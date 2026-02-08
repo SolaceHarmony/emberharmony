@@ -160,8 +160,8 @@ export const DEFAULT_THEMES: Record<string, ThemeJson> = {
   ["one-dark"]: onedark,
   ["osaka-jade"]: osakaJade,
   ["code-harmony"]: harmony,
-  // Backwards compatibility for older configs expecting the "code-harmony" theme name.
-  ["code-harmony"]: harmony,
+  // Backwards compatibility for older configs expecting the original theme name.
+  opencode: harmony,
   orng,
   ["lucent-orng"]: lucentOrng,
   palenight,

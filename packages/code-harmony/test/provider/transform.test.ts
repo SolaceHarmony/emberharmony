@@ -835,8 +835,8 @@ describe("ProviderTransform.message - strip openai metadata when store=false", (
 
     const result = ProviderTransform.message(msgs, harmonyModel, { store: false }) as any[]
 
-    expect(result[0].content[0].providerOptions?.code-harmony?.itemId).toBe("msg_123")
-    expect(result[0].content[0].providerOptions?.code-harmony?.otherOption).toBe("value")
+    expect(result[0].content[0].providerOptions?.["code-harmony"]?.itemId).toBe("msg_123")
+    expect(result[0].content[0].providerOptions?.["code-harmony"]?.otherOption).toBe("value")
   })
 
   test("preserves itemId across all providerOptions keys", () => {
@@ -874,10 +874,10 @@ describe("ProviderTransform.message - strip openai metadata when store=false", (
     const result = ProviderTransform.message(msgs, harmonyModel, { store: false }) as any[]
 
     expect(result[0].providerOptions?.openai?.itemId).toBe("msg_root")
-    expect(result[0].providerOptions?.code-harmony?.itemId).toBe("msg_harmony")
+    expect(result[0].providerOptions?.["code-harmony"]?.itemId).toBe("msg_harmony")
     expect(result[0].providerOptions?.extra?.itemId).toBe("msg_extra")
     expect(result[0].content[0].providerOptions?.openai?.itemId).toBe("msg_openai_part")
-    expect(result[0].content[0].providerOptions?.code-harmony?.itemId).toBe("msg_harmony_part")
+    expect(result[0].content[0].providerOptions?.["code-harmony"]?.itemId).toBe("msg_harmony_part")
     expect(result[0].content[0].providerOptions?.extra?.itemId).toBe("msg_extra_part")
   })
 

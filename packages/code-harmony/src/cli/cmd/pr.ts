@@ -13,6 +13,7 @@ export const PrCommand = cmd({
       demandOption: true,
     }),
   async handler(args) {
+    const num = args.number
     await Instance.provide({
       directory: process.cwd(),
       async fn() {
@@ -22,7 +23,7 @@ export const PrCommand = cmd({
           process.exit(1)
         }
 
-        const prNumber = args.number
+        const prNumber = num
         const localBranchName = `pr/${prNumber}`
         UI.println(`Fetching and checking out PR #${prNumber}...`)
 
@@ -93,8 +94,8 @@ export const PrCommand = cmd({
 
         // Launch CodeHarmony TUI with session ID if available
         const { spawn } = await import("child_process")
-        const args = sessionId ? ["-s", sessionId] : []
-        const proc = spawn("code-harmony", args, {
+        const argv = sessionId ? ["-s", sessionId] : []
+        const proc = spawn("code-harmony", argv, {
           stdio: "inherit",
           cwd: process.cwd(),
         })
