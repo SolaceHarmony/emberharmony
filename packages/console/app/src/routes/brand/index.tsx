@@ -4,25 +4,25 @@ import { Header } from "~/component/header"
 import { config } from "~/config"
 import { Footer } from "~/component/footer"
 import { Legal } from "~/component/legal"
-import previewLogoLight from "../../asset/brand/preview-opencode-logo-light.png"
-import previewLogoDark from "../../asset/brand/preview-opencode-logo-dark.png"
-import previewWordmarkLight from "../../asset/brand/preview-opencode-wordmark-light.png"
-import previewWordmarkDark from "../../asset/brand/preview-opencode-wordmark-dark.png"
-import previewWordmarkSimpleLight from "../../asset/brand/preview-opencode-wordmark-simple-light.png"
-import previewWordmarkSimpleDark from "../../asset/brand/preview-opencode-wordmark-simple-dark.png"
-import logoLightPng from "../../asset/brand/opencode-logo-light.png"
-import logoDarkPng from "../../asset/brand/opencode-logo-dark.png"
-import wordmarkLightPng from "../../asset/brand/opencode-wordmark-light.png"
-import wordmarkDarkPng from "../../asset/brand/opencode-wordmark-dark.png"
-import wordmarkSimpleLightPng from "../../asset/brand/opencode-wordmark-simple-light.png"
-import wordmarkSimpleDarkPng from "../../asset/brand/opencode-wordmark-simple-dark.png"
-import logoLightSvg from "../../asset/brand/opencode-logo-light.svg"
-import logoDarkSvg from "../../asset/brand/opencode-logo-dark.svg"
-import wordmarkLightSvg from "../../asset/brand/opencode-wordmark-light.svg"
-import wordmarkDarkSvg from "../../asset/brand/opencode-wordmark-dark.svg"
-import wordmarkSimpleLightSvg from "../../asset/brand/opencode-wordmark-simple-light.svg"
-import wordmarkSimpleDarkSvg from "../../asset/brand/opencode-wordmark-simple-dark.svg"
-const brandAssets = "/opencode-brand-assets.zip"
+import previewLogoLight from "../../asset/brand/preview-code-harmony-logo-light.png"
+import previewLogoDark from "../../asset/brand/preview-code-harmony-logo-dark.png"
+import previewWordmarkLight from "../../asset/brand/preview-code-harmony-wordmark-light.png"
+import previewWordmarkDark from "../../asset/brand/preview-code-harmony-wordmark-dark.png"
+import previewWordmarkSimpleLight from "../../asset/brand/preview-code-harmony-wordmark-simple-light.png"
+import previewWordmarkSimpleDark from "../../asset/brand/preview-code-harmony-wordmark-simple-dark.png"
+import logoLightPng from "../../asset/brand/code-harmony-logo-light.png"
+import logoDarkPng from "../../asset/brand/code-harmony-logo-dark.png"
+import wordmarkLightPng from "../../asset/brand/code-harmony-wordmark-light.png"
+import wordmarkDarkPng from "../../asset/brand/code-harmony-wordmark-dark.png"
+import wordmarkSimpleLightPng from "../../asset/brand/code-harmony-wordmark-simple-light.png"
+import wordmarkSimpleDarkPng from "../../asset/brand/code-harmony-wordmark-simple-dark.png"
+import logoLightSvg from "../../asset/brand/code-harmony-logo-light.svg"
+import logoDarkSvg from "../../asset/brand/code-harmony-logo-dark.svg"
+import wordmarkLightSvg from "../../asset/brand/code-harmony-wordmark-light.svg"
+import wordmarkDarkSvg from "../../asset/brand/code-harmony-wordmark-dark.svg"
+import wordmarkSimpleLightSvg from "../../asset/brand/code-harmony-wordmark-simple-light.svg"
+import wordmarkSimpleDarkSvg from "../../asset/brand/code-harmony-wordmark-simple-dark.svg"
+const brandAssets = "/code-harmony-brand-assets.zip"
 
 export default function Brand() {
   const downloadFile = async (url: string, filename: string) => {
@@ -65,7 +65,7 @@ export default function Brand() {
             <p>Resources and assets to help you work with the CodeHarmony brand.</p>
             <button
               data-component="download-button"
-              onClick={() => downloadFile(brandAssets, "opencode-brand-assets.zip")}
+              onClick={() => downloadFile(brandAssets, "code-harmony-brand-assets.zip")}
             >
               Download all assets
               <svg width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
@@ -82,7 +82,7 @@ export default function Brand() {
               <div>
                 <img src={previewLogoLight} alt="CodeHarmony brand guidelines" />
                 <div data-component="actions">
-                  <button onClick={() => downloadFile(logoLightPng, "opencode-logo-light.png")}>
+                  <button onClick={() => downloadFile(logoLightPng, "code-harmony-logo-light.png")}>
                     PNG
                     <svg width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
                       <path
@@ -93,7 +93,7 @@ export default function Brand() {
                       />
                     </svg>
                   </button>
-                  <button onClick={() => downloadFile(logoLightSvg, "opencode-logo-light.svg")}>
+                  <button onClick={() => downloadFile(logoLightSvg, "code-harmony-logo-light.svg")}>
                     SVG
                     <svg width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
                       <path
@@ -109,7 +109,7 @@ export default function Brand() {
               <div>
                 <img src={previewLogoDark} alt="CodeHarmony brand guidelines" />
                 <div data-component="actions">
-                  <button onClick={() => downloadFile(logoDarkPng, "opencode-logo-dark.png")}>
+                  <button onClick={() => downloadFile(logoDarkPng, "code-harmony-logo-dark.png")}>
                     PNG
                     <svg width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
                       <path
@@ -120,7 +120,7 @@ export default function Brand() {
                       />
                     </svg>
                   </button>
-                  <button onClick={() => downloadFile(logoDarkSvg, "opencode-logo-dark.svg")}>
+                  <button onClick={() => downloadFile(logoDarkSvg, "code-harmony-logo-dark.svg")}>
                     SVG
                     <svg width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
                       <path
@@ -136,7 +136,7 @@ export default function Brand() {
               <div>
                 <img src={previewWordmarkLight} alt="CodeHarmony brand guidelines" />
                 <div data-component="actions">
-                  <button onClick={() => downloadFile(wordmarkLightPng, "opencode-wordmark-light.png")}>
+                  <button onClick={() => downloadFile(wordmarkLightPng, "code-harmony-wordmark-light.png")}>
                     PNG
                     <svg width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
                       <path
@@ -147,7 +147,7 @@ export default function Brand() {
                       />
                     </svg>
                   </button>
-                  <button onClick={() => downloadFile(wordmarkLightSvg, "opencode-wordmark-light.svg")}>
+                  <button onClick={() => downloadFile(wordmarkLightSvg, "code-harmony-wordmark-light.svg")}>
                     SVG
                     <svg width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
                       <path
@@ -163,7 +163,7 @@ export default function Brand() {
               <div>
                 <img src={previewWordmarkDark} alt="CodeHarmony brand guidelines" />
                 <div data-component="actions">
-                  <button onClick={() => downloadFile(wordmarkDarkPng, "opencode-wordmark-dark.png")}>
+                  <button onClick={() => downloadFile(wordmarkDarkPng, "code-harmony-wordmark-dark.png")}>
                     PNG
                     <svg width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
                       <path
@@ -174,7 +174,7 @@ export default function Brand() {
                       />
                     </svg>
                   </button>
-                  <button onClick={() => downloadFile(wordmarkDarkSvg, "opencode-wordmark-dark.svg")}>
+                  <button onClick={() => downloadFile(wordmarkDarkSvg, "code-harmony-wordmark-dark.svg")}>
                     SVG
                     <svg width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
                       <path
@@ -190,7 +190,7 @@ export default function Brand() {
               <div>
                 <img src={previewWordmarkSimpleLight} alt="CodeHarmony brand guidelines" />
                 <div data-component="actions">
-                  <button onClick={() => downloadFile(wordmarkSimpleLightPng, "opencode-wordmark-simple-light.png")}>
+                  <button onClick={() => downloadFile(wordmarkSimpleLightPng, "code-harmony-wordmark-simple-light.png")}>
                     PNG
                     <svg width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
                       <path
@@ -201,7 +201,7 @@ export default function Brand() {
                       />
                     </svg>
                   </button>
-                  <button onClick={() => downloadFile(wordmarkSimpleLightSvg, "opencode-wordmark-simple-light.svg")}>
+                  <button onClick={() => downloadFile(wordmarkSimpleLightSvg, "code-harmony-wordmark-simple-light.svg")}>
                     SVG
                     <svg width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
                       <path
@@ -217,7 +217,7 @@ export default function Brand() {
               <div>
                 <img src={previewWordmarkSimpleDark} alt="CodeHarmony brand guidelines" />
                 <div data-component="actions">
-                  <button onClick={() => downloadFile(wordmarkSimpleDarkPng, "opencode-wordmark-simple-dark.png")}>
+                  <button onClick={() => downloadFile(wordmarkSimpleDarkPng, "code-harmony-wordmark-simple-dark.png")}>
                     PNG
                     <svg width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
                       <path
@@ -228,7 +228,7 @@ export default function Brand() {
                       />
                     </svg>
                   </button>
-                  <button onClick={() => downloadFile(wordmarkSimpleDarkSvg, "opencode-wordmark-simple-dark.svg")}>
+                  <button onClick={() => downloadFile(wordmarkSimpleDarkSvg, "code-harmony-wordmark-simple-dark.svg")}>
                     SVG
                     <svg width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
                       <path

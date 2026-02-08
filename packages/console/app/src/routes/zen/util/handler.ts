@@ -68,20 +68,20 @@ export async function handler(
     const model = opts.parseModel(url, body)
     const isStream = opts.parseIsStream(url, body)
     const ip = input.request.headers.get("x-real-ip") ?? ""
-    const sessionId = input.request.headers.get("x-opencode-session") ?? ""
-    const requestId = input.request.headers.get("x-opencode-request") ?? ""
-    const projectId = input.request.headers.get("x-opencode-project") ?? ""
-    const ocClient = input.request.headers.get("x-opencode-client") ?? ""
+    const sessionId = input.request.headers.get("x-code-harmony-session") ?? ""
+    const requestId = input.request.headers.get("x-code-harmony-request") ?? ""
+    const projectId = input.request.headers.get("x-code-harmony-project") ?? ""
+    const client = input.request.headers.get("x-code-harmony-client") ?? ""
     logger.metric({
       is_tream: isStream,
       session: sessionId,
       request: requestId,
-      client: ocClient,
+      client,
     })
     const zenData = ZenData.list()
     const modelInfo = validateModel(zenData, model)
     const dataDumper = createDataDumper(sessionId, requestId, projectId)
-    const trialLimiter = createTrialLimiter(modelInfo.trial, ip, ocClient)
+    const trialLimiter = createTrialLimiter(modelInfo.trial, ip, client)
     const isTrial = await trialLimiter?.isTrial()
     const rateLimiter = createRateLimiter(modelInfo.rateLimit, ip)
     await rateLimiter?.check()
@@ -125,10 +125,10 @@ export async function handler(
           })
           headers.delete("host")
           headers.delete("content-length")
-          headers.delete("x-opencode-request")
-          headers.delete("x-opencode-session")
-          headers.delete("x-opencode-project")
-          headers.delete("x-opencode-client")
+          headers.delete("x-code-harmony-request")
+          headers.delete("x-code-harmony-session")
+          headers.delete("x-code-harmony-project")
+          headers.delete("x-code-harmony-client")
           return headers
         })(),
         body: reqBody,

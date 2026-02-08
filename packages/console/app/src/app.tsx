@@ -13,7 +13,7 @@ export default function App() {
       explicitLinks={true}
       root={(props) => (
         <MetaProvider>
-          <Title>opencode</Title>
+          <Title>CodeHarmony</Title>
           <Meta name="description" content="CodeHarmony - The open source coding agent." />
           <Favicon />
           <Font />

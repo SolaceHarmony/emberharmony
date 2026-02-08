@@ -325,8 +325,8 @@ pub fn run() {
                 .inner_size(size.width as f64, size.height as f64)
                 .initialization_script(format!(
                     r#"
-                      window.__OPENCODE__ ??= {{}};
-                      window.__OPENCODE__.updaterEnabled = {updater_enabled};
+                      window.__CODE_HARMONY__ ??= {{}};
+                      window.__CODE_HARMONY__.updaterEnabled = {updater_enabled};
                     "#
                 ));
 

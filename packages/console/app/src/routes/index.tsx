@@ -1,8 +1,8 @@
 import "./index.css"
 import { Title, Meta, Link } from "@solidjs/meta"
 //import { HttpHeader } from "@solidjs/start"
-import video from "../asset/lander/opencode-min.mp4"
-import videoPoster from "../asset/lander/opencode-poster.png"
+import video from "../asset/lander/code-harmony-min.mp4"
+import videoPoster from "../asset/lander/code-harmony-poster.png"
 import { IconCopy, IconCheck } from "../component/icon"
 import { A, createAsync } from "@solidjs/router"
 import { EmailSignup } from "~/component/email-signup"
@@ -41,7 +41,7 @@ export default function Home() {
   }
 
   return (
-    <main data-page="opencode">
+    <main data-page="code-harmony">
       {/*<HttpHeader name="Cache-Control" value="public, max-age=1, s-maxage=3600, stale-while-revalidate=86400" />*/}
       <Title>CodeHarmony | The open source AI coding agent</Title>
       <Link rel="canonical" href={config.baseUrl} />
