@@ -2,14 +2,14 @@ import { Popover as Kobalte } from "@kobalte/core/popover"
 import { Component, ComponentProps, createEffect, createMemo, JSX, onCleanup, Show, ValidComponent } from "solid-js"
 import { createStore } from "solid-js/store"
 import { useLocal } from "@/context/local"
-import { useDialog } from "@opencode-harmony/ui/context/dialog"
+import { useDialog } from "@thesolaceproject/code-harmony-ui/context/dialog"
 import { popularProviders } from "@/hooks/use-providers"
-import { Button } from "@opencode-harmony/ui/button"
-import { IconButton } from "@opencode-harmony/ui/icon-button"
-import { Tag } from "@opencode-harmony/ui/tag"
-import { Dialog } from "@opencode-harmony/ui/dialog"
-import { List } from "@opencode-harmony/ui/list"
-import { Tooltip } from "@opencode-harmony/ui/tooltip"
+import { Button } from "@thesolaceproject/code-harmony-ui/button"
+import { IconButton } from "@thesolaceproject/code-harmony-ui/icon-button"
+import { Tag } from "@thesolaceproject/code-harmony-ui/tag"
+import { Dialog } from "@thesolaceproject/code-harmony-ui/dialog"
+import { List } from "@thesolaceproject/code-harmony-ui/list"
+import { Tooltip } from "@thesolaceproject/code-harmony-ui/tooltip"
 import { DialogSelectProvider } from "./dialog-select-provider"
 import { DialogManageModels } from "./dialog-manage-models"
 import { ModelTooltip } from "./model-tooltip"
@@ -59,10 +59,10 @@ const ModelList: Component<{
             <ModelTooltip
               model={item}
               latest={item.latest}
-              free={item.provider.id === "opencode" && (!item.cost || item.cost.input === 0)}
+              free={item.provider.id === "code-harmony" && (!item.cost || item.cost.input === 0)}
             />
-          }
-        >
+              }
+            >
           {node}
         </Tooltip>
       )}
@@ -73,12 +73,12 @@ const ModelList: Component<{
         props.onSelect()
       }}
     >
-      {(i) => (
-        <div class="w-full flex items-center gap-x-2 text-13-regular">
-          <span class="truncate">{i.name}</span>
-          <Show when={i.provider.id === "opencode" && (!i.cost || i.cost?.input === 0)}>
-            <Tag>{language.t("model.tag.free")}</Tag>
-          </Show>
+          {(i) => (
+            <div class="w-full flex items-center gap-x-2 text-13-regular">
+              <span class="truncate">{i.name}</span>
+              <Show when={i.provider.id === "code-harmony" && (!i.cost || i.cost?.input === 0)}>
+                <Tag>{language.t("model.tag.free")}</Tag>
+              </Show>
           <Show when={i.latest}>
             <Tag>{language.t("model.tag.latest")}</Tag>
           </Show>

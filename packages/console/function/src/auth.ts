@@ -7,16 +7,16 @@ import { THEME_OPENAUTH } from "@openauthjs/openauth/ui/theme"
 import { GithubProvider } from "@openauthjs/openauth/provider/github"
 import { GoogleOidcProvider } from "@openauthjs/openauth/provider/google"
 import { CloudflareStorage } from "@openauthjs/openauth/storage/cloudflare"
-import { Account } from "@opencode-harmony/console-core/account.js"
-import { Workspace } from "@opencode-harmony/console-core/workspace.js"
-import { Actor } from "@opencode-harmony/console-core/actor.js"
-import { Resource } from "@opencode-harmony/console-resource"
-import { User } from "@opencode-harmony/console-core/user.js"
-import { and, Database, eq, isNull, or } from "@opencode-harmony/console-core/drizzle/index.js"
-import { WorkspaceTable } from "@opencode-harmony/console-core/schema/workspace.sql.js"
-import { UserTable } from "@opencode-harmony/console-core/schema/user.sql.js"
-import { AuthTable } from "@opencode-harmony/console-core/schema/auth.sql.js"
-import { Identifier } from "@opencode-harmony/console-core/identifier.js"
+import { Account } from "@thesolaceproject/code-harmony-console-core/account.js"
+import { Workspace } from "@thesolaceproject/code-harmony-console-core/workspace.js"
+import { Actor } from "@thesolaceproject/code-harmony-console-core/actor.js"
+import { Resource } from "@thesolaceproject/code-harmony-console-resource"
+import { User } from "@thesolaceproject/code-harmony-console-core/user.js"
+import { and, Database, eq, isNull, or } from "@thesolaceproject/code-harmony-console-core/drizzle/index.js"
+import { WorkspaceTable } from "@thesolaceproject/code-harmony-console-core/schema/workspace.sql.js"
+import { UserTable } from "@thesolaceproject/code-harmony-console-core/schema/user.sql.js"
+import { AuthTable } from "@thesolaceproject/code-harmony-console-core/schema/auth.sql.js"
+import { Identifier } from "@thesolaceproject/code-harmony-console-core/identifier.js"
 
 type Env = {
   AuthStorage: KVNamespace
@@ -35,7 +35,7 @@ export const subjects = createSubjects({
 
 const MY_THEME: Theme = {
   ...THEME_OPENAUTH,
-  logo: "https://opencode.ai/favicon-v3.svg",
+  logo: "https://solace.ofharmony.ai/favicon-v3.svg",
 }
 
 export default {
@@ -108,20 +108,20 @@ export default {
         let email: string | undefined
 
         if (response.provider === "github") {
-          const emails = (await fetch("https://api.github.com/user/emails", {
-            headers: {
-              Authorization: `Bearer ${response.tokenset.access}`,
-              "User-Agent": "opencode",
-              Accept: "application/vnd.github+json",
-            },
-          }).then((x) => x.json())) as any
-          const user = (await fetch("https://api.github.com/user", {
-            headers: {
-              Authorization: `Bearer ${response.tokenset.access}`,
-              "User-Agent": "opencode",
-              Accept: "application/vnd.github+json",
-            },
-          }).then((x) => x.json())) as any
+	          const emails = (await fetch("https://api.github.com/user/emails", {
+	            headers: {
+	              Authorization: `Bearer ${response.tokenset.access}`,
+	              "User-Agent": "code-harmony",
+	              Accept: "application/vnd.github+json",
+	            },
+	          }).then((x) => x.json())) as any
+	          const user = (await fetch("https://api.github.com/user", {
+	            headers: {
+	              Authorization: `Bearer ${response.tokenset.access}`,
+	              "User-Agent": "code-harmony",
+	              Accept: "application/vnd.github+json",
+	            },
+	          }).then((x) => x.json())) as any
           subject = user.id.toString()
 
           const primaryEmail = emails.find((x: any) => x.primary)

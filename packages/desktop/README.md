@@ -1,6 +1,6 @@
-# OpenCode Desktop
+# CodeHarmony Desktop
 
-Native OpenCode desktop app, built with Tauri v2.
+Native CodeHarmony desktop app, built with Tauri v2.
 
 ## Development
 

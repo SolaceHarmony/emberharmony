@@ -1,5 +1,5 @@
-import { createOpencodeClient, type Event } from "@opencode-harmony/sdk/v2/client"
-import { createSimpleContext } from "@opencode-harmony/ui/context"
+import { createCodeHarmonyClient, type Event } from "@thesolaceproject/code-harmony-sdk/v2/client"
+import { createSimpleContext } from "@thesolaceproject/code-harmony-ui/context"
 import { createGlobalEmitter } from "@solid-primitives/event-bus"
 import { createEffect, createMemo, onCleanup } from "solid-js"
 import { useGlobalSDK } from "./global-sdk"
@@ -13,7 +13,7 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
 
     const directory = createMemo(() => props.directory)
     const client = createMemo(() =>
-      createOpencodeClient({
+      createCodeHarmonyClient({
         baseUrl: globalSDK.url,
         fetch: platform.fetch,
         directory: directory(),

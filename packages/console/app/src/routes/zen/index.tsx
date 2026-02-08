@@ -31,7 +31,7 @@ export default function Home() {
   return (
     <main data-page="zen">
       {/*<HttpHeader name="Cache-Control" value="public, max-age=1, s-maxage=3600, stale-while-revalidate=86400" />*/}
-      <Title>OpenCode Zen | A curated set of reliable optimized models for coding agents</Title>
+      <Title>CodeHarmony Zen | A curated set of reliable optimized models for coding agents</Title>
       <Link rel="canonical" href={`${config.baseUrl}/zen`} />
       <Meta property="og:image" content="/social-share-zen.png" />
       <Meta name="twitter:image" content="/social-share-zen.png" />
@@ -47,9 +47,9 @@ export default function Home() {
               <img data-slot="zen logo dark" src={zenLogoDark} alt="zen logo dark" />
               <h1>Reliable optimized models for coding agents</h1>
               <p>
-                Zen gives you access to a curated set of AI models that OpenCode has tested and benchmarked specifically
-                for coding agents. No need to worry about inconsistent performance and quality, use validated models
-                that work.
+                Zen gives you access to a curated set of AI models that CodeHarmony has tested and benchmarked
+                specifically for coding agents. No need to worry about inconsistent performance and quality, use
+                validated models that work.
               </p>
               <div data-slot="model-logos">
                 <div>
@@ -153,7 +153,7 @@ export default function Home() {
                 configure them differently with varying results.
               </p>
             </div>
-            <p>We're fixing this for everyone, not just OpenCode users.</p>
+            <p>We're fixing this for everyone, not just CodeHarmony users.</p>
             <ul>
               <li>
                 <span>[*]</span> Testing select models and consulting their teams
@@ -170,7 +170,7 @@ export default function Home() {
           <section data-component="how">
             <div data-slot="section-title">
               <h3>How Zen works</h3>
-              <p>While we suggest you use Zen with OpenCode, you can use Zen with any agent.</p>
+              <p>While we suggest you use Zen with CodeHarmony, you can use Zen with any agent.</p>
             </div>
             <ul>
               <li>
@@ -221,7 +221,7 @@ export default function Home() {
                   <span>ex-CEO, Terminal Products</span>
                 </div>
                 <div data-slot="quote">
-                  <span>@OpenCode</span> Zen has been life changing, it's truly a no-brainer.
+                  <span>@CodeHarmony</span> Zen has been life changing, it's truly a no-brainer.
                 </div>
               </div>
             </a>
@@ -234,7 +234,7 @@ export default function Home() {
                   <span>ex-Founder, SEED, PM, Melt, Pop, Dapt, Cadmus, and ViewPoint</span>
                 </div>
                 <div data-slot="quote">
-                  4 out of 5 people on our team love using <span>@OpenCode</span> Zen.
+                  4 out of 5 people on our team love using <span>@CodeHarmony</span> Zen.
                 </div>
               </div>
             </a>
@@ -247,7 +247,7 @@ export default function Home() {
                   <span>ex-Hero, AWS</span>
                 </div>
                 <div data-slot="quote">
-                  I can't recommend <span>@OpenCode</span> Zen enough. Seriously, it’s really good.
+                  I can't recommend <span>@CodeHarmony</span> Zen enough. Seriously, it’s really good.
                 </div>
               </div>
             </a>
@@ -260,7 +260,7 @@ export default function Home() {
                   <span>ex-Head of Design, Laravel</span>
                 </div>
                 <div data-slot="quote">
-                  With <span>@OpenCode</span> Zen I know all the models are tested and perfect for coding agents.
+                  With <span>@CodeHarmony</span> Zen I know all the models are tested and perfect for coding agents.
                 </div>
               </div>
             </a>
@@ -283,9 +283,9 @@ export default function Home() {
             </div>
             <ul>
               <li>
-                <Faq question="What is OpenCode Zen?">
+                <Faq question="What is CodeHarmony Zen?">
                   Zen is a curated set of AI models tested and benchmarked for coding agents created by the team behind
-                  OpenCode.
+                  CodeHarmony.
                 </Faq>
               </li>
               <li>
@@ -297,15 +297,15 @@ export default function Home() {
               <li>
                 <Faq question="Is Zen cheaper?">
                   Zen is not for profit. Zen passes through the costs from the model providers to you. The higher Zen’s
-                  usage the more OpenCode can negotiate better rates and pass those to you.
+                  usage the more CodeHarmony can negotiate better rates and pass those to you.
                 </Faq>
               </li>
               <li>
                 <Faq question="How much does Zen cost?">
                   Zen <a href="/docs/zen/#pricing">charges per request</a> with zero markups, so you pay exactly what
                   the model provider charges. Your total cost depends on usage, and you can set monthly spend limits in
-                  your <a href="/auth">account</a>. To cover costs, OpenCode adds only a small payment processing fee of
-                  $1.23 per $20 balance top-up.
+                  your <a href="/auth">account</a>. To cover costs, CodeHarmony adds only a small payment processing fee
+                  of $1.23 per $20 balance top-up.
                 </Faq>
               </li>
               <li>
@@ -324,8 +324,8 @@ export default function Home() {
               </li>
               <li>
                 <Faq question="Can I use Zen with other coding agents?">
-                  While Zen works great with OpenCode, you can use Zen with any agent. Follow the setup instructions in
-                  your preferred coding agent.
+                  While Zen works great with CodeHarmony, you can use Zen with any agent. Follow the setup instructions
+                  in your preferred coding agent.
                 </Faq>
               </li>
             </ul>

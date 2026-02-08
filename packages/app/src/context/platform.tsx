@@ -1,4 +1,4 @@
-import { createSimpleContext } from "@opencode-harmony/ui/context"
+import { createSimpleContext } from "@thesolaceproject/code-harmony-ui/context"
 import { AsyncStorage, SyncStorage } from "@solid-primitives/storage"
 
 export type Platform = {

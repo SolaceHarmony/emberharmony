@@ -3,11 +3,10 @@ import { resolveThemeVariant, themeToCss } from "./resolve"
 import { hexToRgb } from "./color"
 
 let activeTheme: DesktopTheme | null = null
-const THEME_STYLE_ID = "opencode-theme"
+const THEME_STYLE_ID = "code-harmony-theme"
 
 // Cache the macOS detection result at module load time
-const IS_MACOS =
-  typeof window !== "undefined" && "__TAURI__" in window && navigator.userAgent.includes("Mac")
+const IS_MACOS = typeof window !== "undefined" && "__TAURI__" in window && navigator.userAgent.includes("Mac")
 
 function ensureLoaderStyleElement(): HTMLStyleElement {
   const existing = document.getElementById(THEME_STYLE_ID) as HTMLStyleElement | null

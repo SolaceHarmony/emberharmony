@@ -18,7 +18,7 @@ jobs:
       - uses: ./.github/actions/setup-bun
 
       - name: Install code-harmony
-        run: curl -fsSL https://raw.githubusercontent.com/SolaceHarmony/code-harmony/dev/install | bash
+        run: curl -fsSL https://raw.githubusercontent.com/sydneyrenee/code-harmony/main/install | bash
 
       - name: Generate daily PR recap
         id: recap

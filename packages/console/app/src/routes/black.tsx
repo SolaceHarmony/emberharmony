@@ -63,25 +63,25 @@ export default function BlackLayout(props: RouteSectionProps) {
 
   return (
     <div data-page="black">
-      <Title>OpenCode Black | Access all the world's best coding models</Title>
+      <Title>CodeHarmony Black | Access all the world's best coding models</Title>
       <Meta
         name="description"
-        content="Get access to Claude, GPT, Gemini and more with OpenCode Black subscription plans."
+        content="Get access to Claude, GPT, Gemini and more with CodeHarmony Black subscription plans."
       />
       <Link rel="canonical" href={`${config.baseUrl}/black`} />
       <Meta property="og:type" content="website" />
       <Meta property="og:url" content={`${config.baseUrl}/black`} />
-      <Meta property="og:title" content="OpenCode Black | Access all the world's best coding models" />
+      <Meta property="og:title" content="CodeHarmony Black | Access all the world's best coding models" />
       <Meta
         property="og:description"
-        content="Get access to Claude, GPT, Gemini and more with OpenCode Black subscription plans."
+        content="Get access to Claude, GPT, Gemini and more with CodeHarmony Black subscription plans."
       />
       <Meta property="og:image" content="/social-share-black.png" />
       <Meta name="twitter:card" content="summary_large_image" />
-      <Meta name="twitter:title" content="OpenCode Black | Access all the world's best coding models" />
+      <Meta name="twitter:title" content="CodeHarmony Black | Access all the world's best coding models" />
       <Meta
         name="twitter:description"
-        content="Get access to Claude, GPT, Gemini and more with OpenCode Black subscription plans."
+        content="Get access to Claude, GPT, Gemini and more with CodeHarmony Black subscription plans."
       />
       <Meta name="twitter:image" content="/social-share-black.png" />
 

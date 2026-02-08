@@ -1,6 +1,6 @@
 import { z } from "zod"
 import { fn } from "./util/fn"
-import { Resource } from "@opencode-harmony/console-resource"
+import { Resource } from "@thesolaceproject/code-harmony-console-resource"
 import { centsToMicroCents } from "./util/price"
 import { getWeekBounds } from "./util/date"
 import { SubscriptionPlan } from "./schema/billing.sql"

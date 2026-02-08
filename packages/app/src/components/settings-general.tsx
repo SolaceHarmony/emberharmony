@@ -1,16 +1,16 @@
 import { Component, createMemo, type JSX } from "solid-js"
 import { createStore } from "solid-js/store"
-import { Button } from "@opencode-harmony/ui/button"
-import { Select } from "@opencode-harmony/ui/select"
-import { Switch } from "@opencode-harmony/ui/switch"
-import { useTheme, type ColorScheme } from "@opencode-harmony/ui/theme"
-import { showToast } from "@opencode-harmony/ui/toast"
+import { Button } from "@thesolaceproject/code-harmony-ui/button"
+import { Select } from "@thesolaceproject/code-harmony-ui/select"
+import { Switch } from "@thesolaceproject/code-harmony-ui/switch"
+import { useTheme, type ColorScheme } from "@thesolaceproject/code-harmony-ui/theme"
+import { showToast } from "@thesolaceproject/code-harmony-ui/toast"
 import { useLanguage } from "@/context/language"
 import { usePlatform } from "@/context/platform"
 import { useSettings, monoFontFamily } from "@/context/settings"
 import { playSound, SOUND_OPTIONS } from "@/utils/sound"
 import { Link } from "./link"
-import { ScrollFade } from "@opencode-harmony/ui/scroll-fade"
+import { ScrollFade } from "@thesolaceproject/code-harmony-ui/scroll-fade"
 
 let demoSoundState = {
   cleanup: undefined as (() => void) | undefined,
@@ -192,7 +192,7 @@ export const SettingsGeneral: Component = () => {
               description={
                 <>
                   {language.t("settings.general.row.theme.description")}{" "}
-                  <Link href="https://opencode.ai/docs/themes/">{language.t("common.learnMore")}</Link>
+                  <Link href="https://solace.ofharmony.ai/docs/themes/">{language.t("common.learnMore")}</Link>
                 </>
               }
             >

@@ -39,7 +39,7 @@ jobs:
 
       - name: Install code-harmony
         if: env.OPENCODE_API_KEY != ''
-        run: curl -fsSL https://raw.githubusercontent.com/SolaceHarmony/code-harmony/dev/install | bash
+        run: curl -fsSL https://raw.githubusercontent.com/sydneyrenee/code-harmony/main/install | bash
 
       - name: Build prompt
         if: env.OPENCODE_API_KEY != ''

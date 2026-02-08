@@ -1,12 +1,12 @@
 import { json, query, action, useParams, createAsync, useSubmission } from "@solidjs/router"
 import { createEffect, createSignal, For, Show } from "solid-js"
 import { IconCopy, IconCheck } from "~/component/icon"
-import { Key } from "@opencode-harmony/console-core/key.js"
+import { Key } from "@thesolaceproject/code-harmony-console-core/key.js"
 import { withActor } from "~/context/auth.withActor"
 import { createStore } from "solid-js/store"
 import { formatDateUTC, formatDateForTable } from "../../common"
 import styles from "./key-section.module.css"
-import { Actor } from "@opencode-harmony/console-core/actor.js"
+import { Actor } from "@thesolaceproject/code-harmony-console-core/actor.js"
 
 const removeKey = action(async (form: FormData) => {
   "use server"

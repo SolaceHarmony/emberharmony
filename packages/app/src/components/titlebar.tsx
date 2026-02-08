@@ -1,11 +1,11 @@
 import { createEffect, createMemo, Show, untrack } from "solid-js"
 import { createStore } from "solid-js/store"
 import { useLocation, useNavigate } from "@solidjs/router"
-import { IconButton } from "@opencode-harmony/ui/icon-button"
-import { Icon } from "@opencode-harmony/ui/icon"
-import { Button } from "@opencode-harmony/ui/button"
-import { Tooltip, TooltipKeybind } from "@opencode-harmony/ui/tooltip"
-import { useTheme } from "@opencode-harmony/ui/theme"
+import { IconButton } from "@thesolaceproject/code-harmony-ui/icon-button"
+import { Icon } from "@thesolaceproject/code-harmony-ui/icon"
+import { Button } from "@thesolaceproject/code-harmony-ui/button"
+import { Tooltip, TooltipKeybind } from "@thesolaceproject/code-harmony-ui/tooltip"
+import { useTheme } from "@thesolaceproject/code-harmony-ui/theme"
 
 import { useLayout } from "@/context/layout"
 import { usePlatform } from "@/context/platform"
@@ -219,14 +219,14 @@ export function Titlebar() {
             </Tooltip>
           </div>
         </div>
-        <div id="opencode-titlebar-left" class="flex items-center gap-3 min-w-0 px-2" data-tauri-drag-region />
+        <div id="code-harmony-titlebar-left" class="flex items-center gap-3 min-w-0 px-2" data-tauri-drag-region />
       </div>
 
       <div
         class="min-w-0 flex items-center justify-center pointer-events-none lg:absolute lg:inset-0 lg:flex lg:items-center lg:justify-center"
         data-tauri-drag-region
       >
-        <div id="opencode-titlebar-center" class="pointer-events-auto w-full min-w-0 flex justify-center lg:w-fit" />
+        <div id="code-harmony-titlebar-center" class="pointer-events-auto w-full min-w-0 flex justify-center lg:w-fit" />
       </div>
 
       <div
@@ -237,7 +237,7 @@ export function Titlebar() {
         onMouseDown={drag}
         data-tauri-drag-region
       >
-        <div id="opencode-titlebar-right" class="flex items-center gap-3 shrink-0 justify-end" data-tauri-drag-region />
+        <div id="code-harmony-titlebar-right" class="flex items-center gap-3 shrink-0 justify-end" data-tauri-drag-region />
         <Show when={windows()}>
           <div class="w-6 shrink-0" />
           <div data-tauri-decorum-tb class="flex flex-row" />

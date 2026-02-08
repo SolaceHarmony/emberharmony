@@ -6,14 +6,14 @@
       "name": "opencode",
       "dependencies": {
         "@aws-sdk/client-s3": "3.933.0",
-        "@opencode-harmony/plugin": "workspace:*",
-        "@opencode-harmony/script": "workspace:*",
-        "@opencode-harmony/sdk": "workspace:*",
+        "@thesolaceproject/code-harmony-plugin": "workspace:*",
+        "@thesolaceproject/code-harmony-script": "workspace:*",
+        "@thesolaceproject/code-harmony-sdk": "workspace:*",
         "typescript": "catalog:",
       },
       "devDependencies": {
         "@actions/artifact": "5.0.1",
-        "@opencode-harmony/security-scanner": "workspace:*",
+        "@thesolaceproject/code-harmony-security-scanner": "workspace:*",
         "@tsconfig/bun": "catalog:",
         "husky": "9.1.7",
         "prettier": "3.6.2",
@@ -23,13 +23,10 @@
       },
     },
     "packages/app": {
-      "name": "@opencode-harmony/app",
+      "name": "@thesolaceproject/code-harmony-app",
       "version": "1.0.0",
       "dependencies": {
         "@kobalte/core": "catalog:",
-        "@opencode-harmony/sdk": "workspace:*",
-        "@opencode-harmony/ui": "workspace:*",
-        "@opencode-harmony/util": "workspace:*",
         "@shikijs/transformers": "3.9.2",
         "@solid-primitives/active-element": "2.1.3",
         "@solid-primitives/audio": "1.4.2",
@@ -42,6 +39,9 @@
         "@solid-primitives/websocket": "1.3.1",
         "@solidjs/meta": "catalog:",
         "@solidjs/router": "catalog:",
+        "@thesolaceproject/code-harmony-sdk": "workspace:*",
+        "@thesolaceproject/code-harmony-ui": "workspace:*",
+        "@thesolaceproject/code-harmony-util": "workspace:*",
         "@thisbeyond/solid-dnd": "0.7.5",
         "diff": "catalog:",
         "fuzzysort": "catalog:",
@@ -72,192 +72,7 @@
         "vite-plugin-solid": "catalog:",
       },
     },
-    "packages/console/app": {
-      "name": "@opencode-harmony/console-app",
-      "version": "1.0.0",
-      "dependencies": {
-        "@cloudflare/vite-plugin": "1.15.2",
-        "@ibm/plex": "6.4.1",
-        "@jsx-email/render": "1.1.1",
-        "@kobalte/core": "catalog:",
-        "@openauthjs/openauth": "catalog:",
-        "@opencode-harmony/console-core": "workspace:*",
-        "@opencode-harmony/console-mail": "workspace:*",
-        "@opencode-harmony/console-resource": "workspace:*",
-        "@opencode-harmony/ui": "workspace:*",
-        "@smithy/eventstream-codec": "4.2.7",
-        "@smithy/util-utf8": "4.2.0",
-        "@solidjs/meta": "catalog:",
-        "@solidjs/router": "catalog:",
-        "@solidjs/start": "catalog:",
-        "@stripe/stripe-js": "8.6.1",
-        "chart.js": "4.5.1",
-        "nitro": "3.0.1-alpha.1",
-        "solid-js": "catalog:",
-        "solid-list": "0.3.0",
-        "solid-stripe": "0.8.1",
-        "vite": "catalog:",
-        "zod": "catalog:",
-      },
-      "devDependencies": {
-        "@typescript/native-preview": "catalog:",
-        "@webgpu/types": "0.1.54",
-        "typescript": "catalog:",
-        "wrangler": "4.59.1",
-      },
-    },
-    "packages/console/core": {
-      "name": "@opencode-harmony/console-core",
-      "version": "1.0.0",
-      "dependencies": {
-        "@aws-sdk/client-sts": "3.933.0",
-        "@jsx-email/render": "1.1.1",
-        "@opencode-harmony/console-mail": "workspace:*",
-        "@opencode-harmony/console-resource": "workspace:*",
-        "@planetscale/database": "1.19.0",
-        "aws4fetch": "1.0.20",
-        "drizzle-orm": "0.41.0",
-        "postgres": "3.4.7",
-        "stripe": "18.0.0",
-        "ulid": "catalog:",
-        "zod": "catalog:",
-      },
-      "devDependencies": {
-        "@cloudflare/workers-types": "catalog:",
-        "@tsconfig/node22": "22.0.2",
-        "@types/bun": "1.3.0",
-        "@types/node": "catalog:",
-        "@typescript/native-preview": "catalog:",
-        "drizzle-kit": "0.30.5",
-        "mysql2": "3.14.4",
-        "typescript": "catalog:",
-      },
-    },
-    "packages/console/function": {
-      "name": "@opencode-harmony/console-function",
-      "version": "1.0.0",
-      "dependencies": {
-        "@ai-sdk/anthropic": "2.0.0",
-        "@ai-sdk/openai": "2.0.2",
-        "@ai-sdk/openai-compatible": "1.0.1",
-        "@hono/zod-validator": "catalog:",
-        "@openauthjs/openauth": "0.0.0-20250322224806",
-        "@opencode-harmony/console-core": "workspace:*",
-        "@opencode-harmony/console-resource": "workspace:*",
-        "ai": "catalog:",
-        "hono": "catalog:",
-        "zod": "catalog:",
-      },
-      "devDependencies": {
-        "@cloudflare/workers-types": "catalog:",
-        "@tsconfig/node22": "22.0.2",
-        "@types/node": "catalog:",
-        "@typescript/native-preview": "catalog:",
-        "openai": "5.11.0",
-        "typescript": "catalog:",
-      },
-    },
-    "packages/console/mail": {
-      "name": "@opencode-harmony/console-mail",
-      "version": "1.0.0",
-      "dependencies": {
-        "@jsx-email/all": "2.2.3",
-        "@jsx-email/cli": "1.4.3",
-        "@tsconfig/bun": "1.0.9",
-        "@types/react": "18.0.25",
-        "react": "18.2.0",
-        "solid-js": "catalog:",
-      },
-    },
-    "packages/console/resource": {
-      "name": "@opencode-harmony/console-resource",
-      "dependencies": {
-        "@cloudflare/workers-types": "catalog:",
-      },
-      "devDependencies": {
-        "@cloudflare/workers-types": "catalog:",
-        "@tsconfig/node22": "22.0.2",
-        "@types/node": "catalog:",
-        "cloudflare": "5.2.0",
-      },
-    },
-    "packages/desktop": {
-      "name": "@opencode-harmony/desktop",
-      "version": "1.0.0",
-      "dependencies": {
-        "@opencode-harmony/app": "workspace:*",
-        "@opencode-harmony/ui": "workspace:*",
-        "@solid-primitives/i18n": "2.2.1",
-        "@solid-primitives/storage": "catalog:",
-        "@tauri-apps/api": "^2",
-        "@tauri-apps/plugin-deep-link": "~2",
-        "@tauri-apps/plugin-dialog": "~2",
-        "@tauri-apps/plugin-http": "~2",
-        "@tauri-apps/plugin-notification": "~2",
-        "@tauri-apps/plugin-opener": "^2",
-        "@tauri-apps/plugin-os": "~2",
-        "@tauri-apps/plugin-process": "~2",
-        "@tauri-apps/plugin-shell": "~2",
-        "@tauri-apps/plugin-store": "~2",
-        "@tauri-apps/plugin-updater": "~2",
-        "@tauri-apps/plugin-window-state": "~2",
-        "solid-js": "catalog:",
-      },
-      "devDependencies": {
-        "@actions/artifact": "4.0.0",
-        "@tauri-apps/cli": "^2",
-        "@types/bun": "catalog:",
-        "@typescript/native-preview": "catalog:",
-        "typescript": "~5.6.2",
-        "vite": "catalog:",
-      },
-    },
-    "packages/enterprise": {
-      "name": "@opencode-harmony/enterprise",
-      "version": "1.0.0",
-      "dependencies": {
-        "@opencode-harmony/ui": "workspace:*",
-        "@opencode-harmony/util": "workspace:*",
-        "@pierre/diffs": "catalog:",
-        "@solidjs/meta": "catalog:",
-        "@solidjs/router": "catalog:",
-        "@solidjs/start": "catalog:",
-        "aws4fetch": "^1.0.20",
-        "hono": "catalog:",
-        "hono-openapi": "catalog:",
-        "js-base64": "3.7.7",
-        "luxon": "catalog:",
-        "nitro": "3.0.1-alpha.1",
-        "solid-js": "catalog:",
-        "zod": "catalog:",
-      },
-      "devDependencies": {
-        "@cloudflare/workers-types": "catalog:",
-        "@tailwindcss/vite": "catalog:",
-        "@types/luxon": "catalog:",
-        "@typescript/native-preview": "catalog:",
-        "tailwindcss": "catalog:",
-        "typescript": "catalog:",
-        "vite": "catalog:",
-      },
-    },
-    "packages/function": {
-      "name": "@opencode-harmony/function",
-      "version": "1.0.0",
-      "dependencies": {
-        "@octokit/auth-app": "8.0.1",
-        "@octokit/rest": "catalog:",
-        "hono": "catalog:",
-        "jose": "6.0.11",
-      },
-      "devDependencies": {
-        "@cloudflare/workers-types": "catalog:",
-        "@tsconfig/node22": "22.0.2",
-        "@types/node": "catalog:",
-        "typescript": "catalog:",
-      },
-    },
-    "packages/opencode": {
+    "packages/code-harmony": {
       "name": "code-harmony",
       "version": "1.0.0",
       "bin": {
@@ -294,10 +109,6 @@
         "@octokit/graphql": "9.0.2",
         "@octokit/rest": "catalog:",
         "@openauthjs/openauth": "catalog:",
-        "@opencode-harmony/plugin": "workspace:*",
-        "@opencode-harmony/script": "workspace:*",
-        "@opencode-harmony/sdk": "workspace:*",
-        "@opencode-harmony/util": "workspace:*",
         "@openrouter/ai-sdk-provider": "1.5.2",
         "@opentui/core": "0.1.75",
         "@opentui/solid": "0.1.75",
@@ -306,6 +117,10 @@
         "@solid-primitives/event-bus": "1.1.2",
         "@solid-primitives/scheduled": "1.5.2",
         "@standard-schema/spec": "1.0.0",
+        "@thesolaceproject/code-harmony-plugin": "workspace:*",
+        "@thesolaceproject/code-harmony-script": "workspace:*",
+        "@thesolaceproject/code-harmony-sdk": "workspace:*",
+        "@thesolaceproject/code-harmony-util": "workspace:*",
         "@zip.js/zip.js": "2.7.62",
         "ai": "catalog:",
         "bonjour-service": "1.3.0",
@@ -340,7 +155,6 @@
       "devDependencies": {
         "@babel/core": "7.28.4",
         "@octokit/webhooks-types": "7.6.1",
-        "@opencode-harmony/script": "workspace:*",
         "@parcel/watcher-darwin-arm64": "2.5.1",
         "@parcel/watcher-darwin-x64": "2.5.1",
         "@parcel/watcher-linux-arm64-glibc": "2.5.1",
@@ -349,6 +163,7 @@
         "@parcel/watcher-linux-x64-musl": "2.5.1",
         "@parcel/watcher-win32-x64": "2.5.1",
         "@standard-schema/spec": "1.0.0",
+        "@thesolaceproject/code-harmony-script": "workspace:*",
         "@tsconfig/bun": "catalog:",
         "@types/babel__core": "7.20.5",
         "@types/bun": "catalog:",
@@ -361,11 +176,196 @@
         "zod-to-json-schema": "3.24.5",
       },
     },
-    "packages/plugin": {
-      "name": "@opencode-harmony/plugin",
+    "packages/console/app": {
+      "name": "@thesolaceproject/code-harmony-console-app",
       "version": "1.0.0",
       "dependencies": {
-        "@opencode-harmony/sdk": "workspace:*",
+        "@cloudflare/vite-plugin": "1.15.2",
+        "@ibm/plex": "6.4.1",
+        "@jsx-email/render": "1.1.1",
+        "@kobalte/core": "catalog:",
+        "@openauthjs/openauth": "catalog:",
+        "@smithy/eventstream-codec": "4.2.7",
+        "@smithy/util-utf8": "4.2.0",
+        "@solidjs/meta": "catalog:",
+        "@solidjs/router": "catalog:",
+        "@solidjs/start": "catalog:",
+        "@stripe/stripe-js": "8.6.1",
+        "@thesolaceproject/code-harmony-console-core": "workspace:*",
+        "@thesolaceproject/code-harmony-console-mail": "workspace:*",
+        "@thesolaceproject/code-harmony-console-resource": "workspace:*",
+        "@thesolaceproject/code-harmony-ui": "workspace:*",
+        "chart.js": "4.5.1",
+        "nitro": "3.0.1-alpha.1",
+        "solid-js": "catalog:",
+        "solid-list": "0.3.0",
+        "solid-stripe": "0.8.1",
+        "vite": "catalog:",
+        "zod": "catalog:",
+      },
+      "devDependencies": {
+        "@typescript/native-preview": "catalog:",
+        "@webgpu/types": "0.1.54",
+        "typescript": "catalog:",
+        "wrangler": "4.59.1",
+      },
+    },
+    "packages/console/core": {
+      "name": "@thesolaceproject/code-harmony-console-core",
+      "version": "1.0.0",
+      "dependencies": {
+        "@aws-sdk/client-sts": "3.933.0",
+        "@jsx-email/render": "1.1.1",
+        "@planetscale/database": "1.19.0",
+        "@thesolaceproject/code-harmony-console-mail": "workspace:*",
+        "@thesolaceproject/code-harmony-console-resource": "workspace:*",
+        "aws4fetch": "1.0.20",
+        "drizzle-orm": "0.41.0",
+        "postgres": "3.4.7",
+        "stripe": "18.0.0",
+        "ulid": "catalog:",
+        "zod": "catalog:",
+      },
+      "devDependencies": {
+        "@cloudflare/workers-types": "catalog:",
+        "@tsconfig/node22": "22.0.2",
+        "@types/bun": "1.3.0",
+        "@types/node": "catalog:",
+        "@typescript/native-preview": "catalog:",
+        "drizzle-kit": "0.30.5",
+        "mysql2": "3.14.4",
+        "typescript": "catalog:",
+      },
+    },
+    "packages/console/function": {
+      "name": "@thesolaceproject/code-harmony-console-function",
+      "version": "1.0.0",
+      "dependencies": {
+        "@ai-sdk/anthropic": "2.0.0",
+        "@ai-sdk/openai": "2.0.2",
+        "@ai-sdk/openai-compatible": "1.0.1",
+        "@hono/zod-validator": "catalog:",
+        "@openauthjs/openauth": "0.0.0-20250322224806",
+        "@thesolaceproject/code-harmony-console-core": "workspace:*",
+        "@thesolaceproject/code-harmony-console-resource": "workspace:*",
+        "ai": "catalog:",
+        "hono": "catalog:",
+        "zod": "catalog:",
+      },
+      "devDependencies": {
+        "@cloudflare/workers-types": "catalog:",
+        "@tsconfig/node22": "22.0.2",
+        "@types/node": "catalog:",
+        "@typescript/native-preview": "catalog:",
+        "openai": "5.11.0",
+        "typescript": "catalog:",
+      },
+    },
+    "packages/console/mail": {
+      "name": "@thesolaceproject/code-harmony-console-mail",
+      "version": "1.0.0",
+      "dependencies": {
+        "@jsx-email/all": "2.2.3",
+        "@jsx-email/cli": "1.4.3",
+        "@tsconfig/bun": "1.0.9",
+        "@types/react": "18.0.25",
+        "react": "18.2.0",
+        "solid-js": "catalog:",
+      },
+    },
+    "packages/console/resource": {
+      "name": "@thesolaceproject/code-harmony-console-resource",
+      "dependencies": {
+        "@cloudflare/workers-types": "catalog:",
+      },
+      "devDependencies": {
+        "@cloudflare/workers-types": "catalog:",
+        "@tsconfig/node22": "22.0.2",
+        "@types/node": "catalog:",
+        "cloudflare": "5.2.0",
+      },
+    },
+    "packages/desktop": {
+      "name": "@thesolaceproject/code-harmony-desktop",
+      "version": "1.0.0",
+      "dependencies": {
+        "@solid-primitives/i18n": "2.2.1",
+        "@solid-primitives/storage": "catalog:",
+        "@tauri-apps/api": "^2",
+        "@tauri-apps/plugin-deep-link": "~2",
+        "@tauri-apps/plugin-dialog": "~2",
+        "@tauri-apps/plugin-http": "~2",
+        "@tauri-apps/plugin-notification": "~2",
+        "@tauri-apps/plugin-opener": "^2",
+        "@tauri-apps/plugin-os": "~2",
+        "@tauri-apps/plugin-process": "~2",
+        "@tauri-apps/plugin-shell": "~2",
+        "@tauri-apps/plugin-store": "~2",
+        "@tauri-apps/plugin-updater": "~2",
+        "@tauri-apps/plugin-window-state": "~2",
+        "@thesolaceproject/code-harmony-app": "workspace:*",
+        "@thesolaceproject/code-harmony-ui": "workspace:*",
+        "solid-js": "catalog:",
+      },
+      "devDependencies": {
+        "@actions/artifact": "4.0.0",
+        "@tauri-apps/cli": "^2",
+        "@types/bun": "catalog:",
+        "@typescript/native-preview": "catalog:",
+        "typescript": "~5.6.2",
+        "vite": "catalog:",
+      },
+    },
+    "packages/enterprise": {
+      "name": "@thesolaceproject/code-harmony-enterprise",
+      "version": "1.0.0",
+      "dependencies": {
+        "@pierre/diffs": "catalog:",
+        "@solidjs/meta": "catalog:",
+        "@solidjs/router": "catalog:",
+        "@solidjs/start": "catalog:",
+        "@thesolaceproject/code-harmony-ui": "workspace:*",
+        "@thesolaceproject/code-harmony-util": "workspace:*",
+        "aws4fetch": "^1.0.20",
+        "hono": "catalog:",
+        "hono-openapi": "catalog:",
+        "js-base64": "3.7.7",
+        "luxon": "catalog:",
+        "nitro": "3.0.1-alpha.1",
+        "solid-js": "catalog:",
+        "zod": "catalog:",
+      },
+      "devDependencies": {
+        "@cloudflare/workers-types": "catalog:",
+        "@tailwindcss/vite": "catalog:",
+        "@types/luxon": "catalog:",
+        "@typescript/native-preview": "catalog:",
+        "tailwindcss": "catalog:",
+        "typescript": "catalog:",
+        "vite": "catalog:",
+      },
+    },
+    "packages/function": {
+      "name": "@thesolaceproject/code-harmony-function",
+      "version": "1.0.0",
+      "dependencies": {
+        "@octokit/auth-app": "8.0.1",
+        "@octokit/rest": "catalog:",
+        "hono": "catalog:",
+        "jose": "6.0.11",
+      },
+      "devDependencies": {
+        "@cloudflare/workers-types": "catalog:",
+        "@tsconfig/node22": "22.0.2",
+        "@types/node": "catalog:",
+        "typescript": "catalog:",
+      },
+    },
+    "packages/plugin": {
+      "name": "@thesolaceproject/code-harmony-plugin",
+      "version": "1.0.0",
+      "dependencies": {
+        "@thesolaceproject/code-harmony-sdk": "workspace:*",
         "zod": "catalog:",
       },
       "devDependencies": {
@@ -376,13 +376,13 @@
       },
     },
     "packages/script": {
-      "name": "@opencode-harmony/script",
+      "name": "@thesolaceproject/code-harmony-script",
       "devDependencies": {
         "@types/bun": "catalog:",
       },
     },
     "packages/sdk/js": {
-      "name": "@opencode-harmony/sdk",
+      "name": "@thesolaceproject/code-harmony-sdk",
       "version": "1.0.0",
       "devDependencies": {
         "@hey-api/openapi-ts": "0.90.10",
@@ -393,18 +393,18 @@
       },
     },
     "packages/security-scanner": {
-      "name": "@opencode-harmony/security-scanner",
+      "name": "@thesolaceproject/code-harmony-security-scanner",
       "version": "1.0.0",
       "dependencies": {
         "bun-osv-scanner": "2.0.0",
       },
     },
     "packages/slack": {
-      "name": "@opencode-harmony/slack",
+      "name": "@thesolaceproject/code-harmony-slack",
       "version": "1.0.0",
       "dependencies": {
-        "@opencode-harmony/sdk": "workspace:*",
         "@slack/bolt": "^3.17.1",
+        "@thesolaceproject/code-harmony-sdk": "workspace:*",
       },
       "devDependencies": {
         "@types/node": "catalog:",
@@ -413,18 +413,18 @@
       },
     },
     "packages/ui": {
-      "name": "@opencode-harmony/ui",
+      "name": "@thesolaceproject/code-harmony-ui",
       "version": "1.0.0",
       "dependencies": {
         "@kobalte/core": "catalog:",
-        "@opencode-harmony/sdk": "workspace:*",
-        "@opencode-harmony/util": "workspace:*",
         "@pierre/diffs": "catalog:",
         "@shikijs/transformers": "3.9.2",
         "@solid-primitives/bounds": "0.1.3",
         "@solid-primitives/media": "2.3.3",
         "@solid-primitives/resize-observer": "2.1.3",
         "@solidjs/meta": "catalog:",
+        "@thesolaceproject/code-harmony-sdk": "workspace:*",
+        "@thesolaceproject/code-harmony-util": "workspace:*",
         "@typescript/native-preview": "catalog:",
         "dompurify": "3.3.1",
         "fuzzysort": "catalog:",
@@ -455,7 +455,7 @@
       },
     },
     "packages/util": {
-      "name": "@opencode-harmony/util",
+      "name": "@thesolaceproject/code-harmony-util",
       "version": "1.0.0",
       "dependencies": {
         "zod": "catalog:",
@@ -466,7 +466,7 @@
       },
     },
     "packages/web": {
-      "name": "@opencode-harmony/web",
+      "name": "@thesolaceproject/code-harmony-web",
       "version": "1.0.0",
       "dependencies": {
         "@astrojs/cloudflare": "12.6.11",
@@ -1218,40 +1218,6 @@
 
     "@openauthjs/openauth": ["@openauthjs/openauth@0.0.0-20250322224806", "", { "dependencies": { "@standard-schema/spec": "1.0.0-beta.3", "aws4fetch": "1.0.20", "jose": "5.9.6" }, "peerDependencies": { "arctic": "^2.2.2", "hono": "^4.0.0" } }, "sha512-p5IWSRXvABcwocH2dNI0w8c1QJelIOFulwhKk+aLLFfUbs8u1pr7kQbYe8yCSM2+bcLHiwbogpUQc2ovrGwCuw=="],
 
-    "@opencode-harmony/app": ["@opencode-harmony/app@workspace:packages/app"],
-
-    "@opencode-harmony/console-app": ["@opencode-harmony/console-app@workspace:packages/console/app"],
-
-    "@opencode-harmony/console-core": ["@opencode-harmony/console-core@workspace:packages/console/core"],
-
-    "@opencode-harmony/console-function": ["@opencode-harmony/console-function@workspace:packages/console/function"],
-
-    "@opencode-harmony/console-mail": ["@opencode-harmony/console-mail@workspace:packages/console/mail"],
-
-    "@opencode-harmony/console-resource": ["@opencode-harmony/console-resource@workspace:packages/console/resource"],
-
-    "@opencode-harmony/desktop": ["@opencode-harmony/desktop@workspace:packages/desktop"],
-
-    "@opencode-harmony/enterprise": ["@opencode-harmony/enterprise@workspace:packages/enterprise"],
-
-    "@opencode-harmony/function": ["@opencode-harmony/function@workspace:packages/function"],
-
-    "@opencode-harmony/plugin": ["@opencode-harmony/plugin@workspace:packages/plugin"],
-
-    "@opencode-harmony/script": ["@opencode-harmony/script@workspace:packages/script"],
-
-    "@opencode-harmony/sdk": ["@opencode-harmony/sdk@workspace:packages/sdk/js"],
-
-    "@opencode-harmony/security-scanner": ["@opencode-harmony/security-scanner@workspace:packages/security-scanner"],
-
-    "@opencode-harmony/slack": ["@opencode-harmony/slack@workspace:packages/slack"],
-
-    "@opencode-harmony/ui": ["@opencode-harmony/ui@workspace:packages/ui"],
-
-    "@opencode-harmony/util": ["@opencode-harmony/util@workspace:packages/util"],
-
-    "@opencode-harmony/web": ["@opencode-harmony/web@workspace:packages/web"],
-
     "@openrouter/ai-sdk-provider": ["@openrouter/ai-sdk-provider@1.5.2", "", { "dependencies": { "@openrouter/sdk": "^0.1.27" }, "peerDependencies": { "@toon-format/toon": "^2.0.0", "ai": "^5.0.0", "zod": "^3.24.1 || ^v4" }, "optionalPeers": ["@toon-format/toon"] }, "sha512-3Th0vmJ9pjnwcPc2H1f59Mb0LFvwaREZAScfOQIpUxAHjZ7ZawVKDP27qgsteZPmMYqccNMy4r4Y3kgUnNcKAg=="],
 
     "@openrouter/sdk": ["@openrouter/sdk@0.1.27", "", { "dependencies": { "zod": "^3.25.0 || ^4.0.0" } }, "sha512-RH//L10bSmc81q25zAZudiI4kNkLgxF2E+WU42vghp3N6TEvZ6F0jK7uT3tOxkEn91gzmMw9YVmDENy7SJsajQ=="],
@@ -1806,6 +1772,40 @@
 
     "@tauri-apps/plugin-window-state": ["@tauri-apps/plugin-window-state@2.4.1", "", { "dependencies": { "@tauri-apps/api": "^2.8.0" } }, "sha512-OuvdrzyY8Q5Dbzpj+GcrnV1iCeoZbcFdzMjanZMMcAEUNy/6PH5pxZPXpaZLOR7whlzXiuzx0L9EKZbH7zpdRw=="],
 
+    "@thesolaceproject/code-harmony-app": ["@thesolaceproject/code-harmony-app@workspace:packages/app"],
+
+    "@thesolaceproject/code-harmony-console-app": ["@thesolaceproject/code-harmony-console-app@workspace:packages/console/app"],
+
+    "@thesolaceproject/code-harmony-console-core": ["@thesolaceproject/code-harmony-console-core@workspace:packages/console/core"],
+
+    "@thesolaceproject/code-harmony-console-function": ["@thesolaceproject/code-harmony-console-function@workspace:packages/console/function"],
+
+    "@thesolaceproject/code-harmony-console-mail": ["@thesolaceproject/code-harmony-console-mail@workspace:packages/console/mail"],
+
+    "@thesolaceproject/code-harmony-console-resource": ["@thesolaceproject/code-harmony-console-resource@workspace:packages/console/resource"],
+
+    "@thesolaceproject/code-harmony-desktop": ["@thesolaceproject/code-harmony-desktop@workspace:packages/desktop"],
+
+    "@thesolaceproject/code-harmony-enterprise": ["@thesolaceproject/code-harmony-enterprise@workspace:packages/enterprise"],
+
+    "@thesolaceproject/code-harmony-function": ["@thesolaceproject/code-harmony-function@workspace:packages/function"],
+
+    "@thesolaceproject/code-harmony-plugin": ["@thesolaceproject/code-harmony-plugin@workspace:packages/plugin"],
+
+    "@thesolaceproject/code-harmony-script": ["@thesolaceproject/code-harmony-script@workspace:packages/script"],
+
+    "@thesolaceproject/code-harmony-sdk": ["@thesolaceproject/code-harmony-sdk@workspace:packages/sdk/js"],
+
+    "@thesolaceproject/code-harmony-security-scanner": ["@thesolaceproject/code-harmony-security-scanner@workspace:packages/security-scanner"],
+
+    "@thesolaceproject/code-harmony-slack": ["@thesolaceproject/code-harmony-slack@workspace:packages/slack"],
+
+    "@thesolaceproject/code-harmony-ui": ["@thesolaceproject/code-harmony-ui@workspace:packages/ui"],
+
+    "@thesolaceproject/code-harmony-util": ["@thesolaceproject/code-harmony-util@workspace:packages/util"],
+
+    "@thesolaceproject/code-harmony-web": ["@thesolaceproject/code-harmony-web@workspace:packages/web"],
+
     "@thisbeyond/solid-dnd": ["@thisbeyond/solid-dnd@0.7.5", "", { "peerDependencies": { "solid-js": "^1.5" } }, "sha512-DfI5ff+yYGpK9M21LhYwIPlbP2msKxN2ARwuu6GF8tT1GgNVDTI8VCQvH4TJFoVApP9d44izmAcTh/iTCH2UUw=="],
 
     "@tokenizer/token": ["@tokenizer/token@0.3.0", "", {}, "sha512-OvjF+z51L3ov0OyAU0duzsYuvO01PH7x4t6DJx+guahgTnBHkhJdG7soQeTSFLWN3efnHyibZ4Z8l2EuWwJN3A=="],
@@ -2210,7 +2210,7 @@
 
     "clsx": ["clsx@2.1.1", "", {}, "sha512-eYm0QWBtUrBWZWG0d386OGAw16Z995PiOVo2B7bjWSbHedGl5e0ZWaq65kOGgUSNesEIDkB9ISbTg/JK9dhCZA=="],
 
-    "code-harmony": ["code-harmony@workspace:packages/opencode"],
+    "code-harmony": ["code-harmony@workspace:packages/code-harmony"],
 
     "collapse-white-space": ["collapse-white-space@2.1.0", "", {}, "sha512-loKTxY1zCOuG4j9f6EPnuyyYkf58RnhhWTvRoZEokgB+WbdXehfjFviyOVYkqzEWz1Q5kRiZdBYS5SwxbQYwzw=="],
 
@@ -4190,12 +4190,6 @@
 
     "@openauthjs/openauth/jose": ["jose@5.9.6", "", {}, "sha512-AMlnetc9+CV9asI19zHmrgS/WYsWUwCn2R7RzlbJWD7F9eWYUTGyBmU9o6PxngtLGOiDGPRu+Uc4fhKzbpteZQ=="],
 
-    "@opencode-harmony/desktop/@actions/artifact": ["@actions/artifact@4.0.0", "", { "dependencies": { "@actions/core": "^1.10.0", "@actions/github": "^6.0.1", "@actions/http-client": "^2.1.0", "@azure/core-http": "^3.0.5", "@azure/storage-blob": "^12.15.0", "@octokit/core": "^5.2.1", "@octokit/plugin-request-log": "^1.0.4", "@octokit/plugin-retry": "^3.0.9", "@octokit/request": "^8.4.1", "@octokit/request-error": "^5.1.1", "@protobuf-ts/plugin": "^2.2.3-alpha.1", "archiver": "^7.0.1", "jwt-decode": "^3.1.2", "unzip-stream": "^0.3.1" } }, "sha512-HCc2jMJRAfviGFAh0FsOR/jNfWhirxl7W6z8zDtttt0GltwxBLdEIjLiweOPFl9WbyJRW1VWnPUSAixJqcWUMQ=="],
-
-    "@opencode-harmony/desktop/typescript": ["typescript@5.6.3", "", { "bin": { "tsc": "bin/tsc", "tsserver": "bin/tsserver" } }, "sha512-hjcS1mhfuyi4WW8IWtjP7brDrG2cuDZukyrYrSauoXGNgx0S7zceP07adYkJycEr56BOUTNPzbInooiN3fn1qw=="],
-
-    "@opencode-harmony/web/@shikijs/transformers": ["@shikijs/transformers@3.4.2", "", { "dependencies": { "@shikijs/core": "3.4.2", "@shikijs/types": "3.4.2" } }, "sha512-I5baLVi/ynLEOZoWSAMlACHNnG+yw5HDmse0oe+GW6U1u+ULdEB3UHiVWaHoJSSONV7tlcVxuaMy74sREDkSvg=="],
-
     "@opentui/solid/@babel/core": ["@babel/core@7.28.0", "", { "dependencies": { "@ampproject/remapping": "^2.2.0", "@babel/code-frame": "^7.27.1", "@babel/generator": "^7.28.0", "@babel/helper-compilation-targets": "^7.27.2", "@babel/helper-module-transforms": "^7.27.3", "@babel/helpers": "^7.27.6", "@babel/parser": "^7.28.0", "@babel/template": "^7.27.2", "@babel/traverse": "^7.28.0", "@babel/types": "^7.28.0", "convert-source-map": "^2.0.0", "debug": "^4.1.0", "gensync": "^1.0.0-beta.2", "json5": "^2.2.3", "semver": "^6.3.1" } }, "sha512-UlLAnTPrFdNGoFtbSXwcGFQBtQZJCNjaN6hQNP3UPvuNXT1i82N26KL3dZeIpNalWywr9IuQuncaAfUaS1g6sQ=="],
 
     "@opentui/solid/babel-preset-solid": ["babel-preset-solid@1.9.9", "", { "dependencies": { "babel-plugin-jsx-dom-expressions": "^0.40.1" }, "peerDependencies": { "@babel/core": "^7.0.0", "solid-js": "^1.9.8" }, "optionalPeers": ["solid-js"] }, "sha512-pCnxWrciluXCeli/dj5PIEHgbNzim3evtTn12snjqqg8QZWJNMjH1AWIp4iG/tbVjqQ72aBEymMSagvmgxubXw=="],
@@ -4267,6 +4261,12 @@
     "@tanstack/directive-functions-plugin/@babel/code-frame": ["@babel/code-frame@7.27.1", "", { "dependencies": { "@babel/helper-validator-identifier": "^7.27.1", "js-tokens": "^4.0.0", "picocolors": "^1.1.1" } }, "sha512-cjQ7ZlQ0Mv3b47hABuTevyTuYN4i+loJKGeV9flcCgIK37cCXRh+L1bd3iBHlynerhQ7BhCkn2BPbQUL+rGqFg=="],
 
     "@tanstack/server-functions-plugin/@babel/code-frame": ["@babel/code-frame@7.27.1", "", { "dependencies": { "@babel/helper-validator-identifier": "^7.27.1", "js-tokens": "^4.0.0", "picocolors": "^1.1.1" } }, "sha512-cjQ7ZlQ0Mv3b47hABuTevyTuYN4i+loJKGeV9flcCgIK37cCXRh+L1bd3iBHlynerhQ7BhCkn2BPbQUL+rGqFg=="],
+
+    "@thesolaceproject/code-harmony-desktop/@actions/artifact": ["@actions/artifact@4.0.0", "", { "dependencies": { "@actions/core": "^1.10.0", "@actions/github": "^6.0.1", "@actions/http-client": "^2.1.0", "@azure/core-http": "^3.0.5", "@azure/storage-blob": "^12.15.0", "@octokit/core": "^5.2.1", "@octokit/plugin-request-log": "^1.0.4", "@octokit/plugin-retry": "^3.0.9", "@octokit/request": "^8.4.1", "@octokit/request-error": "^5.1.1", "@protobuf-ts/plugin": "^2.2.3-alpha.1", "archiver": "^7.0.1", "jwt-decode": "^3.1.2", "unzip-stream": "^0.3.1" } }, "sha512-HCc2jMJRAfviGFAh0FsOR/jNfWhirxl7W6z8zDtttt0GltwxBLdEIjLiweOPFl9WbyJRW1VWnPUSAixJqcWUMQ=="],
+
+    "@thesolaceproject/code-harmony-desktop/typescript": ["typescript@5.6.3", "", { "bin": { "tsc": "bin/tsc", "tsserver": "bin/tsserver" } }, "sha512-hjcS1mhfuyi4WW8IWtjP7brDrG2cuDZukyrYrSauoXGNgx0S7zceP07adYkJycEr56BOUTNPzbInooiN3fn1qw=="],
+
+    "@thesolaceproject/code-harmony-web/@shikijs/transformers": ["@shikijs/transformers@3.4.2", "", { "dependencies": { "@shikijs/core": "3.4.2", "@shikijs/types": "3.4.2" } }, "sha512-I5baLVi/ynLEOZoWSAMlACHNnG+yw5HDmse0oe+GW6U1u+ULdEB3UHiVWaHoJSSONV7tlcVxuaMy74sREDkSvg=="],
 
     "accepts/mime-types": ["mime-types@2.1.35", "", { "dependencies": { "mime-db": "1.52.0" } }, "sha512-ZDY+bPm5zTTF+YpCrAU9nK0UgICYPT0QtT1NZWFv4s++TNkcgVaT0g6+4R2uI4MjQjzysHB1zxuWL50hzaeXiw=="],
 
@@ -4636,12 +4636,6 @@
 
     "@octokit/rest/@octokit/core/before-after-hook": ["before-after-hook@4.0.0", "", {}, "sha512-q6tR3RPqIB1pMiTRMFcZwuG5T8vwp+vUvEG0vuI6B+Rikh5BfPp2fQ82c925FOs+b0lcFQ8CFrL+KbilfZFhOQ=="],
 
-    "@opencode-harmony/desktop/@actions/artifact/@actions/http-client": ["@actions/http-client@2.2.3", "", { "dependencies": { "tunnel": "^0.0.6", "undici": "^5.25.4" } }, "sha512-mx8hyJi/hjFvbPokCg4uRd4ZX78t+YyRPtnKWwIl+RzNaVuFpQHfmlGVfsKEJN8LwTCvL+DfVgAM04XaHkm6bA=="],
-
-    "@opencode-harmony/web/@shikijs/transformers/@shikijs/core": ["@shikijs/core@3.4.2", "", { "dependencies": { "@shikijs/types": "3.4.2", "@shikijs/vscode-textmate": "^10.0.2", "@types/hast": "^3.0.4", "hast-util-to-html": "^9.0.5" } }, "sha512-AG8vnSi1W2pbgR2B911EfGqtLE9c4hQBYkv/x7Z+Kt0VxhgQKcW7UNDVYsu9YxwV6u+OJrvdJrMq6DNWoBjihQ=="],
-
-    "@opencode-harmony/web/@shikijs/transformers/@shikijs/types": ["@shikijs/types@3.4.2", "", { "dependencies": { "@shikijs/vscode-textmate": "^10.0.2", "@types/hast": "^3.0.4" } }, "sha512-zHC1l7L+eQlDXLnxvM9R91Efh2V4+rN3oMVS2swCBssbj2U/FBwybD1eeLaq8yl/iwT+zih8iUbTBCgGZOYlVg=="],
-
     "@opentui/solid/@babel/core/semver": ["semver@6.3.1", "", { "bin": { "semver": "bin/semver.js" } }, "sha512-BR7VvDCVHO+q2xBEWskxS6DJE1qRnb7DxzUrogb71CWoSficBxYsiAGd+Kl0mmq/MprG9yArRkyrQxTO6XjMzA=="],
 
     "@pierre/diffs/@shikijs/core/@shikijs/types": ["@shikijs/types@3.20.0", "", { "dependencies": { "@shikijs/vscode-textmate": "^10.0.2", "@types/hast": "^3.0.4" } }, "sha512-lhYAATn10nkZcBQ0BlzSbJA3wcmL5MXUUF8d2Zzon6saZDlToKaiRX60n2+ZaHJCmXEcZRWNzn+k9vplr8Jhsw=="],
@@ -4681,6 +4675,12 @@
     "@solidjs/start/shiki/@shikijs/types": ["@shikijs/types@1.29.2", "", { "dependencies": { "@shikijs/vscode-textmate": "^10.0.1", "@types/hast": "^3.0.4" } }, "sha512-VJjK0eIijTZf0QSTODEXCqinjBn0joAHQ+aPSBzrv4O2d/QSbsMw+ZeSRx03kV34Hy7NzUvV/7NqfYGRLrASmw=="],
 
     "@tailwindcss/oxide-wasm32-wasi/@napi-rs/wasm-runtime/@tybys/wasm-util": ["@tybys/wasm-util@0.10.1", "", { "dependencies": { "tslib": "^2.4.0" } }, "sha512-9tTaPJLSiejZKx+Bmog4uSubteqTvFrVrURwkmHixBo0G4seD0zUxp98E1DzUBJxLQ3NPwXrGKDiVjwx/DpPsg=="],
+
+    "@thesolaceproject/code-harmony-desktop/@actions/artifact/@actions/http-client": ["@actions/http-client@2.2.3", "", { "dependencies": { "tunnel": "^0.0.6", "undici": "^5.25.4" } }, "sha512-mx8hyJi/hjFvbPokCg4uRd4ZX78t+YyRPtnKWwIl+RzNaVuFpQHfmlGVfsKEJN8LwTCvL+DfVgAM04XaHkm6bA=="],
+
+    "@thesolaceproject/code-harmony-web/@shikijs/transformers/@shikijs/core": ["@shikijs/core@3.4.2", "", { "dependencies": { "@shikijs/types": "3.4.2", "@shikijs/vscode-textmate": "^10.0.2", "@types/hast": "^3.0.4", "hast-util-to-html": "^9.0.5" } }, "sha512-AG8vnSi1W2pbgR2B911EfGqtLE9c4hQBYkv/x7Z+Kt0VxhgQKcW7UNDVYsu9YxwV6u+OJrvdJrMq6DNWoBjihQ=="],
+
+    "@thesolaceproject/code-harmony-web/@shikijs/transformers/@shikijs/types": ["@shikijs/types@3.4.2", "", { "dependencies": { "@shikijs/vscode-textmate": "^10.0.2", "@types/hast": "^3.0.4" } }, "sha512-zHC1l7L+eQlDXLnxvM9R91Efh2V4+rN3oMVS2swCBssbj2U/FBwybD1eeLaq8yl/iwT+zih8iUbTBCgGZOYlVg=="],
 
     "accepts/mime-types/mime-db": ["mime-db@1.52.0", "", {}, "sha512-sPU4uV7dYlvtWJxwwxHD0PuihVNiE7TyAbQ5SWxDCB9mUYvOgroQOwYQQOKPJ8CIbE+1ETVlOoK1UC2nU3gYvg=="],
 

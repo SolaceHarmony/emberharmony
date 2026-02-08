@@ -29,7 +29,7 @@ async function main() {
   }
 
   console.log("Checking out beta branch...")
-  const checkoutBeta = await $`git checkout -B beta origin/dev`.nothrow()
+  const checkoutBeta = await $`git checkout -B beta origin/main`.nothrow()
   if (checkoutBeta.exitCode !== 0) {
     throw new Error(`Failed to checkout beta branch: ${checkoutBeta.stderr}`)
   }

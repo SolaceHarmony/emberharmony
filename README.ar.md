@@ -9,9 +9,9 @@
 </p>
 <p align="center">وكيل برمجة بالذكاء الاصطناعي مفتوح المصدر.</p>
 <p align="center">
-  <a href="https://github.com/SolaceHarmony/code-harmony/discussions"><img alt="Discord" src="https://img.shields.io/discord/1391832426048651334?style=flat-square&label=discord" /></a>
+  <a href="https://github.com/sydneyrenee/code-harmony/discussions"><img alt="Discord" src="https://img.shields.io/discord/1391832426048651334?style=flat-square&label=discord" /></a>
   <a href="https://www.npmjs.com/package/code-harmony"><img alt="npm" src="https://img.shields.io/npm/v/code-harmony?style=flat-square" /></a>
-  <a href="https://github.com/SolaceHarmony/code-harmony/actions/workflows/publish.yml"><img alt="Build status" src="https://img.shields.io/github/actions/workflow/status/SolaceHarmony/code-harmony/publish.yml?style=flat-square&branch=dev" /></a>
+  <a href="https://github.com/sydneyrenee/code-harmony/actions/workflows/publish.yml"><img alt="Build status" src="https://img.shields.io/github/actions/workflow/status/sydneyrenee/code-harmony/publish.yml?style=flat-square&branch=main" /></a>
 </p>
 
 <p align="center">
@@ -40,7 +40,7 @@
 
 ```bash
 # YOLO
-curl -fsSL https://raw.githubusercontent.com/SolaceHarmony/code-harmony/dev/install | bash
+curl -fsSL https://raw.githubusercontent.com/sydneyrenee/code-harmony/main/install | bash
 
 # مديري الحزم
 npm i -g code-harmony@latest        # او bun/pnpm/yarn
@@ -48,7 +48,7 @@ scoop install code-harmony             # Windows
 choco install code-harmony             # Windows
 paru -S code-harmony-bin               # Arch Linux
 mise use -g code-harmony               # اي نظام
-nix run nixpkgs#code-harmony           # او github:SolaceHarmony/code-harmony لاحدث فرع dev
+nix run nixpkgs#code-harmony           # او github:sydneyrenee/code-harmony لاحدث فرع dev
 ```
 
 > [!TIP]
@@ -56,18 +56,18 @@ nix run nixpkgs#code-harmony           # او github:SolaceHarmony/code-harmony 
 
 ### تطبيق سطح المكتب (BETA)
 
-يتوفر CodeHarmony ايضا كتطبيق سطح مكتب. قم بالتنزيل مباشرة من [صفحة الاصدارات](https://github.com/SolaceHarmony/code-harmony/releases) او من [solace.ofharmony.ai/download](https://github.com/SolaceHarmony/code-harmony/releases).
+يتوفر CodeHarmony ايضا كتطبيق سطح مكتب. قم بالتنزيل مباشرة من [صفحة الاصدارات](https://github.com/sydneyrenee/code-harmony/releases) او من [solace.ofharmony.ai/download](https://github.com/sydneyrenee/code-harmony/releases).
 
-| المنصة                | التنزيل                               |
-| --------------------- | ------------------------------------- |
+| المنصة                | التنزيل                                   |
+| --------------------- | ----------------------------------------- |
 | macOS (Apple Silicon) | `code-harmony-desktop-darwin-aarch64.dmg` |
 | macOS (Intel)         | `code-harmony-desktop-darwin-x64.dmg`     |
 | Windows               | `code-harmony-desktop-windows-x64.exe`    |
-| Linux                 | `.deb` او `.rpm` او AppImage          |
+| Linux                 | `.deb` او `.rpm` او AppImage              |
 
 ```bash
 # Windows (Scoop)
-scoop bucket add extras; scoop install extras/code-harmony-desktop
+scoop bucket add extras; scoop install extras@thesolaceproject/code-harmony-desktop
 ```
 
 #### مجلد التثبيت
@@ -81,8 +81,8 @@ scoop bucket add extras; scoop install extras/code-harmony-desktop
 
 ```bash
 # امثلة
-CODE_HARMONY_INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/SolaceHarmony/code-harmony/dev/install | bash
-XDG_BIN_DIR=$HOME/.local/bin curl -fsSL https://raw.githubusercontent.com/SolaceHarmony/code-harmony/dev/install | bash
+CODE_HARMONY_INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/sydneyrenee/code-harmony/main/install | bash
+XDG_BIN_DIR=$HOME/.local/bin curl -fsSL https://raw.githubusercontent.com/sydneyrenee/code-harmony/main/install | bash
 ```
 
 ### Agents
@@ -110,7 +110,7 @@ XDG_BIN_DIR=$HOME/.local/bin curl -fsSL https://raw.githubusercontent.com/Solace
 
 ### البناء فوق CodeHarmony
 
-اذا كنت تعمل على مشروع مرتبط بـ CodeHarmony ويستخدم "opencode" كجزء من اسمه (مثل "opencode-dashboard" او "opencode-mobile")، يرجى اضافة ملاحظة في README توضح انه ليس مبنيا بواسطة فريق CodeHarmony ولا يرتبط بنا بأي شكل.
+اذا كنت تعمل على مشروع مرتبط بـ CodeHarmony ويستخدم "code-harmony" كجزء من اسمه (مثل "code-harmony-dashboard" او "code-harmony-mobile")، يرجى اضافة ملاحظة في README توضح انه ليس مبنيا بواسطة فريق CodeHarmony ولا يرتبط بنا بأي شكل.
 
 ### FAQ
 
@@ -126,4 +126,4 @@ XDG_BIN_DIR=$HOME/.local/bin curl -fsSL https://raw.githubusercontent.com/Solace
 
 ---
 
-**انضم الى مجتمعنا** [Discord](https://github.com/SolaceHarmony/code-harmony/discussions) | [X.com](https://github.com/SolaceHarmony/code-harmony)
+**انضم الى مجتمعنا** [Discord](https://github.com/sydneyrenee/code-harmony/discussions) | [X.com](https://github.com/sydneyrenee/code-harmony)

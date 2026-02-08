@@ -54,14 +54,14 @@ const VERSION = await (async () => {
     })
     .catch(() => undefined)
 
-  const local = await (async () => {
-    const paths = [
-      path.resolve(import.meta.dir, "../../app/package.json"),
-      path.resolve(import.meta.dir, "../../opencode/package.json"),
-    ]
-    for (const item of paths) {
-      const file = Bun.file(item)
-      const exists = await file.exists()
+	  const local = await (async () => {
+	    const paths = [
+	      path.resolve(import.meta.dir, "../../app/package.json"),
+	      path.resolve(import.meta.dir, "../../code-harmony/package.json"),
+	    ]
+	    for (const item of paths) {
+	      const file = Bun.file(item)
+	      const exists = await file.exists()
       if (!exists) continue
       const data = (await file.json()) as unknown
       if (typeof data !== "object" || !data) continue

@@ -27,7 +27,7 @@ permissions:
 jobs:
   version:
     runs-on: ubuntu-latest
-    if: github.repository == 'SolaceHarmony/code-harmony' && github.ref_name == 'dev' && (inputs.bump || inputs.version)
+    if: github.repository == 'sydneyrenee/code-harmony' && github.ref_name == 'main' && (inputs.bump || inputs.version)
     steps:
       - uses: actions/checkout@v3
         with:
@@ -51,7 +51,7 @@ jobs:
   build-cli:
     needs: version
     runs-on: ubuntu-latest
-    if: github.repository == 'SolaceHarmony/code-harmony'
+    if: github.repository == 'sydneyrenee/code-harmony'
     steps:
       - uses: actions/checkout@v3
         with:

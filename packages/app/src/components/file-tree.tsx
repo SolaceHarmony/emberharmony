@@ -1,8 +1,8 @@
 import { useFile } from "@/context/file"
-import { Collapsible } from "@opencode-harmony/ui/collapsible"
-import { FileIcon } from "@opencode-harmony/ui/file-icon"
-import { Icon } from "@opencode-harmony/ui/icon"
-import { Tooltip } from "@opencode-harmony/ui/tooltip"
+import { Collapsible } from "@thesolaceproject/code-harmony-ui/collapsible"
+import { FileIcon } from "@thesolaceproject/code-harmony-ui/file-icon"
+import { Icon } from "@thesolaceproject/code-harmony-ui/icon"
+import { Tooltip } from "@thesolaceproject/code-harmony-ui/tooltip"
 import {
   createEffect,
   createMemo,
@@ -16,7 +16,7 @@ import {
   type ParentProps,
 } from "solid-js"
 import { Dynamic } from "solid-js/web"
-import type { FileNode } from "@opencode-harmony/sdk/v2"
+import type { FileNode } from "@thesolaceproject/code-harmony-sdk/v2"
 
 type Kind = "add" | "del" | "mix"
 

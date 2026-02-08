@@ -1,8 +1,8 @@
 ;(function () {
-  var themeId = localStorage.getItem("opencode-theme-id")
+  var themeId = localStorage.getItem("code-harmony-theme-id")
   if (!themeId) return
 
-  var scheme = localStorage.getItem("opencode-color-scheme") || "system"
+  var scheme = localStorage.getItem("code-harmony-color-scheme") || "system"
   var isDark = scheme === "dark" || (scheme === "system" && matchMedia("(prefers-color-scheme: dark)").matches)
   var mode = isDark ? "dark" : "light"
 
@@ -11,10 +11,10 @@
 
   if (themeId === "oc-1") return
 
-  var css = localStorage.getItem("opencode-theme-css-" + themeId + "-" + mode)
+  var css = localStorage.getItem(isDark ? "code-harmony-theme-css-dark" : "code-harmony-theme-css-light")
   if (css) {
     var style = document.createElement("style")
-    style.id = "oc-theme-preload"
+    style.id = "code-harmony-theme-preload"
     style.textContent =
       ":root{color-scheme:" +
       mode +

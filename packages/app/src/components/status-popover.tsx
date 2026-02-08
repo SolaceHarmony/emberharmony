@@ -1,27 +1,27 @@
 import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js"
 import { createStore, reconcile } from "solid-js/store"
 import { useNavigate } from "@solidjs/router"
-import { useDialog } from "@opencode-harmony/ui/context/dialog"
-import { Popover } from "@opencode-harmony/ui/popover"
-import { Tabs } from "@opencode-harmony/ui/tabs"
-import { Button } from "@opencode-harmony/ui/button"
-import { Switch } from "@opencode-harmony/ui/switch"
-import { Icon } from "@opencode-harmony/ui/icon"
-import { Tooltip } from "@opencode-harmony/ui/tooltip"
+import { useDialog } from "@thesolaceproject/code-harmony-ui/context/dialog"
+import { Popover } from "@thesolaceproject/code-harmony-ui/popover"
+import { Tabs } from "@thesolaceproject/code-harmony-ui/tabs"
+import { Button } from "@thesolaceproject/code-harmony-ui/button"
+import { Switch } from "@thesolaceproject/code-harmony-ui/switch"
+import { Icon } from "@thesolaceproject/code-harmony-ui/icon"
+import { Tooltip } from "@thesolaceproject/code-harmony-ui/tooltip"
 import { useSync } from "@/context/sync"
 import { useSDK } from "@/context/sdk"
 import { normalizeServerUrl, serverDisplayName, useServer } from "@/context/server"
 import { usePlatform } from "@/context/platform"
 import { useLanguage } from "@/context/language"
-import { createOpencodeClient } from "@opencode-harmony/sdk/v2/client"
+import { createCodeHarmonyClient } from "@thesolaceproject/code-harmony-sdk/v2/client"
 import { DialogSelectServer } from "./dialog-select-server"
-import { showToast } from "@opencode-harmony/ui/toast"
+import { showToast } from "@thesolaceproject/code-harmony-ui/toast"
 
 type ServerStatus = { healthy: boolean; version?: string }
 
 async function checkHealth(url: string, platform: ReturnType<typeof usePlatform>): Promise<ServerStatus> {
   const signal = (AbortSignal as unknown as { timeout?: (ms: number) => AbortSignal }).timeout?.(3000)
-  const sdk = createOpencodeClient({
+  const sdk = createCodeHarmonyClient({
     baseUrl: url,
     fetch: platform.fetch,
     signal,
@@ -387,7 +387,7 @@ export function StatusPopover() {
                     <div class="text-14-regular text-text-base text-center my-auto">
                       {(() => {
                         const value = language.t("dialog.plugins.empty")
-                        const file = "opencode.json"
+                        const file = "code-harmony.json"
                         const parts = value.split(file)
                         if (parts.length === 1) return value
                         return (

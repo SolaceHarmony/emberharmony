@@ -141,8 +141,10 @@ async fn set_default_server_url(app: AppHandle, url: Option<String>) -> Result<(
 }
 
 fn get_sidecar_port() -> u32 {
-    option_env!("OPENCODE_PORT")
+    option_env!("CODE_HARMONY_PORT")
         .map(|s| s.to_string())
+        .or_else(|| std::env::var("CODE_HARMONY_PORT").ok())
+        .or_else(|| option_env!("OPENCODE_PORT").map(|s| s.to_string()))
         .or_else(|| std::env::var("OPENCODE_PORT").ok())
         .and_then(|port_str| port_str.parse().ok())
         .unwrap_or_else(|| {
@@ -164,10 +166,10 @@ fn spawn_sidecar(app: &AppHandle, hostname: &str, port: u32, password: &str) -> 
         app,
         format!("serve --hostname {hostname} --port {port}").as_str(),
     )
-    .env("OPENCODE_SERVER_USERNAME", "opencode")
-    .env("OPENCODE_SERVER_PASSWORD", password)
+    .env("CODE_HARMONY_SERVER_USERNAME", "code-harmony")
+    .env("CODE_HARMONY_SERVER_PASSWORD", password)
     .spawn()
-    .expect("Failed to spawn opencode");
+    .expect("Failed to spawn code-harmony");
 
     tauri::async_runtime::spawn(async move {
         while let Some(event) = rx.recv().await {
@@ -239,7 +241,7 @@ async fn check_server_health(url: &str, password: Option<&str>) -> bool {
     let mut req = client.get(health_url);
 
     if let Some(password) = password {
-        req = req.basic_auth("opencode", Some(password));
+        req = req.basic_auth("code-harmony", Some(password));
     }
 
     req.send()

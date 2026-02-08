@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 
 import { $ } from "bun"
-import { Script } from "@opencode-harmony/script"
+import { Script } from "@thesolaceproject/code-harmony-script"
 
 const highlightsTemplate = `
 <!--
@@ -75,7 +75,7 @@ if (Script.release) {
     }
 
     await $`git fetch origin`
-    await $`git cherry-pick HEAD..origin/dev`.nothrow()
+    await $`git cherry-pick HEAD..origin/main`.nothrow()
     await $`git push origin HEAD --tags --no-verify --force-with-lease`
   } else {
     console.log("Skipping git commit/tag/push (OPENCODE_SKIP_GIT=1)")
@@ -86,7 +86,7 @@ if (Script.release) {
 }
 
 console.log("\n=== cli ===\n")
-await import(`../packages/opencode/script/publish.ts`)
+await import(`../packages/code-harmony/script/publish.ts`)
 
 const publishAll = process.env.OPENCODE_PUBLISH_ALL === "1"
 

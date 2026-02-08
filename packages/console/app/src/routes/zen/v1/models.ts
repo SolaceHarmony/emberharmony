@@ -1,9 +1,9 @@
 import type { APIEvent } from "@solidjs/start/server"
-import { and, Database, eq, isNull } from "@opencode-harmony/console-core/drizzle/index.js"
-import { KeyTable } from "@opencode-harmony/console-core/schema/key.sql.js"
-import { WorkspaceTable } from "@opencode-harmony/console-core/schema/workspace.sql.js"
-import { ModelTable } from "@opencode-harmony/console-core/schema/model.sql.js"
-import { ZenData } from "@opencode-harmony/console-core/model.js"
+import { and, Database, eq, isNull } from "@thesolaceproject/code-harmony-console-core/drizzle/index.js"
+import { KeyTable } from "@thesolaceproject/code-harmony-console-core/schema/key.sql.js"
+import { WorkspaceTable } from "@thesolaceproject/code-harmony-console-core/schema/workspace.sql.js"
+import { ModelTable } from "@thesolaceproject/code-harmony-console-core/schema/model.sql.js"
+import { ZenData } from "@thesolaceproject/code-harmony-console-core/model.js"
 
 export async function OPTIONS(input: APIEvent) {
   return new Response(null, {

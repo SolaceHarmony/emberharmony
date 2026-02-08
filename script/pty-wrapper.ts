@@ -161,9 +161,10 @@ Options:
 
 const base = opts.url.endsWith("/") ? opts.url.slice(0, -1) : opts.url
 const auth = (() => {
-  const pass = process.env.OPENCODE_SERVER_PASSWORD
+  const pass = process.env.CODE_HARMONY_SERVER_PASSWORD ?? process.env.OPENCODE_SERVER_PASSWORD
   if (!pass) return undefined
-  const user = process.env.OPENCODE_SERVER_USERNAME ?? "opencode"
+  const user =
+    process.env.CODE_HARMONY_SERVER_USERNAME ?? process.env.OPENCODE_SERVER_USERNAME ?? "code-harmony"
   return `Basic ${btoa(`${user}:${pass}`)}`
 })()
 

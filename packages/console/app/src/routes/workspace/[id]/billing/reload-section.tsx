@@ -2,9 +2,9 @@ import { json, action, useParams, createAsync, useSubmission } from "@solidjs/ro
 import { createEffect, Show, createMemo } from "solid-js"
 import { createStore } from "solid-js/store"
 import { withActor } from "~/context/auth.withActor"
-import { Billing } from "@opencode-harmony/console-core/billing.js"
-import { Database, eq } from "@opencode-harmony/console-core/drizzle/index.js"
-import { BillingTable } from "@opencode-harmony/console-core/schema/billing.sql.js"
+import { Billing } from "@thesolaceproject/code-harmony-console-core/billing.js"
+import { Database, eq } from "@thesolaceproject/code-harmony-console-core/drizzle/index.js"
+import { BillingTable } from "@thesolaceproject/code-harmony-console-core/schema/billing.sql.js"
 import styles from "./reload-section.module.css"
 import { queryBillingInfo } from "../../common"
 

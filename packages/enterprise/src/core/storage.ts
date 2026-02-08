@@ -1,5 +1,5 @@
 import { AwsClient } from "aws4fetch"
-import { lazy } from "@opencode-harmony/util/lazy"
+import { lazy } from "@thesolaceproject/code-harmony-util/lazy"
 
 export namespace Storage {
   export interface Adapter {
