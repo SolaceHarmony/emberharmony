@@ -1,0 +1,20 @@
+{
+  "ignore": [
+    {
+      "file": "flake.lock",
+      "kind": "Nix SRI hash",
+      "reason": "Nix narHash values (integrity hashes), not secrets."
+    },
+    {
+      "file": "nix/hashes.json",
+      "kind": "Nix SRI hash",
+      "reason": "Nix fixed-output hashes for reproducible node_modules builds, not secrets."
+    },
+    {
+      "file": "packages/desktop/src-tauri/tauri.prod.conf.json",
+      "kind": "Tauri updater pubkey (base64)",
+      "reason": "Updater public key, not a secret. Keep private signing key out of repo."
+    }
+  ]
+}
+

@@ -1,0 +1,47 @@
+name: "Setup Git Committer"
+description: "Create app token and configure git user"
+inputs:
+  opencode-app-id:
+    description: "GitHub App ID (optional)"
+    required: false
+  opencode-app-secret:
+    description: "GitHub App private key (optional)"
+    required: false
+outputs:
+  token:
+    description: "GitHub token"
+    value: ${{ steps.apptoken.outputs.token || github.token }}
+  app-slug:
+    description: "GitHub bot slug"
+    value: ${{ steps.apptoken.outputs.app-slug || 'github-actions' }}
+runs:
+  using: "composite"
+  steps:
+    - name: Create app token
+      id: apptoken
+      if: ${{ inputs.opencode-app-id != '' && inputs.opencode-app-secret != '' }}
+      uses: actions/create-github-app-token@v2
+      with:
+        app-id: ${{ inputs.opencode-app-id }}
+        private-key: ${{ inputs.opencode-app-secret }}
+        owner: ${{ github.repository_owner }}
+
+    - name: Configure git user
+      env:
+        APP_SLUG: ${{ steps.apptoken.outputs.app-slug || 'github-actions' }}
+      run: |
+        git config --global user.name "${APP_SLUG}[bot]"
+        git config --global user.email "${APP_SLUG}[bot]@users.noreply.github.com"
+      shell: bash
+
+    - name: Clear checkout auth
+      run: |
+        git config --local --unset-all http.https://github.com/.extraheader || true
+      shell: bash
+
+    - name: Configure git remote
+      env:
+        TOKEN: ${{ steps.apptoken.outputs.token || github.token }}
+      run: |
+        git remote set-url origin https://x-access-token:${TOKEN}@github.com/${{ github.repository }}
+      shell: bash

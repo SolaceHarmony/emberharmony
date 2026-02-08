@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>ai.ofharmony.code</id>
+
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+
+  <name>CodeHarmony</name>
+  <summary>Open source AI coding agent</summary>
+
+  <developer id="ai.ofharmony">
+    <name>The Solace Project</name>
+  </developer>
+
+  <description>
+    <p>
+      CodeHarmony is an open source agent that helps you write and run code with any AI model.
+    </p>
+  </description>
+
+  <launchable type="desktop-id">ai.ofharmony.code.desktop</launchable>
+
+  <content_rating type="oars-1.1" />
+
+  <url type="bugtracker">https://github.com/SolaceHarmony/code-harmony/issues</url>
+  <url type="homepage">https://solace.ofharmony.ai</url>
+  <url type="vcs-browser">https://github.com/SolaceHarmony/code-harmony</url>
+
+  <screenshots>
+    <screenshot type="default">
+      <image>https://raw.githubusercontent.com/SolaceHarmony/code-harmony/dev/packages/web/src/assets/lander/screenshot.png</image>
+    </screenshot>
+  </screenshots>
+
+  <releases>
+    <release version="1.0.0" date="2026-02-08">
+      <url type="details">https://github.com/SolaceHarmony/code-harmony/releases/tag/v1.0.0</url>
+    </release>
+  </releases>
+</component>
