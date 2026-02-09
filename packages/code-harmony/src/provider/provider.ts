@@ -882,6 +882,7 @@ export namespace Provider {
       if (disabled.has(providerID)) continue
       const data = database[providerID]
       if (!data) {
+        if (providerID === "code-harmony") continue
         log.error("Provider does not exist in model list " + providerID)
         continue
       }
