@@ -51,7 +51,7 @@ export function NewUserSection() {
           </div>
           <div data-slot="feature">
             <h3>No Lock-in</h3>
-            <p>Use Zen with any coding agent, and continue using other providers with opencode whenever you want.</p>
+            <p>Use Zen with any coding agent, and continue using other providers with CodeHarmony whenever you want.</p>
           </div>
         </div>
 
@@ -90,11 +90,11 @@ export function NewUserSection() {
           <ol>
             <li>Enable billing</li>
             <li>
-              Run <code>opencode auth login</code> and select opencode
+              Run <code>code-harmony auth login</code> and select CodeHarmony
             </li>
             <li>Paste your API key</li>
             <li>
-              Start opencode and run <code>/models</code> to select a model
+              Start CodeHarmony and run <code>/models</code> to select a model
             </li>
           </ol>
         </div>
