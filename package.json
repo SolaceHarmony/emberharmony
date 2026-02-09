@@ -15,7 +15,7 @@
     "prepare": "husky",
     "random": "echo 'Random script'",
     "hello": "echo 'Hello World!'",
-    "test": "bun test"
+    "test": "bun run script/test.ts"
   },
   "workspaces": {
     "packages": [

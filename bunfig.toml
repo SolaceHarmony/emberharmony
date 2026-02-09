@@ -5,4 +5,4 @@ exact = true
 scanner = "./packages/security-scanner/src/index.ts"
 
 [test]
-root = "./do-not-run-tests-from-root"
+root = "./do-not-run-tests-from-root-missing"
