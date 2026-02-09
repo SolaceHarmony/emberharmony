@@ -71,8 +71,8 @@ detect_install_dir() {
         return
     fi
     # Backward compat for users that still set this.
-    if [ -n "${OPENCODE_INSTALL_DIR-}" ]; then
-        echo "$OPENCODE_INSTALL_DIR"
+    if [ -n "${CODE_HARMONY_INSTALL_DIR-}" ]; then
+        echo "$CODE_HARMONY_INSTALL_DIR"
         return
     fi
     if [ -n "${XDG_BIN_DIR-}" ]; then
@@ -282,7 +282,7 @@ download_with_progress() {
     fi
 
     local tmp_dir=${TMPDIR:-/tmp}
-    local basename="${tmp_dir}/opencode_harmony_install_$$"
+    local basename="${tmp_dir}/code_harmony_install_$$"
     local tracefile="${basename}.trace"
 
     rm -f "$tracefile"
@@ -333,7 +333,7 @@ download_with_progress() {
 
 download_and_install() {
     print_message info "\n${MUTED}Installing ${NC}${APP} ${MUTED}version: ${NC}$specific_version"
-    local tmp_dir="${TMPDIR:-/tmp}/opencode_harmony_install_$$"
+    local tmp_dir="${TMPDIR:-/tmp}/code_harmony_install_$$"
     mkdir -p "$tmp_dir"
 
     if [[ "$os" == "windows" ]] || ! [ -t 2 ] || ! download_with_progress "$url" "$tmp_dir/$filename"; then

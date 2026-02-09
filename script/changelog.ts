@@ -244,8 +244,8 @@ export async function buildNotes(from: string, to: string) {
 
   const notes: string[] = []
 
-  if (!process.env.OPENCODE_API_KEY) {
-    console.log("OPENCODE_API_KEY is not set, using raw commits")
+  if (!process.env.CODE_HARMONY_API_KEY) {
+    console.log("CODE_HARMONY_API_KEY is not set, using raw commits")
     const grouped = new Map<string, string[]>()
 
     for (const commit of commits) {

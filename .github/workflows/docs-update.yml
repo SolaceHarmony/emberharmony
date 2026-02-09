@@ -43,9 +43,9 @@ jobs:
         if: steps.commits.outputs.has_commits == 'true'
         uses: sydneyrenee/code-harmony/github@latest
         env:
-          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          CODE_HARMONY_API_KEY: ${{ secrets.CODE_HARMONY_API_KEY }}
         with:
-          model: opencode/gpt-5.2
+          model: code-harmony/gpt-5.2
           agent: docs
           prompt: |
             Review the following commits from the last ${{ env.LOOKBACK_HOURS }} hours and identify any new features that may need documentation.

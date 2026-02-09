@@ -1,7 +1,7 @@
 const args = process.argv.slice(2)
 
 const opts = {
-  url: process.env.OPENCODE_SERVER_URL ?? "http://localhost:4096",
+  url: process.env.CODE_HARMONY_SERVER_URL ?? "http://localhost:4096",
   id: "",
   cmd: "",
   title: "",
@@ -161,9 +161,9 @@ Options:
 
 const base = opts.url.endsWith("/") ? opts.url.slice(0, -1) : opts.url
 const auth = (() => {
-  const pass = process.env.CODE_HARMONY_SERVER_PASSWORD ?? process.env.OPENCODE_SERVER_PASSWORD
+  const pass = process.env.CODE_HARMONY_SERVER_PASSWORD ?? process.env.CODE_HARMONY_SERVER_PASSWORD
   if (!pass) return undefined
-  const user = process.env.CODE_HARMONY_SERVER_USERNAME ?? process.env.OPENCODE_SERVER_USERNAME ?? "code-harmony"
+  const user = process.env.CODE_HARMONY_SERVER_USERNAME ?? process.env.CODE_HARMONY_SERVER_USERNAME ?? "code-harmony"
   return `Basic ${btoa(`${user}:${pass}`)}`
 })()
 

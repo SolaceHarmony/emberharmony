@@ -28,7 +28,7 @@ export function activate(context: vscode.ExtensionContext) {
     const env = terminal.creationOptions.env as Record<string, unknown> | undefined
     const portRaw =
       (typeof env?.["_EXTENSION_CODE_HARMONY_PORT"] === "string" && env?._EXTENSION_CODE_HARMONY_PORT) ||
-      (typeof env?.["_EXTENSION_OPENCODE_PORT"] === "string" && env?._EXTENSION_OPENCODE_PORT)
+      (typeof env?.["_EXTENSION_CODE_HARMONY_PORT"] === "string" && env?._EXTENSION_CODE_HARMONY_PORT)
     const port = portRaw ? parseInt(portRaw) : NaN
 
     if (!Number.isFinite(port)) {
@@ -58,9 +58,9 @@ export function activate(context: vscode.ExtensionContext) {
       env: {
         _EXTENSION_CODE_HARMONY_PORT: port.toString(),
         // Backwards compatibility for older tooling/scripts.
-        _EXTENSION_OPENCODE_PORT: port.toString(),
+        _EXTENSION_CODE_HARMONY_PORT: port.toString(),
         CODE_HARMONY_CALLER: "vscode",
-        OPENCODE_CALLER: "vscode",
+        CODE_HARMONY_CALLER: "vscode",
       },
     })
 

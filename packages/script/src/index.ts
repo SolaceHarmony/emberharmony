@@ -17,15 +17,15 @@ if (!semver.satisfies(process.versions.bun, expectedBunVersionRange)) {
 }
 
 const env = {
-  OPENCODE_CHANNEL: process.env["OPENCODE_CHANNEL"],
-  OPENCODE_BUMP: process.env["OPENCODE_BUMP"],
-  OPENCODE_VERSION: process.env["OPENCODE_VERSION"],
-  OPENCODE_RELEASE: process.env["OPENCODE_RELEASE"],
+  CODE_HARMONY_CHANNEL: process.env["CODE_HARMONY_CHANNEL"],
+  CODE_HARMONY_BUMP: process.env["CODE_HARMONY_BUMP"],
+  CODE_HARMONY_VERSION: process.env["CODE_HARMONY_VERSION"],
+  CODE_HARMONY_RELEASE: process.env["CODE_HARMONY_RELEASE"],
 }
 const CHANNEL = await (async () => {
-  if (env.OPENCODE_CHANNEL) return env.OPENCODE_CHANNEL
-  if (env.OPENCODE_BUMP) return "latest"
-  if (env.OPENCODE_VERSION && !env.OPENCODE_VERSION.startsWith("0.0.0-")) return "latest"
+  if (env.CODE_HARMONY_CHANNEL) return env.CODE_HARMONY_CHANNEL
+  if (env.CODE_HARMONY_BUMP) return "latest"
+  if (env.CODE_HARMONY_VERSION && !env.CODE_HARMONY_VERSION.startsWith("0.0.0-")) return "latest"
   return await $`git branch --show-current`.text().then((x) => x.trim())
 })()
 const IS_PREVIEW = CHANNEL !== "latest"
@@ -39,7 +39,7 @@ const bump = (current: string, kind: string | undefined) => {
 }
 
 const VERSION = await (async () => {
-  if (env.OPENCODE_VERSION) return env.OPENCODE_VERSION
+  if (env.CODE_HARMONY_VERSION) return env.CODE_HARMONY_VERSION
   if (IS_PREVIEW) return `0.0.0-${CHANNEL}-${new Date().toISOString().slice(0, 16).replace(/[-:T]/g, "")}`
 
   const npm = await fetch("https://registry.npmjs.org/code-harmony/latest")
@@ -78,7 +78,7 @@ const VERSION = await (async () => {
     .then((x) => (x.startsWith("v") ? x.slice(1) : x))
 
   const current = npm ?? local ?? (tag.length > 0 ? tag : "0.0.0")
-  return bump(current, env.OPENCODE_BUMP)
+  return bump(current, env.CODE_HARMONY_BUMP)
 })()
 
 export const Script = {
@@ -92,7 +92,7 @@ export const Script = {
     return IS_PREVIEW
   },
   get release() {
-    return env.OPENCODE_RELEASE
+    return env.CODE_HARMONY_RELEASE
   },
 }
 console.log(`code-harmony script`, JSON.stringify(Script, null, 2))

@@ -340,9 +340,9 @@ test("migrates mode field to agent field", async () => {
 test("loads config from .code-harmony directory", async () => {
   await using tmp = await tmpdir({
     init: async (dir) => {
-      const opencodeDir = path.join(dir, ".code-harmony")
-      await fs.mkdir(opencodeDir, { recursive: true })
-      const agentDir = path.join(opencodeDir, "agent")
+      const harmony = path.join(dir, ".code-harmony")
+      await fs.mkdir(harmony, { recursive: true })
+      const agentDir = path.join(harmony, "agent")
       await fs.mkdir(agentDir, { recursive: true })
 
       await Bun.write(
@@ -372,10 +372,10 @@ Test agent prompt`,
 test("loads agents from .code-harmony/agents (plural)", async () => {
   await using tmp = await tmpdir({
     init: async (dir) => {
-      const opencodeDir = path.join(dir, ".code-harmony")
-      await fs.mkdir(opencodeDir, { recursive: true })
+      const harmony = path.join(dir, ".code-harmony")
+      await fs.mkdir(harmony, { recursive: true })
 
-      const agentsDir = path.join(opencodeDir, "agents")
+      const agentsDir = path.join(harmony, "agents")
       await fs.mkdir(path.join(agentsDir, "nested"), { recursive: true })
 
       await Bun.write(
@@ -423,10 +423,10 @@ Nested agent prompt`,
 test("loads commands from .code-harmony/command (singular)", async () => {
   await using tmp = await tmpdir({
     init: async (dir) => {
-      const opencodeDir = path.join(dir, ".code-harmony")
-      await fs.mkdir(opencodeDir, { recursive: true })
+      const harmony = path.join(dir, ".code-harmony")
+      await fs.mkdir(harmony, { recursive: true })
 
-      const commandDir = path.join(opencodeDir, "command")
+      const commandDir = path.join(harmony, "command")
       await fs.mkdir(path.join(commandDir, "nested"), { recursive: true })
 
       await Bun.write(
@@ -468,10 +468,10 @@ Nested command template`,
 test("loads commands from .code-harmony/commands (plural)", async () => {
   await using tmp = await tmpdir({
     init: async (dir) => {
-      const opencodeDir = path.join(dir, ".code-harmony")
-      await fs.mkdir(opencodeDir, { recursive: true })
+      const harmony = path.join(dir, ".code-harmony")
+      await fs.mkdir(harmony, { recursive: true })
 
-      const commandsDir = path.join(opencodeDir, "commands")
+      const commandsDir = path.join(harmony, "commands")
       await fs.mkdir(path.join(commandsDir, "nested"), { recursive: true })
 
       await Bun.write(
@@ -592,8 +592,8 @@ test("merges plugin arrays from global and local configs", async () => {
     init: async (dir) => {
       // Create a nested project structure with local .code-harmony config
       const projectDir = path.join(dir, "project")
-      const opencodeDir = path.join(projectDir, ".code-harmony")
-      await fs.mkdir(opencodeDir, { recursive: true })
+      const harmony = path.join(projectDir, ".code-harmony")
+      await fs.mkdir(harmony, { recursive: true })
 
       // Global config with plugins
       await Bun.write(
@@ -606,7 +606,7 @@ test("merges plugin arrays from global and local configs", async () => {
 
       // Local .code-harmony config with different plugins
       await Bun.write(
-        path.join(opencodeDir, "code-harmony.json"),
+        path.join(harmony, "code-harmony.json"),
         JSON.stringify({
           $schema: "https://solace.ofharmony.ai/config.json",
           plugin: ["local-plugin-1"],
@@ -636,9 +636,9 @@ test("merges plugin arrays from global and local configs", async () => {
 test("does not error when only custom agent is a subagent", async () => {
   await using tmp = await tmpdir({
     init: async (dir) => {
-      const opencodeDir = path.join(dir, ".code-harmony")
-      await fs.mkdir(opencodeDir, { recursive: true })
-      const agentDir = path.join(opencodeDir, "agent")
+      const harmony = path.join(dir, ".code-harmony")
+      await fs.mkdir(harmony, { recursive: true })
+      const agentDir = path.join(harmony, "agent")
       await fs.mkdir(agentDir, { recursive: true })
 
       await Bun.write(
@@ -669,8 +669,8 @@ test("merges instructions arrays from global and local configs", async () => {
   await using tmp = await tmpdir({
     init: async (dir) => {
       const projectDir = path.join(dir, "project")
-      const opencodeDir = path.join(projectDir, ".code-harmony")
-      await fs.mkdir(opencodeDir, { recursive: true })
+      const harmony = path.join(projectDir, ".code-harmony")
+      await fs.mkdir(harmony, { recursive: true })
 
       await Bun.write(
         path.join(dir, "code-harmony.json"),
@@ -681,7 +681,7 @@ test("merges instructions arrays from global and local configs", async () => {
       )
 
       await Bun.write(
-        path.join(opencodeDir, "code-harmony.json"),
+        path.join(harmony, "code-harmony.json"),
         JSON.stringify({
           $schema: "https://solace.ofharmony.ai/config.json",
           instructions: ["local-instructions.md"],
@@ -708,8 +708,8 @@ test("deduplicates duplicate instructions from global and local configs", async 
   await using tmp = await tmpdir({
     init: async (dir) => {
       const projectDir = path.join(dir, "project")
-      const opencodeDir = path.join(projectDir, ".code-harmony")
-      await fs.mkdir(opencodeDir, { recursive: true })
+      const harmony = path.join(projectDir, ".code-harmony")
+      await fs.mkdir(harmony, { recursive: true })
 
       await Bun.write(
         path.join(dir, "code-harmony.json"),
@@ -720,7 +720,7 @@ test("deduplicates duplicate instructions from global and local configs", async 
       )
 
       await Bun.write(
-        path.join(opencodeDir, "code-harmony.json"),
+        path.join(harmony, "code-harmony.json"),
         JSON.stringify({
           $schema: "https://solace.ofharmony.ai/config.json",
           instructions: ["duplicate.md", "local-only.md"],
@@ -751,8 +751,8 @@ test("deduplicates duplicate plugins from global and local configs", async () =>
     init: async (dir) => {
       // Create a nested project structure with local .code-harmony config
       const projectDir = path.join(dir, "project")
-      const opencodeDir = path.join(projectDir, ".code-harmony")
-      await fs.mkdir(opencodeDir, { recursive: true })
+      const harmony = path.join(projectDir, ".code-harmony")
+      await fs.mkdir(harmony, { recursive: true })
 
       // Global config with plugins
       await Bun.write(
@@ -765,7 +765,7 @@ test("deduplicates duplicate plugins from global and local configs", async () =>
 
       // Local .code-harmony config with some overlapping plugins
       await Bun.write(
-        path.join(opencodeDir, "code-harmony.json"),
+        path.join(harmony, "code-harmony.json"),
         JSON.stringify({
           $schema: "https://solace.ofharmony.ai/config.json",
           plugin: ["duplicate-plugin", "local-plugin-1"],
@@ -1301,10 +1301,10 @@ test("local .code-harmony config can override MCP from project config", async ()
         }),
       )
       // Local .code-harmony directory config enables it
-      const opencodeDir = path.join(dir, ".code-harmony")
-      await fs.mkdir(opencodeDir, { recursive: true })
+      const harmony = path.join(dir, ".code-harmony")
+      await fs.mkdir(harmony, { recursive: true })
       await Bun.write(
-        path.join(opencodeDir, "code-harmony.json"),
+        path.join(harmony, "code-harmony.json"),
         JSON.stringify({
           $schema: "https://solace.ofharmony.ai/config.json",
           mcp: {
@@ -1462,8 +1462,8 @@ describe("deduplicatePlugins", () => {
     await using tmp = await tmpdir({
       init: async (dir) => {
         const projectDir = path.join(dir, "project")
-        const opencodeDir = path.join(projectDir, ".code-harmony")
-        const pluginDir = path.join(opencodeDir, "plugin")
+        const harmony = path.join(projectDir, ".code-harmony")
+        const pluginDir = path.join(harmony, "plugin")
         await fs.mkdir(pluginDir, { recursive: true })
 
         await Bun.write(
@@ -1537,9 +1537,9 @@ describe("CODE_HARMONY_DISABLE_PROJECT_CONFIG", () => {
       await using tmp = await tmpdir({
         init: async (dir) => {
           // Create a .code-harmony directory with a command
-          const opencodeDir = path.join(dir, ".code-harmony", "command")
-          await fs.mkdir(opencodeDir, { recursive: true })
-          await Bun.write(path.join(opencodeDir, "test-cmd.md"), "# Test Command\nThis is a test command.")
+          const harmony = path.join(dir, ".code-harmony", "command")
+          await fs.mkdir(harmony, { recursive: true })
+          await Bun.write(path.join(harmony, "test-cmd.md"), "# Test Command\nThis is a test command.")
         },
       })
       await Instance.provide({
@@ -1547,8 +1547,8 @@ describe("CODE_HARMONY_DISABLE_PROJECT_CONFIG", () => {
         fn: async () => {
           const directories = await Config.directories()
           // Project .code-harmony should NOT be in directories list
-          const hasProjectOpencode = directories.some((d) => d.startsWith(tmp.path))
-          expect(hasProjectOpencode).toBe(false)
+          const hasProject = directories.some((d) => d.startsWith(tmp.path))
+          expect(hasProject).toBe(false)
         },
       })
     } finally {

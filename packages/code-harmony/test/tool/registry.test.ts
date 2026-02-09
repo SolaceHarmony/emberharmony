@@ -9,10 +9,10 @@ describe("tool.registry", () => {
   test("loads tools from .code-harmony/tool (singular)", async () => {
     await using tmp = await tmpdir({
       init: async (dir) => {
-        const opencodeDir = path.join(dir, ".code-harmony")
-        await fs.mkdir(opencodeDir, { recursive: true })
+        const harmony = path.join(dir, ".code-harmony")
+        await fs.mkdir(harmony, { recursive: true })
 
-        const toolDir = path.join(opencodeDir, "tool")
+        const toolDir = path.join(harmony, "tool")
         await fs.mkdir(toolDir, { recursive: true })
 
         await Bun.write(
@@ -43,10 +43,10 @@ describe("tool.registry", () => {
   test("loads tools from .code-harmony/tools (plural)", async () => {
     await using tmp = await tmpdir({
       init: async (dir) => {
-        const opencodeDir = path.join(dir, ".code-harmony")
-        await fs.mkdir(opencodeDir, { recursive: true })
+        const harmony = path.join(dir, ".code-harmony")
+        await fs.mkdir(harmony, { recursive: true })
 
-        const toolsDir = path.join(opencodeDir, "tools")
+        const toolsDir = path.join(harmony, "tools")
         await fs.mkdir(toolsDir, { recursive: true })
 
         await Bun.write(

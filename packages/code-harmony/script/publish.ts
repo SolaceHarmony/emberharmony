@@ -8,7 +8,7 @@ import { fileURLToPath } from "url"
 const dir = fileURLToPath(new URL("..", import.meta.url))
 process.chdir(dir)
 const root = path.resolve(dir, "..", "..")
-const publishName = process.env.OPENCODE_PUBLISH_NAME ?? pkg.name
+const publishName = process.env.CODE_HARMONY_PUBLISH_NAME ?? pkg.name
 const cliName = publishName.includes("/") ? publishName.split("/").pop() || publishName : publishName
 
 const binaries: Record<string, string> = {}
@@ -105,9 +105,9 @@ const publish = async (target: string) => {
   throw new Error(`npm publish failed after retries: ${last}`)
 }
 
-const publishPlatforms = process.env.OPENCODE_PUBLISH_PLATFORMS === "1"
+const publishPlatforms = process.env.CODE_HARMONY_PUBLISH_PLATFORMS === "1"
 if (!publishPlatforms) {
-  console.log("Skipping platform package publish (set OPENCODE_PUBLISH_PLATFORMS=1 to enable)")
+  console.log("Skipping platform package publish (set CODE_HARMONY_PUBLISH_PLATFORMS=1 to enable)")
 }
 if (publishPlatforms) {
   const items = entries.filter((entry) => entry.dir !== pkg.name)
@@ -187,7 +187,7 @@ if (!Script.preview) {
     `  cd "code-harmony-\${pkgver}"`,
     `  bun install`,
     "  cd ./packages/code-harmony",
-    `  OPENCODE_CHANNEL=latest OPENCODE_VERSION=${pkgver} bun run ./script/build.ts --single`,
+    `  CODE_HARMONY_CHANNEL=latest CODE_HARMONY_VERSION=${pkgver} bun run ./script/build.ts --single`,
     "}",
     "",
     "package() {",

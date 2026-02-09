@@ -8,7 +8,7 @@ import { fileURLToPath } from "url"
 
 import pkg from "../package.json"
 import { Script } from "@thesolaceproject/code-harmony-script"
-const publishName = process.env.OPENCODE_PUBLISH_NAME ?? pkg.name
+const publishName = process.env.CODE_HARMONY_PUBLISH_NAME ?? pkg.name
 const cliName = publishName.includes("/") ? publishName.split("/").pop() || publishName : publishName
 
 const __filename = fileURLToPath(import.meta.url)
@@ -111,13 +111,13 @@ const targets = singleFlag
     })
   : allTargets
 
-const allowTargets = process.env.OPENCODE_BUILD_TARGETS
-  ? process.env.OPENCODE_BUILD_TARGETS.split(",")
+const allowTargets = process.env.CODE_HARMONY_BUILD_TARGETS
+  ? process.env.CODE_HARMONY_BUILD_TARGETS.split(",")
       .map((item) => item.trim())
       .filter(Boolean)
   : []
 const allowSet = new Set(allowTargets)
-const skipClean = process.env.OPENCODE_BUILD_NO_CLEAN === "1"
+const skipClean = process.env.CODE_HARMONY_BUILD_NO_CLEAN === "1"
 if (!skipClean) {
   await $`rm -rf dist`
 }
@@ -169,11 +169,11 @@ for (const item of targets) {
     },
     entrypoints: ["./src/index.ts", parserWorker, workerPath],
     define: {
-      OPENCODE_VERSION: `'${Script.version}'`,
+      CODE_HARMONY_VERSION: `'${Script.version}'`,
       OTUI_TREE_SITTER_WORKER_PATH: bunfsRoot + workerRelativePath,
-      OPENCODE_WORKER_PATH: workerPath,
-      OPENCODE_CHANNEL: `'${Script.channel}'`,
-      OPENCODE_LIBC: item.os === "linux" ? `'${item.abi ?? "glibc"}'` : "",
+      CODE_HARMONY_WORKER_PATH: workerPath,
+      CODE_HARMONY_CHANNEL: `'${Script.channel}'`,
+      CODE_HARMONY_LIBC: item.os === "linux" ? `'${item.abi ?? "glibc"}'` : "",
     },
   })
 
