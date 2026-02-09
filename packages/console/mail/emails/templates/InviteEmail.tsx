@@ -24,7 +24,7 @@ interface InviteEmailProps {
   assetsUrl: string
 }
 export const InviteEmail = ({
-  inviter = "test@anoma.ly",
+  inviter = "test@solace.ofharmony.ai",
   workspaceID = "wrk_01K6XFY7V53T8XN0A7X8G9BTN3",
   workspaceName = "anomaly",
   assetsUrl = `${CONSOLE_URL}email`,

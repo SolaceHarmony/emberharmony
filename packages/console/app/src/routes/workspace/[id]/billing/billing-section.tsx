@@ -139,7 +139,7 @@ export function BillingSection() {
       <div data-slot="section-title">
         <h2>Billing</h2>
         <p>
-          Manage payments methods. <a href="mailto:contact@anoma.ly">Contact us</a> if you have any questions.
+          Manage payments methods. <a href="mailto:sydney@solace.ofharmony.ai">Contact us</a> if you have any questions.
         </p>
       </div>
       <div data-slot="section-content">

@@ -32,7 +32,7 @@ export namespace AWS {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          FromEmailAddress: `CodeHarmony Zen <contact@anoma.ly>`,
+          FromEmailAddress: `CodeHarmony Zen <sydney@solace.ofharmony.ai>`,
           Destination: {
             ToAddresses: [input.to],
           },

@@ -33,7 +33,7 @@ ${body.email}`.trim()
 
     // Send email using AWS SES
     await AWS.sendEmail({
-      to: "contact@anoma.ly",
+      to: "sydney@solace.ofharmony.ai",
       subject: `Enterprise Inquiry from ${body.name}`,
       body: emailContent,
       replyTo: body.email,

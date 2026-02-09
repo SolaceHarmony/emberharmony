@@ -28,14 +28,14 @@ export default function TermsOfService() {
               </p>
 
               <p>
-                Email: <a href="mailto:contact@anoma.ly">contact@anoma.ly</a>
+                Email: <a href="mailto:sydney@solace.ofharmony.ai">sydney@solace.ofharmony.ai</a>
               </p>
 
               <p>
                 These Terms of Use (the "Terms") are a binding contract between you and{" "}
-                <strong>ANOMALY INNOVATIONS, INC.</strong> ("CodeHarmony," "we" and "us"). Your use of the Services in
-                any way means that you agree to all of these Terms, and these Terms will remain in effect while you use
-                the Services. These Terms include the provisions in this document as well as those in the Privacy Policy{" "}
+                <strong>THE SOLACE PROJECT</strong> ("CodeHarmony," "we" and "us"). Your use of the Services in any way
+                means that you agree to all of these Terms, and these Terms will remain in effect while you use the
+                Services. These Terms include the provisions in this document as well as those in the Privacy Policy{" "}
                 <a href="/legal/privacy-policy">https://solace.ofharmony.ai/legal/privacy-policy</a>.{" "}
                 <strong>
                   Your use of or participation in certain Services may also be subject to additional policies, rules
@@ -313,7 +313,7 @@ export default function TermsOfService() {
                 specified time of the trial. You must stop using a Paid Service before the end of the trial period in
                 order to avoid being charged for that Paid Service. If you cancel prior to the end of the trial period
                 and are inadvertently charged for a Paid Service, please contact us at{" "}
-                <a href="mailto:contact@anoma.ly">contact@anoma.ly</a>.
+                <a href="mailto:sydney@solace.ofharmony.ai">sydney@solace.ofharmony.ai</a>.
               </p>
 
               <h2 id="what-if-i-want-to-stop">What if I want to stop using the Services?</h2>
