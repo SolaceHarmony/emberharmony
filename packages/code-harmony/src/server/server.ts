@@ -536,7 +536,31 @@ export namespace Server {
               ...c.req.raw.headers,
               host: "app.solace.ofharmony.ai",
             },
-          })
+          }).catch(() => undefined)
+          if (!response) {
+            return c.html(
+              `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>CodeHarmony</title>
+    <style>
+      body{font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial;max-width:720px;margin:48px auto;padding:0 16px;line-height:1.4}
+      code{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;background:#f3f3f3;padding:2px 6px;border-radius:6px}
+      a{color:#0b5fff}
+    </style>
+  </head>
+  <body>
+    <h1>CodeHarmony server is running</h1>
+    <p>The hosted web UI (<code>app.solace.ofharmony.ai</code>) is not reachable from this machine right now.</p>
+    <p>If you're developing in the repo, run <code>npm run web</code> from the repo root to start the local web UI.</p>
+    <p>API health: <a href="/global/health">/global/health</a></p>
+    <p>API docs: <a href="/doc">/doc</a></p>
+  </body>
+</html>`,
+            )
+          }
           response.headers.set(
             "Content-Security-Policy",
             "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; media-src 'self' data:; connect-src 'self' data:",
