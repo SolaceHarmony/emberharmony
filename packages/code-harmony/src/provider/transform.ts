@@ -734,7 +734,7 @@ export namespace ProviderTransform {
   }
 
   export function error(providerID: string, error: APICallError) {
-    let message = error.message
+    const message = error.message
     if (providerID.includes("github-copilot") && error.statusCode === 403) {
       return "Please reauthenticate with the copilot provider to ensure your credentials work properly with CodeHarmony."
     }
@@ -743,6 +743,19 @@ export namespace ProviderTransform {
         message +
         "\n\nMake sure the model is enabled in your copilot settings: https://github.com/settings/copilot/features"
       )
+    }
+
+    const text = (error.responseBody ?? "") + "\n" + message
+    if (providerID === "lmstudio" && text.toLowerCase().includes("tokens to keep from the initial prompt")) {
+      return [
+        "LM Studio returned a context window error.",
+        "",
+        "Fixes:",
+        "1) In LM Studio, reload the model with a larger Context Length (n_ctx).",
+        "2) Or shorten your system prompt / agent instructions / chat history.",
+        "",
+        `Original error: ${message}`,
+      ].join("\n")
     }
 
     return message

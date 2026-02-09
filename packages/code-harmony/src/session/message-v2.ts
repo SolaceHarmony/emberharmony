@@ -666,6 +666,20 @@ export namespace MessageV2 {
   }
 
   export function fromError(e: unknown, ctx: { providerID: string }) {
+    const failed = iife(() => {
+      if (!(e instanceof Error)) return undefined
+      if (e.name !== "ProviderRequestFailedError") return undefined
+      if (!("data" in e)) return undefined
+      const schema = z.object({
+        providerID: z.string(),
+        url: z.string().optional(),
+        error: z.string(),
+      })
+      const parsed = schema.safeParse((e as { data?: unknown }).data)
+      if (!parsed.success) return undefined
+      return parsed.data
+    })
+
     switch (true) {
       case e instanceof DOMException && e.name === "AbortError":
         return new MessageV2.AbortedError(
@@ -693,6 +707,18 @@ export namespace MessageV2 {
               code: (e as SystemError).code ?? "",
               syscall: (e as SystemError).syscall ?? "",
               message: (e as SystemError).message ?? "",
+            },
+          },
+          { cause: e },
+        ).toObject()
+      case failed !== undefined:
+        return new MessageV2.APIError(
+          {
+            message: `Unable to connect to ${failed.providerID} at ${failed.url ?? "(unknown url)"}.\n\n${failed.error}`,
+            isRetryable: true,
+            metadata: {
+              providerID: failed.providerID,
+              url: failed.url ?? "",
             },
           },
           { cause: e },
