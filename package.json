@@ -98,7 +98,7 @@
   "overrides": {
     "@types/bun": "catalog:",
     "@types/node": "catalog:",
-    "@modelcontextprotocol/sdk": "1.25.2",
+    "@modelcontextprotocol/sdk": "1.26.0",
     "@remix-run/router": "1.23.2",
     "astro": "5.15.9",
     "diff": "8.0.3",
