@@ -1020,6 +1020,20 @@ export namespace Provider {
           ...opts,
           // @ts-ignore see here: https://github.com/oven-sh/bun/issues/16682
           timeout: false,
+        }).catch((error: unknown) => {
+          const url = (() => {
+            const base = options["baseURL"]
+            if (typeof base === "string") return base
+            if (base && typeof base === "object" && "toString" in base) return String(base)
+            if (typeof input === "string") return input
+            if (input && typeof input === "object" && "url" in input) return String((input as { url?: unknown }).url ?? "")
+            return ""
+          })()
+          throw new RequestFailedError({
+            providerID: model.providerID,
+            url,
+            error: error instanceof Error ? error.message : String(error),
+          })
         })
       }
 
@@ -1214,6 +1228,15 @@ export namespace Provider {
     "ProviderInitError",
     z.object({
       providerID: z.string(),
+    }),
+  )
+
+  export const RequestFailedError = NamedError.create(
+    "ProviderRequestFailedError",
+    z.object({
+      providerID: z.string(),
+      url: z.string().optional(),
+      error: z.string(),
     }),
   )
 }
