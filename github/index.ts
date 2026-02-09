@@ -377,7 +377,7 @@ function useIssueId() {
 }
 
 function useShareUrl() {
-  const env = (process.env["CODE_HARMONY_SHARE_URL"] ?? process.env["OPENCODE_SHARE_URL"] ?? "").trim()
+  const env = (process.env["CODE_HARMONY_SHARE_URL"] ?? "").trim()
   if (env.length) return env
   return isMock() ? "https://dev.solace.ofharmony.ai" : "https://solace.ofharmony.ai"
 }
