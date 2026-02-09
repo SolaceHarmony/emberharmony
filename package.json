@@ -15,6 +15,7 @@
     "prepare": "husky",
     "random": "echo 'Random script'",
     "hello": "echo 'Hello World!'",
+    "probe:ollama": "bun run script/ollama-cloud-probe.ts",
     "test": "bun run script/test.ts"
   },
   "workspaces": {
