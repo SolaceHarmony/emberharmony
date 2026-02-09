@@ -425,12 +425,12 @@ export namespace MCP {
         command: cmd,
         args,
         cwd,
-          env: {
-            ...process.env,
-            ...(cmd === "code-harmony" ? { BUN_BE_BUN: "1" } : {}),
-            ...mcp.environment,
-          },
-        })
+        env: {
+          ...process.env,
+          ...(cmd === "code-harmony" ? { BUN_BE_BUN: "1" } : {}),
+          ...mcp.environment,
+        },
+      })
       transport.stderr?.on("data", (chunk: Buffer) => {
         log.info(`mcp stderr: ${chunk.toString()}`, { key })
       })

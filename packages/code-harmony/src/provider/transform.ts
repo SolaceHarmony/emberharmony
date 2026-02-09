@@ -562,12 +562,12 @@ export namespace ProviderTransform {
       }
     }
 
-	    if (
-	      input.model.providerID === "baseten" ||
-	      (input.model.providerID === "code-harmony" && ["kimi-k2-thinking", "glm-4.6"].includes(input.model.api.id))
-	    ) {
-	      result["chat_template_args"] = { enable_thinking: true }
-	    }
+    if (
+      input.model.providerID === "baseten" ||
+      (input.model.providerID === "code-harmony" && ["kimi-k2-thinking", "glm-4.6"].includes(input.model.api.id))
+    ) {
+      result["chat_template_args"] = { enable_thinking: true }
+    }
 
     if (["zai", "zhipuai"].includes(input.model.providerID) && input.model.api.npm === "@ai-sdk/openai-compatible") {
       result["thinking"] = {
@@ -602,12 +602,12 @@ export namespace ProviderTransform {
         result["textVerbosity"] = "low"
       }
 
-	      if (input.model.providerID.startsWith("code-harmony")) {
-	        result["promptCacheKey"] = input.sessionID
-	        result["include"] = ["reasoning.encrypted_content"]
-	        result["reasoningSummary"] = "auto"
-	      }
-	    }
+      if (input.model.providerID.startsWith("code-harmony")) {
+        result["promptCacheKey"] = input.sessionID
+        result["include"] = ["reasoning.encrypted_content"]
+        result["reasoningSummary"] = "auto"
+      }
+    }
 
     if (input.model.providerID === "venice") {
       result["promptCacheKey"] = input.sessionID

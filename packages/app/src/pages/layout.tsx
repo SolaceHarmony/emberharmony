@@ -1651,15 +1651,15 @@ export default function Layout(props: ParentProps) {
     return (
       <div class={`relative size-8 shrink-0 rounded ${props.class ?? ""}`}>
         <div class="size-full rounded overflow-clip">
-            <Avatar
-              fallback={name()}
-              src={
+          <Avatar
+            fallback={name()}
+            src={
               props.project.id === harmony ? "https://solace.ofharmony.ai/favicon.svg" : props.project.icon?.override
             }
-              {...getAvatarColors(props.project.icon?.color)}
-              class="size-full rounded"
-              classList={{ "badge-mask": notifications().length > 0 && props.notify }}
-            />
+            {...getAvatarColors(props.project.icon?.color)}
+            class="size-full rounded"
+            classList={{ "badge-mask": notifications().length > 0 && props.notify }}
+          />
         </div>
         <Show when={notifications().length > 0 && props.notify}>
           <div

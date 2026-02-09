@@ -11,9 +11,7 @@ import * as fuzzysort from "fuzzysort"
 export function useConnected() {
   const sync = useSync()
   return createMemo(() =>
-    sync.data.provider.some(
-      (x) => x.id !== "code-harmony" || Object.values(x.models).some((y) => y.cost?.input !== 0),
-    ),
+    sync.data.provider.some((x) => x.id !== "code-harmony" || Object.values(x.models).some((y) => y.cost?.input !== 0)),
   )
 }
 

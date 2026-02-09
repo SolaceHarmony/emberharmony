@@ -72,7 +72,8 @@ export namespace Share {
       ? "https://api.dev.solace.ofharmony.ai"
       : "https://api.solace.ofharmony.ai")
 
-  const disabled = process.env["CODE_HARMONY_DISABLE_SHARE"] === "true" || process.env["CODE_HARMONY_DISABLE_SHARE"] === "1"
+  const disabled =
+    process.env["CODE_HARMONY_DISABLE_SHARE"] === "true" || process.env["CODE_HARMONY_DISABLE_SHARE"] === "1"
 
   export async function create(sessionID: string) {
     if (disabled) return { url: "", secret: "" }

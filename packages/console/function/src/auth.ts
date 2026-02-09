@@ -108,20 +108,20 @@ export default {
         let email: string | undefined
 
         if (response.provider === "github") {
-	          const emails = (await fetch("https://api.github.com/user/emails", {
-	            headers: {
-	              Authorization: `Bearer ${response.tokenset.access}`,
-	              "User-Agent": "code-harmony",
-	              Accept: "application/vnd.github+json",
-	            },
-	          }).then((x) => x.json())) as any
-	          const user = (await fetch("https://api.github.com/user", {
-	            headers: {
-	              Authorization: `Bearer ${response.tokenset.access}`,
-	              "User-Agent": "code-harmony",
-	              Accept: "application/vnd.github+json",
-	            },
-	          }).then((x) => x.json())) as any
+          const emails = (await fetch("https://api.github.com/user/emails", {
+            headers: {
+              Authorization: `Bearer ${response.tokenset.access}`,
+              "User-Agent": "code-harmony",
+              Accept: "application/vnd.github+json",
+            },
+          }).then((x) => x.json())) as any
+          const user = (await fetch("https://api.github.com/user", {
+            headers: {
+              Authorization: `Bearer ${response.tokenset.access}`,
+              "User-Agent": "code-harmony",
+              Accept: "application/vnd.github+json",
+            },
+          }).then((x) => x.json())) as any
           subject = user.id.toString()
 
           const primaryEmail = emails.find((x: any) => x.primary)

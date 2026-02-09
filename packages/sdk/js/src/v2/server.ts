@@ -28,7 +28,7 @@ export async function createCodeHarmonyServer(options?: ServerOptions) {
     options ?? {},
   )
 
-  const bin = process.env.CODE_HARMONY_BIN ?? process.env.OPENCODE_BIN ?? "code-harmony"
+  const bin = process.env.CODE_HARMONY_BIN ?? "code-harmony"
   const args = [`serve`, `--hostname=${options.hostname}`, `--port=${options.port}`]
   if (options.config?.logLevel) args.push(`--log-level=${options.config.logLevel}`)
 
@@ -37,7 +37,6 @@ export async function createCodeHarmonyServer(options?: ServerOptions) {
     env: {
       ...process.env,
       CODE_HARMONY_CONFIG_CONTENT: JSON.stringify(options.config ?? {}),
-      OPENCODE_CONFIG_CONTENT: JSON.stringify(options.config ?? {}),
     },
   })
 
@@ -99,7 +98,7 @@ export async function createCodeHarmonyServer(options?: ServerOptions) {
 }
 
 export function createCodeHarmonyTui(options?: TuiOptions) {
-  const bin = process.env.CODE_HARMONY_BIN ?? process.env.OPENCODE_BIN ?? "code-harmony"
+  const bin = process.env.CODE_HARMONY_BIN ?? "code-harmony"
   const args = []
 
   if (options?.project) {
@@ -121,7 +120,6 @@ export function createCodeHarmonyTui(options?: TuiOptions) {
     env: {
       ...process.env,
       CODE_HARMONY_CONFIG_CONTENT: JSON.stringify(options?.config ?? {}),
-      OPENCODE_CONFIG_CONTENT: JSON.stringify(options?.config ?? {}),
     },
   })
 
@@ -131,7 +129,3 @@ export function createCodeHarmonyTui(options?: TuiOptions) {
     },
   }
 }
-
-// Backwards compatibility for older consumers.
-export const createOpencodeServer = createCodeHarmonyServer
-export const createOpencodeTui = createCodeHarmonyTui

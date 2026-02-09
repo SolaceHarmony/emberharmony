@@ -61,8 +61,8 @@ const ModelList: Component<{
               latest={item.latest}
               free={item.provider.id === "code-harmony" && (!item.cost || item.cost.input === 0)}
             />
-              }
-            >
+          }
+        >
           {node}
         </Tooltip>
       )}
@@ -73,12 +73,12 @@ const ModelList: Component<{
         props.onSelect()
       }}
     >
-          {(i) => (
-            <div class="w-full flex items-center gap-x-2 text-13-regular">
-              <span class="truncate">{i.name}</span>
-              <Show when={i.provider.id === "code-harmony" && (!i.cost || i.cost?.input === 0)}>
-                <Tag>{language.t("model.tag.free")}</Tag>
-              </Show>
+      {(i) => (
+        <div class="w-full flex items-center gap-x-2 text-13-regular">
+          <span class="truncate">{i.name}</span>
+          <Show when={i.provider.id === "code-harmony" && (!i.cost || i.cost?.input === 0)}>
+            <Tag>{language.t("model.tag.free")}</Tag>
+          </Show>
           <Show when={i.latest}>
             <Tag>{language.t("model.tag.latest")}</Tag>
           </Show>

@@ -190,7 +190,9 @@ export default function Brand() {
               <div>
                 <img src={previewWordmarkSimpleLight} alt="CodeHarmony brand guidelines" />
                 <div data-component="actions">
-                  <button onClick={() => downloadFile(wordmarkSimpleLightPng, "code-harmony-wordmark-simple-light.png")}>
+                  <button
+                    onClick={() => downloadFile(wordmarkSimpleLightPng, "code-harmony-wordmark-simple-light.png")}
+                  >
                     PNG
                     <svg width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
                       <path
@@ -201,7 +203,9 @@ export default function Brand() {
                       />
                     </svg>
                   </button>
-                  <button onClick={() => downloadFile(wordmarkSimpleLightSvg, "code-harmony-wordmark-simple-light.svg")}>
+                  <button
+                    onClick={() => downloadFile(wordmarkSimpleLightSvg, "code-harmony-wordmark-simple-light.svg")}
+                  >
                     SVG
                     <svg width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
                       <path

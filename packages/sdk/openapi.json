@@ -1,8 +1,8 @@
 {
   "openapi": "3.1.1",
   "info": {
-    "title": "opencode",
-    "description": "opencode api",
+    "title": "CodeHarmony",
+    "description": "CodeHarmony API",
     "version": "1.0.0"
   },
   "paths": {
@@ -8886,7 +8886,7 @@
         "enum": ["DEBUG", "INFO", "WARN", "ERROR"]
       },
       "ServerConfig": {
-        "description": "Server configuration for opencode serve and web commands",
+        "description": "Server configuration for code-harmony serve and web commands",
         "type": "object",
         "properties": {
           "port": {

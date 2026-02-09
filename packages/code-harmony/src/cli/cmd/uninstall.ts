@@ -268,10 +268,7 @@ async function getShellConfigFile(): Promise<string | null> {
     const content = await Bun.file(file)
       .text()
       .catch(() => "")
-    if (
-      content.includes("# code-harmony") ||
-      content.includes(".code-harmony/bin")
-    ) {
+    if (content.includes("# code-harmony") || content.includes(".code-harmony/bin")) {
       return file
     }
   }

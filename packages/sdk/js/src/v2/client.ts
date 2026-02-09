@@ -4,7 +4,6 @@ import { createClient } from "./gen/client/client.gen.js"
 import { type Config } from "./gen/client/types.gen.js"
 import { CodeHarmonyClient } from "./gen/sdk.gen.js"
 export { type Config as CodeHarmonyClientConfig, CodeHarmonyClient }
-export { type Config as OpencodeClientConfig, CodeHarmonyClient as OpencodeClient }
 
 export function createCodeHarmonyClient(config?: Config & { directory?: string }) {
   const cfg = { ...config }
@@ -13,13 +12,9 @@ export function createCodeHarmonyClient(config?: Config & { directory?: string }
   if (cfg.directory) {
     const isNonASCII = /[^\x00-\x7F]/.test(cfg.directory)
     const encodedDirectory = isNonASCII ? encodeURIComponent(cfg.directory) : cfg.directory
-    headers["x-opencode-directory"] = encodedDirectory
     headers["x-code-harmony-directory"] = encodedDirectory
   }
 
   const client = createClient({ ...cfg, headers })
   return new CodeHarmonyClient({ client })
 }
-
-// Backwards compatibility for older consumers.
-export const createOpencodeClient = createCodeHarmonyClient

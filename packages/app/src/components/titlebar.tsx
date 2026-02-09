@@ -226,7 +226,10 @@ export function Titlebar() {
         class="min-w-0 flex items-center justify-center pointer-events-none lg:absolute lg:inset-0 lg:flex lg:items-center lg:justify-center"
         data-tauri-drag-region
       >
-        <div id="code-harmony-titlebar-center" class="pointer-events-auto w-full min-w-0 flex justify-center lg:w-fit" />
+        <div
+          id="code-harmony-titlebar-center"
+          class="pointer-events-auto w-full min-w-0 flex justify-center lg:w-fit"
+        />
       </div>
 
       <div
@@ -237,7 +240,11 @@ export function Titlebar() {
         onMouseDown={drag}
         data-tauri-drag-region
       >
-        <div id="code-harmony-titlebar-right" class="flex items-center gap-3 shrink-0 justify-end" data-tauri-drag-region />
+        <div
+          id="code-harmony-titlebar-right"
+          class="flex items-center gap-3 shrink-0 justify-end"
+          data-tauri-drag-region
+        />
         <Show when={windows()}>
           <div class="w-6 shrink-0" />
           <div data-tauri-decorum-tb class="flex flex-row" />

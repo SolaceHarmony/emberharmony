@@ -117,7 +117,9 @@ export namespace ToolRegistry {
       ApplyPatchTool,
       ...(Flag.CODE_HARMONY_EXPERIMENTAL_LSP_TOOL ? [LspTool] : []),
       ...(config.experimental?.batch_tool === true ? [BatchTool] : []),
-      ...(Flag.CODE_HARMONY_EXPERIMENTAL_PLAN_MODE && Flag.CODE_HARMONY_CLIENT === "cli" ? [PlanExitTool, PlanEnterTool] : []),
+      ...(Flag.CODE_HARMONY_EXPERIMENTAL_PLAN_MODE && Flag.CODE_HARMONY_CLIENT === "cli"
+        ? [PlanExitTool, PlanEnterTool]
+        : []),
       ...custom,
     ]
   }
