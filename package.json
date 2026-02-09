@@ -9,6 +9,8 @@
     "dev": "bun run --cwd packages/code-harmony --conditions=browser src/index.ts",
     "web": "bun run --cwd packages/code-harmony web",
     "serve": "bun run --cwd packages/code-harmony serve",
+    "pack:local": "bun run --cwd packages/code-harmony pack:local",
+    "install:local": "bun run --cwd packages/code-harmony install:local",
     "typecheck": "bun turbo typecheck",
     "prepare": "husky",
     "random": "echo 'Random script'",

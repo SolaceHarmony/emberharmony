@@ -55,6 +55,15 @@ nix run nixpkgs#code-harmony           # or github:sydneyrenee/code-harmony for 
 > [!TIP]
 > Remove versions older than 0.1.x before installing.
 
+#### Local Build + Install (No CI)
+
+```bash
+bun install
+npm run pack:local
+# prints a .tgz path you can install, e.g.
+# npm i -g /absolute/path/to/code-harmony-1.0.0.tgz
+```
+
 ### Desktop App (BETA)
 
 CodeHarmony is also available as a desktop application. Download directly from the [releases page](https://github.com/sydneyrenee/code-harmony/releases) or [solace.ofharmony.ai/download](https://github.com/sydneyrenee/code-harmony/releases).

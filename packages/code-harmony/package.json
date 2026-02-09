@@ -9,6 +9,8 @@
     "typecheck": "tsgo --noEmit",
     "test": "bun test",
     "build": "bun run script/build.ts",
+    "pack:local": "bun run script/pack-local.ts",
+    "install:local": "bun run script/pack-local.ts --install",
     "dev": "bun run --conditions=browser ./src/index.ts",
     "serve": "bun run --conditions=browser ./src/index.ts serve",
     "web": "bun run --conditions=browser ./src/index.ts web",

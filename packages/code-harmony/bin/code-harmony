@@ -24,6 +24,7 @@ if (envPath) {
 
 const scriptPath = fs.realpathSync(__filename)
 const scriptDir = path.dirname(scriptPath)
+const pkgDir = path.join(scriptDir, "..")
 
 function readPackageName() {
   try {
@@ -142,12 +143,12 @@ function findBinary(startDir) {
   }
 }
 
-const local = findLocalBinary(scriptDir, platform, arch, binary)
+const local = findLocalBinary(pkgDir, platform, arch, binary)
 if (local) {
   run(local)
 }
 
-const resolved = findBinary(scriptDir)
+const resolved = findBinary(pkgDir)
 if (!resolved) {
   console.error(
     'It seems that your package manager failed to install the right version of the code-harmony CLI for your platform. You can try manually installing the "' +
