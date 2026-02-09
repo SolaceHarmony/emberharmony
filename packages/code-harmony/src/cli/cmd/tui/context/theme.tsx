@@ -161,7 +161,7 @@ export const DEFAULT_THEMES: Record<string, ThemeJson> = {
   ["osaka-jade"]: osakaJade,
   ["code-harmony"]: harmony,
   // Backwards compatibility for older configs expecting the original theme name.
-  opencode: harmony,
+  // Intentionally removed during the rebrand to keep configs and screenshots clean.
   orng,
   ["lucent-orng"]: lucentOrng,
   palenight,

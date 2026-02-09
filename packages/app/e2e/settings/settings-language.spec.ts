@@ -3,7 +3,7 @@ import { modKey, settingsLanguageSelectSelector } from "../utils"
 
 test("smoke changing language updates settings labels", async ({ page, gotoSession }) => {
   await page.addInitScript(() => {
-    localStorage.setItem("opencode.global.dat:language", JSON.stringify({ locale: "en" }))
+    localStorage.setItem("code-harmony.global.dat:language", JSON.stringify({ locale: "en" }))
   })
 
   await gotoSession()

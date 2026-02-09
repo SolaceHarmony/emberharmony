@@ -66,7 +66,7 @@ export default function TermsOfService() {
                 RIGHT TO PARTICIPATE IN A CLASS ACTION LAWSUIT OR CLASS-WIDE ARBITRATION.
               </p>
 
-              <h2 id="what-is-opencode">What is CodeHarmony?</h2>
+              <h2 id="what-is-code-harmony">What is CodeHarmony?</h2>
               <p>
                 CodeHarmony is an AI-powered coding agent that helps you write, understand, and modify code using large
                 language models. Certain of these large language models are provided by third parties ("Third Party
@@ -112,7 +112,8 @@ export default function TermsOfService() {
                 attempt to register for or otherwise use the Services or send us any personal information. If we learn
                 we have collected personal information from a child under 13 years of age, we will delete that
                 information as quickly as possible. If you believe that a child under 13 years of age may have provided
-                us personal information, please contact us at <a href="mailto:contact@anoma.ly">contact@anoma.ly</a>.
+                us personal information, please contact us at{" "}
+                <a href="mailto:sydney@solace.ofharmony.ai">sydney@solace.ofharmony.ai</a>.
               </p>
 
               <h2 id="what-are-the-basics">What are the basics of using CodeHarmony?</h2>
@@ -244,7 +245,7 @@ export default function TermsOfService() {
                 any Third Party Model.
               </p>
 
-              <h2 id="will-opencode-ever-change-the-services">Will CodeHarmony ever change the Services?</h2>
+              <h2 id="will-code-harmony-ever-change-the-services">Will CodeHarmony ever change the Services?</h2>
               <p>
                 We're always trying to improve our Services, so they may change over time. We may suspend or discontinue
                 any part of the Services, or we may introduce new features or impose limits on certain features or
@@ -350,7 +351,7 @@ export default function TermsOfService() {
                 claims, actions, suits procedures, costs, expenses, damages or liabilities arising out of use of, or in
                 any way related to your participation in, the Services. The CodeHarmony Parties make no representations
                 or warranties regarding suggestions or recommendations of services or products offered or purchased
-                through or in connection with the Services. THE SERVICES AND CONTENT ARE PROVIDED BY OPENCODE (AND ITS
+                through or in connection with the Services. THE SERVICES AND CONTENT ARE PROVIDED BY CODEHARMONY (AND ITS
                 LICENSORS AND SUPPLIERS) ON AN "AS-IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
                 INCLUDING, WITHOUT LIMITATION, IMPLIED WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE,
                 NON-INFRINGEMENT, OR THAT USE OF THE SERVICES WILL BE UNINTERRUPTED OR ERROR-FREE. SOME STATES DO NOT
@@ -361,12 +362,12 @@ export default function TermsOfService() {
               <p>
                 TO THE FULLEST EXTENT ALLOWED BY APPLICABLE LAW, UNDER NO CIRCUMSTANCES AND UNDER NO LEGAL THEORY
                 (INCLUDING, WITHOUT LIMITATION, TORT, CONTRACT, STRICT LIABILITY, OR OTHERWISE) SHALL ANY OF THE
-                OPENCODE PARTIES BE LIABLE TO YOU OR TO ANY OTHER PERSON FOR (A) ANY INDIRECT, SPECIAL, INCIDENTAL,
+                CODEHARMONY PARTIES BE LIABLE TO YOU OR TO ANY OTHER PERSON FOR (A) ANY INDIRECT, SPECIAL, INCIDENTAL,
                 PUNITIVE OR CONSEQUENTIAL DAMAGES OF ANY KIND, INCLUDING DAMAGES FOR LOST PROFITS, BUSINESS
                 INTERRUPTION, LOSS OF DATA, LOSS OF GOODWILL, WORK STOPPAGE, ACCURACY OF RESULTS, OR COMPUTER FAILURE OR
                 MALFUNCTION, (B) ANY SUBSTITUTE GOODS, SERVICES OR TECHNOLOGY, (C) ANY AMOUNT, IN THE AGGREGATE, IN
                 EXCESS OF THE GREATER OF (I) ONE-HUNDRED ($100) DOLLARS OR (II) THE AMOUNTS PAID AND/OR PAYABLE BY YOU
-                TO OPENCODE IN CONNECTION WITH THE SERVICES IN THE TWELVE (12) MONTH PERIOD PRECEDING THIS APPLICABLE
+                TO CODEHARMONY IN CONNECTION WITH THE SERVICES IN THE TWELVE (12) MONTH PERIOD PRECEDING THIS APPLICABLE
                 CLAIM OR (D) ANY MATTER BEYOND OUR REASONABLE CONTROL. SOME STATES DO NOT ALLOW THE EXCLUSION OR
                 LIMITATION OF INCIDENTAL OR CONSEQUENTIAL OR CERTAIN OTHER DAMAGES, SO THE ABOVE LIMITATION AND
                 EXCLUSIONS MAY NOT APPLY TO YOU.
@@ -439,11 +440,11 @@ export default function TermsOfService() {
 
               <h4>Waiver of Jury Trial</h4>
               <p>
-                YOU AND OPENCODE WAIVE ANY CONSTITUTIONAL AND STATUTORY RIGHTS TO GO TO COURT AND HAVE A TRIAL IN FRONT
+                YOU AND CODEHARMONY WAIVE ANY CONSTITUTIONAL AND STATUTORY RIGHTS TO GO TO COURT AND HAVE A TRIAL IN FRONT
                 OF A JUDGE OR JURY. You and CodeHarmony are instead choosing to have claims and disputes resolved by
                 arbitration. Arbitration procedures are typically more limited, more efficient, and less costly than
                 rules applicable in court and are subject to very limited review by a court. In any litigation between
-                you and CodeHarmony over whether to vacate or enforce an arbitration award, YOU AND OPENCODE WAIVE ALL
+                you and CodeHarmony over whether to vacate or enforce an arbitration award, YOU AND CODEHARMONY WAIVE ALL
                 RIGHTS TO A JURY TRIAL, and elect instead to have the dispute be resolved by a judge.
               </p>
 
