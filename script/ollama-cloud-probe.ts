@@ -1,12 +1,15 @@
 const main = async () => {
   const key = process.env.OLLAMA_API_KEY
-  if (!key) {
+  const base = (process.env.OLLAMA_BASE_URL ?? "https://ollama.com/v1").replace(/\/+$/, "")
+  const url = base + "/chat/completions"
+
+  const cloud = base === "https://ollama.com/v1"
+  if (cloud && !key) {
     console.error("Missing OLLAMA_API_KEY (required for Ollama Cloud).")
     process.exit(1)
   }
 
   const model = process.argv[2] ?? "gemini-3-pro-preview"
-  const url = "https://ollama.com/v1/chat/completions"
 
   const todowrite = await Bun.file("packages/code-harmony/src/tool/todowrite.txt")
     .text()
@@ -104,12 +107,13 @@ const main = async () => {
     },
   ] as const
 
+  console.log("base\t" + base)
   for (const item of cases) {
     const res = await fetch(url, {
       method: "POST",
       headers: {
-        authorization: `Bearer ${key}`,
         "content-type": "application/json",
+        ...(key ? { authorization: `Bearer ${key}` } : {}),
       },
       body: JSON.stringify(item.body),
     })
@@ -121,4 +125,3 @@ const main = async () => {
 }
 
 await main()
-
