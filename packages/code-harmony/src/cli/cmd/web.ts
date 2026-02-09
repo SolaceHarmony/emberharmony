@@ -5,6 +5,7 @@ import { withNetworkOptions, resolveNetworkOptions } from "../network"
 import { Flag } from "../../flag/flag"
 import open from "open"
 import { networkInterfaces } from "os"
+import path from "path"
 
 function getNetworkIPs() {
   const nets = networkInterfaces()
@@ -42,40 +43,85 @@ export const WebCommand = cmd({
     UI.println(UI.logo("  "))
     UI.empty()
 
+    const localhostApi = `http://127.0.0.1:${server.port}`
     if (opts.hostname === "0.0.0.0") {
-      // Show localhost for local access
-      const localhostUrl = `http://localhost:${server.port}`
-      UI.println(UI.Style.TEXT_INFO_BOLD + "  Local access:      ", UI.Style.TEXT_NORMAL, localhostUrl)
-
-      // Show network IPs for remote access
+      UI.println(UI.Style.TEXT_INFO_BOLD + "  Local access:      ", UI.Style.TEXT_NORMAL, localhostApi)
       const networkIPs = getNetworkIPs()
       if (networkIPs.length > 0) {
         for (const ip of networkIPs) {
-          UI.println(
-            UI.Style.TEXT_INFO_BOLD + "  Network access:    ",
-            UI.Style.TEXT_NORMAL,
-            `http://${ip}:${server.port}`,
-          )
+          UI.println(UI.Style.TEXT_INFO_BOLD + "  Network access:    ", UI.Style.TEXT_NORMAL, `http://${ip}:${server.port}`)
         }
       }
 
       if (opts.mdns) {
-        UI.println(
-          UI.Style.TEXT_INFO_BOLD + "  mDNS:              ",
-          UI.Style.TEXT_NORMAL,
-          `code-harmony.local:${server.port}`,
-        )
+        UI.println(UI.Style.TEXT_INFO_BOLD + "  mDNS:              ", UI.Style.TEXT_NORMAL, `code-harmony.local:${server.port}`)
       }
-
-      // Open localhost in browser
-      open(localhostUrl.toString()).catch(() => {})
-    } else {
-      const displayUrl = server.url.toString()
-      UI.println(UI.Style.TEXT_INFO_BOLD + "  Web interface:    ", UI.Style.TEXT_NORMAL, displayUrl)
-      open(displayUrl).catch(() => {})
     }
 
-    await new Promise(() => {})
-    await server.stop()
+    const mode = process.env.CODE_HARMONY_WEB_UI ?? "auto"
+    const noopen = process.env.CODE_HARMONY_WEB_NO_OPEN === "1"
+
+    const appdir = path.resolve(process.cwd(), "..", "app")
+    const apppkg = path.join(appdir, "package.json")
+    const hasapp = await Bun.file(apppkg).exists()
+    const bunbin = Bun.which("bun")
+
+    const useLocal = mode === "local" || (mode === "auto" && hasapp && !!bunbin)
+    if (!useLocal) {
+      const url = server.url.toString()
+      UI.println(UI.Style.TEXT_INFO_BOLD + "  Web interface:     ", UI.Style.TEXT_NORMAL, url)
+      if (!noopen) open(url).catch(() => {})
+      await new Promise(() => {})
+      await server.stop()
+      return
+    }
+
+    const probe = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch() {
+        return new Response("")
+      },
+    })
+    const uiport = probe.port
+    probe.stop(true)
+
+    const url = `http://127.0.0.1:${uiport}/`
+    UI.println(UI.Style.TEXT_INFO_BOLD + "  Web interface:     ", UI.Style.TEXT_NORMAL, url)
+
+    const child = Bun.spawn({
+      cmd: ["bun", "run", "dev", "--", "--host", "127.0.0.1", "--port", String(uiport), "--strictPort"],
+      cwd: appdir,
+      env: {
+        ...process.env,
+        VITE_CODE_HARMONY_SERVER_HOST: "127.0.0.1",
+        VITE_CODE_HARMONY_SERVER_PORT: String(server.port),
+      },
+      stdio: ["ignore", "inherit", "inherit"],
+    })
+
+    // Give the UI dev server a moment to bind before opening the browser.
+    for (const delay of [50, 100, 250, 500, 1000, 2000]) {
+      const ctrl = new AbortController()
+      const timer = setTimeout(() => ctrl.abort(), 250)
+      const ok = await fetch(url, { signal: ctrl.signal })
+        .then(() => true)
+        .catch(() => false)
+      clearTimeout(timer)
+      if (ok) break
+      await new Promise((resolve) => setTimeout(resolve, delay))
+    }
+    if (!noopen) open(url).catch(() => {})
+
+    const stop = async () => {
+      child.kill()
+      await server.stop(true)
+      process.exit(0)
+    }
+    process.once("SIGINT", () => void stop())
+    process.once("SIGTERM", () => void stop())
+
+    await child.exited
+    await server.stop(true)
   },
 })
