@@ -745,7 +745,35 @@ export namespace ProviderTransform {
       )
     }
 
+    const values = (() => {
+      const body = (error as unknown as { requestBodyValues?: unknown }).requestBodyValues
+      if (!body || typeof body !== "object") return undefined
+      return body as Record<string, unknown>
+    })()
+    const hastools = (() => {
+      if (!values) return false
+      const tools = values["tools"]
+      if (!Array.isArray(tools)) return false
+      return tools.length > 0
+    })()
+
     const text = (error.responseBody ?? "") + "\n" + message
+    if (providerID === "ollama-cloud" && error.statusCode === 500 && hastools && text.includes("Internal Server Error")) {
+      const url = (error as unknown as { url?: unknown }).url
+      const loc = typeof url === "string" ? ` (${url})` : ""
+      return [
+        `Ollama Cloud returned HTTP 500 when tools were enabled${loc}.`,
+        "",
+        "This is an upstream provider/model limitation or outage (the request works until tool schemas are included).",
+        "",
+        "Workarounds:",
+        "1) Switch to a different provider/model that supports tools (for Gemini, prefer the Google provider if available).",
+        "2) Disable tool use for this session/agent.",
+        "3) Retry later (Ollama Cloud may be temporarily failing).",
+        "",
+        `Original error: ${message}`,
+      ].join("\n")
+    }
     if (providerID === "lmstudio" && text.toLowerCase().includes("tokens to keep from the initial prompt")) {
       return [
         "LM Studio returned a context window error.",

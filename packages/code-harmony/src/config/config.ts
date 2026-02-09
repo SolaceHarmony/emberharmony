@@ -237,14 +237,13 @@ export namespace Config {
     const hasGitIgnore = await Bun.file(gitignore).exists()
     if (!hasGitIgnore) await Bun.write(gitignore, ["node_modules", "package.json", "bun.lock", ".gitignore"].join("\n"))
 
-    const plugin = (() => {
-      const root = path.resolve(import.meta.dir, "../../../..")
-      const local = path.join(root, "packages", "plugin")
-      const exists = Installation.isLocal() && existsSync(path.join(local, "package.json"))
-      return exists ? local : "@thesolaceproject/code-harmony-plugin@" + Installation.VERSION
-    })()
-
-    await BunProc.run(["add", plugin, "--exact"], { cwd: dir }).catch(() => {})
+    // In local/dev installs, internal plugins are loaded from source.
+    // Installing the workspace plugin into ~/.config/code-harmony fails because it depends on workspace:* packages.
+    if (!Installation.isLocal()) {
+      await BunProc.run(["add", "@thesolaceproject/code-harmony-plugin@" + Installation.VERSION, "--exact"], {
+        cwd: dir,
+      }).catch(() => {})
+    }
 
     // Install any additional dependencies defined in the package.json
     // This allows local plugins and custom tools to use external packages

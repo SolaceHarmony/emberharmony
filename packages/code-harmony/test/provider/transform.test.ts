@@ -1725,3 +1725,31 @@ describe("ProviderTransform.variants", () => {
     })
   })
 })
+
+describe("ProviderTransform.error", () => {
+  test("ollama-cloud 500 with tool schemas returns actionable guidance", () => {
+    const err = {
+      message: "Internal Server Error",
+      statusCode: 500,
+      responseBody: JSON.stringify({ error: "Internal Server Error" }),
+      url: "https://ollama.com/v1/chat/completions",
+      requestBodyValues: {
+        tools: [
+          {
+            type: "function",
+            function: {
+              name: "example",
+              description: "example",
+              parameters: { type: "object", properties: {} },
+            },
+          },
+        ],
+      },
+    } as any
+
+    const out = ProviderTransform.error("ollama-cloud", err)
+    expect(out).toContain("Ollama Cloud")
+    expect(out).toContain("tools")
+    expect(out).toContain("Workarounds:")
+  })
+})
