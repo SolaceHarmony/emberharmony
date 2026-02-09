@@ -1,9 +1,9 @@
 const main = async () => {
   const key = process.env.OLLAMA_API_KEY
-  const base = (process.env.OLLAMA_BASE_URL ?? "https://ollama.com/v1").replace(/\/+$/, "")
-  const url = base + "/chat/completions"
+  const root = (process.env.OLLAMA_BASE_URL ?? "https://ollama.com/v1").replace(/\/+$/, "")
+  const url = root + "/chat/completions"
 
-  const cloud = base === "https://ollama.com/v1"
+  const cloud = root === "https://ollama.com/v1"
   if (cloud && !key) {
     console.error("Missing OLLAMA_API_KEY (required for Ollama Cloud).")
     process.exit(1)
@@ -17,7 +17,7 @@ const main = async () => {
 
   const mk = (n: number) => "x".repeat(n)
 
-  const base = {
+  const body = {
     model,
     stream: false,
     max_tokens: 16,
@@ -39,22 +39,24 @@ const main = async () => {
     tool_choice: "auto",
   })
 
+  const sizes = [1024, 4096, 8192, 16384, 32768, 65536, 131072]
+
   const cases = [
     {
       name: "no-tools",
-      body: base,
+      body,
     },
     {
       name: "tools-min",
       body: {
-        ...base,
+        ...body,
         ...tool("ping", { type: "object", properties: {}, additionalProperties: false }),
       },
     },
     {
       name: "tools-schema",
       body: {
-        ...base,
+        ...body,
         ...tool("ping", {
           $schema: "https://json-schema.org/draft/2020-12/schema",
           type: "object",
@@ -64,23 +66,9 @@ const main = async () => {
       },
     },
     {
-      name: "tools-desc-8k",
-      body: {
-        ...base,
-        ...tool(mk(8192), { type: "object", properties: {}, additionalProperties: false }),
-      },
-    },
-    {
-      name: "tools-desc-16k",
-      body: {
-        ...base,
-        ...tool(mk(16384), { type: "object", properties: {}, additionalProperties: false }),
-      },
-    },
-    {
       name: "tools-todowrite",
       body: {
-        ...base,
+        ...body,
         ...tool(todowrite, {
           $schema: "https://json-schema.org/draft/2020-12/schema",
           type: "object",
@@ -105,9 +93,16 @@ const main = async () => {
         }),
       },
     },
-  ] as const
+    ...sizes.map((n) => ({
+      name: "tools-desc-" + n,
+      body: {
+        ...body,
+        ...tool(mk(n), { type: "object", properties: {}, additionalProperties: false }),
+      },
+    })),
+  ]
 
-  console.log("base\t" + base)
+  console.log("base\t" + root)
   for (const item of cases) {
     const res = await fetch(url, {
       method: "POST",
