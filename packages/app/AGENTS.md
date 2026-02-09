@@ -4,7 +4,7 @@
 
 ## Local Dev
 
-- `code-harmony dev web` proxies `https://app.solace.ofharmony.ai`, so local UI/CSS changes will not show there.
+- `code-harmony web` proxies `https://app.solace.ofharmony.ai`, so local UI/CSS changes will not show there.
 - For local UI changes, run the backend and app dev servers separately.
 - Backend (from `packages/code-harmony`): `bun run --conditions=browser ./src/index.ts serve --port 4096`
 - App (from `packages/app`): `bun dev -- --port 4444`

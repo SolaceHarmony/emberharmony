@@ -79,7 +79,7 @@ During development, `bun dev` is the local equivalent of the built `code-harmony
 # Development (from project root)
 bun dev --help           # Show all available commands
 bun dev serve            # Start headless API server
-bun dev web              # Start server + open web interface
+code-harmony web         # Start server + open web interface
 bun dev <directory>      # Start TUI in specific directory
 
 # Production
