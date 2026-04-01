@@ -4,6 +4,14 @@ import { $ } from "bun"
 import { createCodeHarmony } from "@thesolaceproject/code-harmony-sdk/v2"
 import { parseArgs } from "util"
 
+const repo = Bun.env.GITHUB_REPOSITORY ?? "sydneyrenee/code-harmony"
+const token = Bun.env.GH_TOKEN ?? Bun.env.GITHUB_TOKEN
+const headers = {
+  accept: "application/vnd.github+json",
+  "x-github-api-version": "2022-11-28",
+  ...(token ? { authorization: `Bearer ${token}` } : {}),
+}
+
 export const team = [
   "actions-user",
   "code-harmony",
@@ -25,12 +33,12 @@ type Release = {
 }
 
 export async function getLatestRelease(skip?: string) {
-  const data = await fetch("https://api.github.com/repos/sydneyrenee/code-harmony/releases?per_page=100").then(
-    (res) => {
-      if (!res.ok) throw new Error(res.statusText)
-      return res.json()
-    },
-  )
+  const res = await fetch(`https://api.github.com/repos/${repo}/releases?per_page=100`, { headers })
+
+  if (res.status === 404) return
+  if (!res.ok) throw new Error(res.statusText)
+
+  const data = await res.json()
 
   const releases = data as Release[]
   const target = skip?.replace(/^v/, "")
@@ -57,7 +65,7 @@ export async function getCommits(from: string, to: string): Promise<Commit[]> {
 
   // Get commit data with GitHub usernames from the API
   const compare =
-    await $`gh api "/repos/sydneyrenee/code-harmony/compare/${fromRef}...${toRef}" --jq '.commits[] | {sha: .sha, login: .author.login, message: .commit.message}'`.text()
+    await $`gh api "/repos/${repo}/compare/${fromRef}...${toRef}" --jq '.commits[] | {sha: .sha, login: .author.login, message: .commit.message}'`.text()
 
   const commitData = new Map<string, { login: string | null; message: string }>()
   for (const line of compare.split("\n").filter(Boolean)) {
@@ -218,7 +226,7 @@ export async function getContributors(from: string, to: string) {
   const fromRef = from.startsWith("v") ? from : `v${from}`
   const toRef = to === "HEAD" ? to : to.startsWith("v") ? to : `v${to}`
   const compare =
-    await $`gh api "/repos/sydneyrenee/code-harmony/compare/${fromRef}...${toRef}" --jq '.commits[] | {login: .author.login, message: .commit.message}'`.text()
+    await $`gh api "/repos/${repo}/compare/${fromRef}...${toRef}" --jq '.commits[] | {login: .author.login, message: .commit.message}'`.text()
   const contributors = new Map<string, Set<string>>()
 
   for (const line of compare.split("\n").filter(Boolean)) {
