@@ -1316,7 +1316,7 @@ export type KeybindsConfig = {
 export type LogLevel = "DEBUG" | "INFO" | "WARN" | "ERROR"
 
 /**
- * Server configuration for opencode serve and web commands
+ * Server configuration for code-harmony serve and web commands
  */
 export type ServerConfig = {
   /**
@@ -1623,7 +1623,7 @@ export type Config = {
   }
   server?: ServerConfig
   /**
-   * Command configuration, see https://opencode.ai/docs/commands
+   * Command configuration, see https://solace.ofharmony.ai/docs/commands
    */
   command?: {
     [key: string]: {
@@ -1693,7 +1693,7 @@ export type Config = {
     [key: string]: AgentConfig | undefined
   }
   /**
-   * Agent configuration, see https://opencode.ai/docs/agents
+   * Agent configuration, see https://solace.ofharmony.ai/docs/agents
    */
   agent?: {
     plan?: AgentConfig

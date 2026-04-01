@@ -1,12 +1,12 @@
 import { createMemo, onCleanup } from "solid-js"
 import { createStore, produce } from "solid-js/store"
-import { createSimpleContext } from "@opencode-harmony/ui/context"
-import type { PermissionRequest } from "@opencode-harmony/sdk/v2/client"
+import { createSimpleContext } from "@thesolaceproject/code-harmony-ui/context"
+import type { PermissionRequest } from "@thesolaceproject/code-harmony-sdk/v2/client"
 import { Persist, persisted } from "@/utils/persist"
 import { useGlobalSDK } from "@/context/global-sdk"
 import { useGlobalSync } from "./global-sync"
 import { useParams } from "@solidjs/router"
-import { base64Encode } from "@opencode-harmony/util/encode"
+import { base64Encode } from "@thesolaceproject/code-harmony-util/encode"
 import { decode64 } from "@/utils/base64"
 
 type PermissionRespondFn = (input: {

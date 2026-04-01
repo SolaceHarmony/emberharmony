@@ -1,11 +1,11 @@
-import { Resource } from "@opencode-harmony/console-resource"
-import { Actor } from "@opencode-harmony/console-core/actor.js"
+import { Resource } from "@thesolaceproject/code-harmony-console-resource"
+import { Actor } from "@thesolaceproject/code-harmony-console-core/actor.js"
 import { action, json, query } from "@solidjs/router"
 import { withActor } from "~/context/auth.withActor"
-import { Billing } from "@opencode-harmony/console-core/billing.js"
-import { and, Database, desc, eq, isNull } from "@opencode-harmony/console-core/drizzle/index.js"
-import { WorkspaceTable } from "@opencode-harmony/console-core/schema/workspace.sql.js"
-import { UserTable } from "@opencode-harmony/console-core/schema/user.sql.js"
+import { Billing } from "@thesolaceproject/code-harmony-console-core/billing.js"
+import { and, Database, desc, eq, isNull } from "@thesolaceproject/code-harmony-console-core/drizzle/index.js"
+import { WorkspaceTable } from "@thesolaceproject/code-harmony-console-core/schema/workspace.sql.js"
+import { UserTable } from "@thesolaceproject/code-harmony-console-core/schema/user.sql.js"
 
 export function formatDateForTable(date: Date) {
   const options: Intl.DateTimeFormatOptions = {

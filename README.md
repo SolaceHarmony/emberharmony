@@ -9,9 +9,9 @@
 </p>
 <p align="center">The open source AI coding agent.</p>
 <p align="center">
-  <a href="https://github.com/SolaceHarmony/code-harmony/discussions"><img alt="Discord" src="https://img.shields.io/discord/1391832426048651334?style=flat-square&label=discord" /></a>
+  <a href="https://discord.gg/EdF8f7JR"><img alt="Discord" src="https://img.shields.io/discord/1391832426048651334?style=flat-square&label=discord" /></a>
   <a href="https://www.npmjs.com/package/code-harmony"><img alt="npm" src="https://img.shields.io/npm/v/code-harmony?style=flat-square" /></a>
-  <a href="https://github.com/SolaceHarmony/code-harmony/actions/workflows/publish.yml"><img alt="Build status" src="https://img.shields.io/github/actions/workflow/status/SolaceHarmony/code-harmony/publish.yml?style=flat-square&branch=dev" /></a>
+  <a href="https://github.com/sydneyrenee/code-harmony/actions/workflows/publish.yml"><img alt="Build status" src="https://img.shields.io/github/actions/workflow/status/sydneyrenee/code-harmony/publish.yml?style=flat-square&branch=main" /></a>
 </p>
 
 <p align="center">
@@ -41,7 +41,7 @@
 
 ```bash
 # YOLO
-curl -fsSL https://raw.githubusercontent.com/SolaceHarmony/code-harmony/dev/install | bash
+curl -fsSL https://raw.githubusercontent.com/sydneyrenee/code-harmony/main/install | bash
 
 # Package managers
 npm i -g code-harmony@latest        # or bun/pnpm/yarn
@@ -49,26 +49,35 @@ scoop install code-harmony             # Windows
 choco install code-harmony             # Windows
 paru -S code-harmony-bin               # Arch Linux
 mise use -g code-harmony               # Any OS
-nix run nixpkgs#code-harmony           # or github:SolaceHarmony/code-harmony for latest dev branch
+nix run nixpkgs#code-harmony           # or github:sydneyrenee/code-harmony for latest dev branch
 ```
 
 > [!TIP]
 > Remove versions older than 0.1.x before installing.
 
+#### Local Build + Install (No CI)
+
+```bash
+bun install
+npm run pack:local
+# prints a .tgz path you can install, e.g.
+# npm i -g /absolute/path/to/code-harmony-1.0.0.tgz
+```
+
 ### Desktop App (BETA)
 
-CodeHarmony is also available as a desktop application. Download directly from the [releases page](https://github.com/SolaceHarmony/code-harmony/releases) or [solace.ofharmony.ai/download](https://github.com/SolaceHarmony/code-harmony/releases).
+CodeHarmony is also available as a desktop application. Download directly from the [releases page](https://github.com/sydneyrenee/code-harmony/releases) or [solace.ofharmony.ai/download](https://github.com/sydneyrenee/code-harmony/releases).
 
-| Platform              | Download                              |
-| --------------------- | ------------------------------------- |
+| Platform              | Download                                  |
+| --------------------- | ----------------------------------------- |
 | macOS (Apple Silicon) | `code-harmony-desktop-darwin-aarch64.dmg` |
 | macOS (Intel)         | `code-harmony-desktop-darwin-x64.dmg`     |
 | Windows               | `code-harmony-desktop-windows-x64.exe`    |
-| Linux                 | `.deb`, `.rpm`, or AppImage           |
+| Linux                 | `.deb`, `.rpm`, or AppImage               |
 
 ```bash
 # Windows (Scoop)
-scoop bucket add extras; scoop install extras/code-harmony-desktop
+scoop bucket add extras; scoop install extras@thesolaceproject/code-harmony-desktop
 ```
 
 #### Installation Directory
@@ -82,8 +91,8 @@ The install script respects the following priority order for the installation pa
 
 ```bash
 # Examples
-CODE_HARMONY_INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/SolaceHarmony/code-harmony/dev/install | bash
-XDG_BIN_DIR=$HOME/.local/bin curl -fsSL https://raw.githubusercontent.com/SolaceHarmony/code-harmony/dev/install | bash
+CODE_HARMONY_INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/sydneyrenee/code-harmony/main/install | bash
+XDG_BIN_DIR=$HOME/.local/bin curl -fsSL https://raw.githubusercontent.com/sydneyrenee/code-harmony/main/install | bash
 ```
 
 ### Agents
@@ -127,4 +136,4 @@ It's very similar to Claude Code in terms of capability. Here are the key differ
 
 ---
 
-**Join our community** [Discord](https://github.com/SolaceHarmony/code-harmony/discussions) | [X.com](https://github.com/SolaceHarmony/code-harmony)
+**Join our community** [Discord](https://discord.gg/EdF8f7JR) | [GitHub Discussions](https://github.com/SolaceHarmony/code-harmony/discussions)

@@ -8,7 +8,7 @@ env:
 
 jobs:
   update-docs:
-    if: github.repository == 'SolaceHarmony/code-harmony'
+    if: github.repository == 'sydneyrenee/code-harmony'
     runs-on: ubuntu-latest
     permissions:
       id-token: write
@@ -41,11 +41,11 @@ jobs:
 
       - name: Run code-harmony
         if: steps.commits.outputs.has_commits == 'true'
-        uses: SolaceHarmony/code-harmony/github@latest
+        uses: sydneyrenee/code-harmony/github@latest
         env:
-          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          CODE_HARMONY_API_KEY: ${{ secrets.CODE_HARMONY_API_KEY }}
         with:
-          model: opencode/gpt-5.2
+          model: code-harmony/gpt-5.2
           agent: docs
           prompt: |
             Review the following commits from the last ${{ env.LOOKBACK_HOURS }} hours and identify any new features that may need documentation.

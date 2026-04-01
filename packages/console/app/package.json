@@ -1,13 +1,13 @@
 {
-  "name": "@opencode-harmony/console-app",
+  "name": "@thesolaceproject/code-harmony-console-app",
   "version": "1.0.0",
   "type": "module",
   "license": "MIT",
   "scripts": {
     "typecheck": "tsgo --noEmit",
     "dev": "vite dev --host 0.0.0.0",
-    "dev:remote": "VITE_AUTH_URL=https://auth.dev.opencode.ai VITE_STRIPE_PUBLISHABLE_KEY=pk_test_... bun sst shell --stage=dev bun dev",
-    "build": "./script/generate-sitemap.ts && vite build && ../../opencode/script/schema.ts ./.output/public/config.json",
+    "dev:remote": "VITE_AUTH_URL=https://auth.dev.solace.ofharmony.ai VITE_STRIPE_PUBLISHABLE_KEY=pk_test_... bun sst shell --stage=dev bun dev",
+    "build": "./script/generate-sitemap.ts && vite build && ../../code-harmony/script/schema.ts ./.output/public/config.json",
     "start": "vite start"
   },
   "dependencies": {
@@ -16,10 +16,10 @@
     "@jsx-email/render": "1.1.1",
     "@kobalte/core": "catalog:",
     "@openauthjs/openauth": "catalog:",
-    "@opencode-harmony/console-core": "workspace:*",
-    "@opencode-harmony/console-mail": "workspace:*",
-    "@opencode-harmony/console-resource": "workspace:*",
-    "@opencode-harmony/ui": "workspace:*",
+    "@thesolaceproject/code-harmony-console-core": "workspace:*",
+    "@thesolaceproject/code-harmony-console-mail": "workspace:*",
+    "@thesolaceproject/code-harmony-console-resource": "workspace:*",
+    "@thesolaceproject/code-harmony-ui": "workspace:*",
     "@smithy/eventstream-codec": "4.2.7",
     "@smithy/util-utf8": "4.2.0",
     "@solidjs/meta": "catalog:",

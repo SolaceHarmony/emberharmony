@@ -1,11 +1,11 @@
-import { TextField } from "@opencode-harmony/ui/text-field"
-import { Logo } from "@opencode-harmony/ui/logo"
-import { Button } from "@opencode-harmony/ui/button"
+import { TextField } from "@thesolaceproject/code-harmony-ui/text-field"
+import { Logo } from "@thesolaceproject/code-harmony-ui/logo"
+import { Button } from "@thesolaceproject/code-harmony-ui/button"
 import { Component, Show } from "solid-js"
 import { createStore } from "solid-js/store"
 import { usePlatform } from "@/context/platform"
 import { useLanguage } from "@/context/language"
-import { Icon } from "@opencode-harmony/ui/icon"
+import { Icon } from "@thesolaceproject/code-harmony-ui/icon"
 
 export type InitError = {
   name: string
@@ -272,7 +272,7 @@ export const ErrorPage: Component<ErrorPageProps> = (props) => {
             <button
               type="button"
               class="flex items-center text-text-interactive-base gap-1"
-              onClick={() => platform.openLink("https://opencode.ai/desktop-feedback")}
+              onClick={() => platform.openLink("https://solace.ofharmony.ai/desktop-feedback")}
             >
               <div>{language.t("error.page.report.discord")}</div>
               <Icon name="discord" class="text-text-interactive-base" />

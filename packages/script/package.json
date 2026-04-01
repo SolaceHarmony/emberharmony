@@ -1,6 +1,6 @@
 {
   "$schema": "https://json.schemastore.org/package",
-  "name": "@opencode-harmony/script",
+  "name": "@thesolaceproject/code-harmony-script",
   "license": "MIT",
   "devDependencies": {
     "@types/bun": "catalog:"

@@ -1,11 +1,11 @@
-import { Button } from "@opencode-harmony/ui/button"
-import { useDialog } from "@opencode-harmony/ui/context/dialog"
-import { Dialog } from "@opencode-harmony/ui/dialog"
-import type { IconName } from "@opencode-harmony/ui/icons/provider"
-import { List, type ListRef } from "@opencode-harmony/ui/list"
-import { ProviderIcon } from "@opencode-harmony/ui/provider-icon"
-import { Tag } from "@opencode-harmony/ui/tag"
-import { Tooltip } from "@opencode-harmony/ui/tooltip"
+import { Button } from "@thesolaceproject/code-harmony-ui/button"
+import { useDialog } from "@thesolaceproject/code-harmony-ui/context/dialog"
+import { Dialog } from "@thesolaceproject/code-harmony-ui/dialog"
+import type { IconName } from "@thesolaceproject/code-harmony-ui/icons/provider"
+import { List, type ListRef } from "@thesolaceproject/code-harmony-ui/list"
+import { ProviderIcon } from "@thesolaceproject/code-harmony-ui/provider-icon"
+import { Tag } from "@thesolaceproject/code-harmony-ui/tag"
+import { Tooltip } from "@thesolaceproject/code-harmony-ui/tooltip"
 import { type Component, onCleanup, onMount, Show } from "solid-js"
 import { useLocal } from "@/context/local"
 import { popularProviders, useProviders } from "@/hooks/use-providers"
@@ -55,7 +55,7 @@ export const DialogSelectModelUnpaid: Component = () => {
                 <ModelTooltip
                   model={item}
                   latest={item.latest}
-                  free={item.provider.id === "opencode" && (!item.cost || item.cost.input === 0)}
+                  free={item.provider.id === "code-harmony" && (!item.cost || item.cost.input === 0)}
                 />
               }
             >
@@ -104,7 +104,7 @@ export const DialogSelectModelUnpaid: Component = () => {
                   <div class="w-full flex items-center gap-x-3">
                     <ProviderIcon data-slot="list-item-extra-icon" id={i.id as IconName} />
                     <span>{i.name}</span>
-                    <Show when={i.id === "opencode"}>
+                    <Show when={i.id === "code-harmony"}>
                       <Tag>{language.t("dialog.provider.tag.recommended")}</Tag>
                     </Show>
                     <Show when={i.id === "anthropic"}>

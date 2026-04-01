@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { Script } from "@opencode-harmony/script"
+import { Script } from "@thesolaceproject/code-harmony-script"
 import { $ } from "bun"
 
 const dir = new URL("..", import.meta.url).pathname

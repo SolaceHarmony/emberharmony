@@ -23,9 +23,9 @@ on:
 jobs:
   nix-hashes:
     if: |
-      (github.event_name == 'workflow_dispatch' && github.ref_name == 'dev') ||
+      (github.event_name == 'workflow_dispatch' && github.ref_name == 'main') ||
       (github.event_name == 'push' &&
-        github.ref_name == 'dev' &&
+        github.ref_name == 'main' &&
         startsWith(github.event.head_commit.message, 'release: v')) ||
       (github.event_name == 'pull_request' &&
         github.event.pull_request.head.repo.full_name == github.repository)

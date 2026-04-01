@@ -1,10 +1,10 @@
-import { FileDiff, Message, Model, Part, Session } from "@opencode-harmony/sdk/v2"
-import { fn } from "@opencode-harmony/util/fn"
-import { iife } from "@opencode-harmony/util/iife"
-import { Identifier } from "@opencode-harmony/util/identifier"
+import { FileDiff, Message, Model, Part, Session } from "@thesolaceproject/code-harmony-sdk/v2"
+import { fn } from "@thesolaceproject/code-harmony-util/fn"
+import { iife } from "@thesolaceproject/code-harmony-util/iife"
+import { Identifier } from "@thesolaceproject/code-harmony-util/identifier"
 import z from "zod"
 import { Storage } from "./storage"
-import { Binary } from "@opencode-harmony/util/binary"
+import { Binary } from "@thesolaceproject/code-harmony-util/binary"
 
 export namespace Share {
   export const Info = z.object({

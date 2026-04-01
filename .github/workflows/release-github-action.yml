@@ -16,7 +16,7 @@ permissions:
 jobs:
   release:
     if: |
-      github.ref_name == 'dev' &&
+      github.ref_name == 'main' &&
       (github.event_name == 'workflow_dispatch' ||
         (github.event_name == 'push' &&
           startsWith(github.event.head_commit.message, 'release: v')))

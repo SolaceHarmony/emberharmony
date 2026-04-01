@@ -51,7 +51,7 @@ export default function BlackWorkspace() {
 
   return (
     <div data-page="black">
-      <Title>opencode</Title>
+      <Title>CodeHarmony</Title>
       <div data-component="header-gradient" />
       <header data-component="header">
         <div data-component="header-logo">
@@ -207,7 +207,7 @@ export default function BlackWorkspace() {
       <footer data-component="footer">
         <div data-slot="footer-content">
           <span data-slot="anomaly">
-            ©{new Date().getFullYear()} <a href="https://anoma.ly">Anomaly</a>
+            ©{new Date().getFullYear()} <a href="https://solace.ofharmony.ai">The Solace Project</a>
           </span>
           <a href={config.github.repoUrl} target="_blank">
             GitHub <span data-slot="github-stars">[{starCount()}]</span>
@@ -221,7 +221,7 @@ export default function BlackWorkspace() {
           </span>
         </div>
         <span data-slot="anomaly-alt">
-          ©{new Date().getFullYear()} <a href="https://anoma.ly">Anomaly</a>
+          ©{new Date().getFullYear()} <a href="https://solace.ofharmony.ai">The Solace Project</a>
         </span>
       </footer>
     </div>

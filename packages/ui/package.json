@@ -1,5 +1,5 @@
 {
-  "name": "@opencode-harmony/ui",
+  "name": "@thesolaceproject/code-harmony-ui",
   "version": "1.0.0",
   "type": "module",
   "license": "MIT",
@@ -40,8 +40,8 @@
   },
   "dependencies": {
     "@kobalte/core": "catalog:",
-    "@opencode-harmony/sdk": "workspace:*",
-    "@opencode-harmony/util": "workspace:*",
+    "@thesolaceproject/code-harmony-sdk": "workspace:*",
+    "@thesolaceproject/code-harmony-util": "workspace:*",
     "@pierre/diffs": "catalog:",
     "@shikijs/transformers": "3.9.2",
     "@solid-primitives/bounds": "0.1.3",

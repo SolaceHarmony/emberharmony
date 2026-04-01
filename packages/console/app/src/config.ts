@@ -3,7 +3,7 @@
  */
 export const config = {
   // Base URL
-  baseUrl: "https://opencode.ai",
+  baseUrl: "https://solace.ofharmony.ai",
 
   // GitHub
   github: {
@@ -16,8 +16,8 @@ export const config = {
 
   // Social links
   social: {
-    twitter: "https://x.com/opencode",
-    discord: "https://discord.gg/opencode",
+    website: "https://solace.ofharmony.ai",
+    discord: "https://discord.gg/EdF8f7JR",
   },
 
   // Static stats (used on landing page)

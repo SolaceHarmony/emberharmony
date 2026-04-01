@@ -1,5 +1,5 @@
 {
-  "name": "@opencode-harmony/app",
+  "name": "@thesolaceproject/code-harmony-app",
   "version": "1.0.0",
   "description": "",
   "type": "module",
@@ -36,9 +36,9 @@
   },
   "dependencies": {
     "@kobalte/core": "catalog:",
-    "@opencode-harmony/sdk": "workspace:*",
-    "@opencode-harmony/ui": "workspace:*",
-    "@opencode-harmony/util": "workspace:*",
+    "@thesolaceproject/code-harmony-sdk": "workspace:*",
+    "@thesolaceproject/code-harmony-ui": "workspace:*",
+    "@thesolaceproject/code-harmony-util": "workspace:*",
     "@shikijs/transformers": "3.9.2",
     "@solid-primitives/active-element": "2.1.3",
     "@solid-primitives/audio": "1.4.2",

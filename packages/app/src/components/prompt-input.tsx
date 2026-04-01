@@ -1,4 +1,4 @@
-import { useFilteredList } from "@opencode-harmony/ui/hooks"
+import { useFilteredList } from "@thesolaceproject/code-harmony-ui/hooks"
 import {
   createEffect,
   on,
@@ -31,20 +31,20 @@ import { useSDK } from "@/context/sdk"
 import { useNavigate, useParams } from "@solidjs/router"
 import { useSync } from "@/context/sync"
 import { useComments } from "@/context/comments"
-import { FileIcon } from "@opencode-harmony/ui/file-icon"
-import { MorphChevron } from "@opencode-harmony/ui/morph-chevron"
-import { Button } from "@opencode-harmony/ui/button"
-import { CycleLabel } from "@opencode-harmony/ui/cycle-label"
-import { Icon } from "@opencode-harmony/ui/icon"
-import { ProviderIcon } from "@opencode-harmony/ui/provider-icon"
-import type { IconName } from "@opencode-harmony/ui/icons/provider"
-import { Tooltip, TooltipKeybind } from "@opencode-harmony/ui/tooltip"
-import { IconButton } from "@opencode-harmony/ui/icon-button"
-import { Select } from "@opencode-harmony/ui/select"
-import { getDirectory, getFilename, getFilenameTruncated } from "@opencode-harmony/util/path"
-import { useDialog } from "@opencode-harmony/ui/context/dialog"
-import { ImagePreview } from "@opencode-harmony/ui/image-preview"
-import { ReasoningIcon } from "@opencode-harmony/ui/reasoning-icon"
+import { FileIcon } from "@thesolaceproject/code-harmony-ui/file-icon"
+import { MorphChevron } from "@thesolaceproject/code-harmony-ui/morph-chevron"
+import { Button } from "@thesolaceproject/code-harmony-ui/button"
+import { CycleLabel } from "@thesolaceproject/code-harmony-ui/cycle-label"
+import { Icon } from "@thesolaceproject/code-harmony-ui/icon"
+import { ProviderIcon } from "@thesolaceproject/code-harmony-ui/provider-icon"
+import type { IconName } from "@thesolaceproject/code-harmony-ui/icons/provider"
+import { Tooltip, TooltipKeybind } from "@thesolaceproject/code-harmony-ui/tooltip"
+import { IconButton } from "@thesolaceproject/code-harmony-ui/icon-button"
+import { Select } from "@thesolaceproject/code-harmony-ui/select"
+import { getDirectory, getFilename, getFilenameTruncated } from "@thesolaceproject/code-harmony-util/path"
+import { useDialog } from "@thesolaceproject/code-harmony-ui/context/dialog"
+import { ImagePreview } from "@thesolaceproject/code-harmony-ui/image-preview"
+import { ReasoningIcon } from "@thesolaceproject/code-harmony-ui/reasoning-icon"
 import { ModelSelectorPopover } from "@/components/dialog-select-model"
 import { DialogSelectModelUnpaid } from "@/components/dialog-select-model-unpaid"
 import { useProviders } from "@/hooks/use-providers"
@@ -57,10 +57,10 @@ import { usePermission } from "@/context/permission"
 import { useLanguage } from "@/context/language"
 import { useGlobalSync } from "@/context/global-sync"
 import { usePlatform } from "@/context/platform"
-import { createOpencodeClient, type Message, type Part } from "@opencode-harmony/sdk/v2/client"
-import { Binary } from "@opencode-harmony/util/binary"
-import { showToast } from "@opencode-harmony/ui/toast"
-import { base64Encode } from "@opencode-harmony/util/encode"
+import { createCodeHarmonyClient, type Message, type Part } from "@thesolaceproject/code-harmony-sdk/v2/client"
+import { Binary } from "@thesolaceproject/code-harmony-util/binary"
+import { showToast } from "@thesolaceproject/code-harmony-ui/toast"
+import { base64Encode } from "@thesolaceproject/code-harmony-util/encode"
 
 const ACCEPTED_IMAGE_TYPES = ["image/png", "image/jpeg", "image/gif", "image/webp"]
 const ACCEPTED_FILE_TYPES = [...ACCEPTED_IMAGE_TYPES, "application/pdf"]
@@ -1197,7 +1197,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
       }
 
       if (sessionDirectory !== projectDirectory) {
-        client = createOpencodeClient({
+        client = createCodeHarmonyClient({
           baseUrl: sdk.url,
           fetch: platform.fetch,
           directory: sessionDirectory,

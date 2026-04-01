@@ -11,6 +11,8 @@ playground
 tmp
 .tmp
 dist
+dist-local
+**/dist-local/
 ts-dist
 .turbo
 **/.serena

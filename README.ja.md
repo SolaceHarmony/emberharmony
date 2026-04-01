@@ -9,9 +9,9 @@
 </p>
 <p align="center">オープンソースのAIコーディングエージェント。</p>
 <p align="center">
-  <a href="https://github.com/SolaceHarmony/code-harmony/discussions"><img alt="Discord" src="https://img.shields.io/discord/1391832426048651334?style=flat-square&label=discord" /></a>
+  <a href="https://github.com/sydneyrenee/code-harmony/discussions"><img alt="Discord" src="https://img.shields.io/discord/1391832426048651334?style=flat-square&label=discord" /></a>
   <a href="https://www.npmjs.com/package/code-harmony"><img alt="npm" src="https://img.shields.io/npm/v/code-harmony?style=flat-square" /></a>
-  <a href="https://github.com/SolaceHarmony/code-harmony/actions/workflows/publish.yml"><img alt="Build status" src="https://img.shields.io/github/actions/workflow/status/SolaceHarmony/code-harmony/publish.yml?style=flat-square&branch=dev" /></a>
+  <a href="https://github.com/sydneyrenee/code-harmony/actions/workflows/publish.yml"><img alt="Build status" src="https://img.shields.io/github/actions/workflow/status/sydneyrenee/code-harmony/publish.yml?style=flat-square&branch=main" /></a>
 </p>
 
 <p align="center">
@@ -40,7 +40,7 @@
 
 ```bash
 # YOLO
-curl -fsSL https://raw.githubusercontent.com/SolaceHarmony/code-harmony/dev/install | bash
+curl -fsSL https://raw.githubusercontent.com/sydneyrenee/code-harmony/main/install | bash
 
 # パッケージマネージャー
 npm i -g code-harmony@latest        # bun/pnpm/yarn でもOK
@@ -48,7 +48,7 @@ scoop install code-harmony             # Windows
 choco install code-harmony             # Windows
 paru -S code-harmony-bin               # Arch Linux
 mise use -g code-harmony               # どのOSでも
-nix run nixpkgs#code-harmony           # または github:SolaceHarmony/code-harmony で最新 dev ブランチ
+nix run nixpkgs#code-harmony           # または github:sydneyrenee/code-harmony で最新 dev ブランチ
 ```
 
 > [!TIP]
@@ -56,18 +56,18 @@ nix run nixpkgs#code-harmony           # または github:SolaceHarmony/code-har
 
 ### デスクトップアプリ (BETA)
 
-CodeHarmony はデスクトップアプリとしても利用できます。[releases page](https://github.com/SolaceHarmony/code-harmony/releases) から直接ダウンロードするか、[solace.ofharmony.ai/download](https://github.com/SolaceHarmony/code-harmony/releases) を利用してください。
+CodeHarmony はデスクトップアプリとしても利用できます。[releases page](https://github.com/sydneyrenee/code-harmony/releases) から直接ダウンロードするか、[solace.ofharmony.ai/download](https://github.com/sydneyrenee/code-harmony/releases) を利用してください。
 
-| プラットフォーム      | ダウンロード                          |
-| --------------------- | ------------------------------------- |
+| プラットフォーム      | ダウンロード                              |
+| --------------------- | ----------------------------------------- |
 | macOS (Apple Silicon) | `code-harmony-desktop-darwin-aarch64.dmg` |
 | macOS (Intel)         | `code-harmony-desktop-darwin-x64.dmg`     |
 | Windows               | `code-harmony-desktop-windows-x64.exe`    |
-| Linux                 | `.deb`、`.rpm`、または AppImage       |
+| Linux                 | `.deb`、`.rpm`、または AppImage           |
 
 ```bash
 # Windows (Scoop)
-scoop bucket add extras; scoop install extras/code-harmony-desktop
+scoop bucket add extras; scoop install extras@thesolaceproject/code-harmony-desktop
 ```
 
 #### インストールディレクトリ
@@ -81,8 +81,8 @@ scoop bucket add extras; scoop install extras/code-harmony-desktop
 
 ```bash
 # 例
-CODE_HARMONY_INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/SolaceHarmony/code-harmony/dev/install | bash
-XDG_BIN_DIR=$HOME/.local/bin curl -fsSL https://raw.githubusercontent.com/SolaceHarmony/code-harmony/dev/install | bash
+CODE_HARMONY_INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/sydneyrenee/code-harmony/main/install | bash
+XDG_BIN_DIR=$HOME/.local/bin curl -fsSL https://raw.githubusercontent.com/sydneyrenee/code-harmony/main/install | bash
 ```
 
 ### Agents
@@ -110,7 +110,7 @@ CodeHarmony に貢献したい場合は、Pull Request を送る前に [contribu
 
 ### CodeHarmony の上に構築する
 
-CodeHarmony に関連するプロジェクトで、名前に "opencode"（例: "opencode-dashboard" や "opencode-mobile"）を含める場合は、そのプロジェクトが CodeHarmony チームによって作られたものではなく、いかなる形でも関係がないことを README に明記してください。
+CodeHarmony に関連するプロジェクトで、名前に "code-harmony"（例: "code-harmony-dashboard" や "code-harmony-mobile"）を含める場合は、そのプロジェクトが CodeHarmony チームによって作られたものではなく、いかなる形でも関係がないことを README に明記してください。
 
 ### FAQ
 
@@ -126,4 +126,4 @@ CodeHarmony に関連するプロジェクトで、名前に "opencode"（例: "
 
 ---
 
-**コミュニティに参加** [Discord](https://github.com/SolaceHarmony/code-harmony/discussions) | [X.com](https://github.com/SolaceHarmony/code-harmony)
+**コミュニティに参加** [Discord](https://github.com/sydneyrenee/code-harmony/discussions) | [X.com](https://github.com/sydneyrenee/code-harmony)

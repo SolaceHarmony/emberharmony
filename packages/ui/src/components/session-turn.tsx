@@ -6,15 +6,15 @@ import {
   type PermissionRequest,
   TextPart,
   ToolPart,
-} from "@opencode-harmony/sdk/v2/client"
-import { type FileDiff } from "@opencode-harmony/sdk/v2"
+} from "@thesolaceproject/code-harmony-sdk/v2/client"
+import { type FileDiff } from "@thesolaceproject/code-harmony-sdk/v2"
 import { useData } from "../context"
 import { useDiffComponent } from "../context/diff"
 import { type UiI18nKey, type UiI18nParams, useI18n } from "../context/i18n"
-import { findLast } from "@opencode-harmony/util/array"
-import { getDirectory, getFilename } from "@opencode-harmony/util/path"
+import { findLast } from "@thesolaceproject/code-harmony-util/array"
+import { getDirectory, getFilename } from "@thesolaceproject/code-harmony-util/path"
 
-import { Binary } from "@opencode-harmony/util/binary"
+import { Binary } from "@thesolaceproject/code-harmony-util/binary"
 import { createEffect, createMemo, createSignal, For, Match, on, onCleanup, ParentProps, Show, Switch } from "solid-js"
 import { DiffChanges } from "./diff-changes"
 import { Message, Part } from "./message-part"

@@ -24,7 +24,7 @@ function patterns() {
     { name: "Stripe secret key", re: /\bsk_(?:live|test)_[A-Za-z0-9]{10,}\b/g },
     { name: "Cerebras API key", re: /\bcsk-[A-Za-z0-9]{10,}\b/g },
     { name: "NPM token", re: /\bnpm_[A-Za-z0-9]{10,}\b/g },
-    { name: "OpenCode-style key", re: /\boc_(?:live_sk|test_sk|live|test|prod|dev)_[A-Za-z0-9]{10,}\b/g },
+    { name: "CodeHarmony-style key", re: /\boc_(?:live_sk|test_sk|live|test|prod|dev)_[A-Za-z0-9]{10,}\b/g },
     // Nix SRI hashes are not secrets, but scanners sometimes flag them.
     { name: "Nix SRI hash", re: /\bsha256-[A-Za-z0-9+/]{10,}={0,2}\b/g },
   ] as const
@@ -33,7 +33,9 @@ function patterns() {
 
 async function allowlist(root: string) {
   const file = join(root, "security/allowlist/manifest.json")
-  const text = await Bun.file(file).text().catch(() => "")
+  const text = await Bun.file(file)
+    .text()
+    .catch(() => "")
   if (!text) return []
 
   const data = JSON.parse(text) as { ignore?: Array<{ file?: string; kind?: string }> }
@@ -51,11 +53,7 @@ async function main() {
   const ts = new Date().toISOString().replace(/[:.]/g, "-")
   const base = (Bun.env.CODE_HARMONY_QUARANTINE_DIR ?? "").trim()
   const home = (Bun.env.HOME ?? "").trim()
-  const dir = base
-    ? base
-    : home
-      ? join(home, "Documents", "code-harmony-quarantine")
-      : join(root, ".quarantine")
+  const dir = base ? base : home ? join(home, "Documents", "code-harmony-quarantine") : join(root, ".quarantine")
   const out = join(dir, ts)
   await mkdir(out, { recursive: true })
   const allow = await allowlist(root)
@@ -96,7 +94,9 @@ async function main() {
     if (!info.isFile()) continue
     if (info.size > 2_000_000) continue
 
-    const text = await Bun.file(p).text().catch(() => "")
+    const text = await Bun.file(p)
+      .text()
+      .catch(() => "")
     if (!text) continue
 
     const found = patterns()

@@ -31,7 +31,9 @@ export function Footer() {
         <a href="/discord">Discord</a>
       </div>
       <div data-slot="cell">
-        <a href={config.social.twitter}>X</a>
+        <a href={config.social.website} target="_blank">
+          Website
+        </a>
       </div>
     </footer>
   )

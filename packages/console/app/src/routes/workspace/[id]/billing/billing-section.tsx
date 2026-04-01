@@ -1,7 +1,7 @@
 import { action, useParams, useAction, createAsync, useSubmission, json } from "@solidjs/router"
 import { createMemo, Match, Show, Switch, createEffect } from "solid-js"
 import { createStore } from "solid-js/store"
-import { Billing } from "@opencode-harmony/console-core/billing.js"
+import { Billing } from "@thesolaceproject/code-harmony-console-core/billing.js"
 import { withActor } from "~/context/auth.withActor"
 import { IconCreditCard, IconStripe } from "~/component/icon"
 import styles from "./billing-section.module.css"
@@ -139,7 +139,7 @@ export function BillingSection() {
       <div data-slot="section-title">
         <h2>Billing</h2>
         <p>
-          Manage payments methods. <a href="mailto:contact@anoma.ly">Contact us</a> if you have any questions.
+          Manage payments methods. <a href="mailto:sydney@solace.ofharmony.ai">Contact us</a> if you have any questions.
         </p>
       </div>
       <div data-slot="section-content">
