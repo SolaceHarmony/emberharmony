@@ -123,6 +123,13 @@ jobs:
 
           if [ -n "${APPLE_SIGNING_IDENTITY:-}" ]; then
             echo "CERT_ID=$APPLE_SIGNING_IDENTITY" >> "$GITHUB_ENV"
+
+            TEAM_ID=$(echo "$APPLE_SIGNING_IDENTITY" | sed -n 's/.*(\([A-Z0-9]\{10\}\)).*/\1/p')
+            if [ -n "${TEAM_ID:-}" ]; then
+              echo "APPLE_TEAM_ID=$TEAM_ID" >> "$GITHUB_ENV"
+              echo "Using APPLE_TEAM_ID from signing identity: $TEAM_ID"
+            fi
+
             echo "Using APPLE_SIGNING_IDENTITY override."
             security find-identity -v -p codesigning build.keychain | cat
             exit 0
@@ -138,6 +145,12 @@ jobs:
           CERT_ID=$(echo "$CERT_INFO" | awk -F'"' '{print $2}')
           echo "CERT_ID=$CERT_ID" >> "$GITHUB_ENV"
           echo "Certificate imported: $CERT_ID"
+
+          TEAM_ID=$(echo "$CERT_ID" | sed -n 's/.*(\([A-Z0-9]\{10\}\)).*/\1/p')
+          if [ -n "${TEAM_ID:-}" ]; then
+            echo "APPLE_TEAM_ID=$TEAM_ID" >> "$GITHUB_ENV"
+            echo "Detected APPLE_TEAM_ID from certificate: $TEAM_ID"
+          fi
 
       - name: Setup Apple API Key
         if: ${{ runner.os == 'macOS' && env.APPLE_API_KEY_PATH != '' }}
@@ -217,7 +230,7 @@ jobs:
           APPLE_API_KEY_PATH: ${{ runner.temp }}/apple-api-key.p8
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_TEAM_ID: ${{ env.APPLE_TEAM_ID }}
 
   publish:
     if: github.repository == 'SolaceHarmony/code-harmony'
