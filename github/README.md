@@ -1,6 +1,6 @@
 # CodeHarmony GitHub Action
 
-A GitHub Action that integrates [CodeHarmony](https://github.com/SolaceHarmony/code-harmony) directly into your GitHub workflow.
+A GitHub Action that integrates [CodeHarmony](https://github.com/sydneyrenee/code-harmony) directly into your GitHub workflow.
 
 Mention `/code-harmony` or `/oc` in your comment, and CodeHarmony will execute tasks within your GitHub Actions runner.
 
@@ -56,15 +56,14 @@ Run the following command in the terminal from your GitHub repo:
 code-harmony github install
 ```
 
-This will walk you through installing the GitHub app, creating the workflow, and setting up secrets.
+This will walk you through creating the workflow and setting up secrets.
 
 ### Manual Setup
 
-1. Install the GitHub app https://github.com/apps/opencode-agent. Make sure it is installed on the target repository.
-2. Add the following workflow file to `.github/workflows/code-harmony.yml` in your repo. Set the appropriate `model` and required API keys in `env`.
+1. Add the following workflow file to `.github/workflows/code-harmony.yml` in your repo. Set the appropriate `model` and required API keys in `env`.
 
    ```yml
-   name: opencode
+   name: code-harmony
 
    on:
      issue_comment:
@@ -73,35 +72,32 @@ This will walk you through installing the GitHub app, creating the workflow, and
        types: [created]
 
    jobs:
-     opencode:
+     code-harmony:
        if: |
          contains(github.event.comment.body, '/oc') ||
          contains(github.event.comment.body, '/code-harmony')
        runs-on: ubuntu-latest
        permissions:
-         id-token: write
+         contents: write
+         pull-requests: write
+         issues: write
        steps:
-          - name: Checkout repository
-            uses: actions/checkout@v6
-            with:
-              fetch-depth: 1
-              persist-credentials: false
+         - uses: actions/checkout@v4
 
-          - name: Run code-harmony
-            uses: SolaceHarmony/code-harmony/github@latest
+         - name: Run code-harmony
+           uses: sydneyrenee/code-harmony/github@latest
            env:
+             GITHUB_TOKEN: ${{ github.token }}
              ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-             GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
            with:
              model: anthropic/claude-sonnet-4-20250514
-             use_github_token: true
    ```
 
-3. Store the API keys in secrets. In your organization or project **settings**, expand **Secrets and variables** on the left and select **Actions**. Add the required API keys.
+2. Store the API keys in secrets. In your organization or project **settings**, expand **Secrets and variables** on the left and select **Actions**. Add the required API keys.
 
 ## Support
 
-This is an early release. If you encounter issues or have feedback, please create an issue at https://github.com/SolaceHarmony/code-harmony/issues.
+This is an early release. If you encounter issues or have feedback, please create an issue at https://github.com/sydneyrenee/code-harmony/issues.
 
 ## Development
 
@@ -134,7 +130,7 @@ To test locally:
 ### Issue comment event
 
 ```
-MOCK_EVENT='{"eventName":"issue_comment","repo":{"owner":"sst","repo":"hello-world"},"actor":"fwang","payload":{"issue":{"number":4},"comment":{"id":1,"body":"hey opencode, summarize thread"}}}'
+MOCK_EVENT='{"eventName":"issue_comment","repo":{"owner":"sst","repo":"hello-world"},"actor":"fwang","payload":{"issue":{"number":4},"comment":{"id":1,"body":"/code-harmony summarize thread"}}}'
 ```
 
 Replace:
@@ -143,12 +139,12 @@ Replace:
 - `"repo":"hello-world"` with repo name
 - `"actor":"fwang"` with the GitHub username of commenter
 - `"number":4` with the GitHub issue id
-- `"body":"hey opencode, summarize thread"` with comment body
+- `"body":"/code-harmony summarize thread"` with comment body
 
 ### Issue comment with image attachment.
 
 ```
-MOCK_EVENT='{"eventName":"issue_comment","repo":{"owner":"sst","repo":"hello-world"},"actor":"fwang","payload":{"issue":{"number":4},"comment":{"id":1,"body":"hey opencode, what is in my image ![Image](https://github.com/user-attachments/assets/xxxxxxxx)"}}}'
+MOCK_EVENT='{"eventName":"issue_comment","repo":{"owner":"sst","repo":"hello-world"},"actor":"fwang","payload":{"issue":{"number":4},"comment":{"id":1,"body":"/code-harmony what is in my image ![Image](https://github.com/user-attachments/assets/xxxxxxxx)"}}}'
 ```
 
 Replace the image URL `https://github.com/user-attachments/assets/xxxxxxxx` with a valid GitHub attachment (you can generate one by commenting with an image in any issue).
@@ -156,11 +152,11 @@ Replace the image URL `https://github.com/user-attachments/assets/xxxxxxxx` with
 ### PR comment event
 
 ```
-MOCK_EVENT='{"eventName":"issue_comment","repo":{"owner":"sst","repo":"hello-world"},"actor":"fwang","payload":{"issue":{"number":4,"pull_request":{}},"comment":{"id":1,"body":"hey opencode, summarize thread"}}}'
+MOCK_EVENT='{"eventName":"issue_comment","repo":{"owner":"sst","repo":"hello-world"},"actor":"fwang","payload":{"issue":{"number":4,"pull_request":{}},"comment":{"id":1,"body":"/code-harmony summarize thread"}}}'
 ```
 
 ### PR review comment event
 
 ```
-MOCK_EVENT='{"eventName":"pull_request_review_comment","repo":{"owner":"sst","repo":"hello-world"},"actor":"fwang","payload":{"pull_request":{"number":7},"comment":{"id":1,"body":"hey opencode, add error handling","path":"src/components/Button.tsx","diff_hunk":"@@ -45,8 +45,11 @@\n- const handleClick = () => {\n-   console.log('clicked')\n+ const handleClick = useCallback(() => {\n+   console.log('clicked')\n+   doSomething()\n+ }, [doSomething])","line":47,"original_line":45,"position":10,"commit_id":"abc123","original_commit_id":"def456"}}}'
+MOCK_EVENT='{"eventName":"pull_request_review_comment","repo":{"owner":"sst","repo":"hello-world"},"actor":"fwang","payload":{"pull_request":{"number":7},"comment":{"id":1,"body":"/oc add error handling","path":"src/components/Button.tsx","diff_hunk":"@@ -45,8 +45,11 @@\n- const handleClick = () => {\n-   console.log('clicked')\n+ const handleClick = useCallback(() => {\n+   console.log('clicked')\n+   doSomething()\n+ }, [doSomething])","line":47,"original_line":45,"position":10,"commit_id":"abc123","original_commit_id":"def456"}}}'
 ```

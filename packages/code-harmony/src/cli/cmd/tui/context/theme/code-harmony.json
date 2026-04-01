@@ -1,0 +1,218 @@
+{
+  "$schema": "https://solace.ofharmony.ai/theme.json",
+  "defs": {
+    "black": "#000000",
+    "white": "#ffffff"
+  },
+  "theme": {
+    "primary": {
+      "dark": "white",
+      "light": "white"
+    },
+    "secondary": {
+      "dark": "white",
+      "light": "white"
+    },
+    "accent": {
+      "dark": "white",
+      "light": "white"
+    },
+    "error": {
+      "dark": "white",
+      "light": "white"
+    },
+    "warning": {
+      "dark": "white",
+      "light": "white"
+    },
+    "success": {
+      "dark": "white",
+      "light": "white"
+    },
+    "info": {
+      "dark": "white",
+      "light": "white"
+    },
+    "text": {
+      "dark": "white",
+      "light": "white"
+    },
+    "textMuted": {
+      "dark": "white",
+      "light": "white"
+    },
+    "selectedListItemText": {
+      "dark": "white",
+      "light": "white"
+    },
+    "background": {
+      "dark": "black",
+      "light": "black"
+    },
+    "backgroundPanel": {
+      "dark": "black",
+      "light": "black"
+    },
+    "backgroundElement": {
+      "dark": "black",
+      "light": "black"
+    },
+    "backgroundMenu": {
+      "dark": "black",
+      "light": "black"
+    },
+    "border": {
+      "dark": "white",
+      "light": "white"
+    },
+    "borderActive": {
+      "dark": "white",
+      "light": "white"
+    },
+    "borderSubtle": {
+      "dark": "white",
+      "light": "white"
+    },
+    "diffAdded": {
+      "dark": "white",
+      "light": "white"
+    },
+    "diffRemoved": {
+      "dark": "white",
+      "light": "white"
+    },
+    "diffContext": {
+      "dark": "white",
+      "light": "white"
+    },
+    "diffHunkHeader": {
+      "dark": "white",
+      "light": "white"
+    },
+    "diffHighlightAdded": {
+      "dark": "white",
+      "light": "white"
+    },
+    "diffHighlightRemoved": {
+      "dark": "white",
+      "light": "white"
+    },
+    "diffAddedBg": {
+      "dark": "black",
+      "light": "black"
+    },
+    "diffRemovedBg": {
+      "dark": "black",
+      "light": "black"
+    },
+    "diffContextBg": {
+      "dark": "black",
+      "light": "black"
+    },
+    "diffLineNumber": {
+      "dark": "white",
+      "light": "white"
+    },
+    "diffAddedLineNumberBg": {
+      "dark": "black",
+      "light": "black"
+    },
+    "diffRemovedLineNumberBg": {
+      "dark": "black",
+      "light": "black"
+    },
+    "markdownText": {
+      "dark": "white",
+      "light": "white"
+    },
+    "markdownHeading": {
+      "dark": "white",
+      "light": "white"
+    },
+    "markdownLink": {
+      "dark": "white",
+      "light": "white"
+    },
+    "markdownLinkText": {
+      "dark": "white",
+      "light": "white"
+    },
+    "markdownCode": {
+      "dark": "white",
+      "light": "white"
+    },
+    "markdownBlockQuote": {
+      "dark": "white",
+      "light": "white"
+    },
+    "markdownEmph": {
+      "dark": "white",
+      "light": "white"
+    },
+    "markdownStrong": {
+      "dark": "white",
+      "light": "white"
+    },
+    "markdownHorizontalRule": {
+      "dark": "white",
+      "light": "white"
+    },
+    "markdownListItem": {
+      "dark": "white",
+      "light": "white"
+    },
+    "markdownListEnumeration": {
+      "dark": "white",
+      "light": "white"
+    },
+    "markdownImage": {
+      "dark": "white",
+      "light": "white"
+    },
+    "markdownImageText": {
+      "dark": "white",
+      "light": "white"
+    },
+    "markdownCodeBlock": {
+      "dark": "white",
+      "light": "white"
+    },
+    "syntaxComment": {
+      "dark": "white",
+      "light": "white"
+    },
+    "syntaxKeyword": {
+      "dark": "white",
+      "light": "white"
+    },
+    "syntaxFunction": {
+      "dark": "white",
+      "light": "white"
+    },
+    "syntaxVariable": {
+      "dark": "white",
+      "light": "white"
+    },
+    "syntaxString": {
+      "dark": "white",
+      "light": "white"
+    },
+    "syntaxNumber": {
+      "dark": "white",
+      "light": "white"
+    },
+    "syntaxType": {
+      "dark": "white",
+      "light": "white"
+    },
+    "syntaxOperator": {
+      "dark": "white",
+      "light": "white"
+    },
+    "syntaxPunctuation": {
+      "dark": "white",
+      "light": "white"
+    },
+    "thinkingOpacity": 1
+  }
+}

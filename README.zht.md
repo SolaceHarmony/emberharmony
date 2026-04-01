@@ -9,9 +9,9 @@
 </p>
 <p align="center">開源的 AI Coding Agent。</p>
 <p align="center">
-  <a href="https://github.com/SolaceHarmony/code-harmony/discussions"><img alt="Discord" src="https://img.shields.io/discord/1391832426048651334?style=flat-square&label=discord" /></a>
+  <a href="https://github.com/sydneyrenee/code-harmony/discussions"><img alt="Discord" src="https://img.shields.io/discord/1391832426048651334?style=flat-square&label=discord" /></a>
   <a href="https://www.npmjs.com/package/code-harmony"><img alt="npm" src="https://img.shields.io/npm/v/code-harmony?style=flat-square" /></a>
-  <a href="https://github.com/SolaceHarmony/code-harmony/actions/workflows/publish.yml"><img alt="Build status" src="https://img.shields.io/github/actions/workflow/status/SolaceHarmony/code-harmony/publish.yml?style=flat-square&branch=dev" /></a>
+  <a href="https://github.com/sydneyrenee/code-harmony/actions/workflows/publish.yml"><img alt="Build status" src="https://img.shields.io/github/actions/workflow/status/sydneyrenee/code-harmony/publish.yml?style=flat-square&branch=main" /></a>
 </p>
 
 <p align="center">
@@ -40,7 +40,7 @@
 
 ```bash
 # 直接安裝 (YOLO)
-curl -fsSL https://raw.githubusercontent.com/SolaceHarmony/code-harmony/dev/install | bash
+curl -fsSL https://raw.githubusercontent.com/sydneyrenee/code-harmony/main/install | bash
 
 # 套件管理員
 npm i -g code-harmony@latest        # 也可使用 bun/pnpm/yarn
@@ -48,7 +48,7 @@ scoop install code-harmony             # Windows
 choco install code-harmony             # Windows
 paru -S code-harmony-bin               # Arch Linux
 mise use -g code-harmony               # 任何作業系統
-nix run nixpkgs#code-harmony           # 或使用 github:SolaceHarmony/code-harmony 以取得最新開發分支
+nix run nixpkgs#code-harmony           # 或使用 github:sydneyrenee/code-harmony 以取得最新開發分支
 ```
 
 > [!TIP]
@@ -56,18 +56,18 @@ nix run nixpkgs#code-harmony           # 或使用 github:SolaceHarmony/code-har
 
 ### 桌面應用程式 (BETA)
 
-CodeHarmony 也提供桌面版應用程式。您可以直接從 [發佈頁面 (releases page)](https://github.com/SolaceHarmony/code-harmony/releases) 或 [solace.ofharmony.ai/download](https://github.com/SolaceHarmony/code-harmony/releases) 下載。
+CodeHarmony 也提供桌面版應用程式。您可以直接從 [發佈頁面 (releases page)](https://github.com/sydneyrenee/code-harmony/releases) 或 [solace.ofharmony.ai/download](https://github.com/sydneyrenee/code-harmony/releases) 下載。
 
-| 平台                  | 下載連結                              |
-| --------------------- | ------------------------------------- |
+| 平台                  | 下載連結                                  |
+| --------------------- | ----------------------------------------- |
 | macOS (Apple Silicon) | `code-harmony-desktop-darwin-aarch64.dmg` |
 | macOS (Intel)         | `code-harmony-desktop-darwin-x64.dmg`     |
 | Windows               | `code-harmony-desktop-windows-x64.exe`    |
-| Linux                 | `.deb`, `.rpm`, 或 AppImage           |
+| Linux                 | `.deb`, `.rpm`, 或 AppImage               |
 
 ```bash
 # Windows (Scoop)
-scoop bucket add extras; scoop install extras/code-harmony-desktop
+scoop bucket add extras; scoop install extras@thesolaceproject/code-harmony-desktop
 ```
 
 #### 安裝目錄
@@ -81,8 +81,8 @@ scoop bucket add extras; scoop install extras/code-harmony-desktop
 
 ```bash
 # 範例
-CODE_HARMONY_INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/SolaceHarmony/code-harmony/dev/install | bash
-XDG_BIN_DIR=$HOME/.local/bin curl -fsSL https://raw.githubusercontent.com/SolaceHarmony/code-harmony/dev/install | bash
+CODE_HARMONY_INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/sydneyrenee/code-harmony/main/install | bash
+XDG_BIN_DIR=$HOME/.local/bin curl -fsSL https://raw.githubusercontent.com/sydneyrenee/code-harmony/main/install | bash
 ```
 
 ### Agents
@@ -109,7 +109,7 @@ CodeHarmony 內建了兩種 Agent，您可以使用 `Tab` 鍵快速切換。
 
 ### 基於 CodeHarmony 進行開發
 
-如果您正在開發與 CodeHarmony 相關的專案，並在名稱中使用了 "opencode"（例如 "opencode-dashboard" 或 "opencode-mobile"），請在您的 README 中加入聲明，說明該專案並非由 CodeHarmony 團隊開發，且與我們沒有任何隸屬關係。
+如果您正在開發與 CodeHarmony 相關的專案，並在名稱中使用了 "code-harmony"（例如 "code-harmony-dashboard" 或 "code-harmony-mobile"），請在您的 README 中加入聲明，說明該專案並非由 CodeHarmony 團隊開發，且與我們沒有任何隸屬關係。
 
 ### 常見問題 (FAQ)
 
@@ -125,4 +125,4 @@ CodeHarmony 內建了兩種 Agent，您可以使用 `Tab` 鍵快速切換。
 
 ---
 
-**加入我們的社群** [Discord](https://github.com/SolaceHarmony/code-harmony/discussions) | [X.com](https://github.com/SolaceHarmony/code-harmony)
+**加入我們的社群** [Discord](https://github.com/sydneyrenee/code-harmony/discussions) | [X.com](https://github.com/sydneyrenee/code-harmony)

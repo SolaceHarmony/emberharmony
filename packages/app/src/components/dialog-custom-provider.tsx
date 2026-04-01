@@ -1,10 +1,10 @@
-import { Button } from "@opencode-harmony/ui/button"
-import { useDialog } from "@opencode-harmony/ui/context/dialog"
-import { Dialog } from "@opencode-harmony/ui/dialog"
-import { IconButton } from "@opencode-harmony/ui/icon-button"
-import { ProviderIcon } from "@opencode-harmony/ui/provider-icon"
-import { TextField } from "@opencode-harmony/ui/text-field"
-import { showToast } from "@opencode-harmony/ui/toast"
+import { Button } from "@thesolaceproject/code-harmony-ui/button"
+import { useDialog } from "@thesolaceproject/code-harmony-ui/context/dialog"
+import { Dialog } from "@thesolaceproject/code-harmony-ui/dialog"
+import { IconButton } from "@thesolaceproject/code-harmony-ui/icon-button"
+import { ProviderIcon } from "@thesolaceproject/code-harmony-ui/provider-icon"
+import { TextField } from "@thesolaceproject/code-harmony-ui/text-field"
+import { showToast } from "@thesolaceproject/code-harmony-ui/toast"
 import { For } from "solid-js"
 import { createStore, produce } from "solid-js/store"
 import { Link } from "@/components/link"
@@ -284,7 +284,7 @@ export function DialogCustomProvider(props: Props) {
         <form onSubmit={save} class="px-2.5 pb-6 flex flex-col gap-6">
           <p class="text-14-regular text-text-base">
             Configure an OpenAI-compatible provider. See the{" "}
-            <Link href="https://opencode.ai/docs/providers/#custom-provider" tabIndex={-1}>
+            <Link href="https://solace.ofharmony.ai/docs/providers/#custom-provider" tabIndex={-1}>
               provider config docs
             </Link>
             .

@@ -6,9 +6,9 @@ import { bundledLanguages, type BundledLanguage } from "shiki"
 import { createSimpleContext } from "./helper"
 import { getSharedHighlighter, registerCustomTheme, ThemeRegistrationResolved } from "@pierre/diffs"
 
-registerCustomTheme("OpenCode", () => {
+const theme = (name: string) => {
   return Promise.resolve({
-    name: "OpenCode",
+    name,
     colors: {
       "editor.background": "transparent",
       "editor.foreground": "var(--text-base)",
@@ -374,7 +374,9 @@ registerCustomTheme("OpenCode", () => {
       "variable.defaultLibrary": "var(--syntax-unknown)",
     },
   } as unknown as ThemeRegistrationResolved)
-})
+}
+
+registerCustomTheme("CodeHarmony", () => theme("CodeHarmony"))
 
 function renderMathInText(text: string): string {
   let result = text
@@ -428,7 +430,7 @@ async function highlightCodeBlocks(html: string): Promise<string> {
   const matches = [...html.matchAll(codeBlockRegex)]
   if (matches.length === 0) return html
 
-  const highlighter = await getSharedHighlighter({ themes: ["OpenCode"], langs: [] })
+  const highlighter = await getSharedHighlighter({ themes: ["CodeHarmony"], langs: [] })
 
   let result = html
   for (const match of matches) {
@@ -450,7 +452,7 @@ async function highlightCodeBlocks(html: string): Promise<string> {
 
     const highlighted = highlighter.codeToHtml(code, {
       lang: language,
-      theme: "OpenCode",
+      theme: "CodeHarmony",
       tabindex: false,
     })
     result = result.replace(fullMatch, () => highlighted)
@@ -479,7 +481,7 @@ export const { use: useMarked, provider: MarkedProvider } = createSimpleContext(
       }),
       markedShiki({
         async highlight(code, lang) {
-          const highlighter = await getSharedHighlighter({ themes: ["OpenCode"], langs: [] })
+          const highlighter = await getSharedHighlighter({ themes: ["CodeHarmony"], langs: [] })
           if (!(lang in bundledLanguages)) {
             lang = "text"
           }
@@ -488,7 +490,7 @@ export const { use: useMarked, provider: MarkedProvider } = createSimpleContext(
           }
           return highlighter.codeToHtml(code, {
             lang: lang || "text",
-            theme: "OpenCode",
+            theme: "CodeHarmony",
             tabindex: false,
           })
         },

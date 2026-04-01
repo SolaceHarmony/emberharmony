@@ -1,18 +1,22 @@
 import type { APIEvent } from "@solidjs/start/server"
-import { and, Database, eq, isNull, lt, or, sql } from "@opencode-harmony/console-core/drizzle/index.js"
-import { KeyTable } from "@opencode-harmony/console-core/schema/key.sql.js"
-import { BillingTable, SubscriptionTable, UsageTable } from "@opencode-harmony/console-core/schema/billing.sql.js"
-import { centsToMicroCents } from "@opencode-harmony/console-core/util/price.js"
-import { getWeekBounds } from "@opencode-harmony/console-core/util/date.js"
-import { Identifier } from "@opencode-harmony/console-core/identifier.js"
-import { Billing } from "@opencode-harmony/console-core/billing.js"
-import { Actor } from "@opencode-harmony/console-core/actor.js"
-import { WorkspaceTable } from "@opencode-harmony/console-core/schema/workspace.sql.js"
-import { ZenData } from "@opencode-harmony/console-core/model.js"
-import { Black, BlackData } from "@opencode-harmony/console-core/black.js"
-import { UserTable } from "@opencode-harmony/console-core/schema/user.sql.js"
-import { ModelTable } from "@opencode-harmony/console-core/schema/model.sql.js"
-import { ProviderTable } from "@opencode-harmony/console-core/schema/provider.sql.js"
+import { and, Database, eq, isNull, lt, or, sql } from "@thesolaceproject/code-harmony-console-core/drizzle/index.js"
+import { KeyTable } from "@thesolaceproject/code-harmony-console-core/schema/key.sql.js"
+import {
+  BillingTable,
+  SubscriptionTable,
+  UsageTable,
+} from "@thesolaceproject/code-harmony-console-core/schema/billing.sql.js"
+import { centsToMicroCents } from "@thesolaceproject/code-harmony-console-core/util/price.js"
+import { getWeekBounds } from "@thesolaceproject/code-harmony-console-core/util/date.js"
+import { Identifier } from "@thesolaceproject/code-harmony-console-core/identifier.js"
+import { Billing } from "@thesolaceproject/code-harmony-console-core/billing.js"
+import { Actor } from "@thesolaceproject/code-harmony-console-core/actor.js"
+import { WorkspaceTable } from "@thesolaceproject/code-harmony-console-core/schema/workspace.sql.js"
+import { ZenData } from "@thesolaceproject/code-harmony-console-core/model.js"
+import { Black, BlackData } from "@thesolaceproject/code-harmony-console-core/black.js"
+import { UserTable } from "@thesolaceproject/code-harmony-console-core/schema/user.sql.js"
+import { ModelTable } from "@thesolaceproject/code-harmony-console-core/schema/model.sql.js"
+import { ProviderTable } from "@thesolaceproject/code-harmony-console-core/schema/provider.sql.js"
 import { logger } from "./logger"
 import {
   AuthError,
@@ -55,7 +59,7 @@ export async function handler(
   const MAX_RETRIES = 3
   const FREE_WORKSPACES = [
     "wrk_01K46JDFR0E75SG2Q8K172KF3Y", // frank
-    "wrk_01K6W1A3VE0KMNVSCQT43BG2SX", // opencode bench
+    "wrk_01K6W1A3VE0KMNVSCQT43BG2SX", // code-harmony bench
   ]
 
   try {
@@ -64,20 +68,20 @@ export async function handler(
     const model = opts.parseModel(url, body)
     const isStream = opts.parseIsStream(url, body)
     const ip = input.request.headers.get("x-real-ip") ?? ""
-    const sessionId = input.request.headers.get("x-opencode-session") ?? ""
-    const requestId = input.request.headers.get("x-opencode-request") ?? ""
-    const projectId = input.request.headers.get("x-opencode-project") ?? ""
-    const ocClient = input.request.headers.get("x-opencode-client") ?? ""
+    const sessionId = input.request.headers.get("x-code-harmony-session") ?? ""
+    const requestId = input.request.headers.get("x-code-harmony-request") ?? ""
+    const projectId = input.request.headers.get("x-code-harmony-project") ?? ""
+    const client = input.request.headers.get("x-code-harmony-client") ?? ""
     logger.metric({
       is_tream: isStream,
       session: sessionId,
       request: requestId,
-      client: ocClient,
+      client,
     })
     const zenData = ZenData.list()
     const modelInfo = validateModel(zenData, model)
     const dataDumper = createDataDumper(sessionId, requestId, projectId)
-    const trialLimiter = createTrialLimiter(modelInfo.trial, ip, ocClient)
+    const trialLimiter = createTrialLimiter(modelInfo.trial, ip, client)
     const isTrial = await trialLimiter?.isTrial()
     const rateLimiter = createRateLimiter(modelInfo.rateLimit, ip)
     await rateLimiter?.check()
@@ -121,10 +125,10 @@ export async function handler(
           })
           headers.delete("host")
           headers.delete("content-length")
-          headers.delete("x-opencode-request")
-          headers.delete("x-opencode-session")
-          headers.delete("x-opencode-project")
-          headers.delete("x-opencode-client")
+          headers.delete("x-code-harmony-request")
+          headers.delete("x-code-harmony-session")
+          headers.delete("x-code-harmony-project")
+          headers.delete("x-code-harmony-client")
           return headers
         })(),
         body: reqBody,
@@ -542,11 +546,11 @@ export async function handler(
     const billing = authInfo.billing
     if (!billing.paymentMethodID)
       throw new CreditsError(
-        `No payment method. Add a payment method here: https://opencode.ai/workspace/${authInfo.workspaceID}/billing`,
+        `No payment method. Add a payment method here: https://solace.ofharmony.ai/workspace/${authInfo.workspaceID}/billing`,
       )
     if (billing.balance <= 0)
       throw new CreditsError(
-        `Insufficient balance. Manage your billing here: https://opencode.ai/workspace/${authInfo.workspaceID}/billing`,
+        `Insufficient balance. Manage your billing here: https://solace.ofharmony.ai/workspace/${authInfo.workspaceID}/billing`,
       )
 
     const now = new Date()
@@ -561,7 +565,7 @@ export async function handler(
       currentMonth === billing.timeMonthlyUsageUpdated.getUTCMonth()
     )
       throw new MonthlyLimitError(
-        `Your workspace has reached its monthly spending limit of $${billing.monthlyLimit}. Manage your limits here: https://opencode.ai/workspace/${authInfo.workspaceID}/billing`,
+        `Your workspace has reached its monthly spending limit of $${billing.monthlyLimit}. Manage your limits here: https://solace.ofharmony.ai/workspace/${authInfo.workspaceID}/billing`,
       )
 
     if (
@@ -573,7 +577,7 @@ export async function handler(
       currentMonth === authInfo.user.timeMonthlyUsageUpdated.getUTCMonth()
     )
       throw new UserLimitError(
-        `You have reached your monthly spending limit of $${authInfo.user.monthlyLimit}. Manage your limits here: https://opencode.ai/workspace/${authInfo.workspaceID}/members`,
+        `You have reached your monthly spending limit of $${authInfo.user.monthlyLimit}. Manage your limits here: https://solace.ofharmony.ai/workspace/${authInfo.workspaceID}/members`,
       )
 
     return "balance"

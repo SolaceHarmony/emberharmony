@@ -9,9 +9,9 @@
 </p>
 <p align="center">O agente de programação com IA de código aberto.</p>
 <p align="center">
-  <a href="https://github.com/SolaceHarmony/code-harmony/discussions"><img alt="Discord" src="https://img.shields.io/discord/1391832426048651334?style=flat-square&label=discord" /></a>
+  <a href="https://github.com/sydneyrenee/code-harmony/discussions"><img alt="Discord" src="https://img.shields.io/discord/1391832426048651334?style=flat-square&label=discord" /></a>
   <a href="https://www.npmjs.com/package/code-harmony"><img alt="npm" src="https://img.shields.io/npm/v/code-harmony?style=flat-square" /></a>
-  <a href="https://github.com/SolaceHarmony/code-harmony/actions/workflows/publish.yml"><img alt="Build status" src="https://img.shields.io/github/actions/workflow/status/SolaceHarmony/code-harmony/publish.yml?style=flat-square&branch=dev" /></a>
+  <a href="https://github.com/sydneyrenee/code-harmony/actions/workflows/publish.yml"><img alt="Build status" src="https://img.shields.io/github/actions/workflow/status/sydneyrenee/code-harmony/publish.yml?style=flat-square&branch=main" /></a>
 </p>
 
 <p align="center">
@@ -40,7 +40,7 @@
 
 ```bash
 # YOLO
-curl -fsSL https://raw.githubusercontent.com/SolaceHarmony/code-harmony/dev/install | bash
+curl -fsSL https://raw.githubusercontent.com/sydneyrenee/code-harmony/main/install | bash
 
 # Gerenciadores de pacotes
 npm i -g code-harmony@latest        # ou bun/pnpm/yarn
@@ -48,7 +48,7 @@ scoop install code-harmony             # Windows
 choco install code-harmony             # Windows
 paru -S code-harmony-bin               # Arch Linux
 mise use -g code-harmony               # qualquer sistema
-nix run nixpkgs#code-harmony           # ou github:SolaceHarmony/code-harmony para a branch dev mais recente
+nix run nixpkgs#code-harmony           # ou github:sydneyrenee/code-harmony para a branch dev mais recente
 ```
 
 > [!TIP]
@@ -56,18 +56,18 @@ nix run nixpkgs#code-harmony           # ou github:SolaceHarmony/code-harmony pa
 
 ### App desktop (BETA)
 
-O CodeHarmony também está disponível como aplicativo desktop. Baixe diretamente pela [página de releases](https://github.com/SolaceHarmony/code-harmony/releases) ou em [solace.ofharmony.ai/download](https://github.com/SolaceHarmony/code-harmony/releases).
+O CodeHarmony também está disponível como aplicativo desktop. Baixe diretamente pela [página de releases](https://github.com/sydneyrenee/code-harmony/releases) ou em [solace.ofharmony.ai/download](https://github.com/sydneyrenee/code-harmony/releases).
 
-| Plataforma            | Download                              |
-| --------------------- | ------------------------------------- |
+| Plataforma            | Download                                  |
+| --------------------- | ----------------------------------------- |
 | macOS (Apple Silicon) | `code-harmony-desktop-darwin-aarch64.dmg` |
 | macOS (Intel)         | `code-harmony-desktop-darwin-x64.dmg`     |
 | Windows               | `code-harmony-desktop-windows-x64.exe`    |
-| Linux                 | `.deb`, `.rpm` ou AppImage            |
+| Linux                 | `.deb`, `.rpm` ou AppImage                |
 
 ```bash
 # Windows (Scoop)
-scoop bucket add extras; scoop install extras/code-harmony-desktop
+scoop bucket add extras; scoop install extras@thesolaceproject/code-harmony-desktop
 ```
 
 #### Diretório de instalação
@@ -81,8 +81,8 @@ O script de instalação respeita a seguinte ordem de prioridade para o caminho 
 
 ```bash
 # Exemplos
-CODE_HARMONY_INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/SolaceHarmony/code-harmony/dev/install | bash
-XDG_BIN_DIR=$HOME/.local/bin curl -fsSL https://raw.githubusercontent.com/SolaceHarmony/code-harmony/dev/install | bash
+CODE_HARMONY_INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/sydneyrenee/code-harmony/main/install | bash
+XDG_BIN_DIR=$HOME/.local/bin curl -fsSL https://raw.githubusercontent.com/sydneyrenee/code-harmony/main/install | bash
 ```
 
 ### Agents
@@ -110,7 +110,7 @@ Se você tem interesse em contribuir com o CodeHarmony, leia os [contributing do
 
 ### Construindo com CodeHarmony
 
-Se você estiver trabalhando em um projeto relacionado ao CodeHarmony e estiver usando "opencode" como parte do nome (por exemplo, "opencode-dashboard" ou "opencode-mobile"), adicione uma nota no README para deixar claro que não foi construído pela equipe do CodeHarmony e não é afiliado a nós de nenhuma forma.
+Se você estiver trabalhando em um projeto relacionado ao CodeHarmony e estiver usando "code-harmony" como parte do nome (por exemplo, "code-harmony-dashboard" ou "code-harmony-mobile"), adicione uma nota no README para deixar claro que não foi construído pela equipe do CodeHarmony e não é afiliado a nós de nenhuma forma.
 
 ### FAQ
 
@@ -126,4 +126,4 @@ Se você estiver trabalhando em um projeto relacionado ao CodeHarmony e estiver 
 
 ---
 
-**Junte-se à nossa comunidade** [Discord](https://github.com/SolaceHarmony/code-harmony/discussions) | [X.com](https://github.com/SolaceHarmony/code-harmony)
+**Junte-se à nossa comunidade** [Discord](https://github.com/sydneyrenee/code-harmony/discussions) | [X.com](https://github.com/sydneyrenee/code-harmony)

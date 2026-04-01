@@ -1,5 +1,5 @@
 {
-  "name": "@opencode-harmony/desktop",
+  "name": "@thesolaceproject/code-harmony-desktop",
   "private": true,
   "version": "1.0.0",
   "type": "module",
@@ -13,8 +13,8 @@
     "tauri": "tauri"
   },
   "dependencies": {
-    "@opencode-harmony/app": "workspace:*",
-    "@opencode-harmony/ui": "workspace:*",
+    "@thesolaceproject/code-harmony-app": "workspace:*",
+    "@thesolaceproject/code-harmony-ui": "workspace:*",
     "@solid-primitives/i18n": "2.2.1",
     "@solid-primitives/storage": "catalog:",
     "@tauri-apps/api": "^2",

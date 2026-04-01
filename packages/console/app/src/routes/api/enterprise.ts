@@ -1,5 +1,5 @@
 import type { APIEvent } from "@solidjs/start/server"
-import { AWS } from "@opencode-harmony/console-core/aws.js"
+import { AWS } from "@thesolaceproject/code-harmony-console-core/aws.js"
 
 interface EnterpriseFormData {
   name: string
@@ -33,7 +33,7 @@ ${body.email}`.trim()
 
     // Send email using AWS SES
     await AWS.sendEmail({
-      to: "contact@anoma.ly",
+      to: "sydney@solace.ofharmony.ai",
       subject: `Enterprise Inquiry from ${body.name}`,
       body: emailContent,
       replyTo: body.email,

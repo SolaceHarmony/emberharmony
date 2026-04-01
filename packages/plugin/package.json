@@ -1,6 +1,6 @@
 {
   "$schema": "https://json.schemastore.org/package.json",
-  "name": "@opencode-harmony/plugin",
+  "name": "@thesolaceproject/code-harmony-plugin",
   "version": "1.0.0",
   "type": "module",
   "license": "MIT",
@@ -16,7 +16,7 @@
     "dist"
   ],
   "dependencies": {
-    "@opencode-harmony/sdk": "workspace:*",
+    "@thesolaceproject/code-harmony-sdk": "workspace:*",
     "zod": "catalog:"
   },
   "devDependencies": {

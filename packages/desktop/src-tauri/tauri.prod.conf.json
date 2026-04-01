@@ -27,7 +27,7 @@
   "plugins": {
     "updater": {
       "pubkey": "__SET_TAURI_UPDATER_PUBKEY_AT_BUILD_TIME__",
-      "endpoints": ["https://github.com/SolaceHarmony/code-harmony/releases/latest/download/latest.json"]
+      "endpoints": ["https://github.com/sydneyrenee/code-harmony/releases/latest/download/latest.json"]
     }
   }
 }

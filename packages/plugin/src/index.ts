@@ -1,16 +1,16 @@
 import type {
   Event,
-  createOpencodeClient,
+  createCodeHarmonyClient,
   Project,
   Model,
   Provider,
-  Permission,
+  PermissionRequest,
   UserMessage,
   Message,
   Part,
   Auth,
   Config,
-} from "@opencode-harmony/sdk"
+} from "@thesolaceproject/code-harmony-sdk"
 
 import type { BunShell } from "./shell"
 import { type ToolDefinition } from "./tool"
@@ -20,11 +20,11 @@ export * from "./tool"
 export type ProviderContext = {
   source: "env" | "config" | "custom" | "api"
   info: Provider
-  options: Record<string, any>
+  options: Record<string, unknown>
 }
 
 export type PluginInput = {
-  client: ReturnType<typeof createOpencodeClient>
+  client: ReturnType<typeof createCodeHarmonyClient>
   project: Project
   directory: string
   worktree: string
@@ -36,7 +36,7 @@ export type Plugin = (input: PluginInput) => Promise<Hooks>
 
 export type AuthHook = {
   provider: string
-  loader?: (auth: () => Promise<Auth>, provider: Provider) => Promise<Record<string, any>>
+  loader?: (auth: () => Promise<Auth>, provider: Provider) => Promise<Record<string, unknown>>
   methods: (
     | {
         type: "oauth"
@@ -170,13 +170,13 @@ export interface Hooks {
    */
   "chat.params"?: (
     input: { sessionID: string; agent: string; model: Model; provider: ProviderContext; message: UserMessage },
-    output: { temperature: number; topP: number; topK: number; options: Record<string, any> },
+    output: { temperature: number; topP: number; topK: number; options: Record<string, unknown> },
   ) => Promise<void>
   "chat.headers"?: (
     input: { sessionID: string; agent: string; model: Model; provider: ProviderContext; message: UserMessage },
     output: { headers: Record<string, string> },
   ) => Promise<void>
-  "permission.ask"?: (input: Permission, output: { status: "ask" | "deny" | "allow" }) => Promise<void>
+  "permission.ask"?: (input: PermissionRequest, output: { status: "ask" | "deny" | "allow" }) => Promise<void>
   "command.execute.before"?: (
     input: { command: string; sessionID: string; arguments: string },
     output: { parts: Part[] },

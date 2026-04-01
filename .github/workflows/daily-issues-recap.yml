@@ -18,14 +18,14 @@ jobs:
       - uses: ./.github/actions/setup-bun
 
       - name: Install code-harmony
-        run: curl -fsSL https://raw.githubusercontent.com/SolaceHarmony/code-harmony/dev/install | bash
+        run: curl -fsSL https://raw.githubusercontent.com/sydneyrenee/code-harmony/main/install | bash
 
       - name: Generate daily issues recap
         id: recap
         env:
-          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          CODE_HARMONY_API_KEY: ${{ secrets.CODE_HARMONY_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          OPENCODE_PERMISSION: |
+          CODE_HARMONY_PERMISSION: |
             {
               "bash": {
                 "*": "deny",
@@ -40,7 +40,7 @@ jobs:
           # Get today's date range
           TODAY=$(date -u +%Y-%m-%d)
 
-          code-harmony run -m opencode/claude-sonnet-4-5 "Generate a daily issues recap for the OpenCode repository.
+          code-harmony run -m code-harmony/claude-sonnet-4-5 "Generate a daily issues recap for the CodeHarmony repository.
 
           TODAY'S DATE: ${TODAY}
 

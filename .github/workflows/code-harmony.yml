@@ -15,20 +15,17 @@ jobs:
       startsWith(github.event.comment.body, '/code-harmony')
     runs-on: ubuntu-latest
     permissions:
-      id-token: write
-      contents: read
-      pull-requests: read
-      issues: read
+      contents: write
+      pull-requests: write
+      issues: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - uses: ./.github/actions/setup-bun
-
       - name: Run code-harmony
-        uses: SolaceHarmony/code-harmony/github@latest
+        uses: sydneyrenee/code-harmony/github@latest
         env:
-          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
-          OPENCODE_PERMISSION: '{"bash": "deny"}'
+          GITHUB_TOKEN: ${{ github.token }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         with:
-          model: opencode/claude-opus-4-5
+          model: anthropic/claude-sonnet-4-20250514

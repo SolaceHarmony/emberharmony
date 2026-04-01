@@ -42,7 +42,7 @@
     ],
     "active": true,
     "targets": ["deb", "rpm", "dmg", "nsis", "app"],
-    "externalBin": ["sidecars/code-harmony-cli"],
+    "externalBin": ["sidecars@thesolaceproject/code-harmony-cli"],
     "macOS": {
       "entitlements": "./entitlements.plist"
     },

@@ -4,7 +4,7 @@ export function Legal() {
   return (
     <div data-component="legal">
       <span>
-        ©{new Date().getFullYear()} <a href="https://anoma.ly">Anomaly</a>
+        ©{new Date().getFullYear()} <a href="https://solace.ofharmony.ai">The Solace Project</a>
       </span>
       <span>
         <A href="/brand">Brand</A>

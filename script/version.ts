@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 
-import { Script } from "@opencode-harmony/script"
+import { Script } from "@thesolaceproject/code-harmony-script"
 import { $ } from "bun"
 import { buildNotes, getLatestRelease } from "./changelog"
 
