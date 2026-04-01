@@ -10,8 +10,8 @@
 <p align="center">The open source AI coding agent.</p>
 <p align="center">
   <a href="https://discord.gg/EdF8f7JR"><img alt="Discord" src="https://img.shields.io/discord/1391832426048651334?style=flat-square&label=discord" /></a>
-  <a href="https://www.npmjs.com/package/code-harmony"><img alt="npm" src="https://img.shields.io/npm/v/code-harmony?style=flat-square" /></a>
-  <a href="https://github.com/sydneyrenee/code-harmony/actions/workflows/publish.yml"><img alt="Build status" src="https://img.shields.io/github/actions/workflow/status/sydneyrenee/code-harmony/publish.yml?style=flat-square&branch=main" /></a>
+  <a href="https://www.npmjs.com/package/@thesolaceproject/emberharmony"><img alt="npm" src="https://img.shields.io/npm/v/%40thesolaceproject%2Femberharmony?style=flat-square" /></a>
+  <a href="https://github.com/SolaceHarmony/code-harmony/actions/workflows/publish.yml"><img alt="Build status" src="https://img.shields.io/github/actions/workflow/status/SolaceHarmony/code-harmony/publish.yml?style=flat-square&branch=dev" /></a>
 </p>
 
 <p align="center">
@@ -41,15 +41,15 @@
 
 ```bash
 # YOLO
-curl -fsSL https://raw.githubusercontent.com/sydneyrenee/code-harmony/main/install | bash
+curl -fsSL https://raw.githubusercontent.com/SolaceHarmony/code-harmony/dev/install | bash
 
 # Package managers
-npm i -g code-harmony@latest        # or bun/pnpm/yarn
-scoop install code-harmony             # Windows
-choco install code-harmony             # Windows
-paru -S code-harmony-bin               # Arch Linux
-mise use -g code-harmony               # Any OS
-nix run nixpkgs#code-harmony           # or github:sydneyrenee/code-harmony for latest dev branch
+npm i -g @thesolaceproject/emberharmony@latest        # or bun/pnpm/yarn
+scoop install emberharmony             # Windows
+choco install emberharmony             # Windows
+paru -S emberharmony-bin               # Arch Linux
+mise use -g emberharmony               # Any OS
+nix run nixpkgs#code-harmony           # or github:SolaceHarmony/code-harmony for latest dev branch
 ```
 
 > [!TIP]
@@ -66,7 +66,7 @@ npm run pack:local
 
 ### Desktop App (BETA)
 
-CodeHarmony is also available as a desktop application. Download directly from the [releases page](https://github.com/sydneyrenee/code-harmony/releases) or [solace.ofharmony.ai/download](https://github.com/sydneyrenee/code-harmony/releases).
+CodeHarmony is also available as a desktop application. Download directly from the [releases page](https://github.com/SolaceHarmony/code-harmony/releases) or [solace.ofharmony.ai/download](https://github.com/SolaceHarmony/code-harmony/releases).
 
 | Platform              | Download                                  |
 | --------------------- | ----------------------------------------- |
@@ -84,15 +84,16 @@ scoop bucket add extras; scoop install extras@thesolaceproject/code-harmony-desk
 
 The install script respects the following priority order for the installation path:
 
-1. `$CODE_HARMONY_INSTALL_DIR` - Custom installation directory
-2. `$XDG_BIN_DIR` - XDG Base Directory Specification compliant path
-3. `$HOME/bin` - Standard user binary directory (if exists or can be created)
-4. `$HOME/.code-harmony/bin` - Default fallback
+1. `$EMBERHARMONY_INSTALL_DIR` - Custom installation directory (preferred)
+2. `$CODE_HARMONY_INSTALL_DIR` - Backward compat
+3. `$XDG_BIN_DIR` - XDG Base Directory Specification compliant path
+4. `$HOME/bin` - Standard user binary directory (if exists or can be created)
+5. `$HOME/.emberharmony/bin` - Default fallback
 
 ```bash
 # Examples
-CODE_HARMONY_INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/sydneyrenee/code-harmony/main/install | bash
-XDG_BIN_DIR=$HOME/.local/bin curl -fsSL https://raw.githubusercontent.com/sydneyrenee/code-harmony/main/install | bash
+EMBERHARMONY_INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/SolaceHarmony/code-harmony/dev/install | bash
+XDG_BIN_DIR=$HOME/.local/bin curl -fsSL https://raw.githubusercontent.com/SolaceHarmony/code-harmony/dev/install | bash
 ```
 
 ### Agents

@@ -57,9 +57,10 @@ export namespace Installation {
     return CHANNEL === "local"
   }
 
-  const npmName = "@thesolaceproject/code-harmony"
+  const npmName = "@thesolaceproject/emberharmony"
 
   export async function method() {
+    if (process.execPath.includes(path.join(".emberharmony", "bin"))) return "curl"
     if (process.execPath.includes(path.join(".code-harmony", "bin"))) return "curl"
     // Backward compat for installs from before the rebrand.
     if (process.execPath.includes(path.join(".code-harmony", "bin"))) return "curl"
@@ -101,7 +102,7 @@ export namespace Installation {
       return 0
     })
 
-    const names = [npmName, "code-harmony"]
+    const names = [npmName, "@thesolaceproject/code-harmony", "code-harmony"]
 
     for (const check of checks) {
       const output = await check.command()
@@ -165,7 +166,7 @@ export namespace Installation {
 
   export const VERSION = typeof CODE_HARMONY_VERSION === "string" ? CODE_HARMONY_VERSION : "local"
   export const CHANNEL = typeof CODE_HARMONY_CHANNEL === "string" ? CODE_HARMONY_CHANNEL : "local"
-  export const USER_AGENT = `code-harmony/${CHANNEL}/${VERSION}/${Flag.CODE_HARMONY_CLIENT}`
+  export const USER_AGENT = `emberharmony/${CHANNEL}/${VERSION}/${Flag.CODE_HARMONY_CLIENT}`
 
   export async function latest(installMethod?: Method) {
     const detectedMethod = installMethod || (await method())
