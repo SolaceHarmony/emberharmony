@@ -30,7 +30,7 @@ jobs:
     runs-on: ubuntu-latest
     if: github.ref_name == 'dev' && (inputs.bump || inputs.version)
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
@@ -54,7 +54,7 @@ jobs:
     runs-on: ubuntu-latest
     if: github.ref_name == 'dev' && (inputs.bump || inputs.version)
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           fetch-tags: true
 
@@ -105,11 +105,11 @@ jobs:
       APPLE_API_KEY_PATH: ${{ secrets.APPLE_API_KEY_PATH }}
       APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           fetch-tags: true
 
-      - uses: apple-actions/import-codesign-certs@v2
+      - uses: apple-actions/import-codesign-certs@v3
         if: ${{ runner.os == 'macOS' && env.APPLE_CERTIFICATE != '' && env.APPLE_CERTIFICATE_PASSWORD != '' }}
         with:
           keychain: build
@@ -253,7 +253,7 @@ jobs:
     env:
       AUR_KEY: ${{ secrets.AUR_KEY }}
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - uses: ./.github/actions/setup-bun
 
