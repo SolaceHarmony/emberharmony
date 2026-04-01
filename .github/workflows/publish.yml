@@ -27,7 +27,7 @@ permissions:
 jobs:
   version:
     runs-on: ubuntu-latest
-    if: github.repository == 'sydneyrenee/code-harmony' && github.ref_name == 'main' && (inputs.bump || inputs.version)
+    if: github.ref_name == 'dev' && (inputs.bump || inputs.version)
     steps:
       - uses: actions/checkout@v3
         with:
@@ -51,7 +51,7 @@ jobs:
   build-cli:
     needs: version
     runs-on: ubuntu-latest
-    if: github.repository == 'sydneyrenee/code-harmony'
+    if: github.ref_name == 'dev' && (inputs.bump || inputs.version)
     steps:
       - uses: actions/checkout@v3
         with:
@@ -78,6 +78,7 @@ jobs:
       version: ${{ needs.version.outputs.version }}
 
   build-tauri:
+    if: github.ref_name == 'dev' && (inputs.bump || inputs.version)
     needs:
       - build-cli
       - version
@@ -101,6 +102,7 @@ jobs:
       APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
       APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
       APPLE_API_KEY_PATH: ${{ secrets.APPLE_API_KEY_PATH }}
+      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
     steps:
       - uses: actions/checkout@v3
         with:
@@ -116,10 +118,25 @@ jobs:
       - name: Verify Certificate
         if: ${{ runner.os == 'macOS' && env.APPLE_CERTIFICATE != '' && env.APPLE_CERTIFICATE_PASSWORD != '' }}
         run: |
-          CERT_INFO=$(security find-identity -v -p codesigning build.keychain | grep "Developer ID Application")
+          set -euo pipefail
+
+          if [ -n "${APPLE_SIGNING_IDENTITY:-}" ]; then
+            echo "CERT_ID=$APPLE_SIGNING_IDENTITY" >> "$GITHUB_ENV"
+            echo "Using APPLE_SIGNING_IDENTITY override."
+            security find-identity -v -p codesigning build.keychain | cat
+            exit 0
+          fi
+
+          CERT_INFO=$(security find-identity -v -p codesigning build.keychain | grep "Developer ID Application" | head -n 1 || true)
+          if [ -z "$CERT_INFO" ]; then
+            echo "No 'Developer ID Application' identity found in build.keychain" >&2
+            security find-identity -v -p codesigning build.keychain | cat
+            exit 1
+          fi
+
           CERT_ID=$(echo "$CERT_INFO" | awk -F'"' '{print $2}')
-          echo "CERT_ID=$CERT_ID" >> $GITHUB_ENV
-          echo "Certificate imported."
+          echo "CERT_ID=$CERT_ID" >> "$GITHUB_ENV"
+          echo "Certificate imported: $CERT_ID"
 
       - name: Setup Apple API Key
         if: ${{ runner.os == 'macOS' && env.APPLE_API_KEY_PATH != '' }}
@@ -159,7 +176,7 @@ jobs:
           bun ./scripts/prepare.ts
         env:
           CODE_HARMONY_VERSION: ${{ needs.version.outputs.version }}
-          GITHUB_TOKEN: ${{ steps.committer.outputs.token }}
+          GITHUB_TOKEN: ${{ github.token }}
           RUST_TARGET: ${{ matrix.settings.target }}
           GH_TOKEN: ${{ github.token }}
           GITHUB_RUN_ID: ${{ github.run_id }}
@@ -197,6 +214,9 @@ jobs:
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
           APPLE_API_KEY_PATH: ${{ runner.temp }}/apple-api-key.p8
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
 
   publish:
     needs:
