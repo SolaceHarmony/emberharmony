@@ -42,7 +42,8 @@ const VERSION = await (async () => {
   if (env.CODE_HARMONY_VERSION) return env.CODE_HARMONY_VERSION
   if (IS_PREVIEW) return `0.0.0-${CHANNEL}-${new Date().toISOString().slice(0, 16).replace(/[-:T]/g, "")}`
 
-  const npm = await fetch("https://registry.npmjs.org/code-harmony/latest")
+  const publish = process.env["CODE_HARMONY_PUBLISH_NAME"] ?? "code-harmony"
+  const npm = await fetch(`https://registry.npmjs.org/${publish}/latest`)
     .then(async (res) => {
       if (!res.ok) return
       const data = (await res.json()) as unknown

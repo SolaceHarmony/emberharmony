@@ -29,10 +29,37 @@ await $`mkdir -p ./dist/${pkg.name}`
 await $`cp -r ./bin ./dist/${pkg.name}/bin`
 await $`cp ./script/postinstall.mjs ./dist/${pkg.name}/postinstall.mjs`
 
+const meta = await Bun.file(path.join(root, "package.json"))
+  .json()
+  .catch(() => ({} as unknown))
+
+const description =
+  typeof meta === "object" && meta && "description" in meta && typeof meta.description === "string" ? meta.description : undefined
+
+const homepage =
+  typeof meta === "object" && meta && "homepage" in meta && typeof meta.homepage === "string" ? meta.homepage : undefined
+
+const license = typeof meta === "object" && meta && "license" in meta && typeof meta.license === "string" ? meta.license : "MIT"
+
+const repository =
+  typeof meta === "object" && meta && "repository" in meta && (typeof meta.repository === "object" || typeof meta.repository === "string")
+    ? meta.repository
+    : undefined
+
+const bugs =
+  typeof meta === "object" && meta && "bugs" in meta && (typeof meta.bugs === "object" || typeof meta.bugs === "string")
+    ? meta.bugs
+    : undefined
+
 await Bun.file(`./dist/${pkg.name}/package.json`).write(
   JSON.stringify(
     {
       name: publishName,
+      description,
+      homepage,
+      repository,
+      bugs,
+      license,
       bin: {
         [cliName]: `bin/${cliName}`,
       },

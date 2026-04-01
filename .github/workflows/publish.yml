@@ -41,6 +41,7 @@ jobs:
           ./script/version.ts
         env:
           GH_TOKEN: ${{ github.token }}
+          CODE_HARMONY_PUBLISH_NAME: @thesolaceproject/code-harmony
           CODE_HARMONY_BUMP: ${{ inputs.bump }}
           CODE_HARMONY_VERSION: ${{ inputs.version }}
           CODE_HARMONY_API_KEY: ${{ secrets.CODE_HARMONY_API_KEY }}
@@ -67,7 +68,7 @@ jobs:
         env:
           CODE_HARMONY_VERSION: ${{ needs.version.outputs.version }}
           CODE_HARMONY_RELEASE: ${{ needs.version.outputs.release }}
-          CODE_HARMONY_PUBLISH_NAME: code-harmony
+          CODE_HARMONY_PUBLISH_NAME: @thesolaceproject/code-harmony
           GH_TOKEN: ${{ github.token }}
 
       - uses: actions/upload-artifact@v4
@@ -325,7 +326,7 @@ jobs:
         env:
           CODE_HARMONY_VERSION: ${{ needs.version.outputs.version }}
           CODE_HARMONY_RELEASE: ${{ needs.version.outputs.release }}
-          CODE_HARMONY_PUBLISH_NAME: code-harmony
+          CODE_HARMONY_PUBLISH_NAME: @thesolaceproject/code-harmony
           CODE_HARMONY_PUBLISH_PLATFORMS: "1"
           CODE_HARMONY_SKIP_GIT: "1"
           AUR_KEY: ${{ secrets.AUR_KEY }}

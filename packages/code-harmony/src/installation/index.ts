@@ -57,6 +57,8 @@ export namespace Installation {
     return CHANNEL === "local"
   }
 
+  const npmName = "@thesolaceproject/code-harmony"
+
   export async function method() {
     if (process.execPath.includes(path.join(".code-harmony", "bin"))) return "curl"
     // Backward compat for installs from before the rebrand.
@@ -99,10 +101,11 @@ export namespace Installation {
       return 0
     })
 
+    const names = [npmName, "code-harmony"]
+
     for (const check of checks) {
       const output = await check.command()
-      const installedName = "code-harmony"
-      if (output.includes(installedName)) {
+      if (names.some((name) => output.includes(name))) {
         return check.name
       }
     }
@@ -121,19 +124,19 @@ export namespace Installation {
     let cmd
     switch (method) {
       case "curl":
-        cmd = $`curl -fsSL https://raw.githubusercontent.com/sydneyrenee/code-harmony/main/install | bash`.env({
+        cmd = $`curl -fsSL https://raw.githubusercontent.com/SolaceHarmony/code-harmony/dev/install | bash`.env({
           ...process.env,
           VERSION: target,
         })
         break
       case "npm":
-        cmd = $`npm install -g code-harmony@${target}`
+        cmd = $`npm install -g ${npmName}@${target}`
         break
       case "pnpm":
-        cmd = $`pnpm install -g code-harmony@${target}`
+        cmd = $`pnpm install -g ${npmName}@${target}`
         break
       case "bun":
-        cmd = $`bun install -g code-harmony@${target}`
+        cmd = $`bun install -g ${npmName}@${target}`
         break
       case "choco":
         cmd = $`echo Y | choco upgrade code-harmony --version=${target}`
@@ -174,7 +177,8 @@ export namespace Installation {
         return reg.endsWith("/") ? reg.slice(0, -1) : reg
       })
       const channel = CHANNEL
-      return fetch(`${registry}/code-harmony/${channel}`)
+      const name = encodeURIComponent(npmName)
+      return fetch(`${registry}/${name}/${channel}`)
         .then((res) => {
           if (!res.ok) throw new Error(res.statusText)
           return res.json()
@@ -205,7 +209,7 @@ export namespace Installation {
         .then((data: any) => data.version)
     }
 
-    return fetch("https://api.github.com/repos/sydneyrenee/code-harmony/releases/latest")
+    return fetch("https://api.github.com/repos/SolaceHarmony/code-harmony/releases/latest")
       .then((res) => {
         if (!res.ok) throw new Error(res.statusText)
         return res.json()
