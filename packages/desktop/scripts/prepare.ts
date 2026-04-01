@@ -37,7 +37,7 @@ await tauri()
 
 const sidecar = getCurrentSidecar()
 
-const dir = "src-tauri/target@thesolaceproject/code-harmony-binaries"
+const dir = "src-tauri/target/code-harmony-binaries"
 
 await $`mkdir -p ${dir}`
 await $`gh run download ${Bun.env.GITHUB_RUN_ID} -n code-harmony-cli`.cwd(dir)

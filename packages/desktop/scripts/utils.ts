@@ -41,7 +41,7 @@ export function getCurrentSidecar(target = RUST_TARGET) {
 
 export async function copyBinaryToSidecarFolder(source: string, target = RUST_TARGET) {
   await $`mkdir -p src-tauri/sidecars`
-  const dest = windowsify(`src-tauri/sidecars@thesolaceproject/code-harmony-cli-${target}`)
+  const dest = windowsify(`src-tauri/sidecars/code-harmony-cli-${target}`)
   await $`cp ${source} ${dest}`
 
   console.log(`Copied ${source} to ${dest}`)
