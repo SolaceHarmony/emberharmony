@@ -1,5 +1,5 @@
 {
-  description = "CodeHarmony development flake";
+  description = "EmberHarmony development flake";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
@@ -36,7 +36,7 @@
           node_modules = pkgs.callPackage ./nix/node_modules.nix {
             inherit rev;
           };
-          cli = pkgs.callPackage ./nix/code-harmony.nix {
+          cli = pkgs.callPackage ./nix/emberharmony.nix {
             inherit node_modules;
           };
           desktop = pkgs.callPackage ./nix/desktop.nix {
@@ -62,7 +62,7 @@
         in
         {
           default = cli;
-          "code-harmony" = cli;
+          "emberharmony" = cli;
           inherit cli desktop;
         } // moduleUpdaters
       );

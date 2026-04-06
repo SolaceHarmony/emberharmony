@@ -20,8 +20,8 @@ Options:
         --no-modify-path    Don't modify shell config files (.zshrc, .bashrc, etc.)
 
 Examples:
-    curl -fsSL https://raw.githubusercontent.com/SolaceHarmony/code-harmony/dev/install | bash
-    curl -fsSL https://raw.githubusercontent.com/SolaceHarmony/code-harmony/dev/install | bash -s -- --version 1.0.180
+    curl -fsSL https://raw.githubusercontent.com/SolaceHarmony/emberharmony/dev/install | bash
+    curl -fsSL https://raw.githubusercontent.com/SolaceHarmony/emberharmony/dev/install | bash -s -- --version 1.0.180
     ./install --binary /path/to/emberharmony
 EOF
 }
@@ -71,8 +71,8 @@ detect_install_dir() {
         return
     fi
     # Backward compat
-    if [ -n "${CODE_HARMONY_INSTALL_DIR-}" ]; then
-        echo "$CODE_HARMONY_INSTALL_DIR"
+    if [ -n "${EMBERHARMONY_INSTALL_DIR-}" ]; then
+        echo "$EMBERHARMONY_INSTALL_DIR"
         return
     fi
     if [ -n "${XDG_BIN_DIR-}" ]; then
@@ -188,8 +188,8 @@ else
     fi
 
     if [ -z "$requested_version" ]; then
-        url="https://github.com/SolaceHarmony/code-harmony/releases/latest/download/$filename"
-        specific_version=$(curl -s https://api.github.com/repos/SolaceHarmony/code-harmony/releases/latest | sed -n 's/.*"tag_name": *"v\([^"]*\)".*/\1/p')
+        url="https://github.com/SolaceHarmony/emberharmony/releases/latest/download/$filename"
+        specific_version=$(curl -s https://api.github.com/repos/SolaceHarmony/emberharmony/releases/latest | sed -n 's/.*"tag_name": *"v\([^"]*\)".*/\1/p')
 
         if [[ $? -ne 0 || -z "$specific_version" ]]; then
             echo -e "${RED}Failed to fetch version information${NC}"
@@ -198,14 +198,14 @@ else
     else
         # Strip leading 'v' if present
         requested_version="${requested_version#v}"
-        url="https://github.com/SolaceHarmony/code-harmony/releases/download/v${requested_version}/$filename"
+        url="https://github.com/SolaceHarmony/emberharmony/releases/download/v${requested_version}/$filename"
         specific_version=$requested_version
 
         # Verify the release exists before downloading
-        http_status=$(curl -sI -o /dev/null -w "%{http_code}" "https://github.com/SolaceHarmony/code-harmony/releases/tag/v${requested_version}")
+        http_status=$(curl -sI -o /dev/null -w "%{http_code}" "https://github.com/SolaceHarmony/emberharmony/releases/tag/v${requested_version}")
         if [ "$http_status" = "404" ]; then
             echo -e "${RED}Error: Release v${requested_version} not found${NC}"
-            echo -e "${MUTED}Available releases: https://github.com/SolaceHarmony/code-harmony/releases${NC}"
+            echo -e "${MUTED}Available releases: https://github.com/SolaceHarmony/emberharmony/releases${NC}"
             exit 1
         fi
     fi
@@ -282,7 +282,7 @@ download_with_progress() {
     fi
 
     local tmp_dir=${TMPDIR:-/tmp}
-    local basename="${tmp_dir}/code_harmony_install_$$"
+    local basename="${tmp_dir}/emberharmony_install_$$"
     local tracefile="${basename}.trace"
 
     rm -f "$tracefile"
@@ -333,7 +333,7 @@ download_with_progress() {
 
 download_and_install() {
     print_message info "\n${MUTED}Installing ${NC}${APP} ${MUTED}version: ${NC}$specific_version"
-    local tmp_dir="${TMPDIR:-/tmp}/code_harmony_install_$$"
+    local tmp_dir="${TMPDIR:-/tmp}/emberharmony_install_$$"
     mkdir -p "$tmp_dir"
 
     if [[ "$os" == "windows" ]] || ! [ -t 2 ] || ! download_with_progress "$url" "$tmp_dir/$filename"; then
@@ -462,6 +462,6 @@ echo -e ""
 echo -e "cd <project>  ${MUTED}# Open directory${NC}"
 echo -e "emberharmony      ${MUTED}# Run command${NC}"
 echo -e ""
-echo -e "${MUTED}For more information visit ${NC}https://github.com/SolaceHarmony/code-harmony"
+echo -e "${MUTED}For more information visit ${NC}https://github.com/SolaceHarmony/emberharmony"
 echo -e ""
 echo -e ""

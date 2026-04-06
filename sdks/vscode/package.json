@@ -1,12 +1,12 @@
 {
-  "name": "code-harmony",
-  "displayName": "CodeHarmony",
-  "description": "CodeHarmony for VS Code",
+  "name": "emberharmony",
+  "displayName": "EmberHarmony",
+  "description": "EmberHarmony for VS Code",
   "version": "1.0.0",
   "publisher": "thesolaceproject",
   "repository": {
     "type": "git",
-    "url": "https://github.com/SolaceHarmony/code-harmony"
+    "url": "https://github.com/SolaceHarmony/emberharmony"
   },
   "license": "MIT",
   "icon": "images/icon.png",
@@ -26,7 +26,7 @@
     "commands": [
       {
         "command": "codeharmony.openTerminal",
-        "title": "Open CodeHarmony",
+        "title": "Open EmberHarmony",
         "icon": {
           "light": "images/button-dark.svg",
           "dark": "images/button-light.svg"
@@ -34,7 +34,7 @@
       },
       {
         "command": "codeharmony.openNewTerminal",
-        "title": "Open CodeHarmony in new tab",
+        "title": "Open EmberHarmony in new tab",
         "icon": {
           "light": "images/button-dark.svg",
           "dark": "images/button-light.svg"
@@ -56,7 +56,7 @@
     "keybindings": [
       {
         "command": "codeharmony.openTerminal",
-        "title": "Run CodeHarmony",
+        "title": "Run EmberHarmony",
         "key": "cmd+escape",
         "mac": "cmd+escape",
         "win": "ctrl+escape",
@@ -64,7 +64,7 @@
       },
       {
         "command": "codeharmony.openNewTerminal",
-        "title": "Run CodeHarmony",
+        "title": "Run EmberHarmony",
         "key": "cmd+shift+escape",
         "mac": "cmd+shift+escape",
         "win": "ctrl+shift+escape",
@@ -72,7 +72,7 @@
       },
       {
         "command": "codeharmony.addFilepathToTerminal",
-        "title": "CodeHarmony: Insert At-Mentioned",
+        "title": "EmberHarmony: Insert At-Mentioned",
         "key": "cmd+alt+k",
         "mac": "cmd+alt+k",
         "win": "ctrl+alt+K",

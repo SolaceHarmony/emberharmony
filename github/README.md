@@ -1,30 +1,30 @@
-# CodeHarmony GitHub Action
+# EmberHarmony GitHub Action
 
-A GitHub Action that integrates [CodeHarmony](https://github.com/sydneyrenee/code-harmony) directly into your GitHub workflow.
+A GitHub Action that integrates [EmberHarmony](https://github.com/SolaceHarmony/emberharmony) directly into your GitHub workflow.
 
-Mention `/code-harmony` or `/oc` in your comment, and CodeHarmony will execute tasks within your GitHub Actions runner.
+Mention `/emberharmony` or `/oc` in your comment, and EmberHarmony will execute tasks within your GitHub Actions runner.
 
 ## Features
 
 #### Explain an issue
 
-Leave the following comment on a GitHub issue. `code-harmony` will read the entire thread, including all comments, and reply with a clear explanation.
+Leave the following comment on a GitHub issue. `emberharmony` will read the entire thread, including all comments, and reply with a clear explanation.
 
 ```
-/code-harmony explain this issue
+/emberharmony explain this issue
 ```
 
 #### Fix an issue
 
-Leave the following comment on a GitHub issue. code-harmony will create a new branch, implement the changes, and open a PR with the changes.
+Leave the following comment on a GitHub issue. emberharmony will create a new branch, implement the changes, and open a PR with the changes.
 
 ```
-/code-harmony fix this
+/emberharmony fix this
 ```
 
 #### Review PRs and make changes
 
-Leave the following comment on a GitHub PR. code-harmony will implement the requested change and commit it to the same PR.
+Leave the following comment on a GitHub PR. emberharmony will implement the requested change and commit it to the same PR.
 
 ```
 Delete the attachment from S3 when the note is removed /oc
@@ -32,14 +32,14 @@ Delete the attachment from S3 when the note is removed /oc
 
 #### Review specific code lines
 
-Leave a comment directly on code lines in the PR's "Files" tab. code-harmony will automatically detect the file, line numbers, and diff context to provide precise responses.
+Leave a comment directly on code lines in the PR's "Files" tab. emberharmony will automatically detect the file, line numbers, and diff context to provide precise responses.
 
 ```
 [Comment on specific lines in Files tab]
 /oc add error handling here
 ```
 
-When commenting on specific lines, code-harmony receives:
+When commenting on specific lines, emberharmony receives:
 
 - The exact file being reviewed
 - The specific lines of code
@@ -53,17 +53,17 @@ This allows for more targeted requests without needing to specify file paths or 
 Run the following command in the terminal from your GitHub repo:
 
 ```bash
-code-harmony github install
+emberharmony github install
 ```
 
 This will walk you through creating the workflow and setting up secrets.
 
 ### Manual Setup
 
-1. Add the following workflow file to `.github/workflows/code-harmony.yml` in your repo. Set the appropriate `model` and required API keys in `env`.
+1. Add the following workflow file to `.github/workflows/emberharmony.yml` in your repo. Set the appropriate `model` and required API keys in `env`.
 
    ```yml
-   name: code-harmony
+   name: emberharmony
 
    on:
      issue_comment:
@@ -72,10 +72,10 @@ This will walk you through creating the workflow and setting up secrets.
        types: [created]
 
    jobs:
-     code-harmony:
+     emberharmony:
        if: |
          contains(github.event.comment.body, '/oc') ||
-         contains(github.event.comment.body, '/code-harmony')
+         contains(github.event.comment.body, '/emberharmony')
        runs-on: ubuntu-latest
        permissions:
          contents: write
@@ -84,8 +84,8 @@ This will walk you through creating the workflow and setting up secrets.
        steps:
          - uses: actions/checkout@v4
 
-         - name: Run code-harmony
-           uses: sydneyrenee/code-harmony/github@latest
+         - name: Run emberharmony
+           uses: SolaceHarmony/emberharmony/github@latest
            env:
              GITHUB_TOKEN: ${{ github.token }}
              ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -97,7 +97,7 @@ This will walk you through creating the workflow and setting up secrets.
 
 ## Support
 
-This is an early release. If you encounter issues or have feedback, please create an issue at https://github.com/sydneyrenee/code-harmony/issues.
+This is an early release. If you encounter issues or have feedback, please create an issue at https://github.com/SolaceHarmony/emberharmony/issues.
 
 ## Development
 
@@ -117,34 +117,34 @@ To test locally:
      GITHUB_RUN_ID=dummy \
      MOCK_TOKEN=github_pat_... \
      MOCK_EVENT='{"eventName":"issue_comment",...}' \
-     bun /path/to/code-harmony/github/index.ts
+     bun /path/to/emberharmony/github/index.ts
    ```
 
-   - `MODEL`: The model used by code-harmony. Same as the `MODEL` defined in the GitHub workflow.
+   - `MODEL`: The model used by emberharmony. Same as the `MODEL` defined in the GitHub workflow.
    - `ANTHROPIC_API_KEY`: Your model provider API key. Same as the keys defined in the GitHub workflow.
    - `GITHUB_RUN_ID`: Dummy value to emulate GitHub action environment.
    - `MOCK_TOKEN`: A GitHub personal access token. This token is used to verify you have `admin` or `write` access to the test repo. Generate a token [here](https://github.com/settings/personal-access-tokens).
    - `MOCK_EVENT`: Mock GitHub event payload (see templates below).
-   - `/path/to/code-harmony`: Path to your cloned CodeHarmony repo. `bun /path/to/code-harmony/github/index.ts` runs your local version of `code-harmony`.
+   - `/path/to/emberharmony`: Path to your cloned EmberHarmony repo. `bun /path/to/emberharmony/github/index.ts` runs your local version of `emberharmony`.
 
 ### Issue comment event
 
 ```
-MOCK_EVENT='{"eventName":"issue_comment","repo":{"owner":"sst","repo":"hello-world"},"actor":"fwang","payload":{"issue":{"number":4},"comment":{"id":1,"body":"/code-harmony summarize thread"}}}'
+MOCK_EVENT='{"eventName":"issue_comment","repo":{"owner":"SolaceHarmony","repo":"emberharmony"},"actor":"sydneyrenee","payload":{"issue":{"number":4},"comment":{"id":1,"body":"/emberharmony summarize thread"}}}'
 ```
 
 Replace:
 
 - `"owner":"sst"` with repo owner
 - `"repo":"hello-world"` with repo name
-- `"actor":"fwang"` with the GitHub username of commenter
+- `"actor":"sydneyrenee"` with the GitHub username of commenter
 - `"number":4` with the GitHub issue id
-- `"body":"/code-harmony summarize thread"` with comment body
+- `"body":"/emberharmony summarize thread"` with comment body
 
 ### Issue comment with image attachment.
 
 ```
-MOCK_EVENT='{"eventName":"issue_comment","repo":{"owner":"sst","repo":"hello-world"},"actor":"fwang","payload":{"issue":{"number":4},"comment":{"id":1,"body":"/code-harmony what is in my image ![Image](https://github.com/user-attachments/assets/xxxxxxxx)"}}}'
+MOCK_EVENT='{"eventName":"issue_comment","repo":{"owner":"SolaceHarmony","repo":"emberharmony"},"actor":"sydneyrenee","payload":{"issue":{"number":4},"comment":{"id":1,"body":"/emberharmony what is in my image ![Image](https://github.com/user-attachments/assets/xxxxxxxx)"}}}'
 ```
 
 Replace the image URL `https://github.com/user-attachments/assets/xxxxxxxx` with a valid GitHub attachment (you can generate one by commenting with an image in any issue).
@@ -152,11 +152,11 @@ Replace the image URL `https://github.com/user-attachments/assets/xxxxxxxx` with
 ### PR comment event
 
 ```
-MOCK_EVENT='{"eventName":"issue_comment","repo":{"owner":"sst","repo":"hello-world"},"actor":"fwang","payload":{"issue":{"number":4,"pull_request":{}},"comment":{"id":1,"body":"/code-harmony summarize thread"}}}'
+MOCK_EVENT='{"eventName":"issue_comment","repo":{"owner":"SolaceHarmony","repo":"emberharmony"},"actor":"sydneyrenee","payload":{"issue":{"number":4,"pull_request":{}},"comment":{"id":1,"body":"/emberharmony summarize thread"}}}'
 ```
 
 ### PR review comment event
 
 ```
-MOCK_EVENT='{"eventName":"pull_request_review_comment","repo":{"owner":"sst","repo":"hello-world"},"actor":"fwang","payload":{"pull_request":{"number":7},"comment":{"id":1,"body":"/oc add error handling","path":"src/components/Button.tsx","diff_hunk":"@@ -45,8 +45,11 @@\n- const handleClick = () => {\n-   console.log('clicked')\n+ const handleClick = useCallback(() => {\n+   console.log('clicked')\n+   doSomething()\n+ }, [doSomething])","line":47,"original_line":45,"position":10,"commit_id":"abc123","original_commit_id":"def456"}}}'
+MOCK_EVENT='{"eventName":"pull_request_review_comment","repo":{"owner":"SolaceHarmony","repo":"emberharmony"},"actor":"sydneyrenee","payload":{"pull_request":{"number":7},"comment":{"id":1,"body":"/oc add error handling","path":"src/components/Button.tsx","diff_hunk":"@@ -45,8 +45,11 @@\n- const handleClick = () => {\n-   console.log('clicked')\n+ const handleClick = useCallback(() => {\n+   console.log('clicked')\n+   doSomething()\n+ }, [doSomething])","line":47,"original_line":45,"position":10,"commit_id":"abc123","original_commit_id":"def456"}}}'
 ```

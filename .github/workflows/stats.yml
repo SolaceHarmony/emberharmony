@@ -7,7 +7,7 @@ concurrency: ${{ github.workflow }}-${{ github.ref }}
 
 jobs:
   stats:
-    if: github.repository == 'sydneyrenee/code-harmony'
+    if: github.repository == 'SolaceHarmony/emberharmony'
     runs-on: ubuntu-latest
     permissions:
       contents: write

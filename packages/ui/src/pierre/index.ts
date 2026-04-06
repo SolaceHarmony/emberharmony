@@ -132,7 +132,7 @@ const unsafeCSS = `
 
 export function createDefaultOptions<T>(style: FileDiffOptions<T>["diffStyle"]) {
   return {
-    theme: "CodeHarmony",
+    theme: "EmberHarmony",
     themeType: "system",
     disableLineNumbers: false,
     overflow: "wrap",

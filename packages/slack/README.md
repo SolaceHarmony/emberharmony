@@ -1,6 +1,6 @@
-# @thesolaceproject/code-harmony-slack
+# @thesolaceproject/emberharmony-slack
 
-Slack bot integration for code-harmony that creates threaded conversations.
+Slack bot integration for emberharmony that creates threaded conversations.
 
 ## Setup
 
@@ -24,4 +24,4 @@ Slack bot integration for code-harmony that creates threaded conversations.
 bun dev
 ```
 
-The bot will respond to messages in channels where it's added, creating separate code-harmony sessions for each thread.
+The bot will respond to messages in channels where it's added, creating separate emberharmony sessions for each thread.

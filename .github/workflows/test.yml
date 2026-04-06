@@ -43,57 +43,57 @@ jobs:
       - name: Set OS-specific paths
         run: |
           if [ "${{ runner.os }}" = "Windows" ]; then
-            printf '%s\n' "CODE_HARMONY_E2E_ROOT=${{ runner.temp }}\\code-harmony-e2e" >> "$GITHUB_ENV"
-            printf '%s\n' "CODE_HARMONY_TEST_HOME=${{ runner.temp }}\\code-harmony-e2e\\home" >> "$GITHUB_ENV"
-            printf '%s\n' "XDG_DATA_HOME=${{ runner.temp }}\\code-harmony-e2e\\share" >> "$GITHUB_ENV"
-            printf '%s\n' "XDG_CACHE_HOME=${{ runner.temp }}\\code-harmony-e2e\\cache" >> "$GITHUB_ENV"
-            printf '%s\n' "XDG_CONFIG_HOME=${{ runner.temp }}\\code-harmony-e2e\\config" >> "$GITHUB_ENV"
-            printf '%s\n' "XDG_STATE_HOME=${{ runner.temp }}\\code-harmony-e2e\\state" >> "$GITHUB_ENV"
+            printf '%s\n' "EMBERHARMONY_E2E_ROOT=${{ runner.temp }}\\emberharmony-e2e" >> "$GITHUB_ENV"
+            printf '%s\n' "EMBERHARMONY_TEST_HOME=${{ runner.temp }}\\emberharmony-e2e\\home" >> "$GITHUB_ENV"
+            printf '%s\n' "XDG_DATA_HOME=${{ runner.temp }}\\emberharmony-e2e\\share" >> "$GITHUB_ENV"
+            printf '%s\n' "XDG_CACHE_HOME=${{ runner.temp }}\\emberharmony-e2e\\cache" >> "$GITHUB_ENV"
+            printf '%s\n' "XDG_CONFIG_HOME=${{ runner.temp }}\\emberharmony-e2e\\config" >> "$GITHUB_ENV"
+            printf '%s\n' "XDG_STATE_HOME=${{ runner.temp }}\\emberharmony-e2e\\state" >> "$GITHUB_ENV"
           else
-            printf '%s\n' "CODE_HARMONY_E2E_ROOT=${{ runner.temp }}/code-harmony-e2e" >> "$GITHUB_ENV"
-            printf '%s\n' "CODE_HARMONY_TEST_HOME=${{ runner.temp }}/code-harmony-e2e/home" >> "$GITHUB_ENV"
-            printf '%s\n' "XDG_DATA_HOME=${{ runner.temp }}/code-harmony-e2e/share" >> "$GITHUB_ENV"
-            printf '%s\n' "XDG_CACHE_HOME=${{ runner.temp }}/code-harmony-e2e/cache" >> "$GITHUB_ENV"
-            printf '%s\n' "XDG_CONFIG_HOME=${{ runner.temp }}/code-harmony-e2e/config" >> "$GITHUB_ENV"
-            printf '%s\n' "XDG_STATE_HOME=${{ runner.temp }}/code-harmony-e2e/state" >> "$GITHUB_ENV"
+            printf '%s\n' "EMBERHARMONY_E2E_ROOT=${{ runner.temp }}/emberharmony-e2e" >> "$GITHUB_ENV"
+            printf '%s\n' "EMBERHARMONY_TEST_HOME=${{ runner.temp }}/emberharmony-e2e/home" >> "$GITHUB_ENV"
+            printf '%s\n' "XDG_DATA_HOME=${{ runner.temp }}/emberharmony-e2e/share" >> "$GITHUB_ENV"
+            printf '%s\n' "XDG_CACHE_HOME=${{ runner.temp }}/emberharmony-e2e/cache" >> "$GITHUB_ENV"
+            printf '%s\n' "XDG_CONFIG_HOME=${{ runner.temp }}/emberharmony-e2e/config" >> "$GITHUB_ENV"
+            printf '%s\n' "XDG_STATE_HOME=${{ runner.temp }}/emberharmony-e2e/state" >> "$GITHUB_ENV"
           fi
 
-      - name: Seed CodeHarmony data
+      - name: Seed EmberHarmony data
         if: matrix.settings.name != 'windows'
-        working-directory: packages/code-harmony
+        working-directory: packages/emberharmony
         run: bun script/seed-e2e.ts
         env:
-          CODE_HARMONY_DISABLE_SHARE: "true"
-          CODE_HARMONY_DISABLE_LSP_DOWNLOAD: "true"
-          CODE_HARMONY_DISABLE_DEFAULT_PLUGINS: "true"
-          CODE_HARMONY_EXPERIMENTAL_DISABLE_FILEWATCHER: "true"
-          CODE_HARMONY_TEST_HOME: ${{ env.CODE_HARMONY_TEST_HOME }}
+          EMBERHARMONY_DISABLE_SHARE: "true"
+          EMBERHARMONY_DISABLE_LSP_DOWNLOAD: "true"
+          EMBERHARMONY_DISABLE_DEFAULT_PLUGINS: "true"
+          EMBERHARMONY_EXPERIMENTAL_DISABLE_FILEWATCHER: "true"
+          EMBERHARMONY_TEST_HOME: ${{ env.EMBERHARMONY_TEST_HOME }}
           XDG_DATA_HOME: ${{ env.XDG_DATA_HOME }}
           XDG_CACHE_HOME: ${{ env.XDG_CACHE_HOME }}
           XDG_CONFIG_HOME: ${{ env.XDG_CONFIG_HOME }}
           XDG_STATE_HOME: ${{ env.XDG_STATE_HOME }}
-          CODE_HARMONY_E2E_PROJECT_DIR: ${{ github.workspace }}
-          CODE_HARMONY_E2E_SESSION_TITLE: "E2E Session"
-          CODE_HARMONY_E2E_MESSAGE: "Seeded for UI e2e"
-          CODE_HARMONY_E2E_MODEL: "code-harmony/gpt-5-nano"
+          EMBERHARMONY_E2E_PROJECT_DIR: ${{ github.workspace }}
+          EMBERHARMONY_E2E_SESSION_TITLE: "E2E Session"
+          EMBERHARMONY_E2E_MESSAGE: "Seeded for UI e2e"
+          EMBERHARMONY_E2E_MODEL: "emberharmony/gpt-5-nano"
 
-      - name: Run CodeHarmony server
+      - name: Run EmberHarmony server
         if: matrix.settings.name != 'windows'
-        working-directory: packages/code-harmony
+        working-directory: packages/emberharmony
         run: bun dev -- --print-logs --log-level WARN serve --port 4096 --hostname 127.0.0.1 &
         env:
-          CODE_HARMONY_DISABLE_SHARE: "true"
-          CODE_HARMONY_DISABLE_LSP_DOWNLOAD: "true"
-          CODE_HARMONY_DISABLE_DEFAULT_PLUGINS: "true"
-          CODE_HARMONY_EXPERIMENTAL_DISABLE_FILEWATCHER: "true"
-          CODE_HARMONY_TEST_HOME: ${{ env.CODE_HARMONY_TEST_HOME }}
+          EMBERHARMONY_DISABLE_SHARE: "true"
+          EMBERHARMONY_DISABLE_LSP_DOWNLOAD: "true"
+          EMBERHARMONY_DISABLE_DEFAULT_PLUGINS: "true"
+          EMBERHARMONY_EXPERIMENTAL_DISABLE_FILEWATCHER: "true"
+          EMBERHARMONY_TEST_HOME: ${{ env.EMBERHARMONY_TEST_HOME }}
           XDG_DATA_HOME: ${{ env.XDG_DATA_HOME }}
           XDG_CACHE_HOME: ${{ env.XDG_CACHE_HOME }}
           XDG_CONFIG_HOME: ${{ env.XDG_CONFIG_HOME }}
           XDG_STATE_HOME: ${{ env.XDG_STATE_HOME }}
-          CODE_HARMONY_CLIENT: "app"
+          EMBERHARMONY_CLIENT: "app"
 
-      - name: Wait for CodeHarmony server
+      - name: Wait for EmberHarmony server
         if: matrix.settings.name != 'windows'
         run: |
           for i in {1..120}; do
@@ -107,20 +107,20 @@ jobs:
         run: ${{ matrix.settings.command }}
         env:
           CI: true
-          CODE_HARMONY_DISABLE_SHARE: "true"
-          CODE_HARMONY_DISABLE_LSP_DOWNLOAD: "true"
-          CODE_HARMONY_DISABLE_DEFAULT_PLUGINS: "true"
-          CODE_HARMONY_EXPERIMENTAL_DISABLE_FILEWATCHER: "true"
-          CODE_HARMONY_TEST_HOME: ${{ env.CODE_HARMONY_TEST_HOME }}
+          EMBERHARMONY_DISABLE_SHARE: "true"
+          EMBERHARMONY_DISABLE_LSP_DOWNLOAD: "true"
+          EMBERHARMONY_DISABLE_DEFAULT_PLUGINS: "true"
+          EMBERHARMONY_EXPERIMENTAL_DISABLE_FILEWATCHER: "true"
+          EMBERHARMONY_TEST_HOME: ${{ env.EMBERHARMONY_TEST_HOME }}
           XDG_DATA_HOME: ${{ env.XDG_DATA_HOME }}
           XDG_CACHE_HOME: ${{ env.XDG_CACHE_HOME }}
           XDG_CONFIG_HOME: ${{ env.XDG_CONFIG_HOME }}
           XDG_STATE_HOME: ${{ env.XDG_STATE_HOME }}
           PLAYWRIGHT_SERVER_HOST: "127.0.0.1"
           PLAYWRIGHT_SERVER_PORT: "4096"
-          VITE_CODE_HARMONY_SERVER_HOST: "127.0.0.1"
-          VITE_CODE_HARMONY_SERVER_PORT: "4096"
-          CODE_HARMONY_CLIENT: "app"
+          VITE_EMBERHARMONY_SERVER_HOST: "127.0.0.1"
+          VITE_EMBERHARMONY_SERVER_PORT: "4096"
+          EMBERHARMONY_CLIENT: "app"
         timeout-minutes: 30
 
       - name: Upload Playwright artifacts

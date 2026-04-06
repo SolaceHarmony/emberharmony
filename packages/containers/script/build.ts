@@ -22,11 +22,11 @@ const images = ["base", "bun-node", "rust", "tauri-linux", "publish"]
 const setup = async () => {
   if (!push) return
   const list = await $`docker buildx ls`.text()
-  if (list.includes("code-harmony")) {
-    await $`docker buildx use code-harmony`
+  if (list.includes("emberharmony")) {
+    await $`docker buildx use emberharmony`
     return
   }
-  await $`docker buildx create --name code-harmony --use`
+  await $`docker buildx create --name emberharmony --use`
 }
 
 await setup()

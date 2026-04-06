@@ -24,7 +24,7 @@
   cli,
 }:
 rustPlatform.buildRustPackage (finalAttrs: {
-  pname = "code-harmony-desktop";
+  pname = "emberharmony-desktop";
   inherit (cli)
     version
     src
@@ -72,7 +72,7 @@ rustPlatform.buildRustPackage (finalAttrs: {
     patchShebangs packages/desktop/node_modules
 
     mkdir -p packages/desktop/src-tauri/sidecars
-    cp ${cli}/bin/code-harmony packages/desktop/src-tauri/sidecars/code-harmony-cli-${stdenv.hostPlatform.rust.rustcTarget}
+    cp ${cli}/bin/emberharmony packages/desktop/src-tauri/sidecars/emberharmony-cli-${stdenv.hostPlatform.rust.rustcTarget}
   '';
 
   # see publish-tauri job in .github/workflows/publish.yml
@@ -86,15 +86,15 @@ rustPlatform.buildRustPackage (finalAttrs: {
   # should be removed once binary is renamed or decided otherwise
   # darwin output is a .app bundle so no conflict
   postFixup = lib.optionalString stdenv.hostPlatform.isLinux ''
-    mv $out/bin/CodeHarmony $out/bin/code-harmony-desktop
-    sed -i 's|^Exec=CodeHarmony$|Exec=code-harmony-desktop|' $out/share/applications/CodeHarmony.desktop
+    mv $out/bin/EmberHarmony $out/bin/emberharmony-desktop
+    sed -i 's|^Exec=EmberHarmony$|Exec=emberharmony-desktop|' $out/share/applications/EmberHarmony.desktop
   '';
 
   meta = {
-    description = "CodeHarmony Desktop App";
+    description = "EmberHarmony Desktop App";
     homepage = "https://solace.ofharmony.ai";
     license = lib.licenses.mit;
-    mainProgram = "code-harmony-desktop";
+    mainProgram = "emberharmony-desktop";
     inherit (cli.meta) platforms;
   };
 })

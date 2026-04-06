@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 
 import { $ } from "bun"
-import { Script } from "@thesolaceproject/code-harmony-script"
+import { Script } from "@thesolaceproject/emberharmony-script"
 
 const highlightsTemplate = `
 <!--
@@ -57,7 +57,7 @@ await $`BUN_SECURITY_SCAN=0 bun install --config=packages/app/bunfig-ci.toml`
 await import(`../packages/sdk/js/script/build.ts`)
 
 if (Script.release) {
-  const skipGit = process.env.CODE_HARMONY_SKIP_GIT === "1"
+  const skipGit = process.env.EMBERHARMONY_SKIP_GIT === "1"
   if (!skipGit) {
     const changed = await $`git status --porcelain=v1`.text().then((x) => x.trim().length > 0)
     if (changed) {
@@ -78,7 +78,7 @@ if (Script.release) {
     await $`git cherry-pick HEAD..origin/main`.nothrow()
     await $`git push origin HEAD --tags --no-verify --force-with-lease`
   } else {
-    console.log("Skipping git commit/tag/push (CODE_HARMONY_SKIP_GIT=1)")
+    console.log("Skipping git commit/tag/push (EMBERHARMONY_SKIP_GIT=1)")
   }
 
   await new Promise((resolve) => setTimeout(resolve, 5_000))
@@ -86,13 +86,13 @@ if (Script.release) {
 }
 
 console.log("\n=== cli ===\n")
-await import(`../packages/code-harmony/script/publish.ts`)
+await import(`../packages/emberharmony/script/publish.ts`)
 
-const publishAll = process.env.CODE_HARMONY_PUBLISH_ALL === "1"
+const publishAll = process.env.EMBERHARMONY_PUBLISH_ALL === "1"
 
 console.log("\n=== sdk ===\n")
 if (!publishAll) {
-  console.log("Skipping SDK publish (set CODE_HARMONY_PUBLISH_ALL=1 to enable)")
+  console.log("Skipping SDK publish (set EMBERHARMONY_PUBLISH_ALL=1 to enable)")
 }
 if (publishAll) {
   await import(`../packages/sdk/js/script/publish.ts`)
@@ -100,7 +100,7 @@ if (publishAll) {
 
 console.log("\n=== plugin ===\n")
 if (!publishAll) {
-  console.log("Skipping plugin publish (set CODE_HARMONY_PUBLISH_ALL=1 to enable)")
+  console.log("Skipping plugin publish (set EMBERHARMONY_PUBLISH_ALL=1 to enable)")
 }
 if (publishAll) {
   await import(`../packages/plugin/script/publish.ts`)

@@ -1,5 +1,5 @@
-import { createCodeHarmonyClient } from "@thesolaceproject/code-harmony-sdk/v2/client"
-import { base64Encode } from "@thesolaceproject/code-harmony-util/encode"
+import { createEmberHarmonyClient } from "@thesolaceproject/emberharmony-sdk/v2/client"
+import { base64Encode } from "@thesolaceproject/emberharmony-util/encode"
 
 export const serverHost = process.env.PLAYWRIGHT_SERVER_HOST ?? "localhost"
 export const serverPort = process.env.PLAYWRIGHT_SERVER_PORT ?? "4096"
@@ -17,7 +17,7 @@ export const modelVariantCycleSelector = '[data-action="model-variant-cycle"]'
 export const settingsLanguageSelectSelector = '[data-action="settings-language"]'
 
 export function createSdk(directory?: string) {
-  return createCodeHarmonyClient({ baseUrl: serverUrl, directory, throwOnError: true })
+  return createEmberHarmonyClient({ baseUrl: serverUrl, directory, throwOnError: true })
 }
 
 export async function getWorktree() {

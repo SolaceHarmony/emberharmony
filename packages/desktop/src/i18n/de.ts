@@ -11,22 +11,22 @@ export const dict = {
   "desktop.updater.checkFailed.title": "Updateprüfung fehlgeschlagen",
   "desktop.updater.checkFailed.message": "Updates konnten nicht geprüft werden",
   "desktop.updater.none.title": "Kein Update verfügbar",
-  "desktop.updater.none.message": "Sie verwenden bereits die neueste Version von CodeHarmony",
+  "desktop.updater.none.message": "Sie verwenden bereits die neueste Version von EmberHarmony",
   "desktop.updater.downloadFailed.title": "Update fehlgeschlagen",
   "desktop.updater.downloadFailed.message": "Update konnte nicht heruntergeladen werden",
   "desktop.updater.downloaded.title": "Update heruntergeladen",
   "desktop.updater.downloaded.prompt":
-    "Version {{version}} von CodeHarmony wurde heruntergeladen. Möchten Sie sie installieren und neu starten?",
+    "Version {{version}} von EmberHarmony wurde heruntergeladen. Möchten Sie sie installieren und neu starten?",
   "desktop.updater.installFailed.title": "Update fehlgeschlagen",
   "desktop.updater.installFailed.message": "Update konnte nicht installiert werden",
 
   "desktop.cli.installed.title": "CLI installiert",
   "desktop.cli.installed.message":
-    "CLI wurde in {{path}} installiert\n\nStarten Sie Ihr Terminal neu, um den Befehl 'code-harmony' zu verwenden.",
+    "CLI wurde in {{path}} installiert\n\nStarten Sie Ihr Terminal neu, um den Befehl 'emberharmony' zu verwenden.",
   "desktop.cli.failed.title": "Installation fehlgeschlagen",
   "desktop.cli.failed.message": "CLI konnte nicht installiert werden: {{error}}",
 
-  "desktop.error.serverStartFailed.title": "CodeHarmony konnte nicht gestartet werden",
+  "desktop.error.serverStartFailed.title": "EmberHarmony konnte nicht gestartet werden",
   "desktop.error.serverStartFailed.description":
-    "Der lokale CodeHarmony-Server konnte nicht gestartet werden. Starten Sie die App neu oder überprüfen Sie Ihre Netzwerkeinstellungen (VPN/Proxy) und versuchen Sie es erneut.",
+    "Der lokale EmberHarmony-Server konnte nicht gestartet werden. Starten Sie die App neu oder überprüfen Sie Ihre Netzwerkeinstellungen (VPN/Proxy) und versuchen Sie es erneut.",
 }

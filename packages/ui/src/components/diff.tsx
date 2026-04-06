@@ -1,4 +1,4 @@
-import { checksum } from "@thesolaceproject/code-harmony-util/encode"
+import { checksum } from "@thesolaceproject/emberharmony-util/encode"
 import { FileDiff, type SelectedLineRange } from "@pierre/diffs"
 import { createMediaQuery } from "@solid-primitives/media"
 import { createEffect, createMemo, createSignal, onCleanup, splitProps } from "solid-js"

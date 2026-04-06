@@ -1,5 +1,5 @@
 {
-  "name": "@thesolaceproject/code-harmony-console-app",
+  "name": "@thesolaceproject/emberharmony-console-app",
   "version": "1.0.0",
   "type": "module",
   "license": "MIT",
@@ -7,7 +7,7 @@
     "typecheck": "tsgo --noEmit",
     "dev": "vite dev --host 0.0.0.0",
     "dev:remote": "VITE_AUTH_URL=https://auth.dev.solace.ofharmony.ai VITE_STRIPE_PUBLISHABLE_KEY=pk_test_... bun sst shell --stage=dev bun dev",
-    "build": "./script/generate-sitemap.ts && vite build && ../../code-harmony/script/schema.ts ./.output/public/config.json",
+    "build": "./script/generate-sitemap.ts && vite build && ../../emberharmony/script/schema.ts ./.output/public/config.json",
     "start": "vite start"
   },
   "dependencies": {
@@ -16,10 +16,10 @@
     "@jsx-email/render": "1.1.1",
     "@kobalte/core": "catalog:",
     "@openauthjs/openauth": "catalog:",
-    "@thesolaceproject/code-harmony-console-core": "workspace:*",
-    "@thesolaceproject/code-harmony-console-mail": "workspace:*",
-    "@thesolaceproject/code-harmony-console-resource": "workspace:*",
-    "@thesolaceproject/code-harmony-ui": "workspace:*",
+    "@thesolaceproject/emberharmony-console-core": "workspace:*",
+    "@thesolaceproject/emberharmony-console-mail": "workspace:*",
+    "@thesolaceproject/emberharmony-console-resource": "workspace:*",
+    "@thesolaceproject/emberharmony-ui": "workspace:*",
     "@smithy/eventstream-codec": "4.2.7",
     "@smithy/util-utf8": "4.2.0",
     "@solidjs/meta": "catalog:",

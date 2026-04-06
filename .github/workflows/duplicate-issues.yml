@@ -18,14 +18,14 @@ jobs:
 
       - uses: ./.github/actions/setup-bun
 
-      - name: Install code-harmony
-        run: curl -fsSL https://raw.githubusercontent.com/sydneyrenee/code-harmony/main/install | bash
+      - name: Install emberharmony
+        run: curl -fsSL https://raw.githubusercontent.com/SolaceHarmony/emberharmony/dev/install | bash
 
       - name: Check for duplicate issues
         env:
-          CODE_HARMONY_API_KEY: ${{ secrets.CODE_HARMONY_API_KEY }}
+          EMBERHARMONY_API_KEY: ${{ secrets.EMBERHARMONY_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          CODE_HARMONY_PERMISSION: |
+          EMBERHARMONY_PERMISSION: |
             {
               "bash": {
                 "*": "deny",
@@ -34,7 +34,7 @@ jobs:
               "webfetch": "deny"
             }
         run: |
-          code-harmony run -m code-harmony/claude-haiku-4-5 "A new issue has been created:'
+          emberharmony run -m emberharmony/claude-haiku-4-5 "A new issue has been created:'
 
           Issue number:
           ${{ github.event.issue.number }}

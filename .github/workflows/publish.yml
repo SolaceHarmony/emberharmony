@@ -41,10 +41,10 @@ jobs:
           ./script/version.ts
         env:
           GH_TOKEN: ${{ github.token }}
-          CODE_HARMONY_PUBLISH_NAME: @thesolaceproject/emberharmony
-          CODE_HARMONY_BUMP: ${{ inputs.bump }}
-          CODE_HARMONY_VERSION: ${{ inputs.version }}
-          CODE_HARMONY_API_KEY: ${{ secrets.CODE_HARMONY_API_KEY }}
+          EMBERHARMONY_PUBLISH_NAME: @thesolaceproject/emberharmony
+          EMBERHARMONY_BUMP: ${{ inputs.bump }}
+          EMBERHARMONY_VERSION: ${{ inputs.version }}
+          EMBERHARMONY_API_KEY: ${{ secrets.EMBERHARMONY_API_KEY }}
     outputs:
       version: ${{ steps.version.outputs.version }}
       release: ${{ steps.version.outputs.release }}
@@ -64,17 +64,17 @@ jobs:
       - name: Build
         id: build
         run: |
-          ./packages/code-harmony/script/build.ts
+          ./packages/emberharmony/script/build.ts
         env:
-          CODE_HARMONY_VERSION: ${{ needs.version.outputs.version }}
-          CODE_HARMONY_RELEASE: ${{ needs.version.outputs.release }}
-          CODE_HARMONY_PUBLISH_NAME: @thesolaceproject/emberharmony
+          EMBERHARMONY_VERSION: ${{ needs.version.outputs.version }}
+          EMBERHARMONY_RELEASE: ${{ needs.version.outputs.release }}
+          EMBERHARMONY_PUBLISH_NAME: @thesolaceproject/emberharmony
           GH_TOKEN: ${{ github.token }}
 
       - uses: actions/upload-artifact@v4
         with:
-          name: code-harmony-cli
-          path: packages/code-harmony/dist
+          name: emberharmony-cli
+          path: packages/emberharmony/dist
 
     outputs:
       version: ${{ needs.version.outputs.version }}
@@ -190,7 +190,7 @@ jobs:
           cd packages/desktop
           bun ./scripts/prepare.ts
         env:
-          CODE_HARMONY_VERSION: ${{ needs.version.outputs.version }}
+          EMBERHARMONY_VERSION: ${{ needs.version.outputs.version }}
           GITHUB_TOKEN: ${{ github.token }}
           RUST_TARGET: ${{ matrix.settings.target }}
           GH_TOKEN: ${{ github.token }}
@@ -231,7 +231,7 @@ jobs:
           releaseId: ${{ needs.version.outputs.release }}
           tagName: ${{ needs.version.outputs.tag }}
           releaseDraft: true
-          releaseAssetNamePattern: code-harmony-desktop-[platform]-[arch][ext]
+          releaseAssetNamePattern: emberharmony-desktop-[platform]-[arch][ext]
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_BUNDLER_NEW_APPIMAGE_FORMAT: true
@@ -246,7 +246,7 @@ jobs:
           APPLE_TEAM_ID: ${{ env.APPLE_TEAM_ID }}
 
   publish:
-    if: github.repository == 'SolaceHarmony/code-harmony'
+    if: github.repository == 'SolaceHarmony/emberharmony'
     needs:
       - version
       - build-cli
@@ -282,24 +282,24 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
-          name: code-harmony-cli
-          path: packages/code-harmony/dist
+          name: emberharmony-cli
+          path: packages/emberharmony/dist
 
       - name: Verify CLI artifact
         run: |
           set -euo pipefail
-          ls -la packages/code-harmony/dist
-          test -f packages/code-harmony/dist/code-harmony-linux-x64/bin/code-harmony
-          test -f packages/code-harmony/dist/code-harmony-linux-arm64/bin/code-harmony
-          test -f packages/code-harmony/dist/code-harmony-linux-x64-baseline/bin/code-harmony
-          test -f packages/code-harmony/dist/code-harmony-linux-x64-musl/bin/code-harmony
-          test -f packages/code-harmony/dist/code-harmony-linux-x64-baseline-musl/bin/code-harmony
-          test -f packages/code-harmony/dist/code-harmony-linux-arm64-musl/bin/code-harmony
-          test -f packages/code-harmony/dist/code-harmony-darwin-x64/bin/code-harmony
-          test -f packages/code-harmony/dist/code-harmony-darwin-x64-baseline/bin/code-harmony
-          test -f packages/code-harmony/dist/code-harmony-darwin-arm64/bin/code-harmony
-          test -f packages/code-harmony/dist/code-harmony-windows-x64/bin/code-harmony.exe
-          test -f packages/code-harmony/dist/code-harmony-windows-x64-baseline/bin/code-harmony.exe
+          ls -la packages/emberharmony/dist
+          test -f packages/emberharmony/dist/emberharmony-linux-x64/bin/emberharmony
+          test -f packages/emberharmony/dist/emberharmony-linux-arm64/bin/emberharmony
+          test -f packages/emberharmony/dist/emberharmony-linux-x64-baseline/bin/emberharmony
+          test -f packages/emberharmony/dist/emberharmony-linux-x64-musl/bin/emberharmony
+          test -f packages/emberharmony/dist/emberharmony-linux-x64-baseline-musl/bin/emberharmony
+          test -f packages/emberharmony/dist/emberharmony-linux-arm64-musl/bin/emberharmony
+          test -f packages/emberharmony/dist/emberharmony-darwin-x64/bin/emberharmony
+          test -f packages/emberharmony/dist/emberharmony-darwin-x64-baseline/bin/emberharmony
+          test -f packages/emberharmony/dist/emberharmony-darwin-arm64/bin/emberharmony
+          test -f packages/emberharmony/dist/emberharmony-windows-x64/bin/emberharmony.exe
+          test -f packages/emberharmony/dist/emberharmony-windows-x64-baseline/bin/emberharmony.exe
 
       - name: Cache apt packages (AUR)
         if: ${{ env.AUR_KEY != '' }}
@@ -324,11 +324,11 @@ jobs:
 
       - run: ./script/publish.ts
         env:
-          CODE_HARMONY_VERSION: ${{ needs.version.outputs.version }}
-          CODE_HARMONY_RELEASE: ${{ needs.version.outputs.release }}
-          CODE_HARMONY_PUBLISH_NAME: @thesolaceproject/emberharmony
-          CODE_HARMONY_PUBLISH_PLATFORMS: "1"
-          CODE_HARMONY_SKIP_GIT: "1"
+          EMBERHARMONY_VERSION: ${{ needs.version.outputs.version }}
+          EMBERHARMONY_RELEASE: ${{ needs.version.outputs.release }}
+          EMBERHARMONY_PUBLISH_NAME: @thesolaceproject/emberharmony
+          EMBERHARMONY_PUBLISH_PLATFORMS: "1"
+          EMBERHARMONY_SKIP_GIT: "1"
           AUR_KEY: ${{ secrets.AUR_KEY }}
           GITHUB_TOKEN: ${{ steps.committer.outputs.token }}
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}

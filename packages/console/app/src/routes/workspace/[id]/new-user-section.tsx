@@ -1,8 +1,8 @@
 import { query, useParams, createAsync } from "@solidjs/router"
 import { createMemo, createSignal, Show } from "solid-js"
 import { IconCopy, IconCheck } from "~/component/icon"
-import { Key } from "@thesolaceproject/code-harmony-console-core/key.js"
-import { Billing } from "@thesolaceproject/code-harmony-console-core/billing.js"
+import { Key } from "@thesolaceproject/emberharmony-console-core/key.js"
+import { Billing } from "@thesolaceproject/emberharmony-console-core/billing.js"
 import { withActor } from "~/context/auth.withActor"
 import styles from "./new-user-section.module.css"
 
@@ -51,7 +51,7 @@ export function NewUserSection() {
           </div>
           <div data-slot="feature">
             <h3>No Lock-in</h3>
-            <p>Use Zen with any coding agent, and continue using other providers with CodeHarmony whenever you want.</p>
+            <p>Use Zen with any coding agent, and continue using other providers with EmberHarmony whenever you want.</p>
           </div>
         </div>
 
@@ -90,11 +90,11 @@ export function NewUserSection() {
           <ol>
             <li>Enable billing</li>
             <li>
-              Run <code>code-harmony auth login</code> and select CodeHarmony
+              Run <code>emberharmony auth login</code> and select EmberHarmony
             </li>
             <li>Paste your API key</li>
             <li>
-              Start CodeHarmony and run <code>/models</code> to select a model
+              Start EmberHarmony and run <code>/models</code> to select a model
             </li>
           </ol>
         </div>

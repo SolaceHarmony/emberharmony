@@ -1,5 +1,5 @@
 import { App } from "@slack/bolt"
-import { createCodeHarmony, type ToolPart } from "@thesolaceproject/code-harmony-sdk"
+import { createEmberHarmony, type ToolPart } from "@thesolaceproject/emberharmony-sdk"
 
 const app = new App({
   token: process.env.SLACK_BOT_TOKEN,
@@ -13,11 +13,11 @@ console.log("- Bot token present:", !!process.env.SLACK_BOT_TOKEN)
 console.log("- Signing secret present:", !!process.env.SLACK_SIGNING_SECRET)
 console.log("- App token present:", !!process.env.SLACK_APP_TOKEN)
 
-console.log("🚀 Starting CodeHarmony server...")
-const harmony = await createCodeHarmony({
+console.log("🚀 Starting EmberHarmony server...")
+const harmony = await createEmberHarmony({
   port: 0,
 })
-console.log("✅ CodeHarmony server ready")
+console.log("✅ EmberHarmony server ready")
 
 const sessions = new Map<string, { client: any; server: any; sessionId: string; channel: string; thread: string }>()
 ;(async () => {
@@ -72,7 +72,7 @@ app.message(async ({ message, say }) => {
   let session = sessions.get(sessionKey)
 
   if (!session) {
-    console.log("🆕 Creating new CodeHarmony session...")
+    console.log("🆕 Creating new EmberHarmony session...")
     const { client, server } = harmony
 
     const createResult = await client.session.create({
@@ -88,7 +88,7 @@ app.message(async ({ message, say }) => {
       return
     }
 
-    console.log("✅ Created CodeHarmony session:", createResult.data.id)
+    console.log("✅ Created EmberHarmony session:", createResult.data.id)
 
     session = { client, server, sessionId: createResult.data.id, channel, thread }
     sessions.set(sessionKey, session)
@@ -101,13 +101,13 @@ app.message(async ({ message, say }) => {
     }
   }
 
-  console.log("📝 Sending to CodeHarmony:", message.text)
+  console.log("📝 Sending to EmberHarmony:", message.text)
   const result = await session.client.session.prompt({
     sessionID: session.sessionId,
     parts: [{ type: "text", text: message.text }],
   })
 
-  console.log("📤 CodeHarmony response:", JSON.stringify(result, null, 2))
+  console.log("📤 EmberHarmony response:", JSON.stringify(result, null, 2))
 
   if (result.error) {
     console.error("❌ Failed to send message:", result.error)

@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 
-import { Script } from "@thesolaceproject/code-harmony-script"
+import { Script } from "@thesolaceproject/emberharmony-script"
 import { $ } from "bun"
 
 const main = async () => {

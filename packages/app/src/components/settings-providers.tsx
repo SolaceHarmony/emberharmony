@@ -1,9 +1,9 @@
-import { Button } from "@thesolaceproject/code-harmony-ui/button"
-import { useDialog } from "@thesolaceproject/code-harmony-ui/context/dialog"
-import { ProviderIcon } from "@thesolaceproject/code-harmony-ui/provider-icon"
-import { Tag } from "@thesolaceproject/code-harmony-ui/tag"
-import { showToast } from "@thesolaceproject/code-harmony-ui/toast"
-import { iconNames, type IconName } from "@thesolaceproject/code-harmony-ui/icons/provider"
+import { Button } from "@thesolaceproject/emberharmony-ui/button"
+import { useDialog } from "@thesolaceproject/emberharmony-ui/context/dialog"
+import { ProviderIcon } from "@thesolaceproject/emberharmony-ui/provider-icon"
+import { Tag } from "@thesolaceproject/emberharmony-ui/tag"
+import { showToast } from "@thesolaceproject/emberharmony-ui/toast"
+import { iconNames, type IconName } from "@thesolaceproject/emberharmony-ui/icons/provider"
 import { popularProviders, useProviders } from "@/hooks/use-providers"
 import { createMemo, type Component, For, Show } from "solid-js"
 import { useLanguage } from "@/context/language"
@@ -31,7 +31,7 @@ export const SettingsProviders: Component = () => {
   const connected = createMemo(() => {
     return providers
       .connected()
-      .filter((p) => p.id !== "code-harmony" || Object.values(p.models).find((m) => m.cost?.input))
+      .filter((p) => p.id !== "emberharmony" || Object.values(p.models).find((m) => m.cost?.input))
   })
 
   const popular = createMemo(() => {
@@ -171,13 +171,13 @@ export const SettingsProviders: Component = () => {
                     <div class="flex items-center gap-x-3">
                       <ProviderIcon id={icon(item.id)} class="size-5 shrink-0 icon-strong-base" />
                       <span class="text-14-medium text-text-strong">{item.name}</span>
-                      <Show when={item.id === "code-harmony"}>
+                      <Show when={item.id === "emberharmony"}>
                         <Tag>{language.t("dialog.provider.tag.recommended")}</Tag>
                       </Show>
                     </div>
-                    <Show when={item.id === "code-harmony"}>
+                    <Show when={item.id === "emberharmony"}>
                       <span class="text-12-regular text-text-weak pl-8">
-                        {language.t("dialog.provider.code-harmony.note")}
+                        {language.t("dialog.provider.emberharmony.note")}
                       </span>
                     </Show>
                     <Show when={item.id === "anthropic"}>

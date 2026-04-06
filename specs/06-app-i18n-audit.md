@@ -56,7 +56,7 @@ File: `packages/app/src/components/dialog-connect-provider.tsx`
 
 Completed (2026-01-20):
 
-- Localized all user-visible copy via `provider.connect.*` keys (titles, statuses, validations, instructions, CodeHarmony Zen onboarding).
+- Localized all user-visible copy via `provider.connect.*` keys (titles, statuses, validations, instructions, EmberHarmony Zen onboarding).
 - Added `common.submit` and used it for both API + OAuth submit buttons.
 - Localized the success toast via `provider.connect.toast.connected.*`.
 

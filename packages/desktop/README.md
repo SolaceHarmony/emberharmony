@@ -1,6 +1,6 @@
-# CodeHarmony Desktop
+# EmberHarmony Desktop
 
-Native CodeHarmony desktop app, built with Tauri v2.
+Native EmberHarmony desktop app, built with Tauri v2.
 
 ## Development
 

@@ -1,4 +1,4 @@
-import { base64Decode } from "@thesolaceproject/code-harmony-util/encode"
+import { base64Decode } from "@thesolaceproject/emberharmony-util/encode"
 
 export function decode64(value: string | undefined) {
   if (value === undefined) return

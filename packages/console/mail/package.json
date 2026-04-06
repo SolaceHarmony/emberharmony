@@ -1,5 +1,5 @@
 {
-  "name": "@thesolaceproject/code-harmony-console-mail",
+  "name": "@thesolaceproject/emberharmony-console-mail",
   "version": "1.0.0",
   "dependencies": {
     "@jsx-email/all": "2.2.3",

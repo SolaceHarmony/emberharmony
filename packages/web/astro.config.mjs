@@ -31,7 +31,7 @@ export default defineConfig({
     configSchema(),
     solidJs(),
     starlight({
-      title: "CodeHarmony",
+      title: "EmberHarmony",
       favicon: "/favicon-v3.svg",
       head: [
         {
@@ -137,7 +137,7 @@ function configSchema() {
     hooks: {
       "astro:build:done": async () => {
         console.log("generating config schema")
-        spawnSync("../code-harmony/script/schema.ts", ["./dist/config.json"])
+        spawnSync("../emberharmony/script/schema.ts", ["./dist/config.json"])
       },
     },
   }

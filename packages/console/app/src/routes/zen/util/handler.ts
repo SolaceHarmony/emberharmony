@@ -1,22 +1,22 @@
 import type { APIEvent } from "@solidjs/start/server"
-import { and, Database, eq, isNull, lt, or, sql } from "@thesolaceproject/code-harmony-console-core/drizzle/index.js"
-import { KeyTable } from "@thesolaceproject/code-harmony-console-core/schema/key.sql.js"
+import { and, Database, eq, isNull, lt, or, sql } from "@thesolaceproject/emberharmony-console-core/drizzle/index.js"
+import { KeyTable } from "@thesolaceproject/emberharmony-console-core/schema/key.sql.js"
 import {
   BillingTable,
   SubscriptionTable,
   UsageTable,
-} from "@thesolaceproject/code-harmony-console-core/schema/billing.sql.js"
-import { centsToMicroCents } from "@thesolaceproject/code-harmony-console-core/util/price.js"
-import { getWeekBounds } from "@thesolaceproject/code-harmony-console-core/util/date.js"
-import { Identifier } from "@thesolaceproject/code-harmony-console-core/identifier.js"
-import { Billing } from "@thesolaceproject/code-harmony-console-core/billing.js"
-import { Actor } from "@thesolaceproject/code-harmony-console-core/actor.js"
-import { WorkspaceTable } from "@thesolaceproject/code-harmony-console-core/schema/workspace.sql.js"
-import { ZenData } from "@thesolaceproject/code-harmony-console-core/model.js"
-import { Black, BlackData } from "@thesolaceproject/code-harmony-console-core/black.js"
-import { UserTable } from "@thesolaceproject/code-harmony-console-core/schema/user.sql.js"
-import { ModelTable } from "@thesolaceproject/code-harmony-console-core/schema/model.sql.js"
-import { ProviderTable } from "@thesolaceproject/code-harmony-console-core/schema/provider.sql.js"
+} from "@thesolaceproject/emberharmony-console-core/schema/billing.sql.js"
+import { centsToMicroCents } from "@thesolaceproject/emberharmony-console-core/util/price.js"
+import { getWeekBounds } from "@thesolaceproject/emberharmony-console-core/util/date.js"
+import { Identifier } from "@thesolaceproject/emberharmony-console-core/identifier.js"
+import { Billing } from "@thesolaceproject/emberharmony-console-core/billing.js"
+import { Actor } from "@thesolaceproject/emberharmony-console-core/actor.js"
+import { WorkspaceTable } from "@thesolaceproject/emberharmony-console-core/schema/workspace.sql.js"
+import { ZenData } from "@thesolaceproject/emberharmony-console-core/model.js"
+import { Black, BlackData } from "@thesolaceproject/emberharmony-console-core/black.js"
+import { UserTable } from "@thesolaceproject/emberharmony-console-core/schema/user.sql.js"
+import { ModelTable } from "@thesolaceproject/emberharmony-console-core/schema/model.sql.js"
+import { ProviderTable } from "@thesolaceproject/emberharmony-console-core/schema/provider.sql.js"
 import { logger } from "./logger"
 import {
   AuthError,
@@ -59,7 +59,7 @@ export async function handler(
   const MAX_RETRIES = 3
   const FREE_WORKSPACES = [
     "wrk_01K46JDFR0E75SG2Q8K172KF3Y", // frank
-    "wrk_01K6W1A3VE0KMNVSCQT43BG2SX", // code-harmony bench
+    "wrk_01K6W1A3VE0KMNVSCQT43BG2SX", // emberharmony bench
   ]
 
   try {
@@ -68,10 +68,10 @@ export async function handler(
     const model = opts.parseModel(url, body)
     const isStream = opts.parseIsStream(url, body)
     const ip = input.request.headers.get("x-real-ip") ?? ""
-    const sessionId = input.request.headers.get("x-code-harmony-session") ?? ""
-    const requestId = input.request.headers.get("x-code-harmony-request") ?? ""
-    const projectId = input.request.headers.get("x-code-harmony-project") ?? ""
-    const client = input.request.headers.get("x-code-harmony-client") ?? ""
+    const sessionId = input.request.headers.get("x-emberharmony-session") ?? ""
+    const requestId = input.request.headers.get("x-emberharmony-request") ?? ""
+    const projectId = input.request.headers.get("x-emberharmony-project") ?? ""
+    const client = input.request.headers.get("x-emberharmony-client") ?? ""
     logger.metric({
       is_tream: isStream,
       session: sessionId,
@@ -125,10 +125,10 @@ export async function handler(
           })
           headers.delete("host")
           headers.delete("content-length")
-          headers.delete("x-code-harmony-request")
-          headers.delete("x-code-harmony-session")
-          headers.delete("x-code-harmony-project")
-          headers.delete("x-code-harmony-client")
+          headers.delete("x-emberharmony-request")
+          headers.delete("x-emberharmony-session")
+          headers.delete("x-emberharmony-project")
+          headers.delete("x-emberharmony-client")
           return headers
         })(),
         body: reqBody,

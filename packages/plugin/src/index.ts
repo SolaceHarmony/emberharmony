@@ -1,6 +1,6 @@
 import type {
   Event,
-  createCodeHarmonyClient,
+  createEmberHarmonyClient,
   Project,
   Model,
   Provider,
@@ -10,7 +10,7 @@ import type {
   Part,
   Auth,
   Config,
-} from "@thesolaceproject/code-harmony-sdk"
+} from "@thesolaceproject/emberharmony-sdk"
 
 import type { BunShell } from "./shell"
 import { type ToolDefinition } from "./tool"
@@ -24,7 +24,7 @@ export type ProviderContext = {
 }
 
 export type PluginInput = {
-  client: ReturnType<typeof createCodeHarmonyClient>
+  client: ReturnType<typeof createEmberHarmonyClient>
   project: Project
   directory: string
   worktree: string

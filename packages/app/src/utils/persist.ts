@@ -1,6 +1,6 @@
 import { usePlatform } from "@/context/platform"
 import { makePersisted, type AsyncStorage, type SyncStorage } from "@solid-primitives/storage"
-import { checksum } from "@thesolaceproject/code-harmony-util/encode"
+import { checksum } from "@thesolaceproject/emberharmony-util/encode"
 import { createResource, type Accessor } from "solid-js"
 import type { SetStoreFunction, Store } from "solid-js/store"
 
@@ -15,8 +15,8 @@ type PersistTarget = {
 }
 
 const LEGACY_STORAGE = "default.dat"
-const GLOBAL_STORAGE = "code-harmony.global.dat"
-const LOCAL_PREFIX = "code-harmony."
+const GLOBAL_STORAGE = "emberharmony.global.dat"
+const LOCAL_PREFIX = "emberharmony."
 const fallback = { disabled: false }
 
 const CACHE_MAX_ENTRIES = 500
@@ -191,7 +191,7 @@ function parse(value: string) {
 function workspaceStorage(dir: string) {
   const head = dir.slice(0, 12) || "workspace"
   const sum = checksum(dir) ?? "0"
-  return `code-harmony.workspace.${head}.${sum}.dat`
+  return `emberharmony.workspace.${head}.${sum}.dat`
 }
 
 function localStorageWithPrefix(prefix: string): SyncStorage {

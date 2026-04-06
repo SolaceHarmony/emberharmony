@@ -138,10 +138,10 @@ export namespace User {
             .then((rows) => rows[0]),
         )
 
-        const { InviteEmail } = await import("@thesolaceproject/code-harmony-console-mail/InviteEmail.jsx")
+        const { InviteEmail } = await import("@thesolaceproject/emberharmony-console-mail/InviteEmail.jsx")
         await AWS.sendEmail({
           to: email,
-          subject: `You've been invited to join the ${emailInfo.workspaceName} workspace on CodeHarmony`,
+          subject: `You've been invited to join the ${emailInfo.workspaceName} workspace on EmberHarmony`,
           body: render(
             // @ts-ignore
             InviteEmail({

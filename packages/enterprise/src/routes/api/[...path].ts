@@ -16,9 +16,9 @@ app
     openAPIRouteHandler(app, {
       documentation: {
         info: {
-          title: "CodeHarmony Enterprise API",
+          title: "EmberHarmony Enterprise API",
           version: "1.0.0",
-          description: "CodeHarmony Enterprise API endpoints",
+          description: "EmberHarmony Enterprise API endpoints",
         },
         openapi: "3.1.1",
       },

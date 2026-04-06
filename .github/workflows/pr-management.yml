@@ -8,39 +8,33 @@ jobs:
   check-duplicates:
     if: |
       github.event.pull_request.user.login != 'actions-user' &&
-      github.event.pull_request.user.login != 'rekram1-node' &&
-      github.event.pull_request.user.login != 'thdxr' &&
-      github.event.pull_request.user.login != 'kommander' &&
-      github.event.pull_request.user.login != 'jayair' &&
-      github.event.pull_request.user.login != 'fwang' &&
-      github.event.pull_request.user.login != 'adamdotdevin' &&
-      github.event.pull_request.user.login != 'iamdavidhill'
+      github.event.pull_request.user.login != 'sydneyrenee'
     runs-on: ubuntu-latest
     permissions:
       contents: read
       pull-requests: write
     env:
-      CODE_HARMONY_API_KEY: ${{ secrets.CODE_HARMONY_API_KEY }}
+      EMBERHARMONY_API_KEY: ${{ secrets.EMBERHARMONY_API_KEY }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
-      - name: Skip (missing CODE_HARMONY_API_KEY)
-        if: env.CODE_HARMONY_API_KEY == ''
-        run: echo "CODE_HARMONY_API_KEY is not set for this repo; skipping duplicate PR detection."
+      - name: Skip (missing EMBERHARMONY_API_KEY)
+        if: env.EMBERHARMONY_API_KEY == ''
+        run: echo "EMBERHARMONY_API_KEY is not set for this repo; skipping duplicate PR detection."
 
       - name: Setup Bun
-        if: env.CODE_HARMONY_API_KEY != ''
+        if: env.EMBERHARMONY_API_KEY != ''
         uses: ./.github/actions/setup-bun
 
-      - name: Install code-harmony
-        if: env.CODE_HARMONY_API_KEY != ''
-        run: curl -fsSL https://raw.githubusercontent.com/sydneyrenee/code-harmony/main/install | bash
+      - name: Install emberharmony
+        if: env.EMBERHARMONY_API_KEY != ''
+        run: curl -fsSL https://raw.githubusercontent.com/SolaceHarmony/emberharmony/dev/install | bash
 
       - name: Build prompt
-        if: env.CODE_HARMONY_API_KEY != ''
+        if: env.EMBERHARMONY_API_KEY != ''
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -57,7 +51,7 @@ jobs:
           } > pr_info.txt
 
       - name: Check for duplicate PRs
-        if: env.CODE_HARMONY_API_KEY != ''
+        if: env.EMBERHARMONY_API_KEY != ''
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}

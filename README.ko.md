@@ -3,15 +3,15 @@
     <picture>
       <source srcset="packages/console/app/src/asset/logo-ornate-dark.svg" media="(prefers-color-scheme: dark)">
       <source srcset="packages/console/app/src/asset/logo-ornate-light.svg" media="(prefers-color-scheme: light)">
-      <img src="packages/console/app/src/asset/logo-ornate-light.svg" alt="CodeHarmony logo">
+      <img src="packages/console/app/src/asset/logo-ornate-light.svg" alt="EmberHarmony logo">
     </picture>
   </a>
 </p>
 <p align="center">오픈 소스 AI 코딩 에이전트.</p>
 <p align="center">
-  <a href="https://github.com/sydneyrenee/code-harmony/discussions"><img alt="Discord" src="https://img.shields.io/discord/1391832426048651334?style=flat-square&label=discord" /></a>
-  <a href="https://www.npmjs.com/package/code-harmony"><img alt="npm" src="https://img.shields.io/npm/v/code-harmony?style=flat-square" /></a>
-  <a href="https://github.com/sydneyrenee/code-harmony/actions/workflows/publish.yml"><img alt="Build status" src="https://img.shields.io/github/actions/workflow/status/sydneyrenee/code-harmony/publish.yml?style=flat-square&branch=main" /></a>
+  <a href="https://discord.gg/EdF8f7JR"><img alt="Discord" src="https://img.shields.io/discord/1391832426048651334?style=flat-square&label=discord" /></a>
+  <a href="https://www.npmjs.com/package/@thesolaceproject/emberharmony"><img alt="npm" src="https://img.shields.io/npm/v/%40thesolaceproject%2Femberharmony?style=flat-square" /></a>
+  <a href="https://github.com/SolaceHarmony/emberharmony/actions/workflows/publish.yml"><img alt="Build status" src="https://img.shields.io/github/actions/workflow/status/SolaceHarmony/emberharmony/publish.yml?style=flat-square&branch=dev" /></a>
 </p>
 
 <p align="center">
@@ -32,7 +32,7 @@
   <a href="README.br.md">Português (Brasil)</a>
 </p>
 
-[![CodeHarmony Terminal UI](packages/web/src/assets/lander/screenshot.png)](https://solace.ofharmony.ai)
+[![EmberHarmony Terminal UI](packages/web/src/assets/lander/screenshot.png)](https://solace.ofharmony.ai)
 
 ---
 
@@ -40,15 +40,15 @@
 
 ```bash
 # YOLO
-curl -fsSL https://raw.githubusercontent.com/sydneyrenee/code-harmony/main/install | bash
+curl -fsSL https://raw.githubusercontent.com/SolaceHarmony/emberharmony/dev/install | bash
 
 # 패키지 매니저
-npm i -g code-harmony@latest        # bun/pnpm/yarn 도 가능
-scoop install code-harmony             # Windows
-choco install code-harmony             # Windows
-paru -S code-harmony-bin               # Arch Linux
-mise use -g code-harmony               # 어떤 OS든
-nix run nixpkgs#code-harmony           # 또는 github:sydneyrenee/code-harmony 로 최신 dev 브랜치
+npm i -g @thesolaceproject/emberharmony@latest        # bun/pnpm/yarn 도 가능
+scoop install emberharmony             # Windows
+choco install emberharmony             # Windows
+paru -S emberharmony-bin               # Arch Linux
+mise use -g emberharmony               # 어떤 OS든
+nix run nixpkgs#emberharmony           # 또는 github:SolaceHarmony/emberharmony 로 최신 dev 브랜치
 ```
 
 > [!TIP]
@@ -56,38 +56,38 @@ nix run nixpkgs#code-harmony           # 또는 github:sydneyrenee/code-harmony 
 
 ### 데스크톱 앱 (BETA)
 
-CodeHarmony 는 데스크톱 앱으로도 제공됩니다. [releases page](https://github.com/sydneyrenee/code-harmony/releases) 에서 직접 다운로드하거나 [solace.ofharmony.ai/download](https://github.com/sydneyrenee/code-harmony/releases) 를 이용하세요.
+EmberHarmony 는 데스크톱 앱으로도 제공됩니다. [releases page](https://github.com/SolaceHarmony/emberharmony/releases) 에서 직접 다운로드하거나 [solace.ofharmony.ai/download](https://github.com/SolaceHarmony/emberharmony/releases) 를 이용하세요.
 
 | 플랫폼                | 다운로드                                  |
 | --------------------- | ----------------------------------------- |
-| macOS (Apple Silicon) | `code-harmony-desktop-darwin-aarch64.dmg` |
-| macOS (Intel)         | `code-harmony-desktop-darwin-x64.dmg`     |
-| Windows               | `code-harmony-desktop-windows-x64.exe`    |
+| macOS (Apple Silicon) | `emberharmony-desktop-darwin-aarch64.dmg` |
+| macOS (Intel)         | `emberharmony-desktop-darwin-x64.dmg`     |
+| Windows               | `emberharmony-desktop-windows-x64.exe`    |
 | Linux                 | `.deb`, `.rpm`, 또는 AppImage             |
 
 ```bash
 # Windows (Scoop)
-scoop bucket add extras; scoop install extras@thesolaceproject/code-harmony-desktop
+scoop bucket add extras; scoop install extras@thesolaceproject/emberharmony-desktop
 ```
 
 #### 설치 디렉터리
 
 설치 스크립트는 설치 경로를 다음 우선순위로 결정합니다.
 
-1. `$CODE_HARMONY_INSTALL_DIR` - 사용자 지정 설치 디렉터리
+1. `$EMBERHARMONY_INSTALL_DIR` - 사용자 지정 설치 디렉터리
 2. `$XDG_BIN_DIR` - XDG Base Directory Specification 준수 경로
 3. `$HOME/bin` - 표준 사용자 바이너리 디렉터리 (존재하거나 생성 가능할 경우)
-4. `$HOME/.code-harmony/bin` - 기본 폴백
+4. `$HOME/.emberharmony/bin` - 기본 폴백
 
 ```bash
 # 예시
-CODE_HARMONY_INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/sydneyrenee/code-harmony/main/install | bash
-XDG_BIN_DIR=$HOME/.local/bin curl -fsSL https://raw.githubusercontent.com/sydneyrenee/code-harmony/main/install | bash
+EMBERHARMONY_INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/SolaceHarmony/emberharmony/dev/install | bash
+XDG_BIN_DIR=$HOME/.local/bin curl -fsSL https://raw.githubusercontent.com/SolaceHarmony/emberharmony/dev/install | bash
 ```
 
 ### Agents
 
-CodeHarmony 에는 내장 에이전트 2개가 있으며 `Tab` 키로 전환할 수 있습니다.
+EmberHarmony 에는 내장 에이전트 2개가 있으며 `Tab` 키로 전환할 수 있습니다.
 
 - **build** - 기본값, 개발 작업을 위한 전체 권한 에이전트
 - **plan** - 분석 및 코드 탐색을 위한 읽기 전용 에이전트
@@ -102,15 +102,15 @@ CodeHarmony 에는 내장 에이전트 2개가 있으며 `Tab` 키로 전환할 
 
 ### 문서
 
-CodeHarmony 설정에 대한 자세한 내용은 [**문서**](https://solace.ofharmony.ai/docs) 를 참고하세요.
+EmberHarmony 설정에 대한 자세한 내용은 [**문서**](https://solace.ofharmony.ai/docs) 를 참고하세요.
 
 ### 기여하기
 
-CodeHarmony 에 기여하고 싶다면, Pull Request 를 제출하기 전에 [contributing docs](./CONTRIBUTING.md) 를 읽어주세요.
+EmberHarmony 에 기여하고 싶다면, Pull Request 를 제출하기 전에 [contributing docs](./CONTRIBUTING.md) 를 읽어주세요.
 
-### CodeHarmony 기반으로 만들기
+### EmberHarmony 기반으로 만들기
 
-CodeHarmony 와 관련된 프로젝트를 진행하면서 이름에 "code-harmony"(예: "code-harmony-dashboard" 또는 "code-harmony-mobile") 를 포함한다면, README 에 해당 프로젝트가 CodeHarmony 팀이 만든 것이 아니며 어떤 방식으로도 우리와 제휴되어 있지 않다는 점을 명시해 주세요.
+EmberHarmony 와 관련된 프로젝트를 진행하면서 이름에 "emberharmony"(예: "emberharmony-dashboard" 또는 "emberharmony-mobile") 를 포함한다면, README 에 해당 프로젝트가 EmberHarmony 팀이 만든 것이 아니며 어떤 방식으로도 우리와 제휴되어 있지 않다는 점을 명시해 주세요.
 
 ### FAQ
 
@@ -119,11 +119,21 @@ CodeHarmony 와 관련된 프로젝트를 진행하면서 이름에 "code-harmon
 기능 면에서는 Claude Code 와 매우 유사합니다. 주요 차이점은 다음과 같습니다.
 
 - 100% 오픈 소스
-- 특정 제공자에 묶여 있지 않습니다. [CodeHarmony Zen](https://solace.ofharmony.ai/zen) 을 통해 제공하는 모델을 권장하지만, CodeHarmony 는 Claude, OpenAI, Google 또는 로컬 모델과도 사용할 수 있습니다. 모델이 발전하면서 격차는 줄고 가격은 내려가므로 provider-agnostic 인 것이 중요합니다.
+- 특정 제공자에 묶여 있지 않습니다. 모델이 발전하면서 격차는 줄고 가격은 내려가므로 provider-agnostic 인 것이 중요합니다.
 - 기본으로 제공되는 LSP 지원
-- TUI 에 집중. CodeHarmony 는 neovim 사용자와 [terminal.shop](https://terminal.shop) 제작자가 만들었으며, 터미널에서 가능한 것의 한계를 밀어붙입니다.
-- 클라이언트/서버 아키텍처. 예를 들어 CodeHarmony 를 내 컴퓨터에서 실행하면서 모바일 앱으로 원격 조작할 수 있습니다. 즉, TUI 프런트엔드는 가능한 여러 클라이언트 중 하나일 뿐입니다.
+- TUI 에 집중. EmberHarmony 는터미널에서 가능한 것의 한계를 밀어붙입니다.
+- 클라이언트/서버 아키텍처. 예를 들어 EmberHarmony 를 내 컴퓨터에서 실행하면서 모바일 앱으로 원격 조작할 수 있습니다. 즉, TUI 프런트엔드는 가능한 여러 클라이언트 중 하나일 뿐입니다.
+
+
+### Acknowledgments
+
+EmberHarmony is a fork of [EmberHarmony](https://github.com/sst/emberharmony) by the [SST](https://sst.dev) team. We are deeply grateful for their foundational work in building an exceptional open source AI coding agent.
+
+### Maintainer
+
+**Sydney Renee** — sydney@solace.ofharmony.ai
+[The Solace Project](https://solace.ofharmony.ai)
 
 ---
 
-**커뮤니티에 참여하기** [Discord](https://github.com/sydneyrenee/code-harmony/discussions) | [X.com](https://github.com/sydneyrenee/code-harmony)
+**커뮤니티에 참여하기** [Discord](https://discord.gg/EdF8f7JR) | [GitHub Discussions](https://github.com/SolaceHarmony/emberharmony/discussions)

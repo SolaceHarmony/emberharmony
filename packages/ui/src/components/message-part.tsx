@@ -26,7 +26,7 @@ import {
   QuestionRequest,
   QuestionAnswer,
   QuestionInfo,
-} from "@thesolaceproject/code-harmony-sdk/v2"
+} from "@thesolaceproject/emberharmony-sdk/v2"
 import { createStore } from "solid-js/store"
 import { useData } from "../context"
 import { useDiffComponent } from "../context/diff"
@@ -42,9 +42,9 @@ import { Checkbox } from "./checkbox"
 import { DiffChanges } from "./diff-changes"
 import { Markdown } from "./markdown"
 import { ImagePreview } from "./image-preview"
-import { findLast } from "@thesolaceproject/code-harmony-util/array"
-import { getDirectory as _getDirectory, getFilename } from "@thesolaceproject/code-harmony-util/path"
-import { checksum } from "@thesolaceproject/code-harmony-util/encode"
+import { findLast } from "@thesolaceproject/emberharmony-util/array"
+import { getDirectory as _getDirectory, getFilename } from "@thesolaceproject/emberharmony-util/path"
+import { checksum } from "@thesolaceproject/emberharmony-util/encode"
 import { Tooltip } from "./tooltip"
 import { IconButton } from "./icon-button"
 import { createAutoScroll } from "../hooks"

@@ -4,6 +4,6 @@ import { $ } from "bun"
 
 await $`bun ./packages/sdk/js/script/build.ts`
 
-await $`bun dev generate > ../sdk/openapi.json`.cwd("packages/code-harmony")
+await $`bun dev generate > ../sdk/openapi.json`.cwd("packages/emberharmony")
 
 await $`./script/format.ts`

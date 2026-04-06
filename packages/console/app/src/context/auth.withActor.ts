@@ -1,4 +1,4 @@
-import { Actor } from "@thesolaceproject/code-harmony-console-core/actor.js"
+import { Actor } from "@thesolaceproject/emberharmony-console-core/actor.js"
 import { getActor } from "./auth"
 
 export async function withActor<T>(fn: () => T, workspace?: string) {

@@ -1,11 +1,11 @@
 import { createEffect, createMemo, Show, untrack } from "solid-js"
 import { createStore } from "solid-js/store"
 import { useLocation, useNavigate } from "@solidjs/router"
-import { IconButton } from "@thesolaceproject/code-harmony-ui/icon-button"
-import { Icon } from "@thesolaceproject/code-harmony-ui/icon"
-import { Button } from "@thesolaceproject/code-harmony-ui/button"
-import { Tooltip, TooltipKeybind } from "@thesolaceproject/code-harmony-ui/tooltip"
-import { useTheme } from "@thesolaceproject/code-harmony-ui/theme"
+import { IconButton } from "@thesolaceproject/emberharmony-ui/icon-button"
+import { Icon } from "@thesolaceproject/emberharmony-ui/icon"
+import { Button } from "@thesolaceproject/emberharmony-ui/button"
+import { Tooltip, TooltipKeybind } from "@thesolaceproject/emberharmony-ui/tooltip"
+import { useTheme } from "@thesolaceproject/emberharmony-ui/theme"
 
 import { useLayout } from "@/context/layout"
 import { usePlatform } from "@/context/platform"
@@ -219,7 +219,7 @@ export function Titlebar() {
             </Tooltip>
           </div>
         </div>
-        <div id="code-harmony-titlebar-left" class="flex items-center gap-3 min-w-0 px-2" data-tauri-drag-region />
+        <div id="emberharmony-titlebar-left" class="flex items-center gap-3 min-w-0 px-2" data-tauri-drag-region />
       </div>
 
       <div
@@ -227,7 +227,7 @@ export function Titlebar() {
         data-tauri-drag-region
       >
         <div
-          id="code-harmony-titlebar-center"
+          id="emberharmony-titlebar-center"
           class="pointer-events-auto w-full min-w-0 flex justify-center lg:w-fit"
         />
       </div>
@@ -241,7 +241,7 @@ export function Titlebar() {
         data-tauri-drag-region
       >
         <div
-          id="code-harmony-titlebar-right"
+          id="emberharmony-titlebar-right"
           class="flex items-center gap-3 shrink-0 justify-end"
           data-tauri-drag-region
         />

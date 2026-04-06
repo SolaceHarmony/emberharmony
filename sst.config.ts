@@ -3,7 +3,7 @@
 export default $config({
   app(input) {
     return {
-      name: "code-harmony",
+      name: "emberharmony",
       removal: input?.stage === "production" ? "retain" : "remove",
       protect: ["production"].includes(input?.stage),
       home: "cloudflare",

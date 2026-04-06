@@ -1,5 +1,5 @@
 {
-  "name": "@thesolaceproject/code-harmony-web",
+  "name": "@thesolaceproject/emberharmony-web",
   "type": "module",
   "license": "MIT",
   "version": "1.0.0",
@@ -34,7 +34,7 @@
     "toolbeam-docs-theme": "0.4.8"
   },
   "devDependencies": {
-    "code-harmony": "workspace:*",
+    "emberharmony": "workspace:*",
     "@types/node": "catalog:",
     "typescript": "catalog:"
   }

@@ -11,22 +11,22 @@ export const dict = {
   "desktop.updater.checkFailed.title": "アップデートの確認に失敗しました",
   "desktop.updater.checkFailed.message": "アップデートを確認できませんでした",
   "desktop.updater.none.title": "利用可能なアップデートはありません",
-  "desktop.updater.none.message": "すでに最新バージョンの CodeHarmony を使用しています",
+  "desktop.updater.none.message": "すでに最新バージョンの EmberHarmony を使用しています",
   "desktop.updater.downloadFailed.title": "アップデートに失敗しました",
   "desktop.updater.downloadFailed.message": "アップデートをダウンロードできませんでした",
   "desktop.updater.downloaded.title": "アップデートをダウンロードしました",
   "desktop.updater.downloaded.prompt":
-    "CodeHarmony のバージョン {{version}} がダウンロードされました。インストールして再起動しますか？",
+    "EmberHarmony のバージョン {{version}} がダウンロードされました。インストールして再起動しますか？",
   "desktop.updater.installFailed.title": "アップデートに失敗しました",
   "desktop.updater.installFailed.message": "アップデートをインストールできませんでした",
 
   "desktop.cli.installed.title": "CLI をインストールしました",
   "desktop.cli.installed.message":
-    "CLI を {{path}} にインストールしました\n\nターミナルを再起動して 'code-harmony' コマンドを使用してください。",
+    "CLI を {{path}} にインストールしました\n\nターミナルを再起動して 'emberharmony' コマンドを使用してください。",
   "desktop.cli.failed.title": "インストールに失敗しました",
   "desktop.cli.failed.message": "CLI のインストールに失敗しました: {{error}}",
 
-  "desktop.error.serverStartFailed.title": "CodeHarmony の起動に失敗しました",
+  "desktop.error.serverStartFailed.title": "EmberHarmony の起動に失敗しました",
   "desktop.error.serverStartFailed.description":
-    "ローカルの CodeHarmony サーバーを起動できませんでした。アプリを再起動するか、ネットワーク設定 (VPN/proxy) を確認して再試行してください。",
+    "ローカルの EmberHarmony サーバーを起動できませんでした。アプリを再起動するか、ネットワーク設定 (VPN/proxy) を確認して再試行してください。",
 }

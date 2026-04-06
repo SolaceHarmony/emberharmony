@@ -7,7 +7,7 @@ export const config = {
 
   // GitHub
   github: {
-    repoUrl: "https://github.com/SolaceHarmony/code-harmony",
+    repoUrl: "https://github.com/SolaceHarmony/emberharmony",
     starsFormatted: {
       compact: "80K",
       full: "80,000",

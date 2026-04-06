@@ -17,15 +17,15 @@ jobs:
 
       - uses: ./.github/actions/setup-bun
 
-      - name: Install code-harmony
-        run: curl -fsSL https://raw.githubusercontent.com/sydneyrenee/code-harmony/main/install | bash
+      - name: Install emberharmony
+        run: curl -fsSL https://raw.githubusercontent.com/SolaceHarmony/emberharmony/dev/install | bash
 
       - name: Generate daily PR recap
         id: recap
         env:
-          CODE_HARMONY_API_KEY: ${{ secrets.CODE_HARMONY_API_KEY }}
+          EMBERHARMONY_API_KEY: ${{ secrets.EMBERHARMONY_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          CODE_HARMONY_PERMISSION: |
+          EMBERHARMONY_PERMISSION: |
             {
               "bash": {
                 "*": "deny",
@@ -39,7 +39,7 @@ jobs:
         run: |
           TODAY=$(date -u +%Y-%m-%d)
 
-          code-harmony run -m code-harmony/claude-sonnet-4-5 "Generate a daily PR activity recap for the CodeHarmony repository.
+          emberharmony run -m emberharmony/claude-sonnet-4-5 "Generate a daily PR activity recap for the EmberHarmony repository.
 
           TODAY'S DATE: ${TODAY}
 

@@ -11,7 +11,7 @@ const main = async () => {
 
   const model = process.argv[2] ?? "gemini-3-pro-preview"
 
-  const todowrite = await Bun.file("packages/code-harmony/src/tool/todowrite.txt")
+  const todowrite = await Bun.file("packages/emberharmony/src/tool/todowrite.txt")
     .text()
     .catch(() => "")
 

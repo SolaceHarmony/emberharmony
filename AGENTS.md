@@ -3,6 +3,13 @@
 - The default branch in this repo is `dev`.
 - Prefer automation: execute requested actions without confirmation unless blocked by missing info or safety/irreversibility.
 
+## Git Commits
+
+- **NEVER** add `Co-authored-by: Copilot` or any AI co-authorship trailer to commit messages.
+- **NEVER** add `Co-authored-by:` trailers of any kind to commit messages.
+- All commits in this repository are solely authored by the human committer.
+- AI tools are task executors only — not co-authors. Adding such trailers is considered an invalid copyright attribution by the repository owner.
+
 ## Style Guide
 
 - Keep things in one function unless composable or reusable

@@ -1,10 +1,10 @@
 #!/usr/bin/env bun
 
 import { $ } from "bun"
-import { createCodeHarmony } from "@thesolaceproject/code-harmony-sdk/v2"
+import { createEmberHarmony } from "@thesolaceproject/emberharmony-sdk/v2"
 import { parseArgs } from "util"
 
-const repo = Bun.env.GITHUB_REPOSITORY ?? "sydneyrenee/code-harmony"
+const repo = Bun.env.GITHUB_REPOSITORY ?? "SolaceHarmony/emberharmony"
 const token = Bun.env.GH_TOKEN ?? Bun.env.GITHUB_TOKEN
 const headers = {
   accept: "application/vnd.github+json",
@@ -14,16 +14,8 @@ const headers = {
 
 export const team = [
   "actions-user",
-  "code-harmony",
-  "rekram1-node",
-  "thdxr",
-  "kommander",
-  "jayair",
-  "fwang",
-  "adamdotdevin",
-  "iamdavidhill",
-  "code-harmony-agent[bot]",
-  "R44VC0RP",
+  "sydneyrenee",
+  "emberharmony-agent[bot]",
 ]
 
 type Release = {
@@ -75,7 +67,7 @@ export async function getCommits(from: string, to: string): Promise<Commit[]> {
 
   // Get commits that touch the relevant packages
   const log =
-    await $`git log ${fromRef}..${toRef} --oneline --format="%H" -- packages/code-harmony packages/sdk packages/plugin packages/desktop packages/app sdks/vscode packages/extensions github`.text()
+    await $`git log ${fromRef}..${toRef} --oneline --format="%H" -- packages/emberharmony packages/sdk packages/plugin packages/desktop packages/app sdks/vscode packages/extensions github`.text()
   const hashes = log.split("\n").filter(Boolean)
 
   const commits: Commit[] = []
@@ -90,8 +82,8 @@ export async function getCommits(from: string, to: string): Promise<Commit[]> {
     const areas = new Set<string>()
 
     for (const file of files.split("\n").filter(Boolean)) {
-      if (file.startsWith("packages/code-harmony/src/cli/cmd/")) areas.add("tui")
-      else if (file.startsWith("packages/code-harmony/")) areas.add("core")
+      if (file.startsWith("packages/emberharmony/src/cli/cmd/")) areas.add("tui")
+      else if (file.startsWith("packages/emberharmony/")) areas.add("core")
       else if (file.startsWith("packages/desktop/src-tauri/")) areas.add("tauri")
       else if (file.startsWith("packages/desktop/")) areas.add("app")
       else if (file.startsWith("packages/app/")) areas.add("app")
@@ -159,7 +151,7 @@ function getSection(areas: Set<string>): string {
 }
 
 async function summarizeCommit(
-  harmony: Awaited<ReturnType<typeof createCodeHarmony>>,
+  harmony: Awaited<ReturnType<typeof createEmberHarmony>>,
   message: string,
 ): Promise<string> {
   console.log("summarizing commit:", message)
@@ -168,7 +160,7 @@ async function summarizeCommit(
     .prompt(
       {
         sessionID: session.data!.id,
-        model: { providerID: "code-harmony", modelID: "claude-sonnet-4-5" },
+        model: { providerID: "emberharmony", modelID: "claude-sonnet-4-5" },
         tools: {
           "*": false,
         },
@@ -189,7 +181,7 @@ Commit: ${message}`,
   return result.trim()
 }
 
-export async function generateChangelog(commits: Commit[], harmony: Awaited<ReturnType<typeof createCodeHarmony>>) {
+export async function generateChangelog(commits: Commit[], harmony: Awaited<ReturnType<typeof createEmberHarmony>>) {
   // Summarize commits in parallel with max 10 concurrent requests
   const BATCH_SIZE = 10
   const summaries: string[] = []
@@ -252,8 +244,8 @@ export async function buildNotes(from: string, to: string) {
 
   const notes: string[] = []
 
-  if (!process.env.CODE_HARMONY_API_KEY) {
-    console.log("CODE_HARMONY_API_KEY is not set, using raw commits")
+  if (!process.env.EMBERHARMONY_API_KEY) {
+    console.log("EMBERHARMONY_API_KEY is not set, using raw commits")
     const grouped = new Map<string, string[]>()
 
     for (const commit of commits) {
@@ -274,9 +266,9 @@ export async function buildNotes(from: string, to: string) {
     }
   }
 
-  if (process.env.CODE_HARMONY_API_KEY) {
+  if (process.env.EMBERHARMONY_API_KEY) {
     console.log("generating changelog since " + from)
-    const harmony = await createCodeHarmony({ port: 0 })
+    const harmony = await createEmberHarmony({ port: 0 })
 
     try {
       const lines = await generateChangelog(commits, harmony)

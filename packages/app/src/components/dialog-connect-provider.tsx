@@ -1,16 +1,16 @@
-import type { ProviderAuthAuthorization } from "@thesolaceproject/code-harmony-sdk/v2/client"
-import { Button } from "@thesolaceproject/code-harmony-ui/button"
-import { useDialog } from "@thesolaceproject/code-harmony-ui/context/dialog"
-import { Dialog } from "@thesolaceproject/code-harmony-ui/dialog"
-import { Icon } from "@thesolaceproject/code-harmony-ui/icon"
-import { IconButton } from "@thesolaceproject/code-harmony-ui/icon-button"
-import type { IconName } from "@thesolaceproject/code-harmony-ui/icons/provider"
-import { List, type ListRef } from "@thesolaceproject/code-harmony-ui/list"
-import { ProviderIcon } from "@thesolaceproject/code-harmony-ui/provider-icon"
-import { Spinner } from "@thesolaceproject/code-harmony-ui/spinner"
-import { TextField } from "@thesolaceproject/code-harmony-ui/text-field"
-import { showToast } from "@thesolaceproject/code-harmony-ui/toast"
-import { iife } from "@thesolaceproject/code-harmony-util/iife"
+import type { ProviderAuthAuthorization } from "@thesolaceproject/emberharmony-sdk/v2/client"
+import { Button } from "@thesolaceproject/emberharmony-ui/button"
+import { useDialog } from "@thesolaceproject/emberharmony-ui/context/dialog"
+import { Dialog } from "@thesolaceproject/emberharmony-ui/dialog"
+import { Icon } from "@thesolaceproject/emberharmony-ui/icon"
+import { IconButton } from "@thesolaceproject/emberharmony-ui/icon-button"
+import type { IconName } from "@thesolaceproject/emberharmony-ui/icons/provider"
+import { List, type ListRef } from "@thesolaceproject/emberharmony-ui/list"
+import { ProviderIcon } from "@thesolaceproject/emberharmony-ui/provider-icon"
+import { Spinner } from "@thesolaceproject/emberharmony-ui/spinner"
+import { TextField } from "@thesolaceproject/emberharmony-ui/text-field"
+import { showToast } from "@thesolaceproject/emberharmony-ui/toast"
+import { iife } from "@thesolaceproject/emberharmony-util/iife"
 import { createMemo, Match, onCleanup, onMount, Switch } from "solid-js"
 import { createStore, produce } from "solid-js/store"
 import { Link } from "@/components/link"
@@ -265,7 +265,7 @@ export function DialogConnectProvider(props: { provider: string }) {
                 return (
                   <div class="flex flex-col gap-6">
                     <Switch>
-                      <Match when={provider().id === "code-harmony"}>
+                      <Match when={provider().id === "emberharmony"}>
                         <div class="flex flex-col gap-4">
                           <div class="text-14-regular text-text-base">
                             {language.t("provider.connect.harmonyZen.line1")}

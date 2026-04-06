@@ -1,8 +1,8 @@
 use tauri::{AppHandle, Manager, path::BaseDirectory};
 use tauri_plugin_shell::{ShellExt, process::Command};
 
-const CLI_INSTALL_DIR: &str = ".code-harmony/bin";
-const CLI_BINARY_NAME: &str = "code-harmony";
+const CLI_INSTALL_DIR: &str = ".emberharmony/bin";
+const CLI_BINARY_NAME: &str = "emberharmony";
 
 #[derive(serde::Deserialize)]
 pub struct ServerConfig {
@@ -39,7 +39,7 @@ pub fn get_sidecar_path(app: &tauri::AppHandle) -> std::path::PathBuf {
         .expect("Failed to get current binary")
         .parent()
         .expect("Failed to get parent dir")
-        .join("code-harmony-cli")
+        .join("emberharmony-cli")
 }
 
 fn is_cli_installed() -> bool {
@@ -61,7 +61,7 @@ pub fn install_cli(app: tauri::AppHandle) -> Result<String, String> {
         return Err("Sidecar binary not found".to_string());
     }
 
-    let temp_script = std::env::temp_dir().join("code-harmony-install.sh");
+    let temp_script = std::env::temp_dir().join("emberharmony-install.sh");
     std::fs::write(&temp_script, INSTALL_SCRIPT)
         .map_err(|e| format!("Failed to write install script: {}", e))?;
 
@@ -153,12 +153,12 @@ pub fn create_command(app: &tauri::AppHandle, args: &str) -> Command {
     #[cfg(target_os = "windows")]
     return app
         .shell()
-        .sidecar("code-harmony-cli")
+        .sidecar("emberharmony-cli")
         .unwrap()
         .args(args.split_whitespace())
-        .env("CODE_HARMONY_EXPERIMENTAL_ICON_DISCOVERY", "true")
-        .env("CODE_HARMONY_EXPERIMENTAL_FILEWATCHER", "true")
-        .env("CODE_HARMONY_CLIENT", "desktop")
+        .env("EMBERHARMONY_EXPERIMENTAL_ICON_DISCOVERY", "true")
+        .env("EMBERHARMONY_EXPERIMENTAL_FILEWATCHER", "true")
+        .env("EMBERHARMONY_CLIENT", "desktop")
         .env("XDG_STATE_HOME", &state_dir);
 
     #[cfg(not(target_os = "windows"))]
@@ -174,9 +174,9 @@ pub fn create_command(app: &tauri::AppHandle, args: &str) -> Command {
 
         app.shell()
             .command(&shell)
-            .env("CODE_HARMONY_EXPERIMENTAL_ICON_DISCOVERY", "true")
-            .env("CODE_HARMONY_EXPERIMENTAL_FILEWATCHER", "true")
-            .env("CODE_HARMONY_CLIENT", "desktop")
+            .env("EMBERHARMONY_EXPERIMENTAL_ICON_DISCOVERY", "true")
+            .env("EMBERHARMONY_EXPERIMENTAL_FILEWATCHER", "true")
+            .env("EMBERHARMONY_CLIENT", "desktop")
             .env("XDG_STATE_HOME", &state_dir)
             .args(["-il", "-c", &cmd])
     };

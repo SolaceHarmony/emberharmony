@@ -5,7 +5,7 @@ export default {
   console: stage === "production" ? "https://solace.ofharmony.ai/auth" : `https://${stage}.solace.ofharmony.ai/auth`,
   email: "sydney@solace.ofharmony.ai",
   socialCard: "https://social-cards.sst.dev",
-  github: "https://github.com/sydneyrenee/code-harmony",
+  github: "https://github.com/sydneyrenee/emberharmony",
   discord: "https://discord.gg/EdF8f7JR",
   headerLinks: [
     { name: "Home", url: "/" },

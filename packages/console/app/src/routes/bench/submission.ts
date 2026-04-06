@@ -1,7 +1,7 @@
 import type { APIEvent } from "@solidjs/start/server"
-import { Database } from "@thesolaceproject/code-harmony-console-core/drizzle/index.js"
-import { BenchmarkTable } from "@thesolaceproject/code-harmony-console-core/schema/benchmark.sql.js"
-import { Identifier } from "@thesolaceproject/code-harmony-console-core/identifier.js"
+import { Database } from "@thesolaceproject/emberharmony-console-core/drizzle/index.js"
+import { BenchmarkTable } from "@thesolaceproject/emberharmony-console-core/schema/benchmark.sql.js"
+import { Identifier } from "@thesolaceproject/emberharmony-console-core/identifier.js"
 
 interface SubmissionBody {
   model: string

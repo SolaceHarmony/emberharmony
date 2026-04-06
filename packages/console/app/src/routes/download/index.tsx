@@ -5,7 +5,7 @@ import { Header } from "~/component/header"
 import { Footer } from "~/component/footer"
 import { IconCopy, IconCheck } from "~/component/icon"
 import { Faq } from "~/component/faq"
-import desktopAppIcon from "../../asset/lander/code-harmony-desktop-icon.png"
+import desktopAppIcon from "../../asset/lander/emberharmony-desktop-icon.png"
 import { Legal } from "~/component/legal"
 import { config } from "~/config"
 import { createSignal, onMount, Show, JSX } from "solid-js"
@@ -80,19 +80,19 @@ export default function Download() {
   }
   return (
     <main data-page="download">
-      <Title>CodeHarmony | Download</Title>
+      <Title>EmberHarmony | Download</Title>
       <Link rel="canonical" href={`${config.baseUrl}/download`} />
-      <Meta name="description" content="Download CodeHarmony for macOS, Windows, and Linux" />
+      <Meta name="description" content="Download EmberHarmony for macOS, Windows, and Linux" />
       <div data-component="container">
         <Header hideGetStarted />
 
         <div data-component="content">
           <section data-component="download-hero">
             <div data-component="hero-icon">
-              <img src={desktopAppIcon} alt="CodeHarmony Desktop" />
+              <img src={desktopAppIcon} alt="EmberHarmony Desktop" />
             </div>
             <div data-component="hero-text">
-              <h1>Download CodeHarmony</h1>
+              <h1>Download EmberHarmony</h1>
               <p>Available in Beta for macOS, Windows, and Linux</p>
               <Show when={detectedOS()}>
                 <a href={getDownloadHref(getDownloadPlatform(detectedOS()))} data-component="download-button">
@@ -105,36 +105,36 @@ export default function Download() {
 
           <section data-component="download-section">
             <div data-component="section-label">
-              <span>[1]</span> CodeHarmony Terminal
+              <span>[1]</span> EmberHarmony Terminal
             </div>
             <div data-component="section-content">
               <button
                 data-component="cli-row"
                 onClick={handleCopyClick(
-                  "curl -fsSL https://raw.githubusercontent.com/sydneyrenee/code-harmony/main/install | bash",
+                  "curl -fsSL https://raw.githubusercontent.com/sydneyrenee/emberharmony/main/install | bash",
                 )}
               >
                 <code>
-                  curl -fsSL https://<strong>raw.githubusercontent.com/sydneyrenee/code-harmony/main/install</strong> |
+                  curl -fsSL https://<strong>raw.githubusercontent.com/sydneyrenee/emberharmony/main/install</strong> |
                   bash
                 </code>
                 <CopyStatus />
               </button>
-              <button data-component="cli-row" onClick={handleCopyClick("npm i -g code-harmony")}>
+              <button data-component="cli-row" onClick={handleCopyClick("npm i -g emberharmony")}>
                 <code>
-                  npm i -g <strong>code-harmony</strong>
+                  npm i -g <strong>emberharmony</strong>
                 </code>
                 <CopyStatus />
               </button>
-              <button data-component="cli-row" onClick={handleCopyClick("bun add -g code-harmony")}>
+              <button data-component="cli-row" onClick={handleCopyClick("bun add -g emberharmony")}>
                 <code>
-                  bun add -g <strong>code-harmony</strong>
+                  bun add -g <strong>emberharmony</strong>
                 </code>
                 <CopyStatus />
               </button>
-              <button data-component="cli-row" onClick={handleCopyClick("paru -S code-harmony-bin")}>
+              <button data-component="cli-row" onClick={handleCopyClick("paru -S emberharmony-bin")}>
                 <code>
-                  paru -S <strong>code-harmony-bin</strong>
+                  paru -S <strong>emberharmony-bin</strong>
                 </code>
                 <CopyStatus />
               </button>
@@ -143,7 +143,7 @@ export default function Download() {
 
           <section data-component="download-section">
             <div data-component="section-label">
-              <span>[2]</span> CodeHarmony Desktop (Beta)
+              <span>[2]</span> EmberHarmony Desktop (Beta)
             </div>
             <div data-component="section-content">
               <div data-component="download-row">
@@ -257,7 +257,7 @@ export default function Download() {
 
           <section data-component="download-section">
             <div data-component="section-label">
-              <span>[3]</span> CodeHarmony Extensions
+              <span>[3]</span> EmberHarmony Extensions
             </div>
             <div data-component="section-content">
               <div data-component="download-row">
@@ -363,7 +363,7 @@ export default function Download() {
 
           <section data-component="download-section">
             <div data-component="section-label">
-              <span>[4]</span> CodeHarmony Integrations
+              <span>[4]</span> EmberHarmony Integrations
             </div>
             <div data-component="section-content">
               <div data-component="download-row">
@@ -409,48 +409,48 @@ export default function Download() {
           </div>
           <ul>
             <li>
-              <Faq question="What is CodeHarmony?">
-                CodeHarmony is an open source agent that helps you write and run code with any AI model. It's available
+              <Faq question="What is EmberHarmony?">
+                EmberHarmony is an open source agent that helps you write and run code with any AI model. It's available
                 as a terminal-based interface, desktop app, or IDE extension.
               </Faq>
             </li>
             <li>
-              <Faq question="How do I use CodeHarmony?">
+              <Faq question="How do I use EmberHarmony?">
                 The easiest way to get started is to read the <a href="/docs">intro</a>.
               </Faq>
             </li>
             <li>
-              <Faq question="Do I need extra AI subscriptions to use CodeHarmony?">
-                Not necessarily, but probably. You'll need an AI subscription if you want to connect CodeHarmony to a
+              <Faq question="Do I need extra AI subscriptions to use EmberHarmony?">
+                Not necessarily, but probably. You'll need an AI subscription if you want to connect EmberHarmony to a
                 paid provider, although you can work with{" "}
                 <a href="/docs/providers/#lm-studio" target="_blank">
                   local models
                 </a>{" "}
-                for free. While we encourage users to use <A href="/zen">Zen</A>, CodeHarmony works with all popular
+                for free. While we encourage users to use <A href="/zen">Zen</A>, EmberHarmony works with all popular
                 providers such as OpenAI, Anthropic, xAI etc.
               </Faq>
             </li>
             <li>
-              <Faq question="Can I only use CodeHarmony in the terminal?">
-                Not anymore! CodeHarmony is now available as an app for your <a href="/download">desktop</a> and{" "}
+              <Faq question="Can I only use EmberHarmony in the terminal?">
+                Not anymore! EmberHarmony is now available as an app for your <a href="/download">desktop</a> and{" "}
                 <a href="/docs/cli/#web">web</a>!
               </Faq>
             </li>
             <li>
-              <Faq question="How much does CodeHarmony cost?">
-                CodeHarmony is 100% free to use. Any additional costs will come from your subscription to a model
-                provider. While CodeHarmony works with any model provider, we recommend using <A href="/zen">Zen</A>.
+              <Faq question="How much does EmberHarmony cost?">
+                EmberHarmony is 100% free to use. Any additional costs will come from your subscription to a model
+                provider. While EmberHarmony works with any model provider, we recommend using <A href="/zen">Zen</A>.
               </Faq>
             </li>
             <li>
               <Faq question="What about data and privacy?">
-                Your data and information is only stored when you create sharable links in CodeHarmony. Learn more about{" "}
+                Your data and information is only stored when you create sharable links in EmberHarmony. Learn more about{" "}
                 <a href="/docs/share/#privacy">share pages</a>.
               </Faq>
             </li>
             <li>
-              <Faq question="Is CodeHarmony open source?">
-                Yes, CodeHarmony is fully open source. The source code is public on{" "}
+              <Faq question="Is EmberHarmony open source?">
+                Yes, EmberHarmony is fully open source. The source code is public on{" "}
                 <a href={config.github.repoUrl} target="_blank">
                   GitHub
                 </a>{" "}

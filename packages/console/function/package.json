@@ -1,5 +1,5 @@
 {
-  "name": "@thesolaceproject/code-harmony-console-function",
+  "name": "@thesolaceproject/emberharmony-console-function",
   "version": "1.0.0",
   "$schema": "https://json.schemastore.org/package.json",
   "private": true,
@@ -21,8 +21,8 @@
     "@ai-sdk/openai": "2.0.2",
     "@ai-sdk/openai-compatible": "1.0.1",
     "@hono/zod-validator": "catalog:",
-    "@thesolaceproject/code-harmony-console-core": "workspace:*",
-    "@thesolaceproject/code-harmony-console-resource": "workspace:*",
+    "@thesolaceproject/emberharmony-console-core": "workspace:*",
+    "@thesolaceproject/emberharmony-console-resource": "workspace:*",
     "@openauthjs/openauth": "0.0.0-20250322224806",
     "ai": "catalog:",
     "hono": "catalog:",

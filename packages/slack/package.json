@@ -1,5 +1,5 @@
 {
-  "name": "@thesolaceproject/code-harmony-slack",
+  "name": "@thesolaceproject/emberharmony-slack",
   "version": "1.0.0",
   "type": "module",
   "license": "MIT",
@@ -8,7 +8,7 @@
     "typecheck": "tsgo --noEmit"
   },
   "dependencies": {
-    "@thesolaceproject/code-harmony-sdk": "workspace:*",
+    "@thesolaceproject/emberharmony-sdk": "workspace:*",
     "@slack/bolt": "^3.17.1"
   },
   "devDependencies": {

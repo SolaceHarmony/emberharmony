@@ -1,5 +1,5 @@
 import { defineConfig } from "vite"
-import appPlugin from "@thesolaceproject/code-harmony-app/vite"
+import appPlugin from "@thesolaceproject/emberharmony-app/vite"
 
 const host = process.env.TAURI_DEV_HOST
 

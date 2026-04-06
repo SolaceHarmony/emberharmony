@@ -1,6 +1,6 @@
 {
   "$schema": "https://json.schemastore.org/package.json",
-  "name": "@thesolaceproject/code-harmony-plugin",
+  "name": "@thesolaceproject/emberharmony-plugin",
   "version": "1.0.0",
   "type": "module",
   "license": "MIT",
@@ -16,7 +16,7 @@
     "dist"
   ],
   "dependencies": {
-    "@thesolaceproject/code-harmony-sdk": "workspace:*",
+    "@thesolaceproject/emberharmony-sdk": "workspace:*",
     "zod": "catalog:"
   },
   "devDependencies": {

@@ -1,36 +1,36 @@
-id = "code-harmony"
-name = "CodeHarmony"
+id = "emberharmony"
+name = "EmberHarmony"
 description = "The open source coding agent."
 version = "1.0.0"
 schema_version = 1
 authors = ["The Solace Project"]
-repository = "https://github.com/sydneyrenee/code-harmony"
+repository = "https://github.com/SolaceHarmony/emberharmony"
 
-[agent_servers.code-harmony]
-name = "CodeHarmony"
-icon = "./icons/code-harmony.svg"
+[agent_servers.emberharmony]
+name = "EmberHarmony"
+icon = "./icons/emberharmony.svg"
 
-[agent_servers.code-harmony.targets.darwin-aarch64]
-archive = "https://github.com/sydneyrenee/code-harmony/releases/download/v1.0.0/code-harmony-darwin-arm64.zip"
-cmd = "./code-harmony"
+[agent_servers.emberharmony.targets.darwin-aarch64]
+archive = "https://github.com/SolaceHarmony/emberharmony/releases/download/v1.0.0/emberharmony-darwin-arm64.zip"
+cmd = "./emberharmony"
 args = ["acp"]
 
-[agent_servers.code-harmony.targets.darwin-x86_64]
-archive = "https://github.com/sydneyrenee/code-harmony/releases/download/v1.0.0/code-harmony-darwin-x64.zip"
-cmd = "./code-harmony"
+[agent_servers.emberharmony.targets.darwin-x86_64]
+archive = "https://github.com/SolaceHarmony/emberharmony/releases/download/v1.0.0/emberharmony-darwin-x64.zip"
+cmd = "./emberharmony"
 args = ["acp"]
 
-[agent_servers.code-harmony.targets.linux-aarch64]
-archive = "https://github.com/sydneyrenee/code-harmony/releases/download/v1.0.0/code-harmony-linux-arm64.tar.gz"
-cmd = "./code-harmony"
+[agent_servers.emberharmony.targets.linux-aarch64]
+archive = "https://github.com/SolaceHarmony/emberharmony/releases/download/v1.0.0/emberharmony-linux-arm64.tar.gz"
+cmd = "./emberharmony"
 args = ["acp"]
 
-[agent_servers.code-harmony.targets.linux-x86_64]
-archive = "https://github.com/sydneyrenee/code-harmony/releases/download/v1.0.0/code-harmony-linux-x64.tar.gz"
-cmd = "./code-harmony"
+[agent_servers.emberharmony.targets.linux-x86_64]
+archive = "https://github.com/SolaceHarmony/emberharmony/releases/download/v1.0.0/emberharmony-linux-x64.tar.gz"
+cmd = "./emberharmony"
 args = ["acp"]
 
-[agent_servers.code-harmony.targets.windows-x86_64]
-archive = "https://github.com/sydneyrenee/code-harmony/releases/download/v1.0.0/code-harmony-windows-x64.zip"
-cmd = "./code-harmony.exe"
+[agent_servers.emberharmony.targets.windows-x86_64]
+archive = "https://github.com/SolaceHarmony/emberharmony/releases/download/v1.0.0/emberharmony-windows-x64.zip"
+cmd = "./emberharmony.exe"
 args = ["acp"]

@@ -1,7 +1,7 @@
-import { Database, eq, sql } from "@thesolaceproject/code-harmony-console-core/drizzle/index.js"
-import { IpTable } from "@thesolaceproject/code-harmony-console-core/schema/ip.sql.js"
+import { Database, eq, sql } from "@thesolaceproject/emberharmony-console-core/drizzle/index.js"
+import { IpTable } from "@thesolaceproject/emberharmony-console-core/schema/ip.sql.js"
 import { UsageInfo } from "./provider/provider"
-import { ZenData } from "@thesolaceproject/code-harmony-console-core/model.js"
+import { ZenData } from "@thesolaceproject/emberharmony-console-core/model.js"
 
 export function createTrialLimiter(trial: ZenData.Trial | undefined, ip: string, client: string) {
   if (!trial) return

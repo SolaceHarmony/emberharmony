@@ -1,5 +1,5 @@
-import { createCodeHarmonyClient } from "@thesolaceproject/code-harmony-sdk/v2/client"
-import { createSimpleContext } from "@thesolaceproject/code-harmony-ui/context"
+import { createEmberHarmonyClient } from "@thesolaceproject/emberharmony-sdk/v2/client"
+import { createSimpleContext } from "@thesolaceproject/emberharmony-ui/context"
 import { batch, createEffect, createMemo, onCleanup } from "solid-js"
 import { createStore } from "solid-js/store"
 import { usePlatform } from "@/context/platform"
@@ -96,7 +96,7 @@ export const { use: useServer, provider: ServerProvider } = createSimpleContext(
 
     const check = (url: string) => {
       const signal = (AbortSignal as unknown as { timeout?: (ms: number) => AbortSignal }).timeout?.(3000)
-      const sdk = createCodeHarmonyClient({
+      const sdk = createEmberHarmonyClient({
         baseUrl: url,
         fetch: platform.fetch,
         signal,

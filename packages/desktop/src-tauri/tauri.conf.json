@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "CodeHarmony Dev",
+  "productName": "EmberHarmony Dev",
   "identifier": "ai.ofharmony.code.dev",
-  "mainBinaryName": "CodeHarmony",
+  "mainBinaryName": "EmberHarmony",
   "version": "../package.json",
   "build": {
     "beforeDevCommand": "bun run dev",
@@ -15,7 +15,7 @@
       {
         "label": "main",
         "create": false,
-        "title": "CodeHarmony",
+        "title": "EmberHarmony",
         "url": "/",
         "decorations": true,
         "transparent": true,
@@ -42,7 +42,7 @@
     ],
     "active": true,
     "targets": ["deb", "rpm", "dmg", "nsis", "app"],
-    "externalBin": ["sidecars/code-harmony-cli"],
+    "externalBin": ["sidecars/emberharmony-cli"],
     "macOS": {
       "entitlements": "./entitlements.plist"
     },
@@ -57,7 +57,7 @@
   "plugins": {
     "deep-link": {
       "desktop": {
-        "schemes": ["codeharmony"]
+        "schemes": ["emberharmony"]
       }
     }
   }

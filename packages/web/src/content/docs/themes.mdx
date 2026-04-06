@@ -3,9 +3,9 @@ title: Themes
 description: Select a built-in theme or define your own.
 ---
 
-With CodeHarmony you can select from one of several built-in themes, use a theme that adapts to your terminal theme, or define your own custom theme.
+With EmberHarmony you can select from one of several built-in themes, use a theme that adapts to your terminal theme, or define your own custom theme.
 
-By default, CodeHarmony uses our own `code-harmony` theme.
+By default, EmberHarmony uses our own `emberharmony` theme.
 
 ---
 
@@ -23,7 +23,7 @@ Without truecolor support, themes may appear with reduced color accuracy or fall
 
 ## Built-in themes
 
-CodeHarmony comes with several built-in themes.
+EmberHarmony comes with several built-in themes.
 
 | Name                   | Description                                                                  |
 | ---------------------- | ---------------------------------------------------------------------------- |
@@ -53,7 +53,7 @@ The `system` theme is designed to automatically adapt to your terminal's color s
 
 The system theme is for users who:
 
-- Want CodeHarmony to match their terminal's appearance
+- Want EmberHarmony to match their terminal's appearance
 - Use custom terminal color schemes
 - Prefer a consistent look across all terminal applications
 
@@ -63,7 +63,7 @@ The system theme is for users who:
 
 You can select a theme by bringing up the theme select with the `/theme` command. Or you can specify it in your [config](/docs/config).
 
-```json title="code-harmony.json" {3}
+```json title="emberharmony.json" {3}
 {
   "$schema": "https://solace.ofharmony.ai/config.json",
   "theme": "tokyonight"
@@ -74,7 +74,7 @@ You can select a theme by bringing up the theme select with the `/theme` command
 
 ## Custom themes
 
-CodeHarmony supports a flexible JSON-based theme system that allows users to create and customize themes easily.
+EmberHarmony supports a flexible JSON-based theme system that allows users to create and customize themes easily.
 
 ---
 
@@ -83,9 +83,9 @@ CodeHarmony supports a flexible JSON-based theme system that allows users to cre
 Themes are loaded from multiple directories in the following order where later directories override earlier ones:
 
 1. **Built-in themes** - These are embedded in the binary
-2. **User config directory** - Defined in `~/.config/code-harmony/themes/*.json` or `$XDG_CONFIG_HOME/code-harmony/themes/*.json`
-3. **Project root directory** - Defined in the `<project-root>/.code-harmony/themes/*.json`
-4. **Current working directory** - Defined in `./.code-harmony/themes/*.json`
+2. **User config directory** - Defined in `~/.config/emberharmony/themes/*.json` or `$XDG_CONFIG_HOME/emberharmony/themes/*.json`
+3. **Project root directory** - Defined in the `<project-root>/.emberharmony/themes/*.json`
+4. **Current working directory** - Defined in `./.emberharmony/themes/*.json`
 
 If multiple directories contain a theme with the same name, the theme from the directory with higher priority will be used.
 
@@ -98,15 +98,15 @@ To create a custom theme, create a JSON file in one of the theme directories.
 For user-wide themes:
 
 ```bash no-frame
-mkdir -p ~/.config/code-harmony/themes
-vim ~/.config/code-harmony/themes/my-theme.json
+mkdir -p ~/.config/emberharmony/themes
+vim ~/.config/emberharmony/themes/my-theme.json
 ```
 
 And for project-specific themes.
 
 ```bash no-frame
-mkdir -p .code-harmony/themes
-vim .code-harmony/themes/my-theme.json
+mkdir -p .emberharmony/themes
+vim .emberharmony/themes/my-theme.json
 ```
 
 ---

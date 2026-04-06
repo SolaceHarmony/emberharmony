@@ -3,7 +3,7 @@
     <picture>
       <source srcset="packages/console/app/src/asset/logo-ornate-dark.svg" media="(prefers-color-scheme: dark)">
       <source srcset="packages/console/app/src/asset/logo-ornate-light.svg" media="(prefers-color-scheme: light)">
-      <img src="packages/console/app/src/asset/logo-ornate-light.svg" alt="CodeHarmony logo">
+      <img src="packages/console/app/src/asset/logo-ornate-light.svg" alt="EmberHarmony logo">
     </picture>
   </a>
 </p>
@@ -11,7 +11,7 @@
 <p align="center">
   <a href="https://discord.gg/EdF8f7JR"><img alt="Discord" src="https://img.shields.io/discord/1391832426048651334?style=flat-square&label=discord" /></a>
   <a href="https://www.npmjs.com/package/@thesolaceproject/emberharmony"><img alt="npm" src="https://img.shields.io/npm/v/%40thesolaceproject%2Femberharmony?style=flat-square" /></a>
-  <a href="https://github.com/SolaceHarmony/code-harmony/actions/workflows/publish.yml"><img alt="Build status" src="https://img.shields.io/github/actions/workflow/status/SolaceHarmony/code-harmony/publish.yml?style=flat-square&branch=dev" /></a>
+  <a href="https://github.com/SolaceHarmony/emberharmony/actions/workflows/publish.yml"><img alt="Build status" src="https://img.shields.io/github/actions/workflow/status/SolaceHarmony/emberharmony/publish.yml?style=flat-square&branch=dev" /></a>
 </p>
 
 <p align="center">
@@ -33,7 +33,7 @@
   <a href="README.th.md">ไทย</a>
 </p>
 
-[![CodeHarmony Terminal UI](packages/web/src/assets/lander/screenshot.png)](https://solace.ofharmony.ai)
+[![EmberHarmony Terminal UI](packages/web/src/assets/lander/screenshot.png)](https://solace.ofharmony.ai)
 
 ---
 
@@ -41,7 +41,7 @@
 
 ```bash
 # YOLO
-curl -fsSL https://raw.githubusercontent.com/SolaceHarmony/code-harmony/dev/install | bash
+curl -fsSL https://raw.githubusercontent.com/SolaceHarmony/emberharmony/dev/install | bash
 
 # Package managers
 npm i -g @thesolaceproject/emberharmony@latest        # or bun/pnpm/yarn
@@ -49,7 +49,7 @@ scoop install emberharmony             # Windows
 choco install emberharmony             # Windows
 paru -S emberharmony-bin               # Arch Linux
 mise use -g emberharmony               # Any OS
-nix run nixpkgs#code-harmony           # or github:SolaceHarmony/code-harmony for latest dev branch
+nix run nixpkgs#emberharmony           # or github:SolaceHarmony/emberharmony for latest dev branch
 ```
 
 > [!TIP]
@@ -61,23 +61,23 @@ nix run nixpkgs#code-harmony           # or github:SolaceHarmony/code-harmony fo
 bun install
 npm run pack:local
 # prints a .tgz path you can install, e.g.
-# npm i -g /absolute/path/to/code-harmony-1.0.0.tgz
+# npm i -g /absolute/path/to/emberharmony-1.0.0.tgz
 ```
 
 ### Desktop App (BETA)
 
-CodeHarmony is also available as a desktop application. Download directly from the [releases page](https://github.com/SolaceHarmony/code-harmony/releases) or [solace.ofharmony.ai/download](https://github.com/SolaceHarmony/code-harmony/releases).
+EmberHarmony is also available as a desktop application. Download directly from the [releases page](https://github.com/SolaceHarmony/emberharmony/releases) or [solace.ofharmony.ai/download](https://github.com/SolaceHarmony/emberharmony/releases).
 
 | Platform              | Download                                  |
 | --------------------- | ----------------------------------------- |
-| macOS (Apple Silicon) | `code-harmony-desktop-darwin-aarch64.dmg` |
-| macOS (Intel)         | `code-harmony-desktop-darwin-x64.dmg`     |
-| Windows               | `code-harmony-desktop-windows-x64.exe`    |
+| macOS (Apple Silicon) | `emberharmony-desktop-darwin-aarch64.dmg` |
+| macOS (Intel)         | `emberharmony-desktop-darwin-x64.dmg`     |
+| Windows               | `emberharmony-desktop-windows-x64.exe`    |
 | Linux                 | `.deb`, `.rpm`, or AppImage               |
 
 ```bash
 # Windows (Scoop)
-scoop bucket add extras; scoop install extras@thesolaceproject/code-harmony-desktop
+scoop bucket add extras; scoop install extras@thesolaceproject/emberharmony-desktop
 ```
 
 #### Installation Directory
@@ -85,20 +85,20 @@ scoop bucket add extras; scoop install extras@thesolaceproject/code-harmony-desk
 The install script respects the following priority order for the installation path:
 
 1. `$EMBERHARMONY_INSTALL_DIR` - Custom installation directory (preferred)
-2. `$CODE_HARMONY_INSTALL_DIR` - Backward compat
+2. `$EMBERHARMONY_INSTALL_DIR` - Backward compat
 3. `$XDG_BIN_DIR` - XDG Base Directory Specification compliant path
 4. `$HOME/bin` - Standard user binary directory (if exists or can be created)
 5. `$HOME/.emberharmony/bin` - Default fallback
 
 ```bash
 # Examples
-EMBERHARMONY_INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/SolaceHarmony/code-harmony/dev/install | bash
-XDG_BIN_DIR=$HOME/.local/bin curl -fsSL https://raw.githubusercontent.com/SolaceHarmony/code-harmony/dev/install | bash
+EMBERHARMONY_INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/SolaceHarmony/emberharmony/dev/install | bash
+XDG_BIN_DIR=$HOME/.local/bin curl -fsSL https://raw.githubusercontent.com/SolaceHarmony/emberharmony/dev/install | bash
 ```
 
 ### Agents
 
-CodeHarmony includes two built-in agents you can switch between with the `Tab` key.
+EmberHarmony includes two built-in agents you can switch between with the `Tab` key.
 
 - **build** - Default, full access agent for development work
 - **plan** - Read-only agent for analysis and code exploration
@@ -113,15 +113,15 @@ Learn more about [agents](https://solace.ofharmony.ai/docs/agents).
 
 ### Documentation
 
-For more info on how to configure CodeHarmony [**head over to our docs**](https://solace.ofharmony.ai/docs).
+For more info on how to configure EmberHarmony [**head over to our docs**](https://solace.ofharmony.ai/docs).
 
 ### Contributing
 
-If you're interested in contributing to CodeHarmony, please read our [contributing docs](./CONTRIBUTING.md) before submitting a pull request.
+If you're interested in contributing to EmberHarmony, please read our [contributing docs](./CONTRIBUTING.md) before submitting a pull request.
 
-### Building on CodeHarmony
+### Building on EmberHarmony
 
-If you are working on a project that's related to CodeHarmony and is using "code-harmony" as a part of its name; for example, "code-harmony-dashboard" or "code-harmony-mobile", please add a note in your README to clarify that it is not built by the CodeHarmony team and is not affiliated with us in any way.
+If you are working on a project that's related to EmberHarmony and is using "emberharmony" or "emberharmony" as a part of its name, please add a note in your README to clarify that it is not built by The Solace Project and is not affiliated with us in any way.
 
 ### FAQ
 
@@ -130,11 +130,20 @@ If you are working on a project that's related to CodeHarmony and is using "code
 It's very similar to Claude Code in terms of capability. Here are the key differences:
 
 - 100% open source
-- Not coupled to any provider. Although we recommend the models we provide through [CodeHarmony Zen](https://solace.ofharmony.ai/zen); CodeHarmony can be used with Claude, OpenAI, Google or even local models. As models evolve the gaps between them will close and pricing will drop so being provider-agnostic is important.
+- Not coupled to any provider. EmberHarmony can be used with Claude, OpenAI, Google, or even local models. As models evolve the gaps between them will close and pricing will drop, so being provider-agnostic is important.
 - Out of the box LSP support
-- A focus on TUI. CodeHarmony is built by neovim users and the creators of [terminal.shop](https://terminal.shop); we are going to push the limits of what's possible in the terminal.
-- A client/server architecture. This for example can allow CodeHarmony to run on your computer, while you can drive it remotely from a mobile app. Meaning that the TUI frontend is just one of the possible clients.
+- A focus on TUI — we are going to push the limits of what's possible in the terminal.
+- A client/server architecture. This for example can allow EmberHarmony to run on your computer, while you can drive it remotely from a mobile app. The TUI frontend is just one of the possible clients.
+
+### Acknowledgments
+
+EmberHarmony is a fork of [EmberHarmony](https://github.com/sst/emberharmony) by the [SST](https://sst.dev) team. We are deeply grateful for their foundational work in building an exceptional open source AI coding agent. This project would not exist without their vision and engineering.
+
+### Maintainer
+
+**Sydney Renee** — sydney@solace.ofharmony.ai
+[The Solace Project](https://solace.ofharmony.ai)
 
 ---
 
-**Join our community** [Discord](https://discord.gg/EdF8f7JR) | [GitHub Discussions](https://github.com/SolaceHarmony/code-harmony/discussions)
+**Join our community** [Discord](https://discord.gg/EdF8f7JR) | [GitHub Discussions](https://github.com/SolaceHarmony/emberharmony/discussions)

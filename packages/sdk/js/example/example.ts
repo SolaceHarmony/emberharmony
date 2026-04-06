@@ -1,7 +1,7 @@
-import { createCodeHarmonyClient, createCodeHarmonyServer } from "@thesolaceproject/code-harmony-sdk"
+import { createEmberHarmonyClient, createEmberHarmonyServer } from "@thesolaceproject/emberharmony-sdk"
 
-const server = await createCodeHarmonyServer()
-const client = createCodeHarmonyClient({ baseUrl: server.url })
+const server = await createEmberHarmonyServer()
+const client = createEmberHarmonyClient({ baseUrl: server.url })
 
 const input = await Array.fromAsync(new Bun.Glob("packages/core/*.ts").scan())
 
