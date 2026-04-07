@@ -1,20 +1,20 @@
 import { createResource, createEffect, createMemo, onCleanup, Show, createSignal } from "solid-js"
 import { createStore, reconcile } from "solid-js/store"
-import { useDialog } from "@opencode-harmony/ui/context/dialog"
-import { Dialog } from "@opencode-harmony/ui/dialog"
-import { List } from "@opencode-harmony/ui/list"
-import { Button } from "@opencode-harmony/ui/button"
-import { IconButton } from "@opencode-harmony/ui/icon-button"
-import { TextField } from "@opencode-harmony/ui/text-field"
+import { useDialog } from "@thesolaceproject/emberharmony-ui/context/dialog"
+import { Dialog } from "@thesolaceproject/emberharmony-ui/dialog"
+import { List } from "@thesolaceproject/emberharmony-ui/list"
+import { Button } from "@thesolaceproject/emberharmony-ui/button"
+import { IconButton } from "@thesolaceproject/emberharmony-ui/icon-button"
+import { TextField } from "@thesolaceproject/emberharmony-ui/text-field"
 import { normalizeServerUrl, serverDisplayName, useServer } from "@/context/server"
 import { usePlatform } from "@/context/platform"
-import { createOpencodeClient } from "@opencode-harmony/sdk/v2/client"
+import { createEmberHarmonyClient } from "@thesolaceproject/emberharmony-sdk/v2/client"
 import { useNavigate } from "@solidjs/router"
 import { useLanguage } from "@/context/language"
-import { DropdownMenu } from "@opencode-harmony/ui/dropdown-menu"
-import { Tooltip } from "@opencode-harmony/ui/tooltip"
+import { DropdownMenu } from "@thesolaceproject/emberharmony-ui/dropdown-menu"
+import { Tooltip } from "@thesolaceproject/emberharmony-ui/tooltip"
 import { useGlobalSDK } from "@/context/global-sdk"
-import { showToast } from "@opencode-harmony/ui/toast"
+import { showToast } from "@thesolaceproject/emberharmony-ui/toast"
 
 type ServerStatus = { healthy: boolean; version?: string }
 
@@ -42,7 +42,7 @@ interface EditRowProps {
 
 async function checkHealth(url: string, platform: ReturnType<typeof usePlatform>): Promise<ServerStatus> {
   const signal = (AbortSignal as unknown as { timeout?: (ms: number) => AbortSignal }).timeout?.(3000)
-  const sdk = createOpencodeClient({
+  const sdk = createEmberHarmonyClient({
     baseUrl: url,
     fetch: platform.fetch,
     signal,

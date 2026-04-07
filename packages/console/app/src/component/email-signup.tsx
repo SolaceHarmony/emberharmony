@@ -1,6 +1,6 @@
 import { action, useSubmission } from "@solidjs/router"
 import dock from "../asset/lander/dock.png"
-import { Resource } from "@opencode-harmony/console-resource"
+import { Resource } from "@thesolaceproject/emberharmony-console-resource"
 import { Show } from "solid-js"
 
 const emailSignup = action(async (formData: FormData) => {

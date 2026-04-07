@@ -23,13 +23,14 @@ permissions:
   id-token: write
   contents: write
   packages: write
+  actions: read
 
 jobs:
   version:
     runs-on: ubuntu-latest
-    if: github.repository == 'SolaceHarmony/code-harmony' && github.ref_name == 'dev' && (inputs.bump || inputs.version)
+    if: github.ref_name == 'dev' && (inputs.bump || inputs.version)
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
@@ -40,9 +41,10 @@ jobs:
           ./script/version.ts
         env:
           GH_TOKEN: ${{ github.token }}
-          OPENCODE_BUMP: ${{ inputs.bump }}
-          OPENCODE_VERSION: ${{ inputs.version }}
-          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          EMBERHARMONY_PUBLISH_NAME: @thesolaceproject/emberharmony
+          EMBERHARMONY_BUMP: ${{ inputs.bump }}
+          EMBERHARMONY_VERSION: ${{ inputs.version }}
+          EMBERHARMONY_API_KEY: ${{ secrets.EMBERHARMONY_API_KEY }}
     outputs:
       version: ${{ steps.version.outputs.version }}
       release: ${{ steps.version.outputs.release }}
@@ -51,9 +53,9 @@ jobs:
   build-cli:
     needs: version
     runs-on: ubuntu-latest
-    if: github.repository == 'SolaceHarmony/code-harmony'
+    if: github.ref_name == 'dev' && (inputs.bump || inputs.version)
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           fetch-tags: true
 
@@ -62,22 +64,23 @@ jobs:
       - name: Build
         id: build
         run: |
-          ./packages/opencode/script/build.ts
+          ./packages/emberharmony/script/build.ts
         env:
-          OPENCODE_VERSION: ${{ needs.version.outputs.version }}
-          OPENCODE_RELEASE: ${{ needs.version.outputs.release }}
-          OPENCODE_PUBLISH_NAME: code-harmony
+          EMBERHARMONY_VERSION: ${{ needs.version.outputs.version }}
+          EMBERHARMONY_RELEASE: ${{ needs.version.outputs.release }}
+          EMBERHARMONY_PUBLISH_NAME: @thesolaceproject/emberharmony
           GH_TOKEN: ${{ github.token }}
 
       - uses: actions/upload-artifact@v4
         with:
-          name: code-harmony-cli
-          path: packages/opencode/dist
+          name: emberharmony-cli
+          path: packages/emberharmony/dist
 
     outputs:
       version: ${{ needs.version.outputs.version }}
 
   build-tauri:
+    if: github.ref_name == 'dev' && (inputs.bump || inputs.version)
     needs:
       - build-cli
       - version
@@ -101,12 +104,13 @@ jobs:
       APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
       APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
       APPLE_API_KEY_PATH: ${{ secrets.APPLE_API_KEY_PATH }}
+      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           fetch-tags: true
 
-      - uses: apple-actions/import-codesign-certs@v2
+      - uses: apple-actions/import-codesign-certs@v3
         if: ${{ runner.os == 'macOS' && env.APPLE_CERTIFICATE != '' && env.APPLE_CERTIFICATE_PASSWORD != '' }}
         with:
           keychain: build
@@ -116,10 +120,38 @@ jobs:
       - name: Verify Certificate
         if: ${{ runner.os == 'macOS' && env.APPLE_CERTIFICATE != '' && env.APPLE_CERTIFICATE_PASSWORD != '' }}
         run: |
-          CERT_INFO=$(security find-identity -v -p codesigning build.keychain | grep "Developer ID Application")
+          set -euo pipefail
+
+          if [ -n "${APPLE_SIGNING_IDENTITY:-}" ]; then
+            echo "CERT_ID=$APPLE_SIGNING_IDENTITY" >> "$GITHUB_ENV"
+
+            TEAM_ID=$(echo "$APPLE_SIGNING_IDENTITY" | sed -n 's/.*(\([A-Z0-9]\{10\}\)).*/\1/p')
+            if [ -n "${TEAM_ID:-}" ]; then
+              echo "APPLE_TEAM_ID=$TEAM_ID" >> "$GITHUB_ENV"
+              echo "Using APPLE_TEAM_ID from signing identity: $TEAM_ID"
+            fi
+
+            echo "Using APPLE_SIGNING_IDENTITY override."
+            security find-identity -v -p codesigning build.keychain | cat
+            exit 0
+          fi
+
+          CERT_INFO=$(security find-identity -v -p codesigning build.keychain | grep "Developer ID Application" | head -n 1 || true)
+          if [ -z "$CERT_INFO" ]; then
+            echo "No 'Developer ID Application' identity found in build.keychain" >&2
+            security find-identity -v -p codesigning build.keychain | cat
+            exit 1
+          fi
+
           CERT_ID=$(echo "$CERT_INFO" | awk -F'"' '{print $2}')
-          echo "CERT_ID=$CERT_ID" >> $GITHUB_ENV
-          echo "Certificate imported."
+          echo "CERT_ID=$CERT_ID" >> "$GITHUB_ENV"
+          echo "Certificate imported: $CERT_ID"
+
+          TEAM_ID=$(echo "$CERT_ID" | sed -n 's/.*(\([A-Z0-9]\{10\}\)).*/\1/p')
+          if [ -n "${TEAM_ID:-}" ]; then
+            echo "APPLE_TEAM_ID=$TEAM_ID" >> "$GITHUB_ENV"
+            echo "Detected APPLE_TEAM_ID from certificate: $TEAM_ID"
+          fi
 
       - name: Setup Apple API Key
         if: ${{ runner.os == 'macOS' && env.APPLE_API_KEY_PATH != '' }}
@@ -158,8 +190,8 @@ jobs:
           cd packages/desktop
           bun ./scripts/prepare.ts
         env:
-          OPENCODE_VERSION: ${{ needs.version.outputs.version }}
-          GITHUB_TOKEN: ${{ steps.committer.outputs.token }}
+          EMBERHARMONY_VERSION: ${{ needs.version.outputs.version }}
+          GITHUB_TOKEN: ${{ github.token }}
           RUST_TARGET: ${{ matrix.settings.target }}
           GH_TOKEN: ${{ github.token }}
           GITHUB_RUN_ID: ${{ github.run_id }}
@@ -171,6 +203,20 @@ jobs:
           cargo install tauri-cli --git https://github.com/tauri-apps/tauri --branch feat/truly-portable-appimage --force
           echo "Installed tauri-cli version:"
           cargo tauri --version
+
+      - name: Export Apple ID notarization credentials
+        if: ${{ runner.os == 'macOS' }}
+        run: |
+          APPLE_ID="${{ secrets.APPLE_ID }}"
+          APPLE_PASSWORD="${{ secrets.APPLE_PASSWORD }}"
+
+          if [ -z "${APPLE_ID:-}" ] || [ -z "${APPLE_PASSWORD:-}" ]; then
+            echo "Apple ID notarization not configured; using App Store Connect API key."
+            exit 0
+          fi
+
+          echo "APPLE_ID=$APPLE_ID" >> "$GITHUB_ENV"
+          echo "APPLE_PASSWORD=$APPLE_PASSWORD" >> "$GITHUB_ENV"
 
       - name: Build and upload artifacts
         uses: tauri-apps/tauri-action@390cbe447412ced1303d35abe75287949e43437a
@@ -185,7 +231,7 @@ jobs:
           releaseId: ${{ needs.version.outputs.release }}
           tagName: ${{ needs.version.outputs.tag }}
           releaseDraft: true
-          releaseAssetNamePattern: code-harmony-desktop-[platform]-[arch][ext]
+          releaseAssetNamePattern: emberharmony-desktop-[platform]-[arch][ext]
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_BUNDLER_NEW_APPIMAGE_FORMAT: true
@@ -197,8 +243,10 @@ jobs:
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
           APPLE_API_KEY_PATH: ${{ runner.temp }}/apple-api-key.p8
+          APPLE_TEAM_ID: ${{ env.APPLE_TEAM_ID }}
 
   publish:
+    if: github.repository == 'SolaceHarmony/emberharmony'
     needs:
       - version
       - build-cli
@@ -206,7 +254,7 @@ jobs:
     env:
       AUR_KEY: ${{ secrets.AUR_KEY }}
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - uses: ./.github/actions/setup-bun
 
@@ -234,24 +282,24 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
-          name: code-harmony-cli
-          path: packages/opencode/dist
+          name: emberharmony-cli
+          path: packages/emberharmony/dist
 
       - name: Verify CLI artifact
         run: |
           set -euo pipefail
-          ls -la packages/opencode/dist
-          test -f packages/opencode/dist/code-harmony-linux-x64/bin/code-harmony
-          test -f packages/opencode/dist/code-harmony-linux-arm64/bin/code-harmony
-          test -f packages/opencode/dist/code-harmony-linux-x64-baseline/bin/code-harmony
-          test -f packages/opencode/dist/code-harmony-linux-x64-musl/bin/code-harmony
-          test -f packages/opencode/dist/code-harmony-linux-x64-baseline-musl/bin/code-harmony
-          test -f packages/opencode/dist/code-harmony-linux-arm64-musl/bin/code-harmony
-          test -f packages/opencode/dist/code-harmony-darwin-x64/bin/code-harmony
-          test -f packages/opencode/dist/code-harmony-darwin-x64-baseline/bin/code-harmony
-          test -f packages/opencode/dist/code-harmony-darwin-arm64/bin/code-harmony
-          test -f packages/opencode/dist/code-harmony-windows-x64/bin/code-harmony.exe
-          test -f packages/opencode/dist/code-harmony-windows-x64-baseline/bin/code-harmony.exe
+          ls -la packages/emberharmony/dist
+          test -f packages/emberharmony/dist/emberharmony-linux-x64/bin/emberharmony
+          test -f packages/emberharmony/dist/emberharmony-linux-arm64/bin/emberharmony
+          test -f packages/emberharmony/dist/emberharmony-linux-x64-baseline/bin/emberharmony
+          test -f packages/emberharmony/dist/emberharmony-linux-x64-musl/bin/emberharmony
+          test -f packages/emberharmony/dist/emberharmony-linux-x64-baseline-musl/bin/emberharmony
+          test -f packages/emberharmony/dist/emberharmony-linux-arm64-musl/bin/emberharmony
+          test -f packages/emberharmony/dist/emberharmony-darwin-x64/bin/emberharmony
+          test -f packages/emberharmony/dist/emberharmony-darwin-x64-baseline/bin/emberharmony
+          test -f packages/emberharmony/dist/emberharmony-darwin-arm64/bin/emberharmony
+          test -f packages/emberharmony/dist/emberharmony-windows-x64/bin/emberharmony.exe
+          test -f packages/emberharmony/dist/emberharmony-windows-x64-baseline/bin/emberharmony.exe
 
       - name: Cache apt packages (AUR)
         if: ${{ env.AUR_KEY != '' }}
@@ -276,11 +324,11 @@ jobs:
 
       - run: ./script/publish.ts
         env:
-          OPENCODE_VERSION: ${{ needs.version.outputs.version }}
-          OPENCODE_RELEASE: ${{ needs.version.outputs.release }}
-          OPENCODE_PUBLISH_NAME: code-harmony
-          OPENCODE_PUBLISH_PLATFORMS: "1"
-          OPENCODE_SKIP_GIT: "1"
+          EMBERHARMONY_VERSION: ${{ needs.version.outputs.version }}
+          EMBERHARMONY_RELEASE: ${{ needs.version.outputs.release }}
+          EMBERHARMONY_PUBLISH_NAME: @thesolaceproject/emberharmony
+          EMBERHARMONY_PUBLISH_PLATFORMS: "1"
+          EMBERHARMONY_SKIP_GIT: "1"
           AUR_KEY: ${{ secrets.AUR_KEY }}
           GITHUB_TOKEN: ${{ steps.committer.outputs.token }}
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}

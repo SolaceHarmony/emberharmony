@@ -1,24 +1,33 @@
 {
   "$schema": "https://json.schemastore.org/package.json",
-  "name": "code-harmony",
-  "description": "AI-powered development tool",
+  "name": "emberharmony",
+  "description": "EmberHarmony — the open source AI coding agent",
   "private": true,
   "type": "module",
   "packageManager": "bun@1.3.8",
   "scripts": {
-    "dev": "bun run --cwd packages/opencode --conditions=browser src/index.ts",
+    "dev": "bun install && bun run --cwd packages/emberharmony --conditions=browser src/index.ts",
+    "dev:stack": "bun install && bun run script/dev-stack.ts",
+    "web": "bun install && bun run --cwd packages/emberharmony web",
+    "serve": "bun install && bun run --cwd packages/emberharmony serve",
+    "pack:local": "bun install && bun run --cwd packages/emberharmony pack:local",
+    "install:local": "bun install && bun run --cwd packages/emberharmony install:local",
+    "desktop:build": "bun run --cwd packages/desktop build:local",
+    "desktop:build:nodmg": "bun run --cwd packages/desktop build:local:nodmg",
     "typecheck": "bun turbo typecheck",
     "prepare": "husky",
     "random": "echo 'Random script'",
     "hello": "echo 'Hello World!'",
-    "test": "echo 'do not run tests from root' && exit 1"
+    "probe:ollama": "bun run script/ollama-cloud-probe.ts",
+    "test": "bun run script/test.ts"
   },
   "workspaces": {
     "packages": [
       "packages/*",
       "packages/console/*",
       "packages/sdk/js",
-      "packages/slack"
+      "packages/slack",
+      "github"
     ],
     "catalog": {
       "@types/bun": "1.3.8",
@@ -37,7 +46,7 @@
       "@solid-primitives/storage": "4.3.3",
       "@tailwindcss/vite": "4.1.11",
       "diff": "8.0.3",
-      "dompurify": "3.3.1",
+      "dompurify": "3.3.3",
       "ai": "5.0.119",
       "hono": "4.11.7",
       "hono-openapi": "1.1.2",
@@ -64,7 +73,7 @@
   },
   "devDependencies": {
     "@actions/artifact": "5.0.1",
-    "@opencode-harmony/security-scanner": "workspace:*",
+    "@thesolaceproject/emberharmony-security-scanner": "workspace:*",
     "@tsconfig/bun": "catalog:",
     "husky": "9.1.7",
     "prettier": "3.6.2",
@@ -74,16 +83,25 @@
   },
   "dependencies": {
     "@aws-sdk/client-s3": "3.933.0",
-    "@opencode-harmony/plugin": "workspace:*",
-    "@opencode-harmony/script": "workspace:*",
-    "@opencode-harmony/sdk": "workspace:*",
+    "@thesolaceproject/emberharmony-plugin": "workspace:*",
+    "@thesolaceproject/emberharmony-script": "workspace:*",
+    "@thesolaceproject/emberharmony-sdk": "workspace:*",
     "typescript": "catalog:"
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/SolaceHarmony/code-harmony"
+    "url": "https://github.com/SolaceHarmony/emberharmony"
+  },
+  "homepage": "https://solace.ofharmony.ai",
+  "bugs": {
+    "url": "https://github.com/SolaceHarmony/emberharmony/issues"
   },
   "license": "MIT",
+  "author": {
+    "name": "Sydney Renee",
+    "email": "sydney@solace.ofharmony.ai",
+    "url": "https://solace.ofharmony.ai"
+  },
   "prettier": {
     "semi": false,
     "printWidth": 120
@@ -98,9 +116,9 @@
   "overrides": {
     "@types/bun": "catalog:",
     "@types/node": "catalog:",
-    "@modelcontextprotocol/sdk": "1.25.2",
+    "@modelcontextprotocol/sdk": "1.26.0",
     "@remix-run/router": "1.23.2",
-    "astro": "5.15.9",
+    "astro": "5.18.1",
     "diff": "8.0.3",
     "esbuild": "0.25.0",
     "fast-xml-parser": "5.3.4",

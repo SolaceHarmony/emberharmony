@@ -1,6 +1,6 @@
 {
-  "name": "@opencode-harmony/app",
-  "version": "1.0.0",
+  "name": "@thesolaceproject/emberharmony-app",
+  "version": "1.1.0",
   "description": "",
   "type": "module",
   "exports": {
@@ -36,9 +36,9 @@
   },
   "dependencies": {
     "@kobalte/core": "catalog:",
-    "@opencode-harmony/sdk": "workspace:*",
-    "@opencode-harmony/ui": "workspace:*",
-    "@opencode-harmony/util": "workspace:*",
+    "@thesolaceproject/emberharmony-sdk": "workspace:*",
+    "@thesolaceproject/emberharmony-ui": "workspace:*",
+    "@thesolaceproject/emberharmony-util": "workspace:*",
     "@shikijs/transformers": "3.9.2",
     "@solid-primitives/active-element": "2.1.3",
     "@solid-primitives/audio": "1.4.2",

@@ -1,8 +1,8 @@
-import { Model } from "@opencode-harmony/console-core/model.js"
+import { Model } from "@thesolaceproject/emberharmony-console-core/model.js"
 import { query, action, useParams, createAsync, json } from "@solidjs/router"
 import { createMemo, For, Show } from "solid-js"
 import { withActor } from "~/context/auth.withActor"
-import { ZenData } from "@opencode-harmony/console-core/model.js"
+import { ZenData } from "@thesolaceproject/emberharmony-console-core/model.js"
 import styles from "./model-section.module.css"
 import { querySessionInfo } from "../common"
 import {

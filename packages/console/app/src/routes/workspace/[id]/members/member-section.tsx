@@ -3,9 +3,9 @@ import { createEffect, For, Show } from "solid-js"
 import { withActor } from "~/context/auth.withActor"
 import { createStore } from "solid-js/store"
 import styles from "./member-section.module.css"
-import { UserRole } from "@opencode-harmony/console-core/schema/user.sql.js"
-import { Actor } from "@opencode-harmony/console-core/actor.js"
-import { User } from "@opencode-harmony/console-core/user.js"
+import { UserRole } from "@thesolaceproject/emberharmony-console-core/schema/user.sql.js"
+import { Actor } from "@thesolaceproject/emberharmony-console-core/actor.js"
+import { User } from "@thesolaceproject/emberharmony-console-core/user.js"
 import { RoleDropdown } from "./role-dropdown"
 
 const listMembers = query(async (workspaceID: string) => {

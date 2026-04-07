@@ -1,8 +1,8 @@
 import { getRequestEvent } from "solid-js/web"
-import { and, Database, eq, inArray, isNull, sql } from "@opencode-harmony/console-core/drizzle/index.js"
-import { UserTable } from "@opencode-harmony/console-core/schema/user.sql.js"
+import { and, Database, eq, inArray, isNull, sql } from "@thesolaceproject/emberharmony-console-core/drizzle/index.js"
+import { UserTable } from "@thesolaceproject/emberharmony-console-core/schema/user.sql.js"
 import { redirect } from "@solidjs/router"
-import { Actor } from "@opencode-harmony/console-core/actor.js"
+import { Actor } from "@thesolaceproject/emberharmony-console-core/actor.js"
 
 import { createClient } from "@openauthjs/openauth/client"
 
@@ -12,7 +12,7 @@ export const AuthClient = createClient({
 })
 
 import { useSession } from "@solidjs/start/http"
-import { Resource } from "@opencode-harmony/console-resource"
+import { Resource } from "@thesolaceproject/emberharmony-console-resource"
 
 export interface AuthSession {
   account?: Record<

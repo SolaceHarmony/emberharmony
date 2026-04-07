@@ -3,15 +3,15 @@
     <picture>
       <source srcset="packages/console/app/src/asset/logo-ornate-dark.svg" media="(prefers-color-scheme: dark)">
       <source srcset="packages/console/app/src/asset/logo-ornate-light.svg" media="(prefers-color-scheme: light)">
-      <img src="packages/console/app/src/asset/logo-ornate-light.svg" alt="شعار CodeHarmony">
+      <img src="packages/console/app/src/asset/logo-ornate-light.svg" alt="شعار EmberHarmony">
     </picture>
   </a>
 </p>
 <p align="center">وكيل برمجة بالذكاء الاصطناعي مفتوح المصدر.</p>
 <p align="center">
-  <a href="https://github.com/SolaceHarmony/code-harmony/discussions"><img alt="Discord" src="https://img.shields.io/discord/1391832426048651334?style=flat-square&label=discord" /></a>
-  <a href="https://www.npmjs.com/package/code-harmony"><img alt="npm" src="https://img.shields.io/npm/v/code-harmony?style=flat-square" /></a>
-  <a href="https://github.com/SolaceHarmony/code-harmony/actions/workflows/publish.yml"><img alt="Build status" src="https://img.shields.io/github/actions/workflow/status/SolaceHarmony/code-harmony/publish.yml?style=flat-square&branch=dev" /></a>
+  <a href="https://discord.gg/EdF8f7JR"><img alt="Discord" src="https://img.shields.io/discord/1391832426048651334?style=flat-square&label=discord" /></a>
+  <a href="https://www.npmjs.com/package/@thesolaceproject/emberharmony"><img alt="npm" src="https://img.shields.io/npm/v/%40thesolaceproject%2Femberharmony?style=flat-square" /></a>
+  <a href="https://github.com/SolaceHarmony/emberharmony/actions/workflows/publish.yml"><img alt="Build status" src="https://img.shields.io/github/actions/workflow/status/SolaceHarmony/emberharmony/publish.yml?style=flat-square&branch=dev" /></a>
 </p>
 
 <p align="center">
@@ -32,7 +32,7 @@
   <a href="README.br.md">Português (Brasil)</a>
 </p>
 
-[![CodeHarmony Terminal UI](packages/web/src/assets/lander/screenshot.png)](https://solace.ofharmony.ai)
+[![EmberHarmony Terminal UI](packages/web/src/assets/lander/screenshot.png)](https://solace.ofharmony.ai)
 
 ---
 
@@ -40,15 +40,15 @@
 
 ```bash
 # YOLO
-curl -fsSL https://raw.githubusercontent.com/SolaceHarmony/code-harmony/dev/install | bash
+curl -fsSL https://raw.githubusercontent.com/SolaceHarmony/emberharmony/dev/install | bash
 
 # مديري الحزم
-npm i -g code-harmony@latest        # او bun/pnpm/yarn
-scoop install code-harmony             # Windows
-choco install code-harmony             # Windows
-paru -S code-harmony-bin               # Arch Linux
-mise use -g code-harmony               # اي نظام
-nix run nixpkgs#code-harmony           # او github:SolaceHarmony/code-harmony لاحدث فرع dev
+npm i -g @thesolaceproject/emberharmony@latest        # او bun/pnpm/yarn
+scoop install emberharmony             # Windows
+choco install emberharmony             # Windows
+paru -S emberharmony-bin               # Arch Linux
+mise use -g emberharmony               # اي نظام
+nix run nixpkgs#emberharmony           # او github:SolaceHarmony/emberharmony لاحدث فرع dev
 ```
 
 > [!TIP]
@@ -56,38 +56,38 @@ nix run nixpkgs#code-harmony           # او github:SolaceHarmony/code-harmony 
 
 ### تطبيق سطح المكتب (BETA)
 
-يتوفر CodeHarmony ايضا كتطبيق سطح مكتب. قم بالتنزيل مباشرة من [صفحة الاصدارات](https://github.com/SolaceHarmony/code-harmony/releases) او من [solace.ofharmony.ai/download](https://github.com/SolaceHarmony/code-harmony/releases).
+يتوفر EmberHarmony ايضا كتطبيق سطح مكتب. قم بالتنزيل مباشرة من [صفحة الاصدارات](https://github.com/SolaceHarmony/emberharmony/releases) او من [solace.ofharmony.ai/download](https://github.com/SolaceHarmony/emberharmony/releases).
 
-| المنصة                | التنزيل                               |
-| --------------------- | ------------------------------------- |
-| macOS (Apple Silicon) | `code-harmony-desktop-darwin-aarch64.dmg` |
-| macOS (Intel)         | `code-harmony-desktop-darwin-x64.dmg`     |
-| Windows               | `code-harmony-desktop-windows-x64.exe`    |
-| Linux                 | `.deb` او `.rpm` او AppImage          |
+| المنصة                | التنزيل                                   |
+| --------------------- | ----------------------------------------- |
+| macOS (Apple Silicon) | `emberharmony-desktop-darwin-aarch64.dmg` |
+| macOS (Intel)         | `emberharmony-desktop-darwin-x64.dmg`     |
+| Windows               | `emberharmony-desktop-windows-x64.exe`    |
+| Linux                 | `.deb` او `.rpm` او AppImage              |
 
 ```bash
 # Windows (Scoop)
-scoop bucket add extras; scoop install extras/code-harmony-desktop
+scoop bucket add extras; scoop install extras@thesolaceproject/emberharmony-desktop
 ```
 
 #### مجلد التثبيت
 
 يحترم سكربت التثبيت ترتيب الاولوية التالي لمسار التثبيت:
 
-1. `$CODE_HARMONY_INSTALL_DIR` - مجلد تثبيت مخصص
+1. `$EMBERHARMONY_INSTALL_DIR` - مجلد تثبيت مخصص
 2. `$XDG_BIN_DIR` - مسار متوافق مع مواصفات XDG Base Directory
 3. `$HOME/bin` - مجلد الثنائيات القياسي للمستخدم (ان وجد او امكن انشاؤه)
-4. `$HOME/.code-harmony/bin` - المسار الافتراضي الاحتياطي
+4. `$HOME/.emberharmony/bin` - المسار الافتراضي الاحتياطي
 
 ```bash
 # امثلة
-CODE_HARMONY_INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/SolaceHarmony/code-harmony/dev/install | bash
-XDG_BIN_DIR=$HOME/.local/bin curl -fsSL https://raw.githubusercontent.com/SolaceHarmony/code-harmony/dev/install | bash
+EMBERHARMONY_INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/SolaceHarmony/emberharmony/dev/install | bash
+XDG_BIN_DIR=$HOME/.local/bin curl -fsSL https://raw.githubusercontent.com/SolaceHarmony/emberharmony/dev/install | bash
 ```
 
 ### Agents
 
-يتضمن CodeHarmony وكيليْن (Agents) مدمجين يمكنك التبديل بينهما باستخدام زر `Tab`.
+يتضمن EmberHarmony وكيليْن (Agents) مدمجين يمكنك التبديل بينهما باستخدام زر `Tab`.
 
 - **build** - الافتراضي، وكيل بصلاحيات كاملة لاعمال التطوير
 - **plan** - وكيل للقراءة فقط للتحليل واستكشاف الكود
@@ -102,15 +102,15 @@ XDG_BIN_DIR=$HOME/.local/bin curl -fsSL https://raw.githubusercontent.com/Solace
 
 ### التوثيق
 
-لمزيد من المعلومات حول كيفية ضبط CodeHarmony، [**راجع التوثيق**](https://solace.ofharmony.ai/docs).
+لمزيد من المعلومات حول كيفية ضبط EmberHarmony، [**راجع التوثيق**](https://solace.ofharmony.ai/docs).
 
 ### المساهمة
 
-اذا كنت مهتما بالمساهمة في CodeHarmony، يرجى قراءة [contributing docs](./CONTRIBUTING.md) قبل ارسال pull request.
+اذا كنت مهتما بالمساهمة في EmberHarmony، يرجى قراءة [contributing docs](./CONTRIBUTING.md) قبل ارسال pull request.
 
-### البناء فوق CodeHarmony
+### البناء فوق EmberHarmony
 
-اذا كنت تعمل على مشروع مرتبط بـ CodeHarmony ويستخدم "opencode" كجزء من اسمه (مثل "opencode-dashboard" او "opencode-mobile")، يرجى اضافة ملاحظة في README توضح انه ليس مبنيا بواسطة فريق CodeHarmony ولا يرتبط بنا بأي شكل.
+اذا كنت تعمل على مشروع مرتبط بـ EmberHarmony ويستخدم "emberharmony" كجزء من اسمه (مثل "emberharmony-dashboard" او "emberharmony-mobile")، يرجى اضافة ملاحظة في README توضح انه ليس مبنيا بواسطة فريق EmberHarmony ولا يرتبط بنا بأي شكل.
 
 ### FAQ
 
@@ -119,11 +119,21 @@ XDG_BIN_DIR=$HOME/.local/bin curl -fsSL https://raw.githubusercontent.com/Solace
 هو مشابه جدا لـ Claude Code من حيث القدرات. هذه هي الفروقات الاساسية:
 
 - 100% مفتوح المصدر
-- غير مقترن بمزود معين. نوصي بالنماذج التي نوفرها عبر [CodeHarmony Zen](https://solace.ofharmony.ai/zen)؛ لكن يمكن استخدام CodeHarmony مع Claude او OpenAI او Google او حتى نماذج محلية. مع تطور النماذج ستتقلص الفجوات وستنخفض الاسعار، لذا من المهم ان يكون مستقلا عن المزود.
+- غير مقترن بمزود معين. نوصي بالنماذج التي نوفرها عبر مع تطور النماذج ستتقلص الفجوات وستنخفض الاسعار، لذا من المهم ان يكون مستقلا عن المزود.
 - دعم LSP جاهز للاستخدام
-- تركيز على TUI. تم بناء CodeHarmony بواسطة مستخدمي neovim ومنشئي [terminal.shop](https://terminal.shop)؛ وسندفع حدود ما هو ممكن داخل الطرفية.
-- معمارية عميل/خادم. على سبيل المثال، يمكن تشغيل CodeHarmony على جهازك بينما تقوده عن بعد من تطبيق جوال. هذا يعني ان واجهة TUI هي واحدة فقط من العملاء الممكنين.
+- تركيز على TUI. تم بناء EmberHarmony وسندفع حدود ما هو ممكن داخل الطرفية.
+- معمارية عميل/خادم. على سبيل المثال، يمكن تشغيل EmberHarmony على جهازك بينما تقوده عن بعد من تطبيق جوال. هذا يعني ان واجهة TUI هي واحدة فقط من العملاء الممكنين.
+
+
+### Acknowledgments
+
+EmberHarmony is a fork of [EmberHarmony](https://github.com/sst/emberharmony) by the [SST](https://sst.dev) team. We are deeply grateful for their foundational work in building an exceptional open source AI coding agent.
+
+### Maintainer
+
+**Sydney Renee** — sydney@solace.ofharmony.ai
+[The Solace Project](https://solace.ofharmony.ai)
 
 ---
 
-**انضم الى مجتمعنا** [Discord](https://github.com/SolaceHarmony/code-harmony/discussions) | [X.com](https://github.com/SolaceHarmony/code-harmony)
+**انضم الى مجتمعنا** [Discord](https://discord.gg/EdF8f7JR) | [GitHub Discussions](https://github.com/SolaceHarmony/emberharmony/discussions)

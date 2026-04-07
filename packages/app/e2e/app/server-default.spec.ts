@@ -1,7 +1,7 @@
 import { test, expect } from "../fixtures"
 import { serverName, serverUrl } from "../utils"
 
-const DEFAULT_SERVER_URL_KEY = "opencode.settings.dat:defaultServerUrl"
+const DEFAULT_SERVER_URL_KEY = "emberharmony.settings.dat:defaultServerUrl"
 
 test("can set a default server on web", async ({ page, gotoSession }) => {
   await page.addInitScript((key: string) => {

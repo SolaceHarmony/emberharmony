@@ -1,16 +1,16 @@
-import type { ProviderAuthAuthorization } from "@opencode-harmony/sdk/v2/client"
-import { Button } from "@opencode-harmony/ui/button"
-import { useDialog } from "@opencode-harmony/ui/context/dialog"
-import { Dialog } from "@opencode-harmony/ui/dialog"
-import { Icon } from "@opencode-harmony/ui/icon"
-import { IconButton } from "@opencode-harmony/ui/icon-button"
-import type { IconName } from "@opencode-harmony/ui/icons/provider"
-import { List, type ListRef } from "@opencode-harmony/ui/list"
-import { ProviderIcon } from "@opencode-harmony/ui/provider-icon"
-import { Spinner } from "@opencode-harmony/ui/spinner"
-import { TextField } from "@opencode-harmony/ui/text-field"
-import { showToast } from "@opencode-harmony/ui/toast"
-import { iife } from "@opencode-harmony/util/iife"
+import type { ProviderAuthAuthorization } from "@thesolaceproject/emberharmony-sdk/v2/client"
+import { Button } from "@thesolaceproject/emberharmony-ui/button"
+import { useDialog } from "@thesolaceproject/emberharmony-ui/context/dialog"
+import { Dialog } from "@thesolaceproject/emberharmony-ui/dialog"
+import { Icon } from "@thesolaceproject/emberharmony-ui/icon"
+import { IconButton } from "@thesolaceproject/emberharmony-ui/icon-button"
+import type { IconName } from "@thesolaceproject/emberharmony-ui/icons/provider"
+import { List, type ListRef } from "@thesolaceproject/emberharmony-ui/list"
+import { ProviderIcon } from "@thesolaceproject/emberharmony-ui/provider-icon"
+import { Spinner } from "@thesolaceproject/emberharmony-ui/spinner"
+import { TextField } from "@thesolaceproject/emberharmony-ui/text-field"
+import { showToast } from "@thesolaceproject/emberharmony-ui/toast"
+import { iife } from "@thesolaceproject/emberharmony-util/iife"
 import { createMemo, Match, onCleanup, onMount, Switch } from "solid-js"
 import { createStore, produce } from "solid-js/store"
 import { Link } from "@/components/link"
@@ -265,20 +265,20 @@ export function DialogConnectProvider(props: { provider: string }) {
                 return (
                   <div class="flex flex-col gap-6">
                     <Switch>
-                      <Match when={provider().id === "opencode"}>
+                      <Match when={provider().id === "emberharmony"}>
                         <div class="flex flex-col gap-4">
                           <div class="text-14-regular text-text-base">
-                            {language.t("provider.connect.opencodeZen.line1")}
+                            {language.t("provider.connect.harmonyZen.line1")}
                           </div>
                           <div class="text-14-regular text-text-base">
-                            {language.t("provider.connect.opencodeZen.line2")}
+                            {language.t("provider.connect.harmonyZen.line2")}
                           </div>
                           <div class="text-14-regular text-text-base">
-                            {language.t("provider.connect.opencodeZen.visit.prefix")}
-                            <Link href="https://opencode.ai/zen" tabIndex={-1}>
-                              {language.t("provider.connect.opencodeZen.visit.link")}
+                            {language.t("provider.connect.harmonyZen.visit.prefix")}
+                            <Link href="https://solace.ofharmony.ai/zen" tabIndex={-1}>
+                              {language.t("provider.connect.harmonyZen.visit.link")}
                             </Link>
-                            {language.t("provider.connect.opencodeZen.visit.suffix")}
+                            {language.t("provider.connect.harmonyZen.visit.suffix")}
                           </div>
                         </div>
                       </Match>

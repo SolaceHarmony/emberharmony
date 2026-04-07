@@ -2,14 +2,14 @@ import "@/index.css"
 import { ErrorBoundary, Show, lazy, type ParentProps } from "solid-js"
 import { Router, Route, Navigate } from "@solidjs/router"
 import { MetaProvider } from "@solidjs/meta"
-import { Font } from "@opencode-harmony/ui/font"
-import { MarkedProvider } from "@opencode-harmony/ui/context/marked"
-import { DiffComponentProvider } from "@opencode-harmony/ui/context/diff"
-import { CodeComponentProvider } from "@opencode-harmony/ui/context/code"
-import { I18nProvider } from "@opencode-harmony/ui/context"
-import { Diff } from "@opencode-harmony/ui/diff"
-import { Code } from "@opencode-harmony/ui/code"
-import { ThemeProvider } from "@opencode-harmony/ui/theme"
+import { Font } from "@thesolaceproject/emberharmony-ui/font"
+import { MarkedProvider } from "@thesolaceproject/emberharmony-ui/context/marked"
+import { DiffComponentProvider } from "@thesolaceproject/emberharmony-ui/context/diff"
+import { CodeComponentProvider } from "@thesolaceproject/emberharmony-ui/context/code"
+import { I18nProvider } from "@thesolaceproject/emberharmony-ui/context"
+import { Diff } from "@thesolaceproject/emberharmony-ui/diff"
+import { Code } from "@thesolaceproject/emberharmony-ui/code"
+import { ThemeProvider } from "@thesolaceproject/emberharmony-ui/theme"
 import { GlobalSyncProvider } from "@/context/global-sync"
 import { PermissionProvider } from "@/context/permission"
 import { LayoutProvider } from "@/context/layout"
@@ -22,7 +22,7 @@ import { FileProvider } from "@/context/file"
 import { CommentsProvider } from "@/context/comments"
 import { NotificationProvider } from "@/context/notification"
 import { ModelsProvider } from "@/context/models"
-import { DialogProvider } from "@opencode-harmony/ui/context/dialog"
+import { DialogProvider } from "@thesolaceproject/emberharmony-ui/context/dialog"
 import { CommandProvider } from "@/context/command"
 import { LanguageProvider, useLanguage } from "@/context/language"
 import { usePlatform } from "@/context/platform"
@@ -43,7 +43,7 @@ function UiI18nBridge(props: ParentProps) {
 
 declare global {
   interface Window {
-    __OPENCODE__?: { updaterEnabled?: boolean; serverPassword?: string; deepLinks?: string[] }
+    __EMBERHARMONY__?: { updaterEnabled?: boolean; serverPassword?: string; deepLinks?: string[] }
   }
 }
 
@@ -98,9 +98,9 @@ export function AppInterface(props: { defaultUrl?: string }) {
   const defaultServerUrl = () => {
     if (props.defaultUrl) return props.defaultUrl
     if (stored) return stored
-    if (location.hostname.includes("opencode.ai")) return "http://localhost:4096"
+    if (location.hostname.includes("solace.ofharmony.ai")) return "http://localhost:4096"
     if (import.meta.env.DEV)
-      return `http://${import.meta.env.VITE_OPENCODE_SERVER_HOST ?? "localhost"}:${import.meta.env.VITE_OPENCODE_SERVER_PORT ?? "4096"}`
+      return `http://${import.meta.env.VITE_EMBERHARMONY_SERVER_HOST ?? "localhost"}:${import.meta.env.VITE_EMBERHARMONY_SERVER_PORT ?? "4096"}`
 
     return window.location.origin
   }

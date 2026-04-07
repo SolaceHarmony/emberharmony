@@ -1,5 +1,5 @@
-import { createOpencodeClient, type Event } from "@opencode-harmony/sdk/v2/client"
-import { createSimpleContext } from "@opencode-harmony/ui/context"
+import { createEmberHarmonyClient, type Event } from "@thesolaceproject/emberharmony-sdk/v2/client"
+import { createSimpleContext } from "@thesolaceproject/emberharmony-ui/context"
 import { createGlobalEmitter } from "@solid-primitives/event-bus"
 import { batch, onCleanup } from "solid-js"
 import { usePlatform } from "./platform"
@@ -12,7 +12,7 @@ export const { use: useGlobalSDK, provider: GlobalSDKProvider } = createSimpleCo
     const platform = usePlatform()
     const abort = new AbortController()
 
-    const eventSdk = createOpencodeClient({
+    const eventSdk = createEmberHarmonyClient({
       baseUrl: server.url,
       signal: abort.signal,
       fetch: platform.fetch,
@@ -97,7 +97,7 @@ export const { use: useGlobalSDK, provider: GlobalSDKProvider } = createSimpleCo
       flush()
     })
 
-    const sdk = createOpencodeClient({
+    const sdk = createEmberHarmonyClient({
       baseUrl: server.url,
       fetch: platform.fetch,
       throwOnError: true,

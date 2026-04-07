@@ -1,8 +1,8 @@
 import { Title } from "@solidjs/meta"
 import { createAsync, query, useParams } from "@solidjs/router"
 import { createSignal, For, Show } from "solid-js"
-import { Database, desc, eq } from "@opencode-harmony/console-core/drizzle/index.js"
-import { BenchmarkTable } from "@opencode-harmony/console-core/schema/benchmark.sql.js"
+import { Database, desc, eq } from "@thesolaceproject/emberharmony-console-core/drizzle/index.js"
+import { BenchmarkTable } from "@thesolaceproject/emberharmony-console-core/schema/benchmark.sql.js"
 
 interface TaskSource {
   repo: string

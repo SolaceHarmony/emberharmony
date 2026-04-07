@@ -1,5 +1,5 @@
-name: "code-harmony GitHub Action"
-description: "Run code-harmony in GitHub Actions workflows"
+name: "emberharmony GitHub Action"
+description: "Run emberharmony in GitHub Actions workflows"
 branding:
   icon: "code"
   color: "orange"
@@ -14,62 +14,51 @@ inputs:
     required: false
 
   share:
-    description: "Share the opencode session (defaults to true for public repos)"
+    description: "Share the session (defaults to true for public repos)"
     required: false
 
   prompt:
     description: "Custom prompt to override the default prompt"
     required: false
 
-  use_github_token:
-    description: "Use GITHUB_TOKEN directly instead of OpenCode App token exchange. When true, skips OIDC and uses the GITHUB_TOKEN env var."
-    required: false
-    default: "false"
-
   mentions:
-    description: "Comma-separated list of trigger phrases (case-insensitive). Defaults to '/code-harmony,/oc'"
+    description: "Comma-separated list of trigger phrases (case-insensitive). Defaults to '/emberharmony,/oc'"
     required: false
-
-  oidc_base_url:
-    description: "Base URL for OIDC token exchange API. Only required when running a custom GitHub App install. Defaults to https://api.opencode.ai"
-    required: false
-    default: "https://api.opencode.ai"
 
 runs:
   using: "composite"
   steps:
-    - name: Get code-harmony version
+    - name: Get emberharmony version
       id: version
       shell: bash
       run: |
-        VERSION=$(curl -sf https://api.github.com/repos/SolaceHarmony/code-harmony/releases/latest | grep -o '"tag_name": *"[^"]*"' | cut -d'"' -f4)
+        VERSION=$(curl -sf https://api.github.com/repos/SolaceHarmony/emberharmony/releases/latest | grep -o '"tag_name": *"[^"]*"' | cut -d'"' -f4)
         echo "version=${VERSION:-latest}" >> $GITHUB_OUTPUT
 
-    - name: Cache code-harmony
+    - name: Cache emberharmony
       id: cache
       uses: actions/cache@v4
       with:
-        path: ~/.code-harmony/bin
-        key: code-harmony-${{ runner.os }}-${{ runner.arch }}-${{ steps.version.outputs.version }}
+        path: ~/.emberharmony/bin
+        key: emberharmony-${{ runner.os }}-${{ runner.arch }}-${{ steps.version.outputs.version }}
 
-    - name: Install code-harmony
+    - name: Install emberharmony
       if: steps.cache.outputs.cache-hit != 'true'
       shell: bash
-      run: CODE_HARMONY_INSTALL_DIR="$HOME/.code-harmony/bin" curl -fsSL https://raw.githubusercontent.com/SolaceHarmony/code-harmony/dev/install | bash
+      run: EMBERHARMONY_INSTALL_DIR="$HOME/.emberharmony/bin" curl -fsSL https://raw.githubusercontent.com/SolaceHarmony/emberharmony/dev/install | bash
 
-    - name: Add code-harmony to PATH
+    - name: Add emberharmony to PATH
       shell: bash
-      run: echo "$HOME/.code-harmony/bin" >> $GITHUB_PATH
+      run: echo "$HOME/.emberharmony/bin" >> $GITHUB_PATH
 
-    - name: Run code-harmony
+    - name: Run emberharmony
       shell: bash
-      id: run_opencode
-      run: code-harmony github run
+      id: run_emberharmony
+      run: emberharmony github run
       env:
+        GITHUB_TOKEN: ${{ github.token }}
         MODEL: ${{ inputs.model }}
         AGENT: ${{ inputs.agent }}
         SHARE: ${{ inputs.share }}
         PROMPT: ${{ inputs.prompt }}
-        USE_GITHUB_TOKEN: ${{ inputs.use_github_token }}
         MENTIONS: ${{ inputs.mentions }}
-        OIDC_BASE_URL: ${{ inputs.oidc_base_url }}

@@ -1,13 +1,17 @@
-import { Billing } from "@opencode-harmony/console-core/billing.js"
+import { Billing } from "@thesolaceproject/emberharmony-console-core/billing.js"
 import type { APIEvent } from "@solidjs/start/server"
-import { and, Database, eq, isNull, sql } from "@opencode-harmony/console-core/drizzle/index.js"
-import { BillingTable, PaymentTable, SubscriptionTable } from "@opencode-harmony/console-core/schema/billing.sql.js"
-import { Identifier } from "@opencode-harmony/console-core/identifier.js"
-import { centsToMicroCents } from "@opencode-harmony/console-core/util/price.js"
-import { Actor } from "@opencode-harmony/console-core/actor.js"
-import { Resource } from "@opencode-harmony/console-resource"
-import { UserTable } from "@opencode-harmony/console-core/schema/user.sql.js"
-import { AuthTable } from "@opencode-harmony/console-core/schema/auth.sql.js"
+import { and, Database, eq, isNull, sql } from "@thesolaceproject/emberharmony-console-core/drizzle/index.js"
+import {
+  BillingTable,
+  PaymentTable,
+  SubscriptionTable,
+} from "@thesolaceproject/emberharmony-console-core/schema/billing.sql.js"
+import { Identifier } from "@thesolaceproject/emberharmony-console-core/identifier.js"
+import { centsToMicroCents } from "@thesolaceproject/emberharmony-console-core/util/price.js"
+import { Actor } from "@thesolaceproject/emberharmony-console-core/actor.js"
+import { Resource } from "@thesolaceproject/emberharmony-console-resource"
+import { UserTable } from "@thesolaceproject/emberharmony-console-core/schema/user.sql.js"
+import { AuthTable } from "@thesolaceproject/emberharmony-console-core/schema/auth.sql.js"
 
 export async function POST(input: APIEvent) {
   const body = await Billing.stripe().webhooks.constructEventAsync(

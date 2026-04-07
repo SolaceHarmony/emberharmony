@@ -1,10 +1,10 @@
 name: "Setup Git Committer"
 description: "Create app token and configure git user"
 inputs:
-  opencode-app-id:
+  emberharmony-app-id:
     description: "GitHub App ID (optional)"
     required: false
-  opencode-app-secret:
+  emberharmony-app-secret:
     description: "GitHub App private key (optional)"
     required: false
 outputs:
@@ -19,11 +19,11 @@ runs:
   steps:
     - name: Create app token
       id: apptoken
-      if: ${{ inputs.opencode-app-id != '' && inputs.opencode-app-secret != '' }}
+      if: ${{ inputs.emberharmony-app-id != '' && inputs.emberharmony-app-secret != '' }}
       uses: actions/create-github-app-token@v2
       with:
-        app-id: ${{ inputs.opencode-app-id }}
-        private-key: ${{ inputs.opencode-app-secret }}
+        app-id: ${{ inputs.emberharmony-app-id }}
+        private-key: ${{ inputs.emberharmony-app-secret }}
         owner: ${{ github.repository_owner }}
 
     - name: Configure git user

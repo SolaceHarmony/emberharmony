@@ -6,11 +6,11 @@
       "dependsOn": ["^build"],
       "outputs": ["dist/**"]
     },
-    "opencode#test": {
+    "emberharmony#test": {
       "dependsOn": ["^build"],
       "outputs": []
     },
-    "@opencode-harmony/app#test": {
+    "@thesolaceproject/emberharmony-app#test": {
       "dependsOn": ["^build"],
       "outputs": []
     }

@@ -2,7 +2,7 @@ import { json, action, useParams, createAsync, useSubmission } from "@solidjs/ro
 import { createEffect, Show } from "solid-js"
 import { createStore } from "solid-js/store"
 import { withActor } from "~/context/auth.withActor"
-import { Billing } from "@opencode-harmony/console-core/billing.js"
+import { Billing } from "@thesolaceproject/emberharmony-console-core/billing.js"
 import styles from "./monthly-limit-section.module.css"
 import { queryBillingInfo } from "../../common"
 

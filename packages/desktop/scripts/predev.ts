@@ -6,8 +6,8 @@ const RUST_TARGET = Bun.env.TAURI_ENV_TARGET_TRIPLE
 
 const sidecarConfig = getCurrentSidecar(RUST_TARGET)
 
-const binaryPath = windowsify(`../opencode/dist/${sidecarConfig.ocBinary}/bin/code-harmony`)
+const binaryPath = windowsify(`../emberharmony/dist/${sidecarConfig.ocBinary}/bin/emberharmony`)
 
-await $`cd ../opencode && bun run build --single`
+await $`cd ../emberharmony && bun run build --single`
 
 await copyBinaryToSidecarFolder(binaryPath, RUST_TARGET)

@@ -24,8 +24,8 @@ export default defineConfig({
     reuseExistingServer: reuse,
     timeout: 120_000,
     env: {
-      VITE_OPENCODE_SERVER_HOST: serverHost,
-      VITE_OPENCODE_SERVER_PORT: serverPort,
+      VITE_EMBERHARMONY_SERVER_HOST: serverHost,
+      VITE_EMBERHARMONY_SERVER_PORT: serverPort,
     },
   },
   use: {

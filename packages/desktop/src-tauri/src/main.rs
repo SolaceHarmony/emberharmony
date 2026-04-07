@@ -86,5 +86,5 @@ fn main() {
         }
     }
 
-    code_harmony_lib::run()
+    emberharmony_lib::run()
 }

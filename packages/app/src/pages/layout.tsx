@@ -19,24 +19,24 @@ import { A, useNavigate, useParams } from "@solidjs/router"
 import { useLayout, getAvatarColors, LocalProject } from "@/context/layout"
 import { useGlobalSync } from "@/context/global-sync"
 import { Persist, persisted } from "@/utils/persist"
-import { base64Encode } from "@opencode-harmony/util/encode"
+import { base64Encode } from "@thesolaceproject/emberharmony-util/encode"
 import { decode64 } from "@/utils/base64"
-import { Avatar } from "@opencode-harmony/ui/avatar"
-import { ResizeHandle } from "@opencode-harmony/ui/resize-handle"
-import { Button } from "@opencode-harmony/ui/button"
-import { Icon } from "@opencode-harmony/ui/icon"
-import { IconButton } from "@opencode-harmony/ui/icon-button"
-import { InlineInput } from "@opencode-harmony/ui/inline-input"
-import { Tooltip, TooltipKeybind } from "@opencode-harmony/ui/tooltip"
-import { HoverCard } from "@opencode-harmony/ui/hover-card"
-import { MessageNav } from "@opencode-harmony/ui/message-nav"
-import { DropdownMenu } from "@opencode-harmony/ui/dropdown-menu"
-import { Collapsible } from "@opencode-harmony/ui/collapsible"
-import { DiffChanges } from "@opencode-harmony/ui/diff-changes"
-import { Spinner } from "@opencode-harmony/ui/spinner"
-import { Dialog } from "@opencode-harmony/ui/dialog"
-import { getFilename } from "@opencode-harmony/util/path"
-import { Session, type Message, type TextPart } from "@opencode-harmony/sdk/v2/client"
+import { Avatar } from "@thesolaceproject/emberharmony-ui/avatar"
+import { ResizeHandle } from "@thesolaceproject/emberharmony-ui/resize-handle"
+import { Button } from "@thesolaceproject/emberharmony-ui/button"
+import { Icon } from "@thesolaceproject/emberharmony-ui/icon"
+import { IconButton } from "@thesolaceproject/emberharmony-ui/icon-button"
+import { InlineInput } from "@thesolaceproject/emberharmony-ui/inline-input"
+import { Tooltip, TooltipKeybind } from "@thesolaceproject/emberharmony-ui/tooltip"
+import { HoverCard } from "@thesolaceproject/emberharmony-ui/hover-card"
+import { MessageNav } from "@thesolaceproject/emberharmony-ui/message-nav"
+import { DropdownMenu } from "@thesolaceproject/emberharmony-ui/dropdown-menu"
+import { Collapsible } from "@thesolaceproject/emberharmony-ui/collapsible"
+import { DiffChanges } from "@thesolaceproject/emberharmony-ui/diff-changes"
+import { Spinner } from "@thesolaceproject/emberharmony-ui/spinner"
+import { Dialog } from "@thesolaceproject/emberharmony-ui/dialog"
+import { getFilename } from "@thesolaceproject/emberharmony-util/path"
+import { Session, type Message, type TextPart } from "@thesolaceproject/emberharmony-sdk/v2/client"
 import { usePlatform } from "@/context/platform"
 import { useSettings } from "@/context/settings"
 import { createStore, produce, reconcile } from "solid-js/store"
@@ -50,18 +50,18 @@ import {
 } from "@thisbeyond/solid-dnd"
 import type { DragEvent } from "@thisbeyond/solid-dnd"
 import { useProviders } from "@/hooks/use-providers"
-import { showToast, Toast, toaster } from "@opencode-harmony/ui/toast"
+import { showToast, Toast, toaster } from "@thesolaceproject/emberharmony-ui/toast"
 import { useGlobalSDK } from "@/context/global-sdk"
 import { useNotification } from "@/context/notification"
 import { usePermission } from "@/context/permission"
-import { Binary } from "@opencode-harmony/util/binary"
-import { retry } from "@opencode-harmony/util/retry"
+import { Binary } from "@thesolaceproject/emberharmony-util/binary"
+import { retry } from "@thesolaceproject/emberharmony-util/retry"
 import { playSound, soundSrc } from "@/utils/sound"
 import { Worktree as WorktreeState } from "@/utils/worktree"
 import { agentColor } from "@/utils/agent"
 
-import { useDialog } from "@opencode-harmony/ui/context/dialog"
-import { useTheme, type ColorScheme } from "@opencode-harmony/ui/theme"
+import { useDialog } from "@thesolaceproject/emberharmony-ui/context/dialog"
+import { useTheme, type ColorScheme } from "@thesolaceproject/emberharmony-ui/theme"
 import { DialogSelectProvider } from "@/components/dialog-select-provider"
 import { DialogSelectServer } from "@/components/dialog-select-server"
 import { DialogSettings } from "@/components/dialog-settings"
@@ -1136,10 +1136,10 @@ export default function Layout(props: ParentProps) {
     if (navigate) navigateToProject(directory)
   }
 
-  const deepLinkEvent = "opencode:deep-link"
+  const deepLinkEvent = "emberharmony:deep-link"
 
   const parseDeepLink = (input: string) => {
-    if (!input.startsWith("opencode://")) return
+    if (!input.startsWith("emberharmony://")) return
     const url = new URL(input)
     if (url.hostname !== "open-project") return
     const directory = url.searchParams.get("directory")
@@ -1157,9 +1157,9 @@ export default function Layout(props: ParentProps) {
   }
 
   const drainDeepLinks = () => {
-    const pending = window.__OPENCODE__?.deepLinks ?? []
+    const pending = window.__EMBERHARMONY__?.deepLinks ?? []
     if (pending.length === 0) return
-    if (window.__OPENCODE__) window.__OPENCODE__.deepLinks = []
+    if (window.__EMBERHARMONY__) window.__EMBERHARMONY__.deepLinks = []
     handleDeepLinks(pending)
   }
 
@@ -1646,14 +1646,16 @@ export default function Layout(props: ParentProps) {
     const notifications = createMemo(() => notification.project.unseen(props.project.worktree))
     const hasError = createMemo(() => notifications().some((n) => n.type === "error"))
     const name = createMemo(() => props.project.name || getFilename(props.project.worktree))
-    const opencode = "4b0ea68d7af9a6031a7ffda7ad66e0cb83315750"
+    const harmony = "4b0ea68d7af9a6031a7ffda7ad66e0cb83315750"
 
     return (
       <div class={`relative size-8 shrink-0 rounded ${props.class ?? ""}`}>
         <div class="size-full rounded overflow-clip">
           <Avatar
             fallback={name()}
-            src={props.project.id === opencode ? "https://opencode.ai/favicon.svg" : props.project.icon?.override}
+            src={
+              props.project.id === harmony ? "https://solace.ofharmony.ai/favicon.svg" : props.project.icon?.override
+            }
             {...getAvatarColors(props.project.icon?.color)}
             class="size-full rounded"
             classList={{ "badge-mask": notifications().length > 0 && props.notify }}
@@ -1847,7 +1849,7 @@ export default function Layout(props: ParentProps) {
                   getLabel={messageLabel}
                   onMessageSelect={(message) => {
                     if (!isActive()) {
-                      sessionStorage.setItem("opencode.pendingMessage", `${props.session.id}|${message.id}`)
+                      sessionStorage.setItem("emberharmony.pendingMessage", `${props.session.id}|${message.id}`)
                       navigate(`${props.slug}/session/${props.session.id}`)
                       return
                     }
@@ -2794,7 +2796,7 @@ export default function Layout(props: ParentProps) {
                 icon="help"
                 variant="ghost"
                 size="large"
-                onClick={() => platform.openLink("https://opencode.ai/desktop-feedback")}
+                onClick={() => platform.openLink("https://solace.ofharmony.ai/desktop-feedback")}
                 aria-label={language.t("sidebar.help")}
               />
             </Tooltip>

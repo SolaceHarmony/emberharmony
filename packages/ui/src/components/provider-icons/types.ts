@@ -26,7 +26,7 @@ export const iconNames = [
   "perplexity",
   "ovhcloud",
   "openrouter",
-  "opencode",
+  "emberharmony",
   "openai",
   "ollama-cloud",
   "nvidia",

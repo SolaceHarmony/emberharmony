@@ -1,7 +1,7 @@
 import type { APIEvent } from "@solidjs/start/server"
 import { json } from "@solidjs/router"
-import { Database } from "@opencode-harmony/console-core/drizzle/index.js"
-import { UserTable } from "@opencode-harmony/console-core/schema/user.sql.js"
+import { Database } from "@thesolaceproject/emberharmony-console-core/drizzle/index.js"
+import { UserTable } from "@thesolaceproject/emberharmony-console-core/schema/user.sql.js"
 
 export async function GET(evt: APIEvent) {
   return json({

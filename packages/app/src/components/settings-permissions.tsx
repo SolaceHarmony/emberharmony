@@ -1,5 +1,5 @@
-import { Select } from "@opencode-harmony/ui/select"
-import { showToast } from "@opencode-harmony/ui/toast"
+import { Select } from "@thesolaceproject/emberharmony-ui/select"
+import { showToast } from "@thesolaceproject/emberharmony-ui/toast"
 import { Component, For, createMemo, type JSX } from "solid-js"
 import { useGlobalSync } from "@/context/global-sync"
 import { useLanguage } from "@/context/language"

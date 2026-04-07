@@ -1,0 +1,71 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "emberharmony-tui",
+      "runtimeExecutable": "/opt/homebrew/bin/bun",
+      "runtimeArgs": ["run", "--cwd", "packages/emberharmony", "--conditions=browser", "src/index.ts"],
+      "port": 0
+    },
+    {
+      "name": "emberharmony-server",
+      "runtimeExecutable": "/opt/homebrew/bin/bun",
+      "runtimeArgs": ["run", "--cwd", "packages/emberharmony", "--conditions=browser", "src/index.ts", "serve"],
+      "port": 0
+    },
+    {
+      "name": "app",
+      "runtimeExecutable": "/opt/homebrew/bin/bun",
+      "runtimeArgs": ["run", "--cwd", "packages/app", "dev"],
+      "port": 3000
+    },
+    {
+      "name": "stack",
+      "runtimeExecutable": "/opt/homebrew/bin/bun",
+      "runtimeArgs": ["run", "script/dev-stack.ts"],
+      "port": 3000
+    },
+    {
+      "name": "ui",
+      "runtimeExecutable": "/opt/homebrew/bin/bun",
+      "runtimeArgs": ["run", "--cwd", "packages/ui", "dev"],
+      "port": 3001
+    },
+    {
+      "name": "desktop",
+      "runtimeExecutable": "/opt/homebrew/bin/bun",
+      "runtimeArgs": ["run", "--cwd", "packages/desktop", "dev"],
+      "port": 1420
+    },
+    {
+      "name": "console-app",
+      "runtimeExecutable": "/opt/homebrew/bin/bun",
+      "runtimeArgs": ["run", "--cwd", "packages/console/app", "dev"],
+      "port": 3000
+    },
+    {
+      "name": "console-mail",
+      "runtimeExecutable": "/opt/homebrew/bin/bun",
+      "runtimeArgs": ["run", "--cwd", "packages/console/mail", "dev"],
+      "port": 0
+    },
+    {
+      "name": "enterprise",
+      "runtimeExecutable": "/opt/homebrew/bin/bun",
+      "runtimeArgs": ["run", "--cwd", "packages/enterprise", "dev"],
+      "port": 3000
+    },
+    {
+      "name": "web-docs",
+      "runtimeExecutable": "/opt/homebrew/bin/bun",
+      "runtimeArgs": ["run", "--cwd", "packages/web", "dev"],
+      "port": 4321
+    },
+    {
+      "name": "slack",
+      "runtimeExecutable": "/opt/homebrew/bin/bun",
+      "runtimeArgs": ["run", "--cwd", "packages/slack", "dev"],
+      "port": 0
+    }
+  ]
+}

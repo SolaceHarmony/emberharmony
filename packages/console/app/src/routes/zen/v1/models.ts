@@ -1,9 +1,9 @@
 import type { APIEvent } from "@solidjs/start/server"
-import { and, Database, eq, isNull } from "@opencode-harmony/console-core/drizzle/index.js"
-import { KeyTable } from "@opencode-harmony/console-core/schema/key.sql.js"
-import { WorkspaceTable } from "@opencode-harmony/console-core/schema/workspace.sql.js"
-import { ModelTable } from "@opencode-harmony/console-core/schema/model.sql.js"
-import { ZenData } from "@opencode-harmony/console-core/model.js"
+import { and, Database, eq, isNull } from "@thesolaceproject/emberharmony-console-core/drizzle/index.js"
+import { KeyTable } from "@thesolaceproject/emberharmony-console-core/schema/key.sql.js"
+import { WorkspaceTable } from "@thesolaceproject/emberharmony-console-core/schema/workspace.sql.js"
+import { ModelTable } from "@thesolaceproject/emberharmony-console-core/schema/model.sql.js"
+import { ZenData } from "@thesolaceproject/emberharmony-console-core/model.js"
 
 export async function OPTIONS(input: APIEvent) {
   return new Response(null, {
@@ -29,7 +29,7 @@ export async function GET(input: APIEvent) {
           id,
           object: "model",
           created: Math.floor(Date.now() / 1000),
-          owned_by: "opencode",
+          owned_by: "emberharmony",
         })),
     }),
     {

@@ -1,7 +1,7 @@
-import { createOpencodeClient, createOpencodeServer } from "@opencode-harmony/sdk"
+import { createEmberHarmonyClient, createEmberHarmonyServer } from "@thesolaceproject/emberharmony-sdk"
 
-const server = await createOpencodeServer()
-const client = createOpencodeClient({ baseUrl: server.url })
+const server = await createEmberHarmonyServer()
+const client = createEmberHarmonyClient({ baseUrl: server.url })
 
 const input = await Array.fromAsync(new Bun.Glob("packages/core/*.ts").scan())
 

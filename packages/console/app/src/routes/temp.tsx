@@ -38,15 +38,15 @@ export default function Home() {
 
   return (
     <main data-page="home">
-      <Title>opencode | AI coding agent built for the terminal</Title>
+      <Title>EmberHarmony | AI coding agent built for the terminal</Title>
 
       <div data-component="content">
         <section data-component="top">
-          <img data-slot="logo light" src={logoLight} alt="opencode logo light" />
-          <img data-slot="logo dark" src={logoDark} alt="opencode logo dark" />
+          <img data-slot="logo light" src={logoLight} alt="EmberHarmony logo light" />
+          <img data-slot="logo dark" src={logoDark} alt="EmberHarmony logo dark" />
           <h1 data-slot="title">The AI coding agent built for the terminal</h1>
           <div data-slot="login">
-            <a href="/auth">opencode zen</a>
+            <a href="/auth">EmberHarmony Zen</a>
           </div>
         </section>
 
@@ -55,14 +55,14 @@ export default function Home() {
             <a href="/docs">Get Started</a>
           </div>
           <div data-slot="center">
-            <a href="/auth">opencode zen</a>
+            <a href="/auth">EmberHarmony Zen</a>
           </div>
           <div data-slot="right">
             <button data-copy data-slot="command">
               <span>
                 <span>curl -fsSL </span>
                 <span data-slot="protocol">https://</span>
-                <span data-slot="highlight">raw.githubusercontent.com/SolaceHarmony/code-harmony/dev/install</span>
+                <span data-slot="highlight">raw.githubusercontent.com/sydneyrenee/emberharmony/main/install</span>
                 <span> | bash</span>
               </span>
               <CopyStatus />
@@ -79,7 +79,7 @@ export default function Home() {
               <strong>LSP enabled</strong> Automatically loads the right LSPs for the LLM
             </li>
             <li>
-              <strong>opencode zen</strong> A <a href="/docs/zen">curated list of models</a> provided by opencode{" "}
+              <strong>EmberHarmony Zen</strong> A <a href="/docs/zen">curated list of models</a> provided by EmberHarmony{" "}
               <label>New</label>
             </li>
             <li>
@@ -106,7 +106,7 @@ export default function Home() {
             <h3 data-component="title">npm</h3>
             <button data-copy data-slot="button">
               <span>
-                npm install -g <strong>code-harmony</strong>
+                npm install -g <strong>emberharmony</strong>
               </span>
               <CopyStatus />
             </button>
@@ -115,7 +115,7 @@ export default function Home() {
             <h3 data-component="title">bun</h3>
             <button data-copy data-slot="button">
               <span>
-                bun install -g <strong>code-harmony</strong>
+                bun install -g <strong>emberharmony</strong>
               </span>
               <CopyStatus />
             </button>
@@ -124,7 +124,7 @@ export default function Home() {
             <h3 data-component="title">paru</h3>
             <button data-copy data-slot="button">
               <span>
-                paru -S <strong>opencode-bin</strong>
+                paru -S <strong>emberharmony-bin</strong>
               </span>
               <CopyStatus />
             </button>
@@ -133,29 +133,29 @@ export default function Home() {
 
         <section data-component="screenshots">
           <figure>
-            <figcaption>opencode TUI with the tokyonight theme</figcaption>
+            <figcaption>EmberHarmony TUI with the tokyonight theme</figcaption>
             <a href="/docs/cli">
-              <img src={IMG_SPLASH} alt="opencode TUI with tokyonight theme" />
+              <img src={IMG_SPLASH} alt="EmberHarmony TUI with tokyonight theme" />
             </a>
           </figure>
         </section>
 
         <footer data-component="footer">
           <div data-slot="cell">
-            <a href="https://x.com/opencode">X.com</a>
+            <a href="https://solace.ofharmony.ai">Website</a>
           </div>
           <div data-slot="cell">
-            <a href="https://github.com/SolaceHarmony/code-harmony">GitHub</a>
+            <a href="https://github.com/SolaceHarmony/emberharmony">GitHub</a>
           </div>
           <div data-slot="cell">
-            <a href="https://opencode.ai/discord">Discord</a>
+            <a href="https://discord.gg/EdF8f7JR">Discord</a>
           </div>
         </footer>
       </div>
 
       <div data-component="legal">
         <span>
-          ©2025 <a href="https://anoma.ly">Anomaly</a>
+          ©2026 <a href="https://github.com/SolaceHarmony/emberharmony">The Solace Project</a>
         </span>
       </div>
     </main>

@@ -1,37 +1,49 @@
-import { FileDiff, Message, Model, Part, Session, SessionStatus, UserMessage } from "@opencode-harmony/sdk/v2"
-import { SessionTurn } from "@opencode-harmony/ui/session-turn"
-import { SessionReview } from "@opencode-harmony/ui/session-review"
-import { DataProvider } from "@opencode-harmony/ui/context"
-import { DiffComponentProvider } from "@opencode-harmony/ui/context/diff"
-import { CodeComponentProvider } from "@opencode-harmony/ui/context/code"
-import { WorkerPoolProvider } from "@opencode-harmony/ui/context/worker-pool"
+import {
+  FileDiff,
+  Message,
+  Model,
+  Part,
+  Session,
+  SessionStatus,
+  UserMessage,
+} from "@thesolaceproject/emberharmony-sdk/v2"
+import { SessionTurn } from "@thesolaceproject/emberharmony-ui/session-turn"
+import { SessionReview } from "@thesolaceproject/emberharmony-ui/session-review"
+import { DataProvider } from "@thesolaceproject/emberharmony-ui/context"
+import { DiffComponentProvider } from "@thesolaceproject/emberharmony-ui/context/diff"
+import { CodeComponentProvider } from "@thesolaceproject/emberharmony-ui/context/code"
+import { WorkerPoolProvider } from "@thesolaceproject/emberharmony-ui/context/worker-pool"
 import { createAsync, query, useParams } from "@solidjs/router"
 import { createEffect, createMemo, ErrorBoundary, For, Match, Show, Switch } from "solid-js"
 import { Share } from "~/core/share"
-import { Logo, Mark } from "@opencode-harmony/ui/logo"
-import { IconButton } from "@opencode-harmony/ui/icon-button"
-import { ProviderIcon } from "@opencode-harmony/ui/provider-icon"
-import { createDefaultOptions } from "@opencode-harmony/ui/pierre"
-import { iife } from "@opencode-harmony/util/iife"
-import { Binary } from "@opencode-harmony/util/binary"
-import { NamedError } from "@opencode-harmony/util/error"
+import { Logo, Mark } from "@thesolaceproject/emberharmony-ui/logo"
+import { IconButton } from "@thesolaceproject/emberharmony-ui/icon-button"
+import { ProviderIcon } from "@thesolaceproject/emberharmony-ui/provider-icon"
+import { createDefaultOptions } from "@thesolaceproject/emberharmony-ui/pierre"
+import { iife } from "@thesolaceproject/emberharmony-util/iife"
+import { Binary } from "@thesolaceproject/emberharmony-util/binary"
+import { NamedError } from "@thesolaceproject/emberharmony-util/error"
 import { DateTime } from "luxon"
 import { createStore } from "solid-js/store"
 import z from "zod"
 import NotFound from "../[...404]"
-import { Tabs } from "@opencode-harmony/ui/tabs"
-import { MessageNav } from "@opencode-harmony/ui/message-nav"
+import { Tabs } from "@thesolaceproject/emberharmony-ui/tabs"
+import { MessageNav } from "@thesolaceproject/emberharmony-ui/message-nav"
 import { preloadMultiFileDiff, PreloadMultiFileDiffResult } from "@pierre/diffs/ssr"
-import { Diff as SSRDiff } from "@opencode-harmony/ui/diff-ssr"
+import { Diff as SSRDiff } from "@thesolaceproject/emberharmony-ui/diff-ssr"
 import { clientOnly } from "@solidjs/start"
-import { type IconName } from "@opencode-harmony/ui/icons/provider"
+import { type IconName } from "@thesolaceproject/emberharmony-ui/icons/provider"
 import { Meta, Title } from "@solidjs/meta"
 import { Base64 } from "js-base64"
 
-const ClientOnlyDiff = clientOnly(() => import("@opencode-harmony/ui/diff").then((m) => ({ default: m.Diff })))
-const ClientOnlyCode = clientOnly(() => import("@opencode-harmony/ui/code").then((m) => ({ default: m.Code })))
+const ClientOnlyDiff = clientOnly(() =>
+  import("@thesolaceproject/emberharmony-ui/diff").then((m) => ({ default: m.Diff })),
+)
+const ClientOnlyCode = clientOnly(() =>
+  import("@thesolaceproject/emberharmony-ui/code").then((m) => ({ default: m.Code })),
+)
 const ClientOnlyWorkerPoolProvider = clientOnly(() =>
-  import("@opencode-harmony/ui/pierre/worker").then((m) => ({
+  import("@thesolaceproject/emberharmony-ui/pierre/worker").then((m) => ({
     default: (props: { children: any }) => (
       <WorkerPoolProvider pools={m.getWorkerPools()}>{props.children}</WorkerPoolProvider>
     ),
@@ -206,15 +218,15 @@ export default function () {
               modelParam = "unknown"
             }
             const version = `v${info().version}`
-            return `https://social-cards.sst.dev/opencode-share/${encodedTitle}.png?model=${modelParam}&version=${version}&id=${data().shareID}`
+            return `https://social-cards.sst.dev/emberharmony-share/${encodedTitle}.png?model=${modelParam}&version=${version}&id=${data().shareID}`
           })
 
           return (
             <>
               <Show when={info().title}>
-                <Title>{info().title} | OpenCode</Title>
+                <Title>{info().title} | EmberHarmony</Title>
               </Show>
-              <Meta name="description" content="opencode - The AI coding agent built for the terminal." />
+              <Meta name="description" content="EmberHarmony - The AI coding agent built for the terminal." />
               <Meta property="og:image" content={ogImage()} />
               <Meta name="twitter:image" content={ogImage()} />
               <ClientOnlyWorkerPoolProvider>
@@ -321,21 +333,21 @@ export default function () {
                           <div class="relative bg-background-stronger w-screen h-screen overflow-hidden flex flex-col">
                             <header class="h-12 px-6 py-2 flex items-center justify-between self-stretch bg-background-base border-b border-border-weak-base">
                               <div class="">
-                                <a href="https://opencode.ai">
+                                <a href="https://solace.ofharmony.ai">
                                   <Mark />
                                 </a>
                               </div>
                               <div class="flex gap-3 items-center">
                                 <IconButton
                                   as={"a"}
-                                  href="https://github.com/SolaceHarmony/code-harmony"
+                                  href="https://github.com/sydneyrenee/emberharmony"
                                   target="_blank"
                                   icon="github"
                                   variant="ghost"
                                 />
                                 <IconButton
                                   as={"a"}
-                                  href="https://opencode.ai/discord"
+                                  href="https://discord.gg/EdF8f7JR"
                                   target="_blank"
                                   icon="discord"
                                   variant="ghost"

@@ -1,4 +1,4 @@
-import { Resource } from "@opencode-harmony/console-resource"
+import { Resource } from "@thesolaceproject/emberharmony-console-resource"
 import type { TraceItem } from "@cloudflare/workers-types"
 
 export default {

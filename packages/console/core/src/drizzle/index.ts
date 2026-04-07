@@ -1,5 +1,5 @@
 import { drizzle } from "drizzle-orm/planetscale-serverless"
-import { Resource } from "@opencode-harmony/console-resource"
+import { Resource } from "@thesolaceproject/emberharmony-console-resource"
 export * from "drizzle-orm"
 import { Client } from "@planetscale/database"
 

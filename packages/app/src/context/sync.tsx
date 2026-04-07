@@ -1,11 +1,11 @@
 import { batch, createMemo } from "solid-js"
 import { createStore, produce, reconcile } from "solid-js/store"
-import { Binary } from "@opencode-harmony/util/binary"
-import { retry } from "@opencode-harmony/util/retry"
-import { createSimpleContext } from "@opencode-harmony/ui/context"
+import { Binary } from "@thesolaceproject/emberharmony-util/binary"
+import { retry } from "@thesolaceproject/emberharmony-util/retry"
+import { createSimpleContext } from "@thesolaceproject/emberharmony-ui/context"
 import { useGlobalSync } from "./global-sync"
 import { useSDK } from "./sdk"
-import type { Message, Part } from "@opencode-harmony/sdk/v2/client"
+import type { Message, Part } from "@thesolaceproject/emberharmony-sdk/v2/client"
 
 const keyFor = (directory: string, id: string) => `${directory}\n${id}`
 

@@ -8,7 +8,7 @@ env:
 
 jobs:
   update-docs:
-    if: github.repository == 'SolaceHarmony/code-harmony'
+    if: github.repository == 'SolaceHarmony/emberharmony'
     runs-on: ubuntu-latest
     permissions:
       id-token: write
@@ -39,13 +39,13 @@ jobs:
             } >> $GITHUB_OUTPUT
           fi
 
-      - name: Run code-harmony
+      - name: Run emberharmony
         if: steps.commits.outputs.has_commits == 'true'
-        uses: SolaceHarmony/code-harmony/github@latest
+        uses: SolaceHarmony/emberharmony/github@latest
         env:
-          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          EMBERHARMONY_API_KEY: ${{ secrets.EMBERHARMONY_API_KEY }}
         with:
-          model: opencode/gpt-5.2
+          model: emberharmony/gpt-5.2
           agent: docs
           prompt: |
             Review the following commits from the last ${{ env.LOOKBACK_HOURS }} hours and identify any new features that may need documentation.

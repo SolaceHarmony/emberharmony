@@ -18,7 +18,7 @@ export type TuiOptions = {
   config?: Config
 }
 
-export async function createOpencodeServer(options?: ServerOptions) {
+export async function createEmberHarmonyServer(options?: ServerOptions) {
   options = Object.assign(
     {
       hostname: "127.0.0.1",
@@ -28,7 +28,7 @@ export async function createOpencodeServer(options?: ServerOptions) {
     options ?? {},
   )
 
-  const bin = process.env.OPENCODE_BIN ?? "code-harmony"
+  const bin = process.env.EMBERHARMONY_BIN ?? "emberharmony"
   const args = [`serve`, `--hostname=${options.hostname}`, `--port=${options.port}`]
   if (options.config?.logLevel) args.push(`--log-level=${options.config.logLevel}`)
 
@@ -36,7 +36,7 @@ export async function createOpencodeServer(options?: ServerOptions) {
     signal: options.signal,
     env: {
       ...process.env,
-      OPENCODE_CONFIG_CONTENT: JSON.stringify(options.config ?? {}),
+      EMBERHARMONY_CONFIG_CONTENT: JSON.stringify(options.config ?? {}),
     },
   })
 
@@ -97,8 +97,8 @@ export async function createOpencodeServer(options?: ServerOptions) {
   }
 }
 
-export function createOpencodeTui(options?: TuiOptions) {
-  const bin = process.env.OPENCODE_BIN ?? "code-harmony"
+export function createEmberHarmonyTui(options?: TuiOptions) {
+  const bin = process.env.EMBERHARMONY_BIN ?? "emberharmony"
   const args = []
 
   if (options?.project) {
@@ -119,7 +119,7 @@ export function createOpencodeTui(options?: TuiOptions) {
     stdio: "inherit",
     env: {
       ...process.env,
-      OPENCODE_CONFIG_CONTENT: JSON.stringify(options?.config ?? {}),
+      EMBERHARMONY_CONFIG_CONTENT: JSON.stringify(options?.config ?? {}),
     },
   })
 

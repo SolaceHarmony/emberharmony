@@ -1,6 +1,6 @@
-# OpenCode Desktop
+# EmberHarmony Desktop
 
-Native OpenCode desktop app, built with Tauri v2.
+Native EmberHarmony desktop app, built with Tauri v2.
 
 ## Development
 

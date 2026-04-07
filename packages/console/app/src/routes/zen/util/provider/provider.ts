@@ -1,4 +1,4 @@
-import { ZenData } from "@opencode-harmony/console-core/model.js"
+import { ZenData } from "@thesolaceproject/emberharmony-console-core/model.js"
 import {
   fromAnthropicChunk,
   fromAnthropicRequest,

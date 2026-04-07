@@ -4,11 +4,11 @@ import { SDKProvider, useSDK } from "@/context/sdk"
 import { SyncProvider, useSync } from "@/context/sync"
 import { LocalProvider } from "@/context/local"
 
-import { DataProvider } from "@opencode-harmony/ui/context"
-import { iife } from "@opencode-harmony/util/iife"
-import type { QuestionAnswer } from "@opencode-harmony/sdk/v2"
+import { DataProvider } from "@thesolaceproject/emberharmony-ui/context"
+import { iife } from "@thesolaceproject/emberharmony-util/iife"
+import type { QuestionAnswer } from "@thesolaceproject/emberharmony-sdk/v2"
 import { decode64 } from "@/utils/base64"
-import { showToast } from "@opencode-harmony/ui/toast"
+import { showToast } from "@thesolaceproject/emberharmony-ui/toast"
 import { useLanguage } from "@/context/language"
 
 export default function Layout(props: ParentProps) {

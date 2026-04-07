@@ -11,13 +11,13 @@ concurrency: ${{ github.workflow }}-${{ github.ref }}
 jobs:
   deploy:
     if: |
-      github.ref_name == 'dev' &&
+      github.ref_name == 'main' &&
       (github.event_name == 'workflow_dispatch' ||
         (github.event_name == 'push' &&
           startsWith(github.event.head_commit.message, 'release: v')))
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - uses: ./.github/actions/setup-bun
 

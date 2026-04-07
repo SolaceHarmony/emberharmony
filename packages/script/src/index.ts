@@ -17,15 +17,15 @@ if (!semver.satisfies(process.versions.bun, expectedBunVersionRange)) {
 }
 
 const env = {
-  OPENCODE_CHANNEL: process.env["OPENCODE_CHANNEL"],
-  OPENCODE_BUMP: process.env["OPENCODE_BUMP"],
-  OPENCODE_VERSION: process.env["OPENCODE_VERSION"],
-  OPENCODE_RELEASE: process.env["OPENCODE_RELEASE"],
+  EMBERHARMONY_CHANNEL: process.env["EMBERHARMONY_CHANNEL"],
+  EMBERHARMONY_BUMP: process.env["EMBERHARMONY_BUMP"],
+  EMBERHARMONY_VERSION: process.env["EMBERHARMONY_VERSION"],
+  EMBERHARMONY_RELEASE: process.env["EMBERHARMONY_RELEASE"],
 }
 const CHANNEL = await (async () => {
-  if (env.OPENCODE_CHANNEL) return env.OPENCODE_CHANNEL
-  if (env.OPENCODE_BUMP) return "latest"
-  if (env.OPENCODE_VERSION && !env.OPENCODE_VERSION.startsWith("0.0.0-")) return "latest"
+  if (env.EMBERHARMONY_CHANNEL) return env.EMBERHARMONY_CHANNEL
+  if (env.EMBERHARMONY_BUMP) return "latest"
+  if (env.EMBERHARMONY_VERSION && !env.EMBERHARMONY_VERSION.startsWith("0.0.0-")) return "latest"
   return await $`git branch --show-current`.text().then((x) => x.trim())
 })()
 const IS_PREVIEW = CHANNEL !== "latest"
@@ -39,10 +39,11 @@ const bump = (current: string, kind: string | undefined) => {
 }
 
 const VERSION = await (async () => {
-  if (env.OPENCODE_VERSION) return env.OPENCODE_VERSION
+  if (env.EMBERHARMONY_VERSION) return env.EMBERHARMONY_VERSION
   if (IS_PREVIEW) return `0.0.0-${CHANNEL}-${new Date().toISOString().slice(0, 16).replace(/[-:T]/g, "")}`
 
-  const npm = await fetch("https://registry.npmjs.org/code-harmony/latest")
+  const publish = process.env["EMBERHARMONY_PUBLISH_NAME"] ?? "@thesolaceproject/emberharmony"
+  const npm = await fetch(`https://registry.npmjs.org/${publish}/latest`)
     .then(async (res) => {
       if (!res.ok) return
       const data = (await res.json()) as unknown
@@ -57,7 +58,7 @@ const VERSION = await (async () => {
   const local = await (async () => {
     const paths = [
       path.resolve(import.meta.dir, "../../app/package.json"),
-      path.resolve(import.meta.dir, "../../opencode/package.json"),
+      path.resolve(import.meta.dir, "../../emberharmony/package.json"),
     ]
     for (const item of paths) {
       const file = Bun.file(item)
@@ -78,7 +79,7 @@ const VERSION = await (async () => {
     .then((x) => (x.startsWith("v") ? x.slice(1) : x))
 
   const current = npm ?? local ?? (tag.length > 0 ? tag : "0.0.0")
-  return bump(current, env.OPENCODE_BUMP)
+  return bump(current, env.EMBERHARMONY_BUMP)
 })()
 
 export const Script = {
@@ -92,7 +93,7 @@ export const Script = {
     return IS_PREVIEW
   },
   get release() {
-    return env.OPENCODE_RELEASE
+    return env.EMBERHARMONY_RELEASE
   },
 }
-console.log(`code-harmony script`, JSON.stringify(Script, null, 2))
+console.log(`emberharmony script`, JSON.stringify(Script, null, 2))

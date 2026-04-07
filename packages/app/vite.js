@@ -7,7 +7,7 @@ import { fileURLToPath } from "url"
  */
 export default [
   {
-    name: "opencode-desktop:config",
+    name: "emberharmony-desktop:config",
     config() {
       return {
         resolve: {
