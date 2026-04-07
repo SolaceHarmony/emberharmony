@@ -70,9 +70,9 @@ detect_install_dir() {
         echo "$EMBERHARMONY_INSTALL_DIR"
         return
     fi
-    # Backward compat
-    if [ -n "${EMBERHARMONY_INSTALL_DIR-}" ]; then
-        echo "$EMBERHARMONY_INSTALL_DIR"
+    # Backward compat for users migrating from opencode
+    if [ -n "${OPENCODE_INSTALL_DIR-}" ]; then
+        echo "$OPENCODE_INSTALL_DIR"
         return
     fi
     if [ -n "${XDG_BIN_DIR-}" ]; then
