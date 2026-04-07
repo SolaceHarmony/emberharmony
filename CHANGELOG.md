@@ -5,6 +5,20 @@ All notable changes to EmberHarmony will be documented in this file.
 This project is a fork of [opencode](https://github.com/opencode-ai/opencode),
 rebranded and maintained by [The Solace Project](https://github.com/SolaceHarmony).
 
+## [1.1.1] - 2026-04-06
+
+### Fixed
+- Replace opencode square SVG mark/splash with ember flame icon
+- Deep link protocol `codeharmony://` → `emberharmony://` (app + desktop)
+- VS Code extension command IDs `codeharmony.*` → `emberharmony.*`
+- Legal text references updated to EMBERHARMONY
+- Use raw `g_object_get_data` FFI for Linux pinch-zoom disable — the typed
+  `ObjectExt::data::<T>()` wrapper silently returns None for C-attached data
+- Drop direct `gtk` crate dependency; use webkit2gtk glib re-export instead
+- Remove redundant sidecar port lookup in desktop lib.rs
+- Install script backward compat now checks `OPENCODE_INSTALL_DIR`
+- Test snapshot path updated from code-harmony to emberharmony
+
 ## [1.1.0] - 2026-04-06
 
 ### Added
