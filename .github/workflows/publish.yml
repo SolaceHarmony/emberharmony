@@ -250,6 +250,7 @@ jobs:
     needs:
       - version
       - build-cli
+      - build-tauri
     runs-on: ubuntu-latest
     env:
       AUR_KEY: ${{ secrets.AUR_KEY }}
