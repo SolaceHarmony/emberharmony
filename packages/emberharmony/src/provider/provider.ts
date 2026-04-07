@@ -329,6 +329,66 @@ export namespace Provider {
         },
       }
     },
+    ollama: async (provider) => {
+      // Auto-discover locally running Ollama models via the /api/tags endpoint.
+      const config = await Config.get()
+      const baseURL = config.provider?.["ollama"]?.options?.baseURL ?? "http://localhost:11434"
+
+      try {
+        const res = await fetch(`${baseURL}/api/tags`, {
+          signal: AbortSignal.timeout(1500),
+        })
+        if (!res.ok) return { autoload: false }
+        const data = (await res.json()) as { models?: Array<{ name: string; details?: { parameter_size?: string; family?: string; quantization_level?: string } }> }
+        if (!data.models?.length) return { autoload: false }
+
+        for (const m of data.models) {
+          const id = m.name
+          const details = m.details ?? {}
+          const paramSize = details.parameter_size ?? ""
+          const family = details.family ?? ""
+          const quant = details.quantization_level ?? ""
+          const displayName = [id, paramSize, quant].filter(Boolean).join(" · ")
+
+          provider.models[id] = {
+            id,
+            api: { id, npm: "@ai-sdk/openai-compatible", url: `${baseURL}/v1` },
+            name: displayName,
+            providerID: "ollama",
+            status: "active",
+            capabilities: {
+              temperature: true,
+              reasoning: false,
+              attachment: false,
+              toolcall: true,
+              input: { text: true, audio: false, image: false, video: false, pdf: false },
+              output: { text: true, audio: false, image: false, video: false, pdf: false },
+              interleaved: false,
+            },
+            cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+            options: {},
+            limit: { context: 0, output: 0 },
+            headers: {},
+            family,
+            release_date: "",
+            variants: {},
+          }
+        }
+
+        log.info("ollama: discovered " + data.models.length + " local models")
+
+        return {
+          autoload: true,
+          options: {
+            baseURL: `${baseURL}/v1`,
+            apiKey: "ollama",
+          },
+        }
+      } catch {
+        // Ollama not running — skip silently
+        return { autoload: false }
+      }
+    },
     vercel: async () => {
       return {
         autoload: false,
@@ -875,6 +935,18 @@ export namespace Provider {
             mergeProvider(enterpriseProviderID, patch)
           }
         }
+      }
+    }
+
+    // Inject local Ollama provider if not already in database
+    if (!database["ollama"] && !disabled.has("ollama")) {
+      database["ollama"] = {
+        id: "ollama",
+        name: "Ollama",
+        env: [],
+        options: {},
+        source: "custom",
+        models: {},
       }
     }
 
