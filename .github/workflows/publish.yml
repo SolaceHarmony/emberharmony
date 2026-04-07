@@ -41,7 +41,7 @@ jobs:
           ./script/version.ts
         env:
           GH_TOKEN: ${{ github.token }}
-          EMBERHARMONY_PUBLISH_NAME: @thesolaceproject/emberharmony
+          EMBERHARMONY_PUBLISH_NAME: "@thesolaceproject/emberharmony"
           EMBERHARMONY_BUMP: ${{ inputs.bump }}
           EMBERHARMONY_VERSION: ${{ inputs.version }}
           EMBERHARMONY_API_KEY: ${{ secrets.EMBERHARMONY_API_KEY }}
@@ -68,7 +68,7 @@ jobs:
         env:
           EMBERHARMONY_VERSION: ${{ needs.version.outputs.version }}
           EMBERHARMONY_RELEASE: ${{ needs.version.outputs.release }}
-          EMBERHARMONY_PUBLISH_NAME: @thesolaceproject/emberharmony
+          EMBERHARMONY_PUBLISH_NAME: "@thesolaceproject/emberharmony"
           GH_TOKEN: ${{ github.token }}
 
       - uses: actions/upload-artifact@v4
@@ -326,7 +326,7 @@ jobs:
         env:
           EMBERHARMONY_VERSION: ${{ needs.version.outputs.version }}
           EMBERHARMONY_RELEASE: ${{ needs.version.outputs.release }}
-          EMBERHARMONY_PUBLISH_NAME: @thesolaceproject/emberharmony
+          EMBERHARMONY_PUBLISH_NAME: "@thesolaceproject/emberharmony"
           EMBERHARMONY_PUBLISH_PLATFORMS: "1"
           EMBERHARMONY_SKIP_GIT: "1"
           AUR_KEY: ${{ secrets.AUR_KEY }}
