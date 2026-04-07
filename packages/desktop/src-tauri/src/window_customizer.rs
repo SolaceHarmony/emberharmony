@@ -21,11 +21,15 @@ impl<R: Runtime> Plugin<R> for PinchZoomDisablePlugin {
         let _ = webview_window.with_webview(|_webview| {
             #[cfg(target_os = "linux")]
             unsafe {
-                use gtk::glib::ObjectExt;
-                use gtk::GestureZoom;
+                // Use glib re-exported by webkit2gtk — avoids direct dependency on
+                // the unmaintained `gtk` (GTK3) crate and its pinned glib 0.18.x.
+                use webkit2gtk::glib::prelude::ObjectExt;
                 use webkit2gtk::glib::gobject_ffi;
 
-                if let Some(data) = _webview.inner().data::<GestureZoom>("wk-view-zoom-gesture") {
+                // The type parameter is irrelevant — we only need the raw pointer.
+                // `data()` performs g_object_get_data under the hood; the key string
+                // "wk-view-zoom-gesture" is what identifies the gesture handler.
+                if let Some(data) = _webview.inner().data::<u8>("wk-view-zoom-gesture") {
                     gobject_ffi::g_signal_handlers_destroy(data.as_ptr().cast());
                 }
             }
