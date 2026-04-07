@@ -5,6 +5,13 @@ All notable changes to EmberHarmony will be documented in this file.
 This project is a fork of [opencode](https://github.com/opencode-ai/opencode),
 rebranded and maintained by [The Solace Project](https://github.com/SolaceHarmony).
 
+## [1.2.0] - 2026-04-06
+
+### Added
+- Auto-discover local Ollama models — the provider queries `localhost:11434/api/tags`
+  on startup and registers every installed model with zero configuration. Display
+  names include parameter size and quantization level (e.g. `llama3.2 · 3B · Q4_K_M`).
+
 ## [1.1.1] - 2026-04-06
 
 ### Fixed
