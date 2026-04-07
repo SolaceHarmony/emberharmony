@@ -3,11 +3,11 @@ import * as vscode from "vscode"
 const terminalName = "EmberHarmony"
 
 export function activate(context: vscode.ExtensionContext) {
-  const openNew = vscode.commands.registerCommand("codeharmony.openNewTerminal", async () => {
+  const openNew = vscode.commands.registerCommand("emberharmony.openNewTerminal", async () => {
     await openTerminal()
   })
 
-  const open = vscode.commands.registerCommand("codeharmony.openTerminal", async () => {
+  const open = vscode.commands.registerCommand("emberharmony.openTerminal", async () => {
     const existing = vscode.window.terminals.find((t) => t.name === terminalName)
     if (existing) {
       existing.show()
@@ -16,7 +16,7 @@ export function activate(context: vscode.ExtensionContext) {
     await openTerminal()
   })
 
-  const addFile = vscode.commands.registerCommand("codeharmony.addFilepathToTerminal", async () => {
+  const addFile = vscode.commands.registerCommand("emberharmony.addFilepathToTerminal", async () => {
     const fileRef = getActiveFile()
     if (!fileRef) return
 

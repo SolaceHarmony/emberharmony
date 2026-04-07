@@ -1136,10 +1136,10 @@ export default function Layout(props: ParentProps) {
     if (navigate) navigateToProject(directory)
   }
 
-  const deepLinkEvent = "codeharmony:deep-link"
+  const deepLinkEvent = "emberharmony:deep-link"
 
   const parseDeepLink = (input: string) => {
-    if (!input.startsWith("codeharmony://")) return
+    if (!input.startsWith("emberharmony://")) return
     const url = new URL(input)
     if (url.hostname !== "open-project") return
     const directory = url.searchParams.get("directory")

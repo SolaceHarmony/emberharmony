@@ -351,7 +351,7 @@ export default function TermsOfService() {
                 claims, actions, suits procedures, costs, expenses, damages or liabilities arising out of use of, or in
                 any way related to your participation in, the Services. The EmberHarmony Parties make no representations
                 or warranties regarding suggestions or recommendations of services or products offered or purchased
-                through or in connection with the Services. THE SERVICES AND CONTENT ARE PROVIDED BY CODEHARMONY (AND ITS
+                through or in connection with the Services. THE SERVICES AND CONTENT ARE PROVIDED BY EMBERHARMONY (AND ITS
                 LICENSORS AND SUPPLIERS) ON AN "AS-IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
                 INCLUDING, WITHOUT LIMITATION, IMPLIED WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE,
                 NON-INFRINGEMENT, OR THAT USE OF THE SERVICES WILL BE UNINTERRUPTED OR ERROR-FREE. SOME STATES DO NOT
@@ -362,12 +362,12 @@ export default function TermsOfService() {
               <p>
                 TO THE FULLEST EXTENT ALLOWED BY APPLICABLE LAW, UNDER NO CIRCUMSTANCES AND UNDER NO LEGAL THEORY
                 (INCLUDING, WITHOUT LIMITATION, TORT, CONTRACT, STRICT LIABILITY, OR OTHERWISE) SHALL ANY OF THE
-                CODEHARMONY PARTIES BE LIABLE TO YOU OR TO ANY OTHER PERSON FOR (A) ANY INDIRECT, SPECIAL, INCIDENTAL,
+                EMBERHARMONY PARTIES BE LIABLE TO YOU OR TO ANY OTHER PERSON FOR (A) ANY INDIRECT, SPECIAL, INCIDENTAL,
                 PUNITIVE OR CONSEQUENTIAL DAMAGES OF ANY KIND, INCLUDING DAMAGES FOR LOST PROFITS, BUSINESS
                 INTERRUPTION, LOSS OF DATA, LOSS OF GOODWILL, WORK STOPPAGE, ACCURACY OF RESULTS, OR COMPUTER FAILURE OR
                 MALFUNCTION, (B) ANY SUBSTITUTE GOODS, SERVICES OR TECHNOLOGY, (C) ANY AMOUNT, IN THE AGGREGATE, IN
                 EXCESS OF THE GREATER OF (I) ONE-HUNDRED ($100) DOLLARS OR (II) THE AMOUNTS PAID AND/OR PAYABLE BY YOU
-                TO CODEHARMONY IN CONNECTION WITH THE SERVICES IN THE TWELVE (12) MONTH PERIOD PRECEDING THIS APPLICABLE
+                TO EMBERHARMONY IN CONNECTION WITH THE SERVICES IN THE TWELVE (12) MONTH PERIOD PRECEDING THIS APPLICABLE
                 CLAIM OR (D) ANY MATTER BEYOND OUR REASONABLE CONTROL. SOME STATES DO NOT ALLOW THE EXCLUSION OR
                 LIMITATION OF INCIDENTAL OR CONSEQUENTIAL OR CERTAIN OTHER DAMAGES, SO THE ABOVE LIMITATION AND
                 EXCLUSIONS MAY NOT APPLY TO YOU.
@@ -440,11 +440,11 @@ export default function TermsOfService() {
 
               <h4>Waiver of Jury Trial</h4>
               <p>
-                YOU AND CODEHARMONY WAIVE ANY CONSTITUTIONAL AND STATUTORY RIGHTS TO GO TO COURT AND HAVE A TRIAL IN FRONT
+                YOU AND EMBERHARMONY WAIVE ANY CONSTITUTIONAL AND STATUTORY RIGHTS TO GO TO COURT AND HAVE A TRIAL IN FRONT
                 OF A JUDGE OR JURY. You and EmberHarmony are instead choosing to have claims and disputes resolved by
                 arbitration. Arbitration procedures are typically more limited, more efficient, and less costly than
                 rules applicable in court and are subject to very limited review by a court. In any litigation between
-                you and EmberHarmony over whether to vacate or enforce an arbitration award, YOU AND CODEHARMONY WAIVE ALL
+                you and EmberHarmony over whether to vacate or enforce an arbitration award, YOU AND EMBERHARMONY WAIVE ALL
                 RIGHTS TO A JURY TRIAL, and elect instead to have the dispute be resolved by a judge.
               </p>
 

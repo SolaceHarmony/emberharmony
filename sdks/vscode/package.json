@@ -25,7 +25,7 @@
   "contributes": {
     "commands": [
       {
-        "command": "codeharmony.openTerminal",
+        "command": "emberharmony.openTerminal",
         "title": "Open EmberHarmony",
         "icon": {
           "light": "images/button-dark.svg",
@@ -33,7 +33,7 @@
         }
       },
       {
-        "command": "codeharmony.openNewTerminal",
+        "command": "emberharmony.openNewTerminal",
         "title": "Open EmberHarmony in new tab",
         "icon": {
           "light": "images/button-dark.svg",
@@ -41,21 +41,21 @@
         }
       },
       {
-        "command": "codeharmony.addFilepathToTerminal",
+        "command": "emberharmony.addFilepathToTerminal",
         "title": "Add Filepath to Terminal"
       }
     ],
     "menus": {
       "editor/title": [
         {
-          "command": "codeharmony.openNewTerminal",
+          "command": "emberharmony.openNewTerminal",
           "group": "navigation"
         }
       ]
     },
     "keybindings": [
       {
-        "command": "codeharmony.openTerminal",
+        "command": "emberharmony.openTerminal",
         "title": "Run EmberHarmony",
         "key": "cmd+escape",
         "mac": "cmd+escape",
@@ -63,7 +63,7 @@
         "linux": "ctrl+escape"
       },
       {
-        "command": "codeharmony.openNewTerminal",
+        "command": "emberharmony.openNewTerminal",
         "title": "Run EmberHarmony",
         "key": "cmd+shift+escape",
         "mac": "cmd+shift+escape",
@@ -71,7 +71,7 @@
         "linux": "ctrl+shift+escape"
       },
       {
-        "command": "codeharmony.addFilepathToTerminal",
+        "command": "emberharmony.addFilepathToTerminal",
         "title": "EmberHarmony: Insert At-Mentioned",
         "key": "cmd+alt+k",
         "mac": "cmd+alt+k",

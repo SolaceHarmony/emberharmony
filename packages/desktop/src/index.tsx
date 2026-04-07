@@ -43,7 +43,7 @@ window.getComputedStyle = ((elt: Element, pseudoElt?: string | null) => {
 
 let update: Update | null = null
 
-const deepLinkEvent = "codeharmony:deep-link"
+const deepLinkEvent = "emberharmony:deep-link"
 
 const emitDeepLinks = (urls: string[]) => {
   if (urls.length === 0) return
