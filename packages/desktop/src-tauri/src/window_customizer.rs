@@ -28,7 +28,7 @@ impl<R: Runtime> Plugin<R> for PinchZoomDisablePlugin {
                 // the gesture data is attached by WebKitGTK's C code, not Rust — it
                 // lacks TypeId metadata so the typed wrapper would always return None.
                 let obj: *mut gobject_ffi::GObject =
-                    _webview.inner().to_glib_none().0 as *mut _;
+                    ToGlibPtr::<*mut gobject_ffi::GObject>::to_glib_none(&_webview.inner()).0;
                 let data = gobject_ffi::g_object_get_data(
                     obj,
                     b"wk-view-zoom-gesture\0".as_ptr() as *const _,
