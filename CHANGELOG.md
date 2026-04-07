@@ -5,6 +5,12 @@ All notable changes to EmberHarmony will be documented in this file.
 This project is a fork of [opencode](https://github.com/opencode-ai/opencode),
 rebranded and maintained by [The Solace Project](https://github.com/SolaceHarmony).
 
+## [1.2.1] - 2026-04-07
+
+### Fixed
+- CI: quote scoped npm package name in publish workflow (unquoted `@` broke YAML parsing)
+- CI: make publish job wait for all Tauri desktop builds before finalizing the release
+
 ## [1.2.0] - 2026-04-06
 
 ### Added
