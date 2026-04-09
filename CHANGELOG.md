@@ -5,6 +5,33 @@ All notable changes to EmberHarmony will be documented in this file.
 This project is a fork of [opencode](https://github.com/opencode-ai/opencode),
 rebranded and maintained by [The Solace Project](https://github.com/SolaceHarmony).
 
+## [1.2.2] - 2026-04-09
+
+### Security
+- **13 upstream workflows removed** — inherited from opencode fork, exposed
+  `ANTHROPIC_API_KEY` and `EMBERHARMONY_API_KEY` to fork PRs via
+  `pull_request_target` without fork detection, and fetched unverified code
+  via `curl | bash` from the dev branch
+- **11 CVEs patched** in dependencies:
+  - hono 4.11.7 → 4.12.12 (serveStatic file access, cookie injection, prototype pollution)
+  - vite 7.1.11 → 7.3.2 (arbitrary file read via WebSocket, `server.fs.deny` bypass)
+  - drizzle-orm 0.41.0 → 0.45.2 (SQL injection via unescaped identifiers)
+  - fast-xml-parser 5.3.4 → 5.5.11 (entity expansion DoS, regex injection bypass)
+  - h3 → 1.15.11 (SSE injection, middleware bypass)
+  - undici → 7.22.0 (WebSocket DoS, request smuggling)
+  - file-type → 22.0.0 (infinite loop on malformed ASF input)
+- **Code injection closed** — removed `new Function()` eval in debug agent CLI
+- **Path traversal hardened** — `path.resolve()` normalization on server directory param
+- **CORS restricted** — enterprise API endpoint locked to known origins
+- **Open redirects blocked** — `window.location.href` assignments validate HTTPS
+- **CSP headers added** — `secureHeaders` middleware on Hono server
+- **GitHub Actions pinned** — all 13 workflow files use commit SHA references
+
+### Changed
+- README rewritten for EmberHarmony brand — removed dead links, stub package
+  manager commands, and incorrect upstream references; added provider support
+  section documenting Ollama auto-discovery
+
 ## [1.2.1] - 2026-04-07
 
 ### Fixed
