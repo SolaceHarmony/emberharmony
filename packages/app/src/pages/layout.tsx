@@ -1144,6 +1144,8 @@ export default function Layout(props: ParentProps) {
     if (url.hostname !== "open-project") return
     const directory = url.searchParams.get("directory")
     if (!directory) return
+    // Reject path traversal and relative paths (allow Windows drive letters)
+    if (directory.includes("..") || (!directory.startsWith("/") && !/^[a-zA-Z]:/.test(directory))) return
     return directory
   }
 

@@ -583,6 +583,7 @@ export async function POST(input: APIEvent) {
       return Response.json({ message: message ?? "done" }, { status: 200 })
     })
     .catch((error: any) => {
-      return Response.json({ message: error.message }, { status: 500 })
+      console.error("[stripe webhook]", error)
+      return Response.json({ message: "Internal server error" }, { status: 500 })
     })
 }

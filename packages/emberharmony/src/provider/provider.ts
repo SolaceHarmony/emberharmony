@@ -227,7 +227,17 @@ export namespace Provider {
       // Add custom endpoint if specified (endpoint takes precedence over baseURL)
       const endpoint = providerConfig?.options?.endpoint ?? providerConfig?.options?.baseURL
       if (endpoint) {
-        providerOptions.baseURL = endpoint
+        // Validate endpoint: must be http(s), no javascript: or data: schemes
+        try {
+          const parsed = new URL(endpoint)
+          if (!["http:", "https:"].includes(parsed.protocol)) {
+            console.warn("[provider] Custom endpoint rejected — only http/https allowed:", endpoint)
+          } else {
+            providerOptions.baseURL = endpoint
+          }
+        } catch {
+          console.warn("[provider] Custom endpoint rejected — invalid URL:", endpoint)
+        }
       }
 
       return {
@@ -327,6 +337,67 @@ export namespace Provider {
             "X-Title": "emberharmony",
           },
         },
+      }
+    },
+    ollama: async (provider) => {
+      // Auto-discover locally running Ollama models via the /api/tags endpoint.
+      const config = await Config.get()
+      const baseURL = config.provider?.["ollama"]?.options?.baseURL ?? "http://localhost:11434"
+
+      try {
+        const res = await fetch(`${baseURL}/api/tags`, {
+          signal: AbortSignal.timeout(1500),
+        })
+        if (!res.ok) return { autoload: false }
+        const data = (await res.json()) as { models?: Array<{ name: string; details?: { parameter_size?: string; family?: string; quantization_level?: string } }> }
+        if (!data.models?.length) return { autoload: false }
+
+        for (const m of data.models) {
+          const id = m.name
+          if (!id || id === "__proto__" || id === "constructor" || id === "prototype") continue
+          const details = m.details ?? {}
+          const paramSize = details.parameter_size ?? ""
+          const family = details.family ?? ""
+          const quant = details.quantization_level ?? ""
+          const displayName = [id, paramSize, quant].filter(Boolean).join(" · ")
+
+          provider.models[id] = {
+            id,
+            api: { id, npm: "@ai-sdk/openai-compatible", url: `${baseURL}/v1` },
+            name: displayName,
+            providerID: "ollama",
+            status: "active",
+            capabilities: {
+              temperature: true,
+              reasoning: false,
+              attachment: false,
+              toolcall: true,
+              input: { text: true, audio: false, image: false, video: false, pdf: false },
+              output: { text: true, audio: false, image: false, video: false, pdf: false },
+              interleaved: false,
+            },
+            cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+            options: {},
+            limit: { context: 0, output: 0 },
+            headers: {},
+            family,
+            release_date: "",
+            variants: {},
+          }
+        }
+
+        log.info("ollama: discovered " + data.models.length + " local models")
+
+        return {
+          autoload: true,
+          options: {
+            baseURL: `${baseURL}/v1`,
+            apiKey: "ollama",
+          },
+        }
+      } catch {
+        // Ollama not running — skip silently
+        return { autoload: false }
       }
     },
     vercel: async () => {
@@ -878,6 +949,18 @@ export namespace Provider {
       }
     }
 
+    // Inject local Ollama provider if not already in database
+    if (!database["ollama"] && !disabled.has("ollama")) {
+      database["ollama"] = {
+        id: "ollama",
+        name: "Ollama",
+        env: [],
+        options: {},
+        source: "custom",
+        models: {},
+      }
+    }
+
     for (const [providerID, fn] of Object.entries(CUSTOM_LOADERS)) {
       if (disabled.has(providerID)) continue
       const data = database[providerID]
@@ -1032,7 +1115,7 @@ export namespace Provider {
           })()
           throw new RequestFailedError({
             providerID: model.providerID,
-            url,
+            url: url ? url.split("?")[0] : undefined,
             error: error instanceof Error ? error.message : String(error),
           })
         })

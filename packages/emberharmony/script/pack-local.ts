@@ -3,6 +3,13 @@ import { $ } from "bun"
 import path from "path"
 import { fileURLToPath } from "url"
 
+// Ensure system package managers (npm) are reachable regardless of how
+// bun was launched — some environments (IDE plugins, preview tools)
+// use a minimal PATH that omits Homebrew / nvm / fnm directories.
+if (process.platform === "darwin" && !process.env.PATH?.includes("/opt/homebrew")) {
+  process.env.PATH = `/opt/homebrew/bin:${process.env.PATH}`
+}
+
 const main = async () => {
   const dir = fileURLToPath(new URL("..", import.meta.url))
   process.chdir(dir)

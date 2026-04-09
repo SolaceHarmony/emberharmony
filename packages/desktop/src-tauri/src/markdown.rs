@@ -45,7 +45,7 @@ pub fn parse_markdown(input: &str) -> String {
     options.extension.table = true;
     options.extension.tasklist = true;
     options.extension.autolink = true;
-    options.render.r#unsafe = true;
+    options.render.r#unsafe = false;
 
     let arena = Arena::new();
     let doc = parse_document(&arena, input, &options);
