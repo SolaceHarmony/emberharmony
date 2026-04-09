@@ -227,7 +227,17 @@ export namespace Provider {
       // Add custom endpoint if specified (endpoint takes precedence over baseURL)
       const endpoint = providerConfig?.options?.endpoint ?? providerConfig?.options?.baseURL
       if (endpoint) {
-        providerOptions.baseURL = endpoint
+        // Validate endpoint: must be http(s), no javascript: or data: schemes
+        try {
+          const parsed = new URL(endpoint)
+          if (!["http:", "https:"].includes(parsed.protocol)) {
+            console.warn("[provider] Custom endpoint rejected — only http/https allowed:", endpoint)
+          } else {
+            providerOptions.baseURL = endpoint
+          }
+        } catch {
+          console.warn("[provider] Custom endpoint rejected — invalid URL:", endpoint)
+        }
       }
 
       return {
@@ -1104,7 +1114,7 @@ export namespace Provider {
           })()
           throw new RequestFailedError({
             providerID: model.providerID,
-            url,
+            url: url ? url.split("?")[0] : undefined,
             error: error instanceof Error ? error.message : String(error),
           })
         })
