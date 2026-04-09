@@ -354,6 +354,7 @@ export namespace Provider {
 
         for (const m of data.models) {
           const id = m.name
+          if (!id || id === "__proto__" || id === "constructor" || id === "prototype") continue
           const details = m.details ?? {}
           const paramSize = details.parameter_size ?? ""
           const family = details.family ?? ""

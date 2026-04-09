@@ -28,7 +28,7 @@
     ],
     "withGlobalTauri": true,
     "security": {
-      "csp": "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; connect-src 'self' http://localhost:* http://127.0.0.1:* ws://localhost:* ws://127.0.0.1:* wss://localhost:* https://*.solace.ofharmony.ai tauri://localhost http://tauri.localhost; media-src 'self' data:"
+      "csp": "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; connect-src 'self' http://localhost:* http://127.0.0.1:* ws://localhost:* ws://127.0.0.1:* wss://localhost:* https://*.solace.ofharmony.ai https://github.com/SolaceHarmony/ tauri://localhost http://tauri.localhost; media-src 'self' data:"
     },
     "macOSPrivateApi": true
   },
