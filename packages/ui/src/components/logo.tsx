@@ -54,6 +54,8 @@ export const Splash = (props: { class?: string }) => {
 }
 
 export const Logo = (props: { class?: string }) => {
+  // Placeholder wordmark until a bespoke pixel-art "emberharmony" design lands.
+  // Uses a monospace system font to stay visually consistent with the Mark block.
   return (
     <svg
       xmlns="http://www.w3.org/2000/svg"
