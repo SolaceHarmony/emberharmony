@@ -10,7 +10,18 @@ const app = new Hono()
 
 app
   .basePath("/api")
-  .use(cors())
+  .use(
+    cors({
+      origin(input) {
+        if (!input) return undefined
+        if (input.startsWith("http://localhost:")) return input
+        if (input.startsWith("http://127.0.0.1:")) return input
+        if (input === "tauri://localhost" || input === "http://tauri.localhost") return input
+        if (/^https:\/\/([a-z0-9-]+\.)*solace\.ofharmony\.ai$/.test(input)) return input
+        return undefined
+      },
+    }),
+  )
   .get(
     "/doc",
     openAPIRouteHandler(app, {

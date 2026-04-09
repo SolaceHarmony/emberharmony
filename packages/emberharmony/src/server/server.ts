@@ -1,3 +1,4 @@
+import path from "node:path"
 import { BusEvent } from "@/bus/bus-event"
 import { Bus } from "@/bus"
 import { Log } from "../util/log"
@@ -191,6 +192,8 @@ export namespace Server {
           } catch {
             // fallback to original value
           }
+          // Normalize to an absolute path and reject traversal attempts
+          directory = path.resolve(directory)
           return Instance.provide({
             directory,
             init: InstanceBootstrap,

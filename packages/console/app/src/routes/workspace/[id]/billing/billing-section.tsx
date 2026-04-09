@@ -53,8 +53,10 @@ export function BillingSection() {
 
     const checkout = await checkoutAction(params.id!, amount, baseUrl, baseUrl)
     if (checkout && checkout.data) {
+      const url = checkout.data
+      if (!/^https:\/\//.test(url)) return
       setStore("checkoutRedirecting", true)
-      window.location.href = checkout.data
+      window.location.href = url
     }
   }
 
@@ -62,8 +64,10 @@ export function BillingSection() {
     const baseUrl = window.location.href
     const sessionUrl = await sessionAction(params.id!, baseUrl)
     if (sessionUrl && sessionUrl.data) {
+      const url = sessionUrl.data
+      if (!/^https:\/\//.test(url)) return
       setStore("sessionRedirecting", true)
-      window.location.href = sessionUrl.data
+      window.location.href = url
     }
   }
 
