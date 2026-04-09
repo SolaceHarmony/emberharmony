@@ -5,6 +5,7 @@ import { Log } from "../util/log"
 import { describeRoute, generateSpecs, validator, resolver, openAPIRouteHandler } from "hono-openapi"
 import { Hono } from "hono"
 import { cors } from "hono/cors"
+import { secureHeaders } from "hono/secure-headers"
 import { streamSSE } from "hono/streaming"
 import { proxy } from "hono/proxy"
 import { basicAuth } from "hono/basic-auth"
@@ -120,6 +121,18 @@ export namespace Server {
 
               return
             },
+          }),
+        )
+        .use(
+          secureHeaders({
+            contentSecurityPolicy: {
+              defaultSrc: ["'self'"],
+              scriptSrc: ["'self'"],
+              styleSrc: ["'self'", "'unsafe-inline'"],
+              connectSrc: ["'self'", "http://localhost:*", "http://127.0.0.1:*", "ws://localhost:*", "ws://127.0.0.1:*", "https://*.solace.ofharmony.ai"],
+              imgSrc: ["'self'", "data:", "https:"],
+            },
+            crossOriginEmbedderPolicy: false,
           }),
         )
         .route("/global", GlobalRoutes())
