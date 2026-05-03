@@ -281,17 +281,16 @@ download_with_progress() {
         exec 4>/dev/null
     fi
 
-    local tmp_dir=${TMPDIR:-/tmp}
-    local basename="${tmp_dir}/emberharmony_install_$$"
-    local tracefile="${basename}.trace"
+    local tracedir
+    tracedir=$(mktemp -d)
+    local tracefile="${tracedir}/trace"
 
-    rm -f "$tracefile"
     mkfifo "$tracefile"
 
     # Hide cursor
     printf "\033[?25l" >&4
 
-    trap "trap - RETURN; rm -f \"$tracefile\"; printf '\033[?25h' >&4; exec 4>&-" RETURN
+    trap "trap - RETURN; rm -rf \"$tracedir\"; printf '\033[?25h' >&4; exec 4>&-" RETURN
 
     (
         curl --trace-ascii "$tracefile" -s -L -o "$output" "$url"
@@ -331,14 +330,56 @@ download_with_progress() {
     return $ret
 }
 
+verify_checksum() {
+    local archive="$1"
+    local checksum_url="$2"
+    local sha_cmd
+
+    if command -v shasum >/dev/null 2>&1; then
+        sha_cmd="shasum -a 256"
+    elif command -v sha256sum >/dev/null 2>&1; then
+        sha_cmd="sha256sum"
+    else
+        echo -e "${ORANGE}Warning: No SHA256 tool found, skipping checksum verification${NC}" >&2
+        return 0
+    fi
+
+    local expected
+    expected=$(curl -fsSL "$checksum_url" | awk '{print $1}') || {
+        echo -e "${ORANGE}Warning: Could not fetch checksum, skipping verification${NC}" >&2
+        return 0
+    }
+    if [ -z "$expected" ]; then
+        echo -e "${ORANGE}Warning: Could not fetch checksum, skipping verification${NC}" >&2
+        return 0
+    fi
+
+    local actual
+    actual=$($sha_cmd "$archive" | awk '{print $1}')
+
+    if [ "$expected" != "$actual" ]; then
+        echo -e "${RED}Checksum mismatch! Aborting.${NC}" >&2
+        echo -e "${RED}Expected: $expected${NC}" >&2
+        echo -e "${RED}Actual:   $actual${NC}" >&2
+        return 1
+    fi
+
+    echo -e "${MUTED}Checksum verified.${NC}"
+}
+
 download_and_install() {
     print_message info "\n${MUTED}Installing ${NC}${APP} ${MUTED}version: ${NC}$specific_version"
-    local tmp_dir="${TMPDIR:-/tmp}/emberharmony_install_$$"
-    mkdir -p "$tmp_dir"
+    local tmp_dir
+    tmp_dir=$(mktemp -d)
 
     if [[ "$os" == "windows" ]] || ! [ -t 2 ] || ! download_with_progress "$url" "$tmp_dir/$filename"; then
         # Fallback to standard curl on Windows, non-TTY environments, or if custom progress fails
         curl -# -L -o "$tmp_dir/$filename" "$url"
+    fi
+
+    if ! verify_checksum "$tmp_dir/$filename" "${url}.sha256"; then
+        rm -rf "$tmp_dir"
+        exit 1
     fi
 
     if [ "$os" = "linux" ]; then
