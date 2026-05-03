@@ -115,6 +115,78 @@ describe("File.list path traversal protection", () => {
   })
 })
 
+describe("File.read symlink protection", () => {
+  test("rejects symlink pointing outside project directory", async () => {
+    await using tmp = await tmpdir({
+      init: async (dir) => {
+        // Create a file outside the project and a symlink inside pointing to it
+        await Bun.write(path.join(dir, "real.txt"), "inside project")
+        await fs.symlink("/etc/passwd", path.join(dir, "escape.txt"))
+      },
+    })
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        await expect(File.read("escape.txt")).rejects.toThrow("Access denied: path escapes project directory")
+      },
+    })
+  })
+
+  test("allows symlink within project directory", async () => {
+    await using tmp = await tmpdir({
+      init: async (dir) => {
+        await Bun.write(path.join(dir, "real.txt"), "real content")
+        await fs.symlink(path.join(dir, "real.txt"), path.join(dir, "link.txt"))
+      },
+    })
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const result = await File.read("link.txt")
+        expect(result.content).toBe("real content")
+      },
+    })
+  })
+})
+
+describe("File.list symlink protection", () => {
+  test("rejects symlinked directory pointing outside project", async () => {
+    await using tmp = await tmpdir({
+      init: async (dir) => {
+        await fs.symlink("/etc", path.join(dir, "escape"))
+      },
+    })
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        await expect(File.list("escape")).rejects.toThrow("Access denied: path escapes project directory")
+      },
+    })
+  })
+
+  test("allows symlinked directory within project", async () => {
+    await using tmp = await tmpdir({
+      init: async (dir) => {
+        await fs.mkdir(path.join(dir, "real"), { recursive: true })
+        await Bun.write(path.join(dir, "real", "file.txt"), "content")
+        await fs.symlink(path.join(dir, "real"), path.join(dir, "link"))
+      },
+    })
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const result = await File.list("link")
+        expect(Array.isArray(result)).toBe(true)
+        expect(result.some((n) => n.name === "file.txt")).toBe(true)
+      },
+    })
+  })
+})
+
 describe("Instance.containsPath", () => {
   test("returns true for path inside directory", async () => {
     await using tmp = await tmpdir({ git: true })
