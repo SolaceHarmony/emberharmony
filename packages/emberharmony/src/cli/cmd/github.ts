@@ -793,12 +793,13 @@ export const GithubRunCommand = cmd({
           const tag = m[0]
           const url = m[1]
           const start = m.index
-          const safeUrl = toAllowedAttachmentUrl(url)
-          if (!safeUrl) {
+          const safeUrlObj = toAllowedAttachmentUrl(url)
+          if (!safeUrlObj) {
             console.error(`Skipping non-allowed attachment URL: ${url}`)
             continue
           }
-          const filename = path.basename(new URL(safeUrl).pathname)
+          const safeUrl = safeUrlObj.toString()
+          const filename = path.basename(safeUrlObj.pathname)
 
           // Download image
           const res = await fetch(safeUrl, {
