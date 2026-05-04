@@ -1,6 +1,10 @@
 import { test, expect } from "../fixtures"
 import { promptSelector } from "../utils"
 
+// Skipped on CI: requires a configured LLM provider with real model credentials.
+// Run locally with provider credentials available.
+test.skip(!!process.env.CI, "Disabled in CI: requires access to a real model provider")
+
 test("smoke model selection updates prompt footer", async ({ page, gotoSession }) => {
   await gotoSession()
 
