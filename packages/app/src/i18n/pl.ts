@@ -1,3 +1,7 @@
+import { dict as en } from "./en"
+
+type Keys = keyof typeof en
+
 export const dict = {
   "command.category.suggested": "Sugerowane",
   "command.category.view": "Widok",
@@ -724,4 +728,4 @@ export const dict = {
   "workspace.reset.archived.one": "1 sesja zostanie zarchiwizowana.",
   "workspace.reset.archived.many": "{{count}} sesji zostanie zarchiwizowanych.",
   "workspace.reset.note": "To zresetuje przestrzeń roboczą, aby odpowiadała domyślnej gałęzi.",
-}
+} satisfies Partial<Record<Keys, string>>
