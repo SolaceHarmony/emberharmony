@@ -44,7 +44,7 @@ Sign nested code (frameworks, helpers, plugins) before the app. Prefer explicit 
 # Sign nested frameworks/helpers first (repeat for each nested item)
 codesign --force --options runtime --timestamp \
   --sign "Developer ID Application: Your Org (TEAMID)" \
-  "MyApp.app/Contents/Frameworks/Some.framework/Versions/A"
+  "MyApp.app/Contents/Frameworks/Some.framework"
 
 # Then sign the app bundle
 codesign --force --options runtime --timestamp \
