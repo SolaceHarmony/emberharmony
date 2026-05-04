@@ -1,6 +1,10 @@
 import { test, expect } from "../fixtures"
 import { modKey, promptSelector } from "../utils"
 
+// Skipped on CI: requires a configured LLM provider with real model credentials.
+// Run locally with provider credentials available.
+test.skip(!!process.env.CI, "Disabled in CI: requires access to a real model provider")
+
 test("hiding a model removes it from the model picker", async ({ page, gotoSession }) => {
   await gotoSession()
 

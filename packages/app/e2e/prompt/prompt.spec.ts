@@ -1,6 +1,10 @@
 import { test, expect } from "../fixtures"
 import { promptSelector } from "../utils"
 
+// Skipped on CI: requires a configured LLM provider and network access to complete prompt/reply flows.
+// Run locally with provider credentials available.
+test.skip(!!process.env.CI, "Disabled in CI: requires access to a real model provider")
+
 function sessionIDFromUrl(url: string) {
   const match = /\/session\/([^/?#]+)/.exec(url)
   return match?.[1]

@@ -1,6 +1,10 @@
 import { test, expect } from "../fixtures"
 import { promptSelector } from "../utils"
 
+// Skipped on CI: requires a configured LLM provider and network access to complete prompt flows.
+// Run locally with provider credentials available.
+test.skip(!!process.env.CI, "Disabled in CI: requires access to a real model provider")
+
 test("context panel can be opened from the prompt", async ({ page, sdk, gotoSession }) => {
   const title = `e2e smoke context ${Date.now()}`
   const created = await sdk.session.create({ title }).then((r) => r.data)
