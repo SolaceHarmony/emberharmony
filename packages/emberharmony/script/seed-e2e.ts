@@ -1,11 +1,51 @@
+import path from "path"
+
 const dir = process.env.EMBERHARMONY_E2E_PROJECT_DIR ?? process.cwd()
 const title = process.env.EMBERHARMONY_E2E_SESSION_TITLE ?? "E2E Session"
 const text = process.env.EMBERHARMONY_E2E_MESSAGE ?? "Seeded for UI e2e"
-const model = process.env.EMBERHARMONY_E2E_MODEL ?? "emberharmony/gpt-5-nano"
+const model = process.env.EMBERHARMONY_E2E_MODEL ?? "mock/mock-model"
 const parts = model.split("/")
-const providerID = parts[0] ?? "emberharmony"
-const modelID = parts[1] ?? "gpt-5-nano"
+const providerID = parts[0] ?? "mock"
+const modelID = parts[1] ?? "mock-model"
 const now = Date.now()
+
+// Write a mock provider config so E2E tests have models available without real credentials.
+// This config is only written when the config file does not already exist in the directory,
+// so it won't overwrite real project configurations.
+const configPath = path.join(dir, "emberharmony.json")
+const configExists = await Bun.file(configPath).exists()
+if (!configExists) {
+  const mockConfig = {
+    $schema: "https://solace.ofharmony.ai/config.json",
+    provider: {
+      mock: {
+        name: "Mock Provider",
+        npm: "@ai-sdk/openai-compatible",
+        env: [],
+        models: {
+          "mock-model": {
+            name: "Mock Model",
+            tool_call: true,
+            limit: { context: 16000, output: 4096 },
+          },
+          "mock-model-2": {
+            name: "Mock Model 2",
+            tool_call: true,
+            limit: { context: 16000, output: 4096 },
+          },
+        },
+        options: {
+          apiKey: "mock-key",
+          // baseURL is never called by model-picker/visibility E2E tests
+          // (they only list models, they don't send chat requests).
+          // Port 4097 is an arbitrary unused port; the URL is a valid placeholder.
+          baseURL: "http://127.0.0.1:4097/v1",
+        },
+      },
+    },
+  }
+  await Bun.write(configPath, JSON.stringify(mockConfig, null, 2))
+}
 
 const seed = async () => {
   const { Instance } = await import("../src/project/instance")
