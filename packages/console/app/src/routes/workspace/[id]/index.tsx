@@ -24,8 +24,10 @@ export default function () {
     const baseUrl = window.location.href
     const checkout = await checkoutAction(params.id!, billingInfo()!.reloadAmount, baseUrl, baseUrl)
     if (checkout && checkout.data) {
+      const url = checkout.data
+      if (!/^https:\/\//.test(url)) return
       setStore("checkoutRedirecting", true)
-      window.location.href = checkout.data
+      window.location.href = url
     }
   }
 

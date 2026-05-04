@@ -75,7 +75,7 @@ export namespace Filesystem {
           cwd: current,
           absolute: true,
           onlyFiles: true,
-          followSymlinks: true,
+          followSymlinks: false,
           dot: true,
         })) {
           result.push(match)

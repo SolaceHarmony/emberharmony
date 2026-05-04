@@ -32,7 +32,12 @@
     "notification:default",
     {
       "identifier": "http:default",
-      "allow": [{ "url": "http://*" }, { "url": "https://*" }, { "url": "http://*:*/*" }]
+      "allow": [
+        { "url": "http://127.0.0.1:*" },
+        { "url": "http://localhost:*" },
+        { "url": "https://*.solace.ofharmony.ai/*" },
+        { "url": "https://github.com/SolaceHarmony/*" }
+      ]
     }
   ]
 }

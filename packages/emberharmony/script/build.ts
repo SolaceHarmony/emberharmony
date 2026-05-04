@@ -201,11 +201,15 @@ if (Script.release) {
     const releaseName = key.replace(pkg.name, cliName)
     if (key.includes("linux")) {
       await $`tar -czf ../../${releaseName}.tar.gz *`.cwd(`dist/${key}/bin`)
+      const hash = (await $`sha256sum ./dist/${releaseName}.tar.gz`.text()).split(/\s+/)[0]
+      await Bun.write(`./dist/${releaseName}.tar.gz.sha256`, hash + "\n")
     } else {
       await $`zip -r ../../${releaseName}.zip *`.cwd(`dist/${key}/bin`)
+      const hash = (await $`sha256sum ./dist/${releaseName}.zip`.text()).split(/\s+/)[0]
+      await Bun.write(`./dist/${releaseName}.zip.sha256`, hash + "\n")
     }
   }
-  await $`gh release upload v${Script.version} ./dist/*.zip ./dist/*.tar.gz --clobber`
+  await $`gh release upload v${Script.version} ./dist/*.zip ./dist/*.tar.gz ./dist/*.sha256 --clobber`
 }
 
 export { binaries }
