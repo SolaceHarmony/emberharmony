@@ -776,13 +776,13 @@ export const GithubRunCommand = cmd({
         const matches = [...mdMatches, ...tagMatches].sort((a, b) => a.index - b.index)
         console.log("Images", JSON.stringify(matches, null, 2))
 
-        const toAllowedAttachmentUrl = (raw: string): string | null => {
+        const toAllowedAttachmentUrl = (raw: string): URL | null => {
           try {
             const parsed = new URL(raw)
             if (parsed.protocol !== "https:") return null
             if (parsed.hostname !== "github.com") return null
             if (!parsed.pathname.startsWith("/user-attachments/")) return null
-            return parsed.toString()
+            return parsed
           } catch {
             return null
           }
