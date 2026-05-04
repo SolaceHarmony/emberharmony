@@ -75,7 +75,7 @@ jobs:
           EMBERHARMONY_E2E_PROJECT_DIR: ${{ github.workspace }}
           EMBERHARMONY_E2E_SESSION_TITLE: "E2E Session"
           EMBERHARMONY_E2E_MESSAGE: "Seeded for UI e2e"
-          EMBERHARMONY_E2E_MODEL: "emberharmony/gpt-5-nano"
+          EMBERHARMONY_E2E_MODEL: "mock/mock-model"
 
       - name: Run EmberHarmony server
         if: matrix.settings.name != 'windows'
