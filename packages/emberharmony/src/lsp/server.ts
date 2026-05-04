@@ -948,6 +948,10 @@ export namespace LSPServer {
         log.error("clangd release did not include a tag name")
         return
       }
+      if (!/^[0-9A-Za-z._-]+$/.test(tag)) {
+        log.error("clangd release tag contains unsupported characters", { tag })
+        return
+      }
       const platform = process.platform
       const tokens: Record<string, string> = {
         darwin: "mac",
