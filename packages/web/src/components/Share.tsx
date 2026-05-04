@@ -2,11 +2,11 @@ import { For, Show, onMount, Suspense, onCleanup, createMemo, createSignal, Susp
 import { DateTime } from "luxon"
 import { createStore, reconcile, unwrap } from "solid-js/store"
 import { IconArrowDown } from "./icons"
-import { IconCodeHarmony } from "./icons/custom"
+import { IconEmberHarmony } from "./icons/custom"
 import styles from "./share.module.css"
-import type { MessageV2 } from "code-harmony/session/message-v2"
-import type { Message } from "code-harmony/session/message"
-import type { Session } from "code-harmony/session/index"
+import type { MessageV2 } from "emberharmony/session/message-v2"
+import type { Message } from "emberharmony/session/message"
+import type { Session } from "emberharmony/session/index"
 import { Part, ProviderIcon } from "./share/part"
 
 type MessageWithParts = MessageV2.Info & { parts: MessageV2.Part[] }
@@ -302,9 +302,9 @@ export default function Share(props: { id: string; api: string; info: Session.In
           <h1 data-component="header-title">{store.info?.title}</h1>
           <div data-component="header-details">
             <ul data-component="header-stats">
-              <li title="CodeHarmony version" data-slot="item">
-                <div data-slot="icon" title="CodeHarmony">
-                  <IconCodeHarmony width={16} height={16} />
+              <li title="EmberHarmony version" data-slot="item">
+                <div data-slot="icon" title="EmberHarmony">
+                  <IconEmberHarmony width={16} height={16} />
                 </div>
                 <Show when={store.info?.version} fallback="v0.0.1">
                   <span>v{store.info?.version}</span>

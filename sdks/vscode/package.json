@@ -1,12 +1,12 @@
 {
-  "name": "code-harmony",
-  "displayName": "CodeHarmony",
-  "description": "CodeHarmony for VS Code",
+  "name": "emberharmony",
+  "displayName": "EmberHarmony",
+  "description": "EmberHarmony for VS Code",
   "version": "1.0.0",
   "publisher": "thesolaceproject",
   "repository": {
     "type": "git",
-    "url": "https://github.com/sydneyrenee/code-harmony"
+    "url": "https://github.com/SolaceHarmony/emberharmony"
   },
   "license": "MIT",
   "icon": "images/icon.png",
@@ -25,54 +25,54 @@
   "contributes": {
     "commands": [
       {
-        "command": "codeharmony.openTerminal",
-        "title": "Open CodeHarmony",
+        "command": "emberharmony.openTerminal",
+        "title": "Open EmberHarmony",
         "icon": {
           "light": "images/button-dark.svg",
           "dark": "images/button-light.svg"
         }
       },
       {
-        "command": "codeharmony.openNewTerminal",
-        "title": "Open CodeHarmony in new tab",
+        "command": "emberharmony.openNewTerminal",
+        "title": "Open EmberHarmony in new tab",
         "icon": {
           "light": "images/button-dark.svg",
           "dark": "images/button-light.svg"
         }
       },
       {
-        "command": "codeharmony.addFilepathToTerminal",
+        "command": "emberharmony.addFilepathToTerminal",
         "title": "Add Filepath to Terminal"
       }
     ],
     "menus": {
       "editor/title": [
         {
-          "command": "codeharmony.openNewTerminal",
+          "command": "emberharmony.openNewTerminal",
           "group": "navigation"
         }
       ]
     },
     "keybindings": [
       {
-        "command": "codeharmony.openTerminal",
-        "title": "Run CodeHarmony",
+        "command": "emberharmony.openTerminal",
+        "title": "Run EmberHarmony",
         "key": "cmd+escape",
         "mac": "cmd+escape",
         "win": "ctrl+escape",
         "linux": "ctrl+escape"
       },
       {
-        "command": "codeharmony.openNewTerminal",
-        "title": "Run CodeHarmony",
+        "command": "emberharmony.openNewTerminal",
+        "title": "Run EmberHarmony",
         "key": "cmd+shift+escape",
         "mac": "cmd+shift+escape",
         "win": "ctrl+shift+escape",
         "linux": "ctrl+shift+escape"
       },
       {
-        "command": "codeharmony.addFilepathToTerminal",
-        "title": "CodeHarmony: Insert At-Mentioned",
+        "command": "emberharmony.addFilepathToTerminal",
+        "title": "EmberHarmony: Insert At-Mentioned",
         "key": "cmd+alt+k",
         "mac": "cmd+alt+k",
         "win": "ctrl+alt+K",

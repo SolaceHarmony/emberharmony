@@ -1,10 +1,10 @@
 import { createStore } from "solid-js/store"
-import { createSimpleContext } from "@thesolaceproject/code-harmony-ui/context"
+import { createSimpleContext } from "@thesolaceproject/emberharmony-ui/context"
 import { batch, createMemo, createRoot, onCleanup } from "solid-js"
 import { useParams } from "@solidjs/router"
 import type { FileSelection } from "@/context/file"
 import { Persist, persisted } from "@/utils/persist"
-import { checksum } from "@thesolaceproject/code-harmony-util/encode"
+import { checksum } from "@thesolaceproject/emberharmony-util/encode"
 
 interface PartBase {
   content: string

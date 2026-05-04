@@ -17,11 +17,11 @@ import {
   type VcsInfo,
   type PermissionRequest,
   type QuestionRequest,
-  createCodeHarmonyClient,
-} from "@thesolaceproject/code-harmony-sdk/v2/client"
+  createEmberHarmonyClient,
+} from "@thesolaceproject/emberharmony-sdk/v2/client"
 import { createStore, produce, reconcile, type SetStoreFunction, type Store } from "solid-js/store"
-import { Binary } from "@thesolaceproject/code-harmony-util/binary"
-import { retry } from "@thesolaceproject/code-harmony-util/retry"
+import { Binary } from "@thesolaceproject/emberharmony-util/binary"
+import { retry } from "@thesolaceproject/emberharmony-util/retry"
 import { useGlobalSDK } from "./global-sdk"
 import type { InitError } from "../pages/error"
 import {
@@ -39,8 +39,8 @@ import {
   Switch,
   Match,
 } from "solid-js"
-import { showToast } from "@thesolaceproject/code-harmony-ui/toast"
-import { getFilename } from "@thesolaceproject/code-harmony-util/path"
+import { showToast } from "@thesolaceproject/emberharmony-ui/toast"
+import { getFilename } from "@thesolaceproject/emberharmony-util/path"
 import { usePlatform } from "./platform"
 import { useLanguage } from "@/context/language"
 import { Persist, persisted } from "@/utils/persist"
@@ -139,12 +139,12 @@ function createGlobalSync() {
   const metaCache = new Map<string, MetaCache>()
   const iconCache = new Map<string, IconCache>()
 
-  const sdkCache = new Map<string, ReturnType<typeof createCodeHarmonyClient>>()
+  const sdkCache = new Map<string, ReturnType<typeof createEmberHarmonyClient>>()
   const sdkFor = (directory: string) => {
     const cached = sdkCache.get(directory)
     if (cached) return cached
 
-    const sdk = createCodeHarmonyClient({
+    const sdk = createEmberHarmonyClient({
       baseUrl: globalSDK.url,
       fetch: platform.fetch,
       directory,
@@ -984,7 +984,7 @@ function createGlobalSync() {
         globalSDK.client.project.list().then(async (x) => {
           const projects = (x.data ?? [])
             .filter((p) => !!p?.id)
-            .filter((p) => !!p.worktree && !p.worktree.includes("code-harmony-test"))
+            .filter((p) => !!p.worktree && !p.worktree.includes("emberharmony-test"))
             .slice()
             .sort((a, b) => a.id.localeCompare(b.id))
           setGlobalStore("project", projects)

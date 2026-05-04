@@ -3,9 +3,9 @@ title: Keybinds
 description: Customize your keybinds.
 ---
 
-CodeHarmony has a list of keybinds that you can customize through the CodeHarmony config.
+EmberHarmony has a list of keybinds that you can customize through the EmberHarmony config.
 
-```json title="code-harmony.json"
+```json title="emberharmony.json"
 {
   "$schema": "https://solace.ofharmony.ai/config.json",
   "keybinds": {
@@ -106,7 +106,7 @@ CodeHarmony has a list of keybinds that you can customize through the CodeHarmon
 
 ## Leader key
 
-CodeHarmony uses a `leader` key for most keybinds. This avoids conflicts in your terminal.
+EmberHarmony uses a `leader` key for most keybinds. This avoids conflicts in your terminal.
 
 By default, `ctrl+x` is the leader key and most actions require you to first press the leader key and then the shortcut. For example, to start a new session you first press `ctrl+x` and then press `n`.
 
@@ -118,7 +118,7 @@ You don't need to use a leader key for your keybinds but we recommend doing so.
 
 You can disable a keybind by adding the key to your config with a value of "none".
 
-```json title="code-harmony.json"
+```json title="emberharmony.json"
 {
   "$schema": "https://solace.ofharmony.ai/config.json",
   "keybinds": {
@@ -131,7 +131,7 @@ You can disable a keybind by adding the key to your config with a value of "none
 
 ## Desktop prompt shortcuts
 
-The CodeHarmony desktop app prompt input supports common Readline/Emacs-style shortcuts for editing text. These are built-in and currently not configurable via `code-harmony.json`.
+The EmberHarmony desktop app prompt input supports common Readline/Emacs-style shortcuts for editing text. These are built-in and currently not configurable via `emberharmony.json`.
 
 | Shortcut | Action                                   |
 | -------- | ---------------------------------------- |

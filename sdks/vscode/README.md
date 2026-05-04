@@ -1,21 +1,21 @@
-# CodeHarmony VS Code Extension
+# EmberHarmony VS Code Extension
 
-A Visual Studio Code extension that integrates CodeHarmony directly into your development workflow.
+A Visual Studio Code extension that integrates EmberHarmony directly into your development workflow.
 
 ## Prerequisites
 
-This extension requires the `code-harmony` CLI to be installed on your system.
+This extension requires the `emberharmony` CLI to be installed on your system.
 
 ## Features
 
-- **Quick Launch**: Use `Cmd+Esc` (Mac) or `Ctrl+Esc` (Windows/Linux) to open CodeHarmony in a split terminal view, or focus an existing terminal session if one is already running.
-- **New Session**: Use `Cmd+Shift+Esc` (Mac) or `Ctrl+Shift+Esc` (Windows/Linux) to start a new CodeHarmony terminal session, even if one is already open.
-- **Context Awareness**: Automatically share your current selection or tab with CodeHarmony.
+- **Quick Launch**: Use `Cmd+Esc` (Mac) or `Ctrl+Esc` (Windows/Linux) to open EmberHarmony in a split terminal view, or focus an existing terminal session if one is already running.
+- **New Session**: Use `Cmd+Shift+Esc` (Mac) or `Ctrl+Shift+Esc` (Windows/Linux) to start a new EmberHarmony terminal session, even if one is already open.
+- **Context Awareness**: Automatically share your current selection or tab with EmberHarmony.
 - **File Reference Shortcuts**: Use `Cmd+Option+K` (Mac) or `Alt+Ctrl+K` (Linux/Windows) to insert file references. For example, `@File#L37-42`.
 
 ## Support
 
-This is an early release. If you encounter issues or have feedback, please create an issue at https://github.com/sydneyrenee/code-harmony/issues.
+This is an early release. If you encounter issues or have feedback, please create an issue at https://github.com/SolaceHarmony/emberharmony/issues.
 
 ## Development
 

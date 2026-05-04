@@ -1,12 +1,12 @@
-import { Dialog } from "@thesolaceproject/code-harmony-ui/dialog"
-import { List } from "@thesolaceproject/code-harmony-ui/list"
-import { Switch } from "@thesolaceproject/code-harmony-ui/switch"
-import { Button } from "@thesolaceproject/code-harmony-ui/button"
+import { Dialog } from "@thesolaceproject/emberharmony-ui/dialog"
+import { List } from "@thesolaceproject/emberharmony-ui/list"
+import { Switch } from "@thesolaceproject/emberharmony-ui/switch"
+import { Button } from "@thesolaceproject/emberharmony-ui/button"
 import type { Component } from "solid-js"
 import { useLocal } from "@/context/local"
 import { popularProviders } from "@/hooks/use-providers"
 import { useLanguage } from "@/context/language"
-import { useDialog } from "@thesolaceproject/code-harmony-ui/context/dialog"
+import { useDialog } from "@thesolaceproject/emberharmony-ui/context/dialog"
 import { DialogSelectProvider } from "./dialog-select-provider"
 
 export const DialogManageModels: Component = () => {

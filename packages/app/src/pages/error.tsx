@@ -1,11 +1,11 @@
-import { TextField } from "@thesolaceproject/code-harmony-ui/text-field"
-import { Logo } from "@thesolaceproject/code-harmony-ui/logo"
-import { Button } from "@thesolaceproject/code-harmony-ui/button"
+import { TextField } from "@thesolaceproject/emberharmony-ui/text-field"
+import { Logo } from "@thesolaceproject/emberharmony-ui/logo"
+import { Button } from "@thesolaceproject/emberharmony-ui/button"
 import { Component, Show } from "solid-js"
 import { createStore } from "solid-js/store"
 import { usePlatform } from "@/context/platform"
 import { useLanguage } from "@/context/language"
-import { Icon } from "@thesolaceproject/code-harmony-ui/icon"
+import { Icon } from "@thesolaceproject/emberharmony-ui/icon"
 
 export type InitError = {
   name: string

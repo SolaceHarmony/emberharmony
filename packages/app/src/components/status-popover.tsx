@@ -1,27 +1,27 @@
 import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js"
 import { createStore, reconcile } from "solid-js/store"
 import { useNavigate } from "@solidjs/router"
-import { useDialog } from "@thesolaceproject/code-harmony-ui/context/dialog"
-import { Popover } from "@thesolaceproject/code-harmony-ui/popover"
-import { Tabs } from "@thesolaceproject/code-harmony-ui/tabs"
-import { Button } from "@thesolaceproject/code-harmony-ui/button"
-import { Switch } from "@thesolaceproject/code-harmony-ui/switch"
-import { Icon } from "@thesolaceproject/code-harmony-ui/icon"
-import { Tooltip } from "@thesolaceproject/code-harmony-ui/tooltip"
+import { useDialog } from "@thesolaceproject/emberharmony-ui/context/dialog"
+import { Popover } from "@thesolaceproject/emberharmony-ui/popover"
+import { Tabs } from "@thesolaceproject/emberharmony-ui/tabs"
+import { Button } from "@thesolaceproject/emberharmony-ui/button"
+import { Switch } from "@thesolaceproject/emberharmony-ui/switch"
+import { Icon } from "@thesolaceproject/emberharmony-ui/icon"
+import { Tooltip } from "@thesolaceproject/emberharmony-ui/tooltip"
 import { useSync } from "@/context/sync"
 import { useSDK } from "@/context/sdk"
 import { normalizeServerUrl, serverDisplayName, useServer } from "@/context/server"
 import { usePlatform } from "@/context/platform"
 import { useLanguage } from "@/context/language"
-import { createCodeHarmonyClient } from "@thesolaceproject/code-harmony-sdk/v2/client"
+import { createEmberHarmonyClient } from "@thesolaceproject/emberharmony-sdk/v2/client"
 import { DialogSelectServer } from "./dialog-select-server"
-import { showToast } from "@thesolaceproject/code-harmony-ui/toast"
+import { showToast } from "@thesolaceproject/emberharmony-ui/toast"
 
 type ServerStatus = { healthy: boolean; version?: string }
 
 async function checkHealth(url: string, platform: ReturnType<typeof usePlatform>): Promise<ServerStatus> {
   const signal = (AbortSignal as unknown as { timeout?: (ms: number) => AbortSignal }).timeout?.(3000)
-  const sdk = createCodeHarmonyClient({
+  const sdk = createEmberHarmonyClient({
     baseUrl: url,
     fetch: platform.fetch,
     signal,
@@ -387,7 +387,7 @@ export function StatusPopover() {
                     <div class="text-14-regular text-text-base text-center my-auto">
                       {(() => {
                         const value = language.t("dialog.plugins.empty")
-                        const file = "code-harmony.json"
+                        const file = "emberharmony.json"
                         const parts = value.split(file)
                         if (parts.length === 1) return value
                         return (

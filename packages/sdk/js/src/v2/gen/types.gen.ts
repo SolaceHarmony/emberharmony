@@ -1316,7 +1316,7 @@ export type KeybindsConfig = {
 export type LogLevel = "DEBUG" | "INFO" | "WARN" | "ERROR"
 
 /**
- * Server configuration for code-harmony serve and web commands
+ * Server configuration for emberharmony serve and web commands
  */
 export type ServerConfig = {
   /**

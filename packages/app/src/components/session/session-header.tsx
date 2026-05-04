@@ -8,16 +8,16 @@ import { useLanguage } from "@/context/language"
 import { usePlatform } from "@/context/platform"
 import { useSync } from "@/context/sync"
 import { useGlobalSDK } from "@/context/global-sdk"
-import { getFilename } from "@thesolaceproject/code-harmony-util/path"
+import { getFilename } from "@thesolaceproject/emberharmony-util/path"
 import { decode64 } from "@/utils/base64"
 
-import { Icon } from "@thesolaceproject/code-harmony-ui/icon"
-import { IconButton } from "@thesolaceproject/code-harmony-ui/icon-button"
-import { Button } from "@thesolaceproject/code-harmony-ui/button"
-import { Tooltip, TooltipKeybind } from "@thesolaceproject/code-harmony-ui/tooltip"
-import { Popover } from "@thesolaceproject/code-harmony-ui/popover"
-import { TextField } from "@thesolaceproject/code-harmony-ui/text-field"
-import { Keybind } from "@thesolaceproject/code-harmony-ui/keybind"
+import { Icon } from "@thesolaceproject/emberharmony-ui/icon"
+import { IconButton } from "@thesolaceproject/emberharmony-ui/icon-button"
+import { Button } from "@thesolaceproject/emberharmony-ui/button"
+import { Tooltip, TooltipKeybind } from "@thesolaceproject/emberharmony-ui/tooltip"
+import { Popover } from "@thesolaceproject/emberharmony-ui/popover"
+import { TextField } from "@thesolaceproject/emberharmony-ui/text-field"
+import { Keybind } from "@thesolaceproject/emberharmony-ui/keybind"
 import { StatusPopover } from "../status-popover"
 
 export function SessionHeader() {
@@ -120,8 +120,8 @@ export function SessionHeader() {
     platform.openLink(url)
   }
 
-  const centerMount = createMemo(() => document.getElementById("code-harmony-titlebar-center"))
-  const rightMount = createMemo(() => document.getElementById("code-harmony-titlebar-right"))
+  const centerMount = createMemo(() => document.getElementById("emberharmony-titlebar-center"))
+  const rightMount = createMemo(() => document.getElementById("emberharmony-titlebar-right"))
 
   return (
     <>

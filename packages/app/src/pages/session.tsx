@@ -19,19 +19,19 @@ import { selectionFromLines, useFile, type FileSelection, type SelectedLineRange
 import { createStore } from "solid-js/store"
 import { PromptInput } from "@/components/prompt-input"
 import { SessionContextUsage } from "@/components/session-context-usage"
-import { IconButton } from "@thesolaceproject/code-harmony-ui/icon-button"
-import { Button } from "@thesolaceproject/code-harmony-ui/button"
-import { Icon } from "@thesolaceproject/code-harmony-ui/icon"
-import { Tooltip, TooltipKeybind } from "@thesolaceproject/code-harmony-ui/tooltip"
-import { ResizeHandle } from "@thesolaceproject/code-harmony-ui/resize-handle"
-import { Tabs } from "@thesolaceproject/code-harmony-ui/tabs"
-import { useCodeComponent } from "@thesolaceproject/code-harmony-ui/context/code"
-import { LineComment as LineCommentView, LineCommentEditor } from "@thesolaceproject/code-harmony-ui/line-comment"
-import { SessionTurn } from "@thesolaceproject/code-harmony-ui/session-turn"
-import { BasicTool } from "@thesolaceproject/code-harmony-ui/basic-tool"
-import { createAutoScroll } from "@thesolaceproject/code-harmony-ui/hooks"
-import { SessionReview } from "@thesolaceproject/code-harmony-ui/session-review"
-import { Mark } from "@thesolaceproject/code-harmony-ui/logo"
+import { IconButton } from "@thesolaceproject/emberharmony-ui/icon-button"
+import { Button } from "@thesolaceproject/emberharmony-ui/button"
+import { Icon } from "@thesolaceproject/emberharmony-ui/icon"
+import { Tooltip, TooltipKeybind } from "@thesolaceproject/emberharmony-ui/tooltip"
+import { ResizeHandle } from "@thesolaceproject/emberharmony-ui/resize-handle"
+import { Tabs } from "@thesolaceproject/emberharmony-ui/tabs"
+import { useCodeComponent } from "@thesolaceproject/emberharmony-ui/context/code"
+import { LineComment as LineCommentView, LineCommentEditor } from "@thesolaceproject/emberharmony-ui/line-comment"
+import { SessionTurn } from "@thesolaceproject/emberharmony-ui/session-turn"
+import { BasicTool } from "@thesolaceproject/emberharmony-ui/basic-tool"
+import { createAutoScroll } from "@thesolaceproject/emberharmony-ui/hooks"
+import { SessionReview } from "@thesolaceproject/emberharmony-ui/session-review"
+import { Mark } from "@thesolaceproject/emberharmony-ui/logo"
 
 import { DragDropProvider, DragDropSensors, DragOverlay, SortableProvider, closestCenter } from "@thisbeyond/solid-dnd"
 import type { DragEvent } from "@thisbeyond/solid-dnd"
@@ -39,9 +39,9 @@ import { useSync } from "@/context/sync"
 import { useTerminal, type LocalPTY } from "@/context/terminal"
 import { useLayout } from "@/context/layout"
 import { Terminal } from "@/components/terminal"
-import { checksum, base64Encode } from "@thesolaceproject/code-harmony-util/encode"
-import { findLast } from "@thesolaceproject/code-harmony-util/array"
-import { useDialog } from "@thesolaceproject/code-harmony-ui/context/dialog"
+import { checksum, base64Encode } from "@thesolaceproject/emberharmony-util/encode"
+import { findLast } from "@thesolaceproject/emberharmony-util/array"
+import { useDialog } from "@thesolaceproject/emberharmony-ui/context/dialog"
 import { DialogSelectFile } from "@/components/dialog-select-file"
 import FileTree from "@/components/file-tree"
 import { DialogSelectModel } from "@/components/dialog-select-model"
@@ -50,8 +50,8 @@ import { DialogFork } from "@/components/dialog-fork"
 import { useCommand } from "@/context/command"
 import { useLanguage } from "@/context/language"
 import { useNavigate, useParams } from "@solidjs/router"
-import { UserMessage } from "@thesolaceproject/code-harmony-sdk/v2"
-import type { FileDiff } from "@thesolaceproject/code-harmony-sdk/v2/client"
+import { UserMessage } from "@thesolaceproject/emberharmony-sdk/v2"
+import type { FileDiff } from "@thesolaceproject/emberharmony-sdk/v2/client"
 import { useSDK } from "@/context/sdk"
 import { usePrompt } from "@/context/prompt"
 import { useComments, type LineComment } from "@/context/comments"
@@ -59,7 +59,7 @@ import { extractPromptFromParts } from "@/utils/prompt"
 import { ConstrainDragYAxis, getDraggableId } from "@/utils/solid-dnd"
 import { usePermission } from "@/context/permission"
 import { decode64 } from "@/utils/base64"
-import { showToast } from "@thesolaceproject/code-harmony-ui/toast"
+import { showToast } from "@thesolaceproject/emberharmony-ui/toast"
 import {
   SessionHeader,
   SessionContextTab,
@@ -1458,7 +1458,7 @@ export default function Page() {
   createEffect(() => {
     const sessionID = params.id
     if (!sessionID) return
-    const raw = sessionStorage.getItem("code-harmony.pendingMessage")
+    const raw = sessionStorage.getItem("emberharmony.pendingMessage")
     if (!raw) return
     const parts = raw.split("|")
     const pendingSessionID = parts[0]
@@ -1466,7 +1466,7 @@ export default function Page() {
     if (!pendingSessionID || !messageID) return
     if (pendingSessionID !== sessionID) return
 
-    sessionStorage.removeItem("code-harmony.pendingMessage")
+    sessionStorage.removeItem("emberharmony.pendingMessage")
     setUi("pendingMessage", messageID)
   })
 

@@ -1,12 +1,12 @@
 {
-  "name": "@thesolaceproject/code-harmony-console-mail",
-  "version": "1.0.0",
+  "name": "@thesolaceproject/emberharmony-console-mail",
+  "version": "1.2.2",
   "dependencies": {
     "@jsx-email/all": "2.2.3",
     "@jsx-email/cli": "1.4.3",
     "@tsconfig/bun": "1.0.9",
-    "@types/react": "18.0.25",
-    "react": "18.2.0",
+    "@types/react": "18.3.28",
+    "react": "18.3.1",
     "solid-js": "catalog:"
   },
   "exports": {

@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "CodeHarmony",
+  "productName": "EmberHarmony",
   "identifier": "ai.ofharmony.code",
   "bundle": {
     "createUpdaterArtifacts": true,
@@ -27,7 +27,7 @@
   "plugins": {
     "updater": {
       "pubkey": "__SET_TAURI_UPDATER_PUBKEY_AT_BUILD_TIME__",
-      "endpoints": ["https://github.com/sydneyrenee/code-harmony/releases/latest/download/latest.json"]
+      "endpoints": ["https://github.com/SolaceHarmony/emberharmony/releases/latest/download/latest.json"]
     }
   }
 }

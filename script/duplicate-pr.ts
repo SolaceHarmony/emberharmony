@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 
 import path from "path"
-import { createCodeHarmony } from "@thesolaceproject/code-harmony-sdk"
+import { createEmberHarmony } from "@thesolaceproject/emberharmony-sdk"
 import { parseArgs } from "util"
 
 async function main() {
@@ -34,7 +34,7 @@ Examples:
     process.exit(1)
   }
 
-  const harmony = await createCodeHarmony({ port: 0 })
+  const harmony = await createEmberHarmony({ port: 0 })
 
   try {
     const parts: Array<{ type: "text"; text: string } | { type: "file"; url: string; filename: string; mime: string }> =

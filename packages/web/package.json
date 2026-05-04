@@ -1,8 +1,8 @@
 {
-  "name": "@thesolaceproject/code-harmony-web",
+  "name": "@thesolaceproject/emberharmony-web",
   "type": "module",
   "license": "MIT",
-  "version": "1.0.0",
+  "version": "1.2.2",
   "scripts": {
     "dev": "astro dev",
     "dev:remote": "VITE_API_URL=https://api.solace.ofharmony.ai astro dev",
@@ -20,7 +20,7 @@
     "@shikijs/transformers": "3.4.2",
     "@types/luxon": "catalog:",
     "ai": "catalog:",
-    "astro": "5.15.9",
+    "astro": "5.18.1",
     "diff": "catalog:",
     "js-base64": "3.7.7",
     "lang-map": "0.4.0",
@@ -34,7 +34,7 @@
     "toolbeam-docs-theme": "0.4.8"
   },
   "devDependencies": {
-    "code-harmony": "workspace:*",
+    "emberharmony": "workspace:*",
     "@types/node": "catalog:",
     "typescript": "catalog:"
   }

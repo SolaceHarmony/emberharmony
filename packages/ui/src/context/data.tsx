@@ -7,7 +7,7 @@ import type {
   PermissionRequest,
   QuestionRequest,
   QuestionAnswer,
-} from "@thesolaceproject/code-harmony-sdk/v2"
+} from "@thesolaceproject/emberharmony-sdk/v2"
 import { createSimpleContext } from "./helper"
 import { PreloadMultiFileDiffResult } from "@pierre/diffs/ssr"
 

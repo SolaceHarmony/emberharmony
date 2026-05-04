@@ -1,22 +1,22 @@
 ---
 title: TUI
-description: Using the CodeHarmony terminal user interface.
+description: Using the EmberHarmony terminal user interface.
 ---
 
 import { Tabs, TabItem } from "@astrojs/starlight/components"
 
-CodeHarmony provides an interactive terminal interface or TUI for working on your projects with an LLM.
+EmberHarmony provides an interactive terminal interface or TUI for working on your projects with an LLM.
 
-Running CodeHarmony starts the TUI for the current directory.
+Running EmberHarmony starts the TUI for the current directory.
 
 ```bash
-code-harmony
+emberharmony
 ```
 
 Or you can start it for a specific working directory.
 
 ```bash
-code-harmony /path/to/project
+emberharmony /path/to/project
 ```
 
 Once you're in the TUI, you can prompt it with a message.
@@ -57,7 +57,7 @@ The output of the command is added to the conversation as a tool result.
 
 ## Commands
 
-When using the CodeHarmony TUI, you can type `/` followed by a command name to quickly execute actions. For example:
+When using the EmberHarmony TUI, you can type `/` followed by a command name to quickly execute actions. For example:
 
 ```bash frame="none"
 /help
@@ -71,7 +71,7 @@ Here are all available slash commands:
 
 ### connect
 
-Add a provider to CodeHarmony. Allows you to select from available providers and add their API keys.
+Add a provider to EmberHarmony. Allows you to select from available providers and add their API keys.
 
 ```bash frame="none"
 /connect
@@ -117,7 +117,7 @@ Open external editor for composing messages. Uses the editor set in your `EDITOR
 
 ### exit
 
-Exit CodeHarmony. _Aliases_: `/quit`, `/q`
+Exit EmberHarmony. _Aliases_: `/quit`, `/q`
 
 ```bash frame="none"
 /exit
@@ -355,9 +355,9 @@ Some editors need command-line arguments to run in blocking mode. The `--wait` f
 
 ## Configure
 
-You can customize TUI behavior through your CodeHarmony config file.
+You can customize TUI behavior through your EmberHarmony config file.
 
-```json title="code-harmony.json"
+```json title="emberharmony.json"
 {
   "$schema": "https://solace.ofharmony.ai/config.json",
   "tui": {

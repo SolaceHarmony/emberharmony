@@ -6,11 +6,11 @@
       "dependsOn": ["^build"],
       "outputs": ["dist/**"]
     },
-    "code-harmony#test": {
+    "emberharmony#test": {
       "dependsOn": ["^build"],
       "outputs": []
     },
-    "@thesolaceproject/code-harmony-app#test": {
+    "@thesolaceproject/emberharmony-app#test": {
       "dependsOn": ["^build"],
       "outputs": []
     }

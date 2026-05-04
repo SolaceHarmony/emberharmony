@@ -1,5 +1,5 @@
-import { Database, eq, and, sql, inArray } from "@thesolaceproject/code-harmony-console-core/drizzle/index.js"
-import { IpRateLimitTable } from "@thesolaceproject/code-harmony-console-core/schema/ip.sql.js"
+import { Database, eq, and, sql, inArray } from "@thesolaceproject/emberharmony-console-core/drizzle/index.js"
+import { IpRateLimitTable } from "@thesolaceproject/emberharmony-console-core/schema/ip.sql.js"
 import { RateLimitError } from "./error"
 import { logger } from "./logger"
 

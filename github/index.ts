@@ -6,7 +6,7 @@ import * as core from "@actions/core"
 import * as github from "@actions/github"
 import type { Context as GitHubContext } from "@actions/github/lib/context"
 import type { IssueCommentEvent, PullRequestReviewCommentEvent } from "@octokit/webhooks-types"
-import { createCodeHarmonyClient } from "@thesolaceproject/code-harmony-sdk"
+import { createEmberHarmonyClient } from "@thesolaceproject/emberharmony-sdk"
 import { spawn } from "node:child_process"
 
 type GitHubAuthor = {
@@ -141,7 +141,7 @@ try {
   const comment = await createComment()
   commentId = comment.data.id
 
-  // Setup CodeHarmony session
+  // Setup EmberHarmony session
   const repoData = await fetchRepo()
   session = await client.session.create<true>().then((r) => r.data)
   await subscribeSessionEvents()
@@ -151,7 +151,7 @@ try {
     await client.session.share<true>({ path: session })
     return session.id.slice(-8)
   })()
-  console.log("code-harmony session", session.id)
+  console.log("emberharmony session", session.id)
   if (shareId) {
     console.log("Share link:", `${useShareUrl()}/s/${shareId}`)
   }
@@ -230,8 +230,8 @@ function create() {
   const host = "127.0.0.1"
   const port = 4096
   const url = `http://${host}:${port}`
-  const proc = spawn(`code-harmony`, [`serve`, `--hostname=${host}`, `--port=${port}`])
-  const client = createCodeHarmonyClient({ baseUrl: url })
+  const proc = spawn(`emberharmony`, [`serve`, `--hostname=${host}`, `--port=${port}`])
+  const client = createEmberHarmonyClient({ baseUrl: url })
 
   return {
     server: { url, close: () => proc.kill() },
@@ -245,7 +245,7 @@ function escapeRegex(value: string) {
 
 function useMentions() {
   const raw = (process.env["MENTIONS"] ?? "").trim()
-  if (!raw.length) return ["/code-harmony", "/oc"]
+  if (!raw.length) return ["/emberharmony", "/oc"]
   return raw
     .split(",")
     .map((x) => x.trim())
@@ -301,7 +301,7 @@ async function assertConnected() {
     return false
   })()
   if (connected) return
-  throw new Error("Failed to connect to code-harmony server")
+  throw new Error("Failed to connect to emberharmony server")
 }
 
 function assertContextEvent(...events: string[]) {
@@ -377,7 +377,7 @@ function useIssueId() {
 }
 
 function useShareUrl() {
-  const env = (process.env["CODE_HARMONY_SHARE_URL"] ?? "").trim()
+  const env = (process.env["EMBERHARMONY_SHARE_URL"] ?? "").trim()
   if (env.length) return env
   return isMock() ? "https://dev.solace.ofharmony.ai" : "https://solace.ofharmony.ai"
 }
@@ -618,7 +618,7 @@ async function resolveAgent(): Promise<string | undefined> {
 }
 
 async function chat(text: string, files: PromptFiles = []) {
-  console.log("Sending message to code-harmony...")
+  console.log("Sending message to emberharmony...")
   const { providerID, modelID } = useEnvModel()
   const agent = await resolveAgent()
 
@@ -674,8 +674,8 @@ async function configureGit(appToken: string) {
 
   await $`git config --local --unset-all ${config}`
   await $`git config --local ${config} "AUTHORIZATION: basic ${newCredentials}"`
-  await $`git config --global user.name "code-harmony-agent[bot]"`
-  await $`git config --global user.email "code-harmony-agent[bot]@users.noreply.github.com"`
+  await $`git config --global user.name "emberharmony-agent[bot]"`
+  await $`git config --global user.email "emberharmony-agent[bot]@users.noreply.github.com"`
 }
 
 async function restoreGitConfig() {
@@ -721,7 +721,7 @@ function generateBranchName(type: "issue" | "pr") {
     .replace(/\.\d{3}Z/, "")
     .split("T")
     .join("")
-  return `code-harmony/${type}${useIssueId()}-${timestamp}`
+  return `emberharmony/${type}${useIssueId()}-${timestamp}`
 }
 
 async function pushToNewBranch(summary: string, branch: string) {

@@ -1,6 +1,6 @@
 {
-  "name": "@thesolaceproject/code-harmony-enterprise",
-  "version": "1.0.0",
+  "name": "@thesolaceproject/emberharmony-enterprise",
+  "version": "1.2.2",
   "private": true,
   "type": "module",
   "license": "MIT",
@@ -8,13 +8,13 @@
     "typecheck": "tsgo --noEmit",
     "dev": "vite dev",
     "build": "vite build",
-    "build:cloudflare": "CODE_HARMONY_DEPLOYMENT_TARGET=cloudflare vite build",
+    "build:cloudflare": "EMBERHARMONY_DEPLOYMENT_TARGET=cloudflare vite build",
     "start": "vite start",
     "shell-prod": "sst shell --target Teams --stage production"
   },
   "dependencies": {
-    "@thesolaceproject/code-harmony-util": "workspace:*",
-    "@thesolaceproject/code-harmony-ui": "workspace:*",
+    "@thesolaceproject/emberharmony-util": "workspace:*",
+    "@thesolaceproject/emberharmony-ui": "workspace:*",
     "aws4fetch": "^1.0.20",
     "@pierre/diffs": "catalog:",
     "@solidjs/router": "catalog:",

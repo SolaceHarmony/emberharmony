@@ -1,6 +1,6 @@
 ## project
 
-The goal is to let a single instance of CodeHarmony run sessions for multiple projects and different worktrees per project.
+The goal is to let a single instance of EmberHarmony run sessions for multiple projects and different worktrees per project.
 
 ### api
 

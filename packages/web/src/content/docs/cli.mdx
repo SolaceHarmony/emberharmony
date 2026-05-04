@@ -1,30 +1,30 @@
 ---
 title: CLI
-description: CodeHarmony CLI options and commands.
+description: EmberHarmony CLI options and commands.
 ---
 
 import { Tabs, TabItem } from "@astrojs/starlight/components"
 
-The CodeHarmony CLI by default starts the [TUI](/docs/tui) when run without any arguments.
+The EmberHarmony CLI by default starts the [TUI](/docs/tui) when run without any arguments.
 
 ```bash
-code-harmony
+emberharmony
 ```
 
-But it also accepts commands as documented on this page. This allows you to interact with CodeHarmony programmatically.
+But it also accepts commands as documented on this page. This allows you to interact with EmberHarmony programmatically.
 
 ```bash
-code-harmony run "Explain how closures work in JavaScript"
+emberharmony run "Explain how closures work in JavaScript"
 ```
 
 ---
 
 ### tui
 
-Start the CodeHarmony terminal user interface.
+Start the EmberHarmony terminal user interface.
 
 ```bash
-code-harmony [project]
+emberharmony [project]
 ```
 
 #### Flags
@@ -43,36 +43,36 @@ code-harmony [project]
 
 ## Commands
 
-The CodeHarmony CLI also has the following commands.
+The EmberHarmony CLI also has the following commands.
 
 ---
 
 ### agent
 
-Manage agents for CodeHarmony.
+Manage agents for EmberHarmony.
 
 ```bash
-code-harmony agent [command]
+emberharmony agent [command]
 ```
 
 ---
 
 ### attach
 
-Attach a terminal to an already running CodeHarmony backend server started via `serve` or `web` commands.
+Attach a terminal to an already running EmberHarmony backend server started via `serve` or `web` commands.
 
 ```bash
-code-harmony attach [url]
+emberharmony attach [url]
 ```
 
-This allows using the TUI with a remote CodeHarmony backend. For example:
+This allows using the TUI with a remote EmberHarmony backend. For example:
 
 ```bash
 # Start the backend server for web/mobile access
-code-harmony web --port 4096 --hostname 0.0.0.0
+emberharmony web --port 4096 --hostname 0.0.0.0
 
 # In another terminal, attach the TUI to the running backend
-code-harmony attach http://10.20.30.40:4096
+emberharmony attach http://10.20.30.40:4096
 ```
 
 #### Flags
@@ -89,7 +89,7 @@ code-harmony attach http://10.20.30.40:4096
 Create a new agent with custom configuration.
 
 ```bash
-code-harmony agent create
+emberharmony agent create
 ```
 
 This command will guide you through creating a new agent with a custom system prompt and tool configuration.
@@ -101,7 +101,7 @@ This command will guide you through creating a new agent with a custom system pr
 List all available agents.
 
 ```bash
-code-harmony agent list
+emberharmony agent list
 ```
 
 ---
@@ -111,20 +111,20 @@ code-harmony agent list
 Command to manage credentials and login for providers.
 
 ```bash
-code-harmony auth [command]
+emberharmony auth [command]
 ```
 
 ---
 
 #### login
 
-CodeHarmony is powered by the provider list at [Models.dev](https://models.dev), so you can use `code-harmony auth login` to configure API keys for any provider you'd like to use. This is stored in `~/.local/share/code-harmony/auth.json`.
+EmberHarmony is powered by the provider list at [Models.dev](https://models.dev), so you can use `emberharmony auth login` to configure API keys for any provider you'd like to use. This is stored in `~/.local/share/emberharmony/auth.json`.
 
 ```bash
-code-harmony auth login
+emberharmony auth login
 ```
 
-When CodeHarmony starts up it loads the providers from the credentials file. And if there are any keys defined in your environments or a `.env` file in your project.
+When EmberHarmony starts up it loads the providers from the credentials file. And if there are any keys defined in your environments or a `.env` file in your project.
 
 ---
 
@@ -133,13 +133,13 @@ When CodeHarmony starts up it loads the providers from the credentials file. And
 Lists all the authenticated providers as stored in the credentials file.
 
 ```bash
-code-harmony auth list
+emberharmony auth list
 ```
 
 Or the short version.
 
 ```bash
-code-harmony auth ls
+emberharmony auth ls
 ```
 
 ---
@@ -149,7 +149,7 @@ code-harmony auth ls
 Logs you out of a provider by clearing it from the credentials file.
 
 ```bash
-code-harmony auth logout
+emberharmony auth logout
 ```
 
 ---
@@ -159,7 +159,7 @@ code-harmony auth logout
 Manage the GitHub agent for repository automation.
 
 ```bash
-code-harmony github [command]
+emberharmony github [command]
 ```
 
 ---
@@ -169,7 +169,7 @@ code-harmony github [command]
 Install the GitHub agent in your repository.
 
 ```bash
-code-harmony github install
+emberharmony github install
 ```
 
 This sets up the necessary GitHub Actions workflow and guides you through the configuration process. [Learn more](/docs/github).
@@ -181,7 +181,7 @@ This sets up the necessary GitHub Actions workflow and guides you through the co
 Run the GitHub agent. This is typically used in GitHub Actions.
 
 ```bash
-code-harmony github run
+emberharmony github run
 ```
 
 ##### Flags
@@ -198,7 +198,7 @@ code-harmony github run
 Manage Model Context Protocol servers.
 
 ```bash
-code-harmony mcp [command]
+emberharmony mcp [command]
 ```
 
 ---
@@ -208,7 +208,7 @@ code-harmony mcp [command]
 Add an MCP server to your configuration.
 
 ```bash
-code-harmony mcp add
+emberharmony mcp add
 ```
 
 This command will guide you through adding either a local or remote MCP server.
@@ -220,13 +220,13 @@ This command will guide you through adding either a local or remote MCP server.
 List all configured MCP servers and their connection status.
 
 ```bash
-code-harmony mcp list
+emberharmony mcp list
 ```
 
 Or use the short version.
 
 ```bash
-code-harmony mcp ls
+emberharmony mcp ls
 ```
 
 ---
@@ -236,7 +236,7 @@ code-harmony mcp ls
 Authenticate with an OAuth-enabled MCP server.
 
 ```bash
-code-harmony mcp auth [name]
+emberharmony mcp auth [name]
 ```
 
 If you don't provide a server name, you'll be prompted to select from available OAuth-capable servers.
@@ -244,13 +244,13 @@ If you don't provide a server name, you'll be prompted to select from available 
 You can also list OAuth-capable servers and their authentication status.
 
 ```bash
-code-harmony mcp auth list
+emberharmony mcp auth list
 ```
 
 Or use the short version.
 
 ```bash
-code-harmony mcp auth ls
+emberharmony mcp auth ls
 ```
 
 ---
@@ -260,7 +260,7 @@ code-harmony mcp auth ls
 Remove OAuth credentials for an MCP server.
 
 ```bash
-code-harmony mcp logout [name]
+emberharmony mcp logout [name]
 ```
 
 ---
@@ -270,7 +270,7 @@ code-harmony mcp logout [name]
 Debug OAuth connection issues for an MCP server.
 
 ```bash
-code-harmony mcp debug <name>
+emberharmony mcp debug <name>
 ```
 
 ---
@@ -280,7 +280,7 @@ code-harmony mcp debug <name>
 List all available models from configured providers.
 
 ```bash
-code-harmony models [provider]
+emberharmony models [provider]
 ```
 
 This command displays all models available across your configured providers in the format `provider/model`.
@@ -290,7 +290,7 @@ This is useful for figuring out the exact model name to use in [your config](/do
 You can optionally pass a provider ID to filter models by that provider.
 
 ```bash
-code-harmony models anthropic
+emberharmony models anthropic
 ```
 
 #### Flags
@@ -300,36 +300,36 @@ code-harmony models anthropic
 | `--refresh` | Refresh the models cache from models.dev                     |
 | `--verbose` | Use more verbose model output (includes metadata like costs) |
 
-Use the `--refresh` flag to update the cached model list. This is useful when new models have been added to a provider and you want to see them in CodeHarmony.
+Use the `--refresh` flag to update the cached model list. This is useful when new models have been added to a provider and you want to see them in EmberHarmony.
 
 ```bash
-code-harmony models --refresh
+emberharmony models --refresh
 ```
 
 ---
 
 ### run
 
-Run code-harmony in non-interactive mode by passing a prompt directly.
+Run emberharmony in non-interactive mode by passing a prompt directly.
 
 ```bash
-code-harmony run [message..]
+emberharmony run [message..]
 ```
 
 This is useful for scripting, automation, or when you want a quick answer without launching the full TUI. For example.
 
-```bash "code-harmony run"
-code-harmony run Explain the use of context in Go
+```bash "emberharmony run"
+emberharmony run Explain the use of context in Go
 ```
 
-You can also attach to a running `code-harmony serve` instance to avoid MCP server cold boot times on every run:
+You can also attach to a running `emberharmony serve` instance to avoid MCP server cold boot times on every run:
 
 ```bash
 # Start a headless server in one terminal
-code-harmony serve
+emberharmony serve
 
 # In another terminal, run commands that attach to it
-code-harmony run --attach http://localhost:4096 "Explain async/await in JavaScript"
+emberharmony run --attach http://localhost:4096 "Explain async/await in JavaScript"
 ```
 
 #### Flags
@@ -345,20 +345,20 @@ code-harmony run --attach http://localhost:4096 "Explain async/await in JavaScri
 | `--file`     | `-f`  | File(s) to attach to message                                          |
 | `--format`   |       | Format: default (formatted) or json (raw JSON events)                 |
 | `--title`    |       | Title for the session (uses truncated prompt if no value provided)    |
-| `--attach`   |       | Attach to a running code-harmony server (e.g., http://localhost:4096) |
+| `--attach`   |       | Attach to a running emberharmony server (e.g., http://localhost:4096) |
 | `--port`     |       | Port for the local server (defaults to random port)                   |
 
 ---
 
 ### serve
 
-Start a headless CodeHarmony server for API access. Check out the [server docs](/docs/server) for the full HTTP interface.
+Start a headless EmberHarmony server for API access. Check out the [server docs](/docs/server) for the full HTTP interface.
 
 ```bash
-code-harmony serve
+emberharmony serve
 ```
 
-This starts an HTTP server that provides API access to code-harmony functionality without the TUI interface. Set `CODE_HARMONY_SERVER_PASSWORD` to enable HTTP basic auth (username defaults to `code-harmony`).
+This starts an HTTP server that provides API access to emberharmony functionality without the TUI interface. Set `EMBERHARMONY_SERVER_PASSWORD` to enable HTTP basic auth (username defaults to `emberharmony`).
 
 #### Flags
 
@@ -373,20 +373,20 @@ This starts an HTTP server that provides API access to code-harmony functionalit
 
 ### session
 
-Manage CodeHarmony sessions.
+Manage EmberHarmony sessions.
 
 ```bash
-code-harmony session [command]
+emberharmony session [command]
 ```
 
 ---
 
 #### list
 
-List all CodeHarmony sessions.
+List all EmberHarmony sessions.
 
 ```bash
-code-harmony session list
+emberharmony session list
 ```
 
 ##### Flags
@@ -400,10 +400,10 @@ code-harmony session list
 
 ### stats
 
-Show token usage and cost statistics for your CodeHarmony sessions.
+Show token usage and cost statistics for your EmberHarmony sessions.
 
 ```bash
-code-harmony stats
+emberharmony stats
 ```
 
 #### Flags
@@ -422,7 +422,7 @@ code-harmony stats
 Export session data as JSON.
 
 ```bash
-code-harmony export [sessionID]
+emberharmony export [sessionID]
 ```
 
 If you don't provide a session ID, you'll be prompted to select from available sessions.
@@ -431,30 +431,30 @@ If you don't provide a session ID, you'll be prompted to select from available s
 
 ### import
 
-Import session data from a JSON file or CodeHarmony share URL.
+Import session data from a JSON file or EmberHarmony share URL.
 
 ```bash
-code-harmony import <file>
+emberharmony import <file>
 ```
 
-You can import from a local file or an CodeHarmony share URL.
+You can import from a local file or an EmberHarmony share URL.
 
 ```bash
-code-harmony import session.json
-code-harmony import https://solace.ofharmony.ai/s/abc123
+emberharmony import session.json
+emberharmony import https://solace.ofharmony.ai/s/abc123
 ```
 
 ---
 
 ### web
 
-Start a headless CodeHarmony server with a web interface.
+Start a headless EmberHarmony server with a web interface.
 
 ```bash
-code-harmony web
+emberharmony web
 ```
 
-This starts an HTTP server and opens a web browser to access CodeHarmony through a web interface. Set `CODE_HARMONY_SERVER_PASSWORD` to enable HTTP basic auth (username defaults to `code-harmony`).
+This starts an HTTP server and opens a web browser to access EmberHarmony through a web interface. Set `EMBERHARMONY_SERVER_PASSWORD` to enable HTTP basic auth (username defaults to `emberharmony`).
 
 #### Flags
 
@@ -472,7 +472,7 @@ This starts an HTTP server and opens a web browser to access CodeHarmony through
 Start an ACP (Agent Client Protocol) server.
 
 ```bash
-code-harmony acp
+emberharmony acp
 ```
 
 This command starts an ACP server that communicates via stdin/stdout using nd-JSON.
@@ -489,10 +489,10 @@ This command starts an ACP server that communicates via stdin/stdout using nd-JS
 
 ### uninstall
 
-Uninstall CodeHarmony and remove all related files.
+Uninstall EmberHarmony and remove all related files.
 
 ```bash
-code-harmony uninstall
+emberharmony uninstall
 ```
 
 #### Flags
@@ -508,22 +508,22 @@ code-harmony uninstall
 
 ### upgrade
 
-Updates code-harmony to the latest version or a specific version.
+Updates emberharmony to the latest version or a specific version.
 
 ```bash
-code-harmony upgrade [target]
+emberharmony upgrade [target]
 ```
 
 To upgrade to the latest version.
 
 ```bash
-code-harmony upgrade
+emberharmony upgrade
 ```
 
 To upgrade to a specific version.
 
 ```bash
-code-harmony upgrade v0.1.48
+emberharmony upgrade v0.1.48
 ```
 
 #### Flags
@@ -536,7 +536,7 @@ code-harmony upgrade v0.1.48
 
 ## Global Flags
 
-The code-harmony CLI takes the following global flags.
+The emberharmony CLI takes the following global flags.
 
 | Flag           | Short | Description                          |
 | -------------- | ----- | ------------------------------------ |
@@ -549,30 +549,30 @@ The code-harmony CLI takes the following global flags.
 
 ## Environment variables
 
-CodeHarmony can be configured using environment variables.
+EmberHarmony can be configured using environment variables.
 
 | Variable                              | Type    | Description                                           |
 | ------------------------------------- | ------- | ----------------------------------------------------- |
-| `CODE_HARMONY_AUTO_SHARE`                 | boolean | Automatically share sessions                          |
-| `CODE_HARMONY_GIT_BASH_PATH`              | string  | Path to Git Bash executable on Windows                |
-| `CODE_HARMONY_CONFIG`                     | string  | Path to config file                                   |
-| `CODE_HARMONY_CONFIG_DIR`                 | string  | Path to config directory                              |
-| `CODE_HARMONY_CONFIG_CONTENT`             | string  | Inline json config content                            |
-| `CODE_HARMONY_DISABLE_AUTOUPDATE`         | boolean | Disable automatic update checks                       |
-| `CODE_HARMONY_DISABLE_PRUNE`              | boolean | Disable pruning of old data                           |
-| `CODE_HARMONY_DISABLE_TERMINAL_TITLE`     | boolean | Disable automatic terminal title updates              |
-| `CODE_HARMONY_PERMISSION`                 | string  | Inlined json permissions config                       |
-| `CODE_HARMONY_DISABLE_DEFAULT_PLUGINS`    | boolean | Disable default plugins                               |
-| `CODE_HARMONY_DISABLE_LSP_DOWNLOAD`       | boolean | Disable automatic LSP server downloads                |
-| `CODE_HARMONY_ENABLE_EXPERIMENTAL_MODELS` | boolean | Enable experimental models                            |
-| `CODE_HARMONY_DISABLE_AUTOCOMPACT`        | boolean | Disable automatic context compaction                  |
-| `CODE_HARMONY_DISABLE_CLAUDE_CODE`        | boolean | Disable reading from `.claude` (prompt + skills)      |
-| `CODE_HARMONY_DISABLE_CLAUDE_CODE_PROMPT` | boolean | Disable reading `~/.claude/CLAUDE.md`                 |
-| `CODE_HARMONY_DISABLE_CLAUDE_CODE_SKILLS` | boolean | Disable loading `.claude/skills`                      |
-| `CODE_HARMONY_CLIENT`                     | string  | Client identifier (defaults to `cli`)                 |
-| `CODE_HARMONY_ENABLE_EXA`                 | boolean | Enable Exa web search tools                           |
-| `CODE_HARMONY_SERVER_PASSWORD`            | string  | Enable basic auth for `serve`/`web`                   |
-| `CODE_HARMONY_SERVER_USERNAME`            | string  | Override basic auth username (default `code-harmony`) |
+| `EMBERHARMONY_AUTO_SHARE`                 | boolean | Automatically share sessions                          |
+| `EMBERHARMONY_GIT_BASH_PATH`              | string  | Path to Git Bash executable on Windows                |
+| `EMBERHARMONY_CONFIG`                     | string  | Path to config file                                   |
+| `EMBERHARMONY_CONFIG_DIR`                 | string  | Path to config directory                              |
+| `EMBERHARMONY_CONFIG_CONTENT`             | string  | Inline json config content                            |
+| `EMBERHARMONY_DISABLE_AUTOUPDATE`         | boolean | Disable automatic update checks                       |
+| `EMBERHARMONY_DISABLE_PRUNE`              | boolean | Disable pruning of old data                           |
+| `EMBERHARMONY_DISABLE_TERMINAL_TITLE`     | boolean | Disable automatic terminal title updates              |
+| `EMBERHARMONY_PERMISSION`                 | string  | Inlined json permissions config                       |
+| `EMBERHARMONY_DISABLE_DEFAULT_PLUGINS`    | boolean | Disable default plugins                               |
+| `EMBERHARMONY_DISABLE_LSP_DOWNLOAD`       | boolean | Disable automatic LSP server downloads                |
+| `EMBERHARMONY_ENABLE_EXPERIMENTAL_MODELS` | boolean | Enable experimental models                            |
+| `EMBERHARMONY_DISABLE_AUTOCOMPACT`        | boolean | Disable automatic context compaction                  |
+| `EMBERHARMONY_DISABLE_CLAUDE_CODE`        | boolean | Disable reading from `.claude` (prompt + skills)      |
+| `EMBERHARMONY_DISABLE_CLAUDE_CODE_PROMPT` | boolean | Disable reading `~/.claude/CLAUDE.md`                 |
+| `EMBERHARMONY_DISABLE_CLAUDE_CODE_SKILLS` | boolean | Disable loading `.claude/skills`                      |
+| `EMBERHARMONY_CLIENT`                     | string  | Client identifier (defaults to `cli`)                 |
+| `EMBERHARMONY_ENABLE_EXA`                 | boolean | Enable Exa web search tools                           |
+| `EMBERHARMONY_SERVER_PASSWORD`            | string  | Enable basic auth for `serve`/`web`                   |
+| `EMBERHARMONY_SERVER_USERNAME`            | string  | Override basic auth username (default `emberharmony`) |
 
 ---
 
@@ -582,16 +582,16 @@ These environment variables enable experimental features that may change or be r
 
 | Variable                                        | Type    | Description                             |
 | ----------------------------------------------- | ------- | --------------------------------------- |
-| `CODE_HARMONY_EXPERIMENTAL`                         | boolean | Enable all experimental features        |
-| `CODE_HARMONY_EXPERIMENTAL_ICON_DISCOVERY`          | boolean | Enable icon discovery                   |
-| `CODE_HARMONY_EXPERIMENTAL_DISABLE_COPY_ON_SELECT`  | boolean | Disable copy on select in TUI           |
-| `CODE_HARMONY_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS` | number  | Default timeout for bash commands in ms |
-| `CODE_HARMONY_EXPERIMENTAL_OUTPUT_TOKEN_MAX`        | number  | Max output tokens for LLM responses     |
-| `CODE_HARMONY_EXPERIMENTAL_FILEWATCHER`             | boolean | Enable file watcher for entire dir      |
-| `CODE_HARMONY_EXPERIMENTAL_OXFMT`                   | boolean | Enable oxfmt formatter                  |
-| `CODE_HARMONY_EXPERIMENTAL_LSP_TOOL`                | boolean | Enable experimental LSP tool            |
-| `CODE_HARMONY_EXPERIMENTAL_DISABLE_FILEWATCHER`     | boolean | Disable file watcher                    |
-| `CODE_HARMONY_EXPERIMENTAL_EXA`                     | boolean | Enable experimental Exa features        |
-| `CODE_HARMONY_EXPERIMENTAL_LSP_TY`                  | boolean | Enable experimental LSP type checking   |
-| `CODE_HARMONY_EXPERIMENTAL_MARKDOWN`                | boolean | Enable experimental markdown features   |
-| `CODE_HARMONY_EXPERIMENTAL_PLAN_MODE`               | boolean | Enable plan mode                        |
+| `EMBERHARMONY_EXPERIMENTAL`                         | boolean | Enable all experimental features        |
+| `EMBERHARMONY_EXPERIMENTAL_ICON_DISCOVERY`          | boolean | Enable icon discovery                   |
+| `EMBERHARMONY_EXPERIMENTAL_DISABLE_COPY_ON_SELECT`  | boolean | Disable copy on select in TUI           |
+| `EMBERHARMONY_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS` | number  | Default timeout for bash commands in ms |
+| `EMBERHARMONY_EXPERIMENTAL_OUTPUT_TOKEN_MAX`        | number  | Max output tokens for LLM responses     |
+| `EMBERHARMONY_EXPERIMENTAL_FILEWATCHER`             | boolean | Enable file watcher for entire dir      |
+| `EMBERHARMONY_EXPERIMENTAL_OXFMT`                   | boolean | Enable oxfmt formatter                  |
+| `EMBERHARMONY_EXPERIMENTAL_LSP_TOOL`                | boolean | Enable experimental LSP tool            |
+| `EMBERHARMONY_EXPERIMENTAL_DISABLE_FILEWATCHER`     | boolean | Disable file watcher                    |
+| `EMBERHARMONY_EXPERIMENTAL_EXA`                     | boolean | Enable experimental Exa features        |
+| `EMBERHARMONY_EXPERIMENTAL_LSP_TY`                  | boolean | Enable experimental LSP type checking   |
+| `EMBERHARMONY_EXPERIMENTAL_MARKDOWN`                | boolean | Enable experimental markdown features   |
+| `EMBERHARMONY_EXPERIMENTAL_PLAN_MODE`               | boolean | Enable plan mode                        |

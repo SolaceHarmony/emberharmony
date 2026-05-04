@@ -1,16 +1,16 @@
 import { Component, createMemo, type JSX } from "solid-js"
 import { createStore } from "solid-js/store"
-import { Button } from "@thesolaceproject/code-harmony-ui/button"
-import { Select } from "@thesolaceproject/code-harmony-ui/select"
-import { Switch } from "@thesolaceproject/code-harmony-ui/switch"
-import { useTheme, type ColorScheme } from "@thesolaceproject/code-harmony-ui/theme"
-import { showToast } from "@thesolaceproject/code-harmony-ui/toast"
+import { Button } from "@thesolaceproject/emberharmony-ui/button"
+import { Select } from "@thesolaceproject/emberharmony-ui/select"
+import { Switch } from "@thesolaceproject/emberharmony-ui/switch"
+import { useTheme, type ColorScheme } from "@thesolaceproject/emberharmony-ui/theme"
+import { showToast } from "@thesolaceproject/emberharmony-ui/toast"
 import { useLanguage } from "@/context/language"
 import { usePlatform } from "@/context/platform"
 import { useSettings, monoFontFamily } from "@/context/settings"
 import { playSound, SOUND_OPTIONS } from "@/utils/sound"
 import { Link } from "./link"
-import { ScrollFade } from "@thesolaceproject/code-harmony-ui/scroll-fade"
+import { ScrollFade } from "@thesolaceproject/emberharmony-ui/scroll-fade"
 
 let demoSoundState = {
   cleanup: undefined as (() => void) | undefined,

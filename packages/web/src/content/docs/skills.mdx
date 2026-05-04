@@ -3,7 +3,7 @@ title: "Agent Skills"
 description: "Define reusable behavior via SKILL.md definitions"
 ---
 
-Agent skills let CodeHarmony discover reusable instructions from your repo or home directory.
+Agent skills let EmberHarmony discover reusable instructions from your repo or home directory.
 Skills are loaded on-demand via the native `skill` tool—agents see available skills and can load the full content when needed.
 
 ---
@@ -11,10 +11,10 @@ Skills are loaded on-demand via the native `skill` tool—agents see available s
 ## Place files
 
 Create one folder per skill name and put a `SKILL.md` inside it.
-CodeHarmony searches these locations:
+EmberHarmony searches these locations:
 
-- Project config: `.code-harmony/skills/<name>/SKILL.md`
-- Global config: `~/.config/code-harmony/skills/<name>/SKILL.md`
+- Project config: `.emberharmony/skills/<name>/SKILL.md`
+- Global config: `~/.config/emberharmony/skills/<name>/SKILL.md`
 - Project Claude-compatible: `.claude/skills/<name>/SKILL.md`
 - Global Claude-compatible: `~/.claude/skills/<name>/SKILL.md`
 
@@ -22,10 +22,10 @@ CodeHarmony searches these locations:
 
 ## Understand discovery
 
-For project-local paths, CodeHarmony walks up from your current working directory until it reaches the git worktree.
-It loads any matching `skills/*/SKILL.md` in `.code-harmony/` and any matching `.claude/skills/*/SKILL.md` along the way.
+For project-local paths, EmberHarmony walks up from your current working directory until it reaches the git worktree.
+It loads any matching `skills/*/SKILL.md` in `.emberharmony/` and any matching `.claude/skills/*/SKILL.md` along the way.
 
-Global definitions are also loaded from `~/.config/code-harmony/skills/*/SKILL.md` and `~/.claude/skills/*/SKILL.md`.
+Global definitions are also loaded from `~/.config/emberharmony/skills/*/SKILL.md` and `~/.claude/skills/*/SKILL.md`.
 
 ---
 
@@ -71,14 +71,14 @@ Keep it specific enough for the agent to choose correctly.
 
 ## Use an example
 
-Create `.code-harmony/skills/git-release/SKILL.md` like this:
+Create `.emberharmony/skills/git-release/SKILL.md` like this:
 
 ```markdown
 ---
 name: git-release
 description: Create consistent releases and changelogs
 license: MIT
-compatibility: code-harmony
+compatibility: emberharmony
 metadata:
   audience: maintainers
   workflow: github
@@ -100,7 +100,7 @@ Ask clarifying questions if the target versioning scheme is unclear.
 
 ## Recognize tool description
 
-CodeHarmony lists available skills in the `skill` tool description.
+EmberHarmony lists available skills in the `skill` tool description.
 Each entry includes the skill name and description:
 
 ```xml
@@ -122,7 +122,7 @@ skill({ name: "git-release" })
 
 ## Configure permissions
 
-Control which skills agents can access using pattern-based permissions in `code-harmony.json`:
+Control which skills agents can access using pattern-based permissions in `emberharmony.json`:
 
 ```json
 {
@@ -161,7 +161,7 @@ permission:
 ---
 ```
 
-**For built-in agents** (in `code-harmony.json`):
+**For built-in agents** (in `emberharmony.json`):
 
 ```json
 {

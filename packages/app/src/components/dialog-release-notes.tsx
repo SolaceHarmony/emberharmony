@@ -1,7 +1,7 @@
 import { createSignal, createEffect, onMount, onCleanup } from "solid-js"
-import { Dialog } from "@thesolaceproject/code-harmony-ui/dialog"
-import { Button } from "@thesolaceproject/code-harmony-ui/button"
-import { useDialog } from "@thesolaceproject/code-harmony-ui/context/dialog"
+import { Dialog } from "@thesolaceproject/emberharmony-ui/dialog"
+import { Button } from "@thesolaceproject/emberharmony-ui/button"
+import { useDialog } from "@thesolaceproject/emberharmony-ui/context/dialog"
 import { useSettings } from "@/context/settings"
 
 export type Highlight = {

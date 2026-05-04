@@ -1,13 +1,13 @@
 import * as vscode from "vscode"
 
-const terminalName = "CodeHarmony"
+const terminalName = "EmberHarmony"
 
 export function activate(context: vscode.ExtensionContext) {
-  const openNew = vscode.commands.registerCommand("codeharmony.openNewTerminal", async () => {
+  const openNew = vscode.commands.registerCommand("emberharmony.openNewTerminal", async () => {
     await openTerminal()
   })
 
-  const open = vscode.commands.registerCommand("codeharmony.openTerminal", async () => {
+  const open = vscode.commands.registerCommand("emberharmony.openTerminal", async () => {
     const existing = vscode.window.terminals.find((t) => t.name === terminalName)
     if (existing) {
       existing.show()
@@ -16,7 +16,7 @@ export function activate(context: vscode.ExtensionContext) {
     await openTerminal()
   })
 
-  const addFile = vscode.commands.registerCommand("codeharmony.addFilepathToTerminal", async () => {
+  const addFile = vscode.commands.registerCommand("emberharmony.addFilepathToTerminal", async () => {
     const fileRef = getActiveFile()
     if (!fileRef) return
 
@@ -27,8 +27,8 @@ export function activate(context: vscode.ExtensionContext) {
     // @ts-expect-error VS Code's terminal env typing isn't strong enough here.
     const env = terminal.creationOptions.env as Record<string, unknown> | undefined
     const portRaw =
-      (typeof env?.["_EXTENSION_CODE_HARMONY_PORT"] === "string" && env?._EXTENSION_CODE_HARMONY_PORT) ||
-      (typeof env?.["_EXTENSION_CODE_HARMONY_PORT"] === "string" && env?._EXTENSION_CODE_HARMONY_PORT)
+      (typeof env?.["_EXTENSION_EMBERHARMONY_PORT"] === "string" && env?._EXTENSION_EMBERHARMONY_PORT) ||
+      (typeof env?.["_EXTENSION_EMBERHARMONY_PORT"] === "string" && env?._EXTENSION_EMBERHARMONY_PORT)
     const port = portRaw ? parseInt(portRaw) : NaN
 
     if (!Number.isFinite(port)) {
@@ -56,16 +56,16 @@ export function activate(context: vscode.ExtensionContext) {
         preserveFocus: false,
       },
       env: {
-        _EXTENSION_CODE_HARMONY_PORT: port.toString(),
+        _EXTENSION_EMBERHARMONY_PORT: port.toString(),
         // Backwards compatibility for older tooling/scripts.
-        _EXTENSION_CODE_HARMONY_PORT: port.toString(),
-        CODE_HARMONY_CALLER: "vscode",
-        CODE_HARMONY_CALLER: "vscode",
+        _EXTENSION_EMBERHARMONY_PORT: port.toString(),
+        EMBERHARMONY_CALLER: "vscode",
+        EMBERHARMONY_CALLER: "vscode",
       },
     })
 
     terminal.show()
-    terminal.sendText(`code-harmony --port ${port}`)
+    terminal.sendText(`emberharmony --port ${port}`)
 
     const fileRef = getActiveFile()
     if (!fileRef) return

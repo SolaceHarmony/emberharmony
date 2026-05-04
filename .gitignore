@@ -5,7 +5,7 @@ node_modules
 .env
 .idea
 .vscode
-.opencode/
+.emberharmony/
 *~
 playground
 tmp
@@ -20,7 +20,7 @@ ts-dist
 /result
 refs
 Session.vim
-opencode.json
+emberharmony.json
 .quarantine/
 .git.old-*/
 a.out
@@ -30,6 +30,6 @@ target
 .xdg/
 
 # Local dev files
-opencode-dev
+emberharmony-dev
 logs/
 *.bun-build

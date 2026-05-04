@@ -8,13 +8,13 @@ import { createSimpleContext } from "../context/helper"
 export type ColorScheme = "light" | "dark" | "system"
 
 const STORAGE_KEYS = {
-  THEME_ID: "code-harmony-theme-id",
-  COLOR_SCHEME: "code-harmony-color-scheme",
-  THEME_CSS_LIGHT: "code-harmony-theme-css-light",
-  THEME_CSS_DARK: "code-harmony-theme-css-dark",
+  THEME_ID: "emberharmony-theme-id",
+  COLOR_SCHEME: "emberharmony-color-scheme",
+  THEME_CSS_LIGHT: "emberharmony-theme-css-light",
+  THEME_CSS_DARK: "emberharmony-theme-css-dark",
 } as const
 
-const THEME_STYLE_ID = "code-harmony-theme"
+const THEME_STYLE_ID = "emberharmony-theme"
 
 function ensureThemeStyleElement(): HTMLStyleElement {
   const existing = document.getElementById(THEME_STYLE_ID) as HTMLStyleElement | null
@@ -35,7 +35,7 @@ function applyThemeCss(theme: DesktopTheme, themeId: string, mode: "light" | "da
   const tokens = resolveThemeVariant(variant, isDark)
   const css = themeToCss(tokens)
 
-  if (themeId !== "oc-1") {
+  if (themeId !== "eh-1") {
     try {
       localStorage.setItem(isDark ? STORAGE_KEYS.THEME_CSS_DARK : STORAGE_KEYS.THEME_CSS_LIGHT, css)
     } catch {}
@@ -47,14 +47,14 @@ function applyThemeCss(theme: DesktopTheme, themeId: string, mode: "light" | "da
   ${css}
 }`
 
-  document.getElementById("code-harmony-theme-preload")?.remove()
+  document.getElementById("emberharmony-theme-preload")?.remove()
   ensureThemeStyleElement().textContent = fullCss
   document.documentElement.dataset.theme = themeId
   document.documentElement.dataset.colorScheme = mode
 }
 
 function cacheThemeVariants(theme: DesktopTheme, themeId: string) {
-  if (themeId === "oc-1") return
+  if (themeId === "eh-1") return
   for (const mode of ["light", "dark"] as const) {
     const isDark = mode === "dark"
     const variant = isDark ? theme.dark : theme.light
@@ -71,7 +71,7 @@ export const { use: useTheme, provider: ThemeProvider } = createSimpleContext({
   init: (props: { defaultTheme?: string }) => {
     const [store, setStore] = createStore({
       themes: DEFAULT_THEMES as Record<string, DesktopTheme>,
-      themeId: props.defaultTheme ?? "oc-1",
+      themeId: props.defaultTheme ?? "eh-1",
       colorScheme: "system" as ColorScheme,
       mode: getSystemMode(),
       previewThemeId: null as string | null,

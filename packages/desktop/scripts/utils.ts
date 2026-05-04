@@ -3,27 +3,27 @@ import { $ } from "bun"
 export const SIDECAR_BINARIES: Array<{ rustTarget: string; ocBinary: string; assetExt: string }> = [
   {
     rustTarget: "aarch64-apple-darwin",
-    ocBinary: "code-harmony-darwin-arm64",
+    ocBinary: "emberharmony-darwin-arm64",
     assetExt: "zip",
   },
   {
     rustTarget: "x86_64-apple-darwin",
-    ocBinary: "code-harmony-darwin-x64",
+    ocBinary: "emberharmony-darwin-x64",
     assetExt: "zip",
   },
   {
     rustTarget: "x86_64-pc-windows-msvc",
-    ocBinary: "code-harmony-windows-x64",
+    ocBinary: "emberharmony-windows-x64",
     assetExt: "zip",
   },
   {
     rustTarget: "x86_64-unknown-linux-gnu",
-    ocBinary: "code-harmony-linux-x64",
+    ocBinary: "emberharmony-linux-x64",
     assetExt: "tar.gz",
   },
   {
     rustTarget: "aarch64-unknown-linux-gnu",
-    ocBinary: "code-harmony-linux-arm64",
+    ocBinary: "emberharmony-linux-arm64",
     assetExt: "tar.gz",
   },
 ]
@@ -41,7 +41,7 @@ export function getCurrentSidecar(target = RUST_TARGET) {
 
 export async function copyBinaryToSidecarFolder(source: string, target = RUST_TARGET) {
   await $`mkdir -p src-tauri/sidecars`
-  const dest = windowsify(`src-tauri/sidecars@thesolaceproject/code-harmony-cli-${target}`)
+  const dest = windowsify(`src-tauri/sidecars/emberharmony-cli-${target}`)
   await $`cp ${source} ${dest}`
 
   console.log(`Copied ${source} to ${dest}`)

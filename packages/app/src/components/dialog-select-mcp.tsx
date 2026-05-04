@@ -1,9 +1,9 @@
 import { Component, createMemo, createSignal, Show } from "solid-js"
 import { useSync } from "@/context/sync"
 import { useSDK } from "@/context/sdk"
-import { Dialog } from "@thesolaceproject/code-harmony-ui/dialog"
-import { List } from "@thesolaceproject/code-harmony-ui/list"
-import { Switch } from "@thesolaceproject/code-harmony-ui/switch"
+import { Dialog } from "@thesolaceproject/emberharmony-ui/dialog"
+import { List } from "@thesolaceproject/emberharmony-ui/list"
+import { Switch } from "@thesolaceproject/emberharmony-ui/switch"
 import { useLanguage } from "@/context/language"
 
 export const DialogSelectMcp: Component = () => {

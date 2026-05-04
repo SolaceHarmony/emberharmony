@@ -5,7 +5,7 @@
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>MIT</project_license>
 
-  <name>CodeHarmony</name>
+  <name>EmberHarmony</name>
   <summary>Open source AI coding agent</summary>
 
   <developer id="ai.ofharmony">
@@ -14,7 +14,7 @@
 
   <description>
     <p>
-      CodeHarmony is an open source agent that helps you write and run code with any AI model.
+      EmberHarmony is an open source agent that helps you write and run code with any AI model.
     </p>
   </description>
 
@@ -22,19 +22,19 @@
 
   <content_rating type="oars-1.1" />
 
-  <url type="bugtracker">https://github.com/sydneyrenee/code-harmony/issues</url>
+  <url type="bugtracker">https://github.com/sydneyrenee/emberharmony/issues</url>
   <url type="homepage">https://solace.ofharmony.ai</url>
-  <url type="vcs-browser">https://github.com/sydneyrenee/code-harmony</url>
+  <url type="vcs-browser">https://github.com/sydneyrenee/emberharmony</url>
 
   <screenshots>
     <screenshot type="default">
-      <image>https://raw.githubusercontent.com/sydneyrenee/code-harmony/main/packages/web/src/assets/lander/screenshot.png</image>
+      <image>https://raw.githubusercontent.com/sydneyrenee/emberharmony/main/packages/web/src/assets/lander/screenshot.png</image>
     </screenshot>
   </screenshots>
 
   <releases>
     <release version="1.0.0" date="2026-02-08">
-      <url type="details">https://github.com/sydneyrenee/code-harmony/releases/tag/v1.0.0</url>
+      <url type="details">https://github.com/sydneyrenee/emberharmony/releases/tag/v1.0.0</url>
     </release>
   </releases>
 </component>

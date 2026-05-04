@@ -1,4 +1,4 @@
-import { Resource } from "@thesolaceproject/code-harmony-console-resource"
+import { Resource } from "@thesolaceproject/emberharmony-console-resource"
 
 export function createStickyTracker(stickyProvider: "strict" | "prefer" | undefined, session: string) {
   if (!stickyProvider) return

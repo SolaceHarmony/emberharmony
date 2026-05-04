@@ -7,16 +7,16 @@ import { THEME_OPENAUTH } from "@openauthjs/openauth/ui/theme"
 import { GithubProvider } from "@openauthjs/openauth/provider/github"
 import { GoogleOidcProvider } from "@openauthjs/openauth/provider/google"
 import { CloudflareStorage } from "@openauthjs/openauth/storage/cloudflare"
-import { Account } from "@thesolaceproject/code-harmony-console-core/account.js"
-import { Workspace } from "@thesolaceproject/code-harmony-console-core/workspace.js"
-import { Actor } from "@thesolaceproject/code-harmony-console-core/actor.js"
-import { Resource } from "@thesolaceproject/code-harmony-console-resource"
-import { User } from "@thesolaceproject/code-harmony-console-core/user.js"
-import { and, Database, eq, isNull, or } from "@thesolaceproject/code-harmony-console-core/drizzle/index.js"
-import { WorkspaceTable } from "@thesolaceproject/code-harmony-console-core/schema/workspace.sql.js"
-import { UserTable } from "@thesolaceproject/code-harmony-console-core/schema/user.sql.js"
-import { AuthTable } from "@thesolaceproject/code-harmony-console-core/schema/auth.sql.js"
-import { Identifier } from "@thesolaceproject/code-harmony-console-core/identifier.js"
+import { Account } from "@thesolaceproject/emberharmony-console-core/account.js"
+import { Workspace } from "@thesolaceproject/emberharmony-console-core/workspace.js"
+import { Actor } from "@thesolaceproject/emberharmony-console-core/actor.js"
+import { Resource } from "@thesolaceproject/emberharmony-console-resource"
+import { User } from "@thesolaceproject/emberharmony-console-core/user.js"
+import { and, Database, eq, isNull, or } from "@thesolaceproject/emberharmony-console-core/drizzle/index.js"
+import { WorkspaceTable } from "@thesolaceproject/emberharmony-console-core/schema/workspace.sql.js"
+import { UserTable } from "@thesolaceproject/emberharmony-console-core/schema/user.sql.js"
+import { AuthTable } from "@thesolaceproject/emberharmony-console-core/schema/auth.sql.js"
+import { Identifier } from "@thesolaceproject/emberharmony-console-core/identifier.js"
 
 type Env = {
   AuthStorage: KVNamespace
@@ -111,14 +111,14 @@ export default {
           const emails = (await fetch("https://api.github.com/user/emails", {
             headers: {
               Authorization: `Bearer ${response.tokenset.access}`,
-              "User-Agent": "code-harmony",
+              "User-Agent": "emberharmony",
               Accept: "application/vnd.github+json",
             },
           }).then((x) => x.json())) as any
           const user = (await fetch("https://api.github.com/user", {
             headers: {
               Authorization: `Bearer ${response.tokenset.access}`,
-              "User-Agent": "code-harmony",
+              "User-Agent": "emberharmony",
               Accept: "application/vnd.github+json",
             },
           }).then((x) => x.json())) as any

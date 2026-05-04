@@ -10,15 +10,26 @@ const app = new Hono()
 
 app
   .basePath("/api")
-  .use(cors())
+  .use(
+    cors({
+      origin(input) {
+        if (!input) return undefined
+        if (input.startsWith("http://localhost:")) return input
+        if (input.startsWith("http://127.0.0.1:")) return input
+        if (input === "tauri://localhost" || input === "http://tauri.localhost") return input
+        if (/^https:\/\/([a-z0-9-]+\.)*solace\.ofharmony\.ai$/.test(input)) return input
+        return undefined
+      },
+    }),
+  )
   .get(
     "/doc",
     openAPIRouteHandler(app, {
       documentation: {
         info: {
-          title: "CodeHarmony Enterprise API",
+          title: "EmberHarmony Enterprise API",
           version: "1.0.0",
-          description: "CodeHarmony Enterprise API endpoints",
+          description: "EmberHarmony Enterprise API endpoints",
         },
         openapi: "3.1.1",
       },
@@ -52,12 +63,15 @@ app
     async (c) => {
       const body = c.req.valid("json")
       const share = await Share.create({ sessionID: body.sessionID })
-      const protocol = c.req.header("x-forwarded-proto") ?? c.req.header("x-forwarded-protocol") ?? "https"
-      const host = c.req.header("x-forwarded-host") ?? c.req.header("host")
+      const rawProto = c.req.header("x-forwarded-proto") ?? c.req.header("x-forwarded-protocol") ?? "https"
+      const protocol = rawProto === "http" || rawProto === "https" ? rawProto : "https"
+      const host = c.req.header("x-forwarded-host") ?? c.req.header("host") ?? ""
+      // Reject hosts with protocol-like patterns or path traversal
+      const safeHost = /^[a-z0-9._-]+(:[0-9]+)?$/i.test(host) ? host : ""
       return c.json({
         id: share.id,
         secret: share.secret,
-        url: `${protocol}://${host}/share/${share.id}`,
+        url: safeHost ? `${protocol}://${safeHost}/share/${share.id}` : "",
       })
     },
   )

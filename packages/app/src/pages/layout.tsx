@@ -19,24 +19,24 @@ import { A, useNavigate, useParams } from "@solidjs/router"
 import { useLayout, getAvatarColors, LocalProject } from "@/context/layout"
 import { useGlobalSync } from "@/context/global-sync"
 import { Persist, persisted } from "@/utils/persist"
-import { base64Encode } from "@thesolaceproject/code-harmony-util/encode"
+import { base64Encode } from "@thesolaceproject/emberharmony-util/encode"
 import { decode64 } from "@/utils/base64"
-import { Avatar } from "@thesolaceproject/code-harmony-ui/avatar"
-import { ResizeHandle } from "@thesolaceproject/code-harmony-ui/resize-handle"
-import { Button } from "@thesolaceproject/code-harmony-ui/button"
-import { Icon } from "@thesolaceproject/code-harmony-ui/icon"
-import { IconButton } from "@thesolaceproject/code-harmony-ui/icon-button"
-import { InlineInput } from "@thesolaceproject/code-harmony-ui/inline-input"
-import { Tooltip, TooltipKeybind } from "@thesolaceproject/code-harmony-ui/tooltip"
-import { HoverCard } from "@thesolaceproject/code-harmony-ui/hover-card"
-import { MessageNav } from "@thesolaceproject/code-harmony-ui/message-nav"
-import { DropdownMenu } from "@thesolaceproject/code-harmony-ui/dropdown-menu"
-import { Collapsible } from "@thesolaceproject/code-harmony-ui/collapsible"
-import { DiffChanges } from "@thesolaceproject/code-harmony-ui/diff-changes"
-import { Spinner } from "@thesolaceproject/code-harmony-ui/spinner"
-import { Dialog } from "@thesolaceproject/code-harmony-ui/dialog"
-import { getFilename } from "@thesolaceproject/code-harmony-util/path"
-import { Session, type Message, type TextPart } from "@thesolaceproject/code-harmony-sdk/v2/client"
+import { Avatar } from "@thesolaceproject/emberharmony-ui/avatar"
+import { ResizeHandle } from "@thesolaceproject/emberharmony-ui/resize-handle"
+import { Button } from "@thesolaceproject/emberharmony-ui/button"
+import { Icon } from "@thesolaceproject/emberharmony-ui/icon"
+import { IconButton } from "@thesolaceproject/emberharmony-ui/icon-button"
+import { InlineInput } from "@thesolaceproject/emberharmony-ui/inline-input"
+import { Tooltip, TooltipKeybind } from "@thesolaceproject/emberharmony-ui/tooltip"
+import { HoverCard } from "@thesolaceproject/emberharmony-ui/hover-card"
+import { MessageNav } from "@thesolaceproject/emberharmony-ui/message-nav"
+import { DropdownMenu } from "@thesolaceproject/emberharmony-ui/dropdown-menu"
+import { Collapsible } from "@thesolaceproject/emberharmony-ui/collapsible"
+import { DiffChanges } from "@thesolaceproject/emberharmony-ui/diff-changes"
+import { Spinner } from "@thesolaceproject/emberharmony-ui/spinner"
+import { Dialog } from "@thesolaceproject/emberharmony-ui/dialog"
+import { getFilename } from "@thesolaceproject/emberharmony-util/path"
+import { Session, type Message, type TextPart } from "@thesolaceproject/emberharmony-sdk/v2/client"
 import { usePlatform } from "@/context/platform"
 import { useSettings } from "@/context/settings"
 import { createStore, produce, reconcile } from "solid-js/store"
@@ -50,18 +50,18 @@ import {
 } from "@thisbeyond/solid-dnd"
 import type { DragEvent } from "@thisbeyond/solid-dnd"
 import { useProviders } from "@/hooks/use-providers"
-import { showToast, Toast, toaster } from "@thesolaceproject/code-harmony-ui/toast"
+import { showToast, Toast, toaster } from "@thesolaceproject/emberharmony-ui/toast"
 import { useGlobalSDK } from "@/context/global-sdk"
 import { useNotification } from "@/context/notification"
 import { usePermission } from "@/context/permission"
-import { Binary } from "@thesolaceproject/code-harmony-util/binary"
-import { retry } from "@thesolaceproject/code-harmony-util/retry"
+import { Binary } from "@thesolaceproject/emberharmony-util/binary"
+import { retry } from "@thesolaceproject/emberharmony-util/retry"
 import { playSound, soundSrc } from "@/utils/sound"
 import { Worktree as WorktreeState } from "@/utils/worktree"
 import { agentColor } from "@/utils/agent"
 
-import { useDialog } from "@thesolaceproject/code-harmony-ui/context/dialog"
-import { useTheme, type ColorScheme } from "@thesolaceproject/code-harmony-ui/theme"
+import { useDialog } from "@thesolaceproject/emberharmony-ui/context/dialog"
+import { useTheme, type ColorScheme } from "@thesolaceproject/emberharmony-ui/theme"
 import { DialogSelectProvider } from "@/components/dialog-select-provider"
 import { DialogSelectServer } from "@/components/dialog-select-server"
 import { DialogSettings } from "@/components/dialog-settings"
@@ -1136,14 +1136,16 @@ export default function Layout(props: ParentProps) {
     if (navigate) navigateToProject(directory)
   }
 
-  const deepLinkEvent = "codeharmony:deep-link"
+  const deepLinkEvent = "emberharmony:deep-link"
 
   const parseDeepLink = (input: string) => {
-    if (!input.startsWith("codeharmony://")) return
+    if (!input.startsWith("emberharmony://")) return
     const url = new URL(input)
     if (url.hostname !== "open-project") return
     const directory = url.searchParams.get("directory")
     if (!directory) return
+    // Reject path traversal and relative paths (allow Windows drive letters)
+    if (directory.includes("..") || (!directory.startsWith("/") && !/^[a-zA-Z]:/.test(directory))) return
     return directory
   }
 
@@ -1157,9 +1159,9 @@ export default function Layout(props: ParentProps) {
   }
 
   const drainDeepLinks = () => {
-    const pending = window.__CODE_HARMONY__?.deepLinks ?? []
+    const pending = window.__EMBERHARMONY__?.deepLinks ?? []
     if (pending.length === 0) return
-    if (window.__CODE_HARMONY__) window.__CODE_HARMONY__.deepLinks = []
+    if (window.__EMBERHARMONY__) window.__EMBERHARMONY__.deepLinks = []
     handleDeepLinks(pending)
   }
 
@@ -1849,7 +1851,7 @@ export default function Layout(props: ParentProps) {
                   getLabel={messageLabel}
                   onMessageSelect={(message) => {
                     if (!isActive()) {
-                      sessionStorage.setItem("code-harmony.pendingMessage", `${props.session.id}|${message.id}`)
+                      sessionStorage.setItem("emberharmony.pendingMessage", `${props.session.id}|${message.id}`)
                       navigate(`${props.slug}/session/${props.session.id}`)
                       return
                     }

@@ -1,7 +1,7 @@
 import { action, useParams, useAction, createAsync, useSubmission, json } from "@solidjs/router"
 import { createMemo, Match, Show, Switch, createEffect } from "solid-js"
 import { createStore } from "solid-js/store"
-import { Billing } from "@thesolaceproject/code-harmony-console-core/billing.js"
+import { Billing } from "@thesolaceproject/emberharmony-console-core/billing.js"
 import { withActor } from "~/context/auth.withActor"
 import { IconCreditCard, IconStripe } from "~/component/icon"
 import styles from "./billing-section.module.css"
@@ -53,8 +53,10 @@ export function BillingSection() {
 
     const checkout = await checkoutAction(params.id!, amount, baseUrl, baseUrl)
     if (checkout && checkout.data) {
+      const url = checkout.data
+      if (!/^https:\/\//.test(url)) return
       setStore("checkoutRedirecting", true)
-      window.location.href = checkout.data
+      window.location.href = url
     }
   }
 
@@ -62,8 +64,10 @@ export function BillingSection() {
     const baseUrl = window.location.href
     const sessionUrl = await sessionAction(params.id!, baseUrl)
     if (sessionUrl && sessionUrl.data) {
+      const url = sessionUrl.data
+      if (!/^https:\/\//.test(url)) return
       setStore("sessionRedirecting", true)
-      window.location.href = sessionUrl.data
+      window.location.href = url
     }
   }
 

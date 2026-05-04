@@ -9,9 +9,9 @@ import { Legal } from "~/component/legal"
 export default function TermsOfService() {
   return (
     <main data-page="legal">
-      <Title>CodeHarmony | Terms of Service</Title>
+      <Title>EmberHarmony | Terms of Service</Title>
       <Link rel="canonical" href={`${config.baseUrl}/legal/terms-of-service`} />
-      <Meta name="description" content="CodeHarmony terms of service" />
+      <Meta name="description" content="EmberHarmony terms of service" />
       <div data-component="container">
         <Header />
 
@@ -22,8 +22,8 @@ export default function TermsOfService() {
               <p class="effective-date">Effective date: Dec 16, 2025</p>
 
               <p>
-                Welcome to CodeHarmony. Please read on to learn the rules and restrictions that govern your use of
-                CodeHarmony (the "Services"). If you have any questions, comments, or concerns regarding these terms or
+                Welcome to EmberHarmony. Please read on to learn the rules and restrictions that govern your use of
+                EmberHarmony (the "Services"). If you have any questions, comments, or concerns regarding these terms or
                 the Services, please contact us at:
               </p>
 
@@ -33,7 +33,7 @@ export default function TermsOfService() {
 
               <p>
                 These Terms of Use (the "Terms") are a binding contract between you and{" "}
-                <strong>THE SOLACE PROJECT</strong> ("CodeHarmony," "we" and "us"). Your use of the Services in any way
+                <strong>THE SOLACE PROJECT</strong> ("EmberHarmony," "we" and "us"). Your use of the Services in any way
                 means that you agree to all of these Terms, and these Terms will remain in effect while you use the
                 Services. These Terms include the provisions in this document as well as those in the Privacy Policy{" "}
                 <a href="/legal/privacy-policy">https://solace.ofharmony.ai/legal/privacy-policy</a>.{" "}
@@ -66,12 +66,12 @@ export default function TermsOfService() {
                 RIGHT TO PARTICIPATE IN A CLASS ACTION LAWSUIT OR CLASS-WIDE ARBITRATION.
               </p>
 
-              <h2 id="what-is-code-harmony">What is CodeHarmony?</h2>
+              <h2 id="what-is-emberharmony">What is EmberHarmony?</h2>
               <p>
-                CodeHarmony is an AI-powered coding agent that helps you write, understand, and modify code using large
+                EmberHarmony is an AI-powered coding agent that helps you write, understand, and modify code using large
                 language models. Certain of these large language models are provided by third parties ("Third Party
-                Models") and certain of these models are provided directly by us if you use the CodeHarmony Zen paid
-                offering ("Zen"). Regardless of whether you use Third Party Models or Zen, CodeHarmony enables you to
+                Models") and certain of these models are provided directly by us if you use the EmberHarmony Zen paid
+                offering ("Zen"). Regardless of whether you use Third Party Models or Zen, EmberHarmony enables you to
                 access the functionality of models through a coding agent running within your terminal.
               </p>
 
@@ -95,7 +95,7 @@ export default function TermsOfService() {
 
               <h2 id="what-about-my-privacy">What about my privacy?</h2>
               <p>
-                CodeHarmony takes the privacy of its users very seriously. For the current CodeHarmony Privacy Policy,
+                EmberHarmony takes the privacy of its users very seriously. For the current EmberHarmony Privacy Policy,
                 please click here{" "}
                 <a href="https://solace.ofharmony.ai/legal/privacy-policy">
                   https://solace.ofharmony.ai/legal/privacy-policy
@@ -116,7 +116,7 @@ export default function TermsOfService() {
                 <a href="mailto:sydney@solace.ofharmony.ai">sydney@solace.ofharmony.ai</a>.
               </p>
 
-              <h2 id="what-are-the-basics">What are the basics of using CodeHarmony?</h2>
+              <h2 id="what-are-the-basics">What are the basics of using EmberHarmony?</h2>
               <p>
                 You represent and warrant that you are an individual of legal age to form a binding contract (or if not,
                 you've received your parent's or guardian's permission to use the Services and have gotten your parent
@@ -143,11 +143,11 @@ export default function TermsOfService() {
               <ol style="list-style-type: lower-alpha;">
                 <li>
                   infringes or violates the intellectual property rights or any other rights of anyone else (including
-                  CodeHarmony);
+                  EmberHarmony);
                 </li>
                 <li>
                   violates any law or regulation, including, without limitation, any applicable export control laws,
-                  privacy laws or any other purpose not reasonably intended by CodeHarmony;
+                  privacy laws or any other purpose not reasonably intended by EmberHarmony;
                 </li>
                 <li>
                   is dangerous, harmful, fraudulent, deceptive, threatening, harassing, defamatory, obscene, or
@@ -223,7 +223,7 @@ export default function TermsOfService() {
               </p>
 
               <p>
-                If you use CodeHarmony with Third Party Models, then your Content will be subject to the data retention
+                If you use EmberHarmony with Third Party Models, then your Content will be subject to the data retention
                 policies of the providers of such Third Party Models. Although we will not retain your Content, we
                 cannot and do not control the retention practices of Third Party Model providers. You should review the
                 terms and conditions applicable to any Third Party Model for more information about the data use and
@@ -233,19 +233,19 @@ export default function TermsOfService() {
               <h2 id="what-about-third-party-models">What about Third Party Models?</h2>
               <p>
                 The Services enable you to access and use Third Party Models, which are not owned or controlled by
-                CodeHarmony. Your ability to access Third Party Models is contingent on you having API keys or otherwise
+                EmberHarmony. Your ability to access Third Party Models is contingent on you having API keys or otherwise
                 having the right to access such Third Party Models.
               </p>
 
               <p>
-                CodeHarmony has no control over, and assumes no responsibility for, the content, accuracy, privacy
+                EmberHarmony has no control over, and assumes no responsibility for, the content, accuracy, privacy
                 policies, or practices of any providers of Third Party Models. We encourage you to read the terms and
                 conditions and privacy policy of each provider of a Third Party Model that you choose to utilize. By
                 using the Services, you release and hold us harmless from any and all liability arising from your use of
                 any Third Party Model.
               </p>
 
-              <h2 id="will-code-harmony-ever-change-the-services">Will CodeHarmony ever change the Services?</h2>
+              <h2 id="will-emberharmony-ever-change-the-services">Will EmberHarmony ever change the Services?</h2>
               <p>
                 We're always trying to improve our Services, so they may change over time. We may suspend or discontinue
                 any part of the Services, or we may introduce new features or impose limits on certain features or
@@ -325,8 +325,8 @@ export default function TermsOfService() {
               </p>
 
               <p>
-                CodeHarmony is also free to terminate (or suspend access to) your use of the Services for any reason in
-                our discretion, including your breach of these Terms. CodeHarmony has the sole right to decide whether
+                EmberHarmony is also free to terminate (or suspend access to) your use of the Services for any reason in
+                our discretion, including your breach of these Terms. EmberHarmony has the sole right to decide whether
                 you are in violation of any of the restrictions set forth in these Terms.
               </p>
 
@@ -341,17 +341,17 @@ export default function TermsOfService() {
 
               <h3>Warranty Disclaimer</h3>
               <p>
-                CodeHarmony and its licensors, suppliers, partners, parent, subsidiaries or affiliated entities, and
+                EmberHarmony and its licensors, suppliers, partners, parent, subsidiaries or affiliated entities, and
                 each of their respective officers, directors, members, employees, consultants, contract employees,
-                representatives and agents, and each of their respective successors and assigns (CodeHarmony and all
-                such parties together, the "CodeHarmony Parties") make no representations or warranties concerning the
+                representatives and agents, and each of their respective successors and assigns (EmberHarmony and all
+                such parties together, the "EmberHarmony Parties") make no representations or warranties concerning the
                 Services, including without limitation regarding any Content contained in or accessed through the
-                Services, and the CodeHarmony Parties will not be responsible or liable for the accuracy, copyright
+                Services, and the EmberHarmony Parties will not be responsible or liable for the accuracy, copyright
                 compliance, legality, or decency of material contained in or accessed through the Services or any
                 claims, actions, suits procedures, costs, expenses, damages or liabilities arising out of use of, or in
-                any way related to your participation in, the Services. The CodeHarmony Parties make no representations
+                any way related to your participation in, the Services. The EmberHarmony Parties make no representations
                 or warranties regarding suggestions or recommendations of services or products offered or purchased
-                through or in connection with the Services. THE SERVICES AND CONTENT ARE PROVIDED BY CODEHARMONY (AND ITS
+                through or in connection with the Services. THE SERVICES AND CONTENT ARE PROVIDED BY EMBERHARMONY (AND ITS
                 LICENSORS AND SUPPLIERS) ON AN "AS-IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
                 INCLUDING, WITHOUT LIMITATION, IMPLIED WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE,
                 NON-INFRINGEMENT, OR THAT USE OF THE SERVICES WILL BE UNINTERRUPTED OR ERROR-FREE. SOME STATES DO NOT
@@ -362,12 +362,12 @@ export default function TermsOfService() {
               <p>
                 TO THE FULLEST EXTENT ALLOWED BY APPLICABLE LAW, UNDER NO CIRCUMSTANCES AND UNDER NO LEGAL THEORY
                 (INCLUDING, WITHOUT LIMITATION, TORT, CONTRACT, STRICT LIABILITY, OR OTHERWISE) SHALL ANY OF THE
-                CODEHARMONY PARTIES BE LIABLE TO YOU OR TO ANY OTHER PERSON FOR (A) ANY INDIRECT, SPECIAL, INCIDENTAL,
+                EMBERHARMONY PARTIES BE LIABLE TO YOU OR TO ANY OTHER PERSON FOR (A) ANY INDIRECT, SPECIAL, INCIDENTAL,
                 PUNITIVE OR CONSEQUENTIAL DAMAGES OF ANY KIND, INCLUDING DAMAGES FOR LOST PROFITS, BUSINESS
                 INTERRUPTION, LOSS OF DATA, LOSS OF GOODWILL, WORK STOPPAGE, ACCURACY OF RESULTS, OR COMPUTER FAILURE OR
                 MALFUNCTION, (B) ANY SUBSTITUTE GOODS, SERVICES OR TECHNOLOGY, (C) ANY AMOUNT, IN THE AGGREGATE, IN
                 EXCESS OF THE GREATER OF (I) ONE-HUNDRED ($100) DOLLARS OR (II) THE AMOUNTS PAID AND/OR PAYABLE BY YOU
-                TO CODEHARMONY IN CONNECTION WITH THE SERVICES IN THE TWELVE (12) MONTH PERIOD PRECEDING THIS APPLICABLE
+                TO EMBERHARMONY IN CONNECTION WITH THE SERVICES IN THE TWELVE (12) MONTH PERIOD PRECEDING THIS APPLICABLE
                 CLAIM OR (D) ANY MATTER BEYOND OUR REASONABLE CONTROL. SOME STATES DO NOT ALLOW THE EXCLUSION OR
                 LIMITATION OF INCIDENTAL OR CONSEQUENTIAL OR CERTAIN OTHER DAMAGES, SO THE ABOVE LIMITATION AND
                 EXCLUSIONS MAY NOT APPLY TO YOU.
@@ -375,7 +375,7 @@ export default function TermsOfService() {
 
               <h3>Indemnity</h3>
               <p>
-                You agree to indemnify and hold the CodeHarmony Parties harmless from and against any and all claims,
+                You agree to indemnify and hold the EmberHarmony Parties harmless from and against any and all claims,
                 liabilities, damages (actual and consequential), losses and expenses (including attorneys' fees) arising
                 from or in any way related to any claims relating to (a) your use of the Services, and (b) your
                 violation of these Terms. In the event of such a claim, suit, or action ("Claim"), we will attempt to
@@ -386,7 +386,7 @@ export default function TermsOfService() {
               <h3>Assignment</h3>
               <p>
                 You may not assign, delegate or transfer these Terms or your rights or obligations hereunder, or your
-                Services account, in any way (by operation of law or otherwise) without CodeHarmony's prior written
+                Services account, in any way (by operation of law or otherwise) without EmberHarmony's prior written
                 consent. We may transfer, assign, or delegate these Terms and our rights and obligations without
                 consent.
               </p>
@@ -400,9 +400,9 @@ export default function TermsOfService() {
               <h3 id="arbitration-agreement">Arbitration Agreement</h3>
               <p>
                 Please read the following ARBITRATION AGREEMENT carefully because it requires you to arbitrate certain
-                disputes and claims with CodeHarmony and limits the manner in which you can seek relief from
-                CodeHarmony. Both you and CodeHarmony acknowledge and agree that for the purposes of any dispute arising
-                out of or relating to the subject matter of these Terms, CodeHarmony's officers, directors, employees
+                disputes and claims with EmberHarmony and limits the manner in which you can seek relief from
+                EmberHarmony. Both you and EmberHarmony acknowledge and agree that for the purposes of any dispute arising
+                out of or relating to the subject matter of these Terms, EmberHarmony's officers, directors, employees
                 and independent contractors ("Personnel") are third-party beneficiaries of these Terms, and that upon
                 your acceptance of these Terms, Personnel will have the right (and will be deemed to have accepted the
                 right) to enforce these Terms against you as the third-party beneficiary hereof.
@@ -423,14 +423,14 @@ export default function TermsOfService() {
 
               <h4>Costs of Arbitration</h4>
               <p>
-                The Rules will govern payment of all arbitration fees. CodeHarmony will pay all arbitration fees for
-                claims less than seventy-five thousand ($75,000) dollars. CodeHarmony will not seek its attorneys' fees
+                The Rules will govern payment of all arbitration fees. EmberHarmony will pay all arbitration fees for
+                claims less than seventy-five thousand ($75,000) dollars. EmberHarmony will not seek its attorneys' fees
                 and costs in arbitration unless the arbitrator determines that your claim is frivolous.
               </p>
 
               <h4>Small Claims Court; Infringement</h4>
               <p>
-                Either you or CodeHarmony may assert claims, if they qualify, in small claims court in New Castle
+                Either you or EmberHarmony may assert claims, if they qualify, in small claims court in New Castle
                 County, Delaware or any United States county where you live or work. Furthermore, notwithstanding the
                 foregoing obligation to arbitrate disputes, each party shall have the right to pursue injunctive or
                 other equitable relief at any time, from any court of competent jurisdiction, to prevent the actual or
@@ -440,11 +440,11 @@ export default function TermsOfService() {
 
               <h4>Waiver of Jury Trial</h4>
               <p>
-                YOU AND CODEHARMONY WAIVE ANY CONSTITUTIONAL AND STATUTORY RIGHTS TO GO TO COURT AND HAVE A TRIAL IN FRONT
-                OF A JUDGE OR JURY. You and CodeHarmony are instead choosing to have claims and disputes resolved by
+                YOU AND EMBERHARMONY WAIVE ANY CONSTITUTIONAL AND STATUTORY RIGHTS TO GO TO COURT AND HAVE A TRIAL IN FRONT
+                OF A JUDGE OR JURY. You and EmberHarmony are instead choosing to have claims and disputes resolved by
                 arbitration. Arbitration procedures are typically more limited, more efficient, and less costly than
                 rules applicable in court and are subject to very limited review by a court. In any litigation between
-                you and CodeHarmony over whether to vacate or enforce an arbitration award, YOU AND CODEHARMONY WAIVE ALL
+                you and EmberHarmony over whether to vacate or enforce an arbitration award, YOU AND EMBERHARMONY WAIVE ALL
                 RIGHTS TO A JURY TRIAL, and elect instead to have the dispute be resolved by a judge.
               </p>
 
@@ -454,7 +454,7 @@ export default function TermsOfService() {
                 ON AN INDIVIDUAL BASIS AND NOT ON A CLASS BASIS. CLAIMS OF MORE THAN ONE CUSTOMER OR USER CANNOT BE
                 ARBITRATED OR LITIGATED JOINTLY OR CONSOLIDATED WITH THOSE OF ANY OTHER CUSTOMER OR USER. If however,
                 this waiver of class or consolidated actions is deemed invalid or unenforceable, neither you nor
-                CodeHarmony is entitled to arbitration; instead all claims and disputes will be resolved in a court as
+                EmberHarmony is entitled to arbitration; instead all claims and disputes will be resolved in a court as
                 set forth in (g) below.
               </p>
 
@@ -470,9 +470,9 @@ export default function TermsOfService() {
               <h4>Exclusive Venue</h4>
               <p>
                 If you send the opt-out notice in (f), and/or in any circumstances where the foregoing arbitration
-                agreement permits either you or CodeHarmony to litigate any dispute arising out of or relating to the
+                agreement permits either you or EmberHarmony to litigate any dispute arising out of or relating to the
                 subject matter of these Terms in court, then the foregoing arbitration agreement will not apply to
-                either party, and both you and CodeHarmony agree that any judicial proceeding (other than small claims
+                either party, and both you and EmberHarmony agree that any judicial proceeding (other than small claims
                 actions) will be brought in the state or federal courts located in, respectively, New Castle County,
                 Delaware, or the federal district in which that county falls.
               </p>
@@ -482,28 +482,28 @@ export default function TermsOfService() {
                 If the prohibition against class actions and other claims brought on behalf of third parties contained
                 above is found to be unenforceable, then all of the preceding language in this Arbitration Agreement
                 section will be null and void. This arbitration agreement will survive the termination of your
-                relationship with CodeHarmony.
+                relationship with EmberHarmony.
               </p>
 
               <h3>Miscellaneous</h3>
               <p>
                 You will be responsible for paying, withholding, filing, and reporting all taxes, duties, and other
                 governmental assessments associated with your activity in connection with the Services, provided that
-                the CodeHarmony may, in its sole discretion, do any of the foregoing on your behalf or for itself as it
+                the EmberHarmony may, in its sole discretion, do any of the foregoing on your behalf or for itself as it
                 sees fit. The failure of either you or us to exercise, in any way, any right herein shall not be deemed
                 a waiver of any further rights hereunder. If any provision of these Terms are found to be unenforceable
                 or invalid, that provision will be limited or eliminated, to the minimum extent necessary, so that these
-                Terms shall otherwise remain in full force and effect and enforceable. You and CodeHarmony agree that
+                Terms shall otherwise remain in full force and effect and enforceable. You and EmberHarmony agree that
                 these Terms are the complete and exclusive statement of the mutual understanding between you and
-                CodeHarmony, and that these Terms supersede and cancel all previous written and oral agreements,
+                EmberHarmony, and that these Terms supersede and cancel all previous written and oral agreements,
                 communications and other understandings relating to the subject matter of these Terms. You hereby
-                acknowledge and agree that you are not an employee, agent, partner, or joint venture of CodeHarmony, and
-                you do not have any authority of any kind to bind CodeHarmony in any respect whatsoever.
+                acknowledge and agree that you are not an employee, agent, partner, or joint venture of EmberHarmony, and
+                you do not have any authority of any kind to bind EmberHarmony in any respect whatsoever.
               </p>
 
               <p>
                 Except as expressly set forth in the section above regarding the arbitration agreement, you and
-                CodeHarmony agree there are no third-party beneficiaries intended under these Terms.
+                EmberHarmony agree there are no third-party beneficiaries intended under these Terms.
               </p>
             </article>
           </section>

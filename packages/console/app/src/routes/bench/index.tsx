@@ -1,8 +1,8 @@
 import { Title } from "@solidjs/meta"
 import { A, createAsync, query } from "@solidjs/router"
 import { createMemo, For, Show } from "solid-js"
-import { Database, desc } from "@thesolaceproject/code-harmony-console-core/drizzle/index.js"
-import { BenchmarkTable } from "@thesolaceproject/code-harmony-console-core/schema/benchmark.sql.js"
+import { Database, desc } from "@thesolaceproject/emberharmony-console-core/drizzle/index.js"
+import { BenchmarkTable } from "@thesolaceproject/emberharmony-console-core/schema/benchmark.sql.js"
 
 interface BenchmarkResult {
   averageScore: number

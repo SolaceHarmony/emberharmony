@@ -1,6 +1,6 @@
 {
-  "name": "@thesolaceproject/code-harmony-ui",
-  "version": "1.0.0",
+  "name": "@thesolaceproject/emberharmony-ui",
+  "version": "1.2.2",
   "type": "module",
   "license": "MIT",
   "exports": {
@@ -40,8 +40,8 @@
   },
   "dependencies": {
     "@kobalte/core": "catalog:",
-    "@thesolaceproject/code-harmony-sdk": "workspace:*",
-    "@thesolaceproject/code-harmony-util": "workspace:*",
+    "@thesolaceproject/emberharmony-sdk": "workspace:*",
+    "@thesolaceproject/emberharmony-util": "workspace:*",
     "@pierre/diffs": "catalog:",
     "@shikijs/transformers": "3.9.2",
     "@solid-primitives/bounds": "0.1.3",
@@ -49,7 +49,7 @@
     "@solid-primitives/resize-observer": "2.1.3",
     "@solidjs/meta": "catalog:",
     "@typescript/native-preview": "catalog:",
-    "dompurify": "3.3.1",
+    "dompurify": "3.3.3",
     "fuzzysort": "catalog:",
     "katex": "0.16.27",
     "luxon": "catalog:",

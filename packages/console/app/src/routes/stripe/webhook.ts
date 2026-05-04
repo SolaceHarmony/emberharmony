@@ -1,17 +1,17 @@
-import { Billing } from "@thesolaceproject/code-harmony-console-core/billing.js"
+import { Billing } from "@thesolaceproject/emberharmony-console-core/billing.js"
 import type { APIEvent } from "@solidjs/start/server"
-import { and, Database, eq, isNull, sql } from "@thesolaceproject/code-harmony-console-core/drizzle/index.js"
+import { and, Database, eq, isNull, sql } from "@thesolaceproject/emberharmony-console-core/drizzle/index.js"
 import {
   BillingTable,
   PaymentTable,
   SubscriptionTable,
-} from "@thesolaceproject/code-harmony-console-core/schema/billing.sql.js"
-import { Identifier } from "@thesolaceproject/code-harmony-console-core/identifier.js"
-import { centsToMicroCents } from "@thesolaceproject/code-harmony-console-core/util/price.js"
-import { Actor } from "@thesolaceproject/code-harmony-console-core/actor.js"
-import { Resource } from "@thesolaceproject/code-harmony-console-resource"
-import { UserTable } from "@thesolaceproject/code-harmony-console-core/schema/user.sql.js"
-import { AuthTable } from "@thesolaceproject/code-harmony-console-core/schema/auth.sql.js"
+} from "@thesolaceproject/emberharmony-console-core/schema/billing.sql.js"
+import { Identifier } from "@thesolaceproject/emberharmony-console-core/identifier.js"
+import { centsToMicroCents } from "@thesolaceproject/emberharmony-console-core/util/price.js"
+import { Actor } from "@thesolaceproject/emberharmony-console-core/actor.js"
+import { Resource } from "@thesolaceproject/emberharmony-console-resource"
+import { UserTable } from "@thesolaceproject/emberharmony-console-core/schema/user.sql.js"
+import { AuthTable } from "@thesolaceproject/emberharmony-console-core/schema/auth.sql.js"
 
 export async function POST(input: APIEvent) {
   const body = await Billing.stripe().webhooks.constructEventAsync(
@@ -583,6 +583,7 @@ export async function POST(input: APIEvent) {
       return Response.json({ message: message ?? "done" }, { status: 200 })
     })
     .catch((error: any) => {
-      return Response.json({ message: error.message }, { status: 500 })
+      console.error("[stripe webhook]", error)
+      return Response.json({ message: "Internal server error" }, { status: 500 })
     })
 }

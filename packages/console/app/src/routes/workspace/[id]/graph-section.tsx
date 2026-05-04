@@ -9,11 +9,11 @@ import {
   or,
   sql,
   sum,
-} from "@thesolaceproject/code-harmony-console-core/drizzle/index.js"
-import { UsageTable } from "@thesolaceproject/code-harmony-console-core/schema/billing.sql.js"
-import { KeyTable } from "@thesolaceproject/code-harmony-console-core/schema/key.sql.js"
-import { UserTable } from "@thesolaceproject/code-harmony-console-core/schema/user.sql.js"
-import { AuthTable } from "@thesolaceproject/code-harmony-console-core/schema/auth.sql.js"
+} from "@thesolaceproject/emberharmony-console-core/drizzle/index.js"
+import { UsageTable } from "@thesolaceproject/emberharmony-console-core/schema/billing.sql.js"
+import { KeyTable } from "@thesolaceproject/emberharmony-console-core/schema/key.sql.js"
+import { UserTable } from "@thesolaceproject/emberharmony-console-core/schema/user.sql.js"
+import { AuthTable } from "@thesolaceproject/emberharmony-console-core/schema/auth.sql.js"
 import { useParams } from "@solidjs/router"
 import { createEffect, createMemo, onCleanup, Show, For } from "solid-js"
 import { createStore } from "solid-js/store"

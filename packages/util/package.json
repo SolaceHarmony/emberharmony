@@ -1,6 +1,6 @@
 {
-  "name": "@thesolaceproject/code-harmony-util",
-  "version": "1.0.0",
+  "name": "@thesolaceproject/emberharmony-util",
+  "version": "1.2.2",
   "private": true,
   "type": "module",
   "license": "MIT",

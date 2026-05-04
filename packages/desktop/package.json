@@ -1,7 +1,7 @@
 {
-  "name": "@thesolaceproject/code-harmony-desktop",
+  "name": "@thesolaceproject/emberharmony-desktop",
   "private": true,
-  "version": "1.0.0",
+  "version": "1.2.2",
   "type": "module",
   "license": "MIT",
   "scripts": {
@@ -9,12 +9,15 @@
     "predev": "bun ./scripts/predev.ts",
     "dev": "vite",
     "build": "bun run typecheck && vite build",
+    "build:local": "bun ./scripts/build-local.ts",
+    "build:local:nobundle": "bun ./scripts/build-local.ts --no-bundle",
+    "build:local:nodmg": "bun ./scripts/build-local.ts --no-dmg",
     "preview": "vite preview",
     "tauri": "tauri"
   },
   "dependencies": {
-    "@thesolaceproject/code-harmony-app": "workspace:*",
-    "@thesolaceproject/code-harmony-ui": "workspace:*",
+    "@thesolaceproject/emberharmony-app": "workspace:*",
+    "@thesolaceproject/emberharmony-ui": "workspace:*",
     "@solid-primitives/i18n": "2.2.1",
     "@solid-primitives/storage": "catalog:",
     "@tauri-apps/api": "^2",

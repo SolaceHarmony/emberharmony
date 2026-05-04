@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "CodeHarmony Dev",
+  "productName": "EmberHarmony Dev",
   "identifier": "ai.ofharmony.code.dev",
-  "mainBinaryName": "CodeHarmony",
+  "mainBinaryName": "EmberHarmony",
   "version": "../package.json",
   "build": {
     "beforeDevCommand": "bun run dev",
@@ -15,7 +15,7 @@
       {
         "label": "main",
         "create": false,
-        "title": "CodeHarmony",
+        "title": "EmberHarmony",
         "url": "/",
         "decorations": true,
         "transparent": true,
@@ -28,7 +28,7 @@
     ],
     "withGlobalTauri": true,
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; connect-src 'self' http://localhost:* http://127.0.0.1:* ws://localhost:* ws://127.0.0.1:* wss://localhost:* https://*.solace.ofharmony.ai https://github.com/SolaceHarmony/ tauri://localhost http://tauri.localhost; media-src 'self' data:"
     },
     "macOSPrivateApi": true
   },
@@ -42,7 +42,7 @@
     ],
     "active": true,
     "targets": ["deb", "rpm", "dmg", "nsis", "app"],
-    "externalBin": ["sidecars@thesolaceproject/code-harmony-cli"],
+    "externalBin": ["sidecars/emberharmony-cli"],
     "macOS": {
       "entitlements": "./entitlements.plist"
     },
@@ -57,7 +57,7 @@
   "plugins": {
     "deep-link": {
       "desktop": {
-        "schemes": ["codeharmony"]
+        "schemes": ["emberharmony"]
       }
     }
   }

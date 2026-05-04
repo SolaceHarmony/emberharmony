@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-APP=code-harmony
+APP=emberharmony
 
 MUTED='\033[0;2m'
 RED='\033[0;31m'
@@ -9,7 +9,7 @@ NC='\033[0m' # No Color
 
 usage() {
     cat <<EOF
-CodeHarmony Installer
+EmberHarmony Installer
 
 Usage: install.sh [options]
 
@@ -20,9 +20,9 @@ Options:
         --no-modify-path    Don't modify shell config files (.zshrc, .bashrc, etc.)
 
 Examples:
-    curl -fsSL https://raw.githubusercontent.com/sydneyrenee/code-harmony/main/install | bash
-    curl -fsSL https://raw.githubusercontent.com/sydneyrenee/code-harmony/main/install | bash -s -- --version 1.0.180
-    ./install --binary /path/to/code-harmony
+    curl -fsSL https://raw.githubusercontent.com/SolaceHarmony/emberharmony/dev/install | bash
+    curl -fsSL https://raw.githubusercontent.com/SolaceHarmony/emberharmony/dev/install | bash -s -- --version 1.0.180
+    ./install --binary /path/to/emberharmony
 EOF
 }
 
@@ -66,13 +66,13 @@ while [[ $# -gt 0 ]]; do
 done
 
 detect_install_dir() {
-    if [ -n "${CODE_HARMONY_INSTALL_DIR-}" ]; then
-        echo "$CODE_HARMONY_INSTALL_DIR"
+    if [ -n "${EMBERHARMONY_INSTALL_DIR-}" ]; then
+        echo "$EMBERHARMONY_INSTALL_DIR"
         return
     fi
-    # Backward compat for users that still set this.
-    if [ -n "${CODE_HARMONY_INSTALL_DIR-}" ]; then
-        echo "$CODE_HARMONY_INSTALL_DIR"
+    # Backward compat for users migrating from opencode
+    if [ -n "${OPENCODE_INSTALL_DIR-}" ]; then
+        echo "$OPENCODE_INSTALL_DIR"
         return
     fi
     if [ -n "${XDG_BIN_DIR-}" ]; then
@@ -83,7 +83,7 @@ detect_install_dir() {
         echo "$HOME/bin"
         return
     fi
-    echo "$HOME/.code-harmony/bin"
+    echo "$HOME/.emberharmony/bin"
 }
 
 INSTALL_DIR=$(detect_install_dir)
@@ -188,8 +188,8 @@ else
     fi
 
     if [ -z "$requested_version" ]; then
-        url="https://github.com/sydneyrenee/code-harmony/releases/latest/download/$filename"
-        specific_version=$(curl -s https://api.github.com/repos/sydneyrenee/code-harmony/releases/latest | sed -n 's/.*"tag_name": *"v\([^"]*\)".*/\1/p')
+        url="https://github.com/SolaceHarmony/emberharmony/releases/latest/download/$filename"
+        specific_version=$(curl -s https://api.github.com/repos/SolaceHarmony/emberharmony/releases/latest | sed -n 's/.*"tag_name": *"v\([^"]*\)".*/\1/p')
 
         if [[ $? -ne 0 || -z "$specific_version" ]]; then
             echo -e "${RED}Failed to fetch version information${NC}"
@@ -198,14 +198,14 @@ else
     else
         # Strip leading 'v' if present
         requested_version="${requested_version#v}"
-        url="https://github.com/sydneyrenee/code-harmony/releases/download/v${requested_version}/$filename"
+        url="https://github.com/SolaceHarmony/emberharmony/releases/download/v${requested_version}/$filename"
         specific_version=$requested_version
 
         # Verify the release exists before downloading
-        http_status=$(curl -sI -o /dev/null -w "%{http_code}" "https://github.com/sydneyrenee/code-harmony/releases/tag/v${requested_version}")
+        http_status=$(curl -sI -o /dev/null -w "%{http_code}" "https://github.com/SolaceHarmony/emberharmony/releases/tag/v${requested_version}")
         if [ "$http_status" = "404" ]; then
             echo -e "${RED}Error: Release v${requested_version} not found${NC}"
-            echo -e "${MUTED}Available releases: https://github.com/sydneyrenee/code-harmony/releases${NC}"
+            echo -e "${MUTED}Available releases: https://github.com/SolaceHarmony/emberharmony/releases${NC}"
             exit 1
         fi
     fi
@@ -281,17 +281,16 @@ download_with_progress() {
         exec 4>/dev/null
     fi
 
-    local tmp_dir=${TMPDIR:-/tmp}
-    local basename="${tmp_dir}/code_harmony_install_$$"
-    local tracefile="${basename}.trace"
+    local tracedir
+    tracedir=$(mktemp -d)
+    local tracefile="${tracedir}/trace"
 
-    rm -f "$tracefile"
     mkfifo "$tracefile"
 
     # Hide cursor
     printf "\033[?25l" >&4
 
-    trap "trap - RETURN; rm -f \"$tracefile\"; printf '\033[?25h' >&4; exec 4>&-" RETURN
+    trap "trap - RETURN; rm -rf \"$tracedir\"; printf '\033[?25h' >&4; exec 4>&-" RETURN
 
     (
         curl --trace-ascii "$tracefile" -s -L -o "$output" "$url"
@@ -331,14 +330,56 @@ download_with_progress() {
     return $ret
 }
 
+verify_checksum() {
+    local archive="$1"
+    local checksum_url="$2"
+    local sha_cmd
+
+    if command -v shasum >/dev/null 2>&1; then
+        sha_cmd="shasum -a 256"
+    elif command -v sha256sum >/dev/null 2>&1; then
+        sha_cmd="sha256sum"
+    else
+        echo -e "${ORANGE}Warning: No SHA256 tool found, skipping checksum verification${NC}" >&2
+        return 0
+    fi
+
+    local expected
+    expected=$(curl -fsSL "$checksum_url" | awk '{print $1}') || {
+        echo -e "${ORANGE}Warning: Could not fetch checksum, skipping verification${NC}" >&2
+        return 0
+    }
+    if [ -z "$expected" ]; then
+        echo -e "${ORANGE}Warning: Could not fetch checksum, skipping verification${NC}" >&2
+        return 0
+    fi
+
+    local actual
+    actual=$($sha_cmd "$archive" | awk '{print $1}')
+
+    if [ "$expected" != "$actual" ]; then
+        echo -e "${RED}Checksum mismatch! Aborting.${NC}" >&2
+        echo -e "${RED}Expected: $expected${NC}" >&2
+        echo -e "${RED}Actual:   $actual${NC}" >&2
+        return 1
+    fi
+
+    echo -e "${MUTED}Checksum verified.${NC}"
+}
+
 download_and_install() {
     print_message info "\n${MUTED}Installing ${NC}${APP} ${MUTED}version: ${NC}$specific_version"
-    local tmp_dir="${TMPDIR:-/tmp}/code_harmony_install_$$"
-    mkdir -p "$tmp_dir"
+    local tmp_dir
+    tmp_dir=$(mktemp -d)
 
     if [[ "$os" == "windows" ]] || ! [ -t 2 ] || ! download_with_progress "$url" "$tmp_dir/$filename"; then
         # Fallback to standard curl on Windows, non-TTY environments, or if custom progress fails
         curl -# -L -o "$tmp_dir/$filename" "$url"
+    fi
+
+    if ! verify_checksum "$tmp_dir/$filename" "${url}.sha256"; then
+        rm -rf "$tmp_dir"
+        exit 1
     fi
 
     if [ "$os" = "linux" ]; then
@@ -373,7 +414,7 @@ add_to_path() {
     if grep -Fxq "$command" "$config_file"; then
         print_message info "Command already exists in $config_file, skipping write."
     elif [[ -w $config_file ]]; then
-        echo -e "\n# code-harmony" >> "$config_file"
+        echo -e "\n# emberharmony" >> "$config_file"
         echo "$command" >> "$config_file"
         print_message info "${MUTED}Successfully added ${NC}${APP} ${MUTED}to \$PATH in ${NC}$config_file"
     else
@@ -457,11 +498,11 @@ echo -e "${MUTED}█░░█ █░░█ █▀▀▀ █░░█ ${NC}█░
 echo -e "${MUTED}▀▀▀▀ █▀▀▀ ▀▀▀▀ ▀  ▀ ${NC}▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀"
 echo -e ""
 echo -e ""
-echo -e "${MUTED}CodeHarmony includes free models, to start:${NC}"
+echo -e "${MUTED}EmberHarmony includes free models, to start:${NC}"
 echo -e ""
 echo -e "cd <project>  ${MUTED}# Open directory${NC}"
-echo -e "code-harmony      ${MUTED}# Run command${NC}"
+echo -e "emberharmony      ${MUTED}# Run command${NC}"
 echo -e ""
-echo -e "${MUTED}For more information visit ${NC}https://github.com/sydneyrenee/code-harmony"
+echo -e "${MUTED}For more information visit ${NC}https://github.com/SolaceHarmony/emberharmony"
 echo -e ""
 echo -e ""

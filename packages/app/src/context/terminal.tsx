@@ -1,5 +1,5 @@
 import { createStore, produce } from "solid-js/store"
-import { createSimpleContext } from "@thesolaceproject/code-harmony-ui/context"
+import { createSimpleContext } from "@thesolaceproject/emberharmony-ui/context"
 import { batch, createEffect, createMemo, createRoot, onCleanup } from "solid-js"
 import { useParams } from "@solidjs/router"
 import { useSDK } from "./sdk"
