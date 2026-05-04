@@ -28,10 +28,20 @@ async function generatePKCE(): Promise<PkceCodes> {
 
 function generateRandomString(length: number): string {
   const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
-  const bytes = crypto.getRandomValues(new Uint8Array(length))
-  return Array.from(bytes)
-    .map((b) => chars[b % chars.length])
-    .join("")
+  const charLen = chars.length
+  const maxValid = Math.floor(256 / charLen) * charLen
+  const result: string[] = []
+
+  while (result.length < length) {
+    const bytes = crypto.getRandomValues(new Uint8Array(length - result.length))
+    for (const b of bytes) {
+      if (b >= maxValid) continue
+      result.push(chars[b % charLen])
+      if (result.length === length) break
+    }
+  }
+
+  return result.join("")
 }
 
 function base64UrlEncode(buffer: ArrayBuffer): string {
