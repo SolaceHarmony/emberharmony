@@ -19,7 +19,7 @@ If you share what you’re shipping (.app, .dmg, .pkg, or .zip) and whether you 
 - `.pkg` (installer package)
 - `.zip` (zipped app)
 
-You can submit any of the above to Apple’s notarization service. Best practice is to notarize the app bundle and staple it, then package into a DMG (and optionally notarize/staple the DMG as well).
+You can submit any of the above to Apple’s notarization service. Best practice is to notarize the app bundle and staple it, then package into a DMG or PKG, which should also be notarized and stapled to ensure a smooth Gatekeeper experience.
 
 ---
 
