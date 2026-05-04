@@ -776,15 +776,32 @@ export const GithubRunCommand = cmd({
         const matches = [...mdMatches, ...tagMatches].sort((a, b) => a.index - b.index)
         console.log("Images", JSON.stringify(matches, null, 2))
 
+        const toAllowedAttachmentUrl = (raw: string): string | null => {
+          try {
+            const parsed = new URL(raw)
+            if (parsed.protocol !== "https:") return null
+            if (parsed.hostname !== "github.com") return null
+            if (!parsed.pathname.startsWith("/user-attachments/")) return null
+            return parsed.toString()
+          } catch {
+            return null
+          }
+        }
+
         let offset = 0
         for (const m of matches) {
           const tag = m[0]
           const url = m[1]
           const start = m.index
-          const filename = path.basename(url)
+          const safeUrl = toAllowedAttachmentUrl(url)
+          if (!safeUrl) {
+            console.error(`Skipping non-allowed attachment URL: ${url}`)
+            continue
+          }
+          const filename = path.basename(new URL(safeUrl).pathname)
 
           // Download image
-          const res = await fetch(url, {
+          const res = await fetch(safeUrl, {
             headers: {
               Authorization: `Bearer ${appToken}`,
               Accept: "application/vnd.github.v3+json",
