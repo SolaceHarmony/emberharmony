@@ -14,6 +14,12 @@ const ignoreIds = new Set([
   "GHSA-2mjp-6q6p-2qxm", "GHSA-f269-vfmq-vjvj", "GHSA-vrm6-8vpv-qv8q",
   "GHSA-4992-7rv2-5pvq", "GHSA-phc3-fgpg-7m6h", "GHSA-v9p9-hfj2-hcw8",
 ])
+// postcss CVE-2026-41305 / GHSA-qx2v-qp2m-jg93 — fixed in postcss >= 8.5.10.
+// OSV's affected-range data is stale and flags 8.5.x as affected. We gate the
+// suppression on every installed postcss being >= 8.5.10: if the root override
+// (currently pinning all resolutions to 8.5.14) were ever removed and a pre-8.5.10
+// copy snuck back in via tw-to-css or another transitive dep, this would surface it.
+const postcssIgnoreIds = new Set(["CVE-2026-41305", "GHSA-qx2v-qp2m-jg93"])
 const win = process.platform === "win32"
 const ci =
   process.env["CI"] === "true" || process.env["GITHUB_ACTIONS"] === "true" || process.env["BUN_SECURITY_SCAN"] === "0"
@@ -33,6 +39,28 @@ export const scanner: Bun.Security.Scanner = {
         console.log("[security-scan] mcp", JSON.stringify(advisory))
       }
     }
-    return advisories.filter((advisory) => !ignore.has(advisory.package) && !ignoreIds.has(advisory.id))
+    return advisories.filter((advisory) => {
+      if (ignore.has(advisory.package)) return false
+      if (ignoreIds.has(advisory.id)) return false
+      if (postcssIgnoreIds.has(advisory.id) && advisory.package === "postcss") {
+        // Only suppress when every installed postcss is >= 8.5.10.
+        // If the root override is removed and a vulnerable copy sneaks in, this surfaces it.
+        const hasVulnerable = input.packages.some((pkg) => pkg.name === "postcss" && !atLeast(pkg.version, "8.5.10"))
+        return hasVulnerable
+      }
+      return true
+    })
   },
+}
+
+function atLeast(version: string, min: string) {
+  const v = version.split(".").map(Number)
+  const m = min.split(".").map(Number)
+  for (let i = 0; i < Math.max(v.length, m.length); i++) {
+    const a = v[i] ?? 0
+    const b = m[i] ?? 0
+    if (a > b) return true
+    if (a < b) return false
+  }
+  return true
 }
