@@ -13,8 +13,14 @@ const ignoreIds = new Set([
   // WebSocket DoS requires connecting to a malicious server — not applicable in CI.
   "GHSA-2mjp-6q6p-2qxm", "GHSA-f269-vfmq-vjvj", "GHSA-vrm6-8vpv-qv8q",
   "GHSA-4992-7rv2-5pvq", "GHSA-phc3-fgpg-7m6h", "GHSA-v9p9-hfj2-hcw8",
-  // postcss CVE-2026-41305 — fixed in 8.5.10. We resolve postcss@8.5.14 via vite,
-  // but OSV's affected-range data is incomplete and still flags current versions.
+  // postcss CVE-2026-41305 / GHSA-qx2v-qp2m-jg93 — fixed in 8.5.10. The bun
+  // overrides force ALL postcss resolutions to 8.5.14 (without the override,
+  // tw-to-css pulls in postcss@8.4.31 which IS vulnerable). The scanner still
+  // flags 8.5.14 because OSV's affected-range data is incomplete and treats
+  // every 8.x as affected. The override is the actual mitigation; this entry
+  // suppresses the resulting false positive. If the override is ever removed,
+  // remove this entry too — the scanner will then correctly catch any
+  // pre-8.5.10 postcss that sneaks in via a transitive dep.
   "CVE-2026-41305", "GHSA-qx2v-qp2m-jg93",
 ])
 const win = process.platform === "win32"
