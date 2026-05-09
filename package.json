@@ -48,7 +48,7 @@
       "diff": "8.0.3",
       "dompurify": "3.3.3",
       "ai": "5.0.119",
-      "hono": "4.12.12",
+      "hono": "4.12.18",
       "hono-openapi": "1.1.2",
       "fuzzysort": "3.1.0",
       "luxon": "3.6.1",
@@ -118,19 +118,19 @@
     "@types/node": "catalog:",
     "@modelcontextprotocol/sdk": "1.26.0",
     "@remix-run/router": "1.23.2",
-    "astro": "5.18.1",
+    "astro": "6.3.1",
     "diff": "8.0.3",
     "esbuild": "0.25.0",
     "file-type": "22.0.0",
-    "h3": "1.15.11",
-    "fast-xml-parser": "5.5.11",
-    "hono": "4.12.12",
+    "h3": "2.0.1-rc.22",
+    "fast-xml-parser": "5.7.3",
+    "hono": "4.12.18",
     "@isaacs/brace-expansion": "5.0.1",
     "react-router": "7.12.0",
     "seroval": "1.4.1",
     "undici": "7.22.0",
     "vite": "7.3.2",
-    "wrangler": "4.59.1"
+    "wrangler": "4.90.0"
   },
   "patchedDependencies": {
     "ghostty-web@0.3.0": "patches/ghostty-web@0.3.0.patch"
