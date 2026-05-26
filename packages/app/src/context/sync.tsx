@@ -55,21 +55,28 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
       setMeta("loading", key, true)
       await retry(() => input.client.session.messages({ sessionID: input.sessionID, limit: input.limit }))
         .then((messages) => {
-          const items = (messages.data ?? []).filter((x) => !!x?.info?.id)
+          // Defensive: ensure messages.data is an array
+          const rawData = Array.isArray(messages.data) ? messages.data : []
+          const items = rawData.filter((x): x is NonNullable<typeof x> => {
+            if (!x || typeof x !== "object") return false
+            if (!x.info?.id) return false
+            return true
+          })
           const next = items
             .map((x) => x.info)
-            .filter((m) => !!m?.id)
+            .filter((m): m is NonNullable<typeof m> => !!m?.id)
             .sort((a, b) => a.id.localeCompare(b.id))
 
           batch(() => {
             input.setStore("message", input.sessionID, reconcile(next, { key: "id" }))
 
             for (const message of items) {
+              const safeParts = Array.isArray(message.parts) ? message.parts : []
               input.setStore(
                 "part",
                 message.info.id,
                 reconcile(
-                  message.parts.filter((p) => !!p?.id).sort((a, b) => a.id.localeCompare(b.id)),
+                  safeParts.filter((p): p is NonNullable<typeof p> => !!p?.id).sort((a, b) => a.id.localeCompare(b.id)),
                   { key: "id" },
                 ),
               )
@@ -78,6 +85,12 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
             setMeta("limit", key, input.limit)
             setMeta("complete", key, next.length < input.limit)
           })
+        })
+        .catch((err) => {
+          // Log error but don't crash - empty messages is better than crash
+          console.error("Failed to load messages:", err)
+          // Initialize with empty array to prevent undefined
+          input.setStore("message", input.sessionID, [])
         })
         .finally(() => {
           setMeta("loading", key, false)

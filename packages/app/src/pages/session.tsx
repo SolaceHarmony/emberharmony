@@ -382,7 +382,18 @@ export default function Page() {
   const reviewCount = createMemo(() => Math.max(info()?.summary?.files ?? 0, diffs().length))
   const hasReview = createMemo(() => reviewCount() > 0)
   const revertMessageID = createMemo(() => info()?.revert?.messageID)
-  const messages = createMemo(() => (params.id ? (sync.data.message[params.id] ?? []) : []))
+  const messages = createMemo(() => {
+    if (!params.id) return []
+    const msgs = sync.data.message[params.id]
+    if (!Array.isArray(msgs)) return []
+    // Filter out any null/undefined messages and ensure they have required fields
+    return msgs.filter((m): m is NonNullable<typeof m> => {
+      if (!m || typeof m !== "object") return false
+      // Ensure message has an id
+      if (!m.id) return false
+      return true
+    })
+  })
   const messagesReady = createMemo(() => {
     const id = params.id
     if (!id) return true

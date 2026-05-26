@@ -780,21 +780,27 @@ function createGlobalSync() {
         break
       }
       case "message.updated": {
-        const messages = store.message[event.properties.info.sessionID]
-        if (!messages) {
-          setStore("message", event.properties.info.sessionID, [event.properties.info])
+        // Defensive: validate message info before processing
+        const info = event.properties?.info
+        if (!info || typeof info !== "object" || !info.id || !info.sessionID) {
+          console.warn("Invalid message.updated event: missing required fields", event)
           break
         }
-        const result = Binary.search(messages, event.properties.info.id, (m) => m.id)
+        const messages = store.message[info.sessionID]
+        if (!messages) {
+          setStore("message", info.sessionID, [info])
+          break
+        }
+        const result = Binary.search(messages, info.id, (m) => m.id)
         if (result.found) {
-          setStore("message", event.properties.info.sessionID, result.index, reconcile(event.properties.info))
+          setStore("message", info.sessionID, result.index, reconcile(info))
           break
         }
         setStore(
           "message",
-          event.properties.info.sessionID,
+          info.sessionID,
           produce((draft) => {
-            draft.splice(result.index, 0, event.properties.info)
+            draft.splice(result.index, 0, info)
           }),
         )
         break
@@ -819,7 +825,12 @@ function createGlobalSync() {
         break
       }
       case "message.part.updated": {
-        const part = event.properties.part
+        // Defensive: validate part before processing
+        const part = event.properties?.part
+        if (!part || typeof part !== "object" || !part.id || !part.messageID) {
+          console.warn("Invalid message.part.updated event: missing required fields", event)
+          break
+        }
         const parts = store.part[part.messageID]
         if (!parts) {
           setStore("part", part.messageID, [part])
