@@ -65,7 +65,7 @@ rebranded and maintained by [The Solace Project](https://github.com/SolaceHarmon
 - EmberHarmony brand identity — full rebrand from upstream opencode
 - Ember flame ASCII logo with figlet "standard" font wordmark for CLI splash
 - Unified dev stack launcher (`bun run dev:stack`) — starts backend + Vite UI concurrently
-- EH-1 default theme (renamed from OC-1) with updated preload and barrel exports
+- EH-1 default theme (renamed from EH-1) with updated preload and barrel exports
 - `@thesolaceproject/emberharmony-plugin` package scope
 
 ### Changed
