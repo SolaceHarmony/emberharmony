@@ -16,6 +16,8 @@ on:
         description: "Override version (optional)"
         required: false
         type: string
+  release:
+    types: [published]
 
 concurrency: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.version || inputs.bump }}
 
@@ -28,15 +30,29 @@ permissions:
 jobs:
   version:
     runs-on: ubuntu-latest
-    if: github.ref_name == 'dev' && (inputs.bump || inputs.version)
+    if: (github.ref_name == 'dev' && (inputs.bump || inputs.version)) || github.event_name == 'release'
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      release: ${{ steps.version.outputs.release }}
+      tag: ${{ steps.version.outputs.tag }}
     steps:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
+      - name: Extract version from release
+        if: github.event_name == 'release'
+        id: release-version
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+
       - uses: ./.github/actions/setup-bun
+        if: github.event_name != 'release'
 
       - id: version
+        if: github.event_name != 'release'
         run: |
           ./script/version.ts
         env:
@@ -45,15 +61,19 @@ jobs:
           EMBERHARMONY_BUMP: ${{ inputs.bump }}
           EMBERHARMONY_VERSION: ${{ inputs.version }}
           EMBERHARMONY_API_KEY: ${{ secrets.EMBERHARMONY_API_KEY }}
-    outputs:
-      version: ${{ steps.version.outputs.version }}
-      release: ${{ steps.version.outputs.release }}
-      tag: ${{ steps.version.outputs.tag }}
+
+      - name: Set outputs for release trigger
+        id: version-release
+        if: github.event_name == 'release'
+        run: |
+          echo "version=${{ steps.release-version.outputs.version }}" >> "$GITHUB_OUTPUT"
+          echo "tag=${{ steps.release-version.outputs.tag }}" >> "$GITHUB_OUTPUT"
+          echo "release=${{ github.event.release.id }}" >> "$GITHUB_OUTPUT"
 
   build-cli:
     needs: version
     runs-on: ubuntu-latest
-    if: github.ref_name == 'dev' && (inputs.bump || inputs.version)
+    if: (github.ref_name == 'dev' && (inputs.bump || inputs.version)) || github.event_name == 'release'
     steps:
       - uses: actions/checkout@v6
         with:
@@ -178,6 +198,7 @@ jobs:
       - name: install Rust stable
         uses: dtolnay/rust-toolchain@v1
         with:
+          toolchain: stable
           targets: ${{ matrix.settings.target }}
 
       - uses: Swatinem/rust-cache@v2
