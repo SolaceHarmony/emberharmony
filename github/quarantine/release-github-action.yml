@@ -1,0 +1,35 @@
+name: release-github-action
+
+on:
+  push:
+    branches:
+      - dev
+    paths:
+      - "github/**"
+  workflow_dispatch:
+
+concurrency: ${{ github.workflow }}-${{ github.ref }}
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    if: |
+      github.ref_name == 'main' &&
+      (github.event_name == 'workflow_dispatch' ||
+        (github.event_name == 'push' &&
+          startsWith(github.event.head_commit.message, 'release: v')))
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - run: git fetch --force --tags
+
+      - name: Release
+        run: |
+          git config --global user.email "action@github.com"
+          git config --global user.name "github-actions[bot]"
+          ./github/script/release

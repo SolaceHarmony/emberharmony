@@ -449,7 +449,7 @@ fn normalize_hostname_for_url(hostname: &str) -> String {
 fn get_server_url_from_config(config: &cli::Config) -> Option<String> {
     let server = config.server.as_ref()?;
     let port = server.port?;
-    println!("server.port found in OC config: {port}");
+    println!("server.port found in EH config: {port}");
     let hostname = server
         .hostname
         .as_ref()

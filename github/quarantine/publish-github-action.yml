@@ -1,0 +1,30 @@
+name: publish-github-action
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "github-v*.*.*"
+      - "!github-v1"
+
+concurrency: ${{ github.workflow }}-${{ github.ref }}
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - run: git fetch --force --tags
+
+      - name: Publish
+        run: |
+          git config --global user.email "action@github.com"
+          git config --global user.name "github-actions[bot]"
+          ./script/publish
+        working-directory: ./github

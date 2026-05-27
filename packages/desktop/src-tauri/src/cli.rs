@@ -19,7 +19,7 @@ pub async fn get_config(app: &AppHandle) -> Option<Config> {
     create_command(app, "debug config")
         .output()
         .await
-        .inspect_err(|e| eprintln!("Failed to read OC config: {e}"))
+        .inspect_err(|e| eprintln!("Failed to read EH config: {e}"))
         .ok()
         .and_then(|out| String::from_utf8(out.stdout.to_vec()).ok())
         .and_then(|s| serde_json::from_str::<Config>(&s).ok())
