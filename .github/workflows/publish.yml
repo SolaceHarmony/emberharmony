@@ -1,32 +1,12 @@
 name: Publish
-run-name: ${{ inputs.bump && format('release {0}', inputs.bump) || (github.event_name == 'release' && github.event.release.tag_name) || github.sha }}
+run-name: ${{ (github.event_name == 'release' && github.event.release.tag_name) || github.sha }}
 
 on:
   workflow_dispatch:
-    inputs:
-      bump:
-        description: "Bump major, minor, or patch"
-        required: false
-        type: choice
-        options:
-          - major
-          - minor
-          - patch
-      version:
-        description: "Override version (optional)"
-        required: false
-        type: string
-  push:
-    branches:
-      - dev
-    paths-ignore:
-      - 'README.md'
-      - 'CHANGELOG.md'
-      - 'github/quarantine/**'
   release:
     types: [published]
 
-concurrency: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.version || inputs.bump || github.sha }}
+concurrency: ${{ github.workflow }}-${{ github.ref }}
 
 permissions:
   id-token: write
@@ -39,9 +19,9 @@ jobs:
     runs-on: ubuntu-latest
     if: github.ref_name == 'dev' || github.event_name == 'release'
     outputs:
-      version: ${{ steps.version.outputs.version }}
-      release: ${{ steps.version.outputs.release }}
-      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version || steps.version-release.outputs.version }}
+      release: ${{ steps.version-release.outputs.release }}
+      tag: ${{ steps.version.outputs.tag || steps.version-release.outputs.tag }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -51,8 +31,15 @@ jobs:
         if: github.event_name == 'release'
         id: release-version
         run: |
-          VERSION=${GITHUB_REF#refs/tags/v}
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          TAG_VERSION=${GITHUB_REF#refs/tags/v}
+          PKG_VERSION=$(jq -r .version packages/emberharmony/package.json)
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "Release tag v$TAG_VERSION does not match packages/emberharmony/package.json version $PKG_VERSION." >&2
+            echo "Versions travel with the code: bump package.json in a commit, then tag the release at that version." >&2
+            exit 1
+          fi
+          echo "version=$TAG_VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
 
       - uses: ./.github/actions/setup-bun
@@ -65,8 +52,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           EMBERHARMONY_PUBLISH_NAME: "@thesolaceproject/emberharmony"
-          EMBERHARMONY_BUMP: ${{ inputs.bump }}
-          EMBERHARMONY_VERSION: ${{ inputs.version }}
+          EMBERHARMONY_CHANNEL: latest
           EMBERHARMONY_API_KEY: ${{ secrets.EMBERHARMONY_API_KEY }}
 
       - name: Set outputs for release trigger
@@ -93,7 +79,6 @@ jobs:
         run: |
           ./packages/emberharmony/script/build.ts
         env:
-          EMBERHARMONY_VERSION: ${{ needs.version.outputs.version }}
           EMBERHARMONY_RELEASE: ${{ needs.version.outputs.release }}
           EMBERHARMONY_PUBLISH_NAME: "@thesolaceproject/emberharmony"
           GH_TOKEN: ${{ github.token }}
@@ -218,7 +203,6 @@ jobs:
           cd packages/desktop
           bun ./scripts/prepare.ts
         env:
-          EMBERHARMONY_VERSION: ${{ needs.version.outputs.version }}
           GITHUB_TOKEN: ${{ github.token }}
           RUST_TARGET: ${{ matrix.settings.target }}
           GH_TOKEN: ${{ github.token }}
@@ -280,7 +264,6 @@ jobs:
       - build-cli
       - build-tauri
     runs-on: ubuntu-latest
-    env:
     steps:
       - uses: actions/checkout@v6
 
@@ -318,7 +301,6 @@ jobs:
 
       - run: ./script/publish.ts
         env:
-          EMBERHARMONY_VERSION: ${{ needs.version.outputs.version }}
           EMBERHARMONY_RELEASE: ${{ needs.version.outputs.release }}
           EMBERHARMONY_PUBLISH_NAME: "@thesolaceproject/emberharmony"
           EMBERHARMONY_PUBLISH_PLATFORMS: "1"
