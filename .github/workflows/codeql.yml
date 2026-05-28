@@ -1,0 +1,46 @@
+name: CodeQL
+run-name: codeql ${{ github.ref_name }} @ ${{ github.sha }}
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+  schedule:
+    # Weekly catch-all so dormant branches still get scanned. Monday 04:23 UTC.
+    - cron: "23 4 * * 1"
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        # javascript-typescript covers the whole TS/JS codebase (CLI, web, console, ui, etc).
+        # actions scans .github/workflows/** for secret-handling and injection bugs —
+        # relevant given this repo's prior fork-PR-secret incident (see commit 5569e76).
+        # Rust CodeQL is still experimental; the Tauri Rust surface is small enough to skip.
+        language: [javascript-typescript, actions]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"
