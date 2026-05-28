@@ -1,0 +1,38 @@
+name: ci
+run-name: ci ${{ github.ref_name }} @ ${{ github.sha }}
+
+# Verification builds. Runs the full 5-target CLI + Tauri matrix on every push
+# to an integration branch (i.e. after a PR merges). Does NOT run on pull_request
+# — that keeps the expensive matrix off PR review and away from fork secrets.
+
+on:
+  push:
+    branches: [main, dev]
+  workflow_dispatch:
+
+# Every merge commit deserves its own verification — do not cancel in progress.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - id: v
+        run: echo "version=0.0.0-ci.${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: version
+    uses: ./.github/workflows/_build.yml
+    with:
+      version: ${{ needs.version.outputs.version }}
+      # release and tag intentionally left empty — _build.yml will produce
+      # workflow artifacts only, no GitHub release attachment.
+    secrets: inherit
