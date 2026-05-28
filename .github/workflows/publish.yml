@@ -17,10 +17,10 @@ permissions:
 jobs:
   version:
     runs-on: ubuntu-latest
-    if: github.ref_name == 'dev' || github.event_name == 'release'
+    if: github.ref_name == 'main' || github.event_name == 'release'
     outputs:
       version: ${{ steps.version.outputs.version || steps.version-release.outputs.version }}
-      release: ${{ steps.version-release.outputs.release }}
+      release: ${{ steps.version.outputs.release || steps.version-release.outputs.release }}
       tag: ${{ steps.version.outputs.tag || steps.version-release.outputs.tag }}
     steps:
       - uses: actions/checkout@v6
@@ -66,7 +66,7 @@ jobs:
   build-cli:
     needs: version
     runs-on: ubuntu-latest
-    if: github.ref_name == 'dev' || github.event_name == 'release'
+    if: github.ref_name == 'main' || github.event_name == 'release'
     steps:
       - uses: actions/checkout@v6
         with:
@@ -92,7 +92,7 @@ jobs:
       version: ${{ needs.version.outputs.version }}
 
   build-tauri:
-    if: github.ref_name == 'dev' || github.event_name == 'release'
+    if: github.ref_name == 'main' || github.event_name == 'release'
     needs:
       - build-cli
       - version
