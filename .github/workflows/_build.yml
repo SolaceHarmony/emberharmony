@@ -1,5 +1,5 @@
-name: build
-run-name: build ${{ inputs.version }}${{ inputs.release != '' && format(' (release {0})', inputs.release) || '' }}
+name: Build
+run-name: Build ${{ inputs.version }}${{ inputs.release != '' && format(' (release {0})', inputs.release) || '' }}
 
 # Reusable workflow that produces the CLI binaries and Tauri desktop bundles.
 # Called by:
@@ -30,21 +30,26 @@ on:
         type: string
         default: "@thesolaceproject/emberharmony"
 
-permissions:
-  contents: write
-  actions: read
+# Permissions are inherited from the caller (ci.yml grants read; publish.yml
+# grants write for release-asset upload via tauri-action). A reusable workflow
+# cannot request more than its caller grants, so we don't declare here.
 
 jobs:
   build-cli:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v6
+      - name: Checkout
+        uses: actions/checkout@v6
         with:
           fetch-tags: true
 
-      - uses: ./.github/actions/setup-bun
+      - name: Setup Bun
+        uses: ./.github/actions/setup-bun
 
-      - name: Build
+      - name: Build CLI binaries
         id: build
         run: |
           ./packages/emberharmony/script/build.ts
@@ -53,14 +58,17 @@ jobs:
           EMBERHARMONY_PUBLISH_NAME: ${{ inputs.publish-name }}
           GH_TOKEN: ${{ github.token }}
 
-      - uses: actions/upload-artifact@v7
+      - name: Upload CLI artifacts
+        uses: actions/upload-artifact@v7
         with:
           name: emberharmony-cli
           path: packages/emberharmony/dist
 
   build-tauri:
     needs: build-cli
-    continue-on-error: false
+    timeout-minutes: 90
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -82,12 +90,14 @@ jobs:
       APPLE_API_KEY_PATH: ${{ secrets.APPLE_API_KEY_PATH }}
       APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
     steps:
-      - uses: actions/checkout@v6
+      - name: Checkout
+        uses: actions/checkout@v6
         with:
           fetch-tags: true
 
-      - uses: apple-actions/import-codesign-certs@v7
+      - name: Import code-signing certificate
         if: ${{ runner.os == 'macOS' && env.APPLE_CERTIFICATE != '' && env.APPLE_CERTIFICATE_PASSWORD != '' }}
+        uses: apple-actions/import-codesign-certs@v7
         with:
           keychain: build
           p12-file-base64: ${{ secrets.APPLE_CERTIFICATE }}
@@ -134,7 +144,8 @@ jobs:
         run: |
           printf '%s' "${{ secrets.APPLE_API_KEY_PATH }}" > "$RUNNER_TEMP/apple-api-key.p8"
 
-      - uses: ./.github/actions/setup-bun
+      - name: Setup Bun
+        uses: ./.github/actions/setup-bun
 
       - name: Cache apt packages
         if: contains(matrix.settings.host, 'ubuntu')
@@ -145,19 +156,20 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-${{ matrix.settings.target }}-apt-
 
-      - name: install dependencies (ubuntu only)
+      - name: Install Linux build dependencies
         if: contains(matrix.settings.host, 'ubuntu')
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
 
-      - name: install Rust stable
+      - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: stable
           targets: ${{ matrix.settings.target }}
 
-      - uses: Swatinem/rust-cache@v2
+      - name: Restore Cargo cache
+        uses: Swatinem/rust-cache@v2
         with:
           workspaces: packages/desktop/src-tauri
           shared-key: ${{ matrix.settings.target }}
@@ -211,7 +223,7 @@ jobs:
           releaseDraft: true
           releaseAssetNamePattern: emberharmony-desktop-[platform]-[arch][ext]
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
           TAURI_BUNDLER_NEW_APPIMAGE_FORMAT: true
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
