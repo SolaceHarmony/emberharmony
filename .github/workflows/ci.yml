@@ -1,5 +1,5 @@
-name: ci
-run-name: ci ${{ github.ref_name }} @ ${{ github.sha }}
+name: CI
+run-name: CI ${{ github.ref_name }} @ ${{ github.sha }}
 
 # Verification builds. Runs the full 5-target CLI + Tauri matrix on every push
 # to an integration branch (i.e. after a PR merges). Does NOT run on pull_request
@@ -22,10 +22,12 @@ permissions:
 jobs:
   version:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
-      version: ${{ steps.v.outputs.version }}
+      version: ${{ steps.compute.outputs.version }}
     steps:
-      - id: v
+      - name: Compute CI version
+        id: compute
         run: echo "version=0.0.0-ci.${{ github.run_number }}" >> "$GITHUB_OUTPUT"
 
   build:
