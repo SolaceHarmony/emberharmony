@@ -64,6 +64,9 @@ Then run it with:
 
 Replace `<platform>` with your platform (e.g., `darwin-arm64`, `linux-x64`).
 
+> [!NOTE]
+> For the full build pipeline — local desktop builds, CI verification, release publishing, and the matrix/signing details — see [BUILDING.md](./BUILDING.md).
+
 - Core pieces:
   - `packages/emberharmony`: EmberHarmony core business logic & server.
   - `packages/emberharmony/src/cli/cmd/tui/`: The TUI code, written in SolidJS with [opentui](https://github.com/sst/opentui)
