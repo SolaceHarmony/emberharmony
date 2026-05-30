@@ -1,5 +1,5 @@
 name: Build
-run-name: Build ${{ inputs.version }}${{ inputs.release != '' && format(' (release {0})', inputs.release) || '' }}
+run-name: Build ${{ inputs.version || github.sha }}${{ inputs.release != '' && format(' (release {0})', inputs.release) || '' }}
 
 # Reusable workflow that produces the CLI binaries and Tauri desktop bundles.
 # Called by:
@@ -14,9 +14,12 @@ on:
   workflow_call:
     inputs:
       version:
-        description: "Semver version string the artifacts should carry."
+        description: "Display-only label for the build run-name. Artifacts derive their
+          actual version from packages/emberharmony/package.json at build time, so this
+          is purely cosmetic and may be omitted (CI does)."
         type: string
-        required: true
+        required: false
+        default: ""
       release:
         description: "GitHub release ID to attach artifacts to. Empty = workflow artifacts only."
         type: string

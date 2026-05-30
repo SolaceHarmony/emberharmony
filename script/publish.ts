@@ -46,44 +46,12 @@ for (const file of pkgjsons) {
   await Bun.file(file).write(pkg)
 }
 
-const extensionToml = new URL("../packages/extensions/zed/extension.toml", import.meta.url).pathname
-let toml = await Bun.file(extensionToml).text()
-toml = toml.replace(/^version = "[^"]+"/m, `version = "${Script.version}"`)
-toml = toml.replaceAll(/releases\/download\/v[^/]+\//g, `releases/download/v${Script.version}/`)
-console.log("updated:", extensionToml)
-await Bun.file(extensionToml).write(toml)
-
 await $`BUN_SECURITY_SCAN=0 bun install --config=packages/app/bunfig-ci.toml`
 await import(`../packages/sdk/js/script/build.ts`)
 
-if (Script.release) {
-  const skipGit = process.env.EMBERHARMONY_SKIP_GIT === "1"
-  if (!skipGit) {
-    const changed = await $`git status --porcelain=v1`.text().then((x) => x.trim().length > 0)
-    if (changed) {
-      await $`git commit -am "release: v${Script.version}"`
-    } else {
-      console.log(`No changes to commit for v${Script.version}`)
-    }
-
-    const tag = `v${Script.version}`
-    const exists = await $`git rev-parse -q --verify refs/tags/${tag}`.nothrow()
-    if (exists.exitCode !== 0) {
-      await $`git tag ${tag}`
-    } else {
-      console.log(`Tag ${tag} already exists`)
-    }
-
-    await $`git fetch origin`
-    await $`git cherry-pick HEAD..origin/main`.nothrow()
-    await $`git push origin HEAD --tags --no-verify --force-with-lease`
-  } else {
-    console.log("Skipping git commit/tag/push (EMBERHARMONY_SKIP_GIT=1)")
-  }
-
-  await new Promise((resolve) => setTimeout(resolve, 5_000))
-  await $`gh release edit v${Script.version} --draft=false`
-}
+// Publishing is triggered by a published GitHub release, so the tag already exists
+// and the release is already public. This script never commits, tags, or pushes —
+// it only updates in-tree version strings (above) and publishes the built artifacts.
 
 console.log("\n=== cli ===\n")
 await import(`../packages/emberharmony/script/publish.ts`)

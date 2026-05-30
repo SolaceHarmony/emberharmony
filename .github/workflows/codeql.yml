@@ -2,8 +2,6 @@ name: CodeQL Advanced
 run-name: codeql ${{ github.ref_name }} @ ${{ github.sha }}
 
 on:
-  push:
-    branches: [main, dev]
   pull_request:
     branches: [main, dev]
   schedule:

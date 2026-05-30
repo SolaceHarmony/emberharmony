@@ -97,22 +97,20 @@ If a merge-triggered run fails, re-run it from the Actions UI via `workflow_disp
 
 ### Release publish: `publish.yml`
 
-Triggers:
-
-- `workflow_dispatch` from the Actions UI (preferred for normal releases)
-- `release` event (`types: [published]`) when a GitHub release is created
+Triggered **solely by a published GitHub release** (`release` event, `types: [published]`). There is no `workflow_dispatch` path, and nothing in CI commits, tags, or pushes — the version travels with the code and the tag is created by the release you cut.
 
 Job flow:
 
-1. **`version`** — computes the next version. On `workflow_dispatch`, `./script/version.ts` does the bump and creates a draft release. On a release event, the tag's version must match `packages/emberharmony/package.json` or the job fails fast.
-2. **`build`** — calls `_build.yml` with the computed `version`, `release` ID, and `tag`. Same 11-CLI + 5-Tauri matrix as CI, but artifacts attach to the release draft.
-3. **`publish`** — runs `./script/publish.ts` to publish `@thesolaceproject/emberharmony` (and the 11 platform npm packages) to npmjs.org, then promotes the GitHub release from draft to published.
+1. **`version`** — extracts the version from the release tag (`refs/tags/v<x>`) and fails fast unless it matches `packages/emberharmony/package.json`.
+2. **`build`** — calls `_build.yml` with the `version`, `release` ID, and `tag`. Same 11-CLI + 5-Tauri matrix as CI, with artifacts attached to the release.
+3. **`publish`** — runs `./script/publish.ts` to publish `@thesolaceproject/emberharmony` (and the 11 platform npm packages) to npmjs.org.
 
 To cut a release:
 
 ```bash
-gh workflow run publish.yml
-# follow the version prompts in ./script/version.ts when it runs
+# 1. Bump "version" in packages/emberharmony/package.json and commit it.
+# 2. Create a GitHub release whose tag matches that version:
+gh release create v1.3.0 --title v1.3.0 --generate-notes
 ```
 
 ## Signing and notarization
