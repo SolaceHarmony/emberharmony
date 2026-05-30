@@ -2,8 +2,9 @@ name: Publish
 run-name: ${{ github.event.release.tag_name }}
 
 # Publishing is driven solely by a published GitHub release. Cut a release with a
-# tag like v1.3.0 whose version matches packages/emberharmony/package.json — there
-# is no manual/local publish path and nothing here commits, tags, or pushes.
+# tag like v1.3.0; the release id and tag flow straight from the github.event
+# context into the build — no CI step parses or validates the version (the tag is
+# trusted), and nothing here commits, tags, or pushes.
 on:
   release:
     types: [published]
@@ -17,48 +18,20 @@ permissions:
   actions: read
 
 jobs:
-  version:
-    runs-on: ubuntu-latest
-    outputs:
-      version: ${{ steps.release-version.outputs.version }}
-      release: ${{ steps.release-version.outputs.release }}
-      tag: ${{ steps.release-version.outputs.tag }}
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      - name: Extract version from release
-        id: release-version
-        run: |
-          set -euo pipefail
-          TAG_VERSION=${GITHUB_REF#refs/tags/v}
-          PKG_VERSION=$(jq -r .version packages/emberharmony/package.json)
-          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
-            echo "Release tag v$TAG_VERSION does not match packages/emberharmony/package.json version $PKG_VERSION." >&2
-            echo "Versions travel with the code: bump package.json in a commit, then tag the release at that version." >&2
-            exit 1
-          fi
-          {
-            echo "version=$TAG_VERSION"
-            echo "tag=${GITHUB_REF#refs/tags/}"
-            echo "release=${{ github.event.release.id }}"
-          } >> "$GITHUB_OUTPUT"
-
   build:
-    needs: version
     uses: ./.github/workflows/_build.yml
     with:
-      version: ${{ needs.version.outputs.version }}
-      release: ${{ needs.version.outputs.release }}
-      tag: ${{ needs.version.outputs.tag }}
+      release: ${{ github.event.release.id }}
+      tag: ${{ github.event.release.tag_name }}
       publish-name: "@thesolaceproject/emberharmony"
     secrets: inherit
 
+  # npm publish runs for STABLE releases only. A pre-release (the portal's
+  # "Set as a pre-release" checkbox) still builds and attaches desktop assets to the
+  # GitHub release via the build job above, but never touches npm.
   publish:
-    if: github.repository == 'SolaceHarmony/emberharmony'
+    if: ${{ github.repository == 'SolaceHarmony/emberharmony' && !github.event.release.prerelease }}
     needs:
-      - version
       - build
     runs-on: ubuntu-latest
     steps:
@@ -94,7 +67,7 @@ jobs:
 
       - run: ./script/publish.ts
         env:
-          EMBERHARMONY_RELEASE: ${{ needs.version.outputs.release }}
+          EMBERHARMONY_RELEASE: ${{ github.event.release.id }}
           EMBERHARMONY_PUBLISH_NAME: "@thesolaceproject/emberharmony"
           EMBERHARMONY_PUBLISH_PLATFORMS: "1"
           GITHUB_TOKEN: ${{ github.token }}

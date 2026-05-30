@@ -207,7 +207,12 @@ if (Script.release) {
       await Bun.write(`./dist/${releaseName}.zip.sha256`, hash + "\n")
     }
   }
-  await $`gh release upload v${Script.version} ./dist/*.zip ./dist/*.tar.gz ./dist/*.sha256 --clobber`
+  // Upload the CLI archives as a separate set of assets on the release the user cut.
+  // EMBERHARMONY_TAG is the actual release tag (stable v1.3.0 or a pre-release like
+  // v1.3.0-dev.1); fall back to the static version for local/manual runs. Bun's $
+  // escapes the interpolated tag as a single argument, so it is injection-safe.
+  const releaseTag = process.env.EMBERHARMONY_TAG || `v${Script.version}`
+  await $`gh release upload ${releaseTag} ./dist/*.zip ./dist/*.tar.gz ./dist/*.sha256 --clobber`
 }
 
 export { binaries }

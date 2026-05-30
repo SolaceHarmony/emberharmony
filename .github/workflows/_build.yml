@@ -1,10 +1,10 @@
 name: Build
-run-name: Build ${{ inputs.version || github.sha }}${{ inputs.release != '' && format(' (release {0})', inputs.release) || '' }}
+run-name: Build ${{ inputs.tag || github.sha }}
 
 # Reusable workflow that produces the CLI binaries and Tauri desktop bundles.
 # Called by:
 #   - ci.yml     (post-merge verification on dev/main; uploads workflow artifacts only)
-#   - publish.yml (release publish; uploads artifacts AND attaches to GitHub release draft)
+#   - publish.yml (release publish; uploads artifacts AND attaches them to the published GitHub release)
 #
 # When inputs.release and inputs.tag are empty strings, tauri-action skips
 # release attachment and only produces workflow artifacts. See:
@@ -13,13 +13,6 @@ run-name: Build ${{ inputs.version || github.sha }}${{ inputs.release != '' && f
 on:
   workflow_call:
     inputs:
-      version:
-        description: "Display-only label for the build run-name. Artifacts derive their
-          actual version from packages/emberharmony/package.json at build time, so this
-          is purely cosmetic and may be omitted (CI does)."
-        type: string
-        required: false
-        default: ""
       release:
         description: "GitHub release ID to attach artifacts to. Empty = workflow artifacts only."
         type: string
@@ -33,16 +26,15 @@ on:
         type: string
         default: "@thesolaceproject/emberharmony"
 
-# Permissions are inherited from the caller (ci.yml grants read; publish.yml
-# grants write for release-asset upload via tauri-action). A reusable workflow
-# cannot request more than its caller grants, so we don't declare here.
+# Permissions are inherited from the caller: ci.yml grants read (artifacts only),
+# publish.yml grants write so a release build can upload assets — CLI archives via
+# `gh release upload` and desktop bundles via tauri-action. A reusable workflow
+# cannot exceed its caller's grant, so jobs do not declare permissions here.
 
 jobs:
   build-cli:
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    permissions:
-      contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -58,6 +50,7 @@ jobs:
           ./packages/emberharmony/script/build.ts
         env:
           EMBERHARMONY_RELEASE: ${{ inputs.release }}
+          EMBERHARMONY_TAG: ${{ inputs.tag }}
           EMBERHARMONY_PUBLISH_NAME: ${{ inputs.publish-name }}
           GH_TOKEN: ${{ github.token }}
 
@@ -70,8 +63,6 @@ jobs:
   build-tauri:
     needs: build-cli
     timeout-minutes: 90
-    permissions:
-      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -223,7 +214,6 @@ jobs:
           # tauri-action skips the release upload and only emits workflow artifacts.
           releaseId: ${{ inputs.release }}
           tagName: ${{ inputs.tag }}
-          releaseDraft: true
           releaseAssetNamePattern: emberharmony-desktop-[platform]-[arch][ext]
         env:
           GITHUB_TOKEN: ${{ github.token }}
