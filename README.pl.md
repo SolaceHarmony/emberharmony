@@ -127,7 +127,7 @@ Jest bardzo podobne do Claude Code pod względem możliwości. Oto kluczowe ró�
 
 ### Acknowledgments
 
-EmberHarmony is a fork of [EmberHarmony](https://github.com/sst/emberharmony) by the [SST](https://sst.dev) team. We are deeply grateful for their foundational work in building an exceptional open source AI coding agent.
+EmberHarmony is a fork of [opencode](https://github.com/anomalyco/opencode) by the [SST](https://sst.dev) team. We are deeply grateful for their foundational work in building an exceptional open source AI coding agent.
 
 ### Maintainer
 

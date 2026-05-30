@@ -126,7 +126,7 @@ EmberHarmony 内置两种 Agent，可用 `Tab` 键快速切换：
 
 ### Acknowledgments
 
-EmberHarmony is a fork of [EmberHarmony](https://github.com/sst/emberharmony) by the [SST](https://sst.dev) team. We are deeply grateful for their foundational work in building an exceptional open source AI coding agent.
+EmberHarmony is a fork of [opencode](https://github.com/anomalyco/opencode) by the [SST](https://sst.dev) team. We are deeply grateful for their foundational work in building an exceptional open source AI coding agent.
 
 ### Maintainer
 
