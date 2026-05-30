@@ -1,5 +1,5 @@
 <p align="center">
-  <a href="https://solace.ofharmony.ai">
+  <a href="https://github.com/SolaceHarmony/emberharmony">
     <picture>
       <source srcset="packages/console/app/src/asset/logo-ornate-dark.svg" media="(prefers-color-scheme: dark)">
       <source srcset="packages/console/app/src/asset/logo-ornate-light.svg" media="(prefers-color-scheme: light)">
@@ -11,52 +11,63 @@
 <p align="center">
   <a href="https://discord.gg/EdF8f7JR"><img alt="Discord" src="https://img.shields.io/discord/1391832426048651334?style=flat-square&label=discord" /></a>
   <a href="https://www.npmjs.com/package/@thesolaceproject/emberharmony"><img alt="npm" src="https://img.shields.io/npm/v/%40thesolaceproject%2Femberharmony?style=flat-square" /></a>
-  <a href="https://github.com/SolaceHarmony/emberharmony/actions/workflows/publish.yml"><img alt="Build status" src="https://img.shields.io/github/actions/workflow/status/SolaceHarmony/emberharmony/publish.yml?style=flat-square&branch=dev" /></a>
+  <a href="https://github.com/SolaceHarmony/emberharmony/actions/workflows/ci.yml"><img alt="Build status" src="https://img.shields.io/github/actions/workflow/status/SolaceHarmony/emberharmony/ci.yml?style=flat-square&branch=main" /></a>
 </p>
 
-<p align="center">
-  <a href="README.md">English</a> |
-  <a href="README.zh.md">简体中文</a> |
-  <a href="README.zht.md">繁體中文</a> |
-  <a href="README.ko.md">한국어</a> |
-  <a href="README.de.md">Deutsch</a> |
-  <a href="README.es.md">Español</a> |
-  <a href="README.fr.md">Français</a> |
-  <a href="README.it.md">Italiano</a> |
-  <a href="README.da.md">Dansk</a> |
-  <a href="README.ja.md">日本語</a> |
-  <a href="README.pl.md">Polski</a> |
-  <a href="README.ru.md">Русский</a> |
-  <a href="README.ar.md">العربية</a> |
-  <a href="README.no.md">Norsk</a> |
-  <a href="README.br.md">Português (Brasil)</a>
-</p>
-
-[![EmberHarmony Terminal UI](packages/web/src/assets/lander/screenshot.png)](https://solace.ofharmony.ai)
+[![Interface terminal d'EmberHarmony](packages/web/src/assets/lander/screenshot.png)](https://github.com/SolaceHarmony/emberharmony)
 
 ---
+
+## Qu'est-ce qu'EmberHarmony ?
+
+EmberHarmony est un agent de codage IA open source qui s'exécute dans votre terminal. Il est agnostique vis-à-vis des fournisseurs — utilisez-le avec Claude, OpenAI, Google, des modèles locaux via Ollama, ou tout point de terminaison compatible OpenAI. Il offre une TUI riche, une prise en charge intégrée de LSP, et une architecture client/serveur qui vous permet de le piloter à distance.
+
+### Modèles locaux sans configuration
+
+EmberHarmony découvre automatiquement chaque modèle installé dans votre instance locale [Ollama](https://ollama.com). Aucune clé API, aucun fichier de configuration, aucune installation manuelle. Si Ollama est en cours d'exécution, vos modèles apparaissent :
+
+```
+ollama (custom): 19 models
+  gemma3:latest           · 4.3B  · Q4_K_M
+  llama3.2:latest         · 3.2B  · Q4_K_M
+  deepseek-r1:14b         · 14.0B · Q4_K_M
+  qwen3:8b                · 8.2B  · Q4_K_M
+  ...
+```
+
+Basculez entre modèles cloud et locaux en pleine conversation. Effectuez des analyses de code sensibles entièrement sur votre machine. Utilisez les modèles cloud quand vous avez besoin de capacités de pointe, et les modèles locaux quand vous avez besoin de confidentialité ou d'un accès hors ligne.
+
+**Principales différences avec les autres outils de codage IA :**
+
+- **Local d'abord** — découverte automatique des modèles Ollama, zéro configuration, aucune clé nécessaire
+- 100 % open source (MIT)
+- Non couplé à un fournisseur unique — fonctionne avec Claude, OpenAI, Google, Ollama, et plus encore
+- Prise en charge LSP immédiate pour une navigation intelligente dans le code
+- Interface terminal riche qui repousse les limites de ce qui est possible dans le terminal
+- Architecture client/serveur — exécutez sur votre machine, pilotez depuis n'importe où
 
 ### Installation
 
 ```bash
-# YOLO
+# Quick install
 curl -fsSL https://raw.githubusercontent.com/SolaceHarmony/emberharmony/dev/install | bash
 
-# Gestionnaires de paquets
-npm i -g @thesolaceproject/emberharmony@latest        # ou bun/pnpm/yarn
-scoop install emberharmony             # Windows
-choco install emberharmony             # Windows
-paru -S emberharmony-bin               # Arch Linux
-mise use -g emberharmony               # n'importe quel OS
-nix run nixpkgs#emberharmony           # ou github:SolaceHarmony/emberharmony pour la branche dev la plus récente
+# npm / bun
+npm i -g @thesolaceproject/emberharmony@latest
 ```
 
-> [!TIP]
-> Supprimez les versions antérieures à 0.1.x avant d'installer.
+#### Build local + installation
 
-### Application de bureau (BETA)
+```bash
+bun install
+npm run pack:local
+# prints a .tgz path you can install, e.g.
+# npm i -g /absolute/path/to/emberharmony-1.2.2.tgz
+```
 
-EmberHarmony est aussi disponible en application de bureau. Téléchargez-la directement depuis la [page des releases](https://github.com/SolaceHarmony/emberharmony/releases) ou [solace.ofharmony.ai/download](https://github.com/SolaceHarmony/emberharmony/releases).
+### Application de bureau (Bêta)
+
+EmberHarmony est également disponible sous forme d'application de bureau. Téléchargez-la directement depuis la [page des releases](https://github.com/SolaceHarmony/emberharmony/releases).
 
 | Plateforme            | Téléchargement                            |
 | --------------------- | ----------------------------------------- |
@@ -65,75 +76,82 @@ EmberHarmony est aussi disponible en application de bureau. Téléchargez-la dir
 | Windows               | `emberharmony-desktop-windows-x64.exe`    |
 | Linux                 | `.deb`, `.rpm`, ou AppImage               |
 
-```bash
-# Windows (Scoop)
-scoop bucket add extras; scoop install extras@thesolaceproject/emberharmony-desktop
-```
-
 #### Répertoire d'installation
 
-Le script d'installation respecte l'ordre de priorité suivant pour le chemin d'installation :
+Le script d'installation respecte l'ordre de priorité suivant :
 
-1. `$EMBERHARMONY_INSTALL_DIR` - Répertoire d'installation personnalisé
-2. `$XDG_BIN_DIR` - Chemin conforme à la spécification XDG Base Directory
-3. `$HOME/bin` - Répertoire binaire utilisateur standard (s'il existe ou peut être créé)
-4. `$HOME/.emberharmony/bin` - Repli par défaut
+1. `$EMBERHARMONY_INSTALL_DIR` — répertoire d'installation personnalisé
+2. `$XDG_BIN_DIR` — chemin conforme à la spécification XDG Base Directory
+3. `$HOME/bin` — répertoire binaire utilisateur standard (s'il existe)
+4. `$HOME/.emberharmony/bin` — solution de repli par défaut
 
 ```bash
-# Exemples
 EMBERHARMONY_INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/SolaceHarmony/emberharmony/dev/install | bash
-XDG_BIN_DIR=$HOME/.local/bin curl -fsSL https://raw.githubusercontent.com/SolaceHarmony/emberharmony/dev/install | bash
 ```
 
 ### Agents
 
-EmberHarmony inclut deux agents intégrés que vous pouvez basculer avec la touche `Tab`.
+EmberHarmony inclut deux agents intégrés entre lesquels vous pouvez basculer avec la touche `Tab`.
 
-- **build** - Par défaut, agent avec accès complet pour le travail de développement
-- **plan** - Agent en lecture seule pour l'analyse et l'exploration du code
+- **build** — agent par défaut à accès complet pour le travail de développement
+- **plan** — agent en lecture seule pour l'analyse et l'exploration du code
   - Refuse les modifications de fichiers par défaut
-  - Demande l'autorisation avant d'exécuter des commandes bash
-  - Idéal pour explorer une base de code inconnue ou planifier des changements
+  - Demande la permission avant d'exécuter des commandes bash
+  - Idéal pour explorer des bases de code inconnues ou planifier des changements
 
-Un sous-agent **general** est aussi inclus pour les recherches complexes et les tâches en plusieurs étapes.
-Il est utilisé en interne et peut être invoqué via `@general` dans les messages.
+Un sous-agent **general** est également disponible pour les recherches complexes et les tâches multi-étapes. Il est utilisé en interne et peut être invoqué avec `@general` dans les messages.
 
-En savoir plus sur les [agents](https://solace.ofharmony.ai/docs/agents).
+### Prise en charge des fournisseurs
 
-### Documentation
+EmberHarmony fonctionne avec toute API compatible OpenAI. Prise en charge intégrée pour :
 
-Pour plus d'informations sur la configuration d'EmberHarmony, [**consultez notre documentation**](https://solace.ofharmony.ai/docs).
+| Fournisseur | Modèles | Configuration requise |
+|----------|--------|---------------|
+| **Ollama (local)** | Découverts automatiquement depuis `localhost:11434` | Aucune — lancez simplement Ollama |
+| **Ollama Cloud** | Modèles Ollama hébergés | Clé API |
+| **Anthropic** | Claude Opus, Sonnet, Haiku | Clé API |
+| **OpenAI** | GPT-4o, o1, o3 | Clé API |
+| **Google** | Gemini Pro, Flash | Clé API |
+| **Tout fournisseur compatible OpenAI** | LM Studio, vLLM, Together, Groq, etc. | Point de terminaison + clé |
+
+#### Configuration locale d'Ollama
+
+```bash
+# 1. Install Ollama (https://ollama.com)
+# 2. Pull a model
+ollama pull llama3.2
+
+# 3. Run EmberHarmony — models appear automatically
+emberharmony
+```
+
+Pour utiliser une adresse Ollama non par défaut, ajoutez ceci à `~/.config/emberharmony/config.json` :
+```json
+{
+  "provider": {
+    "ollama": {
+      "options": { "baseURL": "http://192.168.1.100:11434" }
+    }
+  }
+}
+```
 
 ### Contribuer
 
-Si vous souhaitez contribuer à EmberHarmony, lisez nos [docs de contribution](./CONTRIBUTING.md) avant de soumettre une pull request.
+Si vous souhaitez contribuer à EmberHarmony, veuillez lire notre [guide de contribution](./CONTRIBUTING.md) avant de soumettre une pull request.
 
-### Construire avec EmberHarmony
+### Construire sur EmberHarmony
 
-Si vous travaillez sur un projet lié à EmberHarmony et que vous utilisez "emberharmony" dans le nom du projet (par exemple, "emberharmony-dashboard" ou "emberharmony-mobile"), ajoutez une note dans votre README pour préciser qu'il n'est pas construit par l'équipe EmberHarmony et qu'il n'est pas affilié à nous.
+Si vous travaillez sur un projet lié à EmberHarmony qui utilise « emberharmony » dans son nom, veuillez ajouter une note dans votre README précisant qu'il n'est pas développé par The Solace Project et qu'il n'est pas affilié à nous.
 
-### FAQ
+### Remerciements
 
-#### En quoi est-ce différent de Claude Code ?
+EmberHarmony est un fork d'[opencode](https://github.com/anomalyco/opencode) par l'équipe [SST](https://sst.dev). Nous sommes profondément reconnaissants pour leur travail fondateur dans la construction d'un agent de codage IA open source exceptionnel. Ce projet s'appuie sur leur vision et leur ingénierie.
 
-C'est très similaire à Claude Code en termes de capacités. Voici les principales différences :
+### Mainteneuse
 
-- 100% open source
-- Pas couplé à un fournisseur. Nous recommandons les modèles proposés via Au fur et à mesure que les modèles évoluent, les écarts se réduiront et les prix baisseront, donc être agnostique au fournisseur est important.
-- Support LSP prêt à l'emploi
-- Un focus sur la TUI. EmberHarmony est construit; nous allons repousser les limites de ce qui est possible dans le terminal.
-- Architecture client/serveur. Cela permet par exemple de faire tourner EmberHarmony sur votre ordinateur tout en le pilotant à distance depuis une application mobile. Cela signifie que la TUI n'est qu'un des clients possibles.
-
-
-### Acknowledgments
-
-EmberHarmony is a fork of [opencode](https://github.com/anomalyco/opencode) by the [SST](https://sst.dev) team. We are deeply grateful for their foundational work in building an exceptional open source AI coding agent.
-
-### Maintainer
-
-**Sydney Renee** — sydney@solace.ofharmony.ai
-[The Solace Project](https://solace.ofharmony.ai)
+**Sydney Renee** — [The Solace Project](https://github.com/SolaceHarmony)
 
 ---
 
-**Rejoignez notre communauté** [Discord](https://discord.gg/EdF8f7JR) | [GitHub Discussions](https://github.com/SolaceHarmony/emberharmony/discussions)
+**Communauté :** [Discord](https://discord.gg/EdF8f7JR) | [Issues](https://github.com/SolaceHarmony/emberharmony/issues) | [Releases](https://github.com/SolaceHarmony/emberharmony/releases)
