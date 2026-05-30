@@ -15,8 +15,7 @@
     "desktop:build": "bun run --cwd packages/desktop build:local",
     "desktop:build:nodmg": "bun run --cwd packages/desktop build:local:nodmg",
     "typecheck": "bun turbo typecheck",
-    "random": "echo 'Random script'",
-    "hello": "echo 'Hello World!'",
+    "version:sync": "bun run script/sync-version.ts",
     "probe:ollama": "bun run script/ollama-cloud-probe.ts",
     "test": "bun run script/test.ts"
   },

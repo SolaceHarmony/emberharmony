@@ -1,0 +1,9 @@
+{
+  "version": "1.3.0",
+  "name": "EmberHarmony",
+  "packageName": "@thesolaceproject/emberharmony",
+  "repository": "https://github.com/SolaceHarmony/emberharmony",
+  "homepage": "https://solace.ofharmony.ai",
+  "tagline": "The open source AI coding agent",
+  "discord": "https://discord.gg/EdF8f7JR"
+}
