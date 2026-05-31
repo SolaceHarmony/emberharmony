@@ -146,7 +146,7 @@ Si estás trabajando en un proyecto relacionado con EmberHarmony que usa "emberh
 
 ### Agradecimientos
 
-EmberHarmony es un fork de [opencode](https://github.com/anomalyco/opencode) del equipo de [SST](https://sst.dev). Estamos profundamente agradecidos por su trabajo fundacional al construir un agente de codificación con IA de código abierto excepcional. Este proyecto se basa en su visión y su ingeniería.
+EmberHarmony es un fork de [opencode](https://github.com/anomalyco/opencode) del equipo de opencode upstream. Estamos profundamente agradecidos por su trabajo fundacional al construir un agente de codificación con IA de código abierto excepcional. Este proyecto se basa en su visión y su ingeniería.
 
 ### Responsable del mantenimiento
 

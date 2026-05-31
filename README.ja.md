@@ -146,7 +146,7 @@ EmberHarmony に関連するプロジェクトで、その名前に「emberharmo
 
 ### 謝辞
 
-EmberHarmony は、[SST](https://sst.dev) チームによる [opencode](https://github.com/anomalyco/opencode) のフォークです。優れたオープンソース AI コーディングエージェントを構築するという彼らの基礎的な仕事に、私たちは深く感謝しています。本プロジェクトは、彼らのビジョンとエンジニアリングの上に築かれています。
+EmberHarmony は、opencode upstream チームによる [opencode](https://github.com/anomalyco/opencode) のフォークです。優れたオープンソース AI コーディングエージェントを構築するという彼らの基礎的な仕事に、私たちは深く感謝しています。本プロジェクトは、彼らのビジョンとエンジニアリングの上に築かれています。
 
 ### メンテナー
 

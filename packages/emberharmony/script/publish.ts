@@ -31,18 +31,26 @@ await $`cp ./script/postinstall.mjs ./dist/${pkg.name}/postinstall.mjs`
 
 const meta = await Bun.file(path.join(root, "package.json"))
   .json()
-  .catch(() => ({} as unknown))
+  .catch(() => ({}) as unknown)
 
 const description =
-  typeof meta === "object" && meta && "description" in meta && typeof meta.description === "string" ? meta.description : undefined
+  typeof meta === "object" && meta && "description" in meta && typeof meta.description === "string"
+    ? meta.description
+    : undefined
 
 const homepage =
-  typeof meta === "object" && meta && "homepage" in meta && typeof meta.homepage === "string" ? meta.homepage : undefined
+  typeof meta === "object" && meta && "homepage" in meta && typeof meta.homepage === "string"
+    ? meta.homepage
+    : undefined
 
-const license = typeof meta === "object" && meta && "license" in meta && typeof meta.license === "string" ? meta.license : "MIT"
+const license =
+  typeof meta === "object" && meta && "license" in meta && typeof meta.license === "string" ? meta.license : "MIT"
 
 const repository =
-  typeof meta === "object" && meta && "repository" in meta && (typeof meta.repository === "object" || typeof meta.repository === "string")
+  typeof meta === "object" &&
+  meta &&
+  "repository" in meta &&
+  (typeof meta.repository === "object" || typeof meta.repository === "string")
     ? meta.repository
     : undefined
 
@@ -146,132 +154,3 @@ if (publishPlatforms) {
   }
 }
 await publish(`./dist/${pkg.name}`)
-
-// registries
-if (!Script.preview) {
-  // Calculate SHA values
-  const arm64Sha = await $`sha256sum ./dist/${cliName}-linux-arm64.tar.gz | cut -d' ' -f1`.text().then((x) => x.trim())
-  const x64Sha = await $`sha256sum ./dist/${cliName}-linux-x64.tar.gz | cut -d' ' -f1`.text().then((x) => x.trim())
-  const macX64Sha = await $`sha256sum ./dist/${cliName}-darwin-x64.zip | cut -d' ' -f1`.text().then((x) => x.trim())
-  const macArm64Sha = await $`sha256sum ./dist/${cliName}-darwin-arm64.zip | cut -d' ' -f1`.text().then((x) => x.trim())
-
-  const [pkgver, _subver = ""] = Script.version.split(/(-.*)/, 2)
-
-  /*
-  // arch
-  const binaryPkgbuild = [
-    "# Maintainer: dax",
-    "# Maintainer: adam",
-    "",
-    "pkgname='emberharmony-bin'",
-    `pkgver=${pkgver}`,
-    `_subver=${_subver}`,
-    "options=('!debug' '!strip')",
-    "pkgrel=1",
-    "pkgdesc='The AI coding agent built for the terminal.'",
-    "url='https://github.com/SolaceHarmony/emberharmony'",
-    "arch=('aarch64' 'x86_64')",
-    "license=('MIT')",
-    "provides=('emberharmony')",
-    "conflicts=('emberharmony')",
-    "depends=('ripgrep')",
-    "",
-    `source_aarch64=("\${pkgname}_\${pkgver}_aarch64.tar.gz::https://github.com/SolaceHarmony/emberharmony/releases/download/v\${pkgver}\${_subver}/${cliName}-linux-arm64.tar.gz")`,
-    `sha256sums_aarch64=('${arm64Sha}')`,
-
-    `source_x86_64=("\${pkgname}_\${pkgver}_x86_64.tar.gz::https://github.com/SolaceHarmony/emberharmony/releases/download/v\${pkgver}\${_subver}/${cliName}-linux-x64.tar.gz")`,
-    `sha256sums_x86_64=('${x64Sha}')`,
-    "",
-    "package() {",
-    `  install -Dm755 ./${cliName} "${pkgdir}/usr/bin/${cliName}"`,
-    "}",
-    "",
-  ].join("\n")
-
-  // Source-based PKGBUILD for emberharmony
-  const sourcePkgbuild = [
-    "# Maintainer: dax",
-    "# Maintainer: adam",
-    "",
-    "pkgname='emberharmony'",
-    `pkgver=${pkgver}`,
-    `_subver=${_subver}`,
-    "options=('!debug' '!strip')",
-    "pkgrel=1",
-    "pkgdesc='The AI coding agent built for the terminal.'",
-    "url='https://github.com/SolaceHarmony/emberharmony'",
-    "arch=('aarch64' 'x86_64')",
-    "license=('MIT')",
-    "provides=('emberharmony')",
-    "conflicts=('emberharmony-bin')",
-    "depends=('ripgrep')",
-    "makedepends=('git' 'bun' 'go')",
-    "",
-    `source=("emberharmony-\${pkgver}.tar.gz::https://github.com/SolaceHarmony/emberharmony/archive/v\${pkgver}\${_subver}.tar.gz")`,
-    `sha256sums=('SKIP')`,
-    "",
-    "build() {",
-    `  cd "emberharmony-\${pkgver}"`,
-    `  bun install`,
-    "  cd ./packages/emberharmony",
-    `  EMBERHARMONY_CHANNEL=latest EMBERHARMONY_VERSION=${pkgver} bun run ./script/build.ts --single`,
-    "}",
-    "",
-    "package() {",
-    `  cd "emberharmony-\${pkgver}/packages/emberharmony"`,
-    '  mkdir -p "${pkgdir}/usr/bin"',
-    '  target_arch="x64"',
-    '  case "$CARCH" in',
-    '    x86_64) target_arch="x64" ;;',
-    '    aarch64) target_arch="arm64" ;;',
-    '    *) printf "unsupported architecture: %s\\n" "$CARCH" >&2 ; return 1 ;;',
-    "  esac",
-    '  libc=""',
-    "  if command -v ldd >/dev/null 2>&1; then",
-    "    if ldd --version 2>&1 | grep -qi musl; then",
-    '      libc="-musl"',
-    "    fi",
-    "  fi",
-    '  if [ -z "$libc" ] && ls /lib/ld-musl-* >/dev/null 2>&1; then',
-    '    libc="-musl"',
-    "  fi",
-    '  base=""',
-    '  if [ "$target_arch" = "x64" ]; then',
-    "    if ! grep -qi avx2 /proc/cpuinfo 2>/dev/null; then",
-    '      base="-baseline"',
-    "    fi",
-    "  fi",
-    `  bin="dist/emberharmony-linux-\${target_arch}\${base}\${libc}/bin/${cliName}"`,
-    '  if [ ! -f "$bin" ]; then',
-    '    printf "unable to find binary for %s%s%s\\n" "$target_arch" "$base" "$libc" >&2',
-    "    return 1",
-    "  fi",
-    `  install -Dm755 "$bin" "${pkgdir}/usr/bin/${cliName}"`,
-    "}",
-    "",
-  ].join("\n")
-
-  for (const [pkg, pkgbuild] of [
-    ["emberharmony-bin", binaryPkgbuild],
-    ["emberharmony", sourcePkgbuild],
-  ]) {
-    for (let i = 0; i < 30; i++) {
-      try {
-        await $`rm -rf ./dist/aur-${pkg}`
-        await $`git clone ssh://aur@aur.archlinux.org/${pkg}.git ./dist/aur-${pkg}`
-        await $`cd ./dist/aur-${pkg} && git checkout master`
-        await Bun.file(`./dist/aur-${pkg}/PKGBUILD`).write(pkgbuild)
-        await $`cd ./dist/aur-${pkg} && makepkg --printsrcinfo > .SRCINFO`
-        await $`cd ./dist/aur-${pkg} && git add PKGBUILD .SRCINFO`
-        await $`cd ./dist/aur-${pkg} && git commit -m "Update to v${Script.version}"`
-        await $`cd ./dist/aur-${pkg} && git push`
-        break
-      } catch (e) {
-        continue
-      }
-    }
-  }
-  */
-
-  // Tap updates disabled for now.
-}

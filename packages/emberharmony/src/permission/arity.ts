@@ -141,7 +141,6 @@ This dictionary is used to identify the "human-understandable command" from an i
     sfdx: 3, // sfdx force:org:list
     skaffold: 2, // skaffold dev
     sls: 2, // sls deploy
-    sst: 2, // sst deploy
     swift: 2, // swift build
     systemctl: 2, // systemctl restart nginx
     terraform: 2, // terraform apply

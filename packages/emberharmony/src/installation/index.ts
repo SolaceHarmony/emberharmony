@@ -81,14 +81,6 @@ export namespace Installation {
         name: "bun" as const,
         command: () => $`bun pm ls -g`.throws(false).quiet().text(),
       },
-      {
-        name: "scoop" as const,
-        command: () => $`scoop list emberharmony`.throws(false).quiet().text(),
-      },
-      {
-        name: "choco" as const,
-        command: () => $`choco list --limit-output emberharmony`.throws(false).quiet().text(),
-      },
     ]
 
     checks.sort((a, b) => {
@@ -136,20 +128,13 @@ export namespace Installation {
       case "bun":
         cmd = $`bun install -g ${npmName}@${target}`
         break
-      case "choco":
-        cmd = $`echo Y | choco upgrade emberharmony --version=${target}`
-        break
-      case "scoop":
-        cmd = $`scoop install emberharmony@${target}`
-        break
       default:
         throw new Error(`Unknown method: ${method}`)
     }
     const result = await cmd.quiet().throws(false)
     if (result.exitCode !== 0) {
-      const stderr = method === "choco" ? "not running from an elevated command shell" : result.stderr.toString("utf8")
       throw new UpgradeFailedError({
-        stderr: stderr,
+        stderr: result.stderr.toString("utf8"),
       })
     }
     log.info("upgraded", {
@@ -177,29 +162,6 @@ export namespace Installation {
       const channel = CHANNEL
       const name = encodeURIComponent(npmName)
       return fetch(`${registry}/${name}/${channel}`)
-        .then((res) => {
-          if (!res.ok) throw new Error(res.statusText)
-          return res.json()
-        })
-        .then((data: any) => data.version)
-    }
-
-    if (detectedMethod === "choco") {
-      return fetch(
-        "https://community.chocolatey.org/api/v2/Packages?$filter=Id%20eq%20%27emberharmony%27%20and%20IsLatestVersion&$select=Version",
-        { headers: { Accept: "application/json;odata=verbose" } },
-      )
-        .then((res) => {
-          if (!res.ok) throw new Error(res.statusText)
-          return res.json()
-        })
-        .then((data: any) => data.d.results[0].Version)
-    }
-
-    if (detectedMethod === "scoop") {
-      return fetch("https://raw.githubusercontent.com/ScoopInstaller/Main/master/bucket/emberharmony.json", {
-        headers: { Accept: "application/json" },
-      })
         .then((res) => {
           if (!res.ok) throw new Error(res.statusText)
           return res.json()

@@ -1,9 +1,9 @@
 name: CI
 run-name: CI ${{ github.ref_name }} @ ${{ github.sha }}
 
-# Verification builds. Runs the full 5-target CLI + Tauri matrix on every push
-# to an integration branch (i.e. after a PR merges). Does NOT run on pull_request
-# — that keeps the expensive matrix off PR review and away from fork secrets.
+# Verification builds. Runs the CLI build on every push to an integration branch
+# (i.e. after a PR merges). Does NOT run on pull_request — that keeps the
+# expensive release build off PR review.
 
 on:
   push:

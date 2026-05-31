@@ -1,5 +1,4 @@
 import path from "path"
-import { exec } from "child_process"
 import * as prompts from "@clack/prompts"
 import { map, pipe, sortBy, values } from "remeda"
 import { Octokit } from "@octokit/rest"
@@ -131,7 +130,7 @@ type IssueQueryResponse = {
   }
 }
 
-const AGENT_USERNAME = "emberharmony-agent[bot]"
+const AGENT_USERNAME = "github-actions[bot]"
 const AGENT_REACTION = "eyes"
 const WORKFLOW_FILE = ".github/workflows/emberharmony.yml"
 
@@ -199,7 +198,6 @@ export const GithubInstallCommand = cmd({
           UI.empty()
           prompts.intro("Install GitHub agent")
           const app = await getAppInfo()
-          await installGitHubApp()
 
           const providers = await ModelsDev.get().then((p) => {
             // TODO: add guide for copilot, for now just hide it
@@ -260,7 +258,7 @@ export const GithubInstallCommand = cmd({
 
           async function promptProvider() {
             const priority: Record<string, number> = {
-              "emberharmony": 0,
+              emberharmony: 0,
               anthropic: 1,
               openai: 2,
               google: 3,
@@ -309,64 +307,14 @@ export const GithubInstallCommand = cmd({
             return model
           }
 
-          async function installGitHubApp() {
-            const s = prompts.spinner()
-            s.start("Installing GitHub app")
-
-            // Get installation
-            const installation = await getInstallation()
-            if (installation) return s.stop("GitHub app already installed")
-
-            // Open browser
-            const url = "https://github.com/apps/emberharmony-agent"
-            const command =
-              process.platform === "darwin"
-                ? `open "${url}"`
-                : process.platform === "win32"
-                  ? `start "" "${url}"`
-                  : `xdg-open "${url}"`
-
-            exec(command, (error) => {
-              if (error) {
-                prompts.log.warn(`Could not open browser. Please visit: ${url}`)
-              }
-            })
-
-            // Wait for installation
-            s.message("Waiting for GitHub app to be installed")
-            const MAX_RETRIES = 120
-            let retries = 0
-            do {
-              const installation = await getInstallation()
-              if (installation) break
-
-              if (retries > MAX_RETRIES) {
-                s.stop(
-                  `Failed to detect GitHub app installation. Make sure to install the app for the \`${app.owner}/${app.repo}\` repository.`,
-                )
-                throw new UI.CancelledError()
-              }
-
-              retries++
-              await Bun.sleep(1000)
-            } while (true)
-
-            s.stop("Installed GitHub app")
-
-            async function getInstallation() {
-              return await fetch(
-                `https://api.solace.ofharmony.ai/get_github_app_installation?owner=${app.owner}&repo=${app.repo}`,
-              )
-                .then((res) => res.json())
-                .then((data) => data.installation)
-            }
-          }
-
           async function addWorkflowFiles() {
-            const envStr =
-              provider === "amazon-bedrock"
-                ? ""
-                : `\n        env:${providers[provider].env.map((e) => `\n          ${e}: \${{ secrets.${e} }}`).join("")}`
+            const env = [
+              "GITHUB_TOKEN: ${{ github.token }}",
+              ...(provider === "amazon-bedrock"
+                ? []
+                : providers[provider].env.map((e) => `${e}: \${{ secrets.${e} }}`)),
+            ]
+            const envStr = `\n        env:${env.map((e) => `\n          ${e}`).join("")}`
 
             await Bun.write(
               path.join(app.root, WORKFLOW_FILE),
@@ -387,10 +335,9 @@ jobs:
       startsWith(github.event.comment.body, '/emberharmony')
     runs-on: ubuntu-latest
     permissions:
-      id-token: write
-      contents: read
-      pull-requests: read
-      issues: read
+      contents: write
+      pull-requests: write
+      issues: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -415,18 +362,13 @@ export const GithubRunCommand = cmd({
   command: "run",
   describe: "run the GitHub agent",
   builder: (yargs) =>
-    yargs
-      .option("event", {
-        type: "string",
-        describe: "GitHub mock event to run the agent for",
-      })
-      .option("token", {
-        type: "string",
-        describe: "GitHub personal access token (github_pat_********)",
-      }),
+    yargs.option("event", {
+      type: "string",
+      describe: "GitHub mock event to run the agent for",
+    }),
   async handler(args) {
     await bootstrap(process.cwd(), async () => {
-      const isMock = args.token || args.event
+      const isMock = !!args.event
 
       const context = isMock ? (JSON.parse(args.event!) as Context) : github.context
       if (!SUPPORTED_EVENTS.includes(context.eventName as (typeof SUPPORTED_EVENTS)[number])) {
@@ -447,7 +389,6 @@ export const GithubRunCommand = cmd({
       const { providerID, modelID } = normalizeModel()
       const runId = normalizeRunId()
       const share = normalizeShare()
-      const oidcBaseUrl = normalizeOidcBaseUrl()
       const { owner, repo } = context.repo
       // For repo events (schedule, workflow_dispatch), payload has no issue/comment data
       const payload = context.payload as
@@ -469,7 +410,6 @@ export const GithubRunCommand = cmd({
       const runUrl = `/${owner}/${repo}/actions/runs/${runId}`
       const shareBaseUrl = isMock ? "https://dev.solace.ofharmony.ai" : "https://solace.ofharmony.ai"
 
-      let appToken: string
       let octoRest: Octokit
       let octoGraph: typeof graphql
       let gitConfig: string
@@ -480,35 +420,22 @@ export const GithubRunCommand = cmd({
       const triggerCommentId = isCommentEvent
         ? (payload as IssueCommentEvent | PullRequestReviewCommentEvent).comment.id
         : undefined
-      const useGithubToken = normalizeUseGithubToken()
       const commentType = isCommentEvent
         ? context.eventName === "pull_request_review_comment"
           ? "pr_review"
           : "issue"
         : undefined
+      const auth = process.env["GITHUB_TOKEN"]
+      if (!auth) throw new Error("GITHUB_TOKEN environment variable is not set.")
 
       try {
-        if (useGithubToken) {
-          const githubToken = process.env["GITHUB_TOKEN"]
-          if (!githubToken) {
-            throw new Error(
-              "GITHUB_TOKEN environment variable is not set. When using use_github_token, you must provide GITHUB_TOKEN.",
-            )
-          }
-          appToken = githubToken
-        } else {
-          const actionToken = isMock ? args.token! : await getOidcToken()
-          appToken = await exchangeForAppToken(actionToken)
-        }
-        octoRest = new Octokit({ auth: appToken })
+        octoRest = new Octokit({ auth })
         octoGraph = graphql.defaults({
-          headers: { authorization: `token ${appToken}` },
+          headers: { authorization: `token ${auth}` },
         })
 
         const { userPrompt, promptFiles } = await getUserPrompt()
-        if (!useGithubToken) {
-          await configureGit(appToken)
-        }
+        await configureGit(auth)
         // Skip permission check and reactions for repo events (no actor to check, no issue to react to)
         if (isUserEvent) {
           await assertPermissions()
@@ -641,10 +568,7 @@ export const GithubRunCommand = cmd({
         // Also output the clean error message for the action to capture
         //core.setOutput("prepare_error", e.message);
       } finally {
-        if (!useGithubToken) {
-          await restoreGitConfig()
-          await revokeAppToken()
-        }
+        await restoreGitConfig()
       }
       process.exit(exitCode)
 
@@ -671,20 +595,6 @@ export const GithubRunCommand = cmd({
         if (value === "true") return true
         if (value === "false") return false
         throw new Error(`Invalid share value: ${value}. Share must be a boolean.`)
-      }
-
-      function normalizeUseGithubToken() {
-        const value = process.env["USE_GITHUB_TOKEN"]
-        if (!value) return false
-        if (value === "true") return true
-        if (value === "false") return false
-        throw new Error(`Invalid use_github_token value: ${value}. Must be a boolean.`)
-      }
-
-      function normalizeOidcBaseUrl(): string {
-        const value = process.env["OIDC_BASE_URL"]
-        if (!value) return "https://api.solace.ofharmony.ai"
-        return value.replace(/\/+$/, "")
       }
 
       function isIssueCommentEvent(
@@ -804,7 +714,7 @@ export const GithubRunCommand = cmd({
           // Download image
           const res = await fetch(safeUrl, {
             headers: {
-              Authorization: `Bearer ${appToken}`,
+              Authorization: `Bearer ${auth}`,
               Accept: "application/vnd.github.v3+json",
             },
           })
@@ -978,45 +888,7 @@ export const GithubRunCommand = cmd({
         return summaryText
       }
 
-      async function getOidcToken() {
-        try {
-          return await core.getIDToken("emberharmony-github-action")
-        } catch (error) {
-          console.error("Failed to get OIDC token:", error instanceof Error ? error.message : error)
-          throw new Error(
-            "Could not fetch an OIDC token. Make sure to add `id-token: write` to your workflow permissions.",
-          )
-        }
-      }
-
-      async function exchangeForAppToken(token: string) {
-        const response = token.startsWith("github_pat_")
-          ? await fetch(`${oidcBaseUrl}/exchange_github_app_token_with_pat`, {
-              method: "POST",
-              headers: {
-                Authorization: `Bearer ${token}`,
-              },
-              body: JSON.stringify({ owner, repo }),
-            })
-          : await fetch(`${oidcBaseUrl}/exchange_github_app_token`, {
-              method: "POST",
-              headers: {
-                Authorization: `Bearer ${token}`,
-              },
-            })
-
-        if (!response.ok) {
-          const responseJson = (await response.json()) as { error?: string }
-          throw new Error(
-            `App token exchange failed: ${response.status} ${response.statusText} - ${responseJson.error}`,
-          )
-        }
-
-        const responseJson = (await response.json()) as { token: string }
-        return responseJson.token
-      }
-
-      async function configureGit(appToken: string) {
+      async function configureGit(auth: string) {
         // Do not change git config when running locally
         if (isMock) return
 
@@ -1030,7 +902,7 @@ export const GithubRunCommand = cmd({
           await $`git config --local --unset-all ${config}`
         }
 
-        const newCredentials = Buffer.from(`x-access-token:${appToken}`, "utf8").toString("base64")
+        const newCredentials = Buffer.from(`x-access-token:${auth}`, "utf8").toString("base64")
 
         await $`git config --local ${config} "AUTHORIZATION: basic ${newCredentials}"`
         await $`git config --global user.name "${AGENT_USERNAME}"`
@@ -1547,19 +1419,6 @@ query($owner: String!, $repo: String!, $number: Int!) {
           ...(reviewData.length > 0 ? ["<pull_request_reviews>", ...reviewData, "</pull_request_reviews>"] : []),
           "</pull_request>",
         ].join("\n")
-      }
-
-      async function revokeAppToken() {
-        if (!appToken) return
-
-        await fetch("https://api.github.com/installation/token", {
-          method: "DELETE",
-          headers: {
-            Authorization: `Bearer ${appToken}`,
-            Accept: "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28",
-          },
-        })
       }
     })
   },

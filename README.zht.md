@@ -146,7 +146,7 @@ emberharmony
 
 ### 致謝
 
-EmberHarmony 是 [SST](https://sst.dev) 團隊所開發的 [opencode](https://github.com/anomalyco/opencode) 的一個分支（fork）。我們由衷感謝他們在打造一個卓越的開源 AI 程式設計代理上所奠定的基礎工作。本專案正是建立在他們的願景與工程之上。
+EmberHarmony 是 opencode upstream 團隊所開發的 [opencode](https://github.com/anomalyco/opencode) 的一個分支（fork）。我們由衷感謝他們在打造一個卓越的開源 AI 程式設計代理上所奠定的基礎工作。本專案正是建立在他們的願景與工程之上。
 
 ### 維護者
 

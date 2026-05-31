@@ -3,7 +3,6 @@
   "productName": "EmberHarmony",
   "identifier": "ai.ofharmony.code",
   "bundle": {
-    "createUpdaterArtifacts": true,
     "icon": [
       "icons/prod/32x32.png",
       "icons/prod/128x128.png",
@@ -22,12 +21,6 @@
           "/usr/share/metainfo/ai.ofharmony.code.metainfo.xml": "release/appstream.metainfo.xml"
         }
       }
-    }
-  },
-  "plugins": {
-    "updater": {
-      "pubkey": "__SET_TAURI_UPDATER_PUBKEY_AT_BUILD_TIME__",
-      "endpoints": ["https://github.com/SolaceHarmony/emberharmony/releases/latest/download/latest.json"]
     }
   }
 }

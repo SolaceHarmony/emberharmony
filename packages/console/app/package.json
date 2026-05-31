@@ -6,7 +6,6 @@
   "scripts": {
     "typecheck": "tsgo --noEmit",
     "dev": "vite dev --host 0.0.0.0",
-    "dev:remote": "VITE_AUTH_URL=https://auth.dev.solace.ofharmony.ai VITE_STRIPE_PUBLISHABLE_KEY=pk_test_... bun sst shell --stage=dev bun dev",
     "build": "./script/generate-sitemap.ts && vite build && ../../emberharmony/script/schema.ts ./.output/public/config.json",
     "start": "vite start"
   },
