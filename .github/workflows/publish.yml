@@ -12,9 +12,7 @@ on:
 concurrency: ${{ github.workflow }}-${{ github.ref }}
 
 permissions:
-  id-token: write
   contents: write
-  packages: write
   actions: read
 
 jobs:
@@ -26,9 +24,9 @@ jobs:
       publish-name: "@thesolaceproject/emberharmony"
     secrets: inherit
 
-  # npm publish runs for STABLE releases only. A pre-release (the portal's
-  # "Set as a pre-release" checkbox) still builds and attaches desktop assets to the
-  # GitHub release via the build job above, but never touches npm.
+  # npm publish runs for STABLE releases only. A pre-release still builds and
+  # uploads CLI assets to the GitHub release via the build job above, but never
+  # touches npm.
   publish:
     if: ${{ github.repository == 'SolaceHarmony/emberharmony' && !github.event.release.prerelease }}
     needs:

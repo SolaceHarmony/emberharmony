@@ -27,7 +27,7 @@ jobs:
         # javascript-typescript covers the whole TS/JS codebase (CLI, web, console, ui, etc).
         # actions scans .github/workflows/** for secret-handling and injection bugs —
         # relevant given this repo's prior fork-PR-secret incident (see commit 5569e76).
-        # rust covers the Tauri desktop surface (packages/desktop/src-tauri).
+        # rust covers the desktop source surface (packages/desktop/src-tauri).
         # build-mode none = buildless extraction; no cargo build or system libs required.
         include:
           - language: javascript-typescript

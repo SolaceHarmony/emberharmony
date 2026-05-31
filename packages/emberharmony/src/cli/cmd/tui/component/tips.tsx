@@ -142,7 +142,6 @@ const TIPS = [
   "Press {highlight}Ctrl+X S{/highlight} or {highlight}/status{/highlight} to see system status info",
   "Enable {highlight}tui.scroll_acceleration{/highlight} for smooth macOS-style scrolling",
   "Toggle username display in chat via command palette ({highlight}Ctrl+P{/highlight})",
-  "Run {highlight}docker run -it --rm ghcr.io/sydneyrenee/emberharmony{/highlight} for containerized use",
   "Use {highlight}/connect{/highlight} with EmberHarmony Zen for curated, tested models",
   "Commit your project's {highlight}AGENTS.md{/highlight} file to Git for team sharing",
   "Use {highlight}/review{/highlight} to review uncommitted changes, branches, or PRs",

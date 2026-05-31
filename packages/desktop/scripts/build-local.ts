@@ -11,8 +11,6 @@
  * Flags:
  *   --no-dmg    Skip DMG creation (macOS only)
  *   --no-bundle Skip all bundling, just build the binary
- *   --release   Signed release build (requires Apple signing env vars)
- *
  * Environment:
  *   EMBERHARMONY_SKIP_CLI=1   Reuse an existing CLI binary in ../emberharmony/dist
  *
@@ -31,8 +29,7 @@ const desktopDir = path.resolve(__dirname, "..")
 const emberharmonyDir = path.resolve(desktopDir, "../emberharmony")
 const repoRoot = path.resolve(desktopDir, "../..")
 
-// Load .env from repo root so Apple signing/notarization credentials are available
-// to `cargo tauri build`. Bun only auto-loads .env from cwd.
+// Load .env from repo root. Bun only auto-loads .env from cwd.
 const rootEnv = path.join(repoRoot, ".env")
 if (existsSync(rootEnv)) {
   const envText = await Bun.file(rootEnv).text()
@@ -59,7 +56,6 @@ process.chdir(desktopDir)
 
 const noDmg = process.argv.includes("--no-dmg")
 const noBundle = process.argv.includes("--no-bundle")
-const isRelease = process.argv.includes("--release")
 const skipCli = process.env.EMBERHARMONY_SKIP_CLI === "1"
 
 // Resolve the Rust target triple for the current host.
@@ -109,8 +105,6 @@ if (noBundle) {
 // fails. We create the DMG manually afterwards if the host is macOS.
 const tauriArgs = ["build"]
 // Note: `cargo tauri build` is release mode by default; `--debug` is the only toggle.
-// Apple signing env vars (if set) are picked up automatically by Tauri.
-void isRelease
 
 // Build only the .app on macOS (skip dmg in Tauri's own bundler)
 if (process.platform === "darwin") {
@@ -153,13 +147,6 @@ if (process.platform === "darwin" && !noDmg) {
 
   await $`hdiutil create -volname "EmberHarmony Dev" -srcfolder ${stagingDir} -ov -format UDZO ${dmgPath}`
   await $`rm -rf ${stagingDir}`
-
-  // Sign the DMG itself so Gatekeeper trusts the container too.
-  const signingIdentity = process.env.APPLE_SIGNING_IDENTITY
-  if (signingIdentity) {
-    console.log(`[build-local] signing DMG with: ${signingIdentity}`)
-    await $`codesign --force --sign ${signingIdentity} ${dmgPath}`
-  }
 
   console.log(`[build-local] DMG created: ${dmgPath}`)
 }
