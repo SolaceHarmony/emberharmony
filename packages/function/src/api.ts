@@ -160,7 +160,7 @@ export default new Hono<{ Bindings: Env }>()
     const body = await c.req.json<{ sessionShortName: string; adminSecret: string }>()
     const sessionShortName = body.sessionShortName
     const adminSecret = body.adminSecret
-    if (adminSecret !== c.env.ADMIN_SECRET) throw new Error("Invalid admin secret")
+    if (!c.env.ADMIN_SECRET || adminSecret !== c.env.ADMIN_SECRET) throw new Error("Invalid admin secret")
     const id = c.env.SYNC_SERVER.idFromName(sessionShortName)
     const stub = c.env.SYNC_SERVER.get(id)
     await stub.clear()

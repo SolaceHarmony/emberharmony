@@ -1,10 +1,10 @@
 import { defineConfig } from "drizzle-kit"
 
-const env = (...names: string[]) => names.map((name) => process.env[name]).find((value) => value)
+const env = (...names: string[]) => names.map((name) => process.env[name]).find((value) => value !== undefined)
 
 const required = (...names: string[]) => {
   const value = env(...names)
-  if (value) return value
+  if (value !== undefined) return value
   throw new Error(`${names.join(" or ")} is required`)
 }
 
@@ -19,7 +19,7 @@ export default defineConfig({
     host: required("DATABASE_HOST"),
     user: required("DATABASE_USERNAME", "DATABASE_USER"),
     password: required("DATABASE_PASSWORD"),
-    port: Number(env("DATABASE_PORT") ?? "3306"),
+    port: Number(env("DATABASE_PORT") || "3306"),
     ssl: {
       rejectUnauthorized: false,
     },

@@ -2,11 +2,11 @@ export const waitUntil = async (promise: Promise<unknown>) => {
   await promise
 }
 
-const env = (...names: string[]) => names.map((name) => process.env[name]).find((value) => value)
+const env = (...names: string[]) => names.map((name) => process.env[name]).find((value) => value !== undefined)
 
 const required = (...names: string[]) => {
   const value = env(...names)
-  if (value) return value
+  if (value !== undefined) return value
   throw new Error(`${names.join(" or ")} is required`)
 }
 
@@ -36,7 +36,7 @@ export const Resource = {
       return required("DATABASE_PASSWORD")
     },
     get port() {
-      return Number(env("DATABASE_PORT") ?? "3306")
+      return Number(env("DATABASE_PORT") || "3306")
     },
   },
   AWS_SES_ACCESS_KEY_ID: secret("AWS_SES_ACCESS_KEY_ID"),
