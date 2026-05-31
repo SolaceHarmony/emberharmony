@@ -22,7 +22,6 @@ export namespace FileIgnore {
     ".turbo",
     ".output",
     "desktop",
-    ".sst",
     ".cache",
     ".webkit-cache",
     "__pycache__",

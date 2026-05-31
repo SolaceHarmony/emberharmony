@@ -146,7 +146,7 @@ emberharmony
 
 ### شكر وتقدير
 
-EmberHarmony هو نسخة معدّلة (fork) من [opencode](https://github.com/anomalyco/opencode) بواسطة فريق [SST](https://sst.dev). نحن ممتنون للغاية لعملهم التأسيسي في بناء وكيل برمجة بالذكاء الاصطناعي مفتوح المصدر استثنائي. يبني هذا المشروع على رؤيتهم وهندستهم.
+EmberHarmony هو نسخة معدّلة (fork) من [opencode](https://github.com/anomalyco/opencode) بواسطة فريق opencode upstream. نحن ممتنون للغاية لعملهم التأسيسي في بناء وكيل برمجة بالذكاء الاصطناعي مفتوح المصدر استثنائي. يبني هذا المشروع على رؤيتهم وهندستهم.
 
 ### المشرف
 

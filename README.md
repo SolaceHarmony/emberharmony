@@ -146,7 +146,7 @@ If you are working on a project related to EmberHarmony that uses "emberharmony"
 
 ### Acknowledgments
 
-EmberHarmony is a fork of [opencode](https://github.com/anomalyco/opencode) by the [SST](https://sst.dev) team. We are deeply grateful for their foundational work in building an exceptional open source AI coding agent. This project builds on their vision and engineering.
+EmberHarmony is a fork of [opencode](https://github.com/anomalyco/opencode) by the opencode upstream team. We are deeply grateful for their foundational work in building an exceptional open source AI coding agent. This project builds on their vision and engineering.
 
 ### Maintainer
 

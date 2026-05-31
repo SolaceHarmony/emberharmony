@@ -4,21 +4,27 @@ import { randomUUID } from "node:crypto"
 import { jwtVerify, createRemoteJWKSet } from "jose"
 import { createAppAuth } from "@octokit/auth-app"
 import { Octokit } from "@octokit/rest"
-import { Resource } from "sst"
 
 type Env = {
   SYNC_SERVER: DurableObjectNamespace<SyncServer>
   Bucket: R2Bucket
   WEB_DOMAIN: string
+  ADMIN_SECRET: string
+  DISCORD_SUPPORT_BOT_TOKEN: string
+  DISCORD_SUPPORT_CHANNEL_ID: string
+  FEISHU_APP_ID: string
+  FEISHU_APP_SECRET: string
+  GITHUB_APP_ID: string
+  GITHUB_APP_PRIVATE_KEY: string
 }
 
-async function getFeishuTenantToken(): Promise<string> {
+async function getFeishuTenantToken(env: Env): Promise<string> {
   const response = await fetch("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      app_id: Resource.FEISHU_APP_ID.value,
-      app_secret: Resource.FEISHU_APP_SECRET.value,
+      app_id: env.FEISHU_APP_ID,
+      app_secret: env.FEISHU_APP_SECRET,
     }),
   })
   const data = (await response.json()) as { tenant_access_token?: string }
@@ -154,7 +160,7 @@ export default new Hono<{ Bindings: Env }>()
     const body = await c.req.json<{ sessionShortName: string; adminSecret: string }>()
     const sessionShortName = body.sessionShortName
     const adminSecret = body.adminSecret
-    if (adminSecret !== Resource.ADMIN_SECRET.value) throw new Error("Invalid admin secret")
+    if (adminSecret !== c.env.ADMIN_SECRET) throw new Error("Invalid admin secret")
     const id = c.env.SYNC_SERVER.idFromName(sessionShortName)
     const stub = c.env.SYNC_SERVER.get(id)
     await stub.clear()
@@ -247,19 +253,16 @@ export default new Hono<{ Bindings: Env }>()
     const threadId = body.event?.message?.root_id || body.event?.message?.message_id
     if (threadId) message = `${message} [${threadId}]`
 
-    const response = await fetch(
-      `https://discord.com/api/v10/channels/${Resource.DISCORD_SUPPORT_CHANNEL_ID.value}/messages`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bot ${Resource.DISCORD_SUPPORT_BOT_TOKEN.value}`,
-        },
-        body: JSON.stringify({
-          content: `${message}`,
-        }),
+    const response = await fetch(`https://discord.com/api/v10/channels/${c.env.DISCORD_SUPPORT_CHANNEL_ID}/messages`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bot ${c.env.DISCORD_SUPPORT_BOT_TOKEN}`,
       },
-    )
+      body: JSON.stringify({
+        content: `${message}`,
+      }),
+    })
 
     if (!response.ok) {
       console.error(await response.text())
@@ -299,8 +302,8 @@ export default new Hono<{ Bindings: Env }>()
 
     // Create app JWT token
     const auth = createAppAuth({
-      appId: Resource.GITHUB_APP_ID.value,
-      privateKey: Resource.GITHUB_APP_PRIVATE_KEY.value,
+      appId: c.env.GITHUB_APP_ID,
+      privateKey: c.env.GITHUB_APP_PRIVATE_KEY,
     })
     const appAuth = await auth({ type: "app" })
 
@@ -341,8 +344,8 @@ export default new Hono<{ Bindings: Env }>()
 
       // Get installation token
       const auth = createAppAuth({
-        appId: Resource.GITHUB_APP_ID.value,
-        privateKey: Resource.GITHUB_APP_PRIVATE_KEY.value,
+        appId: c.env.GITHUB_APP_ID,
+        privateKey: c.env.GITHUB_APP_PRIVATE_KEY,
       })
       const appAuth = await auth({ type: "app" })
 
@@ -377,8 +380,8 @@ export default new Hono<{ Bindings: Env }>()
     const repo = c.req.query("repo")
 
     const auth = createAppAuth({
-      appId: Resource.GITHUB_APP_ID.value,
-      privateKey: Resource.GITHUB_APP_PRIVATE_KEY.value,
+      appId: c.env.GITHUB_APP_ID,
+      privateKey: c.env.GITHUB_APP_PRIVATE_KEY,
     })
     const appAuth = await auth({ type: "app" })
 

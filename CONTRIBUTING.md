@@ -69,7 +69,7 @@ Replace `<platform>` with your platform (e.g., `darwin-arm64`, `linux-x64`).
 
 - Core pieces:
   - `packages/emberharmony`: EmberHarmony core business logic & server.
-  - `packages/emberharmony/src/cli/cmd/tui/`: The TUI code, written in SolidJS with [opentui](https://github.com/sst/opentui)
+  - `packages/emberharmony/src/cli/cmd/tui/`: The TUI code, written in SolidJS with opentui
   - `packages/app`: The shared web UI components, written in SolidJS
   - `packages/desktop`: The native desktop app, built with Tauri (wraps `packages/app`)
   - `packages/plugin`: Source for `@thesolaceproject/emberharmony-plugin`

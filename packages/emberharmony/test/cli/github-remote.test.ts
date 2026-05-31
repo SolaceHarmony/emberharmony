@@ -2,27 +2,45 @@ import { test, expect } from "bun:test"
 import { parseGitHubRemote } from "../../src/cli/cmd/github"
 
 test("parses https URL with .git suffix", () => {
-  expect(parseGitHubRemote("https://github.com/sst/emberharmony.git")).toEqual({ owner: "sst", repo: "emberharmony" })
+  expect(parseGitHubRemote("https://github.com/SolaceHarmony/emberharmony.git")).toEqual({
+    owner: "SolaceHarmony",
+    repo: "emberharmony",
+  })
 })
 
 test("parses https URL without .git suffix", () => {
-  expect(parseGitHubRemote("https://github.com/sst/emberharmony")).toEqual({ owner: "sst", repo: "emberharmony" })
+  expect(parseGitHubRemote("https://github.com/SolaceHarmony/emberharmony")).toEqual({
+    owner: "SolaceHarmony",
+    repo: "emberharmony",
+  })
 })
 
 test("parses git@ URL with .git suffix", () => {
-  expect(parseGitHubRemote("git@github.com:sst/emberharmony.git")).toEqual({ owner: "sst", repo: "emberharmony" })
+  expect(parseGitHubRemote("git@github.com:SolaceHarmony/emberharmony.git")).toEqual({
+    owner: "SolaceHarmony",
+    repo: "emberharmony",
+  })
 })
 
 test("parses git@ URL without .git suffix", () => {
-  expect(parseGitHubRemote("git@github.com:sst/emberharmony")).toEqual({ owner: "sst", repo: "emberharmony" })
+  expect(parseGitHubRemote("git@github.com:SolaceHarmony/emberharmony")).toEqual({
+    owner: "SolaceHarmony",
+    repo: "emberharmony",
+  })
 })
 
 test("parses ssh:// URL with .git suffix", () => {
-  expect(parseGitHubRemote("ssh://git@github.com/sst/emberharmony.git")).toEqual({ owner: "sst", repo: "emberharmony" })
+  expect(parseGitHubRemote("ssh://git@github.com/SolaceHarmony/emberharmony.git")).toEqual({
+    owner: "SolaceHarmony",
+    repo: "emberharmony",
+  })
 })
 
 test("parses ssh:// URL without .git suffix", () => {
-  expect(parseGitHubRemote("ssh://git@github.com/sst/emberharmony")).toEqual({ owner: "sst", repo: "emberharmony" })
+  expect(parseGitHubRemote("ssh://git@github.com/SolaceHarmony/emberharmony")).toEqual({
+    owner: "SolaceHarmony",
+    repo: "emberharmony",
+  })
 })
 
 test("parses http URL", () => {

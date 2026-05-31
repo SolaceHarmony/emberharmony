@@ -1,5 +1,12 @@
-import { Resource } from "sst"
 import { defineConfig } from "drizzle-kit"
+
+const env = (...names: string[]) => names.map((name) => process.env[name]).find((value) => value)
+
+const required = (...names: string[]) => {
+  const value = env(...names)
+  if (value) return value
+  throw new Error(`${names.join(" or ")} is required`)
+}
 
 export default defineConfig({
   out: "./migrations/",
@@ -8,11 +15,11 @@ export default defineConfig({
   verbose: true,
   dialect: "mysql",
   dbCredentials: {
-    database: Resource.Database.database,
-    host: Resource.Database.host,
-    user: Resource.Database.username,
-    password: Resource.Database.password,
-    port: Resource.Database.port,
+    database: required("DATABASE_NAME", "DATABASE_DATABASE"),
+    host: required("DATABASE_HOST"),
+    user: required("DATABASE_USERNAME", "DATABASE_USER"),
+    password: required("DATABASE_PASSWORD"),
+    port: Number(env("DATABASE_PORT") ?? "3306"),
     ssl: {
       rejectUnauthorized: false,
     },

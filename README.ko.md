@@ -146,7 +146,7 @@ EmberHarmony에 기여하는 데 관심이 있다면, 풀 리퀘스트를 제출
 
 ### 감사의 말
 
-EmberHarmony는 [SST](https://sst.dev) 팀의 [opencode](https://github.com/anomalyco/opencode)에서 포크한 프로젝트입니다. 뛰어난 오픈 소스 AI 코딩 에이전트를 구축한 그들의 기초 작업에 깊이 감사드립니다. 이 프로젝트는 그들의 비전과 엔지니어링 위에 세워졌습니다.
+EmberHarmony는 opencode upstream 팀의 [opencode](https://github.com/anomalyco/opencode)에서 포크한 프로젝트입니다. 뛰어난 오픈 소스 AI 코딩 에이전트를 구축한 그들의 기초 작업에 깊이 감사드립니다. 이 프로젝트는 그들의 비전과 엔지니어링 위에 세워졌습니다.
 
 ### 메인테이너
 

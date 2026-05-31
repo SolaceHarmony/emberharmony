@@ -9,8 +9,7 @@
     "dev": "vite dev",
     "build": "vite build",
     "build:cloudflare": "EMBERHARMONY_DEPLOYMENT_TARGET=cloudflare vite build",
-    "start": "vite start",
-    "shell-prod": "sst shell --target Teams --stage production"
+    "start": "vite start"
   },
   "dependencies": {
     "@thesolaceproject/emberharmony-util": "workspace:*",

@@ -146,7 +146,7 @@ Wenn du an einem Projekt im Zusammenhang mit EmberHarmony arbeitest, das „embe
 
 ### Danksagungen
 
-EmberHarmony ist ein Fork von [opencode](https://github.com/anomalyco/opencode) des [SST](https://sst.dev)-Teams. Wir sind zutiefst dankbar für ihre grundlegende Arbeit beim Aufbau eines herausragenden quelloffenen KI-Coding-Agenten. Dieses Projekt baut auf ihrer Vision und ihrer Ingenieursarbeit auf.
+EmberHarmony ist ein Fork von [opencode](https://github.com/anomalyco/opencode) des opencode upstream-Teams. Wir sind zutiefst dankbar für ihre grundlegende Arbeit beim Aufbau eines herausragenden quelloffenen KI-Coding-Agenten. Dieses Projekt baut auf ihrer Vision und ihrer Ingenieursarbeit auf.
 
 ### Maintainer
 
