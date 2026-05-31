@@ -12,9 +12,6 @@
     "typescript": "catalog:"
   },
   "dependencies": {
-    "@octokit/auth-app": "8.0.1",
-    "@octokit/rest": "catalog:",
-    "hono": "catalog:",
-    "jose": "6.0.11"
+    "hono": "catalog:"
   }
 }
