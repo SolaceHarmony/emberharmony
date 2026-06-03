@@ -23,7 +23,7 @@ Run the following command in a project that is in a GitHub repo:
 emberharmony github install
 ```
 
-This will walk you through installing the GitHub app, creating the workflow, and setting up secrets.
+This will walk you through creating the workflow and setting up secrets.
 
 ---
 
@@ -31,15 +31,11 @@ This will walk you through installing the GitHub app, creating the workflow, and
 
 Or you can set it up manually.
 
-1. **Install the GitHub app**
-
-   Head over to [**github.com/apps/emberharmony-agent**](https://github.com/apps/emberharmony-agent). Make sure it's installed on the target repository.
-
-2. **Add the workflow**
+1. **Add the workflow**
 
    Add the following workflow file to `.github/workflows/emberharmony.yml` in your repo. Make sure to set the appropriate `model` and required API keys in `env`.
 
-   ```yml title=".github/workflows/emberharmony.yml" {24,26}
+   ```yml title=".github/workflows/emberharmony.yml" {24,27}
    name: emberharmony
 
    on:
@@ -55,25 +51,27 @@ Or you can set it up manually.
          contains(github.event.comment.body, '/emberharmony')
        runs-on: ubuntu-latest
        permissions:
-         id-token: write
+         contents: write
+         pull-requests: write
+         issues: write
        steps:
-          - name: Checkout repository
-            uses: actions/checkout@v6
-            with:
-              fetch-depth: 1
-              persist-credentials: false
+         - name: Checkout repository
+           uses: actions/checkout@v6
+           with:
+             fetch-depth: 1
+             persist-credentials: false
 
-          - name: Run EmberHarmony
+         - name: Run EmberHarmony
            uses: sydneyrenee/emberharmony/github@latest
            env:
+             GITHUB_TOKEN: ${{ github.token }}
              ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
            with:
              model: anthropic/claude-sonnet-4-20250514
              # share: true
-             # github_token: xxxx
    ```
 
-3. **Store the API keys in secrets**
+2. **Store the API keys in secrets**
 
    In your organization or project **settings**, expand **Secrets and variables** on the left and select **Actions**. And add the required API keys.
 
@@ -85,19 +83,15 @@ Or you can set it up manually.
 - `agent`: The agent to use. Must be a primary agent. Falls back to `default_agent` from config or `"build"` if not found.
 - `share`: Whether to share the EmberHarmony session. Defaults to **true** for public repositories.
 - `prompt`: Optional custom prompt to override the default behavior. Use this to customize how EmberHarmony processes requests.
-- `token`: Optional GitHub access token for performing operations such as creating comments, committing changes, and opening pull requests. By default, EmberHarmony uses the installation access token from the EmberHarmony GitHub App, so commits, comments, and pull requests appear as coming from the app.
 
-  Alternatively, you can use the GitHub Action runner's [built-in `GITHUB_TOKEN`](https://docs.github.com/en/actions/tutorials/authenticate-with-github_token) without installing the EmberHarmony GitHub App. Just make sure to grant the required permissions in your workflow:
+EmberHarmony uses the GitHub Actions runner's built-in `GITHUB_TOKEN`. Do not configure external GitHub credentials for the action. Make sure to grant the required permissions in your workflow:
 
-  ```yaml
-  permissions:
-    id-token: write
-    contents: write
-    pull-requests: write
-    issues: write
-  ```
-
-  You can also use a [personal access tokens](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens)(PAT) if preferred.
+```yaml
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+```
 
 ---
 
@@ -105,8 +99,8 @@ Or you can set it up manually.
 
 EmberHarmony can be triggered by the following GitHub events:
 
-| Event Type                    | Triggered By                           | Details                                                                                                                  |
-| ----------------------------- | -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| Event Type                    | Triggered By                           | Details                                                                                                                   |
+| ----------------------------- | -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
 | `issue_comment`               | Comment on an issue or PR              | Mention `/emberharmony` or `/oc` in your comment. EmberHarmony reads context and can create branches, open PRs, or reply. |
 | `pull_request_review_comment` | Comment on specific code lines in a PR | Mention `/emberharmony` or `/oc` while reviewing code. EmberHarmony receives file path, line numbers, and diff context.   |
 | `issues`                      | Issue opened or edited                 | Automatically trigger EmberHarmony when issues are created or modified. Requires `prompt` input.                          |
@@ -129,7 +123,6 @@ jobs:
   emberharmony:
     runs-on: ubuntu-latest
     permissions:
-      id-token: write
       contents: write
       pull-requests: write
       issues: write
@@ -142,6 +135,7 @@ jobs:
       - name: Run EmberHarmony
         uses: sydneyrenee/emberharmony/github@latest
         env:
+          GITHUB_TOKEN: ${{ github.token }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         with:
           model: anthropic/claude-sonnet-4-20250514
@@ -169,21 +163,19 @@ jobs:
   review:
     runs-on: ubuntu-latest
     permissions:
-      id-token: write
-      contents: read
-      pull-requests: read
-      issues: read
+      contents: write
+      pull-requests: write
+      issues: write
     steps:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
       - uses: sydneyrenee/emberharmony/github@latest
         env:
+          GITHUB_TOKEN: ${{ github.token }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           model: anthropic/claude-sonnet-4-20250514
-          use_github_token: true
           prompt: |
             Review this pull request:
             - Check for code quality issues
@@ -210,7 +202,6 @@ jobs:
   triage:
     runs-on: ubuntu-latest
     permissions:
-      id-token: write
       contents: write
       pull-requests: write
       issues: write
@@ -236,6 +227,7 @@ jobs:
       - uses: sydneyrenee/emberharmony/github@latest
         if: steps.check.outputs.result == 'true'
         env:
+          GITHUB_TOKEN: ${{ github.token }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         with:
           model: anthropic/claude-sonnet-4-20250514

@@ -75,7 +75,7 @@ export default {
         //              Destination: {
         //                ToAddresses: [email],
         //              },
-        //              FromEmailAddress: `SST <auth@${Resource.Email.sender}>`,
+        //              FromEmailAddress: `EmberHarmony <auth@${Resource.Email.sender}>`,
         //              Content: {
         //                Simple: {
         //                  Body: {
@@ -87,7 +87,7 @@ export default {
         //                    },
         //                  },
         //                  Subject: {
-        //                    Data: "SST Console Pin Code: " + code,
+        //                    Data: "EmberHarmony Console Pin Code: " + code,
         //                  },
         //                },
         //              },

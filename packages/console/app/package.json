@@ -1,12 +1,11 @@
 {
   "name": "@thesolaceproject/emberharmony-console-app",
-  "version": "1.2.2",
+  "version": "1.3.0",
   "type": "module",
   "license": "MIT",
   "scripts": {
     "typecheck": "tsgo --noEmit",
     "dev": "vite dev --host 0.0.0.0",
-    "dev:remote": "VITE_AUTH_URL=https://auth.dev.solace.ofharmony.ai VITE_STRIPE_PUBLISHABLE_KEY=pk_test_... bun sst shell --stage=dev bun dev",
     "build": "./script/generate-sitemap.ts && vite build && ../../emberharmony/script/schema.ts ./.output/public/config.json",
     "start": "vite start"
   },
@@ -27,7 +26,7 @@
     "@solidjs/start": "catalog:",
     "@stripe/stripe-js": "8.6.1",
     "chart.js": "4.5.1",
-    "nitro": "3.0.260429-beta",
+    "nitro": "3.0.260522-beta",
     "solid-js": "catalog:",
     "solid-list": "0.3.0",
     "solid-stripe": "0.8.1",

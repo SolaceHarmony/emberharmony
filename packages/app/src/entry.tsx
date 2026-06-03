@@ -4,7 +4,7 @@ import { AppBaseProviders, AppInterface } from "@/app"
 import { Platform, PlatformProvider } from "@/context/platform"
 import { dict as en } from "@/i18n/en"
 import { dict as zh } from "@/i18n/zh"
-import pkg from "../package.json"
+import meta from "../../../version.json"
 
 const DEFAULT_SERVER_URL_KEY = "emberharmony.settings.dat:defaultServerUrl"
 
@@ -27,7 +27,7 @@ if (import.meta.env.DEV && !(root instanceof HTMLElement)) {
 
 const platform: Platform = {
   platform: "web",
-  version: pkg.version,
+  version: meta.version,
   openLink(url: string) {
     window.open(url, "_blank")
   },

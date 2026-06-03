@@ -1,9 +1,9 @@
 name: CI
 run-name: CI ${{ github.ref_name }} @ ${{ github.sha }}
 
-# Verification builds. Runs the full 5-target CLI + Tauri matrix on every push
-# to an integration branch (i.e. after a PR merges). Does NOT run on pull_request
-# — that keeps the expensive matrix off PR review and away from fork secrets.
+# Verification builds. Runs the CLI build on every push to an integration branch
+# (i.e. after a PR merges). Does NOT run on pull_request — that keeps the
+# expensive release build off PR review.
 
 on:
   push:
@@ -20,21 +20,9 @@ permissions:
   actions: read
 
 jobs:
-  version:
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    outputs:
-      version: ${{ steps.compute.outputs.version }}
-    steps:
-      - name: Compute CI version
-        id: compute
-        run: echo "version=0.0.0-ci.${{ github.run_number }}" >> "$GITHUB_OUTPUT"
-
+  # No version job: artifacts carry the version from packages/emberharmony/package.json
+  # at build time. release and tag are omitted, so _build.yml produces workflow
+  # artifacts only — no GitHub release attachment, and nothing commits, tags, or pushes.
   build:
-    needs: version
     uses: ./.github/workflows/_build.yml
-    with:
-      version: ${{ needs.version.outputs.version }}
-      # release and tag intentionally left empty — _build.yml will produce
-      # workflow artifacts only, no GitHub release attachment.
     secrets: inherit

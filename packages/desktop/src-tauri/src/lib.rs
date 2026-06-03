@@ -250,8 +250,6 @@ async fn check_server_health(url: &str, password: Option<&str>) -> bool {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let updater_enabled = option_env!("TAURI_SIGNING_PRIVATE_KEY").is_some_and(|key| !key.is_empty());
-
     #[cfg(all(target_os = "macos", not(debug_assertions)))]
     let _ = std::process::Command::new("killall")
         .arg("emberharmony-cli")
@@ -324,7 +322,7 @@ pub fn run() {
                 .initialization_script(format!(
                     r#"
                       window.__EMBERHARMONY__ ??= {{}};
-                      window.__EMBERHARMONY__.updaterEnabled = {updater_enabled};
+                      window.__EMBERHARMONY__.updaterEnabled = false;
                     "#
                 ));
 
@@ -409,10 +407,6 @@ pub fn run() {
 
             Ok(())
         });
-
-    if updater_enabled {
-        builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
-    }
 
     builder
         .build(tauri::generate_context!())

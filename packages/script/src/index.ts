@@ -22,6 +22,10 @@ const env = {
 
 const CHANNEL = await (async () => {
   if (env.EMBERHARMONY_CHANNEL) return env.EMBERHARMONY_CHANNEL
+  // A release build (EMBERHARMONY_RELEASE set) is always the stable channel. Releases
+  // run on a detached tag checkout where `git branch` can't see dev/main, so we key off
+  // the release context instead of the branch. Local/CI branch builds keep preview logic.
+  if (env.EMBERHARMONY_RELEASE) return "latest"
   const branch = await $`git branch --show-current`
     .text()
     .then((x) => x.trim())
@@ -30,10 +34,10 @@ const CHANNEL = await (async () => {
 })()
 const IS_PREVIEW = CHANNEL !== "latest"
 
-// Source of truth: the published CLI package's package.json. Version travels with the code;
-// to release a new version, edit that file and commit.
+// Source of truth: the root version.json. Version travels with the code;
+// to release a new version, edit version.json and run `bun run version:sync`.
 const STATIC_VERSION = await (async () => {
-  const pkgPath = path.resolve(import.meta.dir, "../../emberharmony/package.json")
+  const pkgPath = path.resolve(import.meta.dir, "../../../version.json")
   const data = (await Bun.file(pkgPath).json()) as { version?: unknown }
   if (typeof data.version !== "string" || data.version.length === 0) {
     throw new Error(`version field missing or invalid in ${pkgPath}`)

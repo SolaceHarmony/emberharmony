@@ -11,6 +11,7 @@
     "allowJs": true,
     "resolveJsonModule": true,
     "strict": true,
+    "types": ["bun", "node", "vite/client"],
     "isolatedModules": true,
     "noEmit": true,
     "emitDeclarationOnly": false,

@@ -1,10 +1,10 @@
-const stage = process.env.SST_STAGE || "dev"
+const stage = process.env.APP_STAGE || process.env.STAGE || "dev"
 
 export default {
   url: stage === "production" ? "https://solace.ofharmony.ai" : `https://${stage}.solace.ofharmony.ai`,
   console: stage === "production" ? "https://solace.ofharmony.ai/auth" : `https://${stage}.solace.ofharmony.ai/auth`,
   email: "sydney@solace.ofharmony.ai",
-  socialCard: "https://social-cards.sst.dev",
+  socialCard: "https://solace.ofharmony.ai/social-cards",
   github: "https://github.com/sydneyrenee/emberharmony",
   discord: "https://discord.gg/EdF8f7JR",
   headerLinks: [

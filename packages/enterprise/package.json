@@ -1,6 +1,6 @@
 {
   "name": "@thesolaceproject/emberharmony-enterprise",
-  "version": "1.2.2",
+  "version": "1.3.0",
   "private": true,
   "type": "module",
   "license": "MIT",
@@ -9,8 +9,7 @@
     "dev": "vite dev",
     "build": "vite build",
     "build:cloudflare": "EMBERHARMONY_DEPLOYMENT_TARGET=cloudflare vite build",
-    "start": "vite start",
-    "shell-prod": "sst shell --target Teams --stage production"
+    "start": "vite start"
   },
   "dependencies": {
     "@thesolaceproject/emberharmony-util": "workspace:*",
@@ -24,7 +23,7 @@
     "hono-openapi": "catalog:",
     "js-base64": "3.7.7",
     "luxon": "catalog:",
-    "nitro": "3.0.1-alpha.1",
+    "nitro": "3.0.260522-beta",
     "solid-js": "catalog:",
     "zod": "catalog:"
   },

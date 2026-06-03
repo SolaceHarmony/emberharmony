@@ -1,85 +1,35 @@
 name: Publish
-run-name: ${{ (github.event_name == 'release' && github.event.release.tag_name) || github.sha }}
+run-name: ${{ github.event.release.tag_name }}
 
+# Publishing is driven solely by a published GitHub release. Cut a release with a
+# tag like v1.3.0; the release id and tag flow straight from the github.event
+# context into the build — no CI step parses or validates the version (the tag is
+# trusted), and nothing here commits, tags, or pushes.
 on:
-  workflow_dispatch:
   release:
     types: [published]
 
 concurrency: ${{ github.workflow }}-${{ github.ref }}
 
 permissions:
-  id-token: write
   contents: write
-  packages: write
   actions: read
 
 jobs:
-  version:
-    runs-on: ubuntu-latest
-    if: github.ref_name == 'main' || github.event_name == 'release'
-    outputs:
-      version: ${{ steps.version.outputs.version || steps.version-release.outputs.version }}
-      release: ${{ steps.version.outputs.release || steps.version-release.outputs.release }}
-      tag: ${{ steps.version.outputs.tag || steps.version-release.outputs.tag }}
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      - name: Extract version from release
-        if: github.event_name == 'release'
-        id: release-version
-        run: |
-          set -euo pipefail
-          TAG_VERSION=${GITHUB_REF#refs/tags/v}
-          PKG_VERSION=$(jq -r .version packages/emberharmony/package.json)
-          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
-            echo "Release tag v$TAG_VERSION does not match packages/emberharmony/package.json version $PKG_VERSION." >&2
-            echo "Versions travel with the code: bump package.json in a commit, then tag the release at that version." >&2
-            exit 1
-          fi
-          echo "version=$TAG_VERSION" >> "$GITHUB_OUTPUT"
-          echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
-
-      - uses: ./.github/actions/setup-bun
-        if: github.event_name != 'release'
-
-      - id: version
-        if: github.event_name != 'release'
-        run: |
-          ./script/version.ts
-        env:
-          GH_TOKEN: ${{ github.token }}
-          EMBERHARMONY_PUBLISH_NAME: "@thesolaceproject/emberharmony"
-          EMBERHARMONY_CHANNEL: latest
-          EMBERHARMONY_API_KEY: ${{ secrets.EMBERHARMONY_API_KEY }}
-
-      - name: Set outputs for release trigger
-        id: version-release
-        if: github.event_name == 'release'
-        run: |
-          {
-            echo "version=${{ steps.release-version.outputs.version }}"
-            echo "tag=${{ steps.release-version.outputs.tag }}"
-            echo "release=${{ github.event.release.id }}"
-          } >> "$GITHUB_OUTPUT"
-
   build:
-    needs: version
-    if: github.ref_name == 'main' || github.event_name == 'release'
     uses: ./.github/workflows/_build.yml
     with:
-      version: ${{ needs.version.outputs.version }}
-      release: ${{ needs.version.outputs.release }}
-      tag: ${{ needs.version.outputs.tag }}
+      release: ${{ github.event.release.id }}
+      tag: ${{ github.event.release.tag_name }}
       publish-name: "@thesolaceproject/emberharmony"
     secrets: inherit
 
+  # npm publish runs for STABLE releases only. A pre-release still builds and
+  # uploads CLI assets to the GitHub release via the build job above, but never
+  # touches npm.
   publish:
-    if: github.repository == 'SolaceHarmony/emberharmony'
+    if: ${{ github.repository == 'SolaceHarmony/emberharmony' && !github.event.release.prerelease }}
     needs:
-      - version
       - build
     runs-on: ubuntu-latest
     steps:
@@ -91,10 +41,6 @@ jobs:
         with:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
-
-      - name: Setup git committer
-        id: committer
-        uses: ./.github/actions/setup-git-committer
 
       - uses: actions/download-artifact@v8
         with:
@@ -119,11 +65,10 @@ jobs:
 
       - run: ./script/publish.ts
         env:
-          EMBERHARMONY_RELEASE: ${{ needs.version.outputs.release }}
+          EMBERHARMONY_RELEASE: ${{ github.event.release.id }}
           EMBERHARMONY_PUBLISH_NAME: "@thesolaceproject/emberharmony"
           EMBERHARMONY_PUBLISH_PLATFORMS: "1"
-          EMBERHARMONY_SKIP_GIT: "1"
-          GITHUB_TOKEN: ${{ steps.committer.outputs.token }}
+          GITHUB_TOKEN: ${{ github.token }}
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           NPM_CONFIG_PROVENANCE: false
