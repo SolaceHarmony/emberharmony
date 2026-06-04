@@ -33,10 +33,12 @@ for await (const rel of new Glob("**/package.json").scan({ cwd: ROOT })) {
   }
   const file = path.join(ROOT, rel)
   const text = await Bun.file(file).text()
-  // Only touch a package's own top-level "version" field; dependency specifiers
-  // use a different shape ("name": "1.2.3") and are never matched here.
-  if (!/"version":\s*"[^"]*"/.test(text)) continue
-  const next = text.replace(/"version":\s*"[^"]*"/, `"version": "${version}"`)
+  // Only touch a package's own top-level "version" field. Anchoring to a
+  // two-space indent at line start ensures we never match a nested "version"
+  // key (deeper indentation) inside scripts/dependencies/etc.
+  const TOP_LEVEL_VERSION = /^( {2}"version":\s*)"[^"]*"/m
+  if (!TOP_LEVEL_VERSION.test(text)) continue
+  const next = text.replace(TOP_LEVEL_VERSION, `$1"${version}"`)
   if (next !== text) {
     await Bun.write(file, next)
     updated.push(rel)

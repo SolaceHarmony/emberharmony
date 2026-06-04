@@ -31,7 +31,7 @@ await $`cp ./script/postinstall.mjs ./dist/${pkg.name}/postinstall.mjs`
 
 const meta = await Bun.file(path.join(root, "package.json"))
   .json()
-  .catch(() => ({}) as unknown)
+  .catch(() => ({}) as Record<string, unknown>)
 
 const description =
   typeof meta === "object" && meta && "description" in meta && typeof meta.description === "string"
