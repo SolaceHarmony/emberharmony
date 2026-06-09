@@ -29,35 +29,31 @@ await $`mkdir -p ./dist/${pkg.name}`
 await $`cp -r ./bin ./dist/${pkg.name}/bin`
 await $`cp ./script/postinstall.mjs ./dist/${pkg.name}/postinstall.mjs`
 
-const meta = await Bun.file(path.join(root, "package.json"))
-  .json()
-  .catch(() => ({}) as Record<string, unknown>)
+// The published manifest is derived from the repo-root package.json. A failed
+// read or a missing field is a real misconfiguration, so surface it instead of
+// publishing a package with silently-dropped metadata.
+const meta = (await Bun.file(path.join(root, "package.json")).json()) as Record<string, unknown>
 
-const description =
-  typeof meta === "object" && meta && "description" in meta && typeof meta.description === "string"
-    ? meta.description
-    : undefined
+const requireString = (key: string): string => {
+  const value = meta[key]
+  if (typeof value !== "string" || value.length === 0) {
+    throw new Error(`root package.json is missing a valid "${key}" string`)
+  }
+  return value
+}
+const requireMeta = (key: string): unknown => {
+  const value = meta[key]
+  if (value == null) {
+    throw new Error(`root package.json is missing required field "${key}"`)
+  }
+  return value
+}
 
-const homepage =
-  typeof meta === "object" && meta && "homepage" in meta && typeof meta.homepage === "string"
-    ? meta.homepage
-    : undefined
-
-const license =
-  typeof meta === "object" && meta && "license" in meta && typeof meta.license === "string" ? meta.license : "MIT"
-
-const repository =
-  typeof meta === "object" &&
-  meta &&
-  "repository" in meta &&
-  (typeof meta.repository === "object" || typeof meta.repository === "string")
-    ? meta.repository
-    : undefined
-
-const bugs =
-  typeof meta === "object" && meta && "bugs" in meta && (typeof meta.bugs === "object" || typeof meta.bugs === "string")
-    ? meta.bugs
-    : undefined
+const description = requireString("description")
+const homepage = requireString("homepage")
+const license = requireString("license")
+const repository = requireMeta("repository")
+const bugs = requireMeta("bugs")
 
 await Bun.file(`./dist/${pkg.name}/package.json`).write(
   JSON.stringify(
