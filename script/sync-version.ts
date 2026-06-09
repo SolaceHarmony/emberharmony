@@ -24,6 +24,7 @@ const SKIP = ["packages/sdk/js/package.json", "sdks/vscode/package.json"]
 
 const updated: string[] = []
 const skipped: string[] = []
+const noVersion: string[] = []
 
 for await (const rel of new Glob("**/package.json").scan({ cwd: ROOT })) {
   if (rel.includes("node_modules") || rel.includes("/dist") || rel.includes("/.output/")) continue
@@ -33,10 +34,29 @@ for await (const rel of new Glob("**/package.json").scan({ cwd: ROOT })) {
   }
   const file = path.join(ROOT, rel)
   const text = await Bun.file(file).text()
-  // Only touch a package's own top-level "version" field; dependency specifiers
-  // use a different shape ("name": "1.2.3") and are never matched here.
-  if (!/"version":\s*"[^"]*"/.test(text)) continue
-  const next = text.replace(/"version":\s*"[^"]*"/, `"version": "${version}"`)
+
+  // Authoritatively decide whether this package carries its own version by
+  // parsing it: a nested "version" (inside scripts/dependencies/etc.) is never
+  // a top-level key, so it can't be mistaken for the package's own version.
+  // A malformed package.json throws here rather than being silently skipped.
+  const parsed = JSON.parse(text) as { version?: unknown }
+  if (!("version" in parsed)) {
+    noVersion.push(rel)
+    continue
+  }
+
+  // The package has a top-level version. Rewrite it in place with a
+  // format-preserving replace targeting a two-space-indented line. If that
+  // pattern doesn't match, the file uses unexpected formatting — fail loudly
+  // instead of silently leaving its version out of sync.
+  const TOP_LEVEL_VERSION = /^( {2}"version":\s*)"[^"]*"/m
+  if (!TOP_LEVEL_VERSION.test(text)) {
+    throw new Error(
+      `${rel} has a top-level "version" key that is not a two-space-indented line; ` +
+        `reformat it or update sync-version.ts rather than silently skipping it`,
+    )
+  }
+  const next = text.replace(TOP_LEVEL_VERSION, `$1"${version}"`)
   if (next !== text) {
     await Bun.write(file, next)
     updated.push(rel)
@@ -47,3 +67,4 @@ console.log(`version.json → ${version}`)
 console.log(`updated ${updated.length} package.json file(s):`)
 for (const r of updated.sort()) console.log(`  ${r}`)
 if (skipped.length) console.log(`skipped (independently versioned): ${skipped.join(", ")}`)
+if (noVersion.length) console.log(`no top-level version (left untouched): ${noVersion.sort().join(", ")}`)
