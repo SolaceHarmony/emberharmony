@@ -22,10 +22,9 @@ on:
         type: string
         default: "@thesolaceproject/emberharmony"
 
-# Permissions are inherited from the caller: ci.yml grants read, and
-# publish.yml grants write so the CLI build can upload release assets via
-# `gh release upload`. A reusable workflow cannot exceed its caller's grant,
-# so jobs do not declare permissions here.
+# Permissions are inherited from the caller. Both callers grant read-only:
+# this build never mutates the repository (no commit, tag, push, or release
+# upload). The CLI binaries are surfaced solely as workflow artifacts below.
 
 jobs:
   build-cli:
@@ -48,7 +47,6 @@ jobs:
           EMBERHARMONY_RELEASE: ${{ inputs.release }}
           EMBERHARMONY_TAG: ${{ inputs.tag }}
           EMBERHARMONY_PUBLISH_NAME: ${{ inputs.publish-name }}
-          GH_TOKEN: ${{ github.token }}
 
       - name: Upload CLI artifacts
         uses: actions/upload-artifact@v7

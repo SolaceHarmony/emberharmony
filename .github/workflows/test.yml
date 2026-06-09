@@ -36,8 +36,6 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Setup Bun
         uses: ./.github/actions/setup-bun
