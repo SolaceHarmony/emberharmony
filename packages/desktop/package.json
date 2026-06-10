@@ -5,7 +5,7 @@
   "type": "module",
   "license": "MIT",
   "scripts": {
-    "typecheck": "tsgo -b",
+    "typecheck": "tsgo -b --force",
     "predev": "bun ./scripts/predev.ts",
     "dev": "vite",
     "build": "bun run typecheck && vite build",

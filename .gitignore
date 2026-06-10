@@ -33,3 +33,4 @@ target
 emberharmony-dev
 logs/
 *.bun-build
+*.tsbuildinfo
