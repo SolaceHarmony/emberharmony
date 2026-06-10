@@ -29,7 +29,30 @@ bun run --cwd packages/desktop tauri build
 
 ## Prerequisites
 
-Running the desktop app requires additional Tauri dependencies (Rust toolchain, platform-specific libraries). See the [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) for setup instructions.
+Every requirement is declared in the repo; nothing relies on ad-hoc global installs:
+
+| Requirement | Declared by | Notes |
+|---|---|---|
+| Bun | `packageManager` in the root `package.json` | The only supported package manager — npm cannot resolve this workspace's `catalog:` versions |
+| Tauri CLI | `@tauri-apps/cli` devDependency | Installed by `bun install`; build scripts invoke it via `bunx tauri` (not the cargo-installed `cargo tauri`) |
+| Rust toolchain | `src-tauri/rust-toolchain.toml` | rustup picks the pinned version up automatically; install rustup via <https://rustup.rs> |
+| Platform libraries | [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) | OS packages (e.g. webkit2gtk on Linux) |
+
+`scripts/build-local.ts` verifies all of this up front (preflight) and fails with
+install guidance before any compilation starts.
+
+### macOS signing for local builds
+
+`build-local.ts` checks that `APPLE_SIGNING_IDENTITY` (usually from the repo-root
+`.env`) resolves to a certificate actually present in the keychain, and fails
+fast listing the valid identities if not. With no identity configured, local
+builds are ad-hoc signed (`-`): runnable on this machine, not distributable,
+never notarized. Notarization is exclusively a release-pipeline concern.
+
+```bash
+# explicit ad-hoc local build
+APPLE_SIGNING_IDENTITY="-" bun run --cwd packages/desktop build:local
+```
 
 ## Platform-Specific Features
 
