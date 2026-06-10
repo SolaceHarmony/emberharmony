@@ -163,7 +163,7 @@ jobs:
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: stable
+          toolchain: 1.96.0
           targets: ${{ matrix.settings.target }}
 
       - name: Add Rust cross-compilation target
