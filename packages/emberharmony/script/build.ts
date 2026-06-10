@@ -195,8 +195,24 @@ for (const item of targets) {
 }
 
 if (Script.release) {
+  // Archive filenames are sculpted from the human-created release tag
+  // (e.g. v2.3.0 → emberharmony-v2.3.0-linux-x64.tar.gz). The tag names the
+  // release only — the version embedded in the binaries above always comes
+  // from version.json and is unrelated to the tag.
+  const releaseTag = process.env.EMBERHARMONY_TAG
+  if (!releaseTag) {
+    throw new Error("EMBERHARMONY_TAG must be set for a release build (the GitHub release tag names the archives)")
+  }
+  if (!/^[A-Za-z0-9._-]+$/.test(releaseTag)) {
+    throw new Error(`release tag "${releaseTag}" contains characters unsafe for filenames`)
+  }
+  // Optional: bundle the human-written release notes into each archive.
+  const releaseNotes = process.env.EMBERHARMONY_RELEASE_NOTES
   for (const key of Object.keys(binaries)) {
-    const releaseName = key.replace(pkg.name, cliName)
+    if (releaseNotes) {
+      await Bun.write(`dist/${key}/bin/RELEASE_NOTES.md`, releaseNotes)
+    }
+    const releaseName = key.replace(pkg.name, `${cliName}-${releaseTag}`)
     if (key.includes("linux")) {
       await $`tar -czf ../../${releaseName}.tar.gz *`.cwd(`dist/${key}/bin`)
       const hash = (await $`sha256sum ./dist/${releaseName}.tar.gz`.text()).split(/\s+/)[0]
@@ -209,7 +225,8 @@ if (Script.release) {
   }
   // The archives above are produced for distribution but are NOT uploaded from
   // here: this build is not permitted to mutate GitHub. CI exposes them as
-  // workflow artifacts; attaching them to a release is a human step.
+  // workflow artifacts; attaching them to a release is a human step
+  // (the attach-assets job in publish.yml, authorized by a scoped PAT).
 }
 
 export { binaries }

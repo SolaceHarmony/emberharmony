@@ -24,6 +24,11 @@ jobs:
     with:
       release: ${{ github.event.release.id }}
       tag: ${{ github.event.release.tag_name }}
+      # The branch the human picked as the release target in the GitHub UI.
+      # main → stable ("latest"), dev → dev channel; the build fails on
+      # anything else.
+      target: ${{ github.event.release.target_commitish }}
+      release-notes: ${{ github.event.release.body }}
       publish-name: "@thesolaceproject/emberharmony"
     secrets: inherit
 
@@ -54,11 +59,11 @@ jobs:
           gh release upload "$TAG" dist/*.tar.gz dist/*.zip dist/*.sha256 \
             --clobber --repo "${{ github.repository }}"
 
-  # npm publish runs for STABLE releases only. A pre-release still builds the CLI
-  # binaries and attaches them to the release via attach-assets, but never
-  # touches npm.
+  # npm publish runs ONLY for stable releases targeting main. A dev-target or
+  # pre-release build still ships binaries to the release page via
+  # attach-assets, but never touches npm.
   publish:
-    if: ${{ github.repository == 'SolaceHarmony/emberharmony' && !github.event.release.prerelease }}
+    if: ${{ github.repository == 'SolaceHarmony/emberharmony' && !github.event.release.prerelease && github.event.release.target_commitish == 'main' }}
     needs:
       - build
     runs-on: ubuntu-latest
@@ -96,6 +101,7 @@ jobs:
       - run: ./script/publish.ts
         env:
           EMBERHARMONY_RELEASE: ${{ github.event.release.id }}
+          EMBERHARMONY_TARGET: ${{ github.event.release.target_commitish }}
           EMBERHARMONY_PUBLISH_NAME: "@thesolaceproject/emberharmony"
           EMBERHARMONY_PUBLISH_PLATFORMS: "1"
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
