@@ -87,9 +87,11 @@ console.log(`[build-local] target: ${rustTarget} (${sidecar.ocBinary})`)
     missing.push("Rust toolchain (cargo) — install via https://rustup.rs; src-tauri/rust-toolchain.toml pins the version")
   }
 
-  // The Tauri CLI is this package's @tauri-apps/cli devDependency, resolved
-  // from node_modules/.bin by bunx — not a cargo-installed global.
-  const tauri = await $`bunx tauri --version`.quiet().nothrow()
+  // The Tauri CLI is this package's @tauri-apps/cli devDependency, run via
+  // the package's "tauri" script so it resolves strictly from
+  // node_modules/.bin — never bunx, which would auto-install the deprecated
+  // npm package named "tauri" from the registry when node_modules is absent.
+  const tauri = await $`bun run tauri --version`.quiet().nothrow()
   if (tauri.exitCode !== 0) {
     missing.push("Tauri CLI (@tauri-apps/cli devDependency) — run `bun install` at the repo root")
   }
@@ -180,12 +182,13 @@ await copyBinaryToSidecarFolder(cliBinaryPath, rustTarget)
 
 // --- Step 3: Run tauri build (no-bundle to skip the broken DMG path) ------
 // The Tauri CLI comes from this package's @tauri-apps/cli devDependency
-// (resolved from node_modules/.bin by bunx), NOT the cargo-installed
+// (run via the package's "tauri" script, strictly from node_modules/.bin),
+// NOT the cargo-installed
 // `cargo tauri` subcommand — that is a separate global install this repo
 // neither declares nor requires.
 if (noBundle) {
   console.log(`[build-local] running: tauri build --no-bundle`)
-  await $`bunx tauri build --no-bundle`
+  await $`bun run tauri build --no-bundle`
   console.log(`[build-local] done (no bundle)`)
   process.exit(0)
 }
@@ -205,7 +208,7 @@ if (process.platform === "darwin") {
 }
 
 console.log(`[build-local] running: tauri ${tauriArgs.join(" ")}`)
-await $`bunx tauri ${tauriArgs}`
+await $`bun run tauri ${tauriArgs}`
 
 // --- Step 4: Create DMG manually (macOS only) -----------------------------
 if (process.platform === "darwin" && !noDmg) {
