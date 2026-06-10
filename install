@@ -15,18 +15,25 @@ Usage: install.sh [options]
 
 Options:
     -h, --help              Display this help message
-    -v, --version <version> Install a specific version (e.g., 1.0.180)
+    -t, --tag <tag>         Install a specific GitHub release tag (e.g., v2.3.0)
     -b, --binary <path>     Install from a local binary instead of downloading
         --no-modify-path    Don't modify shell config files (.zshrc, .bashrc, etc.)
 
 Examples:
     curl -fsSL https://raw.githubusercontent.com/SolaceHarmony/emberharmony/dev/install | bash
-    curl -fsSL https://raw.githubusercontent.com/SolaceHarmony/emberharmony/dev/install | bash -s -- --version 1.0.180
+    curl -fsSL https://raw.githubusercontent.com/SolaceHarmony/emberharmony/dev/install | bash -s -- --tag v2.3.0
     ./install --binary /path/to/emberharmony
 EOF
 }
 
-requested_version=${VERSION:-}
+# Releases are identified by their GitHub release tag, used verbatim. The
+# legacy VERSION interface is gone: versions live inside the binary
+# (version.json) and never name a release.
+if [ -n "${VERSION:-}" ]; then
+    echo -e "${RED}Error: VERSION is no longer supported; releases are addressed by tag. Use TAG=<release tag> (e.g. TAG=v2.3.0)${NC}"
+    exit 1
+fi
+requested_tag=${TAG:-}
 no_modify_path=false
 binary_path=""
 
@@ -37,11 +44,15 @@ while [[ $# -gt 0 ]]; do
             exit 0
             ;;
         -v|--version)
+            echo -e "${RED}Error: --version is no longer supported; releases are addressed by tag. Use --tag <release tag> (e.g. --tag v2.3.0)${NC}"
+            exit 1
+            ;;
+        -t|--tag)
             if [[ -n "${2:-}" ]]; then
-                requested_version="$2"
+                requested_tag="$2"
                 shift 2
             else
-                echo -e "${RED}Error: --version requires a version argument${NC}"
+                echo -e "${RED}Error: --tag requires a release tag argument${NC}"
                 exit 1
             fi
             ;;
@@ -172,9 +183,6 @@ else
       target="$target-musl"
     fi
 
-    filename="$APP-$target$archive_ext"
-
-
     if [ "$os" = "linux" ]; then
         if ! command -v tar >/dev/null 2>&1; then
              echo -e "${RED}Error: 'tar' is required but not installed.${NC}"
@@ -187,28 +195,32 @@ else
         fi
     fi
 
-    if [ -z "$requested_version" ]; then
-        url="https://github.com/SolaceHarmony/emberharmony/releases/latest/download/$filename"
-        specific_version=$(curl -s https://api.github.com/repos/SolaceHarmony/emberharmony/releases/latest | sed -n 's/.*"tag_name": *"v\([^"]*\)".*/\1/p')
+    # Resolve the release tag, then sculpt the asset filename from it
+    # (e.g. v2.3.0 -> emberharmony-v2.3.0-linux-x64.tar.gz). Tags are used
+    # verbatim — releases older than the tag-named scheme cannot be installed
+    # with this script.
+    if [ -z "$requested_tag" ]; then
+        release_tag=$(curl -s https://api.github.com/repos/SolaceHarmony/emberharmony/releases/latest | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p')
 
-        if [[ $? -ne 0 || -z "$specific_version" ]]; then
-            echo -e "${RED}Failed to fetch version information${NC}"
+        if [[ -z "$release_tag" ]]; then
+            echo -e "${RED}Failed to fetch the latest release tag from GitHub${NC}"
             exit 1
         fi
     else
-        # Strip leading 'v' if present
-        requested_version="${requested_version#v}"
-        url="https://github.com/SolaceHarmony/emberharmony/releases/download/v${requested_version}/$filename"
-        specific_version=$requested_version
+        release_tag=$requested_tag
 
         # Verify the release exists before downloading
-        http_status=$(curl -sI -o /dev/null -w "%{http_code}" "https://github.com/SolaceHarmony/emberharmony/releases/tag/v${requested_version}")
+        http_status=$(curl -sI -o /dev/null -w "%{http_code}" "https://github.com/SolaceHarmony/emberharmony/releases/tag/${release_tag}")
         if [ "$http_status" = "404" ]; then
-            echo -e "${RED}Error: Release v${requested_version} not found${NC}"
+            echo -e "${RED}Error: Release ${release_tag} not found${NC}"
             echo -e "${MUTED}Available releases: https://github.com/SolaceHarmony/emberharmony/releases${NC}"
             exit 1
         fi
     fi
+
+    filename="$APP-$release_tag-$target$archive_ext"
+    url="https://github.com/SolaceHarmony/emberharmony/releases/download/${release_tag}/$filename"
+    specific_version=$release_tag
 fi
 
 print_message() {
@@ -229,14 +241,12 @@ check_version() {
     if command -v "$APP" >/dev/null 2>&1; then
         app_path=$(which "$APP")
 
-        ## Check the installed version
+        # Informational only: the binary reports its embedded version
+        # (version.json), which is intentionally unrelated to the release tag
+        # being installed, so equality can't be used to skip the install.
         installed_version=$("$APP" --version 2>/dev/null || echo "")
-
-        if [[ "$installed_version" != "$specific_version" ]]; then
-            print_message info "${MUTED}Installed version: ${NC}$installed_version."
-        else
-            print_message info "${MUTED}Version ${NC}$specific_version${MUTED} already installed"
-            exit 0
+        if [[ -n "$installed_version" ]]; then
+            print_message info "${MUTED}Installed version: ${NC}$installed_version"
         fi
     fi
 }
@@ -368,7 +378,7 @@ verify_checksum() {
 }
 
 download_and_install() {
-    print_message info "\n${MUTED}Installing ${NC}${APP} ${MUTED}version: ${NC}$specific_version"
+    print_message info "\n${MUTED}Installing ${NC}${APP} ${MUTED}release: ${NC}$specific_version"
     local tmp_dir
     tmp_dir=$(mktemp -d)
 

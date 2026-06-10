@@ -122,6 +122,20 @@ if (!skipClean) {
   await $`rm -rf dist`
 }
 
+// The release tag (human-created in the GitHub release UI) names the release
+// and its artifacts, and is embedded so installed binaries can compare their
+// own release identity against GitHub when checking for updates. The version
+// embedded below stays version.json and is unrelated to the tag.
+const releaseTag = process.env.EMBERHARMONY_TAG ?? ""
+if (Script.release) {
+  if (!releaseTag) {
+    throw new Error("EMBERHARMONY_TAG must be set for a release build (the GitHub release tag names the archives)")
+  }
+  if (!/^[A-Za-z0-9._-]+$/.test(releaseTag)) {
+    throw new Error(`release tag "${releaseTag}" contains characters unsafe for filenames`)
+  }
+}
+
 const binaries: Record<string, string> = {}
 if (!skipInstall) {
   await $`bun install --os="*" --cpu="*" @opentui/core@${pkg.dependencies["@opentui/core"]}`
@@ -170,6 +184,7 @@ for (const item of targets) {
     entrypoints: ["./src/index.ts", parserWorker, workerPath],
     define: {
       EMBERHARMONY_VERSION: `'${Script.version}'`,
+      EMBERHARMONY_TAG: `'${releaseTag}'`,
       OTUI_TREE_SITTER_WORKER_PATH: bunfsRoot + workerRelativePath,
       EMBERHARMONY_WORKER_PATH: workerPath,
       EMBERHARMONY_CHANNEL: `'${Script.channel}'`,
@@ -195,17 +210,8 @@ for (const item of targets) {
 }
 
 if (Script.release) {
-  // Archive filenames are sculpted from the human-created release tag
-  // (e.g. v2.3.0 → emberharmony-v2.3.0-linux-x64.tar.gz). The tag names the
-  // release only — the version embedded in the binaries above always comes
-  // from version.json and is unrelated to the tag.
-  const releaseTag = process.env.EMBERHARMONY_TAG
-  if (!releaseTag) {
-    throw new Error("EMBERHARMONY_TAG must be set for a release build (the GitHub release tag names the archives)")
-  }
-  if (!/^[A-Za-z0-9._-]+$/.test(releaseTag)) {
-    throw new Error(`release tag "${releaseTag}" contains characters unsafe for filenames`)
-  }
+  // Archive filenames are sculpted from the release tag validated above
+  // (e.g. v2.3.0 → emberharmony-v2.3.0-linux-x64.tar.gz).
   // Optional: bundle the human-written release notes into each archive.
   const releaseNotes = process.env.EMBERHARMONY_RELEASE_NOTES
   for (const key of Object.keys(binaries)) {

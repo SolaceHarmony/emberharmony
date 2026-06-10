@@ -8,7 +8,9 @@ export async function upgrade() {
   const method = await Installation.method()
   const latest = await Installation.latest(method).catch(() => {})
   if (!latest) return
-  if (Installation.VERSION === latest) return
+  // npm installs compare package versions; GitHub installs compare release
+  // tags — the embedded version is unrelated to the release tag by design.
+  if (Installation.installed(method) === latest) return
 
   if (config.autoupdate === false || Flag.EMBERHARMONY_DISABLE_AUTOUPDATE) {
     return

@@ -19,7 +19,28 @@ permissions:
   actions: read
 
 jobs:
+  # A release targeting dev that is not marked as a pre-release would become
+  # GitHub's /releases/latest — the target of every stable curl install and
+  # update check — so a single missed checkbox would ship dev binaries to
+  # stable users. Refuse to build it.
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require dev-target releases to be pre-releases
+        env:
+          TARGET: ${{ github.event.release.target_commitish }}
+          PRERELEASE: ${{ github.event.release.prerelease }}
+        run: |
+          set -euo pipefail
+          if [ "$TARGET" = "dev" ] && [ "$PRERELEASE" != "true" ]; then
+            echo "::error::Release targets dev but is not marked as a pre-release. Delete the release, recreate it with the pre-release checkbox set, and try again."
+            exit 1
+          fi
+          echo "release target=$TARGET prerelease=$PRERELEASE — ok"
+
   build:
+    needs:
+      - validate
     uses: ./.github/workflows/_build.yml
     with:
       release: ${{ github.event.release.id }}
