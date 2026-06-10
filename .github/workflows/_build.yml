@@ -1,10 +1,15 @@
 name: Build
 run-name: Build ${{ inputs.tag || github.sha }}
 
-# Reusable workflow that produces the CLI binaries.
+# Reusable workflow that produces the CLI binaries and Tauri desktop bundles.
 # Called by:
 #   - ci.yml     (post-merge verification on dev/main; uploads workflow artifacts only)
-#   - publish.yml (release publish; uploads CLI archives to the published GitHub release)
+#   - publish.yml (release publish; uploads CLI archives to the published GitHub release
+#                  and desktop bundles via attach-assets)
+#
+# When inputs.release and inputs.tag are empty strings, tauri-action skips
+# release attachment and only produces workflow artifacts. See:
+# https://github.com/tauri-apps/tauri-action#workflow-inputs
 
 on:
   workflow_call:
@@ -32,7 +37,7 @@ on:
 
 # Permissions are inherited from the caller. Both callers grant read-only:
 # this build never mutates the repository (no commit, tag, push, or release
-# upload). The CLI binaries are surfaced solely as workflow artifacts below.
+# upload). The CLI binaries and desktop bundles are surfaced as workflow artifacts.
 
 jobs:
   build-cli:
@@ -63,3 +68,168 @@ jobs:
         with:
           name: emberharmony-cli
           path: packages/emberharmony/dist
+
+  build-tauri:
+    needs: build-cli
+    continue-on-error: false
+    strategy:
+      fail-fast: false
+      matrix:
+        settings:
+          - host: macos-latest
+            target: x86_64-apple-darwin
+          - host: macos-latest
+            target: aarch64-apple-darwin
+          - host: windows-latest
+            target: x86_64-pc-windows-msvc
+          - host: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - host: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.settings.host }}
+    env:
+      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      APPLE_API_KEY_PATH: ${{ secrets.APPLE_API_KEY_PATH }}
+      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-tags: true
+
+      - uses: apple-actions/import-codesign-certs@v7
+        if: ${{ runner.os == 'macOS' && env.APPLE_CERTIFICATE != '' && env.APPLE_CERTIFICATE_PASSWORD != '' }}
+        with:
+          keychain: build
+          p12-file-base64: ${{ secrets.APPLE_CERTIFICATE }}
+          p12-password: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+
+      - name: Verify Certificate
+        if: ${{ runner.os == 'macOS' && env.APPLE_CERTIFICATE != '' && env.APPLE_CERTIFICATE_PASSWORD != '' }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "${APPLE_SIGNING_IDENTITY:-}" ]; then
+            echo "CERT_ID=$APPLE_SIGNING_IDENTITY" >> "$GITHUB_ENV"
+
+            TEAM_ID=$(echo "$APPLE_SIGNING_IDENTITY" | sed -n 's/.*(\([A-Z0-9]\{10\}\)).*/\1/p')
+            if [ -n "${TEAM_ID:-}" ]; then
+              echo "APPLE_TEAM_ID=$TEAM_ID" >> "$GITHUB_ENV"
+              echo "Using APPLE_TEAM_ID from signing identity: $TEAM_ID"
+            fi
+
+            echo "Using APPLE_SIGNING_IDENTITY override."
+            security find-identity -v -p codesigning build.keychain | cat
+            exit 0
+          fi
+
+          CERT_INFO=$(security find-identity -v -p codesigning build.keychain | grep "Developer ID Application" | head -n 1 || true)
+          if [ -z "$CERT_INFO" ]; then
+            echo "No 'Developer ID Application' identity found in build.keychain" >&2
+            security find-identity -v -p codesigning build.keychain | cat
+            exit 1
+          fi
+
+          CERT_ID=$(echo "$CERT_INFO" | awk -F'"' '{print $2}')
+          echo "CERT_ID=$CERT_ID" >> "$GITHUB_ENV"
+          echo "Certificate imported: $CERT_ID"
+
+          TEAM_ID=$(echo "$CERT_ID" | sed -n 's/.*(\([A-Z0-9]\{10\}\)).*/\1/p')
+          if [ -n "${TEAM_ID:-}" ]; then
+            echo "APPLE_TEAM_ID=$TEAM_ID" >> "$GITHUB_ENV"
+            echo "Detected APPLE_TEAM_ID from certificate: $TEAM_ID"
+          fi
+
+      - name: Setup Apple API Key
+        if: ${{ runner.os == 'macOS' && env.APPLE_API_KEY_PATH != '' }}
+        run: |
+          printf '%s' "${{ secrets.APPLE_API_KEY_PATH }}" > "$RUNNER_TEMP/apple-api-key.p8"
+
+      - uses: ./.github/actions/setup-bun
+
+      - name: Cache apt packages
+        if: contains(matrix.settings.host, 'ubuntu')
+        uses: actions/cache@v5
+        with:
+          path: /var/cache/apt/archives/*.deb
+          key: ${{ runner.os }}-${{ matrix.settings.target }}-apt-${{ hashFiles('.github/workflows/_build.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.settings.target }}-apt-
+
+      - name: Install dependencies (ubuntu only)
+        if: contains(matrix.settings.host, 'ubuntu')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+          targets: ${{ matrix.settings.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: packages/desktop/src-tauri
+          shared-key: ${{ matrix.settings.target }}
+
+      - name: Prepare
+        run: |
+          cd packages/desktop
+          bun ./scripts/prepare.ts
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RUST_TARGET: ${{ matrix.settings.target }}
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+
+      # Fixes AppImage build issues, can be removed when https://github.com/tauri-apps/tauri/pull/12491 is released
+      - name: Install tauri-cli from portable appimage branch
+        if: contains(matrix.settings.host, 'ubuntu')
+        run: |
+          cargo install tauri-cli --git https://github.com/tauri-apps/tauri --branch feat/truly-portable-appimage --force
+          echo "Installed tauri-cli version:"
+          cargo tauri --version
+
+      - name: Export Apple ID notarization credentials
+        if: ${{ runner.os == 'macOS' }}
+        run: |
+          APPLE_ID="${{ secrets.APPLE_ID }}"
+          APPLE_PASSWORD="${{ secrets.APPLE_PASSWORD }}"
+
+          if [ -z "${APPLE_ID:-}" ] || [ -z "${APPLE_PASSWORD:-}" ]; then
+            echo "Apple ID notarization not configured; using App Store Connect API key."
+            exit 0
+          fi
+
+          echo "APPLE_ID=$APPLE_ID" >> "$GITHUB_ENV"
+          echo "APPLE_PASSWORD=$APPLE_PASSWORD" >> "$GITHUB_ENV"
+
+      - name: Build and upload artifacts
+        uses: tauri-apps/tauri-action@v0
+        timeout-minutes: 60
+        if: ${{ runner.os != 'macOS' || (env.APPLE_CERTIFICATE != '' && env.APPLE_CERTIFICATE_PASSWORD != '') }}
+        with:
+          projectPath: packages/desktop
+          uploadWorkflowArtifacts: true
+          tauriScript: ${{ (contains(matrix.settings.host, 'ubuntu') && 'cargo tauri') || '' }}
+          args: --target ${{ matrix.settings.target }} --config ./src-tauri/tauri.prod.conf.json --verbose
+          updaterJsonPreferNsis: true
+          # Release attachment is handled by publish.yml's attach-assets job using
+          # RELEASE_ASSETS_TOKEN (a fine-grained PAT). Leave releaseId/tagName empty
+          # so tauri-action only produces workflow artifacts — it never writes to the repo.
+          releaseId: ""
+          tagName: ""
+          releaseAssetNamePattern: emberharmony-desktop-[platform]-[arch][ext]
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_BUNDLER_NEW_APPIMAGE_FORMAT: true
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ env.CERT_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_PATH: ${{ runner.temp }}/apple-api-key.p8
+          APPLE_TEAM_ID: ${{ env.APPLE_TEAM_ID }}
