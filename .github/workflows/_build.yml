@@ -212,6 +212,7 @@ jobs:
         if: ${{ runner.os != 'macOS' || (env.APPLE_CERTIFICATE != '' && env.APPLE_CERTIFICATE_PASSWORD != '') }}
         with:
           projectPath: packages/desktop
+          uploadWorkflowArtifacts: true
           tauriScript: ${{ (contains(matrix.settings.host, 'ubuntu') && 'cargo tauri') || '' }}
           args: --target ${{ matrix.settings.target }} --config ./src-tauri/tauri.prod.conf.json --verbose
           updaterJsonPreferNsis: true
