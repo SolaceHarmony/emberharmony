@@ -8,7 +8,7 @@
     "./vite": "./vite.js"
   },
   "scripts": {
-    "typecheck": "tsgo -b",
+    "typecheck": "tsgo -b --force",
     "start": "vite",
     "dev": "vite",
     "build": "vite build",
