@@ -27,19 +27,14 @@ export const UpgradeCommand = {
     const detectedMethod = await Installation.method()
     const method = (args.method as Installation.Method) ?? detectedMethod
     if (method === "unknown") {
-      prompts.log.error(`emberharmony is installed to ${process.execPath} and may be managed by a package manager`)
-      const install = await prompts.select({
-        message: "Install anyways?",
-        options: [
-          { label: "Yes", value: true },
-          { label: "No", value: false },
-        ],
-        initialValue: false,
-      })
-      if (!install) {
-        prompts.outro("Done")
-        return
-      }
+      // Proceeding with an unknown method can only end in Installation.upgrade
+      // throwing — tell the user how to choose one instead of pretending.
+      prompts.log.error(
+        `emberharmony is installed to ${process.execPath} and may be managed by a package manager; ` +
+          `specify how to upgrade with --method (curl, npm, pnpm, bun, yarn)`,
+      )
+      prompts.outro("Done")
+      return
     }
     prompts.log.info("Using method: " + method)
     // npm targets are bare package versions; curl targets are release tags

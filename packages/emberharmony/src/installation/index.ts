@@ -1,4 +1,5 @@
 import { BusEvent } from "@/bus/bus-event"
+import os from "os"
 import path from "path"
 import { $ } from "bun"
 import z from "zod"
@@ -114,16 +115,34 @@ export namespace Installation {
   export async function upgrade(method: Method, target: string) {
     let cmd
     switch (method) {
-      case "curl":
+      case "curl": {
+        // The tag is interpolated into a URL whose response gets executed,
+        // and URL clients normalize ../ segments — a crafted tag could
+        // otherwise address an arbitrary repository. Enforce the same
+        // release-tag character allowlist as build.ts and the install script.
+        if (!/^[A-Za-z0-9._-]+$/.test(target)) {
+          throw new Error(`invalid release tag "${target}"`)
+        }
         // The installer takes the release TAG verbatim — tags name releases;
         // versions live in version.json and never identify a release. The
-        // installer script itself is fetched at the target tag's ref so the
-        // install is reproducible and matches the release being installed.
-        cmd = $`curl -fsSL https://raw.githubusercontent.com/SolaceHarmony/emberharmony/${target}/install | bash`.env({
+        // installer script is fetched at the target tag's ref so the install
+        // is reproducible, and fetched explicitly rather than `curl | bash`:
+        // in a pipe, bash exits 0 on empty input when curl fails, silently
+        // no-op'ing the upgrade while reporting success.
+        const res = await fetch(`https://raw.githubusercontent.com/SolaceHarmony/emberharmony/${target}/install`, {
+          headers: { "User-Agent": USER_AGENT },
+        })
+        if (!res.ok) {
+          throw new Error(`failed to fetch installer for ${target}: ${res.status} ${res.statusText}`)
+        }
+        const installer = path.join(os.tmpdir(), `emberharmony-install-${target}.sh`)
+        await Bun.write(installer, await res.text())
+        cmd = $`bash ${installer}`.env({
           ...process.env,
           TAG: target,
         })
         break
+      }
       case "npm":
         cmd = $`npm install -g ${npmName}@${target}`
         break
