@@ -16,7 +16,7 @@ export const UpgradeCommand = {
         alias: "m",
         describe: "installation method to use",
         type: "string",
-        choices: ["curl", "npm", "pnpm", "bun"],
+        choices: ["curl", "npm", "pnpm", "bun", "yarn"],
       })
   },
   handler: async (args: { target?: string; method?: string }) => {
@@ -27,30 +27,32 @@ export const UpgradeCommand = {
     const detectedMethod = await Installation.method()
     const method = (args.method as Installation.Method) ?? detectedMethod
     if (method === "unknown") {
-      prompts.log.error(`emberharmony is installed to ${process.execPath} and may be managed by a package manager`)
-      const install = await prompts.select({
-        message: "Install anyways?",
-        options: [
-          { label: "Yes", value: true },
-          { label: "No", value: false },
-        ],
-        initialValue: false,
-      })
-      if (!install) {
-        prompts.outro("Done")
-        return
-      }
+      // Proceeding with an unknown method can only end in Installation.upgrade
+      // throwing — tell the user how to choose one instead of pretending.
+      prompts.log.error(
+        `emberharmony is installed to ${process.execPath} and may be managed by a package manager; ` +
+          `specify how to upgrade with --method (curl, npm, pnpm, bun, yarn)`,
+      )
+      prompts.outro("Done")
+      return
     }
     prompts.log.info("Using method: " + method)
     // npm targets are bare package versions; curl targets are release tags
     // used verbatim (the tag is the release identity, unrelated to the
     // embedded version).
-    const isNpmLike = method === "npm" || method === "pnpm" || method === "bun"
-    const target = args.target
-      ? isNpmLike
-        ? args.target.replace(/^v/, "")
-        : args.target
-      : await Installation.latest(method)
+    const isNpmLike = method === "npm" || method === "pnpm" || method === "bun" || method === "yarn"
+    let target: string
+    try {
+      target = args.target
+        ? isNpmLike
+          ? args.target.replace(/^v/, "")
+          : args.target
+        : await Installation.latest(method)
+    } catch (err) {
+      prompts.log.error(`Failed to resolve the latest release: ${err instanceof Error ? err.message : String(err)}`)
+      prompts.outro("Done")
+      return
+    }
     const current = Installation.installed(method)
 
     if (current === target) {

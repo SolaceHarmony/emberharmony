@@ -219,15 +219,14 @@ if (Script.release) {
       await Bun.write(`dist/${key}/bin/RELEASE_NOTES.md`, releaseNotes)
     }
     const releaseName = key.replace(pkg.name, `${cliName}-${releaseTag}`)
+    const archive = key.includes("linux") ? `${releaseName}.tar.gz` : `${releaseName}.zip`
     if (key.includes("linux")) {
-      await $`tar -czf ../../${releaseName}.tar.gz *`.cwd(`dist/${key}/bin`)
-      const hash = (await $`sha256sum ./dist/${releaseName}.tar.gz`.text()).split(/\s+/)[0]
-      await Bun.write(`./dist/${releaseName}.tar.gz.sha256`, hash + "\n")
+      await $`tar -czf ../../${archive} *`.cwd(`dist/${key}/bin`)
     } else {
-      await $`zip -r ../../${releaseName}.zip *`.cwd(`dist/${key}/bin`)
-      const hash = (await $`sha256sum ./dist/${releaseName}.zip`.text()).split(/\s+/)[0]
-      await Bun.write(`./dist/${releaseName}.zip.sha256`, hash + "\n")
+      await $`zip -r ../../${archive} *`.cwd(`dist/${key}/bin`)
     }
+    const hash = new Bun.CryptoHasher("sha256").update(await Bun.file(`./dist/${archive}`).arrayBuffer()).digest("hex")
+    await Bun.write(`./dist/${archive}.sha256`, hash + "\n")
   }
   // The archives above are produced for distribution but are NOT uploaded from
   // here: this build is not permitted to mutate GitHub. CI exposes them as
