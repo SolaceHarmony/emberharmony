@@ -5,7 +5,8 @@
  * Handles the full pipeline:
  *   1. Builds the emberharmony CLI binary for the current platform
  *   2. Copies it into src-tauri/sidecars/ as the Tauri sidecar
- *   3. Runs `cargo tauri build` (no DMG, to avoid the upstream Tauri bundle_dmg.sh bug)
+ *   3. Runs `tauri build` via the @tauri-apps/cli devDependency (no DMG, to
+ *      avoid the upstream Tauri bundle_dmg.sh bug)
  *   4. Creates a DMG manually via `hdiutil` on macOS
  *
  * Flags:
@@ -76,6 +77,92 @@ const sidecar = getCurrentSidecar(rustTarget)
 
 console.log(`[build-local] target: ${rustTarget} (${sidecar.ocBinary})`)
 
+// --- Step 0: Preflight — verify every requirement before spending minutes
+// compiling. Each failure names the missing tool and how to get it.
+{
+  const missing: string[] = []
+
+  const cargo = await $`cargo --version`.quiet().nothrow()
+  if (cargo.exitCode !== 0) {
+    missing.push("Rust toolchain (cargo) — install via https://rustup.rs; src-tauri/rust-toolchain.toml pins the version")
+  }
+
+  // The Tauri CLI is this package's @tauri-apps/cli devDependency, run via
+  // the package's "tauri" script so it resolves strictly from
+  // node_modules/.bin — never bunx, which would auto-install the deprecated
+  // npm package named "tauri" from the registry when node_modules is absent.
+  const tauri = await $`bun run tauri --version`.quiet().nothrow()
+  if (tauri.exitCode !== 0) {
+    missing.push("Tauri CLI (@tauri-apps/cli devDependency) — run `bun install` at the repo root")
+  }
+
+  if (process.platform === "darwin" && !noDmg && !noBundle) {
+    const hdiutil = await $`hdiutil info`.quiet().nothrow()
+    if (hdiutil.exitCode !== 0) {
+      missing.push("hdiutil (macOS DMG creation) — or pass --no-dmg to skip the DMG step")
+    }
+  }
+
+  // Notarization is a release-pipeline concern and is impossible for a local
+  // ad-hoc build, but Tauri auto-notarizes whenever the Apple API/ID env vars
+  // are present (and the repo-root .env carries them for releases). Strip
+  // them for local builds — explicitly and loudly — unless the caller opts
+  // in with EMBERHARMONY_NOTARIZE=1.
+  if (process.platform === "darwin" && !noBundle) {
+    const notarizeVars = ["APPLE_API_KEY", "APPLE_API_ISSUER", "APPLE_API_KEY_PATH", "APPLE_ID", "APPLE_PASSWORD"]
+    if (process.env.EMBERHARMONY_NOTARIZE === "1") {
+      const keyPath = process.env.APPLE_API_KEY_PATH
+      if (keyPath && !existsSync(keyPath)) {
+        missing.push(`APPLE_API_KEY_PATH points to "${keyPath}" which does not exist on this machine`)
+      }
+    } else {
+      const present = notarizeVars.filter((name) => process.env[name])
+      if (present.length > 0) {
+        for (const name of present) delete process.env[name]
+        console.log(
+          `[build-local] notarization disabled for local builds — ignoring ${present.join(", ")} ` +
+            `(set EMBERHARMONY_NOTARIZE=1 to attempt notarization)`,
+        )
+      }
+    }
+  }
+
+  // macOS signing: verify the configured identity actually resolves BEFORE
+  // the compile, because Tauri's own failure ("failed to sign app") names
+  // neither the identity nor the reason. "-" is ad-hoc signing and needs no
+  // keychain entry — the right mode for local, non-distributed builds.
+  if (process.platform === "darwin" && !noBundle) {
+    const identity = process.env.APPLE_SIGNING_IDENTITY
+    if (identity && identity !== "-") {
+      const identities = (await $`security find-identity -v -p codesigning`.quiet().nothrow()).stdout.toString()
+      if (!identities.includes(identity)) {
+        missing.push(
+          `signing identity "${identity}" (from APPLE_SIGNING_IDENTITY / .env) is not in the keychain.\n` +
+            `    Valid identities:\n${identities
+              .split("\n")
+              .filter((line) => line.includes('"'))
+              .map((line) => `      ${line.trim()}`)
+              .join("\n")}\n` +
+            `    Install that certificate, fix .env, or run with APPLE_SIGNING_IDENTITY="-" for an ad-hoc local build`,
+        )
+      }
+    } else if (!identity) {
+      // Explicit, logged choice — not a silent fallback: local builds without
+      // a configured identity are ad-hoc signed (runnable locally, not
+      // distributable, never notarized).
+      process.env.APPLE_SIGNING_IDENTITY = "-"
+      console.log(`[build-local] no APPLE_SIGNING_IDENTITY configured — using ad-hoc signing ("-") for this local build`)
+    }
+  }
+
+  if (missing.length > 0) {
+    console.error(`[build-local] missing requirements:`)
+    for (const item of missing) console.error(`  - ${item}`)
+    process.exit(1)
+  }
+  console.log(`[build-local] preflight ok: ${cargo.stdout.toString().trim()}, tauri-cli ${tauri.stdout.toString().trim()}`)
+}
+
 // --- Step 1: Build CLI binary ---------------------------------------------
 const cliBinaryPath = path.join(emberharmonyDir, "dist", sidecar.ocBinary, "bin", windowsify("emberharmony"))
 
@@ -94,9 +181,14 @@ console.log(`[build-local] copying sidecar to src-tauri/sidecars/...`)
 await copyBinaryToSidecarFolder(cliBinaryPath, rustTarget)
 
 // --- Step 3: Run tauri build (no-bundle to skip the broken DMG path) ------
+// The Tauri CLI comes from this package's @tauri-apps/cli devDependency
+// (run via the package's "tauri" script, strictly from node_modules/.bin),
+// NOT the cargo-installed
+// `cargo tauri` subcommand — that is a separate global install this repo
+// neither declares nor requires.
 if (noBundle) {
-  console.log(`[build-local] running: cargo tauri build --no-bundle`)
-  await $`cargo tauri build --no-bundle`
+  console.log(`[build-local] running: tauri build --no-bundle`)
+  await $`bun run tauri build --no-bundle`
   console.log(`[build-local] done (no bundle)`)
   process.exit(0)
 }
@@ -104,7 +196,7 @@ if (noBundle) {
 // Always skip DMG in the Tauri invocation because the upstream bundle_dmg.sh
 // fails. We create the DMG manually afterwards if the host is macOS.
 const tauriArgs = ["build"]
-// Note: `cargo tauri build` is release mode by default; `--debug` is the only toggle.
+// Note: `tauri build` is release mode by default; `--debug` is the only toggle.
 
 // Build only the .app on macOS (skip dmg in Tauri's own bundler)
 if (process.platform === "darwin") {
@@ -115,8 +207,8 @@ if (process.platform === "darwin") {
   tauriArgs.push("--bundles", "nsis,msi")
 }
 
-console.log(`[build-local] running: cargo tauri ${tauriArgs.join(" ")}`)
-await $`cargo tauri ${tauriArgs}`
+console.log(`[build-local] running: tauri ${tauriArgs.join(" ")}`)
+await $`bun run tauri ${tauriArgs}`
 
 // --- Step 4: Create DMG manually (macOS only) -----------------------------
 if (process.platform === "darwin" && !noDmg) {
