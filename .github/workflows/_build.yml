@@ -168,6 +168,9 @@ jobs:
           toolchain: stable
           targets: ${{ matrix.settings.target }}
 
+      - name: Add Rust cross-compilation target
+        run: rustup target add ${{ matrix.settings.target }}
+
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: packages/desktop/src-tauri
@@ -211,7 +214,6 @@ jobs:
         if: ${{ runner.os != 'macOS' || (env.APPLE_CERTIFICATE != '' && env.APPLE_CERTIFICATE_PASSWORD != '') }}
         with:
           projectPath: packages/desktop
-          uploadWorkflowArtifacts: true
           tauriScript: ${{ (contains(matrix.settings.host, 'ubuntu') && 'cargo tauri') || '' }}
           args: --target ${{ matrix.settings.target }} --config ./src-tauri/tauri.prod.conf.json --verbose
           updaterJsonPreferNsis: true
@@ -220,7 +222,7 @@ jobs:
           # so tauri-action only produces workflow artifacts — it never writes to the repo.
           releaseId: ""
           tagName: ""
-          releaseAssetNamePattern: emberharmony-desktop-[platform]-[arch][ext]
+          assetNamePattern: emberharmony-desktop-[platform]-[arch][ext]
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_BUNDLER_NEW_APPIMAGE_FORMAT: true
