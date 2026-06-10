@@ -195,6 +195,16 @@ else
         fi
     fi
 
+    # The tag becomes part of filenames and URLs — refuse anything that could
+    # traverse paths or smuggle shell/URL syntax (same rule as build.ts).
+    # Must run BEFORE the tag is interpolated into any URL or path.
+    validate_tag() {
+        if [[ ! "$1" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo -e "${RED}Error: Release tag '$1' contains unsafe characters${NC}"
+            exit 1
+        fi
+    }
+
     # Resolve the release tag, then sculpt the asset filename from it
     # (e.g. v2.3.0 -> emberharmony-v2.3.0-linux-x64.tar.gz). Tags are used
     # verbatim — releases older than the tag-named scheme cannot be installed
@@ -206,8 +216,10 @@ else
             echo -e "${RED}Failed to fetch the latest release tag from GitHub${NC}"
             exit 1
         fi
+        validate_tag "$release_tag"
     else
         release_tag=$requested_tag
+        validate_tag "$release_tag"
 
         # Verify the release exists before downloading
         http_status=$(curl -sI -o /dev/null -w "%{http_code}" "https://github.com/SolaceHarmony/emberharmony/releases/tag/${release_tag}")

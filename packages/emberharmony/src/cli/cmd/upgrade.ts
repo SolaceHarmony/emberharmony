@@ -16,7 +16,7 @@ export const UpgradeCommand = {
         alias: "m",
         describe: "installation method to use",
         type: "string",
-        choices: ["curl", "npm", "pnpm", "bun"],
+        choices: ["curl", "npm", "pnpm", "bun", "yarn"],
       })
   },
   handler: async (args: { target?: string; method?: string }) => {
@@ -45,12 +45,19 @@ export const UpgradeCommand = {
     // npm targets are bare package versions; curl targets are release tags
     // used verbatim (the tag is the release identity, unrelated to the
     // embedded version).
-    const isNpmLike = method === "npm" || method === "pnpm" || method === "bun"
-    const target = args.target
-      ? isNpmLike
-        ? args.target.replace(/^v/, "")
-        : args.target
-      : await Installation.latest(method)
+    const isNpmLike = method === "npm" || method === "pnpm" || method === "bun" || method === "yarn"
+    let target: string
+    try {
+      target = args.target
+        ? isNpmLike
+          ? args.target.replace(/^v/, "")
+          : args.target
+        : await Installation.latest(method)
+    } catch (err) {
+      prompts.log.error(`Failed to resolve the latest release: ${err instanceof Error ? err.message : String(err)}`)
+      prompts.outro("Done")
+      return
+    }
     const current = Installation.installed(method)
 
     if (current === target) {

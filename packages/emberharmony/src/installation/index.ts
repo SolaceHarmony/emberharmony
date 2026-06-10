@@ -116,8 +116,10 @@ export namespace Installation {
     switch (method) {
       case "curl":
         // The installer takes the release TAG verbatim — tags name releases;
-        // versions live in version.json and never identify a release.
-        cmd = $`curl -fsSL https://raw.githubusercontent.com/SolaceHarmony/emberharmony/dev/install | bash`.env({
+        // versions live in version.json and never identify a release. The
+        // installer script itself is fetched at the target tag's ref so the
+        // install is reproducible and matches the release being installed.
+        cmd = $`curl -fsSL https://raw.githubusercontent.com/SolaceHarmony/emberharmony/${target}/install | bash`.env({
           ...process.env,
           TAG: target,
         })
@@ -130,6 +132,9 @@ export namespace Installation {
         break
       case "bun":
         cmd = $`bun install -g ${npmName}@${target}`
+        break
+      case "yarn":
+        cmd = $`yarn global add ${npmName}@${target}`
         break
       default:
         throw new Error(`Unknown method: ${method}`)
@@ -170,7 +175,7 @@ export namespace Installation {
   export async function latest(installMethod?: Method) {
     const detectedMethod = installMethod || (await method())
 
-    if (detectedMethod === "npm" || detectedMethod === "bun" || detectedMethod === "pnpm") {
+    if (detectedMethod === "npm" || detectedMethod === "bun" || detectedMethod === "pnpm" || detectedMethod === "yarn") {
       const registry = await iife(async () => {
         const r = (await $`npm config get registry`.quiet().nothrow().text()).trim()
         const reg = r || "https://registry.npmjs.org"
@@ -190,7 +195,9 @@ export namespace Installation {
     // builds never appear in /releases/latest (dev-target releases are always
     // prereleases), so they follow the newest prerelease targeting dev.
     if (CHANNEL === "dev") {
-      return fetch("https://api.github.com/repos/SolaceHarmony/emberharmony/releases?per_page=30")
+      return fetch("https://api.github.com/repos/SolaceHarmony/emberharmony/releases?per_page=30", {
+        headers: { "User-Agent": USER_AGENT },
+      })
         .then((res) => {
           if (!res.ok) throw new Error(res.statusText)
           return res.json()
@@ -202,7 +209,9 @@ export namespace Installation {
         })
     }
 
-    return fetch("https://api.github.com/repos/SolaceHarmony/emberharmony/releases/latest")
+    return fetch("https://api.github.com/repos/SolaceHarmony/emberharmony/releases/latest", {
+      headers: { "User-Agent": USER_AGENT },
+    })
       .then((res) => {
         if (!res.ok) throw new Error(res.statusText)
         return res.json()
