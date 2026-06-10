@@ -18,19 +18,32 @@ if (!semver.satisfies(process.versions.bun, expectedBunVersionRange)) {
 const env = {
   EMBERHARMONY_CHANNEL: process.env["EMBERHARMONY_CHANNEL"],
   EMBERHARMONY_RELEASE: process.env["EMBERHARMONY_RELEASE"],
+  EMBERHARMONY_TARGET: process.env["EMBERHARMONY_TARGET"],
 }
 
 const CHANNEL = await (async () => {
   if (env.EMBERHARMONY_CHANNEL) return env.EMBERHARMONY_CHANNEL
-  // A release build (EMBERHARMONY_RELEASE set) is always the stable channel. Releases
-  // run on a detached tag checkout where `git branch` can't see dev/main, so we key off
-  // the release context instead of the branch. Local/CI branch builds keep preview logic.
-  if (env.EMBERHARMONY_RELEASE) return "latest"
+  // Release builds run on a detached tag checkout where `git branch` can't see
+  // dev/main, so the channel comes from the branch the human targeted in the
+  // GitHub release UI (EMBERHARMONY_TARGET = release.target_commitish):
+  // main → stable "latest", dev → "dev". Anything else is a misconfigured
+  // release and fails the build. Local/CI branch builds keep preview logic.
+  if (env.EMBERHARMONY_RELEASE) {
+    if (env.EMBERHARMONY_TARGET === "main") return "latest"
+    if (env.EMBERHARMONY_TARGET === "dev") return "dev"
+    throw new Error(
+      `release builds require EMBERHARMONY_TARGET of "main" or "dev", got "${env.EMBERHARMONY_TARGET ?? "(unset)"}"`,
+    )
+  }
+  // Branch builds mirror the release mapping: main → "latest", dev → "dev".
+  // A dev-branch build is therefore IS_PREVIEW and gets a timestamped version,
+  // so CI verification artifacts can never impersonate a pinned release build
+  // (release builds bypass this via EMBERHARMONY_RELEASE above).
   const branch = await $`git branch --show-current`
     .text()
     .then((x) => x.trim())
     .catch(() => "")
-  return branch === "dev" || branch === "main" ? "latest" : branch || "preview"
+  return branch === "main" ? "latest" : branch || "preview"
 })()
 const IS_PREVIEW = CHANNEL !== "latest"
 
@@ -45,9 +58,14 @@ const STATIC_VERSION = await (async () => {
   return data.version
 })()
 
-const VERSION = IS_PREVIEW
-  ? `0.0.0-${CHANNEL}-${new Date().toISOString().slice(0, 16).replace(/[-:T]/g, "")}`
-  : STATIC_VERSION
+// The embedded version is hard-coded from version.json for every release
+// build regardless of tag or channel — the tag names the release, it never
+// defines the version. Timestamped preview versions exist only for local /
+// non-integration-branch builds.
+const VERSION =
+  env.EMBERHARMONY_RELEASE || !IS_PREVIEW
+    ? STATIC_VERSION
+    : `0.0.0-${CHANNEL}-${new Date().toISOString().slice(0, 16).replace(/[-:T]/g, "")}`
 
 export const Script = {
   get channel() {

@@ -9,7 +9,7 @@ export const UpgradeCommand = {
   builder: (yargs: Argv) => {
     return yargs
       .positional("target", {
-        describe: "version to upgrade to, for ex '0.1.48' or 'v0.1.48'",
+        describe: "npm version (e.g. '0.1.48') or GitHub release tag (e.g. 'v2.3.0') to upgrade to",
         type: "string",
       })
       .option("method", {
@@ -42,15 +42,24 @@ export const UpgradeCommand = {
       }
     }
     prompts.log.info("Using method: " + method)
-    const target = args.target ? args.target.replace(/^v/, "") : await Installation.latest()
+    // npm targets are bare package versions; curl targets are release tags
+    // used verbatim (the tag is the release identity, unrelated to the
+    // embedded version).
+    const isNpmLike = method === "npm" || method === "pnpm" || method === "bun"
+    const target = args.target
+      ? isNpmLike
+        ? args.target.replace(/^v/, "")
+        : args.target
+      : await Installation.latest(method)
+    const current = Installation.installed(method)
 
-    if (Installation.VERSION === target) {
+    if (current === target) {
       prompts.log.warn(`emberharmony upgrade skipped: ${target} is already installed`)
       prompts.outro("Done")
       return
     }
 
-    prompts.log.info(`From ${Installation.VERSION} → ${target}`)
+    prompts.log.info(`From ${current} → ${target}`)
     const spinner = prompts.spinner()
     spinner.start("Upgrading...")
     const err = await Installation.upgrade(method, target).catch((err) => err)

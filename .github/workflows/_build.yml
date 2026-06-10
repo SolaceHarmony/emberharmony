@@ -14,7 +14,15 @@ on:
         type: string
         default: ""
       tag:
-        description: "Git tag name for the release (e.g. v1.2.3). Empty in CI."
+        description: "Git tag name for the release (e.g. v1.2.3). Sculpts the archive filenames. Empty in CI."
+        type: string
+        default: ""
+      target:
+        description: "Branch the release targets (main or dev). Determines the channel. Empty in CI."
+        type: string
+        default: ""
+      release-notes:
+        description: "Human-written release notes, bundled into each archive as RELEASE_NOTES.md. Optional."
         type: string
         default: ""
       publish-name:
@@ -46,6 +54,8 @@ jobs:
         env:
           EMBERHARMONY_RELEASE: ${{ inputs.release }}
           EMBERHARMONY_TAG: ${{ inputs.tag }}
+          EMBERHARMONY_TARGET: ${{ inputs.target }}
+          EMBERHARMONY_RELEASE_NOTES: ${{ inputs.release-notes }}
           EMBERHARMONY_PUBLISH_NAME: ${{ inputs.publish-name }}
 
       - name: Upload CLI artifacts
