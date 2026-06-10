@@ -3,7 +3,6 @@ import { DownloadPlatform } from "./types"
 
 const assetNames: Record<string, string> = {
   "darwin-aarch64-dmg": "emberharmony-desktop-darwin-aarch64.dmg",
-  "darwin-x64-dmg": "emberharmony-desktop-darwin-x64.dmg",
   "windows-x64-nsis": "emberharmony-desktop-windows-x64.exe",
   "linux-x64-deb": "emberharmony-desktop-linux-amd64.deb",
   "linux-x64-appimage": "emberharmony-desktop-linux-amd64.AppImage",
@@ -13,7 +12,6 @@ const assetNames: Record<string, string> = {
 // Doing this on the server lets us preserve the original name for platforms we don't care to rename for
 const downloadNames: Record<string, string> = {
   "darwin-aarch64-dmg": "EmberHarmony Desktop.dmg",
-  "darwin-x64-dmg": "EmberHarmony Desktop.dmg",
   "windows-x64-nsis": "EmberHarmony Desktop Installer.exe",
 } satisfies { [K in DownloadPlatform]?: string }
 
