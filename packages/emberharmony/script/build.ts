@@ -122,6 +122,20 @@ if (!skipClean) {
   await $`rm -rf dist`
 }
 
+// The release tag (human-created in the GitHub release UI) names the release
+// and its artifacts, and is embedded so installed binaries can compare their
+// own release identity against GitHub when checking for updates. The version
+// embedded below stays version.json and is unrelated to the tag.
+const releaseTag = process.env.EMBERHARMONY_TAG ?? ""
+if (Script.release) {
+  if (!releaseTag) {
+    throw new Error("EMBERHARMONY_TAG must be set for a release build (the GitHub release tag names the archives)")
+  }
+  if (!/^[A-Za-z0-9._-]+$/.test(releaseTag)) {
+    throw new Error(`release tag "${releaseTag}" contains characters unsafe for filenames`)
+  }
+}
+
 const binaries: Record<string, string> = {}
 if (!skipInstall) {
   await $`bun install --os="*" --cpu="*" @opentui/core@${pkg.dependencies["@opentui/core"]}`
@@ -170,6 +184,7 @@ for (const item of targets) {
     entrypoints: ["./src/index.ts", parserWorker, workerPath],
     define: {
       EMBERHARMONY_VERSION: `'${Script.version}'`,
+      EMBERHARMONY_TAG: `'${releaseTag}'`,
       OTUI_TREE_SITTER_WORKER_PATH: bunfsRoot + workerRelativePath,
       EMBERHARMONY_WORKER_PATH: workerPath,
       EMBERHARMONY_CHANNEL: `'${Script.channel}'`,
@@ -195,24 +210,28 @@ for (const item of targets) {
 }
 
 if (Script.release) {
+  // Archive filenames are sculpted from the release tag validated above
+  // (e.g. v2.3.0 → emberharmony-v2.3.0-linux-x64.tar.gz).
+  // Optional: bundle the human-written release notes into each archive.
+  const releaseNotes = process.env.EMBERHARMONY_RELEASE_NOTES
   for (const key of Object.keys(binaries)) {
-    const releaseName = key.replace(pkg.name, cliName)
-    if (key.includes("linux")) {
-      await $`tar -czf ../../${releaseName}.tar.gz *`.cwd(`dist/${key}/bin`)
-      const hash = (await $`sha256sum ./dist/${releaseName}.tar.gz`.text()).split(/\s+/)[0]
-      await Bun.write(`./dist/${releaseName}.tar.gz.sha256`, hash + "\n")
-    } else {
-      await $`zip -r ../../${releaseName}.zip *`.cwd(`dist/${key}/bin`)
-      const hash = (await $`sha256sum ./dist/${releaseName}.zip`.text()).split(/\s+/)[0]
-      await Bun.write(`./dist/${releaseName}.zip.sha256`, hash + "\n")
+    if (releaseNotes) {
+      await Bun.write(`dist/${key}/bin/RELEASE_NOTES.md`, releaseNotes)
     }
+    const releaseName = key.replace(pkg.name, `${cliName}-${releaseTag}`)
+    const archive = key.includes("linux") ? `${releaseName}.tar.gz` : `${releaseName}.zip`
+    if (key.includes("linux")) {
+      await $`tar -czf ../../${archive} *`.cwd(`dist/${key}/bin`)
+    } else {
+      await $`zip -r ../../${archive} *`.cwd(`dist/${key}/bin`)
+    }
+    const hash = new Bun.CryptoHasher("sha256").update(await Bun.file(`./dist/${archive}`).arrayBuffer()).digest("hex")
+    await Bun.write(`./dist/${archive}.sha256`, hash + "\n")
   }
-  // Upload the CLI archives as a separate set of assets on the release the user cut.
-  // EMBERHARMONY_TAG is the actual release tag (stable v1.3.0 or a pre-release like
-  // v1.3.0-dev.1); fall back to the static version for local/manual runs. Bun's $
-  // escapes the interpolated tag as a single argument, so it is injection-safe.
-  const releaseTag = process.env.EMBERHARMONY_TAG || `v${Script.version}`
-  await $`gh release upload ${releaseTag} ./dist/*.zip ./dist/*.tar.gz ./dist/*.sha256 --clobber`
+  // The archives above are produced for distribution but are NOT uploaded from
+  // here: this build is not permitted to mutate GitHub. CI exposes them as
+  // workflow artifacts; attaching them to a release is a human step
+  // (the attach-assets job in publish.yml, authorized by a scoped PAT).
 }
 
 export { binaries }

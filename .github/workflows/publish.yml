@@ -1,10 +1,13 @@
 name: Publish
 run-name: ${{ github.event.release.tag_name }}
 
-# Publishing is driven solely by a published GitHub release. Cut a release with a
-# tag like v1.3.0; the release id and tag flow straight from the github.event
-# context into the build — no CI step parses or validates the version (the tag is
-# trusted), and nothing here commits, tags, or pushes.
+# Publishing is driven solely by a published GitHub release (a human cuts the
+# release and its tag from the GitHub UI — CI never creates tags or releases).
+# The default GITHUB_TOKEN stays read-only per enterprise policy. The single
+# repository write — attaching the built binaries to the human-created release —
+# is performed by the attach-assets job below using RELEASE_ASSETS_TOKEN, a
+# fine-grained PAT scoped to contents:write on this repository only. The npm
+# publish targets the external npm registry and uses NPM_TOKEN.
 on:
   release:
     types: [published]
@@ -12,23 +15,76 @@ on:
 concurrency: ${{ github.workflow }}-${{ github.ref }}
 
 permissions:
-  contents: write
+  contents: read
   actions: read
 
 jobs:
+  # A release targeting dev that is not marked as a pre-release would become
+  # GitHub's /releases/latest — the target of every stable curl install and
+  # update check — so a single missed checkbox would ship dev binaries to
+  # stable users. Refuse to build it.
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require dev-target releases to be pre-releases
+        env:
+          TARGET: ${{ github.event.release.target_commitish }}
+          PRERELEASE: ${{ github.event.release.prerelease }}
+        run: |
+          set -euo pipefail
+          if [ "$TARGET" = "dev" ] && [ "$PRERELEASE" != "true" ]; then
+            echo "::error::Release targets dev but is not marked as a pre-release. Delete the release, recreate it with the pre-release checkbox set, and try again."
+            exit 1
+          fi
+          echo "release target=$TARGET prerelease=$PRERELEASE — ok"
+
   build:
+    needs:
+      - validate
     uses: ./.github/workflows/_build.yml
     with:
       release: ${{ github.event.release.id }}
       tag: ${{ github.event.release.tag_name }}
+      # The branch the human picked as the release target in the GitHub UI.
+      # main → stable ("latest"), dev → dev channel; the build fails on
+      # anything else.
+      target: ${{ github.event.release.target_commitish }}
+      release-notes: ${{ github.event.release.body }}
       publish-name: "@thesolaceproject/emberharmony"
     secrets: inherit
 
-  # npm publish runs for STABLE releases only. A pre-release still builds and
-  # uploads CLI assets to the GitHub release via the build job above, but never
-  # touches npm.
+  # The one sanctioned repository write: attach the built archives to the release
+  # the human cut. Runs for stable releases AND pre-releases (a dev build still
+  # ships its binaries on the release page). Deliberately does not use the
+  # workflow's GITHUB_TOKEN — RELEASE_ASSETS_TOKEN is a fine-grained PAT with
+  # contents:write on this repo only. build.ts itself has no upload capability,
+  # so compromising the build cannot publish anything.
+  attach-assets:
+    if: ${{ github.repository == 'SolaceHarmony/emberharmony' }}
+    needs:
+      - build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: emberharmony-cli
+          path: dist
+
+      - name: Attach archives to release
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_ASSETS_TOKEN }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          ls -la dist
+          gh release upload "$TAG" dist/*.tar.gz dist/*.zip dist/*.sha256 \
+            --clobber --repo "${{ github.repository }}"
+
+  # npm publish runs ONLY for stable releases targeting main. A dev-target or
+  # pre-release build still ships binaries to the release page via
+  # attach-assets, but never touches npm.
   publish:
-    if: ${{ github.repository == 'SolaceHarmony/emberharmony' && !github.event.release.prerelease }}
+    if: ${{ github.repository == 'SolaceHarmony/emberharmony' && !github.event.release.prerelease && github.event.release.target_commitish == 'main' }}
     needs:
       - build
     runs-on: ubuntu-latest
@@ -66,9 +122,9 @@ jobs:
       - run: ./script/publish.ts
         env:
           EMBERHARMONY_RELEASE: ${{ github.event.release.id }}
+          EMBERHARMONY_TARGET: ${{ github.event.release.target_commitish }}
           EMBERHARMONY_PUBLISH_NAME: "@thesolaceproject/emberharmony"
           EMBERHARMONY_PUBLISH_PLATFORMS: "1"
-          GITHUB_TOKEN: ${{ github.token }}
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           NPM_CONFIG_PROVENANCE: false
