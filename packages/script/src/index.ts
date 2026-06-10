@@ -35,11 +35,15 @@ const CHANNEL = await (async () => {
       `release builds require EMBERHARMONY_TARGET of "main" or "dev", got "${env.EMBERHARMONY_TARGET ?? "(unset)"}"`,
     )
   }
+  // Branch builds mirror the release mapping: main → "latest", dev → "dev".
+  // A dev-branch build is therefore IS_PREVIEW and gets a timestamped version,
+  // so CI verification artifacts can never impersonate a pinned release build
+  // (release builds bypass this via EMBERHARMONY_RELEASE above).
   const branch = await $`git branch --show-current`
     .text()
     .then((x) => x.trim())
     .catch(() => "")
-  return branch === "dev" || branch === "main" ? "latest" : branch || "preview"
+  return branch === "main" ? "latest" : branch || "preview"
 })()
 const IS_PREVIEW = CHANNEL !== "latest"
 
