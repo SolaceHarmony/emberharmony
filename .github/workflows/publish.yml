@@ -72,9 +72,10 @@ jobs:
 
       - uses: actions/download-artifact@v8
         with:
-          pattern: emberharmony-desktop_*
+          pattern: emberharmony-desktop-*
           path: desktop
           merge-multiple: true
+        continue-on-error: true
 
       - name: Attach archives to release
         env:
@@ -86,8 +87,8 @@ jobs:
           ls -la desktop || true
           gh release upload "$TAG" dist/*.tar.gz dist/*.zip dist/*.sha256 \
             --clobber --repo "${{ github.repository }}"
-          # Desktop bundles are uploaded by tauri-action when release inputs are set,
-          # but we also upload any workflow artifacts as a fallback.
+          # Desktop bundles come from the tauri-action workflow artifacts
+          # (named emberharmony-desktop-* per workflowArtifactNamePattern).
           if ls desktop/*.* 2>/dev/null; then
             gh release upload "$TAG" desktop/*.* \
               --clobber --repo "${{ github.repository }}"
