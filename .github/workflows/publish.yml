@@ -94,6 +94,20 @@ jobs:
           merge-multiple: true
         continue-on-error: true
 
+      - name: Rename desktop bundles for consistent download URLs
+        run: |
+          cd desktop 2>/dev/null || exit 0
+          # Tauri produces names like EmberHarmony_1.3.0_aarch64.dmg;
+          # the download page expects emberharmony-desktop-darwin-aarch64.dmg etc.
+          for f in EmberHarmony_*_aarch64.dmg;          do [ -f "$f" ] && mv "$f" "emberharmony-desktop-darwin-aarch64.dmg";       done
+          for f in EmberHarmony_*_x64-setup.exe;        do [ -f "$f" ] && mv "$f" "emberharmony-desktop-windows-x64.exe";          done
+          for f in EmberHarmony_*_amd64.deb;            do [ -f "$f" ] && mv "$f" "emberharmony-desktop-linux-amd64.deb";           done
+          for f in EmberHarmony_*_amd64.AppImage;      do [ -f "$f" ] && mv "$f" "emberharmony-desktop-linux-amd64.AppImage";      done
+          for f in EmberHarmony_*.x86_64.rpm;           do [ -f "$f" ] && mv "$f" "emberharmony-desktop-linux-x86_64.rpm";          done
+          for f in EmberHarmony_*_arm64.deb;            do [ -f "$f" ] && mv "$f" "emberharmony-desktop-linux-arm64.deb";           done
+          for f in EmberHarmony_*_arm64.AppImage;       do [ -f "$f" ] && mv "$f" "emberharmony-desktop-linux-arm64.AppImage";      done
+          for f in EmberHarmony_*.aarch64.rpm;          do [ -f "$f" ] && mv "$f" "emberharmony-desktop-linux-arm64.rpm";           done
+
       - name: Attach archives to release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -104,8 +118,6 @@ jobs:
           ls -la desktop 2>/dev/null || echo "No desktop artifacts found"
           gh release upload "$TAG" dist/*.tar.gz dist/*.zip dist/*.sha256 \
             --clobber --repo "${{ github.repository }}"
-          # Desktop bundles come from the tauri-action workflow artifacts
-          # (named emberharmony-desktop-* per workflowArtifactNamePattern).
           if ls desktop/*.* 2>/dev/null; then
             gh release upload "$TAG" desktop/*.* \
               --clobber --repo "${{ github.repository }}"
