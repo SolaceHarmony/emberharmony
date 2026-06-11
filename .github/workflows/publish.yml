@@ -15,7 +15,7 @@ on:
 concurrency: ${{ github.workflow }}-${{ github.ref }}
 
 permissions:
-  contents: read
+  contents: write
   actions: read
 
 jobs:
@@ -53,12 +53,9 @@ jobs:
       publish-name: "@thesolaceproject/emberharmony"
     secrets: inherit
 
-  # The sanctioned repository writes: attach the built archives (CLI + desktop)
-  # to the release the human cut. Runs for stable releases AND pre-releases
-  # (a dev build still ships its binaries on the release page). Deliberately
-  # does not use the workflow's GITHUB_TOKEN — RELEASE_ASSETS_TOKEN is a
-  # fine-grained PAT with contents:write on this repo only. build.ts itself
-  # has no upload capability, so compromising the build cannot publish anything.
+  # Attach built archives (CLI + desktop) to the release. Runs for stable
+  # releases AND pre-releases — a dev build still ships its binaries on the
+  # release page.
   attach-assets:
     if: ${{ github.repository == 'SolaceHarmony/emberharmony' }}
     needs:
@@ -79,7 +76,7 @@ jobs:
 
       - name: Attach archives to release
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_ASSETS_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.event.release.tag_name }}
         run: |
           set -euo pipefail
@@ -87,6 +84,8 @@ jobs:
           ls -la desktop 2>/dev/null || echo "No desktop artifacts found"
           gh release upload "$TAG" dist/*.tar.gz dist/*.zip dist/*.sha256 \
             --clobber --repo "${{ github.repository }}"
+          # Desktop bundles come from the tauri-action workflow artifacts
+          # (named emberharmony-desktop-* per workflowArtifactNamePattern).
           if ls desktop/*.* 2>/dev/null; then
             gh release upload "$TAG" desktop/*.* \
               --clobber --repo "${{ github.repository }}"
