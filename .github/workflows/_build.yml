@@ -85,63 +85,10 @@ jobs:
           - host: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
     runs-on: ${{ matrix.settings.host }}
-    env:
-      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-      APPLE_API_KEY_PATH: ${{ secrets.APPLE_API_KEY_PATH }}
-      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
     steps:
       - uses: actions/checkout@v6
         with:
           fetch-tags: true
-
-      - uses: apple-actions/import-codesign-certs@v7
-        if: ${{ runner.os == 'macOS' && env.APPLE_CERTIFICATE != '' && env.APPLE_CERTIFICATE_PASSWORD != '' }}
-        with:
-          keychain: build
-          p12-file-base64: ${{ secrets.APPLE_CERTIFICATE }}
-          p12-password: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-
-      - name: Verify Certificate
-        if: ${{ runner.os == 'macOS' && env.APPLE_CERTIFICATE != '' && env.APPLE_CERTIFICATE_PASSWORD != '' }}
-        run: |
-          set -euo pipefail
-
-          if [ -n "${APPLE_SIGNING_IDENTITY:-}" ]; then
-            echo "CERT_ID=$APPLE_SIGNING_IDENTITY" >> "$GITHUB_ENV"
-
-            TEAM_ID=$(echo "$APPLE_SIGNING_IDENTITY" | sed -n 's/.*(\([A-Z0-9]\{10\}\)).*/\1/p')
-            if [ -n "${TEAM_ID:-}" ]; then
-              echo "APPLE_TEAM_ID=$TEAM_ID" >> "$GITHUB_ENV"
-              echo "Using APPLE_TEAM_ID from signing identity: $TEAM_ID"
-            fi
-
-            echo "Using APPLE_SIGNING_IDENTITY override."
-            security find-identity -v -p codesigning build.keychain | cat
-            exit 0
-          fi
-
-          CERT_INFO=$(security find-identity -v -p codesigning build.keychain | grep "Developer ID Application" | head -n 1 || true)
-          if [ -z "$CERT_INFO" ]; then
-            echo "No 'Developer ID Application' identity found in build.keychain" >&2
-            security find-identity -v -p codesigning build.keychain | cat
-            exit 1
-          fi
-
-          CERT_ID=$(echo "$CERT_INFO" | awk -F'"' '{print $2}')
-          echo "CERT_ID=$CERT_ID" >> "$GITHUB_ENV"
-          echo "Certificate imported: $CERT_ID"
-
-          TEAM_ID=$(echo "$CERT_ID" | sed -n 's/.*(\([A-Z0-9]\{10\}\)).*/\1/p')
-          if [ -n "${TEAM_ID:-}" ]; then
-            echo "APPLE_TEAM_ID=$TEAM_ID" >> "$GITHUB_ENV"
-            echo "Detected APPLE_TEAM_ID from certificate: $TEAM_ID"
-          fi
-
-      - name: Setup Apple API Key
-        if: ${{ runner.os == 'macOS' && env.APPLE_API_KEY_PATH != '' }}
-        run: |
-          printf '%s' "${{ secrets.APPLE_API_KEY_PATH }}" > "$RUNNER_TEMP/apple-api-key.p8"
 
       - uses: ./.github/actions/setup-bun
 
@@ -197,14 +144,6 @@ jobs:
       - name: Build desktop app
         uses: tauri-apps/tauri-action@v0.6.2
         timeout-minutes: 60
-        if: ${{ runner.os != 'macOS' || (env.APPLE_CERTIFICATE != '' && env.APPLE_CERTIFICATE_PASSWORD != '') }}
-        with:
-          projectPath: packages/desktop
-          tauriScript: ${{ (contains(matrix.settings.host, 'ubuntu') && 'cargo tauri') || '' }}
-          args: --target ${{ matrix.settings.target }} --config ./src-tauri/tauri.prod.conf.json --verbose
-          updaterJsonPreferNsis: true
-          uploadWorkflowArtifacts: true
-          workflowArtifactNamePattern: emberharmony-desktop-[platform]-[arch]
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_BUNDLER_NEW_APPIMAGE_FORMAT: true
@@ -212,8 +151,21 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ env.CERT_ID }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
           APPLE_API_KEY_PATH: ${{ runner.temp }}/apple-api-key.p8
-          APPLE_TEAM_ID: ${{ env.APPLE_TEAM_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        with:
+          projectPath: packages/desktop
+          tauriScript: ${{ (contains(matrix.settings.host, 'ubuntu') && 'cargo tauri') || '' }}
+          args: --target ${{ matrix.settings.target }} --config ./src-tauri/tauri.prod.conf.json
+          updaterJsonPreferNsis: true
+
+      - name: Upload desktop artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: emberharmony-desktop-${{ matrix.settings.target }}
+          path: |
+            packages/desktop/src-tauri/target/release/bundle/**/*
+            packages/desktop/src-tauri/target/${{ matrix.settings.target }}/release/bundle/**/*
