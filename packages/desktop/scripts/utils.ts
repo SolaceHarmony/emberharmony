@@ -7,11 +7,6 @@ export const SIDECAR_BINARIES: Array<{ rustTarget: string; ocBinary: string; ass
     assetExt: "zip",
   },
   {
-    rustTarget: "x86_64-apple-darwin",
-    ocBinary: "emberharmony-darwin-x64",
-    assetExt: "zip",
-  },
-  {
     rustTarget: "x86_64-pc-windows-msvc",
     ocBinary: "emberharmony-windows-x64",
     assetExt: "zip",

@@ -66,7 +66,7 @@ function currentRustTarget(): string {
   if (envTarget) return envTarget
 
   const { platform, arch } = process
-  if (platform === "darwin") return arch === "arm64" ? "aarch64-apple-darwin" : "x86_64-apple-darwin"
+  if (platform === "darwin") return "aarch64-apple-darwin"
   if (platform === "linux") return arch === "arm64" ? "aarch64-unknown-linux-gnu" : "x86_64-unknown-linux-gnu"
   if (platform === "win32") return "x86_64-pc-windows-msvc"
   throw new Error(`Unsupported platform: ${platform}/${arch}`)

@@ -2,4 +2,4 @@
 # automatically when building inside src-tauri, so every machine builds with
 # the same compiler instead of whatever happens to be installed.
 [toolchain]
-channel = "1.93.0"
+channel = "1.96.0"
