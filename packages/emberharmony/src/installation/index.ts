@@ -211,21 +211,25 @@ export namespace Installation {
     }
 
     // GitHub-released binaries follow release tags verbatim. Dev-channel
-    // builds never appear in /releases/latest (dev-target releases are always
-    // prereleases), so they follow the newest prerelease targeting dev.
+    // builds never appear in /releases/latest (dev releases are always
+    // prereleases — enforced by the publish workflow's validate gate, which
+    // is also why prerelease status alone identifies the dev stream here:
+    // release.target_commitish is unreliable for releases cut from existing
+    // tags). Paginate: the newest dev prerelease may sit behind many stable
+    // releases in the listing.
     if (CHANNEL === "dev") {
-      return fetch("https://api.github.com/repos/SolaceHarmony/emberharmony/releases?per_page=30", {
-        headers: { "User-Agent": USER_AGENT },
-      })
-        .then((res) => {
-          if (!res.ok) throw new Error(res.statusText)
-          return res.json()
-        })
-        .then((data: any[]) => {
-          const release = data.find((item) => item.prerelease && !item.draft && item.target_commitish === "dev")
-          if (!release) throw new Error("no dev-target prerelease found on GitHub")
-          return release.tag_name as string
-        })
+      for (let page = 1; page <= 10; page++) {
+        const res = await fetch(
+          `https://api.github.com/repos/SolaceHarmony/emberharmony/releases?per_page=100&page=${page}`,
+          { headers: { "User-Agent": USER_AGENT } },
+        )
+        if (!res.ok) throw new Error(res.statusText)
+        const data = (await res.json()) as any[]
+        const release = data.find((item) => item.prerelease && !item.draft)
+        if (release) return release.tag_name as string
+        if (data.length < 100) break
+      }
+      throw new Error("no dev prerelease found on GitHub")
     }
 
     return fetch("https://api.github.com/repos/SolaceHarmony/emberharmony/releases/latest", {

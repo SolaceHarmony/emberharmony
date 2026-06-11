@@ -19,24 +19,44 @@ permissions:
   actions: read
 
 jobs:
-  # A release targeting dev that is not marked as a pre-release would become
-  # GitHub's /releases/latest — the target of every stable curl install and
-  # update check — so a single missed checkbox would ship dev binaries to
-  # stable users. Refuse to build it.
+  # The human-controlled pre-release checkbox IS the channel selector:
+  # pre-release → dev channel, stable → main channel. It cannot be derived
+  # from release.target_commitish (GitHub documents that field as unused when
+  # a release is cut from an existing tag — it then reports the default
+  # branch) nor from tag-commit ancestry alone (after a dev→main merge, dev
+  # commits are reachable from main too). The ancestry check below is the
+  # safety net for the checkbox: a stable release whose tag is not on main —
+  # e.g. someone cut a stable release from the dev tip — refuses to build,
+  # because it would become GitHub's /releases/latest, the target of every
+  # stable curl install and update check.
   validate:
     runs-on: ubuntu-latest
+    outputs:
+      channel: ${{ steps.channel.outputs.channel }}
     steps:
-      - name: Require dev-target releases to be pre-releases
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Derive channel from the pre-release flag; stable must come from main
+        id: channel
         env:
-          TARGET: ${{ github.event.release.target_commitish }}
+          TAG: ${{ github.event.release.tag_name }}
           PRERELEASE: ${{ github.event.release.prerelease }}
         run: |
           set -euo pipefail
-          if [ "$TARGET" = "dev" ] && [ "$PRERELEASE" != "true" ]; then
-            echo "::error::Release targets dev but is not marked as a pre-release. Delete the release, recreate it with the pre-release checkbox set, and try again."
-            exit 1
+          commit=$(git rev-list -n1 "refs/tags/$TAG")
+          if [ "$PRERELEASE" = "true" ]; then
+            channel=dev
+          else
+            channel=main
+            if ! git merge-base --is-ancestor "$commit" origin/main; then
+              echo "::error::Stable release $TAG ($commit) is not reachable from main. Stable releases must be cut from main; for a dev build, recreate the release with the pre-release checkbox set."
+              exit 1
+            fi
           fi
-          echo "release target=$TARGET prerelease=$PRERELEASE — ok"
+          echo "tag=$TAG commit=$commit channel=$channel prerelease=$PRERELEASE — ok"
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
 
   build:
     needs:
@@ -45,10 +65,10 @@ jobs:
     with:
       release: ${{ github.event.release.id }}
       tag: ${{ github.event.release.tag_name }}
-      # The branch the human picked as the release target in the GitHub UI.
-      # main → stable ("latest"), dev → dev channel; the build fails on
-      # anything else.
-      target: ${{ github.event.release.target_commitish }}
+      # The branch the tag's commit actually belongs to, resolved by the
+      # validate job (release.target_commitish is unreliable for releases cut
+      # from existing tags). main → stable ("latest"), dev → dev channel.
+      target: ${{ needs.validate.outputs.channel }}
       release-notes: ${{ github.event.release.body }}
       publish-name: "@thesolaceproject/emberharmony"
     secrets: inherit
@@ -91,13 +111,16 @@ jobs:
               --clobber --repo "${{ github.repository }}"
           fi
 
-  # npm publish runs ONLY for stable releases targeting main. A dev-target or
-  # pre-release build still ships binaries to the release page via
-  # attach-assets, but never touches npm.
+  # npm publish runs ONLY for stable main-channel releases, and only after the
+  # GitHub release assets are attached — an npm package must never point at a
+  # release whose binaries failed to upload. A dev or pre-release build still
+  # ships binaries to the release page via attach-assets, but never touches npm.
   publish:
-    if: ${{ github.repository == 'SolaceHarmony/emberharmony' && !github.event.release.prerelease && github.event.release.target_commitish == 'main' }}
+    if: ${{ github.repository == 'SolaceHarmony/emberharmony' && !github.event.release.prerelease && needs.validate.outputs.channel == 'main' }}
     needs:
+      - validate
       - build
+      - attach-assets
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -133,7 +156,7 @@ jobs:
       - run: ./script/publish.ts
         env:
           EMBERHARMONY_RELEASE: ${{ github.event.release.id }}
-          EMBERHARMONY_TARGET: ${{ github.event.release.target_commitish }}
+          EMBERHARMONY_TARGET: ${{ needs.validate.outputs.channel }}
           EMBERHARMONY_PUBLISH_NAME: "@thesolaceproject/emberharmony"
           EMBERHARMONY_PUBLISH_PLATFORMS: "1"
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
