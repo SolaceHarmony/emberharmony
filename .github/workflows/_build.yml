@@ -143,7 +143,7 @@ jobs:
 
       - name: Write Apple API key
         if: runner.os == 'macOS'
-        run: echo "${APPLE_API_KEY}" | base64 --decode > "${APPLE_API_KEY_PATH}"
+        run: printf '%s' "$APPLE_API_KEY" > "$APPLE_API_KEY_PATH"
         env:
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
           APPLE_API_KEY_PATH: ${{ runner.temp }}/apple-api-key.p8
