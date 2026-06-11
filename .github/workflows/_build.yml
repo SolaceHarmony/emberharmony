@@ -194,20 +194,6 @@ jobs:
           echo "Installed tauri-cli version:"
           cargo tauri --version
 
-      - name: Export Apple ID notarization credentials
-        if: ${{ runner.os == 'macOS' }}
-        run: |
-          APPLE_ID="${{ secrets.APPLE_ID }}"
-          APPLE_PASSWORD="${{ secrets.APPLE_PASSWORD }}"
-
-          if [ -z "${APPLE_ID:-}" ] || [ -z "${APPLE_PASSWORD:-}" ]; then
-            echo "Apple ID notarization not configured; using App Store Connect API key."
-            exit 0
-          fi
-
-          echo "APPLE_ID=$APPLE_ID" >> "$GITHUB_ENV"
-          echo "APPLE_PASSWORD=$APPLE_PASSWORD" >> "$GITHUB_ENV"
-
       - name: Build desktop app
         uses: tauri-apps/tauri-action@v0.6.2
         timeout-minutes: 60
