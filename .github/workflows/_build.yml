@@ -143,9 +143,10 @@ jobs:
 
       - name: Write Apple API key
         if: runner.os == 'macOS'
-        run: printf '%s' "$APPLE_API_KEY" > "$APPLE_API_KEY_PATH"
+        shell: bash
+        run: printf '%s' "$APPLE_API_KEY_CONTENT" > "$APPLE_API_KEY_PATH"
         env:
-          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY_PATH }}
           APPLE_API_KEY_PATH: ${{ runner.temp }}/apple-api-key.p8
 
       - name: Build desktop app
