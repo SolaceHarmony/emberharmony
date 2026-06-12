@@ -93,11 +93,16 @@ export const RunCommand = cmd({
       })
   },
   handler: async (args) => {
-    // Reassemble argv into the prompt / command-arguments string. This is
-    // natural-language text, not a shell command, so it must stay verbatim —
-    // quoting and escaping here would corrupt real content (e.g. Windows
-    // paths) with no downstream unescape.
-    let message = [...args.message, ...(args["--"] || [])].join(" ")
+    // Reassemble argv into the prompt / command-arguments string. Multi-word
+    // args are wrapped in quotes so the command parser's argsRegex keeps them
+    // as a single $N placeholder (it strips the quotes again via
+    // quoteTrimRegex). Deliberately no character escaping: this value is
+    // reparsed into prompt templates, never handed to a shell, and the parser
+    // does not unescape — escaping backslashes would corrupt content like
+    // Windows paths.
+    let message = [...args.message, ...(args["--"] || [])]
+      .map((arg) => (arg.includes(" ") ? `"${arg}"` : arg))
+      .join(" ")
 
     const fileParts: any[] = []
     if (args.file) {
