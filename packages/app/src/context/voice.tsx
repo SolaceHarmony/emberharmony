@@ -16,6 +16,13 @@ export type VoiceState = "disconnected" | "connecting" | "connected" | "error"
 export type MicState = "muted" | "unmuted" | "unavailable"
 export type { AgentState } from "@thesolaceproject/livekit-components-solid"
 
+// Voice intent that survives provider remounts (project switches unmount the
+// whole directory-scoped provider tree) within a single app run. Deliberately
+// not persisted: the microphone must never auto-enable on a fresh launch.
+// Cleared only by an explicit user disconnect.
+let followProjects = false
+let followModel: { providerID: string; modelID: string } | undefined
+
 const { use: useVoice, provider: VoiceValueProvider } = createSimpleContext({
   name: "Voice",
   init: (props: { room: Room }) => {
@@ -24,9 +31,6 @@ const { use: useVoice, provider: VoiceValueProvider } = createSimpleContext({
     const params = useParams()
     const [error, setError] = createSignal<string | undefined>(undefined)
     const [connecting, setConnecting] = createSignal(false)
-    // remembered for session-follow reconnects; only used as a fallback when
-    // the target session has no message history to inherit a model from
-    const [lastModel, setLastModel] = createSignal<{ providerID: string; modelID: string } | undefined>(undefined)
 
     // the provider outlives session navigation; a connected room bridges into
     // the session it was started for, so leaving that session must hang up —
@@ -37,13 +41,20 @@ const { use: useVoice, provider: VoiceValueProvider } = createSimpleContext({
       on(
         () => params.id,
         (id, prev) => {
-          if (prev === undefined) return
+          if (prev === undefined) {
+            // first session opened after a (re)mount — resume if voice was
+            // active before a project switch
+            if (followProjects && id && state() === "disconnected" && !connecting()) {
+              connect(id, followModel).catch(() => {})
+            }
+            return
+          }
           const wasActive = state() === "connected" || connecting()
           const generation = ++followGeneration
           void room.disconnect().then(() => {
             if (!wasActive || !id) return
             if (generation !== followGeneration) return
-            connect(id, lastModel()).catch(() => {})
+            connect(id, followModel).catch(() => {})
           })
         },
         { defer: true },
@@ -107,7 +118,8 @@ const { use: useVoice, provider: VoiceValueProvider } = createSimpleContext({
       if (state() === "connecting" || state() === "connected") return
       setError(undefined)
       setConnecting(true)
-      if (model) setLastModel(model)
+      followProjects = true
+      if (model) followModel = model
       try {
         const grant = await sdk.client.voice.token({ sessionID, model }).then((x) => x.data)
         if (!grant) throw new Error("voice token request failed")
@@ -135,6 +147,7 @@ const { use: useVoice, provider: VoiceValueProvider } = createSimpleContext({
     }
 
     async function disconnect() {
+      followProjects = false
       setError(undefined)
       await room.disconnect()
     }
@@ -147,6 +160,11 @@ const { use: useVoice, provider: VoiceValueProvider } = createSimpleContext({
     onCleanup(() => {
       room.disconnect()
     })
+
+    // resume voice after a project switch remounted the provider
+    if (followProjects && params.id) {
+      void connect(params.id, followModel).catch(() => {})
+    }
 
     return {
       room,
