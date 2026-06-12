@@ -32,6 +32,7 @@
     "@tauri-apps/plugin-updater": "~2",
     "@tauri-apps/plugin-http": "~2",
     "@tauri-apps/plugin-window-state": "~2",
+    "livekit-client": "catalog:",
     "solid-js": "catalog:"
   },
   "devDependencies": {

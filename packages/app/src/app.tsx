@@ -18,6 +18,7 @@ import { normalizeServerUrl, ServerProvider, useServer } from "@/context/server"
 import { SettingsProvider } from "@/context/settings"
 import { TerminalProvider } from "@/context/terminal"
 import { PromptProvider } from "@/context/prompt"
+import { VoiceProvider } from "@/context/voice"
 import { FileProvider } from "@/context/file"
 import { CommentsProvider } from "@/context/comments"
 import { NotificationProvider } from "@/context/notification"
@@ -146,11 +147,13 @@ export function AppInterface(props: { defaultUrl?: string }) {
                       <TerminalProvider>
                         <FileProvider>
                           <PromptProvider>
-                            <CommentsProvider>
-                              <Suspense fallback={<Loading />}>
-                                <Session />
-                              </Suspense>
-                            </CommentsProvider>
+                            <VoiceProvider>
+                              <CommentsProvider>
+                                <Suspense fallback={<Loading />}>
+                                  <Session />
+                                </Suspense>
+                              </CommentsProvider>
+                            </VoiceProvider>
                           </PromptProvider>
                         </FileProvider>
                       </TerminalProvider>

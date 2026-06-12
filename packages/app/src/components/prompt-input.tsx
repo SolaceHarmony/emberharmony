@@ -55,6 +55,8 @@ import { Worktree as WorktreeState } from "@/utils/worktree"
 import { SessionContextUsage } from "@/components/session-context-usage"
 import { usePermission } from "@/context/permission"
 import { useLanguage } from "@/context/language"
+import { useVoice } from "@/context/voice"
+import { BarVisualizer } from "@thesolaceproject/livekit-components-solid"
 import { useGlobalSync } from "@/context/global-sync"
 import { usePlatform } from "@/context/platform"
 import { createEmberHarmonyClient, type Message, type Part } from "@thesolaceproject/emberharmony-sdk/v2/client"
@@ -135,6 +137,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
   const command = useCommand()
   const permission = usePermission()
   const language = useLanguage()
+  const voice = useVoice()
   let editorRef!: HTMLDivElement
   let fileInputRef!: HTMLInputElement
   let scrollRef!: HTMLDivElement
@@ -2045,6 +2048,64 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
             />
             <div class="flex items-center gap-1.5 mr-1.5">
               <SessionContextUsage />
+              <Show when={voice.state() === "connected"}>
+                <BarVisualizer
+                  state={voice.agentState()}
+                  track={voice.agentAudioTrack()}
+                  barCount={5}
+                  options={{ minHeight: 15 }}
+                  aria-label={language.t("voice.connected")}
+                />
+              </Show>
+              <Show when={store.mode === "normal" && voice.available() && params.id}>
+                <Tooltip
+                  placement="top"
+                  value={
+                    voice.state() === "connecting"
+                      ? language.t("voice.connecting")
+                      : voice.state() === "connected"
+                        ? language.t("voice.disconnect")
+                        : language.t("voice.toggle")
+                  }
+                >
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="small"
+                    class="px-1"
+                    disabled={voice.state() === "connecting"}
+                    onClick={() => {
+                      if (voice.state() === "connected") {
+                        voice.disconnect()
+                        return
+                      }
+                      const currentModel = local.model.current()
+                      voice
+                        .connect(
+                          params.id!,
+                          currentModel ? { providerID: currentModel.provider.id, modelID: currentModel.id } : undefined,
+                        )
+                        .catch((err) => {
+                          showToast({
+                            title: language.t("voice.toast.connectFailed.title"),
+                            description: err instanceof Error ? err.message : String(err),
+                          })
+                        })
+                    }}
+                    aria-label={language.t("voice.toggle")}
+                    aria-pressed={voice.state() === "connected"}
+                  >
+                    <Icon
+                      name="microphone"
+                      classList={{
+                        "size-6": true,
+                        "text-icon-base": voice.state() !== "connected",
+                        "text-icon-success-base": voice.state() === "connected",
+                      }}
+                    />
+                  </Button>
+                </Tooltip>
+              </Show>
               <Show when={store.mode === "normal"}>
                 <Tooltip placement="top" value={language.t("prompt.action.attachFile")}>
                   <Button

@@ -163,6 +163,13 @@ import type {
   TuiShowToastResponses,
   TuiSubmitPromptResponses,
   VcsGetResponses,
+  VoiceConfig,
+  VoiceConfigResponses,
+  VoiceConfigUpdateErrors,
+  VoiceConfigUpdateResponses,
+  VoiceStatusResponses,
+  VoiceTokenErrors,
+  VoiceTokenResponses,
   WorktreeCreateErrors,
   WorktreeCreateInput,
   WorktreeCreateResponses,
@@ -2948,6 +2955,123 @@ export class Tui extends HeyApiClient {
   }
 }
 
+export class Voice extends HeyApiClient {
+  /**
+   * Get voice status
+   *
+   * Check whether LiveKit voice is configured on this server.
+   */
+  public status<ThrowOnError extends boolean = false>(
+    parameters?: {
+      directory?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams([parameters], [{ args: [{ in: "query", key: "directory" }] }])
+    return (options?.client ?? this.client).get<VoiceStatusResponses, unknown, ThrowOnError>({
+      url: "/voice/status",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Get voice configuration
+   *
+   * Effective voice settings, the registry of supported STT/TTS integrations, and which credentials are stored (never the secrets themselves).
+   */
+  public config<ThrowOnError extends boolean = false>(
+    parameters?: {
+      directory?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams([parameters], [{ args: [{ in: "query", key: "directory" }] }])
+    return (options?.client ?? this.client).get<VoiceConfigResponses, unknown, ThrowOnError>({
+      url: "/voice/config",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Update voice configuration
+   *
+   * Update voice settings in the global config. LiveKit credentials are stored separately via the auth API (PUT /auth/livekit).
+   */
+  public configUpdate<ThrowOnError extends boolean = false>(
+    parameters?: {
+      directory?: string
+      voiceConfig?: VoiceConfig
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { key: "voiceConfig", map: "body" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).patch<VoiceConfigUpdateResponses, VoiceConfigUpdateErrors, ThrowOnError>({
+      url: "/voice/config",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Create voice token
+   *
+   * Generate a LiveKit access token for a voice session.
+   */
+  public token<ThrowOnError extends boolean = false>(
+    parameters?: {
+      directory?: string
+      sessionID?: string
+      agentName?: string
+      model?: {
+        providerID: string
+        modelID: string
+      }
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "body", key: "sessionID" },
+            { in: "body", key: "agentName" },
+            { in: "body", key: "model" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<VoiceTokenResponses, VoiceTokenErrors, ThrowOnError>({
+      url: "/voice/token",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+}
+
 export class Instance extends HeyApiClient {
   /**
    * Dispose instance
@@ -3269,6 +3393,11 @@ export class EmberHarmonyClient extends HeyApiClient {
   private _tui?: Tui
   get tui(): Tui {
     return (this._tui ??= new Tui({ client: this.client }))
+  }
+
+  private _voice?: Voice
+  get voice(): Voice {
+    return (this._voice ??= new Voice({ client: this.client }))
   }
 
   private _instance?: Instance
