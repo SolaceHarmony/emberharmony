@@ -93,11 +93,11 @@ export const RunCommand = cmd({
       })
   },
   handler: async (args) => {
-    let message = [...args.message, ...(args["--"] || [])]
-      // escape backslashes before quotes so a trailing "\" can't escape the
-      // closing quote when re-joining args that contain spaces
-      .map((arg) => (arg.includes(" ") ? `"${arg.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"` : arg))
-      .join(" ")
+    // Reassemble argv into the prompt / command-arguments string. This is
+    // natural-language text, not a shell command, so it must stay verbatim —
+    // quoting and escaping here would corrupt real content (e.g. Windows
+    // paths) with no downstream unescape.
+    let message = [...args.message, ...(args["--"] || [])].join(" ")
 
     const fileParts: any[] = []
     if (args.file) {
