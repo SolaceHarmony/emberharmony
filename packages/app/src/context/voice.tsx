@@ -24,15 +24,27 @@ const { use: useVoice, provider: VoiceValueProvider } = createSimpleContext({
     const params = useParams()
     const [error, setError] = createSignal<string | undefined>(undefined)
     const [connecting, setConnecting] = createSignal(false)
+    // remembered for session-follow reconnects; only used as a fallback when
+    // the target session has no message history to inherit a model from
+    const [lastModel, setLastModel] = createSignal<{ providerID: string; modelID: string } | undefined>(undefined)
 
     // the provider outlives session navigation; a connected room bridges into
-    // the session it was started for, so leaving that session must hang up
+    // the session it was started for, so leaving that session must hang up —
+    // and when voice was active, follow the user into the new session's room
+    // (each session has its own room and agent, keyed by session id)
+    let followGeneration = 0
     createEffect(
       on(
         () => params.id,
-        (_id, prev) => {
+        (id, prev) => {
           if (prev === undefined) return
-          room.disconnect()
+          const wasActive = state() === "connected" || connecting()
+          const generation = ++followGeneration
+          void room.disconnect().then(() => {
+            if (!wasActive || !id) return
+            if (generation !== followGeneration) return
+            connect(id, lastModel()).catch(() => {})
+          })
         },
         { defer: true },
       ),
@@ -95,6 +107,7 @@ const { use: useVoice, provider: VoiceValueProvider } = createSimpleContext({
       if (state() === "connecting" || state() === "connected") return
       setError(undefined)
       setConnecting(true)
+      if (model) setLastModel(model)
       try {
         const grant = await sdk.client.voice.token({ sessionID, model }).then((x) => x.data)
         if (!grant) throw new Error("voice token request failed")

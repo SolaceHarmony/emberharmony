@@ -715,3 +715,8 @@ EMBERHARMONY_VOICE_TTS_VOICE=9626c31c-bec5-4cca-baa8-f8ba9e84c8bc
 | Desktop deps | `packages/desktop/package.json` |
 | Server deps | `packages/emberharmony/package.json` |
 | Server startup | `packages/emberharmony/src/cli/cmd/serve.ts` |
+## Status (2026-06-12, night): voice follows session switches
+
+Navigating between sessions while voice is active now hangs up the old session's room and automatically reconnects into the new session's room (rooms and agents are keyed per session id, so the bridge context always matches the visible session). The model last used to connect is remembered as the fallback for sessions with no history. Switching to a not-yet-created session ("new") disconnects without following — the mic button appears once the session exists. Cross-project navigation unmounts the provider entirely and stays disconnected; reconnect manually. Teardown takes a few seconds, so the macOS recording indicator lingers briefly after a switch.
+
+Follow-up worth doing: let the mic button create the session on a "new" session route (like the prompt input does on submit), so voice can start a session hands-free from the very first word.
