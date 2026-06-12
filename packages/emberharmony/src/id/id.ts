@@ -44,10 +44,16 @@ export namespace Identifier {
 
   function randomBase62(length: number): string {
     const chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+    // Rejection sampling: 256 is not a multiple of 62, so `byte % 62` biases
+    // toward the first 256 % 62 = 8 characters. Discard bytes in the biased
+    // tail (>= 248, the largest multiple of 62 that fits) so every character
+    // is equally likely.
+    const limit = 256 - (256 % 62) // 248
     let result = ""
-    const bytes = randomBytes(length)
-    for (let i = 0; i < length; i++) {
-      result += chars[bytes[i] % 62]
+    while (result.length < length) {
+      for (const byte of randomBytes(length - result.length)) {
+        if (byte < limit) result += chars[byte % 62]
+      }
     }
     return result
   }

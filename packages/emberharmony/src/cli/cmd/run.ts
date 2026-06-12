@@ -94,7 +94,9 @@ export const RunCommand = cmd({
   },
   handler: async (args) => {
     let message = [...args.message, ...(args["--"] || [])]
-      .map((arg) => (arg.includes(" ") ? `"${arg.replace(/"/g, '\\"')}"` : arg))
+      // escape backslashes before quotes so a trailing "\" can't escape the
+      // closing quote when re-joining args that contain spaces
+      .map((arg) => (arg.includes(" ") ? `"${arg.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"` : arg))
       .join(" ")
 
     const fileParts: any[] = []
