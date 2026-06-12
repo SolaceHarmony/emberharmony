@@ -116,7 +116,7 @@ Settings → **Voice** panel (desktop-first):
 
 Verified sandboxed (XDG_CONFIG_HOME/XDG_DATA_HOME redirected, zero env vars): fresh server reports unavailable → URL via PATCH + credentials via auth → status available, token mints, `voice` section lands in the global `emberharmony.jsonc` and secrets in `auth.json` (0600) → serve spawns the worker, it registers with LiveKit Cloud, and shuts down cleanly on SIGTERM.
 
-Remaining for this plan: tier 2 (BYO-key plugin providers), bundling the agent into the compiled CLI so worker spawn works outside source checkouts.
+Remaining for this plan: tier 2 (BYO-key plugin providers), bundling the agent into the compiled CLI so worker spawn works outside source checkouts, and desktop CSP for self-hosted LiveKit servers (connect-src currently allowlists `*.livekit.cloud` + localhost only — a saved self-hosted URL is blocked by the webview until the CSP becomes config-driven).
 
 ## Status (2026-06-12, evening): desktop round-trip verified live + plan/build voice workflow
 
@@ -125,7 +125,7 @@ Full hands-free round-trip confirmed by a human on the desktop app: spoken quest
 - **WKWebView audio unlock**: audio elements played silently (healthy srcObject, not paused, volume 1 — inaudible) until an `AudioContext` was created. `connect()` now resumes an AudioContext inside the click gesture and no longer swallows `startAudio()` failures; an `AudioPlaybackStatusChanged` handler retries if playback gets blocked later.
 - **Worker env**: LiveKit Inference STT/TTS read the standard `LIVEKIT_*` env names — the serve spawn now injects both naming schemes. (Symptom: agent entry died with "apiKey is required", so the agent joined but never spoke.)
 - **Interruption pile-up**: interrupting the agent left the server session generating; the next voice turn was rejected as busy and the LLM stream waited forever ("job is unresponsive"). The bridge now POSTs `/session/:id/abort` when its stream is aborted, and a staleness watchdog (server heartbeats guarantee wakeups) errors out instead of hanging.
-- **Reconnect dispatch**: token `roomConfig` agent dispatch only fires at room creation; reconnecting into a lingering room summons no agent. Workaround verified via explicit `AgentDispatchClient.createDispatch`; the durable fix (token route explicitly dispatching when the room exists without an agent) is still TODO.
+- **Reconnect dispatch**: token `roomConfig` agent dispatch only fires at room creation; reconnecting into a lingering room summons no agent. Fixed durably after PR review: the token route now checks the room via `RoomServiceClient` and explicitly dispatches via `AgentDispatchClient` when the room exists without an agent participant. Live-verified: agent present on first join and on immediate reconnect.
 - **Tauri CSP**: added `ipc: http://ipc.localhost` to connect-src (plugin IPC was falling back to postMessage).
 - **Settings toggle race**: the Voice switch mounted during config load reads "off"; clicking it then persisted `disabled: true`. The switch now renders only after config loads.
 

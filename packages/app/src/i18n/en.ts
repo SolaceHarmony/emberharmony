@@ -257,6 +257,7 @@ export const dict = {
   "settings.voice.toast.testOk": "Voice is configured",
   "settings.voice.toast.testFailed": "Voice connection test failed",
   "settings.voice.toast.testUnavailable": "Server reports voice as unavailable — check URL and credentials",
+  "settings.voice.toast.credentialsIncomplete": "Enter both the API key and the API secret to save credentials",
   "settings.voice.hint.credentials": "Enter your LiveKit server URL, API key, and secret to enable voice mode.",
 
   "prompt.toast.pasteUnsupported.title": "Unsupported paste",

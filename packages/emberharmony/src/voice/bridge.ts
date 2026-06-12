@@ -60,7 +60,9 @@ async function* serverEvents(opts: SessionBridgeOptions, signal: AbortSignal): A
         buffer = buffer.slice(boundary + 2)
         for (const line of chunk.split("\n")) {
           if (!line.startsWith("data:")) continue
-          yield JSON.parse(line.slice(5).trim())
+          const data = line.slice(5).trim()
+          if (!data) continue
+          yield JSON.parse(data)
         }
       }
     }
@@ -190,7 +192,10 @@ export class SessionLLMStream extends llm.LLMStream {
       signal,
     })
     if (!response.ok) return this.#opts.fallbackModel
-    const messages: Array<{ info: { role: string; providerID?: string; modelID?: string } }> = await response.json()
+    const messages: Array<{ info: { role: string; providerID?: string; modelID?: string } }> | null = await response
+      .json()
+      .catch(() => null)
+    if (!Array.isArray(messages)) return this.#opts.fallbackModel
     for (let i = messages.length - 1; i >= 0; i--) {
       const info = messages[i]!.info
       if (info.role === "assistant" && info.providerID && info.modelID) {

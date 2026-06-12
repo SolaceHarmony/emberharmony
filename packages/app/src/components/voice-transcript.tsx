@@ -19,7 +19,7 @@ export function VoiceTranscript() {
     const stream = streams[streams.length - 1]
     if (!stream.text.trim()) return undefined
     return {
-      agent: stream.participantInfo.identity.startsWith("agent"),
+      agent: stream.participantInfo?.identity?.startsWith("agent") ?? false,
       text: stream.text,
     }
   })

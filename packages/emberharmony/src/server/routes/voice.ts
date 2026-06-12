@@ -173,19 +173,22 @@ export const VoiceRoutes = lazy(() =>
       async (c) => {
         const body = c.req.valid("json")
         const roomName = `emberharmony_${body.sessionID}`
+        const agentName = body.agentName ?? Voice.AGENT_NAME
+        // the agent worker uses this to bridge the voice conversation into
+        // the EmberHarmony session (same tools, permissions, and context)
+        const agentMetadata = JSON.stringify({
+          sessionID: body.sessionID,
+          directory: Instance.directory,
+          serverUrl: new URL(c.req.url).origin,
+          model: body.model,
+        })
         const result = await Voice.token({
           roomName,
           identity: `user_${body.sessionID}`,
-          agentName: body.agentName ?? Voice.AGENT_NAME,
-          // the agent worker uses this to bridge the voice conversation into
-          // the EmberHarmony session (same tools, permissions, and context)
-          agentMetadata: JSON.stringify({
-            sessionID: body.sessionID,
-            directory: Instance.directory,
-            serverUrl: new URL(c.req.url).origin,
-            model: body.model,
-          }),
+          agentName,
+          agentMetadata,
         })
+        await Voice.ensureAgentDispatched({ roomName, agentName, metadata: agentMetadata })
         return c.json({ token: result.token, url: result.url, roomName })
       },
     ),

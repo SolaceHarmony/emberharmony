@@ -47,7 +47,9 @@ export class VoiceWorkflow {
       for await (const chunk of stream) {
         verdict += chunk.delta?.content ?? ""
       }
-      if (/\bBUILD\b/i.test(verdict)) this.#mode = "build"
+      // exact match only — a rambling verdict like "PLAN, not BUILD" must
+      // never grant execution
+      if (verdict.trim().toUpperCase() === "BUILD") this.#mode = "build"
       log().info(`voice workflow: ${this.#mode} turn (intent: ${verdict.trim() || "<empty>"})`)
     } catch (error) {
       // classification failure must never grant execution — stay in plan

@@ -40,18 +40,30 @@ export const SettingsVoice: Component = () => {
   }
 
   async function saveConnection() {
+    const key = apiKey().trim()
+    const secret = apiSecret().trim()
+    if ((key && !secret) || (!key && secret)) {
+      showToast({
+        title: language.t("settings.voice.toast.saveFailed"),
+        description: language.t("settings.voice.toast.credentialsIncomplete"),
+      })
+      return
+    }
     setSaving(true)
     try {
       if (url() !== undefined && url() !== config()?.url) {
         await globalSDK.client.voice.configUpdate({ voiceConfig: { livekit: { url: url() } } })
       }
-      if (apiKey().trim() && apiSecret().trim()) {
+      if (key && secret) {
         await globalSDK.client.auth.set({
           providerID: "livekit",
-          auth: { type: "api", key: apiKey().trim(), secret: apiSecret().trim() },
+          auth: { type: "api", key, secret },
         })
         setApiKey("")
         setApiSecret("")
+        // the auth route only stores credentials; an empty voice config patch
+        // nudges serve to (re)start the agent worker with them
+        await globalSDK.client.voice.configUpdate({ voiceConfig: {} })
       }
       await refetch()
       showToast({ title: language.t("settings.voice.toast.saved") })

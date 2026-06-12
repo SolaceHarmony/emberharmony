@@ -1,5 +1,6 @@
 import { createSimpleContext } from "@thesolaceproject/emberharmony-ui/context"
-import { createResource, createSignal, onCleanup, type ParentProps } from "solid-js"
+import { createEffect, createResource, createSignal, on, onCleanup, type ParentProps } from "solid-js"
+import { useParams } from "@solidjs/router"
 import { ConnectionState, Room, RoomEvent } from "livekit-client"
 import {
   RoomContext,
@@ -20,8 +21,22 @@ const { use: useVoice, provider: VoiceValueProvider } = createSimpleContext({
   init: (props: { room: Room }) => {
     const room = props.room
     const sdk = useSDK()
+    const params = useParams()
     const [error, setError] = createSignal<string | undefined>(undefined)
     const [connecting, setConnecting] = createSignal(false)
+
+    // the provider outlives session navigation; a connected room bridges into
+    // the session it was started for, so leaving that session must hang up
+    createEffect(
+      on(
+        () => params.id,
+        (_id, prev) => {
+          if (prev === undefined) return
+          room.disconnect()
+        },
+        { defer: true },
+      ),
+    )
 
     const connectionState = useConnectionState(room)
     const local = useLocalParticipant(room)
@@ -39,7 +54,7 @@ const { use: useVoice, provider: VoiceValueProvider } = createSimpleContext({
         .catch((err) => setError(err instanceof Error ? err.message : String(err)))
     })
 
-    const [status] = createResource(
+    const [status, { refetch: refetchStatus }] = createResource(
       () => sdk.client,
       (client) =>
         client.voice
@@ -48,6 +63,13 @@ const { use: useVoice, provider: VoiceValueProvider } = createSimpleContext({
           .catch(() => undefined),
     )
     const available = () => status()?.available === true
+
+    // voice can be configured in settings while a session is open; poll until
+    // available so the mic button appears without a reload
+    const statusPoll = setInterval(() => {
+      if (!available()) refetchStatus()
+    }, 30_000)
+    onCleanup(() => clearInterval(statusPoll))
 
     const state = (): VoiceState => {
       if (error()) return "error"
@@ -81,12 +103,17 @@ const { use: useVoice, provider: VoiceValueProvider } = createSimpleContext({
         // gesture activates it (observed: audio elements were healthy but
         // inaudible until an AudioContext was created)
         const unlock = new AudioContext()
-        await unlock.resume().catch(() => {})
-        await room.connect(grant.url, grant.token)
-        await room.startAudio()
-        await unlock.close().catch(() => {})
+        try {
+          await unlock.resume().catch(() => {})
+          await room.connect(grant.url, grant.token)
+          await room.startAudio()
+        } finally {
+          await unlock.close().catch(() => {})
+        }
         await room.localParticipant.setMicrophoneEnabled(true)
       } catch (err) {
+        // unwind a partially joined room so a retry starts from clean state
+        await room.disconnect().catch(() => {})
         setError(err instanceof Error ? err.message : String(err))
         throw err
       } finally {

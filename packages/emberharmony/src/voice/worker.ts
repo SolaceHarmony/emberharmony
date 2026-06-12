@@ -19,6 +19,7 @@ export namespace VoiceWorker {
   let lastServerUrl: string | undefined
 
   export async function start(serverUrl: string, override?: Config.Voice): Promise<boolean> {
+    stop()
     lastServerUrl = serverUrl
     const settings = await Voice.settings(override)
     if (!settings.available) {
