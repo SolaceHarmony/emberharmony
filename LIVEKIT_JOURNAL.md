@@ -1,5 +1,148 @@
 # LiveKit Voice Integration Journal
 
+## Status (2026-06-12): Phase 1 implemented
+
+Everything in the Phase 1 critical path below is built and typechecks. What exists now:
+
+- **Deps**: `livekit-client` (app, desktop), `livekit-server-sdk` + `@livekit/protocol` + `@livekit/agents` stack (emberharmony) in the workspace catalog.
+- **Server**: `Flag.EMBERHARMONY_LIVEKIT_URL/API_KEY/API_SECRET` (each falls back to the standard `LIVEKIT_*` env var names, so a stock LiveKit `.env` works as-is); voice is available whenever credentials are configured, with `EMBERHARMONY_VOICE_DISABLE=true` as the kill switch (opt-out instead of the originally planned `EMBERHARMONY_VOICE_ENABLED` opt-in, matching the codebase's `DISABLE_*` flag convention); token util at `packages/emberharmony/src/voice/token.ts`; routes at `packages/emberharmony/src/server/routes/voice.ts` (`GET /voice/status`, `POST /voice/token`), registered in `server.ts`; server CSP updated. Verified by curl: status reports availability, token returns a JWT with room grant + `emberharmony-voice` agent dispatch, and the unconfigured path returns `VoiceNotConfiguredError`.
+- **SDK**: regenerated; clients call `client.voice.status()` and `client.voice.token({ sessionID })`.
+- **App**: `packages/app/src/context/voice.tsx` (`useVoice`: state/micState/agentState, connect/disconnect/toggleMute, agent state tracked via the `lk.agent.state` participant attribute); `VoiceProvider` wraps the session route in `app.tsx`; mic toggle button in `prompt-input.tsx` (visible only when the server reports voice available); `microphone`/`microphone-off` icons added to the UI icon set; `voice.*` i18n keys in `en.ts` (other locales fall back to English).
+- **Tauri**: `tauri.conf.json` CSP allows `wss://*.livekit.cloud` + `blob:` media; capabilities allow LiveKit HTTP/WSS. (`tauri.prod.conf.json` has no CSP section — it inherits from the base config, so no change needed there.)
+- **Agent worker**: `packages/emberharmony/src/voice/agent.ts` (STT→LLM→TTS pipeline via LiveKit Inference, silero VAD, multilingual turn detection). Run `bun run src/voice/agent.ts download-files` once, then `bun run voice-agent` (the `dev` subcommand) with the `EMBERHARMONY_LIVEKIT_*` env vars set. Verified: boots, loads models, attempts worker registration.
+
+End-to-end verified against the real LiveKit Cloud project (credentials from `.env`): token issued → simulated participant joined → agent auto-dispatched → went thinking → published TTS greeting audio → listening.
+
+## Status (2026-06-12, later): vendored SolidJS components package
+
+LiveKit only ships React components, so `packages/livekit-solid` (`@thesolaceproject/livekit-components-solid`) now holds a SolidJS port of the parts of `@livekit/components-react` v2.9.21 we need, built on the framework-agnostic `@livekit/components-core` npm package (which does the real work via RxJS observables — the port translates the thin React wrapper to signals/effects). Apache-2.0, with LICENSE/NOTICE attribution; see that package's README for the port table and what was intentionally left unported. To port more surface, re-clone `livekit/components-js` and translate from `packages/react/src`.
+
+Ported: `RoomContext`, `observableState` (the signal⇄observable bridge, unit-tested), `useConnectionState`, `useRemoteParticipants`, `useParticipantAttributes`, `useParticipantTracks`, `useLocalParticipant`, `useTracks`, `useTrackTranscription`, `useTextStream`, `useTranscriptions`, `useVoiceAssistant`, `useMultibandTrackVolume`, `useBarAnimator`, `<RoomAudioRenderer>`, `<AudioTrack>`, `<BarVisualizer>`.
+
+The app's `voice.tsx` was rewired on top of it: one `Room` per provider exposed via `RoomContext`, `<RoomAudioRenderer>` replaces the manual track attach/detach, agent state comes from `useVoiceAssistant`, mic state derives from `useLocalParticipant`, and live transcriptions are exposed on the context (`transcriptions`) for UI use. The prompt input shows a `<BarVisualizer>` (agent state + audio-reactive bars, styled in `packages/app/src/index.css`) while voice is connected.
+
+## Status (2026-06-12, later still): session bridge + desktop focus
+
+Desktop (Tauri) is the primary target for voice. Changes:
+
+- **Session bridge** (`packages/emberharmony/src/voice/bridge.ts`): `SessionLLM` — a custom `llm.LLM` for the agent pipeline. Each voice turn posts the transcribed utterance to `POST /session/:id/prompt_async` and streams the reply text out of the `GET /event` SSE feed (`message.part.updated` deltas, completion via `message.updated` with `time.completed`). The reply is identified as the first message in the session that streams text deltas (user parts are created whole, never stream). The session does the real work — model, tools, permissions, context — and voice turns show up in the chat UI like typed ones. The bridge reuses whatever model the session last used (the app always prompts with an explicit model; server-side `defaultModel()` is only a fallback and isn't well-defined unless the user configured one). Verified live: ~2s to first delta through a seeded session.
+- **Dispatch metadata**: `POST /voice/token` embeds `{sessionID, directory, serverUrl}` in the `RoomAgentDispatch` metadata; the agent refuses to start without it. `serverUrl` is taken from the request origin (overridable with `EMBERHARMONY_VOICE_SERVER_URL` on the worker). Basic-auth servers are supported via the `EMBERHARMONY_SERVER_USERNAME/PASSWORD` env on the worker.
+- **Agent** (`agent.ts`): pipeline is now STT → `SessionLLM` → TTS (`EMBERHARMONY_VOICE_LLM_MODEL` is gone); greets via `session.say(...)` since `generateReply` has no meaning against a session bridge.
+- **Desktop mic**: `packages/desktop/src-tauri/Info.plist` adds `NSMicrophoneUsageDescription` (required on macOS or TCC kills the bundled app at first `getUserMedia`); entitlements already had `audio-input`; wry 0.55 auto-grants WKWebView media-capture requests.
+- **Live transcript strip** (`packages/app/src/components/voice-transcript.tsx`): shows the current utterance (user STT / agent speech) above the prompt input while voice is connected, fed from the `lk.transcription` text stream via the vendored `useTranscriptions`.
+
+Verified end-to-end (against real LiveKit Cloud + local Ollama): bridge turn streams the exact expected reply through the session; room-level dispatch parses metadata, greets over TTS, settles into listening.
+
+Known gaps / next:
+- Interrupting the agent mid-reply stops the voice stream but does not abort server-side generation (the reply still completes in the chat UI). Decide whether to call `POST /session/:id/abort` on interruption.
+- An empty session with no configured default model fails the first voice turn ("no providers found") — voice currently assumes it joins a session that has been used at least once.
+- Human pass on the desktop app: mic permission prompt, greeting audible, full spoken round-trip.
+- Phase 2 (Realtime API, noise cancellation, mobile) unchanged.
+
+---
+
+## Plan: Voice as a configurable provider (replace env vars with UI-managed config)
+
+### Why voice doesn't fit the existing provider model
+
+EmberHarmony's `provider` config is single-source: a provider supplies *the* LLM for a session, and exactly one is active per prompt. Voice is orthogonal — you run an Ollama (or Anthropic, etc.) session *and* a voice stack at the same time. The session bridge already enforces this separation: **the voice stack is ears, mouth, and transport; the session model stays the brain.** Voice provider selection must never change which LLM answers.
+
+So voice gets its own registry — a **voice stack** with independently selectable parts:
+
+| Part | Role | Examples |
+|------|------|----------|
+| Transport | WebRTC rooms, agent dispatch | LiveKit (cloud or self-hosted) |
+| STT | speech → text | **Deepgram Nova-3 (blessed default** — the pairing Cerebras used for their demo, and what we already default to), AssemblyAI |
+| TTS | text → speech | Cartesia Sonic-3 (current default), ElevenLabs, Inworld, Rime |
+| Realtime (Phase 2) | STT+LLM+TTS fused | OpenAI Realtime — *only this kind would override the session brain; flag it clearly in the registry* |
+
+### Two integration tiers
+
+1. **LiveKit Inference (default, what we use today)** — one credential (the LiveKit API key/secret), STT/TTS chosen as model strings (`deepgram/nova-3:multi`, `cartesia/sonic-3:<voice>`) routed through LiveKit's gateway. Zero per-provider keys; the curated picker is just a list of gateway-blessed model strings.
+2. **Direct (BYO keys)** — the `@livekit/agents` plugin ecosystem (deepgram, cartesia, elevenlabs, assemblyai, …) with the provider's own API key. Bypasses the gateway: per-provider billing, sometimes lower latency, more knobs. Requires the worker to load the matching plugin package.
+
+Ship tier 1 configurable first; tier 2 is additive (registry entries gain a `plugin` field + key requirement).
+
+### Data model
+
+- **Non-secret config** — new `voice` section in `Config.Info` (`emberharmony.json`, global or per-project), replacing the `EMBERHARMONY_VOICE_*` env vars:
+  ```jsonc
+  "voice": {
+    "disabled": false,
+    "livekit": { "url": "wss://<project>.livekit.cloud" },
+    "stt": "deepgram/nova-3:multi",          // tier 1 model string, or "plugin:deepgram/nova-3" for tier 2
+    "tts": "cartesia/sonic-3:<voiceID>"
+  }
+  ```
+- **Secrets** — reuse the existing `Auth` store (`PUT /auth/:providerID`, same place `auth login` writes):
+  - `livekit` → API key + secret. `Auth.Api` holds a single `key`; extend with an optional `secret` field (backwards-compatible discriminated-union member or an optional column on `Api`).
+  - `deepgram`, `cartesia`, `elevenlabs`, … → ordinary `{type:"api", key}` entries, only needed for tier 2.
+- **Precedence**: config/auth > `EMBERHARMONY_LIVEKIT_*`/`LIVEKIT_*` env (env stays as CI/dev fallback and for the standalone worker).
+
+### Server surface
+
+- `GET /voice/config` — effective settings + the blessed registry (STT/TTS options with display names) + per-entry `hasCredentials` booleans (never the secrets themselves).
+- `PATCH /voice/config` — update the `voice` config section.
+- `GET /voice/status` — unchanged (availability for the mic button).
+- Regenerate the SDK so the app gets `client.voice.config()` / typed registry.
+
+### Worker wiring
+
+Today the agent worker is a hand-started process reading env vars. Plan (Option B from the original journal): `serve.ts` spawns the worker as a child process when voice is configured, injecting resolved config+credentials via env at spawn. Config changes restart the worker. This keeps a single configuration path (UI → config/auth → worker) and means users never touch env vars. The standalone `bun run voice-agent` stays for development.
+
+### UI
+
+Settings → **Voice** panel (desktop-first):
+- Enable toggle (writes `voice.disabled`)
+- LiveKit connection: URL field + key/secret credential fields (stored via auth route) + a **Test connection** button (round-trips `/voice/status` + a token mint)
+- STT picker and TTS picker (+ TTS voice ID) from the registry, grouped by tier; tier-2 entries show a key field inline when `hasCredentials` is false
+- Existing mic button/visualizer/transcript untouched — they already key off `/voice/status`
+
+### Sequencing
+
+1. Config schema (`voice` section) + `Auth.Api.secret` + resolution in `Voice.available()`/`token()`/worker env (replaces flag reads, env as fallback)
+2. `/voice/config` GET/PATCH + registry + SDK regen
+3. Worker spawn from `serve.ts`
+4. Settings panel in the app
+5. Tier 2 (direct plugin providers with BYO keys)
+
+### Status (2026-06-12): steps 1–4 implemented
+
+- **Schema**: `voice` section in `Config.Info` (`disabled`, `livekit.url`, `stt`, `tts`); `Auth.Api` gained an optional `secret`. `Voice.settings()` in `voice/token.ts` resolves config + the `livekit` auth entry first, `EMBERHARMONY_LIVEKIT_*`/`LIVEKIT_*`/`EMBERHARMONY_VOICE_*` env as fallback.
+- **Registry**: `voice/registry.ts` — curated tier-1 gateway model strings (ids verified against `@livekit/agents` inference typings). Defaults: Deepgram Nova-3 STT, Cartesia Sonic-3 TTS.
+- **Endpoints**: `GET /voice/config` (effective settings + registry + `credentials.livekit` boolean, never secrets) and `PATCH /voice/config` (writes the global config via `Config.updateGlobal`, restarts a serve-managed worker, and responds from the merged result — `updateGlobal` disposes instance caches asynchronously, so reading back through `Config.get()` in the same request races a stale cache). Credentials go through the existing `PUT /auth/livekit` with `{type:"api", key, secret}`. SDK regenerated.
+- **Worker spawn**: `voice/worker.ts` + `serve.ts` — serve spawns the agent worker with resolved settings injected as env, health-check port `0` (ephemeral, so it never collides with a manually started worker on 8081), stdout/stderr inherited (worker logs and failures surface in serve output), and SIGINT/SIGTERM/exit handlers so the child dies with serve (the idle `await` in serve never resolves; without handlers a signal orphans the worker — observed before the fix). Compiled-CLI builds can't spawn the worker yet (agent source isn't bundled); it warns and you run `bun run voice-agent` manually.
+- **Settings UI**: `settings-voice.tsx`, registered as a "Voice" tab in `dialog-settings.tsx` — enable toggle, LiveKit URL + key/secret fields (saved via the auth route; placeholders show `••••` when stored), Test-connection button (round-trips `/voice/status`), and STT/TTS pickers from the registry.
+
+Verified sandboxed (XDG_CONFIG_HOME/XDG_DATA_HOME redirected, zero env vars): fresh server reports unavailable → URL via PATCH + credentials via auth → status available, token mints, `voice` section lands in the global `emberharmony.jsonc` and secrets in `auth.json` (0600) → serve spawns the worker, it registers with LiveKit Cloud, and shuts down cleanly on SIGTERM.
+
+Remaining for this plan: tier 2 (BYO-key plugin providers), bundling the agent into the compiled CLI so worker spawn works outside source checkouts.
+
+## Status (2026-06-12, evening): desktop round-trip verified live + plan/build voice workflow
+
+Full hands-free round-trip confirmed by a human on the desktop app: spoken question → Deepgram STT → session bridge → reply spoken back via Cartesia, with live transcript strip, visualizer states, tool execution by voice (ran Bash from a spoken command), and multi-turn context. Issues found live and fixed:
+
+- **WKWebView audio unlock**: audio elements played silently (healthy srcObject, not paused, volume 1 — inaudible) until an `AudioContext` was created. `connect()` now resumes an AudioContext inside the click gesture and no longer swallows `startAudio()` failures; an `AudioPlaybackStatusChanged` handler retries if playback gets blocked later.
+- **Worker env**: LiveKit Inference STT/TTS read the standard `LIVEKIT_*` env names — the serve spawn now injects both naming schemes. (Symptom: agent entry died with "apiKey is required", so the agent joined but never spoke.)
+- **Interruption pile-up**: interrupting the agent left the server session generating; the next voice turn was rejected as busy and the LLM stream waited forever ("job is unresponsive"). The bridge now POSTs `/session/:id/abort` when its stream is aborted, and a staleness watchdog (server heartbeats guarantee wakeups) errors out instead of hanging.
+- **Reconnect dispatch**: token `roomConfig` agent dispatch only fires at room creation; reconnecting into a lingering room summons no agent. Workaround verified via explicit `AgentDispatchClient.createDispatch`; the durable fix (token route explicitly dispatching when the room exists without an agent) is still TODO.
+- **Tauri CSP**: added `ipc: http://ipc.localhost` to connect-src (plugin IPC was falling back to postMessage).
+- **Settings toggle race**: the Voice switch mounted during config load reads "off"; clicking it then persisted `disabled: true`. The switch now renders only after config loads.
+
+### Voice workflow: plan by default, build on spoken confirmation
+
+`voice/workflow.ts` — every spoken turn runs the session's **plan** agent (read-only) unless a small fast gateway model (`openai/gpt-5.4-nano`, configurable as `voice.intent`) classifies the utterance as an explicit confirmation ("yes, do it", "sounds good, ship it") — that single turn runs as **build**, then the next turn re-defaults to plan, so every execution needs a fresh spoken yes. Classification failure always falls back to plan — an error can never grant execution. The hook is `voice.Agent.onUserTurnCompleted`, which runs before the bridge; the bridge passes `agent` and a `system` voice-etiquette prompt (short speakable replies, propose-then-ask) on every prompt. Verified against the live gateway: confirmations route to build, requests/questions/hesitation stay in plan.
+
+### Configurability audit (PR gate)
+
+Sandboxed (XDG redirected, zero env): URL, API key+secret, STT, TTS, intent model, and the disable switch all set via UI/API → persisted (`emberharmony.jsonc` + `auth.json` 0600) → survive server restart → worker env injection carries all of them. Env vars remain only as dev/CI fallback. Internal-only env (worker port, worker→server URL) is plumbing, not user config.
+
+Follow-up fixes (2026-06-12, after the first signed local desktop build):
+- `VoiceWorker.restart()` now starts the worker even when serve booted unconfigured — configuring voice through the Settings panel brings the worker up live, no serve restart needed.
+- Empty-session first turn fixed: the mic button passes the app's currently selected model through `POST /voice/token` → dispatch metadata → `SessionLLM.fallbackModel`, used only when the session has no assistant message to inherit a model from.
+- Local desktop build: `bun run build:local` in packages/desktop works with the keychain's Developer ID identity (override `APPLE_SIGNING_IDENTITY` if `.env` names a different team; notarization is skipped for local builds and not needed to run on the build machine). Verified the bundled app carries `NSMicrophoneUsageDescription`.
+- Mic-button availability is fetched once per session mount; after configuring voice in settings, re-open the session view to see the button. Worth wiring to config-change events later.
+
 ## Overview
 
 Adding voice input/output to EmberHarmony using LiveKit as the realtime media transport layer. The desktop app gets a microphone toggle in the prompt input bar. When activated, the user's speech is transcribed (STT), sent through EmberHarmony's existing LLM session pipeline (same tools, permissions, context), and the response is spoken back (TTS).
@@ -490,14 +633,15 @@ export const { use: useVoice, provider: VoiceProvider } = createSimpleContext({
 
 ```
 # LiveKit server URL (e.g., wss://my-project.livekit.cloud)
+# Falls back to LIVEKIT_URL if unset (same for the key/secret below)
 EMBERHARMONY_LIVEKIT_URL=
 
 # LiveKit API key and secret (for token generation)
 EMBERHARMONY_LIVEKIT_API_KEY=
 EMBERHARMONY_LIVEKIT_API_SECRET=
 
-# Feature flag to enable/disable voice
-EMBERHARMONY_VOICE_ENABLED=true
+# Voice is on whenever credentials are configured; set this to turn it off
+EMBERHARMONY_VOICE_DISABLE=false
 
 # Voice agent configuration (optional, for STT/LLM/TTS model selection)
 EMBERHARMONY_VOICE_STT_MODEL=deepgram/nova-3

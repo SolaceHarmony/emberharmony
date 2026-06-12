@@ -1,0 +1,11 @@
+@thesolaceproject/livekit-components-solid
+
+This package is a SolidJS port of @livekit/components-react v2.9.21
+(https://github.com/livekit/components-js), Copyright LiveKit, Inc.,
+licensed under the Apache License, Version 2.0.
+
+The framework-agnostic state logic comes from @livekit/components-core
+(consumed as a regular npm dependency, not vendored). The hooks and
+components in this package were translated from React (useState/useEffect)
+to SolidJS (signals/effects) primitives; the observable wiring, visualizer
+animation sequences, and component semantics follow the upstream source.

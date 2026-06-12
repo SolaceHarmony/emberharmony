@@ -18,6 +18,7 @@ import { useLocal } from "@/context/local"
 import { selectionFromLines, useFile, type FileSelection, type SelectedLineRange } from "@/context/file"
 import { createStore } from "solid-js/store"
 import { PromptInput } from "@/components/prompt-input"
+import { VoiceTranscript } from "@/components/voice-transcript"
 import { SessionContextUsage } from "@/components/session-context-usage"
 import { IconButton } from "@thesolaceproject/emberharmony-ui/icon-button"
 import { Button } from "@thesolaceproject/emberharmony-ui/button"
@@ -2150,6 +2151,7 @@ export default function Page() {
                   </div>
                 }
               >
+                <VoiceTranscript />
                 <PromptInput
                   ref={(el) => {
                     inputRef = el

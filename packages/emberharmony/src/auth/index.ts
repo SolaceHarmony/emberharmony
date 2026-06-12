@@ -20,6 +20,7 @@ export namespace Auth {
     .object({
       type: z.literal("api"),
       key: z.string(),
+      secret: z.string().optional().describe("Second credential for providers that use a key+secret pair (e.g. LiveKit)"),
     })
     .meta({ ref: "ApiAuth" })
 

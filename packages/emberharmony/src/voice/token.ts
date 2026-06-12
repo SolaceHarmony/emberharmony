@@ -1,0 +1,83 @@
+import { AccessToken } from "livekit-server-sdk"
+import { RoomConfiguration, RoomAgentDispatch } from "@livekit/protocol"
+import z from "zod"
+import { NamedError } from "@thesolaceproject/emberharmony-util/error"
+import { Auth } from "../auth"
+import { Config } from "../config/config"
+import { Flag } from "../flag/flag"
+import { VoiceRegistry } from "./registry"
+
+export namespace Voice {
+  export const AGENT_NAME = "emberharmony-voice"
+
+  /** Auth store entry holding the LiveKit API key (key) and secret (secret) */
+  export const AUTH_PROVIDER_ID = "livekit"
+
+  export const NotConfiguredError = NamedError.create("VoiceNotConfiguredError", z.object({}))
+
+  export interface Settings {
+    disabled: boolean
+    url?: string
+    apiKey?: string
+    apiSecret?: string
+    stt: string
+    tts: string
+    intent: string
+    available: boolean
+  }
+
+  /**
+   * Effective voice settings: config + credential store first, environment
+   * variables (EMBERHARMONY_LIVEKIT_* / LIVEKIT_* / EMBERHARMONY_VOICE_*) as
+   * fallback for CI and the standalone worker. Pass `override` to resolve
+   * against a just-written voice config instead of the instance cache.
+   */
+  export async function settings(override?: Config.Voice): Promise<Settings> {
+    const voice: Config.Voice = override ?? (await Config.get()).voice ?? {}
+    const auth = await Auth.get(AUTH_PROVIDER_ID)
+    const credentials = auth?.type === "api" ? auth : undefined
+    const url = voice.livekit?.url ?? Flag.EMBERHARMONY_LIVEKIT_URL
+    const apiKey = credentials?.key ?? Flag.EMBERHARMONY_LIVEKIT_API_KEY
+    const apiSecret = credentials?.secret ?? Flag.EMBERHARMONY_LIVEKIT_API_SECRET
+    const disabled = voice.disabled ?? Flag.EMBERHARMONY_VOICE_DISABLE
+    return {
+      disabled,
+      url,
+      apiKey,
+      apiSecret,
+      stt: voice.stt ?? process.env["EMBERHARMONY_VOICE_STT_MODEL"] ?? VoiceRegistry.DEFAULT_STT,
+      tts: voice.tts ?? process.env["EMBERHARMONY_VOICE_TTS_MODEL"] ?? VoiceRegistry.DEFAULT_TTS,
+      intent: voice.intent ?? process.env["EMBERHARMONY_VOICE_INTENT_MODEL"] ?? VoiceRegistry.DEFAULT_INTENT,
+      available: Boolean(!disabled && url && apiKey && apiSecret),
+    }
+  }
+
+  export async function token(opts: {
+    roomName: string
+    identity: string
+    name?: string
+    agentName?: string
+    agentMetadata?: string
+  }) {
+    const resolved = await settings()
+    if (!resolved.available) throw new NotConfiguredError({})
+    const token = new AccessToken(resolved.apiKey!, resolved.apiSecret!, {
+      identity: opts.identity,
+      name: opts.name,
+      ttl: "15m",
+    })
+    token.addGrant({
+      room: opts.roomName,
+      roomJoin: true,
+      canPublish: true,
+      canSubscribe: true,
+      canPublishData: true,
+    })
+    if (opts.agentName) {
+      token.roomConfig = new RoomConfiguration({
+        agents: [new RoomAgentDispatch({ agentName: opts.agentName, metadata: opts.agentMetadata })],
+      })
+    }
+    return { token: await token.toJwt(), url: resolved.url! }
+  }
+}

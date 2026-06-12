@@ -36,7 +36,9 @@
         { "url": "http://127.0.0.1:*" },
         { "url": "http://localhost:*" },
         { "url": "https://*.solace.ofharmony.ai/*" },
-        { "url": "https://github.com/SolaceHarmony/*" }
+        { "url": "https://github.com/SolaceHarmony/*" },
+        { "url": "https://*.livekit.cloud/*" },
+        { "url": "wss://*.livekit.cloud/*" }
       ]
     }
   ]

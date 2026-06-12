@@ -1,1 +1,21 @@
 @import "@thesolaceproject/emberharmony-ui/styles/tailwind";
+
+/* Voice mode bar visualizer (vendored @thesolaceproject/livekit-components-solid) */
+.lk-audio-bar-visualizer {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  height: 1.25rem;
+  width: 2.25rem;
+}
+.lk-audio-bar {
+  width: 3px;
+  min-height: 2px;
+  border-radius: 9999px;
+  background-color: var(--icon-base);
+  transition: background-color 0.15s ease;
+}
+.lk-audio-bar.lk-highlighted {
+  background-color: var(--icon-success-base);
+}

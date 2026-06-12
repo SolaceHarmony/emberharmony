@@ -1337,6 +1337,34 @@ export type ServerConfig = {
   cors?: Array<string>
 }
 
+export type VoiceConfig = {
+  /**
+   * Disable voice mode even when LiveKit credentials are configured
+   */
+  disabled?: boolean
+  /**
+   * LiveKit transport settings; the API key and secret live in the credentials store
+   */
+  livekit?: {
+    /**
+     * LiveKit server URL, e.g. wss://<project>.livekit.cloud
+     */
+    url?: string
+  }
+  /**
+   * Speech-to-text model string, e.g. deepgram/nova-3:multi
+   */
+  stt?: string
+  /**
+   * Text-to-speech model string, e.g. cartesia/sonic-3:<voiceID>
+   */
+  tts?: string
+  /**
+   * Small fast model that routes voice turns between plan and build, e.g. openai/gpt-5.4-nano
+   */
+  intent?: string
+}
+
 export type PermissionActionConfig = "ask" | "allow" | "deny"
 
 export type PermissionObjectConfig = {
@@ -1622,6 +1650,7 @@ export type Config = {
     diff_style?: "auto" | "stacked"
   }
   server?: ServerConfig
+  voice?: VoiceConfig
   /**
    * Command configuration, see https://solace.ofharmony.ai/docs/commands
    */
@@ -1823,6 +1852,10 @@ export type OAuth = {
 export type ApiAuth = {
   type: "api"
   key: string
+  /**
+   * Second credential for providers that use a key+secret pair (e.g. LiveKit)
+   */
+  secret?: string
 }
 
 export type WellKnownAuth = {
@@ -2098,6 +2131,29 @@ export type McpStatus =
   | McpStatusFailed
   | McpStatusNeedsAuth
   | McpStatusNeedsClientRegistration
+
+export type VoiceRegistryOption = {
+  id: string
+  name: string
+  provider: string
+  defaultSuffix?: string
+}
+
+export type VoiceConfigInfo = {
+  available: boolean
+  disabled: boolean
+  url: string | null
+  stt: string
+  tts: string
+  intent: string
+  registry: {
+    stt: Array<VoiceRegistryOption>
+    tts: Array<VoiceRegistryOption>
+  }
+  credentials: {
+    livekit: boolean
+  }
+}
 
 export type Path = {
   home: string
@@ -4759,6 +4815,113 @@ export type TuiControlResponseResponses = {
 }
 
 export type TuiControlResponseResponse = TuiControlResponseResponses[keyof TuiControlResponseResponses]
+
+export type VoiceStatusData = {
+  body?: never
+  path?: never
+  query?: {
+    directory?: string
+  }
+  url: "/voice/status"
+}
+
+export type VoiceStatusResponses = {
+  /**
+   * Voice availability
+   */
+  200: {
+    available: boolean
+    url: string | null
+  }
+}
+
+export type VoiceStatusResponse = VoiceStatusResponses[keyof VoiceStatusResponses]
+
+export type VoiceConfigData = {
+  body?: never
+  path?: never
+  query?: {
+    directory?: string
+  }
+  url: "/voice/config"
+}
+
+export type VoiceConfigResponses = {
+  /**
+   * Voice configuration
+   */
+  200: VoiceConfigInfo
+}
+
+export type VoiceConfigResponse = VoiceConfigResponses[keyof VoiceConfigResponses]
+
+export type VoiceConfigUpdateData = {
+  body?: VoiceConfig
+  path?: never
+  query?: {
+    directory?: string
+  }
+  url: "/voice/config"
+}
+
+export type VoiceConfigUpdateErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type VoiceConfigUpdateError = VoiceConfigUpdateErrors[keyof VoiceConfigUpdateErrors]
+
+export type VoiceConfigUpdateResponses = {
+  /**
+   * Updated voice configuration
+   */
+  200: VoiceConfigInfo
+}
+
+export type VoiceConfigUpdateResponse = VoiceConfigUpdateResponses[keyof VoiceConfigUpdateResponses]
+
+export type VoiceTokenData = {
+  body?: {
+    sessionID: string
+    agentName?: string
+    /**
+     * Model to use for voice turns when the session has no message history yet
+     */
+    model?: {
+      providerID: string
+      modelID: string
+    }
+  }
+  path?: never
+  query?: {
+    directory?: string
+  }
+  url: "/voice/token"
+}
+
+export type VoiceTokenErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type VoiceTokenError = VoiceTokenErrors[keyof VoiceTokenErrors]
+
+export type VoiceTokenResponses = {
+  /**
+   * LiveKit access token
+   */
+  200: {
+    token: string
+    url: string
+    roomName: string
+  }
+}
+
+export type VoiceTokenResponse = VoiceTokenResponses[keyof VoiceTokenResponses]
 
 export type InstanceDisposeData = {
   body?: never

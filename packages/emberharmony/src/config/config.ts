@@ -861,6 +861,29 @@ export namespace Config {
   })
   export type Layout = z.infer<typeof Layout>
 
+  export const Voice = z
+    .object({
+      disabled: z.boolean().optional().describe("Disable voice mode even when LiveKit credentials are configured"),
+      livekit: z
+        .object({
+          url: z.string().optional().describe("LiveKit server URL, e.g. wss://<project>.livekit.cloud"),
+        })
+        .strict()
+        .optional()
+        .describe("LiveKit transport settings; the API key and secret live in the credentials store"),
+      stt: z.string().optional().describe("Speech-to-text model string, e.g. deepgram/nova-3:multi"),
+      tts: z.string().optional().describe("Text-to-speech model string, e.g. cartesia/sonic-3:<voiceID>"),
+      intent: z
+        .string()
+        .optional()
+        .describe("Small fast model that routes voice turns between plan and build, e.g. openai/gpt-5.4-nano"),
+    })
+    .strict()
+    .meta({
+      ref: "VoiceConfig",
+    })
+  export type Voice = z.infer<typeof Voice>
+
   export const Provider = ModelsDev.Provider.partial()
     .extend({
       whitelist: z.array(z.string()).optional(),
@@ -922,6 +945,7 @@ export namespace Config {
       logLevel: Log.Level.optional().describe("Log level"),
       tui: TUI.optional().describe("TUI specific settings"),
       server: Server.optional().describe("Server configuration for emberharmony serve and web commands"),
+      voice: Voice.optional().describe("Voice mode (LiveKit) configuration"),
       command: z
         .record(z.string(), Command)
         .optional()

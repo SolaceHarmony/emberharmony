@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json.schemastore.org/package.json",
+  "name": "@thesolaceproject/livekit-components-solid",
+  "version": "0.1.0",
+  "type": "module",
+  "license": "Apache-2.0",
+  "description": "SolidJS port of @livekit/components-react, built on @livekit/components-core. Vendored into EmberHarmony.",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsgo --noEmit",
+    "test": "bun test --conditions=browser"
+  },
+  "dependencies": {
+    "@livekit/components-core": "catalog:",
+    "livekit-client": "catalog:",
+    "rxjs": "7.8.2",
+    "solid-js": "catalog:"
+  },
+  "devDependencies": {
+    "@tsconfig/node22": "catalog:",
+    "@types/bun": "catalog:",
+    "typescript": "catalog:",
+    "@typescript/native-preview": "catalog:"
+  }
+}

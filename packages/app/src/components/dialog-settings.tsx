@@ -8,6 +8,7 @@ import { SettingsGeneral } from "./settings-general"
 import { SettingsKeybinds } from "./settings-keybinds"
 import { SettingsProviders } from "./settings-providers"
 import { SettingsModels } from "./settings-models"
+import { SettingsVoice } from "./settings-voice"
 
 export const DialogSettings: Component = () => {
   const language = useLanguage()
@@ -45,6 +46,10 @@ export const DialogSettings: Component = () => {
                       <Icon name="models" />
                       {language.t("settings.models.title")}
                     </Tabs.Trigger>
+                    <Tabs.Trigger value="voice">
+                      <Icon name="microphone" />
+                      {language.t("settings.voice.title")}
+                    </Tabs.Trigger>
                   </div>
                 </div>
               </div>
@@ -66,6 +71,9 @@ export const DialogSettings: Component = () => {
         </Tabs.Content>
         <Tabs.Content value="models" class="no-scrollbar">
           <SettingsModels />
+        </Tabs.Content>
+        <Tabs.Content value="voice" class="no-scrollbar">
+          <SettingsVoice />
         </Tabs.Content>
         {/* <Tabs.Content value="agents" class="no-scrollbar"> */}
         {/*   <SettingsAgents /> */}
