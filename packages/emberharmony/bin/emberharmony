@@ -30,8 +30,10 @@ function readPackageName() {
   try {
     const pkgPath = path.join(scriptDir, "..", "package.json")
     const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"))
-    const name = typeof pkg.name === "string" ? pkg.name : "emberharmony"
-    return name.includes("/") ? name.split("/").pop() : name
+    // Keep the full name including any scope: platform binary packages are
+    // published as `<name>-<platform>-<arch>` off this exact name (e.g.
+    // `@thesolaceproject/emberharmony-darwin-arm64`).
+    return typeof pkg.name === "string" ? pkg.name : "emberharmony"
   } catch {
     return "emberharmony"
   }
@@ -119,20 +121,34 @@ if (!arch) {
 const base = readPackageName() + "-" + platform + "-" + arch
 const binary = platform === "windows" ? "emberharmony.exe" : "emberharmony"
 
+// `base` may be scoped (e.g. "@thesolaceproject/emberharmony-darwin-arm64").
+// Scoped packages live under node_modules/<scope>/, so split off the scope and
+// match the remaining prefix (which still catches -baseline/-musl variants)
+// against the directory entries inside that scope.
+const baseSlash = base.lastIndexOf("/")
+const baseScope = baseSlash === -1 ? "" : base.slice(0, baseSlash)
+const basePrefix = baseSlash === -1 ? base : base.slice(baseSlash + 1)
+
 function findBinary(startDir) {
   let current = startDir
   for (;;) {
     const modules = path.join(current, "node_modules")
-    if (fs.existsSync(modules)) {
-      const entries = fs.readdirSync(modules)
-      for (const entry of entries) {
-        if (!entry.startsWith(base)) {
-          continue
-        }
-        const candidate = path.join(modules, entry, "bin", binary)
-        if (fs.existsSync(candidate)) {
-          return candidate
-        }
+    const searchDir = baseScope ? path.join(modules, baseScope) : modules
+    // Tolerate searchDir being absent, a file (ENOTDIR), or unreadable
+    // (EACCES): skip it and keep walking up rather than crashing the wrapper.
+    let entries = []
+    try {
+      entries = fs.readdirSync(searchDir)
+    } catch {
+      entries = []
+    }
+    for (const entry of entries) {
+      if (!entry.startsWith(basePrefix)) {
+        continue
+      }
+      const candidate = path.join(searchDir, entry, "bin", binary)
+      if (fs.existsSync(candidate)) {
+        return candidate
       }
     }
     const parent = path.dirname(current)
