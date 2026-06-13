@@ -13,8 +13,11 @@ function readPackageName() {
   try {
     const pkgPath = path.join(__dirname, "package.json")
     const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"))
-    const name = typeof pkg.name === "string" ? pkg.name : "emberharmony"
-    return name.includes("/") ? name.split("/").pop() : name
+    // Keep the full name including any scope: the platform binary packages are
+    // published as `<name>-<platform>-<arch>` off this exact name (e.g.
+    // `@thesolaceproject/emberharmony-darwin-arm64`). Stripping the scope here
+    // would look for an unscoped `emberharmony-darwin-arm64` that does not exist.
+    return typeof pkg.name === "string" ? pkg.name : "emberharmony"
   } catch {
     return "emberharmony"
   }

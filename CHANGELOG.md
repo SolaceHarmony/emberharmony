@@ -5,6 +5,21 @@ All notable changes to EmberHarmony will be documented in this file.
 This project is a fork of [opencode](https://github.com/opencode-ai/opencode),
 rebranded and maintained by [The Solace Project](https://github.com/SolaceHarmony).
 
+## [1.4.1] - 2026-06-13
+
+### Fixed
+
+- **`npm i -g @thesolaceproject/emberharmony` failed during postinstall** —
+  both the postinstall and the runtime `bin/emberharmony` wrapper derived the
+  platform binary package name by stripping the `@thesolaceproject/` scope,
+  then looked for an unscoped `emberharmony-<platform>-<arch>` that is never
+  published (the real packages are scoped, e.g.
+  `@thesolaceproject/emberharmony-darwin-arm64`). The postinstall exited 1 and
+  broke the install; the wrapper's `node_modules` walk likewise couldn't find a
+  scoped package. Both now keep the full scoped name, and the wrapper descends
+  into `node_modules/<scope>/`. (Latent since the package was scoped; only
+  surfaced now that the CLI is installed from npm rather than built locally.)
+
 ## [1.4.0] - 2026-06-12
 
 ### Added
