@@ -97,16 +97,22 @@ jobs:
       - name: Rename desktop bundles for consistent download URLs
         run: |
           cd desktop 2>/dev/null || exit 0
-          # Tauri produces names like EmberHarmony_1.3.0_aarch64.dmg;
+          # nullglob: a bundle format that wasn't produced (not every platform
+          # emits every format) expands to nothing and its loop is a no-op,
+          # instead of leaving the literal pattern that fails `[ -f ]` and, as
+          # the script's last command under `bash -e`, fails the whole step.
+          # A real `mv` failure still propagates.
+          shopt -s nullglob
+          # Tauri produces names like EmberHarmony_1.4.0_aarch64.dmg;
           # the download page expects emberharmony-desktop-darwin-aarch64.dmg etc.
-          for f in EmberHarmony_*_aarch64.dmg;          do [ -f "$f" ] && mv "$f" "emberharmony-desktop-darwin-aarch64.dmg";       done
-          for f in EmberHarmony_*_x64-setup.exe;        do [ -f "$f" ] && mv "$f" "emberharmony-desktop-windows-x64.exe";          done
-          for f in EmberHarmony_*_amd64.deb;            do [ -f "$f" ] && mv "$f" "emberharmony-desktop-linux-amd64.deb";           done
-          for f in EmberHarmony_*_amd64.AppImage;      do [ -f "$f" ] && mv "$f" "emberharmony-desktop-linux-amd64.AppImage";      done
-          for f in EmberHarmony_*.x86_64.rpm;           do [ -f "$f" ] && mv "$f" "emberharmony-desktop-linux-x86_64.rpm";          done
-          for f in EmberHarmony_*_arm64.deb;            do [ -f "$f" ] && mv "$f" "emberharmony-desktop-linux-arm64.deb";           done
-          for f in EmberHarmony_*_arm64.AppImage;       do [ -f "$f" ] && mv "$f" "emberharmony-desktop-linux-arm64.AppImage";      done
-          for f in EmberHarmony_*.aarch64.rpm;          do [ -f "$f" ] && mv "$f" "emberharmony-desktop-linux-arm64.rpm";           done
+          for f in EmberHarmony_*_aarch64.dmg;          do mv "$f" "emberharmony-desktop-darwin-aarch64.dmg";       done
+          for f in EmberHarmony_*_x64-setup.exe;        do mv "$f" "emberharmony-desktop-windows-x64.exe";          done
+          for f in EmberHarmony_*_amd64.deb;            do mv "$f" "emberharmony-desktop-linux-amd64.deb";           done
+          for f in EmberHarmony_*_amd64.AppImage;       do mv "$f" "emberharmony-desktop-linux-amd64.AppImage";      done
+          for f in EmberHarmony_*.x86_64.rpm;           do mv "$f" "emberharmony-desktop-linux-x86_64.rpm";          done
+          for f in EmberHarmony_*_arm64.deb;            do mv "$f" "emberharmony-desktop-linux-arm64.deb";           done
+          for f in EmberHarmony_*_arm64.AppImage;       do mv "$f" "emberharmony-desktop-linux-arm64.AppImage";      done
+          for f in EmberHarmony_*.aarch64.rpm;          do mv "$f" "emberharmony-desktop-linux-arm64.rpm";           done
 
       - name: Attach archives to release
         env:
