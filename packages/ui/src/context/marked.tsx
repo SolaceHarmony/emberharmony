@@ -435,12 +435,14 @@ async function highlightCodeBlocks(html: string): Promise<string> {
   let result = html
   for (const match of matches) {
     const [fullMatch, lang, escapedCode] = match
+    // &amp; must be decoded last: decoding it earlier would let an escaped
+    // entity like "&amp;quot;" (literal "&quot;") be re-decoded into '"'.
     const code = escapedCode
       .replace(/&lt;/g, "<")
       .replace(/&gt;/g, ">")
-      .replace(/&amp;/g, "&")
       .replace(/&quot;/g, '"')
       .replace(/&#39;/g, "'")
+      .replace(/&amp;/g, "&")
 
     let language = lang || "text"
     if (!(language in bundledLanguages)) {

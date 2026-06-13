@@ -93,9 +93,25 @@ export const RunCommand = cmd({
       })
   },
   handler: async (args) => {
-    let message = [...args.message, ...(args["--"] || [])]
-      .map((arg) => (arg.includes(" ") ? `"${arg.replace(/"/g, '\\"')}"` : arg))
-      .join(" ")
+    // Reassemble argv into the prompt / command-arguments string. Multi-word
+    // args are wrapped in quotes so the command parser's argsRegex keeps them
+    // as a single $N placeholder (it accepts both "…" and '…' tokens and
+    // strips the quotes again via quoteTrimRegex). The quote character is
+    // chosen to avoid the one the value already contains, which lets a spaced
+    // arg with embedded double quotes (e.g. a JSON blob) survive as one
+    // argument. Deliberately no character escaping: this value is reparsed
+    // into prompt templates, never handed to a shell, and the parser does not
+    // unescape — escaping backslashes would corrupt content like Windows
+    // paths. An arg containing spaces and BOTH quote characters cannot be
+    // grouped (the parser has no escape mechanism); it falls back to double
+    // quotes and may split.
+    const quoteArg = (arg: string) => {
+      if (!arg.includes(" ")) return arg
+      if (!arg.includes('"')) return `"${arg}"`
+      if (!arg.includes("'")) return `'${arg}'`
+      return `"${arg}"`
+    }
+    let message = [...args.message, ...(args["--"] || [])].map(quoteArg).join(" ")
 
     const fileParts: any[] = []
     if (args.file) {
