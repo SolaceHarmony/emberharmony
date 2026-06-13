@@ -118,35 +118,34 @@ let arch = archMap[os.arch()]
 if (!arch) {
   arch = os.arch()
 }
-const base = readPackageName() + "-" + platform + "-" + arch
 const binary = platform === "windows" ? "emberharmony.exe" : "emberharmony"
 
-// `base` may be scoped (e.g. "@thesolaceproject/emberharmony-darwin-arm64").
-// Scoped packages live under node_modules/<scope>/, so split off the scope and
-// match the remaining prefix (which still catches -baseline/-musl variants)
-// against the directory entries inside that scope.
-const baseSlash = base.lastIndexOf("/")
-const baseScope = baseSlash === -1 ? "" : base.slice(0, baseSlash)
-const basePrefix = baseSlash === -1 ? base : base.slice(baseSlash + 1)
+// The full package name may be scoped (e.g. "@thesolaceproject/emberharmony").
+// Scoped packages live under node_modules/<scope>/, so split the scope from the
+// bare name. Platform binary packages are named
+// "<bareName>-<platform>-<arch>[-baseline][-musl]".
+const fullName = readPackageName()
+const nameSlash = fullName.lastIndexOf("/")
+const nameScope = nameSlash === -1 ? "" : fullName.slice(0, nameSlash)
+const bareName = nameSlash === -1 ? fullName : fullName.slice(nameSlash + 1)
+
+// Exact platform-package directory names to try, in priority order. Reuse the
+// same host-capability ranking as findLocalBinary: on Linux, npm installs every
+// variant (glibc/musl, AVX2/baseline) because they share os/cpu metadata, so a
+// musl or non-AVX2 host must pick its specific variant before the generic
+// package rather than whichever the directory happens to list first.
+const candidateDirs = localCandidates(platform, arch).map((variant) => bareName + "-" + variant)
+const base = (nameScope ? nameScope + "/" : "") + (candidateDirs[0] || bareName + "-" + platform + "-" + arch)
 
 function findBinary(startDir) {
   let current = startDir
   for (;;) {
     const modules = path.join(current, "node_modules")
-    const searchDir = baseScope ? path.join(modules, baseScope) : modules
-    // Tolerate searchDir being absent, a file (ENOTDIR), or unreadable
-    // (EACCES): skip it and keep walking up rather than crashing the wrapper.
-    let entries = []
-    try {
-      entries = fs.readdirSync(searchDir)
-    } catch {
-      entries = []
-    }
-    for (const entry of entries) {
-      if (!entry.startsWith(basePrefix)) {
-        continue
-      }
-      const candidate = path.join(searchDir, entry, "bin", binary)
+    const searchDir = nameScope ? path.join(modules, nameScope) : modules
+    // existsSync never throws, so an absent / file / permission-denied ancestor
+    // is simply skipped and the walk continues up the tree.
+    for (const dir of candidateDirs) {
+      const candidate = path.join(searchDir, dir, "bin", binary)
       if (fs.existsSync(candidate)) {
         return candidate
       }
