@@ -134,16 +134,21 @@ function findBinary(startDir) {
   for (;;) {
     const modules = path.join(current, "node_modules")
     const searchDir = baseScope ? path.join(modules, baseScope) : modules
-    if (fs.existsSync(searchDir)) {
-      const entries = fs.readdirSync(searchDir)
-      for (const entry of entries) {
-        if (!entry.startsWith(basePrefix)) {
-          continue
-        }
-        const candidate = path.join(searchDir, entry, "bin", binary)
-        if (fs.existsSync(candidate)) {
-          return candidate
-        }
+    // Tolerate searchDir being absent, a file (ENOTDIR), or unreadable
+    // (EACCES): skip it and keep walking up rather than crashing the wrapper.
+    let entries = []
+    try {
+      entries = fs.readdirSync(searchDir)
+    } catch {
+      entries = []
+    }
+    for (const entry of entries) {
+      if (!entry.startsWith(basePrefix)) {
+        continue
+      }
+      const candidate = path.join(searchDir, entry, "bin", binary)
+      if (fs.existsSync(candidate)) {
+        return candidate
       }
     }
     const parent = path.dirname(current)
