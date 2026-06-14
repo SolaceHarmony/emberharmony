@@ -193,6 +193,19 @@ if (noBundle) {
   process.exit(0)
 }
 
+// --- Step 2b: Assemble the bundled voice runtime --------------------------
+// The LiveKit agents worker can't run inside the compiled CLI (it forks
+// node_modules scripts), so the desktop bundle ships a self-contained runtime
+// (bun + agent.js + node_modules + models) as a Tauri resource. Pass --no-voice
+// to skip (smaller build, voice disabled). Builds for the current host target.
+if (!process.argv.includes("--no-voice")) {
+  console.log(`[build-local] assembling voice runtime resource...`)
+  await $`bun ./scripts/build-voice-runtime.ts`.cwd(desktopDir)
+} else {
+  console.log(`[build-local] --no-voice: skipping voice runtime (voice will be disabled in this build)`)
+  await $`rm -rf ${path.join(desktopDir, "src-tauri/resources/voice")}`
+}
+
 // Always skip DMG in the Tauri invocation because the upstream bundle_dmg.sh
 // fails. We create the DMG manually afterwards if the host is macOS.
 const tauriArgs = ["build"]

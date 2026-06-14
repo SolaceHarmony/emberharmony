@@ -1,4 +1,5 @@
 import { existsSync } from "node:fs"
+import path from "node:path"
 import { fileURLToPath } from "node:url"
 import type { Config } from "../config/config"
 import { Log } from "../util/log"
@@ -8,15 +9,61 @@ import { Voice } from "./token"
  * Manages the voice agent worker as a child process of `emberharmony serve`.
  * The worker gets the resolved voice settings (config + credential store)
  * injected as environment variables at spawn, so the UI is the single
- * configuration path. Requires running from source — the compiled CLI cannot
- * spawn the agent yet (see LIVEKIT_JOURNAL.md); use `bun run voice-agent`
- * manually in that case.
+ * configuration path.
+ *
+ * Two launch modes:
+ *  - **Bundled runtime** (packaged desktop app): the LiveKit agents framework
+ *    forks node_modules scripts and dynamically imports the agent file, so it
+ *    cannot run inside the compiled single-file CLI. The desktop app ships a
+ *    self-contained runtime (bun + agent.js + node_modules + models) and points
+ *    the sidecar at it via EMBERHARMONY_VOICE_RUNTIME_DIR; we spawn that.
+ *  - **Source** (dev / `bun run`): spawn `./agent.ts` with the current Bun.
  */
 export namespace VoiceWorker {
   const log = Log.create({ service: "voice.worker" })
 
   let proc: ReturnType<typeof Bun.spawn> | undefined
   let lastServerUrl: string | undefined
+
+  interface Launch {
+    mode: "bundled" | "source"
+    cmd: string[]
+    cwd?: string
+    env: Record<string, string>
+  }
+
+  /**
+   * Resolve how to launch the worker. Prefer the bundled runtime the desktop
+   * app ships (EMBERHARMONY_VOICE_RUNTIME_DIR); otherwise fall back to running
+   * the TypeScript source with the current Bun (dev). Returns undefined when
+   * neither is available (e.g. compiled CLI with no bundled runtime).
+   */
+  function resolveLaunch(): Launch | undefined {
+    const runtimeDir = process.env["EMBERHARMONY_VOICE_RUNTIME_DIR"]
+    if (runtimeDir) {
+      const bunBin = path.join(runtimeDir, process.platform === "win32" ? "bun.exe" : "bun")
+      const agentJs = path.join(runtimeDir, "agent.js")
+      if (existsSync(bunBin) && existsSync(agentJs)) {
+        return {
+          mode: "bundled",
+          cmd: [bunBin, agentJs, "start"],
+          cwd: runtimeDir,
+          // Point the HF/agents model caches at the bundled models so the
+          // worker loads VAD + turn-detector offline.
+          env: {
+            HF_HOME: path.join(runtimeDir, "models"),
+            XDG_CACHE_HOME: path.join(runtimeDir, "models"),
+          },
+        }
+      }
+      log.warn("EMBERHARMONY_VOICE_RUNTIME_DIR set but bundle incomplete", { runtimeDir })
+    }
+    const agentPath = fileURLToPath(new URL("./agent.ts", import.meta.url))
+    if (existsSync(agentPath)) {
+      return { mode: "source", cmd: [process.execPath, "run", agentPath, "start"], env: {} }
+    }
+    return undefined
+  }
 
   export async function start(serverUrl: string, override?: Config.Voice): Promise<boolean> {
     stop()
@@ -26,15 +73,17 @@ export namespace VoiceWorker {
       log.info("voice not configured; agent worker not started")
       return false
     }
-    const agentPath = fileURLToPath(new URL("./agent.ts", import.meta.url))
-    if (!existsSync(agentPath)) {
-      log.warn("voice agent source not available in this build; start the worker manually with `bun run voice-agent`")
+    const launch = resolveLaunch()
+    if (!launch) {
+      log.warn("voice agent runtime not available in this build; start the worker manually with `bun run voice-agent`")
       return false
     }
     proc = Bun.spawn({
-      cmd: [process.execPath, "run", agentPath, "start"],
+      cmd: launch.cmd,
+      cwd: launch.cwd,
       env: {
         ...process.env,
+        ...launch.env,
         EMBERHARMONY_LIVEKIT_URL: settings.url!,
         EMBERHARMONY_LIVEKIT_API_KEY: settings.apiKey!,
         EMBERHARMONY_LIVEKIT_API_SECRET: settings.apiSecret!,
@@ -56,7 +105,7 @@ export namespace VoiceWorker {
         }
       },
     })
-    log.info("voice agent worker started", { pid: proc.pid, stt: settings.stt, tts: settings.tts })
+    log.info("voice agent worker started", { pid: proc.pid, mode: launch.mode, stt: settings.stt, tts: settings.tts })
     return true
   }
 

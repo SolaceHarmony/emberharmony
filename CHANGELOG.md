@@ -5,6 +5,28 @@ All notable changes to EmberHarmony will be documented in this file.
 This project is a fork of [opencode](https://github.com/opencode-ai/opencode),
 rebranded and maintained by [The Solace Project](https://github.com/SolaceHarmony).
 
+## [1.4.3] - 2026-06-13
+
+### Fixed
+
+- **Voice mode now works in the packaged desktop app** — the LiveKit agents
+  framework forks `node_modules` scripts and dynamically imports the agent file
+  by path, so the voice worker could not run inside the compiled single-file
+  CLI sidecar (which has no on-disk `node_modules`); voice was silently dead in
+  every installed build. The desktop app now ships a self-contained voice
+  runtime (a Bun binary, the bundled worker, the pruned native deps, and the
+  pre-downloaded Silero VAD + turn-detector ONNX models) as a Tauri resource,
+  and `serve` spawns that runtime instead. The bundle is assembled per platform
+  at build time and pruned from ~647 MB to ~305 MB (dropping `onnxruntime-web`
+  and `typescript`, and stripping source maps, type decls, docs, and tests).
+- **Voice worker failed to load on paths containing a space** — the agents
+  job-processor loaded the agent with `import(pathToFileURL(file).pathname)`,
+  which keeps percent-encoding (`%20`) but drops the `file://` scheme, so any
+  install path with a space (the dev app bundle, Windows `Program Files`, a
+  user home with a space) resolved to a literal `%20` and failed with "Cannot
+  find module". The bundled framework loader is now patched to use `.href`,
+  matching the framework's own `download.js`.
+
 ## [1.4.2] - 2026-06-13
 
 ### Fixed

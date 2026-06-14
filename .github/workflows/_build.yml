@@ -149,6 +149,15 @@ jobs:
           APPLE_API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY_PATH }}
           APPLE_API_KEY_PATH: ${{ runner.temp }}/apple-api-key.p8
 
+      # Assemble the self-contained voice runtime (bun + agent.js + node_modules
+      # + models) that the desktop app ships as a Tauri resource. The runner's
+      # host platform matches the matrix target, so the script's host
+      # auto-detection produces the correct per-platform bundle.
+      - name: Assemble voice runtime
+        run: |
+          cd packages/desktop
+          bun ./scripts/build-voice-runtime.ts
+
       - name: Build desktop app
         uses: tauri-apps/tauri-action@v0.6.2
         timeout-minutes: 60

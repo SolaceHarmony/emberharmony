@@ -6,7 +6,7 @@ import { llm } from "@livekit/agents"
 import { Flag } from "../flag/flag"
 import { SessionLLM } from "./bridge"
 import { VoiceRegistry } from "./registry"
-import { Voice } from "./token"
+import { VOICE_AGENT_NAME } from "./constants"
 import { VoiceWorkflow, VOICE_SYSTEM_PROMPT } from "./workflow"
 
 // Model strings accept an optional ":language" (STT) or ":voice" (TTS) suffix.
@@ -95,7 +95,7 @@ if (import.meta.main) {
   cli.runApp(
     new ServerOptions({
       agent: fileURLToPath(import.meta.url),
-      agentName: Voice.AGENT_NAME,
+      agentName: VOICE_AGENT_NAME,
       wsURL: url,
       apiKey,
       apiSecret,
