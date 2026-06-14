@@ -120,10 +120,8 @@ jobs:
           stage 'EmberHarmony_*_aarch64.dmg'    emberharmony-desktop-darwin-aarch64.dmg
           stage 'EmberHarmony_*_x64-setup.exe'  emberharmony-desktop-windows-x64.exe
           stage 'EmberHarmony_*_amd64.deb'      emberharmony-desktop-linux-amd64.deb
-          stage 'EmberHarmony_*_amd64.AppImage' emberharmony-desktop-linux-amd64.AppImage
           stage 'EmberHarmony*x86_64.rpm'       emberharmony-desktop-linux-x86_64.rpm
           stage 'EmberHarmony_*_arm64.deb'      emberharmony-desktop-linux-arm64.deb
-          stage 'EmberHarmony_*_arm64.AppImage' emberharmony-desktop-linux-arm64.AppImage
           stage 'EmberHarmony*aarch64.rpm'      emberharmony-desktop-linux-arm64.rpm
 
       - name: Attach archives to release

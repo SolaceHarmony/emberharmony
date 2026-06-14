@@ -74,7 +74,7 @@ EmberHarmony is also available as a desktop application. Download directly from 
 | macOS (Apple Silicon) | `emberharmony-desktop-darwin-aarch64.dmg` |
 | macOS (Intel)         | `emberharmony-desktop-darwin-x64.dmg`     |
 | Windows               | `emberharmony-desktop-windows-x64.exe`    |
-| Linux                 | `.deb`, `.rpm`, or AppImage               |
+| Linux                 | `.deb` or `.rpm`                          |
 
 #### Installation Directory
 
