@@ -158,10 +158,23 @@ console.log("[voice-runtime] downloading ONNX models")
 const modelsDir = path.join(outDir, "models")
 await mkdir(modelsDir, { recursive: true })
 const modelEnv = { ...process.env, HF_HOME: modelsDir, XDG_CACHE_HOME: modelsDir, BUN_SECURITY_SCAN: "0" }
-await $`bun run ${path.join(outDir, "agent.js")} download-files`
-  .cwd(outDir)
-  .env(modelEnv)
-  .quiet()
+// HuggingFace downloads flake — rate limits and transient errors surface as
+// e.g. "tokenizerConfig.tokenizer_class undefined" (a non-JSON response parsed
+// as the tokenizer config). A single flake otherwise aborts the whole build,
+// so retry with backoff and only fail loudly once attempts are exhausted.
+const MODEL_DL_ATTEMPTS = 4
+for (let attempt = 1; ; attempt++) {
+  const res = await $`bun run ${path.join(outDir, "agent.js")} download-files`.cwd(outDir).env(modelEnv).quiet().nothrow()
+  if (res.exitCode === 0) break
+  if (attempt >= MODEL_DL_ATTEMPTS) {
+    throw new Error(
+      `[voice-runtime] model download failed after ${MODEL_DL_ATTEMPTS} attempts:\n${(res.stderr.toString() || res.stdout.toString()).trim()}`,
+    )
+  }
+  const backoffSec = attempt * 5
+  console.log(`[voice-runtime] model download attempt ${attempt}/${MODEL_DL_ATTEMPTS} failed; retrying in ${backoffSec}s`)
+  await Bun.sleep(backoffSec * 1000)
+}
 
 // --- 3b. Prune the staged node_modules to runtime-only -------------------
 // The install pulls heavy transitive deps the worker never loads. Drop the
