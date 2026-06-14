@@ -104,6 +104,31 @@ if (existsSync(ort)) {
   }
 }
 
+// --- 2c. Patch the agents job-proc loader for paths with special chars ----
+// @livekit/agents forks job_proc_lazy_main.js and loads the agent with
+// `import(pathToFileURL(moduleFile).pathname)`. `.pathname` keeps percent-
+// encoding (a space becomes %20) but drops the file:// scheme, so import()
+// looks for a literal "%20" on disk and fails — which happens whenever the
+// install path contains a space ("EmberHarmony Dev.app", Windows "Program
+// Files", a user home with a space). The framework's own download.js uses
+// `.href` for the same call; mirror that. Fail loudly if the expected source
+// is absent (upstream changed it or the file moved) rather than shipping a
+// silently-broken worker.
+{
+  const loader = path.join(outDir, "node_modules/@livekit/agents/dist/ipc/job_proc_lazy_main.js")
+  const before = "import(pathToFileURL(moduleFile).pathname)"
+  const after = "import(pathToFileURL(moduleFile).href)"
+  const src = await Bun.file(loader).text()
+  if (!src.includes(before)) {
+    throw new Error(
+      `[voice-runtime] cannot patch job_proc_lazy_main.js: expected \`${before}\` not found in ${loader}. ` +
+        "The @livekit/agents loader changed; re-verify the agent-path fix before shipping.",
+    )
+  }
+  await Bun.write(loader, src.replace(before, after))
+  console.log("[voice-runtime] patched agents job-proc loader (pathname -> href)")
+}
+
 // --- 3. Pre-download the ONNX models (Silero VAD + turn detector) ----------
 // `download-files` populates the HF/agents caches; point them at models/ so the
 // bundled worker finds them offline. Only possible for a same-platform host
