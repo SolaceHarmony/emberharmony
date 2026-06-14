@@ -201,6 +201,12 @@ if (noBundle) {
 if (!process.argv.includes("--no-voice")) {
   console.log(`[build-local] assembling voice runtime resource...`)
   await $`bun ./scripts/build-voice-runtime.ts`.cwd(desktopDir)
+  // Sign the runtime's nested native libs (.node/.dylib) so notarization
+  // passes. The script no-ops on non-macOS and for ad-hoc local builds
+  // (APPLE_SIGNING_IDENTITY "-"), so this only does work when a real Developer
+  // ID is configured (e.g. EMBERHARMONY_NOTARIZE=1). Must run before tauri
+  // build seals the .app.
+  await $`bun ./scripts/sign-voice-runtime.ts`.cwd(desktopDir)
 } else {
   console.log(`[build-local] --no-voice: skipping voice runtime (voice will be disabled in this build)`)
   await $`rm -rf ${path.join(desktopDir, "src-tauri/resources/voice")}`
