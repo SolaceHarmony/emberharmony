@@ -5,6 +5,28 @@ All notable changes to EmberHarmony will be documented in this file.
 This project is a fork of [opencode](https://github.com/opencode-ai/opencode),
 rebranded and maintained by [The Solace Project](https://github.com/SolaceHarmony).
 
+## [1.4.6] - 2026-06-14
+
+### Fixed
+
+- **Windows desktop build failed packaging the voice runtime** — the bundled
+  runtime's `node_modules` was installed with bun, whose standalone install
+  deep-nests `@livekit/agents`' genuinely-conflicting `@opentelemetry`
+  dependencies (OTel 1.x *and* 2.x are both required) four to five
+  `node_modules` levels deep, producing paths over Windows' 260-char `MAX_PATH`
+  limit that the NSIS bundler can't open ("The system cannot find the file
+  specified"). The voice-runtime assembler now installs with **npm**, whose
+  hoisting collapses the same unavoidable conflicts into a shallow, shippable
+  tree (longest path ~167 chars, down from ~205). 1.4.5 built clean on
+  macOS/Linux but never produced a Windows bundle.
+
+### Changed
+
+- The voice-runtime assembler now reads the `@livekit/*` versions from the
+  workspace catalog and the Bun version from `packageManager`, instead of
+  hardcoding them — so the bundled runtime can no longer silently drift from
+  what the worker is compiled against.
+
 ## [1.4.5] - 2026-06-14
 
 ### Changed
