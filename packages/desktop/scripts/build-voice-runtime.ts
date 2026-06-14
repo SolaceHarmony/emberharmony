@@ -24,8 +24,6 @@ import { cp, mkdir, rm, readdir, chmod, stat } from "node:fs/promises"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 
-const BUN_VERSION = "1.3.8"
-
 function parseArg(name: string, fallback: string) {
   const i = process.argv.indexOf(`--${name}`)
   return i !== -1 && process.argv[i + 1] ? process.argv[i + 1]! : fallback
@@ -41,6 +39,23 @@ const desktopDir = path.resolve(fileURLToPath(import.meta.url), "../..")
 const repoRoot = path.resolve(desktopDir, "../..")
 const emberharmonyDir = path.join(repoRoot, "packages/emberharmony")
 const outDir = path.join(desktopDir, "src-tauri/resources/voice")
+
+// Single source of truth. The bundled runtime must install exactly the
+// @livekit versions agent.ts is compiled against (the workspace catalog), and
+// the staged bun must match the repo's bun (packageManager) — hardcoding either
+// drifts silently from the rest of the repo.
+const rootPkg = JSON.parse(await Bun.file(path.join(repoRoot, "package.json")).text())
+const BUN_VERSION = String(rootPkg.packageManager ?? "").replace(/^bun@/, "")
+if (!/^\d+\.\d+\.\d+$/.test(BUN_VERSION)) {
+  throw new Error(`[voice-runtime] no bun version in root package.json "packageManager": ${rootPkg.packageManager}`)
+}
+const catalog = rootPkg.workspaces?.catalog ?? {}
+const voiceDeps: Record<string, string> = {}
+for (const name of ["@livekit/agents", "@livekit/agents-plugin-livekit", "@livekit/agents-plugin-silero", "@livekit/rtc-node"]) {
+  const version = catalog[name]
+  if (!version) throw new Error(`[voice-runtime] ${name} missing from root package.json workspaces.catalog`)
+  voiceDeps[name] = version
+}
 
 console.log(`[voice-runtime] target: ${targetOs}/${targetArch} (host ${hostOs}/${hostArch}${isCross ? ", CROSS" : ""})`)
 
@@ -67,23 +82,27 @@ await Bun.write(
     {
       name: "emberharmony-voice-runtime",
       version: "0.0.0",
-      dependencies: {
-        "@livekit/agents": "1.4.5",
-        "@livekit/agents-plugin-livekit": "1.4.5",
-        "@livekit/agents-plugin-silero": "1.4.5",
-        "@livekit/rtc-node": "0.13.29",
-      },
+      dependencies: voiceDeps,
     },
     null,
     2,
   ),
 )
-// --os/--cpu prune the optional native deps (rtc-ffi-bindings-*) to the target.
-const bunOs = targetOs === "windows" ? "win32" : targetOs
-await $`bun install --no-save --production --os=${bunOs} --cpu=${targetArch}`
-  .cwd(stage)
-  .env({ ...process.env, BUN_SECURITY_SCAN: "0" })
-  .quiet()
+// Install with npm, not bun. Bun's standalone install deep-nests
+// @livekit/agents' @opentelemetry version conflicts (OTel 1.x AND 2.x are both
+// genuinely required) 4-5 node_modules levels deep, blowing past Windows'
+// 260-char MAX_PATH in the NSIS bundler. npm's hoisting collapses the same
+// unavoidable conflicts into a shallow, shippable tree. npm resolves optional
+// native deps (rtc-ffi-bindings-*) for the host, so the runner must be the
+// target platform — CI builds each platform on its own native runner.
+if (isCross) {
+  throw new Error(
+    `[voice-runtime] cannot cross-assemble for ${targetOs}/${targetArch} on ${hostOs}/${hostArch}: ` +
+      "npm installs the host's native deps — run the assembly on a native runner for the target.",
+  )
+}
+const bunOs = targetOs === "windows" ? "win32" : targetOs // onnxruntime-node bin dir os name
+await $`npm install --omit=dev --no-audit --no-fund --loglevel=error`.cwd(stage).quiet()
 await cp(path.join(stage, "node_modules"), path.join(outDir, "node_modules"), { recursive: true, dereference: true })
 
 // onnxruntime-node bundles every platform in one package; keep only the target.
