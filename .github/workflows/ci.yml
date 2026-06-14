@@ -23,9 +23,12 @@ permissions:
   actions: read
 
 jobs:
-  # No version job: artifacts carry the version from packages/emberharmony/package.json
-  # at build time. release and tag are omitted, so _build.yml produces workflow
-  # artifacts only — no GitHub release attachment, and nothing commits, tags, or pushes.
+  # `release` is omitted, so _build.yml produces workflow artifacts only — no
+  # GitHub release attachment, nothing commits/tags/pushes. `tag`/`target` mark
+  # these as dev-channel builds (the trigger is a dev-v* tag or manual dispatch).
   build:
     uses: ./.github/workflows/_build.yml
     secrets: inherit
+    with:
+      target: dev
+      tag: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
