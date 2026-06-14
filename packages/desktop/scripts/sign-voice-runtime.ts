@@ -30,7 +30,7 @@
  * No-op (exit 0) on non-macOS hosts and when the identity is absent or "-"
  * (ad-hoc / local non-notarized builds don't need timestamps).
  */
-import { $ } from "bun"
+import { existsSync } from "node:fs"
 import { open, readdir } from "node:fs/promises"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
@@ -86,17 +86,32 @@ async function findMachO(root: string): Promise<string[]> {
   return out
 }
 
+if (!existsSync(dir)) {
+  throw new Error(`[sign-voice-runtime] runtime dir ${dir} does not exist — assemble it first (build-voice-runtime.ts)`)
+}
 const binaries = await findMachO(dir)
 if (binaries.length === 0) {
   throw new Error(`[sign-voice-runtime] no Mach-O binaries found under ${dir} — is the voice runtime assembled?`)
 }
 
+// Run codesign via Bun.spawn with explicit argv (not the `$` shell) so the
+// optional --keychain flag and the space-containing identity are passed as
+// exact arguments, with no shell quoting or empty-array interpolation quirks.
+async function run(args: string[]) {
+  const proc = Bun.spawn(["codesign", ...args], { stdout: "ignore", stderr: "pipe" })
+  await proc.exited
+  if (proc.exitCode !== 0) {
+    const err = await new Response(proc.stderr).text()
+    throw new Error(`[sign-voice-runtime] \`codesign ${args.join(" ")}\` failed (${proc.exitCode}): ${err.trim()}`)
+  }
+}
+
 console.log(`[sign-voice-runtime] signing ${binaries.length} Mach-O binaries with "${identity}"`)
-const kcArgs = keychain ? ["--keychain", keychain] : []
+const keychainArgs = keychain ? ["--keychain", keychain] : []
 for (const bin of binaries) {
-  await $`codesign --force --timestamp --options runtime --preserve-metadata=entitlements ${kcArgs} --sign ${identity} ${bin}`.quiet()
+  await run(["--force", "--timestamp", "--options", "runtime", "--preserve-metadata=entitlements", ...keychainArgs, "--sign", identity, bin])
   // --strict catches a signature that codesign wrote but that won't pass Gatekeeper.
-  await $`codesign --verify --strict --verbose=2 ${bin}`.quiet()
+  await run(["--verify", "--strict", "--verbose=2", bin])
   console.log(`  ✓ ${path.relative(dir, bin)}`)
 }
 console.log("[sign-voice-runtime] done")
