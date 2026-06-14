@@ -22,3 +22,8 @@ export { useMultibandTrackVolume, type MultiBandTrackVolumeOptions } from "./hoo
 export { useBarAnimator } from "./hooks/bar-animator"
 export { AudioTrack, RoomAudioRenderer, type AudioTrackProps, type RoomAudioRendererProps } from "./components/audio"
 export { BarVisualizer, type BarVisualizerProps, type BarVisualizerOptions } from "./components/bar-visualizer"
+// Re-export the upstream types that appear in this package's public hook
+// signatures (useVoiceAssistant().audioTrack, useTranscriptions()), so
+// consumers can type values bridged out of the hooks without depending on
+// @livekit/components-core directly.
+export type { TrackReference, TextStreamData } from "@livekit/components-core"
