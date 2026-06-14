@@ -158,6 +158,34 @@ jobs:
           cd packages/desktop
           bun ./scripts/build-voice-runtime.ts
 
+      # Sign the voice runtime's nested native libs (.node/.dylib) with the
+      # Developer ID cert + a secure timestamp, BEFORE tauri-action assembles
+      # and notarizes the app — tauri seals resource code without re-signing it,
+      # so unsigned nested binaries otherwise fail notarization. Uses a throwaway
+      # keychain; the bundled `bun` is left as oven-sh shipped it.
+      - name: Sign bundled voice runtime binaries
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN="$RUNNER_TEMP/voice-sign.keychain-db"
+          KEYCHAIN_PW="$(openssl rand -base64 24)"
+          CERT="$RUNNER_TEMP/voice-cert.p12"
+          security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          echo "$APPLE_CERTIFICATE" | base64 --decode > "$CERT"
+          security import "$CERT" -P "$APPLE_CERTIFICATE_PASSWORD" -k "$KEYCHAIN" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PW" "$KEYCHAIN" >/dev/null
+          # Prepend the keychain to the search list so codesign resolves the identity.
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | sed 's/"//g')
+          bun packages/desktop/scripts/sign-voice-runtime.ts --identity "$APPLE_SIGNING_IDENTITY" --keychain "$KEYCHAIN"
+          rm -f "$CERT"
+
       - name: Build desktop app
         uses: tauri-apps/tauri-action@v0.6.2
         timeout-minutes: 60

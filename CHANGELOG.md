@@ -5,6 +5,23 @@ All notable changes to EmberHarmony will be documented in this file.
 This project is a fork of [opencode](https://github.com/opencode-ai/opencode),
 rebranded and maintained by [The Solace Project](https://github.com/SolaceHarmony).
 
+## [1.4.4] - 2026-06-14
+
+### Fixed
+
+- **macOS desktop release failed notarization** — the bundled voice runtime
+  ships prebuilt native libraries (`@livekit/rtc-ffi`, `onnxruntime-node`,
+  `sharp`/`libvips`) that arrive from npm unsigned. Tauri signs the app, its
+  main binary, and the sidecar but seals nested resource code without signing
+  it, so notarization rejected every macOS build of 1.4.3 with "not signed with
+  a valid Developer ID certificate" / "signature does not include a secure
+  timestamp". The build now signs each nested `.node`/`.dylib` with the
+  Developer ID cert + a secure timestamp + hardened runtime before `tauri build`
+  seals the app (`scripts/sign-voice-runtime.ts`, wired into the local build and
+  a CI keychain step). The bundled `bun` is left as oven-sh ships it — already
+  Developer-ID signed and timestamped, with `disable-library-validation` (which
+  is what lets it load the re-signed libs).
+
 ## [1.4.3] - 2026-06-13
 
 ### Fixed
