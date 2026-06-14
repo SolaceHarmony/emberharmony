@@ -9,6 +9,15 @@ rebranded and maintained by [The Solace Project](https://github.com/SolaceHarmon
 
 ### Fixed
 
+- **macOS notarization rejected the unsigned voice-runtime binaries** — the CI
+  step that signs the bundled native binaries passed
+  `--identity "$APPLE_SIGNING_IDENTITY"`, but that secret is intentionally unset
+  in this repo (it is optional; `tauri-action` auto-derives the identity from
+  the imported `APPLE_CERTIFICATE`). With an empty identity the signer took its
+  ad-hoc "skip" path, so every nested `.node`/`.dylib`/`ffmpeg` shipped unsigned
+  and notarization failed with "not signed with a valid Developer ID
+  certificate". The step now derives the Developer ID identity from the imported
+  cert in its keychain and fails loudly if none is found, instead of skipping.
 - **Windows desktop build failed packaging the voice runtime** — the bundled
   runtime's `node_modules` was installed with bun, whose standalone install
   deep-nests `@livekit/agents`' genuinely-conflicting `@opentelemetry`
