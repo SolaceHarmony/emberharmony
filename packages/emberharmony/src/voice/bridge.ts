@@ -149,14 +149,26 @@ export class SessionLLMStream extends llm.LLMStream {
       throw new Error(`session prompt failed: ${response.status} ${await response.text().catch(() => "")}`)
     }
 
-    // The reply is whichever message in this session streams text deltas next.
-    // User-message parts are created whole (no delta), so they never match.
-    // The server emits heartbeats every 30s, so this loop always wakes even
-    // when the session goes quiet — the staleness check turns a reply that
-    // never starts (or never finishes) into an error instead of a worker hang.
+    // A turn can span several assistant messages: a tool-call step finalizes
+    // its message (sets time.completed) BEFORE the tool runs, then the next
+    // step opens a fresh assistant message for the post-tool reply. So we
+    // stream text from every assistant message in this session — under one
+    // stable id so TTS speaks it as one continuous utterance — and end the
+    // turn only when the session returns to idle.
+    //
+    // Ending on a single message's completion (the old behaviour) cut the reply
+    // off the instant the first tool-call message finalized: this stream closed,
+    // its abort handler POSTed /abort, and the server killed the still-running
+    // tool ("operation aborted") while the continuation never streamed.
+    //
+    // The server emits a heartbeat every 30s, which bumps the activity clock —
+    // so the staleness check only fires when the SSE connection itself goes
+    // dead (no heartbeat for STALE_MS), turning a silently-dropped stream into
+    // an error instead of a worker hang. A long-running tool keeps the stream
+    // alive via those heartbeats, so it never trips this.
     const STALE_MS = 120_000
     let lastActivity = Date.now()
-    let replyMessageID: string | undefined
+    let replyId: string | undefined
     for await (const event of events) {
       if (Date.now() - lastActivity > STALE_MS) {
         throw new Error(`session reply timed out (no session events for ${STALE_MS / 1000}s)`)
@@ -166,17 +178,21 @@ export class SessionLLMStream extends llm.LLMStream {
         if (!part || part.sessionID !== this.#opts.sessionID) continue
         lastActivity = Date.now()
         if (part.type !== "text" || !delta) continue
-        if (!replyMessageID) replyMessageID = part.messageID
-        if (part.messageID !== replyMessageID) continue
-        this.queue.put({ id: replyMessageID!, delta: { role: "assistant", content: delta } })
+        if (!replyId) replyId = part.messageID
+        this.queue.put({ id: replyId!, delta: { role: "assistant", content: delta } })
       }
       if (event.type === "message.updated") {
-        const info = event.properties?.info
-        if (!info || info.sessionID !== this.#opts.sessionID) continue
-        lastActivity = Date.now()
-        if (replyMessageID && info.id === replyMessageID && info.time?.completed) return
-        // reply finished with no text at all (e.g. aborted server-side)
-        if (!replyMessageID && info.role === "assistant" && info.time?.completed) return
+        if (event.properties?.info?.sessionID === this.#opts.sessionID) lastActivity = Date.now()
+      }
+      // Heartbeats (every 30s) prove the SSE connection is alive even while a
+      // long tool runs with no message events — bump activity so the staleness
+      // check only trips on a genuinely dead connection, not a slow tool.
+      if (event.type === "server.heartbeat") lastActivity = Date.now()
+      // The whole turn — every step and tool call — is done only when the
+      // session goes idle (also fires on server-side cancel, which ends the
+      // turn just the same).
+      if (event.type === "session.idle" && event.properties?.sessionID === this.#opts.sessionID) {
+        return
       }
       if (event.type === "session.error") {
         const props = event.properties ?? {}
