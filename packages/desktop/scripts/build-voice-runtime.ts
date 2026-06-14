@@ -46,10 +46,12 @@ const outDir = path.join(desktopDir, "src-tauri/resources/voice")
 // drifts silently from the rest of the repo.
 const rootPkg = JSON.parse(await Bun.file(path.join(repoRoot, "package.json")).text())
 const BUN_VERSION = String(rootPkg.packageManager ?? "").replace(/^bun@/, "")
-if (!/^\d+\.\d+\.\d+$/.test(BUN_VERSION)) {
+// Allow pre-release/canary tags (e.g. 1.3.8-canary.1), not just exact semver.
+if (!/^\d+\.\d+\.\d+(?:-.+)?$/.test(BUN_VERSION)) {
   throw new Error(`[voice-runtime] no bun version in root package.json "packageManager": ${rootPkg.packageManager}`)
 }
-const catalog = rootPkg.workspaces?.catalog ?? {}
+// Catalogs may live at the top level or under workspaces (bun supports both).
+const catalog = rootPkg.catalog ?? rootPkg.workspaces?.catalog ?? {}
 const voiceDeps: Record<string, string> = {}
 for (const name of ["@livekit/agents", "@livekit/agents-plugin-livekit", "@livekit/agents-plugin-silero", "@livekit/rtc-node"]) {
   const version = catalog[name]
