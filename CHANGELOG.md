@@ -5,6 +5,15 @@ All notable changes to EmberHarmony will be documented in this file.
 This project is a fork of [opencode](https://github.com/opencode-ai/opencode),
 rebranded and maintained by [The Solace Project](https://github.com/SolaceHarmony).
 
+## [1.4.5] - 2026-06-14
+
+### Changed
+
+- **`@parcel/watcher` 2.5.1 → 2.5.6** — bumped the file-watcher and all seven
+  pinned platform binary packages (`darwin-arm64`, `darwin-x64`,
+  `linux-{arm64,x64}-{glibc,musl}`, `win32-x64`) plus the meta package, keeping
+  the lockfile's full platform set aligned at 2.5.6.
+
 ## [1.4.4] - 2026-06-14
 
 ### Fixed
