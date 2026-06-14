@@ -160,14 +160,30 @@ fn spawn_sidecar(app: &AppHandle, hostname: &str, port: u32, password: &str) -> 
 
     println!("spawning sidecar on port {port}");
 
-    let (mut rx, child) = cli::create_command(
+    let mut command = cli::create_command(
         app,
         format!("serve --hostname {hostname} --port {port}").as_str(),
     )
     .env("EMBERHARMONY_SERVER_USERNAME", "emberharmony")
-    .env("EMBERHARMONY_SERVER_PASSWORD", password)
-    .spawn()
-    .expect("Failed to spawn emberharmony");
+    .env("EMBERHARMONY_SERVER_PASSWORD", password);
+
+    // Point the sidecar at the bundled voice runtime (bun + agent.js +
+    // node_modules + models). The LiveKit agents framework forks node_modules
+    // scripts, so it can't run inside the compiled CLI; serve spawns this
+    // self-contained runtime instead. Only set when the resource is present.
+    match app
+        .path()
+        .resolve("resources/voice", tauri::path::BaseDirectory::Resource)
+    {
+        Ok(dir) if dir.join("agent.js").exists() => {
+            println!("voice runtime: {}", dir.display());
+            command = command.env("EMBERHARMONY_VOICE_RUNTIME_DIR", dir);
+        }
+        Ok(dir) => eprintln!("voice runtime not bundled at {} — voice disabled", dir.display()),
+        Err(e) => eprintln!("could not resolve voice runtime resource: {e}"),
+    }
+
+    let (mut rx, child) = command.spawn().expect("Failed to spawn emberharmony");
 
     tauri::async_runtime::spawn(async move {
         while let Some(event) = rx.recv().await {

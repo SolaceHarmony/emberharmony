@@ -6,9 +6,10 @@ import { Auth } from "../auth"
 import { Config } from "../config/config"
 import { Flag } from "../flag/flag"
 import { VoiceRegistry } from "./registry"
+import { VOICE_AGENT_NAME } from "./constants"
 
 export namespace Voice {
-  export const AGENT_NAME = "emberharmony-voice"
+  export const AGENT_NAME = VOICE_AGENT_NAME
 
   /** Auth store entry holding the LiveKit API key (key) and secret (secret) */
   export const AUTH_PROVIDER_ID = "livekit"
