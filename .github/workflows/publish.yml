@@ -94,25 +94,37 @@ jobs:
           merge-multiple: true
         continue-on-error: true
 
-      - name: Rename desktop bundles for consistent download URLs
+      - name: Stage desktop bundles for the release
         run: |
-          cd desktop 2>/dev/null || exit 0
-          # nullglob: a bundle format that wasn't produced (not every platform
-          # emits every format) expands to nothing and its loop is a no-op,
-          # instead of leaving the literal pattern that fails `[ -f ]` and, as
-          # the script's last command under `bash -e`, fails the whole step.
-          # A real `mv` failure still propagates.
-          shopt -s nullglob
-          # Tauri produces names like EmberHarmony_1.4.0_aarch64.dmg;
-          # the download page expects emberharmony-desktop-darwin-aarch64.dmg etc.
-          for f in EmberHarmony_*_aarch64.dmg;          do mv "$f" "emberharmony-desktop-darwin-aarch64.dmg";       done
-          for f in EmberHarmony_*_x64-setup.exe;        do mv "$f" "emberharmony-desktop-windows-x64.exe";          done
-          for f in EmberHarmony_*_amd64.deb;            do mv "$f" "emberharmony-desktop-linux-amd64.deb";           done
-          for f in EmberHarmony_*_amd64.AppImage;       do mv "$f" "emberharmony-desktop-linux-amd64.AppImage";      done
-          for f in EmberHarmony_*.x86_64.rpm;           do mv "$f" "emberharmony-desktop-linux-x86_64.rpm";          done
-          for f in EmberHarmony_*_arm64.deb;            do mv "$f" "emberharmony-desktop-linux-arm64.deb";           done
-          for f in EmberHarmony_*_arm64.AppImage;       do mv "$f" "emberharmony-desktop-linux-arm64.AppImage";      done
-          for f in EmberHarmony_*.aarch64.rpm;          do mv "$f" "emberharmony-desktop-linux-arm64.rpm";           done
+          # tauri-action's bundles land NESTED, e.g.
+          #   desktop/<artifact>/.../release/bundle/dmg/EmberHarmony_1.4.1_aarch64.dmg
+          # The previous step globbed only the top level of desktop/, matched
+          # nothing, and renamed/uploaded nothing — which is why every release so
+          # far shipped only CLI archives and no desktop app. Find each bundle
+          # wherever it sits and copy it to a flat dir under the canonical
+          # download name the README/console reference. `cp` (not `mv`) so the
+          # original artifact tree stays intact for debugging.
+          set -u
+          mkdir -p desktop-assets
+          stage() {
+            # $1 = find -name pattern (case-sensitive), $2 = canonical filename
+            local src
+            src=$(find desktop -type f -name "$1" 2>/dev/null | head -n1)
+            if [ -n "$src" ]; then
+              cp "$src" "desktop-assets/$2"
+              echo "staged: $src -> desktop-assets/$2"
+            else
+              echo "no match for $1 (this platform/format not built — skipping)"
+            fi
+          }
+          stage 'EmberHarmony_*_aarch64.dmg'    emberharmony-desktop-darwin-aarch64.dmg
+          stage 'EmberHarmony_*_x64-setup.exe'  emberharmony-desktop-windows-x64.exe
+          stage 'EmberHarmony_*_amd64.deb'      emberharmony-desktop-linux-amd64.deb
+          stage 'EmberHarmony_*_amd64.AppImage' emberharmony-desktop-linux-amd64.AppImage
+          stage 'EmberHarmony*x86_64.rpm'       emberharmony-desktop-linux-x86_64.rpm
+          stage 'EmberHarmony_*_arm64.deb'      emberharmony-desktop-linux-arm64.deb
+          stage 'EmberHarmony_*_arm64.AppImage' emberharmony-desktop-linux-arm64.AppImage
+          stage 'EmberHarmony*aarch64.rpm'      emberharmony-desktop-linux-arm64.rpm
 
       - name: Attach archives to release
         env:
@@ -121,12 +133,14 @@ jobs:
         run: |
           set -euo pipefail
           ls -la dist
-          ls -la desktop 2>/dev/null || echo "No desktop artifacts found"
+          ls -la desktop-assets 2>/dev/null || echo "No desktop bundles staged"
           gh release upload "$TAG" dist/*.tar.gz dist/*.zip dist/*.sha256 \
             --clobber --repo "${{ github.repository }}"
-          if ls desktop/*.* 2>/dev/null; then
-            gh release upload "$TAG" desktop/*.* \
+          if compgen -G "desktop-assets/*" > /dev/null; then
+            gh release upload "$TAG" desktop-assets/* \
               --clobber --repo "${{ github.repository }}"
+          else
+            echo "No desktop bundles to upload"
           fi
 
   # npm publish runs ONLY for stable main-channel releases, and only after the

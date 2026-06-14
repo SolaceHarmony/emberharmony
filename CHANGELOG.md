@@ -5,6 +5,21 @@ All notable changes to EmberHarmony will be documented in this file.
 This project is a fork of [opencode](https://github.com/opencode-ai/opencode),
 rebranded and maintained by [The Solace Project](https://github.com/SolaceHarmony).
 
+## [1.4.2] - 2026-06-13
+
+### Fixed
+
+- **Desktop app missing from releases** — the `attach-assets` release step
+  globbed only the top level of the downloaded artifacts, but tauri-action
+  writes its bundles nested under `…/release/bundle/<type>/`, so the `.dmg`,
+  `.exe`, `.deb`, `.rpm`, and `.AppImage` were never found, renamed, or
+  uploaded — every prior release shipped CLI archives only. The step now finds
+  each bundle recursively and uploads it under the canonical
+  `emberharmony-desktop-*` name. (The macOS `.app`/`.dmg` are signed and
+  notarized in CI, so they open without Gatekeeper friction — unlike the raw
+  CLI binary, which is unsigned and meant to be installed via npm or the
+  install script, not double-clicked.)
+
 ## [1.4.1] - 2026-06-13
 
 ### Fixed
