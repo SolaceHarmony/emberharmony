@@ -9,6 +9,12 @@ rebranded and maintained by [The Solace Project](https://github.com/SolaceHarmon
 
 ### Fixed
 
+- **Voice-runtime build aborted on a flaky HuggingFace model download** — the
+  assembler's `download-files` step had no retry, so a single transient
+  HuggingFace error (rate limiting surfaces as
+  "tokenizerConfig.tokenizer_class undefined" when a non-JSON response is parsed
+  as the turn-detector tokenizer config) failed the whole build. The download
+  now retries with backoff and only fails loudly after exhausting attempts.
 - **macOS notarization rejected the unsigned voice-runtime binaries** — the CI
   step that signs the bundled native binaries passed
   `--identity "$APPLE_SIGNING_IDENTITY"`, but that secret is intentionally unset
