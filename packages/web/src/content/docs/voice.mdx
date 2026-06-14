@@ -1,0 +1,348 @@
+---
+title: Voice
+description: Talk to EmberHarmony with your voice.
+---
+
+Voice lets you speak to EmberHarmony and hear replies in real time. It uses [LiveKit](https://livekit.io) for audio, speech-to-text, and text-to-speech.
+
+---
+
+## Setup
+
+Voice requires a LiveKit Cloud account or self-hosted LiveKit server.
+
+1. Create a project at [livekit.cloud](https://cloud.livekit.io) and note your URL, API key, and API secret.
+
+2. Open **Settings → Voice** in the app.
+
+3. Enter your LiveKit URL (e.g. `wss://my-project.livekit.cloud`) and credentials.
+
+4. Enable voice and pick your preferred STT and TTS providers.
+
+5. Press the mic button in any session to start talking.
+
+---
+
+## How it works today
+
+When you press the mic button, the app requests a LiveKit token, connects to a room named `emberharmony_{sessionID}`, and dispatches a voice agent worker. One room per session — navigating to a different session disconnects and reconnects.
+
+```
+You speak → STT → Intent router (plan or build)
+         → Session bridge → EmberHarmony server → LLM response
+         → TTS → You hear the reply
+```
+
+### Intent routing
+
+Every spoken turn starts in **plan** mode (read-only). The `VoiceWorkflow` sends the utterance to a small fast model that classifies it as `PLAN` or `BUILD`. Only an exact match of "BUILD" — triggered by explicit confirmation like "yes, do it" or "go ahead" — switches to build mode for that single turn. Classification failures default safely to plan.
+
+```ts
+// From workflow.ts — exact match only
+if (verdict.trim().toUpperCase() === "BUILD") this.#mode = "build"
+```
+
+### Session bridge
+
+`SessionLLM` replaces the LLM step in the LiveKit voice pipeline. Instead of calling a model provider directly, each voice turn:
+
+1. Opens an SSE connection to `{serverUrl}/event`
+2. Resolves the model from recent message history
+3. POSTs the transcribed text to `/session/{sessionID}/prompt_async`
+4. Streams text deltas from the SSE feed back to TTS
+5. Ends the turn when the session emits `session.idle`
+
+The bridge also POSTs `/session/{sessionID}/abort` when the user interrupts, so the server cancels generation and the next turn isn't blocked by a busy session.
+
+### Room model
+
+Each session gets its own LiveKit room named `emberharmony_{sessionID}`. The agent is dispatched to that room via `RoomAgentDispatch` in the access token, with session metadata baked in:
+
+```ts
+token.roomConfig = new RoomConfiguration({
+  agents: [
+    new RoomAgentDispatch({
+      agentName: "emberharmony-voice",
+      metadata: JSON.stringify({
+        sessionID: "abc123",
+        directory: "/path/to/project",
+        serverUrl: "http://localhost:4096",
+      }),
+    }),
+  ],
+})
+```
+
+### Limitations
+
+The current design has some constraints:
+
+- **Session-locked.** The agent is bound to the session it was dispatched to. Switching sessions requires disconnecting from one room and connecting to another.
+- **No memory.** The agent doesn't carry context between rooms. Each session starts fresh.
+- **No tools.** The agent can't list sessions, create new ones, or switch on its own. It can only forward words to the attached session.
+- **No workflow states.** The intent router classifies each turn independently. There's no state machine tracking whether the agent proposed a plan, the user confirmed it, or execution finished. Every turn is either plan or build — no memory of the conversation stage.
+
+---
+
+## Proposed design
+
+> **This section describes the planned architecture.** It is not yet implemented. See the project plan for implementation phasing.
+
+Voice is being redesigned as an untethered assistant — one that has its own reasoning brain, its own context window, and the ability to move between sessions without reconnecting.
+
+### Why voice needs its own brain
+
+When you type a prompt, you're in a session. The session has its own model, its own context, its own tools. Voice doesn't fit that model for three reasons:
+
+1. **You speak without looking at the screen.** You can't see which session is focused. The agent needs to know where it is and be able to tell you, or switch to where the work needs to happen.
+
+2. **You change your mind mid-conversation.** "Actually, let me check on the API refactor first." In text, you open another tab. In voice, the agent should follow you — or you should be able to tell it to switch.
+
+3. **Voice has its own safety concerns.** The model shouldn't execute file changes just because you said something ambiguous. Every turn defaults to plan mode unless you explicitly confirm execution. A lightweight intent classifier gates this, not the LLM itself.
+
+These constraints lead to a voice agent that has its own reasoning brain, its own context window, and the ability to attach to any session — or operate detached, browsing your project from above.
+
+### Pipeline
+
+When you press the mic button the app connects to a persistent LiveKit room (one per project, not one per session) and the agent is dispatched once.
+
+```
+You speak → STT → Brain (own context, own tools)
+                    ↓ intent classifier gates plan/build safety
+                 → TTS → You hear the reply
+                    ↓ when attached to a session
+                 → Session bridge → EmberHarmony server → prompt_async
+```
+
+The brain doesn't forward every word to a session. It reasons about what you said, decides which tool to call, and only touches a session when it has something specific to submit. This is why it needs its own LLM — the brain is the thinker, the session is the worker.
+
+### Workflows
+
+Voice runs a **workflow state machine** — a set of stages with defined transitions, enforced by the agent rather than left to prompt engineering.
+
+Without a state machine, every turn is independent. The agent has no memory of whether it just proposed a plan or whether the user confirmed it. You'd need the LLM to infer state from the conversation history — fragile, easy to jailbreak, and impossible to surface in the UI.
+
+With a workflow, the agent _knows_ it's in the proposing stage. The UI can show a "Confirm" button. The intent classifier can gate the transition. The agent can't skip ahead. The state is explicit, shared, and enforced.
+
+#### The planning workflow
+
+The default cycle for planning and building:
+
+```
+[gathering]  → you describe what you want
+      ↓
+[proposing]  → the agent presents a plan and asks whether to proceed
+      ↓       you confirm (voice or tap)
+[confirmed]  → one-time flip to build mode
+      ↓
+[executing]  → the agent submits work to the attached session
+      ↓       the session goes idle
+[reviewing]  → the agent summarizes what happened
+      ↓       back to gathering
+```
+
+The agent can't skip from `gathering` to `executing`. It must propose, and you must confirm. This isn't just a UX nicety — it's a safety property. The brain is powerful (it can submit to any session, switch sessions, create new ones). The workflow constrains that power to moments where you've explicitly granted it.
+
+The current stage is exposed through [participant attributes](https://docs.livekit.io/transport/data/state/participant-attributes):
+
+```ts
+ctx.room.localParticipant.setAttributes({
+  "emberharmony.agent_state": agentState,
+  "emberharmony.voice_mode": "plan",
+  "emberharmony.voice_stage": "proposing",
+  "emberharmony.attached_session": currentSessionID,
+})
+```
+
+The client reads these reactively:
+
+```ts
+const { agentAttributes } = useVoiceAssistant(room)
+const voiceMode = () => agentAttributes()?.["emberharmony.voice_mode"] ?? "plan"
+const voiceStage = () => agentAttributes()?.["emberharmony.voice_stage"] ?? "gathering"
+```
+
+#### The proposing moment
+
+When the agent finishes gathering requirements, it transitions to `proposing` and delivers a structured plan. The UI can show a "Confirm" button. The user can say "yes" or tap it — both trigger the same transition:
+
+```ts
+// Voice: the intent classifier recognizes "yes, do it" as a build confirmation
+// Touch: the client sends an RPC
+await room.localParticipant.performRpc({
+  destinationIdentity: agent.identity,
+  method: "confirm_plan",
+  payload: "",
+})
+```
+
+The agent registers the handler:
+
+```ts
+ctx.room.localParticipant.registerRpcMethod("confirm_plan", async () => {
+  workflow.transition("confirmed")
+  return "ok"
+})
+```
+
+Either path flips the mode to `build` for exactly one turn, then the workflow returns to `plan`.
+
+#### Docs mode
+
+The `docs` workflow mode lets the agent write documentation instead of code. It follows the same shape — `gathering` → `proposing` → `executing` → `reviewing` — but the system prompt instructs the agent to write docs. The confirmation gate still applies.
+
+#### Custom workflows
+
+The same pattern works for other domains. A customer service workflow:
+
+```
+[greeting] → [diagnosing] → [resolving] → [confirming] → [closed]
+```
+
+Each workflow is a set of stages, valid transitions, mode assignments, and system prompts. The LiveKit agent framework makes this natural — the `Agent` class persists across the entire room session and has lifecycle hooks (`onUserTurnCompleted`, `onEnter`, etc.) that drive transitions.
+
+### Two agents: Concierge and Operator
+
+The voice agent isn't one monolith. It's two agents that hand off to each other depending on whether you're browsing or working:
+
+- **Concierge** (detached) — lists sessions, searches, creates new ones, answers questions about your project. No session attached. Tools: `listSessions`, `searchSessions`, `createSession`, `attachSession`, `setModel`.
+
+- **Operator** (attached) — working inside a specific session. Submits prompts, checks status, switches sessions. Tools: `submitToAttached`, `getStatus`, `abortAttached`, `switchSession`, `detach`, `setModel`.
+
+When you say "open the auth session," the Concierge calls `attachSession`, which triggers a LiveKit handoff to the Operator. The Operator picks up the conversation with a handoff brief that preserves the "why." When you say "switch to the API work," the Operator hands off to a new Operator instance bound to that session.
+
+This separation exists because **detached and attached are fundamentally different modes**. A detached agent should reason about your project as a whole. An attached agent should reason about the specific task in front of it. The tools, the system prompt, and the safety constraints are different.
+
+### Session-agnostic voice
+
+The agent isn't locked to the session it started in. It can switch sessions, list them, create new ones — all by voice.
+
+- "Switch to the API work session"
+- "Start a new session about the login refactor"
+- "What sessions do I have open?"
+
+The agent resolves session names through the server API. You never need the keyboard to change context.
+
+Voice uses **one LiveKit room per project** (`emberharmony_voice_{projectID}`), not one per session. Session switching is done entirely through [participant attributes](https://docs.livekit.io/transport/data/state/participant-attributes) — a real-time key-value store synced to every participant in the room. No data messages, no generation counters, no reconnects.
+
+Each participant publishes which session it's focused on, and observes the other's attribute to stay in sync:
+
+```ts
+// App publishes the session the user is looking at
+room.localParticipant.setAttributes({
+  "emberharmony.app_session": currentSessionID,
+})
+
+// Agent publishes the session it's attached to
+ctx.room.localParticipant.setAttributes({
+  "emberharmony.attached_session": currentSessionID,
+  "emberharmony.voice_mode": "plan",
+  "emberharmony.voice_stage": "proposing",
+})
+```
+
+Each side watches the other's attribute and reconciles. When you navigate to a different session in the UI, the app updates `app_session`. The agent observes the change and switches its prompt target. When the agent switches sessions by voice command, it updates `attached_session`. The app observes the change and routes there.
+
+Echo suppression is just value comparison — if the new value already matches your current state, skip it. Attributes survive reconnects because they're stored server-side on the participant, so a brief network interruption doesn't cause desync.
+
+RPC is reserved for true imperatives — actions that need an immediate response and can't be expressed as a state change:
+
+| Method         | Payload    | Purpose                                |
+| -------------- | ---------- | -------------------------------------- |
+| `confirm_plan` | _(empty)_  | Transition from proposing to confirmed |
+| `switch_mode`  | `{ mode }` | Change the agent's mode directly       |
+
+### The brain
+
+The voice agent doesn't run its LLM inside the worker process. It proxies through a server endpoint.
+
+The bundled voice runtime is a sealed artifact — `agent.js` plus four `@livekit/*` packages. The EmberHarmony provider stack is ~25 AI-SDK packages plus Config, Auth, and Instance state. Importing all of that into the worker would bloat the bundle and create a dependency nightmare (the worker has no project credentials, no config access).
+
+Instead, the worker's `BrainLLM` serializes the conversation context and tool schemas, POSTs them to `POST /voice/brain`, and streams back `text-delta` and `tool-call` events. This mirrors how `SessionLLM` already proxies over HTTP.
+
+`/voice/brain` runs one AI-SDK step per call. Tools are passed as schemas with no `execute` function — the brain only _proposes_ tool calls. The worker registers real `llm.tool()`s whose `execute` runs locally. AgentSession appends results to the conversation context and calls `chat()` again, which triggers the next `/voice/brain` step.
+
+#### Plan/build safety
+
+The brain must never self-authorize execution. The intent classifier's verdict is the only thing that can flip to build mode, and it's enforced in the tool's `execute` function:
+
+```ts
+// The brain can downgrade to plan, but never upgrade to build
+const effectiveMode = classifierVerdict === "build" && requested !== "plan" ? "build" : "plan"
+```
+
+This is enforced in code, not in instructions. A prompt injection cannot grant build access.
+
+---
+
+## Configuration
+
+### Environment variables
+
+The voice agent worker reads these at startup:
+
+| Variable                          | Purpose                                                      |
+| --------------------------------- | ------------------------------------------------------------ |
+| `EMBERHARMONY_LIVEKIT_URL`        | LiveKit server URL                                           |
+| `EMBERHARMONY_LIVEKIT_API_KEY`    | API key                                                      |
+| `EMBERHARMONY_LIVEKIT_API_SECRET` | API secret                                                   |
+| `EMBERHARMONY_VOICE_STT_MODEL`    | Speech-to-text model (default: `deepgram/nova-3:multi`)      |
+| `EMBERHARMONY_VOICE_TTS_MODEL`    | Text-to-speech model (default: `cartesia/sonic-3`)           |
+| `EMBERHARMONY_VOICE_INTENT_MODEL` | Intent classification model (default: `openai/gpt-5.4-nano`) |
+| `EMBERHARMONY_VOICE_SERVER_URL`   | Override the EmberHarmony server URL                         |
+| `EMBERHARMONY_VOICE_WORKER_PORT`  | Health-check port (default: `0` for ephemeral)               |
+
+### Settings API
+
+Voice settings are managed through the config API:
+
+- `GET /voice/status` — check if voice is configured and available
+- `GET /voice/config` — current settings and registry of available STT/TTS models
+- `PATCH /voice/config` — update settings (disabled, stt, tts, intent)
+- `POST /voice/token` — generate a LiveKit access token
+
+---
+
+## Architecture
+
+### Components
+
+- **VoiceWorker** — a child process managed by `emberharmony serve` that runs the LiveKit agent
+- **VoiceWorkflow** — classifies each spoken turn as plan or build using a small intent model
+- **SessionLLM** — bridges voice turns into EmberHarmony sessions via the server prompt API
+- **VoiceProvider** — SolidJS context that manages the LiveKit room, mic state, and session following
+
+### Launch modes
+
+The voice worker has two launch modes:
+
+- **Bundled** — the desktop app ships a self-contained runtime (bun + agent.js + node_modules + models)
+- **Source** — dev mode runs `agent.ts` with the current Bun process
+
+---
+
+## Troubleshooting
+
+### Voice not available
+
+Check that your LiveKit credentials are correct in **Settings → Voice**. The status indicator shows whether the connection is healthy.
+
+### Agent worker not starting
+
+The worker logs to the server's stdout/stderr. Run `emberharmony serve` in the foreground to see worker logs. Common issues:
+
+- Missing or wrong API credentials
+- Network connectivity to LiveKit Cloud
+- Port conflicts on the health-check port
+
+### Mic not working
+
+WebKit (iOS, macOS Safari) can block audio playback until a user gesture activates the audio session. The app creates an `AudioContext` on connect to work around this. If mic still doesn't work, check browser permissions.
+
+### Voice settings loop
+
+If the voice settings panel causes rapid worker restarts (hundreds of spawns in seconds), make sure you're on version 1.4.7 or later. Earlier versions had a controlled-component loop where PATCH requests fired on every refetch. The fix guards each widget to only PATCH when the value actually changes, and the server skips worker restarts when settings are identical.
+
+### Webview resets
+
+The desktop app uses WKWebView, which has a hard memory limit (~1.5–2 GB). The LiveKit `Room` object with WebRTC peer connections and audio processing can push the webview process over that limit, causing macOS to terminate and restart it. If the app appears to refresh on its own, check Activity Monitor for the WebContent process memory. The persistent room model (one room per project instead of one per session) reduces WebRTC churn, and future versions will move the Room object higher in the component tree so it survives navigation.
