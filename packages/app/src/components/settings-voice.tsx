@@ -129,7 +129,14 @@ export const SettingsVoice: Component = () => {
                   disabled:true even though the user meant to enable */}
               <Show when={config()}>
                 {(cfg) => (
-                  <Switch hideLabel checked={!cfg().disabled} onChange={(checked) => update({ disabled: !checked })}>
+                  <Switch
+                    hideLabel
+                    checked={!cfg().disabled}
+                    onChange={(checked) => {
+                      if (!cfg().disabled === checked) return
+                      update({ disabled: !checked })
+                    }}
+                  >
                     {language.t("settings.voice.row.enabled.title")}
                   </Switch>
                 )}
@@ -186,7 +193,12 @@ export const SettingsVoice: Component = () => {
                 current={currentStt()}
                 value={(o) => o.id}
                 label={(o) => `${o.provider} ${o.name}`}
-                onSelect={(option) => option && update({ stt: modelValue(option) })}
+                onSelect={(option) => {
+                  if (!option) return
+                  const next = modelValue(option)
+                  if (config()?.stt === next) return
+                  update({ stt: next })
+                }}
                 variant="secondary"
                 size="small"
                 triggerVariant="settings"
@@ -201,7 +213,12 @@ export const SettingsVoice: Component = () => {
                 current={currentTts()}
                 value={(o) => o.id}
                 label={(o) => `${o.provider} ${o.name}`}
-                onSelect={(option) => option && update({ tts: modelValue(option) })}
+                onSelect={(option) => {
+                  if (!option) return
+                  const next = modelValue(option)
+                  if (config()?.tts === next) return
+                  update({ tts: next })
+                }}
                 variant="secondary"
                 size="small"
                 triggerVariant="settings"

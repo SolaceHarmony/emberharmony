@@ -24,6 +24,7 @@ export namespace VoiceWorker {
 
   let proc: ReturnType<typeof Bun.spawn> | undefined
   let lastServerUrl: string | undefined
+  let lastSettings: Voice.Settings | undefined
 
   interface Launch {
     mode: "bundled" | "source"
@@ -106,6 +107,7 @@ export namespace VoiceWorker {
       },
     })
     log.info("voice agent worker started", { pid: proc.pid, mode: launch.mode, stt: settings.stt, tts: settings.tts })
+    lastSettings = settings
     return true
   }
 
@@ -117,6 +119,7 @@ export namespace VoiceWorker {
     if (!proc) return
     const p = proc
     proc = undefined
+    lastSettings = undefined
     p.kill()
   }
 
@@ -130,7 +133,24 @@ export namespace VoiceWorker {
    */
   export async function restart(override?: Config.Voice): Promise<boolean> {
     if (!lastServerUrl) return false
+    const next = await Voice.settings(override)
+    if (lastSettings && settingsEqual(lastSettings, next) && running()) {
+      log.info("voice settings unchanged; skipping worker restart")
+      return running()
+    }
     stop()
     return start(lastServerUrl, override)
+  }
+
+  function settingsEqual(a: Voice.Settings, b: Voice.Settings): boolean {
+    return (
+      a.url === b.url &&
+      a.apiKey === b.apiKey &&
+      a.apiSecret === b.apiSecret &&
+      a.stt === b.stt &&
+      a.tts === b.tts &&
+      a.intent === b.intent &&
+      a.disabled === b.disabled
+    )
   }
 }
