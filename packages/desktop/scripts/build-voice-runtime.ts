@@ -167,9 +167,10 @@ for (let attempt = 1; ; attempt++) {
   const res = await $`bun run ${path.join(outDir, "agent.js")} download-files`.cwd(outDir).env(modelEnv).quiet().nothrow()
   if (res.exitCode === 0) break
   if (attempt >= MODEL_DL_ATTEMPTS) {
-    throw new Error(
-      `[voice-runtime] model download failed after ${MODEL_DL_ATTEMPTS} attempts:\n${(res.stderr.toString() || res.stdout.toString()).trim()}`,
-    )
+    // download-files logs the real error to stdout; keep both streams so a
+    // stray stderr warning can't hide it.
+    const output = [res.stderr.toString().trim(), res.stdout.toString().trim()].filter(Boolean).join("\n\n")
+    throw new Error(`[voice-runtime] model download failed after ${MODEL_DL_ATTEMPTS} attempts:\n${output}`)
   }
   const backoffSec = attempt * 5
   console.log(`[voice-runtime] model download attempt ${attempt}/${MODEL_DL_ATTEMPTS} failed; retrying in ${backoffSec}s`)
