@@ -1,13 +1,16 @@
 name: CI
 run-name: CI ${{ github.ref_name }} @ ${{ github.sha }}
 
-# Verification builds. Runs the CLI build on every push to an integration branch
-# (i.e. after a PR merges). Does NOT run on pull_request — that keeps the
-# expensive release build off PR review.
+# Full desktop/CLI build. This is expensive (4-platform Tauri builds), so it
+# does NOT run on every push — type-checking (typecheck.yml) covers per-push
+# verification. Run it intentionally: push a dev-channel tag (dev-v*) for a dev
+# build, or trigger manually. Release builds go through publish.yml on a
+# published GitHub release.
 
 on:
   push:
-    branches: [main, dev]
+    tags:
+      - "dev-v*"
   workflow_dispatch:
 
 # Every merge commit deserves its own verification — do not cancel in progress.
