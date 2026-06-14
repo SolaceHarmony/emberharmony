@@ -5,6 +5,7 @@ This document explains how to sign, notarize, and staple macOS builds for distri
 If you share what you’re shipping (.app, .dmg, .pkg, or .zip) and whether you prefer Xcode or command line, you can tailor these steps directly to your build.
 
 ## Prerequisites
+
 - An Apple Developer account with:
   - Developer ID Application certificate (for apps, tools, frameworks)
   - Developer ID Installer certificate (for .pkg installers)
@@ -14,6 +15,7 @@ If you share what you’re shipping (.app, .dmg, .pkg, or .zip) and whether you 
   - Ensure `com.apple.security.get-task-allow` is false for distribution
 
 ## Supported artifacts
+
 - `.app` (macOS app bundle)
 - `.dmg` (disk image)
 - `.pkg` (installer package)
@@ -24,6 +26,7 @@ You can submit any of the above to Apple’s notarization service. Best practice
 ---
 
 ## Option A: Xcode Organizer (GUI)
+
 This is the simplest path if you archive with Xcode and distribute an app bundle.
 
 1. Product → Archive your macOS app.
@@ -35,9 +38,11 @@ This is the simplest path if you archive with Xcode and distribute an app bundle
 ---
 
 ## Option B: Command line with `notarytool` (recommended for CI)
+
 The steps below work for `.app`, `.dmg`, `.pkg`, or `.zip` submissions. Adjust paths to match your build output.
 
 ### 1) Code sign with Hardened Runtime + timestamp
+
 Sign nested code (frameworks, helpers, plugins) before the app. Prefer explicit signing over `--deep` when possible.
 
 ```bash
@@ -113,23 +118,75 @@ xcrun stapler staple "MyApp.pkg"
 
 ---
 
+## Local builds in this repo
+
+`build-local.ts` handles signing and notarization automatically. It reads credentials from the repo-root `.env` file and verifies them before starting the build.
+
+### What happens by default
+
+1. **Signing**: `APPLE_SIGNING_IDENTITY` from `.env` is verified against your keychain. If the cert isn't found, the build fails with a list of valid identities. If you don't have a Developer ID cert, pass `--quick` for ad-hoc signing.
+
+2. **Voice runtime signing**: All Mach-O binaries in `src-tauri/resources/voice/` are signed with your Developer ID before the app bundle is sealed. This is handled by `scripts/sign-voice-runtime.ts`, which runs automatically as part of the build.
+
+3. **Notarization**: Apple's notary service receives the app, verifies the signing and hardened runtime, and returns a ticket. The build script waits for this to complete (typically 2-8 minutes). The ticket is then stapled to the app bundle.
+
+4. **DMG creation**: After notarization, `hdiutil create` packages the `.app` into a drag-to-install DMG with an `/Applications` symlink.
+
+### Opting out
+
+| Flag            | What it skips                                                                                                                                 |
+| --------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--quick`       | Real signing (uses ad-hoc `-`), notarization, DMG creation. Fastest build, but macOS will quarantine the app.                                 |
+| `--no-notarize` | Notarization only. The app is still signed with your Developer ID, so macOS won't quarantine it, but users may see a warning on first launch. |
+| `--no-dmg`      | DMG creation only. The `.app` bundle is still signed and notarized.                                                                           |
+
+### Required `.env` variables
+
+```bash
+# Signing (required for all builds except --quick)
+APPLE_SIGNING_IDENTITY=Developer ID Application: Your Name (TEAMID)
+
+# Notarization (required unless --quick or --no-notarize)
+APPLE_API_KEY=ABC123DEFG
+APPLE_API_ISSUER=your-issuer-id
+APPLE_API_KEY_PATH=/path/to/AuthKey_ABC123DEFG.p8
+APPLE_TEAM_ID=TEAMID
+
+# Optional: .p12 certificate import (only needed in CI, not local builds)
+APPLE_CERTIFICATE=
+APPLE_CERTIFICATE_PASSWORD=
+```
+
+### Troubleshooting
+
+**"signing identity not in keychain"**: Your `APPLE_SIGNING_IDENTITY` doesn't match any certificate in your keychain. Run `security find-identity -v -p codesigning` to see valid identities, or pass `--quick` for an ad-hoc build.
+
+**"APPLE_API_KEY_PATH does not exist"**: The `.p8` file path in `.env` doesn't exist on this machine. Download it from App Store Connect → Users and Access → Integrations → App Store Connect API.
+
+**Notarization timeout**: Apple's notary service can take 2-8 minutes. If it consistently times out, check your network connection and API key validity. Pass `--no-notarize` to skip it for faster iteration.
+
+**Quarantine warning on --quick builds**: macOS Gatekeeper quarantines ad-hoc signed apps. Right-click the app and choose Open, or run `xattr -cr EmberHarmony\ Dev.app` to remove the quarantine flag.
+
+---
+
 ## CI notes for this repo
 
 Our GitHub Actions workflow signs/notarizes macOS releases in `.github/workflows/publish.yml`.
 It expects these **Actions secrets**:
 
 **Signing**
+
 - `APPLE_CERTIFICATE`: base64 of your exported **Developer ID Application** `.p12`
 - `APPLE_CERTIFICATE_PASSWORD`: password for that `.p12`
 - `APPLE_SIGNING_IDENTITY` (optional): explicit identity string to use (useful if you have multiple certs)
 
 **Notarization (choose one)**
+
 - App Store Connect API key:
   - `APPLE_API_ISSUER`
   - `APPLE_API_KEY`
-  - `APPLE_API_KEY_PATH` (the *contents* of `AuthKey_*.p8`)
+  - `APPLE_API_KEY_PATH` (the _contents_ of `AuthKey_*.p8`)
 - Apple ID fallback:
   - `APPLE_ID`
   - `APPLE_PASSWORD` (app-specific password)
   - `APPLE_TEAM_ID`
-

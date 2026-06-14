@@ -5,15 +5,31 @@
  * Handles the full pipeline:
  *   1. Builds the emberharmony CLI binary for the current platform
  *   2. Copies it into src-tauri/sidecars/ as the Tauri sidecar
- *   3. Runs `tauri build` via the @tauri-apps/cli devDependency (no DMG, to
- *      avoid the upstream Tauri bundle_dmg.sh bug)
- *   4. Creates a DMG manually via `hdiutil` on macOS
+ *   3. Assembles and signs the voice runtime
+ *   4. Runs `tauri build` with appropriate bundle flags
+ *   5. Creates a DMG manually on macOS (workaround for upstream bundle_dmg.sh bug)
+ *
+ * Defaults match CI: signed, notarized, prod config, full bundle.
+ * Use flags to opt out for faster iteration.
  *
  * Flags:
- *   --no-dmg    Skip DMG creation (macOS only)
- *   --no-bundle Skip all bundling, just build the binary
+ *   --dev          Use dev config (EmberHarmony Dev, ai.ofharmony.code.dev)
+ *   --quick        Ad-hoc signing, skip notarization, skip DMG, dev config.
+ *                  Fastest iteration. App will be quarantined on first launch.
+ *   --no-notarize  Sign but skip notarization. Faster, macOS may warn on first launch.
+ *   --no-dmg       Skip DMG creation (macOS only).
+ *   --no-bundle    Skip all bundling, just build the binary.
+ *   --no-voice     Skip voice runtime assembly (voice will be disabled in build).
+ *
  * Environment:
  *   EMBERHARMONY_SKIP_CLI=1   Reuse an existing CLI binary in ../emberharmony/dist
+ *
+ * Signing credentials are read from the repo-root .env:
+ *   APPLE_SIGNING_IDENTITY  Developer ID certificate common name
+ *   APPLE_API_KEY           App Store Connect API key ID
+ *   APPLE_API_ISSUER        App Store Connect API issuer ID
+ *   APPLE_API_KEY_PATH      Path to AuthKey_*.p8
+ *   APPLE_TEAM_ID           Apple team ID
  *
  * Exit codes: 0 success, non-zero on any failure.
  */
@@ -41,12 +57,9 @@ if (existsSync(rootEnv)) {
     if (eq === -1) continue
     const key = trimmed.slice(0, eq).trim()
     let value = trimmed.slice(eq + 1).trim()
-    // Strip surrounding quotes if present
     if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
       value = value.slice(1, -1)
     }
-    // Only set if key has a value and isn't already in env — empty values would
-    // trigger Tauri's cert-import path with garbage.
     if (key && value && !(key in process.env)) {
       process.env[key] = value
     }
@@ -55,12 +68,19 @@ if (existsSync(rootEnv)) {
 
 process.chdir(desktopDir)
 
+const quick = process.argv.includes("--quick")
+const dev = process.argv.includes("--dev")
+const noNotarize = process.argv.includes("--no-notarize")
 const noDmg = process.argv.includes("--no-dmg")
 const noBundle = process.argv.includes("--no-bundle")
 const skipCli = process.env.EMBERHARMONY_SKIP_CLI === "1"
 
+// --quick implies --dev --no-notarize --no-dmg and ad-hoc signing
+const useDevConfig = quick || dev
+const skipNotarization = quick || noNotarize
+const skipDmg = quick || noDmg
+
 // Resolve the Rust target triple for the current host.
-// Tauri normally exports TAURI_ENV_TARGET_TRIPLE; we mirror its logic for standalone runs.
 function currentRustTarget(): string {
   const envTarget = Bun.env.TAURI_ENV_TARGET_TRIPLE ?? Bun.env.RUST_TARGET
   if (envTarget) return envTarget
@@ -75,83 +95,85 @@ function currentRustTarget(): string {
 const rustTarget = currentRustTarget()
 const sidecar = getCurrentSidecar(rustTarget)
 
-console.log(`[build-local] target: ${rustTarget} (${sidecar.ocBinary})`)
+const configLabel = useDevConfig ? "dev" : "prod"
+const signLabel = quick ? "ad-hoc" : "Developer ID"
+const notarizeLabel = skipNotarization ? "no" : "yes"
+console.log(
+  `[build-local] target: ${rustTarget} (${sidecar.ocBinary}), config: ${configLabel}, signing: ${signLabel}, notarize: ${notarizeLabel}`,
+)
 
-// --- Step 0: Preflight — verify every requirement before spending minutes
-// compiling. Each failure names the missing tool and how to get it.
+// --- Step 0: Preflight --------------------------------------------------------
 {
   const missing: string[] = []
 
   const cargo = await $`cargo --version`.quiet().nothrow()
   if (cargo.exitCode !== 0) {
-    missing.push("Rust toolchain (cargo) — install via https://rustup.rs; src-tauri/rust-toolchain.toml pins the version")
+    missing.push(
+      "Rust toolchain (cargo) — install via https://rustup.rs; src-tauri/rust-toolchain.toml pins the version",
+    )
   }
 
-  // The Tauri CLI is this package's @tauri-apps/cli devDependency, run via
-  // the package's "tauri" script so it resolves strictly from
-  // node_modules/.bin — never bunx, which would auto-install the deprecated
-  // npm package named "tauri" from the registry when node_modules is absent.
   const tauri = await $`bun run tauri --version`.quiet().nothrow()
   if (tauri.exitCode !== 0) {
     missing.push("Tauri CLI (@tauri-apps/cli devDependency) — run `bun install` at the repo root")
   }
 
-  if (process.platform === "darwin" && !noDmg && !noBundle) {
+  if (process.platform === "darwin" && !skipDmg && !noBundle) {
     const hdiutil = await $`hdiutil info`.quiet().nothrow()
     if (hdiutil.exitCode !== 0) {
       missing.push("hdiutil (macOS DMG creation) — or pass --no-dmg to skip the DMG step")
     }
   }
 
-  // Notarization is a release-pipeline concern and is impossible for a local
-  // ad-hoc build, but Tauri auto-notarizes whenever the Apple API/ID env vars
-  // are present (and the repo-root .env carries them for releases). Strip
-  // them for local builds — explicitly and loudly — unless the caller opts
-  // in with EMBERHARMONY_NOTARIZE=1.
-  if (process.platform === "darwin" && !noBundle) {
-    const notarizeVars = ["APPLE_API_KEY", "APPLE_API_ISSUER", "APPLE_API_KEY_PATH", "APPLE_ID", "APPLE_PASSWORD"]
-    if (process.env.EMBERHARMONY_NOTARIZE === "1") {
-      const keyPath = process.env.APPLE_API_KEY_PATH
-      if (keyPath && !existsSync(keyPath)) {
-        missing.push(`APPLE_API_KEY_PATH points to "${keyPath}" which does not exist on this machine`)
-      }
-    } else {
-      const present = notarizeVars.filter((name) => process.env[name])
-      if (present.length > 0) {
-        for (const name of present) delete process.env[name]
-        console.log(
-          `[build-local] notarization disabled for local builds — ignoring ${present.join(", ")} ` +
-            `(set EMBERHARMONY_NOTARIZE=1 to attempt notarization)`,
-        )
-      }
+  // Notarization: on by default, opt out with --quick or --no-notarize.
+  // When notarizing, verify the API key file exists.
+  if (process.platform === "darwin" && !noBundle && !skipNotarization) {
+    const keyPath = process.env.APPLE_API_KEY_PATH
+    if (keyPath && !existsSync(keyPath)) {
+      missing.push(`APPLE_API_KEY_PATH points to "${keyPath}" which does not exist on this machine`)
     }
   }
 
-  // macOS signing: verify the configured identity actually resolves BEFORE
-  // the compile, because Tauri's own failure ("failed to sign app") names
-  // neither the identity nor the reason. "-" is ad-hoc signing and needs no
-  // keychain entry — the right mode for local, non-distributed builds.
+  // When skipping notarization, strip the Apple API env vars so Tauri doesn't
+  // attempt notarization either.
+  if (skipNotarization && process.platform === "darwin") {
+    const notarizeVars = ["APPLE_API_KEY", "APPLE_API_ISSUER", "APPLE_API_KEY_PATH", "APPLE_ID", "APPLE_PASSWORD"]
+    const present = notarizeVars.filter((name) => process.env[name])
+    if (present.length > 0) {
+      for (const name of present) delete process.env[name]
+      console.log(`[build-local] notarization disabled — stripped ${present.join(", ")}`)
+    }
+  }
+
+  // macOS signing: verify the configured identity is in the keychain.
   if (process.platform === "darwin" && !noBundle) {
-    const identity = process.env.APPLE_SIGNING_IDENTITY
-    if (identity && identity !== "-") {
-      const identities = (await $`security find-identity -v -p codesigning`.quiet().nothrow()).stdout.toString()
-      if (!identities.includes(identity)) {
+    if (quick) {
+      process.env.APPLE_SIGNING_IDENTITY = "-"
+      console.log(`[build-local] --quick: using ad-hoc signing ("-")`)
+    } else {
+      const identity = process.env.APPLE_SIGNING_IDENTITY
+      if (identity && identity !== "-") {
+        const identities = (await $`security find-identity -v -p codesigning`.quiet().nothrow()).stdout.toString()
+        if (!identities.includes(identity)) {
+          missing.push(
+            `signing identity "${identity}" (from APPLE_SIGNING_IDENTITY / .env) is not in the keychain.\n` +
+              `    Valid identities:\n${identities
+                .split("\n")
+                .filter((line) => line.includes('"'))
+                .map((line) => `      ${line.trim()}`)
+                .join("\n")}\n` +
+              `    Install that certificate, fix .env, or pass --quick for an ad-hoc build`,
+          )
+        }
+      } else if (!identity) {
+        // No identity configured and not --quick — fail rather than silently
+        // fall back to ad-hoc. The default should be real signing.
         missing.push(
-          `signing identity "${identity}" (from APPLE_SIGNING_IDENTITY / .env) is not in the keychain.\n` +
-            `    Valid identities:\n${identities
-              .split("\n")
-              .filter((line) => line.includes('"'))
-              .map((line) => `      ${line.trim()}`)
-              .join("\n")}\n` +
-            `    Install that certificate, fix .env, or run with APPLE_SIGNING_IDENTITY="-" for an ad-hoc local build`,
+          `No APPLE_SIGNING_IDENTITY found in .env or environment.\n` +
+            `    Add your Developer ID identity to .env (e.g. APPLE_SIGNING_IDENTITY="Developer ID Application: Your Name (TEAMID)")\n` +
+            `    or pass --quick for an ad-hoc build (not distributable, macOS will quarantine)`,
         )
       }
-    } else if (!identity) {
-      // Explicit, logged choice — not a silent fallback: local builds without
-      // a configured identity are ad-hoc signed (runnable locally, not
-      // distributable, never notarized).
-      process.env.APPLE_SIGNING_IDENTITY = "-"
-      console.log(`[build-local] no APPLE_SIGNING_IDENTITY configured — using ad-hoc signing ("-") for this local build`)
     }
   }
 
@@ -160,10 +182,12 @@ console.log(`[build-local] target: ${rustTarget} (${sidecar.ocBinary})`)
     for (const item of missing) console.error(`  - ${item}`)
     process.exit(1)
   }
-  console.log(`[build-local] preflight ok: ${cargo.stdout.toString().trim()}, tauri-cli ${tauri.stdout.toString().trim()}`)
+  console.log(
+    `[build-local] preflight ok: ${cargo.stdout.toString().trim()}, tauri-cli ${tauri.stdout.toString().trim()}`,
+  )
 }
 
-// --- Step 1: Build CLI binary ---------------------------------------------
+// --- Step 1: Build CLI binary -------------------------------------------------
 const cliBinaryPath = path.join(emberharmonyDir, "dist", sidecar.ocBinary, "bin", windowsify("emberharmony"))
 
 if (skipCli && existsSync(cliBinaryPath)) {
@@ -176,48 +200,36 @@ if (skipCli && existsSync(cliBinaryPath)) {
   }
 }
 
-// --- Step 2: Copy sidecar --------------------------------------------------
+// --- Step 2: Copy sidecar -----------------------------------------------------
 console.log(`[build-local] copying sidecar to src-tauri/sidecars/...`)
 await copyBinaryToSidecarFolder(cliBinaryPath, rustTarget)
 
-// --- Step 3: Run tauri build (no-bundle to skip the broken DMG path) ------
-// The Tauri CLI comes from this package's @tauri-apps/cli devDependency
-// (run via the package's "tauri" script, strictly from node_modules/.bin),
-// NOT the cargo-installed
-// `cargo tauri` subcommand — that is a separate global install this repo
-// neither declares nor requires.
-if (noBundle) {
-  console.log(`[build-local] running: tauri build --no-bundle`)
-  await $`bun run tauri build --no-bundle`
-  console.log(`[build-local] done (no bundle)`)
-  process.exit(0)
-}
-
-// --- Step 2b: Assemble the bundled voice runtime --------------------------
-// The LiveKit agents worker can't run inside the compiled CLI (it forks
-// node_modules scripts), so the desktop bundle ships a self-contained runtime
-// (bun + agent.js + node_modules + models) as a Tauri resource. Pass --no-voice
-// to skip (smaller build, voice disabled). Builds for the current host target.
+// --- Step 2b: Assemble the bundled voice runtime -----------------------------
 if (!process.argv.includes("--no-voice")) {
   console.log(`[build-local] assembling voice runtime resource...`)
   await $`bun ./scripts/build-voice-runtime.ts`.cwd(desktopDir)
-  // Sign the runtime's nested native libs (.node/.dylib) so notarization
-  // passes. The script no-ops on non-macOS and for ad-hoc local builds
-  // (APPLE_SIGNING_IDENTITY "-"), so this only does work when a real Developer
-  // ID is configured (e.g. EMBERHARMONY_NOTARIZE=1). Must run before tauri
-  // build seals the .app.
   await $`bun ./scripts/sign-voice-runtime.ts`.cwd(desktopDir)
 } else {
   console.log(`[build-local] --no-voice: skipping voice runtime (voice will be disabled in this build)`)
   await $`rm -rf ${path.join(desktopDir, "src-tauri/resources/voice")}`
 }
 
-// Always skip DMG in the Tauri invocation because the upstream bundle_dmg.sh
-// fails. We create the DMG manually afterwards if the host is macOS.
-const tauriArgs = ["build"]
-// Note: `tauri build` is release mode by default; `--debug` is the only toggle.
+// --- Step 3: Run tauri build -------------------------------------------------
+if (noBundle) {
+  const configArg = useDevConfig ? [] : ["--config", "./src-tauri/tauri.prod.conf.json"]
+  console.log(`[build-local] running: tauri build --no-bundle ${configArg.join(" ")}`)
+  await $`bun run tauri build --no-bundle ${configArg}`
+  console.log(`[build-local] done (no bundle)`)
+  process.exit(0)
+}
 
-// Build only the .app on macOS (skip dmg in Tauri's own bundler)
+const tauriArgs = ["build"]
+
+// Use prod config by default, dev config with --dev or --quick
+if (!useDevConfig) {
+  tauriArgs.push("--config", "./src-tauri/tauri.prod.conf.json")
+}
+
 if (process.platform === "darwin") {
   tauriArgs.push("--bundles", "app")
 } else if (process.platform === "linux") {
@@ -229,10 +241,11 @@ if (process.platform === "darwin") {
 console.log(`[build-local] running: tauri ${tauriArgs.join(" ")}`)
 await $`bun run tauri ${tauriArgs}`
 
-// --- Step 4: Create DMG manually (macOS only) -----------------------------
-if (process.platform === "darwin" && !noDmg) {
+// --- Step 4: Create DMG manually (macOS only) --------------------------------
+if (process.platform === "darwin" && !skipDmg) {
   const targetRelease = path.join(desktopDir, "src-tauri/target/release")
-  const appBundle = path.join(targetRelease, "bundle/macos/EmberHarmony Dev.app")
+  const appName = useDevConfig ? "EmberHarmony Dev" : "EmberHarmony"
+  const appBundle = path.join(targetRelease, `bundle/macos/${appName}.app`)
 
   if (!existsSync(appBundle)) {
     throw new Error(`.app bundle not found: ${appBundle}`)
@@ -241,22 +254,20 @@ if (process.platform === "darwin" && !noDmg) {
   const pkg = await Bun.file(path.join(desktopDir, "package.json")).json()
   const arch = process.arch === "arm64" ? "aarch64" : "x86_64"
   const dmgDir = path.join(targetRelease, "bundle/dmg")
-  const dmgPath = path.join(dmgDir, `EmberHarmony Dev_${pkg.version}_${arch}.dmg`)
+  const dmgPath = path.join(dmgDir, `${appName}_${pkg.version}_${arch}.dmg`)
 
   await $`mkdir -p ${dmgDir}`
   await $`rm -f ${dmgPath}`
 
   console.log(`[build-local] creating installer DMG: ${dmgPath}`)
 
-  // Build a proper installer DMG by staging .app + /Applications symlink in a
-  // temp directory, then packaging it. This gives the drag-to-install UX.
   const stagingDir = path.join(targetRelease, "bundle/dmg/.staging")
   await $`rm -rf ${stagingDir}`
   await $`mkdir -p ${stagingDir}`
   await $`cp -R ${appBundle} ${stagingDir}/`
   await $`ln -s /Applications ${stagingDir}/Applications`
 
-  await $`hdiutil create -volname "EmberHarmony Dev" -srcfolder ${stagingDir} -ov -format UDZO ${dmgPath}`
+  await $`hdiutil create -volname "${appName}" -srcfolder ${stagingDir} -ov -format UDZO ${dmgPath}`
   await $`rm -rf ${stagingDir}`
 
   console.log(`[build-local] DMG created: ${dmgPath}`)

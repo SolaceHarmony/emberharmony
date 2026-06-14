@@ -31,28 +31,28 @@ bun run --cwd packages/desktop tauri build
 
 Every requirement is declared in the repo; nothing relies on ad-hoc global installs:
 
-| Requirement | Declared by | Notes |
-|---|---|---|
-| Bun | `packageManager` in the root `package.json` | The only supported package manager — npm cannot resolve this workspace's `catalog:` versions |
-| Tauri CLI | `@tauri-apps/cli` devDependency | Installed by `bun install`; build scripts invoke it via `bun run tauri`, resolving strictly from `node_modules/.bin` (never `bunx`, which auto-installs from the registry, and not the cargo-installed `cargo tauri`) |
-| Rust toolchain | `src-tauri/rust-toolchain.toml` | rustup picks the pinned version up automatically; install rustup via <https://rustup.rs> |
-| Platform libraries | [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) | OS packages (e.g. webkit2gtk on Linux) |
+| Requirement        | Declared by                                                      | Notes                                                                                                                                                                                                                 |
+| ------------------ | ---------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Bun                | `packageManager` in the root `package.json`                      | The only supported package manager — npm cannot resolve this workspace's `catalog:` versions                                                                                                                          |
+| Tauri CLI          | `@tauri-apps/cli` devDependency                                  | Installed by `bun install`; build scripts invoke it via `bun run tauri`, resolving strictly from `node_modules/.bin` (never `bunx`, which auto-installs from the registry, and not the cargo-installed `cargo tauri`) |
+| Rust toolchain     | `src-tauri/rust-toolchain.toml`                                  | rustup picks the pinned version up automatically; install rustup via <https://rustup.rs>                                                                                                                              |
+| Platform libraries | [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) | OS packages (e.g. webkit2gtk on Linux)                                                                                                                                                                                |
 
 `scripts/build-local.ts` verifies all of this up front (preflight) and fails with
 install guidance before any compilation starts.
 
 ### macOS signing for local builds
 
-`build-local.ts` checks that `APPLE_SIGNING_IDENTITY` (usually from the repo-root
-`.env`) resolves to a certificate actually present in the keychain, and fails
-fast listing the valid identities if not. With no identity configured, local
-builds are ad-hoc signed (`-`): runnable on this machine, not distributable,
-never notarized. Notarization is exclusively a release-pipeline concern.
+Local builds are **signed and notarized by default**. The build script reads `APPLE_SIGNING_IDENTITY` from the repo-root `.env` and verifies it's in your keychain before starting.
 
-```bash
-# explicit ad-hoc local build
-APPLE_SIGNING_IDENTITY="-" bun run --cwd packages/desktop build:local
-```
+| Command                   | Signing      | Notarized | Notes                                  |
+| ------------------------- | ------------ | --------- | -------------------------------------- |
+| `bun desktop:build`       | Developer ID | yes       | Matches CI output                      |
+| `bun desktop:build:fast`  | Developer ID | no        | Faster, macOS may warn on first launch |
+| `bun desktop:build:quick` | Ad-hoc (`-`) | no        | Fastest, macOS quarantines the app     |
+| `bun desktop:build:dev`   | Developer ID | yes       | Dev config (`EmberHarmony Dev`)        |
+
+Pass `--quick` for the fastest iteration — the app works locally but macOS will quarantine it on first launch. See [BUILDING.md](../../BUILDING.md) for the full command reference and [APPLE.md](../../APPLE.md) for signing details.
 
 ## Platform-Specific Features
 
