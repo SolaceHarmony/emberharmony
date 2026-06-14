@@ -183,7 +183,18 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PW" "$KEYCHAIN" >/dev/null
           # Prepend the keychain to the search list so codesign resolves the identity.
           security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | sed 's/"//g')
-          bun packages/desktop/scripts/sign-voice-runtime.ts --identity "$APPLE_SIGNING_IDENTITY" --keychain "$KEYCHAIN"
+          # APPLE_SIGNING_IDENTITY is unset in this repo — tauri-action auto-derives
+          # it from the imported cert, so we must too, or the signer silently skips
+          # (which is exactly what shipped unsigned nested binaries to notarization).
+          IDENTITY="${APPLE_SIGNING_IDENTITY:-}"
+          if [ -z "$IDENTITY" ] || [ "$IDENTITY" = "-" ]; then
+            IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN" | sed -nE 's/^[[:space:]]*[0-9]+\)[[:space:]]+[0-9A-F]+[[:space:]]+"(Developer ID Application: .*)"$/\1/p' | head -1)"
+          fi
+          if [ -z "$IDENTITY" ]; then
+            echo "::error::no Developer ID Application identity in the signing keychain"; exit 1
+          fi
+          echo "Signing voice runtime with identity: $IDENTITY"
+          bun packages/desktop/scripts/sign-voice-runtime.ts --identity "$IDENTITY" --keychain "$KEYCHAIN"
           rm -f "$CERT"
 
       - name: Build desktop app
