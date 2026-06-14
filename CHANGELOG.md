@@ -37,6 +37,13 @@ rebranded and maintained by [The Solace Project](https://github.com/SolaceHarmon
 
 ### Changed
 
+- **Linux desktop ships `.deb` + `.rpm` only (AppImage dropped).** AppImage
+  bundling stalls on x86_64 — the AppImage runtime/FUSE step hangs with no
+  timeout, burning the full 60-minute build limit (arm64 took ~18 min but
+  eventually finished it). It also wasn't in the configured bundle targets. The
+  build now pins `--bundles deb,rpm` on Linux and drops the custom
+  `truly-portable-appimage` tauri-cli, which also removes a ~5-minute
+  per-Linux-build `cargo install` step.
 - The voice-runtime assembler now reads the `@livekit/*` versions from the
   workspace catalog and the Bun version from `packageManager`, instead of
   hardcoding them — so the bundled runtime can no longer silently drift from
