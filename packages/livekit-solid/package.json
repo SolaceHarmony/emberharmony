@@ -1,7 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/package.json",
   "name": "@thesolaceproject/livekit-components-solid",
-  "version": "1.4.4",
+  "version": "1.4.5",
   "type": "module",
   "license": "Apache-2.0",
   "description": "SolidJS port of @livekit/components-react, built on @livekit/components-core. Vendored into EmberHarmony.",
