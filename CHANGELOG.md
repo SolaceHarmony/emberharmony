@@ -9,6 +9,15 @@ rebranded and maintained by [The Solace Project](https://github.com/SolaceHarmon
 
 ### Fixed
 
+- **Voice broke on every tool use ("operation aborted")** — the session bridge
+  ended a voice reply as soon as the first assistant message completed. But a
+  tool-call step finalizes its message (`time.completed`, `finish: "tool-calls"`)
+  *before* the tool runs, then opens a new assistant message for the result. So
+  the bridge returned mid-tool, its stream closed, the abort handler POSTed
+  `/session/abort`, and the server killed the running tool — voice then went
+  silent (though still listening) because the continuation never streamed. The
+  bridge now streams text from every assistant message in the turn (under one
+  stable id, so TTS stays continuous) and ends only when the session goes idle.
 - **Voice-runtime build aborted on a flaky HuggingFace model download** — the
   assembler's `download-files` step had no retry, so a single transient
   HuggingFace error (rate limiting surfaces as
