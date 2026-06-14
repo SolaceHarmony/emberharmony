@@ -34,3 +34,5 @@ emberharmony-dev
 logs/
 *.bun-build
 *.tsbuildinfo
+solace_prompt.txt
+solace_seed.txt
