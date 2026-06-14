@@ -168,8 +168,10 @@ for (let attempt = 1; ; attempt++) {
   if (res.exitCode === 0) break
   if (attempt >= MODEL_DL_ATTEMPTS) {
     // download-files logs the real error to stdout; keep both streams so a
-    // stray stderr warning can't hide it.
-    const output = [res.stderr.toString().trim(), res.stdout.toString().trim()].filter(Boolean).join("\n\n")
+    // stray stderr warning can't hide it, with a fallback if both are empty.
+    const output =
+      [res.stderr.toString().trim(), res.stdout.toString().trim()].filter(Boolean).join("\n\n") ||
+      "(no output captured from stdout or stderr)"
     throw new Error(`[voice-runtime] model download failed after ${MODEL_DL_ATTEMPTS} attempts:\n${output}`)
   }
   const backoffSec = attempt * 5

@@ -133,14 +133,6 @@ jobs:
           EMBERHARMONY_RELEASE: ${{ inputs.release }}
           EMBERHARMONY_TARGET: ${{ inputs.target }}
 
-      # Fixes AppImage build issues, can be removed when https://github.com/tauri-apps/tauri/pull/12491 is released
-      - name: Install tauri-cli from portable appimage branch
-        if: contains(matrix.settings.host, 'ubuntu')
-        run: |
-          cargo install tauri-cli --git https://github.com/tauri-apps/tauri --branch feat/truly-portable-appimage --force
-          echo "Installed tauri-cli version:"
-          cargo tauri --version
-
       - name: Write Apple API key
         if: runner.os == 'macOS'
         shell: bash
@@ -202,7 +194,6 @@ jobs:
         timeout-minutes: 60
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAURI_BUNDLER_NEW_APPIMAGE_FORMAT: true
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
@@ -214,8 +205,11 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
           projectPath: packages/desktop
-          tauriScript: ${{ (contains(matrix.settings.host, 'ubuntu') && 'cargo tauri') || '' }}
-          args: --target ${{ matrix.settings.target }} --config ./src-tauri/tauri.prod.conf.json
+          # Linux ships deb + rpm only. AppImage bundling stalls on x64 (hangs on
+          # the AppImage runtime/FUSE step with no timeout → 60-min build timeout)
+          # and isn't in the configured bundle.targets anyway; pin --bundles so it
+          # can never be attempted.
+          args: ${{ contains(matrix.settings.host, 'ubuntu') && '--bundles deb,rpm ' || '' }}--target ${{ matrix.settings.target }} --config ./src-tauri/tauri.prod.conf.json
           updaterJsonPreferNsis: true
 
       - name: Upload desktop artifacts
