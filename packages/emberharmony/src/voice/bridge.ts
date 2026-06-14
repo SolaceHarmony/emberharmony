@@ -161,9 +161,11 @@ export class SessionLLMStream extends llm.LLMStream {
     // its abort handler POSTed /abort, and the server killed the still-running
     // tool ("operation aborted") while the continuation never streamed.
     //
-    // The server emits heartbeats every 30s, so this loop always wakes even
-    // when the session goes quiet; the staleness check turns a reply that never
-    // starts (or never finishes) into an error instead of a worker hang.
+    // The server emits a heartbeat every 30s, which bumps the activity clock —
+    // so the staleness check only fires when the SSE connection itself goes
+    // dead (no heartbeat for STALE_MS), turning a silently-dropped stream into
+    // an error instead of a worker hang. A long-running tool keeps the stream
+    // alive via those heartbeats, so it never trips this.
     const STALE_MS = 120_000
     let lastActivity = Date.now()
     let replyId: string | undefined
@@ -182,6 +184,10 @@ export class SessionLLMStream extends llm.LLMStream {
       if (event.type === "message.updated") {
         if (event.properties?.info?.sessionID === this.#opts.sessionID) lastActivity = Date.now()
       }
+      // Heartbeats (every 30s) prove the SSE connection is alive even while a
+      // long tool runs with no message events — bump activity so the staleness
+      // check only trips on a genuinely dead connection, not a slow tool.
+      if (event.type === "server.heartbeat") lastActivity = Date.now()
       // The whole turn — every step and tool call — is done only when the
       // session goes idle (also fires on server-side cancel, which ends the
       // turn just the same).
