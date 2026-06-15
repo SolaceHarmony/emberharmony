@@ -139,7 +139,10 @@ const { use: useVoice, provider: VoiceValueProvider } = createSimpleContext({
       try {
         const r = getOrCreateRoom()
         setRoom(r)
-        const grant = await sdk.client.voice.token({ sessionID, model }).then((x) => x.data)
+        // The server derives the room name from the project context (x-emberharmony-directory),
+        // so sessionID is not required. One room per project — session switching
+        // happens via participant attributes.
+        const grant = await sdk.client.voice.token({ model }).then((x) => x.data)
         if (!grant) throw new Error("voice token request failed")
         // WKWebView keeps media silently "playing" until the page's audio
         // session activates; resuming an AudioContext inside the connect

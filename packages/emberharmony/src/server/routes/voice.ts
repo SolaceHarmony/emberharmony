@@ -163,7 +163,7 @@ export const VoiceRoutes = lazy(() =>
       validator(
         "json",
         z.object({
-          sessionID: z.string(),
+          sessionID: z.string().optional(),
           agentName: z.string().optional(),
           model: z
             .object({ providerID: z.string(), modelID: z.string() })
@@ -173,19 +173,23 @@ export const VoiceRoutes = lazy(() =>
       ),
       async (c) => {
         const body = c.req.valid("json")
-        const roomName = `emberharmony_${body.sessionID}`
+        // One room per project: emberharmony_voice_{projectID}. The project ID
+        // comes from the Instance context (set via x-emberharmony-directory header).
+        // Session switching happens via participant attributes, not room changes.
+        const projectID = Instance.project.id
+        const roomName = `emberharmony_voice_${projectID}`
         const agentName = body.agentName ?? Voice.AGENT_NAME
         // the agent worker uses this to bridge the voice conversation into
         // the EmberHarmony session (same tools, permissions, and context)
         const agentMetadata = JSON.stringify({
-          sessionID: body.sessionID,
+          projectID,
           directory: Instance.directory,
           serverUrl: new URL(c.req.url).origin,
           model: body.model,
         })
         const result = await Voice.token({
           roomName,
-          identity: `user_${body.sessionID}`,
+          identity: `user_${projectID}`,
           agentName,
           agentMetadata,
         })

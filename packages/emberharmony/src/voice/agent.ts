@@ -21,6 +21,7 @@ const INTENT_MODEL = process.env["EMBERHARMONY_VOICE_INTENT_MODEL"] ?? VoiceRegi
 /** Participant attribute keys published by the voice agent */
 const ATTR_STAGE = "emberharmony.voice_stage"
 const ATTR_MODE = "emberharmony.voice_mode"
+const ATTR_ATTACHED_SESSION = "emberharmony.attached_session"
 
 class EmberHarmonyAgent extends voice.Agent {
   #workflow: VoiceWorkflow
@@ -46,7 +47,11 @@ class EmberHarmonyAgent extends voice.Agent {
  * Publish the current workflow state as participant attributes.
  * setAttributes is a full replacement, so we merge with existing attrs.
  */
-async function publishStage(room: JobContext["room"], workflow: VoiceWorkflow): Promise<void> {
+async function publishStage(
+  room: JobContext["room"],
+  workflow: VoiceWorkflow,
+  attachedSessionID?: string,
+): Promise<void> {
   const lp = room.localParticipant
   if (!lp || !room.isConnected) return
   const existing = lp.attributes ?? {}
@@ -54,6 +59,7 @@ async function publishStage(room: JobContext["room"], workflow: VoiceWorkflow): 
     ...existing,
     [ATTR_STAGE]: workflow.stage,
     [ATTR_MODE]: workflow.canBuild ? "build" : "plan",
+    [ATTR_ATTACHED_SESSION]: attachedSessionID ?? "",
   })
 }
 
@@ -98,10 +104,10 @@ export default defineAgent({
         return {}
       }
     })()
-    const { sessionID, directory, serverUrl, model } = metadata
-    if (!sessionID || !directory || !serverUrl) {
+    const { projectID, directory, serverUrl, model } = metadata
+    if (!projectID || !directory || !serverUrl) {
       throw new Error(
-        `voice agent dispatched without session metadata (got: ${ctx.job.metadata || "<empty>"}) — ` +
+        `voice agent dispatched without project metadata (got: ${ctx.job.metadata || "<empty>"}) — ` +
           "rooms must be created through EmberHarmony's POST /voice/token endpoint",
       )
     }
