@@ -2,6 +2,7 @@ mod cli;
 #[cfg(windows)]
 mod job_object;
 mod markdown;
+#[cfg(feature = "voice")]
 mod voice;
 mod window_customizer;
 
@@ -307,9 +308,13 @@ pub fn run() {
             get_default_server_url,
             set_default_server_url,
             markdown::parse_markdown_command,
+            #[cfg(feature = "voice")]
             voice::voice_connect,
+            #[cfg(feature = "voice")]
             voice::voice_disconnect,
+            #[cfg(feature = "voice")]
             voice::voice_toggle_mute,
+            #[cfg(feature = "voice")]
             voice::voice_state
         ])
         .setup(move |app| {
@@ -320,6 +325,10 @@ pub fn run() {
 
             // Initialize log state
             app.manage(LogState(Arc::new(Mutex::new(VecDeque::new()))));
+
+            // Initialize voice handle
+            #[cfg(feature = "voice")]
+            app.manage(voice::VoiceHandle::new());
 
             #[cfg(windows)]
             app.manage(JobObjectState::new());
