@@ -282,11 +282,11 @@ The brain session lives in `~/.local/share/emberharmony/voice/`. This is a regul
 
 The directory can contain scratch files, plans, and notes that the brain session creates and references. Because it's a real project directory, it can also be a git repository — the brain can commit plans, track changes, and maintain a history of its own work.
 
-The `directory` field in the session LLM code already makes the project folder optional. The voice project is the permanent home for the brain's context: it's where the conversation history lives between voice calls, where the brain stores its plans, and where compaction happens when the context window fills up.
+The directory `~/.local/share/emberharmony/voice/` is a real EmberHarmony project directory. The `directory` field is mandatory for every session — `Instance.provide({directory})`, `Project.fromDirectory(directory)`, and `Session.Info.directory` all require it. The voice brain simply uses a dedicated directory rather than a project directory. That's why the dedicated-folder approach is correct, not a workaround — it gives the brain its own project root, its own config, its own session store, and its own git history, all without any optionality in the session code.
 
 #### Voice as commentary
 
-When the attached session is executing (tools running, files being written), the voice agent describes what's happening in natural language. The `SessionObserver` watches the attached session's SSE event stream and feeds interpretations back into the brain session:
+When the attached session is executing (tools running, files being written), the voice agent describes what's happening in natural language. The `SessionObserver` is a server-side bus subscriber that watches the attached session's events and feeds interpretations back into the brain session:
 
 ```
 Session runs:   edit(auth.ts) → run tests → test fails → edit(auth.ts) → run tests → pass
@@ -299,7 +299,7 @@ The brain never reads raw tool output. It receives narrated summaries from the o
 
 #### Tools
 
-The brain session has its own tools, registered as `llm.tool()` in the LiveKit agent. These call the EmberHarmony server API to affect application state:
+The brain session has its own tools. These run server-side as EmberHarmony session tools — the brain session owns the tool schemas, and the server executes them:
 
 | Tool                  | Mode  | What it does                                                             |
 | --------------------- | ----- | ------------------------------------------------------------------------ |
@@ -312,7 +312,7 @@ The brain session has its own tools, registered as `llm.tool()` in the LiveKit a
 | `abort_attached`      | build | Aborts the current generation in the attached session                    |
 | `confirm_plan`        | build | Transitions workflow from proposing → confirmed (also callable via RPC)  |
 
-Each tool's `execute` function calls the EmberHarmony server API directly. The tool schemas travel to the model as function definitions; the model decides when to call them. Execution happens in the worker, results come back to the brain session's chat context, and the brain speaks the interpretation.
+The brain session's tools run server-side as EmberHarmony session tools. The brain session owns the tool definitions (schemas); the EmberHarmony server executes them and returns results. `attach_session` sets LiveKit room attributes via `RoomServiceClient` (the server has the credentials). `submit_prompt` drives a project session via `prompt_async`. The model decides when to call each tool; results come back to the brain session's context, and the brain speaks the interpretation.
 
 `submit_prompt` is the only tool that interacts with the attached session. It sends a prompt and then the `SessionObserver` takes over — watching the SSE stream for `session.idle` and feeding narrated summaries back to the brain for TTS output.
 
@@ -373,10 +373,10 @@ Voice settings are managed through the config API:
 
 ### Components
 
-- **VoiceWorker** — a child process managed by `emberharmony serve` that runs the LiveKit agent
+- **VoiceWorker** — a thin STT → prompt_async → SSE → TTS bridge. Sends transcribed speech to the brain session via `prompt_async`, streams text deltas back to TTS. The worker doesn't run inference or own tools — it's a LiveKit audio pipeline.
 - **Brain session** — a permanent EmberHarmony session at `~/.local/share/emberharmony/voice/` that serves as the voice brain's context, history, and project directory
 - **VoiceWorkflow** — state machine that gates plan/build transitions (gathering → proposing → confirmed → executing → reviewing)
-- **SessionObserver** — watches the attached session's SSE stream and feeds narrated interpretations (not raw output) into the brain session
+- **SessionObserver** — a server-side bus subscriber that watches the attached session's events and feeds narrated interpretations (not raw output) into the brain session
 - **VoiceProvider** — SolidJS context that manages the LiveKit room, mic state, and session following
 
 ### Launch modes
@@ -416,4 +416,4 @@ The desktop app uses WKWebView, which has a hard memory limit (~1.5–2 GB). The
 
 ### Voice interruption aborts the session
 
-If pressing the mic button while a text response is streaming causes "The operation was aborted" errors in the server log, this is the `SessionLLM` bridge sending `POST /session/{id}/abort` on every voice interruption. The `BrainLLM` design fixes this — the brain controls when the session is aborted, not the voice pipeline. Until the brain is implemented, these errors are expected and harmless (the session recovers on the next prompt).
+If pressing the mic button while a text response is streaming causes "The operation was aborted" errors in the server log, this is the `SessionLLM` bridge sending `POST /session/{id}/abort` on every voice interruption. The brain session design fixes this — the brain controls when the attached session is aborted, not the voice pipeline. Until the brain is implemented, these errors are expected and harmless (the session recovers on the next prompt).
