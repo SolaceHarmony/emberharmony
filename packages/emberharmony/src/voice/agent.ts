@@ -8,6 +8,7 @@ import { SessionLLM } from "./bridge"
 import { VoiceRegistry } from "./registry"
 import { VOICE_AGENT_NAME } from "./constants"
 import { VoiceWorkflow, VOICE_SYSTEM_PROMPT } from "./workflow"
+import { BRAIN_SYSTEM_PROMPT, VOICE_PROJECT_DIR } from "./brain"
 
 // Model strings accept an optional ":language" (STT) or ":voice" (TTS) suffix.
 // The serve command injects these from the resolved voice config when it
@@ -34,6 +35,35 @@ class EmberHarmonyAgent extends voice.Agent {
   }
 }
 
+/**
+ * Discover the brain session at startup. Calls GET /voice/brain on the
+ * EmberHarmony server to find or create the permanent voice brain session.
+ * Returns { sessionID, directory, system } for use by SessionLLM.
+ */
+async function discoverBrainSession(serverUrl: string): Promise<{
+  sessionID: string
+  directory: string
+  system: string
+}> {
+  const url = new URL("/voice/brain", serverUrl)
+  const headers: Record<string, string> = {
+    "x-emberharmony-directory": encodeURIComponent(VOICE_PROJECT_DIR),
+  }
+  const username = Flag.EMBERHARMONY_SERVER_USERNAME
+  const password = Flag.EMBERHARMONY_SERVER_PASSWORD
+  if (password) {
+    const user = username ?? "emberharmony"
+    headers["authorization"] = `Basic ${Buffer.from(`${user}:${password}`).toString("base64")}`
+  }
+
+  const response = await fetch(url, { headers })
+  if (!response.ok) {
+    throw new Error(`failed to discover brain session: ${response.status} ${await response.text().catch(() => "")}`)
+  }
+  const body = (await response.json()) as { sessionID: string; directory: string; system: string }
+  return body
+}
+
 export default defineAgent({
   prewarm: async (proc: JobProcess) => {
     proc.userData.vad = await silero.VAD.load()
@@ -54,19 +84,29 @@ export default defineAgent({
       )
     }
 
+    // Discover the brain session — a permanent EmberHarmony session in
+    // ~/.local/share/emberharmony/voice/ that holds the voice brain's
+    // context, history, and tools. The bridge targets this session instead
+    // of the user's project session. The user's session is only accessed
+    // via server-side tools (submit_prompt, attach_session, etc.).
+    const brain = await discoverBrainSession(process.env["EMBERHARMONY_VOICE_SERVER_URL"] ?? serverUrl)
+
     const vad = ctx.proc.userData.vad as silero.VAD
     const workflow = new VoiceWorkflow(inference.LLM.fromModelString(INTENT_MODEL))
     const session = new voice.AgentSession({
       stt: inference.STT.fromModelString(STT_MODEL),
       llm: new SessionLLM({
+        // Target the brain session, not the user's project session.
+        // The brain session lives in the voice project directory with its
+        // own context, history, and system prompt.
         serverUrl: process.env["EMBERHARMONY_VOICE_SERVER_URL"] ?? serverUrl,
-        directory,
-        sessionID,
+        directory: brain.directory,
+        sessionID: brain.sessionID,
         username: Flag.EMBERHARMONY_SERVER_USERNAME,
         password: Flag.EMBERHARMONY_SERVER_PASSWORD,
         fallbackModel: model,
         agent: () => workflow.agent(),
-        system: VOICE_SYSTEM_PROMPT,
+        system: brain.system,
       }),
       tts: inference.TTS.fromModelString(TTS_MODEL),
       vad,
