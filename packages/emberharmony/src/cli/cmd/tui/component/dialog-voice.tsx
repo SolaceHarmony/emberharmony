@@ -1,209 +1,206 @@
-import { createMemo, createSignal, Show } from "solid-js"
+import { createMemo } from "solid-js"
 import { useSync } from "@tui/context/sync"
 import { useSDK } from "@tui/context/sdk"
 import { DialogSelect } from "@tui/ui/dialog-select"
 import { useDialog } from "@tui/ui/dialog"
-import { useTheme } from "../context/theme"
-import { TextAttributes } from "@opentui/core"
-import type { VoiceConfigInfo } from "@thesolaceproject/emberharmony-sdk/v2"
+import { pipe, flatMap, entries, sortBy } from "remeda"
 
 /**
  * TUI voice settings dialog.
  *
- * Shows the current voice configuration — brain model, STT/TTS,
- * intent classifier, structured workflow, and LiveKit connection status.
- * Sub-dialogs handle model selection changes.
+ * Selectable options for brain model, workflow mode, and status info.
+ * Selecting "Change brain model" or "Toggle structured" opens a sub-dialog.
  */
 export function DialogVoice() {
   const sync = useSync()
   const sdk = useSDK()
   const dialog = useDialog()
-  const { theme } = useTheme()
-
-  const voice = createMemo(() => sync.data.voice)
 
   async function refreshVoice() {
     const result = await sdk.client.voice.config()
     if (result.data) sync.set("voice", result.data)
   }
 
-  const brainOptions = createMemo(() => {
-    const providers = sync.data.provider
-    const items: Array<{ title: string; value: string; description: string; category: string }> = []
-    for (const p of providers) {
-      for (const m of Object.values(p.models)) {
-        items.push({
-          title: m.name,
-          value: `${p.id}/${m.id}`,
-          description: p.name,
-          category: p.name,
-        })
-      }
+  const options = createMemo(() => {
+    const voice = sync.data.voice
+    if (!voice) return []
+
+    const items = []
+
+    // Status section
+    items.push({
+      value: "status",
+      title: voice.available ? "Connected" : "Not configured",
+      description: voice.url ?? undefined,
+      category: "Status",
+      onSelect: () => {
+        dialog.clear()
+      },
+    })
+
+    // Brain model
+    items.push({
+      value: "brain",
+      title: voice.brain ?? "default",
+      category: "Brain model",
+      onSelect: () => {
+        dialog.replace(() => <DialogBrainModelSelect />)
+      },
+    })
+
+    // Workflow
+    items.push({
+      value: "workflow",
+      title: voice.structured ? "Structured (5-stage)" : "Free-form",
+      category: "Workflow",
+      onSelect: () => {
+        dialog.replace(() => <DialogStructuredToggle />)
+      },
+    })
+
+    // Info lines (non-selectable context)
+    items.push({
+      value: "stt",
+      title: voice.stt,
+      category: "STT",
+      onSelect: () => {
+        dialog.clear()
+      },
+    })
+    items.push({
+      value: "tts",
+      title: voice.tts,
+      category: "TTS",
+      onSelect: () => {
+        dialog.clear()
+      },
+    })
+    if (voice.intent) {
+      items.push({
+        value: "intent",
+        title: voice.intent,
+        category: "Intent classifier",
+        onSelect: () => {
+          dialog.clear()
+        },
+      })
     }
+    items.push({
+      value: "credentials",
+      title: voice.credentials.livekit ? "configured" : "missing",
+      category: "LiveKit credentials",
+      onSelect: () => {
+        dialog.clear()
+      },
+    })
+
     return items
   })
 
   return (
-    <box paddingLeft={2} paddingRight={2} gap={1} paddingBottom={1}>
-      <box flexDirection="row" justifyContent="space-between">
-        <text fg={theme.text} attributes={TextAttributes.BOLD}>
-          Voice settings
-        </text>
-        <text fg={theme.textMuted}>esc</text>
-      </box>
-
-      <Show when={voice()} fallback={<text fg={theme.textMuted}>Loading voice config...</text>}>
-        <VoiceConfigView
-          config={voice()!}
-          brainOptions={brainOptions()}
-          onSelectBrain={async (value: string | undefined) => {
-            await sdk.client.voice.configUpdate({ voiceConfig: { brain: value } })
-            await refreshVoice()
-          }}
-          onToggleStructured={async (structured: boolean) => {
-            await sdk.client.voice.configUpdate({ voiceConfig: { structured } })
-            await refreshVoice()
-          }}
-        />
-      </Show>
-    </box>
-  )
-}
-
-function VoiceConfigView(props: {
-  config: VoiceConfigInfo
-  brainOptions: Array<{ title: string; value: string; description: string; category: string }>
-  onSelectBrain: (value: string | undefined) => Promise<void>
-  onToggleStructured: (structured: boolean) => Promise<void>
-}) {
-  const { theme } = useTheme()
-  const dialog = useDialog()
-  const sync = useSync()
-  const cfg = createMemo(() => props.config)
-
-  return (
-    <box gap={1}>
-      {/* Status */}
-      <box flexDirection="row" gap={1}>
-        <text fg={theme.textMuted}>Status:</text>
-        <text fg={cfg().available ? theme.success : theme.error}>
-          {cfg().available ? "Connected" : "Not configured"}
-        </text>
-      </box>
-
-      {/* Connection */}
-      <text fg={theme.text} attributes={TextAttributes.BOLD}>
-        Connection
-      </text>
-      <box flexDirection="row" gap={1}>
-        <text fg={theme.textMuted}>URL:</text>
-        <text fg={theme.text}>{cfg().url ?? "not set"}</text>
-      </box>
-      <box flexDirection="row" gap={1}>
-        <text fg={theme.textMuted}>Credentials:</text>
-        <text fg={cfg().credentials.livekit ? theme.success : theme.error}>
-          {cfg().credentials.livekit ? "configured" : "missing"}
-        </text>
-      </box>
-
-      {/* Models */}
-      <text fg={theme.text} attributes={TextAttributes.BOLD}>
-        Models
-      </text>
-      <box flexDirection="row" gap={1}>
-        <text fg={theme.textMuted}>Brain:</text>
-        <text fg={theme.text}>{cfg().brain ?? "default"}</text>
-      </box>
-      <box flexDirection="row" gap={1}>
-        <text fg={theme.textMuted}>STT:</text>
-        <text fg={theme.text}>{cfg().stt}</text>
-      </box>
-      <box flexDirection="row" gap={1}>
-        <text fg={theme.textMuted}>TTS:</text>
-        <text fg={theme.text}>{cfg().tts}</text>
-      </box>
-      <box flexDirection="row" gap={1}>
-        <text fg={theme.textMuted}>Intent:</text>
-        <text fg={theme.text}>{cfg().intent}</text>
-      </box>
-
-      {/* Workflow */}
-      <text fg={theme.text} attributes={TextAttributes.BOLD}>
-        Workflow
-      </text>
-      <box flexDirection="row" gap={1}>
-        <text fg={theme.textMuted}>Structured:</text>
-        <text fg={theme.text}>{cfg().structured ? "on (5-stage)" : "off (free-form)"}</text>
-      </box>
-    </box>
+    <DialogSelect
+      title="Voice settings"
+      placeholder="Search voice settings..."
+      options={options()}
+      onSelect={(option) => option.onSelect?.(dialog)}
+    />
   )
 }
 
 /**
- * Opens a sub-dialog to change the brain model.
+ * Sub-dialog to pick a brain model from the provider/model list.
  */
-export function openBrainModelSelect() {
+function DialogBrainModelSelect() {
   const sync = useSync()
-  const dialog = useDialog()
   const sdk = useSDK()
+  const dialog = useDialog()
 
-  const options = createMemo(() => {
-    const providers = sync.data.provider
-    const items: Array<{ title: string; value: string; description: string; category: string }> = []
-    for (const p of providers) {
-      for (const m of Object.values(p.models)) {
-        items.push({
-          title: m.name,
-          value: `${p.id}/${m.id}`,
-          description: p.name,
-          category: p.name,
-        })
-      }
-    }
-    return items
-  })
+  async function refreshVoice() {
+    const result = await sdk.client.voice.config()
+    if (result.data) sync.set("voice", result.data)
+  }
 
-  dialog.replace(() => (
+  const options = createMemo(() =>
+    pipe(
+      sync.data.provider,
+      sortBy(
+        (p) => p.id !== "emberharmony",
+        (p) => p.name,
+      ),
+      flatMap((p) =>
+        pipe(
+          p.models,
+          entries(),
+          flatMap(([modelID, info]) => [
+            {
+              value: `${p.id}/${modelID}`,
+              title: info.name ?? modelID,
+              description: p.name,
+              category: p.name,
+              onSelect: async () => {
+                await sdk.client.voice.configUpdate({ voiceConfig: { brain: `${p.id}/${modelID}` } })
+                await refreshVoice()
+                dialog.clear()
+              },
+            },
+          ]),
+        ),
+      ),
+    ),
+  )
+
+  return (
     <DialogSelect
       title="Brain model"
       placeholder="Select LLM for voice brain..."
-      options={options()}
       current={sync.data.voice?.brain ?? undefined}
-      onSelect={async (option) => {
-        await sdk.client.voice.configUpdate({ voiceConfig: { brain: option?.value } })
-        const result = await sdk.client.voice.config()
-        if (result.data) sync.set("voice", result.data)
-      }}
+      options={options()}
     />
-  ))
+  )
 }
 
 /**
- * Opens a sub-dialog to toggle the structured workflow.
+ * Sub-dialog to toggle the structured workflow mode.
  */
-export function openStructuredToggle() {
+function DialogStructuredToggle() {
   const sync = useSync()
-  const dialog = useDialog()
   const sdk = useSDK()
+  const dialog = useDialog()
 
-  dialog.replace(() => (
+  async function refreshVoice() {
+    const result = await sdk.client.voice.config()
+    if (result.data) sync.set("voice", result.data)
+  }
+
+  const current = createMemo(() => (sync.data.voice?.structured ? "on" : "off"))
+
+  return (
     <DialogSelect
       title="Workflow mode"
       placeholder="Select workflow mode..."
+      current={current()}
       options={[
-        { title: "Free-form", value: "off", description: "Brain flows naturally, plan/build only" },
         {
-          title: "Structured (5-stage)",
+          value: "off",
+          title: "Free-form",
+          description: "Brain flows naturally, plan/build only",
+          onSelect: async () => {
+            await sdk.client.voice.configUpdate({ voiceConfig: { structured: false } })
+            await refreshVoice()
+            dialog.clear()
+          },
+        },
+        {
           value: "on",
+          title: "Structured (5-stage)",
           description: "gathering → proposing → confirmed → executing → reviewing",
+          onSelect: async () => {
+            await sdk.client.voice.configUpdate({ voiceConfig: { structured: true } })
+            await refreshVoice()
+            dialog.clear()
+          },
         },
       ]}
-      current={sync.data.voice?.structured ? "on" : "off"}
-      onSelect={async (option) => {
-        await sdk.client.voice.configUpdate({ voiceConfig: { structured: option?.value === "on" } })
-        const result = await sdk.client.voice.config()
-        if (result.data) sync.set("voice", result.data)
-      }}
     />
-  ))
+  )
 }
