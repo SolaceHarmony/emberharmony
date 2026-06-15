@@ -254,11 +254,11 @@ RPC is reserved for true imperatives — actions that need an immediate response
 
 ### The brain
 
-The voice agent has its own LLM, its own context window, and its own tool calls. It runs inside the LiveKit worker process.
+The voice agent has its own LLM context, its own tools, and its own workflow state. Orchestration lives in the LiveKit worker; credentialed model inference lives on the server.
 
 The current `SessionLLM` bridge forwards every word you say to a text session and streams raw output back to TTS. That approach has a fundamental problem: voice becomes a raw pipe. When the session runs tools, the voice reads out file contents, command output, and technical detail verbatim. That's not how people talk. You want the agent to _interpret_ what's happening and narrate it naturally — an "out-of-body" commentary on the work being done.
 
-The `BrainLLM` replaces `SessionLLM`. It calls the model provider directly (the same provider the text session uses, resolved from token metadata). It has its own system prompt, its own chat context, and its own tools. The brain is the thinker; the session is the worker.
+The `BrainLLM` replaces `SessionLLM`. It has its own system prompt, its own chat context, and its own tools. The brain is the thinker; the session is the worker.
 
 ```
 Current (SessionLLM — raw pipe):
@@ -268,16 +268,31 @@ Current (SessionLLM — raw pipe):
 
 Proposed (BrainLLM — commentary layer):
 
-  You speak → STT → Brain (own context, own tools)
+  You speak → STT → Brain (own context, own tools, own workflow)
                     ├─ TTS ← brain speaks an interpretation
                     ├─ Tool: list_sessions → GET /session
                     ├─ Tool: attach_session → sets attributes
                     ├─ Tool: submit_prompt → POST /session/{id}/prompt_async
                     ├─ Tool: get_recent_activity → GET /session/{id}/message
                     └─ Intent classifier gates plan/build safety
+
+  Model inference:
+    Worker serializes context + tool schemas
+    → POST /voice/brain (server handles auth, OAuth, provider transforms)
+    → streams text-delta + tool-call events back
+    → Worker executes tools locally, feeds results into context
+    → Next /voice/brain call with updated context
 ```
 
 The brain doesn't forward your words. It reasons about them, decides what to do, and speaks a natural interpretation back. When the attached session is busy running tools, the brain watches and narrates — not word-for-word, but as a commentary layer.
+
+#### Why the server still handles inference
+
+The worker can't call model providers directly. EmberHarmony's Auth store does OAuth token refresh, provider transforms, and beta headers inside server-side `LLM.stream()`. An OAuth-authed Claude or any provider that requires token refresh won't authenticate from the worker.
+
+The synthesis: **the worker owns orchestration (context, tools, workflow, observer), and the server owns only credentialed inference**. The `/voice/brain` endpoint receives a serialized chat context and tool schemas, runs one AI-SDK step with full auth, and streams back `text-delta` and `tool-call` events. Tools are schemas without `execute` functions. The worker registers real `llm.tool()`s whose `execute` runs locally. AgentSession appends results and calls `chat()` again, triggering the next `/voice/brain` step.
+
+This is different from the old `SessionLLM` proxy in one critical way: `SessionLLM` proxied the **entire conversation** through a text session. `/voice/brain` proxies only the **model inference call** — the conversation context, tool execution, workflow state, and observer narration all live in the worker.
 
 #### Voice as commentary
 
