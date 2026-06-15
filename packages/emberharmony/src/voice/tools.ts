@@ -223,6 +223,85 @@ export const SetModelTool = Tool.define("set_model", {
 })
 
 /**
+ * Attach to a project session. This transitions the voice agent from
+ * concierge mode (browsing sessions) to operator mode (working in a session).
+ * The worker detects the attached_session metadata change and hands off
+ * to the Operator agent.
+ */
+export const AttachSessionTool = Tool.define("attach_session", {
+  description:
+    "Attach to a project session for voice interaction. Use this when the user wants to " +
+    "work on a specific session — say, to start coding or make changes. After attaching, " +
+    "you'll be in operator mode and can submit prompts to the session.",
+  parameters: z.object({
+    sessionID: z.string().describe("The session ID to attach to"),
+    directory: z.string().describe("The project directory for the session"),
+  }),
+  async execute(params, ctx) {
+    const session = await Session.get(params.sessionID).catch(() => undefined)
+    if (!session) {
+      return {
+        title: "Session not found",
+        metadata: {
+          sessions: [] as Array<{ id: string; title: string; status: string }>,
+          sessionID: params.sessionID,
+          attached_session: "",
+          attached_directory: "",
+        },
+        output: `Session ${params.sessionID} not found. It may have been deleted.`,
+      }
+    }
+
+    // The tool result includes the attached session metadata so the worker
+    // can detect the attachment and hand off to the Operator agent.
+    // The worker monitors for metadata changes in the tool result and
+    // triggers a LiveKit handoff when attached_session changes.
+    return {
+      title: `Attached to "${session.title}"`,
+      metadata: {
+        sessions: [{ id: session.id, title: session.title, status: "active" }] as Array<{
+          id: string
+          title: string
+          status: string
+        }>,
+        sessionID: params.sessionID,
+        attached_session: params.sessionID,
+        attached_directory: params.directory,
+      },
+      output: `Attached to session "${session.title}" (${params.sessionID}). You are now in operator mode. You can submit prompts to work on this session.`,
+    }
+  },
+})
+
+/**
+ * Detach from the current session. This transitions the voice agent from
+ * operator mode back to concierge mode (browsing sessions).
+ * The worker detects the detached state and hands off to the Concierge.
+ */
+export const DetachSessionTool = Tool.define("detach_session", {
+  description:
+    "Detach from the current session. Use this when the user wants to switch to a " +
+    "different session or go back to browsing sessions. After detaching, you'll be " +
+    "in concierge mode and can list or search for other sessions.",
+  parameters: z.object({}),
+  async execute(params, ctx) {
+    // Clear the attached session metadata so the worker can detect
+    // the detachment and hand off to the Concierge.
+    return {
+      title: "Detached from session",
+      metadata: {
+        sessions: [] as Array<{ id: string; title: string; status: string }>,
+        sessionID: "",
+        attached_session: "",
+        attached_directory: "",
+      },
+      output:
+        "Detached from the current session. You are now in concierge mode and can list or search for other sessions.",
+    }
+  },
+})
+
+/**
  * All voice brain tools exported as an array for registration.
  */
 export const voiceTools = [
@@ -231,4 +310,6 @@ export const voiceTools = [
   SubmitPromptTool,
   AbortAttachedTool,
   SetModelTool,
+  AttachSessionTool,
+  DetachSessionTool,
 ] as const

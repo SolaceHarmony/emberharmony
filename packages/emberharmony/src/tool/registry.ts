@@ -33,6 +33,8 @@ import {
   SubmitPromptTool,
   AbortAttachedTool,
   SetModelTool,
+  AttachSessionTool,
+  DetachSessionTool,
 } from "../voice/tools"
 
 export namespace ToolRegistry {
@@ -133,6 +135,8 @@ export namespace ToolRegistry {
       SubmitPromptTool,
       AbortAttachedTool,
       SetModelTool,
+      AttachSessionTool,
+      DetachSessionTool,
       ...custom,
     ]
   }
