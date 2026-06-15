@@ -27,6 +27,13 @@ import { LspTool } from "./lsp"
 import { Truncate } from "./truncation"
 import { PlanExitTool, PlanEnterTool } from "./plan"
 import { ApplyPatchTool } from "./apply_patch"
+import {
+  ListSessionsTool,
+  GetRecentActivityTool,
+  SubmitPromptTool,
+  AbortAttachedTool,
+  SetModelTool,
+} from "../voice/tools"
 
 export namespace ToolRegistry {
   const log = Log.create({ service: "tool.registry" })
@@ -120,6 +127,12 @@ export namespace ToolRegistry {
       ...(Flag.EMBERHARMONY_EXPERIMENTAL_PLAN_MODE && Flag.EMBERHARMONY_CLIENT === "cli"
         ? [PlanExitTool, PlanEnterTool]
         : []),
+      // Voice brain tools — available when the agent is "voice"
+      ListSessionsTool,
+      GetRecentActivityTool,
+      SubmitPromptTool,
+      AbortAttachedTool,
+      SetModelTool,
       ...custom,
     ]
   }
