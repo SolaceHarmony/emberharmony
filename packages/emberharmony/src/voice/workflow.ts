@@ -1,34 +1,77 @@
 import { llm, log } from "@livekit/agents"
 
 /**
- * Voice mode workflow: every spoken turn runs through the session's `plan`
- * agent (read-only — the session refuses mutating tools) unless the utterance
- * is an explicit confirmation to proceed, in which case that single turn runs
- * as the `build` agent. Confirmation is judged by a small fast model on the
- * LiveKit Inference gateway, so the heavy session model never decides its own
- * permissions. Every turn re-defaults to plan: each execution needs a fresh
- * spoken confirmation.
+ * Voice workflow state machine.
+ *
+ * The agent moves through defined stages:
+ *
+ *   gathering  → you describe what you want
+ *        ↓
+ *   proposing  → the agent presents a plan and asks whether to proceed
+ *        ↓       you confirm (voice or tap)
+ *   confirmed  → one-time flip to build mode
+ *        ↓
+ *   executing  → the agent submits work to the attached session
+ *        ↓       the session goes idle
+ *   reviewing  → the agent summarizes what happened
+ *        ↓       back to gathering
+ *
+ * The agent can't skip from gathering to executing. It must propose, and
+ * you must confirm. The intent classifier can upgrade from plan to build,
+ * but only when the workflow is in the confirmed stage — enforced in
+ * code, not instructions. A prompt injection cannot grant build access.
  */
+
+export type Stage = "gathering" | "proposing" | "confirmed" | "executing" | "reviewing"
+
 export class VoiceWorkflow {
-  #mode: "plan" | "build" = "plan"
+  #stage: Stage = "gathering"
   #intent: llm.LLM
 
   constructor(intent: llm.LLM) {
     this.#intent = intent
   }
 
+  /** Current stage — exposed via participant attributes */
+  get stage(): Stage {
+    return this.#stage
+  }
+
+  /** Whether the workflow allows build-mode tool calls */
+  get canBuild(): boolean {
+    return this.#stage === "confirmed" || this.#stage === "executing"
+  }
+
   /** Agent name for the current voice turn — wired into the session bridge */
   agent(): string {
-    return this.#mode
+    return this.canBuild ? "build" : "plan"
+  }
+
+  /**
+   * Transition the workflow to a new stage.
+   * Only valid transitions are allowed — invalid ones are no-ops.
+   */
+  transition(next: Stage): void {
+    const allowed = transitions[this.#stage]
+    if (!allowed.includes(next)) {
+      log().warn(`workflow: invalid transition ${this.#stage} → ${next}`)
+      return
+    }
+    log().info(`workflow: ${this.#stage} → ${next}`)
+    this.#stage = next
   }
 
   /**
    * Called when the user's turn is finalized, before the session bridge runs.
-   * Flips this single turn to build mode only on explicit confirmation.
+   * Uses the intent classifier to determine whether the utterance is a
+   * confirmation (upgrade to build) or a new instruction (stay in plan).
+   *
+   * The classifier verdict can only upgrade the workflow to build mode
+   * when the stage is "confirmed" — enforced by canBuild above.
    */
   async route(utterance: string): Promise<void> {
-    this.#mode = "plan"
     if (!utterance.trim()) return
+
     try {
       const chatCtx = llm.ChatContext.empty()
       chatCtx.addMessage({
@@ -47,16 +90,46 @@ export class VoiceWorkflow {
       for await (const chunk of stream) {
         verdict += chunk.delta?.content ?? ""
       }
-      // exact match only — a rambling verdict like "PLAN, not BUILD" must
+      // Exact match only — a rambling verdict like "PLAN, not BUILD" must
       // never grant execution
-      if (verdict.trim().toUpperCase() === "BUILD") this.#mode = "build"
-      log().info(`voice workflow: ${this.#mode} turn (intent: ${verdict.trim() || "<empty>"})`)
+      const confirmed = verdict.trim().toUpperCase() === "BUILD"
+
+      if (confirmed) {
+        // The classifier says this is a confirmation. If the workflow is
+        // in proposing, transition to confirmed. If we're already in
+        // confirmed/executing, stay there. Otherwise, stay in gathering.
+        if (this.#stage === "proposing") {
+          this.transition("confirmed")
+        } else if (this.#stage === "confirmed" || this.#stage === "executing") {
+          // Already building — keep going
+        } else {
+          // Premature confirmation — user confirmed before a plan was
+          // proposed. Treat as gathering input.
+          log().info("workflow: premature BUILD verdict, staying in gathering")
+        }
+      } else {
+        // Not a confirmation — treat as new input. If we were proposing,
+        // the user modified the request; go back to gathering.
+        if (this.#stage === "proposing") {
+          this.#stage = "gathering"
+        }
+      }
+
+      log().info(`voice workflow: ${this.#stage} (intent: ${verdict.trim() || "<empty>"})`)
     } catch (error) {
-      // classification failure must never grant execution — stay in plan
-      this.#mode = "plan"
-      log().warn(`voice workflow intent check failed, staying in plan mode: ${error}`)
+      // Classification failure must never grant execution — stay in current stage
+      log().warn(`voice workflow intent check failed: ${error}`)
     }
   }
+}
+
+/** Valid transitions from each stage */
+const transitions: Record<Stage, Stage[]> = {
+  gathering: ["proposing"],
+  proposing: ["confirmed", "gathering"],
+  confirmed: ["executing"],
+  executing: ["reviewing"],
+  reviewing: ["gathering"],
 }
 
 export const VOICE_SYSTEM_PROMPT = [

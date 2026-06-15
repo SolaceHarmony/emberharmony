@@ -7,7 +7,7 @@ import { Flag } from "../flag/flag"
 import { SessionLLM } from "./bridge"
 import { VoiceRegistry } from "./registry"
 import { VOICE_AGENT_NAME } from "./constants"
-import { VoiceWorkflow, VOICE_SYSTEM_PROMPT } from "./workflow"
+import { VoiceWorkflow, type Stage } from "./workflow"
 import { BRAIN_SYSTEM_PROMPT, VOICE_PROJECT_DIR } from "./brain"
 
 // Model strings accept an optional ":language" (STT) or ":voice" (TTS) suffix.
@@ -18,21 +18,43 @@ const TTS_MODEL = process.env["EMBERHARMONY_VOICE_TTS_MODEL"] ?? VoiceRegistry.D
 // Small fast gateway model that routes plan/build per spoken turn
 const INTENT_MODEL = process.env["EMBERHARMONY_VOICE_INTENT_MODEL"] ?? VoiceRegistry.DEFAULT_INTENT
 
+/** Participant attribute keys published by the voice agent */
+const ATTR_STAGE = "emberharmony.voice_stage"
+const ATTR_MODE = "emberharmony.voice_mode"
+
 class EmberHarmonyAgent extends voice.Agent {
   #workflow: VoiceWorkflow
+  #publishState: () => Promise<void>
 
-  constructor(workflow: VoiceWorkflow) {
+  constructor(workflow: VoiceWorkflow, publishState: () => Promise<void>) {
     super({
       // The session bridge holds the real context server-side; these
       // instructions only exist because voice.Agent requires them.
       instructions: "You are EmberHarmony, a voice interface to a coding assistant session.",
     })
     this.#workflow = workflow
+    this.#publishState = publishState
   }
 
   override async onUserTurnCompleted(_chatCtx: llm.ChatContext, newMessage: llm.ChatMessage): Promise<void> {
     await this.#workflow.route(newMessage.textContent ?? "")
+    await this.#publishState()
   }
+}
+
+/**
+ * Publish the current workflow state as participant attributes.
+ * setAttributes is a full replacement, so we merge with existing attrs.
+ */
+async function publishStage(room: JobContext["room"], workflow: VoiceWorkflow): Promise<void> {
+  const lp = room.localParticipant
+  if (!lp || !room.isConnected) return
+  const existing = lp.attributes ?? {}
+  await lp.setAttributes({
+    ...existing,
+    [ATTR_STAGE]: workflow.stage,
+    [ATTR_MODE]: workflow.canBuild ? "build" : "plan",
+  })
 }
 
 /**
@@ -113,8 +135,18 @@ export default defineAgent({
       turnDetection: new livekit.turnDetector.MultilingualModel(),
     })
 
-    await session.start({ agent: new EmberHarmonyAgent(workflow), room: ctx.room })
+    await session.start({
+      agent: new EmberHarmonyAgent(workflow, async () => {
+        await publishStage(ctx.room, workflow)
+      }),
+      room: ctx.room,
+    })
     await ctx.connect()
+
+    // Publish initial workflow state as participant attributes so the
+    // client can observe plan/build mode and workflow stage changes.
+    await publishStage(ctx.room, workflow)
+
     session.say(
       "Hey, I'm listening. We're in plan mode — tell me what you'd like to work on, and say the word when you want me to build.",
     )
