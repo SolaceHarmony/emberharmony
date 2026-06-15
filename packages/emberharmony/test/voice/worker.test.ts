@@ -11,6 +11,7 @@ const mockSettings: Voice.Settings = {
   stt: "deepgram/nova-3:multi",
   tts: "cartesia/sonic-3",
   intent: "openai/gpt-5.4-nano",
+  structured: false,
   available: true,
 }
 

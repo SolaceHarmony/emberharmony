@@ -871,12 +871,22 @@ export namespace Config {
         .strict()
         .optional()
         .describe("LiveKit transport settings; the API key and secret live in the credentials store"),
+      brain: z
+        .string()
+        .optional()
+        .describe("LLM model for the voice brain session, e.g. anthropic/claude-sonnet-4-20250514 or openai/gpt-4o"),
       stt: z.string().optional().describe("Speech-to-text model string, e.g. deepgram/nova-3:multi"),
       tts: z.string().optional().describe("Text-to-speech model string, e.g. cartesia/sonic-3:<voiceID>"),
       intent: z
         .string()
         .optional()
         .describe("Small fast model that routes voice turns between plan and build, e.g. openai/gpt-5.4-nano"),
+      structured: z
+        .boolean()
+        .optional()
+        .describe(
+          "Enable the structured 5-stage workflow (gathering → proposing → confirmed → executing → reviewing). When off, the brain flows naturally with plan/build as the only modes.",
+        ),
     })
     .strict()
     .meta({

@@ -104,7 +104,7 @@ export default defineAgent({
         return {}
       }
     })()
-    const { projectID, directory, serverUrl, model } = metadata
+    const { projectID, directory, serverUrl, model, brainModel, structured } = metadata
     if (!projectID || !directory || !serverUrl) {
       throw new Error(
         `voice agent dispatched without project metadata (got: ${ctx.job.metadata || "<empty>"}) — ` +
@@ -119,8 +119,17 @@ export default defineAgent({
     // via server-side tools (submit_prompt, attach_session, etc.).
     const brain = await discoverBrainSession(process.env["EMBERHARMONY_VOICE_SERVER_URL"] ?? serverUrl)
 
+    // Parse the configured brain model (e.g. "anthropic/claude-sonnet-4-20250514")
+    // into { providerID, modelID } for the session bridge fallback
+    const brainFallback = brainModel
+      ? { providerID: brainModel.split("/")[0], modelID: brainModel.split("/").slice(1).join("/") }
+      : model
+
     const vad = ctx.proc.userData.vad as silero.VAD
-    const workflow = new VoiceWorkflow(inference.LLM.fromModelString(INTENT_MODEL))
+    const workflow = new VoiceWorkflow({
+      intent: inference.LLM.fromModelString(INTENT_MODEL),
+      structured: structured ?? false,
+    })
     const session = new voice.AgentSession({
       stt: inference.STT.fromModelString(STT_MODEL),
       llm: new SessionLLM({
@@ -132,7 +141,7 @@ export default defineAgent({
         sessionID: brain.sessionID,
         username: Flag.EMBERHARMONY_SERVER_USERNAME,
         password: Flag.EMBERHARMONY_SERVER_PASSWORD,
-        fallbackModel: model,
+        fallbackModel: brainFallback,
         agent: () => workflow.agent(),
         system: brain.system,
         // The brain session should NOT be aborted on every voice interruption.

@@ -21,9 +21,11 @@ export namespace Voice {
     url?: string
     apiKey?: string
     apiSecret?: string
+    brain?: string
     stt: string
     tts: string
     intent: string
+    structured: boolean
     available: boolean
   }
 
@@ -46,9 +48,11 @@ export namespace Voice {
       url,
       apiKey,
       apiSecret,
+      brain: voice.brain ?? process.env["EMBERHARMONY_VOICE_BRAIN_MODEL"],
       stt: voice.stt ?? process.env["EMBERHARMONY_VOICE_STT_MODEL"] ?? VoiceRegistry.DEFAULT_STT,
       tts: voice.tts ?? process.env["EMBERHARMONY_VOICE_TTS_MODEL"] ?? VoiceRegistry.DEFAULT_TTS,
       intent: voice.intent ?? process.env["EMBERHARMONY_VOICE_INTENT_MODEL"] ?? VoiceRegistry.DEFAULT_INTENT,
+      structured: voice.structured ?? false,
       available: Boolean(!disabled && url && apiKey && apiSecret),
     }
   }

@@ -25,9 +25,11 @@ const VoiceConfigInfo = z
     available: z.boolean(),
     disabled: z.boolean(),
     url: z.string().nullable(),
+    brain: z.string().nullable(),
     stt: z.string(),
     tts: z.string(),
     intent: z.string(),
+    structured: z.boolean(),
     registry: z.object({
       stt: RegistryOption.array(),
       tts: RegistryOption.array(),
@@ -45,9 +47,11 @@ async function configInfo(override?: Config.Voice) {
     available: settings.available,
     disabled: settings.disabled,
     url: settings.url ?? null,
+    brain: settings.brain ?? null,
     stt: settings.stt,
     tts: settings.tts,
     intent: settings.intent,
+    structured: settings.structured,
     registry: { stt: VoiceRegistry.STT, tts: VoiceRegistry.TTS },
     credentials: {
       livekit: Boolean(auth?.type === "api" && auth.key && auth.secret),
@@ -179,6 +183,7 @@ export const VoiceRoutes = lazy(() =>
         const projectID = Instance.project.id
         const roomName = `emberharmony_voice_${projectID}`
         const agentName = body.agentName ?? Voice.AGENT_NAME
+        const resolved = await Voice.settings()
         // the agent worker uses this to bridge the voice conversation into
         // the EmberHarmony session (same tools, permissions, and context)
         const agentMetadata = JSON.stringify({
@@ -186,6 +191,8 @@ export const VoiceRoutes = lazy(() =>
           directory: Instance.directory,
           serverUrl: new URL(c.req.url).origin,
           model: body.model,
+          brainModel: resolved.brain,
+          structured: resolved.structured,
         })
         const result = await Voice.token({
           roomName,

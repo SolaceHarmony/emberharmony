@@ -5,12 +5,16 @@ import { Switch } from "@thesolaceproject/emberharmony-ui/switch"
 import { TextField } from "@thesolaceproject/emberharmony-ui/text-field"
 import { showToast } from "@thesolaceproject/emberharmony-ui/toast"
 import { ScrollFade } from "@thesolaceproject/emberharmony-ui/scroll-fade"
+import { ProviderIcon } from "@thesolaceproject/emberharmony-ui/provider-icon"
+import type { IconName } from "@thesolaceproject/emberharmony-ui/icons/provider"
 import { useLanguage } from "@/context/language"
 import { useGlobalSDK } from "@/context/global-sdk"
+import { useModels } from "@/context/models"
 
 export const SettingsVoice: Component = () => {
   const language = useLanguage()
   const globalSDK = useGlobalSDK()
+  const models = useModels()
 
   const [config, { refetch }] = createResource(() =>
     globalSDK.client.voice
@@ -109,6 +113,24 @@ export const SettingsVoice: Component = () => {
   const currentStt = createMemo(() => sttOptions().find((o) => config()?.stt.split(":")[0] === o.id))
   const currentTts = createMemo(() => ttsOptions().find((o) => config()?.tts.split(":")[0] === o.id))
 
+  // Brain model options from the full provider/model list
+  type BrainModelOption = { providerID: string; modelID: string; name: string; providerName: string }
+  const brainOptions = createMemo(() =>
+    models.list().map((m) => ({
+      providerID: m.provider.id,
+      modelID: m.id,
+      name: m.name,
+      providerName: m.provider.name,
+    })),
+  )
+  const currentBrain = createMemo(() => {
+    const brain = (config() as any)?.brain
+    if (!brain) return undefined
+    const [providerID, ...rest] = brain.split("/")
+    const modelID = rest.join("/")
+    return brainOptions().find((o) => o.providerID === providerID && o.modelID === modelID)
+  })
+
   return (
     <ScrollFade class="h-full overflow-y-auto px-8">
       <div class="sticky top-0 z-10 bg-[linear-gradient(to_bottom,var(--surface-raised-stronger-non-alpha)_calc(100%_-_24px),transparent)]">
@@ -185,6 +207,31 @@ export const SettingsVoice: Component = () => {
           <h3 class="text-14-medium text-text-strong pb-2">{language.t("settings.voice.section.models")}</h3>
           <div class="bg-surface-raised-base px-4 rounded-lg">
             <SettingsRow
+              title="Brain model"
+              description="LLM that powers the voice brain — selects from your configured providers"
+            >
+              <Select
+                options={brainOptions()}
+                current={currentBrain()}
+                value={(o) => `${o.providerID}/${o.modelID}`}
+                label={(o) => `${o.providerName} ${o.name}`}
+                groupBy={(o) => o.providerName}
+                placeholder="Default"
+                onSelect={(option) => {
+                  if (!option) {
+                    if ((config() as any)?.brain) update({ brain: undefined })
+                    return
+                  }
+                  const next = `${option.providerID}/${option.modelID}`
+                  if ((config() as any)?.brain === next) return
+                  update({ brain: next })
+                }}
+                variant="secondary"
+                size="small"
+                triggerVariant="settings"
+              />
+            </SettingsRow>
+            <SettingsRow
               title={language.t("settings.voice.row.stt.title")}
               description={language.t("settings.voice.row.stt.description")}
             >
@@ -239,6 +286,25 @@ export const SettingsVoice: Component = () => {
                       if (value && value !== cfg().intent) update({ intent: value })
                     }}
                   />
+                )}
+              </Show>
+            </SettingsRow>
+            <SettingsRow
+              title="Structured workflow"
+              description="5-stage mode: gathering → proposing → confirmed → executing → reviewing. Say 'exit workflow' to escape."
+            >
+              <Show when={config()}>
+                {(cfg) => (
+                  <Switch
+                    hideLabel
+                    checked={(cfg() as any).structured ?? false}
+                    onChange={(checked) => {
+                      if (((cfg() as any).structured ?? false) === checked) return
+                      update({ structured: checked })
+                    }}
+                  >
+                    Structured workflow
+                  </Switch>
                 )}
               </Show>
             </SettingsRow>

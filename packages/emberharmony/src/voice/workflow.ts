@@ -1,45 +1,54 @@
 import { llm, log } from "@livekit/agents"
 
 /**
- * Voice workflow state machine.
+ * Voice workflow — plan/build routing with optional structured stages.
  *
- * The agent moves through defined stages:
+ * Default mode (structured: false):
+ *   The brain flows naturally. The classifier decides plan/build per turn.
+ *   The brain proposes and asks for confirmation because its system prompt
+ *   tells it to — not because a state machine forces it through named stages.
+ *   The only enforcement is the build gate: ctx.agent in submit_prompt.
+ *   Every turn re-defaults to "plan." A single "yes" authorizes one build.
  *
- *   gathering  → you describe what you want
- *        ↓
- *   proposing  → the agent presents a plan and asks whether to proceed
- *        ↓       you confirm (voice or tap)
- *   confirmed  → one-time flip to build mode
- *        ↓
- *   executing  → the agent submits work to the attached session
- *        ↓       the session goes idle
- *   reviewing  → the agent summarizes what happened
- *        ↓       back to gathering
+ * Structured mode (structured: true):
+ *   The 5-stage machine activates:
+ *     gathering → proposing → confirmed → executing → reviewing → gathering
+ *   The agent must propose, and the user must confirm. Transitions are
+ *   enforced in code. The user can say "skip" or "exit workflow" to
+ *   escape back to free-form at any time.
  *
- * The agent can't skip from gathering to executing. It must propose, and
- * you must confirm. The intent classifier can upgrade from plan to build,
- * but only when the workflow is in the confirmed stage — enforced in
- * code, not instructions. A prompt injection cannot grant build access.
+ * Both modes share the same build gate — the classifier's verdict flows
+ * through ctx.agent, which submit_prompt trusts. A prompt injection cannot
+ * grant build access because the model cannot control ctx.agent.
  */
 
 export type Stage = "gathering" | "proposing" | "confirmed" | "executing" | "reviewing"
 
 export class VoiceWorkflow {
+  #mode: "plan" | "build" = "plan"
   #stage: Stage = "gathering"
+  #structured: boolean
   #intent: llm.LLM
 
-  constructor(intent: llm.LLM) {
-    this.#intent = intent
+  constructor(opts: { intent: llm.LLM; structured?: boolean }) {
+    this.#intent = opts.intent
+    this.#structured = opts.structured ?? false
   }
 
-  /** Current stage — exposed via participant attributes */
+  /** Current stage (only meaningful when structured is true) */
   get stage(): Stage {
     return this.#stage
   }
 
   /** Whether the workflow allows build-mode tool calls */
   get canBuild(): boolean {
+    if (!this.#structured) return this.#mode === "build"
     return this.#stage === "confirmed" || this.#stage === "executing"
+  }
+
+  /** Whether the structured 5-stage machine is active */
+  get structured(): boolean {
+    return this.#structured
   }
 
   /** Agent name for the current voice turn — wired into the session bridge */
@@ -49,9 +58,14 @@ export class VoiceWorkflow {
 
   /**
    * Transition the workflow to a new stage.
-   * Only valid transitions are allowed — invalid ones are no-ops.
+   * Only valid when structured mode is active. Only valid transitions
+   * are allowed — invalid ones are no-ops.
    */
   transition(next: Stage): void {
+    if (!this.#structured) {
+      log().warn("workflow: transitions are only available in structured mode")
+      return
+    }
     const allowed = transitions[this.#stage]
     if (!allowed.includes(next)) {
       log().warn(`workflow: invalid transition ${this.#stage} → ${next}`)
@@ -62,15 +76,33 @@ export class VoiceWorkflow {
   }
 
   /**
+   * Escape the structured workflow and return to free-form mode.
+   * The user can say "exit workflow" or "skip the stages" at any time.
+   */
+  escape(): void {
+    if (!this.#structured) return
+    log().info("workflow: escaping structured mode")
+    this.#stage = "gathering"
+    this.#mode = "plan"
+  }
+
+  /**
    * Called when the user's turn is finalized, before the session bridge runs.
    * Uses the intent classifier to determine whether the utterance is a
    * confirmation (upgrade to build) or a new instruction (stay in plan).
    *
-   * The classifier verdict can only upgrade the workflow to build mode
-   * when the stage is "confirmed" — enforced by canBuild above.
+   * In default mode: the classifier verdict directly sets plan/build.
+   * In structured mode: the classifier verdict drives stage transitions.
+   * In both modes: classification failure must never grant execution.
    */
   async route(utterance: string): Promise<void> {
     if (!utterance.trim()) return
+
+    // Check for escape phrases before running the classifier
+    if (this.#structured && isEscape(utterance)) {
+      this.escape()
+      return
+    }
 
     try {
       const chatCtx = llm.ChatContext.empty()
@@ -81,7 +113,7 @@ export class VoiceWorkflow {
           "Reply with exactly one word. Reply BUILD only if the user is explicitly confirming " +
           "that the assistant should go ahead and execute work that was previously discussed or " +
           'proposed — e.g. "yes, do it", "go ahead", "sounds good, proceed", "ship it", ' +
-          '"run it". Reply PLAN for everything else: questions, ideas, requests to look at ' +
+          '"run it", "just do it". Reply PLAN for everything else: questions, ideas, requests to look at ' +
           "something, hesitation, or new instructions that have not been confirmed.",
       })
       chatCtx.addMessage({ role: "user", content: utterance })
@@ -95,41 +127,87 @@ export class VoiceWorkflow {
       const confirmed = verdict.trim().toUpperCase() === "BUILD"
 
       if (confirmed) {
-        // The classifier says this is a confirmation. If the workflow is
-        // in proposing, transition to confirmed. If we're already in
-        // confirmed/executing, stay there. Otherwise, stay in gathering.
-        if (this.#stage === "proposing") {
-          this.transition("confirmed")
-        } else if (this.#stage === "confirmed" || this.#stage === "executing") {
-          // Already building — keep going
+        if (this.#structured) {
+          this.routeStructuredConfirm()
         } else {
-          // Premature confirmation — user confirmed before a plan was
-          // proposed. Treat as gathering input.
-          log().info("workflow: premature BUILD verdict, staying in gathering")
+          // Default mode: classifier says build — one-shot authorization
+          this.#mode = "build"
         }
       } else {
-        // Not a confirmation — treat as new input. If we were proposing,
-        // the user modified the request; go back to gathering.
-        if (this.#stage === "proposing") {
-          this.#stage = "gathering"
+        if (this.#structured) {
+          this.routeStructuredPlan()
+        } else {
+          // Default mode: not a confirmation — stay in plan
+          this.#mode = "plan"
         }
       }
 
-      log().info(`voice workflow: ${this.#stage} (intent: ${verdict.trim() || "<empty>"})`)
+      log().info(
+        `voice workflow: ${this.#structured ? this.#stage : this.#mode} (intent: ${verdict.trim() || "<empty>"})`,
+      )
     } catch (error) {
-      // Classification failure must never grant execution — stay in current stage
+      // Classification failure must never grant execution
+      this.#mode = "plan"
       log().warn(`voice workflow intent check failed: ${error}`)
     }
+  }
+
+  /**
+   * Structured mode: handle a BUILD verdict from the classifier.
+   * Transitions through the stage machine.
+   */
+  routeStructuredConfirm(): void {
+    if (this.#stage === "proposing") {
+      this.transition("confirmed")
+    } else if (this.#stage === "confirmed" || this.#stage === "executing") {
+      // Already building — keep going
+    } else if (this.#stage === "gathering") {
+      // User confirmed before the agent proposed. In structured mode,
+      // treat as a direct skip — jump straight to confirmed.
+      log().info("workflow: skipping to confirmed (user confirmed early)")
+      this.#stage = "confirmed"
+    } else {
+      // reviewing or other — stay put
+      log().info(`workflow: BUILD verdict in ${this.#stage}, staying`)
+    }
+  }
+
+  /**
+   * Structured mode: handle a PLAN verdict from the classifier.
+   * The user is still discussing, not confirming.
+   */
+  routeStructuredPlan(): void {
+    if (this.#stage === "proposing") {
+      this.#stage = "gathering"
+    }
+    // In all other stages, a PLAN verdict just means "not confirming"
   }
 }
 
 /** Valid transitions from each stage */
 const transitions: Record<Stage, Stage[]> = {
-  gathering: ["proposing"],
+  gathering: ["proposing", "confirmed"],
   proposing: ["confirmed", "gathering"],
   confirmed: ["executing"],
   executing: ["reviewing"],
   reviewing: ["gathering"],
+}
+
+/** Escape phrases that drop out of structured mode */
+const ESCAPE_PHRASES = [
+  "exit workflow",
+  "skip the stages",
+  "skip the workflow",
+  "stop the workflow",
+  "leave workflow",
+  "no workflow",
+  "free form",
+  "freeform",
+]
+
+function isEscape(utterance: string): boolean {
+  const lower = utterance.toLowerCase().trim()
+  return ESCAPE_PHRASES.some((phrase) => lower.includes(phrase))
 }
 
 export const VOICE_SYSTEM_PROMPT = [
