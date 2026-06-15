@@ -51,7 +51,7 @@ livekit-api = { version = "0.5", optional = true }
 log = "0.4"
 
 [features]
-default = []
+default = ["voice"]
 voice = ["livekit", "livekit-api"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
