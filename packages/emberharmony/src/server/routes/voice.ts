@@ -7,6 +7,7 @@ import { Voice } from "../../voice/token"
 import { VoiceRegistry } from "../../voice/registry"
 import { VoiceWorker } from "../../voice/worker"
 import { Instance } from "../../project/instance"
+import { ensureBrainSession, BRAIN_SYSTEM_PROMPT, VOICE_PROJECT_DIR } from "../../voice/brain"
 import { errors } from "../error"
 import { lazy } from "../../util/lazy"
 
@@ -190,6 +191,41 @@ export const VoiceRoutes = lazy(() =>
         })
         await Voice.ensureAgentDispatched({ roomName, agentName, metadata: agentMetadata })
         return c.json({ token: result.token, url: result.url, roomName })
+      },
+    )
+    .get(
+      "/brain",
+      describeRoute({
+        summary: "Get the voice brain session",
+        description:
+          "Find or create the permanent voice brain session in the voice project directory. " +
+          "Returns the session ID, the project directory, and the brain system prompt. " +
+          "The voice agent worker calls this at startup to get the brain session it should target.",
+        operationId: "voice.brain",
+        responses: {
+          200: {
+            description: "Voice brain session info",
+            content: {
+              "application/json": {
+                schema: resolver(
+                  z.object({
+                    sessionID: z.string(),
+                    directory: z.string(),
+                    system: z.string(),
+                  }),
+                ),
+              },
+            },
+          },
+        },
+      }),
+      async (c) => {
+        const sessionID = await ensureBrainSession()
+        return c.json({
+          sessionID,
+          directory: VOICE_PROJECT_DIR,
+          system: BRAIN_SYSTEM_PROMPT,
+        })
       },
     ),
 )
