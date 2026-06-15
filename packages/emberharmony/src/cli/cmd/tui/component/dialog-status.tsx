@@ -166,13 +166,19 @@ export function DialogStatus() {
             <text
               flexShrink={0}
               style={{
-                fg: sync.data.voice?.available ? theme.success : theme.error,
+                fg: sync.data.voice?.disabled
+                  ? theme.textMuted
+                  : sync.data.voice?.available
+                    ? theme.success
+                    : theme.error,
               }}
             >
               •
             </text>
             <text fg={theme.text}>
-              <b>{sync.data.voice?.available ? "Connected" : "Not configured"}</b>
+              <b>
+                {sync.data.voice?.disabled ? "Disabled" : sync.data.voice?.available ? "Connected" : "Not configured"}
+              </b>
               <Show when={sync.data.voice?.brain}>
                 <span style={{ fg: theme.textMuted }}> — {sync.data.voice?.brain}</span>
               </Show>

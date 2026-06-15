@@ -28,15 +28,30 @@ export function DialogVoice() {
     const items = []
 
     // Status section
+    const statusLabel = voice.disabled ? "Disabled" : voice.available ? "Connected" : "Not configured"
     items.push({
       value: "status",
-      title: voice.available ? "Connected" : "Not configured",
+      title: statusLabel,
       description: voice.url ?? undefined,
       category: "Status",
       onSelect: () => {
         dialog.clear()
       },
     })
+
+    // Enable/disable voice toggle (only when credentials exist)
+    if (voice.credentials.livekit) {
+      items.push({
+        value: "toggle",
+        title: voice.disabled ? "Enable voice" : "Disable voice",
+        category: "Status",
+        onSelect: async () => {
+          await sdk.client.voice.configUpdate({ voiceConfig: { disabled: !voice.disabled } })
+          await refreshVoice()
+          dialog.clear()
+        },
+      })
+    }
 
     // Brain model
     items.push({
