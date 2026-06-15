@@ -32,7 +32,6 @@ import {
   GetRecentActivityTool,
   SubmitPromptTool,
   AbortAttachedTool,
-  SetModelTool,
   AttachSessionTool,
   DetachSessionTool,
 } from "../voice/tools"
@@ -134,7 +133,6 @@ export namespace ToolRegistry {
       GetRecentActivityTool,
       SubmitPromptTool,
       AbortAttachedTool,
-      SetModelTool,
       AttachSessionTool,
       DetachSessionTool,
       ...custom,

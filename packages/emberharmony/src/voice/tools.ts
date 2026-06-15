@@ -3,6 +3,7 @@ import { Tool } from "../tool/tool"
 import { Instance } from "../project/instance"
 import { Session } from "../session"
 import { SessionPrompt } from "../session/prompt"
+import { SessionStatus } from "../session/status"
 import { Log } from "../util/log"
 
 /**
@@ -21,6 +22,13 @@ import { Log } from "../util/log"
 
 const log = Log.create({ service: "voice.tools" })
 
+/** Session metadata shared across voice tool results */
+interface SessionMeta {
+  id: string
+  title: string
+  status: string
+}
+
 /**
  * List open sessions in the current project.
  * The brain uses this to tell the user what sessions are available.
@@ -33,15 +41,16 @@ export const ListSessionsTool = Tool.define("list_sessions", {
     search: z.string().optional().describe("Optional search query to filter sessions by title"),
   }),
   async execute(params, ctx) {
-    const sessions: Array<{ id: string; title: string; status: string }> = []
+    const sessions: SessionMeta[] = []
     for await (const session of Session.list()) {
       if (params.search && !session.title.toLowerCase().includes(params.search.toLowerCase())) continue
-      sessions.push({ id: session.id, title: session.title, status: "active" })
+      const status = SessionStatus.get(session.id)
+      sessions.push({ id: session.id, title: session.title, status: status.type })
     }
     if (sessions.length === 0) {
       return {
         title: "No sessions found",
-        metadata: { sessions: [] as Array<{ id: string; title: string; status: string }>, sessionID: "" },
+        metadata: { sessions: [] as SessionMeta[], sessionID: "" },
         output: params.search ? `No sessions matching "${params.search}".` : "No open sessions.",
       }
     }
@@ -68,11 +77,14 @@ export const GetRecentActivityTool = Tool.define("get_recent_activity", {
     limit: z.number().optional().describe("Number of recent messages to return (default 5)"),
   }),
   async execute(params, ctx) {
-    const session = await Session.get(params.sessionID).catch(() => undefined)
+    const session = await Session.get(params.sessionID).catch((error) => {
+      log.warn("session lookup failed", { sessionID: params.sessionID, error })
+      return undefined
+    })
     if (!session) {
       return {
         title: "Session not found",
-        metadata: { sessions: [] as Array<{ id: string; title: string; status: string }>, sessionID: params.sessionID },
+        metadata: { sessions: [] as SessionMeta[], sessionID: params.sessionID },
         output: `Session ${params.sessionID} not found. It may have been deleted.`,
       }
     }
@@ -88,7 +100,7 @@ export const GetRecentActivityTool = Tool.define("get_recent_activity", {
     if (!messages || messages.length === 0) {
       return {
         title: "No recent activity",
-        metadata: { sessions: [] as Array<{ id: string; title: string; status: string }>, sessionID: params.sessionID },
+        metadata: { sessions: [] as SessionMeta[], sessionID: params.sessionID },
         output: `No recent messages in "${session.title}".`,
       }
     }
@@ -163,7 +175,7 @@ export const SubmitPromptTool = Tool.define("submit_prompt", {
       })
       return {
         title: "Prompt submitted",
-        metadata: { sessions: [] as Array<{ id: string; title: string; status: string }>, sessionID: params.sessionID },
+        metadata: { sessions: [] as SessionMeta[], sessionID: params.sessionID },
         output: `Prompt submitted to session ${params.sessionID} in ${effectiveAgent} mode. The session is now processing.`,
       }
     } catch (error) {
@@ -171,7 +183,7 @@ export const SubmitPromptTool = Tool.define("submit_prompt", {
         return {
           title: "Session busy",
           metadata: {
-            sessions: [] as Array<{ id: string; title: string; status: string }>,
+            sessions: [] as SessionMeta[],
             sessionID: params.sessionID,
           },
           output: `Session ${params.sessionID} is busy. Please wait for it to finish and try again.`,
@@ -179,7 +191,7 @@ export const SubmitPromptTool = Tool.define("submit_prompt", {
       }
       return {
         title: "Prompt submission failed",
-        metadata: { sessions: [] as Array<{ id: string; title: string; status: string }>, sessionID: params.sessionID },
+        metadata: { sessions: [] as SessionMeta[], sessionID: params.sessionID },
         output: `Failed to submit prompt to session ${params.sessionID}: ${error instanceof Error ? error.message : String(error)}`,
       }
     }
@@ -207,32 +219,8 @@ export const AbortAttachedTool = Tool.define("abort_attached", {
 
     return {
       title: "Session aborted",
-      metadata: { sessions: [] as Array<{ id: string; title: string; status: string }>, sessionID: params.sessionID },
+      metadata: { sessions: [] as SessionMeta[], sessionID: params.sessionID },
       output: `Session ${params.sessionID} aborted.`,
-    }
-  },
-})
-
-/**
- * Change the model for the attached session.
- */
-export const SetModelTool = Tool.define("set_model", {
-  description:
-    "Change the AI model used by the attached session. Use this when the user asks to " +
-    "switch models (e.g. 'use Claude for this task' or 'switch to GPT-4').",
-  parameters: z.object({
-    sessionID: z.string().describe("The session ID"),
-    directory: z.string().describe("The project directory for the session"),
-    providerID: z.string().describe("The provider ID (e.g. 'openai', 'anthropic', 'ollama')"),
-    modelID: z.string().describe("The model ID (e.g. 'gpt-4o', 'claude-3.5-sonnet')"),
-  }),
-  async execute(params, ctx) {
-    // Model changes through voice are not yet supported — the session PATCH
-    // endpoint doesn't have a model field. We'll add this when it does.
-    return {
-      title: "Model change requested",
-      metadata: { sessions: [] as Array<{ id: string; title: string; status: string }>, sessionID: params.sessionID },
-      output: `Model change to ${params.providerID}/${params.modelID} is not yet supported via voice. Please change the model in the session settings.`,
     }
   },
 })
@@ -253,12 +241,15 @@ export const AttachSessionTool = Tool.define("attach_session", {
     directory: z.string().describe("The project directory for the session"),
   }),
   async execute(params, ctx) {
-    const session = await Session.get(params.sessionID).catch(() => undefined)
+    const session = await Session.get(params.sessionID).catch((error) => {
+      log.warn("session lookup failed for attach", { sessionID: params.sessionID, error })
+      return undefined
+    })
     if (!session) {
       return {
         title: "Session not found",
         metadata: {
-          sessions: [] as Array<{ id: string; title: string; status: string }>,
+          sessions: [] as SessionMeta[],
           sessionID: params.sessionID,
           attached_session: "",
           attached_directory: "",
@@ -267,14 +258,11 @@ export const AttachSessionTool = Tool.define("attach_session", {
       }
     }
 
+    const status = SessionStatus.get(session.id)
     return {
       title: `Attached to "${session.title}"`,
       metadata: {
-        sessions: [{ id: session.id, title: session.title, status: "active" }] as Array<{
-          id: string
-          title: string
-          status: string
-        }>,
+        sessions: [{ id: session.id, title: session.title, status: status.type }] as SessionMeta[],
         sessionID: params.sessionID,
         attached_session: params.sessionID,
         attached_directory: params.directory,
@@ -299,7 +287,7 @@ export const DetachSessionTool = Tool.define("detach_session", {
     return {
       title: "Detached from session",
       metadata: {
-        sessions: [] as Array<{ id: string; title: string; status: string }>,
+        sessions: [] as SessionMeta[],
         sessionID: "",
         attached_session: "",
         attached_directory: "",
@@ -309,16 +297,3 @@ export const DetachSessionTool = Tool.define("detach_session", {
     }
   },
 })
-
-/**
- * All voice brain tools exported as an array for registration.
- */
-export const voiceTools = [
-  ListSessionsTool,
-  GetRecentActivityTool,
-  SubmitPromptTool,
-  AbortAttachedTool,
-  SetModelTool,
-  AttachSessionTool,
-  DetachSessionTool,
-] as const

@@ -209,10 +209,3 @@ function isEscape(utterance: string): boolean {
   const lower = utterance.toLowerCase().trim()
   return ESCAPE_PHRASES.some((phrase) => lower.includes(phrase))
 }
-
-export const VOICE_SYSTEM_PROMPT = [
-  "The user is speaking to you by voice and hears your replies as speech.",
-  "Keep replies short and speakable: plain sentences, no markdown, no code blocks, no long enumerations.",
-  "When the user asks for changes while you are in plan mode, lay out a brief plan in a sentence or two,",
-  "then ask whether to proceed — they will confirm out loud.",
-].join(" ")
