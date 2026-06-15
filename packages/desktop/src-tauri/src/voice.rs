@@ -26,6 +26,7 @@
 //! - Watch `ParticipantAttributesChanged` for workflow stage updates
 //! - Bridge state changes to the JS frontend via Tauri events
 
+use log::debug;
 use serde::Serialize;
 use tauri::AppHandle;
 
@@ -85,7 +86,7 @@ pub async fn voice_connect(
     // - TrackUnsubscribed: agent stopped speaking
     // - ParticipantAttributesChanged: workflow stage/mode updates
 
-    println!("voice_connect (stub): url={url}");
+    debug!("voice_connect (stub): url={url}");
 
     Ok(VoiceState {
         connected: true,
@@ -100,7 +101,7 @@ pub async fn voice_connect(
 #[tauri::command]
 pub async fn voice_disconnect(_app: AppHandle) -> Result<VoiceState, String> {
     // TODO: Disconnect from the LiveKit room
-    println!("voice_disconnect (stub)");
+    debug!("voice_disconnect (stub)");
 
     Ok(VoiceState::default())
 }
@@ -109,7 +110,7 @@ pub async fn voice_disconnect(_app: AppHandle) -> Result<VoiceState, String> {
 #[tauri::command]
 pub async fn voice_toggle_mute(_app: AppHandle) -> Result<bool, String> {
     // TODO: Toggle mute on the published local audio track
-    println!("voice_toggle_mute (stub)");
+    debug!("voice_toggle_mute (stub)");
 
     Ok(false)
 }

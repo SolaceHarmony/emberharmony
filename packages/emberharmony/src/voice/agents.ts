@@ -1,13 +1,15 @@
 import { llm, voice } from "@livekit/agents"
 
 /**
- * Concierge agent — the detached voice agent that handles session browsing,
- * searching, and attachment. No session is attached; the concierge helps
- * the user find and connect to a project session.
+ * Concierge and Operator agents for the planned multi-agent voice handoff.
  *
- * The concierge always operates in plan mode. When the user asks to connect
- * to a session, the concierge calls `attach_session` which triggers a
- * LiveKit handoff to the Operator.
+ * These are not yet wired into the voice worker — the current agent.ts uses
+ * a single EmberHarmonyAgent. When the Concierge/Operator handoff is
+ * implemented, the worker will detect attach_session/detach_session metadata
+ * changes and swap between these agents via session.updateAgent().
+ *
+ * Until then, these instruction constants and agent classes serve as the
+ * design spec for the handoff architecture.
  */
 export const CONCIERGE_INSTRUCTIONS = [
   "You are EmberHarmony's voice concierge.",

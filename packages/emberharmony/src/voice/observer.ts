@@ -6,10 +6,9 @@ import { MessageV2 } from "../session/message-v2"
  * SessionObserver watches an attached project session's events and feeds
  * narrated interpretations into the brain session's context.
  *
- * Instead of piping raw tool output to TTS, the observer interprets what's
- * happening and injects system messages into the brain session. The brain then
- * decides what to say — it may narrate, ask a follow-up, or simply
- * acknowledge completion.
+ * Not yet wired into the voice worker. When implemented, the brain session
+ * will use the observer to interpret what's happening in the attached session
+ * and decide what to narrate. Currently only tested — no production consumer.
  *
  * This is a server-side bus subscriber, not a worker SSE client. It runs
  * within the EmberHarmony server process and subscribes to session events
