@@ -45,8 +45,8 @@ tauri-plugin-decorum = "1.1.1"
 comrak = { version = "0.50", default-features = false }
 
 # LiveKit Rust SDK — native audio transport for voice sessions.
-# Replaces the JS worker's WebRTC with cross-platform Rust audio.
-livekit = { version = "0.7", optional = true }
+# native-tls is required for wss:// connections to LiveKit Cloud.
+livekit = { version = "0.7", optional = true, features = ["native-tls"] }
 livekit-api = { version = "0.5", optional = true }
 log = "0.4"
 
