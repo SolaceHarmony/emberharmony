@@ -114,7 +114,7 @@ You speak → STT → Brain (own context, own tools)
                  → Session bridge → EmberHarmony server → prompt_async
 ```
 
-The brain doesn't forward every word to a session. It reasons about what you said, decides which tool to call, and only touches a session when it has something specific to submit. This is why it needs its own LLM — the brain is the thinker, the session is the worker.
+The brain doesn't forward every word to a session. It reasons about what you said, decides which tool to call, and only touches a project session when it has something specific to submit. This is why it needs its own session — the brain is the thinker, the project session is the worker.
 
 ### Workflows
 
@@ -254,49 +254,39 @@ RPC is reserved for true imperatives — actions that need an immediate response
 
 ### The brain
 
-The voice agent has its own LLM context, its own tools, and its own workflow state. Orchestration lives in the LiveKit worker; credentialed model inference lives on the server.
+The voice brain is a permanent EmberHarmony session. It lives in `~/.local/share/emberharmony/voice/` — a dedicated project directory that persists across conversations. It reuses the entire session infrastructure: providers, model selection, message history, compaction, auth, the lot. No new context management, no custom inference endpoint. Just a session.
 
-The current `SessionLLM` bridge forwards every word you say to a text session and streams raw output back to TTS. That approach has a fundamental problem: voice becomes a raw pipe. When the session runs tools, the voice reads out file contents, command output, and technical detail verbatim. That's not how people talk. You want the agent to _interpret_ what's happening and narrate it naturally — an "out-of-body" commentary on the work being done.
-
-The `BrainLLM` replaces `SessionLLM`. It has its own system prompt, its own chat context, and its own tools. The brain is the thinker; the session is the worker.
+The current `SessionLLM` bridge forwards every word you say to an attached text session and streams raw output back to TTS. That approach has a fundamental problem: voice becomes a raw pipe. When the session runs tools, the voice reads out file contents, command output, and technical detail verbatim. That's not how people talk. You want the agent to _interpret_ what's happening and narrate it naturally — an "out-of-body" commentary on the work being done.
 
 ```
 Current (SessionLLM — raw pipe):
 
-  You speak → STT → Intent router → Session bridge → LLM response (raw)
+  You speak → STT → Intent router → Attached session → LLM response (raw)
                     → TTS (reads raw output verbatim)
 
-Proposed (BrainLLM — commentary layer):
+Proposed (brain session — commentary layer):
 
-  You speak → STT → Brain (own context, own tools, own workflow)
-                    ├─ TTS ← brain speaks an interpretation
-                    ├─ Tool: list_sessions → GET /session
-                    ├─ Tool: attach_session → sets attributes
-                    ├─ Tool: submit_prompt → POST /session/{id}/prompt_async
-                    ├─ Tool: get_recent_activity → GET /session/{id}/message
-                    └─ Intent classifier gates plan/build safety
-
-  Model inference:
-    Worker serializes context + tool schemas
-    → POST /voice/brain (server handles auth, OAuth, provider transforms)
-    → streams text-delta + tool-call events back
-    → Worker executes tools locally, feeds results into context
-    → Next /voice/brain call with updated context
+  You speak → STT → Brain session (~/.local/share/emberharmony/voice/)
+                    ├─ Own system prompt, own history, own model
+                    ├─ Own tools: list_sessions, attach_session, submit_prompt, ...
+                    ├─ Intent classifier gates plan/build safety
+                    └─ When attached: SessionObserver feeds narrated summaries
+                         → TTS ← brain speaks an interpretation
 ```
 
-The brain doesn't forward your words. It reasons about them, decides what to do, and speaks a natural interpretation back. When the attached session is busy running tools, the brain watches and narrates — not word-for-word, but as a commentary layer.
+The brain session has a dedicated system prompt that instructs the model to narrate, interpret, and summarize — not to read raw output verbatim. It has its own message history, so it remembers past conversations. It has its own model selection, so you can run a different model for voice than for text. And it uses the same provider infrastructure as every other session — OAuth, token refresh, beta headers, all of it works automatically.
 
-#### Why the server still handles inference
+#### The voice project
 
-The worker can't call model providers directly. EmberHarmony's Auth store does OAuth token refresh, provider transforms, and beta headers inside server-side `LLM.stream()`. An OAuth-authed Claude or any provider that requires token refresh won't authenticate from the worker.
+The brain session lives in `~/.local/share/emberharmony/voice/`. This is a regular EmberHarmony project directory — it has an `.emberharmony/` config, message history, and a session store. The voice worker connects to this project at startup.
 
-The synthesis: **the worker owns orchestration (context, tools, workflow, observer), and the server owns only credentialed inference**. The `/voice/brain` endpoint receives a serialized chat context and tool schemas, runs one AI-SDK step with full auth, and streams back `text-delta` and `tool-call` events. Tools are schemas without `execute` functions. The worker registers real `llm.tool()`s whose `execute` runs locally. AgentSession appends results and calls `chat()` again, triggering the next `/voice/brain` step.
+The directory can contain scratch files, plans, and notes that the brain session creates and references. Because it's a real project directory, it can also be a git repository — the brain can commit plans, track changes, and maintain a history of its own work.
 
-This is different from the old `SessionLLM` proxy in one critical way: `SessionLLM` proxied the **entire conversation** through a text session. `/voice/brain` proxies only the **model inference call** — the conversation context, tool execution, workflow state, and observer narration all live in the worker.
+The `directory` field in the session LLM code already makes the project folder optional. The voice project is the permanent home for the brain's context: it's where the conversation history lives between voice calls, where the brain stores its plans, and where compaction happens when the context window fills up.
 
 #### Voice as commentary
 
-When the attached session is executing (tools running, files being written), the voice agent describes what's happening in natural language. The `SessionObserver` watches the attached session's SSE event stream and feeds interpretations back into the brain's context:
+When the attached session is executing (tools running, files being written), the voice agent describes what's happening in natural language. The `SessionObserver` watches the attached session's SSE event stream and feeds interpretations back into the brain session:
 
 ```
 Session runs:   edit(auth.ts) → run tests → test fails → edit(auth.ts) → run tests → pass
@@ -309,7 +299,7 @@ The brain never reads raw tool output. It receives narrated summaries from the o
 
 #### Tools
 
-The brain has its own tools, registered as `llm.tool()` in the LiveKit agent. These execute locally in the worker — they call the EmberHarmony server API to affect application state.
+The brain session has its own tools, registered as `llm.tool()` in the LiveKit agent. These call the EmberHarmony server API to affect application state:
 
 | Tool                  | Mode  | What it does                                                             |
 | --------------------- | ----- | ------------------------------------------------------------------------ |
@@ -322,7 +312,7 @@ The brain has its own tools, registered as `llm.tool()` in the LiveKit agent. Th
 | `abort_attached`      | build | Aborts the current generation in the attached session                    |
 | `confirm_plan`        | build | Transitions workflow from proposing → confirmed (also callable via RPC)  |
 
-Each tool's `execute` function calls the EmberHarmony server API directly. The tool schemas travel to the model as function definitions; the model decides when to call them. Execution happens in the worker, results come back to the brain's chat context, and the brain speaks the interpretation.
+Each tool's `execute` function calls the EmberHarmony server API directly. The tool schemas travel to the model as function definitions; the model decides when to call them. Execution happens in the worker, results come back to the brain session's chat context, and the brain speaks the interpretation.
 
 `submit_prompt` is the only tool that interacts with the attached session. It sends a prompt and then the `SessionObserver` takes over — watching the SSE stream for `session.idle` and feeding narrated summaries back to the brain for TTS output.
 
@@ -341,13 +331,13 @@ This is enforced in code, not in instructions. A prompt injection cannot grant b
 
 The current `SessionLLM` bridge sends `POST /session/{id}/abort` on every voice interruption, producing cascading abort errors. The new design handles interruption differently:
 
-1. **User interrupts during brain narration** — The `BrainLLM` stream is cancelled. No server abort needed because the brain hasn't submitted anything yet. The brain context rolls back to the last stable state.
+1. **User interrupts during brain narration** — The brain session stream is cancelled. No server abort needed because the brain hasn't submitted anything to the attached session. The brain context rolls back to the last stable state.
 
-2. **User interrupts during session execution** — The brain's `submit_prompt` tool is still pending. The brain cancels the `SessionObserver` and sends `POST /session/{id}/abort` to stop the session. This is a single deliberate abort, not a cascade — the brain is in control.
+2. **User interrupts during session execution** — The brain's `submit_prompt` tool is still pending. The brain cancels the `SessionObserver` and sends `POST /session/{id}/abort` to stop the attached session. This is a single deliberate abort, not a cascade — the brain is in control.
 
 3. **Session finishes while user is speaking** — The observer sees `session.idle` and feeds the completion summary to the brain. The brain holds it until the user finishes, then narrates the result.
 
-The brain is always the controller. Aborts only happen when the brain decides the session should stop, not as a side effect of voice interruption.
+The brain is always the controller. Aborts only happen when the brain decides the attached session should stop, not as a side effect of voice interruption.
 
 ---
 
@@ -384,9 +374,9 @@ Voice settings are managed through the config API:
 ### Components
 
 - **VoiceWorker** — a child process managed by `emberharmony serve` that runs the LiveKit agent
-- **BrainLLM** — the voice brain: its own LLM, context, and tools, running inside the LiveKit worker
+- **Brain session** — a permanent EmberHarmony session at `~/.local/share/emberharmony/voice/` that serves as the voice brain's context, history, and project directory
 - **VoiceWorkflow** — state machine that gates plan/build transitions (gathering → proposing → confirmed → executing → reviewing)
-- **SessionObserver** — watches the attached session's SSE stream and feeds narrated interpretations (not raw output) into the brain's context
+- **SessionObserver** — watches the attached session's SSE stream and feeds narrated interpretations (not raw output) into the brain session
 - **VoiceProvider** — SolidJS context that manages the LiveKit room, mic state, and session following
 
 ### Launch modes
