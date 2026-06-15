@@ -1,13 +1,20 @@
 // @refresh reload
 import "./webview-zoom"
 import { render } from "solid-js/web"
-import { AppBaseProviders, AppInterface, PlatformProvider, Platform } from "@thesolaceproject/emberharmony-app"
+import {
+  AppBaseProviders,
+  AppInterface,
+  PlatformProvider,
+  Platform,
+  VoiceAdapter,
+} from "@thesolaceproject/emberharmony-app"
 import { open, save } from "@tauri-apps/plugin-dialog"
 import { getCurrent, onOpenUrl } from "@tauri-apps/plugin-deep-link"
 import { open as shellOpen } from "@tauri-apps/plugin-shell"
 import { type as ostype } from "@tauri-apps/plugin-os"
 import { check, Update } from "@tauri-apps/plugin-updater"
 import { invoke } from "@tauri-apps/api/core"
+import { voiceAdapter } from "./voice"
 import { getCurrentWindow } from "@tauri-apps/api/window"
 import { isPermissionGranted, requestPermission } from "@tauri-apps/plugin-notification"
 import { relaunch } from "@tauri-apps/plugin-process"
@@ -346,6 +353,8 @@ const createPlatform = (password: Accessor<string | null>): Platform => ({
   parseMarkdown: async (markdown: string) => {
     return invoke<string>("parse_markdown_command", { markdown })
   },
+
+  voice: voiceAdapter,
 })
 
 createMenu()

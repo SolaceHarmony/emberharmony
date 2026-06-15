@@ -12,6 +12,7 @@ import {
   type AgentState,
 } from "@thesolaceproject/livekit-components-solid"
 import { useSDK } from "./sdk"
+import { usePlatform, type VoiceAdapter, type VoiceState as NativeVoiceState } from "./platform"
 
 export type VoiceState = "disconnected" | "connecting" | "connected" | "error"
 export type MicState = "muted" | "unmuted" | "unavailable"
@@ -23,6 +24,8 @@ export type { AgentState } from "@thesolaceproject/livekit-components-solid"
 // Cleared only by an explicit user disconnect.
 let followProjects = false
 let followModel: { providerID: string; modelID: string } | undefined
+
+// ── WebRTC (browser) path ──────────────────────────────────────────────────
 
 // The room is created lazily on first connect() and reused across
 // disconnect/reconnect cycles. It is never destroyed during the app's
@@ -43,6 +46,7 @@ const { use: useVoice, provider: VoiceValueProvider } = createSimpleContext({
   name: "Voice",
   init: () => {
     const sdk = useSDK()
+    const platform = usePlatform()
     const params = useParams()
     const [error, setError] = createSignal<string | undefined>(undefined)
     const [connecting, setConnecting] = createSignal(false)
@@ -54,14 +58,29 @@ const { use: useVoice, provider: VoiceValueProvider } = createSimpleContext({
     const [connectionState, setConnectionState] = createSignal<ConnectionState>(ConnectionState.Disconnected)
     const [micEnabled, setMicEnabled] = createSignal(false)
     const [agentState, setAgentState] = createSignal<AgentState>("disconnected")
-    // Track and transcription types come from livekit-components-core which
-    // isn't a direct app dependency. These are bridged from the room island
-    // where the livekit hooks run — the types match what useVoiceAssistant and
-    // useTranscriptions return.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const [agentAudioTrack, setAgentAudioTrack] = createSignal<any>(undefined)
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const [voiceTranscriptions, setVoiceTranscriptions] = createSignal<any[]>([])
+
+    // ── Native voice state (desktop/Tauri path) ──────────────────────
+
+    const [nativeState, setNativeState] = createSignal<NativeVoiceState>({
+      connected: false,
+      room: null,
+      agentStage: null,
+      agentMode: null,
+      micMuted: false,
+    })
+
+    // Listen for native state changes if the platform provides a voice adapter
+    createEffect(() => {
+      if (!platform.voice) return
+      const unsub = platform.voice.onStateChange((state) => {
+        setNativeState(state)
+      })
+      onCleanup(unsub)
+    })
 
     // the provider outlives session navigation; a connected room bridges into
     // the session it was started for, so leaving that session must hang up —
@@ -110,9 +129,14 @@ const { use: useVoice, provider: VoiceValueProvider } = createSimpleContext({
     }, 30_000)
     onCleanup(() => clearInterval(statusPoll))
 
+    // ── State derived from source (native vs WebRTC) ─────────────────
+
     const state = (): VoiceState => {
       if (error()) return "error"
       if (connecting()) return "connecting"
+      if (platform.voice) {
+        return nativeState().connected ? "connected" : "disconnected"
+      }
       switch (connectionState()) {
         case ConnectionState.Connected:
         case ConnectionState.Reconnecting:
@@ -127,8 +151,13 @@ const { use: useVoice, provider: VoiceValueProvider } = createSimpleContext({
 
     const micState = (): MicState => {
       if (state() !== "connected") return "unavailable"
+      if (platform.voice) {
+        return nativeState().micMuted ? "muted" : "unmuted"
+      }
       return micEnabled() ? "unmuted" : "muted"
     }
+
+    // ── Connect/disconnect/toggleMute ────────────────────────────────
 
     async function connect(sessionID: string, model?: { providerID: string; modelID: string }) {
       if (state() === "connecting" || state() === "connected") return
@@ -136,18 +165,28 @@ const { use: useVoice, provider: VoiceValueProvider } = createSimpleContext({
       setConnecting(true)
       followProjects = true
       if (model) followModel = model
+
+      // Native path: delegate to the Tauri voice adapter
+      if (platform.voice) {
+        try {
+          const grant = await sdk.client.voice.token({ model }).then((x) => x.data)
+          if (!grant) throw new Error("voice token request failed")
+          await platform.voice.connect(grant.url, grant.token)
+        } catch (err) {
+          setError(err instanceof Error ? err.message : String(err))
+          throw err
+        } finally {
+          setConnecting(false)
+        }
+        return
+      }
+
+      // WebRTC path: use livekit-client in the browser
       try {
         const r = getOrCreateRoom()
         setRoom(r)
-        // The server derives the room name from the project context (x-emberharmony-directory),
-        // so sessionID is not required. One room per project — session switching
-        // happens via participant attributes.
         const grant = await sdk.client.voice.token({ model }).then((x) => x.data)
         if (!grant) throw new Error("voice token request failed")
-        // WKWebView keeps media silently "playing" until the page's audio
-        // session activates; resuming an AudioContext inside the connect
-        // gesture activates it (observed: audio elements were healthy but
-        // inaudible until an AudioContext was created)
         const unlock = new AudioContext()
         try {
           await unlock.resume().catch(() => {})
@@ -171,12 +210,25 @@ const { use: useVoice, provider: VoiceValueProvider } = createSimpleContext({
     async function disconnect() {
       followProjects = false
       setError(undefined)
+
+      if (platform.voice) {
+        await platform.voice.disconnect()
+        return
+      }
+
       const r = room()
       if (r) await r.disconnect()
     }
 
     async function toggleMute() {
       if (state() !== "connected") return
+
+      if (platform.voice) {
+        const newMuted = await platform.voice.toggleMute()
+        setNativeState((prev) => ({ ...prev, micMuted: !newMuted }))
+        return
+      }
+
       const r = room()
       if (r) await r.localParticipant.setMicrophoneEnabled(!r.localParticipant.isMicrophoneEnabled)
     }
@@ -258,10 +310,14 @@ function VoiceRoomIsland(props: { room: Room }) {
 }
 
 export function VoiceProvider(props: ParentProps) {
+  const platform = usePlatform()
+
   return (
     <VoiceValueProvider>
       {props.children}
-      <RoomIsland />
+      <Show when={!platform.voice}>
+        <RoomIsland />
+      </Show>
     </VoiceValueProvider>
   )
 }
@@ -271,6 +327,7 @@ export function VoiceProvider(props: ParentProps) {
  * This is a sibling of VoiceProvider's children, not a gate — children always
  * render regardless of whether voice is connected. The island only mounts the
  * heavy WebRTC/audio resources when the user actually presses the mic button.
+ * On desktop (where platform.voice exists), this is never rendered.
  */
 function RoomIsland() {
   const voice = useVoice()
