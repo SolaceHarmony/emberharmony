@@ -97,9 +97,25 @@ export namespace Voice {
     if (!resolved.available) return
     const url = resolved.url!.replace(/^ws/, "http")
     const rooms = new RoomServiceClient(url, resolved.apiKey!, resolved.apiSecret!)
-    const existing = await rooms.listRooms([opts.roomName]).catch(() => [])
+    let existing: Awaited<ReturnType<RoomServiceClient["listRooms"]>>
+    try {
+      existing = await rooms.listRooms([opts.roomName])
+    } catch (error) {
+      // Room listing failed (network/auth error). A fresh room will get its
+      // dispatch from the token roomConfig, so this is safe to skip — but
+      // log it so we can diagnose LiveKit connectivity issues.
+      console.warn("voice: listRooms failed, skipping dispatch check", error)
+      return
+    }
     if (existing.length === 0) return // fresh room — token roomConfig dispatches on creation
-    const participants = await rooms.listParticipants(opts.roomName).catch(() => [])
+    let participants: Awaited<ReturnType<RoomServiceClient["listParticipants"]>>
+    try {
+      participants = await rooms.listParticipants(opts.roomName)
+    } catch (error) {
+      // Could be a race: room disappeared between listRooms and listParticipants.
+      console.warn("voice: listParticipants failed, skipping dispatch check", error)
+      return
+    }
     if (participants.some((p) => p.identity.startsWith("agent"))) return
     const dispatch = new AgentDispatchClient(url, resolved.apiKey!, resolved.apiSecret!)
     await dispatch.createDispatch(opts.roomName, opts.agentName, { metadata: opts.metadata })

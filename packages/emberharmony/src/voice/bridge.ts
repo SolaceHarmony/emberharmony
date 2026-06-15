@@ -135,7 +135,9 @@ export class SessionLLMStream extends llm.LLMStream {
         fetch(`${this.#opts.serverUrl}/session/${this.#opts.sessionID}/abort`, {
           method: "POST",
           headers: headers(this.#opts),
-        }).catch(() => {})
+        }).catch((error) => {
+          console.warn(`voice: abort POST failed for session ${this.#opts.sessionID}`, error)
+        })
       })
     }
 
@@ -226,7 +228,10 @@ export class SessionLLMStream extends llm.LLMStream {
     if (!response.ok) return this.#opts.fallbackModel
     const messages: Array<{ info: { role: string; providerID?: string; modelID?: string } }> | null = await response
       .json()
-      .catch(() => null)
+      .catch((error) => {
+        console.warn(`voice: session message parse failed for ${this.#opts.sessionID}`, error)
+        return null
+      })
     if (!Array.isArray(messages)) return this.#opts.fallbackModel
     for (let i = messages.length - 1; i >= 0; i--) {
       const info = messages[i]!.info
