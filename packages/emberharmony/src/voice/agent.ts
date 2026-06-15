@@ -135,10 +135,22 @@ export default defineAgent({
         fallbackModel: model,
         agent: () => workflow.agent(),
         system: brain.system,
+        // The brain session should NOT be aborted on every voice interruption.
+        // The brain controls aborts deliberately — it only aborts the attached
+        // project session when it decides the session should stop, not as a
+        // side effect of the user interrupting narration.
+        abortOnInterrupt: false,
       }),
       tts: inference.TTS.fromModelString(TTS_MODEL),
       vad,
       turnDetection: new livekit.turnDetector.MultilingualModel(),
+      // Increase the minimum endpointing delay to reduce premature turn
+      // completions. The default 500ms is too aggressive for natural
+      // speech pauses — 800ms gives the user more time to continue
+      // speaking without the agent cutting in.
+      turnHandling: {
+        endpointing: { minDelay: 800 },
+      },
     })
 
     await session.start({

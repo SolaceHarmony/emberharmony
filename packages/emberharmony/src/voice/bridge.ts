@@ -26,6 +26,13 @@ export interface SessionBridgeOptions {
   agent?: () => string | undefined
   /** Extra per-message system instructions attached to every voice prompt */
   system?: string
+  /**
+   * Whether to abort the server session when voice interrupts.
+   * Defaults to true for backward compatibility, but should be set to false
+   * for the brain session — the brain controls its own aborts deliberately,
+   * not as a side effect of voice interruption.
+   */
+  abortOnInterrupt?: boolean
 }
 
 function headers(opts: SessionBridgeOptions): Record<string, string> {
@@ -112,16 +119,25 @@ export class SessionLLMStream extends llm.LLMStream {
     if (!text) return
     const signal = this.abortController.signal
 
-    // Voice interruption aborts this stream; abort the server-side generation
-    // too. Otherwise the session stays busy, the next voice turn's prompt is
-    // rejected, and this stream waits forever on a reply that never starts
-    // (observed as the worker's "job is unresponsive" death).
-    signal.addEventListener("abort", () => {
-      fetch(`${this.#opts.serverUrl}/session/${this.#opts.sessionID}/abort`, {
-        method: "POST",
-        headers: headers(this.#opts),
-      }).catch(() => {})
-    })
+    // Voice interruption aborts this stream. For the brain session, we don't
+    // abort the server session on every interruption — the brain controls
+    // its own aborts deliberately. For backward compatibility, sessions
+    // that don't set abortOnInterrupt still abort on interruption.
+    //
+    // Without the abort, a busy session blocks the next turn's prompt.
+    // With it, every voice interruption kills the session — causing abort
+    // cascades when the brain is just narrating. The brain session uses
+    // abortOnInterrupt=false and sends deliberate aborts only when the
+    // attached session should stop.
+    const abortOnInterrupt = this.#opts.abortOnInterrupt !== false
+    if (abortOnInterrupt) {
+      signal.addEventListener("abort", () => {
+        fetch(`${this.#opts.serverUrl}/session/${this.#opts.sessionID}/abort`, {
+          method: "POST",
+          headers: headers(this.#opts),
+        }).catch(() => {})
+      })
+    }
 
     const events = serverEvents(this.#opts, signal)
     // generators are lazy: pull the first event (server.connected) so the SSE
