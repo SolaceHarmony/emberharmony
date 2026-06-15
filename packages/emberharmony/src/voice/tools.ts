@@ -2,6 +2,7 @@ import { z } from "zod"
 import { Tool } from "../tool/tool"
 import { Instance } from "../project/instance"
 import { Session } from "../session"
+import { SessionPrompt } from "../session/prompt"
 import { Log } from "../util/log"
 
 /**
@@ -9,9 +10,13 @@ import { Log } from "../util/log"
  * interact with the project. The brain session owns the tool schemas; the
  * EmberHarmony server executes them and returns results.
  *
- * These tools are only available when the brain session's agent is set to
- * "voice". They call the EmberHarmony server API to affect application state:
- * list sessions, attach/detach, submit prompts, etc.
+ * Build authorization is enforced in code, not instructions. submit_prompt
+ * derives the effective agent from ctx.agent — a trusted signal set by the
+ * worker's intent classifier — NOT from the model-supplied params. The model
+ * cannot forge "build" mode: if the classifier sent "plan", the tool forces
+ * "plan" regardless of what the model asks for. This is one-shot — each call
+ * to submit_prompt uses the classifier's verdict for that turn, and every
+ * turn re-defaults to "plan".
  */
 
 const log = Log.create({ service: "voice.tools" })
@@ -67,7 +72,7 @@ export const GetRecentActivityTool = Tool.define("get_recent_activity", {
     if (!session) {
       return {
         title: "Session not found",
-        metadata: { sessions: [], sessionID: params.sessionID },
+        metadata: { sessions: [] as Array<{ id: string; title: string; status: string }>, sessionID: params.sessionID },
         output: `Session ${params.sessionID} not found. It may have been deleted.`,
       }
     }
@@ -75,21 +80,15 @@ export const GetRecentActivityTool = Tool.define("get_recent_activity", {
     const messages = await Instance.provide({
       directory: session.directory,
       async fn() {
-        const result = await fetch(
-          `http://localhost:${process.env.EMBERHARMONY_PORT || 4096}/session/${params.sessionID}/message?limit=${params.limit ?? 5}`,
-          { headers: { "x-emberharmony-directory": encodeURIComponent(session.directory) } },
-        )
-        if (!result.ok) return []
-        return result.json() as Promise<
-          Array<{ info: { role: string; agent?: string }; parts: Array<{ type: string; text?: string }> }>
-        >
+        const msgs = await Session.messages({ sessionID: params.sessionID, limit: params.limit ?? 5 })
+        return msgs
       },
     })
 
     if (!messages || messages.length === 0) {
       return {
         title: "No recent activity",
-        metadata: { sessions: [], sessionID: params.sessionID },
+        metadata: { sessions: [] as Array<{ id: string; title: string; status: string }>, sessionID: params.sessionID },
         output: `No recent messages in "${session.title}".`,
       }
     }
@@ -114,52 +113,75 @@ export const GetRecentActivityTool = Tool.define("get_recent_activity", {
 
 /**
  * Submit a prompt to the attached project session.
- * This is the only tool that directly interacts with the project session.
+ *
+ * BUILD AUTHORIZATION IS ENFORCED IN CODE, NOT INSTRUCTIONS.
+ *
+ * The model-supplied "agent" parameter is IGNORED. The effective agent is
+ * derived from ctx.agent — a trusted signal set by the worker's intent
+ * classifier. If the classifier sent "plan", this tool forces "plan"
+ * regardless of what the model asks. A prompt injection cannot grant build
+ * access because it cannot control ctx.agent.
+ *
+ * This is one-shot: each call uses the classifier's verdict for that turn.
+ * Every turn re-defaults to "plan" — a single "yes" authorizes exactly one
+ * build submission.
  */
 export const SubmitPromptTool = Tool.define("submit_prompt", {
   description:
     "Submit a prompt to the attached project session. Use this to send work to the session " +
-    "when you and the user have confirmed what to build. Only use this in build mode after confirmation.",
+    "when you and the user have confirmed what to build. The agent mode is determined automatically.",
   parameters: z.object({
     sessionID: z.string().describe("The session ID to submit the prompt to"),
     directory: z.string().describe("The project directory for the session"),
     text: z.string().describe("The prompt text to submit"),
-    agent: z.string().optional().describe("The agent to use (e.g. 'build' or 'plan')"),
   }),
   async execute(params, ctx) {
-    const result = await Instance.provide({
-      directory: params.directory,
-      async fn() {
-        const response = await fetch(
-          `http://localhost:${process.env.EMBERHARMONY_PORT || 4096}/session/${params.sessionID}/prompt_async`,
-          {
-            method: "POST",
-            headers: {
-              "content-type": "application/json",
-              "x-emberharmony-directory": encodeURIComponent(params.directory),
-            },
-            body: JSON.stringify({
-              parts: [{ type: "text", text: params.text }],
-              ...(params.agent ? { agent: params.agent } : {}),
-            }),
-          },
-        )
-        return response.status
-      },
+    // BUILD SAFETY: ctx.agent is the TRUSTED signal from the worker's intent
+    // classifier. The model cannot control this value. If the classifier
+    // said "plan", the attached session runs in plan mode — no amount of
+    // prompt injection can upgrade it to "build".
+    const effectiveAgent = ctx.agent === "build" ? "build" : "plan"
+
+    log.info("submit_prompt", {
+      sessionID: params.sessionID,
+      agent: ctx.agent,
+      effectiveAgent,
     })
 
-    if (result === 204 || result === 200) {
+    try {
+      await Instance.provide({
+        directory: params.directory,
+        async fn() {
+          // Fire and forget — prompt_async semantics. The session processes
+          // the prompt asynchronously while the voice agent continues.
+          SessionPrompt.prompt({
+            sessionID: params.sessionID,
+            parts: [{ type: "text", text: params.text }],
+            agent: effectiveAgent,
+          })
+        },
+      })
       return {
         title: "Prompt submitted",
-        metadata: { sessions: [], sessionID: params.sessionID },
-        output: `Prompt submitted to session ${params.sessionID}. The session is now processing.`,
+        metadata: { sessions: [] as Array<{ id: string; title: string; status: string }>, sessionID: params.sessionID },
+        output: `Prompt submitted to session ${params.sessionID} in ${effectiveAgent} mode. The session is now processing.`,
       }
-    }
-
-    return {
-      title: "Prompt submission failed",
-      metadata: { sessions: [], sessionID: params.sessionID },
-      output: `Failed to submit prompt to session ${params.sessionID} (status ${result}).`,
+    } catch (error) {
+      if (error instanceof Session.BusyError) {
+        return {
+          title: "Session busy",
+          metadata: {
+            sessions: [] as Array<{ id: string; title: string; status: string }>,
+            sessionID: params.sessionID,
+          },
+          output: `Session ${params.sessionID} is busy. Please wait for it to finish and try again.`,
+        }
+      }
+      return {
+        title: "Prompt submission failed",
+        metadata: { sessions: [] as Array<{ id: string; title: string; status: string }>, sessionID: params.sessionID },
+        output: `Failed to submit prompt to session ${params.sessionID}: ${error instanceof Error ? error.message : String(error)}`,
+      }
     }
   },
 })
@@ -176,24 +198,17 @@ export const AbortAttachedTool = Tool.define("abort_attached", {
     directory: z.string().describe("The project directory for the session"),
   }),
   async execute(params, ctx) {
-    const result = await Instance.provide({
+    await Instance.provide({
       directory: params.directory,
       async fn() {
-        const response = await fetch(
-          `http://localhost:${process.env.EMBERHARMONY_PORT || 4096}/session/${params.sessionID}/abort`,
-          {
-            method: "POST",
-            headers: { "x-emberharmony-directory": encodeURIComponent(params.directory) },
-          },
-        )
-        return response.status
+        SessionPrompt.cancel(params.sessionID)
       },
     })
 
     return {
       title: "Session aborted",
-      metadata: { sessions: [], sessionID: params.sessionID },
-      output: result === 200 ? `Session ${params.sessionID} aborted.` : `Abort request sent (status ${result}).`,
+      metadata: { sessions: [] as Array<{ id: string; title: string; status: string }>, sessionID: params.sessionID },
+      output: `Session ${params.sessionID} aborted.`,
     }
   },
 })
@@ -216,7 +231,7 @@ export const SetModelTool = Tool.define("set_model", {
     // endpoint doesn't have a model field. We'll add this when it does.
     return {
       title: "Model change requested",
-      metadata: { sessions: [], sessionID: params.sessionID },
+      metadata: { sessions: [] as Array<{ id: string; title: string; status: string }>, sessionID: params.sessionID },
       output: `Model change to ${params.providerID}/${params.modelID} is not yet supported via voice. Please change the model in the session settings.`,
     }
   },
@@ -252,10 +267,6 @@ export const AttachSessionTool = Tool.define("attach_session", {
       }
     }
 
-    // The tool result includes the attached session metadata so the worker
-    // can detect the attachment and hand off to the Operator agent.
-    // The worker monitors for metadata changes in the tool result and
-    // triggers a LiveKit handoff when attached_session changes.
     return {
       title: `Attached to "${session.title}"`,
       metadata: {
@@ -285,8 +296,6 @@ export const DetachSessionTool = Tool.define("detach_session", {
     "in concierge mode and can list or search for other sessions.",
   parameters: z.object({}),
   async execute(params, ctx) {
-    // Clear the attached session metadata so the worker can detect
-    // the detachment and hand off to the Concierge.
     return {
       title: "Detached from session",
       metadata: {
