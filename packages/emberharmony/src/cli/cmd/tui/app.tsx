@@ -13,6 +13,7 @@ import { LocalProvider, useLocal } from "@tui/context/local"
 import { DialogModel, useConnected } from "@tui/component/dialog-model"
 import { DialogMcp } from "@tui/component/dialog-mcp"
 import { DialogStatus } from "@tui/component/dialog-status"
+import { DialogVoice } from "@tui/component/dialog-voice"
 import { DialogThemeList } from "@tui/component/dialog-theme-list"
 import { DialogHelp } from "./ui/dialog-help"
 import { CommandProvider, useCommandDialog } from "@tui/component/dialog-command"
@@ -446,6 +447,18 @@ function App() {
         dialog.replace(() => <DialogStatus />)
       },
       category: "System",
+    },
+    {
+      title: "Voice settings",
+      keybind: "voice_settings",
+      value: "voice.settings",
+      slash: {
+        name: "voice",
+      },
+      onSelect: () => {
+        dialog.replace(() => <DialogVoice />)
+      },
+      category: "Voice",
     },
     {
       title: "Switch theme",

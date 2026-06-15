@@ -159,6 +159,30 @@ export function DialogStatus() {
           </For>
         </box>
       </Show>
+      <Show when={sync.data.voice} fallback={<text fg={theme.text}>No Voice</text>}>
+        <box>
+          <text fg={theme.text}>Voice</text>
+          <box flexDirection="row" gap={1}>
+            <text
+              flexShrink={0}
+              style={{
+                fg: sync.data.voice?.available ? theme.success : theme.error,
+              }}
+            >
+              •
+            </text>
+            <text fg={theme.text}>
+              <b>{sync.data.voice?.available ? "Connected" : "Not configured"}</b>
+              <Show when={sync.data.voice?.brain}>
+                <span style={{ fg: theme.textMuted }}> — {sync.data.voice?.brain}</span>
+              </Show>
+              <Show when={sync.data.voice?.structured}>
+                <span style={{ fg: theme.textMuted }}> (structured)</span>
+              </Show>
+            </text>
+          </box>
+        </box>
+      </Show>
     </box>
   )
 }
