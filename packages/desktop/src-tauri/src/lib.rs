@@ -2,6 +2,7 @@ mod cli;
 #[cfg(windows)]
 mod job_object;
 mod markdown;
+mod voice;
 mod window_customizer;
 
 use cli::{install_cli, sync_cli};
@@ -305,7 +306,11 @@ pub fn run() {
             ensure_server_ready,
             get_default_server_url,
             set_default_server_url,
-            markdown::parse_markdown_command
+            markdown::parse_markdown_command,
+            voice::voice_connect,
+            voice::voice_disconnect,
+            voice::voice_toggle_mute,
+            voice::voice_state
         ])
         .setup(move |app| {
             #[cfg(any(target_os = "linux", all(debug_assertions, windows)))]

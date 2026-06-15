@@ -17,6 +17,7 @@ import type {
   ProviderListResponse,
   ProviderAuthMethod,
   VcsInfo,
+  VoiceConfigInfo,
 } from "@thesolaceproject/emberharmony-sdk/v2"
 import { createStore, produce, reconcile } from "solid-js/store"
 import { useSDK } from "@tui/context/sdk"
@@ -72,6 +73,7 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
       }
       formatter: FormatterStatus[]
       vcs: VcsInfo | undefined
+      voice: VoiceConfigInfo | undefined
       path: Path
     }>({
       provider_next: {
@@ -99,6 +101,7 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
       mcp_resource: {},
       formatter: [],
       vcs: undefined,
+      voice: undefined,
       path: { state: "", config: "", worktree: "", directory: "", home: "" },
     })
 
@@ -395,6 +398,10 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
             sdk.client.provider.auth().then((x) => setStore("provider_auth", reconcile(x.data ?? {}))),
             sdk.client.vcs.get().then((x) => setStore("vcs", reconcile(x.data))),
             sdk.client.path.get().then((x) => setStore("path", reconcile(x.data!))),
+            sdk.client.voice
+              .config()
+              .then((x) => setStore("voice", reconcile(x.data!)))
+              .catch(() => setStore("voice", undefined)),
           ]).then(() => {
             setStore("status", "complete")
           })

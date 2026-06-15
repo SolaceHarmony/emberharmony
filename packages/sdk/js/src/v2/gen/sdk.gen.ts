@@ -163,6 +163,7 @@ import type {
   TuiShowToastResponses,
   TuiSubmitPromptResponses,
   VcsGetResponses,
+  VoiceBrainResponses,
   VoiceConfig,
   VoiceConfigResponses,
   VoiceConfigUpdateErrors,
@@ -3068,6 +3069,25 @@ export class Voice extends HeyApiClient {
         ...options?.headers,
         ...params.headers,
       },
+    })
+  }
+
+  /**
+   * Get the voice brain session
+   *
+   * Find or create the permanent voice brain session in the voice project directory. Returns the session ID, the project directory, and the brain system prompt. The voice agent worker calls this at startup to get the brain session it should target.
+   */
+  public brain<ThrowOnError extends boolean = false>(
+    parameters?: {
+      directory?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams([parameters], [{ args: [{ in: "query", key: "directory" }] }])
+    return (options?.client ?? this.client).get<VoiceBrainResponses, unknown, ThrowOnError>({
+      url: "/voice/brain",
+      ...options,
+      ...params,
     })
   }
 }

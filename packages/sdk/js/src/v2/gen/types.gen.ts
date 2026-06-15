@@ -1308,6 +1308,10 @@ export type KeybindsConfig = {
    * Toggle tips on home screen
    */
   tips_toggle?: string
+  /**
+   * Open voice settings
+   */
+  voice_settings?: string
 }
 
 /**
@@ -1352,6 +1356,10 @@ export type VoiceConfig = {
     url?: string
   }
   /**
+   * LLM model for the voice brain session, e.g. anthropic/claude-sonnet-4-20250514 or openai/gpt-4o
+   */
+  brain?: string
+  /**
    * Speech-to-text model string, e.g. deepgram/nova-3:multi
    */
   stt?: string
@@ -1363,6 +1371,10 @@ export type VoiceConfig = {
    * Small fast model that routes voice turns between plan and build, e.g. openai/gpt-5.4-nano
    */
   intent?: string
+  /**
+   * Enable the structured 5-stage workflow (gathering → proposing → confirmed → executing → reviewing). When off, the brain flows naturally with plan/build as the only modes.
+   */
+  structured?: boolean
 }
 
 export type PermissionActionConfig = "ask" | "allow" | "deny"
@@ -2143,9 +2155,11 @@ export type VoiceConfigInfo = {
   available: boolean
   disabled: boolean
   url: string | null
+  brain: string | null
   stt: string
   tts: string
   intent: string
+  structured: boolean
   registry: {
     stt: Array<VoiceRegistryOption>
     tts: Array<VoiceRegistryOption>
@@ -4884,7 +4898,7 @@ export type VoiceConfigUpdateResponse = VoiceConfigUpdateResponses[keyof VoiceCo
 
 export type VoiceTokenData = {
   body?: {
-    sessionID: string
+    sessionID?: string
     agentName?: string
     /**
      * Model to use for voice turns when the session has no message history yet
@@ -4922,6 +4936,28 @@ export type VoiceTokenResponses = {
 }
 
 export type VoiceTokenResponse = VoiceTokenResponses[keyof VoiceTokenResponses]
+
+export type VoiceBrainData = {
+  body?: never
+  path?: never
+  query?: {
+    directory?: string
+  }
+  url: "/voice/brain"
+}
+
+export type VoiceBrainResponses = {
+  /**
+   * Voice brain session info
+   */
+  200: {
+    sessionID: string
+    directory: string
+    system: string
+  }
+}
+
+export type VoiceBrainResponse = VoiceBrainResponses[keyof VoiceBrainResponses]
 
 export type InstanceDisposeData = {
   body?: never
