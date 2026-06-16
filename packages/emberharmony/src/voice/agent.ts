@@ -4,6 +4,7 @@ import * as livekit from "@livekit/agents-plugin-livekit"
 import * as silero from "@livekit/agents-plugin-silero"
 import { llm } from "@livekit/agents"
 import { Flag } from "../flag/flag"
+import { Log } from "../util/log"
 import { SessionLLM } from "./bridge"
 import { VoiceRegistry } from "./registry"
 import { VOICE_AGENT_NAME } from "./constants"
@@ -20,6 +21,7 @@ const INTENT_MODEL = process.env["EMBERHARMONY_VOICE_INTENT_MODEL"] ?? VoiceRegi
 
 /** Participant attribute keys published by the voice agent */
 const ATTR_ATTACHED_SESSION = "emberharmony.attached_session"
+const log = Log.create({ service: "voice.agent" })
 
 class EmberHarmonyAgent extends voice.Agent {
   #workflow: VoiceWorkflow
@@ -102,12 +104,18 @@ export default defineAgent({
         return {}
       }
     })()
-    const { projectID, directory, serverUrl, model, brainModel, structured } = metadata
-    if (!projectID || !directory || !serverUrl) {
-      throw new Error(
-        `voice agent dispatched without project metadata (got: ${ctx.job.metadata || "<empty>"}) — ` +
-          "rooms must be created through EmberHarmony's POST /voice/token endpoint",
-      )
+    let { projectID, directory, serverUrl, model, brainModel, structured } = metadata
+    // When the worker is auto-dispatched (e.g. from a lingering room or stale
+    // connection), projectID may be "global" and directory "/". Fall back to
+    // the voice brain project in this case.
+    if (!projectID || !directory || !serverUrl || projectID === "global" || directory === "/") {
+      log.info("using voice brain project as fallback", { projectID, directory })
+      directory = VOICE_PROJECT_DIR
+      projectID = "voice"
+      serverUrl = process.env["EMBERHARMONY_VOICE_SERVER_URL"] ?? serverUrl
+    }
+    if (!serverUrl) {
+      throw new Error("voice agent dispatched without server URL — set EMBERHARMONY_VOICE_SERVER_URL or pass metadata")
     }
 
     // Discover the brain session — a permanent EmberHarmony session in
