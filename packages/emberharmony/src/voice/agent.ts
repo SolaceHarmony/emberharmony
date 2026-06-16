@@ -19,8 +19,6 @@ const TTS_MODEL = process.env["EMBERHARMONY_VOICE_TTS_MODEL"] ?? VoiceRegistry.D
 const INTENT_MODEL = process.env["EMBERHARMONY_VOICE_INTENT_MODEL"] ?? VoiceRegistry.DEFAULT_INTENT
 
 /** Participant attribute keys published by the voice agent */
-const ATTR_STAGE = "emberharmony.voice_stage"
-const ATTR_MODE = "emberharmony.voice_mode"
 const ATTR_ATTACHED_SESSION = "emberharmony.attached_session"
 
 class EmberHarmonyAgent extends voice.Agent {
@@ -44,21 +42,21 @@ class EmberHarmonyAgent extends voice.Agent {
 }
 
 /**
- * Publish the current workflow state as participant attributes.
+ * Publish the attached-session pointer as a participant attribute.
+ *
+ * Plan/build is a coding-session concept — only meaningful when attached to a
+ * project session, and gated in submit_prompt — NOT a conversation "mode." So we
+ * deliberately do NOT publish voice_mode / voice_stage here; surfacing them made
+ * the agent claim "we're in plan mode" with nothing attached. They return in a
+ * later phase, scoped to the attached/Operator state once the worker tracks it.
  * setAttributes is a full replacement, so we merge with existing attrs.
  */
-async function publishStage(
-  room: JobContext["room"],
-  workflow: VoiceWorkflow,
-  attachedSessionID?: string,
-): Promise<void> {
+async function publishStage(room: JobContext["room"], attachedSessionID?: string): Promise<void> {
   const lp = room.localParticipant
   if (!lp || !room.isConnected) return
   const existing = lp.attributes ?? {}
   await lp.setAttributes({
     ...existing,
-    [ATTR_STAGE]: workflow.stage,
-    [ATTR_MODE]: workflow.canBuild ? "build" : "plan",
     [ATTR_ATTACHED_SESSION]: attachedSessionID ?? "",
   })
 }
@@ -164,19 +162,20 @@ export default defineAgent({
 
     await session.start({
       agent: new EmberHarmonyAgent(workflow, async () => {
-        await publishStage(ctx.room, workflow)
+        await publishStage(ctx.room)
       }),
       room: ctx.room,
     })
     await ctx.connect()
 
-    // Publish initial workflow state as participant attributes so the
-    // client can observe plan/build mode and workflow stage changes.
-    await publishStage(ctx.room, workflow)
+    // Publish initial state. Plan/build is not surfaced as a conversation mode.
+    await publishStage(ctx.room)
 
-    session.say(
-      "Hey, I'm listening. We're in plan mode — tell me what you'd like to work on, and say the word when you want me to build.",
-    )
+    // Casual, non-plan/build opening — nothing is attached, so there is no
+    // "mode," just conversation. (A later phase makes this orient-first: survey
+    // recent voice sessions + compaction summaries, then greet informed by what
+    // was last discussed.)
+    session.say("Hey — good to hear you. What's on your mind?")
   },
 })
 

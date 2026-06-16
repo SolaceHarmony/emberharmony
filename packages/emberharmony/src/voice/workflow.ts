@@ -142,9 +142,12 @@ export class VoiceWorkflow {
         }
       }
 
-      log().info(
-        `voice workflow: ${this.#structured ? this.#stage : this.#mode} (intent: ${verdict.trim() || "<empty>"})`,
-      )
+      // Only log the meaningful event — a build authorization. Logging every
+      // "plan" turn spams the worker log and reads like a state transition when
+      // plan is just the default for ordinary conversation.
+      if (confirmed) {
+        log().info(`voice workflow: build authorized (intent: ${verdict.trim()})`)
+      }
     } catch (error) {
       // Classification failure must never grant execution
       this.#mode = "plan"
