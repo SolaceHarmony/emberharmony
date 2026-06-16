@@ -1,9 +1,16 @@
-import { existsSync } from "node:fs"
+import { existsSync, writeFileSync, unlinkSync, readFileSync, mkdirSync } from "node:fs"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 import type { Config } from "../config/config"
 import { Log } from "../util/log"
 import { Voice } from "./token"
+
+const PID_DIR = path.join(
+  process.env["XDG_RUNTIME_DIR"] ?? path.join(process.env["HOME"] ?? "/tmp", ".local", "share", "emberharmony"),
+  "voice",
+)
+const PID_FILE = path.join(PID_DIR, "worker.pid")
+const LOCK_PORT = 47819
 
 /**
  * Manages the voice agent worker as a child process of `emberharmony serve`.
@@ -18,6 +25,13 @@ import { Voice } from "./token"
  *    self-contained runtime (bun + agent.js + node_modules + models) and points
  *    the sidecar at it via EMBERHARMONY_VOICE_RUNTIME_DIR; we spawn that.
  *  - **Source** (dev / `bun run`): spawn `./agent.ts` with the current Bun.
+ *
+ * Process management:
+ *  - A PID file at $XDG_RUNTIME_DIR/emberharmony/voice/worker.pid tracks the
+ *    running worker, enabling stale-process detection across restarts.
+ *  - On start, any stale worker (same PID file, dead process) is killed.
+ *  - On stop, SIGTERM is sent first, then SIGKILL after 3s if the process
+ *    hasn't exited.
  */
 export namespace VoiceWorker {
   const log = Log.create({ service: "voice.worker" })
@@ -33,12 +47,6 @@ export namespace VoiceWorker {
     env: Record<string, string>
   }
 
-  /**
-   * Resolve how to launch the worker. Prefer the bundled runtime the desktop
-   * app ships (EMBERHARMONY_VOICE_RUNTIME_DIR); otherwise fall back to running
-   * the TypeScript source with the current Bun (dev). Returns undefined when
-   * neither is available (e.g. compiled CLI with no bundled runtime).
-   */
   function resolveLaunch(): Launch | undefined {
     const runtimeDir = process.env["EMBERHARMONY_VOICE_RUNTIME_DIR"]
     if (runtimeDir) {
@@ -49,8 +57,6 @@ export namespace VoiceWorker {
           mode: "bundled",
           cmd: [bunBin, agentJs, "start"],
           cwd: runtimeDir,
-          // Point the HF/agents model caches at the bundled models so the
-          // worker loads VAD + turn-detector offline.
           env: {
             HF_HOME: path.join(runtimeDir, "models"),
             XDG_CACHE_HOME: path.join(runtimeDir, "models"),
@@ -66,8 +72,70 @@ export namespace VoiceWorker {
     return undefined
   }
 
+  function readPidFile(): number | undefined {
+    try {
+      const content = readFileSync(PID_FILE, "utf-8").trim()
+      const pid = Number(content)
+      return Number.isFinite(pid) ? pid : undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  function writePidFile(pid: number) {
+    mkdirSync(PID_DIR, { recursive: true })
+    writeFileSync(PID_FILE, String(pid), "utf-8")
+  }
+
+  function removePidFile() {
+    try {
+      unlinkSync(PID_FILE)
+    } catch {}
+  }
+
+  function isProcessAlive(pid: number): boolean {
+    try {
+      process.kill(pid, 0)
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  function killProcess(pid: number): boolean {
+    if (!isProcessAlive(pid)) return true
+    try {
+      process.kill(pid, "SIGTERM")
+    } catch {
+      return false
+    }
+    // Give the process 3 seconds to exit gracefully
+    const deadline = Date.now() + 3000
+    while (Date.now() < deadline) {
+      if (!isProcessAlive(pid)) return true
+      // Busy-wait is intentional here — we need to poll at millisecond
+      // granularity for a clean shutdown. 3s max.
+    }
+    // Force kill
+    try {
+      process.kill(pid, "SIGKILL")
+    } catch {}
+    return !isProcessAlive(pid)
+  }
+
+  function killStaleWorker() {
+    const stalePid = readPidFile()
+    if (stalePid === undefined) return
+    if (isProcessAlive(stalePid)) {
+      log.info("killing stale voice worker", { pid: stalePid })
+      killProcess(stalePid)
+    }
+    removePidFile()
+  }
+
   export async function start(serverUrl: string, override?: Config.Voice): Promise<boolean> {
     stop()
+    killStaleWorker()
     lastServerUrl = serverUrl
     const settings = await Voice.settings(override)
     if (!settings.available) {
@@ -88,7 +156,6 @@ export namespace VoiceWorker {
         EMBERHARMONY_LIVEKIT_URL: settings.url!,
         EMBERHARMONY_LIVEKIT_API_KEY: settings.apiKey!,
         EMBERHARMONY_LIVEKIT_API_SECRET: settings.apiSecret!,
-        // LiveKit Inference (STT/TTS) reads the standard env var names
         LIVEKIT_URL: settings.url!,
         LIVEKIT_API_KEY: settings.apiKey!,
         LIVEKIT_API_SECRET: settings.apiSecret!,
@@ -96,7 +163,7 @@ export namespace VoiceWorker {
         EMBERHARMONY_VOICE_TTS_MODEL: settings.tts,
         EMBERHARMONY_VOICE_INTENT_MODEL: settings.intent,
         EMBERHARMONY_VOICE_SERVER_URL: serverUrl,
-        EMBERHARMONY_VOICE_WORKER_PORT: "0",
+        EMBERHARMONY_VOICE_WORKER_PORT: String(LOCK_PORT),
       },
       stdout: "inherit",
       stderr: "inherit",
@@ -104,8 +171,10 @@ export namespace VoiceWorker {
         if (proc && exitCode !== null && exitCode !== 0) {
           log.error("voice agent worker exited", { exitCode })
         }
+        removePidFile()
       },
     })
+    writePidFile(proc.pid)
     log.info("voice agent worker started", { pid: proc.pid, mode: launch.mode, stt: settings.stt, tts: settings.tts })
     lastSettings = settings
     return true
@@ -120,17 +189,19 @@ export namespace VoiceWorker {
     const p = proc
     proc = undefined
     lastSettings = undefined
+    // Send SIGTERM for graceful shutdown; Bun.spawn.kill() sends SIGKILL
+    try {
+      process.kill(p.pid, "SIGTERM")
+    } catch {}
+    // Give it 3 seconds to exit cleanly, then SIGKILL
+    const deadline = Date.now() + 3000
+    while (Date.now() < deadline) {
+      if (p.exitCode !== null) break
+    }
     p.kill()
+    removePidFile()
   }
 
-  /**
-   * Respawn with freshly resolved settings (after a config change). Also
-   * handles the boot-unconfigured case: serve always records its URL via
-   * start(), so configuring voice later starts the worker without a restart
-   * of serve. No-op when not running under serve at all. Pass the just-merged
-   * voice config — instance caches dispose asynchronously after a config
-   * write, so resolving through Config.get() here would race a stale cache.
-   */
   export async function restart(override?: Config.Voice): Promise<boolean> {
     if (!lastServerUrl) return false
     const next = await Voice.settings(override)

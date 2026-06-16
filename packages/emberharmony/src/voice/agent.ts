@@ -200,7 +200,7 @@ if (import.meta.main) {
       apiSecret,
       // health-check server port; 0 = ephemeral (used for serve-managed
       // workers so they never collide with a manually started one)
-      port: Number(process.env["EMBERHARMONY_VOICE_WORKER_PORT"] ?? 8081),
+      port: Number(process.env["EMBERHARMONY_VOICE_WORKER_PORT"] ?? 47819),
     }),
   )
 }
