@@ -321,6 +321,11 @@ pub fn run() {
             #[cfg(any(target_os = "linux", all(debug_assertions, windows)))]
             app.deep_link().register_all().ok();
 
+            // Initialize Rust logger so voice.rs info!/debug!/warn! appear in console
+            env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn,voice=debug"))
+                .format_timestamp(None)
+                .init();
+
             let app = app.handle().clone();
 
             // Initialize log state
