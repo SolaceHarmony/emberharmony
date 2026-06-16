@@ -1,6 +1,6 @@
 import { createSimpleContext } from "@thesolaceproject/emberharmony-ui/context"
 import { createEffect, createResource, createSignal, on, onCleanup, type ParentProps, Show } from "solid-js"
-import { useParams } from "@solidjs/router"
+import { useParams, useNavigate } from "@solidjs/router"
 import { ConnectionState, Room, RoomEvent } from "livekit-client"
 import {
   RoomContext,
@@ -13,6 +13,7 @@ import {
 } from "@thesolaceproject/livekit-components-solid"
 import { useSDK } from "./sdk"
 import { usePlatform, type VoiceAdapter, type VoiceState as NativeVoiceState } from "./platform"
+import { base64Encode } from "@thesolaceproject/emberharmony-util/encode"
 
 export type VoiceState = "disconnected" | "connecting" | "connected" | "error"
 export type MicState = "muted" | "unmuted" | "unavailable"
@@ -48,6 +49,7 @@ const { use: useVoice, provider: VoiceValueProvider } = createSimpleContext({
     const sdk = useSDK()
     const platform = usePlatform()
     const params = useParams()
+    const navigate = useNavigate()
     const [error, setError] = createSignal<string | undefined>(undefined)
     const [connecting, setConnecting] = createSignal(false)
     const [room, setRoom] = createSignal<Room | undefined>(roomInstance)
@@ -172,6 +174,11 @@ const { use: useVoice, provider: VoiceValueProvider } = createSimpleContext({
           const grant = await sdk.client.voice.token({ model }).then((x) => x.data)
           if (!grant) throw new Error("voice token request failed")
           await platform.voice.connect(grant.url, grant.token)
+          // Navigate to the voice project directory so the user sees their
+          // voice conversations in the sidebar
+          if (grant.directory) {
+            navigate(`/${base64Encode(grant.directory)}`)
+          }
         } catch (err) {
           followProjects = false
           setError(err instanceof Error ? err.message : String(err))

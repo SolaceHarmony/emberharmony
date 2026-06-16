@@ -4932,6 +4932,8 @@ export type VoiceTokenResponses = {
     token: string
     url: string
     roomName: string
+    directory: string
+    projectID: string
   }
 }
 

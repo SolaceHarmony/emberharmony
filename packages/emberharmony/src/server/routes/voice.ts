@@ -162,6 +162,8 @@ export const VoiceRoutes = lazy(() =>
                     token: z.string(),
                     url: z.string(),
                     roomName: z.string(),
+                    directory: z.string(),
+                    projectID: z.string(),
                   }),
                 ),
               },
@@ -217,7 +219,7 @@ export const VoiceRoutes = lazy(() =>
           agentMetadata,
         })
         await Voice.ensureAgentDispatched({ roomName, agentName, metadata: agentMetadata })
-        return c.json({ token: result.token, url: result.url, roomName })
+        return c.json({ token: result.token, url: result.url, roomName, directory, projectID })
       },
     )
     .get(

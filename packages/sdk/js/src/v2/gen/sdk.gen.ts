@@ -3073,9 +3073,9 @@ export class Voice extends HeyApiClient {
   }
 
   /**
-   * Get the voice brain session
+   * Start a voice conversation
    *
-   * Find or create the permanent voice brain session in the voice project directory. Returns the session ID, the project directory, and the brain system prompt. The voice agent worker calls this at startup to get the brain session it should target.
+   * Create a NEW conversation session in the voice project and return it with the brain system prompt (which folds in memory of recent conversations). The voice agent worker calls this at startup to get the session it should target.
    */
   public brain<ThrowOnError extends boolean = false>(
     parameters?: {
