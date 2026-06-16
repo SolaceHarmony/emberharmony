@@ -43,6 +43,9 @@ cpal = { version = "0.15", optional = true }
 # path — WebRTC AEC3 port. Without this the agent hears itself via the
 # speakers and barges in on its own speech. linear pipeline = HPF→AEC3→NS→AGC2.
 aec3 = { version = "0.3", optional = true }
+# Bounded channel for cpal→AEC thread communication — never blocks in audio
+# callbacks, matches the aec3 crate's reference examples.
+crossbeam-channel = { version = "0.5", optional = true }
 listeners = "0.3"
 tauri-plugin-os = "2"
 futures = "0.3.31"
@@ -61,7 +64,7 @@ env_logger = "0.11"
 
 [features]
 default = ["voice"]
-voice = ["livekit", "livekit-api", "cpal", "aec3"]
+voice = ["livekit", "livekit-api", "cpal", "aec3", "crossbeam-channel"]
 
 # Standalone headless native voice client: connects to a LiveKit room and
 # bridges the OS mic/speakers via cpal — no webview, no Tauri window. Run with:

@@ -17,6 +17,7 @@
     "desktop:build:fast": "bun run --cwd packages/desktop build:local:fast",
     "desktop:build:quick": "bun run --cwd packages/desktop build:local:quick",
     "desktop:build:nodmg": "bun run --cwd packages/desktop build:local:nodmg",
+    "clean": "bun run script/clean.ts",
     "typecheck": "bun turbo typecheck",
     "version:sync": "bun run script/sync-version.ts",
     "probe:ollama": "bun run script/ollama-cloud-probe.ts",

@@ -122,7 +122,7 @@ const { use: useVoice, provider: VoiceValueProvider } = createSimpleContext({
           .then((x) => x.data)
           .catch(() => undefined),
     )
-    const available = () => status()?.available === true
+    const available = () => !!platform.voice || status()?.available === true
 
     // voice can be configured in settings while a session is open; poll until
     // available so the mic button appears without a reload
