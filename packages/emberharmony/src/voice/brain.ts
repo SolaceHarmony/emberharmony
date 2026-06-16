@@ -79,6 +79,77 @@ export async function ensureBrainSession(): Promise<string> {
   })
 }
 
+/**
+ * Create a NEW voice conversation session in the voice project.
+ *
+ * Voice is a *project* of conversations: each launch gets its own session — an
+ * individual, viewable record — not one eternal session. Continuity comes from
+ * gatherRecentVoiceContext() reading the recent ones, not from reuse.
+ */
+export async function createVoiceSession(): Promise<string> {
+  const directory = await ensureVoiceProject()
+  return Instance.provide({
+    directory,
+    async fn() {
+      const session = await Session.create({ title: `Voice — ${new Date().toISOString()}` })
+      log.info("created voice session", { id: session.id, directory })
+      return session.id
+    },
+  })
+}
+
+/**
+ * Gather short "where it landed" summaries of the most recent voice
+ * conversations, formatted as memory for the brain's system prompt. This is the
+ * orient step: the brain knows what was discussed last time and can open
+ * casually referencing it. Returns "" when there are no prior conversations.
+ */
+export async function gatherRecentVoiceContext(excludeID: string, limit = 5): Promise<string> {
+  const directory = await ensureVoiceProject()
+  return Instance.provide({
+    directory,
+    async fn() {
+      const infos: Session.Info[] = []
+      for await (const info of Session.list()) {
+        if (info.id !== excludeID && !info.parentID) infos.push(info)
+      }
+      infos.sort((a, b) => b.time.created - a.time.created)
+
+      const lines: string[] = []
+      for (const info of infos.slice(0, limit)) {
+        const last = await lastAssistantText(info.id)
+        if (last) lines.push(`- ${truncate(last, 160)}`)
+      }
+      if (lines.length === 0) return ""
+
+      return [
+        "MEMORY — recent voice conversations with this user (most recent first):",
+        ...lines,
+        "",
+        "When you open a new conversation, greet casually and naturally. If there is recent",
+        "context above, briefly reference what you were last working on and offer to continue",
+        "or start something fresh. Never read this list aloud verbatim.",
+      ].join("\n")
+    },
+  })
+}
+
+/** Last assistant text in a session — a cheap "where it landed" signal. */
+async function lastAssistantText(sessionID: string): Promise<string | undefined> {
+  const msgs = await Session.messages({ sessionID, limit: 20 })
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    if (msgs[i]!.info.role !== "assistant") continue
+    const textPart = msgs[i]!.parts.find((p) => p.type === "text" && p.text.trim().length > 0)
+    if (textPart) return truncate((textPart as { text: string }).text, 400)
+  }
+  return undefined
+}
+
+function truncate(s: string, n: number): string {
+  const t = s.replace(/\s+/g, " ").trim()
+  return t.length > n ? `${t.slice(0, n - 1)}…` : t
+}
+
 /** The title used to identify the brain session across restarts */
 export const BRAIN_SESSION_TITLE = "Voice Brain"
 

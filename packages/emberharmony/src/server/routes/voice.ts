@@ -7,7 +7,7 @@ import { Voice } from "../../voice/token"
 import { VoiceRegistry } from "../../voice/registry"
 import { VoiceWorker } from "../../voice/worker"
 import { Instance } from "../../project/instance"
-import { ensureVoiceProject, ensureBrainSession, BRAIN_SYSTEM_PROMPT, VOICE_PROJECT_DIR } from "../../voice/brain"
+import { ensureVoiceProject, createVoiceSession, gatherRecentVoiceContext, BRAIN_SYSTEM_PROMPT, VOICE_PROJECT_DIR } from "../../voice/brain"
 import { errors } from "../error"
 import { lazy } from "../../util/lazy"
 
@@ -209,11 +209,11 @@ export const VoiceRoutes = lazy(() =>
     .get(
       "/brain",
       describeRoute({
-        summary: "Get the voice brain session",
+        summary: "Start a voice conversation",
         description:
-          "Find or create the permanent voice brain session in the voice project directory. " +
-          "Returns the session ID, the project directory, and the brain system prompt. " +
-          "The voice agent worker calls this at startup to get the brain session it should target.",
+          "Create a NEW conversation session in the voice project and return it with the brain " +
+          "system prompt (which folds in memory of recent conversations). The voice agent worker " +
+          "calls this at startup to get the session it should target.",
         operationId: "voice.brain",
         responses: {
           200: {
@@ -233,12 +233,13 @@ export const VoiceRoutes = lazy(() =>
         },
       }),
       async (c) => {
-        const sessionID = await ensureBrainSession()
-        return c.json({
-          sessionID,
-          directory: VOICE_PROJECT_DIR,
-          system: BRAIN_SYSTEM_PROMPT,
-        })
+        // Each conversation is a NEW session in the voice project. Continuity
+        // comes from recent-conversation memory folded into the system prompt
+        // (the orient step), not from reusing one eternal session.
+        const sessionID = await createVoiceSession()
+        const recent = await gatherRecentVoiceContext(sessionID)
+        const system = recent ? `${BRAIN_SYSTEM_PROMPT}\n\n${recent}` : BRAIN_SYSTEM_PROMPT
+        return c.json({ sessionID, directory: VOICE_PROJECT_DIR, system })
       },
     ),
 )
