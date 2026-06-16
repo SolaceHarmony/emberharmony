@@ -115,6 +115,22 @@ export class SessionLLMStream extends llm.LLMStream {
   }
 
   protected async run(): Promise<void> {
+    try {
+      await this.#runTurn()
+    } catch (err) {
+      // A voice interruption aborts this stream mid-flight: the in-flight fetch
+      // and SSE reader throw AbortError. That is a normal turn cancellation, not
+      // a fatal LLM error — swallow it so the AgentSession is NOT torn down.
+      // (The crash we saw: "AgentSession is closing due to an unrecoverable
+      // error" came from this AbortError propagating out of run().)
+      if (this.abortController.signal.aborted || (err as { name?: string } | null)?.name === "AbortError") {
+        return
+      }
+      throw err
+    }
+  }
+
+  async #runTurn(): Promise<void> {
     const text = this.#latestUserText()
     if (!text) return
     const signal = this.abortController.signal
