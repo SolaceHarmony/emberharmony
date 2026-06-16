@@ -7,7 +7,7 @@ import { Voice } from "../../voice/token"
 import { VoiceRegistry } from "../../voice/registry"
 import { VoiceWorker } from "../../voice/worker"
 import { Instance } from "../../project/instance"
-import { ensureBrainSession, BRAIN_SYSTEM_PROMPT, VOICE_PROJECT_DIR } from "../../voice/brain"
+import { ensureVoiceProject, ensureBrainSession, BRAIN_SYSTEM_PROMPT, VOICE_PROJECT_DIR } from "../../voice/brain"
 import { errors } from "../error"
 import { lazy } from "../../util/lazy"
 
@@ -177,10 +177,12 @@ export const VoiceRoutes = lazy(() =>
       ),
       async (c) => {
         const body = c.req.valid("json")
-        // One room per project: emberharmony_voice_{projectID}. The project ID
-        // comes from the Instance context (set via x-emberharmony-directory header).
-        // Session switching happens via participant attributes, not room changes.
-        const projectID = Instance.project.id
+        // One room per project: emberharmony_voice_{projectID}. When no project
+        // context is active (e.g. connecting from the TUI or desktop without a
+        // session open), fall back to the permanent voice brain project so the
+        // agent always has a valid session to work with.
+        const directory = Instance.directory === "/" ? await ensureVoiceProject() : Instance.directory
+        const projectID = Instance.directory === "/" ? "voice" : Instance.project.id
         const roomName = `emberharmony_voice_${projectID}`
         const agentName = body.agentName ?? Voice.AGENT_NAME
         const resolved = await Voice.settings()
@@ -188,7 +190,7 @@ export const VoiceRoutes = lazy(() =>
         // the EmberHarmony session (same tools, permissions, and context)
         const agentMetadata = JSON.stringify({
           projectID,
-          directory: Instance.directory,
+          directory,
           serverUrl: new URL(c.req.url).origin,
           model: body.model,
           brainModel: resolved.brain,
