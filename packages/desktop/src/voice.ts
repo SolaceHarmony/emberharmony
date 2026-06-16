@@ -22,13 +22,25 @@ export const voiceAdapter: VoiceAdapter = {
   },
 
   onStateChange(callback: (state: VoiceState) => void): () => void {
+    let disposed = false
     let unlisten: (() => void) | undefined
+
+    // Fetch initial state immediately so we don't miss events between
+    // listener setup and the first Tauri event.
+    invoke<VoiceState>("voice_state")
+      .then((state) => {
+        if (!disposed) callback(state)
+      })
+      .catch(() => {})
+
     listen<VoiceState>(VOICE_STATE_EVENT, (event) => {
-      callback(event.payload)
+      if (!disposed) callback(event.payload)
     }).then((fn) => {
       unlisten = fn
     })
+
     return () => {
+      disposed = true
       unlisten?.()
     }
   },

@@ -102,19 +102,17 @@ export namespace VoiceWorker {
     }
   }
 
-  function killProcess(pid: number): boolean {
+  async function killProcess(pid: number): Promise<boolean> {
     if (!isProcessAlive(pid)) return true
     try {
       process.kill(pid, "SIGTERM")
     } catch {
       return false
     }
-    // Give the process 3 seconds to exit gracefully
-    const deadline = Date.now() + 3000
-    while (Date.now() < deadline) {
+    // Poll every 100ms for up to 3 seconds
+    for (let i = 0; i < 30; i++) {
+      await Bun.sleep(100)
       if (!isProcessAlive(pid)) return true
-      // Busy-wait is intentional here — we need to poll at millisecond
-      // granularity for a clean shutdown. 3s max.
     }
     // Force kill
     try {
@@ -123,19 +121,19 @@ export namespace VoiceWorker {
     return !isProcessAlive(pid)
   }
 
-  function killStaleWorker() {
+  async function killStaleWorker() {
     const stalePid = readPidFile()
     if (stalePid === undefined) return
     if (isProcessAlive(stalePid)) {
       log.info("killing stale voice worker", { pid: stalePid })
-      killProcess(stalePid)
+      await killProcess(stalePid)
     }
     removePidFile()
   }
 
   export async function start(serverUrl: string, override?: Config.Voice): Promise<boolean> {
     stop()
-    killStaleWorker()
+    await killStaleWorker()
     lastServerUrl = serverUrl
     const settings = await Voice.settings(override)
     if (!settings.available) {
@@ -184,21 +182,30 @@ export namespace VoiceWorker {
     return proc !== undefined && proc.exitCode === null
   }
 
-  export function stop() {
+  export async function stop() {
     if (!proc) return
     const p = proc
     proc = undefined
     lastSettings = undefined
-    // Send SIGTERM for graceful shutdown; Bun.spawn.kill() sends SIGKILL
     try {
       process.kill(p.pid, "SIGTERM")
     } catch {}
-    // Give it 3 seconds to exit cleanly, then SIGKILL
-    const deadline = Date.now() + 3000
-    while (Date.now() < deadline) {
-      if (p.exitCode !== null) break
+    // Wait up to 3 seconds for graceful exit
+    const exited = await new Promise<boolean>((resolve) => {
+      const timeout = setTimeout(() => resolve(false), 3000)
+      p.exited
+        .then(() => {
+          clearTimeout(timeout)
+          resolve(true)
+        })
+        .catch(() => {
+          clearTimeout(timeout)
+          resolve(false)
+        })
+    })
+    if (!exited) {
+      p.kill()
     }
-    p.kill()
     removePidFile()
   }
 

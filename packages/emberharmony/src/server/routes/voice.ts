@@ -7,7 +7,13 @@ import { Voice } from "../../voice/token"
 import { VoiceRegistry } from "../../voice/registry"
 import { VoiceWorker } from "../../voice/worker"
 import { Instance } from "../../project/instance"
-import { ensureVoiceProject, createVoiceSession, gatherRecentVoiceContext, BRAIN_SYSTEM_PROMPT, VOICE_PROJECT_DIR } from "../../voice/brain"
+import {
+  ensureVoiceProject,
+  createVoiceSession,
+  gatherRecentVoiceContext,
+  BRAIN_SYSTEM_PROMPT,
+  VOICE_PROJECT_DIR,
+} from "../../voice/brain"
 import { errors } from "../error"
 import { lazy } from "../../util/lazy"
 
@@ -181,8 +187,16 @@ export const VoiceRoutes = lazy(() =>
         // context is active (e.g. connecting from the TUI or desktop without a
         // session open), fall back to the permanent voice brain project so the
         // agent always has a valid session to work with.
-        const directory = Instance.directory === "/" ? await ensureVoiceProject() : Instance.directory
-        const projectID = Instance.directory === "/" ? "voice" : Instance.project.id
+        let directory: string
+        let projectID: string
+        try {
+          directory = Instance.directory
+          projectID = Instance.project.id
+        } catch {
+          // No Instance context (TUI, desktop without session) — use voice project
+          directory = await ensureVoiceProject()
+          projectID = "voice"
+        }
         const roomName = `emberharmony_voice_${projectID}`
         const agentName = body.agentName ?? Voice.AGENT_NAME
         const resolved = await Voice.settings()

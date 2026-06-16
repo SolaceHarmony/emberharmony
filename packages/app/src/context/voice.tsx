@@ -173,6 +173,7 @@ const { use: useVoice, provider: VoiceValueProvider } = createSimpleContext({
           if (!grant) throw new Error("voice token request failed")
           await platform.voice.connect(grant.url, grant.token)
         } catch (err) {
+          followProjects = false
           setError(err instanceof Error ? err.message : String(err))
           throw err
         } finally {
@@ -197,6 +198,7 @@ const { use: useVoice, provider: VoiceValueProvider } = createSimpleContext({
         }
         await r.localParticipant.setMicrophoneEnabled(true)
       } catch (err) {
+        followProjects = false
         // unwind a partially joined room so a retry starts from clean state
         const r = room()
         if (r) await r.disconnect().catch(() => {})
@@ -212,7 +214,8 @@ const { use: useVoice, provider: VoiceValueProvider } = createSimpleContext({
       setError(undefined)
 
       if (platform.voice) {
-        await platform.voice.disconnect()
+        const result = await platform.voice.disconnect()
+        setNativeState(result)
         return
       }
 
@@ -225,7 +228,7 @@ const { use: useVoice, provider: VoiceValueProvider } = createSimpleContext({
 
       if (platform.voice) {
         const newMuted = await platform.voice.toggleMute()
-        setNativeState((prev) => ({ ...prev, micMuted: !newMuted }))
+        setNativeState((prev) => ({ ...prev, micMuted: newMuted }))
         return
       }
 
