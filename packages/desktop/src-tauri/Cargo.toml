@@ -34,7 +34,14 @@ tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1.48.0", features = ["sync"] }
+tokio = { version = "1.48.0", features = ["sync", "rt-multi-thread", "macros", "time", "signal"] }
+# OS audio device I/O (mic capture + speaker playback) for the native voice
+# client. cpal streams are !Send, so they live on dedicated threads.
+cpal = { version = "0.15", optional = true }
+# Acoustic echo cancellation (+ noise suppression + AGC) for the native mic
+# path — WebRTC AEC3 port. Without this the agent hears itself via the
+# speakers and barges in on its own speech. linear pipeline = HPF→AEC3→NS→AGC2.
+aec3 = { version = "0.3", optional = true }
 listeners = "0.3"
 tauri-plugin-os = "2"
 futures = "0.3.31"
@@ -52,7 +59,15 @@ log = "0.4"
 
 [features]
 default = ["voice"]
-voice = ["livekit", "livekit-api"]
+voice = ["livekit", "livekit-api", "cpal", "aec3"]
+
+# Standalone headless native voice client: connects to a LiveKit room and
+# bridges the OS mic/speakers via cpal — no webview, no Tauri window. Run with:
+#   cargo run --bin voice-native --features voice
+[[bin]]
+name = "voice-native"
+path = "src/bin/voice_native.rs"
+required-features = ["voice"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 webkit2gtk = "=2.0.2"
