@@ -1,18 +1,30 @@
-//! Voice module — native LiveKit audio transport.
+//! Voice module — native LiveKit room transport.
 //!
-//! Uses the LiveKit Rust SDK to connect to voice rooms, capture microphone
-//! audio, and play back the agent's speech. This replaces the JS worker's
-//! WebRTC with cross-platform Rust audio.
+//! Uses the LiveKit Rust SDK to connect to voice rooms and manage audio
+//! tracks. This is the native (non-webview) path; it will replace the JS
+//! worker's WebRTC for cross-platform audio.
 //!
 //! ## Architecture
 //!
 //! The voice module runs inside the Tauri app process. It:
 //! - Connects to a LiveKit room using the token from `POST /voice/token`
-//! - Captures audio from the local microphone via NativeAudioSource
-//! - Publishes the local audio track to the room
-//! - Subscribes to the agent's audio track and plays it back via NativeAudioStream
+//! - Creates a local audio track + source and publishes it to the room
+//! - Subscribes to the agent's audio track
 //! - Watches ParticipantAttributesChanged for workflow stage/mode updates
 //! - Exposes state (connected, speaking, agent stage) via Tauri commands + events
+//!
+//! ## NOT YET WIRED: OS audio device I/O
+//!
+//! The room/track plumbing is in place, but the bridge to the operating
+//! system's microphone and speakers is NOT implemented yet:
+//! - The published mic track's `NativeAudioSource` is never fed real mic
+//!   frames, so it currently carries silence.
+//! - Subscribed agent audio is read from `NativeAudioStream` but is NOT routed
+//!   to an output device, so nothing is played back.
+//!
+//! Wiring this needs an OS audio layer (e.g. `cpal`) running on a dedicated
+//! thread (cpal streams are `!Send`), bridged to these LiveKit frames. Until
+//! then, this transport connects but is SILENT in both directions.
 //!
 //! ## Usage
 //!
@@ -76,7 +88,6 @@ struct VoiceSession {
     room: Room,
     _audio_source: NativeAudioSource,
     mic_publication: LocalTrackPublication,
-    events: mpsc::UnboundedReceiver<RoomEvent>,
     state: VoiceState,
 }
 
@@ -123,7 +134,9 @@ pub async fn voice_connect(
 
     let room_name = room.name();
 
-    // Create mic audio source (48kHz mono — standard for speech)
+    // Create mic audio source (48kHz mono — standard for speech).
+    // NOTE: this source is NOT yet fed real microphone frames (no cpal capture),
+    // so the published track currently carries silence. See module docs.
     let sample_rate = 48000u32;
     let num_channels = 1u32;
     let audio_source = NativeAudioSource::new(
@@ -167,18 +180,20 @@ pub async fn voice_connect(
         room,
         _audio_source: audio_source,
         mic_publication: publication,
-        events,
         state: state.clone(),
     };
 
     // Store the session
     *handle.session.lock().await = Some(session);
 
-    // Spawn event loop
+    // Spawn the event loop. The event receiver is owned by the loop (not stored
+    // in the session) so it can await the next event WITHOUT holding the session
+    // lock — otherwise voice_toggle_mute / voice_state / voice_disconnect would
+    // block until an unrelated room event happened to arrive.
     let session_arc = handle.session.clone();
     let app_clone = app.clone();
     tauri::async_runtime::spawn(async move {
-        event_loop(session_arc, app_clone).await;
+        event_loop(session_arc, app_clone, events).await;
     });
 
     emit_state(&app, &state);
@@ -259,24 +274,25 @@ pub async fn voice_state(handle: State<'_, VoiceHandle>) -> Result<VoiceState, S
 /// - ParticipantAttributesChanged: workflow stage/mode from the agent
 /// - Disconnected: clean up session on remote disconnect
 /// - TrackMuted/TrackUnmuted: sync mute state
-async fn event_loop(session: Arc<Mutex<Option<VoiceSession>>>, app: AppHandle) {
+async fn event_loop(
+    session: Arc<Mutex<Option<VoiceSession>>>,
+    app: AppHandle,
+    mut events: mpsc::UnboundedReceiver<RoomEvent>,
+) {
     loop {
-        let event = {
+        // Await the next event WITHOUT holding the session lock, so Tauri
+        // commands (toggle_mute / state / disconnect) can touch the session
+        // concurrently instead of blocking until an event arrives.
+        let Some(event) = events.recv().await else {
+            // Event stream closed — room disconnected.
+            info!("voice event stream closed");
             let mut guard = session.lock().await;
-            match guard.as_mut() {
-                Some(s) => match s.events.recv().await {
-                    Some(e) => e,
-                    None => {
-                        // Event stream closed — room disconnected
-                        info!("voice event stream closed");
-                        s.state = VoiceState::default();
-                        emit_state(&app, &s.state);
-                        *guard = None;
-                        return;
-                    }
-                },
-                None => return, // session dropped
+            if let Some(s) = guard.as_mut() {
+                s.state = VoiceState::default();
+                emit_state(&app, &s.state);
             }
+            *guard = None;
+            return;
         };
 
         match event {
@@ -370,11 +386,14 @@ async fn event_loop(session: Arc<Mutex<Option<VoiceSession>>>, app: AppHandle) {
     }
 }
 
-/// Spawn an audio playback task for a subscribed remote audio track.
+/// Drain a subscribed remote audio track's decoded frames.
 ///
-/// Creates a NativeAudioStream from the remote track and reads frames.
-/// On macOS/Linux, the audio is played back through the system audio device
-/// by the LiveKit runtime's native audio renderer.
+/// NOTE: `NativeAudioStream` is a *read* stream — it yields decoded PCM frames
+/// but does NOT play them to any speaker, and there is no "native audio
+/// renderer" that does so automatically. Routing these frames to an OS output
+/// device (e.g. via `cpal`) is NOT implemented yet, so the agent's voice is
+/// currently inaudible. We drain the stream to avoid the decoder backing up
+/// until the output-device bridge lands.
 fn spawn_audio_playback(audio_track: RemoteAudioTrack, participant_identity: String) {
     tauri::async_runtime::spawn(async move {
         let target_sample_rate = 48000i32;
@@ -384,15 +403,11 @@ fn spawn_audio_playback(audio_track: RemoteAudioTrack, participant_identity: Str
         let mut audio_stream =
             NativeAudioStream::new(rtc_track, target_sample_rate, target_channels);
 
-        debug!("started audio playback for {participant_identity}");
+        debug!("draining agent audio for {participant_identity} (playback not yet wired)");
 
-        // Read frames to drive playback through the native audio sink.
-        // The NativeAudioStream connects to the platform's audio output.
-        while let Some(_frame) = audio_stream.next().await {
-            // Frames are processed by the native audio stream internally.
-            // We just need to keep reading to keep the pipeline flowing.
-        }
+        // TODO(voice): route these frames to an OS output device (cpal).
+        while let Some(_frame) = audio_stream.next().await {}
 
-        debug!("audio playback ended for {participant_identity}");
+        debug!("agent audio stream ended for {participant_identity}");
     });
 }
