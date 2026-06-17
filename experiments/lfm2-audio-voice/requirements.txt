@@ -1,0 +1,4 @@
+# Local voice loop deps. The GLM subagent uses only the Python stdlib.
+numpy>=1.26
+sounddevice>=0.4.6
+soundfile>=0.12.1
