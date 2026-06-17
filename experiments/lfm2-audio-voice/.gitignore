@@ -1,6 +1,5 @@
-# Large/local artifacts — not committed
+# Large/local + build artifacts — not committed
 models/            # downloaded GGUF weights
 llama.cpp/         # built llama.cpp checkout (PR #18641)
-__pycache__/
-*.pyc
+/target/           # cargo build output
 *.wav

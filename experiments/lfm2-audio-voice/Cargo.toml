@@ -1,0 +1,21 @@
+[package]
+name = "lfm2-audio-voice"
+version = "0.1.0"
+edition = "2021"
+description = "Local LFM2.5-Audio voice loop with GLM subagent delegation — no LiveKit, no brain bridge"
+
+[[bin]]
+name = "lfm-voice"
+path = "src/main.rs"
+
+[dependencies]
+# Native OS mic/speaker — same crate the rest of the native voice code uses.
+cpal = "0.15"
+# WAV read/write for handing audio to/from llama-liquid-audio-cli.
+hound = "3"
+# GLM subagent over the ollama-cloud OpenAI-compatible HTTP API. rustls to match
+# the desktop crate's TLS choice; blocking keeps the loop simple and sequential.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
