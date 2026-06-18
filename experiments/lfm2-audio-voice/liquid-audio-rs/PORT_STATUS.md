@@ -8,7 +8,7 @@ run it with the model present to close the parity column).
 
 | Python module | LOC | Rust module | Status |
 |---|---:|---|---|
-| `utils.py` | 54 | `src/utils.rs` | ✅ done (incl. `get_model_dir` local path) |
+| `utils.py` | 54 | `src/utils.rs` | ✅ done (incl. `get_model_dir` snapshot-download via `hf-hub`) |
 | `model/mlp.py` | 40 | `src/model/mlp.rs` | ✅ done |
 | `model/transformer.py` | 578 | `src/model/transformer.rs` | ✅ done — depthformer + shared embeddings backbone (RMSNorm, SwiGLU, GQA attn + qk-RMSNorm + interleaved RoPE, MHA, StandardBlock, SharedEmbedding, RawLmBackbone, KV cache) |
 | (HF `Lfm2Model`) | ~660 | `src/model/lfm2_hf.rs` | ✅ done — **main** backbone (hybrid short-conv + GQA attn), adapted from candle `lfm2.rs`; all-position hidden + custom-mask forward |
@@ -36,7 +36,12 @@ run it with the model present to close the parity column).
   The parity reference is dumped at `torch.float32`, so there is no dtype gap
   against it. True in-memory bf16 is accepted for CUDA/Metal but rejected on CPU
   (candle has no CPU bf16 matmul kernel) with a clear error.
-- **hf-hub auto-download**: `get_model_dir` takes a local dir; repo auto-download is a follow-up.
+- **hf-hub auto-download**: ✅ done — `get_model_dir(repo_or_path, revision)`
+  snapshot-downloads a HF repo id via the `hf-hub` crate (sync, the
+  `snapshot_download` analog) and returns the snapshot dir; local paths pass
+  through (revision-with-path is an error, as in Python). Gated behind the
+  `download` feature (on by default). `from_pretrained_hub(repo_id, ...)` is the
+  faithful repo-id entry point.
 - **Mimi audio-out (v1)**: the LFM2.5 detokenizer path is ported; the v1 `processor.mimi` (moshi-crate) decode path is deferred.
 - **Parity**: harness built (PARITY.md); run against the model to verify the numbers.
 

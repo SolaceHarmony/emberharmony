@@ -47,19 +47,59 @@ pub fn module_exists(name: &str) -> bool {
     }
 }
 
-/// Resolve a model directory. Faithful to `get_model_dir`'s path branch: a local
-/// path is returned as-is. The repo-id branch (`snapshot_download`) is a
-/// follow-up (needs hf-hub) — for now download the HF repo and pass the path.
-pub fn get_model_dir(repo_or_path: &str) -> std::io::Result<std::path::PathBuf> {
+/// Resolve a model directory. Faithful to `get_model_dir(repo_id, *, revision)`:
+/// an existing local path is returned as-is (and a `revision` alongside a path is
+/// an error, as in Python); otherwise `repo_or_path` is treated as a HF repo id
+/// and snapshot-downloaded (the `huggingface_hub.snapshot_download` analog), the
+/// snapshot directory being returned. The download branch requires the `download`
+/// feature (on by default).
+pub fn get_model_dir(repo_or_path: &str, revision: Option<&str>) -> std::io::Result<std::path::PathBuf> {
     let p = std::path::PathBuf::from(repo_or_path);
     if p.is_dir() {
-        Ok(p)
-    } else {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("{repo_or_path} is not a local dir; hf-hub auto-download not yet wired — clone the HF repo and pass its path"),
-        ))
+        if revision.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "cannot use `revision` when given a path", // RuntimeError in Python
+            ));
+        }
+        return Ok(p);
     }
+    download_snapshot(repo_or_path, revision)
+}
+
+/// `snapshot_download(repo_id, revision=...)` — fetch every file in the repo into
+/// the HF cache and return the snapshot directory (parent of `config.json`).
+#[cfg(feature = "download")]
+fn download_snapshot(repo_id: &str, revision: Option<&str>) -> std::io::Result<std::path::PathBuf> {
+    use hf_hub::{api::sync::Api, Repo, RepoType};
+    let to_io = |e: hf_hub::api::sync::ApiError| std::io::Error::new(std::io::ErrorKind::Other, format!("hf-hub: {e}"));
+
+    let api = Api::new().map_err(to_io)?;
+    let repo = match revision {
+        Some(rev) => api.repo(Repo::with_revision(repo_id.to_string(), RepoType::Model, rev.to_string())),
+        None => api.model(repo_id.to_string()),
+    };
+
+    // List then fetch every sibling (snapshot_download grabs the whole repo).
+    let info = repo.info().map_err(to_io)?;
+    let mut root: Option<std::path::PathBuf> = None;
+    for sib in &info.siblings {
+        let path = repo.get(&sib.rfilename).map_err(to_io)?;
+        if sib.rfilename == "config.json" {
+            root = path.parent().map(|p| p.to_path_buf());
+        }
+    }
+    root.ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, format!("repo {repo_id} has no config.json"))
+    })
+}
+
+#[cfg(not(feature = "download"))]
+fn download_snapshot(repo_id: &str, _revision: Option<&str>) -> std::io::Result<std::path::PathBuf> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        format!("{repo_id} is not a local dir and the `download` feature is disabled — clone the HF repo and pass its path"),
+    ))
 }
 
 #[cfg(test)]

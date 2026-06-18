@@ -18,9 +18,9 @@ pub mod processor; // processor.py
 pub mod utils;
 
 pub use detokenizer::LFM2AudioDetokenizer;
-pub use loader::from_pretrained;
+pub use loader::{from_pretrained, from_pretrained_hub};
 pub use model::lfm2_audio::{GenParams, GenToken, LFM2AudioModel};
 pub use processor::{ChatState, LFM2AudioProcessor};
-pub use utils::LFMModality;
+pub use utils::{get_model_dir, LFMModality};
 // pub use model::lfm2_audio::LFM2AudioModel;
 // pub use processor::{ChatState, LFM2AudioProcessor};

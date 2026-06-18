@@ -66,6 +66,20 @@ fn parse_encoder(e: &Value) -> ConformerEncoderConfig {
     }
 }
 
+/// Resolve `repo_id` (or a local path) via [`get_model_dir`] — snapshot-
+/// downloading from the Hub if needed — then load at `dtype`. This is the
+/// faithful analog of the Python `LFM2AudioModel.from_pretrained(repo_id, ...)`
+/// entry point (which calls `get_model_dir` internally).
+pub fn from_pretrained_hub(
+    repo_id: &str,
+    revision: Option<&str>,
+    dtype: DType,
+    device: &Device,
+) -> Result<(LFM2AudioModel, LFM2AudioProcessor)> {
+    let dir = crate::utils::get_model_dir(repo_id, revision).map_err(err)?;
+    from_pretrained(&dir, dtype, device)
+}
+
 /// Load the main model + processor from a local model directory, at `dtype`
 /// (mirrors the Python `dtype=` keyword; `DType::BF16` matches the deployed
 /// model, `DType::F32` matches the parity reference).
