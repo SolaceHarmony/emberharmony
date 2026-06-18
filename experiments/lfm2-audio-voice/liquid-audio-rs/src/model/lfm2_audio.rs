@@ -221,6 +221,13 @@ impl LFM2AudioModel {
         self.lfm.forward_embeds(embeds, 0, &mut cache, None)
     }
 
+    /// Debug: prefill input embeddings for a `ChatState` (the modality-scatter
+    /// assembly: text embed + conformer/adapter audio-in + audio-out embedding).
+    #[doc(hidden)]
+    pub fn prefill_chat(&self, chat: &ChatState) -> Result<Tensor> {
+        self.prefill(chat)
+    }
+
     /// Debug: tied-embedding text logits for a single hidden vector (H,) — the
     /// text head used in generation.
     #[doc(hidden)]

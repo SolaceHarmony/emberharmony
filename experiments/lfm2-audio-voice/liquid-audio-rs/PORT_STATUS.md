@@ -44,15 +44,24 @@ run it with the model present to close the parity column).
   faithful repo-id entry point.
 - **Mimi audio-out (v1)**: the LFM2.5 detokenizer path is ported; the v1 `processor.mimi` (moshi-crate) decode path is deferred.
 - **Parity**: ✅ verified against the real upstream + actual weights
-  (LFM2-Audio-1.5B, f32, CPU) across the full understanding + generation path:
-  **mel 1.1e-5, FastConformer 8.3e-7** (every stage ≤ 1.6e-6), **lfm backbone
-  6.6e-6**, **depthformer audio frame token-exact**. Bugs caught + fixed: STFT
-  frame off-by-one (`torch.stft(center=True)` ⇒ `1 + L/hop`), the `lfm.*`
-  weight-key layout (bare `Lfm2Model`, `embedding_norm`), the conformer length
-  convention (full mel width, not `mel_len`), and a latent 1-D `Linear` in the
-  depthformer sampler (candle needs a 2-D input). Detokenizer (audio-out) parity
-  is the remaining tap (needs the `audio_detokenizer/` weights — absent from the
-  1.5B repo, which ships the v1 Mimi path). Workflow in PARITY.md.
+  (LFM2-Audio-1.5B, f32, CPU) across the full pipeline — understanding,
+  generation heads, and the prefill assembly:
+  - mel featurizer **1.1e-5**
+  - FastConformer encoder **8.3e-7** (every stage ≤ 1.6e-6)
+  - lfm backbone **6.6e-6**
+  - text head (`text_logits`) **5.5e-6**
+  - depthformer audio frame **token-exact**
+  - prefill modality-scatter **1.1e-6**
+
+  Bugs caught + fixed via the harness: STFT frame off-by-one
+  (`torch.stft(center=True)` ⇒ `1 + L/hop`); the `lfm.*` weight-key layout (bare
+  `Lfm2Model`, `embedding_norm`); the conformer length convention (full mel width,
+  not `mel_len`); and a latent 1-D `Linear` in the depthformer sampler (candle
+  needs a 2-D input). The only remaining untested piece is the **audio-out
+  detokenizer** (needs the `audio_detokenizer/` weights — absent from the 1.5B
+  repo, which ships the v1 Mimi path; deferred with the v1 Mimi decode). The
+  generate loop is a deterministic state machine over these verified components.
+  Workflow in PARITY.md.
 
 ## IO model (faithful to Python)
 - Model / `generate_interleaved`: synchronous streaming → Rust synchronous callback stream (no async).

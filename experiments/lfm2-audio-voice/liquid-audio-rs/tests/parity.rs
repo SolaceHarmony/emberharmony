@@ -77,6 +77,33 @@ fn conformer_stages_parity() -> anyhow::Result<()> {
 }
 
 #[test]
+#[ignore = "needs LFM_MODEL_DIR + parity/golden/prefill_refs.safetensors"]
+fn prefill_parity() -> anyhow::Result<()> {
+    let dir = std::env::var("LFM_MODEL_DIR").expect("set LFM_MODEL_DIR");
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let device = Device::Cpu;
+    let r = candle_core::safetensors::load(manifest.join("parity/golden/prefill_refs.safetensors"), &device)?;
+
+    let (model, proc) = liquid_audio::from_pretrained(Path::new(&dir), DType::F32, &device)?;
+    // Build a ChatState from the Python-dumped raw fields (identical inputs, no
+    // template re-tokenization). Fields are u32 in the port; the dump is i64.
+    let mut chat = liquid_audio::ChatState::new(&proc, 8)?;
+    chat.text = r.get("text").unwrap().to_dtype(DType::U32)?;
+    chat.audio_in = r.get("audio_in").unwrap().to_dtype(DType::F32)?;
+    chat.audio_in_lens = r.get("audio_in_lens").unwrap().to_dtype(DType::U32)?;
+    chat.audio_out = r.get("audio_out").unwrap().to_dtype(DType::U32)?;
+    chat.modality_flag = r.get("modality_flag").unwrap().to_dtype(DType::U32)?;
+
+    let in_emb = model.prefill_chat(&chat)?;
+    let want = r.get("in_emb").expect("in_emb");
+    let e = rel_err(&in_emb, want);
+    println!("prefill rel-err: {e:.3e}  rust {:?}  ref {:?}", in_emb.dims(), want.dims());
+    assert_eq!(in_emb.dims(), want.dims(), "prefill shape mismatch");
+    assert!(e < 2e-2, "prefill parity failed: {e}");
+    Ok(())
+}
+
+#[test]
 #[ignore = "needs LFM_MODEL_DIR + parity/golden/depthformer_refs.safetensors"]
 fn depthformer_parity() -> anyhow::Result<()> {
     let dir = std::env::var("LFM_MODEL_DIR").expect("set LFM_MODEL_DIR");

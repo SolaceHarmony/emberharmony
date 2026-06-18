@@ -81,6 +81,9 @@ accessors (`conformer_encode`, and add accessors for prefill / step as needed).
   over a 24-token sequence; hybrid short-conv + GQA attention + standard RoPE match.
 - **text head**: ✅ verified (5.5e-6) — tied-embedding `text_logits` for the last
   position matches `F.linear(hidden, embed_tokens.weight)`.
+- **prefill assembly**: ✅ verified (1.1e-6) — the modality-scatter that assembles
+  text + conformer/adapter audio-in + audio-out embeddings into the LFM input
+  (`_prefill`) for a real ChatState (system text + a user audio turn) matches.
 - **depthformer**: ✅ verified token-exact — greedy 8-codebook audio frame for a
   fixed lfm-hidden vector; interleaved `rope_i` + per-codebook autoregression match.
   (This run found a latent 1-D `Linear` bug in the sampler.)
