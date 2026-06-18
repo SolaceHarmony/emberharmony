@@ -19,7 +19,7 @@ Python with shared weights + fixed inputs.
 | `model/conformer/modules.py` | 471 | `src/model/conformer/modules.rs` | **done (compiles; parity pending)** | ConformerLayer / ConformerConvolution / FeedForward / CausalConv1D |
 | `model/conformer/subsampling.rs` | 605 | `src/model/conformer/subsampling.rs` | **done (compiles; parity pending)** | ConvSubsampling forward (skip conv chunking) |
 | `model/conformer/encoder.rs` | 1163 | `src/model/conformer/encoder.rs` | **done (compiles; parity pending)** | ConformerEncoder offline forward (skip streaming/export/stochastic) |
-| `model/conformer/processor.py` | 556 | `src/model/conformer/processor.rs` | pending | AudioToMelSpectrogramPreprocessor / FilterbankFeatures (STFT via `rustfft`) |
+| `model/conformer/processor.rs` | 556 | `src/model/conformer/processor.rs` | **done (compiles; parity pending)** | AudioToMelSpectrogramPreprocessor / FilterbankFeatures (STFT via `rustfft`) |
 | `moshi/*` | 8715 | — | **reuse** | the `moshi` crate (Kyutai's own Rust port) — identical upstream to the vendored copy |
 
 ## IO model (faithful to Python)

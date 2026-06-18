@@ -18,6 +18,8 @@ path = "src/lib.rs"
 # Tensor substrate (matches the moshi crate's candle 0.9.x).
 candle-core = "0.9"
 candle-nn = "0.9"
+# STFT (mel featurizer) and ISTFT (detokenizer vocoder).
+rustfft = "6"
 # Added as their consuming modules are ported:
 #   candle-transformers = "0.9"  # lfm2 backbone (model/transformer.rs)
 #   moshi = "0.6"                # Mimi codec (processor.rs decode path)
