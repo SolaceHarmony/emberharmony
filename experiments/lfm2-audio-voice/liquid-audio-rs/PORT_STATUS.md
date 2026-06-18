@@ -14,6 +14,7 @@ Python with shared weights + fixed inputs.
 | `detokenizer.py` | 136 | `src/detokenizer.rs` | pending (after backbone) | FusedEmbedding + Vocos-style ISTFT (needs inverse FFT via `rustfft` + overlap-add `fold`) + Lfm2Model backbone |
 | `processor.py` | 269 | `src/processor.rs` | pending | tokenizer (`tokenizers`), mel preprocessor, Mimi decode (via `moshi` crate), `ChatState` |
 | `model/lfm2_audio.py` | 534 | `src/model/lfm2_audio.rs` | pending | `LFM2AudioModel` + `generate_interleaved` (sync streaming iterator) |
+| (HF transformers `Lfm2Model`) | ~660 | `src/model/lfm2_hf.rs` | **done (compiles; parity pending)** | main LFM2 backbone (hybrid short-conv + GQA attn), adapted from candle main lfm2.rs to candle 0.9; returns all-position hidden state + custom-mask forward |
 | `model/conformer/utils.py` | 112 | — | **skip** | autocast/streaming/stochastic-depth helpers — not on inference path |
 | `model/conformer/mha.py` | 457 | `src/model/conformer/mha.rs` | **done (compiles; parity pending)** | RelPositionalEncoding + RelPositionMultiHeadAttention (manual branch, no cache/streaming/sdpa) |
 | `model/conformer/modules.py` | 471 | `src/model/conformer/modules.rs` | **done (compiles; parity pending)** | ConformerLayer / ConformerConvolution / FeedForward / CausalConv1D |
