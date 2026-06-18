@@ -1,0 +1,30 @@
+# Faithful Rust port of Liquid AI's `liquid_audio` (LFM2.5-Audio).
+# Module-for-module with the Python package under src/liquid_audio/.
+# Empty [workspace] makes this its own workspace root (it lives nested under the
+# lfm-voice crate).
+[workspace]
+
+[package]
+name = "liquid-audio"
+version = "0.1.0"
+edition = "2021"
+description = "Faithful Rust port of liquid_audio (LFM2.5-Audio) on candle + the moshi crate"
+
+[lib]
+name = "liquid_audio"
+path = "src/lib.rs"
+
+[dependencies]
+# Tensor substrate (matches the moshi crate's candle 0.9.x).
+candle-core = "0.9"
+candle-nn = "0.9"
+# Added as their consuming modules are ported:
+#   candle-transformers = "0.9"  # lfm2 backbone (model/transformer.rs)
+#   moshi = "0.6"                # Mimi codec (processor.rs decode path)
+#   tokenizers = "0.21"          # text tokenizer (processor.rs)
+#   hf-hub = "0.3"               # weight download (utils::get_model_dir, processor)
+#   safetensors = "0.4"          # weight loading
+
+[features]
+# Mirrors the Python `module_exists("flash_attn")` optional path.
+flash-attn = []

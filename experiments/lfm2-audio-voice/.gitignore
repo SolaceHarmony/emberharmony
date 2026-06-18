@@ -1,5 +1,6 @@
 # Large/local + build artifacts — not committed
-models/            # downloaded GGUF weights
-llama.cpp/         # built llama.cpp checkout (PR #18641)
-/target/           # cargo build output
+models/                  # downloaded GGUF weights
+llama.cpp/               # built llama.cpp checkout (PR #18641)
+upstream-liquid-audio/   # reference clone of Liquid4All/liquid-audio (port source)
+/target/                 # cargo build output
 *.wav

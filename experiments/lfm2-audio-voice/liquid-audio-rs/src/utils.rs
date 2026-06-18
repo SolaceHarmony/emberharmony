@@ -1,0 +1,72 @@
+//! Port of `liquid_audio/utils.py`.
+
+/// Modality flag for interleaved generation. Mirrors `LFMModality(IntEnum)` —
+/// Python `IntEnum` + `auto()` numbers from 1, so TEXT=1, AUDIO_IN=2, AUDIO_OUT=3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i64)]
+pub enum LFMModality {
+    Text = 1,
+    AudioIn = 2,
+    AudioOut = 3,
+}
+
+/// Python floor division (`a // b`): rounds toward negative infinity, unlike
+/// Rust's `/` which truncates toward zero. Needed for faithful `mel2emb_len`.
+fn floordiv(a: i64, b: i64) -> i64 {
+    let q = a / b;
+    let r = a % b;
+    if r != 0 && (r < 0) != (b < 0) {
+        q - 1
+    } else {
+        q
+    }
+}
+
+/// Convert log-mel feature length to final LFM embedding length.
+///
+/// This is just floor division. Faithful to `-(l // -8)` (i.e. ceil(l/8)).
+/// Note: smallest mel-length for encoder is 9.
+pub fn mel2emb_len(l: i64) -> i64 {
+    -floordiv(l, -8)
+}
+
+/// Convert LFM embedding length to log-mel feature length.
+///
+/// Note: this is an upper bound. Faithful to `l * 8`.
+pub fn emb2mel_len(l: i64) -> i64 {
+    l * 8
+}
+
+/// Faithful to Python's importlib-based `module_exists`. Rust has no runtime
+/// module lookup, so this maps to compile-time Cargo features (the analog used
+/// here is the optional flash-attn path).
+pub fn module_exists(name: &str) -> bool {
+    match name {
+        "flash_attn" => cfg!(feature = "flash-attn"),
+        _ => false,
+    }
+}
+
+// `get_model_dir(repo_id, revision)` is ported alongside `processor.rs`
+// (its only consumer), where the `hf-hub` dependency is introduced.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn modality_values_match_intenum() {
+        assert_eq!(LFMModality::Text as i64, 1);
+        assert_eq!(LFMModality::AudioIn as i64, 2);
+        assert_eq!(LFMModality::AudioOut as i64, 3);
+    }
+
+    #[test]
+    fn mel_emb_len_roundtrip() {
+        // -(9 // -8) == 2 ; -(16 // -8) == 2 ; -(17 // -8) == 3
+        assert_eq!(mel2emb_len(9), 2);
+        assert_eq!(mel2emb_len(16), 2);
+        assert_eq!(mel2emb_len(17), 3);
+        assert_eq!(emb2mel_len(2), 16);
+    }
+}
