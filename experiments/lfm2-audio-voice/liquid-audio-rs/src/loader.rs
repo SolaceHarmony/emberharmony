@@ -2,9 +2,18 @@
 //!
 //! Mirrors `LFM2AudioModel.from_pretrained` / `LFM2AudioProcessor.from_pretrained`:
 //! parse the config, construct the typed configs, memory-map the safetensors, and
-//! build the model + processor. Weights are loaded as f32 (CPU/Metal friendly;
-//! bf16 parity is a config knob for later). Expects a local model directory
-//! (download the HF repo first; hf-hub auto-download is a follow-up).
+//! build the model + processor. `dtype` mirrors the Python keyword arg
+//! (`dtype: torch.dtype = torch.bfloat16`): pass `DType::BF16` on CUDA/Metal to
+//! match the deployed model, or `DType::F32` for the parity harness (which dumps
+//! the Python reference at `torch.float32`) and for CPU.
+//!
+//! Note: the on-disk checkpoint is stored bf16, so `DType::F32` still loads the
+//! *faithful* (bf16-rounded) weight values and upcasts them — on CPU this is the
+//! correct path, because candle's CPU backend has no bf16 matmul kernel. Request-
+//! ing `DType::BF16` on a CPU device is therefore rejected up front (see guard)
+//! rather than failing later with a cryptic "unsupported dtype BF16 for op
+//! matmul". Expects a local model directory (download the HF repo first; hf-hub
+//! auto-download is a follow-up).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -57,8 +66,16 @@ fn parse_encoder(e: &Value) -> ConformerEncoderConfig {
     }
 }
 
-/// Load the main model + processor from a local model directory.
-pub fn from_pretrained(dir: &Path, device: &Device) -> Result<(LFM2AudioModel, LFM2AudioProcessor)> {
+/// Load the main model + processor from a local model directory, at `dtype`
+/// (mirrors the Python `dtype=` keyword; `DType::BF16` matches the deployed
+/// model, `DType::F32` matches the parity reference).
+pub fn from_pretrained(dir: &Path, dtype: DType, device: &Device) -> Result<(LFM2AudioModel, LFM2AudioProcessor)> {
+    if dtype == DType::BF16 && device.is_cpu() {
+        return Err(err(
+            "bf16 on CPU is unsupported (candle has no CPU bf16 matmul); use DType::F32 \
+             — it still loads the bf16-stored weights and upcasts them faithfully",
+        ));
+    }
     let config: Value = serde_json::from_str(&fs::read_to_string(dir.join("config.json")).map_err(err)?).map_err(err)?;
 
     let lfm_cfg: Lfm2Config = serde_json::from_value(config["lfm"].clone()).map_err(err)?;
@@ -73,20 +90,20 @@ pub fn from_pretrained(dir: &Path, device: &Device) -> Result<(LFM2AudioModel, L
     let n_audio = config["interleaved_n_audio"].as_u64().unwrap_or(1) as usize;
 
     let safes = safetensors_in(dir)?;
-    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&safes, DType::F32, device)? };
+    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&safes, dtype, device)? };
     let model = LFM2AudioModel::new(lfm_cfg, &enc_cfg, &depth_cfg, codebooks, n_text, n_audio, vb)?;
 
     let prep: PreprocessorConfig = serde_json::from_value(config["preprocessor"].clone()).map_err(err)?;
     let audio = FilterbankFeatures::new(prep.mel_config(), device)?;
     let tokenizer = LFM2AudioProcessor::load_tokenizer(dir)?;
-    let detok = load_detokenizer(dir, device).ok();
+    let detok = load_detokenizer(dir, dtype, device).ok();
     let proc = LFM2AudioProcessor::new(tokenizer, audio, detok, device.clone());
 
     Ok((model, proc))
 }
 
 /// Load the LFM2.5 audio detokenizer from `<dir>/audio_detokenizer/` if present.
-fn load_detokenizer(dir: &Path, device: &Device) -> Result<LFM2AudioDetokenizer> {
+fn load_detokenizer(dir: &Path, dtype: DType, device: &Device) -> Result<LFM2AudioDetokenizer> {
     let detok_dir = dir.join("audio_detokenizer");
     let mut cfg: Value = serde_json::from_str(&fs::read_to_string(detok_dir.join("config.json")).map_err(err)?).map_err(err)?;
     // llama.cpp → transformers compat: "sliding_attention" → "full_attention"
@@ -100,6 +117,6 @@ fn load_detokenizer(dir: &Path, device: &Device) -> Result<LFM2AudioDetokenizer>
     let sliding_window = cfg["sliding_window"].as_u64().unwrap_or(30) as usize;
     let lfm_cfg: Lfm2Config = serde_json::from_value(cfg).map_err(err)?;
     let safes = safetensors_in(&detok_dir)?;
-    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&safes, DType::F32, device)? };
+    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&safes, dtype, device)? };
     LFM2AudioDetokenizer::new(lfm_cfg, sliding_window, vb)
 }

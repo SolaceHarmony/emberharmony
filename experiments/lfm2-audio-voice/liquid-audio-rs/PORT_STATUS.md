@@ -25,10 +25,19 @@ run it with the model present to close the parity column).
 | `moshi/*` | 8715 | — | ♻ reuse the `moshi` crate (Kyutai's own Rust port — identical upstream) |
 
 ## Remaining refinements (documented, non-structural)
-- **Sampling**: greedy (argmax) for text + audio; temperature/top-k (multinomial) not yet ported.
+- **Sampling**: ✅ done — greedy + temperature/top-k (multinomial via seeded
+  `StdRng`) for text and audio, faithful to `_sample_text_token` /
+  `_sample_audio_frame`; `GenParams` threaded through `generate_interleaved` and
+  the now-ported `generate_sequential`. Unit-tested (greedy/top-k/determinism).
+- **dtype**: ✅ resolved — `from_pretrained(dir, dtype, device)` mirrors the
+  Python `dtype=` kwarg. The on-disk checkpoint is bf16, so `DType::F32` loads
+  the *exact* bf16-rounded weights and upcasts (bf16→f32 is lossless): the weight
+  values already match the deployed model, and compute is simply more precise.
+  The parity reference is dumped at `torch.float32`, so there is no dtype gap
+  against it. True in-memory bf16 is accepted for CUDA/Metal but rejected on CPU
+  (candle has no CPU bf16 matmul kernel) with a clear error.
 - **hf-hub auto-download**: `get_model_dir` takes a local dir; repo auto-download is a follow-up.
 - **Mimi audio-out (v1)**: the LFM2.5 detokenizer path is ported; the v1 `processor.mimi` (moshi-crate) decode path is deferred.
-- **dtype**: weights load f32 (Python bf16) — small expected diffs; a bf16 path would tighten parity.
 - **Parity**: harness built (PARITY.md); run against the model to verify the numbers.
 
 ## IO model (faithful to Python)

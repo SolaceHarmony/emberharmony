@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use candle_core::{Device, Tensor};
+use candle_core::{DType, Device, Tensor};
 
 fn rel_err(a: &Tensor, b: &Tensor) -> f32 {
     let a = a.flatten_all().unwrap().to_dtype(candle_core::DType::F32).unwrap();
@@ -26,7 +26,8 @@ fn front_end_parity() -> anyhow::Result<()> {
     let refs = candle_core::safetensors::load(&refs_path, &device)?;
     let wav = refs.get("wav").expect("wav in refs").clone();
 
-    let (model, proc) = liquid_audio::from_pretrained(Path::new(&dir), &device)?;
+    // f32 to match the reference dump (dump_reference.py uses dtype=torch.float32).
+    let (model, proc) = liquid_audio::from_pretrained(Path::new(&dir), DType::F32, &device)?;
 
     // mel featurizer
     let mel = proc.audio.forward(&wav)?;
