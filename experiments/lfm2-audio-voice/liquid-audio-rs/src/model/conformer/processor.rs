@@ -43,6 +43,11 @@ impl FilterbankFeatures {
         Ok(Self { cfg, window, fb, device })
     }
 
+    /// Number of mel bins (encoder `feat_in`).
+    pub fn nfilt(&self) -> usize {
+        self.cfg.nfilt
+    }
+
     /// Window padded (centered) to n_fft, as torch.stft does for win_length < n_fft.
     fn padded_window(&self) -> Vec<f32> {
         let n = self.cfg.n_fft;

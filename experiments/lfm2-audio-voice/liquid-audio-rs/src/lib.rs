@@ -13,10 +13,11 @@
 
 pub mod detokenizer; // detokenizer.py
 pub mod model;
+pub mod processor; // processor.py
 pub mod utils;
-// pub mod processor;     // processor.py
 
 pub use detokenizer::LFM2AudioDetokenizer;
+pub use processor::{ChatState, LFM2AudioProcessor};
 pub use utils::LFMModality;
 // pub use model::lfm2_audio::LFM2AudioModel;
 // pub use processor::{ChatState, LFM2AudioProcessor};

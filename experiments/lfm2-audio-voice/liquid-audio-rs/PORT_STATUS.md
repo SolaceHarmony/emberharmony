@@ -9,10 +9,10 @@ Python with shared weights + fixed inputs.
 |---|---:|---|---|---|
 | `utils.py` | 54 | `src/utils.rs` | **partial** | `LFMModality`, `mel2emb_len`, `emb2mel_len`, `module_exists` ported; `get_model_dir` lands with `processor.rs` (its consumer, needs hf-hub) |
 | `model/mlp.py` | 40 | `src/model/mlp.rs` | **done** | candle `Sequential`; GELU = erf (matches `nn.GELU()`); weight indices mirror `nn.Sequential` |
-| `processor.py` | 269 | `src/processor.rs` | pending | tokenizer (`tokenizers`), mel preprocessor, Mimi decode (via `moshi` crate), `ChatState` |
+| `processor.py` | 269 | `src/processor.rs` | **done (compiles; parity pending)** | tokenizer (`tokenizers`), mel preprocessor, Mimi decode (via `moshi` crate), `ChatState` |
 | `model/transformer.py` | 578 | `src/model/transformer.rs` | **done (compiles; parity pending)** | LFM2 backbone (own impl, not HF Lfm2): RMSNorm, SwiGLU GLU, BoundedAttention (GQA + qk-RMSNorm + interleaved RoPE via `rope_i`), MHA, StandardBlock, SharedEmbedding (tied), RawLmBackbone, LayerKvCache. Training-only bits (init scales, activation checkpoint, `forward_cached` split) omitted |
 | `detokenizer.py` | 136 | `src/detokenizer.rs` | **done (compiles; parity pending)** | FusedEmbedding + Vocos-style ISTFT (needs inverse FFT via `rustfft` + overlap-add `fold`) + Lfm2Model backbone |
-| `processor.py` | 269 | `src/processor.rs` | pending | tokenizer (`tokenizers`), mel preprocessor, Mimi decode (via `moshi` crate), `ChatState` |
+| `processor.py` | 269 | `src/processor.rs` | **done (compiles; parity pending)** | tokenizer (`tokenizers`), mel preprocessor, Mimi decode (via `moshi` crate), `ChatState` |
 | `model/lfm2_audio.py` | 534 | `src/model/lfm2_audio.rs` | pending | `LFM2AudioModel` + `generate_interleaved` (sync streaming iterator) |
 | (HF transformers `Lfm2Model`) | ~660 | `src/model/lfm2_hf.rs` | **done (compiles; parity pending)** | main LFM2 backbone (hybrid short-conv + GQA attn), adapted from candle main lfm2.rs to candle 0.9; returns all-position hidden state + custom-mask forward |
 | `model/conformer/utils.py` | 112 | — | **skip** | autocast/streaming/stochastic-depth helpers — not on inference path |
