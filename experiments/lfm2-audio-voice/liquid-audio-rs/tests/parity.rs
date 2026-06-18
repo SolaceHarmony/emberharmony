@@ -79,8 +79,9 @@ fn conformer_stages_parity() -> anyhow::Result<()> {
 #[test]
 #[ignore = "needs LFM_MODEL_DIR (loads the Mimi weights shipped in the repo)"]
 fn mimi_decode_smoke() -> anyhow::Result<()> {
-    // Pure-candle audio-out: the Kyutai Mimi codec from candle-transformers
-    // decodes 8-codebook tokens to a 24 kHz waveform. No torch, no moshi crate.
+    // Pure-candle audio-out through the AudioDetokenizer trait: for the v1 1.5B
+    // model (no audio_detokenizer/ subdir) the backend resolves to the Kyutai
+    // Mimi codec (moshi crate), decoding 8-codebook tokens to 24 kHz. No torch.
     let dir = std::env::var("LFM_MODEL_DIR").expect("set LFM_MODEL_DIR");
     let device = Device::Cpu;
     let (_model, proc) = liquid_audio::from_pretrained(Path::new(&dir), DType::F32, &device)?;
@@ -90,7 +91,7 @@ fn mimi_decode_smoke() -> anyhow::Result<()> {
     let codes: Vec<u32> = (0..k * t).map(|i| (i * 37 % 2048) as u32).collect();
     let codes = Tensor::from_vec(codes, (1, k, t), &device)?;
 
-    let wav = proc.mimi_decode(&codes)?;
+    let wav = proc.decode(&codes)?;
     let flat = wav.flatten_all()?.to_dtype(DType::F32)?;
     let n = flat.dims1()?;
     let max = flat.abs()?.max(0)?.to_scalar::<f32>()?;

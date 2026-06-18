@@ -11,12 +11,14 @@
 //! from liquid_audio.utils import LFMModality
 //! ```
 
+pub mod audio_out; // AudioDetokenizer trait + backends (LFM2 detok / Mimi)
 pub mod detokenizer; // detokenizer.py
 pub mod loader; // config.json + safetensors → model + processor
 pub mod model;
 pub mod processor; // processor.py
 pub mod utils;
 
+pub use audio_out::{AudioDetokenizer, MimiDetokenizer};
 pub use detokenizer::LFM2AudioDetokenizer;
 pub use loader::{from_pretrained, from_pretrained_hub};
 pub use model::lfm2_audio::{GenParams, GenToken, LFM2AudioModel};

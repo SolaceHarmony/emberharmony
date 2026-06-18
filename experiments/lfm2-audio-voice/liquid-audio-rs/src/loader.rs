@@ -23,6 +23,8 @@ use candle_nn::VarBuilder;
 use moshi::mimi;
 use serde_json::Value;
 
+use crate::audio_out::{AudioDetokenizer, MimiDetokenizer};
+
 use crate::detokenizer::LFM2AudioDetokenizer;
 use crate::model::conformer::encoder::ConformerEncoderConfig;
 use crate::model::conformer::processor::FilterbankFeatures;
@@ -111,9 +113,14 @@ pub fn from_pretrained(dir: &Path, dtype: DType, device: &Device) -> Result<(LFM
     let prep: PreprocessorConfig = serde_json::from_value(config["preprocessor"].clone()).map_err(err)?;
     let audio = FilterbankFeatures::new(prep.mel_config(), device)?;
     let tokenizer = LFM2AudioProcessor::load_tokenizer(dir)?;
-    let detok = load_detokenizer(dir, dtype, device).ok();
-    let mimi = load_mimi(dir, codebooks, device)?;
-    let proc = LFM2AudioProcessor::new(tokenizer, audio, detok, mimi, device.clone());
+    // Audio-out backend, behind the AudioDetokenizer trait: prefer the in-tree
+    // LFM2 detokenizer (LFM2.5 models, `audio_detokenizer/`); else the Mimi codec
+    // (v1 models, `tokenizer-…checkpoint125.safetensors`).
+    let audio_out: Option<Box<dyn AudioDetokenizer>> = match load_detokenizer(dir, dtype, device).ok() {
+        Some(d) => Some(Box::new(d)),
+        None => load_mimi(dir, codebooks, device)?.map(|m| Box::new(MimiDetokenizer::new(m)) as Box<dyn AudioDetokenizer>),
+    };
+    let proc = LFM2AudioProcessor::new(tokenizer, audio, audio_out, device.clone());
 
     Ok((model, proc))
 }
