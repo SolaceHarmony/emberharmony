@@ -12,11 +12,14 @@
 //! ```
 
 pub mod detokenizer; // detokenizer.py
+pub mod loader; // config.json + safetensors → model + processor
 pub mod model;
 pub mod processor; // processor.py
 pub mod utils;
 
 pub use detokenizer::LFM2AudioDetokenizer;
+pub use loader::from_pretrained;
+pub use model::lfm2_audio::{GenToken, LFM2AudioModel};
 pub use processor::{ChatState, LFM2AudioProcessor};
 pub use utils::LFMModality;
 // pub use model::lfm2_audio::LFM2AudioModel;

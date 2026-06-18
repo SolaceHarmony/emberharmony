@@ -1,0 +1,105 @@
+//! Model loading — `config.json` → configs → safetensors VarBuilder → model.
+//!
+//! Mirrors `LFM2AudioModel.from_pretrained` / `LFM2AudioProcessor.from_pretrained`:
+//! parse the config, construct the typed configs, memory-map the safetensors, and
+//! build the model + processor. Weights are loaded as f32 (CPU/Metal friendly;
+//! bf16 parity is a config knob for later). Expects a local model directory
+//! (download the HF repo first; hf-hub auto-download is a follow-up).
+
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use candle_core::{DType, Device, Result};
+use candle_nn::VarBuilder;
+use serde_json::Value;
+
+use crate::detokenizer::LFM2AudioDetokenizer;
+use crate::model::conformer::encoder::ConformerEncoderConfig;
+use crate::model::conformer::processor::FilterbankFeatures;
+use crate::model::lfm2_audio::{DepthformerConfig, LFM2AudioModel};
+use crate::model::lfm2_hf::Lfm2Config;
+use crate::processor::{LFM2AudioProcessor, PreprocessorConfig};
+
+fn err(e: impl std::fmt::Display) -> candle_core::Error {
+    candle_core::Error::Msg(e.to_string())
+}
+
+fn safetensors_in(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    for entry in fs::read_dir(dir).map_err(err)? {
+        let p = entry.map_err(err)?.path();
+        if p.extension().and_then(|e| e.to_str()) == Some("safetensors") {
+            out.push(p);
+        }
+    }
+    if out.is_empty() {
+        return Err(err(format!("no .safetensors in {}", dir.display())));
+    }
+    out.sort();
+    Ok(out)
+}
+
+fn parse_encoder(e: &Value) -> ConformerEncoderConfig {
+    let u = |k: &str| e[k].as_u64().unwrap_or(0) as usize;
+    let feat_out = e["feat_out"].as_i64().unwrap_or(-1);
+    let conv_ch = e["subsampling_conv_channels"].as_i64().unwrap_or(-1);
+    ConformerEncoderConfig {
+        feat_in: u("feat_in"),
+        feat_out: if feat_out > 0 { feat_out as usize } else { 0 },
+        n_layers: u("n_layers"),
+        d_model: u("d_model"),
+        subsampling_factor: u("subsampling_factor"),
+        subsampling_conv_channels: if conv_ch > 0 { conv_ch as usize } else { 0 },
+        ff_expansion_factor: u("ff_expansion_factor"),
+        n_heads: u("n_heads"),
+        conv_kernel_size: u("conv_kernel_size"),
+        xscaling: e["xscaling"].as_bool().unwrap_or(true),
+    }
+}
+
+/// Load the main model + processor from a local model directory.
+pub fn from_pretrained(dir: &Path, device: &Device) -> Result<(LFM2AudioModel, LFM2AudioProcessor)> {
+    let config: Value = serde_json::from_str(&fs::read_to_string(dir.join("config.json")).map_err(err)?).map_err(err)?;
+
+    let lfm_cfg: Lfm2Config = serde_json::from_value(config["lfm"].clone()).map_err(err)?;
+    let enc_cfg = parse_encoder(&config["encoder"]);
+    let depth_cfg = DepthformerConfig {
+        layers: config["depthformer"]["layers"].as_u64().unwrap_or(0) as usize,
+        dim: config["depthformer"]["dim"].as_u64().unwrap_or(0) as usize,
+        tie: config["depthformer"]["tie"].as_bool().unwrap_or(true),
+    };
+    let codebooks = config["codebooks"].as_u64().unwrap_or(8) as usize;
+    let n_text = config["interleaved_n_text"].as_u64().unwrap_or(1) as usize;
+    let n_audio = config["interleaved_n_audio"].as_u64().unwrap_or(1) as usize;
+
+    let safes = safetensors_in(dir)?;
+    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&safes, DType::F32, device)? };
+    let model = LFM2AudioModel::new(lfm_cfg, &enc_cfg, &depth_cfg, codebooks, n_text, n_audio, vb)?;
+
+    let prep: PreprocessorConfig = serde_json::from_value(config["preprocessor"].clone()).map_err(err)?;
+    let audio = FilterbankFeatures::new(prep.mel_config(), device)?;
+    let tokenizer = LFM2AudioProcessor::load_tokenizer(dir)?;
+    let detok = load_detokenizer(dir, device).ok();
+    let proc = LFM2AudioProcessor::new(tokenizer, audio, detok, device.clone());
+
+    Ok((model, proc))
+}
+
+/// Load the LFM2.5 audio detokenizer from `<dir>/audio_detokenizer/` if present.
+fn load_detokenizer(dir: &Path, device: &Device) -> Result<LFM2AudioDetokenizer> {
+    let detok_dir = dir.join("audio_detokenizer");
+    let mut cfg: Value = serde_json::from_str(&fs::read_to_string(detok_dir.join("config.json")).map_err(err)?).map_err(err)?;
+    // llama.cpp → transformers compat: "sliding_attention" → "full_attention"
+    if let Some(arr) = cfg["layer_types"].as_array_mut() {
+        for v in arr.iter_mut() {
+            if v.as_str() == Some("sliding_attention") {
+                *v = Value::String("full_attention".into());
+            }
+        }
+    }
+    let sliding_window = cfg["sliding_window"].as_u64().unwrap_or(30) as usize;
+    let lfm_cfg: Lfm2Config = serde_json::from_value(cfg).map_err(err)?;
+    let safes = safetensors_in(&detok_dir)?;
+    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&safes, DType::F32, device)? };
+    LFM2AudioDetokenizer::new(lfm_cfg, sliding_window, vb)
+}

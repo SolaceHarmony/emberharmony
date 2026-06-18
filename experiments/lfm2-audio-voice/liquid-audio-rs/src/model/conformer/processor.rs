@@ -8,12 +8,12 @@
 //! Training-only bits (dither, nb-augmentation, frame splicing) are skipped.
 
 use candle_core::{Device, Result, Tensor};
-use candle_nn::VarBuilder;
 use rustfft::{num_complex::Complex, FftPlanner};
 
 /// Subset of NeMo's preprocessor config needed offline.
 #[derive(Debug, Clone)]
 pub struct MelConfig {
+    pub sample_rate: usize,     // 16000
     pub n_window_size: usize,   // win_length (e.g. 400)
     pub n_window_stride: usize, // hop_length (e.g. 160)
     pub n_fft: usize,           // e.g. 512
@@ -22,6 +22,70 @@ pub struct MelConfig {
     pub log_zero_guard_value: f64, // 2^-24
     pub mag_power: f64,         // 2.0
     pub pad_to: usize,          // 16
+}
+
+/// Symmetric Hann window (`periodic=False`), faithful to `torch.hann_window(N, periodic=False)`.
+fn hann(n: usize) -> Vec<f32> {
+    if n == 1 {
+        return vec![1.0];
+    }
+    (0..n)
+        .map(|i| 0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / (n as f64 - 1.0)).cos())
+        .map(|w| w as f32)
+        .collect()
+}
+
+// librosa slaney mel scale.
+fn hz_to_mel(f: f64) -> f64 {
+    let f_sp = 200.0 / 3.0;
+    let min_log_hz = 1000.0;
+    let min_log_mel = min_log_hz / f_sp;
+    let logstep = (6.4f64).ln() / 27.0;
+    if f >= min_log_hz {
+        min_log_mel + (f / min_log_hz).ln() / logstep
+    } else {
+        f / f_sp
+    }
+}
+fn mel_to_hz(m: f64) -> f64 {
+    let f_sp = 200.0 / 3.0;
+    let min_log_hz = 1000.0;
+    let min_log_mel = min_log_hz / f_sp;
+    let logstep = (6.4f64).ln() / 27.0;
+    if m >= min_log_mel {
+        min_log_hz * (logstep * (m - min_log_mel)).exp()
+    } else {
+        f_sp * m
+    }
+}
+
+/// `librosa.filters.mel(sr, n_fft, n_mels, fmin=0, fmax=sr/2, norm="slaney")`,
+/// returned flattened `(nfilt * freq)` row-major. `freq = n_fft/2+1`.
+fn mel_filterbank(sr: usize, n_fft: usize, n_mels: usize) -> Vec<f32> {
+    let freq = n_fft / 2 + 1;
+    let fmin = 0.0;
+    let fmax = sr as f64 / 2.0;
+    let fft_freqs: Vec<f64> = (0..freq).map(|k| k as f64 * sr as f64 / n_fft as f64).collect();
+    let mel_min = hz_to_mel(fmin);
+    let mel_max = hz_to_mel(fmax);
+    let mel_pts: Vec<f64> = (0..n_mels + 2)
+        .map(|i| mel_to_hz(mel_min + (mel_max - mel_min) * i as f64 / (n_mels + 1) as f64))
+        .collect();
+
+    let mut fb = vec![0f32; n_mels * freq];
+    for m in 0..n_mels {
+        let lower = mel_pts[m];
+        let center = mel_pts[m + 1];
+        let upper = mel_pts[m + 2];
+        let enorm = 2.0 / (upper - lower); // slaney normalization
+        for (k, &f) in fft_freqs.iter().enumerate() {
+            let down = (f - lower) / (center - lower);
+            let up = (upper - f) / (upper - center);
+            let w = down.min(up).max(0.0);
+            fb[m * freq + k] = (w * enorm) as f32;
+        }
+    }
+    fb
 }
 
 const CONSTANT: f64 = 1e-5;
@@ -34,13 +98,14 @@ pub struct FilterbankFeatures {
 }
 
 impl FilterbankFeatures {
-    pub fn new(cfg: MelConfig, vb: VarBuilder) -> Result<Self> {
-        let window = vb.get(cfg.n_window_size, "window")?.to_dtype(candle_core::DType::F32)?.to_vec1::<f32>()?;
+    /// Computes the Hann window and slaney mel filterbank (as the Python
+    /// preprocessor does at init — they are not checkpoint tensors).
+    pub fn new(cfg: MelConfig, device: &Device) -> Result<Self> {
+        let window = hann(cfg.n_window_size);
         let freq = cfg.n_fft / 2 + 1;
-        // fb is registered as (1, nfilt, freq); accept either shape.
-        let fb = vb.get((1, cfg.nfilt, freq), "fb")?.reshape((cfg.nfilt, freq))?.to_dtype(candle_core::DType::F32)?;
-        let device = vb.device().clone();
-        Ok(Self { cfg, window, fb, device })
+        let fb_data = mel_filterbank(cfg.sample_rate, cfg.n_fft, cfg.nfilt);
+        let fb = Tensor::from_vec(fb_data, (cfg.nfilt, freq), device)?;
+        Ok(Self { cfg, window, fb, device: device.clone() })
     }
 
     /// Number of mel bins (encoder `feat_in`).

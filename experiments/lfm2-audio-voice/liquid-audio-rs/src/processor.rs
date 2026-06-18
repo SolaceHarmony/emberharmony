@@ -38,6 +38,7 @@ impl PreprocessorConfig {
     /// Used by the model builder (lfm2_audio) to construct the featurizer.
     pub fn mel_config(&self) -> MelConfig {
         MelConfig {
+            sample_rate: self.sample_rate,
             n_window_size: (self.window_size * self.sample_rate as f64).round() as usize,
             n_window_stride: (self.window_stride * self.sample_rate as f64).round() as usize,
             n_fft: self.n_fft,
