@@ -213,6 +213,22 @@ impl LFM2AudioModel {
         self.conformer.subsampling_conv_out(mel)
     }
 
+    /// Debug: full causal forward of the `lfm` backbone over `embeds` (1,L,H),
+    /// returning the normed all-position hidden state — for backbone parity.
+    #[doc(hidden)]
+    pub fn backbone_forward_embeds(&self, embeds: &Tensor) -> Result<Tensor> {
+        let mut cache = LfmCache::new(true, embeds.dtype(), &self.lfm_cfg, embeds.device())?;
+        self.lfm.forward_embeds(embeds, 0, &mut cache, None)
+    }
+
+    /// Debug: greedy depthformer audio frame (8 codebook tokens) for a fixed
+    /// `embedding` (H,) — for depthformer parity (token-exact vs Python greedy).
+    #[doc(hidden)]
+    pub fn audio_frame_greedy(&self, embedding: &Tensor) -> Result<Vec<u32>> {
+        let mut rng = StdRng::seed_from_u64(0); // unused on the greedy path
+        self.sample_audio_frame(embedding, None, None, &mut rng)
+    }
+
     /// Build the prefill input embeddings, scattering text / audio-in / audio-out
     /// embeddings into sequence order by `modality_flag` (index_select instead of
     /// PyTorch boolean assignment).
@@ -306,8 +322,11 @@ impl LFM2AudioModel {
     /// `_sample_audio_frame`: per-codebook greedy/temperature/top-k via
     /// [`sample_token`].
     fn sample_audio_frame(&self, embedding: &Tensor, temperature: Option<f64>, top_k: Option<usize>, rng: &mut StdRng) -> Result<Vec<u32>> {
-        // depth_linear(embedding) → (codebooks, depthformer_dim)
-        let din = self.depth_linear.forward(embedding)?.reshape((self.codebooks, self.depthformer_dim))?;
+        // depth_linear(embedding) → (codebooks, depthformer_dim). `embedding` is a
+        // 1-D (D,) lfm hidden; candle's Linear needs a 2-D input, so add a row dim
+        // (Python's nn.Linear accepts the 1-D vector directly).
+        let emb2d = embedding.flatten_all()?.unsqueeze(0)?; // (1, D)
+        let din = self.depth_linear.forward(&emb2d)?.reshape((self.codebooks, self.depthformer_dim))?;
         let mut df_token = Tensor::zeros((self.depthformer_dim,), din.dtype(), din.device())?;
         let mut caches: Vec<LayerKvCache> = (0..self.depthformer.layers.len()).map(|_| LayerKvCache::new()).collect();
         let mut out = Vec::with_capacity(self.codebooks);

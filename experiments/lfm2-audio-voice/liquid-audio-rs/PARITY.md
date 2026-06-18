@@ -77,7 +77,11 @@ accessors (`conformer_encode`, and add accessors for prefill / step as needed).
 - **FastConformer encoder**: ✅ verified end-to-end and per-stage (≤ 1.6e-6) — the
   manual rel-pos attention path, dw_striding subsampling, conv (batch_norm), and
   macaron FFN all match.
-- **backbone / depthformer / detokenizer**: not yet parity-run. The `lfm` backbone
-  weight-key layout is now confirmed against the real checkpoint; RoPE is standard
-  `rope` on the backbone vs interleaved `rope_i` on the depthformer — a backbone
-  `forward_embeds` vs `lfm(inputs_embeds)` check is the natural next tap.
+- **lfm backbone**: ✅ verified (6.6e-6) — `forward_embeds` vs `lfm(inputs_embeds)`
+  over a 24-token sequence; hybrid short-conv + GQA attention + standard RoPE match.
+- **depthformer**: ✅ verified token-exact — greedy 8-codebook audio frame for a
+  fixed lfm-hidden vector; interleaved `rope_i` + per-codebook autoregression match.
+  (This run found a latent 1-D `Linear` bug in the sampler.)
+- **detokenizer (audio-out)**: not yet run — needs the `audio_detokenizer/` weights,
+  which the 1.5B repo omits (it ships the v1 Mimi codec path instead). Deferred
+  alongside the v1 `processor.mimi` decode.

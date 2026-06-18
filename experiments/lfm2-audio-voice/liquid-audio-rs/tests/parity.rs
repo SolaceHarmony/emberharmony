@@ -77,6 +77,41 @@ fn conformer_stages_parity() -> anyhow::Result<()> {
 }
 
 #[test]
+#[ignore = "needs LFM_MODEL_DIR + parity/golden/depthformer_refs.safetensors"]
+fn depthformer_parity() -> anyhow::Result<()> {
+    let dir = std::env::var("LFM_MODEL_DIR").expect("set LFM_MODEL_DIR");
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let device = Device::Cpu;
+    let refs = candle_core::safetensors::load(manifest.join("parity/golden/depthformer_refs.safetensors"), &device)?;
+    let embedding = refs.get("embedding").expect("embedding").clone();
+    let want: Vec<u32> = refs.get("tokens").expect("tokens").to_dtype(DType::U32)?.to_vec1::<u32>()?;
+
+    let (model, _) = liquid_audio::from_pretrained(Path::new(&dir), DType::F32, &device)?;
+    let got = model.audio_frame_greedy(&embedding)?;
+    println!("depthformer rust {got:?}  ref {want:?}");
+    assert_eq!(got, want, "depthformer greedy tokens differ");
+    Ok(())
+}
+
+#[test]
+#[ignore = "needs LFM_MODEL_DIR + parity/golden/backbone_refs.safetensors"]
+fn backbone_parity() -> anyhow::Result<()> {
+    let dir = std::env::var("LFM_MODEL_DIR").expect("set LFM_MODEL_DIR");
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let device = Device::Cpu;
+    let refs = candle_core::safetensors::load(manifest.join("parity/golden/backbone_refs.safetensors"), &device)?;
+    let embeds = refs.get("embeds").expect("embeds").clone();
+
+    let (model, _) = liquid_audio::from_pretrained(Path::new(&dir), DType::F32, &device)?;
+    let got = model.backbone_forward_embeds(&embeds)?;
+    let want = refs.get("backbone").expect("backbone");
+    let e = rel_err(&got, want);
+    println!("backbone rel-err: {e:.3e}  shape {:?}", got.dims());
+    assert!(e < 2e-2, "backbone parity failed: {e}");
+    Ok(())
+}
+
+#[test]
 #[ignore = "needs LFM_MODEL_DIR + parity/golden/refs.safetensors"]
 fn front_end_parity() -> anyhow::Result<()> {
     let dir = std::env::var("LFM_MODEL_DIR").expect("set LFM_MODEL_DIR to the local model dir");
