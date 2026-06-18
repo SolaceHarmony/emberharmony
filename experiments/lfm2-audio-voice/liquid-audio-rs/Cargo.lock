@@ -633,6 +633,7 @@ dependencies = [
  "anyhow",
  "candle-core",
  "candle-nn",
+ "rand 0.8.6",
  "rustfft",
  "serde",
  "serde_json",

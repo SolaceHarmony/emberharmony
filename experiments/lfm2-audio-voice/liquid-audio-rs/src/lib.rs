@@ -19,7 +19,7 @@ pub mod utils;
 
 pub use detokenizer::LFM2AudioDetokenizer;
 pub use loader::from_pretrained;
-pub use model::lfm2_audio::{GenToken, LFM2AudioModel};
+pub use model::lfm2_audio::{GenParams, GenToken, LFM2AudioModel};
 pub use processor::{ChatState, LFM2AudioProcessor};
 pub use utils::LFMModality;
 // pub use model::lfm2_audio::LFM2AudioModel;
