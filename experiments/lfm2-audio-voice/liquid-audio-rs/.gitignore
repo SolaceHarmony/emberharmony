@@ -1,1 +1,3 @@
 /target/
+# large regenerable stage-localization dump (run parity/dump_conformer_stages.py)
+parity/golden/conformer_stages.safetensors

@@ -23,22 +23,39 @@ one a masked pad column); the port now matches frame count, valid-range
 normalization, and tail masking. The committed `mel_refs.safetensors` (116 KB)
 makes the test re-runnable with no Python/network.
 
-## Tier 2 — conformer encoder + backbone (needs the weights)
+## Tier 2 — FastConformer encoder (needs the weights) ✅ VERIFIED
 
-1. Download the model locally (the Rust loader takes a local dir):
+1. Download the model locally (the Rust loader takes a local dir). The repo is
+   public and Python-env-light here (torchaudio is import-only on this path; the
+   dump scripts register a spec'd stub, so no torchaudio wheel is required):
    ```bash
-   huggingface-cli download LiquidAI/LFM2-Audio-1.5B --local-dir ./model
+   python -m pip install einops sentencepiece librosa   # no torchaudio needed
+   python -c "from huggingface_hub import snapshot_download as d; d('LiquidAI/LFM2-Audio-1.5B', local_dir='model')"
    ```
-2. Dump Python reference tensors (needs the full `liquid_audio` env):
+2. Dump Python reference tensors (full encoder + stage intermediates):
    ```bash
    python parity/dump_reference.py ./model parity/golden
+   python parity/dump_conformer_stages.py ./model parity/golden   # optional, for localization
    ```
-3. Run the Rust parity test (loads the same weights + input, compares):
+3. Run the Rust parity tests (load the same weights + input, compare):
    ```bash
    LFM_MODEL_DIR=./model cargo test --test parity -- --ignored --nocapture
    ```
 
-The test asserts relative error bounds per stage (mel ≤ 5e-3, conformer ≤ 2e-2).
+Result (LFM2-Audio-1.5B, f32, CPU): **mel 1.1e-5, conformer 8.3e-7**, and every
+stage near-exact — conv-stack 5.6e-7, subsampling-out 1.0e-6, pos-emb 9.5e-7,
+after-layer-0 1.1e-6, final 1.6e-6. Two bugs the harness caught and closed:
+- the `lfm.*` weight keys (bare HF `Lfm2Model`, no `.model.` wrapper; final norm
+  is `embedding_norm`) — fixed in `lfm2_hf.rs`;
+- the conformer **length** the model actually feeds is the full mel width
+  (`ChatState.add_audio` ⇒ `audio_in_lens = mel.shape[1]`), not the
+  preprocessor's valid `mel_len`; so a single clip gets no intermediate
+  `MaskedConvSequential` masking — which is exactly how the port encodes each
+  segment individually. (The earlier reference used `mel_len` and showed a
+  spurious 7% gap.)
+
+The stage test asserts ≤ 5e-3 per stage; the front-end test asserts mel ≤ 5e-3,
+conformer ≤ 2e-2.
 
 ## Coverage + how to extend
 
@@ -57,6 +74,10 @@ accessors (`conformer_encode`, and add accessors for prefill / step as needed).
 - **dtype**: the checkpoint is bf16; `DType::F32` loads those exact bf16 values
   upcast (lossless) — the parity reference is dumped at f32, so no dtype gap. CPU
   has no bf16 matmul kernel; bf16-in-memory is CUDA/Metal-only.
-- **conformer + backbone**: still to run (Tier 2 — needs the ~3 GB weights). The
-  encoder ports the manual-attention path; RoPE is standard `rope` on the backbone
-  vs interleaved `rope_i` on the depthformer — confirm per-module with Tier 2.
+- **FastConformer encoder**: ✅ verified end-to-end and per-stage (≤ 1.6e-6) — the
+  manual rel-pos attention path, dw_striding subsampling, conv (batch_norm), and
+  macaron FFN all match.
+- **backbone / depthformer / detokenizer**: not yet parity-run. The `lfm` backbone
+  weight-key layout is now confirmed against the real checkpoint; RoPE is standard
+  `rope` on the backbone vs interleaved `rope_i` on the depthformer — a backbone
+  `forward_embeds` vs `lfm(inputs_embeds)` check is the natural next tap.

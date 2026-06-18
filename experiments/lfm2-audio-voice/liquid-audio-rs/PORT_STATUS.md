@@ -43,10 +43,13 @@ run it with the model present to close the parity column).
   `download` feature (on by default). `from_pretrained_hub(repo_id, ...)` is the
   faithful repo-id entry point.
 - **Mimi audio-out (v1)**: the LFM2.5 detokenizer path is ported; the v1 `processor.mimi` (moshi-crate) decode path is deferred.
-- **Parity**: ✅ mel featurizer verified against the real upstream NeMo code
-  (rel-err 1.08e-5; no weights needed) — caught + fixed an STFT frame off-by-one
-  (`torch.stft(center=True)` emits `1 + L/hop` frames). Tier 2 (conformer +
-  backbone) needs the ~3 GB weights — workflow in PARITY.md.
+- **Parity**: ✅ front-end verified against the real upstream + actual weights
+  (LFM2-Audio-1.5B, f32, CPU): **mel 1.1e-5, FastConformer 8.3e-7**, every
+  conformer stage ≤ 1.6e-6. Caught + fixed: STFT frame off-by-one
+  (`torch.stft(center=True)` ⇒ `1 + L/hop` frames), the `lfm.*` weight-key layout
+  (bare `Lfm2Model`, `embedding_norm`), and the conformer length convention
+  (full mel width, not `mel_len`). Backbone/depthformer/detokenizer parity is the
+  documented next tap — workflow in PARITY.md.
 
 ## IO model (faithful to Python)
 - Model / `generate_interleaved`: synchronous streaming → Rust synchronous callback stream (no async).

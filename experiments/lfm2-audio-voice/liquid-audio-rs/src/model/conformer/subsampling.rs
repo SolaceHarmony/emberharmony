@@ -71,6 +71,16 @@ impl ConvSubsampling {
 
     /// `(B, T, feat_in)` → `(B, T', feat_out)`.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let x = self.forward_conv(x)?;
+        // (B, C, T', F') → (B, T', C*F')
+        let (b, c, t, f) = x.dims4()?;
+        let x = x.transpose(1, 2)?.contiguous()?.reshape((b, t, c * f))?;
+        self.out.forward(&x)
+    }
+
+    /// Debug: conv stack output `(B, C, T', F')` before the flatten + `out` linear.
+    #[doc(hidden)]
+    pub fn forward_conv(&self, x: &Tensor) -> Result<Tensor> {
         let mut x = x.unsqueeze(1)?; // (B, 1, T, F)
         for op in &self.layers {
             x = match op {
@@ -78,9 +88,6 @@ impl ConvSubsampling {
                 Op::Relu => x.relu()?,
             };
         }
-        // (B, C, T', F') → (B, T', C*F')
-        let (b, c, t, f) = x.dims4()?;
-        let x = x.transpose(1, 2)?.contiguous()?.reshape((b, t, c * f))?;
-        self.out.forward(&x)
+        Ok(x)
     }
 }

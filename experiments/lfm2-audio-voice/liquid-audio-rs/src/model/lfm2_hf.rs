@@ -347,14 +347,17 @@ pub struct Model {
 
 impl Model {
     pub fn new(cfg: &Lfm2Config, vb: VarBuilder) -> Result<Self> {
-        let vb_m = vb.pp("model");
-        let embed_tokens = embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
+        // `lfm` is a bare HF `Lfm2Model` (not `Lfm2ForCausalLM`), so weights sit
+        // directly under the given prefix — no `.model.` wrapper. Final norm is
+        // `embedding_norm` (verified against LFM2-Audio-1.5B's safetensors keys:
+        // lfm.embed_tokens / lfm.layers.N / lfm.embedding_norm).
+        let embed_tokens = embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("embed_tokens"))?;
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
-        let vb_l = vb_m.pp("layers");
+        let vb_l = vb.pp("layers");
         for i in 0..cfg.num_hidden_layers {
             layers.push(DecoderLayer::new(cfg, i, vb_l.pp(i.to_string()))?);
         }
-        let embedding_norm = rms_norm(cfg.hidden_size, cfg.norm_eps, vb_m.pp("embedding_norm"))?;
+        let embedding_norm = rms_norm(cfg.hidden_size, cfg.norm_eps, vb.pp("embedding_norm"))?;
         Ok(Self { embed_tokens, layers, embedding_norm })
     }
 

@@ -201,6 +201,18 @@ impl LFM2AudioModel {
         self.conformer.forward(mel)
     }
 
+    /// Debug: conformer stage intermediates for parity localization.
+    #[doc(hidden)]
+    pub fn conformer_stages(&self, mel: &Tensor) -> Result<(Tensor, Tensor, Tensor, Tensor, Tensor)> {
+        self.conformer.forward_stages(mel)
+    }
+
+    /// Debug: conformer subsampling conv-stack output (pre flatten+linear).
+    #[doc(hidden)]
+    pub fn conformer_sub_conv(&self, mel: &Tensor) -> Result<Tensor> {
+        self.conformer.subsampling_conv_out(mel)
+    }
+
     /// Build the prefill input embeddings, scattering text / audio-in / audio-out
     /// embeddings into sequence order by `modality_flag` (index_select instead of
     /// PyTorch boolean assignment).

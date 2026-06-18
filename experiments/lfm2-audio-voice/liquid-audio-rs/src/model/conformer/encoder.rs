@@ -73,4 +73,33 @@ impl ConformerEncoder {
         }
         x.transpose(1, 2)?.contiguous() // (B, d_out, T')
     }
+
+    /// Debug: conv-stack output `(B, C, T', F')` before subsampling's flatten+linear.
+    #[doc(hidden)]
+    pub fn subsampling_conv_out(&self, audio_signal: &Tensor) -> Result<Tensor> {
+        let x = audio_signal.transpose(1, 2)?.contiguous()?;
+        self.pre_encode.forward_conv(&x)
+    }
+
+    /// Debug variant returning stage intermediates for parity localization:
+    /// (post-subsampling, pos-encoded x, rel pos-emb, after-layer-0, final).
+    #[doc(hidden)]
+    pub fn forward_stages(&self, audio_signal: &Tensor) -> Result<(Tensor, Tensor, Tensor, Tensor, Tensor)> {
+        let x = audio_signal.transpose(1, 2)?.contiguous()?;
+        let sub = self.pre_encode.forward(&x)?;
+        let (mut x, pos_emb) = self.pos_enc.forward(&sub)?;
+        let posx = x.clone();
+        let mut layer0 = None;
+        for (i, layer) in self.layers.iter().enumerate() {
+            x = layer.forward(&x, None, &pos_emb, None)?;
+            if i == 0 {
+                layer0 = Some(x.clone());
+            }
+        }
+        if let Some(p) = &self.out_proj {
+            x = p.forward(&x)?;
+        }
+        let final_out = x.transpose(1, 2)?.contiguous()?;
+        Ok((sub, posx, pos_emb, layer0.unwrap(), final_out))
+    }
 }

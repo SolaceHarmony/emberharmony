@@ -52,7 +52,32 @@ fn mel_parity() -> anyhow::Result<()> {
 }
 
 #[test]
-#[ignore = "needs LFM_MODEL_DIR + parity/refs/refs.safetensors"]
+#[ignore = "needs LFM_MODEL_DIR + parity/golden/conformer_stages.safetensors"]
+fn conformer_stages_parity() -> anyhow::Result<()> {
+    let dir = std::env::var("LFM_MODEL_DIR").expect("set LFM_MODEL_DIR");
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let device = Device::Cpu;
+    let stages = candle_core::safetensors::load(manifest.join("parity/golden/conformer_stages.safetensors"), &device)?;
+    let refs = candle_core::safetensors::load(manifest.join("parity/golden/refs.safetensors"), &device)?;
+    let mel = refs.get("mel").expect("mel").clone();
+
+    let (model, _) = liquid_audio::from_pretrained(Path::new(&dir), DType::F32, &device)?;
+    let conv_out = model.conformer_sub_conv(&mel)?;
+    let (sub, posx, posemb, layer0, final_out) = model.conformer_stages(&mel)?;
+
+    // Stage-by-stage localization: subsampling conv stack → subsampling out →
+    // pos-encoded x → rel pos-emb → after layer 0 → final.
+    for (name, got) in [("conv_out", &conv_out), ("sub", &sub), ("posx", &posx), ("posemb", &posemb), ("layer0", &layer0), ("final", &final_out)] {
+        let want = stages.get(name).unwrap_or_else(|| panic!("{name} missing in ref"));
+        let e = rel_err(got, want);
+        println!("{name:8} rust {:?}  ref {:?}  rel-err {e:.3e}", got.dims(), want.dims());
+        assert!(e < 5e-3, "{name} parity failed: {e}");
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "needs LFM_MODEL_DIR + parity/golden/refs.safetensors"]
 fn front_end_parity() -> anyhow::Result<()> {
     let dir = std::env::var("LFM_MODEL_DIR").expect("set LFM_MODEL_DIR to the local model dir");
     let refs_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("parity/golden/refs.safetensors");
