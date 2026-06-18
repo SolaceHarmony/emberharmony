@@ -12,7 +12,7 @@
 //! See PORT_STATUS.md for the per-file mapping.
 
 pub mod mha;
-// pub mod modules;      // ConformerLayer / ConformerConvolution / FeedForward / CausalConv1D
+pub mod modules; // ConformerLayer / ConformerConvolution / FeedForward / CausalConv1D
 // pub mod subsampling;  // ConvSubsampling
 // pub mod encoder;      // ConformerEncoder
 // pub mod processor;    // AudioToMelSpectrogramPreprocessor (mel features)
