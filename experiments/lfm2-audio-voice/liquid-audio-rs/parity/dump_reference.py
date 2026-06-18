@@ -7,7 +7,7 @@ FastConformer encoder) and saves the intermediate tensors. The Rust side
 ported modules match within tolerance.
 
 Usage:
-    python parity/dump_reference.py /path/to/LFM2-Audio-1.5B parity/refs
+    python parity/dump_reference.py /path/to/LFM2-Audio-1.5B parity/golden
 
 Extend `refs` with prefill / lfm-hidden / first-token tensors to widen coverage.
 """
@@ -21,7 +21,7 @@ from liquid_audio import LFM2AudioModel, LFM2AudioProcessor
 
 def main() -> int:
     repo = sys.argv[1] if len(sys.argv) > 1 else "LiquidAI/LFM2-Audio-1.5B"
-    out = Path(sys.argv[2]) if len(sys.argv) > 2 else Path(__file__).parent / "refs"
+    out = Path(sys.argv[2]) if len(sys.argv) > 2 else Path(__file__).parent / "golden"
     out.mkdir(parents=True, exist_ok=True)
     device = "cpu"
 

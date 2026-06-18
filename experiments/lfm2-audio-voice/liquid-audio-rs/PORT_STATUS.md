@@ -43,7 +43,10 @@ run it with the model present to close the parity column).
   `download` feature (on by default). `from_pretrained_hub(repo_id, ...)` is the
   faithful repo-id entry point.
 - **Mimi audio-out (v1)**: the LFM2.5 detokenizer path is ported; the v1 `processor.mimi` (moshi-crate) decode path is deferred.
-- **Parity**: harness built (PARITY.md); run against the model to verify the numbers.
+- **Parity**: ✅ mel featurizer verified against the real upstream NeMo code
+  (rel-err 1.08e-5; no weights needed) — caught + fixed an STFT frame off-by-one
+  (`torch.stft(center=True)` emits `1 + L/hop` frames). Tier 2 (conformer +
+  backbone) needs the ~3 GB weights — workflow in PARITY.md.
 
 ## IO model (faithful to Python)
 - Model / `generate_interleaved`: synchronous streaming → Rust synchronous callback stream (no async).

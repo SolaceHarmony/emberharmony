@@ -133,8 +133,10 @@ impl FilterbankFeatures {
         let hop = self.cfg.n_window_stride;
         let n_fft = self.cfg.n_fft;
         let freq = n_fft / 2 + 1;
-        // get_seq_len (center): floor(L / hop)
-        let t = l / hop;
+        // torch.stft(center=True) emits `1 + L/hop` frames; NeMo's get_seq_len is
+        // floor(L/hop), so the trailing frame is a pad column (masked below).
+        let seq_len = l / hop;
+        let t = 1 + l / hop;
 
         // preemphasis: y[0]=x[0]; y[i]=x[i]-preemph*x[i-1]
         let pre = self.cfg.preemph as f32;
@@ -176,8 +178,15 @@ impl FilterbankFeatures {
         let mut mel = self.fb.matmul(&spec)?;
         // log(x + guard)
         mel = (mel + self.cfg.log_zero_guard_value)?.log()?;
-        // per-feature normalization over time (ddof=1)
-        mel = normalize_per_feature(&mel, t)?;
+        // per-feature normalization (ddof=1) over the valid frames only, applied
+        // to all frames — faithful to normalize_batch's valid_mask.
+        mel = normalize_per_feature(&mel, seq_len)?;
+        // mask the trailing pad frame(s) [seq_len, t) to pad_value (0).
+        if seq_len < t {
+            let valid = mel.narrow(1, 0, seq_len)?;
+            let pad = Tensor::zeros((self.cfg.nfilt, t - seq_len), mel.dtype(), &self.device)?;
+            mel = Tensor::cat(&[&valid, &pad], 1)?;
+        }
         // pad time to a multiple of pad_to with zeros
         if self.cfg.pad_to > 0 {
             let rem = t % self.cfg.pad_to;
@@ -190,12 +199,13 @@ impl FilterbankFeatures {
     }
 }
 
-/// `normalize_batch(..., "per_feature")` for a single full clip: mean/std over
-/// time per mel bin, std with ddof=1, `+ CONSTANT`.
-fn normalize_per_feature(x: &Tensor, t: usize) -> Result<Tensor> {
-    let mean = x.mean_keepdim(1)?;
-    let centered = x.broadcast_sub(&mean)?;
-    let var = (centered.sqr()?.sum_keepdim(1)? / (t as f64 - 1.0))?;
+/// `normalize_batch(..., "per_feature")` for a single clip: mean/std per mel bin
+/// over the first `valid` frames (std with ddof=1, `+ CONSTANT`), applied to ALL
+/// frames of `x` (the trailing pad frames are masked to 0 by the caller).
+fn normalize_per_feature(x: &Tensor, valid: usize) -> Result<Tensor> {
+    let xv = x.narrow(1, 0, valid)?;
+    let mean = xv.mean_keepdim(1)?;
+    let var = (xv.broadcast_sub(&mean)?.sqr()?.sum_keepdim(1)? / (valid as f64 - 1.0))?;
     let std = (var.sqrt()? + CONSTANT)?;
-    centered.broadcast_div(&std)
+    x.broadcast_sub(&mean)?.broadcast_div(&std)
 }
