@@ -47,8 +47,20 @@ pub fn module_exists(name: &str) -> bool {
     }
 }
 
-// `get_model_dir(repo_id, revision)` is ported alongside `processor.rs`
-// (its only consumer), where the `hf-hub` dependency is introduced.
+/// Resolve a model directory. Faithful to `get_model_dir`'s path branch: a local
+/// path is returned as-is. The repo-id branch (`snapshot_download`) is a
+/// follow-up (needs hf-hub) — for now download the HF repo and pass the path.
+pub fn get_model_dir(repo_or_path: &str) -> std::io::Result<std::path::PathBuf> {
+    let p = std::path::PathBuf::from(repo_or_path);
+    if p.is_dir() {
+        Ok(p)
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("{repo_or_path} is not a local dir; hf-hub auto-download not yet wired — clone the HF repo and pass its path"),
+        ))
+    }
+}
 
 #[cfg(test)]
 mod tests {

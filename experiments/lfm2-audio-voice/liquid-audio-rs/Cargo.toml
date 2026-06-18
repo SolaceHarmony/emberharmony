@@ -35,6 +35,9 @@ tokenizers = "0.20"
 #   hf-hub = "0.3"               # weight download (utils::get_model_dir, processor)
 #   safetensors = "0.4"          # weight loading
 
+[dev-dependencies]
+anyhow = "1"
+
 [features]
 # Mirrors the Python `module_exists("flash_attn")` optional path.
 flash-attn = []

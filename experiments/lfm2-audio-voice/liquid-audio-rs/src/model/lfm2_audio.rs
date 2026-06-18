@@ -110,6 +110,12 @@ impl LFM2AudioModel {
         })
     }
 
+    /// Run the FastConformer encoder over mel features `(B, feat_in, T)` →
+    /// `(B, d, T')`. Exposed for parity testing.
+    pub fn conformer_encode(&self, mel: &Tensor) -> Result<Tensor> {
+        self.conformer.forward(mel)
+    }
+
     /// Build the prefill input embeddings, scattering text / audio-in / audio-out
     /// embeddings into sequence order by `modality_flag` (index_select instead of
     /// PyTorch boolean assignment).
