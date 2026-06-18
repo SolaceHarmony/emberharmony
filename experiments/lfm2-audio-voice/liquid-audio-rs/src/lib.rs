@@ -11,12 +11,12 @@
 //! from liquid_audio.utils import LFMModality
 //! ```
 
+pub mod detokenizer; // detokenizer.py
 pub mod model;
 pub mod utils;
-// pub mod detokenizer;   // detokenizer.py
 // pub mod processor;     // processor.py
 
+pub use detokenizer::LFM2AudioDetokenizer;
 pub use utils::LFMModality;
-// pub use detokenizer::LFM2AudioDetokenizer;
 // pub use model::lfm2_audio::LFM2AudioModel;
 // pub use processor::{ChatState, LFM2AudioProcessor};
