@@ -11,7 +11,7 @@
 
 use std::path::{Path, PathBuf};
 
-use candle_core::{DType, Device, Tensor};
+use candle_core::{DType, Device, IndexOp, Tensor};
 
 use liquid_audio::model::conformer::processor::FilterbankFeatures;
 use liquid_audio::processor::PreprocessorConfig;
@@ -108,6 +108,14 @@ fn backbone_parity() -> anyhow::Result<()> {
     let e = rel_err(&got, want);
     println!("backbone rel-err: {e:.3e}  shape {:?}", got.dims());
     assert!(e < 2e-2, "backbone parity failed: {e}");
+
+    // text head: tied-embedding logits for the last position
+    let l = got.dim(1)?;
+    let h_last = got.i((0, l - 1))?.contiguous()?;
+    let logits = model.text_logits_of(&h_last)?;
+    let lt = rel_err(&logits, refs.get("text_logits").expect("text_logits"));
+    println!("text_logits rel-err: {lt:.3e}  shape {:?}", logits.dims());
+    assert!(lt < 2e-2, "text_logits parity failed: {lt}");
     Ok(())
 }
 

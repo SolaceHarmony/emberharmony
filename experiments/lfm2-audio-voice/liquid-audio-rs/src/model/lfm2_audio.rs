@@ -221,6 +221,13 @@ impl LFM2AudioModel {
         self.lfm.forward_embeds(embeds, 0, &mut cache, None)
     }
 
+    /// Debug: tied-embedding text logits for a single hidden vector (H,) — the
+    /// text head used in generation.
+    #[doc(hidden)]
+    pub fn text_logits_of(&self, hidden_last: &Tensor) -> Result<Tensor> {
+        self.text_logits(hidden_last)
+    }
+
     /// Debug: greedy depthformer audio frame (8 codebook tokens) for a fixed
     /// `embedding` (H,) — for depthformer parity (token-exact vs Python greedy).
     #[doc(hidden)]

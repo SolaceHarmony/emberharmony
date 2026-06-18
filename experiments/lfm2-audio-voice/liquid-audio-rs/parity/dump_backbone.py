@@ -41,10 +41,13 @@ def main() -> int:
 
     with torch.no_grad():
         out_hidden = model.lfm(inputs_embeds=embeds, use_cache=False).last_hidden_state
+        # text head: tied-embedding logits for the last position (as in generate)
+        text_logits = torch.nn.functional.linear(out_hidden[0, -1], model.lfm.embed_tokens.weight)
 
     refs = {
         "embeds": embeds.contiguous(),       # (1, L, H)
         "backbone": out_hidden.to(torch.float32).contiguous(),  # (1, L, H)
+        "text_logits": text_logits.to(torch.float32).contiguous(),  # (vocab,)
     }
     save_file(refs, str(out / "backbone_refs.safetensors"))
     print("dumped:", {k: tuple(v.shape) for k, v in refs.items()})
