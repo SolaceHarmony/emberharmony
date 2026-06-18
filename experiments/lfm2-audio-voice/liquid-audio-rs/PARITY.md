@@ -87,6 +87,11 @@ accessors (`conformer_encode`, and add accessors for prefill / step as needed).
 - **depthformer**: ✅ verified token-exact — greedy 8-codebook audio frame for a
   fixed lfm-hidden vector; interleaved `rope_i` + per-codebook autoregression match.
   (This run found a latent 1-D `Linear` bug in the sampler.)
-- **detokenizer (audio-out)**: not yet run — needs the `audio_detokenizer/` weights,
-  which the 1.5B repo omits (it ships the v1 Mimi codec path instead). Deferred
-  alongside the v1 `processor.mimi` decode.
+- **Mimi audio-out (v1)**: ✅ wired + smoke-tested — `processor.mimi_decode` via the
+  `moshi` crate decodes codes → finite 24 kHz waveform (`mimi_decode_smoke`). Pure
+  candle, no torch. (candle-transformers' mimi can't load this moshi-format
+  checkpoint; the moshi crate loads it natively.)
+- **LFM2.5 detokenizer (audio-out)**: ported (`detokenizer.rs`); weights are in
+  `LiquidAI/LFM2.5-Audio-1.5B` under `audio_detokenizer/` (314 MB). Numerical
+  parity for it would diff Rust against the upstream — to stay torch-free, diff
+  against the moshi-crate / a frozen golden rather than re-running torch.

@@ -42,7 +42,19 @@ run it with the model present to close the parity column).
   through (revision-with-path is an error, as in Python). Gated behind the
   `download` feature (on by default). `from_pretrained_hub(repo_id, ...)` is the
   faithful repo-id entry point.
-- **Mimi audio-out (v1)**: the LFM2.5 detokenizer path is ported; the v1 `processor.mimi` (moshi-crate) decode path is deferred.
+- **Mimi audio-out (v1)**: ✅ done — `processor.mimi_decode` decodes 8-codebook
+  tokens → 24 kHz waveform via the **`moshi` crate** (Kyutai's own Mimi, the Rust
+  port of the vendored `liquid_audio/moshi`; pins candle ^0.9.1 = our 0.9.2, so no
+  version split). It loads the moshi-format checkpoint
+  (`tokenizer-e351c8d8-checkpoint125.safetensors`: `encoder.model.N.conv.conv…`,
+  split `rvq_first`/`rvq_rest`) that ships in the repo. Note: candle-transformers'
+  `mimi` (0.9 *and* 0.10) uses the Encodec-style `encoder.layers.N`/weight-norm
+  layout and can NOT load this checkpoint — the moshi crate is the right tool.
+  Smoke-tested (`mimi_decode_smoke`): codes → finite 24 kHz audio, no torch.
+- **LFM2.5 audio-out detokenizer**: ported (`detokenizer.rs`, pure candle); its
+  weights live in `LiquidAI/LFM2.5-Audio-1.5B` under `audio_detokenizer/`
+  (config.json + model.safetensors), which the loader already probes. Exercising
+  it just needs that 314 MB subdir pulled.
 - **Parity**: ✅ verified against the real upstream + actual weights
   (LFM2-Audio-1.5B, f32, CPU) across the full pipeline — understanding,
   generation heads, and the prefill assembly:

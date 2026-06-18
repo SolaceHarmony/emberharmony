@@ -77,6 +77,31 @@ fn conformer_stages_parity() -> anyhow::Result<()> {
 }
 
 #[test]
+#[ignore = "needs LFM_MODEL_DIR (loads the Mimi weights shipped in the repo)"]
+fn mimi_decode_smoke() -> anyhow::Result<()> {
+    // Pure-candle audio-out: the Kyutai Mimi codec from candle-transformers
+    // decodes 8-codebook tokens to a 24 kHz waveform. No torch, no moshi crate.
+    let dir = std::env::var("LFM_MODEL_DIR").expect("set LFM_MODEL_DIR");
+    let device = Device::Cpu;
+    let (_model, proc) = liquid_audio::from_pretrained(Path::new(&dir), DType::F32, &device)?;
+
+    // 16 frames of valid Mimi indices (codebook size 2048), shape (1, 8, T).
+    let (k, t) = (8usize, 16usize);
+    let codes: Vec<u32> = (0..k * t).map(|i| (i * 37 % 2048) as u32).collect();
+    let codes = Tensor::from_vec(codes, (1, k, t), &device)?;
+
+    let wav = proc.mimi_decode(&codes)?;
+    let flat = wav.flatten_all()?.to_dtype(DType::F32)?;
+    let n = flat.dims1()?;
+    let max = flat.abs()?.max(0)?.to_scalar::<f32>()?;
+    println!("mimi decode: codes {:?} -> waveform {:?}  ({} samples, max|amp| {:.4})", codes.dims(), wav.dims(), n, max);
+    // Mimi: 12.5 Hz frame rate, 24 kHz → 1920 samples/frame.
+    assert_eq!(n, t * 1920, "unexpected sample count");
+    assert!(max.is_finite() && max > 0.0, "waveform is empty/NaN");
+    Ok(())
+}
+
+#[test]
 #[ignore = "needs LFM_MODEL_DIR + parity/golden/prefill_refs.safetensors"]
 fn prefill_parity() -> anyhow::Result<()> {
     let dir = std::env::var("LFM_MODEL_DIR").expect("set LFM_MODEL_DIR");

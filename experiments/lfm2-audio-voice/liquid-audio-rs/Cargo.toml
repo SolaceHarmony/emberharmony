@@ -32,15 +32,15 @@ rand = "0.8"
 # get_model_dir's repo-id branch. Sync (ureq) backend = faithful to the
 # synchronous Python call. Optional (feature `download`, on by default).
 hf-hub = { version = "0.3", optional = true }
-# NOTE: candle-transformers 0.9.2 has `mimi` + `quantized_lfm2` but no
-# full-precision `lfm2`; the detokenizer's HF Lfm2Model is ported in-tree
-# (model/lfm2_hf.rs) to avoid a git dep / version mismatch with the moshi crate.
-# Added as their consuming modules are ported:
-#   candle-transformers = "0.9"  # lfm2 backbone (model/transformer.rs)
-#   moshi = "0.6"                # Mimi codec (processor.rs decode path)
-#   tokenizers = "0.21"          # text tokenizer (processor.rs)
-#   hf-hub = "0.3"               # weight download (utils::get_model_dir, processor)
-#   safetensors = "0.4"          # weight loading
+# Mimi neural audio codec for the v1 audio-out path (`processor.mimi`). Kyutai's
+# own `moshi` crate — the Rust port of the exact code the Python lib vendors as
+# `liquid_audio/moshi` — so it loads the moshi-format Mimi checkpoint
+# (`encoder.model.N…`, split `rvq_first`/`rvq_rest`) natively. candle-transformers'
+# mimi uses a different (Encodec-style `encoder.layers.N`/weight-norm) layout and
+# can't load this checkpoint. moshi 0.6.4 pins candle ^0.9.1 → shares my candle
+# 0.9.2 (no version split). Pure candle, no torch. (candle-transformers' full-
+# precision `lfm2` is absent in 0.9, so that backbone stays ported in-tree.)
+moshi = "0.6"
 
 [dev-dependencies]
 anyhow = "1"

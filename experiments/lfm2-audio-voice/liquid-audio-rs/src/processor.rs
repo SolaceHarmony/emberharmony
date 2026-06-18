@@ -1,16 +1,23 @@
 //! Port of `liquid_audio/processor.py` — `LFM2AudioProcessor` + `ChatState`.
 //!
 //! `LFM2AudioProcessor` bundles the text tokenizer (HF AutoTokenizer →
-//! `tokenizers` crate), the mel audio preprocessor (`conformer::processor`), and
-//! the LFM2.5 audio detokenizer (`decode`). `ChatState` builds the model inputs
+//! `tokenizers` crate), the mel audio preprocessor (`conformer::processor`), the
+//! LFM2.5 audio detokenizer (`decode`), and the Kyutai Mimi codec (`mimi_decode`,
+//! the v1 `processor.mimi` audio-out path). `ChatState` builds the model inputs
 //! (text tokens, audio-in mel, lengths, audio-out codes, modality flags) the way
 //! the Python usage example does (`new_turn`/`add_text`/`add_audio`/`end_turn`/
-//! `append`). The Mimi-decode path (`processor.mimi`, v1 models) is deferred — the
-//! current models use the detokenizer; Mimi would wire the `moshi` crate.
+//! `append`).
+//!
+//! Mimi is reused from the `moshi` crate — Kyutai's own Mimi, the Rust port of
+//! the exact code the Python lib vendors under `liquid_audio/moshi`, so it loads
+//! the moshi-format checkpoint natively. Pure candle (moshi pins candle ^0.9.1 =
+//! our 0.9.2), no torch.
 
+use std::cell::RefCell;
 use std::path::Path;
 
 use candle_core::{Device, Result, Tensor};
+use moshi::mimi;
 use tokenizers::Tokenizer;
 
 use crate::detokenizer::LFM2AudioDetokenizer;
@@ -55,14 +62,24 @@ pub struct LFM2AudioProcessor {
     pub tokenizer: Tokenizer,
     pub audio: FilterbankFeatures,
     pub detokenizer: Option<LFM2AudioDetokenizer>,
+    /// Kyutai Mimi codec (v1 `processor.mimi`). `RefCell` because Mimi decode is a
+    /// streaming model with internal conv/transformer state (mirrors the Python
+    /// `mimi.streaming(1)` mutation), kept behind `&self` for ergonomics.
+    pub mimi: Option<RefCell<mimi::Mimi>>,
     pub device: Device,
 }
 
 impl LFM2AudioProcessor {
     /// Build from a local model directory: `tokenizer.json` + the mel buffers
     /// (`window`/`fb`) under a VarBuilder rooted at the audio preprocessor.
-    pub fn new(tokenizer: Tokenizer, audio: FilterbankFeatures, detokenizer: Option<LFM2AudioDetokenizer>, device: Device) -> Self {
-        Self { tokenizer, audio, detokenizer, device }
+    pub fn new(
+        tokenizer: Tokenizer,
+        audio: FilterbankFeatures,
+        detokenizer: Option<LFM2AudioDetokenizer>,
+        mimi: Option<mimi::Mimi>,
+        device: Device,
+    ) -> Self {
+        Self { tokenizer, audio, detokenizer, mimi: mimi.map(RefCell::new), device }
     }
 
     pub fn load_tokenizer(dir: &Path) -> Result<Tokenizer> {
@@ -80,7 +97,8 @@ impl LFM2AudioProcessor {
         Tensor::from_vec(ids, (1, n), &self.device)
     }
 
-    /// Detokenize audio codes `(1, 8, T)` → 24 kHz waveform `(1, T')`.
+    /// Detokenize audio codes `(1, 8, T)` → 24 kHz waveform `(1, T')` via the
+    /// LFM2-based detokenizer (LFM2.5 models, `processor.decode`).
     pub fn decode(&self, audio_codes: &Tensor) -> Result<Tensor> {
         let detok = self
             .detokenizer
@@ -89,6 +107,19 @@ impl LFM2AudioProcessor {
         // detokenizer expects (B, L, codebooks)
         let codes = audio_codes.transpose(1, 2)?.contiguous()?;
         detok.forward(&codes)
+    }
+
+    /// v1 audio-out (`processor.mimi`): decode Mimi codes `(1, 8, T)` → 24 kHz
+    /// waveform via the Kyutai Mimi codec (`moshi` crate). Codes are u32 indices.
+    /// `reset_state` first so repeated calls are independent.
+    pub fn mimi_decode(&self, codes: &Tensor) -> Result<Tensor> {
+        let mimi = self.mimi.as_ref().ok_or_else(|| {
+            candle_core::Error::Msg("model does not provide Mimi weights (processor.mimi)".into())
+        })?;
+        let codes = codes.to_dtype(candle_core::DType::U32)?;
+        let mut m = mimi.borrow_mut();
+        m.reset_state();
+        m.decode(&codes)
     }
 }
 

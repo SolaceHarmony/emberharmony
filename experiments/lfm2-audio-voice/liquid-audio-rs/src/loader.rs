@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 
 use candle_core::{DType, Device, Result};
 use candle_nn::VarBuilder;
+use moshi::mimi;
 use serde_json::Value;
 
 use crate::detokenizer::LFM2AudioDetokenizer;
@@ -111,9 +112,25 @@ pub fn from_pretrained(dir: &Path, dtype: DType, device: &Device) -> Result<(LFM
     let audio = FilterbankFeatures::new(prep.mel_config(), device)?;
     let tokenizer = LFM2AudioProcessor::load_tokenizer(dir)?;
     let detok = load_detokenizer(dir, dtype, device).ok();
-    let proc = LFM2AudioProcessor::new(tokenizer, audio, detok, device.clone());
+    let mimi = load_mimi(dir, codebooks, device)?;
+    let proc = LFM2AudioProcessor::new(tokenizer, audio, detok, mimi, device.clone());
 
     Ok((model, proc))
+}
+
+/// Load the Kyutai Mimi codec (v1 `processor.mimi` audio-out) from
+/// `<dir>/tokenizer-e351c8d8-checkpoint125.safetensors` if present. Reused from
+/// the `moshi` crate (Kyutai's own — the Rust port of the vendored
+/// `liquid_audio/moshi`, so it loads the moshi-format checkpoint). Returns `None`
+/// if the file is absent; propagates a real load error (no silent fallback) if
+/// the file exists but can't be loaded.
+fn load_mimi(dir: &Path, codebooks: usize, device: &Device) -> Result<Option<mimi::Mimi>> {
+    let path = dir.join("tokenizer-e351c8d8-checkpoint125.safetensors");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let p = path.to_str().ok_or_else(|| err("non-utf8 mimi weights path"))?;
+    Ok(Some(mimi::load(p, Some(codebooks), device)?))
 }
 
 /// Load the LFM2.5 audio detokenizer from `<dir>/audio_detokenizer/` if present.
