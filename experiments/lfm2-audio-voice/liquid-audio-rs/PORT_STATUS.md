@@ -14,7 +14,12 @@ Python with shared weights + fixed inputs.
 | `detokenizer.py` | 136 | `src/detokenizer.rs` | pending (after backbone) | FusedEmbedding + Vocos-style ISTFT (needs inverse FFT via `rustfft` + overlap-add `fold`) + Lfm2Model backbone |
 | `processor.py` | 269 | `src/processor.rs` | pending | tokenizer (`tokenizers`), mel preprocessor, Mimi decode (via `moshi` crate), `ChatState` |
 | `model/lfm2_audio.py` | 534 | `src/model/lfm2_audio.rs` | pending | `LFM2AudioModel` + `generate_interleaved` (sync streaming iterator) |
-| `model/conformer/*` | ~3360 | `src/model/conformer/*` | **decision: A (candle line-for-line port)** | FastConformer encoder; no Rust equiv. Big separable batch — candidate for parallel drafting |
+| `model/conformer/utils.py` | 112 | — | **skip** | autocast/streaming/stochastic-depth helpers — not on inference path |
+| `model/conformer/mha.py` | 457 | `src/model/conformer/mha.rs` | **done (compiles; parity pending)** | RelPositionalEncoding + RelPositionMultiHeadAttention (manual branch, no cache/streaming/sdpa) |
+| `model/conformer/modules.py` | 471 | `src/model/conformer/modules.rs` | **next** | ConformerLayer / ConformerConvolution / FeedForward / CausalConv1D |
+| `model/conformer/subsampling.py` | 605 | `src/model/conformer/subsampling.rs` | pending | ConvSubsampling forward (skip conv chunking) |
+| `model/conformer/encoder.py` | 1163 | `src/model/conformer/encoder.rs` | pending | ConformerEncoder offline forward (skip streaming/export/stochastic) |
+| `model/conformer/processor.py` | 556 | `src/model/conformer/processor.rs` | pending | AudioToMelSpectrogramPreprocessor / FilterbankFeatures (STFT via `rustfft`) |
 | `moshi/*` | 8715 | — | **reuse** | the `moshi` crate (Kyutai's own Rust port) — identical upstream to the vendored copy |
 
 ## IO model (faithful to Python)
