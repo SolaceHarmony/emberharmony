@@ -17,7 +17,7 @@ Python with shared weights + fixed inputs.
 | `model/conformer/utils.py` | 112 | — | **skip** | autocast/streaming/stochastic-depth helpers — not on inference path |
 | `model/conformer/mha.py` | 457 | `src/model/conformer/mha.rs` | **done (compiles; parity pending)** | RelPositionalEncoding + RelPositionMultiHeadAttention (manual branch, no cache/streaming/sdpa) |
 | `model/conformer/modules.py` | 471 | `src/model/conformer/modules.rs` | **done (compiles; parity pending)** | ConformerLayer / ConformerConvolution / FeedForward / CausalConv1D |
-| `model/conformer/subsampling.py` | 605 | `src/model/conformer/subsampling.rs` | pending | ConvSubsampling forward (skip conv chunking) |
+| `model/conformer/subsampling.rs` | 605 | `src/model/conformer/subsampling.rs` | **done (compiles; parity pending)** | ConvSubsampling forward (skip conv chunking) |
 | `model/conformer/encoder.py` | 1163 | `src/model/conformer/encoder.rs` | pending | ConformerEncoder offline forward (skip streaming/export/stochastic) |
 | `model/conformer/processor.py` | 556 | `src/model/conformer/processor.rs` | pending | AudioToMelSpectrogramPreprocessor / FilterbankFeatures (STFT via `rustfft`) |
 | `moshi/*` | 8715 | — | **reuse** | the `moshi` crate (Kyutai's own Rust port) — identical upstream to the vendored copy |
