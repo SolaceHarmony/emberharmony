@@ -95,6 +95,19 @@ impl LFM2AudioProcessor {
     /// processor dispatches through the [`AudioDetokenizer`](crate::audio_out)
     /// trait — it doesn't know which concrete backend it holds.
     pub fn decode(&self, audio_codes: &Tensor) -> Result<Tensor> {
+        // Python guard: reject codes outside [0, 2047] before detokenizing (the
+        // EOAudio sentinel 2048 must be stripped by the caller). u32 ⇒ ≥0 already;
+        // check the upper bound rather than index OOB in the codebook embedding.
+        let max_code = audio_codes
+            .to_dtype(candle_core::DType::U32)?
+            .flatten_all()?
+            .max(0)?
+            .to_scalar::<u32>()?;
+        if max_code > 2047 {
+            return Err(candle_core::Error::Msg(format!(
+                "audio code {max_code} out of range [0, 2047] (strip the EOAudio frame before decode)"
+            )));
+        }
         self.audio_out
             .as_ref()
             .ok_or_else(|| candle_core::Error::Msg("no audio-out backend loaded".into()))?
@@ -165,12 +178,34 @@ impl<'a> ChatState<'a> {
     }
 
     /// Append generated text + audio-out tokens with their modality flags.
+    ///
+    /// Mirrors the Python `ChatState.append` invariants: `text` is one row,
+    /// `audio_out` has `codebooks` rows, `modality_flag` is one row, and the flag
+    /// count equals `text_len + audio_out_len` (the scatter depends on it).
     pub fn append(&mut self, text: &Tensor, audio_out: &Tensor, modality_flag: &Tensor) -> Result<()> {
+        let mf = if modality_flag.rank() == 1 { modality_flag.unsqueeze(0)? } else { modality_flag.clone() };
+        if text.dim(0)? != 1 {
+            return Err(candle_core::Error::Msg(format!("append: text must be 1 row, got {}", text.dim(0)?)));
+        }
+        if audio_out.dim(0)? != self.codebooks {
+            return Err(candle_core::Error::Msg(format!(
+                "append: audio_out must have {} codebook rows, got {}",
+                self.codebooks,
+                audio_out.dim(0)?
+            )));
+        }
+        if mf.dim(0)? != 1 {
+            return Err(candle_core::Error::Msg("append: modality_flag must be 1 row".into()));
+        }
+        let (n_text, n_audio, n_flag) = (text.dim(1)?, audio_out.dim(1)?, mf.dim(1)?);
+        if n_flag != n_text + n_audio {
+            return Err(candle_core::Error::Msg(format!(
+                "append: modality_flag len {n_flag} != text {n_text} + audio_out {n_audio}"
+            )));
+        }
         self.text = Tensor::cat(&[&self.text, text], 1)?;
         self.audio_out = Tensor::cat(&[&self.audio_out, audio_out], 1)?;
-        let mf = if modality_flag.rank() == 1 { modality_flag.unsqueeze(0)? } else { modality_flag.clone() };
         self.modality_flag = Tensor::cat(&[&self.modality_flag, &mf], 1)?;
-        let _ = self.codebooks;
         Ok(())
     }
 }

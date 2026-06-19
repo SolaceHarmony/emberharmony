@@ -1,10 +1,12 @@
 //! Port of `liquid_audio/model/conformer/processor.py` — NeMo mel featurizer
 //! (`AudioToMelSpectrogramPreprocessor` / `FilterbankFeatures`), inference path.
 //!
-//! The `window` (Hann) and mel filterbank `fb` are persistent buffers in the
-//! checkpoint, so they are loaded verbatim (no librosa/hann reimplementation).
-//! Pipeline: preemphasis → centered STFT (`rustfft`) → power spectrum → mel →
-//! log → per-feature normalization → pad to a multiple of `pad_to`.
+//! The `window` (Hann) and mel filterbank `fb` are **computed at construction**
+//! (`torch.hann_window(periodic=False)` + `librosa.filters.mel(norm="slaney")`),
+//! exactly as the Python preprocessor does in its `__init__` — they are NOT
+//! checkpoint tensors. (Parity-verified to 1e-5 against the upstream featurizer.)
+//! Pipeline: preemphasis → centered STFT (`rustfft`) → magnitude^`mag_power` →
+//! mel → log → per-feature normalization → pad to a multiple of `pad_to`.
 //! Training-only bits (dither, nb-augmentation, frame splicing) are skipped.
 
 use candle_core::{Device, Result, Tensor};
@@ -167,9 +169,13 @@ impl FilterbankFeatures {
                 buf[j].im = 0.0;
             }
             fft.process(&mut buf);
+            let mag_power = self.cfg.mag_power as f32;
             for f in 0..freq {
-                // mag_power=2 → power = re^2 + im^2
-                power[f * t + ti] = buf[f].re * buf[f].re + buf[f].im * buf[f].im;
+                // Python: x = sqrt(re^2+im^2); if mag_power != 1: x = x.pow(mag_power).
+                // Fast path for the common mag_power == 2 (= re^2 + im^2); honor
+                // any other configured power faithfully.
+                let p = buf[f].re * buf[f].re + buf[f].im * buf[f].im;
+                power[f * t + ti] = if mag_power == 2.0 { p } else { p.sqrt().powf(mag_power) };
             }
         }
 

@@ -313,12 +313,24 @@ impl LFM2AudioModel {
                 let v = ai_base + cai;
                 cai += 1;
                 v
-            } else {
+            } else if *m == LFMModality::AudioOut as u32 {
                 let v = ao_base + cao;
                 cao += 1;
                 v
+            } else {
+                // An unknown modality flag must error, not silently bucket as
+                // AudioOut (the Python asserts the flag is one of the 3 modalities).
+                return Err(candle_core::Error::Msg(format!("prefill: unknown modality flag {m} (expected 1/2/3)")));
             };
             index.push(idx as u32);
+        }
+        // The scatter consumes exactly the rows of each part; a count mismatch
+        // means a malformed modality_flag (mirrors the Python _prefill asserts).
+        if ct != n_text || cai != n_ai || cao != audio_out_emb.as_ref().map(|a| a.dim(0).unwrap_or(0)).unwrap_or(0) {
+            return Err(candle_core::Error::Msg(format!(
+                "prefill: modality_flag counts (text {ct}, audio_in {cai}, audio_out {cao}) \
+                 do not match inputs (text {n_text}, audio_in {n_ai})"
+            )));
         }
         let index = Tensor::from_vec(index, (l,), dev)?;
         let in_emb = combined.index_select(&index, 0)?; // (L, D)

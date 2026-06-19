@@ -36,6 +36,15 @@ fn err(e: impl std::fmt::Display) -> candle_core::Error {
     candle_core::Error::Msg(e.to_string())
 }
 
+/// Required uint config field — hard error if missing/invalid (no silent default).
+/// Mirrors Python's dataclass `TypeError` on a missing required kwarg.
+fn req_usize(v: &Value, key: &str) -> Result<usize> {
+    v.get(key)
+        .and_then(Value::as_u64)
+        .map(|x| x as usize)
+        .ok_or_else(|| err(format!("config: missing/invalid required field `{key}`")))
+}
+
 fn safetensors_in(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut out = Vec::new();
     for entry in fs::read_dir(dir).map_err(err)? {
@@ -51,22 +60,25 @@ fn safetensors_in(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 
-fn parse_encoder(e: &Value) -> ConformerEncoderConfig {
-    let u = |k: &str| e[k].as_u64().unwrap_or(0) as usize;
+fn parse_encoder(e: &Value) -> Result<ConformerEncoderConfig> {
+    // Structural fields are required (a wrong default = a silently-broken model).
+    // `feat_out`/`subsampling_conv_channels` keep the upstream `-1 → use d_model`
+    // sentinel (a genuine NeMo default, not a silent fallback); `xscaling` keeps
+    // the upstream default of True.
     let feat_out = e["feat_out"].as_i64().unwrap_or(-1);
     let conv_ch = e["subsampling_conv_channels"].as_i64().unwrap_or(-1);
-    ConformerEncoderConfig {
-        feat_in: u("feat_in"),
+    Ok(ConformerEncoderConfig {
+        feat_in: req_usize(e, "feat_in")?,
         feat_out: if feat_out > 0 { feat_out as usize } else { 0 },
-        n_layers: u("n_layers"),
-        d_model: u("d_model"),
-        subsampling_factor: u("subsampling_factor"),
+        n_layers: req_usize(e, "n_layers")?,
+        d_model: req_usize(e, "d_model")?,
+        subsampling_factor: req_usize(e, "subsampling_factor")?,
         subsampling_conv_channels: if conv_ch > 0 { conv_ch as usize } else { 0 },
-        ff_expansion_factor: u("ff_expansion_factor"),
-        n_heads: u("n_heads"),
-        conv_kernel_size: u("conv_kernel_size"),
+        ff_expansion_factor: req_usize(e, "ff_expansion_factor")?,
+        n_heads: req_usize(e, "n_heads")?,
+        conv_kernel_size: req_usize(e, "conv_kernel_size")?,
         xscaling: e["xscaling"].as_bool().unwrap_or(true),
-    }
+    })
 }
 
 /// Resolve `repo_id` (or a local path) via [`get_model_dir`] — snapshot-
@@ -96,15 +108,19 @@ pub fn from_pretrained(dir: &Path, dtype: DType, device: &Device) -> Result<(LFM
     let config: Value = serde_json::from_str(&fs::read_to_string(dir.join("config.json")).map_err(err)?).map_err(err)?;
 
     let lfm_cfg: Lfm2Config = serde_json::from_value(config["lfm"].clone()).map_err(err)?;
-    let enc_cfg = parse_encoder(&config["encoder"]);
+    let enc_cfg = parse_encoder(&config["encoder"])?;
+    let depth = &config["depthformer"];
     let depth_cfg = DepthformerConfig {
-        layers: config["depthformer"]["layers"].as_u64().unwrap_or(0) as usize,
-        dim: config["depthformer"]["dim"].as_u64().unwrap_or(0) as usize,
-        tie: config["depthformer"]["tie"].as_bool().unwrap_or(true),
+        layers: req_usize(depth, "layers")?,
+        dim: req_usize(depth, "dim")?,
+        tie: depth
+            .get("tie")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| err("config: missing/invalid required field `depthformer.tie`"))?,
     };
-    let codebooks = config["codebooks"].as_u64().unwrap_or(8) as usize;
-    let n_text = config["interleaved_n_text"].as_u64().unwrap_or(1) as usize;
-    let n_audio = config["interleaved_n_audio"].as_u64().unwrap_or(1) as usize;
+    let codebooks = req_usize(&config, "codebooks")?;
+    let n_text = req_usize(&config, "interleaved_n_text")?;
+    let n_audio = req_usize(&config, "interleaved_n_audio")?;
 
     let safes = safetensors_in(dir)?;
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&safes, dtype, device)? };
@@ -115,10 +131,13 @@ pub fn from_pretrained(dir: &Path, dtype: DType, device: &Device) -> Result<(LFM
     let tokenizer = LFM2AudioProcessor::load_tokenizer(dir)?;
     // Audio-out backend, behind the AudioDetokenizer trait: prefer the in-tree
     // LFM2 detokenizer (LFM2.5 models, `audio_detokenizer/`); else the Mimi codec
-    // (v1 models, `tokenizer-…checkpoint125.safetensors`).
-    let audio_out: Option<Box<dyn AudioDetokenizer>> = match load_detokenizer(dir, dtype, device).ok() {
-        Some(d) => Some(Box::new(d)),
-        None => load_mimi(dir, codebooks, device)?.map(|m| Box::new(MimiDetokenizer::new(m)) as Box<dyn AudioDetokenizer>),
+    // (v1 models, `tokenizer-…checkpoint125.safetensors`). No silent fallback: if
+    // `audio_detokenizer/` is present we propagate any load error rather than
+    // quietly dropping to Mimi.
+    let audio_out: Option<Box<dyn AudioDetokenizer>> = if dir.join("audio_detokenizer").is_dir() {
+        Some(Box::new(load_detokenizer(dir, dtype, device)?))
+    } else {
+        load_mimi(dir, codebooks, device)?.map(|m| Box::new(MimiDetokenizer::new(m)) as Box<dyn AudioDetokenizer>)
     };
     let proc = LFM2AudioProcessor::new(tokenizer, audio, audio_out, device.clone());
 
