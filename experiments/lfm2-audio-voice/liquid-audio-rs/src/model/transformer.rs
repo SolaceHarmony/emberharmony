@@ -230,13 +230,17 @@ impl BoundedAttention {
         }
 
         // rotary on [b, heads, t, head_dim]; rope_i wants cos/sin [t, head_dim/2].
-        let q_t = q.transpose(1, 2)?.contiguous()?;
-        let k_t = k.transpose(1, 2)?.contiguous()?;
+        // Python `apply_rotary_emb` upcasts q/k to fp32, rotates, then casts back
+        // (`type_as`). Do the same so the native bf16/f16 path matches torch and
+        // `rope_i` sees fp32 operands consistent with the fp32 cos/sin tables.
+        let in_dtype = q.dtype();
+        let q_t = q.transpose(1, 2)?.contiguous()?.to_dtype(DType::F32)?;
+        let k_t = k.transpose(1, 2)?.contiguous()?.to_dtype(DType::F32)?;
         let q_t = rope_i(&q_t, cos, sin)?;
         let k_t = rope_i(&k_t, cos, sin)?;
-        // back to [b, t, heads, head_dim] for cache concat (mirrors Python)
-        let q = q_t.transpose(1, 2)?.contiguous()?;
-        let k = k_t.transpose(1, 2)?.contiguous()?;
+        // back to [b, t, heads, head_dim] in the original dtype for cache concat
+        let q = q_t.transpose(1, 2)?.contiguous()?.to_dtype(in_dtype)?;
+        let k = k_t.transpose(1, 2)?.contiguous()?.to_dtype(in_dtype)?;
 
         let (k, v) = match cache {
             Some(c) => c.update(&k, &v)?,
@@ -251,14 +255,20 @@ impl BoundedAttention {
         let key = repeat_kv(&k.transpose(1, 2)?.contiguous()?, self.num_heads / kvh)?;
         let value = repeat_kv(&v.transpose(1, 2)?.contiguous()?, self.num_heads / kvh)?;
 
+        // `scaled_dot_product_attention` accumulates scores, softmax, and the
+        // value-weighting in fp32 regardless of input dtype; mirror that (upcast
+        // q/k/v, do the math in fp32, cast the result back) so bf16/f16 matches.
+        let query = query.to_dtype(DType::F32)?;
+        let key = key.to_dtype(DType::F32)?;
+        let value = value.to_dtype(DType::F32)?;
         let scale = 1.0 / (self.head_dim as f64).sqrt();
         let mut attn = (query.matmul(&key.transpose(D::Minus1, D::Minus2)?)? * scale)?;
-        if !(q_len == 1) {
+        if q_len != 1 {
             let mask = causal_mask(q_len, kv_len, q.device())?.to_dtype(attn.dtype())?;
             attn = attn.broadcast_add(&mask)?;
         }
         let attn = softmax_last_dim(&attn)?;
-        let out = attn.matmul(&value)?; // [b, heads, t, head_dim]
+        let out = attn.matmul(&value)?.to_dtype(in_dtype)?; // [b, heads, t, head_dim], back to input dtype
 
         out.transpose(1, 2)?.reshape((bsz, seqlen, self.num_heads * self.head_dim))
     }
@@ -363,8 +373,14 @@ impl StandardBlock {
     }
 }
 
-/// `SharedEmbedding`: tied input embedding + pre-logits RMSNorm + output projection.
-/// `tie_embedding=True` in Python — `to_logits` shares the embedding matrix.
+/// `SharedEmbedding`: input embedding + pre-logits RMSNorm + output projection.
+///
+/// Python `tie_embedding` is a *train-time* parameter-sharing flag; the saved
+/// checkpoint **always** ships a separate `to_logits.weight` (equal to
+/// `embedding.weight` when tied, e.g. the depthformer with `depthformer.tie=True`;
+/// distinct when untied, e.g. `audio_embedding` with `tie_audio_embeddings=False`).
+/// So we load `to_logits.weight` from the checkpoint rather than assuming the tie
+/// and reusing the embedding matrix — faithful for both cases.
 pub struct SharedEmbedding {
     embedding: Embedding,
     embedding_norm: RmsNorm,
@@ -373,10 +389,11 @@ pub struct SharedEmbedding {
 
 impl SharedEmbedding {
     pub fn new(dim: usize, vocab_size: usize, norm_eps: f64, vb: VarBuilder) -> Result<Self> {
-        let weight = vb.pp("embedding").get((vocab_size, dim), "weight")?;
-        let embedding = Embedding::new(weight.clone(), dim);
+        let emb_w = vb.pp("embedding").get((vocab_size, dim), "weight")?;
+        let embedding = Embedding::new(emb_w, dim);
         let embedding_norm = RmsNorm::new(dim, norm_eps, vb.pp("embedding_norm"))?;
-        let to_logits = Linear::new(weight, None);
+        let to_logits_w = vb.pp("to_logits").get((vocab_size, dim), "weight")?;
+        let to_logits = Linear::new(to_logits_w, None);
         Ok(Self { embedding, embedding_norm, to_logits })
     }
 
