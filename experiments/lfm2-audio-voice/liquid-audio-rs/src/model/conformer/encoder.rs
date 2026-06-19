@@ -61,6 +61,15 @@ impl ConformerEncoder {
     }
 
     /// `audio_signal` is `(B, feat_in, T)` (mel features). Returns `(B, d_out, T')`.
+    ///
+    /// **Contract: one unpadded clip (effectively `B==1`, all `T` frames valid).**
+    /// The padded-batch machinery — `MaskedConvSequential`, per-step length
+    /// tracking, and `_create_masks` (`att_mask`/`pad_mask`) — is intentionally
+    /// not ported; masks are `None`. Callers with multiple segments must encode
+    /// each individually (as `_prefill` does), which is numerically equivalent to
+    /// the Python padded-batch+length-mask path (verified in `prefill_parity`,
+    /// 2 segments, 1.1e-6) precisely because that masking only exists to neutralize
+    /// padding. Do NOT feed a zero-padded batch here.
     pub fn forward(&self, audio_signal: &Tensor) -> Result<Tensor> {
         let x = audio_signal.transpose(1, 2)?.contiguous()?; // (B, T, feat_in)
         let x = self.pre_encode.forward(&x)?; // (B, T', d_model)

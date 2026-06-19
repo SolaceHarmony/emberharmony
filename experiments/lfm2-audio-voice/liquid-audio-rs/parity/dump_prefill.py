@@ -43,10 +43,14 @@ def main() -> int:
     chat.new_turn("system")
     chat.add_text("Respond with interleaved text and audio.")
     chat.end_turn()
-    chat.new_turn("user")
+    # Two user audio turns of DIFFERENT lengths, so Python pads them into a batch
+    # and length-masks — the case where per-segment Rust encoding could diverge.
     torch.manual_seed(0)
-    wav = (torch.randn(1, 16000) * 0.1).to(torch.float32)  # fixed 1s @ 16 kHz
-    chat.add_audio(wav, 16000)
+    chat.new_turn("user")
+    chat.add_audio((torch.randn(1, 16000) * 0.1).to(torch.float32), 16000)  # 1.0 s
+    chat.end_turn()
+    chat.new_turn("user")
+    chat.add_audio((torch.randn(1, 9000) * 0.1).to(torch.float32), 16000)   # ~0.56 s
     chat.end_turn()
     chat.new_turn("assistant")
 

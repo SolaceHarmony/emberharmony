@@ -120,6 +120,10 @@ fn prefill_parity() -> anyhow::Result<()> {
     chat.audio_out = r.get("audio_out").unwrap().to_dtype(DType::U32)?;
     chat.modality_flag = r.get("modality_flag").unwrap().to_dtype(DType::U32)?;
 
+    // The reference has TWO audio-in segments of different lengths, so the Python
+    // side pads them into a batch + length-masks; the Rust side encodes each
+    // segment individually. Matching here proves per-segment encode ≡ padded-batch
+    // (the conformer masking exists precisely to make them equal).
     let in_emb = model.prefill_chat(&chat)?;
     let want = r.get("in_emb").expect("in_emb");
     let e = rel_err(&in_emb, want);
