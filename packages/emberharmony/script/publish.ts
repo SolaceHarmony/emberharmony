@@ -27,7 +27,6 @@ const version = Object.values(binaries)[0] || Script.version
 
 await $`mkdir -p ./dist/${pkg.name}`
 await $`cp -r ./bin ./dist/${pkg.name}/bin`
-await $`cp ./script/postinstall.mjs ./dist/${pkg.name}/postinstall.mjs`
 
 // The published manifest is derived from the repo-root package.json. A failed
 // read or a missing field is a real misconfiguration, so surface it instead of
@@ -67,12 +66,9 @@ await Bun.file(`./dist/${pkg.name}/package.json`).write(
       bin: {
         [cliName]: `bin/${cliName}`,
       },
-      scripts: {
-        postinstall: "bun ./postinstall.mjs || node ./postinstall.mjs",
-      },
       version: version,
       optionalDependencies: binaries,
-      files: ["bin/**", "postinstall.mjs", "README.md", "LICENSE"],
+      files: ["bin/**", "README.md", "LICENSE"],
     },
     null,
     2,

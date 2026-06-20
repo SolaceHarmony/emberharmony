@@ -5,6 +5,21 @@ All notable changes to EmberHarmony will be documented in this file.
 This project is a fork of [opencode](https://github.com/opencode-ai/opencode),
 rebranded and maintained by [The Solace Project](https://github.com/SolaceHarmony).
 
+## [1.4.7] - 2026-06-20
+
+### Fixed
+
+- **`npm i -g @thesolaceproject/emberharmony` printed a scary `allow-scripts`
+  approval warning** — the published package declared a `postinstall` script
+  (`bun ./postinstall.mjs || node ./postinstall.mjs`), which recent npm flags as
+  an unapproved install script. But the postinstall was purely diagnostic: on
+  non-Windows it only logged "binary verified" (no symlink), and on Windows it
+  did nothing. The platform binary is an `optionalDependency` that npm installs
+  regardless, and the runtime `bin/emberharmony` wrapper resolves it on its own —
+  so the postinstall was unnecessary. The publish flow no longer emits a
+  `postinstall` script (and the orphaned `postinstall.mjs` is removed), which
+  eliminates the warning with zero functional change to install or runtime.
+
 ## [1.4.6] - 2026-06-14
 
 ### Fixed
