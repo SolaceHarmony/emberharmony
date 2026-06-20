@@ -88,6 +88,12 @@ const allTargets: {
     arch: "x64",
     avx2: false,
   },
+  {
+    // Windows on ARM — native runtime first shipped in Bun 1.3.14. No baseline
+    // variant: baseline is an x64/AVX2 concept and does not apply to arm64.
+    os: "win32",
+    arch: "arm64",
+  },
 ]
 
 const targets = singleFlag

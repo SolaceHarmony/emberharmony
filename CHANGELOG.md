@@ -7,6 +7,16 @@ rebranded and maintained by [The Solace Project](https://github.com/SolaceHarmon
 
 ## [1.4.7] - 2026-06-20
 
+### Added
+
+- **Native Windows on ARM64 support.** Bumped Bun 1.3.8 → 1.3.14, which is the
+  first Bun release to ship a `windows-aarch64` runtime, and added `win32-arm64`
+  to the build matrix. `npm i -g @thesolaceproject/emberharmony` now installs a
+  native ARM64 binary on Windows-on-ARM (incl. Parallels VMs on Apple Silicon)
+  instead of relying on x64 emulation. Verified: Bun 1.3.14 cross-compiles a
+  `PE32+ Aarch64` executable. (The remaining unbuilt platforms — 32-bit ARM,
+  BSD — are ones Bun does not produce a runtime for.)
+
 ### Fixed
 
 - **`npm i -g @thesolaceproject/emberharmony` printed a scary `allow-scripts`
