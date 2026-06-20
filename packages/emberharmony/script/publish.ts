@@ -54,6 +54,25 @@ const license = requireString("license")
 const repository = requireMeta("repository")
 const bugs = requireMeta("bugs")
 
+// Restrict the wrapper to the platforms we actually ship a binary for, derived
+// from the built platform packages. There is no install script (intentionally —
+// it would trip npm's allow-scripts warning, and modern npm defers it unapproved
+// so it never runs anyway), so os/cpu are npm's only resolver-enforced signal to
+// reject a host we have no binary for. Without them, `npm i -g` on e.g. 32-bit
+// linux arm or freebsd would "succeed" and leave a wrapper whose binary can never
+// resolve. Platform package names are `<publishName>-<os>-<arch>[-baseline][-musl]`;
+// npm uses `win32` where our package token says `windows`.
+const osTokens = new Set<string>()
+const cpuTokens = new Set<string>()
+for (const key of Object.keys(binaries)) {
+  const suffix = key.startsWith(`${publishName}-`) ? key.slice(publishName.length + 1) : key
+  const [osToken, archToken] = suffix.split("-")
+  if (osToken) osTokens.add(osToken === "windows" ? "win32" : osToken)
+  if (archToken) cpuTokens.add(archToken)
+}
+const os = Array.from(osTokens).sort()
+const cpu = Array.from(cpuTokens).sort()
+
 await Bun.file(`./dist/${pkg.name}/package.json`).write(
   JSON.stringify(
     {
@@ -67,6 +86,12 @@ await Bun.file(`./dist/${pkg.name}/package.json`).write(
         [cliName]: `bin/${cliName}`,
       },
       version: version,
+      // Only constrain when we actually have binaries; empty arrays would block
+      // every install. The residual gaps os/cpu cannot express (a supported os
+      // with no binary for that arch, e.g. windows-arm64, or `--omit=optional`)
+      // still fail loudly at first run via the bin/emberharmony wrapper (exit 1).
+      ...(os.length > 0 ? { os } : {}),
+      ...(cpu.length > 0 ? { cpu } : {}),
       optionalDependencies: binaries,
       files: ["bin/**", "README.md", "LICENSE"],
     },

@@ -22,7 +22,7 @@
     },
     "packages/app": {
       "name": "@thesolaceproject/emberharmony-app",
-      "version": "1.4.6",
+      "version": "1.4.7",
       "dependencies": {
         "@kobalte/core": "catalog:",
         "@shikijs/transformers": "3.9.2",
@@ -74,7 +74,7 @@
     },
     "packages/console/app": {
       "name": "@thesolaceproject/emberharmony-console-app",
-      "version": "1.4.6",
+      "version": "1.4.7",
       "dependencies": {
         "@cloudflare/vite-plugin": "1.15.2",
         "@ibm/plex": "6.4.1",
@@ -108,7 +108,7 @@
     },
     "packages/console/core": {
       "name": "@thesolaceproject/emberharmony-console-core",
-      "version": "1.4.6",
+      "version": "1.4.7",
       "dependencies": {
         "@aws-sdk/client-sts": "3.933.0",
         "@jsx-email/render": "1.1.1",
@@ -135,7 +135,7 @@
     },
     "packages/console/function": {
       "name": "@thesolaceproject/emberharmony-console-function",
-      "version": "1.4.6",
+      "version": "1.4.7",
       "dependencies": {
         "@ai-sdk/anthropic": "2.0.0",
         "@ai-sdk/openai": "2.0.2",
@@ -159,7 +159,7 @@
     },
     "packages/console/mail": {
       "name": "@thesolaceproject/emberharmony-console-mail",
-      "version": "1.4.6",
+      "version": "1.4.7",
       "dependencies": {
         "@jsx-email/all": "2.2.3",
         "@jsx-email/cli": "1.4.3",
@@ -178,7 +178,7 @@
     },
     "packages/desktop": {
       "name": "@thesolaceproject/emberharmony-desktop",
-      "version": "1.4.6",
+      "version": "1.4.7",
       "dependencies": {
         "@solid-primitives/i18n": "2.2.1",
         "@solid-primitives/storage": "catalog:",
@@ -210,7 +210,7 @@
     },
     "packages/emberharmony": {
       "name": "emberharmony",
-      "version": "1.4.6",
+      "version": "1.4.7",
       "bin": {
         "emberharmony": "bin/emberharmony",
       },
@@ -320,7 +320,7 @@
     },
     "packages/enterprise": {
       "name": "@thesolaceproject/emberharmony-enterprise",
-      "version": "1.4.6",
+      "version": "1.4.7",
       "dependencies": {
         "@pierre/diffs": "catalog:",
         "@solidjs/meta": "catalog:",
@@ -349,7 +349,7 @@
     },
     "packages/function": {
       "name": "@thesolaceproject/emberharmony-function",
-      "version": "1.4.6",
+      "version": "1.4.7",
       "dependencies": {
         "hono": "catalog:",
       },
@@ -362,7 +362,7 @@
     },
     "packages/livekit-solid": {
       "name": "@thesolaceproject/livekit-components-solid",
-      "version": "1.4.6",
+      "version": "1.4.7",
       "dependencies": {
         "@livekit/components-core": "catalog:",
         "livekit-client": "catalog:",
@@ -378,7 +378,7 @@
     },
     "packages/plugin": {
       "name": "@thesolaceproject/emberharmony-plugin",
-      "version": "1.4.6",
+      "version": "1.4.7",
       "dependencies": {
         "@thesolaceproject/emberharmony-sdk": "workspace:*",
         "zod": "catalog:",
@@ -409,14 +409,14 @@
     },
     "packages/security-scanner": {
       "name": "@thesolaceproject/emberharmony-security-scanner",
-      "version": "1.4.6",
+      "version": "1.4.7",
       "dependencies": {
         "bun-osv-scanner": "2.0.0",
       },
     },
     "packages/slack": {
       "name": "@thesolaceproject/emberharmony-slack",
-      "version": "1.4.6",
+      "version": "1.4.7",
       "dependencies": {
         "@slack/bolt": "^3.17.1",
         "@thesolaceproject/emberharmony-sdk": "workspace:*",
@@ -429,7 +429,7 @@
     },
     "packages/ui": {
       "name": "@thesolaceproject/emberharmony-ui",
-      "version": "1.4.6",
+      "version": "1.4.7",
       "dependencies": {
         "@kobalte/core": "catalog:",
         "@pierre/diffs": "catalog:",
@@ -471,7 +471,7 @@
     },
     "packages/util": {
       "name": "@thesolaceproject/emberharmony-util",
-      "version": "1.4.6",
+      "version": "1.4.7",
       "dependencies": {
         "zod": "catalog:",
       },
@@ -482,7 +482,7 @@
     },
     "packages/web": {
       "name": "@thesolaceproject/emberharmony-web",
-      "version": "1.4.6",
+      "version": "1.4.7",
       "dependencies": {
         "@astrojs/cloudflare": "13.1.10",
         "@astrojs/markdown-remark": "6.3.1",
