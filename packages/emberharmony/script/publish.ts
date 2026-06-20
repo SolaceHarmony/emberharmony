@@ -27,7 +27,6 @@ const version = Object.values(binaries)[0] || Script.version
 
 await $`mkdir -p ./dist/${pkg.name}`
 await $`cp -r ./bin ./dist/${pkg.name}/bin`
-await $`cp ./script/postinstall.mjs ./dist/${pkg.name}/postinstall.mjs`
 
 // The published manifest is derived from the repo-root package.json. A failed
 // read or a missing field is a real misconfiguration, so surface it instead of
@@ -55,6 +54,25 @@ const license = requireString("license")
 const repository = requireMeta("repository")
 const bugs = requireMeta("bugs")
 
+// Restrict the wrapper to the platforms we actually ship a binary for, derived
+// from the built platform packages. There is no install script (intentionally —
+// it would trip npm's allow-scripts warning, and modern npm defers it unapproved
+// so it never runs anyway), so os/cpu are npm's only resolver-enforced signal to
+// reject a host we have no binary for. Without them, `npm i -g` on e.g. 32-bit
+// linux arm or freebsd would "succeed" and leave a wrapper whose binary can never
+// resolve. Platform package names are `<publishName>-<os>-<arch>[-baseline][-musl]`;
+// npm uses `win32` where our package token says `windows`.
+const osTokens = new Set<string>()
+const cpuTokens = new Set<string>()
+for (const key of Object.keys(binaries)) {
+  const suffix = key.startsWith(`${publishName}-`) ? key.slice(publishName.length + 1) : key
+  const [osToken, archToken] = suffix.split("-")
+  if (osToken) osTokens.add(osToken === "windows" ? "win32" : osToken)
+  if (archToken) cpuTokens.add(archToken)
+}
+const os = Array.from(osTokens).sort()
+const cpu = Array.from(cpuTokens).sort()
+
 await Bun.file(`./dist/${pkg.name}/package.json`).write(
   JSON.stringify(
     {
@@ -64,15 +82,21 @@ await Bun.file(`./dist/${pkg.name}/package.json`).write(
       repository,
       bugs,
       license,
+      // The bin wrapper is CommonJS (uses require()); declare it so Node never
+      // guesses the module system from an ambient default.
+      type: "commonjs",
       bin: {
         [cliName]: `bin/${cliName}`,
       },
-      scripts: {
-        postinstall: "bun ./postinstall.mjs || node ./postinstall.mjs",
-      },
       version: version,
+      // Only constrain when we actually have binaries; empty arrays would block
+      // every install. The one gap os/cpu cannot express (a supported os with no
+      // binary for a given arch) still fails loudly at first run via the
+      // bin/emberharmony wrapper (exit 1).
+      ...(os.length > 0 ? { os } : {}),
+      ...(cpu.length > 0 ? { cpu } : {}),
       optionalDependencies: binaries,
-      files: ["bin/**", "postinstall.mjs", "README.md", "LICENSE"],
+      files: ["bin/**", "README.md", "LICENSE"],
     },
     null,
     2,
