@@ -4,7 +4,7 @@
   "description": "EmberHarmony — the open source AI coding agent",
   "private": true,
   "type": "module",
-  "packageManager": "bun@1.3.8",
+  "packageManager": "bun@1.3.14",
   "scripts": {
     "dev": "bun install && bun run --cwd packages/emberharmony --conditions=browser src/index.ts",
     "dev:stack": "bun install && bun run script/dev-stack.ts",
@@ -31,7 +31,7 @@
       "packages/slack"
     ],
     "catalog": {
-      "@types/bun": "1.3.8",
+      "@types/bun": "1.3.14",
       "@octokit/rest": "22.0.0",
       "@hono/zod-validator": "0.4.2",
       "ulid": "3.0.1",
