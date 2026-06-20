@@ -82,14 +82,17 @@ await Bun.file(`./dist/${pkg.name}/package.json`).write(
       repository,
       bugs,
       license,
+      // The bin wrapper is CommonJS (uses require()); declare it so Node never
+      // guesses the module system from an ambient default.
+      type: "commonjs",
       bin: {
         [cliName]: `bin/${cliName}`,
       },
       version: version,
       // Only constrain when we actually have binaries; empty arrays would block
-      // every install. The residual gaps os/cpu cannot express (a supported os
-      // with no binary for that arch, e.g. windows-arm64, or `--omit=optional`)
-      // still fail loudly at first run via the bin/emberharmony wrapper (exit 1).
+      // every install. The one gap os/cpu cannot express (a supported os with no
+      // binary for a given arch) still fails loudly at first run via the
+      // bin/emberharmony wrapper (exit 1).
       ...(os.length > 0 ? { os } : {}),
       ...(cpu.length > 0 ? { cpu } : {}),
       optionalDependencies: binaries,
