@@ -5,6 +5,31 @@ All notable changes to EmberHarmony will be documented in this file.
 This project is a fork of [opencode](https://github.com/opencode-ai/opencode),
 rebranded and maintained by [The Solace Project](https://github.com/SolaceHarmony).
 
+## [1.4.7] - 2026-06-20
+
+### Added
+
+- **Native Windows on ARM64 support.** Bumped Bun 1.3.8 → 1.3.14, which is the
+  first Bun release to ship a `windows-aarch64` runtime, and added `win32-arm64`
+  to the build matrix. `npm i -g @thesolaceproject/emberharmony` now installs a
+  native ARM64 binary on Windows-on-ARM (incl. Parallels VMs on Apple Silicon)
+  instead of relying on x64 emulation. Verified: Bun 1.3.14 cross-compiles a
+  `PE32+ Aarch64` executable. (The remaining unbuilt platforms — 32-bit ARM,
+  BSD — are ones Bun does not produce a runtime for.)
+
+### Fixed
+
+- **`npm i -g @thesolaceproject/emberharmony` printed a scary `allow-scripts`
+  approval warning** — the published package declared a `postinstall` script
+  (`bun ./postinstall.mjs || node ./postinstall.mjs`), which recent npm flags as
+  an unapproved install script. But the postinstall was purely diagnostic: on
+  non-Windows it only logged "binary verified" (no symlink), and on Windows it
+  did nothing. The platform binary is an `optionalDependency` that npm installs
+  regardless, and the runtime `bin/emberharmony` wrapper resolves it on its own —
+  so the postinstall was unnecessary. The publish flow no longer emits a
+  `postinstall` script (and the orphaned `postinstall.mjs` is removed), which
+  eliminates the warning with zero functional change to install or runtime.
+
 ## [1.4.6] - 2026-06-14
 
 ### Fixed
