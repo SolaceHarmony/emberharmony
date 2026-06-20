@@ -5,12 +5,7 @@
   "private": true,
   "type": "module",
   "packageManager": "bun@1.3.8",
-  "engines": {
-    "bun": ">=1.3.8",
-    "node": ">=22.0.0"
-  },
   "scripts": {
-    "preinstall": "node -e \"if(process.env.npm_config_user_agent?.includes('npm')||process.env.npm_config_user_agent?.includes('yarn')||process.env.npm_config_user_agent?.includes('pnpm')){console.error('\\\\n\\\\u001b[31mError: This project requires Bun as the package manager.\\\\u001b[0m\\\\n\\\\nPlease use:\\\\n  bun install\\\\n\\\\nSee https://bun.sh for installation instructions.\\\\n');process.exit(1)}\"",
     "dev": "bun install && bun run --cwd packages/emberharmony --conditions=browser src/index.ts",
     "dev:stack": "bun install && bun run script/dev-stack.ts",
     "web": "bun install && bun run --cwd packages/emberharmony web",
