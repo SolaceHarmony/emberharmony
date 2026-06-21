@@ -5,6 +5,27 @@ All notable changes to EmberHarmony will be documented in this file.
 This project is a fork of [opencode](https://github.com/opencode-ai/opencode),
 rebranded and maintained by [The Solace Project](https://github.com/SolaceHarmony).
 
+## [Unreleased]
+
+### Changed
+
+- **~37 MB smaller install per platform.** The published platform packages
+  (`@thesolaceproject/emberharmony-<os>-<arch>`) were shipping the external
+  `*.js.map` sourcemaps Bun emits next to the compiled binary (~37 MB:
+  `index.js.map` 20 MB + `worker.js.map` 16 MB + `parser.worker.js.map`) — dead
+  weight the standalone executable never loads at runtime. Two changes:
+  - **Release builds no longer generate external sourcemaps.** `build.ts` now
+    sets `sourcemap: "none"` whenever `EMBERHARMONY_RELEASE` is set (every
+    npm-published build, `latest` and `dev` channels alike); local/branch dev
+    builds keep `external` maps for debugging. This also shrinks the GitHub
+    release archives and speeds release builds.
+  - **Defense-in-depth `files` allowlist** on each platform package manifest
+    (binary + `RELEASE_NOTES.md`), so a platform tarball can only ever contain
+    the executable regardless of what else lands in `dist/<pkg>/bin/`.
+
+  Net: a darwin-arm64 global install drops from ~135 MB to ~98 MB, and ~440 MB
+  of dead sourcemaps stop being stored across all 12 platform packages.
+
 ## [1.4.7] - 2026-06-20
 
 ### Added
