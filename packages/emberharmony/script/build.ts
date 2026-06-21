@@ -175,7 +175,12 @@ for (const item of targets) {
     conditions: ["browser"],
     tsconfig: "./tsconfig.json",
     plugins: [solidPlugin],
-    sourcemap: "external",
+    // Release builds (any npm-published channel — EMBERHARMONY_RELEASE is set
+    // for both `latest` and `dev` releases) emit no external sourcemaps: the
+    // standalone compiled binary never loads them at runtime, so they were only
+    // ~37 MB of dead weight per platform package. Local/branch dev builds keep
+    // external maps for debugging.
+    sourcemap: Script.release ? "none" : "external",
     compile: {
       autoloadBunfig: false,
       autoloadDotenv: false,
@@ -200,6 +205,7 @@ for (const item of targets) {
 
   await $`rm -rf ./dist/${name}/bin/tui`
   const packageName = name.replace(pkg.name, publishName)
+  const binaryFile = `${cliName}${item.os === "win32" ? ".exe" : ""}`
   await Bun.file(`dist/${name}/package.json`).write(
     JSON.stringify(
       {
@@ -207,6 +213,19 @@ for (const item of targets) {
         version: Script.version,
         os: [item.os],
         cpu: [item.arch],
+        // Ship only the executable (+ release notes when they're actually
+        // written — see the EMBERHARMONY_RELEASE_NOTES block below). Without this
+        // allowlist, bun/npm pack includes everything in bin/ — notably the
+        // ~37 MB of external `*.js.map` sourcemaps Bun emits next to the compiled
+        // binary, which the standalone executable never loads at runtime. The
+        // maps stay on disk in dist/ for release archives; they just don't ship
+        // to npm. RELEASE_NOTES.md is gated on the same condition that creates it
+        // so the allowlist never names a missing file (dev builds, or releases
+        // published without notes).
+        files: [
+          `bin/${binaryFile}`,
+          ...(Script.release && process.env.EMBERHARMONY_RELEASE_NOTES ? ["bin/RELEASE_NOTES.md"] : []),
+        ],
       },
       null,
       2,
