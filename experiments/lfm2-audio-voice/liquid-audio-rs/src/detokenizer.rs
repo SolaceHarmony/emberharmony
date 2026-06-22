@@ -3,12 +3,18 @@
 //! `FusedEmbedding` (codes → embeddings) → ×6 nearest upsample → `Lfm2Model`
 //! backbone under a sliding-window causal mask → Linear(512→1282) → split into
 //! log-magnitude + angle → polar → Vocos-style `ISTFT` → 24 kHz waveform.
-//! The ISTFT uses an inverse FFT (`rustfft`) + overlap-add with window-envelope
-//! normalization ("same" padding), faithful to the Python.
+//!
+//! The ISTFT runs **natively in candle on the model device** (CPU or Metal), in f32 —
+//! a port of `torch.fft.irfft` (MPS = `MPSGraph HermiteanToRealFFTWithTensor`,
+//! f32-only) followed by the Vocos/torchaudio overlap-add. The inverse real FFT is the
+//! inverse-DFT basis matmul (`y = Re·Cw + Im·Sw`, run through candle's tiled `matmul`),
+//! and the windowed overlap-add + window-envelope normalization are `conv_transpose1d`
+//! with an identity kernel at stride `hop`. f32 throughout, matching torch's reference
+//! (the detokenizer backbone was trained against torch's f32 irfft, so f32 — not f64 —
+//! is the faithful match).
 
-use candle_core::{IndexOp, Result, Tensor};
+use candle_core::{Result, Tensor};
 use candle_nn::{linear, Embedding, Linear, Module, VarBuilder};
-use rustfft::{num_complex::Complex, FftPlanner};
 
 use crate::model::lfm2_hf::{Cache, Lfm2Config, Model as Lfm2Model};
 
@@ -43,76 +49,103 @@ impl FusedEmbedding {
 }
 
 /// Vocos-style inverse STFT, "same" padding. n_fft=1280, hop=320, win=1280.
+///
+/// Everything is precomputed on the device so each call is matmul + conv_transpose1d.
 struct Istft {
-    n_fft: usize,
     hop: usize,
-    window: Vec<f32>,
+    /// `(win_length - hop)/2` — the "same"-padding trim on each side.
+    pad: usize,
+    /// Inverse real-DFT basis `(freq, n_fft)` with the Hermitian weights and the
+    /// `norm="backward"` `1/n` scale folded in: `y = Re·cw + Im·sw`. cos/sin computed
+    /// in f64, stored f32 (accurate basis, f32 storage — matching torch's f32 irfft).
+    cw: Tensor,
+    sw: Tensor,
+    /// Analysis window `(1, n_fft, 1)` for the broadcast multiply, and its square for
+    /// the overlap envelope.
+    window: Tensor,
+    win_sq: Tensor,
+    /// Identity overlap-add kernel `(n_fft, 1, n_fft)` for `conv_transpose1d`.
+    ola: Tensor,
 }
 
 impl Istft {
     fn new(n_fft: usize, hop: usize, win_length: usize, vb: VarBuilder) -> Result<Self> {
-        let window = vb.get(win_length, "window")?.to_dtype(candle_core::DType::F32)?.to_vec1::<f32>()?;
-        Ok(Self { n_fft, hop, window })
+        let dev = vb.device().clone();
+        let window_vec = vb.get(win_length, "window")?.to_dtype(candle_core::DType::F32)?.to_vec1::<f32>()?;
+        // Center the analysis window in an n_fft frame (torch pads when win < n_fft).
+        let win: Vec<f32> = if window_vec.len() == n_fft {
+            window_vec
+        } else {
+            let left = (n_fft - window_vec.len()) / 2;
+            let mut w = vec![0f32; n_fft];
+            w[left..left + window_vec.len()].copy_from_slice(&window_vec);
+            w
+        };
+
+        // Inverse real-DFT basis, norm="backward" (1/n on the inverse), Hermitian
+        // weights a_k (DC and even-n Nyquist ×1, the rest ×2). torch.fft.irfft ignores
+        // the imag of DC/Nyquist, which falls out here since sw[0]=sw[n/2]=0.
+        let freq = n_fft / 2 + 1;
+        let two_pi = 2.0 * std::f64::consts::PI;
+        let scale = 1.0 / n_fft as f64;
+        let mut cw = vec![0f32; freq * n_fft];
+        let mut sw = vec![0f32; freq * n_fft];
+        for k in 0..freq {
+            let a = if k == 0 || (n_fft % 2 == 0 && k == n_fft / 2) { 1.0 } else { 2.0 };
+            for j in 0..n_fft {
+                let ang = two_pi * k as f64 * j as f64 / n_fft as f64;
+                cw[k * n_fft + j] = (a * ang.cos() * scale) as f32;
+                sw[k * n_fft + j] = (-(a * ang.sin() * scale)) as f32;
+            }
+        }
+        let cw = Tensor::from_vec(cw, (freq, n_fft), &dev)?;
+        let sw = Tensor::from_vec(sw, (freq, n_fft), &dev)?;
+
+        let win_sq_vec: Vec<f32> = win.iter().map(|w| w * w).collect();
+        let window = Tensor::from_vec(win.clone(), (1, n_fft, 1), &dev)?;
+        let win_sq = Tensor::from_vec(win_sq_vec, (1, n_fft, 1), &dev)?;
+
+        // Identity kernel: conv_transpose1d places frame sample j at output t·hop + j,
+        // i.e. overlap-add. ola[ci][0][j] = (ci==j).
+        let mut eye = vec![0f32; n_fft * n_fft];
+        for i in 0..n_fft {
+            eye[i * n_fft + i] = 1.0;
+        }
+        let ola = Tensor::from_vec(eye, (n_fft, 1, n_fft), &dev)?;
+
+        let pad = (win_length - hop) / 2;
+        Ok(Self { hop, pad, cw, sw, window, win_sq, ola })
     }
 
-    /// `re`/`im`: (1, n_fft/2+1, T) → waveform (1, L).
-    ///
-    /// The inverse FFT, overlap-add, and window-envelope normalization run in **f64**
-    /// (the same numeric-stability repair as the mel front-end STFT), rounding to f32
-    /// only at the output boundary. The ISTFT is a fixed post-network transform — no
-    /// learned layer adapts to its rounding — so f64 is strictly more faithful to the
-    /// spectrogram the model emitted than torch's f32 `irfft` (which on MPS is f32-only
-    /// and on CUDA runs f32/bf16, never promoted to f64).
+    /// `re`/`im`: `(B, n_fft/2+1, T)` complex spectrogram → waveform `(B, L)`.
     fn forward(&self, re: &Tensor, im: &Tensor) -> Result<Tensor> {
-        let (_b, n, t) = re.dims3()?;
-        let device = re.device().clone();
-        let re = re.i(0)?.to_vec2::<f32>()?; // [n][t]
-        let im = im.i(0)?.to_vec2::<f32>()?;
-        let n_fft = self.n_fft;
-        let hop = self.hop;
-        let win: Vec<f64> = self.window.iter().map(|&w| w as f64).collect();
-        let pad = (win.len() - hop) / 2;
-        let out_size = (t - 1) * hop + win.len();
-        let win_sq: Vec<f64> = win.iter().map(|w| w * w).collect();
+        let (b, freq, t) = re.dims3()?;
+        let n = self.cw.dim(1)?; // n_fft
 
-        let mut planner = FftPlanner::<f64>::new();
-        let ifft = planner.plan_fft_inverse(n_fft);
+        // irfft along the freq axis as the inverse-DFT basis matmul:
+        // frames[b,t,:] = Re[b,:,t]·cw + Im[b,:,t]·sw. Contract freq via candle matmul.
+        let re_t = re.transpose(1, 2)?.contiguous()?.reshape((b * t, freq))?; // (B·T, freq)
+        let im_t = im.transpose(1, 2)?.contiguous()?.reshape((b * t, freq))?;
+        let frames = (re_t.matmul(&self.cw)? + im_t.matmul(&self.sw)?)?; // (B·T, n_fft)
+        let frames = frames.reshape((b, t, n))?.transpose(1, 2)?.contiguous()?; // (B, n_fft, T)
 
-        let mut y = vec![0f64; out_size];
-        let mut env = vec![0f64; out_size];
-        let mut buf = vec![Complex { re: 0f64, im: 0f64 }; n_fft];
-        for ti in 0..t {
-            for c in buf.iter_mut() {
-                *c = Complex { re: 0.0, im: 0.0 };
-            }
-            // one-sided → full hermitian spectrum; DC & Nyquist imag ignored (irfft)
-            buf[0] = Complex { re: re[0][ti] as f64, im: 0.0 };
-            for k in 1..n {
-                buf[k] = Complex { re: re[k][ti] as f64, im: im[k][ti] as f64 };
-            }
-            if n_fft.is_multiple_of(2) {
-                buf[n_fft / 2] = Complex { re: re[n - 1][ti] as f64, im: 0.0 };
-            }
-            for k in 1..(n_fft / 2) {
-                buf[n_fft - k] = buf[k].conj();
-            }
-            ifft.process(&mut buf);
-            let scale = 1.0 / n_fft as f64;
-            for j in 0..n_fft {
-                let v = buf[j].re * scale * win[j];
-                y[ti * hop + j] += v;
-                env[ti * hop + j] += win_sq[j];
-            }
-        }
+        // Window, then overlap-add (conv_transpose1d, stride=hop) → (B, out_size).
+        let frames = frames.broadcast_mul(&self.window)?;
+        let y = frames.conv_transpose1d(&self.ola, 0, 0, self.hop, 1, 1)?.squeeze(1)?;
+        // Window-overlap envelope: same overlap-add applied to win² over every frame.
+        let env = self
+            .win_sq
+            .broadcast_as((b, n, t))?
+            .contiguous()?
+            .conv_transpose1d(&self.ola, 0, 0, self.hop, 1, 1)?
+            .squeeze(1)?;
 
-        let lo = pad;
-        let hi = out_size - pad;
-        let mut out = Vec::with_capacity(hi - lo);
-        for i in lo..hi {
-            out.push((y[i] / env[i]) as f32);
-        }
-        let len = out.len();
-        Tensor::from_vec(out, (1, len), &device)
+        // Trim the "same" padding on both sides and normalize by the envelope.
+        let out_size = (t - 1) * self.hop + n;
+        let valid = out_size - 2 * self.pad;
+        let y = y.narrow(1, self.pad, valid)?;
+        let env = env.narrow(1, self.pad, valid)?;
+        y.broadcast_div(&env)
     }
 }
 
@@ -174,5 +207,76 @@ impl LFM2AudioDetokenizer {
         let re = (&abs * angle.cos()?)?;
         let im = (&abs * angle.sin()?)?;
         self.istft.forward(&re, &im)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::{DType, Device};
+    use std::collections::HashMap;
+
+    // Independent f64 reference: per-frame hermitian inverse real DFT (norm="backward")
+    // + windowed overlap-add + window-envelope normalization ("same" trim) — the exact
+    // algorithm the candle Istft realizes, in f64.
+    fn ref_istft(re: &[Vec<f32>], im: &[Vec<f32>], window: &[f32], n_fft: usize, hop: usize) -> Vec<f32> {
+        let t = re[0].len();
+        let freq = n_fft / 2 + 1;
+        let win: Vec<f64> = window.iter().map(|&w| w as f64).collect();
+        let win_sq: Vec<f64> = win.iter().map(|w| w * w).collect();
+        let pad = (window.len() - hop) / 2;
+        let out_size = (t - 1) * hop + n_fft;
+        let two_pi = 2.0 * std::f64::consts::PI;
+        let (mut y, mut env) = (vec![0f64; out_size], vec![0f64; out_size]);
+        for ti in 0..t {
+            for j in 0..n_fft {
+                let mut acc = re[0][ti] as f64; // k=0 (DC, imag ignored)
+                for k in 1..(n_fft / 2) {
+                    let ang = two_pi * k as f64 * j as f64 / n_fft as f64;
+                    acc += 2.0 * (re[k][ti] as f64 * ang.cos() - im[k][ti] as f64 * ang.sin());
+                }
+                let ang = two_pi * (n_fft / 2) as f64 * j as f64 / n_fft as f64;
+                acc += re[freq - 1][ti] as f64 * ang.cos(); // Nyquist, weight 1, imag ignored
+                let v = acc / n_fft as f64;
+                y[ti * hop + j] += v * win[j];
+                env[ti * hop + j] += win_sq[j];
+            }
+        }
+        (pad..out_size - pad).map(|i| (y[i] / env[i]) as f32).collect()
+    }
+
+    #[test]
+    fn candle_istft_matches_f64_reference() {
+        let dev = Device::Cpu;
+        let (n_fft, hop, t) = (16usize, 4usize, 5usize);
+        let freq = n_fft / 2 + 1;
+        // symmetric Hann window (periodic=False), strictly positive envelope under OLA.
+        let window: Vec<f32> = (0..n_fft)
+            .map(|i| (std::f64::consts::PI * i as f64 / (n_fft - 1) as f64).sin().powi(2) as f32)
+            .collect();
+        let re: Vec<Vec<f32>> = (0..freq)
+            .map(|k| (0..t).map(|ti| ((k * 7 + ti * 3) as f32 * 0.1).cos()).collect())
+            .collect();
+        let im: Vec<Vec<f32>> = (0..freq)
+            .map(|k| (0..t).map(|ti| ((k * 5 + ti * 2) as f32 * 0.13).sin()).collect())
+            .collect();
+        let exp = ref_istft(&re, &im, &window, n_fft, hop);
+
+        // Build the candle Istft via a VarBuilder carrying the window.
+        let win_t = Tensor::from_vec(window.clone(), (n_fft,), &dev).unwrap();
+        let vb = VarBuilder::from_tensors(HashMap::from([("window".to_string(), win_t)]), DType::F32, &dev);
+        let istft = Istft::new(n_fft, hop, n_fft, vb).unwrap();
+        // (1, freq, T) spectra.
+        let re_flat: Vec<f32> = (0..freq).flat_map(|k| re[k].clone()).collect();
+        let im_flat: Vec<f32> = (0..freq).flat_map(|k| im[k].clone()).collect();
+        let re_t = Tensor::from_vec(re_flat, (1, freq, t), &dev).unwrap();
+        let im_t = Tensor::from_vec(im_flat, (1, freq, t), &dev).unwrap();
+        let got: Vec<f32> = istft.forward(&re_t, &im_t).unwrap().flatten_all().unwrap().to_vec1().unwrap();
+
+        assert_eq!(got.len(), exp.len(), "ISTFT length mismatch");
+        let maxd = got.iter().zip(exp.iter()).fold(0f32, |m, (a, e)| m.max((a - e).abs()));
+        let scale = exp.iter().fold(0f32, |m, &x| m.max(x.abs())).max(1e-6);
+        eprintln!("candle ISTFT vs f64 ref: max diff {maxd:.2e} (rel {:.2e})", maxd / scale);
+        assert!(maxd / scale < 1e-4, "candle ISTFT vs f64 ref rel {}", maxd / scale);
     }
 }
