@@ -61,6 +61,7 @@ mod dd_complex_mul;
 mod dw3;
 mod fused_fft_conv;
 mod fused_fft_conv_dd;
+mod irfft;
 #[cfg(feature = "metal")]
 mod metal_util;
 
@@ -73,3 +74,4 @@ pub use dd_complex_mul::complex_mul_dd;
 pub use dw3::depthwise3_causal;
 pub use fused_fft_conv::{fused_fft_conv, FusedFftConv};
 pub use fused_fft_conv_dd::{fused_fft_conv_dd, FusedFftConvDd};
+pub use irfft::{irfft, irfft_dd, FftNorm};
