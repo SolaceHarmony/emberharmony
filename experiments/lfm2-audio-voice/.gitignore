@@ -1,6 +1,20 @@
-# Large/local + build artifacts — not committed
-models/                  # downloaded GGUF weights
-llama.cpp/               # built llama.cpp checkout (PR #18641)
-upstream-liquid-audio/   # reference clone of Liquid4All/liquid-audio (port source)
-/target/                 # cargo build output
+# Large/local + build artifacts — not committed.
+# NOTE: keep comments on their own lines — git treats a trailing "# ..."
+# as part of the pattern, not a comment.
+
+# downloaded GGUF weights
+models/
+# local HF model dir (model.safetensors, tokenizer, config) — parity fixture
+model/
+# built llama.cpp checkout (PR #18641)
+llama.cpp/
+# reference clone of Liquid4All/liquid-audio (port source)
+upstream-liquid-audio/
+# npm staging scratch
+.voice-runtime-stage/
+# session scratch
+solace_prompt.txt
+solace_seed.txt
+# cargo build output
+/target/
 *.wav

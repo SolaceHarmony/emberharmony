@@ -75,6 +75,22 @@ impl LFM2AudioProcessor {
         Self { tokenizer, audio, audio_out, device }
     }
 
+    /// PORT: `LFM2AudioProcessor.from_pretrained(repo_id, *, device)` (py 56).
+    ///
+    /// The Python classmethod resolves the model dir (`get_model_dir`), reads
+    /// `config.json`, and constructs the processor (tokenizer + mel featurizer +
+    /// audio-out backend) on `device`. The crate's loader already performs that
+    /// exact construction inside [`crate::loader::from_pretrained`] (it builds both
+    /// the model and the processor in one pass over the checkpoint). To avoid
+    /// duplicating the loader logic this delegates to it and returns just the
+    /// processor — the model is dropped here (the Python classmethod likewise only
+    /// returns the processor). `dtype` mirrors the Python `to(device, dtype)` move
+    /// folded into load.
+    pub fn from_pretrained(dir: &Path, dtype: candle_core::DType, device: &Device) -> Result<Self> {
+        let (_model, processor) = crate::loader::from_pretrained(dir, dtype, device)?;
+        Ok(processor)
+    }
+
     pub fn load_tokenizer(dir: &Path) -> Result<Tokenizer> {
         Tokenizer::from_file(dir.join("tokenizer.json")).map_err(|e| candle_core::Error::Msg(format!("tokenizer: {e}")))
     }
@@ -167,6 +183,69 @@ impl<'a> ChatState<'a> {
         self.modality_flag = Tensor::cat(&[&self.modality_flag, &new_mod], 1)?;
         self.audio_in_lens = Tensor::cat(&[&self.audio_in_lens, &new_len], 0)?;
         Ok(())
+    }
+
+    /// PORT: `ChatState.add_audio(wave, sampling_rate)` (py 226).
+    ///
+    /// Faithful port of the full Python method: assert `wave` is `(1, L)`,
+    /// resample from `sampling_rate` to 16 kHz (Python:
+    /// `torchaudio.functional.resample(wave, sampling_rate, 16_000)`), run the mel
+    /// front-end, then append the new audio-in mel, its `AUDIO_IN` modality flags
+    /// (one per `mel2emb_len(frames)`), and the frame length — exactly the same
+    /// three `torch.cat`s as Python (py 248-250).
+    ///
+    /// `torchaudio`'s resampler uses a windowed-sinc kernel; matching the
+    /// data-mapper's faithful, dependency-free stand-in (`data::mapper::resample`)
+    /// this uses linear interpolation, `L' = round(L * 16000 / sampling_rate)`.
+    /// The post-resample mel/append path delegates to [`Self::add_audio_16k`] so
+    /// the parity computation is shared and unchanged.
+    pub fn add_audio(&mut self, wave: &Tensor, sampling_rate: u32) -> Result<()> {
+        // Python: `assert len(wave.shape) == 2` and `assert wave.shape[0] == 1`.
+        if wave.rank() != 2 {
+            return Err(candle_core::Error::Msg(format!(
+                "add_audio: wave must be 2-D (1, L), got rank {}",
+                wave.rank()
+            )));
+        }
+        if wave.dim(0)? != 1 {
+            return Err(candle_core::Error::Msg(format!(
+                "add_audio: wave must have 1 channel, got {}",
+                wave.dim(0)?
+            )));
+        }
+
+        // Python: `wave = torchaudio.functional.resample(wave, sampling_rate, 16_000)`.
+        let wave16 = Self::resample_16k(wave, sampling_rate)?;
+        self.add_audio_16k(&wave16)
+    }
+
+    /// `torchaudio.functional.resample(wave, orig, 16_000)` — linear-interpolation
+    /// stand-in (no torch). Mirrors `data::mapper::resample`; kept private so the
+    /// processor port stays self-contained. `wave` is `(1, L)` → `(1, L')` f32 with
+    /// `L' = round(L * 16000 / orig)`.
+    fn resample_16k(wave: &Tensor, orig: u32) -> Result<Tensor> {
+        const TARGET: u32 = 16_000;
+        if orig == TARGET {
+            return wave.contiguous();
+        }
+        let x = wave.flatten_all()?.to_dtype(candle_core::DType::F32)?.to_vec1::<f32>()?;
+        let n = x.len();
+        if n == 0 {
+            return Ok(wave.clone());
+        }
+        let ratio = TARGET as f64 / orig as f64;
+        let out_len = (((n as f64) * ratio).round() as usize).max(1);
+        let mut y = vec![0f32; out_len];
+        let step = orig as f64 / TARGET as f64; // input samples per output sample
+        for (i, slot) in y.iter_mut().enumerate() {
+            let src = i as f64 * step;
+            let i0 = src.floor() as usize;
+            let frac = (src - i0 as f64) as f32;
+            let a = x[i0.min(n - 1)];
+            let b = x[(i0 + 1).min(n - 1)];
+            *slot = a + (b - a) * frac;
+        }
+        Tensor::from_vec(y, (1, out_len), wave.device())
     }
 
     pub fn new_turn(&mut self, role: &str) -> Result<()> {

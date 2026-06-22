@@ -13,6 +13,7 @@
 //! softmax, and `torch.multinomial`-equivalent draw via a seeded `StdRng`.
 
 use candle_core::{DType, IndexOp, Result, Tensor};
+use candle_nn::ops::log_softmax;
 use candle_nn::{linear, Linear, Module, VarBuilder};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 
@@ -21,7 +22,7 @@ use crate::model::lfm2_hf::{Cache as LfmCache, Lfm2Config, Model as Lfm2Model};
 use crate::model::mlp::MLP;
 use crate::model::transformer::{HeadStyle, LayerKvCache, Mha, RawLmBackbone, SharedEmbedding, StandardBlock};
 use crate::processor::ChatState;
-use crate::utils::LFMModality;
+use crate::utils::{mel2emb_len, LFMModality};
 
 /// +1 over 2048 for the EOAudio token.
 const AUDIO_VOCAB_SIZE: usize = 2048 + 1;
@@ -31,6 +32,34 @@ pub struct DepthformerConfig {
     pub layers: usize,
     pub dim: usize,
     pub tie: bool,
+}
+
+/// Loss hyperparameters consumed by `LFM2AudioModel::new` to build the
+/// `audio_loss_weights` buffer (Python `__init__` 104-113) and to stash the
+/// loss multipliers (`self.conf.text_loss_multiplier` / `audio_loss_multiplier`).
+/// Bundled into one struct to keep `new`'s signature clean; these are construction
+/// inputs only and never affect any generation/forward computation path.
+#[derive(Debug, Clone)]
+pub struct LossConf {
+    /// `Literal["log", "linear"]` — the per-codebook loss-weight schedule.
+    pub codebook_weight: String,
+    pub semantic_codebook_factor: f64,
+    pub text_loss_multiplier: f64,
+    pub audio_loss_multiplier: f64,
+}
+
+impl Default for LossConf {
+    fn default() -> Self {
+        // Mirrors the `LFM2AudioConfig` field defaults (`text/audio_loss_multiplier
+        // = 1.0`) and the `from_pretrained` config fallbacks (`codebook_weight =
+        // "linear"`, `semantic_codebook_factor = 1.0`).
+        Self {
+            codebook_weight: "linear".to_string(),
+            semantic_codebook_factor: 1.0,
+            text_loss_multiplier: 1.0,
+            audio_loss_multiplier: 1.0,
+        }
+    }
 }
 
 /// `LFM2_HFConfig` — locates the HF backbone checkpoint (dataclass). The loader
@@ -66,12 +95,12 @@ pub struct LFM2AudioConfig {
 /// `LFM2AudioModelOutput` — output of the **training** `forward` (cross-entropy
 /// losses + token counts).
 ///
-/// PORT: the training `forward(batch) -> LFM2AudioModelOutput` and its
-/// `logits(batch)` consume a `LFM2AudioModelInput` training batch from the
-/// `liquid_audio.data` pipeline (`data/types.py`), which is the training
-/// subsystem — outside this inference-port's scope (the model here is the
-/// synchronous streaming generator). The output type is provided for the 1:1
-/// inventory; the loss `forward` itself belongs with the (unported) trainer.
+/// PORT: the training `forward(batch) -> LFM2AudioModelOutput` (see
+/// [`LFM2AudioModel::forward`]) and its `logits(batch)` consume a
+/// `LFM2AudioModelInput` training batch assembled by the `liquid_audio.data`
+/// pipeline (`data/types.py`). `crate::trainer::Trainer::forward` computes the
+/// identical loss math via `logits`; the model's own `forward` is self-contained
+/// (it holds the `audio_loss_weights` buffer + loss multipliers built in `new`).
 #[derive(Debug, Clone)]
 pub struct LFM2AudioModelOutput {
     pub loss: Tensor,
@@ -198,6 +227,25 @@ fn sample_token(logits: &Tensor, temperature: Option<f64>, top_k: Option<usize>,
     Ok((v.len() - 1) as u32) // float-rounding guard: fall back to the last bin
 }
 
+/// `nn.functional.cross_entropy(logits, labels, ignore_index=-100, reduction="none")`
+/// — per-row negative log-likelihood. Returns `(N,)`; an empty input returns `(0,)`.
+/// candle's `candle_nn::loss::cross_entropy` mean-reduces, so it can't supply the
+/// per-token vector the weighted-loss normalization in `forward` needs. Labels here
+/// come from supervised masks, so `-100` (ignore_index) never occurs in practice;
+/// the per-row form honors it implicitly (those rows would simply not appear).
+/// Identical to `crate::trainer::ce_none` (kept here so `forward` is self-contained).
+fn ce_none(logits: &Tensor, labels: &Tensor) -> Result<Tensor> {
+    let n = logits.dim(0)?;
+    if n == 0 {
+        return Tensor::zeros((0,), DType::F32, logits.device());
+    }
+    let logp = log_softmax(&logits.to_dtype(DType::F32)?, 1)?; // (N, V)
+    let labels = labels.to_dtype(DType::U32)?;
+    // gather the log-prob of each row's true class, negate → per-row NLL.
+    let picked = logp.gather(&labels.unsqueeze(1)?, 1)?.squeeze(1)?; // (N,)
+    picked.neg()
+}
+
 pub struct LFM2AudioModel {
     lfm: Lfm2Model,
     lfm_cfg: Lfm2Config,
@@ -213,6 +261,14 @@ pub struct LFM2AudioModel {
     interleaved_n_text: usize,
     interleaved_n_audio: usize,
     hidden: usize,
+    /// `audio_loss_weights` buffer (Python `__init__` 104-113): the per-codebook
+    /// loss weighting, `(C,)`. Construction-only (not used by any generation path);
+    /// consumed by the training `forward`.
+    audio_loss_weights: Tensor,
+    /// `self.conf.text_loss_multiplier` / `audio_loss_multiplier` — training-loss
+    /// scalars (Python `LFM2AudioConfig`). Read only by `forward`.
+    text_loss_multiplier: f64,
+    audio_loss_multiplier: f64,
 }
 
 impl LFM2AudioModel {
@@ -224,6 +280,7 @@ impl LFM2AudioModel {
         codebooks: usize,
         interleaved_n_text: usize,
         interleaved_n_audio: usize,
+        loss_conf: &LossConf,
         vb: VarBuilder,
     ) -> Result<Self> {
         let hidden = lfm_cfg.hidden_size;
@@ -253,6 +310,34 @@ impl LFM2AudioModel {
 
         let codebook_offsets = (0..codebooks as i64).map(|i| i * AUDIO_VOCAB_SIZE as i64).collect();
 
+        // `audio_loss_weights` buffer — Python `__init__` 104-113:
+        // ```python
+        // if codebook_weight == "log":
+        //     weights = (linspace(1, 0, C) * log(semantic_codebook_factor)).exp()
+        // else:
+        //     weights = ones(C); weights[0] *= semantic_codebook_factor
+        // ```
+        // A registered buffer loaded from / co-located with the checkpoint; built
+        // here from config (additive, no effect on any forward/generation path).
+        let dev = vb.device();
+        let weights: Vec<f32> = if loss_conf.codebook_weight == "log" {
+            let log_factor = loss_conf.semantic_codebook_factor.ln();
+            (0..codebooks)
+                .map(|i| {
+                    // linspace(1, 0, C)[i] = 1 - i/(C-1)  (C==1 ⇒ the single point 1.0)
+                    let t = if codebooks > 1 { 1.0 - i as f64 / (codebooks as f64 - 1.0) } else { 1.0 };
+                    (t * log_factor).exp() as f32
+                })
+                .collect()
+        } else {
+            let mut w = vec![1.0f32; codebooks];
+            if let Some(first) = w.first_mut() {
+                *first *= loss_conf.semantic_codebook_factor as f32;
+            }
+            w
+        };
+        let audio_loss_weights = Tensor::from_vec(weights, (codebooks,), dev)?;
+
         Ok(Self {
             lfm,
             lfm_cfg,
@@ -268,7 +353,26 @@ impl LFM2AudioModel {
             interleaved_n_text,
             interleaved_n_audio,
             hidden,
+            audio_loss_weights,
+            text_loss_multiplier: loss_conf.text_loss_multiplier,
+            audio_loss_multiplier: loss_conf.audio_loss_multiplier,
         })
+    }
+
+    /// `from_pretrained(dir, dtype, device)` — load the model + processor from a
+    /// local model directory (Python `LFM2AudioModel.from_pretrained`, 135-169).
+    /// A thin delegation to [`crate::loader::from_pretrained`], which parses
+    /// `config.json` (including `codebook_weight` / `semantic_codebook_factor` /
+    /// `text_loss_multiplier` / `audio_loss_multiplier`), memory-maps the
+    /// safetensors, and constructs both the model and its [`LFM2AudioProcessor`]
+    /// (Python returns just the model; the processor is loaded alongside here, as
+    /// the rest of this crate's entry points do). No loader logic is duplicated.
+    pub fn from_pretrained(
+        dir: &std::path::Path,
+        dtype: DType,
+        device: &candle_core::Device,
+    ) -> Result<(Self, crate::processor::LFM2AudioProcessor)> {
+        crate::loader::from_pretrained(dir, dtype, device)
     }
 
     /// Run the FastConformer encoder over mel features `(B, feat_in, T)` →
@@ -408,7 +512,32 @@ impl LFM2AudioModel {
             let dtok = Tensor::cat(&[&dtok.narrow(1, c - 1, 1)?, &dtok.narrow(1, 0, c - 1)?], 1)?;
             din = (din + dtok)?;
 
-            let dout = self.depthformer.forward(&din, None)?; // (n_a, C, dd), causally masked
+            // Split (Python 435-440): the depthformer cannot handle a batch dim
+            // > 16k (= 2**14). When `n` along dim 0 reaches 2**14, run it on
+            // `2**k` near-equal chunks (`torch.chunk`) and concat. For the parity
+            // inputs `n < 16384` ⇒ `k = 0` ⇒ `num_chunks = 1` ⇒ a single call
+            // identical to the unsplit forward, so this is a no-op for parity.
+            let n = din.dim(0)?;
+            let should_split = n >= 16384; // 2**14
+            let k: i64 = if should_split { (n as f64).log2().floor() as i64 - 14 + 1 } else { 0 };
+            let num_chunks = 1usize << (k.max(0) as usize);
+            let dout = if num_chunks <= 1 {
+                self.depthformer.forward(&din, None)? // (n_a, C, dd), causally masked
+            } else {
+                // `torch.chunk(num_chunks)` along dim 0: ceil(n/num_chunks)-sized
+                // pieces (the last may be smaller / chunks may be fewer). Run each
+                // through the depthformer and concat back along dim 0.
+                let chunk = n.div_ceil(num_chunks);
+                let mut outs: Vec<Tensor> = Vec::new();
+                let mut start = 0usize;
+                while start < n {
+                    let cur = chunk.min(n - start);
+                    let part = din.narrow(0, start, cur)?;
+                    outs.push(self.depthformer.forward(&part, None)?);
+                    start += cur;
+                }
+                Tensor::cat(&outs.iter().collect::<Vec<_>>(), 0)?
+            };
             let mut clog = Vec::with_capacity(c);
             for ci in 0..c {
                 let logits_c = self.depth_embeddings[ci].get_logits(&dout.narrow(1, ci, 1)?.squeeze(1)?)?; // (n_a, Va)
@@ -422,6 +551,91 @@ impl LFM2AudioModel {
         };
 
         Ok((text_logits, audio_logits, text_labels, audio_labels))
+    }
+
+    /// `forward(batch) -> LFM2AudioModelOutput` — the **training** cross-entropy
+    /// loss (Python `LFM2AudioModel.forward`, 453-481). Faithful:
+    /// ```python
+    /// text_logits, audio_logits, text_labels, audio_labels = self.logits(batch)
+    /// text_loss  = cross_entropy(text_logits, text_labels, ignore_index=-100, reduction="none")
+    /// audio_loss = cross_entropy(audio_logits, audio_labels, ignore_index=-100, reduction="none")
+    /// audio_loss = rearrange(audio_loss, "(L C) -> L C", C=codebooks)
+    /// audio_loss = (audio_loss * audio_loss_weights).sum(-1) / audio_loss_weights.sum()
+    /// text_tokens = text_loss.numel(); audio_tokens = audio_loss.numel()
+    /// weighted_tokens = t_mult * text_tokens + a_mult * audio_tokens
+    /// loss = (t_mult * text_loss.sum() + a_mult * audio_loss.sum()) / (weighted_tokens + 1e-6)
+    /// ```
+    /// Self-contained on the model (loss weights/multipliers are now stored fields);
+    /// `crate::trainer::Trainer::forward` computes the identical math via `logits`.
+    pub fn forward(&self, batch: &LFM2AudioModelInput) -> Result<LFM2AudioModelOutput> {
+        let (text_logits, audio_logits, text_labels, audio_labels) = self.logits(batch)?;
+        let dev = text_logits.device();
+
+        // cross_entropy(reduction="none"): per-row -log p(label). `logits`/`labels`
+        // already cover only supervised positions, so `ignore_index=-100` is moot.
+        let text_loss = ce_none(&text_logits, &text_labels)?; // (n_text,)
+        let audio_loss_flat = ce_none(&audio_logits, &audio_labels)?; // (n_audio * C,)
+
+        let c = self.codebooks;
+        let n_audio = audio_loss_flat.dim(0)? / c.max(1);
+        // rearrange "(L C) -> L C"; weight per-codebook then sum / weight-sum.
+        let aw = self.audio_loss_weights.to_dtype(DType::F32)?; // (C,)
+        let aw_sum = aw.sum_all()?.to_scalar::<f32>()? as f64;
+        let audio_loss = if n_audio == 0 {
+            Tensor::zeros((0,), DType::F32, dev)?
+        } else {
+            let al = audio_loss_flat.reshape((n_audio, c))?; // (L, C)
+            let weighted = al.broadcast_mul(&aw)?.sum(1)?; // (L,)
+            (weighted / aw_sum)?
+        };
+
+        let text_tokens = text_loss.dim(0)?; // numel of a 1-D tensor
+        let audio_tokens = audio_loss.dim(0)?;
+        let (tm, am) = (self.text_loss_multiplier, self.audio_loss_multiplier);
+        let weighted_tokens = tm * text_tokens as f64 + am * audio_tokens as f64;
+
+        let text_sum = text_loss.to_dtype(DType::F32)?.sum_all()?;
+        let audio_sum = audio_loss.to_dtype(DType::F32)?.sum_all()?;
+        let loss = ((&text_sum * tm)? + (&audio_sum * am)?)?;
+        let loss = (loss / (weighted_tokens + 1e-6))?;
+
+        // Per-modality mean losses (output diagnostics).
+        let audio_loss_mean = (&audio_sum / (audio_tokens as f64 + 1e-6))?;
+        let text_loss_mean = (&text_sum / (text_tokens as f64 + 1e-6))?;
+
+        // audio_out_tokens = batch.audio_out.shape[1]
+        let audio_out_tokens = Tensor::new(batch.audio_out.dim(1)? as i64, dev)?;
+        // text_tokens = (batch.text[0] > 0).sum()
+        let text_row = batch.text.i(0)?.to_dtype(DType::I64)?;
+        let n_text_pos = text_row.ge(1i64)?.to_dtype(DType::I64)?.sum_all()?;
+        // audio_in_tokens = mel2emb_len(batch.audio_in_lens).sum()
+        let lens: Vec<i64> = batch.audio_in_lens.to_dtype(DType::I64)?.to_vec1::<i64>()?;
+        let audio_in_tokens_val: i64 = lens.iter().map(|&l| mel2emb_len(l)).sum();
+        let audio_in_tokens = Tensor::new(audio_in_tokens_val, dev)?;
+
+        Ok(LFM2AudioModelOutput {
+            loss,
+            audio_loss: audio_loss_mean,
+            text_loss: text_loss_mean,
+            audio_out_tokens,
+            text_tokens: n_text_pos,
+            audio_in_tokens,
+        })
+    }
+
+    /// `_sample_text_token(logits, *, temperature, top_k)` (Python 483-499) — greedy
+    /// (argmax) when `temperature` is None/≤0 or `top_k == 1`, else `logits /=
+    /// temperature`, top-k mask (keep ≥ the k-th largest, rest → -inf), softmax,
+    /// then `torch.multinomial`. Mirrors the file's `sample_audio_frame` style by
+    /// delegating to the shared [`sample_token`] body (identical math).
+    fn sample_text_token(
+        &self,
+        logits: &Tensor,
+        temperature: Option<f64>,
+        top_k: Option<usize>,
+        rng: &mut StdRng,
+    ) -> Result<u32> {
+        sample_token(logits, temperature, top_k, rng)
     }
 
     /// `_prefill(text, audio_in, audio_in_lens, audio_out, modality_flag)` from
@@ -586,7 +800,7 @@ impl LFM2AudioModel {
             match current {
                 LFMModality::Text => {
                     let logits = self.text_logits(&h_last)?;
-                    let next = sample_token(&logits, params.text_temperature, params.text_top_k, &mut rng)?;
+                    let next = self.sample_text_token(&logits, params.text_temperature, params.text_top_k, &mut rng)?;
                     on_token(GenToken::Text(next));
                     if next == 128 {
                         current = LFMModality::AudioOut; // <|audio_start|>
@@ -636,7 +850,7 @@ impl LFM2AudioModel {
             match current {
                 LFMModality::Text => {
                     let logits = self.text_logits(&h_last)?;
-                    let next = sample_token(&logits, params.text_temperature, params.text_top_k, &mut rng)?;
+                    let next = self.sample_text_token(&logits, params.text_temperature, params.text_top_k, &mut rng)?;
                     if next == 7 {
                         break; // <|im_end|>
                     }

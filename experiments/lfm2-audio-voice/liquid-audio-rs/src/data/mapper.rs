@@ -283,9 +283,10 @@ impl<'a> LFM2AudioChatMapper<'a> {
         // `mel_len` — the un-padded frame count — so we slice to it (Python:
         // mel[0, :, :cur_len]).
         let mel = self.processor.audio().forward(&wav)?; // (1, nfilt, T_padded)
-        let hop = self.processor.audio().mel_config().n_window_stride;
         let l = wav.elem_count();
-        let valid = if hop > 0 { l / hop } else { 0 };
+        // Use the featurizer-computed valid frame count (NeMo `get_seq_len`,
+        // = floor(L/hop)) rather than recomputing L/hop here.
+        let valid = self.processor.audio().get_seq_len(l);
         let t_padded = mel.dim(2)?;
         let cur_len = valid.min(t_padded);
         let cur_mel = mel.i(0)?.narrow(1, 0, cur_len)?.to_dtype(DType::F32)?.contiguous()?; // (nfilt, cur_len)

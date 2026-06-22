@@ -24,6 +24,16 @@ pub enum HeadStyle {
     Mqa,
 }
 
+/// `CacheType` (py 13: `type CacheType = torch.Tensor | None | Sequence["CacheType"]`).
+///
+/// PORT: the Python alias is a recursive union — at the leaf a `forward_cached`
+/// layer cache is a `(key, value)` tensor tuple or `None`; at the backbone level
+/// it is a `Sequence` of those. We model the *leaf* (per-layer) cache as
+/// [`LayerCache`] (an `Option<(Tensor, Tensor)>`) and the backbone-level sequence
+/// as `Vec<LayerCache>` (see [`RawLmBackbone::forward_cached`]). This captures the
+/// two concrete shapes the union takes in this module without an open-ended enum.
+pub type LayerCache = Option<(Tensor, Tensor)>;
+
 /// Per-layer KV cache. Mirrors `LayerKVCache`: stores key/value pre-transpose
 /// (shape `[b, t, heads, head_dim]`) and concatenates new steps along dim 1.
 #[derive(Default)]
@@ -35,6 +45,16 @@ pub struct LayerKvCache {
 impl LayerKvCache {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// `LayerKVCache.__init__(cache)` (py 43-46): build from an optional
+    /// `(key, value)` tensor tuple. Faithful to the Python `assert cache is None
+    /// or len(cache) == 2` — a `Some` carries exactly two tensors by construction.
+    pub fn from_cache(cache: LayerCache) -> Self {
+        match cache {
+            None => Self::default(),
+            Some((k, v)) => Self { key_cache: Some(k), value_cache: Some(v) },
+        }
     }
 
     pub fn update(&mut self, k: &Tensor, v: &Tensor) -> Result<(Tensor, Tensor)> {
@@ -57,6 +77,16 @@ impl LayerKvCache {
             Some(k) => k.dim(1).unwrap_or(0),
         }
     }
+
+    /// Extract the current `(key, value)` pair as a [`LayerCache`]. Mirrors the
+    /// Python `forward_cached` returning `new_cache` (the `(k, v)` tuple produced
+    /// by `LayerKVCache.update`). Returns `None` when the cache is still empty.
+    pub fn to_cache(&self) -> LayerCache {
+        match (&self.key_cache, &self.value_cache) {
+            (Some(k), Some(v)) => Some((k.clone(), v.clone())),
+            _ => None,
+        }
+    }
 }
 
 /// `RMSNorm`. Faithful: normalize in f32 (`x * rsqrt(mean(x^2)+eps)`), multiply by
@@ -72,13 +102,30 @@ impl RmsNorm {
         Ok(Self { weight, eps })
     }
 
+    /// `RMSNorm._norm` (py 71-72): `x * rsqrt(mean(x^2, -1, keepdim) + eps)`.
+    ///
+    /// UN-FOLDED from `forward` for 1:1 parity with the Python helper. Operates on
+    /// whatever dtype it is handed (the Python `_norm` is dtype-agnostic; `forward`
+    /// is the one that upcasts to f32 before calling it). `rsqrt(z)` is `1/sqrt(z)`
+    /// expressed here as a `broadcast_div` by `sqrt(z)`, byte-identical to the math
+    /// previously inlined in `forward`.
+    pub fn norm(&self, x: &Tensor) -> Result<Tensor> {
+        let mean_sq = x.sqr()?.mean_keepdim(D::Minus1)?;
+        x.broadcast_div(&(mean_sq + self.eps)?.sqrt()?)
+    }
+
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let in_dtype = x.dtype();
         let x = x.to_dtype(DType::F32)?;
-        let mean_sq = x.sqr()?.mean_keepdim(D::Minus1)?;
-        let normed = x.broadcast_div(&(mean_sq + self.eps)?.sqrt()?)?;
+        let normed = self.norm(&x)?;
         let w = self.weight.to_dtype(DType::F32)?;
         normed.broadcast_mul(&w)?.to_dtype(in_dtype)
+    }
+
+    /// `RMSNorm.forward_cached` (py 80-81): `return self(x, cache), None`. RMSNorm
+    /// holds no KV state, so it threads through a `None` cache unchanged.
+    pub fn forward_cached(&self, x: &Tensor) -> Result<(Tensor, LayerCache)> {
+        Ok((self.forward(x)?, None))
     }
 }
 
@@ -124,6 +171,12 @@ impl Glu {
         } else {
             self.w2.forward(&self.w1.forward(x)?.gelu_erf()?)
         }
+    }
+
+    /// `GLU.forward_cached` (py 136-137): `return self(x, cache), None`. The GLU
+    /// feed-forward is stateless, so it returns a `None` cache.
+    pub fn forward_cached(&self, x: &Tensor) -> Result<(Tensor, LayerCache)> {
+        Ok((self.forward(x)?, None))
     }
 }
 
@@ -368,6 +421,47 @@ impl Mha {
         let ys = self.attention.forward(&xq, &xk, &xv, &cos, &sin, cache)?;
         self.out_proj.forward(&ys)
     }
+
+    /// `MHA._validate_cache` (py 295-301): TypeGuard that the cache is a 2-tuple of
+    /// tensors.
+    ///
+    /// PORT: in the Rust type system a [`LayerCache`] of the `Some` variant is, by
+    /// construction, exactly a `(Tensor, Tensor)` pair — the Python runtime checks
+    /// (`isinstance tuple`, `len == 2`, both entries `torch.Tensor`) are enforced
+    /// statically. This returns the boolean the Python `TypeGuard` returns: `true`
+    /// for `Some(_)`, `false` for `None` (so `assert self._validate_cache(cache)`
+    /// inside the `cache is not None` branch maps to `Some` ⇒ `true`).
+    pub fn validate_cache(&self, cache: &LayerCache) -> bool {
+        cache.is_some()
+    }
+
+    /// `MHA.forward_cached` (py 306-341): build a [`LayerKvCache`] from the incoming
+    /// cache (validating it when present), run the qkv projection / head split /
+    /// cache-aware rotary slice / `BoundedAttention` / output projection, and return
+    /// `(ys, new_cache)` where `new_cache` is the updated `(k, v)` tuple.
+    pub fn forward_cached(&self, x: &Tensor, cache: LayerCache) -> Result<(Tensor, LayerCache)> {
+        // py 307-311: `if cache is not None: assert self._validate_cache(cache);
+        //             kv_cache = LayerKVCache(cache) else: kv_cache = None`.
+        //
+        // PORT: in the Python, `kv_cache=None` still flows `(k, v)` *back out* as
+        // `new_cache` — `BoundedAttention` returns the freshly-projected `(k, v)`
+        // even when it skips `update`. To surface that same tuple (and to keep the
+        // streaming chain alive, since `RawLMBackbone.forward_cached` seeds the
+        // first step with `[None] * n_layers`), we always build a `LayerKvCache`.
+        // For an empty (`None`-seeded) cache, `update` *initializes* to `(k, v)`,
+        // which is byte-identical to the no-`update` return — so this is faithful to
+        // both Python branches, differing only in that we never lose the new tuple.
+        if cache.is_some() {
+            debug_assert!(self.validate_cache(&cache));
+        }
+        let mut kv_cache = LayerKvCache::from_cache(cache);
+
+        // `Mha::forward` carries the whole cache-aware path (qkv split, freqs slice
+        // from `get_cache_size`, `BoundedAttention` with in-place `update`). Run it
+        // with the constructed cache, then surface the updated `(k, v)` tuple.
+        let ys = self.forward(x, Some(&mut kv_cache))?;
+        Ok((ys, kv_cache.to_cache()))
+    }
 }
 
 /// `StandardBlock`: operator(norm(x)) + x, then GLU(norm(h)) + h.
@@ -401,6 +495,21 @@ impl StandardBlock {
         let h_glu = self.feed_forward.forward(&self.ffn_norm.forward(&h)?)?;
         h + h_glu
     }
+
+    /// `StandardBlock.forward_cached` (py 385-390): thread the cache through
+    /// `operator.forward_cached(operator_norm(x))` (which returns the updated cache),
+    /// add the residual, then the stateless `feed_forward(ffn_norm(h))` + residual.
+    /// Returns `(out, new_cache)`.
+    pub fn forward_cached(&self, x: &Tensor, cache: LayerCache) -> Result<(Tensor, LayerCache)> {
+        // py 386: `h, new_cache = self.operator.forward_cached(self.operator_norm(x), cache)`
+        let (h, new_cache) = self.operator.forward_cached(&self.operator_norm.forward(x)?, cache)?;
+        // py 387: `h += x`
+        let h = (h + x)?;
+        // py 388: `h_glu = self.feed_forward.forward(self.ffn_norm(h))`
+        let h_glu = self.feed_forward.forward(&self.ffn_norm.forward(&h)?)?;
+        // py 389-390: `out = h + h_glu; return out, new_cache`
+        Ok(((h + h_glu)?, new_cache))
+    }
 }
 
 /// `SharedEmbedding`: input embedding + pre-logits RMSNorm + output projection.
@@ -425,6 +534,13 @@ impl SharedEmbedding {
         let to_logits_w = vb.pp("to_logits").get((vocab_size, dim), "weight")?;
         let to_logits = Linear::new(to_logits_w, None);
         Ok(Self { embedding, embedding_norm, to_logits })
+    }
+
+    /// `SharedEmbedding.forward` (py 500-501): `return self.embed(tokens)` — the
+    /// plain embedding lookup. UN-FOLDED to delegate to [`SharedEmbedding::embed`]
+    /// exactly as the Python `forward` delegates to `embed`.
+    pub fn forward(&self, tokens: &Tensor) -> Result<Tensor> {
+        self.embed(tokens)
     }
 
     pub fn embed(&self, tokens: &Tensor) -> Result<Tensor> {
@@ -461,20 +577,67 @@ impl RawLmBackbone {
         }
         Ok(x)
     }
+
+    /// `RawLMBackbone.forward_cached` (py 554-566): run each layer's
+    /// `forward_cached`, threading a per-layer cache and collecting the updated
+    /// caches into a `Vec`. Returns `(hidden, Vec<LayerCache>)`.
+    ///
+    /// PORT: the Python `CacheType` here is the `Sequence[CacheType]` arm — a list
+    /// with one `(k, v)` (or `None`) entry per layer. When `cache is None` it seeds
+    /// `[None] * len(self.layers)` (py 559); we mirror that by consuming an
+    /// `Option<Vec<LayerCache>>` and defaulting to a `None`-filled vector. The
+    /// `assert len(cache) == len(self.layers)` (py 557) maps to the length check.
+    pub fn forward_cached(
+        &self,
+        x: &Tensor,
+        cache: Option<Vec<LayerCache>>,
+    ) -> Result<(Tensor, Vec<LayerCache>)> {
+        // py 555-559: validate length when present, else seed `[None] * n_layers`.
+        let cache = match cache {
+            Some(c) => {
+                assert!(c.len() == self.layers.len(), "expected one cache entry per layer");
+                c
+            }
+            None => (0..self.layers.len()).map(|_| None).collect(),
+        };
+
+        // py 561-564: `for layer, layer_cache in zip(...): x, new = layer.forward_cached(x, layer_cache); cache_out.append(new)`
+        let mut x = x.clone();
+        let mut cache_out: Vec<LayerCache> = Vec::with_capacity(self.layers.len());
+        for (layer, layer_cache) in self.layers.iter().zip(cache.into_iter()) {
+            let (next, new_cache) = layer.forward_cached(&x, layer_cache)?;
+            x = next;
+            cache_out.push(new_cache);
+        }
+
+        // py 566: `return x, cache_out`
+        Ok((x, cache_out))
+    }
 }
 
 /// `SequenceModel` (Python `class SequenceModel(nn.Module, ABC)`) — the
 /// sequence-model contract: `[N,T,dim] → [N,T',dim_out]`, with `forward` /
 /// `forward_cached`.
 ///
-/// PORT: Python's `forward_cached(x, cache) -> (out, cache)` returns a fresh
-/// cache; Rust mutates the cache in place via `Option<&mut [LayerKvCache]>`, so
-/// `forward(x, Some(cache))` *is* `forward_cached` — the two abstract methods
-/// collapse to one signature covering both the cached and uncached paths.
+/// PORT: Python's offline `forward(x, cache) -> out` mutates an in-place
+/// `LayerKVCache`; Rust models that with `Option<&mut [LayerKvCache]>`, so the
+/// offline `forward(x, Some(cache))` is the in-place cached path. The streaming
+/// `forward_cached(x, cache) -> (out, cache)` (py 34-35) instead *returns* a fresh
+/// per-layer cache vector — a faithful port of the functional cache contract that
+/// `RawLMBackbone.forward_cached` (py 554) builds on.
 pub trait SequenceModel {
     fn dim(&self) -> usize;
     fn dim_out(&self) -> usize;
     fn forward(&self, x: &Tensor, cache: Option<&mut [LayerKvCache]>) -> Result<Tensor>;
+
+    /// `SequenceModel.forward_cached` (py 34-35): abstract streaming step returning
+    /// `(out, new_cache)`. The cache is the `Sequence[CacheType]` arm of the union —
+    /// one `(k, v)` (or `None`) per layer — modeled as `Vec<LayerCache>`.
+    fn forward_cached(
+        &self,
+        x: &Tensor,
+        cache: Option<Vec<LayerCache>>,
+    ) -> Result<(Tensor, Vec<LayerCache>)>;
 }
 
 impl SequenceModel for RawLmBackbone {
@@ -487,5 +650,13 @@ impl SequenceModel for RawLmBackbone {
     fn forward(&self, x: &Tensor, cache: Option<&mut [LayerKvCache]>) -> Result<Tensor> {
         // Delegate to the inherent method (inherent resolution wins → no recursion).
         RawLmBackbone::forward(self, x, cache)
+    }
+    fn forward_cached(
+        &self,
+        x: &Tensor,
+        cache: Option<Vec<LayerCache>>,
+    ) -> Result<(Tensor, Vec<LayerCache>)> {
+        // Delegate to the inherent method (inherent resolution wins → no recursion).
+        RawLmBackbone::forward_cached(self, x, cache)
     }
 }

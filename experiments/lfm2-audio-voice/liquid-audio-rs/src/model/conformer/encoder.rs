@@ -28,6 +28,17 @@ pub struct ConformerEncoderConfig {
     pub xscaling: bool,
 }
 
+/// Python union for `conv_context_size`: the string `"causal"` or a list of two
+/// integers `[left, right]` with `left + right + 1 == conv_kernel_size`. Used by
+/// [`ConformerEncoder::calc_context_sizes`] (encoder.py L805-851).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConvContextSize {
+    /// `"causal"` → resolves to `[conv_kernel_size - 1, 0]`.
+    Causal,
+    /// `[left, right]`.
+    Size(i64, i64),
+}
+
 pub struct ConformerEncoder {
     pre_encode: ConvSubsampling,
     pos_enc: RelPositionalEncoding,
@@ -151,10 +162,118 @@ impl ConformerEncoder {
         false
     }
 
-    /// PORT: `_calc_context_sizes` / `set_default_att_context_size` /
-    /// `change_attention_model` — limited-context & att-model switching for
-    /// streaming. Offline uses unlimited rel-pos attention (`[-1,-1]`); no-op
-    /// stubs, preserved for 1:1 inventory.
+    /// PORT: `_calc_context_sizes` (encoder.py L805-851).
+    ///
+    /// Computes the cache-aware streaming context sizes from the encoder config.
+    /// Faithful 1:1 of the Python staticmethod-style helper (it does not touch
+    /// `self` on its computation path apart from the error-message interpolation
+    /// of `self.conv_context_size`, which is only reachable on an error branch).
+    /// Returns the 4-tuple `(att_context_size_all, att_context_size, att_context_probs,
+    /// conv_context_size)` where `att_context_size` is `att_context_size_all[0]`.
+    ///
+    /// Inputs mirror the Python union types:
+    /// * `att_context_size` — `None` (empty), a flat `[l, r]`, or a list of `[l, r]`.
+    ///   Python accepts both `list[int]` and `list[list[int]]`. We split these into
+    ///   two args: `att_context_size_flat: Option<Vec<i64>>` for the bare `list[int]`
+    ///   case (wrapped to `[[...]]`, matching the `isinstance(..., int)` branch) and
+    ///   `att_context_size: Option<Vec<Vec<i64>>>` for the list-of-lists case.
+    /// * `conv_context_size` — `None`, `"causal"`, or a `[l, r]` list (see
+    ///   [`ConvContextSize`]).
+    ///
+    /// Off the offline parity path (offline uses unlimited rel-pos `[-1,-1]`); ported
+    /// fully for inventory completeness.
+    #[allow(clippy::type_complexity)]
+    pub fn calc_context_sizes(
+        att_context_size_flat: Option<Vec<i64>>,
+        att_context_size: Option<Vec<Vec<i64>>>,
+        att_context_probs: Option<Vec<f64>>,
+        att_context_style: &str,
+        conv_context_size: Option<ConvContextSize>,
+        conv_kernel_size: i64,
+    ) -> Result<(Vec<Vec<i64>>, Vec<i64>, Vec<f64>, ConvContextSize)> {
+        // convert att_context_size to a standard list of lists
+        //
+        // Python: `if att_context_size:` is truthy for a non-empty list. The bare
+        // `list[int]` form (`att_context_size_flat`) is wrapped into `[[...]]`; the
+        // list-of-lists form is used as-is. An absent / empty value falls through to
+        // the `[[-1, -1]]` default.
+        let att_context_size_all: Vec<Vec<i64>> = {
+            let provided: Option<Vec<Vec<i64>>> = match (att_context_size_flat, att_context_size) {
+                // `isinstance(att_context_size_all[0], int)` branch: wrap the flat list.
+                (Some(flat), _) if !flat.is_empty() => Some(vec![flat]),
+                (_, Some(nested)) if !nested.is_empty() => Some(nested),
+                _ => None,
+            };
+            match provided {
+                Some(all) => {
+                    for (i, att_cs) in all.iter().enumerate() {
+                        if att_context_style == "chunked_limited" {
+                            if att_cs[0] > 0 && att_cs[0] % (att_cs[1] + 1) > 0 {
+                                return Err(candle_core::Error::Msg(format!(
+                                    "att_context_size[{i}][0] % (att_context_size[{i}][1] + 1) should be zero!"
+                                )));
+                            }
+                            if att_cs[1] < 0 && all.len() <= 1 {
+                                return Err(candle_core::Error::Msg(format!(
+                                    "Right context (att_context_size[{i}][1]) can not be unlimited for chunked_limited style!"
+                                )));
+                            }
+                        }
+                    }
+                    all
+                }
+                None => vec![vec![-1, -1]],
+            }
+        };
+
+        let att_context_probs: Vec<f64> = match att_context_probs {
+            Some(probs) if !probs.is_empty() => {
+                if probs.len() != att_context_size_all.len() {
+                    return Err(candle_core::Error::Msg(
+                        "The size of the att_context_probs should be the same as att_context_size.".to_string(),
+                    ));
+                }
+                // Python compares `sum(att_context_probs) != 1` exactly (no tolerance).
+                if probs.iter().sum::<f64>() != 1.0 {
+                    return Err(candle_core::Error::Msg(
+                        "The sum of numbers in att_context_probs should be equal to one to be a distribution."
+                            .to_string(),
+                    ));
+                }
+                probs
+            }
+            _ => {
+                let n = att_context_size_all.len();
+                vec![1.0 / n as f64; n]
+            }
+        };
+
+        let conv_context_size: ConvContextSize = match conv_context_size {
+            Some(ConvContextSize::Causal) => ConvContextSize::Size(conv_kernel_size - 1, 0),
+            Some(ConvContextSize::Size(l, r)) => {
+                if l + r + 1 != conv_kernel_size {
+                    // Python interpolates `self.conv_context_size` here (the as-yet-unset
+                    // attribute); we surface the offending list instead, which is the
+                    // intended diagnostic.
+                    return Err(candle_core::Error::Msg(format!(
+                        "Invalid conv_context_size: [{l}, {r}]!"
+                    )));
+                }
+                ConvContextSize::Size(l, r)
+            }
+            None => {
+                let half = (conv_kernel_size - 1) / 2;
+                ConvContextSize::Size(half, half)
+            }
+        };
+
+        let att_context_size = att_context_size_all[0].clone();
+        Ok((att_context_size_all, att_context_size, att_context_probs, conv_context_size))
+    }
+
+    /// PORT: `set_default_att_context_size` / `change_attention_model` —
+    /// limited-context & att-model switching for streaming. Offline uses unlimited
+    /// rel-pos attention (`[-1,-1]`); no-op stubs, preserved for 1:1 inventory.
     pub fn set_default_att_context_size(&self, _att_context_size: (i64, i64)) {}
 
     /// See [`Self::set_default_att_context_size`].

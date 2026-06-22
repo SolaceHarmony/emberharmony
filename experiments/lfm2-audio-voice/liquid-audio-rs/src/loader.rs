@@ -28,7 +28,7 @@ use crate::audio_out::{AudioDetokenizer, MimiDetokenizer};
 use crate::detokenizer::LFM2AudioDetokenizer;
 use crate::model::conformer::encoder::ConformerEncoderConfig;
 use crate::model::conformer::processor::FilterbankFeatures;
-use crate::model::lfm2_audio::{DepthformerConfig, LFM2AudioModel};
+use crate::model::lfm2_audio::{DepthformerConfig, LFM2AudioModel, LossConf};
 use crate::model::lfm2_hf::Lfm2Config;
 use crate::processor::{LFM2AudioProcessor, PreprocessorConfig};
 
@@ -122,9 +122,18 @@ pub fn from_pretrained(dir: &Path, dtype: DType, device: &Device) -> Result<(LFM
     let n_text = req_usize(&config, "interleaved_n_text")?;
     let n_audio = req_usize(&config, "interleaved_n_audio")?;
 
+    // Loss-weight hyperparameters (Python `LFM2AudioConfig`) feeding the
+    // `audio_loss_weights` buffer + loss multipliers built in `LFM2AudioModel::new`.
+    let loss_conf = LossConf {
+        codebook_weight: config["codebook_weight"].as_str().unwrap_or("linear").to_string(),
+        semantic_codebook_factor: config["semantic_codebook_factor"].as_f64().unwrap_or(1.0),
+        text_loss_multiplier: config["text_loss_multiplier"].as_f64().unwrap_or(1.0),
+        audio_loss_multiplier: config["audio_loss_multiplier"].as_f64().unwrap_or(1.0),
+    };
+
     let safes = safetensors_in(dir)?;
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&safes, dtype, device)? };
-    let model = LFM2AudioModel::new(lfm_cfg, &enc_cfg, &depth_cfg, codebooks, n_text, n_audio, vb)?;
+    let model = LFM2AudioModel::new(lfm_cfg, &enc_cfg, &depth_cfg, codebooks, n_text, n_audio, &loss_conf, vb)?;
 
     let prep: PreprocessorConfig = serde_json::from_value(config["preprocessor"].clone()).map_err(err)?;
     let audio = FilterbankFeatures::new(prep.mel_config(), device)?;
@@ -198,12 +207,26 @@ pub fn from_pretrained_trainable(dir: &Path, dtype: DType, device: &Device) -> R
     let n_text = req_usize(&config, "interleaved_n_text")?;
     let n_audio = req_usize(&config, "interleaved_n_audio")?;
 
+    // Loss-weight hyperparameters (Python `LFM2AudioConfig`) — parsed up front so
+    // they feed both `LFM2AudioModel::new` (the `audio_loss_weights` buffer + loss
+    // multipliers) and the returned `TrainableLoad` below.
+    let codebook_weight = config["codebook_weight"].as_str().unwrap_or("linear").to_string();
+    let semantic_codebook_factor = config["semantic_codebook_factor"].as_f64().unwrap_or(1.0);
+    let text_loss_multiplier = config["text_loss_multiplier"].as_f64().unwrap_or(1.0);
+    let audio_loss_multiplier = config["audio_loss_multiplier"].as_f64().unwrap_or(1.0);
+    let loss_conf = LossConf {
+        codebook_weight: codebook_weight.clone(),
+        semantic_codebook_factor,
+        text_loss_multiplier,
+        audio_loss_multiplier,
+    };
+
     // Build over a fresh VarMap so `LFM2AudioModel::new` allocates trainable Vars,
     // then load the checkpoint into them (faithful: the architecture defines the
     // param set, the safetensors provide the pretrained init).
     let varmap = VarMap::new();
     let vb = VarBuilder::from_varmap(&varmap, dtype, device);
-    let model = LFM2AudioModel::new(lfm_cfg, &enc_cfg, &depth_cfg, codebooks, n_text, n_audio, vb)?;
+    let model = LFM2AudioModel::new(lfm_cfg, &enc_cfg, &depth_cfg, codebooks, n_text, n_audio, &loss_conf, vb)?;
     // Load the checkpoint into the freshly-allocated Vars. `VarMap::load` is *not*
     // usable here: it opens a single file and demands every Var be present in it,
     // so it breaks on a sharded checkpoint *and* on the extra non-model safetensors
@@ -232,11 +255,6 @@ pub fn from_pretrained_trainable(dir: &Path, dtype: DType, device: &Device) -> R
         load_mimi(dir, codebooks, device)?.map(|m| Box::new(MimiDetokenizer::new(m)) as Box<dyn AudioDetokenizer>)
     };
     let processor = LFM2AudioProcessor::new(tokenizer, audio, audio_out, device.clone());
-
-    let codebook_weight = config["codebook_weight"].as_str().unwrap_or("linear").to_string();
-    let semantic_codebook_factor = config["semantic_codebook_factor"].as_f64().unwrap_or(1.0);
-    let text_loss_multiplier = config["text_loss_multiplier"].as_f64().unwrap_or(1.0);
-    let audio_loss_multiplier = config["audio_loss_multiplier"].as_f64().unwrap_or(1.0);
 
     Ok(TrainableLoad {
         model,
