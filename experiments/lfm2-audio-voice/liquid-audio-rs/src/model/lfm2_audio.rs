@@ -431,9 +431,11 @@ impl LFM2AudioModel {
         let l = out_emb.dim(1)?;
         let out_emb_shifted = out_emb.i(0)?.narrow(0, 0, l - 1)?.contiguous()?; // (L-1, D)
 
-        let modality: Vec<u32> = batch.modality_flag.i(0)?.to_vec1::<u32>()?;
+        // Read ids as i64 (torch.long) regardless of the input's int dtype — the
+        // dataloader feeds I64, ChatState feeds U32; the cast handles both.
+        let modality: Vec<i64> = batch.modality_flag.i(0)?.to_dtype(DType::I64)?.to_vec1::<i64>()?;
         let sup: Vec<u8> = batch.supervision_mask.i(0)?.to_dtype(DType::U8)?.to_vec1::<u8>()?;
-        let (text_id, audio_id) = (LFMModality::Text as u32, LFMModality::AudioOut as u32);
+        let (text_id, audio_id) = (LFMModality::Text as i64, LFMModality::AudioOut as i64);
 
         // Supervised, non-first text / audio-out positions: row index into
         // out_emb_shifted (= p-1) + label index within the per-modality token
@@ -629,14 +631,17 @@ impl LFM2AudioModel {
         modality_flag: &Tensor,
     ) -> Result<Tensor> {
         let dev = text.device();
-        let modality: Vec<u32> = modality_flag.i(0)?.to_vec1::<u32>()?;
+        // Read ids as i64 (torch.long) regardless of input int dtype (I64 from the
+        // dataloader, U32 from ChatState). NB: reading an I64 tensor as u32 here would
+        // silently return an empty `lens` (`unwrap_or_default`) and drop audio-in.
+        let modality: Vec<i64> = modality_flag.i(0)?.to_dtype(DType::I64)?.to_vec1::<i64>()?;
         let l = modality.len();
 
         // text embeddings (n_text, D)
         let text_emb = self.lfm.embed(text)?.i(0)?; // (n_text, D)
 
         // audio-in embeddings (n_ai, D): encode each segment, adapt, concat.
-        let lens: Vec<u32> = audio_in_lens.to_vec1::<u32>().unwrap_or_default();
+        let lens: Vec<i64> = audio_in_lens.to_dtype(DType::I64).and_then(|t| t.to_vec1::<i64>()).unwrap_or_default();
         let mut audio_in_rows: Vec<Tensor> = Vec::new();
         let mut frame_cursor = 0usize;
         for &len in &lens {
@@ -690,15 +695,15 @@ impl LFM2AudioModel {
         let ao_base = n_text + n_ai;
         let mut index = Vec::with_capacity(l);
         for m in &modality {
-            let idx = if *m == LFMModality::Text as u32 {
+            let idx = if *m == LFMModality::Text as i64 {
                 let v = text_base + ct;
                 ct += 1;
                 v
-            } else if *m == LFMModality::AudioIn as u32 {
+            } else if *m == LFMModality::AudioIn as i64 {
                 let v = ai_base + cai;
                 cai += 1;
                 v
-            } else if *m == LFMModality::AudioOut as u32 {
+            } else if *m == LFMModality::AudioOut as i64 {
                 let v = ao_base + cao;
                 cao += 1;
                 v

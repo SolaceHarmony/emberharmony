@@ -124,13 +124,16 @@ impl LFM2DataLoader {
             .get(idx)
             .ok_or_else(|| candle_core::Error::Msg(format!("index {idx} out of range (len {})", self.rows.len())))?;
 
-        // torch.as_tensor casts: long → U32 (non-negative ids/counts/codes),
-        // float32 → F32, bool → U8 (candle has no bool dtype; U8 is the 0/1 carrier).
-        let text = row.text.to_dtype(DType::U32)?;
+        // torch.as_tensor casts: long → I64 (torch.long is int64 — keep it; candle's
+        // index_select/embedding accept I64, and the model casts to U32 only at the
+        // ops that need it, exactly as torch does; narrowing to U32 here would be a
+        // lossy int64→u32→i64 round-trip with no upside). float32 → F32. bool → U8
+        // (candle has no bool dtype; U8 is the 0/1 carrier — the one forced deviation).
+        let text = row.text.to_dtype(DType::I64)?;
         let audio_in = row.audio_in.to_dtype(DType::F32)?;
-        let audio_in_lens = row.audio_in_lens.to_dtype(DType::U32)?;
-        let audio_out = row.audio_out.to_dtype(DType::U32)?;
-        let modality = row.modality_flag.to_dtype(DType::U32)?;
+        let audio_in_lens = row.audio_in_lens.to_dtype(DType::I64)?;
+        let audio_out = row.audio_out.to_dtype(DType::I64)?;
+        let modality = row.modality_flag.to_dtype(DType::I64)?;
         let supervision = row.supervision_mask.to_dtype(DType::U8)?;
 
         // pad_len = self.context_length - int(modality.shape[1])
@@ -149,7 +152,7 @@ impl LFM2DataLoader {
         let text = if pad_len > 0 { text.pad_with_zeros(1, 0, pad_len)? } else { text };
 
         // modality = F.pad(modality, (0, pad_len), value=int(LFMModality.TEXT))
-        let modality = pad_right_with(&modality, pad_len, LFMModality::Text as u32, &self.device)?;
+        let modality = pad_right_with(&modality, pad_len, LFMModality::Text as i64, &self.device)?;
 
         // supervision = F.pad(supervision, (0, pad_len), value=False)  — False == 0,
         // so a zero-pad is faithful; pad_with_zeros keeps the U8 dtype.
@@ -173,10 +176,11 @@ impl LFM2DataLoader {
     }
 }
 
-/// `F.pad(x, (0, pad_len), value=v)` for a `(rows, n)` U32 tensor — candle's
+/// `F.pad(x, (0, pad_len), value=v)` for a `(rows, n)` integer tensor — candle's
 /// `pad_with_zeros` only zero-fills, so a non-zero pad value is built explicitly
-/// and concatenated on the right of the last dim.
-fn pad_right_with(x: &Tensor, pad_len: usize, value: u32, device: &Device) -> Result<Tensor> {
+/// and concatenated on the right of the last dim. The pad is cast to `x`'s dtype,
+/// so this works for any integer `x` (I64 here).
+fn pad_right_with(x: &Tensor, pad_len: usize, value: i64, device: &Device) -> Result<Tensor> {
     if pad_len == 0 {
         return Ok(x.clone());
     }
@@ -267,15 +271,19 @@ mod tests {
         assert_eq!(row.audio_in.dims(), &[4, 7]);
         assert_eq!(row.audio_out.dims(), &[8, 3]);
 
+        // dtype is I64 (torch.long), not narrowed to U32.
+        assert_eq!(row.text.dtype(), DType::I64);
+        assert_eq!(row.modality_flag.dtype(), DType::I64);
+        assert_eq!(row.audio_out.dtype(), DType::I64);
         // modality pad value is TEXT; supervision pad value is 0 (False).
-        let modality: Vec<u32> = row.modality_flag.i(0).unwrap().to_vec1().unwrap();
-        assert_eq!(modality[5], LFMModality::Text as u32);
-        assert_eq!(modality[ctx - 1], LFMModality::Text as u32);
+        let modality: Vec<i64> = row.modality_flag.i(0).unwrap().to_vec1().unwrap();
+        assert_eq!(modality[5], LFMModality::Text as i64);
+        assert_eq!(modality[ctx - 1], LFMModality::Text as i64);
         let sup: Vec<u8> = row.supervision_mask.i(0).unwrap().to_vec1().unwrap();
         assert_eq!(sup[5], 0);
         assert_eq!(sup[4], 1);
         // text pad value is 0.
-        let text: Vec<u32> = row.text.i(0).unwrap().to_vec1().unwrap();
+        let text: Vec<i64> = row.text.i(0).unwrap().to_vec1().unwrap();
         assert_eq!(text[ctx - 1], 0);
     }
 
