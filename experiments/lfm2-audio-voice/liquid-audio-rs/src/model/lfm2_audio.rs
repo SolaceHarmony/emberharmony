@@ -13,9 +13,8 @@
 //! softmax, and `torch.multinomial`-equivalent draw via a seeded `StdRng`.
 
 use candle_core::{DType, IndexOp, Result, Tensor};
-use candle_nn::ops::log_softmax;
 use candle_nn::{linear, Linear, Module, VarBuilder};
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use candle_transformers::generation::{LogitsProcessor, Sampling};
 
 use crate::model::conformer::encoder::{ConformerEncoder, ConformerEncoderConfig};
 use crate::model::lfm2_hf::{Cache as LfmCache, Lfm2Config, Model as Lfm2Model};
@@ -98,9 +97,9 @@ pub struct LFM2AudioConfig {
 /// PORT: the training `forward(batch) -> LFM2AudioModelOutput` (see
 /// [`LFM2AudioModel::forward`]) and its `logits(batch)` consume a
 /// `LFM2AudioModelInput` training batch assembled by the `liquid_audio.data`
-/// pipeline (`data/types.py`). `crate::trainer::Trainer::forward` computes the
-/// identical loss math via `logits`; the model's own `forward` is self-contained
-/// (it holds the `audio_loss_weights` buffer + loss multipliers built in `new`).
+/// pipeline (`data/types.py`). The loss lives on the model (it holds the
+/// `audio_loss_weights` buffer + loss multipliers built in `new`); the trainer
+/// just calls `model.forward` — there is no separate trainer-side loss.
 #[derive(Debug, Clone)]
 pub struct LFM2AudioModelOutput {
     pub loss: Tensor,
@@ -111,32 +110,10 @@ pub struct LFM2AudioModelOutput {
     pub audio_in_tokens: Tensor,
 }
 
-/// `LFM2AudioModelInput` — batched training input (Python `data/types.py`
-/// dataclass assembled by collate): the model inputs plus the `supervision_mask`
-/// marking which positions contribute to the loss.
-#[derive(Debug, Clone)]
-pub struct LFM2AudioModelInput {
-    pub text: Tensor,
-    pub audio_in: Tensor,
-    pub audio_in_lens: Tensor,
-    pub audio_out: Tensor,
-    pub modality_flag: Tensor,
-    pub supervision_mask: Tensor,
-}
-
-impl LFM2AudioModelInput {
-    /// `to(device)` — move every field to `device`.
-    pub fn to(&self, device: &candle_core::Device) -> Result<Self> {
-        Ok(Self {
-            text: self.text.to_device(device)?,
-            audio_in: self.audio_in.to_device(device)?,
-            audio_in_lens: self.audio_in_lens.to_device(device)?,
-            audio_out: self.audio_out.to_device(device)?,
-            modality_flag: self.modality_flag.to_device(device)?,
-            supervision_mask: self.supervision_mask.to_device(device)?,
-        })
-    }
-}
+// `LFM2AudioModelInput` (the batched training input) is defined in its Python home
+// `data/types.py` → `crate::data::types`; re-export it here, where `logits`/`forward`
+// consume it.
+pub use crate::data::types::LFM2AudioModelInput;
 
 /// One streamed token: a text id, or one audio frame (codebooks codes).
 #[derive(Debug, Clone)]
@@ -172,8 +149,10 @@ impl Default for GenParams {
     }
 }
 
-/// Faithful port of the sampling body shared by `_sample_text_token` and the
-/// per-codebook step of `_sample_audio_frame`:
+/// `Sampler` — the next-token sampler, built on `candle_transformers`'
+/// [`LogitsProcessor`] (the same sampler `moshi` uses for depformer decoding)
+/// rather than a private softmax+multinomial. Faithful to `_sample_text_token` and
+/// the per-codebook step of `_sample_audio_frame`:
 /// ```python
 /// greedy = temperature is None or temperature <= 0 or top_k == 1
 /// if greedy: next = logits.argmax()
@@ -181,70 +160,78 @@ impl Default for GenParams {
 ///     logits /= temperature
 ///     if top_k is not None:
 ///         min_score = torch.topk(logits, top_k).values[-1]
-///         logits[logits < min_score] = -inf
+///         logits[logits < min_score] = -inf       # threshold-style: ties kept
 ///     next = torch.multinomial(logits.softmax(0), 1)
 /// ```
-fn sample_token(logits: &Tensor, temperature: Option<f64>, top_k: Option<usize>, rng: &mut StdRng) -> Result<u32> {
-    let greedy = match (temperature, top_k) {
-        (None, _) => true,
-        (Some(t), _) if t <= 0.0 => true,
-        (_, Some(1)) => true,
-        _ => false,
-    };
-    let logits = logits.to_dtype(DType::F32)?;
-    if greedy {
-        return logits.argmax(0)?.to_scalar::<u32>();
-    }
-    let temp = temperature.expect("non-greedy ⇒ temperature is Some(>0)") as f32;
-    let mut v: Vec<f32> = logits.to_vec1::<f32>()?.into_iter().map(|x| x / temp).collect();
-    if let Some(k) = top_k {
-        // min_score = the k-th largest logit; keep ≥ it, mask the rest to -inf.
-        let k = k.min(v.len());
-        let mut sorted = v.clone();
-        sorted.sort_unstable_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-        let min_score = sorted[k - 1];
-        for x in v.iter_mut() {
-            if *x < min_score {
-                *x = f32::NEG_INFINITY;
-            }
-        }
-    }
-    // softmax (numerically stable) → multinomial(probs, 1) via inverse-CDF draw.
-    let maxv = v.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let mut sum = 0f32;
-    for x in v.iter_mut() {
-        *x = (*x - maxv).exp();
-        sum += *x;
-    }
-    let r: f32 = rng.gen::<f32>() * sum;
-    let mut acc = 0f32;
-    for (i, p) in v.iter().enumerate() {
-        acc += *p;
-        if r < acc {
-            return Ok(i as u32);
-        }
-    }
-    Ok((v.len() - 1) as u32) // float-rounding guard: fall back to the last bin
+/// Greedy ⇒ [`Sampling::ArgMax`]; `LogitsProcessor::sample_argmax` is
+/// `logits.argmax(-1)`, byte-identical to the previous greedy path, so generation
+/// parity (incl. the token-exact depthformer) is preserved. Stochastic ⇒
+/// [`Sampling::All`] (temperature softmax + multinomial), with Torch's *threshold*
+/// top-k injected through [`LogitsProcessor::sample_f`]: candle's built-in
+/// `Sampling::TopK` keeps exactly `k` tokens, whereas Torch keeps every token `≥`
+/// the k-th largest (ties included), so the mask is applied via the `sample_f`
+/// extension hook rather than forking the sampler.
+struct Sampler {
+    processor: LogitsProcessor,
+    /// Torch threshold top-k bound, applied on the stochastic path only.
+    top_k: Option<usize>,
+    greedy: bool,
 }
 
-/// `nn.functional.cross_entropy(logits, labels, ignore_index=-100, reduction="none")`
-/// — per-row negative log-likelihood. Returns `(N,)`; an empty input returns `(0,)`.
-/// candle's `candle_nn::loss::cross_entropy` mean-reduces, so it can't supply the
-/// per-token vector the weighted-loss normalization in `forward` needs. Labels here
-/// come from supervised masks, so `-100` (ignore_index) never occurs in practice;
-/// the per-row form honors it implicitly (those rows would simply not appear).
-/// Identical to `crate::trainer::ce_none` (kept here so `forward` is self-contained).
-fn ce_none(logits: &Tensor, labels: &Tensor) -> Result<Tensor> {
-    let n = logits.dim(0)?;
-    if n == 0 {
-        return Tensor::zeros((0,), DType::F32, logits.device());
+impl Sampler {
+    fn new(seed: u64, temperature: Option<f64>, top_k: Option<usize>) -> Self {
+        let greedy = match (temperature, top_k) {
+            (None, _) => true,
+            (Some(t), _) if t <= 0.0 => true,
+            (_, Some(1)) => true,
+            _ => false,
+        };
+        let sampling = if greedy {
+            Sampling::ArgMax
+        } else {
+            // non-greedy ⇒ temperature is Some(>0).
+            Sampling::All { temperature: temperature.expect("non-greedy ⇒ temperature is Some(>0)") }
+        };
+        Self { processor: LogitsProcessor::from_sampling(seed, sampling), top_k, greedy }
     }
-    let logp = log_softmax(&logits.to_dtype(DType::F32)?, 1)?; // (N, V)
-    let labels = labels.to_dtype(DType::U32)?;
-    // gather the log-prob of each row's true class, negate → per-row NLL.
-    let picked = logp.gather(&labels.unsqueeze(1)?, 1)?.squeeze(1)?; // (N,)
-    picked.neg()
+
+    /// Sample one token from 1-D `logits` (`V,`).
+    fn sample(&mut self, logits: &Tensor) -> Result<u32> {
+        match (self.greedy, self.top_k) {
+            // Stochastic + top-k: inject Torch's threshold mask via the sample_f hook.
+            (false, Some(k)) => self.processor.sample_f(logits, move |prs| torch_topk_mask(prs, k)),
+            // Greedy (argmax), or stochastic without top-k (plain multinomial).
+            _ => self.processor.sample(logits),
+        }
+    }
 }
+
+/// Torch `topk(logits, k).values[-1]` threshold applied to the probability vector:
+/// zero every probability below the k-th largest. softmax is monotonic, so the
+/// logit threshold and the probability threshold select the same tokens; ties at
+/// the boundary are *kept*, matching `logits[logits < min_score] = -inf`. The kept
+/// probabilities need no renormalization — multinomial (`WeightedIndex`) samples
+/// proportionally, so the resulting distribution equals Python's softmax-after-mask.
+fn torch_topk_mask(prs: &mut [f32], k: usize) {
+    let k = k.min(prs.len());
+    if k == 0 {
+        return;
+    }
+    let mut sorted: Vec<f32> = prs.to_vec();
+    sorted.sort_unstable_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    let min_score = sorted[k - 1];
+    for p in prs.iter_mut() {
+        if *p < min_score {
+            *p = 0.0;
+        }
+    }
+}
+
+// `nn.functional.cross_entropy(..., reduction="none")` lives in
+// [`crate::candle_ext::loss::cross_entropy_none`] — the reduction candle's
+// mean-only `cross_entropy` lacks. `forward` (below) calls it for the text/audio
+// per-token NLL before the per-codebook weighting.
+use crate::candle_ext::loss::cross_entropy_none;
 
 pub struct LFM2AudioModel {
     lfm: Lfm2Model,
@@ -299,7 +286,7 @@ impl LFM2AudioModel {
             let block = StandardBlock::new(mha, None, true, 256, 1.0, 1e-5, lvb)?;
             layers.push(block);
         }
-        let depthformer = RawLmBackbone { layers, embedding: None, dim: depth_cfg.dim };
+        let depthformer = RawLmBackbone::new(layers, None, depth_cfg.dim);
 
         let depth_linear = linear(hidden, depth_cfg.dim * codebooks, vb.pp("depth_linear"))?;
         let de_vb = vb.pp("depth_embeddings");
@@ -419,8 +406,8 @@ impl LFM2AudioModel {
     /// `embedding` (H,) — for depthformer parity (token-exact vs Python greedy).
     #[doc(hidden)]
     pub fn audio_frame_greedy(&self, embedding: &Tensor) -> Result<Vec<u32>> {
-        let mut rng = StdRng::seed_from_u64(0); // unused on the greedy path
-        self.sample_audio_frame(embedding, None, None, &mut rng)
+        let mut sampler = Sampler::new(0, None, None); // greedy ⇒ argmax (seed unused)
+        self.sample_audio_frame(embedding, &mut sampler)
     }
 
     /// Build the prefill input embeddings, scattering text / audio-in / audio-out
@@ -565,16 +552,16 @@ impl LFM2AudioModel {
     /// weighted_tokens = t_mult * text_tokens + a_mult * audio_tokens
     /// loss = (t_mult * text_loss.sum() + a_mult * audio_loss.sum()) / (weighted_tokens + 1e-6)
     /// ```
-    /// Self-contained on the model (loss weights/multipliers are now stored fields);
-    /// `crate::trainer::Trainer::forward` computes the identical math via `logits`.
+    /// Self-contained on the model (loss weights/multipliers are stored fields);
+    /// [`crate::trainer::Trainer`] drives it via `train_step`/`validate`.
     pub fn forward(&self, batch: &LFM2AudioModelInput) -> Result<LFM2AudioModelOutput> {
         let (text_logits, audio_logits, text_labels, audio_labels) = self.logits(batch)?;
         let dev = text_logits.device();
 
         // cross_entropy(reduction="none"): per-row -log p(label). `logits`/`labels`
         // already cover only supervised positions, so `ignore_index=-100` is moot.
-        let text_loss = ce_none(&text_logits, &text_labels)?; // (n_text,)
-        let audio_loss_flat = ce_none(&audio_logits, &audio_labels)?; // (n_audio * C,)
+        let text_loss = cross_entropy_none(&text_logits, &text_labels)?; // (n_text,)
+        let audio_loss_flat = cross_entropy_none(&audio_logits, &audio_labels)?; // (n_audio * C,)
 
         let c = self.codebooks;
         let n_audio = audio_loss_flat.dim(0)? / c.max(1);
@@ -623,19 +610,11 @@ impl LFM2AudioModel {
         })
     }
 
-    /// `_sample_text_token(logits, *, temperature, top_k)` (Python 483-499) — greedy
-    /// (argmax) when `temperature` is None/≤0 or `top_k == 1`, else `logits /=
-    /// temperature`, top-k mask (keep ≥ the k-th largest, rest → -inf), softmax,
-    /// then `torch.multinomial`. Mirrors the file's `sample_audio_frame` style by
-    /// delegating to the shared [`sample_token`] body (identical math).
-    fn sample_text_token(
-        &self,
-        logits: &Tensor,
-        temperature: Option<f64>,
-        top_k: Option<usize>,
-        rng: &mut StdRng,
-    ) -> Result<u32> {
-        sample_token(logits, temperature, top_k, rng)
+    /// `_sample_text_token(logits, *, temperature, top_k)` (Python 483-499) — the
+    /// text head's next-token draw. The temperature/top-k policy is held by the
+    /// [`Sampler`] (built once from `GenParams`), so this just delegates to it.
+    fn sample_text_token(&self, logits: &Tensor, sampler: &mut Sampler) -> Result<u32> {
+        sampler.sample(logits)
     }
 
     /// `_prefill(text, audio_in, audio_in_lens, audio_out, modality_flag)` from
@@ -751,9 +730,9 @@ impl LFM2AudioModel {
     }
 
     /// Depthformer audio-frame sampler → `codebooks` codes. Faithful to
-    /// `_sample_audio_frame`: per-codebook greedy/temperature/top-k via
-    /// [`sample_token`].
-    fn sample_audio_frame(&self, embedding: &Tensor, temperature: Option<f64>, top_k: Option<usize>, rng: &mut StdRng) -> Result<Vec<u32>> {
+    /// `_sample_audio_frame`: per-codebook draw via the audio [`Sampler`]
+    /// (greedy/temperature/top-k held by the sampler).
+    fn sample_audio_frame(&self, embedding: &Tensor, sampler: &mut Sampler) -> Result<Vec<u32>> {
         // depth_linear(embedding) → (codebooks, depthformer_dim). `embedding` is a
         // 1-D (D,) lfm hidden; candle's Linear needs a 2-D input, so add a row dim
         // (Python's nn.Linear accepts the 1-D vector directly).
@@ -767,7 +746,7 @@ impl LFM2AudioModel {
             let dout = self.depthformer.forward(&cur, Some(caches.as_mut_slice()))?; // (1,1,dim)
             let dout = dout.reshape((1, self.depthformer_dim))?;
             let logits = self.depth_embeddings[i].get_logits(&dout)?.i(0)?; // (vocab,)
-            let token = sample_token(&logits, temperature, top_k, rng)?;
+            let token = sampler.sample(&logits)?;
             out.push(token);
             let tok = Tensor::from_vec(vec![token], (1,), din.device())?;
             df_token = self.depth_embeddings[i].embed(&tok)?.reshape((self.depthformer_dim,))?;
@@ -791,7 +770,10 @@ impl LFM2AudioModel {
         let mut in_emb = self.prefill(chat)?;
         let mut index_pos = 0usize;
         let mut cache = LfmCache::new(true, in_emb.dtype(), &self.lfm_cfg, in_emb.device())?;
-        let mut rng = StdRng::seed_from_u64(params.seed);
+        // Text and audio carry independent samplers (the Python uses one generator;
+        // for greedy — the default — both are argmax and the RNG is unused).
+        let mut text_sampler = Sampler::new(params.seed, params.text_temperature, params.text_top_k);
+        let mut audio_sampler = Sampler::new(params.seed, params.audio_temperature, params.audio_top_k);
 
         let mut current = LFMModality::Text;
 
@@ -804,7 +786,7 @@ impl LFM2AudioModel {
             match current {
                 LFMModality::Text => {
                     let logits = self.text_logits(&h_last)?;
-                    let next = self.sample_text_token(&logits, params.text_temperature, params.text_top_k, &mut rng)?;
+                    let next = self.sample_text_token(&logits, &mut text_sampler)?;
                     on_token(GenToken::Text(next));
                     if next == 128 {
                         current = LFMModality::AudioOut; // <|audio_start|>
@@ -816,7 +798,7 @@ impl LFM2AudioModel {
                     in_emb = self.lfm.embed(&tok)?.reshape((1, 1, self.hidden))?;
                 }
                 LFMModality::AudioOut => {
-                    let mut frame = self.sample_audio_frame(&h_last, params.audio_temperature, params.audio_top_k, &mut rng)?;
+                    let mut frame = self.sample_audio_frame(&h_last, &mut audio_sampler)?;
                     if frame[0] == 2048 {
                         for c in frame.iter_mut() {
                             *c = 2048; // next_token[:] = 2048
@@ -838,7 +820,8 @@ impl LFM2AudioModel {
         let mut in_emb = self.prefill(chat)?;
         let mut index_pos = 0usize;
         let mut cache = LfmCache::new(true, in_emb.dtype(), &self.lfm_cfg, in_emb.device())?;
-        let mut rng = StdRng::seed_from_u64(params.seed);
+        let mut text_sampler = Sampler::new(params.seed, params.text_temperature, params.text_top_k);
+        let mut audio_sampler = Sampler::new(params.seed, params.audio_temperature, params.audio_top_k);
 
         let mut current = LFMModality::Text;
         let mut modality_left = self.interleaved_n_text as i64;
@@ -854,7 +837,7 @@ impl LFM2AudioModel {
             match current {
                 LFMModality::Text => {
                     let logits = self.text_logits(&h_last)?;
-                    let next = self.sample_text_token(&logits, params.text_temperature, params.text_top_k, &mut rng)?;
+                    let next = self.sample_text_token(&logits, &mut text_sampler)?;
                     if next == 7 {
                         break; // <|im_end|>
                     }
@@ -870,7 +853,7 @@ impl LFM2AudioModel {
                     in_emb = self.lfm.embed(&tok)?.reshape((1, 1, self.hidden))?;
                 }
                 LFMModality::AudioOut => {
-                    let mut frame = self.sample_audio_frame(&h_last, params.audio_temperature, params.audio_top_k, &mut rng)?;
+                    let mut frame = self.sample_audio_frame(&h_last, &mut audio_sampler)?;
                     if modality_left <= 0 && !text_done {
                         current = LFMModality::Text;
                         modality_left = self.interleaved_n_text as i64;
@@ -902,28 +885,26 @@ mod tests {
 
     #[test]
     fn greedy_when_no_temperature() {
-        let mut rng = StdRng::seed_from_u64(0);
         let l = logits(&[0.1, 5.0, 0.2, 3.0]);
-        assert_eq!(sample_token(&l, None, None, &mut rng).unwrap(), 1);
+        assert_eq!(Sampler::new(0, None, None).sample(&l).unwrap(), 1);
     }
 
     #[test]
     fn greedy_when_temp_nonpositive_or_topk_one() {
-        let mut rng = StdRng::seed_from_u64(0);
         let l = logits(&[0.1, 5.0, 0.2, 3.0]);
         // temperature <= 0 ⇒ greedy
-        assert_eq!(sample_token(&l, Some(0.0), Some(50), &mut rng).unwrap(), 1);
+        assert_eq!(Sampler::new(0, Some(0.0), Some(50)).sample(&l).unwrap(), 1);
         // top_k == 1 ⇒ greedy even with a temperature
-        assert_eq!(sample_token(&l, Some(1.5), Some(1), &mut rng).unwrap(), 1);
+        assert_eq!(Sampler::new(0, Some(1.5), Some(1)).sample(&l).unwrap(), 1);
     }
 
     #[test]
     fn topk_restricts_support() {
         // With top_k=2 the only reachable tokens are the two largest logits (1, 3).
         let l = logits(&[0.1, 5.0, 0.2, 3.0, -2.0]);
-        let mut rng = StdRng::seed_from_u64(7);
+        let mut s = Sampler::new(7, Some(1.0), Some(2));
         for _ in 0..200 {
-            let t = sample_token(&l, Some(1.0), Some(2), &mut rng).unwrap();
+            let t = s.sample(&l).unwrap();
             assert!(t == 1 || t == 3, "top-k=2 sampled out-of-support token {t}");
         }
     }
@@ -932,8 +913,8 @@ mod tests {
     fn seed_is_reproducible() {
         let l = logits(&[1.0, 1.0, 1.0, 1.0, 1.0]);
         let draw = || {
-            let mut rng = StdRng::seed_from_u64(123);
-            (0..16).map(|_| sample_token(&l, Some(1.0), None, &mut rng).unwrap()).collect::<Vec<_>>()
+            let mut s = Sampler::new(123, Some(1.0), None);
+            (0..16).map(|_| s.sample(&l).unwrap()).collect::<Vec<_>>()
         };
         assert_eq!(draw(), draw());
     }
@@ -942,10 +923,10 @@ mod tests {
     fn sampling_can_pick_nonargmax() {
         // A flat-ish distribution with temperature should not always return argmax.
         let l = logits(&[2.0, 1.9, 1.8, 1.7]);
-        let mut rng = StdRng::seed_from_u64(1);
+        let mut s = Sampler::new(1, Some(1.0), None);
         let mut seen_non_zero = false;
         for _ in 0..200 {
-            if sample_token(&l, Some(1.0), None, &mut rng).unwrap() != 0 {
+            if s.sample(&l).unwrap() != 0 {
                 seen_non_zero = true;
                 break;
             }

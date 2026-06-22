@@ -12,6 +12,7 @@
 //! ```
 
 pub mod audio_out; // AudioDetokenizer trait + backends (LFM2 detok / Mimi)
+pub mod candle_ext; // vendored candle 0.10 backports + extensions (kept on the 0.9.2 pin)
 pub mod data; // data/ (data-pipeline value types)
 pub mod detokenizer; // detokenizer.py
 pub mod loader; // config.json + safetensors → model + processor

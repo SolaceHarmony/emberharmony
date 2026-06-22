@@ -24,11 +24,34 @@
 
 use candle_core::{Device, Result, Tensor};
 
-// `LFM2AudioModelInput` is the third dataclass in the Python `data/types.py`.
-// It already exists in the model module (it is what `LFM2AudioModel.logits` /
-// `forward` consume), so we re-export it rather than duplicate it. Faithful to
-// the single Python definition.
-pub use crate::model::lfm2_audio::LFM2AudioModelInput;
+/// `LFM2AudioModelInput` — the batched training input (the third Python
+/// `data/types.py` dataclass, assembled by the collator): the model inputs plus
+/// the `supervision_mask` marking which positions contribute to the loss. Defined
+/// here, where Python defines it; `model::lfm2_audio` (which consumes it in
+/// `logits`/`forward`) re-exports it.
+#[derive(Debug, Clone)]
+pub struct LFM2AudioModelInput {
+    pub text: Tensor,
+    pub audio_in: Tensor,
+    pub audio_in_lens: Tensor,
+    pub audio_out: Tensor,
+    pub modality_flag: Tensor,
+    pub supervision_mask: Tensor,
+}
+
+impl LFM2AudioModelInput {
+    /// `to(self, device) -> LFM2AudioModelInput` (py 69) — move every field to `device`.
+    pub fn to(&self, device: &Device) -> Result<Self> {
+        Ok(Self {
+            text: self.text.to_device(device)?,
+            audio_in: self.audio_in.to_device(device)?,
+            audio_in_lens: self.audio_in_lens.to_device(device)?,
+            audio_out: self.audio_out.to_device(device)?,
+            modality_flag: self.modality_flag.to_device(device)?,
+            supervision_mask: self.supervision_mask.to_device(device)?,
+        })
+    }
+}
 
 /// The `kind` discriminator on a chat-content segment. Faithful to the Python
 /// `Literal["text"]` / `Literal["audio"]` / `Literal["interleaved"]` default

@@ -10,7 +10,15 @@
 //! - `forward_embeds` accepts `inputs_embeds` and an optional **custom additive
 //!   attention mask** (the detokenizer's sliding window); the main path passes
 //!   `None` and gets a causal mask.
-//! - tracing spans and the flash-attn path are dropped (always the manual path).
+//! - tracing spans are dropped, and so are the reference's **custom CUDA kernels**.
+//!   HF selects `flash_attention_2`/`sdpa` for attention (lfm2_audio.py L162) and
+//!   binds the short-conv (`conv_L_cache`) to the `causal_conv1d` kernel when it is
+//!   importable. Here attention is the eager matmul+softmax math (the kernel-free
+//!   `sdpa`/no-flash path, *not* flash-attn's reordered online-softmax) and the
+//!   short-conv is a plain candle `Conv1d` (prefill) / gather-mul-sum (single step).
+//!   No custom kernels — which is precisely what lets this backbone run byte-exact
+//!   on `Device::Cpu` (LFM2's "no GPU needed" design point, which the CUDA-gated
+//!   reference stack cannot deliver as shipped). Verified: backbone parity 6.558e-6.
 
 use candle_core::{DType, Device, IndexOp, Result, Tensor};
 use candle_nn::{embedding, linear_no_bias, rms_norm, Conv1d, Conv1dConfig, Embedding, Linear, Module, RmsNorm, VarBuilder};

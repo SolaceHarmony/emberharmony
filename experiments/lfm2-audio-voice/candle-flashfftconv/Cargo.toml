@@ -1,0 +1,21 @@
+[package]
+name = "candle-flashfftconv"
+version = "0.1.0"
+edition = "2021"
+description = "Candle (CPU + Metal) kernels ported from FlashFFTConv — depthwise causal conv1d (and, WIP, the FFT/Monarch long conv). Metal kernels are CUDA→Metal translations adapted from the MLX `mx.fast.metal_kernel` ports in mlxports/csm-mlx/monarch_metal and m2-bert-mlx; wired into candle via the `CustomOp` `metal_fwd` hook."
+license = "Apache-2.0"
+
+[dependencies]
+candle-core = "0.9"
+# candle's own Metal abstraction (a shim over objc2-metal). candle 0.9 dropped
+# metal-rs, so `MetalStorage::buffer()` returns `&candle_metal_kernels::metal::Buffer`
+# and `MetalDevice` builds pipelines/encoders from these types — we must use the
+# SAME crate, not metal-rs, or the buffers won't type-check across the boundary.
+candle-metal-kernels = { version = "0.9", optional = true }
+# `MTLSize` for the dispatch (candle's objc2-metal version).
+objc2-metal = { version = "0.3", optional = true }
+
+[features]
+default = []
+# Enables the Metal `metal_fwd` path (compiles + dispatches the embedded shaders).
+metal = ["dep:candle-metal-kernels", "dep:objc2-metal", "candle-core/metal"]

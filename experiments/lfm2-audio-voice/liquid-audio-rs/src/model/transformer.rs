@@ -16,6 +16,8 @@
 use candle_core::{DType, Device, Result, Tensor, D};
 use candle_nn::{linear_no_bias, ops::softmax_last_dim, rotary_emb::rope_i, Embedding, Linear, Module, VarBuilder};
 
+use crate::candle_ext::kv_cache::ConcatKvCache;
+
 /// `head_style` for attention. Mirrors the `Literal["mha","gqa","mqa"]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HeadStyle {
@@ -34,12 +36,25 @@ pub enum HeadStyle {
 /// two concrete shapes the union takes in this module without an open-ended enum.
 pub type LayerCache = Option<(Tensor, Tensor)>;
 
-/// Per-layer KV cache. Mirrors `LayerKVCache`: stores key/value pre-transpose
+/// Per-layer KV cache. Port of `LayerKVCache`: stores key/value pre-transpose
 /// (shape `[b, t, heads, head_dim]`) and concatenates new steps along dim 1.
-#[derive(Default)]
+///
+/// This is a thin **adapter** over candle's cat-based [`ConcatKvCache`]
+/// (vendored from candle-nn 0.10.2), which is itself a structural 1:1 of the
+/// Python class (`torch.cat([key_cache, k], dim=1)` ⇒ `append` on `dim=1`). The
+/// adapter only re-exposes the Python method names (`update`, `get_cache_size`)
+/// and the `(key, value)`-tuple constructor the depthformer threads through
+/// `forward_cached`; the cat itself is candle's, not re-implemented here.
 pub struct LayerKvCache {
-    key_cache: Option<Tensor>,
-    value_cache: Option<Tensor>,
+    inner: ConcatKvCache,
+}
+
+impl Default for LayerKvCache {
+    fn default() -> Self {
+        // dim=1: the Python `update` concatenates along the time axis of
+        // `[b, t, heads, head_dim]` (`torch.cat(..., dim=1)`).
+        Self { inner: ConcatKvCache::new(1) }
+    }
 }
 
 impl LayerKvCache {
@@ -51,38 +66,31 @@ impl LayerKvCache {
     /// `(key, value)` tensor tuple. Faithful to the Python `assert cache is None
     /// or len(cache) == 2` — a `Some` carries exactly two tensors by construction.
     pub fn from_cache(cache: LayerCache) -> Self {
-        match cache {
-            None => Self::default(),
-            Some((k, v)) => Self { key_cache: Some(k), value_cache: Some(v) },
+        let mut inner = ConcatKvCache::new(1);
+        if let Some((k, v)) = cache {
+            // Seed the cache with the supplied (key, value) pair; `append` from
+            // empty is exactly "set" (no prior to concatenate with).
+            let _ = inner.append(&k, &v);
         }
+        Self { inner }
     }
 
+    /// `LayerKVCache.update(k, v)` (py 48-56): concatenate the new step and return
+    /// the full `(key, value)`. Delegates to `ConcatKvCache::append` (cat on dim 1).
     pub fn update(&mut self, k: &Tensor, v: &Tensor) -> Result<(Tensor, Tensor)> {
-        let k = match &self.key_cache {
-            None => k.clone(),
-            Some(prev) => Tensor::cat(&[prev, k], 1)?,
-        };
-        let v = match &self.value_cache {
-            None => v.clone(),
-            Some(prev) => Tensor::cat(&[prev, v], 1)?,
-        };
-        self.key_cache = Some(k.clone());
-        self.value_cache = Some(v.clone());
-        Ok((k, v))
+        self.inner.append(k, v)
     }
 
+    /// `LayerKVCache.get_cache_size()` (py 58-62): the cached time length, or 0.
     pub fn get_cache_size(&self) -> usize {
-        match &self.key_cache {
-            None => 0,
-            Some(k) => k.dim(1).unwrap_or(0),
-        }
+        self.inner.current_seq_len()
     }
 
     /// Extract the current `(key, value)` pair as a [`LayerCache`]. Mirrors the
     /// Python `forward_cached` returning `new_cache` (the `(k, v)` tuple produced
     /// by `LayerKVCache.update`). Returns `None` when the cache is still empty.
     pub fn to_cache(&self) -> LayerCache {
-        match (&self.key_cache, &self.value_cache) {
+        match (self.inner.k(), self.inner.v()) {
             (Some(k), Some(v)) => Some((k.clone(), v.clone())),
             _ => None,
         }
@@ -106,12 +114,15 @@ impl RmsNorm {
     ///
     /// UN-FOLDED from `forward` for 1:1 parity with the Python helper. Operates on
     /// whatever dtype it is handed (the Python `_norm` is dtype-agnostic; `forward`
-    /// is the one that upcasts to f32 before calling it). `rsqrt(z)` is `1/sqrt(z)`
-    /// expressed here as a `broadcast_div` by `sqrt(z)`, byte-identical to the math
-    /// previously inlined in `forward`.
+    /// upcasts to f32 first). Matches torch's `x * rsqrt(z)` *structure* —
+    /// `recip(sqrt(z))` then multiply, rather than divide-by-sqrt. candle has no
+    /// *fused* rsqrt, so the reciprocal-sqrt is two ops and still differs from torch's
+    /// fused `rsqrt` by ~1 ULP: that is the cross-library floor (see PYTHON_VS_RUST.md
+    /// §1.4), not a faithfulness defect.
     pub fn norm(&self, x: &Tensor) -> Result<Tensor> {
         let mean_sq = x.sqr()?.mean_keepdim(D::Minus1)?;
-        x.broadcast_div(&(mean_sq + self.eps)?.sqrt()?)
+        let rsqrt = (mean_sq + self.eps)?.sqrt()?.recip()?; // 1/sqrt(z) ≈ rsqrt(z)
+        x.broadcast_mul(&rsqrt)
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -561,6 +572,16 @@ pub struct RawLmBackbone {
 }
 
 impl RawLmBackbone {
+    /// `RawLMBackbone.__init__(layers, vocab_size=65536, norm_eps=1e-5,
+    /// embed_init_scale=1.0, *, has_embedding=True, tie_embedding=True)` (py 517).
+    /// Python derives `self.dim = layers[0].dim` (asserted equal to the last
+    /// layer's `dim_out`); the shared embedding is built by the caller via
+    /// `VarBuilder` (weights are loaded, not initialized) and passed in — `None`
+    /// is `has_embedding=False`. `dim` is the backbone width.
+    pub fn new(layers: Vec<StandardBlock>, embedding: Option<SharedEmbedding>, dim: usize) -> Self {
+        Self { layers, embedding, dim }
+    }
+
     pub fn forward(&self, x: &Tensor, caches: Option<&mut [LayerKvCache]>) -> Result<Tensor> {
         let mut x = x.clone();
         match caches {
@@ -626,6 +647,17 @@ impl RawLmBackbone {
 /// per-layer cache vector — a faithful port of the functional cache contract that
 /// `RawLMBackbone.forward_cached` (py 554) builds on.
 pub trait SequenceModel {
+    /// `SequenceModel.__init__(*args, **kwargs)` (py 28-29) — the abstract base's
+    /// constructor is just `super().__init__()` (nn.Module bookkeeping), which has
+    /// no candle referent in an inference port. Faithfully a no-op; concrete models
+    /// construct via their own `new`. (`where Self: Sized` keeps the trait
+    /// object-safe.)
+    fn new()
+    where
+        Self: Sized,
+    {
+    }
+
     fn dim(&self) -> usize;
     fn dim_out(&self) -> usize;
     fn forward(&self, x: &Tensor, cache: Option<&mut [LayerKvCache]>) -> Result<Tensor>;

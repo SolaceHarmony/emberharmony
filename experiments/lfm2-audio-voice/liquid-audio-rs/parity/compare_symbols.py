@@ -73,6 +73,8 @@ def canon(name: str) -> str:
         "__getitem__": "get",
         "__len__": "len",
         "__repr__": "fmt",
+        "__iter__": "iter",
+        "__next__": "next",
     }
     if name in aliases:
         return aliases[name]

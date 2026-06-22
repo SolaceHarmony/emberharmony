@@ -9,7 +9,7 @@
 //! mel → log → per-feature normalization → pad to a multiple of `pad_to`.
 //! Training-only bits (dither, nb-augmentation, frame splicing) are skipped.
 
-use candle_core::{Device, Result, Tensor};
+use candle_core::{Device, DType, Result, Tensor};
 use rustfft::{num_complex::Complex, FftPlanner};
 
 /// Subset of NeMo's preprocessor config needed offline.
@@ -177,7 +177,7 @@ impl FilterbankFeatures {
     /// the complex bins freq-major: `out[f * t + ti]`, with `t = 1 + L/hop` frames
     /// (the `center=True` frame count). Byte-identical to the previously inlined
     /// FFT loop — only the FFT planning + per-frame transform moved here.
-    fn stft(&self, y: &[f32]) -> Vec<Complex<f32>> {
+    fn stft(&self, y: &[f32]) -> Vec<Complex<f64>> {
         let l = y.len();
         let n_fft = self.cfg.n_fft;
         let hop = self.cfg.n_window_stride;
@@ -190,16 +190,21 @@ impl FilterbankFeatures {
         let mut padded = vec![0f32; l + 2 * pad];
         padded[pad..pad + l].copy_from_slice(y);
 
+        // The mel front-end is precision-sensitive (the Python `AudioPreprocessor`
+        // warns it is "not robust to low precision" — even bf16 costs WER). Torch
+        // runs it in f32; we run the FFT + downstream reductions in **f64** so our
+        // result tracks the mathematically-exact mel, leaving only torch's own f32
+        // rounding as the gap (the FFT and the log/normalize amplify f32 error).
         let window = self.padded_window();
-        let mut planner = FftPlanner::<f32>::new();
+        let mut planner = FftPlanner::<f64>::new();
         let fft = planner.plan_fft_forward(n_fft);
 
-        let mut out = vec![Complex { re: 0f32, im: 0f32 }; freq * t];
-        let mut buf = vec![Complex { re: 0f32, im: 0f32 }; n_fft];
+        let mut out = vec![Complex { re: 0f64, im: 0f64 }; freq * t];
+        let mut buf = vec![Complex { re: 0f64, im: 0f64 }; n_fft];
         for ti in 0..t {
             let start = ti * hop;
             for j in 0..n_fft {
-                buf[j].re = padded[start + j] * window[j];
+                buf[j].re = padded[start + j] as f64 * window[j] as f64;
                 buf[j].im = 0.0;
             }
             fft.process(&mut buf);
@@ -225,6 +230,16 @@ impl FilterbankFeatures {
     }
 
     /// `samples` is mono PCM in [-1,1] as `(L,)` or `(1, L)`. Returns `(1, nfilt, T)`.
+    ///
+    /// The STFT/mel runs on the **CPU** (`rustfft`) **by design**, not as an
+    /// unported shortcut. This is a real-time/streaming front-end: it is fed short
+    /// (~80 ms) frames one at a time, so per-frame host↔device transfer plus
+    /// kernel-launch latency would dominate the (tiny) FFT cost — CPU wins
+    /// wall-clock here. The throughput-bound work that *does* belong on the GPU —
+    /// the conformer / LFM2 / depthformer matmuls — runs on the selected device
+    /// (Metal); only this small DSP front-end stays on the CPU. The result Tensor
+    /// is created on `self.device`, so the hand-off to the conformer is a single
+    /// upload, not a per-op round-trip.
     pub fn forward(&self, samples: &Tensor) -> Result<Tensor> {
         let x = samples.flatten_all()?.to_dtype(candle_core::DType::F32)?.to_vec1::<f32>()?;
         let l = x.len();
@@ -253,8 +268,8 @@ impl FilterbankFeatures {
         // torch stft returns a complex tensor; convert to magnitude then power.
         // Python: x = sqrt(re^2 + im^2 + guard); if mag_power != 1: x = x.pow(mag_power).
         // (guard == 0 for the inference path, use_grads=False.)
-        let mag_power = self.cfg.mag_power as f32;
-        let mut power = vec![0f32; freq * t];
+        let mag_power = self.cfg.mag_power;
+        let mut power = vec![0f64; freq * t];
         for (i, c) in spec.iter().enumerate() {
             // Fast path for the common mag_power == 2 (= re^2 + im^2); honor any
             // other configured power faithfully.
@@ -262,9 +277,16 @@ impl FilterbankFeatures {
             power[i] = if mag_power == 2.0 { p } else { p.sqrt().powf(mag_power) };
         }
 
-        let spec = Tensor::from_vec(power, (freq, t), &self.device)?; // (freq, T)
+        // Power spectrum → mel → log → normalize, all in f64 on the CPU (this
+        // front-end is CPU-by-design; Metal has no f64). Only the final f32 result
+        // is moved to the model device. Keeping the precision-sensitive chain in
+        // f64 removes our own rounding so the gap to torch's f32 reference is just
+        // torch's rounding, not two divergent f32 paths.
+        let cpu = Device::Cpu;
+        let spec = Tensor::from_vec(power, (freq, t), &cpu)?; // (freq, T) f64
         // mel: (nfilt, freq) @ (freq, T) → (nfilt, T)
-        let mut mel = self.fb.matmul(&spec)?;
+        let fb64 = self.fb.to_device(&cpu)?.to_dtype(DType::F64)?;
+        let mut mel = fb64.matmul(&spec)?;
         // log(x + guard) — guard from log_zero_guard_value_fn (log_zero_guard_type="add").
         // Bind the guard first: `mel + …` moves `mel`, so the `&mel` borrow must resolve before.
         let guard = self.log_zero_guard_value_fn(&mel);
@@ -272,6 +294,8 @@ impl FilterbankFeatures {
         // per-feature normalization (ddof=1) over the valid frames only, applied
         // to all frames — faithful to normalize_batch's valid_mask.
         mel = normalize_batch(&mel, seq_len)?;
+        // Down to f32 on the model device for the conformer.
+        let mut mel = mel.to_dtype(DType::F32)?.to_device(&self.device)?;
         // mask the trailing pad frame(s) [seq_len, t) to pad_value (0).
         if seq_len < t {
             let valid = mel.narrow(1, 0, seq_len)?;
@@ -321,20 +345,6 @@ impl FilterbankFeatures {
     }
 }
 
-/// `AudioPreprocessor` (Python `class AudioPreprocessor(nn.Module, ABC)`): the
-/// base preprocessor contract — `forward(input, length)` delegates to the
-/// abstract `get_features`.
-pub trait AudioPreprocessor {
-    /// abstract `get_features(input_signal, length)` — subclasses implement.
-    fn get_features(&self, input_signal: &Tensor, length: Option<&Tensor>) -> Result<(Tensor, Option<Tensor>)>;
-
-    /// `forward(input_signal, length)` = `get_features` (Python wraps it in
-    /// `torch.no_grad()`; inference here is already grad-free).
-    fn forward(&self, input_signal: &Tensor, length: Option<&Tensor>) -> Result<(Tensor, Option<Tensor>)> {
-        self.get_features(input_signal, length)
-    }
-}
-
 /// `AudioToMelSpectrogramPreprocessor(AudioPreprocessor)` — wraps the mel
 /// `FilterbankFeatures` (Python `self.featurizer`); `get_features` / `filter_banks`
 /// delegate to it.
@@ -348,37 +358,112 @@ pub trait AudioPreprocessor {
 /// (the window function is resolved in `FilterbankFeatures::new`; the output is
 /// always f32 here, so the dtype sentinel is a no-op) and are intentionally not
 /// carried.
+/// `torch_windows` keys (py L40-47): the analysis windows the base
+/// `AudioPreprocessor` knows about — `None` maps to `ones`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowKind {
+    Hann,
+    Hamming,
+    Blackman,
+    Bartlett,
+    Ones,
+}
+
+/// `torch.{hann,hamming,blackman,bartlett}_window(n)` / `torch.ones(n)` with the
+/// torch STFT default `periodic=True` (denominator `n`, not `n-1`).
+fn analysis_window(kind: WindowKind, n: usize) -> Vec<f32> {
+    use std::f64::consts::PI;
+    let nn = n.max(1) as f64;
+    (0..n)
+        .map(|i| {
+            let x = i as f64;
+            let w = match kind {
+                WindowKind::Ones => 1.0,
+                WindowKind::Hann => 0.5 - 0.5 * (2.0 * PI * x / nn).cos(),
+                WindowKind::Hamming => 0.54 - 0.46 * (2.0 * PI * x / nn).cos(),
+                WindowKind::Blackman => 0.42 - 0.5 * (2.0 * PI * x / nn).cos() + 0.08 * (4.0 * PI * x / nn).cos(),
+                WindowKind::Bartlett => 1.0 - (2.0 * x / nn - 1.0).abs(),
+            };
+            w as f32
+        })
+        .collect()
+}
+
+/// `AudioPreprocessor(nn.Module, ABC)` (py L28) — the abstract base of the audio
+/// front-end: it holds the STFT `win_length`/`hop_length` and the window-function
+/// table. [`AudioToMelSpectrogramPreprocessor`] composes it (Rust composition for
+/// the Python `super().__init__(...)` inheritance). The Python non-persistent
+/// `dtype_sentinel_tensor` buffer has no field — candle's compute dtype is explicit.
+pub struct AudioPreprocessor {
+    /// `self.win_length` (py L37).
+    pub win_length: usize,
+    /// `self.hop_length` (py L38).
+    pub hop_length: usize,
+}
+
+impl AudioPreprocessor {
+    /// `AudioPreprocessor.__init__(win_length, hop_length)` (py L34-58).
+    pub fn new(win_length: usize, hop_length: usize) -> Self {
+        Self { win_length, hop_length }
+    }
+
+    /// `torch_windows[kind](win_length)` — the length-`win_length` analysis window.
+    pub fn window(&self, kind: WindowKind) -> Vec<f32> {
+        analysis_window(kind, self.win_length)
+    }
+
+    /// `AudioPreprocessor.forward` input guard (py L60-66): the base, under
+    /// `@torch.no_grad()`, warns if the signal is not f32 and casts it to f32
+    /// before delegating to the abstract `get_features`. This is the base half of
+    /// the template; the concrete [`AudioToMelSpectrogramPreprocessor::forward`]
+    /// runs `get_features` and casts the output back to the sentinel (f32) dtype.
+    /// Inference here is already grad-free, so there is no `no_grad` to mirror.
+    pub fn forward(&self, input_signal: &Tensor) -> Result<Tensor> {
+        if input_signal.dtype() != DType::F32 {
+            eprintln!(
+                "AudioPreprocessor received an input signal of dtype {:?}, rather than f32; \
+                 it runs in float32 and the input will be cast (mantissa loss is not recoverable).",
+                input_signal.dtype()
+            );
+        }
+        input_signal.to_dtype(DType::F32)
+    }
+
+    /// `AudioPreprocessor.get_features` (py L71) — the `@abstractmethod` feature
+    /// extractor. The base has no featurizer; concrete preprocessors
+    /// ([`AudioToMelSpectrogramPreprocessor::get_features`]) implement it. Calling
+    /// it on the base bails, mirroring Python's `NotImplementedError` contract.
+    pub fn get_features(&self, _input_signal: &Tensor, _length: Option<&Tensor>) -> Result<(Tensor, Option<Tensor>)> {
+        candle_core::bail!("AudioPreprocessor::get_features is abstract; use a concrete preprocessor")
+    }
+}
+
 pub struct AudioToMelSpectrogramPreprocessor {
     featurizer: FilterbankFeatures,
-    /// base `AudioPreprocessor.win_length` (= `n_window_size`).
-    win_length: usize,
-    /// base `AudioPreprocessor.hop_length` (= `n_window_stride`).
-    hop_length: usize,
+    /// `super().__init__(n_window_size, n_window_stride)` — the base preprocessor.
+    base: AudioPreprocessor,
 }
 
 impl AudioToMelSpectrogramPreprocessor {
-    /// PORT: `AudioToMelSpectrogramPreprocessor.__init__` (py L152-227) +
-    /// `AudioPreprocessor.__init__` (py L34-58). The full Python ctor wires a long
-    /// config into a `FilterbankFeatures`; here the `featurizer` is built
-    /// separately (`FilterbankFeatures::new`) and injected, and the base-class
-    /// `win_length`/`hop_length` are recovered from its `MelConfig`
-    /// (`n_window_size`/`n_window_stride`) — matching Python's
-    /// `super().__init__(n_window_size, n_window_stride)`.
+    /// PORT: `AudioToMelSpectrogramPreprocessor.__init__` (py L152-227). The full
+    /// Python ctor wires a long config into a `FilterbankFeatures`; here the
+    /// `featurizer` is built separately (`FilterbankFeatures::new`) and injected,
+    /// and the base [`AudioPreprocessor`] is `super().__init__(n_window_size,
+    /// n_window_stride)` from its `MelConfig`.
     pub fn new(featurizer: FilterbankFeatures) -> Self {
         let cfg = featurizer.mel_config();
-        let win_length = cfg.n_window_size;
-        let hop_length = cfg.n_window_stride;
-        Self { featurizer, win_length, hop_length }
+        let base = AudioPreprocessor::new(cfg.n_window_size, cfg.n_window_stride);
+        Self { featurizer, base }
     }
 
     /// base `AudioPreprocessor.win_length` (py L37).
     pub fn win_length(&self) -> usize {
-        self.win_length
+        self.base.win_length
     }
 
     /// base `AudioPreprocessor.hop_length` (py L38).
     pub fn hop_length(&self) -> usize {
-        self.hop_length
+        self.base.hop_length
     }
 
     /// `filter_banks` → the featurizer's mel filterbank.
@@ -400,11 +485,21 @@ impl AudioToMelSpectrogramPreprocessor {
     pub fn input_example(&self, _max_batch: usize, _max_dim: usize, _min_length: usize) {}
 }
 
-impl AudioPreprocessor for AudioToMelSpectrogramPreprocessor {
+impl AudioToMelSpectrogramPreprocessor {
     /// `get_features` → `self.featurizer(input_signal, length)`. The Rust mel
     /// featurizer returns the features; per-clip valid length is tracked by the
     /// caller (`ChatState`), so the length slot is `None` here.
-    fn get_features(&self, input_signal: &Tensor, _length: Option<&Tensor>) -> Result<(Tensor, Option<Tensor>)> {
+    pub fn get_features(&self, input_signal: &Tensor, _length: Option<&Tensor>) -> Result<(Tensor, Option<Tensor>)> {
         Ok((self.featurizer.forward(input_signal)?, None))
+    }
+
+    /// `AudioPreprocessor.forward(input_signal, length)` (py L60-68): the base
+    /// applies its f32 input guard ([`AudioPreprocessor::forward`]), delegates to
+    /// the abstract `get_features` (here the mel featurizer), then casts the
+    /// features back to the `dtype_sentinel_tensor` dtype (f32).
+    pub fn forward(&self, input_signal: &Tensor, length: Option<&Tensor>) -> Result<(Tensor, Option<Tensor>)> {
+        let guarded = self.base.forward(input_signal)?;
+        let (signal, len) = self.get_features(&guarded, length)?;
+        Ok((signal.to_dtype(DType::F32)?, len))
     }
 }
