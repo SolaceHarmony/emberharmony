@@ -41,6 +41,24 @@ pub trait AudioDetokenizer {
             "this audio-out backend is decode-only (no encoder); audio-out codes require the Mimi codec".into(),
         ))
     }
+
+    /// Reset streaming-decode state. Call once at the start of each generation
+    /// turn, before the first [`decode_step`](Self::decode_step) — the analog of
+    /// entering the Python `mimi.streaming(1)` context.
+    fn reset_stream(&self) {}
+
+    /// Streaming decode of a single audio frame `(1, codebooks, 1)` → an optional
+    /// audio chunk. A streaming codec buffers a few frames before emitting, so the
+    /// first call(s) may return `None`. Unlike [`decode`](Self::decode), this keeps
+    /// codec state **across** calls (no per-call reset), so chunks stitch
+    /// gaplessly — the real-time path the Python demo uses inside
+    /// `mimi.streaming(1)` (`mimi.decode(frame)` per generated frame).
+    ///
+    /// Default: backends without a true streaming path fall back to a one-shot
+    /// decode of the single frame.
+    fn decode_step(&self, frame: &Tensor) -> Result<Option<Tensor>> {
+        Ok(Some(self.decode(frame)?))
+    }
 }
 
 /// The in-tree LFM2-based detokenizer behind the shared trait. Its `forward`
@@ -81,5 +99,21 @@ impl AudioDetokenizer for MimiDetokenizer {
         let mut m = self.inner.borrow_mut();
         m.reset_state();
         m.encode(wav)
+    }
+
+    /// Reset the moshi Mimi streaming conv/transformer state (turn boundary).
+    fn reset_stream(&self) {
+        self.inner.borrow_mut().reset_state();
+    }
+
+    /// Real streaming decode via moshi's `Mimi::decode_step` — keeps codec state
+    /// across calls (no `reset_state` here; [`reset_stream`](Self::reset_stream)
+    /// does that at the turn boundary). `frame` is `(1, codebooks, 1)`; the codec's
+    /// warmup latency means the first call(s) yield `None`.
+    fn decode_step(&self, frame: &Tensor) -> Result<Option<Tensor>> {
+        let codes = frame.to_dtype(DType::U32)?; // RVQ index_select wants u32
+        let mut m = self.inner.borrow_mut();
+        let out = m.decode_step(&moshi::StreamTensor::from_tensor(codes), &moshi::StreamMask::empty())?;
+        Ok(out.as_option().cloned())
     }
 }

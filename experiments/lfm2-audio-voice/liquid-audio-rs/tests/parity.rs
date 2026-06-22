@@ -103,6 +103,47 @@ fn mimi_decode_smoke() -> anyhow::Result<()> {
 }
 
 #[test]
+#[ignore = "needs LFM_MODEL_DIR (loads the Mimi weights shipped in the repo)"]
+fn mimi_streaming_decode_smoke() -> anyhow::Result<()> {
+    // The real-time path: moshi's streaming `decode_step` decodes one generated
+    // frame at a time (keeping codec state), instead of a one-shot batch decode —
+    // exactly what the Python demo does inside `mimi.streaming(1)`. No torch.
+    let dir = std::env::var("LFM_MODEL_DIR").expect("set LFM_MODEL_DIR");
+    let device = Device::Cpu;
+    let (_model, proc) = liquid_audio::from_pretrained(Path::new(&dir), DType::F32, &device)?;
+    let mimi = proc.audio_detokenizer().expect("audio-out backend (Mimi)");
+
+    let (k, t) = (8usize, 16usize);
+    let codes: Vec<u32> = (0..k * t).map(|i| (i * 37 % 2048) as u32).collect();
+    let codes = Tensor::from_vec(codes, (1, k, t), &device)?;
+
+    // Stream: reset at the turn boundary, then feed each (1, 8, 1) frame.
+    mimi.reset_stream();
+    let mut chunks: Vec<Tensor> = Vec::new();
+    let mut warmup_none = 0usize;
+    for ti in 0..t {
+        let frame = codes.narrow(2, ti, 1)?; // (1, codebooks, 1)
+        match mimi.decode_step(&frame)? {
+            Some(chunk) => chunks.push(chunk.flatten_all()?.to_dtype(DType::F32)?),
+            None => warmup_none += 1,
+        }
+    }
+    assert!(!chunks.is_empty(), "streaming produced no audio chunks");
+    let stream = Tensor::cat(&chunks.iter().collect::<Vec<_>>(), 0)?;
+    let n_stream = stream.dims1()?;
+    let max = stream.abs()?.max(0)?.to_scalar::<f32>()?;
+    println!(
+        "mimi STREAMING decode: {t} frames -> {n_stream} samples ({warmup_none} warmup-None, {} emitting frames), max|amp| {:.4}",
+        t - warmup_none,
+        max
+    );
+    assert!(max.is_finite() && max > 0.0, "streaming waveform empty/NaN");
+    // Each emitting frame yields 1920 samples (12.5 Hz @ 24 kHz).
+    assert_eq!(n_stream, (t - warmup_none) * 1920, "unexpected streaming sample count");
+    Ok(())
+}
+
+#[test]
 #[ignore = "needs LFM_MODEL_DIR + parity/golden/prefill_refs.safetensors"]
 fn prefill_parity() -> anyhow::Result<()> {
     let dir = std::env::var("LFM_MODEL_DIR").expect("set LFM_MODEL_DIR");
