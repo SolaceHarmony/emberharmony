@@ -194,11 +194,11 @@ impl<'a> ChatState<'a> {
     /// (one per `mel2emb_len(frames)`), and the frame length — exactly the same
     /// three `torch.cat`s as Python (py 248-250).
     ///
-    /// `torchaudio`'s resampler uses a windowed-sinc kernel; matching the
-    /// data-mapper's faithful, dependency-free stand-in (`data::mapper::resample`)
-    /// this uses linear interpolation, `L' = round(L * 16000 / sampling_rate)`.
-    /// The post-resample mel/append path delegates to [`Self::add_audio_16k`] so
-    /// the parity computation is shared and unchanged.
+    /// The resample is the faithful windowed-sinc [`crate::resample`] (a 1:1 port
+    /// of `torchaudio.functional.resample`, shared with `data::mapper`),
+    /// `L' = ceil(L * 16000 / sampling_rate)`. The post-resample mel/append path
+    /// delegates to [`Self::add_audio_16k`] so the parity computation is shared
+    /// and unchanged.
     pub fn add_audio(&mut self, wave: &Tensor, sampling_rate: u32) -> Result<()> {
         // Python: `assert len(wave.shape) == 2` and `assert wave.shape[0] == 1`.
         if wave.rank() != 2 {

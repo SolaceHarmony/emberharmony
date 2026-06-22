@@ -363,12 +363,12 @@ impl<'a> LFM2AudioChatMapper<'a> {
     ///
     /// Python decodes the encoded-audio `bytes` with `soundfile.read(..., dtype=
     /// "float32", always_2d=True)`, transposes to channel-major, and mono-downmixes
-    /// (`mean over channels`) if multichannel. There is no candle/soundfile
-    /// referent, so this is a real, dependency-free WAV (RIFF) decoder for the
-    /// common PCM (8/16/24/32-bit) and IEEE-float (32/64-bit) encodings — the same
-    /// formats `soundfile` reads for WAV — returning the mono f32 waveform.
+    /// (`mean over channels`) if multichannel. We decode with `symphonia` (pure
+    /// Rust), which reads the same containers libsndfile/`soundfile` does — WAV,
+    /// FLAC, OGG/Vorbis, AIFF, … and more — to interleaved f32, then keep the
+    /// leading channel dim and mono-downmix, matching the Python exactly.
     pub fn load_audio_bytes(audio: &[u8]) -> Result<(Tensor, u32)> {
-        let WavData { samples, channels, sample_rate } = decode_wav(audio)?;
+        let DecodedAudio { samples, channels, sample_rate } = decode_audio(audio)?;
         let n_frames = if channels == 0 { 0 } else { samples.len() / channels as usize };
 
         // data.T then mean over channels if > 1 → a single (L,) mono row.
@@ -392,85 +392,82 @@ impl<'a> LFM2AudioChatMapper<'a> {
     }
 }
 
-/// Decoded PCM in interleaved channel order (frame-major), as f32 in [-1, 1].
-struct WavData {
+/// Decoded audio in interleaved channel order (frame-major), as f32 in [-1, 1].
+struct DecodedAudio {
     samples: Vec<f32>,
     channels: u16,
     sample_rate: u32,
 }
 
-/// Minimal RIFF/WAVE decoder for the encodings `soundfile` reads for `.wav`:
-/// PCM (8-bit unsigned, 16/24/32-bit signed) and IEEE float (32/64-bit). Mirrors
-/// `soundfile.read(stream, dtype="float32", always_2d=True)` for WAV input.
-fn decode_wav(bytes: &[u8]) -> Result<WavData> {
-    let err = |m: &str| candle_core::Error::Msg(format!("load_audio_bytes: {m}"));
-    if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
-        return Err(err("not a RIFF/WAVE stream (only WAV decoding is supported in-tree)"));
-    }
+/// `soundfile.read(stream, dtype="float32", always_2d=True)` equivalent — decode
+/// an encoded-audio byte stream to interleaved f32 using `symphonia` (pure Rust).
+/// Probes the container (WAV, FLAC, OGG/Vorbis, AIFF, MP3, … — a superset of the
+/// formats libsndfile reads), decodes every packet, and concatenates the
+/// interleaved samples. No torch, no C deps.
+fn decode_audio(bytes: &[u8]) -> Result<DecodedAudio> {
+    use symphonia::core::audio::SampleBuffer;
+    use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
+    use symphonia::core::errors::Error as SymError;
+    use symphonia::core::formats::FormatOptions;
+    use symphonia::core::io::MediaSourceStream;
+    use symphonia::core::meta::MetadataOptions;
+    use symphonia::core::probe::Hint;
 
-    let u16le = |b: &[u8]| u16::from_le_bytes([b[0], b[1]]);
-    let u32le = |b: &[u8]| u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+    let err = |m: String| candle_core::Error::Msg(format!("load_audio_bytes: {m}"));
 
-    let mut pos = 12usize;
-    let mut fmt: Option<(u16, u16, u32, u16)> = None; // (audio_format, channels, sample_rate, bits)
-    let mut data: Option<&[u8]> = None;
+    let mss = MediaSourceStream::new(Box::new(std::io::Cursor::new(bytes.to_vec())), Default::default());
+    let probed = symphonia::default::get_probe()
+        .format(&Hint::new(), mss, &FormatOptions::default(), &MetadataOptions::default())
+        .map_err(|e| err(format!("unsupported/undecodable audio container: {e}")))?;
+    let mut format = probed.format;
+    let track = format
+        .tracks()
+        .iter()
+        .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
+        .ok_or_else(|| err("no decodable audio track".into()))?;
+    let track_id = track.id;
+    let mut decoder = symphonia::default::get_codecs()
+        .make(&track.codec_params, &DecoderOptions::default())
+        .map_err(|e| err(format!("no decoder for codec: {e}")))?;
 
-    while pos + 8 <= bytes.len() {
-        let id = &bytes[pos..pos + 4];
-        let size = u32le(&bytes[pos + 4..pos + 8]) as usize;
-        let body_start = pos + 8;
-        let body_end = (body_start + size).min(bytes.len());
-        match id {
-            b"fmt " if size >= 16 => {
-                let b = &bytes[body_start..body_end];
-                fmt = Some((u16le(&b[0..2]), u16le(&b[2..4]), u32le(&b[4..8]), u16le(&b[14..16])));
-            }
-            b"data" => {
-                data = Some(&bytes[body_start..body_end]);
-            }
-            _ => {}
+    let mut sample_rate = track.codec_params.sample_rate.unwrap_or(0);
+    let mut channels: u16 = track.codec_params.channels.map(|c| c.count() as u16).unwrap_or(0);
+    let mut samples: Vec<f32> = Vec::new();
+
+    loop {
+        let packet = match format.next_packet() {
+            Ok(p) => p,
+            // End of stream (symphonia signals EOF as an UnexpectedEof IoError).
+            Err(SymError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(SymError::ResetRequired) => break,
+            Err(e) => return Err(err(format!("read error: {e}"))),
+        };
+        if packet.track_id() != track_id {
+            continue;
         }
-        // Chunks are word-aligned: advance by size + (size & 1) padding byte.
-        pos = body_start + size + (size & 1);
+        match decoder.decode(&packet) {
+            Ok(decoded) => {
+                let spec = *decoded.spec();
+                if sample_rate == 0 {
+                    sample_rate = spec.rate;
+                }
+                if channels == 0 {
+                    channels = spec.channels.count() as u16;
+                }
+                let mut sb = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
+                sb.copy_interleaved_ref(decoded);
+                samples.extend_from_slice(sb.samples());
+            }
+            // A single corrupt packet is skippable (libsndfile is similarly lenient).
+            Err(SymError::DecodeError(_)) => continue,
+            Err(e) => return Err(err(format!("decode error: {e}"))),
+        }
     }
 
-    let (audio_format, channels, sample_rate, bits) = fmt.ok_or_else(|| err("missing fmt chunk"))?;
-    let data = data.ok_or_else(|| err("missing data chunk"))?;
-    if channels == 0 {
-        return Err(err("zero channels"));
+    if channels == 0 || samples.is_empty() {
+        return Err(err("decoded no audio samples".into()));
     }
-
-    // audio_format: 1 = PCM, 3 = IEEE float, 0xFFFE = extensible (treat by bits).
-    let samples: Vec<f32> = match (audio_format, bits) {
-        (1, 8) => data.iter().map(|&b| (b as f32 - 128.0) / 128.0).collect(),
-        (1, 16) => data
-            .chunks_exact(2)
-            .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0)
-            .collect(),
-        (1, 24) => data
-            .chunks_exact(3)
-            .map(|c| {
-                let v = (c[0] as i32) | ((c[1] as i32) << 8) | ((c[2] as i32) << 16);
-                let v = if v & 0x80_0000 != 0 { v | !0xFF_FFFF } else { v }; // sign-extend
-                v as f32 / 8_388_608.0
-            })
-            .collect(),
-        (1, 32) | (0xFFFE, 32) => data
-            .chunks_exact(4)
-            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f32 / 2_147_483_648.0)
-            .collect(),
-        (3, 32) => data
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect(),
-        (3, 64) => data
-            .chunks_exact(8)
-            .map(|c| f64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]) as f32)
-            .collect(),
-        (fmt, bits) => return Err(err(&format!("unsupported WAV encoding (format {fmt}, {bits}-bit)"))),
-    };
-
-    Ok(WavData { samples, channels, sample_rate })
+    Ok(DecodedAudio { samples, channels, sample_rate })
 }
 
 /// `torchaudio.functional.resample(wav, orig, new)` — the faithful windowed-sinc
@@ -558,9 +555,33 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_wav() {
-        let err = LFM2AudioChatMapper::load_audio_bytes(b"OggS....not a wav").unwrap_err();
-        assert!(format!("{err}").contains("RIFF/WAVE"));
+    fn rejects_undecodable_bytes() {
+        // Not WAV-specific any more: symphonia accepts every libsndfile-ish
+        // container, but truly undecodable bytes still error (no silent silence).
+        let err = LFM2AudioChatMapper::load_audio_bytes(b"this is not audio at all").unwrap_err();
+        let _ = format!("{err}"); // any error is fine; must not panic / succeed
+    }
+
+    /// Multi-format decode (the soundfile-equivalent [P1] fix): decode real AIFF +
+    /// ALAC/m4a files — formats the old WAV-only decoder rejected. Skips if the
+    /// fixtures aren't present (generate with: `afconvert -f AIFF question.wav
+    /// q.aiff` / `afconvert -f m4af -d alac question.wav q.m4a`).
+    #[test]
+    fn decodes_non_wav_containers() {
+        for env in ["LFM_TEST_AIFF", "LFM_TEST_M4A"] {
+            let Some(path) = std::env::var_os(env) else { continue };
+            let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{env} {path:?}: {e}"));
+            let (wav, sr) = LFM2AudioChatMapper::load_audio_bytes(&bytes)
+                .unwrap_or_else(|e| panic!("decode {env} failed: {e}"));
+            assert_eq!(wav.dims().len(), 2, "{env}: expected (1, L)");
+            assert_eq!(wav.dim(0).unwrap(), 1, "{env}: expected mono row");
+            assert!(wav.dim(1).unwrap() > 1000, "{env}: too few samples");
+            assert!(sr >= 8000, "{env}: implausible sample rate {sr}");
+            let v = wav.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            let peak = v.iter().fold(0f32, |m, &x| m.max(x.abs()));
+            assert!(peak.is_finite() && peak > 0.0, "{env}: silent/NaN decode");
+            eprintln!("{env}: decoded {} samples @ {sr} Hz, peak {peak:.3}", v.len());
+        }
     }
 
     #[test]
