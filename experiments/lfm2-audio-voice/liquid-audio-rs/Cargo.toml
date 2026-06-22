@@ -31,7 +31,9 @@ rand = "0.8"
 # HF snapshot download (huggingface_hub.snapshot_download equivalent) for
 # get_model_dir's repo-id branch. Sync (ureq) backend = faithful to the
 # synchronous Python call. Optional (feature `download`, on by default).
-hf-hub = { version = "0.3", optional = true }
+# 0.4 (vs 0.3.2) handles HF's current Xet storage redirects; 0.3.2 fails them
+# with "RelativeUrlWithoutBase". rustls TLS to avoid a system OpenSSL dep.
+hf-hub = { version = "0.4", optional = true, default-features = false, features = ["ureq", "rustls-tls"] }
 # Mimi neural audio codec for the v1 audio-out path (`processor.mimi`). Kyutai's
 # own `moshi` crate — the Rust port of the exact code the Python lib vendors as
 # `liquid_audio/moshi` — so it loads the moshi-format Mimi checkpoint

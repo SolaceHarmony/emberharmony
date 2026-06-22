@@ -109,21 +109,29 @@ fn write_wav_mono_f32(path: &Path, samples: &[f32], rate: u32) -> Res<()> {
 }
 
 fn main() -> Res<()> {
-    let model_dir = std::env::var("LFM_MODEL_DIR").unwrap_or_else(|_| "../model".into());
+    // Model source: a HF repo id is snapshot-downloaded to the HF cache (nothing
+    // lives in the source tree); a local path passes through. Override with
+    // LFM_MODEL (or LFM_MODEL_DIR) = repo id or path.
+    let model_ref = std::env::var("LFM_MODEL")
+        .or_else(|_| std::env::var("LFM_MODEL_DIR"))
+        .unwrap_or_else(|_| "LiquidAI/LFM2.5-Audio-1.5B".into());
     let audio_path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "../upstream-liquid-audio/assets/question.wav".into());
     let max_new_tokens: usize = std::env::var("LFM_MAX_TOKENS").ok().and_then(|s| s.parse().ok()).unwrap_or(96);
     let (device, dtype) = select_device()?;
 
+    eprintln!("[load] resolving model `{model_ref}` (repo id → HF cache download, or local path)…");
+    let dir = liquid_audio::get_model_dir(&model_ref, None)?;
+
     // `codebooks` is a config field (Python LFM2AudioConfig); ChatState needs it.
     let cfg: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(Path::new(&model_dir).join("config.json"))?)?;
+        serde_json::from_str(&std::fs::read_to_string(dir.join("config.json"))?)?;
     let codebooks = cfg["codebooks"].as_u64().ok_or("config.json: missing `codebooks`")? as usize;
 
-    eprintln!("[load] model + processor from {model_dir} ({dtype:?}, {device:?})…");
+    eprintln!("[load] model + processor from {} ({dtype:?}, {device:?})…", dir.display());
     let t0 = std::time::Instant::now();
-    let (model, proc) = from_pretrained(Path::new(&model_dir), dtype, &device)?;
+    let (model, proc) = from_pretrained(&dir, dtype, &device)?;
     eprintln!("[load] done in {:.1}s.", t0.elapsed().as_secs_f32());
 
     let (samples, rate) = read_wav_mono_f32(Path::new(&audio_path))?;

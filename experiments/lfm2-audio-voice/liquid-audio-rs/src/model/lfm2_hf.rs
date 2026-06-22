@@ -45,6 +45,14 @@ pub struct Lfm2Config {
     pub block_ffn_dim_multiplier: f32,
     #[serde(default = "d_mult_of")]
     pub block_multiple_of: usize,
+    /// `block_ff_dim` — the pre-SwiGLU FFN size (0 ⇒ fall back to `4*hidden`,
+    /// matching Python's `ff_dim is None` branch).
+    #[serde(default)]
+    pub block_ff_dim: usize,
+    /// `block_auto_adjust_ff_dim` — apply the SwiGLU `2/3` reduction + multiple-of
+    /// rounding (LFM2 default). When false, `block_ff_dim` is used as-is.
+    #[serde(default = "d_true")]
+    pub block_auto_adjust_ff_dim: bool,
 }
 
 fn d_kv_heads() -> usize { 8 }
@@ -54,15 +62,27 @@ fn d_maxpos() -> usize { 128_000 }
 fn d_lcache() -> usize { 3 }
 fn d_ffn_mult() -> f32 { 1.0 }
 fn d_mult_of() -> usize { 256 }
+fn d_true() -> bool { true }
 
 impl Lfm2Config {
     pub fn head_dim(&self) -> usize {
         self.hidden_size / self.num_attention_heads
     }
-    /// LFM2 FFN size: hidden*4*multiplier, rounded up to block_multiple_of.
+    /// LFM2 SwiGLU FFN size, faithful to the Python Lfm2 MLP / GLU:
+    /// start from `block_ff_dim` (or `4*hidden` if unset); with
+    /// `block_auto_adjust_ff_dim`, reduce by `2/3`, scale by the ffn multiplier,
+    /// then round **up** to `block_multiple_of`. The previous `hidden*4` form only
+    /// coincided when `block_ff_dim == 6*hidden` (the main backbone); it underrounds
+    /// the audio detokenizer (`block_ff_dim=3328` ⇒ 2304, not 2048).
     pub fn intermediate_size(&self) -> usize {
-        let base = (self.hidden_size as f32 * 4.0 * self.block_ffn_dim_multiplier) as usize;
-        base.div_ceil(self.block_multiple_of) * self.block_multiple_of
+        let ff = if self.block_ff_dim > 0 { self.block_ff_dim } else { 4 * self.hidden_size };
+        if self.block_auto_adjust_ff_dim {
+            let reduced = (2 * ff) / 3; // int(2*ff/3)
+            let scaled = (self.block_ffn_dim_multiplier * reduced as f32) as usize;
+            scaled.div_ceil(self.block_multiple_of) * self.block_multiple_of
+        } else {
+            ff
+        }
     }
 }
 

@@ -20,7 +20,6 @@
 
 use std::collections::VecDeque;
 use std::io::Write;
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -182,18 +181,24 @@ fn start_output() -> Res<(cpal::Stream, Arc<Mutex<VecDeque<f32>>>, u32)> {
 }
 
 fn main() -> Res<()> {
-    let model_dir = std::env::var("LFM_MODEL_DIR").unwrap_or_else(|_| "../model".into());
+    // Model source: a HF repo id is snapshot-downloaded to the HF cache (nothing
+    // in the source tree); a local path passes through. Override via LFM_MODEL.
+    let model_ref = std::env::var("LFM_MODEL")
+        .or_else(|_| std::env::var("LFM_MODEL_DIR"))
+        .unwrap_or_else(|_| "LiquidAI/LFM2.5-Audio-1.5B".into());
     let max_new_tokens: usize = std::env::var("LFM_MAX_TOKENS").ok().and_then(|s| s.parse().ok()).unwrap_or(512);
     let seed: u64 = std::env::var("LFM_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
     let (device, dtype) = select_device()?;
 
+    eprintln!("[load] resolving model `{model_ref}` (repo id → HF cache download, or local path)…");
+    let dir = liquid_audio::get_model_dir(&model_ref, None)?;
     let cfg: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(Path::new(&model_dir).join("config.json"))?)?;
+        serde_json::from_str(&std::fs::read_to_string(dir.join("config.json"))?)?;
     let codebooks = cfg["codebooks"].as_u64().ok_or("config.json: missing `codebooks`")? as usize;
 
-    eprintln!("[load] LFM2.5-Audio from {model_dir} ({dtype:?}, {device:?})…");
+    eprintln!("[load] LFM2.5-Audio from {} ({dtype:?}, {device:?})…", dir.display());
     let t0 = Instant::now();
-    let (model, proc) = from_pretrained(Path::new(&model_dir), dtype, &device)?;
+    let (model, proc) = from_pretrained(&dir, dtype, &device)?;
     let mimi = proc.audio_detokenizer().ok_or("no audio-out backend (Mimi) in this model dir")?;
     eprintln!("[load] done in {:.1}s.", t0.elapsed().as_secs_f32());
 
