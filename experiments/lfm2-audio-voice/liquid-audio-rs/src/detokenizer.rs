@@ -124,8 +124,13 @@ impl Istft {
 
         // irfft along the freq axis as the inverse-DFT basis matmul:
         // frames[b,t,:] = Re[b,:,t]·cw + Im[b,:,t]·sw. Contract freq via candle matmul.
-        let re_t = re.transpose(1, 2)?.contiguous()?.reshape((b * t, freq))?; // (B·T, freq)
-        let im_t = im.transpose(1, 2)?.contiguous()?.reshape((b * t, freq))?;
+        // Cast the spectrum to f32: the backbone runs at the model dtype (bf16 on
+        // Metal), but torch runs this irfft in f32 (`torch.polar` upcasts the bf16
+        // output) and the STFT is precision-sensitive — so f32 here is the faithful
+        // match and also the dtype of the basis `cw`/`sw`.
+        let f32 = candle_core::DType::F32;
+        let re_t = re.to_dtype(f32)?.transpose(1, 2)?.contiguous()?.reshape((b * t, freq))?; // (B·T, freq)
+        let im_t = im.to_dtype(f32)?.transpose(1, 2)?.contiguous()?.reshape((b * t, freq))?;
         let frames = (re_t.matmul(&self.cw)? + im_t.matmul(&self.sw)?)?; // (B·T, n_fft)
         let frames = frames.reshape((b, t, n))?.transpose(1, 2)?.contiguous()?; // (B, n_fft, T)
 
