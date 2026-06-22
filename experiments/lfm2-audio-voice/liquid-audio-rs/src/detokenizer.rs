@@ -56,6 +56,13 @@ impl Istft {
     }
 
     /// `re`/`im`: (1, n_fft/2+1, T) → waveform (1, L).
+    ///
+    /// The inverse FFT, overlap-add, and window-envelope normalization run in **f64**
+    /// (the same numeric-stability repair as the mel front-end STFT), rounding to f32
+    /// only at the output boundary. The ISTFT is a fixed post-network transform — no
+    /// learned layer adapts to its rounding — so f64 is strictly more faithful to the
+    /// spectrogram the model emitted than torch's f32 `irfft` (which on MPS is f32-only
+    /// and on CUDA runs f32/bf16, never promoted to f64).
     fn forward(&self, re: &Tensor, im: &Tensor) -> Result<Tensor> {
         let (_b, n, t) = re.dims3()?;
         let device = re.device().clone();
@@ -63,35 +70,36 @@ impl Istft {
         let im = im.i(0)?.to_vec2::<f32>()?;
         let n_fft = self.n_fft;
         let hop = self.hop;
-        let pad = (self.window.len() - hop) / 2;
-        let out_size = (t - 1) * hop + self.window.len();
-        let win_sq: Vec<f32> = self.window.iter().map(|w| w * w).collect();
+        let win: Vec<f64> = self.window.iter().map(|&w| w as f64).collect();
+        let pad = (win.len() - hop) / 2;
+        let out_size = (t - 1) * hop + win.len();
+        let win_sq: Vec<f64> = win.iter().map(|w| w * w).collect();
 
-        let mut planner = FftPlanner::<f32>::new();
+        let mut planner = FftPlanner::<f64>::new();
         let ifft = planner.plan_fft_inverse(n_fft);
 
-        let mut y = vec![0f32; out_size];
-        let mut env = vec![0f32; out_size];
-        let mut buf = vec![Complex { re: 0f32, im: 0f32 }; n_fft];
+        let mut y = vec![0f64; out_size];
+        let mut env = vec![0f64; out_size];
+        let mut buf = vec![Complex { re: 0f64, im: 0f64 }; n_fft];
         for ti in 0..t {
             for c in buf.iter_mut() {
                 *c = Complex { re: 0.0, im: 0.0 };
             }
             // one-sided → full hermitian spectrum; DC & Nyquist imag ignored (irfft)
-            buf[0] = Complex { re: re[0][ti], im: 0.0 };
+            buf[0] = Complex { re: re[0][ti] as f64, im: 0.0 };
             for k in 1..n {
-                buf[k] = Complex { re: re[k][ti], im: im[k][ti] };
+                buf[k] = Complex { re: re[k][ti] as f64, im: im[k][ti] as f64 };
             }
             if n_fft.is_multiple_of(2) {
-                buf[n_fft / 2] = Complex { re: re[n - 1][ti], im: 0.0 };
+                buf[n_fft / 2] = Complex { re: re[n - 1][ti] as f64, im: 0.0 };
             }
             for k in 1..(n_fft / 2) {
                 buf[n_fft - k] = buf[k].conj();
             }
             ifft.process(&mut buf);
-            let scale = 1.0 / n_fft as f32;
+            let scale = 1.0 / n_fft as f64;
             for j in 0..n_fft {
-                let v = buf[j].re * scale * self.window[j];
+                let v = buf[j].re * scale * win[j];
                 y[ti * hop + j] += v;
                 env[ti * hop + j] += win_sq[j];
             }
@@ -101,7 +109,7 @@ impl Istft {
         let hi = out_size - pad;
         let mut out = Vec::with_capacity(hi - lo);
         for i in lo..hi {
-            out.push(y[i] / env[i]);
+            out.push((y[i] / env[i]) as f32);
         }
         let len = out.len();
         Tensor::from_vec(out, (1, len), &device)
