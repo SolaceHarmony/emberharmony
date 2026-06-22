@@ -219,33 +219,12 @@ impl<'a> ChatState<'a> {
         self.add_audio_16k(&wave16)
     }
 
-    /// `torchaudio.functional.resample(wave, orig, 16_000)` — linear-interpolation
-    /// stand-in (no torch). Mirrors `data::mapper::resample`; kept private so the
-    /// processor port stays self-contained. `wave` is `(1, L)` → `(1, L')` f32 with
-    /// `L' = round(L * 16000 / orig)`.
+    /// `torchaudio.functional.resample(wave, orig, 16_000)` — the faithful
+    /// windowed-sinc resampler (default `sinc_interp_hann`, width 6, rolloff 0.99),
+    /// shared with `data::mapper`. `wave` is `(1, L)` → `(1, L')` f32 with
+    /// `L' = ceil(L * 16000 / orig)`. See [`crate::resample`] (1:1 torchaudio port).
     fn resample_16k(wave: &Tensor, orig: u32) -> Result<Tensor> {
-        const TARGET: u32 = 16_000;
-        if orig == TARGET {
-            return wave.contiguous();
-        }
-        let x = wave.flatten_all()?.to_dtype(candle_core::DType::F32)?.to_vec1::<f32>()?;
-        let n = x.len();
-        if n == 0 {
-            return Ok(wave.clone());
-        }
-        let ratio = TARGET as f64 / orig as f64;
-        let out_len = (((n as f64) * ratio).round() as usize).max(1);
-        let mut y = vec![0f32; out_len];
-        let step = orig as f64 / TARGET as f64; // input samples per output sample
-        for (i, slot) in y.iter_mut().enumerate() {
-            let src = i as f64 * step;
-            let i0 = src.floor() as usize;
-            let frac = (src - i0 as f64) as f32;
-            let a = x[i0.min(n - 1)];
-            let b = x[(i0 + 1).min(n - 1)];
-            *slot = a + (b - a) * frac;
-        }
-        Tensor::from_vec(y, (1, out_len), wave.device())
+        crate::resample::resample(wave, orig, 16_000)
     }
 
     pub fn new_turn(&mut self, role: &str) -> Result<()> {

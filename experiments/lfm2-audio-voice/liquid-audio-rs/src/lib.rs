@@ -17,6 +17,7 @@ pub mod detokenizer; // detokenizer.py
 pub mod loader; // config.json + safetensors → model + processor
 pub mod model;
 pub mod processor; // processor.py
+pub mod resample; // torchaudio.functional.resample (windowed-sinc) port
 pub mod trainer; // trainer.py
 pub mod utils;
 

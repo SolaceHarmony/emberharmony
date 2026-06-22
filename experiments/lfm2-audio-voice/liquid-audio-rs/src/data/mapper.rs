@@ -473,34 +473,12 @@ fn decode_wav(bytes: &[u8]) -> Result<WavData> {
     Ok(WavData { samples, channels, sample_rate })
 }
 
-/// `torchaudio.functional.resample(wav, orig, new)` — real-equivalent linear
-/// interpolation resampler. `torchaudio` uses a windowed-sinc kernel; for the
-/// data-mapper's purpose (feeding the mel front-end / codec) a linear resample is
-/// the faithful, dependency-free stand-in (no torch). `wav` is `(1, L)` f32 →
-/// `(1, L')` f32 with `L' = round(L * new / orig)`.
+/// `torchaudio.functional.resample(wav, orig, new)` — the faithful windowed-sinc
+/// resampler (default `sinc_interp_hann`, width 6, rolloff 0.99), shared with the
+/// processor. `wav` is `(1, L)` f32 → `(1, L')` f32, `L' = ceil(L * new / orig)`.
+/// See [`crate::resample`] for the kernel construction (a 1:1 port of torchaudio).
 fn resample(wav: &Tensor, orig: u32, new: u32) -> Result<Tensor> {
-    if orig == new {
-        return wav.contiguous();
-    }
-    let x = wav.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
-    let n = x.len();
-    if n == 0 {
-        return Ok(wav.clone());
-    }
-    let ratio = new as f64 / orig as f64;
-    let out_len = ((n as f64) * ratio).round() as usize;
-    let out_len = out_len.max(1);
-    let mut y = vec![0f32; out_len];
-    let step = orig as f64 / new as f64; // input samples per output sample
-    for (i, slot) in y.iter_mut().enumerate() {
-        let src = i as f64 * step;
-        let i0 = src.floor() as usize;
-        let frac = (src - i0 as f64) as f32;
-        let a = x[i0.min(n - 1)];
-        let b = x[(i0 + 1).min(n - 1)];
-        *slot = a + (b - a) * frac;
-    }
-    Tensor::from_vec(y, (1, out_len), wav.device())
+    crate::resample::resample(wav, orig, new)
 }
 
 #[cfg(test)]
