@@ -154,9 +154,14 @@ impl<'a> ChatState<'a> {
             proc,
             codebooks,
             text,
-            audio_in: Tensor::zeros((nfilt, 0), candle_core::DType::F32, dev)?,
-            audio_in_lens: Tensor::from_vec(Vec::<u32>::new(), (0,), dev)?,
-            audio_out: Tensor::from_vec(Vec::<u32>::new(), (codebooks, 0), dev)?,
+            // Empty placeholders as zero-length VIEWS of a 1-element buffer. candle
+            // can't allocate a zero-size buffer on Metal, so a bare `zeros((nfilt,0))`
+            // fails on GPU; a valid 1-col buffer narrowed to length 0 reports 0
+            // elements, is read only via `dim()` while empty, and is replaced (not
+            // cat'd) on the first add — so no zero-size buffer is ever created.
+            audio_in: Tensor::zeros((nfilt, 1), candle_core::DType::F32, dev)?.narrow(1, 0, 0)?,
+            audio_in_lens: Tensor::zeros((1,), candle_core::DType::U32, dev)?.narrow(0, 0, 0)?,
+            audio_out: Tensor::zeros((codebooks, 1), candle_core::DType::U32, dev)?.narrow(1, 0, 0)?,
             modality_flag,
         })
     }
@@ -179,9 +184,19 @@ impl<'a> ChatState<'a> {
         let emb_len = mel2emb_len(frames as i64) as usize;
         let new_mod = Tensor::from_vec(vec![LFMModality::AudioIn as u32; emb_len], (1, emb_len), &self.proc.device)?;
         let new_len = Tensor::from_vec(vec![frames as u32], (1,), &self.proc.device)?;
-        self.audio_in = Tensor::cat(&[&self.audio_in, &new_audio_in], 1)?;
+        // Replace the empty placeholder on the first add (avoids cat-ing a
+        // zero-length Metal view); otherwise append.
+        self.audio_in = if self.audio_in.dim(1)? == 0 {
+            new_audio_in
+        } else {
+            Tensor::cat(&[&self.audio_in, &new_audio_in], 1)?
+        };
         self.modality_flag = Tensor::cat(&[&self.modality_flag, &new_mod], 1)?;
-        self.audio_in_lens = Tensor::cat(&[&self.audio_in_lens, &new_len], 0)?;
+        self.audio_in_lens = if self.audio_in_lens.dim(0)? == 0 {
+            new_len
+        } else {
+            Tensor::cat(&[&self.audio_in_lens, &new_len], 0)?
+        };
         Ok(())
     }
 
@@ -262,7 +277,12 @@ impl<'a> ChatState<'a> {
             )));
         }
         self.text = Tensor::cat(&[&self.text, text], 1)?;
-        self.audio_out = Tensor::cat(&[&self.audio_out, audio_out], 1)?;
+        // Replace the empty placeholder on the first append (Metal: no zero-len cat).
+        self.audio_out = if self.audio_out.dim(1)? == 0 {
+            audio_out.clone()
+        } else {
+            Tensor::cat(&[&self.audio_out, audio_out], 1)?
+        };
         self.modality_flag = Tensor::cat(&[&self.modality_flag, &mf], 1)?;
         Ok(())
     }

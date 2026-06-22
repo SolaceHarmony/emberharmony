@@ -20,6 +20,25 @@ use liquid_audio::{from_pretrained, ChatState, GenParams, GenToken};
 
 type Res<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+/// `LFM_DEVICE=metal` → Apple GPU at bf16 (the deployed dtype; fast). Otherwise
+/// CPU at f32 (candle has no CPU bf16 matmul, and f32 loads the bf16 weights
+/// losslessly). Metal requires building with `--features metal`.
+fn select_device() -> Res<(Device, DType)> {
+    match std::env::var("LFM_DEVICE").ok().as_deref() {
+        Some("metal") => {
+            #[cfg(feature = "metal")]
+            {
+                Ok((Device::new_metal(0)?, DType::BF16))
+            }
+            #[cfg(not(feature = "metal"))]
+            {
+                Err("LFM_DEVICE=metal needs a build with `--features metal`".into())
+            }
+        }
+        _ => Ok((Device::Cpu, DType::F32)),
+    }
+}
+
 /// Minimal PCM16 WAV reader (mono-downmixed f32 in [-1, 1]); returns (samples, sample_rate).
 /// soundfile/symphonia would handle every container, but the assets are plain PCM16 WAV.
 fn read_wav_mono_f32(path: &Path) -> Res<(Vec<f32>, u32)> {
@@ -95,16 +114,17 @@ fn main() -> Res<()> {
         .nth(1)
         .unwrap_or_else(|| "../upstream-liquid-audio/assets/question.wav".into());
     let max_new_tokens: usize = std::env::var("LFM_MAX_TOKENS").ok().and_then(|s| s.parse().ok()).unwrap_or(96);
-    let device = Device::Cpu;
+    let (device, dtype) = select_device()?;
 
     // `codebooks` is a config field (Python LFM2AudioConfig); ChatState needs it.
     let cfg: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(Path::new(&model_dir).join("config.json"))?)?;
     let codebooks = cfg["codebooks"].as_u64().ok_or("config.json: missing `codebooks`")? as usize;
 
-    eprintln!("[load] model + processor from {model_dir} (f32, CPU)…");
-    let (model, proc) = from_pretrained(Path::new(&model_dir), DType::F32, &device)?;
-    eprintln!("[load] done.");
+    eprintln!("[load] model + processor from {model_dir} ({dtype:?}, {device:?})…");
+    let t0 = std::time::Instant::now();
+    let (model, proc) = from_pretrained(Path::new(&model_dir), dtype, &device)?;
+    eprintln!("[load] done in {:.1}s.", t0.elapsed().as_secs_f32());
 
     let (samples, rate) = read_wav_mono_f32(Path::new(&audio_path))?;
     eprintln!("[input] {} samples @ {rate} Hz ({:.2}s) from {audio_path}", samples.len(), samples.len() as f32 / rate as f32);
@@ -133,10 +153,14 @@ fn main() -> Res<()> {
     eprintln!("[gen] generate_interleaved (greedy, max {max_new_tokens} tokens)…");
     let mut text_ids: Vec<u32> = Vec::new();
     let mut audio_frames: Vec<Vec<u32>> = Vec::new();
+    let tg = std::time::Instant::now();
     model.generate_interleaved(&chat, &params, |tok| match tok {
         GenToken::Text(id) => text_ids.push(id),
         GenToken::Audio(frame) => audio_frames.push(frame),
     })?;
+    let n_tok = text_ids.len() + audio_frames.len();
+    let secs = tg.elapsed().as_secs_f32();
+    eprintln!("[gen] {n_tok} tokens in {secs:.1}s = {:.1} tok/s", n_tok as f32 / secs);
 
     // --- text reply ---
     let text = proc.text().decode(&text_ids, true)?;

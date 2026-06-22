@@ -2,10 +2,10 @@
 # NOTE: keep comments on their own lines — git treats a trailing "# ..."
 # as part of the pattern, not a comment.
 
-# downloaded GGUF weights
-models/
+# downloaded GGUF weights (anchored to this dir — must not match src/model/ etc.)
+/models/
 # local HF model dir (model.safetensors, tokenizer, config) — parity fixture
-model/
+/model/
 # built llama.cpp checkout (PR #18641)
 llama.cpp/
 # reference clone of Liquid4All/liquid-audio (port source)

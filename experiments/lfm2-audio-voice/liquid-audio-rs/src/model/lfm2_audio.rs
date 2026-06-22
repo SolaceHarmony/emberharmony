@@ -663,7 +663,11 @@ impl LFM2AudioModel {
         for &len in &lens {
             let seg = audio_in.narrow(1, frame_cursor, len as usize)?; // (128, frames)
             frame_cursor += len as usize;
-            let seg = seg.unsqueeze(0)?; // (1, 128, frames)
+            // Mel is built in f32 (the NeMo preprocessor runs in f32); cast to the
+            // model dtype before the conformer, matching Python's
+            // `self.conformer(padded_audio_in.mT.to(text_emb.dtype), …)`. No-op on
+            // the f32 CPU parity path; on bf16 (Metal) it avoids a conv dtype clash.
+            let seg = seg.unsqueeze(0)?.to_dtype(text_emb.dtype())?; // (1, 128, frames)
             let enc = self.conformer.forward(&seg)?; // (1, d, T')
             let enc = enc.i(0)?.transpose(0, 1)?.contiguous()?; // (T', d)
             let adapted = self.audio_adapter.forward(&enc)?; // (T', hidden)
