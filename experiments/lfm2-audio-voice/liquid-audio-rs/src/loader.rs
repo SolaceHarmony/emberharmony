@@ -19,7 +19,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use candle_core::{DType, Device, Result};
-use candle_nn::VarBuilder;
+use candle_nn::{VarBuilder, VarMap};
 use moshi::mimi;
 use serde_json::Value;
 
@@ -142,6 +142,112 @@ pub fn from_pretrained(dir: &Path, dtype: DType, device: &Device) -> Result<(LFM
     let proc = LFM2AudioProcessor::new(tokenizer, audio, audio_out, device.clone());
 
     Ok((model, proc))
+}
+
+/// Loss-weight hyperparameters read from `config.json`, needed by the training
+/// `forward` (Python `LFM2AudioModel.forward` reads them off `self.conf` and the
+/// `audio_loss_weights` buffer built in `__init__`). Mirrors the relevant fields
+/// of `LFM2AudioConfig` so the [`crate::trainer`] can compute the weighted loss
+/// without re-parsing the model. Not `Clone`/`Debug`: it owns a live `VarMap`
+/// (the trainable parameter set) and the model holding those `Var`s.
+pub struct TrainableLoad {
+    pub model: LFM2AudioModel,
+    /// The `VarMap` backing every trainable parameter (candle's analog of
+    /// `model.parameters()` — the optimizer steps these `Var`s in place).
+    pub varmap: VarMap,
+    pub processor: LFM2AudioProcessor,
+    /// `codebooks`, `codebook_weight`, `semantic_codebook_factor`,
+    /// `text_loss_multiplier`, `audio_loss_multiplier` — the loss config.
+    pub codebooks: usize,
+    pub codebook_weight: String,
+    pub semantic_codebook_factor: f64,
+    pub text_loss_multiplier: f64,
+    pub audio_loss_multiplier: f64,
+}
+
+/// Trainable analog of [`from_pretrained`]: build the model from a `VarMap`-backed
+/// `VarBuilder` so every weight is a trainable [`candle_core::Var`] (the candle
+/// equivalent of `nn.Module.parameters()` participating in autograd), then load
+/// the checkpoint values into those `Var`s. Mirrors the Python `Trainer.__init__`
+/// step `LFM2AudioModel.from_pretrained(model_id, dtype=torch.bfloat16)` followed
+/// by `accelerator.prepare(model, ...)` — except the params are real `Var`s the
+/// candle optimizer can update, not frozen mmaped tensors.
+///
+/// `dtype` mirrors the Python `torch.bfloat16`; pass `DType::F32` on CPU (candle
+/// has no CPU bf16 matmul) — the bf16-stored weights upcast faithfully.
+pub fn from_pretrained_trainable(dir: &Path, dtype: DType, device: &Device) -> Result<TrainableLoad> {
+    if dtype == DType::BF16 && device.is_cpu() {
+        return Err(err(
+            "bf16 on CPU is unsupported (candle has no CPU bf16 matmul); use DType::F32",
+        ));
+    }
+    let config: Value = serde_json::from_str(&fs::read_to_string(dir.join("config.json")).map_err(err)?).map_err(err)?;
+
+    let lfm_cfg: Lfm2Config = serde_json::from_value(config["lfm"].clone()).map_err(err)?;
+    let enc_cfg = parse_encoder(&config["encoder"])?;
+    let depth = &config["depthformer"];
+    let depth_cfg = DepthformerConfig {
+        layers: req_usize(depth, "layers")?,
+        dim: req_usize(depth, "dim")?,
+        tie: depth
+            .get("tie")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| err("config: missing/invalid required field `depthformer.tie`"))?,
+    };
+    let codebooks = req_usize(&config, "codebooks")?;
+    let n_text = req_usize(&config, "interleaved_n_text")?;
+    let n_audio = req_usize(&config, "interleaved_n_audio")?;
+
+    // Build over a fresh VarMap so `LFM2AudioModel::new` allocates trainable Vars,
+    // then load the checkpoint into them (faithful: the architecture defines the
+    // param set, the safetensors provide the pretrained init).
+    let varmap = VarMap::new();
+    let vb = VarBuilder::from_varmap(&varmap, dtype, device);
+    let model = LFM2AudioModel::new(lfm_cfg, &enc_cfg, &depth_cfg, codebooks, n_text, n_audio, vb)?;
+    // Load the checkpoint into the freshly-allocated Vars. `VarMap::load` is *not*
+    // usable here: it opens a single file and demands every Var be present in it,
+    // so it breaks on a sharded checkpoint *and* on the extra non-model safetensors
+    // in the dir (the Mimi tokenizer `tokenizer-…checkpoint125.safetensors`). Mirror
+    // `VarBuilder::from_mmaped_safetensors` instead — one lazy index over every
+    // shard, pulling each param by name. Strict: a param missing from *every* shard
+    // is a hard error (never a silent zero-init); extra tensors in the dir that no
+    // Var names are simply never requested.
+    let shards = unsafe { candle_core::safetensors::MmapedSafetensors::multi(&safetensors_in(dir)?)? };
+    {
+        let mut ws = varmap.data().lock().unwrap();
+        for (name, var) in ws.iter_mut() {
+            let tensor = shards
+                .load(name, var.device())
+                .map_err(|e| err(format!("checkpoint: param `{name}` not found in any shard: {e}")))?;
+            var.set(&tensor)?;
+        }
+    }
+
+    let prep: PreprocessorConfig = serde_json::from_value(config["preprocessor"].clone()).map_err(err)?;
+    let audio = FilterbankFeatures::new(prep.mel_config(), device)?;
+    let tokenizer = LFM2AudioProcessor::load_tokenizer(dir)?;
+    let audio_out: Option<Box<dyn AudioDetokenizer>> = if dir.join("audio_detokenizer").is_dir() {
+        Some(Box::new(load_detokenizer(dir, dtype, device)?))
+    } else {
+        load_mimi(dir, codebooks, device)?.map(|m| Box::new(MimiDetokenizer::new(m)) as Box<dyn AudioDetokenizer>)
+    };
+    let processor = LFM2AudioProcessor::new(tokenizer, audio, audio_out, device.clone());
+
+    let codebook_weight = config["codebook_weight"].as_str().unwrap_or("linear").to_string();
+    let semantic_codebook_factor = config["semantic_codebook_factor"].as_f64().unwrap_or(1.0);
+    let text_loss_multiplier = config["text_loss_multiplier"].as_f64().unwrap_or(1.0);
+    let audio_loss_multiplier = config["audio_loss_multiplier"].as_f64().unwrap_or(1.0);
+
+    Ok(TrainableLoad {
+        model,
+        varmap,
+        processor,
+        codebooks,
+        codebook_weight,
+        semantic_codebook_factor,
+        text_loss_multiplier,
+        audio_loss_multiplier,
+    })
 }
 
 /// Load the Kyutai Mimi codec (v1 `processor.mimi` audio-out) from

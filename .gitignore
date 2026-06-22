@@ -34,3 +34,4 @@ emberharmony-dev
 logs/
 *.bun-build
 *.tsbuildinfo
+/tools/

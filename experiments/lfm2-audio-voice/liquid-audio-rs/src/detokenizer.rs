@@ -82,7 +82,7 @@ impl Istft {
             for k in 1..n {
                 buf[k] = Complex { re: re[k][ti], im: im[k][ti] };
             }
-            if n_fft % 2 == 0 {
+            if n_fft.is_multiple_of(2) {
                 buf[n_fft / 2] = Complex { re: re[n - 1][ti], im: 0.0 };
             }
             for k in 1..(n_fft / 2) {

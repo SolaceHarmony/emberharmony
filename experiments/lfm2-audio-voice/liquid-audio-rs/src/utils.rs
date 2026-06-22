@@ -72,7 +72,7 @@ pub fn get_model_dir(repo_or_path: &str, revision: Option<&str>) -> std::io::Res
 #[cfg(feature = "download")]
 fn download_snapshot(repo_id: &str, revision: Option<&str>) -> std::io::Result<std::path::PathBuf> {
     use hf_hub::{api::sync::Api, Repo, RepoType};
-    let to_io = |e: hf_hub::api::sync::ApiError| std::io::Error::new(std::io::ErrorKind::Other, format!("hf-hub: {e}"));
+    let to_io = |e: hf_hub::api::sync::ApiError| std::io::Error::other(format!("hf-hub: {e}"));
 
     let api = Api::new().map_err(to_io)?;
     let repo = match revision {

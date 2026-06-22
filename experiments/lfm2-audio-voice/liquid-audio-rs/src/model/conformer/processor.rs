@@ -115,6 +115,13 @@ impl FilterbankFeatures {
         self.cfg.nfilt
     }
 
+    /// The mel config (hop/window/fft sizes) backing this featurizer. Lets
+    /// callers (e.g. the data mapper) recover the hop length to compute the valid
+    /// frame count `floor(L/hop)` — the Python `mel_len`.
+    pub fn mel_config(&self) -> MelConfig {
+        self.cfg.clone()
+    }
+
     /// Window padded (centered) to n_fft, as torch.stft does for win_length < n_fft.
     fn padded_window(&self) -> Vec<f32> {
         let n = self.cfg.n_fft;

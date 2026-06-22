@@ -127,7 +127,7 @@ pub struct MultiHeadAttention {
 
 impl MultiHeadAttention {
     pub fn new(n_head: usize, n_feat: usize, use_bias: bool, vb: VarBuilder) -> Result<Self> {
-        assert!(n_feat % n_head == 0);
+        assert!(n_feat.is_multiple_of(n_head));
         let d_k = n_feat / n_head;
         let mk = |name: &str, vb: VarBuilder| -> Result<Linear> {
             if use_bias {

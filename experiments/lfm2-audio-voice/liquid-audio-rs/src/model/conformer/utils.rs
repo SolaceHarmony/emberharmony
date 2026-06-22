@@ -64,7 +64,7 @@ pub fn compute_stochastic_depth_drop_probs(
                 // start at 1/L * drop_prob, end at the desired drop probability.
                 layer_drop_probs.extend((1..=big_l).map(|l| l as f64 / big_l as f64 * stochastic_depth_drop_prob));
             }
-            "uniform" => layer_drop_probs.extend(std::iter::repeat(stochastic_depth_drop_prob).take(big_l)),
+            "uniform" => layer_drop_probs.extend(std::iter::repeat_n(stochastic_depth_drop_prob, big_l)),
             other => panic!(
                 "stochastic_depth_mode has to be one of [\"linear\", \"uniform\"]. Current value: {other}"
             ),

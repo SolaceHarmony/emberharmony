@@ -104,7 +104,7 @@ impl Glu {
         if use_swiglu {
             ff = 2 * ff / 3;
             ff = (ffn_dim_multiplier * ff as f64) as usize;
-            ff = multiple_of * ((ff + multiple_of - 1) / multiple_of);
+            ff = multiple_of * ff.div_ceil(multiple_of);
         }
         let w1 = linear_no_bias(dim, ff, vb.pp("w1"))?;
         let w3 = if use_swiglu {

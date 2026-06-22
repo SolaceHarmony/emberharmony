@@ -241,6 +241,22 @@ impl LFM2AudioProcessor {
         self.audio_out.as_deref()
     }
 
+    /// `mimi.sample_rate` — the audio-out codec's expected input sample rate.
+    /// Used by the data mapper (`_encode_audio_out`) to decide whether to
+    /// resample before encoding.
+    pub fn mimi_sample_rate(&self) -> Option<u32> {
+        self.audio_out.as_deref().map(|d| d.sample_rate())
+    }
+
+    /// `mimi.encode(wav)` — encode a `(B, 1, L)` waveform to codes via the
+    /// audio-out backend (errors if the backend is decode-only).
+    pub fn mimi_encode(&self, wav: &Tensor) -> Result<Tensor> {
+        self.audio_out
+            .as_ref()
+            .ok_or_else(|| candle_core::Error::Msg("no audio-out backend loaded".into()))?
+            .encode(wav)
+    }
+
     /// PORT: `to(device, dtype)` — torch in-place device/dtype move. candle places
     /// tensors at load (`from_pretrained(device, dtype)`); there is no in-place
     /// move. No-op, preserved for 1:1 inventory.

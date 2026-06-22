@@ -10,7 +10,7 @@
 //! - `forward_embeds` accepts `inputs_embeds` and an optional **custom additive
 //!   attention mask** (the detokenizer's sliding window); the main path passes
 //!   `None` and gets a causal mask.
-//! tracing spans and the flash-attn path are dropped (always the manual path).
+//! - tracing spans and the flash-attn path are dropped (always the manual path).
 
 use candle_core::{DType, Device, IndexOp, Result, Tensor};
 use candle_nn::{embedding, linear_no_bias, rms_norm, Conv1d, Conv1dConfig, Embedding, Linear, Module, RmsNorm, VarBuilder};

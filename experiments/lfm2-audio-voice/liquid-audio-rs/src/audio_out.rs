@@ -27,6 +27,20 @@ pub trait AudioDetokenizer {
     fn sample_rate(&self) -> u32 {
         24_000
     }
+
+    /// Encode a `(B, 1, L)` waveform at [`sample_rate`](Self::sample_rate) →
+    /// integer codes `(B, codebooks, T)`. Mirrors `processor.mimi.encode` used by
+    /// the data mapper (`LFM2AudioChatMapper._encode_audio_out`).
+    ///
+    /// Only the codec backend (Mimi) is an *encoder*; the LFM2 detokenizer is a
+    /// vocoder (decode-only), so the default rejects the call rather than
+    /// pretending — faithful to the Python where only `MimiModel` exposes
+    /// `encode`.
+    fn encode(&self, _wav: &Tensor) -> Result<Tensor> {
+        Err(candle_core::Error::Msg(
+            "this audio-out backend is decode-only (no encoder); audio-out codes require the Mimi codec".into(),
+        ))
+    }
 }
 
 /// The in-tree LFM2-based detokenizer behind the shared trait. Its `forward`
@@ -58,5 +72,14 @@ impl AudioDetokenizer for MimiDetokenizer {
         let mut m = self.inner.borrow_mut();
         m.reset_state();
         m.decode(&codes)
+    }
+
+    /// `mimi.encode(wav)` — `(B, 1, L)` 24 kHz waveform → codes `(B, codebooks, T)`.
+    /// `reset_state` first ⇒ independent (non-streaming) encode, matching the
+    /// Python `mimi.encode` call on a fresh clip in the data mapper.
+    fn encode(&self, wav: &Tensor) -> Result<Tensor> {
+        let mut m = self.inner.borrow_mut();
+        m.reset_state();
+        m.encode(wav)
     }
 }

@@ -50,7 +50,7 @@ pub struct ConformerConvolution {
 
 impl ConformerConvolution {
     pub fn new(d_model: usize, kernel_size: usize, use_bias: bool, vb: VarBuilder) -> Result<Self> {
-        assert!((kernel_size - 1) % 2 == 0);
+        assert!((kernel_size - 1).is_multiple_of(2));
         let context = (kernel_size - 1) / 2;
         let pw = Conv1dConfig { padding: 0, stride: 1, dilation: 1, groups: 1, ..Default::default() };
         let dw = Conv1dConfig { padding: context, stride: 1, dilation: 1, groups: d_model, ..Default::default() };
