@@ -62,5 +62,4 @@ done
 echo
 echo "Done. Quick check:"
 echo "  export LFM_BIN=\"$CLI_BIN\""
-echo "  python lfm_runtime.py        # confirms binary + models resolve"
-echo "  python voice_loop.py         # start talking"
+echo "  cargo run --release --bin lfm-voice   # start talking"

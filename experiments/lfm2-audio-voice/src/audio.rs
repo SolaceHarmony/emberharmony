@@ -94,6 +94,19 @@ pub fn record_utterance(out_wav: &Path) -> Result<bool> {
             err_fn,
             None,
         )?,
+        cpal::SampleFormat::U16 => device.build_input_stream(
+            &config,
+            move |data: &[u16], _: &_| {
+                // cpal U16 is unsigned with silence at 32768; center then normalize.
+                let mono: Vec<f32> = data
+                    .chunks(dev_ch)
+                    .map(|c| c.iter().map(|&s| (s as f32 - 32768.0) / 32768.0).sum::<f32>() / dev_ch as f32)
+                    .collect();
+                push(mono);
+            },
+            err_fn,
+            None,
+        )?,
         other => return Err(anyhow!("unsupported input sample format: {other:?}")),
     };
 
@@ -193,6 +206,29 @@ pub fn play_wav(path: &Path) -> Result<()> {
                         let s = q.pop_front().unwrap_or(0.0);
                         for o in frame.iter_mut() {
                             *o = (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+                        }
+                    }
+                    if q.is_empty() {
+                        d.store(true, Ordering::Relaxed);
+                    }
+                },
+                err_fn,
+                None,
+            )?
+        }
+        cpal::SampleFormat::U16 => {
+            let q = queue.clone();
+            let d = done.clone();
+            device.build_output_stream(
+                &config,
+                move |out: &mut [u16], _: &_| {
+                    let mut q = q.lock().unwrap();
+                    for frame in out.chunks_mut(out_ch) {
+                        let s = q.pop_front().unwrap_or(0.0);
+                        // f32 [-1,1] → U16 centered at 32768 (silence == 0.0 → 32768).
+                        let v = ((s.clamp(-1.0, 1.0) * i16::MAX as f32) as i32 + 32768).clamp(0, u16::MAX as i32) as u16;
+                        for o in frame.iter_mut() {
+                            *o = v;
                         }
                     }
                     if q.is_empty() {

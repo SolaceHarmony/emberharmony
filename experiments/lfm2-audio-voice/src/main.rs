@@ -27,7 +27,10 @@ DELEGATE: <a clear, self-contained description of the task>. Only emit DELEGATE 
 fn extract_delegation(text: &str) -> Option<String> {
     for line in text.lines() {
         let t = line.trim_start();
-        if t.len() >= 9 && t[..9].eq_ignore_ascii_case("DELEGATE:") {
+        // Char-safe: `get(..9)` is `None` when byte 9 isn't a char boundary (e.g.
+        // a line starting with emoji or accented text), so we never slice across a
+        // codepoint. When it's `Some`, byte 9 *is* a boundary, so `t[9..]` is safe.
+        if t.get(..9).is_some_and(|p| p.eq_ignore_ascii_case("DELEGATE:")) {
             let task = t[9..].trim().to_string();
             if !task.is_empty() {
                 return Some(task);
