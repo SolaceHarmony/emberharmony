@@ -1,16 +1,23 @@
 //! Port of `liquid_audio/model/conformer/processor.py` — NeMo mel featurizer
 //! (`AudioToMelSpectrogramPreprocessor` / `FilterbankFeatures`), inference path.
 //!
-//! The `window` (Hann) and mel filterbank `fb` are **computed at construction**
-//! (`torch.hann_window(periodic=False)` + `librosa.filters.mel(norm="slaney")`),
-//! exactly as the Python preprocessor does in its `__init__` — they are NOT
-//! checkpoint tensors. (Parity-verified to 1e-5 against the upstream featurizer.)
-//! Pipeline: preemphasis → centered STFT (`rustfft`) → magnitude^`mag_power` →
-//! mel → log → per-feature normalization → pad to a multiple of `pad_to`.
+//! The `window` (Hann), mel filterbank `fb`, and the STFT DFT-basis kernel are
+//! **computed at construction** (`torch.hann_window(periodic=False)` +
+//! `librosa.filters.mel(norm="slaney")`), exactly as the Python preprocessor does in
+//! its `__init__` — they are NOT checkpoint tensors. (Parity-verified against the
+//! upstream featurizer.)
+//!
+//! Pipeline: preemphasis → centered STFT → magnitude^`mag_power` → mel → log →
+//! per-feature normalization → pad to a multiple of `pad_to`. **The whole chain runs
+//! in candle tensor ops on the model device** (CPU or Metal) in f32 — a direct port
+//! of `torch.stft` (`aten/.../SpectralOps.cpp`: center-pad → frame → ×window →
+//! `_fft_r2c` → transpose) rather than an external FFT library, so it matches torch's
+//! single-precision reference *and* runs on the GPU. The windowed real→complex DFT is
+//! realized as a `Conv1d` against a precomputed DFT basis (stride = hop), the same
+//! formulation torchaudio uses for its GPU spectrogram.
 //! Training-only bits (dither, nb-augmentation, frame splicing) are skipped.
 
 use candle_core::{Device, DType, Result, Tensor};
-use rustfft::{num_complex::Complex, FftPlanner};
 
 /// Subset of NeMo's preprocessor config needed offline.
 #[derive(Debug, Clone)]
@@ -92,22 +99,60 @@ fn mel_filterbank(sr: usize, n_fft: usize, n_mels: usize) -> Vec<f32> {
 
 const CONSTANT: f64 = 1e-5;
 
+/// Window centered/padded to `n_fft`, as `torch.stft` does for `win_length < n_fft`.
+fn pad_window_to(window: &[f32], n_fft: usize) -> Vec<f32> {
+    if window.len() == n_fft {
+        return window.to_vec();
+    }
+    let left = (n_fft - window.len()) / 2;
+    let mut out = vec![0f32; n_fft];
+    out[left..left + window.len()].copy_from_slice(window);
+    out
+}
+
+/// DFT-basis `Conv1d` kernel `(2·freq, 1, n_fft)` realizing torch's onesided
+/// `_fft_r2c` as a strided cross-correlation. Channel `k < freq` carries the real
+/// filter `window[n]·cos(2πkn/N)`; channel `freq+k` the imag filter
+/// `−window[n]·sin(2πkn/N)`, so convolving the windowed frame gives `Re`/`Im` of bin
+/// `k`. Twiddles are computed in f64 and stored f32 (accurate basis, single-precision
+/// storage — matching torch's f32 FFT), with the window folded in.
+fn dft_conv_kernel(n_fft: usize, padded_window: &[f32], device: &Device) -> Result<Tensor> {
+    let freq = n_fft / 2 + 1;
+    let two_pi = 2.0 * std::f64::consts::PI;
+    let mut k = vec![0f32; 2 * freq * n_fft];
+    for kk in 0..freq {
+        for nn in 0..n_fft {
+            let ang = two_pi * kk as f64 * nn as f64 / n_fft as f64;
+            let w = padded_window[nn] as f64;
+            k[kk * n_fft + nn] = (w * ang.cos()) as f32;
+            k[(freq + kk) * n_fft + nn] = (-(w * ang.sin())) as f32;
+        }
+    }
+    Tensor::from_vec(k, (2 * freq, 1, n_fft), device)
+}
+
 pub struct FilterbankFeatures {
     cfg: MelConfig,
     window: Vec<f32>, // loaded (win_length,), padded to n_fft at use
     fb: Tensor,       // (nfilt, n_fft/2+1)
+    /// DFT-basis Conv1d kernel `(2·freq, 1, n_fft)` realizing torch's `_fft_r2c`:
+    /// channels `[0, freq)` are the real filters `window[n]·cos(2πkn/N)`, channels
+    /// `[freq, 2·freq)` the imag filters `−window[n]·sin(2πkn/N)`.
+    stft_kernel: Tensor,
     device: Device,
 }
 
 impl FilterbankFeatures {
-    /// Computes the Hann window and slaney mel filterbank (as the Python
-    /// preprocessor does at init — they are not checkpoint tensors).
+    /// Computes the Hann window, slaney mel filterbank, and the STFT DFT-basis kernel
+    /// (as the Python preprocessor does at init — they are not checkpoint tensors).
     pub fn new(cfg: MelConfig, device: &Device) -> Result<Self> {
         let window = hann(cfg.n_window_size);
         let freq = cfg.n_fft / 2 + 1;
         let fb_data = mel_filterbank(cfg.sample_rate, cfg.n_fft, cfg.nfilt);
         let fb = Tensor::from_vec(fb_data, (cfg.nfilt, freq), device)?;
-        Ok(Self { cfg, window, fb, device: device.clone() })
+        let padded_win = pad_window_to(&window, cfg.n_fft);
+        let stft_kernel = dft_conv_kernel(cfg.n_fft, &padded_win, device)?;
+        Ok(Self { cfg, window, fb, stft_kernel, device: device.clone() })
     }
 
     /// Number of mel bins (encoder `feat_in`).
@@ -151,68 +196,33 @@ impl FilterbankFeatures {
         }
     }
 
-    /// Window padded (centered) to n_fft, as torch.stft does for win_length < n_fft.
-    fn padded_window(&self) -> Vec<f32> {
-        let n = self.cfg.n_fft;
-        let w = &self.window;
-        if w.len() == n {
-            return w.clone();
-        }
-        let left = (n - w.len()) / 2;
-        let mut out = vec![0f32; n];
-        out[left..left + w.len()].copy_from_slice(w);
-        out
-    }
-
-    /// PORT: `FilterbankFeatures.stft` (py L385-395).
+    /// PORT: `FilterbankFeatures.stft` (py L385-395) → `torch.stft`
+    /// (`aten/src/ATen/native/SpectralOps.cpp::stft`), computed **natively in candle**
+    /// so it runs on the model device (CPU or Metal) — no external FFT library.
     ///
-    /// Centered short-time Fourier transform. Python calls `torch.stft(x, n_fft,
-    /// hop_length, win_length, center=True, window=..., return_complex=True,
-    /// pad_mode="constant")` and returns the complex spectrogram of shape
-    /// `[freq, T]` (per clip). This port replays the same operation with
-    /// `rustfft`: the (already preemphasised) signal `y` is centre-padded with
-    /// `n_fft/2` zeros each side (`pad_mode="constant"`, matching `center=True`),
-    /// each `n_fft`-sample frame at stride `hop_length` is windowed and FFT'd, and
-    /// only the first `freq = n_fft/2 + 1` (non-redundant) bins are kept. Returns
-    /// the complex bins freq-major: `out[f * t + ti]`, with `t = 1 + L/hop` frames
-    /// (the `center=True` frame count). Byte-identical to the previously inlined
-    /// FFT loop — only the FFT planning + per-frame transform moved here.
-    fn stft(&self, y: &[f32]) -> Vec<Complex<f64>> {
-        let l = y.len();
+    /// torch.stft is: center-pad (`pad_mode="constant"`) → frame (`as_strided`, stride
+    /// `hop`) → `×window` → `_fft_r2c` (onesided) → transpose. The windowed
+    /// real→complex DFT is realized here as a `Conv1d` against the precomputed
+    /// [`Self::stft_kernel`] DFT basis at stride `hop` — cross-correlation, no kernel
+    /// flip, so `out[k][t] = Σ_n sig[t·hop+n]·window[n]·cos/sin(2πkn/N)` is exactly
+    /// `Re`/`Im` of the bin. `_fft_r2c` keeps the input precision (f32 → complex64 via
+    /// `DFTI_SINGLE`/cuFFT-R2C), so this single-precision path matches torch's
+    /// reference and, unlike rustfft, runs on the GPU.
+    ///
+    /// `y`: `(1, L)` real signal on the device → `(re, im)` each `(1, freq, T)`,
+    /// `T = 1 + L/hop` (the `center=True` frame count).
+    fn stft(&self, y: &Tensor) -> Result<(Tensor, Tensor)> {
         let n_fft = self.cfg.n_fft;
         let hop = self.cfg.n_window_stride;
         let freq = n_fft / 2 + 1;
-        // `t = 1 + L/hop` is torch.stft(center=True)'s emitted frame count.
-        let t = 1 + l / hop;
-
-        // center pad with n_fft/2 zeros each side (pad_mode="constant")
-        let pad = n_fft / 2;
-        let mut padded = vec![0f32; l + 2 * pad];
-        padded[pad..pad + l].copy_from_slice(y);
-
-        // The mel front-end is precision-sensitive (the Python `AudioPreprocessor`
-        // warns it is "not robust to low precision" — even bf16 costs WER). Torch
-        // runs it in f32; we run the FFT + downstream reductions in **f64** so our
-        // result tracks the mathematically-exact mel, leaving only torch's own f32
-        // rounding as the gap (the FFT and the log/normalize amplify f32 error).
-        let window = self.padded_window();
-        let mut planner = FftPlanner::<f64>::new();
-        let fft = planner.plan_fft_forward(n_fft);
-
-        let mut out = vec![Complex { re: 0f64, im: 0f64 }; freq * t];
-        let mut buf = vec![Complex { re: 0f64, im: 0f64 }; n_fft];
-        for ti in 0..t {
-            let start = ti * hop;
-            for j in 0..n_fft {
-                buf[j].re = padded[start + j] as f64 * window[j] as f64;
-                buf[j].im = 0.0;
-            }
-            fft.process(&mut buf);
-            for f in 0..freq {
-                out[f * t + ti] = buf[f];
-            }
-        }
-        out
+        let l = y.dim(1)?;
+        // center=True, pad_mode="constant": n_fft/2 zeros each side of the signal.
+        let xin = y.reshape((1, 1, l))?.pad_with_zeros(2, n_fft / 2, n_fft / 2)?;
+        // _fft_r2c as a strided DFT-basis convolution → (1, 2·freq, T).
+        let out = xin.conv1d(&self.stft_kernel, 0, hop, 1, 1)?;
+        let re = out.narrow(1, 0, freq)?; // (1, freq, T)
+        let im = out.narrow(1, freq, freq)?; // (1, freq, T)
+        Ok((re, im))
     }
 
     /// PORT: `FilterbankFeatures.log_zero_guard_value_fn` (py L397-410).
@@ -231,71 +241,57 @@ impl FilterbankFeatures {
 
     /// `samples` is mono PCM in [-1,1] as `(L,)` or `(1, L)`. Returns `(1, nfilt, T)`.
     ///
-    /// The STFT/mel runs on the **CPU** (`rustfft`) **by design**, not as an
-    /// unported shortcut. This is a real-time/streaming front-end: it is fed short
-    /// (~80 ms) frames one at a time, so per-frame host↔device transfer plus
-    /// kernel-launch latency would dominate the (tiny) FFT cost — CPU wins
-    /// wall-clock here. The throughput-bound work that *does* belong on the GPU —
-    /// the conformer / LFM2 / depthformer matmuls — runs on the selected device
-    /// (Metal); only this small DSP front-end stays on the CPU. The result Tensor
-    /// is created on `self.device`, so the hand-off to the conformer is a single
-    /// upload, not a per-op round-trip.
+    /// The whole featurizer — preemphasis, the `torch.stft` port, magnitude, mel,
+    /// log, and per-feature normalization — runs in candle tensor ops **on the model
+    /// device** (CPU or Metal) in f32, matching torch's reference (the Python wraps
+    /// the STFT in `autocast(enabled=False)`, i.e. deliberate f32). There is no
+    /// external FFT library and no host round-trip: the STFT is a `Conv1d` against the
+    /// DFT basis (see [`Self::stft`]), so on Metal the front-end is GPU-resident like
+    /// the rest of the model.
     pub fn forward(&self, samples: &Tensor) -> Result<Tensor> {
-        let x = samples.flatten_all()?.to_dtype(candle_core::DType::F32)?.to_vec1::<f32>()?;
-        let l = x.len();
-        let n_fft = self.cfg.n_fft;
-        let freq = n_fft / 2 + 1;
+        let dev = &self.device;
+        let hop = self.cfg.n_window_stride;
+        // signal → (L,) f32 on the model device.
+        let x = samples.flatten_all()?.to_dtype(DType::F32)?.to_device(dev)?;
+        let l = x.dim(0)?;
         // NeMo `get_seq_len`: floor(L/hop) valid frames. torch.stft(center=True)
-        // emits `1 + L/hop` frames, so the trailing frame is a pad column (masked
-        // below). seq_len is now produced by the `get_seq_len` method.
+        // emits `1 + L/hop` frames, so the trailing frame is a pad column (masked below).
         let seq_len = self.get_seq_len(l);
-        let t = 1 + l / self.cfg.n_window_stride;
+        let t = 1 + l / hop;
 
-        // preemphasis: y[0]=x[0]; y[i]=x[i]-preemph*x[i-1]
-        let pre = self.cfg.preemph as f32;
-        let mut y = vec![0f32; l];
-        if l > 0 {
-            y[0] = x[0];
-            for i in 1..l {
-                y[i] = x[i] - pre * x[i - 1];
-            }
-        }
+        // preemphasis: y[0]=x[0]; y[i]=x[i]-preemph·x[i-1], in candle on the device.
+        let x2 = x.reshape((1, l))?;
+        let y = if self.cfg.preemph != 0.0 && l > 1 {
+            let pre = self.cfg.preemph;
+            let head = x2.narrow(1, 0, 1)?; // x[0]
+            // x[1:] - preemph·x[:-1]  (scalar via affine; candle has f64·Tensor, not Tensor·f64)
+            let tail = (x2.narrow(1, 1, l - 1)? - x2.narrow(1, 0, l - 1)?.affine(pre, 0.0)?)?;
+            Tensor::cat(&[&head, &tail], 1)? // (1, L)
+        } else {
+            x2
+        };
 
-        // disable autocast to get full range of stft values: x = self.stft(x).
-        // Returns the complex spectrogram freq-major (`spec[f * t + ti]`).
-        let spec = self.stft(&y);
+        // torch.stft (candle-native, on device) → (re, im) each (1, freq, T).
+        let (re, im) = self.stft(&y)?;
+        // magnitude^mag_power: |X|^p. mag_power==2 → re²+im² (guard==0 on the
+        // inference path, use_grads=False); else sqrt(re²+im²)^mag_power.
+        let p2 = (re.sqr()? + im.sqr()?)?; // (1, freq, T)
+        let power = if self.cfg.mag_power == 2.0 {
+            p2
+        } else {
+            p2.sqrt()?.powf(self.cfg.mag_power)?
+        };
+        let power = power.squeeze(0)?.contiguous()?; // (freq, T)
 
-        // torch stft returns a complex tensor; convert to magnitude then power.
-        // Python: x = sqrt(re^2 + im^2 + guard); if mag_power != 1: x = x.pow(mag_power).
-        // (guard == 0 for the inference path, use_grads=False.)
-        let mag_power = self.cfg.mag_power;
-        let mut power = vec![0f64; freq * t];
-        for (i, c) in spec.iter().enumerate() {
-            // Fast path for the common mag_power == 2 (= re^2 + im^2); honor any
-            // other configured power faithfully.
-            let p = c.re * c.re + c.im * c.im;
-            power[i] = if mag_power == 2.0 { p } else { p.sqrt().powf(mag_power) };
-        }
-
-        // Power spectrum → mel → log → normalize, all in f64 on the CPU (this
-        // front-end is CPU-by-design; Metal has no f64). Only the final f32 result
-        // is moved to the model device. Keeping the precision-sensitive chain in
-        // f64 removes our own rounding so the gap to torch's f32 reference is just
-        // torch's rounding, not two divergent f32 paths.
-        let cpu = Device::Cpu;
-        let spec = Tensor::from_vec(power, (freq, t), &cpu)?; // (freq, T) f64
-        // mel: (nfilt, freq) @ (freq, T) → (nfilt, T)
-        let fb64 = self.fb.to_device(&cpu)?.to_dtype(DType::F64)?;
-        let mut mel = fb64.matmul(&spec)?;
+        // mel: (nfilt, freq) @ (freq, T) → (nfilt, T), f32 on device (autocast off).
+        let mut mel = self.fb.matmul(&power)?;
         // log(x + guard) — guard from log_zero_guard_value_fn (log_zero_guard_type="add").
         // Bind the guard first: `mel + …` moves `mel`, so the `&mel` borrow must resolve before.
         let guard = self.log_zero_guard_value_fn(&mel);
         mel = (mel + guard)?.log()?;
         // per-feature normalization (ddof=1) over the valid frames only, applied
         // to all frames — faithful to normalize_batch's valid_mask.
-        mel = normalize_batch(&mel, seq_len)?;
-        // Down to f32 on the model device for the conformer.
-        let mut mel = mel.to_dtype(DType::F32)?.to_device(&self.device)?;
+        let mut mel = normalize_batch(&mel, seq_len)?;
         // mask the trailing pad frame(s) [seq_len, t) to pad_value (0).
         if seq_len < t {
             let valid = mel.narrow(1, 0, seq_len)?;
