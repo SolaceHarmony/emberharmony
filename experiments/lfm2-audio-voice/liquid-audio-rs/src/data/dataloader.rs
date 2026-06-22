@@ -80,13 +80,10 @@ impl LFM2DataLoader {
         Self { dataset_path: dataset_path.into(), context_length, rows, device }
     }
 
-    /// `self.dataset = load_from_disk(self.dataset_path)` — read a
-    /// safetensors-backed row store from disk into the in-memory dataset (the
-    /// crate's persistence convention in place of HF `datasets`' Arrow format).
-    ///
-    /// Each row is stored as a group of tensors keyed `r{idx}.{field}` (e.g.
-    /// `r0.text`, `r0.audio_in`, …) across one or more `.safetensors` files under
-    /// `dataset_path`. Rows are returned in index order, faithful to the ordered
+    /// `self.dataset = load_from_disk(self.dataset_path)` — read the HuggingFace
+    /// `datasets` directory (`state.json` + `dataset_info.json` + the Arrow IPC
+    /// shard(s)) into the in-memory row store, via [`crate::data::arrow_io`] (pure
+    /// Rust `arrow`). Rows come back in dataset order, faithful to the ordered
     /// `datasets.Dataset` indexing `__getitem__(idx)` relies on. The default
     /// `context_length` matching Python's is [`LFM2DataLoader::DEFAULT_CONTEXT_LENGTH`].
     pub fn load_from_disk(
@@ -95,46 +92,7 @@ impl LFM2DataLoader {
         device: Device,
     ) -> Result<Self> {
         let dataset_path = dataset_path.into();
-        let mut tensors = std::collections::HashMap::new();
-        // `load_from_disk` reads every shard in the directory; mirror that by
-        // merging all `.safetensors` files (one is the common case).
-        let entries = std::fs::read_dir(&dataset_path)
-            .map_err(|e| candle_core::Error::Msg(format!("load_from_disk: read_dir {}: {e}", dataset_path.display())))?;
-        let mut shards: Vec<std::path::PathBuf> = entries
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("safetensors"))
-            .collect();
-        shards.sort();
-        if shards.is_empty() {
-            return Err(candle_core::Error::Msg(format!(
-                "load_from_disk: no .safetensors shards under {}",
-                dataset_path.display()
-            )));
-        }
-        for shard in &shards {
-            tensors.extend(candle_core::safetensors::load(shard, &device)?);
-        }
-
-        // Rows are `r{idx}.{field}`; count them by the `*.text` keys present.
-        let n_rows = tensors.keys().filter(|k| k.ends_with(".text")).count();
-        let field = |i: usize, name: &str| -> Result<Tensor> {
-            let key = format!("r{i}.{name}");
-            tensors
-                .get(&key)
-                .cloned()
-                .ok_or_else(|| candle_core::Error::Msg(format!("load_from_disk: missing tensor `{key}`")))
-        };
-        let mut rows = Vec::with_capacity(n_rows);
-        for i in 0..n_rows {
-            rows.push(RawRow {
-                text: field(i, "text")?,
-                audio_in: field(i, "audio_in")?,
-                audio_in_lens: field(i, "audio_in_lens")?,
-                audio_out: field(i, "audio_out")?,
-                modality_flag: field(i, "modality_flag")?,
-                supervision_mask: field(i, "supervision_mask")?,
-            });
-        }
+        let rows = crate::data::arrow_io::load_from_disk(&dataset_path, &device)?;
         Ok(Self::new(dataset_path, context_length, rows, device))
     }
 

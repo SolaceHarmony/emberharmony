@@ -1,5 +1,6 @@
 //! Port of `liquid_audio/data/` — the data-pipeline value types + loader.
 
+pub mod arrow_io; // HF datasets save_to_disk/load_from_disk (Arrow IPC) — pure Rust
 pub mod dataloader; // data/dataloader.py (LFM2DataLoader + lfm2_collator)
 pub mod mapper; // data/mapper.py (LFM2AudioChatMapper: chat → training sample)
 pub mod preprocess; // data/preprocess.py (preprocess_dataset: chats → on-disk dataset)

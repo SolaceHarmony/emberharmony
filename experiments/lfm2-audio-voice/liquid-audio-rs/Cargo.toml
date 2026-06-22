@@ -47,6 +47,13 @@ moshi = "0.6"
 # encoded-audio byte stream (WAV/FLAC/OGG-Vorbis/AIFF/… — the containers libsndfile
 # reads, and more) to f32 samples. Pure Rust, no C deps, no torch.
 symphonia = { version = "0.5", features = ["all"] }
+# Apache Arrow (pure Rust, no C deps) — `data/preprocess` writes the dataset in
+# HuggingFace `datasets.save_to_disk` format (Arrow IPC stream + dataset_info.json
+# + state.json), which `data/dataloader::load_from_disk` reads back. The trimmed
+# IPC-only set (array/schema/ipc) ≈ 13s cold build, vs Python's pyarrow C++ blob.
+arrow-array = "53"
+arrow-schema = "53"
+arrow-ipc = "53"
 
 [dev-dependencies]
 anyhow = "1"
