@@ -245,6 +245,28 @@ the `liquid_audio` parity surface (the Python has no such kernels); each kernel 
 independently verified (cpu == naive/circular/linear convolution; metal == cpu at
 1e-8–1e-6). See `../candle-flashfftconv/`.
 
+**Two precision regimes (faithful vs precise).** The FlashFFTConv CUDA kernels run in
+**bf16/f16**: `csrc/flashfftconv/butterfly/butterfly_cuda_bf16.cu` stores the DFT
+matrices, twiddles, and every per-butterfly output in `__nv_bfloat16`
+(`__float22bfloat162_rn`), with only the inner `wmma` matmul accumulating in `float`.
+PyTorch's *generic* `torch.fft` on CUDA can promote to `complex128` (cuFFT has a real
+double path), but the FlashFFTConv custom kernels never do — they are bf16-at-the-edges,
+f32-in-the-accumulator, **never f64**. That coarse rounding is baked into the trained
+weights, so the crate ships **both** ports:
+
+| regime | op | error vs f64 ground truth (256-pt circular conv) |
+|---|---|---|
+| **faithful (bug-for-bug CUDA)** | `monarch_conv_bf16` | **2.69e-1** |
+| clean f32 | `monarch_conv` | 7.63e-6 |
+| **precise (double-double, ~f64)** | `fused_fft_conv_dd` / `complex_mul_dd` | ≤ 1.18e-7 |
+
+The bf16 regime is **~35000× coarser than f32** — *more* divergent than f64, not less.
+That is deliberate: the network was fit around that rounding, so `monarch_conv_bf16` is
+the reference for matching the trained model, while the double-double path is for the
+true (more accurate than the original CUDA) convolution. `monarch_conv_bf16` needs no new
+shaders — candle's `BF16` dtype is `half::bf16` RNE, matching CUDA `_rn`, so the same
+code path runs the faithful regime on CPU and Metal.
+
 ---
 
 ## Reproduce

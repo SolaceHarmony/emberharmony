@@ -451,6 +451,74 @@ pub fn monarch_conv(
     butterfly_fft_inverse(&prod, id_f_n, id_f_l, ifft_twiddles)
 }
 
+/// Round `t` to bfloat16 and back to f32 — the exact rounding the FlashFFTConv bf16
+/// CUDA kernel applies whenever it stores an intermediate
+/// (`__float22bfloat162_rn`). candle's `BF16` dtype is `half::bf16`
+/// (round-to-nearest-even), so this round-trip matches CUDA's `_rn` bit-for-bit and
+/// runs natively on both CPU and Metal.
+fn bf16_round(t: &Tensor) -> Result<Tensor> {
+    t.to_dtype(candle_core::DType::BF16)?.to_dtype(candle_core::DType::F32)
+}
+
+/// **Faithful** FlashFFTConv long convolution — the same [`monarch_conv`] math run
+/// in the exact dtype regime of the bf16 CUDA kernels
+/// (`csrc/flashfftconv/butterfly/butterfly_cuda_bf16.cu`), i.e. the numerics the
+/// model was actually trained around.
+///
+/// Every value those kernels keep in `__nv_bfloat16` is rounded to bf16 here:
+/// - the DFT matrices `d_f_*` and the twiddle factors (loaded as `__nv_bfloat16`),
+/// - the input `u` and the filter spectrum `k_f` (bf16 activations),
+/// - each butterfly's stored output (`__float22bfloat162_rn` after the wmma matmul
+///   + twiddle multiply).
+///
+/// Inside a butterfly the DFT matmul and the twiddle multiply accumulate in **f32**
+/// (the `wmma::fragment<accumulator, …, float>` is float, and the twiddle uses the
+/// f32 accumulator), and the row-DFT result is held in f32 *through* the twiddle
+/// before the single bf16 store — so the rounding count matches CUDA exactly (one
+/// bf16 store per butterfly pass, not one per phase). The result tracks the bf16
+/// regime (~1e-2 relative), **not** f32 or double-double — which is the point: the
+/// trained weights expect this rounding, so this is the bug-for-bug reference to
+/// compare against [`crate::fused_fft_conv_dd`] (double-double, ~f64) and the clean
+/// f32 [`monarch_conv`].
+#[allow(clippy::too_many_arguments)]
+pub fn monarch_conv_bf16(
+    u: &Tensor,
+    k_f: &Tensor,
+    d_f_n: &Tensor,
+    d_f_l: &Tensor,
+    twiddles: &Tensor,
+    id_f_n: &Tensor,
+    id_f_l: &Tensor,
+    ifft_twiddles: &Tensor,
+) -> Result<Tensor> {
+    // bf16 storage of every coefficient + activation (CUDA holds these as bf16).
+    let u = bf16_round(&u.contiguous()?)?;
+    let k_f = bf16_round(&k_f.contiguous()?)?;
+    let d_f_l = bf16_round(&d_f_l.contiguous()?)?;
+    let d_f_n = bf16_round(&d_f_n.contiguous()?)?;
+    let twiddles = bf16_round(&twiddles.contiguous()?)?;
+    let id_f_n = bf16_round(&id_f_n.contiguous()?)?;
+    let id_f_l = bf16_round(&id_f_l.contiguous()?)?;
+    let ifft_twiddles = bf16_round(&ifft_twiddles.contiguous()?)?;
+
+    // Forward butterfly 1: row DFT (f32 accumulate), held in f32 through the twiddle,
+    // then a single bf16 store. Butterfly 2: col DFT, bf16 store.
+    let y = u.apply_op2(&d_f_l, RowDft)?;
+    let y = y.apply_op2(&twiddles, Twiddle)?;
+    let y = bf16_round(&y)?;
+    let y = y.apply_op2(&d_f_n, ColDft)?;
+    let y = bf16_round(&y)?;
+    // Frequency-domain multiply by the filter spectrum, stored bf16.
+    let prod = bf16_round(&complex_mul(&y, &k_f)?)?;
+    // Inverse butterfly 1: col IDFT (f32 accumulate) through the conj-twiddle, bf16
+    // store. Inverse butterfly 2: row IDFT (real, 1/(N·L)), final bf16 store.
+    let y = prod.apply_op2(&id_f_n, ColDft)?;
+    let y = y.apply_op2(&ifft_twiddles, Twiddle)?;
+    let y = bf16_round(&y)?;
+    let y = y.apply_op2(&id_f_l, RowIDftReal)?;
+    bf16_round(&y)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -597,6 +665,58 @@ mod tests {
         let maxd = y_time.iter().zip(exp.iter()).fold(0f32, |mm, (a, e)| mm.max((a - e).abs()));
         assert!(maxd < 1e-3, "monarch conv != circular conv, max diff {maxd}");
         eprintln!("monarch_conv == circular conv (col-major time order), max diff {maxd:.2e}");
+    }
+
+    // The two-version measurement: the SAME 256-point circular convolution computed
+    // in the faithful bf16 CUDA regime vs clean f32, each scored against the f64
+    // ground truth (`circular_conv`). Shows how far the trained-around bf16 numerics
+    // sit from the true convolution — the gap the double-double path closes.
+    #[test]
+    fn regimes_bf16_vs_f32_vs_f64() {
+        let dev = Device::Cpu;
+        let (n, l) = (16usize, 16);
+        let m = n * l; // 256-point circular conv
+        let u_time: Vec<f32> = (0..m).map(|i| (i as f32 * 0.21).sin() * 2.0).collect();
+        let k_time: Vec<f32> = (0..m).map(|i| (i as f32 * 0.037 + 0.5).cos()).collect();
+        // Monarch reads input column-major: tensor[ni,li] holds time index li*N+ni.
+        let lay = |t: &[f32]| -> Vec<f32> {
+            let mut v = vec![0f32; m];
+            for ni in 0..n {
+                for li in 0..l {
+                    v[ni * l + li] = t[li * n + ni];
+                }
+            }
+            v
+        };
+        let ut = Tensor::from_vec(lay(&u_time), (1, 1, n, l), &dev).unwrap();
+        let kt = Tensor::from_vec(lay(&k_time), (1, 1, n, l), &dev).unwrap();
+        let (dfn, dfl, tw) = (fft_matrix(n, &dev).unwrap(), fft_matrix(l, &dev).unwrap(), twiddle_factors_fft(n, l, &dev).unwrap());
+        let (idfn, idfl, itw) = (ifft_matrix(n, &dev).unwrap(), ifft_matrix(l, &dev).unwrap(), twiddle_factors_ifft(n, l, &dev).unwrap());
+        let k_f = butterfly_fft_forward(&kt, &dfn, &dfl, &tw).unwrap();
+
+        let read = |y: &Tensor| -> Vec<f32> {
+            let f: Vec<f32> = y.flatten_all().unwrap().to_vec1().unwrap();
+            let mut o = vec![0f32; m];
+            for ni in 0..n {
+                for li in 0..l {
+                    o[li * n + ni] = f[ni * l + li];
+                }
+            }
+            o
+        };
+        let y_f32 = read(&monarch_conv(&ut, &k_f, &dfn, &dfl, &tw, &idfn, &idfl, &itw).unwrap());
+        let y_bf16 = read(&monarch_conv_bf16(&ut, &k_f, &dfn, &dfl, &tw, &idfn, &idfl, &itw).unwrap());
+
+        let exp = circular_conv(&u_time, &k_time); // f64 ground truth
+        let err = |y: &[f32]| y.iter().zip(exp.iter()).fold(0f32, |mx, (a, e)| mx.max((a - e).abs()));
+        let (e_f32, e_bf16) = (err(&y_f32), err(&y_bf16));
+        eprintln!(
+            "circular conv (M={m}) vs f64 truth:  f32 {e_f32:.3e}   bf16-faithful {e_bf16:.3e}   (bf16 is {:.0}x the f32 error)",
+            e_bf16 / e_f32.max(f32::MIN_POSITIVE)
+        );
+        // The faithful bf16 regime is far coarser than f32 against the true conv —
+        // that coarseness is exactly what the trained weights were fit to.
+        assert!(e_f32 < e_bf16, "clean f32 ({e_f32:e}) should be closer to truth than bf16 ({e_bf16:e})");
     }
 
     #[cfg(feature = "metal")]

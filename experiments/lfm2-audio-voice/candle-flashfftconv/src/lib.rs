@@ -32,8 +32,28 @@
 //!   radix-2 FFT in threadgroup memory (no global round-trips). For `fft_size` a
 //!   power of two `≤ 1024` (linear conv via `2·seqlen` zero-pad). **Done +
 //!   verified**: `== direct linear convolution` (1.19e-7); metal == cpu (2.98e-8).
-//! - bf16 variants (the LFM2 Metal runtime dtype) and wiring into liquid-audio-rs
-//!   are the remaining steps; the f32 kernels are the verified reference.
+//!
+//! ## Two precision regimes — faithful vs precise
+//!
+//! The FlashFFTConv CUDA kernels run in **bf16/f16** (`butterfly_cuda_bf16.cu`:
+//! `__nv_bfloat16` DFT matrices, twiddles, and per-butterfly stores via
+//! `__float22bfloat162_rn`; only the inner `wmma` matmul accumulates in `float`).
+//! That coarse rounding is part of the trained model — the weights were fit *around*
+//! it — so there are two correct ports, not one:
+//!
+//! - **Faithful (bug-for-bug):** [`monarch_conv_bf16`] reproduces that exact dtype
+//!   chain (bf16 coeffs + activations + per-stage stores, f32 accumulate) so the
+//!   result matches what the network saw in training. candle's `BF16` dtype is
+//!   `half::bf16` RNE, identical to CUDA `_rn`, so this needs **no new shaders** —
+//!   it runs on CPU and Metal from one path.
+//! - **Precise:** [`fused_fft_conv_dd`] / [`complex_mul_dd`] carry the transform in
+//!   **double-double** (~f64), below every existing implementation including the
+//!   original CUDA. Use when you want the true convolution, not the trained-around one.
+//!
+//! Measured on the same 256-point circular convolution vs an f64 ground truth:
+//! **bf16-faithful 2.69e-1, clean f32 [`monarch_conv`] 7.63e-6, double-double
+//! ≤ 1.18e-7** — the bf16 regime is ~35000× coarser than f32, which is the whole
+//! point: that is the gap the training compensates for.
 
 mod butterfly;
 mod conv1d;
@@ -46,7 +66,7 @@ mod metal_util;
 
 pub use butterfly::{
     butterfly_fft_forward, butterfly_fft_inverse, complex_mul, fft_matrix, ifft_matrix, monarch_conv,
-    twiddle_factors_fft, twiddle_factors_ifft,
+    monarch_conv_bf16, twiddle_factors_fft, twiddle_factors_ifft,
 };
 pub use conv1d::{depthwise_conv1d, DepthwiseCausalConv1d};
 pub use dd_complex_mul::complex_mul_dd;
