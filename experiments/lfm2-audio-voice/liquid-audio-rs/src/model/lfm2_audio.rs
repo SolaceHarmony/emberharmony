@@ -51,7 +51,8 @@ pub struct LFM2AudioConfig {
     pub codebooks: usize,
     pub tie_audio_embeddings: bool,
     pub semantic_codebook_factor: f64,
-    pub codebook_weight: Vec<f64>,
+    /// `Literal["log", "linear"]` — the per-codebook loss-weight schedule.
+    pub codebook_weight: String,
     pub text_loss_multiplier: f64,
     pub audio_loss_multiplier: f64,
     pub interleaved_n_text: usize,
@@ -79,6 +80,33 @@ pub struct LFM2AudioModelOutput {
     pub audio_out_tokens: Tensor,
     pub text_tokens: Tensor,
     pub audio_in_tokens: Tensor,
+}
+
+/// `LFM2AudioModelInput` — batched training input (Python `data/types.py`
+/// dataclass assembled by collate): the model inputs plus the `supervision_mask`
+/// marking which positions contribute to the loss.
+#[derive(Debug, Clone)]
+pub struct LFM2AudioModelInput {
+    pub text: Tensor,
+    pub audio_in: Tensor,
+    pub audio_in_lens: Tensor,
+    pub audio_out: Tensor,
+    pub modality_flag: Tensor,
+    pub supervision_mask: Tensor,
+}
+
+impl LFM2AudioModelInput {
+    /// `to(device)` — move every field to `device`.
+    pub fn to(&self, device: &candle_core::Device) -> Result<Self> {
+        Ok(Self {
+            text: self.text.to_device(device)?,
+            audio_in: self.audio_in.to_device(device)?,
+            audio_in_lens: self.audio_in_lens.to_device(device)?,
+            audio_out: self.audio_out.to_device(device)?,
+            modality_flag: self.modality_flag.to_device(device)?,
+            supervision_mask: self.supervision_mask.to_device(device)?,
+        })
+    }
 }
 
 /// One streamed token: a text id, or one audio frame (codebooks codes).
@@ -296,6 +324,104 @@ impl LFM2AudioModel {
     /// PyTorch boolean assignment).
     fn prefill(&self, chat: &ChatState) -> Result<Tensor> {
         self.prefill_inputs(&chat.text, &chat.audio_in, &chat.audio_in_lens, &chat.audio_out, &chat.modality_flag)
+    }
+
+    /// `logits(batch)` — training logits + labels, faithful to
+    /// `LFM2AudioModel.logits`: `(text_logits (n_t,V), audio_logits (n_a·C,Va),
+    /// text_labels (n_t,), audio_labels (n_a·C,))`. Teacher-forced; the depthformer
+    /// runs the C-codebook sequence in parallel (causally masked — see
+    /// transformer.rs). Reuses prefill / backbone / tied text head / depth
+    /// embeddings, all parity-verified, so correctness is by composition.
+    pub fn logits(&self, batch: &LFM2AudioModelInput) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
+        let dev = batch.text.device();
+        let in_emb =
+            self.prefill_inputs(&batch.text, &batch.audio_in, &batch.audio_in_lens, &batch.audio_out, &batch.modality_flag)?;
+        let out_emb = self.backbone_forward_embeds(&in_emb)?; // (1, L, D)
+        let l = out_emb.dim(1)?;
+        let out_emb_shifted = out_emb.i(0)?.narrow(0, 0, l - 1)?.contiguous()?; // (L-1, D)
+
+        let modality: Vec<u32> = batch.modality_flag.i(0)?.to_vec1::<u32>()?;
+        let sup: Vec<u8> = batch.supervision_mask.i(0)?.to_dtype(DType::U8)?.to_vec1::<u8>()?;
+        let (text_id, audio_id) = (LFMModality::Text as u32, LFMModality::AudioOut as u32);
+
+        // Supervised, non-first text / audio-out positions: row index into
+        // out_emb_shifted (= p-1) + label index within the per-modality token
+        // tensor (text is (1,n_text); audio_out is (C, n_ao)).
+        let (mut text_rows, mut text_lbl) = (Vec::<u32>::new(), Vec::<u32>::new());
+        let (mut audio_rows, mut audio_lbl) = (Vec::<u32>::new(), Vec::<u32>::new());
+        let (mut ti, mut ai) = (0u32, 0u32);
+        for p in 0..l {
+            if modality[p] == text_id {
+                if p >= 1 && sup[p] != 0 {
+                    text_rows.push((p - 1) as u32);
+                    text_lbl.push(ti);
+                }
+                ti += 1;
+            } else if modality[p] == audio_id {
+                if p >= 1 && sup[p] != 0 {
+                    audio_rows.push((p - 1) as u32);
+                    audio_lbl.push(ai);
+                }
+                ai += 1;
+            }
+        }
+
+        // ---- text head (tied embedding): F.linear(text_out_emb, embed_tokens.weight) ----
+        let ew = self.lfm.embed_weight().to_dtype(DType::F32)?; // (V, D)
+        let vocab = ew.dim(0)?;
+        let text_logits = if text_rows.is_empty() {
+            Tensor::zeros((0, vocab), DType::F32, dev)?
+        } else {
+            let idx = Tensor::from_vec(text_rows.clone(), (text_rows.len(),), dev)?;
+            let rows = out_emb_shifted.index_select(&idx, 0)?.to_dtype(DType::F32)?;
+            rows.matmul(&ew.t()?.contiguous()?)?
+        };
+        let text_labels = {
+            let t = batch.text.i(0)?;
+            if text_lbl.is_empty() {
+                Tensor::zeros((0,), t.dtype(), dev)?
+            } else {
+                t.index_select(&Tensor::from_vec(text_lbl.clone(), (text_lbl.len(),), dev)?, 0)?
+            }
+        };
+
+        // ---- audio head (teacher-forced depthformer over the C codebooks) ----
+        let (c, dd) = (self.codebooks, self.depthformer_dim);
+        let (audio_logits, audio_labels) = if audio_rows.is_empty() {
+            (Tensor::zeros((0, AUDIO_VOCAB_SIZE), DType::F32, dev)?, Tensor::zeros((0,), DType::U32, dev)?)
+        } else {
+            let n_a = audio_rows.len();
+            let aemb = out_emb_shifted.index_select(&Tensor::from_vec(audio_rows.clone(), (n_a,), dev)?, 0)?; // (n_a, D)
+            let mut din = self.depth_linear.forward(&aemb)?.reshape((n_a, c, dd))?; // (n_a, C, dd)
+
+            // teacher tokens: audio_out[:C, audio_lbl] → (C, n_a); per-codebook embed → (n_a, C, dd)
+            let albl = Tensor::from_vec(audio_lbl.clone(), (audio_lbl.len(),), dev)?;
+            let codes = batch.audio_out.narrow(0, 0, c)?.index_select(&albl, 1)?.to_dtype(DType::I64)?; // (C, n_a)
+            let mut tok_rows = Vec::with_capacity(c);
+            for ci in 0..c {
+                tok_rows.push(self.depth_embeddings[ci].embed(&codes.i(ci)?)?.reshape((n_a, 1, dd))?);
+            }
+            let dtok = Tensor::cat(&tok_rows.iter().collect::<Vec<_>>(), 1)?; // (n_a, C, dd)
+            // dtok[:, -1] *= 0 ; roll(+1) along C → codebook c sees c-1's token, c0 sees zero.
+            let zero_last = Tensor::zeros((n_a, 1, dd), dtok.dtype(), dev)?;
+            let dtok = Tensor::cat(&[&dtok.narrow(1, 0, c - 1)?, &zero_last], 1)?;
+            let dtok = Tensor::cat(&[&dtok.narrow(1, c - 1, 1)?, &dtok.narrow(1, 0, c - 1)?], 1)?;
+            din = (din + dtok)?;
+
+            let dout = self.depthformer.forward(&din, None)?; // (n_a, C, dd), causally masked
+            let mut clog = Vec::with_capacity(c);
+            for ci in 0..c {
+                let logits_c = self.depth_embeddings[ci].get_logits(&dout.narrow(1, ci, 1)?.squeeze(1)?)?; // (n_a, Va)
+                clog.push(logits_c.unsqueeze(0)?);
+            }
+            let stacked = Tensor::cat(&clog.iter().collect::<Vec<_>>(), 0)?; // (C, n_a, Va)
+            let va = stacked.dim(2)?;
+            let audio_logits = stacked.transpose(0, 1)?.contiguous()?.reshape((n_a * c, va))?; // (L C) V
+            let audio_labels = codes.to_dtype(DType::U32)?.transpose(0, 1)?.contiguous()?.reshape((n_a * c,))?; // (L C)
+            (audio_logits, audio_labels)
+        };
+
+        Ok((text_logits, audio_logits, text_labels, audio_labels))
     }
 
     /// `_prefill(text, audio_in, audio_in_lens, audio_out, modality_flag)` from
