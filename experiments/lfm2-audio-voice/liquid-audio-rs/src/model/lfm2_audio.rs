@@ -295,19 +295,33 @@ impl LFM2AudioModel {
     /// embeddings into sequence order by `modality_flag` (index_select instead of
     /// PyTorch boolean assignment).
     fn prefill(&self, chat: &ChatState) -> Result<Tensor> {
-        let dev = chat.text.device();
-        let modality: Vec<u32> = chat.modality_flag.i(0)?.to_vec1::<u32>()?;
+        self.prefill_inputs(&chat.text, &chat.audio_in, &chat.audio_in_lens, &chat.audio_out, &chat.modality_flag)
+    }
+
+    /// `_prefill(text, audio_in, audio_in_lens, audio_out, modality_flag)` from
+    /// raw fields — the modality-scatter shared by `prefill_chat` (inference) and
+    /// `logits` (training). Faithful to Python `LFM2AudioModel._prefill`.
+    pub fn prefill_inputs(
+        &self,
+        text: &Tensor,
+        audio_in: &Tensor,
+        audio_in_lens: &Tensor,
+        audio_out: &Tensor,
+        modality_flag: &Tensor,
+    ) -> Result<Tensor> {
+        let dev = text.device();
+        let modality: Vec<u32> = modality_flag.i(0)?.to_vec1::<u32>()?;
         let l = modality.len();
 
         // text embeddings (n_text, D)
-        let text_emb = self.lfm.embed(&chat.text)?.i(0)?; // (n_text, D)
+        let text_emb = self.lfm.embed(text)?.i(0)?; // (n_text, D)
 
         // audio-in embeddings (n_ai, D): encode each segment, adapt, concat.
-        let lens: Vec<u32> = chat.audio_in_lens.to_vec1::<u32>().unwrap_or_default();
+        let lens: Vec<u32> = audio_in_lens.to_vec1::<u32>().unwrap_or_default();
         let mut audio_in_rows: Vec<Tensor> = Vec::new();
         let mut frame_cursor = 0usize;
         for &len in &lens {
-            let seg = chat.audio_in.narrow(1, frame_cursor, len as usize)?; // (128, frames)
+            let seg = audio_in.narrow(1, frame_cursor, len as usize)?; // (128, frames)
             frame_cursor += len as usize;
             let seg = seg.unsqueeze(0)?; // (1, 128, frames)
             let enc = self.conformer.forward(&seg)?; // (1, d, T')
@@ -323,11 +337,11 @@ impl LFM2AudioModel {
 
         // audio-out embeddings (n_ao, D)
         let audio_out_emb = {
-            let m = chat.audio_out.dim(1)?;
+            let m = audio_out.dim(1)?;
             if m == 0 {
                 None
             } else {
-                let codes = chat.audio_out.narrow(0, 0, self.codebooks)?.to_dtype(DType::I64)?;
+                let codes = audio_out.narrow(0, 0, self.codebooks)?.to_dtype(DType::I64)?;
                 let offs = Tensor::from_vec(self.codebook_offsets.clone(), (self.codebooks, 1), dev)?;
                 let offset_codes = codes.broadcast_add(&offs)?; // (codebooks, m)
                 let emb = self.audio_embedding.embed(&offset_codes)?; // (codebooks, m, D)
