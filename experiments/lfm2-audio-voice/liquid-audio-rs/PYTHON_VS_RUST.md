@@ -200,6 +200,43 @@ Greedy decoding is deterministic and identical. For *stochastic* sampling the po
 different random stream. This was never byte-reproducible across frameworks anyway; the
 token *set* and proportional distribution match (incl. Torch's threshold top-k).
 
+### 2.9 Audio FFTs — candle-native ports (torch.stft / torch.fft.irfft)
+
+The model has exactly **two** FFTs on the inference path (no FlashFFTConv/Hyena long
+conv exists in `liquid_audio` — verified: `grep -riE 'flashfft|monarch|hyena|fft_conv'`
+is empty). Both are now **candle ops on the model device, f32** — a direct port of
+torch's *algorithm at torch's precision*, not an external FFT library:
+
+| Python | Rust | how it differs | faithfulness |
+|---|---|---|---|
+| **input** `torch.stft` (`conformer/processor.py`, mel front-end) | windowed real→complex DFT as a **`Conv1d`** against a precomputed DFT-basis kernel, stride=hop (`processor.rs`) | matmul/conv form of the DFT instead of a Cooley-Tukey FFT; same result to the f32 floor | f32 (torch wraps it in `autocast(enabled=False)`; `_fft_r2c` keeps input precision). Parity vs torch golden: **mel 1.18e-5**, conformer-through-mel **5.6e-7** |
+| **output** `torch.fft.irfft` + `F.fold` (`detokenizer.py` ISTFT, the LFM2 detokenizer) | inverse-DFT basis **matmul** (`y=Re·Cw+Im·Sw`) + **`conv_transpose1d`** overlap-add (`detokenizer.rs::Istft`) | matmul/conv form; `conv_transpose1d` ≡ `F.fold` overlap-add | f32 (torch's irfft is f32 — MPS = MPSGraph `HermiteanToRealFFTWithTensor`, f32-only; `torch.polar` upcasts the bf16 backbone). The bf16 spec is cast to f32 here. **== f64 ref 1.4e-7**; validated **e2e on the full HF snapshot, Metal/bf16** |
+
+Both run on Metal (Conv1d / matmul / conv_transpose1d are all GPU candle ops). `rustfft`
+is no longer a dependency.
+
+### 2.10 A corrected detour — f64 / double-double (reverted to faithful f32)
+
+Honest disclosure: an intermediate exploration ran these FFTs in **f64 / double-double**
+("more precise than torch"). That was **wrong and was reverted.** torch runs both FFTs in
+**f32**, and the networks were trained against that f32 — so f64 fed the model
+out-of-distribution precision (the same class of error as bf16-vs-f32). f32 matching torch
+is the faithful port; §2.9 reflects the corrected state. The double-double GPU kernels
+(`candle-flashfftconv`, §6) survive only as **off-path reusable artifacts** — they are
+*not* a dependency of `liquid-audio-rs` and have **no call site in this model**.
+
+### 2.11 Local `../model` is an incomplete copy (operational gotcha, not a code deviation)
+
+The 1.5B's headline audio-out is the **`LFM2AudioDetokenizer`** (README: "lightning fast
+LFM2 based audio detokenizer … use `processor.decode`"); the HF repo ships
+`audio_detokenizer/` (config + 314 MB weights). The in-tree `../model` dir is an
+**incomplete copy missing `audio_detokenizer/`**, so the loader's
+`if audio_detokenizer/ exists → LFM2AudioDetokenizer else → Mimi` falls back to Mimi there.
+Run the detokenizer path against the **full HF snapshot**
+(`~/.cache/huggingface/hub/models--LiquidAI--LFM2.5-Audio-1.5B/snapshots/<rev>/`), not
+`../model`. (Mimi is the codec the 8-codebook codes come from and the demo's streaming
+decoder; the LFM2 detokenizer is the high-quality vocoder over the same codes — both real.)
+
 ---
 
 ## 3. Word-count audit (Python vs Rust, per mapped file)
