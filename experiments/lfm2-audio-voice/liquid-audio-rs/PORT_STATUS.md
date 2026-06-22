@@ -1,10 +1,53 @@
 # liquid_audio → Rust port status
 
-Faithful, module-for-module on candle. Goal: equivalent structure, function lists,
-and API calls; same IO model (the model is a **synchronous streaming generator** —
-async only at the websocket transport, per upstream). All modules compile.
-**Faithful = numerically verified** against Python — see PARITY.md (harness built;
-run it with the model present to close the parity column).
+Faithful, **class-for-class and function-for-function** on candle (no folding of
+bases into subclasses, no silent omissions). Same IO model (the model is a
+**synchronous streaming generator** — async only at the websocket transport, per
+upstream). All modules compile (0 warnings).
+**Faithful = numerically verified** against Python — see PARITY.md.
+
+## 1:1 inventory (38/38 in-scope classes mapped)
+
+Every class and function in the in-scope Python modules (`utils`, `detokenizer`,
+`processor`, `model/mlp`, `model/transformer`, `model/lfm2_audio`, and all of
+`model/conformer/`) has a Rust counterpart. Python **inheritance** is modelled by
+**composition** (the subclass holds its base and calls its methods, where Python
+uses `super()`); Python **ABCs** become Rust **traits**:
+
+- `PositionalEncoding` ← `RelPositionalEncoding`, `MultiHeadAttention` ←
+  `RelPositionMultiHeadAttention` — base structs composed by the rel-pos subclasses (`mha.rs`).
+- `SequenceModel` (ABC) → trait, impl'd by `RawLmBackbone` (`transformer.rs`).
+- `AudioPreprocessor` (ABC) → trait; `AudioToMelSpectrogramPreprocessor` wraps
+  `FilterbankFeatures` (`conformer/processor.rs`).
+- `CausalConv1D` (`modules.rs`), `MaskedConvSequential` (`subsampling.rs`),
+  `CacheAwareStreamingConfig` + stochastic-depth/autocast fns (`conformer/utils.rs`),
+  `LFM2_HFConfig`/`LFM2AudioConfig`/`LFM2AudioModelOutput` (`lfm2_audio.rs`), and
+  the full `ConformerEncoder` streaming/export method set — all ported.
+
+The un-fold **changed structure only**: the full parity suite re-ran byte-identical
+afterward (conformer 8.25e-7, backbone 6.6e-6, depthformer token-exact, prefill 1.1e-6).
+
+### `// PORT:` markers — members with no candle/Rust referent
+
+A handful of Python members are genuinely untranslatable and are present as
+documented `// PORT:` stubs so the inventory is complete, not silently dropped:
+- **torch autocast** (`avoid_float16_autocast_context`) — candle has no autocast;
+  compute dtype is explicit.
+- **autograd checkpointing** (`wrap_activation_checkpoint`) — no backward pass.
+- **NeMo pickle serialization** (`save_to`/`restore_from`) — persistence is
+  safetensors + `from_pretrained`.
+- **ONNX export / deployment hooks** (`input_example`, `forward_for_export`,
+  `disabled_deployment_*`) — no export path.
+- **cache-aware streaming** (`setup_streaming_params`, `get_initial_cache_state`,
+  `update_cache` on the offline path, …) — offline encode is single-shot.
+- **weight re-init** (`reset_parameters*`) — weights are loaded, not initialized.
+- **training loss** (`LFM2AudioModel.forward` / `logits(batch)`) — consumes a
+  `data/`-pipeline training batch (`LFM2AudioModelInput`), the training subsystem
+  outside this inference port; the output type is provided for the inventory.
+
+The IO model (sync streaming generator) is the only deliberate semantic mapping:
+Python's `forward_cached(x, cache) -> (out, cache)` is Rust's in-place
+`forward(x, Some(&mut cache))` (documented on the `SequenceModel` trait).
 
 | Python module | LOC | Rust module | Status |
 |---|---:|---|---|
@@ -12,7 +55,7 @@ run it with the model present to close the parity column).
 | `model/mlp.py` | 40 | `src/model/mlp.rs` | ✅ done |
 | `model/transformer.py` | 578 | `src/model/transformer.rs` | ✅ done — depthformer + shared embeddings backbone (RMSNorm, SwiGLU, GQA attn + qk-RMSNorm + interleaved RoPE, MHA, StandardBlock, SharedEmbedding, RawLmBackbone, KV cache) |
 | (HF `Lfm2Model`) | ~660 | `src/model/lfm2_hf.rs` | ✅ done — **main** backbone (hybrid short-conv + GQA attn), adapted from candle `lfm2.rs`; all-position hidden + custom-mask forward |
-| `model/conformer/utils.py` | 112 | — | ⏭ skip (autocast/streaming/stochastic-depth — off inference path) |
+| `model/conformer/utils.py` | 112 | `src/model/conformer/utils.rs` | ✅ done — `CacheAwareStreamingConfig` + `compute_stochastic_depth_drop_probs`; `avoid_float16_autocast_context` is a `// PORT:` no-op (no candle autocast) |
 | `model/conformer/mha.py` | 457 | `src/model/conformer/mha.rs` | ✅ done — RelPositionalEncoding + RelPositionMultiHeadAttention |
 | `model/conformer/modules.py` | 471 | `src/model/conformer/modules.rs` | ✅ done — ConformerLayer / Conv / FeedForward |
 | `model/conformer/subsampling.py` | 605 | `src/model/conformer/subsampling.rs` | ✅ done — dw_striding ConvSubsampling |

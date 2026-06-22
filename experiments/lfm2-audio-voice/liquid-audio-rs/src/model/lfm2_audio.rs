@@ -33,6 +33,54 @@ pub struct DepthformerConfig {
     pub tie: bool,
 }
 
+/// `LFM2_HFConfig` — locates the HF backbone checkpoint (dataclass). The loader
+/// resolves this into the concrete [`crate::model::lfm2_hf::Lfm2Config`].
+#[allow(non_camel_case_types)] // mirror the Python class name exactly
+#[derive(Debug, Clone)]
+pub struct LFM2_HFConfig {
+    pub pretrained_model_name_or_path: String,
+    pub revision: Option<String>,
+}
+
+/// `LFM2AudioConfig` — the top-level model config (Python dataclass, parsed from
+/// `config.json`). `loader.rs` reads the same JSON into the concrete sub-configs;
+/// this is the faithful aggregate type for the 1:1 inventory.
+#[derive(Debug, Clone)]
+pub struct LFM2AudioConfig {
+    pub architectures: Vec<String>,
+    pub codebooks: usize,
+    pub tie_audio_embeddings: bool,
+    pub semantic_codebook_factor: f64,
+    pub codebook_weight: Vec<f64>,
+    pub text_loss_multiplier: f64,
+    pub audio_loss_multiplier: f64,
+    pub interleaved_n_text: usize,
+    pub interleaved_n_audio: usize,
+    pub preprocessor: crate::model::conformer::processor::MelConfig,
+    pub encoder: crate::model::conformer::encoder::ConformerEncoderConfig,
+    pub lfm: crate::model::lfm2_hf::Lfm2Config,
+    pub depthformer: DepthformerConfig,
+}
+
+/// `LFM2AudioModelOutput` — output of the **training** `forward` (cross-entropy
+/// losses + token counts).
+///
+/// PORT: the training `forward(batch) -> LFM2AudioModelOutput` and its
+/// `logits(batch)` consume a `LFM2AudioModelInput` training batch from the
+/// `liquid_audio.data` pipeline (`data/types.py`), which is the training
+/// subsystem — outside this inference-port's scope (the model here is the
+/// synchronous streaming generator). The output type is provided for the 1:1
+/// inventory; the loss `forward` itself belongs with the (unported) trainer.
+#[derive(Debug, Clone)]
+pub struct LFM2AudioModelOutput {
+    pub loss: Tensor,
+    pub audio_loss: Tensor,
+    pub text_loss: Tensor,
+    pub audio_out_tokens: Tensor,
+    pub text_tokens: Tensor,
+    pub audio_in_tokens: Tensor,
+}
+
 /// One streamed token: a text id, or one audio frame (codebooks codes).
 #[derive(Debug, Clone)]
 pub enum GenToken {

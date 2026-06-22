@@ -211,3 +211,101 @@ impl<'a> ChatState<'a> {
 }
 
 use candle_core::IndexOp;
+
+impl LFM2AudioProcessor {
+    /// `text` → the text tokenizer.
+    pub fn text(&self) -> &Tokenizer {
+        &self.tokenizer
+    }
+
+    /// `audio` → the mel audio preprocessor (Python `AudioToMelSpectrogramPreprocessor`;
+    /// the port's featurizer).
+    pub fn audio(&self) -> &FilterbankFeatures {
+        &self.audio
+    }
+
+    /// `device` → the device tensors live on.
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+
+    /// `audio_detokenizer` / `mimi` → the audio-out backend. Python exposes the
+    /// concrete `LFM2AudioDetokenizer` / `MimiModel`; the port dispatches `decode`
+    /// through `Box<dyn AudioDetokenizer>`, so both accessors return that backend.
+    pub fn audio_detokenizer(&self) -> Option<&dyn AudioDetokenizer> {
+        self.audio_out.as_deref()
+    }
+
+    /// See [`Self::audio_detokenizer`].
+    pub fn mimi(&self) -> Option<&dyn AudioDetokenizer> {
+        self.audio_out.as_deref()
+    }
+
+    /// PORT: `to(device, dtype)` — torch in-place device/dtype move. candle places
+    /// tensors at load (`from_pretrained(device, dtype)`); there is no in-place
+    /// move. No-op, preserved for 1:1 inventory.
+    pub fn to(&self) {}
+
+    /// PORT: `eval` / `train` — torch training-mode toggle. Inference is always
+    /// eval (dropout/BatchNorm are eval here); no-op, preserved for 1:1 inventory.
+    pub fn eval(&self) {}
+
+    /// See [`Self::eval`].
+    pub fn train(&self) {}
+}
+
+impl ChatState<'_> {
+    /// `model_inputs` — the model-input field names (Python `model_inputs`).
+    pub fn model_inputs(&self) -> [&'static str; 5] {
+        ["text", "audio_in", "audio_in_lens", "audio_out", "modality_flag"]
+    }
+
+    /// `__len__` → number of model-input fields.
+    pub fn len(&self) -> usize {
+        self.model_inputs().len()
+    }
+
+    /// The model-input field set is fixed and non-empty (kept for the
+    /// `len`-without-`is_empty` lint).
+    pub fn is_empty(&self) -> bool {
+        self.model_inputs().is_empty()
+    }
+
+    /// `__iter__` → iterate the model-input field names.
+    pub fn iter(&self) -> impl Iterator<Item = &'static str> {
+        self.model_inputs().into_iter()
+    }
+
+    /// `__getitem__(name)` → the tensor field by model-input name.
+    pub fn get(&self, name: &str) -> Result<&Tensor> {
+        match name {
+            "text" => Ok(&self.text),
+            "audio_in" => Ok(&self.audio_in),
+            "audio_in_lens" => Ok(&self.audio_in_lens),
+            "audio_out" => Ok(&self.audio_out),
+            "modality_flag" => Ok(&self.modality_flag),
+            other => Err(candle_core::Error::Msg(format!(
+                "expected one of {:?}, got {other}.",
+                ["text", "audio_in", "audio_in_lens", "audio_out", "modality_flag"]
+            ))),
+        }
+    }
+
+    /// `device` → the processor's device.
+    pub fn device(&self) -> &Device {
+        &self.proc.device
+    }
+}
+
+impl std::fmt::Display for ChatState<'_> {
+    /// `__repr__`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ChatState(text_tok: {}, audio_in: {}, audio_out: {})",
+            self.text.dim(1).unwrap_or(0),
+            self.audio_in.dim(1).unwrap_or(0),
+            self.audio_out.dim(1).unwrap_or(0),
+        )
+    }
+}

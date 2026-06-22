@@ -215,3 +215,65 @@ fn normalize_per_feature(x: &Tensor, valid: usize) -> Result<Tensor> {
     let std = (var.sqrt()? + CONSTANT)?;
     x.broadcast_sub(&mean)?.broadcast_div(&std)
 }
+
+impl FilterbankFeatures {
+    /// `filter_banks` — the `(nfilt, n_fft/2+1)` mel filterbank (Python
+    /// `featurizer.filter_banks`).
+    pub fn filter_banks(&self) -> &Tensor {
+        &self.fb
+    }
+}
+
+/// `AudioPreprocessor` (Python `class AudioPreprocessor(nn.Module, ABC)`): the
+/// base preprocessor contract — `forward(input, length)` delegates to the
+/// abstract `get_features`.
+pub trait AudioPreprocessor {
+    /// abstract `get_features(input_signal, length)` — subclasses implement.
+    fn get_features(&self, input_signal: &Tensor, length: Option<&Tensor>) -> Result<(Tensor, Option<Tensor>)>;
+
+    /// `forward(input_signal, length)` = `get_features` (Python wraps it in
+    /// `torch.no_grad()`; inference here is already grad-free).
+    fn forward(&self, input_signal: &Tensor, length: Option<&Tensor>) -> Result<(Tensor, Option<Tensor>)> {
+        self.get_features(input_signal, length)
+    }
+}
+
+/// `AudioToMelSpectrogramPreprocessor(AudioPreprocessor)` — wraps the mel
+/// `FilterbankFeatures` (Python `self.featurizer`); `get_features` / `filter_banks`
+/// delegate to it.
+pub struct AudioToMelSpectrogramPreprocessor {
+    featurizer: FilterbankFeatures,
+}
+
+impl AudioToMelSpectrogramPreprocessor {
+    pub fn new(featurizer: FilterbankFeatures) -> Self {
+        Self { featurizer }
+    }
+
+    /// `filter_banks` → the featurizer's mel filterbank.
+    pub fn filter_banks(&self) -> &Tensor {
+        self.featurizer.filter_banks()
+    }
+
+    /// PORT: `save_to` — NeMo `.nemo` archive (tar + yaml config + pickled
+    /// weights). No candle/Rust analog; persistence is via safetensors +
+    /// `from_pretrained`. No-op, preserved for 1:1 inventory.
+    pub fn save_to(&self, _save_path: &str) {}
+
+    /// PORT: `restore_from` — load from a NeMo `.nemo` archive (classmethod).
+    /// No candle analog (see `save_to`); use `from_pretrained`. Preserved for 1:1.
+    pub fn restore_from(_restore_path: &str) {}
+
+    /// PORT: `input_example` — ONNX-export dummy input (random tensor for tracing).
+    /// No export path here; preserved for 1:1 inventory.
+    pub fn input_example(&self, _max_batch: usize, _max_dim: usize, _min_length: usize) {}
+}
+
+impl AudioPreprocessor for AudioToMelSpectrogramPreprocessor {
+    /// `get_features` → `self.featurizer(input_signal, length)`. The Rust mel
+    /// featurizer returns the features; per-clip valid length is tracked by the
+    /// caller (`ChatState`), so the length slot is `None` here.
+    fn get_features(&self, input_signal: &Tensor, _length: Option<&Tensor>) -> Result<(Tensor, Option<Tensor>)> {
+        Ok((self.featurizer.forward(input_signal)?, None))
+    }
+}

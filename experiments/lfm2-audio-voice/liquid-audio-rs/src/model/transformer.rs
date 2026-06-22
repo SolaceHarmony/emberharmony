@@ -140,6 +140,37 @@ pub fn precompute_freqs_cis(dim: usize, end: usize, theta: f64, device: &Device)
     Ok((freqs.cos()?, freqs.sin()?))
 }
 
+/// `apply_rotary_emb(xq, xk, freqs_cis)` — interleaved (GPT-J) rotary applied to
+/// query and key together (Python takes/returns both).
+///
+/// PORT: candle has no complex dtype, so Python's `view_as_complex(...) *
+/// freqs_cis → view_as_real` rotation is the real-valued `rope_i` (the exact
+/// interleaved-pair rotation), with the complex `freqs_cis` table carried as
+/// `(cos, sin)` from `precompute_freqs_cis`. Faithful to the upcast-rotate
+/// contract: callers pass f32 q/k and cast the result back (`type_as`).
+pub fn apply_rotary_emb(xq: &Tensor, xk: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<(Tensor, Tensor)> {
+    Ok((rope_i(xq, cos, sin)?, rope_i(xk, cos, sin)?))
+}
+
+/// `reshape_for_broadcast(freqs_cis, x)` — reshape the `(seq, dim/2)` freq table
+/// to broadcast against `x` of rank `ndim`: size kept on dims `1` and `ndim-1`,
+/// `1` elsewhere. In the candle path `rope_i` performs this broadcast internally
+/// over `[b, heads, t, head_dim]`; provided for 1:1 parity with the Python helper.
+pub fn reshape_for_broadcast(freqs_cis: &Tensor, x: &Tensor) -> Result<Tensor> {
+    let dims = x.dims();
+    let ndim = dims.len();
+    let shape: Vec<usize> = (0..ndim).map(|i| if i == 1 || i == ndim - 1 { dims[i] } else { 1 }).collect();
+    freqs_cis.reshape(shape)
+}
+
+/// PORT: `wrap_activation_checkpoint` — training-only gradient (activation)
+/// checkpointing (`torch.utils.checkpoint`). There is no autograd/backward pass
+/// on the candle inference path, so there is nothing to checkpoint; this is an
+/// identity wrapper, preserved for 1:1 inventory.
+pub fn wrap_activation_checkpoint<T>(module: T) -> T {
+    module
+}
+
 fn repeat_kv(x: &Tensor, n_rep: usize) -> Result<Tensor> {
     if n_rep == 1 {
         return Ok(x.clone());
@@ -236,8 +267,7 @@ impl BoundedAttention {
         let in_dtype = q.dtype();
         let q_t = q.transpose(1, 2)?.contiguous()?.to_dtype(DType::F32)?;
         let k_t = k.transpose(1, 2)?.contiguous()?.to_dtype(DType::F32)?;
-        let q_t = rope_i(&q_t, cos, sin)?;
-        let k_t = rope_i(&k_t, cos, sin)?;
+        let (q_t, k_t) = apply_rotary_emb(&q_t, &k_t, cos, sin)?;
         // back to [b, t, heads, head_dim] in the original dtype for cache concat
         let q = q_t.transpose(1, 2)?.contiguous()?.to_dtype(in_dtype)?;
         let k = k_t.transpose(1, 2)?.contiguous()?.to_dtype(in_dtype)?;
@@ -430,5 +460,32 @@ impl RawLmBackbone {
             }
         }
         Ok(x)
+    }
+}
+
+/// `SequenceModel` (Python `class SequenceModel(nn.Module, ABC)`) — the
+/// sequence-model contract: `[N,T,dim] → [N,T',dim_out]`, with `forward` /
+/// `forward_cached`.
+///
+/// PORT: Python's `forward_cached(x, cache) -> (out, cache)` returns a fresh
+/// cache; Rust mutates the cache in place via `Option<&mut [LayerKvCache]>`, so
+/// `forward(x, Some(cache))` *is* `forward_cached` — the two abstract methods
+/// collapse to one signature covering both the cached and uncached paths.
+pub trait SequenceModel {
+    fn dim(&self) -> usize;
+    fn dim_out(&self) -> usize;
+    fn forward(&self, x: &Tensor, cache: Option<&mut [LayerKvCache]>) -> Result<Tensor>;
+}
+
+impl SequenceModel for RawLmBackbone {
+    fn dim(&self) -> usize {
+        self.dim
+    }
+    fn dim_out(&self) -> usize {
+        self.dim // the raw backbone returns hidden states of `dim`
+    }
+    fn forward(&self, x: &Tensor, cache: Option<&mut [LayerKvCache]>) -> Result<Tensor> {
+        // Delegate to the inherent method (inherent resolution wins → no recursion).
+        RawLmBackbone::forward(self, x, cache)
     }
 }

@@ -1,12 +1,12 @@
 //! Port of `liquid_audio/model/conformer/modules.py` (NeMo conformer blocks).
 //!
 //! Inference path: `ConformerFeedForward`, `ConformerConvolution`,
-//! `ConformerLayer`. `CausalConv1D` collapses to a symmetric "same"-padded
-//! depthwise conv (`_left_padding == _right_padding == (k-1)/2`, the conformer's
-//! config) — the cache/streaming branch is not ported. Dropout is identity at
-//! inference; `norm_type='batch_norm'` (the default) → `BatchNorm1d`.
+//! `ConformerLayer` (the offline conformer uses the symmetric "same"-padded
+//! depthwise conv inside `ConformerConvolution`). `CausalConv1D` (causal /
+//! asymmetric padding + streaming cache) is cold on the offline path but ported
+//! 1:1. Dropout is identity at inference; `norm_type='batch_norm'` → `BatchNorm1d`.
 
-use candle_core::{Result, Tensor};
+use candle_core::{Result, Tensor, D};
 use candle_nn::{
     batch_norm, conv1d, layer_norm, linear, ops::sigmoid, ops::silu, BatchNorm, Conv1d, Conv1dConfig, LayerNorm,
     Linear, Module, ModuleT, VarBuilder,
@@ -33,6 +33,11 @@ impl ConformerFeedForward {
         let x = silu(&x)?;
         self.linear2.forward(&x)
     }
+
+    /// PORT: `reset_parameters_ff` — Xavier/uniform weight re-initialization at
+    /// construction (training). The port loads pretrained weights via VarBuilder,
+    /// so there is nothing to re-initialize; no-op, preserved for 1:1 inventory.
+    pub fn reset_parameters_ff(&self) {}
 }
 
 /// `ConformerConvolution`: pointwise→GLU→(pad mask)→depthwise→BatchNorm→SiLU→pointwise.
@@ -79,6 +84,92 @@ impl ConformerConvolution {
         let x = silu(&x)?;
         let x = self.pointwise_conv2.forward(&x)?;
         x.transpose(1, 2)?.contiguous()
+    }
+
+    /// PORT: `reset_parameters_conv` — conv weight re-initialization at
+    /// construction (training). The port loads pretrained weights, so this is a
+    /// no-op, preserved for 1:1 inventory.
+    pub fn reset_parameters_conv(&self) {}
+}
+
+/// Padding modes for [`CausalConv1D`], mirroring the Python `padding` arg:
+/// `None` (causal), an `int` (symmetric), or a `[left, right]` pair (asymmetric).
+pub enum CausalPadding {
+    /// `padding=None`: causal — `left = k-1`, `right = stride-1`.
+    Causal,
+    /// `padding=int`: symmetric `left == right == p`.
+    Symmetric(usize),
+    /// `padding=[l, r]` with `l + r == k-1` (stride 1 only): asymmetric.
+    Asymmetric(usize, usize),
+}
+
+/// `CausalConv1D` (`nn.Conv1d` subclass) — causal/asymmetric padding so each step
+/// sees a controlled number of right/left neighbours, with a streaming cache.
+///
+/// PORT: cold on the offline conformer forward (which uses the symmetric depthwise
+/// conv in `ConformerConvolution`); ported 1:1 for inventory. Padding is applied
+/// manually (the inner `Conv1d` is `padding=0`), faithful to NeMo's `F.pad` + conv.
+pub struct CausalConv1D {
+    conv: Conv1d,
+    left_padding: usize,
+    right_padding: usize,
+    /// trailing steps dropped from the streaming cache (`0` ⇒ keep all).
+    cache_drop_size: usize,
+}
+
+impl CausalConv1D {
+    pub fn new(
+        in_channels: usize,
+        out_channels: usize,
+        kernel_size: usize,
+        stride: usize,
+        padding: CausalPadding,
+        groups: usize,
+        vb: VarBuilder,
+    ) -> Result<Self> {
+        let (left_padding, right_padding) = match padding {
+            CausalPadding::Causal => (kernel_size - 1, stride.saturating_sub(1)),
+            CausalPadding::Symmetric(p) => {
+                if stride != 1 && p != kernel_size - 1 {
+                    return Err(candle_core::Error::Msg("No striding allowed for non-symmetric convolutions!".into()));
+                }
+                (p, p)
+            }
+            CausalPadding::Asymmetric(l, r) => {
+                if l + r != kernel_size - 1 {
+                    return Err(candle_core::Error::Msg(format!("Invalid padding param: [{l}, {r}]!")));
+                }
+                (l, r)
+            }
+        };
+        let cfg = Conv1dConfig { padding: 0, stride, dilation: 1, groups, ..Default::default() };
+        Ok(Self { conv: conv1d(in_channels, out_channels, kernel_size, cfg, vb)?, left_padding, right_padding, cache_drop_size: 0 })
+    }
+
+    /// `update_cache(x, cache)` → `(padded_x, next_cache)`. Offline (`cache=None`):
+    /// pad left+right. Streaming: pad right only, prepend cache, roll the window
+    /// back to the cache length (dropping `cache_drop_size` trailing steps).
+    pub fn update_cache(&self, x: &Tensor, cache: Option<&Tensor>) -> Result<(Tensor, Option<Tensor>)> {
+        match cache {
+            None => Ok((x.pad_with_zeros(D::Minus1, self.left_padding, self.right_padding)?, None)),
+            Some(c) => {
+                let new_x = x.pad_with_zeros(D::Minus1, 0, self.right_padding)?;
+                let new_x = Tensor::cat(&[c, &new_x], D::Minus1)?;
+                let total = new_x.dim(D::Minus1)?;
+                let kept = if self.cache_drop_size > 0 { total - self.cache_drop_size } else { total };
+                let next = new_x.narrow(D::Minus1, 0, kept)?;
+                let clen = c.dim(D::Minus1)?;
+                let nlen = next.dim(D::Minus1)?;
+                let start = nlen.saturating_sub(clen);
+                Ok((new_x, Some(next.narrow(D::Minus1, start, nlen - start)?)))
+            }
+        }
+    }
+
+    /// `forward(x, cache)` = `update_cache` then the (padding=0) conv.
+    pub fn forward(&self, x: &Tensor, cache: Option<&Tensor>) -> Result<(Tensor, Option<Tensor>)> {
+        let (x, next_cache) = self.update_cache(x, cache)?;
+        Ok((self.conv.forward(&x)?, next_cache))
     }
 }
 

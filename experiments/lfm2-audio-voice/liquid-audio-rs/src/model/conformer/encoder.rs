@@ -111,4 +111,88 @@ impl ConformerEncoder {
         let final_out = x.transpose(1, 2)?.contiguous()?;
         Ok((sub, posx, pos_emb, layer0.unwrap(), final_out))
     }
+
+    // ---- Off the offline forward path; ported 1:1 for inventory (see mod.rs). ----
+
+    /// `forward_internal` — the core encode. Our [`Self::forward`] *is*
+    /// `forward_internal` (the public `forward` in Python just length-handles then
+    /// calls it); kept as an alias for the 1:1 mapping.
+    pub fn forward_internal(&self, audio_signal: &Tensor) -> Result<Tensor> {
+        self.forward(audio_signal)
+    }
+
+    /// PORT: `forward_for_export` — ONNX/TorchScript export wrapper around the
+    /// forward. No export path here; faithfully delegates to `forward`.
+    pub fn forward_for_export(&self, audio_signal: &Tensor) -> Result<Tensor> {
+        self.forward(audio_signal)
+    }
+
+    /// `_create_masks(att_context_size, padding_length, max_audio_length, ...)`
+    /// → `(att_mask, pad_mask)`. On the offline single-clip path (unlimited
+    /// context `[-1,-1]`, no padding) both masks are identity, hence `None`
+    /// (matching what `forward` passes). The padded-batch case is handled by
+    /// per-segment encode (see the `forward` contract / `prefill_parity`).
+    pub fn create_masks(&self) -> (Option<Tensor>, Option<Tensor>) {
+        (None, None)
+    }
+
+    /// PORT: `update_max_seq_length` / `set_max_audio_length` — grow the cached
+    /// positional-encoding table to a max length. The port computes the rel-pos
+    /// table on the fly sized to the input (`RelPositionalEncoding::forward`), so
+    /// there is no fixed buffer to extend; no-op, preserved for 1:1 inventory.
+    pub fn update_max_seq_length(&self, _seq_length: usize, _device: &candle_core::Device) {}
+
+    /// See [`Self::update_max_seq_length`].
+    pub fn set_max_audio_length(&self, _max_audio_length: usize) {}
+
+    /// PORT: `enable_pad_mask` — toggle pad masking. The offline path uses no pad
+    /// mask (single unpadded clip); returns the previous state (always `false`).
+    pub fn enable_pad_mask(&self, _on: bool) -> bool {
+        false
+    }
+
+    /// PORT: `_calc_context_sizes` / `set_default_att_context_size` /
+    /// `change_attention_model` — limited-context & att-model switching for
+    /// streaming. Offline uses unlimited rel-pos attention (`[-1,-1]`); no-op
+    /// stubs, preserved for 1:1 inventory.
+    pub fn set_default_att_context_size(&self, _att_context_size: (i64, i64)) {}
+
+    /// See [`Self::set_default_att_context_size`].
+    pub fn change_attention_model(&self, _self_attention_model: &str) {}
+
+    /// PORT: `setup_streaming_params` / `get_initial_cache_state` /
+    /// `streaming_post_process` — cache-aware streaming setup & cache tensors.
+    /// Not on the offline path; no-op stubs, preserved for 1:1 inventory.
+    pub fn setup_streaming_params(&self) {}
+
+    /// See [`Self::setup_streaming_params`]. Returns no cache (offline).
+    pub fn get_initial_cache_state(&self) -> Option<Tensor> {
+        None
+    }
+
+    /// See [`Self::setup_streaming_params`].
+    pub fn streaming_post_process(&self, rets: Tensor) -> Tensor {
+        rets
+    }
+
+    /// PORT: `input_example` — ONNX-export dummy input (random tensor for tracing).
+    /// `disabled_deployment_{input,output}_names` — export hooks. No export path
+    /// here; preserved for 1:1 inventory.
+    pub fn input_example(&self, _max_batch: usize, _max_dim: usize) {}
+
+    /// See [`Self::input_example`].
+    pub fn disabled_deployment_input_names(&self) -> Vec<&'static str> {
+        Vec::new()
+    }
+
+    /// See [`Self::input_example`].
+    pub fn disabled_deployment_output_names(&self) -> Vec<&'static str> {
+        Vec::new()
+    }
+
+    /// `change_subsampling_conv_chunking_factor` — forwards to the pre-encode
+    /// subsampling (a memory-tiling control; see `ConvSubsampling`).
+    pub fn change_subsampling_conv_chunking_factor(&mut self, factor: i64) -> Result<()> {
+        self.pre_encode.change_subsampling_conv_chunking_factor(factor)
+    }
 }
