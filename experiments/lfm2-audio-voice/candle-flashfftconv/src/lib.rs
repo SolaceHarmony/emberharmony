@@ -37,6 +37,8 @@
 
 mod butterfly;
 mod conv1d;
+mod dd_complex_mul;
+mod dw3;
 mod fused_fft_conv;
 #[cfg(feature = "metal")]
 mod metal_util;
@@ -46,4 +48,6 @@ pub use butterfly::{
     twiddle_factors_fft, twiddle_factors_ifft,
 };
 pub use conv1d::{depthwise_conv1d, DepthwiseCausalConv1d};
+pub use dd_complex_mul::complex_mul_dd;
+pub use dw3::depthwise3_causal;
 pub use fused_fft_conv::{fused_fft_conv, FusedFftConv};

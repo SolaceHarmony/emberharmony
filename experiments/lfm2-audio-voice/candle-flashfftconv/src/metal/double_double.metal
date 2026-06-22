@@ -20,11 +20,10 @@ struct double_double {
     float hi;  // High-order term (standard float32)
     float lo;  // Low-order correction term (residual error)
 
-    // Constructor
+    // Constructor (l defaults to 0, so this also constructs from a single float).
     double_double(float h = 0.0f, float l = 0.0f) : hi(h), lo(l) {}
-
-    // Construct from single float
-    explicit double_double(float x) : hi(x), lo(0.0f) {}
+    // candle mod: removed the separate `explicit double_double(float x)` ctor — it was
+    // ambiguous with the defaulted two-arg ctor above under candle's Metal compiler.
 };
 
 struct complex_dd {
@@ -308,4 +307,5 @@ inline complex_dd unpack_cdd(float4 v) {
     );
 }
 
-#endif // EMBER_ML_DOUBLE_DOUBLE_METAL
+// candle mod: removed an orphaned `#endif` here — the matching `#ifndef
+// EMBER_ML_DOUBLE_DOUBLE_METAL` was absent from the vendored file.
