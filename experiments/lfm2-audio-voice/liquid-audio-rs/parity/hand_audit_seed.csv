@@ -73,6 +73,20 @@ model/conformer/subsampling.py,MaskedConvSequential.forward,FAITHFUL,cold/invent
 model/conformer/subsampling.py,MaskedConvSequential._create_mask,FAITHFUL,—,—,(B T F) 1.0 where arange(time)<length else 0 == Python time_mask.unsqueeze(-1).expand
 model/conformer/subsampling.py,apply_channel_mask,FAITHFUL,—,—,mask.unsqueeze(1).broadcast (B C T F) * tensor (zero masked time/feat across channels)
 model/conformer/subsampling.py,calculate_conv_output_size,FAITHFUL,—,—,(input+pad0+pad1-kernel)//stride+1 (i64 trunc==floor for positive sizes)
+model/conformer/processor.py,AudioPreprocessor.__init__,FAITHFUL,sentinel/window dict dropped,—,win_length+hop_length; torch_windows dict -> analysis_window fn; dtype_sentinel_tensor buffer -> no-op (candle compute dtype explicit; output always f32)
+model/conformer/processor.py,AudioPreprocessor.forward,FAITHFUL,template split; no_grad moot,—,base half: warn if !f32 + cast to f32; concrete AudioToMel.forward runs get_features then casts back to sentinel f32; @no_grad moot at inference
+model/conformer/processor.py,AudioPreprocessor.get_features,FAITHFUL,abstract bail,—,@abstractmethod -> Rust bails (== Python NotImplementedError contract)
+model/conformer/processor.py,AudioToMelSpectrogramPreprocessor.save_to,FAITHFUL,no-op,—,Python pass (NeMo .nemo archive); persistence via safetensors/from_pretrained -> no-op
+model/conformer/processor.py,AudioToMelSpectrogramPreprocessor.restore_from,FAITHFUL,no-op,—,Python classmethod pass; use from_pretrained -> no-op
+model/conformer/processor.py,AudioToMelSpectrogramPreprocessor.__init__,FAITHFUL,featurizer injected; use_torchaudio=False,—,Python computes n_window_size=int(window_size*sr)/n_window_stride + super().__init__ + builds FilterbankFeatures; Rust injects FilterbankFeatures + base=AudioPreprocessor::new(n_window_size n_window_stride) from cfg; FilterbankFeaturesTA path not ported (use_torchaudio=False)
+model/conformer/processor.py,AudioToMelSpectrogramPreprocessor.input_example,FAITHFUL,no-op (off-path export),—,ONNX-export dummy (randn signals + randint lengths); no export path -> no-op
+model/conformer/processor.py,AudioToMelSpectrogramPreprocessor.get_features,FAITHFUL,—,—,self.featurizer(input length) -> (featurizer.forward(input) None); per-clip length tracked by ChatState
+model/conformer/processor.py,AudioToMelSpectrogramPreprocessor.filter_banks,FAITHFUL,—,—,featurizer.filter_banks (property)
+model/conformer/processor.py,FilterbankFeatures.__init__,FAITHFUL,built at construction; training bits skipped,—,window=hann(win periodic=False) + fb=librosa slaney mel + stft DFT-basis kernel computed at construction (not checkpoint tensors) == Python __init__; n_fft from cfg (Python n_fft or 2^ceil(log2(win))); dither/nb_aug/frame_splicing/max_length (training) skipped; mel parity 1.18e-5 vs torch golden
+model/conformer/processor.py,FilterbankFeatures.log_zero_guard_value_fn,FAITHFUL,string branches pre-resolved,—,returns cfg.log_zero_guard_value (numeric 2^-24); Python tiny/eps -> torch.finfo branches pre-resolved at config load (checkpoint uses numeric)
+model/conformer/processor.py,FilterbankFeatures.get_seq_len,FAITHFUL,centered path only,—,pad_amount=(n_fft//2)*2; floor_divide(seq_len+pad_amount-n_fft hop); centered (exact_pad=False) even n_fft -> pad_amount==n_fft -> collapses to floor(seq_len/hop); exact_pad not supported
+model/conformer/processor.py,FilterbankFeatures.filter_banks,FAITHFUL,—,—,&self.fb (property)
+model/conformer/processor.py,normalize_batch,FAITHFUL,per_feature single-clip,—,per_feature: mean=sum(x valid)/count; std=sqrt(sum((x-mean)^2 valid)/(count-1))+CONSTANT(1e-5); ddof=1; valid=leading [0 valid) frames; applied to all frames broadcast; all_features/fixed_mean/none branches not ported (config=per_feature); conformer-through-mel 5.6e-7
 processor.py,LFM2AudioProcessor.to,FAITHFUL,no-op,—,device-agnostic (device at construction); documented no-op
 processor.py,LFM2AudioProcessor.eval,FAITHFUL,no-op,—,training-mode toggle; inference always eval; documented no-op
 processor.py,LFM2AudioProcessor.train,FAITHFUL,no-op,—,see eval
