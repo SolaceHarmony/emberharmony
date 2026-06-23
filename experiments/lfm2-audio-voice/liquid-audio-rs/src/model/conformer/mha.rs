@@ -10,8 +10,19 @@
 //!
 //! Inference path = the rel-pos subclasses via the manual (non-`use_pytorch_sdpa`)
 //! branch, no cache/streaming. `dropout` / `dropout_emb` are eval-time identities
-//! and are omitted; the `use_pytorch_sdpa` branch is a torch-runtime alternative
-//! to the same manual math and is intentionally not ported (see `forward`).
+//! and are omitted.
+//!
+//! The `use_pytorch_sdpa=True` branch (both base and rel-pos) is algebraically the
+//! SAME computation as the manual path, not a separate algorithm: it pre-scales
+//! `matrix_bd` by `1/√d`, bakes the mask in as an additive `-INF`, and lets
+//! `scaled_dot_product_attention` fold in `q·kᵀ/√d`, reconstructing the manual
+//! `softmax((matrix_ac+matrix_bd)/√d)·v`; its explicit all-masked-row zeroing matches
+//! `forward_attention`'s post-softmax `masked_fill(mask, 0)`. So the manual path here
+//! faithfully implements BOTH Python branches — verified by `rel_pos_attention_sdpa_-
+//! parity` against a Python `use_pytorch_sdpa=True` golden (1.07e-6; the Python
+//! True-vs-False diff is itself 1.5e-7). candle DOES ship a fused `ops::sdpa`, but it
+//! is `apply_op*_no_bwd` (severs autograd, cf. d2f4a80) and would break the trainable
+//! audio-in encode graph, so it is deliberately avoided.
 
 use candle_core::{DType, Device, Result, Tensor, D};
 // `ops::softmax` (differentiable basic ops), NOT `softmax_last_dim` (fused
@@ -191,8 +202,9 @@ impl MultiHeadAttention {
     }
 
     /// Base `forward` (standard scaled-dot-product). The encoder uses the rel-pos
-    /// subclass; this is the faithful base path (manual branch — the
-    /// `use_pytorch_sdpa` branch is a torch-runtime alternative to the same math).
+    /// subclass; this is the faithful base path. `use_pytorch_sdpa=True` reduces to the
+    /// same `softmax(q·kᵀ/√d + mask)·v` (see the module note) — both Python branches map
+    /// here; candle's fused `ops::sdpa` is no_bwd and avoided.
     pub fn forward(&self, query: &Tensor, key: &Tensor, value: &Tensor, mask: Option<&Tensor>) -> Result<Tensor> {
         let (q, k, v) = self.forward_qkv(query, key, value)?;
         let scores = (q.matmul(&k.transpose(D::Minus2, D::Minus1)?.contiguous()?)? / self.s_d_k)?;

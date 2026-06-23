@@ -83,6 +83,49 @@ fn mel_exact_pad_parity() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Detector for the off-path `use_pytorch_sdpa=True` rel-pos attention branch.
+///
+/// That branch pre-scales `matrix_bd` by `1/√d`, bakes the mask in as an additive
+/// `-INF`, and lets `scaled_dot_product_attention` fold in `q_u·kᵀ/√d` — algebraically
+/// the SAME `softmax((matrix_ac+matrix_bd)/√d)·v` the manual path computes (its
+/// all-masked-row zeroing matches `forward_attention`'s post-softmax `masked_fill`).
+/// candle's fused `ops::sdpa` is no_bwd (would sever training grads, cf. d2f4a80), so
+/// the manual differentiable path is the faithful translation of BOTH branches. The
+/// golden dumps Python's `use_pytorch_sdpa=True` output on shared weights (the Python
+/// True-vs-False diff is 1.5e-7); this asserts the Rust manual port reproduces it.
+/// Golden: `parity/dump_mha_sdpa.py`.
+#[test]
+#[ignore = "needs parity/golden/mha_sdpa_refs.safetensors (run dump_mha_sdpa.py)"]
+fn rel_pos_attention_sdpa_parity() -> anyhow::Result<()> {
+    use liquid_audio::model::conformer::mha::RelPositionMultiHeadAttention;
+    use std::collections::HashMap;
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let device = Device::Cpu;
+    let g = candle_core::safetensors::load(manifest.join("parity/golden/mha_sdpa_refs.safetensors"), &device)?;
+    let q = g.get("q").expect("q").clone();
+    let pos_emb = g.get("pos_emb").expect("pos_emb").clone();
+    let out_sdpa = g.get("out_sdpa").expect("out_sdpa").clone();
+    let out_manual = g.get("out_manual").expect("out_manual").clone();
+
+    // weights → VarBuilder (strip the "w." dump prefix → linear_q/k/v/out, linear_pos…).
+    let mut ws = HashMap::new();
+    for (k, v) in g.iter() {
+        if let Some(name) = k.strip_prefix("w.") {
+            ws.insert(name.to_string(), v.clone());
+        }
+    }
+    let vb = candle_nn::VarBuilder::from_tensors(ws, DType::F32, &device);
+    let att = RelPositionMultiHeadAttention::new(8, 512, true, vb)?;
+
+    let out = att.forward(&q, &q, &q, None, &pos_emb)?;
+    let e_sdpa = rel_err(&out, &out_sdpa);
+    let e_manual = rel_err(&out, &out_manual);
+    println!("rust rel-pos attn vs Python: use_pytorch_sdpa {e_sdpa:.3e}  manual {e_manual:.3e}");
+    assert!(e_sdpa < 5e-3, "Rust manual path must reproduce Python use_pytorch_sdpa=True: {e_sdpa}");
+    assert!(e_manual < 5e-3, "Rust vs Python manual: {e_manual}");
+    Ok(())
+}
+
 #[test]
 #[ignore = "needs LFM_MODEL_DIR + parity/golden/conformer_stages.safetensors"]
 fn conformer_stages_parity() -> anyhow::Result<()> {
