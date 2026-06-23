@@ -75,10 +75,10 @@ struct Acc {
     mel_parts: Vec<Tensor>,
     /// `audio_out_parts` — codebook-token blocks, each `(codebooks, m)` u32.
     audio_out_parts: Vec<Tensor>,
-    /// `audio_in_lens` — per-segment valid mel-frame counts.
-    audio_in_lens: Vec<u32>,
-    /// `modality_seq` — per-position [`LFMModality`] flags.
-    modality_seq: Vec<u32>,
+    /// `audio_in_lens` — per-segment valid mel-frame counts (torch.long → I64).
+    audio_in_lens: Vec<i64>,
+    /// `modality_seq` — per-position [`LFMModality`] flags (torch.long → I64).
+    modality_seq: Vec<i64>,
     /// `supervision_seq` — per-position loss mask.
     supervision_seq: Vec<bool>,
 }
@@ -174,13 +174,13 @@ impl<'a> LFM2AudioChatMapper<'a> {
         let dev = self.processor.device();
         let nfilt = self.processor.audio().nfilt();
 
-        // text = cat(text_parts, 0).unsqueeze(0)  → (1, n) — candle uses u32 ids
-        // (the crate's token-id dtype) where Python uses torch.long.
+        // text = cat(text_parts, 0).unsqueeze(0)  → (1, n) I64 (torch.long; the
+        // crate's token-id dtype, matching the dataloader/ChatState).
         let text = if acc.text_parts.is_empty() {
-            Tensor::from_vec(Vec::<u32>::new(), (1, 0), dev)?
+            Tensor::from_vec(Vec::<i64>::new(), (1, 0), dev)?
         } else {
             let refs: Vec<&Tensor> = acc.text_parts.iter().collect();
-            Tensor::cat(&refs, 0)?.unsqueeze(0)?
+            Tensor::cat(&refs, 0)?.unsqueeze(0)?.to_dtype(DType::I64)?
         };
 
         // audio_in = cat(mel_parts, 1) else empty((nfilt, 0)) — Python hardcodes
@@ -197,12 +197,13 @@ impl<'a> LFM2AudioChatMapper<'a> {
             Tensor::from_vec(acc.audio_in_lens, (n,), dev)?
         };
 
-        // audio_out = cat(audio_out_parts, 1) else empty((codebooks, 0))
+        // audio_out = cat(audio_out_parts, 1) else empty((codebooks, 0)). I64
+        // (torch.long); mimi.encode hands back u32 codes, cast to match.
         let audio_out = if acc.audio_out_parts.is_empty() {
-            Tensor::from_vec(Vec::<u32>::new(), (self.codebooks, 0), dev)?
+            Tensor::from_vec(Vec::<i64>::new(), (self.codebooks, 0), dev)?
         } else {
             let refs: Vec<&Tensor> = acc.audio_out_parts.iter().collect();
-            Tensor::cat(&refs, 1)?
+            Tensor::cat(&refs, 1)?.to_dtype(DType::I64)?
         };
 
         let n_mod = acc.modality_seq.len();
@@ -239,14 +240,14 @@ impl<'a> LFM2AudioChatMapper<'a> {
         while text_left > 0 || audio_left > 0 {
             let take_text = n_text.min(text_left);
             if take_text > 0 {
-                acc.modality_seq.extend(std::iter::repeat_n(LFMModality::Text as u32, take_text));
+                acc.modality_seq.extend(std::iter::repeat_n(LFMModality::Text as i64, take_text));
                 acc.supervision_seq.extend(std::iter::repeat_n(true, take_text));
                 text_left -= take_text;
             }
 
             let take_audio = n_audio.min(audio_left);
             if take_audio > 0 {
-                acc.modality_seq.extend(std::iter::repeat_n(LFMModality::AudioOut as u32, take_audio));
+                acc.modality_seq.extend(std::iter::repeat_n(LFMModality::AudioOut as i64, take_audio));
                 acc.supervision_seq.extend(std::iter::repeat_n(true, take_audio));
                 audio_left -= take_audio;
             }
@@ -260,7 +261,7 @@ impl<'a> LFM2AudioChatMapper<'a> {
         let text_tokens = self.encode_ids(text)?;
         let n = text_tokens.dim(0)?;
         acc.text_parts.push(text_tokens);
-        acc.modality_seq.extend(std::iter::repeat_n(LFMModality::Text as u32, n));
+        acc.modality_seq.extend(std::iter::repeat_n(LFMModality::Text as i64, n));
         acc.supervision_seq.extend(std::iter::repeat_n(supervised, n));
         Ok(())
     }
@@ -292,10 +293,10 @@ impl<'a> LFM2AudioChatMapper<'a> {
         let cur_mel = mel.i(0)?.narrow(1, 0, cur_len)?.to_dtype(DType::F32)?.contiguous()?; // (nfilt, cur_len)
 
         acc.mel_parts.push(cur_mel);
-        acc.audio_in_lens.push(cur_len as u32);
+        acc.audio_in_lens.push(cur_len as i64);
 
         let n_emb = mel2emb_len(cur_len as i64) as usize;
-        acc.modality_seq.extend(std::iter::repeat_n(LFMModality::AudioIn as u32, n_emb));
+        acc.modality_seq.extend(std::iter::repeat_n(LFMModality::AudioIn as i64, n_emb));
         acc.supervision_seq.extend(std::iter::repeat_n(false, n_emb));
         Ok(())
     }
@@ -307,7 +308,7 @@ impl<'a> LFM2AudioChatMapper<'a> {
         let codes = self.encode_audio_out(wav, sampling_rate)?;
         let n = codes.dim(1)?;
         acc.audio_out_parts.push(codes);
-        acc.modality_seq.extend(std::iter::repeat_n(LFMModality::AudioOut as u32, n));
+        acc.modality_seq.extend(std::iter::repeat_n(LFMModality::AudioOut as i64, n));
         acc.supervision_seq.extend(std::iter::repeat_n(true, n));
         Ok(())
     }
