@@ -126,6 +126,61 @@ fn rel_pos_attention_sdpa_parity() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// END-TO-END greedy generation parity vs Python `generate_interleaved`. This is the
+/// only test that exercises the full autoregressive loop — multi-step KV cache (moshi
+/// `LfmCache` vs HF `Lfm2HybridConvCache`), text sampling, the depthformer per audio
+/// frame, and the interleaved text/audio modality switching — against Python. Greedy ⇒
+/// every generated token id must match EXACTLY. Golden: `parity/dump_generate.py`.
+#[test]
+#[ignore = "needs LFM_MODEL_DIR + parity/golden/{prefill,generate}_refs.safetensors (run dump_generate.py)"]
+fn generate_interleaved_parity() -> anyhow::Result<()> {
+    use liquid_audio::model::lfm2_audio::{GenParams, GenToken};
+    let dir = std::env::var("LFM_MODEL_DIR").expect("set LFM_MODEL_DIR");
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let device = Device::Cpu;
+    let r = candle_core::safetensors::load(manifest.join("parity/golden/prefill_refs.safetensors"), &device)?;
+    let g = candle_core::safetensors::load(manifest.join("parity/golden/generate_refs.safetensors"), &device)?;
+    let (model, _proc) = liquid_audio::from_pretrained(Path::new(&dir), DType::F32, &device)?;
+
+    let in_emb = model.prefill_inputs(
+        &r.get("text").unwrap().to_dtype(DType::I64)?,
+        &r.get("audio_in").unwrap().to_dtype(DType::F32)?,
+        &r.get("audio_in_lens").unwrap().to_dtype(DType::I64)?,
+        &r.get("audio_out").unwrap().to_dtype(DType::I64)?,
+        &r.get("modality_flag").unwrap().to_dtype(DType::I64)?,
+    )?;
+
+    let want_mod = g.get("seq_mod").unwrap().to_dtype(DType::I64)?.to_vec1::<i64>()?;
+    let params = GenParams {
+        max_new_tokens: want_mod.len(),
+        text_temperature: None, text_top_k: None, audio_temperature: None, audio_top_k: None, seed: 0,
+    };
+
+    let mut seq_mod: Vec<i64> = Vec::new();
+    let mut text_vals: Vec<i64> = Vec::new();
+    let mut audio_vals: Vec<Vec<i64>> = Vec::new();
+    model.generate_from_embeds(in_emb, &params, |tok| match tok {
+        GenToken::Text(id) => {
+            seq_mod.push(0);
+            text_vals.push(id as i64);
+        }
+        GenToken::Audio(frame) => {
+            seq_mod.push(1);
+            audio_vals.push(frame.iter().map(|&c| c as i64).collect());
+        }
+    })?;
+
+    // exact token-by-token match vs Python greedy.
+    assert_eq!(seq_mod, want_mod, "generation modality sequence diverged from Python");
+    assert_eq!(text_vals, g.get("text_vals").unwrap().to_dtype(DType::I64)?.to_vec1::<i64>()?, "text token ids diverged from Python");
+    let want_audio = g.get("audio_vals").unwrap().to_dtype(DType::I64)?;
+    let got_audio = Tensor::from_iter(audio_vals.iter().flatten().copied(), &device)?.reshape(want_audio.dims())?;
+    assert_eq!(got_audio.to_vec2::<i64>()?, want_audio.to_vec2::<i64>()?, "audio frame codes diverged from Python");
+    println!("generate parity: {} tokens ({} text, {} audio) — all ids match Python exactly",
+        seq_mod.len(), text_vals.len(), audio_vals.len());
+    Ok(())
+}
+
 /// Cache-aware streaming conformer forward (`forward_streaming` = `forward_internal`
 /// with caches), verified DIRECTLY against the upstream Python streaming on the same
 /// weights + config: output AND all three next caches. Golden:

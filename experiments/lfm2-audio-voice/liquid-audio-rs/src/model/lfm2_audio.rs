@@ -850,8 +850,16 @@ impl LFM2AudioModel {
 
     /// `generate_interleaved` as a synchronous callback stream — interleaves runs
     /// of text and audio (real-time S2S). Faithful to the Python generator.
-    pub fn generate_interleaved<F: FnMut(GenToken)>(&self, chat: &ChatState, params: &GenParams, mut on_token: F) -> Result<()> {
-        let mut in_emb = self.prefill(chat)?;
+    pub fn generate_interleaved<F: FnMut(GenToken)>(&self, chat: &ChatState, params: &GenParams, on_token: F) -> Result<()> {
+        let in_emb = self.prefill(chat)?;
+        self.generate_from_embeds(in_emb, params, on_token)
+    }
+
+    /// The interleaved generation loop given the prefill embeds directly (Python
+    /// `generate_interleaved` after `_prefill`). Exposed so it can be driven from raw
+    /// model inputs (`prefill_inputs`) for the end-to-end `generate_interleaved_parity`
+    /// golden, not just a `ChatState`.
+    pub fn generate_from_embeds<F: FnMut(GenToken)>(&self, mut in_emb: Tensor, params: &GenParams, mut on_token: F) -> Result<()> {
         let mut index_pos = 0usize;
         let mut cache = LfmCache::new(true, in_emb.dtype(), &self.lfm_cfg, in_emb.device())?;
         let mut text_sampler = Sampler::new(params.seed, params.text_temperature, params.text_top_k);
