@@ -41,12 +41,16 @@ use crate::model::lfm2_audio::{LFM2AudioModel, LFM2AudioModelInput, LFM2AudioMod
 /// A source of training/validation batches. Faithful analog of a `torch.utils.data
 /// .DataLoader` over an `LFM2DataLoader` with `lfm2_collator` — the collation /
 /// shuffling / worker machinery lives in the [`crate::data`] subsystem, so the
-/// trainer takes an already-collated batch stream. `next_batch` returns `None` at
+/// trainer takes an already-collated batch stream. `next_batch` returns `Ok(None)` at
 /// the end of an epoch (the `StopIteration` the Python loop catches to bump
 /// `self.epoch` and restart the iterator).
 pub trait DataIter {
-    /// `next(iter(loader))` — the next collated batch, or `None` at epoch end.
-    fn next_batch(&mut self) -> Option<LFM2AudioModelInput>;
+    /// `next(iter(loader))` — the next collated batch as `Ok(Some(batch))`, `Ok(None)`
+    /// at epoch end, or `Err` if a row fails to load / collate. Distinguishing the
+    /// error from exhaustion is the whole point: a malformed or over-long sample must
+    /// fail loudly (as Python's `DataLoader` raises the exception), not be silently
+    /// skipped as "end of epoch".
+    fn next_batch(&mut self) -> Result<Option<LFM2AudioModelInput>>;
     /// `iter(self.train_loader)` — restart iteration for a new epoch.
     fn reset(&mut self);
 }
@@ -66,12 +70,12 @@ impl VecDataIter {
 }
 
 impl DataIter for VecDataIter {
-    fn next_batch(&mut self) -> Option<LFM2AudioModelInput> {
+    fn next_batch(&mut self) -> Result<Option<LFM2AudioModelInput>> {
         let b = self.batches.get(self.pos).cloned();
         if b.is_some() {
             self.pos += 1;
         }
-        b
+        Ok(b) // a fixed in-memory list never fails to "load"
     }
     fn reset(&mut self) {
         self.pos = 0;
@@ -149,17 +153,19 @@ fn splitmix_shuffle(order: &mut [usize], seed: &mut u64) {
 }
 
 impl DataIter for LoaderDataIter {
-    fn next_batch(&mut self) -> Option<LFM2AudioModelInput> {
+    fn next_batch(&mut self) -> Result<Option<LFM2AudioModelInput>> {
         if self.pos >= self.order.len() {
-            return None;
+            return Ok(None); // epoch exhausted — the only legitimate "no batch" case
         }
         let end = (self.pos + self.batch_size).min(self.order.len());
         let rows: Result<Vec<_>> = self.order[self.pos..end].iter().map(|&i| self.loader.get(i)).collect();
         self.pos = end;
-        // A row/collate error ends the epoch rather than panicking; the loader's
-        // own `get` validates lengths (it errors on over-long samples).
-        let rows = rows.ok()?;
-        crate::data::dataloader::lfm2_collator(&rows).ok()
+        // PROPAGATE a row-load / collate failure — do NOT swallow it as end-of-epoch.
+        // `loader.get` validates lengths (it errors on over-long samples); a malformed
+        // sample must surface (Python's DataLoader raises the exception) rather than be
+        // silently skipped, which would shorten training and end validation early.
+        let rows = rows?;
+        Ok(Some(crate::data::dataloader::lfm2_collator(&rows)?))
     }
     fn reset(&mut self) {
         self.pos = 0;
@@ -376,13 +382,14 @@ impl Trainer {
         train_loader.reset();
 
         while self.step < self.cfg.max_steps {
-            let batch = match train_loader.next_batch() {
+            // `?` propagates a data-load/collate failure; `None` is genuine epoch end.
+            let batch = match train_loader.next_batch()? {
                 Some(b) => b,
                 None => {
                     self.epoch += 1;
                     train_loader.reset();
                     train_loader
-                        .next_batch()
+                        .next_batch()?
                         .ok_or_else(|| candle_core::Error::Msg("train_loader is empty".into()))?
                 }
             };
@@ -453,7 +460,9 @@ impl Trainer {
         let mut loss_sum = Tensor::zeros((1,), DType::F32, &self.device)?;
         let mut loss_count = 0f64;
 
-        while let Some(batch) = val_loader.next_batch() {
+        // `?` surfaces a data failure (the Python validation loop would raise it);
+        // `None` is genuine exhaustion, so validation can't be cut short by a bad row.
+        while let Some(batch) = val_loader.next_batch()? {
             let batch = batch.to(&self.device)?;
             let out = self.model.forward(&batch)?;
             loss_sum = (loss_sum + out.loss.to_dtype(DType::F32)?.reshape((1,))?)?;
@@ -525,6 +534,34 @@ enum Reduction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn data_iter_error_propagates_not_exhaustion() {
+        // A row-load / collate failure must surface as `Err`, NOT `Ok(None)` — the
+        // train/validate loops treat `None` as end-of-epoch, so swallowing the error
+        // would silently shorten training / cut validation short. Locks the `?`-vs-
+        // `.ok()?` fix at the trait-contract level (model-free).
+        struct Failing {
+            calls: usize,
+        }
+        impl DataIter for Failing {
+            fn next_batch(&mut self) -> Result<Option<LFM2AudioModelInput>> {
+                self.calls += 1;
+                if self.calls == 1 {
+                    Err(candle_core::Error::Msg("malformed sample".into()))
+                } else {
+                    Ok(None)
+                }
+            }
+            fn reset(&mut self) {
+                self.calls = 0;
+            }
+        }
+        let mut it = Failing { calls: 0 };
+        assert!(it.next_batch().is_err(), "a data failure must propagate as Err, not collapse to Ok(None)");
+        // A subsequent call (genuine exhaustion) is Ok(None) — the two are distinct.
+        assert!(matches!(it.next_batch(), Ok(None)), "exhaustion must be Ok(None)");
+    }
 
     #[test]
     fn lr_schedule_warmup_then_cosine() {
