@@ -38,3 +38,21 @@ detokenizer.py,ISTFT.__init__,FAITHFUL,buffer load vs recompute,—,hann window 
 detokenizer.py,LFM2AudioDetokenizer.__init__,FAITHFUL,—,—,FusedEmbedding(512)+Lfm2Model(backbone_config)+Linear(512 1282)+ISTFT(1280 320 1280 same)+sliding_window(getattr default 30)
 model/conformer/utils.py,compute_stochastic_depth_drop_probs,FAITHFUL,ValueError->panic,—,line-for-line: validations + [0]*start_layer + linear(l/L*p l=1..L)/uniform(p*L) branches identical; training regularizer (off-path at inference drop_prob=0)
 model/conformer/utils.py,avoid_float16_autocast_context,STUB,no-op,—,NeMo autocast helper (avoid float16 via cuda f32/bf16 autocast); Rust explicit-dtype no autocast -> no-op; off-path
+model/conformer/encoder.py,ConformerEncoder.__init__,FAITHFUL,ctor (vb),—,builds pre_encode(subsampling)+pos_enc(RelPositionalEncoding)+ConformerLayer*+out_proj; conformer_stages parity 5.6e-7
+model/conformer/encoder.py,ConformerEncoder.forward,FAITHFUL,—,—,transpose->pre_encode->pos_enc->layers(no mask offline)->out_proj->transpose; == Python forward_internal core; parity 5.6e-7
+model/conformer/encoder.py,ConformerEncoder.forward_internal,FAITHFUL,alias,—,Rust forward IS forward_internal (Python public forward length-handles then calls it); kept as alias for 1:1
+model/conformer/encoder.py,ConformerEncoder._create_masks,FAITHFUL,SIMPLIFIED-offline,—,returns (None None): offline unlimited-context [-1 -1] single unpadded clip -> Python masks reduce to all-False = no masking == None; general triu/tril/chunked_limited NOT ported (needed only for streaming/limited-context configs this model does not use)
+model/conformer/encoder.py,ConformerEncoder._calc_context_sizes,FAITHFUL,off-path,—,1:1 port of the context-size helper (Python union list[int]/list[list[int]] split into flat/list-of-list args); off-path (offline uses [-1 -1]); ported for inventory
+model/conformer/encoder.py,ConformerEncoder.input_example,STUB,off-path,—,NeMo tracing/export input generator; no-op stub
+model/conformer/encoder.py,ConformerEncoder.disabled_deployment_input_names,STUB,off-path,—,deployment inventory; returns name list
+model/conformer/encoder.py,ConformerEncoder.disabled_deployment_output_names,STUB,off-path,—,deployment inventory; returns name list
+model/conformer/encoder.py,ConformerEncoder.forward_for_export,STUB,off-path,—,ONNX/TorchScript export wrapper; no export path -> delegates to forward
+model/conformer/encoder.py,ConformerEncoder.streaming_post_process,STUB,off-path,—,cache-aware streaming post-process; offline passthrough (returns rets)
+model/conformer/encoder.py,ConformerEncoder.update_max_seq_length,STUB,off-path,—,grow cached pos-enc table; Rust computes rel-pos on the fly -> no-op
+model/conformer/encoder.py,ConformerEncoder.set_max_audio_length,STUB,off-path,—,see update_max_seq_length; no-op
+model/conformer/encoder.py,ConformerEncoder.enable_pad_mask,STUB,off-path,—,toggle pad masking; offline no pad mask -> returns false (prev state)
+model/conformer/encoder.py,ConformerEncoder.set_default_att_context_size,STUB,off-path,—,streaming att context setter; no-op
+model/conformer/encoder.py,ConformerEncoder.setup_streaming_params,STUB,off-path,—,cache-aware streaming setup; no-op
+model/conformer/encoder.py,ConformerEncoder.get_initial_cache_state,STUB,off-path,—,streaming cache init; returns None
+model/conformer/encoder.py,ConformerEncoder.change_attention_model,STUB,off-path,—,dynamic attention reconfig; no-op
+model/conformer/encoder.py,ConformerEncoder.change_subsampling_conv_chunking_factor,STUB,off-path,—,conv chunking reconfig; inventory stub
