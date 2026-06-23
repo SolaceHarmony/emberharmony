@@ -231,13 +231,130 @@ impl ConformerEncoder {
         Ok((encoded, length))
     }
 
-    /// `_create_masks(att_context_size, padding_length, max_audio_length, ...)`
-    /// → `(att_mask, pad_mask)`. On the offline single-clip path (unlimited
-    /// context `[-1,-1]`, no padding) both masks are identity, hence `None`
-    /// (matching what `forward` passes). The padded-batch case is handled by
-    /// per-segment encode (see the `forward` contract / `prefill_parity`).
-    pub fn create_masks(&self) -> (Option<Tensor>, Option<Tensor>) {
-        (None, None)
+    /// PORT: `_create_masks` (encoder.py L737-791) → `(pad_mask, att_mask)`, both `bool`
+    /// (`u8`) with `1 = IGNORE` — the convention `forward_attention` (mask → `-INF`) and
+    /// the conv `pad_mask` consume. `att_context_size = [left, right]`. On the offline
+    /// single clip (`[-1,-1]`, full `padding_length`, no `offset`) both come back
+    /// all-zero, i.e. the `None` the offline `forward` passes; the limited/chunked-
+    /// context logic is the streaming path. Delegates to [`Self::build_masks`] with the
+    /// encoder's `self_attention_model` / `att_context_style`.
+    pub fn create_masks(
+        &self,
+        att_context_size: [i64; 2],
+        padding_length: &Tensor,
+        max_audio_length: usize,
+        offset: Option<&Tensor>,
+        device: &Device,
+    ) -> Result<(Tensor, Option<Tensor>)> {
+        Self::build_masks(
+            &self.self_attention_model,
+            &self.att_context_style,
+            att_context_size,
+            padding_length,
+            max_audio_length,
+            offset,
+            device,
+        )
+    }
+
+    /// The `_create_masks` body, factored out of `self` so the mask logic is testable
+    /// with arbitrary `self_attention_model` / `att_context_style` (the model is fixed
+    /// `rel_pos`/`regular`). Boolean grids are tiny and built once, so explicit loops —
+    /// not strided tensor ops — keep the `triu`/`tril`/chunk math 1:1 with torch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_masks(
+        self_attention_model: &str,
+        att_context_style: &str,
+        att_context_size: [i64; 2],
+        padding_length: &Tensor,
+        max_audio_length: usize,
+        offset: Option<&Tensor>,
+        device: &Device,
+    ) -> Result<(Tensor, Option<Tensor>)> {
+        let m = max_audio_length;
+        let (left, right) = (att_context_size[0], att_context_size[1]);
+
+        // att_mask grid (m,m), 1 = VISIBLE so far. `None` for rel_pos_local_attn.
+        let att_visible: Option<Vec<u8>> = if self_attention_model != "rel_pos_local_attn" {
+            let mut a = vec![1u8; m * m];
+            for r in 0..m {
+                for c in 0..m {
+                    let d = c as i64 - r as i64; // col - row
+                    let mut vis = true;
+                    if att_context_style == "regular" {
+                        // triu(diagonal=-left): keep d >= -left; tril(diagonal=right): keep d <= right.
+                        if left >= 0 && d < -left {
+                            vis = false;
+                        }
+                        if right >= 0 && d > right {
+                            vis = false;
+                        }
+                    } else if att_context_style == "chunked_limited" {
+                        if right == -1 {
+                            if left >= 0 && d < -left {
+                                vis = false;
+                            }
+                        } else {
+                            let chunk_size = right + 1;
+                            let left_chunks_num = if left >= 0 { left / chunk_size } else { 10000 };
+                            // diff_chunks = chunk_idx[row] - chunk_idx[col]; keep 0 <= diff <= left_chunks_num.
+                            let dc = (r as i64) / chunk_size - (c as i64) / chunk_size;
+                            if !(dc >= 0 && dc <= left_chunks_num) {
+                                vis = false;
+                            }
+                        }
+                    }
+                    if !vis {
+                        a[r * m + c] = 0;
+                    }
+                }
+            }
+            Some(a)
+        } else {
+            None
+        };
+
+        // pad_valid (b,m), 1 = VALID: arange(m) < padding_length [and >= offset].
+        let plen = padding_length.to_dtype(DType::I64)?.to_vec1::<i64>()?;
+        let b = plen.len();
+        let off = match offset {
+            Some(o) => Some(o.to_dtype(DType::I64)?.to_vec1::<i64>()?),
+            None => None,
+        };
+        let mut pad_valid = vec![0u8; b * m];
+        for (bi, &len) in plen.iter().enumerate() {
+            for ti in 0..m {
+                let mut v = (ti as i64) < len;
+                if let Some(o) = &off {
+                    v = v && (ti as i64) >= o[bi];
+                }
+                pad_valid[bi * m + ti] = v as u8;
+            }
+        }
+
+        // att_mask = ~(pad_for_att & att_visible), 1 = IGNORE. pad_for_att[b,r,c] =
+        // pad_valid[b,r] & pad_valid[b,c] (pad_mask AND its transpose).
+        let att_mask = match &att_visible {
+            Some(av) => {
+                let mut ig = vec![0u8; b * m * m];
+                for bi in 0..b {
+                    for r in 0..m {
+                        let pr = pad_valid[bi * m + r];
+                        for c in 0..m {
+                            let combined = pr & pad_valid[bi * m + c] & av[r * m + c];
+                            ig[bi * m * m + r * m + c] = 1 - combined;
+                        }
+                    }
+                }
+                Some(Tensor::from_vec(ig, (b, m, m), device)?)
+            }
+            None => None,
+        };
+
+        // pad_mask = ~pad_valid, 1 = IGNORE.
+        let pad_ignore: Vec<u8> = pad_valid.iter().map(|&v| 1 - v).collect();
+        let pad_mask = Tensor::from_vec(pad_ignore, (b, m), device)?;
+        Ok((pad_mask, att_mask))
     }
 
     /// PORT: `update_max_seq_length` (encoder.py L704-722). Grow `max_audio_length`

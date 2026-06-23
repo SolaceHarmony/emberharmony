@@ -126,6 +126,47 @@ fn rel_pos_attention_sdpa_parity() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Detector for `_create_masks` (the limited/chunked-context attention masks). The
+/// offline path uses unlimited context (all-zero masks ⇒ `None`), so the `triu`/`tril`
+/// band + `chunked_limited` logic is otherwise unexercised. Golden runs the REAL
+/// upstream method (extracted via `ast`) for several configs — `parity/dump_create_masks.py`.
+#[test]
+#[ignore = "needs parity/golden/create_masks_refs.safetensors (run dump_create_masks.py)"]
+fn create_masks_parity() -> anyhow::Result<()> {
+    use liquid_audio::model::conformer::encoder::ConformerEncoder;
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let device = Device::Cpu;
+    let g = candle_core::safetensors::load(manifest.join("parity/golden/create_masks_refs.safetensors"), &device)?;
+    let plen = g.get("padding_length").expect("padding_length").clone();
+    let off = g.get("offset").expect("offset").clone();
+    let m = 8usize;
+
+    // Mirrors dump_create_masks.py exactly (name, self_attention_model, style, [left,right], use_offset).
+    let cases: [(&str, &str, &str, [i64; 2], bool); 6] = [
+        ("regular_unlimited", "rel_pos", "regular", [-1, -1], false),
+        ("regular_band11", "rel_pos", "regular", [1, 1], false),
+        ("regular_left2", "rel_pos", "regular", [2, -1], false),
+        ("chunked_c4", "rel_pos", "chunked_limited", [4, 3], false),
+        ("chunked_rightunlim", "rel_pos", "chunked_limited", [2, -1], false),
+        ("regular_band11_offset", "rel_pos", "regular", [1, 1], true),
+    ];
+    let diff = |a: &Tensor, b: &Tensor| -> anyhow::Result<i64> {
+        Ok((a.to_dtype(DType::I64)? - b.to_dtype(DType::I64)?)?.abs()?.sum_all()?.to_scalar::<i64>()?)
+    };
+    for (name, sam, style, acs, use_off) in cases {
+        let offset = if use_off { Some(&off) } else { None };
+        let (pad_mask, att_mask) = ConformerEncoder::build_masks(sam, style, acs, &plen, m, offset, &device)?;
+        let want_pm = g.get(&format!("{name}.pad_mask")).expect("pad_mask");
+        assert_eq!(diff(&pad_mask, want_pm)?, 0, "{name} pad_mask mismatch vs Python");
+        let want_am = g.get(&format!("{name}.att_mask")).expect("att_mask");
+        let am = att_mask.expect("att_mask present");
+        assert_eq!(am.dims(), want_am.dims(), "{name} att_mask shape");
+        assert_eq!(diff(&am, want_am)?, 0, "{name} att_mask mismatch vs Python");
+        println!("{name}: pad+att masks bit-exact vs upstream _create_masks");
+    }
+    Ok(())
+}
+
 /// Detector for the base (abs_pos) `MultiHeadAttention.forward`. The encoder uses the
 /// rel-pos subclass, so this standard scaled-dot-product path is otherwise unexercised;
 /// it is the attention the `abs_pos` `ConformerLayer` variant dispatches to. Golden:
