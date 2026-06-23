@@ -80,22 +80,71 @@ impl DataIter for VecDataIter {
 
 /// `DataIter` over the crate's own [`LFM2DataLoader`](crate::data::dataloader::LFM2DataLoader),
 /// batching consecutive rows through [`lfm2_collator`](crate::data::dataloader::lfm2_collator) —
-/// the faithful realization of `DataLoader(train_data, batch_size=…,
+/// the faithful realization of `DataLoader(train_data, batch_size=…, shuffle=…,
 /// collate_fn=lfm2_collator)`. It **owns** the loader (Python's `DataLoader` owns
-/// its dataset reference), so the trainer can store it on `self`. `shuffle` /
-/// `num_workers` / `pin_memory` / `prefetch_factor` are `DataLoader` kwargs whose
-/// only effect is iteration order/throughput, not the batches' values.
+/// its dataset reference), so the trainer can store it on `self`.
+///
+/// `shuffle` reorders the rows at each epoch ([`Self::new_shuffled`], the Python
+/// `DataLoader(train_data, shuffle=True)`); [`Self::new`] keeps the dataset order
+/// (`shuffle=False`, e.g. validation). torch's shuffle draws from the global RNG, so
+/// a different PRNG can never reproduce its exact permutation — a fixed `seed` here
+/// is just as faithful (a fresh epoch-varying permutation) and is reproducible/
+/// testable. `num_workers` / `pin_memory` / `prefetch_factor` are `DataLoader` kwargs
+/// whose only effect is throughput, not the batches' values.
 pub struct LoaderDataIter {
     loader: crate::data::dataloader::LFM2DataLoader,
     batch_size: usize,
     order: Vec<usize>,
     pos: usize,
+    /// `DataLoader(shuffle=…)`: when true, [`Self::reset`] re-permutes `order`.
+    shuffle: bool,
+    /// splitmix64 state, advanced each shuffle so consecutive epochs differ.
+    seed: u64,
 }
 
 impl LoaderDataIter {
+    /// `DataLoader(dataset, batch_size, shuffle=False)` — dataset order preserved
+    /// (validation, or any deterministic pass).
     pub fn new(loader: crate::data::dataloader::LFM2DataLoader, batch_size: usize) -> Self {
+        Self::with_shuffle(loader, batch_size, false, 0)
+    }
+
+    /// `DataLoader(dataset, batch_size, shuffle=True)` — rows re-permuted each epoch
+    /// (training). `seed` makes the run reproducible.
+    pub fn new_shuffled(loader: crate::data::dataloader::LFM2DataLoader, batch_size: usize, seed: u64) -> Self {
+        Self::with_shuffle(loader, batch_size, true, seed)
+    }
+
+    fn with_shuffle(loader: crate::data::dataloader::LFM2DataLoader, batch_size: usize, shuffle: bool, seed: u64) -> Self {
         let order = (0..loader.len()).collect();
-        Self { loader, batch_size: batch_size.max(1), order, pos: 0 }
+        // Order is left as 0..len here; `reset()` — called once per epoch including
+        // the first (`iter(train_loader)`) — applies the shuffle, matching torch's
+        // "re-permute on every `iter()`".
+        Self { loader, batch_size: batch_size.max(1), order, pos: 0, shuffle, seed }
+    }
+
+    /// In-place Fisher–Yates over `order` (no `rand` dependency), advancing `seed` so
+    /// the next epoch draws a different permutation. See [`splitmix_shuffle`].
+    fn shuffle_order(&mut self) {
+        splitmix_shuffle(&mut self.order, &mut self.seed);
+    }
+}
+
+/// In-place Fisher–Yates shuffle driven by a self-contained splitmix64 PRNG. `seed`
+/// is advanced as it draws, so calling it again (next epoch) yields a different — but
+/// reproducible — permutation. Pulled out of [`LoaderDataIter`] so it is unit-testable
+/// without a dataset.
+fn splitmix_shuffle(order: &mut [usize], seed: &mut u64) {
+    let mut next = || {
+        *seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *seed;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    };
+    for i in (1..order.len()).rev() {
+        let j = (next() % (i as u64 + 1)) as usize;
+        order.swap(i, j);
     }
 }
 
@@ -114,6 +163,10 @@ impl DataIter for LoaderDataIter {
     }
     fn reset(&mut self) {
         self.pos = 0;
+        // `iter(loader)` re-permutes when shuffle=True (Python shuffles every epoch).
+        if self.shuffle {
+            self.shuffle_order();
+        }
     }
 }
 
@@ -489,6 +542,32 @@ mod tests {
         let lr_end = t.lr_at(1000);
         assert!(lr_end < lr_mid && lr_mid < lr_warm_end, "cosine must decay: {lr_warm_end} > {lr_mid} > {lr_end}");
         assert!((lr_end - 3e-5 * 0.1).abs() < 1e-7, "cosine floor = lr*min_ratio, got {lr_end}");
+    }
+
+    #[test]
+    fn shuffle_is_permutation_epoch_varying_reproducible() {
+        // Each epoch's shuffle must be a valid permutation (no lost/dup rows),
+        // consecutive epochs must differ (real shuffling, not a fixed order), and the
+        // same seed must reproduce the same sequence (deterministic / testable).
+        let run = |seed: u64| -> (Vec<usize>, Vec<usize>) {
+            let mut s = seed;
+            let mut e0: Vec<usize> = (0..64).collect();
+            splitmix_shuffle(&mut e0, &mut s);
+            let mut e1: Vec<usize> = (0..64).collect();
+            splitmix_shuffle(&mut e1, &mut s); // seed advanced ⇒ different epoch
+            (e0, e1)
+        };
+        let (e0, e1) = run(0xC0FFEE);
+        let mut sorted = e0.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, (0..64).collect::<Vec<_>>(), "epoch 0 is not a permutation");
+        let mut sorted1 = e1.clone();
+        sorted1.sort_unstable();
+        assert_eq!(sorted1, (0..64).collect::<Vec<_>>(), "epoch 1 is not a permutation");
+        assert_ne!(e0, (0..64).collect::<Vec<_>>(), "epoch 0 left rows unshuffled");
+        assert_ne!(e0, e1, "consecutive epochs produced the same order");
+        // Reproducible: same seed ⇒ identical (e0, e1).
+        assert_eq!(run(0xC0FFEE), (e0, e1), "shuffle is not reproducible for a fixed seed");
     }
 
     // A minimal Trainer shell carrying only the schedule config, for `lr_at` unit
