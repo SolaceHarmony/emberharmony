@@ -291,7 +291,7 @@ impl FilterbankFeatures {
         mel = (mel + guard)?.log()?;
         // per-feature normalization (ddof=1) over the valid frames only, applied
         // to all frames — faithful to normalize_batch's valid_mask.
-        let mut mel = normalize_batch(&mel, seq_len)?;
+        let mut mel = normalize_batch(&mel, seq_len, &NormalizeType::PerFeature)?;
         // mask the trailing pad frame(s) [seq_len, t) to pad_value (0).
         if seq_len < t {
             let valid = mel.narrow(1, 0, seq_len)?;
@@ -328,20 +328,56 @@ impl FilterbankFeatures {
 /// the variance is finite), so we avoid the `0/0` outright — `valid <= 1` ⇒ the
 /// masked std is 0 — rather than relying on NaN propagation through `sqrt`.
 ///
-/// Other `normalize_type` branches (`"all_features"`, `"fixed_mean"/"fixed_std"`,
-/// none) are unreachable on the checkpoint config (`normalize="per_feature"`).
-fn normalize_batch(x: &Tensor, valid: usize) -> Result<Tensor> {
-    let xv = x.narrow(1, 0, valid)?;
-    let mean = xv.mean_keepdim(1)?;
-    // ddof=1 std over the valid frames. valid<=1 ⇒ the Python NaN-masked std is 0,
-    // so std collapses to CONSTANT (no 0/0 NaN reaches the divide).
-    let std_pre = if valid > 1 {
-        (xv.broadcast_sub(&mean)?.sqr()?.sum_keepdim(1)? / (valid as f64 - 1.0))?.sqrt()?
-    } else {
-        mean.zeros_like()? // (nfilt, 1) — the NaN-masked-to-0 std
-    };
-    let std = (std_pre + CONSTANT)?;
-    x.broadcast_sub(&mean)?.broadcast_div(&std)
+/// All `normalize_type` branches are translated (single-clip form): `per_feature`
+/// (the checkpoint config), `all_features`, `fixed_mean`/`fixed_std`, and the
+/// pass-through `none`.
+#[derive(Debug, Clone)]
+pub enum NormalizeType {
+    /// `"per_feature"` — per-mel-bin mean/std over valid time.
+    PerFeature,
+    /// `"all_features"` — a single mean/std over the whole valid clip (all bins×time).
+    AllFeatures,
+    /// `{"fixed_mean": …, "fixed_std": …}` — per-feature fixed stats (len == nfilt).
+    Fixed { mean: Vec<f32>, std: Vec<f32> },
+    /// any other `normalize_type` — identity (Python's `else: return x`).
+    None,
+}
+
+fn normalize_batch(x: &Tensor, valid: usize, kind: &NormalizeType) -> Result<Tensor> {
+    match kind {
+        NormalizeType::PerFeature => {
+            let xv = x.narrow(1, 0, valid)?;
+            let mean = xv.mean_keepdim(1)?;
+            // ddof=1 std over the valid frames. valid<=1 ⇒ the Python NaN-masked std
+            // is 0, so std collapses to CONSTANT (no 0/0 NaN reaches the divide).
+            let std_pre = if valid > 1 {
+                (xv.broadcast_sub(&mean)?.sqr()?.sum_keepdim(1)? / (valid as f64 - 1.0))?.sqrt()?
+            } else {
+                mean.zeros_like()? // (nfilt, 1) — the NaN-masked-to-0 std
+            };
+            let std = (std_pre + CONSTANT)?;
+            x.broadcast_sub(&mean)?.broadcast_div(&std)
+        }
+        NormalizeType::AllFeatures => {
+            // Python: x_mean[i] = x[i,:,:len].mean(); x_std[i] = x[i,:,:len].std()
+            // (one scalar per clip over ALL bins × valid time); x_std += CONSTANT.
+            // ddof=1; Python does NOT NaN-mask this branch, so we mirror that.
+            let xv = x.narrow(1, 0, valid)?; // (nfilt, valid)
+            let n = (xv.dim(0)? * valid) as f64;
+            let mean = xv.mean_all()?; // scalar
+            let var = (xv.broadcast_sub(&mean)?.sqr()?.sum_all()? / (n - 1.0))?;
+            let std = (var.sqrt()? + CONSTANT)?;
+            x.broadcast_sub(&mean)?.broadcast_div(&std)
+        }
+        NormalizeType::Fixed { mean, std } => {
+            // Python: (x - fixed_mean[:,None]) / fixed_std[:,None], per feature.
+            let nfilt = x.dim(0)?;
+            let mean = Tensor::from_vec(mean.clone(), (nfilt, 1), x.device())?.to_dtype(x.dtype())?;
+            let std = Tensor::from_vec(std.clone(), (nfilt, 1), x.device())?.to_dtype(x.dtype())?;
+            x.broadcast_sub(&mean)?.broadcast_div(&std)
+        }
+        NormalizeType::None => Ok(x.clone()),
+    }
 }
 
 impl FilterbankFeatures {
@@ -528,7 +564,7 @@ mod tests {
             &dev,
         )
         .unwrap();
-        let got = normalize_batch(&x, 1).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let got = normalize_batch(&x, 1, &NormalizeType::PerFeature).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
         // From: python -c "normalize_batch(x[None], tensor([1]), 'per_feature')"
         let want = [
             0.0f32, 400000.0, -300000.0, 0.0, 850000.0, -50000.0, 0.0, 500000.0, 700000.0, 0.0, 600000.0, -200000.0,
@@ -545,7 +581,47 @@ mod tests {
         // valid>=2 keeps the ddof=1 path (regression guard for the one-frame branch).
         let dev = Device::Cpu;
         let x = Tensor::from_vec(vec![1.0f32, 3.0, 2.0, 4.0], (2, 2), &dev).unwrap();
-        let out = normalize_batch(&x, 2).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let out = normalize_batch(&x, 2, &NormalizeType::PerFeature).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
         assert!(out.iter().all(|v| v.is_finite()));
+    }
+
+    // The newly-translated normalize branches, each vs actual Python output.
+    fn x43() -> Tensor {
+        Tensor::from_vec(
+            vec![1.0f32, 5.0, -2.0, 0.5, 9.0, 0.0, -3.0, 2.0, 4.0, 1.0, 7.0, -1.0],
+            (4, 3),
+            &Device::Cpu,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn normalize_all_features_matches_python() {
+        let got = normalize_batch(&x43(), 3, &NormalizeType::AllFeatures).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        // normalize_batch(x[None], tensor([3]), "all_features")
+        let want = [
+            -0.26375f32, 0.8371, -1.08938, -0.40135, 1.93795, -0.53896, -1.3646, 0.01147, 0.56189, -0.26375, 1.38753,
+            -0.81417,
+        ];
+        for (g, w) in got.iter().zip(want.iter()) {
+            assert!((g - w).abs() < 1e-4, "all_features vs Python: got {got:?} want {want:?}");
+        }
+    }
+
+    #[test]
+    fn normalize_fixed_matches_python() {
+        let kind = NormalizeType::Fixed { mean: vec![0.0, 1.0, 2.0, 3.0], std: vec![1.0, 2.0, 4.0, 0.5] };
+        let got = normalize_batch(&x43(), 3, &kind).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        // normalize_batch(x[None], tensor([3]), {"fixed_mean":[0,1,2,3],"fixed_std":[1,2,4,.5]})
+        let want = [1.0f32, 5.0, -2.0, -0.25, 4.0, -0.5, -1.25, 0.0, 0.5, -4.0, 8.0, -8.0];
+        for (g, w) in got.iter().zip(want.iter()) {
+            assert!((g - w).abs() < 1e-4, "fixed vs Python: got {got:?} want {want:?}");
+        }
+    }
+
+    #[test]
+    fn normalize_none_is_identity() {
+        let got = normalize_batch(&x43(), 3, &NormalizeType::None).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(got, x43().flatten_all().unwrap().to_vec1::<f32>().unwrap());
     }
 }
