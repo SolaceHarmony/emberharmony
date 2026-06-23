@@ -35,9 +35,13 @@ from pathlib import Path
 CSV_COLUMNS = [
     "python_file", "python_symbol", "py_args", "py_ret",
     "rust_file", "rust_symbol", "rust_args", "rust_ret",
-    "struct_flag", "hand_audit", "deviation", "commit", "notes",
+    "struct_flag", "hand_audit", "deviation", "commit", "py_parity", "notes",
 ]
-HUMAN_COLUMNS = ("hand_audit", "deviation", "commit", "notes")
+# `py_parity`: the Python-COMPARISON test (golden) that pins this function's output
+# to Python, with its rel-err — the only verification that actually detects a
+# divergence (vs a Rust-internal regression lock). Empty = no direct Python golden
+# (off-path, no-op, infra, or covered only by a contract/lock test).
+HUMAN_COLUMNS = ("hand_audit", "deviation", "commit", "py_parity", "notes")
 
 
 def load_existing_human(path: Path) -> dict[tuple[str, str], dict]:
