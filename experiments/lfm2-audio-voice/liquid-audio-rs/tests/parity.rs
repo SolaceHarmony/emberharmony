@@ -174,6 +174,85 @@ fn prefill_parity() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Batched (B>1) self-consistency for `prefill_inputs` / `logits`.
+///
+/// A B=2 batch of two IDENTICAL samples must yield prefill/logits equal to the
+/// B=1 result duplicated. This verifies the batched scatter/index paths WITHOUT a
+/// Python reference: any model staleness cancels because both sides share weights.
+/// Batch shapes mirror `lfm2_collator` (text/audio_in/audio_out cat dim=1;
+/// modality/supervision cat dim=0).
+#[test]
+#[ignore = "needs LFM_MODEL_DIR + parity/golden/prefill_refs.safetensors"]
+fn batched_prefill_logits_self_consistency() -> anyhow::Result<()> {
+    use liquid_audio::model::lfm2_audio::LFM2AudioModelInput;
+    let dir = std::env::var("LFM_MODEL_DIR").expect("set LFM_MODEL_DIR");
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let device = Device::Cpu;
+    let r = candle_core::safetensors::load(manifest.join("parity/golden/prefill_refs.safetensors"), &device)?;
+    let (model, _proc) = liquid_audio::from_pretrained(Path::new(&dir), DType::F32, &device)?;
+
+    let text = r.get("text").unwrap().to_dtype(DType::I64)?; // (1, n)
+    let audio_in = r.get("audio_in").unwrap().to_dtype(DType::F32)?; // (128, f)
+    let audio_in_lens = r.get("audio_in_lens").unwrap().to_dtype(DType::I64)?; // (s,)
+    let audio_out = r.get("audio_out").unwrap().to_dtype(DType::I64)?; // (C, a)
+    let modality = r.get("modality_flag").unwrap().to_dtype(DType::I64)?; // (1, L)
+    let l = modality.dim(1)?;
+    let sup = Tensor::ones((1, l), DType::U8, &device)?; // supervise all positions
+
+    let b1 = LFM2AudioModelInput {
+        text: text.clone(),
+        audio_in: audio_in.clone(),
+        audio_in_lens: audio_in_lens.clone(),
+        audio_out: audio_out.clone(),
+        modality_flag: modality.clone(),
+        supervision_mask: sup.clone(),
+    };
+    let b2 = LFM2AudioModelInput {
+        text: Tensor::cat(&[&text, &text], 1)?,
+        audio_in: Tensor::cat(&[&audio_in, &audio_in], 1)?,
+        audio_in_lens: Tensor::cat(&[&audio_in_lens, &audio_in_lens], 0)?,
+        audio_out: Tensor::cat(&[&audio_out, &audio_out], 1)?,
+        modality_flag: Tensor::cat(&[&modality, &modality], 0)?,
+        supervision_mask: Tensor::cat(&[&sup, &sup], 0)?,
+    };
+
+    // prefill: (2,L,D); both rows equal the (1,L,D) result.
+    let p1 = model.prefill_inputs(&b1.text, &b1.audio_in, &b1.audio_in_lens, &b1.audio_out, &b1.modality_flag)?;
+    let p2 = model.prefill_inputs(&b2.text, &b2.audio_in, &b2.audio_in_lens, &b2.audio_out, &b2.modality_flag)?;
+    assert_eq!(p2.dims(), [2, l, p1.dim(2)?], "batched prefill shape");
+    let (e0, e1) = (rel_err(&p2.i(0)?, &p1.i(0)?), rel_err(&p2.i(1)?, &p1.i(0)?));
+    println!("batched prefill rel-err row0 {e0:.3e} row1 {e1:.3e}  dims {:?}", p2.dims());
+    assert!(e0 < 1e-5 && e1 < 1e-5, "batched prefill not row-consistent: {e0} {e1}");
+
+    // logits: B=2 == B=1 duplicated along dim 0.
+    let (tl1, al1, ttok1, atok1) = model.logits(&b1)?;
+    let (tl2, al2, ttok2, atok2) = model.logits(&b2)?;
+    let dup = |t: &Tensor| -> anyhow::Result<Tensor> { Ok(Tensor::cat(&[t, t], 0)?) };
+    println!(
+        "batched logits dims  text {:?}->{:?}  audio {:?}->{:?}",
+        tl1.dims(),
+        tl2.dims(),
+        al1.dims(),
+        al2.dims()
+    );
+    // B=2 row count must be exactly 2× B=1, and the values must match the duplication.
+    // (rel_err reduces, so it is undefined on a 0-row tensor — guard it.)
+    let check = |name: &str, x1: &Tensor, x2: &Tensor| -> anyhow::Result<()> {
+        assert_eq!(x2.dim(0)?, 2 * x1.dim(0)?, "{name}: B=2 rows != 2× B=1");
+        if x1.dim(0)? > 0 {
+            let e = rel_err(x2, &Tensor::cat(&[x1, x1], 0)?);
+            println!("  {name} rel-err {e:.3e}");
+            assert!(e < 1e-5, "{name} mismatch: {e}");
+        }
+        Ok(())
+    };
+    check("text_logits", &tl1, &tl2)?;
+    check("audio_logits", &al1, &al2)?;
+    assert_eq!(ttok2.to_vec1::<i64>()?, dup(&ttok1)?.to_vec1::<i64>()?, "batched text labels");
+    assert_eq!(atok2.to_vec1::<u32>()?, dup(&atok1)?.to_vec1::<u32>()?, "batched audio labels");
+    Ok(())
+}
+
 #[test]
 #[ignore = "needs LFM_MODEL_DIR + parity/golden/depthformer_refs.safetensors"]
 fn depthformer_parity() -> anyhow::Result<()> {

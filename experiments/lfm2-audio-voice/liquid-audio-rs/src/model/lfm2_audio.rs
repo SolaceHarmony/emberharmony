@@ -427,35 +427,44 @@ impl LFM2AudioModel {
         let dev = batch.text.device();
         let in_emb =
             self.prefill_inputs(&batch.text, &batch.audio_in, &batch.audio_in_lens, &batch.audio_out, &batch.modality_flag)?;
-        let out_emb = self.backbone_forward_embeds(&in_emb)?; // (1, L, D)
-        let l = out_emb.dim(1)?;
-        let out_emb_shifted = out_emb.i(0)?.narrow(0, 0, l - 1)?.contiguous()?; // (L-1, D)
+        let out_emb = self.backbone_forward_embeds(&in_emb)?; // (B, L, D)
+        let (b, ll, d) = out_emb.dims3()?;
+        // out_emb_shifted = out_emb[:, :-1] flattened to (B*(L-1), D): the Python
+        // selects supervised rows with a 2-D boolean mask over the whole batch, so
+        // the per-row shift drops each row's last step. For inference (B=1) this is
+        // out_emb.i(0)[..L-1] as before.
+        let out_emb_shifted = out_emb.narrow(1, 0, ll - 1)?.reshape((b * (ll - 1), d))?.contiguous()?; // (B*(L-1), D)
 
         // Read ids as i64 (torch.long) regardless of the input's int dtype — the
-        // dataloader feeds I64, ChatState feeds U32; the cast handles both.
-        let modality: Vec<i64> = batch.modality_flag.i(0)?.to_dtype(DType::I64)?.to_vec1::<i64>()?;
-        let sup: Vec<u8> = batch.supervision_mask.i(0)?.to_dtype(DType::U8)?.to_vec1::<u8>()?;
+        // dataloader feeds I64, ChatState feeds U32; the cast handles both. Read the
+        // FULL (B, L) modality/supervision, not row 0: the Python builds 2-D masks
+        // over the whole batch. For inference (B=1) this is identical to row 0.
+        let modality: Vec<Vec<i64>> = batch.modality_flag.to_dtype(DType::I64)?.to_vec2::<i64>()?;
+        let sup: Vec<Vec<u8>> = batch.supervision_mask.to_dtype(DType::U8)?.to_vec2::<u8>()?;
         let (text_id, audio_id) = (LFMModality::Text as i64, LFMModality::AudioOut as i64);
 
-        // Supervised, non-first text / audio-out positions: row index into
-        // out_emb_shifted (= p-1) + label index within the per-modality token
-        // tensor (text is (1,n_text); audio_out is (C, n_ao)).
+        // Supervised, non-first text / audio-out positions. Row index into the
+        // flattened out_emb_shifted = bi*(L-1) + (p-1) (per-row shift `out_emb[:, :-1]`
+        // paired with `mask[:, 1:]`); label index is the GLOBAL row-major counter into
+        // the flat text (1,n_text) / audio_out (C, n_ao) token tensors.
         let (mut text_rows, mut text_lbl) = (Vec::<u32>::new(), Vec::<u32>::new());
         let (mut audio_rows, mut audio_lbl) = (Vec::<u32>::new(), Vec::<u32>::new());
         let (mut ti, mut ai) = (0u32, 0u32);
-        for p in 0..l {
-            if modality[p] == text_id {
-                if p >= 1 && sup[p] != 0 {
-                    text_rows.push((p - 1) as u32);
-                    text_lbl.push(ti);
+        for bi in 0..b {
+            for p in 0..ll {
+                if modality[bi][p] == text_id {
+                    if p >= 1 && sup[bi][p] != 0 {
+                        text_rows.push((bi * (ll - 1) + (p - 1)) as u32);
+                        text_lbl.push(ti);
+                    }
+                    ti += 1;
+                } else if modality[bi][p] == audio_id {
+                    if p >= 1 && sup[bi][p] != 0 {
+                        audio_rows.push((bi * (ll - 1) + (p - 1)) as u32);
+                        audio_lbl.push(ai);
+                    }
+                    ai += 1;
                 }
-                ti += 1;
-            } else if modality[p] == audio_id {
-                if p >= 1 && sup[p] != 0 {
-                    audio_rows.push((p - 1) as u32);
-                    audio_lbl.push(ai);
-                }
-                ai += 1;
             }
         }
 
@@ -634,8 +643,14 @@ impl LFM2AudioModel {
         // Read ids as i64 (torch.long) regardless of input int dtype (I64 from the
         // dataloader, U32 from ChatState). NB: reading an I64 tensor as u32 here would
         // silently return an empty `lens` (`unwrap_or_default`) and drop audio-in.
-        let modality: Vec<i64> = modality_flag.i(0)?.to_dtype(DType::I64)?.to_vec1::<i64>()?;
-        let l = modality.len();
+        //
+        // Read the FULL (B, L) modality_flag, not row 0: the Python `_prefill` uses 2-D
+        // boolean masks over the whole batch (`in_emb[modality==TEXT] = text_emb`), so
+        // the flat text/audio embeddings scatter across all batch rows in row-major
+        // order. For inference (B=1) this is identical to row 0.
+        let (b, ll) = modality_flag.dims2()?;
+        let modality: Vec<i64> = modality_flag.to_dtype(DType::I64)?.flatten_all()?.to_vec1::<i64>()?;
+        let l = modality.len(); // b*ll
 
         // text embeddings (n_text, D)
         let text_emb = self.lfm.embed(text)?.i(0)?; // (n_text, D)
@@ -723,8 +738,9 @@ impl LFM2AudioModel {
             )));
         }
         let index = Tensor::from_vec(index, (l,), dev)?;
-        let in_emb = combined.index_select(&index, 0)?; // (L, D)
-        in_emb.unsqueeze(0) // (1, L, D)
+        let in_emb = combined.index_select(&index, 0)?; // (B*L, D)
+        let d = in_emb.dim(1)?;
+        in_emb.reshape((b, ll, d)) // (B, L, D) — Python `text_emb.new_empty((B, L, D))`
     }
 
     fn text_logits(&self, h_last: &Tensor) -> Result<Tensor> {
