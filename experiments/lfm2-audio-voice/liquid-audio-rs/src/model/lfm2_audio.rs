@@ -663,7 +663,13 @@ impl LFM2AudioModel {
         let text_emb = self.lfm.embed(text)?.i(0)?; // (n_text, D)
 
         // audio-in embeddings (n_ai, D): encode each segment, adapt, concat.
-        let lens: Vec<i64> = audio_in_lens.to_dtype(DType::I64).and_then(|t| t.to_vec1::<i64>()).unwrap_or_default();
+        // PROPAGATE a malformed-lens error rather than silently dropping ALL audio-in:
+        // the legitimate no-audio / text-only case is a 1-D `(0,)` tensor whose
+        // `to_vec1` is `Ok([])`, so `?` only fires on a genuinely malformed lens
+        // (wrong rank/dtype). The old `unwrap_or_default()` here swallowed those into
+        // an empty `lens`, which would scatter zero audio-in and then trip the count
+        // check below with a confusing message instead of the real cause.
+        let lens: Vec<i64> = audio_in_lens.to_dtype(DType::I64)?.to_vec1::<i64>()?;
         let mut audio_in_rows: Vec<Tensor> = Vec::new();
         let mut frame_cursor = 0usize;
         for &len in &lens {

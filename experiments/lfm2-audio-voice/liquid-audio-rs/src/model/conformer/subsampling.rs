@@ -80,7 +80,15 @@ impl MaskedConvSequential {
 
     /// `forward(x, lengths)` — the general masked path: `(B,T,F)` in, mask applied
     /// before each layer and after each strided layer, returns `(x, out_lengths)`.
-    pub fn forward(&self, x: &Tensor, lengths: &[usize], kernel: i64, stride: i64, pad: (i64, i64)) -> Result<(Tensor, Vec<usize>)> {
+    ///
+    /// Faithful to Python's `MaskedConvSequential.forward`: the length update runs
+    /// only for layers whose `stride != (1,1)`, using **that layer's own** kernel /
+    /// stride / padding. Reading the per-conv `config()` (rather than a uniform
+    /// param) is what keeps the interleaved pointwise (`k=1`, `stride=1`) convs from
+    /// shrinking the length. Time axis is dim 2 of `(B,1,T,F)` ⇒ kernel = `kH`,
+    /// symmetric `pad` ⇒ total `2·pad` (matches Python's `padding[0]+padding[1]` for
+    /// the square padding the model uses).
+    pub fn forward(&self, x: &Tensor, lengths: &[usize]) -> Result<(Tensor, Vec<usize>)> {
         let mut x = x.unsqueeze(1)?; // (B,1,T,F)
         let mut cur: Vec<usize> = lengths.to_vec();
         let mut mask = self.create_mask(&x, &cur)?;
@@ -89,11 +97,16 @@ impl MaskedConvSequential {
             x = match op {
                 Op::Conv(c) => {
                     let out = c.forward(&x)?;
-                    // length update happens for strided convs (stride != 1)
-                    if stride != 1 {
+                    let cfg = c.config();
+                    // Strided conv (stride != 1) shrinks the time axis; pointwise
+                    // (stride 1) leaves it unchanged.
+                    if cfg.stride != 1 {
+                        let kernel = c.weight().dim(2)? as i64; // (out, in, kH, kW) → kH (time)
+                        let pad = cfg.padding as i64;
+                        let (k, s) = (kernel, cfg.stride as i64);
                         cur = cur
                             .iter()
-                            .map(|&l| calculate_conv_output_size(l as i64, kernel, stride, pad).max(0) as usize)
+                            .map(|&l| calculate_conv_output_size(l as i64, k, s, (pad, pad)).max(0) as usize)
                             .collect();
                         mask = self.create_mask(&out, &cur)?;
                     }
@@ -242,5 +255,45 @@ impl ConvSubsampling {
             x.clone()
         };
         conv.forward(&x)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::{DType, Device};
+    use candle_nn::VarMap;
+
+    #[test]
+    fn masked_conv_length_update_is_per_layer() {
+        // A strided conv (k3,s2,pad1) shrinks the time length; an interleaved
+        // pointwise conv (k1,s1,pad0) must NOT. Exercises MaskedConvSequential::forward
+        // (the masked path) and pins the per-conv stride/kernel/pad read.
+        let dev = Device::Cpu;
+        let vm = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
+        let strided = conv2d(
+            1,
+            2,
+            3,
+            Conv2dConfig { padding: 1, stride: 2, dilation: 1, groups: 1, ..Default::default() },
+            vb.pp("s"),
+        )
+        .unwrap();
+        let pointwise = conv2d(
+            2,
+            2,
+            1,
+            Conv2dConfig { padding: 0, stride: 1, dilation: 1, groups: 1, ..Default::default() },
+            vb.pp("p"),
+        )
+        .unwrap();
+        let mcs = MaskedConvSequential::new(vec![Op::Conv(strided), Op::Relu, Op::Conv(pointwise)]);
+
+        let x = Tensor::zeros((1, 10, 4), DType::F32, &dev).unwrap(); // (B, T=10, F=4)
+        let (out, cur) = mcs.forward(&x, &[10]).unwrap();
+        // strided: (10 + 2*1 - 3)/2 + 1 = 5 ; pointwise (stride 1): unchanged.
+        assert_eq!(cur, vec![5], "length must follow the strided conv only");
+        assert_eq!(out.dim(2).unwrap(), 5, "output time dim == updated length");
     }
 }
