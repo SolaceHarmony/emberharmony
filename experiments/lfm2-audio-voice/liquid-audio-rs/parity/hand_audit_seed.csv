@@ -87,6 +87,39 @@ model/conformer/processor.py,FilterbankFeatures.log_zero_guard_value_fn,FAITHFUL
 model/conformer/processor.py,FilterbankFeatures.get_seq_len,FAITHFUL,centered path only,—,pad_amount=(n_fft//2)*2; floor_divide(seq_len+pad_amount-n_fft hop); centered (exact_pad=False) even n_fft -> pad_amount==n_fft -> collapses to floor(seq_len/hop); exact_pad not supported
 model/conformer/processor.py,FilterbankFeatures.filter_banks,FAITHFUL,—,—,&self.fb (property)
 model/conformer/processor.py,normalize_batch,FAITHFUL,per_feature single-clip,—,per_feature: mean=sum(x valid)/count; std=sqrt(sum((x-mean)^2 valid)/(count-1))+CONSTANT(1e-5); ddof=1; valid=leading [0 valid) frames; applied to all frames broadcast; all_features/fixed_mean/none branches not ported (config=per_feature); conformer-through-mel 5.6e-7
+model/transformer.py,SequenceModel.__init__,FAITHFUL,abstract no-op,—,Python @abstractmethod super().__init__() (nn.Module bookkeeping); Rust trait fn new() no-op (where Self:Sized for object safety); concrete models build via own new
+model/transformer.py,SequenceModel.forward,FAITHFUL,trait method,—,abstract [N T dim]->[N T' dim_out]; concrete impls (RawLmBackbone) provide it; Rust forward(x Option<&mut [LayerKvCache]>) = in-place cached path
+model/transformer.py,SequenceModel.forward_cached,FAITHFUL,trait method,—,abstract streaming (out new_cache); cache = Sequence[CacheType] arm modelled Vec<LayerCache>
+model/transformer.py,LayerKVCache.__init__,FAITHFUL,adapter over ConcatKvCache,—,assert cache None or len 2; key/value_cache; Rust LayerKvCache wraps vendored ConcatKvCache(dim=1); from_cache seeds (k v) (append from empty == set)
+model/transformer.py,LayerKVCache.update,FAITHFUL,—,—,None->init else cat([cache k] dim=1) return (key value); Rust inner.append(k v) (cat dim=1)
+model/transformer.py,LayerKVCache.get_cache_size,FAITHFUL,—,—,key_cache.shape[1] or 0 == inner.current_seq_len()
+model/transformer.py,RMSNorm.__init__,FAITHFUL,weight loaded,—,eps + weight (Python ones(dim) init; Rust loads weight from checkpoint)
+model/transformer.py,RMSNorm._norm,FAITHFUL,recip(sqrt)~=rsqrt ~1ULP,—,x*rsqrt(mean(x^2 -1 keepdim)+eps); candle no fused rsqrt -> recip(sqrt(z)) (~1 ULP cross-lib floor PYTHON_VS_RUST §1.4)
+model/transformer.py,RMSNorm.forward,FAITHFUL,—,—,assert cache None; _norm(x.float()) then *weight then type_as(x) (upcast f32 norm + back to input dtype)
+model/transformer.py,RMSNorm.forward_cached,FAITHFUL,—,—,return (self(x) None) (no KV state)
+model/transformer.py,GLU.__init__,FAITHFUL,sizing matches; weights loaded,—,ff=ff_dim or 4*dim; swiglu: ff=2*ff/3 then *ffn_dim_multiplier (int trunc) then multiple_of*div_ceil(ff multiple_of); w1 w3(swiglu) w2 all no_bias; normal init -> loaded
+model/transformer.py,GLU.forward,FAITHFUL,gelu_erf,—,swiglu: w2(silu(w1(x))*w3(x)); else w2(gelu(w1(x))) with gelu_erf (exact erf gelu)
+model/transformer.py,GLU.forward_cached,FAITHFUL,—,—,return (self(x) None) (stateless FF)
+model/transformer.py,BoundedAttention.__init__,FAITHFUL,—,—,assert dim%num_heads==0; num_heads head_dim head_style gqa_dim; qk_layernorm -> q/k RMSNorm(head_dim eps)
+model/transformer.py,BoundedAttention.forward,FAITHFUL,GQA via repeat_kv; f32 SDPA,—,reshape q(num_heads) k/v(kv_heads: mha=num_heads mqa=1 gqa=gqa_dim); qk_layernorm; rotary (upcast f32 rope_i back); cache.update; SDPA in f32 (matmul/scale/causal_mask/softmax/matmul) with repeat_kv GQA repeat == torch enable_gqa; q_len==kv_len -> lower-tri (offset 0) else causal_lower_right(offset=kv_len-q_len) (q_len==1 -> no mask); depthformer parity
+model/transformer.py,MHA.__init__,FAITHFUL,—,—,total_width (mha 3*dim / mqa dim+2*head_dim / gqa dim+2*head_dim*gqa_dim); qkv_proj+out_proj no_bias; BoundedAttention; precompute_freqs_cis(head_dim max_seq_len theta) -> (cos sin)
+model/transformer.py,MHA._validate_cache,FAITHFUL,static type,—,Python TypeGuard isinstance tuple len2 both tensors -> Rust cache.is_some() (Some is statically (Tensor Tensor))
+model/transformer.py,MHA.forward,FAITHFUL,core in-place (inverted),—,Python forward=forward_cached[0]; Rust forward IS the core (qkv_proj->split q/k/v by head_style widths->freqs slice from cache_size->BoundedAttention->out_proj); forward_cached wraps it
+model/transformer.py,MHA.forward_cached,FAITHFUL,always-build cache,—,build LayerKvCache from cache (None-seeded ok); run forward; surface to_cache() (k v); always-build surfaces (k v) even for None-seeded == Python no-update return (byte-identical)
+model/transformer.py,StandardBlock.__init__,FAITHFUL,—,—,operator(Mha)+feed_forward(GLU)+operator_norm+ffn_norm(RMSNorm eps)
+model/transformer.py,StandardBlock.forward,FAITHFUL,—,—,h=operator(operator_norm(x) cache)+x; h_glu=feed_forward(ffn_norm(h)); h+h_glu
+model/transformer.py,StandardBlock.forward_cached,FAITHFUL,—,—,h new=operator.forward_cached(operator_norm(x) cache); h+=x; h_glu=feed_forward(ffn_norm(h)); return (h+h_glu new)
+model/transformer.py,apply_rotary_emb,FAITHFUL,rope_i interleaved,—,Python view_as_complex(rearrange ...(D two)) * freqs_cis -> view_as_real flatten == candle rope_i (interleaved/GPT-J adjacent-pair rotation) with (cos sin) table; upcast f32 then type_as back
+model/transformer.py,reshape_for_broadcast,FAITHFUL,1:1 (rope_i broadcasts internally),—,shape=[d if i==1 or i==ndim-1 else 1]; freqs_cis.view(shape); provided for parity (rope_i does this internally over [b heads t head_dim])
+model/transformer.py,precompute_freqs_cis,FAITHFUL,(cos sin) vs complex,—,inv_freq=1/theta^(arange(0 dim 2)/dim); freqs=outer(t inv_freq); polar(ones freqs) complex -> carried as (cos sin) for rope_i
+model/transformer.py,SharedEmbedding.__init__,FAITHFUL,to_logits loaded not aliased,—,embedding(vocab dim)+embedding_norm(RMSNorm)+to_logits(Linear no bias); Python ties to_logits.weight=embedding.weight when tie_embedding; Rust LOADS to_logits.weight from checkpoint (faithful for tied AND untied — checkpoint always ships both; e.g. depthformer tie=True audio_embedding tie=False)
+model/transformer.py,SharedEmbedding.forward,FAITHFUL,—,—,return self.embed(tokens)
+model/transformer.py,SharedEmbedding.embed,FAITHFUL,—,—,self.embedding(tokens) lookup
+model/transformer.py,SharedEmbedding.get_logits,FAITHFUL,—,—,to_logits(embedding_norm(embeddings))
+model/transformer.py,RawLMBackbone.__init__,FAITHFUL,embedding injected,—,layers(ModuleList); dim=layers[0].dim (assert ==dim_out); SharedEmbedding if has_embedding (Rust caller builds + passes Option; None=has_embedding=False)
+model/transformer.py,RawLMBackbone.forward,FAITHFUL,—,—,cache None->[None]*n; for layer layer_cache: x=layer(x layer_cache); return x; Rust Some(caches)->zip forward(x Some(c)) / None->forward(x None)
+model/transformer.py,RawLMBackbone.forward_cached,FAITHFUL,—,—,cache None->[None]*n (assert len==n_layers); for layer: x new=layer.forward_cached(x layer_cache); cache_out.append; return (x cache_out)
+model/transformer.py,wrap_activation_checkpoint,FAITHFUL,identity (training-only),—,training activation/gradient checkpointing (torch.utils.checkpoint); no autograd/backward on inference path -> identity wrapper
 processor.py,LFM2AudioProcessor.to,FAITHFUL,no-op,—,device-agnostic (device at construction); documented no-op
 processor.py,LFM2AudioProcessor.eval,FAITHFUL,no-op,—,training-mode toggle; inference always eval; documented no-op
 processor.py,LFM2AudioProcessor.train,FAITHFUL,no-op,—,see eval
