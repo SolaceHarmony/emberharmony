@@ -26,6 +26,25 @@ trainer.py,Trainer.train,FAITHFUL,distributed/eval no-ops,—,loop 1:1: next/Sto
 trainer.py,Trainer.train_step,FAITHFUL,zero_grad implicit; scheduler off-by-one,—,batch.to(device)+model.forward (the MODEL's loss)+backward_step; zero_grad implicit (candle builds fresh GradStore per backward); autocast(bf16)=weights at load dtype + loss math f32; set_learning_rate(lr_at(self.step)) BEFORE the in-place step == PyTorch scheduler.step() AFTER optimizer.step() (optimizer step s uses lr_at(s); step 0 = LinearLR floor lr*1e-8)
 trainer.py,Trainer.validate,FAITHFUL,no_grad=lazy grad,—,@torch.no_grad = candle lazy autograd (never call backward); val_loader None->return; loss_sum over val batches via model.forward; mean=sum/count.clamp_min(1) (denom=count.max(1)); reduce(sum)=identity single-process; reset() before iterate == DataLoader fresh iterator each call
 trainer.py,Trainer.log,FAITHFUL,—,—,step>0 && step%logging_interval==0: reduce(loss.detach() mean)=value single-process; lr=optimizer.learning_rate() (== param_groups[0][lr]); print [mm:ss] TRAIN epoch/step/loss/lr
+utils.py,mel2emb_len,FAITHFUL,—,—,-(l // -8) = ceil(l/8) via floordiv helper (Python floor-div rounds toward -inf vs Rust trunc); unit test 9->2 16->2 17->3
+utils.py,emb2mel_len,FAITHFUL,—,—,l*8 (upper bound); unit test 2->16
+utils.py,module_exists,FAITHFUL,importlib->cargo feature,—,Python importlib.util.find_spec(name) -> compile-time cfg!(feature=flash-attn) (only flash_attn is checked); Rust has no runtime module lookup
+utils.py,get_model_dir,FAITHFUL,str/Path unified + @cache dropped,—,existing local dir returned as-is (revision+path -> InvalidInput == Python RuntimeError) else hf-hub snapshot_download returning snapshot root; Python str/Path type-dispatch unified to &str + is_dir(); @cache memo unnecessary (called once at load)
+processor.py,ChatState.__repr__,FAITHFUL,Display impl,—,exact format ChatState(text_tok: {} audio_in: {} audio_out: {}) from .dim(1) == Python .shape[1]
+processor.py,ChatState.device,FAITHFUL,—,—,&self.proc.device (Python @property device -> proc.device)
+processor.py,ChatState.end_turn,FAITHFUL,—,—,add_text("<|im_end|>\n") exact
+processor.py,ChatState.new_turn,FAITHFUL,—,—,add_text("<|im_start|>{role}\n") exact
+model/conformer/modules.py,ConformerLayer.__init__,FAITHFUL,ctor (vb); rel_pos only,—,9 submodules norm_feed_forward1/feed_forward1/norm_self_att/self_attn(RelPositionMHA)/norm_conv/conv/norm_feed_forward2/feed_forward2/norm_out; LayerNorm eps1e-5 (torch default); dropout identity at inference; abs_pos/rel_pos_local_attn branches not ported (model is rel_pos)
+model/conformer/modules.py,ConformerLayer.forward,FAITHFUL,—,—,residual + ff1(norm_ff1)*0.5; + self_attn(norm_self_att q=k=v mask pos_emb); + conv(norm_conv pad_mask); + ff2(norm_ff2)*0.5; norm_out; fc_factor=0.5; dropout identity; conformer_stages parity 5.6e-7
+model/conformer/modules.py,ConformerConvolution.__init__,FAITHFUL,candle conv1d == CausalConv1D offline,—,pointwise_conv1(d_model->2d k1)+depthwise(d_model groups=d_model k padding=(k-1)/2)+BatchNorm1d(eps1e-5)+pointwise_conv2; Rust depthwise is candle conv1d symmetric same-pad == Python CausalConv1D(int padding) with cache=None (offline F.pad symmetric); norm_type=batch_norm; assert (k-1)%2==0
+model/conformer/modules.py,ConformerConvolution.forward,FAITHFUL,—,—,transpose(1 2)->pointwise_conv1->GLU dim1 (a*sigmoid(b))->[pad_mask *= (1-mask) == masked_fill 0]->depthwise->batch_norm.forward_t(false=running stats=eval)->SiLU->pointwise_conv2->transpose; offline cache=None
+model/conformer/modules.py,ConformerConvolution.reset_parameters_conv,FAITHFUL,no-op (loaded weights),—,training uniform re-init of conv weights/bias; port loads pretrained -> correct no-op (re-init would corrupt loaded weights)
+model/conformer/modules.py,ConformerFeedForward.__init__,FAITHFUL,ctor (vb),—,linear1(d_model->d_ff bias)+SiLU+dropout+linear2(d_ff->d_model bias); use_bias=true; activation/dropout folded into forward
+model/conformer/modules.py,ConformerFeedForward.forward,FAITHFUL,—,—,linear1->SiLU->dropout(identity inference)->linear2
+model/conformer/modules.py,ConformerFeedForward.reset_parameters_ff,FAITHFUL,no-op (loaded weights),—,training uniform re-init; port loads pretrained -> correct no-op
+model/conformer/modules.py,CausalConv1D.__init__,FAITHFUL,enum padding,—,CausalPadding enum Causal(left=k-1 right=stride-1)/Symmetric(p p)/Asymmetric(l r l+r==k-1); stride!=1 && p!=k-1 -> error; inner conv padding=0 (manual pad); cold offline ported 1:1 for streaming
+model/conformer/modules.py,CausalConv1D.update_cache,FAITHFUL,—,—,cache None->pad(left right) next None; Some->pad(0 right)+cat([cache new_x]); kept=total-cache_drop_size; next=last clen == Python [: : -cache.size(-1):]
+model/conformer/modules.py,CausalConv1D.forward,FAITHFUL,—,—,update_cache then padding=0 conv; returns (x next_cache)
 processor.py,LFM2AudioProcessor.to,FAITHFUL,no-op,—,device-agnostic (device at construction); documented no-op
 processor.py,LFM2AudioProcessor.eval,FAITHFUL,no-op,—,training-mode toggle; inference always eval; documented no-op
 processor.py,LFM2AudioProcessor.train,FAITHFUL,no-op,—,see eval
