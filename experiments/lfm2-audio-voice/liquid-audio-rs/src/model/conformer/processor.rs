@@ -15,6 +15,13 @@
 //! single-precision reference *and* runs on the GPU. The windowed real→complex DFT is
 //! realized as a `Conv1d` against a precomputed DFT basis (stride = hop), the same
 //! formulation torchaudio uses for its GPU spectrogram.
+//!
+//! Reuse checked (no candle primitive fits): candle-transformers' Whisper/Voxtral mel
+//! is a different convention — power spectrum, *precomputed* filters passed in, log10 +
+//! Whisper normalization, no preemphasis — and its `fft`/`dft`/`log_mel_spectrogram_w`
+//! helpers are module-private (only `pcm_to_mel` is `pub`). candle has no Hann window,
+//! slaney mel-filterbank, or STFT builtin. So this NeMo chain (slaney-computed filters,
+//! preemphasis, `mag_power`, `log(x+guard)`, per-feature norm) is necessarily local.
 //! Training-only bits (dither, nb-augmentation, frame splicing) are skipped.
 
 use candle_core::{Device, DType, Result, Tensor};

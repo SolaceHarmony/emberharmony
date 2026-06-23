@@ -201,6 +201,12 @@ impl Glu {
 /// Precompute rotary `(cos, sin)` of shape `[end, dim/2]`. Faithful to
 /// `precompute_freqs_cis` (`polar(1, outer(t, inv_freq))`), but returned as the
 /// real `cos`/`sin` candle's `rope_i` consumes.
+///
+/// Reuse checked: candle-nn's `rotary_emb` exposes the rope *application*
+/// (`rope`/`rope_slow`/`rope_i`/`rope_i_slow` — all reused) but no cos/sin *table*
+/// builder; the table is model-specific (theta, interleaving) and moshi's
+/// `RotaryEmbedding` bakes its own convention, so this small builder stays local
+/// (backbone parity 6.3e-6 confirms the table matches HF Lfm2).
 pub fn precompute_freqs_cis(dim: usize, end: usize, theta: f64, device: &Device) -> Result<(Tensor, Tensor)> {
     let half = dim / 2;
     let inv_freq: Vec<f32> = (0..half).map(|i| (1.0 / theta.powf(2.0 * i as f64 / dim as f64)) as f32).collect();
