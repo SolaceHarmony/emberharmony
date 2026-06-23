@@ -6,12 +6,17 @@
 //! attention/pad masks are identity, so they are passed as `None`. Streaming,
 //! cache, stochastic depth, reduction, and export paths are not ported.
 
-use candle_core::{Result, Tensor};
+use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::{linear, Linear, Module, VarBuilder};
 
 use super::modules::ConformerLayer;
 use super::mha::RelPositionalEncoding;
 use super::subsampling::ConvSubsampling;
+use super::utils::{CacheAwareStreamingConfig, IntOrPair};
+
+/// Python `pos_emb_max_len` default (encoder.py `__init__`); also the
+/// `RelPositionalEncoding` table max length.
+const POS_EMB_MAX_LEN: usize = 5000;
 
 /// Subset of `ConformerEncoderConfig` needed for the offline forward path.
 #[derive(Debug, Clone)]
@@ -44,6 +49,33 @@ pub struct ConformerEncoder {
     pos_enc: RelPositionalEncoding,
     layers: Vec<ConformerLayer>,
     out_proj: Option<Linear>,
+    // ---- Config / streaming state (mirrors the Python `__init__` attributes;
+    // cold on the offline forward but maintained 1:1 for the streaming/export
+    // methods). `att_context_style`/`self_attention_model` are the offline
+    // defaults ("regular"/"rel_pos") — the only path this encoder supports. ----
+    feat_in: usize,
+    d_model: usize,
+    n_layers: usize,
+    subsampling_factor: usize,
+    att_context_style: String,
+    self_attention_model: String,
+    /// `att_context_size_all` — every configured look-ahead (offline: `[[-1,-1]]`).
+    att_context_size_all: Vec<Vec<i64>>,
+    /// `att_context_size` — the current `[left, right]` (mutable via streaming setters).
+    att_context_size: Vec<i64>,
+    /// `att_context_probs` — sampling distribution over `att_context_size_all`.
+    att_context_probs: Vec<f64>,
+    /// `conv_context_size` — resolved `[left, right]` depthwise-conv context.
+    conv_context_size: (i64, i64),
+    pos_emb_max_len: usize,
+    /// `max_audio_length` — grows the (on-the-fly) positional table; see `set_max_audio_length`.
+    max_audio_length: usize,
+    /// `use_pad_mask` — pad-masking toggle (offline single clip ⇒ effectively off).
+    use_pad_mask: bool,
+    /// `export_cache_support` — whether the export path exposes streaming caches.
+    export_cache_support: bool,
+    /// `streaming_cfg` — the cache-aware streaming parameters (`setup_streaming_params`).
+    streaming_cfg: CacheAwareStreamingConfig,
 }
 
 impl ConformerEncoder {
@@ -68,7 +100,54 @@ impl ConformerEncoder {
             None
         };
 
-        Ok(Self { pre_encode, pos_enc, layers, out_proj })
+        // Resolve the att/conv context sizes from the offline defaults (Python
+        // `_calc_context_sizes` with `att_context_size=None` ⇒ `[[-1,-1]]`,
+        // `att_context_style="regular"`, `conv_context_size=None`). This encoder
+        // only supports the `rel_pos` / unlimited-context offline path.
+        let (att_context_size_all, att_context_size, att_context_probs, conv_ctx) =
+            Self::calc_context_sizes(None, None, None, "regular", None, cfg.conv_kernel_size as i64)?;
+        let conv_context_size = match conv_ctx {
+            ConvContextSize::Size(l, r) => (l, r),
+            ConvContextSize::Causal => (cfg.conv_kernel_size as i64 - 1, 0),
+        };
+
+        // Python `__init__`: `set_max_audio_length(pos_emb_max_len)` then
+        // `setup_streaming_params()`, then `export_cache_support = False`.
+        let streaming_cfg = Self::compute_streaming_cfg(
+            &att_context_size,
+            "regular",
+            cfg.n_layers,
+            conv_context_size,
+            cfg.subsampling_factor,
+            IntOrPair::Pair(1, cfg.subsampling_factor as i64), // pre_encode.get_sampling_frames()
+            IntOrPair::Pair(0, cfg.subsampling_factor as i64 + 1), // get_streaming_cache_size()
+            None,
+            None,
+            None,
+            10_000,
+        );
+
+        Ok(Self {
+            pre_encode,
+            pos_enc,
+            layers,
+            out_proj,
+            feat_in: cfg.feat_in,
+            d_model: cfg.d_model,
+            n_layers: cfg.n_layers,
+            subsampling_factor: cfg.subsampling_factor,
+            att_context_style: "regular".to_string(),
+            self_attention_model: "rel_pos".to_string(),
+            att_context_size_all,
+            att_context_size,
+            att_context_probs,
+            conv_context_size,
+            pos_emb_max_len: POS_EMB_MAX_LEN,
+            max_audio_length: POS_EMB_MAX_LEN,
+            use_pad_mask: true,
+            export_cache_support: false,
+            streaming_cfg,
+        })
     }
 
     /// `audio_signal` is `(B, feat_in, T)` (mel features). Returns `(B, d_out, T')`.
@@ -132,10 +211,22 @@ impl ConformerEncoder {
         self.forward(audio_signal)
     }
 
-    /// PORT: `forward_for_export` — ONNX/TorchScript export wrapper around the
-    /// forward. No export path here; faithfully delegates to `forward`.
-    pub fn forward_for_export(&self, audio_signal: &Tensor) -> Result<Tensor> {
-        self.forward(audio_signal)
+    /// PORT: `forward_for_export` (encoder.py L435-464) — the export forward.
+    ///
+    /// Python transposes any supplied caches `(0,1)`, runs `forward_internal`, then
+    /// `streaming_post_process(rets, keep_all_outputs=False)`. This port covers the
+    /// **offline (no-cache) export**: `forward_internal` returns the 2-element
+    /// `(encoded, length)` form, so `streaming_post_process` is a pass-through (it
+    /// slices only the 5-element streaming form) and there are no caches to
+    /// transpose. `length` is the full `T'` (single unpadded clip). The streaming
+    /// (cache-in/out) export needs the cache-returning `forward_internal`, which is
+    /// not on this inference port's path.
+    pub fn forward_for_export(&self, audio_signal: &Tensor) -> Result<(Tensor, Tensor)> {
+        let encoded = self.forward_internal(audio_signal)?; // (B, d_out, T')
+        let (b, _d, t) = encoded.dims3()?;
+        let length = Tensor::from_vec(vec![t as i64; b], (b,), encoded.device())?;
+        let (encoded, length, _cache) = self.streaming_post_process(encoded, length, None, false)?;
+        Ok((encoded, length))
     }
 
     /// `_create_masks(att_context_size, padding_length, max_audio_length, ...)`
@@ -147,19 +238,30 @@ impl ConformerEncoder {
         (None, None)
     }
 
-    /// PORT: `update_max_seq_length` / `set_max_audio_length` — grow the cached
-    /// positional-encoding table to a max length. The port computes the rel-pos
-    /// table on the fly sized to the input (`RelPositionalEncoding::forward`), so
-    /// there is no fixed buffer to extend; no-op, preserved for 1:1 inventory.
-    pub fn update_max_seq_length(&self, _seq_length: usize, _device: &candle_core::Device) {}
+    /// PORT: `update_max_seq_length` (encoder.py L704-722). Grow `max_audio_length`
+    /// to `seq_length` when it exceeds the current max. The Python distributed
+    /// `all_reduce(MAX)` across ranks is a single-process no-op here.
+    pub fn update_max_seq_length(&mut self, seq_length: usize, _device: &Device) {
+        if seq_length > self.max_audio_length {
+            self.set_max_audio_length(seq_length);
+        }
+    }
 
-    /// See [`Self::update_max_seq_length`].
-    pub fn set_max_audio_length(&self, _max_audio_length: usize) {}
+    /// PORT: `set_max_audio_length` (encoder.py L724-735). Sets the max input length.
+    /// Python pre-extends `pos_enc.extend_pe(max)`; the Rust `RelPositionalEncoding`
+    /// recomputes its table sized to the input on each `forward`, so there is no
+    /// fixed buffer to grow — recording `max_audio_length` is the faithful update.
+    pub fn set_max_audio_length(&mut self, max_audio_length: usize) {
+        self.max_audio_length = max_audio_length;
+    }
 
-    /// PORT: `enable_pad_mask` — toggle pad masking. The offline path uses no pad
-    /// mask (single unpadded clip); returns the previous state (always `false`).
-    pub fn enable_pad_mask(&self, _on: bool) -> bool {
-        false
+    /// PORT: `enable_pad_mask` (encoder.py L793-803). Toggle pad masking and return
+    /// the previous state. Offline uses no pad mask (single unpadded clip); the
+    /// flag is honoured for the (cold) padded/streaming path.
+    pub fn enable_pad_mask(&mut self, on: bool) -> bool {
+        let prev = self.use_pad_mask;
+        self.use_pad_mask = on;
+        prev
     }
 
     /// PORT: `_calc_context_sizes` (encoder.py L805-851).
@@ -271,47 +373,364 @@ impl ConformerEncoder {
         Ok((att_context_size_all, att_context_size, att_context_probs, conv_context_size))
     }
 
-    /// PORT: `set_default_att_context_size` / `change_attention_model` —
-    /// limited-context & att-model switching for streaming. Offline uses unlimited
-    /// rel-pos attention (`[-1,-1]`); no-op stubs, preserved for 1:1 inventory.
-    pub fn set_default_att_context_size(&self, _att_context_size: (i64, i64)) {}
-
-    /// See [`Self::set_default_att_context_size`].
-    pub fn change_attention_model(&self, _self_attention_model: &str) {}
-
-    /// PORT: `setup_streaming_params` / `get_initial_cache_state` /
-    /// `streaming_post_process` — cache-aware streaming setup & cache tensors.
-    /// Not on the offline path; no-op stubs, preserved for 1:1 inventory.
-    pub fn setup_streaming_params(&self) {}
-
-    /// See [`Self::setup_streaming_params`]. Returns no cache (offline).
-    pub fn get_initial_cache_state(&self) -> Option<Tensor> {
-        None
+    /// PORT: `set_default_att_context_size` (encoder.py L853-868). Set the current
+    /// look-ahead and re-derive the streaming params. Warns (Python `logging.warning`)
+    /// if it is not one of the configured `att_context_size_all`.
+    pub fn set_default_att_context_size(&mut self, att_context_size: Vec<i64>) {
+        if !self.att_context_size_all.contains(&att_context_size) {
+            eprintln!(
+                "att_context_size={att_context_size:?} is not among the supported look-aheads: {:?}",
+                self.att_context_size_all
+            );
+        }
+        self.att_context_size = att_context_size;
+        self.setup_streaming_params();
     }
 
-    /// See [`Self::setup_streaming_params`].
-    pub fn streaming_post_process(&self, rets: Tensor) -> Tensor {
-        rets
+    /// PORT: `change_attention_model` (encoder.py L1017-1144). Switch the attention
+    /// model / look-ahead. This inference port wires only `rel_pos` (the model's
+    /// configuration); the Python `abs_pos` / `rel_pos_local_attn` branches rebuild
+    /// the positional encoder and per-layer attention from new weights
+    /// (`load_state_dict`), which has no candle analog here. So `rel_pos → rel_pos`
+    /// is a faithful reconfiguration (the `RelPositionalEncoding` is already the
+    /// right type — no module rebuild — and `set_max_audio_length` resets the table);
+    /// other targets error rather than silently no-op.
+    pub fn change_attention_model(&mut self, self_attention_model: Option<&str>, att_context_size: Option<Vec<i64>>) -> Result<()> {
+        let att_context_size = att_context_size.filter(|v| !v.is_empty()).unwrap_or_else(|| self.att_context_size.clone());
+        let sam = self_attention_model.unwrap_or(&self.self_attention_model).to_string();
+        if sam == "rel_pos_local_attn" && att_context_size.iter().copied().max().unwrap_or(-1) <= 0 {
+            return Err(candle_core::Error::Msg("When using local attention, context size must be set > 0".into()));
+        }
+        if sam != "rel_pos" {
+            return Err(candle_core::Error::Msg(format!(
+                "change_attention_model: '{sam}' is not wired in this port (only 'rel_pos' is supported); \
+                 abs_pos/rel_pos_local_attn require rebuilding the pos-enc + attention from new weights"
+            )));
+        }
+        self.self_attention_model = sam;
+        self.att_context_size = att_context_size;
+        self.set_max_audio_length(self.pos_emb_max_len);
+        Ok(())
     }
 
-    /// PORT: `input_example` — ONNX-export dummy input (random tensor for tracing).
-    /// `disabled_deployment_{input,output}_names` — export hooks. No export path
-    /// here; preserved for 1:1 inventory.
-    pub fn input_example(&self, _max_batch: usize, _max_dim: usize) {}
+    /// PORT: `setup_streaming_params` (encoder.py L870-975). Re-derive the cache-aware
+    /// [`CacheAwareStreamingConfig`] from the current `att_context_size`. Uses the
+    /// default args (no `chunk_size`/`shift_size`/`left_chunks` overrides), as the
+    /// Python `__init__` call does.
+    pub fn setup_streaming_params(&mut self) {
+        self.streaming_cfg = Self::compute_streaming_cfg(
+            &self.att_context_size,
+            &self.att_context_style,
+            self.n_layers,
+            self.conv_context_size,
+            self.subsampling_factor,
+            IntOrPair::Pair(1, self.subsampling_factor as i64),
+            IntOrPair::Pair(0, self.subsampling_factor as i64 + 1),
+            None,
+            None,
+            None,
+            10_000,
+        );
+    }
 
-    /// See [`Self::input_example`].
+    /// The body of [`Self::setup_streaming_params`] (encoder.py L891-966), pulled out
+    /// so `new` can seed `streaming_cfg` before `self` exists. `sampling_frames` /
+    /// `pre_encode_cache` are `pre_encode.get_sampling_frames()` /
+    /// `get_streaming_cache_size()` (the `ConvSubsampling` returns the `[..]` pairs).
+    /// The Python per-layer `cache_drop_size` propagation onto MHA/CausalConv1D
+    /// (L968-974) drives only the streaming KV/conv caches, which are off this
+    /// inference port's path; the config itself is computed 1:1.
+    #[allow(clippy::too_many_arguments)]
+    fn compute_streaming_cfg(
+        att_context_size: &[i64],
+        att_context_style: &str,
+        n_layers: usize,
+        conv_context_size: (i64, i64),
+        subsampling_factor: usize,
+        sampling_frames: IntOrPair,
+        pre_encode_cache: IntOrPair,
+        chunk_size: Option<i64>,
+        shift_size: Option<i64>,
+        left_chunks: Option<i64>,
+        max_context: i64,
+    ) -> CacheAwareStreamingConfig {
+        let mut cfg = CacheAwareStreamingConfig::default();
+        let sf = subsampling_factor as i64;
+
+        // lookahead_steps + cache_drop_size (L897-910).
+        let lookahead_steps: Option<i64> = if let Some(cs) = chunk_size {
+            cfg.cache_drop_size = cs - shift_size.unwrap_or(0);
+            Some(cs - 1)
+        } else if att_context_style == "chunked_limited" {
+            cfg.cache_drop_size = 0;
+            Some(att_context_size[1])
+        } else if att_context_style == "regular" {
+            let la = att_context_size[1] * n_layers as i64 + conv_context_size.1 * n_layers as i64;
+            cfg.cache_drop_size = la;
+            Some(la)
+        } else {
+            cfg.cache_drop_size = 0;
+            None
+        };
+
+        // last_channel_cache_size (L912-923).
+        cfg.last_channel_cache_size = if chunk_size.is_none() {
+            if att_context_size[0] >= 0 { att_context_size[0] } else { max_context }
+        } else if let Some(lc) = left_chunks {
+            lc * chunk_size.unwrap()
+        } else if att_context_size[0] >= 0 {
+            att_context_size[0]
+        } else {
+            max_context
+        };
+
+        // chunk_size / shift_size / valid_out_len (L925-951). `la` is set for the
+        // regular/chunked styles (the only ones reached here); guard the unknown style.
+        let la = lookahead_steps.unwrap_or(0);
+        match sampling_frames {
+            IntOrPair::Pair(s0, s1) => {
+                cfg.chunk_size = IntOrPair::Pair(s0 + sf * la, s1 + sf * la);
+                let shift0 = s0 + s1 * (la - cfg.cache_drop_size);
+                let shift1 = s1 + s1 * (la - cfg.cache_drop_size);
+                cfg.shift_size = IntOrPair::Pair(shift0, shift1);
+                cfg.valid_out_len = (shift1 - s1) / sf + 1;
+            }
+            IntOrPair::Int(s) => {
+                cfg.chunk_size = IntOrPair::Int(s * (1 + la));
+                let shift = s * (1 + la - cfg.cache_drop_size);
+                cfg.shift_size = IntOrPair::Int(shift);
+                cfg.valid_out_len = shift / sf;
+            }
+        }
+
+        // pre_encode_cache_size / drop_extra_pre_encoded (L953-966).
+        cfg.pre_encode_cache_size = pre_encode_cache.clone();
+        cfg.drop_extra_pre_encoded = match pre_encode_cache {
+            IntOrPair::Pair(_, p1) => {
+                if p1 >= 1 { 1 + (p1 - 1) / sf } else { 0 }
+            }
+            IntOrPair::Int(p) => p / sf,
+        };
+        cfg
+    }
+
+    /// PORT: `streaming_post_process` (encoder.py L466-489). Trim the streaming
+    /// output / `last_channel` cache to the valid window. The 2-element offline form
+    /// (no `cache_last_channel_next`) is returned unchanged (Python `if len(rets)==2`).
+    pub fn streaming_post_process(
+        &self,
+        encoded: Tensor,
+        encoded_len: Tensor,
+        cache_last_channel_next: Option<Tensor>,
+        keep_all_outputs: bool,
+    ) -> Result<(Tensor, Tensor, Option<Tensor>)> {
+        // 2-element (no-cache / offline) rets: returned unchanged.
+        let Some(cache) = cache_last_channel_next else {
+            return Ok((encoded, encoded_len, None));
+        };
+
+        // last_channel cache: keep the last `last_channel_cache_size` steps (dim 2 of
+        // (layers, B, T_cache, D)).
+        let cache_out = if self.streaming_cfg.last_channel_cache_size > 0 {
+            let n = self.streaming_cfg.last_channel_cache_size as usize;
+            let t = cache.dim(2)?;
+            if t > n { cache.narrow(2, t - n, n)? } else { cache }
+        } else {
+            cache
+        };
+
+        // encoded: cap time to valid_out_len (dim 2 of (B, D, T)); clamp the length.
+        let (encoded, encoded_len) = if self.streaming_cfg.valid_out_len > 0
+            && (!keep_all_outputs || self.att_context_style == "regular")
+        {
+            let v = self.streaming_cfg.valid_out_len as usize;
+            let t = encoded.dim(2)?;
+            let enc = if t > v { encoded.narrow(2, 0, v)? } else { encoded };
+            let len = encoded_len.clamp(0i64, self.streaming_cfg.valid_out_len)?;
+            (enc, len)
+        } else {
+            (encoded, encoded_len)
+        };
+        Ok((encoded, encoded_len, Some(cache_out)))
+    }
+
+    /// PORT: `get_initial_cache_state` (encoder.py L977-1015). Allocate the
+    /// `last_channel` / `last_time` caches + zeroed lengths. `max_dim == 0` (the
+    /// real init) → zeros; `max_dim > 0` (export tracing) → random fills. The Python
+    /// per-batch random-length tail-zeroing (`max_dim > 0`) is a tracing nicety and
+    /// the lengths stay zero here.
+    pub fn get_initial_cache_state(
+        &self,
+        batch_size: usize,
+        dtype: DType,
+        device: &Device,
+        max_dim: usize,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        let last_time_cache_size = self.conv_context_size.0.max(0) as usize;
+        let lc = self.streaming_cfg.last_channel_cache_size.max(0) as usize;
+        let shape_ch = (self.layers.len(), batch_size, lc, self.d_model);
+        let shape_t = (self.layers.len(), batch_size, self.d_model, last_time_cache_size);
+        let (cache_last_channel, cache_last_time) = if max_dim > 0 {
+            (
+                Tensor::randn(0f32, 1f32, shape_ch, device)?.to_dtype(dtype)?,
+                Tensor::randn(0f32, 1f32, shape_t, device)?.to_dtype(dtype)?,
+            )
+        } else {
+            (Tensor::zeros(shape_ch, dtype, device)?, Tensor::zeros(shape_t, dtype, device)?)
+        };
+        let cache_last_channel_len = Tensor::zeros((batch_size,), DType::I64, device)?;
+        Ok((cache_last_channel, cache_last_time, cache_last_channel_len))
+    }
+
+    /// PORT: `input_example` (encoder.py L176-216). Build dummy tracing inputs: a
+    /// random `(max_batch, feat_in, T)` signal + lengths, plus the initial caches
+    /// when `export_cache_support`. Returns the tuple as a `Vec<Tensor>` (Python
+    /// returns a 2- or 5-element tuple). Lengths use a deterministic `max_dim` stand-in
+    /// for the Python `randint` (a tracing dummy).
+    pub fn input_example(&self, max_batch: usize, max_dim: usize, device: &Device) -> Result<Vec<Tensor>> {
+        if self.export_cache_support {
+            let window_size =
+                (self.streaming_cfg.chunk_size.second() + self.streaming_cfg.pre_encode_cache_size.second()).max(1) as usize;
+            let input = Tensor::randn(0f32, 1f32, (max_batch, self.feat_in, window_size), device)?;
+            let length = Tensor::from_vec(vec![window_size as i64; max_batch], (max_batch,), device)?;
+            let (cc, ct, cl) = self.get_initial_cache_state(max_batch, DType::F32, device, max_dim)?;
+            Ok(vec![input, length, cc.transpose(0, 1)?, ct.transpose(0, 1)?, cl])
+        } else {
+            let input = Tensor::randn(0f32, 1f32, (max_batch, self.feat_in, max_dim), device)?;
+            let mut lens = vec![(max_dim / 2) as i64; max_batch];
+            if let Some(first) = lens.first_mut() {
+                *first = max_dim as i64; // Python pins lengths[0]=max_dim in the cache branch
+            }
+            let length = Tensor::from_vec(lens, (max_batch,), device)?;
+            Ok(vec![input, length])
+        }
+    }
+
+    /// PORT: `disabled_deployment_input_names` (encoder.py L218-223). The cache
+    /// inputs are disabled unless `export_cache_support`.
     pub fn disabled_deployment_input_names(&self) -> Vec<&'static str> {
-        Vec::new()
+        if !self.export_cache_support {
+            vec!["cache_last_channel", "cache_last_time", "cache_last_channel_len"]
+        } else {
+            vec![]
+        }
     }
 
-    /// See [`Self::input_example`].
+    /// PORT: `disabled_deployment_output_names` (encoder.py L225-230). The `*_next`
+    /// cache outputs are disabled unless `export_cache_support`.
     pub fn disabled_deployment_output_names(&self) -> Vec<&'static str> {
-        Vec::new()
+        if !self.export_cache_support {
+            vec!["cache_last_channel_next", "cache_last_time_next", "cache_last_channel_next_len"]
+        } else {
+            vec![]
+        }
+    }
+
+    /// Set `export_cache_support` (Python attribute toggled before export tracing).
+    pub fn set_export_cache_support(&mut self, on: bool) {
+        self.export_cache_support = on;
     }
 
     /// `change_subsampling_conv_chunking_factor` — forwards to the pre-encode
     /// subsampling (a memory-tiling control; see `ConvSubsampling`).
     pub fn change_subsampling_conv_chunking_factor(&mut self, factor: i64) -> Result<()> {
         self.pre_encode.change_subsampling_conv_chunking_factor(factor)
+    }
+
+    // ---- Read accessors for the Python instance attributes (state queryable as in
+    // Python, e.g. `self.streaming_cfg`, `self.att_context_probs`). ----
+
+    /// `att_context_size_all` — every configured look-ahead.
+    pub fn att_context_size_all(&self) -> &[Vec<i64>] {
+        &self.att_context_size_all
+    }
+    /// `att_context_size` — the current `[left, right]` look-ahead.
+    pub fn att_context_size(&self) -> &[i64] {
+        &self.att_context_size
+    }
+    /// `att_context_probs` — sampling distribution over `att_context_size_all`
+    /// (the training-time random att-context choice in `forward_internal`).
+    pub fn att_context_probs(&self) -> &[f64] {
+        &self.att_context_probs
+    }
+    /// `conv_context_size` — resolved `[left, right]` depthwise-conv context.
+    pub fn conv_context_size(&self) -> (i64, i64) {
+        self.conv_context_size
+    }
+    /// `streaming_cfg` — the current cache-aware streaming parameters.
+    pub fn streaming_cfg(&self) -> &CacheAwareStreamingConfig {
+        &self.streaming_cfg
+    }
+    /// `max_audio_length` — current positional-table max length.
+    pub fn max_audio_length(&self) -> usize {
+        self.max_audio_length
+    }
+    /// `use_pad_mask` — current pad-mask toggle.
+    pub fn use_pad_mask(&self) -> bool {
+        self.use_pad_mask
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn streaming_cfg_regular_offline() {
+        // Faithful re-derivation of `setup_streaming_params` for the offline default
+        // (`att_context_size=[-1,-1]`, "regular"). Hand-computed from encoder.py:
+        //   n_layers=4, conv_kernel=9 ⇒ conv_ctx=(4,4), subsampling_factor=8,
+        //   sampling_frames=[1,8], pre_encode_cache=[0,9].
+        //   lookahead = att[1]*L + conv_ctx[1]*L = -1*4 + 4*4 = 12 = cache_drop_size
+        //   last_channel_cache_size = max_context (att[0]=-1<0) = 10000
+        //   chunk = [1+8*12, 8+8*12] = [97,104]; shift = [1,8] (la-drop=0)
+        //   valid_out_len = (8-8)/8 + 1 = 1; drop_extra = 1 + (9-1)/8 = 2
+        let cfg = ConformerEncoder::compute_streaming_cfg(
+            &[-1, -1],
+            "regular",
+            4,
+            (4, 4),
+            8,
+            IntOrPair::Pair(1, 8),
+            IntOrPair::Pair(0, 9),
+            None,
+            None,
+            None,
+            10_000,
+        );
+        assert_eq!(cfg.cache_drop_size, 12);
+        assert_eq!(cfg.last_channel_cache_size, 10_000);
+        assert_eq!(cfg.chunk_size, IntOrPair::Pair(97, 104));
+        assert_eq!(cfg.shift_size, IntOrPair::Pair(1, 8));
+        assert_eq!(cfg.valid_out_len, 1);
+        assert_eq!(cfg.pre_encode_cache_size, IntOrPair::Pair(0, 9));
+        assert_eq!(cfg.drop_extra_pre_encoded, 2);
+    }
+
+    #[test]
+    fn streaming_cfg_chunked_with_overrides() {
+        // chunk_size/shift_size override branch (encoder.py L897-901): chunk=8, shift=4
+        // ⇒ cache_drop=4, lookahead=7; scalar sampling_frames=2.
+        let cfg = ConformerEncoder::compute_streaming_cfg(
+            &[16, 7],
+            "chunked_limited",
+            4,
+            (4, 4),
+            8,
+            IntOrPair::Int(2),
+            IntOrPair::Int(5),
+            Some(8),  // chunk_size
+            Some(4),  // shift_size
+            Some(3),  // left_chunks
+            10_000,
+        );
+        assert_eq!(cfg.cache_drop_size, 8 - 4); // chunk - shift
+        // last_channel_cache_size = left_chunks * chunk_size = 3*8 = 24
+        assert_eq!(cfg.last_channel_cache_size, 24);
+        // scalar: chunk = s*(1+la) = 2*(1+7) = 16; shift = 2*(1+7-4) = 8
+        assert_eq!(cfg.chunk_size, IntOrPair::Int(16));
+        assert_eq!(cfg.shift_size, IntOrPair::Int(8));
+        assert_eq!(cfg.valid_out_len, 8 / 8); // shift // sf = 1
+        assert_eq!(cfg.drop_extra_pre_encoded, 5 / 8); // p // sf = 0
     }
 }

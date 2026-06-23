@@ -368,6 +368,13 @@ impl LFM2AudioModel {
         self.conformer.forward(mel)
     }
 
+    /// The `ConformerEncoder` (Python `self.conformer`). Read access for the
+    /// streaming/export inventory methods (`get_initial_cache_state`,
+    /// `streaming_post_process`, `input_example`, …).
+    pub fn conformer(&self) -> &crate::model::conformer::encoder::ConformerEncoder {
+        &self.conformer
+    }
+
     /// Debug: conformer stage intermediates for parity localization.
     #[doc(hidden)]
     pub fn conformer_stages(&self, mel: &Tensor) -> Result<(Tensor, Tensor, Tensor, Tensor, Tensor)> {

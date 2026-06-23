@@ -4,14 +4,45 @@
 //! streaming config, and stochastic-depth are training/streaming features — but
 //! ported 1:1 for inventory completeness.
 
+use candle_core::DType;
+
+/// A NeMo streaming size that is either a single value or a `[first_step, others]`
+/// pair. Python stores `chunk_size` / `shift_size` / `pre_encode_cache_size` as a
+/// bare `int` OR a 2-element list depending on whether the pre-encoder reports a
+/// list of `get_sampling_frames()` — the [`crate::model::conformer::subsampling::ConvSubsampling`]
+/// does (`[1, subsampling_factor]`), so for this model they are always pairs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IntOrPair {
+    Int(i64),
+    Pair(i64, i64),
+}
+
+impl Default for IntOrPair {
+    fn default() -> Self {
+        IntOrPair::Int(0)
+    }
+}
+
+impl IntOrPair {
+    /// The `[1]` (others) element a Python `cfg.x[1]` access reads; for a scalar it
+    /// is the value itself (Python would index an int — but the list branch is the
+    /// one this model takes).
+    pub fn second(&self) -> i64 {
+        match self {
+            IntOrPair::Int(v) => *v,
+            IntOrPair::Pair(_, b) => *b,
+        }
+    }
+}
+
 /// `CacheAwareStreamingConfig` (dataclass) — cache-aware streaming parameters.
 /// Field docs mirror the Python comments.
 #[derive(Debug, Clone, Default)]
 pub struct CacheAwareStreamingConfig {
-    /// size of each chunk at each step
-    pub chunk_size: i64,
-    /// size of the shift in each step
-    pub shift_size: i64,
+    /// size of each chunk at each step (scalar or `[first, others]`)
+    pub chunk_size: IntOrPair,
+    /// size of the shift in each step (scalar or `[first, others]`)
+    pub shift_size: IntOrPair,
     /// number of steps to drop from the cache
     pub cache_drop_size: i64,
     /// size of the needed cache for last-channel layers
@@ -19,7 +50,7 @@ pub struct CacheAwareStreamingConfig {
     /// number of final-output steps that are valid (== offline mode)
     pub valid_out_len: i64,
     /// cache size for the pre-encoding part (avoids caching inside pre-encode)
-    pub pre_encode_cache_size: i64,
+    pub pre_encode_cache_size: IntOrPair,
     /// steps dropped after the pre-encoding layer
     pub drop_extra_pre_encoded: i64,
     /// number of last-channel layers (e.g. MHA) needing caching
@@ -28,11 +59,26 @@ pub struct CacheAwareStreamingConfig {
     pub last_time_num: i64,
 }
 
-/// PORT: `avoid_float16_autocast_context` — torch AMP autocast dtype guard
-/// (fp16 → bf16/fp32). candle has no autocast; the compute dtype is explicit
-/// (`from_pretrained(dtype)`), so there is no fp16 autocast context to avoid.
-/// No-op, preserved for 1:1 inventory.
-pub fn avoid_float16_autocast_context() {}
+/// PORT: `avoid_float16_autocast_context` (utils.py L25-40).
+///
+/// NeMo's "if the active autocast dtype is f16, compute in bf16 (if supported)
+/// else f32; otherwise leave it" guard. Python returns a *context manager* keyed
+/// off the global autocast state; candle has no implicit autocast, so the faithful
+/// port is the same **decision as a pure function** over the would-be autocast
+/// dtype, returning the dtype the enclosed block should run in (`None` =
+/// `nullcontext()`, no override).
+///
+/// The `torch.jit.is_scripting()/is_tracing()` branch (which forces f32) has no
+/// candle analog and is taken as false. On the offline path the conformer attention
+/// already upcasts to f32 explicitly (see `mha.rs`), so this is the realized logic.
+pub fn avoid_float16_autocast_context(autocast_dtype: Option<DType>, bf16_supported: bool) -> Option<DType> {
+    match autocast_dtype {
+        // f16 autocast active → avoid it: bf16 if the device supports it, else f32.
+        Some(DType::F16) => Some(if bf16_supported { DType::BF16 } else { DType::F32 }),
+        // not in f16 autocast → `nullcontext()`: no dtype override.
+        _ => None,
+    }
+}
 
 /// `compute_stochastic_depth_drop_probs` — per-layer drop probabilities for
 /// stochastic-depth regularization (training). Faithful port: layer 0 never
@@ -71,4 +117,26 @@ pub fn compute_stochastic_depth_drop_probs(
         }
     }
     layer_drop_probs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn avoid_float16_decision() {
+        // f16 autocast active → bf16 when supported, else f32.
+        assert_eq!(avoid_float16_autocast_context(Some(DType::F16), true), Some(DType::BF16));
+        assert_eq!(avoid_float16_autocast_context(Some(DType::F16), false), Some(DType::F32));
+        // not in f16 autocast → nullcontext (no override).
+        assert_eq!(avoid_float16_autocast_context(Some(DType::BF16), true), None);
+        assert_eq!(avoid_float16_autocast_context(Some(DType::F32), true), None);
+        assert_eq!(avoid_float16_autocast_context(None, true), None);
+    }
+
+    #[test]
+    fn int_or_pair_second() {
+        assert_eq!(IntOrPair::Int(7).second(), 7);
+        assert_eq!(IntOrPair::Pair(3, 9).second(), 9);
+    }
 }

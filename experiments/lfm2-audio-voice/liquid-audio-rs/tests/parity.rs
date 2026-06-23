@@ -229,6 +229,56 @@ fn prefill_parity() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The ConformerEncoder streaming/export inventory methods on the REAL encoder.
+///
+/// Off the offline forward path, but ported 1:1 (not stubbed) — this exercises the
+/// tensor-producing methods on the loaded encoder: cache allocation shapes, the
+/// streaming output trim, the export dummy inputs, and the deployment name lists.
+#[test]
+#[ignore = "needs LFM_MODEL_DIR"]
+fn conformer_streaming_inventory() -> anyhow::Result<()> {
+    let dir = std::env::var("LFM_MODEL_DIR").expect("set LFM_MODEL_DIR");
+    let device = Device::Cpu;
+    let (model, _proc) = liquid_audio::from_pretrained(Path::new(&dir), DType::F32, &device)?;
+    let enc = model.conformer();
+
+    // get_initial_cache_state(batch=2, max_dim=0) → zeros of the documented shapes.
+    let (cc, ct, cl) = enc.get_initial_cache_state(2, DType::F32, &device, 0)?;
+    println!("cache shapes: last_channel {:?} last_time {:?} len {:?}", cc.dims(), ct.dims(), cl.dims());
+    assert_eq!(cc.dim(1)?, 2, "last_channel batch");
+    assert_eq!(ct.dim(1)?, 2, "last_time batch");
+    assert_eq!(cl.dims(), [2], "cache_last_channel_len shape");
+    // last_channel_cache_size = max_context (att_context [-1,-1]) = 10000.
+    assert_eq!(cc.dim(2)?, enc.streaming_cfg().last_channel_cache_size as usize);
+
+    // streaming_post_process: 5-element (Some cache) trims encoded to valid_out_len.
+    let valid = enc.streaming_cfg().valid_out_len as usize;
+    // d (channel dim) is arbitrary — streaming_post_process trims the time dim only.
+    let (b, d, t) = (1usize, 8usize, valid + 5);
+    let encoded = Tensor::zeros((b, d, t), DType::F32, &device)?;
+    let elen = Tensor::from_vec(vec![t as i64], (b,), &device)?;
+    let (enc_out, elen_out, cache_out) = enc.streaming_post_process(encoded, elen, Some(cc.clone()), false)?;
+    assert_eq!(enc_out.dim(2)?, valid, "encoded trimmed to valid_out_len");
+    assert_eq!(elen_out.to_vec1::<i64>()?, vec![valid as i64], "length clamped");
+    assert!(cache_out.is_some());
+    // 2-element (None cache) form is returned unchanged.
+    let passthrough = Tensor::zeros((b, d, t), DType::F32, &device)?;
+    let plen = Tensor::from_vec(vec![t as i64], (b,), &device)?;
+    let (pt, _pl, pc) = enc.streaming_post_process(passthrough, plen, None, false)?;
+    assert_eq!(pt.dim(2)?, t, "no-cache form unchanged");
+    assert!(pc.is_none());
+
+    // input_example (export_cache_support=false default) → (signal, length).
+    let ex = enc.input_example(1, 256, &device)?;
+    assert_eq!(ex.len(), 2, "non-cache export = (signal, length)");
+    assert_eq!(ex[0].dim(2)?, 256, "signal time dim");
+
+    // deployment name lists (export_cache_support=false).
+    assert_eq!(enc.disabled_deployment_input_names().len(), 3);
+    assert_eq!(enc.disabled_deployment_output_names().len(), 3);
+    Ok(())
+}
+
 /// Batched (B>1) self-consistency for `prefill_inputs` / `logits`.
 ///
 /// A B=2 batch of two IDENTICAL samples must yield prefill/logits equal to the
