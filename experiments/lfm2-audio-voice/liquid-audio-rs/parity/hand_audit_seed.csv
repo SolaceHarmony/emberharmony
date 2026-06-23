@@ -32,3 +32,9 @@ model/conformer/processor.py,FilterbankFeatures.stft,FAITHFUL,algorithm torch.st
 model/conformer/processor.py,FilterbankFeatures.forward,FAITHFUL,f32-on-device,55acb23,preemph->stft->mag^power->mel->log->per-feature norm all candle f32 on device; conformer-through-mel 5.6e-7
 model/mlp.py,MLP.__init__,FAITHFUL,ctor (vb param),—,same Sequential [LayerNorm(eps1e-5)?]+(Linear[bias][,GELU,Dropout?])* over channels=[in *hidden out]; GELU=exact erf (gelu_erf not tanh); Dropout identity at inference idx reserved for 1:1 model.{i} weight paths
 model/mlp.py,MLP.forward,FAITHFUL,—,—,self.model(x)
+detokenizer.py,FusedEmbedding.__init__,FAITHFUL,—,—,nn.Embedding(codebooks*vocab_size dim); per-codebook offsets precomputed in new
+detokenizer.py,FusedEmbedding.forward,FAITHFUL,transposed layout,—,Python (B codebooks T) mean(1); Rust decode transposes to (B T codebooks) mean(2) — per-codebook offset c*vocab+x identical and mean order-invariant -> same (B T dim)
+detokenizer.py,ISTFT.__init__,FAITHFUL,buffer load vs recompute,—,hann window is a registered buffer (in checkpoint); Rust loads via vb.get('window') instead of torch.hann_window; n_fft=1280 hop=320 win=1280 same-pad
+detokenizer.py,LFM2AudioDetokenizer.__init__,FAITHFUL,—,—,FusedEmbedding(512)+Lfm2Model(backbone_config)+Linear(512 1282)+ISTFT(1280 320 1280 same)+sliding_window(getattr default 30)
+model/conformer/utils.py,compute_stochastic_depth_drop_probs,FAITHFUL,ValueError->panic,—,line-for-line: validations + [0]*start_layer + linear(l/L*p l=1..L)/uniform(p*L) branches identical; training regularizer (off-path at inference drop_prob=0)
+model/conformer/utils.py,avoid_float16_autocast_context,STUB,no-op,—,NeMo autocast helper (avoid float16 via cuda f32/bf16 autocast); Rust explicit-dtype no autocast -> no-op; off-path
