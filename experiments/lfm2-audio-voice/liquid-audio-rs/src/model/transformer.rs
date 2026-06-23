@@ -586,6 +586,17 @@ impl RawLmBackbone {
         let mut x = x.clone();
         match caches {
             Some(cs) => {
+                // Python iterates `zip(self.layers, cache, strict=True)` (py 549/562):
+                // a length mismatch raises. `zip` here silently stops at the shorter
+                // side, so a short cache slice would run only a PREFIX of the backbone.
+                // Require exactly one cache entry per layer instead.
+                if cs.len() != self.layers.len() {
+                    return Err(candle_core::Error::Msg(format!(
+                        "RawLmBackbone::forward: cache has {} entries, expected one per layer ({})",
+                        cs.len(),
+                        self.layers.len()
+                    )));
+                }
                 for (layer, c) in self.layers.iter().zip(cs.iter_mut()) {
                     x = layer.forward(&x, Some(c))?;
                 }
@@ -690,5 +701,30 @@ impl SequenceModel for RawLmBackbone {
     ) -> Result<(Tensor, Vec<LayerCache>)> {
         // Delegate to the inherent method (inherent resolution wins → no recursion).
         RawLmBackbone::forward_cached(self, x, cache)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn forward_rejects_cache_length_mismatch() {
+        // A RawLmBackbone with 0 layers exercises the cache-length guard without any
+        // weights: a cache slice whose len != layer count must error (Python's
+        // zip(strict=True)), not silently run a prefix of the backbone.
+        let bb = RawLmBackbone::new(vec![], None, 4);
+        let x = Tensor::zeros((1, 3, 4), DType::F32, &Device::Cpu).unwrap();
+
+        // Matching lengths (0 caches, 0 layers) → Ok (no layers run).
+        let mut empty: Vec<LayerKvCache> = vec![];
+        assert!(bb.forward(&x, Some(empty.as_mut_slice())).is_ok());
+
+        // Mismatch (1 cache, 0 layers) → Err, not a silent prefix run.
+        let mut one = vec![LayerKvCache::new()];
+        assert!(
+            bb.forward(&x, Some(one.as_mut_slice())).is_err(),
+            "cache length mismatch must error, not skip layers"
+        );
     }
 }

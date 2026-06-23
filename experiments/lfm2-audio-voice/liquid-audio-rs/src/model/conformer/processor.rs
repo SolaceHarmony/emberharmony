@@ -316,20 +316,31 @@ impl FilterbankFeatures {
 /// Per-mel-bin (per-feature) mean/std normalization across time. Python masks the
 /// time axis with `valid_mask = time_steps < seq_len` and computes, per feature:
 /// `x_mean = sum(x where valid) / count(valid)`, `x_std = sqrt(sum((x - x_mean)^2
-/// where valid) / (count - 1))` (ddof=1 bias correction), then `x_std += CONSTANT`
-/// (1e-5) to avoid divide-by-zero, returning `(x - x_mean) / x_std` broadcast over
-/// ALL time steps. Here the `valid` frames are the leading `[0, valid)` columns
-/// (the trailing centred-STFT pad frame is excluded from the statistics and is
-/// masked to 0 by the caller afterwards). Byte-identical to the previously inlined
-/// `normalize_per_feature` — only the function name now matches Python. Other
-/// `normalize_type` branches (`"all_features"`, `"fixed_mean"/"fixed_std"`, none)
-/// are unreachable on the checkpoint config (`normalize="per_feature"`) and so are
-/// not exercised on the inference path.
+/// where valid) / (count - 1))` (ddof=1 bias correction), then **`x_std =
+/// x_std.masked_fill(x_std.isnan(), 0.0)`** and `x_std += CONSTANT` (1e-5),
+/// returning `(x - x_mean) / x_std` broadcast over ALL time steps. Here the `valid`
+/// frames are the leading `[0, valid)` columns (the trailing centred-STFT pad frame
+/// is excluded from the statistics and is masked to 0 by the caller afterwards).
+///
+/// The NaN guard matters for a clip with a single valid frame: the ddof=1 variance
+/// is then `0/0 → NaN`, which Python masks to 0 so `x_std == CONSTANT` and the
+/// features stay finite. That NaN only ever arises at `valid <= 1` (for `valid > 1`
+/// the variance is finite), so we avoid the `0/0` outright — `valid <= 1` ⇒ the
+/// masked std is 0 — rather than relying on NaN propagation through `sqrt`.
+///
+/// Other `normalize_type` branches (`"all_features"`, `"fixed_mean"/"fixed_std"`,
+/// none) are unreachable on the checkpoint config (`normalize="per_feature"`).
 fn normalize_batch(x: &Tensor, valid: usize) -> Result<Tensor> {
     let xv = x.narrow(1, 0, valid)?;
     let mean = xv.mean_keepdim(1)?;
-    let var = (xv.broadcast_sub(&mean)?.sqr()?.sum_keepdim(1)? / (valid as f64 - 1.0))?;
-    let std = (var.sqrt()? + CONSTANT)?;
+    // ddof=1 std over the valid frames. valid<=1 ⇒ the Python NaN-masked std is 0,
+    // so std collapses to CONSTANT (no 0/0 NaN reaches the divide).
+    let std_pre = if valid > 1 {
+        (xv.broadcast_sub(&mean)?.sqr()?.sum_keepdim(1)? / (valid as f64 - 1.0))?.sqrt()?
+    } else {
+        mean.zeros_like()? // (nfilt, 1) — the NaN-masked-to-0 std
+    };
+    let std = (std_pre + CONSTANT)?;
     x.broadcast_sub(&mean)?.broadcast_div(&std)
 }
 
@@ -497,5 +508,38 @@ impl AudioToMelSpectrogramPreprocessor {
         let guarded = self.base.forward(input_signal)?;
         let (signal, len) = self.get_features(&guarded, length)?;
         Ok((signal.to_dtype(DType::F32)?, len))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_one_frame_is_finite() {
+        // A single valid mel frame: ddof=1 variance is 0/0; Python masks the NaN std
+        // to 0 so std == CONSTANT and features stay finite. (nfilt=4, T=3, valid=1.)
+        let dev = Device::Cpu;
+        let x = Tensor::from_vec(
+            vec![1.0f32, 5.0, -2.0, 0.5, 9.0, 0.0, -3.0, 2.0, 4.0, 1.0, 7.0, -1.0],
+            (4, 3),
+            &dev,
+        )
+        .unwrap();
+        let out = normalize_batch(&x, 1).unwrap();
+        let flat = out.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert!(flat.iter().all(|v| v.is_finite()), "one-frame normalize produced non-finite: {flat:?}");
+        // The single valid frame (col 0) is mean-subtracted to 0 → 0 / CONSTANT == 0.
+        let col0: Vec<f32> = (0..4).map(|i| flat[i * 3]).collect();
+        assert!(col0.iter().all(|v| v.abs() < 1e-6), "valid frame should normalize to ~0, got {col0:?}");
+    }
+
+    #[test]
+    fn normalize_two_frames_unchanged() {
+        // valid>=2 keeps the ddof=1 path (regression guard for the one-frame branch).
+        let dev = Device::Cpu;
+        let x = Tensor::from_vec(vec![1.0f32, 3.0, 2.0, 4.0], (2, 2), &dev).unwrap();
+        let out = normalize_batch(&x, 2).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert!(out.iter().all(|v| v.is_finite()));
     }
 }
