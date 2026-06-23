@@ -57,22 +57,36 @@ impl PreprocessorConfig {
 pub struct LFM2AudioProcessor {
     pub tokenizer: Tokenizer,
     pub audio: FilterbankFeatures,
-    /// Audio-out backend (LFM2 detokenizer or Mimi), behind the trait we own so
-    /// the processor never touches a concrete codec type.
+    /// Audio-out DECODE backend: the LFM2 detokenizer (LFM2.5 snapshots ship
+    /// `audio_detokenizer/`). `None` for v1 models, where `decode` falls back to
+    /// [`Self::mimi`]. Behind the trait so the processor never touches a concrete
+    /// codec type. Mirrors the Python processor's `_audio_detokenizer` field.
     pub audio_out: Option<Box<dyn AudioDetokenizer>>,
+    /// The Mimi codec (`tokenizer-…checkpoint125.safetensors`), loaded INDEPENDENTLY
+    /// of `audio_out`. Mirrors the Python processor's separate `_mimi` field: the
+    /// data mapper's `_encode_audio_out` calls `processor.mimi.encode` even on full
+    /// LFM2.5 snapshots — where the decode backend is the LFM2 detokenizer, not Mimi.
+    /// Conflating the two (one shared field) loses the encoder on full snapshots.
+    pub mimi: Option<Box<dyn AudioDetokenizer>>,
     pub device: Device,
 }
 
 impl LFM2AudioProcessor {
     /// Build from a local model directory: `tokenizer.json` + the mel buffers
     /// (`window`/`fb`) under a VarBuilder rooted at the audio preprocessor.
+    ///
+    /// `audio_out` is the LFM2 detokenizer (decode; `None` for v1); `mimi` is the
+    /// Mimi codec (encode + v1 decode fallback). They are separate so a full
+    /// snapshot keeps both — Python loads `_audio_detokenizer` and `_mimi`
+    /// independently.
     pub fn new(
         tokenizer: Tokenizer,
         audio: FilterbankFeatures,
         audio_out: Option<Box<dyn AudioDetokenizer>>,
+        mimi: Option<Box<dyn AudioDetokenizer>>,
         device: Device,
     ) -> Self {
-        Self { tokenizer, audio, audio_out, device }
+        Self { tokenizer, audio, audio_out, mimi, device }
     }
 
     /// PORT: `LFM2AudioProcessor.from_pretrained(repo_id, *, device)` (py 56).
@@ -129,8 +143,13 @@ impl LFM2AudioProcessor {
                 "audio code {max_code} out of range [0, 2047] (strip the EOAudio frame before decode)"
             )));
         }
+        // Decode through the LFM2 detokenizer when present (LFM2.5), else the Mimi
+        // codec (v1). Python's `decode` uses `audio_detokenizer`; v1 models ship no
+        // detokenizer and detokenize via `mimi` directly — the port unifies both
+        // behind `decode` via this `audio_out → mimi` fallback.
         self.audio_out
             .as_ref()
+            .or(self.mimi.as_ref())
             .ok_or_else(|| candle_core::Error::Msg("no audio-out backend loaded".into()))?
             .decode(audio_codes)
     }
@@ -316,31 +335,42 @@ impl LFM2AudioProcessor {
         &self.device
     }
 
-    /// `audio_detokenizer` / `mimi` → the audio-out backend. Python exposes the
-    /// concrete `LFM2AudioDetokenizer` / `MimiModel`; the port dispatches `decode`
-    /// through `Box<dyn AudioDetokenizer>`, so both accessors return that backend.
+    /// `audio_detokenizer` → the audio-out DECODE backend: the LFM2 detokenizer
+    /// (LFM2.5) when present, else the Mimi codec (v1). Python's `audio_detokenizer`
+    /// property is strictly the LFM2 detokenizer; the port folds the v1 Mimi-decode
+    /// path in here so callers (`decode`, streaming `decode_step` in `mic_chat`) get
+    /// a working backend on both model families.
     pub fn audio_detokenizer(&self) -> Option<&dyn AudioDetokenizer> {
-        self.audio_out.as_deref()
+        self.audio_out.as_deref().or(self.mimi.as_deref())
     }
 
-    /// See [`Self::audio_detokenizer`].
+    /// `mimi` → the Mimi CODEC, independent of the decode backend (Python `_mimi`).
+    /// This is what the data mapper's `_encode_audio_out` uses (`processor.mimi.encode`),
+    /// so on a full LFM2.5 snapshot it must return Mimi — NOT the LFM2 detokenizer
+    /// that `audio_detokenizer`/`decode` use.
     pub fn mimi(&self) -> Option<&dyn AudioDetokenizer> {
-        self.audio_out.as_deref()
+        self.mimi.as_deref()
     }
 
-    /// `mimi.sample_rate` — the audio-out codec's expected input sample rate.
-    /// Used by the data mapper (`_encode_audio_out`) to decide whether to
-    /// resample before encoding.
+    /// `mimi.sample_rate` — the Mimi codec's expected input sample rate. Used by the
+    /// data mapper (`_encode_audio_out`) to resample before encoding. Reads the Mimi
+    /// codec (not the decode backend): on a full snapshot the LFM2 detokenizer's rate
+    /// is irrelevant to the encode path.
     pub fn mimi_sample_rate(&self) -> Option<u32> {
-        self.audio_out.as_deref().map(|d| d.sample_rate())
+        self.mimi.as_deref().map(|d| d.sample_rate())
     }
 
-    /// `mimi.encode(wav)` — encode a `(B, 1, L)` waveform to codes via the
-    /// audio-out backend (errors if the backend is decode-only).
+    /// `mimi.encode(wav)` — encode a `(B, 1, L)` waveform to codes via the Mimi codec
+    /// (errors if no Mimi checkpoint was loaded). Always the Mimi codec, never the
+    /// LFM2 detokenizer (which is decode-only).
     pub fn mimi_encode(&self, wav: &Tensor) -> Result<Tensor> {
-        self.audio_out
+        self.mimi
             .as_ref()
-            .ok_or_else(|| candle_core::Error::Msg("no audio-out backend loaded".into()))?
+            .ok_or_else(|| {
+                candle_core::Error::Msg(
+                    "no Mimi codec loaded (encode needs the Mimi tokenizer checkpoint `tokenizer-…checkpoint125.safetensors`)".into(),
+                )
+            })?
             .encode(wav)
     }
 

@@ -79,19 +79,21 @@ fn conformer_stages_parity() -> anyhow::Result<()> {
 #[test]
 #[ignore = "needs LFM_MODEL_DIR (loads the Mimi weights shipped in the repo)"]
 fn mimi_decode_smoke() -> anyhow::Result<()> {
-    // Pure-candle audio-out through the AudioDetokenizer trait: for the v1 1.5B
-    // model (no audio_detokenizer/ subdir) the backend resolves to the Kyutai
-    // Mimi codec (moshi crate), decoding 8-codebook tokens to 24 kHz. No torch.
+    // Pure-candle audio-out through the Mimi codec (moshi crate), decoding
+    // 8-codebook tokens to 24 kHz. No torch. Resolved via `proc.mimi()` — the Mimi
+    // codec specifically — so this exercises Mimi on BOTH v1 and full LFM2.5
+    // snapshots (where the decode backend is the LFM2 detokenizer, not Mimi).
     let dir = std::env::var("LFM_MODEL_DIR").expect("set LFM_MODEL_DIR");
     let device = Device::Cpu;
     let (_model, proc) = liquid_audio::from_pretrained(Path::new(&dir), DType::F32, &device)?;
+    let mimi = proc.mimi().expect("Mimi codec (tokenizer-…checkpoint125.safetensors)");
 
     // 16 frames of valid Mimi indices (codebook size 2048), shape (1, 8, T).
     let (k, t) = (8usize, 16usize);
     let codes: Vec<u32> = (0..k * t).map(|i| (i * 37 % 2048) as u32).collect();
     let codes = Tensor::from_vec(codes, (1, k, t), &device)?;
 
-    let wav = proc.decode(&codes)?;
+    let wav = mimi.decode(&codes)?;
     let flat = wav.flatten_all()?.to_dtype(DType::F32)?;
     let n = flat.dims1()?;
     let max = flat.abs()?.max(0)?.to_scalar::<f32>()?;
@@ -111,7 +113,7 @@ fn mimi_streaming_decode_smoke() -> anyhow::Result<()> {
     let dir = std::env::var("LFM_MODEL_DIR").expect("set LFM_MODEL_DIR");
     let device = Device::Cpu;
     let (_model, proc) = liquid_audio::from_pretrained(Path::new(&dir), DType::F32, &device)?;
-    let mimi = proc.audio_detokenizer().expect("audio-out backend (Mimi)");
+    let mimi = proc.mimi().expect("Mimi codec (tokenizer-…checkpoint125.safetensors)");
 
     let (k, t) = (8usize, 16usize);
     let codes: Vec<u32> = (0..k * t).map(|i| (i * 37 % 2048) as u32).collect();
@@ -140,6 +142,39 @@ fn mimi_streaming_decode_smoke() -> anyhow::Result<()> {
     assert!(max.is_finite() && max > 0.0, "streaming waveform empty/NaN");
     // Each emitting frame yields 1920 samples (12.5 Hz @ 24 kHz).
     assert_eq!(n_stream, (t - warmup_none) * 1920, "unexpected streaming sample count");
+    Ok(())
+}
+
+/// The data mapper's `_encode_audio_out` path: `processor.mimi.encode(wav)`.
+///
+/// On a full LFM2.5 snapshot the DECODE backend is the LFM2 detokenizer, so this
+/// fails unless the Mimi codec is loaded SEPARATELY (the bug: a single shared
+/// backend made `mimi()` return the decode-only detokenizer → `mimi_encode` errors,
+/// breaking dataset preprocessing). Runs on CPU, where moshi's `CodebookEncode`
+/// CustomOp is supported.
+#[test]
+#[ignore = "needs LFM_MODEL_DIR (loads the Mimi weights shipped in the repo)"]
+fn mimi_encode_smoke() -> anyhow::Result<()> {
+    let dir = std::env::var("LFM_MODEL_DIR").expect("set LFM_MODEL_DIR");
+    let device = Device::Cpu;
+    let (_model, proc) = liquid_audio::from_pretrained(Path::new(&dir), DType::F32, &device)?;
+    let sr = proc.mimi_sample_rate().expect("Mimi sample rate (codec must be loaded)");
+
+    // 0.5 s sine at the codec's input rate, shape (B=1, C=1, L) — what
+    // `_encode_audio_out` feeds after `wav.unsqueeze(0)`.
+    let n = (sr / 2) as usize;
+    let wav: Vec<f32> = (0..n).map(|i| (i as f32 * 0.05).sin() * 0.3).collect();
+    let wav = Tensor::from_vec(wav, (1, 1, n), &device)?;
+
+    let codes = proc.mimi_encode(&wav)?; // (1, codebooks_all, T)
+    println!("mimi encode: {sr} Hz wav (1,1,{n}) -> codes {:?}", codes.dims());
+    assert_eq!(codes.dim(0)?, 1, "batch dim");
+    assert!(codes.dim(1)? >= 8, "expected >=8 codebooks, got {}", codes.dim(1)?);
+    assert!(codes.dim(2)? > 0, "no frames encoded");
+    // Codes must be valid codebook indices (< 2048) so `_encode_audio_out` can keep
+    // the first 8 rows and append the EOAudio sentinel.
+    let max = codes.flatten_all()?.to_dtype(DType::U32)?.max(0)?.to_scalar::<u32>()?;
+    assert!(max < 2048, "code {max} out of Mimi codebook range");
     Ok(())
 }
 

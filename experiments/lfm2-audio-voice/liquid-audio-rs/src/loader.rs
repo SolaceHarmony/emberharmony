@@ -138,17 +138,24 @@ pub fn from_pretrained(dir: &Path, dtype: DType, device: &Device) -> Result<(LFM
     let prep: PreprocessorConfig = serde_json::from_value(config["preprocessor"].clone()).map_err(err)?;
     let audio = FilterbankFeatures::new(prep.mel_config(), device)?;
     let tokenizer = LFM2AudioProcessor::load_tokenizer(dir)?;
-    // Audio-out backend, behind the AudioDetokenizer trait: prefer the in-tree
-    // LFM2 detokenizer (LFM2.5 models, `audio_detokenizer/`); else the Mimi codec
-    // (v1 models, `tokenizer-…checkpoint125.safetensors`). No silent fallback: if
-    // `audio_detokenizer/` is present we propagate any load error rather than
-    // quietly dropping to Mimi.
+    // Two INDEPENDENT audio backends, mirroring the Python processor's separate
+    // `_mimi` / `_audio_detokenizer` fields:
+    //  - `mimi`: the Mimi codec (`tokenizer-…checkpoint125.safetensors`), loaded
+    //    whenever present. The data mapper's `_encode_audio_out` calls
+    //    `processor.mimi.encode` even on full LFM2.5 snapshots, so the encoder must
+    //    survive regardless of which backend decodes.
+    //  - `audio_out`: the in-tree LFM2 detokenizer (`audio_detokenizer/`, LFM2.5
+    //    only) used by `decode`. `None` for v1, where `decode` falls back to `mimi`.
+    // No silent fallback for full snapshots: a present `audio_detokenizer/`
+    // propagates any load error rather than quietly dropping to Mimi.
+    let mimi: Option<Box<dyn AudioDetokenizer>> =
+        load_mimi(dir, codebooks, device)?.map(|m| Box::new(MimiDetokenizer::new(m)) as Box<dyn AudioDetokenizer>);
     let audio_out: Option<Box<dyn AudioDetokenizer>> = if dir.join("audio_detokenizer").is_dir() {
         Some(Box::new(load_detokenizer(dir, dtype, device)?))
     } else {
-        load_mimi(dir, codebooks, device)?.map(|m| Box::new(MimiDetokenizer::new(m)) as Box<dyn AudioDetokenizer>)
+        None
     };
-    let proc = LFM2AudioProcessor::new(tokenizer, audio, audio_out, device.clone());
+    let proc = LFM2AudioProcessor::new(tokenizer, audio, audio_out, mimi, device.clone());
 
     Ok((model, proc))
 }
@@ -249,12 +256,16 @@ pub fn from_pretrained_trainable(dir: &Path, dtype: DType, device: &Device) -> R
     let prep: PreprocessorConfig = serde_json::from_value(config["preprocessor"].clone()).map_err(err)?;
     let audio = FilterbankFeatures::new(prep.mel_config(), device)?;
     let tokenizer = LFM2AudioProcessor::load_tokenizer(dir)?;
+    // Mimi codec + LFM2 detokenizer loaded independently (see `from_pretrained`):
+    // training preprocessing also encodes audio-out via `processor.mimi.encode`.
+    let mimi: Option<Box<dyn AudioDetokenizer>> =
+        load_mimi(dir, codebooks, device)?.map(|m| Box::new(MimiDetokenizer::new(m)) as Box<dyn AudioDetokenizer>);
     let audio_out: Option<Box<dyn AudioDetokenizer>> = if dir.join("audio_detokenizer").is_dir() {
         Some(Box::new(load_detokenizer(dir, dtype, device)?))
     } else {
-        load_mimi(dir, codebooks, device)?.map(|m| Box::new(MimiDetokenizer::new(m)) as Box<dyn AudioDetokenizer>)
+        None
     };
-    let processor = LFM2AudioProcessor::new(tokenizer, audio, audio_out, device.clone());
+    let processor = LFM2AudioProcessor::new(tokenizer, audio, audio_out, mimi, device.clone());
 
     Ok(TrainableLoad {
         model,
