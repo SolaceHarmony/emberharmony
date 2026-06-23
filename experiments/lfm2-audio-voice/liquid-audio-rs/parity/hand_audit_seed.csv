@@ -30,3 +30,5 @@ detokenizer.py,ISTFT.forward,FIXED,dtype/algorithm,8da5ec0,candle-native f32 irf
 detokenizer.py,LFM2AudioDetokenizer.forward,FAITHFUL,—,702b6be,FusedEmbedding->x6 upsample->Lfm2Model(sliding mask)->lin->polar->istft; e2e on full HF snapshot
 model/conformer/processor.py,FilterbankFeatures.stft,FAITHFUL,algorithm torch.stft->Conv1d-DFT,55acb23,windowed real-DFT as Conv1d kernel (stride=hop) f32 on-device; mel 1.18e-5 vs torch golden
 model/conformer/processor.py,FilterbankFeatures.forward,FAITHFUL,f32-on-device,55acb23,preemph->stft->mag^power->mel->log->per-feature norm all candle f32 on device; conformer-through-mel 5.6e-7
+model/mlp.py,MLP.__init__,FAITHFUL,ctor (vb param),—,same Sequential [LayerNorm(eps1e-5)?]+(Linear[bias][,GELU,Dropout?])* over channels=[in *hidden out]; GELU=exact erf (gelu_erf not tanh); Dropout identity at inference idx reserved for 1:1 model.{i} weight paths
+model/mlp.py,MLP.forward,FAITHFUL,—,—,self.model(x)
