@@ -178,6 +178,26 @@ fn mimi_encode_smoke() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `from_pretrained_trainable` must cast the STORED checkpoint dtype to the
+/// requested dtype before `Var::set`.
+///
+/// The snapshot is bf16; CPU training needs F32 (candle has no CPU bf16 matmul).
+/// `Var::set` is a same-dtype storage copy, so without the cast a bf16 tensor into
+/// an F32 Var errors on load. This asserts every trainable Var is F32 after load.
+#[test]
+#[ignore = "needs LFM_MODEL_DIR (allocates the full param set as F32 — ~6 GB)"]
+fn trainable_load_upcasts_to_f32() -> anyhow::Result<()> {
+    let dir = std::env::var("LFM_MODEL_DIR").expect("set LFM_MODEL_DIR");
+    let device = Device::Cpu;
+    let tl = liquid_audio::loader::from_pretrained_trainable(Path::new(&dir), DType::F32, &device)?;
+    let vars = tl.varmap.all_vars();
+    assert!(!vars.is_empty(), "no trainable vars loaded");
+    let non_f32 = vars.iter().filter(|v| v.dtype() != DType::F32).count();
+    println!("trainable load: {} vars, {} not F32", vars.len(), non_f32);
+    assert_eq!(non_f32, 0, "{non_f32} vars were not upcast to F32 (Var::set skipped the dtype cast)");
+    Ok(())
+}
+
 #[test]
 #[ignore = "needs LFM_MODEL_DIR + parity/golden/prefill_refs.safetensors"]
 fn prefill_parity() -> anyhow::Result<()> {

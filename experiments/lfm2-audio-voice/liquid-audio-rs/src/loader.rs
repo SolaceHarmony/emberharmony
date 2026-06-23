@@ -249,6 +249,13 @@ pub fn from_pretrained_trainable(dir: &Path, dtype: DType, device: &Device) -> R
             let tensor = shards
                 .load(name, var.device())
                 .map_err(|e| err(format!("checkpoint: param `{name}` not found in any shard: {e}")))?;
+            // Cast the STORED checkpoint dtype to the Var's dtype before `set`. Unlike
+            // `VarBuilder::get` (which casts on read), `Var::set` is a same-dtype
+            // storage copy and errors on a dtype mismatch. A bf16 checkpoint loaded
+            // into F32 Vars — the required path for CPU training, where candle has no
+            // bf16 matmul — would otherwise fail. Mirrors the Python upcast folded
+            // into `from_pretrained(dtype=…)`. No-op when stored dtype == `dtype`.
+            let tensor = tensor.to_dtype(var.dtype())?;
             var.set(&tensor)?;
         }
     }
