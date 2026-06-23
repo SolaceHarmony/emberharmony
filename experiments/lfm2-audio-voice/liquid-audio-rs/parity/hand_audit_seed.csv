@@ -13,7 +13,14 @@ data/mapper.py,LFM2AudioChatMapper._encode_audio_out,FAITHFUL,—,—,resample t
 data/mapper.py,LFM2AudioChatMapper._load_audio_bytes,FAITHFUL,soundfile->symphonia,—,decode encoded-audio bytes to mono f32 waveform
 data/types.py,LFM2AudioModelInput.to,FAITHFUL,—,—,.to(device) on all 6 fields
 data/preprocess.py,preprocess_dataset,FAITHFUL,RET None->Result<usize>,—,iterate->map->filter(0<=max_ctx<len)->save_to_disk; ChatMapper trait = the Python mapper callable; returns kept-row count
-processor.py,LFM2AudioProcessor.decode,FAITHFUL,—,—,code-range guard [0,2047] then dispatch to AudioDetokenizer backend (Rust encode helper — no Python counterpart — carries the long->i64 fix; see ChatState.__init__)
+processor.py,LFM2AudioProcessor.decode,FAITHFUL,v1 mimi fallback,e599ae9,code-range guard [0 2047] then dispatch to decode backend audio_out.or(mimi) (LFM2 detok full snapshot / Mimi v1); Python decode uses audio_detokenizer only — Rust folds v1 mimi-decode in via the fallback; e2e generate 60 frames coherent
+processor.py,LFM2AudioProcessor.__init__,FIXED,ctor + mimi/detok split,e599ae9,Rust new takes BOTH backends (audio_out=LFM2-detok decode + mimi=codec) eagerly vs Python lazy _mimi/_audio_detokenizer paths; the two-field separation IS the fix — a single shared backend lost the Mimi encoder on full LFM2.5 snapshots
+processor.py,LFM2AudioProcessor.from_pretrained,FAITHFUL,delegates to loader,e599ae9,delegates to loader::from_pretrained which loads mimi + audio_detokenizer independently (Python checks tokenizer-…checkpoint125.safetensors AND audio_detokenizer/ separately); returns processor only (Python classmethod likewise drops the model)
+processor.py,LFM2AudioProcessor.text,FAITHFUL,—,—,&Tokenizer accessor (Python @property text -> PreTrainedTokenizer)
+processor.py,LFM2AudioProcessor.audio,FAITHFUL,—,—,&FilterbankFeatures accessor (Python @property audio -> AudioToMelSpectrogramPreprocessor)
+processor.py,LFM2AudioProcessor.mimi,FIXED,separate codec,e599ae9,returns the separate mimi-codec field (was the shared audio_out = decode-only LFM2 detok on full snapshots -> encode failed); used by mapper _encode_audio_out; mimi_encode_smoke 24kHz->codes [1 8 7] all <2048 PASS; mimi decode/streaming 16f->30720=16*1920 PASS
+processor.py,LFM2AudioProcessor.audio_detokenizer,FIXED,decode backend + v1 fallback,e599ae9,returns audio_out.as_deref().or(mimi) (decode backend: LFM2 detok full / Mimi v1); Python property is strictly the LFM2 detok but the Rust folds the v1 mimi-decode path here so decode/decode_step (mic_chat streaming) work on both model families
+processor.py,LFM2AudioProcessor.device,FAITHFUL,—,—,&Device accessor (Python @property device -> torch.device)
 processor.py,LFM2AudioProcessor.to,FAITHFUL,no-op,—,device-agnostic (device at construction); documented no-op
 processor.py,LFM2AudioProcessor.eval,FAITHFUL,no-op,—,training-mode toggle; inference always eval; documented no-op
 processor.py,LFM2AudioProcessor.train,FAITHFUL,no-op,—,see eval
