@@ -274,7 +274,7 @@ def main() -> int:
     if args.csv:
         preserve = load_existing_human(args.seed)
         with args.csv.open("w", newline="") as f:
-            w = csvmod.DictWriter(f, fieldnames=CSV_COLUMNS)
+            w = csvmod.DictWriter(f, fieldnames=CSV_COLUMNS, lineterminator="\n")
             w.writeheader()
             for rec in csv_records:
                 human = preserve.get((rec["python_file"], rec["python_symbol"]), {})
