@@ -516,9 +516,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn normalize_one_frame_is_finite() {
-        // A single valid mel frame: ddof=1 variance is 0/0; Python masks the NaN std
-        // to 0 so std == CONSTANT and features stay finite. (nfilt=4, T=3, valid=1.)
+    fn normalize_one_frame_matches_python() {
+        // REAL Python comparison, not a "finite" lock: the upstream
+        // `normalize_batch(x, seq_len=1, "per_feature")` on CPU masks the 0/0 ddof=1
+        // std to 0 (=> std == CONSTANT 1e-5). The buggy divide-by-(valid-1) yields NaN
+        // here, so this DETECTS that regression. Golden = the actual Python output.
         let dev = Device::Cpu;
         let x = Tensor::from_vec(
             vec![1.0f32, 5.0, -2.0, 0.5, 9.0, 0.0, -3.0, 2.0, 4.0, 1.0, 7.0, -1.0],
@@ -526,12 +528,16 @@ mod tests {
             &dev,
         )
         .unwrap();
-        let out = normalize_batch(&x, 1).unwrap();
-        let flat = out.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        assert!(flat.iter().all(|v| v.is_finite()), "one-frame normalize produced non-finite: {flat:?}");
-        // The single valid frame (col 0) is mean-subtracted to 0 → 0 / CONSTANT == 0.
-        let col0: Vec<f32> = (0..4).map(|i| flat[i * 3]).collect();
-        assert!(col0.iter().all(|v| v.abs() < 1e-6), "valid frame should normalize to ~0, got {col0:?}");
+        let got = normalize_batch(&x, 1).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        // From: python -c "normalize_batch(x[None], tensor([1]), 'per_feature')"
+        let want = [
+            0.0f32, 400000.0, -300000.0, 0.0, 850000.0, -50000.0, 0.0, 500000.0, 700000.0, 0.0, 600000.0, -200000.0,
+        ];
+        for (g, w) in got.iter().zip(want.iter()) {
+            assert!(g.is_finite(), "one-frame normalize produced non-finite: {got:?}");
+            let rel = (g - w).abs() / w.abs().max(1.0);
+            assert!(rel < 1e-4, "normalize one-frame diverges from Python: got {got:?} want {want:?}");
+        }
     }
 
     #[test]
