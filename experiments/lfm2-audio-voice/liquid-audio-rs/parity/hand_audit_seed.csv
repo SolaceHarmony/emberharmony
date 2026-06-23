@@ -1,0 +1,32 @@
+python_file,python_symbol,hand_audit,deviation,commit,notes
+data/dataloader.py,LFM2DataLoader.__init__,FAITHFUL,ctor-split,—,inline load split into new(rows)+load_from_disk(path); device explicit; DEFAULT_CONTEXT_LENGTH=4096
+data/dataloader.py,LFM2DataLoader.__len__,FAITHFUL,—,—,len(dataset)==rows.len()
+data/dataloader.py,LFM2DataLoader.__getitem__,FIXED,dtype int64->u32,7fccde8,padding dims/values + overlong-check faithful; was narrowing long->U32 fixed to I64; supervision bool->U8 (no candle bool)
+data/dataloader.py,lfm2_collator,FAITHFUL,—,—,all 6 torch.cat dims match (audio_in/text/audio_out dim=1; lens/modality/supervision dim=0)
+data/mapper.py,LFM2AudioChatMapper.__init__,FAITHFUL,—,—,codebooks + interleave knobs
+data/mapper.py,LFM2AudioChatMapper.__call__,FIXED,dtype int64->u32,7fbfa1f,control flow (startoftext/im_start/segments/im_end + 3 cats) faithful; finish casts text/audio_out to I64
+data/mapper.py,LFM2AudioChatMapper._append_text,FIXED,dtype int64->u32,7fbfa1f,modality as i64; out-params grouped to &mut Acc
+data/mapper.py,LFM2AudioChatMapper._append_interleaved_out,FIXED,dtype int64->u32,7fbfa1f,push text/audio_out parts; modality i64
+data/mapper.py,LFM2AudioChatMapper._append_audio_in,FIXED,dtype int64->u32,7fbfa1f,resample+mel; lens/modality i64 (real work not stub)
+data/mapper.py,LFM2AudioChatMapper._append_audio_out,FIXED,dtype int64->u32,7fbfa1f,mimi.encode codes + EOAudio frame; modality i64
+data/mapper.py,LFM2AudioChatMapper._encode_audio_out,FAITHFUL,—,—,resample to codec rate + mimi.encode + append EOAudio(2048)
+data/mapper.py,LFM2AudioChatMapper._load_audio_bytes,FAITHFUL,soundfile->symphonia,—,decode encoded-audio bytes to mono f32 waveform
+data/types.py,LFM2AudioModelInput.to,FAITHFUL,—,—,.to(device) on all 6 fields
+data/preprocess.py,preprocess_dataset,FAITHFUL,RET None->Result<usize>,—,iterate->map->filter(0<=max_ctx<len)->save_to_disk; ChatMapper trait = the Python mapper callable; returns kept-row count
+processor.py,LFM2AudioProcessor.decode,FAITHFUL,—,—,code-range guard [0,2047] then dispatch to AudioDetokenizer backend (Rust encode helper — no Python counterpart — carries the long->i64 fix; see ChatState.__init__)
+processor.py,LFM2AudioProcessor.to,FAITHFUL,no-op,—,device-agnostic (device at construction); documented no-op
+processor.py,LFM2AudioProcessor.eval,FAITHFUL,no-op,—,training-mode toggle; inference always eval; documented no-op
+processor.py,LFM2AudioProcessor.train,FAITHFUL,no-op,—,see eval
+processor.py,ChatState.__init__,FIXED,dtype int64->u32,f5bb6d0,text/audio_out(new_empty)/modality(full_like)/lens all long; were U32 now I64; audio_in stays F32
+processor.py,ChatState.add_text,FIXED,dtype int64->u32,f5bb6d0,modality_flag from_vec i64
+processor.py,ChatState.add_audio,FIXED,dtype int64->u32,f5bb6d0,resample(windowed-sinc)->mel->append; modality + frame-len i64; 3 torch.cat match
+processor.py,ChatState.append,FIXED,dtype int64->u32,f5bb6d0,invariants (1 text row / codebooks audio rows / flag==text+audio) match; cast incoming ids to i64 at cat
+processor.py,ChatState.__getitem__,FAITHFUL,—,—,Mapping over model_inputs
+processor.py,ChatState.__iter__,FAITHFUL,—,—,Mapping
+processor.py,ChatState.__len__,FAITHFUL,—,—,Mapping
+model/lfm2_audio.py,LFM2AudioModel.logits,FIXED,dtype u32-read,7fccde8,modality read to_vec1::<u32>()->i64; prefill parity preserved 1.118e-6
+model/lfm2_audio.py,LFM2AudioModel._prefill,FIXED,dtype u32-read,7fccde8,prefill_inputs modality + audio_in_lens read u32->i64 (lens unwrap_or_default would silently drop audio-in on i64)
+detokenizer.py,ISTFT.forward,FIXED,dtype/algorithm,8da5ec0,candle-native f32 irfft (inverse-DFT matmul)+conv_transpose1d OLA; was f64 rustfft; bf16 spec cast to f32; ==f64 ref 1.4e-7 + e2e
+detokenizer.py,LFM2AudioDetokenizer.forward,FAITHFUL,—,702b6be,FusedEmbedding->x6 upsample->Lfm2Model(sliding mask)->lin->polar->istft; e2e on full HF snapshot
+model/conformer/processor.py,FilterbankFeatures.stft,FAITHFUL,algorithm torch.stft->Conv1d-DFT,55acb23,windowed real-DFT as Conv1d kernel (stride=hop) f32 on-device; mel 1.18e-5 vs torch golden
+model/conformer/processor.py,FilterbankFeatures.forward,FAITHFUL,f32-on-device,55acb23,preemph->stft->mag^power->mel->log->per-feature norm all candle f32 on device; conformer-through-mel 5.6e-7

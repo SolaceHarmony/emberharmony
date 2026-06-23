@@ -23,10 +23,33 @@ from __future__ import annotations
 
 import argparse
 import ast
+import csv as csvmod
 import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+
+# The per-function CSV columns. The mechanical columns (everything except
+# hand_audit/deviation/commit/notes) are regenerated from ast+syn each run; the four
+# human columns are PRESERVED across runs by matching (python_file, python_symbol).
+CSV_COLUMNS = [
+    "python_file", "python_symbol", "py_args", "py_ret",
+    "rust_file", "rust_symbol", "rust_args", "rust_ret",
+    "struct_flag", "hand_audit", "deviation", "commit", "notes",
+]
+HUMAN_COLUMNS = ("hand_audit", "deviation", "commit", "notes")
+
+
+def load_existing_human(path: Path) -> dict[tuple[str, str], dict]:
+    """Preserve the human-maintained columns keyed by (python_file, python_symbol)."""
+    out: dict[tuple[str, str], dict] = {}
+    if not path.exists():
+        return out
+    with path.open(newline="") as f:
+        for row in csvmod.DictReader(f):
+            key = (row.get("python_file", ""), row.get("python_symbol", ""))
+            out[key] = {c: row.get(c, "") for c in HUMAN_COLUMNS}
+    return out
 
 HERE = Path(__file__).resolve().parent
 CRATE = HERE.parent
@@ -191,7 +214,11 @@ def main() -> int:
     ap.add_argument("--python-root", type=Path, default=DEFAULT_PY)
     ap.add_argument("--rust-json", type=Path, required=True)
     ap.add_argument("--scope", default="core", choices=["core", "all", "moshi", "demo"])
-    ap.add_argument("--out", type=Path)
+    ap.add_argument("--out", type=Path, help="Markdown report")
+    ap.add_argument("--csv", type=Path, help="per-function CSV (one row per Python fn)")
+    ap.add_argument("--seed", type=Path, default=HERE / "hand_audit_seed.csv",
+                    help="source-of-truth for the human columns (hand_audit/deviation/commit/notes), "
+                         "keyed by python_file+python_symbol; merged into the generated CSV")
     args = ap.parse_args()
 
     rust = json.loads(args.rust_json.read_text())
@@ -201,6 +228,7 @@ def main() -> int:
     lines = ["# Python → Rust signature & return-type audit", ""]
     tot = matched = missing = arity = ret = 0
     file_rows = []
+    csv_records: list[dict] = []
 
     for pf in py_files:
         rel = pf.relative_to(args.python_root).as_posix()
@@ -229,7 +257,34 @@ def main() -> int:
                 rs_args = ", ".join(a["ty"] for a in rs["args"])
                 rs_sig = f"{rs['container'] + '::' if rs['container'] else ''}{rs['name']}({rs_args}) -> {rs['ret']}"
             rows.append((py.line, py_sig, rs_sig, " ".join(fl) if fl else "ok"))
+            csv_records.append({
+                "python_file": rel,
+                "python_symbol": py.qual,
+                "py_args": "(" + ", ".join(py.args) + ")",
+                "py_ret": py.ret or "∅",
+                "rust_file": expected_rust(rel) if rs is not None else "—",
+                "rust_symbol": "—" if rs is None
+                else f"{rs['container'] + '::' if rs['container'] else ''}{rs['name']}",
+                "rust_args": "—" if rs is None else "(" + ", ".join(a["ty"] for a in rs["args"]) + ")",
+                "rust_ret": "—" if rs is None else rs["ret"],
+                "struct_flag": " ".join(fl) if fl else "ok",
+            })
         file_rows.append((rel, expected_rust(rel), rows))
+
+    if args.csv:
+        preserve = load_existing_human(args.seed)
+        with args.csv.open("w", newline="") as f:
+            w = csvmod.DictWriter(f, fieldnames=CSV_COLUMNS)
+            w.writeheader()
+            for rec in csv_records:
+                human = preserve.get((rec["python_file"], rec["python_symbol"]), {})
+                row = dict(rec)
+                for c in HUMAN_COLUMNS:
+                    row[c] = human.get(c) or ("TODO" if c == "hand_audit" else "")
+                w.writerow({c: row.get(c, "") for c in CSV_COLUMNS})
+        seeded = sum(1 for r in csv_records
+                     if preserve.get((r["python_file"], r["python_symbol"]), {}).get("hand_audit", "TODO") not in ("TODO", "", None))
+        print(f"wrote {args.csv}: {len(csv_records)} functions ({seeded} hand-audited, {len(csv_records) - seeded} TODO)")
 
     lines += [
         f"- Scope: `{args.scope}`  ·  Python root: `{args.python_root}`",
