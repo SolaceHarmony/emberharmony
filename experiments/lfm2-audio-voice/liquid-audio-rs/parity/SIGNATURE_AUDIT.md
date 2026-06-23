@@ -5,7 +5,7 @@
 - Flags among matched: **39** arity-mismatch, **5** return-presence-mismatch
 
 Legend: `∅` = no annotation. Flags — MISSING / ARITY py_n/rs_n / RET-py-returns-rust-unit.
-Type identity is shown side-by-side for human check, not auto-asserted.
+Type identity is shown side-by-side for review, not auto-asserted.
 
 ### Findings (the flags are idiomatic, verified against source)
 - **0 missing** — every Python function/method has a Rust counterpart.

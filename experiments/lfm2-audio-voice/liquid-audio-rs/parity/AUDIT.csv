@@ -1,4 +1,4 @@
-python_file,python_symbol,py_args,py_ret,rust_file,rust_symbol,rust_args,rust_ret,struct_flag,hand_audit,deviation,commit,py_parity,notes
+python_file,python_symbol,py_args,py_ret,rust_file,rust_symbol,rust_args,rust_ret,struct_flag,audit,deviation,commit,py_parity,notes
 data/dataloader.py,LFM2DataLoader.__init__,"(dataset_path: str, context_length: int)",None,data/dataloader.rs,LFM2DataLoader::new,"(impl Into < std :: path :: PathBuf >, usize, Vec < RawRow >, Device)",Self,ok,FAITHFUL,ctor-split,—,,inline load split into new(rows)+load_from_disk(path); device explicit; DEFAULT_CONTEXT_LENGTH=4096
 data/dataloader.py,LFM2DataLoader.__len__,(),int,data/dataloader.rs,LFM2DataLoader::len,(),usize,ok,FAITHFUL,—,—,,len(dataset)==rows.len()
 data/dataloader.py,LFM2DataLoader.__getitem__,(idx: int),LFM2AudioRow,data/dataloader.rs,LFM2DataLoader::get,(usize),Result < LFM2AudioRow >,ok,FIXED,dtype int64->u32,7fccde8,,padding dims/values + overlong-check faithful; was narrowing long->U32 fixed to I64; supervision bool->U8 (no candle bool)

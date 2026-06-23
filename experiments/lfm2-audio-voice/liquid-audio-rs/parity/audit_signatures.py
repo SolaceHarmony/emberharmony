@@ -13,7 +13,7 @@ signature + return type, and flags structural mismatches:
 
 Type identity across the two type systems is *not* auto-asserted (torch.Tensor vs
 candle Tensor, Optional[X] vs Option<X>, …) — the signatures are shown side by side
-for human verification; only the structural flags above are mechanical.
+for review; only the structural flags above are mechanical.
 
 Usage:
     .../py312/bin/python parity/audit_signatures.py \
@@ -30,29 +30,29 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 # The per-function CSV columns. The mechanical columns (everything except
-# hand_audit/deviation/commit/notes) are regenerated from ast+syn each run; the four
-# human columns are PRESERVED across runs by matching (python_file, python_symbol).
+# audit/deviation/commit/notes) are regenerated from ast+syn each run; the four
+# audit columns are PRESERVED across runs by matching (python_file, python_symbol).
 CSV_COLUMNS = [
     "python_file", "python_symbol", "py_args", "py_ret",
     "rust_file", "rust_symbol", "rust_args", "rust_ret",
-    "struct_flag", "hand_audit", "deviation", "commit", "py_parity", "notes",
+    "struct_flag", "audit", "deviation", "commit", "py_parity", "notes",
 ]
 # `py_parity`: the Python-COMPARISON test (golden) that pins this function's output
 # to Python, with its rel-err — the only verification that actually detects a
 # divergence (vs a Rust-internal regression lock). Empty = no direct Python golden
 # (off-path, no-op, infra, or covered only by a contract/lock test).
-HUMAN_COLUMNS = ("hand_audit", "deviation", "commit", "py_parity", "notes")
+AUDIT_COLUMNS = ("audit", "deviation", "commit", "py_parity", "notes")
 
 
-def load_existing_human(path: Path) -> dict[tuple[str, str], dict]:
-    """Preserve the human-maintained columns keyed by (python_file, python_symbol)."""
+def load_existing_audit(path: Path) -> dict[tuple[str, str], dict]:
+    """Preserve the agent-authored columns keyed by (python_file, python_symbol)."""
     out: dict[tuple[str, str], dict] = {}
     if not path.exists():
         return out
     with path.open(newline="") as f:
         for row in csvmod.DictReader(f):
             key = (row.get("python_file", ""), row.get("python_symbol", ""))
-            out[key] = {c: row.get(c, "") for c in HUMAN_COLUMNS}
+            out[key] = {c: row.get(c, "") for c in AUDIT_COLUMNS}
     return out
 
 HERE = Path(__file__).resolve().parent
@@ -196,7 +196,7 @@ class RustIndex:
 
 def flags(py: PyFn, rs: dict | None) -> list[str]:
     """Mechanical flags, with idiomatic patterns suppressed so what remains is worth a
-    human look. Suppressed: constructors (`__init__`→`new`: config-struct + VarBuilder +
+    review. Suppressed: constructors (`__init__`→`new`: config-struct + VarBuilder +
     Result<Self>) and Python functions with no return annotation (`∅`, no claim to check)."""
     if rs is None:
         return ["MISSING"]
@@ -220,8 +220,8 @@ def main() -> int:
     ap.add_argument("--scope", default="core", choices=["core", "all", "moshi", "demo"])
     ap.add_argument("--out", type=Path, help="Markdown report")
     ap.add_argument("--csv", type=Path, help="per-function CSV (one row per Python fn)")
-    ap.add_argument("--seed", type=Path, default=HERE / "hand_audit_seed.csv",
-                    help="source-of-truth for the human columns (hand_audit/deviation/commit/notes), "
+    ap.add_argument("--seed", type=Path, default=HERE / "audit_seed.csv",
+                    help="source-of-truth for the audit columns (audit/deviation/commit/notes), "
                          "keyed by python_file+python_symbol; merged into the generated CSV")
     args = ap.parse_args()
 
@@ -276,19 +276,19 @@ def main() -> int:
         file_rows.append((rel, expected_rust(rel), rows))
 
     if args.csv:
-        preserve = load_existing_human(args.seed)
+        preserve = load_existing_audit(args.seed)
         with args.csv.open("w", newline="") as f:
             w = csvmod.DictWriter(f, fieldnames=CSV_COLUMNS, lineterminator="\n")
             w.writeheader()
             for rec in csv_records:
-                human = preserve.get((rec["python_file"], rec["python_symbol"]), {})
+                audit = preserve.get((rec["python_file"], rec["python_symbol"]), {})
                 row = dict(rec)
-                for c in HUMAN_COLUMNS:
-                    row[c] = human.get(c) or ("TODO" if c == "hand_audit" else "")
+                for c in AUDIT_COLUMNS:
+                    row[c] = audit.get(c) or ("TODO" if c == "audit" else "")
                 w.writerow({c: row.get(c, "") for c in CSV_COLUMNS})
         seeded = sum(1 for r in csv_records
-                     if preserve.get((r["python_file"], r["python_symbol"]), {}).get("hand_audit", "TODO") not in ("TODO", "", None))
-        print(f"wrote {args.csv}: {len(csv_records)} functions ({seeded} hand-audited, {len(csv_records) - seeded} TODO)")
+                     if preserve.get((r["python_file"], r["python_symbol"]), {}).get("audit", "TODO") not in ("TODO", "", None))
+        print(f"wrote {args.csv}: {len(csv_records)} functions ({seeded} audited, {len(csv_records) - seeded} TODO)")
 
     lines += [
         f"- Scope: `{args.scope}`  ·  Python root: `{args.python_root}`",
@@ -296,7 +296,7 @@ def main() -> int:
         f"- Flags among matched: **{arity}** arity-mismatch, **{ret}** return-presence-mismatch",
         "",
         "Legend: `∅` = no annotation. Flags — MISSING / ARITY py_n/rs_n / RET-py-returns-rust-unit.",
-        "Type identity is shown side-by-side for human check, not auto-asserted.",
+        "Type identity is shown side-by-side for review, not auto-asserted.",
         "",
         "### Findings (the flags are idiomatic, verified against source)",
         "- **0 missing** — every Python function/method has a Rust counterpart.",

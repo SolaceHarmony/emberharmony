@@ -1,4 +1,4 @@
-python_file,python_symbol,hand_audit,deviation,commit,py_parity,notes
+python_file,python_symbol,audit,deviation,commit,py_parity,notes
 data/dataloader.py,LFM2DataLoader.__init__,FAITHFUL,ctor-split,—,,inline load split into new(rows)+load_from_disk(path); device explicit; DEFAULT_CONTEXT_LENGTH=4096
 data/dataloader.py,LFM2DataLoader.__len__,FAITHFUL,—,—,,len(dataset)==rows.len()
 data/dataloader.py,LFM2DataLoader.__getitem__,FIXED,dtype int64->u32,7fccde8,,padding dims/values + overlong-check faithful; was narrowing long->U32 fixed to I64; supervision bool->U8 (no candle bool)
