@@ -31,6 +31,8 @@ pub struct ConformerEncoderConfig {
     pub n_heads: usize,
     pub conv_kernel_size: usize,
     pub xscaling: bool,
+    /// `rel_pos` (the model's config) or `abs_pos` — selects the per-layer attention.
+    pub self_attention_model: String,
 }
 
 /// Python union for `conv_context_size`: the string `"causal"` or a list of two
@@ -91,7 +93,7 @@ impl ConformerEncoder {
         let layers_vb = vb.pp("layers");
         let mut layers = Vec::with_capacity(cfg.n_layers);
         for i in 0..cfg.n_layers {
-            layers.push(ConformerLayer::new(cfg.d_model, d_ff, cfg.n_heads, cfg.conv_kernel_size, true, layers_vb.pp(i.to_string()))?);
+            layers.push(ConformerLayer::new(cfg.d_model, d_ff, cfg.n_heads, cfg.conv_kernel_size, true, &cfg.self_attention_model, layers_vb.pp(i.to_string()))?);
         }
 
         let out_proj = if cfg.feat_out > 0 && cfg.feat_out != cfg.d_model {
@@ -137,7 +139,7 @@ impl ConformerEncoder {
             n_layers: cfg.n_layers,
             subsampling_factor: cfg.subsampling_factor,
             att_context_style: "regular".to_string(),
-            self_attention_model: "rel_pos".to_string(),
+            self_attention_model: cfg.self_attention_model.clone(),
             att_context_size_all,
             att_context_size,
             att_context_probs,
@@ -388,13 +390,17 @@ impl ConformerEncoder {
     }
 
     /// PORT: `change_attention_model` (encoder.py L1017-1144). Switch the attention
-    /// model / look-ahead. This inference port wires only `rel_pos` (the model's
-    /// configuration); the Python `abs_pos` / `rel_pos_local_attn` branches rebuild
-    /// the positional encoder and per-layer attention from new weights
-    /// (`load_state_dict`), which has no candle analog here. So `rel_pos → rel_pos`
-    /// is a faithful reconfiguration (the `RelPositionalEncoding` is already the
-    /// right type — no module rebuild — and `set_max_audio_length` resets the table);
-    /// other targets error rather than silently no-op.
+    /// model / look-ahead at RUNTIME. This inference port wires only `rel_pos → rel_pos`
+    /// here; the Python `abs_pos` / `rel_pos_local_attn` branches rebuild the positional
+    /// encoder and per-layer attention from new weights (`load_state_dict`), which has
+    /// no candle analog at runtime. (Note: an `abs_pos` encoder CAN be built at
+    /// construction — `ConformerLayer` selects `RelPos`/`Abs` from
+    /// `cfg.self_attention_model`, base-MHA path verified by `abs_attention_parity` —
+    /// but the encoder still holds a fixed `RelPositionalEncoding`, so the abs absolute
+    /// pos-enc swap remains config-gated and a live switch is not supported.) So
+    /// `rel_pos → rel_pos` is a faithful reconfiguration (the `RelPositionalEncoding`
+    /// is already the right type and `set_max_audio_length` resets the table); other
+    /// targets error rather than silently no-op.
     pub fn change_attention_model(&mut self, self_attention_model: Option<&str>, att_context_size: Option<Vec<i64>>) -> Result<()> {
         let att_context_size = att_context_size.filter(|v| !v.is_empty()).unwrap_or_else(|| self.att_context_size.clone());
         let sam = self_attention_model.unwrap_or(&self.self_attention_model).to_string();

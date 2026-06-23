@@ -78,6 +78,7 @@ fn parse_encoder(e: &Value) -> Result<ConformerEncoderConfig> {
         n_heads: req_usize(e, "n_heads")?,
         conv_kernel_size: req_usize(e, "conv_kernel_size")?,
         xscaling: e["xscaling"].as_bool().unwrap_or(true),
+        self_attention_model: e["self_attention_model"].as_str().unwrap_or("rel_pos").to_string(),
     })
 }
 

@@ -86,6 +86,18 @@ def main() -> int:
     save_file(refs, str(out / "mha_sdpa_refs.safetensors"))
     print("dumped:", {k: tuple(v.shape) for k, v in refs.items() if not k.startswith("w.")})
     print("weight keys:", [k[2:] for k in refs if k.startswith("w.")])
+
+    # Base (abs_pos) MultiHeadAttention: the attention the abs_pos ConformerLayer uses
+    # (no pos_emb). The rel_pos model never exercises it, so this golden verifies the
+    # base path in isolation. Same seed-0 inputs, fresh weights.
+    base = mha.MultiHeadAttention(n_head=n_head, n_feat=n_feat, dropout_rate=0.0, use_bias=True).eval()
+    with torch.no_grad():
+        out_abs = base(q, q, q, mask=None)
+    refs_abs = {"q": q.contiguous(), "out": out_abs.contiguous()}
+    for k, v in base.state_dict().items():
+        refs_abs[f"w.{k}"] = v.contiguous()
+    save_file(refs_abs, str(out / "mha_abs_refs.safetensors"))
+    print("dumped abs:", {k: tuple(v.shape) for k, v in refs_abs.items() if not k.startswith("w.")})
     return 0
 
 

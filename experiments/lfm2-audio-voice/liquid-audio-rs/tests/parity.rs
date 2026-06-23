@@ -126,6 +126,37 @@ fn rel_pos_attention_sdpa_parity() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Detector for the base (abs_pos) `MultiHeadAttention.forward`. The encoder uses the
+/// rel-pos subclass, so this standard scaled-dot-product path is otherwise unexercised;
+/// it is the attention the `abs_pos` `ConformerLayer` variant dispatches to. Golden:
+/// `parity/dump_mha_sdpa.py` (`mha_abs_refs`).
+#[test]
+#[ignore = "needs parity/golden/mha_abs_refs.safetensors (run dump_mha_sdpa.py)"]
+fn abs_attention_parity() -> anyhow::Result<()> {
+    use liquid_audio::model::conformer::mha::MultiHeadAttention;
+    use std::collections::HashMap;
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let device = Device::Cpu;
+    let g = candle_core::safetensors::load(manifest.join("parity/golden/mha_abs_refs.safetensors"), &device)?;
+    let q = g.get("q").expect("q").clone();
+    let out_ref = g.get("out").expect("out").clone();
+
+    let mut ws = HashMap::new();
+    for (k, v) in g.iter() {
+        if let Some(name) = k.strip_prefix("w.") {
+            ws.insert(name.to_string(), v.clone());
+        }
+    }
+    let vb = candle_nn::VarBuilder::from_tensors(ws, DType::F32, &device);
+    let att = MultiHeadAttention::new(8, 512, true, vb)?;
+
+    let out = att.forward(&q, &q, &q, None)?;
+    let e = rel_err(&out, &out_ref);
+    println!("rust abs (base) MHA vs Python: {e:.3e}");
+    assert!(e < 5e-3, "Rust base MHA vs Python: {e}");
+    Ok(())
+}
+
 #[test]
 #[ignore = "needs LFM_MODEL_DIR + parity/golden/conformer_stages.safetensors"]
 fn conformer_stages_parity() -> anyhow::Result<()> {

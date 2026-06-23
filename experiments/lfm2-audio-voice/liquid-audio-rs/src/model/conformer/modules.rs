@@ -12,7 +12,7 @@ use candle_nn::{
     Linear, Module, ModuleT, VarBuilder,
 };
 
-use super::mha::RelPositionMultiHeadAttention;
+use super::mha::{MultiHeadAttention, RelPositionMultiHeadAttention};
 use crate::model::norm::{layer_norm, LayerNorm};
 
 /// `ConformerFeedForward`: Linear → SiLU → Linear.
@@ -176,11 +176,28 @@ impl CausalConv1D {
 
 /// `ConformerLayer`: FF/2 → self-attn (rel-pos) → conv → FF/2, pre-LayerNorm with
 /// residuals (`fc_factor = 0.5` on the feed-forwards), then output LayerNorm.
+/// `self_attention_model` selects the layer's attention, faithful to NeMo's
+/// ConformerLayer (which holds one of these as `self.self_attn`):
+/// * `rel_pos` — Transformer-XL relative-position attention (the LFM2.5-Audio model's
+///   config; takes the rel `pos_emb`).
+/// * `abs_pos` — standard scaled-dot-product attention; the encoder instead adds an
+///   absolute `PositionalEncoding` to the input and the layer passes NO `pos_emb`.
+///
+/// The `abs_pos` variant needs an abs_pos checkpoint (base MHA — no `linear_pos` /
+/// `pos_bias_*`), which the LFM2.5-Audio model is not, so it is never constructed here;
+/// the attention itself is verified by `rel_pos_attention_sdpa_parity`'s sibling
+/// `abs_attention_parity`. (The encoder-side absolute pos-enc swap is documented in
+/// `ConformerEncoder` — only `rel_pos` is wired in this inference port.)
+enum SelfAttention {
+    RelPos(RelPositionMultiHeadAttention),
+    Abs(MultiHeadAttention),
+}
+
 pub struct ConformerLayer {
     norm_feed_forward1: LayerNorm,
     feed_forward1: ConformerFeedForward,
     norm_self_att: LayerNorm,
-    self_attn: RelPositionMultiHeadAttention,
+    self_attn: SelfAttention,
     norm_conv: LayerNorm,
     conv: ConformerConvolution,
     norm_feed_forward2: LayerNorm,
@@ -189,12 +206,25 @@ pub struct ConformerLayer {
 }
 
 impl ConformerLayer {
-    pub fn new(d_model: usize, d_ff: usize, n_heads: usize, conv_kernel_size: usize, use_bias: bool, vb: VarBuilder) -> Result<Self> {
+    pub fn new(
+        d_model: usize,
+        d_ff: usize,
+        n_heads: usize,
+        conv_kernel_size: usize,
+        use_bias: bool,
+        self_attention_model: &str,
+        vb: VarBuilder,
+    ) -> Result<Self> {
+        let self_attn = match self_attention_model {
+            "rel_pos" => SelfAttention::RelPos(RelPositionMultiHeadAttention::new(n_heads, d_model, use_bias, vb.pp("self_attn"))?),
+            "abs_pos" => SelfAttention::Abs(MultiHeadAttention::new(n_heads, d_model, use_bias, vb.pp("self_attn"))?),
+            other => candle_core::bail!("ConformerLayer: unsupported self_attention_model '{other}' (rel_pos | abs_pos)"),
+        };
         Ok(Self {
             norm_feed_forward1: layer_norm(d_model, 1e-5, vb.pp("norm_feed_forward1"))?,
             feed_forward1: ConformerFeedForward::new(d_model, d_ff, vb.pp("feed_forward1"))?,
             norm_self_att: layer_norm(d_model, 1e-5, vb.pp("norm_self_att"))?,
-            self_attn: RelPositionMultiHeadAttention::new(n_heads, d_model, use_bias, vb.pp("self_attn"))?,
+            self_attn,
             norm_conv: layer_norm(d_model, 1e-5, vb.pp("norm_conv"))?,
             conv: ConformerConvolution::new(d_model, conv_kernel_size, use_bias, vb.pp("conv"))?,
             norm_feed_forward2: layer_norm(d_model, 1e-5, vb.pp("norm_feed_forward2"))?,
@@ -216,7 +246,12 @@ impl ConformerLayer {
         let residual = (residual + (h * FC)?)?;
 
         let h = self.norm_self_att.forward(&residual)?;
-        let h = self.self_attn.forward(&h, &h, &h, att_mask, pos_emb)?;
+        // rel_pos passes the relative `pos_emb`; abs_pos uses standard attention with no
+        // pos_emb (the encoder would have added an absolute PositionalEncoding upstream).
+        let h = match &self.self_attn {
+            SelfAttention::RelPos(a) => a.forward(&h, &h, &h, att_mask, pos_emb)?,
+            SelfAttention::Abs(a) => a.forward(&h, &h, &h, att_mask)?,
+        };
         let residual = (residual + h)?;
 
         let h = self.conv.forward(&self.norm_conv.forward(&residual)?, pad_mask)?;
