@@ -35,6 +35,23 @@ pub fn calculate_conv_output_size(input_size: i64, kernel_size: i64, stride: i64
     (input_size + padding.0 + padding.1 - kernel_size) / stride + 1
 }
 
+/// Pad the last two (H, W) dims of a `(B,C,H,W)` tensor to even with trailing zeros.
+/// Workaround for candle's conv2d stride>1 backward, which mis-sizes the grad-input
+/// for odd input spatial dims (see `forward_conv`). Forward-identical for a stride-2
+/// k3 p1 conv: the extra zero is the same one `padding` adds and the output count is
+/// unchanged, so this only affects the (otherwise-failing) backward.
+fn pad_even_hw(x: &Tensor) -> Result<Tensor> {
+    let (_, _, h, w) = x.dims4()?;
+    let mut x = x.clone();
+    if h % 2 == 1 {
+        x = x.pad_with_zeros(2, 0, 1)?;
+    }
+    if w % 2 == 1 {
+        x = x.pad_with_zeros(3, 0, 1)?;
+    }
+    Ok(x)
+}
+
 enum Op {
     Conv(Conv2d),
     Relu,
@@ -71,7 +88,23 @@ impl MaskedConvSequential {
         let mut x = x.clone();
         for op in &self.layers {
             x = match op {
-                Op::Conv(c) => c.forward(&x)?,
+                Op::Conv(c) => {
+                    // candle's conv2d stride>1 BACKWARD errors on odd input spatial
+                    // dims: out=N is ambiguous (input 2N-1 or 2N both map to N), and the
+                    // grad-input path assumes the even (2N) size, so an odd input fails
+                    // with a shape-mismatch add. The subsampling hits odd time dims
+                    // (e.g. 101->51), which broke end-to-end training backward. Padding
+                    // an odd H/W to even with a trailing zero is forward-IDENTICAL — the
+                    // appended column is the same zero `padding` adds and the output
+                    // count is unchanged (verified: 0.0 forward diff) — and lets the
+                    // backward run. Stride-1 convs are exact (no ambiguity), so skip them
+                    // (padding would change their output length).
+                    if c.config().stride != 1 {
+                        c.forward(&pad_even_hw(&x)?)?
+                    } else {
+                        c.forward(&x)?
+                    }
+                }
                 Op::Relu => x.relu()?,
             };
         }

@@ -288,14 +288,19 @@ fn conformer_streaming_inventory() -> anyhow::Result<()> {
 /// differentiable variants (`softmax`, `rope_slow`, `rope_i_slow`, `layer_norm_slow`,
 /// the differentiable `RmsNorm`), a backward must reach those params.
 ///
-/// Validated per subsystem (conformer encode, backbone) because both backward cleanly;
-/// the FULL `logits`/`forward` backward currently hits a separate latent shape bug
-/// (`[..,32]` vs `[..,31]`) — a distinct issue exposed only now that autograd reaches
-/// that far, tracked separately.
+/// Validated per subsystem (conformer encode, backbone) AND end-to-end via the real
+/// training path (`forward(batch) -> loss.backward()`). The full path additionally
+/// covers the conformer subsampling stem: candle's conv2d stride-2 BACKWARD errors on
+/// odd input spatial dims (out=N is ambiguous, the grad-input assumes the even size),
+/// and the subsampling hits odd time dims (101->51), so the full backward used to fail
+/// with `[..,32]` vs `[..,31]`. `subsampling::pad_even_hw` (forward-identical even-pad
+/// before strided convs) fixes it; this test is the regression guard — it both runs the
+/// full backward and asserts the subsampling conv weights receive a gradient.
 #[test]
 #[ignore = "needs LFM_MODEL_DIR (full-model load + backward, ~6 GB F32)"]
 fn training_gradients_reach_attention_and_norms() -> anyhow::Result<()> {
     let dir = std::env::var("LFM_MODEL_DIR").expect("set LFM_MODEL_DIR");
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let device = Device::Cpu;
     let tl = liquid_audio::loader::from_pretrained_trainable(Path::new(&dir), DType::F32, &device)?;
     let data = tl.varmap.data().lock().unwrap();
@@ -337,6 +342,43 @@ fn training_gradients_reach_attention_and_norms() -> anyhow::Result<()> {
     println!("backbone grad coverage: {h2}/{t2}");
     miss2.sort();
     assert!(miss2.is_empty(), "backbone params with NO gradient: {:?}", &miss2[..miss2.len().min(8)]);
+
+    // Full training path: forward(batch) -> loss.backward(). This exercises the
+    // conformer subsampling stem (per-segment conv2d), the scatter into the backbone,
+    // and the audio/text heads together. Before pad_even_hw, the strided-conv backward
+    // errored on odd time dims (101->51); this section is the regression guard.
+    use liquid_audio::model::lfm2_audio::LFM2AudioModelInput;
+    let r = candle_core::safetensors::load(manifest.join("parity/golden/prefill_refs.safetensors"), &device)?;
+    let text = r.get("text").unwrap().to_dtype(DType::I64)?;
+    let audio_in = r.get("audio_in").unwrap().to_dtype(DType::F32)?;
+    let audio_in_lens = r.get("audio_in_lens").unwrap().to_dtype(DType::I64)?;
+    let audio_out = r.get("audio_out").unwrap().to_dtype(DType::I64)?;
+    let modality = r.get("modality_flag").unwrap().to_dtype(DType::I64)?;
+    let sup = Tensor::ones((1, modality.dim(1)?), DType::U8, &device)?;
+    let batch = LFM2AudioModelInput {
+        text,
+        audio_in,
+        audio_in_lens,
+        audio_out,
+        modality_flag: modality,
+        supervision_mask: sup,
+    };
+    let out = tl.model.forward(&batch)?;
+    // backward must NOT error (the conv2d odd-input shape bug) and must reach the
+    // subsampling convs — the params the bug previously starved.
+    let grads = out.loss.backward()?;
+    let (mut sub_have, mut sub_total) = (0usize, 0usize);
+    for (name, var) in data.iter() {
+        if name.starts_with("conformer.pre_encode.conv.") && name.ends_with("weight") {
+            sub_total += 1;
+            if grads.get(var).is_some() {
+                sub_have += 1;
+            }
+        }
+    }
+    println!("full forward+backward OK; subsampling conv grad coverage: {sub_have}/{sub_total}");
+    assert!(sub_total > 0, "expected to find subsampling conv weights by name");
+    assert_eq!(sub_have, sub_total, "subsampling conv weights with NO gradient after full backward");
     Ok(())
 }
 
