@@ -9,7 +9,9 @@
 //! Other subsampling schemes (vggnet/striding/*_conv1d) are not ported.
 
 use candle_core::{Result, Tensor, D};
-use candle_nn::{conv2d, linear, Conv2d, Conv2dConfig, Linear, Module, VarBuilder};
+use candle_nn::{conv1d, conv2d, linear, Conv1d, Conv1dConfig, Conv2d, Conv2dConfig, Linear, Module, VarBuilder};
+
+use super::modules::{CausalConv1D, CausalPadding};
 
 /// Faithful to `calc_length`: output length after `repeat_num` strided convs.
 pub fn calc_length(length: usize, all_paddings: i64, kernel_size: i64, stride: i64, ceil_mode: bool, repeat_num: usize) -> usize {
@@ -52,8 +54,55 @@ fn pad_even_hw(x: &Tensor) -> Result<Tensor> {
     Ok(x)
 }
 
+/// 1-D analogue of [`pad_even_hw`] for `(B, C, L)` conv1d inputs: pad an odd `L` to
+/// even with a trailing zero before a strided conv1d. Same candle stride>1 backward
+/// workaround; forward-identical for `k`-odd / symmetric-pad convs.
+fn pad_even_1d(x: &Tensor) -> Result<Tensor> {
+    let (_, _, l) = x.dims3()?;
+    if l % 2 == 1 {
+        x.pad_with_zeros(2, 0, 1)
+    } else {
+        Ok(x.clone())
+    }
+}
+
+/// `MaxPool2d(kernel, stride, padding=0, ceil_mode=True)` (vggnet). candle's
+/// `max_pool2d` is floor-mode only, so for the `k=s=2` case torch's ceil mode is
+/// reproduced by edge-replicating an odd H/W to even, then floor-pooling: the extra
+/// ceil window covers only the last in-bounds element, and `max(x[last], x[last]) =
+/// x[last]` — exactly torch's partial-window max (verified bit-identical in tests).
+fn ceil_pool2d(x: &Tensor, kernel: usize, stride: usize) -> Result<Tensor> {
+    debug_assert_eq!((kernel, stride), (2, 2), "ceil_pool2d only implements the vggnet k=s=2 case");
+    let (_, _, h, w) = x.dims4()?;
+    let mut x = x.clone();
+    if h % 2 == 1 {
+        let last = x.narrow(2, h - 1, 1)?;
+        x = Tensor::cat(&[&x, &last], 2)?;
+    }
+    if w % 2 == 1 {
+        let last = x.narrow(3, w - 1, 1)?;
+        x = Tensor::cat(&[&x, &last], 3)?;
+    }
+    x.max_pool2d_with_stride((kernel, kernel), (stride, stride))
+}
+
+/// Error for the causal conv2d subsampling paths (dw_striding/striding `is_causal`):
+/// they need NeMo's `CausalConv2D`, which is referenced but never defined in the
+/// upstream repo (imported from NeMo) — no source to port.
+fn causal_conv2d_unsupported(scheme: &str) -> candle_core::Error {
+    candle_core::Error::Msg(format!(
+        "ConvSubsampling causal '{scheme}' needs NeMo CausalConv2D (used-but-undefined upstream, no source)"
+    ))
+}
+
 enum Op {
     Conv(Conv2d),
+    /// 1-D conv for the `*_conv1d` schemes (input `(B, feat_in, T)`).
+    Conv1d(Conv1d),
+    /// Causal 1-D conv (`striding_conv1d` with `is_causal`): asymmetric left/right pad.
+    CausalConv1d(CausalConv1D),
+    /// `MaxPool2d(kernel, stride, padding=0, ceil_mode=True)` for `vggnet`.
+    MaxPool2dCeil { kernel: usize, stride: usize },
     Relu,
 }
 
@@ -105,6 +154,17 @@ impl MaskedConvSequential {
                         c.forward(&x)?
                     }
                 }
+                Op::Conv1d(c) => {
+                    if c.config().stride != 1 {
+                        c.forward(&pad_even_1d(&x)?)?
+                    } else {
+                        c.forward(&x)?
+                    }
+                }
+                // CausalConv1D pads asymmetrically (left=k-1, right=stride-1) inside
+                // its forward, so no even-pad here; offline ⇒ no cache.
+                Op::CausalConv1d(c) => c.forward(&x, None)?.0,
+                Op::MaxPool2dCeil { kernel, stride } => ceil_pool2d(&x, *kernel, *stride)?,
                 Op::Relu => x.relu()?,
             };
         }
@@ -145,6 +205,12 @@ impl MaskedConvSequential {
                     }
                     out
                 }
+                // The masked length-tracking path is only built for the conv2d
+                // `dw_striding` model scheme; the 1-D / pooling ops belong to the
+                // offline `forward_conv` schemes, which never use this path.
+                Op::Conv1d(_) | Op::CausalConv1d(_) | Op::MaxPool2dCeil { .. } => {
+                    unreachable!("masked conv path is dw_striding (Conv2d) only")
+                }
                 Op::Relu => x.relu()?,
             };
         }
@@ -155,7 +221,11 @@ impl MaskedConvSequential {
 
 pub struct ConvSubsampling {
     conv: MaskedConvSequential,
-    out: Linear,
+    /// `Some` for the conv2d schemes (flatten C×F → `feat_out`); `None` for conv1d
+    /// (the last conv already emits `feat_out` channels).
+    out: Option<Linear>,
+    /// `True` for vggnet/dw_striding/striding; `False` for the `*_conv1d` schemes.
+    conv2d_subsampling: bool,
     subsampling_factor: usize,
     /// mirrors Python `_sampling_num` (kept for 1:1 inventory; cold on the path).
     #[allow(dead_code)]
@@ -170,63 +240,205 @@ pub struct ConvSubsampling {
 }
 
 impl ConvSubsampling {
-    /// `dw_striding` builder. `feat_in` = mel bins, `feat_out` = encoder d_model.
+    /// `dw_striding` builder (the LFM2.5-Audio model's scheme), `is_causal=false`.
+    /// `feat_in` = mel bins, `feat_out` = encoder d_model. Thin wrapper over
+    /// [`Self::new_scheme`] so the model path is unchanged.
     pub fn new(subsampling_factor: usize, feat_in: usize, feat_out: usize, conv_channels: usize, vb: VarBuilder) -> Result<Self> {
+        Self::new_scheme("dw_striding", subsampling_factor, feat_in, feat_out, conv_channels, false, vb)
+    }
+
+    /// PORT: `ConvSubsampling.__init__` (subsampling.py L43-343) — all schemes.
+    /// `vggnet` / `dw_striding` / `striding` are conv2d (flatten + `out` Linear);
+    /// `striding_conv1d` / `dw_striding_conv1d` are conv1d (no `out`). The Sequential
+    /// index increments for EVERY appended module (incl. ReLU / MaxPool), so the conv
+    /// `vb` prefixes match the Python `conv.{i}.weight` state-dict keys exactly.
+    ///
+    /// `is_causal` is supported only where the upstream uses a class we have: the
+    /// `striding_conv1d` causal path is `CausalConv1D` (ported); the `dw_striding` /
+    /// `striding` causal paths need NeMo's `CausalConv2D`, which is used-but-undefined
+    /// upstream (no source) — those error rather than silently degrade.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_scheme(
+        subsampling: &str,
+        subsampling_factor: usize,
+        feat_in: usize,
+        feat_out: usize,
+        conv_channels: usize,
+        is_causal: bool,
+        vb: VarBuilder,
+    ) -> Result<Self> {
         let sampling_num = (subsampling_factor as f64).log2() as usize;
-        let stride = 2usize;
-        let k = 3usize;
-        let pad = (k - 1) / 2; // symmetric, non-causal
-        let dw_cfg = |groups: usize| Conv2dConfig { padding: pad, stride, dilation: 1, groups, ..Default::default() };
-        let pw_cfg = Conv2dConfig { padding: 0, stride: 1, dilation: 1, groups: 1, ..Default::default() };
-
         let conv = vb.pp("conv");
-        let mut layers = Vec::new();
+        let mut layers: Vec<Op> = Vec::new();
         let mut idx = 0usize;
+        // next vb prefix for a weighted layer + bump the Sequential index.
+        let mut next = |layers_idx: &mut usize| {
+            let p = conv.pp(layers_idx.to_string());
+            *layers_idx += 1;
+            p
+        };
 
-        // Layer 1: Conv2d(1 -> conv_channels), ReLU
-        layers.push(Op::Conv(conv2d(1, conv_channels, k, dw_cfg(1), conv.pp(idx.to_string()))?));
-        idx += 1;
-        layers.push(Op::Relu);
-        idx += 1;
+        let conv2d_subsampling;
+        let kernel_size;
+        let stride;
+        let left_padding;
+        let right_padding;
+        let ceil_mode;
 
-        for _ in 0..(sampling_num - 1) {
-            // depthwise
-            layers.push(Op::Conv(conv2d(conv_channels, conv_channels, k, dw_cfg(conv_channels), conv.pp(idx.to_string()))?));
-            idx += 1;
-            // pointwise (1x1)
-            layers.push(Op::Conv(conv2d(conv_channels, conv_channels, 1, pw_cfg, conv.pp(idx.to_string()))?));
-            idx += 1;
-            layers.push(Op::Relu);
-            idx += 1;
+        match subsampling {
+            "vggnet" => {
+                conv2d_subsampling = true;
+                stride = 2;
+                kernel_size = 2; // the MaxPool kernel/stride (what downsamples)
+                ceil_mode = true;
+                left_padding = 0;
+                right_padding = 0;
+                let cfg = Conv2dConfig { padding: 1, stride: 1, dilation: 1, groups: 1, ..Default::default() };
+                let mut in_ch = 1usize;
+                for _ in 0..sampling_num {
+                    layers.push(Op::Conv(conv2d(in_ch, conv_channels, 3, cfg, next(&mut idx))?));
+                    layers.push(Op::Relu);
+                    idx += 1;
+                    layers.push(Op::Conv(conv2d(conv_channels, conv_channels, 3, cfg, next(&mut idx))?));
+                    layers.push(Op::Relu);
+                    idx += 1;
+                    layers.push(Op::MaxPool2dCeil { kernel: 2, stride: 2 });
+                    idx += 1;
+                    in_ch = conv_channels;
+                }
+            }
+            "dw_striding" | "striding" => {
+                conv2d_subsampling = true;
+                stride = 2;
+                kernel_size = 3;
+                ceil_mode = false;
+                if is_causal {
+                    return Err(causal_conv2d_unsupported(subsampling));
+                }
+                left_padding = (kernel_size - 1) / 2;
+                right_padding = (kernel_size - 1) / 2;
+                let pad = left_padding;
+                let scfg = |groups: usize| Conv2dConfig { padding: pad, stride, dilation: 1, groups, ..Default::default() };
+                let pwcfg = Conv2dConfig { padding: 0, stride: 1, dilation: 1, groups: 1, ..Default::default() };
+                if subsampling == "dw_striding" {
+                    layers.push(Op::Conv(conv2d(1, conv_channels, kernel_size, scfg(1), next(&mut idx))?));
+                    layers.push(Op::Relu);
+                    idx += 1;
+                    for _ in 0..(sampling_num - 1) {
+                        layers.push(Op::Conv(conv2d(conv_channels, conv_channels, kernel_size, scfg(conv_channels), next(&mut idx))?));
+                        layers.push(Op::Conv(conv2d(conv_channels, conv_channels, 1, pwcfg, next(&mut idx))?));
+                        layers.push(Op::Relu);
+                        idx += 1;
+                    }
+                } else {
+                    // striding: plain Conv2d per sampling step.
+                    let mut in_ch = 1usize;
+                    for _ in 0..sampling_num {
+                        layers.push(Op::Conv(conv2d(in_ch, conv_channels, kernel_size, scfg(1), next(&mut idx))?));
+                        layers.push(Op::Relu);
+                        idx += 1;
+                        in_ch = conv_channels;
+                    }
+                }
+            }
+            "striding_conv1d" => {
+                conv2d_subsampling = false;
+                stride = 2;
+                kernel_size = 5;
+                ceil_mode = false;
+                if is_causal {
+                    // CausalConv1D (ported): left=k-1, right=stride-1.
+                    left_padding = kernel_size - 1;
+                    right_padding = stride - 1;
+                } else {
+                    left_padding = (kernel_size - 1) / 2;
+                    right_padding = (kernel_size - 1) / 2;
+                }
+                let cfg = Conv1dConfig { padding: left_padding, stride, dilation: 1, groups: 1, ..Default::default() };
+                let mut in_ch = feat_in;
+                for i in 0..sampling_num {
+                    let out_ch = if sampling_num == i + 1 { feat_out } else { conv_channels };
+                    if is_causal {
+                        layers.push(Op::CausalConv1d(CausalConv1D::new(in_ch, out_ch, kernel_size, stride, CausalPadding::Causal, 1, next(&mut idx))?));
+                    } else {
+                        layers.push(Op::Conv1d(conv1d(in_ch, out_ch, kernel_size, cfg, next(&mut idx))?));
+                    }
+                    layers.push(Op::Relu);
+                    idx += 1;
+                    in_ch = conv_channels;
+                }
+            }
+            "dw_striding_conv1d" => {
+                conv2d_subsampling = false;
+                stride = 2;
+                kernel_size = 5;
+                ceil_mode = false;
+                left_padding = (kernel_size - 1) / 2;
+                right_padding = (kernel_size - 1) / 2;
+                let dwcfg = |groups: usize| Conv1dConfig { padding: left_padding, stride, dilation: 1, groups, ..Default::default() };
+                let pwcfg = Conv1dConfig { padding: 0, stride: 1, dilation: 1, groups: 1, ..Default::default() };
+                // Layer 1: depthwise(feat_in, groups=feat_in) + pointwise.
+                let l1_out = if sampling_num == 1 { feat_out } else { conv_channels };
+                layers.push(Op::Conv1d(conv1d(feat_in, feat_in, kernel_size, dwcfg(feat_in), next(&mut idx))?));
+                layers.push(Op::Conv1d(conv1d(feat_in, l1_out, 1, pwcfg, next(&mut idx))?));
+                layers.push(Op::Relu);
+                idx += 1;
+                let mut in_ch = conv_channels;
+                for i in 0..(sampling_num - 1) {
+                    let out_ch = if sampling_num == i + 2 { feat_out } else { conv_channels };
+                    layers.push(Op::Conv1d(conv1d(in_ch, in_ch, kernel_size, dwcfg(in_ch), next(&mut idx))?));
+                    layers.push(Op::Conv1d(conv1d(in_ch, out_ch, 1, pwcfg, next(&mut idx))?));
+                    layers.push(Op::Relu);
+                    idx += 1;
+                    in_ch = conv_channels;
+                }
+            }
+            other => {
+                return Err(candle_core::Error::Msg(format!("Not valid sub-sampling: {other}!")));
+            }
         }
 
-        let all_paddings = (2 * pad) as i64;
-        let out_freq = calc_length(feat_in, all_paddings, k as i64, stride as i64, false, sampling_num);
-        let out = linear(conv_channels * out_freq, feat_out, vb.pp("out"))?;
+        // conv2d schemes flatten C×F via a final Linear sized by calc_length.
+        let out = if conv2d_subsampling {
+            let all_paddings = (left_padding + right_padding) as i64;
+            let out_freq = calc_length(feat_in, all_paddings, kernel_size as i64, stride as i64, ceil_mode, sampling_num);
+            Some(linear(conv_channels * out_freq, feat_out, vb.pp("out"))?)
+        } else {
+            None
+        };
 
         Ok(Self {
             conv: MaskedConvSequential::new(layers),
             out,
+            conv2d_subsampling,
             subsampling_factor,
             sampling_num,
-            kernel_size: k,
+            kernel_size,
             stride,
             conv_channels,
             subsampling_conv_chunking_factor: 1,
-            is_causal: false,
+            is_causal,
         })
     }
 
-    /// `(B, T, feat_in)` → `(B, T', feat_out)`.
+    /// `(B, T, feat_in)` → `(B, T', feat_out)`. conv2d schemes unsqueeze a channel,
+    /// run the conv stack, flatten `C×F` and project; conv1d schemes transpose to
+    /// `(B, feat_in, T)`, run the conv stack, and transpose back.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let x = self.forward_conv(x)?;
-        // (B, C, T', F') → (B, T', C*F')
-        let (b, c, t, f) = x.dims4()?;
-        let x = x.transpose(1, 2)?.contiguous()?.reshape((b, t, c * f))?;
-        self.out.forward(&x)
+        if self.conv2d_subsampling {
+            let y = self.forward_conv(x)?; // (B, C, T', F')
+            let (b, c, t, f) = y.dims4()?;
+            let y = y.transpose(1, 2)?.contiguous()?.reshape((b, t, c * f))?;
+            self.out.as_ref().expect("conv2d scheme has an out Linear").forward(&y)
+        } else {
+            let xin = x.transpose(1, 2)?.contiguous()?; // (B, feat_in, T)
+            let y = self.conv.forward_conv(&xin)?; // (B, C=feat_out, T')
+            y.transpose(1, 2)?.contiguous() // (B, T', feat_out)
+        }
     }
 
-    /// Debug: conv stack output `(B, C, T', F')` before the flatten + `out` linear.
+    /// Debug: conv2d conv-stack output `(B, C, T', F')` before the flatten + `out`
+    /// linear. (conv2d schemes only — the `conformer_sub_conv` parity probe.)
     #[doc(hidden)]
     pub fn forward_conv(&self, x: &Tensor) -> Result<Tensor> {
         let x = x.unsqueeze(1)?; // (B, 1, T, F)

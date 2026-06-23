@@ -126,6 +126,52 @@ fn rel_pos_attention_sdpa_parity() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Detector for the off-path ConvSubsampling schemes (vggnet / striding / the conv1d
+/// pair). The model is `dw_striding`; these are alternative architectures verified
+/// against torch on shared weights. The golden applies the REAL conv layers directly
+/// (`parity/dump_subsampling_schemes.py`) because the upstream masking wrapper is
+/// conv2d-only and breaks on MaxPool2d / Conv1d — the masking it skips is a no-op at
+/// full length, so the conv/pool/linear ops are the faithful reference.
+#[test]
+#[ignore = "needs parity/golden/subsampling_schemes_refs.safetensors (run dump_subsampling_schemes.py)"]
+fn subsampling_schemes_parity() -> anyhow::Result<()> {
+    use liquid_audio::model::conformer::subsampling::ConvSubsampling;
+    use std::collections::HashMap;
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let device = Device::Cpu;
+    let g = candle_core::safetensors::load(manifest.join("parity/golden/subsampling_schemes_refs.safetensors"), &device)?;
+    let x = g.get("x").expect("x").clone(); // (B, T, feat_in)
+
+    // factor=8, feat_in=128, feat_out=512, conv_channels=256 (matches the dump).
+    // (golden_key, scheme, is_causal)
+    let cases: [(&str, &str, bool); 6] = [
+        ("vggnet", "vggnet", false),
+        ("striding", "striding", false),
+        ("striding_conv1d", "striding_conv1d", false),
+        ("striding_conv1d_causal", "striding_conv1d", true),
+        ("dw_striding_conv1d", "dw_striding_conv1d", false),
+        ("dw_striding", "dw_striding", false),
+    ];
+    for (key, name, is_causal) in cases {
+        let prefix = format!("{key}.w.");
+        let mut ws = HashMap::new();
+        for (k, v) in g.iter() {
+            if let Some(rest) = k.strip_prefix(&prefix) {
+                ws.insert(rest.to_string(), v.clone());
+            }
+        }
+        let vb = candle_nn::VarBuilder::from_tensors(ws, DType::F32, &device);
+        let sub = ConvSubsampling::new_scheme(name, 8, 128, 512, 256, is_causal, vb)?;
+        let out = sub.forward(&x)?;
+        let want = g.get(&format!("{key}.out")).expect("out");
+        assert_eq!(out.dims(), want.dims(), "{key} out shape vs Python");
+        let e = rel_err(&out, want);
+        println!("{key:24} rust {:?}  rel-err {e:.3e}", out.dims());
+        assert!(e < 5e-3, "{key} subsampling-scheme parity vs torch: {e}");
+    }
+    Ok(())
+}
+
 /// Detector for `_create_masks` (the limited/chunked-context attention masks). The
 /// offline path uses unlimited context (all-zero masks ⇒ `None`), so the `triu`/`tril`
 /// band + `chunked_limited` logic is otherwise unexercised. Golden runs the REAL
