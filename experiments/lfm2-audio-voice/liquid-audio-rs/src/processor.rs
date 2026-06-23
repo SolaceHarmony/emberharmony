@@ -96,12 +96,17 @@ impl LFM2AudioProcessor {
     }
 
     /// Encode text without auto special tokens → token id row `(1, n)`.
+    ///
+    /// I64 (torch.long): Python `text.encode(..., return_tensors="pt")` yields a long
+    /// tensor, and every downstream id field (`audio_out` = `text.new_empty`,
+    /// `modality_flag` = `full_like(text)`) inherits it. candle's index_select/embedding
+    /// accept I64, so there is no reason to narrow to U32.
     pub fn encode(&self, text: &str) -> Result<Tensor> {
         let enc = self
             .tokenizer
             .encode(text, false)
             .map_err(|e| candle_core::Error::Msg(format!("encode: {e}")))?;
-        let ids: Vec<u32> = enc.get_ids().to_vec();
+        let ids: Vec<i64> = enc.get_ids().iter().map(|&id| id as i64).collect();
         let n = ids.len();
         Tensor::from_vec(ids, (1, n), &self.device)
     }
@@ -136,11 +141,11 @@ impl LFM2AudioProcessor {
 pub struct ChatState<'a> {
     proc: &'a LFM2AudioProcessor,
     codebooks: usize,
-    pub text: Tensor,          // (1, n) u32 token ids
+    pub text: Tensor,          // (1, n) i64 token ids (torch.long)
     pub audio_in: Tensor,      // (nfilt, total_frames) f32 mel
-    pub audio_in_lens: Tensor, // (k,) u32
-    pub audio_out: Tensor,     // (codebooks, m) u32
-    pub modality_flag: Tensor, // (1, n) u32 (LFMModality)
+    pub audio_in_lens: Tensor, // (k,) i64 (torch.long)
+    pub audio_out: Tensor,     // (codebooks, m) i64 (torch.long)
+    pub modality_flag: Tensor, // (1, n) i64 (LFMModality; torch.long)
 }
 
 impl<'a> ChatState<'a> {
@@ -149,7 +154,7 @@ impl<'a> ChatState<'a> {
         let text = proc.encode("<|startoftext|>")?;
         let n = text.dim(1)?;
         let nfilt = proc.audio.nfilt();
-        let modality_flag = Tensor::from_vec(vec![LFMModality::Text as u32; n], (1, n), dev)?;
+        let modality_flag = Tensor::from_vec(vec![LFMModality::Text as i64; n], (1, n), dev)?;
         Ok(Self {
             proc,
             codebooks,
@@ -160,8 +165,8 @@ impl<'a> ChatState<'a> {
             // elements, is read only via `dim()` while empty, and is replaced (not
             // cat'd) on the first add — so no zero-size buffer is ever created.
             audio_in: Tensor::zeros((nfilt, 1), candle_core::DType::F32, dev)?.narrow(1, 0, 0)?,
-            audio_in_lens: Tensor::zeros((1,), candle_core::DType::U32, dev)?.narrow(0, 0, 0)?,
-            audio_out: Tensor::zeros((codebooks, 1), candle_core::DType::U32, dev)?.narrow(1, 0, 0)?,
+            audio_in_lens: Tensor::zeros((1,), candle_core::DType::I64, dev)?.narrow(0, 0, 0)?,
+            audio_out: Tensor::zeros((codebooks, 1), candle_core::DType::I64, dev)?.narrow(1, 0, 0)?,
             modality_flag,
         })
     }
@@ -169,7 +174,7 @@ impl<'a> ChatState<'a> {
     pub fn add_text(&mut self, text: &str) -> Result<()> {
         let new_text = self.proc.encode(text)?;
         let n = new_text.dim(1)?;
-        let new_mod = Tensor::from_vec(vec![LFMModality::Text as u32; n], (1, n), &self.proc.device)?;
+        let new_mod = Tensor::from_vec(vec![LFMModality::Text as i64; n], (1, n), &self.proc.device)?;
         self.text = Tensor::cat(&[&self.text, &new_text], 1)?;
         self.modality_flag = Tensor::cat(&[&self.modality_flag, &new_mod], 1)?;
         Ok(())
@@ -182,8 +187,8 @@ impl<'a> ChatState<'a> {
         let new_audio_in = mel.i(0)?; // (nfilt, frames)
         let frames = new_audio_in.dim(1)?;
         let emb_len = mel2emb_len(frames as i64) as usize;
-        let new_mod = Tensor::from_vec(vec![LFMModality::AudioIn as u32; emb_len], (1, emb_len), &self.proc.device)?;
-        let new_len = Tensor::from_vec(vec![frames as u32], (1,), &self.proc.device)?;
+        let new_mod = Tensor::from_vec(vec![LFMModality::AudioIn as i64; emb_len], (1, emb_len), &self.proc.device)?;
+        let new_len = Tensor::from_vec(vec![frames as i64], (1,), &self.proc.device)?;
         // Replace the empty placeholder on the first add (avoids cat-ing a
         // zero-length Metal view); otherwise append.
         self.audio_in = if self.audio_in.dim(1)? == 0 {
@@ -276,12 +281,16 @@ impl<'a> ChatState<'a> {
                 "append: modality_flag len {n_flag} != text {n_text} + audio_out {n_audio}"
             )));
         }
-        self.text = Tensor::cat(&[&self.text, text], 1)?;
+        // The state carries I64 (torch.long); cast the incoming ids to match (the
+        // generation loop hands back U32 sampled tokens). Faithful — torch keeps long.
+        let i64t = candle_core::DType::I64;
+        let (text, audio_out, mf) = (text.to_dtype(i64t)?, audio_out.to_dtype(i64t)?, mf.to_dtype(i64t)?);
+        self.text = Tensor::cat(&[&self.text, &text], 1)?;
         // Replace the empty placeholder on the first append (Metal: no zero-len cat).
         self.audio_out = if self.audio_out.dim(1)? == 0 {
-            audio_out.clone()
+            audio_out
         } else {
-            Tensor::cat(&[&self.audio_out, audio_out], 1)?
+            Tensor::cat(&[&self.audio_out, &audio_out], 1)?
         };
         self.modality_flag = Tensor::cat(&[&self.modality_flag, &mf], 1)?;
         Ok(())
