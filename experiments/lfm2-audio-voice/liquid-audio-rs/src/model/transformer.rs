@@ -14,7 +14,14 @@
 //!   shared weights before this is trusted numerically. See PORT_STATUS.md.
 
 use candle_core::{DType, Device, Result, Tensor, D};
-use candle_nn::{linear_no_bias, ops::softmax_last_dim, rotary_emb::rope_i, Embedding, Linear, Module, VarBuilder};
+// `rope_i_slow` (the basic-op rotary), NOT `rope_i` (the fused `apply_op3_no_bwd`
+// kernel): the depthformer runs inside the trainable `logits`/`forward` graph, and
+// the fused op SEVERS autograd (verified — no gradient reaches q/k). The slow path is
+// the SAME interleaved rotation, just differentiable.
+// `ops::softmax` (basic ops, differentiable), NOT `softmax_last_dim` (the fused
+// `apply_op1_no_bwd` kernel that severs autograd) — this attention runs in the
+// trainable `logits`/`forward` graph. Same forward values.
+use candle_nn::{linear_no_bias, ops::softmax, rotary_emb::rope_i_slow, Embedding, Linear, Module, VarBuilder};
 
 use crate::candle_ext::kv_cache::ConcatKvCache;
 
@@ -213,7 +220,7 @@ pub fn precompute_freqs_cis(dim: usize, end: usize, theta: f64, device: &Device)
 /// `(cos, sin)` from `precompute_freqs_cis`. Faithful to the upcast-rotate
 /// contract: callers pass f32 q/k and cast the result back (`type_as`).
 pub fn apply_rotary_emb(xq: &Tensor, xk: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<(Tensor, Tensor)> {
-    Ok((rope_i(xq, cos, sin)?, rope_i(xk, cos, sin)?))
+    Ok((rope_i_slow(xq, cos, sin)?, rope_i_slow(xk, cos, sin)?))
 }
 
 /// `reshape_for_broadcast(freqs_cis, x)` — reshape the `(seq, dim/2)` freq table
@@ -361,7 +368,7 @@ impl BoundedAttention {
             let mask = causal_mask(q_len, kv_len, q.device())?.to_dtype(attn.dtype())?;
             attn = attn.broadcast_add(&mask)?;
         }
-        let attn = softmax_last_dim(&attn)?;
+        let attn = softmax(&attn, D::Minus1)?;
         let out = attn.matmul(&value)?.to_dtype(in_dtype)?; // [b, heads, t, head_dim], back to input dtype
 
         out.transpose(1, 2)?.reshape((bsz, seqlen, self.num_heads * self.head_dim))
@@ -707,6 +714,25 @@ impl SequenceModel for RawLmBackbone {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rotary_is_differentiable() {
+        // apply_rotary_emb runs inside the trainable depthformer graph, so it must NOT
+        // sever autograd. The fused `rope_i` does (apply_op3_no_bwd); `rope_i_slow`
+        // does not. This fails if anyone swaps it back to the fused op.
+        use candle_core::Var;
+        let dev = Device::Cpu;
+        let (b, h, t, d) = (1usize, 1, 4, 8);
+        let cos = Tensor::ones((t, d / 2), DType::F32, &dev).unwrap();
+        let sin = Tensor::zeros((t, d / 2), DType::F32, &dev).unwrap();
+        let q = Var::from_tensor(&Tensor::randn(0f32, 1f32, (b, h, t, d), &dev).unwrap()).unwrap();
+        let k = Var::from_tensor(&Tensor::randn(0f32, 1f32, (b, h, t, d), &dev).unwrap()).unwrap();
+        let (qr, kr) = apply_rotary_emb(q.as_tensor(), k.as_tensor(), &cos, &sin).unwrap();
+        let loss = (qr.sqr().unwrap().sum_all().unwrap() + kr.sqr().unwrap().sum_all().unwrap()).unwrap();
+        let grads = loss.backward().unwrap();
+        assert!(grads.get(&q).is_some(), "rotary severed the gradient to q (fused rope_i?)");
+        assert!(grads.get(&k).is_some(), "rotary severed the gradient to k");
+    }
 
     #[test]
     fn forward_rejects_cache_length_mismatch() {

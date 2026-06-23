@@ -1,7 +1,8 @@
 //! Port of `liquid_audio/model/mlp.py`.
 
 use candle_core::{Result, Tensor};
-use candle_nn::{layer_norm, linear, linear_no_bias, seq, Activation, Module, Sequential, VarBuilder};
+use crate::model::norm::layer_norm;
+use candle_nn::{linear, linear_no_bias, seq, Activation, Module, Sequential, VarBuilder};
 
 /// Faithful port of `MLP(nn.Module)`.
 ///

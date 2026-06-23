@@ -14,9 +14,29 @@
 //! to the same manual math and is intentionally not ported (see `forward`).
 
 use candle_core::{DType, Device, Result, Tensor, D};
-use candle_nn::{linear, linear_no_bias, ops::softmax_last_dim, Linear, Module, VarBuilder};
+// `ops::softmax` (differentiable basic ops), NOT `softmax_last_dim` (fused
+// `apply_op1_no_bwd`, severs autograd): the conformer attention runs in the trainable
+// `logits` graph (audio-in encode). Same forward values.
+use candle_nn::{linear, linear_no_bias, ops::softmax, Linear, Module, VarBuilder};
 
 const INF_VAL: f64 = 10000.0;
+
+/// NeMo masked softmax: `scores.masked_fill(mask, -INF_VAL) → softmax(-1) →
+/// .masked_fill(mask, 0.0)`. `mask` is `(b, t1, t2)` nonzero at masked positions
+/// (broadcast over heads); `None` ⇒ plain softmax. Uses `where_cond` to SET, so it
+/// is bit-identical to torch `masked_fill` (not an additive approximation).
+fn masked_softmax(scores: &Tensor, mask: Option<&Tensor>) -> Result<Tensor> {
+    match mask {
+        Some(m) => {
+            let cond = m.unsqueeze(1)?.broadcast_as(scores.dims())?.to_dtype(DType::U8)?.contiguous()?;
+            let neg = Tensor::full(-INF_VAL as f32, scores.dims(), scores.device())?.to_dtype(scores.dtype())?;
+            let masked = cond.where_cond(&neg, scores)?; // masked_fill(mask, -INF_VAL)
+            let attn = softmax(&masked, D::Minus1)?;
+            cond.where_cond(&attn.zeros_like()?, &attn) // .masked_fill(mask, 0.0)
+        }
+        None => softmax(scores, D::Minus1),
+    }
+}
 
 /// `PositionalEncoding` (base) — fixed sinusoidal positional encoding.
 ///
@@ -158,21 +178,13 @@ impl MultiHeadAttention {
         Ok((q.contiguous()?, k.contiguous()?, v.contiguous()?))
     }
 
-    /// `forward_attention`. `mask` (if given) is `(b, t1, t2)` with 1.0 at masked
-    /// positions; faithful to NeMo's `masked_fill(-INF)` → softmax → `masked_fill(0)`.
+    /// `forward_attention`. `mask` (if given) is `(b, t1, t2)`, nonzero at masked
+    /// positions; faithful to NeMo's `scores.masked_fill(mask, -INF) → softmax →
+    /// .masked_fill(mask, 0)`. Uses `where_cond` to SET (not add) `-INF_VAL`, so it is
+    /// bit-identical to `masked_fill` rather than a near-equivalent additive approx.
     pub fn forward_attention(&self, value: &Tensor, scores: &Tensor, mask: Option<&Tensor>) -> Result<Tensor> {
         let (nb, _h, time, _t2) = scores.dims4()?;
-        let attn = match mask {
-            Some(m) => {
-                let m = m.unsqueeze(1)?.to_dtype(scores.dtype())?; // (b,1,t1,t2)
-                let neg = (&m * (-INF_VAL))?;
-                let scores = scores.broadcast_add(&neg)?;
-                let attn = softmax_last_dim(&scores)?;
-                let keep = (1.0 - &m)?;
-                attn.broadcast_mul(&keep)?
-            }
-            None => softmax_last_dim(scores)?,
-        };
+        let attn = masked_softmax(scores, mask)?;
         let x = attn.matmul(value)?; // (b,h,t1,d_k)
         let x = x.transpose(1, 2)?.reshape((nb, time, self.h * self.d_k))?;
         self.linear_out.forward(&x)
@@ -273,5 +285,27 @@ impl RelPositionMultiHeadAttention {
         let matrix_bd = matrix_bd.narrow(D::Minus1, 0, t2)?;
         let scores = ((matrix_ac + matrix_bd)? / s_d_k)?;
         self.base.forward_attention(&v, &scores, mask)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::Device;
+
+    #[test]
+    fn masked_softmax_matches_python() {
+        // vs torch: scores.masked_fill(mask,-INF).softmax(-1).masked_fill(mask,0).
+        let dev = Device::Cpu;
+        let scores = Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 0.5, 0.5, 0.5], (1, 1, 2, 3), &dev).unwrap();
+        let mask = Tensor::from_vec(vec![0u8, 1, 0, 1, 1, 0], (1, 2, 3), &dev).unwrap();
+        let got = masked_softmax(&scores, Some(&mask)).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let want = [0.119203f32, 0.0, 0.880797, 0.0, 0.0, 1.0];
+        for (g, w) in got.iter().zip(want.iter()) {
+            assert!((g - w).abs() < 1e-5, "masked softmax vs Python: got {got:?} want {want:?}");
+        }
+        // None ⇒ plain softmax (row sums to 1, no zeros).
+        let plain = masked_softmax(&scores, None).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert!((plain[0] + plain[1] + plain[2] - 1.0).abs() < 1e-6);
     }
 }

@@ -21,7 +21,13 @@
 //!   reference stack cannot deliver as shipped). Verified: backbone parity 6.558e-6.
 
 use candle_core::{DType, Device, IndexOp, Result, Tensor};
-use candle_nn::{embedding, linear_no_bias, rms_norm, Conv1d, Conv1dConfig, Embedding, Linear, Module, RmsNorm, VarBuilder};
+use candle_nn::{embedding, linear_no_bias, Conv1d, Conv1dConfig, Embedding, Linear, Module, VarBuilder};
+
+// The differentiable RMSNorm (basic ops), NOT candle_nn::RmsNorm — whose `forward`
+// calls the fused `ops::rms_norm` (`apply_op2_no_bwd`) on contiguous inputs and so
+// SEVERS autograd. The backbone is trained, so every norm must keep the gradient.
+// Same `x * rsqrt(mean(x^2)+eps) * weight` forward.
+use crate::model::transformer::RmsNorm;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -201,8 +207,8 @@ impl Attention {
             k_proj: linear_no_bias(h, nkv * hd, vb.pp("k_proj"))?,
             v_proj: linear_no_bias(h, nkv * hd, vb.pp("v_proj"))?,
             o_proj: linear_no_bias(nh * hd, h, vb.pp("out_proj"))?,
-            q_norm: rms_norm(hd, cfg.norm_eps, vb.pp("q_layernorm"))?,
-            k_norm: rms_norm(hd, cfg.norm_eps, vb.pp("k_layernorm"))?,
+            q_norm: RmsNorm::new(hd, cfg.norm_eps, vb.pp("q_layernorm"))?,
+            k_norm: RmsNorm::new(hd, cfg.norm_eps, vb.pp("k_layernorm"))?,
             n_head: nh,
             n_kv: nkv,
             head_dim: hd,
@@ -213,7 +219,10 @@ impl Attention {
         let (_, _, seq_len, _) = x.dims4()?;
         let cos = cache.cos.narrow(0, index_pos, seq_len)?;
         let sin = cache.sin.narrow(0, index_pos, seq_len)?;
-        candle_nn::rotary_emb::rope(&x.contiguous()?, &cos, &sin)
+        // `rope_slow` (differentiable), NOT `rope` (fused `apply_op3_no_bwd`): the
+        // backbone is trained, and the fused op severs the gradient to q/k. Same NeoX
+        // (half-split) rotation, same forward values.
+        candle_nn::rotary_emb::rope_slow(&x.contiguous()?, &cos, &sin)
     }
 
     fn forward(&self, x: &Tensor, index_pos: usize, block_idx: usize, cache: &mut Cache, add_mask: Option<&Tensor>) -> Result<Tensor> {
@@ -252,7 +261,9 @@ impl Attention {
             None if seq_len == 1 => att,
             None => att.broadcast_add(&causal_mask(seq_len, index_pos, q.device())?)?,
         };
-        let att = candle_nn::ops::softmax_last_dim(&att)?;
+        // `softmax` (differentiable), NOT `softmax_last_dim` (fused no_bwd): backbone
+        // attention is trained. Same forward values.
+        let att = candle_nn::ops::softmax(&att, candle_core::D::Minus1)?;
         let y = att.matmul(&v.contiguous()?)?.to_dtype(x.dtype())?;
         let y = y.transpose(1, 2)?.reshape((b, seq_len, self.n_head * self.head_dim))?;
         self.o_proj.forward(&y)
@@ -342,8 +353,8 @@ struct DecoderLayer {
 
 impl DecoderLayer {
     fn new(cfg: &Lfm2Config, layer_idx: usize, vb: VarBuilder) -> Result<Self> {
-        let operator_norm = rms_norm(cfg.hidden_size, cfg.norm_eps, vb.pp("operator_norm"))?;
-        let ffn_norm = rms_norm(cfg.hidden_size, cfg.norm_eps, vb.pp("ffn_norm"))?;
+        let operator_norm = RmsNorm::new(cfg.hidden_size, cfg.norm_eps, vb.pp("operator_norm"))?;
+        let ffn_norm = RmsNorm::new(cfg.hidden_size, cfg.norm_eps, vb.pp("ffn_norm"))?;
         let mlp = Mlp::new(cfg, vb.pp("feed_forward"))?;
         let kind = match cfg.layer_types.get(layer_idx).copied().unwrap_or(LayerType::FullAttention) {
             LayerType::FullAttention => LayerKind::Attention(Box::new(Attention::new(cfg, vb.pp("self_attn"))?)),
@@ -385,7 +396,7 @@ impl Model {
         for i in 0..cfg.num_hidden_layers {
             layers.push(DecoderLayer::new(cfg, i, vb_l.pp(i.to_string()))?);
         }
-        let embedding_norm = rms_norm(cfg.hidden_size, cfg.norm_eps, vb.pp("embedding_norm"))?;
+        let embedding_norm = RmsNorm::new(cfg.hidden_size, cfg.norm_eps, vb.pp("embedding_norm"))?;
         Ok(Self { embed_tokens, layers, embedding_norm })
     }
 

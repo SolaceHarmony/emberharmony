@@ -8,11 +8,12 @@
 
 use candle_core::{Result, Tensor, D};
 use candle_nn::{
-    batch_norm, conv1d, layer_norm, linear, ops::sigmoid, ops::silu, BatchNorm, Conv1d, Conv1dConfig, LayerNorm,
+    batch_norm, conv1d, linear, ops::sigmoid, ops::silu, BatchNorm, Conv1d, Conv1dConfig,
     Linear, Module, ModuleT, VarBuilder,
 };
 
 use super::mha::RelPositionMultiHeadAttention;
+use crate::model::norm::{layer_norm, LayerNorm};
 
 /// `ConformerFeedForward`: Linear → SiLU → Linear.
 pub struct ConformerFeedForward {

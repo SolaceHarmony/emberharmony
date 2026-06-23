@@ -279,6 +279,67 @@ fn conformer_streaming_inventory() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Training gradients must reach the attention + norm params.
+///
+/// candle's fused `softmax_last_dim` / `rope`(`_i`) / `RmsNorm`+`LayerNorm`::forward
+/// are `apply_op*_no_bwd` — they SEVER autograd. Using them in the trainable graph
+/// silently gave the q/k projections and every norm weight ZERO gradient (a full
+/// forward+backward landed at 152/912 vars with a gradient). After switching to the
+/// differentiable variants (`softmax`, `rope_slow`, `rope_i_slow`, `layer_norm_slow`,
+/// the differentiable `RmsNorm`), a backward must reach those params.
+///
+/// Validated per subsystem (conformer encode, backbone) because both backward cleanly;
+/// the FULL `logits`/`forward` backward currently hits a separate latent shape bug
+/// (`[..,32]` vs `[..,31]`) — a distinct issue exposed only now that autograd reaches
+/// that far, tracked separately.
+#[test]
+#[ignore = "needs LFM_MODEL_DIR (full-model load + backward, ~6 GB F32)"]
+fn training_gradients_reach_attention_and_norms() -> anyhow::Result<()> {
+    let dir = std::env::var("LFM_MODEL_DIR").expect("set LFM_MODEL_DIR");
+    let device = Device::Cpu;
+    let tl = liquid_audio::loader::from_pretrained_trainable(Path::new(&dir), DType::F32, &device)?;
+    let data = tl.varmap.data().lock().unwrap();
+
+    // helper: backward a scalar, return the params (by prefix) that got NO gradient.
+    let severed = |loss: &Tensor, prefix: &str| -> anyhow::Result<(usize, usize, Vec<String>)> {
+        let grads = loss.backward()?;
+        let (mut have, mut total, mut miss) = (0usize, 0usize, Vec::new());
+        for (name, var) in data.iter() {
+            if !name.starts_with(prefix) {
+                continue;
+            }
+            total += 1;
+            // running_mean/var are non-trainable buffers; embed_tokens is bypassed by
+            // forward_embeds (pre-embedded input) — neither gets a gradient here.
+            if name.contains("running_") || name == "lfm.embed_tokens.weight" {
+                continue;
+            }
+            if grads.get(var).is_some() {
+                have += 1;
+            } else {
+                miss.push(name.clone());
+            }
+        }
+        Ok((have, total, miss))
+    };
+
+    // conformer: encode a mel segment → every conformer param must get a gradient
+    // (LayerNorm/attention were severed before the fix).
+    let mel = Tensor::randn(0f32, 1f32, (1, 128, 120), &device)?;
+    let (h, t, mut miss) = severed(&tl.model.conformer_encode(&mel)?.sum_all()?, "conformer.")?;
+    println!("conformer grad coverage: {h}/{t} (excl. running buffers)");
+    miss.sort();
+    assert!(miss.is_empty(), "conformer params with NO gradient (autograd severed): {:?}", &miss[..miss.len().min(8)]);
+
+    // backbone: every lfm param must get a gradient (RmsNorm/rope/softmax were severed).
+    let embeds = Tensor::randn(0f32, 1f32, (1, 24, 2048), &device)?;
+    let (h2, t2, mut miss2) = severed(&tl.model.backbone_forward_embeds(&embeds)?.sum_all()?, "lfm.")?;
+    println!("backbone grad coverage: {h2}/{t2}");
+    miss2.sort();
+    assert!(miss2.is_empty(), "backbone params with NO gradient: {:?}", &miss2[..miss2.len().min(8)]);
+    Ok(())
+}
+
 /// Batched (B=2) training path vs a PYTHON golden — `logits` + `forward`.
 ///
 /// This is the real detector for the B>1 row-0 bug (unlike the self-consistency test
