@@ -24,8 +24,8 @@ processor.py,ChatState.append,FIXED,dtype int64->u32,f5bb6d0,invariants (1 text 
 processor.py,ChatState.__getitem__,FAITHFUL,—,—,Mapping over model_inputs
 processor.py,ChatState.__iter__,FAITHFUL,—,—,Mapping
 processor.py,ChatState.__len__,FAITHFUL,—,—,Mapping
-model/lfm2_audio.py,LFM2AudioModel.logits,FIXED,dtype u32-read,7fccde8,modality read to_vec1::<u32>()->i64; prefill parity preserved 1.118e-6
-model/lfm2_audio.py,LFM2AudioModel._prefill,FIXED,dtype u32-read,7fccde8,prefill_inputs modality + audio_in_lens read u32->i64 (lens unwrap_or_default would silently drop audio-in on i64)
+model/lfm2_audio.py,LFM2AudioModel.logits,FIXED,dtype u32-read + batched B>1,b9f5cc9,read modality/supervision as full (B L) via to_vec2 (was row-0 i(0) -> only first sample in batch_size>1 training); out_emb_shifted flattened (B*(L-1) D) with per-row shift bi*(L-1)+(p-1) + global text/audio counters; B=1 unchanged; self-consistency test (B=2==B=1 dup) text_logits rel-err 0.0; prefill 1.118e-6 (dtype) still holds
+model/lfm2_audio.py,LFM2AudioModel._prefill,FIXED,dtype u32-read + batched B>1,b9f5cc9,prefill_inputs reads full (B L) modality flatten_all (was row-0 i(0)) + reshape output (B L D) (was unsqueeze(0)); audio_in_lens read u32->i64 (lens unwrap_or_default would silently drop audio-in on i64); self-consistency test prefill rel-err 0.0 both batch rows
 detokenizer.py,ISTFT.forward,FIXED,dtype/algorithm,8da5ec0,candle-native f32 irfft (inverse-DFT matmul)+conv_transpose1d OLA; was f64 rustfft; bf16 spec cast to f32; ==f64 ref 1.4e-7 + e2e
 detokenizer.py,LFM2AudioDetokenizer.forward,FAITHFUL,—,702b6be,FusedEmbedding->x6 upsample->Lfm2Model(sliding mask)->lin->polar->istft; e2e on full HF snapshot
 model/conformer/processor.py,FilterbankFeatures.stft,FAITHFUL,algorithm torch.stft->Conv1d-DFT,55acb23,windowed real-DFT as Conv1d kernel (stride=hop) f32 on-device; mel 1.18e-5 vs torch golden
