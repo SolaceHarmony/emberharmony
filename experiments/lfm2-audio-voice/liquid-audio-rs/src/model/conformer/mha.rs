@@ -132,8 +132,15 @@ impl RelPositionalEncoding {
     /// the input length, Python's slice `pe[:, start:end]` is the whole table.
     /// Returns `(x * xscale, pos_emb)`.
     pub fn forward(&self, x: &Tensor) -> Result<(Tensor, Tensor)> {
-        let length = x.dim(1)?;
-        let pe = self.extend_pe(length, x.device(), x.dtype())?;
+        self.forward_cache(x, 0)
+    }
+
+    /// Streaming pos-enc: `input_len = x.size(1) + cache_len`. Python slices the
+    /// pre-extended `pe` to the centered `2·input_len-1` window; here the table is
+    /// built sized to `input_len`, which is exactly that window.
+    pub fn forward_cache(&self, x: &Tensor, cache_len: usize) -> Result<(Tensor, Tensor)> {
+        let input_len = x.dim(1)? + cache_len;
+        let pe = self.extend_pe(input_len, x.device(), x.dtype())?;
         let x = match self.base.xscale {
             Some(s) => (x * s)?,
             None => x.clone(),
@@ -206,9 +213,22 @@ impl MultiHeadAttention {
     /// same `softmax(q·kᵀ/√d + mask)·v` (see the module note) — both Python branches map
     /// here; candle's fused `ops::sdpa` is no_bwd and avoided.
     pub fn forward(&self, query: &Tensor, key: &Tensor, value: &Tensor, mask: Option<&Tensor>) -> Result<Tensor> {
-        let (q, k, v) = self.forward_qkv(query, key, value)?;
+        Ok(self.forward_cache(query, key, value, mask, None)?.0)
+    }
+
+    /// Streaming base attention: `update_cache` (KV concat) → attention →
+    /// `(out, next_cache)`. `cache=None` ⇒ the offline path, `next_cache=None`.
+    pub fn forward_cache(&self, query: &Tensor, key: &Tensor, value: &Tensor, mask: Option<&Tensor>, cache: Option<&Tensor>) -> Result<(Tensor, Option<Tensor>)> {
+        let (key, value, query, next_cache) = self.update_cache(key, value, query, cache)?;
+        let (q, k, v) = self.forward_qkv(&query, &key, &value)?;
         let scores = (q.matmul(&k.transpose(D::Minus2, D::Minus1)?.contiguous()?)? / self.s_d_k)?;
-        self.forward_attention(&v, &scores, mask)
+        Ok((self.forward_attention(&v, &scores, mask)?, next_cache))
+    }
+
+    /// `setup_streaming_params` (encoder.py L968-974) sets `cache_drop_size` on each
+    /// MHA from the streaming config. Drives only `update_cache`'s next-cache trim.
+    pub fn set_cache_drop_size(&mut self, n: usize) {
+        self.cache_drop_size = n;
     }
 
     /// `update_cache`: streaming KV concat. `cache=None` (offline) ⇒ no-op.
@@ -255,6 +275,11 @@ impl RelPositionMultiHeadAttention {
         })
     }
 
+    /// Propagate `cache_drop_size` to the base MHA (streaming setup).
+    pub fn set_cache_drop_size(&mut self, n: usize) {
+        self.base.set_cache_drop_size(n);
+    }
+
     /// `rel_shift`: (b,h,qlen,pos_len) → shifted (b,h,qlen,pos_len).
     fn rel_shift(&self, x: &Tensor) -> Result<Tensor> {
         let (b, h, qlen, pos_len) = x.dims4()?;
@@ -272,8 +297,24 @@ impl RelPositionMultiHeadAttention {
         mask: Option<&Tensor>,
         pos_emb: &Tensor,
     ) -> Result<Tensor> {
+        Ok(self.forward_cache(query, key, value, mask, pos_emb, None)?.0)
+    }
+
+    /// Streaming rel-pos attention: `update_cache` (KV concat, so the current queries
+    /// attend over cache+current keys) → rel-pos attention → `(out, next_cache)`.
+    /// `cache=None` ⇒ the offline path.
+    pub fn forward_cache(
+        &self,
+        query: &Tensor,
+        key: &Tensor,
+        value: &Tensor,
+        mask: Option<&Tensor>,
+        pos_emb: &Tensor,
+        cache: Option<&Tensor>,
+    ) -> Result<(Tensor, Option<Tensor>)> {
         let (h, d_k, s_d_k) = (self.base.h, self.base.d_k, self.base.s_d_k);
-        let (q, k, v) = self.base.forward_qkv(query, key, value)?; // (b,h,t,d_k)
+        let (key, value, query, next_cache) = self.base.update_cache(key, value, query, cache)?;
+        let (q, k, v) = self.base.forward_qkv(&query, &key, &value)?; // (b,h,t,d_k)
         let q = q.transpose(1, 2)?; // (b,t,h,d_k)
 
         let n_batch_pos = pos_emb.dim(0)?;
@@ -296,7 +337,7 @@ impl RelPositionMultiHeadAttention {
         let t2 = matrix_ac.dim(D::Minus1)?;
         let matrix_bd = matrix_bd.narrow(D::Minus1, 0, t2)?;
         let scores = ((matrix_ac + matrix_bd)? / s_d_k)?;
-        self.base.forward_attention(&v, &scores, mask)
+        Ok((self.base.forward_attention(&v, &scores, mask)?, next_cache))
     }
 }
 

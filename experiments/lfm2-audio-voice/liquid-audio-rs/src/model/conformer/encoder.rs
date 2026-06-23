@@ -175,6 +175,105 @@ impl ConformerEncoder {
         x.transpose(1, 2)?.contiguous() // (B, d_out, T')
     }
 
+    /// PORT: `forward_internal` cache-aware STREAMING path (encoder.py L537-702).
+    ///
+    /// `audio_signal`: `(B, feat_in, T)` mel features for this chunk. The caches are the
+    /// per-layer stacks from [`Self::get_initial_cache_state`] (or a previous step):
+    /// `cache_last_channel` `(n_layers, B, cache_len, d_model)` (attention KV),
+    /// `cache_last_time` `(n_layers, B, d_model, T_cache)` (depthwise-conv state),
+    /// `cache_last_channel_len` `(B,)` (valid cached frames). Returns
+    /// `(encoded (B, d_out, T'), length (B,), next_channel, next_time, next_channel_len)`.
+    ///
+    /// `setup_streaming_params` must have run (sets `streaming_cfg` + the per-layer
+    /// `cache_drop_size`). The att context is `self.att_context_size`.
+    pub fn forward_streaming(
+        &self,
+        audio_signal: &Tensor,
+        length: Option<&Tensor>,
+        cache_last_channel: &Tensor,
+        cache_last_time: &Tensor,
+        cache_last_channel_len: &Tensor,
+    ) -> Result<(Tensor, Tensor, Tensor, Tensor, Tensor)> {
+        let device = audio_signal.device();
+        let b = audio_signal.dim(0)?;
+
+        let in_len: Vec<i64> = match length {
+            Some(l) => l.to_dtype(DType::I64)?.to_vec1::<i64>()?,
+            None => vec![audio_signal.dim(2)? as i64; b],
+        };
+
+        // pre_encode: (B, feat_in, T) -> (B, T', d_model); track length via calc_length.
+        let x = audio_signal.transpose(1, 2)?.contiguous()?; // (B, T, feat_in)
+        let mut x = self.pre_encode.forward(&x)?; // (B, T', d_model)
+        let mut length: Vec<i64> = self.pre_encode.out_lengths(&in_len);
+
+        // drop_extra_pre_encoded: in the streaming entry `cache_last_channel is not None`
+        // is ALWAYS true, so Python drops the leading `drop` pre-encoded frames every
+        // chunk (the first chunk too — those frames are streaming warm-up).
+        let drop = self.streaming_cfg.drop_extra_pre_encoded.max(0) as usize;
+        let cllen: Vec<i64> = cache_last_channel_len.to_dtype(DType::I64)?.to_vec1::<i64>()?;
+        if drop > 0 {
+            let t = x.dim(1)?;
+            x = x.narrow(1, drop, t.saturating_sub(drop))?;
+            length = length.iter().map(|&l| (l - drop as i64).max(0)).collect();
+        }
+
+        let max_audio_pre = x.dim(1)?; // before adding cache_len (Python's cache_keep base)
+        let cache_len = self.streaming_cfg.last_channel_cache_size.max(0) as usize;
+        // cache_keep_size = max_audio_length - cache_drop_size — Python does NOT clamp,
+        // so this is signed (negative when the lookahead exceeds the chunk).
+        let cache_keep: i64 = max_audio_pre as i64 - self.streaming_cfg.cache_drop_size;
+        let max_audio_length = max_audio_pre + cache_len;
+        let padding_length: Vec<i64> = length.iter().map(|&l| l + cache_len as i64).collect();
+        let offset: Vec<i64> = cllen.iter().map(|&l| -l + cache_len as i64).collect();
+
+        // pos-enc shifted by the cache length.
+        let (x_scaled, pos_emb) = self.pos_enc.forward_cache(&x, cache_len)?;
+        let mut x = x_scaled;
+
+        // masks over cache+current, then drop the cache region from the QUERY axis.
+        let ctx: [i64; 2] = [self.att_context_size[0], self.att_context_size[1]];
+        let pad_t = Tensor::from_vec(padding_length, (b,), device)?;
+        let off_t = Tensor::from_vec(offset, (b,), device)?;
+        let (pad_mask, att_mask) = self.create_masks(ctx, &pad_t, max_audio_length, Some(&off_t), device)?;
+        let t_cur = max_audio_length - cache_len;
+        let pad_mask = pad_mask.narrow(1, cache_len, t_cur)?;
+        let att_mask = match att_mask {
+            Some(am) => Some(am.narrow(1, cache_len, t_cur)?),
+            None => None,
+        };
+
+        // layers, threading the per-layer KV + conv caches.
+        let mut next_channel = Vec::with_capacity(self.layers.len());
+        let mut next_time = Vec::with_capacity(self.layers.len());
+        for (lth, layer) in self.layers.iter().enumerate() {
+            let ch = cache_last_channel.get(lth)?; // (B, cache_len, d_model)
+            let ti = cache_last_time.get(lth)?; // (B, d_model, T_cache)
+            let (xo, nc, nt) = layer.forward_cache(&x, att_mask.as_ref(), &pos_emb, Some(&pad_mask), Some(&ch), Some(&ti))?;
+            x = xo;
+            next_channel.push(nc.expect("streaming layer returns a channel cache"));
+            next_time.push(nt.expect("streaming layer returns a time cache"));
+        }
+
+        if let Some(p) = &self.out_proj {
+            x = p.forward(&x)?;
+        }
+        let encoded = x.transpose(1, 2)?.contiguous()?; // (B, d_out, T')
+
+        let next_channel = Tensor::stack(&next_channel, 0)?;
+        let next_time = Tensor::stack(&next_time, 0)?;
+        // clamp(cache_last_channel_len + cache_keep_size, max=cache_len) — no min clamp,
+        // so it can be negative (matches Python's `torch.clamp(..., max=cache_len)`).
+        let next_len: Vec<i64> = cllen.iter().map(|&l| (l + cache_keep).min(cache_len as i64)).collect();
+        Ok((
+            encoded,
+            Tensor::from_vec(length, (b,), device)?,
+            next_channel,
+            next_time,
+            Tensor::from_vec(next_len, (b,), device)?,
+        ))
+    }
+
     /// Debug: conv-stack output `(B, C, T', F')` before subsampling's flatten+linear.
     #[doc(hidden)]
     pub fn subsampling_conv_out(&self, audio_signal: &Tensor) -> Result<Tensor> {
@@ -206,29 +305,45 @@ impl ConformerEncoder {
 
     // ---- Off the offline forward path; ported 1:1 for inventory (see mod.rs). ----
 
-    /// `forward_internal` — the core encode. Our [`Self::forward`] *is*
-    /// `forward_internal` (the public `forward` in Python just length-handles then
-    /// calls it); kept as an alias for the 1:1 mapping.
+    /// `forward_internal` — the core encode. The offline form is [`Self::forward`]; the
+    /// cache-aware streaming form (`forward_internal` with caches) is
+    /// [`Self::forward_streaming`].
     pub fn forward_internal(&self, audio_signal: &Tensor) -> Result<Tensor> {
         self.forward(audio_signal)
     }
 
-    /// PORT: `forward_for_export` (encoder.py L435-464) — the export forward.
+    /// PORT: `forward_for_export` (encoder.py L435-464). Python transposes any supplied
+    /// caches `(0,1)` (external `(B, n_layers, …)` ⇄ internal `(n_layers, B, …)`), runs
+    /// `forward_internal`, then `streaming_post_process(keep_all_outputs=False)`.
     ///
-    /// Python transposes any supplied caches `(0,1)`, runs `forward_internal`, then
-    /// `streaming_post_process(rets, keep_all_outputs=False)`. This port covers the
-    /// **offline (no-cache) export**: `forward_internal` returns the 2-element
-    /// `(encoded, length)` form, so `streaming_post_process` is a pass-through (it
-    /// slices only the 5-element streaming form) and there are no caches to
-    /// transpose. `length` is the full `T'` (single unpadded clip). The streaming
-    /// (cache-in/out) export needs the cache-returning `forward_internal`, which is
-    /// not on this inference port's path.
-    pub fn forward_for_export(&self, audio_signal: &Tensor) -> Result<(Tensor, Tensor)> {
-        let encoded = self.forward_internal(audio_signal)?; // (B, d_out, T')
-        let (b, _d, t) = encoded.dims3()?;
-        let length = Tensor::from_vec(vec![t as i64; b], (b,), encoded.device())?;
-        let (encoded, length, _cache) = self.streaming_post_process(encoded, length, None, false)?;
-        Ok((encoded, length))
+    /// `caches=None` ⇒ the offline export (`(encoded, length, None)`). `caches=Some`
+    /// (external layout) ⇒ the streaming export: transpose in, [`Self::forward_streaming`],
+    /// post-process, transpose the next caches back out
+    /// (`(encoded, length, Some((next_channel, next_time, next_len)))`).
+    pub fn forward_for_export(
+        &self,
+        audio_signal: &Tensor,
+        length: Option<&Tensor>,
+        caches: Option<(&Tensor, &Tensor, &Tensor)>,
+    ) -> Result<(Tensor, Tensor, Option<(Tensor, Tensor, Tensor)>)> {
+        let Some((cch, ctime, clen)) = caches else {
+            let encoded = self.forward_internal(audio_signal)?; // (B, d_out, T')
+            let (b, _d, t) = encoded.dims3()?;
+            let len = match length {
+                Some(l) => l.clone(),
+                None => Tensor::from_vec(vec![t as i64; b], (b,), encoded.device())?,
+            };
+            let (encoded, len, _) = self.streaming_post_process(encoded, len, None, false)?;
+            return Ok((encoded, len, None));
+        };
+        // external (B, n_layers, …) → internal (n_layers, B, …).
+        let cch_i = cch.transpose(0, 1)?.contiguous()?;
+        let ctime_i = ctime.transpose(0, 1)?.contiguous()?;
+        let (encoded, len, next_ch, next_time, next_len) = self.forward_streaming(audio_signal, length, &cch_i, &ctime_i, clen)?;
+        let (encoded, len, next_ch) = self.streaming_post_process(encoded, len, Some(next_ch), false)?;
+        let next_ch = next_ch.expect("streaming post-process keeps the channel cache");
+        // internal → external.
+        Ok((encoded, len, Some((next_ch.transpose(0, 1)?.contiguous()?, next_time.transpose(0, 1)?.contiguous()?, next_len))))
     }
 
     /// PORT: `_create_masks` (encoder.py L737-791) → `(pad_mask, att_mask)`, both `bool`
@@ -554,6 +669,19 @@ impl ConformerEncoder {
             None,
             10_000,
         );
+        // Python L968-974: propagate cache_drop_size onto each layer's MHA + conv.
+        let cds = self.streaming_cfg.cache_drop_size.max(0) as usize;
+        for layer in &mut self.layers {
+            layer.set_cache_drop_size(cds);
+        }
+    }
+
+    /// Set the inference attention context `[left, right]` and refresh the streaming
+    /// config (so a caller can stream with a bounded left cache). `right < 0` keeps the
+    /// unlimited-right (offline) behaviour.
+    pub fn set_streaming_att_context(&mut self, att_context_size: [i64; 2]) {
+        self.att_context_size = att_context_size.to_vec();
+        self.setup_streaming_params();
     }
 
     /// The body of [`Self::setup_streaming_params`] (encoder.py L891-966), pulled out

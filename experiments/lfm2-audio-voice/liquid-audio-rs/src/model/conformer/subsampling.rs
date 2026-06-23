@@ -232,6 +232,10 @@ pub struct ConvSubsampling {
     sampling_num: usize,
     kernel_size: usize,
     stride: usize,
+    /// `_left_padding + _right_padding` — for `calc_length` (streaming length update).
+    all_paddings: i64,
+    /// `_ceil_mode` — vggnet (MaxPool) is ceil; the strided-conv schemes are floor.
+    ceil_mode: bool,
     /// mirrors Python `_conv_channels` (kept for 1:1 inventory; cold on the path).
     #[allow(dead_code)]
     conv_channels: usize,
@@ -415,10 +419,22 @@ impl ConvSubsampling {
             sampling_num,
             kernel_size,
             stride,
+            all_paddings: (left_padding + right_padding) as i64,
+            ceil_mode,
             conv_channels,
             subsampling_conv_chunking_factor: 1,
             is_causal,
         })
+    }
+
+    /// `calc_length` over each input length — the per-clip output frame count, used by
+    /// the streaming forward to track `length` through subsampling (Python's
+    /// `pre_encode(x, lengths) -> (x, length)`).
+    pub fn out_lengths(&self, lengths: &[i64]) -> Vec<i64> {
+        lengths
+            .iter()
+            .map(|&l| calc_length(l.max(0) as usize, self.all_paddings, self.kernel_size as i64, self.stride as i64, self.ceil_mode, self.sampling_num) as i64)
+            .collect()
     }
 
     /// `(B, T, feat_in)` → `(B, T', feat_out)`. conv2d schemes unsqueeze a channel,

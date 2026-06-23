@@ -42,9 +42,11 @@ impl ConformerFeedForward {
 }
 
 /// `ConformerConvolution`: pointwise→GLU→(pad mask)→depthwise→BatchNorm→SiLU→pointwise.
+/// The depthwise is a [`CausalConv1D`] (as in Python) — symmetric padding for the model,
+/// but cache-capable so the streaming forward can thread `cache_last_time`.
 pub struct ConformerConvolution {
     pointwise_conv1: Conv1d,
-    depthwise_conv: Conv1d,
+    depthwise_conv: CausalConv1D,
     batch_norm: BatchNorm,
     pointwise_conv2: Conv1d,
 }
@@ -54,18 +56,28 @@ impl ConformerConvolution {
         assert!((kernel_size - 1).is_multiple_of(2));
         let context = (kernel_size - 1) / 2;
         let pw = Conv1dConfig { padding: 0, stride: 1, dilation: 1, groups: 1, ..Default::default() };
-        let dw = Conv1dConfig { padding: context, stride: 1, dilation: 1, groups: d_model, ..Default::default() };
         // candle's conv1d always loads a bias; the conformer uses use_bias=true.
         debug_assert!(use_bias);
         Ok(Self {
             pointwise_conv1: conv1d(d_model, d_model * 2, 1, pw, vb.pp("pointwise_conv1"))?,
-            depthwise_conv: conv1d(d_model, d_model, kernel_size, dw, vb.pp("depthwise_conv"))?,
+            // Python: CausalConv1D(d_model, d_model, k, stride=1, padding=conv_context_size,
+            // groups=d_model). conv_context_size defaults to (k-1)/2 ⇒ symmetric (same
+            // offline output as a plain Conv1d), but carries a streaming cache.
+            depthwise_conv: CausalConv1D::new(d_model, d_model, kernel_size, 1, CausalPadding::Symmetric(context), d_model, vb.pp("depthwise_conv"))?,
             batch_norm: batch_norm(d_model, 1e-5, vb.pp("batch_norm"))?,
             pointwise_conv2: conv1d(d_model, d_model, 1, pw, vb.pp("pointwise_conv2"))?,
         })
     }
 
+    /// Offline forward (no conv cache).
     pub fn forward(&self, x: &Tensor, pad_mask: Option<&Tensor>) -> Result<Tensor> {
+        Ok(self.forward_cache(x, pad_mask, None)?.0)
+    }
+
+    /// PORT: `ConformerConvolution.forward(x, pad_mask, cache)`. With `cache=Some`, the
+    /// depthwise [`CausalConv1D`] consumes/returns `cache_last_time`; returns
+    /// `(out, next_cache)`.
+    pub fn forward_cache(&self, x: &Tensor, pad_mask: Option<&Tensor>, cache: Option<&Tensor>) -> Result<(Tensor, Option<Tensor>)> {
         let x = x.transpose(1, 2)?.contiguous()?; // (B, d_model, T)
         let x = self.pointwise_conv1.forward(&x)?; // (B, 2*d_model, T)
         // GLU over channel dim 1: a * sigmoid(b)
@@ -80,11 +92,16 @@ impl ConformerConvolution {
             x = x.broadcast_mul(&keep)?;
         }
 
-        let x = self.depthwise_conv.forward(&x)?;
+        let (x, next_cache) = self.depthwise_conv.forward(&x, cache)?;
         let x = self.batch_norm.forward_t(&x, false)?;
         let x = silu(&x)?;
         let x = self.pointwise_conv2.forward(&x)?;
-        x.transpose(1, 2)?.contiguous()
+        Ok((x.transpose(1, 2)?.contiguous()?, next_cache))
+    }
+
+    /// Streaming setup: propagate `cache_drop_size` to the depthwise [`CausalConv1D`].
+    pub fn set_cache_drop_size(&mut self, n: usize) {
+        self.depthwise_conv.set_cache_drop_size(n);
     }
 
     /// PORT: `reset_parameters_conv` — conv weight re-initialization at
@@ -157,7 +174,9 @@ impl CausalConv1D {
                 let new_x = x.pad_with_zeros(D::Minus1, 0, self.right_padding)?;
                 let new_x = Tensor::cat(&[c, &new_x], D::Minus1)?;
                 let total = new_x.dim(D::Minus1)?;
-                let kept = if self.cache_drop_size > 0 { total - self.cache_drop_size } else { total };
+                // Python: `new_x[:, :, :-cache_drop_size]` — clamps to empty when
+                // cache_drop_size >= total (a large lookahead vs a short chunk).
+                let kept = if self.cache_drop_size > 0 { total.saturating_sub(self.cache_drop_size) } else { total };
                 let next = new_x.narrow(D::Minus1, 0, kept)?;
                 let clen = c.dim(D::Minus1)?;
                 let nlen = next.dim(D::Minus1)?;
@@ -171,6 +190,11 @@ impl CausalConv1D {
     pub fn forward(&self, x: &Tensor, cache: Option<&Tensor>) -> Result<(Tensor, Option<Tensor>)> {
         let (x, next_cache) = self.update_cache(x, cache)?;
         Ok((self.conv.forward(&x)?, next_cache))
+    }
+
+    /// Streaming setup: trailing steps dropped from the next cache.
+    pub fn set_cache_drop_size(&mut self, n: usize) {
+        self.cache_drop_size = n;
     }
 }
 
@@ -240,6 +264,34 @@ impl ConformerLayer {
         pos_emb: &Tensor,
         pad_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
+        let (out, _, _) = self.forward_cache(x, att_mask, pos_emb, pad_mask, None, None)?;
+        Ok(out)
+    }
+
+    /// `setup_streaming_params`: propagate `cache_drop_size` to this layer's attention
+    /// and conv (the Python per-layer field assignment).
+    pub fn set_cache_drop_size(&mut self, n: usize) {
+        match &mut self.self_attn {
+            SelfAttention::RelPos(a) => a.set_cache_drop_size(n),
+            SelfAttention::Abs(a) => a.set_cache_drop_size(n),
+        }
+        self.conv.set_cache_drop_size(n);
+    }
+
+    /// PORT: `ConformerLayer.forward(x, att_mask, pos_emb, pad_mask, cache_last_channel,
+    /// cache_last_time)`. Threads the attention KV cache (`cache_last_channel`) and the
+    /// conv cache (`cache_last_time`) and returns the next caches. Offline (`None`
+    /// caches) ⇒ the next caches are `None`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_cache(
+        &self,
+        x: &Tensor,
+        att_mask: Option<&Tensor>,
+        pos_emb: &Tensor,
+        pad_mask: Option<&Tensor>,
+        cache_last_channel: Option<&Tensor>,
+        cache_last_time: Option<&Tensor>,
+    ) -> Result<(Tensor, Option<Tensor>, Option<Tensor>)> {
         const FC: f64 = 0.5;
         let residual = x.clone();
         let h = self.feed_forward1.forward(&self.norm_feed_forward1.forward(&residual)?)?;
@@ -248,18 +300,18 @@ impl ConformerLayer {
         let h = self.norm_self_att.forward(&residual)?;
         // rel_pos passes the relative `pos_emb`; abs_pos uses standard attention with no
         // pos_emb (the encoder would have added an absolute PositionalEncoding upstream).
-        let h = match &self.self_attn {
-            SelfAttention::RelPos(a) => a.forward(&h, &h, &h, att_mask, pos_emb)?,
-            SelfAttention::Abs(a) => a.forward(&h, &h, &h, att_mask)?,
+        let (h, next_channel) = match &self.self_attn {
+            SelfAttention::RelPos(a) => a.forward_cache(&h, &h, &h, att_mask, pos_emb, cache_last_channel)?,
+            SelfAttention::Abs(a) => a.forward_cache(&h, &h, &h, att_mask, cache_last_channel)?,
         };
         let residual = (residual + h)?;
 
-        let h = self.conv.forward(&self.norm_conv.forward(&residual)?, pad_mask)?;
+        let (h, next_time) = self.conv.forward_cache(&self.norm_conv.forward(&residual)?, pad_mask, cache_last_time)?;
         let residual = (residual + h)?;
 
         let h = self.feed_forward2.forward(&self.norm_feed_forward2.forward(&residual)?)?;
         let residual = (residual + (h * FC)?)?;
 
-        self.norm_out.forward(&residual)
+        Ok((self.norm_out.forward(&residual)?, next_channel, next_time))
     }
 }

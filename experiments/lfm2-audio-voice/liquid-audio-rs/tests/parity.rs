@@ -126,6 +126,75 @@ fn rel_pos_attention_sdpa_parity() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Cache-aware streaming conformer forward (`forward_streaming` = `forward_internal`
+/// with caches), verified DIRECTLY against the upstream Python streaming on the same
+/// weights + config: output AND all three next caches. Golden:
+/// `parity/dump_conformer_streaming.py` (att context `[29,-1]`, initial zero caches).
+/// This exercises the whole streaming path — pre-encode + drop_extra_pre_encoded,
+/// pos-enc cache_len, `_create_masks` with offset, per-layer KV-cache threading, the
+/// depthwise-conv cache, and the next-cache production (`cache_keep`/`cache_drop`).
+#[test]
+#[ignore = "needs LFM_MODEL_DIR + parity/golden/conformer_streaming_refs.safetensors (run dump_conformer_streaming.py)"]
+fn conformer_streaming_parity() -> anyhow::Result<()> {
+    use liquid_audio::model::conformer::encoder::{ConformerEncoder, ConformerEncoderConfig};
+    use std::collections::HashMap;
+    let dir = std::env::var("LFM_MODEL_DIR").expect("set LFM_MODEL_DIR");
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let device = Device::Cpu;
+
+    // Conformer weights from the snapshot shards (strip the `conformer.` prefix).
+    let mut ws: HashMap<String, Tensor> = HashMap::new();
+    for entry in std::fs::read_dir(&dir)? {
+        let p = entry?.path();
+        if p.extension().and_then(|e| e.to_str()) != Some("safetensors") {
+            continue;
+        }
+        let Ok(sd) = candle_core::safetensors::load(&p, &device) else { continue };
+        for (k, v) in sd {
+            if let Some(rest) = k.strip_prefix("conformer.") {
+                ws.insert(rest.to_string(), v.to_dtype(DType::F32)?);
+            }
+        }
+    }
+    let cfg = ConformerEncoderConfig {
+        feat_in: 128, feat_out: 0, n_layers: 17, d_model: 512, subsampling_factor: 8,
+        subsampling_conv_channels: 256, ff_expansion_factor: 4, n_heads: 8, conv_kernel_size: 9,
+        xscaling: false, self_attention_model: "rel_pos".to_string(),
+    };
+    let vb = candle_nn::VarBuilder::from_tensors(ws, DType::F32, &device);
+    let mut enc = ConformerEncoder::new(&cfg, vb)?;
+
+    let refs = candle_core::safetensors::load(manifest.join("parity/golden/refs.safetensors"), &device)?;
+    let mel = refs.get("mel").expect("mel").to_dtype(DType::F32)?; // (1, 128, 101)
+    let g = candle_core::safetensors::load(manifest.join("parity/golden/conformer_streaming_refs.safetensors"), &device)?;
+
+    // Same config as the Python golden: bounded left context [29, -1], initial zero caches.
+    enc.set_streaming_att_context([29, -1]);
+    let (cch, ctime, clen) = enc.get_initial_cache_state(1, DType::F32, &device, 0)?;
+    let (out, out_len, next_ch, next_time, next_len) = enc.forward_streaming(&mel, None, &cch, &ctime, &clen)?;
+
+    let want_out = g.get("out").expect("out");
+    assert_eq!(out.dims(), want_out.dims(), "streaming output shape vs Python");
+    let e = rel_err(&out, want_out);
+    println!("streaming output vs Python: {e:.3e} (shape {:?})", out.dims());
+    assert!(e < 5e-3, "streaming conformer output vs Python: {e}");
+
+    // next caches: shape + values (the channel cache holds the cached frames; the conv
+    // cache is empty for this config — cache_drop_size 51 > chunk).
+    let want_ch = g.get("next_channel").expect("next_channel");
+    assert_eq!(next_ch.dims(), want_ch.dims(), "next_channel shape vs Python");
+    let e_ch = rel_err(&next_ch, want_ch);
+    println!("next_channel vs Python: {e_ch:.3e}");
+    assert!(e_ch < 5e-3, "next_channel vs Python: {e_ch}");
+    assert_eq!(next_time.dims(), g.get("next_time").expect("next_time").dims(), "next_time shape vs Python");
+
+    // out_len / next_len exact (integers; next_len is negative for this config).
+    assert_eq!(out_len.to_vec1::<i64>()?, g.get("out_len").unwrap().to_dtype(DType::I64)?.to_vec1::<i64>()?, "out_len vs Python");
+    assert_eq!(next_len.to_vec1::<i64>()?, g.get("next_len").unwrap().to_dtype(DType::I64)?.to_vec1::<i64>()?, "next_len vs Python");
+    println!("out_len {:?} next_len {:?} — match Python", out_len.to_vec1::<i64>()?, next_len.to_vec1::<i64>()?);
+    Ok(())
+}
+
 /// Detector for the off-path ConvSubsampling schemes (vggnet / striding / the conv1d
 /// pair). The model is `dw_striding`; these are alternative architectures verified
 /// against torch on shared weights. The golden applies the REAL conv layers directly
