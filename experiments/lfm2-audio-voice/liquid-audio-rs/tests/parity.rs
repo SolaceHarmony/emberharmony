@@ -51,6 +51,38 @@ fn mel_parity() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Detector for the off-path `exact_pad=True` STFT branch (`center=False` + an
+/// explicit `(n_fft - hop)//2` signal pad before preemph, then a timemask). The
+/// LFM2.5-Audio config uses `center=True`, so this is exercised only by forcing
+/// `exact_pad` on. Golden: `dump_mel_reference.py` → `mel_refs_exactpad`.
+#[test]
+#[ignore = "needs parity/golden/mel_refs_exactpad.safetensors (run dump_mel_reference.py)"]
+fn mel_exact_pad_parity() -> anyhow::Result<()> {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let refs_path = manifest.join("parity/golden/mel_refs_exactpad.safetensors");
+    let cfg_path = manifest.join("parity/cfg/config.json");
+    let device = Device::Cpu;
+
+    let refs = candle_core::safetensors::load(&refs_path, &device)?;
+    let wav = refs.get("wav").expect("wav in refs").clone();
+    let mel_ref = refs.get("mel").expect("mel in refs").clone();
+
+    let config: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&cfg_path)?)?;
+    let prep: PreprocessorConfig = serde_json::from_value(config["preprocessor"].clone())?;
+    let mut mc = prep.mel_config();
+    mc.exact_pad = true; // off-path branch; the config omits it (defaults False)
+    let fb = FilterbankFeatures::new(mc, &device)?;
+
+    let mel = fb.forward(&wav)?;
+    println!("exact_pad mel rust {:?}  ref {:?}", mel.dims(), mel_ref.dims());
+    assert_eq!(mel.dims(), mel_ref.dims(), "exact_pad mel shape mismatch (center=False framing)");
+
+    let err = rel_err(&mel, &mel_ref);
+    println!("exact_pad mel rel-err: {err:.3e}");
+    assert!(err < 5e-3, "exact_pad mel parity failed: {err}");
+    Ok(())
+}
+
 #[test]
 #[ignore = "needs LFM_MODEL_DIR + parity/golden/conformer_stages.safetensors"]
 fn conformer_stages_parity() -> anyhow::Result<()> {

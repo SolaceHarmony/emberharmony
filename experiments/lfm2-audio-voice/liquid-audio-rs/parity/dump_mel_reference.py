@@ -61,6 +61,22 @@ def main() -> int:
     save_file(refs, str(out / "mel_refs.safetensors"))
     print("dumped:", {k: tuple(v.shape) for k, v in refs.items()})
     print("mel_len:", int(mel_len[0]))
+
+    # exact_pad=True variant (center=False + explicit (n_fft - hop)//2 signal pad).
+    # The LFM2.5-Audio config uses center=True; this is an off-path branch we port
+    # for completeness, so dump a separate golden on the SAME deterministic wav.
+    prep_ep = dict(prep)
+    prep_ep["exact_pad"] = True
+    preproc_ep = nemo.AudioToMelSpectrogramPreprocessor(**prep_ep).eval()
+    mel_ep, mel_len_ep = preproc_ep(wav, length)
+    refs_ep = {
+        "wav": wav.contiguous(),
+        "mel": mel_ep.to(torch.float32).contiguous(),
+        "mel_len": mel_len_ep.to(torch.int64).contiguous(),
+    }
+    save_file(refs_ep, str(out / "mel_refs_exactpad.safetensors"))
+    print("dumped exact_pad:", {k: tuple(v.shape) for k, v in refs_ep.items()})
+    print("mel_len exact_pad:", int(mel_len_ep[0]))
     return 0
 
 

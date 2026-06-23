@@ -35,6 +35,11 @@ pub struct PreprocessorConfig {
     pub dither: f64,
     pub pad_to: usize,
     pub pad_value: f64,
+    /// NeMo `exact_pad` (constructor arg, not always in the checkpoint JSON; the
+    /// LFM2.5-Audio config omits it ⇒ False). True switches the STFT to `center=False`
+    /// with an explicit `(n_fft - hop)//2` signal pad.
+    #[serde(default)]
+    pub exact_pad: bool,
 }
 
 impl PreprocessorConfig {
@@ -50,6 +55,7 @@ impl PreprocessorConfig {
             log_zero_guard_value: 2f64.powi(-24),
             mag_power: 2.0,
             pad_to: self.pad_to,
+            exact_pad: self.exact_pad,
         }
     }
 }

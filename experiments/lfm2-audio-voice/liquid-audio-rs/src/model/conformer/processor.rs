@@ -38,6 +38,22 @@ pub struct MelConfig {
     pub log_zero_guard_value: f64, // 2^-24
     pub mag_power: f64,         // 2.0
     pub pad_to: usize,          // 16
+    /// NeMo `exact_pad`. False (the checkpoint default) ⇒ `torch.stft(center=True)`
+    /// (symmetric `n_fft//2` internal pad). True ⇒ `center=False` with the signal
+    /// pre-padded by `(n_fft - hop)//2` each side in `forward`, so that the frame
+    /// count equals `audio_length // hop`.
+    pub exact_pad: bool,
+}
+
+impl MelConfig {
+    /// NeMo `self.stft_pad_amount = (n_fft - hop_length) // 2 if exact_pad else None`.
+    pub fn stft_pad_amount(&self) -> Option<usize> {
+        if self.exact_pad {
+            Some((self.n_fft - self.n_window_stride) / 2)
+        } else {
+            None
+        }
+    }
 }
 
 /// Symmetric Hann window (`periodic=False`), faithful to `torch.hann_window(N, periodic=False)`.
@@ -182,18 +198,19 @@ impl FilterbankFeatures {
     /// pad_amount = self.stft_pad_amount * 2 if self.stft_pad_amount is not None else self.n_fft // 2 * 2
     /// seq_len = torch.floor_divide((seq_len + pad_amount - self.n_fft), self.hop_length)
     /// ```
-    /// This port only supports the centered (`exact_pad=False`) path, so
-    /// `stft_pad_amount is None` and `pad_amount = (n_fft // 2) * 2`. With an
-    /// even `n_fft`, `pad_amount == n_fft`, so the formula collapses to
-    /// `floor_divide(seq_len, hop_length)` — i.e. `seq_len / hop` in integer
-    /// arithmetic. Exposed publicly so callers (the data mapper) can use the
-    /// featurizer-computed length instead of recomputing `L / hop` by hand.
+    /// `pad_amount = stft_pad_amount*2` when `exact_pad` (`stft_pad_amount` set),
+    /// else `(n_fft // 2) * 2` — the centered path. For even `n_fft` the centered
+    /// case collapses to `floor_divide(seq_len, hop)`; the exact_pad case gives
+    /// `floor_divide(seq_len + 2·stft_pad_amount - n_fft, hop)`. Exposed publicly so
+    /// callers (the data mapper) can use the featurizer-computed length.
     pub fn get_seq_len(&self, seq_len: usize) -> usize {
-        // pad_amount for the centered path: (n_fft // 2) * 2.
-        let pad_amount = (self.cfg.n_fft / 2) * 2;
+        // pad_amount: stft_pad_amount*2 (exact_pad) else (n_fft // 2) * 2 (centered).
+        let pad_amount = match self.cfg.stft_pad_amount() {
+            Some(p) => p * 2,
+            None => (self.cfg.n_fft / 2) * 2,
+        };
         // torch.floor_divide on non-negative ints == integer division. Guard the
-        // (seq_len + pad_amount - n_fft) subtraction against underflow; for the
-        // even-n_fft case pad_amount == n_fft so this is exactly seq_len.
+        // (seq_len + pad_amount - n_fft) subtraction against underflow.
         let numer = seq_len + pad_amount;
         let numer = numer.saturating_sub(self.cfg.n_fft);
         if self.cfg.n_window_stride > 0 {
@@ -216,15 +233,18 @@ impl FilterbankFeatures {
     /// `DFTI_SINGLE`/cuFFT-R2C), so this single-precision path matches torch's
     /// reference and, unlike rustfft, runs on the GPU.
     ///
-    /// `y`: `(1, L)` real signal on the device → `(re, im)` each `(1, freq, T)`,
-    /// `T = 1 + L/hop` (the `center=True` frame count).
-    fn stft(&self, y: &Tensor) -> Result<(Tensor, Tensor)> {
+    /// `y`: `(1, L)` real signal on the device → `(re, im)` each `(1, freq, T)`.
+    /// `center_pad` is the symmetric zero pad torch applies for `center=True`
+    /// (`n_fft/2`); for `center=False` (the exact_pad path, where `forward` has
+    /// already padded the signal) it is `0`. `T = 1 + (L + 2·center_pad - n_fft)/hop`.
+    fn stft(&self, y: &Tensor, center_pad: usize) -> Result<(Tensor, Tensor)> {
         let n_fft = self.cfg.n_fft;
         let hop = self.cfg.n_window_stride;
         let freq = n_fft / 2 + 1;
         let l = y.dim(1)?;
-        // center=True, pad_mode="constant": n_fft/2 zeros each side of the signal.
-        let xin = y.reshape((1, 1, l))?.pad_with_zeros(2, n_fft / 2, n_fft / 2)?;
+        // pad_mode="constant": center_pad zeros each side (n_fft/2 for center=True, 0
+        // for center=False).
+        let xin = y.reshape((1, 1, l))?.pad_with_zeros(2, center_pad, center_pad)?;
         // _fft_r2c as a strided DFT-basis convolution → (1, 2·freq, T).
         let out = xin.conv1d(&self.stft_kernel, 0, hop, 1, 1)?;
         let re = out.narrow(1, 0, freq)?; // (1, freq, T)
@@ -257,29 +277,49 @@ impl FilterbankFeatures {
     /// the rest of the model.
     pub fn forward(&self, samples: &Tensor) -> Result<Tensor> {
         let dev = &self.device;
-        let hop = self.cfg.n_window_stride;
+        let n_fft = self.cfg.n_fft;
         // signal → (L,) f32 on the model device.
         let x = samples.flatten_all()?.to_dtype(DType::F32)?.to_device(dev)?;
+        // `seq_len_time` in Python: the valid sample count = L for a single clip; it is
+        // the preemphasis timemask boundary (NOT shifted by the exact_pad padding).
         let l = x.dim(0)?;
-        // NeMo `get_seq_len`: floor(L/hop) valid frames. torch.stft(center=True)
-        // emits `1 + L/hop` frames, so the trailing frame is a pad column (masked below).
-        let seq_len = self.get_seq_len(l);
-        let t = 1 + l / hop;
+        let seq_len = self.get_seq_len(l); // valid frame count
 
-        // preemphasis: y[0]=x[0]; y[i]=x[i]-preemph·x[i-1], in candle on the device.
-        let x2 = x.reshape((1, l))?;
-        let y = if self.cfg.preemph != 0.0 && l > 1 {
+        // exact_pad: F.pad(x, (stft_pad_amount, stft_pad_amount)) on the RAW signal
+        // BEFORE preemph, then stft(center=False) (center_pad=0). Centered: no signal
+        // pad — the n_fft/2 pad happens inside stft (center=True).
+        let (center_pad, x_in) = match self.cfg.stft_pad_amount() {
+            Some(p) => (0usize, x.reshape((1, l))?.pad_with_zeros(1, p, p)?), // (1, L+2p)
+            None => (n_fft / 2, x.reshape((1, l))?),                          // (1, L)
+        };
+        let li = x_in.dim(1)?;
+
+        // preemphasis: y[0]=x_in[0]; y[i]=x_in[i]-preemph·x_in[i-1] (over the padded
+        // signal in the exact_pad case, matching Python).
+        let y = if self.cfg.preemph != 0.0 && li > 1 {
             let pre = self.cfg.preemph;
-            let head = x2.narrow(1, 0, 1)?; // x[0]
-            // x[1:] - preemph·x[:-1]  (scalar via affine; candle has f64·Tensor, not Tensor·f64)
-            let tail = (x2.narrow(1, 1, l - 1)? - x2.narrow(1, 0, l - 1)?.affine(pre, 0.0)?)?;
-            Tensor::cat(&[&head, &tail], 1)? // (1, L)
+            let head = x_in.narrow(1, 0, 1)?; // x_in[0]
+            // x_in[1:] - preemph·x_in[:-1] (scalar via affine; candle has f64·Tensor).
+            let tail = (x_in.narrow(1, 1, li - 1)? - x_in.narrow(1, 0, li - 1)?.affine(pre, 0.0)?)?;
+            Tensor::cat(&[&head, &tail], 1)? // (1, li)
         } else {
-            x2
+            x_in
+        };
+        // masked_fill(~(arange(li) < seq_len_time), 0): zero positions >= L. Centered
+        // path li == L ⇒ no-op; exact_pad zeros the [L, li) tail (left pad stays 0).
+        let y = if li > l {
+            let kept = y.narrow(1, 0, l)?;
+            let zeros = Tensor::zeros((1, li - l), y.dtype(), dev)?;
+            Tensor::cat(&[&kept, &zeros], 1)?
+        } else {
+            y
         };
 
         // torch.stft (candle-native, on device) → (re, im) each (1, freq, T).
-        let (re, im) = self.stft(&y)?;
+        let (re, im) = self.stft(&y, center_pad)?;
+        // frame count T (center=True ⇒ 1+L/hop; exact_pad ⇒ L/hop) — read from the
+        // actual framing so both paths agree with their seq_len.
+        let t = re.dim(2)?;
         // magnitude^mag_power: |X|^p. mag_power==2 → re²+im² (guard==0 on the
         // inference path, use_grads=False); else sqrt(re²+im²)^mag_power.
         let p2 = (re.sqr()? + im.sqr()?)?; // (1, freq, T)
