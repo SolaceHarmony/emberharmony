@@ -279,6 +279,60 @@ fn conformer_streaming_inventory() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Batched (B=2) training path vs a PYTHON golden — `logits` + `forward`.
+///
+/// This is the real detector for the B>1 row-0 bug (unlike the self-consistency test
+/// below, which never asks Python anything). The old code read only batch row 0, so
+/// its `text_logits` were `(n_text, V)` — HALF of Python's `(2·n_text, V)`; that is a
+/// hard shape failure here. Golden: `parity/dump_batched_logits.py` (duplicate of the
+/// prefill_refs sample, collated, all-ones supervision).
+#[test]
+#[ignore = "needs LFM_MODEL_DIR + parity/golden/{prefill,batched_logits}_refs.safetensors"]
+fn batched_logits_python_parity() -> anyhow::Result<()> {
+    use liquid_audio::model::lfm2_audio::LFM2AudioModelInput;
+    let dir = std::env::var("LFM_MODEL_DIR").expect("set LFM_MODEL_DIR");
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let device = Device::Cpu;
+    let r = candle_core::safetensors::load(manifest.join("parity/golden/prefill_refs.safetensors"), &device)?;
+    let g = candle_core::safetensors::load(manifest.join("parity/golden/batched_logits_refs.safetensors"), &device)?;
+    let (model, _proc) = liquid_audio::from_pretrained(Path::new(&dir), DType::F32, &device)?;
+
+    let text = r.get("text").unwrap().to_dtype(DType::I64)?;
+    let audio_in = r.get("audio_in").unwrap().to_dtype(DType::F32)?;
+    let audio_in_lens = r.get("audio_in_lens").unwrap().to_dtype(DType::I64)?;
+    let audio_out = r.get("audio_out").unwrap().to_dtype(DType::I64)?;
+    let modality = r.get("modality_flag").unwrap().to_dtype(DType::I64)?;
+    let l = modality.dim(1)?;
+    let sup = Tensor::ones((1, l), DType::U8, &device)?;
+    // B=2 duplicate, lfm2_collator dims (text/audio cat dim=1; modality/sup cat dim=0).
+    let b2 = LFM2AudioModelInput {
+        text: Tensor::cat(&[&text, &text], 1)?,
+        audio_in: Tensor::cat(&[&audio_in, &audio_in], 1)?,
+        audio_in_lens: Tensor::cat(&[&audio_in_lens, &audio_in_lens], 0)?,
+        audio_out: Tensor::cat(&[&audio_out, &audio_out], 1)?,
+        modality_flag: Tensor::cat(&[&modality, &modality], 0)?,
+        supervision_mask: Tensor::cat(&[&sup, &sup], 0)?,
+    };
+
+    let (tl, _al, tt, _at) = model.logits(&b2)?;
+    let want_tl = g.get("text_logits").expect("text_logits");
+    // SHAPE first: the row-0 bug yields half the rows → (28,V) vs Python (56,V).
+    assert_eq!(tl.dims(), want_tl.dims(), "text_logits shape (row-0 bug → half the supervised positions)");
+    let e_tl = rel_err(&tl, want_tl);
+    // text labels must match Python exactly (integer).
+    let got_tt = tt.to_dtype(DType::I64)?.to_vec1::<i64>()?;
+    let want_tt = g.get("text_labels").unwrap().to_dtype(DType::I64)?.to_vec1::<i64>()?;
+    assert_eq!(got_tt, want_tt, "batched text labels vs Python");
+
+    // forward loss vs Python.
+    let out = model.forward(&b2)?;
+    let e_loss = rel_err(&out.loss.reshape((1,))?, g.get("loss").unwrap());
+    println!("batched vs Python: text_logits {:?} rel-err {e_tl:.3e}; loss rel-err {e_loss:.3e}", tl.dims());
+    assert!(e_tl < 2e-2, "batched text_logits vs Python: {e_tl}");
+    assert!(e_loss < 2e-2, "batched loss vs Python: {e_loss}");
+    Ok(())
+}
+
 /// Batched (B>1) self-consistency for `prefill_inputs` / `logits`.
 ///
 /// A B=2 batch of two IDENTICAL samples must yield prefill/logits equal to the
