@@ -1,5 +1,14 @@
 import { fileURLToPath } from "node:url"
-import { type JobContext, type JobProcess, ServerOptions, cli, defineAgent, inference, voice } from "@livekit/agents"
+import {
+  type JobContext,
+  type JobProcess,
+  ServerOptions,
+  AgentServer,
+  defineAgent,
+  inference,
+  voice,
+  initializeLogger,
+} from "@livekit/agents"
 import * as livekit from "@livekit/agents-plugin-livekit"
 import * as silero from "@livekit/agents-plugin-silero"
 import { llm } from "@livekit/agents"
@@ -8,6 +17,7 @@ import { SessionLLM } from "./bridge"
 import { VoiceRegistry } from "./registry"
 import { VOICE_AGENT_NAME } from "./constants"
 import { VoiceWorkflow, VOICE_SYSTEM_PROMPT } from "./workflow"
+import { createServer as createIpcServer, type Server as IpcServer } from "node:net"
 
 // Model strings accept an optional ":language" (STT) or ":voice" (TTS) suffix.
 // The serve command injects these from the resolved voice config when it
@@ -85,23 +95,51 @@ if (import.meta.main) {
   const url = Flag.EMBERHARMONY_LIVEKIT_URL
   const apiKey = Flag.EMBERHARMONY_LIVEKIT_API_KEY
   const apiSecret = Flag.EMBERHARMONY_LIVEKIT_API_SECRET
-  const connects = process.argv.some((arg) => arg === "dev" || arg === "start" || arg === "connect")
-  if (connects && (!url || !apiKey || !apiSecret)) {
+  if (!url || !apiKey || !apiSecret) {
     console.error(
       "Voice agent requires EMBERHARMONY_LIVEKIT_URL, EMBERHARMONY_LIVEKIT_API_KEY, and EMBERHARMONY_LIVEKIT_API_SECRET (or their LIVEKIT_* equivalents) to be set.",
     )
     process.exit(1)
   }
-  cli.runApp(
+
+  initializeLogger({ pretty: false, level: process.env["EMBERHARMONY_VOICE_LOG_LEVEL"] ?? "info" })
+
+  const server = new AgentServer(
     new ServerOptions({
       agent: fileURLToPath(import.meta.url),
       agentName: VOICE_AGENT_NAME,
       wsURL: url,
       apiKey,
       apiSecret,
-      // health-check server port; 0 = ephemeral (used for serve-managed
-      // workers so they never collide with a manually started one)
       port: Number(process.env["EMBERHARMONY_VOICE_WORKER_PORT"] ?? 8081),
     }),
   )
+
+  let ipc: IpcServer | undefined
+
+  const shutdown = async () => {
+    if (ipc) ipc.close()
+    await server.drain(5000).catch(() => {})
+    await server.close().catch(() => {})
+    process.exit(0)
+  }
+
+  const socketPath = process.env["EMBERHARMONY_VOICE_IPC_SOCKET"]
+  if (socketPath) {
+    ipc = createIpcServer((conn) => {
+      conn.on("data", (data) => {
+        if (data.toString().trim() === "shutdown") void shutdown()
+      })
+      conn.on("error", () => {})
+    })
+    ipc.listen(socketPath)
+  }
+
+  process.on("SIGTERM", () => void shutdown())
+  process.on("SIGINT", () => void shutdown())
+
+  void server.run().catch((err) => {
+    console.error("voice agent worker failed:", err)
+    void shutdown()
+  })
 }
