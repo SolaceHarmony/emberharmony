@@ -1,15 +1,20 @@
 import { existsSync } from "node:fs"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
+import { createConnection } from "node:net"
+import os from "node:os"
 import type { Config } from "../config/config"
 import { Log } from "../util/log"
 import { Voice } from "./token"
 
+const GRACEFUL_TIMEOUT_MS = 10_000
+
 /**
  * Manages the voice agent worker as a child process of `emberharmony serve`.
- * The worker gets the resolved voice settings (config + credential store)
- * injected as environment variables at spawn, so the UI is the single
- * configuration path.
+ *
+ * Lifecycle uses IPC (Unix socket) for shutdown: stop() writes "shutdown" to
+ * the socket, and the agent process calls AgentServer.drain() + close() to
+ * gracefully stop all forked job processes. SIGTERM is a fallback only.
  *
  * Two launch modes:
  *  - **Bundled runtime** (packaged desktop app): the LiveKit agents framework
@@ -23,6 +28,7 @@ export namespace VoiceWorker {
   const log = Log.create({ service: "voice.worker" })
 
   let proc: ReturnType<typeof Bun.spawn> | undefined
+  let ipcSocketPath: string | undefined
   let lastServerUrl: string | undefined
 
   interface Launch {
@@ -32,12 +38,6 @@ export namespace VoiceWorker {
     env: Record<string, string>
   }
 
-  /**
-   * Resolve how to launch the worker. Prefer the bundled runtime the desktop
-   * app ships (EMBERHARMONY_VOICE_RUNTIME_DIR); otherwise fall back to running
-   * the TypeScript source with the current Bun (dev). Returns undefined when
-   * neither is available (e.g. compiled CLI with no bundled runtime).
-   */
   function resolveLaunch(): Launch | undefined {
     const runtimeDir = process.env["EMBERHARMONY_VOICE_RUNTIME_DIR"]
     if (runtimeDir) {
@@ -48,8 +48,6 @@ export namespace VoiceWorker {
           mode: "bundled",
           cmd: [bunBin, agentJs, "start"],
           cwd: runtimeDir,
-          // Point the HF/agents model caches at the bundled models so the
-          // worker loads VAD + turn-detector offline.
           env: {
             HF_HOME: path.join(runtimeDir, "models"),
             XDG_CACHE_HOME: path.join(runtimeDir, "models"),
@@ -65,8 +63,34 @@ export namespace VoiceWorker {
     return undefined
   }
 
+  function allocateSocket(): string {
+    const tmpDir = os.tmpdir()
+    return path.join(tmpDir, `emberharmony-voice-${Date.now()}.sock`)
+  }
+
+  async function sendShutdown(): Promise<boolean> {
+    if (!ipcSocketPath) return false
+    const socketPath = ipcSocketPath
+    return new Promise((resolve) => {
+      const conn = createConnection(socketPath, () => {
+        conn.write("shutdown")
+        conn.end()
+        resolve(true)
+      })
+      conn.on("error", () => resolve(false))
+      setTimeout(() => {
+        conn.destroy()
+        resolve(false)
+      }, 2000)
+    })
+  }
+
   export async function start(serverUrl: string, override?: Config.Voice): Promise<boolean> {
-    stop()
+    if (running()) {
+      log.info("voice agent worker already running; skipping duplicate start")
+      return true
+    }
+    await stop()
     lastServerUrl = serverUrl
     const settings = await Voice.settings(override)
     if (!settings.available) {
@@ -78,6 +102,7 @@ export namespace VoiceWorker {
       log.warn("voice agent runtime not available in this build; start the worker manually with `bun run voice-agent`")
       return false
     }
+    ipcSocketPath = allocateSocket()
     proc = Bun.spawn({
       cmd: launch.cmd,
       cwd: launch.cwd,
@@ -87,7 +112,6 @@ export namespace VoiceWorker {
         EMBERHARMONY_LIVEKIT_URL: settings.url!,
         EMBERHARMONY_LIVEKIT_API_KEY: settings.apiKey!,
         EMBERHARMONY_LIVEKIT_API_SECRET: settings.apiSecret!,
-        // LiveKit Inference (STT/TTS) reads the standard env var names
         LIVEKIT_URL: settings.url!,
         LIVEKIT_API_KEY: settings.apiKey!,
         LIVEKIT_API_SECRET: settings.apiSecret!,
@@ -96,6 +120,7 @@ export namespace VoiceWorker {
         EMBERHARMONY_VOICE_INTENT_MODEL: settings.intent,
         EMBERHARMONY_VOICE_SERVER_URL: serverUrl,
         EMBERHARMONY_VOICE_WORKER_PORT: "0",
+        EMBERHARMONY_VOICE_IPC_SOCKET: ipcSocketPath,
       },
       stdout: "inherit",
       stderr: "inherit",
@@ -105,7 +130,13 @@ export namespace VoiceWorker {
         }
       },
     })
-    log.info("voice agent worker started", { pid: proc.pid, mode: launch.mode, stt: settings.stt, tts: settings.tts })
+    log.info("voice agent worker started", {
+      pid: proc.pid,
+      mode: launch.mode,
+      stt: settings.stt,
+      tts: settings.tts,
+      ipc: ipcSocketPath,
+    })
     return true
   }
 
@@ -113,24 +144,73 @@ export namespace VoiceWorker {
     return proc !== undefined && proc.exitCode === null
   }
 
-  export function stop() {
-    if (!proc) return
+  export async function stop(): Promise<void> {
     const p = proc
+    if (!p) return
     proc = undefined
-    p.kill()
+    if (p.exitCode !== null) return
+
+    const ppid = p.pid
+    log.info("gracefully stopping voice agent worker via IPC", { pid: ppid })
+
+    const sent = await sendShutdown()
+    if (sent) {
+      const exited = new Promise<boolean>((resolve) => {
+        const timer = setTimeout(() => resolve(false), GRACEFUL_TIMEOUT_MS)
+        p.exited
+          .then(() => {
+            clearTimeout(timer)
+            resolve(true)
+          })
+          .catch(() => {
+            clearTimeout(timer)
+            resolve(true)
+          })
+      })
+      const graceful = await exited
+      if (graceful) {
+        log.info("voice agent worker stopped gracefully via IPC", { pid: ppid })
+        return
+      }
+    }
+
+    log.warn("IPC shutdown failed or timed out; falling back to SIGTERM", { pid: ppid })
+    p.kill("SIGTERM")
+
+    const exited = new Promise<boolean>((resolve) => {
+      const timer = setTimeout(() => resolve(false), GRACEFUL_TIMEOUT_MS)
+      p.exited
+        .then(() => {
+          clearTimeout(timer)
+          resolve(true)
+        })
+        .catch(() => {
+          clearTimeout(timer)
+          resolve(true)
+        })
+    })
+
+    const graceful = await exited
+    if (graceful) {
+      log.info("voice agent worker stopped via SIGTERM", { pid: ppid })
+      return
+    }
+
+    log.warn("voice agent worker did not exit; force killing", { pid: ppid })
+    if (process.platform === "win32") {
+      Bun.spawn(["taskkill", "/pid", String(ppid), "/f", "/t"], { stdout: "ignore", stderr: "ignore" })
+    } else {
+      try {
+        process.kill(-ppid, "SIGKILL")
+      } catch {
+        p.kill("SIGKILL")
+      }
+    }
   }
 
-  /**
-   * Respawn with freshly resolved settings (after a config change). Also
-   * handles the boot-unconfigured case: serve always records its URL via
-   * start(), so configuring voice later starts the worker without a restart
-   * of serve. No-op when not running under serve at all. Pass the just-merged
-   * voice config — instance caches dispose asynchronously after a config
-   * write, so resolving through Config.get() here would race a stale cache.
-   */
   export async function restart(override?: Config.Voice): Promise<boolean> {
     if (!lastServerUrl) return false
-    stop()
+    await stop()
     return start(lastServerUrl, override)
   }
 }

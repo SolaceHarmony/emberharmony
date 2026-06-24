@@ -168,6 +168,12 @@ function createPromptSession(dir: string, id: string | undefined) {
     },
     set(prompt: Prompt, cursorPosition?: number) {
       const next = clonePrompt(prompt)
+      if (isPromptEqual(next, store.prompt)) {
+        if (cursorPosition !== undefined && cursorPosition !== store.cursor) {
+          setStore("cursor", cursorPosition)
+        }
+        return
+      }
       batch(() => {
         setStore("prompt", next)
         if (cursorPosition !== undefined) setStore("cursor", cursorPosition)
@@ -228,9 +234,14 @@ export const { use: usePrompt, provider: PromptProvider } = createSimpleContext(
     }
 
     const session = createMemo(() => load(params.dir!, params.id))
+    let wasReady = false
 
     return {
-      ready: () => session().ready(),
+      ready: () => {
+        const r = session().ready()
+        if (r) wasReady = true
+        return wasReady
+      },
       current: () => session().current(),
       cursor: () => session().cursor(),
       dirty: () => session().dirty(),
