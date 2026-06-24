@@ -7,6 +7,7 @@ import {
   defineAgent,
   inference,
   voice,
+  initializeLogger,
 } from "@livekit/agents"
 import * as livekit from "@livekit/agents-plugin-livekit"
 import * as silero from "@livekit/agents-plugin-silero"
@@ -100,6 +101,8 @@ if (import.meta.main) {
     )
     process.exit(1)
   }
+
+  initializeLogger({ pretty: false, level: process.env["EMBERHARMONY_VOICE_LOG_LEVEL"] ?? "info" })
 
   const server = new AgentServer(
     new ServerOptions({

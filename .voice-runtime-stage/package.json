@@ -1,0 +1,10 @@
+{
+  "name": "emberharmony-voice-runtime",
+  "version": "0.0.0",
+  "dependencies": {
+    "@livekit/agents": "1.4.5",
+    "@livekit/agents-plugin-livekit": "1.4.5",
+    "@livekit/agents-plugin-silero": "1.4.5",
+    "@livekit/rtc-node": "0.13.29"
+  }
+}
