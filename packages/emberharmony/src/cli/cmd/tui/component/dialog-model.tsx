@@ -1,4 +1,4 @@
-import { createMemo, createSignal } from "solid-js"
+import { createMemo, createSignal, onMount } from "solid-js"
 import { useLocal } from "@tui/context/local"
 import { useSync } from "@tui/context/sync"
 import { map, pipe, flatMap, entries, filter, sortBy, take } from "remeda"
@@ -22,6 +22,16 @@ export function DialogModel(props: { providerID?: string }) {
   const keybind = useKeybind()
   const [ref, setRef] = createSignal<DialogSelectRef<unknown>>()
   const [query, setQuery] = createSignal("")
+
+  onMount(() => {
+    const providerID = props.providerID
+    if (providerID === "ollama" || providerID === "lmstudio") {
+      sync.refreshProvider(providerID)
+    } else if (!providerID) {
+      sync.refreshProvider("ollama")
+      sync.refreshProvider("lmstudio")
+    }
+  })
 
   const connected = useConnected()
   const providers = createDialogProviderOptions()

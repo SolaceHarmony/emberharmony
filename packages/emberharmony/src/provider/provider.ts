@@ -10,6 +10,7 @@ import { ModelsDev } from "./models"
 import { NamedError } from "@thesolaceproject/emberharmony-util/error"
 import { Auth } from "../auth"
 import { Env } from "../env"
+import { Storage } from "../storage/storage"
 import { Instance } from "../project/instance"
 import { Flag } from "../flag/flag"
 import { iife } from "@/util/iife"
@@ -97,7 +98,7 @@ export namespace Provider {
         },
       }
     },
-    "emberharmony": async (input) => {
+    emberharmony: async (input) => {
       const hasKey = await (async () => {
         const env = Env.all()
         if (input.env.some((item) => env[item])) return true
@@ -340,64 +341,42 @@ export namespace Provider {
       }
     },
     ollama: async (provider) => {
-      // Auto-discover locally running Ollama models via the /api/tags endpoint.
       const config = await Config.get()
       const baseURL = config.provider?.["ollama"]?.options?.baseURL ?? "http://localhost:11434"
 
-      try {
-        const res = await fetch(`${baseURL}/api/tags`, {
-          signal: AbortSignal.timeout(1500),
-        })
-        if (!res.ok) return { autoload: false }
-        const data = (await res.json()) as { models?: Array<{ name: string; details?: { parameter_size?: string; family?: string; quantization_level?: string } }> }
-        if (!data.models?.length) return { autoload: false }
+      const discovered = await probeOllama(baseURL)
+      const cached = await loadCachedModels("ollama")
 
-        for (const m of data.models) {
-          const id = m.name
-          if (!id || id === "__proto__" || id === "constructor" || id === "prototype") continue
-          const details = m.details ?? {}
-          const paramSize = details.parameter_size ?? ""
-          const family = details.family ?? ""
-          const quant = details.quantization_level ?? ""
-          const displayName = [id, paramSize, quant].filter(Boolean).join(" · ")
+      const models = discovered.length > 0 ? Object.fromEntries(discovered.map((m) => [m.id, m])) : cached
+      provider.models = models
 
-          provider.models[id] = {
-            id,
-            api: { id, npm: "@ai-sdk/openai-compatible", url: `${baseURL}/v1` },
-            name: displayName,
-            providerID: "ollama",
-            status: "active",
-            capabilities: {
-              temperature: true,
-              reasoning: false,
-              attachment: false,
-              toolcall: true,
-              input: { text: true, audio: false, image: false, video: false, pdf: false },
-              output: { text: true, audio: false, image: false, video: false, pdf: false },
-              interleaved: false,
-            },
-            cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
-            options: {},
-            limit: { context: 0, output: 0 },
-            headers: {},
-            family,
-            release_date: "",
-            variants: {},
-          }
-        }
+      if (discovered.length > 0) await persistModels("ollama", models)
 
-        log.info("ollama: discovered " + data.models.length + " local models")
+      return {
+        autoload: true,
+        options: {
+          baseURL: `${baseURL}/v1`,
+          apiKey: "ollama",
+        },
+      }
+    },
+    lmstudio: async (provider) => {
+      const config = await Config.get()
+      const baseURL = config.provider?.["lmstudio"]?.options?.baseURL ?? "http://127.0.0.1:1234"
 
-        return {
-          autoload: true,
-          options: {
-            baseURL: `${baseURL}/v1`,
-            apiKey: "ollama",
-          },
-        }
-      } catch {
-        // Ollama not running — skip silently
-        return { autoload: false }
+      const discovered = await probeLMStudio(baseURL)
+      const cached = await loadCachedModels("lmstudio")
+
+      const models = discovered.length > 0 ? Object.fromEntries(discovered.map((m) => [m.id, m])) : cached
+      provider.models = models
+
+      if (discovered.length > 0) await persistModels("lmstudio", models)
+
+      return {
+        autoload: true,
+        options: {
+          baseURL: `${baseURL}/v1`,
+        },
       }
     },
     vercel: async () => {
@@ -577,6 +556,147 @@ export namespace Provider {
         },
       }
     },
+  }
+
+  interface OllamaTag {
+    name: string
+    details?: { parameter_size?: string; family?: string; quantization_level?: string }
+  }
+
+  async function probeOllama(baseURL: string): Promise<Model[]> {
+    try {
+      const res = await fetch(`${baseURL}/api/tags`, { signal: AbortSignal.timeout(1500) })
+      if (!res.ok) return []
+      const data = (await res.json()) as { models?: OllamaTag[] }
+      if (!data.models?.length) return []
+      const models: Model[] = []
+      for (const m of data.models) {
+        const id = m.name
+        if (!id || id === "__proto__" || id === "constructor" || id === "prototype") continue
+        const details = m.details ?? {}
+        const paramSize = details.parameter_size ?? ""
+        const family = details.family ?? ""
+        const quant = details.quantization_level ?? ""
+        const displayName = [id, paramSize, quant].filter(Boolean).join(" · ")
+        models.push({
+          id,
+          api: { id, npm: "@ai-sdk/openai-compatible", url: `${baseURL}/v1` },
+          name: displayName,
+          providerID: "ollama",
+          status: "active",
+          capabilities: {
+            temperature: true,
+            reasoning: false,
+            attachment: false,
+            toolcall: true,
+            input: { text: true, audio: false, image: false, video: false, pdf: false },
+            output: { text: true, audio: false, image: false, video: false, pdf: false },
+            interleaved: false,
+          },
+          cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+          options: {},
+          limit: { context: 0, output: 0 },
+          headers: {},
+          family,
+          release_date: "",
+          variants: {},
+        })
+      }
+      log.info("ollama: discovered " + models.length + " local models")
+      return models
+    } catch {
+      return []
+    }
+  }
+
+  interface LMStudioModel {
+    id: string
+    object?: string
+  }
+
+  async function probeLMStudio(baseURL: string): Promise<Model[]> {
+    try {
+      const res = await fetch(`${baseURL}/v1/models`, { signal: AbortSignal.timeout(1500) })
+      if (!res.ok) return []
+      const data = (await res.json()) as { data?: LMStudioModel[] }
+      if (!data.data?.length) return []
+      const models: Model[] = []
+      for (const m of data.data) {
+        const id = m.id
+        if (!id || id === "__proto__" || id === "constructor" || id === "prototype") continue
+        models.push({
+          id,
+          api: { id, npm: "@ai-sdk/openai-compatible", url: `${baseURL}/v1` },
+          name: id,
+          providerID: "lmstudio",
+          status: "active",
+          capabilities: {
+            temperature: true,
+            reasoning: false,
+            attachment: false,
+            toolcall: true,
+            input: { text: true, audio: false, image: false, video: false, pdf: false },
+            output: { text: true, audio: false, image: false, video: false, pdf: false },
+            interleaved: false,
+          },
+          cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+          options: {},
+          limit: { context: 0, output: 0 },
+          headers: {},
+          family: "",
+          release_date: "",
+          variants: {},
+        })
+      }
+      log.info("lmstudio: discovered " + models.length + " local models")
+      return models
+    } catch {
+      return []
+    }
+  }
+
+  async function loadCachedModels(providerID: string): Promise<Record<string, Model>> {
+    const cached = await Storage.read<Record<string, Model>>(["provider", providerID, "models"]).catch(() => undefined)
+    return cached ?? {}
+  }
+
+  async function persistModels(providerID: string, models: Record<string, Model>): Promise<void> {
+    await Storage.write(["provider", providerID, "models"], models).catch(() => {})
+  }
+
+  export async function refresh(providerID: string): Promise<Record<string, Model>> {
+    const config = await Config.get()
+    if (providerID === "ollama") {
+      const baseURL = config.provider?.["ollama"]?.options?.baseURL ?? "http://localhost:11434"
+      const discovered = await probeOllama(baseURL)
+      const models =
+        discovered.length > 0 ? Object.fromEntries(discovered.map((m) => [m.id, m])) : await loadCachedModels("ollama")
+      const s = await state()
+      const provider = s.providers[providerID]
+      if (provider) {
+        provider.models = models
+        provider.options = { baseURL: `${baseURL}/v1`, apiKey: "ollama" }
+      }
+      if (discovered.length > 0) await persistModels(providerID, models)
+      return models
+    }
+    if (providerID === "lmstudio") {
+      const baseURL = config.provider?.["lmstudio"]?.options?.baseURL ?? "http://127.0.0.1:1234"
+      const discovered = await probeLMStudio(baseURL)
+      const models =
+        discovered.length > 0
+          ? Object.fromEntries(discovered.map((m) => [m.id, m]))
+          : await loadCachedModels("lmstudio")
+      const s = await state()
+      const provider = s.providers[providerID]
+      if (provider) {
+        provider.models = models
+        provider.options = { baseURL: `${baseURL}/v1` }
+      }
+      if (discovered.length > 0) await persistModels(providerID, models)
+      return models
+    }
+    return {}
   }
 
   export const Model = z
@@ -961,6 +1081,18 @@ export namespace Provider {
       }
     }
 
+    // Inject local LM Studio provider if not already in database
+    if (!database["lmstudio"] && !disabled.has("lmstudio")) {
+      database["lmstudio"] = {
+        id: "lmstudio",
+        name: "LM Studio",
+        env: [],
+        options: {},
+        source: "custom",
+        models: {},
+      }
+    }
+
     for (const [providerID, fn] of Object.entries(CUSTOM_LOADERS)) {
       if (disabled.has(providerID)) continue
       const data = database[providerID]
@@ -1020,7 +1152,8 @@ export namespace Provider {
         }
       }
 
-      if (Object.keys(provider.models).length === 0) {
+      const isLocal = providerID === "ollama" || providerID === "lmstudio"
+      if (Object.keys(provider.models).length === 0 && !isLocal) {
         delete providers[providerID]
         continue
       }
@@ -1110,7 +1243,8 @@ export namespace Provider {
             if (typeof base === "string") return base
             if (base && typeof base === "object" && "toString" in base) return String(base)
             if (typeof input === "string") return input
-            if (input && typeof input === "object" && "url" in input) return String((input as { url?: unknown }).url ?? "")
+            if (input && typeof input === "object" && "url" in input)
+              return String((input as { url?: unknown }).url ?? "")
             return ""
           })()
           throw new RequestFailedError({
