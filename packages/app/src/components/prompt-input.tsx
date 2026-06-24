@@ -653,11 +653,21 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     }
   }
 
+  const promptContentKey = (parts: Prompt): string =>
+    parts
+      .map(
+        (p) => `${p.type}:${"content" in p ? p.content : ""}:${"path" in p ? p.path : ""}:${"name" in p ? p.name : ""}`,
+      )
+      .join("|")
+
+  let lastRenderedKey = ""
+
   createEffect(
     on(
       () => prompt.current(),
       (currentParts) => {
         const inputParts = currentParts.filter((part) => part.type !== "image") as Prompt
+        const contentKey = promptContentKey(inputParts)
 
         if (mirror.input) {
           mirror.input = false
@@ -670,6 +680,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
           }
 
           renderEditor(inputParts)
+          lastRenderedKey = contentKey
 
           if (cursorPosition !== null) {
             setCursorPosition(editorRef, cursorPosition)
@@ -677,8 +688,13 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
           return
         }
 
+        if (contentKey === lastRenderedKey && isNormalizedEditor()) return
+
         const domParts = parseFromDOM()
-        if (isNormalizedEditor() && isPromptEqual(inputParts, domParts)) return
+        if (isNormalizedEditor() && isPromptEqual(inputParts, domParts)) {
+          lastRenderedKey = contentKey
+          return
+        }
 
         const selection = window.getSelection()
         let cursorPosition: number | null = null
@@ -687,6 +703,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
         }
 
         renderEditor(inputParts)
+        lastRenderedKey = contentKey
 
         if (cursorPosition !== null) {
           setCursorPosition(editorRef, cursorPosition)
