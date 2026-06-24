@@ -19,7 +19,8 @@ for (const [key, value] of Object.entries(pkg.exports)) {
 
 // Resolve workspace:* and catalog: dependencies to the concrete version being
 // published. npm pack/publish rejects workspace: and catalog: protocol strings.
-const catalog = JSON.parse(await Bun.file("../../package.json").text()).catalog as Record<string, string>
+const root = JSON.parse(await Bun.file("../../package.json").text())
+const catalog = (root.workspaces?.catalog ?? {}) as Record<string, string>
 const deps = pkg.dependencies as Record<string, string>
 for (const [dep, ver] of Object.entries(deps)) {
   if (ver.startsWith("workspace:")) {
