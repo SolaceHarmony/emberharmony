@@ -5,11 +5,18 @@ import type { Config } from "../config/config"
 import { Log } from "../util/log"
 import { Voice } from "./token"
 
+const GRACEFUL_TIMEOUT_MS = 10_000
+
 /**
  * Manages the voice agent worker as a child process of `emberharmony serve`.
  * The worker gets the resolved voice settings (config + credential store)
  * injected as environment variables at spawn, so the UI is the single
  * configuration path.
+ *
+ * Lifecycle uses graceful shutdown: stop() sends SIGTERM so the LiveKit
+ * agents framework can drain active jobs and close its WebSocket, then waits
+ * up to GRACEFUL_TIMEOUT_MS before escalating to SIGKILL on the entire
+ * process group.
  *
  * Two launch modes:
  *  - **Bundled runtime** (packaged desktop app): the LiveKit agents framework
@@ -66,7 +73,11 @@ export namespace VoiceWorker {
   }
 
   export async function start(serverUrl: string, override?: Config.Voice): Promise<boolean> {
-    stop()
+    if (running()) {
+      log.info("voice agent worker already running; skipping duplicate start")
+      return true
+    }
+    await stop()
     lastServerUrl = serverUrl
     const settings = await Voice.settings(override)
     if (!settings.available) {
@@ -113,11 +124,49 @@ export namespace VoiceWorker {
     return proc !== undefined && proc.exitCode === null
   }
 
-  export function stop() {
-    if (!proc) return
+  export async function stop(): Promise<void> {
     const p = proc
+    if (!p) return
     proc = undefined
-    p.kill()
+    if (p.exitCode !== null) return
+
+    const ppid = p.pid
+    log.info("gracefully stopping voice agent worker", { pid: ppid })
+
+    // Send SIGTERM so the LiveKit agents framework can drain active jobs
+    // and close its WebSocket connection cleanly.
+    p.kill("SIGTERM")
+
+    // Wait for graceful exit, escalate to process-group SIGKILL if needed.
+    const exited = new Promise<boolean>((resolve) => {
+      const timer = setTimeout(() => resolve(false), GRACEFUL_TIMEOUT_MS)
+      p.exited
+        .then(() => {
+          clearTimeout(timer)
+          resolve(true)
+        })
+        .catch(() => {
+          clearTimeout(timer)
+          resolve(true)
+        })
+    })
+
+    const graceful = await exited
+    if (graceful) {
+      log.info("voice agent worker stopped gracefully", { pid: ppid })
+      return
+    }
+
+    log.warn("voice agent worker did not exit in time; force killing process group", { pid: ppid })
+    if (process.platform === "win32") {
+      Bun.spawn(["taskkill", "/pid", String(ppid), "/f", "/t"], { stdout: "ignore", stderr: "ignore" })
+    } else {
+      try {
+        process.kill(-ppid, "SIGKILL")
+      } catch {
+        p.kill("SIGKILL")
+      }
+    }
   }
 
   /**
@@ -130,7 +179,7 @@ export namespace VoiceWorker {
    */
   export async function restart(override?: Config.Voice): Promise<boolean> {
     if (!lastServerUrl) return false
-    stop()
+    await stop()
     return start(lastServerUrl, override)
   }
 }

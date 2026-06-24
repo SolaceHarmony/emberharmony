@@ -59,3 +59,16 @@ windows = { version = "0.61", features = [
     "Win32_System_Threading",
     "Win32_Security"
 ] }
+
+[profile.release]
+codegen-units = 16
+lto = false
+incremental = false
+
+[profile.ci]
+inherits = "release"
+codegen-units = 32
+lto = false
+opt-level = 1
+debug = false
+strip = true
