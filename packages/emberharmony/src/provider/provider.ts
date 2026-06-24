@@ -675,7 +675,11 @@ export namespace Provider {
       const provider = s.providers[providerID]
       if (provider) {
         provider.models = models
-        provider.options = { baseURL: `${baseURL}/v1`, apiKey: "ollama" }
+        provider.options = {
+          ...provider.options,
+          baseURL: `${baseURL}/v1`,
+          apiKey: "ollama",
+        }
       }
       if (discovered.length > 0) await persistModels(providerID, models)
       return models
@@ -691,7 +695,10 @@ export namespace Provider {
       const provider = s.providers[providerID]
       if (provider) {
         provider.models = models
-        provider.options = { baseURL: `${baseURL}/v1` }
+        provider.options = {
+          ...provider.options,
+          baseURL: `${baseURL}/v1`,
+        }
       }
       if (discovered.length > 0) await persistModels(providerID, models)
       return models
