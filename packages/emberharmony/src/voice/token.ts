@@ -87,8 +87,21 @@ export namespace Voice {
    * reconnect shortly after a disconnect can join a still-lingering room and
    * end up with no agent. If the room already exists without an agent
    * participant, dispatch one explicitly.
+   *
+   * Concurrent calls for the same room are deduplicated via `inflight` so
+   * only one dispatch is created per room at a time.
    */
+  const inflight = new Map<string, Promise<void>>()
+
   export async function ensureAgentDispatched(opts: { roomName: string; agentName: string; metadata: string }) {
+    const existing = inflight.get(opts.roomName)
+    if (existing) return existing
+    const promise = doEnsureAgentDispatched(opts).finally(() => inflight.delete(opts.roomName))
+    inflight.set(opts.roomName, promise)
+    return promise
+  }
+
+  async function doEnsureAgentDispatched(opts: { roomName: string; agentName: string; metadata: string }) {
     const resolved = await settings()
     if (!resolved.available) return
     const url = resolved.url!.replace(/^ws/, "http")
