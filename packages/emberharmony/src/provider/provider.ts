@@ -344,13 +344,13 @@ export namespace Provider {
       const config = await Config.get()
       const baseURL = config.provider?.["ollama"]?.options?.baseURL ?? "http://localhost:11434"
 
-      const discovered = await probeOllama(baseURL)
+      const probe = await probeOllama(baseURL)
       const cached = await loadCachedModels("ollama")
 
-      const models = discovered.length > 0 ? Object.fromEntries(discovered.map((m) => [m.id, m])) : cached
+      const models = probe.reachable ? Object.fromEntries(probe.models.map((m) => [m.id, m])) : cached
       provider.models = models
 
-      if (discovered.length > 0) await persistModels("ollama", models)
+      if (probe.reachable) await persistModels("ollama", models)
 
       return {
         autoload: true,
@@ -364,13 +364,13 @@ export namespace Provider {
       const config = await Config.get()
       const baseURL = config.provider?.["lmstudio"]?.options?.baseURL ?? "http://127.0.0.1:1234"
 
-      const discovered = await probeLMStudio(baseURL)
+      const probe = await probeLMStudio(baseURL)
       const cached = await loadCachedModels("lmstudio")
 
-      const models = discovered.length > 0 ? Object.fromEntries(discovered.map((m) => [m.id, m])) : cached
+      const models = probe.reachable ? Object.fromEntries(probe.models.map((m) => [m.id, m])) : cached
       provider.models = models
 
-      if (discovered.length > 0) await persistModels("lmstudio", models)
+      if (probe.reachable) await persistModels("lmstudio", models)
 
       return {
         autoload: true,
@@ -563,12 +563,17 @@ export namespace Provider {
     details?: { parameter_size?: string; family?: string; quantization_level?: string }
   }
 
-  async function probeOllama(baseURL: string): Promise<Model[]> {
+  interface ProbeResult {
+    reachable: boolean
+    models: Model[]
+  }
+
+  async function probeOllama(baseURL: string): Promise<ProbeResult> {
     try {
       const res = await fetch(`${baseURL}/api/tags`, { signal: AbortSignal.timeout(1500) })
-      if (!res.ok) return []
+      if (!res.ok) return { reachable: false, models: [] }
       const data = (await res.json()) as { models?: OllamaTag[] }
-      if (!data.models?.length) return []
+      if (!data.models?.length) return { reachable: true, models: [] }
       const models: Model[] = []
       for (const m of data.models) {
         const id = m.name
@@ -603,9 +608,9 @@ export namespace Provider {
         })
       }
       log.info("ollama: discovered " + models.length + " local models")
-      return models
+      return { reachable: true, models }
     } catch {
-      return []
+      return { reachable: false, models: [] }
     }
   }
 
@@ -614,12 +619,12 @@ export namespace Provider {
     object?: string
   }
 
-  async function probeLMStudio(baseURL: string): Promise<Model[]> {
+  async function probeLMStudio(baseURL: string): Promise<ProbeResult> {
     try {
       const res = await fetch(`${baseURL}/v1/models`, { signal: AbortSignal.timeout(1500) })
-      if (!res.ok) return []
+      if (!res.ok) return { reachable: false, models: [] }
       const data = (await res.json()) as { data?: LMStudioModel[] }
-      if (!data.data?.length) return []
+      if (!data.data?.length) return { reachable: true, models: [] }
       const models: Model[] = []
       for (const m of data.data) {
         const id = m.id
@@ -649,9 +654,9 @@ export namespace Provider {
         })
       }
       log.info("lmstudio: discovered " + models.length + " local models")
-      return models
+      return { reachable: true, models }
     } catch {
-      return []
+      return { reachable: false, models: [] }
     }
   }
 
@@ -668,9 +673,10 @@ export namespace Provider {
     const config = await Config.get()
     if (providerID === "ollama") {
       const baseURL = config.provider?.["ollama"]?.options?.baseURL ?? "http://localhost:11434"
-      const discovered = await probeOllama(baseURL)
-      const models =
-        discovered.length > 0 ? Object.fromEntries(discovered.map((m) => [m.id, m])) : await loadCachedModels("ollama")
+      const probe = await probeOllama(baseURL)
+      const models = probe.reachable
+        ? Object.fromEntries(probe.models.map((m) => [m.id, m]))
+        : await loadCachedModels("ollama")
       const s = await state()
       const provider = s.providers[providerID]
       if (provider) {
@@ -681,16 +687,15 @@ export namespace Provider {
           apiKey: "ollama",
         }
       }
-      if (discovered.length > 0) await persistModels(providerID, models)
+      if (probe.reachable) await persistModels(providerID, models)
       return models
     }
     if (providerID === "lmstudio") {
       const baseURL = config.provider?.["lmstudio"]?.options?.baseURL ?? "http://127.0.0.1:1234"
-      const discovered = await probeLMStudio(baseURL)
-      const models =
-        discovered.length > 0
-          ? Object.fromEntries(discovered.map((m) => [m.id, m]))
-          : await loadCachedModels("lmstudio")
+      const probe = await probeLMStudio(baseURL)
+      const models = probe.reachable
+        ? Object.fromEntries(probe.models.map((m) => [m.id, m]))
+        : await loadCachedModels("lmstudio")
       const s = await state()
       const provider = s.providers[providerID]
       if (provider) {
@@ -700,7 +705,7 @@ export namespace Provider {
           baseURL: `${baseURL}/v1`,
         }
       }
-      if (discovered.length > 0) await persistModels(providerID, models)
+      if (probe.reachable) await persistModels(providerID, models)
       return models
     }
     return {}
@@ -1422,7 +1427,9 @@ export namespace Provider {
 
     const provider = await list()
       .then((val) => Object.values(val))
-      .then((x) => x.find((p) => !cfg.provider || Object.keys(cfg.provider).includes(p.id)))
+      .then((x) =>
+        x.find((p) => (!cfg.provider || Object.keys(cfg.provider).includes(p.id)) && Object.keys(p.models).length > 0),
+      )
     if (!provider) throw new Error("no providers found")
     const [model] = sort(Object.values(provider.models))
     if (!model) throw new Error("no models found")

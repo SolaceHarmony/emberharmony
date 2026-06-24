@@ -27,6 +27,7 @@ Log.init({ print: false })
 
 const ollamaURL = "http://localhost:11434"
 const lmstudioURL = "http://127.0.0.1:1234"
+const offlineURL = "http://127.0.0.1:65534"
 
 const authHeader: Record<string, string> = (() => {
   const password = process.env.EMBERHARMONY_SERVER_PASSWORD
@@ -46,7 +47,62 @@ async function fetchJSON(url: string): Promise<Record<string, unknown>> {
   return (await res.json()) as Record<string, unknown>
 }
 
-describe("provider.refresh route", () => {
+async function isReachable(url: string): Promise<boolean> {
+  try {
+    await fetch(url, { signal: AbortSignal.timeout(2000) })
+    return true
+  } catch {
+    return false
+  }
+}
+
+const ollamaRunning = await isReachable(`${ollamaURL}/api/tags`)
+const lmstudioRunning = await isReachable(`${lmstudioURL}/v1/models`)
+
+describe("provider routes — offline (no daemon required)", () => {
+  beforeEach(async () => {
+    await clearProviderCache()
+  })
+
+  test("GET /provider includes ollama and lmstudio even when offline", async () => {
+    await using tmp = await tmpdir({
+      init: async (dir) => {
+        await Bun.write(
+          path.join(dir, "emberharmony.json"),
+          JSON.stringify({
+            $schema: "https://solace.ofharmony.ai/config.json",
+            provider: {
+              ollama: { options: { baseURL: offlineURL } },
+              lmstudio: { options: { baseURL: offlineURL } },
+            },
+          }),
+        )
+      },
+    })
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const app = Server.App()
+        const response = await app.request(`/provider?directory=${encodeURIComponent(tmp.path)}`, {
+          headers: authHeader,
+        })
+        expect(response.status).toBe(200)
+        const body = (await response.json()) as {
+          all: Array<{ id: string; name: string }>
+          connected: string[]
+        }
+        const ids = body.all.map((p) => p.id)
+        expect(ids).toContain("ollama")
+        expect(ids).toContain("lmstudio")
+        expect(body.connected).toContain("ollama")
+        expect(body.connected).toContain("lmstudio")
+        await Instance.dispose()
+      },
+    })
+  })
+})
+
+describe.skipIf(!ollamaRunning)("provider routes — Ollama (requires daemon)", () => {
   beforeEach(async () => {
     await clearProviderCache()
   })
@@ -79,6 +135,52 @@ describe("provider.refresh route", () => {
     })
   })
 
+  test("POST /provider/ollama/refresh after offline shows cached models", async () => {
+    await using tmp = await tmpdir({})
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const initial = await Provider.list()
+        const modelNames = Object.keys(initial["ollama"].models)
+        expect(modelNames.length).toBeGreaterThan(0)
+        await Instance.dispose()
+      },
+    })
+
+    await Instance.provide({
+      directory: tmp.path,
+      init: async () => {
+        const configPath = path.join(tmp.path, "emberharmony.json")
+        await Bun.write(
+          configPath,
+          JSON.stringify({
+            $schema: "https://solace.ofharmony.ai/config.json",
+            provider: {
+              ollama: { options: { baseURL: offlineURL } },
+            },
+          }),
+        )
+      },
+      fn: async () => {
+        const app = Server.App()
+        const response = await app.request(`/provider/ollama/refresh?directory=${encodeURIComponent(tmp.path)}`, {
+          method: "POST",
+          headers: authHeader,
+        })
+        expect(response.status).toBe(200)
+        const body = (await response.json()) as { models: Record<string, unknown> }
+        expect(Object.keys(body.models).length).toBeGreaterThan(0)
+        await Instance.dispose()
+      },
+    })
+  })
+})
+
+describe.skipIf(!lmstudioRunning)("provider routes — LM Studio (requires daemon)", () => {
+  beforeEach(async () => {
+    await clearProviderCache()
+  })
+
   test("POST /provider/lmstudio/refresh returns live models from real LM Studio", async () => {
     const res = await fetchJSON(`${lmstudioURL}/v1/models`)
     const modelIds = (res.data as Array<{ id: string }>).map((m) => m.id)
@@ -102,83 +204,6 @@ describe("provider.refresh route", () => {
 
         const providers = await Provider.list()
         expect(Object.keys(providers["lmstudio"].models)).toEqual(keys)
-        await Instance.dispose()
-      },
-    })
-  })
-
-  test("GET /provider includes ollama and lmstudio even when offline", async () => {
-    await using tmp = await tmpdir({
-      init: async (dir) => {
-        await Bun.write(
-          path.join(dir, "emberharmony.json"),
-          JSON.stringify({
-            $schema: "https://solace.ofharmony.ai/config.json",
-            provider: {
-              ollama: { options: { baseURL: "http://127.0.0.1:65534" } },
-              lmstudio: { options: { baseURL: "http://127.0.0.1:65534" } },
-            },
-          }),
-        )
-      },
-    })
-    await Instance.provide({
-      directory: tmp.path,
-      fn: async () => {
-        const app = Server.App()
-        const response = await app.request(`/provider?directory=${encodeURIComponent(tmp.path)}`, {
-          headers: authHeader,
-        })
-        expect(response.status).toBe(200)
-        const body = (await response.json()) as {
-          all: Array<{ id: string; name: string }>
-          connected: string[]
-        }
-        const ids = body.all.map((p) => p.id)
-        expect(ids).toContain("ollama")
-        expect(ids).toContain("lmstudio")
-        expect(body.connected).toContain("ollama")
-        expect(body.connected).toContain("lmstudio")
-        await Instance.dispose()
-      },
-    })
-  })
-
-  test("POST /provider/ollama/refresh after offline shows cached models", async () => {
-    await using tmp = await tmpdir({})
-    await Instance.provide({
-      directory: tmp.path,
-      fn: async () => {
-        const initial = await Provider.list()
-        const modelNames = Object.keys(initial["ollama"].models)
-        expect(modelNames.length).toBeGreaterThan(0)
-        await Instance.dispose()
-      },
-    })
-
-    await Instance.provide({
-      directory: tmp.path,
-      init: async () => {
-        const configPath = path.join(tmp.path, "emberharmony.json")
-        await Bun.write(
-          configPath,
-          JSON.stringify({
-            $schema: "https://solace.ofharmony.ai/config.json",
-            provider: {
-              ollama: { options: { baseURL: "http://127.0.0.1:65534" } },
-            },
-          }),
-        )
-      },
-      fn: async () => {
-        const app = Server.App()
-        const response = await app.request(`/provider/ollama/refresh?directory=${encodeURIComponent(tmp.path)}`, {
-          method: "POST",
-          headers: authHeader,
-        })
-        expect(response.status).toBe(200)
-        const body = (await response.json()) as { models: Record<string, unknown> }
-        expect(Object.keys(body.models).length).toBeGreaterThan(0)
         await Instance.dispose()
       },
     })

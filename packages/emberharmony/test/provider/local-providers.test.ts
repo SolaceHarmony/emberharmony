@@ -36,7 +36,19 @@ async function fetchJSON(url: string): Promise<Record<string, unknown>> {
   return (await res.json()) as Record<string, unknown>
 }
 
-describe("local provider detection (Ollama + LM Studio)", () => {
+async function isReachable(url: string): Promise<boolean> {
+  try {
+    await fetch(url, { signal: AbortSignal.timeout(2000) })
+    return true
+  } catch {
+    return false
+  }
+}
+
+const ollamaRunning = await isReachable(`${ollamaURL}/api/tags`)
+const lmstudioRunning = await isReachable(`${lmstudioURL}/v1/models`)
+
+describe("local provider detection — offline (no daemon required)", () => {
   beforeEach(async () => {
     await clearProviderCache()
   })
@@ -64,6 +76,60 @@ describe("local provider detection (Ollama + LM Studio)", () => {
         await Instance.dispose()
       },
     })
+  })
+
+  test("lmstudio provider always present even when offline with no cache", async () => {
+    await using tmp = await tmpdir({
+      init: async (dir) => {
+        await Bun.write(
+          path.join(dir, "emberharmony.json"),
+          JSON.stringify({
+            $schema: "https://solace.ofharmony.ai/config.json",
+            provider: {
+              lmstudio: { options: { baseURL: offlineURL } },
+            },
+          }),
+        )
+      },
+    })
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const providers = await Provider.list()
+        expect(providers["lmstudio"]).toBeDefined()
+        expect(Object.keys(providers["lmstudio"].models)).toHaveLength(0)
+        await Instance.dispose()
+      },
+    })
+  })
+
+  test("disabled_providers excludes local providers", async () => {
+    await using tmp = await tmpdir({
+      init: async (dir) => {
+        await Bun.write(
+          path.join(dir, "emberharmony.json"),
+          JSON.stringify({
+            $schema: "https://solace.ofharmony.ai/config.json",
+            disabled_providers: ["ollama", "lmstudio"],
+          }),
+        )
+      },
+    })
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const providers = await Provider.list()
+        expect(providers["ollama"]).toBeUndefined()
+        expect(providers["lmstudio"]).toBeUndefined()
+        await Instance.dispose()
+      },
+    })
+  })
+})
+
+describe.skipIf(!ollamaRunning)("local provider detection — Ollama (requires daemon)", () => {
+  beforeEach(async () => {
+    await clearProviderCache()
   })
 
   test("ollama models discovered via /api/tags", async () => {
@@ -156,7 +222,7 @@ describe("local provider detection (Ollama + LM Studio)", () => {
     })
   })
 
-  test("lmstudio provider always present even when offline with no cache", async () => {
+  test("ollama baseURL configurable via emberharmony.json", async () => {
     await using tmp = await tmpdir({
       init: async (dir) => {
         await Bun.write(
@@ -164,7 +230,11 @@ describe("local provider detection (Ollama + LM Studio)", () => {
           JSON.stringify({
             $schema: "https://solace.ofharmony.ai/config.json",
             provider: {
-              lmstudio: { options: { baseURL: offlineURL } },
+              ollama: {
+                options: {
+                  baseURL: ollamaURL,
+                },
+              },
             },
           }),
         )
@@ -174,11 +244,20 @@ describe("local provider detection (Ollama + LM Studio)", () => {
       directory: tmp.path,
       fn: async () => {
         const providers = await Provider.list()
-        expect(providers["lmstudio"]).toBeDefined()
-        expect(Object.keys(providers["lmstudio"].models)).toHaveLength(0)
+        expect(providers["ollama"]).toBeDefined()
+        const models = Object.keys(providers["ollama"].models)
+        expect(models.length).toBeGreaterThan(0)
+        const firstModel = providers["ollama"].models[models[0]]
+        expect(firstModel.api.url).toContain(ollamaURL)
         await Instance.dispose()
       },
     })
+  })
+})
+
+describe.skipIf(!lmstudioRunning)("local provider detection — LM Studio (requires daemon)", () => {
+  beforeEach(async () => {
+    await clearProviderCache()
   })
 
   test("lmstudio models discovered via /v1/models", async () => {
@@ -264,61 +343,6 @@ describe("local provider detection (Ollama + LM Studio)", () => {
         const after = await Provider.list()
         const afterModels = Object.keys(after["lmstudio"].models)
         expect(afterModels).toEqual(Object.keys(refreshed))
-        await Instance.dispose()
-      },
-    })
-  })
-
-  test("disabled_providers excludes local providers", async () => {
-    await using tmp = await tmpdir({
-      init: async (dir) => {
-        await Bun.write(
-          path.join(dir, "emberharmony.json"),
-          JSON.stringify({
-            $schema: "https://solace.ofharmony.ai/config.json",
-            disabled_providers: ["ollama", "lmstudio"],
-          }),
-        )
-      },
-    })
-    await Instance.provide({
-      directory: tmp.path,
-      fn: async () => {
-        const providers = await Provider.list()
-        expect(providers["ollama"]).toBeUndefined()
-        expect(providers["lmstudio"]).toBeUndefined()
-        await Instance.dispose()
-      },
-    })
-  })
-
-  test("ollama baseURL configurable via emberharmony.json", async () => {
-    await using tmp = await tmpdir({
-      init: async (dir) => {
-        await Bun.write(
-          path.join(dir, "emberharmony.json"),
-          JSON.stringify({
-            $schema: "https://solace.ofharmony.ai/config.json",
-            provider: {
-              ollama: {
-                options: {
-                  baseURL: ollamaURL,
-                },
-              },
-            },
-          }),
-        )
-      },
-    })
-    await Instance.provide({
-      directory: tmp.path,
-      fn: async () => {
-        const providers = await Provider.list()
-        expect(providers["ollama"]).toBeDefined()
-        const models = Object.keys(providers["ollama"].models)
-        expect(models.length).toBeGreaterThan(0)
-        const firstModel = providers["ollama"].models[models[0]]
-        expect(firstModel.api.url).toContain(ollamaURL)
         await Instance.dispose()
       },
     })

@@ -465,16 +465,23 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
       },
       bootstrap,
       async refreshProvider(providerID: string) {
-        const result = await sdk.client.provider.refresh({ providerID }, { throwOnError: true })
-        const data = result.data
-        if (!data) return
-        const providersResponse = await sdk.client.config.providers({}, { throwOnError: true })
-        const providerListResponse = await sdk.client.provider.list({}, { throwOnError: true })
-        batch(() => {
-          setStore("provider", reconcile(providersResponse.data!.providers))
-          setStore("provider_default", reconcile(providersResponse.data!.default))
-          setStore("provider_next", reconcile(providerListResponse.data!))
-        })
+        try {
+          const result = await sdk.client.provider.refresh({ providerID }, { throwOnError: true })
+          const data = result.data
+          if (!data) return
+          const providersResponse = await sdk.client.config.providers({}, { throwOnError: true })
+          const providerListResponse = await sdk.client.provider.list({}, { throwOnError: true })
+          batch(() => {
+            setStore("provider", reconcile(providersResponse.data!.providers))
+            setStore("provider_default", reconcile(providersResponse.data!.default))
+            setStore("provider_next", reconcile(providerListResponse.data!))
+          })
+        } catch (e) {
+          Log.Default.error("failed to refresh provider", {
+            providerID,
+            error: e instanceof Error ? e.message : String(e),
+          })
+        }
       },
     }
     return result
