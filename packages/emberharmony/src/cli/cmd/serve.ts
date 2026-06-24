@@ -27,7 +27,7 @@ export const ServeCommand = cmd({
     // the idle promise below never resolves; without these handlers a signal
     // would kill the server and orphan the worker child process
     const shutdown = async () => {
-      VoiceWorker.stop()
+      await VoiceWorker.stop()
       await server.stop()
       process.exit(0)
     }

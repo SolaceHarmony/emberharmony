@@ -16,6 +16,11 @@ const GRACEFUL_TIMEOUT_MS = 10_000
  * the socket, and the agent process calls AgentServer.drain() + close() to
  * gracefully stop all forked job processes. SIGTERM is a fallback only.
  *
+ * Lifecycle uses graceful shutdown: stop() sends SIGTERM so the LiveKit
+ * agents framework can drain active jobs and close its WebSocket, then waits
+ * up to GRACEFUL_TIMEOUT_MS before escalating to SIGKILL on the entire
+ * process group.
+ *
  * Two launch modes:
  *  - **Bundled runtime** (packaged desktop app): the LiveKit agents framework
  *    forks node_modules scripts and dynamically imports the agent file, so it

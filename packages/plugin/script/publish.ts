@@ -16,6 +16,22 @@ for (const [key, value] of Object.entries(pkg.exports)) {
     types: file + ".d.ts",
   }
 }
+
+// Resolve workspace:* and catalog: dependencies to the concrete version being
+// published. npm pack/publish rejects workspace: and catalog: protocol strings.
+const root = JSON.parse(await Bun.file("../../package.json").text())
+const catalog = (root.workspaces?.catalog ?? {}) as Record<string, string>
+const deps = pkg.dependencies as Record<string, string>
+for (const [dep, ver] of Object.entries(deps)) {
+  if (ver.startsWith("workspace:")) {
+    deps[dep] = Script.version
+    console.log(`resolved workspace dep: ${dep} -> ${Script.version}`)
+  } else if (ver === "catalog:") {
+    deps[dep] = catalog[dep] ?? ver
+    console.log(`resolved catalog dep: ${dep} -> ${deps[dep]}`)
+  }
+}
+
 await Bun.write("package.json", JSON.stringify(pkg, null, 2))
 await $`bun pm pack`
 const tarballs = await Array.fromAsync(new Bun.Glob(`*${Script.version}*.tgz`).scan())
