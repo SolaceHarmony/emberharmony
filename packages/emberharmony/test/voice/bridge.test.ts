@@ -18,7 +18,7 @@ mock.module("@livekit/agents", () => agentsShim)
 // `import type` is erased at runtime, so it does NOT trigger loading the real
 // @livekit/agents. The value import must be a dynamic import AFTER mock.module
 // (static imports are hoisted above it, which would load the real module first).
-import type { SessionBridgeOptions } from "../../src/voice/bridge"
+import type { SessionBridgeOptions, SessionLLM as SessionLLMType } from "../../src/voice/bridge"
 
 const { SessionLLM } = await import("../../src/voice/bridge")
 
@@ -121,7 +121,7 @@ async function ticks(n = 3) {
 function bridge(extra: Partial<SessionBridgeOptions> = {}) {
   return new SessionLLM({ serverUrl: "http://x", directory: "/d", sessionID: SID, ...extra })
 }
-function chatOf(llmInst: SessionLLM, userText: string | null = "hello") {
+function chatOf(llmInst: SessionLLMType, userText: string | null = "hello") {
   const ctx = ChatContextShim.empty()
   if (userText !== null) ctx.addMessage({ role: "user", content: userText })
   return llmInst.chat({ chatCtx: ctx as any })

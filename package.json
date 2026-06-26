@@ -91,7 +91,6 @@
     "@thesolaceproject/emberharmony-plugin": "workspace:*",
     "@thesolaceproject/emberharmony-script": "workspace:*",
     "@thesolaceproject/emberharmony-sdk": "workspace:*",
-    "bun": "1.3.14",
     "typescript": "catalog:"
   },
   "repository": {
