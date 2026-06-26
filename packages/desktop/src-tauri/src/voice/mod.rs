@@ -9,7 +9,10 @@
 //!          -> TTS -> cpal playback        (barge-in -> stop TTS + POST /abort)
 //! ```
 //!
-//! Phase 0 (this module's `session`) is the bridge to the EmberHarmony session
-//! sidecar — a direct port of `packages/emberharmony/src/voice/bridge.ts`, whose
-//! 16-test harness is the behavioural spec. The audio/STT/TTS phases land on top.
+//! Phase 0 (`session`) is the bridge to the EmberHarmony session sidecar — a
+//! direct port of `packages/emberharmony/src/voice/bridge.ts`, whose 16-test
+//! harness is the behavioural spec. `control` is the settings-driven seam that
+//! selects between the two providers (the local LFM2-Audio loop and this session
+//! bridge). The audio/STT/TTS loop lands on top.
+pub mod control;
 pub mod session;

@@ -10,6 +10,7 @@ import { useGlobalSDK } from "@/context/global-sdk"
 import {
   defaultVoiceSettings,
   getVoiceSettings,
+  getVoiceStatus,
   isDesktop,
   setVoiceSettings,
   type DelegateSettings,
@@ -34,6 +35,7 @@ export const SettingsVoice: Component = () => {
       .catch(() => undefined),
   )
   const [tauriVoice, { refetch: refetchTauri }] = createResource(getVoiceSettings)
+  const [voiceStatus, { refetch: refetchStatus }] = createResource(getVoiceStatus)
 
   const [url, setUrl] = createSignal<string | undefined>(undefined)
   const [apiKey, setApiKey] = createSignal("")
@@ -68,6 +70,7 @@ export const SettingsVoice: Component = () => {
       }),
     )
     refetchTauri()
+    refetchStatus()
   }
 
   async function updateLfm2(patch: Partial<Lfm2Settings>) {
@@ -79,6 +82,7 @@ export const SettingsVoice: Component = () => {
       }),
     )
     refetchTauri()
+    refetchStatus()
   }
 
   const updateDelegate = (patch: Partial<DelegateSettings>) =>
@@ -224,6 +228,13 @@ export const SettingsVoice: Component = () => {
         <Show when={provider() === "lfm2"}>
           <div class="flex flex-col gap-1">
             <h3 class="text-14-medium text-text-strong pb-2">{language.t("settings.voice.section.lfm2")}</h3>
+            <Show when={voiceStatus()?.provider === "lfm2" ? voiceStatus() : undefined}>
+              {(s) => (
+                <div class={`text-12-regular pb-2 px-1 ${s().ready ? "text-text-weak" : "text-text-strong"}`}>
+                  {s().detail}
+                </div>
+              )}
+            </Show>
             <div class="bg-surface-raised-base px-4 py-3 rounded-lg flex flex-col gap-3">
               <TextField
                 label={language.t("settings.voice.row.modelDir.title")}

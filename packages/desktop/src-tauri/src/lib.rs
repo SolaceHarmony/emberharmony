@@ -309,7 +309,8 @@ pub fn run() {
             set_default_server_url,
             markdown::parse_markdown_command,
             settings::voice_settings_get,
-            settings::voice_settings_set
+            settings::voice_settings_set,
+            voice::control::voice_status
         ])
         .setup(move |app| {
             #[cfg(any(target_os = "linux", all(debug_assertions, windows)))]

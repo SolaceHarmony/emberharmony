@@ -67,3 +67,17 @@ export async function setVoiceSettings(settings: VoiceSettings): Promise<void> {
   if (!invoke) return
   await invoke<void>("voice_settings_set", { settings })
 }
+
+/** Readiness of the active provider — mirrors the Rust `VoicePlan`. */
+export interface VoicePlan {
+  provider: VoiceProvider
+  ready: boolean
+  detail: string
+}
+
+/** Whether the configured voice provider is ready to start (native side). */
+export async function getVoiceStatus(): Promise<VoicePlan> {
+  const invoke = tauriInvoke()
+  if (!invoke) return { provider: "off", ready: false, detail: "" }
+  return invoke<VoicePlan>("voice_status")
+}
