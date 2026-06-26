@@ -7,11 +7,18 @@ import z from "zod"
 import { Config } from "../config/config"
 import { Instance } from "../project/instance"
 import { Scheduler } from "../scheduler"
+import { withTimeout } from "../util/timeout"
 
 export namespace Snapshot {
   const log = Log.create({ service: "snapshot" })
   const hour = 60 * 60 * 1000
   const prune = "7.days"
+  // Snapshots are a convenience for revert/diff, not required to produce an
+  // answer. They run `git add .` + write-tree/diff on EVERY step, inline in the
+  // response stream — so on a slow/remote worktree (NFS/NAS, Parallels share)
+  // they must be bounded: better to skip a step's snapshot than stall the reply.
+  const SNAPSHOT_TIMEOUT_MS = 5_000
+  const errMessage = (err: unknown) => (err instanceof Error ? err.message : String(err))
 
   export function init() {
     Scheduler.register({
@@ -51,6 +58,18 @@ export namespace Snapshot {
     if (Instance.project.vcs !== "git") return
     const cfg = await Config.get()
     if (cfg.snapshot === false) return
+    using _ = log.time("snapshot.track")
+    try {
+      return await withTimeout(trackInner(), SNAPSHOT_TIMEOUT_MS)
+    } catch (err) {
+      log.warn("snapshot.track exceeded budget; skipping snapshot this step (reply not blocked)", {
+        error: errMessage(err),
+      })
+      return undefined
+    }
+  }
+
+  async function trackInner(): Promise<string> {
     const git = gitdir()
     if (await fs.mkdir(git, { recursive: true })) {
       await $`git init`
@@ -82,6 +101,16 @@ export namespace Snapshot {
   export type Patch = z.infer<typeof Patch>
 
   export async function patch(hash: string): Promise<Patch> {
+    using _ = log.time("snapshot.patch", { hash })
+    try {
+      return await withTimeout(patchInner(hash), SNAPSHOT_TIMEOUT_MS)
+    } catch (err) {
+      log.warn("snapshot.patch exceeded budget; skipping diff (reply not blocked)", { hash, error: errMessage(err) })
+      return { hash, files: [] }
+    }
+  }
+
+  async function patchInner(hash: string): Promise<Patch> {
     const git = gitdir()
     await $`git --git-dir ${git} --work-tree ${Instance.worktree} add .`.quiet().cwd(Instance.directory).nothrow()
     const result =

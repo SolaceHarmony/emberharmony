@@ -26,6 +26,34 @@ import { Auth } from "@/auth"
 export namespace LLM {
   const log = Log.create({ service: "llm" })
 
+  // AI-SDK errors (e.g. AI_APICallError) embed the entire request body
+  // (system prompt + full message history) in `requestBodyValues`, and that
+  // field is serialized *before* the diagnostic fields — so a raw log of the
+  // error is ~55KB and a blind truncation would drop statusCode/responseBody.
+  // Keep only the diagnostic fields and bound the free-text ones.
+  function compactStreamError(input: unknown): Record<string, unknown> {
+    let err: any = input && typeof input === "object" && "error" in (input as any) ? (input as any).error : input
+    if (!err || typeof err !== "object") return { error: String(err) }
+    // When retries are exhausted the AI SDK throws an AI_RetryError that carries
+    // only { name, message, reason, errors[], lastError } — the HTTP diagnostics
+    // (statusCode/url/responseBody) live on the underlying APICallError. Unwrap to
+    // it so the retry path (the case we most need to debug) still logs them.
+    const retryReason = err.reason
+    if (err.lastError || Array.isArray(err.errors)) {
+      err = err.lastError ?? (Array.isArray(err.errors) ? err.errors[err.errors.length - 1] : undefined) ?? err
+    }
+    const cap = (v: unknown) => (typeof v === "string" ? v.slice(0, 1000) : v)
+    return {
+      name: err.name,
+      message: cap(err.message),
+      statusCode: err.statusCode,
+      url: err.url,
+      isRetryable: err.isRetryable,
+      responseBody: cap(err.responseBody),
+      ...(retryReason ? { retryReason } : {}),
+    }
+  }
+
   export const OUTPUT_TOKEN_MAX = Flag.EMBERHARMONY_EXPERIMENTAL_OUTPUT_TOKEN_MAX || 32_000
 
   export type StreamInput = {
@@ -56,6 +84,9 @@ export namespace LLM {
       modelID: input.model.id,
       providerID: input.model.providerID,
     })
+    // time the synchronous prep (system prompt, tool resolution, plugin hooks)
+    // before the network call — separates "our overhead" from provider latency
+    const setupTimer = l.time("llm.setup")
     const [language, cfg, provider, auth] = await Promise.all([
       Provider.getLanguage(input.model),
       Config.get(),
@@ -179,10 +210,11 @@ export namespace LLM {
       })
     }
 
+    setupTimer.stop()
     return streamText({
       onError(error) {
         l.error("stream error", {
-          error,
+          error: compactStreamError(error),
         })
       },
       async experimental_repairToolCall(failed) {
