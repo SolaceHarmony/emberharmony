@@ -22,6 +22,9 @@ export namespace Global {
     cache,
     config,
     state,
+    // Local voice models (LFM2-Audio) live next to the config dir's node_modules,
+    // read natively by the Tauri voice loop; default model dir in settings.rs.
+    models: path.join(config, "models"),
   }
 }
 
@@ -31,6 +34,7 @@ await Promise.all([
   fs.mkdir(Global.Path.state, { recursive: true }),
   fs.mkdir(Global.Path.log, { recursive: true }),
   fs.mkdir(Global.Path.bin, { recursive: true }),
+  fs.mkdir(Global.Path.models, { recursive: true }),
 ])
 
 const CACHE_VERSION = "21"

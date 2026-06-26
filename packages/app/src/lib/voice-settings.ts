@@ -40,7 +40,15 @@ export interface VoiceSettings {
 export const defaultVoiceSettings: VoiceSettings = {
   provider: "off",
   livekit: {},
-  lfm2: { device: "cpu", vadThreshold: 0.012, maxTokens: 512, delegate: { enabled: false } },
+  // Desktop resolves modelDir from the Rust default (~/.config/emberharmony/models);
+  // this literal is only the web-build display fallback.
+  lfm2: {
+    modelDir: "~/.config/emberharmony/models",
+    device: "cpu",
+    vadThreshold: 0.012,
+    maxTokens: 512,
+    delegate: { enabled: false },
+  },
 }
 
 type Invoke = <T>(cmd: string, args?: Record<string, unknown>) => Promise<T>

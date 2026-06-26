@@ -80,10 +80,36 @@ pub struct Lfm2Settings {
     pub delegate: DelegateSettings,
 }
 
+/// Default local-model directory: `<config>/emberharmony/models`, the folder the
+/// Node global bootstrap (`global/index.ts`, via xdg-basedir) creates next to the
+/// config dir's `node_modules`. Must resolve to the *same* path on every OS as
+/// xdg-basedir does, so the config base is `XDG_CONFIG_HOME` else `<home>/.config`,
+/// where `<home>` matches Node's `os.homedir()`: `HOME` on POSIX, `USERPROFILE` on
+/// Windows. Returned absolute so the native loop uses it directly; `None` only if
+/// none of those env vars are set.
+fn default_model_dir() -> Option<String> {
+    let home_config = || {
+        std::env::var_os("HOME")
+            .filter(|v| !v.is_empty())
+            .or_else(|| std::env::var_os("USERPROFILE").filter(|v| !v.is_empty()))
+            .map(|h| std::path::PathBuf::from(h).join(".config"))
+    };
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(home_config)?;
+    Some(
+        base.join("emberharmony")
+            .join("models")
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
 impl Default for Lfm2Settings {
     fn default() -> Self {
         Self {
-            model_dir: None,
+            model_dir: default_model_dir(),
             device: Lfm2Device::default(),
             vad_threshold: 0.012,
             max_tokens: 512,
@@ -172,6 +198,19 @@ mod tests {
         assert_eq!(v.lfm2.device, Lfm2Device::Metal);
         assert_eq!(v.lfm2.vad_threshold, 0.012); // filled from Default
         assert_eq!(v.lfm2.max_tokens, 512);
+    }
+
+    #[test]
+    fn default_model_dir_is_under_emberharmony_models() {
+        // Every branch (XDG_CONFIG_HOME / HOME / USERPROFILE) ends the same way; the
+        // path is absolute and points at the config-dir models folder. `Path::ends_with`
+        // is component-wise, so this holds under Windows backslash separators too.
+        let dir = Lfm2Settings::default()
+            .model_dir
+            .expect("HOME/USERPROFILE/XDG set in test env");
+        let p = std::path::Path::new(&dir);
+        assert!(p.ends_with("emberharmony/models"), "got {dir}");
+        assert!(p.is_absolute(), "got {dir}");
     }
 
     #[test]

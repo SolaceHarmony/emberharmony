@@ -240,7 +240,7 @@ export const SettingsVoice: Component = () => {
                 label={language.t("settings.voice.row.modelDir.title")}
                 description={language.t("settings.voice.row.modelDir.description")}
                 placeholder="/path/to/lfm2-audio/model"
-                value={lfm2().modelDir ?? ""}
+                defaultValue={lfm2().modelDir ?? ""}
                 onFocusOut={(e: FocusEvent) => {
                   const value = (e.currentTarget as HTMLInputElement).value.trim()
                   updateLfm2({ modelDir: value || undefined })
@@ -270,7 +270,7 @@ export const SettingsVoice: Component = () => {
                 <TextField
                   hideLabel
                   label={language.t("settings.voice.row.vadThreshold.title")}
-                  value={String(lfm2().vadThreshold)}
+                  defaultValue={String(lfm2().vadThreshold)}
                   onFocusOut={(e: FocusEvent) => {
                     const n = numberFromInput(e)
                     if (n !== undefined && n > 0) updateLfm2({ vadThreshold: n })
@@ -284,7 +284,7 @@ export const SettingsVoice: Component = () => {
                 <TextField
                   hideLabel
                   label={language.t("settings.voice.row.maxTokens.title")}
-                  value={String(lfm2().maxTokens)}
+                  defaultValue={String(lfm2().maxTokens)}
                   onFocusOut={(e: FocusEvent) => {
                     const n = numberFromInput(e)
                     if (n !== undefined && n >= 1) updateLfm2({ maxTokens: Math.floor(n) })
@@ -317,7 +317,7 @@ export const SettingsVoice: Component = () => {
                   <TextField
                     hideLabel
                     label={language.t("settings.voice.row.delegateTarget.title")}
-                    value={lfm2().delegate.target ?? ""}
+                    defaultValue={lfm2().delegate.target ?? ""}
                     onFocusOut={(e: FocusEvent) => {
                       const value = (e.currentTarget as HTMLInputElement).value.trim()
                       updateDelegate({ target: value || undefined })
@@ -433,7 +433,7 @@ export const SettingsVoice: Component = () => {
                     <TextField
                       hideLabel
                       label={language.t("settings.voice.row.intent.title")}
-                      value={cfg().intent}
+                      defaultValue={cfg().intent}
                       onFocusOut={(e: FocusEvent) => {
                         const value = (e.currentTarget as HTMLInputElement).value.trim()
                         if (value && value !== cfg().intent) update({ intent: value })
