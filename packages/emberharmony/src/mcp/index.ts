@@ -166,36 +166,52 @@ export namespace MCP {
       const config = cfg.mcp ?? {}
       const clients: Record<string, MCPClient> = {}
       const status: Record<string, Status> = {}
+      const lifecycle = { disposed: false }
 
-      await Promise.all(
-        Object.entries(config).map(async ([key, mcp]) => {
-          if (!isMcpConfigured(mcp)) {
-            log.error("Ignoring MCP config entry without type", { key })
-            return
-          }
-
-          // If disabled by config, mark as disabled without trying to connect
-          if (mcp.enabled === false) {
-            status[key] = { status: "disabled" }
-            return
-          }
-
-          const result = await create(key, mcp).catch(() => undefined)
-          if (!result) return
-
-          status[key] = result.status
-
-          if (result.mcpClient) {
-            clients[key] = result.mcpClient
-          }
-        }),
-      )
+      // Connect every server in the BACKGROUND. An MCP server is an optional,
+      // external dependency — connecting can take up to ~30s (and ~60s for a
+      // remote that fails both transports). Awaiting them here (the old
+      // Promise.all) meant the FIRST prompt's resolveTools -> MCP.tools() blocked
+      // on the slowest/most-unresponsive peer. Instead `state()` resolves
+      // immediately and each server populates the live `clients`/`status` maps as
+      // it connects (tools() reads them fresh, and ToolsChanged notifies the UI),
+      // so a slow/dead server never holds up a response — it just shows up late.
+      for (const [key, mcp] of Object.entries(config)) {
+        if (!isMcpConfigured(mcp)) {
+          log.error("Ignoring MCP config entry without type", { key })
+          continue
+        }
+        // If disabled by config, mark as disabled without trying to connect
+        if (mcp.enabled === false) {
+          status[key] = { status: "disabled" }
+          continue
+        }
+        void create(key, mcp)
+          .then((result) => {
+            if (lifecycle.disposed) {
+              result?.mcpClient?.close().catch(() => {})
+              return
+            }
+            if (!result) return
+            status[key] = result.status
+            if (result.mcpClient) {
+              clients[key] = result.mcpClient
+              Bus.publish(ToolsChanged, { server: key })
+            }
+          })
+          .catch((error) => {
+            if (lifecycle.disposed) return
+            status[key] = { status: "failed", error: error instanceof Error ? error.message : String(error) }
+          })
+      }
       return {
         status,
         clients,
+        lifecycle,
       }
     },
     async (state) => {
+      state.lifecycle.disposed = true
       await Promise.all(
         Object.values(state.clients).map((client) =>
           client.close().catch((error) => {
@@ -308,6 +324,9 @@ export namespace MCP {
         status: { status: "disabled" as const },
       }
     }
+    // time each MCP startup — a slow/hanging server can block the first prompt
+    // (resolveTools -> MCP.tools) for up to its connect timeout (default 30s)
+    using _ = log.time("mcp.create", { key, type: mcp.type })
 
     log.info("found", { key, type: mcp.type })
     let mcpClient: MCPClient | undefined

@@ -24,7 +24,9 @@ export const Instance = {
     if (!existing) {
       Log.Default.info("creating instance", { directory: input.directory })
       existing = iife(async () => {
+        const resolveTimer = Log.Default.time("instance.project.resolve", { directory: input.directory })
         const { project, sandbox } = await Project.fromDirectory(input.directory)
+        resolveTimer.stop()
         const ctx = {
           directory: input.directory,
           worktree: sandbox,

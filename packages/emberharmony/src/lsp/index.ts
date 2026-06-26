@@ -14,6 +14,14 @@ import { Flag } from "@/flag/flag"
 export namespace LSP {
   const log = Log.create({ service: "lsp" })
 
+  // A language server is an optional, external subprocess: a cold spawn +
+  // initialize handshake is bounded only by a long (45s) timeout. The edit/write
+  // tools call touchFile() inline and the user waits on the result, so we must
+  // never block them on that handshake. Give a cold server a short grace to come
+  // up (so a fast local server still serves first-edit diagnostics), then let it
+  // warm up in the background — it'll be ready on the next touch.
+  const COLD_SPAWN_GRACE_MS = 1_500
+
   export const Event = {
     Updated: BusEvent.define("lsp.updated", z.object({})),
   }
@@ -234,28 +242,38 @@ export namespace LSP {
         continue
       }
 
-      const inflight = s.spawning.get(root + server.id)
-      if (inflight) {
-        const client = await inflight
-        if (!client) continue
-        result.push(client)
-        continue
+      let task = s.spawning.get(root + server.id)
+      if (!task) {
+        task = schedule(server, root, root + server.id)
+        s.spawning.set(root + server.id, task)
+        task.finally(() => {
+          if (s.spawning.get(root + server.id) === task) {
+            s.spawning.delete(root + server.id)
+          }
+        })
+        // notify watchers when the background spawn finally lands
+        task.then((client) => client && Bus.publish(Event.Updated, {})).catch(() => {})
       }
 
-      const task = schedule(server, root, root + server.id)
-      s.spawning.set(root + server.id, task)
-
-      task.finally(() => {
-        if (s.spawning.get(root + server.id) === task) {
-          s.spawning.delete(root + server.id)
-        }
+      // never block the tool result on a cold/slow spawn; only include the client
+      // if it comes up within the short grace, otherwise it warms up in the
+      // background (schedule pushes it to s.clients) and is picked up next touch
+      // clear the grace timer when the spawn settles — getClients runs per touch,
+      // so an uncleared setTimeout would pile up active timers in the event loop
+      const client = await new Promise<Awaited<typeof task> | undefined>((resolve) => {
+        const timer = setTimeout(() => resolve(undefined), COLD_SPAWN_GRACE_MS)
+        void task.then(
+          (c) => {
+            clearTimeout(timer)
+            resolve(c)
+          },
+          () => {
+            clearTimeout(timer)
+            resolve(undefined)
+          },
+        )
       })
-
-      const client = await task
-      if (!client) continue
-
-      result.push(client)
-      Bus.publish(Event.Updated, {})
+      if (client) result.push(client)
     }
 
     return result

@@ -54,9 +54,46 @@ export const ProviderRoutes = lazy(() =>
         )
         return c.json({
           all: Object.values(providers),
-          default: mapValues(providers, (item) => Provider.sort(Object.values(item.models))[0].id),
+          default: mapValues(providers, (item) => {
+            const sorted = Provider.sort(Object.values(item.models))
+            return sorted[0]?.id ?? ""
+          }),
           connected: Object.keys(connected),
         })
+      },
+    )
+    .post(
+      "/:providerID/refresh",
+      describeRoute({
+        summary: "Refresh provider models",
+        description: "Re-probe a local provider (Ollama, LM Studio) for currently loaded models.",
+        operationId: "provider.refresh",
+        responses: {
+          200: {
+            description: "Refreshed model list",
+            content: {
+              "application/json": {
+                schema: resolver(
+                  z.object({
+                    models: z.record(z.string(), Provider.Model),
+                  }),
+                ),
+              },
+            },
+          },
+          ...errors(400),
+        },
+      }),
+      validator(
+        "param",
+        z.object({
+          providerID: z.string().meta({ description: "Provider ID" }),
+        }),
+      ),
+      async (c) => {
+        const providerID = c.req.valid("param").providerID
+        const models = await Provider.refresh(providerID)
+        return c.json({ models })
       },
     )
     .get(

@@ -1,7 +1,7 @@
 {
   "name": "@thesolaceproject/emberharmony-desktop",
   "private": true,
-  "version": "1.4.7",
+  "version": "1.4.9",
   "type": "module",
   "license": "MIT",
   "scripts": {
@@ -12,6 +12,8 @@
     "build:local": "bun ./scripts/build-local.ts",
     "build:local:nobundle": "bun ./scripts/build-local.ts --no-bundle",
     "build:local:nodmg": "bun ./scripts/build-local.ts --no-dmg",
+    "clean": "bun ./scripts/clean.ts",
+    "clean:all": "bun ./scripts/clean.ts --deep",
     "preview": "vite preview",
     "tauri": "tauri"
   },

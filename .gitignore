@@ -34,3 +34,10 @@ emberharmony-dev
 logs/
 *.bun-build
 *.tsbuildinfo
+/tools/
+/experiments/lfm2-audio-voice/liquid-audio-rs/parity/golden/
+/experiments/lfm2-audio-voice/liquid-audio-rs/parity/rust_sig_dump
+/experiments/lfm2-audio-voice/model
+/experiments/lfm2-audio-voice/liquid-audio-rs/out.wav
+/experiments/lfm2-audio-voice/upstream-liquid-audio
+.voice-runtime-stage/

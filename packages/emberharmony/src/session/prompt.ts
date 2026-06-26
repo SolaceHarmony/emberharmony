@@ -150,10 +150,13 @@ export namespace SessionPrompt {
   export type PromptInput = z.infer<typeof PromptInput>
 
   export const prompt = fn(PromptInput, async (input) => {
+    const setupTimer = log.time("prompt.setup", { sessionID: input.sessionID })
     const session = await Session.get(input.sessionID)
     await SessionRevert.cleanup(session)
 
+    const msgTimer = log.time("prompt.createUserMessage", { sessionID: input.sessionID })
     const message = await createUserMessage(input)
+    msgTimer.stop()
     await Session.touch(input.sessionID)
 
     // this is backwards compatibility for allowing `tools` to be specified when
@@ -172,6 +175,8 @@ export namespace SessionPrompt {
         draft.permission = permissions
       })
     }
+
+    setupTimer.stop()
 
     if (input.noReply === true) {
       return message
@@ -1792,7 +1797,9 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       model,
       abort: new AbortController().signal,
       sessionID: input.session.id,
-      retries: 2,
+      // best-effort cosmetic title: one retry is enough; the result.text.catch
+      // below swallows failures so a rate-limited model can't spam
+      retries: 1,
       messages: [
         {
           role: "user",

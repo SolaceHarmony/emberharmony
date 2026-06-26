@@ -193,41 +193,36 @@ if (noBundle) {
   process.exit(0)
 }
 
-// --- Step 2b: Assemble the bundled voice runtime --------------------------
-// The LiveKit agents worker can't run inside the compiled CLI (it forks
-// node_modules scripts), so the desktop bundle ships a self-contained runtime
-// (bun + agent.js + node_modules + models) as a Tauri resource. Pass --no-voice
-// to skip (smaller build, voice disabled). Builds for the current host target.
-if (!process.argv.includes("--no-voice")) {
-  console.log(`[build-local] assembling voice runtime resource...`)
-  await $`bun ./scripts/build-voice-runtime.ts`.cwd(desktopDir)
-  // Sign the runtime's nested native libs (.node/.dylib) so notarization
-  // passes. The script no-ops on non-macOS and for ad-hoc local builds
-  // (APPLE_SIGNING_IDENTITY "-"), so this only does work when a real Developer
-  // ID is configured (e.g. EMBERHARMONY_NOTARIZE=1). Must run before tauri
-  // build seals the .app.
-  await $`bun ./scripts/sign-voice-runtime.ts`.cwd(desktopDir)
-} else {
-  console.log(`[build-local] --no-voice: skipping voice runtime (voice will be disabled in this build)`)
-  await $`rm -rf ${path.join(desktopDir, "src-tauri/resources/voice")}`
-}
+// Voice runs natively in the Tauri/Rust layer now (src-tauri/src/voice), so the
+// desktop bundle no longer ships a separate LiveKit Node voice runtime — the old
+// build-voice-runtime.ts / sign-voice-runtime.ts step was removed.
 
 // Always skip DMG in the Tauri invocation because the upstream bundle_dmg.sh
 // fails. We create the DMG manually afterwards if the host is macOS.
 const tauriArgs = ["build"]
 // Note: `tauri build` is release mode by default; `--debug` is the only toggle.
 
-// Build only the .app on macOS (skip dmg in Tauri's own bundler)
+// Build only the .app on macOS (skip dmg in Tauri's own bundler).
+// On Linux build ONLY the .deb here: rpm is built afterwards with native
+// streaming rpmbuild (Tauri's in-memory rpm crate holds the whole ~950MB
+// payload in RAM → ~55min + swap-thrash vs ~37s for rpmbuild), and AppImage is
+// dropped entirely — its FUSE step hangs (CI excludes it for the same reason).
 if (process.platform === "darwin") {
   tauriArgs.push("--bundles", "app")
 } else if (process.platform === "linux") {
-  tauriArgs.push("--bundles", "deb,rpm,appimage")
+  tauriArgs.push("--bundles", "deb")
 } else if (process.platform === "win32") {
   tauriArgs.push("--bundles", "nsis,msi")
 }
 
 console.log(`[build-local] running: tauri ${tauriArgs.join(" ")}`)
 await $`bun run tauri ${tauriArgs}`
+
+// Linux: build the .rpm from the deb's already-staged buildroot via native
+// streaming rpmbuild — see scripts/build-rpm.ts for the why.
+if (process.platform === "linux") {
+  await $`bun ./scripts/build-rpm.ts ${path.join(desktopDir, "src-tauri/target/release/bundle")}`
+}
 
 // --- Step 4: Create DMG manually (macOS only) -----------------------------
 if (process.platform === "darwin" && !noDmg) {

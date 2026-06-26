@@ -15,12 +15,18 @@ import { Snapshot } from "../snapshot"
 import { Truncate } from "../tool/truncation"
 
 export async function InstanceBootstrap() {
-  Log.Default.info("bootstrapping", { directory: Instance.directory })
-  await Plugin.init()
+  using _ = Log.Default.time("bootstrap", { directory: Instance.directory })
+  {
+    using _ = Log.Default.time("bootstrap.plugin")
+    await Plugin.init()
+  }
   Share.init()
   ShareNext.init()
   Format.init()
-  await LSP.init()
+  {
+    using _ = Log.Default.time("bootstrap.lsp")
+    await LSP.init()
+  }
   FileWatcher.init()
   File.init()
   Vcs.init()

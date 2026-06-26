@@ -55,7 +55,9 @@ export namespace SessionRevert {
 
     if (revert) {
       const session = await Session.get(input.sessionID)
-      revert.snapshot = session.revert?.snapshot ?? (await Snapshot.track())
+      // block: the pre-revert snapshot is the only way to unrevert — never let
+      // the snapshot budget time out and silently drop it (see snapshot.track)
+      revert.snapshot = session.revert?.snapshot ?? (await Snapshot.track({ block: true }))
       await Snapshot.revert(patches)
       if (revert.snapshot) revert.diff = await Snapshot.diff(revert.snapshot)
       const rangeMessages = all.filter((msg) => msg.info.id >= revert!.messageID)
