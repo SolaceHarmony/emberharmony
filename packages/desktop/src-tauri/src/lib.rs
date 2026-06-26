@@ -2,6 +2,7 @@ mod cli;
 #[cfg(windows)]
 mod job_object;
 mod markdown;
+pub mod voice;
 mod window_customizer;
 
 use cli::{install_cli, sync_cli};

@@ -8,9 +8,10 @@ const ignore = new Set([
 // We pin @modelcontextprotocol/sdk to a fixed version in the repo; keep installs unblocked.
 const ignoreIds = new Set([
   "GHSA-j965-2qgj-vjmq", "CVE-2026-25536",
-  // undici WebSocket CVEs — transitive via @actions/github (CI-only).
-  // No fix available: @actions/github@9.1.0 still requires undici ^6.23.0.
-  // WebSocket DoS requires connecting to a malicious server — not applicable in CI.
+  // undici WebSocket CVEs — transitive via @actions/github, which uses undici
+  // for HTTP (the GitHub API), not its WebSocket client, so these WS-only DoS
+  // issues aren't reachable. undici is also pinned to a fixed release (see
+  // overrides); these older GHSA advisories stay suppressed in case OSV lags.
   "GHSA-2mjp-6q6p-2qxm", "GHSA-f269-vfmq-vjvj", "GHSA-vrm6-8vpv-qv8q",
   "GHSA-4992-7rv2-5pvq", "GHSA-phc3-fgpg-7m6h", "GHSA-v9p9-hfj2-hcw8",
   // uuid v3/v5/v6 buffer bounds check — transitive via @actions/artifact › @azure/core-http (CI-only).
@@ -30,6 +31,12 @@ const postcssIgnoreIds = new Set(["CVE-2026-41305", "GHSA-qx2v-qp2m-jg93"])
 const win = process.platform === "win32"
 const ci =
   process.env["CI"] === "true" || process.env["GITHUB_ACTIONS"] === "true" || process.env["BUN_SECURITY_SCAN"] === "0"
+// A non-interactive install can't answer bun's "Continue anyway? [y/N]" warning
+// prompt, so a piped/scripted/Docker run (or any CI that doesn't set the flags
+// above) would HANG on it or auto-abort. Treat "no TTY" as non-interactive and
+// skip the scan — matching the CI-skip behavior. A real terminal (both stdin
+// and stdout are TTYs) still gets scanned and prompted.
+const interactive = Boolean(process.stdin.isTTY) && Boolean(process.stdout.isTTY)
 const debug = process.env["BUN_SECURITY_SCAN_DEBUG"] === "1"
 
 export const scanner: Bun.Security.Scanner = {
@@ -37,6 +44,7 @@ export const scanner: Bun.Security.Scanner = {
   async scan(input) {
     if (win) return []
     if (ci) return []
+    if (!interactive) return []
     const mod = await import("bun-osv-scanner").catch(() => null)
     if (!mod) return []
     const advisories = await mod.scanner.scan(input).catch(() => [])

@@ -12,6 +12,8 @@
     "build:local": "bun ./scripts/build-local.ts",
     "build:local:nobundle": "bun ./scripts/build-local.ts --no-bundle",
     "build:local:nodmg": "bun ./scripts/build-local.ts --no-dmg",
+    "clean": "bun ./scripts/clean.ts",
+    "clean:all": "bun ./scripts/clean.ts --deep",
     "preview": "vite preview",
     "tauri": "tauri"
   },

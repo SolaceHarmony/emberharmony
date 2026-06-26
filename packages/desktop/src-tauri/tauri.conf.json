@@ -43,7 +43,6 @@
     "active": true,
     "targets": ["deb", "rpm", "dmg", "nsis", "app"],
     "externalBin": ["sidecars/emberharmony-cli"],
-    "resources": ["resources/voice/**/*"],
     "macOS": {
       "entitlements": "./entitlements.plist"
     },

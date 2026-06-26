@@ -234,6 +234,18 @@ export const { use: usePrompt, provider: PromptProvider } = createSimpleContext(
     }
 
     const session = createMemo(() => load(params.dir!, params.id))
+    // Load-bearing: `ready()` is latched monotonic. `pages/session.tsx` gates
+    // `<PromptInput>` behind `<Show when={prompt.ready()}>`; the underlying
+    // session().ready() briefly flips false→true on navigation to a freshly
+    // created session, which would UNMOUNT/REMOUNT PromptInput. That remount
+    // re-armed handleSubmit's editor/submit binding while params.id was still
+    // undefined and (pre-guard) minted duplicate sessions — the voice-era
+    // "webview refreshing" + session-clone symptom. Keeping it latched stops the
+    // remount; the re-entrancy guard in prompt-input.tsx is the backstop.
+    // Trade-off: the latch is provider-scoped and never reset, so it also
+    // suppresses the loading gate on subsequent session switches (PromptInput
+    // mounts against the next session's not-yet-hydrated, empty store). Acceptable
+    // because the editor hydrates from current()/cursor() once the store loads.
     let wasReady = false
 
     return {

@@ -225,7 +225,11 @@ export namespace Session {
       },
     }
     log.info("created", result)
-    await Storage.write(["session", Instance.project.id, result.id], result)
+    // Persist write-behind: don't hang the create (and the POST /session response,
+    // and the client waiting to navigate) on a durable disk write. A host
+    // virtual-disk I/O stall froze this write for ~100s in production. read()/
+    // update() are overlay-aware so the session is immediately consistent.
+    Storage.writeBehind(["session", Instance.project.id, result.id], result)
     Bus.publish(Event.Created, {
       info: result,
     })

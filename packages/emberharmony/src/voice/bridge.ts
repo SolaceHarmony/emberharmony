@@ -62,7 +62,16 @@ async function* serverEvents(opts: SessionBridgeOptions, signal: AbortSignal): A
           if (!line.startsWith("data:")) continue
           const data = line.slice(5).trim()
           if (!data) continue
-          yield JSON.parse(data)
+          // A single malformed or truncated frame (or a proxy injecting a
+          // non-JSON keep-alive on a data: line) must not throw out of this
+          // generator and kill the whole voice turn — skip it and keep reading.
+          let event: any
+          try {
+            event = JSON.parse(data)
+          } catch {
+            continue
+          }
+          yield event
         }
       }
     }

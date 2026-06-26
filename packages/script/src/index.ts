@@ -58,14 +58,20 @@ const STATIC_VERSION = await (async () => {
   return data.version
 })()
 
-// The embedded version is hard-coded from version.json for every release
-// build regardless of tag or channel — the tag names the release, it never
-// defines the version. Timestamped preview versions exist only for local /
-// non-integration-branch builds.
+// The embedded version always comes from version.json — the tag names the
+// release, it never defines the version. Release / "latest" builds use it
+// clean; preview builds (local, branch, CI verification, dev) get a timestamped
+// PRERELEASE of it: e.g. `1.4.9-consolidated-fixes.202606250322`. That shows the
+// real base version instead of a meaningless 0.0.0, yet still sorts BELOW the
+// clean `1.4.9` release — so a preview artifact can never impersonate or outrank
+// a pinned release. The channel is sanitized to the semver prerelease charset
+// ([0-9A-Za-z-]); branch names like "consolidated_fixes" or "fix/foo" otherwise
+// produce invalid semver.
+const previewTag = CHANNEL.replace(/[^0-9A-Za-z-]+/g, "-").replace(/^-+|-+$/g, "")
 const VERSION =
   env.EMBERHARMONY_RELEASE || !IS_PREVIEW
     ? STATIC_VERSION
-    : `0.0.0-${CHANNEL}-${new Date().toISOString().slice(0, 16).replace(/[-:T]/g, "")}`
+    : `${STATIC_VERSION}-${previewTag}.${new Date().toISOString().slice(0, 16).replace(/[-:T]/g, "")}`
 
 export const Script = {
   get channel() {
