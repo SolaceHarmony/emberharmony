@@ -18,17 +18,21 @@ for (const [key, value] of Object.entries(pkg.exports)) {
 }
 
 // Resolve workspace:* and catalog: dependencies to the concrete version being
-// published. npm pack/publish rejects workspace: and catalog: protocol strings.
+// published — npm pack/publish rejects the workspace: and catalog: protocol
+// strings. The catalog lives under workspaces.catalog in the root package.json
+// (a top-level `catalog` read returns undefined and crashes on first deref).
 const root = JSON.parse(await Bun.file("../../package.json").text())
 const catalog = (root.workspaces?.catalog ?? {}) as Record<string, string>
-const deps = pkg.dependencies as Record<string, string>
-for (const [dep, ver] of Object.entries(deps)) {
-  if (ver.startsWith("workspace:")) {
-    deps[dep] = Script.version
-    console.log(`resolved workspace dep: ${dep} -> ${Script.version}`)
-  } else if (ver === "catalog:") {
-    deps[dep] = catalog[dep] ?? ver
-    console.log(`resolved catalog dep: ${dep} -> ${deps[dep]}`)
+const deps = pkg.dependencies as Record<string, string> | undefined
+if (deps) {
+  for (const [dep, ver] of Object.entries(deps)) {
+    if (ver.startsWith("workspace:")) {
+      deps[dep] = Script.version
+      console.log(`resolved workspace dep: ${dep} -> ${Script.version}`)
+    } else if (ver === "catalog:") {
+      deps[dep] = catalog[dep] ?? ver
+      console.log(`resolved catalog dep: ${dep} -> ${deps[dep]}`)
+    }
   }
 }
 

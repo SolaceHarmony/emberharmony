@@ -217,17 +217,27 @@ if (!process.argv.includes("--no-voice")) {
 const tauriArgs = ["build"]
 // Note: `tauri build` is release mode by default; `--debug` is the only toggle.
 
-// Build only the .app on macOS (skip dmg in Tauri's own bundler)
+// Build only the .app on macOS (skip dmg in Tauri's own bundler).
+// On Linux build ONLY the .deb here: rpm is built afterwards with native
+// streaming rpmbuild (Tauri's in-memory rpm crate holds the whole ~950MB
+// payload in RAM → ~55min + swap-thrash vs ~37s for rpmbuild), and AppImage is
+// dropped entirely — its FUSE step hangs (CI excludes it for the same reason).
 if (process.platform === "darwin") {
   tauriArgs.push("--bundles", "app")
 } else if (process.platform === "linux") {
-  tauriArgs.push("--bundles", "deb,rpm,appimage")
+  tauriArgs.push("--bundles", "deb")
 } else if (process.platform === "win32") {
   tauriArgs.push("--bundles", "nsis,msi")
 }
 
 console.log(`[build-local] running: tauri ${tauriArgs.join(" ")}`)
 await $`bun run tauri ${tauriArgs}`
+
+// Linux: build the .rpm from the deb's already-staged buildroot via native
+// streaming rpmbuild — see scripts/build-rpm.ts for the why.
+if (process.platform === "linux") {
+  await $`bun ./scripts/build-rpm.ts ${path.join(desktopDir, "src-tauri/target/release/bundle")}`
+}
 
 // --- Step 4: Create DMG manually (macOS only) -----------------------------
 if (process.platform === "darwin" && !noDmg) {

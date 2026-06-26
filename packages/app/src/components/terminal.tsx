@@ -1,4 +1,11 @@
 import type { Ghostty, Terminal as Term, FitAddon } from "ghostty-web"
+// ghostty-web's Ghostty.load() with no argument falls back to an embedded
+// data-URI / ./ghostty-vt.wasm / /ghostty-vt.wasm chain, none of which resolve
+// inside the Tauri bundle — the data URI fails to parse ("doesn't start with
+// '\0asm'") and spams on every terminal render. Import the wasm as a vite asset
+// URL (emitted as a real hashed file with a correct path) and pass it
+// explicitly to load() so it fetches the actual bundled module.
+import ghosttyVtWasmUrl from "ghostty-web/ghostty-vt.wasm?url"
 import { ComponentProps, createEffect, createSignal, onCleanup, onMount, splitProps } from "solid-js"
 import { useSDK } from "@/context/sdk"
 import { monoFontFamily, useSettings } from "@/context/settings"
@@ -21,7 +28,7 @@ let shared: Promise<{ mod: typeof import("ghostty-web"); ghostty: Ghostty }> | u
 const loadGhostty = () => {
   if (shared) return shared
   shared = import("ghostty-web")
-    .then(async (mod) => ({ mod, ghostty: await mod.Ghostty.load() }))
+    .then(async (mod) => ({ mod, ghostty: await mod.Ghostty.load(ghosttyVtWasmUrl) }))
     .catch((err) => {
       shared = undefined
       throw err

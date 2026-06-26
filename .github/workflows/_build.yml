@@ -203,10 +203,6 @@ jobs:
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
           APPLE_API_KEY_PATH: ${{ runner.temp }}/apple-api-key.p8
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          CARGO_PROFILE_CI_CODEGEN_UNITS: "32"
-          CARGO_PROFILE_CI_LTO: "false"
-          CARGO_PROFILE_CI_OPT_LEVEL: "1"
-          CARGO_PROFILE_CI_STRIP: "true"
         with:
           projectPath: packages/desktop
           # Linux ships deb + rpm only. AppImage bundling stalls on x64 (hangs on

@@ -20,7 +20,7 @@
  */
 import { $ } from "bun"
 import { existsSync } from "node:fs"
-import { cp, mkdir, rm, readdir, chmod, stat } from "node:fs/promises"
+import { cp, mkdir, rm, readdir, chmod, stat, realpath } from "node:fs/promises"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 
@@ -157,27 +157,116 @@ if (existsSync(ort)) {
 console.log("[voice-runtime] downloading ONNX models")
 const modelsDir = path.join(outDir, "models")
 await mkdir(modelsDir, { recursive: true })
-const modelEnv = { ...process.env, HF_HOME: modelsDir, XDG_CACHE_HOME: modelsDir, BUN_SECURITY_SCAN: "0" }
+// The turn-detector plugin's hf_utils caches under os.homedir()/.cache/
+// huggingface/hub and ignores HF_HOME entirely; os.homedir() honors $HOME, so
+// HOME is what actually lands the model inside the bundle. The worker sets the
+// SAME HOME at runtime to resolve it offline. HF_HOME/XDG_CACHE_HOME stay for
+// libs that do read them; cwd is already outDir for any cwd-relative cache.
+const modelEnv = {
+  ...process.env,
+  HOME: modelsDir,
+  HF_HOME: modelsDir,
+  XDG_CACHE_HOME: modelsDir,
+  BUN_SECURITY_SCAN: "0",
+}
 // HuggingFace downloads flake — rate limits and transient errors surface as
 // e.g. "tokenizerConfig.tokenizer_class undefined" (a non-JSON response parsed
 // as the tokenizer config). A single flake otherwise aborts the whole build,
 // so retry with backoff and only fail loudly once attempts are exhausted.
+// Use the dedicated `livekit-agents download-files` bin, NOT `agent.js
+// download-files`. The bin discovers @livekit/agents-plugin-* packages in
+// node_modules and runs their downloadFiles() directly — without loading the
+// agent, so it needs no LiveKit creds, no ffmpeg, and doesn't depend on the
+// agent having registered its plugins. The deprecated agent.js/cli.runApp path
+// silently downloaded nothing (exit 0, empty cache).
+const downloadBin = path.join(outDir, "node_modules/@livekit/agents/dist/bin/livekit-agents.js")
 const MODEL_DL_ATTEMPTS = 4
+let lastDownloadOutput = "(no output captured)"
 for (let attempt = 1; ; attempt++) {
-  const res = await $`bun run ${path.join(outDir, "agent.js")} download-files`.cwd(outDir).env(modelEnv).quiet().nothrow()
+  const res = await $`bun ${downloadBin} download-files`.cwd(outDir).env(modelEnv).quiet().nothrow()
+  lastDownloadOutput =
+    [res.stdout.toString().trim(), res.stderr.toString().trim()].filter(Boolean).join("\n\n") || "(no output captured)"
   if (res.exitCode === 0) break
   if (attempt >= MODEL_DL_ATTEMPTS) {
-    // download-files logs the real error to stdout; keep both streams so a
-    // stray stderr warning can't hide it, with a fallback if both are empty.
-    const output =
-      [res.stderr.toString().trim(), res.stdout.toString().trim()].filter(Boolean).join("\n\n") ||
-      "(no output captured from stdout or stderr)"
-    throw new Error(`[voice-runtime] model download failed after ${MODEL_DL_ATTEMPTS} attempts:\n${output}`)
+    throw new Error(`[voice-runtime] model download failed after ${MODEL_DL_ATTEMPTS} attempts:\n${lastDownloadOutput}`)
   }
   const backoffSec = attempt * 5
   console.log(`[voice-runtime] model download attempt ${attempt}/${MODEL_DL_ATTEMPTS} failed; retrying in ${backoffSec}s`)
   await Bun.sleep(backoffSec * 1000)
 }
+
+// Replace symlinks with real files. The HF hub cache stores model files as
+// symlinks (snapshots/*/onnx/model_q8.onnx -> ../../blobs/<etag>); symlinks
+// don't survive Windows installers and are fragile across bundlers, so we
+// dereference every symlink in the runtime into a real copy. (node_modules was
+// already copied with dereference:true; the HF cache is the remaining source.)
+console.log("[voice-runtime] dereferencing symlinks -> real files")
+async function dereferenceSymlinks(dir: string): Promise<void> {
+  for (const entry of await readdir(dir, { withFileTypes: true })) {
+    const full = path.join(dir, entry.name)
+    if (entry.isSymbolicLink()) {
+      const target = await realpath(full) // resolves the link to the real file/dir
+      await rm(full)
+      await cp(target, full, { recursive: true, dereference: true })
+    } else if (entry.isDirectory()) {
+      await dereferenceSymlinks(full)
+    }
+  }
+}
+await dereferenceSymlinks(modelsDir)
+
+// Drop the now-orphaned HF blob store. After dereferencing, each model lives as
+// a real file under snapshots/; the runtime's local_files_only path reads only
+// refs/ + snapshots/ (verified in hf_utils.downloadFileToCacheDir — blobs/ is
+// never read), so keeping blobs/ would ship every model twice (the multilingual
+// turn detector alone is ~378MB).
+for (const blobs of await Array.fromAsync(
+  new Bun.Glob("**/blobs").scan({ cwd: modelsDir, dot: true, onlyFiles: false }),
+)) {
+  await rm(path.join(modelsDir, blobs), { recursive: true, force: true })
+}
+
+// Fail loud if the turn-detector assets didn't actually land in the bundle.
+// download-files can exit 0 while caching nothing reachable, which silently
+// ships a voice runtime that can't do turn detection — the runtime loads BOTH
+// with local_files_only and throws if either is missing:
+//   - model:     @huggingface/hub caches under HOME/.cache/huggingface/hub/...
+//   - tokenizer: @huggingface/transformers caches under its OWN package dir
+//                (node_modules/@huggingface/transformers/.cache/...)
+// Globs need dot:true to descend into those .cache directories. After
+// dereferencing, model_q8.onnx is a real file, so no followSymlinks needed.
+const bundledModel = await Array.fromAsync(new Bun.Glob("**/model_q8.onnx").scan({ cwd: modelsDir, dot: true }))
+const bundledTokenizer = await Array.fromAsync(
+  new Bun.Glob("node_modules/@huggingface/transformers/.cache/**/tokenizer.json").scan({ cwd: outDir, dot: true }),
+)
+if (bundledModel.length === 0 || bundledTokenizer.length === 0) {
+  throw new Error(
+    `[voice-runtime] turn-detector assets missing after download — ` +
+      `model_q8.onnx: ${bundledModel.length}, tokenizer.json: ${bundledTokenizer.length}. ` +
+      `The HuggingFace cache is not landing in the bundle.\n\ndownload-files output:\n${lastDownloadOutput}`,
+  )
+}
+
+// Guard: no symlinks may ship — Windows installers (NSIS/MSI) can't represent
+// them, and they break when the bundle is relocated. Catch any that slip in.
+async function findSymlinks(dir: string, found: string[] = []): Promise<string[]> {
+  for (const entry of await readdir(dir, { withFileTypes: true })) {
+    const full = path.join(dir, entry.name)
+    if (entry.isSymbolicLink()) found.push(path.relative(outDir, full))
+    else if (entry.isDirectory()) await findSymlinks(full, found)
+  }
+  return found
+}
+const symlinks = await findSymlinks(outDir)
+if (symlinks.length > 0) {
+  throw new Error(
+    `[voice-runtime] ${symlinks.length} symlink(s) remain in the bundle (Windows installers can't ship them):\n` +
+      symlinks.slice(0, 20).join("\n"),
+  )
+}
+console.log(
+  `[voice-runtime] turn-detector bundled: ${bundledModel.length} model + ${bundledTokenizer.length} tokenizer file(s), 0 symlinks`,
+)
 
 // --- 3b. Prune the staged node_modules to runtime-only -------------------
 // The install pulls heavy transitive deps the worker never loads. Drop the
