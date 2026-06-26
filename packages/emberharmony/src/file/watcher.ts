@@ -9,13 +9,10 @@ import path from "path"
 // @ts-ignore
 import { createWrapper } from "@parcel/watcher/wrapper"
 import { lazy } from "@/util/lazy"
-import { withTimeout } from "@/util/timeout"
 import type ParcelWatcher from "@parcel/watcher"
 import { $ } from "bun"
 import { Flag } from "@/flag/flag"
 import { readdir } from "fs/promises"
-
-const SUBSCRIBE_TIMEOUT_MS = 10_000
 
 declare const EMBERHARMONY_LIBC: string | undefined
 
@@ -44,26 +41,57 @@ export namespace FileWatcher {
     }
   })
 
-  const state = Instance.state(
-    async () => {
-      if (Instance.project.vcs !== "git") return {}
+  interface WatcherState {
+    subs: ParcelWatcher.AsyncSubscription[]
+    disposed: boolean
+  }
+
+  // The file watcher is a CONVENIENCE: it surfaces edits made OUTSIDE the app so
+  // things like the VCS branch view refresh. In-app edits already publish
+  // Event.Updated directly (tool/edit, tool/write, …), so the OS watch is never a
+  // dependency. It must therefore never block boot or hold a request, and never
+  // pretend to control the filesystem: on a slow/remote/unsupported mount
+  // (Parallels share, NFS/NAS, sshfs) the OS subscribe can take many seconds or
+  // hang forever. So `state()` returns SYNCHRONOUSLY and all setup — including the
+  // subscribe — runs detached in the background; the subscription is fire-and-
+  // forget (never awaited, no timeout). If it resolves we attach; if it hangs we
+  // simply run without external file events; if it rejects we log and move on.
+  const state = Instance.state<WatcherState>(
+    () => {
+      const handle: WatcherState = { subs: [], disposed: false }
+      if (Instance.project.vcs !== "git") return handle
+      void setupWatches(handle)
+      return handle
+    },
+    async (handle) => {
+      handle.disposed = true
+      await Promise.all(handle.subs.splice(0).map((sub) => sub?.unsubscribe().catch(() => {})))
+    },
+  )
+
+  function errMessage(err: unknown): string {
+    return err instanceof Error ? err.message : String(err)
+  }
+
+  async function setupWatches(handle: WatcherState): Promise<void> {
+    try {
       log.info("init")
-      const cfg = await Config.get()
       const backend = (() => {
-        if (process.platform === "win32") return "windows"
-        if (process.platform === "darwin") return "fs-events"
-        if (process.platform === "linux") return "inotify"
+        if (process.platform === "win32") return "windows" as const
+        if (process.platform === "darwin") return "fs-events" as const
+        if (process.platform === "linux") return "inotify" as const
+        return undefined
       })()
       if (!backend) {
-        log.error("watcher backend not supported", { platform: process.platform })
-        return {}
+        log.warn("watcher backend not supported; continuing without file watching", { platform: process.platform })
+        return
       }
-      log.info("watcher backend", { platform: process.platform, backend })
-
       const w = watcher()
-      if (!w) return {}
+      if (!w) return
+      const cfg = await Config.get().catch(() => undefined)
+      const cfgIgnores = cfg?.watcher?.ignore ?? []
 
-      const subscribe: ParcelWatcher.SubscribeCallback = (err, evts) => {
+      const onEvents: ParcelWatcher.SubscribeCallback = (err, evts) => {
         if (err) return
         for (const evt of evts) {
           if (evt.type === "create") Bus.publish(Event.Updated, { file: evt.path, event: "add" })
@@ -72,20 +100,23 @@ export namespace FileWatcher {
         }
       }
 
-      const subs: ParcelWatcher.AsyncSubscription[] = []
-      const cfgIgnores = cfg.watcher?.ignore ?? []
+      // fire-and-forget: NEVER await the subscribe. Attach if/when it resolves.
+      const attach = (dir: string, ignore: string[]) => {
+        if (handle.disposed) return
+        w.subscribe(dir, onEvents, { ignore, backend })
+          .then((sub) => {
+            if (handle.disposed) {
+              void sub.unsubscribe().catch(() => {})
+              return
+            }
+            handle.subs.push(sub)
+            log.info("watching", { dir })
+          })
+          .catch((err) => log.warn("file watch unavailable; continuing without it", { dir, error: errMessage(err) }))
+      }
 
       if (Flag.EMBERHARMONY_EXPERIMENTAL_FILEWATCHER) {
-        const pending = w.subscribe(Instance.directory, subscribe, {
-          ignore: [...FileIgnore.PATTERNS, ...cfgIgnores],
-          backend,
-        })
-        const sub = await withTimeout(pending, SUBSCRIBE_TIMEOUT_MS).catch((err) => {
-          log.error("failed to subscribe to Instance.directory", { error: err })
-          pending.then((s) => s.unsubscribe()).catch(() => {})
-          return undefined
-        })
-        if (sub) subs.push(sub)
+        attach(Instance.directory, [...FileIgnore.PATTERNS, ...cfgIgnores])
       }
 
       const vcsDir = await $`git rev-parse --git-dir`
@@ -97,26 +128,15 @@ export namespace FileWatcher {
         .catch(() => undefined)
       if (vcsDir && !cfgIgnores.includes(".git") && !cfgIgnores.includes(vcsDir)) {
         const gitDirContents = await readdir(vcsDir).catch(() => [])
-        const ignoreList = gitDirContents.filter((entry) => entry !== "HEAD")
-        const pending = w.subscribe(vcsDir, subscribe, {
-          ignore: ignoreList,
-          backend,
-        })
-        const sub = await withTimeout(pending, SUBSCRIBE_TIMEOUT_MS).catch((err) => {
-          log.error("failed to subscribe to vcsDir", { error: err })
-          pending.then((s) => s.unsubscribe()).catch(() => {})
-          return undefined
-        })
-        if (sub) subs.push(sub)
+        attach(
+          vcsDir,
+          gitDirContents.filter((entry) => entry !== "HEAD"),
+        )
       }
-
-      return { subs }
-    },
-    async (state) => {
-      if (!state.subs) return
-      await Promise.all(state.subs.map((sub) => sub?.unsubscribe()))
-    },
-  )
+    } catch (err) {
+      log.warn("file watcher setup failed; continuing without it", { error: errMessage(err) })
+    }
+  }
 
   export function init() {
     if (Flag.EMBERHARMONY_EXPERIMENTAL_DISABLE_FILEWATCHER) {

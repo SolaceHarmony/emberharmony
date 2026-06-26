@@ -57,7 +57,6 @@ const { use: useVoice, provider: VoiceValueProvider } = createSimpleContext({
             connect(id, followModel).catch(() => {})
           })
         },
-        { defer: true },
       ),
     )
 
@@ -160,11 +159,6 @@ const { use: useVoice, provider: VoiceValueProvider } = createSimpleContext({
     onCleanup(() => {
       room.disconnect()
     })
-
-    // resume voice after a project switch remounted the provider
-    if (followProjects && params.id) {
-      void connect(params.id, followModel).catch(() => {})
-    }
 
     return {
       room,

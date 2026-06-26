@@ -4060,6 +4060,42 @@ export type ProviderListResponses = {
 
 export type ProviderListResponse = ProviderListResponses[keyof ProviderListResponses]
 
+export type ProviderRefreshData = {
+  body?: never
+  path: {
+    /**
+     * Provider ID
+     */
+    providerID: string
+  }
+  query?: {
+    directory?: string
+  }
+  url: "/provider/{providerID}/refresh"
+}
+
+export type ProviderRefreshErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type ProviderRefreshError = ProviderRefreshErrors[keyof ProviderRefreshErrors]
+
+export type ProviderRefreshResponses = {
+  /**
+   * Refreshed model list
+   */
+  200: {
+    models: {
+      [key: string]: Model
+    }
+  }
+}
+
+export type ProviderRefreshResponse = ProviderRefreshResponses[keyof ProviderRefreshResponses]
+
 export type ProviderAuthData = {
   body?: never
   path?: never

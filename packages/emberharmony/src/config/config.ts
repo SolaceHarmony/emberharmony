@@ -154,8 +154,27 @@ export namespace Config {
       }
 
       const exists = existsSync(path.join(dir, "node_modules"))
-      const installing = installDependencies(dir)
-      if (!exists) await installing
+      const installing = installDependencies(dir).catch((err) => {
+        log.warn("dependency install failed", { dir, error: err instanceof Error ? err.message : String(err) })
+      })
+      // Never freeze config loading on a slow or failing `bun install`. An
+      // `.emberharmony` dir on a slow/remote mount (Parallels share, NFS/NAS) can
+      // make the install hang or fail repeatedly — node_modules never appears, so
+      // this re-runs and blocks EVERY startup (observed: 64s). Since Config.get()
+      // gates provider/model/session loading, that froze the whole app. Bound the
+      // wait; the install keeps running in the background and project plugin deps
+      // become available on a later build.
+      if (!exists)
+        await new Promise<void>((resolve) => {
+          // bound the wait, but clear the timer once the install settles so it
+          // doesn't keep the event loop alive; never throw — a slow/failing
+          // install must not freeze config loading (deps appear on a later build)
+          const timer = setTimeout(resolve, INSTALL_WAIT_BUDGET_MS)
+          void installing.catch(() => {}).finally(() => {
+            clearTimeout(timer)
+            resolve()
+          })
+        })
 
       result.command = mergeDeep(result.command ?? {}, await loadCommand(dir))
       result.agent = mergeDeep(result.agent, await loadAgent(dir))
@@ -226,7 +245,24 @@ export namespace Config {
     }
   })
 
-  export async function installDependencies(dir: string) {
+  // Max time Config.get() will wait on a first-time dependency install before
+  // proceeding without it (the install continues in the background). A healthy
+  // local install finishes well under this; a stalled mount stops freezing boot.
+  const INSTALL_WAIT_BUDGET_MS = 5_000
+
+  // Dedupe concurrent installs per directory so overlapping Config.get() builds
+  // don't each spawn a `bun install` for the same dir.
+  const inflightInstalls = new Map<string, Promise<void>>()
+
+  export function installDependencies(dir: string): Promise<void> {
+    const existing = inflightInstalls.get(dir)
+    if (existing) return existing
+    const promise = doInstallDependencies(dir).finally(() => inflightInstalls.delete(dir))
+    inflightInstalls.set(dir, promise)
+    return promise
+  }
+
+  async function doInstallDependencies(dir: string) {
     const pkg = path.join(dir, "package.json")
 
     if (!(await Bun.file(pkg).exists())) {

@@ -94,6 +94,39 @@ export namespace Log {
       : result
   }
 
+  // Cap any single rendered field so one fat value (e.g. an AI-SDK error that
+  // embeds the entire request body — system prompt + message history) can't
+  // bloat a log line to tens of KB. The message arg is never capped here, only
+  // the structured key=value fields.
+  const MAX_VALUE_LENGTH = 2048
+  function truncateValue(rendered: string): string {
+    if (rendered.length <= MAX_VALUE_LENGTH) return rendered
+    return rendered.slice(0, MAX_VALUE_LENGTH) + `…[+${rendered.length - MAX_VALUE_LENGTH} chars]`
+  }
+  function safeStringify(value: any): string {
+    try {
+      return JSON.stringify(value) ?? String(value)
+    } catch (e) {
+      // circular refs / BigInt make JSON.stringify throw. Retry with a
+      // circular-safe replacer so we still render partial structure; if that
+      // also fails, emit a NAMED marker rather than the useless "[object Object]"
+      // (the old code would have thrown loudly here — don't silently swallow).
+      try {
+        const seen = new WeakSet()
+        return JSON.stringify(value, (_k, v) => {
+          if (typeof v === "bigint") return `${v.toString()}n`
+          if (typeof v === "object" && v !== null) {
+            if (seen.has(v)) return "[Circular]"
+            seen.add(v)
+          }
+          return v
+        })
+      } catch {
+        return `[unserializable: ${e instanceof Error ? e.message : String(e)}]`
+      }
+    }
+  }
+
   let last = Date.now()
   export function create(tags?: Record<string, any>) {
     tags = tags || {}
@@ -114,9 +147,13 @@ export namespace Log {
         .filter(([_, value]) => value !== undefined && value !== null)
         .map(([key, value]) => {
           const prefix = `${key}=`
-          if (value instanceof Error) return prefix + formatError(value)
-          if (typeof value === "object") return prefix + JSON.stringify(value)
-          return prefix + value
+          const rendered =
+            value instanceof Error
+              ? formatError(value)
+              : typeof value === "object"
+                ? safeStringify(value)
+                : String(value)
+          return prefix + truncateValue(rendered)
         })
         .join(" ")
       const next = new Date()

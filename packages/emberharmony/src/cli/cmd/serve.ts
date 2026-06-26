@@ -4,6 +4,7 @@ import { withNetworkOptions, resolveNetworkOptions } from "../network"
 import { Flag } from "../../flag/flag"
 import { bootstrap } from "../bootstrap"
 import { VoiceWorker } from "../../voice/worker"
+import { Log } from "../../util/log"
 
 export const ServeCommand = cmd({
   command: "serve",
@@ -20,6 +21,7 @@ export const ServeCommand = cmd({
     // the worker is a child process; it talks to this server over loopback
     const localhost = server.hostname === "0.0.0.0" || server.hostname === "::" ? "127.0.0.1" : server.hostname
     await bootstrap(process.cwd(), async () => {
+      using _ = Log.Default.time("serve.voice.start")
       const started = await VoiceWorker.start(`http://${localhost}:${server.port}`)
       if (started) console.log("voice agent worker started")
     })
@@ -27,13 +29,17 @@ export const ServeCommand = cmd({
     // the idle promise below never resolves; without these handlers a signal
     // would kill the server and orphan the worker child process
     const shutdown = async () => {
-      VoiceWorker.stop()
+      // Await the graceful IPC shutdown before exiting — firing it
+      // fire-and-forget would let serve exit mid-drain and orphan the worker.
+      await VoiceWorker.stop()
       await server.stop()
       process.exit(0)
     }
     process.on("SIGINT", shutdown)
     process.on("SIGTERM", shutdown)
-    process.on("exit", () => VoiceWorker.stop())
+    // 'exit' handlers can't await; use the synchronous group-kill fallback so a
+    // hard exit still tears the worker (and its job processes) down.
+    process.on("exit", () => VoiceWorker.killSync())
 
     await new Promise(() => {})
   },

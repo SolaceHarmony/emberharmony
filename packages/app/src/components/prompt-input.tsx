@@ -653,15 +653,33 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     }
   }
 
+  const promptContentKey = (parts: Prompt): string =>
+    parts
+      .map(
+        (p) => `${p.type}:${"content" in p ? p.content : ""}:${"path" in p ? p.path : ""}:${"name" in p ? p.name : ""}`,
+      )
+      .join("|")
+
+  let lastRenderedKey = ""
+
   createEffect(
     on(
       () => prompt.current(),
       (currentParts) => {
         const inputParts = currentParts.filter((part) => part.type !== "image") as Prompt
+        const contentKey = promptContentKey(inputParts)
 
         if (mirror.input) {
           mirror.input = false
-          if (isNormalizedEditor()) return
+          if (isNormalizedEditor()) {
+            // Keep the fingerprint in sync with the just-mirrored user input.
+            // Without this it stays at the previously-rendered (often empty)
+            // key, so a later reset-to-empty produces a matching contentKey and
+            // the guard below wrongly skips the clear — the input would not erase
+            // after sending a message.
+            lastRenderedKey = contentKey
+            return
+          }
 
           const selection = window.getSelection()
           let cursorPosition: number | null = null
@@ -670,6 +688,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
           }
 
           renderEditor(inputParts)
+          lastRenderedKey = contentKey
 
           if (cursorPosition !== null) {
             setCursorPosition(editorRef, cursorPosition)
@@ -677,8 +696,13 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
           return
         }
 
+        if (contentKey === lastRenderedKey && isNormalizedEditor()) return
+
         const domParts = parseFromDOM()
-        if (isNormalizedEditor() && isPromptEqual(inputParts, domParts)) return
+        if (isNormalizedEditor() && isPromptEqual(inputParts, domParts)) {
+          lastRenderedKey = contentKey
+          return
+        }
 
         const selection = window.getSelection()
         let cursorPosition: number | null = null
@@ -687,6 +711,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
         }
 
         renderEditor(inputParts)
+        lastRenderedKey = contentKey
 
         if (cursorPosition !== null) {
           setCursorPosition(editorRef, cursorPosition)
@@ -1128,6 +1153,20 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     }
   }
 
+  // Re-entrancy guard for new-session creation. A submit on the new-session
+  // view creates a session and then navigates to it, but `params.id` only
+  // updates once the router lands on the new route. Until then every extra
+  // submit (rapid Enter, the submit button, or a webview remount re-firing)
+  // still sees `params.id === undefined` and spawns *another* cloned session.
+  // Hold the guard from the first create until navigation settles; the effect
+  // below clears it once we're on a real session (and leaves it cleared when
+  // the user returns to the new-session view to start a fresh one). Mirrors the
+  // voice connect() guard in context/voice.tsx.
+  let creatingSession = false
+  createEffect(() => {
+    if (params.id) creatingSession = false
+  })
+
   const handleSubmit = async (event: Event) => {
     event.preventDefault()
 
@@ -1140,6 +1179,9 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
       if (working()) abort()
       return
     }
+
+    // a new-session create is already in flight — ignore the duplicate submit
+    if (!params.id && creatingSession) return
 
     const currentModel = local.model.current()
     const currentAgent = local.agent.current()
@@ -1172,6 +1214,9 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     let client = sdk.client
 
     if (isNewSession) {
+      // claim the guard before any awaits so a second submit bails out above
+      creatingSession = true
+
       if (worktreeSelection === "create") {
         const createdWorktree = await client.worktree
           .create({ directory: projectDirectory })
@@ -1189,6 +1234,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
             title: language.t("prompt.toast.worktreeCreateFailed.title"),
             description: language.t("common.requestFailed"),
           })
+          creatingSession = false
           return
         }
         WorktreeState.pending(createdWorktree.directory)
@@ -1224,7 +1270,12 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
           })
           return undefined
         })
-      if (session) navigate(`/${base64Encode(sessionDirectory)}/session/${session.id}`)
+      if (session) {
+        navigate(`/${base64Encode(sessionDirectory)}/session/${session.id}`)
+      } else {
+        // creation failed — release the guard so the user can retry
+        creatingSession = false
+      }
     }
     if (!session) return
 

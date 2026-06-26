@@ -50,10 +50,18 @@ export namespace SessionProcessor {
           try {
             let currentText: MessageV2.TextPart | undefined
             let reasoningMap: Record<string, MessageV2.ReasoningPart> = {}
+            const streamStart = Date.now()
+            let sawFirstEvent = false
             const stream = await LLM.stream(streamInput)
 
             for await (const value of stream.fullStream) {
               input.abort.throwIfAborted()
+              if (!sawFirstEvent) {
+                sawFirstEvent = true
+                // time-to-first-token: how long the provider took to start
+                // responding (separates network/provider latency from our setup)
+                log.info("ttft", { ms: Date.now() - streamStart, sessionID: input.sessionID })
+              }
               switch (value.type) {
                 case "start":
                   SessionStatus.set(input.sessionID, { type: "busy" })
@@ -172,6 +180,9 @@ export namespace SessionProcessor {
                 case "tool-result": {
                   const match = toolcalls[value.toolCallId]
                   if (match && match.state.status === "running") {
+                    // per-tool execution time (in addition to the part's stored
+                    // time.start/end), so slow tools show up in the timing logs
+                    log.info("tool.executed", { tool: match.tool, ms: Date.now() - match.state.time.start })
                     await Session.updatePart({
                       ...match,
                       state: {

@@ -134,35 +134,48 @@ export namespace SessionSummary {
     if (textPart && !userMsg.summary?.title) {
       const agent = await Agent.get("title")
       if (!agent) return
-      const stream = await LLM.stream({
-        agent,
-        user: userMsg,
-        tools: {},
-        model: agent.model
-          ? await Provider.getModel(agent.model.providerID, agent.model.modelID)
-          : ((await Provider.getSmallModel(userMsg.model.providerID)) ??
-            (await Provider.getModel(userMsg.model.providerID, userMsg.model.modelID))),
-        small: true,
-        messages: [
-          {
-            role: "user" as const,
-            content: `
+      // Prefer a small model for the (cosmetic) message-nav label; fall back to
+      // the session's own model so single-model setups still get labels. The
+      // real 429-storm cause was duplicate sessions (now fixed by the prompt
+      // re-entrancy guard); here we just keep titling best-effort — one retry,
+      // errors swallowed — so a rate-limited model can't turn it into a storm.
+      const model = agent.model
+        ? await Provider.getModel(agent.model.providerID, agent.model.modelID)
+        : ((await Provider.getSmallModel(userMsg.model.providerID)) ??
+          (await Provider.getModel(userMsg.model.providerID, userMsg.model.modelID)))
+      if (!model) return
+      try {
+        const stream = await LLM.stream({
+          agent,
+          user: userMsg,
+          tools: {},
+          model,
+          small: true,
+          messages: [
+            {
+              role: "user" as const,
+              content: `
               The following is the text to summarize:
               <text>
               ${textPart?.text ?? ""}
               </text>
             `,
-          },
-        ],
-        abort: new AbortController().signal,
-        sessionID: userMsg.sessionID,
-        system: [],
-        retries: 3,
-      })
-      const result = await stream.text
-      log.info("title", { title: result })
-      userMsg.summary.title = result
-      await Session.updateMessage(userMsg)
+            },
+          ],
+          abort: new AbortController().signal,
+          sessionID: userMsg.sessionID,
+          system: [],
+          // best-effort: title is cosmetic, so don't retry hard on rate limits
+          retries: 1,
+        })
+        const result = await stream.text
+        log.info("title", { title: result })
+        userMsg.summary.title = result
+        await Session.updateMessage(userMsg)
+      } catch (err) {
+        // never let a cosmetic title request surface or spam; a later turn retries
+        log.warn("title generation skipped", { error: err instanceof Error ? err.message : String(err) })
+      }
     }
   }
 
