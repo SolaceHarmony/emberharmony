@@ -31,7 +31,7 @@ if (process.platform !== "linux") {
   console.log("[rpm] not Linux — skipping (rpm is a Linux-only bundle)")
   process.exit(0)
 }
-if ((await $`command -v rpmbuild`.nothrow().quiet()).exitCode !== 0) {
+if ((await $`which rpmbuild`.nothrow().quiet()).exitCode !== 0) {
   throw new Error("[rpm] rpmbuild not found — install it (Fedora: `dnf install rpm-build`, Debian/Ubuntu: `apt install rpm`)")
 }
 

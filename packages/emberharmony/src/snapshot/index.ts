@@ -54,11 +54,15 @@ export namespace Snapshot {
     log.info("cleanup", { prune })
   }
 
-  export async function track() {
+  export async function track(opts?: { block?: boolean }) {
     if (Instance.project.vcs !== "git") return
     const cfg = await Config.get()
     if (cfg.snapshot === false) return
     using _ = log.time("snapshot.track")
+    // The pre-revert safety snapshot (revert undo) MUST be captured: block past
+    // the budget rather than silently returning undefined, which would let the
+    // revert mutate files while leaving the user no way to unrevert.
+    if (opts?.block) return await trackInner()
     try {
       return await withTimeout(trackInner(), SNAPSHOT_TIMEOUT_MS)
     } catch (err) {
