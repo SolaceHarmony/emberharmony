@@ -258,10 +258,21 @@ export namespace LSP {
       // never block the tool result on a cold/slow spawn; only include the client
       // if it comes up within the short grace, otherwise it warms up in the
       // background (schedule pushes it to s.clients) and is picked up next touch
-      const client = await Promise.race([
-        task.catch(() => undefined),
-        new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), COLD_SPAWN_GRACE_MS)),
-      ])
+      // clear the grace timer when the spawn settles — getClients runs per touch,
+      // so an uncleared setTimeout would pile up active timers in the event loop
+      const client = await new Promise<Awaited<typeof task> | undefined>((resolve) => {
+        const timer = setTimeout(() => resolve(undefined), COLD_SPAWN_GRACE_MS)
+        void task.then(
+          (c) => {
+            clearTimeout(timer)
+            resolve(c)
+          },
+          () => {
+            clearTimeout(timer)
+            resolve(undefined)
+          },
+        )
+      })
       if (client) result.push(client)
     }
 

@@ -138,7 +138,8 @@ pub fn parse_event(v: &Value) -> SessionEvent {
                 .map(str::to_string);
             let error = props
                 .and_then(|p| p.get("error"))
-                .map(Value::to_string)
+                // a JSON string error -> its clean unquoted text; non-strings -> JSON
+                .map(|e| e.as_str().map(str::to_string).unwrap_or_else(|| e.to_string()))
                 .or_else(|| props.map(Value::to_string))
                 .unwrap_or_default();
             SessionEvent::Error { session_id, error }

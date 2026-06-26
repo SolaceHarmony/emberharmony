@@ -30,8 +30,12 @@ if (deps) {
       deps[dep] = Script.version
       console.log(`resolved workspace dep: ${dep} -> ${Script.version}`)
     } else if (ver === "catalog:") {
-      deps[dep] = catalog[dep] ?? ver
-      console.log(`resolved catalog dep: ${dep} -> ${deps[dep]}`)
+      const resolved = catalog[dep]
+      // fall through silently and npm publish fails later with an opaque error;
+      // fail loud and named here instead
+      if (!resolved) throw new Error(`cannot resolve catalog dependency: ${dep} (not in workspaces.catalog)`)
+      deps[dep] = resolved
+      console.log(`resolved catalog dep: ${dep} -> ${resolved}`)
     }
   }
 }

@@ -89,40 +89,44 @@ if (files.length === 0) throw new Error(`[rpm] no installable files found under 
 //   __requires/provides_exclude .*  -> skip automatic ELF dependency generation
 //   _binary_payload w3.zstdio       -> stream-compress the payload with zstd-3
 const work = await mkdtemp(path.join(os.tmpdir(), "emberharmony-rpm-"))
-const fileListPath = path.join(work, "files.list")
-await writeFile(fileListPath, files.join("\n") + "\n")
-const specPath = path.join(work, `${name}.spec`)
-await writeFile(
-  specPath,
-  [
-    "%global _build_id_links none",
-    "%global __os_install_post %{nil}",
-    "%global __requires_exclude .*",
-    "%global __provides_exclude .*",
-    "%define _binary_payload w3.zstdio",
-    `Name: ${name}`,
-    `Version: ${version}`,
-    "Release: 1",
-    `Summary: ${summary}`,
-    "License: MIT",
-    `BuildArch: ${rpmArch}`,
-    `Requires: ${requires.join(", ")}`,
-    "%description",
-    summary,
-    `%files -f ${fileListPath}`,
-    "%changelog",
-    "",
-  ].join("\n"),
-)
+try {
+  const fileListPath = path.join(work, "files.list")
+  await writeFile(fileListPath, files.join("\n") + "\n")
+  const specPath = path.join(work, `${name}.spec`)
+  await writeFile(
+    specPath,
+    [
+      "%global _build_id_links none",
+      "%global __os_install_post %{nil}",
+      "%global __requires_exclude .*",
+      "%global __provides_exclude .*",
+      "%define _binary_payload w3.zstdio",
+      `Name: ${name}`,
+      `Version: ${version}`,
+      "Release: 1",
+      `Summary: ${summary}`,
+      "License: MIT",
+      `BuildArch: ${rpmArch}`,
+      `Requires: ${requires.join(", ")}`,
+      "%description",
+      summary,
+      `%files -f ${fileListPath}`,
+      "%changelog",
+      "",
+    ].join("\n"),
+  )
 
-await mkdir(outDir, { recursive: true })
-console.log(`[rpm] rpmbuild → ${name}-${version}-1.${rpmArch}.rpm (streaming from ${path.relative(bundleDir, buildroot)})`)
-const start = Bun.nanoseconds()
-await $`rpmbuild -bb ${specPath} --buildroot ${buildroot} --define ${`_topdir ${path.join(work, "top")}`} --define ${`_rpmdir ${outDir}`} --define ${"_rpmfilename %{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}.rpm"}`.quiet()
-const secs = ((Bun.nanoseconds() - start) / 1e9).toFixed(1)
+  await mkdir(outDir, { recursive: true })
+  console.log(`[rpm] rpmbuild → ${name}-${version}-1.${rpmArch}.rpm (streaming from ${path.relative(bundleDir, buildroot)})`)
+  const start = Bun.nanoseconds()
+  await $`rpmbuild -bb ${specPath} --buildroot ${buildroot} --define ${`_topdir ${path.join(work, "top")}`} --define ${`_rpmdir ${outDir}`} --define ${"_rpmfilename %{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}.rpm"}`.quiet()
+  const secs = ((Bun.nanoseconds() - start) / 1e9).toFixed(1)
 
-const rpmPath = path.join(outDir, `${name}-${version}-1.${rpmArch}.rpm`)
-if (!existsSync(rpmPath)) throw new Error(`[rpm] rpmbuild reported success but ${rpmPath} is missing`)
-const sizeMB = ((await stat(rpmPath)).size / 1024 / 1024).toFixed(0)
-await rm(work, { recursive: true, force: true })
-console.log(`[rpm] done in ${secs}s -> ${path.relative(bundleDir, rpmPath)} (${sizeMB} MB)`)
+  const rpmPath = path.join(outDir, `${name}-${version}-1.${rpmArch}.rpm`)
+  if (!existsSync(rpmPath)) throw new Error(`[rpm] rpmbuild reported success but ${rpmPath} is missing`)
+  const sizeMB = ((await stat(rpmPath)).size / 1024 / 1024).toFixed(0)
+  console.log(`[rpm] done in ${secs}s -> ${path.relative(bundleDir, rpmPath)} (${sizeMB} MB)`)
+} finally {
+  // always remove the temp work dir, even if rpmbuild or a later step throws
+  await rm(work, { recursive: true, force: true })
+}

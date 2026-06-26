@@ -164,7 +164,17 @@ export namespace Config {
       // gates provider/model/session loading, that froze the whole app. Bound the
       // wait; the install keeps running in the background and project plugin deps
       // become available on a later build.
-      if (!exists) await Promise.race([installing, new Promise<void>((r) => setTimeout(r, INSTALL_WAIT_BUDGET_MS))])
+      if (!exists)
+        await new Promise<void>((resolve) => {
+          // bound the wait, but clear the timer once the install settles so it
+          // doesn't keep the event loop alive; never throw — a slow/failing
+          // install must not freeze config loading (deps appear on a later build)
+          const timer = setTimeout(resolve, INSTALL_WAIT_BUDGET_MS)
+          void installing.catch(() => {}).finally(() => {
+            clearTimeout(timer)
+            resolve()
+          })
+        })
 
       result.command = mergeDeep(result.command ?? {}, await loadCommand(dir))
       result.agent = mergeDeep(result.agent, await loadAgent(dir))
