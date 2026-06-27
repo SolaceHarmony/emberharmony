@@ -151,6 +151,28 @@ impl Default for GenParams {
     }
 }
 
+impl GenParams {
+    /// The HF getting-started defaults for the interleaved demo: text greedy (no temperature
+    /// or top-k), audio sampled at `temperature=1.0`/`top_k=4`, `max_new_tokens=1024`, fixed
+    /// seed. Mirrors the README two-turn example's `generate_interleaved(..., max_new_tokens=512,
+    /// audio_temperature=1.0, audio_top_k=4)` — but with the demo UI's 1024 interleaved budget.
+    ///
+    /// **Audio is sampled, not greedy, deliberately:** greedy audio (audio temp/top-k `None`)
+    /// is degenerate for the Depthformer — the model is trained for sampled audio, so greedy
+    /// produces an unintelligible reply. `Default` stays greedy (the Python kwargs default);
+    /// this is the realtime/voice-path default.
+    pub fn demo_defaults() -> Self {
+        Self {
+            max_new_tokens: 1024,
+            text_temperature: None,
+            text_top_k: None,
+            audio_temperature: Some(1.0),
+            audio_top_k: Some(4),
+            seed: 0,
+        }
+    }
+}
+
 /// `Sampler` — the next-token sampler, built on `candle_transformers`'
 /// [`LogitsProcessor`] (the same sampler `moshi` uses for depformer decoding)
 /// rather than a private softmax+multinomial. Faithful to `_sample_text_token` and

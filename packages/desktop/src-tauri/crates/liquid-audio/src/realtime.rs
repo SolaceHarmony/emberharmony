@@ -147,7 +147,34 @@ impl Drop for RealtimePipeline {
 
 use candle_core::{DType, Device, Tensor};
 
-use crate::{ChatState, GenParams, GenToken, LFM2AudioModel, LFM2AudioProcessor};
+use crate::{ChatState, GenParams, GenToken, LFM2AudioModel, LFM2AudioProcessor, LFMModality};
+
+/// The accumulated conversation tensors persisted across turns — the five model-input fields
+/// of a [`ChatState`]. The engine holds these (not a `ChatState`, which borrows the processor
+/// and so can't be stored beside it) and rebuilds a transient `ChatState` each turn via
+/// [`ChatState::from_parts`]. This is the Rust analog of Python keeping ONE persistent
+/// `ChatState` object across turns: the discrete `audio_out` generated each turn is fed back
+/// here as context for the next prefill (`generate_interleaved`'s `audio_out` scatter).
+#[derive(Clone)]
+pub struct ConversationState {
+    pub text: Tensor,
+    pub audio_in: Tensor,
+    pub audio_in_lens: Tensor,
+    pub audio_out: Tensor,
+    pub modality_flag: Tensor,
+}
+
+/// Build a `(rows, cols)` i64 tensor, using a zero-length view of a 1-col buffer when
+/// `cols == 0` (candle can't allocate a zero-size buffer on Metal — the same guard
+/// `ChatState::new` uses for its empty placeholders). Used to stack the per-turn generated
+/// `text`/`audio_out`/`modality_flag` for [`ChatState::append`].
+fn stack_i64(vals: Vec<i64>, rows: usize, cols: usize, dev: &Device) -> candle_core::Result<Tensor> {
+    if cols == 0 {
+        Tensor::zeros((rows, 1), DType::I64, dev)?.narrow(1, 0, 0)
+    } else {
+        Tensor::from_vec(vals, (rows, cols), dev)
+    }
+}
 
 /// The real [`VoiceEngine`]: owns the LFM2-Audio model + processor and answers each
 /// utterance via [`LFM2AudioModel::generate_interleaved_cancellable`], decoding audio
@@ -162,6 +189,17 @@ pub struct Lfm2VoiceEngine {
     /// Resample target for emitted PCM. `MIMI_RATE` (or 0) ⇒ emit the codec's native
     /// 24 kHz untouched; otherwise resample each chunk to this device rate.
     out_rate: u32,
+    /// The assistant's system prompt, added once at the start of the conversation (Python adds
+    /// the system turn once, before the first user turn). Defaults to the demo's interleaved
+    /// prompt; the desktop layer's `TurnMode` sets the ASR/TTS variants via
+    /// [`Self::with_system_prompt`]. (Per-mode `max_new_tokens` rides on `params`.)
+    system_prompt: String,
+    /// The persistent conversation: `None` until the first turn completes (cold start = fresh
+    /// `ChatState::new` + the system turn), then `Some`, carrying the accumulated tensors so
+    /// each later turn *continues* the conversation — feeding the prior turn's discrete
+    /// `audio_out` back as context (the `audio_out` → prefill-scatter path). Cold-start-per-turn
+    /// (the prior behavior) made every utterance context-free.
+    conv: Option<ConversationState>,
 }
 
 impl Lfm2VoiceEngine {
@@ -173,7 +211,24 @@ impl Lfm2VoiceEngine {
         device: Device,
         out_rate: u32,
     ) -> Self {
-        Self { model, proc, params, codebooks, device, out_rate }
+        Self {
+            model,
+            proc,
+            params,
+            codebooks,
+            device,
+            out_rate,
+            system_prompt: "Respond with interleaved text and audio.".to_string(),
+            conv: None,
+        }
+    }
+
+    /// Override the system prompt (the desktop `TurnMode` → ASR / TTS / Interleaved prompt,
+    /// verbatim from the demo's `audio-model.js`). Builder form so the single `new` call site
+    /// and the tests stay unchanged.
+    pub fn with_system_prompt(mut self, prompt: impl Into<String>) -> Self {
+        self.system_prompt = prompt.into();
+        self
     }
 }
 
@@ -186,17 +241,40 @@ impl VoiceEngine for Lfm2VoiceEngine {
     ) -> Result<bool, String> {
         let s = |e: candle_core::Error| e.to_string();
 
+        // `audio_detokenizer()` returns the LFM2 detokenizer when present, else falls back to
+        // the Mimi codec (processor.rs: `audio_out.or(mimi)`) — so this streaming `decode_step`
+        // path works on both model families, mirroring the one-shot `processor.decode` fallback.
         let detok = self.proc.audio_detokenizer().ok_or("no audio-out backend (Mimi) in this model")?;
         detok.reset_stream(); // turn boundary — independent streaming decode.
 
-        // Build the chat turn: system prompt, user audio, then the assistant turn to fill.
         let wave = Tensor::from_vec(utt.samples.clone(), (1, utt.samples.len()), &self.device).map_err(s)?;
-        let mut chat = ChatState::new(&self.proc, self.codebooks).map_err(s)?;
-        chat.new_turn("system").map_err(s)?;
-        chat.add_text("Respond with interleaved text and audio.").map_err(s)?;
-        chat.end_turn().map_err(s)?;
+
+        // Restore the persistent conversation (clone the prior tensors — cheap Arc bumps — so an
+        // interrupted turn can be discarded without losing history; we never `take`). First turn
+        // → fresh `ChatState` + the system turn (added once, like Python); later turns → seed
+        // from the accumulated state so the prior discrete `audio_out` conditions this prefill.
+        let prior = self.conv.clone();
+        let mut chat = match &prior {
+            None => {
+                let mut c = ChatState::new(&self.proc, self.codebooks).map_err(s)?;
+                c.new_turn("system").map_err(s)?;
+                c.add_text(&self.system_prompt).map_err(s)?;
+                c.end_turn().map_err(s)?;
+                c
+            }
+            Some(conv) => ChatState::from_parts(
+                &self.proc,
+                self.codebooks,
+                conv.text.clone(),
+                conv.audio_in.clone(),
+                conv.audio_in_lens.clone(),
+                conv.audio_out.clone(),
+                conv.modality_flag.clone(),
+            )
+            .map_err(s)?,
+        };
         chat.new_turn("user").map_err(s)?;
-        chat.add_audio(&wave, utt.rate).map_err(s)?;
+        chat.add_audio(&wave, utt.rate).map_err(s)?; // CONTINUOUS audio-in (mel → Conformer)
         chat.end_turn().map_err(s)?;
         chat.new_turn("assistant").map_err(s)?;
 
@@ -206,19 +284,37 @@ impl VoiceEngine for Lfm2VoiceEngine {
         let out_rate = self.out_rate;
         let mut cb_err: Option<String> = None;
 
+        // Collect the generated stream for `chat.append` (the discrete `audio_out` → context
+        // path). `text_ids` / `audio_frames` are the SEPARATED in-order streams (Python's
+        // `text_out` / `audio_out` lists); `modality_out` preserves the INTERLEAVED generation
+        // order (Python's `modality_out`). `audio_frames` keeps ALL frames including the
+        // all-2048 EOAudio terminator — `append` needs the full `audio_out`
+        // (`torch.stack(audio_out, 1)`); only the Mimi DECODE drops the last (`audio_out[:-1]`).
+        let mut text_ids: Vec<i64> = Vec::new();
+        let mut audio_frames: Vec<Vec<u32>> = Vec::new();
+        let mut modality_out: Vec<i64> = Vec::new();
+
         self.model
             .generate_interleaved_cancellable(&chat, &self.params, cancel, |tok| {
                 if cb_err.is_some() {
                     return;
                 }
                 match tok {
-                    GenToken::Text(id) => match text.decode(&[id], true) {
-                        Ok(text) => emit(VoiceEvent::Text(text)),
-                        Err(e) => cb_err = Some(e.to_string()),
-                    },
+                    GenToken::Text(id) => {
+                        text_ids.push(id as i64);
+                        modality_out.push(LFMModality::Text as i64);
+                        match text.decode(&[id], true) {
+                            Ok(text) => emit(VoiceEvent::Text(text)),
+                            Err(e) => cb_err = Some(e.to_string()),
+                        }
+                    }
                     GenToken::Audio(frame) => {
+                        // Collect EVERY frame (incl. EOAudio) for `append` BEFORE the streaming
+                        // skip — append needs the full audio_out; only PCM playback drops it.
+                        modality_out.push(LFMModality::AudioOut as i64);
+                        audio_frames.push(frame.clone());
                         if frame.contains(&2048) {
-                            return; // EOAudio terminator — no waveform.
+                            return; // EOAudio terminator — no waveform to stream.
                         }
                         // Decode the 8-code frame to PCM via the streaming detokenizer.
                         let decoded = (|| -> candle_core::Result<Option<Vec<f32>>> {
@@ -247,8 +343,46 @@ impl VoiceEngine for Lfm2VoiceEngine {
         if let Some(e) = cb_err {
             return Err(e);
         }
+
         // Completed unless the loop broke because barge-in was requested.
-        Ok(!cancel.load(Ordering::Acquire))
+        let completed = !cancel.load(Ordering::Acquire);
+
+        // Persist the turn ONLY on clean completion. `append` weaves the generated text +
+        // discrete `audio_out` (with their interleaved modality flags) into the conversation,
+        // then `end_turn` closes the assistant turn — exactly Python's `chat.append(...)` +
+        // `chat.end_turn()`. An interrupted turn is discarded: `self.conv` keeps the prior
+        // history (we cloned `prior`, never took it), so barge-in rewinds to before this turn.
+        if completed {
+            let n_text = text_ids.len();
+            let n_audio = audio_frames.len();
+            let n_flag = modality_out.len();
+            let text_t = stack_i64(text_ids, 1, n_text, &self.device).map_err(s)?;
+            // Stack frames into (codebooks, n_audio) column-major: flat[c*n_audio + f] =
+            // frame[f][c] — the transpose of the (frame, codebook) collection, matching
+            // `torch.stack(audio_out, 1)` (each frame is a column).
+            let mut flat = Vec::with_capacity(codebooks * n_audio);
+            for c in 0..codebooks {
+                for f in &audio_frames {
+                    flat.push(f[c] as i64);
+                }
+            }
+            let audio_t = stack_i64(flat, codebooks, n_audio, &self.device).map_err(s)?;
+            let mod_t = stack_i64(modality_out, 1, n_flag, &self.device).map_err(s)?;
+            chat.append(&text_t, &audio_t, &mod_t).map_err(s)?;
+            chat.end_turn().map_err(s)?;
+
+            let saved = ConversationState {
+                text: chat.text.clone(),
+                audio_in: chat.audio_in.clone(),
+                audio_in_lens: chat.audio_in_lens.clone(),
+                audio_out: chat.audio_out.clone(),
+                modality_flag: chat.modality_flag.clone(),
+            };
+            drop(chat); // end the `&self.proc` borrow before writing `self.conv`.
+            self.conv = Some(saved);
+        }
+
+        Ok(completed)
     }
 }
 
@@ -375,6 +509,83 @@ mod tests {
         // The worker must still be alive to serve a second utterance.
         assert!(pipe.submit(utt(0)));
         assert_eq!(pipe.events().recv_timeout(Duration::from_secs(5)).unwrap(), VoiceEvent::Error("boom".into()));
+    }
+
+    /// Real-model proof of the multi-turn persistence (Gap A): two `respond()` calls on the
+    /// actual LFM2.5-Audio engine must GROW the persisted `conv` — turn 2 seeds from turn 1's
+    /// state (`from_parts`) and appends again, so every field is strictly longer than after
+    /// turn 1. This is the engine analog of `examples/chat_multiturn` and the only test that
+    /// exercises `from_parts` + the collect→`append`→save path end-to-end.
+    ///
+    /// `#[ignore]` (needs the model + is slow); run with:
+    ///   LFM_DEVICE=metal cargo test --features metal --lib -- --ignored engine_multiturn
+    /// (or `LFM_MODEL_DIR=/abs/model cargo test --lib -- --ignored engine_multiturn` on CPU/f32).
+    #[test]
+    #[ignore = "needs the real LFM2.5-Audio model; slow"]
+    fn engine_multiturn_grows_conv() {
+        use crate::{from_pretrained, get_model_dir, GenParams};
+
+        // Device: Metal bf16 when built with the feature + LFM_DEVICE=metal; else CPU f32.
+        let (device, dtype) = match std::env::var("LFM_DEVICE").ok().as_deref() {
+            #[cfg(feature = "metal")]
+            Some("metal") => (Device::new_metal(0).expect("metal device"), DType::BF16),
+            _ => (Device::Cpu, DType::F32),
+        };
+
+        let model_ref = std::env::var("LFM_MODEL")
+            .or_else(|_| std::env::var("LFM_MODEL_DIR"))
+            .unwrap_or_else(|_| "LiquidAI/LFM2.5-Audio-1.5B".into());
+        let dir = get_model_dir(&model_ref, None).expect("resolve model dir");
+        let cfg: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
+        let codebooks = cfg["codebooks"].as_u64().expect("codebooks") as usize;
+        let (model, proc) = from_pretrained(&dir, dtype, &device).expect("load model");
+
+        // Short budget keeps the test quick; demo audio sampling so frames are non-degenerate.
+        let params = GenParams { max_new_tokens: 96, ..GenParams::demo_defaults() };
+        let mut engine = Lfm2VoiceEngine::new(model, proc, params, codebooks, device, MIMI_RATE);
+
+        // Reuse the reference question clip for both turns (a smoke test of growth, not content).
+        let wav_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../../../experiments/lfm2-audio-voice/upstream-liquid-audio/assets/question.wav"
+        );
+        let bytes = std::fs::read(wav_path).expect("read question.wav");
+        // PCM16 mono/stereo → mono f32; assume 16-bit (the reference asset is).
+        let hdr = 44usize;
+        let pcm: Vec<f32> = bytes[hdr..]
+            .chunks_exact(2)
+            .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
+            .collect();
+        let utt = || Utterance { samples: pcm.clone(), rate: 16_000 };
+
+        let cancel = AtomicBool::new(false);
+        let mut sink = |_ev: VoiceEvent| {};
+
+        // Turn 1: cold start → fresh ChatState + system turn → generate → append → save.
+        let done1 = engine.respond(&utt(), &cancel, &mut sink).expect("turn 1");
+        assert!(done1, "turn 1 should complete");
+        let c1 = engine.conv.clone().expect("conv persisted after turn 1");
+        let (t1, a1, m1) = (
+            c1.text.dim(1).unwrap(),
+            c1.audio_out.dim(1).unwrap(),
+            c1.modality_flag.dim(1).unwrap(),
+        );
+        assert!(t1 > 0 && a1 > 0, "turn 1 must produce text + discrete audio_out (got {t1}, {a1})");
+
+        // Turn 2: seeds from c1 via from_parts → generate (prefill scatters c1's audio_out as
+        // context) → append → save. Every field must be strictly longer than after turn 1.
+        let done2 = engine.respond(&utt(), &cancel, &mut sink).expect("turn 2");
+        assert!(done2, "turn 2 should complete");
+        let c2 = engine.conv.clone().expect("conv persisted after turn 2");
+        let (t2, a2, m2) = (
+            c2.text.dim(1).unwrap(),
+            c2.audio_out.dim(1).unwrap(),
+            c2.modality_flag.dim(1).unwrap(),
+        );
+        assert!(t2 > t1, "turn 2 text must grow: {t1} -> {t2}");
+        assert!(a2 > a1, "turn 2 audio_out must grow: {a1} -> {a2}");
+        assert!(m2 > m1, "turn 2 modality_flag must grow: {m1} -> {m2}");
     }
 
     #[test]

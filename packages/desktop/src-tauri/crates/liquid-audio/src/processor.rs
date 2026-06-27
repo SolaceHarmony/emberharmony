@@ -196,6 +196,37 @@ impl<'a> ChatState<'a> {
         })
     }
 
+    /// Seed a `ChatState` from a previously persisted conversation (the five model-input
+    /// fields) instead of `new`'s fresh `<|startoftext|>` start.
+    ///
+    /// `ChatState<'a>` borrows the processor, so it cannot itself be held across turns by an
+    /// owner that also owns the processor (self-referential). The realtime engine instead
+    /// holds the accumulated *tensors* (`Lfm2VoiceEngine::conv`) and rebuilds a transient
+    /// `ChatState` each turn via this constructor — the Rust analog of Python keeping ONE
+    /// persistent `ChatState` object across `append`/`new_turn` calls (README getting-started,
+    /// the two-turn example). No `<|startoftext|>` is prepended: the persisted `text` already
+    /// begins with it from the first turn. Fields map 1:1 to `new`'s.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_parts(
+        proc: &'a LFM2AudioProcessor,
+        codebooks: usize,
+        text: Tensor,
+        audio_in: Tensor,
+        audio_in_lens: Tensor,
+        audio_out: Tensor,
+        modality_flag: Tensor,
+    ) -> Result<Self> {
+        // The persisted audio_out is restored from a prior turn's `append`; guard the codebook
+        // row count before it reaches the prefill `audio_out` scatter (which asserts on it).
+        if audio_out.dim(0)? != codebooks {
+            return Err(candle_core::Error::Msg(format!(
+                "from_parts: audio_out must have {codebooks} codebook rows, got {}",
+                audio_out.dim(0)?
+            )));
+        }
+        Ok(Self { proc, codebooks, text, audio_in, audio_in_lens, audio_out, modality_flag })
+    }
+
     pub fn add_text(&mut self, text: &str) -> Result<()> {
         let new_text = self.proc.encode(text)?;
         let n = new_text.dim(1)?;
