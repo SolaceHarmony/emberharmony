@@ -19,7 +19,7 @@ import torch
 from safetensors.torch import load_file, save_file
 
 HERE = Path(__file__).resolve().parent
-CONF = HERE.parent.parent / "upstream-liquid-audio" / "src" / "liquid_audio" / "model" / "conformer"
+CONF = __import__("_upstream").PKG / "model" / "conformer"
 
 
 def load_conformer_module():

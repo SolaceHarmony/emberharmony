@@ -29,7 +29,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 CRATE = HERE.parent
-DEFAULT_PY = CRATE.parent / "upstream-liquid-audio" / "src" / "liquid_audio"
+DEFAULT_PY = __import__("_upstream").PKG
 DEFAULT_RS = CRATE / "src"
 
 

@@ -51,6 +51,17 @@ webkit2gtk = "=2.0.2"
 objc2 = "0.6"
 objc2-web-kit = "0.3"
 window-vibrancy = "0.7"
+# The native voice engine (pure-Rust LFM2-Audio realtime pipeline) compiled INTO the
+# desktop binary — capture → model → playback runs in-process on real OS threads (the
+# `RealtimePipeline` worker), driven directly by the `voice_start` Tauri command, with no
+# Bun/Node sidecar. On Apple Silicon the `metal` feature gives bf16 GPU generation =
+# real-time. See `crates/liquid-audio` (moved here from experiments/lfm2-audio-voice).
+liquid-audio = { path = "crates/liquid-audio", features = ["metal"] }
+
+# Same engine on non-macOS, CPU path (no Metal); below real-time for a 1.5B model but
+# keeps the desktop building everywhere.
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+liquid-audio = { path = "crates/liquid-audio" }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = [

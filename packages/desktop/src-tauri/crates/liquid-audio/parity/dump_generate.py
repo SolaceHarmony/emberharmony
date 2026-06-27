@@ -14,7 +14,7 @@ import torch
 from safetensors.torch import load_file, save_file
 
 HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE.parent.parent / "upstream-liquid-audio" / "src"))
+sys.path.insert(0, str(__import__("_upstream").SRC))
 from liquid_audio import LFM2AudioModel  # noqa: E402
 
 

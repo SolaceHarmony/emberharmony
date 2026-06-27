@@ -89,17 +89,60 @@ pub enum Role {
 }
 
 /// An event streamed to the webview during a voice session.
+///
+/// Covers both the Phase-1 turn flow (the Liquid AI demo: `Transcript` streams the reply text,
+/// `AudioClip` delivers the decoded reply for an `<audio>` player) and the Phase-2 live flow
+/// (`Level` drives the visualizer since native audio never enters the webview as a track —
+/// see `FRONTEND_DESIGN.md`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum VoiceEvent {
     /// session state changed
     State { state: VoiceState },
-    /// a chunk of recognized speech (user) or spoken reply (assistant)
+    /// reply text so far (cumulative, matching the demo's streamed text)
     Transcript { role: Role, text: String },
+    /// audio amplitude (RMS) for the bar visualizer — the native path has no
+    /// `MediaStreamTrack` in the webview, so the loop emits this instead.
+    Level { rms: f32 },
+    /// the decoded audio reply as a WAV clip (turn mode → inline `<audio>` player).
+    AudioClip { wav: Vec<u8>, ms: u32 },
     /// the session ended (cleanly, or with a reason)
     Ended { reason: Option<String> },
     /// an error occurred
     Error { message: String },
+}
+
+/// The Liquid AI demo's three modes — same model, different system prompt + generate path.
+/// (`audio-model.js`: `Perform ASR.` / `Perform TTS. Use the UK female voice.` /
+/// `Respond with interleaved text and audio.`)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TurnMode {
+    /// audio in → text out (transcription). `generate_sequential`, text only.
+    Asr,
+    /// text in → audio out (speech). `generate_sequential`, text then audio.
+    Tts,
+    /// audio (± text) in → interleaved text + audio out. `generate_interleaved`.
+    Interleaved,
+}
+
+impl TurnMode {
+    /// The demo's per-mode system prompt (verbatim from `audio-model.js`).
+    pub fn system_prompt(self) -> &'static str {
+        match self {
+            TurnMode::Asr => "Perform ASR.",
+            TurnMode::Tts => "Perform TTS. Use the UK female voice.",
+            TurnMode::Interleaved => "Respond with interleaved text and audio.",
+        }
+    }
+
+    /// The demo's per-mode token budget (`DEFAULT_MAX_TOKENS_*`).
+    pub fn max_new_tokens(self) -> usize {
+        match self {
+            TurnMode::Asr => 100,
+            TurnMode::Tts | TurnMode::Interleaved => 1024,
+        }
+    }
 }
 
 /// Start a voice session for the configured provider, streaming [`VoiceEvent`]s

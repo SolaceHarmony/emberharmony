@@ -29,7 +29,7 @@ _ta.__version__ = "0.0.0-stub"
 sys.modules.setdefault("torchaudio", _ta)
 
 HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE.parent.parent / "upstream-liquid-audio" / "src"))
+sys.path.insert(0, str(__import__("_upstream").SRC))
 
 from liquid_audio import LFM2AudioModel  # noqa: E402
 from liquid_audio.model.conformer.processor import AudioToMelSpectrogramPreprocessor  # noqa: E402

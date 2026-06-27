@@ -11,12 +11,12 @@ run-name: rust-voice ${{ github.ref_name }} @ ${{ github.sha }}
 on:
   push:
     paths:
-      - "experiments/lfm2-audio-voice/liquid-audio-rs/**"
+      - "packages/desktop/src-tauri/crates/liquid-audio/**"
       - ".github/workflows/rust-voice.yml"
   pull_request:
     branches: [dev, main]
     paths:
-      - "experiments/lfm2-audio-voice/liquid-audio-rs/**"
+      - "packages/desktop/src-tauri/crates/liquid-audio/**"
       - ".github/workflows/rust-voice.yml"
   workflow_dispatch:
 
@@ -30,7 +30,7 @@ concurrency:
 defaults:
   run:
     shell: bash
-    working-directory: experiments/lfm2-audio-voice/liquid-audio-rs
+    working-directory: packages/desktop/src-tauri/crates/liquid-audio
 
 jobs:
   test:
@@ -50,7 +50,7 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: experiments/lfm2-audio-voice/liquid-audio-rs
+          workspaces: packages/desktop/src-tauri/crates/liquid-audio
 
       # cpal (dev-dep, used by the mic_chat example/tests) needs ALSA headers on Linux.
       - name: Linux audio deps (cpal/ALSA)

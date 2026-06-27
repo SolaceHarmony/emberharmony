@@ -19,7 +19,7 @@ import torch
 from safetensors.torch import save_file
 
 HERE = Path(__file__).resolve().parent
-ENCODER_PY = HERE.parent.parent / "upstream-liquid-audio" / "src" / "liquid_audio" / "model" / "conformer" / "encoder.py"
+ENCODER_PY = __import__("_upstream").PKG / "model" / "conformer" / "encoder.py"
 
 
 def load_create_masks():

@@ -24,7 +24,7 @@ import torch
 from safetensors.torch import save_file
 
 HERE = Path(__file__).resolve().parent
-UPSTREAM = HERE.parent.parent / "upstream-liquid-audio" / "src" / "liquid_audio"
+UPSTREAM = __import__("_upstream").PKG
 PROC_PY = UPSTREAM / "model" / "conformer" / "processor.py"
 
 

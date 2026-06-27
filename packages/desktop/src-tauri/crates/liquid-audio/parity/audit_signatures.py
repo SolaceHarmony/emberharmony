@@ -57,7 +57,7 @@ def load_existing_audit(path: Path) -> dict[tuple[str, str], dict]:
 
 HERE = Path(__file__).resolve().parent
 CRATE = HERE.parent
-DEFAULT_PY = CRATE.parent / "upstream-liquid-audio" / "src" / "liquid_audio"
+DEFAULT_PY = __import__("_upstream").PKG
 
 # Python file -> Rust file, mirroring compare_symbols.expected_rust.
 FILE_MAP = {"moshi/models/loaders.py": "loader.rs"}

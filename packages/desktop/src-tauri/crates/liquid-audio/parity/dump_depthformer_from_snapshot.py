@@ -22,7 +22,7 @@ import torch.nn as nn
 from safetensors.torch import load_file, save_file
 
 HERE = Path(__file__).resolve().parent
-SRC = HERE.parent.parent / "upstream-liquid-audio" / "src" / "liquid_audio" / "model"
+SRC = __import__("_upstream").PKG / "model"
 
 
 def load_transformer_module():

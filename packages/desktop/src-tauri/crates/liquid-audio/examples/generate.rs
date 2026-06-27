@@ -8,8 +8,10 @@
 //! `decode`), not reimplemented here.
 //!
 //! Run (CPU, f32 — the on-disk bf16 weights upcast losslessly):
-//!   LFM_MODEL_DIR=../model \
-//!   cargo run --release --example generate -- ../upstream-liquid-audio/assets/question.wav
+//!   LFM_MODEL_DIR=../model cargo run --release --example generate -- path/to/audio.wav
+//! With no path argument it defaults to the upstream reference clip
+//! (`experiments/lfm2-audio-voice/upstream-liquid-audio/assets/question.wav`), resolved
+//! from the manifest dir so it works regardless of the working directory.
 //!
 //! Determinism: greedy (no temperature/top-k), seed fixed — same input → same output.
 
@@ -115,9 +117,17 @@ fn main() -> Res<()> {
     let model_ref = std::env::var("LFM_MODEL")
         .or_else(|_| std::env::var("LFM_MODEL_DIR"))
         .unwrap_or_else(|_| "LiquidAI/LFM2.5-Audio-1.5B".into());
-    let audio_path = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "../upstream-liquid-audio/assets/question.wav".into());
+    let audio_path = std::env::args().nth(1).unwrap_or_else(|| {
+        // The crate moved into the desktop build (packages/desktop/src-tauri/crates/
+        // liquid-audio); the upstream reference assets stay under experiments/. Resolve the
+        // default from CARGO_MANIFEST_DIR (compile-time, CWD-independent) rather than a
+        // sibling relative path, which the move broke.
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../../../experiments/lfm2-audio-voice/upstream-liquid-audio/assets/question.wav"
+        )
+        .into()
+    });
     let max_new_tokens: usize = std::env::var("LFM_MAX_TOKENS").ok().and_then(|s| s.parse().ok()).unwrap_or(96);
     let (device, dtype) = select_device()?;
 
@@ -149,16 +159,19 @@ fn main() -> Res<()> {
     chat.end_turn()?;
     chat.new_turn("assistant")?;
 
+    // The HF example's exact params: text greedy (no text temperature passed),
+    // audio sampled at temperature 1.0 / top-k 4. Greedy audio is degenerate — the model
+    // is trained for sampled audio — so this matters for the audio reply being intelligible.
     let params = GenParams {
         max_new_tokens,
-        text_temperature: None, // greedy → deterministic
+        text_temperature: None,
         text_top_k: None,
-        audio_temperature: None,
-        audio_top_k: None,
+        audio_temperature: Some(1.0),
+        audio_top_k: Some(4),
         seed: 0,
     };
 
-    eprintln!("[gen] generate_interleaved (greedy, max {max_new_tokens} tokens)…");
+    eprintln!("[gen] generate_interleaved (text greedy, audio temp=1.0 top-k=4, max {max_new_tokens})…");
     let mut text_ids: Vec<u32> = Vec::new();
     let mut audio_frames: Vec<Vec<u32>> = Vec::new();
     let tg = std::time::Instant::now();

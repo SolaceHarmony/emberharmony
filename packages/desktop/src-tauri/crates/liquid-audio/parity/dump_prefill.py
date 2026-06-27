@@ -26,7 +26,7 @@ _ta.functional = types.SimpleNamespace(resample=lambda w, orig, new: w)
 sys.modules.setdefault("torchaudio", _ta)
 
 HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE.parent.parent / "upstream-liquid-audio" / "src"))
+sys.path.insert(0, str(__import__("_upstream").SRC))
 
 from liquid_audio import ChatState, LFM2AudioModel, LFM2AudioProcessor  # noqa: E402
 
