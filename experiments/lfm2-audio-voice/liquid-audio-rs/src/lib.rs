@@ -12,6 +12,7 @@
 //! ```
 
 pub mod audio_out; // AudioDetokenizer trait + backends (LFM2 detok / Mimi)
+pub mod bf16_gemm; // NEON BFMMLA bf16 CPU matmul (closes candle's bf16 gemm gap)
 pub mod candle_ext; // vendored candle 0.10 backports + extensions (kept on the 0.9.2 pin)
 pub mod data; // data/ (data-pipeline value types)
 pub mod detokenizer; // detokenizer.py
@@ -19,10 +20,12 @@ pub mod loader; // config.json + safetensors → model + processor
 pub mod model;
 pub mod processor; // processor.py
 pub mod resample; // torchaudio.functional.resample (windowed-sinc) port
+pub mod threads; // intra-op thread-pool parity with torch (at::intraop_default_num_threads)
 pub mod trainer; // trainer.py
 pub mod utils;
 
 pub use audio_out::{AudioDetokenizer, MimiDetokenizer};
+pub use threads::{configure_intraop_threads, intraop_default_num_threads};
 pub use detokenizer::LFM2AudioDetokenizer;
 pub use loader::{from_pretrained, from_pretrained_hub};
 pub use model::lfm2_audio::{GenParams, GenToken, LFM2AudioModel};

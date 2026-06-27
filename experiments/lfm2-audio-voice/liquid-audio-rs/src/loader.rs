@@ -100,10 +100,24 @@ pub fn from_pretrained_hub(
 /// (mirrors the Python `dtype=` keyword; `DType::BF16` matches the deployed
 /// model, `DType::F32` matches the parity reference).
 pub fn from_pretrained(dir: &Path, dtype: DType, device: &Device) -> Result<(LFM2AudioModel, LFM2AudioProcessor)> {
+    // Size the global rayon pool (candle's matmul/conv use it) like torch's intra-op
+    // default — Apple-Silicon performance cores, not all logical cores. Must run before
+    // the first tensor op; idempotent. (No-op for thread parallelism on the Metal path,
+    // but the f64 mel front-end and other CPU ops still benefit.)
+    crate::threads::configure_intraop_threads();
     if dtype == DType::BF16 && device.is_cpu() {
+        // candle supports bf16 broadly (dtype, conversions, every elementwise op, AND
+        // Metal matmul). The single gap is candle 0.9.2's CPU *gemm* matmul allowlist
+        // (`cpu_backend/mod.rs`: `DType::F16 | F32 | F64`; the Accelerate path is F32/F64
+        // only) — bf16 falls through to `UnsupportedDTypeForOp`. It's a candle allowlist
+        // choice, not a `gemm` limit (`gemm-f16` handles the `half` types), so true bf16
+        // CPU matmul is a `candle_ext` backport away if ever needed. For now f32 on CPU is
+        // the right call: the bf16→f32 weight upcast is lossless and the f32 parity
+        // goldens were dumped at f32, so this is the faithful CPU/test path.
         return Err(err(
-            "bf16 on CPU is unsupported (candle has no CPU bf16 matmul); use DType::F32 \
-             — it still loads the bf16-stored weights and upcasts them faithfully",
+            "bf16 matmul is not in candle 0.9.2's CPU gemm allowlist (F16/F32/F64); use \
+             DType::F32 on CPU — it loads the bf16 weights and upcasts them losslessly. \
+             (bf16 runs natively on Metal.)",
         ));
     }
     let config: Value = serde_json::from_str(&fs::read_to_string(dir.join("config.json")).map_err(err)?).map_err(err)?;

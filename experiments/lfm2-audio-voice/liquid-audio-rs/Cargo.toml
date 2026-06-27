@@ -9,6 +9,10 @@ name = "liquid-audio"
 version = "0.1.0"
 edition = "2021"
 description = "Faithful Rust port of liquid_audio (LFM2.5-Audio) on candle + the moshi crate"
+build = "build.rs" # compiles the NEON BFMMLA bf16 GEMM kernel (csrc/bf16_gemm.c) on aarch64
+
+[build-dependencies]
+cc = "1"
 
 [lib]
 name = "liquid_audio"
@@ -60,6 +64,17 @@ symphonia = { version = "0.5", features = ["all"] }
 arrow-array = "53"
 arrow-schema = "53"
 arrow-ipc = "53"
+# Intra-op thread-pool control to match torch's `at::intraop_default_num_threads`
+# (ATen ParallelCommon.cpp). candle's matmul (`gemm`) + conv/sort use rayon's GLOBAL
+# pool; we size it like torch — Apple-Silicon performance cores via `hw.perflevel0.
+# physicalcpu` (libc sysctl), NOT all logical cores (rayon/num_cpus default) which
+# would schedule compute-bound work onto the slow efficiency cores. See `threads.rs`.
+rayon = "1"
+num_cpus = "1"
+libc = "0.2"
+# `half::bf16` — read bf16 tensor lanes to feed the NEON BFMMLA GEMM kernel. Same
+# version candle uses, so cargo unifies to one `half`.
+half = "2"
 
 [dev-dependencies]
 anyhow = "1"
@@ -72,6 +87,10 @@ default = ["download"]
 download = ["dep:hf-hub"]
 # Mirrors the Python `module_exists("flash_attn")` optional path.
 flash-attn = []
+# Apple vecLib (Accelerate) BLAS for the CPU matmul path — torch's CPU backend on
+# Apple Silicon (multi-threaded, hand-tuned). Without it candle falls back to the
+# pure-Rust `gemm`; with it, CPU-mode matmul matches torch's throughput. macOS only.
+accelerate = ["candle-core/accelerate", "candle-nn/accelerate"]
 # Metal (Apple GPU) acceleration — bf16, the deployed dtype — for real-time
 # generation. Enables candle + moshi Metal kernels. `LFM_DEVICE=metal` at runtime.
 metal = ["candle-core/metal", "candle-nn/metal", "moshi/metal"]
