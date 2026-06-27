@@ -54,6 +54,14 @@ when `device==CPU && dtype==bf16`, and relax `loader.rs`'s bf16-on-CPU rejection
 model runs **bf16 natively on CPU** (Metal already does). The kernel + op are ready; this is
 the wiring.
 
+**Caution — this is a decision, not just wiring.** `loader.rs` *deliberately* runs f32 on CPU
+(`:108`, `:210`): the bf16→f32 weight upcast is lossless and f32 is the parity reference; bf16
+is the Metal/real-time path. Wiring bf16 through CPU means replacing `candle_nn::Linear` at
+dozens of sites across the backbone, depthformer, conformer, and detokenizer — a model-wide
+change to a hot path whose parity is verified at **6.558e-6**. So #25 must be done **with the
+model in the loop** (run `mic_chat`/the parity harness and confirm the numerics) — not as a
+blind sweep — and only if bf16-on-CPU is actually wanted over the faithful f32 path.
+
 ## 4. Realtime pipeline threading — DONE (worker pipeline + barge-in), task #24
 
 **Python**: `demo/chat.py` runs the sync generator on a **producer `Thread`** → `queue.Queue`

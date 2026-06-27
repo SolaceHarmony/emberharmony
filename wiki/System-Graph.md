@@ -94,12 +94,9 @@ flowchart LR
   model_lfm2_audio -->|"audio frame u32 codes (routed via proc…"| core_detokenizer
   model_lfm2_audio -->|"audio frame u32 codes → Mimi decode"| moshi_compression
   model_lfm2_backbone -->|"model-dtype last_hidden_state"| model_lfm2_audio
-  model_lfm2_backbone -->|"model-dtype hidden (same backbone arch…"| core_detokenizer
   model_mlp -->|"model dtype (bf16/f32)"| model_lfm2_audio
   model_transformer -->|"int audio frame (8,), codes 0..2048 (2…"| model_lfm2_audio
   model_transformer -->|"int/u32 audio codes 0..2047 per frame …"| core_processor
-  model_transformer -->|"int/u32 codes → f32 waveform @24kHz (L…"| core_detokenizer
-  model_transformer -->|"int/u32 codes → f32 waveform @24kHz (M…"| moshi_compression
   conformer_encoder -->|"model dtype (bf16/f32)"| model_lfm2_audio
   conformer_encoder -->|"model dtype (bf16/f32)"| model_mlp
   conformer_mha -->|"model dtype (bf16/f32)"| conformer_modules
