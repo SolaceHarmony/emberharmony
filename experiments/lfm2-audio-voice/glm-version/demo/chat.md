@@ -16,8 +16,17 @@ talk to the 1.5B model in real time without batching the whole reply into one
 WAV.
 
 ## How it works (Rust)
-The control flow is a single thread + a callback closure (no producer/consumer
-queue split, unlike the Python `Thread` + `queue.Queue`).
+The control flow here (`mic_chat.rs`) is a single thread + a callback closure (no
+producer/consumer queue split, unlike the Python `Thread` + `queue.Queue`) — **half-duplex**,
+like the Python `ReplyOnPause`/`can_interrupt=False` demo.
+
+> **There is now also a worker-thread path.** `src/realtime.rs` (`RealtimePipeline`) +
+> `examples/duplex_chat.rs` *do* have the producer/consumer split — a persistent inference
+> worker thread owns the model and talks to the consumer over `crossbeam-channel`, with live
+> capture (full-duplex) and explicit `AtomicBool` barge-in. That is the faithful analog of
+> `chat.py`'s `chat_producer` `Thread` + `queue.Queue`, extended toward `moshi/server.py`.
+> The full Python↔Rust threading dissection (torch intra/inter-op, the GIL, both demos) is in
+> **[`../threading.md`](../threading.md)**.
 
 **Turn-taking (hand-rolled energy VAD).** `record_utterance` (`mic_chat.rs:68`)
 reads from cpal, computes 200 ms RMS windows vs `LFM_VAD_THRESHOLD` (default
@@ -89,7 +98,7 @@ on_token)` consumes the `ChatState` fields; yields `GenToken::Text(u32)` and
 | Python (`chat.py`) | Rust (`mic_chat.rs`) | Difference | Why |
 |---|---|---|---|
 | `fastrtc.ReplyOnPause` (external VAD) | `record_utterance` energy VAD (`:68`) | **deliberate: hand-rolled VAD** | no fastrtc in Rust; hand-rolled RMS-window VAD. Both `can_interrupt=False`-equivalent. |
-| `Thread` + `queue.Queue` producer/consumer | single thread + callback closure (`generate_interleaved(&chat, &params, \|tok\| …)`, `:245`) | **deliberate: sync callback** | sync streaming generator → sync callback stream (PORT_STATUS §IO model). No queue: decode happens in the callback. |
+| `Thread` + `queue.Queue` producer/consumer | **two paths:** `mic_chat.rs` = single thread + callback closure (`:245`); `realtime.rs`/`duplex_chat.rs` = worker thread + `crossbeam-channel` | **`mic_chat`: sync callback; `realtime`: faithful producer/consumer** | `mic_chat` decodes in the callback (no queue). `realtime.rs` is the faithful `Thread`+`Queue` analog — worker owns the model, channels carry `VoiceEvent`s, **+ explicit barge-in**. See [`../threading.md`](../threading.md). |
 | `mimi.streaming(1)` + `mimi.decode(t[None,:,None])` | `mimi.reset_stream()` + `mimi.decode_step(codes (1,8,1))` (`:239`, `:263`) | **deliberate: moshi-crate reuse** | §2.3. Streaming codec state across frames. |
 | `wav / 32_768` f32 norm | cpal int16→f32 `/32768.0` (`:59`, `:97`) | identical | same int16→f32 convention. |
 | Gradio WebRTC sink, `yield (24000, int16)` | cpal output ring buffer + `resample_slice(24k→out_rate)` (`:206`, `:265`) | **deliberate: cpal** | Rust resamples Mimi's 24 kHz to the device rate; Gradio fixes both at 24 kHz. |

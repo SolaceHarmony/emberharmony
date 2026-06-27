@@ -54,27 +54,57 @@ when `device==CPU && dtype==bf16`, and relax `loader.rs`'s bf16-on-CPU rejection
 model runs **bf16 natively on CPU** (Metal already does). The kernel + op are ready; this is
 the wiring.
 
-## 4. Realtime pipeline threading — DESIGN (remaining, task #24)
+## 4. Realtime pipeline threading — DONE (worker pipeline + barge-in), task #24
 
 **Python**: `demo/chat.py` runs the sync generator on a **producer `Thread`** → `queue.Queue`
 → main relays to WebRTC playback (overlap gen+play; half-duplex via `ReplyOnPause`,
 `can_interrupt=False`). `moshi/server.py` is true full-duplex: 3 asyncio coroutines
 (recv/inference/send) + PortAudio callback threads.
 
-**Rust now**: `mic_chat.rs` runs `generate_interleaved` on **main**; cpal callback threads do
-I/O; `Arc<Mutex<VecDeque>>` ring for playback (gen overlaps play, but gen blocks main and the
-mic is dropped during generation — half-duplex).
+**Was**: `mic_chat.rs` ran `generate_interleaved` on **main**; cpal callback threads did I/O;
+`Arc<Mutex<VecDeque>>` ring for playback (gen overlapped play, but gen blocked main and the
+mic was dropped during generation — half-duplex).
 
-**Target**: a **persistent inference worker thread** (moshi's inference coroutine) that *owns*
-`model` + `mimi` and loops `recv utterance → prefill → generate (decode → send PCM)`; the
-capture stream stays **live** (full-duplex); barge-in via an `AtomicBool` the generate loop
-checks (needs the callback to return `ControlFlow`). Channels: `crossbeam-channel`.
-**Constraint:** the worker must *own* the model/decoder because `MimiDetokenizer` holds a
-`RefCell` (`!Sync`) — share nothing by `&` across threads; move them in, talk over channels.
-`AudioDetokenizer` then needs a `+ Send` bound. This belongs in the (not-yet-built) native
-voice loop (`voice_start`) more than the CLI example.
+**Now** (`src/realtime.rs`): a **persistent inference worker thread** ([`RealtimePipeline`])
+*owns* the model + processor + detokenizer (the [`VoiceEngine`] trait; real impl
+[`Lfm2VoiceEngine`]) and loops `recv `[`Utterance`]` → respond (emit text + decode audio →
+emit PCM) → TurnComplete`, talking to the consumer over **`crossbeam-channel`** ([`VoiceEvent`]
+stream). Because the model lives off the main thread, capture/playback stay live (full-duplex).
+**Barge-in** is an `AtomicBool` the generate loop polls — `generate_interleaved_cancellable`
+(`lfm2_audio.rs`) breaks the decode loop the moment `cancel` is set, so an interrupting
+utterance aborts the in-flight reply instead of running to `max_new_tokens`. The worker can own
+the model because `LFM2AudioModel`/`LFM2AudioProcessor` are now `Send` (the MLP + `AudioDetokenizer`
+`Send` fixes); nothing is shared by `&` across threads. `Drop` closes the channel and joins.
+
+The threading is **unit-tested with a fake engine** (`realtime::tests`): event ordering,
+worker persistence across turns, barge-in aborts the in-flight turn, engine errors are reported
+without killing the worker, and `Drop` joins + drops the engine. End-to-end full-duplex (live
+cpal capture, VAD-driven utterance boundaries, voice-onset-during-reply ⇒ barge-in + flush) is
+the **`duplex_chat`** example. (No acoustic echo cancellation yet — the assistant's own audio
+can re-trigger the mic VAD; headphones / higher `LFM_VAD_THRESHOLD` mitigate.)
+
+## 5. Python ↔ Rust threading-model comparison
+
+Full dissection in **`glm-version/threading.md`** (torch + `chat.py` + `moshi/server.py` vs the
+Rust port). Concurrency separates into **four layers** — keeping them apart is what prevents
+"why is Rust different" confusion:
+
+| Layer | torch / Python | Rust port | Verdict |
+|---|---|---|---|
+| **A · intra-op** (one matmul across cores) | ATen pool, P-cores (`intraop_default_num_threads`) | rayon global pool, sized by `threads.rs` | **parity** (verified 8 P-cores) |
+| **B · inter-op** (independent ops in parallel) | separate `at::launch` pool (default #CPUs) | none (candle is eager-sequential) | **N/A** — LFM2's graph is sequential, torch's pool is idle too |
+| **C · GIL** | GIL serializes Python; torch releases it inside C++ ops ⇒ threads overlap **only during** kernels | **no GIL** — worker ‖ consumer ‖ cpal callbacks overlap **always** | **Rust is more parallel** (overlap is unconditional) |
+| **D · pipeline** | `chat.py`: producer `Thread`+`queue.Queue`, half-duplex, no barge-in · `moshi/server.py`: 3 asyncio coroutines, 1 loop, cooperative, continuous-duplex | `realtime.rs`: worker thread owns model, `crossbeam` channels, **full-duplex + explicit `AtomicBool` barge-in** (`*_cancellable`) | **matched + extended** |
+| **E · audio I/O** | PortAudio/fastrtc/WebSocket callback threads | cpal real-time callback threads + ring | **equivalent** |
+
+The one remaining *structural* difference is a **model** difference, not a threading gap:
+Moshi's server is *continuously* full-duplex (its architecture processes in/out every frame),
+while LFM2-Audio is **turn-based interleaved** — the Rust pipeline is faithful to LFM2's turn
+model and adds explicit barge-in, rather than imposing Moshi's frame loop on it.
 
 ## Files
-`src/threads.rs`, `src/bf16_gemm.rs`, `csrc/bf16_gemm.c`, `build.rs`, `Cargo.toml`
-(`rayon`/`num_cpus`/`libc`/`half` deps, `cc` build-dep, `accelerate` feature),
-`src/loader.rs` (calls `configure_intraop_threads`; precise bf16 note), `src/lib.rs`.
+`src/threads.rs`, `src/bf16_gemm.rs`, `csrc/bf16_gemm.c`, `build.rs`, `src/realtime.rs`,
+`examples/duplex_chat.rs`, `Cargo.toml` (`rayon`/`num_cpus`/`libc`/`half`/`crossbeam-channel`
+deps, `cc` build-dep, `accelerate` feature), `src/model/lfm2_audio.rs`
+(`generate_interleaved_cancellable`), `src/loader.rs` (calls `configure_intraop_threads`;
+precise bf16 note), `src/lib.rs`.

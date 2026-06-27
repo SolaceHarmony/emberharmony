@@ -15,6 +15,7 @@ under `glm-version/` so they are safe from touches to the `ARCH/` tree.
 
 ```
 glm-version/
+├── threading.md                     # Python↔Rust threading models (torch intra/inter-op, GIL, chat.py/moshi vs realtime.rs)
 ├── utils.md                         # LFMModality, mel2emb_len, module_exists, get_model_dir
 ├── processor.md                     # LFM2AudioProcessor + ChatState (the I/O container)
 ├── detokenizer.md                   # LFM2AudioDetokenizer + Istft (the LFM2 ISTFT vocoder)
