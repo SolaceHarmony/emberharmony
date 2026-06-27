@@ -1,0 +1,59 @@
+name: Publish wiki
+
+# Manual only for now — run from the Actions tab (workflow_dispatch). The wiki
+# content lives in `wiki/**`; this regenerates the collapsible Home + _Sidebar
+# from each page's `<!-- topic: -->` tag and syncs `wiki/` to the repo's GitHub
+# Wiki (`<repo>.wiki.git`). Add `push:`/`schedule:` triggers later to publish
+# automatically. (Borrowed from qrad-knowledge/.github/workflows/publish-wiki.yml.)
+on:
+  workflow_dispatch:
+
+# Least-privilege: deny at the top level, grant only what the sync job needs.
+permissions: {}
+
+concurrency:
+  group: publish-wiki
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # required to push to <repo>.wiki.git
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Generate sidebar navigation
+        run: python tools/wiki/generate_sidebar.py --repo-root "$GITHUB_WORKSPACE"
+
+      - name: Generate Home page
+        run: python tools/wiki/generate_home.py --repo-root "$GITHUB_WORKSPACE"
+
+      - name: Publish wiki pages
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          wiki_dir="$(mktemp -d)"
+          git clone "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.wiki.git" "$wiki_dir"
+          rsync -a --delete --exclude '.git/' wiki/ "$wiki_dir"/
+          cd "$wiki_dir"
+          test -d .git
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Wiki is already up to date."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Sync wiki from repository"
+          git push
