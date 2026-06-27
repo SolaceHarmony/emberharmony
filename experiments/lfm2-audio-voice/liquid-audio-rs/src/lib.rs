@@ -19,6 +19,7 @@ pub mod detokenizer; // detokenizer.py
 pub mod loader; // config.json + safetensors → model + processor
 pub mod model;
 pub mod processor; // processor.py
+pub mod realtime; // multi-threaded worker pipeline (chat.py producer/consumer threading)
 pub mod resample; // torchaudio.functional.resample (windowed-sinc) port
 pub mod threads; // intra-op thread-pool parity with torch (at::intraop_default_num_threads)
 pub mod trainer; // trainer.py

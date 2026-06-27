@@ -75,6 +75,11 @@ libc = "0.2"
 # `half::bf16` — read bf16 tensor lanes to feed the NEON BFMMLA GEMM kernel. Same
 # version candle uses, so cargo unifies to one `half`.
 half = "2"
+# MPSC channels for the realtime worker-thread pipeline (`realtime.rs`) — the Rust
+# analog of `chat.py`'s `queue.Queue` between the inference producer and the playback
+# consumer. crossbeam over `std::sync::mpsc` for `recv_timeout`/`select` and `Sync`
+# receivers; its `crossbeam-utils` is already in-tree via rayon, so no new subtree.
+crossbeam-channel = "0.5"
 
 [dev-dependencies]
 anyhow = "1"

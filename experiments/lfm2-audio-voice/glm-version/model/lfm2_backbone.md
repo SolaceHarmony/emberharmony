@@ -6,6 +6,15 @@
 > Rust port as the readable spec; this documents the Rust port
 > (`liquid-audio-rs/src/model/lfm2_hf.rs`) directly and where it diverges from
 > the HF Python source.
+>
+> **As-built update (Claude's mask memoization + vendored helpers):** the
+> hand-rolled `causal_mask`/`repeat_kv` have been replaced with the vendored
+> `build_causal_mask`/`repeat_kv` from candle-transformers' `lfm2.rs` (the
+> reference this port was copied from), and causal masks are now memoized per
+> `(seq_len, kv_len)` shape via `Cache::mask` (built once, reused across all 6
+> attention layers × every decode step). A prior zero-copy `KvCache` swap was
+> **reverted** as a deviation — the faithful `Tensor::cat` KV cache is restored.
+> See [`AS_BUILT_claude_changes.md`](../AS_BUILT_claude_changes.md) §5.
 
 ## Role
 `lfm2_hf::Model` (`lfm2_hf.rs:381`) is the LFM2 **hybrid backbone** in the Rust

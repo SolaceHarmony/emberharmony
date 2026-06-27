@@ -20,8 +20,15 @@
 //!   on `Device::Cpu` (LFM2's "no GPU needed" design point, which the CUDA-gated
 //!   reference stack cannot deliver as shipped). Verified: backbone parity 6.558e-6.
 
+use std::collections::HashMap;
+
 use candle_core::{DType, Device, IndexOp, Result, Tensor};
 use candle_nn::{embedding, linear_no_bias, Conv1d, Conv1dConfig, Embedding, Linear, Module, VarBuilder};
+
+// The exact two `crate::utils::*` helpers candle-transformers' `models/lfm2.rs` imports,
+// vendored onto the 0.9.2 pin (see `candle_ext`). Using the reference helpers — not a
+// hand-rolled `causal_mask`/`repeat_kv` — keeps this a faithful port.
+use crate::candle_ext::transformers_utils::{build_causal_mask, repeat_kv};
 
 // The differentiable RMSNorm (basic ops), NOT candle_nn::RmsNorm — whose `forward`
 // calls the fused `ops::rms_norm` (`apply_op2_no_bwd`) on contiguous inputs and so
@@ -101,12 +108,19 @@ impl Lfm2Config {
 }
 
 /// KV + conv-state cache plus the rotary tables.
+///
+/// Mirrors candle-transformers' `lfm2.rs` `Cache`, including the `masks` memo: each
+/// causal mask is built once per `(seq_len, kv_len)` shape and reused across every
+/// attention layer and decode step, instead of being reconstructed on every call.
 pub struct Cache {
     pub use_kv_cache: bool,
     kvs: Vec<Option<(Tensor, Tensor)>>,
     conv_states: Vec<Option<Tensor>>,
+    // Memoized boolean causal masks, keyed by (seq_len, kv_len) — see `mask`.
+    masks: HashMap<(usize, usize), Tensor>,
     cos: Tensor,
     sin: Tensor,
+    device: Device,
 }
 
 impl Cache {
@@ -128,37 +142,42 @@ impl Cache {
             use_kv_cache,
             kvs: vec![None; cfg.num_hidden_layers],
             conv_states: vec![None; cfg.num_hidden_layers],
+            masks: HashMap::new(),
             cos,
             sin,
+            device: device.clone(),
         })
+    }
+
+    /// Memoized boolean causal mask `(seq_len, kv_len)`, faithful to `lfm2.rs`'s
+    /// `Cache::mask`: build once per shape via the vendored [`build_causal_mask`], reuse
+    /// for every attention layer and every decode step. The mask only depends on the
+    /// `(seq_len, index_pos)` geometry, so caching by `(seq_len, kv_len)` is exact.
+    fn mask(&mut self, seq_len: usize, index_pos: usize) -> Result<Tensor> {
+        let kv_len = index_pos + seq_len;
+        if let Some(mask) = self.masks.get(&(seq_len, kv_len)) {
+            Ok(mask.clone())
+        } else {
+            let mask = build_causal_mask(seq_len, index_pos, &self.device)?;
+            self.masks.insert((seq_len, kv_len), mask.clone());
+            Ok(mask)
+        }
     }
 
     pub fn clear(&mut self) {
         self.kvs.iter_mut().for_each(|v| *v = None);
         self.conv_states.iter_mut().for_each(|v| *v = None);
+        // `masks` are shape-keyed and turn-independent, so they survive `clear` (a fresh
+        // turn reuses the same geometry) — matching the reference, which never drops them.
     }
 }
 
-fn repeat_kv(x: Tensor, n_rep: usize) -> Result<Tensor> {
-    if n_rep == 1 {
-        return Ok(x);
-    }
-    let (b, h, t, d) = x.dims4()?;
-    x.unsqueeze(2)?.expand((b, h, n_rep, t, d))?.reshape((b, h * n_rep, t, d))
-}
-
-/// Additive causal mask `(seq_len, kv_len)`, `kv_len = index_pos + seq_len`.
-fn causal_mask(seq_len: usize, index_pos: usize, device: &Device) -> Result<Tensor> {
-    let kv = index_pos + seq_len;
-    let mut data = vec![0f32; seq_len * kv];
-    for i in 0..seq_len {
-        for j in 0..kv {
-            if j > i + index_pos {
-                data[i * kv + j] = f32::NEG_INFINITY;
-            }
-        }
-    }
-    Tensor::from_vec(data, (seq_len, kv), device)
+/// `masked_fill` (candle-transformers `lfm2.rs`): keep `on_false` where `mask` is zero,
+/// substitute the scalar `on_true` where `mask` is nonzero — the boolean-mask way to set
+/// future positions to `-inf` before the softmax (equivalent to an additive `-inf` mask).
+fn masked_fill(on_false: &Tensor, mask: &Tensor, on_true: f32) -> Result<Tensor> {
+    let on_true = Tensor::new(on_true, on_false.device())?.broadcast_as(mask.shape())?;
+    mask.where_cond(&on_true, on_false)
 }
 
 struct Mlp {
@@ -257,9 +276,15 @@ impl Attention {
         let v = v.to_dtype(DType::F32)?;
         let att = (q.matmul(&k.t()?)? / (self.head_dim as f64).sqrt())?;
         let att = match add_mask {
+            // Detokenizer's sliding window: an *additive* f32 mask supplied by the caller
+            // (our documented deviation — the reference has no custom-mask path).
             Some(m) => att.broadcast_add(&m.to_dtype(DType::F32)?)?,
             None if seq_len == 1 => att,
-            None => att.broadcast_add(&causal_mask(seq_len, index_pos, q.device())?)?,
+            // Causal: the reference's memoized boolean mask + masked_fill(-inf).
+            None => {
+                let mask = cache.mask(seq_len, index_pos)?.broadcast_as(att.shape())?;
+                masked_fill(&att, &mask, f32::NEG_INFINITY)?
+            }
         };
         // `softmax` (differentiable), NOT `softmax_last_dim` (fused no_bwd): backbone
         // attention is trained. Same forward values.

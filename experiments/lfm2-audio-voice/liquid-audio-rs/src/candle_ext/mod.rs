@@ -18,6 +18,14 @@
 //! - [`loss::cross_entropy_none`] — `nn.functional.cross_entropy(reduction="none")`,
 //!   the per-row form candle's mean-reducing [`candle_nn::loss::cross_entropy`] does
 //!   not provide. Written in candle's `loss.rs` style.
+//! - [`transformers_utils::build_causal_mask`] / [`transformers_utils::repeat_kv`] —
+//!   verbatim backport from `candle-transformers` `src/utils.rs`; the exact two
+//!   `crate::utils::*` helpers upstream `models/lfm2.rs` imports, so the backbone port
+//!   uses the reference helpers rather than a hand-rolled substitute.
+//! - [`tensor_ext::TensorExt::to_vec4`] — the rank-4 rung candle's `to_vecN` ladder
+//!   stops short of (absent in 0.9.2 *and* 0.10.2); built from candle's public ops.
 
 pub mod kv_cache;
 pub mod loss;
+pub mod tensor_ext;
+pub mod transformers_utils;

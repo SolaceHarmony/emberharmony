@@ -1,0 +1,70 @@
+name: Rust voice (liquid-audio-rs)
+run-name: rust-voice ${{ github.ref_name }} @ ${{ github.sha }}
+
+# Formalizes the liquid-audio-rs test suite in the build: every change to the crate
+# (or this workflow) builds + runs `cargo test` on both x86_64 Linux and arm64 macOS.
+# The macOS arm64 runner is where the hardware-specific paths actually execute — the
+# NEON BFMMLA bf16 GEMM kernel (FEAT_BF16) and the torch-parity intra-op thread policy
+# (`hw.perflevel0.physicalcpu`); on Linux those self-skip / fall back to physical cores,
+# so the run still proves the cfg fallbacks compile and the portable tests pass.
+
+on:
+  push:
+    paths:
+      - "experiments/lfm2-audio-voice/liquid-audio-rs/**"
+      - ".github/workflows/rust-voice.yml"
+  pull_request:
+    branches: [dev, main]
+    paths:
+      - "experiments/lfm2-audio-voice/liquid-audio-rs/**"
+      - ".github/workflows/rust-voice.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-voice-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+    working-directory: experiments/lfm2-audio-voice/liquid-audio-rs
+
+jobs:
+  test:
+    name: build + test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest] # macos-latest is arm64 → real BFMMLA + perflevel0
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust (stable)
+        run: rustup update stable && rustup default stable && rustc -V
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: experiments/lfm2-audio-voice/liquid-audio-rs
+
+      # cpal (dev-dep, used by the mic_chat example/tests) needs ALSA headers on Linux.
+      - name: Linux audio deps (cpal/ALSA)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+
+      - name: Build (lib + examples + tests)
+        run: cargo build --all-targets
+
+      - name: Test (lib)
+        run: cargo test --lib -- --nocapture
+
+      # macOS only: the Accelerate (vecLib BLAS) CPU-matmul path is the torch backend on
+      # Apple Silicon. Compile-check it so the feature wiring can't rot unnoticed.
+      - name: Compile-check Accelerate feature (macOS)
+        if: runner.os == 'macOS'
+        run: cargo build --lib --features accelerate

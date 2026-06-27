@@ -4,6 +4,13 @@
 > Companion to [`ARCH/model/mlp.md`](../../ARCH/model/mlp.md). The original
 > documents the Python `MLP(nn.Module)`; this documents the Rust `struct MLP`
 > and where it diverges from the source.
+>
+> **As-built update (Claude's `Send` fix):** `MLP` now holds
+> `Vec<Box<dyn Module + Send>>` instead of `candle_nn::Sequential` (whose
+> `Vec<Box<dyn Module>>` is not `Send`), so `LFM2AudioModel: Send` and the model
+> can move to a worker thread. The forward is a manual left fold; the
+> `model.{idx}` weight paths are unchanged. See
+> [`AS_BUILT_claude_changes.md`](../AS_BUILT_claude_changes.md) §3.
 
 ## Role
 Identical purpose: a small, generic feed-forward stack that LFM2-Audio

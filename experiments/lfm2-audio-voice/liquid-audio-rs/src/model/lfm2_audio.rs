@@ -12,6 +12,8 @@
 //! `logits /= temperature`, top-k mask (keep ≥ the k-th largest, rest → -inf),
 //! softmax, and `torch.multinomial`-equivalent draw via a seeded `StdRng`.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use candle_core::{DType, IndexOp, Result, Tensor};
 use candle_nn::{linear, Linear, Module, VarBuilder};
 use candle_transformers::generation::{LogitsProcessor, Sampling};
@@ -855,11 +857,42 @@ impl LFM2AudioModel {
         self.generate_from_embeds(in_emb, params, on_token)
     }
 
+    /// `generate_interleaved` with a **barge-in** signal: the loop polls `cancel` at the
+    /// top of every decode step and returns early once it is set. This is the
+    /// consumer-stops-the-generator semantics of the Python path (whose generator simply
+    /// stops being iterated) made explicit for the worker-thread pipeline — when a new
+    /// utterance arrives the realtime worker flips `cancel` and generation aborts mid-stream
+    /// instead of running to `max_new_tokens` and wasting the P-cores.
+    pub fn generate_interleaved_cancellable<F: FnMut(GenToken)>(
+        &self,
+        chat: &ChatState,
+        params: &GenParams,
+        cancel: &AtomicBool,
+        on_token: F,
+    ) -> Result<()> {
+        let in_emb = self.prefill(chat)?;
+        self.generate_from_embeds_cancellable(in_emb, params, cancel, on_token)
+    }
+
     /// The interleaved generation loop given the prefill embeds directly (Python
     /// `generate_interleaved` after `_prefill`). Exposed so it can be driven from raw
     /// model inputs (`prefill_inputs`) for the end-to-end `generate_interleaved_parity`
     /// golden, not just a `ChatState`.
-    pub fn generate_from_embeds<F: FnMut(GenToken)>(&self, mut in_emb: Tensor, params: &GenParams, mut on_token: F) -> Result<()> {
+    pub fn generate_from_embeds<F: FnMut(GenToken)>(&self, in_emb: Tensor, params: &GenParams, on_token: F) -> Result<()> {
+        // Never-set flag ⇒ identical behavior to before (one relaxed atomic load per step
+        // is negligible next to a transformer block).
+        self.generate_from_embeds_cancellable(in_emb, params, &AtomicBool::new(false), on_token)
+    }
+
+    /// [`generate_from_embeds`] with a barge-in `cancel` signal — see
+    /// [`generate_interleaved_cancellable`](Self::generate_interleaved_cancellable).
+    pub fn generate_from_embeds_cancellable<F: FnMut(GenToken)>(
+        &self,
+        mut in_emb: Tensor,
+        params: &GenParams,
+        cancel: &AtomicBool,
+        mut on_token: F,
+    ) -> Result<()> {
         let mut index_pos = 0usize;
         let mut cache = LfmCache::new(true, in_emb.dtype(), &self.lfm_cfg, in_emb.device())?;
         let mut text_sampler = Sampler::new(params.seed, params.text_temperature, params.text_top_k);
@@ -870,6 +903,10 @@ impl LFM2AudioModel {
         let mut text_done = false;
 
         for _ in 0..params.max_new_tokens {
+            // Barge-in: a new utterance asked us to stop — drop this reply mid-stream.
+            if cancel.load(Ordering::Acquire) {
+                break;
+            }
             modality_left -= 1;
             let seq_len = in_emb.dim(1)?;
             let h = self.lfm.forward_embeds(&in_emb, index_pos, &mut cache, None)?; // (1, seq, D)

@@ -44,6 +44,18 @@ glm-version/
     └── model.md                      # demo/model.py — NOT ported (loader.rs/mic_chat.rs replace it)
 ```
 
+## As-built changes by Claude
+
+[`AS_BUILT_claude_changes.md`](AS_BUILT_claude_changes.md) documents the
+threading, bf16 BFMMLA kernel, `Send` fixes, mask memoization, and `to_vec4`
+extension Claude made to `liquid-audio-rs` across multiple sessions. These are
+**not** part of the original Python port — they are execution-model parity work
+(matching torch's intra-op thread policy, closing candle's CPU bf16-matmul gap,
+and memoizing causal masks to eliminate per-call construction cost). A prior
+zero-copy `KvCache` swap was reverted as a deviation from the reference. The
+relevant per-module docs (`mlp.md`, `lfm2_backbone.md`) have been updated with
+cross-references to the as-built doc.
+
 ## What these docs are (and aren't)
 
 - **Are:** Rust-first architecture docs. Each file documents the Rust source

@@ -22,7 +22,10 @@ use crate::detokenizer::LFM2AudioDetokenizer;
 ///
 /// Required method (`decode`) ⇒ every backend must provide it (the compile-time
 /// "force the override"); `sample_rate` is a default a backend may override.
-pub trait AudioDetokenizer {
+// `Send` so the processor (and thus the model bundle) can move to a dedicated inference
+// worker thread — the realtime full-duplex pipeline owns it there rather than sharing by
+// `&` (the Mimi backend holds a `!Sync` `RefCell`). Both backends are `Send`.
+pub trait AudioDetokenizer: Send {
     fn decode(&self, codes: &Tensor) -> Result<Tensor>;
     fn sample_rate(&self) -> u32 {
         24_000

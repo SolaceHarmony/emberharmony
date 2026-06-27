@@ -4,6 +4,12 @@
 > Companion to [`ARCH/detokenizer.md`](../ARCH/detokenizer.md). The original
 > documents the Python `LFM2AudioDetokenizer` + `Istft`; this documents the Rust
 > port and where it diverges.
+>
+> **As-built update (Claude's mask memoization):** the detokenizer's backbone
+> forward now benefits from the `Cache::mask` memoization (causal masks built
+> once per shape, reused across layers). The detokenizer uses `use_kv_cache =
+> false` so no KV append happens. See
+> [`AS_BUILT_claude_changes.md`](AS_BUILT_claude_changes.md) §5.
 
 ## Role
 `LFM2AudioDetokenizer` (`detokenizer.rs:181`) is the high-quality audio-out
