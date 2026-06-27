@@ -56,7 +56,7 @@ There is **no normalization, attention, RoPE, convolution, or RVQ math in this f
 **Internal calls (consumed by this, not "downstream" of its tensor output):**
 - [moshi_lm](MM03-Moshi-LM) — `LMGen.step` does the actual transformer forward; this file feeds it `input_tokens [B,missing,1]` int64 and reads back `frame [B,1+Q,1]` int64. The text-stream mux (`(second+1)*card+output`) is de-muxed by lm.py's `EmbeddingFactory`.
 - [moshi_compression](MM01-Mimi-Codec) — `mimi.encode` (prefix path, wav f32 → codes int) and `mimi.decode(frame[:,1:,:])` (in `warmup`, codes int → waveform f32 @ 24 kHz).
-- [moshi_cond_text](CN02-Text-Conditioner) / [moshi_cond_tensors](CN03-Tensor-Conditioner) — `LUTConditioner` (cfg) and `TensorCondition` (`speaker_wavs`) consumed via `lm.condition_provider.prepare_and_provide`.
+- [moshi_cond_text](Moshi-Conditioners) / [moshi_cond_tensors](Moshi-Conditioners) — `LUTConditioner` (cfg) and `TensorCondition` (`speaker_wavs`) consumed via `lm.condition_provider.prepare_and_provide`.
 
 **Downstream (consumes this component's output):**
 - `TTSResult.frames` (`list[[B,1+Q,1]]` int64) → [moshi_compression](MM01-Mimi-Codec) `MimiModel.decode` to produce the f32 @ 24 kHz waveform (the standalone `moshi/run_tts.py` driver does this). On the LFM2-Audio path nothing consumes this — it is a self-contained Moshi-TTS subsystem.

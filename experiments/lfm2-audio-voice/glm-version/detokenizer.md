@@ -6,7 +6,7 @@
 > port and where it diverges.
 
 ## Role
-`LFM2AudioDetokenizer` (`detokenizer.rs:158`) is the high-quality audio-out
+`LFM2AudioDetokenizer` (`detokenizer.rs:181`) is the high-quality audio-out
 vocoder for LFM2.5 models in the Rust port: it turns the 8-codebook discrete
 audio codes emitted by the depthformer head into a 24 kHz mono waveform. Unlike
 Mimi (the codec the codes were *encoded* from, also the v1/streaming decoder),
@@ -32,15 +32,18 @@ x.broadcast_add(&offsets)` → `(B, L, 8)`, `flat = offset_x.reshape((B*L*8,))`,
 So the per-frame embedding is the *average* of the 8 per-codebook embeddings,
 not a concat — the RVQ residual structure is collapsed by averaging.
 
-**2. ×6 upsample + LFM2 backbone (`detokenizer.rs:192`).** `x.unsqueeze(2)?
+**2. ×6 upsample + LFM2 backbone (`detokenizer.rs:205`).** `x.unsqueeze(2)?
 .broadcast_as((B, L, 6, D))?.reshape((B, 6L, D))` repeat-interleaves each frame
-6× (`:197`) — nearest-exact at an integer factor is exactly repeat-interleave.
+6× (`:210`) — nearest-exact at an integer factor is exactly repeat-interleave.
 This bridges the code frame-rate (Mimi's 12.5 Hz acoustic rate) up to the
 detokenizer backbone's internal rate so the subsequent STFT inverts to 24 kHz.
 The backbone is the in-tree `lfm2_hf::Model` (hybrid short-conv + GQA, RMSNorm,
 SwiGLU, RoPE — see [`glm-version/model/lfm2_backbone.md`](model/lfm2_backbone.md)),
 run with `Cache::new(false, …)` (no KV cache) and an **explicit additive
-attention mask** built in `sliding_mask` (`:177`): `d = j - i`; attend where
+attention mask** built in `build_sliding_mask` **on-device with vectorized candle
+ops** (`arange` + `broadcast_sub` + `le`/`gt` + `where_cond`) — a faithful port of
+Python's `detokenizer.py:126-128` (`idx - idx[:,None]`, `(d<=0)&(d>-w)`), **not** a
+host-side scalar loop + `Tensor::from_vec` host→device copy. `d = j - i`; attend where
 `d <= 0 && d > -w` (window default 30); `-inf` elsewhere. That is a causal band
 — token *i* attends to *j* iff `i - sliding_window < j <= i`. Critically, the
 loader rewrites `layer_types` `"sliding_attention"→"full_attention"`
@@ -49,11 +52,11 @@ turned off so this module's hand-built band mask is the *sole* windowing.
 `forward_embeds(&x, 0, &mut cache, Some(&mask))` → `last_hidden_state`
 `(B, 6L, 512)`.
 
-**3. `Linear` → complex spectrogram (`detokenizer.rs:203`).** `lin = linear(512,
+**3. `Linear` → complex spectrogram (`detokenizer.rs:218`).** `lin = linear(512,
 1282, …)` → `(B, 6L, 1282)`. Transpose to `(B, 1282, 6L)` and `narrow` into
 `log_abs` and `angle`, each `(B, 641, 6L)` (641 = n_fft/2+1 = 1280/2+1). The
 complex spectrum is `abs = log_abs.exp()`, `re = abs * angle.cos()`, `im = abs *
-angle.sin()` (`:211-213`) — i.e. magnitude `exp(log_abs)` (the head predicts
+angle.sin()` (`:224-226`) — i.e. magnitude `exp(log_abs)` (the head predicts
 log-magnitude so the exp guarantees a positive modulus) at phase `angle`.
 
 **4. `Istft`, "same" padding (`detokenizer.rs:54`).** n_fft=1280, hop=320,
@@ -116,10 +119,10 @@ alternative audio-out backend for the same codes is `MimiDetokenizer`
 | Python (`detokenizer.py`) | Rust (`detokenizer.rs`) | Difference | Why |
 |---|---|---|---|
 | `FusedEmbedding.forward` (`offsets[:,None]+x`, codebooks axis=1, `.mean(1)`) | `FusedEmbedding::forward` (codebooks **last**, `(B, L, 8)`, `.mean(2)`, `:40-48`) | **deliberate: transposed layout** | Rust takes `(B, L, 8)`, Python takes `(B, 8, T)`; both reduce the codebook axis. The Rust layout matches how `processor.decode` reshapes the codes. |
-| `Lfm2Model` (external HF) | `lfm2_hf::Model` (`:170`) | **deliberate: in-tree port** | external `transformers.Lfm2Model` → in-tree `lfm2_hf.rs` (the readable spec). `Cache::new(false, …)` (no KV cache); `forward_embeds(&x, 0, &mut cache, Some(&mask))`. |
-| `interpolate(..., mode="nearest-exact")` ×6 | `unsqueeze→broadcast_as→reshape` repeat-interleave ×6 (`:197`) | **deliberate: repeat-interleave** | nearest-exact at an integer factor is exactly repeat-interleave. |
-| sliding mask `(d<=0)&(d>-w)` bool | `sliding_mask` additive `0 / -inf` `(1,1,n,n)` f32 (`:177-189`) | **deliberate: bool → additive** | the port's eager-SDPA convention (matches `mha.rs`'s `masked_softmax` using `where_cond`). |
-| `torch.polar(exp(log_abs), angle)` | `abs=exp; re=abs·cos; im=abs·sin` (`:211-213`) | **deliberate: explicit polar** | candle has no `torch.polar`; built explicitly. The bf16→f32 upcast is made explicit (`:131-133`). |
+| `Lfm2Model` (external HF) | `lfm2_hf::Model` (`:191`) | **deliberate: in-tree port** | external `transformers.Lfm2Model` → in-tree `lfm2_hf.rs` (the readable spec). `Cache::new(false, …)` (no KV cache); `forward_embeds(&x, 0, &mut cache, Some(&mask))`. |
+| `interpolate(..., mode="nearest-exact")` ×6 | `unsqueeze→broadcast_as→reshape` repeat-interleave ×6 (`:210`) | **deliberate: repeat-interleave** | nearest-exact at an integer factor is exactly repeat-interleave. |
+| sliding mask: `idx - idx[:,None]`, `(d<=0)&(d>-w)` **bool, built on-device** (`detokenizer.py:126-128`, vectorized) | `build_sliding_mask`: same `arange`/`broadcast_sub`/`le`/`gt` **on-device**, then `where_cond` → additive `0 / -inf` `(1,1,n,n)` | **only the convention differs: bool → additive** | candle's eager-SDPA *adds* the mask (`lfm2_hf.rs:260`), so 0/−inf instead of a bool keep-mask. **Construction is identical**: vectorized on the model device, rebuilt every forward (stateless), no host loop / host→device copy. (An earlier host-side double-loop + `Tensor::from_vec` was the real deviation — O(n²) CPU + per-frame transfer with `n=6L`; replaced and parity-locked by `sliding_mask_matches_reference_band`.) |
+| `torch.polar(exp(log_abs), angle)` | `abs=exp; re=abs·cos; im=abs·sin` (`:224-226`) | **deliberate: explicit polar** | candle has no `torch.polar`; built explicitly. The bf16→f32 upcast is made explicit (`:131-133`). |
 | `torch.fft.irfft(spec, n_fft, dim=1, norm="backward")` | inverse-DFT **basis matmul** `y = Re·cw + Im·sw` (`:131-135`) | **deliberate: DFT-basis matmul, not FFT** | §2.9. Cooley-Tukey FFT → DFT-basis matmul; Hermitian weights `a_k` (DC/Nyquist ×1, rest ×2), `1/n` folded into the basis. Device-resident (runs on Metal/GPU). |
 | `F.fold(..., stride=hop)` overlap-add | `conv_transpose1d` with identity kernel `(n_fft, 1, n_fft)`, stride=hop (`:139`) | **deliberate: `conv_transpose1d`** | `F.fold` overlap-add ≡ `conv_transpose1d` with an identity kernel. candle has no `F.fold`; `conv_transpose1d` is the faithful equivalent. |
 | window-envelope normalize via `F.fold` | `win_sq.broadcast_as(…).conv_transpose1d(&ola, …)` (`:141-146`) | identical (same overlap-add) | — |
@@ -128,7 +131,7 @@ alternative audio-out backend for the same codes is `MimiDetokenizer`
 **Deliberate divergences** (PYTHON_VS_RUST.md §2.9, §2.10): both FFTs are
 **candle-native ports run in f32 on the model device** (CPU or Metal), not an
 external FFT lib — `rustfft` was dropped. Validated `== f64 reference at
-1.4e-7` (the `candle_istft_matches_f64_reference` test at `:254`) and
+1.4e-7` (the `candle_istft_matches_f64_reference` test at `:267`) and
 end-to-end on the full HF snapshot at Metal/bf16. §2.10 documents that an
 f64/double-double detour was **reverted** — torch's irfft is f32 (MPS
 `HermiteanToRealFFTWithTensor` is f32-only) and the net was trained against f32,
@@ -144,9 +147,21 @@ so f64 would be out-of-distribution precision; f32 is the faithful match.
   separable downstream. This is the deliberate RVQ-collapse, not a bug.
 - **Sliding mask is this module's, not the backbone's.** The `layer_types`
   rename to `full_attention` (in `loader.rs`) disables HF per-layer sliding so
-  the explicit band mask (window 30, `sliding_mask` at `:177`) is
-  authoritative. Miss this and the backbone double-masks. The mask is additive
-  (`0 / -inf`), matching the port's eager-SDPA convention.
+  the explicit band mask (window 30, `build_sliding_mask`) is authoritative. Miss
+  this and the backbone double-masks. The mask is additive (`0 / -inf`), matching
+  the port's eager-SDPA convention.
+- **Mask is built on the device, every forward — like Python.** `build_sliding_mask`
+  uses `arange`/`broadcast_sub`/`le`/`gt`/`where_cond`, so the `(1,1,6L,6L)` band is
+  constructed on the model device (CPU/Metal) with **no host loop and no host→device
+  copy** — a faithful port of `detokenizer.py:126-128`. `n = 6·L` grows with the reply
+  and this runs on every forward, so the prior host-side scalar double-loop +
+  `Tensor::from_vec` was an O(n²) CPU loop + per-frame transfer; the device build
+  removes it. **Stateless (no cache), matching Python** — a `RefCell<Option<Tensor>>`
+  cache would be a *further, non-Python* optimization (faster via cross-call reuse, but
+  watch the strided-narrow into `broadcast_add` and `alloc_n = n.max(2048)` reallocating
+  every frame once `n>2048`, i.e. past ~341 code frames). Note the main backbone's
+  `causal_mask` (`lfm2_hf.rs:151`) still uses the host-loop form, but there `q_len=1`
+  during decode so its mask is `1×kv` (tiny) — only this full-sequence `n×n` mask grew.
 - **f32 FFT floor.** The cross-library residual on the ISTFT is f32-level (`==
   f64 ref 1.4e-7`, pinned by `candle_istft_matches_f64_reference`); it is
   faithful to torch's f32 irfft, *not* bit-identical to pocketfft. Going below

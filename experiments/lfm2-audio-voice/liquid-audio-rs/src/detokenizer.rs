@@ -154,6 +154,29 @@ impl Istft {
     }
 }
 
+/// Additive sliding-window causal mask `(1,1,n,n)`: attend where `i-w < j <= i`.
+///
+/// Built **on-device** with vectorized candle ops — a faithful port of Python's
+/// `detokenizer.py:126-128` (`idx - idx[:,None]`, then `(d<=0) & (d>-w)`), *not* a
+/// host-side scalar double-loop + `Tensor::from_vec` host→device copy. Since `n = 6·L`
+/// grows with the reply and this runs on every forward pass, the GPU build avoids an
+/// O(n²) CPU loop and a per-frame host→device transfer. Stateless, exactly like Python.
+fn build_sliding_mask(n: usize, sliding_window: usize, device: &candle_core::Device) -> Result<Tensor> {
+    use candle_core::DType;
+    let w = sliding_window as i64;
+    let idx = Tensor::arange(0i64, n as i64, device)?; // (n,)
+    // d[i][j] = idx[j] - idx[i] = j - i  (broadcast (1,n) - (n,1))
+    let d = idx.reshape((1, n))?.broadcast_sub(&idx.reshape((n, 1))?)?;
+    // attend = (d <= 0) & (d > -w), as u8 (1 = attend); `&` via where_cond to avoid u8 mul
+    let attend = d
+        .le(0i64)?
+        .where_cond(&d.gt(-w)?, &Tensor::zeros((n, n), DType::U8, device)?)?;
+    // additive mask: 0 where attend, -inf elsewhere (matches the eager-SDPA convention)
+    let neg = Tensor::full(f32::NEG_INFINITY, (n, n), device)?;
+    let zeros = Tensor::zeros((n, n), DType::F32, device)?;
+    attend.where_cond(&zeros, &neg)?.reshape((1, 1, n, n))
+}
+
 /// `LFM2AudioDetokenizer`: codes → 24 kHz waveform.
 pub struct LFM2AudioDetokenizer {
     emb: FusedEmbedding,
@@ -173,19 +196,9 @@ impl LFM2AudioDetokenizer {
         Ok(Self { emb, lfm, lfm_cfg: backbone_cfg, lin, istft, sliding_window })
     }
 
-    /// Additive sliding-window causal mask `(1,1,n,n)`: attend where `i-w < j <= i`.
+    /// Additive sliding-window causal mask `(1,1,n,n)` — see [`build_sliding_mask`].
     fn sliding_mask(&self, n: usize, device: &candle_core::Device) -> Result<Tensor> {
-        let w = self.sliding_window as i64;
-        let mut data = vec![0f32; n * n];
-        for i in 0..n {
-            for j in 0..n {
-                let d = j as i64 - i as i64;
-                if !(d <= 0 && d > -w) {
-                    data[i * n + j] = f32::NEG_INFINITY;
-                }
-            }
-        }
-        Tensor::from_vec(data, (1, 1, n, n), device)
+        build_sliding_mask(n, self.sliding_window, device)
     }
 
     /// `codes`: (B, L, codebooks) → waveform (1, samples).
@@ -283,5 +296,31 @@ mod tests {
         let scale = exp.iter().fold(0f32, |m, &x| m.max(x.abs())).max(1e-6);
         eprintln!("candle ISTFT vs f64 ref: max diff {maxd:.2e} (rel {:.2e})", maxd / scale);
         assert!(maxd / scale < 1e-4, "candle ISTFT vs f64 ref rel {}", maxd / scale);
+    }
+
+    #[test]
+    fn sliding_mask_matches_reference_band() {
+        let dev = Device::Cpu;
+        for (n, w) in [(7usize, 3usize), (13, 5), (20, 30)] {
+            // Reference = the former host-loop definition: additive 0 where
+            // (j<=i && j>i-w), -inf elsewhere.
+            let mut exp = vec![0f32; n * n];
+            for i in 0..n {
+                for j in 0..n {
+                    let d = j as i64 - i as i64;
+                    if !(d <= 0 && d > -(w as i64)) {
+                        exp[i * n + j] = f32::NEG_INFINITY;
+                    }
+                }
+            }
+            let m = build_sliding_mask(n, w, &dev).unwrap();
+            assert_eq!(m.dims(), &[1, 1, n, n]);
+            let got: Vec<f32> = m.reshape((n, n)).unwrap().flatten_all().unwrap().to_vec1().unwrap();
+            for (k, (&g, &e)) in got.iter().zip(exp.iter()).enumerate() {
+                let same = (g == e)
+                    || (g.is_infinite() && e.is_infinite() && g.is_sign_negative() == e.is_sign_negative());
+                assert!(same, "mask mismatch at {k} (n={n}, w={w}): got {g}, exp {e}");
+            }
+        }
     }
 }

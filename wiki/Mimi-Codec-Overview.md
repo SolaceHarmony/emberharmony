@@ -53,7 +53,7 @@ flowchart TD
     click vq "QZ01-Split-RVQ"
     click core_vq "QZ02-VQ-Core"
     click lm "MM03-Moshi-LM"
-    click server "TR01-WS-Server"
+    click server "Moshi-Transport"
 
     classDef off fill:#fde,stroke:#b36,stroke-dasharray:5 3;
     classDef ext fill:#eef,stroke:#88a;
@@ -70,7 +70,7 @@ flowchart TD
 | `moshi_seanet` | `modules/seanet.py` | decoder: latent `(B,512,t)` @25Hz → waveform `(B,1,t·960)` f32 @24kHz · encoder: waveform `(B,1,T)` f32 → latent `(B,512,T/960)` @25Hz | Causal conv codec ends: encoder strides 24 kHz → 512-dim 25 Hz latent (hop 960); mirror decoder inverts it. ELU, dilated residual blocks, weight-norm folded, `true_skip` identity. **Decoder on-path; encoder is training-prep.** | [./modules/seanet.md](MO01-SEANet) |
 | `moshi_vq` | `quantization/vq.py` | encode: latent `(B,512,T)` → codes `(B,8,T)` int64 0..2047 · decode: codes → latent `(B,512,T)` | `SplitResidualVectorQuantizer` (`rvq_first` semantic n_q=1 + `rvq_rest` acoustic) + `ResidualVectorQuantizer`; 512↔256 input/output proj; `cdist`+`argmin` nearest-centroid via `core_vq` `EuclideanCodebook`. **On-path.** | [./quantization/vq.md](QZ01-Split-RVQ) |
 | `moshi_lm` | `models/lm.py` | codes int64 `[B,n_q+1,T]` (train) · `LMGen.step` `[B,K_in,1]` → `LMOutput.logits` `[B,dep_q,T,card]` + text logits · `LMGen` frame `[B,n_q+1,1]` | Moshi 7B multi-stream LM (text + n_q audio streams) + depformer head + `LMGen` streaming driver. **A DIFFERENT model from LFM2-Audio — reference only (off-path).** | [./models/lm.md](MM03-Moshi-LM) |
-| `moshi_server` | `server.py` | Opus bytes (ws) → sphn-decoded f32 PCM `(1,1,1920)` @24kHz → Opus audio bytes (ws `\x01`) + UTF-8 text-token bytes (ws `\x02`) | `asyncio`+`aiohttp` full-duplex WebSocket transport for Moshi 7B: `recv_loop`/`opus_loop`/`send_loop` driving `mimi.encode`→`lm_gen.step`→`mimi.decode` per 1920-sample frame. **Off the LFM2-Audio path (not ported to Rust).** | [./server.md](TR01-WS-Server) |
+| `moshi_server` | `server.py` | Opus bytes (ws) → sphn-decoded f32 PCM `(1,1,1920)` @24kHz → Opus audio bytes (ws `\x01`) + UTF-8 text-token bytes (ws `\x02`) | `asyncio`+`aiohttp` full-duplex WebSocket transport for Moshi 7B: `recv_loop`/`opus_loop`/`send_loop` driving `mimi.encode`→`lm_gen.step`→`mimi.decode` per 1920-sample frame. **Off the LFM2-Audio path (not ported to Rust).** | [./server.md](Moshi-Transport) |
 
 Supporting on-path modules pulled in by the codec (own specs in this folder): [`modules/resample.md`](MO04-Framerate-Resample) (the learnt `ConvDownsample1d`/`ConvTrUpsample1d` 25↔12.5 Hz bridge), [`modules/transformer.md`](MO03-Codec-Transformer) (the enc/dec `ProjectedTransformer`s at 25 Hz), [`modules/conv.md`](MO02-Streaming-Conv), [`modules/streaming.md`](MO06-Streaming-Module), [`modules/rope.md`](MO05-RoPE), and [`quantization/core_vq.md`](QZ02-VQ-Core)/[`quantization/base.md`](QZ03-Quantizer-Base). Off-path-only specs also present: [`models/lm_utils.md`](MM04-Moshi-LM-Utils), [`models/tts.md`](MM05-Moshi-TTS), the [`conditioners/`](https://github.com/SolaceHarmony/emberharmony/blob/explore/lfm2-audio-voice/experiments/lfm2-audio-voice/ARCH/moshi/conditioners) set, the `client*.md` / `run_inference.md` / `run_tts.md` Moshi tooling, and most of [`utils/`](https://github.com/SolaceHarmony/emberharmony/blob/explore/lfm2-audio-voice/experiments/lfm2-audio-voice/ARCH/moshi/utils).
 

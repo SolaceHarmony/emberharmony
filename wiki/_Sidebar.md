@@ -7,9 +7,12 @@
 
 - [LFM2.5-Audio — Architecture Map (Python reference → Rust port)](Architecture-Map)
 - [Architecture 1 — The Mimi Codec](Codec-Deep-Dive)
+- [Component index](Component-Index)
 - [LFM2.5-Audio — Cross-Reference / Traceability Matrix](Cross-Reference)
 - [Kyutai Moshi stack (codec on-path; LM + transport off-path)](Mimi-Codec-Overview)
 - [LFM2-Audio — Archaeological Map (Python source → Rust port)](Runtime-Questions)
+- [Full system graph (all 50 components)](System-Graph)
+- [Traceability matrix (code · section → Python `file:line`)](Traceability-Matrix)
 
 </details>
 
@@ -113,33 +116,20 @@
 <details>
 <summary><strong>Moshi Conditioners (off-path)</strong></summary>
 
-- [LM conditioners (off-path)](CN00-Overview)
-- [CN01 · ConditionProvider / Fuser](CN01-Conditioner-Base)
-- [CN02 · LUTConditioner](CN02-Text-Conditioner)
-- [CN03 · TensorConditioner](CN03-Tensor-Conditioner)
+- [Moshi Conditioners (off path)](Moshi-Conditioners)
 
 </details>
 
 <details>
 <summary><strong>Moshi Utilities</strong></summary>
 
-- [Moshi utilities (CUDA graphs, sampling, autocast)](MU00-Overview)
-- [MU01 · Moshi sampler (top-k/top-p)](MU01-Sampling)
-- [MU02 · CUDAGraphed + torch.compile gating](MU02-CUDA-Graphs)
-- [MU03 · TorchAutocast](MU03-Autocast)
-- [MU04 · int8 quantize helpers](MU04-Int8-Quantize)
-- [MU05 · Moshi misc utils](MU05-Moshi-Utils)
+- [Moshi Utilities (off path)](Moshi-Utilities)
 
 </details>
 
 <details>
 <summary><strong>Transport (off-path)</strong></summary>
 
-- [TR01 · Moshi websocket server (asyncio)](TR01-WS-Server)
-- [TR02 · Moshi websocket client (asyncio)](TR02-WS-Client)
-- [TR03 · Moshi client utils](TR03-Client-Utils)
-- [TR04 · Moshi run_inference (offline loop)](TR04-Run-Inference)
-- [TR05 · Moshi run_tts](TR05-Run-TTS)
-- [TR06 · Moshi gradio client](TR06-Gradio-Client)
+- [Moshi Transport (off path)](Moshi-Transport)
 
 </details>
