@@ -181,3 +181,52 @@ consumers keep their shape but read the new signals.
 3. Rewrite `voice.tsx` as the event-driven context; switch `BarVisualizer` to `level`.
 4. Prompt-input: audio attachment + mode + audio-player rendering (turn); live toggle + barge-in.
 5. Stop button + typed-submit → `abortTurn()` (both), `setMicEnabled` (live).
+
+## RESOLVED decisions (Phase-1 Tauri wiring) — settle these; stop re-litigating
+
+Grounded in the `liquid-audio` examples (`duplex_chat.rs` = the reference consumer + VAD loop)
+and `realtime.rs` (`RealtimePipeline` owns the engine on a worker thread; `Channel::send` is
+`Send+Sync`).
+
+1. **Model lifecycle → eager-async on `provider == lfm2`, NOT app-start, NOT first-press.**
+   A 1.5B model is ~3 GB RAM + ~21 s CPU (faster on Metal). Don't pay it at startup (most users
+   won't use local voice) and don't pay it as a 21 s mic-button hang. Load on a background
+   thread the moment the active provider becomes `lfm2` (at boot if settings already say so, or
+   on the settings switch). `voice_status` gains `loading | ready` so the UI shows a spinner;
+   the mic enables on `ready`. "Lazy w.r.t. intent, eager w.r.t. first use."
+
+2. **Pipeline storage → ONE persistent `RealtimePipeline` in `State<Mutex<Option<…>>>`; the
+   warm model lives inside it; never reload per session.** `model`+`proc` are owned by
+   `Lfm2VoiceEngine`, owned by the pipeline's worker thread — so the pipeline-in-State *is* the
+   warm-model store (you can't also keep an un-`Clone` copy in State). Created once when the load
+   finishes; reused for every turn (it already persists across turns — `worker_persists_across_turns`
+   — and now accumulates `conv` across turns); dropped only on provider-change / app-exit.
+
+3. **crossbeam → Tauri `Channel` bridge → a plain `std::thread`, `for ev in rx.iter() {
+   channel.send(map(ev)) }`. No tokio, no `try_recv` timer.** `Channel::send` is `Send+Sync`
+   (tauri `OnMessageFn = Box<dyn Fn(..)+Send+Sync>`), callable from any OS thread, so no runtime
+   is needed; blocking `rx.iter()` is lowest-latency (a timer poll adds latency + busy-loops).
+   This IS the `duplex_chat` consumer thread with `ring.extend(pcm)` swapped for `channel.send`.
+   ONE bridge per session, draining `pipe.events().clone()`, ending on the turn/session terminal
+   event — there is only ever one active session (the demo's `isGenerating` guard), so no
+   competing consumers steal events from the shared pipeline.
+
+4. **Event mapping — the naïve `realtime::VoiceEvent → control::VoiceEvent` table has 4 gaps:**
+   - `Text(frag)`: realtime emits per-token FRAGMENTS; `control::Transcript` is CUMULATIVE.
+     The bridge ACCUMULATES a per-turn `String` and emits `Transcript{Assistant, cumulative}`.
+   - `Audio(pcm)`: must be PLAYED, not just measured. **Live** → push to a cpal output ring
+     (Rust-side) + emit `Level{rms}` (no PCM crosses IPC). **Turn** → ACCUMULATE pcm; at
+     `TurnComplete` encode → `AudioClip{wav}` for the webview `<audio>` (no cpal in turn mode).
+   - `TurnComplete`: turn → emit `AudioClip{wav}` THEN `State{Idle}`; live → `State{Listening}`.
+   - `Interrupted`: turn → `State{Idle}`; live → `State{Listening}`.
+   - SYNTHESIZE the states realtime doesn't emit: `State{Thinking}` on submit (before first
+     token), `State{Speaking}` on the first `Audio`. (Listening→Thinking→Speaking, like the demo.)
+
+5. **Phase 1 = `voice_generate_turn` (one-shot) BUILT ON the persistent pipeline — not a
+   separate path, and NOT continuous live yet.** Using the pipeline keeps the model warm (#2),
+   gives abort/barge-in for free, and makes Phase 2 *additive* (live just adds the cpal VAD
+   trigger + streaming playback on the SAME engine). **Turn mode needs NO cpal:** audio-in is a
+   webview-recorded PCM clip (`TurnRequest{audio:{pcm,rate}}`), audio-out is the accumulated
+   `AudioClip{wav}` the webview plays — exactly the Liquid demo. Implement `voice_generate_turn`
+   + `voice_abort_turn`(→`pipe.interrupt()`) now; `voice_start_live`/`voice_stop_live` (cpal +
+   VAD) are Phase 2 stubs.

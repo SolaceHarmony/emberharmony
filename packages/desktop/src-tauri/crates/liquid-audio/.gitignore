@@ -1,3 +1,6 @@
 /target/
-# large regenerable stage-localization dump (run parity/dump_conformer_stages.py)
-parity/golden/conformer_stages.safetensors
+# Parity golden tensors are large, REGENERABLE dumps from the real model (run the matching
+# parity/dump_*.py → parity/golden/). They are reference data, never source — keep them out of
+# the repo (one exceeded GitHub's 50 MB limit). Each parity test is #[ignore]d and names its
+# dump script, so a fresh checkout regenerates only what it needs.
+parity/golden/*.safetensors

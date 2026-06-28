@@ -241,16 +241,19 @@ impl VoiceEngine for Lfm2VoiceEngine {
     ) -> Result<bool, String> {
         let s = |e: candle_core::Error| e.to_string();
 
-        // `audio_detokenizer()` returns the LFM2 detokenizer when present, else falls back to
-        // the Mimi codec (processor.rs: `audio_out.or(mimi)`) — so this streaming `decode_step`
-        // path works on both model families, mirroring the one-shot `processor.decode` fallback.
-        let detok = self.proc.audio_detokenizer().ok_or("no audio-out backend (Mimi) in this model")?;
-        detok.reset_stream(); // turn boundary — independent streaming decode.
+        // STREAMING decode is the Mimi codec — required, never optional. Mimi is the only
+        // backend with a true `decode_step` (it carries codec state ACROSS frames for gapless
+        // output), exactly the Python demo, which streams every frame inside `mimi.streaming(1)`
+        // via `mimi.decode(frame)` (chat.py:21,34). We always ship Mimi; if it is missing the
+        // model load is broken — hard-error. No fallback to the LFM2 detokenizer's degenerate
+        // per-frame one-shot: a fallback would only mask a broken build behind choppy audio.
+        let detok = self.proc.mimi().ok_or("Mimi codec not loaded — required for streaming audio out")?;
+        detok.reset_stream(); // turn boundary — independent streaming decode (`mimi.streaming(1)`).
 
         let wave = Tensor::from_vec(utt.samples.clone(), (1, utt.samples.len()), &self.device).map_err(s)?;
 
-        // Restore the persistent conversation (clone the prior tensors — cheap Arc bumps — so an
-        // interrupted turn can be discarded without losing history; we never `take`). First turn
+        // Restore the persistent conversation (clone the prior tensors — cheap Arc bumps — so a
+        // hard error that returns early leaves prior history intact; we never `take`). First turn
         // → fresh `ChatState` + the system turn (added once, like Python); later turns → seed
         // from the accumulated state so the prior discrete `audio_out` conditions this prefill.
         let prior = self.conv.clone();
@@ -347,12 +350,17 @@ impl VoiceEngine for Lfm2VoiceEngine {
         // Completed unless the loop broke because barge-in was requested.
         let completed = !cancel.load(Ordering::Acquire);
 
-        // Persist the turn ONLY on clean completion. `append` weaves the generated text +
-        // discrete `audio_out` (with their interleaved modality flags) into the conversation,
-        // then `end_turn` closes the assistant turn — exactly Python's `chat.append(...)` +
-        // `chat.end_turn()`. An interrupted turn is discarded: `self.conv` keeps the prior
-        // history (we cloned `prior`, never took it), so barge-in rewinds to before this turn.
-        if completed {
+        // Persist the GENERATED response into the conversation — keyed on what the model
+        // PRODUCED, never on whether it was played or whether a mic was open. The audio frames
+        // were collected above at generation time, before the playback/mute branch, so a muted
+        // speaker changes nothing; and we persist even on barge-in (`completed == false`),
+        // because a thought the model started is still a prior thought. Dropping the model's own
+        // (possibly partial) response would make the context depend on an I/O event — the very
+        // failure mode to avoid: the model would lose its own response. `append` weaves the
+        // generated text + discrete `audio_out` (interleaved per `modality_flag`) in; `end_turn`
+        // closes the assistant turn (early, if barge-in cut it short). Only a hard error (returned
+        // above) or a genuinely empty generation skips this.
+        if !text_ids.is_empty() || !audio_frames.is_empty() {
             let n_text = text_ids.len();
             let n_audio = audio_frames.len();
             let n_flag = modality_out.len();

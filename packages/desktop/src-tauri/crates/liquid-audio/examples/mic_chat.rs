@@ -20,17 +20,15 @@
 
 use std::collections::VecDeque;
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use candle_core::{DType, Device, Tensor};
+use candle_core::{DType, Device};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use liquid_audio::resample::resample_slice;
-use liquid_audio::{from_pretrained, ChatState, GenParams, GenToken};
+use liquid_audio::{from_pretrained, GenParams, Lfm2VoiceEngine, Utterance, VoiceEngine, VoiceEvent};
 
 type Res<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
-
-const MIMI_RATE: u32 = 24_000; // moshi Mimi decode output rate
 
 fn select_device() -> Res<(Device, DType)> {
     match std::env::var("LFM_DEVICE").ok().as_deref() {
@@ -199,7 +197,6 @@ fn main() -> Res<()> {
     eprintln!("[load] LFM2.5-Audio from {} ({dtype:?}, {device:?})…", dir.display());
     let t0 = Instant::now();
     let (model, proc) = from_pretrained(&dir, dtype, &device)?;
-    let mimi = proc.audio_detokenizer().ok_or("no audio-out backend (Mimi) in this model dir")?;
     eprintln!("[load] done in {:.1}s.", t0.elapsed().as_secs_f32());
 
     // Held for the program's lifetime so the output stream keeps draining the ring.
@@ -216,7 +213,16 @@ fn main() -> Res<()> {
         seed,
     };
 
-    println!("\nLFM2.5-Audio live speech-to-speech. Speak when prompted; Ctrl-C to quit.\n");
+    // Drive the real `Lfm2VoiceEngine` (the SAME engine the Tauri voice path uses). It owns the
+    // model + processor and PERSISTS the conversation across turns: each `respond` seeds from the
+    // accumulated `conv` — the prior user audio-in AND the assistant's prior discrete audio-out —
+    // generates, decodes audio to PCM at the speaker rate, then appends the new turn back. So this
+    // is a real multi-turn conversation WITH MEMORY, not a fresh `ChatState` per turn. Turn-based
+    // (we never listen while it speaks), so there is no barge-in and open speakers are fine.
+    let mut engine = Lfm2VoiceEngine::new(model, proc, params, codebooks, device, out_rate);
+    let cancel = AtomicBool::new(false);
+
+    println!("\nLFM2.5-Audio live speech-to-speech (with conversation memory). Speak when prompted; Ctrl-C to quit.\n");
     loop {
         let (utt, in_rate) = record_utterance()?;
         let secs = utt.len() as f32 / in_rate as f32;
@@ -226,58 +232,30 @@ fn main() -> Res<()> {
         }
         eprintln!("[turn] captured {secs:.2}s @ {in_rate} Hz; generating…");
 
-        let wave = Tensor::from_vec(utt.clone(), (1, utt.len()), &device)?;
-        let mut chat = ChatState::new(&proc, codebooks)?;
-        chat.new_turn("system")?;
-        chat.add_text("Respond with interleaved text and audio.")?;
-        chat.end_turn()?;
-        chat.new_turn("user")?;
-        chat.add_audio(&wave, in_rate)?;
-        chat.end_turn()?;
-        chat.new_turn("assistant")?;
-
-        mimi.reset_stream();
         print!("assistant: ");
         std::io::stdout().flush().ok();
-        let mut cb_err: Option<Box<dyn std::error::Error + Send + Sync>> = None;
+        cancel.store(false, Ordering::SeqCst);
         let tg = Instant::now();
-        let mut n_tok = 0usize;
-        model.generate_interleaved(&chat, &params, |tok| {
-            if cb_err.is_some() {
-                return;
+        let utterance = Utterance { samples: utt, rate: in_rate };
+        // The engine streams the reply: text fragments to stdout, decoded PCM (already at the
+        // speaker rate) into the playback ring. On clean completion it appends this turn to `conv`.
+        let res = engine.respond(&utterance, &cancel, &mut |ev| match ev {
+            VoiceEvent::Text(t) => {
+                print!("{t}");
+                std::io::stdout().flush().ok();
             }
-            n_tok += 1;
-            match tok {
-                GenToken::Text(id) => {
-                    if let Ok(s) = proc.text().decode(&[id], true) {
-                        print!("{s}");
-                        std::io::stdout().flush().ok();
-                    }
-                }
-                GenToken::Audio(frame) => {
-                    if frame.contains(&2048) {
-                        return; // EOAudio terminator — no waveform
-                    }
-                    let step = (|| -> Res<()> {
-                        let codes = Tensor::from_vec(frame.clone(), (1, codebooks, 1), &device)?;
-                        if let Some(chunk) = mimi.decode_step(&codes)? {
-                            let s = chunk.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
-                            let s = resample_slice(&s, MIMI_RATE, out_rate);
-                            ring.lock().unwrap().extend(s);
-                        }
-                        Ok(())
-                    })();
-                    if let Err(e) = step {
-                        cb_err = Some(e);
-                    }
-                }
+            VoiceEvent::Audio(pcm) => {
+                ring.lock().unwrap().extend(pcm);
             }
-        })?;
-        if let Some(e) = cb_err {
-            return Err(e);
+            // `respond`'s callback only emits Text/Audio; these terminal variants come from the
+            // `RealtimePipeline` wrapper, not here — handled for match exhaustiveness.
+            VoiceEvent::TurnComplete | VoiceEvent::Interrupted | VoiceEvent::Error(_) => {}
+        });
+        println!(); // terminate the streamed "assistant: …" line
+        if let Err(e) = res {
+            return Err(e.into());
         }
-        let gsecs = tg.elapsed().as_secs_f32();
-        println!("\n[turn] {n_tok} tokens in {gsecs:.1}s = {:.1} tok/s", n_tok as f32 / gsecs);
+        eprintln!("[turn] done in {:.1}s", tg.elapsed().as_secs_f32());
 
         // let the speaker finish draining the reply
         loop {

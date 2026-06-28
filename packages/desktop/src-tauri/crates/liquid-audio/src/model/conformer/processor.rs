@@ -156,8 +156,7 @@ fn dft_conv_kernel(n_fft: usize, padded_window: &[f32], device: &Device) -> Resu
 
 pub struct FilterbankFeatures {
     cfg: MelConfig,
-    window: Vec<f32>, // loaded (win_length,), padded to n_fft at use
-    fb: Tensor,       // (nfilt, n_fft/2+1)
+    fb: Tensor, // (nfilt, n_fft/2+1)
     /// DFT-basis Conv1d kernel `(2·freq, 1, n_fft)` realizing torch's `_fft_r2c`:
     /// channels `[0, freq)` are the real filters `window[n]·cos(2πkn/N)`, channels
     /// `[freq, 2·freq)` the imag filters `−window[n]·sin(2πkn/N)`.
@@ -173,9 +172,12 @@ impl FilterbankFeatures {
         let freq = cfg.n_fft / 2 + 1;
         let fb_data = mel_filterbank(cfg.sample_rate, cfg.n_fft, cfg.nfilt);
         let fb = Tensor::from_vec(fb_data, (cfg.nfilt, freq), device)?;
+        // The Hann window is folded into the DFT-basis kernel here (it multiplies each basis
+        // function), so the STFT applies it via `stft_kernel`; the raw window vector is not
+        // stored — it has no use after the kernel is built.
         let padded_win = pad_window_to(&window, cfg.n_fft);
         let stft_kernel = dft_conv_kernel(cfg.n_fft, &padded_win, device)?;
-        Ok(Self { cfg, window, fb, stft_kernel, device: device.clone() })
+        Ok(Self { cfg, fb, stft_kernel, device: device.clone() })
     }
 
     /// Number of mel bins (encoder `feat_in`).

@@ -276,7 +276,7 @@ impl ConvSubsampling {
         let mut layers: Vec<Op> = Vec::new();
         let mut idx = 0usize;
         // next vb prefix for a weighted layer + bump the Sequential index.
-        let mut next = |layers_idx: &mut usize| {
+        let next = |layers_idx: &mut usize| {
             let p = conv.pp(layers_idx.to_string());
             *layers_idx += 1;
             p
