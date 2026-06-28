@@ -7,6 +7,9 @@ license = "Apache-2.0"
 
 [dependencies]
 candle-core = "0.9"
+# `half::bf16` — read/write bf16 tensor lanes for the bf16 depthwise conv path (the
+# deployed dtype). Same version candle uses, so cargo unifies to one `half`.
+half = "2"
 # candle's own Metal abstraction (a shim over objc2-metal). candle 0.9 dropped
 # metal-rs, so `MetalStorage::buffer()` returns `&candle_metal_kernels::metal::Buffer`
 # and `MetalDevice` builds pipelines/encoders from these types — we must use the

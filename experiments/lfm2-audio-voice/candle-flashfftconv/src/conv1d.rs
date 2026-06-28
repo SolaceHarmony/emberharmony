@@ -65,6 +65,53 @@ kernel void depthwise_causal_conv1d_f32(
 }
 "#;
 
+/// Metal shader (bf16): bf16 weights + input, **f32 accumulate, bf16 store** — the
+/// deployed/trained dtype regime (the same f32-accumulate-bf16-store as FlashFFTConv's
+/// `causal_conv1d` and this crate's faithful-bf16 path). Same indexing as the f32 kernel.
+#[cfg(feature = "metal")]
+const SRC_BF16: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void depthwise_causal_conv1d_bf16(
+    device const bfloat* u        [[buffer(0)]],
+    device const bfloat* weights  [[buffer(1)]],
+    device const bfloat* bias     [[buffer(2)]],
+    device bfloat*       out      [[buffer(3)]],
+    constant uint& B       [[buffer(4)]],
+    constant uint& D       [[buffer(5)]],
+    constant uint& L       [[buffer(6)]],
+    constant uint& K       [[buffer(7)]],
+    constant uint& padding [[buffer(8)]],
+    constant uint& L_out   [[buffer(9)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint total = B * D * L_out;
+    if (gid >= total) { return; }
+    uint l  = gid % L_out;
+    uint bd = gid / L_out;
+    uint d  = bd % D;
+    uint b  = bd / D;
+    uint u_base = b * D * L + d * L;
+    uint w_base = d * K;
+    float acc = float(bias[d]); // f32 accumulate
+    if (K == 3) {
+        int idx = int(l) - int(padding);
+        if (idx >= 0 && idx < int(L)) { acc = fma(float(u[u_base + uint(idx)]), float(weights[w_base + 0]), acc); }
+        idx++;
+        if (idx >= 0 && idx < int(L)) { acc = fma(float(u[u_base + uint(idx)]), float(weights[w_base + 1]), acc); }
+        idx++;
+        if (idx >= 0 && idx < int(L)) { acc = fma(float(u[u_base + uint(idx)]), float(weights[w_base + 2]), acc); }
+    } else {
+        for (uint k = 0; k < K; ++k) {
+            int idx = int(l) - int(padding) + int(k);
+            if (idx >= 0 && idx < int(L)) { acc = fma(float(u[u_base + uint(idx)]), float(weights[w_base + k]), acc); }
+        }
+    }
+    out[b * D * L_out + d * L_out + l] = bfloat(acc); // single bf16 store
+}
+"#;
+
 /// Depthwise causal conv1d op. `padding` is applied symmetrically (like
 /// `candle_nn::Conv1d`); the caller narrows for the causal slice.
 pub struct DepthwiseCausalConv1d {
@@ -90,6 +137,41 @@ fn contig_f32<'a>(s: &'a CpuStorage, l: &Layout) -> Result<&'a [f32]> {
     }
 }
 
+/// Read a contiguous bf16 CPU tensor up-converted to f32 (the accumulate dtype).
+fn contig_bf16_to_f32(s: &CpuStorage, l: &Layout) -> Result<Vec<f32>> {
+    let data = s.as_slice::<half::bf16>()?;
+    match l.contiguous_offsets() {
+        Some((start, end)) => Ok(data[start..end].iter().map(|x| x.to_f32()).collect()),
+        None => candle_core::bail!("depthwise_conv1d expects contiguous bf16 inputs"),
+    }
+}
+
+/// The causal depthwise conv with **f32 accumulate** — shared by the f32 and bf16 CPU
+/// paths (the bf16 path up-converts its inputs here and rounds the result back to bf16,
+/// i.e. f32-accumulate, bf16-store).
+#[allow(clippy::too_many_arguments)]
+fn conv_cpu_f32(u: &[f32], w: &[f32], bias: &[f32], b: usize, d: usize, l: usize, l_out: usize, k: usize, pad: i64) -> Vec<f32> {
+    let mut out = vec![0f32; b * d * l_out];
+    for bi in 0..b {
+        for di in 0..d {
+            let u_base = bi * d * l + di * l;
+            let w_base = di * k;
+            let o_base = bi * d * l_out + di * l_out;
+            for li in 0..l_out {
+                let mut acc = bias[di];
+                for ki in 0..k {
+                    let idx = li as i64 - pad + ki as i64;
+                    if idx >= 0 && (idx as usize) < l {
+                        acc += u[u_base + idx as usize] * w[w_base + ki];
+                    }
+                }
+                out[o_base + li] = acc;
+            }
+        }
+    }
+    out
+}
+
 impl CustomOp3 for DepthwiseCausalConv1d {
     fn name(&self) -> &'static str {
         "depthwise_causal_conv1d"
@@ -104,36 +186,33 @@ impl CustomOp3 for DepthwiseCausalConv1d {
         bs: &CpuStorage,
         bl: &Layout,
     ) -> Result<(CpuStorage, Shape)> {
+        use candle_core::backend::BackendStorage;
         let (b, d, l) = ul.shape().dims3()?;
         let (dw, k) = wl.shape().dims2()?;
         if dw != d {
             candle_core::bail!("depthwise_conv1d: weight channels {dw} != input channels {d}");
         }
         let l_out = self.out_len(l, k)?;
-        let u = contig_f32(us, ul)?;
-        let w = contig_f32(ws, wl)?;
-        let bias = contig_f32(bs, bl)?;
         let pad = self.padding as i64;
-
-        let mut out = vec![0f32; b * d * l_out];
-        for bi in 0..b {
-            for di in 0..d {
-                let u_base = bi * d * l + di * l;
-                let w_base = di * k;
-                let o_base = bi * d * l_out + di * l_out;
-                for li in 0..l_out {
-                    let mut acc = bias[di];
-                    for ki in 0..k {
-                        let idx = li as i64 - pad + ki as i64;
-                        if idx >= 0 && (idx as usize) < l {
-                            acc += u[u_base + idx as usize] * w[w_base + ki];
-                        }
-                    }
-                    out[o_base + li] = acc;
-                }
+        let shape = Shape::from((b, d, l_out));
+        match us.dtype() {
+            DType::F32 => {
+                let out = conv_cpu_f32(contig_f32(us, ul)?, contig_f32(ws, wl)?, contig_f32(bs, bl)?, b, d, l, l_out, k, pad);
+                Ok((CpuStorage::F32(out), shape))
             }
+            DType::BF16 => {
+                // f32 accumulate, bf16 store — the deployed/trained regime.
+                let out = conv_cpu_f32(
+                    &contig_bf16_to_f32(us, ul)?,
+                    &contig_bf16_to_f32(ws, wl)?,
+                    &contig_bf16_to_f32(bs, bl)?,
+                    b, d, l, l_out, k, pad,
+                );
+                let out: Vec<half::bf16> = out.iter().map(|&x| half::bf16::from_f32(x)).collect();
+                Ok((CpuStorage::BF16(out), shape))
+            }
+            other => candle_core::bail!("depthwise_conv1d cpu: f32/bf16 only (got {other:?})"),
         }
-        Ok((CpuStorage::F32(out), Shape::from((b, d, l_out))))
     }
 
     #[cfg(feature = "metal")]
@@ -150,9 +229,6 @@ impl CustomOp3 for DepthwiseCausalConv1d {
         use candle_core::MetalStorage;
         use objc2_metal::MTLSize;
 
-        if us.dtype() != DType::F32 {
-            candle_core::bail!("metal depthwise_conv1d currently supports f32 only (got {:?})", us.dtype());
-        }
         let (b, d, l) = ul.shape().dims3()?;
         let (dw, k) = wl.shape().dims2()?;
         if dw != d {
@@ -161,10 +237,14 @@ impl CustomOp3 for DepthwiseCausalConv1d {
         let l_out = self.out_len(l, k)?;
         let total = b * d * l_out;
         let dev = us.device();
-        let pipeline = f32_pipeline(dev)?;
-        let dts = DType::F32.size_in_bytes();
+        let dt = us.dtype();
+        let (pipeline, dts) = match dt {
+            DType::F32 => (f32_pipeline(dev)?, DType::F32.size_in_bytes()),
+            DType::BF16 => (bf16_pipeline(dev)?, DType::BF16.size_in_bytes()),
+            other => candle_core::bail!("metal depthwise_conv1d: f32/bf16 only (got {other:?})"),
+        };
 
-        let out_buf = dev.new_buffer(total, DType::F32, "depthwise_conv1d")?;
+        let out_buf = dev.new_buffer(total, dt, "depthwise_conv1d")?;
         let encoder = dev.command_encoder()?;
         encoder.set_compute_pipeline_state(&pipeline);
         // Buffers u/weights/bias (honoring layout offsets), then the output.
@@ -191,7 +271,7 @@ impl CustomOp3 for DepthwiseCausalConv1d {
         // candle owns the command-buffer lifecycle (commit/flush on sync); the
         // shared encoder is neither ended nor committed here.
 
-        Ok((MetalStorage::new(out_buf, dev.clone(), total, DType::F32), Shape::from((b, d, l_out))))
+        Ok((MetalStorage::new(out_buf, dev.clone(), total, dt), Shape::from((b, d, l_out))))
     }
 }
 
@@ -222,19 +302,47 @@ fn f32_pipeline(dev: &candle_core::MetalDevice) -> Result<candle_metal_kernels::
     })
 }
 
-/// Depthwise causal conv1d over `u` `[B, D, L]` with `weight` `[D, K]` and an
-/// optional `bias` `[D]`. Returns `[B, D, L + 2·padding − K + 1]`. f32 only (the
-/// reference/parity dtype); bf16 is the next kernel variant.
+/// Compile + cache the bf16 pipeline (mirrors [`f32_pipeline`]).
+#[cfg(feature = "metal")]
+fn bf16_pipeline(dev: &candle_core::MetalDevice) -> Result<candle_metal_kernels::metal::ComputePipeline> {
+    use std::cell::OnceCell;
+    thread_local! {
+        static P: OnceCell<candle_metal_kernels::metal::ComputePipeline> = const { OnceCell::new() };
+    }
+    P.with(|cell| {
+        if let Some(p) = cell.get() {
+            return Ok(p.clone());
+        }
+        let mtl = dev.metal_device();
+        let lib = mtl
+            .new_library_with_source(SRC_BF16, None)
+            .map_err(|e| candle_core::Error::Msg(format!("metal compile bf16: {e}")))?;
+        let func = lib
+            .get_function("depthwise_causal_conv1d_bf16", None)
+            .map_err(|e| candle_core::Error::Msg(format!("metal get_function bf16: {e}")))?;
+        let pipeline = mtl
+            .new_compute_pipeline_state_with_function(&func)
+            .map_err(|e| candle_core::Error::Msg(format!("metal pipeline bf16: {e}")))?;
+        let _ = cell.set(pipeline.clone());
+        Ok(pipeline)
+    })
+}
+
+/// Depthwise causal conv1d over `u` `[B, D, L]` with `weight` `[D, K]` and an optional
+/// `bias` `[D]`. Returns `[B, D, L + 2·padding − K + 1]`. **f32 or bf16** — bf16 runs the
+/// deployed/trained regime (f32 accumulate, bf16 store), so the short-conv keeps the
+/// model's dtype with no upcast. The bias defaults to zeros in the input dtype.
 pub fn depthwise_conv1d(u: &Tensor, weight: &Tensor, bias: Option<&Tensor>, padding: usize) -> Result<Tensor> {
     let (_b, d, _l) = u.dims3()?;
-    if u.dtype() != DType::F32 {
-        candle_core::bail!("depthwise_conv1d currently supports f32 only (got {:?})", u.dtype());
+    let dt = u.dtype();
+    if dt != DType::F32 && dt != DType::BF16 {
+        candle_core::bail!("depthwise_conv1d supports f32 and bf16 (got {dt:?})");
     }
     let u = u.contiguous()?;
     let weight = weight.contiguous()?;
     let bias = match bias {
         Some(x) => x.contiguous()?,
-        None => Tensor::zeros(d, DType::F32, u.device())?,
+        None => Tensor::zeros(d, dt, u.device())?,
     };
     u.apply_op3(&weight, &bias, DepthwiseCausalConv1d { padding })
 }
@@ -248,7 +356,7 @@ pub fn depthwise_conv1d(u: &Tensor, weight: &Tensor, bias: Option<&Tensor>, padd
 /// The conv is just [`depthwise_conv1d`] run as a *valid* (no-pad) conv over the
 /// `K-1`-prepended stream — the same verified Metal kernel, with the left boundary fed
 /// from the cache instead of zeros (the cache cat/extract is host buffer management, the
-/// convolution is the kernel). f32 only. For `cache = None` this equals
+/// convolution is the kernel). f32 or bf16 (the dtype is preserved). For `cache = None` this equals
 /// `depthwise_conv1d(x, weight, None, K-1).narrow(2, 0, T)`, and a `T=1` step is exactly
 /// LFM2's decode gather `Σ_k window[k]·w[k]`.
 pub fn depthwise_conv1d_stream(x: &Tensor, weight: &Tensor, cache: Option<&Tensor>) -> Result<(Tensor, Tensor)> {
@@ -373,5 +481,36 @@ mod tests {
         let maxd = cpu.iter().zip(met.iter()).fold(0f32, |m, (a, b)| m.max((a - b).abs()));
         assert!(maxd < 1e-5, "metal vs cpu max diff {maxd}");
         eprintln!("metal == cpu depthwise conv1d, max diff {maxd:.2e}");
+    }
+
+    // bf16 path (the deployed dtype): f32 accumulate, bf16 store — metal == cpu.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_matches_cpu_bf16() {
+        let mdev = match Device::new_metal(0) {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("no metal device; skipping");
+                return;
+            }
+        };
+        let (b, d, l, k, pad) = (2usize, 4, 33, 3, 2);
+        let u: Vec<f32> = (0..b * d * l).map(|i| (i * 7 % 13) as f32 * 0.1 - 0.6).collect();
+        let w: Vec<f32> = (0..d * k).map(|i| (i * 5 % 7) as f32 * 0.05).collect();
+        let bias: Vec<f32> = (0..d).map(|i| i as f32 * 0.2).collect();
+        let run = |dev: &Device| -> Vec<f32> {
+            let cv = |v: &[f32], s: (usize, usize, usize)| Tensor::from_vec(v.to_vec(), s, dev).unwrap().to_dtype(DType::BF16).unwrap();
+            let ut = cv(&u, (b, d, l));
+            let wt = Tensor::from_vec(w.clone(), (d, k), dev).unwrap().to_dtype(DType::BF16).unwrap();
+            let bt = Tensor::from_vec(bias.clone(), (d,), dev).unwrap().to_dtype(DType::BF16).unwrap();
+            depthwise_conv1d(&ut, &wt, Some(&bt), pad)
+                .unwrap().to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        };
+        let cpu = run(&Device::Cpu);
+        let met = run(&mdev);
+        // both f32-accumulate then a single bf16 store; fma vs mul-add order can differ by ≤1 bf16 ULP.
+        let maxd = cpu.iter().zip(&met).fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+        assert!(maxd < 1e-2, "bf16 metal vs cpu max diff {maxd}");
+        eprintln!("depthwise bf16 (f32-accum, bf16-store): metal == cpu, max diff {maxd:.2e}");
     }
 }

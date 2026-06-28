@@ -339,26 +339,20 @@ impl ShortConv {
         let bx = (bgate * &x_proj)?.contiguous()?;
 
         // One causal depthwise short-conv path for both prefill and decode, through the
-        // FlashFFTConv `depthwise_conv1d_stream` kernel (metal == cpu 5.96e-8). Prefill
-        // (seq_len > 1) zero-pads — ignoring any prior cache, exactly as the reference does;
-        // single-step decode streams the prior K-1 inputs from the conv cache. `new_cache`
-        // carries the last K-1 inputs for the next step. The kernel is f32-only, so the bf16
-        // Metal path upcasts for the conv and casts the result back; the cache stays f32.
+        // FlashFFTConv `depthwise_conv1d_stream` kernel in the model's NATIVE dtype — bf16 on
+        // Metal runs f32-accumulate / bf16-store (the deployed, trained-around regime), no
+        // upcast. Prefill (seq_len > 1) zero-pads, ignoring any prior cache exactly as the
+        // reference does; single-step decode streams the prior K-1 inputs from the conv cache.
         let w = self.conv_weight.squeeze(1)?; // (H, K)
         let prev = if seq_len == 1 && self.l_cache > 0 {
             cache.conv_states[block_idx].clone()
         } else {
             None
         };
-        let (out, new_cache) = candle_flashfftconv::depthwise_conv1d_stream(
-            &bx.to_dtype(candle_core::DType::F32)?,
-            &w.to_dtype(candle_core::DType::F32)?,
-            prev.as_ref(),
-        )?;
+        let (conv_out, new_cache) = candle_flashfftconv::depthwise_conv1d_stream(&bx, &w, prev.as_ref())?;
         if cache.use_kv_cache && self.l_cache > 0 {
             cache.conv_states[block_idx] = Some(new_cache);
         }
-        let conv_out = out.to_dtype(bx.dtype())?;
 
         let conv_out = (c * &conv_out)?.transpose(1, 2)?.contiguous()?;
         self.out_proj.forward(&conv_out)
