@@ -10,7 +10,9 @@
 //!
 //! The Metal kernel is small; all the arithmetic is your `double_double.metal`.
 
-use candle_core::{CpuStorage, CustomOp2, DType, Layout, Result, Shape, Tensor};
+use candle_core::{CpuStorage, CustomOp2, Layout, Result, Shape, Tensor};
+#[cfg(feature = "metal")]
+use candle_core::DType;
 
 /// The kernel that calls `cdd_mul`; compiled with your `double_double.metal`
 /// prepended (it provides `complex_dd`, `cdd_mul`, `cdd_to_float2`, and pulls in

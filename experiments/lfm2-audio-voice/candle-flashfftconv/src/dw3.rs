@@ -8,7 +8,9 @@
 //! [`crate::depthwise_conv1d`] with `padding=2` narrowed to `L`, but driven by your
 //! deterministic kernel.
 
-use candle_core::{CpuStorage, CustomOp2, DType, Layout, Result, Shape, Tensor};
+use candle_core::{CpuStorage, CustomOp2, Layout, Result, Shape, Tensor};
+#[cfg(feature = "metal")]
+use candle_core::DType;
 
 #[cfg(feature = "metal")]
 const SRC: &str = include_str!("metal/Depthwise3.metal");
@@ -157,7 +159,7 @@ mod tests {
         };
         let (b, c, l) = (2usize, 4, 37);
         let x: Vec<f32> = (0..b * c * l).map(|i| ((i * 7 % 13) as f32 * 0.1) - 0.6).collect();
-        let k: Vec<f32> = (0..c * 3).map(|i| ((i * 5 % 7) as f32 * 0.05)).collect();
+        let k: Vec<f32> = (0..c * 3).map(|i| (i * 5 % 7) as f32 * 0.05).collect();
         let run = |dev: &Device| -> Vec<f32> {
             let xt = Tensor::from_vec(x.clone(), (b, c, l), dev).unwrap();
             let kt = Tensor::from_vec(k.clone(), (c, 3), dev).unwrap();

@@ -16,7 +16,9 @@
 //! `threadgroup_position_in_grid` (the dispatch is `(batch, channels)` threadgroups
 //! of `fft_size` threads), not `thread_position_in_grid`.
 
-use candle_core::{CpuStorage, CustomOp3, DType, Layout, Result, Shape, Tensor};
+use candle_core::{CpuStorage, CustomOp3, Layout, Result, Shape, Tensor};
+#[cfg(feature = "metal")]
+use candle_core::DType;
 
 #[cfg(feature = "metal")]
 /// The kernel is your vendored `metal/FFTConv.metal` (verbatim + documented

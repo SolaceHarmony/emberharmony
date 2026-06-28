@@ -27,11 +27,32 @@
 //! - [`monarch_conv`] — the FlashFFTConv long convolution `IFFT(FFT(u) ⊙ k_f)`
 //!   (via [`complex_mul`]). Arbitrary length. **Done + verified**: `monarch_conv ==
 //!   direct circular convolution` (9.69e-8), and metal == cpu (2.24e-8) at every stage.
-//! - [`fused_fft_conv`] — the **single-dispatch** FlashFFTConv path: one Metal
+//! - [`fused_fft_conv`] — the **single-dispatch** radix-2 FlashFFTConv path: one Metal
 //!   threadgroup per `(batch, channel)` does `rfft → ⊙ k_f → irfft → +u·D` with the
 //!   radix-2 FFT in threadgroup memory (no global round-trips). For `fft_size` a
 //!   power of two `≤ 1024` (linear conv via `2·seqlen` zero-pad). **Done +
 //!   verified**: `== direct linear convolution` (1.19e-7); metal == cpu (2.98e-8).
+//!
+//! ## Fused tensor-core path (`simdgroup_matrix`)
+//!
+//! The Monarch transform expressed on Apple's matrix units (the CUDA `wmma` analog):
+//! every sub-DFT is an 8×8 `simdgroup_float8x8` GEMM with **fp32 accumulate**, the whole
+//! pipeline fused into **one** dispatch with the `[N,L]` intermediate resident in
+//! `threadgroup` memory (one threadgroup per `(b,h)`, tiled — full GPU occupancy).
+//! - [`butterfly_fft_forward_fused`] — fused forward butterfly (row-DFT→twiddle→col-DFT
+//!   in one kernel). **Done + verified**: metal == cpu == un-fused (3.81e-6).
+//! - [`monarch_conv_fused`] — the **full** fused conv `IFFT(FFT(u) ⊙ k_f)` in one kernel
+//!   (forward + in-kernel `×k_f` + inverse, ping-ponged so col-DFTs never alias their
+//!   input). Drop-in for [`monarch_conv`]; **any `N,L`** via edge-tile zero-fill (matrices
+//!   padded to mult-of-8 at pack time, ragged boundary handled in-kernel — no caller
+//!   padding). **Done + verified**: metal == `monarch_conv` (1.5e-8) incl. non-mult-of-8
+//!   dims; == circular convolution (9.7e-8). fp32 (bf16/fp16/gated/padded are follow-ons).
+//! - [`warmup`] — pre-compile the fused kernels at init so the realtime path never eats a
+//!   first-frame compile.
+//!
+//! Compiled pipelines are cached **process-wide** (global, thread-safe), so each kernel
+//! compiles once and is shared across threads — the compiled kernel vs. per-dispatch
+//! instances. See `ARCHITECTURE.md` for the full kernel design and verification story.
 //!
 //! ## Two precision regimes — faithful vs precise
 //!
@@ -61,6 +82,7 @@ mod dd_complex_mul;
 mod dw3;
 mod fused_fft_conv;
 mod fused_fft_conv_dd;
+mod fused_monarch;
 mod irfft;
 #[cfg(feature = "metal")]
 mod metal_util;
@@ -74,4 +96,5 @@ pub use dd_complex_mul::complex_mul_dd;
 pub use dw3::depthwise3_causal;
 pub use fused_fft_conv::{fused_fft_conv, FusedFftConv};
 pub use fused_fft_conv_dd::{fused_fft_conv_dd, FusedFftConvDd};
+pub use fused_monarch::{butterfly_fft_forward_fused, monarch_conv_fused, warmup};
 pub use irfft::{irfft, irfft_dd, FftNorm};

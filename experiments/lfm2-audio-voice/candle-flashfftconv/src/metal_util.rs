@@ -10,33 +10,73 @@ use candle_core::backend::BackendStorage;
 use candle_core::{DType, Layout, MetalDevice, MetalStorage, Result, Shape};
 use candle_metal_kernels::metal::ComputePipeline;
 use objc2_metal::MTLSize;
-use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
-thread_local! {
-    static PIPELINES: RefCell<HashMap<&'static str, ComputePipeline>> = RefCell::new(HashMap::new());
+/// Global, thread-safe cache of compiled pipelines, keyed by kernel name. A
+/// `ComputePipeline` is the immutable **compiled kernel** (verified `Send + Sync`, see
+/// `thread_safety`), so it is compiled **once process-wide** and shared across every
+/// thread; each dispatch then builds its own cheap, per-thread command encoder against
+/// the shared pipeline — compiled-code vs. instances-of-the-code.
+static PIPELINES: OnceLock<Mutex<HashMap<&'static str, ComputePipeline>>> = OnceLock::new();
+
+fn pipelines() -> &'static Mutex<HashMap<&'static str, ComputePipeline>> {
+    PIPELINES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Compile `source` and return the pipeline for `fn_name`, cached per thread by
-/// `fn_name`. Assumes a single Metal device (the common case).
+// Test-only per-thread compile counter. The pipeline cache is thread-local, so this
+// mirrors it: a reused kernel compiles once on a thread and then dispatches from the
+// cached `ComputePipeline`, so this stops incrementing on reuse. Thread-local (not
+// global) so the count is unaffected by other tests compiling on other threads.
+#[cfg(test)]
+thread_local! {
+    static PIPELINE_COMPILES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// MSL compiles (cache misses) on the **current thread**. Stops incrementing once a
+/// kernel is cached — the check behind the "compiled once, then reused" test.
+#[cfg(test)]
+pub fn pipeline_compiles() -> u64 {
+    PIPELINE_COMPILES.with(|c| c.get())
+}
+
+#[cfg(test)]
+mod thread_safety {
+    use super::ComputePipeline;
+    // Compiles only if a compiled pipeline is safe to share across threads — i.e. the
+    // compiled kernel can live in one global cache, not one-per-thread. Fails the BUILD
+    // (not just at runtime) if `ComputePipeline` is not `Send + Sync`.
+    #[test]
+    fn compiled_pipeline_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<ComputePipeline>();
+    }
+}
+
+/// Compile `source` and return the pipeline for `fn_name`, cached **process-wide**
+/// (shared across threads) by `fn_name`. Assumes a single Metal device (the common case).
 pub fn pipeline(dev: &MetalDevice, fn_name: &'static str, source: &str) -> Result<ComputePipeline> {
-    PIPELINES.with(|cache| {
-        if let Some(p) = cache.borrow().get(fn_name) {
-            return Ok(p.clone());
-        }
-        let mtl = dev.metal_device();
-        let lib = mtl
-            .new_library_with_source(source, None)
-            .map_err(|e| candle_core::Error::Msg(format!("metal compile {fn_name}: {e}")))?;
-        let func = lib
-            .get_function(fn_name, None)
-            .map_err(|e| candle_core::Error::Msg(format!("metal get_function {fn_name}: {e}")))?;
-        let p = mtl
-            .new_compute_pipeline_state_with_function(&func)
-            .map_err(|e| candle_core::Error::Msg(format!("metal pipeline {fn_name}: {e}")))?;
-        cache.borrow_mut().insert(fn_name, p.clone());
-        Ok(p)
-    })
+    // Fast path: the shared compiled kernel is already cached.
+    if let Some(p) = pipelines().lock().unwrap().get(fn_name) {
+        return Ok(p.clone());
+    }
+    // Miss: compile *without* holding the lock — an MSL compile is slow and other threads
+    // must still be able to look up their (already-cached) kernels. A cold race may
+    // compile the same kernel twice; that is benign (last insert wins).
+    let mtl = dev.metal_device();
+    let lib = mtl
+        .new_library_with_source(source, None)
+        .map_err(|e| candle_core::Error::Msg(format!("metal compile {fn_name}: {e}")))?;
+    let func = lib
+        .get_function(fn_name, None)
+        .map_err(|e| candle_core::Error::Msg(format!("metal get_function {fn_name}: {e}")))?;
+    let p = mtl
+        .new_compute_pipeline_state_with_function(&func)
+        .map_err(|e| candle_core::Error::Msg(format!("metal pipeline {fn_name}: {e}")))?;
+    #[cfg(test)]
+    PIPELINE_COMPILES.with(|c| c.set(c.get() + 1));
+    pipelines().lock().unwrap().insert(fn_name, p.clone());
+    Ok(p)
 }
 
 /// Dispatch a butterfly phase: two f32 inputs (`x` at buffer 0, a matrix/twiddle

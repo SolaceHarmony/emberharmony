@@ -7,7 +7,9 @@
 //! accuracy instead of the f32 floor. Threadgroup memory is `complex_dd` (4 f32 =
 //! 16 bytes/element), so `fft_size ≤ 1024` still fits.
 
-use candle_core::{CpuStorage, CustomOp3, DType, Layout, Result, Shape, Tensor};
+use candle_core::{CpuStorage, CustomOp3, Layout, Result, Shape, Tensor};
+#[cfg(feature = "metal")]
+use candle_core::DType;
 
 #[cfg(feature = "metal")]
 fn dd_source() -> String {
