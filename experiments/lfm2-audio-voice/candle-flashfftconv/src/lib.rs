@@ -19,6 +19,10 @@
 //! - [`depthwise_conv1d`] — depthwise (grouped, one filter per channel) causal
 //!   conv1d. This is the LFM2 short-conv (`conv_L_cache`) and the FlashFFTConv
 //!   short-filter path. **Done + verified** (metal == cpu, 5.96e-8).
+//! - [`depthwise_conv1d_stream`] — the same conv with a cache of the prior `K-1`
+//!   inputs (a *valid* conv over the cache-prepended stream): one op for prefill
+//!   (no cache) and single-step decode (cache), the form LFM2's short-conv decode
+//!   needs. **Done + verified**: chunked streaming incl. `T=1` == full sequence (0.0).
 //! - [`butterfly_fft_forward`] / [`butterfly_fft_inverse`] — the Monarch butterfly
 //!   FFT and its inverse (row-DFT → twiddle → col-DFT, and the mirror), with
 //!   [`fft_matrix`]/[`ifft_matrix`]/[`twiddle_factors_fft`]/[`twiddle_factors_ifft`].
@@ -91,7 +95,7 @@ pub use butterfly::{
     butterfly_fft_forward, butterfly_fft_inverse, complex_mul, fft_matrix, ifft_matrix, monarch_conv,
     monarch_conv_bf16, twiddle_factors_fft, twiddle_factors_ifft,
 };
-pub use conv1d::{depthwise_conv1d, DepthwiseCausalConv1d};
+pub use conv1d::{depthwise_conv1d, depthwise_conv1d_stream, DepthwiseCausalConv1d};
 pub use dd_complex_mul::complex_mul_dd;
 pub use dw3::depthwise3_causal;
 pub use fused_fft_conv::{fused_fft_conv, FusedFftConv};

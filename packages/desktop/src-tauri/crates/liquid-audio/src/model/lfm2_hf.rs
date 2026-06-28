@@ -15,10 +15,11 @@
 //!   binds the short-conv (`conv_L_cache`) to the `causal_conv1d` kernel when it is
 //!   importable. Here attention is the eager matmul+softmax math (the kernel-free
 //!   `sdpa`/no-flash path, *not* flash-attn's reordered online-softmax) and the
-//!   short-conv prefill routes through the FlashFFTConv `depthwise_conv1d` CustomOp (CPU
-//!   reference + one Metal kernel; identical causal-depthwise math to candle's `Conv1d`,
-//!   matched to ~1e-5 — see `tests/short_conv_parity.rs`), single-step decode is
-//!   gather-mul-sum. That op carries a CPU reference, so the backbone still runs on
+//!   short-conv routes through the FlashFFTConv `depthwise_conv1d_stream` CustomOp (CPU
+//!   reference + one Metal kernel) for BOTH prefill and single-step decode — one causal
+//!   depthwise path, the prior K-1 inputs streamed via the conv cache. Identical math to
+//!   candle's `Conv1d` (matched bit-exact — see `tests/short_conv_parity.rs`). The op
+//!   carries a CPU reference, so the backbone still runs on
 //!   `Device::Cpu` (LFM2's "no GPU needed" design point, which the CUDA-gated reference
 //!   stack cannot deliver as shipped). Verified: backbone parity 6.558e-6.
 
@@ -330,54 +331,34 @@ impl ShortConv {
     }
 
     fn forward(&self, x: &Tensor, block_idx: usize, cache: &mut Cache) -> Result<Tensor> {
-        let (b, seq_len, _) = x.dims3()?;
+        let (_b, seq_len, _) = x.dims3()?;
         let bcx = self.in_proj.forward(x)?.transpose(1, 2)?;
         let bgate = bcx.narrow(1, 0, self.hidden_size)?;
         let c = bcx.narrow(1, self.hidden_size, self.hidden_size)?;
         let x_proj = bcx.narrow(1, 2 * self.hidden_size, self.hidden_size)?;
         let bx = (bgate * &x_proj)?.contiguous()?;
 
-        let conv_out = if seq_len == 1 {
-            let conv_weight = self.conv_weight.squeeze(1)?;
-            let mut state = match &cache.conv_states[block_idx] {
-                Some(s) => s.clone(),
-                None => Tensor::zeros((b, self.hidden_size, self.l_cache), bx.dtype(), bx.device())?,
-            };
-            if self.l_cache > 1 {
-                let tail = state.narrow(2, 1, self.l_cache - 1)?;
-                state = Tensor::cat(&[tail, bx.clone()], 2)?;
-            } else {
-                state = bx.clone();
-            }
-            if cache.use_kv_cache {
-                cache.conv_states[block_idx] = Some(state.clone());
-            }
-            (state * conv_weight.unsqueeze(0)?)?.sum_keepdim(2)?.contiguous()?
+        // One causal depthwise short-conv path for both prefill and decode, through the
+        // FlashFFTConv `depthwise_conv1d_stream` kernel (metal == cpu 5.96e-8). Prefill
+        // (seq_len > 1) zero-pads — ignoring any prior cache, exactly as the reference does;
+        // single-step decode streams the prior K-1 inputs from the conv cache. `new_cache`
+        // carries the last K-1 inputs for the next step. The kernel is f32-only, so the bf16
+        // Metal path upcasts for the conv and casts the result back; the cache stays f32.
+        let w = self.conv_weight.squeeze(1)?; // (H, K)
+        let prev = if seq_len == 1 && self.l_cache > 0 {
+            cache.conv_states[block_idx].clone()
         } else {
-            // Full-sequence causal depthwise conv via the FlashFFTConv kernel (one Metal
-            // dispatch; metal == cpu 5.96e-8) — identical math to candle `Conv1d` with
-            // padding = K-1, groups = H, narrowed to seq_len. The kernel is f32-only, so the
-            // bf16 Metal path upcasts for the conv and casts the result back.
-            let w = self.conv_weight.squeeze(1)?; // (H, K)
-            let conv_out = candle_flashfftconv::depthwise_conv1d(
-                &bx.to_dtype(candle_core::DType::F32)?,
-                &w.to_dtype(candle_core::DType::F32)?,
-                None,
-                self.l_cache.saturating_sub(1),
-            )?;
-            let out = conv_out.narrow(2, 0, seq_len)?.to_dtype(bx.dtype())?;
-            if cache.use_kv_cache && self.l_cache > 0 {
-                let start = seq_len.saturating_sub(self.l_cache);
-                let clen = seq_len - start;
-                let mut src = bx.narrow(2, start, clen)?;
-                if clen < self.l_cache {
-                    let zeros = Tensor::zeros((b, self.hidden_size, self.l_cache - clen), src.dtype(), src.device())?;
-                    src = Tensor::cat(&[zeros, src], 2)?;
-                }
-                cache.conv_states[block_idx] = Some(src);
-            }
-            out
+            None
         };
+        let (out, new_cache) = candle_flashfftconv::depthwise_conv1d_stream(
+            &bx.to_dtype(candle_core::DType::F32)?,
+            &w.to_dtype(candle_core::DType::F32)?,
+            prev.as_ref(),
+        )?;
+        if cache.use_kv_cache && self.l_cache > 0 {
+            cache.conv_states[block_idx] = Some(new_cache);
+        }
+        let conv_out = out.to_dtype(bx.dtype())?;
 
         let conv_out = (c * &conv_out)?.transpose(1, 2)?.contiguous()?;
         self.out_proj.forward(&conv_out)

@@ -239,6 +239,32 @@ pub fn depthwise_conv1d(u: &Tensor, weight: &Tensor, bias: Option<&Tensor>, padd
     u.apply_op3(&weight, &bias, DepthwiseCausalConv1d { padding })
 }
 
+/// Streaming causal depthwise conv1d with a cache of the prior `K-1` input samples — the
+/// form LFM2's short-conv (`conv_l_cache`) decode needs. Processes `x` `[B,D,T]` (`T ≥ 1`)
+/// preceded by `cache` `[B,D,K-1]` (the last K-1 inputs from the previous call; `None` =
+/// zero-pad, i.e. a fresh prefill), and returns `(y [B,D,T], new_cache [B,D,K-1])` where
+/// `new_cache` is the last K-1 samples of `[cache | x]`, ready for the next call.
+///
+/// The conv is just [`depthwise_conv1d`] run as a *valid* (no-pad) conv over the
+/// `K-1`-prepended stream — the same verified Metal kernel, with the left boundary fed
+/// from the cache instead of zeros (the cache cat/extract is host buffer management, the
+/// convolution is the kernel). f32 only. For `cache = None` this equals
+/// `depthwise_conv1d(x, weight, None, K-1).narrow(2, 0, T)`, and a `T=1` step is exactly
+/// LFM2's decode gather `Σ_k window[k]·w[k]`.
+pub fn depthwise_conv1d_stream(x: &Tensor, weight: &Tensor, cache: Option<&Tensor>) -> Result<(Tensor, Tensor)> {
+    let (b, d, t) = x.dims3()?;
+    let (_d, k) = weight.dims2()?;
+    let p = k - 1; // cache length = the K-1 prior input samples
+    let cache = match cache {
+        Some(c) => c.contiguous()?,
+        None => Tensor::zeros((b, d, p), x.dtype(), x.device())?,
+    };
+    let stream = Tensor::cat(&[&cache, &x.contiguous()?], 2)?; // [B, D, K-1+T]
+    let y = depthwise_conv1d(&stream, weight, None, 0)?; // valid conv → [B, D, T]
+    let new_cache = stream.narrow(2, t, p)?.contiguous()?; // last K-1 of [cache | x]
+    Ok((y, new_cache))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,6 +307,39 @@ mod tests {
         for (a, e) in got.iter().zip(exp.iter()) {
             assert!((a - e).abs() < 1e-5, "{a} vs {e}");
         }
+    }
+
+    // The streaming-cache correctness property: feeding a sequence through the stream op in
+    // ragged chunks (incl. single-step `T=1` decode chunks), carrying the cache, must equal
+    // the full-sequence zero-pad causal conv. If this holds, LFM2's per-token decode is exact.
+    #[test]
+    fn stream_chunks_match_full_sequence() {
+        let dev = Device::Cpu;
+        let (b, d, k) = (2usize, 4, 3);
+        let total = 11usize;
+        let x: Vec<f32> = (0..b * d * total).map(|i| ((i * 7 % 13) as f32 * 0.1) - 0.6).collect();
+        let w: Vec<f32> = (0..d * k).map(|i| (i * 5 % 7) as f32 * 0.05).collect();
+        let xt = Tensor::from_vec(x, (b, d, total), &dev).unwrap();
+        let wt = Tensor::from_vec(w, (d, k), &dev).unwrap();
+        // reference: one-shot full-sequence causal conv.
+        let full: Vec<f32> = depthwise_conv1d(&xt, &wt, None, k - 1)
+            .unwrap().narrow(2, 0, total).unwrap().flatten_all().unwrap().to_vec1().unwrap();
+        // streamed: prefill chunk then single-step decode chunks then larger chunks.
+        let mut cache: Option<Tensor> = None;
+        let mut ys: Vec<Tensor> = Vec::new();
+        let mut pos = 0usize;
+        for &chunk in &[3usize, 1, 1, 4, 2] {
+            let xc = xt.narrow(2, pos, chunk).unwrap();
+            let (y, nc) = depthwise_conv1d_stream(&xc, &wt, cache.as_ref()).unwrap();
+            ys.push(y);
+            cache = Some(nc);
+            pos += chunk;
+        }
+        let streamed: Vec<f32> = Tensor::cat(&ys.iter().collect::<Vec<_>>(), 2)
+            .unwrap().flatten_all().unwrap().to_vec1().unwrap();
+        let maxd = full.iter().zip(&streamed).fold(0f32, |m, (a, e)| m.max((a - e).abs()));
+        assert!(maxd < 1e-5, "streamed (chunked, incl. T=1) != full-sequence conv: max diff {maxd}");
+        eprintln!("depthwise stream (incl. single-step decode) == full sequence, max diff {maxd:.2e}");
     }
 
     #[cfg(feature = "metal")]
