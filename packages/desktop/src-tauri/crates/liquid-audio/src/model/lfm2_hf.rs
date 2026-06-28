@@ -15,16 +15,18 @@
 //!   binds the short-conv (`conv_L_cache`) to the `causal_conv1d` kernel when it is
 //!   importable. Here attention is the eager matmul+softmax math (the kernel-free
 //!   `sdpa`/no-flash path, *not* flash-attn's reordered online-softmax) and the
-//!   short-conv is a plain candle `Conv1d` (prefill) / gather-mul-sum (single step).
-//!   No custom kernels — which is precisely what lets this backbone run byte-exact
-//!   on `Device::Cpu` (LFM2's "no GPU needed" design point, which the CUDA-gated
-//!   reference stack cannot deliver as shipped). Verified: backbone parity 6.558e-6.
+//!   short-conv prefill routes through the FlashFFTConv `depthwise_conv1d` CustomOp (CPU
+//!   reference + one Metal kernel; identical causal-depthwise math to candle's `Conv1d`,
+//!   matched to ~1e-5 — see `tests/short_conv_parity.rs`), single-step decode is
+//!   gather-mul-sum. That op carries a CPU reference, so the backbone still runs on
+//!   `Device::Cpu` (LFM2's "no GPU needed" design point, which the CUDA-gated reference
+//!   stack cannot deliver as shipped). Verified: backbone parity 6.558e-6.
 
 use std::collections::HashMap;
 
 use candle_core::{DType, Device, IndexOp, Result, Tensor};
 use candle_nn::kv_cache::KvCache;
-use candle_nn::{embedding, linear_no_bias, Conv1d, Conv1dConfig, Embedding, Linear, Module, VarBuilder};
+use candle_nn::{embedding, linear_no_bias, Embedding, Linear, Module, VarBuilder};
 
 // The exact two `crate::utils::*` helpers candle-transformers' `models/lfm2.rs` imports,
 // vendored onto the 0.9.2 pin (see `candle_ext`). Using the reference helpers — not a
@@ -352,12 +354,18 @@ impl ShortConv {
             }
             (state * conv_weight.unsqueeze(0)?)?.sum_keepdim(2)?.contiguous()?
         } else {
-            let conv = Conv1d::new(
-                self.conv_weight.clone(),
+            // Full-sequence causal depthwise conv via the FlashFFTConv kernel (one Metal
+            // dispatch; metal == cpu 5.96e-8) — identical math to candle `Conv1d` with
+            // padding = K-1, groups = H, narrowed to seq_len. The kernel is f32-only, so the
+            // bf16 Metal path upcasts for the conv and casts the result back.
+            let w = self.conv_weight.squeeze(1)?; // (H, K)
+            let conv_out = candle_flashfftconv::depthwise_conv1d(
+                &bx.to_dtype(candle_core::DType::F32)?,
+                &w.to_dtype(candle_core::DType::F32)?,
                 None,
-                Conv1dConfig { padding: self.l_cache.saturating_sub(1), groups: self.hidden_size, ..Default::default() },
-            );
-            let out = conv.forward(&bx)?.narrow(2, 0, seq_len)?;
+                self.l_cache.saturating_sub(1),
+            )?;
+            let out = conv_out.narrow(2, 0, seq_len)?.to_dtype(bx.dtype())?;
             if cache.use_kv_cache && self.l_cache > 0 {
                 let start = seq_len.saturating_sub(self.l_cache);
                 let clen = seq_len - start;

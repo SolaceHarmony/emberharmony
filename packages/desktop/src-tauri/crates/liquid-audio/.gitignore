@@ -4,3 +4,5 @@
 # the repo (one exceeded GitHub's 50 MB limit). Each parity test is #[ignore]d and names its
 # dump script, so a fresh checkout regenerates only what it needs.
 parity/golden/*.safetensors
+# Generated audio from the examples (chat_multiturn / generate / mic_chat write WAVs to cwd).
+*.wav

@@ -30,6 +30,7 @@
        4.6  Full forward diagram
        4.7  The faithful‑port procedure
        4.8  Numerics: candle 0.9.2, bf16 Metal, f32 CPU parity
+       4.9  The conv kernels — candle-flashfftconv
  5.  Layer 2 — Generation (the interleaved modality machine)
  6.  Layer 3 — Context is prior thoughts (the heart of the design)
        6.1  The principle
@@ -402,6 +403,31 @@ path* —
   Result: a bf16‑CPU path that matches the **bf16‑Metal deployment numerics** on CPU (useful for
   non‑Metal machines and for verifying Metal numerics without a GPU), while f32‑CPU stays the
   golden reference. **Until that lands, the kernel earns its keep nowhere.**
+
+### 4.9 The conv kernels — `candle-flashfftconv`
+
+The convolution operators that ML stacks normally gate behind custom CUDA live in their own
+crate, `experiments/lfm2-audio-voice/candle-flashfftconv/` — candle `CustomOp`s that run on
+**CPU** (faithful reference) **and Metal** (real fused kernels), no CUDA, no torch. Two
+families:
+
+- **Short conv** — `depthwise_conv1d` (the LFM2 short‑filter / `conv_L_cache` path). metal == cpu, 5.96e‑8.
+- **Long conv** — the FlashFFTConv Monarch FFT path, ported CUDA → MLX‑oracle → candle. The
+  headline is **`monarch_conv_fused`**: the full `IFFT(FFT(u) ⊙ k_f)` collapsed into **one**
+  tiled `simdgroup_matrix` (Apple tensor‑core) dispatch — every sub‑DFT an 8×8 fp32‑accumulate
+  GEMM, the `[N,L]` intermediate resident in threadgroup memory, the `×k_f` multiply fused
+  in‑kernel, edge tiles zero‑filled so any `N,L` works with no caller padding. Drop‑in for the
+  un‑fused `monarch_conv`. Verified `metal == monarch_conv` (1.5e‑8, incl. non‑mult‑of‑8 dims)
+  and `== circular convolution` (9.7e‑8); 30/30 tests green.
+
+Pipelines are compiled **once process‑wide** and shared across threads (the compiled kernel vs.
+per‑dispatch instances; `warmup()` moves the one compile to engine init). Like the bf16‑CPU
+kernel above, the fused tensor‑core conv is **built and verified**; wiring it into the LFM2
+backbone call site is the remaining step (§15).
+
+→ Full kernel design, dataflow diagram, dispatch contract, edge‑tile handling, the global
+pipeline cache, and the precision regimes (fp32 / bf16‑faithful / double‑double): see
+[`candle-flashfftconv/ARCHITECTURE.md`](../../../../experiments/lfm2-audio-voice/candle-flashfftconv/ARCHITECTURE.md).
 
 ---
 

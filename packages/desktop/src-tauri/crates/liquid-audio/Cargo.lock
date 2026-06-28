@@ -346,6 +346,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "candle-flashfftconv"
+version = "0.1.0"
+dependencies = [
+ "candle-core",
+ "candle-metal-kernels",
+ "objc2-metal",
+]
+
+[[package]]
 name = "candle-metal-kernels"
 version = "0.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1768,6 +1777,7 @@ dependencies = [
  "arrow-ipc",
  "arrow-schema",
  "candle-core",
+ "candle-flashfftconv",
  "candle-nn",
  "candle-transformers",
  "cc",

@@ -80,6 +80,12 @@ half = "2"
 # consumer. crossbeam over `std::sync::mpsc` for `recv_timeout`/`select` and `Sync`
 # receivers; its `crossbeam-utils` is already in-tree via rayon, so no new subtree.
 crossbeam-channel = "0.5"
+# FlashFFTConv kernels ported to candle (CPU + Metal). The LFM2 short-conv (`conv.weight`,
+# causal depthwise, `conv_l_cache`) routes its full-sequence prefill through this crate's
+# verified `depthwise_conv1d` (one Metal kernel; metal == cpu 5.96e-8) instead of candle's
+# generic `Conv1d`. Same candle 0.9.2 pin → one tensor substrate. f32-only kernel, so the
+# bf16 Metal path upcasts for the conv and casts back.
+candle-flashfftconv = { path = "../../../../../experiments/lfm2-audio-voice/candle-flashfftconv" }
 
 [dev-dependencies]
 anyhow = "1"
@@ -98,4 +104,4 @@ flash-attn = []
 accelerate = ["candle-core/accelerate", "candle-nn/accelerate"]
 # Metal (Apple GPU) acceleration — bf16, the deployed dtype — for real-time
 # generation. Enables candle + moshi Metal kernels. `LFM_DEVICE=metal` at runtime.
-metal = ["candle-core/metal", "candle-nn/metal", "moshi/metal"]
+metal = ["candle-core/metal", "candle-nn/metal", "moshi/metal", "candle-flashfftconv/metal"]
