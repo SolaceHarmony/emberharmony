@@ -31,7 +31,9 @@ struct FusedEmbedding {
 impl FusedEmbedding {
     fn new(vb: VarBuilder) -> Result<Self> {
         let emb = candle_nn::embedding(CODEBOOKS * AUDIO_VOCAB, EMB_DIM, vb.pp("emb"))?;
-        let offs: Vec<i64> = (0..CODEBOOKS as i64).map(|i| i * AUDIO_VOCAB as i64).collect();
+        let offs: Vec<i64> = (0..CODEBOOKS as i64)
+            .map(|i| i * AUDIO_VOCAB as i64)
+            .collect();
         let offsets = Tensor::from_vec(offs, (CODEBOOKS,), vb.device())?;
         Ok(Self { emb, offsets })
     }
@@ -39,11 +41,17 @@ impl FusedEmbedding {
     /// `x`: (B, L, codebooks) u32 codes → (B, L, dim).
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         // offset_x = offsets[None,None,:] + x   (codebooks last)
-        let offsets = self.offsets.reshape((1, 1, CODEBOOKS))?.to_dtype(x.dtype())?;
+        let offsets = self
+            .offsets
+            .reshape((1, 1, CODEBOOKS))?
+            .to_dtype(x.dtype())?;
         let offset_x = x.broadcast_add(&offsets)?; // (B, L, codebooks)
         let (b, l, _) = offset_x.dims3()?;
         let flat = offset_x.reshape((b * l * CODEBOOKS,))?;
-        let emb = self.emb.forward(&flat)?.reshape((b, l, CODEBOOKS, EMB_DIM))?;
+        let emb = self
+            .emb
+            .forward(&flat)?
+            .reshape((b, l, CODEBOOKS, EMB_DIM))?;
         emb.mean(2) // average over codebooks → (B, L, dim)
     }
 }
@@ -71,7 +79,10 @@ struct Istft {
 impl Istft {
     fn new(n_fft: usize, hop: usize, win_length: usize, vb: VarBuilder) -> Result<Self> {
         let dev = vb.device().clone();
-        let window_vec = vb.get(win_length, "window")?.to_dtype(candle_core::DType::F32)?.to_vec1::<f32>()?;
+        let window_vec = vb
+            .get(win_length, "window")?
+            .to_dtype(candle_core::DType::F32)?
+            .to_vec1::<f32>()?;
         // Center the analysis window in an n_fft frame (torch pads when win < n_fft).
         let win: Vec<f32> = if window_vec.len() == n_fft {
             window_vec
@@ -91,7 +102,11 @@ impl Istft {
         let mut cw = vec![0f32; freq * n_fft];
         let mut sw = vec![0f32; freq * n_fft];
         for k in 0..freq {
-            let a = if k == 0 || (n_fft % 2 == 0 && k == n_fft / 2) { 1.0 } else { 2.0 };
+            let a = if k == 0 || (n_fft % 2 == 0 && k == n_fft / 2) {
+                1.0
+            } else {
+                2.0
+            };
             for j in 0..n_fft {
                 let ang = two_pi * k as f64 * j as f64 / n_fft as f64;
                 cw[k * n_fft + j] = (a * ang.cos() * scale) as f32;
@@ -114,7 +129,15 @@ impl Istft {
         let ola = Tensor::from_vec(eye, (n_fft, 1, n_fft), &dev)?;
 
         let pad = (win_length - hop) / 2;
-        Ok(Self { hop, pad, cw, sw, window, win_sq, ola })
+        Ok(Self {
+            hop,
+            pad,
+            cw,
+            sw,
+            window,
+            win_sq,
+            ola,
+        })
     }
 
     /// `re`/`im`: `(B, n_fft/2+1, T)` complex spectrogram → waveform `(B, L)`.
@@ -129,14 +152,24 @@ impl Istft {
         // output) and the STFT is precision-sensitive — so f32 here is the faithful
         // match and also the dtype of the basis `cw`/`sw`.
         let f32 = candle_core::DType::F32;
-        let re_t = re.to_dtype(f32)?.transpose(1, 2)?.contiguous()?.reshape((b * t, freq))?; // (B·T, freq)
-        let im_t = im.to_dtype(f32)?.transpose(1, 2)?.contiguous()?.reshape((b * t, freq))?;
+        let re_t = re
+            .to_dtype(f32)?
+            .transpose(1, 2)?
+            .contiguous()?
+            .reshape((b * t, freq))?; // (B·T, freq)
+        let im_t = im
+            .to_dtype(f32)?
+            .transpose(1, 2)?
+            .contiguous()?
+            .reshape((b * t, freq))?;
         let frames = (re_t.matmul(&self.cw)? + im_t.matmul(&self.sw)?)?; // (B·T, n_fft)
         let frames = frames.reshape((b, t, n))?.transpose(1, 2)?.contiguous()?; // (B, n_fft, T)
 
         // Window, then overlap-add (conv_transpose1d, stride=hop) → (B, out_size).
         let frames = frames.broadcast_mul(&self.window)?;
-        let y = frames.conv_transpose1d(&self.ola, 0, 0, self.hop, 1, 1)?.squeeze(1)?;
+        let y = frames
+            .conv_transpose1d(&self.ola, 0, 0, self.hop, 1, 1)?
+            .squeeze(1)?;
         // Window-overlap envelope: same overlap-add applied to win² over every frame.
         let env = self
             .win_sq
@@ -161,11 +194,15 @@ impl Istft {
 /// host-side scalar double-loop + `Tensor::from_vec` host→device copy. Since `n = 6·L`
 /// grows with the reply and this runs on every forward pass, the GPU build avoids an
 /// O(n²) CPU loop and a per-frame host→device transfer. Stateless, exactly like Python.
-fn build_sliding_mask(n: usize, sliding_window: usize, device: &candle_core::Device) -> Result<Tensor> {
+fn build_sliding_mask(
+    n: usize,
+    sliding_window: usize,
+    device: &candle_core::Device,
+) -> Result<Tensor> {
     use candle_core::DType;
     let w = sliding_window as i64;
     let idx = Tensor::arange(0i64, n as i64, device)?; // (n,)
-    // d[i][j] = idx[j] - idx[i] = j - i  (broadcast (1,n) - (n,1))
+                                                       // d[i][j] = idx[j] - idx[i] = j - i  (broadcast (1,n) - (n,1))
     let d = idx.reshape((1, n))?.broadcast_sub(&idx.reshape((n, 1))?)?;
     // attend = (d <= 0) & (d > -w), as u8 (1 = attend); `&` via where_cond to avoid u8 mul
     let attend = d
@@ -193,7 +230,14 @@ impl LFM2AudioDetokenizer {
         let lfm = Lfm2Model::new(&backbone_cfg, vb.pp("lfm"))?;
         let lin = linear(EMB_DIM, 1282, vb.pp("lin"))?;
         let istft = Istft::new(1280, 320, 1280, vb.pp("istft"))?;
-        Ok(Self { emb, lfm, lfm_cfg: backbone_cfg, lin, istft, sliding_window })
+        Ok(Self {
+            emb,
+            lfm,
+            lfm_cfg: backbone_cfg,
+            lin,
+            istft,
+            sliding_window,
+        })
     }
 
     /// Additive sliding-window causal mask `(1,1,n,n)` — see [`build_sliding_mask`].
@@ -207,7 +251,11 @@ impl LFM2AudioDetokenizer {
         let l = x.dim(1)?;
         // ×6 nearest-exact upsample over time = repeat-interleave by 6
         let (b, _, d) = x.dims3()?;
-        let x = x.unsqueeze(2)?.broadcast_as((b, l, 6, d))?.reshape((b, l * 6, d))?.contiguous()?;
+        let x = x
+            .unsqueeze(2)?
+            .broadcast_as((b, l, 6, d))?
+            .reshape((b, l * 6, d))?
+            .contiguous()?;
         let n = l * 6;
 
         let mask = self.sliding_mask(n, x.device())?;
@@ -237,7 +285,13 @@ mod tests {
     // Independent f64 reference: per-frame hermitian inverse real DFT (norm="backward")
     // + windowed overlap-add + window-envelope normalization ("same" trim) — the exact
     // algorithm the candle Istft realizes, in f64.
-    fn ref_istft(re: &[Vec<f32>], im: &[Vec<f32>], window: &[f32], n_fft: usize, hop: usize) -> Vec<f32> {
+    fn ref_istft(
+        re: &[Vec<f32>],
+        im: &[Vec<f32>],
+        window: &[f32],
+        n_fft: usize,
+        hop: usize,
+    ) -> Vec<f32> {
         let t = re[0].len();
         let freq = n_fft / 2 + 1;
         let win: Vec<f64> = window.iter().map(|&w| w as f64).collect();
@@ -260,7 +314,9 @@ mod tests {
                 env[ti * hop + j] += win_sq[j];
             }
         }
-        (pad..out_size - pad).map(|i| (y[i] / env[i]) as f32).collect()
+        (pad..out_size - pad)
+            .map(|i| (y[i] / env[i]) as f32)
+            .collect()
     }
 
     #[test]
@@ -270,32 +326,64 @@ mod tests {
         let freq = n_fft / 2 + 1;
         // symmetric Hann window (periodic=False), strictly positive envelope under OLA.
         let window: Vec<f32> = (0..n_fft)
-            .map(|i| (std::f64::consts::PI * i as f64 / (n_fft - 1) as f64).sin().powi(2) as f32)
+            .map(|i| {
+                (std::f64::consts::PI * i as f64 / (n_fft - 1) as f64)
+                    .sin()
+                    .powi(2) as f32
+            })
             .collect();
         let re: Vec<Vec<f32>> = (0..freq)
-            .map(|k| (0..t).map(|ti| ((k * 7 + ti * 3) as f32 * 0.1).cos()).collect())
+            .map(|k| {
+                (0..t)
+                    .map(|ti| ((k * 7 + ti * 3) as f32 * 0.1).cos())
+                    .collect()
+            })
             .collect();
         let im: Vec<Vec<f32>> = (0..freq)
-            .map(|k| (0..t).map(|ti| ((k * 5 + ti * 2) as f32 * 0.13).sin()).collect())
+            .map(|k| {
+                (0..t)
+                    .map(|ti| ((k * 5 + ti * 2) as f32 * 0.13).sin())
+                    .collect()
+            })
             .collect();
         let exp = ref_istft(&re, &im, &window, n_fft, hop);
 
         // Build the candle Istft via a VarBuilder carrying the window.
         let win_t = Tensor::from_vec(window.clone(), (n_fft,), &dev).unwrap();
-        let vb = VarBuilder::from_tensors(HashMap::from([("window".to_string(), win_t)]), DType::F32, &dev);
+        let vb = VarBuilder::from_tensors(
+            HashMap::from([("window".to_string(), win_t)]),
+            DType::F32,
+            &dev,
+        );
         let istft = Istft::new(n_fft, hop, n_fft, vb).unwrap();
         // (1, freq, T) spectra.
         let re_flat: Vec<f32> = (0..freq).flat_map(|k| re[k].clone()).collect();
         let im_flat: Vec<f32> = (0..freq).flat_map(|k| im[k].clone()).collect();
         let re_t = Tensor::from_vec(re_flat, (1, freq, t), &dev).unwrap();
         let im_t = Tensor::from_vec(im_flat, (1, freq, t), &dev).unwrap();
-        let got: Vec<f32> = istft.forward(&re_t, &im_t).unwrap().flatten_all().unwrap().to_vec1().unwrap();
+        let got: Vec<f32> = istft
+            .forward(&re_t, &im_t)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
 
         assert_eq!(got.len(), exp.len(), "ISTFT length mismatch");
-        let maxd = got.iter().zip(exp.iter()).fold(0f32, |m, (a, e)| m.max((a - e).abs()));
+        let maxd = got
+            .iter()
+            .zip(exp.iter())
+            .fold(0f32, |m, (a, e)| m.max((a - e).abs()));
         let scale = exp.iter().fold(0f32, |m, &x| m.max(x.abs())).max(1e-6);
-        eprintln!("candle ISTFT vs f64 ref: max diff {maxd:.2e} (rel {:.2e})", maxd / scale);
-        assert!(maxd / scale < 1e-4, "candle ISTFT vs f64 ref rel {}", maxd / scale);
+        eprintln!(
+            "candle ISTFT vs f64 ref: max diff {maxd:.2e} (rel {:.2e})",
+            maxd / scale
+        );
+        assert!(
+            maxd / scale < 1e-4,
+            "candle ISTFT vs f64 ref rel {}",
+            maxd / scale
+        );
     }
 
     #[test]
@@ -315,11 +403,22 @@ mod tests {
             }
             let m = build_sliding_mask(n, w, &dev).unwrap();
             assert_eq!(m.dims(), &[1, 1, n, n]);
-            let got: Vec<f32> = m.reshape((n, n)).unwrap().flatten_all().unwrap().to_vec1().unwrap();
+            let got: Vec<f32> = m
+                .reshape((n, n))
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
             for (k, (&g, &e)) in got.iter().zip(exp.iter()).enumerate() {
                 let same = (g == e)
-                    || (g.is_infinite() && e.is_infinite() && g.is_sign_negative() == e.is_sign_negative());
-                assert!(same, "mask mismatch at {k} (n={n}, w={w}): got {g}, exp {e}");
+                    || (g.is_infinite()
+                        && e.is_infinite()
+                        && g.is_sign_negative() == e.is_sign_negative());
+                assert!(
+                    same,
+                    "mask mismatch at {k} (n={n}, w={w}): got {g}, exp {e}"
+                );
             }
         }
     }

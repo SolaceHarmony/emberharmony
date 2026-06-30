@@ -80,14 +80,30 @@ pub struct Lfm2Config {
     pub block_auto_adjust_ff_dim: bool,
 }
 
-fn d_kv_heads() -> usize { 8 }
-fn d_eps() -> f64 { 1e-5 }
-fn d_theta() -> f32 { 1_000_000.0 }
-fn d_maxpos() -> usize { 128_000 }
-fn d_lcache() -> usize { 3 }
-fn d_ffn_mult() -> f32 { 1.0 }
-fn d_mult_of() -> usize { 256 }
-fn d_true() -> bool { true }
+fn d_kv_heads() -> usize {
+    8
+}
+fn d_eps() -> f64 {
+    1e-5
+}
+fn d_theta() -> f32 {
+    1_000_000.0
+}
+fn d_maxpos() -> usize {
+    128_000
+}
+fn d_lcache() -> usize {
+    3
+}
+fn d_ffn_mult() -> f32 {
+    1.0
+}
+fn d_mult_of() -> usize {
+    256
+}
+fn d_true() -> bool {
+    true
+}
 
 impl Lfm2Config {
     pub fn head_dim(&self) -> usize {
@@ -100,7 +116,11 @@ impl Lfm2Config {
     /// coincided when `block_ff_dim == 6*hidden` (the main backbone); it underrounds
     /// the audio detokenizer (`block_ff_dim=3328` ⇒ 2304, not 2048).
     pub fn intermediate_size(&self) -> usize {
-        let ff = if self.block_ff_dim > 0 { self.block_ff_dim } else { 4 * self.hidden_size };
+        let ff = if self.block_ff_dim > 0 {
+            self.block_ff_dim
+        } else {
+            4 * self.hidden_size
+        };
         if self.block_auto_adjust_ff_dim {
             let reduced = (2 * ff) / 3; // int(2*ff/3)
             let scaled = (self.block_ffn_dim_multiplier * reduced as f32) as usize;
@@ -139,7 +159,12 @@ pub struct Cache {
 }
 
 impl Cache {
-    pub fn new(use_kv_cache: bool, dtype: DType, cfg: &Lfm2Config, device: &Device) -> Result<Self> {
+    pub fn new(
+        use_kv_cache: bool,
+        dtype: DType,
+        cfg: &Lfm2Config,
+        device: &Device,
+    ) -> Result<Self> {
         let head_dim = cfg.head_dim();
         let inv_freq: Vec<f32> = (0..head_dim)
             .step_by(2)
@@ -155,7 +180,9 @@ impl Cache {
         let sin = idx_theta.sin()?.to_dtype(dtype)?;
         Ok(Self {
             use_kv_cache,
-            kvs: (0..cfg.num_hidden_layers).map(|_| KvCache::new(2, KV_CACHE_INITIAL_CAP)).collect(),
+            kvs: (0..cfg.num_hidden_layers)
+                .map(|_| KvCache::new(2, KV_CACHE_INITIAL_CAP))
+                .collect(),
             conv_states: vec![None; cfg.num_hidden_layers],
             masks: HashMap::new(),
             cos,
@@ -259,11 +286,31 @@ impl Attention {
         candle_nn::rotary_emb::rope_slow(&x.contiguous()?, &cos, &sin)
     }
 
-    fn forward(&self, x: &Tensor, index_pos: usize, block_idx: usize, cache: &mut Cache, add_mask: Option<&Tensor>) -> Result<Tensor> {
+    fn forward(
+        &self,
+        x: &Tensor,
+        index_pos: usize,
+        block_idx: usize,
+        cache: &mut Cache,
+        add_mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
         let (b, seq_len, _) = x.dims3()?;
-        let q = self.q_proj.forward(x)?.reshape((b, seq_len, self.n_head, self.head_dim))?.transpose(1, 2)?;
-        let k = self.k_proj.forward(x)?.reshape((b, seq_len, self.n_kv, self.head_dim))?.transpose(1, 2)?;
-        let v = self.v_proj.forward(x)?.reshape((b, seq_len, self.n_kv, self.head_dim))?.transpose(1, 2)?.contiguous()?;
+        let q = self
+            .q_proj
+            .forward(x)?
+            .reshape((b, seq_len, self.n_head, self.head_dim))?
+            .transpose(1, 2)?;
+        let k = self
+            .k_proj
+            .forward(x)?
+            .reshape((b, seq_len, self.n_kv, self.head_dim))?
+            .transpose(1, 2)?;
+        let v = self
+            .v_proj
+            .forward(x)?
+            .reshape((b, seq_len, self.n_kv, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
 
         let q = self.q_norm.forward(&q.contiguous()?)?;
         let k = self.k_norm.forward(&k.contiguous()?)?;
@@ -305,7 +352,9 @@ impl Attention {
         // attention is trained. Same forward values.
         let att = candle_nn::ops::softmax(&att, candle_core::D::Minus1)?;
         let y = att.matmul(&v.contiguous()?)?.to_dtype(x.dtype())?;
-        let y = y.transpose(1, 2)?.reshape((b, seq_len, self.n_head * self.head_dim))?;
+        let y = y
+            .transpose(1, 2)?
+            .reshape((b, seq_len, self.n_head * self.head_dim))?;
         self.o_proj.forward(&y)
     }
 }
@@ -349,7 +398,8 @@ impl ShortConv {
         } else {
             None
         };
-        let (conv_out, new_cache) = candle_flashfftconv::depthwise_conv1d_stream(&bx, &w, prev.as_ref())?;
+        let (conv_out, new_cache) =
+            candle_flashfftconv::depthwise_conv1d_stream(&bx, &w, prev.as_ref())?;
         if cache.use_kv_cache && self.l_cache > 0 {
             cache.conv_states[block_idx] = Some(new_cache);
         }
@@ -376,14 +426,33 @@ impl DecoderLayer {
         let operator_norm = RmsNorm::new(cfg.hidden_size, cfg.norm_eps, vb.pp("operator_norm"))?;
         let ffn_norm = RmsNorm::new(cfg.hidden_size, cfg.norm_eps, vb.pp("ffn_norm"))?;
         let mlp = Mlp::new(cfg, vb.pp("feed_forward"))?;
-        let kind = match cfg.layer_types.get(layer_idx).copied().unwrap_or(LayerType::FullAttention) {
-            LayerType::FullAttention => LayerKind::Attention(Box::new(Attention::new(cfg, vb.pp("self_attn"))?)),
+        let kind = match cfg
+            .layer_types
+            .get(layer_idx)
+            .copied()
+            .unwrap_or(LayerType::FullAttention)
+        {
+            LayerType::FullAttention => {
+                LayerKind::Attention(Box::new(Attention::new(cfg, vb.pp("self_attn"))?))
+            }
             LayerType::Conv => LayerKind::ShortConv(ShortConv::new(cfg, vb.pp("conv"))?),
         };
-        Ok(Self { operator_norm, ffn_norm, mlp, kind })
+        Ok(Self {
+            operator_norm,
+            ffn_norm,
+            mlp,
+            kind,
+        })
     }
 
-    fn forward(&self, x: &Tensor, index_pos: usize, block_idx: usize, cache: &mut Cache, add_mask: Option<&Tensor>) -> Result<Tensor> {
+    fn forward(
+        &self,
+        x: &Tensor,
+        index_pos: usize,
+        block_idx: usize,
+        cache: &mut Cache,
+        add_mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
         let residual = x;
         let h = self.operator_norm.forward(x)?;
         let h = match &self.kind {
@@ -417,7 +486,11 @@ impl Model {
             layers.push(DecoderLayer::new(cfg, i, vb_l.pp(i.to_string()))?);
         }
         let embedding_norm = RmsNorm::new(cfg.hidden_size, cfg.norm_eps, vb.pp("embedding_norm"))?;
-        Ok(Self { embed_tokens, layers, embedding_norm })
+        Ok(Self {
+            embed_tokens,
+            layers,
+            embedding_norm,
+        })
     }
 
     /// Embedding lookup (the model's input token embedding).
@@ -432,7 +505,13 @@ impl Model {
 
     /// Run the backbone over `inputs_embeds`, returning the all-position hidden
     /// state. `add_mask` overrides the default causal mask (e.g. sliding window).
-    pub fn forward_embeds(&self, embeds: &Tensor, index_pos: usize, cache: &mut Cache, add_mask: Option<&Tensor>) -> Result<Tensor> {
+    pub fn forward_embeds(
+        &self,
+        embeds: &Tensor,
+        index_pos: usize,
+        cache: &mut Cache,
+        add_mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
         let mut hidden = embeds.clone();
         for (block_idx, layer) in self.layers.iter().enumerate() {
             hidden = layer.forward(&hidden, index_pos, block_idx, cache, add_mask)?;
@@ -441,7 +520,12 @@ impl Model {
     }
 
     /// Convenience: token ids → all-position hidden state (causal).
-    pub fn forward_ids(&self, input_ids: &Tensor, index_pos: usize, cache: &mut Cache) -> Result<Tensor> {
+    pub fn forward_ids(
+        &self,
+        input_ids: &Tensor,
+        index_pos: usize,
+        cache: &mut Cache,
+    ) -> Result<Tensor> {
         let embeds = self.embed(input_ids)?;
         self.forward_embeds(&embeds, index_pos, cache, None)
     }

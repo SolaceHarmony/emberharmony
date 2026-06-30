@@ -256,7 +256,10 @@ Everything else is ≥ 0.6× (most > 1×).
 
 - The vendored Python `liquid_audio/moshi/**` is **reused as the `moshi` crate** (Kyutai's
   Rust port), not re-ported — `compare_symbols`'s `core` scope excludes it by design.
-- `liquid_audio/demo/**` (gradio/CLI demo) is not ported.
+- `liquid_audio/demo/chat.py`'s core Moshi-facing interface is ported under
+  `src/moshi/demo/chat.rs` and wired into the examples/realtime path
+  (`proc.mimi` + `mimi.streaming(1)` + `mimi.decode(frame)`). The Gradio/WebRTC UI
+  and the Moshi server/client transports remain out of scope.
 
 ---
 

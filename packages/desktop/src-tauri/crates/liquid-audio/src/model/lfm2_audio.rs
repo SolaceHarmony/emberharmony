@@ -21,7 +21,9 @@ use candle_transformers::generation::{LogitsProcessor, Sampling};
 use crate::model::conformer::encoder::{ConformerEncoder, ConformerEncoderConfig};
 use crate::model::lfm2_hf::{Cache as LfmCache, Lfm2Config, Model as Lfm2Model};
 use crate::model::mlp::MLP;
-use crate::model::transformer::{HeadStyle, LayerKvCache, Mha, RawLmBackbone, SharedEmbedding, StandardBlock};
+use crate::model::transformer::{
+    HeadStyle, LayerKvCache, Mha, RawLmBackbone, SharedEmbedding, StandardBlock,
+};
 use crate::processor::ChatState;
 use crate::utils::{mel2emb_len, LFMModality};
 
@@ -214,16 +216,24 @@ impl Sampler {
             Sampling::ArgMax
         } else {
             // non-greedy ⇒ temperature is Some(>0).
-            Sampling::All { temperature: temperature.expect("non-greedy ⇒ temperature is Some(>0)") }
+            Sampling::All {
+                temperature: temperature.expect("non-greedy ⇒ temperature is Some(>0)"),
+            }
         };
-        Self { processor: LogitsProcessor::from_sampling(seed, sampling), top_k, greedy }
+        Self {
+            processor: LogitsProcessor::from_sampling(seed, sampling),
+            top_k,
+            greedy,
+        }
     }
 
     /// Sample one token from 1-D `logits` (`V,`).
     fn sample(&mut self, logits: &Tensor) -> Result<u32> {
         match (self.greedy, self.top_k) {
             // Stochastic + top-k: inject Torch's threshold mask via the sample_f hook.
-            (false, Some(k)) => self.processor.sample_f(logits, move |prs| torch_topk_mask(prs, k)),
+            (false, Some(k)) => self
+                .processor
+                .sample_f(logits, move |prs| torch_topk_mask(prs, k)),
             // Greedy (argmax), or stochastic without top-k (plain multinomial).
             _ => self.processor.sample(logits),
         }
@@ -297,16 +307,43 @@ impl LFM2AudioModel {
         let hidden = lfm_cfg.hidden_size;
         let lfm = Lfm2Model::new(&lfm_cfg, vb.pp("lfm"))?;
         let conformer = ConformerEncoder::new(enc_cfg, vb.pp("conformer"))?;
-        let feat_out = if enc_cfg.feat_out > 0 && enc_cfg.feat_out != enc_cfg.d_model { enc_cfg.feat_out } else { enc_cfg.d_model };
-        let audio_adapter = MLP::new(feat_out, hidden, &[hidden], true, true, 0.0, vb.pp("audio_adapter"))?;
-        let audio_embedding = SharedEmbedding::new(hidden, AUDIO_VOCAB_SIZE * codebooks, 1e-5, vb.pp("audio_embedding"))?;
+        let feat_out = if enc_cfg.feat_out > 0 && enc_cfg.feat_out != enc_cfg.d_model {
+            enc_cfg.feat_out
+        } else {
+            enc_cfg.d_model
+        };
+        let audio_adapter = MLP::new(
+            feat_out,
+            hidden,
+            &[hidden],
+            true,
+            true,
+            0.0,
+            vb.pp("audio_adapter"),
+        )?;
+        let audio_embedding = SharedEmbedding::new(
+            hidden,
+            AUDIO_VOCAB_SIZE * codebooks,
+            1e-5,
+            vb.pp("audio_embedding"),
+        )?;
 
         // Depthformer: RawLMBackbone(has_embedding=False) of StandardBlock(MHA(dim)).
         let df_vb = vb.pp("depthformer").pp("layers");
         let mut layers = Vec::with_capacity(depth_cfg.layers);
         for i in 0..depth_cfg.layers {
             let lvb = df_vb.pp(i.to_string());
-            let mha = Mha::new(depth_cfg.dim, 32, HeadStyle::Gqa, true, 1e-5, 8, 128_000, 1_000_000.0, lvb.pp("operator"))?;
+            let mha = Mha::new(
+                depth_cfg.dim,
+                32,
+                HeadStyle::Gqa,
+                true,
+                1e-5,
+                8,
+                128_000,
+                1_000_000.0,
+                lvb.pp("operator"),
+            )?;
             let block = StandardBlock::new(mha, None, true, 256, 1.0, 1e-5, lvb)?;
             layers.push(block);
         }
@@ -316,10 +353,17 @@ impl LFM2AudioModel {
         let de_vb = vb.pp("depth_embeddings");
         let mut depth_embeddings = Vec::with_capacity(codebooks);
         for i in 0..codebooks {
-            depth_embeddings.push(SharedEmbedding::new(depth_cfg.dim, AUDIO_VOCAB_SIZE, 1e-5, de_vb.pp(i.to_string()))?);
+            depth_embeddings.push(SharedEmbedding::new(
+                depth_cfg.dim,
+                AUDIO_VOCAB_SIZE,
+                1e-5,
+                de_vb.pp(i.to_string()),
+            )?);
         }
 
-        let codebook_offsets = (0..codebooks as i64).map(|i| i * AUDIO_VOCAB_SIZE as i64).collect();
+        let codebook_offsets = (0..codebooks as i64)
+            .map(|i| i * AUDIO_VOCAB_SIZE as i64)
+            .collect();
 
         // `audio_loss_weights` buffer — Python `__init__` 104-113:
         // ```python
@@ -336,7 +380,11 @@ impl LFM2AudioModel {
             (0..codebooks)
                 .map(|i| {
                     // linspace(1, 0, C)[i] = 1 - i/(C-1)  (C==1 ⇒ the single point 1.0)
-                    let t = if codebooks > 1 { 1.0 - i as f64 / (codebooks as f64 - 1.0) } else { 1.0 };
+                    let t = if codebooks > 1 {
+                        1.0 - i as f64 / (codebooks as f64 - 1.0)
+                    } else {
+                        1.0
+                    };
                     (t * log_factor).exp() as f32
                 })
                 .collect()
@@ -401,7 +449,10 @@ impl LFM2AudioModel {
 
     /// Debug: conformer stage intermediates for parity localization.
     #[doc(hidden)]
-    pub fn conformer_stages(&self, mel: &Tensor) -> Result<(Tensor, Tensor, Tensor, Tensor, Tensor)> {
+    pub fn conformer_stages(
+        &self,
+        mel: &Tensor,
+    ) -> Result<(Tensor, Tensor, Tensor, Tensor, Tensor)> {
         self.conformer.forward_stages(mel)
     }
 
@@ -445,7 +496,13 @@ impl LFM2AudioModel {
     /// embeddings into sequence order by `modality_flag` (index_select instead of
     /// PyTorch boolean assignment).
     fn prefill(&self, chat: &ChatState) -> Result<Tensor> {
-        self.prefill_inputs(&chat.text, &chat.audio_in, &chat.audio_in_lens, &chat.audio_out, &chat.modality_flag)
+        self.prefill_inputs(
+            &chat.text,
+            &chat.audio_in,
+            &chat.audio_in_lens,
+            &chat.audio_out,
+            &chat.modality_flag,
+        )
     }
 
     /// `logits(batch)` — training logits + labels, faithful to
@@ -456,22 +513,33 @@ impl LFM2AudioModel {
     /// embeddings, all parity-verified, so correctness is by composition.
     pub fn logits(&self, batch: &LFM2AudioModelInput) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
         let dev = batch.text.device();
-        let in_emb =
-            self.prefill_inputs(&batch.text, &batch.audio_in, &batch.audio_in_lens, &batch.audio_out, &batch.modality_flag)?;
+        let in_emb = self.prefill_inputs(
+            &batch.text,
+            &batch.audio_in,
+            &batch.audio_in_lens,
+            &batch.audio_out,
+            &batch.modality_flag,
+        )?;
         let out_emb = self.backbone_forward_embeds(&in_emb)?; // (B, L, D)
         let (b, ll, d) = out_emb.dims3()?;
         // out_emb_shifted = out_emb[:, :-1] flattened to (B*(L-1), D): the Python
         // selects supervised rows with a 2-D boolean mask over the whole batch, so
         // the per-row shift drops each row's last step. For inference (B=1) this is
         // out_emb.i(0)[..L-1] as before.
-        let out_emb_shifted = out_emb.narrow(1, 0, ll - 1)?.reshape((b * (ll - 1), d))?.contiguous()?; // (B*(L-1), D)
+        let out_emb_shifted = out_emb
+            .narrow(1, 0, ll - 1)?
+            .reshape((b * (ll - 1), d))?
+            .contiguous()?; // (B*(L-1), D)
 
         // Read ids as i64 (torch.long) regardless of the input's int dtype — the
         // dataloader feeds I64, ChatState feeds U32; the cast handles both. Read the
         // FULL (B, L) modality/supervision, not row 0: the Python builds 2-D masks
         // over the whole batch. For inference (B=1) this is identical to row 0.
         let modality: Vec<Vec<i64>> = batch.modality_flag.to_dtype(DType::I64)?.to_vec2::<i64>()?;
-        let sup: Vec<Vec<u8>> = batch.supervision_mask.to_dtype(DType::U8)?.to_vec2::<u8>()?;
+        let sup: Vec<Vec<u8>> = batch
+            .supervision_mask
+            .to_dtype(DType::U8)?
+            .to_vec2::<u8>()?;
         let (text_id, audio_id) = (LFMModality::Text as i64, LFMModality::AudioOut as i64);
 
         // Supervised, non-first text / audio-out positions. Row index into the
@@ -506,7 +574,9 @@ impl LFM2AudioModel {
             Tensor::zeros((0, vocab), DType::F32, dev)?
         } else {
             let idx = Tensor::from_vec(text_rows.clone(), (text_rows.len(),), dev)?;
-            let rows = out_emb_shifted.index_select(&idx, 0)?.to_dtype(DType::F32)?;
+            let rows = out_emb_shifted
+                .index_select(&idx, 0)?
+                .to_dtype(DType::F32)?;
             rows.matmul(&ew.t()?.contiguous()?)?
         };
         let text_labels = {
@@ -514,28 +584,43 @@ impl LFM2AudioModel {
             if text_lbl.is_empty() {
                 Tensor::zeros((0,), t.dtype(), dev)?
             } else {
-                t.index_select(&Tensor::from_vec(text_lbl.clone(), (text_lbl.len(),), dev)?, 0)?
+                t.index_select(
+                    &Tensor::from_vec(text_lbl.clone(), (text_lbl.len(),), dev)?,
+                    0,
+                )?
             }
         };
 
         // ---- audio head (teacher-forced depthformer over the C codebooks) ----
         let (c, dd) = (self.codebooks, self.depthformer_dim);
         let (audio_logits, audio_labels) = if audio_rows.is_empty() {
-            (Tensor::zeros((0, AUDIO_VOCAB_SIZE), DType::F32, dev)?, Tensor::zeros((0,), DType::U32, dev)?)
+            (
+                Tensor::zeros((0, AUDIO_VOCAB_SIZE), DType::F32, dev)?,
+                Tensor::zeros((0,), DType::U32, dev)?,
+            )
         } else {
             let n_a = audio_rows.len();
-            let aemb = out_emb_shifted.index_select(&Tensor::from_vec(audio_rows.clone(), (n_a,), dev)?, 0)?; // (n_a, D)
+            let aemb = out_emb_shifted
+                .index_select(&Tensor::from_vec(audio_rows.clone(), (n_a,), dev)?, 0)?; // (n_a, D)
             let mut din = self.depth_linear.forward(&aemb)?.reshape((n_a, c, dd))?; // (n_a, C, dd)
 
             // teacher tokens: audio_out[:C, audio_lbl] → (C, n_a); per-codebook embed → (n_a, C, dd)
             let albl = Tensor::from_vec(audio_lbl.clone(), (audio_lbl.len(),), dev)?;
-            let codes = batch.audio_out.narrow(0, 0, c)?.index_select(&albl, 1)?.to_dtype(DType::I64)?; // (C, n_a)
+            let codes = batch
+                .audio_out
+                .narrow(0, 0, c)?
+                .index_select(&albl, 1)?
+                .to_dtype(DType::I64)?; // (C, n_a)
             let mut tok_rows = Vec::with_capacity(c);
             for ci in 0..c {
-                tok_rows.push(self.depth_embeddings[ci].embed(&codes.i(ci)?)?.reshape((n_a, 1, dd))?);
+                tok_rows.push(
+                    self.depth_embeddings[ci]
+                        .embed(&codes.i(ci)?)?
+                        .reshape((n_a, 1, dd))?,
+                );
             }
             let dtok = Tensor::cat(&tok_rows.iter().collect::<Vec<_>>(), 1)?; // (n_a, C, dd)
-            // dtok[:, -1] *= 0 ; roll(+1) along C → codebook c sees c-1's token, c0 sees zero.
+                                                                              // dtok[:, -1] *= 0 ; roll(+1) along C → codebook c sees c-1's token, c0 sees zero.
             let zero_last = Tensor::zeros((n_a, 1, dd), dtok.dtype(), dev)?;
             let dtok = Tensor::cat(&[&dtok.narrow(1, 0, c - 1)?, &zero_last], 1)?;
             let dtok = Tensor::cat(&[&dtok.narrow(1, c - 1, 1)?, &dtok.narrow(1, 0, c - 1)?], 1)?;
@@ -548,7 +633,11 @@ impl LFM2AudioModel {
             // identical to the unsplit forward, so this is a no-op for parity.
             let n = din.dim(0)?;
             let should_split = n >= 16384; // 2**14
-            let k: i64 = if should_split { (n as f64).log2().floor() as i64 - 14 + 1 } else { 0 };
+            let k: i64 = if should_split {
+                (n as f64).log2().floor() as i64 - 14 + 1
+            } else {
+                0
+            };
             let num_chunks = 1usize << (k.max(0) as usize);
             let dout = if num_chunks <= 1 {
                 self.depthformer.forward(&din, None)? // (n_a, C, dd), causally masked
@@ -569,13 +658,21 @@ impl LFM2AudioModel {
             };
             let mut clog = Vec::with_capacity(c);
             for ci in 0..c {
-                let logits_c = self.depth_embeddings[ci].get_logits(&dout.narrow(1, ci, 1)?.squeeze(1)?)?; // (n_a, Va)
+                let logits_c =
+                    self.depth_embeddings[ci].get_logits(&dout.narrow(1, ci, 1)?.squeeze(1)?)?; // (n_a, Va)
                 clog.push(logits_c.unsqueeze(0)?);
             }
             let stacked = Tensor::cat(&clog.iter().collect::<Vec<_>>(), 0)?; // (C, n_a, Va)
             let va = stacked.dim(2)?;
-            let audio_logits = stacked.transpose(0, 1)?.contiguous()?.reshape((n_a * c, va))?; // (L C) V
-            let audio_labels = codes.to_dtype(DType::U32)?.transpose(0, 1)?.contiguous()?.reshape((n_a * c,))?; // (L C)
+            let audio_logits = stacked
+                .transpose(0, 1)?
+                .contiguous()?
+                .reshape((n_a * c, va))?; // (L C) V
+            let audio_labels = codes
+                .to_dtype(DType::U32)?
+                .transpose(0, 1)?
+                .contiguous()?
+                .reshape((n_a * c,))?; // (L C)
             (audio_logits, audio_labels)
         };
 
@@ -680,7 +777,10 @@ impl LFM2AudioModel {
         // the flat text/audio embeddings scatter across all batch rows in row-major
         // order. For inference (B=1) this is identical to row 0.
         let (b, ll) = modality_flag.dims2()?;
-        let modality: Vec<i64> = modality_flag.to_dtype(DType::I64)?.flatten_all()?.to_vec1::<i64>()?;
+        let modality: Vec<i64> = modality_flag
+            .to_dtype(DType::I64)?
+            .flatten_all()?
+            .to_vec1::<i64>()?;
         let l = modality.len(); // b*ll
 
         // text embeddings (n_text, D)
@@ -721,8 +821,11 @@ impl LFM2AudioModel {
             if m == 0 {
                 None
             } else {
-                let codes = audio_out.narrow(0, 0, self.codebooks)?.to_dtype(DType::I64)?;
-                let offs = Tensor::from_vec(self.codebook_offsets.clone(), (self.codebooks, 1), dev)?;
+                let codes = audio_out
+                    .narrow(0, 0, self.codebooks)?
+                    .to_dtype(DType::I64)?;
+                let offs =
+                    Tensor::from_vec(self.codebook_offsets.clone(), (self.codebooks, 1), dev)?;
                 let offset_codes = codes.broadcast_add(&offs)?; // (codebooks, m)
                 let emb = self.audio_embedding.embed(&offset_codes)?; // (codebooks, m, D)
                 Some(emb.sum(0)?.to_dtype(text_emb.dtype())?) // (m, D)
@@ -731,7 +834,10 @@ impl LFM2AudioModel {
 
         // combined = [text; audio_in; audio_out]; build index per position.
         let n_text = text_emb.dim(0)?;
-        let n_ai = audio_in_emb.as_ref().map(|a| a.dim(0).unwrap_or(0)).unwrap_or(0);
+        let n_ai = audio_in_emb
+            .as_ref()
+            .map(|a| a.dim(0).unwrap_or(0))
+            .unwrap_or(0);
         let mut parts = vec![text_emb.clone()];
         if let Some(a) = &audio_in_emb {
             parts.push(a.clone());
@@ -762,13 +868,22 @@ impl LFM2AudioModel {
             } else {
                 // An unknown modality flag must error, not silently bucket as
                 // AudioOut (the Python asserts the flag is one of the 3 modalities).
-                return Err(candle_core::Error::Msg(format!("prefill: unknown modality flag {m} (expected 1/2/3)")));
+                return Err(candle_core::Error::Msg(format!(
+                    "prefill: unknown modality flag {m} (expected 1/2/3)"
+                )));
             };
             index.push(idx as u32);
         }
         // The scatter consumes exactly the rows of each part; a count mismatch
         // means a malformed modality_flag (mirrors the Python _prefill asserts).
-        if ct != n_text || cai != n_ai || cao != audio_out_emb.as_ref().map(|a| a.dim(0).unwrap_or(0)).unwrap_or(0) {
+        if ct != n_text
+            || cai != n_ai
+            || cao
+                != audio_out_emb
+                    .as_ref()
+                    .map(|a| a.dim(0).unwrap_or(0))
+                    .unwrap_or(0)
+        {
             return Err(candle_core::Error::Msg(format!(
                 "prefill: modality_flag counts (text {ct}, audio_in {cai}, audio_out {cao}) \
                  do not match inputs (text {n_text}, audio_in {n_ai})"
@@ -795,19 +910,28 @@ impl LFM2AudioModel {
         // 1-D (D,) lfm hidden; candle's Linear needs a 2-D input, so add a row dim
         // (Python's nn.Linear accepts the 1-D vector directly).
         let emb2d = embedding.flatten_all()?.unsqueeze(0)?; // (1, D)
-        let din = self.depth_linear.forward(&emb2d)?.reshape((self.codebooks, self.depthformer_dim))?;
+        let din = self
+            .depth_linear
+            .forward(&emb2d)?
+            .reshape((self.codebooks, self.depthformer_dim))?;
         let mut df_token = Tensor::zeros((self.depthformer_dim,), din.dtype(), din.device())?;
-        let mut caches: Vec<LayerKvCache> = (0..self.depthformer.layers.len()).map(|_| LayerKvCache::new()).collect();
+        let mut caches: Vec<LayerKvCache> = (0..self.depthformer.layers.len())
+            .map(|_| LayerKvCache::new())
+            .collect();
         let mut out = Vec::with_capacity(self.codebooks);
         for i in 0..self.codebooks {
             let cur = (din.i(i)? + &df_token)?.reshape((1, 1, self.depthformer_dim))?;
-            let dout = self.depthformer.forward(&cur, Some(caches.as_mut_slice()))?; // (1,1,dim)
+            let dout = self
+                .depthformer
+                .forward(&cur, Some(caches.as_mut_slice()))?; // (1,1,dim)
             let dout = dout.reshape((1, self.depthformer_dim))?;
             let logits = self.depth_embeddings[i].get_logits(&dout)?.i(0)?; // (vocab,)
             let token = sampler.sample(&logits)?;
             out.push(token);
             let tok = Tensor::from_vec(vec![token], (1,), din.device())?;
-            df_token = self.depth_embeddings[i].embed(&tok)?.reshape((self.depthformer_dim,))?;
+            df_token = self.depth_embeddings[i]
+                .embed(&tok)?
+                .reshape((self.depthformer_dim,))?;
         }
         Ok(out)
     }
@@ -815,7 +939,11 @@ impl LFM2AudioModel {
     fn audio_frame_embed(&self, tokens: &[u32]) -> Result<Tensor> {
         // audio_embedding(tokens + offsets).sum(0) → (D,) → (1,1,D)
         let dev = self.lfm.embed_weight().device();
-        let codes: Vec<i64> = tokens.iter().zip(&self.codebook_offsets).map(|(t, o)| *t as i64 + o).collect();
+        let codes: Vec<i64> = tokens
+            .iter()
+            .zip(&self.codebook_offsets)
+            .map(|(t, o)| *t as i64 + o)
+            .collect();
         let codes = Tensor::from_vec(codes, (self.codebooks,), dev)?;
         let emb = self.audio_embedding.embed(&codes)?; // (codebooks, D)
         emb.sum(0)?.reshape((1, 1, self.hidden))
@@ -824,20 +952,29 @@ impl LFM2AudioModel {
     /// `generate_sequential` as a synchronous callback stream — text is emitted
     /// in full, then (after `<|audio_start|>`) audio frames until EOAudio.
     /// Faithful to the Python generator (ASR/TTS path).
-    pub fn generate_sequential<F: FnMut(GenToken)>(&self, chat: &ChatState, params: &GenParams, mut on_token: F) -> Result<()> {
+    pub fn generate_sequential<F: FnMut(GenToken)>(
+        &self,
+        chat: &ChatState,
+        params: &GenParams,
+        mut on_token: F,
+    ) -> Result<()> {
         let mut in_emb = self.prefill(chat)?;
         let mut index_pos = 0usize;
         let mut cache = LfmCache::new(true, in_emb.dtype(), &self.lfm_cfg, in_emb.device())?;
         // Text and audio carry independent samplers (the Python uses one generator;
         // for greedy — the default — both are argmax and the RNG is unused).
-        let mut text_sampler = Sampler::new(params.seed, params.text_temperature, params.text_top_k);
-        let mut audio_sampler = Sampler::new(params.seed, params.audio_temperature, params.audio_top_k);
+        let mut text_sampler =
+            Sampler::new(params.seed, params.text_temperature, params.text_top_k);
+        let mut audio_sampler =
+            Sampler::new(params.seed, params.audio_temperature, params.audio_top_k);
 
         let mut current = LFMModality::Text;
 
         for _ in 0..params.max_new_tokens {
             let seq_len = in_emb.dim(1)?;
-            let h = self.lfm.forward_embeds(&in_emb, index_pos, &mut cache, None)?; // (1, seq, D)
+            let h = self
+                .lfm
+                .forward_embeds(&in_emb, index_pos, &mut cache, None)?; // (1, seq, D)
             index_pos += seq_len;
             let h_last = h.i((0, seq_len - 1))?.contiguous()?; // (D,)
 
@@ -874,7 +1011,12 @@ impl LFM2AudioModel {
 
     /// `generate_interleaved` as a synchronous callback stream — interleaves runs
     /// of text and audio (real-time S2S). Faithful to the Python generator.
-    pub fn generate_interleaved<F: FnMut(GenToken)>(&self, chat: &ChatState, params: &GenParams, on_token: F) -> Result<()> {
+    pub fn generate_interleaved<F: FnMut(GenToken)>(
+        &self,
+        chat: &ChatState,
+        params: &GenParams,
+        on_token: F,
+    ) -> Result<()> {
         let in_emb = self.prefill(chat)?;
         self.generate_from_embeds(in_emb, params, on_token)
     }
@@ -900,7 +1042,12 @@ impl LFM2AudioModel {
     /// `generate_interleaved` after `_prefill`). Exposed so it can be driven from raw
     /// model inputs (`prefill_inputs`) for the end-to-end `generate_interleaved_parity`
     /// golden, not just a `ChatState`.
-    pub fn generate_from_embeds<F: FnMut(GenToken)>(&self, in_emb: Tensor, params: &GenParams, on_token: F) -> Result<()> {
+    pub fn generate_from_embeds<F: FnMut(GenToken)>(
+        &self,
+        in_emb: Tensor,
+        params: &GenParams,
+        on_token: F,
+    ) -> Result<()> {
         // Never-set flag ⇒ identical behavior to before (one relaxed atomic load per step
         // is negligible next to a transformer block).
         self.generate_from_embeds_cancellable(in_emb, params, &AtomicBool::new(false), on_token)
@@ -917,8 +1064,10 @@ impl LFM2AudioModel {
     ) -> Result<()> {
         let mut index_pos = 0usize;
         let mut cache = LfmCache::new(true, in_emb.dtype(), &self.lfm_cfg, in_emb.device())?;
-        let mut text_sampler = Sampler::new(params.seed, params.text_temperature, params.text_top_k);
-        let mut audio_sampler = Sampler::new(params.seed, params.audio_temperature, params.audio_top_k);
+        let mut text_sampler =
+            Sampler::new(params.seed, params.text_temperature, params.text_top_k);
+        let mut audio_sampler =
+            Sampler::new(params.seed, params.audio_temperature, params.audio_top_k);
 
         let mut current = LFMModality::Text;
         let mut modality_left = self.interleaved_n_text as i64;
@@ -931,7 +1080,9 @@ impl LFM2AudioModel {
             }
             modality_left -= 1;
             let seq_len = in_emb.dim(1)?;
-            let h = self.lfm.forward_embeds(&in_emb, index_pos, &mut cache, None)?; // (1, seq, D)
+            let h = self
+                .lfm
+                .forward_embeds(&in_emb, index_pos, &mut cache, None)?; // (1, seq, D)
             index_pos += seq_len;
             let h_last = h.i((0, seq_len - 1))?.contiguous()?; // (D,)
 

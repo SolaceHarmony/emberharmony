@@ -234,6 +234,8 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
       },
   )
   const working = createMemo(() => status()?.type !== "idle")
+  const active = createMemo(() => working() || voice.turnActive())
+  const voiceOn = createMemo(() => voice.state() === "connected" || voice.enabled())
   const imageAttachments = createMemo(
     () => prompt.current().filter((part) => part.type === "image") as ImageAttachmentPart[],
   )
@@ -318,6 +320,18 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
   }
 
   const isFocused = createFocusSignal(() => editorRef)
+
+  const [voiceMic, setVoiceMic] = createSignal<boolean | undefined>(undefined)
+  createEffect(() => {
+    const target = voice.state() === "connected" ? !prompt.dirty() : undefined
+    if (voiceMic() === target) return
+    setVoiceMic(target)
+    if (target === undefined) return
+    voice.setMicEnabled(target).catch(() => {})
+  })
+  onCleanup(() => {
+    if (voiceMic() === false) voice.setMicEnabled(true).catch(() => {})
+  })
 
   createEffect(() => {
     params.id
@@ -940,6 +954,10 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
   }
 
   const abort = async () => {
+    const busy = working()
+    const speaking = voice.turnActive()
+    await voice.interrupt().catch(() => {})
+    if (!busy && !speaking) return Promise.resolve()
     const sessionID = params.id
     if (!sessionID) return Promise.resolve()
     const queued = pending.get(sessionID)
@@ -1099,7 +1117,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
         event.preventDefault()
         return
       }
-      if (working()) {
+      if (active()) {
         abort()
         event.preventDefault()
       }
@@ -1147,7 +1165,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     if (event.key === "Escape") {
       if (store.popover) {
         setStore("popover", null)
-      } else if (working()) {
+      } else if (active()) {
         abort()
       }
     }
@@ -1170,13 +1188,17 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
   const handleSubmit = async (event: Event) => {
     event.preventDefault()
 
+    if (active()) {
+      await abort()
+      return
+    }
+
     const currentPrompt = prompt.current()
     const text = currentPrompt.map((part) => ("content" in part ? part.content : "")).join("")
     const images = imageAttachments().slice()
     const mode = store.mode
 
     if (text.trim().length === 0 && images.length === 0) {
-      if (working()) abort()
       return
     }
 
@@ -2100,15 +2122,24 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
             <div class="flex items-center gap-1.5 mr-1.5">
               <SessionContextUsage />
               <Show when={voice.state() === "connected"}>
-                <BarVisualizer
-                  state={voice.agentState()}
-                  track={voice.agentAudioTrack()}
-                  barCount={5}
-                  options={{ minHeight: 15 }}
-                  aria-label={language.t("voice.connected")}
-                />
+                <Switch>
+                  <Match when={voice.agentAudioTrack()}>
+                    {(track) => (
+                      <BarVisualizer
+                        state={voice.agentState()}
+                        track={track()}
+                        barCount={5}
+                        options={{ minHeight: 15 }}
+                        aria-label={language.t("voice.connected")}
+                      />
+                    )}
+                  </Match>
+                  <Match when={voice.agentLevel() !== undefined}>
+                    <NativeVoiceMeter level={voice.agentLevel() ?? 0} ariaLabel={language.t("voice.connected")} />
+                  </Match>
+                </Switch>
               </Show>
-              <Show when={store.mode === "normal" && voice.available() && params.id}>
+              <Show when={store.mode === "normal" && params.id}>
                 <Tooltip
                   placement="top"
                   value={
@@ -2131,11 +2162,16 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
                         return
                       }
                       const currentModel = local.model.current()
+                      const currentAgent = local.agent.current()
                       voice
-                        .connect(
-                          params.id!,
-                          currentModel ? { providerID: currentModel.provider.id, modelID: currentModel.id } : undefined,
-                        )
+                        .connect(params.id!, {
+                          agent: currentAgent?.name,
+                          model: currentModel
+                            ? { providerID: currentModel.provider.id, modelID: currentModel.id }
+                            : undefined,
+                          variant: local.model.variant.current() || undefined,
+                          promptMode: currentAgent?.name === "build" ? "build" : "plan",
+                        })
                         .catch((err) => {
                           showToast({
                             title: language.t("voice.toast.connectFailed.title"),
@@ -2144,14 +2180,14 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
                         })
                     }}
                     aria-label={language.t("voice.toggle")}
-                    aria-pressed={voice.state() === "connected"}
+                    aria-pressed={voiceOn()}
                   >
                     <Icon
                       name="microphone"
                       classList={{
                         "size-6": true,
-                        "text-icon-base": voice.state() !== "connected",
-                        "text-icon-success-base": voice.state() === "connected",
+                        "text-icon-base": !voiceOn(),
+                        "text-icon-success-base": voiceOn(),
                       }}
                     />
                   </Button>
@@ -2174,10 +2210,10 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
             </div>
             <Tooltip
               placement="top"
-              inactive={!prompt.dirty() && !working()}
+              inactive={!prompt.dirty() && !active()}
               value={
                 <Switch>
-                  <Match when={working()}>
+                  <Match when={active()}>
                     <div class="flex items-center gap-2">
                       <span>{language.t("prompt.action.stop")}</span>
                       <span class="text-icon-base text-12-medium text-[10px]!">{language.t("common.key.esc")}</span>
@@ -2194,16 +2230,39 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
             >
               <IconButton
                 type="submit"
-                disabled={!prompt.dirty() && !working()}
-                icon={working() ? "stop" : "arrow-up"}
+                disabled={!prompt.dirty() && !active()}
+                icon={active() ? "stop" : "arrow-up"}
                 variant="primary"
                 class="h-6 w-5.5"
-                aria-label={working() ? language.t("prompt.action.stop") : language.t("prompt.action.send")}
+                aria-label={active() ? language.t("prompt.action.stop") : language.t("prompt.action.send")}
               />
             </Tooltip>
           </div>
         </div>
       </form>
+    </div>
+  )
+}
+
+function NativeVoiceMeter(props: { level: number; ariaLabel: string }) {
+  const weights = [0.4, 0.7, 1, 0.7, 0.4]
+  const level = () => Math.min(1, Math.max(0.08, props.level))
+
+  return (
+    <div class="lk-audio-bar-visualizer" data-lk-va-state="speaking" aria-label={props.ariaLabel}>
+      <For each={weights}>
+        {(weight, index) => {
+          const height = () => Math.min(100, Math.max(15, level() * weight * 100 + 5))
+          return (
+            <span
+              data-lk-highlighted={props.level > 0.01}
+              data-lk-bar-index={index()}
+              classList={{ "lk-audio-bar": true, "lk-highlighted": props.level > 0.01 }}
+              style={{ height: `${height()}%` }}
+            />
+          )
+        }}
+      </For>
     </div>
   )
 }

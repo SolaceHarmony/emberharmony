@@ -2,16 +2,44 @@
 //! pipelines: the local LFM2-Audio loop (`lfm2`) and the LiveKit session bridge
 //! (`livekit`, see [`super::session`]).
 //!
-//! This phase wires **settings → provider readiness**, exposed to the webview as
-//! the `voice_status` command. The streaming start/stop loop plugs in here next:
-//! for `lfm2`, cpal capture + the candle model from `experiments/lfm2-audio-voice`;
-//! for `livekit`, the SSE reducer in [`super::session`]. Both will surface
-//! transcript/state to the webview over a `tauri::ipc::Channel<VoiceEvent>` —
-//! ordered, high-throughput streaming rather than events.
+//! This layer wires **settings → provider readiness → runtime control**. For
+//! `lfm2`, `voice_start` enters the in-process Rust service; CPAL capture,
+//! playback, VAD, interruption, and the model worker are owned by Tauri. LiveKit
+//! remains the legacy bridge path while that provider still exists.
 
 use crate::settings::{self, VoiceProvider, VoiceSettings};
+use crate::{ServerReadyData, ServerState};
 use serde::{Deserialize, Serialize};
-use tauri::AppHandle;
+use tauri::{AppHandle, State};
+
+use super::runtime::VoiceRuntime;
+use super::session::{SessionBridgeConfig, SessionBridgeModel, VOICE_SYSTEM_PROMPT};
+
+/// Model selected by the session when the voice runtime was started.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionModel {
+    #[serde(rename = "providerID")]
+    pub provider_id: String,
+    #[serde(rename = "modelID")]
+    pub model_id: String,
+}
+
+/// Session context bound to a native voice run.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionCtx {
+    #[serde(rename = "sessionID")]
+    pub session_id: String,
+    pub directory: String,
+    pub agent: Option<String>,
+    pub model: Option<SessionModel>,
+    pub variant: Option<String>,
+    #[serde(rename = "delegateTarget")]
+    pub delegate_target: Option<String>,
+    #[serde(rename = "promptMode")]
+    pub prompt_mode: Option<String>,
+}
 
 /// Whether the active provider is ready to start a voice session, and what to do
 /// about it if not. Drives the readiness hint in the voice settings panel.
@@ -20,10 +48,24 @@ use tauri::AppHandle;
 pub struct VoicePlan {
     /// The active provider.
     pub provider: VoiceProvider,
+    /// Whether voice mode is enabled at all.
+    pub enabled: bool,
+    /// Which runtime surface owns the selected provider.
+    pub surface: VoiceSurface,
     /// Ready to start.
     pub ready: bool,
     /// Human-readable detail — what to configure if not ready.
     pub detail: String,
+}
+
+/// Runtime surface for the active provider. LFM2 is owned by the desktop Rust
+/// service; LiveKit is still the webview media room while that provider exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VoiceSurface {
+    Off,
+    Native,
+    Livekit,
 }
 
 /// Pure decision: given the settings, which provider runs and is it ready.
@@ -31,27 +73,39 @@ pub fn plan(settings: &VoiceSettings) -> VoicePlan {
     match settings.provider {
         VoiceProvider::Off => VoicePlan {
             provider: VoiceProvider::Off,
+            enabled: false,
+            surface: VoiceSurface::Off,
             ready: false,
             detail: "Voice is off.".into(),
         },
         VoiceProvider::Lfm2 => {
-            let has_model = settings
+            let has_model_ref = settings
+                .lfm2
+                .model
+                .as_deref()
+                .is_some_and(|d| !d.trim().is_empty());
+            let has_model_dir = settings
                 .lfm2
                 .model_dir
                 .as_deref()
-                .is_some_and(|d| !d.trim().is_empty());
+                .is_some_and(|d| std::path::Path::new(d.trim()).join("config.json").is_file());
+            let has_model = has_model_ref || has_model_dir;
             VoicePlan {
                 provider: VoiceProvider::Lfm2,
+                enabled: true,
+                surface: VoiceSurface::Native,
                 ready: has_model,
                 detail: if has_model {
                     "Local LFM2-Audio model ready.".into()
                 } else {
-                    "Set the model directory to enable the local model.".into()
+                    "Set the model directory to a downloaded LFM2-Audio model.".into()
                 },
             }
         }
         VoiceProvider::Livekit => VoicePlan {
             provider: VoiceProvider::Livekit,
+            enabled: true,
+            surface: VoiceSurface::Livekit,
             // LiveKit readiness (URL + credentials) is owned by the sidecar / the
             // LiveKit panel, not this store — the session bridge picks it up at
             // dispatch — so the native side reports it as configured there.
@@ -74,6 +128,7 @@ pub fn voice_status(app: AppHandle) -> Result<VoicePlan, String> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum VoiceState {
+    Loading,
     Idle,
     Listening,
     Thinking,
@@ -145,31 +200,95 @@ impl TurnMode {
     }
 }
 
-/// Start a voice session for the configured provider, streaming [`VoiceEvent`]s
-/// over `channel`. Errors (with the readiness detail) if the provider isn't ready.
+/// Start a voice session for the configured provider.
 ///
-/// The provider loop bodies are the next phase: for `lfm2`, cpal capture + the
-/// candle model from `experiments/lfm2-audio-voice`; for `livekit`, an SSE runner
-/// driving [`super::session`]'s reducer. Both stream `Transcript`/`State` here.
+/// For `lfm2`, this starts the thread-managed desktop service: CPAL mic,
+/// speaker playback, VAD, interruption, and the realtime model pipeline all run
+/// inside the Tauri process. The command returns after the service thread is
+/// spawned; events stream over `channel`.
 #[tauri::command]
-pub async fn voice_start(app: AppHandle, channel: tauri::ipc::Channel<VoiceEvent>) -> Result<(), String> {
-    let p = plan(&settings::load(&app));
+pub async fn voice_start(
+    app: AppHandle,
+    runtime: State<'_, VoiceRuntime>,
+    server: State<'_, ServerState>,
+    ctx: SessionCtx,
+    channel: tauri::ipc::Channel<VoiceEvent>,
+) -> Result<(), String> {
+    let settings = settings::load(&app);
+    let p = plan(&settings);
     if !p.ready {
         return Err(p.detail);
     }
-    let _ = channel.send(VoiceEvent::State { state: VoiceState::Idle });
     match p.provider {
-        VoiceProvider::Lfm2 => Err("the local LFM2-Audio loop is not wired up yet".into()),
+        VoiceProvider::Lfm2 => {
+            let ready = server
+                .status
+                .clone()
+                .await
+                .map_err(|_| "Failed to get server status".to_string())??;
+            let bridge = session_bridge_config(&ctx, ready);
+            runtime.start_lfm2(ctx, settings, channel, bridge)
+        }
         VoiceProvider::Livekit => Err("the LiveKit session-bridge loop is not wired up yet".into()),
         VoiceProvider::Off => Err("Voice is off.".into()),
     }
 }
 
+fn session_bridge_config(ctx: &SessionCtx, server: ServerReadyData) -> Option<SessionBridgeConfig> {
+    let target = ctx.delegate_target.as_deref()?.trim();
+    if target.is_empty() {
+        return None;
+    }
+    Some(SessionBridgeConfig {
+        server_url: server.url,
+        directory: ctx.directory.clone(),
+        session_id: ctx.session_id.clone(),
+        username: server.password.as_ref().map(|_| "emberharmony".to_string()),
+        password: server.password,
+        agent: ctx.prompt_mode.clone().or_else(|| ctx.agent.clone()),
+        model: parse_model_ref(target).or_else(|| {
+            ctx.model.as_ref().map(|model| SessionBridgeModel {
+                provider_id: model.provider_id.clone(),
+                model_id: model.model_id.clone(),
+            })
+        }),
+        variant: ctx.variant.clone(),
+        system: Some(VOICE_SYSTEM_PROMPT.to_string()),
+    })
+}
+
+fn parse_model_ref(value: &str) -> Option<SessionBridgeModel> {
+    let (provider, model) = value.split_once('/')?;
+    let provider = provider.trim();
+    let model = model.trim();
+    if provider.is_empty() || model.is_empty() {
+        return None;
+    }
+    Some(SessionBridgeModel {
+        provider_id: provider.to_string(),
+        model_id: model.to_string(),
+    })
+}
+
 /// Stop the active voice session.
 #[tauri::command]
-pub async fn voice_stop(_app: AppHandle) -> Result<(), String> {
-    // next phase: signal the active provider task to drain + stop.
-    Ok(())
+pub async fn voice_stop(runtime: State<'_, VoiceRuntime>) -> Result<(), String> {
+    runtime.stop()
+}
+
+/// Interrupt the current native reply without disconnecting the session.
+#[tauri::command]
+pub async fn voice_interrupt(runtime: State<'_, VoiceRuntime>) -> Result<(), String> {
+    runtime.interrupt()
+}
+
+/// Pause/resume native microphone capture without tearing down the session.
+#[tauri::command]
+pub async fn voice_set_mic_enabled(
+    runtime: State<'_, VoiceRuntime>,
+    enabled: bool,
+) -> Result<(), String> {
+    runtime.set_mic_enabled(enabled)
 }
 
 #[cfg(test)]
@@ -197,7 +316,17 @@ mod tests {
     fn lfm2_needs_a_model_dir() {
         assert!(!plan(&settings(VoiceProvider::Lfm2, None)).ready);
         assert!(!plan(&settings(VoiceProvider::Lfm2, Some("   "))).ready);
-        assert!(plan(&settings(VoiceProvider::Lfm2, Some("/models/lfm2"))).ready);
+    }
+
+    #[test]
+    fn lfm2_accepts_a_model_dir_with_config() {
+        let dir =
+            std::env::temp_dir().join(format!("emberharmony-lfm2-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.json"), "{}").unwrap();
+        let path = dir.to_string_lossy().into_owned();
+        assert!(plan(&settings(VoiceProvider::Lfm2, Some(&path))).ready);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -221,5 +350,44 @@ mod tests {
         .unwrap();
         assert_eq!(s["type"], "state");
         assert_eq!(s["state"], "speaking");
+    }
+
+    #[test]
+    fn parses_delegate_model_ref() {
+        assert_eq!(
+            parse_model_ref("glm/z1"),
+            Some(SessionBridgeModel {
+                provider_id: "glm".into(),
+                model_id: "z1".into()
+            })
+        );
+        assert_eq!(parse_model_ref("glm"), None);
+        assert_eq!(parse_model_ref("/z1"), None);
+        assert_eq!(parse_model_ref("glm/"), None);
+    }
+
+    #[test]
+    fn session_ctx_accepts_frontend_names() {
+        let ctx: SessionCtx = serde_json::from_value(serde_json::json!({
+            "sessionID": "ses_123",
+            "directory": "/tmp/project",
+            "agent": "plan",
+            "model": {
+                "providerID": "openai",
+                "modelID": "gpt-5"
+            },
+            "variant": "xhigh",
+            "delegateTarget": "glm/z1",
+            "promptMode": "plan"
+        }))
+        .unwrap();
+        assert_eq!(ctx.session_id, "ses_123");
+        assert_eq!(ctx.directory, "/tmp/project");
+        assert_eq!(ctx.agent.as_deref(), Some("plan"));
+        assert_eq!(ctx.model.as_ref().unwrap().provider_id, "openai");
+        assert_eq!(ctx.model.as_ref().unwrap().model_id, "gpt-5");
+        assert_eq!(ctx.variant.as_deref(), Some("xhigh"));
+        assert_eq!(ctx.delegate_target.as_deref(), Some("glm/z1"));
+        assert_eq!(ctx.prompt_mode.as_deref(), Some("plan"));
     }
 }

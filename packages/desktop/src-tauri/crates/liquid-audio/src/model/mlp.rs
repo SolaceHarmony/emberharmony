@@ -1,7 +1,7 @@
 //! Port of `liquid_audio/model/mlp.py`.
 
-use candle_core::{Result, Tensor};
 use crate::model::norm::layer_norm;
+use candle_core::{Result, Tensor};
 use candle_nn::{linear, linear_no_bias, Activation, Module, VarBuilder};
 
 /// Faithful port of `MLP(nn.Module)`.
@@ -48,7 +48,11 @@ impl MLP {
         let mut idx = 0usize; // mirrors nn.Sequential child index for weight names
 
         if use_layer_norm {
-            model.push(Box::new(layer_norm(channels[0], 1e-5, vb.pp(format!("model.{idx}")))?));
+            model.push(Box::new(layer_norm(
+                channels[0],
+                1e-5,
+                vb.pp(format!("model.{idx}")),
+            )?));
             idx += 1;
         }
 
@@ -112,7 +116,10 @@ mod tests {
             let y = mlp.forward(&x).unwrap();
             assert_eq!(y.dims(), &[2, 3], "bias={bias} ln={ln}");
             let v: Vec<f32> = y.flatten_all().unwrap().to_vec1().unwrap();
-            assert!(v.iter().all(|f| f.is_finite()), "non-finite output (bias={bias} ln={ln})");
+            assert!(
+                v.iter().all(|f| f.is_finite()),
+                "non-finite output (bias={bias} ln={ln})"
+            );
         }
     }
 

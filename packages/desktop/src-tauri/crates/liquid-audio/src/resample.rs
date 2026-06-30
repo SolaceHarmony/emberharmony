@@ -82,7 +82,11 @@ pub fn resample_slice(x: &[f32], orig_freq: u32, new_freq: u32) -> Vec<f32> {
     }
 
     let stride = orig as usize;
-    let blocks = if padded_len >= kernel_len { (padded_len - kernel_len) / stride + 1 } else { 0 };
+    let blocks = if padded_len >= kernel_len {
+        (padded_len - kernel_len) / stride + 1
+    } else {
+        0
+    };
     let mut out: Vec<f32> = Vec::with_capacity(blocks * new as usize);
     let mut start = 0usize;
     while start + kernel_len <= padded_len {
@@ -124,11 +128,16 @@ mod tests {
         // (windowed-sinc passes in-band content; amplitude within a few %).
         let n = 16_000usize;
         let f = 440.0f64;
-        let x: Vec<f32> = (0..n).map(|i| (2.0 * std::f64::consts::PI * f * i as f64 / 16_000.0).sin() as f32).collect();
+        let x: Vec<f32> = (0..n)
+            .map(|i| (2.0 * std::f64::consts::PI * f * i as f64 / 16_000.0).sin() as f32)
+            .collect();
         let y = resample_slice(&x, 16_000, 24_000);
         // ignore edges (kernel transient); check the interior peak ≈ 1.0
         let mid = &y[2000..y.len() - 2000];
         let peak = mid.iter().fold(0f32, |m, &v| m.max(v.abs()));
-        assert!((0.9..=1.05).contains(&peak), "peak {peak} out of expected band");
+        assert!(
+            (0.9..=1.05).contains(&peak),
+            "peak {peak} out of expected band"
+        );
     }
 }

@@ -9,8 +9,8 @@
 use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::{linear, Linear, Module, VarBuilder};
 
-use super::modules::ConformerLayer;
 use super::mha::RelPositionalEncoding;
+use super::modules::ConformerLayer;
 use super::subsampling::ConvSubsampling;
 use super::utils::{CacheAwareStreamingConfig, IntOrPair};
 
@@ -83,17 +83,39 @@ pub struct ConformerEncoder {
 impl ConformerEncoder {
     pub fn new(cfg: &ConformerEncoderConfig, vb: VarBuilder) -> Result<Self> {
         let d_ff = cfg.d_model * cfg.ff_expansion_factor;
-        let conv_channels = if cfg.subsampling_conv_channels == 0 { cfg.d_model } else { cfg.subsampling_conv_channels };
+        let conv_channels = if cfg.subsampling_conv_channels == 0 {
+            cfg.d_model
+        } else {
+            cfg.subsampling_conv_channels
+        };
 
-        let pre_encode = ConvSubsampling::new(cfg.subsampling_factor, cfg.feat_in, cfg.d_model, conv_channels, vb.pp("pre_encode"))?;
+        let pre_encode = ConvSubsampling::new(
+            cfg.subsampling_factor,
+            cfg.feat_in,
+            cfg.d_model,
+            conv_channels,
+            vb.pp("pre_encode"),
+        )?;
 
-        let xscale = if cfg.xscaling { Some((cfg.d_model as f64).sqrt()) } else { None };
+        let xscale = if cfg.xscaling {
+            Some((cfg.d_model as f64).sqrt())
+        } else {
+            None
+        };
         let pos_enc = RelPositionalEncoding::new(cfg.d_model, xscale);
 
         let layers_vb = vb.pp("layers");
         let mut layers = Vec::with_capacity(cfg.n_layers);
         for i in 0..cfg.n_layers {
-            layers.push(ConformerLayer::new(cfg.d_model, d_ff, cfg.n_heads, cfg.conv_kernel_size, true, &cfg.self_attention_model, layers_vb.pp(i.to_string()))?);
+            layers.push(ConformerLayer::new(
+                cfg.d_model,
+                d_ff,
+                cfg.n_heads,
+                cfg.conv_kernel_size,
+                true,
+                &cfg.self_attention_model,
+                layers_vb.pp(i.to_string()),
+            )?);
         }
 
         let out_proj = if cfg.feat_out > 0 && cfg.feat_out != cfg.d_model {
@@ -107,7 +129,14 @@ impl ConformerEncoder {
         // `att_context_style="regular"`, `conv_context_size=None`). This encoder
         // only supports the `rel_pos` / unlimited-context offline path.
         let (att_context_size_all, att_context_size, att_context_probs, conv_ctx) =
-            Self::calc_context_sizes(None, None, None, "regular", None, cfg.conv_kernel_size as i64)?;
+            Self::calc_context_sizes(
+                None,
+                None,
+                None,
+                "regular",
+                None,
+                cfg.conv_kernel_size as i64,
+            )?;
         let conv_context_size = match conv_ctx {
             ConvContextSize::Size(l, r) => (l, r),
             ConvContextSize::Causal => (cfg.conv_kernel_size as i64 - 1, 0),
@@ -211,7 +240,9 @@ impl ConformerEncoder {
         // is ALWAYS true, so Python drops the leading `drop` pre-encoded frames every
         // chunk (the first chunk too — those frames are streaming warm-up).
         let drop = self.streaming_cfg.drop_extra_pre_encoded.max(0) as usize;
-        let cllen: Vec<i64> = cache_last_channel_len.to_dtype(DType::I64)?.to_vec1::<i64>()?;
+        let cllen: Vec<i64> = cache_last_channel_len
+            .to_dtype(DType::I64)?
+            .to_vec1::<i64>()?;
         if drop > 0 {
             let t = x.dim(1)?;
             x = x.narrow(1, drop, t.saturating_sub(drop))?;
@@ -235,7 +266,8 @@ impl ConformerEncoder {
         let ctx: [i64; 2] = [self.att_context_size[0], self.att_context_size[1]];
         let pad_t = Tensor::from_vec(padding_length, (b,), device)?;
         let off_t = Tensor::from_vec(offset, (b,), device)?;
-        let (pad_mask, att_mask) = self.create_masks(ctx, &pad_t, max_audio_length, Some(&off_t), device)?;
+        let (pad_mask, att_mask) =
+            self.create_masks(ctx, &pad_t, max_audio_length, Some(&off_t), device)?;
         let t_cur = max_audio_length - cache_len;
         let pad_mask = pad_mask.narrow(1, cache_len, t_cur)?;
         let att_mask = match att_mask {
@@ -249,7 +281,14 @@ impl ConformerEncoder {
         for (lth, layer) in self.layers.iter().enumerate() {
             let ch = cache_last_channel.get(lth)?; // (B, cache_len, d_model)
             let ti = cache_last_time.get(lth)?; // (B, d_model, T_cache)
-            let (xo, nc, nt) = layer.forward_cache(&x, att_mask.as_ref(), &pos_emb, Some(&pad_mask), Some(&ch), Some(&ti))?;
+            let (xo, nc, nt) = layer.forward_cache(
+                &x,
+                att_mask.as_ref(),
+                &pos_emb,
+                Some(&pad_mask),
+                Some(&ch),
+                Some(&ti),
+            )?;
             x = xo;
             next_channel.push(nc.expect("streaming layer returns a channel cache"));
             next_time.push(nt.expect("streaming layer returns a time cache"));
@@ -264,7 +303,10 @@ impl ConformerEncoder {
         let next_time = Tensor::stack(&next_time, 0)?;
         // clamp(cache_last_channel_len + cache_keep_size, max=cache_len) — no min clamp,
         // so it can be negative (matches Python's `torch.clamp(..., max=cache_len)`).
-        let next_len: Vec<i64> = cllen.iter().map(|&l| (l + cache_keep).min(cache_len as i64)).collect();
+        let next_len: Vec<i64> = cllen
+            .iter()
+            .map(|&l| (l + cache_keep).min(cache_len as i64))
+            .collect();
         Ok((
             encoded,
             Tensor::from_vec(length, (b,), device)?,
@@ -284,7 +326,10 @@ impl ConformerEncoder {
     /// Debug variant returning stage intermediates for parity localization:
     /// (post-subsampling, pos-encoded x, rel pos-emb, after-layer-0, final).
     #[doc(hidden)]
-    pub fn forward_stages(&self, audio_signal: &Tensor) -> Result<(Tensor, Tensor, Tensor, Tensor, Tensor)> {
+    pub fn forward_stages(
+        &self,
+        audio_signal: &Tensor,
+    ) -> Result<(Tensor, Tensor, Tensor, Tensor, Tensor)> {
         let x = audio_signal.transpose(1, 2)?.contiguous()?;
         let sub = self.pre_encode.forward(&x)?;
         let (mut x, pos_emb) = self.pos_enc.forward(&sub)?;
@@ -339,11 +384,21 @@ impl ConformerEncoder {
         // external (B, n_layers, …) → internal (n_layers, B, …).
         let cch_i = cch.transpose(0, 1)?.contiguous()?;
         let ctime_i = ctime.transpose(0, 1)?.contiguous()?;
-        let (encoded, len, next_ch, next_time, next_len) = self.forward_streaming(audio_signal, length, &cch_i, &ctime_i, clen)?;
-        let (encoded, len, next_ch) = self.streaming_post_process(encoded, len, Some(next_ch), false)?;
+        let (encoded, len, next_ch, next_time, next_len) =
+            self.forward_streaming(audio_signal, length, &cch_i, &ctime_i, clen)?;
+        let (encoded, len, next_ch) =
+            self.streaming_post_process(encoded, len, Some(next_ch), false)?;
         let next_ch = next_ch.expect("streaming post-process keeps the channel cache");
         // internal → external.
-        Ok((encoded, len, Some((next_ch.transpose(0, 1)?.contiguous()?, next_time.transpose(0, 1)?.contiguous()?, next_len))))
+        Ok((
+            encoded,
+            len,
+            Some((
+                next_ch.transpose(0, 1)?.contiguous()?,
+                next_time.transpose(0, 1)?.contiguous()?,
+                next_len,
+            )),
+        ))
     }
 
     /// PORT: `_create_masks` (encoder.py L737-791) → `(pad_mask, att_mask)`, both `bool`
@@ -566,7 +621,8 @@ impl ConformerEncoder {
             Some(probs) if !probs.is_empty() => {
                 if probs.len() != att_context_size_all.len() {
                     return Err(candle_core::Error::Msg(
-                        "The size of the att_context_probs should be the same as att_context_size.".to_string(),
+                        "The size of the att_context_probs should be the same as att_context_size."
+                            .to_string(),
                     ));
                 }
                 // Python compares `sum(att_context_probs) != 1` exactly (no tolerance).
@@ -604,7 +660,12 @@ impl ConformerEncoder {
         };
 
         let att_context_size = att_context_size_all[0].clone();
-        Ok((att_context_size_all, att_context_size, att_context_probs, conv_context_size))
+        Ok((
+            att_context_size_all,
+            att_context_size,
+            att_context_probs,
+            conv_context_size,
+        ))
     }
 
     /// PORT: `set_default_att_context_size` (encoder.py L853-868). Set the current
@@ -633,11 +694,22 @@ impl ConformerEncoder {
     /// `rel_pos → rel_pos` is a faithful reconfiguration (the `RelPositionalEncoding`
     /// is already the right type and `set_max_audio_length` resets the table); other
     /// targets error rather than silently no-op.
-    pub fn change_attention_model(&mut self, self_attention_model: Option<&str>, att_context_size: Option<Vec<i64>>) -> Result<()> {
-        let att_context_size = att_context_size.filter(|v| !v.is_empty()).unwrap_or_else(|| self.att_context_size.clone());
-        let sam = self_attention_model.unwrap_or(&self.self_attention_model).to_string();
-        if sam == "rel_pos_local_attn" && att_context_size.iter().copied().max().unwrap_or(-1) <= 0 {
-            return Err(candle_core::Error::Msg("When using local attention, context size must be set > 0".into()));
+    pub fn change_attention_model(
+        &mut self,
+        self_attention_model: Option<&str>,
+        att_context_size: Option<Vec<i64>>,
+    ) -> Result<()> {
+        let att_context_size = att_context_size
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| self.att_context_size.clone());
+        let sam = self_attention_model
+            .unwrap_or(&self.self_attention_model)
+            .to_string();
+        if sam == "rel_pos_local_attn" && att_context_size.iter().copied().max().unwrap_or(-1) <= 0
+        {
+            return Err(candle_core::Error::Msg(
+                "When using local attention, context size must be set > 0".into(),
+            ));
         }
         if sam != "rel_pos" {
             return Err(candle_core::Error::Msg(format!(
@@ -726,7 +798,11 @@ impl ConformerEncoder {
 
         // last_channel_cache_size (L912-923).
         cfg.last_channel_cache_size = if chunk_size.is_none() {
-            if att_context_size[0] >= 0 { att_context_size[0] } else { max_context }
+            if att_context_size[0] >= 0 {
+                att_context_size[0]
+            } else {
+                max_context
+            }
         } else if let Some(lc) = left_chunks {
             lc * chunk_size.unwrap()
         } else if att_context_size[0] >= 0 {
@@ -758,7 +834,11 @@ impl ConformerEncoder {
         cfg.pre_encode_cache_size = pre_encode_cache.clone();
         cfg.drop_extra_pre_encoded = match pre_encode_cache {
             IntOrPair::Pair(_, p1) => {
-                if p1 >= 1 { 1 + (p1 - 1) / sf } else { 0 }
+                if p1 >= 1 {
+                    1 + (p1 - 1) / sf
+                } else {
+                    0
+                }
             }
             IntOrPair::Int(p) => p / sf,
         };
@@ -785,7 +865,11 @@ impl ConformerEncoder {
         let cache_out = if self.streaming_cfg.last_channel_cache_size > 0 {
             let n = self.streaming_cfg.last_channel_cache_size as usize;
             let t = cache.dim(2)?;
-            if t > n { cache.narrow(2, t - n, n)? } else { cache }
+            if t > n {
+                cache.narrow(2, t - n, n)?
+            } else {
+                cache
+            }
         } else {
             cache
         };
@@ -796,7 +880,11 @@ impl ConformerEncoder {
         {
             let v = self.streaming_cfg.valid_out_len as usize;
             let t = encoded.dim(2)?;
-            let enc = if t > v { encoded.narrow(2, 0, v)? } else { encoded };
+            let enc = if t > v {
+                encoded.narrow(2, 0, v)?
+            } else {
+                encoded
+            };
             let len = encoded_len.clamp(0i64, self.streaming_cfg.valid_out_len)?;
             (enc, len)
         } else {
@@ -820,14 +908,22 @@ impl ConformerEncoder {
         let last_time_cache_size = self.conv_context_size.0.max(0) as usize;
         let lc = self.streaming_cfg.last_channel_cache_size.max(0) as usize;
         let shape_ch = (self.layers.len(), batch_size, lc, self.d_model);
-        let shape_t = (self.layers.len(), batch_size, self.d_model, last_time_cache_size);
+        let shape_t = (
+            self.layers.len(),
+            batch_size,
+            self.d_model,
+            last_time_cache_size,
+        );
         let (cache_last_channel, cache_last_time) = if max_dim > 0 {
             (
                 Tensor::randn(0f32, 1f32, shape_ch, device)?.to_dtype(dtype)?,
                 Tensor::randn(0f32, 1f32, shape_t, device)?.to_dtype(dtype)?,
             )
         } else {
-            (Tensor::zeros(shape_ch, dtype, device)?, Tensor::zeros(shape_t, dtype, device)?)
+            (
+                Tensor::zeros(shape_ch, dtype, device)?,
+                Tensor::zeros(shape_t, dtype, device)?,
+            )
         };
         let cache_last_channel_len = Tensor::zeros((batch_size,), DType::I64, device)?;
         Ok((cache_last_channel, cache_last_time, cache_last_channel_len))
@@ -838,14 +934,28 @@ impl ConformerEncoder {
     /// when `export_cache_support`. Returns the tuple as a `Vec<Tensor>` (Python
     /// returns a 2- or 5-element tuple). Lengths use a deterministic `max_dim` stand-in
     /// for the Python `randint` (a tracing dummy).
-    pub fn input_example(&self, max_batch: usize, max_dim: usize, device: &Device) -> Result<Vec<Tensor>> {
+    pub fn input_example(
+        &self,
+        max_batch: usize,
+        max_dim: usize,
+        device: &Device,
+    ) -> Result<Vec<Tensor>> {
         if self.export_cache_support {
-            let window_size =
-                (self.streaming_cfg.chunk_size.second() + self.streaming_cfg.pre_encode_cache_size.second()).max(1) as usize;
+            let window_size = (self.streaming_cfg.chunk_size.second()
+                + self.streaming_cfg.pre_encode_cache_size.second())
+            .max(1) as usize;
             let input = Tensor::randn(0f32, 1f32, (max_batch, self.feat_in, window_size), device)?;
-            let length = Tensor::from_vec(vec![window_size as i64; max_batch], (max_batch,), device)?;
-            let (cc, ct, cl) = self.get_initial_cache_state(max_batch, DType::F32, device, max_dim)?;
-            Ok(vec![input, length, cc.transpose(0, 1)?, ct.transpose(0, 1)?, cl])
+            let length =
+                Tensor::from_vec(vec![window_size as i64; max_batch], (max_batch,), device)?;
+            let (cc, ct, cl) =
+                self.get_initial_cache_state(max_batch, DType::F32, device, max_dim)?;
+            Ok(vec![
+                input,
+                length,
+                cc.transpose(0, 1)?,
+                ct.transpose(0, 1)?,
+                cl,
+            ])
         } else {
             let input = Tensor::randn(0f32, 1f32, (max_batch, self.feat_in, max_dim), device)?;
             let mut lens = vec![(max_dim / 2) as i64; max_batch];
@@ -861,7 +971,11 @@ impl ConformerEncoder {
     /// inputs are disabled unless `export_cache_support`.
     pub fn disabled_deployment_input_names(&self) -> Vec<&'static str> {
         if !self.export_cache_support {
-            vec!["cache_last_channel", "cache_last_time", "cache_last_channel_len"]
+            vec![
+                "cache_last_channel",
+                "cache_last_time",
+                "cache_last_channel_len",
+            ]
         } else {
             vec![]
         }
@@ -871,7 +985,11 @@ impl ConformerEncoder {
     /// cache outputs are disabled unless `export_cache_support`.
     pub fn disabled_deployment_output_names(&self) -> Vec<&'static str> {
         if !self.export_cache_support {
-            vec!["cache_last_channel_next", "cache_last_time_next", "cache_last_channel_next_len"]
+            vec![
+                "cache_last_channel_next",
+                "cache_last_time_next",
+                "cache_last_channel_next_len",
+            ]
         } else {
             vec![]
         }
@@ -885,7 +1003,8 @@ impl ConformerEncoder {
     /// `change_subsampling_conv_chunking_factor` — forwards to the pre-encode
     /// subsampling (a memory-tiling control; see `ConvSubsampling`).
     pub fn change_subsampling_conv_chunking_factor(&mut self, factor: i64) -> Result<()> {
-        self.pre_encode.change_subsampling_conv_chunking_factor(factor)
+        self.pre_encode
+            .change_subsampling_conv_chunking_factor(factor)
     }
 
     // ---- Read accessors for the Python instance attributes (state queryable as in
@@ -970,13 +1089,13 @@ mod tests {
             8,
             IntOrPair::Int(2),
             IntOrPair::Int(5),
-            Some(8),  // chunk_size
-            Some(4),  // shift_size
-            Some(3),  // left_chunks
+            Some(8), // chunk_size
+            Some(4), // shift_size
+            Some(3), // left_chunks
             10_000,
         );
         assert_eq!(cfg.cache_drop_size, 8 - 4); // chunk - shift
-        // last_channel_cache_size = left_chunks * chunk_size = 3*8 = 24
+                                                // last_channel_cache_size = left_chunks * chunk_size = 3*8 = 24
         assert_eq!(cfg.last_channel_cache_size, 24);
         // scalar: chunk = s*(1+la) = 2*(1+7) = 16; shift = 2*(1+7-4) = 8
         assert_eq!(cfg.chunk_size, IntOrPair::Int(16));

@@ -71,10 +71,17 @@ pub struct CacheAwareStreamingConfig {
 /// The `torch.jit.is_scripting()/is_tracing()` branch (which forces f32) has no
 /// candle analog and is taken as false. On the offline path the conformer attention
 /// already upcasts to f32 explicitly (see `mha.rs`), so this is the realized logic.
-pub fn avoid_float16_autocast_context(autocast_dtype: Option<DType>, bf16_supported: bool) -> Option<DType> {
+pub fn avoid_float16_autocast_context(
+    autocast_dtype: Option<DType>,
+    bf16_supported: bool,
+) -> Option<DType> {
     match autocast_dtype {
         // f16 autocast active → avoid it: bf16 if the device supports it, else f32.
-        Some(DType::F16) => Some(if bf16_supported { DType::BF16 } else { DType::F32 }),
+        Some(DType::F16) => Some(if bf16_supported {
+            DType::BF16
+        } else {
+            DType::F32
+        }),
         // not in f16 autocast → `nullcontext()`: no dtype override.
         _ => None,
     }
@@ -126,10 +133,19 @@ mod tests {
     #[test]
     fn avoid_float16_decision() {
         // f16 autocast active → bf16 when supported, else f32.
-        assert_eq!(avoid_float16_autocast_context(Some(DType::F16), true), Some(DType::BF16));
-        assert_eq!(avoid_float16_autocast_context(Some(DType::F16), false), Some(DType::F32));
+        assert_eq!(
+            avoid_float16_autocast_context(Some(DType::F16), true),
+            Some(DType::BF16)
+        );
+        assert_eq!(
+            avoid_float16_autocast_context(Some(DType::F16), false),
+            Some(DType::F32)
+        );
         // not in f16 autocast → nullcontext (no override).
-        assert_eq!(avoid_float16_autocast_context(Some(DType::BF16), true), None);
+        assert_eq!(
+            avoid_float16_autocast_context(Some(DType::BF16), true),
+            None
+        );
         assert_eq!(avoid_float16_autocast_context(Some(DType::F32), true), None);
         assert_eq!(avoid_float16_autocast_context(None, true), None);
     }

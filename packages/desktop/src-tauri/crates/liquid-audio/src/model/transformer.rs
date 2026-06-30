@@ -21,7 +21,9 @@ use candle_core::{DType, Device, Result, Tensor, D};
 // `ops::softmax` (basic ops, differentiable), NOT `softmax_last_dim` (the fused
 // `apply_op1_no_bwd` kernel that severs autograd) — this attention runs in the
 // trainable `logits`/`forward` graph. Same forward values.
-use candle_nn::{linear_no_bias, ops::softmax, rotary_emb::rope_i_slow, Embedding, Linear, Module, VarBuilder};
+use candle_nn::{
+    linear_no_bias, ops::softmax, rotary_emb::rope_i_slow, Embedding, Linear, Module, VarBuilder,
+};
 
 use crate::candle_ext::kv_cache::ConcatKvCache;
 
@@ -60,7 +62,9 @@ impl Default for LayerKvCache {
     fn default() -> Self {
         // dim=1: the Python `update` concatenates along the time axis of
         // `[b, t, heads, head_dim]` (`torch.cat(..., dim=1)`).
-        Self { inner: ConcatKvCache::new(1) }
+        Self {
+            inner: ConcatKvCache::new(1),
+        }
     }
 }
 
@@ -178,7 +182,12 @@ impl Glu {
             None
         };
         let w2 = linear_no_bias(ff, dim, vb.pp("w2"))?;
-        Ok(Self { w1, w2, w3, use_swiglu })
+        Ok(Self {
+            w1,
+            w2,
+            w3,
+            use_swiglu,
+        })
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -207,9 +216,16 @@ impl Glu {
 /// builder; the table is model-specific (theta, interleaving) and moshi's
 /// `RotaryEmbedding` bakes its own convention, so this small builder stays local
 /// (backbone parity 6.3e-6 confirms the table matches HF Lfm2).
-pub fn precompute_freqs_cis(dim: usize, end: usize, theta: f64, device: &Device) -> Result<(Tensor, Tensor)> {
+pub fn precompute_freqs_cis(
+    dim: usize,
+    end: usize,
+    theta: f64,
+    device: &Device,
+) -> Result<(Tensor, Tensor)> {
     let half = dim / 2;
-    let inv_freq: Vec<f32> = (0..half).map(|i| (1.0 / theta.powf(2.0 * i as f64 / dim as f64)) as f32).collect();
+    let inv_freq: Vec<f32> = (0..half)
+        .map(|i| (1.0 / theta.powf(2.0 * i as f64 / dim as f64)) as f32)
+        .collect();
     let inv_freq = Tensor::from_vec(inv_freq, (1, half), device)?;
     let t: Vec<f32> = (0..end).map(|i| i as f32).collect();
     let t = Tensor::from_vec(t, (end, 1), device)?;
@@ -225,7 +241,12 @@ pub fn precompute_freqs_cis(dim: usize, end: usize, theta: f64, device: &Device)
 /// interleaved-pair rotation), with the complex `freqs_cis` table carried as
 /// `(cos, sin)` from `precompute_freqs_cis`. Faithful to the upcast-rotate
 /// contract: callers pass f32 q/k and cast the result back (`type_as`).
-pub fn apply_rotary_emb(xq: &Tensor, xk: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<(Tensor, Tensor)> {
+pub fn apply_rotary_emb(
+    xq: &Tensor,
+    xk: &Tensor,
+    cos: &Tensor,
+    sin: &Tensor,
+) -> Result<(Tensor, Tensor)> {
     Ok((rope_i_slow(xq, cos, sin)?, rope_i_slow(xk, cos, sin)?))
 }
 
@@ -236,7 +257,9 @@ pub fn apply_rotary_emb(xq: &Tensor, xk: &Tensor, cos: &Tensor, sin: &Tensor) ->
 pub fn reshape_for_broadcast(freqs_cis: &Tensor, x: &Tensor) -> Result<Tensor> {
     let dims = x.dims();
     let ndim = dims.len();
-    let shape: Vec<usize> = (0..ndim).map(|i| if i == 1 || i == ndim - 1 { dims[i] } else { 1 }).collect();
+    let shape: Vec<usize> = (0..ndim)
+        .map(|i| if i == 1 || i == ndim - 1 { dims[i] } else { 1 })
+        .collect();
     freqs_cis.reshape(shape)
 }
 
@@ -253,7 +276,9 @@ fn repeat_kv(x: &Tensor, n_rep: usize) -> Result<Tensor> {
         return Ok(x.clone());
     }
     let (b, h, t, d) = x.dims4()?;
-    x.unsqueeze(2)?.expand((b, h, n_rep, t, d))?.reshape((b, h * n_rep, t, d))
+    x.unsqueeze(2)?
+        .expand((b, h, n_rep, t, d))?
+        .reshape((b, h * n_rep, t, d))
 }
 
 /// Additive causal mask of shape `[q_len, kv_len]`. For `q_len == kv_len` this is
@@ -303,7 +328,14 @@ impl BoundedAttention {
         } else {
             (None, None)
         };
-        Ok(Self { num_heads, head_dim, head_style, gqa_dim, q_layernorm, k_layernorm })
+        Ok(Self {
+            num_heads,
+            head_dim,
+            head_style,
+            gqa_dim,
+            q_layernorm,
+            k_layernorm,
+        })
     }
 
     fn kv_heads(&self) -> usize {
@@ -377,7 +409,8 @@ impl BoundedAttention {
         let attn = softmax(&attn, D::Minus1)?;
         let out = attn.matmul(&value)?.to_dtype(in_dtype)?; // [b, heads, t, head_dim], back to input dtype
 
-        out.transpose(1, 2)?.reshape((bsz, seqlen, self.num_heads * self.head_dim))
+        out.transpose(1, 2)?
+            .reshape((bsz, seqlen, self.num_heads * self.head_dim))
     }
 }
 
@@ -416,9 +449,27 @@ impl Mha {
         };
         let qkv_proj = linear_no_bias(dim, total_width, vb.pp("qkv_proj"))?;
         let out_proj = linear_no_bias(dim, dim, vb.pp("out_proj"))?;
-        let attention = BoundedAttention::new(dim, num_heads, head_style, gqa_dim, qk_layernorm, norm_eps, vb.pp("bounded_attention"))?;
+        let attention = BoundedAttention::new(
+            dim,
+            num_heads,
+            head_style,
+            gqa_dim,
+            qk_layernorm,
+            norm_eps,
+            vb.pp("bounded_attention"),
+        )?;
         let (cos, sin) = precompute_freqs_cis(head_dim, max_seq_len, theta, vb.device())?;
-        Ok(Self { dim, head_dim, head_style, gqa_dim, qkv_proj, out_proj, attention, cos, sin })
+        Ok(Self {
+            dim,
+            head_dim,
+            head_style,
+            gqa_dim,
+            qkv_proj,
+            out_proj,
+            attention,
+            cos,
+            sin,
+        })
     }
 
     pub fn dim(&self) -> usize {
@@ -508,14 +559,29 @@ impl StandardBlock {
         vb: VarBuilder,
     ) -> Result<Self> {
         let dim = operator.dim();
-        let feed_forward = Glu::new(dim, ff_dim, use_swiglu, multiple_of, ffn_dim_multiplier, vb.pp("feed_forward"))?;
+        let feed_forward = Glu::new(
+            dim,
+            ff_dim,
+            use_swiglu,
+            multiple_of,
+            ffn_dim_multiplier,
+            vb.pp("feed_forward"),
+        )?;
         let operator_norm = RmsNorm::new(dim, norm_eps, vb.pp("operator_norm"))?;
         let ffn_norm = RmsNorm::new(dim, norm_eps, vb.pp("ffn_norm"))?;
-        Ok(Self { operator, feed_forward, operator_norm, ffn_norm })
+        Ok(Self {
+            operator,
+            feed_forward,
+            operator_norm,
+            ffn_norm,
+        })
     }
 
     pub fn forward(&self, x: &Tensor, cache: Option<&mut LayerKvCache>) -> Result<Tensor> {
-        let h = (self.operator.forward(&self.operator_norm.forward(x)?, cache)? + x)?;
+        let h = (self
+            .operator
+            .forward(&self.operator_norm.forward(x)?, cache)?
+            + x)?;
         let h_glu = self.feed_forward.forward(&self.ffn_norm.forward(&h)?)?;
         h + h_glu
     }
@@ -526,7 +592,9 @@ impl StandardBlock {
     /// Returns `(out, new_cache)`.
     pub fn forward_cached(&self, x: &Tensor, cache: LayerCache) -> Result<(Tensor, LayerCache)> {
         // py 386: `h, new_cache = self.operator.forward_cached(self.operator_norm(x), cache)`
-        let (h, new_cache) = self.operator.forward_cached(&self.operator_norm.forward(x)?, cache)?;
+        let (h, new_cache) = self
+            .operator
+            .forward_cached(&self.operator_norm.forward(x)?, cache)?;
         // py 387: `h += x`
         let h = (h + x)?;
         // py 388: `h_glu = self.feed_forward.forward(self.ffn_norm(h))`
@@ -557,7 +625,11 @@ impl SharedEmbedding {
         let embedding_norm = RmsNorm::new(dim, norm_eps, vb.pp("embedding_norm"))?;
         let to_logits_w = vb.pp("to_logits").get((vocab_size, dim), "weight")?;
         let to_logits = Linear::new(to_logits_w, None);
-        Ok(Self { embedding, embedding_norm, to_logits })
+        Ok(Self {
+            embedding,
+            embedding_norm,
+            to_logits,
+        })
     }
 
     /// `SharedEmbedding.forward` (py 500-501): `return self.embed(tokens)` — the
@@ -572,7 +644,8 @@ impl SharedEmbedding {
     }
 
     pub fn get_logits(&self, embeddings: &Tensor) -> Result<Tensor> {
-        self.to_logits.forward(&self.embedding_norm.forward(embeddings)?)
+        self.to_logits
+            .forward(&self.embedding_norm.forward(embeddings)?)
     }
 }
 
@@ -592,7 +665,11 @@ impl RawLmBackbone {
     /// `VarBuilder` (weights are loaded, not initialized) and passed in — `None`
     /// is `has_embedding=False`. `dim` is the backbone width.
     pub fn new(layers: Vec<StandardBlock>, embedding: Option<SharedEmbedding>, dim: usize) -> Self {
-        Self { layers, embedding, dim }
+        Self {
+            layers,
+            embedding,
+            dim,
+        }
     }
 
     pub fn forward(&self, x: &Tensor, caches: Option<&mut [LayerKvCache]>) -> Result<Tensor> {
@@ -640,7 +717,10 @@ impl RawLmBackbone {
         // py 555-559: validate length when present, else seed `[None] * n_layers`.
         let cache = match cache {
             Some(c) => {
-                assert!(c.len() == self.layers.len(), "expected one cache entry per layer");
+                assert!(
+                    c.len() == self.layers.len(),
+                    "expected one cache entry per layer"
+                );
                 c
             }
             None => (0..self.layers.len()).map(|_| None).collect(),
@@ -734,9 +814,13 @@ mod tests {
         let q = Var::from_tensor(&Tensor::randn(0f32, 1f32, (b, h, t, d), &dev).unwrap()).unwrap();
         let k = Var::from_tensor(&Tensor::randn(0f32, 1f32, (b, h, t, d), &dev).unwrap()).unwrap();
         let (qr, kr) = apply_rotary_emb(q.as_tensor(), k.as_tensor(), &cos, &sin).unwrap();
-        let loss = (qr.sqr().unwrap().sum_all().unwrap() + kr.sqr().unwrap().sum_all().unwrap()).unwrap();
+        let loss =
+            (qr.sqr().unwrap().sum_all().unwrap() + kr.sqr().unwrap().sum_all().unwrap()).unwrap();
         let grads = loss.backward().unwrap();
-        assert!(grads.get(&q).is_some(), "rotary severed the gradient to q (fused rope_i?)");
+        assert!(
+            grads.get(&q).is_some(),
+            "rotary severed the gradient to q (fused rope_i?)"
+        );
         assert!(grads.get(&k).is_some(), "rotary severed the gradient to k");
     }
 

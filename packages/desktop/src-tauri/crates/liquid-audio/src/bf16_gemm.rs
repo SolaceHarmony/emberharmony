@@ -68,7 +68,13 @@ impl CustomOp2 for Bf16Gemm {
         "bf16-gemm"
     }
 
-    fn cpu_fwd(&self, s1: &CpuStorage, l1: &Layout, s2: &CpuStorage, l2: &Layout) -> Result<(CpuStorage, Shape)> {
+    fn cpu_fwd(
+        &self,
+        s1: &CpuStorage,
+        l1: &Layout,
+        s2: &CpuStorage,
+        l2: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
         if !bf16_gemm_available() {
             candle_core::bail!("bf16-gemm: FEAT_BF16 kernel unavailable on this target");
         }
@@ -136,22 +142,56 @@ mod tests {
         let dev = Device::Cpu;
         // Non-aligned dims exercise the M%2 / N%2 / K%4 zero-padded edges.
         let (m, k, n) = (5usize, 13usize, 7usize);
-        let av: Vec<f32> = (0..m * k).map(|i| ((i * 7 % 23) as f32 / 23.0 - 0.5) * 2.0).collect();
-        let bv: Vec<f32> = (0..k * n).map(|i| ((i * 5 % 19) as f32 / 19.0 - 0.5) * 2.0).collect();
+        let av: Vec<f32> = (0..m * k)
+            .map(|i| ((i * 7 % 23) as f32 / 23.0 - 0.5) * 2.0)
+            .collect();
+        let bv: Vec<f32> = (0..k * n)
+            .map(|i| ((i * 5 % 19) as f32 / 19.0 - 0.5) * 2.0)
+            .collect();
         let a = Tensor::from_vec(av, (m, k), &dev).unwrap();
         let b = Tensor::from_vec(bv, (k, n), &dev).unwrap();
 
         // Reference: round inputs to bf16, then an f32 matmul — BFMMLA's exact-product
         // f32-accumulate numerics, modulo accumulation order.
-        let a_ref = a.to_dtype(DType::BF16).unwrap().to_dtype(DType::F32).unwrap();
-        let b_ref = b.to_dtype(DType::BF16).unwrap().to_dtype(DType::F32).unwrap();
-        let cref: Vec<f32> = a_ref.matmul(&b_ref).unwrap().flatten_all().unwrap().to_vec1().unwrap();
-        let cgot: Vec<f32> = bf16_matmul(&a, &b).unwrap().unwrap().flatten_all().unwrap().to_vec1().unwrap();
+        let a_ref = a
+            .to_dtype(DType::BF16)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap();
+        let b_ref = b
+            .to_dtype(DType::BF16)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap();
+        let cref: Vec<f32> = a_ref
+            .matmul(&b_ref)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let cgot: Vec<f32> = bf16_matmul(&a, &b)
+            .unwrap()
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
 
         assert_eq!(cgot.len(), cref.len());
-        let maxd = cgot.iter().zip(&cref).fold(0f32, |m, (g, r)| m.max((g - r).abs()));
+        let maxd = cgot
+            .iter()
+            .zip(&cref)
+            .fold(0f32, |m, (g, r)| m.max((g - r).abs()));
         let scale = cref.iter().fold(0f32, |m, &x| m.max(x.abs())).max(1e-6);
-        eprintln!("BFMMLA bf16 GEMM vs f32(bf16-inputs) ref: max {maxd:.3e} (rel {:.3e})", maxd / scale);
-        assert!(maxd / scale < 1e-2, "BFMMLA vs ref rel {} too large", maxd / scale);
+        eprintln!(
+            "BFMMLA bf16 GEMM vs f32(bf16-inputs) ref: max {maxd:.3e} (rel {:.3e})",
+            maxd / scale
+        );
+        assert!(
+            maxd / scale < 1e-2,
+            "BFMMLA vs ref rel {} too large",
+            maxd / scale
+        );
     }
 }

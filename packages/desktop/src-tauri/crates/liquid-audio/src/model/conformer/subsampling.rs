@@ -9,12 +9,21 @@
 //! Other subsampling schemes (vggnet/striding/*_conv1d) are not ported.
 
 use candle_core::{Result, Tensor, D};
-use candle_nn::{conv1d, conv2d, linear, Conv1d, Conv1dConfig, Conv2d, Conv2dConfig, Linear, Module, VarBuilder};
+use candle_nn::{
+    conv1d, conv2d, linear, Conv1d, Conv1dConfig, Conv2d, Conv2dConfig, Linear, Module, VarBuilder,
+};
 
 use super::modules::{CausalConv1D, CausalPadding};
 
 /// Faithful to `calc_length`: output length after `repeat_num` strided convs.
-pub fn calc_length(length: usize, all_paddings: i64, kernel_size: i64, stride: i64, ceil_mode: bool, repeat_num: usize) -> usize {
+pub fn calc_length(
+    length: usize,
+    all_paddings: i64,
+    kernel_size: i64,
+    stride: i64,
+    ceil_mode: bool,
+    repeat_num: usize,
+) -> usize {
     let add_pad = (all_paddings - kernel_size) as f64;
     let mut l = length as f64;
     for _ in 0..repeat_num {
@@ -33,7 +42,12 @@ pub fn apply_channel_mask(tensor: &Tensor, mask: &Tensor) -> Result<Tensor> {
 }
 
 /// `calculate_conv_output_size`: `(input + l_pad + r_pad - kernel) // stride + 1`.
-pub fn calculate_conv_output_size(input_size: i64, kernel_size: i64, stride: i64, padding: (i64, i64)) -> i64 {
+pub fn calculate_conv_output_size(
+    input_size: i64,
+    kernel_size: i64,
+    stride: i64,
+    padding: (i64, i64),
+) -> i64 {
     (input_size + padding.0 + padding.1 - kernel_size) / stride + 1
 }
 
@@ -72,7 +86,11 @@ fn pad_even_1d(x: &Tensor) -> Result<Tensor> {
 /// ceil window covers only the last in-bounds element, and `max(x[last], x[last]) =
 /// x[last]` — exactly torch's partial-window max (verified bit-identical in tests).
 fn ceil_pool2d(x: &Tensor, kernel: usize, stride: usize) -> Result<Tensor> {
-    debug_assert_eq!((kernel, stride), (2, 2), "ceil_pool2d only implements the vggnet k=s=2 case");
+    debug_assert_eq!(
+        (kernel, stride),
+        (2, 2),
+        "ceil_pool2d only implements the vggnet k=s=2 case"
+    );
     let (_, _, h, w) = x.dims4()?;
     let mut x = x.clone();
     if h % 2 == 1 {
@@ -102,7 +120,10 @@ enum Op {
     /// Causal 1-D conv (`striding_conv1d` with `is_causal`): asymmetric left/right pad.
     CausalConv1d(CausalConv1D),
     /// `MaxPool2d(kernel, stride, padding=0, ceil_mode=True)` for `vggnet`.
-    MaxPool2dCeil { kernel: usize, stride: usize },
+    MaxPool2dCeil {
+        kernel: usize,
+        stride: usize,
+    },
     Relu,
 }
 
@@ -199,7 +220,10 @@ impl MaskedConvSequential {
                         let (k, s) = (kernel, cfg.stride as i64);
                         cur = cur
                             .iter()
-                            .map(|&l| calculate_conv_output_size(l as i64, k, s, (pad, pad)).max(0) as usize)
+                            .map(|&l| {
+                                calculate_conv_output_size(l as i64, k, s, (pad, pad)).max(0)
+                                    as usize
+                            })
                             .collect();
                         mask = self.create_mask(&out, &cur)?;
                     }
@@ -247,8 +271,22 @@ impl ConvSubsampling {
     /// `dw_striding` builder (the LFM2.5-Audio model's scheme), `is_causal=false`.
     /// `feat_in` = mel bins, `feat_out` = encoder d_model. Thin wrapper over
     /// [`Self::new_scheme`] so the model path is unchanged.
-    pub fn new(subsampling_factor: usize, feat_in: usize, feat_out: usize, conv_channels: usize, vb: VarBuilder) -> Result<Self> {
-        Self::new_scheme("dw_striding", subsampling_factor, feat_in, feat_out, conv_channels, false, vb)
+    pub fn new(
+        subsampling_factor: usize,
+        feat_in: usize,
+        feat_out: usize,
+        conv_channels: usize,
+        vb: VarBuilder,
+    ) -> Result<Self> {
+        Self::new_scheme(
+            "dw_striding",
+            subsampling_factor,
+            feat_in,
+            feat_out,
+            conv_channels,
+            false,
+            vb,
+        )
     }
 
     /// PORT: `ConvSubsampling.__init__` (subsampling.py L43-343) — all schemes.
@@ -297,16 +335,37 @@ impl ConvSubsampling {
                 ceil_mode = true;
                 left_padding = 0;
                 right_padding = 0;
-                let cfg = Conv2dConfig { padding: 1, stride: 1, dilation: 1, groups: 1, ..Default::default() };
+                let cfg = Conv2dConfig {
+                    padding: 1,
+                    stride: 1,
+                    dilation: 1,
+                    groups: 1,
+                    ..Default::default()
+                };
                 let mut in_ch = 1usize;
                 for _ in 0..sampling_num {
-                    layers.push(Op::Conv(conv2d(in_ch, conv_channels, 3, cfg, next(&mut idx))?));
+                    layers.push(Op::Conv(conv2d(
+                        in_ch,
+                        conv_channels,
+                        3,
+                        cfg,
+                        next(&mut idx),
+                    )?));
                     layers.push(Op::Relu);
                     idx += 1;
-                    layers.push(Op::Conv(conv2d(conv_channels, conv_channels, 3, cfg, next(&mut idx))?));
+                    layers.push(Op::Conv(conv2d(
+                        conv_channels,
+                        conv_channels,
+                        3,
+                        cfg,
+                        next(&mut idx),
+                    )?));
                     layers.push(Op::Relu);
                     idx += 1;
-                    layers.push(Op::MaxPool2dCeil { kernel: 2, stride: 2 });
+                    layers.push(Op::MaxPool2dCeil {
+                        kernel: 2,
+                        stride: 2,
+                    });
                     idx += 1;
                     in_ch = conv_channels;
                 }
@@ -322,15 +381,45 @@ impl ConvSubsampling {
                 left_padding = (kernel_size - 1) / 2;
                 right_padding = (kernel_size - 1) / 2;
                 let pad = left_padding;
-                let scfg = |groups: usize| Conv2dConfig { padding: pad, stride, dilation: 1, groups, ..Default::default() };
-                let pwcfg = Conv2dConfig { padding: 0, stride: 1, dilation: 1, groups: 1, ..Default::default() };
+                let scfg = |groups: usize| Conv2dConfig {
+                    padding: pad,
+                    stride,
+                    dilation: 1,
+                    groups,
+                    ..Default::default()
+                };
+                let pwcfg = Conv2dConfig {
+                    padding: 0,
+                    stride: 1,
+                    dilation: 1,
+                    groups: 1,
+                    ..Default::default()
+                };
                 if subsampling == "dw_striding" {
-                    layers.push(Op::Conv(conv2d(1, conv_channels, kernel_size, scfg(1), next(&mut idx))?));
+                    layers.push(Op::Conv(conv2d(
+                        1,
+                        conv_channels,
+                        kernel_size,
+                        scfg(1),
+                        next(&mut idx),
+                    )?));
                     layers.push(Op::Relu);
                     idx += 1;
                     for _ in 0..(sampling_num - 1) {
-                        layers.push(Op::Conv(conv2d(conv_channels, conv_channels, kernel_size, scfg(conv_channels), next(&mut idx))?));
-                        layers.push(Op::Conv(conv2d(conv_channels, conv_channels, 1, pwcfg, next(&mut idx))?));
+                        layers.push(Op::Conv(conv2d(
+                            conv_channels,
+                            conv_channels,
+                            kernel_size,
+                            scfg(conv_channels),
+                            next(&mut idx),
+                        )?));
+                        layers.push(Op::Conv(conv2d(
+                            conv_channels,
+                            conv_channels,
+                            1,
+                            pwcfg,
+                            next(&mut idx),
+                        )?));
                         layers.push(Op::Relu);
                         idx += 1;
                     }
@@ -338,7 +427,13 @@ impl ConvSubsampling {
                     // striding: plain Conv2d per sampling step.
                     let mut in_ch = 1usize;
                     for _ in 0..sampling_num {
-                        layers.push(Op::Conv(conv2d(in_ch, conv_channels, kernel_size, scfg(1), next(&mut idx))?));
+                        layers.push(Op::Conv(conv2d(
+                            in_ch,
+                            conv_channels,
+                            kernel_size,
+                            scfg(1),
+                            next(&mut idx),
+                        )?));
                         layers.push(Op::Relu);
                         idx += 1;
                         in_ch = conv_channels;
@@ -358,14 +453,38 @@ impl ConvSubsampling {
                     left_padding = (kernel_size - 1) / 2;
                     right_padding = (kernel_size - 1) / 2;
                 }
-                let cfg = Conv1dConfig { padding: left_padding, stride, dilation: 1, groups: 1, ..Default::default() };
+                let cfg = Conv1dConfig {
+                    padding: left_padding,
+                    stride,
+                    dilation: 1,
+                    groups: 1,
+                    ..Default::default()
+                };
                 let mut in_ch = feat_in;
                 for i in 0..sampling_num {
-                    let out_ch = if sampling_num == i + 1 { feat_out } else { conv_channels };
-                    if is_causal {
-                        layers.push(Op::CausalConv1d(CausalConv1D::new(in_ch, out_ch, kernel_size, stride, CausalPadding::Causal, 1, next(&mut idx))?));
+                    let out_ch = if sampling_num == i + 1 {
+                        feat_out
                     } else {
-                        layers.push(Op::Conv1d(conv1d(in_ch, out_ch, kernel_size, cfg, next(&mut idx))?));
+                        conv_channels
+                    };
+                    if is_causal {
+                        layers.push(Op::CausalConv1d(CausalConv1D::new(
+                            in_ch,
+                            out_ch,
+                            kernel_size,
+                            stride,
+                            CausalPadding::Causal,
+                            1,
+                            next(&mut idx),
+                        )?));
+                    } else {
+                        layers.push(Op::Conv1d(conv1d(
+                            in_ch,
+                            out_ch,
+                            kernel_size,
+                            cfg,
+                            next(&mut idx),
+                        )?));
                     }
                     layers.push(Op::Relu);
                     idx += 1;
@@ -379,18 +498,56 @@ impl ConvSubsampling {
                 ceil_mode = false;
                 left_padding = (kernel_size - 1) / 2;
                 right_padding = (kernel_size - 1) / 2;
-                let dwcfg = |groups: usize| Conv1dConfig { padding: left_padding, stride, dilation: 1, groups, ..Default::default() };
-                let pwcfg = Conv1dConfig { padding: 0, stride: 1, dilation: 1, groups: 1, ..Default::default() };
+                let dwcfg = |groups: usize| Conv1dConfig {
+                    padding: left_padding,
+                    stride,
+                    dilation: 1,
+                    groups,
+                    ..Default::default()
+                };
+                let pwcfg = Conv1dConfig {
+                    padding: 0,
+                    stride: 1,
+                    dilation: 1,
+                    groups: 1,
+                    ..Default::default()
+                };
                 // Layer 1: depthwise(feat_in, groups=feat_in) + pointwise.
-                let l1_out = if sampling_num == 1 { feat_out } else { conv_channels };
-                layers.push(Op::Conv1d(conv1d(feat_in, feat_in, kernel_size, dwcfg(feat_in), next(&mut idx))?));
-                layers.push(Op::Conv1d(conv1d(feat_in, l1_out, 1, pwcfg, next(&mut idx))?));
+                let l1_out = if sampling_num == 1 {
+                    feat_out
+                } else {
+                    conv_channels
+                };
+                layers.push(Op::Conv1d(conv1d(
+                    feat_in,
+                    feat_in,
+                    kernel_size,
+                    dwcfg(feat_in),
+                    next(&mut idx),
+                )?));
+                layers.push(Op::Conv1d(conv1d(
+                    feat_in,
+                    l1_out,
+                    1,
+                    pwcfg,
+                    next(&mut idx),
+                )?));
                 layers.push(Op::Relu);
                 idx += 1;
                 let mut in_ch = conv_channels;
                 for i in 0..(sampling_num - 1) {
-                    let out_ch = if sampling_num == i + 2 { feat_out } else { conv_channels };
-                    layers.push(Op::Conv1d(conv1d(in_ch, in_ch, kernel_size, dwcfg(in_ch), next(&mut idx))?));
+                    let out_ch = if sampling_num == i + 2 {
+                        feat_out
+                    } else {
+                        conv_channels
+                    };
+                    layers.push(Op::Conv1d(conv1d(
+                        in_ch,
+                        in_ch,
+                        kernel_size,
+                        dwcfg(in_ch),
+                        next(&mut idx),
+                    )?));
                     layers.push(Op::Conv1d(conv1d(in_ch, out_ch, 1, pwcfg, next(&mut idx))?));
                     layers.push(Op::Relu);
                     idx += 1;
@@ -398,14 +555,23 @@ impl ConvSubsampling {
                 }
             }
             other => {
-                return Err(candle_core::Error::Msg(format!("Not valid sub-sampling: {other}!")));
+                return Err(candle_core::Error::Msg(format!(
+                    "Not valid sub-sampling: {other}!"
+                )));
             }
         }
 
         // conv2d schemes flatten C×F via a final Linear sized by calc_length.
         let out = if conv2d_subsampling {
             let all_paddings = (left_padding + right_padding) as i64;
-            let out_freq = calc_length(feat_in, all_paddings, kernel_size as i64, stride as i64, ceil_mode, sampling_num);
+            let out_freq = calc_length(
+                feat_in,
+                all_paddings,
+                kernel_size as i64,
+                stride as i64,
+                ceil_mode,
+                sampling_num,
+            );
             Some(linear(conv_channels * out_freq, feat_out, vb.pp("out"))?)
         } else {
             None
@@ -433,7 +599,16 @@ impl ConvSubsampling {
     pub fn out_lengths(&self, lengths: &[i64]) -> Vec<i64> {
         lengths
             .iter()
-            .map(|&l| calc_length(l.max(0) as usize, self.all_paddings, self.kernel_size as i64, self.stride as i64, self.ceil_mode, self.sampling_num) as i64)
+            .map(|&l| {
+                calc_length(
+                    l.max(0) as usize,
+                    self.all_paddings,
+                    self.kernel_size as i64,
+                    self.stride as i64,
+                    self.ceil_mode,
+                    self.sampling_num,
+                ) as i64
+            })
             .collect()
     }
 
@@ -445,7 +620,10 @@ impl ConvSubsampling {
             let y = self.forward_conv(x)?; // (B, C, T', F')
             let (b, c, t, f) = y.dims4()?;
             let y = y.transpose(1, 2)?.contiguous()?.reshape((b, t, c * f))?;
-            self.out.as_ref().expect("conv2d scheme has an out Linear").forward(&y)
+            self.out
+                .as_ref()
+                .expect("conv2d scheme has an out Linear")
+                .forward(&y)
         } else {
             let xin = x.transpose(1, 2)?.contiguous()?; // (B, feat_in, T)
             let y = self.conv.forward_conv(&xin)?; // (B, C=feat_out, T')
@@ -492,7 +670,11 @@ impl ConvSubsampling {
     /// for torch's 2³¹ tensor-indexing limit (pytorch#80020); the output equals
     /// the un-tiled conv. candle has no such limit, so the faithful "same thing"
     /// is the plain conv stack. Returns `(x, lengths, split_happened=false)`.
-    pub fn conv_split_by_batch(&self, x: &Tensor, lengths: Vec<usize>) -> Result<(Tensor, Vec<usize>, bool)> {
+    pub fn conv_split_by_batch(
+        &self,
+        x: &Tensor,
+        lengths: Vec<usize>,
+    ) -> Result<(Tensor, Vec<usize>, bool)> {
         Ok((self.conv.forward_conv(x)?, lengths, false))
     }
 
@@ -506,7 +688,12 @@ impl ConvSubsampling {
     /// `chunk_size`, padding when `is_causal`. Memory-tiling of a single conv
     /// (pytorch#80020 workaround); the un-tiled conv yields the same result on
     /// candle. The causal-pad shape mirrors Python for parity of intent.
-    pub fn channel_chunked_conv(&self, conv: &Conv2d, _chunk_size: usize, x: &Tensor) -> Result<Tensor> {
+    pub fn channel_chunked_conv(
+        &self,
+        conv: &Conv2d,
+        _chunk_size: usize,
+        x: &Tensor,
+    ) -> Result<Tensor> {
         let x = if self.is_causal {
             let k = self.kernel_size as i64 - 1;
             let s = self.stride as i64 - 1;
@@ -537,7 +724,13 @@ mod tests {
             1,
             2,
             3,
-            Conv2dConfig { padding: 1, stride: 2, dilation: 1, groups: 1, ..Default::default() },
+            Conv2dConfig {
+                padding: 1,
+                stride: 2,
+                dilation: 1,
+                groups: 1,
+                ..Default::default()
+            },
             vb.pp("s"),
         )
         .unwrap();
@@ -545,7 +738,13 @@ mod tests {
             2,
             2,
             1,
-            Conv2dConfig { padding: 0, stride: 1, dilation: 1, groups: 1, ..Default::default() },
+            Conv2dConfig {
+                padding: 0,
+                stride: 1,
+                dilation: 1,
+                groups: 1,
+                ..Default::default()
+            },
             vb.pp("p"),
         )
         .unwrap();

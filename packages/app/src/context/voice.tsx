@@ -9,7 +9,24 @@ import {
   useLocalParticipant,
   useTranscriptions,
   useVoiceAssistant,
+  type AgentState,
 } from "@thesolaceproject/livekit-components-solid"
+import {
+  getVoiceSettingsState,
+  getVoiceStatus,
+  interruptVoice,
+  isDesktop,
+  setVoiceMicEnabled,
+  startVoice,
+  stopVoice,
+  VOICE_SETTINGS_CHANGED,
+  type NativeVoiceEvent,
+  type NativeVoiceState,
+  type VoiceStartContext,
+  type VoicePlan,
+  type VoiceProvider,
+  type VoiceSettings,
+} from "@/lib/voice-settings"
 import { useSDK } from "./sdk"
 
 export type VoiceState = "disconnected" | "connecting" | "connected" | "error"
@@ -21,7 +38,22 @@ export type { AgentState } from "@thesolaceproject/livekit-components-solid"
 // not persisted: the microphone must never auto-enable on a fresh launch.
 // Cleared only by an explicit user disconnect.
 let followProjects = false
-let followModel: { providerID: string; modelID: string } | undefined
+let followContext: Omit<VoiceStartContext, "sessionID" | "directory"> | undefined
+
+type NativeStatus = {
+  plan: VoicePlan
+  settings: VoiceSettings
+  stored: boolean
+}
+
+async function loadNativeStatus(desktop: boolean): Promise<NativeStatus | undefined> {
+  if (!desktop) return undefined
+  const plan = await getVoiceStatus().catch(() => undefined)
+  if (!plan) return undefined
+  const state = await getVoiceSettingsState().catch(() => undefined)
+  if (!state) return undefined
+  return { plan, settings: state.settings, stored: state.stored }
+}
 
 const { use: useVoice, provider: VoiceValueProvider } = createSimpleContext({
   name: "Voice",
@@ -29,8 +61,15 @@ const { use: useVoice, provider: VoiceValueProvider } = createSimpleContext({
     const room = props.room
     const sdk = useSDK()
     const params = useParams()
+    const desktop = isDesktop()
     const [error, setError] = createSignal<string | undefined>(undefined)
     const [connecting, setConnecting] = createSignal(false)
+    const [nativeState, setNativeState] = createSignal<VoiceState>("disconnected")
+    const [nativeAgent, setNativeAgent] = createSignal<AgentState>("disconnected")
+    const [nativeMic, setNativeMic] = createSignal(true)
+    const [nativeLine, setNativeLine] = createSignal<{ agent: boolean; text: string } | undefined>(undefined)
+    const [nativeLevel, setNativeLevel] = createSignal(0)
+    const [nativeRun, setNativeRun] = createSignal(false)
 
     // the provider outlives session navigation; a connected room bridges into
     // the session it was started for, so leaving that session must hang up —
@@ -41,11 +80,30 @@ const { use: useVoice, provider: VoiceValueProvider } = createSimpleContext({
       on(
         () => params.id,
         (id, prev) => {
+          if (desktop && nativeRun()) {
+            if (prev === undefined) return
+            const wasActive = state() === "connected" || connecting()
+            const generation = ++followGeneration
+            void stopVoice()
+              .catch(() => {})
+              .then(() => {
+                setNativeState("disconnected")
+                setNativeAgent("disconnected")
+                setNativeMic(true)
+                setNativeLine(undefined)
+                setNativeLevel(0)
+                setNativeRun(false)
+                if (!wasActive || !id) return
+                if (generation !== followGeneration) return
+                connect(id, followContext).catch(() => {})
+              })
+            return
+          }
           if (prev === undefined) {
             // first session opened after a (re)mount — resume if voice was
             // active before a project switch
             if (followProjects && id && state() === "disconnected" && !connecting()) {
-              connect(id, followModel).catch(() => {})
+              connect(id, followContext).catch(() => {})
             }
             return
           }
@@ -54,7 +112,7 @@ const { use: useVoice, provider: VoiceValueProvider } = createSimpleContext({
           void room.disconnect().then(() => {
             if (!wasActive || !id) return
             if (generation !== followGeneration) return
-            connect(id, followModel).catch(() => {})
+            connect(id, followContext).catch(() => {})
           })
         },
       ),
@@ -76,7 +134,7 @@ const { use: useVoice, provider: VoiceValueProvider } = createSimpleContext({
         .catch((err) => setError(err instanceof Error ? err.message : String(err)))
     })
 
-    const [status, { refetch: refetchStatus }] = createResource(
+    const [status, { refetch: refetchStatus, mutate: setStatus }] = createResource(
       () => sdk.client,
       (client) =>
         client.voice
@@ -84,18 +142,75 @@ const { use: useVoice, provider: VoiceValueProvider } = createSimpleContext({
           .then((x) => x.data)
           .catch(() => undefined),
     )
-    const available = () => status()?.available === true
+    const [native, { refetch: refetchNative, mutate: setNative }] = createResource(
+      () => desktop,
+      (enabled) => loadNativeStatus(enabled),
+    )
+    const providerFor = (
+      current: NativeStatus | undefined,
+      server: { available?: boolean } | undefined,
+    ): VoiceProvider => {
+      if (!desktop) return "livekit"
+      if (current?.stored === false && server?.available) return "livekit"
+      return current?.plan.provider ?? "off"
+    }
+    const provider = () => providerFor(native(), status())
+    const enabled = () => {
+      const current = native()
+      if (desktop && current?.stored === false && status()?.available) return true
+      return current?.plan.enabled ?? provider() !== "off"
+    }
+    const nativeActive = () => desktop && nativeRun()
 
-    // voice can be configured in settings while a session is open; poll until
-    // available so the mic button appears without a reload
-    const statusPoll = setInterval(() => {
-      if (!available()) refetchStatus()
-    }, 30_000)
-    onCleanup(() => clearInterval(statusPoll))
+    async function refreshNative() {
+      if (!desktop) return undefined
+      const next = await loadNativeStatus(true)
+      if (next) setNative(next)
+      return next
+    }
+
+    function nativeAgentState(state: NativeVoiceState): AgentState {
+      if (state === "loading") return "initializing"
+      return state
+    }
+
+    function handleNative(event: NativeVoiceEvent) {
+      switch (event.type) {
+        case "state":
+          setNativeAgent(nativeAgentState(event.state))
+          if (event.state !== "speaking") setNativeLevel(0)
+          setNativeState(event.state === "loading" ? "connecting" : event.state === "idle" ? "disconnected" : "connected")
+          setError(undefined)
+          break
+        case "transcript":
+          setNativeLine({ agent: event.role === "assistant", text: event.text })
+          break
+        case "level":
+          setNativeLevel(Math.min(1, Math.max(0, event.rms * 24)))
+          break
+        case "ended":
+          setNativeState("disconnected")
+          setNativeAgent("disconnected")
+          setNativeLine(undefined)
+          setNativeLevel(0)
+          setNativeMic(true)
+          setNativeRun(false)
+          if (event.reason) setError(event.reason)
+          break
+        case "error":
+          setError(event.message)
+          setNativeState("error")
+          setNativeAgent("failed")
+          setNativeLevel(0)
+          setNativeRun(false)
+          break
+      }
+    }
 
     const state = (): VoiceState => {
       if (error()) return "error"
       if (connecting()) return "connecting"
+      if (nativeActive()) return nativeState()
       switch (connectionState()) {
         case ConnectionState.Connected:
         case ConnectionState.Reconnecting:
@@ -109,18 +224,77 @@ const { use: useVoice, provider: VoiceValueProvider } = createSimpleContext({
     }
 
     const micState = (): MicState => {
+      if (nativeActive()) {
+        if (state() !== "connected") return "unavailable"
+        return nativeMic() ? "unmuted" : "muted"
+      }
       if (state() !== "connected") return "unavailable"
       return local.isMicrophoneEnabled() ? "unmuted" : "muted"
     }
 
-    async function connect(sessionID: string, model?: { providerID: string; modelID: string }) {
+    const available = () => {
+      if (state() === "connected" || state() === "connecting") return true
+      if (desktop && provider() === "lfm2") return native()?.plan.ready === true
+      if (desktop && provider() !== "livekit") return false
+      return status()?.available === true
+    }
+
+    // Voice can be configured in settings while a session is open; poll both the
+    // native provider switch and LiveKit availability so the mic button tracks it.
+    const statusPoll = setInterval(() => {
+      if (desktop) refetchNative()
+      if (provider() === "livekit" && !available()) refetchStatus()
+    }, 30_000)
+    onCleanup(() => clearInterval(statusPoll))
+    if (desktop) {
+      const refresh = () => {
+        refreshNative().catch(() => {})
+        refetchStatus()
+      }
+      window.addEventListener(VOICE_SETTINGS_CHANGED, refresh)
+      onCleanup(() => window.removeEventListener(VOICE_SETTINGS_CHANGED, refresh))
+    }
+
+    async function connect(sessionID: string, ctx?: Omit<VoiceStartContext, "sessionID" | "directory">) {
       if (state() === "connecting" || state() === "connected") return
       setError(undefined)
       setConnecting(true)
-      followProjects = true
-      if (model) followModel = model
       try {
-        const grant = await sdk.client.voice.token({ sessionID, model }).then((x) => x.data)
+        const current = desktop ? await refreshNative() : undefined
+        const server = await (async () => {
+          if (desktop && current?.stored !== false) return status()
+          const next = await sdk.client.voice.status().then((x) => x.data).catch(() => undefined)
+          setStatus(next)
+          return next
+        })()
+        const active = providerFor(current, server)
+        if (desktop && active === "lfm2") {
+          followProjects = true
+          if (ctx) followContext = ctx
+          const delegateTarget = current?.settings.lfm2.delegate.enabled ? current.settings.lfm2.delegate.target : undefined
+          setNativeRun(true)
+          setNativeState("connecting")
+          setNativeAgent("connecting")
+          setNativeMic(true)
+          setNativeLine(undefined)
+          setNativeLevel(0)
+          await startVoice(
+            {
+              sessionID,
+              directory: sdk.directory,
+              delegateTarget,
+              ...ctx,
+            },
+            handleNative,
+          )
+          return
+        }
+        if (desktop && active !== "livekit") {
+          throw new Error(current?.plan.detail || "Voice is not set to LiveKit.")
+        }
+        followProjects = true
+        if (ctx) followContext = ctx
+        const grant = await sdk.client.voice.token({ sessionID, model: ctx?.model }).then((x) => x.data)
         if (!grant) throw new Error("voice token request failed")
         // WKWebView keeps media silently "playing" until the page's audio
         // session activates; resuming an AudioContext inside the connect
@@ -137,6 +311,12 @@ const { use: useVoice, provider: VoiceValueProvider } = createSimpleContext({
         await room.localParticipant.setMicrophoneEnabled(true)
       } catch (err) {
         // unwind a partially joined room so a retry starts from clean state
+        followProjects = false
+        followContext = undefined
+        setNativeState("disconnected")
+        setNativeAgent("disconnected")
+        setNativeLevel(0)
+        setNativeRun(false)
         await room.disconnect().catch(() => {})
         setError(err instanceof Error ? err.message : String(err))
         throw err
@@ -147,16 +327,66 @@ const { use: useVoice, provider: VoiceValueProvider } = createSimpleContext({
 
     async function disconnect() {
       followProjects = false
+      followContext = undefined
       setError(undefined)
+      if (nativeActive()) {
+        await stopVoice()
+        setNativeState("disconnected")
+        setNativeAgent("disconnected")
+        setNativeMic(true)
+        setNativeLine(undefined)
+        setNativeLevel(0)
+        setNativeRun(false)
+        return
+      }
+      await room.localParticipant.setMicrophoneEnabled(false).catch(() => {})
       await room.disconnect()
     }
 
+    async function interrupt() {
+      if (nativeActive()) {
+        await interruptVoice()
+        return
+      }
+      if (state() !== "connected" && state() !== "connecting") return
+      followProjects = false
+      followContext = undefined
+      await room.localParticipant.setMicrophoneEnabled(false).catch(() => {})
+      await room.disconnect()
+      setError(undefined)
+      setConnecting(false)
+      setNativeState("disconnected")
+      setNativeAgent("disconnected")
+      setNativeLevel(0)
+      setNativeRun(false)
+      setNativeMic(true)
+      setNativeLine(undefined)
+      if (desktop) await stopVoice().catch(() => {})
+    }
+
+    async function setMicEnabled(enabled: boolean) {
+      if (nativeActive()) {
+        await setVoiceMicEnabled(enabled)
+        setNativeMic(enabled)
+        return
+      }
+      if (state() !== "connected") return
+      await room.localParticipant.setMicrophoneEnabled(enabled)
+    }
+
     async function toggleMute() {
+      if (nativeActive()) {
+        const enabled = micState() !== "unmuted"
+        await setVoiceMicEnabled(enabled)
+        setNativeMic(enabled)
+        return
+      }
       if (state() !== "connected") return
       await room.localParticipant.setMicrophoneEnabled(!local.isMicrophoneEnabled())
     }
 
     onCleanup(() => {
+      if (desktop) stopVoice().catch(() => {})
       room.disconnect()
     })
 
@@ -164,14 +394,33 @@ const { use: useVoice, provider: VoiceValueProvider } = createSimpleContext({
       room,
       state,
       micState,
+      enabled,
+      provider,
       error,
       available,
       connect,
       disconnect,
+      interrupt,
+      setMicEnabled,
       toggleMute,
-      agentState: assistant.state,
-      agentAudioTrack: assistant.audioTrack,
-      transcriptions,
+      agentState: () => (nativeActive() ? nativeAgent() : assistant.state()),
+      agentAudioTrack: () => (nativeActive() ? undefined : assistant.audioTrack()),
+      agentLevel: () => (nativeActive() ? nativeLevel() : undefined),
+      turnActive: () => {
+        const current = nativeActive() ? nativeAgent() : assistant.state()
+        return current === "thinking" || current === "speaking"
+      },
+      transcriptions: () => {
+        if (!nativeActive()) return transcriptions()
+        const line = nativeLine()
+        if (!line) return [] as ReturnType<typeof transcriptions>
+        return [
+          {
+            text: line.text,
+            participantInfo: { identity: line.agent ? "agent-native" : "user-native" },
+          },
+        ] as ReturnType<typeof transcriptions>
+      },
     }
   },
 })

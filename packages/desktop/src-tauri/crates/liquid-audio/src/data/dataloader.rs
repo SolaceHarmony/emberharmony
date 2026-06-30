@@ -76,8 +76,18 @@ impl LFM2DataLoader {
     /// `rows` are the decoded records (the `load_from_disk` result). `device` is
     /// where the padded row tensors are built (torch leaves these on CPU here;
     /// pass [`Device::Cpu`] to match).
-    pub fn new(dataset_path: impl Into<std::path::PathBuf>, context_length: usize, rows: Vec<RawRow>, device: Device) -> Self {
-        Self { dataset_path: dataset_path.into(), context_length, rows, device }
+    pub fn new(
+        dataset_path: impl Into<std::path::PathBuf>,
+        context_length: usize,
+        rows: Vec<RawRow>,
+        device: Device,
+    ) -> Self {
+        Self {
+            dataset_path: dataset_path.into(),
+            context_length,
+            rows,
+            device,
+        }
     }
 
     /// `self.dataset = load_from_disk(self.dataset_path)` — read the HuggingFace
@@ -119,10 +129,12 @@ impl LFM2DataLoader {
     /// `supervision` (with `False`). `audio_in` / `audio_in_lens` / `audio_out` are
     /// returned unpadded — collate concatenates them.
     pub fn get(&self, idx: usize) -> Result<LFM2AudioRow> {
-        let row = self
-            .rows
-            .get(idx)
-            .ok_or_else(|| candle_core::Error::Msg(format!("index {idx} out of range (len {})", self.rows.len())))?;
+        let row = self.rows.get(idx).ok_or_else(|| {
+            candle_core::Error::Msg(format!(
+                "index {idx} out of range (len {})",
+                self.rows.len()
+            ))
+        })?;
 
         // torch.as_tensor casts: long → I64 (torch.long is int64 — keep it; candle's
         // index_select/embedding accept I64, and the model casts to U32 only at the
@@ -149,14 +161,22 @@ impl LFM2DataLoader {
         let pad_len = self.context_length - cur_len;
 
         // text = F.pad(text, (0, pad_len))  — right-pad the last dim with 0.
-        let text = if pad_len > 0 { text.pad_with_zeros(1, 0, pad_len)? } else { text };
+        let text = if pad_len > 0 {
+            text.pad_with_zeros(1, 0, pad_len)?
+        } else {
+            text
+        };
 
         // modality = F.pad(modality, (0, pad_len), value=int(LFMModality.TEXT))
         let modality = pad_right_with(&modality, pad_len, LFMModality::Text as i64, &self.device)?;
 
         // supervision = F.pad(supervision, (0, pad_len), value=False)  — False == 0,
         // so a zero-pad is faithful; pad_with_zeros keeps the U8 dtype.
-        let supervision = if pad_len > 0 { supervision.pad_with_zeros(1, 0, pad_len)? } else { supervision };
+        let supervision = if pad_len > 0 {
+            supervision.pad_with_zeros(1, 0, pad_len)?
+        } else {
+            supervision
+        };
 
         // return LFM2AudioRow(text=…, audio_in=…, …)
         Ok(LFM2AudioRow {
@@ -188,7 +208,8 @@ fn pad_right_with(x: &Tensor, pad_len: usize, value: i64, device: &Device) -> Re
         return x.pad_with_zeros(1, 0, pad_len);
     }
     let rows = x.dim(0)?;
-    let pad = Tensor::from_vec(vec![value; rows * pad_len], (rows, pad_len), device)?.to_dtype(x.dtype())?;
+    let pad = Tensor::from_vec(vec![value; rows * pad_len], (rows, pad_len), device)?
+        .to_dtype(x.dtype())?;
     Tensor::cat(&[x, &pad], 1)
 }
 

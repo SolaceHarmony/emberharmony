@@ -39,10 +39,11 @@ listeners = "0.3"
 tauri-plugin-os = "2"
 futures = "0.3.31"
 semver = "1.0.27"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
 uuid = { version = "1.19.0", features = ["v4"] }
 tauri-plugin-decorum = "1.1.1"
 comrak = { version = "0.50", default-features = false }
+candle-core = "0.9"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 webkit2gtk = "=2.0.2"
@@ -56,12 +57,12 @@ window-vibrancy = "0.7"
 # `RealtimePipeline` worker), driven directly by the `voice_start` Tauri command, with no
 # Bun/Node sidecar. On Apple Silicon the `metal` feature gives bf16 GPU generation =
 # real-time. See `crates/liquid-audio` (moved here from experiments/lfm2-audio-voice).
-liquid-audio = { path = "crates/liquid-audio", features = ["metal"] }
+liquid-audio = { path = "crates/liquid-audio", features = ["metal", "audio-io"] }
 
 # Same engine on non-macOS, CPU path (no Metal); below real-time for a 1.5B model but
 # keeps the desktop building everywhere.
 [target.'cfg(not(target_os = "macos"))'.dependencies]
-liquid-audio = { path = "crates/liquid-audio" }
+liquid-audio = { path = "crates/liquid-audio", features = ["audio-io"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = [

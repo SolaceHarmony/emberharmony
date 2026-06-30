@@ -115,16 +115,32 @@ impl LoaderDataIter {
 
     /// `DataLoader(dataset, batch_size, shuffle=True)` — rows re-permuted each epoch
     /// (training). `seed` makes the run reproducible.
-    pub fn new_shuffled(loader: crate::data::dataloader::LFM2DataLoader, batch_size: usize, seed: u64) -> Self {
+    pub fn new_shuffled(
+        loader: crate::data::dataloader::LFM2DataLoader,
+        batch_size: usize,
+        seed: u64,
+    ) -> Self {
         Self::with_shuffle(loader, batch_size, true, seed)
     }
 
-    fn with_shuffle(loader: crate::data::dataloader::LFM2DataLoader, batch_size: usize, shuffle: bool, seed: u64) -> Self {
+    fn with_shuffle(
+        loader: crate::data::dataloader::LFM2DataLoader,
+        batch_size: usize,
+        shuffle: bool,
+        seed: u64,
+    ) -> Self {
         let order = (0..loader.len()).collect();
         // Order is left as 0..len here; `reset()` — called once per epoch including
         // the first (`iter(train_loader)`) — applies the shuffle, matching torch's
         // "re-permute on every `iter()`".
-        Self { loader, batch_size: batch_size.max(1), order, pos: 0, shuffle, seed }
+        Self {
+            loader,
+            batch_size: batch_size.max(1),
+            order,
+            pos: 0,
+            shuffle,
+            seed,
+        }
     }
 
     /// In-place Fisher–Yates over `order` (no `rand` dependency), advancing `seed` so
@@ -158,7 +174,10 @@ impl DataIter for LoaderDataIter {
             return Ok(None); // epoch exhausted — the only legitimate "no batch" case
         }
         let end = (self.pos + self.batch_size).min(self.order.len());
-        let rows: Result<Vec<_>> = self.order[self.pos..end].iter().map(|&i| self.loader.get(i)).collect();
+        let rows: Result<Vec<_>> = self.order[self.pos..end]
+            .iter()
+            .map(|&i| self.loader.get(i))
+            .collect();
         self.pos = end;
         // PROPAGATE a row-load / collate failure — do NOT swallow it as end-of-epoch.
         // `loader.get` validates lengths (it errors on over-long samples); a malformed
@@ -266,7 +285,8 @@ impl Trainer {
         train_loader: Box<dyn DataIter>,
         val_loader: Option<Box<dyn DataIter>>,
     ) -> Result<Self> {
-        let TrainableLoad { model, varmap, .. } = from_pretrained_trainable(model_dir, cfg.dtype, device)?;
+        let TrainableLoad { model, varmap, .. } =
+            from_pretrained_trainable(model_dir, cfg.dtype, device)?;
         Self::with_model(model, varmap, cfg, device.clone(), train_loader, val_loader)
     }
 
@@ -364,7 +384,10 @@ impl Trainer {
     pub fn train(&mut self) -> Result<()> {
         // Move the loaders out so the loop can iterate them while `&mut self` drives
         // `train_step`/`validate`/`log`/`save`; they are restored before returning.
-        let mut train_loader = std::mem::replace(&mut self.train_loader, Box::new(VecDataIter::new(Vec::new())));
+        let mut train_loader = std::mem::replace(
+            &mut self.train_loader,
+            Box::new(VecDataIter::new(Vec::new())),
+        );
         let mut val_loader = self.val_loader.take();
         let result = self.train_loop(train_loader.as_mut(), val_loader.as_deref_mut());
         self.train_loader = train_loader;
@@ -486,7 +509,10 @@ impl Trainer {
         if self.step > 0 && self.step % self.cfg.logging_interval == 0 {
             // reduce(loss, "mean") — single process ⇒ the value itself.
             let reduced = self.reduce(&model_output.loss, Reduction::Mean)?;
-            let train_loss = reduced.to_dtype(DType::F32)?.sum_all()?.to_scalar::<f32>()? as f64;
+            let train_loss = reduced
+                .to_dtype(DType::F32)?
+                .sum_all()?
+                .to_scalar::<f32>()? as f64;
             let lr = self.optimizer.learning_rate();
             self.print(&format!(
                 "TRAIN: epoch={} step={}/{} loss={:.4} lr={:.3e}",
@@ -500,8 +526,12 @@ impl Trainer {
     /// analog is `VarMap::save` to a safetensors file under `output_dir`
     /// (automatic checkpoint naming → `state_step_{N}.safetensors`).
     pub fn save_state(&self) -> Result<()> {
-        std::fs::create_dir_all(&self.cfg.output_dir).map_err(|e| candle_core::Error::Msg(e.to_string()))?;
-        let path = format!("{}/state_step_{}.safetensors", self.cfg.output_dir, self.step);
+        std::fs::create_dir_all(&self.cfg.output_dir)
+            .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+        let path = format!(
+            "{}/state_step_{}.safetensors",
+            self.cfg.output_dir, self.step
+        );
         self.varmap.save(&path)
     }
 
@@ -558,27 +588,51 @@ mod tests {
             }
         }
         let mut it = Failing { calls: 0 };
-        assert!(it.next_batch().is_err(), "a data failure must propagate as Err, not collapse to Ok(None)");
+        assert!(
+            it.next_batch().is_err(),
+            "a data failure must propagate as Err, not collapse to Ok(None)"
+        );
         // A subsequent call (genuine exhaustion) is Ok(None) — the two are distinct.
-        assert!(matches!(it.next_batch(), Ok(None)), "exhaustion must be Ok(None)");
+        assert!(
+            matches!(it.next_batch(), Ok(None)),
+            "exhaustion must be Ok(None)"
+        );
     }
 
     #[test]
     fn lr_schedule_warmup_then_cosine() {
-        let cfg = TrainerConfig { lr: 3e-5, warmup_steps: 100, max_steps: 1000, min_ratio: 0.1, ..Default::default() };
+        let cfg = TrainerConfig {
+            lr: 3e-5,
+            warmup_steps: 100,
+            max_steps: 1000,
+            min_ratio: 0.1,
+            ..Default::default()
+        };
         // Exercise `lr_at` via a model-free shell (the real constructor needs a
         // checkpoint on disk).
         let t = LrOnly { cfg };
         // Warmup: near-zero at step 1, ~peak at the warmup boundary.
         let lr1 = t.lr_at(1);
         let lr_warm_end = t.lr_at(100);
-        assert!(lr1 < lr_warm_end, "warmup must increase lr ({lr1} !< {lr_warm_end})");
-        assert!((lr_warm_end - 3e-5).abs() < 1e-7, "lr at warmup end ≈ peak, got {lr_warm_end}");
+        assert!(
+            lr1 < lr_warm_end,
+            "warmup must increase lr ({lr1} !< {lr_warm_end})"
+        );
+        assert!(
+            (lr_warm_end - 3e-5).abs() < 1e-7,
+            "lr at warmup end ≈ peak, got {lr_warm_end}"
+        );
         // Cosine: monotone decreasing after warmup, floor at lr*min_ratio.
         let lr_mid = t.lr_at(550);
         let lr_end = t.lr_at(1000);
-        assert!(lr_end < lr_mid && lr_mid < lr_warm_end, "cosine must decay: {lr_warm_end} > {lr_mid} > {lr_end}");
-        assert!((lr_end - 3e-5 * 0.1).abs() < 1e-7, "cosine floor = lr*min_ratio, got {lr_end}");
+        assert!(
+            lr_end < lr_mid && lr_mid < lr_warm_end,
+            "cosine must decay: {lr_warm_end} > {lr_mid} > {lr_end}"
+        );
+        assert!(
+            (lr_end - 3e-5 * 0.1).abs() < 1e-7,
+            "cosine floor = lr*min_ratio, got {lr_end}"
+        );
     }
 
     #[test]
@@ -597,14 +651,30 @@ mod tests {
         let (e0, e1) = run(0xC0FFEE);
         let mut sorted = e0.clone();
         sorted.sort_unstable();
-        assert_eq!(sorted, (0..64).collect::<Vec<_>>(), "epoch 0 is not a permutation");
+        assert_eq!(
+            sorted,
+            (0..64).collect::<Vec<_>>(),
+            "epoch 0 is not a permutation"
+        );
         let mut sorted1 = e1.clone();
         sorted1.sort_unstable();
-        assert_eq!(sorted1, (0..64).collect::<Vec<_>>(), "epoch 1 is not a permutation");
-        assert_ne!(e0, (0..64).collect::<Vec<_>>(), "epoch 0 left rows unshuffled");
+        assert_eq!(
+            sorted1,
+            (0..64).collect::<Vec<_>>(),
+            "epoch 1 is not a permutation"
+        );
+        assert_ne!(
+            e0,
+            (0..64).collect::<Vec<_>>(),
+            "epoch 0 left rows unshuffled"
+        );
         assert_ne!(e0, e1, "consecutive epochs produced the same order");
         // Reproducible: same seed ⇒ identical (e0, e1).
-        assert_eq!(run(0xC0FFEE), (e0, e1), "shuffle is not reproducible for a fixed seed");
+        assert_eq!(
+            run(0xC0FFEE),
+            (e0, e1),
+            "shuffle is not reproducible for a fixed seed"
+        );
     }
 
     // A minimal Trainer shell carrying only the schedule config, for `lr_at` unit

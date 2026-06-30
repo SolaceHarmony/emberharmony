@@ -138,7 +138,9 @@ impl TextSegment {
 impl Default for TextSegment {
     /// `TextSegment()` — the Python default (`text=""`).
     fn default() -> Self {
-        Self { text: String::new() }
+        Self {
+            text: String::new(),
+        }
     }
 }
 
@@ -161,7 +163,9 @@ pub struct AudioSegment {
 impl AudioSegment {
     /// `AudioSegment(audio=...)`.
     pub fn new(audio: impl Into<Vec<u8>>) -> Self {
-        Self { audio: audio.into() }
+        Self {
+            audio: audio.into(),
+        }
     }
 
     /// The fixed `kind` field (`"audio"`).
@@ -203,7 +207,10 @@ pub struct InterleavedSegment {
 impl InterleavedSegment {
     /// `InterleavedSegment(text=..., audio=...)`.
     pub fn new(text: impl Into<String>, audio: impl Into<Vec<u8>>) -> Self {
-        Self { text: text.into(), audio: audio.into() }
+        Self {
+            text: text.into(),
+            audio: audio.into(),
+        }
     }
 
     /// The fixed `kind` field (`"interleaved"`).
@@ -225,7 +232,10 @@ impl InterleavedSegment {
 impl Default for InterleavedSegment {
     /// `InterleavedSegment()` — the Python defaults (`text=""`, `audio=b""`).
     fn default() -> Self {
-        Self { text: String::new(), audio: Vec::new() }
+        Self {
+            text: String::new(),
+            audio: Vec::new(),
+        }
     }
 }
 
@@ -414,7 +424,10 @@ mod tests {
     fn segment_kinds_are_fixed() {
         assert_eq!(TextSegment::default().kind(), SegmentKind::Text);
         assert_eq!(AudioSegment::default().kind(), SegmentKind::Audio);
-        assert_eq!(InterleavedSegment::default().kind(), SegmentKind::Interleaved);
+        assert_eq!(
+            InterleavedSegment::default().kind(),
+            SegmentKind::Interleaved
+        );
         assert_eq!(SegmentKind::Text.as_str(), "text");
         assert_eq!(SegmentKind::Audio.as_str(), "audio");
         assert_eq!(SegmentKind::Interleaved.as_str(), "interleaved");
@@ -450,7 +463,10 @@ mod tests {
     fn chat_message_holds_role_and_content() {
         let msg = ChatMessage::new(
             Role::Assistant,
-            vec![TextSegment::new("hello").into(), AudioSegment::new(vec![0u8, 1]).into()],
+            vec![
+                TextSegment::new("hello").into(),
+                AudioSegment::new(vec![0u8, 1]).into(),
+            ],
         );
         assert_eq!(msg.role(), Role::Assistant);
         assert_eq!(msg.content().len(), 2);

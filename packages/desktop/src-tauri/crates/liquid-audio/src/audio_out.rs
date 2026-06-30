@@ -78,12 +78,14 @@ impl AudioDetokenizer for LFM2AudioDetokenizer {
 /// mutability for Mimi's streaming conv/transformer state (mirrors the Python
 /// `mimi.streaming(1)` mutation). `reset_state` first ⇒ independent decodes.
 pub struct MimiDetokenizer {
-    inner: RefCell<moshi::mimi::Mimi>,
+    inner: RefCell<::moshi::mimi::Mimi>,
 }
 
 impl MimiDetokenizer {
-    pub fn new(mimi: moshi::mimi::Mimi) -> Self {
-        Self { inner: RefCell::new(mimi) }
+    pub fn new(mimi: ::moshi::mimi::Mimi) -> Self {
+        Self {
+            inner: RefCell::new(mimi),
+        }
     }
 }
 
@@ -116,7 +118,10 @@ impl AudioDetokenizer for MimiDetokenizer {
     fn decode_step(&self, frame: &Tensor) -> Result<Option<Tensor>> {
         let codes = frame.to_dtype(DType::U32)?; // RVQ index_select wants u32
         let mut m = self.inner.borrow_mut();
-        let out = m.decode_step(&moshi::StreamTensor::from_tensor(codes), &moshi::StreamMask::empty())?;
+        let out = m.decode_step(
+            &::moshi::StreamTensor::from_tensor(codes),
+            &::moshi::StreamMask::empty(),
+        )?;
         Ok(out.as_option().cloned())
     }
 }

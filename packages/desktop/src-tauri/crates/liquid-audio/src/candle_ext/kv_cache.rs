@@ -34,12 +34,19 @@ impl ConcatKvCache {
     /// - attention shaped `[batch, heads, seq, head_dim]` → `dim = 2`
     /// - attention shaped `[batch, seq, heads, head_dim]` → `dim = 1`
     pub fn new(dim: usize) -> Self {
-        Self { k: None, v: None, dim }
+        Self {
+            k: None,
+            v: None,
+            dim,
+        }
     }
 
     /// Current sequence length in the cache (0 if empty).
     pub fn current_seq_len(&self) -> usize {
-        self.k.as_ref().and_then(|k| k.dims().get(self.dim).copied()).unwrap_or(0)
+        self.k
+            .as_ref()
+            .and_then(|k| k.dims().get(self.dim).copied())
+            .unwrap_or(0)
     }
 
     /// Whether the cache is empty.
@@ -65,7 +72,10 @@ impl ConcatKvCache {
             None => v.clone(),
             Some(v_cache) => Tensor::cat(&[v_cache, &v], self.dim)?,
         });
-        Ok((self.k.as_ref().unwrap().clone(), self.v.as_ref().unwrap().clone()))
+        Ok((
+            self.k.as_ref().unwrap().clone(),
+            self.v.as_ref().unwrap().clone(),
+        ))
     }
 
     /// Reset the cache (clear all stored keys and values).

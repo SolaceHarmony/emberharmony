@@ -26,7 +26,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use arrow_array::builder::{BooleanBuilder, Float32Builder, Int64Builder, ListBuilder};
-use arrow_array::{Array, ArrayRef, BooleanArray, Float32Array, Int64Array, ListArray, RecordBatch};
+use arrow_array::{
+    Array, ArrayRef, BooleanArray, Float32Array, Int64Array, ListArray, RecordBatch,
+};
 use arrow_ipc::reader::StreamReader;
 use arrow_ipc::writer::StreamWriter;
 use arrow_schema::{Field, Schema};
@@ -50,7 +52,11 @@ fn rows_f32(t: &Tensor) -> Result<Vec<Vec<f32>>> {
     t.to_dtype(DType::F32)?.to_vec2::<f32>()
 }
 fn rows_bool(t: &Tensor) -> Result<Vec<Vec<bool>>> {
-    Ok(t.to_dtype(DType::U8)?.to_vec2::<u8>()?.into_iter().map(|r| r.into_iter().map(|x| x != 0).collect()).collect())
+    Ok(t.to_dtype(DType::U8)?
+        .to_vec2::<u8>()?
+        .into_iter()
+        .map(|r| r.into_iter().map(|x| x != 0).collect())
+        .collect())
 }
 fn flat_i64(t: &Tensor) -> Result<Vec<i64>> {
     t.flatten_all()?.to_dtype(DType::I64)?.to_vec1::<i64>()
@@ -58,15 +64,27 @@ fn flat_i64(t: &Tensor) -> Result<Vec<i64>> {
 
 fn tensor2_i64(rows: &[Vec<i64>], dev: &Device) -> Result<Tensor> {
     let (r, c) = (rows.len(), rows.first().map_or(0, |x| x.len()));
-    Tensor::from_vec(rows.iter().flatten().copied().collect::<Vec<_>>(), (r, c), dev)
+    Tensor::from_vec(
+        rows.iter().flatten().copied().collect::<Vec<_>>(),
+        (r, c),
+        dev,
+    )
 }
 fn tensor2_f32(rows: &[Vec<f32>], dev: &Device) -> Result<Tensor> {
     let (r, c) = (rows.len(), rows.first().map_or(0, |x| x.len()));
-    Tensor::from_vec(rows.iter().flatten().copied().collect::<Vec<_>>(), (r, c), dev)
+    Tensor::from_vec(
+        rows.iter().flatten().copied().collect::<Vec<_>>(),
+        (r, c),
+        dev,
+    )
 }
 fn tensor2_u8(rows: &[Vec<bool>], dev: &Device) -> Result<Tensor> {
     let (r, c) = (rows.len(), rows.first().map_or(0, |x| x.len()));
-    Tensor::from_vec(rows.iter().flatten().map(|&b| b as u8).collect::<Vec<_>>(), (r, c), dev)
+    Tensor::from_vec(
+        rows.iter().flatten().map(|&b| b as u8).collect::<Vec<_>>(),
+        (r, c),
+        dev,
+    )
 }
 
 // ---- write -------------------------------------------------------------------
@@ -130,14 +148,21 @@ pub fn save_to_disk(out_dir: &Path, samples: &[LFM2AudioTrainingSample]) -> Resu
         ("modality_flag", Arc::new(modality.finish())),
         ("supervision_mask", Arc::new(supervision.finish())),
     ];
-    let fields: Vec<Field> = cols.iter().map(|(n, a)| Field::new(*n, a.data_type().clone(), true)).collect();
+    let fields: Vec<Field> = cols
+        .iter()
+        .map(|(n, a)| Field::new(*n, a.data_type().clone(), true))
+        .collect();
 
     // Embed the HF `Features`/info in the schema metadata (key "huggingface"), the
     // same way pyarrow does, so the shard is self-describing for `datasets`.
     let mut meta = HashMap::new();
-    meta.insert("huggingface".to_string(), format!("{{\"info\": {{\"features\": {}}}}}", features_json()));
+    meta.insert(
+        "huggingface".to_string(),
+        format!("{{\"info\": {{\"features\": {}}}}}", features_json()),
+    );
     let schema = Arc::new(Schema::new_with_metadata(fields, meta));
-    let batch = RecordBatch::try_new(schema.clone(), cols.into_iter().map(|(_, a)| a).collect()).map_err(err)?;
+    let batch = RecordBatch::try_new(schema.clone(), cols.into_iter().map(|(_, a)| a).collect())
+        .map_err(err)?;
 
     std::fs::create_dir_all(out_dir).map_err(err)?;
     let file = std::fs::File::create(out_dir.join(DATA_FILE)).map_err(err)?;
@@ -165,8 +190,16 @@ fn write_sidecars(out_dir: &Path) -> Result<()> {
         "_format_columns": null, "_format_kwargs": {}, "_format_type": null,
         "_indexes": {}, "_output_all_columns": false, "_split": null,
     });
-    std::fs::write(out_dir.join("dataset_info.json"), serde_json::to_vec_pretty(&info).map_err(err)?).map_err(err)?;
-    std::fs::write(out_dir.join("state.json"), serde_json::to_vec_pretty(&state).map_err(err)?).map_err(err)?;
+    std::fs::write(
+        out_dir.join("dataset_info.json"),
+        serde_json::to_vec_pretty(&info).map_err(err)?,
+    )
+    .map_err(err)?;
+    std::fs::write(
+        out_dir.join("state.json"),
+        serde_json::to_vec_pretty(&state).map_err(err)?,
+    )
+    .map_err(err)?;
     Ok(())
 }
 
@@ -196,7 +229,8 @@ pub fn load_from_disk(dir: &Path, device: &Device) -> Result<Vec<RawRow>> {
     let shards = data_files(dir)?;
     let mut rows = Vec::new();
     for shard in shards {
-        let file = std::fs::File::open(&shard).map_err(|e| err(format!("open {}: {e}", shard.display())))?;
+        let file = std::fs::File::open(&shard)
+            .map_err(|e| err(format!("open {}: {e}", shard.display())))?;
         let reader = StreamReader::try_new(file, None).map_err(err)?;
         for batch in reader {
             let batch = batch.map_err(err)?;
@@ -229,16 +263,22 @@ fn data_files(dir: &Path) -> Result<Vec<std::path::PathBuf>> {
         .collect();
     out.sort();
     if out.is_empty() {
-        return Err(err(format!("load_from_disk: no .arrow shards under {}", dir.display())));
+        return Err(err(format!(
+            "load_from_disk: no .arrow shards under {}",
+            dir.display()
+        )));
     }
     Ok(out)
 }
 
 fn col<'a>(b: &'a RecordBatch, name: &str) -> Result<&'a ArrayRef> {
-    b.column_by_name(name).ok_or_else(|| err(format!("load_from_disk: missing column `{name}`")))
+    b.column_by_name(name)
+        .ok_or_else(|| err(format!("load_from_disk: missing column `{name}`")))
 }
 fn as_list(a: &ArrayRef) -> Result<&ListArray> {
-    a.as_any().downcast_ref::<ListArray>().ok_or_else(|| err("expected a List column"))
+    a.as_any()
+        .downcast_ref::<ListArray>()
+        .ok_or_else(|| err("expected a List column"))
 }
 
 /// One outer-list element (one sample) of a `List<List<T>>` column → `Vec<Vec>`.
@@ -248,7 +288,10 @@ fn ll_i64(outer: &ListArray, i: usize) -> Result<Vec<Vec<i64>>> {
     (0..inner.len())
         .map(|j| {
             let v = inner.value(j);
-            let v = v.as_any().downcast_ref::<Int64Array>().ok_or_else(|| err("expected Int64"))?;
+            let v = v
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| err("expected Int64"))?;
             Ok(v.values().to_vec())
         })
         .collect()
@@ -259,7 +302,10 @@ fn ll_f32(outer: &ListArray, i: usize) -> Result<Vec<Vec<f32>>> {
     (0..inner.len())
         .map(|j| {
             let v = inner.value(j);
-            let v = v.as_any().downcast_ref::<Float32Array>().ok_or_else(|| err("expected Float32"))?;
+            let v = v
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or_else(|| err("expected Float32"))?;
             Ok(v.values().to_vec())
         })
         .collect()
@@ -270,7 +316,10 @@ fn ll_bool(outer: &ListArray, i: usize) -> Result<Vec<Vec<bool>>> {
     (0..inner.len())
         .map(|j| {
             let v = inner.value(j);
-            let v = v.as_any().downcast_ref::<BooleanArray>().ok_or_else(|| err("expected Boolean"))?;
+            let v = v
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| err("expected Boolean"))?;
             Ok((0..v.len()).map(|k| v.value(k)).collect())
         })
         .collect()
@@ -287,7 +336,10 @@ fn read_batch(batch: &RecordBatch, dev: &Device, out: &mut Vec<RawRow>) -> Resul
     for i in 0..batch.num_rows() {
         // audio_in_lens is a single-nested List<Int64>.
         let lens_i = lens.value(i);
-        let lens_v = lens_i.as_any().downcast_ref::<Int64Array>().ok_or_else(|| err("expected Int64 lens"))?;
+        let lens_v = lens_i
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| err("expected Int64 lens"))?;
         out.push(RawRow {
             text: tensor2_i64(&ll_i64(text, i)?, dev)?,
             audio_in: tensor2_f32(&ll_f32(audio_in, i)?, dev)?,

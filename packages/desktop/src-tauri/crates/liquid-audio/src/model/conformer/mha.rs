@@ -39,8 +39,13 @@ const INF_VAL: f64 = 10000.0;
 fn masked_softmax(scores: &Tensor, mask: Option<&Tensor>) -> Result<Tensor> {
     match mask {
         Some(m) => {
-            let cond = m.unsqueeze(1)?.broadcast_as(scores.dims())?.to_dtype(DType::U8)?.contiguous()?;
-            let neg = Tensor::full(-INF_VAL as f32, scores.dims(), scores.device())?.to_dtype(scores.dtype())?;
+            let cond = m
+                .unsqueeze(1)?
+                .broadcast_as(scores.dims())?
+                .to_dtype(DType::U8)?
+                .contiguous()?;
+            let neg = Tensor::full(-INF_VAL as f32, scores.dims(), scores.device())?
+                .to_dtype(scores.dtype())?;
             let masked = cond.where_cond(&neg, scores)?; // masked_fill(mask, -INF_VAL)
             let attn = softmax(&masked, D::Minus1)?;
             cond.where_cond(&attn.zeros_like()?, &attn) // .masked_fill(mask, 0.0)
@@ -62,7 +67,11 @@ pub struct PositionalEncoding {
 
 impl PositionalEncoding {
     pub fn new(d_model: usize, max_len: usize, xscale: Option<f64>) -> Self {
-        Self { d_model, max_len, xscale }
+        Self {
+            d_model,
+            max_len,
+            xscale,
+        }
     }
 
     /// `create_pe(positions, dtype)` → `(1, pos_length, d_model)`:
@@ -116,14 +125,18 @@ pub struct RelPositionalEncoding {
 
 impl RelPositionalEncoding {
     pub fn new(d_model: usize, xscale: Option<f64>) -> Self {
-        Self { base: PositionalEncoding::new(d_model, 5000, xscale) }
+        Self {
+            base: PositionalEncoding::new(d_model, 5000, xscale),
+        }
     }
 
     /// override `extend_pe`: `positions = arange(length-1, -length, -1)` →
     /// `(2L-1,)`, then the inherited `create_pe` builds the interleaved table.
     fn extend_pe(&self, length: usize, device: &Device, dtype: DType) -> Result<Tensor> {
         let pos_len = 2 * length - 1;
-        let positions: Vec<f32> = (0..pos_len).map(|i| (length as i64 - 1 - i as i64) as f32).collect();
+        let positions: Vec<f32> = (0..pos_len)
+            .map(|i| (length as i64 - 1 - i as i64) as f32)
+            .collect();
         let positions = Tensor::from_vec(positions, (pos_len,), device)?;
         self.base.create_pe(&positions, dtype)
     }
@@ -187,12 +200,29 @@ impl MultiHeadAttention {
     }
 
     /// `forward_qkv` → q,k,v each `(b, h, t, d_k)`.
-    pub fn forward_qkv(&self, query: &Tensor, key: &Tensor, value: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
+    pub fn forward_qkv(
+        &self,
+        query: &Tensor,
+        key: &Tensor,
+        value: &Tensor,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
         let (nb, t1, _) = query.dims3()?;
         let t2 = key.dim(1)?;
-        let q = self.linear_q.forward(query)?.reshape((nb, t1, self.h, self.d_k))?.transpose(1, 2)?;
-        let k = self.linear_k.forward(key)?.reshape((nb, t2, self.h, self.d_k))?.transpose(1, 2)?;
-        let v = self.linear_v.forward(value)?.reshape((nb, t2, self.h, self.d_k))?.transpose(1, 2)?;
+        let q = self
+            .linear_q
+            .forward(query)?
+            .reshape((nb, t1, self.h, self.d_k))?
+            .transpose(1, 2)?;
+        let k = self
+            .linear_k
+            .forward(key)?
+            .reshape((nb, t2, self.h, self.d_k))?
+            .transpose(1, 2)?;
+        let v = self
+            .linear_v
+            .forward(value)?
+            .reshape((nb, t2, self.h, self.d_k))?
+            .transpose(1, 2)?;
         Ok((q.contiguous()?, k.contiguous()?, v.contiguous()?))
     }
 
@@ -200,7 +230,12 @@ impl MultiHeadAttention {
     /// positions; faithful to NeMo's `scores.masked_fill(mask, -INF) → softmax →
     /// .masked_fill(mask, 0)`. Uses `where_cond` to SET (not add) `-INF_VAL`, so it is
     /// bit-identical to `masked_fill` rather than a near-equivalent additive approx.
-    pub fn forward_attention(&self, value: &Tensor, scores: &Tensor, mask: Option<&Tensor>) -> Result<Tensor> {
+    pub fn forward_attention(
+        &self,
+        value: &Tensor,
+        scores: &Tensor,
+        mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
         let (nb, _h, time, _t2) = scores.dims4()?;
         let attn = masked_softmax(scores, mask)?;
         let x = attn.matmul(value)?; // (b,h,t1,d_k)
@@ -212,13 +247,26 @@ impl MultiHeadAttention {
     /// subclass; this is the faithful base path. `use_pytorch_sdpa=True` reduces to the
     /// same `softmax(q·kᵀ/√d + mask)·v` (see the module note) — both Python branches map
     /// here; candle's fused `ops::sdpa` is no_bwd and avoided.
-    pub fn forward(&self, query: &Tensor, key: &Tensor, value: &Tensor, mask: Option<&Tensor>) -> Result<Tensor> {
+    pub fn forward(
+        &self,
+        query: &Tensor,
+        key: &Tensor,
+        value: &Tensor,
+        mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
         Ok(self.forward_cache(query, key, value, mask, None)?.0)
     }
 
     /// Streaming base attention: `update_cache` (KV concat) → attention →
     /// `(out, next_cache)`. `cache=None` ⇒ the offline path, `next_cache=None`.
-    pub fn forward_cache(&self, query: &Tensor, key: &Tensor, value: &Tensor, mask: Option<&Tensor>, cache: Option<&Tensor>) -> Result<(Tensor, Option<Tensor>)> {
+    pub fn forward_cache(
+        &self,
+        query: &Tensor,
+        key: &Tensor,
+        value: &Tensor,
+        mask: Option<&Tensor>,
+        cache: Option<&Tensor>,
+    ) -> Result<(Tensor, Option<Tensor>)> {
         let (key, value, query, next_cache) = self.update_cache(key, value, query, cache)?;
         let (q, k, v) = self.forward_qkv(&query, &key, &value)?;
         let scores = (q.matmul(&k.transpose(D::Minus2, D::Minus1)?.contiguous()?)? / self.s_d_k)?;
@@ -246,7 +294,13 @@ impl MultiHeadAttention {
                 let kv = Tensor::cat(&[c, key], 1)?;
                 let q_keep = query.dim(1)?.saturating_sub(self.cache_drop_size);
                 let c_len = c.dim(1)?;
-                let new_cache = Tensor::cat(&[&c.narrow(1, q_keep, c_len - q_keep)?, &query.narrow(1, 0, q_keep)?], 1)?;
+                let new_cache = Tensor::cat(
+                    &[
+                        &c.narrow(1, q_keep, c_len - q_keep)?,
+                        &query.narrow(1, 0, q_keep)?,
+                    ],
+                    1,
+                )?;
                 Ok((kv.clone(), kv, query.clone(), Some(new_cache)))
             }
         }
@@ -297,7 +351,9 @@ impl RelPositionMultiHeadAttention {
         mask: Option<&Tensor>,
         pos_emb: &Tensor,
     ) -> Result<Tensor> {
-        Ok(self.forward_cache(query, key, value, mask, pos_emb, None)?.0)
+        Ok(self
+            .forward_cache(query, key, value, mask, pos_emb, None)?
+            .0)
     }
 
     /// Streaming rel-pos attention: `update_cache` (KV concat, so the current queries
@@ -350,15 +406,29 @@ mod tests {
     fn masked_softmax_matches_python() {
         // vs torch: scores.masked_fill(mask,-INF).softmax(-1).masked_fill(mask,0).
         let dev = Device::Cpu;
-        let scores = Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 0.5, 0.5, 0.5], (1, 1, 2, 3), &dev).unwrap();
+        let scores =
+            Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 0.5, 0.5, 0.5], (1, 1, 2, 3), &dev).unwrap();
         let mask = Tensor::from_vec(vec![0u8, 1, 0, 1, 1, 0], (1, 2, 3), &dev).unwrap();
-        let got = masked_softmax(&scores, Some(&mask)).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let got = masked_softmax(&scores, Some(&mask))
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
         let want = [0.119203f32, 0.0, 0.880797, 0.0, 0.0, 1.0];
         for (g, w) in got.iter().zip(want.iter()) {
-            assert!((g - w).abs() < 1e-5, "masked softmax vs Python: got {got:?} want {want:?}");
+            assert!(
+                (g - w).abs() < 1e-5,
+                "masked softmax vs Python: got {got:?} want {want:?}"
+            );
         }
         // None ⇒ plain softmax (row sums to 1, no zeros).
-        let plain = masked_softmax(&scores, None).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let plain = masked_softmax(&scores, None)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
         assert!((plain[0] + plain[1] + plain[2] - 1.0).abs() < 1e-6);
     }
 }

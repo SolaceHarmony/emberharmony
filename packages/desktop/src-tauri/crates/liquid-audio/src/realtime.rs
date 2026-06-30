@@ -27,6 +27,10 @@ use std::thread::JoinHandle;
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
 
+use crate::moshi::demo::chat::decode_audio_frame;
+use crate::moshi::models::MimiModel;
+
+#[cfg(test)]
 const MIMI_RATE: u32 = 24_000; // Mimi/LFM2 detokenizer output rate.
 
 /// A captured user utterance handed to the worker: mono f32 samples + their sample rate.
@@ -108,7 +112,12 @@ impl RealtimePipeline {
             })
             .expect("spawn lfm2-inference worker");
 
-        Self { utt_tx: Some(utt_tx), event_rx, cancel, worker: Some(worker) }
+        Self {
+            utt_tx: Some(utt_tx),
+            event_rx,
+            cancel,
+            worker: Some(worker),
+        }
     }
 
     /// Hand the worker a new utterance. Returns `false` if the worker has stopped.
@@ -168,7 +177,12 @@ pub struct ConversationState {
 /// `cols == 0` (candle can't allocate a zero-size buffer on Metal — the same guard
 /// `ChatState::new` uses for its empty placeholders). Used to stack the per-turn generated
 /// `text`/`audio_out`/`modality_flag` for [`ChatState::append`].
-fn stack_i64(vals: Vec<i64>, rows: usize, cols: usize, dev: &Device) -> candle_core::Result<Tensor> {
+fn stack_i64(
+    vals: Vec<i64>,
+    rows: usize,
+    cols: usize,
+    dev: &Device,
+) -> candle_core::Result<Tensor> {
     if cols == 0 {
         Tensor::zeros((rows, 1), DType::I64, dev)?.narrow(1, 0, 0)
     } else {
@@ -186,8 +200,8 @@ pub struct Lfm2VoiceEngine {
     params: GenParams,
     codebooks: usize,
     device: Device,
-    /// Resample target for emitted PCM. `MIMI_RATE` (or 0) ⇒ emit the codec's native
-    /// 24 kHz untouched; otherwise resample each chunk to this device rate.
+    /// Resample target for emitted PCM. `0` ⇒ emit the codec's native rate;
+    /// otherwise resample each chunk to this device rate.
     out_rate: u32,
     /// The assistant's system prompt, added once at the start of the conversation (Python adds
     /// the system turn once, before the first user turn). Defaults to the demo's interleaved
@@ -247,10 +261,16 @@ impl VoiceEngine for Lfm2VoiceEngine {
         // via `mimi.decode(frame)` (chat.py:21,34). We always ship Mimi; if it is missing the
         // model load is broken — hard-error. No fallback to the LFM2 detokenizer's degenerate
         // per-frame one-shot: a fallback would only mask a broken build behind choppy audio.
-        let detok = self.proc.mimi().ok_or("Mimi codec not loaded — required for streaming audio out")?;
-        detok.reset_stream(); // turn boundary — independent streaming decode (`mimi.streaming(1)`).
+        let mimi = MimiModel::new(
+            self.proc
+                .mimi()
+                .ok_or("Mimi codec not loaded — required for streaming audio out")?,
+        );
+        let mut stream = mimi.streaming(1).map_err(s)?; // turn boundary (`mimi.streaming(1)`).
+        let mimi_rate = mimi.sample_rate();
 
-        let wave = Tensor::from_vec(utt.samples.clone(), (1, utt.samples.len()), &self.device).map_err(s)?;
+        let wave = Tensor::from_vec(utt.samples.clone(), (1, utt.samples.len()), &self.device)
+            .map_err(s)?;
 
         // Restore the persistent conversation (clone the prior tensors — cheap Arc bumps — so a
         // hard error that returns early leaves prior history intact; we never `take`). First turn
@@ -316,17 +336,18 @@ impl VoiceEngine for Lfm2VoiceEngine {
                         // skip — append needs the full audio_out; only PCM playback drops it.
                         modality_out.push(LFMModality::AudioOut as i64);
                         audio_frames.push(frame.clone());
-                        if frame.contains(&2048) {
-                            return; // EOAudio terminator — no waveform to stream.
-                        }
                         // Decode the 8-code frame to PCM via the streaming detokenizer.
                         let decoded = (|| -> candle_core::Result<Option<Vec<f32>>> {
-                            let codes = Tensor::from_vec(frame.clone(), (1, codebooks, 1), device)?;
-                            match detok.decode_step(&codes)? {
+                            match decode_audio_frame(&mut stream, &frame, codebooks, device)? {
                                 Some(chunk) => {
-                                    let mut pcm = chunk.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
-                                    if out_rate != MIMI_RATE && out_rate != 0 {
-                                        pcm = crate::resample::resample_slice(&pcm, MIMI_RATE, out_rate);
+                                    let mut pcm = chunk
+                                        .flatten_all()?
+                                        .to_dtype(DType::F32)?
+                                        .to_vec1::<f32>()?;
+                                    if out_rate != mimi_rate && out_rate != 0 {
+                                        pcm = crate::resample::resample_slice(
+                                            &pcm, mimi_rate, out_rate,
+                                        );
                                     }
                                     Ok(Some(pcm))
                                 }
@@ -401,7 +422,10 @@ mod tests {
     use std::time::Duration;
 
     fn utt(n: usize) -> Utterance {
-        Utterance { samples: vec![0.0; n], rate: 16_000 }
+        Utterance {
+            samples: vec![0.0; n],
+            rate: 16_000,
+        }
     }
 
     /// Drain events until a terminal one (TurnComplete / Interrupted / Error), bounded by
@@ -409,7 +433,9 @@ mod tests {
     fn collect_turn(rx: &Receiver<VoiceEvent>) -> Vec<VoiceEvent> {
         let mut out = Vec::new();
         loop {
-            let ev = rx.recv_timeout(Duration::from_secs(5)).expect("expected an event before timeout");
+            let ev = rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("expected an event before timeout");
             let terminal = matches!(
                 ev,
                 VoiceEvent::TurnComplete | VoiceEvent::Interrupted | VoiceEvent::Error(_)
@@ -426,7 +452,12 @@ mod tests {
         turns: Arc<AtomicUsize>,
     }
     impl VoiceEngine for ScriptEngine {
-        fn respond(&mut self, utt: &Utterance, _cancel: &AtomicBool, emit: &mut dyn FnMut(VoiceEvent)) -> Result<bool, String> {
+        fn respond(
+            &mut self,
+            utt: &Utterance,
+            _cancel: &AtomicBool,
+            emit: &mut dyn FnMut(VoiceEvent),
+        ) -> Result<bool, String> {
             self.turns.fetch_add(1, Ordering::SeqCst);
             emit(VoiceEvent::Text(format!("got {}", utt.samples.len())));
             emit(VoiceEvent::Audio(vec![0.1, 0.2, 0.3]));
@@ -437,7 +468,9 @@ mod tests {
     #[test]
     fn emits_events_in_order_then_turn_complete() {
         let turns = Arc::new(AtomicUsize::new(0));
-        let pipe = RealtimePipeline::spawn(ScriptEngine { turns: turns.clone() });
+        let pipe = RealtimePipeline::spawn(ScriptEngine {
+            turns: turns.clone(),
+        });
         assert!(pipe.submit(utt(5)));
         assert_eq!(
             collect_turn(pipe.events()),
@@ -453,19 +486,30 @@ mod tests {
     #[test]
     fn worker_persists_across_turns() {
         let turns = Arc::new(AtomicUsize::new(0));
-        let pipe = RealtimePipeline::spawn(ScriptEngine { turns: turns.clone() });
+        let pipe = RealtimePipeline::spawn(ScriptEngine {
+            turns: turns.clone(),
+        });
         for n in [3usize, 7] {
             assert!(pipe.submit(utt(n)));
             let evs = collect_turn(pipe.events());
             assert_eq!(evs.last(), Some(&VoiceEvent::TurnComplete));
         }
-        assert_eq!(turns.load(Ordering::SeqCst), 2, "the worker should serve every utterance");
+        assert_eq!(
+            turns.load(Ordering::SeqCst),
+            2,
+            "the worker should serve every utterance"
+        );
     }
 
     /// Emits Audio forever until `cancel` is set — stands in for a long generation.
     struct LoopEngine;
     impl VoiceEngine for LoopEngine {
-        fn respond(&mut self, _utt: &Utterance, cancel: &AtomicBool, emit: &mut dyn FnMut(VoiceEvent)) -> Result<bool, String> {
+        fn respond(
+            &mut self,
+            _utt: &Utterance,
+            cancel: &AtomicBool,
+            emit: &mut dyn FnMut(VoiceEvent),
+        ) -> Result<bool, String> {
             for _ in 0..100_000 {
                 if cancel.load(Ordering::Acquire) {
                     return Ok(false);
@@ -482,7 +526,10 @@ mod tests {
         let pipe = RealtimePipeline::spawn(LoopEngine);
         assert!(pipe.submit(utt(1)));
         // Wait until generation is actually under way.
-        let first = pipe.events().recv_timeout(Duration::from_secs(5)).expect("turn should start");
+        let first = pipe
+            .events()
+            .recv_timeout(Duration::from_secs(5))
+            .expect("turn should start");
         assert!(matches!(first, VoiceEvent::Audio(_)));
 
         pipe.interrupt();
@@ -490,7 +537,10 @@ mod tests {
         // It must terminate with Interrupted (not TurnComplete), and promptly.
         let mut seen = 0;
         loop {
-            let ev = pipe.events().recv_timeout(Duration::from_secs(5)).expect("expected terminal event");
+            let ev = pipe
+                .events()
+                .recv_timeout(Duration::from_secs(5))
+                .expect("expected terminal event");
             match ev {
                 VoiceEvent::Interrupted => break,
                 VoiceEvent::TurnComplete => panic!("barge-in should interrupt, not complete"),
@@ -504,7 +554,12 @@ mod tests {
 
     struct ErrEngine;
     impl VoiceEngine for ErrEngine {
-        fn respond(&mut self, _utt: &Utterance, _cancel: &AtomicBool, _emit: &mut dyn FnMut(VoiceEvent)) -> Result<bool, String> {
+        fn respond(
+            &mut self,
+            _utt: &Utterance,
+            _cancel: &AtomicBool,
+            _emit: &mut dyn FnMut(VoiceEvent),
+        ) -> Result<bool, String> {
             Err("boom".into())
         }
     }
@@ -513,10 +568,16 @@ mod tests {
     fn engine_error_is_reported_and_worker_survives() {
         let pipe = RealtimePipeline::spawn(ErrEngine);
         assert!(pipe.submit(utt(0)));
-        assert_eq!(pipe.events().recv_timeout(Duration::from_secs(5)).unwrap(), VoiceEvent::Error("boom".into()));
+        assert_eq!(
+            pipe.events().recv_timeout(Duration::from_secs(5)).unwrap(),
+            VoiceEvent::Error("boom".into())
+        );
         // The worker must still be alive to serve a second utterance.
         assert!(pipe.submit(utt(0)));
-        assert_eq!(pipe.events().recv_timeout(Duration::from_secs(5)).unwrap(), VoiceEvent::Error("boom".into()));
+        assert_eq!(
+            pipe.events().recv_timeout(Duration::from_secs(5)).unwrap(),
+            VoiceEvent::Error("boom".into())
+        );
     }
 
     /// Real-model proof of the multi-turn persistence (Gap A): two `respond()` calls on the
@@ -545,12 +606,16 @@ mod tests {
             .unwrap_or_else(|_| "LiquidAI/LFM2.5-Audio-1.5B".into());
         let dir = get_model_dir(&model_ref, None).expect("resolve model dir");
         let cfg: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
+            serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
+                .unwrap();
         let codebooks = cfg["codebooks"].as_u64().expect("codebooks") as usize;
         let (model, proc) = from_pretrained(&dir, dtype, &device).expect("load model");
 
         // Short budget keeps the test quick; demo audio sampling so frames are non-degenerate.
-        let params = GenParams { max_new_tokens: 96, ..GenParams::demo_defaults() };
+        let params = GenParams {
+            max_new_tokens: 96,
+            ..GenParams::demo_defaults()
+        };
         let mut engine = Lfm2VoiceEngine::new(model, proc, params, codebooks, device, MIMI_RATE);
 
         // Reuse the reference question clip for both turns (a smoke test of growth, not content).
@@ -565,7 +630,10 @@ mod tests {
             .chunks_exact(2)
             .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
             .collect();
-        let utt = || Utterance { samples: pcm.clone(), rate: 16_000 };
+        let utt = || Utterance {
+            samples: pcm.clone(),
+            rate: 16_000,
+        };
 
         let cancel = AtomicBool::new(false);
         let mut sink = |_ev: VoiceEvent| {};
@@ -579,7 +647,10 @@ mod tests {
             c1.audio_out.dim(1).unwrap(),
             c1.modality_flag.dim(1).unwrap(),
         );
-        assert!(t1 > 0 && a1 > 0, "turn 1 must produce text + discrete audio_out (got {t1}, {a1})");
+        assert!(
+            t1 > 0 && a1 > 0,
+            "turn 1 must produce text + discrete audio_out (got {t1}, {a1})"
+        );
 
         // Turn 2: seeds from c1 via from_parts → generate (prefill scatters c1's audio_out as
         // context) → append → save. Every field must be strictly longer than after turn 1.
@@ -611,7 +682,12 @@ mod tests {
             _g: Guard,
         }
         impl VoiceEngine for GuardedEngine {
-            fn respond(&mut self, _utt: &Utterance, _cancel: &AtomicBool, emit: &mut dyn FnMut(VoiceEvent)) -> Result<bool, String> {
+            fn respond(
+                &mut self,
+                _utt: &Utterance,
+                _cancel: &AtomicBool,
+                emit: &mut dyn FnMut(VoiceEvent),
+            ) -> Result<bool, String> {
                 emit(VoiceEvent::Text("x".into()));
                 Ok(true)
             }
@@ -619,11 +695,16 @@ mod tests {
 
         let dropped = Arc::new(AtomicBool::new(false));
         {
-            let pipe = RealtimePipeline::spawn(GuardedEngine { _g: Guard(dropped.clone()) });
+            let pipe = RealtimePipeline::spawn(GuardedEngine {
+                _g: Guard(dropped.clone()),
+            });
             assert!(pipe.submit(utt(1)));
             let _ = collect_turn(pipe.events());
             // `pipe` drops here → channel closes → worker loop ends → engine (+ Guard) drop.
         }
-        assert!(dropped.load(Ordering::SeqCst), "worker must drop the engine on shutdown");
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "worker must drop the engine on shutdown"
+        );
     }
 }

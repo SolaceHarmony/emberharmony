@@ -4,8 +4,8 @@
 //! `chat_producer` generate loop) minus the Gradio/WebRTC UI: load the real
 //! LFM2.5-Audio model + processor, feed a spoken question, greedily generate an
 //! interleaved text+audio reply, print the text, and write the reply audio to a
-//! WAV. Mimi audio-out is the `moshi` crate (already wired behind the processor's
-//! `decode`), not reimplemented here.
+//! WAV. Mimi audio-out goes through the same `proc.mimi` interface as the Python
+//! demo, not through the generic processor detokenizer dispatch.
 //!
 //! Run (CPU, f32 — the on-disk bf16 weights upcast losslessly):
 //!   LFM_MODEL_DIR=../model cargo run --release --example generate -- path/to/audio.wav
@@ -18,6 +18,8 @@
 use std::path::Path;
 
 use candle_core::{DType, Device, Tensor};
+use liquid_audio::moshi::demo::chat::decode_audio_reply;
+use liquid_audio::moshi::models::MimiModel;
 use liquid_audio::{from_pretrained, ChatState, GenParams, GenToken};
 
 type Res<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -128,7 +130,10 @@ fn main() -> Res<()> {
         )
         .into()
     });
-    let max_new_tokens: usize = std::env::var("LFM_MAX_TOKENS").ok().and_then(|s| s.parse().ok()).unwrap_or(96);
+    let max_new_tokens: usize = std::env::var("LFM_MAX_TOKENS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(96);
     let (device, dtype) = select_device()?;
 
     eprintln!("[load] resolving model `{model_ref}` (repo id → HF cache download, or local path)…");
@@ -137,15 +142,28 @@ fn main() -> Res<()> {
     // `codebooks` is a config field (Python LFM2AudioConfig); ChatState needs it.
     let cfg: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(dir.join("config.json"))?)?;
-    let codebooks = cfg["codebooks"].as_u64().ok_or("config.json: missing `codebooks`")? as usize;
+    let codebooks = cfg["codebooks"]
+        .as_u64()
+        .ok_or("config.json: missing `codebooks`")? as usize;
 
-    eprintln!("[load] model + processor from {} ({dtype:?}, {device:?})…", dir.display());
+    eprintln!(
+        "[load] model + processor from {} ({dtype:?}, {device:?})…",
+        dir.display()
+    );
     let t0 = std::time::Instant::now();
     let (model, proc) = from_pretrained(&dir, dtype, &device)?;
+    let mimi = MimiModel::new(
+        proc.mimi()
+            .ok_or("Mimi codec not loaded — required by liquid_audio/demo/chat.py")?,
+    );
     eprintln!("[load] done in {:.1}s.", t0.elapsed().as_secs_f32());
 
     let (samples, rate) = read_wav_mono_f32(Path::new(&audio_path))?;
-    eprintln!("[input] {} samples @ {rate} Hz ({:.2}s) from {audio_path}", samples.len(), samples.len() as f32 / rate as f32);
+    eprintln!(
+        "[input] {} samples @ {rate} Hz ({:.2}s) from {audio_path}",
+        samples.len(),
+        samples.len() as f32 / rate as f32
+    );
     let n = samples.len();
     let wave = Tensor::from_vec(samples, (1, n), &device)?;
 
@@ -171,7 +189,9 @@ fn main() -> Res<()> {
         seed: 0,
     };
 
-    eprintln!("[gen] generate_interleaved (text greedy, audio temp=1.0 top-k=4, max {max_new_tokens})…");
+    eprintln!(
+        "[gen] generate_interleaved (text greedy, audio temp=1.0 top-k=4, max {max_new_tokens})…"
+    );
     let mut text_ids: Vec<u32> = Vec::new();
     let mut audio_frames: Vec<Vec<u32>> = Vec::new();
     let tg = std::time::Instant::now();
@@ -181,30 +201,28 @@ fn main() -> Res<()> {
     })?;
     let n_tok = text_ids.len() + audio_frames.len();
     let secs = tg.elapsed().as_secs_f32();
-    eprintln!("[gen] {n_tok} tokens in {secs:.1}s = {:.1} tok/s", n_tok as f32 / secs);
+    eprintln!(
+        "[gen] {n_tok} tokens in {secs:.1}s = {:.1} tok/s",
+        n_tok as f32 / secs
+    );
 
     // --- text reply ---
     let text = proc.text().decode(&text_ids, true)?;
     println!("\n=== TEXT REPLY ({} tokens) ===\n{text}\n", text_ids.len());
 
-    // --- audio reply: drop EOAudio (2048) terminator frames, stack (1, C, frames), Mimi-decode ---
-    let frames: Vec<&Vec<u32>> = audio_frames.iter().filter(|f| !f.contains(&2048)).collect();
-    eprintln!("[audio] {} frames generated, {} after stripping EOAudio", audio_frames.len(), frames.len());
-    if frames.is_empty() {
+    // --- audio reply: drop EOAudio (2048) terminator frame, stack (1, C, frames), Mimi-decode ---
+    eprintln!(
+        "[audio] {} frames generated, {} after stripping EOAudio",
+        audio_frames.len(),
+        audio_frames.len().saturating_sub(1)
+    );
+    let Some(wav) = decode_audio_reply(&mimi, &audio_frames, codebooks, &device)? else {
         println!("=== AUDIO REPLY ===\n(no audio frames generated)");
         return Ok(());
-    }
-    let nf = frames.len();
-    let mut flat = Vec::with_capacity(codebooks * nf);
-    for c in 0..codebooks {
-        for f in &frames {
-            flat.push(f[c]);
-        }
-    }
-    let codes = Tensor::from_vec(flat, (1, codebooks, nf), &device)?;
-    let wav = proc.decode(&codes)?; // moshi Mimi codec (proven by mimi_decode_smoke)
+    };
     let wav_v = wav.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
-    let out_rate = proc.mimi_sample_rate().unwrap_or(24_000);
+    let out_rate = mimi.sample_rate();
+    let nf = audio_frames.len() - 1;
     write_wav_mono_f32(Path::new("out.wav"), &wav_v, out_rate)?;
     println!(
         "=== AUDIO REPLY ===\n{} frames → {} samples @ {out_rate} Hz ({:.2}s) → out.wav",

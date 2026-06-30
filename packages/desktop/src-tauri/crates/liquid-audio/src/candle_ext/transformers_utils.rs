@@ -67,7 +67,10 @@ mod tests {
         let dev = Device::Cpu;
         let (b, n_kv, t, d) = (1usize, 2usize, 4usize, 3usize);
         let n = (b * n_kv * t * d) as f32;
-        let xs = Tensor::arange(0f32, n, &dev).unwrap().reshape((b, n_kv, t, d)).unwrap();
+        let xs = Tensor::arange(0f32, n, &dev)
+            .unwrap()
+            .reshape((b, n_kv, t, d))
+            .unwrap();
 
         use crate::candle_ext::tensor_ext::TensorExt;
 
@@ -78,9 +81,12 @@ mod tests {
         // n_rep == 3 (cat form) must equal the unsqueeze+expand+reshape reference exactly.
         let got = repeat_kv(xs.clone(), 3).unwrap();
         let want = xs
-            .unsqueeze(2).unwrap()
-            .expand((b, n_kv, 3, t, d)).unwrap()
-            .reshape((b, n_kv * 3, t, d)).unwrap();
+            .unsqueeze(2)
+            .unwrap()
+            .expand((b, n_kv, 3, t, d))
+            .unwrap()
+            .reshape((b, n_kv * 3, t, d))
+            .unwrap();
         assert_eq!(got.dims(), &[b, n_kv * 3, t, d]);
         assert_eq!(
             got.to_vec4::<f32>().unwrap(),

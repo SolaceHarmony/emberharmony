@@ -20,7 +20,6 @@ use std::path::{Path, PathBuf};
 
 use candle_core::{DType, Device, Result};
 use candle_nn::{VarBuilder, VarMap};
-use moshi::mimi;
 use serde_json::Value;
 
 use crate::audio_out::{AudioDetokenizer, MimiDetokenizer};
@@ -30,6 +29,7 @@ use crate::model::conformer::encoder::ConformerEncoderConfig;
 use crate::model::conformer::processor::FilterbankFeatures;
 use crate::model::lfm2_audio::{DepthformerConfig, LFM2AudioModel, LossConf};
 use crate::model::lfm2_hf::Lfm2Config;
+use crate::moshi::models::get_mimi;
 use crate::processor::{LFM2AudioProcessor, PreprocessorConfig};
 
 fn err(e: impl std::fmt::Display) -> candle_core::Error {
@@ -78,7 +78,10 @@ fn parse_encoder(e: &Value) -> Result<ConformerEncoderConfig> {
         n_heads: req_usize(e, "n_heads")?,
         conv_kernel_size: req_usize(e, "conv_kernel_size")?,
         xscaling: e["xscaling"].as_bool().unwrap_or(true),
-        self_attention_model: e["self_attention_model"].as_str().unwrap_or("rel_pos").to_string(),
+        self_attention_model: e["self_attention_model"]
+            .as_str()
+            .unwrap_or("rel_pos")
+            .to_string(),
     })
 }
 
@@ -99,7 +102,11 @@ pub fn from_pretrained_hub(
 /// Load the main model + processor from a local model directory, at `dtype`
 /// (mirrors the Python `dtype=` keyword; `DType::BF16` matches the deployed
 /// model, `DType::F32` matches the parity reference).
-pub fn from_pretrained(dir: &Path, dtype: DType, device: &Device) -> Result<(LFM2AudioModel, LFM2AudioProcessor)> {
+pub fn from_pretrained(
+    dir: &Path,
+    dtype: DType,
+    device: &Device,
+) -> Result<(LFM2AudioModel, LFM2AudioProcessor)> {
     // Size the global rayon pool (candle's matmul/conv use it) like torch's intra-op
     // default — Apple-Silicon performance cores, not all logical cores. Must run before
     // the first tensor op; idempotent. (No-op for thread parallelism on the Metal path,
@@ -120,7 +127,9 @@ pub fn from_pretrained(dir: &Path, dtype: DType, device: &Device) -> Result<(LFM
              (bf16 runs natively on Metal.)",
         ));
     }
-    let config: Value = serde_json::from_str(&fs::read_to_string(dir.join("config.json")).map_err(err)?).map_err(err)?;
+    let config: Value =
+        serde_json::from_str(&fs::read_to_string(dir.join("config.json")).map_err(err)?)
+            .map_err(err)?;
 
     let lfm_cfg: Lfm2Config = serde_json::from_value(config["lfm"].clone()).map_err(err)?;
     let enc_cfg = parse_encoder(&config["encoder"])?;
@@ -140,7 +149,10 @@ pub fn from_pretrained(dir: &Path, dtype: DType, device: &Device) -> Result<(LFM
     // Loss-weight hyperparameters (Python `LFM2AudioConfig`) feeding the
     // `audio_loss_weights` buffer + loss multipliers built in `LFM2AudioModel::new`.
     let loss_conf = LossConf {
-        codebook_weight: config["codebook_weight"].as_str().unwrap_or("linear").to_string(),
+        codebook_weight: config["codebook_weight"]
+            .as_str()
+            .unwrap_or("linear")
+            .to_string(),
         semantic_codebook_factor: config["semantic_codebook_factor"].as_f64().unwrap_or(1.0),
         text_loss_multiplier: config["text_loss_multiplier"].as_f64().unwrap_or(1.0),
         audio_loss_multiplier: config["audio_loss_multiplier"].as_f64().unwrap_or(1.0),
@@ -148,9 +160,12 @@ pub fn from_pretrained(dir: &Path, dtype: DType, device: &Device) -> Result<(LFM
 
     let safes = safetensors_in(dir)?;
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&safes, dtype, device)? };
-    let model = LFM2AudioModel::new(lfm_cfg, &enc_cfg, &depth_cfg, codebooks, n_text, n_audio, &loss_conf, vb)?;
+    let model = LFM2AudioModel::new(
+        lfm_cfg, &enc_cfg, &depth_cfg, codebooks, n_text, n_audio, &loss_conf, vb,
+    )?;
 
-    let prep: PreprocessorConfig = serde_json::from_value(config["preprocessor"].clone()).map_err(err)?;
+    let prep: PreprocessorConfig =
+        serde_json::from_value(config["preprocessor"].clone()).map_err(err)?;
     let audio = FilterbankFeatures::new(prep.mel_config(), device)?;
     let tokenizer = LFM2AudioProcessor::load_tokenizer(dir)?;
     // Two INDEPENDENT audio backends, mirroring the Python processor's separate
@@ -163,8 +178,8 @@ pub fn from_pretrained(dir: &Path, dtype: DType, device: &Device) -> Result<(LFM
     //    only) used by `decode`. `None` for v1, where `decode` falls back to `mimi`.
     // No silent fallback for full snapshots: a present `audio_detokenizer/`
     // propagates any load error rather than quietly dropping to Mimi.
-    let mimi: Option<Box<dyn AudioDetokenizer>> =
-        load_mimi(dir, codebooks, device)?.map(|m| Box::new(MimiDetokenizer::new(m)) as Box<dyn AudioDetokenizer>);
+    let mimi: Option<Box<dyn AudioDetokenizer>> = load_mimi(dir, codebooks, device)?
+        .map(|m| Box::new(MimiDetokenizer::new(m)) as Box<dyn AudioDetokenizer>);
     let audio_out: Option<Box<dyn AudioDetokenizer>> = if dir.join("audio_detokenizer").is_dir() {
         Some(Box::new(load_detokenizer(dir, dtype, device)?))
     } else {
@@ -206,13 +221,19 @@ pub struct TrainableLoad {
 ///
 /// `dtype` mirrors the Python `torch.bfloat16`; pass `DType::F32` on CPU (candle
 /// has no CPU bf16 matmul) — the bf16-stored weights upcast faithfully.
-pub fn from_pretrained_trainable(dir: &Path, dtype: DType, device: &Device) -> Result<TrainableLoad> {
+pub fn from_pretrained_trainable(
+    dir: &Path,
+    dtype: DType,
+    device: &Device,
+) -> Result<TrainableLoad> {
     if dtype == DType::BF16 && device.is_cpu() {
         return Err(err(
             "bf16 on CPU is unsupported (candle has no CPU bf16 matmul); use DType::F32",
         ));
     }
-    let config: Value = serde_json::from_str(&fs::read_to_string(dir.join("config.json")).map_err(err)?).map_err(err)?;
+    let config: Value =
+        serde_json::from_str(&fs::read_to_string(dir.join("config.json")).map_err(err)?)
+            .map_err(err)?;
 
     let lfm_cfg: Lfm2Config = serde_json::from_value(config["lfm"].clone()).map_err(err)?;
     let enc_cfg = parse_encoder(&config["encoder"])?;
@@ -232,7 +253,10 @@ pub fn from_pretrained_trainable(dir: &Path, dtype: DType, device: &Device) -> R
     // Loss-weight hyperparameters (Python `LFM2AudioConfig`) — parsed up front so
     // they feed both `LFM2AudioModel::new` (the `audio_loss_weights` buffer + loss
     // multipliers) and the returned `TrainableLoad` below.
-    let codebook_weight = config["codebook_weight"].as_str().unwrap_or("linear").to_string();
+    let codebook_weight = config["codebook_weight"]
+        .as_str()
+        .unwrap_or("linear")
+        .to_string();
     let semantic_codebook_factor = config["semantic_codebook_factor"].as_f64().unwrap_or(1.0);
     let text_loss_multiplier = config["text_loss_multiplier"].as_f64().unwrap_or(1.0);
     let audio_loss_multiplier = config["audio_loss_multiplier"].as_f64().unwrap_or(1.0);
@@ -248,7 +272,9 @@ pub fn from_pretrained_trainable(dir: &Path, dtype: DType, device: &Device) -> R
     // param set, the safetensors provide the pretrained init).
     let varmap = VarMap::new();
     let vb = VarBuilder::from_varmap(&varmap, dtype, device);
-    let model = LFM2AudioModel::new(lfm_cfg, &enc_cfg, &depth_cfg, codebooks, n_text, n_audio, &loss_conf, vb)?;
+    let model = LFM2AudioModel::new(
+        lfm_cfg, &enc_cfg, &depth_cfg, codebooks, n_text, n_audio, &loss_conf, vb,
+    )?;
     // Load the checkpoint into the freshly-allocated Vars. `VarMap::load` is *not*
     // usable here: it opens a single file and demands every Var be present in it,
     // so it breaks on a sharded checkpoint *and* on the extra non-model safetensors
@@ -257,13 +283,16 @@ pub fn from_pretrained_trainable(dir: &Path, dtype: DType, device: &Device) -> R
     // shard, pulling each param by name. Strict: a param missing from *every* shard
     // is a hard error (never a silent zero-init); extra tensors in the dir that no
     // Var names are simply never requested.
-    let shards = unsafe { candle_core::safetensors::MmapedSafetensors::multi(&safetensors_in(dir)?)? };
+    let shards =
+        unsafe { candle_core::safetensors::MmapedSafetensors::multi(&safetensors_in(dir)?)? };
     {
         let mut ws = varmap.data().lock().unwrap();
         for (name, var) in ws.iter_mut() {
-            let tensor = shards
-                .load(name, var.device())
-                .map_err(|e| err(format!("checkpoint: param `{name}` not found in any shard: {e}")))?;
+            let tensor = shards.load(name, var.device()).map_err(|e| {
+                err(format!(
+                    "checkpoint: param `{name}` not found in any shard: {e}"
+                ))
+            })?;
             // Cast the STORED checkpoint dtype to the Var's dtype before `set`. Unlike
             // `VarBuilder::get` (which casts on read), `Var::set` is a same-dtype
             // storage copy and errors on a dtype mismatch. A bf16 checkpoint loaded
@@ -275,13 +304,14 @@ pub fn from_pretrained_trainable(dir: &Path, dtype: DType, device: &Device) -> R
         }
     }
 
-    let prep: PreprocessorConfig = serde_json::from_value(config["preprocessor"].clone()).map_err(err)?;
+    let prep: PreprocessorConfig =
+        serde_json::from_value(config["preprocessor"].clone()).map_err(err)?;
     let audio = FilterbankFeatures::new(prep.mel_config(), device)?;
     let tokenizer = LFM2AudioProcessor::load_tokenizer(dir)?;
     // Mimi codec + LFM2 detokenizer loaded independently (see `from_pretrained`):
     // training preprocessing also encodes audio-out via `processor.mimi.encode`.
-    let mimi: Option<Box<dyn AudioDetokenizer>> =
-        load_mimi(dir, codebooks, device)?.map(|m| Box::new(MimiDetokenizer::new(m)) as Box<dyn AudioDetokenizer>);
+    let mimi: Option<Box<dyn AudioDetokenizer>> = load_mimi(dir, codebooks, device)?
+        .map(|m| Box::new(MimiDetokenizer::new(m)) as Box<dyn AudioDetokenizer>);
     let audio_out: Option<Box<dyn AudioDetokenizer>> = if dir.join("audio_detokenizer").is_dir() {
         Some(Box::new(load_detokenizer(dir, dtype, device)?))
     } else {
@@ -307,19 +337,23 @@ pub fn from_pretrained_trainable(dir: &Path, dtype: DType, device: &Device) -> R
 /// `liquid_audio/moshi`, so it loads the moshi-format checkpoint). Returns `None`
 /// if the file is absent; propagates a real load error (no silent fallback) if
 /// the file exists but can't be loaded.
-fn load_mimi(dir: &Path, codebooks: usize, device: &Device) -> Result<Option<mimi::Mimi>> {
+fn load_mimi(dir: &Path, codebooks: usize, device: &Device) -> Result<Option<::moshi::mimi::Mimi>> {
     let path = dir.join("tokenizer-e351c8d8-checkpoint125.safetensors");
     if !path.exists() {
         return Ok(None);
     }
-    let p = path.to_str().ok_or_else(|| err("non-utf8 mimi weights path"))?;
-    Ok(Some(mimi::load(p, Some(codebooks), device)?))
+    let p = path
+        .to_str()
+        .ok_or_else(|| err("non-utf8 mimi weights path"))?;
+    Ok(Some(get_mimi(p, codebooks, device)?))
 }
 
 /// Load the LFM2.5 audio detokenizer from `<dir>/audio_detokenizer/` if present.
 fn load_detokenizer(dir: &Path, dtype: DType, device: &Device) -> Result<LFM2AudioDetokenizer> {
     let detok_dir = dir.join("audio_detokenizer");
-    let mut cfg: Value = serde_json::from_str(&fs::read_to_string(detok_dir.join("config.json")).map_err(err)?).map_err(err)?;
+    let mut cfg: Value =
+        serde_json::from_str(&fs::read_to_string(detok_dir.join("config.json")).map_err(err)?)
+            .map_err(err)?;
     // llama.cpp → transformers compat: "sliding_attention" → "full_attention"
     if let Some(arr) = cfg["layer_types"].as_array_mut() {
         for v in arr.iter_mut() {

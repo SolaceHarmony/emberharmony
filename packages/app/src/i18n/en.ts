@@ -238,7 +238,7 @@ export const dict = {
   "settings.voice.section.connection": "LiveKit connection",
   "settings.voice.section.models": "Speech models",
   "settings.voice.row.enabled.title": "Voice mode",
-  "settings.voice.row.enabled.description": "Talk to sessions hands-free through LiveKit",
+  "settings.voice.row.enabled.description": "Talk to sessions hands-free with the selected voice provider",
   "settings.voice.row.url.title": "Server URL",
   "settings.voice.row.url.description": "LiveKit Cloud project or self-hosted server",
   "settings.voice.row.apiKey.title": "API key",

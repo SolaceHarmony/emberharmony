@@ -62,7 +62,8 @@ pub fn create_output_dir(out_dir: &Path) -> Result<()> {
             out_dir.display()
         )));
     }
-    std::fs::create_dir_all(out_dir).map_err(|e| candle_core::Error::Msg(format!("mkdir {}: {e}", out_dir.display())))
+    std::fs::create_dir_all(out_dir)
+        .map_err(|e| candle_core::Error::Msg(format!("mkdir {}: {e}", out_dir.display())))
 }
 
 /// Faithful port of `preprocess_dataset`.
@@ -98,8 +99,8 @@ pub fn preprocess_dataset(
     for (i, messages) in data.into_iter().enumerate() {
         let sample = mapper.map(&messages)?;
         let sample_len = sample.modality_flag.dim(D::Minus1)? as i64; // int(...shape[-1])
-        // `if 0 <= max_context_length < sample_len` — the half-open range
-        // `[0, sample_len)` contains `max_context_length` iff both bounds hold.
+                                                                      // `if 0 <= max_context_length < sample_len` — the half-open range
+                                                                      // `[0, sample_len)` contains `max_context_length` iff both bounds hold.
         if (0..sample_len).contains(&max_context_length) {
             eprintln!("WARNING: skipping sample {i} with {sample_len} tokens (max_context_length={max_context_length})");
             continue;
@@ -158,7 +159,10 @@ mod tests {
         let info: serde_json::Value =
             serde_json::from_slice(&std::fs::read(out.join("dataset_info.json")).unwrap()).unwrap();
         assert_eq!(info["features"]["text"]["_type"], "Sequence");
-        assert_eq!(info["features"]["audio_in"]["feature"]["feature"]["dtype"], "float32");
+        assert_eq!(
+            info["features"]["audio_in"]["feature"]["feature"]["dtype"],
+            "float32"
+        );
         std::fs::remove_dir_all(&out).ok();
     }
 
@@ -178,7 +182,8 @@ mod tests {
             sample_with_len(n, &Device::Cpu)
         };
         // lengths 2, 5, 3 ; max_context_length=4 ⇒ the length-5 sample is skipped.
-        let written = preprocess_dataset(vec![one_msg(2), one_msg(5), one_msg(3)], &out, &mapper, 4).unwrap();
+        let written =
+            preprocess_dataset(vec![one_msg(2), one_msg(5), one_msg(3)], &out, &mapper, 4).unwrap();
         assert_eq!(written, 2, "the length-5 sample should be filtered out");
 
         // The on-disk Arrow dataset round-trips through the crate's dataloader.
@@ -192,7 +197,8 @@ mod tests {
         let out = tmp_dir("keepall");
         let mapper = |m: &[ChatMessage]| sample_with_len(m.len().max(1), &Device::Cpu);
         // max_context_length=-1 ⇒ `0 <= -1` is false ⇒ nothing is skipped.
-        let written = preprocess_dataset(vec![one_msg(2), one_msg(9999)], &out, &mapper, -1).unwrap();
+        let written =
+            preprocess_dataset(vec![one_msg(2), one_msg(9999)], &out, &mapper, -1).unwrap();
         assert_eq!(written, 2);
         std::fs::remove_dir_all(&out).ok();
     }

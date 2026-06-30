@@ -46,7 +46,10 @@ mod tests {
         let dev = Device::Cpu;
         let (a, b, c, d) = (2usize, 3usize, 4usize, 5usize);
         let n = (a * b * c * d) as i64;
-        let t = Tensor::arange(0i64, n, &dev).unwrap().reshape((a, b, c, d)).unwrap();
+        let t = Tensor::arange(0i64, n, &dev)
+            .unwrap()
+            .reshape((a, b, c, d))
+            .unwrap();
 
         let v = t.to_vec4::<i64>().unwrap();
         assert_eq!(v.len(), a);

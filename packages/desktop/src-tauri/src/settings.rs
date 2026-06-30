@@ -131,6 +131,14 @@ pub struct VoiceSettings {
     pub lfm2: Lfm2Settings,
 }
 
+/// Settings plus whether the `voice` key was actually present in the store.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VoiceSettingsState {
+    pub settings: VoiceSettings,
+    pub stored: bool,
+}
+
 /// Lenient in-process read for the native voice loop: returns defaults on any
 /// error (missing store / unset / parse failure) so the loop never fails to
 /// start over config.
@@ -150,10 +158,28 @@ pub fn voice_settings_get(app: AppHandle) -> Result<VoiceSettings, String> {
         .store(SETTINGS_STORE)
         .map_err(|e| format!("Failed to open settings store: {}", e))?;
     match store.get(VOICE_KEY) {
-        Some(value) => {
-            serde_json::from_value(value).map_err(|e| format!("Failed to parse voice settings: {}", e))
-        }
+        Some(value) => serde_json::from_value(value)
+            .map_err(|e| format!("Failed to parse voice settings: {}", e)),
         None => Ok(VoiceSettings::default()),
+    }
+}
+
+/// Read persisted voice settings and report whether they were explicitly stored.
+#[tauri::command]
+pub fn voice_settings_state(app: AppHandle) -> Result<VoiceSettingsState, String> {
+    let store = app
+        .store(SETTINGS_STORE)
+        .map_err(|e| format!("Failed to open settings store: {}", e))?;
+    match store.get(VOICE_KEY) {
+        Some(value) => Ok(VoiceSettingsState {
+            settings: serde_json::from_value(value)
+                .map_err(|e| format!("Failed to parse voice settings: {}", e))?,
+            stored: true,
+        }),
+        None => Ok(VoiceSettingsState {
+            settings: VoiceSettings::default(),
+            stored: false,
+        }),
     }
 }
 
@@ -215,7 +241,10 @@ mod tests {
 
     #[test]
     fn provider_and_device_serialize_lowercase() {
-        assert_eq!(serde_json::to_value(VoiceProvider::Livekit).unwrap(), "livekit");
+        assert_eq!(
+            serde_json::to_value(VoiceProvider::Livekit).unwrap(),
+            "livekit"
+        );
         assert_eq!(serde_json::to_value(Lfm2Device::Metal).unwrap(), "metal");
     }
 }

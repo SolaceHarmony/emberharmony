@@ -10,9 +10,9 @@
 //!
 //! See PORT_STATUS.md for the per-file class/fn mapping.
 
+pub mod encoder; // ConformerEncoder
 pub mod mha;
 pub mod modules; // ConformerLayer / ConformerConvolution / FeedForward / CausalConv1D
-pub mod encoder; // ConformerEncoder
 pub mod processor; // AudioPreprocessor / AudioToMelSpectrogramPreprocessor (mel features)
 pub mod subsampling; // ConvSubsampling / MaskedConvSequential
 pub mod utils; // CacheAwareStreamingConfig, stochastic-depth, autocast guard

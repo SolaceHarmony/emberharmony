@@ -53,7 +53,10 @@ pub fn module_exists(name: &str) -> bool {
 /// and snapshot-downloaded (the `huggingface_hub.snapshot_download` analog), the
 /// snapshot directory being returned. The download branch requires the `download`
 /// feature (on by default).
-pub fn get_model_dir(repo_or_path: &str, revision: Option<&str>) -> std::io::Result<std::path::PathBuf> {
+pub fn get_model_dir(
+    repo_or_path: &str,
+    revision: Option<&str>,
+) -> std::io::Result<std::path::PathBuf> {
     let p = std::path::PathBuf::from(repo_or_path);
     if p.is_dir() {
         if revision.is_some() {
@@ -76,7 +79,11 @@ fn download_snapshot(repo_id: &str, revision: Option<&str>) -> std::io::Result<s
 
     let api = Api::new().map_err(to_io)?;
     let repo = match revision {
-        Some(rev) => api.repo(Repo::with_revision(repo_id.to_string(), RepoType::Model, rev.to_string())),
+        Some(rev) => api.repo(Repo::with_revision(
+            repo_id.to_string(),
+            RepoType::Model,
+            rev.to_string(),
+        )),
         None => api.model(repo_id.to_string()),
     };
 
@@ -90,12 +97,18 @@ fn download_snapshot(repo_id: &str, revision: Option<&str>) -> std::io::Result<s
         }
     }
     root.ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::NotFound, format!("repo {repo_id} has no config.json"))
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("repo {repo_id} has no config.json"),
+        )
     })
 }
 
 #[cfg(not(feature = "download"))]
-fn download_snapshot(repo_id: &str, _revision: Option<&str>) -> std::io::Result<std::path::PathBuf> {
+fn download_snapshot(
+    repo_id: &str,
+    _revision: Option<&str>,
+) -> std::io::Result<std::path::PathBuf> {
     Err(std::io::Error::new(
         std::io::ErrorKind::NotFound,
         format!("{repo_id} is not a local dir and the `download` feature is disabled — clone the HF repo and pass its path"),

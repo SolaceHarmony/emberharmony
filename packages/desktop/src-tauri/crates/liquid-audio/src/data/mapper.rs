@@ -28,7 +28,9 @@
 
 use candle_core::{DType, IndexOp, Result, Tensor};
 
-use crate::data::types::{ChatContentSegment, ChatMessage, InterleavedSegment, LFM2AudioTrainingSample, Role};
+use crate::data::types::{
+    ChatContentSegment, ChatMessage, InterleavedSegment, LFM2AudioTrainingSample, Role,
+};
 use crate::processor::LFM2AudioProcessor;
 use crate::utils::{mel2emb_len, LFMModality};
 
@@ -105,7 +107,12 @@ impl<'a> LFM2AudioChatMapper<'a> {
         interleaved_text_tokens: usize,
         interleaved_audio_tokens: usize,
     ) -> Self {
-        Self { processor, codebooks, interleaved_text_tokens, interleaved_audio_tokens }
+        Self {
+            processor,
+            codebooks,
+            interleaved_text_tokens,
+            interleaved_audio_tokens,
+        }
     }
 
     /// `__init__` with the Python keyword defaults (`codebooks=8`,
@@ -127,7 +134,11 @@ impl<'a> LFM2AudioChatMapper<'a> {
         self.append_text("<|startoftext|>", false, &mut acc)?;
 
         for msg in messages {
-            self.append_text(&format!("<|im_start|>{}\n", msg.role().as_str()), false, &mut acc)?;
+            self.append_text(
+                &format!("<|im_start|>{}\n", msg.role().as_str()),
+                false,
+                &mut acc,
+            )?;
 
             for segment in msg.content() {
                 match segment {
@@ -135,7 +146,8 @@ impl<'a> LFM2AudioChatMapper<'a> {
                         if msg.role() != Role::Assistant {
                             // raise ValueError(...)
                             return Err(candle_core::Error::Msg(
-                                "InterleavedSegment is only supported for assistant messages".into(),
+                                "InterleavedSegment is only supported for assistant messages"
+                                    .into(),
                             ));
                         }
                         self.append_interleaved_out(seg, &mut acc)?;
@@ -215,7 +227,14 @@ impl<'a> LFM2AudioChatMapper<'a> {
         let sup_u8: Vec<u8> = acc.supervision_seq.iter().map(|&b| b as u8).collect();
         let supervision_mask = Tensor::from_vec(sup_u8, (1, n_sup), dev)?;
 
-        Ok(LFM2AudioTrainingSample { text, audio_in, audio_in_lens, audio_out, modality_flag, supervision_mask })
+        Ok(LFM2AudioTrainingSample {
+            text,
+            audio_in,
+            audio_in_lens,
+            audio_out,
+            modality_flag,
+            supervision_mask,
+        })
     }
 
     /// `_append_interleaved_out(text, audio, ...)`.
@@ -240,15 +259,21 @@ impl<'a> LFM2AudioChatMapper<'a> {
         while text_left > 0 || audio_left > 0 {
             let take_text = n_text.min(text_left);
             if take_text > 0 {
-                acc.modality_seq.extend(std::iter::repeat_n(LFMModality::Text as i64, take_text));
-                acc.supervision_seq.extend(std::iter::repeat_n(true, take_text));
+                acc.modality_seq
+                    .extend(std::iter::repeat_n(LFMModality::Text as i64, take_text));
+                acc.supervision_seq
+                    .extend(std::iter::repeat_n(true, take_text));
                 text_left -= take_text;
             }
 
             let take_audio = n_audio.min(audio_left);
             if take_audio > 0 {
-                acc.modality_seq.extend(std::iter::repeat_n(LFMModality::AudioOut as i64, take_audio));
-                acc.supervision_seq.extend(std::iter::repeat_n(true, take_audio));
+                acc.modality_seq.extend(std::iter::repeat_n(
+                    LFMModality::AudioOut as i64,
+                    take_audio,
+                ));
+                acc.supervision_seq
+                    .extend(std::iter::repeat_n(true, take_audio));
                 audio_left -= take_audio;
             }
         }
@@ -261,8 +286,10 @@ impl<'a> LFM2AudioChatMapper<'a> {
         let text_tokens = self.encode_ids(text)?;
         let n = text_tokens.dim(0)?;
         acc.text_parts.push(text_tokens);
-        acc.modality_seq.extend(std::iter::repeat_n(LFMModality::Text as i64, n));
-        acc.supervision_seq.extend(std::iter::repeat_n(supervised, n));
+        acc.modality_seq
+            .extend(std::iter::repeat_n(LFMModality::Text as i64, n));
+        acc.supervision_seq
+            .extend(std::iter::repeat_n(supervised, n));
         Ok(())
     }
 
@@ -290,14 +317,20 @@ impl<'a> LFM2AudioChatMapper<'a> {
         let valid = self.processor.audio().get_seq_len(l);
         let t_padded = mel.dim(2)?;
         let cur_len = valid.min(t_padded);
-        let cur_mel = mel.i(0)?.narrow(1, 0, cur_len)?.to_dtype(DType::F32)?.contiguous()?; // (nfilt, cur_len)
+        let cur_mel = mel
+            .i(0)?
+            .narrow(1, 0, cur_len)?
+            .to_dtype(DType::F32)?
+            .contiguous()?; // (nfilt, cur_len)
 
         acc.mel_parts.push(cur_mel);
         acc.audio_in_lens.push(cur_len as i64);
 
         let n_emb = mel2emb_len(cur_len as i64) as usize;
-        acc.modality_seq.extend(std::iter::repeat_n(LFMModality::AudioIn as i64, n_emb));
-        acc.supervision_seq.extend(std::iter::repeat_n(false, n_emb));
+        acc.modality_seq
+            .extend(std::iter::repeat_n(LFMModality::AudioIn as i64, n_emb));
+        acc.supervision_seq
+            .extend(std::iter::repeat_n(false, n_emb));
         Ok(())
     }
 
@@ -308,7 +341,8 @@ impl<'a> LFM2AudioChatMapper<'a> {
         let codes = self.encode_audio_out(wav, sampling_rate)?;
         let n = codes.dim(1)?;
         acc.audio_out_parts.push(codes);
-        acc.modality_seq.extend(std::iter::repeat_n(LFMModality::AudioOut as i64, n));
+        acc.modality_seq
+            .extend(std::iter::repeat_n(LFMModality::AudioOut as i64, n));
         acc.supervision_seq.extend(std::iter::repeat_n(true, n));
         Ok(())
     }
@@ -325,7 +359,10 @@ impl<'a> LFM2AudioChatMapper<'a> {
     /// ```
     fn encode_audio_out(&self, wav: &Tensor, sampling_rate: u32) -> Result<Tensor> {
         let wav = wav.to_dtype(DType::F32)?;
-        let mimi_sample_rate = self.processor.mimi_sample_rate().unwrap_or(DEFAULT_MIMI_SAMPLE_RATE);
+        let mimi_sample_rate = self
+            .processor
+            .mimi_sample_rate()
+            .unwrap_or(DEFAULT_MIMI_SAMPLE_RATE);
         let wav = if sampling_rate != mimi_sample_rate {
             resample(&wav, sampling_rate, mimi_sample_rate)?
         } else {
@@ -346,7 +383,11 @@ impl<'a> LFM2AudioChatMapper<'a> {
         let codes = if kept == self.codebooks {
             codes
         } else {
-            let pad = Tensor::zeros((self.codebooks - kept, codes.dim(1)?), DType::U32, wav.device())?;
+            let pad = Tensor::zeros(
+                (self.codebooks - kept, codes.dim(1)?),
+                DType::U32,
+                wav.device(),
+            )?;
             Tensor::cat(&[&codes, &pad], 0)?
         };
         Tensor::cat(&[&codes, &end_of_audio], 1)
@@ -369,8 +410,16 @@ impl<'a> LFM2AudioChatMapper<'a> {
     /// FLAC, OGG/Vorbis, AIFF, … and more — to interleaved f32, then keep the
     /// leading channel dim and mono-downmix, matching the Python exactly.
     pub fn load_audio_bytes(audio: &[u8]) -> Result<(Tensor, u32)> {
-        let DecodedAudio { samples, channels, sample_rate } = decode_audio(audio)?;
-        let n_frames = if channels == 0 { 0 } else { samples.len() / channels as usize };
+        let DecodedAudio {
+            samples,
+            channels,
+            sample_rate,
+        } = decode_audio(audio)?;
+        let n_frames = if channels == 0 {
+            0
+        } else {
+            samples.len() / channels as usize
+        };
 
         // data.T then mean over channels if > 1 → a single (L,) mono row.
         let mut mono = vec![0f32; n_frames];
@@ -416,9 +465,17 @@ fn decode_audio(bytes: &[u8]) -> Result<DecodedAudio> {
 
     let err = |m: String| candle_core::Error::Msg(format!("load_audio_bytes: {m}"));
 
-    let mss = MediaSourceStream::new(Box::new(std::io::Cursor::new(bytes.to_vec())), Default::default());
+    let mss = MediaSourceStream::new(
+        Box::new(std::io::Cursor::new(bytes.to_vec())),
+        Default::default(),
+    );
     let probed = symphonia::default::get_probe()
-        .format(&Hint::new(), mss, &FormatOptions::default(), &MetadataOptions::default())
+        .format(
+            &Hint::new(),
+            mss,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
         .map_err(|e| err(format!("unsupported/undecodable audio container: {e}")))?;
     let mut format = probed.format;
     let track = format
@@ -432,7 +489,11 @@ fn decode_audio(bytes: &[u8]) -> Result<DecodedAudio> {
         .map_err(|e| err(format!("no decoder for codec: {e}")))?;
 
     let mut sample_rate = track.codec_params.sample_rate.unwrap_or(0);
-    let mut channels: u16 = track.codec_params.channels.map(|c| c.count() as u16).unwrap_or(0);
+    let mut channels: u16 = track
+        .codec_params
+        .channels
+        .map(|c| c.count() as u16)
+        .unwrap_or(0);
     let mut samples: Vec<f32> = Vec::new();
 
     loop {
@@ -468,7 +529,11 @@ fn decode_audio(bytes: &[u8]) -> Result<DecodedAudio> {
     if channels == 0 || samples.is_empty() {
         return Err(err("decoded no audio samples".into()));
     }
-    Ok(DecodedAudio { samples, channels, sample_rate })
+    Ok(DecodedAudio {
+        samples,
+        channels,
+        sample_rate,
+    })
 }
 
 /// `torchaudio.functional.resample(wav, orig, new)` — the faithful windowed-sinc
@@ -570,7 +635,9 @@ mod tests {
     #[test]
     fn decodes_non_wav_containers() {
         for env in ["LFM_TEST_AIFF", "LFM_TEST_M4A"] {
-            let Some(path) = std::env::var_os(env) else { continue };
+            let Some(path) = std::env::var_os(env) else {
+                continue;
+            };
             let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{env} {path:?}: {e}"));
             let (wav, sr) = LFM2AudioChatMapper::load_audio_bytes(&bytes)
                 .unwrap_or_else(|e| panic!("decode {env} failed: {e}"));
@@ -581,14 +648,21 @@ mod tests {
             let v = wav.flatten_all().unwrap().to_vec1::<f32>().unwrap();
             let peak = v.iter().fold(0f32, |m, &x| m.max(x.abs()));
             assert!(peak.is_finite() && peak > 0.0, "{env}: silent/NaN decode");
-            eprintln!("{env}: decoded {} samples @ {sr} Hz, peak {peak:.3}", v.len());
+            eprintln!(
+                "{env}: decoded {} samples @ {sr} Hz, peak {peak:.3}",
+                v.len()
+            );
         }
     }
 
     #[test]
     fn resample_changes_length_by_ratio() {
-        let x = Tensor::from_vec((0..100).map(|i| i as f32).collect::<Vec<_>>(), (1, 100), &candle_core::Device::Cpu)
-            .unwrap();
+        let x = Tensor::from_vec(
+            (0..100).map(|i| i as f32).collect::<Vec<_>>(),
+            (1, 100),
+            &candle_core::Device::Cpu,
+        )
+        .unwrap();
         let down = resample(&x, 24_000, 16_000).unwrap();
         assert_eq!(down.dims(), &[1, 67]); // round(100 * 16000/24000) = 67
         let up = resample(&x, 16_000, 24_000).unwrap();
@@ -600,6 +674,9 @@ mod tests {
         let x = Tensor::from_vec(vec![1f32, 2., 3.], (1, 3), &candle_core::Device::Cpu).unwrap();
         let y = resample(&x, 16_000, 16_000).unwrap();
         assert_eq!(y.dims(), &[1, 3]);
-        assert_eq!(y.flatten_all().unwrap().to_vec1::<f32>().unwrap(), vec![1f32, 2., 3.]);
+        assert_eq!(
+            y.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            vec![1f32, 2., 3.]
+        );
     }
 }

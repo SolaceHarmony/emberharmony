@@ -24,20 +24,20 @@
 //! preemphasis, `mag_power`, `log(x+guard)`, per-feature norm) is necessarily local.
 //! Training-only bits (dither, nb-augmentation, frame splicing) are skipped.
 
-use candle_core::{Device, DType, Result, Tensor};
+use candle_core::{DType, Device, Result, Tensor};
 
 /// Subset of NeMo's preprocessor config needed offline.
 #[derive(Debug, Clone)]
 pub struct MelConfig {
-    pub sample_rate: usize,     // 16000
-    pub n_window_size: usize,   // win_length (e.g. 400)
-    pub n_window_stride: usize, // hop_length (e.g. 160)
-    pub n_fft: usize,           // e.g. 512
-    pub nfilt: usize,           // mel bins (feat_in of the encoder)
-    pub preemph: f64,           // 0.97
+    pub sample_rate: usize,        // 16000
+    pub n_window_size: usize,      // win_length (e.g. 400)
+    pub n_window_stride: usize,    // hop_length (e.g. 160)
+    pub n_fft: usize,              // e.g. 512
+    pub nfilt: usize,              // mel bins (feat_in of the encoder)
+    pub preemph: f64,              // 0.97
     pub log_zero_guard_value: f64, // 2^-24
-    pub mag_power: f64,         // 2.0
-    pub pad_to: usize,          // 16
+    pub mag_power: f64,            // 2.0
+    pub pad_to: usize,             // 16
     /// NeMo `exact_pad`. False (the checkpoint default) ⇒ `torch.stft(center=True)`
     /// (symmetric `n_fft//2` internal pad). True ⇒ `center=False` with the signal
     /// pre-padded by `(n_fft - hop)//2` each side in `forward`, so that the frame
@@ -97,7 +97,9 @@ fn mel_filterbank(sr: usize, n_fft: usize, n_mels: usize) -> Vec<f32> {
     let freq = n_fft / 2 + 1;
     let fmin = 0.0;
     let fmax = sr as f64 / 2.0;
-    let fft_freqs: Vec<f64> = (0..freq).map(|k| k as f64 * sr as f64 / n_fft as f64).collect();
+    let fft_freqs: Vec<f64> = (0..freq)
+        .map(|k| k as f64 * sr as f64 / n_fft as f64)
+        .collect();
     let mel_min = hz_to_mel(fmin);
     let mel_max = hz_to_mel(fmax);
     let mel_pts: Vec<f64> = (0..n_mels + 2)
@@ -177,7 +179,12 @@ impl FilterbankFeatures {
         // stored — it has no use after the kernel is built.
         let padded_win = pad_window_to(&window, cfg.n_fft);
         let stft_kernel = dft_conv_kernel(cfg.n_fft, &padded_win, device)?;
-        Ok(Self { cfg, fb, stft_kernel, device: device.clone() })
+        Ok(Self {
+            cfg,
+            fb,
+            stft_kernel,
+            device: device.clone(),
+        })
     }
 
     /// Number of mel bins (encoder `feat_in`).
@@ -246,7 +253,9 @@ impl FilterbankFeatures {
         let l = y.dim(1)?;
         // pad_mode="constant": center_pad zeros each side (n_fft/2 for center=True, 0
         // for center=False).
-        let xin = y.reshape((1, 1, l))?.pad_with_zeros(2, center_pad, center_pad)?;
+        let xin = y
+            .reshape((1, 1, l))?
+            .pad_with_zeros(2, center_pad, center_pad)?;
         // _fft_r2c as a strided DFT-basis convolution → (1, 2·freq, T).
         let out = xin.conv1d(&self.stft_kernel, 0, hop, 1, 1)?;
         let re = out.narrow(1, 0, freq)?; // (1, freq, T)
@@ -281,7 +290,10 @@ impl FilterbankFeatures {
         let dev = &self.device;
         let n_fft = self.cfg.n_fft;
         // signal → (L,) f32 on the model device.
-        let x = samples.flatten_all()?.to_dtype(DType::F32)?.to_device(dev)?;
+        let x = samples
+            .flatten_all()?
+            .to_dtype(DType::F32)?
+            .to_device(dev)?;
         // `seq_len_time` in Python: the valid sample count = L for a single clip; it is
         // the preemphasis timemask boundary (NOT shifted by the exact_pad padding).
         let l = x.dim(0)?;
@@ -301,8 +313,9 @@ impl FilterbankFeatures {
         let y = if self.cfg.preemph != 0.0 && li > 1 {
             let pre = self.cfg.preemph;
             let head = x_in.narrow(1, 0, 1)?; // x_in[0]
-            // x_in[1:] - preemph·x_in[:-1] (scalar via affine; candle has f64·Tensor).
-            let tail = (x_in.narrow(1, 1, li - 1)? - x_in.narrow(1, 0, li - 1)?.affine(pre, 0.0)?)?;
+                                              // x_in[1:] - preemph·x_in[:-1] (scalar via affine; candle has f64·Tensor).
+            let tail =
+                (x_in.narrow(1, 1, li - 1)? - x_in.narrow(1, 0, li - 1)?.affine(pre, 0.0)?)?;
             Tensor::cat(&[&head, &tail], 1)? // (1, li)
         } else {
             x_in
@@ -351,7 +364,11 @@ impl FilterbankFeatures {
         if self.cfg.pad_to > 0 {
             let rem = t % self.cfg.pad_to;
             if rem != 0 {
-                let padding = Tensor::zeros((self.cfg.nfilt, self.cfg.pad_to - rem), mel.dtype(), &self.device)?;
+                let padding = Tensor::zeros(
+                    (self.cfg.nfilt, self.cfg.pad_to - rem),
+                    mel.dtype(),
+                    &self.device,
+                )?;
                 mel = Tensor::cat(&[&mel, &padding], 1)?;
             }
         }
@@ -421,7 +438,8 @@ fn normalize_batch(x: &Tensor, valid: usize, kind: &NormalizeType) -> Result<Ten
         NormalizeType::Fixed { mean, std } => {
             // Python: (x - fixed_mean[:,None]) / fixed_std[:,None], per feature.
             let nfilt = x.dim(0)?;
-            let mean = Tensor::from_vec(mean.clone(), (nfilt, 1), x.device())?.to_dtype(x.dtype())?;
+            let mean =
+                Tensor::from_vec(mean.clone(), (nfilt, 1), x.device())?.to_dtype(x.dtype())?;
             let std = Tensor::from_vec(std.clone(), (nfilt, 1), x.device())?.to_dtype(x.dtype())?;
             x.broadcast_sub(&mean)?.broadcast_div(&std)
         }
@@ -473,7 +491,9 @@ fn analysis_window(kind: WindowKind, n: usize) -> Vec<f32> {
                 WindowKind::Ones => 1.0,
                 WindowKind::Hann => 0.5 - 0.5 * (2.0 * PI * x / nn).cos(),
                 WindowKind::Hamming => 0.54 - 0.46 * (2.0 * PI * x / nn).cos(),
-                WindowKind::Blackman => 0.42 - 0.5 * (2.0 * PI * x / nn).cos() + 0.08 * (4.0 * PI * x / nn).cos(),
+                WindowKind::Blackman => {
+                    0.42 - 0.5 * (2.0 * PI * x / nn).cos() + 0.08 * (4.0 * PI * x / nn).cos()
+                }
                 WindowKind::Bartlett => 1.0 - (2.0 * x / nn - 1.0).abs(),
             };
             w as f32
@@ -496,7 +516,10 @@ pub struct AudioPreprocessor {
 impl AudioPreprocessor {
     /// `AudioPreprocessor.__init__(win_length, hop_length)` (py L34-58).
     pub fn new(win_length: usize, hop_length: usize) -> Self {
-        Self { win_length, hop_length }
+        Self {
+            win_length,
+            hop_length,
+        }
     }
 
     /// `torch_windows[kind](win_length)` — the length-`win_length` analysis window.
@@ -525,8 +548,14 @@ impl AudioPreprocessor {
     /// extractor. The base has no featurizer; concrete preprocessors
     /// ([`AudioToMelSpectrogramPreprocessor::get_features`]) implement it. Calling
     /// it on the base bails, mirroring Python's `NotImplementedError` contract.
-    pub fn get_features(&self, _input_signal: &Tensor, _length: Option<&Tensor>) -> Result<(Tensor, Option<Tensor>)> {
-        candle_core::bail!("AudioPreprocessor::get_features is abstract; use a concrete preprocessor")
+    pub fn get_features(
+        &self,
+        _input_signal: &Tensor,
+        _length: Option<&Tensor>,
+    ) -> Result<(Tensor, Option<Tensor>)> {
+        candle_core::bail!(
+            "AudioPreprocessor::get_features is abstract; use a concrete preprocessor"
+        )
     }
 }
 
@@ -581,7 +610,11 @@ impl AudioToMelSpectrogramPreprocessor {
     /// `get_features` → `self.featurizer(input_signal, length)`. The Rust mel
     /// featurizer returns the features; per-clip valid length is tracked by the
     /// caller (`ChatState`), so the length slot is `None` here.
-    pub fn get_features(&self, input_signal: &Tensor, _length: Option<&Tensor>) -> Result<(Tensor, Option<Tensor>)> {
+    pub fn get_features(
+        &self,
+        input_signal: &Tensor,
+        _length: Option<&Tensor>,
+    ) -> Result<(Tensor, Option<Tensor>)> {
         Ok((self.featurizer.forward(input_signal)?, None))
     }
 
@@ -589,7 +622,11 @@ impl AudioToMelSpectrogramPreprocessor {
     /// applies its f32 input guard ([`AudioPreprocessor::forward`]), delegates to
     /// the abstract `get_features` (here the mel featurizer), then casts the
     /// features back to the `dtype_sentinel_tensor` dtype (f32).
-    pub fn forward(&self, input_signal: &Tensor, length: Option<&Tensor>) -> Result<(Tensor, Option<Tensor>)> {
+    pub fn forward(
+        &self,
+        input_signal: &Tensor,
+        length: Option<&Tensor>,
+    ) -> Result<(Tensor, Option<Tensor>)> {
         let guarded = self.base.forward(input_signal)?;
         let (signal, len) = self.get_features(&guarded, length)?;
         Ok((signal.to_dtype(DType::F32)?, len))
@@ -608,20 +645,34 @@ mod tests {
         // here, so this DETECTS that regression. Golden = the actual Python output.
         let dev = Device::Cpu;
         let x = Tensor::from_vec(
-            vec![1.0f32, 5.0, -2.0, 0.5, 9.0, 0.0, -3.0, 2.0, 4.0, 1.0, 7.0, -1.0],
+            vec![
+                1.0f32, 5.0, -2.0, 0.5, 9.0, 0.0, -3.0, 2.0, 4.0, 1.0, 7.0, -1.0,
+            ],
             (4, 3),
             &dev,
         )
         .unwrap();
-        let got = normalize_batch(&x, 1, &NormalizeType::PerFeature).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let got = normalize_batch(&x, 1, &NormalizeType::PerFeature)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
         // From: python -c "normalize_batch(x[None], tensor([1]), 'per_feature')"
         let want = [
-            0.0f32, 400000.0, -300000.0, 0.0, 850000.0, -50000.0, 0.0, 500000.0, 700000.0, 0.0, 600000.0, -200000.0,
+            0.0f32, 400000.0, -300000.0, 0.0, 850000.0, -50000.0, 0.0, 500000.0, 700000.0, 0.0,
+            600000.0, -200000.0,
         ];
         for (g, w) in got.iter().zip(want.iter()) {
-            assert!(g.is_finite(), "one-frame normalize produced non-finite: {got:?}");
+            assert!(
+                g.is_finite(),
+                "one-frame normalize produced non-finite: {got:?}"
+            );
             let rel = (g - w).abs() / w.abs().max(1.0);
-            assert!(rel < 1e-4, "normalize one-frame diverges from Python: got {got:?} want {want:?}");
+            assert!(
+                rel < 1e-4,
+                "normalize one-frame diverges from Python: got {got:?} want {want:?}"
+            );
         }
     }
 
@@ -630,14 +681,21 @@ mod tests {
         // valid>=2 keeps the ddof=1 path (regression guard for the one-frame branch).
         let dev = Device::Cpu;
         let x = Tensor::from_vec(vec![1.0f32, 3.0, 2.0, 4.0], (2, 2), &dev).unwrap();
-        let out = normalize_batch(&x, 2, &NormalizeType::PerFeature).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let out = normalize_batch(&x, 2, &NormalizeType::PerFeature)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
         assert!(out.iter().all(|v| v.is_finite()));
     }
 
     // The newly-translated normalize branches, each vs actual Python output.
     fn x43() -> Tensor {
         Tensor::from_vec(
-            vec![1.0f32, 5.0, -2.0, 0.5, 9.0, 0.0, -3.0, 2.0, 4.0, 1.0, 7.0, -1.0],
+            vec![
+                1.0f32, 5.0, -2.0, 0.5, 9.0, 0.0, -3.0, 2.0, 4.0, 1.0, 7.0, -1.0,
+            ],
             (4, 3),
             &Device::Cpu,
         )
@@ -646,31 +704,67 @@ mod tests {
 
     #[test]
     fn normalize_all_features_matches_python() {
-        let got = normalize_batch(&x43(), 3, &NormalizeType::AllFeatures).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let got = normalize_batch(&x43(), 3, &NormalizeType::AllFeatures)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
         // normalize_batch(x[None], tensor([3]), "all_features")
         let want = [
-            -0.26375f32, 0.8371, -1.08938, -0.40135, 1.93795, -0.53896, -1.3646, 0.01147, 0.56189, -0.26375, 1.38753,
+            -0.26375f32,
+            0.8371,
+            -1.08938,
+            -0.40135,
+            1.93795,
+            -0.53896,
+            -1.3646,
+            0.01147,
+            0.56189,
+            -0.26375,
+            1.38753,
             -0.81417,
         ];
         for (g, w) in got.iter().zip(want.iter()) {
-            assert!((g - w).abs() < 1e-4, "all_features vs Python: got {got:?} want {want:?}");
+            assert!(
+                (g - w).abs() < 1e-4,
+                "all_features vs Python: got {got:?} want {want:?}"
+            );
         }
     }
 
     #[test]
     fn normalize_fixed_matches_python() {
-        let kind = NormalizeType::Fixed { mean: vec![0.0, 1.0, 2.0, 3.0], std: vec![1.0, 2.0, 4.0, 0.5] };
-        let got = normalize_batch(&x43(), 3, &kind).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let kind = NormalizeType::Fixed {
+            mean: vec![0.0, 1.0, 2.0, 3.0],
+            std: vec![1.0, 2.0, 4.0, 0.5],
+        };
+        let got = normalize_batch(&x43(), 3, &kind)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
         // normalize_batch(x[None], tensor([3]), {"fixed_mean":[0,1,2,3],"fixed_std":[1,2,4,.5]})
-        let want = [1.0f32, 5.0, -2.0, -0.25, 4.0, -0.5, -1.25, 0.0, 0.5, -4.0, 8.0, -8.0];
+        let want = [
+            1.0f32, 5.0, -2.0, -0.25, 4.0, -0.5, -1.25, 0.0, 0.5, -4.0, 8.0, -8.0,
+        ];
         for (g, w) in got.iter().zip(want.iter()) {
-            assert!((g - w).abs() < 1e-4, "fixed vs Python: got {got:?} want {want:?}");
+            assert!(
+                (g - w).abs() < 1e-4,
+                "fixed vs Python: got {got:?} want {want:?}"
+            );
         }
     }
 
     #[test]
     fn normalize_none_is_identity() {
-        let got = normalize_batch(&x43(), 3, &NormalizeType::None).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let got = normalize_batch(&x43(), 3, &NormalizeType::None)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
         assert_eq!(got, x43().flatten_all().unwrap().to_vec1::<f32>().unwrap());
     }
 }

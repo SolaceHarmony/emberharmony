@@ -51,7 +51,7 @@ impl PreprocessorConfig {
             n_window_stride: (self.window_stride * self.sample_rate as f64).round() as usize,
             n_fft: self.n_fft,
             nfilt: self.features,
-            preemph: 0.97,            // FilterbankFeatures default
+            preemph: 0.97, // FilterbankFeatures default
             log_zero_guard_value: 2f64.powi(-24),
             mag_power: 2.0,
             pad_to: self.pad_to,
@@ -92,7 +92,13 @@ impl LFM2AudioProcessor {
         mimi: Option<Box<dyn AudioDetokenizer>>,
         device: Device,
     ) -> Self {
-        Self { tokenizer, audio, audio_out, mimi, device }
+        Self {
+            tokenizer,
+            audio,
+            audio_out,
+            mimi,
+            device,
+        }
     }
 
     /// PORT: `LFM2AudioProcessor.from_pretrained(repo_id, *, device)` (py 56).
@@ -112,7 +118,8 @@ impl LFM2AudioProcessor {
     }
 
     pub fn load_tokenizer(dir: &Path) -> Result<Tokenizer> {
-        Tokenizer::from_file(dir.join("tokenizer.json")).map_err(|e| candle_core::Error::Msg(format!("tokenizer: {e}")))
+        Tokenizer::from_file(dir.join("tokenizer.json"))
+            .map_err(|e| candle_core::Error::Msg(format!("tokenizer: {e}")))
     }
 
     /// Encode text without auto special tokens → token id row `(1, n)`.
@@ -191,7 +198,8 @@ impl<'a> ChatState<'a> {
             // cat'd) on the first add — so no zero-size buffer is ever created.
             audio_in: Tensor::zeros((nfilt, 1), candle_core::DType::F32, dev)?.narrow(1, 0, 0)?,
             audio_in_lens: Tensor::zeros((1,), candle_core::DType::I64, dev)?.narrow(0, 0, 0)?,
-            audio_out: Tensor::zeros((codebooks, 1), candle_core::DType::I64, dev)?.narrow(1, 0, 0)?,
+            audio_out: Tensor::zeros((codebooks, 1), candle_core::DType::I64, dev)?
+                .narrow(1, 0, 0)?,
             modality_flag,
         })
     }
@@ -224,13 +232,22 @@ impl<'a> ChatState<'a> {
                 audio_out.dim(0)?
             )));
         }
-        Ok(Self { proc, codebooks, text, audio_in, audio_in_lens, audio_out, modality_flag })
+        Ok(Self {
+            proc,
+            codebooks,
+            text,
+            audio_in,
+            audio_in_lens,
+            audio_out,
+            modality_flag,
+        })
     }
 
     pub fn add_text(&mut self, text: &str) -> Result<()> {
         let new_text = self.proc.encode(text)?;
         let n = new_text.dim(1)?;
-        let new_mod = Tensor::from_vec(vec![LFMModality::Text as i64; n], (1, n), &self.proc.device)?;
+        let new_mod =
+            Tensor::from_vec(vec![LFMModality::Text as i64; n], (1, n), &self.proc.device)?;
         self.text = Tensor::cat(&[&self.text, &new_text], 1)?;
         self.modality_flag = Tensor::cat(&[&self.modality_flag, &new_mod], 1)?;
         Ok(())
@@ -243,7 +260,11 @@ impl<'a> ChatState<'a> {
         let new_audio_in = mel.i(0)?; // (nfilt, frames)
         let frames = new_audio_in.dim(1)?;
         let emb_len = mel2emb_len(frames as i64) as usize;
-        let new_mod = Tensor::from_vec(vec![LFMModality::AudioIn as i64; emb_len], (1, emb_len), &self.proc.device)?;
+        let new_mod = Tensor::from_vec(
+            vec![LFMModality::AudioIn as i64; emb_len],
+            (1, emb_len),
+            &self.proc.device,
+        )?;
         let new_len = Tensor::from_vec(vec![frames as i64], (1,), &self.proc.device)?;
         // Replace the empty placeholder on the first add (avoids cat-ing a
         // zero-length Metal view); otherwise append.
@@ -316,10 +337,22 @@ impl<'a> ChatState<'a> {
     /// Mirrors the Python `ChatState.append` invariants: `text` is one row,
     /// `audio_out` has `codebooks` rows, `modality_flag` is one row, and the flag
     /// count equals `text_len + audio_out_len` (the scatter depends on it).
-    pub fn append(&mut self, text: &Tensor, audio_out: &Tensor, modality_flag: &Tensor) -> Result<()> {
-        let mf = if modality_flag.rank() == 1 { modality_flag.unsqueeze(0)? } else { modality_flag.clone() };
+    pub fn append(
+        &mut self,
+        text: &Tensor,
+        audio_out: &Tensor,
+        modality_flag: &Tensor,
+    ) -> Result<()> {
+        let mf = if modality_flag.rank() == 1 {
+            modality_flag.unsqueeze(0)?
+        } else {
+            modality_flag.clone()
+        };
         if text.dim(0)? != 1 {
-            return Err(candle_core::Error::Msg(format!("append: text must be 1 row, got {}", text.dim(0)?)));
+            return Err(candle_core::Error::Msg(format!(
+                "append: text must be 1 row, got {}",
+                text.dim(0)?
+            )));
         }
         if audio_out.dim(0)? != self.codebooks {
             return Err(candle_core::Error::Msg(format!(
@@ -329,7 +362,9 @@ impl<'a> ChatState<'a> {
             )));
         }
         if mf.dim(0)? != 1 {
-            return Err(candle_core::Error::Msg("append: modality_flag must be 1 row".into()));
+            return Err(candle_core::Error::Msg(
+                "append: modality_flag must be 1 row".into(),
+            ));
         }
         let (n_text, n_audio, n_flag) = (text.dim(1)?, audio_out.dim(1)?, mf.dim(1)?);
         if n_flag != n_text + n_audio {
@@ -340,7 +375,11 @@ impl<'a> ChatState<'a> {
         // The state carries I64 (torch.long); cast the incoming ids to match (the
         // generation loop hands back U32 sampled tokens). Faithful — torch keeps long.
         let i64t = candle_core::DType::I64;
-        let (text, audio_out, mf) = (text.to_dtype(i64t)?, audio_out.to_dtype(i64t)?, mf.to_dtype(i64t)?);
+        let (text, audio_out, mf) = (
+            text.to_dtype(i64t)?,
+            audio_out.to_dtype(i64t)?,
+            mf.to_dtype(i64t)?,
+        );
         self.text = Tensor::cat(&[&self.text, &text], 1)?;
         // Replace the empty placeholder on the first append (Metal: no zero-len cat).
         self.audio_out = if self.audio_out.dim(1)? == 0 {
@@ -427,7 +466,13 @@ impl LFM2AudioProcessor {
 impl ChatState<'_> {
     /// `model_inputs` — the model-input field names (Python `model_inputs`).
     pub fn model_inputs(&self) -> [&'static str; 5] {
-        ["text", "audio_in", "audio_in_lens", "audio_out", "modality_flag"]
+        [
+            "text",
+            "audio_in",
+            "audio_in_lens",
+            "audio_out",
+            "modality_flag",
+        ]
     }
 
     /// `__len__` → number of model-input fields.
@@ -456,7 +501,13 @@ impl ChatState<'_> {
             "modality_flag" => Ok(&self.modality_flag),
             other => Err(candle_core::Error::Msg(format!(
                 "expected one of {:?}, got {other}.",
-                ["text", "audio_in", "audio_in_lens", "audio_out", "modality_flag"]
+                [
+                    "text",
+                    "audio_in",
+                    "audio_in_lens",
+                    "audio_out",
+                    "modality_flag"
+                ]
             ))),
         }
     }

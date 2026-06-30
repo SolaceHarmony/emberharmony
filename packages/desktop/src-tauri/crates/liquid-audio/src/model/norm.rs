@@ -21,7 +21,11 @@ pub struct LayerNorm {
 
 impl LayerNorm {
     pub fn new(dim: usize, eps: f64, vb: VarBuilder) -> Result<Self> {
-        Ok(Self { weight: vb.get(dim, "weight")?, bias: vb.get(dim, "bias")?, eps: eps as f32 })
+        Ok(Self {
+            weight: vb.get(dim, "weight")?,
+            bias: vb.get(dim, "bias")?,
+            eps: eps as f32,
+        })
     }
 }
 

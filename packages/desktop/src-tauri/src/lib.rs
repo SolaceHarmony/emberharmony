@@ -18,10 +18,10 @@ use std::{
     time::{Duration, Instant},
 };
 use tauri::{AppHandle, LogicalSize, Manager, RunEvent, State, WebviewWindowBuilder};
-#[cfg(any(target_os = "linux", all(debug_assertions, windows)))]
-use tauri_plugin_deep_link::DeepLinkExt;
 #[cfg(windows)]
 use tauri_plugin_decorum::WebviewWindowExt;
+#[cfg(any(target_os = "linux", all(debug_assertions, windows)))]
+use tauri_plugin_deep_link::DeepLinkExt;
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogResult};
 use tauri_plugin_shell::process::{CommandChild, CommandEvent};
 use tauri_plugin_store::StoreExt;
@@ -33,19 +33,19 @@ const SETTINGS_STORE: &str = "emberharmony.settings.dat";
 const DEFAULT_SERVER_URL_KEY: &str = "defaultServerUrl";
 
 #[derive(Clone, serde::Serialize)]
-struct ServerReadyData {
-    url: String,
-    password: Option<String>,
+pub(crate) struct ServerReadyData {
+    pub(crate) url: String,
+    pub(crate) password: Option<String>,
 }
 
 #[derive(Clone)]
-struct ServerState {
+pub struct ServerState {
     child: Arc<Mutex<Option<CommandChild>>>,
-    status: future::Shared<oneshot::Receiver<Result<ServerReadyData, String>>>,
+    pub(crate) status: future::Shared<oneshot::Receiver<Result<ServerReadyData, String>>>,
 }
 
 impl ServerState {
-    pub fn new(
+    pub(crate) fn new(
         child: Option<CommandChild>,
         status: oneshot::Receiver<Result<ServerReadyData, String>>,
     ) -> Self {
@@ -55,7 +55,7 @@ impl ServerState {
         }
     }
 
-    pub fn set_child(&self, child: Option<CommandChild>) {
+    pub(crate) fn set_child(&self, child: Option<CommandChild>) {
         *self.child.lock().unwrap() = child;
     }
 }
@@ -181,7 +181,10 @@ fn spawn_sidecar(app: &AppHandle, hostname: &str, port: u32, password: &str) -> 
             println!("voice runtime: {}", dir.display());
             command = command.env("EMBERHARMONY_VOICE_RUNTIME_DIR", dir);
         }
-        Ok(dir) => eprintln!("voice runtime not bundled at {} — voice disabled", dir.display()),
+        Ok(dir) => eprintln!(
+            "voice runtime not bundled at {} — voice disabled",
+            dir.display()
+        ),
         Err(e) => eprintln!("could not resolve voice runtime resource: {e}"),
     }
 
@@ -309,10 +312,13 @@ pub fn run() {
             set_default_server_url,
             markdown::parse_markdown_command,
             settings::voice_settings_get,
+            settings::voice_settings_state,
             settings::voice_settings_set,
             voice::control::voice_status,
             voice::control::voice_start,
-            voice::control::voice_stop
+            voice::control::voice_stop,
+            voice::control::voice_interrupt,
+            voice::control::voice_set_mic_enabled
         ])
         .setup(move |app| {
             #[cfg(any(target_os = "linux", all(debug_assertions, windows)))]
@@ -322,6 +328,7 @@ pub fn run() {
 
             // Initialize log state
             app.manage(LogState(Arc::new(Mutex::new(VecDeque::new()))));
+            app.manage(voice::runtime::VoiceRuntime::default());
 
             #[cfg(windows)]
             app.manage(JobObjectState::new());

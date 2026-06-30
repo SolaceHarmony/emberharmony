@@ -26,6 +26,8 @@
 use std::path::Path;
 
 use candle_core::{DType, Device, Tensor};
+use liquid_audio::moshi::demo::chat::decode_audio_reply;
+use liquid_audio::moshi::models::MimiModel;
 use liquid_audio::{from_pretrained, ChatState, GenParams, GenToken, LFMModality};
 
 type Res<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -116,19 +118,6 @@ fn write_wav_mono_f32(path: &Path, samples: &[f32], rate: u32) -> Res<()> {
     Ok(())
 }
 
-/// Stack a slice of audio frames into `(1, codebooks, k)` column-major (each frame is a
-/// column) for `processor.decode` — the Rust form of `torch.stack(frames, 1).unsqueeze(0)`.
-fn frames_to_codes(frames: &[Vec<u32>], codebooks: usize, device: &Device) -> Res<Tensor> {
-    let k = frames.len();
-    let mut flat = Vec::with_capacity(codebooks * k);
-    for c in 0..codebooks {
-        for f in frames {
-            flat.push(f[c]);
-        }
-    }
-    Ok(Tensor::from_vec(flat, (1, codebooks, k), device)?)
-}
-
 fn main() -> Res<()> {
     let model_ref = std::env::var("LFM_MODEL")
         .or_else(|_| std::env::var("LFM_MODEL_DIR"))
@@ -140,19 +129,30 @@ fn main() -> Res<()> {
         )
         .into()
     });
-    let max_new_tokens: usize =
-        std::env::var("LFM_MAX_TOKENS").ok().and_then(|s| s.parse().ok()).unwrap_or(512);
+    let max_new_tokens: usize = std::env::var("LFM_MAX_TOKENS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(512);
     let (device, dtype) = select_device()?;
 
     eprintln!("[load] resolving model `{model_ref}`…");
     let dir = liquid_audio::get_model_dir(&model_ref, None)?;
     let cfg: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(dir.join("config.json"))?)?;
-    let codebooks = cfg["codebooks"].as_u64().ok_or("config.json: missing `codebooks`")? as usize;
+    let codebooks = cfg["codebooks"]
+        .as_u64()
+        .ok_or("config.json: missing `codebooks`")? as usize;
 
-    eprintln!("[load] model + processor from {} ({dtype:?}, {device:?})…", dir.display());
+    eprintln!(
+        "[load] model + processor from {} ({dtype:?}, {device:?})…",
+        dir.display()
+    );
     let t0 = std::time::Instant::now();
     let (model, proc) = from_pretrained(&dir, dtype, &device)?;
+    let mimi = MimiModel::new(
+        proc.mimi()
+            .ok_or("Mimi codec not loaded — required by liquid_audio/demo/chat.py")?,
+    );
     eprintln!("[load] done in {:.1}s.", t0.elapsed().as_secs_f32());
 
     // README params: text greedy, audio sampled (temp 1.0 / top-k 4). Greedy audio is degenerate.
@@ -201,20 +201,27 @@ fn main() -> Res<()> {
     })?;
     let secs = tg.elapsed().as_secs_f32();
     let n_tok = text_ids.len() + audio_frames.len();
-    eprintln!("[turn 1] {n_tok} tokens in {secs:.1}s = {:.1} tok/s", n_tok as f32 / secs.max(1e-6));
+    eprintln!(
+        "[turn 1] {n_tok} tokens in {secs:.1}s = {:.1} tok/s",
+        n_tok as f32 / secs.max(1e-6)
+    );
 
     let text1 = proc.text().decode(&text_ids, true)?;
-    println!("\n=== TURN 1 TEXT ({} tokens) ===\n{text1}\n", text_ids.len());
+    println!(
+        "\n=== TURN 1 TEXT ({} tokens) ===\n{text1}\n",
+        text_ids.len()
+    );
 
-    // Mimi-decode, dropping the LAST (EOAudio) frame — README `torch.stack(audio_out[:-1], 1)`.
-    if audio_frames.len() > 1 {
-        let keep = &audio_frames[..audio_frames.len() - 1];
-        let codes = frames_to_codes(keep, codebooks, &device)?;
-        let wav = proc.decode(&codes)?;
+    // Mimi-decode, dropping the LAST (EOAudio) frame — demo/chat.py `mimi.decode(...)`.
+    if let Some(wav) = decode_audio_reply(&mimi, &audio_frames, codebooks, &device)? {
         let wav_v = wav.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
-        let out_rate = proc.mimi_sample_rate().unwrap_or(24_000);
+        let out_rate = mimi.sample_rate();
         write_wav_mono_f32(Path::new("answer1.wav"), &wav_v, out_rate)?;
-        eprintln!("[turn 1] {} frames → answer1.wav ({:.2}s)", keep.len(), wav_v.len() as f32 / out_rate as f32);
+        eprintln!(
+            "[turn 1] {} frames → answer1.wav ({:.2}s)",
+            audio_frames.len() - 1,
+            wav_v.len() as f32 / out_rate as f32
+        );
     } else {
         eprintln!("[turn 1] no audio frames generated");
     }
@@ -222,7 +229,11 @@ fn main() -> Res<()> {
     // Append the generated tokens to history — the discrete audio_out → context path.
     // text (1, n_text), audio_out (codebooks, n_audio) FULL incl. EOAudio, modality (1, n_text+n_audio).
     let n_text = text_ids.len();
-    let text_t = Tensor::from_vec(text_ids.iter().map(|&i| i as i64).collect::<Vec<_>>(), (1, n_text), &device)?;
+    let text_t = Tensor::from_vec(
+        text_ids.iter().map(|&i| i as i64).collect::<Vec<_>>(),
+        (1, n_text),
+        &device,
+    )?;
     let n_audio = audio_frames.len();
     let mut aflat = Vec::with_capacity(codebooks * n_audio);
     for c in 0..codebooks {
@@ -250,20 +261,29 @@ fn main() -> Res<()> {
     })?;
     let secs2 = tg2.elapsed().as_secs_f32();
     let n_tok2 = text_ids2.len() + audio_frames2.len();
-    eprintln!("[turn 2] {n_tok2} tokens in {secs2:.1}s = {:.1} tok/s", n_tok2 as f32 / secs2.max(1e-6));
+    eprintln!(
+        "[turn 2] {n_tok2} tokens in {secs2:.1}s = {:.1} tok/s",
+        n_tok2 as f32 / secs2.max(1e-6)
+    );
 
     let text2 = proc.text().decode(&text_ids2, true)?;
-    println!("\n=== TURN 2 TEXT ({} tokens) ===\n{text2}\n", text_ids2.len());
-    println!("(expect a CHAIRS slogan — proves turn 2 was conditioned on turn 1's appended audio)\n");
+    println!(
+        "\n=== TURN 2 TEXT ({} tokens) ===\n{text2}\n",
+        text_ids2.len()
+    );
+    println!(
+        "(expect a CHAIRS slogan — proves turn 2 was conditioned on turn 1's appended audio)\n"
+    );
 
-    if audio_frames2.len() > 1 {
-        let keep = &audio_frames2[..audio_frames2.len() - 1];
-        let codes = frames_to_codes(keep, codebooks, &device)?;
-        let wav = proc.decode(&codes)?;
+    if let Some(wav) = decode_audio_reply(&mimi, &audio_frames2, codebooks, &device)? {
         let wav_v = wav.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
-        let out_rate = proc.mimi_sample_rate().unwrap_or(24_000);
+        let out_rate = mimi.sample_rate();
         write_wav_mono_f32(Path::new("answer2.wav"), &wav_v, out_rate)?;
-        eprintln!("[turn 2] {} frames → answer2.wav ({:.2}s)", keep.len(), wav_v.len() as f32 / out_rate as f32);
+        eprintln!(
+            "[turn 2] {} frames → answer2.wav ({:.2}s)",
+            audio_frames2.len() - 1,
+            wav_v.len() as f32 / out_rate as f32
+        );
     } else {
         eprintln!("[turn 2] no audio frames generated");
     }

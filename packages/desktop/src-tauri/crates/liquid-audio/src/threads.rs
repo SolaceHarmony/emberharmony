@@ -22,7 +22,10 @@
 ///    performance cores (`hw.perflevel0.physicalcpu`); elsewhere physical cores.
 pub fn intraop_default_num_threads() -> usize {
     for var in ["OMP_NUM_THREADS", "MKL_NUM_THREADS", "RAYON_NUM_THREADS"] {
-        if let Some(n) = std::env::var(var).ok().and_then(|s| s.parse::<usize>().ok()) {
+        if let Some(n) = std::env::var(var)
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+        {
             if n > 0 {
                 return n;
             }
@@ -68,7 +71,9 @@ pub fn configure_intraop_threads() -> usize {
     let n = intraop_default_num_threads();
     // `build_global` errors if the global pool already exists — that's fine, it means
     // someone (or a previous call) already sized it; we just report our intended count.
-    let _ = rayon::ThreadPoolBuilder::new().num_threads(n).build_global();
+    let _ = rayon::ThreadPoolBuilder::new()
+        .num_threads(n)
+        .build_global();
     n
 }
 
@@ -93,7 +98,11 @@ mod tests {
         assert!(n >= 1, "must pick at least one thread");
         // Should never exceed the logical core count, and on Apple Silicon should be
         // the performance-core subset (≤ physical ≤ logical).
-        assert!(n <= num_cpus::get(), "n={n} exceeds logical cores {}", num_cpus::get());
+        assert!(
+            n <= num_cpus::get(),
+            "n={n} exceeds logical cores {}",
+            num_cpus::get()
+        );
         eprintln!(
             "intraop threads = {n} (physical {}, logical {})",
             num_cpus::get_physical(),

@@ -37,9 +37,13 @@ mod tests {
     #[test]
     fn matches_manual_nll() {
         // 2 rows, 3 classes; labels [0, 2].
-        let logits = Tensor::from_vec(vec![2.0f32, 1.0, 0.1, 0.0, 0.0, 3.0], (2, 3), &Device::Cpu).unwrap();
+        let logits =
+            Tensor::from_vec(vec![2.0f32, 1.0, 0.1, 0.0, 0.0, 3.0], (2, 3), &Device::Cpu).unwrap();
         let labels = Tensor::from_vec(vec![0u32, 2u32], (2,), &Device::Cpu).unwrap();
-        let loss: Vec<f32> = cross_entropy_none(&logits, &labels).unwrap().to_vec1().unwrap();
+        let loss: Vec<f32> = cross_entropy_none(&logits, &labels)
+            .unwrap()
+            .to_vec1()
+            .unwrap();
         let nll = |v: &[f32], k: usize| {
             let m = v.iter().cloned().fold(f32::MIN, f32::max);
             let denom: f32 = v.iter().map(|x| (x - m).exp()).sum();
@@ -53,6 +57,12 @@ mod tests {
     fn empty_is_empty() {
         let logits = Tensor::zeros((0, 5), DType::F32, &Device::Cpu).unwrap();
         let labels = Tensor::zeros((0,), DType::U32, &Device::Cpu).unwrap();
-        assert_eq!(cross_entropy_none(&logits, &labels).unwrap().dim(0).unwrap(), 0);
+        assert_eq!(
+            cross_entropy_none(&logits, &labels)
+                .unwrap()
+                .dim(0)
+                .unwrap(),
+            0
+        );
     }
 }

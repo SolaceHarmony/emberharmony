@@ -9,7 +9,7 @@ import { useLanguage } from "@/context/language"
 import { useGlobalSDK } from "@/context/global-sdk"
 import {
   defaultVoiceSettings,
-  getVoiceSettings,
+  getVoiceSettingsState,
   getVoiceStatus,
   isDesktop,
   setVoiceSettings,
@@ -34,7 +34,7 @@ export const SettingsVoice: Component = () => {
       .then((x) => x.data)
       .catch(() => undefined),
   )
-  const [tauriVoice, { refetch: refetchTauri }] = createResource(getVoiceSettings)
+  const [tauriVoice, { refetch: refetchTauri, mutate: setTauriVoice }] = createResource(getVoiceSettingsState)
   const [voiceStatus, { refetch: refetchStatus }] = createResource(getVoiceStatus)
 
   const [url, setUrl] = createSignal<string | undefined>(undefined)
@@ -45,42 +45,85 @@ export const SettingsVoice: Component = () => {
   const [override, setOverride] = createSignal<VoiceProvider>()
 
   const effectiveUrl = () => url() ?? config()?.url ?? ""
-  const lfm2 = (): Lfm2Settings => tauriVoice()?.lfm2 ?? defaultVoiceSettings.lfm2
+  const voice = (): VoiceSettings => tauriVoice()?.settings ?? defaultVoiceSettings
+  const lfm2 = (): Lfm2Settings => voice().lfm2
   const livekitConfigured = () => Boolean(config()?.url || config()?.credentials?.livekit)
 
   // Effective provider: an explicit pick wins; otherwise the stored provider, and
   // as a migration nicety existing LiveKit users default to "livekit" so their
-  // config stays visible even before they touch the new switch.
+  // config stays visible only before the native voice setting exists.
   const provider = (): VoiceProvider => {
     const picked = override()
     if (picked) return picked
-    const stored = tauriVoice()?.provider
-    if (stored && stored !== "off") return stored
+    const stored = tauriVoice()
+    if (stored?.stored) return stored.settings.provider
     if (livekitConfigured()) return "livekit"
-    return stored ?? "off"
+    return stored?.settings.provider ?? "off"
+  }
+
+  const enabled = () => provider() !== "off"
+  const defaultProvider = (): Exclude<VoiceProvider, "off"> => {
+    const stored = voice().provider
+    if (stored === "lfm2" || stored === "livekit") return stored
+    if (desktop) return "lfm2"
+    return "livekit"
+  }
+  const activeProvider = (): Exclude<VoiceProvider, "off"> => {
+    const current = provider()
+    if (current === "lfm2" || current === "livekit") return current
+    return defaultProvider()
   }
 
   async function changeProvider(next: VoiceProvider) {
+    const previous = provider()
     setOverride(next)
-    const base = tauriVoice() ?? defaultVoiceSettings
-    await setVoiceSettings({ ...base, provider: next }).catch((err) =>
-      showToast({
-        title: language.t("settings.voice.toast.saveFailed"),
-        description: err instanceof Error ? err.message : String(err),
-      }),
-    )
+    const base = voice()
+    const settings = { ...base, provider: next }
+    const ok = await setVoiceSettings(settings)
+      .then(() => {
+        setTauriVoice({ settings, stored: true })
+        setOverride(undefined)
+        return true
+      })
+      .catch((err) => {
+        setOverride(previous)
+        showToast({
+          title: language.t("settings.voice.toast.saveFailed"),
+          description: err instanceof Error ? err.message : String(err),
+        })
+        return false
+      })
     refetchTauri()
     refetchStatus()
+    return ok
+  }
+
+  async function toggleVoice(checked: boolean) {
+    const previous = provider()
+    const next = checked ? activeProvider() : "off"
+    if (!(await changeProvider(next))) return
+    if (previous === "livekit" && next !== "livekit") await update({ disabled: true })
+    if (next === "livekit") await update({ disabled: false })
+  }
+
+  async function selectProvider(next: Exclude<VoiceProvider, "off">) {
+    const previous = provider()
+    if (!(await changeProvider(next))) return
+    if (previous === "livekit" && next !== "livekit") await update({ disabled: true })
+    if (next === "livekit") await update({ disabled: false })
   }
 
   async function updateLfm2(patch: Partial<Lfm2Settings>) {
-    const base = tauriVoice() ?? defaultVoiceSettings
-    await setVoiceSettings({ ...base, lfm2: { ...base.lfm2, ...patch } }).catch((err) =>
-      showToast({
-        title: language.t("settings.voice.toast.saveFailed"),
-        description: err instanceof Error ? err.message : String(err),
-      }),
-    )
+    const base = voice()
+    const settings = { ...base, lfm2: { ...base.lfm2, ...patch } }
+    await setVoiceSettings(settings)
+      .then(() => setTauriVoice({ settings, stored: true }))
+      .catch((err) =>
+        showToast({
+          title: language.t("settings.voice.toast.saveFailed"),
+          description: err instanceof Error ? err.message : String(err),
+        }),
+      )
     refetchTauri()
     refetchStatus()
   }
@@ -168,13 +211,12 @@ export const SettingsVoice: Component = () => {
   const currentStt = createMemo(() => sttOptions().find((o) => config()?.stt.split(":")[0] === o.id))
   const currentTts = createMemo(() => ttsOptions().find((o) => config()?.tts.split(":")[0] === o.id))
 
-  type ProviderOption = { id: VoiceProvider; label: string }
+  type ProviderOption = { id: Exclude<VoiceProvider, "off">; label: string }
   const providerOptions = (): ProviderOption[] => [
-    { id: "off", label: language.t("settings.voice.provider.off") },
     { id: "lfm2", label: language.t("settings.voice.provider.lfm2") },
     { id: "livekit", label: language.t("settings.voice.provider.livekit") },
   ]
-  const currentProvider = () => providerOptions().find((o) => o.id === provider())
+  const currentProvider = () => providerOptions().find((o) => o.id === activeProvider())
 
   type DeviceOption = { id: Lfm2Device; label: string }
   const deviceOptions: DeviceOption[] = [
@@ -199,7 +241,20 @@ export const SettingsVoice: Component = () => {
       </div>
 
       <div class="flex flex-col gap-8 w-full pb-8">
-        {/* provider switch — the two-provider surface */}
+        <div class="flex flex-col gap-1">
+          <div class="bg-surface-raised-base px-4 rounded-lg">
+            <SettingsRow
+              title={language.t("settings.voice.row.enabled.title")}
+              description={language.t("settings.voice.row.enabled.description")}
+            >
+              <Switch hideLabel checked={enabled()} onChange={toggleVoice}>
+                {language.t("settings.voice.row.enabled.title")}
+              </Switch>
+            </SettingsRow>
+          </div>
+        </div>
+
+        {/* provider switch — provider choice is separate from enablement */}
         <div class="flex flex-col gap-1">
           <div class="bg-surface-raised-base px-4 rounded-lg">
             <SettingsRow
@@ -211,7 +266,7 @@ export const SettingsVoice: Component = () => {
                 current={currentProvider()}
                 value={(o) => o.id}
                 label={(o) => o.label}
-                onSelect={(option) => option && changeProvider(option.id)}
+                onSelect={(option) => option && selectProvider(option.id)}
                 variant="secondary"
                 size="small"
                 triggerVariant="settings"
@@ -220,12 +275,12 @@ export const SettingsVoice: Component = () => {
           </div>
         </div>
 
-        <Show when={provider() === "off"}>
+        <Show when={!enabled()}>
           <div class="text-12-regular text-text-weak px-1">{language.t("settings.voice.off.hint")}</div>
         </Show>
 
         {/* ---- Local LFM2-Audio provider (native, Tauri store) ---- */}
-        <Show when={provider() === "lfm2"}>
+        <Show when={enabled() && activeProvider() === "lfm2"}>
           <div class="flex flex-col gap-1">
             <h3 class="text-14-medium text-text-strong pb-2">{language.t("settings.voice.section.lfm2")}</h3>
             <Show when={voiceStatus()?.provider === "lfm2" ? voiceStatus() : undefined}>
@@ -334,27 +389,7 @@ export const SettingsVoice: Component = () => {
         </Show>
 
         {/* ---- LiveKit provider (sidecar config + credentials store) ---- */}
-        <Show when={provider() === "livekit"}>
-          <div class="flex flex-col gap-1">
-            <div class="bg-surface-raised-base px-4 rounded-lg">
-              <SettingsRow
-                title={language.t("settings.voice.row.enabled.title")}
-                description={language.t("settings.voice.row.enabled.description")}
-              >
-                {/* render only once config is loaded — a Switch mounted in the
-                    loading state reads as "off" and a click then persists
-                    disabled:true even though the user meant to enable */}
-                <Show when={config()}>
-                  {(cfg) => (
-                    <Switch hideLabel checked={!cfg().disabled} onChange={(checked) => update({ disabled: !checked })}>
-                      {language.t("settings.voice.row.enabled.title")}
-                    </Switch>
-                  )}
-                </Show>
-              </SettingsRow>
-            </div>
-          </div>
-
+        <Show when={enabled() && activeProvider() === "livekit"}>
           <div class="flex flex-col gap-1">
             <h3 class="text-14-medium text-text-strong pb-2">{language.t("settings.voice.section.connection")}</h3>
             <div class="bg-surface-raised-base px-4 py-3 rounded-lg flex flex-col gap-3">
