@@ -233,8 +233,12 @@ impl MultiHeadAttention {
         mask: Option<&Tensor>,
     ) -> Result<Tensor> {
         let (nb, _h, time, _t2) = scores.dims4()?;
+        let out_dtype = value.dtype();
         let attn = masked_softmax(scores, mask)?;
-        let x = attn.matmul(value)?; // (b,h,t1,d_k)
+        // CPU BF16 matmul is only bridged for 2-D linears. Attention score/value
+        // matmuls intentionally accumulate in F32, matching the backbone path.
+        let x = attn.to_dtype(DType::F32)?.matmul(&value.to_dtype(DType::F32)?)?; // (b,h,t1,d_k)
+        let x = x.to_dtype(out_dtype)?;
         let x = x.transpose(1, 2)?.reshape((nb, time, self.h * self.d_k))?;
         linear_forward(&self.linear_out, &x)
     }
@@ -265,7 +269,11 @@ impl MultiHeadAttention {
     ) -> Result<(Tensor, Option<Tensor>)> {
         let (key, value, query, next_cache) = self.update_cache(key, value, query, cache)?;
         let (q, k, v) = self.forward_qkv(&query, &key, &value)?;
-        let scores = (q.matmul(&k.transpose(D::Minus2, D::Minus1)?.contiguous()?)? / self.s_d_k)?;
+        let scores = (q.to_dtype(DType::F32)?.matmul(
+            &k.transpose(D::Minus2, D::Minus1)?
+                .contiguous()?
+                .to_dtype(DType::F32)?,
+        )? / self.s_d_k)?;
         Ok((self.forward_attention(&v, &scores, mask)?, next_cache))
     }
 
@@ -380,10 +388,18 @@ impl RelPositionMultiHeadAttention {
         let q_with_bias_u = q.broadcast_add(&bias_u)?.transpose(1, 2)?.contiguous()?; // (b,h,t,d_k)
         let q_with_bias_v = q.broadcast_add(&bias_v)?.transpose(1, 2)?.contiguous()?;
 
-        let matrix_bd = q_with_bias_v.matmul(&p.transpose(D::Minus2, D::Minus1)?.contiguous()?)?; // (b,h,t,pos_len)
+        let matrix_bd = q_with_bias_v.to_dtype(DType::F32)?.matmul(
+            &p.transpose(D::Minus2, D::Minus1)?
+                .contiguous()?
+                .to_dtype(DType::F32)?,
+        )?; // (b,h,t,pos_len)
         let matrix_bd = self.rel_shift(&matrix_bd)?;
 
-        let matrix_ac = q_with_bias_u.matmul(&k.transpose(D::Minus2, D::Minus1)?.contiguous()?)?; // (b,h,t,t2)
+        let matrix_ac = q_with_bias_u.to_dtype(DType::F32)?.matmul(
+            &k.transpose(D::Minus2, D::Minus1)?
+                .contiguous()?
+                .to_dtype(DType::F32)?,
+        )?; // (b,h,t,t2)
         let t2 = matrix_ac.dim(D::Minus1)?;
         let matrix_bd = matrix_bd.narrow(D::Minus1, 0, t2)?;
         let scores = ((matrix_ac + matrix_bd)? / s_d_k)?;
