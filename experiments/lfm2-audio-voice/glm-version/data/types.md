@@ -1,7 +1,7 @@
 # data_types (Rust port)
-**Source:** `liquid-audio-rs/src/data/types.rs` · **Python:** `upstream-liquid-audio/src/liquid_audio/data/types.py` · **On the LFM2-Audio inference path:** no
+**Source:** `liquid-audio/src/data/types.rs` · **Python:** `upstream-liquid-audio/src/liquid_audio/data/types.py` · **On the LFM2-Audio inference path:** no
 
-> Companion to [`ARCH/data/types.md`](../../ARCH/data/types.md). The original is
+> Companion to [`wiki/data/types.md`](../../../wiki/data/types.md). The original is
 > already Rust-aware; this is the Rust-first version.
 
 ## Role
@@ -122,8 +122,8 @@ stored as I64 (it's an enum, not a flag); `supervision_mask` is the real bool
   every bundle.
 
 ## Cross-references
-- [`ARCH/data/types.md`](../../ARCH/data/types.md) — Python original.
-- `liquid-audio-rs/PYTHON_VS_RUST.md` §2.1 (device-agnostic), §2.7 (data
+- [`wiki/data/types.md`](../../../wiki/data/types.md) — Python original.
+- `liquid-audio/PYTHON_VS_RUST.md` §2.1 (device-agnostic), §2.7 (data
   pipeline backends).
-- `liquid-audio-rs/PORT_STATUS.md` — the 38/38 inventory + 170/170 symbol
+- `liquid-audio/PORT_STATUS.md` — the 38/38 inventory + 170/170 symbol
   coverage.

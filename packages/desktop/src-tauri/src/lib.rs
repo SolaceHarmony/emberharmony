@@ -318,7 +318,11 @@ pub fn run() {
             voice::control::voice_start,
             voice::control::voice_stop,
             voice::control::voice_interrupt,
-            voice::control::voice_set_mic_enabled
+            voice::control::voice_set_mic_enabled,
+            voice::model::voice_model_download,
+            voice::model::voice_pick_model_dir,
+            voice::model::voice_hf_token_set,
+            voice::model::voice_hf_token_status
         ])
         .setup(move |app| {
             #[cfg(any(target_os = "linux", all(debug_assertions, windows)))]

@@ -29,6 +29,8 @@ export interface Lfm2Settings {
   vadThreshold: number
   maxTokens: number
   model?: string
+  /** Download-source revision (branch/tag/commit); ignored once modelDir is set. */
+  revision?: string
   seed?: number
   delegate: DelegateSettings
 }
@@ -190,4 +192,54 @@ export async function setVoiceMicEnabled(enabled: boolean): Promise<void> {
   const invoke = tauriInvoke()
   if (!invoke) return
   await invoke<void>("voice_set_mic_enabled", { enabled })
+}
+
+// ---- model management (download / local dir / HF token) ----
+
+export type NativeDownloadEvent =
+  | { type: "started"; total: number }
+  | { type: "file"; index: number; total: number; name: string }
+  | { type: "done"; dir: string }
+  | { type: "error"; message: string }
+
+/**
+ * Download an LFM2-Audio model snapshot (repo id or pasted HF URL + optional revision),
+ * streaming per-file progress over a Channel. The terminal `done`/`error` event is
+ * authoritative; on `done` the caller persists `dir` as the active `modelDir`. The HF
+ * token is read natively from the keychain and never passed from here.
+ */
+export async function downloadVoiceModel(
+  args: { source: string; revision?: string },
+  onEvent: (event: NativeDownloadEvent) => void,
+): Promise<void> {
+  const core = tauriCore()
+  if (!core?.invoke || !core.Channel) throw new Error("Native model download is unavailable.")
+  const Channel = core.Channel
+  const channel = new Channel(onEvent)
+  await core.invoke<void>("voice_model_download", {
+    source: args.source,
+    revision: args.revision,
+    channel,
+  })
+}
+
+/** Native folder picker for a local model snapshot directory (undefined if cancelled). */
+export async function pickModelDir(): Promise<string | undefined> {
+  const invoke = tauriInvoke()
+  if (!invoke) return undefined
+  return (await invoke<string | null>("voice_pick_model_dir")) ?? undefined
+}
+
+/** Whether a Hugging Face token is stored in the OS keychain (presence only). */
+export async function getHfTokenStatus(): Promise<boolean> {
+  const invoke = tauriInvoke()
+  if (!invoke) return false
+  return invoke<boolean>("voice_hf_token_status")
+}
+
+/** Store (non-empty) or clear (empty) the Hugging Face token in the OS keychain. */
+export async function setHfToken(token: string): Promise<void> {
+  const invoke = tauriInvoke()
+  if (!invoke) return
+  await invoke<void>("voice_hf_token_set", { token })
 }

@@ -37,6 +37,8 @@ pub use realtime::{Lfm2VoiceEngine, RealtimePipeline, Utterance, VoiceEngine, Vo
 pub use threads::{configure_intraop_threads, intraop_default_num_threads};
 pub use trainer::{Trainer, TrainerConfig};
 pub use utils::{get_model_dir, LFMModality};
+#[cfg(feature = "download")]
+pub use utils::{snapshot_download_with, DownloadProgress};
 #[cfg(feature = "audio-io")]
 pub use voice_runtime::{RuntimeConfig, RuntimeEvent, SessionState, VoiceRuntime};
 // pub use model::lfm2_audio::LFM2AudioModel;

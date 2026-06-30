@@ -1,9 +1,9 @@
 # model_transformer (Rust port)
-**Source:** `liquid-audio-rs/src/model/transformer.rs` · **Python:** `upstream-liquid-audio/src/liquid_audio/model/transformer.py` · **On the LFM2-Audio inference path:** yes
+**Source:** `liquid-audio/src/model/transformer.rs` · **Python:** `upstream-liquid-audio/src/liquid_audio/model/transformer.py` · **On the LFM2-Audio inference path:** yes
 
-> Companion to [`ARCH/model/transformer.md`](../../ARCH/model/transformer.md).
+> Companion to [`wiki/model/transformer.md`](../../../wiki/model/transformer.md).
 > The original documents the Python `transformer.py` depthformer stack; this
-> documents the Rust port in `liquid-audio-rs/src/model/transformer.rs` and
+> documents the Rust port in `liquid-audio/src/model/transformer.rs` and
 > where it deliberately diverges from the source.
 
 ## Role
@@ -239,9 +239,9 @@ frame token-EXACT** `[213,836,182,416,782,1796,202,578]` (PARITY.md).
   here, but the depthformer's `SharedEmbedding` vocab is `2049` to admit it.)
 
 ## Cross-references
-- [`ARCH/model/transformer.md`](../../ARCH/model/transformer.md) — Python original.
-- `liquid-audio-rs/PYTHON_VS_RUST.md` §2.1 (device-agnostic), §2.2 (CUDA kernels
+- [`wiki/model/transformer.md`](../../../wiki/model/transformer.md) — Python original.
+- `liquid-audio/PYTHON_VS_RUST.md` §2.1 (device-agnostic), §2.2 (CUDA kernels
   → portable candle ops), §2.3 (`ConcatKvCache` reuse), §2.4 (RMSNorm bf16
   order), §2.5 (off-path stubs).
-- `liquid-audio-rs/parity/PARITY.md` — depthformer audio frame token-EXACT.
-- `liquid-audio-rs/src/candle_ext/kv_cache.rs` — the vendored `ConcatKvCache`.
+- `liquid-audio/parity/PARITY.md` — depthformer audio frame token-EXACT.
+- `liquid-audio/src/candle_ext/kv_cache.rs` — the vendored `ConcatKvCache`.

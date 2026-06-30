@@ -26,7 +26,9 @@ use std::time::{Duration, Instant};
 
 use candle_core::{DType, Device};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use liquid_audio::{from_pretrained, GenParams, Lfm2VoiceEngine, Utterance, VoiceEngine, VoiceEvent};
+use liquid_audio::{
+    from_pretrained, GenParams, Lfm2VoiceEngine, Utterance, VoiceEngine, VoiceEvent,
+};
 
 type Res<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -50,7 +52,10 @@ fn downmix(interleaved: &[f32], channels: usize) -> Vec<f32> {
     if channels <= 1 {
         return interleaved.to_vec();
     }
-    interleaved.chunks(channels).map(|c| c.iter().sum::<f32>() / channels as f32).collect()
+    interleaved
+        .chunks(channels)
+        .map(|c| c.iter().sum::<f32>() / channels as f32)
+        .collect()
 }
 
 fn rms(x: &[f32]) -> f32 {
@@ -65,7 +70,9 @@ fn rms(x: &[f32]) -> f32 {
 /// after ~0.8 s of silence (or a 30 s cap). Returns mono f32 + the input rate.
 fn record_utterance() -> Res<(Vec<f32>, u32)> {
     let host = cpal::default_host();
-    let dev = host.default_input_device().ok_or("no default input device")?;
+    let dev = host
+        .default_input_device()
+        .ok_or("no default input device")?;
     let supported = dev.default_input_config()?;
     let rate = supported.sample_rate().0;
     let channels = supported.channels() as usize;
@@ -98,7 +105,10 @@ fn record_utterance() -> Res<(Vec<f32>, u32)> {
     };
     stream.play()?;
 
-    let thr: f32 = std::env::var("LFM_VAD_THRESHOLD").ok().and_then(|s| s.parse().ok()).unwrap_or(0.012);
+    let thr: f32 = std::env::var("LFM_VAD_THRESHOLD")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.012);
     let window = (rate as usize / 5).max(1); // 200 ms
     let max_samples = rate as usize * 30; // 30 s cap
     let silence_stop = Duration::from_millis(800);
@@ -139,7 +149,9 @@ fn record_utterance() -> Res<(Vec<f32>, u32)> {
 /// fanned to every channel). The generate loop pushes decoded chunks into it.
 fn start_output() -> Res<(cpal::Stream, Arc<Mutex<VecDeque<f32>>>, u32)> {
     let host = cpal::default_host();
-    let dev = host.default_output_device().ok_or("no default output device")?;
+    let dev = host
+        .default_output_device()
+        .ok_or("no default output device")?;
     let supported = dev.default_output_config()?;
     let rate = supported.sample_rate().0;
     let channels = supported.channels() as usize;
@@ -170,8 +182,12 @@ fn start_output() -> Res<(cpal::Stream, Arc<Mutex<VecDeque<f32>>>, u32)> {
     }
     let stream = match fmt {
         cpal::SampleFormat::F32 => output_stream!(f32, |s: f32| s),
-        cpal::SampleFormat::I16 => output_stream!(i16, |s: f32| (s.clamp(-1.0, 1.0) * 32767.0) as i16),
-        cpal::SampleFormat::U16 => output_stream!(u16, |s: f32| ((s.clamp(-1.0, 1.0) * 32767.0) as i32 + 32768) as u16),
+        cpal::SampleFormat::I16 => {
+            output_stream!(i16, |s: f32| (s.clamp(-1.0, 1.0) * 32767.0) as i16)
+        }
+        cpal::SampleFormat::U16 => output_stream!(u16, |s: f32| ((s.clamp(-1.0, 1.0) * 32767.0)
+            as i32
+            + 32768) as u16),
         other => return Err(format!("unsupported output sample format {other:?}").into()),
     };
     stream.play()?;
@@ -184,17 +200,28 @@ fn main() -> Res<()> {
     let model_ref = std::env::var("LFM_MODEL")
         .or_else(|_| std::env::var("LFM_MODEL_DIR"))
         .unwrap_or_else(|_| "LiquidAI/LFM2.5-Audio-1.5B".into());
-    let max_new_tokens: usize = std::env::var("LFM_MAX_TOKENS").ok().and_then(|s| s.parse().ok()).unwrap_or(512);
-    let seed: u64 = std::env::var("LFM_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let max_new_tokens: usize = std::env::var("LFM_MAX_TOKENS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(512);
+    let seed: u64 = std::env::var("LFM_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
     let (device, dtype) = select_device()?;
 
     eprintln!("[load] resolving model `{model_ref}` (repo id → HF cache download, or local path)…");
     let dir = liquid_audio::get_model_dir(&model_ref, None)?;
     let cfg: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(dir.join("config.json"))?)?;
-    let codebooks = cfg["codebooks"].as_u64().ok_or("config.json: missing `codebooks`")? as usize;
+    let codebooks = cfg["codebooks"]
+        .as_u64()
+        .ok_or("config.json: missing `codebooks`")? as usize;
 
-    eprintln!("[load] LFM2.5-Audio from {} ({dtype:?}, {device:?})…", dir.display());
+    eprintln!(
+        "[load] LFM2.5-Audio from {} ({dtype:?}, {device:?})…",
+        dir.display()
+    );
     let t0 = Instant::now();
     let (model, proc) = from_pretrained(&dir, dtype, &device)?;
     eprintln!("[load] done in {:.1}s.", t0.elapsed().as_secs_f32());
@@ -236,7 +263,10 @@ fn main() -> Res<()> {
         std::io::stdout().flush().ok();
         cancel.store(false, Ordering::SeqCst);
         let tg = Instant::now();
-        let utterance = Utterance { samples: utt, rate: in_rate };
+        let utterance = Utterance {
+            samples: utt,
+            rate: in_rate,
+        };
         // The engine streams the reply: text fragments to stdout, decoded PCM (already at the
         // speaker rate) into the playback ring. On clean completion it appends this turn to `conv`.
         let res = engine.respond(&utterance, &cancel, &mut |ev| match ev {

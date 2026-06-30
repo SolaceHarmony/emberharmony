@@ -14,5 +14,6 @@
 //! cleanup all live in Rust threads. `session` remains the reducer for the
 //! sidecar-backed LiveKit bridge while that provider still exists.
 pub mod control;
+pub mod model;
 pub mod runtime;
 pub mod session;

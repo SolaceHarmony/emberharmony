@@ -1,7 +1,7 @@
 # conformer_mha (Rust port)
-**Source:** `liquid-audio-rs/src/model/conformer/mha.rs` · **Python:** `upstream-liquid-audio/src/liquid_audio/model/conformer/mha.py` · **On the LFM2-Audio inference path:** yes
+**Source:** `liquid-audio/src/model/conformer/mha.rs` · **Python:** `upstream-liquid-audio/src/liquid_audio/model/conformer/mha.py` · **On the LFM2-Audio inference path:** yes
 
-> Companion to [`ARCH/model/conformer/mha.md`](../../ARCH/model/conformer/mha.md).
+> Companion to [`wiki/model/conformer/mha.md`](../../../wiki/model/conformer/mha.md).
 
 ## Role
 NeMo FastConformer self-attention primitives in the Rust port:
@@ -173,9 +173,9 @@ offline config uses full context (`att_context_size = [-1,-1]`), so
   backbone/depthformer, not in this attention.
 
 ## Cross-references
-- [`ARCH/model/conformer/mha.md`](../../ARCH/model/conformer/mha.md) — Python
+- [`wiki/model/conformer/mha.md`](../../../wiki/model/conformer/mha.md) — Python
   original.
-- `liquid-audio-rs/PYTHON_VS_RUST.md` §2.2 (kernel-free SDPA), §2.5 (off-path
+- `liquid-audio/PYTHON_VS_RUST.md` §2.2 (kernel-free SDPA), §2.5 (off-path
   streaming stubs).
-- `liquid-audio-rs/parity/PARITY.md` — conformer rel-pos embedding 9.537e-7,
+- `liquid-audio/parity/PARITY.md` — conformer rel-pos embedding 9.537e-7,
   conformer layer 0 1.056e-6, conformer final 1.592e-6/8.25e-7.

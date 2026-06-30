@@ -1,9 +1,21 @@
 # demo_chat (Rust port)
-**Source:** `liquid-audio-rs/examples/mic_chat.rs` · **Python:** `upstream-liquid-audio/…/demo/chat.py` (not in the vendored tree; see `ARCH/demo/chat.md`) · **On the LFM2-Audio inference path:** no
+**Source:** `liquid-audio/examples/mic_chat.rs`, `duplex_chat.rs`, `text_chat.rs`, `chat_multiturn.rs` · **Python:** `upstream-liquid-audio/…/demo/chat.py` (not in the vendored tree; see `wiki/demo/chat.md`) · **On the LFM2-Audio inference path:** no
 
-> Companion to [`ARCH/demo/chat.md`](../../ARCH/demo/chat.md). The original
+> Companion to [`wiki/demo/chat.md`](../../../wiki/demo/chat.md). The original
 > documents the Python `chat.py` Gradio/fastrtc demo; this documents the Rust
-> `mic_chat.rs` headless equivalent.
+> examples that replace it.
+>
+> **As-built updates:** four examples now exist:
+> - `mic_chat.rs` — the original headless mic→model→speaker demo
+> - `duplex_chat.rs` — full-duplex live demo using `voice_runtime.rs` (cpal VAD
+>   + barge-in)
+> - `text_chat.rs` — minimal text-only proof (no audio path; `generate_sequential`
+>   + greedy + CPU F32; 4.3 tok/s)
+> - `chat_multiturn.rs` — canonical two-turn proof (Metal bf16; exercises
+>   `ChatState::append` + the discrete `audio_out` → context prefill scatter;
+>   turn 2 is correctly conditioned on turn 1's audio)
+>
+> See [`AS_BUILT_claude_changes.md`](../AS_BUILT_claude_changes.md) §6.
 
 ## Role
 `mic_chat.rs` is the realtime speech-to-speech demo harness in the Rust port.
@@ -135,7 +147,7 @@ on_token)` consumes the `ChatState` fields; yields `GenToken::Text(u32)` and
   may need a higher threshold.
 
 ## Cross-references
-- [`ARCH/demo/chat.md`](../../ARCH/demo/chat.md) — Python original.
-- `liquid-audio-rs/PYTHON_VS_RUST.md` §2.1 (device-agnostic), §2.3 (moshi-crate
+- [`wiki/demo/chat.md`](../../../wiki/demo/chat.md) — Python original.
+- `liquid-audio/PYTHON_VS_RUST.md` §2.1 (device-agnostic), §2.3 (moshi-crate
   reuse), §4 (demo out of parity surface).
-- `liquid-audio-rs/PORT_STATUS.md` — the IO model (sync streaming → sync callback).
+- `liquid-audio/PORT_STATUS.md` — the IO model (sync streaming → sync callback).

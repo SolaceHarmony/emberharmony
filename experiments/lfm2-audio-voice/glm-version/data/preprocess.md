@@ -1,7 +1,7 @@
 # data_preprocess (Rust port)
-**Source:** `liquid-audio-rs/src/data/preprocess.rs` + `liquid-audio-rs/src/data/arrow_io.rs` · **Python:** `upstream-liquid-audio/src/liquid_audio/data/preprocess.py` · **On the LFM2-Audio inference path:** no
+**Source:** `liquid-audio/src/data/preprocess.rs` + `liquid-audio/src/data/arrow_io.rs` · **Python:** `upstream-liquid-audio/src/liquid_audio/data/preprocess.py` · **On the LFM2-Audio inference path:** no
 
-> Companion to [`ARCH/data/preprocess.md`](../../ARCH/data/preprocess.md). The
+> Companion to [`wiki/data/preprocess.md`](../../../wiki/data/preprocess.md). The
 > original is already Rust-aware; this is the Rust-first version.
 
 ## Role
@@ -119,7 +119,7 @@ the on-disk corpus interchangeable with the Python `datasets` reader.
   (exact for int64/bool; f32 is bit-preserved by the pinned `float32` schema).
 
 ## Cross-references
-- [`ARCH/data/preprocess.md`](../../ARCH/data/preprocess.md) — Python original.
-- `liquid-audio-rs/PYTHON_VS_RUST.md` §2.7 (data pipeline — HF `datasets` →
+- [`wiki/data/preprocess.md`](../../../wiki/data/preprocess.md) — Python original.
+- `liquid-audio/PYTHON_VS_RUST.md` §2.7 (data pipeline — HF `datasets` →
   pure-Rust `arrow`).
-- `liquid-audio-rs/src/data/arrow_io.rs` — the Arrow IPC reader/writer.
+- `liquid-audio/src/data/arrow_io.rs` — the Arrow IPC reader/writer.

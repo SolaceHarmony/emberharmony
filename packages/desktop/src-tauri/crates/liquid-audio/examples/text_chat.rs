@@ -24,7 +24,10 @@ fn select_device() -> Res<(Device, DType)> {
             }
             #[cfg(not(feature = "metal"))]
             {
-                Err("build with `--features metal` (or set LFM_DEVICE=cpu for the f32 reference)".into())
+                Err(
+                    "build with `--features metal` (or set LFM_DEVICE=cpu for the f32 reference)"
+                        .into(),
+                )
             }
         }
     }
@@ -37,8 +40,10 @@ fn main() -> Res<()> {
     let prompt = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "Hello! Who are you, in one sentence?".into());
-    let max_new_tokens: usize =
-        std::env::var("LFM_MAX_TOKENS").ok().and_then(|s| s.parse().ok()).unwrap_or(64);
+    let max_new_tokens: usize = std::env::var("LFM_MAX_TOKENS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(64);
 
     // Default: bf16 on Metal — the deployed numerics + the real-time path.
     let (device, dtype) = select_device()?;
@@ -47,9 +52,14 @@ fn main() -> Res<()> {
     let dir = get_model_dir(&model_ref, None)?;
     let cfg: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(dir.join("config.json"))?)?;
-    let codebooks = cfg["codebooks"].as_u64().ok_or("config.json: missing `codebooks`")? as usize;
+    let codebooks = cfg["codebooks"]
+        .as_u64()
+        .ok_or("config.json: missing `codebooks`")? as usize;
 
-    eprintln!("[load] model + processor from {} ({dtype:?}, {device:?})…", dir.display());
+    eprintln!(
+        "[load] model + processor from {} ({dtype:?}, {device:?})…",
+        dir.display()
+    );
     let t0 = std::time::Instant::now();
     let (model, proc) = from_pretrained(&dir, dtype, &device)?;
     eprintln!("[load] done in {:.1}s.", t0.elapsed().as_secs_f32());

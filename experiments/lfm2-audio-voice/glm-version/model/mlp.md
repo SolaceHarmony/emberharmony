@@ -1,7 +1,7 @@
 # model_mlp (Rust port)
-**Source:** `liquid-audio-rs/src/model/mlp.rs` · **Python:** `upstream-liquid-audio/src/liquid_audio/model/mlp.py` · **On the LFM2-Audio inference path:** yes
+**Source:** `liquid-audio/src/model/mlp.rs` · **Python:** `upstream-liquid-audio/src/liquid_audio/model/mlp.py` · **On the LFM2-Audio inference path:** yes
 
-> Companion to [`ARCH/model/mlp.md`](../../ARCH/model/mlp.md). The original
+> Companion to [`wiki/model/mlp.md`](../../../wiki/model/mlp.md). The original
 > documents the Python `MLP(nn.Module)`; this documents the Rust `struct MLP`
 > and where it diverges from the source.
 >
@@ -140,10 +140,10 @@ the turn.
   `?` is implicit in the `Module` trait's return type.
 
 ## Cross-references
-- [`ARCH/model/mlp.md`](../../ARCH/model/mlp.md) — Python original.
-- `liquid-audio-rs/PYTHON_VS_RUST.md` §2.1 (device-agnostic), §2.4 (the RMSNorm
+- [`wiki/model/mlp.md`](../../../wiki/model/mlp.md) — Python original.
+- `liquid-audio/PYTHON_VS_RUST.md` §2.1 (device-agnostic), §2.4 (the RMSNorm
   bf16-ordering fix — lives in the backbone, *not* here; this module uses true
   LayerNorm).
-- `liquid-audio-rs/src/model/norm.rs` — the differentiable LayerNorm wrapper.
-- `liquid-audio-rs/parity/PARITY.md` — prefill modality-scatter 1.1e-6 (which
+- `liquid-audio/src/model/norm.rs` — the differentiable LayerNorm wrapper.
+- `liquid-audio/parity/PARITY.md` — prefill modality-scatter 1.1e-6 (which
   exercises the adapter end-to-end).

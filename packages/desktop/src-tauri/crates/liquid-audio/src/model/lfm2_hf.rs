@@ -26,7 +26,6 @@
 use std::collections::HashMap;
 
 use candle_core::{DType, Device, IndexOp, Result, Tensor};
-use candle_nn::kv_cache::KvCache;
 use candle_nn::{embedding, linear_no_bias, Embedding, Linear, Module, VarBuilder};
 
 // The exact two `crate::utils::*` helpers candle-transformers' `models/lfm2.rs` imports,
@@ -136,20 +135,13 @@ impl Lfm2Config {
 /// Mirrors candle-transformers' `lfm2.rs` `Cache`, including the `masks` memo: each
 /// causal mask is built once per `(seq_len, kv_len)` shape and reused across every
 /// attention layer and decode step, instead of being reconstructed on every call.
-/// Initial per-layer KV-cache capacity along the sequence axis. candle's [`KvCache`]
-/// preallocates this many slots and grows by the same amount when exceeded (a `Tensor::cat`,
-/// amortized negligible), so a turn shorter than this never reallocates. Kept modest so a
-/// single short turn doesn't preallocate gigabytes; long contexts grow into it.
-const KV_CACHE_INITIAL_CAP: usize = 512;
-
 pub struct Cache {
     pub use_kv_cache: bool,
-    /// Per-layer preallocated KV cache (candle's `KvCache`): `append` slice-sets the new K/V
-    /// into a fixed buffer (O(new)) instead of `Tensor::cat`-ing the whole cache every step
-    /// (O(seqlen) realloc+copy). Same accumulated values, far less memory traffic; also the
-    /// unit that inter-turn persistence will carry across turns. Seq axis is dim 2 of
-    /// `(b, n_kv, seq, head_dim)`.
-    kvs: Vec<KvCache>,
+    /// Per-layer KV cache, faithful to candle-transformers/HF: append new K/V by
+    /// concatenating on the sequence axis. This intentionally does not use
+    /// `candle_nn::kv_cache::KvCache`; that preallocated cache changes the reference
+    /// structure and was previously reverted as a parity deviation.
+    kvs: Vec<Option<(Tensor, Tensor)>>,
     conv_states: Vec<Option<Tensor>>,
     // Memoized boolean causal masks, keyed by (seq_len, kv_len) — see `mask`.
     masks: HashMap<(usize, usize), Tensor>,
@@ -180,9 +172,7 @@ impl Cache {
         let sin = idx_theta.sin()?.to_dtype(dtype)?;
         Ok(Self {
             use_kv_cache,
-            kvs: (0..cfg.num_hidden_layers)
-                .map(|_| KvCache::new(2, KV_CACHE_INITIAL_CAP))
-                .collect(),
+            kvs: vec![None; cfg.num_hidden_layers],
             conv_states: vec![None; cfg.num_hidden_layers],
             masks: HashMap::new(),
             cos,
@@ -207,7 +197,7 @@ impl Cache {
     }
 
     pub fn clear(&mut self) {
-        self.kvs.iter_mut().for_each(|c| c.reset());
+        self.kvs.iter_mut().for_each(|v| *v = None);
         self.conv_states.iter_mut().for_each(|v| *v = None);
         // `masks` are shape-keyed and turn-independent, so they survive `clear` (a fresh
         // turn reuses the same geometry) — matching the reference, which never drops them.
@@ -318,14 +308,15 @@ impl Attention {
         let k = self.rope(&k, index_pos, cache)?;
 
         let (k, v) = if cache.use_kv_cache {
-            // Preallocated candle `KvCache`: `append` slice-sets the new K/V into the fixed
-            // buffer (O(seq_len), not an O(kv_len) `cat` + `clone` every step) and returns the
-            // full accumulated (k, v) — identical values to the old `Tensor::cat` form. The
-            // src must be contiguous for `slice_set`; the returned views feed `repeat_kv` /
-            // the f32 upcast, which produce contiguous outputs for the score matmul. With a
-            // fresh cache per generation this also subsumes the old `index_pos > 0` guard
-            // (an empty cache appends as the prefill, a populated one appends as a decode step).
-            cache.kvs[block_idx].append(&k.contiguous()?, &v.contiguous()?)?
+            let (k, v) = match &cache.kvs[block_idx] {
+                Some((kc, vc)) if index_pos > 0 => (
+                    Tensor::cat(&[kc, &k], 2)?.contiguous()?,
+                    Tensor::cat(&[vc, &v], 2)?.contiguous()?,
+                ),
+                _ => (k, v),
+            };
+            cache.kvs[block_idx] = Some((k.clone(), v.clone()));
+            (k, v)
         } else {
             (k, v)
         };

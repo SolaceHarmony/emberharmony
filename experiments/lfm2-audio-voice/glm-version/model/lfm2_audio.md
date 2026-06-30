@@ -1,9 +1,14 @@
 # model_lfm2_audio (Rust port)
-**Source:** `liquid-audio-rs/src/model/lfm2_audio.rs` · **Python:** `upstream-liquid-audio/src/liquid_audio/model/lfm2_audio.py` · **On the LFM2-Audio inference path:** yes
+**Source:** `liquid-audio/src/model/lfm2_audio.rs` · **Python:** `upstream-liquid-audio/src/liquid_audio/model/lfm2_audio.py` · **On the LFM2-Audio inference path:** yes
 
-> Companion to [`ARCH/model/lfm2_audio.md`](../../ARCH/model/lfm2_audio.md). The
+> Companion to [`wiki/model/lfm2_audio.md`](../../../wiki/model/lfm2_audio.md). The
 > original documents the Python `LFM2AudioModel`; this documents the Rust port
 > and where it deliberately diverges.
+>
+> **As-built updates:** `generate_interleaved_cancellable` (barge-in via
+> `AtomicBool`) and `GenParams::demo_defaults()` (audio temp 1.0 / top-k 4)
+> have been added. See [`AS_BUILT_claude_changes.md`](../AS_BUILT_claude_changes.md)
+> §6.
 
 ## Role
 `LFM2AudioModel` (the `struct` in `lfm2_audio.rs:236`) is the top-level
@@ -344,11 +349,11 @@ modality-scatter 1.118e-6.
   distribution match (§2.8).
 
 ## Cross-references
-- [`ARCH/model/lfm2_audio.md`](../../ARCH/model/lfm2_audio.md) — Python original.
-- `liquid-audio-rs/PYTHON_VS_RUST.md` §1.3 (`index_select` scatter), §2.1
+- [`wiki/model/lfm2_audio.md`](../../../wiki/model/lfm2_audio.md) — Python original.
+- `liquid-audio/PYTHON_VS_RUST.md` §1.3 (`index_select` scatter), §2.1
   (device-agnostic), §2.2 (CUDA kernels → portable candle ops), §2.3
   (`LogitsProcessor` reuse + threshold top-k), §2.6 (`cross_entropy_none`),
   §2.8 (stochastic RNG).
-- `liquid-audio-rs/parity/PARITY.md` — prefill modality-scatter 1.1e-6,
+- `liquid-audio/parity/PARITY.md` — prefill modality-scatter 1.1e-6,
   depthformer audio frame token-EXACT.
-- `liquid-audio-rs/src/loader.rs` — `from_pretrained` / `from_pretrained_hub`.
+- `liquid-audio/src/loader.rs` — `from_pretrained` / `from_pretrained_hub`.

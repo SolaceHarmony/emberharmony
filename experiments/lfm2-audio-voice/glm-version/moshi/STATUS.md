@@ -55,7 +55,7 @@ picks the LFM2 detokenizer if `audio_detokenizer/` is present, else Mimi.
 
 ## See also
 - [`glm-version/moshi/README.md`](README.md) — the overview.
-- [`ARCH/moshi/README.md`](../../ARCH/moshi/README.md) — the vendored Python
+- [`wiki/moshi/README.md`](../../../wiki/moshi/README.md) — the vendored Python
   overview (with the component wiring diagram + per-file specs).
-- `liquid-audio-rs/src/audio_out.rs` — the `AudioDetokenizer` trait +
+- `liquid-audio/src/audio_out.rs` — the `AudioDetokenizer` trait +
   `MimiDetokenizer` adapter.

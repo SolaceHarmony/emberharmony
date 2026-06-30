@@ -1,9 +1,9 @@
 # core_utils (Rust port)
-**Source:** `liquid-audio-rs/src/utils.rs` · **Python:** `upstream-liquid-audio/src/liquid_audio/utils.py` · **On the LFM2-Audio inference path:** yes
+**Source:** `liquid-audio/src/utils.rs` · **Python:** `upstream-liquid-audio/src/liquid_audio/utils.py` · **On the LFM2-Audio inference path:** yes
 
-> This is the Rust-side companion to [`ARCH/utils.md`](../ARCH/utils.md). Claude's
+> This is the Rust-side companion to [`wiki/utils.md`](../../wiki/utils.md). Claude's
 > original documents the **Python** module; this one documents the **Rust port**
-> in `liquid-audio-rs/src/utils.rs` and calls out where the two diverge. Same
+> in `liquid-audio/src/utils.rs` and calls out where the two diverge. Same
 > topic, different language.
 
 ## Role
@@ -145,13 +145,13 @@ below for why this is a stricter contract than the Python version.
   `snapshot_download` is always available (and always tries the network).
 
 ## Cross-references
-- [`ARCH/utils.md`](../ARCH/utils.md) — the Python original this is the Rust
+- [`wiki/utils.md`](../../wiki/utils.md) — the Python original this is the Rust
   companion to. That doc has the Python `IntEnum`/`auto()` provenance and the
   `@cache` semantics; this one has the `floordiv`/`cfg!`/`hf-hub` differences.
-- `liquid-audio-rs/PYTHON_VS_RUST.md` §2.1 (device-agnostic loaders —
+- `liquid-audio/PYTHON_VS_RUST.md` §2.1 (device-agnostic loaders —
   `get_model_dir` takes no `device`/`dtype`, the loaders do) and §2.2
   (`module_exists("flash_attn")` → eager matmul + additive causal mask).
-- `liquid-audio-rs/PORT_STATUS.md` — `utils.rs` marked ✅ done, including
+- `liquid-audio/PORT_STATUS.md` — `utils.rs` marked ✅ done, including
   `get_model_dir` snapshot-download via `hf-hub`.
-- `liquid-audio-rs/parity/SIGNATURE_AUDIT.md` — symbol-level coverage for this
+- `liquid-audio/parity/SIGNATURE_AUDIT.md` — symbol-level coverage for this
   module.

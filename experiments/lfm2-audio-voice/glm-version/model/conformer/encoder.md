@@ -1,7 +1,7 @@
 # conformer_encoder (Rust port)
-**Source:** `liquid-audio-rs/src/model/conformer/encoder.rs` · **Python:** `upstream-liquid-audio/src/liquid_audio/model/conformer/encoder.py` · **On the LFM2-Audio inference path:** yes
+**Source:** `liquid-audio/src/model/conformer/encoder.rs` · **Python:** `upstream-liquid-audio/src/liquid_audio/model/conformer/encoder.py` · **On the LFM2-Audio inference path:** yes
 
-> Companion to [`ARCH/model/conformer/encoder.md`](../../ARCH/model/conformer/encoder.md).
+> Companion to [`wiki/model/conformer/encoder.md`](../../../wiki/model/conformer/encoder.md).
 
 ## Role
 `ConformerEncoder` (`encoder.rs:49`) is the **audio-IN** acoustic encoder in the
@@ -204,8 +204,8 @@ CUDA.
   1.0e-6; layer-0 1.06e-6; **final 8.25e-7** (PARITY.md).
 
 ## Cross-references
-- [`ARCH/model/conformer/encoder.md`](../../ARCH/model/conformer/encoder.md)
+- [`wiki/model/conformer/encoder.md`](../../../wiki/model/conformer/encoder.md)
   — Python original.
-- `liquid-audio-rs/PYTHON_VS_RUST.md` §2.1 (device-agnostic), §2.2 (kernel-free
+- `liquid-audio/PYTHON_VS_RUST.md` §2.1 (device-agnostic), §2.2 (kernel-free
   SDPA), §2.5 (off-path streaming stubs), §5.1 (padded-batch masking gap).
-- `liquid-audio-rs/parity/PARITY.md` — conformer final 8.25e-7, prefill 1.1e-6.
+- `liquid-audio/parity/PARITY.md` — conformer final 8.25e-7, prefill 1.1e-6.

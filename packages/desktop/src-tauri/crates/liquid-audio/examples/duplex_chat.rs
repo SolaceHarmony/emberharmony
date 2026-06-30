@@ -57,7 +57,10 @@ fn downmix(interleaved: &[f32], channels: usize) -> Vec<f32> {
     if channels <= 1 {
         return interleaved.to_vec();
     }
-    interleaved.chunks(channels).map(|c| c.iter().sum::<f32>() / channels as f32).collect()
+    interleaved
+        .chunks(channels)
+        .map(|c| c.iter().sum::<f32>() / channels as f32)
+        .collect()
 }
 
 fn rms(x: &[f32]) -> f32 {
@@ -70,7 +73,9 @@ fn rms(x: &[f32]) -> f32 {
 /// Continuous input: an always-on stream appending mono f32 mic audio to a shared buffer.
 fn start_input() -> Res<(cpal::Stream, Arc<Mutex<Vec<f32>>>, u32)> {
     let host = cpal::default_host();
-    let dev = host.default_input_device().ok_or("no default input device")?;
+    let dev = host
+        .default_input_device()
+        .ok_or("no default input device")?;
     let supported = dev.default_input_config()?;
     let rate = supported.sample_rate().0;
     let channels = supported.channels() as usize;
@@ -86,7 +91,9 @@ fn start_input() -> Res<(cpal::Stream, Arc<Mutex<Vec<f32>>>, u32)> {
                 &cfg,
                 move |d: &[$t], _: &cpal::InputCallbackInfo| {
                     let f: Vec<f32> = d.iter().map(|&s| $conv(s)).collect();
-                    buf.lock().unwrap().extend_from_slice(&downmix(&f, channels));
+                    buf.lock()
+                        .unwrap()
+                        .extend_from_slice(&downmix(&f, channels));
                 },
                 err_fn,
                 None,
@@ -107,7 +114,9 @@ fn start_input() -> Res<(cpal::Stream, Arc<Mutex<Vec<f32>>>, u32)> {
 /// channel). Returns the ring so the consumer can push PCM and flush on barge-in.
 fn start_output() -> Res<(cpal::Stream, Arc<Mutex<VecDeque<f32>>>, u32)> {
     let host = cpal::default_host();
-    let dev = host.default_output_device().ok_or("no default output device")?;
+    let dev = host
+        .default_output_device()
+        .ok_or("no default output device")?;
     let supported = dev.default_output_config()?;
     let rate = supported.sample_rate().0;
     let channels = supported.channels() as usize;
@@ -137,8 +146,12 @@ fn start_output() -> Res<(cpal::Stream, Arc<Mutex<VecDeque<f32>>>, u32)> {
     }
     let stream = match fmt {
         cpal::SampleFormat::F32 => output_stream!(f32, |s: f32| s),
-        cpal::SampleFormat::I16 => output_stream!(i16, |s: f32| (s.clamp(-1.0, 1.0) * 32767.0) as i16),
-        cpal::SampleFormat::U16 => output_stream!(u16, |s: f32| ((s.clamp(-1.0, 1.0) * 32767.0) as i32 + 32768) as u16),
+        cpal::SampleFormat::I16 => {
+            output_stream!(i16, |s: f32| (s.clamp(-1.0, 1.0) * 32767.0) as i16)
+        }
+        cpal::SampleFormat::U16 => output_stream!(u16, |s: f32| ((s.clamp(-1.0, 1.0) * 32767.0)
+            as i32
+            + 32768) as u16),
         other => return Err(format!("unsupported output sample format {other:?}").into()),
     };
     stream.play()?;
@@ -149,16 +162,28 @@ fn main() -> Res<()> {
     let model_ref = std::env::var("LFM_MODEL")
         .or_else(|_| std::env::var("LFM_MODEL_DIR"))
         .unwrap_or_else(|_| "LiquidAI/LFM2.5-Audio-1.5B".into());
-    let max_new_tokens: usize = std::env::var("LFM_MAX_TOKENS").ok().and_then(|s| s.parse().ok()).unwrap_or(512);
-    let seed: u64 = std::env::var("LFM_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let max_new_tokens: usize = std::env::var("LFM_MAX_TOKENS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(512);
+    let seed: u64 = std::env::var("LFM_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
     let (device, dtype) = select_device()?;
 
     eprintln!("[load] resolving model `{model_ref}`…");
     let dir = liquid_audio::get_model_dir(&model_ref, None)?;
-    let cfg: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json"))?)?;
-    let codebooks = cfg["codebooks"].as_u64().ok_or("config.json: missing `codebooks`")? as usize;
+    let cfg: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("config.json"))?)?;
+    let codebooks = cfg["codebooks"]
+        .as_u64()
+        .ok_or("config.json: missing `codebooks`")? as usize;
 
-    eprintln!("[load] LFM2.5-Audio from {} ({dtype:?}, {device:?})…", dir.display());
+    eprintln!(
+        "[load] LFM2.5-Audio from {} ({dtype:?}, {device:?})…",
+        dir.display()
+    );
     let t0 = Instant::now();
     let (model, proc) = from_pretrained(&dir, dtype, &device)?;
     eprintln!("[load] done in {:.1}s.", t0.elapsed().as_secs_f32());
@@ -214,7 +239,10 @@ fn main() -> Res<()> {
         })
     };
 
-    let thr: f32 = std::env::var("LFM_VAD_THRESHOLD").ok().and_then(|s| s.parse().ok()).unwrap_or(0.012);
+    let thr: f32 = std::env::var("LFM_VAD_THRESHOLD")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.012);
     let window = (in_rate as usize / 5).max(1); // 200 ms VAD window
     let silence_stop = Duration::from_millis(800);
 
@@ -264,7 +292,10 @@ fn main() -> Res<()> {
             eprintln!("[turn] captured {secs:.2}s; generating…");
             print!("assistant: ");
             std::io::stdout().flush().ok();
-            if !pipe.submit(Utterance { samples, rate: in_rate }) {
+            if !pipe.submit(Utterance {
+                samples,
+                rate: in_rate,
+            }) {
                 break; // worker gone
             }
         } else if !speaking && n > in_rate as usize * 5 {

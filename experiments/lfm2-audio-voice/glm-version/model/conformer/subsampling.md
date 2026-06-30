@@ -1,7 +1,7 @@
 # conformer_subsampling (Rust port)
-**Source:** `liquid-audio-rs/src/model/conformer/subsampling.rs` · **Python:** `upstream-liquid-audio/src/liquid_audio/model/conformer/subsampling.py` · **On the LFM2-Audio inference path:** yes
+**Source:** `liquid-audio/src/model/conformer/subsampling.rs` · **Python:** `upstream-liquid-audio/src/liquid_audio/model/conformer/subsampling.py` · **On the LFM2-Audio inference path:** yes
 
-> Companion to [`ARCH/model/conformer/subsampling.md`](../../ARCH/model/conformer/subsampling.md).
+> Companion to [`wiki/model/conformer/subsampling.md`](../../../wiki/model/conformer/subsampling.md).
 
 ## Role
 `ConvSubsampling` (`subsampling.rs:222`) is the FastConformer **pre-encoder**
@@ -165,9 +165,9 @@ stream. Net: `subsampling → encoder layers → audio_adapter → backbone`.
   FFT-library floor (9.31e-6), so subsampling is not the precision bottleneck.
 
 ## Cross-references
-- [`ARCH/model/conformer/subsampling.md`](../../ARCH/model/conformer/subsampling.md)
+- [`wiki/model/conformer/subsampling.md`](../../../wiki/model/conformer/subsampling.md)
   — Python original.
-- `liquid-audio-rs/PYTHON_VS_RUST.md` §2.1 (device-agnostic), §2.2 (kernel-free
+- `liquid-audio/PYTHON_VS_RUST.md` §2.1 (device-agnostic), §2.2 (kernel-free
   convs), §2.5 (off-path schemes).
-- `liquid-audio-rs/parity/PARITY.md` — conv-stack out 5.611e-7, post-subsample
+- `liquid-audio/parity/PARITY.md` — conv-stack out 5.611e-7, post-subsample
   1.019e-6.

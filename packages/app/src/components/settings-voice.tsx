@@ -5,13 +5,18 @@ import { Switch } from "@thesolaceproject/emberharmony-ui/switch"
 import { TextField } from "@thesolaceproject/emberharmony-ui/text-field"
 import { showToast } from "@thesolaceproject/emberharmony-ui/toast"
 import { ScrollFade } from "@thesolaceproject/emberharmony-ui/scroll-fade"
+import { Link } from "./link"
 import { useLanguage } from "@/context/language"
 import { useGlobalSDK } from "@/context/global-sdk"
 import {
   defaultVoiceSettings,
+  downloadVoiceModel,
+  getHfTokenStatus,
   getVoiceSettingsState,
   getVoiceStatus,
   isDesktop,
+  pickModelDir,
+  setHfToken,
   setVoiceSettings,
   type DelegateSettings,
   type Lfm2Device,
@@ -19,6 +24,10 @@ import {
   type VoiceProvider,
   type VoiceSettings,
 } from "@/lib/voice-settings"
+
+// The canonical model — the same constant the upstream demo hardcodes. Pre-filled so a
+// user never has to "find" a repo id; editable only to point at a fork or newer version.
+const DEFAULT_MODEL = "LiquidAI/LFM2.5-Audio-1.5B"
 
 export const SettingsVoice: Component = () => {
   const language = useLanguage()
@@ -44,9 +53,23 @@ export const SettingsVoice: Component = () => {
   const [testing, setTesting] = createSignal(false)
   const [override, setOverride] = createSignal<VoiceProvider>()
 
+  // LFM2 model management — download / HF token / native dir picker.
+  const [hfTokenInput, setHfTokenInput] = createSignal("")
+  const [savingToken, setSavingToken] = createSignal(false)
+  const [modelDirEdit, setModelDirEdit] = createSignal<string | undefined>(undefined)
+  const [downloading, setDownloading] = createSignal(false)
+  const [downloadMsg, setDownloadMsg] = createSignal<string | undefined>(undefined)
+  const [hfTokenStored, { refetch: refetchToken }] = createResource(getHfTokenStatus)
+
   const effectiveUrl = () => url() ?? config()?.url ?? ""
   const voice = (): VoiceSettings => tauriVoice()?.settings ?? defaultVoiceSettings
   const lfm2 = (): Lfm2Settings => voice().lfm2
+  const modelDirValue = () => modelDirEdit() ?? lfm2().modelDir ?? ""
+  const hfModel = () => (lfm2().model ?? DEFAULT_MODEL).trim()
+  const hfUrl = () => {
+    const m = hfModel()
+    return m.startsWith("http") ? m : `https://huggingface.co/${m}`
+  }
   const livekitConfigured = () => Boolean(config()?.url || config()?.credentials?.livekit)
 
   // Effective provider: an explicit pick wins; otherwise the stored provider, and
@@ -126,6 +149,79 @@ export const SettingsVoice: Component = () => {
       )
     refetchTauri()
     refetchStatus()
+  }
+
+  async function saveToken() {
+    setSavingToken(true)
+    try {
+      await setHfToken(hfTokenInput().trim())
+      setHfTokenInput("")
+      await refetchToken()
+    } catch (err) {
+      showToast({
+        title: language.t("settings.voice.toast.saveFailed"),
+        description: err instanceof Error ? err.message : String(err),
+      })
+    } finally {
+      setSavingToken(false)
+    }
+  }
+
+  async function browseModelDir() {
+    try {
+      const dir = await pickModelDir()
+      if (!dir) return
+      setModelDirEdit(dir)
+      await updateLfm2({ modelDir: dir })
+    } catch (err) {
+      showToast({
+        title: language.t("settings.voice.toast.saveFailed"),
+        description: err instanceof Error ? err.message : String(err),
+      })
+    }
+  }
+
+  // Explicit, fail-hard download: progress streams over a Channel; the model only becomes
+  // active on a clean `done`. Nothing here downloads silently and nothing auto-starts.
+  async function downloadModel() {
+    // The shown model (pre-filled default unless the user overrode it) — never empty, so
+    // one click downloads the recommended model without anyone hunting for a repo id.
+    const source = hfModel()
+    setDownloading(true)
+    setDownloadMsg(`${language.t("settings.voice.download.downloading")}…`)
+    try {
+      await downloadVoiceModel({ source, revision: lfm2().revision }, (event) => {
+        switch (event.type) {
+          case "started":
+            setDownloadMsg(`${language.t("settings.voice.download.downloading")} 0/${event.total}`)
+            break
+          case "file":
+            setDownloadMsg(
+              `${language.t("settings.voice.download.downloading")} ${event.index}/${event.total}: ${event.name}`,
+            )
+            break
+          case "done":
+            setDownloading(false)
+            setDownloadMsg(undefined)
+            setModelDirEdit(event.dir)
+            void updateLfm2({ modelDir: event.dir })
+            showToast({ title: language.t("settings.voice.download.done"), description: event.dir })
+            break
+          case "error":
+            setDownloading(false)
+            setDownloadMsg(undefined)
+            showToast({ title: language.t("settings.voice.download.failed"), description: event.message })
+            break
+        }
+      })
+    } catch (err) {
+      setDownloading(false)
+      setDownloadMsg(undefined)
+      showToast({
+        title: language.t("settings.voice.download.failed"),
+        description: err instanceof Error ? err.message : String(err),
+      })
+    }
   }
 
   const updateDelegate = (patch: Partial<DelegateSettings>) =>
@@ -294,23 +390,69 @@ export const SettingsVoice: Component = () => {
               <TextField
                 label={language.t("settings.voice.row.model.title")}
                 description={language.t("settings.voice.row.model.description")}
-                placeholder="LiquidAI/LFM2.5-Audio-1.5B"
-                defaultValue={lfm2().model ?? ""}
+                placeholder={DEFAULT_MODEL}
+                defaultValue={lfm2().model ?? DEFAULT_MODEL}
                 onFocusOut={(e: FocusEvent) => {
                   const value = (e.currentTarget as HTMLInputElement).value.trim()
                   updateLfm2({ model: value || undefined })
                 }}
               />
+              <Link href={hfUrl()}>{language.t("settings.voice.row.model.viewOnHf")}</Link>
               <TextField
-                label={language.t("settings.voice.row.modelDir.title")}
-                description={language.t("settings.voice.row.modelDir.description")}
-                placeholder="/path/to/huggingface/snapshot"
-                defaultValue={lfm2().modelDir ?? ""}
+                label={language.t("settings.voice.row.revision.title")}
+                description={language.t("settings.voice.row.revision.description")}
+                placeholder="main"
+                defaultValue={lfm2().revision ?? ""}
                 onFocusOut={(e: FocusEvent) => {
                   const value = (e.currentTarget as HTMLInputElement).value.trim()
-                  updateLfm2({ modelDir: value || undefined })
+                  updateLfm2({ revision: value || undefined })
                 }}
               />
+              <TextField
+                label={language.t("settings.voice.row.hfToken.title")}
+                description={language.t("settings.voice.row.hfToken.description")}
+                type="password"
+                placeholder={hfTokenStored() ? "••••••••" : "hf_…"}
+                value={hfTokenInput()}
+                onChange={setHfTokenInput}
+              />
+              <div class="flex items-center gap-2">
+                <Button variant="secondary" size="small" disabled={savingToken()} onClick={saveToken}>
+                  {language.t("settings.voice.action.saveToken")}
+                </Button>
+                <Show when={hfTokenStored()}>
+                  <span class="text-12-regular text-text-weak">
+                    {language.t("settings.voice.row.hfToken.stored")}
+                  </span>
+                </Show>
+              </div>
+              <div class="flex items-end gap-2">
+                <div class="flex-1 min-w-0">
+                  <TextField
+                    label={language.t("settings.voice.row.modelDir.title")}
+                    description={language.t("settings.voice.row.modelDir.description")}
+                    placeholder="/path/to/huggingface/snapshot"
+                    value={modelDirValue()}
+                    onChange={setModelDirEdit}
+                    onFocusOut={() => updateLfm2({ modelDir: modelDirValue().trim() || undefined })}
+                  />
+                </div>
+                <Show when={desktop}>
+                  <Button variant="secondary" size="small" onClick={browseModelDir}>
+                    {language.t("settings.voice.row.modelDir.browse")}
+                  </Button>
+                </Show>
+              </div>
+              <Show when={desktop}>
+                <div class="flex items-center gap-2 pt-1">
+                  <Button variant="primary" size="small" disabled={downloading()} onClick={downloadModel}>
+                    {language.t("settings.voice.action.download")}
+                  </Button>
+                  <Show when={downloadMsg()}>
+                    {(msg) => <span class="text-12-regular text-text-weak truncate">{msg()}</span>}
+                  </Show>
+                </div>
+              </Show>
             </div>
             <div class="bg-surface-raised-base px-4 rounded-lg mt-2">
               <SettingsRow

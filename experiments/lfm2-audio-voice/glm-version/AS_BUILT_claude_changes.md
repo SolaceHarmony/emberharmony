@@ -1,32 +1,55 @@
-# Claude's threading, bf16, mask memoization, and `to_vec4` changes — as-built
+# Claude + Codex changes to `liquid-audio` — as-built
 
-> This documents the changes Claude made to `liquid-audio-rs` across two sessions,
-> **as built on disk** (not as proposed). It covers what was changed, how it works,
-> what's verified, and what remains. All changes are currently **uncommitted** except
-> the `d87a52e` commit (deps + `lib.rs`/`loader.rs` wiring).
+> This documents the changes Claude and Codex made to the `liquid-audio` crate
+> across multiple sessions, **as built** (not as proposed). It covers what was
+> changed, how it works, what's verified, and what remains. The crate was
+> originally at `experiments/lfm2-audio-voice/liquid-audio-rs/` and has been
+> moved to `packages/desktop/src-tauri/crates/liquid-audio/`.
 
 ## State at a glance
 
-| File | Status | What changed |
-|---|---|---|
-| `src/threads.rs` | **untracked** (new) | torch-parity intra-op thread pool |
-| `src/bf16_gemm.rs` | **untracked** (new) | NEON BFMMLA bf16 GEMM: FFI + `CustomOp2` + runtime gate |
-| `csrc/bf16_gemm.c` | **untracked** (new) | the C BFMMLA micro-kernel |
-| `build.rs` | **untracked** (new) | compiles the C kernel on aarch64 via `cc` |
-| `THREADING_PARITY.md` | **untracked** (new) | Claude's writeup (partially outdated — see below) |
-| `.github/workflows/rust-voice.yml` | **untracked** (new) | Rust CI: build + test on Linux + macOS arm64 |
-| `src/lib.rs` | **committed** (`d87a52e`) | `pub mod threads; pub mod bf16_gemm;` + re-exports |
-| `src/loader.rs` | **committed** (`d87a52e`) | calls `configure_intraop_threads()` at top of `from_pretrained` |
-| `Cargo.toml` | **committed** (`d87a52e`) | `rayon`/`num_cpus`/`libc`/`half` deps, `cc` build-dep, `accelerate` feature |
-| `Cargo.lock` | **committed** (`d87a52e`) | resolved |
-| `src/audio_out.rs` | **unstaged** (modified) | `AudioDetokenizer: Send` bound |
-| `src/model/mlp.rs` | **unstaged** (modified) | `Sequential` → `Vec<Box<dyn Module + Send>>` + 3 tests |
-| `src/model/lfm2_hf.rs` | **unstaged** (modified) | vendored `build_causal_mask`/`repeat_kv` from candle-transformers; mask memoization (`Cache::mask`); reverted the `KvCache` swap (faithful `Tensor::cat` restored) |
-| `src/candle_ext/transformers_utils.rs` | **untracked** (new) | the vendored `build_causal_mask` + `repeat_kv` (candle 0.10→0.9.2 backport) |
-| `src/candle_ext/tensor_ext.rs` | **untracked** (new) | `TensorExt::to_vec4` (candle's `to_vecN` ladder stops at 3; this extends it by one rank) |
-| `src/candle_ext/mod.rs` | **unstaged** (modified) | `pub mod tensor_ext; pub mod transformers_utils;` |
+The crate is now at `packages/desktop/src-tauri/crates/liquid-audio/` and
+committed. All files below are in the committed tree.
 
-**Build state:** `cargo test --lib` → **57 passed; 0 failed**. `cargo build --all-targets` → clean. The MLP `Send` fix (which unblocked a prior compile error) is in place.
+| File | What changed |
+|---|---|
+| `src/threads.rs` | torch-parity intra-op thread pool |
+| `src/bf16_gemm.rs` | NEON BFMMLA bf16 GEMM: FFI + `CustomOp2` + runtime gate |
+| `csrc/bf16_gemm.c` | the C BFMMLA micro-kernel |
+| `build.rs` | compiles the C kernel on aarch64 via `cc` |
+| `src/lib.rs` | module declarations + re-exports (incl. `realtime`, `voice_runtime`) |
+| `src/loader.rs` | calls `configure_intraop_threads()` at top of `from_pretrained` |
+| `Cargo.toml` | `rayon`/`num_cpus`/`libc`/`half`/`crossbeam-channel` deps, `cc` build-dep, `accelerate`/`metal` features |
+| `src/audio_out.rs` | `AudioDetokenizer: Send` bound |
+| `src/model/mlp.rs` | `Sequential` → `Vec<Box<dyn Module + Send>>` + 3 tests |
+| `src/model/lfm2_hf.rs` | vendored `build_causal_mask`/`repeat_kv`; mask memoization (`Cache::mask`); faithful `Tensor::cat` KV cache |
+| `src/model/lfm2_audio.rs` | `generate_interleaved_cancellable` (barge-in); `GenParams::demo_defaults()`; multi-turn collect/append |
+| `src/processor.rs` | `ChatState::from_parts` (multi-turn persistence constructor) |
+| `src/realtime.rs` | `RealtimePipeline` (worker thread); `Lfm2VoiceEngine` (owns model); `ConversationState`; `StreamingPcmResampler`; multi-turn persistence; barge-in |
+| `src/voice_runtime.rs` | `VoiceRuntime` (cpal VAD + playback); `RuntimeConfig`; `can_interrupt` gate |
+| `src/candle_ext/transformers_utils.rs` | vendored `build_causal_mask` + `repeat_kv` (candle 0.10→0.9.2 backport) |
+| `src/candle_ext/tensor_ext.rs` | `TensorExt::to_vec4` |
+| `src/candle_ext/mod.rs` | `pub mod tensor_ext; pub mod transformers_utils;` |
+| `examples/text_chat.rs` | text-only proof (no audio path) |
+| `examples/chat_multiturn.rs` | canonical two-turn discrete-audio context proof |
+| `examples/duplex_chat.rs` | full-duplex live demo (cpal + VAD + barge-in) |
+| `THREADING_PARITY.md` | implementer's threading-parity view (updated for realtime pipeline) |
+| `.github/workflows/rust-voice.yml` | Rust CI: build + test on Linux + macOS arm64 |
+| **Desktop crate (Tauri integration)** | |
+| `src/voice/control.rs` | Tauri commands: `voice_start`/`voice_stop`/`voice_status`/`voice_set_mic_enabled`; `VoiceEvent` contract; `VoiceStartResult`; `TurnMode`; `LiveKitGrant` |
+| `src/voice/runtime.rs` | `VoiceRuntime` (session lifecycle); `ThreadManager`; `VoiceSession` enum (`Lfm2`/`Livekit`) |
+| `src/voice/session.rs` | HTTP session bridge (LiveKit delegate path only) |
+| `src/voice/FRONTEND_DESIGN.md` | voice frontend design (turn mode + live mode, one event-driven core) |
+| `src/settings.rs` | `VoiceSettings`/`Lfm2Settings`/`VoiceProvider`; `lfm2_model_ref`/`lfm2_model_dir` resolution; `DEFAULT_LFM2_MODEL` |
+| **Frontend (SolidJS)** | |
+| `packages/app/src/lib/voice-settings.ts` | Tauri command wrappers; `VoiceStartResult` return type |
+| `packages/app/src/lib/voice-state.ts` | pure decision functions (extracted, tested) |
+| `packages/app/src/lib/voice-state.test.ts` | 6 unit tests for the decision functions |
+| `packages/app/src/context/voice.tsx` | rewritten: provider-branched (lfm2 → Tauri Channel events; livekit → grant + room.connect) |
+| `packages/app/src/components/settings-voice.tsx` | HF model field + local snapshot directory field |
+| `packages/app/src/components/prompt-input.tsx` | mic button + mic-pause-on-typing via extracted `voiceButtonOn`/`voiceMicTarget` |
+
+**Build state:** `cargo test --lib` → **62 passed; 0 failed; 1 ignored** (real-model engine test). `cargo build --features metal --examples` → clean.
 
 ---
 
@@ -147,10 +170,10 @@ The per-call mask-construction cost: the old hand-rolled `causal_mask` built a `
 ## 6. Rust CI workflow (`.github/workflows/rust-voice.yml`)
 
 ### What it does
-Formalizes the `liquid-audio-rs` test suite in the build: every change to the crate (or the workflow) builds + runs `cargo test` on both x86_64 Linux and arm64 macOS.
+Formalizes the `liquid-audio` test suite in the build: every change to the crate (or the workflow) builds + runs `cargo test` on both x86_64 Linux and arm64 macOS.
 
 ### Triggers
-`push` / `pull_request` on path filter `experiments/lfm2-audio-voice/liquid-audio-rs/**` + `.github/workflows/rust-voice.yml`, plus `workflow_dispatch`.
+`push` / `pull_request` on path filter `packages/desktop/src-tauri/crates/liquid-audio/**` + `.github/workflows/rust-voice.yml`, plus `workflow_dispatch`.
 
 ### Matrix
 - `ubuntu-latest` — proves the cfg fallbacks compile and portable tests pass (BFMMLA self-skips, thread policy falls back to physical cores).
@@ -172,7 +195,199 @@ Formalizes the `liquid-audio-rs` test suite in the build: every change to the cr
 
 ## `THREADING_PARITY.md` — Claude's writeup (partially outdated)
 
-Claude's `THREADING_PARITY.md` documents items 1–4 above but was written **before** the mask memoization + vendored helpers (item 5) and the `to_vec4` extension. It lists "Realtime pipeline threading — DESIGN (remaining, task #24)" as the only remaining item. As-built, the mask memoization and `to_vec4` are also done. The writeup's "Remaining (task #25)" note (route bf16 through the model) is still accurate — that wiring is not done.
+Claude's `THREADING_PARITY.md` documents items 1–4 above but was written **before** the mask memoization + vendored helpers (item 5), the `to_vec4` extension, the realtime pipeline (§6), and the Tauri integration (§7). It has since been updated in-crate to reflect the realtime pipeline as done.
+
+---
+
+## 6. Multi-turn persistence + audio sampling defaults + realtime pipeline (Claude)
+
+### Multi-turn persistence (Gap A)
+The Python getting-started code persists one `ChatState` across turns: after
+generating a reply, it calls `chat.append(text, audio_out, modality_flag)` +
+`chat.end_turn()` + `chat.new_turn("user")` so the next utterance has context.
+The Rust `realtime.rs` previously created a fresh `ChatState::new()` every
+`respond()` call — each utterance was a cold start.
+
+**Fix:**
+- `ChatState::from_parts(proc, codebooks, text, audio_in, audio_in_lens,
+  audio_out, modality_flag)` — a thin constructor that seeds the five persisted
+  tensors from a prior conversation instead of `<|startoftext|>`. No change to
+  `new`; no ripple to existing callers.
+- `Lfm2VoiceEngine` holds `conv: Option<ConversationState>` (the five tensors).
+  `respond` seeds turn 1 from `ChatState::new` + system turn; later turns via
+  `from_parts`. After generation, collects `(text_ids, audio_frames,
+  modality_out)` from the `GenToken` stream, calls `chat.append()` +
+  `chat.end_turn()`, and saves `conv` **only on clean completion** (barge-in
+  discards the partial turn via `prior = self.conv.clone()` — history survives).
+- `ChatState<'a>` stays transient (borrows `proc` only within `respond`) — no
+  `Arc`/lifetime ripple.
+
+**EOAudio handling:** all frames including the all-2048 terminator are collected
+for `append` (so the model knows the audio segment ended in context); the EOAudio
+frame is skipped at the PCM-decode step (matching the Python's
+`audio_out[:-1]` for Mimi decode).
+
+### Audio sampling defaults (Gap B)
+`GenParams::demo_defaults()` — `audio_temperature: Some(1.0),
+audio_top_k: Some(4)` (text stays greedy `None`). Greedy audio is degenerate for
+the Depthformer (it's trained to sample). `Default` stays greedy for
+backward compat.
+
+### Configurable system prompt (Gap C)
+`Lfm2VoiceEngine::with_system_prompt(prompt)` builder replaces the hardcoded
+`"Respond with interleaved text and audio."`. The desktop `TurnMode` enum
+(`Asr`/`Tts`/`Interleaved`) maps mode→prompt+budget at the command layer
+(liquid-audio can't import desktop's `TurnMode` — the dependency points the
+other way).
+
+### `StreamingPcmResampler` (audio continuity)
+The old code called `resample_slice()` independently on each tiny decoded
+frame, resetting the filter at every chunk boundary. The new
+`StreamingPcmResampler` maintains `prev: Option<f32>` across calls for
+integer upsample (24kHz→48kHz, the common macOS case), doing linear
+interpolation between the last sample of the previous chunk and the first of
+the next. Tested (`streaming_resampler_keeps_integer_upsample_continuity`).
+
+### `can_interrupt` VAD gate
+The VAD loop in `voice_runtime.rs` now drops mic input while the assistant is
+speaking if `can_interrupt` is false — matching `chat.py`'s
+`ReplyOnPause(can_interrupt=False)`. This prevents the user's own speaker
+output from re-triggering a false utterance.
+
+### Canonical two-turn proof
+`examples/chat_multiturn.rs` (NEW) — the canonical two-turn proof on Metal bf16:
+- Turn 1 (spoken question): "Handcrafted Excellence, Every Day" — woodworking.
+- Turn 2 (text "…chairs…"): "…the quality and style of **your chairs**… Elevate
+  Your Seating Experience" — **chairs-conditioned**, proving turn 2's prefill
+  consumed turn 1's appended discrete audio as context.
+
+### `text_chat.rs` example
+A minimal text-only proof: `generate_sequential` + `add_text` + greedy, CPU
+F32. Exercises tokenizer → backbone → text head → sampler → detokenize without
+the audio path. 4.3 tok/s on CPU P-cores.
+
+### New examples
+- `examples/text_chat.rs` — text-only proof (no audio path)
+- `examples/chat_multiturn.rs` — canonical two-turn discrete-audio context proof
+
+### Tests
+62 lib tests pass (1 ignored = the real-model `engine_multiturn_grows_conv`
+test). Metal build clean. All examples compile.
+
+---
+
+## 7. Tauri voice service integration (Codex, commit `d3436b9`)
+
+### Crate moved
+The crate was moved from `experiments/lfm2-audio-voice/liquid-audio-rs/` to
+`packages/desktop/src-tauri/crates/liquid-audio/` and wired as a Tauri
+workspace dependency:
+```toml
+liquid-audio = { path = "crates/liquid-audio", features = ["metal"] }
+```
+
+### `voice_runtime.rs` (liquid-audio crate, 598 lines)
+The `VoiceRuntime` wraps `RealtimePipeline` + cpal capture/playback into a
+managed service. Contains:
+- `RuntimeConfig` — VAD threshold, silence ms, min utterance, `can_interrupt`.
+- The VAD loop (`vad_loop`) — energy-threshold onset detection, silence-pause
+  end-of-utterance, `can_interrupt` gate (drops mic while assistant speaks).
+- cpal input/output stream management — mono downmix in the callback, ring
+  buffer playback with prebuffer + idle-reset.
+- `mic_enabled` AtomicBool — pause/resume mic without killing the stream.
+
+### `voice/control.rs` (desktop crate, 516 lines)
+The Tauri command surface:
+- `voice_status` — returns `VoicePlan { provider, enabled, surface, running,
+  running_provider, mic_enabled, ready, detail }`. Reads from `VoiceRuntime`
+  for the runtime fields.
+- `voice_start` — returns `VoiceStartResult::Lfm2` or
+  `VoiceStartResult::Livekit { grant }`. For `lfm2`: spawns
+  `VoiceRuntime::start_lfm2` (which builds `Lfm2VoiceEngine` + starts the
+  pipeline + cpal). For `livekit`: starts the runtime tracking + mints a
+  LiveKit token via HTTP to the local sidecar (`livekit_grant()`).
+- `voice_stop` — calls `VoiceRuntime::stop()` (interrupts + drops the session).
+- `voice_set_mic_enabled` — pauses/resumes the cpal mic.
+- `VoiceEvent` contract — `State`/`Transcript`/`Level`/`AudioClip`/`Ended`/
+  `Error` (streamed over `tauri::ipc::Channel`).
+- `TurnMode` — `Asr`/`Tts`/`Interleaved` with `system_prompt()` and
+  `max_new_tokens()` matching the demo.
+
+### `voice/runtime.rs` (desktop crate, 579 lines)
+The `VoiceRuntime` manages the session lifecycle:
+- `VoiceSession` enum — `Lfm2(Lfm2Session)` / `Livekit(LiveKitSession)`.
+  Dispatches `is_finished`/`provider`/`session_id`/`interrupt`/
+  `set_mic_enabled`/`mic_enabled`/`stop` per variant.
+- `ThreadManager` — `Vec<JoinHandle>` with `reap()` (joins finished), `wait()`
+  (joins all before new session), `Drop` (joins all on shutdown). No detached
+  threads.
+- `Lfm2Session` — owns the `Lfm2Runtime` (from `voice_runtime.rs`), the
+  bridge cancel `AtomicBool`, and the done flag. `stop()` signals done +
+  drops the runtime.
+- `LiveKitSession` — lightweight state tracker (ctx + mic `AtomicBool`). The
+  actual LiveKit room lives in the webview; `stop()` is a no-op (the webview
+  calls `room.disconnect()`).
+
+### `voice/session.rs` (desktop crate)
+The HTTP session bridge for the LiveKit provider's delegate path — an SSE
+reducer that drives `POST /session/:id/prompt_async` + `GET /event` for the
+LiveKit provider when delegation is configured. This is the only HTTP path
+in the voice layer; the LFM2 path is fully in-process.
+
+### `settings.rs` (desktop crate, 285 lines)
+- `VoiceProvider` — `Off`/`Lfm2`/`Livekit`.
+- `Lfm2Settings` — `model_dir` (optional local snapshot), `model` (HF repo id,
+  default `"LiquidAI/LFM2.5-Audio-1.5B"`), `device`, `vad_threshold`,
+  `max_tokens`, `seed`, `delegate`.
+- `lfm2_model_ref()` — resolves: explicit `model` → `model_dir` (if
+  `config.json` exists) → `DEFAULT_LFM2_MODEL`. This means the default is a
+  downloadable HF repo id, not a local directory.
+- `lfm2_model_dir()` — resolves + `expand_user_path` (`~/` expansion).
+- `VoicePlan` readiness for `Lfm2` now always returns `ready: true` (the model
+  can download from HF on first start).
+
+### Frontend (`packages/app/src/`)
+- `lib/voice-settings.ts` — typed Tauri command wrappers
+  (`getVoiceSettings`/`setVoiceSettings`/`getVoiceStatus`/`startVoice`/
+  `stopVoice`/`setVoiceMicEnabled`). `startVoice` now returns
+  `VoiceStartResult` (the discriminated union). `VoicePlan` gained
+  `running`/`runningProvider`/`micEnabled` fields.
+- `lib/voice-state.ts` (NEW, 44 lines) — pure decision functions extracted
+  from the component: `voiceProvider`, `voiceEnabled`, `voiceButtonOn`,
+  `voiceMicTarget`, `shouldStopRuntimeForProviderChange`. Tested (6 unit
+  tests in `voice-state.test.ts`).
+- `context/voice.tsx` — rewritten to branch on provider: `lfm2` → Tauri
+  `startVoice` + Channel event listener (feeds `VoiceEvent`s into SolidJS
+  signals: `nativeAgent`, `nativeState`, `nativeLevel`, `nativeLine`,
+  `nativeMic`); `livekit` → `startVoice` returns a `LiveKitGrant` →
+  `room.connect()`. `disconnect`/`interrupt`/`setMicEnabled`/`toggleMute`
+  all branch on `nativeActive()` vs LiveKit. The `Room` is still created
+  unconditionally (needed for the `livekit` path), but unused for `lfm2`.
+- `components/settings-voice.tsx` — gained the "Hugging Face model" field
+  (for the repo id) alongside the optional "Local snapshot directory" field.
+- `components/prompt-input.tsx` — mic button visibility and mic-pause-on-typing
+  now use the extracted `voiceButtonOn`/`voiceMicTarget` functions.
+
+### `FRONTEND_DESIGN.md`
+The design doc for the voice frontend — phased:
+- Phase 1 (NOW): absolute parity with Liquid AI's demo (turn-based, ASR/TTS/
+  Interleaved, clip-based).
+- Phase 2 (LATER): natural full-duplex via Moshi (the LM, not just Mimi).
+
+### Known issues (from the `d3436b9` review)
+- **`livekit_grant` uses HTTP** to the local sidecar for token minting. The
+  LFM2 path is fully in-process; the LiveKit path still goes through HTTP
+  because the LiveKit credentials live on the server side.
+- **`LiveKitSession::stop()` is a no-op** — the room disconnect happens in the
+  webview. Correct but asymmetric.
+- **`voice_status` doesn't verify LFM2 model loadability** — reports
+  `ready: true` for LFM2 even when the model isn't downloaded. The actual
+  load/download happens in `voice_start`.
+- **`StreamingPcmResampler` only handles integer upsample continuously** —
+  non-integer ratios fall back to per-chunk `resample_slice` (no cross-chunk
+  continuity). Fine for 24k→48k (the common macOS case).
+- **`voice.tsx` still creates a `Room` unconditionally** — the LiveKit client
+  library is loaded even when the user only uses the local model.
 
 ---
 
@@ -189,28 +404,40 @@ Claude's `THREADING_PARITY.md` documents items 1–4 above but was written **bef
 | Mask memoization | ✅ done (faithful to `lfm2.rs`'s `Cache::mask`; eliminates per-call mask construction) |
 | Vendored `build_causal_mask`/`repeat_kv` | ✅ done (candle-transformers 0.10→0.9.2 backport) |
 | `to_vec4` | ✅ done (`TensorExt` trait; tested contiguous + strided) |
-| Rust CI workflow | ✅ done (untracked) |
-| **Route bf16 through the model** (task #25) | ❌ not done — kernel + op ready; backbone `Linear` matmuls don't call `bf16_matmul` yet; `loader.rs` still rejects bf16 on CPU |
-| **Realtime worker thread** (task #24) | ❌ not done — `Send` bounds are in place (the prerequisite); the worker thread + channels + barge-in not built |
-| **Commit the work** | ❌ nothing committed except `d87a52e` (deps/wiring); the 5 modified files + 6 untracked files are all uncommitted |
+| Rust CI workflow | ✅ done |
+| Multi-turn persistence | ✅ done (`ChatState::from_parts` + `ConversationState` + `chat_multiturn.rs` proof) |
+| Audio sampling defaults | ✅ done (`GenParams::demo_defaults()`) |
+| Configurable system prompt | ✅ done (`with_system_prompt` builder) |
+| `StreamingPcmResampler` | ✅ done (cross-chunk audio continuity for integer upsample) |
+| `can_interrupt` VAD gate | ✅ done (matches `chat.py`'s `ReplyOnPause(can_interrupt=False)`) |
+| Realtime worker thread (#24) | ✅ done (`RealtimePipeline` + `Lfm2VoiceEngine` + `voice_runtime.rs` + Tauri integration) |
+| Tauri voice service integration | ✅ done (`control.rs` + `runtime.rs` + `settings.rs` + frontend rewrite) |
+| Short-conv flashfftconv routing | ✅ done (commits `0b4fdab`/`2c8d18a`/`2b5721c` — prefill + decode through `candle-flashfftconv`) |
+| **Route bf16 through the model** (#25) | ⚠️ partial — short-conv routed through the kernel; backbone `Linear` matmuls still use candle's gemm; `loader.rs` still rejects bf16 on CPU for the full model |
+| **Moshi LM for full-duplex** (Phase 2) | ❌ not started — the `moshi` crate provides Mimi (codec) only; the LM (conversational full-duplex) is Phase 2 |
+| **ASR/TTS modes** | ❌ not wired — `TurnMode` enum exists; `generate_sequential` exists; the Tauri command doesn't dispatch on mode yet |
 
 ---
 
 ## Build + test verification (as-built)
 
 ```
-$ cargo test --lib
-test result: ok. 57 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+$ cargo test --lib (in packages/desktop/src-tauri/crates/liquid-audio)
+test result: ok. 62 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 
-$ cargo build --all-targets
-Finished `dev` profile [unoptimized + debuginfo] target(s)
+$ cargo build --features metal --examples
+Finished `release` profile [optimized] target(s)
 
 $ cargo test --lib -- --nocapture | grep key
 BFMMLA bf16 GEMM vs f32(bf16-inputs) ref: max 0.000e0 (rel 0.000e0)
 intraop threads = 8 (physical 12, logical 12)
 test model::mlp::tests::mlp_is_send ... ok
 test threads::tests::realtime_pipeline_types_are_send ... ok
-test result: ok. 57 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test realtime::tests::streaming_resampler_keeps_integer_upsample_continuity ... ok
+test result: ok. 62 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 ```
 
-57 tests pass (was 50 before this work; +3 MLP tests, +1 bf16 test, +1 threads test, +1 Send probe, +1 `to_vec4` test).
+62 tests pass (was 50 before this work; +3 MLP, +1 bf16, +1 threads, +1 Send
+probe, +1 `to_vec4`, +5 realtime pipeline, +1 streaming resampler). The crate
+is now committed at `packages/desktop/src-tauri/crates/liquid-audio/` and
+wired into the Tauri desktop build.

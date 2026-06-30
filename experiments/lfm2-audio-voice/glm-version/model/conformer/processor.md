@@ -1,7 +1,7 @@
 # conformer_processor (Rust port)
-**Source:** `liquid-audio-rs/src/model/conformer/processor.rs` · **Python:** `upstream-liquid-audio/src/liquid_audio/model/conformer/processor.py` · **On the LFM2-Audio inference path:** yes
+**Source:** `liquid-audio/src/model/conformer/processor.rs` · **Python:** `upstream-liquid-audio/src/liquid_audio/model/conformer/processor.py` · **On the LFM2-Audio inference path:** yes
 
-> Companion to [`ARCH/model/conformer/processor.md`](../../ARCH/model/conformer/processor.md).
+> Companion to [`wiki/model/conformer/processor.md`](../../../wiki/model/conformer/processor.md).
 
 ## Role
 This is the **mel front-end** for audio-IN in the Rust port: it turns mic PCM
@@ -177,8 +177,8 @@ math and [`glm-version/model/conformer/encoder.md`](encoder.md).
   not this featurizer.
 
 ## Cross-references
-- [`ARCH/model/conformer/processor.md`](../../ARCH/model/conformer/processor.md)
+- [`wiki/model/conformer/processor.md`](../../../wiki/model/conformer/processor.md)
   — Python original.
-- `liquid-audio-rs/PYTHON_VS_RUST.md` §1.4 (the mel precision repair), §2.9
+- `liquid-audio/PYTHON_VS_RUST.md` §1.4 (the mel precision repair), §2.9
   (audio FFTs — candle-native ports).
-- `liquid-audio-rs/parity/PARITY.md` — mel 9.31e-6, conformer-through-mel 5.6e-7.
+- `liquid-audio/parity/PARITY.md` — mel 9.31e-6, conformer-through-mel 5.6e-7.

@@ -1,7 +1,7 @@
 # core_trainer (Rust port)
-**Source:** `liquid-audio-rs/src/trainer.rs` · **Python:** `upstream-liquid-audio/src/liquid_audio/trainer.py` · **On the LFM2-Audio inference path:** no
+**Source:** `liquid-audio/src/trainer.rs` · **Python:** `upstream-liquid-audio/src/liquid_audio/trainer.py` · **On the LFM2-Audio inference path:** no
 
-> Companion to [`ARCH/trainer.md`](../ARCH/trainer.md). The original is already
+> Companion to [`wiki/trainer.md`](../../wiki/trainer.md). The original is already
 > notably Rust-aware (it references `trainer.rs` line numbers throughout); this
 > version is Rust-first and consolidates the Rust-specific divergences.
 
@@ -179,10 +179,10 @@ trainer-side loss). Loaders are stored on `self` to match
   `model.safetensors` for the final model.
 
 ## Cross-references
-- [`ARCH/trainer.md`](../ARCH/trainer.md) — Python original (already
+- [`wiki/trainer.md`](../../wiki/trainer.md) — Python original (already
   Rust-aware).
-- `liquid-audio-rs/PYTHON_VS_RUST.md` §2.1 (device-agnostic), §2.6 (trainer —
+- `liquid-audio/PYTHON_VS_RUST.md` §2.1 (device-agnostic), §2.6 (trainer —
   `accelerate`/torch → candle, loss on the model, de-duplicated).
-- `liquid-audio-rs/src/data/dataloader.rs` — `LFM2DataLoader` + `lfm2_collator`.
-- `liquid-audio-rs/src/loader.rs` — `from_pretrained_trainable` (the trainable
+- `liquid-audio/src/data/dataloader.rs` — `LFM2DataLoader` + `lfm2_collator`.
+- `liquid-audio/src/loader.rs` — `from_pretrained_trainable` (the trainable
   load path).

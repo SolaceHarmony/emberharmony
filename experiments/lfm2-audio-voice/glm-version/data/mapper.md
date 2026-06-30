@@ -1,7 +1,7 @@
 # data_mapper (Rust port)
-**Source:** `liquid-audio-rs/src/data/mapper.rs` · **Python:** `upstream-liquid-audio/src/liquid_audio/data/mapper.py` · **On the LFM2-Audio inference path:** no
+**Source:** `liquid-audio/src/data/mapper.rs` · **Python:** `upstream-liquid-audio/src/liquid_audio/data/mapper.py` · **On the LFM2-Audio inference path:** no
 
-> Companion to [`ARCH/data/mapper.md`](../../ARCH/data/mapper.md). The original
+> Companion to [`wiki/data/mapper.md`](../../../wiki/data/mapper.md). The original
 > is already Rust-aware; this is the Rust-first version.
 
 ## Role
@@ -137,7 +137,7 @@ rows back. See [`glm-version/data/preprocess.md`](preprocess.md) and
   returns frame-major.
 
 ## Cross-references
-- [`ARCH/data/mapper.md`](../../ARCH/data/mapper.md) — Python original.
-- `liquid-audio-rs/PYTHON_VS_RUST.md` §2.7 (data pipeline — `soundfile` →
+- [`wiki/data/mapper.md`](../../../wiki/data/mapper.md) — Python original.
+- `liquid-audio/PYTHON_VS_RUST.md` §2.7 (data pipeline — `soundfile` →
   symphonia, `torchaudio.resample` → windowed-sinc).
-- `liquid-audio-rs/src/resample.rs` — the windowed-sinc resampler.
+- `liquid-audio/src/resample.rs` — the windowed-sinc resampler.

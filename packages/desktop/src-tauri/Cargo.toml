@@ -44,6 +44,9 @@ uuid = { version = "1.19.0", features = ["v4"] }
 tauri-plugin-decorum = "1.1.1"
 comrak = { version = "0.50", default-features = false }
 candle-core = "0.9"
+# HF token storage in the OS keychain (macOS Keychain / Windows Credential Manager /
+# Linux Secret Service). The token never lands in the settings JSON — see voice::model.
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 webkit2gtk = "=2.0.2"

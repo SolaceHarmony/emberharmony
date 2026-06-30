@@ -1,10 +1,10 @@
 # model_lfm2_backbone (Rust port)
-**Source:** `liquid-audio-rs/src/model/lfm2_hf.rs` · **Python:** `transformers.Lfm2Model` (imported by `upstream-liquid-audio/src/liquid_audio/model/lfm2_audio.py`) · **On the LFM2-Audio inference path:** yes
+**Source:** `liquid-audio/src/model/lfm2_hf.rs` · **Python:** `transformers.Lfm2Model` (imported by `upstream-liquid-audio/src/liquid_audio/model/lfm2_audio.py`) · **On the LFM2-Audio inference path:** yes
 
-> Companion to [`ARCH/model/lfm2_backbone.md`](../../ARCH/model/lfm2_backbone.md).
+> Companion to [`wiki/model/lfm2_backbone.md`](../../../wiki/model/lfm2_backbone.md).
 > The original documents the *external* HF `transformers.Lfm2Model` and uses the
 > Rust port as the readable spec; this documents the Rust port
-> (`liquid-audio-rs/src/model/lfm2_hf.rs`) directly and where it diverges from
+> (`liquid-audio/src/model/lfm2_hf.rs`) directly and where it diverges from
 > the HF Python source.
 >
 > **As-built update (Claude's mask memoization + vendored helpers):** the
@@ -256,12 +256,12 @@ tied text logits 5.505e-6 (PARITY.md).
   starting a new generation turn with the same `Cache`.
 
 ## Cross-references
-- [`ARCH/model/lfm2_backbone.md`](../../ARCH/model/lfm2_backbone.md) — Python
+- [`wiki/model/lfm2_backbone.md`](../../../wiki/model/lfm2_backbone.md) — Python
   original (which uses this Rust port as the readable spec).
 - [`glm-version/model/transformer.md`](transformer.md) — the `RmsNorm` shared
   with this module, and the depthformer (which uses the *interleaved* `rope_i`,
   not the NeoX half-split `rope` used here).
-- `liquid-audio-rs/PYTHON_VS_RUST.md` §2.1 (device-agnostic), §2.2 (CUDA kernels
+- `liquid-audio/PYTHON_VS_RUST.md` §2.1 (device-agnostic), §2.2 (CUDA kernels
   → portable candle ops), §2.4 (RMSNorm bf16 order).
-- `liquid-audio-rs/parity/PARITY.md` — backbone hidden 6.558e-6, text logits
+- `liquid-audio/parity/PARITY.md` — backbone hidden 6.558e-6, text logits
   5.505e-6.

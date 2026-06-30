@@ -1,7 +1,7 @@
 # conformer_utils (Rust port)
-**Source:** `liquid-audio-rs/src/model/conformer/utils.rs` · **Python:** `upstream-liquid-audio/src/liquid_audio/model/conformer/utils.py` · **On the LFM2-Audio inference path:** yes (but inert on the offline path)
+**Source:** `liquid-audio/src/model/conformer/utils.rs` · **Python:** `upstream-liquid-audio/src/liquid_audio/model/conformer/utils.py` · **On the LFM2-Audio inference path:** yes (but inert on the offline path)
 
-> Companion to [`ARCH/model/conformer/utils.md`](../../ARCH/model/conformer/utils.md).
+> Companion to [`wiki/model/conformer/utils.md`](../../../wiki/model/conformer/utils.md).
 > The original documents the Python NeMo helpers; this documents the Rust port
 > and where it diverges.
 
@@ -129,9 +129,9 @@ This component is a config/guard layer; it carries **no activation tensors**.
   the autocast guard is recorded in `PORT_STATUS.md`.
 
 ## Cross-references
-- [`ARCH/model/conformer/utils.md`](../../ARCH/model/conformer/utils.md) —
+- [`wiki/model/conformer/utils.md`](../../../wiki/model/conformer/utils.md) —
   Python original.
-- `liquid-audio-rs/PYTHON_VS_RUST.md` §2.5 (off-path NeMo machinery → inventory
+- `liquid-audio/PYTHON_VS_RUST.md` §2.5 (off-path NeMo machinery → inventory
   stubs), §2.6 (accelerator.autocast → candle equivalents).
-- `liquid-audio-rs/PORT_STATUS.md` — the `// PORT:` no-op note for
+- `liquid-audio/PORT_STATUS.md` — the `// PORT:` no-op note for
   `avoid_float16_autocast_context`.

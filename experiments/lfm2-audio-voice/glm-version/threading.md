@@ -1,6 +1,6 @@
 # Threading & concurrency — Python (torch + liquid_audio + moshi) ↔ Rust
 
-> **Rust-side companion:** `liquid-audio-rs/THREADING_PARITY.md` (the implementer's view +
+> **Rust-side companion:** `liquid-audio/THREADING_PARITY.md` (the implementer's view +
 > verification). This doc is the reference-side dissection: what torch and the Python demos
 > actually do, and where the Rust port matches, differs, or deliberately improves.
 
@@ -18,7 +18,7 @@ A single `matmul`/`conv` is parallelized internally across worker threads.
 | **torch** | ATen `at::parallel_for` over a global intra-op pool | `intraop_default_num_threads()` (`ParallelCommon.cpp`): `OMP_NUM_THREADS`→`MKL_NUM_THREADS`, else `TaskThreadPoolBase::defaultNumThreads()` ⇒ on Apple Silicon **`hw.perflevel0.physicalcpu` (P-cores only)** |
 | **Rust/candle** | the `gemm` crate + candle kernels call **rayon's global pool** | default `num_cpus::get()` = **all logical cores** (incl. slow E-cores) |
 
-**Parity: ACHIEVED.** `liquid-audio-rs/src/threads.rs` (`configure_intraop_threads`)
+**Parity: ACHIEVED.** `liquid-audio/src/threads.rs` (`configure_intraop_threads`)
 replicates torch's policy exactly and installs it as rayon's global pool, so candle + `gemm`
 inherit it. Verified on M2 Max: candle would pick 12 (all logical); we pick **8** (P-cores),
 byte-matching `sysctl hw.perflevel0.physicalcpu`. This is the single biggest compute-parity
@@ -85,14 +85,26 @@ VecDeque>>` ring; cpal callback threads do I/O. Gen overlaps playback (different
 gen **blocks main** and the mic is dropped during generation — **half-duplex**, no
 producer/consumer split. This is the closest analog to `chat.py` *minus* the producer thread.
 
-### Rust · `src/realtime.rs` + `examples/duplex_chat.rs` — worker thread + channels (new)
+### Rust · `src/realtime.rs` + `src/voice_runtime.rs` + Tauri integration — worker thread + channels + managed service (as-built)
 A **persistent inference worker thread** (`RealtimePipeline`) **owns** the model + processor +
 detokenizer (`VoiceEngine` trait; real impl `Lfm2VoiceEngine`) and loops `recv Utterance →
 respond (emit text + decode audio → emit PCM) → TurnComplete`, over **`crossbeam-channel`**.
-The consumer drains `VoiceEvent`s → cpal ring + stdout. **True parallel** (worker ‖ consumer ‖
-cpal callbacks, no GIL), **full-duplex** (live mic), with **explicit barge-in**: an
-`AtomicBool` that `generate_interleaved_cancellable` polls each decode step to abort the reply
-mid-stream (`chat.py` cannot do this; it is a turn-based take on Moshi's interruptibility).
+The consumer drains `VoiceEvent`s → cpal ring + stdout / Tauri Channel. **True parallel**
+(worker ‖ consumer ‖ cpal callbacks, no GIL), **full-duplex** (live mic), with **explicit
+barge-in**: an `AtomicBool` that `generate_interleaved_cancellable` polls each decode step to
+abort the reply mid-stream.
+
+The `voice_runtime.rs` module wraps the pipeline + cpal capture/playback into a `VoiceRuntime`
+service: energy VAD → utterance submission, `can_interrupt` gate (drops mic while assistant
+speaks, matching `chat.py`'s `ReplyOnPause(can_interrupt=False)`), `StreamingPcmResampler`
+for cross-chunk audio continuity (24k→48k integer upsample).
+
+The Tauri integration (`voice/control.rs` + `voice/runtime.rs` in the desktop crate) wraps
+`VoiceRuntime` in a `VoiceSession` enum (`Lfm2`/`Livekit`) managed via `tauri::State` with a
+`ThreadManager` (reap/wait/drop). `voice_start` spawns the pipeline, `voice_stop` interrupts +
+drops, `voice_set_mic_enabled` pauses the cpal mic. Events stream over a
+`tauri::ipc::Channel<VoiceEvent>` to the SolidJS frontend. **No HTTP for the LFM2 path** —
+fully in-process.
 
 ### Mapping
 
@@ -137,5 +149,8 @@ should not) impose Moshi's continuous-duplex frame loop on a turn-based model.
   `set_num_interop_threads` (inter-op pool), pybind GIL-release on dispatched ops.
 - `upstream-liquid-audio/src/liquid_audio/demo/chat.py` (`chat_producer`/`chat_response`).
 - `upstream-liquid-audio/src/liquid_audio/moshi/server.py` (`handle_chat`'s 3 coroutines).
-- Rust: `src/threads.rs`, `src/realtime.rs`, `src/model/lfm2_audio.rs`
-  (`generate_interleaved_cancellable`), `examples/mic_chat.rs`, `examples/duplex_chat.rs`.
+- Rust: `src/threads.rs`, `src/realtime.rs`, `src/voice_runtime.rs`,
+  `src/model/lfm2_audio.rs` (`generate_interleaved_cancellable`),
+  `examples/mic_chat.rs`, `examples/duplex_chat.rs`, `examples/chat_multiturn.rs`,
+  `../../packages/desktop/src-tauri/src/voice/control.rs`,
+  `../../packages/desktop/src-tauri/src/voice/runtime.rs`.

@@ -70,14 +70,47 @@ pub fn get_model_dir(
     download_snapshot(repo_or_path, revision)
 }
 
+/// Per-file progress for [`snapshot_download_with`]. `index` is 0-based; `total` is the
+/// sibling count. Byte-level progress is **not** available from hf-hub's sync API (it only
+/// offers a terminal indicatif bar), so progress is honestly reported per file, not per byte.
+#[derive(Debug, Clone)]
+pub struct DownloadProgress {
+    pub index: usize,
+    pub total: usize,
+    pub file: String,
+}
+
 /// `snapshot_download(repo_id, revision=...)` — fetch every file in the repo into
-/// the HF cache and return the snapshot directory (parent of `config.json`).
+/// the HF cache and return the snapshot directory (parent of `config.json`). Ambient
+/// credential, no progress callback; the token-aware/progress-reporting form is
+/// [`snapshot_download_with`].
 #[cfg(feature = "download")]
 fn download_snapshot(repo_id: &str, revision: Option<&str>) -> std::io::Result<std::path::PathBuf> {
-    use hf_hub::{api::sync::Api, Repo, RepoType};
+    snapshot_download_with(repo_id, revision, None, |_| {})
+}
+
+/// `huggingface_hub.snapshot_download(repo_id, revision=, token=)` with a per-file progress
+/// callback. Fail-hard: any hf-hub error propagates; returns the snapshot directory (parent
+/// of `config.json`), or `NotFound` if the repo has none. `token`, when `Some`, overrides the
+/// ambient credential (`HF_TOKEN` / `~/.cache/huggingface/token`); `None` leaves hf-hub's
+/// default ambient resolution intact (so an existing `huggingface-cli login` keeps working).
+#[cfg(feature = "download")]
+pub fn snapshot_download_with(
+    repo_id: &str,
+    revision: Option<&str>,
+    token: Option<&str>,
+    mut progress: impl FnMut(DownloadProgress),
+) -> std::io::Result<std::path::PathBuf> {
+    use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
     let to_io = |e: hf_hub::api::sync::ApiError| std::io::Error::other(format!("hf-hub: {e}"));
 
-    let api = Api::new().map_err(to_io)?;
+    // Only override the token when one is supplied — `with_token(None)` would *disable*
+    // ambient resolution, which is the opposite of what `token: None` means here.
+    let mut builder = ApiBuilder::new();
+    if let Some(t) = token {
+        builder = builder.with_token(Some(t.to_string()));
+    }
+    let api = builder.build().map_err(to_io)?;
     let repo = match revision {
         Some(rev) => api.repo(Repo::with_revision(
             repo_id.to_string(),
@@ -89,8 +122,14 @@ fn download_snapshot(repo_id: &str, revision: Option<&str>) -> std::io::Result<s
 
     // List then fetch every sibling (snapshot_download grabs the whole repo).
     let info = repo.info().map_err(to_io)?;
+    let total = info.siblings.len();
     let mut root: Option<std::path::PathBuf> = None;
-    for sib in &info.siblings {
+    for (index, sib) in info.siblings.iter().enumerate() {
+        progress(DownloadProgress {
+            index,
+            total,
+            file: sib.rfilename.clone(),
+        });
         let path = repo.get(&sib.rfilename).map_err(to_io)?;
         if sib.rfilename == "config.json" {
             root = path.parent().map(|p| p.to_path_buf());

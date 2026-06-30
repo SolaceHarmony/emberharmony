@@ -1,7 +1,7 @@
 # data_dataloader (Rust port)
-**Source:** `liquid-audio-rs/src/data/dataloader.rs` · **Python:** `upstream-liquid-audio/src/liquid_audio/data/dataloader.py` · **On the LFM2-Audio inference path:** no
+**Source:** `liquid-audio/src/data/dataloader.rs` · **Python:** `upstream-liquid-audio/src/liquid_audio/data/dataloader.py` · **On the LFM2-Audio inference path:** no
 
-> Companion to [`ARCH/data/dataloader.md`](../../ARCH/data/dataloader.md). The
+> Companion to [`wiki/data/dataloader.md`](../../../wiki/data/dataloader.md). The
 > original is already Rust-aware; this is the Rust-first version.
 
 ## Role
@@ -119,7 +119,7 @@ back into modality slots using `modality_flag`, computes loss masked by
   call; Rust owns decoded rows in a `Vec` (`:38`). Same observable semantics.
 
 ## Cross-references
-- [`ARCH/data/dataloader.md`](../../ARCH/data/dataloader.md) — Python original.
-- `liquid-audio-rs/PYTHON_VS_RUST.md` §2.1 (device-agnostic), §2.7 (data
+- [`wiki/data/dataloader.md`](../../../wiki/data/dataloader.md) — Python original.
+- `liquid-audio/PYTHON_VS_RUST.md` §2.1 (device-agnostic), §2.7 (data
   pipeline — HF `datasets` → pure-Rust `arrow`).
-- `liquid-audio-rs/src/data/arrow_io.rs` — the Arrow IPC reader.
+- `liquid-audio/src/data/arrow_io.rs` — the Arrow IPC reader.

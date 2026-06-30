@@ -1,21 +1,25 @@
-# `glm-version/` — Rust-side architecture docs for `liquid-audio-rs`
+# `glm-version/` — Rust-side architecture docs for `liquid-audio`
 
-This folder mirrors the `ARCH/` tree (which documents the **Python** source of
+This folder mirrors the the `wiki/` tree (formerly `wiki/`) (which documents the **Python** source of
 Liquid AI's `liquid_audio`) with **Rust-first** companions for the
-`liquid-audio-rs` port. Each file documents the Rust source file(s), how the
+`liquid-audio` port. Each file documents the Rust source file(s), how the
 port works in Rust, and — most importantly — **where the port deliberately
 diverges from the Python and why**.
 
-The original `ARCH/` files were created by Claude on the Python code. These
+The original `wiki/` files (formerly `wiki/`) were created by Claude on the Python code. These
 companions are the Rust-side view: same topic, different language, focused on
 the differences a Rust reader (or future GLM session) needs to know. They live
-under `glm-version/` so they are safe from touches to the `ARCH/` tree.
+under `glm-version/` so they are safe from touches to the the `wiki/` tree (formerly `wiki/`).
 
 ## Layout
 
 ```
 glm-version/
+├── AS_BUILT_claude_changes.md       # All Claude + Codex changes to the crate (as-built record)
 ├── threading.md                     # Python↔Rust threading models (torch intra/inter-op, GIL, chat.py/moshi vs realtime.rs)
+├── tauri-voice.md                   # Tauri voice service: control.rs, runtime.rs, session.rs, settings.rs
+├── voice_runtime.md                 # voice_runtime.rs: cpal VAD + playback runtime (the in-process voice loop)
+├── frontend.md                      # voice.tsx, voice-settings.ts, voice-state.ts, settings-voice.tsx
 ├── utils.md                         # LFMModality, mel2emb_len, module_exists, get_model_dir
 ├── processor.md                     # LFM2AudioProcessor + ChatState (the I/O container)
 ├── detokenizer.md                   # LFM2AudioDetokenizer + Istft (the LFM2 ISTFT vocoder)
@@ -41,30 +45,38 @@ glm-version/
 │   ├── README.md                     # overview: reused via the `moshi` crate, not re-ported
 │   └── STATUS.md                     # per-file status table (on-path codec vs off-path LM/transport)
 └── demo/
-    ├── chat.md                       # mic_chat.rs (the realtime speech-to-speech demo)
-    └── model.md                      # demo/model.py — NOT ported (loader.rs/mic_chat.rs replace it)
+    ├── chat.md                       # mic_chat.rs, duplex_chat.rs, text_chat.rs, chat_multiturn.rs
+    └── model.md                      # demo/model.py — NOT ported (loader.rs/examples replace it)
 ```
 
-## As-built changes by Claude
+## As-built changes by Claude + Codex
 
 [`AS_BUILT_claude_changes.md`](AS_BUILT_claude_changes.md) documents the
-threading, bf16 BFMMLA kernel, `Send` fixes, mask memoization, and `to_vec4`
-extension Claude made to `liquid-audio-rs` across multiple sessions. These are
-**not** part of the original Python port — they are execution-model parity work
-(matching torch's intra-op thread policy, closing candle's CPU bf16-matmul gap,
-and memoizing causal masks to eliminate per-call construction cost). A prior
+threading, bf16 BFMMLA kernel, `Send` fixes, mask memoization, `to_vec4`
+extension, multi-turn persistence, and the Tauri voice service integration
+made to `liquid-audio` across multiple sessions by Claude and Codex. These
+are **not** part of the original Python port — they are execution-model
+parity work (matching torch's intra-op thread policy, closing candle's CPU
+bf16-matmul gap, memoizing causal masks, adding barge-in, multi-turn
+conversation, and wiring the in-process Tauri voice service). A prior
 zero-copy `KvCache` swap was reverted as a deviation from the reference. The
-relevant per-module docs (`mlp.md`, `lfm2_backbone.md`) have been updated with
-cross-references to the as-built doc.
+relevant per-module docs (`mlp.md`, `lfm2_backbone.md`) have been updated
+with cross-references to the as-built doc.
+
+The crate was **moved** from `experiments/lfm2-audio-voice/liquid-audio-rs/`
+to `packages/desktop/src-tauri/crates/liquid-audio/` and is now a Tauri
+workspace dependency (`liquid-audio = { path = "crates/liquid-audio",
+features = ["metal"] }`). All path references in these docs have been
+updated to the new location.
 
 ## What these docs are (and aren't)
 
 - **Are:** Rust-first architecture docs. Each file documents the Rust source
   file's role, how it works in Rust, its dtypes/shapes, its wiring, and a
   Python↔Rust diff table explaining every deliberate divergence and why.
-- **Aren't:** a rehash of the Python. The `ARCH/` tree already covers the
+- **Aren't:** a rehash of the Python. The the `wiki/` tree (formerly `wiki/`) already covers the
   Python in depth; these docs cross-reference it and focus on the Rust
-  differences. Read the `ARCH/` file for the Python's full mechanism; read the
+  differences. Read the `wiki/` file for the Python's full mechanism; read the
   `glm-version/` file for what the Rust port actually does and where it
   diverges.
 
@@ -143,15 +155,20 @@ They are documented per-file but summarized here so the pattern is visible:
    (`model/transformer.md`) for the audio-OUT head.
 4. [`moshi/README.md`](moshi/README.md) explains why the moshi tree is reused
    not re-ported.
-5. The `ARCH/` originals are the Python-side companions — same topic, different
+5. The `wiki/` originals are the Python-side companions — same topic, different
    language.
 
 ## Cross-references
 
-- `ARCH/` — the Python-first architecture docs (Claude's originals).
-- `liquid-audio-rs/PYTHON_VS_RUST.md` — the port report (where we are the same,
-  where we differ, why).
-- `liquid-audio-rs/PORT_STATUS.md` — the 38/38 class + 170/170 symbol
-  inventory.
-- `liquid-audio-rs/parity/PARITY.md` — the numerical parity harness workflow +
-  results.
+- `wiki/` — the Python-first architecture docs (Claude's originals; now moved
+  to `wiki/` in the repo root).
+- `packages/desktop/src-tauri/crates/liquid-audio/PYTHON_VS_RUST.md` — the port
+  report (where we are the same, where we differ, why).
+- `packages/desktop/src-tauri/crates/liquid-audio/PORT_STATUS.md` — the 38/38
+  class + 170/170 symbol inventory.
+- `packages/desktop/src-tauri/crates/liquid-audio/THREADING_PARITY.md` — the
+  implementer's threading-parity view + verification.
+- `packages/desktop/src-tauri/crates/liquid-audio/parity/PARITY.md` — the
+  numerical parity harness workflow + results.
+- `packages/desktop/src-tauri/src/voice/FRONTEND_DESIGN.md` — the Tauri voice
+  frontend design doc (turn mode + live mode, one event-driven core).

@@ -1,9 +1,13 @@
 # core_processor (Rust port)
-**Source:** `liquid-audio-rs/src/processor.rs` · **Python:** `upstream-liquid-audio/src/liquid_audio/processor.py` · **On the LFM2-Audio inference path:** yes
+**Source:** `liquid-audio/src/processor.rs` · **Python:** `upstream-liquid-audio/src/liquid_audio/processor.py` · **On the LFM2-Audio inference path:** yes
 
-> Companion to [`ARCH/processor.md`](../ARCH/processor.md). The original
+> Companion to [`wiki/processor.md`](../../wiki/processor.md). The original
 > documents the Python `LFM2AudioProcessor` + `ChatState`; this documents the
 > Rust port and where it diverges.
+>
+> **As-built update:** `ChatState::from_parts` (a multi-turn persistence
+> constructor that seeds the five tensors from a prior conversation) has been
+> added. See [`AS_BUILT_claude_changes.md`](AS_BUILT_claude_changes.md) §6.
 
 ## Role
 `LFM2AudioProcessor` (`processor.rs:63`) is the I/O container in the Rust port
@@ -169,11 +173,11 @@ CPU bf16 matmul), Metal stays bf16.
   fallback. Both are loaded independently so a full snapshot keeps both.
 
 ## Cross-references
-- [`ARCH/processor.md`](../ARCH/processor.md) — Python original.
-- `liquid-audio-rs/PYTHON_VS_RUST.md` §2.1 (device-agnostic), §2.7 (resample
+- [`wiki/processor.md`](../../wiki/processor.md) — Python original.
+- `liquid-audio/PYTHON_VS_RUST.md` §2.1 (device-agnostic), §2.7 (resample
   port).
-- `liquid-audio-rs/src/loader.rs` — `from_pretrained` (shared model+processor
+- `liquid-audio/src/loader.rs` — `from_pretrained` (shared model+processor
   loader).
-- `liquid-audio-rs/src/audio_out.rs` — the `AudioDetokenizer` trait + both
+- `liquid-audio/src/audio_out.rs` — the `AudioDetokenizer` trait + both
   backends.
-- `liquid-audio-rs/src/resample.rs` — the windowed-sinc resampler.
+- `liquid-audio/src/resample.rs` — the windowed-sinc resampler.

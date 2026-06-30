@@ -1,6 +1,6 @@
 # `data/` — Rust-side architecture docs for the data pipeline
 
-Rust-first companions for the `liquid-audio-rs/src/data/` training-data
+Rust-first companions for the `liquid-audio/src/data/` training-data
 pipeline. The whole tree is **off the inference path** — it exists to build
 Arrow datasets of pre-packed training rows.
 
@@ -13,4 +13,4 @@ Arrow datasets of pre-packed training rows.
 
 See [`../README.md`](../README.md) for the recurring Rust divergences
 (device-agnostic, `symphonia`/`arrow` backends, U8 for bool, etc.) and the
-parity summary. See `ARCH/data/` for the Python-first companions.
+parity summary. See `wiki/data/` for the Python-first companions.

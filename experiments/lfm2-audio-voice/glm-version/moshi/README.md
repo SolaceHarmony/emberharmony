@@ -1,6 +1,6 @@
 # Kyutai Moshi stack — Rust port (reused via the `moshi` crate)
 
-> Companion to [`ARCH/moshi/README.md`](../../ARCH/moshi/README.md). The
+> Companion to [`wiki/moshi/README.md`](../../../wiki/moshi/README.md). The
 > original documents the **vendored Python** `liquid_audio/moshi/**`; this
 > documents the **Rust port's** relationship to that code.
 
@@ -13,7 +13,7 @@ uses the Encodec-style `encoder.layers.N`/weight-norm layout and **cannot load
 this checkpoint** (PYTHON_VS_RUST.md §2.3).
 
 The `moshi` crate pins `candle ^0.9.1` (= our 0.9.2). It is consumed in-tree via
-`liquid-audio-rs/src/audio_out.rs::MimiDetokenizer`, a thin adapter wrapping
+`liquid-audio/src/audio_out.rs::MimiDetokenizer`, a thin adapter wrapping
 `RefCell<Mimi>` behind the `AudioDetokenizer` trait. The processor
 (`processor.rs`) dispatches `decode` through `Box<dyn AudioDetokenizer>` and
 never touches a concrete codec type.
@@ -27,11 +27,11 @@ the asyncio WebSocket transport, the conditioners, and the clients — is **a
 different model / off-path reference only**, and is **not ported** to Rust.
 
 ## What the Rust port actually has
-- `liquid-audio-rs/src/audio_out.rs` — the `AudioDetokenizer` trait + the
+- `liquid-audio/src/audio_out.rs` — the `AudioDetokenizer` trait + the
   `MimiDetokenizer` adapter over `moshi::mimi::Mimi`. This is the **only**
   in-tree Rust code for the moshi codec. It exposes `decode`, `decode_step`
   (streaming), `encode` (for training-data prep), and `reset_stream`.
-- `liquid-audio-rs/Cargo.toml` — the `moshi` crate dependency.
+- `liquid-audio/Cargo.toml` — the `moshi` crate dependency.
 
 ## What the Rust port does NOT have
 - No in-tree port of `compression.py`, `vq.py`, `core_vq.py`, `seanet.py`,
@@ -79,9 +79,9 @@ for each Python file are a single-line status. See
   Streaming `decode_step` rejects non-multiple-of-1920 lengths.
 
 ## Cross-references
-- [`ARCH/moshi/README.md`](../../ARCH/moshi/README.md) — the vendored Python
+- [`wiki/moshi/README.md`](../../../wiki/moshi/README.md) — the vendored Python
   overview (component wiring diagram + per-file specs).
-- `liquid-audio-rs/PYTHON_VS_RUST.md` §2.3 (codec reuse), §2.10 (the reverted
+- `liquid-audio/PYTHON_VS_RUST.md` §2.3 (codec reuse), §2.10 (the reverted
   f64 detour — does not apply to Mimi).
-- `liquid-audio-rs/src/audio_out.rs` — the `AudioDetokenizer` trait +
+- `liquid-audio/src/audio_out.rs` — the `AudioDetokenizer` trait +
   `MimiDetokenizer` adapter.

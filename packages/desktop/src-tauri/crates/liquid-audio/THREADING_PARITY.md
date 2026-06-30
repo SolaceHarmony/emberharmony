@@ -88,8 +88,23 @@ The threading is **unit-tested with a fake engine** (`realtime::tests`): event o
 worker persistence across turns, barge-in aborts the in-flight turn, engine errors are reported
 without killing the worker, and `Drop` joins + drops the engine. End-to-end full-duplex (live
 cpal capture, VAD-driven utterance boundaries, voice-onset-during-reply ⇒ barge-in + flush) is
-the **`duplex_chat`** example. (No acoustic echo cancellation yet — the assistant's own audio
-can re-trigger the mic VAD; headphones / higher `LFM_VAD_THRESHOLD` mitigate.)
+the **`duplex_chat`** example.
+
+The `voice_runtime.rs` module wraps the pipeline + cpal into a `VoiceRuntime` service: energy
+VAD → utterance submission, `can_interrupt` gate (drops mic while assistant speaks, matching
+`chat.py`'s `ReplyOnPause(can_interrupt=False)`), `StreamingPcmResampler` for cross-chunk
+audio continuity (24k→48k integer upsample), and `mic_enabled` `AtomicBool` for pause/resume.
+
+The Tauri integration (`voice/control.rs` + `voice/runtime.rs` in the desktop crate) wraps
+`VoiceRuntime` in a `VoiceSession` enum (`Lfm2`/`Livekit`) managed via `tauri::State` with a
+`ThreadManager` (reap/wait/drop). `voice_start` spawns the pipeline, `voice_stop` interrupts +
+drops, `voice_set_mic_enabled` pauses the cpal mic. Events stream over a
+`tauri::ipc::Channel<VoiceEvent>` to the SolidJS frontend. **No HTTP for the LFM2 path** —
+fully in-process.
+
+(No acoustic echo cancellation yet — the assistant's own audio can re-trigger the mic VAD;
+`can_interrupt=false` mitigates by dropping mic input while the assistant speaks; headphones /
+higher `LFM_VAD_THRESHOLD` also help.)
 
 ## 5. Python ↔ Rust threading-model comparison
 
@@ -112,7 +127,11 @@ model and adds explicit barge-in, rather than imposing Moshi's frame loop on it.
 
 ## Files
 `src/threads.rs`, `src/bf16_gemm.rs`, `csrc/bf16_gemm.c`, `build.rs`, `src/realtime.rs`,
-`examples/duplex_chat.rs`, `Cargo.toml` (`rayon`/`num_cpus`/`libc`/`half`/`crossbeam-channel`
-deps, `cc` build-dep, `accelerate` feature), `src/model/lfm2_audio.rs`
-(`generate_interleaved_cancellable`), `src/loader.rs` (calls `configure_intraop_threads`;
-precise bf16 note), `src/lib.rs`.
+`src/voice_runtime.rs`, `examples/duplex_chat.rs`, `examples/chat_multiturn.rs`,
+`examples/text_chat.rs`, `Cargo.toml` (`rayon`/`num_cpus`/`libc`/`half`/`crossbeam-channel`
+deps, `cc` build-dep, `accelerate`/`metal` features), `src/model/lfm2_audio.rs`
+(`generate_interleaved_cancellable`, `GenParams::demo_defaults`),
+`src/processor.rs` (`ChatState::from_parts` for multi-turn),
+`src/loader.rs` (calls `configure_intraop_threads`; precise bf16 note), `src/lib.rs`.
+Desktop crate: `src/voice/control.rs`, `src/voice/runtime.rs`, `src/voice/session.rs`,
+`src/settings.rs`.

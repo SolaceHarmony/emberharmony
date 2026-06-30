@@ -6,8 +6,9 @@
 //! through the [`voice_settings_get`] / [`voice_settings_set`] commands — a
 //! proper Tauri command binding, no sidecar round-trip and no `LFM_*` env vars.
 //!
-//! Secrets (LiveKit API key/secret, provider keys) do NOT live here — they stay
-//! in the secure credentials store and are referenced by id.
+//! Secrets do NOT live here. The Hugging Face token is kept in the OS keychain
+//! (see `voice::model`); LiveKit API key/secret stay in the server credentials store.
+//! This file holds only non-secret config.
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -80,6 +81,9 @@ pub struct Lfm2Settings {
     pub model: Option<String>,
     /// Optional fixed seed for reproducible generation.
     pub seed: Option<u64>,
+    /// Git revision (branch/tag/commit) of the HF repo to DOWNLOAD. Download-source
+    /// only; ignored once `model_dir` points at a local snapshot. `None` = default branch.
+    pub revision: Option<String>,
     pub delegate: DelegateSettings,
 }
 
@@ -114,14 +118,12 @@ pub fn lfm2_model_dir(settings: &Lfm2Settings) -> Option<PathBuf> {
         .map(expand_user_path)
 }
 
-pub fn lfm2_model_ref(settings: &Lfm2Settings) -> String {
-    if let Some(model) = settings.model.as_deref().filter(|s| !s.trim().is_empty()) {
-        return model.trim().to_string();
-    }
-    if let Some(dir) = lfm2_model_dir(settings).filter(|dir| dir.join("config.json").is_file()) {
-        return dir.to_string_lossy().into_owned();
-    }
-    DEFAULT_LFM2_MODEL.to_string()
+/// The active LOCAL model directory iff it exists and contains `config.json`. No repo-id
+/// fallback, no default — this is the fail-hard run-path resolver: with no local model the
+/// caller reports not-ready instead of silently downloading. `model`/`revision` are the
+/// download *source*; this is what the runtime actually loads.
+pub fn lfm2_active_model_dir(settings: &Lfm2Settings) -> Option<PathBuf> {
+    lfm2_model_dir(settings).filter(|dir| dir.join("config.json").is_file())
 }
 
 impl Default for Lfm2Settings {
@@ -133,6 +135,7 @@ impl Default for Lfm2Settings {
             max_tokens: 512,
             model: Some(DEFAULT_LFM2_MODEL.to_string()),
             seed: None,
+            revision: None,
             delegate: DelegateSettings::default(),
         }
     }
@@ -245,18 +248,6 @@ mod tests {
     }
 
     #[test]
-    fn model_ref_falls_back_to_downloadable_default() {
-        let mut s = Lfm2Settings {
-            model: None,
-            model_dir: Some("~/definitely-not-a-model-dir".into()),
-            ..Default::default()
-        };
-        assert_eq!(lfm2_model_ref(&s), DEFAULT_LFM2_MODEL);
-        s.model = Some("custom/model".into());
-        assert_eq!(lfm2_model_ref(&s), "custom/model");
-    }
-
-    #[test]
     fn expands_home_relative_model_dirs() {
         let path = expand_user_path("~/models/lfm2-audio");
         assert!(path.is_absolute() || std::env::var_os("HOME").is_none());
@@ -281,5 +272,38 @@ mod tests {
             "livekit"
         );
         assert_eq!(serde_json::to_value(Lfm2Device::Metal).unwrap(), "metal");
+    }
+
+    #[test]
+    fn revision_defaults_to_none_and_round_trips() {
+        assert_eq!(Lfm2Settings::default().revision, None);
+        let s = Lfm2Settings {
+            revision: Some("refs/pr/3".into()),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&s).unwrap();
+        assert_eq!(json["revision"], "refs/pr/3");
+        let back: Lfm2Settings = serde_json::from_value(json).unwrap();
+        assert_eq!(back.revision.as_deref(), Some("refs/pr/3"));
+    }
+
+    #[test]
+    fn active_model_dir_requires_config_json() {
+        // No dir → None.
+        let mut s = Lfm2Settings {
+            model_dir: None,
+            ..Default::default()
+        };
+        assert!(lfm2_active_model_dir(&s).is_none());
+        // Dir without config.json → None (never silently active).
+        let dir =
+            std::env::temp_dir().join(format!("emberharmony-active-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        s.model_dir = Some(dir.to_string_lossy().into_owned());
+        assert!(lfm2_active_model_dir(&s).is_none());
+        // Dir with config.json → Some.
+        std::fs::write(dir.join("config.json"), "{}").unwrap();
+        assert_eq!(lfm2_active_model_dir(&s), Some(dir.clone()));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

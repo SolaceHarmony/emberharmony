@@ -109,12 +109,10 @@ pub fn plan(settings: &VoiceSettings) -> VoicePlan {
             detail: "Voice is off.".into(),
         },
         VoiceProvider::Lfm2 => {
-            let configured_dir = settings::lfm2_model_dir(&settings.lfm2);
-            let valid_dir = configured_dir
-                .as_ref()
-                .is_some_and(|d| d.join("config.json").is_file());
-            let model = settings::lfm2_model_ref(&settings.lfm2);
-            let remote = model == settings::DEFAULT_LFM2_MODEL;
+            // Fail-hard, decoupled: the RUN path loads only a local snapshot dir. A repo id is
+            // a download *source*, not a ready model — typing one never silently downloads at
+            // start. Ready iff a local model dir with `config.json` exists.
+            let active = settings::lfm2_active_model_dir(&settings.lfm2).is_some();
             VoicePlan {
                 provider: VoiceProvider::Lfm2,
                 enabled: true,
@@ -122,14 +120,11 @@ pub fn plan(settings: &VoiceSettings) -> VoicePlan {
                 running: false,
                 running_provider: None,
                 mic_enabled: false,
-                ready: true,
-                detail: if valid_dir {
+                ready: active,
+                detail: if active {
                     "Local LFM2-Audio model ready.".into()
-                } else if remote {
-                    "LFM2-Audio will use the Hugging Face cache and download on first start if needed."
-                        .into()
                 } else {
-                    format!("LFM2-Audio model `{model}` will download on first start if needed.")
+                    "No local model. Download a model or choose a model directory below.".into()
                 },
             }
         }
@@ -412,9 +407,10 @@ mod tests {
     }
 
     #[test]
-    fn lfm2_uses_downloadable_default_without_a_model_dir() {
-        assert!(plan(&settings(VoiceProvider::Lfm2, None)).ready);
-        assert!(plan(&settings(VoiceProvider::Lfm2, Some("   "))).ready);
+    fn lfm2_not_ready_without_local_model() {
+        // A repo id alone is a download source, not a ready model — no silent download.
+        assert!(!plan(&settings(VoiceProvider::Lfm2, None)).ready);
+        assert!(!plan(&settings(VoiceProvider::Lfm2, Some("   "))).ready);
     }
 
     #[test]

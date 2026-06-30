@@ -1,7 +1,7 @@
 # conformer_modules (Rust port)
-**Source:** `liquid-audio-rs/src/model/conformer/modules.rs` · **Python:** `upstream-liquid-audio/src/liquid_audio/model/conformer/modules.py` · **On the LFM2-Audio inference path:** yes
+**Source:** `liquid-audio/src/model/conformer/modules.rs` · **Python:** `upstream-liquid-audio/src/liquid_audio/model/conformer/modules.py` · **On the LFM2-Audio inference path:** yes
 
-> Companion to [`ARCH/model/conformer/modules.md`](../../ARCH/model/conformer/modules.md).
+> Companion to [`wiki/model/conformer/modules.md`](../../../wiki/model/conformer/modules.md).
 
 ## Role
 The per-layer building blocks of the FastConformer audio-in encoder in the
@@ -199,9 +199,9 @@ tensors (PARITY.md).
   floor (8.25e-7 final), the irreducible limit of any cross-framework port.
 
 ## Cross-references
-- [`ARCH/model/conformer/modules.md`](../../ARCH/model/conformer/modules.md)
+- [`wiki/model/conformer/modules.md`](../../../wiki/model/conformer/modules.md)
   — Python original.
-- `liquid-audio-rs/PYTHON_VS_RUST.md` §2.2 (kernel-free SDPA), §2.5 (off-path
+- `liquid-audio/PYTHON_VS_RUST.md` §2.2 (kernel-free SDPA), §2.5 (off-path
   streaming stubs).
-- `liquid-audio-rs/parity/PARITY.md` — conformer layer 0 1.056e-6, final
+- `liquid-audio/parity/PARITY.md` — conformer layer 0 1.056e-6, final
   8.25e-7.

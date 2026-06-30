@@ -19,7 +19,7 @@ use std::{
 use candle_core::{DType, Device};
 use liquid_audio::{
     GenParams, Lfm2VoiceEngine, RuntimeConfig, RuntimeEvent, SessionState,
-    VoiceRuntime as Lfm2Runtime, from_pretrained, get_model_dir,
+    VoiceRuntime as Lfm2Runtime, from_pretrained,
 };
 
 use crate::settings::{self, Lfm2Device, VoiceProvider, VoiceSettings};
@@ -529,10 +529,13 @@ fn send_runtime(channel: &UiChannel, event: RuntimeEvent) -> bool {
 }
 
 fn build_engine(settings: VoiceSettings, out_rate: u32) -> Result<Lfm2VoiceEngine, String> {
-    let model_ref = settings::lfm2_model_ref(&settings.lfm2);
+    // Fail-hard, no network at start: load ONLY a local snapshot dir. The repo id/revision are
+    // the download source (Settings → Download), not a run-time fetch — never auto-download here.
+    let dir = settings::lfm2_active_model_dir(&settings.lfm2).ok_or_else(|| {
+        "No local LFM2-Audio model — download a model or select a model directory in Settings."
+            .to_string()
+    })?;
     let (device, dtype) = select_device(&settings.lfm2.device)?;
-    let dir = get_model_dir(&model_ref, None)
-        .map_err(|e| format!("failed to resolve model `{model_ref}`: {e}"))?;
     let codebooks = codebooks(&dir)?;
     let (model, proc) = from_pretrained(&dir, dtype, &device)
         .map_err(|e| format!("failed to load LFM2-Audio: {e}"))?;

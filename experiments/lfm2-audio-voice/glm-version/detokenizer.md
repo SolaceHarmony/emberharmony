@@ -1,7 +1,7 @@
 # core_detokenizer (Rust port)
-**Source:** `liquid-audio-rs/src/detokenizer.rs` · **Python:** `upstream-liquid-audio/src/liquid_audio/detokenizer.py` · **On the LFM2-Audio inference path:** yes
+**Source:** `liquid-audio/src/detokenizer.rs` · **Python:** `upstream-liquid-audio/src/liquid_audio/detokenizer.py` · **On the LFM2-Audio inference path:** yes
 
-> Companion to [`ARCH/detokenizer.md`](../ARCH/detokenizer.md). The original
+> Companion to [`wiki/detokenizer.md`](../../wiki/detokenizer.md). The original
 > documents the Python `LFM2AudioDetokenizer` + `Istft`; this documents the Rust
 > port and where it diverges.
 >
@@ -196,10 +196,10 @@ so f64 would be out-of-distribution precision; f32 is the faithful match.
   (`:76-83`).
 
 ## Cross-references
-- [`ARCH/detokenizer.md`](../ARCH/detokenizer.md) — Python original.
-- `liquid-audio-rs/PYTHON_VS_RUST.md` §2.1 (device-agnostic), §2.9 (audio FFTs
+- [`wiki/detokenizer.md`](../../wiki/detokenizer.md) — Python original.
+- `liquid-audio/PYTHON_VS_RUST.md` §2.1 (device-agnostic), §2.9 (audio FFTs
   — candle-native ports), §2.10 (the reverted f64 detour), §2.11 (the local
   `../model` gap).
-- `liquid-audio-rs/src/audio_out.rs` — the `AudioDetokenizer` trait + the
+- `liquid-audio/src/audio_out.rs` — the `AudioDetokenizer` trait + the
   `MimiDetokenizer` backend.
-- `liquid-audio-rs/src/lfm2_hf.rs` — the backbone used here.
+- `liquid-audio/src/lfm2_hf.rs` — the backbone used here.

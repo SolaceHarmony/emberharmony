@@ -1,7 +1,7 @@
 # demo_model (Rust port — not ported)
-**Source:** no Rust counterpart · **Python:** `upstream-liquid-audio/…/demo/model.py` (not in the vendored tree; see `ARCH/demo/model.md`) · **On the LFM2-Audio inference path:** no
+**Source:** no Rust counterpart · **Python:** `upstream-liquid-audio/…/demo/model.py` (not in the vendored tree; see `wiki/demo/model.md`) · **On the LFM2-Audio inference path:** no
 
-> Companion to [`ARCH/demo/model.md`](../../ARCH/demo/model.md). The original
+> Companion to [`wiki/demo/model.md`](../../../wiki/demo/model.md). The original
 > documents the Python `model.py` singleton-loader/warmup module; the Rust port
 > does **not** port it — the Rust tree achieves the same singleton-construction
 > device-agnostically in `loader.rs` / `mic_chat.rs`.
@@ -60,10 +60,10 @@ boots the full 1.5B end-to-end on `Device::Cpu` with no warmup stage. This is
   [`glm-version/model/transformer.md`](../model/transformer.md)).
 
 ## Cross-references
-- [`ARCH/demo/model.md`](../../ARCH/demo/model.md) — Python original.
-- `liquid-audio-rs/PYTHON_VS_RUST.md` §2.1 (device-agnostic), §2.2 (kernel-free
+- [`wiki/demo/model.md`](../../../wiki/demo/model.md) — Python original.
+- `liquid-audio/PYTHON_VS_RUST.md` §2.1 (device-agnostic), §2.2 (kernel-free
   SDPA), §4 (demo out of parity surface — `liquid_audio/demo/**` is not ported).
-- `liquid-audio-rs/src/loader.rs` — `from_pretrained` / `from_pretrained_hub`
+- `liquid-audio/src/loader.rs` — `from_pretrained` / `from_pretrained_hub`
   (the shared model+processor loader).
-- `liquid-audio-rs/examples/mic_chat.rs` — the Rust demo that builds its own
+- `liquid-audio/examples/mic_chat.rs` — the Rust demo that builds its own
   singletons. See [`glm-version/demo/chat.md`](chat.md).
