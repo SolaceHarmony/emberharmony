@@ -44,13 +44,15 @@ export interface VoiceSettingsState {
   stored: boolean
 }
 
+export type VoiceSettingsChangedEvent = CustomEvent<VoiceSettings>
+
 export const defaultVoiceSettings: VoiceSettings = {
   provider: "off",
   livekit: {},
-  // Desktop resolves modelDir from the Rust default (~/.config/emberharmony/models);
-  // this literal is only the web-build display fallback.
+  // Desktop resolves the default `model` in Rust; this literal is only the
+  // web-build display fallback when no Tauri runtime exists.
   lfm2: {
-    modelDir: "~/.config/emberharmony/models",
+    model: "LiquidAI/LFM2.5-Audio-1.5B",
     device: "cpu",
     vadThreshold: 0.012,
     maxTokens: 512,
@@ -94,7 +96,7 @@ export async function setVoiceSettings(settings: VoiceSettings): Promise<void> {
   const invoke = tauriInvoke()
   if (!invoke) return
   await invoke<void>("voice_settings_set", { settings })
-  window.dispatchEvent(new CustomEvent(VOICE_SETTINGS_CHANGED))
+  window.dispatchEvent(new CustomEvent(VOICE_SETTINGS_CHANGED, { detail: settings }))
 }
 
 /** Readiness of the active provider — mirrors the Rust `VoicePlan`. */
@@ -102,6 +104,9 @@ export interface VoicePlan {
   provider: VoiceProvider
   enabled: boolean
   surface: VoiceSurface
+  running: boolean
+  runningProvider?: VoiceProvider
+  micEnabled: boolean
   ready: boolean
   detail: string
 }
@@ -109,7 +114,17 @@ export interface VoicePlan {
 /** Whether the configured voice provider is ready to start (native side). */
 export async function getVoiceStatus(): Promise<VoicePlan> {
   const invoke = tauriInvoke()
-  if (!invoke) return { provider: "off", enabled: false, surface: "off", ready: false, detail: "" }
+  if (!invoke)
+    return {
+      provider: "off",
+      enabled: false,
+      surface: "off",
+      running: false,
+      runningProvider: undefined,
+      micEnabled: false,
+      ready: false,
+      detail: "",
+    }
   return invoke<VoicePlan>("voice_status")
 }
 
@@ -136,13 +151,24 @@ export interface VoiceStartContext {
   promptMode?: "plan" | "build"
 }
 
+export interface LiveKitGrant {
+  token: string
+  url: string
+  roomName: string
+}
+
+export type VoiceStartResult = { provider: "lfm2" } | { provider: "livekit"; grant: LiveKitGrant }
+
 /** Start the native desktop voice service. */
-export async function startVoice(ctx: VoiceStartContext, onEvent: (event: NativeVoiceEvent) => void): Promise<void> {
+export async function startVoice(
+  ctx: VoiceStartContext,
+  onEvent: (event: NativeVoiceEvent) => void,
+): Promise<VoiceStartResult> {
   const core = tauriCore()
   if (!core?.invoke || !core.Channel) throw new Error("Native voice is unavailable.")
   const Channel = core.Channel
   const channel = new Channel(onEvent)
-  await core.invoke<void>("voice_start", { ctx, channel })
+  return core.invoke<VoiceStartResult>("voice_start", { ctx, channel })
 }
 
 /** Stop the native desktop voice service. */

@@ -10,10 +10,11 @@
 use crate::settings::{self, VoiceProvider, VoiceSettings};
 use crate::{ServerReadyData, ServerState};
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use tauri::{AppHandle, State};
 
 use super::runtime::VoiceRuntime;
-use super::session::{SessionBridgeConfig, SessionBridgeModel, VOICE_SYSTEM_PROMPT};
+use super::session::{SessionBridgeConfig, SessionBridgeModel, VOICE_SYSTEM_PROMPT, url_encode};
 
 /// Model selected by the session when the voice runtime was started.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -41,6 +42,24 @@ pub struct SessionCtx {
     pub prompt_mode: Option<String>,
 }
 
+/// LiveKit room grant returned by the local server dispatch endpoint.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LiveKitGrant {
+    pub token: String,
+    pub url: String,
+    #[serde(rename = "roomName")]
+    pub room_name: String,
+}
+
+/// Result of starting the configured provider.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "provider", rename_all = "lowercase")]
+pub enum VoiceStartResult {
+    Lfm2,
+    Livekit { grant: LiveKitGrant },
+}
+
 /// Whether the active provider is ready to start a voice session, and what to do
 /// about it if not. Drives the readiness hint in the voice settings panel.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -52,6 +71,14 @@ pub struct VoicePlan {
     pub enabled: bool,
     /// Which runtime surface owns the selected provider.
     pub surface: VoiceSurface,
+    /// Whether the native runtime has an active service thread.
+    pub running: bool,
+    /// Provider currently owned by the runtime, if any.
+    #[serde(rename = "runningProvider")]
+    pub running_provider: Option<VoiceProvider>,
+    /// Whether the native runtime currently accepts microphone input.
+    #[serde(rename = "micEnabled")]
+    pub mic_enabled: bool,
     /// Ready to start.
     pub ready: bool,
     /// Human-readable detail — what to configure if not ready.
@@ -75,30 +102,34 @@ pub fn plan(settings: &VoiceSettings) -> VoicePlan {
             provider: VoiceProvider::Off,
             enabled: false,
             surface: VoiceSurface::Off,
+            running: false,
+            running_provider: None,
+            mic_enabled: false,
             ready: false,
             detail: "Voice is off.".into(),
         },
         VoiceProvider::Lfm2 => {
-            let has_model_ref = settings
-                .lfm2
-                .model
-                .as_deref()
-                .is_some_and(|d| !d.trim().is_empty());
-            let has_model_dir = settings
-                .lfm2
-                .model_dir
-                .as_deref()
-                .is_some_and(|d| std::path::Path::new(d.trim()).join("config.json").is_file());
-            let has_model = has_model_ref || has_model_dir;
+            let configured_dir = settings::lfm2_model_dir(&settings.lfm2);
+            let valid_dir = configured_dir
+                .as_ref()
+                .is_some_and(|d| d.join("config.json").is_file());
+            let model = settings::lfm2_model_ref(&settings.lfm2);
+            let remote = model == settings::DEFAULT_LFM2_MODEL;
             VoicePlan {
                 provider: VoiceProvider::Lfm2,
                 enabled: true,
                 surface: VoiceSurface::Native,
-                ready: has_model,
-                detail: if has_model {
+                running: false,
+                running_provider: None,
+                mic_enabled: false,
+                ready: true,
+                detail: if valid_dir {
                     "Local LFM2-Audio model ready.".into()
+                } else if remote {
+                    "LFM2-Audio will use the Hugging Face cache and download on first start if needed."
+                        .into()
                 } else {
-                    "Set the model directory to a downloaded LFM2-Audio model.".into()
+                    format!("LFM2-Audio model `{model}` will download on first start if needed.")
                 },
             }
         }
@@ -106,6 +137,9 @@ pub fn plan(settings: &VoiceSettings) -> VoicePlan {
             provider: VoiceProvider::Livekit,
             enabled: true,
             surface: VoiceSurface::Livekit,
+            running: false,
+            running_provider: None,
+            mic_enabled: false,
             // LiveKit readiness (URL + credentials) is owned by the sidecar / the
             // LiveKit panel, not this store — the session bridge picks it up at
             // dispatch — so the native side reports it as configured there.
@@ -117,8 +151,13 @@ pub fn plan(settings: &VoiceSettings) -> VoicePlan {
 
 /// Report whether the configured voice provider is ready to start.
 #[tauri::command]
-pub fn voice_status(app: AppHandle) -> Result<VoicePlan, String> {
-    Ok(plan(&settings::load(&app)))
+pub fn voice_status(app: AppHandle, runtime: State<'_, VoiceRuntime>) -> Result<VoicePlan, String> {
+    let mut p = plan(&settings::load(&app));
+    let active = runtime.active_provider()?;
+    p.running = active.is_some();
+    p.running_provider = active;
+    p.mic_enabled = p.running && runtime.mic_enabled()?;
+    Ok(p)
 }
 
 // ---- streaming contract: the run loops emit these to the webview over a
@@ -213,7 +252,7 @@ pub async fn voice_start(
     server: State<'_, ServerState>,
     ctx: SessionCtx,
     channel: tauri::ipc::Channel<VoiceEvent>,
-) -> Result<(), String> {
+) -> Result<VoiceStartResult, String> {
     let settings = settings::load(&app);
     let p = plan(&settings);
     if !p.ready {
@@ -227,11 +266,71 @@ pub async fn voice_start(
                 .await
                 .map_err(|_| "Failed to get server status".to_string())??;
             let bridge = session_bridge_config(&ctx, ready);
-            runtime.start_lfm2(ctx, settings, channel, bridge)
+            runtime.start_lfm2(ctx, settings, channel, bridge)?;
+            Ok(VoiceStartResult::Lfm2)
         }
-        VoiceProvider::Livekit => Err("the LiveKit session-bridge loop is not wired up yet".into()),
+        VoiceProvider::Livekit => {
+            let ready = server
+                .status
+                .clone()
+                .await
+                .map_err(|_| "Failed to get server status".to_string())??;
+            runtime.start_livekit(ctx.clone())?;
+            let grant = match livekit_grant(&ctx, ready).await {
+                Ok(grant) => grant,
+                Err(error) => {
+                    let _ = runtime.stop();
+                    return Err(error);
+                }
+            };
+            if !runtime.is_running_session(&ctx.session_id)? {
+                return Err("Voice start was cancelled.".into());
+            }
+            Ok(VoiceStartResult::Livekit { grant })
+        }
         VoiceProvider::Off => Err("Voice is off.".into()),
     }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LiveKitTokenRequest {
+    #[serde(rename = "sessionID")]
+    session_id: String,
+    model: Option<SessionModel>,
+}
+
+async fn livekit_grant(ctx: &SessionCtx, server: ServerReadyData) -> Result<LiveKitGrant, String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("voice token client: {e}"))?;
+    let body = LiveKitTokenRequest {
+        session_id: ctx.session_id.clone(),
+        model: ctx.model.clone(),
+    };
+    let req = client
+        .post(format!("{}/voice/token", server.url.trim_end_matches('/')))
+        .header("content-type", "application/json")
+        .header("x-emberharmony-directory", url_encode(&ctx.directory))
+        .json(&body);
+    let req = match server.password.as_deref() {
+        Some(password) => req.basic_auth("emberharmony", Some(password)),
+        None => req,
+    };
+    let response = req
+        .send()
+        .await
+        .map_err(|e| format!("voice token request failed: {e}"))?;
+    if response.status().is_success() {
+        return response
+            .json::<LiveKitGrant>()
+            .await
+            .map_err(|e| format!("voice token response failed: {e}"));
+    }
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    Err(format!("voice token request failed: {status} {body}"))
 }
 
 fn session_bridge_config(ctx: &SessionCtx, server: ServerReadyData) -> Option<SessionBridgeConfig> {
@@ -313,9 +412,9 @@ mod tests {
     }
 
     #[test]
-    fn lfm2_needs_a_model_dir() {
-        assert!(!plan(&settings(VoiceProvider::Lfm2, None)).ready);
-        assert!(!plan(&settings(VoiceProvider::Lfm2, Some("   "))).ready);
+    fn lfm2_uses_downloadable_default_without_a_model_dir() {
+        assert!(plan(&settings(VoiceProvider::Lfm2, None)).ready);
+        assert!(plan(&settings(VoiceProvider::Lfm2, Some("   "))).ready);
     }
 
     #[test]
@@ -335,6 +434,16 @@ mod tests {
     }
 
     #[test]
+    fn plan_reports_enabled_surface_and_runtime_defaults() {
+        let p = plan(&settings(VoiceProvider::Livekit, None));
+        assert!(p.enabled);
+        assert_eq!(p.surface, VoiceSurface::Livekit);
+        assert!(!p.running);
+        assert_eq!(p.running_provider, None);
+        assert!(!p.mic_enabled);
+    }
+
+    #[test]
     fn voice_event_tagged_serialization() {
         let t = serde_json::to_value(VoiceEvent::Transcript {
             role: Role::User,
@@ -350,6 +459,20 @@ mod tests {
         .unwrap();
         assert_eq!(s["type"], "state");
         assert_eq!(s["state"], "speaking");
+    }
+
+    #[test]
+    fn voice_start_result_serializes_provider_tag() {
+        let v = serde_json::to_value(VoiceStartResult::Livekit {
+            grant: LiveKitGrant {
+                token: "t".into(),
+                url: "wss://voice.example".into(),
+                room_name: "emberharmony_ses_123".into(),
+            },
+        })
+        .unwrap();
+        assert_eq!(v["provider"], "livekit");
+        assert_eq!(v["grant"]["roomName"], "emberharmony_ses_123");
     }
 
     #[test]

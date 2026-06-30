@@ -292,9 +292,19 @@ export const SettingsVoice: Component = () => {
             </Show>
             <div class="bg-surface-raised-base px-4 py-3 rounded-lg flex flex-col gap-3">
               <TextField
+                label={language.t("settings.voice.row.model.title")}
+                description={language.t("settings.voice.row.model.description")}
+                placeholder="LiquidAI/LFM2.5-Audio-1.5B"
+                defaultValue={lfm2().model ?? ""}
+                onFocusOut={(e: FocusEvent) => {
+                  const value = (e.currentTarget as HTMLInputElement).value.trim()
+                  updateLfm2({ model: value || undefined })
+                }}
+              />
+              <TextField
                 label={language.t("settings.voice.row.modelDir.title")}
                 description={language.t("settings.voice.row.modelDir.description")}
-                placeholder="/path/to/lfm2-audio/model"
+                placeholder="/path/to/huggingface/snapshot"
                 defaultValue={lfm2().modelDir ?? ""}
                 onFocusOut={(e: FocusEvent) => {
                   const value = (e.currentTarget as HTMLInputElement).value.trim()

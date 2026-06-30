@@ -10,12 +10,14 @@
 //! in the secure credentials store and are referenced by id.
 
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use tauri::AppHandle;
 use tauri_plugin_store::StoreExt;
 
 /// Same store file the rest of the desktop settings use (see `lib.rs`).
 const SETTINGS_STORE: &str = "emberharmony.settings.dat";
 const VOICE_KEY: &str = "voice";
+pub const DEFAULT_LFM2_MODEL: &str = "LiquidAI/LFM2.5-Audio-1.5B";
 
 /// Which voice provider is active — two providers behind one surface.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,54 +68,70 @@ pub struct DelegateSettings {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Lfm2Settings {
-    /// Path to the model directory (GGUF + tokenizer).
+    /// Optional local snapshot directory containing `config.json`, weights, and tokenizer files.
+    /// Leave unset to resolve `model` through Hugging Face's cache/download flow.
     pub model_dir: Option<String>,
     pub device: Lfm2Device,
     /// Energy-VAD threshold (mic_chat default 0.012).
     pub vad_threshold: f32,
     /// Max tokens per turn (mic_chat default 512).
     pub max_tokens: u32,
-    /// Optional model-file override.
+    /// Hugging Face model id used by the cache/download resolver.
     pub model: Option<String>,
     /// Optional fixed seed for reproducible generation.
     pub seed: Option<u64>,
     pub delegate: DelegateSettings,
 }
 
-/// Default local-model directory: `<config>/emberharmony/models`, the folder the
-/// Node global bootstrap (`global/index.ts`, via xdg-basedir) creates next to the
-/// config dir's `node_modules`. Must resolve to the *same* path on every OS as
-/// xdg-basedir does, so the config base is `XDG_CONFIG_HOME` else `<home>/.config`,
-/// where `<home>` matches Node's `os.homedir()`: `HOME` on POSIX, `USERPROFILE` on
-/// Windows. Returned absolute so the native loop uses it directly; `None` only if
-/// none of those env vars are set.
-fn default_model_dir() -> Option<String> {
-    let home_config = || {
-        std::env::var_os("HOME")
-            .filter(|v| !v.is_empty())
-            .or_else(|| std::env::var_os("USERPROFILE").filter(|v| !v.is_empty()))
-            .map(|h| std::path::PathBuf::from(h).join(".config"))
-    };
-    let base = std::env::var_os("XDG_CONFIG_HOME")
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
         .filter(|v| !v.is_empty())
-        .map(std::path::PathBuf::from)
-        .or_else(home_config)?;
-    Some(
-        base.join("emberharmony")
-            .join("models")
-            .to_string_lossy()
-            .into_owned(),
-    )
+        .or_else(|| std::env::var_os("USERPROFILE").filter(|v| !v.is_empty()))
+        .map(PathBuf::from)
+}
+
+pub fn expand_user_path(value: &str) -> PathBuf {
+    let value = value.trim();
+    if value == "~" {
+        return home_dir().unwrap_or_else(|| PathBuf::from(value));
+    }
+    if let Some(rest) = value
+        .strip_prefix("~/")
+        .or_else(|| value.strip_prefix("~\\"))
+    {
+        return home_dir()
+            .map(|home| home.join(rest))
+            .unwrap_or_else(|| PathBuf::from(value));
+    }
+    PathBuf::from(value)
+}
+
+pub fn lfm2_model_dir(settings: &Lfm2Settings) -> Option<PathBuf> {
+    settings
+        .model_dir
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .map(expand_user_path)
+}
+
+pub fn lfm2_model_ref(settings: &Lfm2Settings) -> String {
+    if let Some(model) = settings.model.as_deref().filter(|s| !s.trim().is_empty()) {
+        return model.trim().to_string();
+    }
+    if let Some(dir) = lfm2_model_dir(settings).filter(|dir| dir.join("config.json").is_file()) {
+        return dir.to_string_lossy().into_owned();
+    }
+    DEFAULT_LFM2_MODEL.to_string()
 }
 
 impl Default for Lfm2Settings {
     fn default() -> Self {
         Self {
-            model_dir: default_model_dir(),
+            model_dir: None,
             device: Lfm2Device::default(),
             vad_threshold: 0.012,
             max_tokens: 512,
-            model: None,
+            model: Some(DEFAULT_LFM2_MODEL.to_string()),
             seed: None,
             delegate: DelegateSettings::default(),
         }
@@ -227,16 +245,33 @@ mod tests {
     }
 
     #[test]
-    fn default_model_dir_is_under_emberharmony_models() {
-        // Every branch (XDG_CONFIG_HOME / HOME / USERPROFILE) ends the same way; the
-        // path is absolute and points at the config-dir models folder. `Path::ends_with`
-        // is component-wise, so this holds under Windows backslash separators too.
-        let dir = Lfm2Settings::default()
-            .model_dir
-            .expect("HOME/USERPROFILE/XDG set in test env");
-        let p = std::path::Path::new(&dir);
-        assert!(p.ends_with("emberharmony/models"), "got {dir}");
-        assert!(p.is_absolute(), "got {dir}");
+    fn model_ref_falls_back_to_downloadable_default() {
+        let mut s = Lfm2Settings {
+            model: None,
+            model_dir: Some("~/definitely-not-a-model-dir".into()),
+            ..Default::default()
+        };
+        assert_eq!(lfm2_model_ref(&s), DEFAULT_LFM2_MODEL);
+        s.model = Some("custom/model".into());
+        assert_eq!(lfm2_model_ref(&s), "custom/model");
+    }
+
+    #[test]
+    fn expands_home_relative_model_dirs() {
+        let path = expand_user_path("~/models/lfm2-audio");
+        assert!(path.is_absolute() || std::env::var_os("HOME").is_none());
+        assert!(
+            path.ends_with("models/lfm2-audio"),
+            "got {}",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn default_lfm2_model_is_a_repo_id_not_a_directory() {
+        let s = Lfm2Settings::default();
+        assert_eq!(s.model.as_deref(), Some(DEFAULT_LFM2_MODEL));
+        assert_eq!(s.model_dir, None);
     }
 
     #[test]

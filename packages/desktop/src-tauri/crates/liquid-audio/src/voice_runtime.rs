@@ -45,6 +45,7 @@ pub struct RuntimeConfig {
     pub vad_threshold: f32,
     pub silence_ms: u64,
     pub min_utterance_s: f32,
+    pub can_interrupt: bool,
 }
 
 impl Default for RuntimeConfig {
@@ -53,6 +54,7 @@ impl Default for RuntimeConfig {
             vad_threshold: 0.012,
             silence_ms: 800,
             min_utterance_s: 0.3,
+            can_interrupt: false,
         }
     }
 }
@@ -100,6 +102,11 @@ impl VoiceRuntime {
     /// Pause/resume mic capture without ending the session.
     pub fn set_mic_enabled(&self, on: bool) {
         self.mic_enabled.store(on, Ordering::SeqCst);
+    }
+
+    /// Whether mic capture is currently allowed.
+    pub fn mic_enabled(&self) -> bool {
+        self.mic_enabled.load(Ordering::SeqCst)
     }
 
     /// Whether the session thread has exited.
@@ -378,6 +385,15 @@ fn vad_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
             continue;
         }
 
+        if assistant.load(Ordering::SeqCst) && !cfg.can_interrupt {
+            if let Ok(mut mic) = mic.lock() {
+                mic.clear();
+            }
+            read = 0;
+            speaking = false;
+            continue;
+        }
+
         let mut mic_buf = match mic.lock() {
             Ok(mic_buf) => mic_buf,
             Err(_) => {
@@ -446,16 +462,6 @@ fn vad_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
     }
 }
 
-fn downmix(interleaved: &[f32], channels: usize) -> Vec<f32> {
-    if channels <= 1 {
-        return interleaved.to_vec();
-    }
-    interleaved
-        .chunks(channels)
-        .map(|chunk| chunk.iter().sum::<f32>() / channels as f32)
-        .collect()
-}
-
 fn rms(samples: &[f32]) -> f32 {
     if samples.is_empty() {
         return 0.0;
@@ -482,9 +488,15 @@ fn start_input() -> Res<(cpal::Stream, Mic, u32)> {
             dev.build_input_stream(
                 &cfg,
                 move |data: &[$t], _: &cpal::InputCallbackInfo| {
-                    let samples: Vec<f32> = data.iter().map(|&s| $conv(s)).collect();
                     if let Ok(mut mic) = mic.try_lock() {
-                        mic.extend_from_slice(&downmix(&samples, channels));
+                        if channels <= 1 {
+                            mic.extend(data.iter().map(|&s| $conv(s)));
+                            return;
+                        }
+                        for frame in data.chunks(channels) {
+                            let sum = frame.iter().map(|&s| $conv(s)).sum::<f32>();
+                            mic.push(sum / frame.len() as f32);
+                        }
                     }
                 },
                 err,
@@ -515,12 +527,14 @@ fn start_output() -> Res<(cpal::Stream, Ring, u32)> {
     let cfg: cpal::StreamConfig = supported.into();
     let ring: Ring = Arc::new(Mutex::new(VecDeque::new()));
     let prebuffer = (rate as usize / 5).max(1);
+    let idle_reset = (rate as usize / 2).max(1);
     let err = |e| eprintln!("[voice] output stream error: {e}");
 
     macro_rules! stream {
         ($t:ty, $conv:expr) => {{
             let ring = ring.clone();
             let mut started = false;
+            let mut empty_frames = 0usize;
             dev.build_output_stream(
                 &cfg,
                 move |data: &mut [$t], _: &cpal::OutputCallbackInfo| {
@@ -539,18 +553,29 @@ fn start_output() -> Res<(cpal::Stream, Ring, u32)> {
                             return;
                         }
                         started = true;
+                        empty_frames = 0;
                     }
+                    let mut played = false;
                     for frame in data.chunks_mut(channels) {
                         let Some(next) = ring.pop_front() else {
-                            started = false;
                             for out in frame.iter_mut() {
                                 *out = silence;
                             }
                             continue;
                         };
+                        played = true;
                         let sample: $t = $conv(next);
                         for out in frame.iter_mut() {
                             *out = sample;
+                        }
+                    }
+                    if played {
+                        empty_frames = 0;
+                    } else if started {
+                        empty_frames += data.len() / channels;
+                        if empty_frames >= idle_reset {
+                            started = false;
+                            empty_frames = 0;
                         }
                     }
                 },

@@ -63,6 +63,7 @@ import { createEmberHarmonyClient, type Message, type Part } from "@thesolacepro
 import { Binary } from "@thesolaceproject/emberharmony-util/binary"
 import { showToast } from "@thesolaceproject/emberharmony-ui/toast"
 import { base64Encode } from "@thesolaceproject/emberharmony-util/encode"
+import { voiceButtonOn, voiceMicTarget } from "@/lib/voice-state"
 
 const ACCEPTED_IMAGE_TYPES = ["image/png", "image/jpeg", "image/gif", "image/webp"]
 const ACCEPTED_FILE_TYPES = [...ACCEPTED_IMAGE_TYPES, "application/pdf"]
@@ -235,7 +236,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
   )
   const working = createMemo(() => status()?.type !== "idle")
   const active = createMemo(() => working() || voice.turnActive())
-  const voiceOn = createMemo(() => voice.state() === "connected" || voice.enabled())
+  const voiceOn = createMemo(() => voiceButtonOn(voice.state(), voice.enabled()))
   const imageAttachments = createMemo(
     () => prompt.current().filter((part) => part.type === "image") as ImageAttachmentPart[],
   )
@@ -323,7 +324,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
 
   const [voiceMic, setVoiceMic] = createSignal<boolean | undefined>(undefined)
   createEffect(() => {
-    const target = voice.state() === "connected" ? !prompt.dirty() : undefined
+    const target = voiceMicTarget(voice.state(), prompt.dirty(), working())
     if (voiceMic() === target) return
     setVoiceMic(target)
     if (target === undefined) return

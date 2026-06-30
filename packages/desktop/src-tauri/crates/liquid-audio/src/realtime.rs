@@ -304,7 +304,7 @@ impl VoiceEngine for Lfm2VoiceEngine {
         let text = self.proc.text();
         let device = &self.device;
         let codebooks = self.codebooks;
-        let out_rate = self.out_rate;
+        let mut resampler = StreamingPcmResampler::new(mimi_rate, self.out_rate);
         let mut cb_err: Option<String> = None;
 
         // Collect the generated stream for `chat.append` (the discrete `audio_out` → context
@@ -344,11 +344,7 @@ impl VoiceEngine for Lfm2VoiceEngine {
                                         .flatten_all()?
                                         .to_dtype(DType::F32)?
                                         .to_vec1::<f32>()?;
-                                    if out_rate != mimi_rate && out_rate != 0 {
-                                        pcm = crate::resample::resample_slice(
-                                            &pcm, mimi_rate, out_rate,
-                                        );
-                                    }
+                                    pcm = resampler.process(pcm);
                                     Ok(Some(pcm))
                                 }
                                 None => Ok(None),
@@ -415,6 +411,52 @@ impl VoiceEngine for Lfm2VoiceEngine {
     }
 }
 
+/// Stateful PCM conversion for the streaming Mimi decoder.
+///
+/// The reference model emits Mimi audio at 24 kHz, while the built-in macOS output path is
+/// usually 48 kHz. The old path ran the offline sinc resampler independently on each tiny
+/// decoded frame, which resets the filter at every chunk boundary and can produce audible
+/// discontinuities. The hot desktop path needs continuity over the whole turn.
+struct StreamingPcmResampler {
+    from: u32,
+    to: u32,
+    prev: Option<f32>,
+}
+
+impl StreamingPcmResampler {
+    fn new(from: u32, to: u32) -> Self {
+        Self {
+            from,
+            to,
+            prev: None,
+        }
+    }
+
+    fn process(&mut self, pcm: Vec<f32>) -> Vec<f32> {
+        if pcm.is_empty() || self.to == 0 || self.to == self.from {
+            return pcm;
+        }
+        if self.to > self.from && self.to % self.from == 0 {
+            return self.upsample_integer(&pcm, (self.to / self.from) as usize);
+        }
+        self.prev = pcm.last().copied();
+        crate::resample::resample_slice(&pcm, self.from, self.to)
+    }
+
+    fn upsample_integer(&mut self, pcm: &[f32], ratio: usize) -> Vec<f32> {
+        let mut out = Vec::with_capacity(pcm.len() * ratio);
+        for &sample in pcm {
+            let last = self.prev.unwrap_or(sample);
+            for step in 1..=ratio {
+                let t = step as f32 / ratio as f32;
+                out.push(last + (sample - last) * t);
+            }
+            self.prev = Some(sample);
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -445,6 +487,13 @@ mod tests {
                 return out;
             }
         }
+    }
+
+    #[test]
+    fn streaming_resampler_keeps_integer_upsample_continuity() {
+        let mut resampler = StreamingPcmResampler::new(24_000, 48_000);
+        assert_eq!(resampler.process(vec![0.0, 1.0]), vec![0.0, 0.0, 0.5, 1.0]);
+        assert_eq!(resampler.process(vec![0.0]), vec![0.5, 0.0]);
     }
 
     /// Emits a scripted (Text, Audio) pair then completes; counts the turns it served.

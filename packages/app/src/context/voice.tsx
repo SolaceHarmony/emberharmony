@@ -25,8 +25,14 @@ import {
   type VoiceStartContext,
   type VoicePlan,
   type VoiceProvider,
-  type VoiceSettings,
+  type VoiceSettingsChangedEvent,
 } from "@/lib/voice-settings"
+import {
+  shouldStopRuntimeForProviderChange,
+  voiceEnabled,
+  voiceProvider,
+  type VoiceNativeStatus,
+} from "@/lib/voice-state"
 import { useSDK } from "./sdk"
 
 export type VoiceState = "disconnected" | "connecting" | "connected" | "error"
@@ -40,13 +46,7 @@ export type { AgentState } from "@thesolaceproject/livekit-components-solid"
 let followProjects = false
 let followContext: Omit<VoiceStartContext, "sessionID" | "directory"> | undefined
 
-type NativeStatus = {
-  plan: VoicePlan
-  settings: VoiceSettings
-  stored: boolean
-}
-
-async function loadNativeStatus(desktop: boolean): Promise<NativeStatus | undefined> {
+async function loadNativeStatus(desktop: boolean): Promise<VoiceNativeStatus | undefined> {
   if (!desktop) return undefined
   const plan = await getVoiceStatus().catch(() => undefined)
   if (!plan) return undefined
@@ -109,11 +109,15 @@ const { use: useVoice, provider: VoiceValueProvider } = createSimpleContext({
           }
           const wasActive = state() === "connected" || connecting()
           const generation = ++followGeneration
-          void room.disconnect().then(() => {
-            if (!wasActive || !id) return
-            if (generation !== followGeneration) return
-            connect(id, followContext).catch(() => {})
-          })
+          void room
+            .disconnect()
+            .then(() => (desktop ? stopVoice().catch(() => {}) : undefined))
+            .then(() => {
+              markNativeRuntime(false, false)
+              if (!wasActive || !id) return
+              if (generation !== followGeneration) return
+              connect(id, followContext).catch(() => {})
+            })
         },
       ),
     )
@@ -146,21 +150,66 @@ const { use: useVoice, provider: VoiceValueProvider } = createSimpleContext({
       () => desktop,
       (enabled) => loadNativeStatus(enabled),
     )
-    const providerFor = (
-      current: NativeStatus | undefined,
-      server: { available?: boolean } | undefined,
-    ): VoiceProvider => {
-      if (!desktop) return "livekit"
-      if (current?.stored === false && server?.available) return "livekit"
-      return current?.plan.provider ?? "off"
+    const provider = () => voiceProvider(desktop, native(), status())
+    const enabled = () => voiceEnabled(desktop, native(), status())
+    const nativeActive = () => desktop && (nativeRun() || native()?.plan.runningProvider === "lfm2")
+
+    function runtimeProvider() {
+      return native()?.plan.runningProvider ?? provider()
     }
-    const provider = () => providerFor(native(), status())
-    const enabled = () => {
+
+    function markNativeRuntime(running: boolean, mic = running, active = running ? runtimeProvider() : undefined) {
       const current = native()
-      if (desktop && current?.stored === false && status()?.available) return true
-      return current?.plan.enabled ?? provider() !== "off"
+      if (!current) return
+      setNative({ ...current, plan: { ...current.plan, running, runningProvider: active, micEnabled: mic } })
     }
-    const nativeActive = () => desktop && nativeRun()
+
+    function clearNativeRuntime() {
+      setNativeState("disconnected")
+      setNativeAgent("disconnected")
+      setNativeMic(true)
+      setNativeLine(undefined)
+      setNativeLevel(0)
+      markNativeRuntime(false, false)
+      setNativeRun(false)
+    }
+
+    async function stopNativeRuntime(provider?: VoiceProvider) {
+      followProjects = false
+      followContext = undefined
+      if (provider === "livekit") {
+        await room.localParticipant.setMicrophoneEnabled(false).catch(() => {})
+        await room.disconnect().catch(() => {})
+      }
+      await stopVoice().catch(() => {})
+      setConnecting(false)
+      clearNativeRuntime()
+    }
+
+    const syncRoomDisconnect = () => {
+      if (!desktop) return
+      if (native()?.plan.runningProvider !== "livekit") return
+      stopVoice().catch(() => {})
+      clearNativeRuntime()
+      setConnecting(false)
+    }
+    room.on(RoomEvent.Disconnected, syncRoomDisconnect)
+    onCleanup(() => room.off(RoomEvent.Disconnected, syncRoomDisconnect))
+
+    createEffect(() => {
+      const current = native()
+      if (!desktop || !current) return
+      const running = current.plan.runningProvider === "lfm2"
+      if (!running) {
+        if (!nativeRun()) return
+        clearNativeRuntime()
+        return
+      }
+      setNativeRun(true)
+      setNativeMic(current.plan.micEnabled)
+      if (nativeState() === "disconnected") setNativeState("connected")
+      if (nativeAgent() === "disconnected") setNativeAgent("listening")
+    })
 
     async function refreshNative() {
       if (!desktop) return undefined
@@ -179,7 +228,9 @@ const { use: useVoice, provider: VoiceValueProvider } = createSimpleContext({
         case "state":
           setNativeAgent(nativeAgentState(event.state))
           if (event.state !== "speaking") setNativeLevel(0)
-          setNativeState(event.state === "loading" ? "connecting" : event.state === "idle" ? "disconnected" : "connected")
+          setNativeState(
+            event.state === "loading" ? "connecting" : event.state === "idle" ? "disconnected" : "connected",
+          )
           setError(undefined)
           break
         case "transcript":
@@ -194,6 +245,7 @@ const { use: useVoice, provider: VoiceValueProvider } = createSimpleContext({
           setNativeLine(undefined)
           setNativeLevel(0)
           setNativeMic(true)
+          markNativeRuntime(false, false)
           setNativeRun(false)
           if (event.reason) setError(event.reason)
           break
@@ -202,6 +254,7 @@ const { use: useVoice, provider: VoiceValueProvider } = createSimpleContext({
           setNativeState("error")
           setNativeAgent("failed")
           setNativeLevel(0)
+          markNativeRuntime(false, false)
           setNativeRun(false)
           break
       }
@@ -247,8 +300,19 @@ const { use: useVoice, provider: VoiceValueProvider } = createSimpleContext({
     }, 30_000)
     onCleanup(() => clearInterval(statusPoll))
     if (desktop) {
-      const refresh = () => {
-        refreshNative().catch(() => {})
+      const refresh = (event: Event) => {
+        const current = native()?.plan.runningProvider
+        const settings = (event as VoiceSettingsChangedEvent).detail
+        refreshNative()
+          .then((next) => {
+            if (!shouldStopRuntimeForProviderChange(current, settings)) return
+            if (!next) return
+            stopNativeRuntime(current).catch(() => {})
+          })
+          .catch(() => {
+            if (!shouldStopRuntimeForProviderChange(current, settings)) return
+            stopNativeRuntime(current).catch(() => {})
+          })
         refetchStatus()
       }
       window.addEventListener(VOICE_SETTINGS_CHANGED, refresh)
@@ -263,22 +327,28 @@ const { use: useVoice, provider: VoiceValueProvider } = createSimpleContext({
         const current = desktop ? await refreshNative() : undefined
         const server = await (async () => {
           if (desktop && current?.stored !== false) return status()
-          const next = await sdk.client.voice.status().then((x) => x.data).catch(() => undefined)
+          const next = await sdk.client.voice
+            .status()
+            .then((x) => x.data)
+            .catch(() => undefined)
           setStatus(next)
           return next
         })()
-        const active = providerFor(current, server)
+        const active = voiceProvider(desktop, current, server)
         if (desktop && active === "lfm2") {
           followProjects = true
           if (ctx) followContext = ctx
-          const delegateTarget = current?.settings.lfm2.delegate.enabled ? current.settings.lfm2.delegate.target : undefined
+          const delegateTarget = current?.settings.lfm2.delegate.enabled
+            ? current.settings.lfm2.delegate.target
+            : undefined
           setNativeRun(true)
+          markNativeRuntime(true, true)
           setNativeState("connecting")
           setNativeAgent("connecting")
           setNativeMic(true)
           setNativeLine(undefined)
           setNativeLevel(0)
-          await startVoice(
+          const result = await startVoice(
             {
               sessionID,
               directory: sdk.directory,
@@ -287,6 +357,7 @@ const { use: useVoice, provider: VoiceValueProvider } = createSimpleContext({
             },
             handleNative,
           )
+          if (result.provider !== "lfm2") throw new Error("Voice provider changed while starting.")
           return
         }
         if (desktop && active !== "livekit") {
@@ -294,7 +365,20 @@ const { use: useVoice, provider: VoiceValueProvider } = createSimpleContext({
         }
         followProjects = true
         if (ctx) followContext = ctx
-        const grant = await sdk.client.voice.token({ sessionID, model: ctx?.model }).then((x) => x.data)
+        const grant = await (async () => {
+          if (!desktop) return sdk.client.voice.token({ sessionID, model: ctx?.model }).then((x) => x.data)
+          const result = await startVoice(
+            {
+              sessionID,
+              directory: sdk.directory,
+              ...ctx,
+            },
+            handleNative,
+          )
+          markNativeRuntime(true, true)
+          if (result.provider !== "livekit") throw new Error("Voice provider changed while starting.")
+          return result.grant
+        })()
         if (!grant) throw new Error("voice token request failed")
         // WKWebView keeps media silently "playing" until the page's audio
         // session activates; resuming an AudioContext inside the connect
@@ -313,10 +397,8 @@ const { use: useVoice, provider: VoiceValueProvider } = createSimpleContext({
         // unwind a partially joined room so a retry starts from clean state
         followProjects = false
         followContext = undefined
-        setNativeState("disconnected")
-        setNativeAgent("disconnected")
-        setNativeLevel(0)
-        setNativeRun(false)
+        clearNativeRuntime()
+        if (desktop) await stopVoice().catch(() => {})
         await room.disconnect().catch(() => {})
         setError(err instanceof Error ? err.message : String(err))
         throw err
@@ -331,16 +413,15 @@ const { use: useVoice, provider: VoiceValueProvider } = createSimpleContext({
       setError(undefined)
       if (nativeActive()) {
         await stopVoice()
-        setNativeState("disconnected")
-        setNativeAgent("disconnected")
-        setNativeMic(true)
-        setNativeLine(undefined)
-        setNativeLevel(0)
-        setNativeRun(false)
+        clearNativeRuntime()
         return
       }
       await room.localParticipant.setMicrophoneEnabled(false).catch(() => {})
       await room.disconnect()
+      if (desktop) {
+        await stopVoice()
+        markNativeRuntime(false, false)
+      }
     }
 
     async function interrupt() {
@@ -355,23 +436,23 @@ const { use: useVoice, provider: VoiceValueProvider } = createSimpleContext({
       await room.disconnect()
       setError(undefined)
       setConnecting(false)
-      setNativeState("disconnected")
-      setNativeAgent("disconnected")
-      setNativeLevel(0)
-      setNativeRun(false)
-      setNativeMic(true)
-      setNativeLine(undefined)
       if (desktop) await stopVoice().catch(() => {})
+      clearNativeRuntime()
     }
 
     async function setMicEnabled(enabled: boolean) {
       if (nativeActive()) {
         await setVoiceMicEnabled(enabled)
         setNativeMic(enabled)
+        markNativeRuntime(true, enabled)
         return
       }
       if (state() !== "connected") return
       await room.localParticipant.setMicrophoneEnabled(enabled)
+      if (desktop) {
+        await setVoiceMicEnabled(enabled).catch(() => {})
+        markNativeRuntime(true, enabled)
+      }
     }
 
     async function toggleMute() {
@@ -379,10 +460,16 @@ const { use: useVoice, provider: VoiceValueProvider } = createSimpleContext({
         const enabled = micState() !== "unmuted"
         await setVoiceMicEnabled(enabled)
         setNativeMic(enabled)
+        markNativeRuntime(true, enabled)
         return
       }
       if (state() !== "connected") return
-      await room.localParticipant.setMicrophoneEnabled(!local.isMicrophoneEnabled())
+      const enabled = !local.isMicrophoneEnabled()
+      await room.localParticipant.setMicrophoneEnabled(enabled)
+      if (desktop) {
+        await setVoiceMicEnabled(enabled).catch(() => {})
+        markNativeRuntime(true, enabled)
+      }
     }
 
     onCleanup(() => {

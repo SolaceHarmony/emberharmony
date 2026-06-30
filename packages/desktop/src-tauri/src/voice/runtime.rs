@@ -13,7 +13,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    thread,
+    thread::{self, JoinHandle},
 };
 
 use candle_core::{DType, Device};
@@ -22,7 +22,7 @@ use liquid_audio::{
     VoiceRuntime as Lfm2Runtime, from_pretrained, get_model_dir,
 };
 
-use crate::settings::{Lfm2Device, VoiceSettings};
+use crate::settings::{self, Lfm2Device, VoiceProvider, VoiceSettings};
 
 use super::control::{Role, SessionCtx, VoiceEvent, VoiceState};
 use super::session::{SessionBridgeConfig, SessionBridgeEvent, run_turn};
@@ -33,6 +33,7 @@ type UiChannel = Arc<Mutex<tauri::ipc::Channel<VoiceEvent>>>;
 #[derive(Default)]
 pub struct VoiceRuntime {
     session: Mutex<Option<VoiceSession>>,
+    threads: ThreadManager,
 }
 
 impl VoiceRuntime {
@@ -47,6 +48,7 @@ impl VoiceRuntime {
             .session
             .lock()
             .map_err(|_| "voice runtime lock poisoned".to_string())?;
+        self.threads.wait()?;
         if guard.as_ref().is_some_and(VoiceSession::is_finished) {
             if let Some(session) = guard.take() {
                 session.stop();
@@ -55,21 +57,38 @@ impl VoiceRuntime {
         if guard.is_some() {
             return Err("Voice is already running.".into());
         }
-        *guard = Some(VoiceSession::spawn(ctx, settings, channel, bridge));
+        *guard = Some(VoiceSession::Lfm2(Lfm2Session::spawn(
+            ctx, settings, channel, bridge,
+        )));
+        Ok(())
+    }
+
+    pub fn start_livekit(&self, ctx: SessionCtx) -> Result<(), String> {
+        let mut guard = self
+            .session
+            .lock()
+            .map_err(|_| "voice runtime lock poisoned".to_string())?;
+        self.threads.wait()?;
+        if guard.as_ref().is_some_and(VoiceSession::is_finished) {
+            if let Some(session) = guard.take() {
+                session.stop();
+            }
+        }
+        if guard.is_some() {
+            return Err("Voice is already running.".into());
+        }
+        *guard = Some(VoiceSession::Livekit(LiveKitSession::new(ctx)));
         Ok(())
     }
 
     pub fn stop(&self) -> Result<(), String> {
-        let session = self
+        let mut guard = self
             .session
             .lock()
-            .map_err(|_| "voice runtime lock poisoned".to_string())?
-            .take();
-        if let Some(session) = session {
-            thread::Builder::new()
-                .name("voice-lfm2-stop".into())
-                .spawn(move || session.stop())
-                .map_err(|e| format!("failed to spawn voice cleanup thread: {e}"))?;
+            .map_err(|_| "voice runtime lock poisoned".to_string())?;
+        if let Some(session) = guard.take() {
+            self.threads
+                .spawn("voice-session-stop", move || session.stop())?;
         }
         Ok(())
     }
@@ -97,16 +116,197 @@ impl VoiceRuntime {
         }
         Ok(())
     }
+
+    pub fn is_running(&self) -> Result<bool, String> {
+        self.threads.reap()?;
+        Ok(self
+            .session
+            .lock()
+            .map_err(|_| "voice runtime lock poisoned".to_string())?
+            .as_ref()
+            .is_some_and(|session| !session.is_finished()))
+    }
+
+    pub fn mic_enabled(&self) -> Result<bool, String> {
+        Ok(self
+            .session
+            .lock()
+            .map_err(|_| "voice runtime lock poisoned".to_string())?
+            .as_ref()
+            .is_some_and(VoiceSession::mic_enabled))
+    }
+
+    pub fn active_provider(&self) -> Result<Option<VoiceProvider>, String> {
+        self.threads.reap()?;
+        Ok(self
+            .session
+            .lock()
+            .map_err(|_| "voice runtime lock poisoned".to_string())?
+            .as_ref()
+            .filter(|session| !session.is_finished())
+            .map(VoiceSession::provider))
+    }
+
+    pub fn is_running_session(&self, session_id: &str) -> Result<bool, String> {
+        Ok(self
+            .session
+            .lock()
+            .map_err(|_| "voice runtime lock poisoned".to_string())?
+            .as_ref()
+            .is_some_and(|session| !session.is_finished() && session.session_id() == session_id))
+    }
 }
 
-struct VoiceSession {
-    _ctx: SessionCtx,
+#[derive(Default)]
+struct ThreadManager {
+    handles: Mutex<Vec<JoinHandle<()>>>,
+}
+
+impl ThreadManager {
+    fn spawn(&self, name: &'static str, run: impl FnOnce() + Send + 'static) -> Result<(), String> {
+        self.reap()?;
+        let handle = thread::Builder::new()
+            .name(name.into())
+            .spawn(run)
+            .map_err(|e| format!("failed to spawn {name}: {e}"))?;
+        self.handles
+            .lock()
+            .map_err(|_| "voice thread manager lock poisoned".to_string())?
+            .push(handle);
+        Ok(())
+    }
+
+    fn reap(&self) -> Result<(), String> {
+        let mut handles = self
+            .handles
+            .lock()
+            .map_err(|_| "voice thread manager lock poisoned".to_string())?;
+        let mut live = Vec::new();
+        for handle in handles.drain(..) {
+            if handle.is_finished() {
+                let _ = handle.join();
+                continue;
+            }
+            live.push(handle);
+        }
+        *handles = live;
+        Ok(())
+    }
+
+    fn wait(&self) -> Result<(), String> {
+        let handles = {
+            let mut handles = self
+                .handles
+                .lock()
+                .map_err(|_| "voice thread manager lock poisoned".to_string())?;
+            handles.drain(..).collect::<Vec<_>>()
+        };
+        for handle in handles {
+            let _ = handle.join();
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ThreadManager {
+    fn drop(&mut self) {
+        let Ok(handles) = self.handles.get_mut() else {
+            return;
+        };
+        for handle in handles.drain(..) {
+            let _ = handle.join();
+        }
+    }
+}
+
+enum VoiceSession {
+    Lfm2(Lfm2Session),
+    Livekit(LiveKitSession),
+}
+
+impl VoiceSession {
+    fn is_finished(&self) -> bool {
+        match self {
+            VoiceSession::Lfm2(session) => session.is_finished(),
+            VoiceSession::Livekit(_) => false,
+        }
+    }
+
+    fn provider(&self) -> VoiceProvider {
+        match self {
+            VoiceSession::Lfm2(_) => VoiceProvider::Lfm2,
+            VoiceSession::Livekit(_) => VoiceProvider::Livekit,
+        }
+    }
+
+    fn session_id(&self) -> &str {
+        match self {
+            VoiceSession::Lfm2(session) => &session.ctx.session_id,
+            VoiceSession::Livekit(session) => &session.ctx.session_id,
+        }
+    }
+
+    fn interrupt(&self) {
+        match self {
+            VoiceSession::Lfm2(session) => session.interrupt(),
+            VoiceSession::Livekit(_) => {}
+        }
+    }
+
+    fn set_mic_enabled(&self, enabled: bool) {
+        match self {
+            VoiceSession::Lfm2(session) => session.set_mic_enabled(enabled),
+            VoiceSession::Livekit(session) => session.set_mic_enabled(enabled),
+        }
+    }
+
+    fn mic_enabled(&self) -> bool {
+        match self {
+            VoiceSession::Lfm2(session) => session.mic_enabled(),
+            VoiceSession::Livekit(session) => session.mic_enabled(),
+        }
+    }
+
+    fn stop(self) {
+        match self {
+            VoiceSession::Lfm2(session) => session.stop(),
+            VoiceSession::Livekit(session) => session.stop(),
+        }
+    }
+}
+
+struct LiveKitSession {
+    ctx: SessionCtx,
+    mic_enabled: AtomicBool,
+}
+
+impl LiveKitSession {
+    fn new(ctx: SessionCtx) -> Self {
+        Self {
+            ctx,
+            mic_enabled: AtomicBool::new(true),
+        }
+    }
+
+    fn set_mic_enabled(&self, enabled: bool) {
+        self.mic_enabled.store(enabled, Ordering::SeqCst);
+    }
+
+    fn mic_enabled(&self) -> bool {
+        self.mic_enabled.load(Ordering::SeqCst)
+    }
+
+    fn stop(self) {}
+}
+
+struct Lfm2Session {
+    ctx: SessionCtx,
     done: Arc<AtomicBool>,
     bridge_cancel: Arc<AtomicBool>,
     live: Option<Lfm2Runtime>,
 }
 
-impl VoiceSession {
+impl Lfm2Session {
     fn spawn(
         ctx: SessionCtx,
         settings: VoiceSettings,
@@ -139,7 +339,7 @@ impl VoiceSession {
             },
         );
         Self {
-            _ctx: ctx,
+            ctx,
             done,
             bridge_cancel,
             live: Some(live),
@@ -163,6 +363,10 @@ impl VoiceSession {
         }
     }
 
+    fn mic_enabled(&self) -> bool {
+        self.live.as_ref().is_some_and(Lfm2Runtime::mic_enabled)
+    }
+
     fn stop(mut self) {
         self.done.store(true, Ordering::SeqCst);
         self.bridge_cancel.store(true, Ordering::SeqCst);
@@ -172,7 +376,7 @@ impl VoiceSession {
     }
 }
 
-impl Drop for VoiceSession {
+impl Drop for Lfm2Session {
     fn drop(&mut self) {
         self.done.store(true, Ordering::SeqCst);
         self.bridge_cancel.store(true, Ordering::SeqCst);
@@ -325,7 +529,7 @@ fn send_runtime(channel: &UiChannel, event: RuntimeEvent) -> bool {
 }
 
 fn build_engine(settings: VoiceSettings, out_rate: u32) -> Result<Lfm2VoiceEngine, String> {
-    let model_ref = model_ref(&settings)?;
+    let model_ref = settings::lfm2_model_ref(&settings.lfm2);
     let (device, dtype) = select_device(&settings.lfm2.device)?;
     let dir = get_model_dir(&model_ref, None)
         .map_err(|e| format!("failed to resolve model `{model_ref}`: {e}"))?;
@@ -343,24 +547,6 @@ fn build_engine(settings: VoiceSettings, out_rate: u32) -> Result<Lfm2VoiceEngin
     Ok(Lfm2VoiceEngine::new(
         model, proc, params, codebooks, device, out_rate,
     ))
-}
-
-fn model_ref(settings: &VoiceSettings) -> Result<String, String> {
-    if let Some(model) = settings
-        .lfm2
-        .model
-        .as_deref()
-        .filter(|s| !s.trim().is_empty())
-    {
-        return Ok(model.trim().to_string());
-    }
-    settings
-        .lfm2
-        .model_dir
-        .as_deref()
-        .filter(|s| !s.trim().is_empty())
-        .map(|s| s.trim().to_string())
-        .ok_or_else(|| "Set the model directory to enable the local model.".to_string())
 }
 
 fn select_device(device: &Lfm2Device) -> Result<(Device, DType), String> {
