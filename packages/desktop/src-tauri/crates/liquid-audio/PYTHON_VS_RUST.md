@@ -119,11 +119,11 @@ Every divergence below is deliberate; none changes the verified numerics.
   `LFM2AudioProcessor`, `ChatState`), and **hard-codes `.cuda()`** for the detokenizer
   (`processor.py:151`) and `device="cuda"` in the demo. As shipped, the reference
   **requires** a CUDA box (the detok `.cuda()` crashes on a CPU-only host).
-- **Rust:** *nothing* in `src/` hardcodes a device; every loader (`from_pretrained`,
-  `load_detokenizer`, `load_mimi`) takes `device: &Device` + `dtype: DType` and honors
-  it. Examples default to `(Cpu, F32)`, Metal is opt-in (`LFM_DEVICE=metal` → bf16).
-  candle has no CPU bf16 matmul, so CPU→f32 is the correct mapping (and matches
-  Python's f32-pinned mel).
+- **Rust:** *nothing* in `src/` hardcodes a device; loaders take `device: &Device`,
+  and persistent model weight dtype comes from safetensors tensor headers. Examples
+  default to CPU BF16 through the in-tree NEON bridge when FEAT_BF16 is available;
+  Metal is opt-in (`LFM_DEVICE=metal`). F32 remains local math for PCM/audio,
+  attention accumulation, logits/sampling/loss, and BF16 matmul accumulation.
 - **Consequence:** the port actually delivers LFM2's "runs on CPU" design point — the
   full 1.5B model decodes end-to-end and all 8 parity tests pass **on `Device::Cpu`**;
   the Python, as written, would not boot without CUDA.
@@ -317,5 +317,5 @@ export LFM_MODEL_DIR=../model
 python parity/compare_symbols.py --scope core          # 170/170
 cargo test --lib                                       # 31 passed
 cargo test --test parity --release -- --ignored --nocapture   # 8/8 byte-exact
-LFM_MODEL_DIR=../model cargo run --release --example generate # end-to-end, CPU/f32
+LFM_MODEL_DIR=../model cargo run --release --example generate # end-to-end, CPU BF16 via NEON
 ```

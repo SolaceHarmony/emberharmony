@@ -1,11 +1,11 @@
 //! NEON `BFMMLA` bf16 GEMM — closes candle 0.9.2's CPU bf16-matmul gap.
 //!
 //! candle's CPU matmul allowlist is `F16 | F32 | F64` (`cpu_backend/mod.rs`); bf16 falls
-//! through to `UnsupportedDTypeForOp`, so the loader forces f32 on CPU. The Arm BFloat16
-//! extension (FEAT_BF16) has `BFMMLA`, which does a 2×4·4×2 bf16 matmul with **f32
-//! accumulate** — the same numerics torch's CPU bf16 matmul uses. We compile a small C
-//! micro-kernel (`csrc/bf16_gemm.c`, via build.rs `cc` with `-march=armv8.2-a+bf16`) and
-//! call it here. Build-gated on aarch64 (`cfg(has_bf16_kernel)`) and **runtime**-gated on
+//! through to `UnsupportedDTypeForOp`, so BF16 CPU linears route through this bridge instead
+//! of stock candle matmul. The Arm BFloat16 extension (FEAT_BF16) has `BFMMLA`, which does
+//! a 2×4·4×2 bf16 matmul with **f32 accumulate**. We compile a small C micro-kernel
+//! (`csrc/bf16_gemm.c`, via build.rs `cc` with `-march=armv8.2-a+bf16`) and call it here.
+//! Build-gated on aarch64 (`cfg(has_bf16_kernel)`) and **runtime**-gated on
 //! FEAT_BF16 (BFMMLA `SIGILL`s without it), so a binary stays portable.
 
 use candle_core::{CpuStorage, CustomOp2, DType, Layout, Result, Shape, Tensor};

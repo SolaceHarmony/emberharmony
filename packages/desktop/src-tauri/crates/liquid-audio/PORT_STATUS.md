@@ -72,13 +72,11 @@ Python's `forward_cached(x, cache) -> (out, cache)` is Rust's in-place
   `StdRng`) for text and audio, faithful to `_sample_text_token` /
   `_sample_audio_frame`; `GenParams` threaded through `generate_interleaved` and
   the now-ported `generate_sequential`. Unit-tested (greedy/top-k/determinism).
-- **dtype**: ✅ resolved — `from_pretrained(dir, dtype, device)` mirrors the
-  Python `dtype=` kwarg. The on-disk checkpoint is bf16, so `DType::F32` loads
-  the *exact* bf16-rounded weights and upcasts (bf16→f32 is lossless): the weight
-  values already match the deployed model, and compute is simply more precise.
-  The parity reference is dumped at `torch.float32`, so there is no dtype gap
-  against it. True in-memory bf16 is accepted for CUDA/Metal but rejected on CPU
-  (candle has no CPU bf16 matmul kernel) with a clear error.
+- **dtype**: ✅ resolved — `from_pretrained(dir, device)` derives persistent
+  weight dtype from the safetensors tensor headers. BF16 checkpoint weights stay
+  BF16 on CPU and Metal; the caller cannot request an F32 model copy. F32 remains
+  only where the implementation explicitly needs local accumulation or audio/math
+  buffers.
 - **hf-hub auto-download**: ✅ done — `get_model_dir(repo_or_path, revision)`
   snapshot-downloads a HF repo id via the `hf-hub` crate (sync, the
   `snapshot_download` analog) and returns the snapshot dir; local paths pass

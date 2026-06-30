@@ -110,10 +110,10 @@ The two-field split (`mimi` vs `audio_out`) is preserved in `loader.rs:151-159`;
   `if x.device.type != 'cuda': no_compile()`). No `causal_conv1d`/`flash_attn`/`triton`
   import in the vendored codec — stock torch SDPA + `torch.compile`. **As shipped,
   the Python won't boot on a CPU-only host** (the detok `.cuda()` crashes).
-- **Rust is device-agnostic.** Every loader takes `device: &Device` + `dtype: DType`
-  (`loader.rs:296`), nothing hardcoded; SDPA is eager `matmul + mask + softmax` (the
-  `sdpa`/no-flash math). Defaults `(Cpu, F32)`; Metal opt-in (`LFM_DEVICE=metal`,
-  `Cargo.toml:77`). On CPU it uses F32 (candle has no CPU bf16 matmul).
+- **Rust is device-agnostic.** Loaders take `device: &Device`; persistent model
+  weight dtype comes from safetensors tensor headers. SDPA is eager `matmul + mask
+  + softmax` (the `sdpa`/no-flash math). CPU BF16 uses the in-tree NEON bridge
+  when FEAT_BF16 is available; Metal is opt-in (`LFM_DEVICE=metal`).
 - **Off-path note:** the `candle-flashfftconv` crate (bf16×2 `__nv_bfloat162` FFT
   kernels) is **not** wired into this model — `liquid-audio-rs` has zero references to
   it and no dep in `Cargo.lock`. The only FFTs on-path are the f32 mel STFT and the
@@ -127,7 +127,7 @@ The two-field split (`mimi` vs `audio_out`) is preserved in `loader.rs:151-159`;
 
 | File | Holds | Loaded by (Python) | dtype |
 |---|---|---|---|
-| `model.safetensors` (~2.94 GB) | the whole `LFM2AudioModel`: `lfm` (HF `Lfm2Model` backbone), `conformer`, `audio_adapter`, `audio_embedding`, `depthformer`, `depth_linear`, `depth_embeddings` | `accelerate.load_checkpoint_in_model(model, dir)` — `lfm2_audio.py:167` | bf16 (`config.lfm.torch_dtype`) |
+| `model.safetensors` (~2.94 GB) | the whole `LFM2AudioModel`: `lfm` (HF `Lfm2Model` backbone), `conformer`, `audio_adapter`, `audio_embedding`, `depthformer`, `depth_linear`, `depth_embeddings` | `accelerate.load_checkpoint_in_model(model, dir)` — `lfm2_audio.py:167` | BF16 from safetensors tensor headers |
 | `tokenizer-e351c8d8-checkpoint125.safetensors` (~384 MB) | Kyutai **Mimi** codec | `safetensors.torch.load_file` + `load_state_dict` — `processor.py:111-115` | fp32 module |
 | `tokenizer.json` | HF BPE text tokenizer | `AutoTokenizer.from_pretrained` — `processor.py:45` | n/a |
 | `config.json` | all hyperparameters | `json.load` — `lfm2_audio.py:146`, `processor.py:64` | n/a |

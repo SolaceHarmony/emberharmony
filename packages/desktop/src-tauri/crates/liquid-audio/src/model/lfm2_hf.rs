@@ -32,6 +32,7 @@ use candle_nn::{embedding, linear_no_bias, Embedding, Linear, Module, VarBuilder
 // vendored onto the 0.9.2 pin (see `candle_ext`). Using the reference helpers — not a
 // hand-rolled `causal_mask`/`repeat_kv` — keeps this a faithful port.
 use crate::candle_ext::transformers_utils::{build_causal_mask, repeat_kv};
+use crate::model::linear::linear_forward;
 
 // The differentiable RMSNorm (basic ops), NOT candle_nn::RmsNorm — whose `forward`
 // calls the fused `ops::rms_norm` (`apply_op2_no_bwd`) on contiguous inputs and so
@@ -229,9 +230,9 @@ impl Mlp {
         })
     }
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let gate = candle_nn::ops::silu(&self.gate_proj.forward(x)?)?;
-        let up = self.up_proj.forward(x)?;
-        self.down_proj.forward(&(gate * up)?)
+        let gate = candle_nn::ops::silu(&linear_forward(&self.gate_proj, x)?)?;
+        let up = linear_forward(&self.up_proj, x)?;
+        linear_forward(&self.down_proj, &(gate * up)?)
     }
 }
 
@@ -285,19 +286,13 @@ impl Attention {
         add_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
         let (b, seq_len, _) = x.dims3()?;
-        let q = self
-            .q_proj
-            .forward(x)?
+        let q = linear_forward(&self.q_proj, x)?
             .reshape((b, seq_len, self.n_head, self.head_dim))?
             .transpose(1, 2)?;
-        let k = self
-            .k_proj
-            .forward(x)?
+        let k = linear_forward(&self.k_proj, x)?
             .reshape((b, seq_len, self.n_kv, self.head_dim))?
             .transpose(1, 2)?;
-        let v = self
-            .v_proj
-            .forward(x)?
+        let v = linear_forward(&self.v_proj, x)?
             .reshape((b, seq_len, self.n_kv, self.head_dim))?
             .transpose(1, 2)?
             .contiguous()?;
@@ -346,7 +341,7 @@ impl Attention {
         let y = y
             .transpose(1, 2)?
             .reshape((b, seq_len, self.n_head * self.head_dim))?;
-        self.o_proj.forward(&y)
+        linear_forward(&self.o_proj, &y)
     }
 }
 
@@ -372,7 +367,7 @@ impl ShortConv {
 
     fn forward(&self, x: &Tensor, block_idx: usize, cache: &mut Cache) -> Result<Tensor> {
         let (_b, seq_len, _) = x.dims3()?;
-        let bcx = self.in_proj.forward(x)?.transpose(1, 2)?;
+        let bcx = linear_forward(&self.in_proj, x)?.transpose(1, 2)?;
         let bgate = bcx.narrow(1, 0, self.hidden_size)?;
         let c = bcx.narrow(1, self.hidden_size, self.hidden_size)?;
         let x_proj = bcx.narrow(1, 2 * self.hidden_size, self.hidden_size)?;
@@ -396,7 +391,7 @@ impl ShortConv {
         }
 
         let conv_out = (c * &conv_out)?.transpose(1, 2)?.contiguous()?;
-        self.out_proj.forward(&conv_out)
+        linear_forward(&self.out_proj, &conv_out)
     }
 }
 

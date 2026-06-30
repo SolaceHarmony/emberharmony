@@ -10,10 +10,11 @@
 
 use candle_core::{Result, Tensor, D};
 use candle_nn::{
-    conv1d, conv2d, linear, Conv1d, Conv1dConfig, Conv2d, Conv2dConfig, Linear, Module, VarBuilder,
+    conv1d, conv2d, linear, Conv1d, Conv1dConfig, Conv2d, Conv2dConfig, Linear, VarBuilder,
 };
 
 use super::modules::{CausalConv1D, CausalPadding};
+use crate::model::linear::{conv1d_forward, conv2d_forward, linear_forward};
 
 /// Faithful to `calc_length`: output length after `repeat_num` strided convs.
 pub fn calc_length(
@@ -170,16 +171,16 @@ impl MaskedConvSequential {
                     // backward run. Stride-1 convs are exact (no ambiguity), so skip them
                     // (padding would change their output length).
                     if c.config().stride != 1 {
-                        c.forward(&pad_even_hw(&x)?)?
+                        conv2d_forward(c, &pad_even_hw(&x)?)?
                     } else {
-                        c.forward(&x)?
+                        conv2d_forward(c, &x)?
                     }
                 }
                 Op::Conv1d(c) => {
                     if c.config().stride != 1 {
-                        c.forward(&pad_even_1d(&x)?)?
+                        conv1d_forward(c, &pad_even_1d(&x)?)?
                     } else {
-                        c.forward(&x)?
+                        conv1d_forward(c, &x)?
                     }
                 }
                 // CausalConv1D pads asymmetrically (left=k-1, right=stride-1) inside
@@ -210,7 +211,7 @@ impl MaskedConvSequential {
             x = apply_channel_mask(&x, &mask)?;
             x = match op {
                 Op::Conv(c) => {
-                    let out = c.forward(&x)?;
+                    let out = conv2d_forward(c, &x)?;
                     let cfg = c.config();
                     // Strided conv (stride != 1) shrinks the time axis; pointwise
                     // (stride 1) leaves it unchanged.
@@ -620,10 +621,10 @@ impl ConvSubsampling {
             let y = self.forward_conv(x)?; // (B, C, T', F')
             let (b, c, t, f) = y.dims4()?;
             let y = y.transpose(1, 2)?.contiguous()?.reshape((b, t, c * f))?;
-            self.out
-                .as_ref()
-                .expect("conv2d scheme has an out Linear")
-                .forward(&y)
+            linear_forward(
+                self.out.as_ref().expect("conv2d scheme has an out Linear"),
+                &y,
+            )
         } else {
             let xin = x.transpose(1, 2)?.contiguous()?; // (B, feat_in, T)
             let y = self.conv.forward_conv(&xin)?; // (B, C=feat_out, T')
@@ -702,7 +703,7 @@ impl ConvSubsampling {
         } else {
             x.clone()
         };
-        conv.forward(&x)
+        conv2d_forward(conv, &x)
     }
 }
 

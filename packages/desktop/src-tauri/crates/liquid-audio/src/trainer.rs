@@ -223,9 +223,6 @@ pub struct TrainerConfig {
     pub val_interval: usize,
     /// `output_dir` (Python `"tmp"`).
     pub output_dir: String,
-    /// `mixed_precision="bf16"` ⇒ the model/activation dtype. bf16 on CUDA/Metal,
-    /// f32 on CPU (candle has no CPU bf16 matmul). Loss math is always upcast to f32.
-    pub dtype: DType,
 }
 
 impl Default for TrainerConfig {
@@ -243,7 +240,6 @@ impl Default for TrainerConfig {
             save_interval: 500,
             val_interval: 100,
             output_dir: "tmp".to_string(),
-            dtype: DType::F32,
         }
     }
 }
@@ -285,8 +281,7 @@ impl Trainer {
         train_loader: Box<dyn DataIter>,
         val_loader: Option<Box<dyn DataIter>>,
     ) -> Result<Self> {
-        let TrainableLoad { model, varmap, .. } =
-            from_pretrained_trainable(model_dir, cfg.dtype, device)?;
+        let TrainableLoad { model, varmap, .. } = from_pretrained_trainable(model_dir, device)?;
         Self::with_model(model, varmap, cfg, device.clone(), train_loader, val_loader)
     }
 

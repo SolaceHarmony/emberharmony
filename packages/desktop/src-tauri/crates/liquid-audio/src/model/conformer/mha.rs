@@ -28,7 +28,9 @@ use candle_core::{DType, Device, Result, Tensor, D};
 // `ops::softmax` (differentiable basic ops), NOT `softmax_last_dim` (fused
 // `apply_op1_no_bwd`, severs autograd): the conformer attention runs in the trainable
 // `logits` graph (audio-in encode). Same forward values.
-use candle_nn::{linear, linear_no_bias, ops::softmax, Linear, Module, VarBuilder};
+use candle_nn::{linear, linear_no_bias, ops::softmax, Linear, VarBuilder};
+
+use crate::model::linear::linear_forward;
 
 const INF_VAL: f64 = 10000.0;
 
@@ -208,19 +210,13 @@ impl MultiHeadAttention {
     ) -> Result<(Tensor, Tensor, Tensor)> {
         let (nb, t1, _) = query.dims3()?;
         let t2 = key.dim(1)?;
-        let q = self
-            .linear_q
-            .forward(query)?
+        let q = linear_forward(&self.linear_q, query)?
             .reshape((nb, t1, self.h, self.d_k))?
             .transpose(1, 2)?;
-        let k = self
-            .linear_k
-            .forward(key)?
+        let k = linear_forward(&self.linear_k, key)?
             .reshape((nb, t2, self.h, self.d_k))?
             .transpose(1, 2)?;
-        let v = self
-            .linear_v
-            .forward(value)?
+        let v = linear_forward(&self.linear_v, value)?
             .reshape((nb, t2, self.h, self.d_k))?
             .transpose(1, 2)?;
         Ok((q.contiguous()?, k.contiguous()?, v.contiguous()?))
@@ -240,7 +236,7 @@ impl MultiHeadAttention {
         let attn = masked_softmax(scores, mask)?;
         let x = attn.matmul(value)?; // (b,h,t1,d_k)
         let x = x.transpose(1, 2)?.reshape((nb, time, self.h * self.d_k))?;
-        self.linear_out.forward(&x)
+        linear_forward(&self.linear_out, &x)
     }
 
     /// Base `forward` (standard scaled-dot-product). The encoder uses the rel-pos
@@ -374,9 +370,7 @@ impl RelPositionMultiHeadAttention {
         let q = q.transpose(1, 2)?; // (b,t,h,d_k)
 
         let n_batch_pos = pos_emb.dim(0)?;
-        let p = self
-            .linear_pos
-            .forward(pos_emb)?
+        let p = linear_forward(&self.linear_pos, pos_emb)?
             .reshape((n_batch_pos, (), h, d_k))?
             .transpose(1, 2)?
             .contiguous()?; // (1,h,pos_len,d_k)

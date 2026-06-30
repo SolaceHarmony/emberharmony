@@ -16,6 +16,7 @@
 use candle_core::{Result, Tensor};
 use candle_nn::{linear, Embedding, Linear, Module, VarBuilder};
 
+use crate::model::linear::linear_forward;
 use crate::model::lfm2_hf::{Cache, Lfm2Config, Model as Lfm2Model};
 
 const AUDIO_VOCAB: usize = 2048;
@@ -261,7 +262,7 @@ impl LFM2AudioDetokenizer {
         let mask = self.sliding_mask(n, x.device())?;
         let mut cache = Cache::new(false, x.dtype(), &self.lfm_cfg, x.device())?;
         let h = self.lfm.forward_embeds(&x, 0, &mut cache, Some(&mask))?; // (B, n, dim)
-        let x = self.lin.forward(&h)?; // (B, n, 1282)
+        let x = linear_forward(&self.lin, &h)?; // (B, n, 1282)
 
         // split (over the 1282 feature dim, after transpose to (B,1282,n)) into
         // log-magnitude and angle, each (B, 641, n)

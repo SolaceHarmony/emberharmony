@@ -25,7 +25,11 @@ pub enum DownloadEvent {
     /// total file count is known (repo listing succeeded)
     Started { total: u32 },
     /// fetching file `index` of `total`
-    File { index: u32, total: u32, name: String },
+    File {
+        index: u32,
+        total: u32,
+        name: String,
+    },
     /// finished; `dir` is the local snapshot directory to set as the active model
     Done { dir: String },
     /// hard failure — the download did not complete; no model is marked active
@@ -243,10 +247,7 @@ mod tests {
         assert_eq!(f["type"], "file");
         assert_eq!(f["index"], 2);
         assert_eq!(f["name"], "model.safetensors");
-        let d = serde_json::to_value(DownloadEvent::Done {
-            dir: "/x/y".into(),
-        })
-        .unwrap();
+        let d = serde_json::to_value(DownloadEvent::Done { dir: "/x/y".into() }).unwrap();
         assert_eq!(d["type"], "done");
         assert_eq!(d["dir"], "/x/y");
     }

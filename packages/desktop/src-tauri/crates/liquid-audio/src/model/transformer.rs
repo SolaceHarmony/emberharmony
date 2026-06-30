@@ -26,6 +26,7 @@ use candle_nn::{
 };
 
 use crate::candle_ext::kv_cache::ConcatKvCache;
+use crate::model::linear::linear_forward;
 
 /// `head_style` for attention. Mirrors the `Literal["mha","gqa","mqa"]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -192,11 +193,11 @@ impl Glu {
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         if self.use_swiglu {
-            let a = candle_nn::ops::silu(&self.w1.forward(x)?)?;
-            let b = self.w3.as_ref().unwrap().forward(x)?;
-            self.w2.forward(&(a * b)?)
+            let a = candle_nn::ops::silu(&linear_forward(&self.w1, x)?)?;
+            let b = linear_forward(self.w3.as_ref().unwrap(), x)?;
+            linear_forward(&self.w2, &(a * b)?)
         } else {
-            self.w2.forward(&self.w1.forward(x)?.gelu_erf()?)
+            linear_forward(&self.w2, &linear_forward(&self.w1, x)?.gelu_erf()?)
         }
     }
 
@@ -478,7 +479,7 @@ impl Mha {
 
     pub fn forward(&self, x: &Tensor, cache: Option<&mut LayerKvCache>) -> Result<Tensor> {
         let seq_len = x.dim(1)?;
-        let x = self.qkv_proj.forward(x)?;
+        let x = linear_forward(&self.qkv_proj, x)?;
         let (q_w, kv_w) = match self.head_style {
             HeadStyle::Mha => (self.dim, self.dim),
             HeadStyle::Mqa => (self.dim, self.head_dim),
@@ -494,7 +495,7 @@ impl Mha {
         let sin = self.sin.narrow(0, cache_size, seq_len)?;
 
         let ys = self.attention.forward(&xq, &xk, &xv, &cos, &sin, cache)?;
-        self.out_proj.forward(&ys)
+        linear_forward(&self.out_proj, &ys)
     }
 
     /// `MHA._validate_cache` (py 295-301): TypeGuard that the cache is a 2-tuple of
@@ -644,8 +645,7 @@ impl SharedEmbedding {
     }
 
     pub fn get_logits(&self, embeddings: &Tensor) -> Result<Tensor> {
-        self.to_logits
-            .forward(&self.embedding_norm.forward(embeddings)?)
+        linear_forward(&self.to_logits, &self.embedding_norm.forward(embeddings)?)
     }
 }
 

@@ -107,7 +107,7 @@ into plain convs at export, so inference loads ordinary conv weights.
 
 | Aspect | Python | Rust |
 |---|---|---|
-| Default device | `from_pretrained(device="cuda")` (`processor.py:61`); LFM2 detok hard-`.cuda()` (`processor.py:151`) | `device: &Device` everywhere; `(Cpu,F32)` default, Metal opt-in |
+| Default device | `from_pretrained(device="cuda")` (`processor.py:61`); LFM2 detok hard-`.cuda()` (`processor.py:151`) | `device: &Device` everywhere; persistent weight dtype from safetensors; CPU BF16 via NEON, Metal opt-in |
 | CUDA graphs | `_MimiState` wraps encoder/decoder/transformers in `CUDAGraphed` (`compression.py:99-102,219-230`) — **`disable = device.type != 'cuda'`** (`compression.py:221`), so graphs engage **only on CUDA** | none — candle ops directly |
 | Attention | `F.scaled_dot_product_attention` + `torch.compile` (CUDA-gated) in the codec transformer | eager matmul + mask + softmax (`moshi` crate) |
 | Custom kernels | none in the vendored codec (no `causal_conv1d`/`flash_attn`/triton) — stock torch SDPA | none |

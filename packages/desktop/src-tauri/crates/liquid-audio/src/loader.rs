@@ -2,17 +2,10 @@
 //!
 //! Mirrors `LFM2AudioModel.from_pretrained` / `LFM2AudioProcessor.from_pretrained`:
 //! parse the config, construct the typed configs, memory-map the safetensors, and
-//! build the model + processor. `dtype` mirrors the Python keyword arg
-//! (`dtype: torch.dtype = torch.bfloat16`): pass `DType::BF16` on CUDA/Metal to
-//! match the deployed model, or `DType::F32` for the parity harness (which dumps
-//! the Python reference at `torch.float32`) and for CPU.
-//!
-//! Note: the on-disk checkpoint is stored bf16, so `DType::F32` still loads the
-//! *faithful* (bf16-rounded) weight values and upcasts them — on CPU this is the
-//! correct path, because candle's CPU backend has no bf16 matmul kernel. Request-
-//! ing `DType::BF16` on a CPU device is therefore rejected up front (see guard)
-//! rather than failing later with a cryptic "unsupported dtype BF16 for op
-//! matmul". Expects a local model directory (download the HF repo first; hf-hub
+//! build the model + processor. Persistent model weights load at the floating
+//! dtype stored in the safetensors headers; callers do not choose a convenience
+//! dtype. BF16 CPU inference requires the in-tree NEON BFMMLA matmul bridge.
+//! Expects a local model directory (download the HF repo first; hf-hub
 //! auto-download is a follow-up).
 
 use std::fs;
@@ -60,6 +53,62 @@ fn safetensors_in(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 
+fn model_safetensors_in(dir: &Path) -> Result<Vec<PathBuf>> {
+    let safes: Vec<PathBuf> = safetensors_in(dir)?
+        .into_iter()
+        .filter(|p| {
+            !p.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("tokenizer-"))
+        })
+        .collect();
+    if safes.is_empty() {
+        return Err(err(format!(
+            "no model .safetensors in {}",
+            dir.display()
+        )));
+    }
+    Ok(safes)
+}
+
+fn is_floating_dtype(dtype: DType) -> bool {
+    matches!(
+        dtype,
+        DType::BF16
+            | DType::F16
+            | DType::F32
+            | DType::F64
+            | DType::F8E4M3
+            | DType::F6E2M3
+            | DType::F6E3M2
+            | DType::F4
+            | DType::F8E8M0
+    )
+}
+
+fn safetensors_floating_dtype(safes: &[PathBuf]) -> Result<DType> {
+    let tensors = unsafe { candle_core::safetensors::MmapedSafetensors::multi(safes)? };
+    let mut found: Option<(DType, String)> = None;
+    for (name, view) in tensors.tensors() {
+        let dtype: DType = view.dtype().try_into()?;
+        if !is_floating_dtype(dtype) {
+            continue;
+        }
+        match &found {
+            Some((prev, first)) if *prev != dtype => {
+                return Err(err(format!(
+                    "mixed floating safetensor dtypes: `{first}` is {prev:?}, `{name}` is {dtype:?}"
+                )));
+            }
+            None => found = Some((dtype, name)),
+            _ => {}
+        }
+    }
+    found
+        .map(|(dtype, _)| dtype)
+        .ok_or_else(|| err("checkpoint has no floating safetensor tensors"))
+}
+
 fn parse_encoder(e: &Value) -> Result<ConformerEncoderConfig> {
     // Structural fields are required (a wrong default = a silently-broken model).
     // `feat_out`/`subsampling_conv_channels` keep the upstream `-1 → use d_model`
@@ -86,25 +135,21 @@ fn parse_encoder(e: &Value) -> Result<ConformerEncoderConfig> {
 }
 
 /// Resolve `repo_id` (or a local path) via [`get_model_dir`] — snapshot-
-/// downloading from the Hub if needed — then load at `dtype`. This is the
-/// faithful analog of the Python `LFM2AudioModel.from_pretrained(repo_id, ...)`
-/// entry point (which calls `get_model_dir` internally).
+/// downloading from the Hub if needed — then load using the floating dtype stored
+/// in the model safetensors.
 pub fn from_pretrained_hub(
     repo_id: &str,
     revision: Option<&str>,
-    dtype: DType,
     device: &Device,
 ) -> Result<(LFM2AudioModel, LFM2AudioProcessor)> {
     let dir = crate::utils::get_model_dir(repo_id, revision).map_err(err)?;
-    from_pretrained(&dir, dtype, device)
+    from_pretrained(&dir, device)
 }
 
-/// Load the main model + processor from a local model directory, at `dtype`
-/// (mirrors the Python `dtype=` keyword; `DType::BF16` matches the deployed
-/// model, `DType::F32` matches the parity reference).
+/// Load the main model + processor from a local model directory. Persistent
+/// floating weights keep the dtype stored in the model safetensors.
 pub fn from_pretrained(
     dir: &Path,
-    dtype: DType,
     device: &Device,
 ) -> Result<(LFM2AudioModel, LFM2AudioProcessor)> {
     // Size the global rayon pool (candle's matmul/conv use it) like torch's intra-op
@@ -112,24 +157,17 @@ pub fn from_pretrained(
     // the first tensor op; idempotent. (No-op for thread parallelism on the Metal path,
     // but the f64 mel front-end and other CPU ops still benefit.)
     crate::threads::configure_intraop_threads();
-    if dtype == DType::BF16 && device.is_cpu() {
-        // candle supports bf16 broadly (dtype, conversions, every elementwise op, AND
-        // Metal matmul). The single gap is candle 0.9.2's CPU *gemm* matmul allowlist
-        // (`cpu_backend/mod.rs`: `DType::F16 | F32 | F64`; the Accelerate path is F32/F64
-        // only) — bf16 falls through to `UnsupportedDTypeForOp`. It's a candle allowlist
-        // choice, not a `gemm` limit (`gemm-f16` handles the `half` types), so true bf16
-        // CPU matmul is a `candle_ext` backport away if ever needed. For now f32 on CPU is
-        // the right call: the bf16→f32 weight upcast is lossless and the f32 parity
-        // goldens were dumped at f32, so this is the faithful CPU/test path.
-        return Err(err(
-            "bf16 matmul is not in candle 0.9.2's CPU gemm allowlist (F16/F32/F64); use \
-             DType::F32 on CPU — it loads the bf16 weights and upcasts them losslessly. \
-             (bf16 runs natively on Metal.)",
-        ));
-    }
     let config: Value =
         serde_json::from_str(&fs::read_to_string(dir.join("config.json")).map_err(err)?)
             .map_err(err)?;
+    let safes = model_safetensors_in(dir)?;
+    let dtype = safetensors_floating_dtype(&safes)?;
+    if dtype == DType::BF16 && device.is_cpu() && !crate::bf16_gemm::bf16_gemm_available() {
+        return Err(err(
+            "CPU bf16 inference requires the in-tree NEON BFMMLA matmul kernel, but it is \
+             unavailable on this machine. Use Metal or a CPU with FEAT_BF16.",
+        ));
+    }
 
     let lfm_cfg: Lfm2Config = serde_json::from_value(config["lfm"].clone()).map_err(err)?;
     let enc_cfg = parse_encoder(&config["encoder"])?;
@@ -158,7 +196,6 @@ pub fn from_pretrained(
         audio_loss_multiplier: config["audio_loss_multiplier"].as_f64().unwrap_or(1.0),
     };
 
-    let safes = safetensors_in(dir)?;
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&safes, dtype, device)? };
     let model = LFM2AudioModel::new(
         lfm_cfg, &enc_cfg, &depth_cfg, codebooks, n_text, n_audio, &loss_conf, vb,
@@ -181,7 +218,7 @@ pub fn from_pretrained(
     let mimi: Option<Box<dyn AudioDetokenizer>> = load_mimi(dir, codebooks, device)?
         .map(|m| Box::new(MimiDetokenizer::new(m)) as Box<dyn AudioDetokenizer>);
     let audio_out: Option<Box<dyn AudioDetokenizer>> = if dir.join("audio_detokenizer").is_dir() {
-        Some(Box::new(load_detokenizer(dir, dtype, device)?))
+        Some(Box::new(load_detokenizer(dir, device)?))
     } else {
         None
     };
@@ -214,26 +251,26 @@ pub struct TrainableLoad {
 /// Trainable analog of [`from_pretrained`]: build the model from a `VarMap`-backed
 /// `VarBuilder` so every weight is a trainable [`candle_core::Var`] (the candle
 /// equivalent of `nn.Module.parameters()` participating in autograd), then load
-/// the checkpoint values into those `Var`s. Mirrors the Python `Trainer.__init__`
-/// step `LFM2AudioModel.from_pretrained(model_id, dtype=torch.bfloat16)` followed
-/// by `accelerator.prepare(model, ...)` — except the params are real `Var`s the
-/// candle optimizer can update, not frozen mmaped tensors.
+/// the checkpoint values into those `Var`s. The params are real `Var`s the candle
+/// optimizer can update, not frozen mmaped tensors.
 ///
-/// `dtype` mirrors the Python `torch.bfloat16`; pass `DType::F32` on CPU (candle
-/// has no CPU bf16 matmul) — the bf16-stored weights upcast faithfully.
+/// CPU BF16 training is rejected because the NEON inference matmul bridge is
+/// no-bwd; callers should not upcast persistent BF16 weights to F32 just to make
+/// CPU training run.
 pub fn from_pretrained_trainable(
     dir: &Path,
-    dtype: DType,
     device: &Device,
 ) -> Result<TrainableLoad> {
-    if dtype == DType::BF16 && device.is_cpu() {
-        return Err(err(
-            "bf16 on CPU is unsupported (candle has no CPU bf16 matmul); use DType::F32",
-        ));
-    }
     let config: Value =
         serde_json::from_str(&fs::read_to_string(dir.join("config.json")).map_err(err)?)
             .map_err(err)?;
+    let safes = model_safetensors_in(dir)?;
+    let dtype = safetensors_floating_dtype(&safes)?;
+    if dtype == DType::BF16 && device.is_cpu() {
+        return Err(err(
+            "trainable CPU bf16 is unsupported because the NEON bf16 matmul bridge is no-bwd",
+        ));
+    }
 
     let lfm_cfg: Lfm2Config = serde_json::from_value(config["lfm"].clone()).map_err(err)?;
     let enc_cfg = parse_encoder(&config["encoder"])?;
@@ -283,8 +320,7 @@ pub fn from_pretrained_trainable(
     // shard, pulling each param by name. Strict: a param missing from *every* shard
     // is a hard error (never a silent zero-init); extra tensors in the dir that no
     // Var names are simply never requested.
-    let shards =
-        unsafe { candle_core::safetensors::MmapedSafetensors::multi(&safetensors_in(dir)?)? };
+    let shards = unsafe { candle_core::safetensors::MmapedSafetensors::multi(&safes)? };
     {
         let mut ws = varmap.data().lock().unwrap();
         for (name, var) in ws.iter_mut() {
@@ -295,10 +331,9 @@ pub fn from_pretrained_trainable(
             })?;
             // Cast the STORED checkpoint dtype to the Var's dtype before `set`. Unlike
             // `VarBuilder::get` (which casts on read), `Var::set` is a same-dtype
-            // storage copy and errors on a dtype mismatch. A bf16 checkpoint loaded
-            // into F32 Vars — the required path for CPU training, where candle has no
-            // bf16 matmul — would otherwise fail. Mirrors the Python upcast folded
-            // into `from_pretrained(dtype=…)`. No-op when stored dtype == `dtype`.
+            // storage copy and errors on a dtype mismatch. This is a no-op for
+            // model-card-faithful loads; the cast remains because `Var::set`
+            // requires exact dtype equality.
             let tensor = tensor.to_dtype(var.dtype())?;
             var.set(&tensor)?;
         }
@@ -313,7 +348,7 @@ pub fn from_pretrained_trainable(
     let mimi: Option<Box<dyn AudioDetokenizer>> = load_mimi(dir, codebooks, device)?
         .map(|m| Box::new(MimiDetokenizer::new(m)) as Box<dyn AudioDetokenizer>);
     let audio_out: Option<Box<dyn AudioDetokenizer>> = if dir.join("audio_detokenizer").is_dir() {
-        Some(Box::new(load_detokenizer(dir, dtype, device)?))
+        Some(Box::new(load_detokenizer(dir, device)?))
     } else {
         None
     };
@@ -349,7 +384,7 @@ fn load_mimi(dir: &Path, codebooks: usize, device: &Device) -> Result<Option<::m
 }
 
 /// Load the LFM2.5 audio detokenizer from `<dir>/audio_detokenizer/` if present.
-fn load_detokenizer(dir: &Path, dtype: DType, device: &Device) -> Result<LFM2AudioDetokenizer> {
+fn load_detokenizer(dir: &Path, device: &Device) -> Result<LFM2AudioDetokenizer> {
     let detok_dir = dir.join("audio_detokenizer");
     let mut cfg: Value =
         serde_json::from_str(&fs::read_to_string(detok_dir.join("config.json")).map_err(err)?)
@@ -364,7 +399,8 @@ fn load_detokenizer(dir: &Path, dtype: DType, device: &Device) -> Result<LFM2Aud
     }
     let sliding_window = cfg["sliding_window"].as_u64().unwrap_or(30) as usize;
     let lfm_cfg: Lfm2Config = serde_json::from_value(cfg).map_err(err)?;
-    let safes = safetensors_in(&detok_dir)?;
+    let safes = model_safetensors_in(&detok_dir)?;
+    let dtype = safetensors_floating_dtype(&safes)?;
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&safes, dtype, device)? };
     LFM2AudioDetokenizer::new(lfm_cfg, sliding_window, vb)
 }

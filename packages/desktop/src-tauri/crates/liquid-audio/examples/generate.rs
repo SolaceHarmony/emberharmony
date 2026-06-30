@@ -7,8 +7,9 @@
 //! WAV. Mimi audio-out goes through the same `proc.mimi` interface as the Python
 //! demo, not through the generic processor detokenizer dispatch.
 //!
-//! Run (CPU, f32 — the on-disk bf16 weights upcast losslessly):
+//! Run (CPU BF16 via the in-tree NEON kernel):
 //!   LFM_MODEL_DIR=../model cargo run --release --example generate -- path/to/audio.wav
+//! Use `LFM_DEVICE=metal` for Apple GPU BF16.
 //! With no path argument it defaults to the upstream reference clip
 //! (`experiments/lfm2-audio-voice/upstream-liquid-audio/assets/question.wav`), resolved
 //! from the manifest dir so it works regardless of the working directory.
@@ -24,22 +25,28 @@ use liquid_audio::{from_pretrained, ChatState, GenParams, GenToken};
 
 type Res<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-/// `LFM_DEVICE=metal` → Apple GPU at bf16 (the deployed dtype; fast). Otherwise
-/// CPU at f32 (candle has no CPU bf16 matmul, and f32 loads the bf16 weights
-/// losslessly). Metal requires building with `--features metal`.
-fn select_device() -> Res<(Device, DType)> {
+/// `LFM_DEVICE=metal` → Apple GPU BF16. Default/`cpu` → CPU BF16 through the
+/// in-tree NEON kernel.
+fn select_device() -> Res<Device> {
     match std::env::var("LFM_DEVICE").ok().as_deref() {
         Some("metal") => {
             #[cfg(feature = "metal")]
             {
-                Ok((Device::new_metal(0)?, DType::BF16))
+                Ok(Device::new_metal(0)?)
             }
             #[cfg(not(feature = "metal"))]
             {
                 Err("LFM_DEVICE=metal needs a build with `--features metal`".into())
             }
         }
-        _ => Ok((Device::Cpu, DType::F32)),
+        Some("cpu") | None => {
+            if liquid_audio::bf16_gemm::bf16_gemm_available() {
+                Ok(Device::Cpu)
+            } else {
+                Err("CPU BF16 needs the NEON BFMMLA kernel; use Metal on this Mac".into())
+            }
+        }
+        Some(other) => Err(format!("unknown LFM_DEVICE={other}; use cpu or metal").into()),
     }
 }
 
@@ -134,7 +141,7 @@ fn main() -> Res<()> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(96);
-    let (device, dtype) = select_device()?;
+    let device = select_device()?;
 
     eprintln!("[load] resolving model `{model_ref}` (repo id → HF cache download, or local path)…");
     let dir = liquid_audio::get_model_dir(&model_ref, None)?;
@@ -147,11 +154,11 @@ fn main() -> Res<()> {
         .ok_or("config.json: missing `codebooks`")? as usize;
 
     eprintln!(
-        "[load] model + processor from {} ({dtype:?}, {device:?})…",
+        "[load] model + processor from {} (safetensor dtype, {device:?})…",
         dir.display()
     );
     let t0 = std::time::Instant::now();
-    let (model, proc) = from_pretrained(&dir, dtype, &device)?;
+    let (model, proc) = from_pretrained(&dir, &device)?;
     let mimi = MimiModel::new(
         proc.mimi()
             .ok_or("Mimi codec not loaded — required by liquid_audio/demo/chat.py")?,

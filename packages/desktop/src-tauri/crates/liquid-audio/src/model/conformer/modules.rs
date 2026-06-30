@@ -13,6 +13,7 @@ use candle_nn::{
 };
 
 use super::mha::{MultiHeadAttention, RelPositionMultiHeadAttention};
+use crate::model::linear::{conv1d_forward, linear_forward};
 use crate::model::norm::{layer_norm, LayerNorm};
 
 /// `ConformerFeedForward`: Linear → SiLU → Linear.
@@ -30,9 +31,9 @@ impl ConformerFeedForward {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let x = self.linear1.forward(x)?;
+        let x = linear_forward(&self.linear1, x)?;
         let x = silu(&x)?;
-        self.linear2.forward(&x)
+        linear_forward(&self.linear2, &x)
     }
 
     /// PORT: `reset_parameters_ff` — Xavier/uniform weight re-initialization at
@@ -98,7 +99,7 @@ impl ConformerConvolution {
         cache: Option<&Tensor>,
     ) -> Result<(Tensor, Option<Tensor>)> {
         let x = x.transpose(1, 2)?.contiguous()?; // (B, d_model, T)
-        let x = self.pointwise_conv1.forward(&x)?; // (B, 2*d_model, T)
+        let x = conv1d_forward(&self.pointwise_conv1, &x)?; // (B, 2*d_model, T)
                                                    // GLU over channel dim 1: a * sigmoid(b)
         let c = x.dim(1)?;
         let a = x.narrow(1, 0, c / 2)?;
@@ -114,7 +115,7 @@ impl ConformerConvolution {
         let (x, next_cache) = self.depthwise_conv.forward(&x, cache)?;
         let x = self.batch_norm.forward_t(&x, false)?;
         let x = silu(&x)?;
-        let x = self.pointwise_conv2.forward(&x)?;
+        let x = conv1d_forward(&self.pointwise_conv2, &x)?;
         Ok((x.transpose(1, 2)?.contiguous()?, next_cache))
     }
 
@@ -234,7 +235,7 @@ impl CausalConv1D {
     /// `forward(x, cache)` = `update_cache` then the (padding=0) conv.
     pub fn forward(&self, x: &Tensor, cache: Option<&Tensor>) -> Result<(Tensor, Option<Tensor>)> {
         let (x, next_cache) = self.update_cache(x, cache)?;
-        Ok((self.conv.forward(&x)?, next_cache))
+        Ok((conv1d_forward(&self.conv, &x)?, next_cache))
     }
 
     /// Streaming setup: trailing steps dropped from the next cache.

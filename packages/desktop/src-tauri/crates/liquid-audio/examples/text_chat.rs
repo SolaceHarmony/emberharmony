@@ -2,34 +2,38 @@
 //! all — this exercises tokenizer → LFM2 backbone (`lfm2_hf`) → text head → sampler →
 //! detokenize, the cleanest check that the assembled port generates coherent language.
 //!
-//! Run (CPU, f32 — the faithful reference path; bf16 weights upcast losslessly):
+//! Run (CPU BF16 via the in-tree NEON kernel):
 //!   LFM_MODEL_DIR=/abs/path/to/model \
 //!     cargo run --release --example text_chat -- "Hello! Who are you, in one sentence?"
+//! Use `LFM_DEVICE=metal` for Apple GPU BF16.
 
-use candle_core::{DType, Device};
+use candle_core::Device;
 use liquid_audio::{from_pretrained, get_model_dir, ChatState, GenParams, GenToken};
 
 type Res<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-/// The model ships **bf16 on Metal** (Apple GPU) — that is the real deployment path. CPU has
-/// no bf16 matmul kernel in candle, so `Device::Cpu` falls back to f32 (the parity reference,
-/// not the deployed numerics). Default to Metal; `LFM_DEVICE=cpu` forces the f32 reference.
-fn select_device() -> Res<(Device, DType)> {
+/// `LFM_DEVICE=metal` → Apple GPU BF16. Default/`cpu` → CPU BF16 through the
+/// in-tree NEON kernel.
+fn select_device() -> Res<Device> {
     match std::env::var("LFM_DEVICE").ok().as_deref() {
-        Some("cpu") => Ok((Device::Cpu, DType::F32)),
-        _ => {
+        Some("metal") => {
             #[cfg(feature = "metal")]
             {
-                Ok((Device::new_metal(0)?, DType::BF16))
+                Ok(Device::new_metal(0)?)
             }
             #[cfg(not(feature = "metal"))]
             {
-                Err(
-                    "build with `--features metal` (or set LFM_DEVICE=cpu for the f32 reference)"
-                        .into(),
-                )
+                Err("LFM_DEVICE=metal needs a build with `--features metal`".into())
             }
         }
+        Some("cpu") | None => {
+            if liquid_audio::bf16_gemm::bf16_gemm_available() {
+                Ok(Device::Cpu)
+            } else {
+                Err("CPU BF16 needs the NEON BFMMLA kernel; use Metal on this Mac".into())
+            }
+        }
+        Some(other) => Err(format!("unknown LFM_DEVICE={other}; use cpu or metal").into()),
     }
 }
 
@@ -45,8 +49,8 @@ fn main() -> Res<()> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(64);
 
-    // Default: bf16 on Metal — the deployed numerics + the real-time path.
-    let (device, dtype) = select_device()?;
+    // Default: BF16 inference, on CPU via NEON or on Metal when requested.
+    let device = select_device()?;
 
     eprintln!("[load] resolving `{model_ref}`…");
     let dir = get_model_dir(&model_ref, None)?;
@@ -57,11 +61,11 @@ fn main() -> Res<()> {
         .ok_or("config.json: missing `codebooks`")? as usize;
 
     eprintln!(
-        "[load] model + processor from {} ({dtype:?}, {device:?})…",
+        "[load] model + processor from {} (safetensor dtype, {device:?})…",
         dir.display()
     );
     let t0 = std::time::Instant::now();
-    let (model, proc) = from_pretrained(&dir, dtype, &device)?;
+    let (model, proc) = from_pretrained(&dir, &device)?;
     eprintln!("[load] done in {:.1}s.", t0.elapsed().as_secs_f32());
 
     // Text-only chat: helpful-assistant system prompt + a user TEXT turn + open assistant

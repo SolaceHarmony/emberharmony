@@ -2,7 +2,7 @@
 //! must reproduce candle's generic `Conv1d` (the op it replaces in `ShortConv::forward`)
 //! to f32 precision. This is the exact prefill math — causal depthwise, `padding = K-1`,
 //! `groups = H`, narrowed to the input length — so if it matches, the swap is faithful and
-//! the backbone is unchanged (modulo float-accumulation order). CPU/f32; no model needed.
+//! the backbone is unchanged (modulo float-accumulation order). Synthetic F32 tensors; no model weights.
 
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{Conv1d, Conv1dConfig, Module};

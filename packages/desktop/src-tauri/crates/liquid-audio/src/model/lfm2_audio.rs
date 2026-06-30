@@ -19,6 +19,7 @@ use candle_nn::{linear, Linear, Module, VarBuilder};
 use candle_transformers::generation::{LogitsProcessor, Sampling};
 
 use crate::model::conformer::encoder::{ConformerEncoder, ConformerEncoderConfig};
+use crate::model::linear::{linear_forward, linear_logits};
 use crate::model::lfm2_hf::{Cache as LfmCache, Lfm2Config, Model as Lfm2Model};
 use crate::model::mlp::MLP;
 use crate::model::transformer::{
@@ -418,7 +419,7 @@ impl LFM2AudioModel {
         })
     }
 
-    /// `from_pretrained(dir, dtype, device)` — load the model + processor from a
+    /// `from_pretrained(dir, device)` — load the model + processor from a
     /// local model directory (Python `LFM2AudioModel.from_pretrained`, 135-169).
     /// A thin delegation to [`crate::loader::from_pretrained`], which parses
     /// `config.json` (including `codebook_weight` / `semantic_codebook_factor` /
@@ -428,10 +429,9 @@ impl LFM2AudioModel {
     /// the rest of this crate's entry points do). No loader logic is duplicated.
     pub fn from_pretrained(
         dir: &std::path::Path,
-        dtype: DType,
         device: &candle_core::Device,
     ) -> Result<(Self, crate::processor::LFM2AudioProcessor)> {
-        crate::loader::from_pretrained(dir, dtype, device)
+        crate::loader::from_pretrained(dir, device)
     }
 
     /// Run the FastConformer encoder over mel features `(B, feat_in, T)` →
@@ -568,16 +568,14 @@ impl LFM2AudioModel {
         }
 
         // ---- text head (tied embedding): F.linear(text_out_emb, embed_tokens.weight) ----
-        let ew = self.lfm.embed_weight().to_dtype(DType::F32)?; // (V, D)
+        let ew = self.lfm.embed_weight(); // (V, D)
         let vocab = ew.dim(0)?;
         let text_logits = if text_rows.is_empty() {
             Tensor::zeros((0, vocab), DType::F32, dev)?
         } else {
             let idx = Tensor::from_vec(text_rows.clone(), (text_rows.len(),), dev)?;
-            let rows = out_emb_shifted
-                .index_select(&idx, 0)?
-                .to_dtype(DType::F32)?;
-            rows.matmul(&ew.t()?.contiguous()?)?
+            let rows = out_emb_shifted.index_select(&idx, 0)?;
+            linear_logits(ew, &rows)?
         };
         let text_labels = {
             let t = batch.text.i(0)?;
@@ -602,7 +600,7 @@ impl LFM2AudioModel {
             let n_a = audio_rows.len();
             let aemb = out_emb_shifted
                 .index_select(&Tensor::from_vec(audio_rows.clone(), (n_a,), dev)?, 0)?; // (n_a, D)
-            let mut din = self.depth_linear.forward(&aemb)?.reshape((n_a, c, dd))?; // (n_a, C, dd)
+            let mut din = linear_forward(&self.depth_linear, &aemb)?.reshape((n_a, c, dd))?; // (n_a, C, dd)
 
             // teacher tokens: audio_out[:C, audio_lbl] → (C, n_a); per-codebook embed → (n_a, C, dd)
             let albl = Tensor::from_vec(audio_lbl.clone(), (audio_lbl.len(),), dev)?;
@@ -897,9 +895,8 @@ impl LFM2AudioModel {
 
     fn text_logits(&self, h_last: &Tensor) -> Result<Tensor> {
         // nn.functional.linear(h, embed_weight): (V,D) @ (D,) -> (V,)
-        let w = self.lfm.embed_weight().to_dtype(DType::F32)?;
-        let h = h_last.to_dtype(DType::F32)?.reshape((self.hidden, 1))?;
-        w.matmul(&h)?.squeeze(1)
+        let h = h_last.reshape((1, self.hidden))?;
+        linear_logits(self.lfm.embed_weight(), &h)?.squeeze(0)
     }
 
     /// Depthformer audio-frame sampler → `codebooks` codes. Faithful to
@@ -910,10 +907,8 @@ impl LFM2AudioModel {
         // 1-D (D,) lfm hidden; candle's Linear needs a 2-D input, so add a row dim
         // (Python's nn.Linear accepts the 1-D vector directly).
         let emb2d = embedding.flatten_all()?.unsqueeze(0)?; // (1, D)
-        let din = self
-            .depth_linear
-            .forward(&emb2d)?
-            .reshape((self.codebooks, self.depthformer_dim))?;
+        let din =
+            linear_forward(&self.depth_linear, &emb2d)?.reshape((self.codebooks, self.depthformer_dim))?;
         let mut df_token = Tensor::zeros((self.depthformer_dim,), din.dtype(), din.device())?;
         let mut caches: Vec<LayerKvCache> = (0..self.depthformer.layers.len())
             .map(|_| LayerKvCache::new())

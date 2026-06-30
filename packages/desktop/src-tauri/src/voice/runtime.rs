@@ -16,7 +16,7 @@ use std::{
     thread::{self, JoinHandle},
 };
 
-use candle_core::{DType, Device};
+use candle_core::Device;
 use liquid_audio::{
     GenParams, Lfm2VoiceEngine, RuntimeConfig, RuntimeEvent, SessionState,
     VoiceRuntime as Lfm2Runtime, from_pretrained,
@@ -535,10 +535,10 @@ fn build_engine(settings: VoiceSettings, out_rate: u32) -> Result<Lfm2VoiceEngin
         "No local LFM2-Audio model — download a model or select a model directory in Settings."
             .to_string()
     })?;
-    let (device, dtype) = select_device(&settings.lfm2.device)?;
+    let device = select_device(&settings.lfm2.device)?;
     let codebooks = codebooks(&dir)?;
-    let (model, proc) = from_pretrained(&dir, dtype, &device)
-        .map_err(|e| format!("failed to load LFM2-Audio: {e}"))?;
+    let (model, proc) =
+        from_pretrained(&dir, &device).map_err(|e| format!("failed to load LFM2-Audio: {e}"))?;
     let params = GenParams {
         max_new_tokens: settings.lfm2.max_tokens as usize,
         text_temperature: None,
@@ -552,15 +552,22 @@ fn build_engine(settings: VoiceSettings, out_rate: u32) -> Result<Lfm2VoiceEngin
     ))
 }
 
-fn select_device(device: &Lfm2Device) -> Result<(Device, DType), String> {
+fn select_device(device: &Lfm2Device) -> Result<Device, String> {
     match device {
-        Lfm2Device::Cpu => Ok((Device::Cpu, DType::F32)),
+        Lfm2Device::Cpu => {
+            if liquid_audio::bf16_gemm::bf16_gemm_available() {
+                Ok(Device::Cpu)
+            } else {
+                Err(
+                    "CPU LFM2 voice requires the NEON BF16 matmul kernel; choose Metal on this Mac."
+                        .into(),
+                )
+            }
+        }
         Lfm2Device::Metal => {
             #[cfg(target_os = "macos")]
             {
-                Device::new_metal(0)
-                    .map(|device| (device, DType::BF16))
-                    .map_err(|e| format!("failed to open Metal device: {e}"))
+                Device::new_metal(0).map_err(|e| format!("failed to open Metal device: {e}"))
             }
             #[cfg(not(target_os = "macos"))]
             {

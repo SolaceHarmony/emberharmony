@@ -47,7 +47,6 @@ fn rel_err(a: &Tensor, b: &Tensor) -> f32 {
 }
 
 #[test]
-#[ignore = "needs parity/golden/mel_refs.safetensors (run dump_mel_reference.py)"]
 fn mel_parity() -> anyhow::Result<()> {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let refs_path = manifest.join("parity/golden/mel_refs.safetensors");
@@ -82,7 +81,6 @@ fn mel_parity() -> anyhow::Result<()> {
 /// LFM2.5-Audio config uses `center=True`, so this is exercised only by forcing
 /// `exact_pad` on. Golden: `dump_mel_reference.py` → `mel_refs_exactpad`.
 #[test]
-#[ignore = "needs parity/golden/mel_refs_exactpad.safetensors (run dump_mel_reference.py)"]
 fn mel_exact_pad_parity() -> anyhow::Result<()> {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let refs_path = manifest.join("parity/golden/mel_refs_exactpad.safetensors");
@@ -129,7 +127,6 @@ fn mel_exact_pad_parity() -> anyhow::Result<()> {
 /// True-vs-False diff is 1.5e-7); this asserts the Rust manual port reproduces it.
 /// Golden: `parity/dump_mha_sdpa.py`.
 #[test]
-#[ignore = "needs parity/golden/mha_sdpa_refs.safetensors (run dump_mha_sdpa.py)"]
 fn rel_pos_attention_sdpa_parity() -> anyhow::Result<()> {
     use liquid_audio::model::conformer::mha::RelPositionMultiHeadAttention;
     use std::collections::HashMap;
@@ -172,7 +169,6 @@ fn rel_pos_attention_sdpa_parity() -> anyhow::Result<()> {
 /// frame, and the interleaved text/audio modality switching — against Python. Greedy ⇒
 /// every generated token id must match EXACTLY. Golden: `parity/dump_generate.py`.
 #[test]
-#[ignore = "needs LFM_MODEL_DIR + parity/golden/{prefill,generate}_refs.safetensors (run dump_generate.py)"]
 fn generate_interleaved_parity() -> anyhow::Result<()> {
     use liquid_audio::model::lfm2_audio::{GenParams, GenToken};
     let dir = std::env::var("LFM_MODEL_DIR").expect("set LFM_MODEL_DIR");
@@ -186,7 +182,7 @@ fn generate_interleaved_parity() -> anyhow::Result<()> {
         manifest.join("parity/golden/generate_refs.safetensors"),
         &device,
     )?;
-    let (model, _proc) = liquid_audio::from_pretrained(Path::new(&dir), DType::F32, &device)?;
+    let (model, _proc) = liquid_audio::from_pretrained(Path::new(&dir), &device)?;
 
     let in_emb = model.prefill_inputs(
         &r.get("text").unwrap().to_dtype(DType::I64)?,
@@ -262,7 +258,6 @@ fn generate_interleaved_parity() -> anyhow::Result<()> {
 /// pos-enc cache_len, `_create_masks` with offset, per-layer KV-cache threading, the
 /// depthwise-conv cache, and the next-cache production (`cache_keep`/`cache_drop`).
 #[test]
-#[ignore = "needs LFM_MODEL_DIR + parity/golden/conformer_streaming_refs.safetensors (run dump_conformer_streaming.py)"]
 fn conformer_streaming_parity() -> anyhow::Result<()> {
     use liquid_audio::model::conformer::encoder::{ConformerEncoder, ConformerEncoderConfig};
     use std::collections::HashMap;
@@ -277,9 +272,9 @@ fn conformer_streaming_parity() -> anyhow::Result<()> {
         if p.extension().and_then(|e| e.to_str()) != Some("safetensors") {
             continue;
         }
-        let Ok(sd) = candle_core::safetensors::load(&p, &device) else {
-            continue;
-        };
+        // Fail hard: a .safetensors shard that won't load must error, not be skipped
+        // (a silent skip could load partial weights and mask a real failure).
+        let sd = candle_core::safetensors::load(&p, &device)?;
         for (k, v) in sd {
             if let Some(rest) = k.strip_prefix("conformer.") {
                 ws.insert(rest.to_string(), v.to_dtype(DType::F32)?);
@@ -378,7 +373,6 @@ fn conformer_streaming_parity() -> anyhow::Result<()> {
 /// conv2d-only and breaks on MaxPool2d / Conv1d — the masking it skips is a no-op at
 /// full length, so the conv/pool/linear ops are the faithful reference.
 #[test]
-#[ignore = "needs parity/golden/subsampling_schemes_refs.safetensors (run dump_subsampling_schemes.py)"]
 fn subsampling_schemes_parity() -> anyhow::Result<()> {
     use liquid_audio::model::conformer::subsampling::ConvSubsampling;
     use std::collections::HashMap;
@@ -425,7 +419,6 @@ fn subsampling_schemes_parity() -> anyhow::Result<()> {
 /// band + `chunked_limited` logic is otherwise unexercised. Golden runs the REAL
 /// upstream method (extracted via `ast`) for several configs — `parity/dump_create_masks.py`.
 #[test]
-#[ignore = "needs parity/golden/create_masks_refs.safetensors (run dump_create_masks.py)"]
 fn create_masks_parity() -> anyhow::Result<()> {
     use liquid_audio::model::conformer::encoder::ConformerEncoder;
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -483,7 +476,6 @@ fn create_masks_parity() -> anyhow::Result<()> {
 /// it is the attention the `abs_pos` `ConformerLayer` variant dispatches to. Golden:
 /// `parity/dump_mha_sdpa.py` (`mha_abs_refs`).
 #[test]
-#[ignore = "needs parity/golden/mha_abs_refs.safetensors (run dump_mha_sdpa.py)"]
 fn abs_attention_parity() -> anyhow::Result<()> {
     use liquid_audio::model::conformer::mha::MultiHeadAttention;
     use std::collections::HashMap;
@@ -513,7 +505,6 @@ fn abs_attention_parity() -> anyhow::Result<()> {
 }
 
 #[test]
-#[ignore = "needs LFM_MODEL_DIR + parity/golden/conformer_stages.safetensors"]
 fn conformer_stages_parity() -> anyhow::Result<()> {
     let dir = std::env::var("LFM_MODEL_DIR").expect("set LFM_MODEL_DIR");
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -526,7 +517,7 @@ fn conformer_stages_parity() -> anyhow::Result<()> {
         candle_core::safetensors::load(manifest.join("parity/golden/refs.safetensors"), &device)?;
     let mel = refs.get("mel").expect("mel").clone();
 
-    let (model, _) = liquid_audio::from_pretrained(Path::new(&dir), DType::F32, &device)?;
+    let (model, _) = liquid_audio::from_pretrained(Path::new(&dir), &device)?;
     let conv_out = model.conformer_sub_conv(&mel)?;
     let (sub, posx, posemb, layer0, final_out) = model.conformer_stages(&mel)?;
 
@@ -555,7 +546,6 @@ fn conformer_stages_parity() -> anyhow::Result<()> {
 }
 
 #[test]
-#[ignore = "needs LFM_MODEL_DIR (loads the Mimi weights shipped in the repo)"]
 fn mimi_decode_smoke() -> anyhow::Result<()> {
     // Pure-candle audio-out through the Mimi codec (moshi crate), decoding
     // 8-codebook tokens to 24 kHz. No torch. Resolved via `proc.mimi()` — the Mimi
@@ -563,7 +553,7 @@ fn mimi_decode_smoke() -> anyhow::Result<()> {
     // snapshots (where the decode backend is the LFM2 detokenizer, not Mimi).
     let dir = std::env::var("LFM_MODEL_DIR").expect("set LFM_MODEL_DIR");
     let device = Device::Cpu;
-    let (_model, proc) = liquid_audio::from_pretrained(Path::new(&dir), DType::F32, &device)?;
+    let (_model, proc) = liquid_audio::from_pretrained(Path::new(&dir), &device)?;
     let mimi = proc
         .mimi()
         .expect("Mimi codec (tokenizer-…checkpoint125.safetensors)");
@@ -591,14 +581,13 @@ fn mimi_decode_smoke() -> anyhow::Result<()> {
 }
 
 #[test]
-#[ignore = "needs LFM_MODEL_DIR (loads the Mimi weights shipped in the repo)"]
 fn mimi_streaming_decode_smoke() -> anyhow::Result<()> {
     // The real-time path: moshi's streaming `decode_step` decodes one generated
     // frame at a time (keeping codec state), instead of a one-shot batch decode —
     // exactly what the Python demo does inside `mimi.streaming(1)`. No torch.
     let dir = std::env::var("LFM_MODEL_DIR").expect("set LFM_MODEL_DIR");
     let device = Device::Cpu;
-    let (_model, proc) = liquid_audio::from_pretrained(Path::new(&dir), DType::F32, &device)?;
+    let (_model, proc) = liquid_audio::from_pretrained(Path::new(&dir), &device)?;
     let mimi = proc
         .mimi()
         .expect("Mimi codec (tokenizer-…checkpoint125.safetensors)");
@@ -645,11 +634,10 @@ fn mimi_streaming_decode_smoke() -> anyhow::Result<()> {
 /// breaking dataset preprocessing). Runs on CPU, where moshi's `CodebookEncode`
 /// CustomOp is supported.
 #[test]
-#[ignore = "needs LFM_MODEL_DIR (loads the Mimi weights shipped in the repo)"]
 fn mimi_encode_smoke() -> anyhow::Result<()> {
     let dir = std::env::var("LFM_MODEL_DIR").expect("set LFM_MODEL_DIR");
     let device = Device::Cpu;
-    let (_model, proc) = liquid_audio::from_pretrained(Path::new(&dir), DType::F32, &device)?;
+    let (_model, proc) = liquid_audio::from_pretrained(Path::new(&dir), &device)?;
     let sr = proc
         .mimi_sample_rate()
         .expect("Mimi sample rate (codec must be loaded)");
@@ -683,31 +671,26 @@ fn mimi_encode_smoke() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `from_pretrained_trainable` must cast the STORED checkpoint dtype to the
-/// requested dtype before `Var::set`.
-///
-/// The snapshot is bf16; CPU training needs F32 (candle has no CPU bf16 matmul).
-/// `Var::set` is a same-dtype storage copy, so without the cast a bf16 tensor into
-/// an F32 Var errors on load. This asserts every trainable Var is F32 after load.
+/// `from_pretrained_trainable` must not silently upcast persistent BF16 weights to
+/// make CPU training work. Until the BF16 matmul bridge has backward support, CPU
+/// trainable loads fail clearly instead of creating an F32 model copy.
 #[test]
-#[ignore = "needs LFM_MODEL_DIR (allocates the full param set as F32 — ~6 GB)"]
-fn trainable_load_upcasts_to_f32() -> anyhow::Result<()> {
+fn trainable_cpu_bf16_is_rejected() -> anyhow::Result<()> {
     let dir = std::env::var("LFM_MODEL_DIR").expect("set LFM_MODEL_DIR");
     let device = Device::Cpu;
-    let tl = liquid_audio::loader::from_pretrained_trainable(Path::new(&dir), DType::F32, &device)?;
-    let vars = tl.varmap.all_vars();
-    assert!(!vars.is_empty(), "no trainable vars loaded");
-    let non_f32 = vars.iter().filter(|v| v.dtype() != DType::F32).count();
-    println!("trainable load: {} vars, {} not F32", vars.len(), non_f32);
-    assert_eq!(
-        non_f32, 0,
-        "{non_f32} vars were not upcast to F32 (Var::set skipped the dtype cast)"
+    let res = liquid_audio::loader::from_pretrained_trainable(Path::new(&dir), &device);
+    let err = match res {
+        Ok(_) => anyhow::bail!("CPU BF16 trainable load unexpectedly succeeded"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string().contains("trainable CPU bf16 is unsupported"),
+        "unexpected error: {err}"
     );
     Ok(())
 }
 
 #[test]
-#[ignore = "needs LFM_MODEL_DIR + parity/golden/prefill_refs.safetensors"]
 fn prefill_parity() -> anyhow::Result<()> {
     let dir = std::env::var("LFM_MODEL_DIR").expect("set LFM_MODEL_DIR");
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -717,7 +700,7 @@ fn prefill_parity() -> anyhow::Result<()> {
         &device,
     )?;
 
-    let (model, proc) = liquid_audio::from_pretrained(Path::new(&dir), DType::F32, &device)?;
+    let (model, proc) = liquid_audio::from_pretrained(Path::new(&dir), &device)?;
     // Build a ChatState from the Python-dumped raw fields (identical inputs, no
     // template re-tokenization). Fields are u32 in the port; the dump is i64.
     let mut chat = liquid_audio::ChatState::new(&proc, 8)?;
@@ -750,11 +733,10 @@ fn prefill_parity() -> anyhow::Result<()> {
 /// tensor-producing methods on the loaded encoder: cache allocation shapes, the
 /// streaming output trim, the export dummy inputs, and the deployment name lists.
 #[test]
-#[ignore = "needs LFM_MODEL_DIR"]
 fn conformer_streaming_inventory() -> anyhow::Result<()> {
     let dir = std::env::var("LFM_MODEL_DIR").expect("set LFM_MODEL_DIR");
     let device = Device::Cpu;
-    let (model, _proc) = liquid_audio::from_pretrained(Path::new(&dir), DType::F32, &device)?;
+    let (model, _proc) = liquid_audio::from_pretrained(Path::new(&dir), &device)?;
     let enc = model.conformer();
 
     // get_initial_cache_state(batch=2, max_dim=0) → zeros of the documented shapes.
@@ -825,12 +807,12 @@ fn conformer_streaming_inventory() -> anyhow::Result<()> {
 /// before strided convs) fixes it; this test is the regression guard — it both runs the
 /// full backward and asserts the subsampling conv weights receive a gradient.
 #[test]
-#[ignore = "needs LFM_MODEL_DIR (full-model load + backward, ~6 GB F32)"]
+#[ignore = "CPU BF16 trainable load is rejected until the BF16 matmul bridge has backward support"]
 fn training_gradients_reach_attention_and_norms() -> anyhow::Result<()> {
     let dir = std::env::var("LFM_MODEL_DIR").expect("set LFM_MODEL_DIR");
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let device = Device::Cpu;
-    let tl = liquid_audio::loader::from_pretrained_trainable(Path::new(&dir), DType::F32, &device)?;
+    let tl = liquid_audio::loader::from_pretrained_trainable(Path::new(&dir), &device)?;
     let data = tl.varmap.data().lock().unwrap();
 
     // helper: backward a scalar, return the params (by prefix) that got NO gradient.
@@ -938,7 +920,6 @@ fn training_gradients_reach_attention_and_norms() -> anyhow::Result<()> {
 /// hard shape failure here. Golden: `parity/dump_batched_logits.py` (duplicate of the
 /// prefill_refs sample, collated, all-ones supervision).
 #[test]
-#[ignore = "needs LFM_MODEL_DIR + parity/golden/{prefill,batched_logits}_refs.safetensors"]
 fn batched_logits_python_parity() -> anyhow::Result<()> {
     use liquid_audio::model::lfm2_audio::LFM2AudioModelInput;
     let dir = std::env::var("LFM_MODEL_DIR").expect("set LFM_MODEL_DIR");
@@ -952,7 +933,7 @@ fn batched_logits_python_parity() -> anyhow::Result<()> {
         manifest.join("parity/golden/batched_logits_refs.safetensors"),
         &device,
     )?;
-    let (model, _proc) = liquid_audio::from_pretrained(Path::new(&dir), DType::F32, &device)?;
+    let (model, _proc) = liquid_audio::from_pretrained(Path::new(&dir), &device)?;
 
     let text = r.get("text").unwrap().to_dtype(DType::I64)?;
     let audio_in = r.get("audio_in").unwrap().to_dtype(DType::F32)?;
@@ -1009,7 +990,6 @@ fn batched_logits_python_parity() -> anyhow::Result<()> {
 /// Batch shapes mirror `lfm2_collator` (text/audio_in/audio_out cat dim=1;
 /// modality/supervision cat dim=0).
 #[test]
-#[ignore = "needs LFM_MODEL_DIR + parity/golden/prefill_refs.safetensors"]
 fn batched_prefill_logits_self_consistency() -> anyhow::Result<()> {
     use liquid_audio::model::lfm2_audio::LFM2AudioModelInput;
     let dir = std::env::var("LFM_MODEL_DIR").expect("set LFM_MODEL_DIR");
@@ -1019,7 +999,7 @@ fn batched_prefill_logits_self_consistency() -> anyhow::Result<()> {
         manifest.join("parity/golden/prefill_refs.safetensors"),
         &device,
     )?;
-    let (model, _proc) = liquid_audio::from_pretrained(Path::new(&dir), DType::F32, &device)?;
+    let (model, _proc) = liquid_audio::from_pretrained(Path::new(&dir), &device)?;
 
     let text = r.get("text").unwrap().to_dtype(DType::I64)?; // (1, n)
     let audio_in = r.get("audio_in").unwrap().to_dtype(DType::F32)?; // (128, f)
@@ -1110,7 +1090,6 @@ fn batched_prefill_logits_self_consistency() -> anyhow::Result<()> {
 }
 
 #[test]
-#[ignore = "needs LFM_MODEL_DIR + parity/golden/depthformer_refs.safetensors"]
 fn depthformer_parity() -> anyhow::Result<()> {
     let dir = std::env::var("LFM_MODEL_DIR").expect("set LFM_MODEL_DIR");
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -1126,7 +1105,7 @@ fn depthformer_parity() -> anyhow::Result<()> {
         .to_dtype(DType::U32)?
         .to_vec1::<u32>()?;
 
-    let (model, _) = liquid_audio::from_pretrained(Path::new(&dir), DType::F32, &device)?;
+    let (model, _) = liquid_audio::from_pretrained(Path::new(&dir), &device)?;
     let got = model.audio_frame_greedy(&embedding)?;
     println!("depthformer rust {got:?}  ref {want:?}");
     assert_eq!(got, want, "depthformer greedy tokens differ");
@@ -1134,7 +1113,6 @@ fn depthformer_parity() -> anyhow::Result<()> {
 }
 
 #[test]
-#[ignore = "needs LFM_MODEL_DIR + parity/golden/backbone_refs.safetensors"]
 fn backbone_parity() -> anyhow::Result<()> {
     let dir = std::env::var("LFM_MODEL_DIR").expect("set LFM_MODEL_DIR");
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -1145,7 +1123,7 @@ fn backbone_parity() -> anyhow::Result<()> {
     )?;
     let embeds = refs.get("embeds").expect("embeds").clone();
 
-    let (model, _) = liquid_audio::from_pretrained(Path::new(&dir), DType::F32, &device)?;
+    let (model, _) = liquid_audio::from_pretrained(Path::new(&dir), &device)?;
     let got = model.backbone_forward_embeds(&embeds)?;
     let want = refs.get("backbone").expect("backbone");
     let e = rel_err(&got, want);
@@ -1163,7 +1141,6 @@ fn backbone_parity() -> anyhow::Result<()> {
 }
 
 #[test]
-#[ignore = "needs LFM_MODEL_DIR + parity/golden/refs.safetensors"]
 fn front_end_parity() -> anyhow::Result<()> {
     let dir = std::env::var("LFM_MODEL_DIR").expect("set LFM_MODEL_DIR to the local model dir");
     let refs_path =
@@ -1173,8 +1150,7 @@ fn front_end_parity() -> anyhow::Result<()> {
     let refs = candle_core::safetensors::load(&refs_path, &device)?;
     let wav = refs.get("wav").expect("wav in refs").clone();
 
-    // f32 to match the reference dump (dump_reference.py uses dtype=torch.float32).
-    let (model, proc) = liquid_audio::from_pretrained(Path::new(&dir), DType::F32, &device)?;
+    let (model, proc) = liquid_audio::from_pretrained(Path::new(&dir), &device)?;
 
     // mel featurizer
     let mel = proc.audio.forward(&wav)?;

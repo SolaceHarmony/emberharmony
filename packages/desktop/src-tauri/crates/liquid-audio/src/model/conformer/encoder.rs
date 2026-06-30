@@ -7,12 +7,13 @@
 //! cache, stochastic depth, reduction, and export paths are not ported.
 
 use candle_core::{DType, Device, Result, Tensor};
-use candle_nn::{linear, Linear, Module, VarBuilder};
+use candle_nn::{linear, Linear, VarBuilder};
 
 use super::mha::RelPositionalEncoding;
 use super::modules::ConformerLayer;
 use super::subsampling::ConvSubsampling;
 use super::utils::{CacheAwareStreamingConfig, IntOrPair};
+use crate::model::linear::linear_forward;
 
 /// Python `pos_emb_max_len` default (encoder.py `__init__`); also the
 /// `RelPositionalEncoding` table max length.
@@ -199,7 +200,7 @@ impl ConformerEncoder {
             x = layer.forward(&x, None, &pos_emb, None)?;
         }
         if let Some(p) = &self.out_proj {
-            x = p.forward(&x)?;
+            x = linear_forward(p, &x)?;
         }
         x.transpose(1, 2)?.contiguous() // (B, d_out, T')
     }
@@ -295,7 +296,7 @@ impl ConformerEncoder {
         }
 
         if let Some(p) = &self.out_proj {
-            x = p.forward(&x)?;
+            x = linear_forward(p, &x)?;
         }
         let encoded = x.transpose(1, 2)?.contiguous()?; // (B, d_out, T')
 
@@ -342,7 +343,7 @@ impl ConformerEncoder {
             }
         }
         if let Some(p) = &self.out_proj {
-            x = p.forward(&x)?;
+            x = linear_forward(p, &x)?;
         }
         let final_out = x.transpose(1, 2)?.contiguous()?;
         Ok((sub, posx, pos_emb, layer0.unwrap(), final_out))

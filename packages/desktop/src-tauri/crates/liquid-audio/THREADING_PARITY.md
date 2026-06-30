@@ -49,17 +49,14 @@ a real kernel instead of falling back to f32:
 - **Verified**: `bf16_gemm_matches_f32_reference` → **max 0.000e0 (rel 0.000e0)** vs the f32
   reference (bf16-rounded inputs, f32 matmul) on 5×13×7 (exercises the padded edges).
 
-**Remaining (task #25):** route the backbone `Linear` matmuls through `Bf16Gemm`/`bf16_matmul`
-when `device==CPU && dtype==bf16`, and relax `loader.rs`'s bf16-on-CPU rejection — then the
-model runs **bf16 natively on CPU** (Metal already does). The kernel + op are ready; this is
-the wiring.
+**Done (task #25):** backbone/depthformer/conformer/detokenizer linears now route BF16 CPU
+weights through `Bf16Gemm`/`bf16_matmul`, and `loader.rs` derives persistent weight dtype from
+safetensors instead of accepting a caller-selected dtype.
 
-**Caution — this is a decision, not just wiring.** `loader.rs` *deliberately* runs f32 on CPU
-(`:108`, `:210`): the bf16→f32 weight upcast is lossless and f32 is the parity reference; bf16
-is the Metal/real-time path. Wiring bf16 through CPU means replacing `candle_nn::Linear` at
-dozens of sites across the backbone, depthformer, conformer, and detokenizer — a model-wide
-change to a hot path whose parity is verified at **6.558e-6**. So #25 must be done **with the
-model in the loop** (run `mic_chat`/the parity harness and confirm the numerics) — not as a
+**Caution.** The 2-D linear path is BF16 on CPU when the checkpoint is BF16 and FEAT_BF16 is
+available. The intentional F32 paths are local math/accumulation only: audio preprocessing,
+logits/loss/sampling, and 4-D attention score/value matmuls. Any parity run that reloads the
+whole checkpoint as F32 is no longer a valid test for the desktop voice path.
 blind sweep — and only if bf16-on-CPU is actually wanted over the faithful f32 path.
 
 ## 4. Realtime pipeline threading — DONE (worker pipeline + barge-in), task #24

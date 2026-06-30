@@ -4,6 +4,8 @@ use crate::model::norm::layer_norm;
 use candle_core::{Result, Tensor};
 use candle_nn::{linear, linear_no_bias, Activation, Module, VarBuilder};
 
+use crate::model::linear::Bf16Linear;
+
 /// Faithful port of `MLP(nn.Module)`.
 ///
 /// Builds the same `nn.Sequential`:
@@ -62,7 +64,7 @@ impl MLP {
             } else {
                 linear_no_bias(channels[i], channels[i + 1], vb.pp(format!("model.{idx}")))?
             };
-            model.push(Box::new(lin));
+            model.push(Box::new(Bf16Linear::new(lin)));
             idx += 1;
 
             if i != channels.len() - 2 {

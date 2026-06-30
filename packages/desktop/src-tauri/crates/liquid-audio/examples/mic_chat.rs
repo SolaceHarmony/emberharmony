@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use candle_core::{DType, Device};
+use candle_core::Device;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use liquid_audio::{
     from_pretrained, GenParams, Lfm2VoiceEngine, Utterance, VoiceEngine, VoiceEvent,
@@ -32,19 +32,26 @@ use liquid_audio::{
 
 type Res<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-fn select_device() -> Res<(Device, DType)> {
+fn select_device() -> Res<Device> {
     match std::env::var("LFM_DEVICE").ok().as_deref() {
         Some("metal") => {
             #[cfg(feature = "metal")]
             {
-                Ok((Device::new_metal(0)?, DType::BF16))
+                Ok(Device::new_metal(0)?)
             }
             #[cfg(not(feature = "metal"))]
             {
                 Err("LFM_DEVICE=metal needs a build with `--features metal`".into())
             }
         }
-        _ => Ok((Device::Cpu, DType::F32)),
+        Some("cpu") | None => {
+            if liquid_audio::bf16_gemm::bf16_gemm_available() {
+                Ok(Device::Cpu)
+            } else {
+                Err("CPU BF16 needs the NEON BFMMLA kernel; use Metal on this Mac".into())
+            }
+        }
+        Some(other) => Err(format!("unknown LFM_DEVICE={other}; use cpu or metal").into()),
     }
 }
 
@@ -208,7 +215,7 @@ fn main() -> Res<()> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
-    let (device, dtype) = select_device()?;
+    let device = select_device()?;
 
     eprintln!("[load] resolving model `{model_ref}` (repo id → HF cache download, or local path)…");
     let dir = liquid_audio::get_model_dir(&model_ref, None)?;
@@ -219,11 +226,11 @@ fn main() -> Res<()> {
         .ok_or("config.json: missing `codebooks`")? as usize;
 
     eprintln!(
-        "[load] LFM2.5-Audio from {} ({dtype:?}, {device:?})…",
+        "[load] LFM2.5-Audio from {} (safetensor dtype, {device:?})…",
         dir.display()
     );
     let t0 = Instant::now();
-    let (model, proc) = from_pretrained(&dir, dtype, &device)?;
+    let (model, proc) = from_pretrained(&dir, &device)?;
     eprintln!("[load] done in {:.1}s.", t0.elapsed().as_secs_f32());
 
     // Held for the program's lifetime so the output stream keeps draining the ring.

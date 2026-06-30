@@ -110,10 +110,9 @@ impl LFM2AudioProcessor {
     /// the model and the processor in one pass over the checkpoint). To avoid
     /// duplicating the loader logic this delegates to it and returns just the
     /// processor — the model is dropped here (the Python classmethod likewise only
-    /// returns the processor). `dtype` mirrors the Python `to(device, dtype)` move
-    /// folded into load.
-    pub fn from_pretrained(dir: &Path, dtype: candle_core::DType, device: &Device) -> Result<Self> {
-        let (_model, processor) = crate::loader::from_pretrained(dir, dtype, device)?;
+    /// returns the processor).
+    pub fn from_pretrained(dir: &Path, device: &Device) -> Result<Self> {
+        let (_model, processor) = crate::loader::from_pretrained(dir, device)?;
         Ok(processor)
     }
 
@@ -450,9 +449,10 @@ impl LFM2AudioProcessor {
             .encode(wav)
     }
 
-    /// PORT: `to(device, dtype)` — torch in-place device/dtype move. candle places
-    /// tensors at load (`from_pretrained(device, dtype)`); there is no in-place
-    /// move. No-op, preserved for 1:1 inventory.
+    /// PORT: `to(device, dtype)` — the Python in-place device/dtype move. Candle
+    /// places tensors on the selected device at load, while persistent weight dtype
+    /// comes from safetensors; there is no in-place move. No-op, preserved for 1:1
+    /// inventory.
     pub fn to(&self) {}
 
     /// PORT: `eval` / `train` — torch training-mode toggle. Inference is always

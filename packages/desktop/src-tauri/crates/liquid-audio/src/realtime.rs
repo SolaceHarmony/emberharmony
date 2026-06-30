@@ -637,17 +637,23 @@ mod tests {
     ///
     /// `#[ignore]` (needs the model + is slow); run with:
     ///   LFM_DEVICE=metal cargo test --features metal --lib -- --ignored engine_multiturn
-    /// (or `LFM_MODEL_DIR=/abs/model cargo test --lib -- --ignored engine_multiturn` on CPU/f32).
+    /// (or `LFM_MODEL_DIR=/abs/model cargo test --lib -- --ignored engine_multiturn` on CPU BF16).
     #[test]
     #[ignore = "needs the real LFM2.5-Audio model; slow"]
     fn engine_multiturn_grows_conv() {
         use crate::{from_pretrained, get_model_dir, GenParams};
 
-        // Device: Metal bf16 when built with the feature + LFM_DEVICE=metal; else CPU f32.
-        let (device, dtype) = match std::env::var("LFM_DEVICE").ok().as_deref() {
+        // Device: Metal BF16 when built with the feature + LFM_DEVICE=metal; else CPU BF16.
+        let device = match std::env::var("LFM_DEVICE").ok().as_deref() {
             #[cfg(feature = "metal")]
-            Some("metal") => (Device::new_metal(0).expect("metal device"), DType::BF16),
-            _ => (Device::Cpu, DType::F32),
+            Some("metal") => Device::new_metal(0).expect("metal device"),
+            _ => {
+                assert!(
+                    crate::bf16_gemm::bf16_gemm_available(),
+                    "CPU BF16 needs the NEON BFMMLA kernel; use Metal on this Mac"
+                );
+                Device::Cpu
+            }
         };
 
         let model_ref = std::env::var("LFM_MODEL")
@@ -658,7 +664,7 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
                 .unwrap();
         let codebooks = cfg["codebooks"].as_u64().expect("codebooks") as usize;
-        let (model, proc) = from_pretrained(&dir, dtype, &device).expect("load model");
+        let (model, proc) = from_pretrained(&dir, &device).expect("load model");
 
         // Short budget keeps the test quick; demo audio sampling so frames are non-degenerate.
         let params = GenParams {

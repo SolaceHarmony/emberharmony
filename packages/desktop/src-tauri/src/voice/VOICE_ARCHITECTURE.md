@@ -371,38 +371,26 @@ Faithfulness is gated **behaviorally**, not by structural similarity: ported tes
 differential dumps (`parity/dump_*.py` → `parity/golden/*.safetensors`, gitignored, regenerable)
 + real end‑to‑end runs. Structural/AST distance is a shadow and is cheatable; we don't use it.
 
-### 4.8 Numerics: candle 0.9.2, bf16 Metal, f32 CPU parity
+### 4.8 Numerics: safetensor dtype, bf16 Metal/CPU, f32 local math
 
 - **candle 0.9.2** is the pin (transitively via `moshi`). Everything is built against it.
-- **bf16 on Metal** is the *deployed* path — the model ships bf16, Metal runs it in real time
-  (~13–16 tok/s for a 1.5B model on Apple GPU).
-- **f32 on CPU** is the *parity reference* — f32 loads the bf16 weights losslessly and is
-  deterministic, so CPU/f32 is the reference for golden comparison.
-- `LFM_DEVICE=metal` selects Apple GPU bf16; default is CPU f32. Audio sampling uses
-  `temperature=1.0, top_k=4` (greedy audio is degenerate — the Depthformer is trained for
-  sampled audio); text is greedy.
+- **Persistent model weights keep the floating dtype stored in the safetensors headers.** The
+  Rust loader does not accept a caller-selected model dtype and does not use config metadata to
+  upcast BF16 weights.
+- **bf16 on Metal** is the deployed path; the model ships bf16 and Metal runs it in real time.
+- **bf16 on CPU** uses the in-tree NEON `BFMMLA` bridge for 2-D linear/logit matmuls when the
+  CPU exposes FEAT_BF16. If that CPU feature is missing, CPU LFM2 inference fails clearly rather
+  than loading a second F32 model copy.
+- **F32 remains intentional local math**, not persistent weight storage: audio PCM/front-end
+  buffers, logits/sampling/loss calculations, attention-score/value matmuls, and BF16 matmul
+  accumulation use F32 where the canonical path requires it.
+- `LFM_DEVICE=metal` selects Apple GPU execution; default/`cpu` uses CPU BF16 through the
+  NEON bridge. Audio sampling uses `temperature=1.0, top_k=4` (greedy audio is degenerate);
+  text is greedy.
 
-**⚠️ The bf16‑CPU kernel — built, NOT wired (the gap).** *Stock* candle 0.9.2 has no bf16 CPU
-matmul (its gemm allowlist is `F16|F32|F64`; bf16 → `UnsupportedDTypeForOp`) — which is *why*
-the CPU path loads f32. We **wrote a native one** to close that gap: a NEON **`BFMMLA`** bf16
-GEMM (`src/bf16_gemm.rs` + the C micro‑kernel `csrc/bf16_gemm.c`, compiled by `build.rs` with
-`-march=armv8.2-a+bf16`). bf16 inputs, **f32 accumulate** — exactly torch's CPU‑bf16 numerics —
-exposed as a candle `CustomOp2` (`Bf16Gemm`) and the `bf16_matmul(a,b)` wrapper (2‑D, CPU,
-runtime‑gated on `FEAT_BF16`, falls back to `None`). It is **built, exported, and unit‑tested**
-(`bf16_gemm_matches_f32_reference`, < 1e‑2 rel vs the f32(bf16‑inputs) reference) — but **nothing
-calls it.** Every model matmul still routes through stock candle, so today it is *dead code in
-the inference path*: the model runs f32‑on‑CPU and bf16‑on‑GPU, and the kernel's niche
-(bf16‑on‑CPU) is used by neither. **Wiring it in is a real task** (§15 #9): it needs a *bf16‑CPU
-path* —
-  1. let device selection load weights **bf16 on CPU** (today the CPU path forces f32);
-  2. route the **2‑D Linear projections** (q/k/v/o, MLP gate/up/down, the conformer/depthformer
-     linears, the text head) through `bf16_matmul` with the f32 fallback — candle can't `.matmul()`
-     bf16 on CPU, so a custom `Linear` wrapper is required, not a drop‑in;
-  3. leave the **4‑D batched attention scores** (`q·kᵀ`, `att·v`) on the f32 path — the kernel is
-     2‑D only, and those are already upcast to f32 for parity.
-  Result: a bf16‑CPU path that matches the **bf16‑Metal deployment numerics** on CPU (useful for
-  non‑Metal machines and for verifying Metal numerics without a GPU), while f32‑CPU stays the
-  golden reference. **Until that lands, the kernel earns its keep nowhere.**
+The NEON BF16 GEMM is `src/bf16_gemm.rs` plus `csrc/bf16_gemm.c`, compiled by `build.rs` with
+`-march=armv8.2-a+bf16`. `model::linear` routes BF16 CPU linears/logits through that bridge and
+keeps the 4-D attention matmuls on the explicit F32 accumulation path.
 
 ### 4.9 The conv kernels — `candle-flashfftconv`
 

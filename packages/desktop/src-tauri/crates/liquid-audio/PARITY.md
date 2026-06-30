@@ -71,9 +71,10 @@ accessors (`conformer_encode`, and add accessors for prefill / step as needed).
   — centering + window-padding + valid-range normalization confirmed.
 - **Sampling**: ✅ ported (greedy + temperature/top-k multinomial); deterministic
   greedy is what parity exercises, sampling adds diversity on top.
-- **dtype**: the checkpoint is bf16; `DType::F32` loads those exact bf16 values
-  upcast (lossless) — the parity reference is dumped at f32, so no dtype gap. CPU
-  has no bf16 matmul kernel; bf16-in-memory is CUDA/Metal-only.
+- **dtype**: persistent weights load using the floating dtype stored in safetensors.
+  BF16 stays BF16. F32 appears only in explicit local math paths such as audio
+  preprocessing, logits/loss/sampling, attention accumulation, and BF16 matmul
+  accumulation.
 - **FastConformer encoder**: ✅ verified end-to-end and per-stage (≤ 1.6e-6) — the
   manual rel-pos attention path, dw_striding subsampling, conv (batch_norm), and
   macaron FFN all match.
