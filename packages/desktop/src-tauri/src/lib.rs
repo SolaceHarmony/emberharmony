@@ -162,31 +162,17 @@ fn spawn_sidecar(app: &AppHandle, hostname: &str, port: u32, password: &str) -> 
 
     println!("spawning sidecar on port {port}");
 
-    let mut command = cli::create_command(
+    let command = cli::create_command(
         app,
         format!("serve --hostname {hostname} --port {port}").as_str(),
     )
     .env("EMBERHARMONY_SERVER_USERNAME", "emberharmony")
-    .env("EMBERHARMONY_SERVER_PASSWORD", password);
-
-    // Point the sidecar at the bundled voice runtime (bun + agent.js +
-    // node_modules + models). The LiveKit agents framework forks node_modules
-    // scripts, so it can't run inside the compiled CLI; serve spawns this
-    // self-contained runtime instead. Only set when the resource is present.
-    match app
-        .path()
-        .resolve("resources/voice", tauri::path::BaseDirectory::Resource)
-    {
-        Ok(dir) if dir.join("agent.js").exists() => {
-            println!("voice runtime: {}", dir.display());
-            command = command.env("EMBERHARMONY_VOICE_RUNTIME_DIR", dir);
-        }
-        Ok(dir) => eprintln!(
-            "voice runtime not bundled at {} — voice disabled",
-            dir.display()
-        ),
-        Err(e) => eprintln!("could not resolve voice runtime resource: {e}"),
-    }
+    .env("EMBERHARMONY_SERVER_PASSWORD", password)
+    // Desktop voice is owned by the native Tauri kernel (`src/voice`): LFM2
+    // and LiveKit media/control both enter through Tauri commands. The server
+    // sidecar still serves sessions, but it must not spawn the legacy Bun
+    // voice agent worker in desktop mode.
+    .env("EMBERHARMONY_DESKTOP_NATIVE_VOICE", "1");
 
     let (mut rx, child) = command.spawn().expect("Failed to spawn emberharmony");
 
@@ -319,6 +305,9 @@ pub fn run() {
             voice::control::voice_stop,
             voice::control::voice_interrupt,
             voice::control::voice_set_mic_enabled,
+            voice::control::voice_begin_typed_input,
+            voice::livekit::voice_livekit_credentials_set,
+            voice::livekit::voice_livekit_credentials_status,
             voice::model::voice_model_download,
             voice::model::voice_pick_model_dir,
             voice::model::voice_hf_token_set,
@@ -333,6 +322,7 @@ pub fn run() {
             // Initialize log state
             app.manage(LogState(Arc::new(Mutex::new(VecDeque::new()))));
             app.manage(voice::runtime::VoiceRuntime::default());
+            app.manage(voice::model::ModelDownloadRuntime::default());
 
             #[cfg(windows)]
             app.manage(JobObjectState::new());

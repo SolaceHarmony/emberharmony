@@ -34,7 +34,8 @@ tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = "1.48.0"
+crossbeam-channel = "0.5"
+tokio = { version = "1.48.0", features = ["sync", "macros"] }
 listeners = "0.3"
 tauri-plugin-os = "2"
 futures = "0.3.31"
@@ -47,6 +48,12 @@ candle-core = "0.9"
 # HF token storage in the OS keychain (macOS Keychain / Windows Credential Manager /
 # Linux Secret Service). The token never lands in the settings JSON — see voice::model.
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
+livekit = { version = "0.7.49", features = ["rustls-tls-webpki-roots"] }
+# libwebrtc 0.3.38 is not compatible with webrtc-sys 0.3.36's packet metadata ABI.
+# Keep this exact until LiveKit publishes a libwebrtc that forwards `user_data`.
+webrtc-sys = "=0.3.35"
+livekit-api = { version = "0.5.4", default-features = false, features = ["access-token", "services-tokio", "rustls-tls-webpki-roots"] }
+livekit-protocol = "0.7.10"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 webkit2gtk = "=2.0.2"

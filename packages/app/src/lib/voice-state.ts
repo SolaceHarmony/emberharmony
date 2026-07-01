@@ -13,10 +13,9 @@ export type VoiceConnectionState = "disconnected" | "connecting" | "connected" |
 export function voiceProvider(
   desktop: boolean,
   current: VoiceNativeStatus | undefined,
-  server: VoiceServerStatus,
+  _server: VoiceServerStatus,
 ): VoiceProvider {
   if (!desktop) return "livekit"
-  if (current?.stored === false && server?.available) return "livekit"
   return current?.plan.provider ?? "off"
 }
 
@@ -26,7 +25,6 @@ export function voiceEnabled(
   server: VoiceServerStatus,
 ): boolean {
   if (!desktop) return server?.available === true
-  if (current?.stored === false && server?.available) return true
   return current?.plan.enabled ?? voiceProvider(desktop, current, server) !== "off"
 }
 
@@ -37,8 +35,4 @@ export function voiceButtonOn(state: VoiceConnectionState, enabled: boolean): bo
 export function voiceMicTarget(state: VoiceConnectionState, dirty: boolean, busy: boolean): boolean | undefined {
   if (state !== "connected") return undefined
   return !dirty && !busy
-}
-
-export function shouldStopRuntimeForProviderChange(running: VoiceProvider | undefined, next: VoiceSettings): boolean {
-  return running !== undefined && next.provider !== running
 }

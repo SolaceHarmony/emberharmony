@@ -4,16 +4,20 @@
 //! process:
 //!
 //! ```text
-//! Solid UI -> Tauri command -> VoiceRuntime
-//!                         -> cpal mic -> Rust VAD -> RealtimePipeline worker
-//!                         -> cpal playback + Tauri Channel state/events
+//! Solid UI -> Tauri command -> VoiceRuntime kernel
+//!                         -> LFM2: native mic -> Rust VAD -> RealtimePipeline worker
+//!                         -> LiveKit: Rust Room + PlatformAudio + native WebRTC media
+//!                         -> Tauri Channel state/events
 //! ```
 //!
 //! `control` is the settings-driven command seam. `runtime` is the managed
-//! service layer: CPAL streams, VAD, playback, interruption, model inference, and
-//! cleanup all live in Rust threads. `session` remains the reducer for the
-//! sidecar-backed LiveKit bridge while that provider still exists.
+//! service layer: provider sessions, audio callbacks, VAD, playback,
+//! interruption, model inference, LiveKit media, and cleanup all live in Rust.
+//! `session` is the reducer/runner for delegated turns into the EmberHarmony
+//! session backend, not the desktop media owner.
 pub mod control;
+pub mod livekit;
 pub mod model;
 pub mod runtime;
 pub mod session;
+mod threads;

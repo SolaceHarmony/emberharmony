@@ -210,7 +210,7 @@ fn main() -> Res<()> {
         seed,
     };
     let engine = Lfm2VoiceEngine::new(model, proc, params, codebooks, device, out_rate);
-    let pipe = RealtimePipeline::spawn(engine);
+    let pipe = RealtimePipeline::spawn(engine)?;
 
     // `assistant_active` is true between the first reply event and the turn terminal — the
     // capture loop reads it to decide whether a fresh voice onset is a barge-in.

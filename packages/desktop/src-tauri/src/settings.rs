@@ -7,18 +7,24 @@
 //! proper Tauri command binding, no sidecar round-trip and no `LFM_*` env vars.
 //!
 //! Secrets do NOT live here. The Hugging Face token is kept in the OS keychain
-//! (see `voice::model`); LiveKit API key/secret stay in the server credentials store.
-//! This file holds only non-secret config.
+//! (see `voice::model`), and the desktop LiveKit API key/secret are kept there
+//! too (see `voice::livekit`). This file holds only non-secret config.
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use tauri::AppHandle;
+use tauri::{AppHandle, State};
 use tauri_plugin_store::StoreExt;
+
+use crate::voice::runtime::VoiceRuntime;
 
 /// Same store file the rest of the desktop settings use (see `lib.rs`).
 const SETTINGS_STORE: &str = "emberharmony.settings.dat";
 const VOICE_KEY: &str = "voice";
 pub const DEFAULT_LFM2_MODEL: &str = "LiquidAI/LFM2.5-Audio-1.5B";
+
+fn default_last_provider() -> Option<VoiceProvider> {
+    Some(VoiceProvider::Lfm2)
+}
 
 /// Which voice provider is active — two providers behind one surface.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,13 +35,13 @@ pub enum VoiceProvider {
     Off,
     /// Local LFM2.5-Audio model, fully native in this process.
     Lfm2,
-    /// LiveKit room + the EmberHarmony session as the brain (via the sidecar).
+    /// LiveKit room + the EmberHarmony session as the brain.
     Livekit,
 }
 
 /// LiveKit provider config — non-secret only; the API key/secret live in the
-/// credentials store.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// OS keychain via `voice::livekit`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct LiveKitSettings {
     /// e.g. `wss://<project>.livekit.cloud`
@@ -58,7 +64,7 @@ pub enum Lfm2Device {
 
 /// Where a `DELEGATE: <task>` line from the local model routes the hard work
 /// (e.g. a GLM model id, or the EmberHarmony session).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct DelegateSettings {
     pub enabled: bool,
@@ -66,7 +72,7 @@ pub struct DelegateSettings {
 }
 
 /// Local LFM2.5-Audio provider config — replaces the old `LFM_*` env vars.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Lfm2Settings {
     /// Optional local snapshot directory containing `config.json`, weights, and tokenizer files.
@@ -144,12 +150,27 @@ impl Default for Lfm2Settings {
 /// The whole voice settings object. `#[serde(default)]` makes deserialization
 /// tolerant of missing fields, so adding settings later never breaks an older
 /// persisted store.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct VoiceSettings {
     pub provider: VoiceProvider,
+    /// Last non-off provider selected in the UI. This keeps "voice off" from
+    /// erasing whether the user meant to re-enable local LFM2 or LiveKit later.
+    #[serde(default = "default_last_provider")]
+    pub last_provider: Option<VoiceProvider>,
     pub livekit: LiveKitSettings,
     pub lfm2: Lfm2Settings,
+}
+
+impl Default for VoiceSettings {
+    fn default() -> Self {
+        Self {
+            provider: VoiceProvider::Off,
+            last_provider: Some(VoiceProvider::Lfm2),
+            livekit: LiveKitSettings::default(),
+            lfm2: Lfm2Settings::default(),
+        }
+    }
 }
 
 /// Settings plus whether the `voice` key was actually present in the store.
@@ -206,16 +227,23 @@ pub fn voice_settings_state(app: AppHandle) -> Result<VoiceSettingsState, String
 
 /// Persist the whole voice settings object.
 #[tauri::command]
-pub fn voice_settings_set(app: AppHandle, settings: VoiceSettings) -> Result<(), String> {
-    let store = app
-        .store(SETTINGS_STORE)
-        .map_err(|e| format!("Failed to open settings store: {}", e))?;
+pub async fn voice_settings_set(
+    app: AppHandle,
+    runtime: State<'_, VoiceRuntime>,
+    settings: VoiceSettings,
+) -> Result<(), String> {
     let value = serde_json::to_value(&settings)
         .map_err(|e| format!("Failed to serialize voice settings: {}", e))?;
-    store.set(VOICE_KEY, value);
-    store
-        .save()
-        .map_err(|e| format!("Failed to save settings: {}", e))?;
+    runtime.apply_settings(settings.clone()).await?;
+    {
+        let store = app
+            .store(SETTINGS_STORE)
+            .map_err(|e| format!("Failed to open settings store: {}", e))?;
+        store.set(VOICE_KEY, value);
+        store
+            .save()
+            .map_err(|e| format!("Failed to save settings: {}", e))?;
+    }
     Ok(())
 }
 
@@ -228,11 +256,13 @@ mod tests {
         let v = VoiceSettings::default();
         let json = serde_json::to_value(&v).unwrap();
         assert_eq!(json["provider"], "off");
+        assert_eq!(json["lastProvider"], "lfm2");
         assert_eq!(json["lfm2"]["maxTokens"], 512);
         assert_eq!(json["lfm2"]["device"], "cpu");
         assert!(json["lfm2"]["vadThreshold"].is_number()); // exact-float compare is brittle
         let back: VoiceSettings = serde_json::from_value(json).unwrap();
         assert_eq!(back.provider, VoiceProvider::Off);
+        assert_eq!(back.last_provider, Some(VoiceProvider::Lfm2));
         assert_eq!(back.lfm2.vad_threshold, 0.012); // f32 round-trips losslessly
     }
 
@@ -242,6 +272,7 @@ mod tests {
         let json = serde_json::json!({ "provider": "lfm2", "lfm2": { "device": "metal" } });
         let v: VoiceSettings = serde_json::from_value(json).unwrap();
         assert_eq!(v.provider, VoiceProvider::Lfm2);
+        assert_eq!(v.last_provider, Some(VoiceProvider::Lfm2));
         assert_eq!(v.lfm2.device, Lfm2Device::Metal);
         assert_eq!(v.lfm2.vad_threshold, 0.012); // filled from Default
         assert_eq!(v.lfm2.max_tokens, 512);

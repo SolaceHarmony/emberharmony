@@ -8,8 +8,10 @@
 //! webview: the token is set/queried-for-presence here and read natively at download time.
 
 use serde::{Deserialize, Serialize};
-use tauri::AppHandle;
 use tauri::ipc::Channel;
+use tauri::{AppHandle, State};
+
+use super::threads::ThreadManager;
 
 /// Keychain coordinates for the Hugging Face token. The token lives ONLY here — never in
 /// the settings JSON, never sent to the webview.
@@ -100,6 +102,21 @@ fn annotate(err: &std::io::Error) -> String {
     }
 }
 
+#[derive(Default)]
+pub struct ModelDownloadRuntime {
+    threads: ThreadManager,
+}
+
+impl ModelDownloadRuntime {
+    fn spawn(&self, f: impl FnOnce() + Send + 'static) -> Result<(), String> {
+        self.threads.spawn_if_idle(
+            "voice-model-download",
+            "voice model download already running",
+            f,
+        )
+    }
+}
+
 /// Download a model snapshot into the HF cache with per-file progress.
 ///
 /// `source` is a repo id or a pasted Hub URL; `revision` (if non-empty) overrides any
@@ -110,6 +127,7 @@ fn annotate(err: &std::io::Error) -> String {
 /// never yields a `Done`.
 #[tauri::command]
 pub async fn voice_model_download(
+    runtime: State<'_, ModelDownloadRuntime>,
     source: String,
     revision: Option<String>,
     channel: Channel<DownloadEvent>,
@@ -121,38 +139,34 @@ pub async fn voice_model_download(
         .or(url_rev);
     let token = hf_token()?;
 
-    std::thread::Builder::new()
-        .name("voice-model-download".into())
-        .spawn(move || {
-            let result = liquid_audio::snapshot_download_with(
-                &repo_id,
-                revision.as_deref(),
-                token.as_deref(),
-                |p| {
-                    if p.index == 0 {
-                        let _ = channel.send(DownloadEvent::Started {
-                            total: p.total as u32,
-                        });
-                    }
-                    let _ = channel.send(DownloadEvent::File {
-                        index: p.index as u32 + 1,
+    runtime.spawn(move || {
+        let result = liquid_audio::snapshot_download_with(
+            &repo_id,
+            revision.as_deref(),
+            token.as_deref(),
+            |p| {
+                if p.index == 0 {
+                    let _ = channel.send(DownloadEvent::Started {
                         total: p.total as u32,
-                        name: p.file,
                     });
-                },
-            );
-            let terminal = match result {
-                Ok(dir) => DownloadEvent::Done {
-                    dir: dir.to_string_lossy().into_owned(),
-                },
-                Err(e) => DownloadEvent::Error {
-                    message: annotate(&e),
-                },
-            };
-            let _ = channel.send(terminal);
-        })
-        .map_err(|e| format!("failed to spawn download thread: {e}"))?;
-    Ok(())
+                }
+                let _ = channel.send(DownloadEvent::File {
+                    index: p.index as u32 + 1,
+                    total: p.total as u32,
+                    name: p.file,
+                });
+            },
+        );
+        let terminal = match result {
+            Ok(dir) => DownloadEvent::Done {
+                dir: dir.to_string_lossy().into_owned(),
+            },
+            Err(e) => DownloadEvent::Error {
+                message: annotate(&e),
+            },
+        };
+        let _ = channel.send(terminal);
+    })
 }
 
 /// Open a native folder picker; returns the chosen directory path (or `None` if cancelled).

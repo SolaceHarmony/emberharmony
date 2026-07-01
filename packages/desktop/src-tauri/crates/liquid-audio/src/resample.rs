@@ -27,6 +27,11 @@ fn gcd(mut a: u32, mut b: u32) -> u32 {
 /// `torchaudio.functional.resample(wave, orig_freq, new_freq)` with the library
 /// defaults. `wave` is `(1, L)` → `(1, L')` f32 with `L' = ceil(L * new/orig)`.
 pub fn resample(wave: &Tensor, orig_freq: u32, new_freq: u32) -> Result<Tensor> {
+    if orig_freq == 0 || new_freq == 0 {
+        return Err(candle_core::Error::Msg(format!(
+            "resample: sample rates must be non-zero, got orig={orig_freq}, new={new_freq}"
+        )));
+    }
     if orig_freq == new_freq {
         return wave.contiguous();
     }
@@ -120,6 +125,15 @@ mod tests {
         let x: Vec<f32> = (0..100).map(|i| i as f32).collect();
         assert_eq!(resample_slice(&x, 24_000, 16_000).len(), 67); // ceil(16000*100/24000)
         assert_eq!(resample_slice(&x, 16_000, 24_000).len(), 150); // ceil(24000*100/16000)
+    }
+
+    #[test]
+    fn rejects_zero_sample_rate() {
+        let x = Tensor::from_vec(vec![0.0f32, 1.0], (1, 2), &candle_core::Device::Cpu).unwrap();
+        let err = resample(&x, 0, 16_000).unwrap_err().to_string();
+        assert!(err.contains("sample rates must be non-zero"), "{err}");
+        let err = resample(&x, 16_000, 0).unwrap_err().to_string();
+        assert!(err.contains("sample rates must be non-zero"), "{err}");
     }
 
     #[test]

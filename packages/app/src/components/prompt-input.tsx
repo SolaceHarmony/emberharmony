@@ -328,6 +328,10 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     if (voiceMic() === target) return
     setVoiceMic(target)
     if (target === undefined) return
+    if (!target) {
+      voice.beginTypedInput().catch(() => {})
+      return
+    }
     voice.setMicEnabled(target).catch(() => {})
   })
   onCleanup(() => {
@@ -1202,6 +1206,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     if (text.trim().length === 0 && images.length === 0) {
       return
     }
+    if (voice.state() === "connected") await voice.beginTypedInput().catch(() => {})
 
     // a new-session create is already in flight — ignore the duplicate submit
     if (!params.id && creatingSession) return

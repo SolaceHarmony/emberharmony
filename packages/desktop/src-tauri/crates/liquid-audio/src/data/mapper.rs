@@ -526,6 +526,9 @@ fn decode_audio(bytes: &[u8]) -> Result<DecodedAudio> {
         }
     }
 
+    if sample_rate == 0 {
+        return Err(err("decoded audio sample rate is zero".into()));
+    }
     if channels == 0 || samples.is_empty() {
         return Err(err("decoded no audio samples".into()));
     }

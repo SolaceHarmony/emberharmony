@@ -1,232 +1,140 @@
-# Voice frontend design — turn mode + live mode (one event-driven core)
+# Voice Frontend Design
 
-## Phasing (the directive)
+This document tracks the SolidJS side of the native desktop voice kernel described in
+`desktop-stack.md`. The key rule is simple: SolidJS is intent and rendering only. The Tauri
+process owns provider readiness, microphone truth, LiveKit rooms, LFM2 model lifecycle, stop
+semantics, and audio buffering.
 
-- **Phase 1 — NOW: absolute parity with Liquid AI's WebGPU demo.** Turn-based, multi-modal
-  (ASR / TTS / Interleaved), clip-based. Prove we can do exactly what Liquid AI did, with our
-  native Rust `liquid-audio` engine instead of transformers.js/ONNX. This is the whole
-  near-term scope; everything below under "turn mode" is Phase 1.
-- **Phase 2 — LATER: natural, full-duplex conversation.** The end state is *not* turn-based —
-  speech should be continuous and interruptible. The right model for that is **Moshi (the LM),
-  not just Mimi (the codec)** — Moshi is architecturally full-duplex (it processes input and
-  output streams every frame), so it beats LFM2 + a hand-rolled VAD loop (`duplex_chat.rs`,
-  which is a stopgap, not the destination). The `moshi` crate already gives us Mimi; Phase 2
-  brings in its LM. "Live mode" below is the Phase-2 shape.
+## Provider Ownership
 
-The point of designing both now is that the **event-driven core is identical** — Phase 2 is
-*additive* (a new trigger + a different model behind the same `VoiceEvent` session), not a
-rewrite. Build Phase 1 to parity; do not paint Phase 2 into a corner.
+Desktop voice has two native providers behind the same Tauri command surface:
 
----
+- `lfm2`: local LFM2-Audio, running inside the desktop process.
+- `livekit`: native LiveKit/WebRTC room plus an in-process LFM2 agent, also inside the desktop
+  process.
 
-Design for the native (Tauri) voice frontend after moving off LiveKit. It supports **both**
-reference UX models on one core, phased as above:
+The browser LiveKit `Room` path remains only for non-desktop web builds. In the desktop shell,
+`context/voice.tsx` must return the Tauri voice client before constructing `new Room`, rendering
+`RoomAudioRenderer`, or calling `sdk.client.voice.status()` / `sdk.client.voice.token()`.
 
-- **Turn mode** — Liquid AI's WebGPU demo (`spaces/LiquidAI/LFM2.5-Audio-1.5B-transformers-js`,
-  `main.js`): record/upload a clip *or* type → **Send** → streamed text + an audio reply.
-  Explicit modes **ASR / TTS / Interleaved**. One turn at a time (`isGenerating` guard).
-  Audio reply is decoded after the turn and shown as an inline `<audio>` player.
-- **Live mode** — `liquid_audio/demo/chat.py` (`ReplyOnPause`, `can_interrupt=False`) and our
-  `liquid-audio` `RealtimePipeline` / `duplex_chat.rs`: continuous mic, VAD-detected
-  utterances, streaming playback, barge-in. Hands-free.
+## Tauri Command Surface
 
-## The unifying primitive
+The desktop command surface is intentionally small and provider-agnostic:
 
-Both are the **same turn**: `(mode, audio?, text?) → stream(text tokens, audio frames) → done`.
-The only differences:
+```text
+voice_status(app, runtime)
+  -> VoicePlan { provider, enabled, surface, running, runningProvider, micEnabled, ready, detail }
 
-| | trigger | audio out | concurrency |
-|---|---|---|---|
-| **turn** | user presses Send | clip → webview `<audio>` player | one turn, then idle |
-| **live** | VAD onset/pause (in Rust) | streamed → cpal speaker (in Rust) | continuous; barge-in |
+voice_start(app, runtime, server, ctx, channel)
+  -> VoiceStartResult::{ lfm2 | livekit }
 
-So the frontend models one **event-driven session** that emits `VoiceEvent`s; `voiceMode ∈
-{off, turn, live}` selects trigger + playback. The Rust `RealtimePipeline.submit(Utterance)` →
-event-drain is exactly the shared turn; `duplex_chat.rs`'s continuous-VAD wrapper is *only* the
-live trigger, not a different engine.
+voice_stop(runtime)
+  -> stop and join the active native VoiceSession
 
-## Tauri command surface
+voice_interrupt(runtime)
+  -> interrupt the current reply without disconnecting the session
 
-`voice_settings_get` / `voice_settings_set` / `voice_status` already exist; `voice_status`
-must report **runtime** readiness (model/device for `lfm2`; sidecar reachability for
-`livekit`), not just "provider says ready" (GPT/GLM).
+voice_set_mic_enabled(runtime, enabled)
+  -> pause/resume native microphone capture
 
-```
-voice_status() -> VoicePlan { provider, ready, detail }          # branch by provider
+voice_begin_typed_input(runtime)
+  -> atomically pause native microphone capture and interrupt the active reply
 
-# turn mode — one turn, streams VoiceEvents, ends with State::Idle
-voice_generate_turn(req: TurnRequest, channel: Channel<VoiceEvent>) -> Result<()>
-  TurnRequest { mode: asr|tts|interleaved, audio?: { pcm: bytes, rate }, text?: string, ctx: SessionCtx }
+voice_settings_get / voice_settings_state / voice_settings_set
+  -> read/write provider settings through Tauri; runtime reconciliation happens in Rust
 
-# live mode — continuous session, streams VoiceEvents until stopped
-voice_start_live(ctx: SessionCtx, channel: Channel<VoiceEvent>) -> Result<()>
-voice_stop_live() -> Result<()>
-
-# shared turn control (both modes)
-voice_abort_turn() -> Result<()>          # cancel the in-flight generation (the
-                                          # generate_interleaved_cancellable AtomicBool)
-voice_set_mic_enabled(on: bool) -> Result<()>   # live only: pause/resume STT capture
+voice_livekit_credentials_set / voice_livekit_credentials_status
+  -> store/read LiveKit API credentials in the OS keychain
 ```
 
-`SessionCtx { sessionID, directory, model, agent, delegateTarget?, promptMode: plan|build }`
-— GPT's point that voice must carry session context, not just a channel. `voice_start`'s
-current `(app, channel)` stub becomes these two typed entrypoints; `voice_stop`'s no-op
-becomes `voice_stop_live` + `voice_abort_turn`.
+`SessionCtx` carries session identity and ordinary prompt context:
 
-## `VoiceEvent` contract (revised)
-
-Current (`control.rs:94-103`): `State{Idle|Listening|Thinking|Speaking}`, `Transcript{role,text}`,
-`Ended{reason}`, `Error{message}`. Revisions to cover both modes + the gap reading the UI
-surfaced:
-
-```
-enum VoiceEvent {
-  State { state }                         # idle|listening|thinking|speaking
-  Transcript { role, text }               # text is CUMULATIVE (demo streams cumulative)
-  Level { rms: f32 }                      # NEW — amplitude for the visualizer (see below)
-  AudioClip { wav: bytes, ms: u32 }       # NEW — turn mode: the decoded reply as a player clip
-  Ended { reason: Option<String> }
-  Error { message }
-}
+```text
+SessionCtx { sessionID, directory, model?, agent?, variant?, promptMode? }
 ```
 
-**Why `Level` is required, not optional:** the `BarVisualizer` reads
-`track={voice.agentAudioTrack()}` (`prompt-input.tsx:2105`) — a LiveKit `MediaStreamTrack` it
-samples to draw bars. In the native path there is **no track in the webview** (audio is cpal
-in Rust, live mode; or a decoded blob, turn mode). GLM's "components already exist, just
-populate the signals" is wrong here: `agentAudioTrack` has no native source. The Rust loop
-emits `Level{rms}` from the PCM it is playing; the visualizer draws from that scalar.
+It does not carry `delegateTarget`. Delegation target is native settings, read by Rust from
+`settings.lfm2.delegate`, and the desktop kernel defaults delegated execution to the safe planning
+agent unless and until a native classifier exists.
 
-**Audio out, per mode:**
-- **live**: cpal plays in Rust; webview gets only `Level` (+ `Transcript`/`State`). No PCM
-  crosses the IPC boundary — the whole point of in-process audio.
-- **turn**: the reply is decoded to a clip and sent as `AudioClip{wav}` at `TurnComplete`,
-  rendered as an `<audio>` player in the assistant message (exactly the demo, `main.js:464-485`).
+## VoiceEvent Contract
 
-## SolidJS voice context (`context/voice.tsx`, rewritten)
+Both providers emit the same event stream over a Tauri `Channel<VoiceEvent>`:
 
-`voice.tsx` is **gutted** from a LiveKit `Room` wrapper (it is one end-to-end: `Room` ctor,
-`RoomContext`/`RoomAudioRenderer`, `connectionState`, `useVoiceAssistant`, `useTranscriptions`,
-`token()`→`room.connect()`) into an event-driven, provider/mode-branched context:
-
-```ts
-// store
-provider   // off | lfm2 | livekit          (from voice_settings_get)
-ready      // bool                          (from voice_status)
-mode       // off | turn | live             (interaction model)
-state      // idle | listening | thinking | speaking | error   (VoiceEvent::State)
-mic        // muted | unmuted | unavailable (voice_set_mic_enabled, live only)
-transcript // string                        (VoiceEvent::Transcript, cumulative)
-level      // number                        (VoiceEvent::Level — drives BarVisualizer)
-error      // string | undefined
-
-// actions
-submitTurn({ audio?, text?, mode })  // turn: voice_generate_turn + listen on channel
-startLive() / stopLive()             // live: voice_start_live / voice_stop_live
-abortTurn()                          // voice_abort_turn (stop button + typed barge-in)
-setMicEnabled(on)                    // live: voice_set_mic_enabled
+```text
+State { loading | idle | listening | thinking | speaking }
+Transcript { role, text }
+Level { rms }
+AudioClip { wav, ms }
+Ended { reason? }
+Error { message }
 ```
 
-`lfm2` → these Tauri commands; `livekit` → the existing `Room` path kept behind the same
-surface (legacy, until removed). `available()` = `voice_status().ready`, branched by provider
-— not `sdk.client.voice.status()` for everything. The `BarVisualizer` call site changes from
-`track={agentAudioTrack()}` to `level={voice.level()}`; `transcript`/`state`/mic-button
-consumers keep their shape but read the new signals.
+For continuous native sessions, audio stays in Rust. The webview gets scalar `Level` updates for
+the meter, transcripts for display, and state transitions for controls. `AudioClip` remains in the
+contract for turn-style output, but the live desktop path should not ship PCM through webview IPC.
 
-## Prompt-input integration
+## SolidJS Voice Context
 
-**Turn mode (default — models the demo onto the existing prompt):**
-- Audio is a **turn-input attachment**, like an image: a record/upload control adds an audio
-  clip to the prompt. Mode is inferred from the turn (audio+interleaved = conversation;
-  text-only+tts = speech; audio+asr = transcribe) or set by a small selector.
-- `handleSubmit` (`prompt-input.tsx:1170`): when the turn has audio (or voice mode is on),
-  route through `submitTurn(...)`; stream `Transcript` into the assistant message; render
-  `AudioClip` as an inline `<audio>` player.
-- **Stop**: `abort()` (`:942-957`) additionally calls `voice.abortTurn()` — cancels the
-  in-flight generation. Returns to `idle`.
-- **Typing**: no conflict — audio is an attachment composed into one turn; text and audio are
-  the *same* turn, never racing. (This is why the demo model dissolves the live-mode typing
-  problem.)
+The desktop context state is derived from Tauri settings, `voice_status`, and streamed
+`VoiceEvent`s:
 
-**Live mode (hands-free toggle):**
-- The mic button enters live mode: `startLive()`. `BarVisualizer` shows `level`; the transcript
-  strip shows `Transcript`; audio plays via cpal in Rust. Barge-in is handled in Rust
-  (`RealtimePipeline.interrupt()` on VAD onset).
-- **Stop button** = `abortTurn()` (stop *this* turn, stay live → `listening`). The mic/live
-  toggle off = `stopLive()` (leave live mode).
-- **Typing while live**: a typed submit is a barge-in — `abortTurn()` first, then submit the
-  text; and while the input is focused-and-non-empty, `setMicEnabled(false)` so typing doesn't
-  trip a voice turn. Resume on idle. (GPT's rule, scoped to live mode where it actually applies.)
+```text
+provider       off | lfm2 | livekit
+enabled        whether the native provider is turned on
+available      native readiness from voice_status().ready
+state          disconnected | connecting | connected | error
+micState       unavailable | muted | unmuted
+agentState     disconnected | initializing | listening | thinking | speaking | failed
+agentLevel     scalar RMS for NativeVoiceMeter
+transcriptions cumulative native transcript rows
+```
 
-## Reconciliation — GLM & GPT 5.5
+The actions map directly to Tauri commands:
 
-| Their proposal | Verdict | Note |
-|---|---|---|
-| GPT: `voice_start` carries session context | **keep** | `SessionCtx` on both `voice_generate_turn` + `voice_start_live`. |
-| GPT/GLM: rewrite `voice.tsx` to Tauri events | **keep** | It's a full gut of a `Room` wrapper, not a patch. |
-| GPT: `voice_status` = runtime readiness | **keep** | branch by provider; `livekit` checks sidecar. |
-| GPT: add `voice_abort_turn` / `voice_stop({turn})` | **keep** | one `voice_abort_turn`; the cancel hook already exists. |
-| GPT: `voice_set_mic_enabled` / pause listening | **keep, live-only** | N/A in turn mode (no continuous mic). |
-| GPT/GLM: stream state/transcript/partial/error/ended | **keep + extend** | add **`Level`** (visualizer) and **`AudioClip`** (turn-mode player). |
-| GPT: stop = barge-in (abort + TTS stop → listening) | **revise per mode** | turn → idle; live → listening. |
-| GPT: typing = barge-in + pause STT | **keep, live-only** | turn mode has no race to resolve. |
-| GLM: "components exist, just populate signals" | **revise** | `agentAudioTrack` has **no** native source → `Level` is mandatory. |
-| Both: only designed the **live** model | **the gap this fills** | their design = "live mode"; the demo = "turn mode"; both share the event-driven session + `voice_abort_turn`. |
+```text
+connect(sessionID, ctx)   -> voice_start(ctx, channel)
+disconnect()              -> voice_stop()
+interrupt()               -> voice_interrupt()
+beginTypedInput()         -> voice_begin_typed_input()
+setMicEnabled(enabled)    -> voice_set_mic_enabled(enabled)
+toggleMute()              -> setMicEnabled(!current)
+```
 
-## Build order
-1. Extend `VoiceEvent` (`Level`, `AudioClip`) + add the commands (`voice_generate_turn`,
-   `voice_start_live`/`stop_live`, `voice_abort_turn`, `voice_set_mic_enabled`).
-2. Wire `voice_generate_turn[lfm2]` → `RealtimePipeline.submit` (turn mode is the smaller,
-   testable first slice; live mode adds the VAD trigger on top).
-3. Rewrite `voice.tsx` as the event-driven context; switch `BarVisualizer` to `level`.
-4. Prompt-input: audio attachment + mode + audio-player rendering (turn); live toggle + barge-in.
-5. Stop button + typed-submit → `abortTurn()` (both), `setMicEnabled` (live).
+Provider switching, model directory changes, device changes, VAD threshold changes, LiveKit URL
+changes, and keychain credential writes are reconciled in Rust. The frontend dispatches the
+settings event so UI state refetches, but it must not decide which native session to stop.
 
-## RESOLVED decisions (Phase-1 Tauri wiring) — settle these; stop re-litigating
+## Prompt Input Integration
 
-Grounded in the `liquid-audio` examples (`duplex_chat.rs` = the reference consumer + VAD loop)
-and `realtime.rs` (`RealtimePipeline` owns the engine on a worker thread; `Channel::send` is
-`Send+Sync`).
+The voice button is an affordance for the selected native provider. It remains visible and
+pressed when voice is enabled even if the provider is not ready yet; clicking it attempts
+`voice_start`, and the native readiness detail explains why startup failed.
 
-1. **Model lifecycle → eager-async on `provider == lfm2`, NOT app-start, NOT first-press.**
-   A 1.5B model is ~3 GB RAM + ~21 s CPU (faster on Metal). Don't pay it at startup (most users
-   won't use local voice) and don't pay it as a 21 s mic-button hang. Load on a background
-   thread the moment the active provider becomes `lfm2` (at boot if settings already say so, or
-   on the settings switch). `voice_status` gains `loading | ready` so the UI shows a spinner;
-   the mic enables on `ready`. "Lazy w.r.t. intent, eager w.r.t. first use."
+The stop button has two native meanings:
 
-2. **Pipeline storage → ONE persistent `RealtimePipeline` in `State<Mutex<Option<…>>>`; the
-   warm model lives inside it; never reload per session.** `model`+`proc` are owned by
-   `Lfm2VoiceEngine`, owned by the pipeline's worker thread — so the pipeline-in-State *is* the
-   warm-model store (you can't also keep an un-`Clone` copy in State). Created once when the load
-   finishes; reused for every turn (it already persists across turns — `worker_persists_across_turns`
-   — and now accumulates `conv` across turns); dropped only on provider-change / app-exit.
+- while voice is speaking/thinking: call `voice_interrupt()` and keep the session alive;
+- when the voice toggle is turned off: call `voice_stop()` and leave voice mode.
 
-3. **crossbeam → Tauri `Channel` bridge → a plain `std::thread`, `for ev in rx.iter() {
-   channel.send(map(ev)) }`. No tokio, no `try_recv` timer.** `Channel::send` is `Send+Sync`
-   (tauri `OnMessageFn = Box<dyn Fn(..)+Send+Sync>`), callable from any OS thread, so no runtime
-   is needed; blocking `rx.iter()` is lowest-latency (a timer poll adds latency + busy-loops).
-   This IS the `duplex_chat` consumer thread with `ring.extend(pcm)` swapped for `channel.send`.
-   ONE bridge per session, draining `pipe.events().clone()`, ending on the turn/session terminal
-   event — there is only ever one active session (the demo's `isGenerating` guard), so no
-   competing consumers steal events from the shared pipeline.
+Typed input is a kernel event, not a UI-only mute. When the user begins typing or prompt execution
+is active, `prompt-input.tsx` calls `voice_begin_typed_input()` so Rust pauses capture and
+interrupts the active response before the typed prompt proceeds. When the prompt is clean and the
+app is idle again, the UI may call `voice_set_mic_enabled(true)` to resume capture.
 
-4. **Event mapping — the naïve `realtime::VoiceEvent → control::VoiceEvent` table has 4 gaps:**
-   - `Text(frag)`: realtime emits per-token FRAGMENTS; `control::Transcript` is CUMULATIVE.
-     The bridge ACCUMULATES a per-turn `String` and emits `Transcript{Assistant, cumulative}`.
-   - `Audio(pcm)`: must be PLAYED, not just measured. **Live** → push to a cpal output ring
-     (Rust-side) + emit `Level{rms}` (no PCM crosses IPC). **Turn** → ACCUMULATE pcm; at
-     `TurnComplete` encode → `AudioClip{wav}` for the webview `<audio>` (no cpal in turn mode).
-   - `TurnComplete`: turn → emit `AudioClip{wav}` THEN `State{Idle}`; live → `State{Listening}`.
-   - `Interrupted`: turn → `State{Idle}`; live → `State{Listening}`.
-   - SYNTHESIZE the states realtime doesn't emit: `State{Thinking}` on submit (before first
-     token), `State{Speaking}` on the first `Audio`. (Listening→Thinking→Speaking, like the demo.)
+The visualizer branches by source:
 
-5. **Phase 1 = `voice_generate_turn` (one-shot) BUILT ON the persistent pipeline — not a
-   separate path, and NOT continuous live yet.** Using the pipeline keeps the model warm (#2),
-   gives abort/barge-in for free, and makes Phase 2 *additive* (live just adds the cpal VAD
-   trigger + streaming playback on the SAME engine). **Turn mode needs NO cpal:** audio-in is a
-   webview-recorded PCM clip (`TurnRequest{audio:{pcm,rate}}`), audio-out is the accumulated
-   `AudioClip{wav}` the webview plays — exactly the Liquid demo. Implement `voice_generate_turn`
-   + `voice_abort_turn`(→`pipe.interrupt()`) now; `voice_start_live`/`voice_stop_live` (cpal +
-   VAD) are Phase 2 stubs.
+- web fallback: `BarVisualizer` samples a browser LiveKit `MediaStreamTrack`;
+- desktop native: `NativeVoiceMeter` renders `VoiceEvent::Level` because no audio track enters the
+  webview.
+
+## Regression Guards
+
+The current tests intentionally guard these seams:
+
+- desktop `voice.tsx` does not construct or connect a browser LiveKit room;
+- desktop start context does not contain `delegateTarget`;
+- desktop availability comes from Tauri `voice_status`, not server LiveKit status;
+- stop, interrupt, mic, typed input, settings, and provider invalidation go through the bounded
+  Tauri runtime queue;
+- LFM2 and LiveKit both hang off `VoiceRuntime` as native `VoiceSession` implementations;
+- prompt input pauses native voice through `voice_begin_typed_input` before typed work proceeds.

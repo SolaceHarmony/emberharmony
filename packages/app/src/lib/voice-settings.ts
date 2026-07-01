@@ -37,6 +37,7 @@ export interface Lfm2Settings {
 
 export interface VoiceSettings {
   provider: VoiceProvider
+  lastProvider?: Exclude<VoiceProvider, "off">
   livekit: LiveKitSettings
   lfm2: Lfm2Settings
 }
@@ -46,10 +47,11 @@ export interface VoiceSettingsState {
   stored: boolean
 }
 
-export type VoiceSettingsChangedEvent = CustomEvent<VoiceSettings>
+export type VoiceSettingsChangedEvent = CustomEvent<VoiceSettings | undefined>
 
 export const defaultVoiceSettings: VoiceSettings = {
   provider: "off",
+  lastProvider: "lfm2",
   livekit: {},
   // Desktop resolves the default `model` in Rust; this literal is only the
   // web-build display fallback when no Tauri runtime exists.
@@ -149,17 +151,10 @@ export interface VoiceStartContext {
     modelID: string
   }
   variant?: string
-  delegateTarget?: string
   promptMode?: "plan" | "build"
 }
 
-export interface LiveKitGrant {
-  token: string
-  url: string
-  roomName: string
-}
-
-export type VoiceStartResult = { provider: "lfm2" } | { provider: "livekit"; grant: LiveKitGrant }
+export type VoiceStartResult = { provider: "lfm2" } | { provider: "livekit" }
 
 /** Start the native desktop voice service. */
 export async function startVoice(
@@ -192,6 +187,32 @@ export async function setVoiceMicEnabled(enabled: boolean): Promise<void> {
   const invoke = tauriInvoke()
   if (!invoke) return
   await invoke<void>("voice_set_mic_enabled", { enabled })
+}
+
+/** Pause native microphone capture and interrupt voice before a typed prompt runs. */
+export async function beginVoiceTypedInput(): Promise<void> {
+  const invoke = tauriInvoke()
+  if (!invoke) return
+  await invoke<void>("voice_begin_typed_input")
+}
+
+export interface LiveKitCredentialsStatus {
+  stored: boolean
+}
+
+/** Store or clear desktop LiveKit API credentials in the native OS keychain. */
+export async function setLiveKitCredentials(apiKey: string, apiSecret: string): Promise<void> {
+  const invoke = tauriInvoke()
+  if (!invoke) return
+  await invoke<void>("voice_livekit_credentials_set", { apiKey, apiSecret })
+  window.dispatchEvent(new CustomEvent(VOICE_SETTINGS_CHANGED, { detail: undefined }))
+}
+
+/** Whether desktop LiveKit API credentials are stored natively. */
+export async function getLiveKitCredentialsStatus(): Promise<LiveKitCredentialsStatus> {
+  const invoke = tauriInvoke()
+  if (!invoke) return { stored: false }
+  return invoke<LiveKitCredentialsStatus>("voice_livekit_credentials_status")
 }
 
 // ---- model management (download / local dir / HF token) ----

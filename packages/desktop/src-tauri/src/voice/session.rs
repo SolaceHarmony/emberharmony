@@ -19,6 +19,12 @@ use std::time::{Duration, Instant};
 use futures::StreamExt;
 use serde_json::{Value, json};
 
+const SESSION_BRIDGE_CONNECT_TIMEOUT_SECS: u64 = 10;
+const SESSION_BRIDGE_READ_TIMEOUT_SECS: u64 = 1;
+const SESSION_BRIDGE_CANCEL_POLL_MS: u64 = 50;
+const SESSION_BRIDGE_ERROR_BODY_CAP: usize = 8 * 1024;
+const SESSION_BRIDGE_SSE_BUFFER_CAP: usize = 256 * 1024;
+
 pub const VOICE_SYSTEM_PROMPT: &str = concat!(
     "The user is speaking to you by voice and hears your replies as speech. ",
     "Keep replies short and speakable: plain sentences, no markdown, no code blocks, no long enumerations. ",
@@ -291,7 +297,12 @@ pub async fn run_turn(
 
     // Pull the server.connected frame before posting the prompt so the stream
     // cannot miss the first reply delta.
-    let _ = next_event(&mut events, &cancel).await?;
+    let _ = tokio::time::timeout(
+        Duration::from_secs(SESSION_BRIDGE_CONNECT_TIMEOUT_SECS),
+        next_event(&mut events, &cancel),
+    )
+    .await
+    .map_err(|_| "session event stream did not connect".to_string())??;
 
     post_prompt(&client, &cfg, &text, &cancel).await?;
 
@@ -303,7 +314,12 @@ pub async fn run_turn(
             return Ok(());
         }
 
-        match tokio::time::timeout(Duration::from_secs(1), next_event(&mut events, &cancel)).await {
+        match tokio::time::timeout(
+            Duration::from_secs(SESSION_BRIDGE_READ_TIMEOUT_SECS),
+            next_event(&mut events, &cancel),
+        )
+        .await
+        {
             Ok(Ok(Some(event))) => match reducer.step(&event, elapsed_ms(start)) {
                 Step::Delta { reply_id, text } => {
                     if !sink(SessionBridgeEvent::Delta { reply_id, text }) {
@@ -335,7 +351,7 @@ type EventStream = futures::stream::BoxStream<'static, Result<Vec<u8>, String>>;
 
 struct SseStream {
     chunks: EventStream,
-    buffer: String,
+    buffer: Vec<u8>,
 }
 
 async fn open_events(
@@ -354,7 +370,7 @@ async fn open_events(
     .map_err(|e| format!("event stream failed: {e}"))?;
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+        let body = capped_error_body(response).await;
         return Err(format!("event stream failed: {status} {body}"));
     }
     Ok(SseStream {
@@ -366,7 +382,7 @@ async fn open_events(
                     .map_err(|e| format!("event stream read failed: {e}"))
             })
             .boxed(),
-        buffer: String::new(),
+        buffer: Vec::new(),
     })
 }
 
@@ -381,26 +397,54 @@ async fn next_event(
         if cancel.load(Ordering::SeqCst) {
             return Ok(None);
         }
-        let Some(chunk) = stream.chunks.next().await else {
-            return Ok(None);
+        let chunk = tokio::select! {
+            chunk = stream.chunks.next() => {
+                let Some(chunk) = chunk else {
+                    return Ok(None);
+                };
+                chunk?
+            }
+            _ = wait_cancel(cancel) => {
+                return Ok(None);
+            }
         };
-        let chunk = chunk?;
-        stream.buffer.push_str(&String::from_utf8_lossy(&chunk));
+        if stream.buffer.len().saturating_add(chunk.len()) > SESSION_BRIDGE_SSE_BUFFER_CAP {
+            stream.buffer.clear();
+            return Err(format!(
+                "session event frame exceeded {} bytes",
+                SESSION_BRIDGE_SSE_BUFFER_CAP
+            ));
+        }
+        stream.buffer.extend_from_slice(&chunk);
     }
 }
 
-fn drain_event(buffer: &mut String) -> Option<SessionEvent> {
+fn drain_event(buffer: &mut Vec<u8>) -> Option<SessionEvent> {
     loop {
-        let Some(boundary) = buffer.find("\n\n") else {
+        let Some((boundary, width)) = sse_boundary(buffer) else {
             return None;
         };
-        let chunk = buffer[..boundary].to_string();
-        buffer.replace_range(..boundary + 2, "");
+        let bytes = buffer.drain(..boundary + width).collect::<Vec<_>>();
+        let Ok(chunk) = std::str::from_utf8(&bytes[..boundary]) else {
+            continue;
+        };
         for line in chunk.lines() {
             if let Some(event) = event_from_data_line(line) {
                 return Some(event);
             }
         }
+    }
+}
+
+fn sse_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
+    let lf = buffer.windows(2).position(|window| window == b"\n\n");
+    let crlf = buffer.windows(4).position(|window| window == b"\r\n\r\n");
+    match (lf, crlf) {
+        (Some(lf), Some(crlf)) if lf < crlf => Some((lf, 2)),
+        (Some(_), Some(crlf)) => Some((crlf, 4)),
+        (Some(lf), None) => Some((lf, 2)),
+        (None, Some(crlf)) => Some((crlf, 4)),
+        (None, None) => None,
     }
 }
 
@@ -450,8 +494,62 @@ async fn post_prompt(
         return Ok(());
     }
     let status = response.status();
-    let body = response.text().await.unwrap_or_default();
+    let body = capped_error_body(response).await;
     Err(format!("session prompt failed: {status} {body}"))
+}
+
+async fn wait_cancel(cancel: &Arc<AtomicBool>) {
+    let mut poll = tokio::time::interval(Duration::from_millis(SESSION_BRIDGE_CANCEL_POLL_MS));
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            return;
+        }
+        poll.tick().await;
+    }
+}
+
+async fn capped_error_body(response: reqwest::Response) -> String {
+    let mut stream = response.bytes_stream();
+    let mut body = Vec::new();
+    let mut truncated = false;
+    while body.len() < SESSION_BRIDGE_ERROR_BODY_CAP {
+        let Some(chunk) = stream.next().await else {
+            break;
+        };
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                if body.is_empty() {
+                    return format!("body read failed: {error}");
+                }
+                truncated = true;
+                break;
+            }
+        };
+        let remaining = SESSION_BRIDGE_ERROR_BODY_CAP - body.len();
+        if chunk.len() > remaining {
+            body.extend_from_slice(&chunk[..remaining]);
+            truncated = true;
+            break;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    if body.len() == SESSION_BRIDGE_ERROR_BODY_CAP {
+        truncated = true;
+    }
+    let mut text = utf8_prefix(&body).to_string();
+    if truncated {
+        text.push_str("\n...[truncated]");
+    }
+    text
+}
+
+fn utf8_prefix(bytes: &[u8]) -> &str {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(error) => std::str::from_utf8(&bytes[..error.valid_up_to()]).unwrap_or_default(),
+    }
 }
 
 async fn abort_prompt(client: &reqwest::Client, cfg: &SessionBridgeConfig) {
@@ -506,6 +604,7 @@ pub(crate) fn url_encode(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt as _;
 
     const SID: &str = "ses_test";
 
@@ -694,5 +793,64 @@ mod tests {
             event_from_data_line(r#"data: {"type":"something.unknown"}"#),
             Some(SessionEvent::Other)
         );
+    }
+
+    #[tokio::test]
+    async fn sse_stream_preserves_utf8_across_network_chunks() {
+        let payload = format!(
+            r#"data: {{"type":"message.part.updated","properties":{{"part":{{"sessionID":"{}","type":"text","messageID":"m1"}},"delta":"caf{}"}}}}"#,
+            SID, "\u{00e9}"
+        );
+        let frame = format!("{payload}\n\n").into_bytes();
+        let split = frame
+            .iter()
+            .position(|byte| *byte == 0xC3)
+            .expect("test frame should contain utf-8 lead byte")
+            + 1;
+        let mut stream = SseStream {
+            chunks: futures::stream::iter([
+                Ok(frame[..split].to_vec()),
+                Ok(frame[split..].to_vec()),
+            ])
+            .boxed(),
+            buffer: Vec::new(),
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        assert_eq!(
+            next_event(&mut stream, &cancel).await.unwrap(),
+            Some(part("m1", "caf\u{00e9}"))
+        );
+    }
+
+    #[test]
+    fn drain_event_accepts_crlf_sse_boundaries() {
+        let mut buffer = b"data: {\"type\":\"server.heartbeat\"}\r\n\r\n".to_vec();
+
+        assert_eq!(drain_event(&mut buffer), Some(SessionEvent::Heartbeat));
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn utf8_prefix_cuts_at_complete_char_boundary() {
+        let text = "voice caf\u{00e9}";
+        let bytes = text.as_bytes();
+        let cut = &bytes[..bytes.len() - 1];
+
+        assert_eq!(utf8_prefix(cut), "voice caf");
+    }
+
+    #[tokio::test]
+    async fn sse_stream_rejects_unbounded_frame_without_boundary() {
+        let mut stream = SseStream {
+            chunks: futures::stream::iter([Ok(vec![b'x'; SESSION_BRIDGE_SSE_BUFFER_CAP + 1])])
+                .boxed(),
+            buffer: Vec::new(),
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let err = next_event(&mut stream, &cancel).await.unwrap_err();
+
+        assert!(err.contains("session event frame exceeded"));
+        assert!(stream.buffer.is_empty());
     }
 }

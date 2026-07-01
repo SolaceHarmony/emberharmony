@@ -255,9 +255,11 @@ impl<'a> ChatState<'a> {
     /// `wave`: (1, L) at `sampling_rate`. Resampling to 16 kHz is the caller's
     /// responsibility (kept out of the core port); pass 16 kHz mono.
     pub fn add_audio_16k(&mut self, wave: &Tensor) -> Result<()> {
-        let (mel, _) = (self.proc.audio.forward(wave)?, ());
-        let new_audio_in = mel.i(0)?; // (nfilt, frames)
-        let frames = new_audio_in.dim(1)?;
+        let mel = self.proc.audio.forward(wave)?;
+        let samples = wave.flatten_all()?.dim(0)?;
+        let padded = mel.dim(2)?;
+        let frames = self.proc.audio.get_seq_len(samples).min(padded);
+        let new_audio_in = mel.i(0)?.narrow(1, 0, frames)?.contiguous()?; // (nfilt, valid_frames)
         let emb_len = mel2emb_len(frames as i64) as usize;
         let new_mod = Tensor::from_vec(
             vec![LFMModality::AudioIn as i64; emb_len],
@@ -297,6 +299,11 @@ impl<'a> ChatState<'a> {
     /// and unchanged.
     pub fn add_audio(&mut self, wave: &Tensor, sampling_rate: u32) -> Result<()> {
         // Python: `assert len(wave.shape) == 2` and `assert wave.shape[0] == 1`.
+        if sampling_rate == 0 {
+            return Err(candle_core::Error::Msg(
+                "add_audio: sampling_rate must be non-zero".into(),
+            ));
+        }
         if wave.rank() != 2 {
             return Err(candle_core::Error::Msg(format!(
                 "add_audio: wave must be 2-D (1, L), got rank {}",
@@ -515,6 +522,79 @@ impl ChatState<'_> {
     /// `device` → the processor's device.
     pub fn device(&self) -> &Device {
         &self.proc.device
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::DType;
+    use std::collections::HashMap;
+    use tokenizers::models::wordlevel::WordLevel;
+
+    fn test_processor() -> LFM2AudioProcessor {
+        let dev = Device::Cpu;
+        let mut vocab = HashMap::new();
+        vocab.insert("<unk>".to_string(), 0);
+        vocab.insert("<|startoftext|>".to_string(), 1);
+        let tokenizer = Tokenizer::new(
+            WordLevel::builder()
+                .vocab(vocab)
+                .unk_token("<unk>".to_string())
+                .build()
+                .unwrap(),
+        );
+        let audio = FilterbankFeatures::new(
+            MelConfig {
+                sample_rate: 16_000,
+                n_window_size: 400,
+                n_window_stride: 160,
+                n_fft: 512,
+                nfilt: 8,
+                preemph: 0.97,
+                log_zero_guard_value: 2f64.powi(-24),
+                mag_power: 2.0,
+                pad_to: 16,
+                exact_pad: false,
+            },
+            &dev,
+        )
+        .unwrap();
+        LFM2AudioProcessor::new(tokenizer, audio, None, None, dev)
+    }
+
+    #[test]
+    fn add_audio_16k_uses_valid_mel_length_not_center_padding() {
+        let proc = test_processor();
+        let wave = Tensor::zeros((1, 1280), DType::F32, proc.device()).unwrap();
+        let raw = proc.audio().forward(&wave).unwrap();
+        let valid = proc.audio().get_seq_len(1280);
+
+        assert_eq!(raw.dim(2).unwrap(), 9);
+        assert_eq!(valid, 8);
+        assert_eq!(mel2emb_len(raw.dim(2).unwrap() as i64), 2);
+        assert_eq!(mel2emb_len(valid as i64), 1);
+
+        let mut chat = ChatState::new(&proc, 8).unwrap();
+        chat.add_audio_16k(&wave).unwrap();
+
+        assert_eq!(chat.audio_in.dim(1).unwrap(), valid);
+        assert_eq!(chat.audio_in_lens.to_vec1::<i64>().unwrap(), vec![8]);
+        let flags = chat.modality_flag.to_vec2::<i64>().unwrap();
+        let audio_flags = flags[0]
+            .iter()
+            .filter(|&&flag| flag == LFMModality::AudioIn as i64)
+            .count();
+        assert_eq!(audio_flags, mel2emb_len(valid as i64) as usize);
+    }
+
+    #[test]
+    fn add_audio_rejects_zero_sampling_rate() {
+        let proc = test_processor();
+        let wave = Tensor::zeros((1, 320), DType::F32, proc.device()).unwrap();
+        let mut chat = ChatState::new(&proc, 8).unwrap();
+        let err = chat.add_audio(&wave, 0).unwrap_err().to_string();
+        assert!(err.contains("sampling_rate must be non-zero"), "{err}");
     }
 }
 

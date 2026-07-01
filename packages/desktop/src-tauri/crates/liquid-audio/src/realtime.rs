@@ -25,13 +25,26 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
-use crossbeam_channel::{unbounded, Receiver, Sender};
+use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 
 use crate::moshi::demo::chat::decode_audio_frame;
 use crate::moshi::models::MimiModel;
 
 #[cfg(test)]
 const MIMI_RATE: u32 = 24_000; // Mimi/LFM2 detokenizer output rate.
+
+const UTTERANCE_QUEUE_CAP: usize = 1;
+const EVENT_QUEUE_CAP: usize = 128;
+
+fn try_send_event(tx: &Sender<VoiceEvent>, ev: VoiceEvent, cancel: &AtomicBool) -> bool {
+    match tx.try_send(ev) {
+        Ok(()) => true,
+        Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
+            cancel.store(true, Ordering::SeqCst);
+            false
+        }
+    }
+}
 
 /// A captured user utterance handed to the worker: mono f32 samples + their sample rate.
 pub struct Utterance {
@@ -79,12 +92,39 @@ pub struct RealtimePipeline {
     worker: Option<JoinHandle<()>>,
 }
 
+/// Cloneable control handle for producers that feed an existing realtime worker.
+#[derive(Clone)]
+pub struct RealtimePipelineHandle {
+    utt_tx: Sender<Utterance>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl RealtimePipelineHandle {
+    /// Hand the worker a new utterance. Returns `false` if the bounded queue is full or the
+    /// worker has stopped.
+    pub fn submit(&self, utt: Utterance) -> bool {
+        match self.utt_tx.try_send(utt) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => false,
+        }
+    }
+
+    /// Request barge-in: abort the in-flight reply.
+    pub fn interrupt(&self) {
+        self.cancel.store(true, Ordering::SeqCst);
+    }
+}
+
 impl RealtimePipeline {
     /// Spawn the worker thread; it owns `engine` for its lifetime and serves utterances
     /// until this handle is dropped (which closes the utterance channel).
-    pub fn spawn<E: VoiceEngine + 'static>(mut engine: E) -> Self {
-        let (utt_tx, utt_rx) = unbounded::<Utterance>();
-        let (event_tx, event_rx) = unbounded::<VoiceEvent>();
+    pub fn spawn<E: VoiceEngine + 'static>(mut engine: E) -> Result<Self, String> {
+        // The realtime mic/VAD side must not accumulate stale speech behind a busy model.
+        // One queued utterance is enough: current generation + next turn. Barge-in sets the
+        // cancel flag first; if this slot is still full, the caller gets backpressure instead
+        // of silently growing latency.
+        let (utt_tx, utt_rx) = bounded::<Utterance>(UTTERANCE_QUEUE_CAP);
+        let (event_tx, event_rx) = bounded::<VoiceEvent>(EVENT_QUEUE_CAP);
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_worker = cancel.clone();
 
@@ -97,32 +137,52 @@ impl RealtimePipeline {
                     // A fresh turn clears any barge-in left set by the previous reply, so
                     // it cannot carry over and abort the new one before it starts.
                     cancel_worker.store(false, Ordering::SeqCst);
-                    let mut emit = |ev: VoiceEvent| {
-                        let _ = event_tx.send(ev);
+                    let mut event_backpressure = false;
+                    let responded = {
+                        let mut emit = |ev: VoiceEvent| {
+                            if event_backpressure {
+                                return;
+                            }
+                            if !try_send_event(&event_tx, ev, &cancel_worker) {
+                                event_backpressure = true;
+                            }
+                        };
+                        engine.respond(&utt, &cancel_worker, &mut emit)
                     };
-                    let terminal = match engine.respond(&utt, &cancel_worker, &mut emit) {
-                        Ok(true) => VoiceEvent::TurnComplete,
-                        Ok(false) => VoiceEvent::Interrupted,
-                        Err(e) => VoiceEvent::Error(e),
+                    let terminal = if event_backpressure {
+                        VoiceEvent::Error("voice event queue full or disconnected".into())
+                    } else {
+                        match responded {
+                            Ok(true) => VoiceEvent::TurnComplete,
+                            Ok(false) => VoiceEvent::Interrupted,
+                            Err(e) => VoiceEvent::Error(e),
+                        }
                     };
-                    if event_tx.send(terminal).is_err() {
+                    if !try_send_event(&event_tx, terminal, &cancel_worker) {
                         break; // consumer hung up — nothing left to serve.
                     }
                 }
             })
-            .expect("spawn lfm2-inference worker");
+            .map_err(|e| format!("spawn lfm2-inference worker failed: {e}"))?;
 
-        Self {
+        Ok(Self {
             utt_tx: Some(utt_tx),
             event_rx,
             cancel,
             worker: Some(worker),
-        }
+        })
     }
 
-    /// Hand the worker a new utterance. Returns `false` if the worker has stopped.
+    /// Hand the worker a new utterance. Returns `false` if the bounded queue is full or the
+    /// worker has stopped.
     pub fn submit(&self, utt: Utterance) -> bool {
-        self.utt_tx.as_ref().is_some_and(|tx| tx.send(utt).is_ok())
+        let Some(tx) = self.utt_tx.as_ref() else {
+            return false;
+        };
+        match tx.try_send(utt) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => false,
+        }
     }
 
     /// Request barge-in: abort the in-flight reply. The engine polls this and returns
@@ -135,6 +195,14 @@ impl RealtimePipeline {
     /// The stream of reply events; drain it in the consumer (UI / playback feeder).
     pub fn events(&self) -> &Receiver<VoiceEvent> {
         &self.event_rx
+    }
+
+    /// A cloneable producer/control handle for external audio transports.
+    pub fn handle(&self) -> Option<RealtimePipelineHandle> {
+        self.utt_tx.as_ref().map(|utt_tx| RealtimePipelineHandle {
+            utt_tx: utt_tx.clone(),
+            cancel: self.cancel.clone(),
+        })
     }
 }
 
@@ -268,6 +336,15 @@ impl VoiceEngine for Lfm2VoiceEngine {
         );
         let mut stream = mimi.streaming(1).map_err(s)?; // turn boundary (`mimi.streaming(1)`).
         let mimi_rate = mimi.sample_rate();
+        if utt.rate == 0 {
+            return Err("utterance sample rate must be non-zero".into());
+        }
+        if mimi_rate == 0 {
+            return Err("Mimi codec sample rate must be non-zero".into());
+        }
+        if self.out_rate == 0 {
+            return Err("output sample rate must be non-zero".into());
+        }
 
         let wave = Tensor::from_vec(utt.samples.clone(), (1, utt.samples.len()), &self.device)
             .map_err(s)?;
@@ -460,7 +537,7 @@ impl StreamingPcmResampler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::{atomic::AtomicUsize, mpsc};
     use std::time::Duration;
 
     fn utt(n: usize) -> Utterance {
@@ -519,7 +596,8 @@ mod tests {
         let turns = Arc::new(AtomicUsize::new(0));
         let pipe = RealtimePipeline::spawn(ScriptEngine {
             turns: turns.clone(),
-        });
+        })
+        .expect("spawn realtime pipeline");
         assert!(pipe.submit(utt(5)));
         assert_eq!(
             collect_turn(pipe.events()),
@@ -537,7 +615,8 @@ mod tests {
         let turns = Arc::new(AtomicUsize::new(0));
         let pipe = RealtimePipeline::spawn(ScriptEngine {
             turns: turns.clone(),
-        });
+        })
+        .expect("spawn realtime pipeline");
         for n in [3usize, 7] {
             assert!(pipe.submit(utt(n)));
             let evs = collect_turn(pipe.events());
@@ -548,6 +627,74 @@ mod tests {
             2,
             "the worker should serve every utterance"
         );
+    }
+
+    struct BlockingEngine {
+        entered: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+    }
+
+    impl VoiceEngine for BlockingEngine {
+        fn respond(
+            &mut self,
+            _utt: &Utterance,
+            _cancel: &AtomicBool,
+            _emit: &mut dyn FnMut(VoiceEvent),
+        ) -> Result<bool, String> {
+            let _ = self.entered.send(());
+            self.release
+                .recv_timeout(Duration::from_secs(5))
+                .map_err(|e| format!("release wait failed: {e}"))?;
+            Ok(true)
+        }
+    }
+
+    #[test]
+    fn utterance_queue_is_bounded_to_one_pending_turn() {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let pipe = RealtimePipeline::spawn(BlockingEngine {
+            entered: entered_tx,
+            release: release_rx,
+        })
+        .expect("spawn realtime pipeline");
+
+        assert!(pipe.submit(utt(1)));
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker should start first utterance");
+        assert!(pipe.submit(utt(2)), "one pending utterance is allowed");
+        assert!(
+            !pipe.submit(utt(3)),
+            "third utterance must hit backpressure instead of growing an unbounded queue"
+        );
+
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            pipe.events().recv_timeout(Duration::from_secs(5)).unwrap(),
+            VoiceEvent::TurnComplete
+        );
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            pipe.events().recv_timeout(Duration::from_secs(5)).unwrap(),
+            VoiceEvent::TurnComplete
+        );
+    }
+
+    #[test]
+    fn event_backpressure_sets_cancel_without_blocking() {
+        let (tx, rx) = bounded::<VoiceEvent>(1);
+        let cancel = AtomicBool::new(false);
+
+        assert!(try_send_event(&tx, VoiceEvent::Text("a".into()), &cancel));
+        assert!(!cancel.load(Ordering::SeqCst));
+        assert!(!try_send_event(&tx, VoiceEvent::Text("b".into()), &cancel));
+        assert!(cancel.load(Ordering::SeqCst));
+
+        drop(rx);
+        cancel.store(false, Ordering::SeqCst);
+        assert!(!try_send_event(&tx, VoiceEvent::Text("c".into()), &cancel));
+        assert!(cancel.load(Ordering::SeqCst));
     }
 
     /// Emits Audio forever until `cancel` is set — stands in for a long generation.
@@ -572,7 +719,7 @@ mod tests {
 
     #[test]
     fn interrupt_aborts_in_flight_turn() {
-        let pipe = RealtimePipeline::spawn(LoopEngine);
+        let pipe = RealtimePipeline::spawn(LoopEngine).expect("spawn realtime pipeline");
         assert!(pipe.submit(utt(1)));
         // Wait until generation is actually under way.
         let first = pipe
@@ -615,7 +762,7 @@ mod tests {
 
     #[test]
     fn engine_error_is_reported_and_worker_survives() {
-        let pipe = RealtimePipeline::spawn(ErrEngine);
+        let pipe = RealtimePipeline::spawn(ErrEngine).expect("spawn realtime pipeline");
         assert!(pipe.submit(utt(0)));
         assert_eq!(
             pipe.events().recv_timeout(Duration::from_secs(5)).unwrap(),
@@ -752,7 +899,8 @@ mod tests {
         {
             let pipe = RealtimePipeline::spawn(GuardedEngine {
                 _g: Guard(dropped.clone()),
-            });
+            })
+            .expect("spawn realtime pipeline");
             assert!(pipe.submit(utt(1)));
             let _ = collect_turn(pipe.events());
             // `pipe` drops here → channel closes → worker loop ends → engine (+ Guard) drop.

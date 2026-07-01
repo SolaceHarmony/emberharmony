@@ -73,12 +73,16 @@ async function cleanupSocket() {
 
 describe("VoiceWorker lifecycle (IPC shutdown, no LiveKit)", () => {
   beforeEach(async () => {
+    delete process.env["EMBERHARMONY_DESKTOP_NATIVE_VOICE"]
+    delete process.env["EMBERHARMONY_VOICE_RUNTIME_DIR"]
     await ensureFakeRuntime()
     await cleanupSocket()
   })
 
   afterEach(async () => {
     await VoiceWorker.stop()
+    delete process.env["EMBERHARMONY_DESKTOP_NATIVE_VOICE"]
+    delete process.env["EMBERHARMONY_VOICE_RUNTIME_DIR"]
     await cleanupSocket()
     await cleanupPidfiles()
   })
@@ -95,6 +99,25 @@ describe("VoiceWorker lifecycle (IPC shutdown, no LiveKit)", () => {
         expect(ok).toBe(true)
         expect(VoiceWorker.running()).toBe(true)
         await VoiceWorker.stop()
+        await Instance.dispose()
+      },
+    })
+  })
+
+  test("desktop native voice env prevents legacy worker spawn", async () => {
+    await using tmp = await tmpdir({})
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        process.env["EMBERHARMONY_VOICE_RUNTIME_DIR"] = FAKE_RUNTIME_DIR
+        process.env["EMBERHARMONY_DESKTOP_NATIVE_VOICE"] = "1"
+        const ok = await VoiceWorker.start("http://localhost:0", {
+          disabled: false,
+        } as any)
+        expect(ok).toBe(false)
+        expect(VoiceWorker.running()).toBe(false)
+        expect(existsSync(PIDFILE)).toBe(false)
+        expect((await listSocketNames()).length).toBe(0)
         await Instance.dispose()
       },
     })

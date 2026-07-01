@@ -12,11 +12,13 @@ import {
   defaultVoiceSettings,
   downloadVoiceModel,
   getHfTokenStatus,
+  getLiveKitCredentialsStatus,
   getVoiceSettingsState,
   getVoiceStatus,
   isDesktop,
   pickModelDir,
   setHfToken,
+  setLiveKitCredentials,
   setVoiceSettings,
   type DelegateSettings,
   type Lfm2Device,
@@ -34,17 +36,19 @@ export const SettingsVoice: Component = () => {
   const globalSDK = useGlobalSDK()
   const desktop = isDesktop()
 
-  // LiveKit settings live in the sidecar config + credentials store (the sidecar
-  // dispatches the LiveKit agent). The provider switch + the local LFM2 config
-  // live in the Tauri settings store, read natively by the Rust voice loop.
+  // The Tauri settings/keychain are the desktop voice source of truth. The
+  // legacy server config remains only for the non-desktop web voice provider.
   const [config, { refetch }] = createResource(() =>
-    globalSDK.client.voice
-      .config()
-      .then((x) => x.data)
-      .catch(() => undefined),
+    desktop
+      ? Promise.resolve(undefined)
+      : globalSDK.client.voice
+          .config()
+          .then((x) => x.data)
+          .catch(() => undefined),
   )
   const [tauriVoice, { refetch: refetchTauri, mutate: setTauriVoice }] = createResource(getVoiceSettingsState)
   const [voiceStatus, { refetch: refetchStatus }] = createResource(getVoiceStatus)
+  const [nativeLivekit, { refetch: refetchNativeLivekit }] = createResource(getLiveKitCredentialsStatus)
 
   const [url, setUrl] = createSignal<string | undefined>(undefined)
   const [apiKey, setApiKey] = createSignal("")
@@ -61,7 +65,7 @@ export const SettingsVoice: Component = () => {
   const [downloadMsg, setDownloadMsg] = createSignal<string | undefined>(undefined)
   const [hfTokenStored, { refetch: refetchToken }] = createResource(getHfTokenStatus)
 
-  const effectiveUrl = () => url() ?? config()?.url ?? ""
+  const effectiveUrl = () => url() ?? voice().livekit.url ?? (!desktop ? config()?.url : undefined) ?? ""
   const voice = (): VoiceSettings => tauriVoice()?.settings ?? defaultVoiceSettings
   const lfm2 = (): Lfm2Settings => voice().lfm2
   const modelDirValue = () => modelDirEdit() ?? lfm2().modelDir ?? ""
@@ -70,24 +74,31 @@ export const SettingsVoice: Component = () => {
     const m = hfModel()
     return m.startsWith("http") ? m : `https://huggingface.co/${m}`
   }
-  const livekitConfigured = () => Boolean(config()?.url || config()?.credentials?.livekit)
+  const livekitCredentialsStored = () => nativeLivekit()?.stored || (!desktop && config()?.credentials?.livekit)
+  const livekitConfigured = () => Boolean(effectiveUrl() || livekitCredentialsStored())
 
-  // Effective provider: an explicit pick wins; otherwise the stored provider, and
-  // as a migration nicety existing LiveKit users default to "livekit" so their
-  // config stays visible only before the native voice setting exists.
+  // Effective provider: an explicit pick wins; otherwise the stored provider. In
+  // web mode only, old LiveKit config can still surface the legacy provider.
   const provider = (): VoiceProvider => {
     const picked = override()
     if (picked) return picked
     const stored = tauriVoice()
     if (stored?.stored) return stored.settings.provider
-    if (livekitConfigured()) return "livekit"
+    if (!desktop && livekitConfigured()) return "livekit"
     return stored?.settings.provider ?? "off"
   }
 
   const enabled = () => provider() !== "off"
+  const rememberedProvider = (): Exclude<VoiceProvider, "off"> | undefined => {
+    const last = voice().lastProvider
+    if (last === "lfm2" || last === "livekit") return last
+    return undefined
+  }
   const defaultProvider = (): Exclude<VoiceProvider, "off"> => {
     const stored = voice().provider
     if (stored === "lfm2" || stored === "livekit") return stored
+    const remembered = rememberedProvider()
+    if (remembered) return remembered
     if (desktop) return "lfm2"
     return "livekit"
   }
@@ -101,7 +112,8 @@ export const SettingsVoice: Component = () => {
     const previous = provider()
     setOverride(next)
     const base = voice()
-    const settings = { ...base, provider: next }
+    const lastProvider = next === "off" ? (activeProvider() ?? base.lastProvider) : next
+    const settings = { ...base, provider: next, lastProvider }
     const ok = await setVoiceSettings(settings)
       .then(() => {
         setTauriVoice({ settings, stored: true })
@@ -125,30 +137,58 @@ export const SettingsVoice: Component = () => {
     const previous = provider()
     const next = checked ? activeProvider() : "off"
     if (!(await changeProvider(next))) return
-    if (previous === "livekit" && next !== "livekit") await update({ disabled: true })
-    if (next === "livekit") await update({ disabled: false })
+    if (!desktop && previous === "livekit" && next !== "livekit") await update({ disabled: true })
+    if (!desktop && next === "livekit") await update({ disabled: false })
   }
 
   async function selectProvider(next: Exclude<VoiceProvider, "off">) {
     const previous = provider()
+    if (!enabled()) {
+      const base = voice()
+      const settings = { ...base, lastProvider: next }
+      await setVoiceSettings(settings)
+        .then(() => setTauriVoice({ settings, stored: true }))
+        .catch((err) =>
+          showToast({
+            title: language.t("settings.voice.toast.saveFailed"),
+            description: err instanceof Error ? err.message : String(err),
+          }),
+        )
+      refetchTauri()
+      refetchStatus()
+      return
+    }
     if (!(await changeProvider(next))) return
-    if (previous === "livekit" && next !== "livekit") await update({ disabled: true })
-    if (next === "livekit") await update({ disabled: false })
+    if (!desktop && previous === "livekit" && next !== "livekit") await update({ disabled: true })
+    if (!desktop && next === "livekit") await update({ disabled: false })
   }
 
   async function updateLfm2(patch: Partial<Lfm2Settings>) {
     const base = voice()
     const settings = { ...base, lfm2: { ...base.lfm2, ...patch } }
-    await setVoiceSettings(settings)
-      .then(() => setTauriVoice({ settings, stored: true }))
-      .catch((err) =>
+    const ok = await setVoiceSettings(settings)
+      .then(() => {
+        setTauriVoice({ settings, stored: true })
+        return true
+      })
+      .catch((err) => {
         showToast({
           title: language.t("settings.voice.toast.saveFailed"),
           description: err instanceof Error ? err.message : String(err),
-        }),
-      )
+        })
+        return false
+      })
     refetchTauri()
     refetchStatus()
+    return ok
+  }
+
+  async function updateLiveKit(patch: Partial<VoiceSettings["livekit"]>) {
+    const base = voice()
+    const settings = { ...base, livekit: { ...base.livekit, ...patch } }
+    await setVoiceSettings(settings).then(() => setTauriVoice({ settings, stored: true }))
+    await refetchTauri()
+    await refetchStatus()
   }
 
   async function saveToken() {
@@ -201,11 +241,14 @@ export const SettingsVoice: Component = () => {
             )
             break
           case "done":
-            setDownloading(false)
-            setDownloadMsg(undefined)
-            setModelDirEdit(event.dir)
-            void updateLfm2({ modelDir: event.dir })
-            showToast({ title: language.t("settings.voice.download.done"), description: event.dir })
+            void (async () => {
+              setModelDirEdit(event.dir)
+              const saved = await updateLfm2({ modelDir: event.dir })
+              setDownloading(false)
+              setDownloadMsg(undefined)
+              if (!saved) return
+              showToast({ title: language.t("settings.voice.download.done"), description: event.dir })
+            })()
             break
           case "error":
             setDownloading(false)
@@ -228,6 +271,10 @@ export const SettingsVoice: Component = () => {
     updateLfm2({ delegate: { ...lfm2().delegate, ...patch } })
 
   async function update(patch: Record<string, unknown>) {
+    if (desktop) {
+      await updateLiveKit(patch as Partial<VoiceSettings["livekit"]>)
+      return
+    }
     await globalSDK.client.voice
       .configUpdate({ voiceConfig: patch })
       .then(() => refetch())
@@ -251,21 +298,28 @@ export const SettingsVoice: Component = () => {
     }
     setSaving(true)
     try {
-      if (url() !== undefined && url() !== config()?.url) {
-        await globalSDK.client.voice.configUpdate({ voiceConfig: { livekit: { url: url() } } })
+      const nextUrl = effectiveUrl().trim()
+      if (url() !== undefined || nextUrl !== (voice().livekit.url ?? "").trim()) {
+        await updateLiveKit({ url: nextUrl || undefined })
       }
       if (key && secret) {
-        await globalSDK.client.auth.set({
-          providerID: "livekit",
-          auth: { type: "api", key, secret },
-        })
+        await setLiveKitCredentials(key, secret)
         setApiKey("")
         setApiSecret("")
-        // the auth route only stores credentials; an empty voice config patch
-        // nudges serve to (re)start the agent worker with them
-        await globalSDK.client.voice.configUpdate({ voiceConfig: {} })
+        if (!desktop) {
+          await globalSDK.client.auth.set({
+            providerID: "livekit",
+            auth: { type: "api", key, secret },
+          })
+          await globalSDK.client.voice.configUpdate({ voiceConfig: {} })
+        }
       }
-      await refetch()
+      if (!desktop && url() !== undefined && url() !== config()?.url) {
+        await globalSDK.client.voice.configUpdate({ voiceConfig: { livekit: { url: nextUrl } } })
+      }
+      await refetchNativeLivekit()
+      await refetchStatus()
+      if (!desktop) await refetch()
       showToast({ title: language.t("settings.voice.toast.saved") })
     } catch (err) {
       showToast({
@@ -280,6 +334,18 @@ export const SettingsVoice: Component = () => {
   async function testConnection() {
     setTesting(true)
     try {
+      if (desktop) {
+        const status = await getVoiceStatus()
+        if (status.provider === "livekit" && status.ready) {
+          showToast({ title: language.t("settings.voice.toast.testOk"), description: status.detail })
+          return
+        }
+        showToast({
+          title: language.t("settings.voice.toast.testFailed"),
+          description: status.detail || language.t("settings.voice.toast.testUnavailable"),
+        })
+        return
+      }
       const status = await globalSDK.client.voice.status().then((x) => x.data)
       if (status?.available) {
         showToast({ title: language.t("settings.voice.toast.testOk"), description: status.url ?? undefined })
@@ -313,6 +379,9 @@ export const SettingsVoice: Component = () => {
     { id: "livekit", label: language.t("settings.voice.provider.livekit") },
   ]
   const currentProvider = () => providerOptions().find((o) => o.id === activeProvider())
+  const showNativeModel = () =>
+    enabled() && (activeProvider() === "lfm2" || (desktop && activeProvider() === "livekit"))
+  const showLegacyLiveKitModels = () => !desktop && enabled() && activeProvider() === "livekit"
 
   type DeviceOption = { id: Lfm2Device; label: string }
   const deviceOptions: DeviceOption[] = [
@@ -375,8 +444,8 @@ export const SettingsVoice: Component = () => {
           <div class="text-12-regular text-text-weak px-1">{language.t("settings.voice.off.hint")}</div>
         </Show>
 
-        {/* ---- Local LFM2-Audio provider (native, Tauri store) ---- */}
-        <Show when={enabled() && activeProvider() === "lfm2"}>
+        {/* ---- Local LFM2-Audio model/delegation (native, Tauri store) ---- */}
+        <Show when={showNativeModel()}>
           <div class="flex flex-col gap-1">
             <h3 class="text-14-medium text-text-strong pb-2">{language.t("settings.voice.section.lfm2")}</h3>
             <Show when={voiceStatus()?.provider === "lfm2" ? voiceStatus() : undefined}>
@@ -421,9 +490,7 @@ export const SettingsVoice: Component = () => {
                   {language.t("settings.voice.action.saveToken")}
                 </Button>
                 <Show when={hfTokenStored()}>
-                  <span class="text-12-regular text-text-weak">
-                    {language.t("settings.voice.row.hfToken.stored")}
-                  </span>
+                  <span class="text-12-regular text-text-weak">{language.t("settings.voice.row.hfToken.stored")}</span>
                 </Show>
               </div>
               <div class="flex items-end gap-2">
@@ -540,10 +607,17 @@ export const SettingsVoice: Component = () => {
           </Show>
         </Show>
 
-        {/* ---- LiveKit provider (sidecar config + credentials store) ---- */}
+        {/* ---- LiveKit provider (native Tauri config + keychain credentials) ---- */}
         <Show when={enabled() && activeProvider() === "livekit"}>
           <div class="flex flex-col gap-1">
             <h3 class="text-14-medium text-text-strong pb-2">{language.t("settings.voice.section.connection")}</h3>
+            <Show when={voiceStatus()?.provider === "livekit" ? voiceStatus() : undefined}>
+              {(s) => (
+                <div class={`text-12-regular pb-2 px-1 ${s().ready ? "text-text-weak" : "text-text-strong"}`}>
+                  {s().detail}
+                </div>
+              )}
+            </Show>
             <div class="bg-surface-raised-base px-4 py-3 rounded-lg flex flex-col gap-3">
               <TextField
                 label={language.t("settings.voice.row.url.title")}
@@ -555,7 +629,7 @@ export const SettingsVoice: Component = () => {
               <TextField
                 label={language.t("settings.voice.row.apiKey.title")}
                 type="password"
-                placeholder={config()?.credentials.livekit ? "••••••••" : "API…"}
+                placeholder={livekitCredentialsStored() ? "••••••••" : "API…"}
                 value={apiKey()}
                 onChange={setApiKey}
               />
@@ -563,7 +637,7 @@ export const SettingsVoice: Component = () => {
                 label={language.t("settings.voice.row.apiSecret.title")}
                 description={language.t("settings.voice.row.credentials.description")}
                 type="password"
-                placeholder={config()?.credentials.livekit ? "••••••••" : ""}
+                placeholder={livekitCredentialsStored() ? "••••••••" : ""}
                 value={apiSecret()}
                 onChange={setApiSecret}
               />
@@ -578,61 +652,63 @@ export const SettingsVoice: Component = () => {
             </div>
           </div>
 
-          <div class="flex flex-col gap-1">
-            <h3 class="text-14-medium text-text-strong pb-2">{language.t("settings.voice.section.models")}</h3>
-            <div class="bg-surface-raised-base px-4 rounded-lg">
-              <SettingsRow
-                title={language.t("settings.voice.row.stt.title")}
-                description={language.t("settings.voice.row.stt.description")}
-              >
-                <Select
-                  options={sttOptions()}
-                  current={currentStt()}
-                  value={(o) => o.id}
-                  label={(o) => `${o.provider} ${o.name}`}
-                  onSelect={(option) => option && update({ stt: modelValue(option) })}
-                  variant="secondary"
-                  size="small"
-                  triggerVariant="settings"
-                />
-              </SettingsRow>
-              <SettingsRow
-                title={language.t("settings.voice.row.tts.title")}
-                description={language.t("settings.voice.row.tts.description")}
-              >
-                <Select
-                  options={ttsOptions()}
-                  current={currentTts()}
-                  value={(o) => o.id}
-                  label={(o) => `${o.provider} ${o.name}`}
-                  onSelect={(option) => option && update({ tts: modelValue(option) })}
-                  variant="secondary"
-                  size="small"
-                  triggerVariant="settings"
-                />
-              </SettingsRow>
-              <SettingsRow
-                title={language.t("settings.voice.row.intent.title")}
-                description={language.t("settings.voice.row.intent.description")}
-              >
-                <Show when={config()}>
-                  {(cfg) => (
-                    <TextField
-                      hideLabel
-                      label={language.t("settings.voice.row.intent.title")}
-                      defaultValue={cfg().intent}
-                      onFocusOut={(e: FocusEvent) => {
-                        const value = (e.currentTarget as HTMLInputElement).value.trim()
-                        if (value && value !== cfg().intent) update({ intent: value })
-                      }}
-                    />
-                  )}
-                </Show>
-              </SettingsRow>
+          <Show when={showLegacyLiveKitModels()}>
+            <div class="flex flex-col gap-1">
+              <h3 class="text-14-medium text-text-strong pb-2">{language.t("settings.voice.section.models")}</h3>
+              <div class="bg-surface-raised-base px-4 rounded-lg">
+                <SettingsRow
+                  title={language.t("settings.voice.row.stt.title")}
+                  description={language.t("settings.voice.row.stt.description")}
+                >
+                  <Select
+                    options={sttOptions()}
+                    current={currentStt()}
+                    value={(o) => o.id}
+                    label={(o) => `${o.provider} ${o.name}`}
+                    onSelect={(option) => option && update({ stt: modelValue(option) })}
+                    variant="secondary"
+                    size="small"
+                    triggerVariant="settings"
+                  />
+                </SettingsRow>
+                <SettingsRow
+                  title={language.t("settings.voice.row.tts.title")}
+                  description={language.t("settings.voice.row.tts.description")}
+                >
+                  <Select
+                    options={ttsOptions()}
+                    current={currentTts()}
+                    value={(o) => o.id}
+                    label={(o) => `${o.provider} ${o.name}`}
+                    onSelect={(option) => option && update({ tts: modelValue(option) })}
+                    variant="secondary"
+                    size="small"
+                    triggerVariant="settings"
+                  />
+                </SettingsRow>
+                <SettingsRow
+                  title={language.t("settings.voice.row.intent.title")}
+                  description={language.t("settings.voice.row.intent.description")}
+                >
+                  <Show when={config()}>
+                    {(cfg) => (
+                      <TextField
+                        hideLabel
+                        label={language.t("settings.voice.row.intent.title")}
+                        defaultValue={cfg().intent}
+                        onFocusOut={(e: FocusEvent) => {
+                          const value = (e.currentTarget as HTMLInputElement).value.trim()
+                          if (value && value !== cfg().intent) update({ intent: value })
+                        }}
+                      />
+                    )}
+                  </Show>
+                </SettingsRow>
+              </div>
             </div>
-          </div>
+          </Show>
 
-          <Show when={config() && !config()!.credentials.livekit && !config()!.available}>
+          <Show when={config() && !livekitCredentialsStored() && !config()!.available}>
             <div class="text-12-regular text-text-weak px-1">{language.t("settings.voice.hint.credentials")}</div>
           </Show>
         </Show>

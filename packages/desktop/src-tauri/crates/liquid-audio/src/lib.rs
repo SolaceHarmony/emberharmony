@@ -33,7 +33,9 @@ pub use detokenizer::LFM2AudioDetokenizer;
 pub use loader::{from_pretrained, from_pretrained_hub};
 pub use model::lfm2_audio::{GenParams, GenToken, LFM2AudioModel};
 pub use processor::{ChatState, LFM2AudioProcessor};
-pub use realtime::{Lfm2VoiceEngine, RealtimePipeline, Utterance, VoiceEngine, VoiceEvent};
+pub use realtime::{
+    Lfm2VoiceEngine, RealtimePipeline, RealtimePipelineHandle, Utterance, VoiceEngine, VoiceEvent,
+};
 pub use threads::{configure_intraop_threads, intraop_default_num_threads};
 pub use trainer::{Trainer, TrainerConfig};
 pub use utils::{get_model_dir, LFMModality};
