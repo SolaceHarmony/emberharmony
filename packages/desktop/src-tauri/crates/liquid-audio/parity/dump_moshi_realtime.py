@@ -40,6 +40,13 @@ from liquid_audio.moshi.run_inference import get_condition_tensors  # noqa: E402
 
 FNV_OFFSET = 0xCBF29CE484222325
 FNV_PRIME = 0x100000001B3
+GENERATION_DEFAULTS = {
+    "use_sampling": True,
+    "temp": 0.8,
+    "temp_text": 0.7,
+    "top_k": 250,
+    "top_k_text": 25,
+}
 
 
 def seed_all(seed: int) -> None:
@@ -130,6 +137,23 @@ def resolve_torch_dtype(name: str, checkpoint: Path) -> tuple[str, torch.dtype]:
     if dtype == "float32":
         return dtype, torch.float32
     raise SystemExit(f"unsupported Moshi trace dtype: {dtype}")
+
+
+def effective_generation_config(lm_config: dict, cfg_coef: float, greedy: bool) -> dict:
+    config = dict(GENERATION_DEFAULTS)
+    for key in GENERATION_DEFAULTS:
+        if key in lm_config:
+            config[key] = lm_config[key]
+    if greedy:
+        config["use_sampling"] = False
+    return {
+        "use_sampling": bool(config["use_sampling"]),
+        "temp": float(config["temp"]),
+        "temp_text": float(config["temp_text"]),
+        "top_k": int(config["top_k"]),
+        "top_k_text": int(config["top_k_text"]),
+        "cfg_coef": float(cfg_coef),
+    }
 
 
 def resolve_checkpoint(model: str) -> CheckpointInfo:
@@ -438,6 +462,7 @@ def main() -> None:
     text = info.get_text_tokenizer()
     lm, layout = load_moshi_for_trace(info, args.device, dtype, layout)
     frame_size = int(mimi.sample_rate / mimi.frame_rate)
+    generation = effective_generation_config(info.lm_gen_config, args.cfg_coef, args.greedy)
     trace = {
         "source": "python",
         "model": args.model,
@@ -452,6 +477,7 @@ def main() -> None:
         "seed": int(args.seed),
         "dtype": dtype_name,
         "cfg_coef": float(args.cfg_coef),
+        "generation": generation,
         "sample_rate": int(mimi.sample_rate),
         "frame_size": int(frame_size),
         "warmup_frames": int(args.warmup_frames),

@@ -12,7 +12,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from dump_moshi_realtime import checkpoint_floating_dtype, resolve_checkpoint
+from dump_moshi_realtime import (
+    checkpoint_floating_dtype,
+    effective_generation_config,
+    resolve_checkpoint,
+)
 
 
 def write_safetensor_header(path: Path, header: dict) -> None:
@@ -138,6 +142,42 @@ class MoshiRealtimeConfigTest(unittest.TestCase):
 
             with self.assertRaises(SystemExit):
                 checkpoint_floating_dtype(path)
+
+    def test_generation_config_defaults_match_lmgen(self):
+        self.assertEqual(
+            effective_generation_config({}, 1.0, False),
+            {
+                "use_sampling": True,
+                "temp": 0.8,
+                "temp_text": 0.7,
+                "top_k": 250,
+                "top_k_text": 25,
+                "cfg_coef": 1.0,
+            },
+        )
+
+    def test_generation_config_applies_overrides_and_greedy(self):
+        self.assertEqual(
+            effective_generation_config(
+                {
+                    "use_sampling": True,
+                    "temp": 0.6,
+                    "temp_text": 0.5,
+                    "top_k": 40,
+                    "top_k_text": 7,
+                },
+                1.0,
+                True,
+            ),
+            {
+                "use_sampling": False,
+                "temp": 0.6,
+                "temp_text": 0.5,
+                "top_k": 40,
+                "top_k_text": 7,
+                "cfg_coef": 1.0,
+            },
+        )
 
 
 if __name__ == "__main__":

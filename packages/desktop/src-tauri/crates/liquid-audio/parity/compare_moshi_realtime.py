@@ -86,6 +86,14 @@ def normalize_dtype(dtype: object) -> str | None:
     return aliases.get(name, name)
 
 
+def assert_same_generation(py: dict, rs: dict) -> None:
+    assert py.get("generation") == rs.get("generation"), {
+        "python": py.get("generation"),
+        "rust": rs.get("generation"),
+        "message": "Moshi traces must use the same resolved LMGen sampling config",
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("python_trace", type=Path)
@@ -126,6 +134,7 @@ def main() -> None:
         "rust": rs.get("cfg_coef"),
         "message": "Rust Moshi parity only covers the unconditioned cfg_coef=1 path",
     }
+    assert_same_generation(py, rs)
     assert py["sample_rate"] == rs["sample_rate"], (py["sample_rate"], rs["sample_rate"])
     assert py["frame_size"] == rs["frame_size"], (py["frame_size"], rs["frame_size"])
     assert py.get("warmup_frames") == rs.get("warmup_frames"), (

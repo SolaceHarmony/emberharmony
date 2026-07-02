@@ -141,8 +141,6 @@ fn main() -> Res<()> {
     let mut params = files.params.with_seed(seed.unwrap_or(files.params.seed));
     if greedy {
         params.use_sampling = false;
-        params.audio_temperature = 0.0;
-        params.text_temperature = 0.0;
     }
     let dtype = safetensors_floating_dtype(&files.moshi_weights)?;
     let dtype_name = format!("{dtype:?}").to_lowercase();
@@ -214,6 +212,14 @@ fn main() -> Res<()> {
         "seed": params.seed,
         "dtype": dtype_name,
         "cfg_coef": 1.0,
+        "generation": {
+            "use_sampling": params.use_sampling,
+            "temp": params.audio_temperature,
+            "temp_text": params.text_temperature,
+            "top_k": params.audio_top_k,
+            "top_k_text": params.text_top_k,
+            "cfg_coef": 1.0,
+        },
         "sample_rate": realtime.sample_rate(),
         "frame_size": realtime.frame_size(),
         "warmup_frames": warmup_frames,
