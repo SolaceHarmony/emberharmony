@@ -73,7 +73,7 @@ pub enum VoiceEvent {
     Audio(Vec<f32>),
     /// The reply for the current utterance finished normally (`chat.py`'s `q.put(None)`).
     TurnComplete,
-    /// The reply was cut short by [`RealtimePipeline::interrupt`] (barge-in).
+    /// The reply/output stream was cut short by an explicit interrupt.
     Interrupted,
     /// The engine errored on this turn. The worker stays alive for the next utterance.
     Error(String),
@@ -111,8 +111,9 @@ pub trait VoiceEngine: Send {
         Err("voice engine does not support realtime PCM frames".into())
     }
 
-    /// Flush stream-local output state after a UI stop/interrupt. Model context reset is
-    /// engine-specific; the default is only to acknowledge the interrupt.
+    /// Handle a hard pipeline interrupt/reset. Turn pipelines call this when aborting a
+    /// generated turn; frame pipelines deliberately skip it for soft output interrupts
+    /// so Moshi keeps its Mimi/LM stream state alive. The default only acknowledges it.
     fn interrupt_stream(&mut self) -> Result<(), String> {
         Ok(())
     }
@@ -428,6 +429,10 @@ impl RealtimeFramePipelineHandle {
         self.try_submit_frame(pcm).is_ok()
     }
 
+    /// Soft-interrupt frame output without resetting the engine stream. This advances
+    /// the epoch so already-queued PCM frames are dropped, and it flips `cancel` so
+    /// any in-flight `respond_frame` stops emitting promptly. Moshi's Mimi/LM state
+    /// is preserved; a full session stop tears down the whole worker instead.
     pub fn interrupt(&self) {
         let epoch = self.epoch.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
         self.cancel.store(true, Ordering::SeqCst);
@@ -467,18 +472,10 @@ impl RealtimeFramePipeline {
                                 continue;
                             }
                             current_epoch = epoch;
-                            cancel_worker.store(true, Ordering::SeqCst);
-                            let interrupted = engine.interrupt_stream().is_ok();
                             cancel_worker.store(false, Ordering::SeqCst);
                             active = false;
                             idle_frames = 0;
-                            if interrupted
-                                && !try_send_event(
-                                    &event_tx,
-                                    VoiceEvent::Interrupted,
-                                    &cancel_worker,
-                                )
-                            {
+                            if !try_send_event(&event_tx, VoiceEvent::Interrupted, &cancel_worker) {
                                 break;
                             }
                         }
@@ -487,30 +484,15 @@ impl RealtimeFramePipeline {
                             if epoch < latest_epoch {
                                 if latest_epoch > current_epoch {
                                     current_epoch = latest_epoch;
-                                    cancel_worker.store(true, Ordering::SeqCst);
-                                    let reset = engine.interrupt_stream();
                                     cancel_worker.store(false, Ordering::SeqCst);
                                     active = false;
                                     idle_frames = 0;
-                                    match reset {
-                                        Ok(()) => {
-                                            if !try_send_event(
-                                                &event_tx,
-                                                VoiceEvent::Interrupted,
-                                                &cancel_worker,
-                                            ) {
-                                                break;
-                                            }
-                                        }
-                                        Err(error) => {
-                                            if !try_send_event(
-                                                &event_tx,
-                                                VoiceEvent::Error(error),
-                                                &cancel_worker,
-                                            ) {
-                                                break;
-                                            }
-                                        }
+                                    if !try_send_event(
+                                        &event_tx,
+                                        VoiceEvent::Interrupted,
+                                        &cancel_worker,
+                                    ) {
+                                        break;
                                     }
                                 }
                                 continue;
@@ -519,18 +501,7 @@ impl RealtimeFramePipeline {
                                 current_epoch = epoch;
                                 active = false;
                                 idle_frames = 0;
-                                if engine.interrupt_stream().is_err() {
-                                    if !try_send_event(
-                                        &event_tx,
-                                        VoiceEvent::Error(
-                                            "failed to interrupt voice stream".into(),
-                                        ),
-                                        &cancel_worker,
-                                    ) {
-                                        break;
-                                    }
-                                    continue;
-                                }
+                                cancel_worker.store(false, Ordering::SeqCst);
                                 let _ = try_send_event(
                                     &event_tx,
                                     VoiceEvent::Interrupted,
@@ -584,6 +555,11 @@ impl RealtimeFramePipeline {
                                     }
                                 }
                                 Ok(false) => {
+                                    let latest_epoch = epoch_worker.load(Ordering::Acquire);
+                                    if latest_epoch > current_epoch {
+                                        current_epoch = latest_epoch;
+                                    }
+                                    cancel_worker.store(false, Ordering::SeqCst);
                                     active = false;
                                     idle_frames = 0;
                                     if !try_send_event(
@@ -645,6 +621,8 @@ impl RealtimeFramePipeline {
         self.try_submit_frame(pcm).is_ok()
     }
 
+    /// Soft-interrupt frame output without resetting the engine stream. See
+    /// [`RealtimeFramePipelineHandle::interrupt`].
     pub fn interrupt(&self) {
         let epoch = self.epoch.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
         self.cancel.store(true, Ordering::SeqCst);
@@ -1312,7 +1290,7 @@ mod tests {
     }
 
     #[test]
-    fn frame_pipeline_interrupt_resets_even_when_command_queue_is_full() {
+    fn frame_pipeline_interrupt_drops_stale_frames_without_reset() {
         let calls = Arc::new(AtomicUsize::new(0));
         let resets = Arc::new(AtomicUsize::new(0));
         let (entered_tx, entered_rx) = mpsc::channel();
@@ -1351,11 +1329,14 @@ mod tests {
             }
         }
 
-        assert!(saw_interrupted, "full queues must not drop stream reset");
+        assert!(
+            saw_interrupted,
+            "full queues must not drop interrupt acknowledgement"
+        );
         assert_eq!(
             resets.load(Ordering::SeqCst),
-            1,
-            "the stale queued frame should trigger the missed interrupt reset"
+            0,
+            "interrupting frame output must not reset Mimi/LM stream state"
         );
         assert_eq!(
             calls.load(Ordering::SeqCst),
