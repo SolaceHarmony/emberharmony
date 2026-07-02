@@ -412,6 +412,7 @@ def main() -> None:
         "elapsed_s": 0.0,
         "text_tokens": [],
         "text": "",
+        "audio_tokens": [],
         "audio_chunks": [],
     }
     if args.load_only:
@@ -437,6 +438,7 @@ def main() -> None:
     all_pcm = np.asarray(in_pcms, dtype=np.float32)
 
     text_tokens: list[int] = []
+    audio_tokens: list[list[int]] = []
     audio_chunks: list[dict[str, float | int]] = []
     skip_frames = 1
     frames = 0
@@ -456,6 +458,7 @@ def main() -> None:
                 tokens = lm_gen.step(codes[:, :, c : c + 1])
                 if tokens is None:
                     continue
+                audio_tokens.append([int(v) for v in tokens[0, 1:, 0].detach().cpu().tolist()])
                 main_pcm = mimi.decode(tokens[:, 1:]).detach().cpu()[0, 0].numpy()
                 token = int(tokens[0, 0, 0].item())
                 if token not in (0, 3):
@@ -474,6 +477,7 @@ def main() -> None:
     trace["elapsed_s"] = time.time() - start
     trace["text_tokens"] = text_tokens
     trace["text"] = text.decode(text_tokens) if text_tokens else ""
+    trace["audio_tokens"] = audio_tokens
     trace["audio_chunks"] = audio_chunks
     args.out.write_text(json.dumps(trace, indent=2))
 

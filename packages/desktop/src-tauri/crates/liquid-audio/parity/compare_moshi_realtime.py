@@ -87,6 +87,10 @@ def main() -> None:
         "python": py["text_tokens"],
         "rust": rs["text_tokens"],
     }
+    assert py["audio_tokens"] == rs["audio_tokens"], {
+        "python": py["audio_tokens"],
+        "rust": rs["audio_tokens"],
+    }
 
     py_audio = py["audio_chunks"]
     rs_audio = rs["audio_chunks"]

@@ -1018,6 +1018,7 @@ impl MoshiVoiceEngine {
                         emit(VoiceEvent::Text(text));
                     }
                 }
+                RealtimeMoshiEvent::AudioTokenFrame(_) => {}
                 RealtimeMoshiEvent::Audio { pcm, rate } => {
                     let pcm = if rate == self.out_rate {
                         pcm

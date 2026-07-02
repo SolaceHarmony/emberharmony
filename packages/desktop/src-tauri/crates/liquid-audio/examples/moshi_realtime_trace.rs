@@ -162,6 +162,7 @@ fn main() -> Res<()> {
     }
 
     let mut text = Vec::<u32>::new();
+    let mut audio_tokens = Vec::<Vec<u32>>::new();
     let mut audio = Vec::<serde_json::Value>::new();
     let mut frames = 0usize;
     for chunk in samples
@@ -175,6 +176,7 @@ fn main() -> Res<()> {
         for event in realtime.step_pcm_frame(chunk)? {
             match event {
                 RealtimeMoshiEvent::TextToken(token) => text.push(token),
+                RealtimeMoshiEvent::AudioTokenFrame(codes) => audio_tokens.push(codes),
                 RealtimeMoshiEvent::Audio { pcm, rate } => audio.push(serde_json::json!({
                     "samples": pcm.len(),
                     "rate": rate,
@@ -201,6 +203,7 @@ fn main() -> Res<()> {
         "warmup_frames": 4,
         "input_frames": frames,
         "text_tokens": text,
+        "audio_tokens": audio_tokens,
         "audio_chunks": audio,
     });
     std::fs::write(out, serde_json::to_vec_pretty(&trace)?)?;

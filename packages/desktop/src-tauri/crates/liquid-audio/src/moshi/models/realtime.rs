@@ -103,6 +103,7 @@ impl RealtimeMoshiParams {
 #[derive(Debug, Clone, PartialEq)]
 pub enum RealtimeMoshiEvent {
     TextToken(u32),
+    AudioTokenFrame(Vec<u32>),
     Audio { pcm: Vec<f32>, rate: u32 },
 }
 
@@ -255,9 +256,11 @@ impl RealtimeMoshi {
             let Some(audio) = self.state.last_audio_tokens() else {
                 continue;
             };
-            let generated = &audio[..self.generated_codebooks.min(audio.len())];
-            let frame =
-                Tensor::from_vec(generated.to_vec(), (1, generated.len(), 1), &self.device)?;
+            let generated = audio[..self.generated_codebooks.min(audio.len())].to_vec();
+            if emit_events {
+                events.push(RealtimeMoshiEvent::AudioTokenFrame(generated.clone()));
+            }
+            let frame = Tensor::from_vec(generated.clone(), (1, generated.len(), 1), &self.device)?;
             let out = self.mimi.decode_step(
                 &::moshi::StreamTensor::from_tensor(frame),
                 &::moshi::StreamMask::empty(),
