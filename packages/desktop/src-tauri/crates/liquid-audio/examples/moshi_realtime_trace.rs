@@ -202,6 +202,7 @@ fn main() -> Res<()> {
         "source": "rust",
         "mode": "step",
         "model_dir": model.display().to_string(),
+        "model_type": files.model_type,
         "checkpoint": {
             "moshi": file_fingerprint(&files.moshi_weights)?,
             "mimi": file_fingerprint(&files.mimi_weights)?,

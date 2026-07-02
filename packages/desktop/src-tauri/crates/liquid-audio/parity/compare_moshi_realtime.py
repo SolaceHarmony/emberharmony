@@ -57,6 +57,20 @@ def assert_step_trace(name: str, trace: dict) -> None:
     }
 
 
+def assert_same_model_type(py: dict, rs: dict) -> None:
+    py_model_type = py.get("model_type")
+    rs_model_type = rs.get("model_type")
+    assert py_model_type == rs_model_type, {
+        "python": py_model_type,
+        "rust": rs_model_type,
+        "message": "Moshi realtime traces must use the same model_type",
+    }
+    assert py_model_type == "moshi", {
+        "model_type": py_model_type,
+        "message": "Rust realtime Moshi parity only covers plain moshi checkpoints",
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("python_trace", type=Path)
@@ -74,6 +88,7 @@ def main() -> None:
 
     assert_step_trace("python", py)
     assert_step_trace("rust", rs)
+    assert_same_model_type(py, rs)
     if not args.allow_converted_checkpoints:
         assert_same_checkpoints(py, rs)
     assert py.get("greedy") == rs.get("greedy"), {
