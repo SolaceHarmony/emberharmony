@@ -104,6 +104,34 @@ def moshi_weight_layout(path: Path) -> str:
     return "unknown-safetensors"
 
 
+def checkpoint_floating_dtype(path: Path) -> str:
+    if path.suffix not in (".safetensors", ".sft", ".sfts"):
+        return "bfloat16"
+    aliases = {
+        "BF16": "bfloat16",
+        "F32": "float32",
+    }
+    dtypes = {
+        aliases[value["dtype"]]
+        for value in safetensors_header(path).values()
+        if value.get("dtype") in aliases
+    }
+    if len(dtypes) != 1:
+        raise SystemExit(
+            f"selected Moshi checkpoint has unsupported or mixed floating dtypes: {sorted(dtypes)}"
+        )
+    return next(iter(dtypes))
+
+
+def resolve_torch_dtype(name: str, checkpoint: Path) -> tuple[str, torch.dtype]:
+    dtype = checkpoint_floating_dtype(checkpoint) if name == "auto" else name
+    if dtype == "bfloat16":
+        return dtype, torch.bfloat16
+    if dtype == "float32":
+        return dtype, torch.float32
+    raise SystemExit(f"unsupported Moshi trace dtype: {dtype}")
+
+
 def resolve_checkpoint(model: str) -> CheckpointInfo:
     path = Path(model)
     if not path.is_dir():
@@ -340,7 +368,7 @@ def rms(values: np.ndarray) -> float:
     return float(np.sqrt(np.mean(np.square(values, dtype=np.float64))))
 
 
-def write_metadata_trace(args, info: CheckpointInfo, layout: str) -> None:
+def write_metadata_trace(args, info: CheckpointInfo, layout: str, dtype_name: str) -> None:
     header = safetensors_header(Path(info.moshi_weights)) if layout != "torch-pickle" else {}
     remapped = remap_candle_moshi_header(header) if layout == "candle" else header
     trace = {
@@ -348,7 +376,7 @@ def write_metadata_trace(args, info: CheckpointInfo, layout: str) -> None:
         "mode": "verify-remap-only",
         "model": args.model,
         "model_type": info.model_type,
-        "dtype": args.dtype,
+        "dtype": dtype_name,
         "checkpoint": {
             "moshi": quick_file_info(Path(info.moshi_weights)) | {"layout": layout},
             "mimi": quick_file_info(Path(info.mimi_weights)),
@@ -369,7 +397,7 @@ def main() -> None:
     parser.add_argument("wav", type=Path, help="input WAV; resampled to Mimi sample rate")
     parser.add_argument("out", type=Path, help="output JSON trace")
     parser.add_argument("--device", default="cpu")
-    parser.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float32"])
+    parser.add_argument("--dtype", default="auto", choices=["auto", "bfloat16", "float32"])
     parser.add_argument("--cfg-coef", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=42424242)
     parser.add_argument("--frames", type=int, default=None)
@@ -394,8 +422,8 @@ def main() -> None:
 
     torch.set_grad_enabled(False)
     seed_all(args.seed)
-    dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float32
     info = resolve_checkpoint(args.model)
+    dtype_name, dtype = resolve_torch_dtype(args.dtype, Path(info.moshi_weights))
     layout = moshi_weight_layout(Path(info.moshi_weights))
     if layout == "unknown-safetensors":
         raise SystemExit(
@@ -403,7 +431,7 @@ def main() -> None:
             "upstream Python Moshi layout; refusing to dump a misleading trace."
         )
     if args.verify_remap_only:
-        write_metadata_trace(args, info, layout)
+        write_metadata_trace(args, info, layout, dtype_name)
         return
 
     mimi = info.get_mimi(args.device)
@@ -422,7 +450,7 @@ def main() -> None:
         "input": str(args.wav),
         "greedy": bool(args.greedy),
         "seed": int(args.seed),
-        "dtype": args.dtype,
+        "dtype": dtype_name,
         "cfg_coef": float(args.cfg_coef),
         "sample_rate": int(mimi.sample_rate),
         "frame_size": int(frame_size),

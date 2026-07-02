@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import struct
 import sys
 import tempfile
 import unittest
@@ -11,7 +12,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from dump_moshi_realtime import resolve_checkpoint
+from dump_moshi_realtime import checkpoint_floating_dtype, resolve_checkpoint
+
+
+def write_safetensor_header(path: Path, header: dict) -> None:
+    data = json.dumps(header).encode()
+    path.write_bytes(struct.pack("<Q", len(data)) + data)
 
 
 class MoshiRealtimeConfigTest(unittest.TestCase):
@@ -101,6 +107,37 @@ class MoshiRealtimeConfigTest(unittest.TestCase):
 
         self.assertEqual(result["lm_gen_config"], {})
         self.assertEqual(result["lm_config"], {"dim": 4096})
+
+    def test_auto_dtype_uses_safetensor_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bf16 = root / "bf16.safetensors"
+            f32 = root / "f32.safetensors"
+            write_safetensor_header(
+                bf16,
+                {"a": {"dtype": "BF16", "shape": [1], "data_offsets": [0, 2]}},
+            )
+            write_safetensor_header(
+                f32,
+                {"a": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}},
+            )
+
+            self.assertEqual(checkpoint_floating_dtype(bf16), "bfloat16")
+            self.assertEqual(checkpoint_floating_dtype(f32), "float32")
+
+    def test_auto_dtype_rejects_mixed_safetensor_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "mixed.safetensors"
+            write_safetensor_header(
+                path,
+                {
+                    "a": {"dtype": "BF16", "shape": [1], "data_offsets": [0, 2]},
+                    "b": {"dtype": "F32", "shape": [1], "data_offsets": [2, 6]},
+                },
+            )
+
+            with self.assertRaises(SystemExit):
+                checkpoint_floating_dtype(path)
 
 
 if __name__ == "__main__":
