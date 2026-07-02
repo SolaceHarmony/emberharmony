@@ -12,6 +12,7 @@ use candle_transformers::generation::{LogitsProcessor, Sampling};
 const DEFAULT_MOSHI_NAME: &str = "model.safetensors";
 const DEFAULT_MIMI_NAME: &str = "tokenizer-e351c8d8-checkpoint125.safetensors";
 const DEFAULT_TEXT_TOKENIZER_NAME: &str = "tokenizer_spm_32k_3.model";
+pub const REALTIME_MOSHI_WARMUP_FRAMES: usize = 4;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RealtimeMoshiFiles {
@@ -197,8 +198,8 @@ impl RealtimeMoshi {
         self.skip_frames = 1;
     }
 
-    pub fn warmup(&mut self) -> Result<()> {
-        for _ in 0..4 {
+    pub fn warmup(&mut self, frames: usize) -> Result<()> {
+        for _ in 0..frames {
             let wav = Tensor::zeros((1, 1, self.frame_size), DType::F32, &self.device)?;
             let codes = self.mimi.encode_step(
                 &::moshi::StreamTensor::from_tensor(wav),
@@ -290,6 +291,24 @@ pub fn load_realtime_moshi(
     device: &Device,
     params: RealtimeMoshiParams,
 ) -> Result<RealtimeMoshi> {
+    load_realtime_moshi_with_warmup(
+        moshi_weights,
+        mimi_weights,
+        dtype,
+        device,
+        params,
+        REALTIME_MOSHI_WARMUP_FRAMES,
+    )
+}
+
+pub fn load_realtime_moshi_with_warmup(
+    moshi_weights: &str,
+    mimi_weights: &str,
+    dtype: DType,
+    device: &Device,
+    params: RealtimeMoshiParams,
+    warmup_frames: usize,
+) -> Result<RealtimeMoshi> {
     let cfg = ::moshi::lm_generate_multistream::Config::v0_1();
     let mimi = ::moshi::mimi::load_b(
         None,
@@ -299,7 +318,7 @@ pub fn load_realtime_moshi(
     )?;
     let lm = ::moshi::lm::load_streaming_both_ways(moshi_weights, dtype, device)?;
     let mut realtime = RealtimeMoshi::new(mimi, lm, device.clone(), params);
-    realtime.warmup()?;
+    realtime.warmup(warmup_frames)?;
     Ok(realtime)
 }
 

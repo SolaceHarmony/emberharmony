@@ -5,7 +5,7 @@
 //! exact PCM frame -> Mimi encode_step -> multistream LM step -> Mimi decode_step.
 //!
 //! Usage:
-//!   MOSHI_GREEDY=1 MOSHI_TRACE_FRAMES=16 \
+//!   MOSHI_GREEDY=1 MOSHI_TRACE_FRAMES=16 MOSHI_WARMUP_FRAMES=4 \
 //!     cargo run --release --example moshi_realtime_trace -- \
 //!       /path/to/moshiko-candle-bf16 /path/to/input-24khz.wav /tmp/rust-moshi.json
 
@@ -13,7 +13,8 @@ use std::{io::Read, path::Path};
 
 use candle_core::Device;
 use liquid_audio::moshi::models::{
-    load_realtime_moshi, realtime_moshi_files, safetensors_floating_dtype, RealtimeMoshiEvent,
+    load_realtime_moshi_with_warmup, realtime_moshi_files, safetensors_floating_dtype,
+    RealtimeMoshiEvent, REALTIME_MOSHI_WARMUP_FRAMES,
 };
 
 type Res<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -128,6 +129,10 @@ fn main() -> Res<()> {
     let greedy = std::env::var("MOSHI_GREEDY")
         .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
         .unwrap_or(false);
+    let warmup_frames = std::env::var("MOSHI_WARMUP_FRAMES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(REALTIME_MOSHI_WARMUP_FRAMES);
 
     let files = realtime_moshi_files(model)?.ok_or("selected directory is not a Moshi snapshot")?;
     let mut params = files.params;
@@ -138,7 +143,7 @@ fn main() -> Res<()> {
     }
     let dtype = safetensors_floating_dtype(&files.moshi_weights)?;
     let device = select_device()?;
-    let mut realtime = load_realtime_moshi(
+    let mut realtime = load_realtime_moshi_with_warmup(
         files
             .moshi_weights
             .to_str()
@@ -150,6 +155,7 @@ fn main() -> Res<()> {
         dtype,
         &device,
         params,
+        warmup_frames,
     )?;
 
     let (samples, rate) = read_wav_mono_f32(wav)?;
@@ -202,7 +208,7 @@ fn main() -> Res<()> {
         "greedy": greedy,
         "sample_rate": realtime.sample_rate(),
         "frame_size": realtime.frame_size(),
-        "warmup_frames": 4,
+        "warmup_frames": warmup_frames,
         "input_frames": frames,
         "input_audio_tokens": input_audio_tokens,
         "text_tokens": text,

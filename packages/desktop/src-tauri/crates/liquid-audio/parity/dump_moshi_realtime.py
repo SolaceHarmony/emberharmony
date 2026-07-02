@@ -6,9 +6,8 @@ keeps the same step order as `server.py`: fixed PCM frame -> Mimi encode ->
 LMGen.step -> Mimi decode. Compare its JSON output with the Rust example:
 
   conda activate py312
-  MOSHI_GREEDY=1 MOSHI_TRACE_FRAMES=16 \
-    python parity/dump_moshi_realtime.py kyutai/moshiko-pytorch-bf16 \
-      assets/question-24khz.wav /tmp/python-moshi.json
+  python parity/dump_moshi_realtime.py kyutai/moshiko-pytorch-bf16 \
+    assets/question-24khz.wav /tmp/python-moshi.json --greedy --frames 16 --warmup-frames 4
 
 The Rust runtime consumes the Candle layout (`kyutai/moshiko-candle-bf16`). When
 the Python side sees that layout, it remaps the Candle depformer keys into the

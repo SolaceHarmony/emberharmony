@@ -4,8 +4,8 @@
 Generate inputs with:
 
   conda activate py312
-  python parity/dump_moshi_realtime.py <python-model> input.wav /tmp/py.json --greedy --frames 16
-  MOSHI_GREEDY=1 MOSHI_TRACE_FRAMES=16 \
+  python parity/dump_moshi_realtime.py <python-model> input.wav /tmp/py.json --greedy --frames 16 --warmup-frames 4
+  MOSHI_GREEDY=1 MOSHI_TRACE_FRAMES=16 MOSHI_WARMUP_FRAMES=4 \
     cargo run --release --example moshi_realtime_trace -- <candle-model-dir> input.wav /tmp/rs.json
   python parity/compare_moshi_realtime.py /tmp/py.json /tmp/rs.json
 

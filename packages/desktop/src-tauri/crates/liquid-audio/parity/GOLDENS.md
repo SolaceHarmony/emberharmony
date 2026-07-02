@@ -70,8 +70,8 @@ the same 24 kHz PCM input:
 
 ```
 conda activate py312
-python parity/dump_moshi_realtime.py <python-moshi-model> input-24khz.wav /tmp/py-moshi.json --greedy --frames 16
-MOSHI_GREEDY=1 MOSHI_TRACE_FRAMES=16 cargo run --release --example moshi_realtime_trace -- <candle-moshi-dir> input-24khz.wav /tmp/rs-moshi.json
+python parity/dump_moshi_realtime.py <python-moshi-model> input-24khz.wav /tmp/py-moshi.json --greedy --frames 16 --warmup-frames 4
+MOSHI_GREEDY=1 MOSHI_TRACE_FRAMES=16 MOSHI_WARMUP_FRAMES=4 cargo run --release --example moshi_realtime_trace -- <candle-moshi-dir> input-24khz.wav /tmp/rs-moshi.json
 python parity/compare_moshi_realtime.py /tmp/py-moshi.json /tmp/rs-moshi.json
 ```
 
@@ -80,8 +80,9 @@ the Candle-to-Python depformer key mapping from the safetensors header and write
 cheap file metadata without loading model tensors or computing full-file hashes.
 Use `--load-only` when you intentionally want to instantiate the vendored Python
 model, apply the remapped weights, and write exact FNV fingerprints. For a single
-stepping smoke test, pass `--warmup-frames 0 --frames 1`; the canonical
-`server.py` parity path keeps the default four warmup frames.
+stepping smoke test, pass `--warmup-frames 0 --frames 1` on Python and
+`MOSHI_WARMUP_FRAMES=0 MOSHI_TRACE_FRAMES=1` on Rust; the canonical
+`server.py` parity path keeps the default four warmup frames on both sides.
 
 `compare_moshi_realtime.py` only accepts `mode: "step"` traces, requires the
 Python/Rust `warmup_frames` values to match, and compares Mimi input audio code
