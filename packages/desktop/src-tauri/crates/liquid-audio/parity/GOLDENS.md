@@ -77,10 +77,11 @@ python parity/compare_moshi_realtime.py /tmp/py-moshi.json /tmp/rs-moshi.json
 
 The comparator requires matching Moshi/Mimi/tokenizer byte fingerprints by
 default. The current Rust side supports the unconditioned Candle Moshi layout
-only (for example `kyutai/moshiko-candle-bf16`), while the vendored upstream
-Python loader expects PyTorch Moshi keys. If you intentionally compare a
-PyTorch/Candle converted pair, pass `--allow-converted-checkpoints`; do not call
-that a same-checkpoint parity run.
+only (for example `kyutai/moshiko-candle-bf16`). The Python trace dumper remaps
+that Candle depformer layout into the vendored Python module names before
+loading, so same-file parity can run against the local Rust checkpoint. If you
+intentionally compare a PyTorch/Candle converted pair, pass
+`--allow-converted-checkpoints`; do not call that a same-checkpoint parity run.
 
 If a config advertises Liquid's conditioning/CFG fuser path, the native loader
 must reject it rather than run with missing `condition_tensors` or CFG

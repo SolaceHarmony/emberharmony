@@ -10,9 +10,9 @@ LMGen.step -> Mimi decode. Compare its JSON output with the Rust example:
     python parity/dump_moshi_realtime.py kyutai/moshiko-pytorch-bf16 \
       assets/question-24khz.wav /tmp/python-moshi.json
 
-The Rust runtime currently consumes the Candle layout (`kyutai/moshiko-candle-bf16`),
-while this vendored Python loader expects PyTorch keys. Converted-pair checks are
-explicitly supported by the comparator flag, but same-checkpoint parity remains
+The Rust runtime consumes the Candle layout (`kyutai/moshiko-candle-bf16`). When
+the Python side sees that layout, it remaps the Candle depformer keys into the
+vendored Python module names before loading, so same-checkpoint parity remains
 the default contract.
 """
 
@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import struct
 import sys
 import time
 from pathlib import Path
@@ -28,7 +29,6 @@ from pathlib import Path
 import numpy as np
 import sphn
 import torch
-from safetensors import safe_open
 
 from _upstream import SRC
 
@@ -71,11 +71,17 @@ def file_fingerprint(path: Path) -> dict[str, int | str]:
     }
 
 
+def safetensors_keys(path: Path) -> list[str]:
+    with path.open("rb") as handle:
+        size = struct.unpack("<Q", handle.read(8))[0]
+        header = json.loads(handle.read(size))
+    return [key for key in header if key != "__metadata__"]
+
+
 def moshi_weight_layout(path: Path) -> str:
     if path.suffix not in (".safetensors", ".sft", ".sfts"):
         return "torch-pickle"
-    with safe_open(path, framework="pt", device="cpu") as handle:
-        keys = list(handle.keys())
+    keys = safetensors_keys(path)
     if any(key.startswith("depformer.") and key.endswith(".linear_in.weight") for key in keys):
         return "candle"
     if any(
@@ -125,6 +131,88 @@ def resolve_checkpoint(model: str) -> CheckpointInfo:
     )
 
 
+def depformer_slice_index(key: str) -> int | None:
+    parts = key.split(".")
+    if len(parts) < 3 or parts[0] != "depformer" or not parts[1].isdigit():
+        return None
+    return int(parts[1])
+
+
+def remap_candle_moshi_state(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Map Kyutai's Candle Moshi key layout into the vendored Python LM layout."""
+
+    slices = sorted({idx for key in state if (idx := depformer_slice_index(key)) is not None})
+    if not slices:
+        raise RuntimeError("Candle Moshi state has no depformer slices to remap")
+
+    out: dict[str, torch.Tensor] = {}
+    attention: dict[tuple[int, str], dict[int, torch.Tensor]] = {}
+    for key, value in state.items():
+        idx = depformer_slice_index(key)
+        if idx is None:
+            out[key] = value
+            continue
+
+        rest = key.split(".", 2)[2]
+        if rest == "emb.weight":
+            target = "depformer_text_emb.weight" if idx == 0 else f"depformer_emb.{idx - 1}.weight"
+            out[target] = value
+            continue
+        if rest == "linear_in.weight":
+            out[f"depformer_in.{idx}.weight"] = value
+            continue
+        if rest == "linear_out.weight":
+            out[f"linears.{idx}.weight"] = value
+            continue
+
+        parts = rest.split(".")
+        if (
+            len(parts) >= 5
+            and parts[0] == "transformer"
+            and parts[1] == "layers"
+            and parts[2].isdigit()
+        ):
+            layer = int(parts[2])
+            tail = ".".join(parts[3:])
+            if tail in ("self_attn.in_proj_weight", "self_attn.out_proj.weight"):
+                attention.setdefault((layer, tail), {})[idx] = value
+                continue
+            if tail.startswith("gating."):
+                out[f"depformer.layers.{layer}.gating.{idx}.{tail.removeprefix('gating.')}"] = value
+                continue
+            if tail in ("norm1.alpha", "norm2.alpha"):
+                if idx == 0:
+                    out[f"depformer.layers.{layer}.{tail}"] = value
+                continue
+
+        raise RuntimeError(f"unmapped Candle Moshi key: {key}")
+
+    for (layer, tail), values in attention.items():
+        missing = [idx for idx in slices if idx not in values]
+        if missing:
+            raise RuntimeError(f"missing depformer slices for layer {layer} {tail}: {missing}")
+        out[f"depformer.layers.{layer}.{tail}"] = torch.cat(
+            [values[idx] for idx in slices],
+            dim=0,
+        )
+    return out
+
+
+def load_moshi_for_trace(info: CheckpointInfo, device: str, dtype: torch.dtype, layout: str):
+    if layout != "candle":
+        return info.get_moshi(device, dtype=dtype).eval(), layout
+
+    from safetensors.torch import load_file
+
+    lm = info.get_moshi(device, dtype=dtype, load_weight=False).eval()
+    state = load_file(info.moshi_weights, device=str(device))
+    for key, value in state.items():
+        if value.dtype.is_floating_point:
+            state[key] = value.to(dtype)
+    lm.load_state_dict(remap_candle_moshi_state(state), assign=True)
+    return lm.eval(), "candle-remapped-to-python"
+
+
 def warmup(mimi, lm_gen, frame_size: int, device: torch.device | str) -> None:
     for _ in range(4):
         chunk = torch.zeros(1, 1, frame_size, dtype=torch.float32, device=device)
@@ -160,13 +248,6 @@ def main() -> None:
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float32
     info = resolve_checkpoint(args.model)
     layout = moshi_weight_layout(Path(info.moshi_weights))
-    if layout == "candle":
-        raise SystemExit(
-            "selected Moshi checkpoint uses the Candle key layout; upstream Python "
-            "`liquid_audio.moshi` expects PyTorch keys. Use a Python-layout checkpoint "
-            "for the Python trace, or compare a converted pair explicitly with "
-            "`compare_moshi_realtime.py --allow-converted-checkpoints`."
-        )
     if layout == "unknown-safetensors":
         raise SystemExit(
             "selected Moshi checkpoint is safetensors but does not look like the "
@@ -174,7 +255,7 @@ def main() -> None:
         )
     mimi = info.get_mimi(args.device)
     text = info.get_text_tokenizer()
-    lm = info.get_moshi(args.device, dtype=dtype).eval()
+    lm, layout = load_moshi_for_trace(info, args.device, dtype, layout)
     condition_tensors = get_condition_tensors(info.model_type, lm, batch_size=1, cfg_coef=args.cfg_coef)
     lm_config = dict(info.lm_gen_config)
     if args.greedy:
