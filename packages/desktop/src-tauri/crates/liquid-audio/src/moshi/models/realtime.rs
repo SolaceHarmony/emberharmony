@@ -102,6 +102,7 @@ impl RealtimeMoshiParams {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum RealtimeMoshiEvent {
+    InputAudioTokenFrame(Vec<u32>),
     TextToken(u32),
     AudioTokenFrame(Vec<u32>),
     Audio { pcm: Vec<f32>, rate: u32 },
@@ -246,6 +247,9 @@ impl RealtimeMoshi {
                 .iter()
                 .map(|codebook| codebook[frame])
                 .collect::<Vec<_>>();
+            if emit_events {
+                events.push(RealtimeMoshiEvent::InputAudioTokenFrame(input.clone()));
+            }
             let text = self
                 .state
                 .step_without_ca_src(self.text_token, &input, None)?;

@@ -410,6 +410,7 @@ def main() -> None:
         "warmup_frames": int(args.warmup_frames),
         "input_frames": 0,
         "elapsed_s": 0.0,
+        "input_audio_tokens": [],
         "text_tokens": [],
         "text": "",
         "audio_tokens": [],
@@ -438,6 +439,7 @@ def main() -> None:
     all_pcm = np.asarray(in_pcms, dtype=np.float32)
 
     text_tokens: list[int] = []
+    input_audio_tokens: list[list[int]] = []
     audio_tokens: list[list[int]] = []
     audio_chunks: list[dict[str, float | int]] = []
     skip_frames = 1
@@ -455,6 +457,7 @@ def main() -> None:
                 mimi.reset_streaming()
                 skip_frames -= 1
             for c in range(codes.shape[-1]):
+                input_audio_tokens.append([int(v) for v in codes[0, :, c].detach().cpu().tolist()])
                 tokens = lm_gen.step(codes[:, :, c : c + 1])
                 if tokens is None:
                     continue
@@ -475,6 +478,7 @@ def main() -> None:
     trace["mode"] = "step"
     trace["input_frames"] = int(frames)
     trace["elapsed_s"] = time.time() - start
+    trace["input_audio_tokens"] = input_audio_tokens
     trace["text_tokens"] = text_tokens
     trace["text"] = text.decode(text_tokens) if text_tokens else ""
     trace["audio_tokens"] = audio_tokens

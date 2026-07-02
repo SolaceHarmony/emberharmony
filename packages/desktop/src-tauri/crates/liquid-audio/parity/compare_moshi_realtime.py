@@ -83,6 +83,10 @@ def main() -> None:
         rs.get("warmup_frames"),
     )
     assert py["input_frames"] == rs["input_frames"], (py["input_frames"], rs["input_frames"])
+    assert py["input_audio_tokens"] == rs["input_audio_tokens"], {
+        "python": py["input_audio_tokens"],
+        "rust": rs["input_audio_tokens"],
+    }
     assert py["text_tokens"] == rs["text_tokens"], {
         "python": py["text_tokens"],
         "rust": rs["text_tokens"],

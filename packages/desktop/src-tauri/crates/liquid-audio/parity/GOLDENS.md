@@ -84,10 +84,11 @@ stepping smoke test, pass `--warmup-frames 0 --frames 1`; the canonical
 `server.py` parity path keeps the default four warmup frames.
 
 `compare_moshi_realtime.py` only accepts `mode: "step"` traces, requires the
-Python/Rust `warmup_frames` values to match, and compares both text tokens and
-generated Moshi audio code frames exactly. Decoded PCM chunk RMS is a secondary
-sanity check for the Mimi decode path. Remap-only and load-only outputs are
-smoke artifacts; they are not valid stepping parity evidence.
+Python/Rust `warmup_frames` values to match, and compares Mimi input audio code
+frames, text tokens, and generated Moshi audio code frames exactly. Decoded PCM
+chunk RMS is a secondary sanity check for the Mimi decode path. Remap-only and
+load-only outputs are smoke artifacts; they are not valid stepping parity
+evidence.
 
 The comparator requires matching Moshi/Mimi/tokenizer byte fingerprints by
 default. The current Rust side supports the unconditioned Candle Moshi layout

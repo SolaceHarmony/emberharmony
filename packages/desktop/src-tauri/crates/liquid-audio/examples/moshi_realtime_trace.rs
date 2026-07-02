@@ -162,6 +162,7 @@ fn main() -> Res<()> {
     }
 
     let mut text = Vec::<u32>::new();
+    let mut input_audio_tokens = Vec::<Vec<u32>>::new();
     let mut audio_tokens = Vec::<Vec<u32>>::new();
     let mut audio = Vec::<serde_json::Value>::new();
     let mut frames = 0usize;
@@ -175,6 +176,7 @@ fn main() -> Res<()> {
         frames += 1;
         for event in realtime.step_pcm_frame(chunk)? {
             match event {
+                RealtimeMoshiEvent::InputAudioTokenFrame(codes) => input_audio_tokens.push(codes),
                 RealtimeMoshiEvent::TextToken(token) => text.push(token),
                 RealtimeMoshiEvent::AudioTokenFrame(codes) => audio_tokens.push(codes),
                 RealtimeMoshiEvent::Audio { pcm, rate } => audio.push(serde_json::json!({
@@ -202,6 +204,7 @@ fn main() -> Res<()> {
         "frame_size": realtime.frame_size(),
         "warmup_frames": 4,
         "input_frames": frames,
+        "input_audio_tokens": input_audio_tokens,
         "text_tokens": text,
         "audio_tokens": audio_tokens,
         "audio_chunks": audio,

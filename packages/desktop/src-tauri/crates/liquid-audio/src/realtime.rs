@@ -1013,6 +1013,7 @@ impl MoshiVoiceEngine {
                 return false;
             }
             match event {
+                RealtimeMoshiEvent::InputAudioTokenFrame(_) => {}
                 RealtimeMoshiEvent::TextToken(token) => {
                     if let Some(text) = self.decode_text_token(token) {
                         emit(VoiceEvent::Text(text));
