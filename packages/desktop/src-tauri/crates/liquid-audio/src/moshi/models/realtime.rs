@@ -372,6 +372,40 @@ fn validate_candle_moshi_checkpoint(path: &Path) -> Result<()> {
     ))
 }
 
+fn has_unimplemented_conditioning(config: &serde_json::Value) -> bool {
+    const KEYS: &[&str] = &[
+        "conditioners",
+        "condition_provider",
+        "condition_tensors",
+        "fuser",
+    ];
+    KEYS.iter()
+        .any(|key| config.get(key).is_some_and(|value| !value.is_null()))
+}
+
+fn has_unimplemented_cfg(config: Option<&serde_json::Value>) -> bool {
+    let Some(config) = config else {
+        return false;
+    };
+    if config
+        .get("cfg_is_masked_until")
+        .is_some_and(|value| !value.is_null())
+        || config
+            .get("cfg_is_no_text")
+            .is_some_and(|value| value.as_bool().unwrap_or(true))
+    {
+        return true;
+    }
+    ["cfg_coef", "cfg_alpha"].iter().any(|key| {
+        config.get(key).is_some_and(|value| {
+            value
+                .as_f64()
+                .map(|n| (n - 1.0).abs() > f64::EPSILON)
+                .unwrap_or(!value.is_null())
+        })
+    })
+}
+
 pub fn realtime_moshi_files(dir: &Path) -> Result<Option<RealtimeMoshiFiles>> {
     let config = dir.join("config.json");
     let (moshi_name, mimi_name, tokenizer_name, model_type, params) = if config.is_file() {
@@ -407,10 +441,13 @@ pub fn realtime_moshi_files(dir: &Path) -> Result<Option<RealtimeMoshiFiles>> {
                 "native realtime Moshi only supports plain `moshi` checkpoints; `{model_type}` needs the upstream Python conditioning/streaming path"
             )));
         }
-        let conditioned = value.get("conditioners").is_some()
-            || value.get("fuser").is_some()
-            || lm.is_some_and(|lm| lm.get("conditioners").is_some() || lm.get("fuser").is_some());
-        if conditioned {
+        let lm_value = value.get("lm_config");
+        let conditioned = has_unimplemented_conditioning(&value)
+            || lm_value.is_some_and(has_unimplemented_conditioning);
+        let cfg = has_unimplemented_cfg(Some(&value))
+            || has_unimplemented_cfg(value.get("lm_gen_config"))
+            || has_unimplemented_cfg(lm_value.and_then(|lm| lm.get("lm_gen_config")));
+        if conditioned || cfg {
             return Err(Error::Msg(
                 "native realtime Moshi does not yet implement Liquid's condition_tensors/CFG fuser path; use an unconditioned Moshiko Candle snapshot"
                     .into(),
@@ -599,6 +636,51 @@ mod tests {
                 "lm_config": {
                     "conditioners": { "description": {} },
                     "fuser": { "sum": ["description"] }
+                }
+            }"#,
+        )
+        .unwrap();
+        write_candle_moshi(&dir.join(DEFAULT_MOSHI_NAME));
+        touch(&dir.join(DEFAULT_MIMI_NAME));
+        touch(&dir.join(DEFAULT_TEXT_TOKENIZER_NAME));
+
+        let err = realtime_moshi_files(&dir).unwrap_err().to_string();
+        assert!(err.contains("condition_tensors/CFG"), "{err}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn realtime_moshi_files_rejects_condition_provider_config() {
+        let dir = temp_dir("emberharmony-moshi-condition-provider");
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{
+                "model_type": "moshi",
+                "lm_config": {
+                    "condition_provider": { "description": {} }
+                }
+            }"#,
+        )
+        .unwrap();
+        write_candle_moshi(&dir.join(DEFAULT_MOSHI_NAME));
+        touch(&dir.join(DEFAULT_MIMI_NAME));
+        touch(&dir.join(DEFAULT_TEXT_TOKENIZER_NAME));
+
+        let err = realtime_moshi_files(&dir).unwrap_err().to_string();
+        assert!(err.contains("condition_tensors/CFG"), "{err}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn realtime_moshi_files_rejects_cfg_generation_config() {
+        let dir = temp_dir("emberharmony-moshi-cfg");
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{
+                "model_type": "moshi",
+                "lm_gen_config": {
+                    "cfg_coef": 2.0,
+                    "cfg_is_no_text": true
                 }
             }"#,
         )

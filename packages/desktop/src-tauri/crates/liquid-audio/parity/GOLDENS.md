@@ -60,3 +60,22 @@ The conformer/depthformer pure-torch dumps (`dump_conformer_on_refmel.py`,
 
 **Always regenerate the goldens from the SAME model dir (`LFM_MODEL_DIR`) the tests
 load.** The committed goldens here are from snapshot `c362a06…`.
+
+## Realtime Moshi trace parity
+
+The desktop Moshi path is frame-fed rather than prompt-fed, so its parity check is
+a trace pair instead of a safetensors golden. Dump the upstream Python
+`server.py` order and the native Rust order from equivalent checkpoints and the
+same 24 kHz PCM input:
+
+```
+conda activate py312
+python parity/dump_moshi_realtime.py <python-moshi-model> input-24khz.wav /tmp/py-moshi.json --greedy --frames 16
+MOSHI_GREEDY=1 MOSHI_TRACE_FRAMES=16 cargo run --release --example moshi_realtime_trace -- <candle-moshi-dir> input-24khz.wav /tmp/rs-moshi.json
+python parity/compare_moshi_realtime.py /tmp/py-moshi.json /tmp/rs-moshi.json
+```
+
+The Rust side currently supports the unconditioned Candle Moshi layout only
+(for example `kyutai/moshiko-candle-bf16`). If a config advertises Liquid's
+conditioning/CFG fuser path, the native loader must reject it rather than run
+with missing `condition_tensors` or CFG semantics.
