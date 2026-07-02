@@ -71,11 +71,24 @@ def file_fingerprint(path: Path) -> dict[str, int | str]:
     }
 
 
-def safetensors_keys(path: Path) -> list[str]:
+def quick_file_info(path: Path) -> dict[str, int | str]:
+    stat = path.stat()
+    return {
+        "path": str(path),
+        "bytes": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+    }
+
+
+def safetensors_header(path: Path) -> dict[str, dict]:
     with path.open("rb") as handle:
         size = struct.unpack("<Q", handle.read(8))[0]
         header = json.loads(handle.read(size))
-    return [key for key in header if key != "__metadata__"]
+    return {key: value for key, value in header.items() if key != "__metadata__"}
+
+
+def safetensors_keys(path: Path) -> list[str]:
+    return list(safetensors_header(path))
 
 
 def moshi_weight_layout(path: Path) -> str:
@@ -136,6 +149,83 @@ def depformer_slice_index(key: str) -> int | None:
     if len(parts) < 3 or parts[0] != "depformer" or not parts[1].isdigit():
         return None
     return int(parts[1])
+
+
+def concat_metadata(values: list[dict], dim: int) -> dict:
+    first = dict(values[0])
+    shape = list(first["shape"])
+    dtype = first["dtype"]
+    if any(value["dtype"] != dtype for value in values):
+        raise RuntimeError("cannot concatenate safetensors metadata with mixed dtypes")
+    if any(len(value["shape"]) != len(shape) for value in values):
+        raise RuntimeError("cannot concatenate safetensors metadata with mixed ranks")
+    for value in values[1:]:
+        for idx, size in enumerate(value["shape"]):
+            if idx != dim and size != shape[idx]:
+                raise RuntimeError("cannot concatenate safetensors metadata with incompatible shapes")
+        shape[dim] += value["shape"][dim]
+    first["shape"] = shape
+    return first
+
+
+def remap_candle_moshi_header(header: dict[str, dict]) -> dict[str, dict]:
+    """Metadata-only mirror of `remap_candle_moshi_state` for cheap coverage checks."""
+
+    slices = sorted({idx for key in header if (idx := depformer_slice_index(key)) is not None})
+    if not slices:
+        raise RuntimeError("Candle Moshi state has no depformer slices to remap")
+
+    out: dict[str, dict] = {}
+    attention: dict[tuple[int, str], dict[int, dict]] = {}
+    for key, value in header.items():
+        idx = depformer_slice_index(key)
+        if idx is None:
+            out[key] = value
+            continue
+
+        rest = key.split(".", 2)[2]
+        if rest == "emb.weight":
+            target = "depformer_text_emb.weight" if idx == 0 else f"depformer_emb.{idx - 1}.weight"
+            out[target] = value
+            continue
+        if rest == "linear_in.weight":
+            out[f"depformer_in.{idx}.weight"] = value
+            continue
+        if rest == "linear_out.weight":
+            out[f"linears.{idx}.weight"] = value
+            continue
+
+        parts = rest.split(".")
+        if (
+            len(parts) >= 5
+            and parts[0] == "transformer"
+            and parts[1] == "layers"
+            and parts[2].isdigit()
+        ):
+            layer = int(parts[2])
+            tail = ".".join(parts[3:])
+            if tail in ("self_attn.in_proj_weight", "self_attn.out_proj.weight"):
+                attention.setdefault((layer, tail), {})[idx] = value
+                continue
+            if tail.startswith("gating."):
+                out[f"depformer.layers.{layer}.gating.{idx}.{tail.removeprefix('gating.')}"] = value
+                continue
+            if tail in ("norm1.alpha", "norm2.alpha"):
+                if idx == 0:
+                    out[f"depformer.layers.{layer}.{tail}"] = value
+                continue
+
+        raise RuntimeError(f"unmapped Candle Moshi key: {key}")
+
+    for (layer, tail), values in attention.items():
+        missing = [idx for idx in slices if idx not in values]
+        if missing:
+            raise RuntimeError(f"missing depformer slices for layer {layer} {tail}: {missing}")
+        out[f"depformer.layers.{layer}.{tail}"] = concat_metadata(
+            [values[idx] for idx in slices],
+            dim=0,
+        )
+    return out
 
 
 def remap_candle_moshi_state(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -209,12 +299,16 @@ def load_moshi_for_trace(info: CheckpointInfo, device: str, dtype: torch.dtype, 
     for key, value in state.items():
         if value.dtype.is_floating_point:
             state[key] = value.to(dtype)
-    lm.load_state_dict(remap_candle_moshi_state(state), assign=True)
+    remapped = remap_candle_moshi_state(state)
+    del state
+    lm.load_state_dict(remapped, assign=True)
+    del remapped
     return lm.eval(), "candle-remapped-to-python"
 
 
-def warmup(mimi, lm_gen, frame_size: int, device: torch.device | str) -> None:
-    for _ in range(4):
+@torch.no_grad()
+def warmup(mimi, lm_gen, frame_size: int, device: torch.device | str, frames: int) -> None:
+    for _ in range(frames):
         chunk = torch.zeros(1, 1, frame_size, dtype=torch.float32, device=device)
         codes = mimi.encode(chunk)
         for c in range(codes.shape[-1]):
@@ -231,6 +325,28 @@ def rms(values: np.ndarray) -> float:
     return float(np.sqrt(np.mean(np.square(values, dtype=np.float64))))
 
 
+def write_metadata_trace(args, info: CheckpointInfo, layout: str) -> None:
+    header = safetensors_header(Path(info.moshi_weights)) if layout != "torch-pickle" else {}
+    remapped = remap_candle_moshi_header(header) if layout == "candle" else header
+    trace = {
+        "source": "python",
+        "mode": "verify-remap-only",
+        "model": args.model,
+        "model_type": info.model_type,
+        "checkpoint": {
+            "moshi": quick_file_info(Path(info.moshi_weights)) | {"layout": layout},
+            "mimi": quick_file_info(Path(info.mimi_weights)),
+            "tokenizer": quick_file_info(Path(info.tokenizer)),
+        },
+        "moshi_header_keys": len(header),
+        "remapped_moshi_keys": len(remapped),
+        "depformer_slices": sorted(
+            {idx for key in header if (idx := depformer_slice_index(key)) is not None}
+        ),
+    }
+    args.out.write_text(json.dumps(trace, indent=2))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("model", help="HF repo id or upstream-compatible model reference")
@@ -241,9 +357,26 @@ def main() -> None:
     parser.add_argument("--cfg-coef", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=42424242)
     parser.add_argument("--frames", type=int, default=None)
+    parser.add_argument(
+        "--warmup-frames",
+        type=int,
+        default=4,
+        help="number of empty Mimi/LM frames to run before the trace; server.py parity uses 4",
+    )
+    parser.add_argument(
+        "--load-only",
+        action="store_true",
+        help="load/remap the checkpoint and write metadata without running the realtime step loop",
+    )
+    parser.add_argument(
+        "--verify-remap-only",
+        action="store_true",
+        help="validate the Candle-to-Python key remap from safetensors metadata only",
+    )
     parser.add_argument("--greedy", action="store_true")
     args = parser.parse_args()
 
+    torch.set_grad_enabled(False)
     seed_all(args.seed)
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float32
     info = resolve_checkpoint(args.model)
@@ -253,19 +386,48 @@ def main() -> None:
             "selected Moshi checkpoint is safetensors but does not look like the "
             "upstream Python Moshi layout; refusing to dump a misleading trace."
         )
+    if args.verify_remap_only:
+        write_metadata_trace(args, info, layout)
+        return
+
     mimi = info.get_mimi(args.device)
     text = info.get_text_tokenizer()
     lm, layout = load_moshi_for_trace(info, args.device, dtype, layout)
+    frame_size = int(mimi.sample_rate / mimi.frame_rate)
+    trace = {
+        "source": "python",
+        "model": args.model,
+        "model_type": info.model_type,
+        "checkpoint": {
+            "moshi": file_fingerprint(Path(info.moshi_weights)) | {"layout": layout},
+            "mimi": file_fingerprint(Path(info.mimi_weights)),
+            "tokenizer": file_fingerprint(Path(info.tokenizer)),
+        },
+        "input": str(args.wav),
+        "greedy": bool(args.greedy),
+        "sample_rate": int(mimi.sample_rate),
+        "frame_size": int(frame_size),
+        "warmup_frames": int(args.warmup_frames),
+        "input_frames": 0,
+        "elapsed_s": 0.0,
+        "text_tokens": [],
+        "text": "",
+        "audio_chunks": [],
+    }
+    if args.load_only:
+        trace["mode"] = "load-only"
+        args.out.write_text(json.dumps(trace, indent=2))
+        return
+
     condition_tensors = get_condition_tensors(info.model_type, lm, batch_size=1, cfg_coef=args.cfg_coef)
     lm_config = dict(info.lm_gen_config)
     if args.greedy:
         lm_config["use_sampling"] = False
     lm_gen = LMGen(lm, cfg_coef=args.cfg_coef, condition_tensors=condition_tensors, **lm_config)
 
-    frame_size = int(mimi.sample_rate / mimi.frame_rate)
     mimi.streaming_forever(1)
     lm_gen.streaming_forever(1)
-    warmup(mimi, lm_gen, frame_size, args.device)
+    warmup(mimi, lm_gen, frame_size, args.device, args.warmup_frames)
     mimi.reset_streaming()
     lm_gen.reset_streaming()
 
@@ -279,51 +441,40 @@ def main() -> None:
     skip_frames = 1
     frames = 0
     start = time.time()
-    for offset in range(0, all_pcm.shape[-1] - frame_size + 1, frame_size):
-        if args.frames is not None and frames >= args.frames:
-            break
-        frames += 1
-        chunk_np = all_pcm[offset : offset + frame_size]
-        chunk = torch.from_numpy(chunk_np).to(device=args.device)[None, None]
-        codes = mimi.encode(chunk)
-        if skip_frames:
-            mimi.reset_streaming()
-            skip_frames -= 1
-        for c in range(codes.shape[-1]):
-            tokens = lm_gen.step(codes[:, :, c : c + 1])
-            if tokens is None:
-                continue
-            main_pcm = mimi.decode(tokens[:, 1:]).detach().cpu()[0, 0].numpy()
-            token = int(tokens[0, 0, 0].item())
-            if token not in (0, 3):
-                text_tokens.append(token)
-            audio_chunks.append(
-                {
-                    "samples": int(main_pcm.shape[-1]),
-                    "rate": int(mimi.sample_rate),
-                    "rms": rms(main_pcm),
-                    "first": float(main_pcm[0]) if main_pcm.shape[-1] else 0.0,
-                }
-            )
+    with torch.no_grad():
+        for offset in range(0, all_pcm.shape[-1] - frame_size + 1, frame_size):
+            if args.frames is not None and frames >= args.frames:
+                break
+            frames += 1
+            chunk_np = all_pcm[offset : offset + frame_size]
+            chunk = torch.from_numpy(chunk_np).to(device=args.device)[None, None]
+            codes = mimi.encode(chunk)
+            if skip_frames:
+                mimi.reset_streaming()
+                skip_frames -= 1
+            for c in range(codes.shape[-1]):
+                tokens = lm_gen.step(codes[:, :, c : c + 1])
+                if tokens is None:
+                    continue
+                main_pcm = mimi.decode(tokens[:, 1:]).detach().cpu()[0, 0].numpy()
+                token = int(tokens[0, 0, 0].item())
+                if token not in (0, 3):
+                    text_tokens.append(token)
+                audio_chunks.append(
+                    {
+                        "samples": int(main_pcm.shape[-1]),
+                        "rate": int(mimi.sample_rate),
+                        "rms": rms(main_pcm),
+                        "first": float(main_pcm[0]) if main_pcm.shape[-1] else 0.0,
+                    }
+                )
 
-    trace = {
-        "source": "python",
-        "model": args.model,
-        "checkpoint": {
-            "moshi": file_fingerprint(Path(info.moshi_weights)) | {"layout": layout},
-            "mimi": file_fingerprint(Path(info.mimi_weights)),
-            "tokenizer": file_fingerprint(Path(info.tokenizer)),
-        },
-        "input": str(args.wav),
-        "greedy": bool(args.greedy),
-        "sample_rate": int(mimi.sample_rate),
-        "frame_size": int(frame_size),
-        "input_frames": int(frames),
-        "elapsed_s": time.time() - start,
-        "text_tokens": text_tokens,
-        "text": text.decode(text_tokens) if text_tokens else "",
-        "audio_chunks": audio_chunks,
-    }
+    trace["mode"] = "step"
+    trace["input_frames"] = int(frames)
+    trace["elapsed_s"] = time.time() - start
+    trace["text_tokens"] = text_tokens
+    trace["text"] = text.decode(text_tokens) if text_tokens else ""
+    trace["audio_chunks"] = audio_chunks
     args.out.write_text(json.dumps(trace, indent=2))
 
 

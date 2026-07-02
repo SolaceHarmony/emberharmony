@@ -75,6 +75,14 @@ MOSHI_GREEDY=1 MOSHI_TRACE_FRAMES=16 cargo run --release --example moshi_realtim
 python parity/compare_moshi_realtime.py /tmp/py-moshi.json /tmp/rs-moshi.json
 ```
 
+For a cheap checkpoint/remap smoke test, use `--verify-remap-only`; it validates
+the Candle-to-Python depformer key mapping from the safetensors header and writes
+cheap file metadata without loading model tensors or computing full-file hashes.
+Use `--load-only` when you intentionally want to instantiate the vendored Python
+model, apply the remapped weights, and write exact FNV fingerprints. For a single
+stepping smoke test, pass `--warmup-frames 0 --frames 1`; the canonical
+`server.py` parity path keeps the default four warmup frames.
+
 The comparator requires matching Moshi/Mimi/tokenizer byte fingerprints by
 default. The current Rust side supports the unconditioned Candle Moshi layout
 only (for example `kyutai/moshiko-candle-bf16`). The Python trace dumper remaps
