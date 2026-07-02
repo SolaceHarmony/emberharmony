@@ -36,7 +36,6 @@ const MIMI_RATE: u32 = 24_000; // Mimi/LFM2 detokenizer output rate.
 const UTTERANCE_QUEUE_CAP: usize = 1;
 const EVENT_QUEUE_CAP: usize = 128;
 const FRAME_QUEUE_CAP: usize = 8;
-const STREAM_IDLE_FRAMES: usize = 5;
 
 fn try_send_event(tx: &Sender<VoiceEvent>, ev: VoiceEvent, cancel: &AtomicBool) -> bool {
     match tx.try_send(ev) {
@@ -69,6 +68,7 @@ pub enum VoiceEvent {
     /// A decoded PCM chunk (mono f32) at the pipeline's output rate.
     Audio(Vec<f32>),
     /// The reply for the current utterance finished normally (`chat.py`'s `q.put(None)`).
+    /// Frame-fed Moshi pipelines do not synthesize this on silence; the stream is continuous.
     TurnComplete,
     /// The reply/output stream was cut short by an explicit interrupt.
     Interrupted,
@@ -459,8 +459,6 @@ impl RealtimeFramePipeline {
         let worker = std::thread::Builder::new()
             .name("moshi-frame-inference".into())
             .spawn(move || {
-                let mut active = false;
-                let mut idle_frames = 0usize;
                 let mut current_epoch = 0u64;
                 for cmd in frame_rx.iter() {
                     match cmd {
@@ -470,8 +468,6 @@ impl RealtimeFramePipeline {
                             }
                             current_epoch = epoch;
                             cancel_worker.store(false, Ordering::SeqCst);
-                            active = false;
-                            idle_frames = 0;
                             if !try_send_event(&event_tx, VoiceEvent::Interrupted, &cancel_worker) {
                                 break;
                             }
@@ -482,8 +478,6 @@ impl RealtimeFramePipeline {
                                 if latest_epoch > current_epoch {
                                     current_epoch = latest_epoch;
                                     cancel_worker.store(false, Ordering::SeqCst);
-                                    active = false;
-                                    idle_frames = 0;
                                     if !try_send_event(
                                         &event_tx,
                                         VoiceEvent::Interrupted,
@@ -496,8 +490,6 @@ impl RealtimeFramePipeline {
                             }
                             if epoch > current_epoch {
                                 current_epoch = epoch;
-                                active = false;
-                                idle_frames = 0;
                                 cancel_worker.store(false, Ordering::SeqCst);
                                 let _ = try_send_event(
                                     &event_tx,
@@ -507,14 +499,11 @@ impl RealtimeFramePipeline {
                             }
                             cancel_worker.store(false, Ordering::SeqCst);
                             let mut event_backpressure = false;
-                            let mut emitted_output = false;
                             let responded = {
                                 let mut emit = |ev: VoiceEvent| {
                                     if event_backpressure {
                                         return;
                                     }
-                                    emitted_output |=
-                                        matches!(ev, VoiceEvent::Text(_) | VoiceEvent::Audio(_));
                                     if !try_send_event(&event_tx, ev, &cancel_worker) {
                                         event_backpressure = true;
                                     }
@@ -532,33 +521,13 @@ impl RealtimeFramePipeline {
                                 break;
                             }
                             match responded {
-                                Ok(true) => {
-                                    if emitted_output {
-                                        active = true;
-                                        idle_frames = 0;
-                                    } else if active {
-                                        idle_frames += 1;
-                                        if idle_frames >= STREAM_IDLE_FRAMES {
-                                            active = false;
-                                            idle_frames = 0;
-                                            if !try_send_event(
-                                                &event_tx,
-                                                VoiceEvent::TurnComplete,
-                                                &cancel_worker,
-                                            ) {
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
+                                Ok(true) => {}
                                 Ok(false) => {
                                     let latest_epoch = epoch_worker.load(Ordering::Acquire);
                                     if latest_epoch > current_epoch {
                                         current_epoch = latest_epoch;
                                     }
                                     cancel_worker.store(false, Ordering::SeqCst);
-                                    active = false;
-                                    idle_frames = 0;
                                     if !try_send_event(
                                         &event_tx,
                                         VoiceEvent::Interrupted,
@@ -568,8 +537,6 @@ impl RealtimeFramePipeline {
                                     }
                                 }
                                 Err(e) => {
-                                    active = false;
-                                    idle_frames = 0;
                                     if !try_send_event(
                                         &event_tx,
                                         VoiceEvent::Error(e),
@@ -1392,6 +1359,69 @@ mod tests {
             calls.load(Ordering::SeqCst),
             FRAME_QUEUE_CAP + 1,
             "accepted frames should still reach the engine in order"
+        );
+    }
+
+    struct OneOutputFrameEngine {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl VoiceEngine for OneOutputFrameEngine {
+        fn respond(
+            &mut self,
+            _utt: &Utterance,
+            _cancel: &AtomicBool,
+            _emit: &mut dyn FnMut(VoiceEvent),
+        ) -> Result<bool, String> {
+            unreachable!("frame engine should not receive utterances")
+        }
+
+        fn frame_config(&self) -> Option<FrameConfig> {
+            Some(FrameConfig {
+                sample_rate: 24_000,
+                frame_size: 2,
+            })
+        }
+
+        fn respond_frame(
+            &mut self,
+            _frame: &[f32],
+            _cancel: &AtomicBool,
+            emit: &mut dyn FnMut(VoiceEvent),
+        ) -> Result<bool, String> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                emit(VoiceEvent::Audio(vec![0.0, 0.0]));
+            }
+            Ok(true)
+        }
+    }
+
+    #[test]
+    fn frame_pipeline_does_not_synthesize_turn_complete_on_idle_frames() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let pipe = RealtimeFramePipeline::spawn(OneOutputFrameEngine {
+            calls: calls.clone(),
+        })
+        .expect("spawn frame pipeline");
+
+        for _ in 0..8 {
+            assert!(pipe.submit_frame(vec![0.0, 0.0]));
+        }
+        assert_eq!(
+            pipe.events().recv_timeout(Duration::from_secs(5)).unwrap(),
+            VoiceEvent::Audio(vec![0.0, 0.0])
+        );
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while calls.load(Ordering::SeqCst) < 8 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 8);
+        assert_eq!(
+            pipe.events().recv_timeout(Duration::from_millis(50)),
+            Err(crossbeam_channel::RecvTimeoutError::Timeout),
+            "frame-fed Moshi is continuous and must not invent turn boundaries"
         );
     }
 
