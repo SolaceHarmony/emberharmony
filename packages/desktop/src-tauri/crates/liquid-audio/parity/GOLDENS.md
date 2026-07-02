@@ -83,6 +83,10 @@ model, apply the remapped weights, and write exact FNV fingerprints. For a singl
 stepping smoke test, pass `--warmup-frames 0 --frames 1`; the canonical
 `server.py` parity path keeps the default four warmup frames.
 
+`compare_moshi_realtime.py` only accepts `mode: "step"` traces and requires the
+Python/Rust `warmup_frames` values to match. Remap-only and load-only outputs are
+smoke artifacts; they are not valid stepping parity evidence.
+
 The comparator requires matching Moshi/Mimi/tokenizer byte fingerprints by
 default. The current Rust side supports the unconditioned Candle Moshi layout
 only (for example `kyutai/moshiko-candle-bf16`). The Python trace dumper remaps

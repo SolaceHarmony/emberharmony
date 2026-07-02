@@ -187,6 +187,7 @@ fn main() -> Res<()> {
 
     let trace = serde_json::json!({
         "source": "rust",
+        "mode": "step",
         "model_dir": model.display().to_string(),
         "checkpoint": {
             "moshi": file_fingerprint(&files.moshi_weights)?,
@@ -197,6 +198,7 @@ fn main() -> Res<()> {
         "greedy": greedy,
         "sample_rate": realtime.sample_rate(),
         "frame_size": realtime.frame_size(),
+        "warmup_frames": 4,
         "input_frames": frames,
         "text_tokens": text,
         "audio_chunks": audio,

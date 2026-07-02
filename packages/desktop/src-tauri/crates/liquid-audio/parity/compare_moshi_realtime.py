@@ -48,6 +48,15 @@ def assert_same_checkpoints(py: dict, rs: dict) -> None:
         }
 
 
+def assert_step_trace(name: str, trace: dict) -> None:
+    mode = trace.get("mode")
+    assert mode == "step", {
+        "trace": name,
+        "mode": mode,
+        "message": "Moshi parity requires realtime stepping traces, not load/remap metadata",
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("python_trace", type=Path)
@@ -63,10 +72,16 @@ def main() -> None:
     py = load(args.python_trace)
     rs = load(args.rust_trace)
 
+    assert_step_trace("python", py)
+    assert_step_trace("rust", rs)
     if not args.allow_converted_checkpoints:
         assert_same_checkpoints(py, rs)
     assert py["sample_rate"] == rs["sample_rate"], (py["sample_rate"], rs["sample_rate"])
     assert py["frame_size"] == rs["frame_size"], (py["frame_size"], rs["frame_size"])
+    assert py.get("warmup_frames") == rs.get("warmup_frames"), (
+        py.get("warmup_frames"),
+        rs.get("warmup_frames"),
+    )
     assert py["input_frames"] == rs["input_frames"], (py["input_frames"], rs["input_frames"])
     assert py["text_tokens"] == rs["text_tokens"], {
         "python": py["text_tokens"],
