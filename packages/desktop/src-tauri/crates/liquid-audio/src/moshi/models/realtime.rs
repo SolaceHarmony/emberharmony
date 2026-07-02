@@ -413,6 +413,14 @@ fn has_unimplemented_cfg(config: Option<&serde_json::Value>) -> bool {
     })
 }
 
+fn has_unimplemented_lora(config: Option<&serde_json::Value>) -> bool {
+    config.is_some_and(|config| {
+        config
+            .get("lora_name")
+            .is_some_and(|value| !value.is_null())
+    })
+}
+
 pub fn realtime_moshi_files(dir: &Path) -> Result<Option<RealtimeMoshiFiles>> {
     let config = dir.join("config.json");
     let (moshi_name, mimi_name, tokenizer_name, model_type, params) = if config.is_file() {
@@ -449,6 +457,12 @@ pub fn realtime_moshi_files(dir: &Path) -> Result<Option<RealtimeMoshiFiles>> {
             )));
         }
         let lm_value = value.get("lm_config");
+        if has_unimplemented_lora(Some(&value)) || has_unimplemented_lora(lm_value) {
+            return Err(Error::Msg(
+                "native realtime Moshi does not yet implement Liquid's LoRA fuse path; use a base unconditioned Moshiko Candle snapshot"
+                    .into(),
+            ));
+        }
         let lm_gen_config = value
             .get("lm_gen_config")
             .or_else(|| lm_value.and_then(|lm| lm.get("lm_gen_config")));
@@ -643,6 +657,48 @@ mod tests {
         let err = realtime_moshi_files(&dir).unwrap_err().to_string();
         assert!(err.contains("plain `moshi`"), "{err}");
         assert!(err.contains("upstream Python conditioning"), "{err}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn realtime_moshi_files_rejects_lora_config() {
+        let dir = temp_dir("emberharmony-moshi-lora");
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{
+                "model_type": "moshi",
+                "lora_name": "adapter.safetensors"
+            }"#,
+        )
+        .unwrap();
+        write_candle_moshi(&dir.join(DEFAULT_MOSHI_NAME));
+        touch(&dir.join(DEFAULT_MIMI_NAME));
+        touch(&dir.join(DEFAULT_TEXT_TOKENIZER_NAME));
+
+        let err = realtime_moshi_files(&dir).unwrap_err().to_string();
+        assert!(err.contains("LoRA fuse"), "{err}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn realtime_moshi_files_rejects_nested_lora_config() {
+        let dir = temp_dir("emberharmony-moshi-nested-lora");
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{
+                "model_type": "moshi",
+                "lm_config": {
+                    "lora_name": "adapter.safetensors"
+                }
+            }"#,
+        )
+        .unwrap();
+        write_candle_moshi(&dir.join(DEFAULT_MOSHI_NAME));
+        touch(&dir.join(DEFAULT_MIMI_NAME));
+        touch(&dir.join(DEFAULT_TEXT_TOKENIZER_NAME));
+
+        let err = realtime_moshi_files(&dir).unwrap_err().to_string();
+        assert!(err.contains("LoRA fuse"), "{err}");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
