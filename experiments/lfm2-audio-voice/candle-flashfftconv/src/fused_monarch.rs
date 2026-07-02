@@ -144,13 +144,22 @@ impl CustomOp2 for MonarchFusedForward {
         "monarch_fused_fwd"
     }
 
-    fn cpu_fwd(&self, us: &CpuStorage, ul: &Layout, ps: &CpuStorage, pl: &Layout) -> Result<(CpuStorage, Shape)> {
+    fn cpu_fwd(
+        &self,
+        us: &CpuStorage,
+        ul: &Layout,
+        ps: &CpuStorage,
+        pl: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
         let (b, h, n, l) = ul.shape().dims4()?;
         let u = contig_f32(us, ul)?;
         let packed = contig_f32(ps, pl)?;
         let (o_dlr, o_dli, o_dnr, o_dni, o_tw, total) = packed_offsets(n, l);
         if packed.len() != total {
-            candle_core::bail!("monarch fused fwd: packed len {} != expected {total}", packed.len());
+            candle_core::bail!(
+                "monarch fused fwd: packed len {} != expected {total}",
+                packed.len()
+            );
         }
         let (dlr, dli) = (&packed[o_dlr..o_dlr + l * l], &packed[o_dli..o_dli + l * l]);
         let (dnr, dni) = (&packed[o_dnr..o_dnr + n * n], &packed[o_dni..o_dni + n * n]);
@@ -217,7 +226,9 @@ impl CustomOp2 for MonarchFusedForward {
 
         let (b, h, n, l) = ul.shape().dims4()?;
         if n % 8 != 0 || l % 8 != 0 {
-            candle_core::bail!("monarch fused fwd metal: N,L must be multiples of 8 (got N={n} L={l})");
+            candle_core::bail!(
+                "monarch fused fwd metal: N,L must be multiples of 8 (got N={n} L={l})"
+            );
         }
         let (o_dlr, o_dli, o_dnr, o_dni, o_tw, _total) = packed_offsets(n, l);
 
@@ -263,10 +274,21 @@ impl CustomOp2 for MonarchFusedForward {
         enc.set_threadgroup_memory_length(2, 4 * 64 * dts);
         // one threadgroup per (b,h); one simdgroup (32 lanes) each.
         enc.dispatch_thread_groups(
-            MTLSize { width: b * h, height: 1, depth: 1 },
-            MTLSize { width: 32, height: 1, depth: 1 },
+            MTLSize {
+                width: b * h,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: 32,
+                height: 1,
+                depth: 1,
+            },
         );
-        Ok((MetalStorage::new(out, dev.clone(), out_el, DType::F32), Shape::from((b, h, n, l, 2))))
+        Ok((
+            MetalStorage::new(out, dev.clone(), out_el, DType::F32),
+            Shape::from((b, h, n, l, 2)),
+        ))
     }
 }
 
@@ -289,9 +311,18 @@ fn pack_forward(d_f_n: &Tensor, d_f_l: &Tensor, twiddles: &Tensor) -> Result<Ten
 /// (`x` `[B,H,N,L]` real → `[B,H,N,L,2]` complex), but the whole transform is one
 /// tiled `simdgroup_matrix` Metal dispatch instead of three. `N,L` must be multiples
 /// of 8 on Metal; the CPU reference has no such restriction.
-pub fn butterfly_fft_forward_fused(x: &Tensor, d_f_n: &Tensor, d_f_l: &Tensor, twiddles: &Tensor) -> Result<Tensor> {
+pub fn butterfly_fft_forward_fused(
+    x: &Tensor,
+    d_f_n: &Tensor,
+    d_f_l: &Tensor,
+    twiddles: &Tensor,
+) -> Result<Tensor> {
     let x = x.contiguous()?;
-    let packed = pack_forward(&d_f_n.contiguous()?, &d_f_l.contiguous()?, &twiddles.contiguous()?)?;
+    let packed = pack_forward(
+        &d_f_n.contiguous()?,
+        &d_f_l.contiguous()?,
+        &twiddles.contiguous()?,
+    )?;
     x.apply_op2(&packed, MonarchFusedForward)
 }
 
@@ -521,7 +552,21 @@ fn pack_layout(n: usize, l: usize) -> PackLayout {
     let idli = idlr + ll;
     let itw = idli + ll;
     let total = itw + twn;
-    PackLayout { np, lp, dlr, dli, dnr, dni, tw, idnr, idni, idlr, idli, itw, total }
+    PackLayout {
+        np,
+        lp,
+        dlr,
+        dli,
+        dnr,
+        dni,
+        tw,
+        idnr,
+        idni,
+        idlr,
+        idli,
+        itw,
+        total,
+    }
 }
 
 /// Zero-pad a `[d,d]` matrix tensor up to `[dp,dp]` (bottom/right).
@@ -593,7 +638,11 @@ impl CustomOp3 for MonarchFusedConv {
         let lay = pack_layout(n, l);
         let (np, lp) = (lay.np, lay.lp);
         if packed.len() != lay.total {
-            candle_core::bail!("monarch fused conv: packed len {} != expected {}", packed.len(), lay.total);
+            candle_core::bail!(
+                "monarch fused conv: packed len {} != expected {}",
+                packed.len(),
+                lay.total
+            );
         }
         let scale = 1.0f32 / (n * l) as f32;
         let mut out = vec![0f32; b * h * n * l];
@@ -620,7 +669,10 @@ impl CustomOp3 for MonarchFusedConv {
                 for lo in 0..l {
                     let idx = ni * l + lo;
                     let (zr, zi) = (ar[idx], ai[idx]);
-                    let (twr, twi) = (packed[lay.tw + (ni * lp + lo) * 2], packed[lay.tw + (ni * lp + lo) * 2 + 1]);
+                    let (twr, twi) = (
+                        packed[lay.tw + (ni * lp + lo) * 2],
+                        packed[lay.tw + (ni * lp + lo) * 2 + 1],
+                    );
                     ar[idx] = zr * twr - zi * twi;
                     ai[idx] = zr * twi + zi * twr;
                 }
@@ -630,7 +682,10 @@ impl CustomOp3 for MonarchFusedConv {
                 for lo in 0..l {
                     let (mut sr, mut si) = (0f32, 0f32);
                     for k in 0..n {
-                        let (dr, di) = (packed[lay.dnr + np_ * np + k], packed[lay.dni + np_ * np + k]);
+                        let (dr, di) = (
+                            packed[lay.dnr + np_ * np + k],
+                            packed[lay.dni + np_ * np + k],
+                        );
                         let (zr, zi) = (ar[k * l + lo], ai[k * l + lo]);
                         sr += dr * zr - di * zi;
                         si += dr * zi + di * zr;
@@ -651,7 +706,10 @@ impl CustomOp3 for MonarchFusedConv {
                 for lo in 0..l {
                     let (mut sr, mut si) = (0f32, 0f32);
                     for k in 0..n {
-                        let (dr, di) = (packed[lay.idnr + np_ * np + k], packed[lay.idni + np_ * np + k]);
+                        let (dr, di) = (
+                            packed[lay.idnr + np_ * np + k],
+                            packed[lay.idni + np_ * np + k],
+                        );
                         let (zr, zi) = (br[k * l + lo], bi[k * l + lo]);
                         sr += dr * zr - di * zi;
                         si += dr * zi + di * zr;
@@ -665,7 +723,10 @@ impl CustomOp3 for MonarchFusedConv {
                 for lo in 0..l {
                     let idx = ni * l + lo;
                     let (zr, zi) = (ar[idx], ai[idx]);
-                    let (twr, twi) = (packed[lay.itw + (ni * lp + lo) * 2], packed[lay.itw + (ni * lp + lo) * 2 + 1]);
+                    let (twr, twi) = (
+                        packed[lay.itw + (ni * lp + lo) * 2],
+                        packed[lay.itw + (ni * lp + lo) * 2 + 1],
+                    );
                     ar[idx] = zr * twr - zi * twi;
                     ai[idx] = zr * twi + zi * twr;
                 }
@@ -675,7 +736,8 @@ impl CustomOp3 for MonarchFusedConv {
                 for lo in 0..l {
                     let mut sr = 0f32;
                     for k in 0..l {
-                        sr += ar[ni * l + k] * packed[lay.idlr + k * lp + lo] - ai[ni * l + k] * packed[lay.idli + k * lp + lo];
+                        sr += ar[ni * l + k] * packed[lay.idlr + k * lp + lo]
+                            - ai[ni * l + k] * packed[lay.idli + k * lp + lo];
                     }
                     out[bh * n * l + ni * l + lo] = sr * scale;
                 }
@@ -765,10 +827,21 @@ impl CustomOp3 for MonarchFusedConv {
         enc.set_threadgroup_memory_length(4, nplp); // bxi
         enc.set_threadgroup_memory_length(5, 4 * 64 * dts); // scratch
         enc.dispatch_thread_groups(
-            MTLSize { width: b * h, height: 1, depth: 1 },
-            MTLSize { width: 32, height: 1, depth: 1 },
+            MTLSize {
+                width: b * h,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: 32,
+                height: 1,
+                depth: 1,
+            },
         );
-        Ok((MetalStorage::new(out, dev.clone(), out_el, DType::F32), Shape::from((b, h, n, l))))
+        Ok((
+            MetalStorage::new(out, dev.clone(), out_el, DType::F32),
+            Shape::from((b, h, n, l)),
+        ))
     }
 }
 
@@ -818,7 +891,10 @@ pub fn warmup(device: &candle_core::Device) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{butterfly_fft_forward, fft_matrix, ifft_matrix, monarch_conv, twiddle_factors_fft, twiddle_factors_ifft};
+    use crate::{
+        butterfly_fft_forward, fft_matrix, ifft_matrix, monarch_conv, twiddle_factors_fft,
+        twiddle_factors_ifft,
+    };
     use candle_core::Device;
 
     // Build the six DFT/twiddle matrices for (n,l) on `dev`.
@@ -838,7 +914,9 @@ mod tests {
     fn fused_forward_cpu_matches_unfused() {
         let dev = Device::Cpu;
         let (b, h, n, l) = (2usize, 3, 16, 8);
-        let x: Vec<f32> = (0..b * h * n * l).map(|i| (i as f32 * 0.07).sin()).collect();
+        let x: Vec<f32> = (0..b * h * n * l)
+            .map(|i| (i as f32 * 0.07).sin())
+            .collect();
         let xt = Tensor::from_vec(x, (b, h, n, l), &dev).unwrap();
         let (dfn, dfl, tw) = (
             fft_matrix(n, &dev).unwrap(),
@@ -857,7 +935,10 @@ mod tests {
             .unwrap()
             .to_vec1()
             .unwrap();
-        let maxd = fused.iter().zip(&unfused).fold(0f32, |m, (a, e)| m.max((a - e).abs()));
+        let maxd = fused
+            .iter()
+            .zip(&unfused)
+            .fold(0f32, |m, (a, e)| m.max((a - e).abs()));
         assert!(maxd < 1e-4, "fused fwd (cpu) vs un-fused max diff {maxd}");
         eprintln!("fused forward cpu == un-fused, max diff {maxd:.2e}");
     }
@@ -868,17 +949,35 @@ mod tests {
     fn fused_conv_cpu_matches_monarch_conv() {
         let dev = Device::Cpu;
         let (b, h, n, l) = (2usize, 2, 16, 8);
-        let u: Vec<f32> = (0..b * h * n * l).map(|i| (i as f32 * 0.05).sin()).collect();
+        let u: Vec<f32> = (0..b * h * n * l)
+            .map(|i| (i as f32 * 0.05).sin())
+            .collect();
         let ut = Tensor::from_vec(u, (b, h, n, l), &dev).unwrap();
-        let kf: Vec<f32> = (0..b * h * n * l * 2).map(|i| ((i * 7 % 13) as f32 * 0.03) - 0.2).collect();
+        let kf: Vec<f32> = (0..b * h * n * l * 2)
+            .map(|i| ((i * 7 % 13) as f32 * 0.03) - 0.2)
+            .collect();
         let kft = Tensor::from_vec(kf, (b, h, n, l, 2), &dev).unwrap();
         let (dfn, dfl, tw, idfn, idfl, itw) = mats(n, l, &dev);
         let fused: Vec<f32> = monarch_conv_fused(&ut, &kft, &dfn, &dfl, &tw, &idfn, &idfl, &itw)
-            .unwrap().flatten_all().unwrap().to_vec1().unwrap();
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
         let oracle: Vec<f32> = monarch_conv(&ut, &kft, &dfn, &dfl, &tw, &idfn, &idfl, &itw)
-            .unwrap().flatten_all().unwrap().to_vec1().unwrap();
-        let maxd = fused.iter().zip(&oracle).fold(0f32, |m, (a, e)| m.max((a - e).abs()));
-        assert!(maxd < 1e-3, "fused conv (cpu) vs monarch_conv max diff {maxd}");
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let maxd = fused
+            .iter()
+            .zip(&oracle)
+            .fold(0f32, |m, (a, e)| m.max((a - e).abs()));
+        assert!(
+            maxd < 1e-3,
+            "fused conv (cpu) vs monarch_conv max diff {maxd}"
+        );
         eprintln!("fused conv cpu == monarch_conv, max diff {maxd:.2e}");
     }
 
@@ -893,8 +992,12 @@ mod tests {
             }
         };
         let (b, h, n, l) = (2usize, 2, 16, 16);
-        let u: Vec<f32> = (0..b * h * n * l).map(|i| ((i * 13 % 19) as f32 * 0.05) - 0.4).collect();
-        let kf: Vec<f32> = (0..b * h * n * l * 2).map(|i| ((i * 7 % 11) as f32 * 0.03) - 0.15).collect();
+        let u: Vec<f32> = (0..b * h * n * l)
+            .map(|i| ((i * 13 % 19) as f32 * 0.05) - 0.4)
+            .collect();
+        let kf: Vec<f32> = (0..b * h * n * l * 2)
+            .map(|i| ((i * 7 % 11) as f32 * 0.03) - 0.15)
+            .collect();
         let run = |dev: &Device, fused: bool| -> Vec<f32> {
             let ut = Tensor::from_vec(u.clone(), (b, h, n, l), dev).unwrap();
             let kft = Tensor::from_vec(kf.clone(), (b, h, n, l, 2), dev).unwrap();
@@ -909,9 +1012,18 @@ mod tests {
         let fused_met = run(&mdev, true);
         let oracle_met = run(&mdev, false);
         let fused_cpu = run(&Device::Cpu, true);
-        let d_oracle = fused_met.iter().zip(&oracle_met).fold(0f32, |m, (a, e)| m.max((a - e).abs()));
-        let d_cpu = fused_met.iter().zip(&fused_cpu).fold(0f32, |m, (a, e)| m.max((a - e).abs()));
-        assert!(d_oracle < 1e-3, "fused-metal vs monarch_conv max diff {d_oracle}");
+        let d_oracle = fused_met
+            .iter()
+            .zip(&oracle_met)
+            .fold(0f32, |m, (a, e)| m.max((a - e).abs()));
+        let d_cpu = fused_met
+            .iter()
+            .zip(&fused_cpu)
+            .fold(0f32, |m, (a, e)| m.max((a - e).abs()));
+        assert!(
+            d_oracle < 1e-3,
+            "fused-metal vs monarch_conv max diff {d_oracle}"
+        );
         assert!(d_cpu < 1e-4, "fused-metal vs fused-cpu max diff {d_cpu}");
         eprintln!("fused conv: metal==oracle {d_oracle:.2e}, metal==cpu {d_cpu:.2e}");
     }
@@ -929,8 +1041,12 @@ mod tests {
         };
         for (n, l) in [(6usize, 10usize), (12, 20), (8, 24), (10, 6)] {
             let (b, h) = (1usize, 2usize);
-            let u: Vec<f32> = (0..b * h * n * l).map(|i| ((i * 5 % 17) as f32 * 0.05) - 0.3).collect();
-            let kf: Vec<f32> = (0..b * h * n * l * 2).map(|i| ((i * 3 % 7) as f32 * 0.04) - 0.1).collect();
+            let u: Vec<f32> = (0..b * h * n * l)
+                .map(|i| ((i * 5 % 17) as f32 * 0.05) - 0.3)
+                .collect();
+            let kf: Vec<f32> = (0..b * h * n * l * 2)
+                .map(|i| ((i * 3 % 7) as f32 * 0.04) - 0.1)
+                .collect();
             let run = |dev: &Device, fused: bool| -> Vec<f32> {
                 let ut = Tensor::from_vec(u.clone(), (b, h, n, l), dev).unwrap();
                 let kft = Tensor::from_vec(kf.clone(), (b, h, n, l, 2), dev).unwrap();
@@ -944,8 +1060,14 @@ mod tests {
             };
             let fm = run(&mdev, true);
             let om = run(&mdev, false);
-            let d = fm.iter().zip(&om).fold(0f32, |m, (a, e)| m.max((a - e).abs()));
-            assert!(d < 1e-3, "edge dims N={n} L={l}: fused-metal vs oracle max diff {d}");
+            let d = fm
+                .iter()
+                .zip(&om)
+                .fold(0f32, |m, (a, e)| m.max((a - e).abs()));
+            assert!(
+                d < 1e-3,
+                "edge dims N={n} L={l}: fused-metal vs oracle max diff {d}"
+            );
             eprintln!("fused conv edge N={n} L={l}: metal==oracle {d:.2e}");
         }
     }
@@ -956,7 +1078,9 @@ mod tests {
         let (n, l) = (4usize, 4);
         let m = n * l;
         let u_time: Vec<f32> = (0..m).map(|i| (i as f32 * 0.21).sin()).collect();
-        let k_time: Vec<f32> = (0..m).map(|i| (i as f32 * 0.11 + 1.0).cos() * 0.5).collect();
+        let k_time: Vec<f32> = (0..m)
+            .map(|i| (i as f32 * 0.11 + 1.0).cos() * 0.5)
+            .collect();
         // Monarch reads input column-major: tensor[ni*L+li] holds time index li*N+ni.
         let lay = |t: &[f32]| -> Vec<f32> {
             let mut v = vec![0f32; m];
@@ -988,7 +1112,10 @@ mod tests {
             }
             exp[nn] = acc as f32;
         }
-        let maxd = y_time.iter().zip(&exp).fold(0f32, |mm, (a, e)| mm.max((a - e).abs()));
+        let maxd = y_time
+            .iter()
+            .zip(&exp)
+            .fold(0f32, |mm, (a, e)| mm.max((a - e).abs()));
         assert!(maxd < 1e-3, "fused conv != circular conv, max diff {maxd}");
         eprintln!("fused conv == circular conv (col-major time order), max diff {maxd:.2e}");
     }
@@ -1020,7 +1147,12 @@ mod tests {
             go();
         }
         let after = crate::metal_util::pipeline_compiles();
-        assert_eq!(after, before, "fused fwd kernel recompiled on reuse: {} compiles over 8 dispatches", after - before);
+        assert_eq!(
+            after,
+            before,
+            "fused fwd kernel recompiled on reuse: {} compiles over 8 dispatches",
+            after - before
+        );
         eprintln!("fused forward: 0 recompiles over 8 reuses (cached pipeline, total compiles seen = {after})");
     }
 
@@ -1072,7 +1204,10 @@ mod tests {
             worker_compiles, 0,
             "worker thread recompiled the shared kernel {worker_compiles}x instead of reusing it"
         );
-        let maxd = main_res.iter().zip(&worker_res).fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+        let maxd = main_res
+            .iter()
+            .zip(&worker_res)
+            .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
         assert!(maxd < 1e-6, "cross-thread result mismatch {maxd}");
         eprintln!("fused forward: compiled once on main, reused on worker thread (0 recompiles), result identical ({maxd:.1e})");
     }
@@ -1088,7 +1223,9 @@ mod tests {
             }
         };
         let (b, h, n, l) = (2usize, 3, 16, 16);
-        let x: Vec<f32> = (0..b * h * n * l).map(|i| ((i * 11 % 17) as f32 * 0.05) - 0.4).collect();
+        let x: Vec<f32> = (0..b * h * n * l)
+            .map(|i| ((i * 11 % 17) as f32 * 0.05) - 0.4)
+            .collect();
         // fused on metal vs the crate's already-verified un-fused forward on metal.
         let run = |dev: &Device, fused: bool| -> Vec<f32> {
             let xt = Tensor::from_vec(x.clone(), (b, h, n, l), dev).unwrap();
@@ -1107,8 +1244,14 @@ mod tests {
         let fused_met = run(&mdev, true);
         let unfused_met = run(&mdev, false);
         let fused_cpu = run(&Device::Cpu, true);
-        let d_mm = fused_met.iter().zip(&unfused_met).fold(0f32, |m, (a, e)| m.max((a - e).abs()));
-        let d_mc = fused_met.iter().zip(&fused_cpu).fold(0f32, |m, (a, e)| m.max((a - e).abs()));
+        let d_mm = fused_met
+            .iter()
+            .zip(&unfused_met)
+            .fold(0f32, |m, (a, e)| m.max((a - e).abs()));
+        let d_mc = fused_met
+            .iter()
+            .zip(&fused_cpu)
+            .fold(0f32, |m, (a, e)| m.max((a - e).abs()));
         assert!(d_mm < 1e-4, "fused-metal vs unfused-metal max diff {d_mm}");
         assert!(d_mc < 1e-4, "fused-metal vs fused-cpu max diff {d_mc}");
         eprintln!("fused forward: metal==unfused {d_mm:.2e}, metal==cpu {d_mc:.2e}");
@@ -1146,11 +1289,21 @@ kernel void sg_probe_f32(
         fn name(&self) -> &'static str {
             "sg_probe"
         }
-        fn cpu_fwd(&self, as_: &CpuStorage, al: &Layout, bs: &CpuStorage, bl: &Layout) -> Result<(CpuStorage, Shape)> {
+        fn cpu_fwd(
+            &self,
+            as_: &CpuStorage,
+            al: &Layout,
+            bs: &CpuStorage,
+            bl: &Layout,
+        ) -> Result<(CpuStorage, Shape)> {
             let a = as_.as_slice::<f32>()?;
             let b = bs.as_slice::<f32>()?;
-            let (a0, _) = al.contiguous_offsets().ok_or_else(|| candle_core::Error::Msg("sg_probe: A not contiguous".into()))?;
-            let (b0, _) = bl.contiguous_offsets().ok_or_else(|| candle_core::Error::Msg("sg_probe: B not contiguous".into()))?;
+            let (a0, _) = al
+                .contiguous_offsets()
+                .ok_or_else(|| candle_core::Error::Msg("sg_probe: A not contiguous".into()))?;
+            let (b0, _) = bl
+                .contiguous_offsets()
+                .ok_or_else(|| candle_core::Error::Msg("sg_probe: B not contiguous".into()))?;
             let mut c = vec![0f32; 64];
             for i in 0..8 {
                 for j in 0..8 {
@@ -1163,7 +1316,13 @@ kernel void sg_probe_f32(
             }
             Ok((CpuStorage::F32(c), Shape::from((8, 8))))
         }
-        fn metal_fwd(&self, as_: &MetalStorage, al: &Layout, bs: &MetalStorage, bl: &Layout) -> Result<(MetalStorage, Shape)> {
+        fn metal_fwd(
+            &self,
+            as_: &MetalStorage,
+            al: &Layout,
+            bs: &MetalStorage,
+            bl: &Layout,
+        ) -> Result<(MetalStorage, Shape)> {
             use objc2_metal::MTLSize;
             let dev = as_.device();
             let p = crate::metal_util::pipeline(dev, "sg_probe_f32", SRC)?;
@@ -1174,10 +1333,21 @@ kernel void sg_probe_f32(
             enc.set_buffer(1, Some(bs.buffer()), bl.start_offset() * 4);
             enc.set_buffer(2, Some(&*out), 0);
             enc.dispatch_thread_groups(
-                MTLSize { width: 1, height: 1, depth: 1 },
-                MTLSize { width: 32, height: 1, depth: 1 },
+                MTLSize {
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 32,
+                    height: 1,
+                    depth: 1,
+                },
             );
-            Ok((MetalStorage::new(out, dev.clone(), 64, DType::F32), Shape::from((8, 8))))
+            Ok((
+                MetalStorage::new(out, dev.clone(), 64, DType::F32),
+                Shape::from((8, 8)),
+            ))
         }
     }
 
@@ -1192,16 +1362,29 @@ kernel void sg_probe_f32(
             }
         };
         let a: Vec<f32> = (0..64).map(|i| ((i * 7 % 13) as f32) * 0.1 - 0.3).collect();
-        let b: Vec<f32> = (0..64).map(|i| ((i * 5 % 11) as f32) * 0.07 - 0.2).collect();
+        let b: Vec<f32> = (0..64)
+            .map(|i| ((i * 5 % 11) as f32) * 0.07 - 0.2)
+            .collect();
         let run = |dev: &Device| -> Vec<f32> {
             let at = Tensor::from_vec(a.clone(), (8, 8), dev).unwrap();
             let bt = Tensor::from_vec(b.clone(), (8, 8), dev).unwrap();
-            at.apply_op2(&bt, SgProbe).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap()
+            at.apply_op2(&bt, SgProbe)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
         };
         let cpu = run(&Device::Cpu);
         let met = run(&mdev);
-        let maxd = cpu.iter().zip(&met).fold(0f32, |m, (x, y)| m.max((x - y).abs()));
-        assert!(maxd < 1e-4, "simdgroup_matrix probe metal vs cpu max diff {maxd}");
+        let maxd = cpu
+            .iter()
+            .zip(&met)
+            .fold(0f32, |m, (x, y)| m.max((x - y).abs()));
+        assert!(
+            maxd < 1e-4,
+            "simdgroup_matrix probe metal vs cpu max diff {maxd}"
+        );
         eprintln!("simdgroup_matrix probe: metal == cpu, max diff {maxd:.2e}");
     }
 }

@@ -63,10 +63,7 @@ fn model_safetensors_in(dir: &Path) -> Result<Vec<PathBuf>> {
         })
         .collect();
     if safes.is_empty() {
-        return Err(err(format!(
-            "no model .safetensors in {}",
-            dir.display()
-        )));
+        return Err(err(format!("no model .safetensors in {}", dir.display())));
     }
     Ok(safes)
 }
@@ -257,10 +254,7 @@ pub struct TrainableLoad {
 /// CPU BF16 training is rejected because the NEON inference matmul bridge is
 /// no-bwd; callers should not upcast persistent BF16 weights to F32 just to make
 /// CPU training run.
-pub fn from_pretrained_trainable(
-    dir: &Path,
-    device: &Device,
-) -> Result<TrainableLoad> {
+pub fn from_pretrained_trainable(dir: &Path, device: &Device) -> Result<TrainableLoad> {
     let config: Value =
         serde_json::from_str(&fs::read_to_string(dir.join("config.json")).map_err(err)?)
             .map_err(err)?;

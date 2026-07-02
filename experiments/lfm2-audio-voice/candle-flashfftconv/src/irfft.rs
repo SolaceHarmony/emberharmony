@@ -57,7 +57,11 @@ fn irfft_basis(n: usize, freq: usize, norm: FftNorm) -> (Vec<f64>, Vec<f64>) {
     let mut sw = vec![0f64; freq * n];
     for k in 0..freq {
         // Hermitian weight: DC and (even-n) Nyquist counted once, the rest twice.
-        let a = if k == 0 || (n % 2 == 0 && k == n / 2) { 1.0 } else { 2.0 };
+        let a = if k == 0 || (n % 2 == 0 && k == n / 2) {
+            1.0
+        } else {
+            2.0
+        };
         for j in 0..n {
             let ang = two_pi * k as f64 * j as f64 / n as f64;
             cw[k * n + j] = a * ang.cos() * scale;
@@ -96,8 +100,12 @@ pub fn irfft(re: &Tensor, im: &Tensor, n: usize, norm: FftNorm) -> Result<Tensor
     // downcast before it ever touches the GPU. (For f64-on-Metal use `irfft_dd`.)
     let (cw, sw) = irfft_basis(n, freq, norm);
     let cpu = candle_core::Device::Cpu;
-    let cw = Tensor::from_vec(cw, (freq, n), &cpu)?.to_dtype(dtype)?.to_device(dev)?;
-    let sw = Tensor::from_vec(sw, (freq, n), &cpu)?.to_dtype(dtype)?.to_device(dev)?;
+    let cw = Tensor::from_vec(cw, (freq, n), &cpu)?
+        .to_dtype(dtype)?
+        .to_device(dev)?;
+    let sw = Tensor::from_vec(sw, (freq, n), &cpu)?
+        .to_dtype(dtype)?
+        .to_device(dev)?;
     // Contract the freq axis: [M, freq] @ [freq, n] → [M, n].
     let m: usize = dims[..dims.len() - 1].iter().product();
     let re2 = re.reshape((m, freq))?.contiguous()?;
@@ -161,7 +169,13 @@ impl CustomOp2 for IrfftDd {
         "irfft_dd"
     }
 
-    fn cpu_fwd(&self, rs: &CpuStorage, rl: &Layout, is: &CpuStorage, il: &Layout) -> Result<(CpuStorage, Shape)> {
+    fn cpu_fwd(
+        &self,
+        rs: &CpuStorage,
+        rl: &Layout,
+        is: &CpuStorage,
+        il: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
         let (m, freq) = rl.shape().dims2()?;
         if freq != rfft_freqs(self.n) {
             candle_core::bail!("irfft_dd: freq {freq} != n/2+1 for n={}", self.n);
@@ -250,10 +264,21 @@ impl CustomOp2 for IrfftDd {
         let tg = total.clamp(1, max_tg);
         let ng = total.div_ceil(tg);
         enc.dispatch_thread_groups(
-            MTLSize { width: ng, height: 1, depth: 1 },
-            MTLSize { width: tg, height: 1, depth: 1 },
+            MTLSize {
+                width: ng,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: tg,
+                height: 1,
+                depth: 1,
+            },
         );
-        Ok((MetalStorage::new(out, dev.clone(), total, DType::F32), Shape::from((m, n))))
+        Ok((
+            MetalStorage::new(out, dev.clone(), total, DType::F32),
+            Shape::from((m, n)),
+        ))
     }
 }
 
@@ -317,8 +342,16 @@ mod tests {
         let exp = naive_irfft(&re, &im, n, FftNorm::Backward);
         let ret = Tensor::from_vec(re.clone(), (1, freq), &dev).unwrap();
         let imt = Tensor::from_vec(im.clone(), (1, freq), &dev).unwrap();
-        let got: Vec<f64> = irfft(&ret, &imt, n, FftNorm::Backward).unwrap().flatten_all().unwrap().to_vec1().unwrap();
-        let maxd = got.iter().zip(exp.iter()).fold(0f64, |m, (a, e)| m.max((a - e).abs()));
+        let got: Vec<f64> = irfft(&ret, &imt, n, FftNorm::Backward)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let maxd = got
+            .iter()
+            .zip(exp.iter())
+            .fold(0f64, |m, (a, e)| m.max((a - e).abs()));
         assert!(maxd < 1e-12, "irfft f64 vs naive: {maxd:e}");
         eprintln!("irfft f64 == naive hermitian iDFT, max diff {maxd:.2e}");
     }
@@ -328,14 +361,24 @@ mod tests {
         let dev = Device::Cpu;
         let n = 1280usize; // the detokenizer size (2^8·5, not power of two)
         let freq = rfft_freqs(n);
-        let re: Vec<f64> = (0..freq).map(|k| (k as f64 * 0.017).cos() * (1.0 + k as f64 * 0.01)).collect();
+        let re: Vec<f64> = (0..freq)
+            .map(|k| (k as f64 * 0.017).cos() * (1.0 + k as f64 * 0.01))
+            .collect();
         let im: Vec<f64> = (0..freq).map(|k| (k as f64 * 0.013).sin()).collect();
         let exp = naive_irfft(&re, &im, n, FftNorm::Backward);
         let ref32 = |v: &[f64]| -> Vec<f32> { v.iter().map(|&x| x as f32).collect() };
         let ret = Tensor::from_vec(ref32(&re), (1, freq), &dev).unwrap();
         let imt = Tensor::from_vec(ref32(&im), (1, freq), &dev).unwrap();
-        let got: Vec<f32> = irfft(&ret, &imt, n, FftNorm::Backward).unwrap().flatten_all().unwrap().to_vec1().unwrap();
-        let maxd = got.iter().zip(exp.iter()).fold(0f64, |m, (a, &e)| m.max((*a as f64 - e).abs()));
+        let got: Vec<f32> = irfft(&ret, &imt, n, FftNorm::Backward)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let maxd = got
+            .iter()
+            .zip(exp.iter())
+            .fold(0f64, |m, (a, &e)| m.max((*a as f64 - e).abs()));
         // f32 matmul of a 641-term inverse DFT — within the f32 floor of the true value.
         assert!(maxd < 1e-3, "irfft f32 vs f64 ref: {maxd:e}");
         eprintln!("irfft f32 tracks f64 reference (n={n}), max diff {maxd:.2e}");
@@ -346,16 +389,26 @@ mod tests {
         let dev = Device::Cpu;
         let n = 1280usize;
         let freq = rfft_freqs(n);
-        let re: Vec<f64> = (0..freq).map(|k| (k as f64 * 0.017).cos() * (1.0 + k as f64 * 0.01)).collect();
+        let re: Vec<f64> = (0..freq)
+            .map(|k| (k as f64 * 0.017).cos() * (1.0 + k as f64 * 0.01))
+            .collect();
         let im: Vec<f64> = (0..freq).map(|k| (k as f64 * 0.013).sin()).collect();
         let exp = naive_irfft(&re, &im, n, FftNorm::Backward);
         let r32: Vec<f32> = re.iter().map(|&x| x as f32).collect();
         let i32v: Vec<f32> = im.iter().map(|&x| x as f32).collect();
         let ret = Tensor::from_vec(r32, (1, freq), &dev).unwrap();
         let imt = Tensor::from_vec(i32v, (1, freq), &dev).unwrap();
-        let got: Vec<f32> = irfft_dd(&ret, &imt, n, FftNorm::Backward).unwrap().flatten_all().unwrap().to_vec1().unwrap();
+        let got: Vec<f32> = irfft_dd(&ret, &imt, n, FftNorm::Backward)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
         // dd cpu path = the exact f64 reference rounded to f32 → within f32 epsilon.
-        let maxd = got.iter().zip(exp.iter()).fold(0f64, |m, (a, &e)| m.max((*a as f64 - e).abs()));
+        let maxd = got
+            .iter()
+            .zip(exp.iter())
+            .fold(0f64, |m, (a, &e)| m.max((*a as f64 - e).abs()));
         assert!(maxd < 1e-4, "irfft_dd cpu vs f64 ref: {maxd:e}");
         eprintln!("irfft_dd cpu == f64 reference (n={n}), max diff {maxd:.2e}");
     }
@@ -377,15 +430,35 @@ mod tests {
         };
         let n = 512usize;
         let freq = rfft_freqs(n);
-        let re: Vec<f32> = (0..freq).map(|k| ((k as f32 * 0.031).cos()) * (1.0 + k as f32 * 0.05)).collect();
-        let im: Vec<f32> = (0..freq).map(|k| ((k as f32 * 0.027).sin()) * (1.0 + k as f32 * 0.05)).collect();
+        let re: Vec<f32> = (0..freq)
+            .map(|k| ((k as f32 * 0.031).cos()) * (1.0 + k as f32 * 0.05))
+            .collect();
+        let im: Vec<f32> = (0..freq)
+            .map(|k| ((k as f32 * 0.027).sin()) * (1.0 + k as f32 * 0.05))
+            .collect();
         let mk = |dev: &Device, v: &[f32]| Tensor::from_vec(v.to_vec(), (1, freq), dev).unwrap();
         // dd on CPU (exact f64 reference) and dd on Metal (the kernel under test).
-        let cpu_dd: Vec<f32> = irfft_dd(&mk(&Device::Cpu, &re), &mk(&Device::Cpu, &im), n, FftNorm::Backward)
-            .unwrap().flatten_all().unwrap().to_vec1().unwrap();
+        let cpu_dd: Vec<f32> = irfft_dd(
+            &mk(&Device::Cpu, &re),
+            &mk(&Device::Cpu, &im),
+            n,
+            FftNorm::Backward,
+        )
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1()
+        .unwrap();
         let met_dd: Vec<f32> = irfft_dd(&mk(&mdev, &re), &mk(&mdev, &im), n, FftNorm::Backward)
-            .unwrap().flatten_all().unwrap().to_vec1().unwrap();
-        let maxd = cpu_dd.iter().zip(met_dd.iter()).fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let maxd = cpu_dd
+            .iter()
+            .zip(met_dd.iter())
+            .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
         let scale = cpu_dd.iter().fold(0f32, |m, &x| m.max(x.abs())).max(1e-6);
         let rel = maxd / scale;
         eprintln!("irfft_dd: metal == cpu f64, max diff {maxd:.2e} (rel {rel:.2e})");
@@ -410,11 +483,19 @@ mod tests {
         let run = |dev: &Device| -> Vec<f32> {
             let ret = Tensor::from_vec(re.clone(), (1, freq), dev).unwrap();
             let imt = Tensor::from_vec(im.clone(), (1, freq), dev).unwrap();
-            irfft(&ret, &imt, n, FftNorm::Backward).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap()
+            irfft(&ret, &imt, n, FftNorm::Backward)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
         };
         let cpu = run(&Device::Cpu);
         let met = run(&mdev);
-        let maxd = cpu.iter().zip(met.iter()).fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+        let maxd = cpu
+            .iter()
+            .zip(met.iter())
+            .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
         assert!(maxd < 1e-4, "irfft metal vs cpu: {maxd:e}");
         eprintln!("irfft f32: metal == cpu, max diff {maxd:.2e}");
     }

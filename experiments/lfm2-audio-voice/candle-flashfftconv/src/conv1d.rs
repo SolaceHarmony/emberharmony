@@ -122,7 +122,10 @@ impl DepthwiseCausalConv1d {
     fn out_len(&self, l: usize, k: usize) -> Result<usize> {
         let lo = l as i64 + 2 * self.padding as i64 - k as i64 + 1;
         if lo <= 0 {
-            candle_core::bail!("depthwise_conv1d: non-positive output length (L={l}, K={k}, padding={})", self.padding);
+            candle_core::bail!(
+                "depthwise_conv1d: non-positive output length (L={l}, K={k}, padding={})",
+                self.padding
+            );
         }
         Ok(lo as usize)
     }
@@ -150,7 +153,17 @@ fn contig_bf16_to_f32(s: &CpuStorage, l: &Layout) -> Result<Vec<f32>> {
 /// paths (the bf16 path up-converts its inputs here and rounds the result back to bf16,
 /// i.e. f32-accumulate, bf16-store).
 #[allow(clippy::too_many_arguments)]
-fn conv_cpu_f32(u: &[f32], w: &[f32], bias: &[f32], b: usize, d: usize, l: usize, l_out: usize, k: usize, pad: i64) -> Vec<f32> {
+fn conv_cpu_f32(
+    u: &[f32],
+    w: &[f32],
+    bias: &[f32],
+    b: usize,
+    d: usize,
+    l: usize,
+    l_out: usize,
+    k: usize,
+    pad: i64,
+) -> Vec<f32> {
     let mut out = vec![0f32; b * d * l_out];
     for bi in 0..b {
         for di in 0..d {
@@ -197,7 +210,17 @@ impl CustomOp3 for DepthwiseCausalConv1d {
         let shape = Shape::from((b, d, l_out));
         match us.dtype() {
             DType::F32 => {
-                let out = conv_cpu_f32(contig_f32(us, ul)?, contig_f32(ws, wl)?, contig_f32(bs, bl)?, b, d, l, l_out, k, pad);
+                let out = conv_cpu_f32(
+                    contig_f32(us, ul)?,
+                    contig_f32(ws, wl)?,
+                    contig_f32(bs, bl)?,
+                    b,
+                    d,
+                    l,
+                    l_out,
+                    k,
+                    pad,
+                );
                 Ok((CpuStorage::F32(out), shape))
             }
             DType::BF16 => {
@@ -206,7 +229,12 @@ impl CustomOp3 for DepthwiseCausalConv1d {
                     &contig_bf16_to_f32(us, ul)?,
                     &contig_bf16_to_f32(ws, wl)?,
                     &contig_bf16_to_f32(bs, bl)?,
-                    b, d, l, l_out, k, pad,
+                    b,
+                    d,
+                    l,
+                    l_out,
+                    k,
+                    pad,
                 );
                 let out: Vec<half::bf16> = out.iter().map(|&x| half::bf16::from_f32(x)).collect();
                 Ok((CpuStorage::BF16(out), shape))
@@ -265,20 +293,33 @@ impl CustomOp3 for DepthwiseCausalConv1d {
         let tg = total.clamp(1, max_tg);
         let n_groups = total.div_ceil(tg);
         encoder.dispatch_thread_groups(
-            MTLSize { width: n_groups, height: 1, depth: 1 },
-            MTLSize { width: tg, height: 1, depth: 1 },
+            MTLSize {
+                width: n_groups,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: tg,
+                height: 1,
+                depth: 1,
+            },
         );
         // candle owns the command-buffer lifecycle (commit/flush on sync); the
         // shared encoder is neither ended nor committed here.
 
-        Ok((MetalStorage::new(out_buf, dev.clone(), total, dt), Shape::from((b, d, l_out))))
+        Ok((
+            MetalStorage::new(out_buf, dev.clone(), total, dt),
+            Shape::from((b, d, l_out)),
+        ))
     }
 }
 
 /// Compile + cache the f32 pipeline. The cache is per-thread and assumes a single
 /// Metal device (the common case); a second device would recompile per thread.
 #[cfg(feature = "metal")]
-fn f32_pipeline(dev: &candle_core::MetalDevice) -> Result<candle_metal_kernels::metal::ComputePipeline> {
+fn f32_pipeline(
+    dev: &candle_core::MetalDevice,
+) -> Result<candle_metal_kernels::metal::ComputePipeline> {
     use std::cell::OnceCell;
     thread_local! {
         static P: OnceCell<candle_metal_kernels::metal::ComputePipeline> = const { OnceCell::new() };
@@ -304,7 +345,9 @@ fn f32_pipeline(dev: &candle_core::MetalDevice) -> Result<candle_metal_kernels::
 
 /// Compile + cache the bf16 pipeline (mirrors [`f32_pipeline`]).
 #[cfg(feature = "metal")]
-fn bf16_pipeline(dev: &candle_core::MetalDevice) -> Result<candle_metal_kernels::metal::ComputePipeline> {
+fn bf16_pipeline(
+    dev: &candle_core::MetalDevice,
+) -> Result<candle_metal_kernels::metal::ComputePipeline> {
     use std::cell::OnceCell;
     thread_local! {
         static P: OnceCell<candle_metal_kernels::metal::ComputePipeline> = const { OnceCell::new() };
@@ -332,7 +375,12 @@ fn bf16_pipeline(dev: &candle_core::MetalDevice) -> Result<candle_metal_kernels:
 /// `bias` `[D]`. Returns `[B, D, L + 2·padding − K + 1]`. **f32 or bf16** — bf16 runs the
 /// deployed/trained regime (f32 accumulate, bf16 store), so the short-conv keeps the
 /// model's dtype with no upcast. The bias defaults to zeros in the input dtype.
-pub fn depthwise_conv1d(u: &Tensor, weight: &Tensor, bias: Option<&Tensor>, padding: usize) -> Result<Tensor> {
+pub fn depthwise_conv1d(
+    u: &Tensor,
+    weight: &Tensor,
+    bias: Option<&Tensor>,
+    padding: usize,
+) -> Result<Tensor> {
     let (_b, d, _l) = u.dims3()?;
     let dt = u.dtype();
     if dt != DType::F32 && dt != DType::BF16 {
@@ -359,7 +407,11 @@ pub fn depthwise_conv1d(u: &Tensor, weight: &Tensor, bias: Option<&Tensor>, padd
 /// convolution is the kernel). f32 or bf16 (the dtype is preserved). For `cache = None` this equals
 /// `depthwise_conv1d(x, weight, None, K-1).narrow(2, 0, T)`, and a `T=1` step is exactly
 /// LFM2's decode gather `Σ_k window[k]·w[k]`.
-pub fn depthwise_conv1d_stream(x: &Tensor, weight: &Tensor, cache: Option<&Tensor>) -> Result<(Tensor, Tensor)> {
+pub fn depthwise_conv1d_stream(
+    x: &Tensor,
+    weight: &Tensor,
+    cache: Option<&Tensor>,
+) -> Result<(Tensor, Tensor)> {
     let (b, d, t) = x.dims3()?;
     let (_d, k) = weight.dims2()?;
     let p = k - 1; // cache length = the K-1 prior input samples
@@ -378,7 +430,16 @@ mod tests {
     use super::*;
     use candle_core::Device;
 
-    fn naive(u: &[f32], w: &[f32], bias: &[f32], b: usize, d: usize, l: usize, k: usize, pad: usize) -> (Vec<f32>, usize) {
+    fn naive(
+        u: &[f32],
+        w: &[f32],
+        bias: &[f32],
+        b: usize,
+        d: usize,
+        l: usize,
+        k: usize,
+        pad: usize,
+    ) -> (Vec<f32>, usize) {
         let l_out = (l as i64 + 2 * pad as i64 - k as i64 + 1) as usize;
         let mut out = vec![0f32; b * d * l_out];
         for bi in 0..b {
@@ -425,13 +486,21 @@ mod tests {
         let dev = Device::Cpu;
         let (b, d, k) = (2usize, 4, 3);
         let total = 11usize;
-        let x: Vec<f32> = (0..b * d * total).map(|i| ((i * 7 % 13) as f32 * 0.1) - 0.6).collect();
+        let x: Vec<f32> = (0..b * d * total)
+            .map(|i| ((i * 7 % 13) as f32 * 0.1) - 0.6)
+            .collect();
         let w: Vec<f32> = (0..d * k).map(|i| (i * 5 % 7) as f32 * 0.05).collect();
         let xt = Tensor::from_vec(x, (b, d, total), &dev).unwrap();
         let wt = Tensor::from_vec(w, (d, k), &dev).unwrap();
         // reference: one-shot full-sequence causal conv.
         let full: Vec<f32> = depthwise_conv1d(&xt, &wt, None, k - 1)
-            .unwrap().narrow(2, 0, total).unwrap().flatten_all().unwrap().to_vec1().unwrap();
+            .unwrap()
+            .narrow(2, 0, total)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
         // streamed: prefill chunk then single-step decode chunks then larger chunks.
         let mut cache: Option<Tensor> = None;
         let mut ys: Vec<Tensor> = Vec::new();
@@ -444,10 +513,22 @@ mod tests {
             pos += chunk;
         }
         let streamed: Vec<f32> = Tensor::cat(&ys.iter().collect::<Vec<_>>(), 2)
-            .unwrap().flatten_all().unwrap().to_vec1().unwrap();
-        let maxd = full.iter().zip(&streamed).fold(0f32, |m, (a, e)| m.max((a - e).abs()));
-        assert!(maxd < 1e-5, "streamed (chunked, incl. T=1) != full-sequence conv: max diff {maxd}");
-        eprintln!("depthwise stream (incl. single-step decode) == full sequence, max diff {maxd:.2e}");
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let maxd = full
+            .iter()
+            .zip(&streamed)
+            .fold(0f32, |m, (a, e)| m.max((a - e).abs()));
+        assert!(
+            maxd < 1e-5,
+            "streamed (chunked, incl. T=1) != full-sequence conv: max diff {maxd}"
+        );
+        eprintln!(
+            "depthwise stream (incl. single-step decode) == full sequence, max diff {maxd:.2e}"
+        );
     }
 
     #[cfg(feature = "metal")]
@@ -461,7 +542,9 @@ mod tests {
             }
         };
         let (b, d, l, k, pad) = (2usize, 4, 33, 3, 2);
-        let u: Vec<f32> = (0..b * d * l).map(|i| (i * 7 % 13) as f32 * 0.1 - 0.6).collect();
+        let u: Vec<f32> = (0..b * d * l)
+            .map(|i| (i * 7 % 13) as f32 * 0.1 - 0.6)
+            .collect();
         let w: Vec<f32> = (0..d * k).map(|i| (i * 5 % 7) as f32 * 0.05).collect();
         let bias: Vec<f32> = (0..d).map(|i| i as f32 * 0.2).collect();
         let run = |dev: &Device| -> Vec<f32> {
@@ -478,7 +561,10 @@ mod tests {
         let cpu = run(&Device::Cpu);
         let met = run(&mdev);
         assert_eq!(cpu.len(), met.len());
-        let maxd = cpu.iter().zip(met.iter()).fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+        let maxd = cpu
+            .iter()
+            .zip(met.iter())
+            .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
         assert!(maxd < 1e-5, "metal vs cpu max diff {maxd}");
         eprintln!("metal == cpu depthwise conv1d, max diff {maxd:.2e}");
     }
@@ -495,21 +581,43 @@ mod tests {
             }
         };
         let (b, d, l, k, pad) = (2usize, 4, 33, 3, 2);
-        let u: Vec<f32> = (0..b * d * l).map(|i| (i * 7 % 13) as f32 * 0.1 - 0.6).collect();
+        let u: Vec<f32> = (0..b * d * l)
+            .map(|i| (i * 7 % 13) as f32 * 0.1 - 0.6)
+            .collect();
         let w: Vec<f32> = (0..d * k).map(|i| (i * 5 % 7) as f32 * 0.05).collect();
         let bias: Vec<f32> = (0..d).map(|i| i as f32 * 0.2).collect();
         let run = |dev: &Device| -> Vec<f32> {
-            let cv = |v: &[f32], s: (usize, usize, usize)| Tensor::from_vec(v.to_vec(), s, dev).unwrap().to_dtype(DType::BF16).unwrap();
+            let cv = |v: &[f32], s: (usize, usize, usize)| {
+                Tensor::from_vec(v.to_vec(), s, dev)
+                    .unwrap()
+                    .to_dtype(DType::BF16)
+                    .unwrap()
+            };
             let ut = cv(&u, (b, d, l));
-            let wt = Tensor::from_vec(w.clone(), (d, k), dev).unwrap().to_dtype(DType::BF16).unwrap();
-            let bt = Tensor::from_vec(bias.clone(), (d,), dev).unwrap().to_dtype(DType::BF16).unwrap();
+            let wt = Tensor::from_vec(w.clone(), (d, k), dev)
+                .unwrap()
+                .to_dtype(DType::BF16)
+                .unwrap();
+            let bt = Tensor::from_vec(bias.clone(), (d,), dev)
+                .unwrap()
+                .to_dtype(DType::BF16)
+                .unwrap();
             depthwise_conv1d(&ut, &wt, Some(&bt), pad)
-                .unwrap().to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap()
+                .unwrap()
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
         };
         let cpu = run(&Device::Cpu);
         let met = run(&mdev);
         // both f32-accumulate then a single bf16 store; fma vs mul-add order can differ by ≤1 bf16 ULP.
-        let maxd = cpu.iter().zip(&met).fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+        let maxd = cpu
+            .iter()
+            .zip(&met)
+            .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
         assert!(maxd < 1e-2, "bf16 metal vs cpu max diff {maxd}");
         eprintln!("depthwise bf16 (f32-accum, bf16-store): metal == cpu, max diff {maxd:.2e}");
     }

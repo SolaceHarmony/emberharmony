@@ -75,9 +75,121 @@ describe("desktop voice context boundary", () => {
 
     expect(text).toContain("struct PcmRing")
     expect(text).toContain("UnsafeCell<f32>")
+    expect(text).toContain("wake_tx: Sender<()>")
+    expect(text).toContain("wake_rx: Receiver<()>")
+    expect(text).toContain("fn wait_for_input(&self, timeout: Duration) -> bool")
     expect(text).not.toContain("Arc<Mutex<VecDeque<f32>>>")
     expect(text).not.toContain("Arc<Mutex<Vec<f32>>>")
     expect(text).not.toContain("try_lock()")
+  })
+
+  test("native mic loops wake from audio arrival instead of blind sleep polling", async () => {
+    const text = await root("packages/desktop/src-tauri/crates/liquid-audio/src/voice_runtime.rs")
+    const vad = between(text, "fn vad_loop", "fn frame_loop")
+    const frame = between(text, "fn frame_loop", "struct InputFrameResampler")
+    const input = between(text, "fn start_input()", "fn start_output")
+
+    expect(vad).toContain("mic.wait_for_input(Duration::from_millis(40))")
+    expect(frame).toContain("let has_input = mic.wait_for_input(Duration::from_millis(10))")
+    expect(frame).toContain("if !has_input && mic.len() == 0")
+    expect(input).toContain("mic.notify()")
+    expect(vad).not.toContain("std::thread::sleep")
+    expect(frame).not.toContain("std::thread::sleep")
+  })
+
+  test("native control commands wake sleeping mic loops immediately", async () => {
+    const text = await root("packages/desktop/src-tauri/crates/liquid-audio/src/voice_runtime.rs")
+    const runtime = between(text, "pub struct VoiceRuntime", "impl Drop for VoiceRuntime")
+    const input = between(text, "impl ExternalAudioInputWriter", "impl ExternalAudioOutput")
+
+    expect(runtime).toContain("control: Option<Mic>")
+    expect(runtime).toContain("let control = input.as_ref().map(|input| input.mic.clone())")
+    expect(runtime).toContain("fn wake_control(&self)")
+    expect(runtime).toContain("control.notify()")
+    expect(runtime).toContain("pub fn interrupt(&self)")
+    expect(runtime).toContain("self.wake_control()")
+    expect(runtime).toContain("pub fn set_mic_enabled(&self, on: bool)")
+    expect(runtime).toContain("pub fn stop(mut self)")
+    expect(input).toContain("self.mic.clear()")
+    expect(input).toContain("self.mic.notify()")
+  })
+
+  test("desktop local LFM2 audio I/O is fed by WebRTC PlatformAudio", async () => {
+    const audio = await root("packages/desktop/src-tauri/crates/liquid-audio/src/voice_runtime.rs")
+    const runtime = await root("packages/desktop/src-tauri/src/voice/runtime.rs")
+    const session = between(runtime, "impl Lfm2Session", "fn is_finished")
+
+    expect(audio).toContain("pub struct ExternalAudioInput")
+    expect(audio).toContain("pub struct ExternalAudioOutput")
+    expect(audio).toContain("pub fn prepare_with_input(")
+    expect(audio).toContain("pub fn prepare_with_io(")
+    expect(runtime).toContain("async fn start_local_webrtc_input(")
+    expect(runtime).toContain("async fn start_local_webrtc_output(")
+    expect(runtime).toContain("async fn local_webrtc_input_loopback(")
+    expect(runtime).toContain("async fn local_webrtc_output_loopback(")
+    expect(runtime).toContain("PlatformAudio::new()")
+    expect(runtime).toContain('LocalAudioTrack::create_audio_track("local-microphone", audio.rtc_source())')
+    expect(runtime).toContain("LOCAL_WEBRTC_INPUT_STREAM_ID")
+    expect(runtime).toContain("remote_track.set_enabled(false)")
+    expect(runtime).toContain('"local-assistant"')
+    expect(runtime).toContain("NativeAudioStream::with_options")
+    expect(runtime).toContain("NativeAudioSource::new(")
+    expect(runtime).toContain("LkRuntime::instance()")
+    expect(runtime).toContain("source.capture_frame(&frame)")
+    expect(runtime).toContain("_track: LocalAudioTrack")
+    expect(runtime).toContain("ExternalAudioInput::new(LIVEKIT_AGENT_AUDIO_RATE)")
+    expect(runtime).toContain("ExternalAudioOutput::new(")
+    expect(session).toContain("let input = start_local_webrtc_input(threads, done.clone()).await?")
+    expect(session).toContain("let output = match start_local_webrtc_output().await")
+    expect(session).toContain("Lfm2Runtime::prepare_with_io(")
+    expect(session).toContain("Some(input)")
+    expect(session).toContain("Some(output)")
+    expect(session).not.toContain("Lfm2Runtime::prepare(")
+    expect(session).not.toContain("Lfm2Runtime::prepare_with_input(")
+  })
+
+  test("desktop liquid audio dependency does not enable the CPAL fallback", async () => {
+    const cargo = await root("packages/desktop/src-tauri/Cargo.toml")
+    const lib = await root("packages/desktop/src-tauri/crates/liquid-audio/src/lib.rs")
+    const voice = await root("packages/desktop/src-tauri/crates/liquid-audio/src/voice_runtime.rs")
+
+    expect(cargo).toContain('liquid-audio = { path = "crates/liquid-audio", features = ["metal"] }')
+    expect(cargo).toContain('liquid-audio = { path = "crates/liquid-audio" }')
+    expect(cargo).not.toContain('"audio-io"')
+    expect(lib).toContain("pub mod voice_runtime")
+    expect(lib).not.toContain('#[cfg(feature = "audio-io")]\npub mod voice_runtime')
+    expect(voice).toContain('#[cfg(feature = "audio-io")]\nuse cpal::traits')
+    expect(voice).toContain("external WebRTC audio input is required")
+    expect(voice).toContain("external WebRTC audio output is required")
+  })
+
+  test("desktop local WebRTC setup does not block the async voice kernel", async () => {
+    const runtime = await root("packages/desktop/src-tauri/src/voice/runtime.rs")
+    const output = between(runtime, "async fn local_webrtc_output_loopback", "async fn exchange_loopback_ice")
+    const loopback = between(runtime, "async fn local_webrtc_input_loopback", "async fn start_local_webrtc_input")
+    const input = between(runtime, "async fn start_local_webrtc_input", "async fn local_webrtc_mic_loop")
+    const mic = between(runtime, "async fn local_webrtc_mic_loop", "fn send_local_webrtc_ready")
+
+    expect(runtime).not.toContain("start_local_webrtc_output_async")
+    expect(output).toContain("mpsc::channel::<IceCandidate>(LOCAL_WEBRTC_OUTPUT_ICE_QUEUE_CAP)")
+    expect(output).toContain("try_send(candidate)")
+    expect(output).not.toContain("mpsc::unbounded_channel")
+    expect(output).toContain("oneshot::channel::<livekit::webrtc::audio_track::RtcAudioTrack>()")
+    expect(output).toContain("tokio::time::timeout(")
+    expect(output).toContain("exchange_loopback_ice(&sender, &receiver, sender_ice_rx, receiver_ice_rx).await?")
+    expect(runtime).toContain("local WebRTC audio loopback did not connect before timeout")
+    expect(input).toContain("oneshot::channel()")
+    expect(input).toContain("tokio::time::timeout(")
+    expect(output).not.toContain("recv_timeout")
+    expect(input).not.toContain("recv_timeout")
+    expect(output).not.toContain("std::sync::mpsc")
+    expect(input).not.toContain("std::sync::mpsc")
+    expect(loopback).toContain('LocalAudioTrack::create_audio_track("local-microphone", audio.rtc_source())')
+    expect(loopback).toContain("track.set_enabled(false)")
+    expect(loopback).toContain("remote_track.set_enabled(false)")
+    expect(mic).toContain("let input = match local_webrtc_input_loopback(audio).await")
+    expect(mic).toContain("input.remote_track.clone()")
+    expect(mic).not.toContain("audio.start_recording()")
   })
 
   test("native model event fanout is bounded and non-blocking", async () => {
@@ -88,6 +200,106 @@ describe("desktop voice context boundary", () => {
     expect(text).toContain("try_send_event")
     expect(text).not.toContain("unbounded::<VoiceEvent>")
     expect(text).not.toContain("event_tx.send(")
+  })
+
+  test("Moshi frame queue pressure resyncs instead of surfacing fatal voice errors", async () => {
+    const voice = await root("packages/desktop/src-tauri/crates/liquid-audio/src/voice_runtime.rs")
+    const runtime = await root("packages/desktop/src-tauri/src/voice/runtime.rs")
+    const local = between(voice, "fn frame_loop", "struct InputFrameResampler")
+    const livekit = between(runtime, "async fn native_livekit_agent_frame_mic_loop", "struct LiveKitFrameResampler")
+
+    expect(local).toContain("if pipe.submit_frame(next)")
+    expect(local).toContain("pipe.interrupt()")
+    expect(local).toContain("model.clear()")
+    expect(local).toContain("emit_ready(sink, stop, mic_enabled)")
+    expect(local).not.toContain("RuntimeEvent::Error(\"realtime Moshi frame queue overrun\"")
+    expect(livekit).toContain("if handle.submit_frame(next)")
+    expect(livekit).toContain("handle.interrupt()")
+    expect(livekit).toContain("model.clear()")
+    expect(livekit).toContain("VoiceState::Listening")
+    expect(livekit).not.toContain("native LiveKit Moshi frame queue is full")
+  })
+
+  test("Moshi interruption resets model stream state instead of only flushing playback", async () => {
+    const moshi = await root("packages/desktop/src-tauri/crates/liquid-audio/src/moshi/models/realtime.rs")
+    const realtime = await root("packages/desktop/src-tauri/crates/liquid-audio/src/realtime.rs")
+    const reset = between(moshi, "pub fn reset_stream(&mut self)", "pub fn warmup")
+    const interrupt = between(realtime, "fn interrupt_stream(&mut self)", "/// Stateful PCM conversion")
+
+    expect(moshi).toContain("state: ::moshi::lm_generate_multistream::State")
+    expect(moshi).toContain("lm: ::moshi::lm::LmModel")
+    expect(moshi).toContain("fn new_state(")
+    expect(moshi).toContain("::moshi::lm_generate_multistream::State::new(")
+    expect(moshi).not.toContain("struct RealtimeMoshiState")
+    expect(moshi).not.toContain("fn reset(&mut self)")
+    expect(moshi).toContain("pub fn reset_stream(&mut self)")
+    expect(reset).toContain("self.mimi.reset_state()")
+    expect(reset).toContain("self.state = Self::new_state(self.lm.clone(), self.params, self.config.clone())")
+    expect(reset).toContain("self.text_token = self.config.text_start_token")
+    expect(interrupt).toContain("self.realtime.reset_stream()")
+    expect(interrupt).toContain("self.out_resampler.reset()")
+  })
+
+  test("Moshi realtime first encoded frame follows upstream server loop", async () => {
+    const rust = await root("packages/desktop/src-tauri/crates/liquid-audio/src/moshi/models/realtime.rs")
+    const python = await root("experiments/lfm2-audio-voice/upstream-liquid-audio/src/liquid_audio/moshi/server.py")
+    const step = between(rust, "pub fn step_pcm_frame", "fn step_codes")
+    const codes = between(rust, "fn step_codes", "pub fn load_realtime_moshi")
+    const opus = between(python, "async def opus_loop()", "async def send_loop()")
+    const reset = step.indexOf("self.mimi.reset_state()")
+    const feed = step.indexOf("self.step_codes(codes, true)")
+
+    expect(opus).toContain("codes = self.mimi.encode(chunk)")
+    expect(opus).toContain("self.mimi.reset_streaming()")
+    expect(opus).toContain("tokens = self.lm_gen.step(codes[:, :, c: c + 1])")
+    expect(reset).toBeGreaterThanOrEqual(0)
+    expect(feed).toBeGreaterThan(reset)
+    expect(codes).toContain(".step_without_ca_src(self.text_token, &input, None)?")
+    expect(step).toContain("let reset_mimi_after_encode = self.skip_frames > 0")
+    expect(step).not.toContain("self.skip_frames -= 1;\n                continue;")
+  })
+
+  test("Moshi realtime loader performs upstream server warmup before live frames", async () => {
+    const rust = await root("packages/desktop/src-tauri/crates/liquid-audio/src/moshi/models/realtime.rs")
+    const python = await root("experiments/lfm2-audio-voice/upstream-liquid-audio/src/liquid_audio/moshi/server.py")
+    const warmup = between(rust, "pub fn warmup(&mut self)", "pub fn step_pcm_frame")
+    const load = between(rust, "pub fn load_realtime_moshi", "fn is_floating_dtype")
+
+    expect(python).toContain("state.warmup()")
+    expect(warmup).toContain("for _ in 0..4")
+    expect(warmup).toContain("Tensor::zeros((1, 1, self.frame_size), DType::F32")
+    expect(warmup).toContain("self.mimi.encode_step(")
+    expect(warmup).toContain("self.step_codes(codes, false)")
+    expect(warmup).toContain("self.reset_stream()")
+    expect(load).toContain("realtime.warmup()?")
+  })
+
+  test("utterance workers invalidate queued stale audio on interrupt", async () => {
+    const realtime = await root("packages/desktop/src-tauri/crates/liquid-audio/src/realtime.rs")
+    const voice = await root("packages/desktop/src-tauri/crates/liquid-audio/src/voice_runtime.rs")
+    const runtime = await root("packages/desktop/src-tauri/src/voice/runtime.rs")
+    const pipeline = between(realtime, "struct QueuedUtterance", "/// Frame-fed realtime worker")
+    const local = between(voice, "fn vad_loop", "fn frame_loop")
+    const livekit = between(runtime, "async fn native_livekit_agent_turn_mic_loop", "async fn native_livekit_agent_frame_mic_loop")
+
+    expect(pipeline).toContain("epoch: u64")
+    expect(pipeline).toContain("epoch: Arc<AtomicU64>")
+    expect(pipeline).toContain("let epoch = self.epoch.load(Ordering::Acquire)")
+    expect(pipeline).toContain("self.epoch.fetch_add(1, Ordering::AcqRel)")
+    expect(pipeline).toContain("if epoch < latest_epoch")
+    expect(pipeline).toContain("engine.interrupt_stream()")
+    expect(realtime).toContain("impl Drop for RealtimePipeline")
+    expect(realtime).toContain("impl Drop for RealtimeFramePipeline")
+    expect(realtime).toContain("self.epoch.fetch_add(1, Ordering::AcqRel);")
+    expect(local).toContain("if !pipe.submit(Utterance")
+    expect(local).toContain("pipe.interrupt()")
+    expect(local).toContain("emit_ready(sink, stop, mic_enabled)")
+    expect(local).not.toContain('RuntimeEvent::Error("voice inference worker busy or stopped"')
+    expect(livekit).toContain("if !handle.submit(utt)")
+    expect(livekit).toContain("handle.interrupt()")
+    expect(livekit).toContain("VoiceState::Listening")
+    expect(livekit).toContain("continue;")
+    expect(livekit).not.toContain("native LiveKit agent utterance queue is full")
   })
 
   test("native LFM2 decoded PCM stays inside Rust for LiveKit transport", async () => {
@@ -123,7 +335,9 @@ describe("desktop voice context boundary", () => {
     expect(runtime).toContain("playback_reference_extends_echo_gate_after_generation_finishes")
     expect(runtime).toContain("playback_reference_requires_barge_in_above_echo_floor")
     expect(runtime).toContain("queued_speaker_audio_is_reference_audio_before_output_callback_runs")
-    expect(tauri).toContain("can_interrupt: true")
+    expect(tauri).toContain("let cfg = local_runtime_config(&settings)")
+    expect(tauri).toContain("can_interrupt: can_interrupt_playback(settings)")
+    expect(tauri).toContain("settings.lfm2.engine != LocalVoiceEngine::MoshiRealtime")
   })
 
   test("native LFM2 delegation prompt is wired in the Rust kernel", async () => {
@@ -251,6 +465,23 @@ describe("desktop voice context boundary", () => {
     expect(typed).not.toContain("mark(true")
   })
 
+  test("prompt voice meter uses native level before LiveKit media tracks", async () => {
+    const text = await root("packages/app/src/components/prompt-input.tsx")
+    const visualizer = between(
+      text,
+      '<Show when={voice.state() === "connected"}>',
+      '<Show when={store.mode === "normal" && params.id}>',
+    )
+
+    expect(visualizer).toContain("voice.agentLevel() !== undefined")
+    expect(visualizer).toContain("<NativeVoiceMeter level={voice.agentLevel() ?? 0}")
+    expect(visualizer).toContain("voice.agentAudioTrack()")
+    expect(visualizer).toContain("<BarVisualizer")
+    expect(visualizer.indexOf("voice.agentLevel() !== undefined")).toBeLessThan(
+      visualizer.indexOf("voice.agentAudioTrack()"),
+    )
+  })
+
   test("desktop voice commands await the Tauri runtime kernel", async () => {
     const text = await root("packages/desktop/src-tauri/src/voice/control.rs")
     const runtime = await root("packages/desktop/src-tauri/src/voice/runtime.rs")
@@ -263,7 +494,7 @@ describe("desktop voice context boundary", () => {
     expect(text).toContain(".start_livekit(ctx.clone(), settings, grant, channel, bridge)")
     expect(text).toContain("runtime.stop().await")
     expect(runtime).toContain("session.stop(threads).await?")
-    expect(runtime).toContain("let (live, main) = Lfm2Runtime::prepare(")
+    expect(runtime).toContain("let (live, main) = Lfm2Runtime::prepare_with_io(")
     expect(runtime).toContain('threads.spawn("voice-session", move ||')
     expect(runtime).toContain("wake_kernel(&wake)")
     expect(runtime).toContain("async fn stop_lfm2(threads: &ThreadManager, session: Lfm2Session)")
@@ -457,7 +688,7 @@ describe("desktop voice context boundary", () => {
     expect(loop).not.toContain("Room::connect(&grant.url, &grant.agent_token, agent_options).await")
   })
 
-  test("native LiveKit UI backpressure cancels the provider instead of ignoring event sends", async () => {
+  test("native LiveKit backpressure has explicit cancellation or resync behavior", async () => {
     const text = await root("packages/desktop/src-tauri/src/voice/runtime.rs")
     const sender = between(text, "fn send_livekit(", "fn livekit_fail")
     const loop = between(text, "async fn livekit_session_loop", "fn livekit_room_options")
@@ -467,10 +698,7 @@ describe("desktop voice context boundary", () => {
     const reset = between(text, "fn reset_livekit_audio_state_or_done", "fn spawn_livekit_audio_monitor")
     const monitor = between(text, "fn spawn_livekit_audio_monitor(", "fn rms_i16")
     const mic = between(text, "fn spawn_native_livekit_agent_mic(", "async fn send_livekit_interrupt")
-    const full = mic.slice(
-      mic.indexOf("native LiveKit agent utterance queue is full") - 200,
-      mic.indexOf("native LiveKit agent utterance queue is full") + 240,
-    )
+    const full = mic.slice(mic.indexOf("if !handle.submit(utt)"), mic.indexOf("VoiceState::Listening") + 120)
 
     expect(sender).toContain("done.store(true, Ordering::SeqCst)")
     expect(loop).toContain("if !send_livekit(")
@@ -494,9 +722,11 @@ describe("desktop voice context boundary", () => {
     expect(mic).toContain('threads.spawn("voice-livekit-agent-mic"')
     expect(mic).toContain("native_livekit_agent_mic_loop")
     expect(mic).toContain("livekit_media_cancelled(&done, &cancel)")
-    expect(full).toContain("done.store(true, Ordering::SeqCst)")
-    expect(full).toContain("break;")
-    expect(full).not.toContain("continue;")
+    expect(full).toContain("handle.interrupt()")
+    expect(full).toContain("VoiceState::Listening")
+    expect(full).toContain("continue;")
+    expect(full).not.toContain("done.store(true, Ordering::SeqCst)")
+    expect(full).not.toContain("VoiceEvent::Error")
   })
 
   test("native LiveKit critical controls use bounded async delivery inside the provider", async () => {
@@ -643,7 +873,9 @@ describe("desktop voice context boundary", () => {
     expect(text).not.toContain("LIVEKIT_AGENT_NAME")
     expect(text).toContain("livekit_agent_audio_subscribed(&event, &grant.agent_identity)")
     expect(text).toContain("remote_audio_seen = true")
-    expect(text).toContain("match RealtimePipeline::spawn(engine)")
+    expect(text).toContain("match NativeAgentPipe::spawn(engine)")
+    expect(text).toContain("RealtimePipeline::spawn(engine).map(Self::Turn)")
+    expect(text).toContain("RealtimeFramePipeline::spawn(engine).map(Self::Frame)")
     expect(text).toContain("Native LiveKit agent pipeline failed to start")
     expect(text).toContain("agent_pipe.handle()")
     expect(text).toContain("Room::connect(&grant.url, &grant.agent_token, agent_options)")
@@ -686,7 +918,11 @@ describe("desktop voice context boundary", () => {
     const realtime = await root("packages/desktop/src-tauri/crates/liquid-audio/src/realtime.rs")
     const voice = await root("packages/desktop/src-tauri/crates/liquid-audio/src/voice_runtime.rs")
     const runtime = await root("packages/desktop/src-tauri/src/voice/runtime.rs")
-    const realtimeProd = between(realtime, "impl RealtimePipeline", "// ---------------------------------------------------------------------------------------")
+    const realtimeProd = between(
+      realtime,
+      "impl RealtimePipeline",
+      "// ---------------------------------------------------------------------------------------",
+    )
     const voiceProd = between(voice, "fn session_loop", "#[cfg(test)]")
     const livekit = between(runtime, "async fn livekit_session_loop", "fn livekit_room_options")
 
@@ -700,7 +936,7 @@ describe("desktop voice context boundary", () => {
     expect(voice).toContain("pub fn start(")
     expect(voice).toContain(") -> Result<Self, String>")
     expect(voice).toContain('map_err(|e| format!("spawn voice-session thread failed: {e}"))?')
-    expect(livekit).toContain("match RealtimePipeline::spawn(engine)")
+    expect(livekit).toContain("match NativeAgentPipe::spawn(engine)")
     expect(livekit).toContain("Native LiveKit agent pipeline failed to start")
     expect(voice).not.toContain('expect("spawn voice-session thread")')
     expect(realtimeProd).not.toContain('expect("spawn lfm2-inference worker")')
@@ -816,6 +1052,7 @@ describe("desktop voice context boundary", () => {
     expect(runtime).toContain("const LIVEKIT_AGENT_ECHO_GATE_MS")
     expect(runtime).toContain("const LIVEKIT_AGENT_ECHO_MULTIPLIER")
     expect(runtime).toContain("let playback = LiveKitPlaybackReference::new()")
+    expect(runtime).toContain("let interrupts_playback = can_interrupt_playback(&settings)")
     expect(events).toContain("playback.observe(&pcm, LIVEKIT_AGENT_AUDIO_RATE)")
     expect(events).toContain("playback.clear()")
     expect(interrupt).toContain("playback.clear()")
@@ -824,7 +1061,10 @@ describe("desktop voice context boundary", () => {
     expect(reference).toContain("fn reference_vad_threshold(&self, base: f32) -> f32")
     expect(reference).toContain("base.max(rms * LIVEKIT_AGENT_ECHO_MULTIPLIER)")
     expect(mic).toContain("playback: Arc<LiveKitPlaybackReference>")
+    expect(mic).toContain("can_interrupt_playback: bool")
+    expect(mic).toContain("if playback.active() && !can_interrupt_playback")
     expect(mic).toContain("let threshold = playback.reference_vad_threshold(vad_threshold)")
+    expect(mic).toContain("let interrupting = playback.active() && can_interrupt_playback && rms > threshold")
     expect(mic).toContain("} else if playback.active()")
     expect(mic).toContain("samples.clear()")
     expect(mic.indexOf("let threshold = playback.reference_vad_threshold(vad_threshold)")).toBeLessThan(
@@ -864,7 +1104,8 @@ describe("desktop voice context boundary", () => {
     const settings = await root("packages/app/src/components/settings-voice.tsx")
 
     expect(control).toContain("livekit::configured(&settings)?")
-    expect(control).toContain("settings::lfm2_active_model_dir(&settings.lfm2).is_some()")
+    expect(control).toContain("let local_ready = local_model_ready(&settings)?")
+    expect(control).toContain("livekit::configured(&settings)? && local_ready")
     expect(control).toContain("livekit::grant(&settings, &ctx).await?")
     expect(control).toContain("LIVEKIT_READY_DETAIL")
     expect(control).not.toContain("waiting for the external emberharmony-voice agent")
@@ -956,6 +1197,8 @@ describe("desktop voice context boundary", () => {
     expect(rust).toContain("pub last_provider: Option<VoiceProvider>")
     expect(rust).toContain("fn default_last_provider() -> Option<VoiceProvider>")
     expect(rust).toContain('assert_eq!(json["lastProvider"], "lfm2")')
+    expect(rust).toContain('assert_eq!(json["lfm2"]["engine"], "moshiRealtime")')
+    expect(rust).toContain("stored_voice_settings_without_engine_use_moshi_realtime_default")
   })
 
   test("desktop voice settings save LiveKit configuration only through Tauri", async () => {
@@ -980,6 +1223,8 @@ describe("desktop voice context boundary", () => {
     expect(settings).toContain("const showNativeModel = ()")
     expect(settings).toContain('activeProvider() === "lfm2" || (desktop && activeProvider() === "livekit")')
     expect(settings).toContain("const showLegacyLiveKitModels = () => !desktop")
+    expect(settings).toContain("const statusPoll = desktop ? setInterval(() => refetchStatus(), 1000) : undefined")
+    expect(settings).toContain("clearInterval(statusPoll)")
     expect(settings).toContain("<Show when={showNativeModel()}>")
     expect(settings).toContain("<Show when={showLegacyLiveKitModels()}>")
     expect(save).toContain("await updateLiveKit({ url: nextUrl || undefined })")
@@ -987,28 +1232,51 @@ describe("desktop voice context boundary", () => {
     expect(save).toContain("if (!desktop)")
     expect(save).toContain("globalSDK.client.auth.set")
     expect(save).toContain("globalSDK.client.voice.configUpdate")
+    expect(settings).toContain("if (status.ready)")
+    expect(settings).not.toContain('status.provider === "livekit" && status.ready')
     expect(settings).not.toContain("transitional worker")
     expect(settings).not.toContain("sidecar config")
   })
 
-  test("desktop LFM2 model download persists the native snapshot before reporting success", async () => {
+  test("desktop local model download persists the selected native snapshot before reporting success", async () => {
     const settings = await root("packages/app/src/components/settings-voice.tsx")
+    const voice = await root("packages/app/src/lib/voice-settings.ts")
     const download = between(settings, "async function downloadModel", "const updateDelegate")
 
-    expect(download).toContain("await downloadVoiceModel({ source, revision: lfm2().revision }")
+    expect(voice).toContain('export const DEFAULT_MOSHI_MODEL = "kyutai/moshiko-candle-bf16"')
+    expect(download).toContain("const engine = localEngine()")
+    expect(download).toContain("const revision = hfRevision()")
+    expect(download).toContain("await downloadVoiceModel({ source, revision }")
     expect(download).toContain('case "done":')
+    expect(download).toContain('engine === "moshiRealtime"')
+    expect(download).toContain("await updateLfm2({ moshiModelDir: event.dir })")
+    expect(download).toContain("await updateLfm2({ modelDir: event.dir })")
+    expect(download).toContain("setMoshiModelDirEdit(event.dir)")
     expect(download).toContain("setModelDirEdit(event.dir)")
-    expect(download).toContain("const saved = await updateLfm2({ modelDir: event.dir })")
     expect(download).toContain("if (!saved) return")
     expect(download).toContain(
       'showToast({ title: language.t("settings.voice.download.done"), description: event.dir })',
     )
-    expect(download.indexOf("const saved = await updateLfm2({ modelDir: event.dir })")).toBeLessThan(
+    expect(download.indexOf("await updateLfm2({ modelDir: event.dir })")).toBeLessThan(download.indexOf("if (!saved) return"))
+    expect(download.indexOf("await updateLfm2({ moshiModelDir: event.dir })")).toBeLessThan(
       download.indexOf("if (!saved) return"),
     )
     expect(download.indexOf("if (!saved) return")).toBeLessThan(
       download.indexOf('showToast({ title: language.t("settings.voice.download.done"), description: event.dir })'),
     )
+  })
+
+  test("native model directory settings accept Hugging Face cache repo roots", async () => {
+    const rust = await root("packages/desktop/src-tauri/src/settings.rs")
+    const resolver = between(rust, "fn hf_snapshot_dir", "pub fn expand_user_path")
+    const lfm2 = between(rust, "pub fn lfm2_model_dir", "pub fn moshi_model_dir")
+    const moshi = between(rust, "pub fn moshi_model_dir", "/// The active LFM2-Audio directory")
+
+    expect(resolver).toContain('dir.join("snapshots")')
+    expect(resolver).toContain('dir.join("refs").join("main")')
+    expect(resolver).toContain("snapshots.join(rev.trim())")
+    expect(lfm2).toContain(".map(hf_snapshot_dir)")
+    expect(moshi).toContain(".map(hf_snapshot_dir)")
   })
 
   test("desktop LFM2 model downloads are owned by a bounded native runtime", async () => {
@@ -1038,6 +1306,46 @@ describe("desktop voice context boundary", () => {
     expect(model).not.toContain("Mutex<Vec<JoinHandle<()>>>")
     expect(model).not.toContain("thread::{Builder as ThreadBuilder, JoinHandle}")
     expect(model).not.toContain("std::thread::Builder::new()")
+  })
+
+  test("desktop LFM2 audio counters are exposed through native voice status", async () => {
+    const bridge = await root("packages/app/src/lib/voice-settings.ts")
+    const settings = await root("packages/app/src/components/settings-voice.tsx")
+    const control = await root("packages/desktop/src-tauri/src/voice/control.rs")
+    const runtime = await root("packages/desktop/src-tauri/src/voice/runtime.rs")
+    const audio = await root("packages/desktop/src-tauri/crates/liquid-audio/src/voice_runtime.rs")
+
+    expect(audio).toContain("pub struct AudioStatsSnapshot")
+    expect(audio).toContain("decoded_samples")
+    expect(audio).toContain("played_samples")
+    expect(runtime).toContain("pub audio_stats: Option<AudioStatsSnapshot>")
+    expect(control).toContain('#[serde(rename = "audioStats")]')
+    expect(control).toContain("p.audio_stats = active.audio_stats")
+    expect(control).toContain("pub enum VoiceEngineMode")
+    expect(control).toContain("pub engine: Option<VoiceEngineMode>")
+    expect(control).toContain("local_engine_mode")
+    expect(bridge).toContain("audioStats?:")
+    expect(bridge).toContain("engine?: VoiceEngineMode")
+    expect(settings).toContain("const audioStatsText = ()")
+    expect(settings).toContain("const engineText = ()")
+    expect(settings).toContain('language.t("settings.voice.audioStats"')
+    expect(settings).toContain('settings.voice.engine.moshiRealtime')
+  })
+
+  test("desktop speaker probe reports native WebRTC speaker state", async () => {
+    const bridge = await root("packages/app/src/lib/voice-settings.ts")
+    const settings = await root("packages/app/src/components/settings-voice.tsx")
+    const control = await root("packages/desktop/src-tauri/src/voice/control.rs")
+    const runtime = await root("packages/desktop/src-tauri/src/voice/runtime.rs")
+
+    expect(runtime).toContain("pub struct VoiceAudioProbeReport")
+    expect(runtime).toContain("adm_playout_enabled")
+    expect(runtime).toContain("playout_initialized")
+    expect(runtime).toContain("playout_devices: self.audio.playout_devices().count()")
+    expect(control).toContain("Result<super::runtime::VoiceAudioProbeReport, String>")
+    expect(bridge).toContain("export interface VoiceAudioProbeReport")
+    expect(bridge).toContain("playoutInitialized: boolean")
+    expect(settings).toContain('language.t("settings.voice.toast.speakerReport"')
   })
 
   test("prompt input pauses native voice while text input or prompt execution is active", async () => {
@@ -1080,7 +1388,9 @@ describe("desktop voice context boundary", () => {
     expect(frontend).not.toContain("voice_generate_turn")
     expect(frontend).not.toContain("delegateTarget?")
     expect(architecture).toContain("threads.rs                     shared ThreadManager")
-    expect(architecture).toContain("model.rs                       HF token, model directory picker, ThreadManager-owned download")
+    expect(architecture).toContain(
+      "model.rs                       HF token, model directory picker, ThreadManager-owned download",
+    )
     expect(architecture).not.toContain("runtime.rs                     VoiceRuntime kernel, ThreadManager")
     expect(architecture).toContain("voice_settings_set serializes the settings")
     expect(architecture).toContain("only persists after the kernel")

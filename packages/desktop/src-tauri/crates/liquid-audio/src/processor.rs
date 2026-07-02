@@ -570,11 +570,15 @@ mod tests {
         let raw = proc.audio().forward(&wave).unwrap();
         let valid = proc.audio().get_seq_len(1280);
 
-        assert_eq!(raw.dim(2).unwrap(), 9);
+        // STFT with center=True: center_pad = n_fft/2 = 256, padded_len = 1280+512=1792,
+        // T = (1792-512)/160+1 = 9. Then pad_to=16 pads time to the next multiple → 16.
+        assert_eq!(raw.dim(2).unwrap(), 16); // 9 STFT frames, padded to 16 by pad_to
         assert_eq!(valid, 8);
         assert_eq!(mel2emb_len(raw.dim(2).unwrap() as i64), 2);
         assert_eq!(mel2emb_len(valid as i64), 1);
 
+        // add_audio_16k narrows to the valid frame count (not the padded count),
+        // so audio_in carries only the real frames.
         let mut chat = ChatState::new(&proc, 8).unwrap();
         chat.add_audio_16k(&wave).unwrap();
 

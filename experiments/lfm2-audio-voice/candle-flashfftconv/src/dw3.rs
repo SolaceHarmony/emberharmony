@@ -8,9 +8,9 @@
 //! [`crate::depthwise_conv1d`] with `padding=2` narrowed to `L`, but driven by your
 //! deterministic kernel.
 
-use candle_core::{CpuStorage, CustomOp2, Layout, Result, Shape, Tensor};
 #[cfg(feature = "metal")]
 use candle_core::DType;
+use candle_core::{CpuStorage, CustomOp2, Layout, Result, Shape, Tensor};
 
 #[cfg(feature = "metal")]
 const SRC: &str = include_str!("metal/Depthwise3.metal");
@@ -30,7 +30,13 @@ impl CustomOp2 for Depthwise3Causal {
         "depthwise3_causal"
     }
 
-    fn cpu_fwd(&self, xs: &CpuStorage, xl: &Layout, ks: &CpuStorage, kl: &Layout) -> Result<(CpuStorage, Shape)> {
+    fn cpu_fwd(
+        &self,
+        xs: &CpuStorage,
+        xl: &Layout,
+        ks: &CpuStorage,
+        kl: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
         let (b, c, l) = xl.shape().dims3()?;
         let (ck, three) = kl.shape().dims2()?;
         if ck != c || three != 3 {
@@ -80,7 +86,11 @@ impl CustomOp2 for Depthwise3Causal {
             channels: u32,
             length: u32,
         }
-        let params = Params { batch: b as u32, channels: c as u32, length: l as u32 };
+        let params = Params {
+            batch: b as u32,
+            channels: c as u32,
+            length: l as u32,
+        };
 
         let enc = dev.command_encoder()?;
         enc.set_compute_pipeline_state(&p);
@@ -92,10 +102,21 @@ impl CustomOp2 for Depthwise3Causal {
         let tg = total.clamp(1, max_tg);
         let ng = total.div_ceil(tg);
         enc.dispatch_thread_groups(
-            MTLSize { width: ng, height: 1, depth: 1 },
-            MTLSize { width: tg, height: 1, depth: 1 },
+            MTLSize {
+                width: ng,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: tg,
+                height: 1,
+                depth: 1,
+            },
         );
-        Ok((MetalStorage::new(out, dev.clone(), total, DType::F32), Shape::from((b, c, l))))
+        Ok((
+            MetalStorage::new(out, dev.clone(), total, DType::F32),
+            Shape::from((b, c, l)),
+        ))
     }
 }
 
@@ -138,12 +159,22 @@ mod tests {
         let dev = Device::Cpu;
         let (b, c, l) = (2usize, 3, 11);
         let x: Vec<f32> = (0..b * c * l).map(|i| (i as f32 * 0.2).sin()).collect();
-        let k: Vec<f32> = (0..c * 3).map(|i| (i as f32 * 0.1 + 0.3).cos() * 0.5).collect();
+        let k: Vec<f32> = (0..c * 3)
+            .map(|i| (i as f32 * 0.1 + 0.3).cos() * 0.5)
+            .collect();
         let xt = Tensor::from_vec(x.clone(), (b, c, l), &dev).unwrap();
         let kt = Tensor::from_vec(k.clone(), (c, 3), &dev).unwrap();
-        let y: Vec<f32> = depthwise3_causal(&xt, &kt).unwrap().flatten_all().unwrap().to_vec1().unwrap();
+        let y: Vec<f32> = depthwise3_causal(&xt, &kt)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
         let exp = naive_causal(&x, &k, b, c, l);
-        let maxd = y.iter().zip(exp.iter()).fold(0f32, |m, (a, e)| m.max((a - e).abs()));
+        let maxd = y
+            .iter()
+            .zip(exp.iter())
+            .fold(0f32, |m, (a, e)| m.max((a - e).abs()));
         assert!(maxd < 1e-6, "depthwise3 causal vs naive: {maxd}");
     }
 
@@ -158,16 +189,26 @@ mod tests {
             }
         };
         let (b, c, l) = (2usize, 4, 37);
-        let x: Vec<f32> = (0..b * c * l).map(|i| ((i * 7 % 13) as f32 * 0.1) - 0.6).collect();
+        let x: Vec<f32> = (0..b * c * l)
+            .map(|i| ((i * 7 % 13) as f32 * 0.1) - 0.6)
+            .collect();
         let k: Vec<f32> = (0..c * 3).map(|i| (i * 5 % 7) as f32 * 0.05).collect();
         let run = |dev: &Device| -> Vec<f32> {
             let xt = Tensor::from_vec(x.clone(), (b, c, l), dev).unwrap();
             let kt = Tensor::from_vec(k.clone(), (c, 3), dev).unwrap();
-            depthwise3_causal(&xt, &kt).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap()
+            depthwise3_causal(&xt, &kt)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
         };
         let cpu = run(&Device::Cpu);
         let met = run(&mdev);
-        let maxd = cpu.iter().zip(met.iter()).fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+        let maxd = cpu
+            .iter()
+            .zip(met.iter())
+            .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
         assert!(maxd < 1e-6, "depthwise3 metal vs cpu: {maxd}");
         eprintln!("depthwise3_causal: metal == cpu, max diff {maxd:.2e}");
     }

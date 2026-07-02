@@ -16,8 +16,8 @@
 use candle_core::{Result, Tensor};
 use candle_nn::{linear, Embedding, Linear, Module, VarBuilder};
 
-use crate::model::linear::linear_forward;
 use crate::model::lfm2_hf::{Cache, Lfm2Config, Model as Lfm2Model};
+use crate::model::linear::linear_forward;
 
 const AUDIO_VOCAB: usize = 2048;
 const CODEBOOKS: usize = 8;

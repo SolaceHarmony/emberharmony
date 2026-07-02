@@ -3,8 +3,9 @@
 //! `packages/emberharmony/src/voice/bridge.ts` (see its test harness for the
 //! behavioural contract this mirrors).
 //!
-//! The HTTP/SSE transport (reqwest) lands in Phase 1 alongside cpal/STT/TTS; the
-//! load-bearing, fiddly part — the per-turn event state machine — is implemented
+//! The HTTP/SSE transport (reqwest) is deliberately still just the delegated
+//! session bridge; realtime voice media stays inside the native voice runtime.
+//! The load-bearing, fiddly part — the per-turn event state machine — is implemented
 //! and tested here so the wiring on top is mechanical. A key win of doing this in
 //! Rust: the async runner can wrap each SSE read in `tokio::time::timeout`, so the
 //! staleness watchdog fires even on a fully-silent connection — closing the gap

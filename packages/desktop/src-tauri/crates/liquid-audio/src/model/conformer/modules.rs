@@ -100,7 +100,7 @@ impl ConformerConvolution {
     ) -> Result<(Tensor, Option<Tensor>)> {
         let x = x.transpose(1, 2)?.contiguous()?; // (B, d_model, T)
         let x = conv1d_forward(&self.pointwise_conv1, &x)?; // (B, 2*d_model, T)
-                                                   // GLU over channel dim 1: a * sigmoid(b)
+                                                            // GLU over channel dim 1: a * sigmoid(b)
         let c = x.dim(1)?;
         let a = x.narrow(1, 0, c / 2)?;
         let b = x.narrow(1, c / 2, c / 2)?;

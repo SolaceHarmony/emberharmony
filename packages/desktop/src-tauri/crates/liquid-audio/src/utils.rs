@@ -90,10 +90,12 @@ fn download_snapshot(repo_id: &str, revision: Option<&str>) -> std::io::Result<s
 }
 
 /// `huggingface_hub.snapshot_download(repo_id, revision=, token=)` with a per-file progress
-/// callback. Fail-hard: any hf-hub error propagates; returns the snapshot directory (parent
-/// of `config.json`), or `NotFound` if the repo has none. `token`, when `Some`, overrides the
-/// ambient credential (`HF_TOKEN` / `~/.cache/huggingface/token`); `None` leaves hf-hub's
-/// default ambient resolution intact (so an existing `huggingface-cli login` keeps working).
+/// callback. Fail-hard: any hf-hub error propagates; returns the snapshot directory. Some
+/// voice repos (Moshi/Mimi) intentionally do not have `config.json`, so the root is derived
+/// from the cached file path rather than from a particular config file. `token`, when `Some`,
+/// overrides the ambient credential (`HF_TOKEN` / `~/.cache/huggingface/token`); `None`
+/// leaves hf-hub's default ambient resolution intact (so an existing `huggingface-cli login`
+/// keeps working).
 #[cfg(feature = "download")]
 pub fn snapshot_download_with(
     repo_id: &str,
@@ -120,6 +122,16 @@ pub fn snapshot_download_with(
         None => api.model(repo_id.to_string()),
     };
 
+    fn snapshot_root(path: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
+        let mut root = path.to_path_buf();
+        for _ in std::path::Path::new(name).components() {
+            if !root.pop() {
+                return None;
+            }
+        }
+        Some(root)
+    }
+
     // List then fetch every sibling (snapshot_download grabs the whole repo).
     let info = repo.info().map_err(to_io)?;
     let total = info.siblings.len();
@@ -131,14 +143,16 @@ pub fn snapshot_download_with(
             file: sib.rfilename.clone(),
         });
         let path = repo.get(&sib.rfilename).map_err(to_io)?;
-        if sib.rfilename == "config.json" {
-            root = path.parent().map(|p| p.to_path_buf());
+        let candidate =
+            snapshot_root(&path, &sib.rfilename).or_else(|| path.parent().map(|p| p.to_path_buf()));
+        if root.is_none() || sib.rfilename == "config.json" {
+            root = candidate;
         }
     }
     root.ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            format!("repo {repo_id} has no config.json"),
+            format!("repo {repo_id} has no files"),
         )
     })
 }

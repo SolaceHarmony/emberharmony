@@ -2,6 +2,11 @@
 
 pub mod compression;
 pub mod loaders;
+pub mod realtime;
 
 pub use compression::{MimiModel, MimiStreaming};
 pub use loaders::get_mimi;
+pub use realtime::{
+    load_realtime_moshi, realtime_moshi_files, safetensors_floating_dtype, RealtimeMoshi,
+    RealtimeMoshiEvent, RealtimeMoshiFiles, RealtimeMoshiParams,
+};

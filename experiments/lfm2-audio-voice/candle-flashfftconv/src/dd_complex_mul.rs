@@ -10,9 +10,9 @@
 //!
 //! The Metal kernel is small; all the arithmetic is your `double_double.metal`.
 
-use candle_core::{CpuStorage, CustomOp2, Layout, Result, Shape, Tensor};
 #[cfg(feature = "metal")]
 use candle_core::DType;
+use candle_core::{CpuStorage, CustomOp2, Layout, Result, Shape, Tensor};
 
 /// The kernel that calls `cdd_mul`; compiled with your `double_double.metal`
 /// prepended (it provides `complex_dd`, `cdd_mul`, `cdd_to_float2`, and pulls in
@@ -53,7 +53,13 @@ impl CustomOp2 for ComplexMulDd {
 
     /// CPU reference: the correctly-rounded complex product — compute in f64, round
     /// once to f32. This is exactly what the double-double Metal kernel targets.
-    fn cpu_fwd(&self, as_: &CpuStorage, al: &Layout, bs: &CpuStorage, bl: &Layout) -> Result<(CpuStorage, Shape)> {
+    fn cpu_fwd(
+        &self,
+        as_: &CpuStorage,
+        al: &Layout,
+        bs: &CpuStorage,
+        bl: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
         let dims = al.shape().dims().to_vec();
         let n: usize = dims.iter().product::<usize>() / 2; // last axis is the size-2 complex
         let a = contig_f32(as_, al)?;
@@ -97,10 +103,21 @@ impl CustomOp2 for ComplexMulDd {
         let tg = n.clamp(1, max_tg);
         let ng = n.div_ceil(tg);
         enc.dispatch_thread_groups(
-            MTLSize { width: ng, height: 1, depth: 1 },
-            MTLSize { width: tg, height: 1, depth: 1 },
+            MTLSize {
+                width: ng,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: tg,
+                height: 1,
+                depth: 1,
+            },
         );
-        Ok((MetalStorage::new(out, dev.clone(), n * 2, DType::F32), Shape::from(dims)))
+        Ok((
+            MetalStorage::new(out, dev.clone(), n * 2, DType::F32),
+            Shape::from(dims),
+        ))
     }
 }
 
@@ -161,12 +178,24 @@ mod tests {
         let (a, b) = data(64);
         let at = Tensor::from_vec(a.clone(), (64, 2), &dev).unwrap();
         let bt = Tensor::from_vec(b.clone(), (64, 2), &dev).unwrap();
-        let dd: Vec<f32> = complex_mul_dd(&at, &bt).unwrap().flatten_all().unwrap().to_vec1().unwrap();
+        let dd: Vec<f32> = complex_mul_dd(&at, &bt)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
         let f32n = naive_f32(&a, &b);
         let refd = ref_f64(&a, &b);
-        let err = |v: &[f32]| v.iter().zip(refd.iter()).fold(0f64, |m, (x, r)| m.max((*x as f64 - r).abs()));
+        let err = |v: &[f32]| {
+            v.iter()
+                .zip(refd.iter())
+                .fold(0f64, |m, (x, r)| m.max((*x as f64 - r).abs()))
+        };
         let (e_dd, e_f32) = (err(&dd), err(&f32n));
-        assert!(e_dd <= e_f32, "dd ({e_dd:.2e}) should not be worse than naive f32 ({e_f32:.2e})");
+        assert!(
+            e_dd <= e_f32,
+            "dd ({e_dd:.2e}) should not be worse than naive f32 ({e_f32:.2e})"
+        );
         eprintln!("complex_mul: dd/correctly-rounded err {e_dd:.2e} ≤ naive-f32 err {e_f32:.2e}");
     }
 
@@ -184,13 +213,24 @@ mod tests {
         let run = |dev: &Device| -> Vec<f32> {
             let at = Tensor::from_vec(a.clone(), (256, 2), dev).unwrap();
             let bt = Tensor::from_vec(b.clone(), (256, 2), dev).unwrap();
-            complex_mul_dd(&at, &bt).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap()
+            complex_mul_dd(&at, &bt)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
         };
         let cpu = run(&Device::Cpu); // f64-rounded reference
         let met = run(&mdev); // your cdd_mul on the GPU
-        let maxd = cpu.iter().zip(met.iter()).fold(0f32, |m, (x, y)| m.max((x - y).abs()));
+        let maxd = cpu
+            .iter()
+            .zip(met.iter())
+            .fold(0f32, |m, (x, y)| m.max((x - y).abs()));
         // double-double should reproduce the correctly-rounded result to f32 ulp.
-        assert!(maxd < 1e-6, "metal cdd_mul vs correctly-rounded cpu: {maxd:e}");
+        assert!(
+            maxd < 1e-6,
+            "metal cdd_mul vs correctly-rounded cpu: {maxd:e}"
+        );
         eprintln!("metal cdd_mul == correctly-rounded cpu, max diff {maxd:.2e}");
     }
 }

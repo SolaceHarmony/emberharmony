@@ -21,20 +21,25 @@
 //! The engine is a trait so the threading is unit-tested with a fake (no model needed);
 //! [`Lfm2VoiceEngine`] is the real implementation that owns the model + processor.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 
 use crate::moshi::demo::chat::decode_audio_frame;
-use crate::moshi::models::MimiModel;
+use crate::moshi::models::{
+    load_realtime_moshi, MimiModel, RealtimeMoshi, RealtimeMoshiEvent, RealtimeMoshiFiles,
+    RealtimeMoshiParams,
+};
 
 #[cfg(test)]
 const MIMI_RATE: u32 = 24_000; // Mimi/LFM2 detokenizer output rate.
 
 const UTTERANCE_QUEUE_CAP: usize = 1;
 const EVENT_QUEUE_CAP: usize = 128;
+const FRAME_QUEUE_CAP: usize = 8;
+const STREAM_IDLE_FRAMES: usize = 5;
 
 fn try_send_event(tx: &Sender<VoiceEvent>, ev: VoiceEvent, cancel: &AtomicBool) -> bool {
     match tx.try_send(ev) {
@@ -50,6 +55,13 @@ fn try_send_event(tx: &Sender<VoiceEvent>, ev: VoiceEvent, cancel: &AtomicBool) 
 pub struct Utterance {
     pub samples: Vec<f32>,
     pub rate: u32,
+}
+
+/// Fixed-rate frame contract for models that are truly realtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameConfig {
+    pub sample_rate: u32,
+    pub frame_size: usize,
 }
 
 /// One streamed reply item the worker emits — the Rust analog of `chat.py`'s `q.put`.
@@ -81,29 +93,93 @@ pub trait VoiceEngine: Send {
         cancel: &AtomicBool,
         emit: &mut dyn FnMut(VoiceEvent),
     ) -> Result<bool, String>;
+
+    /// Realtime engines advertise this to bypass utterance/VAD batching and receive exact
+    /// PCM frames continuously, matching upstream Moshi's sounddevice/WebRTC loop.
+    fn frame_config(&self) -> Option<FrameConfig> {
+        None
+    }
+
+    /// Process one fixed-size realtime PCM frame. Returning `Ok(false)` reports an
+    /// interruption to the event stream; ordinary realtime silence should return `Ok(true)`.
+    fn respond_frame(
+        &mut self,
+        _frame: &[f32],
+        _cancel: &AtomicBool,
+        _emit: &mut dyn FnMut(VoiceEvent),
+    ) -> Result<bool, String> {
+        Err("voice engine does not support realtime PCM frames".into())
+    }
+
+    /// Flush stream-local output state after a UI stop/interrupt. Model context reset is
+    /// engine-specific; the default is only to acknowledge the interrupt.
+    fn interrupt_stream(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+impl<T: VoiceEngine + ?Sized> VoiceEngine for Box<T> {
+    fn respond(
+        &mut self,
+        utt: &Utterance,
+        cancel: &AtomicBool,
+        emit: &mut dyn FnMut(VoiceEvent),
+    ) -> Result<bool, String> {
+        (**self).respond(utt, cancel, emit)
+    }
+
+    fn frame_config(&self) -> Option<FrameConfig> {
+        (**self).frame_config()
+    }
+
+    fn respond_frame(
+        &mut self,
+        frame: &[f32],
+        cancel: &AtomicBool,
+        emit: &mut dyn FnMut(VoiceEvent),
+    ) -> Result<bool, String> {
+        (**self).respond_frame(frame, cancel, emit)
+    }
+
+    fn interrupt_stream(&mut self) -> Result<(), String> {
+        (**self).interrupt_stream()
+    }
+}
+
+enum FrameCommand {
+    Pcm { pcm: Vec<f32>, epoch: u64 },
+    Interrupt { epoch: u64 },
+}
+
+struct QueuedUtterance {
+    utt: Utterance,
+    epoch: u64,
 }
 
 /// Handle to the inference worker thread: submit utterances, receive reply events, request
 /// barge-in. Dropping it closes the channel and joins the worker.
 pub struct RealtimePipeline {
-    utt_tx: Option<Sender<Utterance>>,
+    utt_tx: Option<Sender<QueuedUtterance>>,
     event_rx: Receiver<VoiceEvent>,
     cancel: Arc<AtomicBool>,
+    epoch: Arc<AtomicU64>,
     worker: Option<JoinHandle<()>>,
 }
 
 /// Cloneable control handle for producers that feed an existing realtime worker.
 #[derive(Clone)]
 pub struct RealtimePipelineHandle {
-    utt_tx: Sender<Utterance>,
+    utt_tx: Sender<QueuedUtterance>,
     cancel: Arc<AtomicBool>,
+    epoch: Arc<AtomicU64>,
 }
 
 impl RealtimePipelineHandle {
     /// Hand the worker a new utterance. Returns `false` if the bounded queue is full or the
     /// worker has stopped.
     pub fn submit(&self, utt: Utterance) -> bool {
-        match self.utt_tx.try_send(utt) {
+        let epoch = self.epoch.load(Ordering::Acquire);
+        match self.utt_tx.try_send(QueuedUtterance { utt, epoch }) {
             Ok(()) => true,
             Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => false,
         }
@@ -111,6 +187,7 @@ impl RealtimePipelineHandle {
 
     /// Request barge-in: abort the in-flight reply.
     pub fn interrupt(&self) {
+        self.epoch.fetch_add(1, Ordering::AcqRel);
         self.cancel.store(true, Ordering::SeqCst);
     }
 }
@@ -123,17 +200,77 @@ impl RealtimePipeline {
         // One queued utterance is enough: current generation + next turn. Barge-in sets the
         // cancel flag first; if this slot is still full, the caller gets backpressure instead
         // of silently growing latency.
-        let (utt_tx, utt_rx) = bounded::<Utterance>(UTTERANCE_QUEUE_CAP);
+        let (utt_tx, utt_rx) = bounded::<QueuedUtterance>(UTTERANCE_QUEUE_CAP);
         let (event_tx, event_rx) = bounded::<VoiceEvent>(EVENT_QUEUE_CAP);
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_worker = cancel.clone();
+        let epoch = Arc::new(AtomicU64::new(0));
+        let epoch_worker = epoch.clone();
 
         let worker = std::thread::Builder::new()
             .name("lfm2-inference".into())
             .spawn(move || {
                 // The inference coroutine: serve utterances until the sender is dropped
                 // (channel closed) ⇒ `iter()` ends ⇒ the thread returns and joins.
-                for utt in utt_rx.iter() {
+                let mut current_epoch = 0u64;
+                for QueuedUtterance { utt, epoch } in utt_rx.iter() {
+                    let latest_epoch = epoch_worker.load(Ordering::Acquire);
+                    if epoch < latest_epoch {
+                        if latest_epoch > current_epoch {
+                            current_epoch = latest_epoch;
+                            cancel_worker.store(true, Ordering::SeqCst);
+                            let reset = engine.interrupt_stream();
+                            cancel_worker.store(false, Ordering::SeqCst);
+                            match reset {
+                                Ok(()) => {
+                                    if !try_send_event(
+                                        &event_tx,
+                                        VoiceEvent::Interrupted,
+                                        &cancel_worker,
+                                    ) {
+                                        break;
+                                    }
+                                }
+                                Err(error) => {
+                                    if !try_send_event(
+                                        &event_tx,
+                                        VoiceEvent::Error(error),
+                                        &cancel_worker,
+                                    ) {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    if epoch > current_epoch {
+                        current_epoch = epoch;
+                        cancel_worker.store(true, Ordering::SeqCst);
+                        let reset = engine.interrupt_stream();
+                        cancel_worker.store(false, Ordering::SeqCst);
+                        match reset {
+                            Ok(()) => {
+                                if !try_send_event(
+                                    &event_tx,
+                                    VoiceEvent::Interrupted,
+                                    &cancel_worker,
+                                ) {
+                                    break;
+                                }
+                            }
+                            Err(error) => {
+                                if !try_send_event(
+                                    &event_tx,
+                                    VoiceEvent::Error(error),
+                                    &cancel_worker,
+                                ) {
+                                    break;
+                                }
+                                continue;
+                            }
+                        }
+                    }
                     // A fresh turn clears any barge-in left set by the previous reply, so
                     // it cannot carry over and abort the new one before it starts.
                     cancel_worker.store(false, Ordering::SeqCst);
@@ -154,7 +291,21 @@ impl RealtimePipeline {
                     } else {
                         match responded {
                             Ok(true) => VoiceEvent::TurnComplete,
-                            Ok(false) => VoiceEvent::Interrupted,
+                            Ok(false) => {
+                                let latest_epoch = epoch_worker.load(Ordering::Acquire);
+                                if latest_epoch > current_epoch {
+                                    current_epoch = latest_epoch;
+                                    cancel_worker.store(true, Ordering::SeqCst);
+                                    let reset = engine.interrupt_stream();
+                                    cancel_worker.store(false, Ordering::SeqCst);
+                                    match reset {
+                                        Ok(()) => VoiceEvent::Interrupted,
+                                        Err(error) => VoiceEvent::Error(error),
+                                    }
+                                } else {
+                                    VoiceEvent::Interrupted
+                                }
+                            }
                             Err(e) => VoiceEvent::Error(e),
                         }
                     };
@@ -169,6 +320,7 @@ impl RealtimePipeline {
             utt_tx: Some(utt_tx),
             event_rx,
             cancel,
+            epoch,
             worker: Some(worker),
         })
     }
@@ -179,7 +331,8 @@ impl RealtimePipeline {
         let Some(tx) = self.utt_tx.as_ref() else {
             return false;
         };
-        match tx.try_send(utt) {
+        let epoch = self.epoch.load(Ordering::Acquire);
+        match tx.try_send(QueuedUtterance { utt, epoch }) {
             Ok(()) => true,
             Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => false,
         }
@@ -189,6 +342,7 @@ impl RealtimePipeline {
     /// early, after which the worker emits [`VoiceEvent::Interrupted`]. Call this before
     /// submitting the interrupting utterance.
     pub fn interrupt(&self) {
+        self.epoch.fetch_add(1, Ordering::AcqRel);
         self.cancel.store(true, Ordering::SeqCst);
     }
 
@@ -202,6 +356,7 @@ impl RealtimePipeline {
         self.utt_tx.as_ref().map(|utt_tx| RealtimePipelineHandle {
             utt_tx: utt_tx.clone(),
             cancel: self.cancel.clone(),
+            epoch: self.epoch.clone(),
         })
     }
 }
@@ -210,8 +365,291 @@ impl Drop for RealtimePipeline {
     fn drop(&mut self) {
         // Abort any in-flight reply fast, then close the utterance channel so the worker's
         // `iter()` ends, then join — no detached thread, no leak.
+        self.epoch.fetch_add(1, Ordering::AcqRel);
         self.cancel.store(true, Ordering::SeqCst);
         drop(self.utt_tx.take());
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+/// Frame-fed realtime worker for Moshi-style engines. Unlike [`RealtimePipeline`], this
+/// keeps the model advancing on exact PCM frames instead of waiting for a VAD utterance.
+pub struct RealtimeFramePipeline {
+    frame_tx: Option<Sender<FrameCommand>>,
+    event_rx: Receiver<VoiceEvent>,
+    cancel: Arc<AtomicBool>,
+    epoch: Arc<AtomicU64>,
+    cfg: FrameConfig,
+    worker: Option<JoinHandle<()>>,
+}
+
+#[derive(Clone)]
+pub struct RealtimeFramePipelineHandle {
+    frame_tx: Sender<FrameCommand>,
+    cancel: Arc<AtomicBool>,
+    epoch: Arc<AtomicU64>,
+    cfg: FrameConfig,
+}
+
+impl RealtimeFramePipelineHandle {
+    pub fn config(&self) -> FrameConfig {
+        self.cfg
+    }
+
+    pub fn submit_frame(&self, pcm: Vec<f32>) -> bool {
+        if pcm.len() != self.cfg.frame_size {
+            return false;
+        }
+        let epoch = self.epoch.load(Ordering::Acquire);
+        match self.frame_tx.try_send(FrameCommand::Pcm { pcm, epoch }) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => false,
+        }
+    }
+
+    pub fn interrupt(&self) {
+        let epoch = self.epoch.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+        self.cancel.store(true, Ordering::SeqCst);
+        let _ = self.frame_tx.try_send(FrameCommand::Interrupt { epoch });
+    }
+}
+
+impl RealtimeFramePipeline {
+    pub fn spawn<E: VoiceEngine + 'static>(mut engine: E) -> Result<Self, String> {
+        let cfg = engine
+            .frame_config()
+            .ok_or_else(|| "voice engine does not expose a realtime frame config".to_string())?;
+        if cfg.sample_rate == 0 {
+            return Err("realtime frame sample rate must be non-zero".into());
+        }
+        if cfg.frame_size == 0 {
+            return Err("realtime frame size must be non-zero".into());
+        }
+
+        let (frame_tx, frame_rx) = bounded::<FrameCommand>(FRAME_QUEUE_CAP);
+        let (event_tx, event_rx) = bounded::<VoiceEvent>(EVENT_QUEUE_CAP);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_worker = cancel.clone();
+        let epoch = Arc::new(AtomicU64::new(0));
+        let epoch_worker = epoch.clone();
+
+        let worker = std::thread::Builder::new()
+            .name("moshi-frame-inference".into())
+            .spawn(move || {
+                let mut active = false;
+                let mut idle_frames = 0usize;
+                let mut current_epoch = 0u64;
+                for cmd in frame_rx.iter() {
+                    match cmd {
+                        FrameCommand::Interrupt { epoch } => {
+                            if epoch <= current_epoch {
+                                continue;
+                            }
+                            current_epoch = epoch;
+                            cancel_worker.store(true, Ordering::SeqCst);
+                            let interrupted = engine.interrupt_stream().is_ok();
+                            cancel_worker.store(false, Ordering::SeqCst);
+                            active = false;
+                            idle_frames = 0;
+                            if interrupted
+                                && !try_send_event(
+                                    &event_tx,
+                                    VoiceEvent::Interrupted,
+                                    &cancel_worker,
+                                )
+                            {
+                                break;
+                            }
+                        }
+                        FrameCommand::Pcm { pcm: frame, epoch } => {
+                            let latest_epoch = epoch_worker.load(Ordering::Acquire);
+                            if epoch < latest_epoch {
+                                if latest_epoch > current_epoch {
+                                    current_epoch = latest_epoch;
+                                    cancel_worker.store(true, Ordering::SeqCst);
+                                    let reset = engine.interrupt_stream();
+                                    cancel_worker.store(false, Ordering::SeqCst);
+                                    active = false;
+                                    idle_frames = 0;
+                                    match reset {
+                                        Ok(()) => {
+                                            if !try_send_event(
+                                                &event_tx,
+                                                VoiceEvent::Interrupted,
+                                                &cancel_worker,
+                                            ) {
+                                                break;
+                                            }
+                                        }
+                                        Err(error) => {
+                                            if !try_send_event(
+                                                &event_tx,
+                                                VoiceEvent::Error(error),
+                                                &cancel_worker,
+                                            ) {
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                                continue;
+                            }
+                            if epoch > current_epoch {
+                                current_epoch = epoch;
+                                active = false;
+                                idle_frames = 0;
+                                if engine.interrupt_stream().is_err() {
+                                    if !try_send_event(
+                                        &event_tx,
+                                        VoiceEvent::Error(
+                                            "failed to interrupt voice stream".into(),
+                                        ),
+                                        &cancel_worker,
+                                    ) {
+                                        break;
+                                    }
+                                    continue;
+                                }
+                                let _ = try_send_event(
+                                    &event_tx,
+                                    VoiceEvent::Interrupted,
+                                    &cancel_worker,
+                                );
+                            }
+                            cancel_worker.store(false, Ordering::SeqCst);
+                            let mut event_backpressure = false;
+                            let mut emitted_output = false;
+                            let responded = {
+                                let mut emit = |ev: VoiceEvent| {
+                                    if event_backpressure {
+                                        return;
+                                    }
+                                    emitted_output |=
+                                        matches!(ev, VoiceEvent::Text(_) | VoiceEvent::Audio(_));
+                                    if !try_send_event(&event_tx, ev, &cancel_worker) {
+                                        event_backpressure = true;
+                                    }
+                                };
+                                engine.respond_frame(&frame, &cancel_worker, &mut emit)
+                            };
+                            if event_backpressure {
+                                let _ = try_send_event(
+                                    &event_tx,
+                                    VoiceEvent::Error(
+                                        "voice event queue full or disconnected".into(),
+                                    ),
+                                    &cancel_worker,
+                                );
+                                break;
+                            }
+                            match responded {
+                                Ok(true) => {
+                                    if emitted_output {
+                                        active = true;
+                                        idle_frames = 0;
+                                    } else if active {
+                                        idle_frames += 1;
+                                        if idle_frames >= STREAM_IDLE_FRAMES {
+                                            active = false;
+                                            idle_frames = 0;
+                                            if !try_send_event(
+                                                &event_tx,
+                                                VoiceEvent::TurnComplete,
+                                                &cancel_worker,
+                                            ) {
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                                Ok(false) => {
+                                    active = false;
+                                    idle_frames = 0;
+                                    if !try_send_event(
+                                        &event_tx,
+                                        VoiceEvent::Interrupted,
+                                        &cancel_worker,
+                                    ) {
+                                        break;
+                                    }
+                                }
+                                Err(e) => {
+                                    active = false;
+                                    idle_frames = 0;
+                                    if !try_send_event(
+                                        &event_tx,
+                                        VoiceEvent::Error(e),
+                                        &cancel_worker,
+                                    ) {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            })
+            .map_err(|e| format!("spawn moshi-frame-inference worker failed: {e}"))?;
+
+        Ok(Self {
+            frame_tx: Some(frame_tx),
+            event_rx,
+            cancel,
+            epoch,
+            cfg,
+            worker: Some(worker),
+        })
+    }
+
+    pub fn config(&self) -> FrameConfig {
+        self.cfg
+    }
+
+    pub fn submit_frame(&self, pcm: Vec<f32>) -> bool {
+        if pcm.len() != self.cfg.frame_size {
+            return false;
+        }
+        let Some(tx) = self.frame_tx.as_ref() else {
+            return false;
+        };
+        let epoch = self.epoch.load(Ordering::Acquire);
+        match tx.try_send(FrameCommand::Pcm { pcm, epoch }) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => false,
+        }
+    }
+
+    pub fn interrupt(&self) {
+        let epoch = self.epoch.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+        self.cancel.store(true, Ordering::SeqCst);
+        if let Some(tx) = self.frame_tx.as_ref() {
+            let _ = tx.try_send(FrameCommand::Interrupt { epoch });
+        }
+    }
+
+    pub fn events(&self) -> &Receiver<VoiceEvent> {
+        &self.event_rx
+    }
+
+    pub fn handle(&self) -> Option<RealtimeFramePipelineHandle> {
+        self.frame_tx
+            .as_ref()
+            .map(|frame_tx| RealtimeFramePipelineHandle {
+                frame_tx: frame_tx.clone(),
+                cancel: self.cancel.clone(),
+                epoch: self.epoch.clone(),
+                cfg: self.cfg,
+            })
+    }
+}
+
+impl Drop for RealtimeFramePipeline {
+    fn drop(&mut self) {
+        self.epoch.fetch_add(1, Ordering::AcqRel);
+        self.cancel.store(true, Ordering::SeqCst);
+        drop(self.frame_tx.take());
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
@@ -488,6 +926,166 @@ impl VoiceEngine for Lfm2VoiceEngine {
     }
 }
 
+/// Native Moshi realtime engine: persistent Mimi + LMGen-style state fed with fixed PCM frames.
+///
+/// This is the desktop-side counterpart of upstream `moshi/server.py` without the websocket/Opus
+/// wrapper. The surrounding [`RealtimePipeline`] still owns the model on a worker thread and
+/// handles barge-in cancellation; this engine keeps the canonical Moshi step order inside that
+/// worker: PCM frame -> Mimi encode -> multistream LM step -> Mimi decode.
+pub struct MoshiVoiceEngine {
+    realtime: RealtimeMoshi,
+    text: sentencepiece_rust::SentencePieceProcessor,
+    out_rate: u32,
+    out_resampler: StreamingPcmResampler,
+}
+
+impl MoshiVoiceEngine {
+    pub fn new(
+        realtime: RealtimeMoshi,
+        text: sentencepiece_rust::SentencePieceProcessor,
+        out_rate: u32,
+    ) -> Self {
+        let rate = realtime.sample_rate();
+        Self {
+            realtime,
+            text,
+            out_rate,
+            out_resampler: StreamingPcmResampler::new(rate, out_rate),
+        }
+    }
+
+    pub fn from_files(
+        files: &RealtimeMoshiFiles,
+        dtype: DType,
+        device: &Device,
+        params: RealtimeMoshiParams,
+        out_rate: u32,
+    ) -> Result<Self, String> {
+        let moshi_weights = files
+            .moshi_weights
+            .to_str()
+            .ok_or_else(|| "Moshi checkpoint path is not UTF-8".to_string())?;
+        let mimi_weights = files
+            .mimi_weights
+            .to_str()
+            .ok_or_else(|| "Mimi checkpoint path is not UTF-8".to_string())?;
+        let realtime = load_realtime_moshi(moshi_weights, mimi_weights, dtype, device, params)
+            .map_err(|e| e.to_string())?;
+        let text = sentencepiece_rust::SentencePieceProcessor::open(&files.tokenizer)
+            .map_err(|e| e.to_string())?;
+        Ok(Self::new(realtime, text, out_rate))
+    }
+
+    fn decode_text_token(&self, token: u32) -> Option<String> {
+        let piece = self.text.id_to_piece(token as i32)?;
+        let text = piece.replace('▁', " ");
+        if text.is_empty() {
+            return None;
+        }
+        Some(text)
+    }
+
+    fn emit_events(
+        &mut self,
+        events: Vec<RealtimeMoshiEvent>,
+        cancel: &AtomicBool,
+        emit: &mut dyn FnMut(VoiceEvent),
+    ) -> bool {
+        for event in events {
+            if cancel.load(Ordering::Acquire) {
+                return false;
+            }
+            match event {
+                RealtimeMoshiEvent::TextToken(token) => {
+                    if let Some(text) = self.decode_text_token(token) {
+                        emit(VoiceEvent::Text(text));
+                    }
+                }
+                RealtimeMoshiEvent::Audio { pcm, rate } => {
+                    let pcm = if rate == self.out_rate {
+                        pcm
+                    } else {
+                        self.out_resampler.process(pcm)
+                    };
+                    emit(VoiceEvent::Audio(pcm));
+                }
+            }
+        }
+        true
+    }
+}
+
+impl VoiceEngine for MoshiVoiceEngine {
+    fn respond(
+        &mut self,
+        utt: &Utterance,
+        cancel: &AtomicBool,
+        emit: &mut dyn FnMut(VoiceEvent),
+    ) -> Result<bool, String> {
+        if utt.rate == 0 {
+            return Err("utterance sample rate must be non-zero".into());
+        }
+        let rate = self.realtime.sample_rate();
+        if rate == 0 {
+            return Err("Moshi realtime sample rate must be non-zero".into());
+        }
+        if self.out_rate == 0 {
+            return Err("output sample rate must be non-zero".into());
+        }
+        let samples = if utt.rate == rate {
+            utt.samples.clone()
+        } else {
+            crate::resample::resample_slice(&utt.samples, utt.rate, rate)
+        };
+        let frame = self.realtime.frame_size();
+        if frame == 0 {
+            return Err("Moshi realtime frame size must be non-zero".into());
+        }
+        for chunk in samples.chunks(frame).filter(|chunk| chunk.len() == frame) {
+            if cancel.load(Ordering::Acquire) {
+                return Ok(false);
+            }
+            let events = self
+                .realtime
+                .step_pcm_frame(chunk)
+                .map_err(|e| e.to_string())?;
+            if !self.emit_events(events, cancel, emit) {
+                return Ok(false);
+            }
+        }
+        Ok(!cancel.load(Ordering::Acquire))
+    }
+
+    fn frame_config(&self) -> Option<FrameConfig> {
+        Some(FrameConfig {
+            sample_rate: self.realtime.sample_rate(),
+            frame_size: self.realtime.frame_size(),
+        })
+    }
+
+    fn respond_frame(
+        &mut self,
+        frame: &[f32],
+        cancel: &AtomicBool,
+        emit: &mut dyn FnMut(VoiceEvent),
+    ) -> Result<bool, String> {
+        if cancel.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+        let events = self
+            .realtime
+            .step_pcm_frame(frame)
+            .map_err(|e| e.to_string())?;
+        Ok(self.emit_events(events, cancel, emit) && !cancel.load(Ordering::Acquire))
+    }
+
+    fn interrupt_stream(&mut self) -> Result<(), String> {
+        self.realtime.reset_stream();
+        self.out_resampler.reset();
+        Ok(())
+    }
+}
+
 /// Stateful PCM conversion for the streaming Mimi decoder.
 ///
 /// The reference model emits Mimi audio at 24 kHz, while the built-in macOS output path is
@@ -511,6 +1109,7 @@ impl StreamingPcmResampler {
 
     fn process(&mut self, pcm: Vec<f32>) -> Vec<f32> {
         if pcm.is_empty() || self.to == 0 || self.to == self.from {
+            self.prev = pcm.last().copied().or(self.prev);
             return pcm;
         }
         if self.to > self.from && self.to % self.from == 0 {
@@ -518,6 +1117,10 @@ impl StreamingPcmResampler {
         }
         self.prev = pcm.last().copied();
         crate::resample::resample_slice(&pcm, self.from, self.to)
+    }
+
+    fn reset(&mut self) {
+        self.prev = None;
     }
 
     fn upsample_integer(&mut self, pcm: &[f32], ratio: usize) -> Vec<f32> {
@@ -571,6 +1174,196 @@ mod tests {
         let mut resampler = StreamingPcmResampler::new(24_000, 48_000);
         assert_eq!(resampler.process(vec![0.0, 1.0]), vec![0.0, 0.0, 0.5, 1.0]);
         assert_eq!(resampler.process(vec![0.0]), vec![0.5, 0.0]);
+    }
+
+    struct BlockingFrameEngine {
+        calls: Arc<AtomicUsize>,
+        entered: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+    }
+
+    impl VoiceEngine for BlockingFrameEngine {
+        fn respond(
+            &mut self,
+            _utt: &Utterance,
+            _cancel: &AtomicBool,
+            _emit: &mut dyn FnMut(VoiceEvent),
+        ) -> Result<bool, String> {
+            unreachable!("frame engine should not receive utterances")
+        }
+
+        fn frame_config(&self) -> Option<FrameConfig> {
+            Some(FrameConfig {
+                sample_rate: 24_000,
+                frame_size: 2,
+            })
+        }
+
+        fn respond_frame(
+            &mut self,
+            _frame: &[f32],
+            cancel: &AtomicBool,
+            emit: &mut dyn FnMut(VoiceEvent),
+        ) -> Result<bool, String> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                let _ = self.entered.send(());
+                self.release
+                    .recv_timeout(Duration::from_secs(5))
+                    .map_err(|e| format!("release wait failed: {e}"))?;
+            }
+            if cancel.load(Ordering::SeqCst) {
+                return Ok(false);
+            }
+            emit(VoiceEvent::Text(format!("frame {call}")));
+            Ok(true)
+        }
+    }
+
+    #[test]
+    fn frame_pipeline_interrupt_drops_queued_stale_frames() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let pipe = RealtimeFramePipeline::spawn(BlockingFrameEngine {
+            calls: calls.clone(),
+            entered: entered_tx,
+            release: release_rx,
+        })
+        .expect("spawn frame pipeline");
+
+        assert!(pipe.submit_frame(vec![0.0, 0.0]));
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("first frame should enter engine");
+        assert!(pipe.submit_frame(vec![0.1, 0.1]));
+        assert!(pipe.submit_frame(vec![0.2, 0.2]));
+        pipe.interrupt();
+        assert!(pipe.submit_frame(vec![0.3, 0.3]));
+        release_tx.send(()).unwrap();
+
+        let mut saw_new_frame = false;
+        for _ in 0..4 {
+            match pipe
+                .events()
+                .recv_timeout(Duration::from_secs(5))
+                .expect("expected frame pipeline event")
+            {
+                VoiceEvent::Text(text) if text == "frame 1" => {
+                    saw_new_frame = true;
+                    break;
+                }
+                VoiceEvent::Interrupted => {}
+                other => panic!("unexpected event {other:?}"),
+            }
+        }
+
+        assert!(saw_new_frame, "new-epoch frame should still run");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "stale queued frames must not reach the engine"
+        );
+    }
+
+    struct SaturatedFrameEngine {
+        calls: Arc<AtomicUsize>,
+        resets: Arc<AtomicUsize>,
+        entered: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+    }
+
+    impl VoiceEngine for SaturatedFrameEngine {
+        fn respond(
+            &mut self,
+            _utt: &Utterance,
+            _cancel: &AtomicBool,
+            _emit: &mut dyn FnMut(VoiceEvent),
+        ) -> Result<bool, String> {
+            unreachable!("frame engine should not receive utterances")
+        }
+
+        fn frame_config(&self) -> Option<FrameConfig> {
+            Some(FrameConfig {
+                sample_rate: 24_000,
+                frame_size: 2,
+            })
+        }
+
+        fn respond_frame(
+            &mut self,
+            _frame: &[f32],
+            _cancel: &AtomicBool,
+            emit: &mut dyn FnMut(VoiceEvent),
+        ) -> Result<bool, String> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                let _ = self.entered.send(());
+                self.release
+                    .recv_timeout(Duration::from_secs(5))
+                    .map_err(|e| format!("release wait failed: {e}"))?;
+            }
+            emit(VoiceEvent::Text(format!("frame {call}")));
+            Ok(true)
+        }
+
+        fn interrupt_stream(&mut self) -> Result<(), String> {
+            self.resets.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn frame_pipeline_interrupt_resets_even_when_command_queue_is_full() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let resets = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let pipe = RealtimeFramePipeline::spawn(SaturatedFrameEngine {
+            calls: calls.clone(),
+            resets: resets.clone(),
+            entered: entered_tx,
+            release: release_rx,
+        })
+        .expect("spawn frame pipeline");
+
+        assert!(pipe.submit_frame(vec![0.0, 0.0]));
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("first frame should enter engine");
+        for _ in 0..FRAME_QUEUE_CAP {
+            assert!(pipe.submit_frame(vec![0.1, 0.1]));
+        }
+        pipe.interrupt();
+        release_tx.send(()).unwrap();
+
+        let mut saw_interrupted = false;
+        for _ in 0..4 {
+            match pipe
+                .events()
+                .recv_timeout(Duration::from_secs(5))
+                .expect("expected frame pipeline event")
+            {
+                VoiceEvent::Text(text) if text == "frame 0" => {}
+                VoiceEvent::Interrupted => {
+                    saw_interrupted = true;
+                    break;
+                }
+                other => panic!("unexpected event {other:?}"),
+            }
+        }
+
+        assert!(saw_interrupted, "full queues must not drop stream reset");
+        assert_eq!(
+            resets.load(Ordering::SeqCst),
+            1,
+            "the stale queued frame should trigger the missed interrupt reset"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "stale queued frames must not reach the engine after interrupt"
+        );
     }
 
     /// Emits a scripted (Text, Audio) pair then completes; counts the turns it served.

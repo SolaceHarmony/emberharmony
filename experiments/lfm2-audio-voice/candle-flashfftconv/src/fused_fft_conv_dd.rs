@@ -7,9 +7,9 @@
 //! accuracy instead of the f32 floor. Threadgroup memory is `complex_dd` (4 f32 =
 //! 16 bytes/element), so `fft_size ≤ 1024` still fits.
 
-use candle_core::{CpuStorage, CustomOp3, Layout, Result, Shape, Tensor};
 #[cfg(feature = "metal")]
 use candle_core::DType;
+use candle_core::{CpuStorage, CustomOp3, Layout, Result, Shape, Tensor};
 
 #[cfg(feature = "metal")]
 fn dd_source() -> String {
@@ -72,10 +72,16 @@ impl CustomOp3 for FusedFftConvDd {
                         si += uv * ang.sin();
                     }
                     let (kr, ki) = if k < half {
-                        (kf[(ci * half + k) * 2] as f64, kf[(ci * half + k) * 2 + 1] as f64)
+                        (
+                            kf[(ci * half + k) * 2] as f64,
+                            kf[(ci * half + k) * 2 + 1] as f64,
+                        )
                     } else {
                         let m = fft_size - k;
-                        (kf[(ci * half + m) * 2] as f64, -(kf[(ci * half + m) * 2 + 1] as f64))
+                        (
+                            kf[(ci * half + m) * 2] as f64,
+                            -(kf[(ci * half + m) * 2 + 1] as f64),
+                        )
                     };
                     spec_re[k] = sr * kr - si * ki;
                     spec_im[k] = sr * ki + si * kr;
@@ -111,10 +117,14 @@ impl CustomOp3 for FusedFftConvDd {
         let (b, c, seqlen) = ul.shape().dims3()?;
         let fft_size = self.fft_size;
         if !fft_size.is_power_of_two() {
-            candle_core::bail!("fused_fft_conv_dd: fft_size must be a power of two (got {fft_size})");
+            candle_core::bail!(
+                "fused_fft_conv_dd: fft_size must be a power of two (got {fft_size})"
+            );
         }
         if fft_size > 1024 {
-            candle_core::bail!("fused_fft_conv_dd: fft_size {fft_size} exceeds 1024 (one thread/element)");
+            candle_core::bail!(
+                "fused_fft_conv_dd: fft_size {fft_size} exceeds 1024 (one thread/element)"
+            );
         }
         let dev = us.device();
         let p = crate::metal_util::pipeline(dev, "fft_conv_dd", &dd_source())?;
@@ -163,10 +173,21 @@ impl CustomOp3 for FusedFftConvDd {
         // complex_dd = 4 f32 = 16 bytes per FFT element.
         enc.set_threadgroup_memory_length(0, fft_size * 16);
         enc.dispatch_thread_groups(
-            MTLSize { width: b, height: c, depth: 1 },
-            MTLSize { width: fft_size, height: 1, depth: 1 },
+            MTLSize {
+                width: b,
+                height: c,
+                depth: 1,
+            },
+            MTLSize {
+                width: fft_size,
+                height: 1,
+                depth: 1,
+            },
         );
-        Ok((MetalStorage::new(out, dev.clone(), b * c * seqlen, DType::F32), Shape::from((b, c, seqlen))))
+        Ok((
+            MetalStorage::new(out, dev.clone(), b * c * seqlen, DType::F32),
+            Shape::from((b, c, seqlen)),
+        ))
     }
 }
 
@@ -214,29 +235,51 @@ mod tests {
         let (seqlen, fft_size) = (64usize, 128);
         // ill-conditioned filter: large dynamic range so f32 accumulation drifts.
         let u: Vec<f32> = (0..seqlen).map(|i| (i as f32 * 0.37).sin() * 8.0).collect();
-        let k: Vec<f32> = (0..seqlen).map(|i| (i as f32 * 0.11).cos() * (1.0 + i as f32 * 0.3)).collect();
+        let k: Vec<f32> = (0..seqlen)
+            .map(|i| (i as f32 * 0.11).cos() * (1.0 + i as f32 * 0.3))
+            .collect();
         let kf = rfft_half(&k, fft_size);
         let cpu = Device::Cpu;
 
         let ut = |dev: &Device| Tensor::from_vec(u.clone(), (1, 1, seqlen), dev).unwrap();
-        let kt = |dev: &Device| Tensor::from_vec(kf.clone(), (1, fft_size / 2 + 1, 2), dev).unwrap();
+        let kt =
+            |dev: &Device| Tensor::from_vec(kf.clone(), (1, fft_size / 2 + 1, 2), dev).unwrap();
         let dt = |dev: &Device| Tensor::from_vec(vec![0.0f32], (1,), dev).unwrap();
 
         // f64 reference = the dd op's cpu path.
         let f64ref: Vec<f32> = fused_fft_conv_dd(&ut(&cpu), &kt(&cpu), &dt(&cpu), fft_size)
-            .unwrap().flatten_all().unwrap().to_vec1().unwrap();
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
         // f32 Metal kernel.
         let f32m: Vec<f32> = crate::fused_fft_conv(&ut(&mdev), &kt(&mdev), &dt(&mdev), fft_size)
-            .unwrap().flatten_all().unwrap().to_vec1().unwrap();
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
         // double-double Metal kernel (your primitives).
         let ddm: Vec<f32> = fused_fft_conv_dd(&ut(&mdev), &kt(&mdev), &dt(&mdev), fft_size)
-            .unwrap().flatten_all().unwrap().to_vec1().unwrap();
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
 
-        let err = |v: &[f32]| v.iter().zip(f64ref.iter()).fold(0f32, |m, (a, r)| m.max((a - r).abs()));
+        let err = |v: &[f32]| {
+            v.iter()
+                .zip(f64ref.iter())
+                .fold(0f32, |m, (a, r)| m.max((a - r).abs()))
+        };
         let (e_dd, e_f32) = (err(&ddm), err(&f32m));
         eprintln!("fused conv vs f64: double-double {e_dd:.3e}  vs  f32 {e_f32:.3e}");
         // The dd FFT/multiply/IFFT (with the host f64 twiddle table) is strictly
         // closer to the f64 reference than the f32 kernel.
-        assert!(e_dd < e_f32, "double-double ({e_dd:e}) should beat f32 ({e_f32:e})");
+        assert!(
+            e_dd < e_f32,
+            "double-double ({e_dd:e}) should beat f32 ({e_f32:e})"
+        );
     }
 }

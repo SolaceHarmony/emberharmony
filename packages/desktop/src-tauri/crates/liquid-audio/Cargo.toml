@@ -33,6 +33,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # text tokenizer (HF AutoTokenizer equivalent — loads tokenizer.json).
 tokenizers = "0.20"
+# Pure Rust SentencePiece inference for upstream Moshi text tokens
+# (`tokenizer_spm_32k_3.model`), no Python/C++ runtime.
+sentencepiece-rust = "0.1"
 # HF snapshot download (huggingface_hub.snapshot_download equivalent) for
 # get_model_dir's repo-id branch. Sync (ureq) backend = faithful to the
 # synchronous Python call. Optional (feature `download`, on by default).

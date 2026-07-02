@@ -102,7 +102,11 @@ pub fn dispatch_dft(
     }
     let total = b * h * n * l;
     let out_el = if out_complex { total * 2 } else { total };
-    let out_shape = if out_complex { Shape::from((b, h, n, l, 2)) } else { Shape::from((b, h, n, l)) };
+    let out_shape = if out_complex {
+        Shape::from((b, h, n, l, 2))
+    } else {
+        Shape::from((b, h, n, l))
+    };
     let dev = xs.device();
     let p = pipeline(dev, fn_name, src)?;
     let dts = DType::F32.size_in_bytes();
@@ -122,8 +126,19 @@ pub fn dispatch_dft(
     let tg = total.clamp(1, max_tg);
     let ng = total.div_ceil(tg);
     enc.dispatch_thread_groups(
-        MTLSize { width: ng, height: 1, depth: 1 },
-        MTLSize { width: tg, height: 1, depth: 1 },
+        MTLSize {
+            width: ng,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg,
+            height: 1,
+            depth: 1,
+        },
     );
-    Ok((MetalStorage::new(out_buf, dev.clone(), out_el, DType::F32), out_shape))
+    Ok((
+        MetalStorage::new(out_buf, dev.clone(), out_el, DType::F32),
+        out_shape,
+    ))
 }

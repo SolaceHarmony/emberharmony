@@ -1,10 +1,11 @@
 //! Tauri-owned voice runtime.
 //!
-//! The audio service itself lives in `liquid_audio::VoiceRuntime`: CPAL mic
-//! capture, speaker playback, VAD, barge-in, and the realtime inference worker
-//! all run in-process on Rust threads. This module is the desktop kernel wrapper:
-//! it loads Tauri settings, builds the LFM2 engine, owns the single active
-//! session, and maps runtime events onto the webview `Channel`.
+//! The audio service itself lives in `liquid_audio::VoiceRuntime`: the Tauri layer
+//! feeds local microphone frames from WebRTC/PlatformAudio and routes local speaker
+//! PCM through WebRTC/PlatformAudio, while VAD, barge-in, and realtime inference run on Rust
+//! threads. This module is the desktop kernel wrapper: it loads Tauri settings,
+//! builds the LFM2 engine, owns the single active session, and maps runtime events
+//! onto the webview `Channel`.
 
 use std::{
     borrow::Cow,
@@ -12,7 +13,7 @@ use std::{
     future::Future,
     path::Path,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -21,26 +22,35 @@ use std::{
 use candle_core::Device;
 use crossbeam_channel::{Receiver, RecvTimeoutError};
 use futures::StreamExt;
+use liquid_audio::moshi::models::{realtime_moshi_files, safetensors_floating_dtype};
 use liquid_audio::{
-    GenParams, Lfm2VoiceEngine, RealtimePipeline, RealtimePipelineHandle, RuntimeConfig,
-    RuntimeEvent, SessionState, Utterance, VoiceEvent as RealtimeEvent,
+    AudioStatsSnapshot, ExternalAudioInput, ExternalAudioInputWriter, ExternalAudioOutput,
+    GenParams, Lfm2VoiceEngine, MoshiVoiceEngine, RealtimeFramePipeline,
+    RealtimeFramePipelineHandle, RealtimePipeline, RealtimePipelineHandle, RuntimeConfig,
+    RuntimeEvent, SessionState, Utterance, VoiceEngine, VoiceEvent as RealtimeEvent,
     VoiceRuntime as Lfm2Runtime, from_pretrained,
 };
 use livekit::{
     AudioProcessingOptions, ConnectionState, DataPacket, PlatformAudio, Room, RoomEvent,
     RoomOptions,
     options::TrackPublishOptions,
+    rtc_engine::lk_runtime::LkRuntime,
     track::{LocalAudioTrack, LocalTrack, RemoteAudioTrack, RemoteTrack, TrackSource},
-    webrtc::audio_stream::native::NativeAudioStream,
+    webrtc::audio_stream::native::{NativeAudioStream, NativeAudioStreamOptions},
     webrtc::{
         audio_frame::AudioFrame,
         audio_source::{AudioSourceOptions, RtcAudioSource, native::NativeAudioSource},
+        ice_candidate::IceCandidate,
+        media_stream_track::MediaStreamTrack,
+        peer_connection::{AnswerOptions, OfferOptions, PeerConnection, PeerConnectionState},
+        peer_connection_factory::{RtcConfiguration, native::PeerConnectionFactoryExt},
     },
 };
+use serde::Serialize;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::settings::{
-    self, Lfm2Device, Lfm2Settings, LiveKitSettings, VoiceProvider, VoiceSettings,
+    self, Lfm2Device, Lfm2Settings, LiveKitSettings, LocalVoiceEngine, VoiceProvider, VoiceSettings,
 };
 
 use super::control::{LiveKitGrant, Role, SessionCtx, VoiceEvent, VoiceState};
@@ -65,6 +75,13 @@ const LIVEKIT_AGENT_AUDIO_CHANNELS: u32 = 1;
 const LIVEKIT_AGENT_AUDIO_RATE_I32: i32 = 48_000;
 const LIVEKIT_AGENT_AUDIO_CHANNELS_I32: i32 = 1;
 const LIVEKIT_AGENT_AUDIO_QUEUE_MS: u32 = 250;
+const LOCAL_WEBRTC_MIC_QUEUE_FRAMES: usize = 4;
+const LOCAL_WEBRTC_MIC_READY_TIMEOUT_MS: u64 = 5_000;
+const LOCAL_WEBRTC_OUTPUT_READY_TIMEOUT_MS: u64 = 5_000;
+const LOCAL_WEBRTC_OUTPUT_ICE_TIMEOUT_MS: u64 = 5_000;
+const LOCAL_WEBRTC_OUTPUT_ICE_QUEUE_CAP: usize = 16;
+const LOCAL_WEBRTC_INPUT_STREAM_ID: &str = "local-lfm2-input";
+const LOCAL_WEBRTC_OUTPUT_STREAM_ID: &str = "local-lfm2-output";
 const LIVEKIT_AGENT_SILENCE_MS: u64 = 800;
 const LIVEKIT_AGENT_MAX_UTTERANCE_SECONDS: usize = 30;
 const LIVEKIT_AGENT_ECHO_GATE_MS: u64 = 700;
@@ -219,6 +236,7 @@ pub struct RuntimeSnapshot {
     pub running_provider: Option<VoiceProvider>,
     pub mic_enabled: bool,
     pub session_id: Option<String>,
+    pub audio_stats: Option<AudioStatsSnapshot>,
 }
 
 struct UiEvents {
@@ -324,7 +342,8 @@ async fn kernel_loop(
                     channel,
                     bridge,
                     wake.clone(),
-                );
+                )
+                .await;
                 let _ = reply.send(result);
             }
             RuntimeCommand::StartLivekit {
@@ -412,7 +431,7 @@ async fn kernel_loop(
     let _ = threads.wait();
 }
 
-fn start_lfm2_session(
+async fn start_lfm2_session(
     session: &mut Option<VoiceSession>,
     threads: &ThreadManager,
     ctx: SessionCtx,
@@ -426,9 +445,9 @@ fn start_lfm2_session(
         return Err("Voice is already running.".into());
     }
     threads.wait()?;
-    *session = Some(VoiceSession::Lfm2(Lfm2Session::spawn(
-        threads, ctx, settings, channel, bridge, wake,
-    )?));
+    *session = Some(VoiceSession::Lfm2(
+        Lfm2Session::spawn(threads, ctx, settings, channel, bridge, wake).await?,
+    ));
     Ok(())
 }
 
@@ -506,6 +525,7 @@ fn runtime_snapshot(session: &Option<VoiceSession>) -> RuntimeSnapshot {
         running_provider: Some(session.provider()),
         mic_enabled: session.mic_enabled(),
         session_id: Some(session.session_id().to_string()),
+        audio_stats: session.audio_stats(),
     }
 }
 
@@ -592,6 +612,13 @@ impl VoiceSession {
         match self {
             VoiceSession::Lfm2(session) => session.mic_enabled(),
             VoiceSession::Livekit(session) => session.mic_enabled(),
+        }
+    }
+
+    fn audio_stats(&self) -> Option<AudioStatsSnapshot> {
+        match self {
+            VoiceSession::Lfm2(session) => session.audio_stats(),
+            VoiceSession::Livekit(_) => None,
         }
     }
 
@@ -770,6 +797,7 @@ async fn livekit_session_loop(
         return;
     }
     let vad_threshold = settings.lfm2.vad_threshold;
+    let interrupts_playback = can_interrupt_playback(&settings);
     let engine = match build_engine(settings, LIVEKIT_AGENT_AUDIO_RATE) {
         Ok(engine) => engine,
         Err(error) => {
@@ -781,7 +809,7 @@ async fn livekit_session_loop(
             return;
         }
     };
-    let agent_pipe = match RealtimePipeline::spawn(engine) {
+    let agent_pipe = match NativeAgentPipe::spawn(engine) {
         Ok(pipe) => pipe,
         Err(error) => {
             livekit_fail(
@@ -927,7 +955,7 @@ async fn livekit_session_loop(
     }
     let agent_events_spawned = spawn_native_livekit_agent_events(
         &threads,
-        agent_pipe.events().clone(),
+        agent_pipe.events(),
         agent_source.clone(),
         channel.clone(),
         done.clone(),
@@ -1062,6 +1090,7 @@ async fn livekit_session_loop(
                     mic_enabled.clone(),
                     playback.clone(),
                     vad_threshold,
+                    interrupts_playback,
                 );
             }
         }
@@ -1214,6 +1243,49 @@ impl LiveKitMediaTask {
     }
 }
 
+enum NativeAgentPipe {
+    Turn(RealtimePipeline),
+    Frame(RealtimeFramePipeline),
+}
+
+impl NativeAgentPipe {
+    fn spawn(engine: Box<dyn VoiceEngine>) -> Result<Self, String> {
+        if engine.frame_config().is_some() {
+            return RealtimeFramePipeline::spawn(engine).map(Self::Frame);
+        }
+        RealtimePipeline::spawn(engine).map(Self::Turn)
+    }
+
+    fn events(&self) -> Receiver<RealtimeEvent> {
+        match self {
+            Self::Turn(pipe) => pipe.events().clone(),
+            Self::Frame(pipe) => pipe.events().clone(),
+        }
+    }
+
+    fn handle(&self) -> Option<NativeAgentHandle> {
+        match self {
+            Self::Turn(pipe) => pipe.handle().map(NativeAgentHandle::Turn),
+            Self::Frame(pipe) => pipe.handle().map(NativeAgentHandle::Frame),
+        }
+    }
+}
+
+#[derive(Clone)]
+enum NativeAgentHandle {
+    Turn(RealtimePipelineHandle),
+    Frame(RealtimeFramePipelineHandle),
+}
+
+impl NativeAgentHandle {
+    fn interrupt(&self) {
+        match self {
+            Self::Turn(handle) => handle.interrupt(),
+            Self::Frame(handle) => handle.interrupt(),
+        }
+    }
+}
+
 fn cancel_livekit_media_tasks(tasks: &mut Vec<LiveKitMediaTask>) {
     for task in tasks.drain(..) {
         task.cancel();
@@ -1281,12 +1353,13 @@ fn handle_native_livekit_agent_event(
     event: RoomEvent,
     user_identity: &str,
     audio_tasks: &mut Vec<LiveKitMediaTask>,
-    handle: RealtimePipelineHandle,
+    handle: NativeAgentHandle,
     channel: UiChannel,
     done: Arc<AtomicBool>,
     mic_enabled: Arc<AtomicBool>,
     playback: Arc<LiveKitPlaybackReference>,
     vad_threshold: f32,
+    can_interrupt_playback: bool,
 ) {
     match event {
         RoomEvent::TrackSubscribed {
@@ -1306,6 +1379,7 @@ fn handle_native_livekit_agent_event(
                 mic_enabled,
                 playback,
                 vad_threshold,
+                can_interrupt_playback,
             ) {
                 Ok(task) => audio_tasks.push(task),
                 Err(error) => livekit_fail(&channel, &done, error),
@@ -1332,13 +1406,14 @@ fn handle_native_livekit_agent_event(
 
 fn spawn_native_livekit_agent_mic(
     threads: &ThreadManager,
-    handle: RealtimePipelineHandle,
+    handle: NativeAgentHandle,
     track: RemoteAudioTrack,
     channel: UiChannel,
     done: Arc<AtomicBool>,
     mic_enabled: Arc<AtomicBool>,
     playback: Arc<LiveKitPlaybackReference>,
     vad_threshold: f32,
+    can_interrupt_playback: bool,
 ) -> Result<LiveKitMediaTask, String> {
     let cancel = Arc::new(AtomicBool::new(false));
     let thread_cancel = cancel.clone();
@@ -1351,6 +1426,7 @@ fn spawn_native_livekit_agent_mic(
             mic_enabled,
             playback,
             vad_threshold,
+            can_interrupt_playback,
             thread_cancel,
         ));
     })?;
@@ -1358,6 +1434,49 @@ fn spawn_native_livekit_agent_mic(
 }
 
 async fn native_livekit_agent_mic_loop(
+    handle: NativeAgentHandle,
+    track: RemoteAudioTrack,
+    channel: UiChannel,
+    done: Arc<AtomicBool>,
+    mic_enabled: Arc<AtomicBool>,
+    playback: Arc<LiveKitPlaybackReference>,
+    vad_threshold: f32,
+    can_interrupt_playback: bool,
+    cancel: Arc<AtomicBool>,
+) {
+    match handle {
+        NativeAgentHandle::Turn(handle) => {
+            native_livekit_agent_turn_mic_loop(
+                handle,
+                track,
+                channel,
+                done,
+                mic_enabled,
+                playback,
+                vad_threshold,
+                can_interrupt_playback,
+                cancel,
+            )
+            .await;
+        }
+        NativeAgentHandle::Frame(handle) => {
+            native_livekit_agent_frame_mic_loop(
+                handle,
+                track,
+                channel,
+                done,
+                mic_enabled,
+                playback,
+                vad_threshold,
+                can_interrupt_playback,
+                cancel,
+            )
+            .await;
+        }
+    }
+}
+
+async fn native_livekit_agent_turn_mic_loop(
     handle: RealtimePipelineHandle,
     track: RemoteAudioTrack,
     channel: UiChannel,
@@ -1365,6 +1484,7 @@ async fn native_livekit_agent_mic_loop(
     mic_enabled: Arc<AtomicBool>,
     playback: Arc<LiveKitPlaybackReference>,
     vad_threshold: f32,
+    can_interrupt_playback: bool,
     cancel: Arc<AtomicBool>,
 ) {
     let mut stream = NativeAudioStream::new(
@@ -1409,6 +1529,11 @@ async fn native_livekit_agent_mic_loop(
         }
         let pcm = i16_to_f32(frame.data.as_ref());
         let rms = rms_f32(&pcm);
+        if playback.active() && !can_interrupt_playback {
+            speaking = false;
+            samples.clear();
+            continue;
+        }
         let threshold = playback.reference_vad_threshold(vad_threshold);
         if rms > threshold {
             if !speaking {
@@ -1437,15 +1562,18 @@ async fn native_livekit_agent_mic_loop(
         speaking = false;
         handle.interrupt();
         if !handle.submit(utt) {
-            let _ = send_livekit(
+            handle.interrupt();
+            samples.clear();
+            if !send_livekit(
                 &channel,
                 &done,
-                VoiceEvent::Error {
-                    message: "native LiveKit agent utterance queue is full".into(),
+                VoiceEvent::State {
+                    state: VoiceState::Listening,
                 },
-            );
-            done.store(true, Ordering::SeqCst);
-            break;
+            ) {
+                break;
+            }
+            continue;
         }
         if !send_livekit(
             &channel,
@@ -1456,6 +1584,165 @@ async fn native_livekit_agent_mic_loop(
         ) {
             break;
         }
+    }
+}
+
+async fn native_livekit_agent_frame_mic_loop(
+    handle: RealtimeFramePipelineHandle,
+    track: RemoteAudioTrack,
+    channel: UiChannel,
+    done: Arc<AtomicBool>,
+    mic_enabled: Arc<AtomicBool>,
+    playback: Arc<LiveKitPlaybackReference>,
+    vad_threshold: f32,
+    can_interrupt_playback: bool,
+    cancel: Arc<AtomicBool>,
+) {
+    let mut stream = NativeAudioStream::new(
+        track.rtc_track(),
+        LIVEKIT_AGENT_AUDIO_RATE_I32,
+        LIVEKIT_AGENT_AUDIO_CHANNELS_I32,
+    );
+    let frame = handle.config();
+    let mut resampler = LiveKitFrameResampler::new(LIVEKIT_AGENT_AUDIO_RATE, frame.sample_rate);
+    let mut model = Vec::with_capacity(frame.frame_size * 2);
+    let mut poll = tokio::time::interval(Duration::from_millis(LIVEKIT_DONE_POLL_MS));
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut backpressure_reported = false;
+    while !livekit_media_cancelled(&done, &cancel) {
+        let audio = tokio::select! {
+            frame = stream.next() => frame,
+            _ = poll.tick() => {
+                if livekit_media_cancelled(&done, &cancel) {
+                    break;
+                }
+                continue;
+            }
+        };
+        let Some(audio) = audio else {
+            break;
+        };
+        if !mic_enabled.load(Ordering::SeqCst) {
+            model.clear();
+            continue;
+        }
+        if audio.sample_rate == 0 {
+            let _ = send_livekit(
+                &channel,
+                &done,
+                VoiceEvent::Error {
+                    message: "native LiveKit microphone frame sample rate is zero".into(),
+                },
+            );
+            break;
+        }
+        let pcm = i16_to_f32(audio.data.as_ref());
+        let rms = rms_f32(&pcm);
+        let threshold = playback.reference_vad_threshold(vad_threshold);
+        let interrupting = playback.active() && can_interrupt_playback && rms > threshold;
+        if interrupting {
+            handle.interrupt();
+            playback.clear();
+            if !send_livekit(
+                &channel,
+                &done,
+                VoiceEvent::State {
+                    state: VoiceState::Listening,
+                },
+            ) {
+                break;
+            }
+        }
+        let feed = if playback.active() && !interrupting {
+            vec![0.0; pcm.len()]
+        } else {
+            pcm
+        };
+        let rate = audio.sample_rate as u32;
+        if resampler.from() != rate {
+            resampler = LiveKitFrameResampler::new(rate, frame.sample_rate);
+            model.clear();
+        }
+        model.extend(resampler.process(&feed));
+        while model.len() >= frame.frame_size {
+            let next = model[..frame.frame_size].to_vec();
+            model.drain(..frame.frame_size);
+            if handle.submit_frame(next) {
+                backpressure_reported = false;
+                continue;
+            }
+            handle.interrupt();
+            model.clear();
+            if !backpressure_reported {
+                backpressure_reported = true;
+                if !send_livekit(
+                    &channel,
+                    &done,
+                    VoiceEvent::State {
+                        state: VoiceState::Listening,
+                    },
+                ) {
+                    break;
+                }
+            }
+            break;
+        }
+        if model.len() > frame.frame_size * 4 {
+            model.clear();
+        }
+    }
+}
+
+struct LiveKitFrameResampler {
+    from: u32,
+    to: u32,
+    carry: Option<f32>,
+}
+
+impl LiveKitFrameResampler {
+    fn new(from: u32, to: u32) -> Self {
+        Self {
+            from,
+            to,
+            carry: None,
+        }
+    }
+
+    fn from(&self) -> u32 {
+        self.from
+    }
+
+    fn process(&mut self, input: &[f32]) -> Vec<f32> {
+        if input.is_empty() || self.from == 0 || self.to == 0 {
+            return Vec::new();
+        }
+        if self.from == self.to {
+            return input.to_vec();
+        }
+        if self.from == self.to.saturating_mul(2) {
+            return self.downsample_by_two(input);
+        }
+        self.carry = input.last().copied();
+        liquid_audio::resample::resample_slice(input, self.from, self.to)
+    }
+
+    fn downsample_by_two(&mut self, input: &[f32]) -> Vec<f32> {
+        let mut out = Vec::with_capacity(input.len() / 2 + 1);
+        let mut start = 0usize;
+        if let Some(prev) = self.carry.take() {
+            if let Some(&sample) = input.first() {
+                out.push((prev + sample) * 0.5);
+                start = 1;
+            }
+        }
+        let pairs = &input[start..];
+        for pair in pairs.chunks_exact(2) {
+            out.push((pair[0] + pair[1]) * 0.5);
+        }
+        if pairs.len() % 2 == 1 {
+            self.carry = pairs.last().copied();
+        }
+        out
     }
 }
 
@@ -1785,6 +2072,15 @@ fn f32_to_i16(sample: f32) -> i16 {
     (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16
 }
 
+fn livekit_audio_frame_count(samples: usize, rate: u32, channels: u32) -> usize {
+    if samples == 0 || rate == 0 || channels == 0 {
+        return 0;
+    }
+    let samples_per_channel = (rate / 100).max(1);
+    let samples_per_frame = (samples_per_channel * channels) as usize;
+    samples.div_ceil(samples_per_frame)
+}
+
 fn livekit_audio_frames(pcm: &[f32], rate: u32, channels: u32) -> Vec<AudioFrame<'static>> {
     if pcm.is_empty() || rate == 0 || channels == 0 {
         return Vec::new();
@@ -1842,7 +2138,7 @@ struct Lfm2Session {
 }
 
 impl Lfm2Session {
-    fn spawn(
+    async fn spawn(
         threads: &ThreadManager,
         ctx: SessionCtx,
         settings: VoiceSettings,
@@ -1867,13 +2163,19 @@ impl Lfm2Session {
             bridge_cancel.clone(),
             bridge_wake,
         );
-        let cfg = RuntimeConfig {
-            vad_threshold: settings.lfm2.vad_threshold,
-            can_interrupt: true,
-            ..RuntimeConfig::default()
+        let cfg = local_runtime_config(&settings);
+        let input = start_local_webrtc_input(threads, done.clone()).await?;
+        let output = match start_local_webrtc_output().await {
+            Ok(output) => output,
+            Err(error) => {
+                done.store(true, Ordering::SeqCst);
+                return Err(error);
+            }
         };
-        let (live, main) = Lfm2Runtime::prepare(
+        let (live, main) = Lfm2Runtime::prepare_with_io(
             cfg,
+            Some(input),
+            Some(output),
             move |out_rate| build_engine(settings, out_rate),
             move |event| {
                 if matches!(event, RuntimeEvent::Ended(_)) {
@@ -1889,11 +2191,19 @@ impl Lfm2Session {
             },
         );
         let thread_finished = finished.clone();
-        threads.spawn("voice-session", move || {
+        let thread_wake = wake.clone();
+        match threads.spawn("voice-session", move || {
             main();
             thread_finished.store(true, Ordering::SeqCst);
-            wake_kernel(&wake);
-        })?;
+            wake_kernel(&thread_wake);
+        }) {
+            Ok(()) => {}
+            Err(error) => {
+                done.store(true, Ordering::SeqCst);
+                live.stop();
+                return Err(error);
+            }
+        }
         Ok(Self {
             ctx,
             settings: key,
@@ -1946,6 +2256,10 @@ impl Lfm2Session {
 
     fn mic_enabled(&self) -> bool {
         self.live.as_ref().is_some_and(Lfm2Runtime::mic_enabled)
+    }
+
+    fn audio_stats(&self) -> Option<AudioStatsSnapshot> {
+        self.live.as_ref().map(Lfm2Runtime::audio_stats)
     }
 
     fn stop(mut self) {
@@ -2220,14 +2534,56 @@ fn send_runtime(channel: &UiChannel, event: RuntimeEvent) -> bool {
     }
 }
 
-fn build_engine(settings: VoiceSettings, out_rate: u32) -> Result<Lfm2VoiceEngine, String> {
+fn local_runtime_config(settings: &VoiceSettings) -> RuntimeConfig {
+    RuntimeConfig {
+        vad_threshold: settings.lfm2.vad_threshold,
+        can_interrupt: can_interrupt_playback(settings),
+        ..RuntimeConfig::default()
+    }
+}
+
+fn can_interrupt_playback(settings: &VoiceSettings) -> bool {
+    settings.lfm2.engine != LocalVoiceEngine::MoshiRealtime
+}
+
+fn build_engine(settings: VoiceSettings, out_rate: u32) -> Result<Box<dyn VoiceEngine>, String> {
     // Fail-hard, no network at start: load ONLY a local snapshot dir. The repo id/revision are
     // the download source (Settings → Download), not a run-time fetch — never auto-download here.
+    let device = select_device(&settings.lfm2.device)?;
+    if settings.lfm2.engine == LocalVoiceEngine::MoshiRealtime {
+        let dir = settings::moshi_model_dir(&settings.lfm2).ok_or_else(|| {
+            "No local Moshi realtime model — download Moshiko or select a Moshi snapshot directory in Settings."
+                .to_string()
+        })?;
+        let files = realtime_moshi_files(&dir)
+            .map_err(|e| format!("failed to inspect Moshi snapshot: {e}"))?
+            .ok_or_else(|| {
+                "Selected Moshi directory is not a realtime Moshi snapshot.".to_string()
+            })?;
+        let dtype = safetensors_floating_dtype(&files.moshi_weights)
+            .map_err(|e| format!("failed to read Moshi checkpoint dtype: {e}"))?;
+        let engine = MoshiVoiceEngine::from_files(
+            &files,
+            dtype,
+            &device,
+            files
+                .params
+                .with_seed(settings.lfm2.seed.unwrap_or(files.params.seed)),
+            out_rate,
+        )
+        .map_err(|e| format!("failed to load Moshi realtime model: {e}"))?;
+        return Ok(Box::new(engine));
+    }
     let dir = settings::lfm2_active_model_dir(&settings.lfm2).ok_or_else(|| {
         "No local LFM2-Audio model — download a model or select a model directory in Settings."
             .to_string()
     })?;
-    let device = select_device(&settings.lfm2.device)?;
+    if realtime_moshi_files(&dir)
+        .map_err(|e| format!("failed to inspect local voice model: {e}"))?
+        .is_some()
+    {
+        return Err("Selected local engine is LFM2-Audio, but the directory contains a Moshi realtime snapshot. Switch Local engine to Moshi realtime or choose an LFM2-Audio snapshot.".into());
+    }
     let codebooks = codebooks(&dir)?;
     let (model, proc) =
         from_pretrained(&dir, &device).map_err(|e| format!("failed to load LFM2-Audio: {e}"))?;
@@ -2248,9 +2604,11 @@ fn build_engine(settings: VoiceSettings, out_rate: u32) -> Result<Lfm2VoiceEngin
             .as_deref()
             .is_some_and(|target| !target.trim().is_empty())
     {
-        return Ok(engine.with_system_prompt(LFM2_CONVERSE_SYSTEM_PROMPT));
+        return Ok(Box::new(
+            engine.with_system_prompt(LFM2_CONVERSE_SYSTEM_PROMPT),
+        ));
     }
-    Ok(engine)
+    Ok(Box::new(engine))
 }
 
 fn select_device(device: &Lfm2Device) -> Result<Device, String> {
@@ -2287,6 +2645,573 @@ fn codebooks(dir: &Path) -> Result<usize, String> {
         .as_u64()
         .map(|n| n as usize)
         .ok_or_else(|| "model config is missing `codebooks`".to_string())
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VoiceAudioProbeReport {
+    pub sample_rate: u32,
+    pub samples_written: usize,
+    pub webrtc_frames: usize,
+    pub duration_ms: u64,
+    pub playout_devices: usize,
+    pub recording_devices: usize,
+    pub playout_device: Option<String>,
+    pub adm_playout_enabled: bool,
+    pub playout_initialized: bool,
+}
+
+pub async fn play_local_webrtc_probe(
+    duration: Duration,
+    frequency_hz: f32,
+    amplitude: f32,
+) -> Result<VoiceAudioProbeReport, String> {
+    let state = Arc::new(local_webrtc_output_loopback().await?);
+    let output = external_output_from_state(state.clone())?;
+    let rate = output.rate();
+    let frames = ((duration.as_secs_f32() * rate as f32).ceil() as usize).max(1);
+    let freq = if frequency_hz.is_finite() && frequency_hz > 0.0 {
+        frequency_hz
+    } else {
+        440.0
+    };
+    let amp = if amplitude.is_finite() {
+        amplitude.clamp(0.0, 0.5)
+    } else {
+        0.12
+    };
+    let fade = (rate as usize / 100).max(1);
+    let mut samples = Vec::with_capacity(frames);
+    for i in 0..frames {
+        let edge = i.min(frames.saturating_sub(1).saturating_sub(i));
+        let env = (edge as f32 / fade as f32).min(1.0);
+        let phase = std::f32::consts::TAU * freq * i as f32 / rate as f32;
+        samples.push(phase.sin() * amp * env);
+    }
+    let write = output.clone();
+    tauri::async_runtime::spawn_blocking(move || write.write_mono_f32(&samples))
+        .await
+        .map_err(|e| format!("audio probe task failed: {e}"))??;
+    tokio::time::sleep(duration + Duration::from_millis(300)).await;
+    output.clear();
+    Ok(state.probe_report(rate, frames, duration))
+}
+
+struct LocalWebRtcOutputState {
+    audio: PlatformAudio,
+    source: NativeAudioSource,
+    _track: LocalAudioTrack,
+    sender: PeerConnection,
+    receiver: PeerConnection,
+    _remote_track: livekit::webrtc::audio_track::RtcAudioTrack,
+}
+
+impl LocalWebRtcOutputState {
+    fn probe_report(
+        &self,
+        sample_rate: u32,
+        samples_written: usize,
+        duration: Duration,
+    ) -> VoiceAudioProbeReport {
+        let runtime = LkRuntime::instance();
+        let pcf = runtime.pc_factory();
+        let playout_device = self
+            .audio
+            .playout_devices()
+            .next()
+            .map(|device| device.name)
+            .filter(|name| !name.is_empty());
+        VoiceAudioProbeReport {
+            sample_rate,
+            samples_written,
+            webrtc_frames: livekit_audio_frame_count(
+                samples_written,
+                sample_rate,
+                LIVEKIT_AGENT_AUDIO_CHANNELS,
+            ),
+            duration_ms: duration.as_millis() as u64,
+            playout_devices: self.audio.playout_devices().count(),
+            recording_devices: self.audio.recording_devices().count(),
+            playout_device,
+            adm_playout_enabled: pcf.adm_playout_enabled(),
+            playout_initialized: pcf.playout_is_initialized(),
+        }
+    }
+
+    fn write(&self, pcm: &[f32], rate: u32) -> Result<(), String> {
+        if rate != LIVEKIT_AGENT_AUDIO_RATE {
+            return Err(format!(
+                "local WebRTC output expected {} Hz, got {rate} Hz",
+                LIVEKIT_AGENT_AUDIO_RATE
+            ));
+        }
+        for frame in livekit_audio_frames(pcm, rate, LIVEKIT_AGENT_AUDIO_CHANNELS) {
+            tauri::async_runtime::block_on(self.source.capture_frame(&frame))
+                .map_err(|e| format!("local WebRTC speaker capture failed: {e}"))?;
+        }
+        Ok(())
+    }
+
+    fn clear(&self) {
+        self.source.clear_buffer();
+    }
+}
+
+impl Drop for LocalWebRtcOutputState {
+    fn drop(&mut self) {
+        self.source.clear_buffer();
+        stop_local_webrtc_playout();
+        self.sender.close();
+        self.receiver.close();
+    }
+}
+
+async fn start_local_webrtc_output() -> Result<ExternalAudioOutput, String> {
+    let state = Arc::new(local_webrtc_output_loopback().await?);
+    external_output_from_state(state)
+}
+
+fn external_output_from_state(
+    state: Arc<LocalWebRtcOutputState>,
+) -> Result<ExternalAudioOutput, String> {
+    let write_state = state.clone();
+    let clear_state = state.clone();
+    ExternalAudioOutput::new(
+        LIVEKIT_AGENT_AUDIO_RATE,
+        move |pcm, rate| write_state.write(pcm, rate),
+        move || clear_state.clear(),
+    )
+}
+
+async fn local_webrtc_output_loopback() -> Result<LocalWebRtcOutputState, String> {
+    let audio = PlatformAudio::new().map_err(|e| format!("WebRTC speaker device failed: {e}"))?;
+    configure_livekit_audio(&audio)
+        .map_err(|e| format!("WebRTC speaker audio processing failed: {e}"))?;
+    let source = NativeAudioSource::new(
+        AudioSourceOptions::default(),
+        LIVEKIT_AGENT_AUDIO_RATE,
+        LIVEKIT_AGENT_AUDIO_CHANNELS,
+        LIVEKIT_AGENT_AUDIO_QUEUE_MS,
+    );
+    let track = LocalAudioTrack::create_audio_track(
+        "local-assistant",
+        RtcAudioSource::Native(source.clone()),
+    );
+    let runtime = LkRuntime::instance();
+    let factory = runtime.pc_factory();
+    let sender = factory
+        .create_peer_connection(RtcConfiguration::default())
+        .map_err(|e| format!("local WebRTC output sender failed: {e}"))?;
+    let receiver = factory
+        .create_peer_connection(RtcConfiguration::default())
+        .map_err(|e| format!("local WebRTC output receiver failed: {e}"))?;
+    let (sender_ice_tx, sender_ice_rx) =
+        mpsc::channel::<IceCandidate>(LOCAL_WEBRTC_OUTPUT_ICE_QUEUE_CAP);
+    let (receiver_ice_tx, receiver_ice_rx) =
+        mpsc::channel::<IceCandidate>(LOCAL_WEBRTC_OUTPUT_ICE_QUEUE_CAP);
+    let (remote_tx, remote_rx) = oneshot::channel::<livekit::webrtc::audio_track::RtcAudioTrack>();
+    let remote_tx = Arc::new(Mutex::new(Some(remote_tx)));
+
+    sender.on_ice_candidate(Some(Box::new(move |candidate| {
+        let _ = sender_ice_tx.try_send(candidate);
+    })));
+    receiver.on_ice_candidate(Some(Box::new(move |candidate| {
+        let _ = receiver_ice_tx.try_send(candidate);
+    })));
+    receiver.on_track(Some(Box::new(move |event| {
+        if let MediaStreamTrack::Audio(track) = event.track {
+            if let Ok(mut tx) = remote_tx.lock()
+                && let Some(tx) = tx.take()
+            {
+                let _ = tx.send(track);
+            }
+        }
+    })));
+
+    sender
+        .add_track(
+            MediaStreamTrack::Audio(track.rtc_track()),
+            &[LOCAL_WEBRTC_OUTPUT_STREAM_ID],
+        )
+        .map_err(|e| format!("local WebRTC output add_track failed: {e}"))?;
+    let offer = sender
+        .create_offer(OfferOptions::default())
+        .await
+        .map_err(|e| format!("local WebRTC output offer failed: {e}"))?;
+    sender
+        .set_local_description(offer.clone())
+        .await
+        .map_err(|e| format!("local WebRTC output set local offer failed: {e}"))?;
+    receiver
+        .set_remote_description(offer)
+        .await
+        .map_err(|e| format!("local WebRTC output set remote offer failed: {e}"))?;
+    let answer = receiver
+        .create_answer(AnswerOptions::default())
+        .await
+        .map_err(|e| format!("local WebRTC output answer failed: {e}"))?;
+    receiver
+        .set_local_description(answer.clone())
+        .await
+        .map_err(|e| format!("local WebRTC output set local answer failed: {e}"))?;
+    sender
+        .set_remote_description(answer)
+        .await
+        .map_err(|e| format!("local WebRTC output set remote answer failed: {e}"))?;
+    exchange_loopback_ice(&sender, &receiver, sender_ice_rx, receiver_ice_rx).await?;
+    let remote_track = tokio::time::timeout(
+        Duration::from_millis(LOCAL_WEBRTC_OUTPUT_READY_TIMEOUT_MS),
+        remote_rx,
+    )
+    .await
+    .map_err(|_| "local WebRTC speaker track did not become ready".to_string())?
+    .map_err(|_| "local WebRTC speaker track setup channel closed".to_string())?;
+    start_local_webrtc_playout()?;
+
+    Ok(LocalWebRtcOutputState {
+        audio,
+        source,
+        _track: track,
+        sender,
+        receiver,
+        _remote_track: remote_track,
+    })
+}
+
+fn start_local_webrtc_playout() -> Result<(), String> {
+    let runtime = LkRuntime::instance();
+    let factory = runtime.pc_factory();
+    factory.set_adm_playout_enabled(true);
+    if !factory.playout_is_initialized() && !factory.init_playout() {
+        return Err("local WebRTC speaker playout init failed".into());
+    }
+    if !factory.start_playout() {
+        return Err("local WebRTC speaker playout start failed".into());
+    }
+    Ok(())
+}
+
+fn stop_local_webrtc_playout() {
+    let runtime = LkRuntime::instance();
+    let _ = runtime.pc_factory().stop_playout();
+}
+
+async fn exchange_loopback_ice(
+    sender: &PeerConnection,
+    receiver: &PeerConnection,
+    mut sender_ice: mpsc::Receiver<IceCandidate>,
+    mut receiver_ice: mpsc::Receiver<IceCandidate>,
+) -> Result<(), String> {
+    let deadline = tokio::time::sleep(Duration::from_millis(LOCAL_WEBRTC_OUTPUT_ICE_TIMEOUT_MS));
+    tokio::pin!(deadline);
+    let mut poll = tokio::time::interval(Duration::from_millis(20));
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut sender_open = true;
+    let mut receiver_open = true;
+    loop {
+        if local_webrtc_output_connected(sender, receiver) {
+            return Ok(());
+        }
+        tokio::select! {
+            _ = &mut deadline => {
+                return Err("local WebRTC audio loopback did not connect before timeout".into())
+            },
+            _ = poll.tick() => {}
+            candidate = sender_ice.recv(), if sender_open => match candidate {
+                Some(candidate) => receiver
+                    .add_ice_candidate(candidate)
+                    .await
+                    .map_err(|e| format!("local WebRTC output receiver ICE failed: {e}"))?,
+                None => sender_open = false,
+            },
+            candidate = receiver_ice.recv(), if receiver_open => match candidate {
+                Some(candidate) => sender
+                    .add_ice_candidate(candidate)
+                    .await
+                    .map_err(|e| format!("local WebRTC output sender ICE failed: {e}"))?,
+                None => receiver_open = false,
+            },
+        }
+    }
+}
+
+fn local_webrtc_output_connected(sender: &PeerConnection, receiver: &PeerConnection) -> bool {
+    matches!(sender.connection_state(), PeerConnectionState::Connected)
+        && matches!(receiver.connection_state(), PeerConnectionState::Connected)
+}
+
+struct LocalWebRtcInputState {
+    _audio: PlatformAudio,
+    _track: LocalAudioTrack,
+    sender: PeerConnection,
+    receiver: PeerConnection,
+    remote_track: livekit::webrtc::audio_track::RtcAudioTrack,
+}
+
+impl Drop for LocalWebRtcInputState {
+    fn drop(&mut self) {
+        self.remote_track.set_enabled(false);
+        self.sender.close();
+        self.receiver.close();
+    }
+}
+
+async fn local_webrtc_input_loopback(
+    audio: PlatformAudio,
+) -> Result<LocalWebRtcInputState, String> {
+    let track = LocalAudioTrack::create_audio_track("local-microphone", audio.rtc_source());
+    track.enable();
+    track.unmute();
+    let runtime = LkRuntime::instance();
+    let factory = runtime.pc_factory();
+    let sender = factory
+        .create_peer_connection(RtcConfiguration::default())
+        .map_err(|e| format!("local WebRTC input sender failed: {e}"))?;
+    let receiver = factory
+        .create_peer_connection(RtcConfiguration::default())
+        .map_err(|e| format!("local WebRTC input receiver failed: {e}"))?;
+    let (sender_ice_tx, sender_ice_rx) =
+        mpsc::channel::<IceCandidate>(LOCAL_WEBRTC_OUTPUT_ICE_QUEUE_CAP);
+    let (receiver_ice_tx, receiver_ice_rx) =
+        mpsc::channel::<IceCandidate>(LOCAL_WEBRTC_OUTPUT_ICE_QUEUE_CAP);
+    let (remote_tx, remote_rx) = oneshot::channel::<livekit::webrtc::audio_track::RtcAudioTrack>();
+    let remote_tx = Arc::new(Mutex::new(Some(remote_tx)));
+
+    sender.on_ice_candidate(Some(Box::new(move |candidate| {
+        let _ = sender_ice_tx.try_send(candidate);
+    })));
+    receiver.on_ice_candidate(Some(Box::new(move |candidate| {
+        let _ = receiver_ice_tx.try_send(candidate);
+    })));
+    receiver.on_track(Some(Box::new(move |event| {
+        if let MediaStreamTrack::Audio(track) = event.track {
+            track.set_enabled(false);
+            if let Ok(mut tx) = remote_tx.lock()
+                && let Some(tx) = tx.take()
+            {
+                let _ = tx.send(track);
+            }
+        }
+    })));
+
+    sender
+        .add_track(
+            MediaStreamTrack::Audio(track.rtc_track()),
+            &[LOCAL_WEBRTC_INPUT_STREAM_ID],
+        )
+        .map_err(|e| format!("local WebRTC input add_track failed: {e}"))?;
+    let offer = sender
+        .create_offer(OfferOptions::default())
+        .await
+        .map_err(|e| format!("local WebRTC input offer failed: {e}"))?;
+    sender
+        .set_local_description(offer.clone())
+        .await
+        .map_err(|e| format!("local WebRTC input set local offer failed: {e}"))?;
+    receiver
+        .set_remote_description(offer)
+        .await
+        .map_err(|e| format!("local WebRTC input set remote offer failed: {e}"))?;
+    let answer = receiver
+        .create_answer(AnswerOptions::default())
+        .await
+        .map_err(|e| format!("local WebRTC input answer failed: {e}"))?;
+    receiver
+        .set_local_description(answer.clone())
+        .await
+        .map_err(|e| format!("local WebRTC input set local answer failed: {e}"))?;
+    sender
+        .set_remote_description(answer)
+        .await
+        .map_err(|e| format!("local WebRTC input set remote answer failed: {e}"))?;
+    exchange_loopback_ice(&sender, &receiver, sender_ice_rx, receiver_ice_rx).await?;
+    let remote_track = tokio::time::timeout(
+        Duration::from_millis(LOCAL_WEBRTC_MIC_READY_TIMEOUT_MS),
+        remote_rx,
+    )
+    .await
+    .map_err(|_| "local WebRTC microphone track did not become ready".to_string())?
+    .map_err(|_| "local WebRTC microphone track setup channel closed".to_string())?;
+    remote_track.set_enabled(false);
+
+    Ok(LocalWebRtcInputState {
+        _audio: audio,
+        _track: track,
+        sender,
+        receiver,
+        remote_track,
+    })
+}
+
+async fn start_local_webrtc_input(
+    threads: &ThreadManager,
+    done: Arc<AtomicBool>,
+) -> Result<ExternalAudioInput, String> {
+    let (input, writer) = ExternalAudioInput::new(LIVEKIT_AGENT_AUDIO_RATE)?;
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let thread_done = done.clone();
+    threads.spawn("voice-local-webrtc-mic", move || {
+        if let Err(error) =
+            tauri::async_runtime::block_on(local_webrtc_mic_loop(writer, thread_done, ready_tx))
+        {
+            eprintln!("[voice] local WebRTC microphone stopped: {error}");
+        }
+    })?;
+    match tokio::time::timeout(
+        Duration::from_millis(LOCAL_WEBRTC_MIC_READY_TIMEOUT_MS),
+        ready_rx,
+    )
+    .await
+    {
+        Ok(Ok(Ok(()))) => Ok(input),
+        Ok(Ok(Err(error))) => Err(error),
+        Ok(Err(_)) => Err("local WebRTC microphone setup channel closed".into()),
+        Err(_) => {
+            done.store(true, Ordering::SeqCst);
+            Err("local WebRTC microphone did not become ready before timeout".into())
+        }
+    }
+}
+
+async fn local_webrtc_mic_loop(
+    writer: ExternalAudioInputWriter,
+    done: Arc<AtomicBool>,
+    ready: oneshot::Sender<Result<(), String>>,
+) -> Result<(), String> {
+    let mut ready = Some(ready);
+    let audio = match PlatformAudio::new() {
+        Ok(audio) => audio,
+        Err(error) => {
+            let message = format!("WebRTC audio device failed: {error}");
+            send_local_webrtc_ready(&mut ready, Err(message.clone()));
+            return Err(message);
+        }
+    };
+    if let Err(error) = configure_livekit_audio(&audio) {
+        let message = format!("WebRTC audio processing failed: {error}");
+        send_local_webrtc_ready(&mut ready, Err(message.clone()));
+        return Err(message);
+    }
+    let input = match local_webrtc_input_loopback(audio).await {
+        Ok(input) => input,
+        Err(error) => {
+            send_local_webrtc_ready(&mut ready, Err(error.clone()));
+            return Err(error);
+        }
+    };
+    let mut stream = NativeAudioStream::with_options(
+        input.remote_track.clone(),
+        LIVEKIT_AGENT_AUDIO_RATE_I32,
+        LIVEKIT_AGENT_AUDIO_CHANNELS_I32,
+        NativeAudioStreamOptions {
+            queue_size_frames: Some(LOCAL_WEBRTC_MIC_QUEUE_FRAMES),
+        },
+    );
+    let first = tokio::time::timeout(
+        Duration::from_millis(LOCAL_WEBRTC_MIC_READY_TIMEOUT_MS),
+        next_local_webrtc_mic_frame(&mut stream, &done),
+    )
+    .await
+    .map_err(|_| "local WebRTC microphone produced no frames before timeout".to_string())?;
+    match first {
+        Some(frame) => {
+            push_local_webrtc_mic_frame(&writer, &frame);
+            send_local_webrtc_ready(&mut ready, Ok(()));
+        }
+        None => {
+            let message = "local WebRTC microphone stream ended before first frame".to_string();
+            send_local_webrtc_ready(&mut ready, Err(message.clone()));
+            return Err(message);
+        }
+    }
+    let mut poll = tokio::time::interval(Duration::from_millis(LIVEKIT_DONE_POLL_MS));
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    while !done.load(Ordering::SeqCst) {
+        let frame = tokio::select! {
+            frame = stream.next() => frame,
+            _ = poll.tick() => {
+                if done.load(Ordering::SeqCst) {
+                    break;
+                }
+                continue;
+            }
+        };
+        let Some(frame) = frame else {
+            break;
+        };
+        push_local_webrtc_mic_frame(&writer, &frame);
+    }
+    writer.clear();
+    Ok(())
+}
+
+fn send_local_webrtc_ready(
+    ready: &mut Option<oneshot::Sender<Result<(), String>>>,
+    result: Result<(), String>,
+) {
+    if let Some(ready) = ready.take() {
+        let _ = ready.send(result);
+    }
+}
+
+async fn next_local_webrtc_mic_frame(
+    stream: &mut NativeAudioStream,
+    done: &Arc<AtomicBool>,
+) -> Option<AudioFrame<'static>> {
+    let mut poll = tokio::time::interval(Duration::from_millis(LIVEKIT_DONE_POLL_MS));
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        let frame = tokio::select! {
+            frame = stream.next() => frame,
+            _ = poll.tick() => {
+                if done.load(Ordering::SeqCst) {
+                    return None;
+                }
+                continue;
+            }
+        };
+        let Some(frame) = frame else {
+            return None;
+        };
+        if frame.sample_rate == 0 {
+            continue;
+        }
+        if audio_frame_to_mono_f32(&frame).is_empty() {
+            continue;
+        }
+        return Some(frame);
+    }
+}
+
+fn push_local_webrtc_mic_frame(writer: &ExternalAudioInputWriter, frame: &AudioFrame<'_>) -> bool {
+    if frame.sample_rate == 0 {
+        return false;
+    }
+    let pcm = audio_frame_to_mono_f32(frame);
+    if pcm.is_empty() {
+        return false;
+    }
+    let _ = writer.push_mono_f32(&pcm);
+    true
+}
+
+fn audio_frame_to_mono_f32(frame: &AudioFrame<'_>) -> Vec<f32> {
+    let channels = (frame.num_channels as usize).max(1);
+    if channels == 1 {
+        return i16_to_f32(frame.data.as_ref());
+    }
+    frame
+        .data
+        .as_ref()
+        .chunks(channels)
+        .map(|chunk| {
+            let sum = chunk
+                .iter()
+                .map(|sample| *sample as f32 / i16::MAX as f32)
+                .sum::<f32>();
+            sum / chunk.len().max(1) as f32
+        })
+        .collect()
 }
 
 #[cfg(test)]

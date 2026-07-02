@@ -829,18 +829,21 @@ Real defects to fix as this layer comes into the build (not won't‑fix):
 
 ## 9. Layer 6 — Audio I/O (native callbacks)
 
-Native mic/speaker callbacks own realtime capture/playback. The current LFM2 implementation uses
-`cpal`; the architectural invariant is the callback/ring ownership, not the frontend owning
-`MediaStreamTrack`s. To be **unified** into one module (not duplicated) as Layer 5 lands.
+Native mic/speaker callbacks own realtime capture/playback. The current desktop LFM2 path feeds
+microphone frames from the same Rust WebRTC/PlatformAudio device stack used by LiveKit and routes
+assistant PCM into a local WebRTC loopback through `NativeAudioSource`; CPAL remains only as the
+standalone example fallback. The architectural invariant is the native media ownership, not the
+frontend owning `MediaStreamTrack`s. To be **unified** into one module (not duplicated) as Layer 5
+lands.
 
 ```
    CAPTURE                                          PLAYBACK
    ───────                                          ────────
-   default input device                             default output device
-   downmix to mono, normalize per sample format      bounded SPSC PCM ring
+   PlatformAudio device track                       default output device
+   NativeAudioStream → mono f32 frames               bounded SPSC PCM ring
    RMS gate: start on first speech (rms ≥ thr),       generate loop pushes decoded PCM chunks
-     end after ~0.8–1.0 s silence (or max cap)        cpal callback drains ring → all channels
-   resample device‑rate → 16 kHz (Conformer input)   resample 24 kHz (Mimi) → device rate
+     end after ~0.8–1.0 s silence (or max cap)        output callback drains ring → all channels
+   resample 48 kHz → model rate                       resample 24 kHz (Mimi) → device rate
    → bounded local utterance buffer                   barge‑in: output callback flush + interrupt
 ```
 
@@ -914,7 +917,7 @@ consumers steal events).
    realtime                control                            note
    ────────                ───────                            ────
    Text(frag)          →   Transcript{Assistant, CUMULATIVE}  bridge accumulates a per‑turn string
-   Audio(pcm)          →   live:  cpal ring + Level{rms}      PLAY it; only a scalar crosses IPC
+   Audio(pcm)          →   live:  native ring + Level{rms}    PLAY it; only a scalar crosses IPC
                            turn:  accumulate → AudioClip{wav} encode at TurnComplete
    TurnComplete        →   turn: AudioClip then State{Idle}; live: State{Listening}
    Interrupted         →   turn: State{Idle};                live: State{Listening}
@@ -1005,8 +1008,8 @@ flowchart LR
       LUtt["bounded crossbeam utterance queue\ncapacity 1"]
       LInfer["persistent std::thread\nowns Lfm2VoiceEngine + ChatState + Mimi"]
       LEv["bounded crossbeam event queue"]
-      LOut["bounded SPSC speaker ring"]
-      LSpk["OS speaker callback thread"]
+      LOut["ExternalAudioOutput\nNativeAudioSource"]
+      LSpk["WebRTC PlatformAudio\nlocal loopback"]
     end
 
     subgraph LiveKit["VoiceSession::Livekit\nnative Rust/WebRTC provider"]
@@ -1068,7 +1071,7 @@ sequenceDiagram
   alt provider = lfm2
     Kernel->>LFM: spawn Lfm2Runtime/RealtimePipeline session
     Media->>LFM: mic PCM via bounded SPSC ring + utterance queue
-    LFM->>Media: speaker PCM via bounded SPSC ring
+    LFM->>Media: speaker PCM via NativeAudioSource loopback
     LFM->>Events: text/audio/state/level events
   else provider = livekit
     Kernel->>LK: mint token/config from Tauri settings + keychain
@@ -1095,9 +1098,10 @@ sequenceDiagram
   that own the model pipeline, the LiveKit control loop runs in a ThreadManager-owned service
   thread that drives Tokio signaling, OS audio callbacks run on callback threads, and
   LiveKit/WebRTC owns native media worker threads under the Rust SDK.
-- The LFM2 path uses bounded `crossbeam-channel` queues for utterances/events and bounded SPSC
-  PCM rings for mic/speaker audio. Full queues apply backpressure or cancel stale work instead of
-  accumulating unbounded latency.
+- The LFM2 path uses bounded `crossbeam-channel` queues for utterances/events, a bounded SPSC PCM
+  ring for standalone capture/playback fallback, and desktop WebRTC `ExternalAudioInput` /
+  `ExternalAudioOutput` hooks for mic and speaker media. Full queues apply backpressure or cancel
+  stale work instead of accumulating unbounded latency.
 - The LiveKit path mirrors that control shape with native token/config minting from Tauri
   settings plus keychain credentials and a local LFM2 model. A bounded `LiveKitCommand` queue
   controls the active room pair: the user participant publishes `PlatformAudio` microphone frames,
@@ -1109,7 +1113,8 @@ sequenceDiagram
   reliable in-room control packet for compatibility, clears the playback reference, and keeps the room
   alive; if the native agent audio track does not subscribe within the bounded startup window, the
   session emits an error and ends instead of leaving a connected dead mic; stop closes both rooms.
-  Remaining deeper media parity is sample-accurate local CPAL AEC.
+  Remaining deeper media parity is sample-accurate validation against the upstream Moshi realtime
+  loop under sustained interruption and barge-in.
 - Intra‑op thread count mirrors torch's policy (`threads.rs`) so CPU numerics/perf track the
   Python reference. BF16 model weights stay BF16; the in-tree NEON `BFMMLA` bridge is used for
   BF16 CPU 2-D linears/logits where the safetensor dtype requires it, while local math that is
@@ -1213,8 +1218,8 @@ voice stack.
    ✅ multi‑turn discrete  examples/chat_multiturn    turn 2 chairs‑conditioned on turn 1's appended audio
    ✅ engine persistence   realtime::tests::engine_multiturn_grows_conv  (real model, #[ignore], ~41 s):
                                                      conv text/audio_out/modality all grow t1→t2
-   ✅ live mic             examples/mic_chat (engine) real conversation on hardware ("It works SO good"):
-                                                     cpal mic → 48k→16k resample → mel → Conformer → LFM2 →
+   ✅ live mic             desktop local path + examples/mic_chat real conversation on hardware:
+                                                     WebRTC mic in Tauri / fallback mic in examples → model-rate →
                                                      Depthformer → Mimi streaming → speaker, real‑time
    ✅ KvCache rewire       cargo build --features metal + 62 lib tests + identical greedy text (parity)
    ✅ threading            realtime::tests           ordering · persistence · barge‑in · error survival · Drop
@@ -1234,9 +1239,10 @@ ignored.
    ◻️ #2  Inter‑turn KV persistence (§7.2): the real 14 GB fix; prerequisite (KvCache) is done.
    🔧 #3  Finish Layer 5 hardening: `session.rs`/BridgeState now wire DELEGATE into the
             EmberHarmony session; the standalone glm.rs engineer choice and hardening remain.
-   🔧 #4  Desktop media parity: provider-routed voice_start, native LiveKit room/mic, WebRTC
-            AEC, LFM2 playback-reference VAD gate, and LiveKit assistant playback-reference VAD
-            gate are wired; true sample-accurate CPAL AEC remains future polish.
+   🔧 #4  Desktop media parity: provider-routed voice_start, native LiveKit room/mic, local
+            WebRTC mic capture, local WebRTC speaker loopback, LFM2 playback-reference VAD
+            gate, and LiveKit assistant playback-reference VAD gate are wired; sustained
+            realtime Moshi parity and barge-in validation remain.
    ⚠️ #5  Crate hardening (PR threads): zero‑length Metal tensors (T8/T22),
             encoder setup_streaming_params (T24),
             loader tokenizer‑* skip (T3), detok mask cache (T1).

@@ -684,7 +684,8 @@ fn trainable_cpu_bf16_is_rejected() -> anyhow::Result<()> {
         Err(err) => err,
     };
     assert!(
-        err.to_string().contains("trainable CPU bf16 is unsupported"),
+        err.to_string()
+            .contains("trainable CPU bf16 is unsupported"),
         "unexpected error: {err}"
     );
     Ok(())

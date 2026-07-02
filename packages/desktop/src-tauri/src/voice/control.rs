@@ -3,13 +3,15 @@
 //! session (`livekit`).
 //!
 //! This layer wires **settings → provider readiness → runtime control**. For
-//! `lfm2`, `voice_start` enters the in-process Rust service; CPAL capture,
-//! playback, VAD, interruption, and the model worker are owned by Tauri. LiveKit
-//! follows the same Tauri-owned runtime path: the webview asks for voice, Rust
-//! owns the room, microphone, stop, interrupt, and level events.
+//! `lfm2`, `voice_start` enters the in-process Rust service; WebRTC/PlatformAudio
+//! capture/playback, VAD, interruption, and the model worker are owned by Tauri.
+//! LiveKit follows the same Tauri-owned runtime path: the webview asks for voice,
+//! Rust owns the room, microphone, stop, interrupt, and level events.
 
 use crate::settings::{self, VoiceProvider, VoiceSettings};
 use crate::{ServerReadyData, ServerState};
+use liquid_audio::AudioStatsSnapshot;
+use liquid_audio::moshi::models::realtime_moshi_files;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, State};
 
@@ -87,10 +89,32 @@ pub struct VoicePlan {
     /// Whether the native runtime currently accepts microphone input.
     #[serde(rename = "micEnabled")]
     pub mic_enabled: bool,
+    /// Native LFM2 audio counters, present while that provider is running.
+    #[serde(rename = "audioStats")]
+    pub audio_stats: Option<AudioStatsSnapshot>,
+    /// Which native local engine the selected snapshot activates.
+    pub engine: Option<VoiceEngineMode>,
     /// Ready to start.
     pub ready: bool,
     /// Human-readable detail — what to configure if not ready.
     pub detail: String,
+}
+
+/// Native local model mode. LFM2-Audio is turn/interleaved; Moshi is frame-realtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum VoiceEngineMode {
+    Lfm2Interleaved,
+    MoshiRealtime,
+}
+
+impl From<settings::LocalVoiceEngine> for VoiceEngineMode {
+    fn from(value: settings::LocalVoiceEngine) -> Self {
+        match value {
+            settings::LocalVoiceEngine::Lfm2Interleaved => VoiceEngineMode::Lfm2Interleaved,
+            settings::LocalVoiceEngine::MoshiRealtime => VoiceEngineMode::MoshiRealtime,
+        }
+    }
 }
 
 /// Runtime surface for the active provider. Desktop providers are owned by the
@@ -113,14 +137,17 @@ pub fn plan(settings: &VoiceSettings) -> VoicePlan {
             running: false,
             running_provider: None,
             mic_enabled: false,
+            audio_stats: None,
+            engine: None,
             ready: false,
             detail: "Voice is off.".into(),
         },
         VoiceProvider::Lfm2 => {
             // Fail-hard, decoupled: the RUN path loads only a local snapshot dir. A repo id is
             // a download *source*, not a ready model — typing one never silently downloads at
-            // start. Ready iff a local model dir with `config.json` exists.
-            let active = settings::lfm2_active_model_dir(&settings.lfm2).is_some();
+            // start. Ready iff the selected local engine has its matching snapshot directory.
+            let readiness = local_model_ready(settings);
+            let active = readiness.as_ref().is_ok_and(|ready| *ready);
             VoicePlan {
                 provider: VoiceProvider::Lfm2,
                 enabled: true,
@@ -128,12 +155,10 @@ pub fn plan(settings: &VoiceSettings) -> VoicePlan {
                 running: false,
                 running_provider: None,
                 mic_enabled: false,
+                audio_stats: None,
+                engine: local_engine_mode(settings).ok().flatten(),
                 ready: active,
-                detail: if active {
-                    "Local LFM2-Audio model ready.".into()
-                } else {
-                    "No local model. Download a model or choose a model directory below.".into()
-                },
+                detail: local_detail(settings, readiness),
             }
         }
         VoiceProvider::Livekit => VoicePlan {
@@ -143,13 +168,70 @@ pub fn plan(settings: &VoiceSettings) -> VoicePlan {
             running: false,
             running_provider: None,
             mic_enabled: false,
+            audio_stats: None,
+            engine: local_engine_mode(settings).ok().flatten(),
             ready: settings
                 .livekit
                 .url
                 .as_deref()
                 .is_some_and(|url| !url.trim().is_empty())
-                && settings::lfm2_active_model_dir(&settings.lfm2).is_some(),
-            detail: "LiveKit needs a URL, keychain-stored API credentials, and a local LFM2-Audio model.".into(),
+                && local_model_ready(settings).unwrap_or(false),
+            detail:
+                "LiveKit needs a URL, keychain-stored API credentials, and a local voice model."
+                    .into(),
+        },
+    }
+}
+
+fn local_engine_mode(settings: &VoiceSettings) -> Result<Option<VoiceEngineMode>, String> {
+    Ok(Some(settings.lfm2.engine.into()))
+}
+
+fn local_model_ready(settings: &VoiceSettings) -> Result<bool, String> {
+    match settings.lfm2.engine {
+        settings::LocalVoiceEngine::Lfm2Interleaved => {
+            let Some(dir) = settings::lfm2_active_model_dir(&settings.lfm2) else {
+                return Ok(false);
+            };
+            if realtime_moshi_files(&dir)
+                .map_err(|e| format!("failed to inspect local voice model: {e}"))?
+                .is_some()
+            {
+                return Err("Selected local engine is LFM2-Audio, but the directory contains a Moshi realtime snapshot. Switch Local engine to Moshi realtime or choose an LFM2-Audio snapshot.".into());
+            }
+            Ok(true)
+        }
+        settings::LocalVoiceEngine::MoshiRealtime => {
+            let Some(dir) = settings::moshi_model_dir(&settings.lfm2) else {
+                return Ok(false);
+            };
+            realtime_moshi_files(&dir)
+                .map(|files| files.is_some())
+                .map_err(|e| format!("failed to inspect Moshi realtime snapshot: {e}"))
+        }
+    }
+}
+
+fn local_detail(settings: &VoiceSettings, readiness: Result<bool, String>) -> String {
+    match readiness {
+        Err(err) => err,
+        Ok(true) => match settings.lfm2.engine {
+            settings::LocalVoiceEngine::MoshiRealtime => {
+                "Local Moshi realtime model ready.".into()
+            }
+            settings::LocalVoiceEngine::Lfm2Interleaved => {
+                "Local LFM2-Audio interleaved model ready.".into()
+            }
+        },
+        Ok(false) => match settings.lfm2.engine {
+            settings::LocalVoiceEngine::MoshiRealtime => {
+                "No Moshi realtime model. Download Moshiko or choose a Moshi snapshot directory below."
+                    .into()
+            }
+            settings::LocalVoiceEngine::Lfm2Interleaved => {
+                "No local LFM2-Audio model. Download LFM2-Audio or choose a model directory below."
+                    .into()
+            }
         },
     }
 }
@@ -163,12 +245,18 @@ pub async fn voice_status(
     let settings = settings::load(&app);
     let mut p = plan(&settings);
     if settings.provider == VoiceProvider::Livekit {
-        p.ready = livekit::configured(&settings)?
-            && settings::lfm2_active_model_dir(&settings.lfm2).is_some();
+        let local_ready = local_model_ready(&settings)?;
+        p.ready = livekit::configured(&settings)? && local_ready;
+        p.engine = local_engine_mode(&settings)?;
         p.detail = if p.ready {
-            LIVEKIT_READY_DETAIL.into()
-        } else if settings::lfm2_active_model_dir(&settings.lfm2).is_none() {
-            "Choose or download a local LFM2-Audio model for the native LiveKit agent.".into()
+            match p.engine {
+                Some(VoiceEngineMode::MoshiRealtime) => {
+                    "LiveKit URL, credentials, and local Moshi realtime model ready for the native agent.".into()
+                }
+                _ => LIVEKIT_READY_DETAIL.into(),
+            }
+        } else if !local_ready {
+            "Choose or download the selected local voice model for the native LiveKit agent.".into()
         } else {
             "Enter your LiveKit URL, API key, and API secret in voice settings.".into()
         };
@@ -177,7 +265,18 @@ pub async fn voice_status(
     p.running = active.running;
     p.running_provider = active.running_provider;
     p.mic_enabled = active.mic_enabled;
+    p.audio_stats = active.audio_stats;
+    if p.engine.is_none() {
+        p.engine = local_engine_mode(&settings)?;
+    }
     Ok(p)
+}
+
+/// Play a short native speaker probe through the same output path used by LFM2 voice.
+#[tauri::command]
+pub async fn voice_audio_probe() -> Result<super::runtime::VoiceAudioProbeReport, String> {
+    super::runtime::play_local_webrtc_probe(std::time::Duration::from_millis(650), 660.0, 0.12)
+        .await
 }
 
 // ---- streaming contract: the run loops emit these to the webview over a
@@ -261,9 +360,9 @@ impl TurnMode {
 
 /// Start a voice session for the configured provider.
 ///
-/// For `lfm2`, this starts the thread-managed desktop service: CPAL mic,
-/// speaker playback, VAD, interruption, and the realtime model pipeline all run
-/// inside the Tauri process. The command returns after the service thread is
+/// For `lfm2`, this starts the thread-managed desktop service: WebRTC/PlatformAudio
+/// mic and speaker media, VAD, interruption, and the realtime model pipeline all
+/// run inside the Tauri process. The command returns after the service thread is
 /// spawned; events stream over `channel`.
 #[tauri::command]
 pub async fn voice_start(
@@ -276,12 +375,18 @@ pub async fn voice_start(
     let settings = settings::load(&app);
     let mut p = plan(&settings);
     if settings.provider == VoiceProvider::Livekit {
-        p.ready = livekit::configured(&settings)?
-            && settings::lfm2_active_model_dir(&settings.lfm2).is_some();
+        let local_ready = local_model_ready(&settings)?;
+        p.ready = livekit::configured(&settings)? && local_ready;
+        p.engine = local_engine_mode(&settings)?;
         p.detail = if p.ready {
-            LIVEKIT_READY_DETAIL.into()
-        } else if settings::lfm2_active_model_dir(&settings.lfm2).is_none() {
-            "Choose or download a local LFM2-Audio model for the native LiveKit agent.".into()
+            match p.engine {
+                Some(VoiceEngineMode::MoshiRealtime) => {
+                    "LiveKit URL, credentials, and local Moshi realtime model ready for the native agent.".into()
+                }
+                _ => LIVEKIT_READY_DETAIL.into(),
+            }
+        } else if !local_ready {
+            "Choose or download the selected local voice model for the native LiveKit agent.".into()
         } else {
             "Enter your LiveKit URL, API key, and API secret in voice settings.".into()
         };

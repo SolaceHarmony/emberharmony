@@ -8,8 +8,11 @@
 
 export type VoiceProvider = "off" | "lfm2" | "livekit"
 export type VoiceSurface = "off" | "native" | "livekit"
+export type VoiceEngineMode = "lfm2Interleaved" | "moshiRealtime"
 export type Lfm2Device = "cpu" | "metal"
 export const VOICE_SETTINGS_CHANGED = "emberharmony:voice-settings-changed"
+export const DEFAULT_LFM2_MODEL = "LiquidAI/LFM2.5-Audio-1.5B"
+export const DEFAULT_MOSHI_MODEL = "kyutai/moshiko-candle-bf16"
 
 export interface LiveKitSettings {
   url?: string
@@ -24,13 +27,17 @@ export interface DelegateSettings {
 }
 
 export interface Lfm2Settings {
+  engine: VoiceEngineMode
   modelDir?: string
+  moshiModelDir?: string
   device: Lfm2Device
   vadThreshold: number
   maxTokens: number
   model?: string
   /** Download-source revision (branch/tag/commit); ignored once modelDir is set. */
   revision?: string
+  moshiModel?: string
+  moshiRevision?: string
   seed?: number
   delegate: DelegateSettings
 }
@@ -56,8 +63,10 @@ export const defaultVoiceSettings: VoiceSettings = {
   // Desktop resolves the default `model` in Rust; this literal is only the
   // web-build display fallback when no Tauri runtime exists.
   lfm2: {
-    model: "LiquidAI/LFM2.5-Audio-1.5B",
-    device: "cpu",
+    engine: "moshiRealtime",
+    model: DEFAULT_LFM2_MODEL,
+    moshiModel: DEFAULT_MOSHI_MODEL,
+    device: "metal",
     vadThreshold: 0.012,
     maxTokens: 512,
     delegate: { enabled: false },
@@ -111,6 +120,14 @@ export interface VoicePlan {
   running: boolean
   runningProvider?: VoiceProvider
   micEnabled: boolean
+  audioStats?: {
+    decodedSamples: number
+    queuedSamples: number
+    droppedSamples: number
+    playedSamples: number
+    underrunFrames: number
+  }
+  engine?: VoiceEngineMode
   ready: boolean
   detail: string
 }
@@ -126,6 +143,8 @@ export async function getVoiceStatus(): Promise<VoicePlan> {
       running: false,
       runningProvider: undefined,
       micEnabled: false,
+      audioStats: undefined,
+      engine: undefined,
       ready: false,
       detail: "",
     }
@@ -196,6 +215,25 @@ export async function beginVoiceTypedInput(): Promise<void> {
   await invoke<void>("voice_begin_typed_input")
 }
 
+export interface VoiceAudioProbeReport {
+  sampleRate: number
+  samplesWritten: number
+  webrtcFrames: number
+  durationMs: number
+  playoutDevices: number
+  recordingDevices: number
+  playoutDevice?: string
+  admPlayoutEnabled: boolean
+  playoutInitialized: boolean
+}
+
+/** Play a short tone through the native desktop speaker path used by voice. */
+export async function playVoiceAudioProbe(): Promise<VoiceAudioProbeReport | undefined> {
+  const invoke = tauriInvoke()
+  if (!invoke) return
+  return invoke<VoiceAudioProbeReport>("voice_audio_probe")
+}
+
 export interface LiveKitCredentialsStatus {
   stored: boolean
 }
@@ -224,7 +262,7 @@ export type NativeDownloadEvent =
   | { type: "error"; message: string }
 
 /**
- * Download an LFM2-Audio model snapshot (repo id or pasted HF URL + optional revision),
+ * Download a local voice model snapshot (repo id or pasted HF URL + optional revision),
  * streaming per-file progress over a Channel. The terminal `done`/`error` event is
  * authoritative; on `done` the caller persists `dir` as the active `modelDir`. The HF
  * token is read natively from the keychain and never passed from here.

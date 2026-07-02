@@ -2129,6 +2129,9 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
               <SessionContextUsage />
               <Show when={voice.state() === "connected"}>
                 <Switch>
+                  <Match when={voice.agentLevel() !== undefined}>
+                    <NativeVoiceMeter level={voice.agentLevel() ?? 0} ariaLabel={language.t("voice.connected")} />
+                  </Match>
                   <Match when={voice.agentAudioTrack()}>
                     {(track) => (
                       <BarVisualizer
@@ -2139,9 +2142,6 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
                         aria-label={language.t("voice.connected")}
                       />
                     )}
-                  </Match>
-                  <Match when={voice.agentLevel() !== undefined}>
-                    <NativeVoiceMeter level={voice.agentLevel() ?? 0} ariaLabel={language.t("voice.connected")} />
                   </Match>
                 </Switch>
               </Show>

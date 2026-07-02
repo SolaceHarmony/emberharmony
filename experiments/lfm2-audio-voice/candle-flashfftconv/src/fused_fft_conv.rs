@@ -16,9 +16,9 @@
 //! `threadgroup_position_in_grid` (the dispatch is `(batch, channels)` threadgroups
 //! of `fft_size` threads), not `thread_position_in_grid`.
 
-use candle_core::{CpuStorage, CustomOp3, Layout, Result, Shape, Tensor};
 #[cfg(feature = "metal")]
 use candle_core::DType;
+use candle_core::{CpuStorage, CustomOp3, Layout, Result, Shape, Tensor};
 
 #[cfg(feature = "metal")]
 /// The kernel is your vendored `metal/FFTConv.metal` (verbatim + documented
@@ -76,10 +76,16 @@ impl CustomOp3 for FusedFftConv {
                     }
                     // multiply by k_f (Hermitian: mirror the upper half).
                     let (kr, ki) = if k < half {
-                        (kf[(ci * half + k) * 2] as f64, kf[(ci * half + k) * 2 + 1] as f64)
+                        (
+                            kf[(ci * half + k) * 2] as f64,
+                            kf[(ci * half + k) * 2 + 1] as f64,
+                        )
                     } else {
                         let m = fft_size - k;
-                        (kf[(ci * half + m) * 2] as f64, -(kf[(ci * half + m) * 2 + 1] as f64))
+                        (
+                            kf[(ci * half + m) * 2] as f64,
+                            -(kf[(ci * half + m) * 2 + 1] as f64),
+                        )
                     };
                     spec_re[k] = sr * kr - si * ki;
                     spec_im[k] = sr * ki + si * kr;
@@ -151,10 +157,21 @@ impl CustomOp3 for FusedFftConv {
         enc.set_threadgroup_memory_length(0, fft_size * 8);
         // One threadgroup per (batch, channel); fft_size threads each.
         enc.dispatch_thread_groups(
-            MTLSize { width: b, height: c, depth: 1 },
-            MTLSize { width: fft_size, height: 1, depth: 1 },
+            MTLSize {
+                width: b,
+                height: c,
+                depth: 1,
+            },
+            MTLSize {
+                width: fft_size,
+                height: 1,
+                depth: 1,
+            },
         );
-        Ok((MetalStorage::new(out, dev.clone(), b * c * seqlen, DType::F32), Shape::from((b, c, seqlen))))
+        Ok((
+            MetalStorage::new(out, dev.clone(), b * c * seqlen, DType::F32),
+            Shape::from((b, c, seqlen)),
+        ))
     }
 }
 
@@ -210,16 +227,29 @@ mod tests {
         let dev = Device::Cpu;
         let (seqlen, fft_size) = (16usize, 32);
         let u: Vec<f32> = (0..seqlen).map(|i| (i as f32 * 0.3).sin()).collect();
-        let k: Vec<f32> = (0..seqlen).map(|i| (i as f32 * 0.17 + 0.5).cos() * 0.4).collect();
+        let k: Vec<f32> = (0..seqlen)
+            .map(|i| (i as f32 * 0.17 + 0.5).cos() * 0.4)
+            .collect();
         let dval = 0.25f32;
         let kf = rfft_half(&k, fft_size);
         let ut = Tensor::from_vec(u.clone(), (1, 1, seqlen), &dev).unwrap();
         let kt = Tensor::from_vec(kf, (1, fft_size / 2 + 1, 2), &dev).unwrap();
         let dt = Tensor::from_vec(vec![dval], (1,), &dev).unwrap();
-        let y: Vec<f32> = fused_fft_conv(&ut, &kt, &dt, fft_size).unwrap().flatten_all().unwrap().to_vec1().unwrap();
+        let y: Vec<f32> = fused_fft_conv(&ut, &kt, &dt, fft_size)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
         let exp = direct_linear_conv(&u, &k, seqlen, dval);
-        let maxd = y.iter().zip(exp.iter()).fold(0f32, |m, (a, e)| m.max((a - e).abs()));
-        assert!(maxd < 1e-3, "fused conv != direct linear conv, max diff {maxd}");
+        let maxd = y
+            .iter()
+            .zip(exp.iter())
+            .fold(0f32, |m, (a, e)| m.max((a - e).abs()));
+        assert!(
+            maxd < 1e-3,
+            "fused conv != direct linear conv, max diff {maxd}"
+        );
         eprintln!("fused_fft_conv == direct linear conv, max diff {maxd:.2e}");
     }
 
@@ -235,18 +265,30 @@ mod tests {
         };
         let (b, c, seqlen, fft_size) = (2usize, 3, 64, 128);
         let half = fft_size / 2 + 1;
-        let u: Vec<f32> = (0..b * c * seqlen).map(|i| ((i * 13 % 23) as f32 * 0.04) - 0.4).collect();
-        let kf: Vec<f32> = (0..c * half * 2).map(|i| ((i * 5 % 9) as f32 * 0.05) - 0.2).collect();
+        let u: Vec<f32> = (0..b * c * seqlen)
+            .map(|i| ((i * 13 % 23) as f32 * 0.04) - 0.4)
+            .collect();
+        let kf: Vec<f32> = (0..c * half * 2)
+            .map(|i| ((i * 5 % 9) as f32 * 0.05) - 0.2)
+            .collect();
         let dd: Vec<f32> = (0..c).map(|i| 0.1 * i as f32).collect();
         let run = |dev: &Device| -> Vec<f32> {
             let ut = Tensor::from_vec(u.clone(), (b, c, seqlen), dev).unwrap();
             let kt = Tensor::from_vec(kf.clone(), (c, half, 2), dev).unwrap();
             let dt = Tensor::from_vec(dd.clone(), (c,), dev).unwrap();
-            fused_fft_conv(&ut, &kt, &dt, fft_size).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap()
+            fused_fft_conv(&ut, &kt, &dt, fft_size)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
         };
         let cpu = run(&Device::Cpu);
         let met = run(&mdev);
-        let maxd = cpu.iter().zip(met.iter()).fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+        let maxd = cpu
+            .iter()
+            .zip(met.iter())
+            .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
         assert!(maxd < 1e-3, "fused conv metal vs cpu max diff {maxd}");
         eprintln!("fused_fft_conv: metal == cpu, max diff {maxd:.2e}");
     }

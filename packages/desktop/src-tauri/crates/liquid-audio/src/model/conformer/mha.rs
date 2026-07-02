@@ -237,7 +237,9 @@ impl MultiHeadAttention {
         let attn = masked_softmax(scores, mask)?;
         // CPU BF16 matmul is only bridged for 2-D linears. Attention score/value
         // matmuls intentionally accumulate in F32, matching the backbone path.
-        let x = attn.to_dtype(DType::F32)?.matmul(&value.to_dtype(DType::F32)?)?; // (b,h,t1,d_k)
+        let x = attn
+            .to_dtype(DType::F32)?
+            .matmul(&value.to_dtype(DType::F32)?)?; // (b,h,t1,d_k)
         let x = x.to_dtype(out_dtype)?;
         let x = x.transpose(1, 2)?.reshape((nb, time, self.h * self.d_k))?;
         linear_forward(&self.linear_out, &x)

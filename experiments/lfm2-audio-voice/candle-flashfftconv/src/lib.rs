@@ -92,8 +92,8 @@ mod irfft;
 mod metal_util;
 
 pub use butterfly::{
-    butterfly_fft_forward, butterfly_fft_inverse, complex_mul, fft_matrix, ifft_matrix, monarch_conv,
-    monarch_conv_bf16, twiddle_factors_fft, twiddle_factors_ifft,
+    butterfly_fft_forward, butterfly_fft_inverse, complex_mul, fft_matrix, ifft_matrix,
+    monarch_conv, monarch_conv_bf16, twiddle_factors_fft, twiddle_factors_ifft,
 };
 pub use conv1d::{depthwise_conv1d, depthwise_conv1d_stream, DepthwiseCausalConv1d};
 pub use dd_complex_mul::complex_mul_dd;

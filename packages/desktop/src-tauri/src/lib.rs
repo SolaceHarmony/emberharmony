@@ -306,6 +306,7 @@ pub fn run() {
             voice::control::voice_interrupt,
             voice::control::voice_set_mic_enabled,
             voice::control::voice_begin_typed_input,
+            voice::control::voice_audio_probe,
             voice::livekit::voice_livekit_credentials_set,
             voice::livekit::voice_livekit_credentials_status,
             voice::model::voice_model_download,

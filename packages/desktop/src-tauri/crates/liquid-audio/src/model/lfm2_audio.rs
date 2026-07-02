@@ -19,8 +19,8 @@ use candle_nn::{linear, Linear, Module, VarBuilder};
 use candle_transformers::generation::{LogitsProcessor, Sampling};
 
 use crate::model::conformer::encoder::{ConformerEncoder, ConformerEncoderConfig};
-use crate::model::linear::{linear_forward, linear_logits};
 use crate::model::lfm2_hf::{Cache as LfmCache, Lfm2Config, Model as Lfm2Model};
+use crate::model::linear::{linear_forward, linear_logits};
 use crate::model::mlp::MLP;
 use crate::model::transformer::{
     HeadStyle, LayerKvCache, Mha, RawLmBackbone, SharedEmbedding, StandardBlock,
@@ -907,8 +907,8 @@ impl LFM2AudioModel {
         // 1-D (D,) lfm hidden; candle's Linear needs a 2-D input, so add a row dim
         // (Python's nn.Linear accepts the 1-D vector directly).
         let emb2d = embedding.flatten_all()?.unsqueeze(0)?; // (1, D)
-        let din =
-            linear_forward(&self.depth_linear, &emb2d)?.reshape((self.codebooks, self.depthformer_dim))?;
+        let din = linear_forward(&self.depth_linear, &emb2d)?
+            .reshape((self.codebooks, self.depthformer_dim))?;
         let mut df_token = Tensor::zeros((self.depthformer_dim,), din.dtype(), din.device())?;
         let mut caches: Vec<LayerKvCache> = (0..self.depthformer.layers.len())
             .map(|_| LayerKvCache::new())

@@ -16,6 +16,8 @@ function plan(provider: VoiceProvider, enabled = provider !== "off"): VoicePlan 
     running: false,
     runningProvider: undefined,
     micEnabled: false,
+    audioStats: undefined,
+    engine: provider === "off" ? undefined : "lfm2Interleaved",
     ready: provider !== "off",
     detail: "",
   }

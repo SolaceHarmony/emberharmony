@@ -1,4 +1,4 @@
-import { Component, createMemo, createResource, createSignal, Show, type JSX } from "solid-js"
+import { Component, createMemo, createResource, createSignal, onCleanup, Show, type JSX } from "solid-js"
 import { Button } from "@thesolaceproject/emberharmony-ui/button"
 import { Select } from "@thesolaceproject/emberharmony-ui/select"
 import { Switch } from "@thesolaceproject/emberharmony-ui/switch"
@@ -9,6 +9,8 @@ import { Link } from "./link"
 import { useLanguage } from "@/context/language"
 import { useGlobalSDK } from "@/context/global-sdk"
 import {
+  DEFAULT_LFM2_MODEL,
+  DEFAULT_MOSHI_MODEL,
   defaultVoiceSettings,
   downloadVoiceModel,
   getHfTokenStatus,
@@ -17,19 +19,17 @@ import {
   getVoiceStatus,
   isDesktop,
   pickModelDir,
+  playVoiceAudioProbe,
   setHfToken,
   setLiveKitCredentials,
   setVoiceSettings,
   type DelegateSettings,
   type Lfm2Device,
   type Lfm2Settings,
+  type VoiceEngineMode,
   type VoiceProvider,
   type VoiceSettings,
 } from "@/lib/voice-settings"
-
-// The canonical model — the same constant the upstream demo hardcodes. Pre-filled so a
-// user never has to "find" a repo id; editable only to point at a fork or newer version.
-const DEFAULT_MODEL = "LiquidAI/LFM2.5-Audio-1.5B"
 
 export const SettingsVoice: Component = () => {
   const language = useLanguage()
@@ -49,18 +49,25 @@ export const SettingsVoice: Component = () => {
   const [tauriVoice, { refetch: refetchTauri, mutate: setTauriVoice }] = createResource(getVoiceSettingsState)
   const [voiceStatus, { refetch: refetchStatus }] = createResource(getVoiceStatus)
   const [nativeLivekit, { refetch: refetchNativeLivekit }] = createResource(getLiveKitCredentialsStatus)
+  const statusPoll = desktop ? setInterval(() => refetchStatus(), 1000) : undefined
+  onCleanup(() => {
+    if (statusPoll === undefined) return
+    clearInterval(statusPoll)
+  })
 
   const [url, setUrl] = createSignal<string | undefined>(undefined)
   const [apiKey, setApiKey] = createSignal("")
   const [apiSecret, setApiSecret] = createSignal("")
   const [saving, setSaving] = createSignal(false)
   const [testing, setTesting] = createSignal(false)
+  const [probing, setProbing] = createSignal(false)
   const [override, setOverride] = createSignal<VoiceProvider>()
 
   // LFM2 model management — download / HF token / native dir picker.
   const [hfTokenInput, setHfTokenInput] = createSignal("")
   const [savingToken, setSavingToken] = createSignal(false)
   const [modelDirEdit, setModelDirEdit] = createSignal<string | undefined>(undefined)
+  const [moshiModelDirEdit, setMoshiModelDirEdit] = createSignal<string | undefined>(undefined)
   const [downloading, setDownloading] = createSignal(false)
   const [downloadMsg, setDownloadMsg] = createSignal<string | undefined>(undefined)
   const [hfTokenStored, { refetch: refetchToken }] = createResource(getHfTokenStatus)
@@ -68,8 +75,16 @@ export const SettingsVoice: Component = () => {
   const effectiveUrl = () => url() ?? voice().livekit.url ?? (!desktop ? config()?.url : undefined) ?? ""
   const voice = (): VoiceSettings => tauriVoice()?.settings ?? defaultVoiceSettings
   const lfm2 = (): Lfm2Settings => voice().lfm2
+  const localEngine = (): VoiceEngineMode => lfm2().engine ?? "moshiRealtime"
   const modelDirValue = () => modelDirEdit() ?? lfm2().modelDir ?? ""
-  const hfModel = () => (lfm2().model ?? DEFAULT_MODEL).trim()
+  const moshiModelDirValue = () => moshiModelDirEdit() ?? lfm2().moshiModelDir ?? ""
+  const selectedModelDirValue = () => (localEngine() === "moshiRealtime" ? moshiModelDirValue() : modelDirValue())
+  const hfModel = () =>
+    (localEngine() === "moshiRealtime"
+      ? (lfm2().moshiModel ?? DEFAULT_MOSHI_MODEL)
+      : (lfm2().model ?? DEFAULT_LFM2_MODEL)
+    ).trim()
+  const hfRevision = () => (localEngine() === "moshiRealtime" ? lfm2().moshiRevision : lfm2().revision)
   const hfUrl = () => {
     const m = hfModel()
     return m.startsWith("http") ? m : `https://huggingface.co/${m}`
@@ -211,6 +226,11 @@ export const SettingsVoice: Component = () => {
     try {
       const dir = await pickModelDir()
       if (!dir) return
+      if (localEngine() === "moshiRealtime") {
+        setMoshiModelDirEdit(dir)
+        await updateLfm2({ moshiModelDir: dir })
+        return
+      }
       setModelDirEdit(dir)
       await updateLfm2({ modelDir: dir })
     } catch (err) {
@@ -227,10 +247,12 @@ export const SettingsVoice: Component = () => {
     // The shown model (pre-filled default unless the user overrode it) — never empty, so
     // one click downloads the recommended model without anyone hunting for a repo id.
     const source = hfModel()
+    const engine = localEngine()
+    const revision = hfRevision()
     setDownloading(true)
     setDownloadMsg(`${language.t("settings.voice.download.downloading")}…`)
     try {
-      await downloadVoiceModel({ source, revision: lfm2().revision }, (event) => {
+      await downloadVoiceModel({ source, revision }, (event) => {
         switch (event.type) {
           case "started":
             setDownloadMsg(`${language.t("settings.voice.download.downloading")} 0/${event.total}`)
@@ -242,8 +264,12 @@ export const SettingsVoice: Component = () => {
             break
           case "done":
             void (async () => {
-              setModelDirEdit(event.dir)
-              const saved = await updateLfm2({ modelDir: event.dir })
+              const saved =
+                engine === "moshiRealtime"
+                  ? await updateLfm2({ moshiModelDir: event.dir })
+                  : await updateLfm2({ modelDir: event.dir })
+              if (engine === "moshiRealtime") setMoshiModelDirEdit(event.dir)
+              else setModelDirEdit(event.dir)
               setDownloading(false)
               setDownloadMsg(undefined)
               if (!saved) return
@@ -336,7 +362,7 @@ export const SettingsVoice: Component = () => {
     try {
       if (desktop) {
         const status = await getVoiceStatus()
-        if (status.provider === "livekit" && status.ready) {
+        if (status.ready) {
           showToast({ title: language.t("settings.voice.toast.testOk"), description: status.detail })
           return
         }
@@ -365,6 +391,31 @@ export const SettingsVoice: Component = () => {
     }
   }
 
+  async function testSpeaker() {
+    setProbing(true)
+    await playVoiceAudioProbe()
+      .then((report) =>
+        showToast({
+          title: language.t("settings.voice.toast.speakerOk"),
+          description: report
+            ? language.t("settings.voice.toast.speakerReport", {
+                device: report.playoutDevice ?? "default output",
+                rate: report.sampleRate,
+                frames: report.webrtcFrames,
+                adm: report.admPlayoutEnabled && report.playoutInitialized ? "ready" : "not ready",
+              })
+            : undefined,
+        }),
+      )
+      .catch((err) =>
+        showToast({
+          title: language.t("settings.voice.toast.speakerFailed"),
+          description: err instanceof Error ? err.message : String(err),
+        }),
+      )
+      .finally(() => setProbing(false))
+  }
+
   type RegistryOption = { id: string; name: string; provider: string; defaultSuffix?: string }
   const modelValue = (option: RegistryOption) =>
     option.defaultSuffix ? `${option.id}:${option.defaultSuffix}` : option.id
@@ -382,6 +433,31 @@ export const SettingsVoice: Component = () => {
   const showNativeModel = () =>
     enabled() && (activeProvider() === "lfm2" || (desktop && activeProvider() === "livekit"))
   const showLegacyLiveKitModels = () => !desktop && enabled() && activeProvider() === "livekit"
+  const audioStatsText = () => {
+    const stats = voiceStatus()?.audioStats
+    if (!stats) return undefined
+    return language.t("settings.voice.audioStats", {
+      decoded: stats.decodedSamples.toLocaleString(),
+      queued: stats.queuedSamples.toLocaleString(),
+      played: stats.playedSamples.toLocaleString(),
+      dropped: stats.droppedSamples.toLocaleString(),
+      underruns: stats.underrunFrames.toLocaleString(),
+    })
+  }
+  const engineText = () => {
+    const engine = voiceStatus()?.engine
+    if (!engine) return undefined
+    return engine === "moshiRealtime"
+      ? language.t("settings.voice.engine.moshiRealtime")
+      : language.t("settings.voice.engine.lfm2Interleaved")
+  }
+
+  type EngineOption = { id: VoiceEngineMode; label: string }
+  const engineOptions = (): EngineOption[] => [
+    { id: "lfm2Interleaved", label: language.t("settings.voice.engineOption.lfm2Interleaved") },
+    { id: "moshiRealtime", label: language.t("settings.voice.engineOption.moshiRealtime") },
+  ]
+  const currentEngine = () => engineOptions().find((o) => o.id === localEngine())
 
   type DeviceOption = { id: Lfm2Device; label: string }
   const deviceOptions: DeviceOption[] = [
@@ -438,13 +514,33 @@ export const SettingsVoice: Component = () => {
               />
             </SettingsRow>
           </div>
+          <Show when={desktop}>
+            <div class="bg-surface-raised-base px-4 rounded-lg">
+              <SettingsRow
+                title={language.t("settings.voice.row.speaker.title")}
+                description={language.t("settings.voice.row.speaker.description")}
+              >
+                <Button variant="secondary" size="small" disabled={probing()} onClick={testSpeaker}>
+                  {probing()
+                    ? language.t("settings.voice.action.testingSpeaker")
+                    : language.t("settings.voice.action.testSpeaker")}
+                </Button>
+              </SettingsRow>
+            </div>
+          </Show>
+          <Show when={audioStatsText()}>
+            {(text) => <div class="text-12-regular text-text-weak px-1">{text()}</div>}
+          </Show>
+          <Show when={engineText()}>
+            {(text) => <div class="text-12-regular text-text-weak px-1">{text()}</div>}
+          </Show>
         </div>
 
         <Show when={!enabled()}>
           <div class="text-12-regular text-text-weak px-1">{language.t("settings.voice.off.hint")}</div>
         </Show>
 
-        {/* ---- Local LFM2-Audio model/delegation (native, Tauri store) ---- */}
+        {/* ---- Local voice model/delegation (native, Tauri store) ---- */}
         <Show when={showNativeModel()}>
           <div class="flex flex-col gap-1">
             <h3 class="text-14-medium text-text-strong pb-2">{language.t("settings.voice.section.lfm2")}</h3>
@@ -455,28 +551,74 @@ export const SettingsVoice: Component = () => {
                 </div>
               )}
             </Show>
+            <div class="bg-surface-raised-base px-4 rounded-lg">
+              <SettingsRow
+                title={language.t("settings.voice.row.engine.title")}
+                description={language.t("settings.voice.row.engine.description")}
+              >
+                <Select
+                  options={engineOptions()}
+                  current={currentEngine()}
+                  value={(o) => o.id}
+                  label={(o) => o.label}
+                  onSelect={(option) => option && updateLfm2({ engine: option.id })}
+                  variant="secondary"
+                  size="small"
+                  triggerVariant="settings"
+                />
+              </SettingsRow>
+            </div>
             <div class="bg-surface-raised-base px-4 py-3 rounded-lg flex flex-col gap-3">
-              <TextField
-                label={language.t("settings.voice.row.model.title")}
-                description={language.t("settings.voice.row.model.description")}
-                placeholder={DEFAULT_MODEL}
-                defaultValue={lfm2().model ?? DEFAULT_MODEL}
-                onFocusOut={(e: FocusEvent) => {
-                  const value = (e.currentTarget as HTMLInputElement).value.trim()
-                  updateLfm2({ model: value || undefined })
-                }}
-              />
-              <Link href={hfUrl()}>{language.t("settings.voice.row.model.viewOnHf")}</Link>
-              <TextField
-                label={language.t("settings.voice.row.revision.title")}
-                description={language.t("settings.voice.row.revision.description")}
-                placeholder="main"
-                defaultValue={lfm2().revision ?? ""}
-                onFocusOut={(e: FocusEvent) => {
-                  const value = (e.currentTarget as HTMLInputElement).value.trim()
-                  updateLfm2({ revision: value || undefined })
-                }}
-              />
+              <Show
+                when={localEngine() === "moshiRealtime"}
+                fallback={
+                  <>
+                    <TextField
+                      label={language.t("settings.voice.row.model.title")}
+                      description={language.t("settings.voice.row.model.description")}
+                      placeholder={DEFAULT_LFM2_MODEL}
+                      defaultValue={lfm2().model ?? DEFAULT_LFM2_MODEL}
+                      onFocusOut={(e: FocusEvent) => {
+                        const value = (e.currentTarget as HTMLInputElement).value.trim()
+                        updateLfm2({ model: value || undefined })
+                      }}
+                    />
+                    <Link href={hfUrl()}>{language.t("settings.voice.row.model.viewOnHf")}</Link>
+                    <TextField
+                      label={language.t("settings.voice.row.revision.title")}
+                      description={language.t("settings.voice.row.revision.description")}
+                      placeholder="main"
+                      defaultValue={lfm2().revision ?? ""}
+                      onFocusOut={(e: FocusEvent) => {
+                        const value = (e.currentTarget as HTMLInputElement).value.trim()
+                        updateLfm2({ revision: value || undefined })
+                      }}
+                    />
+                  </>
+                }
+              >
+                <TextField
+                  label={language.t("settings.voice.row.model.title")}
+                  description={language.t("settings.voice.row.moshiModel.description")}
+                  placeholder={DEFAULT_MOSHI_MODEL}
+                  defaultValue={lfm2().moshiModel ?? DEFAULT_MOSHI_MODEL}
+                  onFocusOut={(e: FocusEvent) => {
+                    const value = (e.currentTarget as HTMLInputElement).value.trim()
+                    updateLfm2({ moshiModel: value || undefined })
+                  }}
+                />
+                <Link href={hfUrl()}>{language.t("settings.voice.row.model.viewOnHf")}</Link>
+                <TextField
+                  label={language.t("settings.voice.row.revision.title")}
+                  description={language.t("settings.voice.row.revision.description")}
+                  placeholder="main"
+                  defaultValue={lfm2().moshiRevision ?? ""}
+                  onFocusOut={(e: FocusEvent) => {
+                    const value = (e.currentTarget as HTMLInputElement).value.trim()
+                    updateLfm2({ moshiRevision: value || undefined })
+                  }}
+                />
+              </Show>
               <TextField
                 label={language.t("settings.voice.row.hfToken.title")}
                 description={language.t("settings.voice.row.hfToken.description")}
@@ -497,11 +639,21 @@ export const SettingsVoice: Component = () => {
                 <div class="flex-1 min-w-0">
                   <TextField
                     label={language.t("settings.voice.row.modelDir.title")}
-                    description={language.t("settings.voice.row.modelDir.description")}
+                    description={
+                      localEngine() === "moshiRealtime"
+                        ? language.t("settings.voice.row.moshiModelDir.description")
+                        : language.t("settings.voice.row.modelDir.description")
+                    }
                     placeholder="/path/to/huggingface/snapshot"
-                    value={modelDirValue()}
-                    onChange={setModelDirEdit}
-                    onFocusOut={() => updateLfm2({ modelDir: modelDirValue().trim() || undefined })}
+                    value={selectedModelDirValue()}
+                    onChange={(value) =>
+                      localEngine() === "moshiRealtime" ? setMoshiModelDirEdit(value) : setModelDirEdit(value)
+                    }
+                    onFocusOut={() => {
+                      const dir = selectedModelDirValue().trim() || undefined
+                      if (localEngine() === "moshiRealtime") updateLfm2({ moshiModelDir: dir })
+                      else updateLfm2({ modelDir: dir })
+                    }}
                   />
                 </div>
                 <Show when={desktop}>
@@ -551,24 +703,27 @@ export const SettingsVoice: Component = () => {
                   }}
                 />
               </SettingsRow>
-              <SettingsRow
-                title={language.t("settings.voice.row.maxTokens.title")}
-                description={language.t("settings.voice.row.maxTokens.description")}
-              >
-                <TextField
-                  hideLabel
-                  label={language.t("settings.voice.row.maxTokens.title")}
-                  defaultValue={String(lfm2().maxTokens)}
-                  onFocusOut={(e: FocusEvent) => {
-                    const n = numberFromInput(e)
-                    if (n !== undefined && n >= 1) updateLfm2({ maxTokens: Math.floor(n) })
-                  }}
-                />
-              </SettingsRow>
+              <Show when={localEngine() === "lfm2Interleaved"}>
+                <SettingsRow
+                  title={language.t("settings.voice.row.maxTokens.title")}
+                  description={language.t("settings.voice.row.maxTokens.description")}
+                >
+                  <TextField
+                    hideLabel
+                    label={language.t("settings.voice.row.maxTokens.title")}
+                    defaultValue={String(lfm2().maxTokens)}
+                    onFocusOut={(e: FocusEvent) => {
+                      const n = numberFromInput(e)
+                      if (n !== undefined && n >= 1) updateLfm2({ maxTokens: Math.floor(n) })
+                    }}
+                  />
+                </SettingsRow>
+              </Show>
             </div>
           </div>
 
-          <div class="flex flex-col gap-1">
+          <Show when={localEngine() === "lfm2Interleaved"}>
+            <div class="flex flex-col gap-1">
             <h3 class="text-14-medium text-text-strong pb-2">{language.t("settings.voice.section.delegate")}</h3>
             <div class="bg-surface-raised-base px-4 rounded-lg">
               <SettingsRow
@@ -600,7 +755,8 @@ export const SettingsVoice: Component = () => {
                 </SettingsRow>
               </Show>
             </div>
-          </div>
+            </div>
+          </Show>
 
           <Show when={!desktop}>
             <div class="text-12-regular text-text-weak px-1">{language.t("settings.voice.lfm2.desktopOnly")}</div>

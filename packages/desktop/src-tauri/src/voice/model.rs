@@ -177,7 +177,7 @@ pub async fn voice_pick_model_dir(app: AppHandle) -> Result<Option<String>, Stri
     let picked = app
         .dialog()
         .file()
-        .set_title("Select LFM2-Audio model directory")
+        .set_title("Select local voice model directory")
         .blocking_pick_folder();
     match picked {
         Some(path) => Ok(Some(

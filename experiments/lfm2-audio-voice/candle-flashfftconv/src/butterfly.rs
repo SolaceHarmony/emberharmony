@@ -69,7 +69,13 @@ impl CustomOp2 for RowDft {
     fn name(&self) -> &'static str {
         "butterfly_row_dft"
     }
-    fn cpu_fwd(&self, xs: &CpuStorage, xl: &Layout, ds: &CpuStorage, dl: &Layout) -> Result<(CpuStorage, Shape)> {
+    fn cpu_fwd(
+        &self,
+        xs: &CpuStorage,
+        xl: &Layout,
+        ds: &CpuStorage,
+        dl: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
         let (b, h, n, l) = xl.shape().dims4()?;
         let x = contig_f32(xs, xl)?;
         let df = contig_f32(ds, dl)?; // [L,L,2]
@@ -105,7 +111,19 @@ impl CustomOp2 for RowDft {
         dl: &Layout,
     ) -> Result<(candle_core::MetalStorage, Shape)> {
         let (b, h, n, l) = xl.shape().dims4()?;
-        metal_util::dispatch_dft(xs, xl, ds, dl, SRC_ROW_DFT, "butterfly_row_dft_f32", b, h, n, l, true)
+        metal_util::dispatch_dft(
+            xs,
+            xl,
+            ds,
+            dl,
+            SRC_ROW_DFT,
+            "butterfly_row_dft_f32",
+            b,
+            h,
+            n,
+            l,
+            true,
+        )
     }
 }
 
@@ -142,7 +160,13 @@ impl CustomOp2 for Twiddle {
     fn name(&self) -> &'static str {
         "butterfly_twiddle"
     }
-    fn cpu_fwd(&self, xs: &CpuStorage, xl: &Layout, ts: &CpuStorage, tl: &Layout) -> Result<(CpuStorage, Shape)> {
+    fn cpu_fwd(
+        &self,
+        xs: &CpuStorage,
+        xl: &Layout,
+        ts: &CpuStorage,
+        tl: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
         let (b, h, n, l, _two) = xl.shape().dims5()?;
         let x = contig_f32(xs, xl)?;
         let tw = contig_f32(ts, tl)?; // [N,L,2]
@@ -173,7 +197,19 @@ impl CustomOp2 for Twiddle {
         tl: &Layout,
     ) -> Result<(candle_core::MetalStorage, Shape)> {
         let (b, h, n, l, _two) = xl.shape().dims5()?;
-        metal_util::dispatch_dft(xs, xl, ts, tl, SRC_TWIDDLE, "butterfly_twiddle_f32", b, h, n, l, true)
+        metal_util::dispatch_dft(
+            xs,
+            xl,
+            ts,
+            tl,
+            SRC_TWIDDLE,
+            "butterfly_twiddle_f32",
+            b,
+            h,
+            n,
+            l,
+            true,
+        )
     }
 }
 
@@ -215,7 +251,13 @@ impl CustomOp2 for ColDft {
     fn name(&self) -> &'static str {
         "butterfly_col_dft"
     }
-    fn cpu_fwd(&self, xs: &CpuStorage, xl: &Layout, ds: &CpuStorage, dl: &Layout) -> Result<(CpuStorage, Shape)> {
+    fn cpu_fwd(
+        &self,
+        xs: &CpuStorage,
+        xl: &Layout,
+        ds: &CpuStorage,
+        dl: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
         let (b, h, n, l, _two) = xl.shape().dims5()?;
         let x = contig_f32(xs, xl)?;
         let df = contig_f32(ds, dl)?; // [N,N,2]
@@ -252,14 +294,31 @@ impl CustomOp2 for ColDft {
         dl: &Layout,
     ) -> Result<(candle_core::MetalStorage, Shape)> {
         let (b, h, n, l, _two) = xl.shape().dims5()?;
-        metal_util::dispatch_dft(xs, xl, ds, dl, SRC_COL_DFT, "butterfly_col_dft_f32", b, h, n, l, true)
+        metal_util::dispatch_dft(
+            xs,
+            xl,
+            ds,
+            dl,
+            SRC_COL_DFT,
+            "butterfly_col_dft_f32",
+            b,
+            h,
+            n,
+            l,
+            true,
+        )
     }
 }
 
 /// Forward Monarch butterfly FFT of `x` `[B, H, N, L]` (real) → `[B, H, N, L, 2]`
 /// (complex). `d_f_n` `[N,N,2]`, `d_f_l` `[L,L,2]` are DFT matrices and `twiddles`
 /// `[N,L,2]` the twiddle factors (see [`fft_matrix`] / [`twiddle_factors_fft`]).
-pub fn butterfly_fft_forward(x: &Tensor, d_f_n: &Tensor, d_f_l: &Tensor, twiddles: &Tensor) -> Result<Tensor> {
+pub fn butterfly_fft_forward(
+    x: &Tensor,
+    d_f_n: &Tensor,
+    d_f_l: &Tensor,
+    twiddles: &Tensor,
+) -> Result<Tensor> {
     let x = x.contiguous()?;
     let d_f_l = d_f_l.contiguous()?;
     let d_f_n = d_f_n.contiguous()?;
@@ -336,7 +395,13 @@ impl CustomOp2 for RowIDftReal {
     fn name(&self) -> &'static str {
         "butterfly_row_idft_real"
     }
-    fn cpu_fwd(&self, xs: &CpuStorage, xl: &Layout, ds: &CpuStorage, dl: &Layout) -> Result<(CpuStorage, Shape)> {
+    fn cpu_fwd(
+        &self,
+        xs: &CpuStorage,
+        xl: &Layout,
+        ds: &CpuStorage,
+        dl: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
         let (b, h, n, l, _two) = xl.shape().dims5()?;
         let x = contig_f32(xs, xl)?;
         let df = contig_f32(ds, dl)?; // [L,L,2]
@@ -370,7 +435,19 @@ impl CustomOp2 for RowIDftReal {
         dl: &Layout,
     ) -> Result<(candle_core::MetalStorage, Shape)> {
         let (b, h, n, l, _two) = xl.shape().dims5()?;
-        metal_util::dispatch_dft(xs, xl, ds, dl, SRC_ROW_IDFT_REAL, "butterfly_row_idft_real_f32", b, h, n, l, false)
+        metal_util::dispatch_dft(
+            xs,
+            xl,
+            ds,
+            dl,
+            SRC_ROW_IDFT_REAL,
+            "butterfly_row_idft_real_f32",
+            b,
+            h,
+            n,
+            l,
+            false,
+        )
     }
 }
 
@@ -418,7 +495,12 @@ pub fn complex_mul(a: &Tensor, b: &Tensor) -> Result<Tensor> {
 /// (real). Mirror of [`butterfly_fft_forward`]: col-IDFT → conj-twiddle →
 /// row-IDFT (real, `1/(N·L)`-scaled). `id_f_n`/`id_f_l` from [`ifft_matrix`],
 /// `ifft_twiddles` from [`twiddle_factors_ifft`].
-pub fn butterfly_fft_inverse(z: &Tensor, id_f_n: &Tensor, id_f_l: &Tensor, ifft_twiddles: &Tensor) -> Result<Tensor> {
+pub fn butterfly_fft_inverse(
+    z: &Tensor,
+    id_f_n: &Tensor,
+    id_f_l: &Tensor,
+    ifft_twiddles: &Tensor,
+) -> Result<Tensor> {
     let z = z.contiguous()?;
     let id_f_n = id_f_n.contiguous()?;
     let id_f_l = id_f_l.contiguous()?;
@@ -457,7 +539,8 @@ pub fn monarch_conv(
 /// (round-to-nearest-even), so this round-trip matches CUDA's `_rn` bit-for-bit and
 /// runs natively on both CPU and Metal.
 fn bf16_round(t: &Tensor) -> Result<Tensor> {
-    t.to_dtype(candle_core::DType::BF16)?.to_dtype(candle_core::DType::F32)
+    t.to_dtype(candle_core::DType::BF16)?
+        .to_dtype(candle_core::DType::F32)
 }
 
 /// **Faithful** FlashFFTConv long convolution — the same [`monarch_conv`] math run
@@ -547,12 +630,23 @@ mod tests {
     fn row_dft_matches_naive() {
         let dev = Device::Cpu;
         let (b, h, n, l) = (1usize, 2, 3, 8);
-        let x: Vec<f32> = (0..b * h * n * l).map(|i| (i as f32 * 0.13).sin()).collect();
+        let x: Vec<f32> = (0..b * h * n * l)
+            .map(|i| (i as f32 * 0.13).sin())
+            .collect();
         let xt = Tensor::from_vec(x.clone(), (b, h, n, l), &dev).unwrap();
         let d_f_l = fft_matrix(l, &dev).unwrap();
-        let got: Vec<f32> = xt.apply_op2(&d_f_l, RowDft).unwrap().flatten_all().unwrap().to_vec1().unwrap();
+        let got: Vec<f32> = xt
+            .apply_op2(&d_f_l, RowDft)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
         let exp = naive_row_dft(&x, b, h, n, l);
-        let maxd = got.iter().zip(exp.iter()).fold(0f32, |m, (a, e)| m.max((a - e).abs()));
+        let maxd = got
+            .iter()
+            .zip(exp.iter())
+            .fold(0f32, |m, (a, e)| m.max((a - e).abs()));
         assert!(maxd < 1e-4, "row DFT vs naive max diff {maxd}");
     }
 
@@ -567,7 +661,9 @@ mod tests {
             }
         };
         let (b, h, n, l) = (2usize, 3, 16, 16);
-        let x: Vec<f32> = (0..b * h * n * l).map(|i| ((i * 11 % 17) as f32 * 0.05) - 0.4).collect();
+        let x: Vec<f32> = (0..b * h * n * l)
+            .map(|i| ((i * 11 % 17) as f32 * 0.05) - 0.4)
+            .collect();
         let run = |dev: &Device| -> Vec<f32> {
             let xt = Tensor::from_vec(x.clone(), (b, h, n, l), dev).unwrap();
             let d_f_l = fft_matrix(l, dev).unwrap();
@@ -583,7 +679,10 @@ mod tests {
         let cpu = run(&Device::Cpu);
         let met = run(&mdev);
         assert_eq!(cpu.len(), met.len());
-        let maxd = cpu.iter().zip(met.iter()).fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+        let maxd = cpu
+            .iter()
+            .zip(met.iter())
+            .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
         assert!(maxd < 1e-4, "forward FFT metal vs cpu max diff {maxd}");
         eprintln!("butterfly fft forward: metal == cpu, max diff {maxd:.2e}");
     }
@@ -623,7 +722,10 @@ mod tests {
         )
         .unwrap();
         let got: Vec<f32> = xr.flatten_all().unwrap().to_vec1().unwrap();
-        let maxd = got.iter().zip(x.iter()).fold(0f32, |m, (a, e)| m.max((a - e).abs()));
+        let maxd = got
+            .iter()
+            .zip(x.iter())
+            .fold(0f32, |m, (a, e)| m.max((a - e).abs()));
         assert!(maxd < 1e-4, "ifft(fft(x)) != x, max diff {maxd}");
         eprintln!("ifft(fft(x)) == x, max diff {maxd:.2e}");
     }
@@ -635,7 +737,9 @@ mod tests {
         let m = n * l;
         // Time-domain signals (length M).
         let u_time: Vec<f32> = (0..m).map(|i| (i as f32 * 0.21).sin()).collect();
-        let k_time: Vec<f32> = (0..m).map(|i| (i as f32 * 0.11 + 1.0).cos() * 0.5).collect();
+        let k_time: Vec<f32> = (0..m)
+            .map(|i| (i as f32 * 0.11 + 1.0).cos() * 0.5)
+            .collect();
         // The Monarch transform reads input column-major: tensor[ni,li] (row-major
         // ni*L+li) holds time index li*N + ni.
         let lay = |t: &[f32]| -> Vec<f32> {
@@ -649,8 +753,16 @@ mod tests {
         };
         let ut = Tensor::from_vec(lay(&u_time), (1, 1, n, l), &dev).unwrap();
         let kt = Tensor::from_vec(lay(&k_time), (1, 1, n, l), &dev).unwrap();
-        let (dfn, dfl, tw) = (fft_matrix(n, &dev).unwrap(), fft_matrix(l, &dev).unwrap(), twiddle_factors_fft(n, l, &dev).unwrap());
-        let (idfn, idfl, itw) = (ifft_matrix(n, &dev).unwrap(), ifft_matrix(l, &dev).unwrap(), twiddle_factors_ifft(n, l, &dev).unwrap());
+        let (dfn, dfl, tw) = (
+            fft_matrix(n, &dev).unwrap(),
+            fft_matrix(l, &dev).unwrap(),
+            twiddle_factors_fft(n, l, &dev).unwrap(),
+        );
+        let (idfn, idfl, itw) = (
+            ifft_matrix(n, &dev).unwrap(),
+            ifft_matrix(l, &dev).unwrap(),
+            twiddle_factors_ifft(n, l, &dev).unwrap(),
+        );
         let k_f = butterfly_fft_forward(&kt, &dfn, &dfl, &tw).unwrap();
         let y = monarch_conv(&ut, &k_f, &dfn, &dfl, &tw, &idfn, &idfl, &itw).unwrap();
         let out_flat: Vec<f32> = y.flatten_all().unwrap().to_vec1().unwrap();
@@ -662,8 +774,14 @@ mod tests {
             }
         }
         let exp = circular_conv(&u_time, &k_time);
-        let maxd = y_time.iter().zip(exp.iter()).fold(0f32, |mm, (a, e)| mm.max((a - e).abs()));
-        assert!(maxd < 1e-3, "monarch conv != circular conv, max diff {maxd}");
+        let maxd = y_time
+            .iter()
+            .zip(exp.iter())
+            .fold(0f32, |mm, (a, e)| mm.max((a - e).abs()));
+        assert!(
+            maxd < 1e-3,
+            "monarch conv != circular conv, max diff {maxd}"
+        );
         eprintln!("monarch_conv == circular conv (col-major time order), max diff {maxd:.2e}");
     }
 
@@ -690,8 +808,16 @@ mod tests {
         };
         let ut = Tensor::from_vec(lay(&u_time), (1, 1, n, l), &dev).unwrap();
         let kt = Tensor::from_vec(lay(&k_time), (1, 1, n, l), &dev).unwrap();
-        let (dfn, dfl, tw) = (fft_matrix(n, &dev).unwrap(), fft_matrix(l, &dev).unwrap(), twiddle_factors_fft(n, l, &dev).unwrap());
-        let (idfn, idfl, itw) = (ifft_matrix(n, &dev).unwrap(), ifft_matrix(l, &dev).unwrap(), twiddle_factors_ifft(n, l, &dev).unwrap());
+        let (dfn, dfl, tw) = (
+            fft_matrix(n, &dev).unwrap(),
+            fft_matrix(l, &dev).unwrap(),
+            twiddle_factors_fft(n, l, &dev).unwrap(),
+        );
+        let (idfn, idfl, itw) = (
+            ifft_matrix(n, &dev).unwrap(),
+            ifft_matrix(l, &dev).unwrap(),
+            twiddle_factors_ifft(n, l, &dev).unwrap(),
+        );
         let k_f = butterfly_fft_forward(&kt, &dfn, &dfl, &tw).unwrap();
 
         let read = |y: &Tensor| -> Vec<f32> {
@@ -705,10 +831,15 @@ mod tests {
             o
         };
         let y_f32 = read(&monarch_conv(&ut, &k_f, &dfn, &dfl, &tw, &idfn, &idfl, &itw).unwrap());
-        let y_bf16 = read(&monarch_conv_bf16(&ut, &k_f, &dfn, &dfl, &tw, &idfn, &idfl, &itw).unwrap());
+        let y_bf16 =
+            read(&monarch_conv_bf16(&ut, &k_f, &dfn, &dfl, &tw, &idfn, &idfl, &itw).unwrap());
 
         let exp = circular_conv(&u_time, &k_time); // f64 ground truth
-        let err = |y: &[f32]| y.iter().zip(exp.iter()).fold(0f32, |mx, (a, e)| mx.max((a - e).abs()));
+        let err = |y: &[f32]| {
+            y.iter()
+                .zip(exp.iter())
+                .fold(0f32, |mx, (a, e)| mx.max((a - e).abs()))
+        };
         let (e_f32, e_bf16) = (err(&y_f32), err(&y_bf16));
         eprintln!(
             "circular conv (M={m}) vs f64 truth:  f32 {e_f32:.3e}   bf16-faithful {e_bf16:.3e}   (bf16 is {:.0}x the f32 error)",
@@ -716,7 +847,10 @@ mod tests {
         );
         // The faithful bf16 regime is far coarser than f32 against the true conv —
         // that coarseness is exactly what the trained weights were fit to.
-        assert!(e_f32 < e_bf16, "clean f32 ({e_f32:e}) should be closer to truth than bf16 ({e_bf16:e})");
+        assert!(
+            e_f32 < e_bf16,
+            "clean f32 ({e_f32:e}) should be closer to truth than bf16 ({e_bf16:e})"
+        );
     }
 
     #[cfg(feature = "metal")]
@@ -730,13 +864,25 @@ mod tests {
             }
         };
         let (b, h, n, l) = (2usize, 2, 16, 16);
-        let u: Vec<f32> = (0..b * h * n * l).map(|i| ((i * 13 % 19) as f32 * 0.05) - 0.4).collect();
-        let kf: Vec<f32> = (0..b * h * n * l * 2).map(|i| ((i * 7 % 11) as f32 * 0.03) - 0.15).collect();
+        let u: Vec<f32> = (0..b * h * n * l)
+            .map(|i| ((i * 13 % 19) as f32 * 0.05) - 0.4)
+            .collect();
+        let kf: Vec<f32> = (0..b * h * n * l * 2)
+            .map(|i| ((i * 7 % 11) as f32 * 0.03) - 0.15)
+            .collect();
         let run = |dev: &Device| -> Vec<f32> {
             let ut = Tensor::from_vec(u.clone(), (b, h, n, l), dev).unwrap();
             let k_f = Tensor::from_vec(kf.clone(), (b, h, n, l, 2), dev).unwrap();
-            let (dfn, dfl, tw) = (fft_matrix(n, dev).unwrap(), fft_matrix(l, dev).unwrap(), twiddle_factors_fft(n, l, dev).unwrap());
-            let (idfn, idfl, itw) = (ifft_matrix(n, dev).unwrap(), ifft_matrix(l, dev).unwrap(), twiddle_factors_ifft(n, l, dev).unwrap());
+            let (dfn, dfl, tw) = (
+                fft_matrix(n, dev).unwrap(),
+                fft_matrix(l, dev).unwrap(),
+                twiddle_factors_fft(n, l, dev).unwrap(),
+            );
+            let (idfn, idfl, itw) = (
+                ifft_matrix(n, dev).unwrap(),
+                ifft_matrix(l, dev).unwrap(),
+                twiddle_factors_ifft(n, l, dev).unwrap(),
+            );
             monarch_conv(&ut, &k_f, &dfn, &dfl, &tw, &idfn, &idfl, &itw)
                 .unwrap()
                 .flatten_all()
@@ -746,7 +892,10 @@ mod tests {
         };
         let cpu = run(&Device::Cpu);
         let met = run(&mdev);
-        let maxd = cpu.iter().zip(met.iter()).fold(0f32, |mm, (a, b)| mm.max((a - b).abs()));
+        let maxd = cpu
+            .iter()
+            .zip(met.iter())
+            .fold(0f32, |mm, (a, b)| mm.max((a - b).abs()));
         assert!(maxd < 1e-4, "monarch conv metal vs cpu max diff {maxd}");
         eprintln!("monarch_conv: metal == cpu, max diff {maxd:.2e}");
     }
