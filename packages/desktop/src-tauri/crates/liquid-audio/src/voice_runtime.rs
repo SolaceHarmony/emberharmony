@@ -18,7 +18,9 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crossbeam_channel::{bounded, Receiver, Sender};
 use serde::{Deserialize, Serialize};
 
-use crate::{RealtimeFramePipeline, RealtimePipeline, Utterance, VoiceEngine, VoiceEvent};
+use crate::{
+    FrameSubmitError, RealtimeFramePipeline, RealtimePipeline, Utterance, VoiceEngine, VoiceEvent,
+};
 
 type Res<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 type Ring = Arc<PcmRing>;
@@ -1001,15 +1003,15 @@ fn vad_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
 fn frame_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
     pipe: &RealtimeFramePipeline,
     mic: &Mic,
-    speaker: &Ring,
+    _speaker: &Ring,
     playback_flush: &Arc<AtomicBool>,
-    playback: &Playback,
+    _playback: &Playback,
     assistant: &Arc<AtomicBool>,
     sink: &Arc<Mutex<S>>,
     stop: &Arc<AtomicBool>,
     interrupt: &Arc<AtomicBool>,
     mic_enabled: &Arc<AtomicBool>,
-    cfg: RuntimeConfig,
+    _cfg: RuntimeConfig,
     in_rate: u32,
 ) {
     let frame = pipe.config();
@@ -1017,10 +1019,20 @@ fn frame_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
     let mut model = Vec::with_capacity(frame.frame_size * 2);
     let mut resampler = InputFrameResampler::new(in_rate, frame.sample_rate);
     let mut backpressure_reported = false;
+    let interval = Duration::from_secs_f64(frame.frame_size as f64 / frame.sample_rate as f64);
+    let mut next_silence = Instant::now() + interval;
 
+    // Full-duplex frame loop (Moshi semantics): the model receives user audio
+    // continuously, regardless of whether the assistant is speaking. No VAD
+    // gating, no mic zeroing, no barge-in resets. The multistream LM handles
+    // turn-taking natively — it processes user + assistant channels every frame.
+    // Echo/AEC belongs below the model (hardware/WebRTC), not as model-input
+    // zeroing. Explicit Stop/Interrupt are session-level controls only.
     while !stop.load(Ordering::SeqCst) {
         let has_input = mic.wait_for_input(Duration::from_millis(10));
 
+        // Session-level interrupt (Stop button / typed input) — flushes
+        // playback and resets the pipeline, but does NOT zero mic input.
         if interrupt.swap(false, Ordering::SeqCst) {
             pipe.interrupt();
             playback_flush.store(true, Ordering::SeqCst);
@@ -1031,59 +1043,59 @@ fn frame_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
             }
         }
 
+        // Mic pause (typed input / mic toggle) — stop capturing, but don't
+        // feed silence to the model. When paused, the model simply doesn't
+        // receive new frames; when resumed, it picks up the live stream.
         if !mic_enabled.load(Ordering::SeqCst) {
             mic.clear();
             input.clear();
-            model.clear();
             continue;
         }
 
         if !has_input && mic.len() == 0 {
-            continue;
-        }
-
-        let before = input.len();
-        mic.drain_into(&mut input, (in_rate as usize / 4).max(1));
-        if input.len() == before {
-            continue;
-        }
-
-        let active = reference_audio_active(assistant, playback, speaker);
-        let threshold = reference_vad_threshold(cfg.vad_threshold, assistant, playback, speaker);
-        let level = rms(&input[before..]);
-        let interrupting = active && cfg.can_interrupt && level > threshold;
-        if interrupting {
-            pipe.interrupt();
-            playback_flush.store(true, Ordering::SeqCst);
-            assistant.store(false, Ordering::SeqCst);
-            if !emit_or_stop(sink, stop, RuntimeEvent::State(SessionState::Listening)) {
-                return;
+            // No new audio from the native callback. Feed at most one silence
+            // frame per model frame interval so the stream clock can advance
+            // without flooding the bounded inference queue.
+            let now = Instant::now();
+            if now < next_silence {
+                continue;
+            }
+            model.resize(model.len() + frame.frame_size, 0.0);
+            next_silence = now + interval;
+        } else {
+            let before = input.len();
+            mic.drain_into(&mut input, (in_rate as usize / 4).max(1));
+            if input.len() == before && mic.len() == 0 {
+                continue;
+            } else {
+                let chunk = input.split_off(before);
+                // Always feed real mic audio — no zeroing, no VAD gating.
+                model.extend(resampler.process(&chunk));
             }
         }
-
-        let feed_silence = active && !interrupting;
-        let chunk = input.split_off(before);
-        let chunk = if feed_silence {
-            vec![0.0; chunk.len()]
-        } else {
-            chunk
-        };
-        model.extend(resampler.process(&chunk));
 
         while model.len() >= frame.frame_size {
             let next = model[..frame.frame_size].to_vec();
             model.drain(..frame.frame_size);
-            if pipe.submit_frame(next) {
-                backpressure_reported = false;
-                continue;
-            }
-            pipe.interrupt();
-            model.clear();
-            if !backpressure_reported {
-                backpressure_reported = true;
-                if !emit_ready(sink, stop, mic_enabled) {
-                    return;
+            match pipe.try_submit_frame(next) {
+                Ok(()) => {
+                    backpressure_reported = false;
+                    next_silence = Instant::now() + interval;
+                    continue;
                 }
+                Err(FrameSubmitError::Full) => {
+                    // Stay realtime and nonblocking: drop buffered capture
+                    // until the model catches up. Queue pressure is not a
+                    // semantic interruption and must not reset Mimi/LM state.
+                    model.clear();
+                    if !backpressure_reported {
+                        backpressure_reported = true;
+                        if !emit_ready(sink, stop, mic_enabled) {
+                            return;
+                        }
+                    }
+                }
+                Err(FrameSubmitError::Disconnected | FrameSubmitError::WrongSize) => return,
             }
             break;
         }

@@ -151,6 +151,13 @@ enum FrameCommand {
     Interrupt { epoch: u64 },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameSubmitError {
+    WrongSize,
+    Full,
+    Disconnected,
+}
+
 struct QueuedUtterance {
     utt: Utterance,
     epoch: u64,
@@ -398,15 +405,20 @@ impl RealtimeFramePipelineHandle {
         self.cfg
     }
 
-    pub fn submit_frame(&self, pcm: Vec<f32>) -> bool {
+    pub fn try_submit_frame(&self, pcm: Vec<f32>) -> Result<(), FrameSubmitError> {
         if pcm.len() != self.cfg.frame_size {
-            return false;
+            return Err(FrameSubmitError::WrongSize);
         }
         let epoch = self.epoch.load(Ordering::Acquire);
         match self.frame_tx.try_send(FrameCommand::Pcm { pcm, epoch }) {
-            Ok(()) => true,
-            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => false,
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => Err(FrameSubmitError::Full),
+            Err(TrySendError::Disconnected(_)) => Err(FrameSubmitError::Disconnected),
         }
+    }
+
+    pub fn submit_frame(&self, pcm: Vec<f32>) -> bool {
+        self.try_submit_frame(pcm).is_ok()
     }
 
     pub fn interrupt(&self) {
@@ -607,18 +619,23 @@ impl RealtimeFramePipeline {
         self.cfg
     }
 
-    pub fn submit_frame(&self, pcm: Vec<f32>) -> bool {
+    pub fn try_submit_frame(&self, pcm: Vec<f32>) -> Result<(), FrameSubmitError> {
         if pcm.len() != self.cfg.frame_size {
-            return false;
+            return Err(FrameSubmitError::WrongSize);
         }
         let Some(tx) = self.frame_tx.as_ref() else {
-            return false;
+            return Err(FrameSubmitError::Disconnected);
         };
         let epoch = self.epoch.load(Ordering::Acquire);
         match tx.try_send(FrameCommand::Pcm { pcm, epoch }) {
-            Ok(()) => true,
-            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => false,
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => Err(FrameSubmitError::Full),
+            Err(TrySendError::Disconnected(_)) => Err(FrameSubmitError::Disconnected),
         }
+    }
+
+    pub fn submit_frame(&self, pcm: Vec<f32>) -> bool {
+        self.try_submit_frame(pcm).is_ok()
     }
 
     pub fn interrupt(&self) {

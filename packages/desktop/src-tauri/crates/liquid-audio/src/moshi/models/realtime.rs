@@ -393,19 +393,34 @@ pub fn realtime_moshi_files(dir: &Path) -> Result<Option<RealtimeMoshiFiles>> {
                 .unwrap_or(default)
                 .to_string()
         };
+        let model_type = value
+            .get("model_type")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| {
+                lm.and_then(|lm| lm.get("model_type"))
+                    .and_then(serde_json::Value::as_str)
+            })
+            .unwrap_or("moshi")
+            .to_string();
+        if model_type != "moshi" {
+            return Err(Error::Msg(format!(
+                "native realtime Moshi only supports plain `moshi` checkpoints; `{model_type}` needs the upstream Python conditioning/streaming path"
+            )));
+        }
+        let conditioned = value.get("conditioners").is_some()
+            || value.get("fuser").is_some()
+            || lm.is_some_and(|lm| lm.get("conditioners").is_some() || lm.get("fuser").is_some());
+        if conditioned {
+            return Err(Error::Msg(
+                "native realtime Moshi does not yet implement Liquid's condition_tensors/CFG fuser path; use an unconditioned Moshiko Candle snapshot"
+                    .into(),
+            ));
+        }
         (
             name("moshi_name", DEFAULT_MOSHI_NAME),
             name("mimi_name", DEFAULT_MIMI_NAME),
             name("tokenizer_name", DEFAULT_TEXT_TOKENIZER_NAME),
-            value
-                .get("model_type")
-                .and_then(serde_json::Value::as_str)
-                .or_else(|| {
-                    lm.and_then(|lm| lm.get("model_type"))
-                        .and_then(serde_json::Value::as_str)
-                })
-                .unwrap_or("moshi")
-                .to_string(),
+            model_type,
             RealtimeMoshiParams::from_lm_gen_config(value.get("lm_gen_config"))?,
         )
     } else {
@@ -557,6 +572,43 @@ mod tests {
         let err = realtime_moshi_files(&dir).unwrap_err().to_string();
         assert!(err.contains("PyTorch weight layout"), "{err}");
         assert!(err.contains("kyutai/moshiko-candle-bf16"), "{err}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn realtime_moshi_files_rejects_conditioned_model_types() {
+        let dir = temp_dir("emberharmony-moshi-conditioned");
+        std::fs::write(dir.join("config.json"), r#"{ "model_type": "hibiki" }"#).unwrap();
+        write_candle_moshi(&dir.join(DEFAULT_MOSHI_NAME));
+        touch(&dir.join(DEFAULT_MIMI_NAME));
+        touch(&dir.join(DEFAULT_TEXT_TOKENIZER_NAME));
+
+        let err = realtime_moshi_files(&dir).unwrap_err().to_string();
+        assert!(err.contains("plain `moshi`"), "{err}");
+        assert!(err.contains("upstream Python conditioning"), "{err}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn realtime_moshi_files_rejects_conditioner_fuser_config() {
+        let dir = temp_dir("emberharmony-moshi-fuser");
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{
+                "model_type": "moshi",
+                "lm_config": {
+                    "conditioners": { "description": {} },
+                    "fuser": { "sum": ["description"] }
+                }
+            }"#,
+        )
+        .unwrap();
+        write_candle_moshi(&dir.join(DEFAULT_MOSHI_NAME));
+        touch(&dir.join(DEFAULT_MIMI_NAME));
+        touch(&dir.join(DEFAULT_TEXT_TOKENIZER_NAME));
+
+        let err = realtime_moshi_files(&dir).unwrap_err().to_string();
+        assert!(err.contains("condition_tensors/CFG"), "{err}");
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

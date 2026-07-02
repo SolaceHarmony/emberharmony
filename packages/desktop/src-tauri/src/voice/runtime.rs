@@ -25,7 +25,7 @@ use futures::StreamExt;
 use liquid_audio::moshi::models::{realtime_moshi_files, safetensors_floating_dtype};
 use liquid_audio::{
     AudioStatsSnapshot, ExternalAudioInput, ExternalAudioInputWriter, ExternalAudioOutput,
-    GenParams, Lfm2VoiceEngine, MoshiVoiceEngine, RealtimeFramePipeline,
+    FrameSubmitError, GenParams, Lfm2VoiceEngine, MoshiVoiceEngine, RealtimeFramePipeline,
     RealtimeFramePipelineHandle, RealtimePipeline, RealtimePipelineHandle, RuntimeConfig,
     RuntimeEvent, SessionState, Utterance, VoiceEngine, VoiceEvent as RealtimeEvent,
     VoiceRuntime as Lfm2Runtime, from_pretrained,
@@ -1593,9 +1593,9 @@ async fn native_livekit_agent_frame_mic_loop(
     channel: UiChannel,
     done: Arc<AtomicBool>,
     mic_enabled: Arc<AtomicBool>,
-    playback: Arc<LiveKitPlaybackReference>,
-    vad_threshold: f32,
-    can_interrupt_playback: bool,
+    _playback: Arc<LiveKitPlaybackReference>,
+    _vad_threshold: f32,
+    _can_interrupt_playback: bool,
     cancel: Arc<AtomicBool>,
 ) {
     let mut stream = NativeAudioStream::new(
@@ -1623,7 +1623,9 @@ async fn native_livekit_agent_frame_mic_loop(
             break;
         };
         if !mic_enabled.load(Ordering::SeqCst) {
-            model.clear();
+            // Mic paused — stop feeding frames but keep the loop alive.
+            // Don't clear the model buffer; when mic resumes, we pick up
+            // the live stream. Moshi handles silence frames natively.
             continue;
         }
         if audio.sample_rate == 0 {
@@ -1637,53 +1639,44 @@ async fn native_livekit_agent_frame_mic_loop(
             break;
         }
         let pcm = i16_to_f32(audio.data.as_ref());
-        let rms = rms_f32(&pcm);
-        let threshold = playback.reference_vad_threshold(vad_threshold);
-        let interrupting = playback.active() && can_interrupt_playback && rms > threshold;
-        if interrupting {
-            handle.interrupt();
-            playback.clear();
-            if !send_livekit(
-                &channel,
-                &done,
-                VoiceEvent::State {
-                    state: VoiceState::Listening,
-                },
-            ) {
-                break;
-            }
-        }
-        let feed = if playback.active() && !interrupting {
-            vec![0.0; pcm.len()]
-        } else {
-            pcm
-        };
+        // Full-duplex Moshi semantics: always feed real mic audio to the model.
+        // No VAD gating, no mic zeroing, no barge-in resets. The multistream LM
+        // handles turn-taking natively. Echo/AEC is handled by WebRTC's
+        // PlatformAudio (AEC/NS/AGC), not by zeroing model input.
+        // Explicit Stop/Interrupt are session-level controls only.
         let rate = audio.sample_rate as u32;
         if resampler.from() != rate {
             resampler = LiveKitFrameResampler::new(rate, frame.sample_rate);
             model.clear();
         }
-        model.extend(resampler.process(&feed));
+        model.extend(resampler.process(&pcm));
         while model.len() >= frame.frame_size {
             let next = model[..frame.frame_size].to_vec();
             model.drain(..frame.frame_size);
-            if handle.submit_frame(next) {
-                backpressure_reported = false;
-                continue;
-            }
-            handle.interrupt();
-            model.clear();
-            if !backpressure_reported {
-                backpressure_reported = true;
-                if !send_livekit(
-                    &channel,
-                    &done,
-                    VoiceEvent::State {
-                        state: VoiceState::Listening,
-                    },
-                ) {
-                    break;
+            match handle.try_submit_frame(next) {
+                Ok(()) => {
+                    backpressure_reported = false;
+                    continue;
                 }
+                Err(FrameSubmitError::Full) => {
+                    // Queue pressure is timing pressure, not a semantic
+                    // interruption. Keep the Moshi stream state intact and
+                    // drop buffered capture until inference catches up.
+                    model.clear();
+                    if !backpressure_reported {
+                        backpressure_reported = true;
+                        if !send_livekit(
+                            &channel,
+                            &done,
+                            VoiceEvent::State {
+                                state: VoiceState::Listening,
+                            },
+                        ) {
+                            break;
+                        }
+                    }
+                }
+                Err(FrameSubmitError::Disconnected | FrameSubmitError::WrongSize) => break,
             }
             break;
         }

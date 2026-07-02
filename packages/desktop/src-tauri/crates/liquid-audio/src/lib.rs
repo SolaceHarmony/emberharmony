@@ -33,7 +33,7 @@ pub use loader::{from_pretrained, from_pretrained_hub};
 pub use model::lfm2_audio::{GenParams, GenToken, LFM2AudioModel};
 pub use processor::{ChatState, LFM2AudioProcessor};
 pub use realtime::{
-    FrameConfig, Lfm2VoiceEngine, MoshiVoiceEngine, RealtimeFramePipeline,
+    FrameConfig, FrameSubmitError, Lfm2VoiceEngine, MoshiVoiceEngine, RealtimeFramePipeline,
     RealtimeFramePipelineHandle, RealtimePipeline, RealtimePipelineHandle, Utterance, VoiceEngine,
     VoiceEvent,
 };

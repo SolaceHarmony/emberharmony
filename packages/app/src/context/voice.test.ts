@@ -97,6 +97,20 @@ describe("desktop voice context boundary", () => {
     expect(frame).not.toContain("std::thread::sleep")
   })
 
+  test("local Moshi frame loop feeds live mic audio without VAD gating", async () => {
+    const text = await root("packages/desktop/src-tauri/crates/liquid-audio/src/voice_runtime.rs")
+    const frame = between(text, "fn frame_loop", "struct InputFrameResampler")
+    const automatic = between(frame, "if !mic_enabled.load(Ordering::SeqCst)", "while model.len() >= frame.frame_size")
+
+    expect(frame).toContain("Full-duplex frame loop (Moshi semantics)")
+    expect(frame).toContain("model.extend(resampler.process(&chunk))")
+    expect(automatic).not.toContain("reference_audio_active")
+    expect(automatic).not.toContain("reference_vad_threshold")
+    expect(automatic).not.toContain("let interrupting")
+    expect(automatic).not.toContain("vec![0.0; chunk.len()]")
+    expect(automatic).not.toContain("pipe.interrupt()")
+  })
+
   test("native control commands wake sleeping mic loops immediately", async () => {
     const text = await root("packages/desktop/src-tauri/crates/liquid-audio/src/voice_runtime.rs")
     const runtime = between(text, "pub struct VoiceRuntime", "impl Drop for VoiceRuntime")
@@ -202,21 +216,25 @@ describe("desktop voice context boundary", () => {
     expect(text).not.toContain("event_tx.send(")
   })
 
-  test("Moshi frame queue pressure resyncs instead of surfacing fatal voice errors", async () => {
+  test("Moshi frame queue pressure stays nonblocking without resetting the stream", async () => {
     const voice = await root("packages/desktop/src-tauri/crates/liquid-audio/src/voice_runtime.rs")
     const runtime = await root("packages/desktop/src-tauri/src/voice/runtime.rs")
     const local = between(voice, "fn frame_loop", "struct InputFrameResampler")
     const livekit = between(runtime, "async fn native_livekit_agent_frame_mic_loop", "struct LiveKitFrameResampler")
+    const localBackpressure = between(local, "match pipe.try_submit_frame(next)", "if input.len() >")
+    const livekitBackpressure = between(livekit, "match handle.try_submit_frame(next)", "if model.len() >")
 
-    expect(local).toContain("if pipe.submit_frame(next)")
-    expect(local).toContain("pipe.interrupt()")
+    expect(local).toContain("match pipe.try_submit_frame(next)")
+    expect(localBackpressure).toContain("Err(FrameSubmitError::Full)")
     expect(local).toContain("model.clear()")
     expect(local).toContain("emit_ready(sink, stop, mic_enabled)")
-    expect(local).not.toContain("RuntimeEvent::Error(\"realtime Moshi frame queue overrun\"")
-    expect(livekit).toContain("if handle.submit_frame(next)")
-    expect(livekit).toContain("handle.interrupt()")
+    expect(localBackpressure).not.toContain("pipe.interrupt()")
+    expect(local).not.toContain('RuntimeEvent::Error("realtime Moshi frame queue overrun"')
+    expect(livekit).toContain("match handle.try_submit_frame(next)")
+    expect(livekitBackpressure).toContain("Err(FrameSubmitError::Full)")
     expect(livekit).toContain("model.clear()")
     expect(livekit).toContain("VoiceState::Listening")
+    expect(livekitBackpressure).not.toContain("handle.interrupt()")
     expect(livekit).not.toContain("native LiveKit Moshi frame queue is full")
   })
 
@@ -280,7 +298,11 @@ describe("desktop voice context boundary", () => {
     const runtime = await root("packages/desktop/src-tauri/src/voice/runtime.rs")
     const pipeline = between(realtime, "struct QueuedUtterance", "/// Frame-fed realtime worker")
     const local = between(voice, "fn vad_loop", "fn frame_loop")
-    const livekit = between(runtime, "async fn native_livekit_agent_turn_mic_loop", "async fn native_livekit_agent_frame_mic_loop")
+    const livekit = between(
+      runtime,
+      "async fn native_livekit_agent_turn_mic_loop",
+      "async fn native_livekit_agent_frame_mic_loop",
+    )
 
     expect(pipeline).toContain("epoch: u64")
     expect(pipeline).toContain("epoch: Arc<AtomicU64>")
@@ -1042,11 +1064,15 @@ describe("desktop voice context boundary", () => {
     expect(mic.indexOf("if !mic_enabled.load(Ordering::SeqCst)")).toBeLessThan(mic.indexOf("handle.submit(utt)"))
   })
 
-  test("native LiveKit agent mic ingestion uses assistant playback as VAD reference", async () => {
+  test("native LiveKit turn mic ingestion uses assistant playback as VAD reference", async () => {
     const runtime = await root("packages/desktop/src-tauri/src/voice/runtime.rs")
     const events = between(runtime, "fn spawn_native_livekit_agent_events(", "struct LiveKitMediaTask")
     const reference = between(runtime, "struct LiveKitPlaybackReference", "fn handle_native_livekit_agent_event")
-    const mic = between(runtime, "fn spawn_native_livekit_agent_mic(", "async fn send_livekit_interrupt")
+    const mic = between(
+      runtime,
+      "async fn native_livekit_agent_turn_mic_loop",
+      "async fn native_livekit_agent_frame_mic_loop",
+    )
     const interrupt = between(runtime, "LiveKitCommand::Interrupt =>", "LiveKitCommand::SetMicEnabled")
 
     expect(runtime).toContain("const LIVEKIT_AGENT_ECHO_GATE_MS")
@@ -1064,12 +1090,25 @@ describe("desktop voice context boundary", () => {
     expect(mic).toContain("can_interrupt_playback: bool")
     expect(mic).toContain("if playback.active() && !can_interrupt_playback")
     expect(mic).toContain("let threshold = playback.reference_vad_threshold(vad_threshold)")
-    expect(mic).toContain("let interrupting = playback.active() && can_interrupt_playback && rms > threshold")
+    expect(mic).toContain("if rms > threshold")
     expect(mic).toContain("} else if playback.active()")
     expect(mic).toContain("samples.clear()")
     expect(mic.indexOf("let threshold = playback.reference_vad_threshold(vad_threshold)")).toBeLessThan(
       mic.indexOf("handle.submit(utt)"),
     )
+  })
+
+  test("native LiveKit Moshi frame ingestion keeps live mic audio full duplex", async () => {
+    const runtime = await root("packages/desktop/src-tauri/src/voice/runtime.rs")
+    const mic = between(runtime, "async fn native_livekit_agent_frame_mic_loop", "struct LiveKitFrameResampler")
+
+    expect(mic).toContain("let pcm = i16_to_f32(audio.data.as_ref())")
+    expect(mic).toContain("model.extend(resampler.process(&pcm))")
+    expect(mic).toContain("No VAD gating, no mic zeroing, no barge-in resets")
+    expect(mic).not.toContain("let rms = rms_f32(&pcm)")
+    expect(mic).not.toContain("playback.active() && !interrupting")
+    expect(mic).not.toContain("vec![0.0; pcm.len()]")
+    expect(mic).not.toContain("let interrupting = playback.active()")
   })
 
   test("native audio paths reject zero sample rates before realtime buffering", async () => {
@@ -1257,7 +1296,9 @@ describe("desktop voice context boundary", () => {
     expect(download).toContain(
       'showToast({ title: language.t("settings.voice.download.done"), description: event.dir })',
     )
-    expect(download.indexOf("await updateLfm2({ modelDir: event.dir })")).toBeLessThan(download.indexOf("if (!saved) return"))
+    expect(download.indexOf("await updateLfm2({ modelDir: event.dir })")).toBeLessThan(
+      download.indexOf("if (!saved) return"),
+    )
     expect(download.indexOf("await updateLfm2({ moshiModelDir: event.dir })")).toBeLessThan(
       download.indexOf("if (!saved) return"),
     )
@@ -1329,7 +1370,7 @@ describe("desktop voice context boundary", () => {
     expect(settings).toContain("const audioStatsText = ()")
     expect(settings).toContain("const engineText = ()")
     expect(settings).toContain('language.t("settings.voice.audioStats"')
-    expect(settings).toContain('settings.voice.engine.moshiRealtime')
+    expect(settings).toContain("settings.voice.engine.moshiRealtime")
   })
 
   test("desktop speaker probe reports native WebRTC speaker state", async () => {

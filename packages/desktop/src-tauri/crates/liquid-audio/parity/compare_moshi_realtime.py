@@ -1,0 +1,73 @@
+#!/usr/bin/env python
+"""Compare Rust and Python realtime Moshi traces.
+
+Generate inputs with:
+
+  conda activate py312
+  python parity/dump_moshi_realtime.py <python-model> input.wav /tmp/py.json --greedy --frames 16
+  MOSHI_GREEDY=1 MOSHI_TRACE_FRAMES=16 \
+    cargo run --release --example moshi_realtime_trace -- <candle-model-dir> input.wav /tmp/rs.json
+  python parity/compare_moshi_realtime.py /tmp/py.json /tmp/rs.json
+
+The checkpoint names may differ when one side is a converted Candle snapshot, but
+the traces must come from equivalent weights and the same PCM input.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+
+
+def load(path: Path) -> dict:
+    return json.loads(path.read_text())
+
+
+def rel(a: float, b: float) -> float:
+    return abs(a - b) / max(abs(b), 1e-6)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("python_trace", type=Path)
+    parser.add_argument("rust_trace", type=Path)
+    parser.add_argument("--rms-rtol", type=float, default=5e-2)
+    args = parser.parse_args()
+
+    py = load(args.python_trace)
+    rs = load(args.rust_trace)
+
+    assert py["sample_rate"] == rs["sample_rate"], (py["sample_rate"], rs["sample_rate"])
+    assert py["frame_size"] == rs["frame_size"], (py["frame_size"], rs["frame_size"])
+    assert py["input_frames"] == rs["input_frames"], (py["input_frames"], rs["input_frames"])
+    assert py["text_tokens"] == rs["text_tokens"], {
+        "python": py["text_tokens"],
+        "rust": rs["text_tokens"],
+    }
+
+    py_audio = py["audio_chunks"]
+    rs_audio = rs["audio_chunks"]
+    assert len(py_audio) == len(rs_audio), (len(py_audio), len(rs_audio))
+    for i, (a, b) in enumerate(zip(py_audio, rs_audio)):
+        assert a["samples"] == b["samples"], (i, a["samples"], b["samples"])
+        assert a["rate"] == b["rate"], (i, a["rate"], b["rate"])
+        err = rel(float(b["rms"]), float(a["rms"]))
+        assert err <= args.rms_rtol, {
+            "chunk": i,
+            "python_rms": a["rms"],
+            "rust_rms": b["rms"],
+            "relative_error": err,
+            "tolerance": args.rms_rtol,
+        }
+
+    print(
+        "moshi realtime parity ok: "
+        f"{py['input_frames']} input frames, "
+        f"{len(py['text_tokens'])} text tokens, "
+        f"{len(py_audio)} audio chunks"
+    )
+
+
+if __name__ == "__main__":
+    main()
