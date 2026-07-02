@@ -1608,54 +1608,84 @@ async fn native_livekit_agent_frame_mic_loop(
     let mut model = Vec::with_capacity(frame.frame_size * 2);
     let mut poll = tokio::time::interval(Duration::from_millis(LIVEKIT_DONE_POLL_MS));
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let interval = Duration::from_secs_f64(frame.frame_size as f64 / frame.sample_rate as f64);
+    let mut silence = tokio::time::interval(interval);
+    silence.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    silence.tick().await;
+    let mut next_silence = Instant::now() + interval;
     let mut backpressure_reported = false;
     while !livekit_media_cancelled(&done, &cancel) {
-        let audio = tokio::select! {
-            frame = stream.next() => frame,
+        let (source, audio) = tokio::select! {
+            frame = stream.next() => (0u8, frame),
             _ = poll.tick() => {
                 if livekit_media_cancelled(&done, &cancel) {
                     break;
                 }
-                continue;
+                (1u8, None)
+            }
+            _ = silence.tick() => {
+                if livekit_media_cancelled(&done, &cancel) {
+                    break;
+                }
+                (2u8, None)
             }
         };
-        let Some(audio) = audio else {
-            break;
-        };
-        if !mic_enabled.load(Ordering::SeqCst) {
-            // Mic paused — stop feeding frames but keep the loop alive.
-            // Don't clear the model buffer; when mic resumes, we pick up
-            // the live stream. Moshi handles silence frames natively.
+        if source == 1 {
             continue;
         }
-        if audio.sample_rate == 0 {
-            let _ = send_livekit(
-                &channel,
-                &done,
-                VoiceEvent::Error {
-                    message: "native LiveKit microphone frame sample rate is zero".into(),
-                },
-            );
-            break;
+        match source {
+            2 => {
+                if !mic_enabled.load(Ordering::SeqCst) {
+                    continue;
+                }
+                let now = Instant::now();
+                if now < next_silence {
+                    continue;
+                }
+                pad_next_livekit_model_frame(&mut model, frame.frame_size);
+                next_silence = now + interval;
+            }
+            _ => {
+                let Some(audio) = audio else {
+                    break;
+                };
+                if !mic_enabled.load(Ordering::SeqCst) {
+                    // Mic paused — stop feeding frames but keep the loop alive.
+                    // Don't clear the model buffer; when mic resumes, we pick up
+                    // the live stream. Moshi handles silence frames natively.
+                    continue;
+                }
+                if audio.sample_rate == 0 {
+                    let _ = send_livekit(
+                        &channel,
+                        &done,
+                        VoiceEvent::Error {
+                            message: "native LiveKit microphone frame sample rate is zero".into(),
+                        },
+                    );
+                    break;
+                }
+                let pcm = i16_to_f32(audio.data.as_ref());
+                // Full-duplex Moshi semantics: always feed real mic audio to the model.
+                // No VAD gating, no mic zeroing, no barge-in resets. The multistream LM
+                // handles turn-taking natively. Echo/AEC is handled by WebRTC's
+                // PlatformAudio (AEC/NS/AGC), not by zeroing model input.
+                // Explicit Stop/Interrupt are session-level controls only.
+                let rate = audio.sample_rate as u32;
+                if resampler.from() != rate {
+                    resampler = LiveKitFrameResampler::new(rate, frame.sample_rate);
+                    model.clear();
+                }
+                model.extend(resampler.process(&pcm));
+            }
         }
-        let pcm = i16_to_f32(audio.data.as_ref());
-        // Full-duplex Moshi semantics: always feed real mic audio to the model.
-        // No VAD gating, no mic zeroing, no barge-in resets. The multistream LM
-        // handles turn-taking natively. Echo/AEC is handled by WebRTC's
-        // PlatformAudio (AEC/NS/AGC), not by zeroing model input.
-        // Explicit Stop/Interrupt are session-level controls only.
-        let rate = audio.sample_rate as u32;
-        if resampler.from() != rate {
-            resampler = LiveKitFrameResampler::new(rate, frame.sample_rate);
-            model.clear();
-        }
-        model.extend(resampler.process(&pcm));
         while model.len() >= frame.frame_size {
             let next = model[..frame.frame_size].to_vec();
             model.drain(..frame.frame_size);
             match handle.try_submit_frame(next) {
                 Ok(()) => {
                     backpressure_reported = false;
+                    next_silence = Instant::now() + interval;
                     continue;
                 }
                 Err(FrameSubmitError::Full) => {
@@ -1684,6 +1714,19 @@ async fn native_livekit_agent_frame_mic_loop(
             model.clear();
         }
     }
+}
+
+fn pad_next_livekit_model_frame(model: &mut Vec<f32>, frame_size: usize) {
+    if frame_size == 0 {
+        return;
+    }
+    let partial = model.len() % frame_size;
+    let needed = if partial == 0 {
+        frame_size
+    } else {
+        frame_size - partial
+    };
+    model.resize(model.len() + needed, 0.0);
 }
 
 struct LiveKitFrameResampler {
@@ -3258,6 +3301,21 @@ mod tests {
         done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         threads.wait().unwrap();
         assert_eq!(threads.tracked_len(), 0);
+    }
+
+    #[test]
+    fn livekit_silence_padding_tops_off_one_model_frame() {
+        let mut partial = vec![1.0, 2.0, 3.0];
+        pad_next_livekit_model_frame(&mut partial, 5);
+        assert_eq!(partial, vec![1.0, 2.0, 3.0, 0.0, 0.0]);
+
+        let mut empty = Vec::new();
+        pad_next_livekit_model_frame(&mut empty, 4);
+        assert_eq!(empty, vec![0.0, 0.0, 0.0, 0.0]);
+
+        let mut aligned = vec![1.0, 2.0, 3.0, 4.0];
+        pad_next_livekit_model_frame(&mut aligned, 4);
+        assert_eq!(aligned, vec![1.0, 2.0, 3.0, 4.0, 0.0, 0.0, 0.0, 0.0]);
     }
 
     #[test]

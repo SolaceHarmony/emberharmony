@@ -1060,7 +1060,7 @@ fn frame_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
             if now < next_silence {
                 continue;
             }
-            model.resize(model.len() + frame.frame_size, 0.0);
+            pad_next_model_frame(&mut model, frame.frame_size);
             next_silence = now + interval;
         } else {
             let before = input.len();
@@ -1104,6 +1104,19 @@ fn frame_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
             input.clear();
         }
     }
+}
+
+fn pad_next_model_frame(model: &mut Vec<f32>, frame_size: usize) {
+    if frame_size == 0 {
+        return;
+    }
+    let partial = model.len() % frame_size;
+    let needed = if partial == 0 {
+        frame_size
+    } else {
+        frame_size - partial
+    };
+    model.resize(model.len() + needed, 0.0);
 }
 
 struct InputFrameResampler {
@@ -1502,6 +1515,21 @@ mod tests {
 
         mic.store(false, Ordering::SeqCst);
         assert_eq!(ready_state(&mic), SessionState::Idle);
+    }
+
+    #[test]
+    fn silence_padding_tops_off_one_model_frame() {
+        let mut partial = vec![1.0, 2.0, 3.0];
+        pad_next_model_frame(&mut partial, 5);
+        assert_eq!(partial, vec![1.0, 2.0, 3.0, 0.0, 0.0]);
+
+        let mut empty = Vec::new();
+        pad_next_model_frame(&mut empty, 4);
+        assert_eq!(empty, vec![0.0, 0.0, 0.0, 0.0]);
+
+        let mut aligned = vec![1.0, 2.0, 3.0, 4.0];
+        pad_next_model_frame(&mut aligned, 4);
+        assert_eq!(aligned, vec![1.0, 2.0, 3.0, 4.0, 0.0, 0.0, 0.0, 0.0]);
     }
 
     #[test]
