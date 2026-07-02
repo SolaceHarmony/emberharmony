@@ -145,6 +145,7 @@ fn main() -> Res<()> {
         params.text_temperature = 0.0;
     }
     let dtype = safetensors_floating_dtype(&files.moshi_weights)?;
+    let dtype_name = format!("{dtype:?}").to_lowercase();
     let device = select_device()?;
     let mut realtime = load_realtime_moshi_with_warmup(
         files
@@ -211,6 +212,7 @@ fn main() -> Res<()> {
         "input": wav.display().to_string(),
         "greedy": greedy,
         "seed": params.seed,
+        "dtype": dtype_name,
         "cfg_coef": 1.0,
         "sample_rate": realtime.sample_rate(),
         "frame_size": realtime.frame_size(),

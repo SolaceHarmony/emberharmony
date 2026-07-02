@@ -71,6 +71,21 @@ def assert_same_model_type(py: dict, rs: dict) -> None:
     }
 
 
+def normalize_dtype(dtype: object) -> str | None:
+    if dtype is None:
+        return None
+    name = str(dtype).lower()
+    aliases = {
+        "bf16": "bfloat16",
+        "bfloat16": "bfloat16",
+        "f32": "float32",
+        "float32": "float32",
+        "f16": "float16",
+        "float16": "float16",
+    }
+    return aliases.get(name, name)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("python_trace", type=Path)
@@ -100,6 +115,11 @@ def main() -> None:
         "python": py.get("seed"),
         "rust": rs.get("seed"),
         "message": "Moshi traces must use the same sampling seed",
+    }
+    assert normalize_dtype(py.get("dtype")) == normalize_dtype(rs.get("dtype")), {
+        "python": py.get("dtype"),
+        "rust": rs.get("dtype"),
+        "message": "Moshi traces must use the same floating dtype",
     }
     assert float(py.get("cfg_coef", 1.0)) == float(rs.get("cfg_coef", 1.0)), {
         "python": py.get("cfg_coef"),

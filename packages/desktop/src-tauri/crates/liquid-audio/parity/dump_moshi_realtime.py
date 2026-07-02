@@ -348,6 +348,7 @@ def write_metadata_trace(args, info: CheckpointInfo, layout: str) -> None:
         "mode": "verify-remap-only",
         "model": args.model,
         "model_type": info.model_type,
+        "dtype": args.dtype,
         "checkpoint": {
             "moshi": quick_file_info(Path(info.moshi_weights)) | {"layout": layout},
             "mimi": quick_file_info(Path(info.mimi_weights)),
@@ -421,6 +422,7 @@ def main() -> None:
         "input": str(args.wav),
         "greedy": bool(args.greedy),
         "seed": int(args.seed),
+        "dtype": args.dtype,
         "cfg_coef": float(args.cfg_coef),
         "sample_rate": int(mimi.sample_rate),
         "frame_size": int(frame_size),
