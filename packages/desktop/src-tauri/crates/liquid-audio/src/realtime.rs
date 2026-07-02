@@ -1037,42 +1037,14 @@ impl MoshiVoiceEngine {
 impl VoiceEngine for MoshiVoiceEngine {
     fn respond(
         &mut self,
-        utt: &Utterance,
-        cancel: &AtomicBool,
-        emit: &mut dyn FnMut(VoiceEvent),
+        _utt: &Utterance,
+        _cancel: &AtomicBool,
+        _emit: &mut dyn FnMut(VoiceEvent),
     ) -> Result<bool, String> {
-        if utt.rate == 0 {
-            return Err("utterance sample rate must be non-zero".into());
-        }
-        let rate = self.realtime.sample_rate();
-        if rate == 0 {
-            return Err("Moshi realtime sample rate must be non-zero".into());
-        }
-        if self.out_rate == 0 {
-            return Err("output sample rate must be non-zero".into());
-        }
-        let samples = if utt.rate == rate {
-            utt.samples.clone()
-        } else {
-            crate::resample::resample_slice(&utt.samples, utt.rate, rate)
-        };
-        let frame = self.realtime.frame_size();
-        if frame == 0 {
-            return Err("Moshi realtime frame size must be non-zero".into());
-        }
-        for chunk in samples.chunks(frame).filter(|chunk| chunk.len() == frame) {
-            if cancel.load(Ordering::Acquire) {
-                return Ok(false);
-            }
-            let events = self
-                .realtime
-                .step_pcm_frame(chunk)
-                .map_err(|e| e.to_string())?;
-            if !self.emit_events(events, cancel, emit) {
-                return Ok(false);
-            }
-        }
-        Ok(!cancel.load(Ordering::Acquire))
+        Err(
+            "Moshi realtime engine requires the frame pipeline; feed fixed PCM frames with respond_frame"
+                .into(),
+        )
     }
 
     fn frame_config(&self) -> Option<FrameConfig> {
@@ -1436,6 +1408,55 @@ mod tests {
             FRAME_QUEUE_CAP + 1,
             "accepted frames should still reach the engine in order"
         );
+    }
+
+    struct RejectTurnFrameEngine {
+        frames: Arc<AtomicUsize>,
+    }
+
+    impl VoiceEngine for RejectTurnFrameEngine {
+        fn respond(
+            &mut self,
+            _utt: &Utterance,
+            _cancel: &AtomicBool,
+            _emit: &mut dyn FnMut(VoiceEvent),
+        ) -> Result<bool, String> {
+            Err("turn path must not be used for frame engines".into())
+        }
+
+        fn frame_config(&self) -> Option<FrameConfig> {
+            Some(FrameConfig {
+                sample_rate: 24_000,
+                frame_size: 2,
+            })
+        }
+
+        fn respond_frame(
+            &mut self,
+            _frame: &[f32],
+            _cancel: &AtomicBool,
+            emit: &mut dyn FnMut(VoiceEvent),
+        ) -> Result<bool, String> {
+            let n = self.frames.fetch_add(1, Ordering::SeqCst);
+            emit(VoiceEvent::Text(format!("frame {n}")));
+            Ok(true)
+        }
+    }
+
+    #[test]
+    fn frame_capable_engines_use_frame_pipeline_not_turn_respond() {
+        let frames = Arc::new(AtomicUsize::new(0));
+        let pipe = RealtimeFramePipeline::spawn(RejectTurnFrameEngine {
+            frames: frames.clone(),
+        })
+        .expect("spawn frame pipeline");
+
+        assert!(pipe.submit_frame(vec![0.0, 0.0]));
+        assert_eq!(
+            pipe.events().recv_timeout(Duration::from_secs(5)).unwrap(),
+            VoiceEvent::Text("frame 0".into())
+        );
+        assert_eq!(frames.load(Ordering::SeqCst), 1);
     }
 
     /// Emits a scripted (Text, Audio) pair then completes; counts the turns it served.
