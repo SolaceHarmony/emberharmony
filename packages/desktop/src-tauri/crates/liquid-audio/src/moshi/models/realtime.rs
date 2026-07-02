@@ -449,11 +449,12 @@ pub fn realtime_moshi_files(dir: &Path) -> Result<Option<RealtimeMoshiFiles>> {
             )));
         }
         let lm_value = value.get("lm_config");
+        let lm_gen_config = value
+            .get("lm_gen_config")
+            .or_else(|| lm_value.and_then(|lm| lm.get("lm_gen_config")));
         let conditioned = has_unimplemented_conditioning(&value)
             || lm_value.is_some_and(has_unimplemented_conditioning);
-        let cfg = has_unimplemented_cfg(Some(&value))
-            || has_unimplemented_cfg(value.get("lm_gen_config"))
-            || has_unimplemented_cfg(lm_value.and_then(|lm| lm.get("lm_gen_config")));
+        let cfg = has_unimplemented_cfg(Some(&value)) || has_unimplemented_cfg(lm_gen_config);
         if conditioned || cfg {
             return Err(Error::Msg(
                 "native realtime Moshi does not yet implement Liquid's condition_tensors/CFG fuser path; use an unconditioned Moshiko Candle snapshot"
@@ -465,7 +466,7 @@ pub fn realtime_moshi_files(dir: &Path) -> Result<Option<RealtimeMoshiFiles>> {
             name("mimi_name", DEFAULT_MIMI_NAME),
             name("tokenizer_name", DEFAULT_TEXT_TOKENIZER_NAME),
             model_type,
-            RealtimeMoshiParams::from_lm_gen_config(value.get("lm_gen_config"))?,
+            RealtimeMoshiParams::from_lm_gen_config(lm_gen_config)?,
         )
     } else {
         (
@@ -580,7 +581,14 @@ mod tests {
                 "lm_config": {
                     "moshi_name": "moshi-custom.safetensors",
                     "mimi_name": "mimi-custom.safetensors",
-                    "tokenizer_name": "custom.model"
+                    "tokenizer_name": "custom.model",
+                    "lm_gen_config": {
+                        "temp": 0.55,
+                        "top_k": 33,
+                        "temp_text": 0.45,
+                        "top_k_text": 9,
+                        "use_sampling": false
+                    }
                 }
             }"#,
         )
@@ -593,6 +601,11 @@ mod tests {
         assert_eq!(files.moshi_weights, dir.join("moshi-custom.safetensors"));
         assert_eq!(files.mimi_weights, dir.join("mimi-custom.safetensors"));
         assert_eq!(files.tokenizer, dir.join("custom.model"));
+        assert_eq!(files.params.audio_temperature, 0.55);
+        assert_eq!(files.params.audio_top_k, 33);
+        assert_eq!(files.params.text_temperature, 0.45);
+        assert_eq!(files.params.text_top_k, 9);
+        assert!(!files.params.use_sampling);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
