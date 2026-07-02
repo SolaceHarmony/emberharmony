@@ -65,8 +65,8 @@ load.** The committed goldens here are from snapshot `c362a06…`.
 
 The desktop Moshi path is frame-fed rather than prompt-fed, so its parity check is
 a trace pair instead of a safetensors golden. Dump the upstream Python
-`server.py` order and the native Rust order from equivalent checkpoints and the
-same 24 kHz PCM input:
+`server.py` order and the native Rust order from the same checkpoint files and
+the same 24 kHz PCM input:
 
 ```
 conda activate py312
@@ -75,7 +75,13 @@ MOSHI_GREEDY=1 MOSHI_TRACE_FRAMES=16 cargo run --release --example moshi_realtim
 python parity/compare_moshi_realtime.py /tmp/py-moshi.json /tmp/rs-moshi.json
 ```
 
-The Rust side currently supports the unconditioned Candle Moshi layout only
-(for example `kyutai/moshiko-candle-bf16`). If a config advertises Liquid's
-conditioning/CFG fuser path, the native loader must reject it rather than run
-with missing `condition_tensors` or CFG semantics.
+The comparator requires matching Moshi/Mimi/tokenizer byte fingerprints by
+default. The current Rust side supports the unconditioned Candle Moshi layout
+only (for example `kyutai/moshiko-candle-bf16`), while the vendored upstream
+Python loader expects PyTorch Moshi keys. If you intentionally compare a
+PyTorch/Candle converted pair, pass `--allow-converted-checkpoints`; do not call
+that a same-checkpoint parity run.
+
+If a config advertises Liquid's conditioning/CFG fuser path, the native loader
+must reject it rather than run with missing `condition_tensors` or CFG
+semantics.

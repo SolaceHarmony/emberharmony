@@ -9,7 +9,7 @@
 //!     cargo run --release --example moshi_realtime_trace -- \
 //!       /path/to/moshiko-candle-bf16 /path/to/input-24khz.wav /tmp/rust-moshi.json
 
-use std::path::Path;
+use std::{io::Read, path::Path};
 
 use candle_core::Device;
 use liquid_audio::moshi::models::{
@@ -84,6 +84,31 @@ fn rms(samples: &[f32]) -> f32 {
     }
     let sum = samples.iter().map(|v| v * v).sum::<f32>();
     (sum / samples.len() as f32).sqrt()
+}
+
+fn file_fingerprint(path: &Path) -> Res<serde_json::Value> {
+    const OFFSET: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x100000001b3;
+    let mut file = std::fs::File::open(path)?;
+    let mut buf = [0u8; 1024 * 1024];
+    let mut hash = OFFSET;
+    let mut bytes = 0u64;
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        bytes += n as u64;
+        for b in &buf[..n] {
+            hash ^= *b as u64;
+            hash = hash.wrapping_mul(PRIME);
+        }
+    }
+    Ok(serde_json::json!({
+        "path": path.display().to_string(),
+        "bytes": bytes,
+        "fnv1a64": format!("{hash:016x}"),
+    }))
 }
 
 fn main() -> Res<()> {
@@ -163,6 +188,11 @@ fn main() -> Res<()> {
     let trace = serde_json::json!({
         "source": "rust",
         "model_dir": model.display().to_string(),
+        "checkpoint": {
+            "moshi": file_fingerprint(&files.moshi_weights)?,
+            "mimi": file_fingerprint(&files.mimi_weights)?,
+            "tokenizer": file_fingerprint(&files.tokenizer)?,
+        },
         "input": wav.display().to_string(),
         "greedy": greedy,
         "sample_rate": realtime.sample_rate(),

@@ -10,9 +10,10 @@ LMGen.step -> Mimi decode. Compare its JSON output with the Rust example:
     python parity/dump_moshi_realtime.py kyutai/moshiko-pytorch-bf16 \
       assets/question-24khz.wav /tmp/python-moshi.json
 
-The Rust runtime currently consumes the Candle layout (`kyutai/moshiko-candle-bf16`).
-Exact parity requires equivalent converted weights; this script is the reference
-trace source for that converted-pair check.
+The Rust runtime currently consumes the Candle layout (`kyutai/moshiko-candle-bf16`),
+while this vendored Python loader expects PyTorch keys. Converted-pair checks are
+explicitly supported by the comparator flag, but same-checkpoint parity remains
+the default contract.
 """
 
 from __future__ import annotations
@@ -27,14 +28,19 @@ from pathlib import Path
 import numpy as np
 import sphn
 import torch
+from safetensors import safe_open
 
 from _upstream import SRC
 
 sys.path.insert(0, str(SRC))
 
-from liquid_audio.moshi.models import LMGen  # noqa: E402
+from liquid_audio.moshi.models import LMGen, loaders  # noqa: E402
 from liquid_audio.moshi.models.loaders import CheckpointInfo  # noqa: E402
 from liquid_audio.moshi.run_inference import get_condition_tensors  # noqa: E402
+
+
+FNV_OFFSET = 0xCBF29CE484222325
+FNV_PRIME = 0x100000001B3
 
 
 def seed_all(seed: int) -> None:
@@ -44,6 +50,79 @@ def seed_all(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
     random.seed(seed)
     np.random.seed(seed)
+
+
+def file_fingerprint(path: Path) -> dict[str, int | str]:
+    value = FNV_OFFSET
+    size = 0
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            size += len(chunk)
+            for byte in chunk:
+                value ^= byte
+                value = (value * FNV_PRIME) & 0xFFFFFFFFFFFFFFFF
+    return {
+        "path": str(path),
+        "bytes": size,
+        "fnv1a64": f"{value:016x}",
+    }
+
+
+def moshi_weight_layout(path: Path) -> str:
+    if path.suffix not in (".safetensors", ".sft", ".sfts"):
+        return "torch-pickle"
+    with safe_open(path, framework="pt", device="cpu") as handle:
+        keys = list(handle.keys())
+    if any(key.startswith("depformer.") and key.endswith(".linear_in.weight") for key in keys):
+        return "candle"
+    if any(
+        key.startswith(("depformer_in.", "linears.", "depformer_emb."))
+        for key in keys
+    ):
+        return "python"
+    return "unknown-safetensors"
+
+
+def resolve_checkpoint(model: str) -> CheckpointInfo:
+    path = Path(model)
+    if not path.is_dir():
+        return CheckpointInfo.from_hf_repo(model)
+
+    config = path / "config.json"
+    if not config.is_file():
+        return CheckpointInfo(
+            path / loaders.MOSHI_NAME,
+            path / loaders.MIMI_NAME,
+            path / loaders.TEXT_TOKENIZER_NAME,
+        )
+
+    raw = json.loads(config.read_text())
+    lm_config = dict(raw)
+    moshi_name = lm_config.pop("moshi_name", loaders.MOSHI_NAME)
+    mimi_name = lm_config.pop("mimi_name", loaders.MIMI_NAME)
+    tokenizer_name = lm_config.pop("tokenizer_name", loaders.TEXT_TOKENIZER_NAME)
+    lora_name = lm_config.pop("lora_name", None)
+    model_type = lm_config.pop("model_type", "moshi")
+    lm_gen_config = lm_config.pop("lm_gen_config", {})
+    tts_config = lm_config.pop("tts_config", {})
+    stt_config = lm_config.pop("stt_config", {})
+    model_id = lm_config.pop("model_id", {})
+    return CheckpointInfo(
+        path / moshi_name,
+        path / mimi_name,
+        path / tokenizer_name,
+        lm_config,
+        raw,
+        model_type,
+        path / lora_name if lora_name else None,
+        lm_gen_config=lm_gen_config,
+        tts_config=tts_config,
+        stt_config=stt_config,
+        model_id=model_id,
+    )
 
 
 def warmup(mimi, lm_gen, frame_size: int, device: torch.device | str) -> None:
@@ -79,7 +158,20 @@ def main() -> None:
 
     seed_all(args.seed)
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float32
-    info = CheckpointInfo.from_hf_repo(args.model)
+    info = resolve_checkpoint(args.model)
+    layout = moshi_weight_layout(Path(info.moshi_weights))
+    if layout == "candle":
+        raise SystemExit(
+            "selected Moshi checkpoint uses the Candle key layout; upstream Python "
+            "`liquid_audio.moshi` expects PyTorch keys. Use a Python-layout checkpoint "
+            "for the Python trace, or compare a converted pair explicitly with "
+            "`compare_moshi_realtime.py --allow-converted-checkpoints`."
+        )
+    if layout == "unknown-safetensors":
+        raise SystemExit(
+            "selected Moshi checkpoint is safetensors but does not look like the "
+            "upstream Python Moshi layout; refusing to dump a misleading trace."
+        )
     mimi = info.get_mimi(args.device)
     text = info.get_text_tokenizer()
     lm = info.get_moshi(args.device, dtype=dtype).eval()
@@ -136,6 +228,11 @@ def main() -> None:
     trace = {
         "source": "python",
         "model": args.model,
+        "checkpoint": {
+            "moshi": file_fingerprint(Path(info.moshi_weights)) | {"layout": layout},
+            "mimi": file_fingerprint(Path(info.mimi_weights)),
+            "tokenizer": file_fingerprint(Path(info.tokenizer)),
+        },
         "input": str(args.wav),
         "greedy": bool(args.greedy),
         "sample_rate": int(mimi.sample_rate),

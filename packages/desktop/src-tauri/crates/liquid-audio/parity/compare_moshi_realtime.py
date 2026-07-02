@@ -10,7 +10,8 @@ Generate inputs with:
   python parity/compare_moshi_realtime.py /tmp/py.json /tmp/rs.json
 
 The checkpoint names may differ when one side is a converted Candle snapshot, but
-the traces must come from equivalent weights and the same PCM input.
+that must be acknowledged with `--allow-converted-checkpoints`. By default, this
+comparator requires matching checkpoint byte fingerprints.
 """
 
 from __future__ import annotations
@@ -28,16 +29,42 @@ def rel(a: float, b: float) -> float:
     return abs(a - b) / max(abs(b), 1e-6)
 
 
+def assert_same_checkpoints(py: dict, rs: dict) -> None:
+    py_checkpoint = py.get("checkpoint")
+    rs_checkpoint = rs.get("checkpoint")
+    assert py_checkpoint and rs_checkpoint, "both traces must include checkpoint fingerprints"
+    for key in ("moshi", "mimi", "tokenizer"):
+        a = py_checkpoint[key]
+        b = rs_checkpoint[key]
+        assert a["bytes"] == b["bytes"], {
+            "checkpoint": key,
+            "python_bytes": a["bytes"],
+            "rust_bytes": b["bytes"],
+        }
+        assert a["fnv1a64"] == b["fnv1a64"], {
+            "checkpoint": key,
+            "python_hash": a["fnv1a64"],
+            "rust_hash": b["fnv1a64"],
+        }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("python_trace", type=Path)
     parser.add_argument("rust_trace", type=Path)
     parser.add_argument("--rms-rtol", type=float, default=5e-2)
+    parser.add_argument(
+        "--allow-converted-checkpoints",
+        action="store_true",
+        help="Skip byte-fingerprint equality when comparing an explicitly converted PyTorch/Candle pair.",
+    )
     args = parser.parse_args()
 
     py = load(args.python_trace)
     rs = load(args.rust_trace)
 
+    if not args.allow_converted_checkpoints:
+        assert_same_checkpoints(py, rs)
     assert py["sample_rate"] == rs["sample_rate"], (py["sample_rate"], rs["sample_rate"])
     assert py["frame_size"] == rs["frame_size"], (py["frame_size"], rs["frame_size"])
     assert py["input_frames"] == rs["input_frames"], (py["input_frames"], rs["input_frames"])
