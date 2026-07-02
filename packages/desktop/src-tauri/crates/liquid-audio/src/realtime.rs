@@ -1383,6 +1383,59 @@ mod tests {
         );
     }
 
+    #[test]
+    fn frame_queue_pressure_does_not_reset_stream() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let resets = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let pipe = RealtimeFramePipeline::spawn(SaturatedFrameEngine {
+            calls: calls.clone(),
+            resets: resets.clone(),
+            entered: entered_tx,
+            release: release_rx,
+        })
+        .expect("spawn frame pipeline");
+
+        assert!(pipe.submit_frame(vec![0.0, 0.0]));
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("first frame should enter engine");
+        for _ in 0..FRAME_QUEUE_CAP {
+            assert!(pipe.submit_frame(vec![0.1, 0.1]));
+        }
+        assert_eq!(
+            pipe.try_submit_frame(vec![0.2, 0.2]),
+            Err(FrameSubmitError::Full),
+            "ordinary queue pressure should be reported to the producer"
+        );
+        release_tx.send(()).unwrap();
+
+        let mut text = 0usize;
+        while text <= FRAME_QUEUE_CAP {
+            match pipe
+                .events()
+                .recv_timeout(Duration::from_secs(5))
+                .expect("expected frame pipeline event")
+            {
+                VoiceEvent::Text(_) => text += 1,
+                VoiceEvent::TurnComplete => {}
+                other => panic!("unexpected event {other:?}"),
+            }
+        }
+
+        assert_eq!(
+            resets.load(Ordering::SeqCst),
+            0,
+            "queue pressure alone must not reset Mimi/LM stream state"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            FRAME_QUEUE_CAP + 1,
+            "accepted frames should still reach the engine in order"
+        );
+    }
+
     /// Emits a scripted (Text, Audio) pair then completes; counts the turns it served.
     struct ScriptEngine {
         turns: Arc<AtomicUsize>,
