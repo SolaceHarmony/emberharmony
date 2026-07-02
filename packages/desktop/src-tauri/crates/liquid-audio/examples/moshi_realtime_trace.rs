@@ -174,9 +174,10 @@ fn main() -> Res<()> {
     let mut audio_tokens = Vec::<Vec<u32>>::new();
     let mut audio = Vec::<serde_json::Value>::new();
     let mut frames = 0usize;
+    let frame_size = realtime.frame_size();
     for chunk in samples
-        .chunks(realtime.frame_size())
-        .filter(|chunk| chunk.len() == realtime.frame_size())
+        .chunks(frame_size)
+        .filter(|chunk| chunk.len() == frame_size)
     {
         if frames >= max_frames {
             break;

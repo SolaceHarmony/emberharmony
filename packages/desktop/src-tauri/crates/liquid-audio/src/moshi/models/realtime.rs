@@ -316,7 +316,7 @@ pub fn load_realtime_moshi_with_warmup(
         Some(cfg.generated_audio_codebooks),
         device,
     )?;
-    let lm = ::moshi::lm::load_streaming_both_ways(moshi_weights, dtype, device)?;
+    let lm = ::moshi::lm::load_streaming(moshi_weights, dtype, device)?;
     let mut realtime = RealtimeMoshi::new(mimi, lm, device.clone(), params);
     realtime.warmup(warmup_frames)?;
     Ok(realtime)

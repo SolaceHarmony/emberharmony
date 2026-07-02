@@ -43,7 +43,7 @@ test("build agent has correct default properties", async () => {
   })
 })
 
-test("plan agent denies edits except .emberharmony/plans/*", async () => {
+test("plan agent denies edits and bash except .emberharmony/plans/*", async () => {
   await using tmp = await tmpdir()
   await Instance.provide({
     directory: tmp.path,
@@ -52,6 +52,7 @@ test("plan agent denies edits except .emberharmony/plans/*", async () => {
       expect(plan).toBeDefined()
       // Wildcard is denied
       expect(evalPerm(plan, "edit")).toBe("deny")
+      expect(evalPerm(plan, "bash")).toBe("deny")
       // But specific path is allowed
       expect(PermissionNext.evaluate("edit", ".emberharmony/plans/foo.md", plan!.permission).action).toBe("allow")
     },

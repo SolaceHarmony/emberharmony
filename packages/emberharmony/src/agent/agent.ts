@@ -88,13 +88,14 @@ export namespace Agent {
       },
       plan: {
         name: "plan",
-        description: "Plan mode. Disallows all edit tools.",
+        description: "Plan mode. Disallows edit and shell execution tools.",
         options: {},
         permission: PermissionNext.merge(
           defaults,
           PermissionNext.fromConfig({
             question: "allow",
             plan_exit: "allow",
+            bash: "deny",
             external_directory: {
               [path.join(Global.Path.data, "plans", "*")]: "allow",
             },
