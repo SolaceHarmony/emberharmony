@@ -48,6 +48,19 @@ def assert_same_checkpoints(py: dict, rs: dict) -> None:
         }
 
 
+def assert_same_input(py: dict, rs: dict) -> None:
+    py_input = py.get("input_fingerprint")
+    rs_input = rs.get("input_fingerprint")
+    assert py_input and rs_input, "both traces must include input fingerprints"
+    for key in ("bytes", "fnv1a64"):
+        assert py_input[key] == rs_input[key], {
+            "input": key,
+            "python": py_input[key],
+            "rust": rs_input[key],
+            "message": "Moshi traces must use the same input WAV bytes",
+        }
+
+
 def assert_step_trace(name: str, trace: dict) -> None:
     mode = trace.get("mode")
     assert mode == "step", {
@@ -114,6 +127,7 @@ def main() -> None:
     assert_same_model_type(py, rs)
     if not args.allow_converted_checkpoints:
         assert_same_checkpoints(py, rs)
+    assert_same_input(py, rs)
     assert py.get("greedy") == rs.get("greedy"), {
         "python": py.get("greedy"),
         "rust": rs.get("greedy"),

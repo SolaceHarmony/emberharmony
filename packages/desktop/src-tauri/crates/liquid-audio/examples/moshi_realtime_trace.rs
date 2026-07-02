@@ -208,6 +208,7 @@ fn main() -> Res<()> {
             "tokenizer": file_fingerprint(&files.tokenizer)?,
         },
         "input": wav.display().to_string(),
+        "input_fingerprint": file_fingerprint(wav)?,
         "greedy": greedy,
         "seed": params.seed,
         "dtype": dtype_name,

@@ -85,8 +85,9 @@ stepping smoke test, pass `--warmup-frames 0 --frames 1` on Python and
 `server.py` parity path keeps the default four warmup frames on both sides.
 
 `compare_moshi_realtime.py` only accepts `mode: "step"` traces, requires the
-Python/Rust `warmup_frames` values to match, and compares Mimi input audio code
-frames, text tokens, and generated Moshi audio code frames exactly. Decoded PCM
+same input WAV fingerprint and Python/Rust `warmup_frames` values to match, and
+compares Mimi input audio code frames, text tokens, and generated Moshi audio
+code frames exactly. Decoded PCM
 chunk RMS is a secondary sanity check for the Mimi decode path. Remap-only and
 load-only outputs are smoke artifacts; they are not valid stepping parity
 evidence.

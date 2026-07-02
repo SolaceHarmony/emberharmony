@@ -473,6 +473,7 @@ def main() -> None:
             "tokenizer": file_fingerprint(Path(info.tokenizer)),
         },
         "input": str(args.wav),
+        "input_fingerprint": file_fingerprint(args.wav),
         "greedy": bool(args.greedy),
         "seed": int(args.seed),
         "dtype": dtype_name,
