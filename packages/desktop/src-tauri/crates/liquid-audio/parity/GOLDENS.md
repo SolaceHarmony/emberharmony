@@ -71,7 +71,7 @@ the same 24 kHz PCM input:
 ```
 conda activate py312
 python parity/dump_moshi_realtime.py <python-moshi-model> input-24khz.wav /tmp/py-moshi.json --greedy --frames 16 --warmup-frames 4
-MOSHI_GREEDY=1 MOSHI_TRACE_FRAMES=16 MOSHI_WARMUP_FRAMES=4 cargo run --release --example moshi_realtime_trace -- <candle-moshi-dir> input-24khz.wav /tmp/rs-moshi.json
+MOSHI_GREEDY=1 MOSHI_TRACE_FRAMES=16 MOSHI_WARMUP_FRAMES=4 MOSHI_SEED=42424242 cargo run --release --example moshi_realtime_trace -- <candle-moshi-dir> input-24khz.wav /tmp/rs-moshi.json
 python parity/compare_moshi_realtime.py /tmp/py-moshi.json /tmp/rs-moshi.json
 ```
 

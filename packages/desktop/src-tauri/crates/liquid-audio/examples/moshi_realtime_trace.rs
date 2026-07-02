@@ -5,7 +5,7 @@
 //! exact PCM frame -> Mimi encode_step -> multistream LM step -> Mimi decode_step.
 //!
 //! Usage:
-//!   MOSHI_GREEDY=1 MOSHI_TRACE_FRAMES=16 MOSHI_WARMUP_FRAMES=4 \
+//!   MOSHI_GREEDY=1 MOSHI_TRACE_FRAMES=16 MOSHI_WARMUP_FRAMES=4 MOSHI_SEED=42424242 \
 //!     cargo run --release --example moshi_realtime_trace -- \
 //!       /path/to/moshiko-candle-bf16 /path/to/input-24khz.wav /tmp/rust-moshi.json
 
@@ -133,9 +133,12 @@ fn main() -> Res<()> {
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(REALTIME_MOSHI_WARMUP_FRAMES);
+    let seed = std::env::var("MOSHI_SEED")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok());
 
     let files = realtime_moshi_files(model)?.ok_or("selected directory is not a Moshi snapshot")?;
-    let mut params = files.params;
+    let mut params = files.params.with_seed(seed.unwrap_or(files.params.seed));
     if greedy {
         params.use_sampling = false;
         params.audio_temperature = 0.0;
@@ -206,6 +209,8 @@ fn main() -> Res<()> {
         },
         "input": wav.display().to_string(),
         "greedy": greedy,
+        "seed": params.seed,
+        "cfg_coef": 1.0,
         "sample_rate": realtime.sample_rate(),
         "frame_size": realtime.frame_size(),
         "warmup_frames": warmup_frames,

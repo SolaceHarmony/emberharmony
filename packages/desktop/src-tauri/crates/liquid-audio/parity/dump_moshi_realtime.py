@@ -420,6 +420,8 @@ def main() -> None:
         },
         "input": str(args.wav),
         "greedy": bool(args.greedy),
+        "seed": int(args.seed),
+        "cfg_coef": float(args.cfg_coef),
         "sample_rate": int(mimi.sample_rate),
         "frame_size": int(frame_size),
         "warmup_frames": int(args.warmup_frames),

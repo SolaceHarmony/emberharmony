@@ -5,7 +5,7 @@ Generate inputs with:
 
   conda activate py312
   python parity/dump_moshi_realtime.py <python-model> input.wav /tmp/py.json --greedy --frames 16 --warmup-frames 4
-  MOSHI_GREEDY=1 MOSHI_TRACE_FRAMES=16 MOSHI_WARMUP_FRAMES=4 \
+  MOSHI_GREEDY=1 MOSHI_TRACE_FRAMES=16 MOSHI_WARMUP_FRAMES=4 MOSHI_SEED=42424242 \
     cargo run --release --example moshi_realtime_trace -- <candle-model-dir> input.wav /tmp/rs.json
   python parity/compare_moshi_realtime.py /tmp/py.json /tmp/rs.json
 
@@ -76,6 +76,21 @@ def main() -> None:
     assert_step_trace("rust", rs)
     if not args.allow_converted_checkpoints:
         assert_same_checkpoints(py, rs)
+    assert py.get("greedy") == rs.get("greedy"), {
+        "python": py.get("greedy"),
+        "rust": rs.get("greedy"),
+        "message": "Moshi traces must use the same sampling mode",
+    }
+    assert py.get("seed") == rs.get("seed"), {
+        "python": py.get("seed"),
+        "rust": rs.get("seed"),
+        "message": "Moshi traces must use the same sampling seed",
+    }
+    assert float(py.get("cfg_coef", 1.0)) == float(rs.get("cfg_coef", 1.0)), {
+        "python": py.get("cfg_coef"),
+        "rust": rs.get("cfg_coef"),
+        "message": "Rust Moshi parity only covers the unconditioned cfg_coef=1 path",
+    }
     assert py["sample_rate"] == rs["sample_rate"], (py["sample_rate"], rs["sample_rate"])
     assert py["frame_size"] == rs["frame_size"], (py["frame_size"], rs["frame_size"])
     assert py.get("warmup_frames") == rs.get("warmup_frames"), (
