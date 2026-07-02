@@ -119,16 +119,27 @@ def resolve_checkpoint(model: str) -> CheckpointInfo:
         )
 
     raw = json.loads(config.read_text())
-    lm_config = dict(raw)
-    moshi_name = lm_config.pop("moshi_name", loaders.MOSHI_NAME)
-    mimi_name = lm_config.pop("mimi_name", loaders.MIMI_NAME)
-    tokenizer_name = lm_config.pop("tokenizer_name", loaders.TEXT_TOKENIZER_NAME)
-    lora_name = lm_config.pop("lora_name", None)
-    model_type = lm_config.pop("model_type", "moshi")
-    lm_gen_config = lm_config.pop("lm_gen_config", {})
-    tts_config = lm_config.pop("tts_config", {})
-    stt_config = lm_config.pop("stt_config", {})
-    model_id = lm_config.pop("model_id", {})
+    nested = raw.get("lm_config")
+    nested_lm = nested if isinstance(nested, dict) else {}
+    lm_config = dict(nested_lm) if nested_lm else dict(raw)
+
+    def pop_config(key: str, default):
+        root = raw.get(key)
+        nested = nested_lm.get(key)
+        value = root if root is not None else nested
+        lm_config.pop(key, None)
+        return value if value is not None else default
+
+    moshi_name = pop_config("moshi_name", loaders.MOSHI_NAME)
+    mimi_name = pop_config("mimi_name", loaders.MIMI_NAME)
+    tokenizer_name = pop_config("tokenizer_name", loaders.TEXT_TOKENIZER_NAME)
+    lora_name = pop_config("lora_name", None)
+    model_type = pop_config("model_type", "moshi")
+    lm_gen_config = pop_config("lm_gen_config", {})
+    tts_config = pop_config("tts_config", {})
+    stt_config = pop_config("stt_config", {})
+    model_id = pop_config("model_id", {})
+    lm_config.pop("lm_config", None)
     return CheckpointInfo(
         path / moshi_name,
         path / mimi_name,

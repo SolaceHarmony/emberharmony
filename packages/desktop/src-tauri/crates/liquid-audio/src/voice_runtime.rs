@@ -1031,8 +1031,8 @@ fn frame_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
     while !stop.load(Ordering::SeqCst) {
         let has_input = mic.wait_for_input(Duration::from_millis(10));
 
-        // Session-level interrupt (Stop button / typed input) — flushes
-        // playback and resets the pipeline, but does NOT zero mic input.
+        // Session-level interrupt (Stop button / typed input) — cuts queued
+        // output/playback, but does NOT zero mic input or reset Mimi/LM state.
         if interrupt.swap(false, Ordering::SeqCst) {
             pipe.interrupt();
             playback_flush.store(true, Ordering::SeqCst);

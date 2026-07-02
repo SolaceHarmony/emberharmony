@@ -9,14 +9,11 @@
 //! relays text to the UI and PCM to WebRTC playback. Generation overlaps playback because
 //! they run on different threads.
 //!
-//! **Here**: a *persistent* inference worker thread owns the [`VoiceEngine`] and loops
-//! `recv utterance → respond (emit text + decode audio → emit PCM) → TurnComplete`. The
-//! consumer (UI / playback feeder) drains [`VoiceEvent`]s off a channel. Because the model
-//! lives on its own thread, capture and playback are never blocked by generation
-//! (full-duplex), and a newly-detected utterance can request **barge-in** — an
-//! `AtomicBool` the generate loop polls (see
-//! [`LFM2AudioModel::generate_interleaved_cancellable`]) to abort the in-flight reply
-//! instead of running it to `max_new_tokens` and tying up the P-cores.
+//! **Here**: turn-based engines use a persistent inference worker thread that owns the
+//! [`VoiceEngine`] and loops `recv utterance → respond (emit text + decode audio → emit PCM)
+//! → TurnComplete`. Moshi-style engines bypass that utterance path through
+//! [`RealtimeFramePipeline`], which owns the engine on a worker thread and advances on exact
+//! PCM frames without VAD gating or playback-based resets.
 //!
 //! The engine is a trait so the threading is unit-tested with a fake (no model needed);
 //! [`Lfm2VoiceEngine`] is the real implementation that owns the model + processor.
