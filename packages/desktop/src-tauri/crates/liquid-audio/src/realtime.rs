@@ -203,6 +203,13 @@ impl RealtimePipeline {
     /// Spawn the worker thread; it owns `engine` for its lifetime and serves utterances
     /// until this handle is dropped (which closes the utterance channel).
     pub fn spawn<E: VoiceEngine + 'static>(mut engine: E) -> Result<Self, String> {
+        if engine.frame_config().is_some() {
+            return Err(
+                "frame-capable voice engines must use RealtimeFramePipeline, not RealtimePipeline"
+                    .into(),
+            );
+        }
+
         // The realtime mic/VAD side must not accumulate stale speech behind a busy model.
         // One queued utterance is enough: current generation + next turn. Barge-in sets the
         // cancel flag first; if this slot is still full, the caller gets backpressure instead
@@ -946,9 +953,9 @@ impl VoiceEngine for Lfm2VoiceEngine {
 /// Native Moshi realtime engine: persistent Mimi + LMGen-style state fed with fixed PCM frames.
 ///
 /// This is the desktop-side counterpart of upstream `moshi/server.py` without the websocket/Opus
-/// wrapper. The surrounding [`RealtimePipeline`] still owns the model on a worker thread and
-/// handles barge-in cancellation; this engine keeps the canonical Moshi step order inside that
-/// worker: PCM frame -> Mimi encode -> multistream LM step -> Mimi decode.
+/// wrapper. The surrounding [`RealtimeFramePipeline`] owns the model on a worker thread and feeds
+/// continuous PCM frames; this engine keeps the canonical Moshi step order inside that worker:
+/// PCM frame -> Mimi encode -> multistream LM step -> Mimi decode.
 pub struct MoshiVoiceEngine {
     realtime: RealtimeMoshi,
     text: sentencepiece_rust::SentencePieceProcessor,
@@ -1457,6 +1464,22 @@ mod tests {
             VoiceEvent::Text("frame 0".into())
         );
         assert_eq!(frames.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn turn_pipeline_rejects_frame_capable_engines() {
+        let frames = Arc::new(AtomicUsize::new(0));
+        let err = match RealtimePipeline::spawn(RejectTurnFrameEngine {
+            frames: frames.clone(),
+        }) {
+            Ok(_) => panic!("turn pipeline accepted a frame-capable engine"),
+            Err(err) => err,
+        };
+        assert!(
+            err.contains("frame-capable voice engines must use RealtimeFramePipeline"),
+            "{err}"
+        );
+        assert_eq!(frames.load(Ordering::SeqCst), 0);
     }
 
     /// Emits a scripted (Text, Audio) pair then completes; counts the turns it served.
