@@ -20,6 +20,29 @@ const parameters = z.object({
   command: z.string().describe("The command that triggered this task").optional(),
 })
 
+export function inheritedDenyRules(ruleset: PermissionNext.Ruleset): PermissionNext.Ruleset {
+  return ruleset.filter(
+    (rule) => rule.action === "deny" && PermissionNext.evaluate(rule.permission, rule.pattern, ruleset).action === "deny",
+  )
+}
+
+function key(rule: PermissionNext.Rule) {
+  return [rule.permission, rule.pattern, rule.action].join("\0")
+}
+
+function appendRules(base: PermissionNext.Ruleset | undefined, extra: PermissionNext.Ruleset) {
+  const seen = new Set((base ?? []).map(key))
+  return [
+    ...(base ?? []),
+    ...extra.filter((rule) => {
+      const id = key(rule)
+      const ok = !seen.has(id)
+      if (ok) seen.add(id)
+      return ok
+    }),
+  ]
+}
+
 export const TaskTool = Tool.define("task", async (ctx) => {
   const agents = await Agent.list().then((x) => x.filter((a) => a.mode !== "primary"))
 
@@ -57,43 +80,54 @@ export const TaskTool = Tool.define("task", async (ctx) => {
       const agent = await Agent.get(params.subagent_type)
       if (!agent) throw new Error(`Unknown agent type: ${params.subagent_type} is not a valid agent type`)
 
+      const caller = await Agent.get(ctx.agent)
+      const parent = await Session.get(ctx.sessionID)
       const hasTaskPermission = agent.permission.some((rule) => rule.permission === "task")
+      const permission = [
+        {
+          permission: "todowrite",
+          pattern: "*",
+          action: "deny",
+        },
+        {
+          permission: "todoread",
+          pattern: "*",
+          action: "deny",
+        },
+        ...(hasTaskPermission
+          ? []
+          : [
+              {
+                permission: "task" as const,
+                pattern: "*" as const,
+                action: "deny" as const,
+              },
+            ]),
+        ...(config.experimental?.primary_tools?.map((t) => ({
+          pattern: "*",
+          action: "allow" as const,
+          permission: t,
+        })) ?? []),
+        ...inheritedDenyRules(PermissionNext.merge(caller?.permission ?? [], parent.permission ?? [])),
+      ] satisfies PermissionNext.Ruleset
 
       const session = await iife(async () => {
         if (params.session_id) {
           const found = await Session.get(params.session_id).catch(() => {})
-          if (found) return found
+          if (found)
+            return await Session.update(
+              found.id,
+              (draft) => {
+                draft.permission = appendRules(draft.permission, permission)
+              },
+              { touch: false },
+            )
         }
 
         return await Session.create({
           parentID: ctx.sessionID,
           title: params.description + ` (@${agent.name} subagent)`,
-          permission: [
-            {
-              permission: "todowrite",
-              pattern: "*",
-              action: "deny",
-            },
-            {
-              permission: "todoread",
-              pattern: "*",
-              action: "deny",
-            },
-            ...(hasTaskPermission
-              ? []
-              : [
-                  {
-                    permission: "task" as const,
-                    pattern: "*" as const,
-                    action: "deny" as const,
-                  },
-                ]),
-            ...(config.experimental?.primary_tools?.map((t) => ({
-              pattern: "*",
-              action: "allow" as const,
-              permission: t,
-            })) ?? []),
-          ],
+          permission,
         })
       })
       const msg = await MessageV2.get({ sessionID: ctx.sessionID, messageID: ctx.messageID })

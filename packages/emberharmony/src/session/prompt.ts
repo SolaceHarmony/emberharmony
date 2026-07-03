@@ -170,9 +170,9 @@ export namespace SessionPrompt {
       })
     }
     if (permissions.length > 0) {
-      session.permission = permissions
+      session.permission = PermissionNext.merge(session.permission ?? [], permissions)
       await Session.update(session.id, (draft) => {
-        draft.permission = permissions
+        draft.permission = session.permission
       })
     }
 
@@ -604,7 +604,10 @@ export namespace SessionPrompt {
 
       const result = await processor.process({
         user: lastUser,
-        agent,
+        agent: {
+          ...agent,
+          permission: PermissionNext.merge(agent.permission, session.permission ?? []),
+        },
         abort,
         sessionID,
         system: [...(await SystemPrompt.environment(model)), ...(await InstructionPrompt.system())],
