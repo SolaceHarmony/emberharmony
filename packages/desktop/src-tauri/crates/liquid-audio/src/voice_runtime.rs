@@ -219,6 +219,21 @@ impl PcmRing {
         }
     }
 
+    /// Drain all available samples into a new Vec. Non-blocking; returns
+    /// empty if the ring has no data. Used by the output thread to pull
+    /// PCM chunks without blocking on the ring.
+    fn drain_all(&self) -> Vec<f32> {
+        let len = self.len();
+        if len == 0 {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(len);
+        while let Some(sample) = self.pop() {
+            out.push(sample);
+        }
+        out
+    }
+
     fn clear(&self) {
         let write = self.write.load(Ordering::Acquire);
         self.read.store(write, Ordering::Release);
@@ -765,6 +780,47 @@ fn spawn_consumer<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
     playback: Playback,
     output: Option<ExternalAudioOutput>,
 ) -> Result<JoinHandle<()>, String> {
+    // Spawn a dedicated output thread when using ExternalAudioOutput (WebRTC path).
+    // The consumer pushes PCM into a bounded ring (non-blocking); the output thread
+    // drains the ring and calls the blocking write_mono_f32 (which does
+    // block_on(capture_frame)). This decouples model generation from output latency:
+    // the consumer never blocks on capture_frame, so the inference worker's event
+    // channel never backs up, and the model keeps generating at full speed.
+    let output_ring = output.as_ref().map(|_| {
+        PcmRing::new(out_rate as usize * SPEAKER_RING_SECONDS)
+    });
+    let output_flush = Arc::new(AtomicBool::new(false));
+    let output_stop = stop.clone();
+
+    if let (Some(output), Some(ring)) = (&output, &output_ring) {
+        let ring = ring.clone();
+        let output = output.clone();
+        let flush = output_flush.clone();
+        let stop = output_stop.clone();
+        std::thread::Builder::new()
+            .name("voice-output".into())
+            .spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    if flush.swap(false, Ordering::SeqCst) {
+                        output.clear();
+                        ring.clear();
+                    }
+                    // Drain a chunk from the ring (non-blocking pop)
+                    let chunk = ring.drain_all();
+                    if chunk.is_empty() {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        continue;
+                    }
+                    if let Err(e) = output.write_mono_f32(&chunk) {
+                        eprintln!("[voice-output] speaker write failed: {e}");
+                        break;
+                    }
+                }
+                output.clear();
+            })
+            .map_err(|e| format!("spawn voice-output thread failed: {e}"))?;
+    }
+
     std::thread::Builder::new()
         .name("voice-consumer".into())
         .spawn(move || {
@@ -807,7 +863,19 @@ fn spawn_consumer<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
                         }
                         let level = rms(&pcm);
                         let external_output = output.is_some();
-                        let dropped = if let Some(output) = output.as_ref() {
+                        // Push PCM to the output ring (non-blocking) instead of
+                        // calling write_mono_f32 directly. The dedicated output
+                        // thread handles the blocking capture_frame call.
+                        let dropped = if let Some(output_ring) = output_ring.as_ref() {
+                            if playback_flush.swap(false, Ordering::SeqCst) {
+                                output_flush.store(true, Ordering::SeqCst);
+                            }
+                            let d = output_ring.push_slice(&pcm);
+                            if d == 0 {
+                                playback.set_playing(level);
+                            }
+                            d
+                        } else if let Some(output) = output.as_ref() {
                             if playback_flush.swap(false, Ordering::SeqCst) {
                                 output.clear();
                             }
@@ -863,7 +931,9 @@ fn spawn_consumer<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
                     }
                     VoiceEvent::TurnComplete | VoiceEvent::Interrupted => {
                         assistant.store(false, Ordering::SeqCst);
-                        if output.is_some() {
+                        if output_ring.is_some() {
+                            playback.set_idle();
+                        } else if output.is_some() {
                             playback.set_idle();
                         }
                         transcript.clear();
@@ -874,7 +944,9 @@ fn spawn_consumer<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
                     }
                     VoiceEvent::Error(error) => {
                         assistant.store(false, Ordering::SeqCst);
-                        if output.is_some() {
+                        if output_ring.is_some() {
+                            playback.set_idle();
+                        } else if output.is_some() {
                             playback.set_idle();
                         }
                         transcript.clear();
@@ -1667,6 +1739,16 @@ mod tests {
         tx.send(VoiceEvent::Audio(vec![0.25, -0.25])).unwrap();
         drop(tx);
         consumer.join().unwrap();
+
+        // The consumer pushes PCM to a bounded ring; a dedicated output thread
+        // drains the ring and calls write_mono_f32. Wait for it to finish.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while written.load(Ordering::SeqCst) < 2 {
+            if std::time::Instant::now() >= deadline {
+                panic!("output thread did not drain the ring within 2s");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
 
         assert_eq!(written.load(Ordering::SeqCst), 2);
         assert_eq!(
