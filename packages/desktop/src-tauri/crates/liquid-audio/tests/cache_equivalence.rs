@@ -179,6 +179,26 @@ fn suffix_cache_matches_full_prefill() -> anyhow::Result<()> {
     chat.end_turn()?;
     chat.new_turn("assistant")?;
 
+    // The turn grammar must be IN the context the model attends over: role fences
+    // as real text tokens, audio as flagged runs between them. This is the live
+    // answer to "does the model know where it ends and the user begins".
+    let transcript = chat.transcript()?;
+    println!("--- context transcript (turn 2 start) ---\n{transcript}\n---");
+    for fence in [
+        "<|startoftext|>",
+        "<|im_start|>system\n",
+        "<|im_start|>user\n",
+        "<|im_start|>assistant\n",
+        "<|im_end|>",
+        "⟨audio-in ×",
+        "⟨audio-out ×",
+    ] {
+        assert!(
+            transcript.contains(fence),
+            "context transcript missing {fence:?}"
+        );
+    }
+
     // ---- Assertion 2: suffix construction equals the tail of the full prefill. ----
     let suffix = model.prefill_suffix(&chat, &cursor)?;
     let full_embeds = model.prefill_suffix(&chat, &PrefillCursor::default())?;

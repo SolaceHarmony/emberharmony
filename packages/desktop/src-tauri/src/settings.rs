@@ -212,7 +212,7 @@ impl Default for Lfm2Settings {
             moshi_model_dir: None,
             device: Lfm2Device::default(),
             vad_threshold: 0.012,
-            max_tokens: 512,
+            max_tokens: 1024, // vendor interleaved default (transformers-js DEFAULT_MAX_TOKENS_AUDIO)
             model: Some(DEFAULT_LFM2_MODEL.to_string()),
             seed: None,
             revision: None,
@@ -359,7 +359,7 @@ mod tests {
         assert_eq!(v.last_provider, Some(VoiceProvider::Lfm2));
         assert_eq!(v.lfm2.device, Lfm2Device::Metal);
         assert_eq!(v.lfm2.vad_threshold, 0.012); // filled from Default
-        assert_eq!(v.lfm2.max_tokens, 512);
+        assert_eq!(v.lfm2.max_tokens, 1024);
         assert_eq!(v.lfm2.engine, LocalVoiceEngine::MoshiRealtime);
         assert_eq!(v.lfm2.moshi_model.as_deref(), Some(DEFAULT_MOSHI_MODEL));
     }

@@ -87,12 +87,31 @@ pub struct SpecialTokenIds {
 impl SpecialTokenIds {
     pub fn resolve(tokenizer: &Tokenizer) -> Result<Self> {
         let id = |name: &str| -> Result<u32> {
-            tokenizer.token_to_id(name).ok_or_else(|| {
+            let id = tokenizer.token_to_id(name).ok_or_else(|| {
                 candle_core::Error::Msg(format!(
                     "tokenizer does not define {name} — not an LFM2-Audio tokenizer"
                 ))
-            })
+            })?;
+            // The grammar only works if the fence string ENCODES back to this single
+            // id — i.e. the tokenizer matches it as an added special token rather
+            // than char-splitting it into ordinary text. Everything downstream
+            // (turn boundaries, end-of-turn detection, the chat template) rides on
+            // this round-trip, so a tokenizer that fails it must fail the load.
+            let enc = tokenizer.encode(name, false).map_err(|e| {
+                candle_core::Error::Msg(format!("tokenizer encode {name}: {e}"))
+            })?;
+            if enc.get_ids() != [id] {
+                return Err(candle_core::Error::Msg(format!(
+                    "tokenizer does not round-trip {name}: encodes to {:?}, expected [{id}] \
+                     — grammar fences would enter context as plain text",
+                    enc.get_ids()
+                )));
+            }
+            Ok(id)
         };
+        // <|im_start|> is not generation-control (never sampled against) but it IS
+        // the other half of every fence — same round-trip requirement.
+        let _ = id("<|im_start|>")?;
         Ok(Self {
             im_end: id("<|im_end|>")?,
             text_end: id("<|text_end|>")?,
@@ -383,6 +402,69 @@ impl<'a> ChatState<'a> {
 
     pub fn end_turn(&mut self) -> Result<()> {
         self.add_text(TURN_FOOTER)
+    }
+
+    /// Render the context as a human-readable transcript: the text channel decoded
+    /// with special tokens VISIBLE (the turn grammar is the point), and contiguous
+    /// audio runs shown as `⟨audio-in ×N⟩` / `⟨audio-out ×N⟩` placeholders at their
+    /// sequence positions. This is exactly the sequence the model attends over —
+    /// the debug answer to "are the role fences actually in context?".
+    pub fn transcript(&self) -> Result<String> {
+        let flags: Vec<i64> = self
+            .modality_flag
+            .to_dtype(candle_core::DType::I64)?
+            .flatten_all()?
+            .to_vec1::<i64>()?;
+        let ids: Vec<i64> = self.text.flatten_all()?.to_vec1::<i64>()?;
+        let mut out = String::new();
+        let mut text_run: Vec<u32> = Vec::new();
+        let mut audio_run: Option<(i64, usize)> = None; // (modality, len)
+        let mut ti = 0usize;
+
+        let mut flush_text = |out: &mut String, run: &mut Vec<u32>| -> Result<()> {
+            if run.is_empty() {
+                return Ok(());
+            }
+            let s = self
+                .proc
+                .text()
+                .decode(run, false)
+                .map_err(|e| candle_core::Error::Msg(format!("transcript decode: {e}")))?;
+            out.push_str(&s);
+            run.clear();
+            Ok(())
+        };
+        let flush_audio = |out: &mut String, run: &mut Option<(i64, usize)>| {
+            if let Some((m, n)) = run.take() {
+                let name = if m == LFMModality::AudioIn as i64 {
+                    "audio-in"
+                } else {
+                    "audio-out"
+                };
+                out.push_str(&format!("⟨{name} ×{n}⟩"));
+            }
+        };
+
+        for &flag in &flags {
+            if flag == LFMModality::Text as i64 {
+                flush_audio(&mut out, &mut audio_run);
+                text_run.push(ids[ti] as u32);
+                ti += 1;
+            } else {
+                flush_text(&mut out, &mut text_run)?;
+                audio_run = match audio_run {
+                    Some((m, n)) if m == flag => Some((m, n + 1)),
+                    Some(_) => {
+                        flush_audio(&mut out, &mut audio_run);
+                        Some((flag, 1))
+                    }
+                    None => Some((flag, 1)),
+                };
+            }
+        }
+        flush_text(&mut out, &mut text_run)?;
+        flush_audio(&mut out, &mut audio_run);
+        Ok(out)
     }
 
     /// Append generated text + audio-out tokens with their modality flags.

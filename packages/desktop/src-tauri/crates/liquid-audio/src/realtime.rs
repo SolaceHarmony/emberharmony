@@ -881,6 +881,23 @@ impl VoiceEngine for Lfm2VoiceEngine {
             cursor.positions,
             n_ctx - cursor.positions
         );
+        if crate::voice_runtime::voice_trace_enabled() {
+            // The definitive "is the turn grammar in context" answer: the exact
+            // sequence the model attends over, fences visible, audio as ⟨runs⟩.
+            if let Ok(t) = chat.transcript() {
+                const TAIL: usize = 1600;
+                let shown = if t.len() > TAIL {
+                    let mut i = t.len() - TAIL;
+                    while !t.is_char_boundary(i) {
+                        i += 1;
+                    }
+                    format!("… (+{} chars)\n{}", i, &t[i..])
+                } else {
+                    t
+                };
+                crate::vtrace!("engine: context transcript:\n{shown}");
+            }
+        }
         let turn_started = std::time::Instant::now();
 
         self.model

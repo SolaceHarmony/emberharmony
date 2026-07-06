@@ -2684,7 +2684,11 @@ fn build_engine(
     let (model, proc) = resident_lfm2(&dir, &settings.lfm2.device, &device)?;
     let params = GenParams {
         max_new_tokens: settings.lfm2.max_tokens as usize,
-        text_temperature: None,
+        // Sampled text, NOT greedy — vendor-exact: LiquidAI's transformers-js
+        // conversational demo runs textTemperature = 1.0 (full multinomial).
+        // Greedy text at 1.2B is a repetition machine: the model re-emits its
+        // favorite phrasings every turn regardless of context.
+        text_temperature: Some(1.0),
         text_top_k: None,
         audio_temperature: Some(1.0),
         audio_top_k: Some(4),
