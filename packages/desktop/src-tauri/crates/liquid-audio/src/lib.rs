@@ -31,7 +31,7 @@ pub use audio_out::{AudioDetokenizer, MimiDetokenizer};
 pub use detokenizer::LFM2AudioDetokenizer;
 pub use loader::{from_pretrained, from_pretrained_hub};
 pub use model::lfm2_audio::{GenParams, GenToken, LFM2AudioModel, PrefillCursor};
-pub use processor::{ChatState, LFM2AudioProcessor};
+pub use processor::{ChatState, LFM2AudioProcessor, SpecialTokenIds};
 pub use realtime::{
     ConversationVault, FrameConfig, FrameSubmitError, Lfm2VoiceEngine, MoshiVoiceEngine,
     RealtimeFramePipeline, RealtimeFramePipelineHandle, RealtimePipeline, RealtimePipelineHandle,

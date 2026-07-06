@@ -25,11 +25,15 @@ use crate::model::mlp::MLP;
 use crate::model::transformer::{
     HeadStyle, LayerKvCache, Mha, RawLmBackbone, SharedEmbedding, StandardBlock,
 };
-use crate::processor::ChatState;
+use crate::processor::{ChatState, SpecialTokenIds};
 use crate::utils::{mel2emb_len, LFMModality};
 
 /// +1 over 2048 for the EOAudio token.
 const AUDIO_VOCAB_SIZE: usize = 2048 + 1;
+/// End-of-audio code: the per-codebook vocab's final entry (2048). Derived from
+/// `AUDIO_VOCAB_SIZE`, which the checkpoint validates at load — `audio_embedding`
+/// must have exactly `AUDIO_VOCAB_SIZE * codebooks` rows or `VarBuilder::get` fails.
+const END_OF_AUDIO: u32 = (AUDIO_VOCAB_SIZE - 1) as u32;
 
 #[derive(Debug, Clone)]
 pub struct DepthformerConfig {
@@ -298,6 +302,9 @@ pub struct LFM2AudioModel {
     depthformer_dim: usize,
     interleaved_n_text: usize,
     interleaved_n_audio: usize,
+    /// Generation-control token ids resolved from the model's own tokenizer at load
+    /// (never literals — the model defines them). See `SpecialTokenIds`.
+    special: SpecialTokenIds,
     hidden: usize,
     /// `audio_loss_weights` buffer (Python `__init__` 104-113): the per-codebook
     /// loss weighting, `(C,)`. Construction-only (not used by any generation path);
@@ -318,6 +325,7 @@ impl LFM2AudioModel {
         codebooks: usize,
         interleaved_n_text: usize,
         interleaved_n_audio: usize,
+        special: SpecialTokenIds,
         loss_conf: &LossConf,
         vb: VarBuilder,
     ) -> Result<Self> {
@@ -428,6 +436,7 @@ impl LFM2AudioModel {
             depthformer_dim: depth_cfg.dim,
             interleaved_n_text,
             interleaved_n_audio,
+            special,
             hidden,
             audio_loss_weights,
             text_loss_multiplier: loss_conf.text_loss_multiplier,
@@ -1186,10 +1195,10 @@ impl LFM2AudioModel {
                     let logits = self.text_logits(&h_last)?;
                     let next = self.sample_text_token(&logits, &mut text_sampler)?;
                     on_token(GenToken::Text(next));
-                    if next == 128 {
+                    if next == self.special.audio_start {
                         current = LFMModality::AudioOut; // <|audio_start|>
                     }
-                    if next == 7 {
+                    if next == self.special.im_end {
                         break; // <|im_end|>
                     }
                     let tok = Tensor::from_vec(vec![next], (1,), in_emb.device())?;
@@ -1197,9 +1206,9 @@ impl LFM2AudioModel {
                 }
                 LFMModality::AudioOut => {
                     let mut frame = self.sample_audio_frame(&h_last, &mut audio_sampler)?;
-                    if frame[0] == 2048 {
+                    if frame[0] == END_OF_AUDIO {
                         for c in frame.iter_mut() {
-                            *c = 2048; // next_token[:] = 2048
+                            *c = END_OF_AUDIO; // next_token[:] = 2048
                         }
                         current = LFMModality::Text;
                     }
@@ -1312,11 +1321,11 @@ impl LFM2AudioModel {
                 LFMModality::Text => {
                     let logits = self.text_logits(&h_last)?;
                     let next = self.sample_text_token(&logits, &mut text_sampler)?;
-                    if next == 7 {
+                    if next == self.special.im_end {
                         break; // <|im_end|>
                     }
                     on_token(GenToken::Text(next));
-                    if next == 130 {
+                    if next == self.special.text_end {
                         text_done = true; // <|text_end|>
                     }
                     if modality_left <= 0 || text_done {
@@ -1332,9 +1341,9 @@ impl LFM2AudioModel {
                         current = LFMModality::Text;
                         modality_left = self.interleaved_n_text as i64;
                     }
-                    if frame[0] == 2048 {
+                    if frame[0] == END_OF_AUDIO {
                         for c in frame.iter_mut() {
-                            *c = 2048; // next_token[:] = 2048
+                            *c = END_OF_AUDIO; // next_token[:] = 2048
                         }
                         current = LFMModality::Text;
                     }

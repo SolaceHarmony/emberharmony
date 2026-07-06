@@ -60,6 +60,38 @@ impl PreprocessorConfig {
     }
 }
 
+/// Generation-control token ids resolved BY NAME from the model's own tokenizer at
+/// load time — the model defines them, so they pass through instead of living as
+/// literals in the generation loops (`<|im_end|>` also cross-checks the config's
+/// `lfm.eos_token_id`). Resolution is hard-error: a snapshot whose tokenizer lacks
+/// these names is not an LFM2-Audio model, and guessing ids would generate garbage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpecialTokenIds {
+    /// `<|im_end|>` — closes a turn; text sampling stops here.
+    pub im_end: u32,
+    /// `<|text_end|>` — the interleaved text channel is finished for this turn.
+    pub text_end: u32,
+    /// `<|audio_start|>` — sequential (TTS) generation flips to audio frames here.
+    pub audio_start: u32,
+}
+
+impl SpecialTokenIds {
+    pub fn resolve(tokenizer: &Tokenizer) -> Result<Self> {
+        let id = |name: &str| -> Result<u32> {
+            tokenizer.token_to_id(name).ok_or_else(|| {
+                candle_core::Error::Msg(format!(
+                    "tokenizer does not define {name} — not an LFM2-Audio tokenizer"
+                ))
+            })
+        };
+        Ok(Self {
+            im_end: id("<|im_end|>")?,
+            text_end: id("<|text_end|>")?,
+            audio_start: id("<|audio_start|>")?,
+        })
+    }
+}
+
 pub struct LFM2AudioProcessor {
     pub tokenizer: Tokenizer,
     pub audio: FilterbankFeatures,
@@ -119,6 +151,12 @@ impl LFM2AudioProcessor {
     pub fn load_tokenizer(dir: &Path) -> Result<Tokenizer> {
         Tokenizer::from_file(dir.join("tokenizer.json"))
             .map_err(|e| candle_core::Error::Msg(format!("tokenizer: {e}")))
+    }
+
+    /// Resolve the generation-control token ids from THIS model's tokenizer.
+    /// See [`SpecialTokenIds`].
+    pub fn special_token_ids(tokenizer: &Tokenizer) -> Result<SpecialTokenIds> {
+        SpecialTokenIds::resolve(tokenizer)
     }
 
     /// Encode text without auto special tokens → token id row `(1, n)`.

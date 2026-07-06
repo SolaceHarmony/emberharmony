@@ -193,15 +193,30 @@ pub fn from_pretrained(
         audio_loss_multiplier: config["audio_loss_multiplier"].as_f64().unwrap_or(1.0),
     };
 
+    // The tokenizer loads BEFORE the model: the generation-control token ids
+    // (<|im_end|>, <|text_end|>, <|audio_start|>) are defined by the snapshot and
+    // pass through to the generation loops — never hardcoded. The config's own
+    // `lfm.eos_token_id` cross-checks the tokenizer's <|im_end|> so a mismatched
+    // snapshot fails at load, not as silent garbage generation.
+    let tokenizer = LFM2AudioProcessor::load_tokenizer(dir)?;
+    let special = LFM2AudioProcessor::special_token_ids(&tokenizer)?;
+    if let Some(eos) = config["lfm"]["eos_token_id"].as_u64() {
+        if eos as u32 != special.im_end {
+            return Err(err(&format!(
+                "config lfm.eos_token_id ({eos}) disagrees with tokenizer <|im_end|> ({})",
+                special.im_end
+            )));
+        }
+    }
+
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&safes, dtype, device)? };
     let model = LFM2AudioModel::new(
-        lfm_cfg, &enc_cfg, &depth_cfg, codebooks, n_text, n_audio, &loss_conf, vb,
+        lfm_cfg, &enc_cfg, &depth_cfg, codebooks, n_text, n_audio, special, &loss_conf, vb,
     )?;
 
     let prep: PreprocessorConfig =
         serde_json::from_value(config["preprocessor"].clone()).map_err(err)?;
     let audio = FilterbankFeatures::new(prep.mel_config(), device)?;
-    let tokenizer = LFM2AudioProcessor::load_tokenizer(dir)?;
     // Two INDEPENDENT audio backends, mirroring the Python processor's separate
     // `_mimi` / `_audio_detokenizer` fields:
     //  - `mimi`: the Mimi codec (`tokenizer-…checkpoint125.safetensors`), loaded
@@ -298,13 +313,17 @@ pub fn from_pretrained_trainable(dir: &Path, device: &Device) -> Result<Trainabl
         audio_loss_multiplier,
     };
 
+    // Same tokenizer-defined token-id pass-through as the inference loader.
+    let tokenizer = LFM2AudioProcessor::load_tokenizer(dir)?;
+    let special = LFM2AudioProcessor::special_token_ids(&tokenizer)?;
+
     // Build over a fresh VarMap so `LFM2AudioModel::new` allocates trainable Vars,
     // then load the checkpoint into them (faithful: the architecture defines the
     // param set, the safetensors provide the pretrained init).
     let varmap = VarMap::new();
     let vb = VarBuilder::from_varmap(&varmap, dtype, device);
     let model = LFM2AudioModel::new(
-        lfm_cfg, &enc_cfg, &depth_cfg, codebooks, n_text, n_audio, &loss_conf, vb,
+        lfm_cfg, &enc_cfg, &depth_cfg, codebooks, n_text, n_audio, special, &loss_conf, vb,
     )?;
     // Load the checkpoint into the freshly-allocated Vars. `VarMap::load` is *not*
     // usable here: it opens a single file and demands every Var be present in it,
