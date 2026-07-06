@@ -448,16 +448,23 @@ impl ShortConv {
         // zero-pad prefill is the reference semantics.
         if cache.fused_conv_decode && self.l_cache > 0 && seq_len <= 4 && cache.use_kv_cache {
             if let Some(prev) = cache.conv_states[block_idx].clone() {
-                // One line per process, so a live run PROVES this path executed
-                // (the harness A/B can't certify the shipped app; a log line can).
-                static FUSED_ANNOUNCED: std::sync::Once = std::sync::Once::new();
-                FUSED_ANNOUNCED.call_once(|| {
-                    eprintln!(
-                        "[voice] fused conv decode kernel active \
-                         (candle-flashfftconv causal_conv1d_update, {:?})",
-                        bcx.device().location()
-                    );
-                });
+                // One line per DEVICE (not per process): a live run PROVES this
+                // path executed and on which silicon. Per-device matters — the
+                // app can switch compute device between sessions, and a
+                // process-wide `Once` would keep showing the first session's
+                // device forever (exactly the misdirection that hid a CPU run).
+                static FUSED_ANNOUNCED: std::sync::Mutex<Option<candle_core::DeviceLocation>> =
+                    std::sync::Mutex::new(None);
+                let loc = bcx.device().location();
+                if let Ok(mut last) = FUSED_ANNOUNCED.lock() {
+                    if *last != Some(loc) {
+                        *last = Some(loc);
+                        eprintln!(
+                            "[voice] fused conv decode kernel active \
+                             (candle-flashfftconv causal_conv1d_update, {loc:?})"
+                        );
+                    }
+                }
                 let w = self.conv_weight.squeeze(1)?; // (H, K)
                 let bcx = bcx.contiguous()?;
                 let (y, new_state) =

@@ -143,16 +143,33 @@ fn resident_lfm2(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(resident) = slot.as_ref() {
         if resident.dir == dir && &resident.device_setting == device_setting {
+            // Per-session ground truth in the log: which silicon this session's
+            // model actually lives on (the settings store can say one thing and
+            // a stale resident another — this line is the arbiter).
+            eprintln!(
+                "[voice] LFM2 session: setting {:?} -> resident model reused on {:?}",
+                device_setting,
+                resident.device.location()
+            );
             return Ok((
                 resident.model.clone(),
                 resident.proc.clone(),
                 resident.device.clone(),
             ));
         }
+        eprintln!(
+            "[voice] LFM2 session: setting changed ({:?} -> {:?}); reloading model",
+            resident.device_setting, device_setting
+        );
     }
     // First load (or dir/device change): create the device HERE so it lives and
     // dies with the resident weights — one queue, one kernel cache, one pool.
     let device = select_device(device_setting)?;
+    eprintln!(
+        "[voice] LFM2 session: setting {:?} -> loading model onto {:?}",
+        device_setting,
+        device.location()
+    );
     let (model, proc) =
         from_pretrained(dir, &device).map_err(|e| format!("failed to load LFM2-Audio: {e}"))?;
     let (model, proc) = (Arc::new(model), Arc::new(proc));

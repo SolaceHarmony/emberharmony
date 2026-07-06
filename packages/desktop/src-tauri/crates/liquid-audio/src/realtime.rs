@@ -33,11 +33,13 @@ use crate::moshi::models::{
 #[cfg(test)]
 const MIMI_RATE: u32 = 24_000; // Mimi/LFM2 detokenizer output rate.
 
-// 2, not 1: a speculative `Prepare` and the `Respond` that commits the same
-// utterance travel the queue back-to-back (the prepare-during-pause flow); the
-// old 1-slot contract ("current generation + next turn") still holds for
-// utterances because prepares are consumed by the worker in milliseconds.
-const UTTERANCE_QUEUE_CAP: usize = 2;
+// One queued utterance is enough: current generation + next turn. Speculative
+// Prepare/Discard control messages travel a SEPARATE channel (below) so a
+// prepare can never occupy the slot a committed utterance needs — a prepare
+// causing a "pipeline busy" utterance drop is the failure mode this split
+// exists to make impossible.
+const UTTERANCE_QUEUE_CAP: usize = 1;
+const CONTROL_QUEUE_CAP: usize = 2;
 const EVENT_QUEUE_CAP: usize = 128;
 const FRAME_QUEUE_CAP: usize = 8;
 
@@ -181,18 +183,19 @@ pub enum FrameSubmitError {
     Disconnected,
 }
 
-struct QueuedWork {
-    item: WorkItem,
+struct QueuedUtterance {
+    utt: Utterance,
     epoch: u64,
 }
 
-/// What the VAD side hands the inference worker.
-enum WorkItem {
-    /// A committed utterance: run the full reply.
-    Respond(Utterance),
-    /// A PROBABLE utterance (pause detected, not yet committed): speculatively
-    /// prefill it so the matching `Respond` skips straight to generation.
-    Prepare(Utterance),
+/// Speculative-prefill control messages — a separate channel from utterances so
+/// they can never starve a committed turn (see [`VoiceEngine::prepare`]). Both
+/// directions are best-effort: a lost Prepare loses only the head start, a lost
+/// Discard is caught by the engine's own staleness check on the next respond.
+enum Control {
+    /// A PROBABLE utterance (pause detected, not yet committed): prefill it so
+    /// the matching utterance skips straight to generation.
+    Prepare { utt: Utterance, epoch: u64 },
     /// The pause was not a turn end — roll the speculative prefill back.
     DiscardPrepared,
 }
@@ -200,7 +203,8 @@ enum WorkItem {
 /// Handle to the inference worker thread: submit utterances, receive reply events, request
 /// barge-in. Dropping it closes the channel and joins the worker.
 pub struct RealtimePipeline {
-    utt_tx: Option<Sender<QueuedWork>>,
+    utt_tx: Option<Sender<QueuedUtterance>>,
+    ctl_tx: Option<Sender<Control>>,
     event_rx: Receiver<VoiceEvent>,
     cancel: Arc<AtomicBool>,
     epoch: Arc<AtomicU64>,
@@ -210,7 +214,8 @@ pub struct RealtimePipeline {
 /// Cloneable control handle for producers that feed an existing realtime worker.
 #[derive(Clone)]
 pub struct RealtimePipelineHandle {
-    utt_tx: Sender<QueuedWork>,
+    utt_tx: Sender<QueuedUtterance>,
+    ctl_tx: Sender<Control>,
     cancel: Arc<AtomicBool>,
     epoch: Arc<AtomicU64>,
 }
@@ -220,37 +225,25 @@ impl RealtimePipelineHandle {
     /// worker has stopped.
     pub fn submit(&self, utt: Utterance) -> bool {
         let epoch = self.epoch.load(Ordering::Acquire);
-        match self.utt_tx.try_send(QueuedWork {
-            item: WorkItem::Respond(utt),
-            epoch,
-        }) {
+        match self.utt_tx.try_send(QueuedUtterance { utt, epoch }) {
             Ok(()) => true,
             Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => false,
         }
     }
 
     /// Best-effort speculative prefill of a PROBABLE utterance (see
-    /// [`VoiceEngine::prepare`]). Returns `false` if the queue is full — the caller
-    /// loses the head start, never correctness.
+    /// [`VoiceEngine::prepare`]). Returns `false` if the control queue is full —
+    /// the caller loses the head start, never correctness.
     pub fn prepare(&self, utt: Utterance) -> bool {
         let epoch = self.epoch.load(Ordering::Acquire);
-        self.utt_tx
-            .try_send(QueuedWork {
-                item: WorkItem::Prepare(utt),
-                epoch,
-            })
-            .is_ok()
+        self.ctl_tx.try_send(Control::Prepare { utt, epoch }).is_ok()
     }
 
     /// Roll back a speculative prefill (the pause was not a turn end). Best-effort:
     /// if the message is lost, the engine detects the stale prepared state itself
     /// on the next respond.
     pub fn discard_prepared(&self) {
-        let epoch = self.epoch.load(Ordering::Acquire);
-        let _ = self.utt_tx.try_send(QueuedWork {
-            item: WorkItem::DiscardPrepared,
-            epoch,
-        });
+        let _ = self.ctl_tx.try_send(Control::DiscardPrepared);
     }
 
     /// Request barge-in: abort the in-flight reply.
@@ -258,6 +251,125 @@ impl RealtimePipelineHandle {
         self.epoch.fetch_add(1, Ordering::AcqRel);
         self.cancel.store(true, Ordering::SeqCst);
     }
+}
+
+/// Outcome of serving one queued utterance.
+enum Served {
+    Continue,
+    /// Event consumer hung up — stop the worker.
+    Stop,
+}
+
+/// Set the cancel flag, reset the engine's stream state, clear the flag.
+fn interrupt_engine<E: VoiceEngine>(engine: &mut E, cancel: &AtomicBool) -> Result<(), String> {
+    cancel.store(true, Ordering::SeqCst);
+    let reset = engine.interrupt_stream();
+    cancel.store(false, Ordering::SeqCst);
+    reset
+}
+
+/// Handle one speculative-prefill control message (best-effort, no events).
+fn handle_control<E: VoiceEngine>(engine: &mut E, ctl: Control, epoch_worker: &AtomicU64) {
+    match ctl {
+        Control::Prepare { utt, epoch } => {
+            // A stale prepare (barge-in happened since) is simply dropped; the
+            // engine's own staleness check is the real guard.
+            if epoch >= epoch_worker.load(Ordering::Acquire) {
+                if let Err(error) = engine.prepare(&utt) {
+                    crate::vtrace!("worker: speculative prepare failed: {error}");
+                }
+            }
+        }
+        Control::DiscardPrepared => engine.discard_prepared(),
+    }
+}
+
+/// Serve one committed utterance: the epoch/barge-in fencing plus the respond
+/// call — the body of the inference coroutine, extracted so the worker can be
+/// driven from a two-channel `select`.
+fn serve_utterance<E: VoiceEngine>(
+    engine: &mut E,
+    utt: Utterance,
+    epoch: u64,
+    current_epoch: &mut u64,
+    epoch_worker: &AtomicU64,
+    cancel_worker: &AtomicBool,
+    event_tx: &Sender<VoiceEvent>,
+) -> Served {
+    let latest_epoch = epoch_worker.load(Ordering::Acquire);
+    if epoch < latest_epoch {
+        if latest_epoch > *current_epoch {
+            *current_epoch = latest_epoch;
+            match interrupt_engine(engine, cancel_worker) {
+                Ok(()) => {
+                    if !try_send_event(event_tx, VoiceEvent::Interrupted, cancel_worker) {
+                        return Served::Stop;
+                    }
+                }
+                Err(error) => {
+                    if !try_send_event(event_tx, VoiceEvent::Error(error), cancel_worker) {
+                        return Served::Stop;
+                    }
+                }
+            }
+        }
+        return Served::Continue;
+    }
+    if epoch > *current_epoch {
+        *current_epoch = epoch;
+        match interrupt_engine(engine, cancel_worker) {
+            Ok(()) => {
+                if !try_send_event(event_tx, VoiceEvent::Interrupted, cancel_worker) {
+                    return Served::Stop;
+                }
+            }
+            Err(error) => {
+                if !try_send_event(event_tx, VoiceEvent::Error(error), cancel_worker) {
+                    return Served::Stop;
+                }
+                return Served::Continue;
+            }
+        }
+    }
+    // A fresh turn clears any barge-in left set by the previous reply, so
+    // it cannot carry over and abort the new one before it starts.
+    cancel_worker.store(false, Ordering::SeqCst);
+    let mut event_backpressure = false;
+    let responded = {
+        let mut emit = |ev: VoiceEvent| {
+            if event_backpressure {
+                return;
+            }
+            if !try_send_event(event_tx, ev, cancel_worker) {
+                event_backpressure = true;
+            }
+        };
+        engine.respond(&utt, cancel_worker, &mut emit)
+    };
+    let terminal = if event_backpressure {
+        VoiceEvent::Error("voice event queue full or disconnected".into())
+    } else {
+        match responded {
+            Ok(true) => VoiceEvent::TurnComplete,
+            Ok(false) => {
+                let latest_epoch = epoch_worker.load(Ordering::Acquire);
+                if latest_epoch > *current_epoch {
+                    *current_epoch = latest_epoch;
+                    match interrupt_engine(engine, cancel_worker) {
+                        Ok(()) => VoiceEvent::Interrupted,
+                        Err(error) => VoiceEvent::Error(error),
+                    }
+                } else {
+                    VoiceEvent::Interrupted
+                }
+            }
+            Err(e) => VoiceEvent::Error(e),
+        }
+    };
+    if !try_send_event(event_tx, terminal, cancel_worker) {
+        return Served::Stop; // consumer hung up — nothing left to serve.
+    }
+    Served::Continue
 }
 
 impl RealtimePipeline {
@@ -274,8 +386,10 @@ impl RealtimePipeline {
         // The realtime mic/VAD side must not accumulate stale speech behind a busy model.
         // One queued utterance is enough: current generation + next turn. Barge-in sets the
         // cancel flag first; if this slot is still full, the caller gets backpressure instead
-        // of silently growing latency.
-        let (utt_tx, utt_rx) = bounded::<QueuedWork>(UTTERANCE_QUEUE_CAP);
+        // of silently growing latency. Speculative Prepare/Discard ride their own channel so
+        // they can never occupy the utterance slot.
+        let (utt_tx, utt_rx) = bounded::<QueuedUtterance>(UTTERANCE_QUEUE_CAP);
+        let (ctl_tx, ctl_rx) = bounded::<Control>(CONTROL_QUEUE_CAP);
         let (event_tx, event_rx) = bounded::<VoiceEvent>(EVENT_QUEUE_CAP);
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_worker = cancel.clone();
@@ -285,128 +399,63 @@ impl RealtimePipeline {
         let worker = std::thread::Builder::new()
             .name("lfm2-inference".into())
             .spawn(move || {
-                // The inference coroutine: serve utterances until the sender is dropped
-                // (channel closed) ⇒ `iter()` ends ⇒ the thread returns and joins.
+                // The inference coroutine: serve until the pipeline drops (both
+                // senders close ⇒ the utterance recv errors ⇒ return and join).
                 let mut current_epoch = 0u64;
-                for QueuedWork { item, epoch } in utt_rx.iter() {
-                    // Control items first: best-effort, no events, no epoch dance.
-                    // A stale prepare is simply dropped; the engine's own staleness
-                    // check (utterance + conversation mark) is the real guard.
-                    match &item {
-                        WorkItem::Prepare(utt) => {
-                            if epoch >= epoch_worker.load(Ordering::Acquire) {
-                                if let Err(error) = engine.prepare(utt) {
-                                    crate::vtrace!("worker: speculative prepare failed: {error}");
-                                }
-                            }
-                            continue;
-                        }
-                        WorkItem::DiscardPrepared => {
-                            engine.discard_prepared();
-                            continue;
-                        }
-                        WorkItem::Respond(_) => {}
-                    }
-                    let WorkItem::Respond(utt) = item else {
-                        unreachable!("control items handled above")
-                    };
-                    let latest_epoch = epoch_worker.load(Ordering::Acquire);
-                    if epoch < latest_epoch {
-                        if latest_epoch > current_epoch {
-                            current_epoch = latest_epoch;
-                            cancel_worker.store(true, Ordering::SeqCst);
-                            let reset = engine.interrupt_stream();
-                            cancel_worker.store(false, Ordering::SeqCst);
-                            match reset {
-                                Ok(()) => {
-                                    if !try_send_event(
-                                        &event_tx,
-                                        VoiceEvent::Interrupted,
-                                        &cancel_worker,
-                                    ) {
-                                        break;
-                                    }
-                                }
-                                Err(error) => {
-                                    if !try_send_event(
-                                        &event_tx,
-                                        VoiceEvent::Error(error),
-                                        &cancel_worker,
-                                    ) {
-                                        break;
-                                    }
-                                }
+                let mut ctl_open = true;
+                loop {
+                    // Drain queued control first (never blocks): a Prepare sent
+                    // before its committing utterance is guaranteed to run first.
+                    while ctl_open {
+                        match ctl_rx.try_recv() {
+                            Ok(ctl) => handle_control(&mut engine, ctl, &epoch_worker),
+                            Err(crossbeam_channel::TryRecvError::Empty) => break,
+                            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                                ctl_open = false;
                             }
                         }
-                        continue;
                     }
-                    if epoch > current_epoch {
-                        current_epoch = epoch;
-                        cancel_worker.store(true, Ordering::SeqCst);
-                        let reset = engine.interrupt_stream();
-                        cancel_worker.store(false, Ordering::SeqCst);
-                        match reset {
-                            Ok(()) => {
-                                if !try_send_event(
-                                    &event_tx,
-                                    VoiceEvent::Interrupted,
+                    let served = if ctl_open {
+                        crossbeam_channel::select! {
+                            recv(ctl_rx) -> msg => match msg {
+                                Ok(ctl) => {
+                                    handle_control(&mut engine, ctl, &epoch_worker);
+                                    Served::Continue
+                                }
+                                Err(_) => {
+                                    ctl_open = false;
+                                    Served::Continue
+                                }
+                            },
+                            recv(utt_rx) -> msg => match msg {
+                                Ok(QueuedUtterance { utt, epoch }) => serve_utterance(
+                                    &mut engine,
+                                    utt,
+                                    epoch,
+                                    &mut current_epoch,
+                                    &epoch_worker,
                                     &cancel_worker,
-                                ) {
-                                    break;
-                                }
-                            }
-                            Err(error) => {
-                                if !try_send_event(
                                     &event_tx,
-                                    VoiceEvent::Error(error),
-                                    &cancel_worker,
-                                ) {
-                                    break;
-                                }
-                                continue;
-                            }
+                                ),
+                                Err(_) => return,
+                            },
                         }
-                    }
-                    // A fresh turn clears any barge-in left set by the previous reply, so
-                    // it cannot carry over and abort the new one before it starts.
-                    cancel_worker.store(false, Ordering::SeqCst);
-                    let mut event_backpressure = false;
-                    let responded = {
-                        let mut emit = |ev: VoiceEvent| {
-                            if event_backpressure {
-                                return;
-                            }
-                            if !try_send_event(&event_tx, ev, &cancel_worker) {
-                                event_backpressure = true;
-                            }
-                        };
-                        engine.respond(&utt, &cancel_worker, &mut emit)
-                    };
-                    let terminal = if event_backpressure {
-                        VoiceEvent::Error("voice event queue full or disconnected".into())
                     } else {
-                        match responded {
-                            Ok(true) => VoiceEvent::TurnComplete,
-                            Ok(false) => {
-                                let latest_epoch = epoch_worker.load(Ordering::Acquire);
-                                if latest_epoch > current_epoch {
-                                    current_epoch = latest_epoch;
-                                    cancel_worker.store(true, Ordering::SeqCst);
-                                    let reset = engine.interrupt_stream();
-                                    cancel_worker.store(false, Ordering::SeqCst);
-                                    match reset {
-                                        Ok(()) => VoiceEvent::Interrupted,
-                                        Err(error) => VoiceEvent::Error(error),
-                                    }
-                                } else {
-                                    VoiceEvent::Interrupted
-                                }
-                            }
-                            Err(e) => VoiceEvent::Error(e),
+                        match utt_rx.recv() {
+                            Ok(QueuedUtterance { utt, epoch }) => serve_utterance(
+                                &mut engine,
+                                utt,
+                                epoch,
+                                &mut current_epoch,
+                                &epoch_worker,
+                                &cancel_worker,
+                                &event_tx,
+                            ),
+                            Err(_) => return,
                         }
                     };
-                    if !try_send_event(&event_tx, terminal, &cancel_worker) {
-                        break; // consumer hung up — nothing left to serve.
+                    if matches!(served, Served::Stop) {
+                        return;
                     }
                 }
             })
@@ -414,6 +463,7 @@ impl RealtimePipeline {
 
         Ok(Self {
             utt_tx: Some(utt_tx),
+            ctl_tx: Some(ctl_tx),
             event_rx,
             cancel,
             epoch,
@@ -428,10 +478,7 @@ impl RealtimePipeline {
             return false;
         };
         let epoch = self.epoch.load(Ordering::Acquire);
-        match tx.try_send(QueuedWork {
-            item: WorkItem::Respond(utt),
-            epoch,
-        }) {
+        match tx.try_send(QueuedUtterance { utt, epoch }) {
             Ok(()) => true,
             Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => false,
         }
@@ -439,32 +486,25 @@ impl RealtimePipeline {
 
     /// Best-effort speculative prefill of a PROBABLE utterance (see
     /// [`VoiceEngine::prepare`]): the VAD calls this at pause onset so the prefill
-    /// runs during the remaining silence window. Returns `false` if the queue is
-    /// full — the caller loses the head start, never correctness.
+    /// runs during the remaining silence window. Rides the control channel — it
+    /// can never occupy an utterance slot. Returns `false` if the control queue
+    /// is full: the caller loses the head start, never correctness.
     pub fn prepare(&self, utt: Utterance) -> bool {
-        let Some(tx) = self.utt_tx.as_ref() else {
+        let Some(tx) = self.ctl_tx.as_ref() else {
             return false;
         };
         let epoch = self.epoch.load(Ordering::Acquire);
-        tx.try_send(QueuedWork {
-            item: WorkItem::Prepare(utt),
-            epoch,
-        })
-        .is_ok()
+        tx.try_send(Control::Prepare { utt, epoch }).is_ok()
     }
 
     /// Roll back a speculative prefill (the pause was not a turn end). Best-effort:
     /// if this message is lost, the engine detects the stale prepared state itself
     /// on the next respond.
     pub fn discard_prepared(&self) {
-        let Some(tx) = self.utt_tx.as_ref() else {
+        let Some(tx) = self.ctl_tx.as_ref() else {
             return;
         };
-        let epoch = self.epoch.load(Ordering::Acquire);
-        let _ = tx.try_send(QueuedWork {
-            item: WorkItem::DiscardPrepared,
-            epoch,
-        });
+        let _ = tx.try_send(Control::DiscardPrepared);
     }
 
     /// Request barge-in: abort the in-flight reply. The engine polls this and returns
@@ -482,20 +522,25 @@ impl RealtimePipeline {
 
     /// A cloneable producer/control handle for external audio transports.
     pub fn handle(&self) -> Option<RealtimePipelineHandle> {
-        self.utt_tx.as_ref().map(|utt_tx| RealtimePipelineHandle {
-            utt_tx: utt_tx.clone(),
-            cancel: self.cancel.clone(),
-            epoch: self.epoch.clone(),
-        })
+        match (self.utt_tx.as_ref(), self.ctl_tx.as_ref()) {
+            (Some(utt_tx), Some(ctl_tx)) => Some(RealtimePipelineHandle {
+                utt_tx: utt_tx.clone(),
+                ctl_tx: ctl_tx.clone(),
+                cancel: self.cancel.clone(),
+                epoch: self.epoch.clone(),
+            }),
+            _ => None,
+        }
     }
 }
 
 impl Drop for RealtimePipeline {
     fn drop(&mut self) {
-        // Abort any in-flight reply fast, then close the utterance channel so the worker's
-        // `iter()` ends, then join — no detached thread, no leak.
+        // Abort any in-flight reply fast, then close both channels so the worker's
+        // recv errors out, then join — no detached thread, no leak.
         self.epoch.fetch_add(1, Ordering::AcqRel);
         self.cancel.store(true, Ordering::SeqCst);
+        drop(self.ctl_tx.take());
         drop(self.utt_tx.take());
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
@@ -2076,17 +2121,20 @@ mod tests {
         entered_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("worker should start first utterance");
-        // Two queued items are allowed (a speculative Prepare + the Respond that
-        // commits it travel back-to-back); the third must hit backpressure
-        // instead of growing an unbounded queue.
-        assert!(pipe.submit(utt(2)), "first pending utterance is allowed");
-        assert!(pipe.submit(utt(3)), "second pending slot (prepare+respond pair)");
+        assert!(pipe.submit(utt(2)), "one pending utterance is allowed");
         assert!(
-            !pipe.submit(utt(4)),
-            "further utterances must hit backpressure instead of growing an unbounded queue"
+            !pipe.submit(utt(3)),
+            "third utterance must hit backpressure instead of growing an unbounded queue"
+        );
+        // Speculative control messages ride their own channel: a prepare can
+        // NEVER occupy the utterance slot (the regression that caused live
+        // "pipeline busy" utterance drops).
+        assert!(
+            pipe.prepare(utt(9)),
+            "prepare must be accepted even with the utterance queue full"
         );
 
-        for _ in 0..3 {
+        for _ in 0..2 {
             release_tx.send(()).unwrap();
             assert_eq!(
                 pipe.events().recv_timeout(Duration::from_secs(5)).unwrap(),
@@ -2234,11 +2282,9 @@ mod tests {
         };
         let mut engine = Lfm2VoiceEngine::new(model, proc, params, codebooks, device, MIMI_RATE);
 
-        // Reuse the reference question clip for both turns (a smoke test of growth, not content).
-        let wav_path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../../../../experiments/lfm2-audio-voice/upstream-liquid-audio/assets/question.wav"
-        );
+        // Reuse the reference question clip for both turns (a smoke test of growth, not
+        // content). The upstream clip is vendored in-crate.
+        let wav_path = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/question.wav");
         let bytes = std::fs::read(wav_path).expect("read question.wav");
         // PCM16 mono/stereo → mono f32; assume 16-bit (the reference asset is).
         let hdr = 44usize;
