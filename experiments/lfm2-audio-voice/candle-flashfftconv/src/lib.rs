@@ -82,6 +82,7 @@
 
 mod butterfly;
 mod conv1d;
+mod conv1d_update;
 mod dd_complex_mul;
 mod dw3;
 mod fused_fft_conv;
@@ -96,9 +97,12 @@ pub use butterfly::{
     monarch_conv, monarch_conv_bf16, twiddle_factors_fft, twiddle_factors_ifft,
 };
 pub use conv1d::{depthwise_conv1d, depthwise_conv1d_stream, DepthwiseCausalConv1d};
+pub use conv1d_update::causal_conv1d_update_fused;
 pub use dd_complex_mul::complex_mul_dd;
 pub use dw3::depthwise3_causal;
 pub use fused_fft_conv::{fused_fft_conv, FusedFftConv};
 pub use fused_fft_conv_dd::{fused_fft_conv_dd, FusedFftConvDd};
-pub use fused_monarch::{butterfly_fft_forward_fused, monarch_conv_fused, warmup};
+pub use fused_monarch::{
+    butterfly_fft_forward_fused, monarch_conv_fused, monarch_conv_fused_padded, warmup,
+};
 pub use irfft::{irfft, irfft_dd, FftNorm};

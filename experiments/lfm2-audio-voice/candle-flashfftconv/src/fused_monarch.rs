@@ -874,6 +874,584 @@ pub fn monarch_conv_fused(
     u.apply_op3(&packed, &k_f, MonarchFusedConv)
 }
 
+// ===========================================================================
+// PADDED (+ optionally GATED) fused Monarch convolution — the causal-linear-conv
+// variant of `monarch_conv_fused`, on the same simdgroup_matrix core.
+//
+// FFT convolution is CIRCULAR at the transform length M = N·L. For the causal
+// LINEAR convolution a sequence model needs (CUDA monarch_conv's padded path /
+// the MLX `butterfly_*_padded*` oracle family), the length-T signal occupies the
+// FIRST T positions of the M-point transform (T ≤ M, typically M ≥ 2T so wrap
+// never reaches a valid output), the rest is zero-fill, and only the first T
+// outputs are stored. Gating (the Hyena/H3 elementwise gates the CUDA kernels
+// fuse) is applied at the same two touch points: input gate at load, output gate
+// at store — so neither gate ever materializes a gated tensor in device memory.
+//
+// Time order: t = c·N + r over the [N,L] grid — the 4-step COLUMN-major
+// flattening (`reshape(transpose(x))` in the MLX oracle's accuracy test), the
+// same layout `monarch_conv`'s circular equivalence holds in. Pinned down by a
+// delta-shift probe and the linear-conv ground-truth test below.
+// ===========================================================================
+
+#[cfg(feature = "metal")]
+const SRC_FUSED_CONV_PADDED: &str = r#"
+#include <metal_stdlib>
+#include <metal_simdgroup_matrix>
+using namespace metal;
+
+struct PaddedConvParams {
+    uint B; uint H; uint N; uint L; uint Np; uint Lp;
+    uint off_dLr; uint off_dLi; uint off_dNr; uint off_dNi; uint off_tw;
+    uint off_idNr; uint off_idNi; uint off_idLr; uint off_idLi; uint off_itw;
+    uint T; uint gates; // bit0 input gate, bit1 output gate, bit2 u·D skip term
+    uint off_d;         // packed offset of D[H] when gates bit2 is set
+};
+
+kernel void monarch_fused_conv_padded_f32(
+    constant PaddedConvParams& p [[buffer(0)]],
+    device const float*  u_ext  [[buffer(1)]],  // [G,B,H,T]: u | in_gate? | out_gate?
+    device const float*  packed [[buffer(2)]],  // dLr|dLi|dNr|dNi|tw|idNr|idNi|idLr|idLi|itw (padded)
+    device const float*  kf     [[buffer(3)]],  // [B,H,N,L,2] complex (broadcast on host)
+    device float*        out    [[buffer(4)]],  // [B,H,T] real
+    threadgroup float*   ux   [[threadgroup(0)]],
+    threadgroup float*   axr  [[threadgroup(1)]],
+    threadgroup float*   axi  [[threadgroup(2)]],
+    threadgroup float*   bxr  [[threadgroup(3)]],
+    threadgroup float*   bxi  [[threadgroup(4)]],
+    threadgroup float*   scratch [[threadgroup(5)]],
+    uint bh   [[threadgroup_position_in_grid]],
+    uint lane [[thread_position_in_threadgroup]]
+) {
+    uint N = p.N, L = p.L, Np = p.Np, Lp = p.Lp, NL = N * L, NpLp = Np * Lp;
+    uint T = p.T, BH = p.B * p.H;
+    device const float* xb  = u_ext + bh * T; // slot 0
+    device const float* ig  = u_ext + (BH + bh) * T; // slot 1 (valid iff gates&1)
+    uint og_slot = (p.gates & 1u) ? 2u : 1u;
+    device const float* og  = u_ext + (og_slot * BH + bh) * T; // valid iff gates&2
+    device const float* kfb = kf + bh * NL * 2u;
+    device float*       ob  = out + bh * T;
+    device const float* dLr = packed + p.off_dLr;
+    device const float* dLi = packed + p.off_dLi;
+    device const float* dNr = packed + p.off_dNr;
+    device const float* dNi = packed + p.off_dNi;
+    device const float* tw  = packed + p.off_tw;
+    device const float* idNr= packed + p.off_idNr;
+    device const float* idNi= packed + p.off_idNi;
+    device const float* idLr= packed + p.off_idLr;
+    device const float* idLi= packed + p.off_idLi;
+    device const float* itw = packed + p.off_itw;
+    device const float* dvec = packed + p.off_d; // D[H], valid iff gates bit2
+
+    // preamble: stage the length-T signal into ux[Np,Lp]. Time order is the
+    // 4-step column-major flattening t = c*N + r (the transpose-flatten the
+    // oracle accuracy test uses); input gate fused at load, zero-fill past T
+    // and in tile padding.
+    for (uint i = lane; i < NpLp; i += 32u) {
+        uint r = i / Lp, c = i % Lp;
+        float v = 0.0f;
+        if (r < N && c < L) {
+            uint t = c * N + r;
+            if (t < T) {
+                v = xb[t];
+                if (p.gates & 1u) { v *= ig[t]; }
+            }
+        }
+        ux[i] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // stage 1: row DFT / L.  A[Np,Lp] = ux @ dL
+    for (uint pr = 0u; pr < Np; pr += 8u) for (uint qc = 0u; qc < Lp; qc += 8u) {
+        simdgroup_float8x8 ar = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        simdgroup_float8x8 ai = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        for (uint kt = 0u; kt < Lp; kt += 8u) {
+            simdgroup_float8x8 xt, dr, di;
+            simdgroup_load(xt, ux  + pr * Lp + kt, Lp);
+            simdgroup_load(dr, dLr + kt * Lp + qc, Lp);
+            simdgroup_load(di, dLi + kt * Lp + qc, Lp);
+            simdgroup_multiply_accumulate(ar, xt, dr, ar);
+            simdgroup_multiply_accumulate(ai, xt, di, ai);
+        }
+        simdgroup_store(ar, axr + pr * Lp + qc, Lp);
+        simdgroup_store(ai, axi + pr * Lp + qc, Lp);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // stage 2: forward twiddle
+    for (uint i = lane; i < NpLp; i += 32u) {
+        uint n = i / Lp, l = i % Lp;
+        float zr = axr[i], zi = axi[i];
+        float twr = tw[(n * Lp + l) * 2u], twi = tw[(n * Lp + l) * 2u + 1u];
+        axr[i] = zr * twr - zi * twi;
+        axi[i] = zr * twi + zi * twr;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // stage 3: col DFT / N.  B[Np,Lp] = dN @ A
+    for (uint pr = 0u; pr < Np; pr += 8u) for (uint qc = 0u; qc < Lp; qc += 8u) {
+        simdgroup_float8x8 m0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        simdgroup_float8x8 m1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        simdgroup_float8x8 m2 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        simdgroup_float8x8 m3 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        for (uint kt = 0u; kt < Np; kt += 8u) {
+            simdgroup_float8x8 dr, di, zr, zi;
+            simdgroup_load(dr, dNr + pr * Np + kt, Np);
+            simdgroup_load(di, dNi + pr * Np + kt, Np);
+            simdgroup_load(zr, axr + kt * Lp + qc, Lp);
+            simdgroup_load(zi, axi + kt * Lp + qc, Lp);
+            simdgroup_multiply_accumulate(m0, dr, zr, m0);
+            simdgroup_multiply_accumulate(m1, di, zi, m1);
+            simdgroup_multiply_accumulate(m2, dr, zi, m2);
+            simdgroup_multiply_accumulate(m3, di, zr, m3);
+        }
+        simdgroup_store(m0, scratch + 0u,   8); simdgroup_store(m1, scratch + 64u,  8);
+        simdgroup_store(m2, scratch + 128u, 8); simdgroup_store(m3, scratch + 192u, 8);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = lane; i < 64u; i += 32u) {
+            uint r = i / 8u, c = i % 8u; uint o = (pr + r) * Lp + qc + c;
+            bxr[o] = scratch[i] - scratch[64u + i];
+            bxi[o] = scratch[128u + i] + scratch[192u + i];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // stage 4: × k_f, valid [N,L] positions only
+    for (uint i = lane; i < NL; i += 32u) {
+        uint n = i / L, l = i % L; uint bo = n * Lp + l;
+        float zr = bxr[bo], zi = bxi[bo];
+        float kr = kfb[i * 2u], ki = kfb[i * 2u + 1u];
+        bxr[bo] = zr * kr - zi * ki;
+        bxi[bo] = zr * ki + zi * kr;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // stage 5: col IDFT / N.  A[Np,Lp] = idN @ B
+    for (uint pr = 0u; pr < Np; pr += 8u) for (uint qc = 0u; qc < Lp; qc += 8u) {
+        simdgroup_float8x8 m0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        simdgroup_float8x8 m1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        simdgroup_float8x8 m2 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        simdgroup_float8x8 m3 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        for (uint kt = 0u; kt < Np; kt += 8u) {
+            simdgroup_float8x8 dr, di, zr, zi;
+            simdgroup_load(dr, idNr + pr * Np + kt, Np);
+            simdgroup_load(di, idNi + pr * Np + kt, Np);
+            simdgroup_load(zr, bxr + kt * Lp + qc, Lp);
+            simdgroup_load(zi, bxi + kt * Lp + qc, Lp);
+            simdgroup_multiply_accumulate(m0, dr, zr, m0);
+            simdgroup_multiply_accumulate(m1, di, zi, m1);
+            simdgroup_multiply_accumulate(m2, dr, zi, m2);
+            simdgroup_multiply_accumulate(m3, di, zr, m3);
+        }
+        simdgroup_store(m0, scratch + 0u,   8); simdgroup_store(m1, scratch + 64u,  8);
+        simdgroup_store(m2, scratch + 128u, 8); simdgroup_store(m3, scratch + 192u, 8);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = lane; i < 64u; i += 32u) {
+            uint r = i / 8u, c = i % 8u; uint o = (pr + r) * Lp + qc + c;
+            axr[o] = scratch[i] - scratch[64u + i];
+            axi[o] = scratch[128u + i] + scratch[192u + i];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // stage 6: conjugate twiddle
+    for (uint i = lane; i < NpLp; i += 32u) {
+        uint n = i / Lp, l = i % Lp;
+        float zr = axr[i], zi = axi[i];
+        float twr = itw[(n * Lp + l) * 2u], twi = itw[(n * Lp + l) * 2u + 1u];
+        axr[i] = zr * twr - zi * twi;
+        axi[i] = zr * twi + zi * twr;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // stage 7: row IDFT / L, real × 1/(N·L); store ONLY t < T, output gate fused.
+    float scale = 1.0f / (float)(N * L);
+    for (uint pr = 0u; pr < Np; pr += 8u) for (uint qc = 0u; qc < Lp; qc += 8u) {
+        simdgroup_float8x8 m0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        simdgroup_float8x8 m1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        for (uint kt = 0u; kt < Lp; kt += 8u) {
+            simdgroup_float8x8 ar, ai, dr, di;
+            simdgroup_load(ar, axr  + pr * Lp + kt, Lp);
+            simdgroup_load(ai, axi  + pr * Lp + kt, Lp);
+            simdgroup_load(dr, idLr + kt * Lp + qc, Lp);
+            simdgroup_load(di, idLi + kt * Lp + qc, Lp);
+            simdgroup_multiply_accumulate(m0, ar, dr, m0);
+            simdgroup_multiply_accumulate(m1, ai, di, m1);
+        }
+        simdgroup_store(m0, scratch + 0u, 8); simdgroup_store(m1, scratch + 64u, 8);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = lane; i < 64u; i += 32u) {
+            uint r = i / 8u, c = i % 8u; uint gr = pr + r, gc = qc + c;
+            if (gr < N && gc < L) {
+                uint t = gc * N + gr;
+                if (t < T) {
+                    float v = (scratch[i] - scratch[64u + i]) * scale;
+                    // u·D delta-tap skip: ux still holds the STAGED (gated) input —
+                    // untouched since the preamble — so the skip is one multiply.
+                    if (p.gates & 4u) { v += ux[gr * Lp + gc] * dvec[bh % p.H]; }
+                    if (p.gates & 2u) { v *= og[t]; }
+                    ob[t] = v;
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+"#;
+
+struct MonarchFusedConvPadded {
+    n: usize,
+    l: usize,
+    gates: u32,
+}
+
+impl CustomOp3 for MonarchFusedConvPadded {
+    fn name(&self) -> &'static str {
+        "monarch_fused_conv_padded"
+    }
+
+    fn cpu_fwd(
+        &self,
+        us: &CpuStorage,
+        ul: &Layout,
+        ps: &CpuStorage,
+        pl: &Layout,
+        ks: &CpuStorage,
+        kl: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        let (g, b, h, t_len) = ul.shape().dims4()?;
+        let (n, l) = (self.n, self.l);
+        let u_ext = contig_f32(us, ul)?;
+        let packed = contig_f32(ps, pl)?;
+        let kf = contig_f32(ks, kl)?;
+        let lay = pack_layout(n, l);
+        let (np, lp) = (lay.np, lay.lp);
+        let expected_packed = lay.total + if self.gates & 4 != 0 { h } else { 0 };
+        if packed.len() != expected_packed {
+            candle_core::bail!(
+                "monarch fused conv padded: packed len {} != expected {expected_packed}",
+                packed.len()
+            );
+        }
+        let expected_g = 1 + (self.gates & 1) as usize + ((self.gates >> 1) & 1) as usize;
+        if g != expected_g {
+            candle_core::bail!(
+                "monarch fused conv padded: {g} input slots, gates flags expect {expected_g}"
+            );
+        }
+        let has_d = self.gates & 4 != 0;
+        let d_off = lay.total;
+        let bh_stride = b * h * t_len;
+        let og_slot = if self.gates & 1 != 0 { 2 } else { 1 };
+        let scale = 1.0f32 / (n * l) as f32;
+        let mut out = vec![0f32; b * h * t_len];
+        let mut x = vec![0f32; n * l]; // padded, gated input
+        let (mut ar, mut ai) = (vec![0f32; n * l], vec![0f32; n * l]);
+        let (mut br, mut bi) = (vec![0f32; n * l], vec![0f32; n * l]);
+        for bh in 0..b * h {
+            let xb = &u_ext[bh * t_len..(bh + 1) * t_len];
+            let kfb = &kf[bh * n * l * 2..(bh + 1) * n * l * 2];
+            // preamble: pad to [n*l]; time order t = c*n + r (4-step column-major),
+            // so time t lands at grid position (r = t % n, c = t / n); input gate
+            // fused at load.
+            x.iter_mut().for_each(|v| *v = 0.0);
+            for t in 0..t_len.min(n * l) {
+                let mut v = xb[t];
+                if self.gates & 1 != 0 {
+                    v *= u_ext[bh_stride + bh * t_len + t];
+                }
+                x[(t % n) * l + (t / n)] = v;
+            }
+            // 1: A = x @ dL
+            for ni in 0..n {
+                for lo in 0..l {
+                    let (mut sr, mut si) = (0f32, 0f32);
+                    for k in 0..l {
+                        let xv = x[ni * l + k];
+                        sr += xv * packed[lay.dlr + k * lp + lo];
+                        si += xv * packed[lay.dli + k * lp + lo];
+                    }
+                    ar[ni * l + lo] = sr;
+                    ai[ni * l + lo] = si;
+                }
+            }
+            // 2: forward twiddle
+            for ni in 0..n {
+                for lo in 0..l {
+                    let idx = ni * l + lo;
+                    let (zr, zi) = (ar[idx], ai[idx]);
+                    let (twr, twi) = (
+                        packed[lay.tw + (ni * lp + lo) * 2],
+                        packed[lay.tw + (ni * lp + lo) * 2 + 1],
+                    );
+                    ar[idx] = zr * twr - zi * twi;
+                    ai[idx] = zr * twi + zi * twr;
+                }
+            }
+            // 3: B = dN @ A
+            for np_ in 0..n {
+                for lo in 0..l {
+                    let (mut sr, mut si) = (0f32, 0f32);
+                    for k in 0..n {
+                        let (dr, di) = (
+                            packed[lay.dnr + np_ * np + k],
+                            packed[lay.dni + np_ * np + k],
+                        );
+                        let (zr, zi) = (ar[k * l + lo], ai[k * l + lo]);
+                        sr += dr * zr - di * zi;
+                        si += dr * zi + di * zr;
+                    }
+                    br[np_ * l + lo] = sr;
+                    bi[np_ * l + lo] = si;
+                }
+            }
+            // 4: × k_f
+            for i in 0..n * l {
+                let (zr, zi) = (br[i], bi[i]);
+                let (kr, ki) = (kfb[i * 2], kfb[i * 2 + 1]);
+                br[i] = zr * kr - zi * ki;
+                bi[i] = zr * ki + zi * kr;
+            }
+            // 5: A = idN @ B
+            for np_ in 0..n {
+                for lo in 0..l {
+                    let (mut sr, mut si) = (0f32, 0f32);
+                    for k in 0..n {
+                        let (dr, di) = (
+                            packed[lay.idnr + np_ * np + k],
+                            packed[lay.idni + np_ * np + k],
+                        );
+                        let (zr, zi) = (br[k * l + lo], bi[k * l + lo]);
+                        sr += dr * zr - di * zi;
+                        si += dr * zi + di * zr;
+                    }
+                    ar[np_ * l + lo] = sr;
+                    ai[np_ * l + lo] = si;
+                }
+            }
+            // 6: conjugate twiddle
+            for ni in 0..n {
+                for lo in 0..l {
+                    let idx = ni * l + lo;
+                    let (zr, zi) = (ar[idx], ai[idx]);
+                    let (twr, twi) = (
+                        packed[lay.itw + (ni * lp + lo) * 2],
+                        packed[lay.itw + (ni * lp + lo) * 2 + 1],
+                    );
+                    ar[idx] = zr * twr - zi * twi;
+                    ai[idx] = zr * twi + zi * twr;
+                }
+            }
+            // 7: out = Re(A @ idL) × scale, first T only (time t = lo*n + ni),
+            // output gate fused at store.
+            for ni in 0..n {
+                for lo in 0..l {
+                    let t = lo * n + ni;
+                    if t >= t_len {
+                        continue;
+                    }
+                    let mut sr = 0f32;
+                    for k in 0..l {
+                        sr += ar[ni * l + k] * packed[lay.idlr + k * lp + lo]
+                            - ai[ni * l + k] * packed[lay.idli + k * lp + lo];
+                    }
+                    let mut v = sr * scale;
+                    if has_d {
+                        // Delta-tap skip on the staged (gated) input, per head.
+                        v += x[ni * l + lo] * packed[d_off + bh % h];
+                    }
+                    if self.gates & 2 != 0 {
+                        v *= u_ext[og_slot * bh_stride + bh * t_len + t];
+                    }
+                    out[bh * t_len + t] = v;
+                }
+            }
+        }
+        Ok((CpuStorage::F32(out), Shape::from((b, h, t_len))))
+    }
+
+    #[cfg(feature = "metal")]
+    fn metal_fwd(
+        &self,
+        us: &candle_core::MetalStorage,
+        ul: &Layout,
+        ps: &candle_core::MetalStorage,
+        pl: &Layout,
+        ks: &candle_core::MetalStorage,
+        kl: &Layout,
+    ) -> Result<(candle_core::MetalStorage, Shape)> {
+        use candle_core::backend::BackendStorage;
+        use candle_core::{DType, MetalStorage};
+        use objc2_metal::MTLSize;
+
+        let (_g, b, h, t_len) = ul.shape().dims4()?;
+        let (n, l) = (self.n, self.l);
+        let lay = pack_layout(n, l);
+        let (np, lp) = (lay.np, lay.lp);
+        let dts = DType::F32.size_in_bytes();
+        let tg_bytes = (5 * np * lp + 4 * 64) * dts;
+        if tg_bytes > 32768 {
+            candle_core::bail!("monarch fused conv padded: threadgroup mem {tg_bytes}B exceeds 32KB (N={n} L={l}); factor smaller");
+        }
+
+        #[repr(C)]
+        struct PaddedConvParams {
+            b: u32,
+            h: u32,
+            n: u32,
+            l: u32,
+            np: u32,
+            lp: u32,
+            off_dlr: u32,
+            off_dli: u32,
+            off_dnr: u32,
+            off_dni: u32,
+            off_tw: u32,
+            off_idnr: u32,
+            off_idni: u32,
+            off_idlr: u32,
+            off_idli: u32,
+            off_itw: u32,
+            t: u32,
+            gates: u32,
+            off_d: u32,
+        }
+        let params = PaddedConvParams {
+            b: b as u32,
+            h: h as u32,
+            n: n as u32,
+            l: l as u32,
+            np: np as u32,
+            lp: lp as u32,
+            off_dlr: lay.dlr as u32,
+            off_dli: lay.dli as u32,
+            off_dnr: lay.dnr as u32,
+            off_dni: lay.dni as u32,
+            off_tw: lay.tw as u32,
+            off_idnr: lay.idnr as u32,
+            off_idni: lay.idni as u32,
+            off_idlr: lay.idlr as u32,
+            off_idli: lay.idli as u32,
+            off_itw: lay.itw as u32,
+            t: t_len as u32,
+            gates: self.gates,
+            off_d: lay.total as u32,
+        };
+
+        let dev = us.device();
+        let p = crate::metal_util::pipeline(
+            dev,
+            "monarch_fused_conv_padded_f32",
+            SRC_FUSED_CONV_PADDED,
+        )?;
+        let out_el = b * h * t_len;
+        let out = dev.new_buffer(out_el, DType::F32, "monarch_fused_conv_padded")?;
+
+        let enc = dev.command_encoder()?;
+        enc.set_compute_pipeline_state(&p);
+        enc.set_bytes(0, &params);
+        enc.set_buffer(1, Some(us.buffer()), ul.start_offset() * dts);
+        enc.set_buffer(2, Some(ps.buffer()), pl.start_offset() * dts);
+        enc.set_buffer(3, Some(ks.buffer()), kl.start_offset() * dts);
+        enc.set_buffer(4, Some(&*out), 0);
+        let nplp = np * lp * dts;
+        enc.set_threadgroup_memory_length(0, nplp); // ux
+        enc.set_threadgroup_memory_length(1, nplp); // axr
+        enc.set_threadgroup_memory_length(2, nplp); // axi
+        enc.set_threadgroup_memory_length(3, nplp); // bxr
+        enc.set_threadgroup_memory_length(4, nplp); // bxi
+        enc.set_threadgroup_memory_length(5, 4 * 64 * dts); // scratch
+        enc.dispatch_thread_groups(
+            MTLSize {
+                width: b * h,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: 32,
+                height: 1,
+                depth: 1,
+            },
+        );
+        Ok((
+            MetalStorage::new(out, dev.clone(), out_el, DType::F32),
+            Shape::from((b, h, t_len)),
+        ))
+    }
+}
+
+/// PADDED fused Monarch convolution — causal LINEAR convolution of a length-`T`
+/// signal in one tiled `simdgroup_matrix` dispatch, with the Hyena/H3 elementwise
+/// gates fused at their natural touch points (input gate at load, output gate at
+/// store — no gated tensor ever materializes).
+///
+/// `u`/`in_gate`/`out_gate` are `[B,H,T]` real with `T ≤ N·L`; `k_f` `[…,N,L,2]`
+/// is the filter's forward Monarch FFT at the transform size (zero-pad the filter
+/// to `N·L` before `butterfly_fft_forward`, laid out in the same column-major time
+/// order). `d` `[H]` is the optional per-head delta-tap skip `y += (u·in_gate)·D`
+/// (`fused_fft_conv`'s `u·D`, applied to the same input the conv sees), added
+/// before the output gate. FFT conv is circular at `N·L`: choose
+/// `N·L ≥ T + filter_len − 1` (e.g. `T = N·L/2` with a length-`T` filter) so wrap
+/// never reaches a stored output. Returns `[B,H,T]`.
+#[allow(clippy::too_many_arguments)]
+pub fn monarch_conv_fused_padded(
+    u: &Tensor,
+    k_f: &Tensor,
+    in_gate: Option<&Tensor>,
+    out_gate: Option<&Tensor>,
+    d: Option<&Tensor>,
+    d_f_n: &Tensor,
+    d_f_l: &Tensor,
+    twiddles: &Tensor,
+    id_f_n: &Tensor,
+    id_f_l: &Tensor,
+    ifft_twiddles: &Tensor,
+) -> Result<Tensor> {
+    let (b, h, t_len) = u.dims3()?;
+    let (n, _, _) = d_f_n.dims3()?;
+    let (l, _, _) = d_f_l.dims3()?;
+    if t_len > n * l {
+        candle_core::bail!(
+            "monarch_conv_fused_padded: signal length {t_len} exceeds transform {n}*{l}"
+        );
+    }
+    let mut gates = 0u32;
+    let mut parts: Vec<Tensor> = vec![u.contiguous()?];
+    for (gate, bit) in [(in_gate, 1u32), (out_gate, 2u32)] {
+        if let Some(g) = gate {
+            if g.dims3()? != (b, h, t_len) {
+                candle_core::bail!(
+                    "monarch_conv_fused_padded: gate dims {:?} != signal dims {:?}",
+                    g.dims(),
+                    (b, h, t_len)
+                );
+            }
+            gates |= bit;
+            parts.push(g.contiguous()?);
+        }
+    }
+    let u_ext = Tensor::stack(&parts, 0)?.contiguous()?; // [G,B,H,T]
+    let k_f = k_f.broadcast_as((b, h, n, l, 2))?.contiguous()?;
+    let mut packed = pack_full(
+        &d_f_n.contiguous()?,
+        &d_f_l.contiguous()?,
+        &twiddles.contiguous()?,
+        &id_f_n.contiguous()?,
+        &id_f_l.contiguous()?,
+        &ifft_twiddles.contiguous()?,
+    )?;
+    if let Some(dv) = d {
+        if dv.dims1()? != h {
+            candle_core::bail!(
+                "monarch_conv_fused_padded: d has {} entries, expected H = {h}",
+                dv.dims1()?
+            );
+        }
+        gates |= 4;
+        packed = Tensor::cat(&[&packed, &dv.contiguous()?], 0)?;
+    }
+    u_ext.apply_op3(&packed, &k_f, MonarchFusedConvPadded { n, l, gates })
+}
+
 /// Pre-compile the fused tensor-core kernels into the global pipeline cache so the first
 /// realtime dispatch never pays the MSL compile — the candle analog of holding the MLX
 /// kernel object at startup. Compile-once is process-wide (shared across threads), so one
@@ -883,6 +1461,11 @@ pub fn warmup(device: &candle_core::Device) -> Result<()> {
     if let candle_core::Device::Metal(md) = device {
         crate::metal_util::pipeline(md, "monarch_fused_fwd_f32", SRC_FUSED_FWD)?;
         crate::metal_util::pipeline(md, "monarch_fused_conv_f32", SRC_FUSED_CONV)?;
+        crate::metal_util::pipeline(
+            md,
+            "monarch_fused_conv_padded_f32",
+            SRC_FUSED_CONV_PADDED,
+        )?;
     }
     let _ = device;
     Ok(())
@@ -908,6 +1491,169 @@ mod tests {
             ifft_matrix(l, dev).unwrap(),
             twiddle_factors_ifft(n, l, dev).unwrap(),
         )
+    }
+
+    /// Padded fused conv (CPU reference) == compose-from-verified-parts: zero-pad
+    /// the signal to [N,L], run the un-fused `monarch_conv`, trim to T, apply the
+    /// gates as plain tensor multiplies. Odd T exercises the ragged tile boundary.
+    #[test]
+    fn fused_padded_cpu_matches_composition() {
+        let dev = Device::Cpu;
+        let (b, h, n, l) = (2usize, 2, 16, 8);
+        let m = n * l;
+        for t_len in [m / 2, 45usize, m] {
+            let u: Vec<f32> = (0..b * h * t_len).map(|i| (i as f32 * 0.11).sin()).collect();
+            let gi: Vec<f32> = (0..b * h * t_len).map(|i| (i as f32 * 0.05).cos()).collect();
+            let go: Vec<f32> = (0..b * h * t_len)
+                .map(|i| 1.0 + 0.3 * (i as f32 * 0.03).sin())
+                .collect();
+            let ut = Tensor::from_vec(u, (b, h, t_len), &dev).unwrap();
+            let git = Tensor::from_vec(gi, (b, h, t_len), &dev).unwrap();
+            let got = Tensor::from_vec(go, (b, h, t_len), &dev).unwrap();
+            let kf_sig: Vec<f32> = (0..m).map(|i| (-(i as f32) * 0.02).exp()).collect();
+            let (dfn, dfl, tw, idfn, idfl, itw) = mats(n, l, &dev);
+            let kt = Tensor::from_vec(kf_sig, (1, 1, n, l), &dev).unwrap();
+            let k_f = butterfly_fft_forward(&kt, &dfn, &dfl, &tw).unwrap();
+
+            let fused: Vec<f32> = monarch_conv_fused_padded(
+                &ut, &k_f, Some(&git), Some(&got), None, &dfn, &dfl, &tw, &idfn, &idfl, &itw,
+            )
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+
+            // Composition reference from already-verified pieces. Time is the
+            // 4-step column-major flattening of [N,L]: place the padded signal
+            // via reshape[L,N] + transpose, and read the output back the same way.
+            let gated_in = ut.mul(&git).unwrap();
+            let padded = gated_in
+                .reshape((b, h, t_len))
+                .unwrap()
+                .pad_with_zeros(2, 0, m - t_len)
+                .unwrap()
+                .reshape((b, h, l, n))
+                .unwrap()
+                .transpose(2, 3)
+                .unwrap()
+                .contiguous()
+                .unwrap();
+            let full = monarch_conv(&padded, &k_f, &dfn, &dfl, &tw, &idfn, &idfl, &itw).unwrap();
+            let reference: Vec<f32> = full
+                .transpose(2, 3)
+                .unwrap()
+                .reshape((b, h, m))
+                .unwrap()
+                .narrow(2, 0, t_len)
+                .unwrap()
+                .mul(&got)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+
+            let max = fused
+                .iter()
+                .zip(&reference)
+                .map(|(a, r)| (a - r).abs())
+                .fold(0f32, f32::max);
+            assert!(max < 1e-4, "T={t_len}: fused padded vs composition {max}");
+        }
+    }
+
+    /// Ground truth for the FULL fused block: with T = N·L/2 and a length-T filter,
+    /// `out[t] = ( Σ_{s≤t} k[s]·ug[t−s] + ug[t]·D_h ) · out_gate[t]` with
+    /// `ug = u·in_gate` — the complete Hyena/H3 operator, one dispatch.
+    #[test]
+    fn fused_padded_full_block_is_causal_linear_conv() {
+        let dev = Device::Cpu;
+        let (b, h, n, l) = (1usize, 2, 16, 8);
+        let m = n * l;
+        let t_len = m / 2;
+        let u: Vec<f32> = (0..b * h * t_len).map(|i| (i as f32 * 0.13).sin()).collect();
+        let filt: Vec<f32> = (0..t_len).map(|i| (-(i as f32) * 0.1).exp()).collect();
+        let ut = Tensor::from_vec(u.clone(), (b, h, t_len), &dev).unwrap();
+        let mut k_pad = filt.clone();
+        k_pad.resize(m, 0.0);
+        let (dfn, dfl, tw, idfn, idfl, itw) = mats(n, l, &dev);
+        // The filter's time layout must match the signal's: column-major over
+        // [N,L] (t = c*N + r), i.e. reshape [L,N] then transpose.
+        let kt = Tensor::from_vec(k_pad, (1, 1, l, n), &dev)
+            .unwrap()
+            .transpose(2, 3)
+            .unwrap()
+            .contiguous()
+            .unwrap();
+        let k_f = butterfly_fft_forward(&kt, &dfn, &dfl, &tw).unwrap();
+
+        let got: Vec<f32> = monarch_conv_fused_padded(
+            &ut, &k_f, None, None, None, &dfn, &dfl, &tw, &idfn, &idfl, &itw,
+        )
+        .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+
+        let mut max = 0f32;
+        for bh in 0..b * h {
+            for t in 0..t_len {
+                let mut acc = 0f32;
+                for s in 0..=t {
+                    acc += filt[s] * u[bh * t_len + (t - s)];
+                }
+                max = max.max((got[bh * t_len + t] - acc).abs());
+            }
+        }
+        assert!(max < 1e-3, "fused padded vs direct causal conv: {max}");
+    }
+
+    /// metal == cpu for the padded+gated kernel, ragged T.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn fused_padded_metal_matches_cpu() {
+        let cpu = Device::Cpu;
+        let dev = Device::new_metal(0).unwrap();
+        let (b, h, n, l) = (2usize, 3, 16, 8);
+        let t_len = 45usize;
+        let u: Vec<f32> = (0..b * h * t_len).map(|i| (i as f32 * 0.09).sin()).collect();
+        let gi: Vec<f32> = (0..b * h * t_len).map(|i| (i as f32 * 0.04).cos()).collect();
+        let go: Vec<f32> = (0..b * h * t_len)
+            .map(|i| 1.0 + 0.2 * (i as f32 * 0.06).sin())
+            .collect();
+        let kf_sig: Vec<f32> = (0..n * l).map(|i| (-(i as f32) * 0.03).exp()).collect();
+
+        let run = |d: &Device| -> Vec<f32> {
+            let ut = Tensor::from_vec(u.clone(), (b, h, t_len), d).unwrap();
+            let git = Tensor::from_vec(gi.clone(), (b, h, t_len), d).unwrap();
+            let got = Tensor::from_vec(go.clone(), (b, h, t_len), d).unwrap();
+            let (dfn, dfl, tw, idfn, idfl, itw) = mats(n, l, d);
+            let kt = Tensor::from_vec(kf_sig.clone(), (1, 1, n, l), d).unwrap();
+            let k_f = butterfly_fft_forward(&kt, &dfn, &dfl, &tw).unwrap();
+            let dt = Tensor::from_vec(
+                (0..h).map(|i| 0.1 + 0.05 * i as f32).collect::<Vec<f32>>(),
+                (h,),
+                d,
+            )
+            .unwrap();
+            monarch_conv_fused_padded(
+                &ut, &k_f, Some(&git), Some(&got), Some(&dt), &dfn, &dfl, &tw, &idfn, &idfl, &itw,
+            )
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap()
+        };
+        let (c, g) = (run(&cpu), run(&dev));
+        let max = c
+            .iter()
+            .zip(&g)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(max < 1e-3, "padded fused metal vs cpu: {max}");
     }
 
     #[test]

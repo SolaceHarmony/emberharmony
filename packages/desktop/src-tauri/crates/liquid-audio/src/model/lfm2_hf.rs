@@ -366,7 +366,29 @@ impl ShortConv {
     }
 
     fn forward(&self, x: &Tensor, block_idx: usize, cache: &mut Cache) -> Result<Tensor> {
+        let (_b, seq_len, _h) = x.dims3()?;
         let bcx = linear_forward(&self.in_proj, x)?.transpose(1, 2)?;
+
+        // Fused decode fast path (candle-flashfftconv `conv1d_update`): when a carried
+        // conv state exists (mid-stream continuation — decode steps and short suffix
+        // chunks) do `B⊙x → K-tap causal conv → C⊙` in ONE dispatch with a register
+        // window — no `[state|x]` concat staging, no gate intermediates. ~3.3× the
+        // composed path at LFM2 shape (D=2048, K=3, bf16 Metal); rounding count
+        // matches the CUDA-trained regime (Bx and conv-out round through bf16).
+        // Sequence START (conv_states None) stays on the composed path below, whose
+        // zero-pad prefill is the reference semantics.
+        if self.l_cache > 0 && seq_len <= 4 && cache.use_kv_cache {
+            if let Some(prev) = cache.conv_states[block_idx].clone() {
+                let w = self.conv_weight.squeeze(1)?; // (H, K)
+                let bcx = bcx.contiguous()?;
+                let (y, new_state) =
+                    candle_flashfftconv::causal_conv1d_update_fused(&bcx, &prev, &w)?;
+                cache.conv_states[block_idx] = Some(new_state);
+                let y = y.transpose(1, 2)?.contiguous()?;
+                return linear_forward(&self.out_proj, &y);
+            }
+        }
+
         let bgate = bcx.narrow(1, 0, self.hidden_size)?;
         let c = bcx.narrow(1, self.hidden_size, self.hidden_size)?;
         let x_proj = bcx.narrow(1, 2 * self.hidden_size, self.hidden_size)?;
