@@ -3214,15 +3214,6 @@ async fn local_webrtc_mic_loop(
         send_local_webrtc_ready(&mut ready, Err(message.clone()));
         return Err(message);
     }
-    // Explicitly start ADM recording, like the native LiveKit mic path does
-    // (livekit_set_mic). Without it, capture only runs incidentally via the track
-    // and an OS-level denial would surface as silent no-frames instead of an
-    // error — and the APM capture chain (AEC/NS/AGC) may not fully engage.
-    if let Err(error) = audio.start_recording() {
-        let message = format!("WebRTC microphone start failed: {error}");
-        send_local_webrtc_ready(&mut ready, Err(message.clone()));
-        return Err(message);
-    }
     let input = match local_webrtc_input_loopback(audio).await {
         Ok(input) => input,
         Err(error) => {
@@ -3230,6 +3221,18 @@ async fn local_webrtc_mic_loop(
             return Err(error);
         }
     };
+    // Explicitly start ADM recording, like the native LiveKit mic path does
+    // (livekit_set_mic). Without it, capture only runs incidentally via the track
+    // and an OS-level denial would surface as silent no-frames instead of an
+    // error — and the APM capture chain (AEC/NS/AGC) may not fully engage.
+    // ORDER MATTERS: start_recording is a resume-style call — init_recording only
+    // succeeds once the device-source track exists (calling it pre-track failed
+    // with "init_recording failed"), so it runs AFTER the loopback is up.
+    if let Err(error) = input._audio.start_recording() {
+        let message = format!("WebRTC microphone start failed: {error}");
+        send_local_webrtc_ready(&mut ready, Err(message.clone()));
+        return Err(message);
+    }
     let mut stream = NativeAudioStream::with_options(
         input.remote_track.clone(),
         LIVEKIT_AGENT_AUDIO_RATE_I32,
