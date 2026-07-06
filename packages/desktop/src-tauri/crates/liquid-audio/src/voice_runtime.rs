@@ -40,6 +40,12 @@ const MAX_UTTERANCE_SECONDS: usize = 30;
 const SPEAKER_PREBUFFER_MS: usize = 30;
 const PLAYBACK_VAD_MULTIPLIER: f32 = 3.0;
 const PLAYBACK_ECHO_MULTIPLIER: f32 = 2.5;
+/// Barge-in sustain gate (spec 09, W5): while the assistant is audible, this many
+/// CONSECUTIVE voiced VAD windows (200ms each at the in_rate/5 window size) are
+/// required before an interrupt fires. One loud window is how echo blips and coughs
+/// stop the assistant; 400ms of sustained speech is how a human interjects. When the
+/// assistant is quiet the first voiced window still engages immediately.
+const BARGE_IN_SUSTAIN_WINDOWS: usize = 2;
 
 /// Externally-fed microphone input for the desktop runtime.
 ///
@@ -444,7 +450,12 @@ impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             vad_threshold: 0.012,
-            silence_ms: 800,
+            // End-of-turn silence (spec 09, W3): 800ms burned most of the response
+            // budget before any model work. Sesame's demo grades <300ms pause→first-
+            // word as excellent. 350ms proved too eager in live testing — it committed
+            // echo blips as turns and split mid-sentence pauses — so 500ms until the
+            // AEC verification (W6) lands.
+            silence_ms: 500,
             min_utterance_s: 0.3,
             can_interrupt: false,
         }
@@ -1111,6 +1122,10 @@ fn vad_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
     let mut start = 0usize;
     let mut read = 0usize;
     let mut last_voice = Instant::now();
+    // Consecutive voiced windows observed while not yet `speaking`, and where that
+    // run began — the barge-in sustain gate (spec 09, W5).
+    let mut voiced_streak = 0usize;
+    let mut streak_start = 0usize;
 
     while !stop.load(Ordering::SeqCst) {
         let _ = mic.wait_for_input(Duration::from_millis(40));
@@ -1120,6 +1135,7 @@ fn vad_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
             playback_flush.store(true, Ordering::SeqCst);
             assistant.store(false, Ordering::SeqCst);
             speaking = false;
+            voiced_streak = 0;
             if !emit_ready(sink, stop, mic_enabled) {
                 return;
             }
@@ -1130,6 +1146,7 @@ fn vad_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
             mic_buf.clear();
             read = 0;
             speaking = false;
+            voiced_streak = 0;
             continue;
         }
 
@@ -1138,6 +1155,7 @@ fn vad_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
             mic_buf.clear();
             read = 0;
             speaking = false;
+            voiced_streak = 0;
             continue;
         }
 
@@ -1148,18 +1166,33 @@ fn vad_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
                 reference_vad_threshold(cfg.vad_threshold, assistant, playback, speaker);
             if rms(&mic_buf[read..read + window]) > threshold {
                 if !speaking {
-                    if reference_audio_active(assistant, playback, speaker) {
-                        pipe.interrupt();
-                        playback_flush.store(true, Ordering::SeqCst);
+                    if voiced_streak == 0 {
+                        streak_start = read;
                     }
-                    speaking = true;
-                    start = read;
-                    if !emit_or_stop(sink, stop, RuntimeEvent::State(SessionState::Listening)) {
-                        return;
+                    voiced_streak += 1;
+                    // While the assistant is audible, one voiced window is as likely
+                    // echo as speech — demand sustained voice before barging in.
+                    // When it's quiet, engage on the first voiced window as before.
+                    let reference = reference_audio_active(assistant, playback, speaker);
+                    let needed = if reference { BARGE_IN_SUSTAIN_WINDOWS } else { 1 };
+                    if voiced_streak >= needed {
+                        if reference {
+                            pipe.interrupt();
+                            playback_flush.store(true, Ordering::SeqCst);
+                        }
+                        speaking = true;
+                        start = streak_start;
+                        voiced_streak = 0;
+                        if !emit_or_stop(sink, stop, RuntimeEvent::State(SessionState::Listening))
+                        {
+                            return;
+                        }
                     }
                 }
                 last_voice = Instant::now();
                 latency.mark_voice();
+            } else if !speaking {
+                voiced_streak = 0;
             }
             read += window;
         }
@@ -1194,6 +1227,7 @@ fn vad_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
         } else if !speaking && n > in_rate as usize * 5 {
             mic_buf.clear();
             read = 0;
+            voiced_streak = 0;
         }
     }
 }

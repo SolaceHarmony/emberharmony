@@ -30,12 +30,12 @@ pub mod voice_runtime; // in-process thread-managed voice service (external I/O,
 pub use audio_out::{AudioDetokenizer, MimiDetokenizer};
 pub use detokenizer::LFM2AudioDetokenizer;
 pub use loader::{from_pretrained, from_pretrained_hub};
-pub use model::lfm2_audio::{GenParams, GenToken, LFM2AudioModel};
+pub use model::lfm2_audio::{GenParams, GenToken, LFM2AudioModel, PrefillCursor};
 pub use processor::{ChatState, LFM2AudioProcessor};
 pub use realtime::{
-    FrameConfig, FrameSubmitError, Lfm2VoiceEngine, MoshiVoiceEngine, RealtimeFramePipeline,
-    RealtimeFramePipelineHandle, RealtimePipeline, RealtimePipelineHandle, Utterance, VoiceEngine,
-    VoiceEvent,
+    ConversationVault, FrameConfig, FrameSubmitError, Lfm2VoiceEngine, MoshiVoiceEngine,
+    RealtimeFramePipeline, RealtimeFramePipelineHandle, RealtimePipeline, RealtimePipelineHandle,
+    Utterance, VoiceEngine, VoiceEvent,
 };
 pub use threads::{configure_intraop_threads, intraop_default_num_threads};
 pub use trainer::{Trainer, TrainerConfig};

@@ -628,7 +628,10 @@ impl Drop for RealtimeFramePipeline {
 
 use candle_core::{DType, Device, Tensor};
 
-use crate::{ChatState, GenParams, GenToken, LFM2AudioModel, LFM2AudioProcessor, LFMModality};
+use crate::model::lfm2_hf::Cache as LfmCache;
+use crate::{
+    ChatState, GenParams, GenToken, LFM2AudioModel, LFM2AudioProcessor, LFMModality, PrefillCursor,
+};
 
 /// The accumulated conversation tensors persisted across turns — the five model-input fields
 /// of a [`ChatState`]. The engine holds these (not a `ChatState`, which borrows the processor
@@ -666,9 +669,18 @@ fn stack_i64(
 /// utterance via [`LFM2AudioModel::generate_interleaved_cancellable`], decoding audio
 /// frames to PCM through the processor's streaming detokenizer — the headless equivalent
 /// of `chat.py`'s `chat_producer` body.
+/// Shared, lifecycle-proof home for a conversation (spec 09; upstream `chat.py` keeps
+/// its `ChatState` in Gradio session state for the whole browser session — context must
+/// outlive any one voice session). The desktop app owns one vault per chat session and
+/// hands it to each engine it builds; the engine restores from it at attach and writes
+/// through after every turn, so a UI-driven session rebuild no longer wipes the model's
+/// conversation. The KV cache is deliberately NOT vaulted — it is engine-local and is
+/// rebuilt by one full prefill on the first turn after a restore.
+pub type ConversationVault = Arc<std::sync::Mutex<Option<ConversationState>>>;
+
 pub struct Lfm2VoiceEngine {
-    model: LFM2AudioModel,
-    proc: LFM2AudioProcessor,
+    model: Arc<LFM2AudioModel>,
+    proc: Arc<LFM2AudioProcessor>,
     params: GenParams,
     codebooks: usize,
     device: Device,
@@ -686,26 +698,43 @@ pub struct Lfm2VoiceEngine {
     /// `audio_out` back as context (the `audio_out` → prefill-scatter path). Cold-start-per-turn
     /// (the prior behavior) made every utterance context-free.
     conv: Option<ConversationState>,
+    /// The persistent backbone KV/conv cache + cursor (spec 09, W2a): what of the
+    /// conversation context has already been forwarded. Each turn forwards only the
+    /// suffix past the cursor, so per-turn cost stops growing with conversation length.
+    /// Invariant: the cache prefix must equal the `conv`-derived context prefix — on any
+    /// doubt (error mid-turn, cursor mismatch) this is dropped and the next turn falls
+    /// back to a full re-prefill from `conv`, which rebuilds it. `conv` stays the source
+    /// of truth; the cache is purely an accelerator.
+    session_cache: Option<(LfmCache, PrefillCursor)>,
+    /// Optional lifecycle-proof conversation home — restored from at attach, written
+    /// through after every turn. See [`ConversationVault`].
+    vault: Option<ConversationVault>,
 }
 
 impl Lfm2VoiceEngine {
+    /// Model and processor are shared handles (`Arc`), so the app can keep the loaded
+    /// weights resident across voice sessions and hand each engine a cheap clone —
+    /// building an engine must never mean loading the model again. Plain by-value
+    /// call sites keep working via `Into<Arc<_>>`.
     pub fn new(
-        model: LFM2AudioModel,
-        proc: LFM2AudioProcessor,
+        model: impl Into<Arc<LFM2AudioModel>>,
+        proc: impl Into<Arc<LFM2AudioProcessor>>,
         params: GenParams,
         codebooks: usize,
         device: Device,
         out_rate: u32,
     ) -> Self {
         Self {
-            model,
-            proc,
+            model: model.into(),
+            proc: proc.into(),
             params,
             codebooks,
             device,
             out_rate,
             system_prompt: "Respond with interleaved text and audio.".to_string(),
             conv: None,
+            session_cache: None,
+            vault: None,
         }
     }
 
@@ -714,6 +743,16 @@ impl Lfm2VoiceEngine {
     /// and the tests stay unchanged.
     pub fn with_system_prompt(mut self, prompt: impl Into<String>) -> Self {
         self.system_prompt = prompt.into();
+        self
+    }
+
+    /// Attach a [`ConversationVault`]: restore the conversation it holds (context
+    /// survives session rebuilds) and write every completed turn back into it.
+    pub fn with_conversation_vault(mut self, vault: ConversationVault) -> Self {
+        if let Ok(saved) = vault.lock() {
+            self.conv = saved.clone();
+        }
+        self.vault = Some(vault);
         self
     }
 }
@@ -798,8 +837,45 @@ impl VoiceEngine for Lfm2VoiceEngine {
         let mut audio_frames: Vec<Vec<u32>> = Vec::new();
         let mut modality_out: Vec<i64> = Vec::new();
 
+        // Persistent cross-turn cache (spec 09, W2a): forward only the context suffix
+        // the cache has not seen. `take()` means any error path below leaves
+        // `session_cache = None` — the next turn falls back to a full re-prefill from
+        // `conv`, which is always the source of truth.
+        let (prior_cache, mut cursor) = match self.session_cache.take() {
+            Some((c, p)) => (Some(c), p),
+            None => (None, PrefillCursor::default()),
+        };
+        let in_emb = match self.model.prefill_suffix(&chat, &cursor) {
+            Ok(e) => e,
+            Err(err) if cursor != PrefillCursor::default() => {
+                // Desynced cursor — rebuild from scratch off `conv` rather than fail the turn.
+                eprintln!("[voice] persistent cache desync ({err}); falling back to full prefill");
+                cursor = PrefillCursor::default();
+                self.model.prefill_suffix(&chat, &cursor).map_err(s)?
+            }
+            Err(err) => return Err(s(err)),
+        };
+        let mut cache = match if cursor == PrefillCursor::default() {
+            None
+        } else {
+            prior_cache
+        } {
+            Some(c) => c,
+            None => self
+                .model
+                .make_cache(in_emb.dtype(), &self.device)
+                .map_err(s)?,
+        };
+        // Context length at generation start: the suffix forward brings the cache
+        // exactly here; every further forward is one generated token.
+        let n_ctx = chat.modality_flag.dim(1).map_err(s)?;
+        let text_total = chat.text.dim(1).map_err(s)?;
+        let seg_total = chat.audio_in_lens.dim(0).map_err(s)?;
+        let ao_total = chat.audio_out.dim(1).map_err(s)?;
+        let mut index_pos = cursor.positions;
+
         self.model
-            .generate_interleaved_cancellable(&chat, &self.params, cancel, |tok| {
+            .generate_with_cache(&mut cache, &mut index_pos, in_emb, &self.params, cancel, |tok| {
                 if cb_err.is_some() {
                     return;
                 }
@@ -856,8 +932,30 @@ impl VoiceEngine for Lfm2VoiceEngine {
         // (possibly partial) response would make the context depend on an I/O event — the very
         // failure mode to avoid: the model would lose its own response. `append` weaves the
         // generated text + discrete `audio_out` (interleaved per `modality_flag`) in; `end_turn`
-        // closes the assistant turn (early, if barge-in cut it short). Only a hard error (returned
-        // above) or a genuinely empty generation skips this.
+        // closes the assistant turn (early, if barge-in cut it short).
+        //
+        // The cache saw everything the loop forwarded: the whole pre-generation context
+        // (suffix forward) plus every emitted token except the last (the loop forwards the
+        // previous token before sampling the next). Advance the cursor to exactly that.
+        let forwarded_generated = index_pos.saturating_sub(n_ctx);
+        let cache_ok = forwarded_generated <= modality_out.len();
+        if cache_ok {
+            cursor.text = text_total;
+            cursor.audio_segments = seg_total;
+            cursor.audio_out = ao_total;
+            for m in modality_out.iter().take(forwarded_generated) {
+                if *m == LFMModality::Text as i64 {
+                    cursor.text += 1;
+                } else {
+                    cursor.audio_out += 1;
+                }
+            }
+            cursor.positions = index_pos;
+        }
+
+        // Even a genuinely empty generation commits the turn: the user's utterance is
+        // context the moment it was spoken (and the cache has already forwarded it) —
+        // the assistant turn just closes empty.
         if !text_ids.is_empty() || !audio_frames.is_empty() {
             let n_text = text_ids.len();
             let n_audio = audio_frames.len();
@@ -875,17 +973,27 @@ impl VoiceEngine for Lfm2VoiceEngine {
             let audio_t = stack_i64(flat, codebooks, n_audio, &self.device).map_err(s)?;
             let mod_t = stack_i64(modality_out, 1, n_flag, &self.device).map_err(s)?;
             chat.append(&text_t, &audio_t, &mod_t).map_err(s)?;
-            chat.end_turn().map_err(s)?;
+        }
+        chat.end_turn().map_err(s)?;
 
-            let saved = ConversationState {
-                text: chat.text.clone(),
-                audio_in: chat.audio_in.clone(),
-                audio_in_lens: chat.audio_in_lens.clone(),
-                audio_out: chat.audio_out.clone(),
-                modality_flag: chat.modality_flag.clone(),
-            };
-            drop(chat); // end the `&self.proc` borrow before writing `self.conv`.
-            self.conv = Some(saved);
+        let saved = ConversationState {
+            text: chat.text.clone(),
+            audio_in: chat.audio_in.clone(),
+            audio_in_lens: chat.audio_in_lens.clone(),
+            audio_out: chat.audio_out.clone(),
+            modality_flag: chat.modality_flag.clone(),
+        };
+        drop(chat); // end the `&self.proc` borrow before writing `self.conv`.
+        self.conv = Some(saved);
+        if cache_ok {
+            self.session_cache = Some((cache, cursor));
+        }
+        // Write-through to the lifecycle-proof vault: the conversation must survive a
+        // UI-driven session rebuild (tensor clones are cheap Arc bumps).
+        if let Some(vault) = &self.vault {
+            if let Ok(mut slot) = vault.lock() {
+                *slot = self.conv.clone();
+            }
         }
 
         Ok(completed)

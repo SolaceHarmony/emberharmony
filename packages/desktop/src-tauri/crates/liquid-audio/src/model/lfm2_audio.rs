@@ -14,7 +14,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use candle_core::{DType, IndexOp, Result, Tensor};
+use candle_core::{DType, Device, IndexOp, Result, Tensor};
 use candle_nn::{linear, Linear, Module, VarBuilder};
 use candle_transformers::generation::{LogitsProcessor, Sampling};
 
@@ -125,6 +125,22 @@ pub use crate::data::types::LFM2AudioModelInput;
 pub enum GenToken {
     Text(u32),
     Audio(Vec<u32>),
+}
+
+/// What a persistent cross-turn cache already contains (spec 09, W2a): the prefix of
+/// the conversation context that has been forwarded through the backbone. Everything
+/// past the cursor is the suffix [`LFM2AudioModel::prefill_suffix`] must build next
+/// turn. A zero cursor means "nothing cached" — the suffix is the whole context.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PrefillCursor {
+    /// Sequence positions forwarded (the cache's length / next `index_pos`).
+    pub positions: usize,
+    /// Text tokens consumed from `ChatState::text`.
+    pub text: usize,
+    /// Whole audio-in segments consumed (entries of `audio_in_lens`).
+    pub audio_segments: usize,
+    /// Audio-out frames consumed (columns of `ChatState::audio_out`).
+    pub audio_out: usize,
 }
 
 /// Generation knobs — mirrors the kwargs of `generate_interleaved` /
@@ -484,6 +500,19 @@ impl LFM2AudioModel {
         self.text_logits(hidden_last)
     }
 
+    /// Debug: one backbone forward over `in_emb` at `index_pos` through an external
+    /// cache — lets tests assert chunked-continuation forward equals one full forward
+    /// (the numerical contract behind the persistent cross-turn cache, spec 09 W2a).
+    #[doc(hidden)]
+    pub fn forward_embeds_debug(
+        &self,
+        in_emb: &Tensor,
+        index_pos: usize,
+        cache: &mut LfmCache,
+    ) -> Result<Tensor> {
+        self.lfm.forward_embeds(in_emb, index_pos, cache, None)
+    }
+
     /// Debug: greedy depthformer audio frame (8 codebook tokens) for a fixed
     /// `embedding` (H,) — for depthformer parity (token-exact vs Python greedy).
     #[doc(hidden)]
@@ -503,6 +532,185 @@ impl LFM2AudioModel {
             &chat.audio_out,
             &chat.modality_flag,
         )
+    }
+
+    /// A fresh backbone KV/conv cache for the externally-owned generation path
+    /// ([`Self::generate_with_cache`]). The engine keeps this alive across turns
+    /// (spec 09, W2a) so each turn only forwards the context *suffix* it has not
+    /// seen yet, instead of re-prefilling the whole conversation.
+    pub fn make_cache(&self, dtype: DType, device: &Device) -> Result<LfmCache> {
+        LfmCache::new(true, dtype, &self.lfm_cfg, device)
+    }
+
+    /// Build prefill embeddings for the context SUFFIX past `cursor` — the positions a
+    /// persistent cross-turn cache has not forwarded yet. `cursor` counts what the cache
+    /// already contains: sequence positions, text tokens, whole audio-in segments (a
+    /// segment is added atomically with its turn, so it is never split), and audio-out
+    /// frames. With a zero cursor this is exactly [`prefill_chat`](Self::prefill_chat).
+    ///
+    /// Hard-errors if the cursor's per-modality counts do not match the prefix
+    /// `modality_flag[..cursor.positions]` — a desynced cursor must invalidate the cache
+    /// (full re-prefill), never silently misalign the scatter.
+    pub fn prefill_suffix(&self, chat: &ChatState, cursor: &PrefillCursor) -> Result<Tensor> {
+        let dev = chat.text.device();
+        let modality: Vec<i64> = chat
+            .modality_flag
+            .to_dtype(DType::I64)?
+            .flatten_all()?
+            .to_vec1::<i64>()?;
+        let n = modality.len();
+        if cursor.positions > n {
+            return Err(candle_core::Error::Msg(format!(
+                "prefill_suffix: cursor positions {} beyond context length {n}",
+                cursor.positions
+            )));
+        }
+
+        // Verify the cursor against the actual prefix (cheap CPU walk) — the cache and
+        // the context tensors must describe the same prefix or continuation is garbage.
+        let (mut pt, mut pai, mut pao) = (0usize, 0usize, 0usize);
+        for m in &modality[..cursor.positions] {
+            if *m == LFMModality::Text as i64 {
+                pt += 1;
+            } else if *m == LFMModality::AudioIn as i64 {
+                pai += 1;
+            } else if *m == LFMModality::AudioOut as i64 {
+                pao += 1;
+            }
+        }
+        let lens: Vec<i64> = chat.audio_in_lens.to_dtype(DType::I64)?.to_vec1::<i64>()?;
+        if cursor.audio_segments > lens.len() {
+            return Err(candle_core::Error::Msg(format!(
+                "prefill_suffix: cursor segments {} beyond {} audio-in segments",
+                cursor.audio_segments,
+                lens.len()
+            )));
+        }
+        // Cached audio-in positions must cover whole segments: the conformer output
+        // length per segment is what occupies AudioIn positions.
+        if pt != cursor.text || pao != cursor.audio_out {
+            return Err(candle_core::Error::Msg(format!(
+                "prefill_suffix: cursor (text {}, audio_out {}) does not match prefix \
+                 counts (text {pt}, audio_out {pao})",
+                cursor.text, cursor.audio_out
+            )));
+        }
+
+        // text suffix embeddings
+        let n_text_total = chat.text.dim(1)?;
+        let text_suffix = chat
+            .text
+            .narrow(1, cursor.text, n_text_total - cursor.text)?;
+        let text_emb = self.lfm.embed(&text_suffix)?.i(0)?; // (n_text_suffix, D)
+
+        // audio-in: run the conformer ONLY over segments the cache has not seen.
+        let mut frame_cursor: usize = lens[..cursor.audio_segments]
+            .iter()
+            .map(|&l| l as usize)
+            .sum();
+        let mut audio_in_rows: Vec<Tensor> = Vec::new();
+        for &len in &lens[cursor.audio_segments..] {
+            let seg = chat.audio_in.narrow(1, frame_cursor, len as usize)?;
+            frame_cursor += len as usize;
+            let seg = seg.unsqueeze(0)?.to_dtype(text_emb.dtype())?;
+            let enc = self.conformer.forward(&seg)?;
+            let enc = enc.i(0)?.transpose(0, 1)?.contiguous()?;
+            let adapted = self.audio_adapter.forward(&enc)?;
+            audio_in_rows.push(adapted);
+        }
+        let audio_in_emb = if audio_in_rows.is_empty() {
+            None
+        } else {
+            Some(Tensor::cat(&audio_in_rows.iter().collect::<Vec<_>>(), 0)?)
+        };
+        // The prefix AudioIn positions must equal the summed conformer output lengths of
+        // the cached segments — the same subsampling arithmetic `add_audio` used to lay
+        // down the modality flags. A mismatch means cursor/context desync.
+        let cached_emb_len: usize = lens[..cursor.audio_segments]
+            .iter()
+            .map(|&l| mel2emb_len(l) as usize)
+            .sum();
+        if pai != cached_emb_len {
+            return Err(candle_core::Error::Msg(format!(
+                "prefill_suffix: prefix AudioIn positions {pai} do not match cached \
+                 segments' embed length {cached_emb_len} ({} segments)",
+                cursor.audio_segments
+            )));
+        }
+
+        // audio-out suffix embeddings
+        let m_total = chat.audio_out.dim(1)?;
+        let audio_out_emb = {
+            let m = m_total - cursor.audio_out;
+            if m == 0 {
+                None
+            } else {
+                let codes = chat
+                    .audio_out
+                    .narrow(0, 0, self.codebooks)?
+                    .narrow(1, cursor.audio_out, m)?
+                    .to_dtype(DType::I64)?;
+                let offs =
+                    Tensor::from_vec(self.codebook_offsets.clone(), (self.codebooks, 1), dev)?;
+                let offset_codes = codes.broadcast_add(&offs)?;
+                let emb = self.audio_embedding.embed(&offset_codes)?;
+                Some(emb.sum(0)?.to_dtype(text_emb.dtype())?)
+            }
+        };
+
+        // Scatter the suffix parts into sequence order by the suffix modality flags.
+        let n_text = text_emb.dim(0)?;
+        let n_ai = audio_in_emb
+            .as_ref()
+            .map(|a| a.dim(0).unwrap_or(0))
+            .unwrap_or(0);
+        let n_ao = audio_out_emb
+            .as_ref()
+            .map(|a| a.dim(0).unwrap_or(0))
+            .unwrap_or(0);
+        let mut parts = vec![text_emb.clone()];
+        if let Some(a) = &audio_in_emb {
+            parts.push(a.clone());
+        }
+        if let Some(a) = &audio_out_emb {
+            parts.push(a.clone());
+        }
+        let combined = Tensor::cat(&parts.iter().collect::<Vec<_>>(), 0)?;
+
+        let (mut ct, mut cai, mut cao) = (0usize, 0usize, 0usize);
+        let ai_base = n_text;
+        let ao_base = n_text + n_ai;
+        let suffix = &modality[cursor.positions..];
+        let mut index = Vec::with_capacity(suffix.len());
+        for m in suffix {
+            let idx = if *m == LFMModality::Text as i64 {
+                let v = ct;
+                ct += 1;
+                v
+            } else if *m == LFMModality::AudioIn as i64 {
+                let v = ai_base + cai;
+                cai += 1;
+                v
+            } else if *m == LFMModality::AudioOut as i64 {
+                let v = ao_base + cao;
+                cao += 1;
+                v
+            } else {
+                return Err(candle_core::Error::Msg(format!(
+                    "prefill_suffix: unknown modality flag {m} (expected 1/2/3)"
+                )));
+            };
+            index.push(idx as u32);
+        }
+        if ct != n_text || cai != n_ai || cao != n_ao {
+            return Err(candle_core::Error::Msg(format!(
+                "prefill_suffix: suffix modality counts (text {ct}, audio_in {cai}, \
+                 audio_out {cao}) do not match suffix inputs (text {n_text}, audio_in \
+                 {n_ai}, audio_out {n_ao})"
+            )));
+        }
+        let index = Tensor::from_vec(index, (suffix.len(),), dev)?;
+        combined.index_select(&index, 0)?.unsqueeze(0) // (1, n_suffix, D)
     }
 
     /// `logits(batch)` — training logits + labels, faithful to
@@ -1052,13 +1260,32 @@ impl LFM2AudioModel {
     /// [`generate_interleaved_cancellable`](Self::generate_interleaved_cancellable).
     pub fn generate_from_embeds_cancellable<F: FnMut(GenToken)>(
         &self,
+        in_emb: Tensor,
+        params: &GenParams,
+        cancel: &AtomicBool,
+        on_token: F,
+    ) -> Result<()> {
+        let mut cache = LfmCache::new(true, in_emb.dtype(), &self.lfm_cfg, in_emb.device())?;
+        let mut index_pos = 0usize;
+        self.generate_with_cache(&mut cache, &mut index_pos, in_emb, params, cancel, on_token)
+    }
+
+    /// The interleaved generation loop over an EXTERNALLY-owned cache and position —
+    /// the persistent cross-turn path (spec 09, W2a). `in_emb` is the context suffix
+    /// the cache has not seen ([`prefill_suffix`](Self::prefill_suffix)); `index_pos`
+    /// is the cache's current length and is left at the new cache length on return,
+    /// so the caller can account exactly which generated tokens were forwarded (all
+    /// emitted tokens except the last one are in the cache — the loop forwards the
+    /// previous token before sampling the next).
+    pub fn generate_with_cache<F: FnMut(GenToken)>(
+        &self,
+        cache: &mut LfmCache,
+        index_pos: &mut usize,
         mut in_emb: Tensor,
         params: &GenParams,
         cancel: &AtomicBool,
         mut on_token: F,
     ) -> Result<()> {
-        let mut index_pos = 0usize;
-        let mut cache = LfmCache::new(true, in_emb.dtype(), &self.lfm_cfg, in_emb.device())?;
         let mut text_sampler =
             Sampler::new(params.seed, params.text_temperature, params.text_top_k);
         let mut audio_sampler =
@@ -1077,8 +1304,8 @@ impl LFM2AudioModel {
             let seq_len = in_emb.dim(1)?;
             let h = self
                 .lfm
-                .forward_embeds(&in_emb, index_pos, &mut cache, None)?; // (1, seq, D)
-            index_pos += seq_len;
+                .forward_embeds(&in_emb, *index_pos, cache, None)?; // (1, seq, D)
+            *index_pos += seq_len;
             let h_last = h.i((0, seq_len - 1))?.contiguous()?; // (D,)
 
             match current {

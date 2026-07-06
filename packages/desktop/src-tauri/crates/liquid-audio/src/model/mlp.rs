@@ -21,13 +21,13 @@ use crate::model::linear::Bf16Linear;
 /// `Activation::Gelu` maps to `gelu_erf` (exact), which is what we want — not the
 /// tanh approximation (`NewGelu`/`GeluPytorchTanh`).
 ///
-/// Layers are held as `Vec<Box<dyn Module + Send>>` rather than `candle_nn::Sequential`
+/// Layers are held as `Vec<Box<dyn Module + Send + Sync>>` rather than `candle_nn::Sequential`
 /// (whose `Vec<Box<dyn Module>>` is **not** `Send`) so the model — and the processor that
 /// owns it — can move onto a dedicated inference worker thread (the realtime full-duplex
 /// pipeline). `Linear`, our `LayerNorm`, and `Activation` are all `Send`. Forward semantics
 /// are identical: a left fold applying each layer in order.
 pub struct MLP {
-    model: Vec<Box<dyn Module + Send>>,
+    model: Vec<Box<dyn Module + Send + Sync>>,
 }
 
 impl MLP {
@@ -46,7 +46,7 @@ impl MLP {
         channels.extend_from_slice(hidden_dim);
         channels.push(out_channels);
 
-        let mut model: Vec<Box<dyn Module + Send>> = Vec::new();
+        let mut model: Vec<Box<dyn Module + Send + Sync>> = Vec::new();
         let mut idx = 0usize; // mirrors nn.Sequential child index for weight names
 
         if use_layer_norm {
@@ -137,7 +137,7 @@ mod tests {
 
     #[test]
     fn mlp_is_send() {
-        // The whole point of the Vec<Box<dyn Module + Send>> rewrite: MLP must be Send so
+        // The whole point of the Vec<Box<dyn Module + Send + Sync>> rewrite: MLP must be Send so
         // LFM2AudioModel is Send and can be owned by the inference worker thread.
         fn is_send<T: Send>() {}
         is_send::<MLP>();

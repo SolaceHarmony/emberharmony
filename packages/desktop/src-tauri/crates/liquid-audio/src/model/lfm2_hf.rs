@@ -366,20 +366,23 @@ impl ShortConv {
     }
 
     fn forward(&self, x: &Tensor, block_idx: usize, cache: &mut Cache) -> Result<Tensor> {
-        let (_b, seq_len, _) = x.dims3()?;
         let bcx = linear_forward(&self.in_proj, x)?.transpose(1, 2)?;
         let bgate = bcx.narrow(1, 0, self.hidden_size)?;
         let c = bcx.narrow(1, self.hidden_size, self.hidden_size)?;
         let x_proj = bcx.narrow(1, 2 * self.hidden_size, self.hidden_size)?;
         let bx = (bgate * &x_proj)?.contiguous()?;
 
-        // One causal depthwise short-conv path for both prefill and decode, through the
-        // FlashFFTConv `depthwise_conv1d_stream` kernel in the model's NATIVE dtype — bf16 on
-        // Metal runs f32-accumulate / bf16-store (the deployed, trained-around regime), no
-        // upcast. Prefill (seq_len > 1) zero-pads, ignoring any prior cache exactly as the
-        // reference does; single-step decode streams the prior K-1 inputs from the conv cache.
+        // One causal depthwise short-conv path for prefill, decode, AND multi-token
+        // continuation, through the FlashFFTConv `depthwise_conv1d_stream` kernel in the
+        // model's NATIVE dtype — bf16 on Metal runs f32-accumulate / bf16-store (the
+        // deployed, trained-around regime), no upcast. The carried state is keyed on
+        // presence, not seq_len: at sequence start `conv_states` is `None` (fresh or
+        // cleared cache) so prefill zero-pads exactly as the reference; when a suffix
+        // chunk continues an existing stream (persistent cross-turn cache), the carried
+        // K-1 inputs make chunked forward numerically equal to one full-sequence forward
+        // — causal conv has no other cross-boundary dependence.
         let w = self.conv_weight.squeeze(1)?; // (H, K)
-        let prev = if seq_len == 1 && self.l_cache > 0 {
+        let prev = if self.l_cache > 0 {
             cache.conv_states[block_idx].clone()
         } else {
             None

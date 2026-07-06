@@ -12,7 +12,7 @@
 //! implement `decode`), foreign types wrapped behind it (newtype + composition),
 //! and runtime selection via `Box<dyn AudioDetokenizer>`.
 
-use std::cell::RefCell;
+use std::sync::Mutex;
 
 use candle_core::{DType, Result, Tensor};
 
@@ -24,8 +24,8 @@ use crate::detokenizer::LFM2AudioDetokenizer;
 /// "force the override"); `sample_rate` is a default a backend may override.
 // `Send` so the processor (and thus the model bundle) can move to a dedicated inference
 // worker thread — the realtime full-duplex pipeline owns it there rather than sharing by
-// `&` (the Mimi backend holds a `!Sync` `RefCell`). Both backends are `Send`.
-pub trait AudioDetokenizer: Send {
+// `&` (the Mimi backend holds its streaming state behind a `Mutex`, so both backends are `Send + Sync` — required for the app-resident `Arc`-shared model, spec 09).
+pub trait AudioDetokenizer: Send + Sync {
     fn decode(&self, codes: &Tensor) -> Result<Tensor>;
     fn sample_rate(&self) -> u32 {
         24_000
@@ -78,13 +78,13 @@ impl AudioDetokenizer for LFM2AudioDetokenizer {
 /// mutability for Mimi's streaming conv/transformer state (mirrors the Python
 /// `mimi.streaming(1)` mutation). `reset_state` first ⇒ independent decodes.
 pub struct MimiDetokenizer {
-    inner: RefCell<::moshi::mimi::Mimi>,
+    inner: Mutex<::moshi::mimi::Mimi>,
 }
 
 impl MimiDetokenizer {
     pub fn new(mimi: ::moshi::mimi::Mimi) -> Self {
         Self {
-            inner: RefCell::new(mimi),
+            inner: Mutex::new(mimi),
         }
     }
 }
@@ -92,7 +92,7 @@ impl MimiDetokenizer {
 impl AudioDetokenizer for MimiDetokenizer {
     fn decode(&self, codes: &Tensor) -> Result<Tensor> {
         let codes = codes.to_dtype(DType::U32)?; // RVQ index_select wants u32
-        let mut m = self.inner.borrow_mut();
+        let mut m = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         m.reset_state();
         m.decode(&codes)
     }
@@ -101,14 +101,14 @@ impl AudioDetokenizer for MimiDetokenizer {
     /// `reset_state` first ⇒ independent (non-streaming) encode, matching the
     /// Python `mimi.encode` call on a fresh clip in the data mapper.
     fn encode(&self, wav: &Tensor) -> Result<Tensor> {
-        let mut m = self.inner.borrow_mut();
+        let mut m = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         m.reset_state();
         m.encode(wav)
     }
 
     /// Reset the moshi Mimi streaming conv/transformer state (turn boundary).
     fn reset_stream(&self) {
-        self.inner.borrow_mut().reset_state();
+        self.inner.lock().unwrap_or_else(|p| p.into_inner()).reset_state();
     }
 
     /// Real streaming decode via moshi's `Mimi::decode_step` — keeps codec state
@@ -117,7 +117,7 @@ impl AudioDetokenizer for MimiDetokenizer {
     /// warmup latency means the first call(s) yield `None`.
     fn decode_step(&self, frame: &Tensor) -> Result<Option<Tensor>> {
         let codes = frame.to_dtype(DType::U32)?; // RVQ index_select wants u32
-        let mut m = self.inner.borrow_mut();
+        let mut m = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let out = m.decode_step(
             &::moshi::StreamTensor::from_tensor(codes),
             &::moshi::StreamMask::empty(),
