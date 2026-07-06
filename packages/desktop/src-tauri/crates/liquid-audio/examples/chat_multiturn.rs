@@ -132,7 +132,7 @@ fn main() -> Res<()> {
     let audio_path = std::env::args().nth(1).unwrap_or_else(|| {
         concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../../../../experiments/lfm2-audio-voice/upstream-liquid-audio/assets/question.wav"
+            "/assets/question.wav"
         )
         .into()
     });

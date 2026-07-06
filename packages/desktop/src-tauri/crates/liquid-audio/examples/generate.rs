@@ -11,7 +11,7 @@
 //!   LFM_MODEL_DIR=../model cargo run --release --example generate -- path/to/audio.wav
 //! Use `LFM_DEVICE=metal` for Apple GPU BF16.
 //! With no path argument it defaults to the upstream reference clip
-//! (`experiments/lfm2-audio-voice/upstream-liquid-audio/assets/question.wav`), resolved
+//! (`assets/question.wav`, the upstream reference clip, vendored in-crate), resolved
 //! from the manifest dir so it works regardless of the working directory.
 //!
 //! Determinism: greedy (no temperature/top-k), seed fixed — same input → same output.
@@ -127,15 +127,9 @@ fn main() -> Res<()> {
         .or_else(|_| std::env::var("LFM_MODEL_DIR"))
         .unwrap_or_else(|_| "LiquidAI/LFM2.5-Audio-1.5B".into());
     let audio_path = std::env::args().nth(1).unwrap_or_else(|| {
-        // The crate moved into the desktop build (packages/desktop/src-tauri/crates/
-        // liquid-audio); the upstream reference assets stay under experiments/. Resolve the
-        // default from CARGO_MANIFEST_DIR (compile-time, CWD-independent) rather than a
-        // sibling relative path, which the move broke.
-        concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../../../../experiments/lfm2-audio-voice/upstream-liquid-audio/assets/question.wav"
-        )
-        .into()
+        // The upstream reference clip, vendored in-crate. Resolved from
+        // CARGO_MANIFEST_DIR (compile-time, CWD-independent).
+        concat!(env!("CARGO_MANIFEST_DIR"), "/assets/question.wav").into()
     });
     let max_new_tokens: usize = std::env::var("LFM_MAX_TOKENS")
         .ok()

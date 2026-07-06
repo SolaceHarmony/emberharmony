@@ -187,7 +187,7 @@ fn main() -> Res<()> {
         .unwrap_or_else(|_| {
             PathBuf::from(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/../../../../../experiments/lfm2-audio-voice/upstream-liquid-audio/assets/question.wav"
+                "/assets/question.wav"
             ))
         });
     let max_new_tokens = env_usize("LFM_MAX_TOKENS", 64);
