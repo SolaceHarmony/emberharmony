@@ -873,6 +873,15 @@ impl VoiceEngine for Lfm2VoiceEngine {
         let seg_total = chat.audio_in_lens.dim(0).map_err(s)?;
         let ao_total = chat.audio_out.dim(1).map_err(s)?;
         let mut index_pos = cursor.positions;
+        crate::vtrace!(
+            "engine: turn-start — utterance {:.2}s in context as segment #{seg_total}; \
+             ctx {n_ctx} positions (cache had {}, suffix {}), totals: text {text_total}, \
+             audio-out {ao_total}",
+            utt.samples.len() as f32 / utt.rate.max(1) as f32,
+            cursor.positions,
+            n_ctx - cursor.positions
+        );
+        let turn_started = std::time::Instant::now();
 
         self.model
             .generate_with_cache(&mut cache, &mut index_pos, in_emb, &self.params, cancel, |tok| {
@@ -939,6 +948,7 @@ impl VoiceEngine for Lfm2VoiceEngine {
         // previous token before sampling the next). Advance the cursor to exactly that.
         let forwarded_generated = index_pos.saturating_sub(n_ctx);
         let cache_ok = forwarded_generated <= modality_out.len();
+        let (n_text_gen, n_audio_gen) = (text_ids.len(), audio_frames.len());
         if cache_ok {
             cursor.text = text_total;
             cursor.audio_segments = seg_total;
@@ -985,6 +995,20 @@ impl VoiceEngine for Lfm2VoiceEngine {
         };
         drop(chat); // end the `&self.proc` borrow before writing `self.conv`.
         self.conv = Some(saved);
+        crate::vtrace!(
+            "engine: turn-end in {:.2}s — generated {} text + {} audio frames, \
+             completed {completed}, cache {} (cursor -> {} positions), vault {}",
+            turn_started.elapsed().as_secs_f32(),
+            n_text_gen,
+            n_audio_gen,
+            if cache_ok { "kept" } else { "DROPPED" },
+            cursor.positions,
+            if self.vault.is_some() {
+                "written"
+            } else {
+                "absent"
+            }
+        );
         if cache_ok {
             self.session_cache = Some((cache, cursor));
         }

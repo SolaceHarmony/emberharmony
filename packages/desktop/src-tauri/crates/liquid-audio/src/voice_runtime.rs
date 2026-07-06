@@ -46,6 +46,42 @@ const PLAYBACK_ECHO_MULTIPLIER: f32 = 2.5;
 /// stop the assistant; 400ms of sustained speech is how a human interjects. When the
 /// assistant is quiet the first voiced window still engages immediately.
 const BARGE_IN_SUSTAIN_WINDOWS: usize = 2;
+/// Echo-tail hangover: `playback.set_idle()` fires on TurnComplete, but the speaker
+/// is still draining and the room still ringing for a beat after — in that window the
+/// model's own voice was walking back in as a fresh "user" utterance (observed as
+/// 17–125ms pause→first-audio measurements and self-repeating turns). The turn is not
+/// over until the room is quiet: reference-audio gating extends this long past idle.
+/// Matches the LiveKit agent path's LIVEKIT_AGENT_ECHO_GATE_MS.
+const PLAYBACK_ECHO_TAIL_MS: u64 = 700;
+
+/// `LIQUID_VOICE_TRACE=1` — trace the voice call graph (VAD decisions, submits,
+/// pipeline turns, engine context/cursor movements, playback transitions) to stderr
+/// with timestamps relative to session start. Zero cost when off.
+pub(crate) fn voice_trace_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("LIQUID_VOICE_TRACE").is_ok_and(|v| !v.is_empty() && v != "0")
+    })
+}
+
+pub(crate) fn voice_trace_elapsed() -> f64 {
+    static ORIGIN: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    ORIGIN.get_or_init(Instant::now).elapsed().as_secs_f64()
+}
+
+/// `vtrace!("vad: speech-start (streak {n})")` — one stderr line when tracing is on.
+#[macro_export]
+macro_rules! vtrace {
+    ($($arg:tt)*) => {
+        if $crate::voice_runtime::voice_trace_enabled() {
+            eprintln!(
+                "[voice-trace +{:8.3}s] {}",
+                $crate::voice_runtime::voice_trace_elapsed(),
+                format!($($arg)*)
+            );
+        }
+    };
+}
 
 /// Externally-fed microphone input for the desktop runtime.
 ///
@@ -249,6 +285,10 @@ impl PcmRing {
 struct PlaybackReference {
     active: AtomicBool,
     rms_bits: AtomicU32,
+    /// Milliseconds (since `origin`) of the most recent `set_idle` — the start of
+    /// the echo tail. `u64::MAX` = never played, no tail.
+    idle_at_ms: std::sync::atomic::AtomicU64,
+    origin: Instant,
 }
 
 impl PlaybackReference {
@@ -256,22 +296,44 @@ impl PlaybackReference {
         Arc::new(Self {
             active: AtomicBool::new(false),
             rms_bits: AtomicU32::new(0.0f32.to_bits()),
+            idle_at_ms: std::sync::atomic::AtomicU64::new(u64::MAX),
+            origin: Instant::now(),
         })
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.origin.elapsed().as_millis() as u64
     }
 
     fn set_playing(&self, rms: f32) {
         self.rms_bits
             .store(rms.max(0.0).to_bits(), Ordering::Release);
         self.active.store(true, Ordering::Release);
+        self.idle_at_ms.store(u64::MAX, Ordering::Release);
     }
 
     fn set_idle(&self) {
-        self.active.store(false, Ordering::Release);
+        // Only the first idle after playing starts the tail clock; repeated
+        // set_idle calls (TurnComplete then Error, etc.) must not extend it.
+        if self.active.swap(false, Ordering::AcqRel) {
+            self.idle_at_ms.store(self.now_ms(), Ordering::Release);
+        }
         self.rms_bits.store(0.0f32.to_bits(), Ordering::Release);
     }
 
     fn active(&self) -> bool {
         self.active.load(Ordering::Acquire)
+    }
+
+    /// True while playing OR within the post-playback echo tail — the speaker
+    /// drain plus room decay window in which mic energy is presumed to be our own
+    /// voice coming back. The turn is not over until the room is quiet.
+    fn active_or_tail(&self) -> bool {
+        if self.active() {
+            return true;
+        }
+        let idle_at = self.idle_at_ms.load(Ordering::Acquire);
+        idle_at != u64::MAX && self.now_ms().saturating_sub(idle_at) < PLAYBACK_ECHO_TAIL_MS
     }
 
     fn rms(&self) -> f32 {
@@ -948,6 +1010,7 @@ fn spawn_consumer<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
                 if stop.load(Ordering::SeqCst) {
                     break;
                 }
+                let is_turn_complete = matches!(&event, VoiceEvent::TurnComplete);
                 match event {
                     VoiceEvent::Text(text) => {
                         assistant.store(true, Ordering::SeqCst);
@@ -980,6 +1043,12 @@ fn spawn_consumer<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
                             }
                         }
                         let level = rms(&pcm);
+                        if !speaking {
+                            vtrace!(
+                                "consumer: first-audio of reply ({} samples, rms {level:.3})",
+                                pcm.len()
+                            );
+                        }
                         if level > TURN_LATENCY_AGENT_RMS {
                             if let Some(ms) = latency.try_measure() {
                                 audio.record_turn_latency(ms);
@@ -1062,6 +1131,15 @@ fn spawn_consumer<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
                         }
                     }
                     VoiceEvent::TurnComplete | VoiceEvent::Interrupted => {
+                        vtrace!(
+                            "consumer: {} -> playback idle (echo tail {}ms)",
+                            if is_turn_complete {
+                                "turn-complete"
+                            } else {
+                                "interrupted"
+                            },
+                            PLAYBACK_ECHO_TAIL_MS
+                        );
                         assistant.store(false, Ordering::SeqCst);
                         latency.disarm();
                         if output_ring.is_some() {
@@ -1126,11 +1204,14 @@ fn vad_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
     // run began — the barge-in sustain gate (spec 09, W5).
     let mut voiced_streak = 0usize;
     let mut streak_start = 0usize;
+    // Trace-only: report gate transitions once, not every loop iteration.
+    let mut traced_gate = false;
 
     while !stop.load(Ordering::SeqCst) {
         let _ = mic.wait_for_input(Duration::from_millis(40));
 
         if interrupt.swap(false, Ordering::SeqCst) {
+            vtrace!("vad: session interrupt -> pipe.interrupt + playback flush");
             pipe.interrupt();
             playback_flush.store(true, Ordering::SeqCst);
             assistant.store(false, Ordering::SeqCst);
@@ -1142,6 +1223,10 @@ fn vad_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
         }
 
         if !mic_enabled.load(Ordering::SeqCst) {
+            if !traced_gate {
+                traced_gate = true;
+                vtrace!("vad: mic disabled -> clearing capture");
+            }
             mic.clear();
             mic_buf.clear();
             read = 0;
@@ -1151,6 +1236,10 @@ fn vad_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
         }
 
         if reference_audio_active(assistant, playback, speaker) && !cfg.can_interrupt {
+            if !traced_gate {
+                traced_gate = true;
+                vtrace!("vad: reference audio active (no-interrupt mode) -> mic gated");
+            }
             mic.clear();
             mic_buf.clear();
             read = 0;
@@ -1158,6 +1247,7 @@ fn vad_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
             voiced_streak = 0;
             continue;
         }
+        traced_gate = false;
 
         mic.drain_into(&mut mic_buf, max_local);
         let n = mic_buf.len();
@@ -1176,6 +1266,11 @@ fn vad_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
                     let reference = reference_audio_active(assistant, playback, speaker);
                     let needed = if reference { BARGE_IN_SUSTAIN_WINDOWS } else { 1 };
                     if voiced_streak >= needed {
+                        vtrace!(
+                            "vad: speech-start (streak {voiced_streak}, threshold {threshold:.4}, \
+                             reference-active {reference}{})",
+                            if reference { " -> BARGE-IN interrupt" } else { "" }
+                        );
                         if reference {
                             pipe.interrupt();
                             playback_flush.store(true, Ordering::SeqCst);
@@ -1205,7 +1300,8 @@ fn vad_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
             read = 0;
             speaking = false;
 
-            if samples.len() as f32 / in_rate as f32 >= cfg.min_utterance_s {
+            let dur_s = samples.len() as f32 / in_rate as f32;
+            if dur_s >= cfg.min_utterance_s {
                 if !emit_or_stop(sink, stop, RuntimeEvent::State(SessionState::Thinking)) {
                     return;
                 }
@@ -1213,8 +1309,15 @@ fn vad_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
                     samples,
                     rate: in_rate,
                 }) {
+                    vtrace!("vad: utterance-end {dur_s:.2}s -> submitted");
                     latency.arm();
                 } else {
+                    // A full utterance queue silently eating the user's speech is a
+                    // real user-facing event — always say so, not just under trace.
+                    eprintln!(
+                        "[voice] utterance ({dur_s:.2}s) DROPPED — pipeline busy \
+                         (queue full); interrupting current reply"
+                    );
                     pipe.interrupt();
                     playback_flush.store(true, Ordering::SeqCst);
                     assistant.store(false, Ordering::SeqCst);
@@ -1223,6 +1326,8 @@ fn vad_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
                     }
                     continue;
                 }
+            } else {
+                vtrace!("vad: utterance-end {dur_s:.2}s -> discarded (under min_utterance_s)");
             }
         } else if !speaking && n > in_rate as usize * 5 {
             mic_buf.clear();
@@ -1416,7 +1521,7 @@ fn reference_audio_active(
     playback: &PlaybackReference,
     speaker: &PcmRing,
 ) -> bool {
-    assistant.load(Ordering::SeqCst) || playback.active() || speaker.len() > 0
+    assistant.load(Ordering::SeqCst) || playback.active_or_tail() || speaker.len() > 0
 }
 
 fn ready_state(mic_enabled: &AtomicBool) -> SessionState {
@@ -1711,6 +1816,7 @@ mod tests {
         let playback = PlaybackReference::new();
         let speaker = PcmRing::new(4);
 
+        // Never played: no tail, not reference audio.
         assert!(!reference_audio_active(&assistant, &playback, &speaker));
         assert_eq!(
             reference_vad_threshold(0.012, &assistant, &playback, &speaker),
@@ -1721,8 +1827,23 @@ mod tests {
         assert!(reference_audio_active(&assistant, &playback, &speaker));
         assert!(reference_vad_threshold(0.012, &assistant, &playback, &speaker) >= 0.1);
 
+        // Idle starts the ECHO TAIL: the speaker is still draining and the room
+        // still ringing, so the reference gate must stay up (the bug this guards:
+        // the model's own trailing audio re-entering as a fresh "user" utterance).
         playback.set_idle();
+        assert!(!playback.active(), "raw active flag drops on idle");
+        assert!(
+            reference_audio_active(&assistant, &playback, &speaker),
+            "echo tail keeps reference audio active right after idle"
+        );
+
+        // After the tail window passes, the room is presumed quiet.
+        std::thread::sleep(Duration::from_millis(PLAYBACK_ECHO_TAIL_MS + 60));
         assert!(!reference_audio_active(&assistant, &playback, &speaker));
+
+        // Playing again clears the tail bookkeeping.
+        playback.set_playing(0.05);
+        assert!(reference_audio_active(&assistant, &playback, &speaker));
     }
 
     #[test]
