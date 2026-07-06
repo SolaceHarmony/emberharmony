@@ -10,13 +10,16 @@
 //! - the fused ShortConv decode kernel (T=1 steps carrying conv state),
 //! - Mimi streaming-decode of the reply to PCM, asserted non-silent.
 //!
-//! Then the whole conversation is re-run with `Cache::fused_conv_decode = false`
-//! (composed candle ops — injected through the cache the test constructs, no
-//! ambient state) and the first greedy text run of turn 1 — which conditions
-//! ONLY on the deterministic prefill — must be IDENTICAL. Turn 2's run is
-//! compared too, but only when turn 1's full sampled stream matched (otherwise
-//! turn 2 sees different appended context and inequality is not a bug —
-//! near-tie audio sampling may legitimately flip under bf16 rounding).
+//! Then the whole FOUR-turn conversation is re-run with
+//! `Cache::fused_conv_decode = false` (composed candle ops — injected through
+//! the cache the test constructs, no ambient state). Turn 1's FULL stream
+//! (greedy text + seeded sampled audio) must be IDENTICAL — the fused kernel
+//! is built to match the composed path's bf16 rounding bit-for-bit at decode
+//! shapes, so with identical logits the seeded sampler picks identical tokens;
+//! a hard assertion, not a printout. Every later turn's first greedy text run
+//! must then match too. Four turns, not two: compounding cursor drift lives at
+//! turn 3+, and each turn asserts the suffix path (not a silent full
+//! re-prefill) actually served it.
 //!
 //! Run: LFM_DEVICE=metal LFM_MODEL_DIR=/path/to/model \
 //!      cargo test --release --features metal --test e2e_generate -- --nocapture
@@ -82,7 +85,7 @@ fn rms(v: &[f32]) -> f32 {
     (v.iter().map(|x| x * x).sum::<f32>() / v.len() as f32).sqrt()
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Debug)]
 struct TurnOut {
     text_ids: Vec<u32>,
     audio_frames: Vec<Vec<u32>>,
@@ -117,6 +120,7 @@ fn run_turn(
     codebooks: usize,
     device: &Device,
     fused_conv: bool,
+    turn_idx: usize,
 ) -> TurnOut {
     chat.new_turn("user").unwrap();
     chat.add_audio(wave, rate).unwrap();
@@ -125,6 +129,27 @@ fn run_turn(
 
     let n_ctx = chat.modality_flag.dim(1).unwrap();
     let in_emb = model.prefill_suffix(chat, cursor).expect("suffix prefill");
+    // The persistent cache must actually be taking the SUFFIX path on every
+    // turn after the first — a silent fall-back to full re-prefill would keep
+    // all outputs correct while quietly converting the accelerator into
+    // per-turn latency that grows with conversation length. Gating on the turn
+    // INDEX (not on `cursor.positions > 0`) is the point: the desync fallback
+    // resets the cursor to zero, which is exactly the failure this must catch,
+    // not a condition that lets it skip the check.
+    let n_suffix = in_emb.dim(1).unwrap();
+    if turn_idx > 0 {
+        assert!(
+            cursor.positions > 0,
+            "turn {}: persistent cache was dropped (cursor reset to zero) — \
+             a silent full re-prefill served this turn",
+            turn_idx + 1
+        );
+        assert_eq!(
+            n_suffix,
+            n_ctx - cursor.positions,
+            "suffix prefill length must be exactly the unseen context tail"
+        );
+    }
     if cache.is_none() {
         let mut fresh = model.make_cache(in_emb.dtype(), device).unwrap();
         fresh.fused_conv_decode = fused_conv;
@@ -213,13 +238,14 @@ fn run_turn(
     out
 }
 
-/// A full two-turn spoken conversation; returns per-turn output, turn-2 reply
-/// text, and turn-2 Mimi-decoded PCM (with its sample rate).
+/// A full FOUR-turn spoken conversation (turn-3+ is where compounding cursor
+/// drift would live; two-turn tests are structurally blind to it); returns all
+/// turns, the last turn's reply text, and its Mimi-decoded PCM (+ sample rate).
 fn run_conversation(
     device: &Device,
     dir: &Path,
     fused_conv: bool,
-) -> (TurnOut, TurnOut, String, Vec<f32>, u32) {
+) -> (Vec<TurnOut>, String, Vec<f32>, u32) {
     let (model, proc) = liquid_audio::from_pretrained(dir, device).expect("load model");
     let cfg: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(dir.join("config.json")).expect("config.json"),
@@ -253,17 +279,18 @@ fn run_conversation(
 
     let mut cache: Option<LfmCache> = None;
     let mut cursor = PrefillCursor::default();
-    let t1 = run_turn(
-        &model, &mut chat, &mut cache, &mut cursor, &wave, rate, &params, codebooks, device,
-        fused_conv,
-    );
-    let t2 = run_turn(
-        &model, &mut chat, &mut cache, &mut cursor, &wave, rate, &params, codebooks, device,
-        fused_conv,
-    );
+    let turns: Vec<TurnOut> = (0..4)
+        .map(|turn_idx| {
+            run_turn(
+                &model, &mut chat, &mut cache, &mut cursor, &wave, rate, &params, codebooks,
+                device, fused_conv, turn_idx,
+            )
+        })
+        .collect();
 
-    let text2 = proc.text().decode(&t2.text_ids, true).unwrap_or_default();
-    let pcm = decode_audio_reply(&mimi, &t2.audio_frames, codebooks, device)
+    let last = turns.last().expect("four turns");
+    let text_last = proc.text().decode(&last.text_ids, true).unwrap_or_default();
+    let pcm = decode_audio_reply(&mimi, &last.audio_frames, codebooks, device)
         .expect("mimi decode")
         .map(|t| {
             t.flatten_all()
@@ -275,11 +302,11 @@ fn run_conversation(
         })
         .unwrap_or_default();
 
-    (t1, t2, text2, pcm, mimi.sample_rate())
+    (turns, text_last, pcm, mimi.sample_rate())
 }
 
 #[test]
-fn e2e_two_turns_real_speech_and_fused_conv_ab() {
+fn e2e_four_turns_real_speech_and_fused_conv_ab() {
     let dir = std::env::var("LFM_MODEL_DIR").expect("set LFM_MODEL_DIR to the local model dir");
     let dir = Path::new(&dir);
     let device = match std::env::var("LFM_DEVICE").ok().as_deref() {
@@ -288,9 +315,10 @@ fn e2e_two_turns_real_speech_and_fused_conv_ab() {
     };
 
     // ---- Phase A: fused ShortConv decode path (the production default). ----
-    let (a1, a2, text_a, pcm_a, mimi_rate) = run_conversation(&device, dir, true);
+    let (a, text_a, pcm_a, mimi_rate) = run_conversation(&device, dir, true);
 
-    for (name, t) in [("turn1", &a1), ("turn2", &a2)] {
+    for (i, t) in a.iter().enumerate() {
+        let name = format!("turn{}", i + 1);
         assert!(!t.text_ids.is_empty(), "{name}: no text generated");
         assert!(!t.audio_frames.is_empty(), "{name}: no audio generated");
         assert!(
@@ -298,43 +326,49 @@ fn e2e_two_turns_real_speech_and_fused_conv_ab() {
             "{name}: reply does not open with a text run (interleave broken)"
         );
     }
-    println!("turn-2 reply text (fused): {text_a:?}");
+    println!("turn-4 reply text (fused): {text_a:?}");
 
     // The spoken reply must decode to real, non-silent audio of plausible length.
-    assert!(!pcm_a.is_empty(), "turn-2 reply produced no PCM");
+    assert!(!pcm_a.is_empty(), "turn-4 reply produced no PCM");
     let dur = pcm_a.len() as f32 / mimi_rate as f32;
     let level = rms(&pcm_a);
-    println!("turn-2 reply audio: {dur:.2}s @ {mimi_rate} Hz, rms {level:.4}");
-    assert!(dur > 0.2, "turn-2 reply audio implausibly short: {dur:.2}s");
-    assert!(level > 1e-4, "turn-2 reply audio decodes to silence (rms {level})");
+    println!("turn-4 reply audio: {dur:.2}s @ {mimi_rate} Hz, rms {level:.4}");
+    assert!(dur > 0.2, "turn-4 reply audio implausibly short: {dur:.2}s");
+    assert!(level > 1e-4, "turn-4 reply audio decodes to silence (rms {level})");
 
     // ---- Phase B: composed candle ops (fused kernel off via the cache seam). ----
-    let (b1, b2, text_b, _pcm_b, _) = run_conversation(&device, dir, false);
-    println!("turn-2 reply text (composed): {text_b:?}");
+    let (b, text_b, _pcm_b, _) = run_conversation(&device, dir, false);
+    println!("turn-4 reply text (composed): {text_b:?}");
 
     // Turn 1's first text run conditions only on the deterministic prefill:
     // fused and composed paths must agree EXACTLY.
     assert_eq!(
-        a1.first_text_run(),
-        b1.first_text_run(),
+        a[0].first_text_run(),
+        b[0].first_text_run(),
         "turn-1 first text run diverged between fused and composed conv paths"
     );
 
-    // Turn 2 comparison is only sound if turn 1's full sampled stream matched
-    // (else turn 2 conditions on different appended context). The fused kernel
-    // rounds through bf16 to match the composed path bit-for-bit, so full-stream
-    // equality is expected — but a near-tie sample flip is not a kernel bug.
-    if a1 == b1 {
-        println!("turn-1 full stream identical fused-vs-composed; comparing turn 2");
+    // The fused kernel rounds through bf16 to match the composed path
+    // bit-for-bit at the decode shapes, and audio sampling is seeded — so with
+    // identical logits the FULL turn-1 stream (text + sampled audio) must be
+    // identical. This is a hard assertion, deliberately: the earlier version
+    // downgraded it to a println with a "near-tie sampling" escape hatch, which
+    // let any fused-kernel corruption past the first text run ride through the
+    // suite unasserted. If this ever fails, the burden of proof is on showing
+    // the divergence really was a near-tie logit — not on the test to assume it.
+    assert_eq!(
+        a[0], b[0],
+        "turn-1 FULL stream (text + sampled audio) diverged between fused and \
+         composed conv paths — kernel numerics drifted"
+    );
+    // With turn 1 identical, later turns share identical context: compare the
+    // greedy text runs on every remaining turn.
+    for i in 1..a.len() {
         assert_eq!(
-            a2.first_text_run(),
-            b2.first_text_run(),
-            "turn-2 first text run diverged between fused and composed conv paths"
-        );
-    } else {
-        println!(
-            "turn-1 sampled streams diverged after the first text run \
-             (near-tie audio sampling); skipping turn-2 comparison"
+            a[i].first_text_run(),
+            b[i].first_text_run(),
+            "turn-{} first text run diverged between fused and composed conv paths",
+            i + 1
         );
     }
 }

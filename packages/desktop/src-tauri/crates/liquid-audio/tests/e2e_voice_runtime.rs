@@ -204,6 +204,12 @@ fn e2e_voice_runtime_speaks_two_turns_through_real_speaker() {
 
     // ---- Everything else is the production stack, speaker included. ----
     let (tx, rx) = channel();
+    // Speculative-prefill counters, smuggled out of the engine the session
+    // thread builds: the live proof that prepare-during-pause actually CONSUMES
+    // (equivalence alone is satisfied by an accelerator that never fires).
+    let spec: Arc<std::sync::OnceLock<(Arc<std::sync::atomic::AtomicU64>, Arc<std::sync::atomic::AtomicU64>)>> =
+        Arc::new(std::sync::OnceLock::new());
+    let spec_slot = spec.clone();
     let runtime = VoiceRuntime::start_with_input(
         RuntimeConfig::default(),
         Some(input),
@@ -228,9 +234,9 @@ fn e2e_voice_runtime_speaks_two_turns_through_real_speaker() {
                 audio_top_k: Some(4),
                 ..GenParams::default()
             };
-            Ok(Box::new(Lfm2VoiceEngine::new(
-                model, proc, params, codebooks, device, out_rate,
-            )) as Box<dyn liquid_audio::VoiceEngine>)
+            let engine = Lfm2VoiceEngine::new(model, proc, params, codebooks, device, out_rate);
+            let _ = spec_slot.set(engine.speculative_counters());
+            Ok(Box::new(engine) as Box<dyn liquid_audio::VoiceEngine>)
         },
         forward_events(tx),
     )
@@ -306,5 +312,27 @@ fn e2e_voice_runtime_speaks_two_turns_through_real_speaker() {
     assert_eq!(
         stats.turn_count, 2,
         "expected two pause→first-audio turn measurements; events: {log:#?}"
+    );
+
+    // The speculative prefill must have actually FIRED AND CONSUMED through the
+    // live VAD path (pause-onset prepare → byte-identical committed trim →
+    // fingerprint match). Reply equivalence cannot prove this — a prepare that
+    // never matches degrades into silent waste while every other assertion
+    // above still passes. The mock mic's pauses are clean, so both turns
+    // should consume; require at least one and report both counts.
+    let (consumed, discarded) = spec
+        .get()
+        .map(|(c, d)| {
+            (
+                c.load(std::sync::atomic::Ordering::Relaxed),
+                d.load(std::sync::atomic::Ordering::Relaxed),
+            )
+        })
+        .expect("engine was never built");
+    println!("[e2e] speculative prefill: consumed {consumed}, discarded {discarded}");
+    assert!(
+        consumed >= 1,
+        "no speculative prefill was consumed through the live VAD path \
+         (prepare/commit trim identity broken?); consumed {consumed}, discarded {discarded}"
     );
 }

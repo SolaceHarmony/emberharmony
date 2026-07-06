@@ -205,6 +205,12 @@ enum Control {
 pub struct RealtimePipeline {
     utt_tx: Option<Sender<QueuedUtterance>>,
     ctl_tx: Option<Sender<Control>>,
+    /// Held ONLY by the pipeline, never cloned into handles: dropping it is the
+    /// worker's unconditional stop signal. Shutdown must not depend on the data
+    /// channels disconnecting — handle clones keep those alive, and a `Drop`
+    /// that waited on them deadlocked whenever a handle outlived the pipeline
+    /// on the same stack (the native-LiveKit teardown did exactly that).
+    shutdown_tx: Option<Sender<()>>,
     event_rx: Receiver<VoiceEvent>,
     cancel: Arc<AtomicBool>,
     epoch: Arc<AtomicU64>,
@@ -298,6 +304,9 @@ fn serve_utterance<E: VoiceEngine>(
 ) -> Served {
     let latest_epoch = epoch_worker.load(Ordering::Acquire);
     if epoch < latest_epoch {
+        // A stale utterance implies any speculative prefill is stale too —
+        // release its parked cache now instead of at the next turn.
+        engine.discard_prepared();
         if latest_epoch > *current_epoch {
             *current_epoch = latest_epoch;
             match interrupt_engine(engine, cancel_worker) {
@@ -334,6 +343,28 @@ fn serve_utterance<E: VoiceEngine>(
     // A fresh turn clears any barge-in left set by the previous reply, so
     // it cannot carry over and abort the new one before it starts.
     cancel_worker.store(false, Ordering::SeqCst);
+    // Close the clear-vs-interrupt race: if interrupt() bumped the epoch after
+    // the fences above but before that store, the store just erased a live
+    // barge-in and THIS utterance is stale — without this re-check, a full
+    // stale reply would generate uncancellable, playing over the user.
+    let latest_epoch = epoch_worker.load(Ordering::Acquire);
+    if latest_epoch > *current_epoch {
+        *current_epoch = latest_epoch;
+        engine.discard_prepared();
+        match interrupt_engine(engine, cancel_worker) {
+            Ok(()) => {
+                if !try_send_event(event_tx, VoiceEvent::Interrupted, cancel_worker) {
+                    return Served::Stop;
+                }
+            }
+            Err(error) => {
+                if !try_send_event(event_tx, VoiceEvent::Error(error), cancel_worker) {
+                    return Served::Stop;
+                }
+            }
+        }
+        return Served::Continue;
+    }
     let mut event_backpressure = false;
     let responded = {
         let mut emit = |ev: VoiceEvent| {
@@ -390,6 +421,7 @@ impl RealtimePipeline {
         // they can never occupy the utterance slot.
         let (utt_tx, utt_rx) = bounded::<QueuedUtterance>(UTTERANCE_QUEUE_CAP);
         let (ctl_tx, ctl_rx) = bounded::<Control>(CONTROL_QUEUE_CAP);
+        let (shutdown_tx, shutdown_rx) = bounded::<()>(0);
         let (event_tx, event_rx) = bounded::<VoiceEvent>(EVENT_QUEUE_CAP);
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_worker = cancel.clone();
@@ -399,15 +431,37 @@ impl RealtimePipeline {
         let worker = std::thread::Builder::new()
             .name("lfm2-inference".into())
             .spawn(move || {
-                // The inference coroutine: serve until the pipeline drops (both
-                // senders close ⇒ the utterance recv errors ⇒ return and join).
+                // The inference coroutine: serve until the pipeline drops. The
+                // stop signal is `shutdown_rx` disconnecting — guaranteed at
+                // pipeline drop no matter which handle clones are still alive.
                 let mut current_epoch = 0u64;
                 let mut ctl_open = true;
                 loop {
+                    // Teardown observed? Do no further work — especially not a
+                    // queued fresh-epoch Prepare, whose non-cancellable prefill
+                    // would delay Drop's join by up to a full prefill. (Stale
+                    // Prepares are already dropped by the epoch guard; this
+                    // closes the racing-handle window.)
+                    if matches!(
+                        shutdown_rx.try_recv(),
+                        Err(crossbeam_channel::TryRecvError::Disconnected)
+                    ) {
+                        return;
+                    }
                     // Drain queued control first (never blocks): a Prepare sent
                     // before its committing utterance is guaranteed to run first.
+                    // But a Prepare must never DELAY a committed utterance that
+                    // is already waiting: with an utterance queued, a pending
+                    // Prepare is stale by construction (it was built without
+                    // that utterance's turn) — skip it instead of burning a
+                    // prefill the respond would immediately roll back.
                     while ctl_open {
                         match ctl_rx.try_recv() {
+                            Ok(Control::Prepare { .. }) if !utt_rx.is_empty() => {
+                                crate::vtrace!(
+                                    "worker: skipping speculative prepare (utterance waiting)"
+                                );
+                            }
                             Ok(ctl) => handle_control(&mut engine, ctl, &epoch_worker),
                             Err(crossbeam_channel::TryRecvError::Empty) => break,
                             Err(crossbeam_channel::TryRecvError::Disconnected) => {
@@ -417,10 +471,27 @@ impl RealtimePipeline {
                     }
                     let served = if ctl_open {
                         crossbeam_channel::select! {
+                            recv(shutdown_rx) -> _ => return,
                             recv(ctl_rx) -> msg => match msg {
-                                Ok(ctl) => {
-                                    handle_control(&mut engine, ctl, &epoch_worker);
+                                Ok(Control::Prepare { .. }) if !utt_rx.is_empty() => {
+                                    crate::vtrace!(
+                                        "worker: skipping speculative prepare (utterance waiting)"
+                                    );
                                     Served::Continue
+                                }
+                                Ok(ctl) => {
+                                    // Same teardown guard as the loop top: when
+                                    // both arms are ready, select may pick this
+                                    // one even though shutdown already fired.
+                                    if matches!(
+                                        shutdown_rx.try_recv(),
+                                        Err(crossbeam_channel::TryRecvError::Disconnected)
+                                    ) {
+                                        Served::Stop
+                                    } else {
+                                        handle_control(&mut engine, ctl, &epoch_worker);
+                                        Served::Continue
+                                    }
                                 }
                                 Err(_) => {
                                     ctl_open = false;
@@ -441,17 +512,20 @@ impl RealtimePipeline {
                             },
                         }
                     } else {
-                        match utt_rx.recv() {
-                            Ok(QueuedUtterance { utt, epoch }) => serve_utterance(
-                                &mut engine,
-                                utt,
-                                epoch,
-                                &mut current_epoch,
-                                &epoch_worker,
-                                &cancel_worker,
-                                &event_tx,
-                            ),
-                            Err(_) => return,
+                        crossbeam_channel::select! {
+                            recv(shutdown_rx) -> _ => return,
+                            recv(utt_rx) -> msg => match msg {
+                                Ok(QueuedUtterance { utt, epoch }) => serve_utterance(
+                                    &mut engine,
+                                    utt,
+                                    epoch,
+                                    &mut current_epoch,
+                                    &epoch_worker,
+                                    &cancel_worker,
+                                    &event_tx,
+                                ),
+                                Err(_) => return,
+                            },
                         }
                     };
                     if matches!(served, Served::Stop) {
@@ -464,6 +538,7 @@ impl RealtimePipeline {
         Ok(Self {
             utt_tx: Some(utt_tx),
             ctl_tx: Some(ctl_tx),
+            shutdown_tx: Some(shutdown_tx),
             event_rx,
             cancel,
             epoch,
@@ -536,10 +611,14 @@ impl RealtimePipeline {
 
 impl Drop for RealtimePipeline {
     fn drop(&mut self) {
-        // Abort any in-flight reply fast, then close both channels so the worker's
-        // recv errors out, then join — no detached thread, no leak.
+        // Abort any in-flight reply fast, then drop the shutdown sender — the
+        // worker's stop signal. Never wait on the DATA channels disconnecting:
+        // handle clones keep those alive, and a join gated on them deadlocks
+        // when a handle outlives the pipeline on the same stack (the
+        // native-LiveKit session teardown did exactly that).
         self.epoch.fetch_add(1, Ordering::AcqRel);
         self.cancel.store(true, Ordering::SeqCst);
+        drop(self.shutdown_tx.take());
         drop(self.ctl_tx.take());
         drop(self.utt_tx.take());
         if let Some(worker) = self.worker.take() {
@@ -552,6 +631,8 @@ impl Drop for RealtimePipeline {
 /// keeps the model advancing on exact PCM frames instead of waiting for a VAD utterance.
 pub struct RealtimeFramePipeline {
     frame_tx: Option<Sender<FrameCommand>>,
+    /// Worker stop signal, never cloned into handles — see [`RealtimePipeline`].
+    shutdown_tx: Option<Sender<()>>,
     event_rx: Receiver<VoiceEvent>,
     cancel: Arc<AtomicBool>,
     epoch: Arc<AtomicU64>,
@@ -612,6 +693,7 @@ impl RealtimeFramePipeline {
         }
 
         let (frame_tx, frame_rx) = bounded::<FrameCommand>(FRAME_QUEUE_CAP);
+        let (shutdown_tx, shutdown_rx) = bounded::<()>(0);
         let (event_tx, event_rx) = bounded::<VoiceEvent>(EVENT_QUEUE_CAP);
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_worker = cancel.clone();
@@ -622,7 +704,16 @@ impl RealtimeFramePipeline {
             .name("moshi-frame-inference".into())
             .spawn(move || {
                 let mut current_epoch = 0u64;
-                for cmd in frame_rx.iter() {
+                // Stop on `shutdown_rx` disconnect (guaranteed at pipeline drop),
+                // never on the frame channel alone — handle clones keep it alive.
+                loop {
+                    let cmd = crossbeam_channel::select! {
+                        recv(shutdown_rx) -> _ => return,
+                        recv(frame_rx) -> msg => match msg {
+                            Ok(cmd) => cmd,
+                            Err(_) => return,
+                        },
+                    };
                     match cmd {
                         FrameCommand::Interrupt { epoch } => {
                             if epoch <= current_epoch {
@@ -716,6 +807,7 @@ impl RealtimeFramePipeline {
 
         Ok(Self {
             frame_tx: Some(frame_tx),
+            shutdown_tx: Some(shutdown_tx),
             event_rx,
             cancel,
             epoch,
@@ -777,6 +869,9 @@ impl Drop for RealtimeFramePipeline {
     fn drop(&mut self) {
         self.epoch.fetch_add(1, Ordering::AcqRel);
         self.cancel.store(true, Ordering::SeqCst);
+        // Stop signal first — see RealtimePipeline::drop: never gate the join
+        // on data-channel disconnect while handle clones may be alive.
+        drop(self.shutdown_tx.take());
         drop(self.frame_tx.take());
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
@@ -808,6 +903,21 @@ pub struct ConversationState {
     pub audio_in_lens: Tensor,
     pub audio_out: Tensor,
     pub modality_flag: Tensor,
+}
+
+impl ConversationState {
+    /// Move all five tensors to `device` (no-op copies when already there).
+    /// Used when restoring a vaulted conversation into an engine on a different
+    /// compute device than the session that persisted it.
+    pub fn to_device(&self, device: &Device) -> candle_core::Result<Self> {
+        Ok(Self {
+            text: self.text.to_device(device)?,
+            audio_in: self.audio_in.to_device(device)?,
+            audio_in_lens: self.audio_in_lens.to_device(device)?,
+            audio_out: self.audio_out.to_device(device)?,
+            modality_flag: self.modality_flag.to_device(device)?,
+        })
+    }
 }
 
 /// Build a `(rows, cols)` i64 tensor, using a zero-length view of a 1-col buffer when
@@ -875,6 +985,15 @@ pub struct Lfm2VoiceEngine {
     /// [`VoiceEngine::prepare`] during the VAD pause window and consumed by the
     /// matching `respond` — or rolled back by [`VoiceEngine::discard_prepared`].
     pending: Option<PreparedTurn>,
+    /// Lifetime counts of speculative prefills consumed vs rolled back. The
+    /// consumption count is what makes the accelerator FALSIFIABLE: without it,
+    /// a prepare that never matches (broken fingerprint, drifted VAD trim) is
+    /// indistinguishable from one that works — every equivalence test passes
+    /// either way, and the feature silently degrades into pure waste. Shared
+    /// atomics so a caller that moves the engine into a pipeline (the runtime,
+    /// the e2e test) can still observe them from outside.
+    spec_consumed: Arc<AtomicU64>,
+    spec_discarded: Arc<AtomicU64>,
 }
 
 /// See [`Lfm2VoiceEngine::pending`]: the turn context is fully assembled and every
@@ -1027,7 +1146,26 @@ impl Lfm2VoiceEngine {
             session_cache: None,
             vault: None,
             pending: None,
+            spec_consumed: Arc::new(AtomicU64::new(0)),
+            spec_discarded: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// `(consumed, discarded)` lifetime counts for speculative prefills — the
+    /// observable that proves prepare-consumption actually happens (see the
+    /// field docs on why this must be assertable, not just traceable).
+    pub fn speculative_stats(&self) -> (u64, u64) {
+        (
+            self.spec_consumed.load(Ordering::Relaxed),
+            self.spec_discarded.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Handles to the speculative counters, cloneable BEFORE the engine moves
+    /// into a pipeline — how the runtime e2e asserts that live consumption
+    /// actually happened (not just that replies were equivalent).
+    pub fn speculative_counters(&self) -> (Arc<AtomicU64>, Arc<AtomicU64>) {
+        (self.spec_consumed.clone(), self.spec_discarded.clone())
     }
 
     /// Speculative prefill of a PROBABLE next utterance (the VAD saw a pause that
@@ -1101,6 +1239,9 @@ impl Lfm2VoiceEngine {
     /// be a turn end, or when a `respond` arrives with a different utterance.
     pub fn discard_prepared_turn(&mut self) {
         let pending = self.pending.take();
+        if pending.is_some() {
+            self.spec_discarded.fetch_add(1, Ordering::Relaxed);
+        }
         Self::rollback_pending(pending, &mut self.session_cache);
     }
 
@@ -1143,9 +1284,30 @@ impl Lfm2VoiceEngine {
 
     /// Attach a [`ConversationVault`]: restore the conversation it holds (context
     /// survives session rebuilds) and write every completed turn back into it.
+    ///
+    /// The vaulted tensors are pinned to the device of the session that wrote
+    /// them; this engine may live on a different one (the user flipped compute
+    /// device in Settings). Migrate on restore — without it, the first
+    /// `Tensor::cat(old-device, new-device)` errors and, since `conv` never
+    /// changes on the error path, EVERY later turn re-errors: the conversation
+    /// is bricked until app restart. If migration itself fails, drop the
+    /// conversation loudly — a fresh context beats a dead one.
     pub fn with_conversation_vault(mut self, vault: ConversationVault) -> Self {
         if let Ok(saved) = vault.lock() {
-            self.conv = saved.clone();
+            self.conv = match saved.clone() {
+                Some(conv) => match conv.to_device(&self.device) {
+                    Ok(conv) => Some(conv),
+                    Err(e) => {
+                        eprintln!(
+                            "[voice] conversation vault restore failed to migrate to \
+                             {:?} ({e}); starting the conversation fresh",
+                            self.device.location()
+                        );
+                        None
+                    }
+                },
+                None => None,
+            };
         }
         self.vault = Some(vault);
         self
@@ -1206,6 +1368,7 @@ impl VoiceEngine for Lfm2VoiceEngine {
         });
         let (mut chat, mut cache, mut cursor, in_emb, mut index_pos) = if use_pending {
             let p = pending.expect("matched above");
+            self.spec_consumed.fetch_add(1, Ordering::Relaxed);
             crate::vtrace!(
                 "engine: consuming speculative prefill ({} positions pre-forwarded)",
                 p.index_pos - p.cursor.positions
@@ -1224,6 +1387,7 @@ impl VoiceEngine for Lfm2VoiceEngine {
         } else {
             if let Some(p) = pending {
                 crate::vtrace!("engine: pending speculative prefill is stale -> rollback");
+                self.spec_discarded.fetch_add(1, Ordering::Relaxed);
                 Self::rollback_pending(Some(p), &mut self.session_cache);
             }
             // `take()` means any error path below leaves `session_cache = None` — the
@@ -1356,7 +1520,13 @@ impl VoiceEngine for Lfm2VoiceEngine {
         // (suffix forward) plus every emitted token except the last (the loop forwards the
         // previous token before sampling the next). Advance the cursor to exactly that.
         let forwarded_generated = index_pos.saturating_sub(n_ctx);
-        let cache_ok = forwarded_generated <= modality_out.len();
+        // `index_pos < n_ctx` means generation aborted before even the context
+        // suffix was forwarded (instant barge-in). The old `saturating_sub`
+        // masked that as forwarded_generated == 0 and saved a cursor whose
+        // per-modality totals (full-context) contradicted its `positions` —
+        // technically caught by next turn's desync guard, but only by luck.
+        // Be honest: an under-forwarded cache is not resumable; drop it.
+        let cache_ok = index_pos >= n_ctx && forwarded_generated <= modality_out.len();
         let (n_text_gen, n_audio_gen) = (text_ids.len(), audio_frames.len());
         if cache_ok {
             cursor.text = text_total;
@@ -1621,7 +1791,7 @@ impl StreamingPcmResampler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{atomic::AtomicUsize, mpsc};
+    use std::sync::{atomic::AtomicUsize, mpsc, Mutex};
     use std::time::Duration;
 
     fn utt(n: usize) -> Utterance {
@@ -2105,6 +2275,312 @@ mod tests {
                 .map_err(|e| format!("release wait failed: {e}"))?;
             Ok(true)
         }
+    }
+
+    /// Records prepare/respond/discard call order (by utterance length) and can
+    /// optionally block inside respond — the fake that pins the worker's
+    /// control-channel semantics, which no test covered before.
+    struct RecordingEngine {
+        log: Arc<Mutex<Vec<String>>>,
+        prepare_fails: bool,
+        entered: Option<mpsc::Sender<()>>,
+        release: Option<mpsc::Receiver<()>>,
+    }
+
+    impl RecordingEngine {
+        fn free(log: Arc<Mutex<Vec<String>>>) -> Self {
+            Self {
+                log,
+                prepare_fails: false,
+                entered: None,
+                release: None,
+            }
+        }
+
+        fn blocking(
+            log: Arc<Mutex<Vec<String>>>,
+            entered: mpsc::Sender<()>,
+            release: mpsc::Receiver<()>,
+        ) -> Self {
+            Self {
+                log,
+                prepare_fails: false,
+                entered: Some(entered),
+                release: Some(release),
+            }
+        }
+    }
+
+    impl VoiceEngine for RecordingEngine {
+        fn respond(
+            &mut self,
+            utt: &Utterance,
+            _cancel: &AtomicBool,
+            _emit: &mut dyn FnMut(VoiceEvent),
+        ) -> Result<bool, String> {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("respond:{}", utt.samples.len()));
+            if let (Some(entered), Some(release)) = (&self.entered, &self.release) {
+                let _ = entered.send(());
+                release
+                    .recv_timeout(Duration::from_secs(5))
+                    .map_err(|e| format!("release wait failed: {e}"))?;
+            }
+            Ok(true)
+        }
+
+        fn prepare(&mut self, utt: &Utterance) -> Result<(), String> {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("prepare:{}", utt.samples.len()));
+            if self.prepare_fails {
+                Err("prepare exploded".into())
+            } else {
+                Ok(())
+            }
+        }
+
+        fn discard_prepared(&mut self) {
+            self.log.lock().unwrap().push("discard".into());
+        }
+    }
+
+    /// Poll the recording log until it holds `want` entries (bounded).
+    fn wait_log(log: &Arc<Mutex<Vec<String>>>, want: usize) -> Vec<String> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let snapshot = log.lock().unwrap().clone();
+            if snapshot.len() >= want {
+                return snapshot;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("log never reached {want} entries: {snapshot:?}");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Regression for the shutdown deadlock: dropping the pipeline while a
+    /// handle clone is still alive must join promptly — the live-LiveKit
+    /// teardown drops the pipeline with a handle on the same stack, which
+    /// wedged forever when shutdown depended on data-channel disconnect.
+    #[test]
+    fn drop_with_live_handle_joins_promptly() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let pipe = RealtimePipeline::spawn(RecordingEngine::free(log)).expect("spawn");
+        let handle = pipe.handle().expect("handle");
+
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            drop(pipe);
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("pipeline drop deadlocked while a handle clone was alive");
+        drop(handle);
+    }
+
+    /// Same contract for the frame pipeline (identical shutdown structure).
+    #[test]
+    fn frame_pipeline_drop_with_live_handle_joins_promptly() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, _entered_rx) = mpsc::channel();
+        let (_release_tx, release_rx) = mpsc::channel();
+        let pipe = RealtimeFramePipeline::spawn(BlockingFrameEngine {
+            calls,
+            entered: entered_tx,
+            release: release_rx,
+        })
+        .expect("spawn frame pipeline");
+        let handle = pipe.handle().expect("handle");
+
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            drop(pipe);
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("frame pipeline drop deadlocked while a handle clone was alive");
+        drop(handle);
+    }
+
+    /// A Prepare sent before its committing utterance runs first when the
+    /// worker is otherwise idle — the ordering the consume path depends on.
+    #[test]
+    fn prepare_runs_before_its_committing_utterance() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let pipe = RealtimePipeline::spawn(RecordingEngine::blocking(
+            log.clone(),
+            entered_tx,
+            release_rx,
+        ))
+        .expect("spawn");
+
+        assert!(pipe.submit(utt(1)));
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("turn 1 started");
+        // Queued while the worker is busy; no other utterance waits.
+        assert!(pipe.prepare(utt(7)));
+        release_tx.send(()).unwrap();
+        let _ = collect_turn(pipe.events());
+
+        // After turn 1, the drain runs the prepare; then commit the utterance.
+        wait_log(&log, 2);
+        assert!(pipe.submit(utt(7)));
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("turn 7 started");
+        release_tx.send(()).unwrap();
+        let _ = collect_turn(pipe.events());
+
+        assert_eq!(
+            wait_log(&log, 3),
+            vec!["respond:1", "prepare:7", "respond:7"],
+            "prepare must run after the busy turn but before its own utterance"
+        );
+    }
+
+    /// A Prepare must never DELAY a committed utterance that is already
+    /// waiting: it is stale by construction (built without that turn) and is
+    /// skipped, not run-then-rolled-back — the time-axis version of the
+    /// queue-slot starvation this channel split exists to prevent.
+    #[test]
+    fn prepare_skipped_when_utterance_is_waiting() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let pipe = RealtimePipeline::spawn(RecordingEngine::blocking(
+            log.clone(),
+            entered_tx,
+            release_rx,
+        ))
+        .expect("spawn");
+
+        assert!(pipe.submit(utt(1)));
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("turn 1 started");
+        assert!(pipe.prepare(utt(7)), "control queue accepts the prepare");
+        assert!(pipe.submit(utt(2)), "utterance queue accepts the next turn");
+        release_tx.send(()).unwrap();
+        let _ = collect_turn(pipe.events());
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("turn 2 started");
+        release_tx.send(()).unwrap();
+        let _ = collect_turn(pipe.events());
+
+        assert_eq!(
+            wait_log(&log, 2),
+            vec!["respond:1", "respond:2"],
+            "the stale prepare must be skipped, not run ahead of the waiting utterance"
+        );
+    }
+
+    /// A Prepare queued before a barge-in carries a stale epoch and must be
+    /// dropped without reaching the engine.
+    #[test]
+    fn stale_epoch_prepare_is_dropped() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let pipe = RealtimePipeline::spawn(RecordingEngine::blocking(
+            log.clone(),
+            entered_tx,
+            release_rx,
+        ))
+        .expect("spawn");
+
+        assert!(pipe.submit(utt(1)));
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("turn 1 started");
+        assert!(pipe.prepare(utt(7))); // epoch 0
+        pipe.interrupt(); // epoch -> 1: the prepare is now stale
+        release_tx.send(()).unwrap();
+        let _ = collect_turn(pipe.events());
+
+        // Prove the worker is alive and the stale prepare never ran.
+        assert!(pipe.submit(utt(8)));
+        // The epoch bump makes the worker emit Interrupted before serving.
+        let _ = collect_turn(pipe.events());
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("turn 8 started");
+        release_tx.send(()).unwrap();
+        let _ = collect_turn(pipe.events());
+
+        let entries = wait_log(&log, 2);
+        assert!(
+            !entries.iter().any(|e| e.starts_with("prepare")),
+            "stale-epoch prepare reached the engine: {entries:?}"
+        );
+        assert_eq!(entries, vec!["respond:1", "respond:8"]);
+    }
+
+    /// DiscardPrepared is delivered to the engine.
+    #[test]
+    fn discard_prepared_reaches_engine() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let pipe = RealtimePipeline::spawn(RecordingEngine::free(log.clone())).expect("spawn");
+
+        assert!(pipe.prepare(utt(7)));
+        wait_log(&log, 1);
+        pipe.discard_prepared();
+        assert_eq!(wait_log(&log, 2), vec!["prepare:7", "discard"]);
+    }
+
+    /// A failing prepare is logged-and-swallowed; the worker keeps serving.
+    #[test]
+    fn prepare_error_does_not_kill_worker() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut engine = RecordingEngine::free(log.clone());
+        engine.prepare_fails = true;
+        let pipe = RealtimePipeline::spawn(engine).expect("spawn");
+
+        assert!(pipe.prepare(utt(7)));
+        wait_log(&log, 1);
+        assert!(pipe.submit(utt(1)));
+        assert_eq!(
+            collect_turn(pipe.events()).last(),
+            Some(&VoiceEvent::TurnComplete),
+            "worker must survive a prepare error and serve the next turn"
+        );
+        assert_eq!(wait_log(&log, 2), vec!["prepare:7", "respond:1"]);
+    }
+
+    /// The five tensors of a vaulted conversation migrate across compute
+    /// devices on restore — without this, a settings device flip mid-chat
+    /// bricked every subsequent voice turn (device-mismatch on the first cat).
+    #[cfg(feature = "metal")]
+    #[test]
+    fn conversation_state_migrates_devices() {
+        let cpu = Device::Cpu;
+        let metal = Device::new_metal(0).expect("metal device");
+        let conv = ConversationState {
+            text: Tensor::from_vec(vec![1i64, 2, 3], (1, 3), &cpu).unwrap(),
+            audio_in: Tensor::zeros((4, 2), DType::F32, &cpu).unwrap(),
+            audio_in_lens: Tensor::from_vec(vec![2i64], (1,), &cpu).unwrap(),
+            audio_out: Tensor::zeros((8, 2), DType::I64, &cpu).unwrap(),
+            modality_flag: Tensor::from_vec(vec![0i64, 0, 0], (1, 3), &cpu).unwrap(),
+        };
+        let moved = conv.to_device(&metal).expect("migrate to metal");
+        assert_eq!(moved.text.device().location(), metal.location());
+        assert_eq!(moved.audio_out.device().location(), metal.location());
+        // Values survive the trip.
+        let round = moved.to_device(&cpu).expect("migrate back");
+        assert_eq!(
+            round.text.flatten_all().unwrap().to_vec1::<i64>().unwrap(),
+            vec![1, 2, 3]
+        );
     }
 
     #[test]

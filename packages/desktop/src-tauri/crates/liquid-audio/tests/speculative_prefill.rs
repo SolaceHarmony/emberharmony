@@ -1,9 +1,19 @@
 //! Speculative prefill (prepare-during-pause) correctness against the real model.
 //!
-//! The contract: `prepare` is a pure ACCELERATOR. Whatever sequence of
-//! prepare/discard calls precedes a `respond`, the reply must be what a plain
-//! `respond` would have produced. Four equivalences, all through the public
-//! engine API (the one mock is nothing at all — real model, real weights):
+//! The contract, stated honestly: whatever sequence of prepare/discard calls
+//! precedes a `respond`, the reply must be equivalent to a plain `respond`
+//! WITHIN the chunked-forward contract the cross-turn cache already lives
+//! under (cache_equivalence.rs): the suffix is forwarded as [n−1 | 1] instead
+//! of [n], which carries the same measured ~1e-2 bf16 chunk-boundary noise.
+//! The FIRST GREEDY TEXT RUN is the exactness target (it survives that noise);
+//! sampled audio may legitimately tie-flip between the paths — "bit-identical
+//! replies" is NOT the claim. Additionally, consumption is asserted via
+//! `speculative_stats`: an accelerator that never fires would pass every
+//! equivalence below (rollback is also equivalence-preserving), so equivalence
+//! alone proves nothing about the feature actually working.
+//!
+//! Five equivalences, all through the public engine API (the one mock is
+//! nothing at all — real model, real weights):
 //!
 //! 1. prepare(u) → respond(u)  ==  respond(u)                    (consume path)
 //! 2. prepare(u′) → respond(u) ==  respond(u)                    (stale rollback)
@@ -149,7 +159,10 @@ fn prepare_is_a_pure_accelerator() {
         r_ref.wall_s, r_ref.first_text_run
     );
 
-    // 1. Consume path: prepare(u) → respond(u).
+    // 1. Consume path: prepare(u) → respond(u) — and PROVE it consumed. Without
+    // the stats assertion, a prepare that never matches passes this test
+    // identically (rollback is equivalence-preserving) and the feature is
+    // silently pure waste.
     let mut e1 = engine();
     let tp = Instant::now();
     e1.prepare_turn(&utt1).expect("prepare");
@@ -163,6 +176,11 @@ fn prepare_is_a_pure_accelerator() {
         r1.first_text_run, r_ref.first_text_run,
         "consume path diverged from plain respond"
     );
+    assert_eq!(
+        e1.speculative_stats(),
+        (1, 0),
+        "the prepared turn was not actually consumed"
+    );
 
     // 2. Stale rollback: prepare a DIFFERENT utterance, respond with u.
     let mut e2 = engine();
@@ -171,6 +189,11 @@ fn prepare_is_a_pure_accelerator() {
     assert_eq!(
         r2.first_text_run, r_ref.first_text_run,
         "stale-prepare rollback diverged from plain respond"
+    );
+    assert_eq!(
+        e2.speculative_stats(),
+        (0, 1),
+        "the mismatched prepare should have been discarded, not consumed"
     );
 
     // 3. Explicit rollback: prepare(u) → discard → respond(u).
@@ -208,6 +231,11 @@ fn prepare_is_a_pure_accelerator() {
     assert!(
         p2.n_text_events > 0 && p2.n_audio_events > 0,
         "prepared turn 2 produced an empty reply"
+    );
+    assert_eq!(
+        e4.speculative_stats(),
+        (1, 0),
+        "the cross-turn prepared turn was not actually consumed"
     );
 
     // 5. Rollback then a DIFFERENT next turn: prepare(u1) on top of turn 1,

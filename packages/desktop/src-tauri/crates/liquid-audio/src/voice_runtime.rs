@@ -977,6 +977,7 @@ fn spawn_consumer<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
         let output = output.clone();
         let flush = output_flush.clone();
         let stop = output_stop.clone();
+        let audio = audio.clone();
         std::thread::Builder::new()
             .name("voice-output".into())
             .spawn(move || {
@@ -995,6 +996,12 @@ fn spawn_consumer<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
                         eprintln!("[voice-output] speaker write failed: {e}");
                         break;
                     }
+                    // Count as played ONLY after the transport accepted the
+                    // write — counting at ring-push made `played_samples` mean
+                    // "queued, possibly never delivered" on this path.
+                    audio
+                        .played_samples
+                        .fetch_add(chunk.len() as u64, Ordering::Relaxed);
                 }
                 output.clear();
             })
@@ -1093,11 +1100,10 @@ fn spawn_consumer<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
                         audio
                             .dropped_samples
                             .fetch_add(dropped as u64, Ordering::Relaxed);
-                        if external_output && queued > 0 {
-                            audio
-                                .played_samples
-                                .fetch_add(queued as u64, Ordering::Relaxed);
-                        }
+                        // NOTE: `played_samples` for the external-output path is
+                        // counted by the voice-output thread AFTER a successful
+                        // write, not here at ring-push — see spawn above.
+                        let _ = external_output;
                         if !emit_or_stop(
                             &sink,
                             &stop,
@@ -1303,27 +1309,32 @@ fn vad_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
         }
 
         // Pause onset: hand the PROBABLE utterance to the engine so the prefill
-        // runs during the remaining silence window instead of after it. Trimmed to
-        // one window past the last voiced window — the SAME boundary the commit
-        // uses, so the committed utterance is byte-identical and consumes the
-        // prepared state. Best-effort: a full queue just means no head start.
+        // runs during the remaining silence window instead of after it. The
+        // consume path requires the prepared and committed slices to be
+        // byte-identical, so prepare WAITS until the full one-window pad past
+        // `voice_end` has actually been delivered (`n >= voice_end + window`) —
+        // firing on wall-clock alone raced mic delivery jitter into a short
+        // slice the commit could never match, a silently wasted prefill.
         if speaking
             && prepared.is_none()
             && last_voice.elapsed() >= Duration::from_millis(PREPARE_AFTER_MS)
+            && n >= voice_end + window
         {
-            let trim_end = (voice_end + window).min(n);
+            let trim_end = voice_end + window;
             if trim_end > start {
                 let dur_s = (trim_end - start) as f32 / in_rate as f32;
-                if dur_s >= cfg.min_utterance_s
-                    && pipe.prepare(Utterance {
+                if dur_s >= cfg.min_utterance_s {
+                    let sent = pipe.prepare(Utterance {
                         samples: mic_buf[start..trim_end].to_vec(),
                         rate: in_rate,
-                    })
-                {
+                    });
                     vtrace!(
-                        "vad: pause {}ms -> speculative prepare ({dur_s:.2}s)",
+                        "vad: pause {}ms -> speculative prepare ({dur_s:.2}s, sent {sent})",
                         last_voice.elapsed().as_millis()
                     );
+                    // Mark attempted even when the control queue was full: the
+                    // head start is lost either way, and retrying every ~40ms
+                    // loop tick would clone the whole utterance each time.
                     prepared = Some(trim_end);
                 }
             }
@@ -1333,14 +1344,23 @@ fn vad_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
         if speaking && (last_voice.elapsed() >= silence_stop || forced_end) {
             let end = read.min(n);
             // Trim the end-of-turn silence tail: the utterance ends one window past
-            // the last voiced window (matching `prepare` above). The tail carried
-            // no speech — it only made the conformer/prefill longer.
+            // the last voiced window — the same `voice_end + window` boundary
+            // `prepare` used (voice_end is frozen between them: any voiced window
+            // in between discards the prepare), so the slices are byte-identical
+            // whenever the pad was fully delivered by prepare time. The clamp
+            // only bites on forced-end/stall edges, where a fingerprint mismatch
+            // and rollback is the correct, self-healing outcome. Trimming also
+            // means the conformer no longer eats a dead half-second of silence —
+            // NOTE: this changed the model's input distribution (per-feature mel
+            // normalization is computed over the segment, and the silence
+            // fraction shifts it) and made `min_utterance_s` a real gate for
+            // short interjections; both intentional, revisit on quality reports.
             let end = (voice_end + window).clamp(start, end);
             let samples = mic_buf[start..end].to_vec();
             mic_buf.clear();
             read = 0;
             speaking = false;
-            prepared = None;
+            let had_prepare = prepared.take();
             voice_end = 0;
 
             let dur_s = samples.len() as f32 / in_rate as f32;
@@ -1364,6 +1384,12 @@ fn vad_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
                     pipe.interrupt();
                     playback_flush.store(true, Ordering::SeqCst);
                     assistant.store(false, Ordering::SeqCst);
+                    // The committing utterance never reached the engine, so the
+                    // speculative prefill built for it would otherwise sit on a
+                    // context-sized cache until the NEXT turn rolls it back.
+                    if had_prepare.is_some() {
+                        pipe.discard_prepared();
+                    }
                     if !emit_ready(sink, stop, mic_enabled) {
                         return;
                     }
@@ -1371,6 +1397,11 @@ fn vad_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
                 }
             } else {
                 vtrace!("vad: utterance-end {dur_s:.2}s -> discarded (under min_utterance_s)");
+                // Same orphan hazard: a prepare exists but its utterance was
+                // discarded as too short — release the parked cache now.
+                if had_prepare.is_some() {
+                    pipe.discard_prepared();
+                }
             }
         } else if !speaking && n > in_rate as usize * 5 {
             mic_buf.clear();
@@ -2161,11 +2192,14 @@ mod tests {
         consumer.join().unwrap();
 
         // The consumer pushes PCM to a bounded ring; a dedicated output thread
-        // drains the ring and calls write_mono_f32. Wait for it to finish.
+        // drains the ring, calls write_mono_f32, and counts `played_samples`
+        // AFTER the write returns Ok — wait for both.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while written.load(Ordering::SeqCst) < 2 {
+        while written.load(Ordering::SeqCst) < 2
+            || audio.snapshot().played_samples < 2
+        {
             if std::time::Instant::now() >= deadline {
-                panic!("output thread did not drain the ring within 2s");
+                panic!("output thread did not drain + count the ring within 2s");
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
@@ -2183,6 +2217,68 @@ mod tests {
                 last_turn_latency_ms: 0,
                 mean_turn_latency_ms: 0,
             }
+        );
+    }
+
+    /// The other half of the played-at-write contract: a FAILING transport write
+    /// must not count as played. (Counting at ring-push made `played_samples`
+    /// mean "queued, possibly never delivered" — the stat the UI shows would
+    /// claim audio the user never heard.)
+    #[test]
+    fn external_write_failure_is_not_counted_as_played() {
+        let (tx, rx) = crossbeam_channel::bounded(4);
+        let sink = Arc::new(Mutex::new(move |_event| true));
+        let stop = Arc::new(AtomicBool::new(false));
+        let mic = Arc::new(AtomicBool::new(true));
+        let assistant = Arc::new(AtomicBool::new(false));
+        let ring = PcmRing::new(16);
+        let audio = Arc::new(AudioStats::default());
+        let attempted = Arc::new(AtomicUsize::new(0));
+        let tried = attempted.clone();
+        let output = ExternalAudioOutput::new(
+            48_000,
+            move |pcm, _rate| {
+                tried.fetch_add(pcm.len(), Ordering::SeqCst);
+                Err("transport gone".into())
+            },
+            || {},
+        )
+        .expect("external output");
+        let playback = PlaybackReference::new();
+
+        let consumer = spawn_consumer(
+            rx,
+            ring,
+            48_000,
+            assistant,
+            mic,
+            audio.clone(),
+            sink,
+            stop,
+            Arc::new(AtomicBool::new(false)),
+            playback,
+            TurnLatency::new(),
+            Some(output),
+        )
+        .expect("spawn consumer");
+        tx.send(VoiceEvent::Audio(vec![0.25, -0.25])).unwrap();
+        drop(tx);
+        consumer.join().unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while attempted.load(Ordering::SeqCst) < 2 {
+            if std::time::Instant::now() >= deadline {
+                panic!("output thread never attempted the write within 2s");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // Give the output thread a beat to (wrongly) count, then assert it didn't.
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let snap = audio.snapshot();
+        assert_eq!(snap.queued_samples, 2, "PCM should have been queued");
+        assert_eq!(
+            snap.played_samples, 0,
+            "a failed transport write must not count as played"
         );
     }
 
