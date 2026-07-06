@@ -1064,9 +1064,13 @@ fn spawn_consumer<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
                             }
                         }
                         let external_output = output.is_some();
-                        // Push PCM to the output ring (non-blocking) instead of
-                        // calling write_mono_f32 directly. The dedicated output
-                        // thread handles the blocking capture_frame call.
+                        // ONE output path per I/O mode, no fallback chain:
+                        // external output ⇒ the non-blocking ring drained by the
+                        // dedicated voice-output thread (output_ring is ALWAYS
+                        // constructed alongside an external output — the legacy
+                        // direct write_mono_f32 branch was unreachable and is gone);
+                        // no external output ⇒ the internal ring the CPAL callback
+                        // consumes (standalone examples).
                         let dropped = if let Some(output_ring) = output_ring.as_ref() {
                             if playback_flush.swap(false, Ordering::SeqCst) {
                                 output_flush.store(true, Ordering::SeqCst);
@@ -1076,28 +1080,6 @@ fn spawn_consumer<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
                                 playback.set_playing(level);
                             }
                             d
-                        } else if let Some(output) = output.as_ref() {
-                            if playback_flush.swap(false, Ordering::SeqCst) {
-                                output.clear();
-                            }
-                            match output.write_mono_f32(&pcm) {
-                                Ok(()) => {
-                                    playback.set_playing(level);
-                                    0
-                                }
-                                Err(error) => {
-                                    assistant.store(false, Ordering::SeqCst);
-                                    playback.set_idle();
-                                    if !emit_or_stop(
-                                        &sink,
-                                        &stop,
-                                        RuntimeEvent::Error(format!("audio output: {error}")),
-                                    ) {
-                                        break;
-                                    }
-                                    break;
-                                }
-                            }
                         } else {
                             ring.push_slice(&pcm)
                         };
