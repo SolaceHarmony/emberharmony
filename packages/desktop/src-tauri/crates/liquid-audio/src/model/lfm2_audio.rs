@@ -509,11 +509,12 @@ impl LFM2AudioModel {
         self.text_logits(hidden_last)
     }
 
-    /// Debug: one backbone forward over `in_emb` at `index_pos` through an external
-    /// cache — lets tests assert chunked-continuation forward equals one full forward
+    /// One backbone forward over `in_emb` at `index_pos` through an external cache,
+    /// no sampling. Production use: the engine's speculative prefill (forward the
+    /// utterance suffix during the VAD pause window, roll back on false pause);
+    /// also lets tests assert chunked-continuation forward equals one full forward
     /// (the numerical contract behind the persistent cross-turn cache, spec 09 W2a).
-    #[doc(hidden)]
-    pub fn forward_embeds_debug(
+    pub fn forward_embeds(
         &self,
         in_emb: &Tensor,
         index_pos: usize,

@@ -157,6 +157,14 @@ pub struct Cache {
     device: Device,
 }
 
+/// Rollback point for a [`Cache`] — see [`Cache::snapshot`] / [`Cache::rollback`].
+/// Used by the engine's speculative prefill: prefill the next utterance during
+/// the VAD pause window, roll back if the user resumes speaking.
+pub struct CacheSnapshot {
+    kv_lens: Vec<Option<usize>>,
+    conv_states: Vec<Option<Tensor>>,
+}
+
 impl Cache {
     pub fn new(
         use_kv_cache: bool,
@@ -187,6 +195,60 @@ impl Cache {
             sin,
             device: device.clone(),
         })
+    }
+
+    /// Capture a rollback point for speculative prefill: per-layer KV sequence
+    /// lengths plus a clone of the carried conv states (tiny `[B,D,K-1]` tensors).
+    /// The KV tensors themselves are not copied — [`Self::rollback`] restores by
+    /// narrowing back to the recorded lengths.
+    pub fn snapshot(&self) -> Result<CacheSnapshot> {
+        let kv_lens = self
+            .kvs
+            .iter()
+            .map(|kv| kv.as_ref().map(|(k, _)| k.dim(2)).transpose())
+            .collect::<Result<Vec<_>>>()?;
+        Ok(CacheSnapshot {
+            kv_lens,
+            conv_states: self.conv_states.clone(),
+        })
+    }
+
+    /// Undo everything appended since `snap` was taken: truncate each layer's KV
+    /// back to the recorded length and restore the conv states. Only valid for a
+    /// snapshot taken from THIS cache with no rollback-crossing mutations other
+    /// than appends (the speculative-prefill contract).
+    pub fn rollback(&mut self, snap: &CacheSnapshot) -> Result<()> {
+        if snap.kv_lens.len() != self.kvs.len() || snap.conv_states.len() != self.conv_states.len()
+        {
+            candle_core::bail!(
+                "cache rollback: snapshot layer count {}/{} does not match cache {}/{}",
+                snap.kv_lens.len(),
+                snap.conv_states.len(),
+                self.kvs.len(),
+                self.conv_states.len()
+            );
+        }
+        for (kv, len) in self.kvs.iter_mut().zip(&snap.kv_lens) {
+            match (kv.as_ref(), len) {
+                (_, None) => *kv = None,
+                (Some((k, v)), Some(n)) => {
+                    let cur = k.dim(2)?;
+                    if cur < *n {
+                        candle_core::bail!(
+                            "cache rollback: KV shrank below snapshot ({cur} < {n})"
+                        );
+                    }
+                    if cur > *n {
+                        *kv = Some((k.narrow(2, 0, *n)?, v.narrow(2, 0, *n)?));
+                    }
+                }
+                (None, Some(n)) => {
+                    candle_core::bail!("cache rollback: KV lost since snapshot (had len {n})")
+                }
+            }
+        }
+        self.conv_states = snap.conv_states.clone();
+        Ok(())
     }
 
     /// Memoized boolean causal mask `(seq_len, kv_len)`, faithful to `lfm2.rs`'s

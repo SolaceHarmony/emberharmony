@@ -216,14 +216,14 @@ fn suffix_cache_matches_full_prefill() -> anyhow::Result<()> {
     // Split the SAME embeddings at the suffix boundary; forward whole vs two chunks.
     {
         let mut cache_whole = model.make_cache(full_embeds.dtype(), &device)?;
-        let h_whole = model.forward_embeds_debug(&full_embeds, 0, &mut cache_whole)?;
+        let h_whole = model.forward_embeds(&full_embeds, 0, &mut cache_whole)?;
         let h_whole_tail = h_whole.narrow(1, n_full - n_suffix, n_suffix)?;
 
         let head = full_embeds.narrow(1, 0, n_full - n_suffix)?;
         let mut cache_split = model.make_cache(full_embeds.dtype(), &device)?;
-        let _ = model.forward_embeds_debug(&head, 0, &mut cache_split)?;
+        let _ = model.forward_embeds(&head, 0, &mut cache_split)?;
         let h_split_tail =
-            model.forward_embeds_debug(&suffix, n_full - n_suffix, &mut cache_split)?;
+            model.forward_embeds(&suffix, n_full - n_suffix, &mut cache_split)?;
 
         let e_forward = rel_err(&h_split_tail, &h_whole_tail);
         println!("chunked-vs-full forward rel-err: {e_forward:.3e}");

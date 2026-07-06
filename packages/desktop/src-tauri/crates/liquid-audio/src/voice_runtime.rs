@@ -1177,11 +1177,23 @@ fn vad_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
     let window = (in_rate as usize / 5).max(1);
     let max_local = (in_rate as usize * MAX_UTTERANCE_SECONDS).max(window);
     let silence_stop = Duration::from_millis(cfg.silence_ms);
+    // Pause-onset speculative prefill (spec 09 W3 follow-on): after this much
+    // silence the PROBABLE utterance is handed to the engine to prefill, so the
+    // remaining `silence_ms − PREPARE_AFTER_MS` of the wait hides the prefill
+    // cost instead of running in series with it. Must stay well under
+    // `cfg.silence_ms` or the head start is worthless.
+    const PREPARE_AFTER_MS: u64 = 200;
     let mut mic_buf = Vec::with_capacity(window * 2);
     let mut speaking = false;
     let mut start = 0usize;
     let mut read = 0usize;
     let mut last_voice = Instant::now();
+    // Sample index one past the last voiced window — the utterance's real end.
+    // Both `prepare` and the commit trim to `voice_end + window`, so the
+    // speculative prefill and the committed utterance are byte-identical.
+    let mut voice_end = 0usize;
+    // `Some(trim_end)` while a speculative prepare is outstanding for this pause.
+    let mut prepared: Option<usize> = None;
     // Consecutive voiced windows observed while not yet `speaking`, and where that
     // run began — the barge-in sustain gate (spec 09, W5).
     let mut voiced_streak = 0usize;
@@ -1199,6 +1211,9 @@ fn vad_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
             assistant.store(false, Ordering::SeqCst);
             speaking = false;
             voiced_streak = 0;
+            if prepared.take().is_some() {
+                pipe.discard_prepared();
+            }
             if !emit_ready(sink, stop, mic_enabled) {
                 return;
             }
@@ -1214,6 +1229,9 @@ fn vad_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
             read = 0;
             speaking = false;
             voiced_streak = 0;
+            if prepared.take().is_some() {
+                pipe.discard_prepared();
+            }
             continue;
         }
 
@@ -1227,6 +1245,9 @@ fn vad_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
             read = 0;
             speaking = false;
             voiced_streak = 0;
+            if prepared.take().is_some() {
+                pipe.discard_prepared();
+            }
             continue;
         }
         traced_gate = false;
@@ -1268,19 +1289,59 @@ fn vad_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
                 }
                 last_voice = Instant::now();
                 latency.mark_voice();
+                voice_end = read + window;
+                // The pause was not a turn end after all — roll the speculative
+                // prefill back before this utterance keeps growing.
+                if speaking && prepared.take().is_some() {
+                    vtrace!("vad: speech resumed after speculative prepare -> discard");
+                    pipe.discard_prepared();
+                }
             } else if !speaking {
                 voiced_streak = 0;
             }
             read += window;
         }
 
+        // Pause onset: hand the PROBABLE utterance to the engine so the prefill
+        // runs during the remaining silence window instead of after it. Trimmed to
+        // one window past the last voiced window — the SAME boundary the commit
+        // uses, so the committed utterance is byte-identical and consumes the
+        // prepared state. Best-effort: a full queue just means no head start.
+        if speaking
+            && prepared.is_none()
+            && last_voice.elapsed() >= Duration::from_millis(PREPARE_AFTER_MS)
+        {
+            let trim_end = (voice_end + window).min(n);
+            if trim_end > start {
+                let dur_s = (trim_end - start) as f32 / in_rate as f32;
+                if dur_s >= cfg.min_utterance_s
+                    && pipe.prepare(Utterance {
+                        samples: mic_buf[start..trim_end].to_vec(),
+                        rate: in_rate,
+                    })
+                {
+                    vtrace!(
+                        "vad: pause {}ms -> speculative prepare ({dur_s:.2}s)",
+                        last_voice.elapsed().as_millis()
+                    );
+                    prepared = Some(trim_end);
+                }
+            }
+        }
+
         let forced_end = speaking && n >= max_local;
         if speaking && (last_voice.elapsed() >= silence_stop || forced_end) {
             let end = read.min(n);
+            // Trim the end-of-turn silence tail: the utterance ends one window past
+            // the last voiced window (matching `prepare` above). The tail carried
+            // no speech — it only made the conformer/prefill longer.
+            let end = (voice_end + window).clamp(start, end);
             let samples = mic_buf[start..end].to_vec();
             mic_buf.clear();
             read = 0;
             speaking = false;
+            prepared = None;
+            voice_end = 0;
 
             let dur_s = samples.len() as f32 / in_rate as f32;
             if dur_s >= cfg.min_utterance_s {
@@ -1315,6 +1376,7 @@ fn vad_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
             mic_buf.clear();
             read = 0;
             voiced_streak = 0;
+            voice_end = 0;
         }
     }
 }

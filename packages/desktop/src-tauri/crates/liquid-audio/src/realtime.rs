@@ -33,7 +33,11 @@ use crate::moshi::models::{
 #[cfg(test)]
 const MIMI_RATE: u32 = 24_000; // Mimi/LFM2 detokenizer output rate.
 
-const UTTERANCE_QUEUE_CAP: usize = 1;
+// 2, not 1: a speculative `Prepare` and the `Respond` that commits the same
+// utterance travel the queue back-to-back (the prepare-during-pause flow); the
+// old 1-slot contract ("current generation + next turn") still holds for
+// utterances because prepares are consumed by the worker in milliseconds.
+const UTTERANCE_QUEUE_CAP: usize = 2;
 const EVENT_QUEUE_CAP: usize = 128;
 const FRAME_QUEUE_CAP: usize = 8;
 
@@ -114,6 +118,19 @@ pub trait VoiceEngine: Send {
     fn interrupt_stream(&mut self) -> Result<(), String> {
         Ok(())
     }
+
+    /// Optional speculative prefill: the VAD calls this when the user PAUSES —
+    /// before the pause has lasted long enough to commit as a turn end — so the
+    /// engine can prefill the utterance while the silence window runs out. A later
+    /// [`Self::respond`] with the identical utterance skips straight to generation.
+    /// Best-effort: engines without a prefill notion ignore it.
+    fn prepare(&mut self, _utt: &Utterance) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Drop any speculative prefill state (the pause was not a turn end — speech
+    /// resumed). Must restore the engine to exactly the state before `prepare`.
+    fn discard_prepared(&mut self) {}
 }
 
 impl<T: VoiceEngine + ?Sized> VoiceEngine for Box<T> {
@@ -128,6 +145,14 @@ impl<T: VoiceEngine + ?Sized> VoiceEngine for Box<T> {
 
     fn frame_config(&self) -> Option<FrameConfig> {
         (**self).frame_config()
+    }
+
+    fn prepare(&mut self, utt: &Utterance) -> Result<(), String> {
+        (**self).prepare(utt)
+    }
+
+    fn discard_prepared(&mut self) {
+        (**self).discard_prepared()
     }
 
     fn respond_frame(
@@ -156,15 +181,26 @@ pub enum FrameSubmitError {
     Disconnected,
 }
 
-struct QueuedUtterance {
-    utt: Utterance,
+struct QueuedWork {
+    item: WorkItem,
     epoch: u64,
+}
+
+/// What the VAD side hands the inference worker.
+enum WorkItem {
+    /// A committed utterance: run the full reply.
+    Respond(Utterance),
+    /// A PROBABLE utterance (pause detected, not yet committed): speculatively
+    /// prefill it so the matching `Respond` skips straight to generation.
+    Prepare(Utterance),
+    /// The pause was not a turn end — roll the speculative prefill back.
+    DiscardPrepared,
 }
 
 /// Handle to the inference worker thread: submit utterances, receive reply events, request
 /// barge-in. Dropping it closes the channel and joins the worker.
 pub struct RealtimePipeline {
-    utt_tx: Option<Sender<QueuedUtterance>>,
+    utt_tx: Option<Sender<QueuedWork>>,
     event_rx: Receiver<VoiceEvent>,
     cancel: Arc<AtomicBool>,
     epoch: Arc<AtomicU64>,
@@ -174,7 +210,7 @@ pub struct RealtimePipeline {
 /// Cloneable control handle for producers that feed an existing realtime worker.
 #[derive(Clone)]
 pub struct RealtimePipelineHandle {
-    utt_tx: Sender<QueuedUtterance>,
+    utt_tx: Sender<QueuedWork>,
     cancel: Arc<AtomicBool>,
     epoch: Arc<AtomicU64>,
 }
@@ -184,10 +220,37 @@ impl RealtimePipelineHandle {
     /// worker has stopped.
     pub fn submit(&self, utt: Utterance) -> bool {
         let epoch = self.epoch.load(Ordering::Acquire);
-        match self.utt_tx.try_send(QueuedUtterance { utt, epoch }) {
+        match self.utt_tx.try_send(QueuedWork {
+            item: WorkItem::Respond(utt),
+            epoch,
+        }) {
             Ok(()) => true,
             Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => false,
         }
+    }
+
+    /// Best-effort speculative prefill of a PROBABLE utterance (see
+    /// [`VoiceEngine::prepare`]). Returns `false` if the queue is full — the caller
+    /// loses the head start, never correctness.
+    pub fn prepare(&self, utt: Utterance) -> bool {
+        let epoch = self.epoch.load(Ordering::Acquire);
+        self.utt_tx
+            .try_send(QueuedWork {
+                item: WorkItem::Prepare(utt),
+                epoch,
+            })
+            .is_ok()
+    }
+
+    /// Roll back a speculative prefill (the pause was not a turn end). Best-effort:
+    /// if the message is lost, the engine detects the stale prepared state itself
+    /// on the next respond.
+    pub fn discard_prepared(&self) {
+        let epoch = self.epoch.load(Ordering::Acquire);
+        let _ = self.utt_tx.try_send(QueuedWork {
+            item: WorkItem::DiscardPrepared,
+            epoch,
+        });
     }
 
     /// Request barge-in: abort the in-flight reply.
@@ -212,7 +275,7 @@ impl RealtimePipeline {
         // One queued utterance is enough: current generation + next turn. Barge-in sets the
         // cancel flag first; if this slot is still full, the caller gets backpressure instead
         // of silently growing latency.
-        let (utt_tx, utt_rx) = bounded::<QueuedUtterance>(UTTERANCE_QUEUE_CAP);
+        let (utt_tx, utt_rx) = bounded::<QueuedWork>(UTTERANCE_QUEUE_CAP);
         let (event_tx, event_rx) = bounded::<VoiceEvent>(EVENT_QUEUE_CAP);
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_worker = cancel.clone();
@@ -225,7 +288,28 @@ impl RealtimePipeline {
                 // The inference coroutine: serve utterances until the sender is dropped
                 // (channel closed) ⇒ `iter()` ends ⇒ the thread returns and joins.
                 let mut current_epoch = 0u64;
-                for QueuedUtterance { utt, epoch } in utt_rx.iter() {
+                for QueuedWork { item, epoch } in utt_rx.iter() {
+                    // Control items first: best-effort, no events, no epoch dance.
+                    // A stale prepare is simply dropped; the engine's own staleness
+                    // check (utterance + conversation mark) is the real guard.
+                    match &item {
+                        WorkItem::Prepare(utt) => {
+                            if epoch >= epoch_worker.load(Ordering::Acquire) {
+                                if let Err(error) = engine.prepare(utt) {
+                                    crate::vtrace!("worker: speculative prepare failed: {error}");
+                                }
+                            }
+                            continue;
+                        }
+                        WorkItem::DiscardPrepared => {
+                            engine.discard_prepared();
+                            continue;
+                        }
+                        WorkItem::Respond(_) => {}
+                    }
+                    let WorkItem::Respond(utt) = item else {
+                        unreachable!("control items handled above")
+                    };
                     let latest_epoch = epoch_worker.load(Ordering::Acquire);
                     if epoch < latest_epoch {
                         if latest_epoch > current_epoch {
@@ -344,10 +428,43 @@ impl RealtimePipeline {
             return false;
         };
         let epoch = self.epoch.load(Ordering::Acquire);
-        match tx.try_send(QueuedUtterance { utt, epoch }) {
+        match tx.try_send(QueuedWork {
+            item: WorkItem::Respond(utt),
+            epoch,
+        }) {
             Ok(()) => true,
             Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => false,
         }
+    }
+
+    /// Best-effort speculative prefill of a PROBABLE utterance (see
+    /// [`VoiceEngine::prepare`]): the VAD calls this at pause onset so the prefill
+    /// runs during the remaining silence window. Returns `false` if the queue is
+    /// full — the caller loses the head start, never correctness.
+    pub fn prepare(&self, utt: Utterance) -> bool {
+        let Some(tx) = self.utt_tx.as_ref() else {
+            return false;
+        };
+        let epoch = self.epoch.load(Ordering::Acquire);
+        tx.try_send(QueuedWork {
+            item: WorkItem::Prepare(utt),
+            epoch,
+        })
+        .is_ok()
+    }
+
+    /// Roll back a speculative prefill (the pause was not a turn end). Best-effort:
+    /// if this message is lost, the engine detects the stale prepared state itself
+    /// on the next respond.
+    pub fn discard_prepared(&self) {
+        let Some(tx) = self.utt_tx.as_ref() else {
+            return;
+        };
+        let epoch = self.epoch.load(Ordering::Acquire);
+        let _ = tx.try_send(QueuedWork {
+            item: WorkItem::DiscardPrepared,
+            epoch,
+        });
     }
 
     /// Request barge-in: abort the in-flight reply. The engine polls this and returns
@@ -628,7 +745,7 @@ impl Drop for RealtimeFramePipeline {
 
 use candle_core::{DType, Device, Tensor};
 
-use crate::model::lfm2_hf::Cache as LfmCache;
+use crate::model::lfm2_hf::{Cache as LfmCache, CacheSnapshot};
 use crate::{
     ChatState, GenParams, GenToken, LFM2AudioModel, LFM2AudioProcessor, LFMModality, PrefillCursor,
 };
@@ -709,6 +826,135 @@ pub struct Lfm2VoiceEngine {
     /// Optional lifecycle-proof conversation home — restored from at attach, written
     /// through after every turn. See [`ConversationVault`].
     vault: Option<ConversationVault>,
+    /// A speculative prefill of the (probable) next utterance, built by
+    /// [`VoiceEngine::prepare`] during the VAD pause window and consumed by the
+    /// matching `respond` — or rolled back by [`VoiceEngine::discard_prepared`].
+    pending: Option<PreparedTurn>,
+}
+
+/// See [`Lfm2VoiceEngine::pending`]: the turn context is fully assembled and every
+/// suffix position EXCEPT the last is already forwarded through `cache`, so the
+/// consuming `respond` starts generation after one single-position forward.
+struct PreparedTurn {
+    /// Identity of the utterance this was built for ([`utterance_fingerprint`]).
+    fingerprint: u64,
+    /// [`conv_mark`] of the conversation this was built on — a turn landing in
+    /// between (barge-in persistence) makes the prepared context stale.
+    conv_mark: (usize, usize, usize, usize),
+    /// The prepared chat's five tensors (user turn + open assistant fence included).
+    chat: ConversationState,
+    cache: LfmCache,
+    /// Rollback point taken before the speculative forward.
+    snapshot: CacheSnapshot,
+    /// `Some(cursor)` → prepare continued the prior session cache, and a rollback
+    /// restores `session_cache` with this cursor. `None` → prepare built a fresh
+    /// cache; discarding simply drops it.
+    restore_cursor: Option<PrefillCursor>,
+    /// Turn-start cursor (generation bookkeeping on consume).
+    cursor: PrefillCursor,
+    /// Positions already forwarded: `cursor.positions + (suffix_len - 1)`.
+    index_pos: usize,
+    /// The final suffix embedding position, handed to `generate_with_cache`.
+    tail_emb: Tensor,
+}
+
+/// FNV-1a over the utterance PCM bits + rate + length — the identity check that
+/// lets a committed utterance consume the speculative prefill built for it.
+fn utterance_fingerprint(utt: &Utterance) -> u64 {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut h = OFFSET;
+    h = (h ^ utt.rate as u64).wrapping_mul(PRIME);
+    h = (h ^ utt.samples.len() as u64).wrapping_mul(PRIME);
+    for s in &utt.samples {
+        h = (h ^ s.to_bits() as u64).wrapping_mul(PRIME);
+    }
+    h
+}
+
+/// Cheap staleness mark for a conversation: the dims of the five persisted
+/// tensors that grow with every appended turn.
+fn conv_mark(conv: &Option<ConversationState>) -> (usize, usize, usize, usize) {
+    match conv {
+        None => (0, 0, 0, 0),
+        Some(c) => (
+            c.text.dim(1).unwrap_or(usize::MAX),
+            c.modality_flag.dim(1).unwrap_or(usize::MAX),
+            c.audio_out.dim(1).unwrap_or(usize::MAX),
+            c.audio_in_lens.dim(0).unwrap_or(usize::MAX),
+        ),
+    }
+}
+
+/// The shared front half of [`Lfm2VoiceEngine::respond`] and `prepare`: build the
+/// turn context (conversation + the new spoken user turn + the open assistant
+/// fence) and select the backbone cache. Returns the transient chat, the cache to
+/// generate through, the turn-start cursor, the suffix embeddings still to be
+/// forwarded, and whether the PRIOR session cache was continued (vs a fresh cache
+/// built here).
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn setup_turn<'p>(
+    proc: &'p LFM2AudioProcessor,
+    model: &LFM2AudioModel,
+    device: &Device,
+    codebooks: usize,
+    system_prompt: &str,
+    prior: &Option<ConversationState>,
+    session_cache: Option<(LfmCache, PrefillCursor)>,
+    utt: &Utterance,
+) -> Result<(ChatState<'p>, LfmCache, PrefillCursor, Tensor, bool), String> {
+    let s = |e: candle_core::Error| e.to_string();
+    let wave = Tensor::from_vec(utt.samples.clone(), (1, utt.samples.len()), device).map_err(s)?;
+
+    // First turn → fresh `ChatState` + the system turn (added once, like Python);
+    // later turns → seed from the accumulated state so the prior discrete
+    // `audio_out` conditions this prefill.
+    let mut chat = match prior {
+        None => {
+            let mut c = ChatState::new(proc, codebooks).map_err(s)?;
+            c.new_turn("system").map_err(s)?;
+            c.add_text(system_prompt).map_err(s)?;
+            c.end_turn().map_err(s)?;
+            c
+        }
+        Some(conv) => ChatState::from_parts(
+            proc,
+            codebooks,
+            conv.text.clone(),
+            conv.audio_in.clone(),
+            conv.audio_in_lens.clone(),
+            conv.audio_out.clone(),
+            conv.modality_flag.clone(),
+        )
+        .map_err(s)?,
+    };
+    chat.new_turn("user").map_err(s)?;
+    chat.add_audio(&wave, utt.rate).map_err(s)?; // CONTINUOUS audio-in (mel → Conformer)
+    chat.end_turn().map_err(s)?;
+    chat.new_turn("assistant").map_err(s)?;
+
+    // Persistent cross-turn cache (spec 09, W2a): forward only the context suffix
+    // the cache has not seen.
+    let (prior_cache, mut cursor) = match session_cache {
+        Some((c, p)) => (Some(c), p),
+        None => (None, PrefillCursor::default()),
+    };
+    let in_emb = match model.prefill_suffix(&chat, &cursor) {
+        Ok(e) => e,
+        Err(err) if cursor != PrefillCursor::default() => {
+            // Desynced cursor — rebuild from scratch off `conv` rather than fail the turn.
+            eprintln!("[voice] persistent cache desync ({err}); falling back to full prefill");
+            cursor = PrefillCursor::default();
+            model.prefill_suffix(&chat, &cursor).map_err(s)?
+        }
+        Err(err) => return Err(s(err)),
+    };
+    let continued = cursor != PrefillCursor::default();
+    let cache = match if continued { prior_cache } else { None } {
+        Some(c) => c,
+        None => model.make_cache(in_emb.dtype(), device).map_err(s)?,
+    };
+    Ok((chat, cache, cursor, in_emb, continued))
 }
 
 impl Lfm2VoiceEngine {
@@ -735,6 +981,110 @@ impl Lfm2VoiceEngine {
             conv: None,
             session_cache: None,
             vault: None,
+            pending: None,
+        }
+    }
+
+    /// Speculative prefill of a PROBABLE next utterance (the VAD saw a pause that
+    /// has not yet lasted long enough to commit): assemble the turn context and
+    /// forward every suffix position except the last, so a `respond` with the
+    /// identical utterance goes straight to generation. On any error the session
+    /// cache is dropped (next turn full-prefills from `conv`) — same fail-safe as
+    /// `respond` itself.
+    pub fn prepare_turn(&mut self, utt: &Utterance) -> Result<(), String> {
+        let s = |e: candle_core::Error| e.to_string();
+        self.discard_prepared_turn();
+        if utt.rate == 0 {
+            return Err("utterance sample rate must be non-zero".into());
+        }
+        let started = std::time::Instant::now();
+        let prior = self.conv.clone();
+        let taken = self.session_cache.take();
+        let prior_cursor = taken.as_ref().map(|(_, c)| *c);
+        let (chat, mut cache, cursor, in_emb, continued) = setup_turn(
+            &self.proc,
+            &self.model,
+            &self.device,
+            self.codebooks,
+            &self.system_prompt,
+            &prior,
+            taken,
+            utt,
+        )?;
+        let snapshot = cache.snapshot().map_err(s)?;
+        let n = in_emb.dim(1).map_err(s)?;
+        let mut index_pos = cursor.positions;
+        let tail_emb = if n > 1 {
+            let head = in_emb.narrow(1, 0, n - 1).map_err(s)?;
+            self.model
+                .forward_embeds(&head, index_pos, &mut cache)
+                .map_err(s)?;
+            index_pos += n - 1;
+            in_emb.narrow(1, n - 1, 1).map_err(s)?
+        } else {
+            in_emb
+        };
+        let chat_parts = ConversationState {
+            text: chat.text.clone(),
+            audio_in: chat.audio_in.clone(),
+            audio_in_lens: chat.audio_in_lens.clone(),
+            audio_out: chat.audio_out.clone(),
+            modality_flag: chat.modality_flag.clone(),
+        };
+        drop(chat);
+        crate::vtrace!(
+            "engine: speculative prefill ready in {:.0}ms ({} suffix positions pre-forwarded)",
+            started.elapsed().as_secs_f64() * 1e3,
+            n.saturating_sub(1)
+        );
+        self.pending = Some(PreparedTurn {
+            fingerprint: utterance_fingerprint(utt),
+            conv_mark: conv_mark(&prior),
+            chat: chat_parts,
+            cache,
+            snapshot,
+            restore_cursor: if continued { prior_cursor } else { None },
+            cursor,
+            index_pos,
+            tail_emb,
+        });
+        Ok(())
+    }
+
+    /// Undo a speculative prefill: roll the cache back to its pre-`prepare_turn`
+    /// state and restore `session_cache`. Called when the pause turned out not to
+    /// be a turn end, or when a `respond` arrives with a different utterance.
+    pub fn discard_prepared_turn(&mut self) {
+        let pending = self.pending.take();
+        Self::rollback_pending(pending, &mut self.session_cache);
+    }
+
+    /// Field-level body of [`Self::discard_prepared_turn`] — an associated fn over
+    /// the two fields it touches, so `respond` (whose `mimi` holds a borrow of
+    /// `self.proc` for the whole turn) can also call it.
+    fn rollback_pending(
+        pending: Option<PreparedTurn>,
+        session_cache: &mut Option<(LfmCache, PrefillCursor)>,
+    ) {
+        if let Some(p) = pending {
+            match p.restore_cursor {
+                Some(cursor) => {
+                    let mut cache = p.cache;
+                    match cache.rollback(&p.snapshot) {
+                        Ok(()) => {
+                            crate::vtrace!("engine: speculative prefill rolled back");
+                            *session_cache = Some((cache, cursor));
+                        }
+                        Err(e) => eprintln!(
+                            "[voice] speculative-prefill rollback failed ({e}); \
+                             next turn re-prefills from the conversation"
+                        ),
+                    }
+                }
+                // Prepare built a fresh cache (no prior session cache to protect):
+                // discarding is just dropping it.
+                None => crate::vtrace!("engine: speculative prefill dropped (fresh cache)"),
+            }
         }
     }
 
@@ -758,6 +1108,14 @@ impl Lfm2VoiceEngine {
 }
 
 impl VoiceEngine for Lfm2VoiceEngine {
+    fn prepare(&mut self, utt: &Utterance) -> Result<(), String> {
+        self.prepare_turn(utt)
+    }
+
+    fn discard_prepared(&mut self) {
+        self.discard_prepared_turn()
+    }
+
     fn respond(
         &mut self,
         utt: &Utterance,
@@ -789,37 +1147,56 @@ impl VoiceEngine for Lfm2VoiceEngine {
             return Err("output sample rate must be non-zero".into());
         }
 
-        let wave = Tensor::from_vec(utt.samples.clone(), (1, utt.samples.len()), &self.device)
-            .map_err(s)?;
-
         // Restore the persistent conversation (clone the prior tensors — cheap Arc bumps — so a
-        // hard error that returns early leaves prior history intact; we never `take`). First turn
-        // → fresh `ChatState` + the system turn (added once, like Python); later turns → seed
-        // from the accumulated state so the prior discrete `audio_out` conditions this prefill.
+        // hard error that returns early leaves prior history intact; we never `take`).
         let prior = self.conv.clone();
-        let mut chat = match &prior {
-            None => {
-                let mut c = ChatState::new(&self.proc, self.codebooks).map_err(s)?;
-                c.new_turn("system").map_err(s)?;
-                c.add_text(&self.system_prompt).map_err(s)?;
-                c.end_turn().map_err(s)?;
-                c
-            }
-            Some(conv) => ChatState::from_parts(
+
+        // Consume a matching speculative prefill (built by `prepare` during the VAD
+        // pause window): identical utterance AND unchanged conversation → skip
+        // straight to the last suffix position (everything before it is already in
+        // the cache); anything else → roll it back and take the normal path.
+        let pending = self.pending.take();
+        let use_pending = pending.as_ref().is_some_and(|p| {
+            p.fingerprint == utterance_fingerprint(utt) && p.conv_mark == conv_mark(&prior)
+        });
+        let (mut chat, mut cache, mut cursor, in_emb, mut index_pos) = if use_pending {
+            let p = pending.expect("matched above");
+            crate::vtrace!(
+                "engine: consuming speculative prefill ({} positions pre-forwarded)",
+                p.index_pos - p.cursor.positions
+            );
+            let chat = ChatState::from_parts(
                 &self.proc,
                 self.codebooks,
-                conv.text.clone(),
-                conv.audio_in.clone(),
-                conv.audio_in_lens.clone(),
-                conv.audio_out.clone(),
-                conv.modality_flag.clone(),
+                p.chat.text,
+                p.chat.audio_in,
+                p.chat.audio_in_lens,
+                p.chat.audio_out,
+                p.chat.modality_flag,
             )
-            .map_err(s)?,
+            .map_err(s)?;
+            (chat, p.cache, p.cursor, p.tail_emb, p.index_pos)
+        } else {
+            if let Some(p) = pending {
+                crate::vtrace!("engine: pending speculative prefill is stale -> rollback");
+                Self::rollback_pending(Some(p), &mut self.session_cache);
+            }
+            // `take()` means any error path below leaves `session_cache = None` — the
+            // next turn falls back to a full re-prefill from `conv` (source of truth).
+            let taken = self.session_cache.take();
+            let (chat, cache, cursor, in_emb, _continued) = setup_turn(
+                &self.proc,
+                &self.model,
+                &self.device,
+                self.codebooks,
+                &self.system_prompt,
+                &prior,
+                taken,
+                utt,
+            )?;
+            let index_pos = cursor.positions;
+            (chat, cache, cursor, in_emb, index_pos)
         };
-        chat.new_turn("user").map_err(s)?;
-        chat.add_audio(&wave, utt.rate).map_err(s)?; // CONTINUOUS audio-in (mel → Conformer)
-        chat.end_turn().map_err(s)?;
-        chat.new_turn("assistant").map_err(s)?;
 
         let text = self.proc.text();
         let device = &self.device;
@@ -837,42 +1214,12 @@ impl VoiceEngine for Lfm2VoiceEngine {
         let mut audio_frames: Vec<Vec<u32>> = Vec::new();
         let mut modality_out: Vec<i64> = Vec::new();
 
-        // Persistent cross-turn cache (spec 09, W2a): forward only the context suffix
-        // the cache has not seen. `take()` means any error path below leaves
-        // `session_cache = None` — the next turn falls back to a full re-prefill from
-        // `conv`, which is always the source of truth.
-        let (prior_cache, mut cursor) = match self.session_cache.take() {
-            Some((c, p)) => (Some(c), p),
-            None => (None, PrefillCursor::default()),
-        };
-        let in_emb = match self.model.prefill_suffix(&chat, &cursor) {
-            Ok(e) => e,
-            Err(err) if cursor != PrefillCursor::default() => {
-                // Desynced cursor — rebuild from scratch off `conv` rather than fail the turn.
-                eprintln!("[voice] persistent cache desync ({err}); falling back to full prefill");
-                cursor = PrefillCursor::default();
-                self.model.prefill_suffix(&chat, &cursor).map_err(s)?
-            }
-            Err(err) => return Err(s(err)),
-        };
-        let mut cache = match if cursor == PrefillCursor::default() {
-            None
-        } else {
-            prior_cache
-        } {
-            Some(c) => c,
-            None => self
-                .model
-                .make_cache(in_emb.dtype(), &self.device)
-                .map_err(s)?,
-        };
         // Context length at generation start: the suffix forward brings the cache
         // exactly here; every further forward is one generated token.
         let n_ctx = chat.modality_flag.dim(1).map_err(s)?;
         let text_total = chat.text.dim(1).map_err(s)?;
         let seg_total = chat.audio_in_lens.dim(0).map_err(s)?;
         let ao_total = chat.audio_out.dim(1).map_err(s)?;
-        let mut index_pos = cursor.positions;
         crate::vtrace!(
             "engine: turn-start — utterance {:.2}s in context as segment #{seg_total}; \
              ctx {n_ctx} positions (cache had {}, suffix {}), totals: text {text_total}, \
@@ -1716,7 +2063,7 @@ mod tests {
     }
 
     #[test]
-    fn utterance_queue_is_bounded_to_one_pending_turn() {
+    fn utterance_queue_is_bounded() {
         let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let pipe = RealtimePipeline::spawn(BlockingEngine {
@@ -1729,22 +2076,23 @@ mod tests {
         entered_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("worker should start first utterance");
-        assert!(pipe.submit(utt(2)), "one pending utterance is allowed");
+        // Two queued items are allowed (a speculative Prepare + the Respond that
+        // commits it travel back-to-back); the third must hit backpressure
+        // instead of growing an unbounded queue.
+        assert!(pipe.submit(utt(2)), "first pending utterance is allowed");
+        assert!(pipe.submit(utt(3)), "second pending slot (prepare+respond pair)");
         assert!(
-            !pipe.submit(utt(3)),
-            "third utterance must hit backpressure instead of growing an unbounded queue"
+            !pipe.submit(utt(4)),
+            "further utterances must hit backpressure instead of growing an unbounded queue"
         );
 
-        release_tx.send(()).unwrap();
-        assert_eq!(
-            pipe.events().recv_timeout(Duration::from_secs(5)).unwrap(),
-            VoiceEvent::TurnComplete
-        );
-        release_tx.send(()).unwrap();
-        assert_eq!(
-            pipe.events().recv_timeout(Duration::from_secs(5)).unwrap(),
-            VoiceEvent::TurnComplete
-        );
+        for _ in 0..3 {
+            release_tx.send(()).unwrap();
+            assert_eq!(
+                pipe.events().recv_timeout(Duration::from_secs(5)).unwrap(),
+                VoiceEvent::TurnComplete
+            );
+        }
     }
 
     #[test]

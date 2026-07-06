@@ -6,3 +6,5 @@
 parity/golden/*.safetensors
 # Generated audio from the examples (chat_multiturn / generate / mic_chat write WAVs to cwd).
 *.wav
+# self_chat's data-harness output (per-turn WAVs + stitched conversation + transcript.json).
+/self_chat_out/
