@@ -12,6 +12,8 @@ const GRACEFUL_TIMEOUT_MS = 10_000
 
 /**
  * Manages the voice agent worker as a child process of `emberharmony serve`.
+ * Desktop/Tauri builds opt out with EMBERHARMONY_DESKTOP_NATIVE_VOICE=1 because
+ * the Rust desktop process owns voice sessions directly.
  *
  * Lifecycle uses IPC (Unix socket) for shutdown: stop() writes "shutdown" to
  * the socket, and the agent process calls AgentServer.drain() + close() to
@@ -22,12 +24,12 @@ const GRACEFUL_TIMEOUT_MS = 10_000
  * up to GRACEFUL_TIMEOUT_MS before escalating to SIGKILL on the entire
  * process group.
  *
- * Two launch modes:
- *  - **Bundled runtime** (packaged desktop app): the LiveKit agents framework
+ * Two non-desktop launch modes:
+ *  - **Bundled runtime** (legacy/non-native packaging): the LiveKit agents framework
  *    forks node_modules scripts and dynamically imports the agent file, so it
- *    cannot run inside the compiled single-file CLI. The desktop app ships a
- *    self-contained runtime (bun + agent.js + node_modules + models) and points
- *    the sidecar at it via EMBERHARMONY_VOICE_RUNTIME_DIR; we spawn that.
+ *    cannot run inside the compiled single-file CLI. A legacy packaged host can
+ *    still point at a self-contained runtime (bun + agent.js + node_modules +
+ *    models) via EMBERHARMONY_VOICE_RUNTIME_DIR; we spawn that.
  *  - **Source** (dev / `bun run`): spawn `./agent.ts` with the current Bun.
  */
 export namespace VoiceWorker {
@@ -89,6 +91,10 @@ export namespace VoiceWorker {
       return { mode: "source", cmd: [process.execPath, "run", agentPath, "start"], env: {} }
     }
     return undefined
+  }
+
+  function desktopNativeVoice(): boolean {
+    return process.env["EMBERHARMONY_DESKTOP_NATIVE_VOICE"] === "1"
   }
 
   function allocateSocket(): string {
@@ -246,6 +252,11 @@ export namespace VoiceWorker {
   }
 
   async function doStart(serverUrl: string, override?: Config.Voice): Promise<boolean> {
+    if (desktopNativeVoice()) {
+      await doStop()
+      log.info("desktop native voice enabled; legacy voice agent worker not started")
+      return false
+    }
     if (running()) {
       log.info("voice agent worker already running; skipping duplicate start")
       return true

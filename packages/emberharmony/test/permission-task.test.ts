@@ -3,6 +3,8 @@ import { PermissionNext } from "../src/permission/next"
 import { Config } from "../src/config/config"
 import { Instance } from "../src/project/instance"
 import { tmpdir } from "./fixture/fixture"
+import { Session } from "../src/session"
+import { SessionPrompt } from "../src/session/prompt"
 
 describe("PermissionNext.evaluate for permission.task", () => {
   const createRuleset = (rules: Record<string, "allow" | "deny" | "ask">): PermissionNext.Ruleset =>
@@ -139,6 +141,48 @@ describe("PermissionNext.disabled for task tool", () => {
 
 // Integration tests that load permissions from real config files
 describe("permission.task with real config files", () => {
+  test("prompt tool restrictions preserve existing session denies", async () => {
+    await using tmp = await tmpdir({ git: true })
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const session = await Session.create({
+          permission: [
+            {
+              permission: "bash",
+              pattern: "*",
+              action: "deny",
+            },
+          ],
+        })
+
+        await SessionPrompt.prompt({
+          sessionID: session.id,
+          model: {
+            providerID: "test",
+            modelID: "test",
+          },
+          agent: "build",
+          noReply: true,
+          tools: {
+            todoread: false,
+          },
+          parts: [
+            {
+              type: "text",
+              text: "hello",
+            },
+          ],
+        })
+
+        const updated = await Session.get(session.id)
+        const ruleset = updated.permission ?? []
+        expect(PermissionNext.evaluate("bash", "*", ruleset).action).toBe("deny")
+        expect(PermissionNext.evaluate("todoread", "*", ruleset).action).toBe("deny")
+      },
+    })
+  })
+
   test("loads task permissions from emberharmony.json config", async () => {
     await using tmp = await tmpdir({
       git: true,

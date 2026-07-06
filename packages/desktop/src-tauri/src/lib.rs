@@ -2,6 +2,7 @@ mod cli;
 #[cfg(windows)]
 mod job_object;
 mod markdown;
+mod settings;
 pub mod voice;
 mod window_customizer;
 
@@ -17,10 +18,10 @@ use std::{
     time::{Duration, Instant},
 };
 use tauri::{AppHandle, LogicalSize, Manager, RunEvent, State, WebviewWindowBuilder};
-#[cfg(any(target_os = "linux", all(debug_assertions, windows)))]
-use tauri_plugin_deep_link::DeepLinkExt;
 #[cfg(windows)]
 use tauri_plugin_decorum::WebviewWindowExt;
+#[cfg(any(target_os = "linux", all(debug_assertions, windows)))]
+use tauri_plugin_deep_link::DeepLinkExt;
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogResult};
 use tauri_plugin_shell::process::{CommandChild, CommandEvent};
 use tauri_plugin_store::StoreExt;
@@ -32,19 +33,19 @@ const SETTINGS_STORE: &str = "emberharmony.settings.dat";
 const DEFAULT_SERVER_URL_KEY: &str = "defaultServerUrl";
 
 #[derive(Clone, serde::Serialize)]
-struct ServerReadyData {
-    url: String,
-    password: Option<String>,
+pub(crate) struct ServerReadyData {
+    pub(crate) url: String,
+    pub(crate) password: Option<String>,
 }
 
 #[derive(Clone)]
-struct ServerState {
+pub struct ServerState {
     child: Arc<Mutex<Option<CommandChild>>>,
-    status: future::Shared<oneshot::Receiver<Result<ServerReadyData, String>>>,
+    pub(crate) status: future::Shared<oneshot::Receiver<Result<ServerReadyData, String>>>,
 }
 
 impl ServerState {
-    pub fn new(
+    pub(crate) fn new(
         child: Option<CommandChild>,
         status: oneshot::Receiver<Result<ServerReadyData, String>>,
     ) -> Self {
@@ -54,7 +55,7 @@ impl ServerState {
         }
     }
 
-    pub fn set_child(&self, child: Option<CommandChild>) {
+    pub(crate) fn set_child(&self, child: Option<CommandChild>) {
         *self.child.lock().unwrap() = child;
     }
 }
@@ -161,28 +162,17 @@ fn spawn_sidecar(app: &AppHandle, hostname: &str, port: u32, password: &str) -> 
 
     println!("spawning sidecar on port {port}");
 
-    let mut command = cli::create_command(
+    let command = cli::create_command(
         app,
         format!("serve --hostname {hostname} --port {port}").as_str(),
     )
     .env("EMBERHARMONY_SERVER_USERNAME", "emberharmony")
-    .env("EMBERHARMONY_SERVER_PASSWORD", password);
-
-    // Point the sidecar at the bundled voice runtime (bun + agent.js +
-    // node_modules + models). The LiveKit agents framework forks node_modules
-    // scripts, so it can't run inside the compiled CLI; serve spawns this
-    // self-contained runtime instead. Only set when the resource is present.
-    match app
-        .path()
-        .resolve("resources/voice", tauri::path::BaseDirectory::Resource)
-    {
-        Ok(dir) if dir.join("agent.js").exists() => {
-            println!("voice runtime: {}", dir.display());
-            command = command.env("EMBERHARMONY_VOICE_RUNTIME_DIR", dir);
-        }
-        Ok(dir) => eprintln!("voice runtime not bundled at {} — voice disabled", dir.display()),
-        Err(e) => eprintln!("could not resolve voice runtime resource: {e}"),
-    }
+    .env("EMBERHARMONY_SERVER_PASSWORD", password)
+    // Desktop voice is owned by the native Tauri kernel (`src/voice`): LFM2
+    // and LiveKit media/control both enter through Tauri commands. The server
+    // sidecar still serves sessions, but it must not spawn the legacy Bun
+    // voice agent worker in desktop mode.
+    .env("EMBERHARMONY_DESKTOP_NATIVE_VOICE", "1");
 
     let (mut rx, child) = command.spawn().expect("Failed to spawn emberharmony");
 
@@ -306,7 +296,23 @@ pub fn run() {
             ensure_server_ready,
             get_default_server_url,
             set_default_server_url,
-            markdown::parse_markdown_command
+            markdown::parse_markdown_command,
+            settings::voice_settings_get,
+            settings::voice_settings_state,
+            settings::voice_settings_set,
+            voice::control::voice_status,
+            voice::control::voice_start,
+            voice::control::voice_stop,
+            voice::control::voice_interrupt,
+            voice::control::voice_set_mic_enabled,
+            voice::control::voice_begin_typed_input,
+            voice::control::voice_audio_probe,
+            voice::livekit::voice_livekit_credentials_set,
+            voice::livekit::voice_livekit_credentials_status,
+            voice::model::voice_model_download,
+            voice::model::voice_pick_model_dir,
+            voice::model::voice_hf_token_set,
+            voice::model::voice_hf_token_status
         ])
         .setup(move |app| {
             #[cfg(any(target_os = "linux", all(debug_assertions, windows)))]
@@ -316,6 +322,8 @@ pub fn run() {
 
             // Initialize log state
             app.manage(LogState(Arc::new(Mutex::new(VecDeque::new()))));
+            app.manage(voice::runtime::VoiceRuntime::default());
+            app.manage(voice::model::ModelDownloadRuntime::default());
 
             #[cfg(windows)]
             app.manage(JobObjectState::new());

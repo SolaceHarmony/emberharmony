@@ -6,6 +6,9 @@ const serverHost = process.env.PLAYWRIGHT_SERVER_HOST ?? "localhost"
 const serverPort = process.env.PLAYWRIGHT_SERVER_PORT ?? "4096"
 const command = `bun run dev -- --host 0.0.0.0 --port ${port}`
 const reuse = !process.env.CI
+const chromium = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH
+const chromiumLaunch = chromium ? { launchOptions: { executablePath: chromium } } : {}
+const video = process.env.PLAYWRIGHT_VIDEO === "off" ? "off" : "retain-on-failure"
 
 export default defineConfig({
   testDir: "./e2e",
@@ -32,12 +35,12 @@ export default defineConfig({
     baseURL,
     trace: "on-first-retry",
     screenshot: "only-on-failure",
-    video: "retain-on-failure",
+    video,
   },
   projects: [
     {
       name: "chromium",
-      use: { ...devices["Desktop Chrome"] },
+      use: { ...devices["Desktop Chrome"], ...chromiumLaunch },
     },
   ],
 })

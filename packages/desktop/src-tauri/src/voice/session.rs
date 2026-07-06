@@ -3,14 +3,35 @@
 //! `packages/emberharmony/src/voice/bridge.ts` (see its test harness for the
 //! behavioural contract this mirrors).
 //!
-//! The HTTP/SSE transport (reqwest) lands in Phase 1 alongside cpal/STT/TTS; the
-//! load-bearing, fiddly part — the per-turn event state machine — is implemented
+//! The HTTP/SSE transport (reqwest) is deliberately still just the delegated
+//! session bridge; realtime voice media stays inside the native voice runtime.
+//! The load-bearing, fiddly part — the per-turn event state machine — is implemented
 //! and tested here so the wiring on top is mechanical. A key win of doing this in
 //! Rust: the async runner can wrap each SSE read in `tokio::time::timeout`, so the
 //! staleness watchdog fires even on a fully-silent connection — closing the gap
 //! the TS version still has (its check only runs when an event arrives).
 
-use serde_json::Value;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::time::{Duration, Instant};
+
+use futures::StreamExt;
+use serde_json::{Value, json};
+
+const SESSION_BRIDGE_CONNECT_TIMEOUT_SECS: u64 = 10;
+const SESSION_BRIDGE_READ_TIMEOUT_SECS: u64 = 1;
+const SESSION_BRIDGE_CANCEL_POLL_MS: u64 = 50;
+const SESSION_BRIDGE_ERROR_BODY_CAP: usize = 8 * 1024;
+const SESSION_BRIDGE_SSE_BUFFER_CAP: usize = 256 * 1024;
+
+pub const VOICE_SYSTEM_PROMPT: &str = concat!(
+    "The user is speaking to you by voice and hears your replies as speech. ",
+    "Keep replies short and speakable: plain sentences, no markdown, no code blocks, no long enumerations. ",
+    "When the user asks for changes while you are in plan mode, lay out a brief plan in a sentence or two, ",
+    "then ask whether to proceed -- they will confirm out loud."
+);
 
 /// Configuration for one bridged session (Phase 1 input for the async runner).
 #[derive(Debug, Clone)]
@@ -26,8 +47,24 @@ pub struct SessionBridgeConfig {
     pub password: Option<String>,
     /// `plan` / `build` for the turn — the safety gate decides this per utterance.
     pub agent: Option<String>,
+    /// Model override used when the spoken turn delegates work to the session.
+    pub model: Option<SessionBridgeModel>,
+    /// Model variant for the delegated session prompt.
+    pub variant: Option<String>,
     /// Extra per-message system instructions attached to every voice prompt.
     pub system: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionBridgeModel {
+    pub provider_id: String,
+    pub model_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionBridgeEvent {
+    Delta { reply_id: String, text: String },
+    Done,
 }
 
 /// A parsed server SSE event, narrowed to the variants the turn loop cares about.
@@ -93,7 +130,9 @@ pub fn parse_event(v: &Value) -> SessionEvent {
         "server.heartbeat" => SessionEvent::Heartbeat,
         "message.part.updated" => {
             let part = props.and_then(|p| p.get("part"));
-            let session_id = part.and_then(|p| p.get("sessionID")).and_then(Value::as_str);
+            let session_id = part
+                .and_then(|p| p.get("sessionID"))
+                .and_then(Value::as_str);
             match (part, session_id) {
                 (Some(part), Some(session_id)) => SessionEvent::PartUpdated {
                     session_id: session_id.to_string(),
@@ -125,7 +164,10 @@ pub fn parse_event(v: &Value) -> SessionEvent {
             },
             None => SessionEvent::Other,
         },
-        "session.idle" => match props.and_then(|p| p.get("sessionID")).and_then(Value::as_str) {
+        "session.idle" => match props
+            .and_then(|p| p.get("sessionID"))
+            .and_then(Value::as_str)
+        {
             Some(session_id) => SessionEvent::Idle {
                 session_id: session_id.to_string(),
             },
@@ -139,7 +181,11 @@ pub fn parse_event(v: &Value) -> SessionEvent {
             let error = props
                 .and_then(|p| p.get("error"))
                 // a JSON string error -> its clean unquoted text; non-strings -> JSON
-                .map(|e| e.as_str().map(str::to_string).unwrap_or_else(|| e.to_string()))
+                .map(|e| {
+                    e.as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| e.to_string())
+                })
                 .or_else(|| props.map(Value::to_string))
                 .unwrap_or_default();
             SessionEvent::Error { session_id, error }
@@ -214,20 +260,361 @@ impl TurnReducer {
             // An error with no sessionID applies to us; one scoped to a different
             // session is ignored (mirrors bridge.ts's `if (sid && sid !== ours) continue`).
             SessionEvent::Error { session_id, error }
-                if session_id
-                    .as_deref()
-                    .map_or(true, |s| s == self.session_id) =>
+                if session_id.as_deref().map_or(true, |s| s == self.session_id) =>
             {
                 Step::Failed(error.clone())
             }
             _ => Step::Ignore,
         }
     }
+
+    /// Check the staleness window without waiting for the next SSE frame. The TS
+    /// LiveKit bridge can only discover a dead silent socket when another event
+    /// arrives; the native runner polls this once per second so a severed stream
+    /// terminates on time.
+    pub fn tick(&mut self, now_ms: u64) -> Step {
+        if now_ms.saturating_sub(self.last_activity_ms) > self.stale_ms {
+            return Step::TimedOut;
+        }
+        Step::Ignore
+    }
+}
+
+pub async fn run_turn(
+    cfg: SessionBridgeConfig,
+    text: String,
+    cancel: Arc<AtomicBool>,
+    mut sink: impl FnMut(SessionBridgeEvent) -> bool + Send + 'static,
+) -> Result<(), String> {
+    if text.trim().is_empty() {
+        return Ok(());
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(150))
+        .build()
+        .map_err(|e| format!("session bridge client: {e}"))?;
+    let mut events = open_events(&client, &cfg).await?;
+
+    // Pull the server.connected frame before posting the prompt so the stream
+    // cannot miss the first reply delta.
+    let _ = tokio::time::timeout(
+        Duration::from_secs(SESSION_BRIDGE_CONNECT_TIMEOUT_SECS),
+        next_event(&mut events, &cancel),
+    )
+    .await
+    .map_err(|_| "session event stream did not connect".to_string())??;
+
+    post_prompt(&client, &cfg, &text, &cancel).await?;
+
+    let start = Instant::now();
+    let mut reducer = TurnReducer::new(&cfg.session_id, 0);
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            abort_prompt(&client, &cfg).await;
+            return Ok(());
+        }
+
+        match tokio::time::timeout(
+            Duration::from_secs(SESSION_BRIDGE_READ_TIMEOUT_SECS),
+            next_event(&mut events, &cancel),
+        )
+        .await
+        {
+            Ok(Ok(Some(event))) => match reducer.step(&event, elapsed_ms(start)) {
+                Step::Delta { reply_id, text } => {
+                    if !sink(SessionBridgeEvent::Delta { reply_id, text }) {
+                        abort_prompt(&client, &cfg).await;
+                        return Ok(());
+                    }
+                }
+                Step::Done => {
+                    let _ = sink(SessionBridgeEvent::Done);
+                    return Ok(());
+                }
+                Step::Failed(error) => return Err(format!("session error: {error}")),
+                Step::TimedOut => return Err("session reply timed out".into()),
+                Step::Ignore => {}
+            },
+            Ok(Ok(None)) => {
+                // `next_event` yields Ok(None) BOTH for a closed SSE stream and for
+                // a cancellation racing the read — a user Stop mid-delegation must
+                // end the turn quietly, not surface as a session error.
+                if cancel.load(Ordering::SeqCst) {
+                    abort_prompt(&client, &cfg).await;
+                    return Ok(());
+                }
+                return Err("session event stream closed".into());
+            }
+            Ok(Err(error)) => return Err(error),
+            Err(_) => {
+                if matches!(reducer.tick(elapsed_ms(start)), Step::TimedOut) {
+                    abort_prompt(&client, &cfg).await;
+                    return Err("session reply timed out".into());
+                }
+            }
+        }
+    }
+}
+
+type EventStream = futures::stream::BoxStream<'static, Result<Vec<u8>, String>>;
+
+struct SseStream {
+    chunks: EventStream,
+    buffer: Vec<u8>,
+}
+
+async fn open_events(
+    client: &reqwest::Client,
+    cfg: &SessionBridgeConfig,
+) -> Result<SseStream, String> {
+    let response = with_auth(
+        client
+            .get(format!("{}/event", cfg.server_url.trim_end_matches('/')))
+            .header("accept", "text/event-stream")
+            .header("x-emberharmony-directory", url_encode(&cfg.directory)),
+        cfg,
+    )
+    .send()
+    .await
+    .map_err(|e| format!("event stream failed: {e}"))?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = capped_error_body(response).await;
+        return Err(format!("event stream failed: {status} {body}"));
+    }
+    Ok(SseStream {
+        chunks: response
+            .bytes_stream()
+            .map(|chunk| {
+                chunk
+                    .map(|bytes| bytes.to_vec())
+                    .map_err(|e| format!("event stream read failed: {e}"))
+            })
+            .boxed(),
+        buffer: Vec::new(),
+    })
+}
+
+async fn next_event(
+    stream: &mut SseStream,
+    cancel: &Arc<AtomicBool>,
+) -> Result<Option<SessionEvent>, String> {
+    loop {
+        if let Some(event) = drain_event(&mut stream.buffer) {
+            return Ok(Some(event));
+        }
+        if cancel.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
+        let chunk = tokio::select! {
+            chunk = stream.chunks.next() => {
+                let Some(chunk) = chunk else {
+                    return Ok(None);
+                };
+                chunk?
+            }
+            _ = wait_cancel(cancel) => {
+                return Ok(None);
+            }
+        };
+        if stream.buffer.len().saturating_add(chunk.len()) > SESSION_BRIDGE_SSE_BUFFER_CAP {
+            stream.buffer.clear();
+            return Err(format!(
+                "session event frame exceeded {} bytes",
+                SESSION_BRIDGE_SSE_BUFFER_CAP
+            ));
+        }
+        stream.buffer.extend_from_slice(&chunk);
+    }
+}
+
+fn drain_event(buffer: &mut Vec<u8>) -> Option<SessionEvent> {
+    loop {
+        let Some((boundary, width)) = sse_boundary(buffer) else {
+            return None;
+        };
+        let bytes = buffer.drain(..boundary + width).collect::<Vec<_>>();
+        let Ok(chunk) = std::str::from_utf8(&bytes[..boundary]) else {
+            continue;
+        };
+        for line in chunk.lines() {
+            if let Some(event) = event_from_data_line(line) {
+                return Some(event);
+            }
+        }
+    }
+}
+
+fn sse_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
+    let lf = buffer.windows(2).position(|window| window == b"\n\n");
+    let crlf = buffer.windows(4).position(|window| window == b"\r\n\r\n");
+    match (lf, crlf) {
+        (Some(lf), Some(crlf)) if lf < crlf => Some((lf, 2)),
+        (Some(_), Some(crlf)) => Some((crlf, 4)),
+        (Some(lf), None) => Some((lf, 2)),
+        (None, Some(crlf)) => Some((crlf, 4)),
+        (None, None) => None,
+    }
+}
+
+async fn post_prompt(
+    client: &reqwest::Client,
+    cfg: &SessionBridgeConfig,
+    text: &str,
+    cancel: &Arc<AtomicBool>,
+) -> Result<(), String> {
+    if cancel.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+    let mut body = json!({
+        "parts": [{ "type": "text", "text": text }],
+    });
+    if let Some(model) = &cfg.model {
+        body["model"] = json!({
+            "providerID": model.provider_id.as_str(),
+            "modelID": model.model_id.as_str(),
+        });
+    }
+    if let Some(agent) = cfg.agent.as_deref().filter(|s| !s.trim().is_empty()) {
+        body["agent"] = json!(agent);
+    }
+    if let Some(system) = cfg.system.as_deref().filter(|s| !s.trim().is_empty()) {
+        body["system"] = json!(system);
+    }
+    if let Some(variant) = cfg.variant.as_deref().filter(|s| !s.trim().is_empty()) {
+        body["variant"] = json!(variant);
+    }
+    let response = with_auth(
+        client
+            .post(format!(
+                "{}/session/{}/prompt_async",
+                cfg.server_url.trim_end_matches('/'),
+                cfg.session_id.as_str()
+            ))
+            .header("content-type", "application/json")
+            .header("x-emberharmony-directory", url_encode(&cfg.directory))
+            .json(&body),
+        cfg,
+    )
+    .send()
+    .await
+    .map_err(|e| format!("session prompt failed: {e}"))?;
+    if response.status().is_success() {
+        return Ok(());
+    }
+    let status = response.status();
+    let body = capped_error_body(response).await;
+    Err(format!("session prompt failed: {status} {body}"))
+}
+
+async fn wait_cancel(cancel: &Arc<AtomicBool>) {
+    let mut poll = tokio::time::interval(Duration::from_millis(SESSION_BRIDGE_CANCEL_POLL_MS));
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            return;
+        }
+        poll.tick().await;
+    }
+}
+
+async fn capped_error_body(response: reqwest::Response) -> String {
+    let mut stream = response.bytes_stream();
+    let mut body = Vec::new();
+    let mut truncated = false;
+    while body.len() < SESSION_BRIDGE_ERROR_BODY_CAP {
+        let Some(chunk) = stream.next().await else {
+            break;
+        };
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                if body.is_empty() {
+                    return format!("body read failed: {error}");
+                }
+                truncated = true;
+                break;
+            }
+        };
+        let remaining = SESSION_BRIDGE_ERROR_BODY_CAP - body.len();
+        if chunk.len() > remaining {
+            body.extend_from_slice(&chunk[..remaining]);
+            truncated = true;
+            break;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    if body.len() == SESSION_BRIDGE_ERROR_BODY_CAP {
+        truncated = true;
+    }
+    let mut text = utf8_prefix(&body).to_string();
+    if truncated {
+        text.push_str("\n...[truncated]");
+    }
+    text
+}
+
+fn utf8_prefix(bytes: &[u8]) -> &str {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(error) => std::str::from_utf8(&bytes[..error.valid_up_to()]).unwrap_or_default(),
+    }
+}
+
+async fn abort_prompt(client: &reqwest::Client, cfg: &SessionBridgeConfig) {
+    let _ = with_auth(
+        client
+            .post(format!(
+                "{}/session/{}/abort",
+                cfg.server_url.trim_end_matches('/'),
+                cfg.session_id.as_str()
+            ))
+            .header("x-emberharmony-directory", url_encode(&cfg.directory)),
+        cfg,
+    )
+    .send()
+    .await;
+}
+
+fn with_auth(req: reqwest::RequestBuilder, cfg: &SessionBridgeConfig) -> reqwest::RequestBuilder {
+    match cfg.password.as_deref() {
+        Some(password) => req.basic_auth(
+            cfg.username.as_deref().unwrap_or("emberharmony"),
+            Some(password),
+        ),
+        None => req,
+    }
+}
+
+fn elapsed_ms(start: Instant) -> u64 {
+    start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+pub(crate) fn url_encode(value: &str) -> String {
+    value
+        .bytes()
+        .flat_map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                [b as char, '\0', '\0']
+            }
+            _ => {
+                const HEX: &[u8; 16] = b"0123456789ABCDEF";
+                [
+                    '%',
+                    HEX[(b >> 4) as usize] as char,
+                    HEX[(b & 0x0F) as usize] as char,
+                ]
+            }
+        })
+        .filter(|c| *c != '\0')
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt as _;
 
     const SID: &str = "ses_test";
 
@@ -262,9 +649,19 @@ mod tests {
         let (deltas, terminal) = run(&[
             (SessionEvent::Connected, 1_000_000),
             (part("m1", "Let me check. "), 1_000_000),
-            (SessionEvent::MessageUpdated { session_id: SID.into() }, 1_000_000),
+            (
+                SessionEvent::MessageUpdated {
+                    session_id: SID.into(),
+                },
+                1_000_000,
+            ),
             (part("m2", "The answer is 42."), 1_000_000),
-            (SessionEvent::Idle { session_id: SID.into() }, 1_000_000),
+            (
+                SessionEvent::Idle {
+                    session_id: SID.into(),
+                },
+                1_000_000,
+            ),
         ]);
         let text: String = deltas.iter().map(|(_, t)| t.as_str()).collect();
         assert_eq!(text, "Let me check. The answer is 42.");
@@ -279,7 +676,12 @@ mod tests {
             (part("m1", "a"), 1_000_000),
             (part("m2", "b"), 1_000_000),
             (part("m3", "c"), 1_000_000),
-            (SessionEvent::Idle { session_id: SID.into() }, 1_000_000),
+            (
+                SessionEvent::Idle {
+                    session_id: SID.into(),
+                },
+                1_000_000,
+            ),
         ]);
         let text: String = deltas.iter().map(|(_, t)| t.as_str()).collect();
         assert_eq!(text, "abc");
@@ -298,9 +700,19 @@ mod tests {
         let (deltas, terminal) = run(&[
             (SessionEvent::Connected, 1_000_000),
             (foreign_part, 1_000_000),
-            (SessionEvent::Idle { session_id: "other".into() }, 1_000_000), // must NOT end our turn
+            (
+                SessionEvent::Idle {
+                    session_id: "other".into(),
+                },
+                1_000_000,
+            ), // must NOT end our turn
             (part("m1", "ours"), 1_000_000),
-            (SessionEvent::Idle { session_id: SID.into() }, 1_000_000),
+            (
+                SessionEvent::Idle {
+                    session_id: SID.into(),
+                },
+                1_000_000,
+            ),
         ]);
         let text: String = deltas.iter().map(|(_, t)| t.as_str()).collect();
         assert_eq!(text, "ours");
@@ -311,11 +723,23 @@ mod tests {
     fn scoped_error_fails_turn_foreign_error_ignored() {
         let mut r = TurnReducer::new(SID, 0);
         assert_eq!(
-            r.step(&SessionEvent::Error { session_id: Some("other".into()), error: "x".into() }, 0),
+            r.step(
+                &SessionEvent::Error {
+                    session_id: Some("other".into()),
+                    error: "x".into()
+                },
+                0
+            ),
             Step::Ignore
         );
         assert_eq!(
-            r.step(&SessionEvent::Error { session_id: None, error: "no-scope".into() }, 0),
+            r.step(
+                &SessionEvent::Error {
+                    session_id: None,
+                    error: "no-scope".into()
+                },
+                0
+            ),
             Step::Failed("no-scope".into()) // an unscoped error applies to us
         );
     }
@@ -329,7 +753,12 @@ mod tests {
             (SessionEvent::Heartbeat, 1_090_000),
             (SessionEvent::Heartbeat, 1_180_000),
             (part("m1", "b"), 1_270_000),
-            (SessionEvent::Idle { session_id: SID.into() }, 1_270_000),
+            (
+                SessionEvent::Idle {
+                    session_id: SID.into(),
+                },
+                1_270_000,
+            ),
         ]);
         let text: String = deltas.iter().map(|(_, t)| t.as_str()).collect();
         assert_eq!(text, "ab");
@@ -343,7 +772,10 @@ mod tests {
             (part("m1", "a"), 1_000_000),
             (part("m1", "b"), 1_130_001), // 130s later, no heartbeat between
         ]);
-        assert_eq!(deltas.iter().map(|(_, t)| t.as_str()).collect::<String>(), "a");
+        assert_eq!(
+            deltas.iter().map(|(_, t)| t.as_str()).collect::<String>(),
+            "a"
+        );
         assert_eq!(terminal, Step::TimedOut);
     }
 
@@ -371,5 +803,64 @@ mod tests {
             event_from_data_line(r#"data: {"type":"something.unknown"}"#),
             Some(SessionEvent::Other)
         );
+    }
+
+    #[tokio::test]
+    async fn sse_stream_preserves_utf8_across_network_chunks() {
+        let payload = format!(
+            r#"data: {{"type":"message.part.updated","properties":{{"part":{{"sessionID":"{}","type":"text","messageID":"m1"}},"delta":"caf{}"}}}}"#,
+            SID, "\u{00e9}"
+        );
+        let frame = format!("{payload}\n\n").into_bytes();
+        let split = frame
+            .iter()
+            .position(|byte| *byte == 0xC3)
+            .expect("test frame should contain utf-8 lead byte")
+            + 1;
+        let mut stream = SseStream {
+            chunks: futures::stream::iter([
+                Ok(frame[..split].to_vec()),
+                Ok(frame[split..].to_vec()),
+            ])
+            .boxed(),
+            buffer: Vec::new(),
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        assert_eq!(
+            next_event(&mut stream, &cancel).await.unwrap(),
+            Some(part("m1", "caf\u{00e9}"))
+        );
+    }
+
+    #[test]
+    fn drain_event_accepts_crlf_sse_boundaries() {
+        let mut buffer = b"data: {\"type\":\"server.heartbeat\"}\r\n\r\n".to_vec();
+
+        assert_eq!(drain_event(&mut buffer), Some(SessionEvent::Heartbeat));
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn utf8_prefix_cuts_at_complete_char_boundary() {
+        let text = "voice caf\u{00e9}";
+        let bytes = text.as_bytes();
+        let cut = &bytes[..bytes.len() - 1];
+
+        assert_eq!(utf8_prefix(cut), "voice caf");
+    }
+
+    #[tokio::test]
+    async fn sse_stream_rejects_unbounded_frame_without_boundary() {
+        let mut stream = SseStream {
+            chunks: futures::stream::iter([Ok(vec![b'x'; SESSION_BRIDGE_SSE_BUFFER_CAP + 1])])
+                .boxed(),
+            buffer: Vec::new(),
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let err = next_event(&mut stream, &cancel).await.unwrap_err();
+
+        assert!(err.contains("session event frame exceeded"));
+        assert!(stream.buffer.is_empty());
     }
 }

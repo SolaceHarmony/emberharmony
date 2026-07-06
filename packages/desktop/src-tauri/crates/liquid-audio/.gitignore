@@ -1,0 +1,10 @@
+/target/
+# Parity golden tensors are large, REGENERABLE dumps from the real model (run the matching
+# parity/dump_*.py → parity/golden/). They are reference data, never source — keep them out of
+# the repo (one exceeded GitHub's 50 MB limit). Each parity test is #[ignore]d and names its
+# dump script, so a fresh checkout regenerates only what it needs.
+parity/golden/*.safetensors
+# Generated audio from the examples (chat_multiturn / generate / mic_chat write WAVs to cwd).
+*.wav
+# self_chat's data-harness output (per-turn WAVs + stitched conversation + transcript.json).
+/self_chat_out/
