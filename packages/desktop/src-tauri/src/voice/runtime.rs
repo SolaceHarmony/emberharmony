@@ -9,9 +9,10 @@
 
 use std::{
     borrow::Cow,
+    collections::HashMap,
     fs,
     future::Future,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
@@ -24,11 +25,11 @@ use crossbeam_channel::{Receiver, RecvTimeoutError};
 use futures::StreamExt;
 use liquid_audio::moshi::models::{realtime_moshi_files, safetensors_floating_dtype};
 use liquid_audio::{
-    AudioStatsSnapshot, ExternalAudioInput, ExternalAudioInputWriter, ExternalAudioOutput,
-    FrameSubmitError, GenParams, Lfm2VoiceEngine, MoshiVoiceEngine, RealtimeFramePipeline,
-    RealtimeFramePipelineHandle, RealtimePipeline, RealtimePipelineHandle, RuntimeConfig,
-    RuntimeEvent, SessionState, Utterance, VoiceEngine, VoiceEvent as RealtimeEvent,
-    VoiceRuntime as Lfm2Runtime, from_pretrained,
+    AudioStatsSnapshot, ConversationVault, ExternalAudioInput, ExternalAudioInputWriter,
+    ExternalAudioOutput, FrameSubmitError, GenParams, LFM2AudioModel, LFM2AudioProcessor,
+    Lfm2VoiceEngine, MoshiVoiceEngine, RealtimeFramePipeline, RealtimeFramePipelineHandle,
+    RealtimePipeline, RealtimePipelineHandle, RuntimeConfig, RuntimeEvent, SessionState, Utterance,
+    VoiceEngine, VoiceEvent as RealtimeEvent, VoiceRuntime as Lfm2Runtime, from_pretrained,
 };
 use livekit::{
     AudioProcessingOptions, ConnectionState, DataPacket, PlatformAudio, Room, RoomEvent,
@@ -95,6 +96,60 @@ const LFM2_CONVERSE_SYSTEM_PROMPT: &str = concat!(
     "DELEGATE: <a clear, self-contained description of the task>. ",
     "Only emit DELEGATE for genuine work, never for small talk."
 );
+
+/// Resident LFM2 weights (spec 09): loading 1.5B params takes seconds, so the loaded
+/// model lives for the app lifetime and every voice session borrows it via `Arc` —
+/// building an engine must never mean loading the model again. Keyed by (model dir,
+/// device); changing either in Settings reloads once. The ~3GB residency is the price
+/// of instant session starts.
+struct ResidentLfm2 {
+    dir: PathBuf,
+    device: Lfm2Device,
+    model: Arc<LFM2AudioModel>,
+    proc: Arc<LFM2AudioProcessor>,
+}
+
+static LFM2_RESIDENT: Mutex<Option<ResidentLfm2>> = Mutex::new(None);
+
+/// One conversation vault per chat session: the model's conversation must survive
+/// UI-driven voice session rebuilds (route changes, settings writes) — the upstream
+/// `chat.py` invariant, where `ChatState` outlives everything but an explicit reset.
+static CONVERSATION_VAULTS: Mutex<Option<HashMap<String, ConversationVault>>> = Mutex::new(None);
+
+fn conversation_vault(session_id: &str) -> ConversationVault {
+    let mut slot = CONVERSATION_VAULTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    slot.get_or_insert_with(HashMap::new)
+        .entry(session_id.to_string())
+        .or_default()
+        .clone()
+}
+
+fn resident_lfm2(
+    dir: &Path,
+    device_setting: &Lfm2Device,
+    device: &Device,
+) -> Result<(Arc<LFM2AudioModel>, Arc<LFM2AudioProcessor>), String> {
+    let mut slot = LFM2_RESIDENT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(resident) = slot.as_ref() {
+        if resident.dir == dir && &resident.device == device_setting {
+            return Ok((resident.model.clone(), resident.proc.clone()));
+        }
+    }
+    let (model, proc) =
+        from_pretrained(dir, device).map_err(|e| format!("failed to load LFM2-Audio: {e}"))?;
+    let (model, proc) = (Arc::new(model), Arc::new(proc));
+    *slot = Some(ResidentLfm2 {
+        dir: dir.to_path_buf(),
+        device: device_setting.clone(),
+        model: model.clone(),
+        proc: proc.clone(),
+    });
+    Ok((model, proc))
+}
 
 /// One active native voice service for the desktop app.
 pub struct VoiceRuntime {
@@ -798,7 +853,7 @@ async fn livekit_session_loop(
     }
     let vad_threshold = settings.lfm2.vad_threshold;
     let interrupts_playback = can_interrupt_playback(&settings);
-    let engine = match build_engine(settings, LIVEKIT_AGENT_AUDIO_RATE) {
+    let engine = match build_engine(settings, LIVEKIT_AGENT_AUDIO_RATE, None) {
         Ok(engine) => engine,
         Err(error) => {
             livekit_fail(
@@ -2200,6 +2255,7 @@ impl Lfm2Session {
             bridge_wake,
         );
         let cfg = local_runtime_config(&settings);
+        let vault = conversation_vault(&ctx.session_id);
         let input = start_local_webrtc_input(threads, done.clone()).await?;
         let output = match start_local_webrtc_output().await {
             Ok(output) => output,
@@ -2212,7 +2268,7 @@ impl Lfm2Session {
             cfg,
             Some(input),
             Some(output),
-            move |out_rate| build_engine(settings, out_rate),
+            move |out_rate| build_engine(settings, out_rate, Some(vault)),
             move |event| {
                 if matches!(event, RuntimeEvent::Ended(_)) {
                     sink_done.store(true, Ordering::SeqCst);
@@ -2582,7 +2638,11 @@ fn can_interrupt_playback(settings: &VoiceSettings) -> bool {
     settings.lfm2.engine != LocalVoiceEngine::MoshiRealtime
 }
 
-fn build_engine(settings: VoiceSettings, out_rate: u32) -> Result<Box<dyn VoiceEngine>, String> {
+fn build_engine(
+    settings: VoiceSettings,
+    out_rate: u32,
+    vault: Option<ConversationVault>,
+) -> Result<Box<dyn VoiceEngine>, String> {
     // Fail-hard, no network at start: load ONLY a local snapshot dir. The repo id/revision are
     // the download source (Settings → Download), not a run-time fetch — never auto-download here.
     let device = select_device(&settings.lfm2.device)?;
@@ -2621,8 +2681,7 @@ fn build_engine(settings: VoiceSettings, out_rate: u32) -> Result<Box<dyn VoiceE
         return Err("Selected local engine is LFM2-Audio, but the directory contains a Moshi realtime snapshot. Switch Local engine to Moshi realtime or choose an LFM2-Audio snapshot.".into());
     }
     let codebooks = codebooks(&dir)?;
-    let (model, proc) =
-        from_pretrained(&dir, &device).map_err(|e| format!("failed to load LFM2-Audio: {e}"))?;
+    let (model, proc) = resident_lfm2(&dir, &settings.lfm2.device, &device)?;
     let params = GenParams {
         max_new_tokens: settings.lfm2.max_tokens as usize,
         text_temperature: None,
@@ -2631,7 +2690,10 @@ fn build_engine(settings: VoiceSettings, out_rate: u32) -> Result<Box<dyn VoiceE
         audio_top_k: Some(4),
         seed: settings.lfm2.seed.unwrap_or(0),
     };
-    let engine = Lfm2VoiceEngine::new(model, proc, params, codebooks, device, out_rate);
+    let mut engine = Lfm2VoiceEngine::new(model, proc, params, codebooks, device, out_rate);
+    if let Some(vault) = vault {
+        engine = engine.with_conversation_vault(vault);
+    }
     if settings.lfm2.delegate.enabled
         && settings
             .lfm2
