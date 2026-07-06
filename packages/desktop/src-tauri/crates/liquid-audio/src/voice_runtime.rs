@@ -273,6 +273,85 @@ impl PlaybackReference {
     }
 }
 
+/// Sentinel for "no voiced input observed yet" in [`TurnLatency`].
+const TURN_LATENCY_NO_VOICE: u64 = u64::MAX;
+/// Minimum output-chunk RMS that counts as the assistant audibly speaking.
+/// Filters silence frames so the measurement matches voice onset, not stream onset.
+const TURN_LATENCY_AGENT_RMS: f32 = 0.01;
+
+/// Turn-responsiveness telemetry (spec 09, W1): the gap between the user's
+/// last voiced mic input and the first audible assistant PCM per turn — the
+/// same measurement the Sesame demo client grades on 300/500/1000/3000ms bands.
+struct TurnLatency {
+    origin: Instant,
+    /// Milliseconds since `origin` of the most recent voiced mic window.
+    last_voice_ms: std::sync::atomic::AtomicU64,
+    /// Armed while a reply is pending; the first audible chunk measures and disarms.
+    awaiting: AtomicBool,
+    first_word_logged: AtomicBool,
+}
+
+impl TurnLatency {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            origin: Instant::now(),
+            last_voice_ms: std::sync::atomic::AtomicU64::new(TURN_LATENCY_NO_VOICE),
+            awaiting: AtomicBool::new(false),
+            first_word_logged: AtomicBool::new(false),
+        })
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.origin.elapsed().as_millis() as u64
+    }
+
+    fn mark_voice(&self) {
+        self.last_voice_ms.store(self.now_ms(), Ordering::Release);
+    }
+
+    fn arm(&self) {
+        if self.last_voice_ms.load(Ordering::Acquire) != TURN_LATENCY_NO_VOICE {
+            self.awaiting.store(true, Ordering::Release);
+        }
+    }
+
+    fn disarm(&self) {
+        self.awaiting.store(false, Ordering::Release);
+    }
+
+    /// If armed, measure last-voice → now and disarm. Returns the gap in ms.
+    fn try_measure(&self) -> Option<u64> {
+        if !self.awaiting.swap(false, Ordering::AcqRel) {
+            return None;
+        }
+        let last = self.last_voice_ms.load(Ordering::Acquire);
+        if last == TURN_LATENCY_NO_VOICE {
+            return None;
+        }
+        Some(self.now_ms().saturating_sub(last))
+    }
+
+    /// Session-start → first audible assistant word, logged once.
+    fn first_word(&self) -> Option<u64> {
+        if self.first_word_logged.swap(true, Ordering::AcqRel) {
+            return None;
+        }
+        Some(self.now_ms())
+    }
+}
+
+/// Sesame's agent-response-latency rating bands (recovered demo client,
+/// `getAgentResponseLatencyRating`): <300ms = 5 … ≥3000ms = 1.
+fn turn_latency_rating(ms: u64) -> u8 {
+    match ms {
+        0..=299 => 5,
+        300..=499 => 4,
+        500..=999 => 3,
+        1000..=2999 => 2,
+        _ => 1,
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AudioStatsSnapshot {
@@ -281,6 +360,12 @@ pub struct AudioStatsSnapshot {
     pub dropped_samples: u64,
     pub played_samples: u64,
     pub underrun_frames: u64,
+    /// Completed pause→first-audio measurements this session (spec 09, W1).
+    pub turn_count: u64,
+    /// Most recent pause→first-audio gap in milliseconds.
+    pub last_turn_latency_ms: u64,
+    /// Mean pause→first-audio gap in milliseconds across the session.
+    pub mean_turn_latency_ms: u64,
 }
 
 #[derive(Default)]
@@ -290,16 +375,32 @@ struct AudioStats {
     dropped_samples: std::sync::atomic::AtomicU64,
     played_samples: std::sync::atomic::AtomicU64,
     underrun_frames: std::sync::atomic::AtomicU64,
+    turn_count: std::sync::atomic::AtomicU64,
+    last_turn_latency_ms: std::sync::atomic::AtomicU64,
+    total_turn_latency_ms: std::sync::atomic::AtomicU64,
 }
 
 impl AudioStats {
+    fn record_turn_latency(&self, ms: u64) {
+        self.turn_count.fetch_add(1, Ordering::Relaxed);
+        self.last_turn_latency_ms.store(ms, Ordering::Relaxed);
+        self.total_turn_latency_ms.fetch_add(ms, Ordering::Relaxed);
+    }
+
     fn snapshot(&self) -> AudioStatsSnapshot {
+        let turn_count = self.turn_count.load(Ordering::Relaxed);
+        let total_turn_latency_ms = self.total_turn_latency_ms.load(Ordering::Relaxed);
         AudioStatsSnapshot {
             decoded_samples: self.decoded_samples.load(Ordering::Relaxed),
             queued_samples: self.queued_samples.load(Ordering::Relaxed),
             dropped_samples: self.dropped_samples.load(Ordering::Relaxed),
             played_samples: self.played_samples.load(Ordering::Relaxed),
             underrun_frames: self.underrun_frames.load(Ordering::Relaxed),
+            turn_count,
+            last_turn_latency_ms: self.last_turn_latency_ms.load(Ordering::Relaxed),
+            mean_turn_latency_ms: total_turn_latency_ms
+                .checked_div(turn_count)
+                .unwrap_or_default(),
         }
     }
 }
@@ -685,6 +786,7 @@ fn session_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
         }
     };
     let assistant = Arc::new(AtomicBool::new(false));
+    let latency = TurnLatency::new();
     let events = match &pipeline {
         Pipeline::Turn(pipe) => pipe.events().clone(),
         Pipeline::Frame(pipe) => pipe.events().clone(),
@@ -700,6 +802,7 @@ fn session_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
         stop.clone(),
         playback_flush.clone(),
         playback.clone(),
+        latency.clone(),
         external_output,
     ) {
         Ok(consumer) => consumer,
@@ -739,6 +842,7 @@ fn session_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
             &stop,
             &interrupt,
             &mic_enabled,
+            &latency,
             cfg,
             in_rate,
         ),
@@ -753,6 +857,7 @@ fn session_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
             &stop,
             &interrupt,
             &mic_enabled,
+            &latency,
             cfg,
             in_rate,
         ),
@@ -767,6 +872,7 @@ fn session_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_consumer<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
     events: crossbeam_channel::Receiver<VoiceEvent>,
     ring: Ring,
@@ -778,6 +884,7 @@ fn spawn_consumer<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
     stop: Arc<AtomicBool>,
     playback_flush: Arc<AtomicBool>,
     playback: Playback,
+    latency: Arc<TurnLatency>,
     output: Option<ExternalAudioOutput>,
 ) -> Result<JoinHandle<()>, String> {
     // Spawn a dedicated output thread when using ExternalAudioOutput (WebRTC path).
@@ -862,6 +969,20 @@ fn spawn_consumer<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
                             }
                         }
                         let level = rms(&pcm);
+                        if level > TURN_LATENCY_AGENT_RMS {
+                            if let Some(ms) = latency.try_measure() {
+                                audio.record_turn_latency(ms);
+                                eprintln!(
+                                    "[voice-latency] pause→first-audio {ms} ms (rating {}/5)",
+                                    turn_latency_rating(ms)
+                                );
+                            }
+                            if let Some(ms) = latency.first_word() {
+                                eprintln!(
+                                    "[voice-latency] first word {ms} ms after session start"
+                                );
+                            }
+                        }
                         let external_output = output.is_some();
                         // Push PCM to the output ring (non-blocking) instead of
                         // calling write_mono_f32 directly. The dedicated output
@@ -931,6 +1052,7 @@ fn spawn_consumer<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
                     }
                     VoiceEvent::TurnComplete | VoiceEvent::Interrupted => {
                         assistant.store(false, Ordering::SeqCst);
+                        latency.disarm();
                         if output_ring.is_some() {
                             playback.set_idle();
                         } else if output.is_some() {
@@ -944,6 +1066,7 @@ fn spawn_consumer<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
                     }
                     VoiceEvent::Error(error) => {
                         assistant.store(false, Ordering::SeqCst);
+                        latency.disarm();
                         if output_ring.is_some() {
                             playback.set_idle();
                         } else if output.is_some() {
@@ -976,6 +1099,7 @@ fn vad_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
     stop: &Arc<AtomicBool>,
     interrupt: &Arc<AtomicBool>,
     mic_enabled: &Arc<AtomicBool>,
+    latency: &Arc<TurnLatency>,
     cfg: RuntimeConfig,
     in_rate: u32,
 ) {
@@ -1035,6 +1159,7 @@ fn vad_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
                     }
                 }
                 last_voice = Instant::now();
+                latency.mark_voice();
             }
             read += window;
         }
@@ -1051,10 +1176,12 @@ fn vad_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
                 if !emit_or_stop(sink, stop, RuntimeEvent::State(SessionState::Thinking)) {
                     return;
                 }
-                if !pipe.submit(Utterance {
+                if pipe.submit(Utterance {
                     samples,
                     rate: in_rate,
                 }) {
+                    latency.arm();
+                } else {
                     pipe.interrupt();
                     playback_flush.store(true, Ordering::SeqCst);
                     assistant.store(false, Ordering::SeqCst);
@@ -1083,7 +1210,8 @@ fn frame_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
     stop: &Arc<AtomicBool>,
     interrupt: &Arc<AtomicBool>,
     mic_enabled: &Arc<AtomicBool>,
-    _cfg: RuntimeConfig,
+    latency: &Arc<TurnLatency>,
+    cfg: RuntimeConfig,
     in_rate: u32,
 ) {
     let frame = pipe.config();
@@ -1141,6 +1269,15 @@ fn frame_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
                 continue;
             } else {
                 let chunk = input.split_off(before);
+                // Telemetry only (spec 09, W1): note voiced input and arm the
+                // pause→first-audio measurement when the assistant is quiet.
+                // This never gates what reaches the model.
+                if rms(&chunk) > cfg.vad_threshold {
+                    latency.mark_voice();
+                    if !assistant.load(Ordering::SeqCst) {
+                        latency.arm();
+                    }
+                }
                 // Always feed real mic audio — no zeroing, no VAD gating.
                 model.extend(resampler.process(&chunk));
             }
@@ -1581,6 +1718,68 @@ mod tests {
     }
 
     #[test]
+    fn turn_latency_measures_only_when_armed_after_voice() {
+        let latency = TurnLatency::new();
+
+        // Not armed, no voice: nothing to measure.
+        assert_eq!(latency.try_measure(), None);
+
+        // Arming without any voiced input is a no-op.
+        latency.arm();
+        assert_eq!(latency.try_measure(), None);
+
+        latency.mark_voice();
+        latency.arm();
+        let measured = latency.try_measure().expect("armed after voice measures");
+        assert!(measured < 1000, "same-test measurement should be near-zero");
+
+        // Measurement disarms: a second audible chunk doesn't re-measure.
+        assert_eq!(latency.try_measure(), None);
+    }
+
+    #[test]
+    fn turn_latency_disarm_cancels_pending_measurement() {
+        let latency = TurnLatency::new();
+        latency.mark_voice();
+        latency.arm();
+        latency.disarm();
+        assert_eq!(latency.try_measure(), None);
+    }
+
+    #[test]
+    fn turn_latency_first_word_logs_once() {
+        let latency = TurnLatency::new();
+        assert!(latency.first_word().is_some());
+        assert_eq!(latency.first_word(), None);
+    }
+
+    #[test]
+    fn turn_latency_rating_matches_sesame_bands() {
+        assert_eq!(turn_latency_rating(0), 5);
+        assert_eq!(turn_latency_rating(299), 5);
+        assert_eq!(turn_latency_rating(300), 4);
+        assert_eq!(turn_latency_rating(499), 4);
+        assert_eq!(turn_latency_rating(500), 3);
+        assert_eq!(turn_latency_rating(999), 3);
+        assert_eq!(turn_latency_rating(1000), 2);
+        assert_eq!(turn_latency_rating(2999), 2);
+        assert_eq!(turn_latency_rating(3000), 1);
+    }
+
+    #[test]
+    fn audio_stats_snapshot_reports_mean_turn_latency() {
+        let stats = AudioStats::default();
+        assert_eq!(stats.snapshot().mean_turn_latency_ms, 0);
+
+        stats.record_turn_latency(400);
+        stats.record_turn_latency(800);
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.turn_count, 2);
+        assert_eq!(snapshot.last_turn_latency_ms, 800);
+        assert_eq!(snapshot.mean_turn_latency_ms, 600);
+    }
+
+    #[test]
     fn terminal_turn_state_follows_mic_enabled() {
         let mic = AtomicBool::new(true);
         assert_eq!(ready_state(&mic), SessionState::Listening);
@@ -1667,6 +1866,7 @@ mod tests {
             stop,
             Arc::new(AtomicBool::new(false)),
             playback,
+            TurnLatency::new(),
             None,
         )
         .expect("spawn consumer");
@@ -1690,6 +1890,9 @@ mod tests {
                 dropped_samples: 0,
                 played_samples: 0,
                 underrun_frames: 0,
+                turn_count: 0,
+                last_turn_latency_ms: 0,
+                mean_turn_latency_ms: 0,
             }
         );
     }
@@ -1733,6 +1936,7 @@ mod tests {
             stop,
             Arc::new(AtomicBool::new(false)),
             playback,
+            TurnLatency::new(),
             Some(output),
         )
         .expect("spawn consumer");
@@ -1759,6 +1963,9 @@ mod tests {
                 dropped_samples: 0,
                 played_samples: 2,
                 underrun_frames: 0,
+                turn_count: 0,
+                last_turn_latency_ms: 0,
+                mean_turn_latency_ms: 0,
             }
         );
     }
