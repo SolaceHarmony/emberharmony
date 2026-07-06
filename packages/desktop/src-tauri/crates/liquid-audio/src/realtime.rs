@@ -86,6 +86,14 @@ fn interrupt_epoch(cancel: &AtomicBool, epoch: &AtomicU64) -> u64 {
 struct WorkerSignals {
     cancel: Arc<AtomicBool>,
     epoch: Arc<AtomicU64>,
+    /// Monotonic teardown latch. Set true (never cleared) as the FIRST act of
+    /// shutdown, before the epoch bump and before the shutdown channel drops.
+    /// The worker checks it at the decision point (loop top + before running a
+    /// speculative prepare), so a queued prepare — pure optimization — can never
+    /// win a race against teardown and delay the join with a non-cancellable
+    /// prefill. Channel disconnect stays as the wake/backstop; the latch is the
+    /// ordering guarantee disconnect alone couldn't give.
+    shutdown: Arc<AtomicBool>,
     shutdown_tx: Option<Sender<()>>,
 }
 
@@ -94,6 +102,7 @@ impl WorkerSignals {
         Self {
             cancel: Arc::new(AtomicBool::new(false)),
             epoch: Arc::new(AtomicU64::new(0)),
+            shutdown: Arc::new(AtomicBool::new(false)),
             shutdown_tx: Some(shutdown_tx),
         }
     }
@@ -106,6 +115,11 @@ impl WorkerSignals {
         self.epoch.clone()
     }
 
+    /// A clone of the teardown latch for the worker to read.
+    fn shutdown_flag(&self) -> Arc<AtomicBool> {
+        self.shutdown.clone()
+    }
+
     fn current_epoch(&self) -> u64 {
         self.epoch.load(Ordering::Acquire)
     }
@@ -115,6 +129,11 @@ impl WorkerSignals {
     }
 
     fn shutdown(&mut self) {
+        // Latch FIRST: any worker that observes the release of an in-flight turn
+        // after this point sees the latch set and returns without running queued
+        // control. Then interrupt (abort the in-flight reply) and drop the
+        // channel (wakes a blocked select).
+        self.shutdown.store(true, Ordering::SeqCst);
         self.interrupt();
         drop(self.shutdown_tx.take());
     }
@@ -486,39 +505,38 @@ impl RealtimePipeline {
         let signals = WorkerSignals::new(shutdown_tx);
         let cancel_worker = signals.cancel();
         let epoch_worker = signals.epoch();
+        let shutdown_flag = signals.shutdown_flag();
 
         let worker = std::thread::Builder::new()
             .name("lfm2-inference".into())
             .spawn(move || {
-                // The inference coroutine: serve until the pipeline drops. The
-                // stop signal is `shutdown_rx` disconnecting — guaranteed at
-                // pipeline drop no matter which handle clones are still alive.
+                // The inference coroutine: serve until the pipeline drops. Stop is
+                // the `shutdown` LATCH (set as the first act of teardown, before
+                // any channel drop) — checked at every decision point so a queued
+                // speculative Prepare can never win a race against teardown and
+                // stall the join with a non-cancellable prefill. `shutdown_rx`
+                // disconnect stays as the wake for a blocked select.
+                let shutting_down = || shutdown_flag.load(Ordering::Acquire);
+                // A speculative Prepare is pure optimization: skip it whenever an
+                // utterance is already waiting (stale by construction) OR teardown
+                // has latched. Both make running it wasted, non-cancellable work.
+                let skip_prepare = |utt_rx: &Receiver<QueuedUtterance>| {
+                    !utt_rx.is_empty() || shutting_down()
+                };
                 let mut current_epoch = 0u64;
                 let mut ctl_open = true;
                 loop {
-                    // Teardown observed? Do no further work — especially not a
-                    // queued fresh-epoch Prepare, whose non-cancellable prefill
-                    // would delay Drop's join by up to a full prefill. (Stale
-                    // Prepares are already dropped by the epoch guard; this
-                    // closes the racing-handle window.)
-                    if matches!(
-                        shutdown_rx.try_recv(),
-                        Err(crossbeam_channel::TryRecvError::Disconnected)
-                    ) {
+                    if shutting_down() {
                         return;
                     }
                     // Drain queued control first (never blocks): a Prepare sent
-                    // before its committing utterance is guaranteed to run first.
-                    // But a Prepare must never DELAY a committed utterance that
-                    // is already waiting: with an utterance queued, a pending
-                    // Prepare is stale by construction (it was built without
-                    // that utterance's turn) — skip it instead of burning a
-                    // prefill the respond would immediately roll back.
+                    // before its committing utterance is guaranteed to run first —
+                    // unless it should be skipped (utterance waiting or teardown).
                     while ctl_open {
                         match ctl_rx.try_recv() {
-                            Ok(Control::Prepare { .. }) if !utt_rx.is_empty() => {
+                            Ok(Control::Prepare { .. }) if skip_prepare(&utt_rx) => {
                                 crate::vtrace!(
-                                    "worker: skipping speculative prepare (utterance waiting)"
+                                    "worker: skipping speculative prepare (utterance waiting or teardown)"
                                 );
                             }
                             Ok(ctl) => handle_control(&mut engine, ctl, &epoch_worker),
@@ -532,20 +550,17 @@ impl RealtimePipeline {
                         crossbeam_channel::select! {
                             recv(shutdown_rx) -> _ => return,
                             recv(ctl_rx) -> msg => match msg {
-                                Ok(Control::Prepare { .. }) if !utt_rx.is_empty() => {
+                                Ok(Control::Prepare { .. }) if skip_prepare(&utt_rx) => {
                                     crate::vtrace!(
-                                        "worker: skipping speculative prepare (utterance waiting)"
+                                        "worker: skipping speculative prepare (utterance waiting or teardown)"
                                     );
                                     Served::Continue
                                 }
                                 Ok(ctl) => {
-                                    // Same teardown guard as the loop top: when
-                                    // both arms are ready, select may pick this
-                                    // one even though shutdown already fired.
-                                    if matches!(
-                                        shutdown_rx.try_recv(),
-                                        Err(crossbeam_channel::TryRecvError::Disconnected)
-                                    ) {
+                                    // Same teardown guard as the loop top: when both
+                                    // arms are ready, select may pick this one even
+                                    // though the latch is already set.
+                                    if shutting_down() {
                                         Served::Stop
                                     } else {
                                         handle_control(&mut engine, ctl, &epoch_worker);
@@ -927,11 +942,18 @@ pub struct ConversationState {
     pub modality_flag: Tensor,
 }
 
+/// Dimensional fingerprint of a [`ConversationState`] — the staleness guard for
+/// consuming a speculative prefill. Covers ALL FIVE persisted tensors: dropping
+/// any one would let a prepared turn built on conversation A be consumed against
+/// conversation B (a silent cache/context desync). `audio_in` (mel-frame width)
+/// is included even though today's call graph never grows it without also moving
+/// a segment/text dim — the fingerprint must not depend on that coincidence.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct ConversationMark {
     text: usize,
     modality: usize,
     audio_out: usize,
+    audio_in: usize,
     audio_segments: usize,
 }
 
@@ -967,6 +989,7 @@ impl ConversationState {
             text: self.text.dim(1).unwrap_or(usize::MAX),
             modality: self.modality_flag.dim(1).unwrap_or(usize::MAX),
             audio_out: self.audio_out.dim(1).unwrap_or(usize::MAX),
+            audio_in: self.audio_in.dim(1).unwrap_or(usize::MAX),
             audio_segments: self.audio_in_lens.dim(0).unwrap_or(usize::MAX),
         }
     }
@@ -2517,11 +2540,20 @@ mod tests {
             .expect("turn 1 started");
         assert!(handle.prepare(utt(7)));
 
+        // Establish the teardown latch BEFORE releasing the in-flight turn —
+        // faithfully modeling production, where `drop()` latches shutdown and
+        // THEN the running turn completes and the worker loops seeing the latch.
+        // The worker is parked inside respond:1 (blocked on release), so setting
+        // the latch now guarantees it is observed the instant the worker loops —
+        // no dependence on drop-thread scheduling, which is what made this racy.
+        let shutdown_flag = pipe.signals.shutdown_flag();
+
         let (done_tx, done_rx) = mpsc::channel();
         std::thread::spawn(move || {
-            drop(pipe);
+            drop(pipe); // shutdown() re-latches idempotently, then joins
             let _ = done_tx.send(());
         });
+        shutdown_flag.store(true, Ordering::SeqCst);
         release_tx.send(()).unwrap();
         done_rx
             .recv_timeout(Duration::from_secs(2))
@@ -2764,6 +2796,24 @@ mod tests {
         assert_eq!(saved.audio_in_lens.dims(), round.audio_in_lens.dims());
         assert_eq!(saved.audio_out.dims(), round.audio_out.dims());
         assert_eq!(saved.modality_flag.dims(), round.modality_flag.dims());
+
+        // The mark must fingerprint ALL FIVE tensors: a change to audio_in's
+        // mel-frame width alone (with every other dim held constant) must make
+        // the marks differ, or a stale speculative prefill could be consumed
+        // against a mutated conversation. Guards against silently dropping a
+        // tensor from the fingerprint (adversarial-review finding).
+        let mut wider = saved.clone();
+        wider.audio_in = Tensor::zeros(
+            (saved.audio_in.dim(0).unwrap(), saved.audio_in.dim(1).unwrap() + 1),
+            DType::F32,
+            dev,
+        )
+        .unwrap();
+        assert_ne!(
+            saved.mark(),
+            wider.mark(),
+            "mark must distinguish an audio_in-only change"
+        );
     }
 
     #[test]

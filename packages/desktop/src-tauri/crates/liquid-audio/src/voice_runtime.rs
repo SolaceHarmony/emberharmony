@@ -341,6 +341,115 @@ impl PlaybackReference {
     }
 }
 
+struct OutputGuard {
+    _stream: Option<HostStream>,
+}
+
+struct PlaybackOutput {
+    _guard: OutputGuard,
+    ring: Ring,
+    playback: Playback,
+    rate: u32,
+    external: Option<ExternalAudioOutput>,
+}
+
+impl PlaybackOutput {
+    fn new(
+        output: Option<ExternalAudioOutput>,
+        audio: Stats,
+        flush: Arc<AtomicBool>,
+    ) -> Result<Self, String> {
+        match output {
+            Some(output) => {
+                let rate = output.rate();
+                Ok(Self {
+                    _guard: OutputGuard { _stream: None },
+                    ring: PcmRing::new(rate as usize * SPEAKER_RING_SECONDS),
+                    playback: PlaybackReference::new(),
+                    rate,
+                    external: Some(output),
+                })
+            }
+            None => {
+                let (stream, ring, playback, rate) =
+                    start_output(audio, flush).map_err(|e| e.to_string())?;
+                Ok(Self {
+                    _guard: OutputGuard {
+                        _stream: Some(stream),
+                    },
+                    ring,
+                    playback,
+                    rate,
+                    external: None,
+                })
+            }
+        }
+    }
+}
+
+enum OutputSink {
+    Internal { ring: Ring },
+    External { ring: Ring, flush: Arc<AtomicBool> },
+}
+
+impl OutputSink {
+    fn push(&self, pcm: &[f32], level: f32, flush: &AtomicBool, playback: &Playback) -> usize {
+        match self {
+            Self::Internal { ring } => ring.push_slice(pcm),
+            Self::External {
+                ring,
+                flush: output_flush,
+            } => {
+                if flush.swap(false, Ordering::SeqCst) {
+                    output_flush.store(true, Ordering::SeqCst);
+                }
+                let dropped = ring.push_slice(pcm);
+                if dropped == 0 {
+                    playback.set_playing(level);
+                }
+                dropped
+            }
+        }
+    }
+
+    fn set_idle(&self, playback: &Playback) {
+        if matches!(self, Self::External { .. }) {
+            playback.set_idle();
+        }
+    }
+}
+
+struct ConsumerThreads {
+    consumer: JoinHandle<()>,
+    output: Option<JoinHandle<()>>,
+    output_ring: Option<Ring>,
+    stop: Arc<AtomicBool>,
+}
+
+impl ConsumerThreads {
+    fn join(self) -> std::thread::Result<()> {
+        // Consumer first (it produces PCM into the ring); then let the output
+        // worker — still running on its OWN stop flag — drain the residual ring
+        // before we stop it, so the queued tail audio is written, not dropped.
+        let result = self.consumer.join();
+        if let Some(worker) = self.output {
+            if let Some(ring) = self.output_ring {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                // Wait until the ring is drained OR the worker has already died
+                // (e.g. a mid-stream write failure). The `is_finished` guard
+                // means a dead worker returns immediately instead of stalling
+                // the full deadline on a ring nobody is draining.
+                while ring.len() > 0 && Instant::now() < deadline && !worker.is_finished() {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+            self.stop.store(true, Ordering::SeqCst);
+            let _ = worker.join();
+        }
+        result
+    }
+}
+
 /// Sentinel for "no voiced input observed yet" in [`TurnLatency`].
 const TURN_LATENCY_NO_VOICE: u64 = u64::MAX;
 /// Minimum output-chunk RMS that counts as the assistant audibly speaking.
@@ -724,45 +833,25 @@ fn session_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
     if !emit_or_stop(&sink, &stop, RuntimeEvent::State(SessionState::Loading)) {
         return;
     }
-    struct OutputGuard {
-        _stream: Option<HostStream>,
-    }
-    let (out_guard, ring, playback, out_rate, external_output) = match output {
-        Some(output) => (
-            OutputGuard { _stream: None },
-            PcmRing::new(output.rate() as usize * SPEAKER_RING_SECONDS),
-            PlaybackReference::new(),
-            output.rate(),
-            Some(output),
-        ),
-        None => match start_output(audio.clone(), playback_flush.clone()) {
-            Ok((stream, ring, playback, rate)) => (
-                OutputGuard {
-                    _stream: Some(stream),
-                },
-                ring,
-                playback,
-                rate,
-                None,
-            ),
-            Err(error) => {
-                if !emit_or_stop(
-                    &sink,
-                    &stop,
-                    RuntimeEvent::Error(format!("audio output: {error}")),
-                ) {
-                    return;
-                }
-                emit_or_stop(
-                    &sink,
-                    &stop,
-                    RuntimeEvent::Ended(Some("audio output unavailable".into())),
-                );
+    let output = match PlaybackOutput::new(output, audio.clone(), playback_flush.clone()) {
+        Ok(output) => output,
+        Err(error) => {
+            if !emit_or_stop(
+                &sink,
+                &stop,
+                RuntimeEvent::Error(format!("audio output: {error}")),
+            ) {
                 return;
             }
-        },
+            emit_or_stop(
+                &sink,
+                &stop,
+                RuntimeEvent::Ended(Some("audio output unavailable".into())),
+            );
+            return;
+        }
     };
-    let engine = match build_engine(out_rate) {
+    let engine = match build_engine(output.rate) {
         Ok(engine) => engine,
         Err(error) => {
             if !emit_or_stop(
@@ -866,17 +955,17 @@ fn session_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
     };
     let consumer = match spawn_consumer(
         events,
-        ring.clone(),
-        out_rate,
+        output.ring.clone(),
+        output.rate,
         assistant.clone(),
         mic_enabled.clone(),
         audio.clone(),
         sink.clone(),
         stop.clone(),
         playback_flush.clone(),
-        playback.clone(),
+        output.playback.clone(),
         latency.clone(),
-        external_output,
+        output.external.clone(),
     ) {
         Ok(consumer) => consumer,
         Err(error) => {
@@ -898,7 +987,7 @@ fn session_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
 
     if !emit_or_stop(&sink, &stop, RuntimeEvent::State(SessionState::Listening)) {
         drop(input_guard);
-        drop(out_guard);
+        drop(output);
         drop(pipeline);
         let _ = consumer.join();
         return;
@@ -907,9 +996,9 @@ fn session_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
         Pipeline::Turn(pipe) => vad_loop(
             pipe,
             &mic,
-            &ring,
+            &output.ring,
             &playback_flush,
-            &playback,
+            &output.playback,
             &assistant,
             &sink,
             &stop,
@@ -922,9 +1011,9 @@ fn session_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
         Pipeline::Frame(pipe) => frame_loop(
             pipe,
             &mic,
-            &ring,
+            &output.ring,
             &playback_flush,
-            &playback,
+            &output.playback,
             &assistant,
             &sink,
             &stop,
@@ -937,7 +1026,7 @@ fn session_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
     }
 
     drop(input_guard);
-    drop(out_guard);
+    drop(output);
     drop(pipeline);
     let _ = consumer.join();
     if emit_or_stop(&sink, &stop, RuntimeEvent::State(SessionState::Idle)) {
@@ -959,62 +1048,76 @@ fn spawn_consumer<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
     playback: Playback,
     latency: Arc<TurnLatency>,
     output: Option<ExternalAudioOutput>,
-) -> Result<JoinHandle<()>, String> {
+) -> Result<ConsumerThreads, String> {
     // Spawn a dedicated output thread when using ExternalAudioOutput (WebRTC path).
     // The consumer pushes PCM into a bounded ring (non-blocking); the output thread
     // drains the ring and calls the blocking write_mono_f32 (which does
     // block_on(capture_frame)). This decouples model generation from output latency:
     // the consumer never blocks on capture_frame, so the inference worker's event
     // channel never backs up, and the model keeps generating at full speed.
-    let output_ring = output.as_ref().map(|_| {
-        PcmRing::new(out_rate as usize * SPEAKER_RING_SECONDS)
-    });
     let output_flush = Arc::new(AtomicBool::new(false));
-    let output_stop = stop.clone();
+    // The output worker gets its OWN stop signal, NOT the runtime `stop`: the
+    // runtime sets `stop` true BEFORE the session thread reaches
+    // `ConsumerThreads::join`, so sharing it made the worker exit WITHOUT
+    // draining — losing the queued tail audio and stalling the join's drain loop
+    // for its full deadline. `ConsumerThreads::join` drains the ring while the
+    // worker is still running, THEN sets this flag to stop it.
+    let output_stop = Arc::new(AtomicBool::new(false));
+    let (output_sink, output_worker, output_ring) = match output {
+        Some(output) => {
+            let ring = PcmRing::new(out_rate as usize * SPEAKER_RING_SECONDS);
+            let thread_ring = ring.clone();
+            let flush = output_flush.clone();
+            let thread_stop = output_stop.clone();
+            let thread_audio = audio.clone();
+            let worker = std::thread::Builder::new()
+                .name("voice-output".into())
+                .spawn(move || {
+                    while !thread_stop.load(Ordering::SeqCst) {
+                        if flush.swap(false, Ordering::SeqCst) {
+                            output.clear();
+                            thread_ring.clear();
+                        }
+                        // Drain a chunk from the ring (non-blocking pop)
+                        let chunk = thread_ring.drain_all();
+                        if chunk.is_empty() {
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                            continue;
+                        }
+                        if let Err(e) = output.write_mono_f32(&chunk) {
+                            eprintln!("[voice-output] speaker write failed: {e}");
+                            break;
+                        }
+                        // Count as played ONLY after the transport accepted the
+                        // write — counting at ring-push made `played_samples` mean
+                        // "queued, possibly never delivered" on this path.
+                        thread_audio
+                            .played_samples
+                            .fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                    }
+                    output.clear();
+                })
+                .map_err(|e| format!("spawn voice-output thread failed: {e}"))?;
+            (
+                OutputSink::External {
+                    ring: ring.clone(),
+                    flush: output_flush,
+                },
+                Some(worker),
+                Some(ring),
+            )
+        }
+        None => (OutputSink::Internal { ring }, None, None),
+    };
 
-    if let (Some(output), Some(ring)) = (&output, &output_ring) {
-        let ring = ring.clone();
-        let output = output.clone();
-        let flush = output_flush.clone();
-        let stop = output_stop.clone();
-        let audio = audio.clone();
-        std::thread::Builder::new()
-            .name("voice-output".into())
-            .spawn(move || {
-                while !stop.load(Ordering::SeqCst) {
-                    if flush.swap(false, Ordering::SeqCst) {
-                        output.clear();
-                        ring.clear();
-                    }
-                    // Drain a chunk from the ring (non-blocking pop)
-                    let chunk = ring.drain_all();
-                    if chunk.is_empty() {
-                        std::thread::sleep(std::time::Duration::from_millis(5));
-                        continue;
-                    }
-                    if let Err(e) = output.write_mono_f32(&chunk) {
-                        eprintln!("[voice-output] speaker write failed: {e}");
-                        break;
-                    }
-                    // Count as played ONLY after the transport accepted the
-                    // write — counting at ring-push made `played_samples` mean
-                    // "queued, possibly never delivered" on this path.
-                    audio
-                        .played_samples
-                        .fetch_add(chunk.len() as u64, Ordering::Relaxed);
-                }
-                output.clear();
-            })
-            .map_err(|e| format!("spawn voice-output thread failed: {e}"))?;
-    }
-
-    std::thread::Builder::new()
+    let consumer_stop = stop.clone();
+    let consumer = std::thread::Builder::new()
         .name("voice-consumer".into())
         .spawn(move || {
             let mut transcript = String::new();
             let mut speaking = false;
             for event in events.iter() {
-                if stop.load(Ordering::SeqCst) {
+                if consumer_stop.load(Ordering::SeqCst) {
                     break;
                 }
                 let is_turn_complete = matches!(&event, VoiceEvent::TurnComplete);
@@ -1026,14 +1129,17 @@ fn spawn_consumer<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
                             speaking = true;
                             if !emit_or_stop(
                                 &sink,
-                                &stop,
+                                &consumer_stop,
                                 RuntimeEvent::State(SessionState::Speaking),
                             ) {
                                 break;
                             }
                         }
-                        if !emit_or_stop(&sink, &stop, RuntimeEvent::Transcript(transcript.clone()))
-                        {
+                        if !emit_or_stop(
+                            &sink,
+                            &consumer_stop,
+                            RuntimeEvent::Transcript(transcript.clone()),
+                        ) {
                             break;
                         }
                     }
@@ -1043,7 +1149,7 @@ fn spawn_consumer<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
                             speaking = true;
                             if !emit_or_stop(
                                 &sink,
-                                &stop,
+                                &consumer_stop,
                                 RuntimeEvent::State(SessionState::Speaking),
                             ) {
                                 break;
@@ -1070,26 +1176,11 @@ fn spawn_consumer<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
                                 );
                             }
                         }
-                        let external_output = output.is_some();
                         // ONE output path per I/O mode, no fallback chain:
-                        // external output ⇒ the non-blocking ring drained by the
-                        // dedicated voice-output thread (output_ring is ALWAYS
-                        // constructed alongside an external output — the legacy
-                        // direct write_mono_f32 branch was unreachable and is gone);
-                        // no external output ⇒ the internal ring the CPAL callback
-                        // consumes (standalone examples).
-                        let dropped = if let Some(output_ring) = output_ring.as_ref() {
-                            if playback_flush.swap(false, Ordering::SeqCst) {
-                                output_flush.store(true, Ordering::SeqCst);
-                            }
-                            let d = output_ring.push_slice(&pcm);
-                            if d == 0 {
-                                playback.set_playing(level);
-                            }
-                            d
-                        } else {
-                            ring.push_slice(&pcm)
-                        };
+                        // external output ⇒ an OutputSink ring drained by the
+                        // dedicated voice-output thread; no external output ⇒
+                        // the internal ring the CPAL callback consumes.
+                        let dropped = output_sink.push(&pcm, level, &playback_flush, &playback);
                         let queued = pcm.len().saturating_sub(dropped);
                         audio
                             .decoded_samples
@@ -1103,10 +1194,9 @@ fn spawn_consumer<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
                         // NOTE: `played_samples` for the external-output path is
                         // counted by the voice-output thread AFTER a successful
                         // write, not here at ring-push — see spawn above.
-                        let _ = external_output;
                         if !emit_or_stop(
                             &sink,
-                            &stop,
+                            &consumer_stop,
                             RuntimeEvent::Audio {
                                 pcm,
                                 rate: out_rate,
@@ -1114,7 +1204,7 @@ fn spawn_consumer<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
                         ) {
                             break;
                         }
-                        if !emit_or_stop(&sink, &stop, RuntimeEvent::Level(level)) {
+                        if !emit_or_stop(&sink, &consumer_stop, RuntimeEvent::Level(level)) {
                             break;
                         }
                     }
@@ -1130,38 +1220,37 @@ fn spawn_consumer<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
                         );
                         assistant.store(false, Ordering::SeqCst);
                         latency.disarm();
-                        if output_ring.is_some() {
-                            playback.set_idle();
-                        } else if output.is_some() {
-                            playback.set_idle();
-                        }
+                        output_sink.set_idle(&playback);
                         transcript.clear();
                         speaking = false;
-                        if !emit_ready(&sink, &stop, &mic_enabled) {
+                        if !emit_ready(&sink, &consumer_stop, &mic_enabled) {
                             break;
                         }
                     }
                     VoiceEvent::Error(error) => {
                         assistant.store(false, Ordering::SeqCst);
                         latency.disarm();
-                        if output_ring.is_some() {
-                            playback.set_idle();
-                        } else if output.is_some() {
-                            playback.set_idle();
-                        }
+                        output_sink.set_idle(&playback);
                         transcript.clear();
                         speaking = false;
-                        if !emit_or_stop(&sink, &stop, RuntimeEvent::Error(error)) {
+                        if !emit_or_stop(&sink, &consumer_stop, RuntimeEvent::Error(error)) {
                             break;
                         }
-                        if !emit_ready(&sink, &stop, &mic_enabled) {
+                        if !emit_ready(&sink, &consumer_stop, &mic_enabled) {
                             break;
                         }
                     }
                 }
             }
         })
-        .map_err(|e| format!("spawn voice-consumer thread failed: {e}"))
+        .map_err(|e| format!("spawn voice-consumer thread failed: {e}"))?;
+
+    Ok(ConsumerThreads {
+        consumer,
+        output: output_worker,
+        output_ring,
+        stop: output_stop,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2279,6 +2368,239 @@ mod tests {
         assert_eq!(
             snap.played_samples, 0,
             "a failed transport write must not count as played"
+        );
+    }
+
+    #[test]
+    fn external_output_worker_stops_when_consumer_exits() {
+        let (tx, rx) = crossbeam_channel::bounded(4);
+        let sink = Arc::new(Mutex::new(move |_event| true));
+        let stop = Arc::new(AtomicBool::new(false));
+        let mic = Arc::new(AtomicBool::new(true));
+        let assistant = Arc::new(AtomicBool::new(false));
+        let ring = PcmRing::new(16);
+        let audio = Arc::new(AudioStats::default());
+        let cleared = Arc::new(AtomicUsize::new(0));
+        let clear = cleared.clone();
+        let output = ExternalAudioOutput::new(
+            48_000,
+            |_pcm, _rate| Ok(()),
+            move || {
+                clear.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .expect("external output");
+
+        let consumer = spawn_consumer(
+            rx,
+            ring,
+            48_000,
+            assistant,
+            mic,
+            audio,
+            sink,
+            stop,
+            Arc::new(AtomicBool::new(false)),
+            PlaybackReference::new(),
+            TurnLatency::new(),
+            Some(output),
+        )
+        .expect("spawn consumer");
+        drop(tx);
+
+        let started = Instant::now();
+        consumer.join().unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "consumer join must stop the external output worker promptly"
+        );
+        assert!(
+            cleared.load(Ordering::SeqCst) > 0,
+            "external output should be cleared when its worker exits"
+        );
+    }
+
+    #[test]
+    fn external_flush_clears_queued_output_before_next_write() {
+        let (tx, rx) = crossbeam_channel::bounded(4);
+        let sink = Arc::new(Mutex::new(move |_event| true));
+        let stop = Arc::new(AtomicBool::new(false));
+        let mic = Arc::new(AtomicBool::new(true));
+        let assistant = Arc::new(AtomicBool::new(false));
+        let ring = PcmRing::new(16);
+        let audio = Arc::new(AudioStats::default());
+        let writes = Arc::new(AtomicUsize::new(0));
+        let clears = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let wrote = writes.clone();
+        let clear = clears.clone();
+        let release = release_rx.clone();
+        let output = ExternalAudioOutput::new(
+            48_000,
+            move |pcm, _rate| {
+                let prior = wrote.fetch_add(pcm.len(), Ordering::SeqCst);
+                if prior == 0 {
+                    let _ = entered_tx.send(());
+                    release
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(5))
+                        .map_err(|e| format!("release wait failed: {e}"))?;
+                }
+                Ok(())
+            },
+            move || {
+                clear.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .expect("external output");
+        let flush = Arc::new(AtomicBool::new(false));
+
+        let consumer = spawn_consumer(
+            rx,
+            ring,
+            48_000,
+            assistant,
+            mic,
+            audio.clone(),
+            sink,
+            stop,
+            flush.clone(),
+            PlaybackReference::new(),
+            TurnLatency::new(),
+            Some(output),
+        )
+        .expect("spawn consumer");
+        tx.send(VoiceEvent::Audio(vec![0.25, -0.25])).unwrap();
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("first write started");
+
+        flush.store(true, Ordering::SeqCst);
+        tx.send(VoiceEvent::Audio(vec![0.5, -0.5])).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while audio.snapshot().queued_samples < 4 {
+            if Instant::now() >= deadline {
+                panic!("consumer did not queue the flushed audio");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        release_tx.send(()).unwrap();
+
+        // Pin the FLUSH clear specifically: poll for the native clear while the
+        // worker is still alive, BEFORE shutdown. The worker also clears
+        // unconditionally on exit, so asserting `clears > 0` only AFTER join was
+        // tautological — it would pass even if the flush never cleared anything.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while clears.load(Ordering::SeqCst) == 0 {
+            if Instant::now() >= deadline {
+                panic!("flush did not clear the native output before shutdown");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        drop(tx);
+        consumer.join().unwrap();
+
+        assert_eq!(
+            writes.load(Ordering::SeqCst),
+            2,
+            "flush should drop the stale queued PCM before a second native write"
+        );
+    }
+
+    /// F1 regression: the runtime sets `stop` true BEFORE the session thread
+    /// reaches `ConsumerThreads::join`. When the output worker shared that stop
+    /// it exited WITHOUT draining, so the queued tail audio was lost and the
+    /// drain loop stalled its full deadline on a ring nobody emptied. The worker
+    /// must drain the residual ring before it is stopped. This test fails on the
+    /// old shared-stop code (tail lost) and on a stalling drain (slow join).
+    #[test]
+    fn external_shutdown_drains_tail_before_stopping_worker() {
+        let (tx, rx) = crossbeam_channel::bounded(8);
+        let sink = Arc::new(Mutex::new(move |_event| true));
+        let stop = Arc::new(AtomicBool::new(false));
+        let mic = Arc::new(AtomicBool::new(true));
+        let assistant = Arc::new(AtomicBool::new(false));
+        let ring = PcmRing::new(64);
+        let audio = Arc::new(AudioStats::default());
+        let written = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let wrote = written.clone();
+        let release = release_rx.clone();
+        let output = ExternalAudioOutput::new(
+            48_000,
+            move |pcm, _rate| {
+                let prior = wrote.fetch_add(pcm.len(), Ordering::SeqCst);
+                if prior == 0 {
+                    // Block the FIRST write so the later chunks pile up in the
+                    // ring as residual tail while shutdown is initiated.
+                    let _ = entered_tx.send(());
+                    release
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(5))
+                        .map_err(|e| format!("release wait failed: {e}"))?;
+                }
+                Ok(())
+            },
+            || {},
+        )
+        .expect("external output");
+
+        let consumer = spawn_consumer(
+            rx,
+            ring,
+            48_000,
+            assistant,
+            mic,
+            audio.clone(),
+            sink,
+            stop.clone(),
+            Arc::new(AtomicBool::new(false)),
+            PlaybackReference::new(),
+            TurnLatency::new(),
+            Some(output),
+        )
+        .expect("spawn consumer");
+
+        // Chunk 1 → worker grabs it and blocks in the first write.
+        tx.send(VoiceEvent::Audio(vec![0.1, 0.1])).unwrap();
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("first write started");
+        // Chunks 2 & 3 → pile up in the output ring as the residual tail.
+        tx.send(VoiceEvent::Audio(vec![0.2, 0.2])).unwrap();
+        tx.send(VoiceEvent::Audio(vec![0.3, 0.3])).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while audio.snapshot().queued_samples < 6 {
+            if Instant::now() >= deadline {
+                panic!("residual tail never queued");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        // Production shutdown ordering: the runtime latches `stop` BEFORE join,
+        // with the tail still queued. The worker (on its own stop) must drain it.
+        stop.store(true, Ordering::SeqCst);
+        release_tx.send(()).unwrap();
+        drop(tx);
+
+        let started = Instant::now();
+        consumer.join().unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "join must not stall the full drain deadline"
+        );
+        assert_eq!(
+            written.load(Ordering::SeqCst),
+            6,
+            "all queued tail audio must be written before the worker is stopped"
         );
     }
 
