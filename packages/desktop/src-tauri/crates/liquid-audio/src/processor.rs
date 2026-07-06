@@ -60,6 +60,15 @@ impl PreprocessorConfig {
     }
 }
 
+/// The turn-format strings `ChatState` writes — single source of truth, shared with
+/// [`crate::chat_template`]'s load-time verification against the snapshot's own
+/// `chat_template.jinja`. Faithful to the Python `ChatState` (`new_turn`/`end_turn`).
+pub const SEQUENCE_START: &str = "<|startoftext|>";
+pub const TURN_FOOTER: &str = "<|im_end|>\n";
+pub fn turn_header(role: &str) -> String {
+    format!("<|im_start|>{role}\n")
+}
+
 /// Generation-control token ids resolved BY NAME from the model's own tokenizer at
 /// load time — the model defines them, so they pass through instead of living as
 /// literals in the generation loops (`<|im_end|>` also cross-checks the config's
@@ -220,7 +229,7 @@ pub struct ChatState<'a> {
 impl<'a> ChatState<'a> {
     pub fn new(proc: &'a LFM2AudioProcessor, codebooks: usize) -> Result<Self> {
         let dev = &proc.device;
-        let text = proc.encode("<|startoftext|>")?;
+        let text = proc.encode(SEQUENCE_START)?;
         let n = text.dim(1)?;
         let nfilt = proc.audio.nfilt();
         let modality_flag = Tensor::from_vec(vec![LFMModality::Text as i64; n], (1, n), dev)?;
@@ -369,11 +378,11 @@ impl<'a> ChatState<'a> {
     }
 
     pub fn new_turn(&mut self, role: &str) -> Result<()> {
-        self.add_text(&format!("<|im_start|>{role}\n"))
+        self.add_text(&turn_header(role))
     }
 
     pub fn end_turn(&mut self) -> Result<()> {
-        self.add_text("<|im_end|>\n")
+        self.add_text(TURN_FOOTER)
     }
 
     /// Append generated text + audio-out tokens with their modality flags.

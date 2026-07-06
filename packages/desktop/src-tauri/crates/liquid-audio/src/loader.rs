@@ -208,6 +208,10 @@ pub fn from_pretrained(
             )));
         }
     }
+    // ChatState's turn format must tokenize identically to what the snapshot's own
+    // chat_template.jinja renders — template drift fails the load, never prompts
+    // the model off-distribution.
+    crate::chat_template::verify_snapshot(dir, &tokenizer)?;
 
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&safes, dtype, device)? };
     let model = LFM2AudioModel::new(
