@@ -138,6 +138,12 @@ impl Lfm2Config {
 /// attention layer and decode step, instead of being reconstructed on every call.
 pub struct Cache {
     pub use_kv_cache: bool,
+    /// Decode-step ShortConv path selector: `true` (the production default set by
+    /// [`Cache::new`]) runs the fused causal-conv1d update kernel; `false` runs the
+    /// composed candle ops — the reference semantics the fused kernel must match.
+    /// A per-cache field so tests A/B the two paths on the same weights by
+    /// constructing a cache per path; never an ambient/global toggle.
+    pub fused_conv_decode: bool,
     /// Per-layer KV cache, faithful to candle-transformers/HF: append new K/V by
     /// concatenating on the sequence axis. This intentionally does not use
     /// `candle_nn::kv_cache::KvCache`; that preallocated cache changes the reference
@@ -173,6 +179,7 @@ impl Cache {
         let sin = idx_theta.sin()?.to_dtype(dtype)?;
         Ok(Self {
             use_kv_cache,
+            fused_conv_decode: true,
             kvs: vec![None; cfg.num_hidden_layers],
             conv_states: vec![None; cfg.num_hidden_layers],
             masks: HashMap::new(),
@@ -377,7 +384,7 @@ impl ShortConv {
         // matches the CUDA-trained regime (Bx and conv-out round through bf16).
         // Sequence START (conv_states None) stays on the composed path below, whose
         // zero-pad prefill is the reference semantics.
-        if self.l_cache > 0 && seq_len <= 4 && cache.use_kv_cache {
+        if cache.fused_conv_decode && self.l_cache > 0 && seq_len <= 4 && cache.use_kv_cache {
             if let Some(prev) = cache.conv_states[block_idx].clone() {
                 let w = self.conv_weight.squeeze(1)?; // (H, K)
                 let bcx = bcx.contiguous()?;

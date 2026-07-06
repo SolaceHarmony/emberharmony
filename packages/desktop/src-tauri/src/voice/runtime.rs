@@ -104,7 +104,15 @@ const LFM2_CONVERSE_SYSTEM_PROMPT: &str = concat!(
 /// of instant session starts.
 struct ResidentLfm2 {
     dir: PathBuf,
-    device: Lfm2Device,
+    device_setting: Lfm2Device,
+    /// The ONE candle Device for the app's lifetime. candle Metal state is
+    /// per-`MetalDevice` INSTANCE (command queue, built-in kernel cache, buffer
+    /// pool) — minting a fresh `Device::new_metal(0)` per session start left the
+    /// resident weights on the first instance while sessions ran on new ones:
+    /// candle recompiled its kernels every session and two live queues could
+    /// interleave. The compiled-kernel context is resident state, same as the
+    /// weights.
+    device: Device,
     model: Arc<LFM2AudioModel>,
     proc: Arc<LFM2AudioProcessor>,
 }
@@ -129,26 +137,33 @@ fn conversation_vault(session_id: &str) -> ConversationVault {
 fn resident_lfm2(
     dir: &Path,
     device_setting: &Lfm2Device,
-    device: &Device,
-) -> Result<(Arc<LFM2AudioModel>, Arc<LFM2AudioProcessor>), String> {
+) -> Result<(Arc<LFM2AudioModel>, Arc<LFM2AudioProcessor>, Device), String> {
     let mut slot = LFM2_RESIDENT
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(resident) = slot.as_ref() {
-        if resident.dir == dir && &resident.device == device_setting {
-            return Ok((resident.model.clone(), resident.proc.clone()));
+        if resident.dir == dir && &resident.device_setting == device_setting {
+            return Ok((
+                resident.model.clone(),
+                resident.proc.clone(),
+                resident.device.clone(),
+            ));
         }
     }
+    // First load (or dir/device change): create the device HERE so it lives and
+    // dies with the resident weights — one queue, one kernel cache, one pool.
+    let device = select_device(device_setting)?;
     let (model, proc) =
-        from_pretrained(dir, device).map_err(|e| format!("failed to load LFM2-Audio: {e}"))?;
+        from_pretrained(dir, &device).map_err(|e| format!("failed to load LFM2-Audio: {e}"))?;
     let (model, proc) = (Arc::new(model), Arc::new(proc));
     *slot = Some(ResidentLfm2 {
         dir: dir.to_path_buf(),
-        device: device_setting.clone(),
+        device_setting: device_setting.clone(),
+        device: device.clone(),
         model: model.clone(),
         proc: proc.clone(),
     });
-    Ok((model, proc))
+    Ok((model, proc, device))
 }
 
 /// One active native voice service for the desktop app.
@@ -2645,8 +2660,8 @@ fn build_engine(
 ) -> Result<Box<dyn VoiceEngine>, String> {
     // Fail-hard, no network at start: load ONLY a local snapshot dir. The repo id/revision are
     // the download source (Settings → Download), not a run-time fetch — never auto-download here.
-    let device = select_device(&settings.lfm2.device)?;
     if settings.lfm2.engine == LocalVoiceEngine::MoshiRealtime {
+        let device = select_device(&settings.lfm2.device)?;
         let dir = settings::moshi_model_dir(&settings.lfm2).ok_or_else(|| {
             "No local Moshi realtime model — download Moshiko or select a Moshi snapshot directory in Settings."
                 .to_string()
@@ -2681,7 +2696,10 @@ fn build_engine(
         return Err("Selected local engine is LFM2-Audio, but the directory contains a Moshi realtime snapshot. Switch Local engine to Moshi realtime or choose an LFM2-Audio snapshot.".into());
     }
     let codebooks = codebooks(&dir)?;
-    let (model, proc) = resident_lfm2(&dir, &settings.lfm2.device, &device)?;
+    // The Device rides the resident cache: ONE candle MetalDevice instance (one
+    // command queue, one built-in kernel cache, one buffer pool) for the app's
+    // lifetime — sessions borrow it, never mint their own.
+    let (model, proc, device) = resident_lfm2(&dir, &settings.lfm2.device)?;
     let params = GenParams {
         max_new_tokens: settings.lfm2.max_tokens as usize,
         // Sampled text, NOT greedy — vendor-exact: LiquidAI's transformers-js
