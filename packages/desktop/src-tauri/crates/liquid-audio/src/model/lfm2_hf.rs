@@ -448,6 +448,16 @@ impl ShortConv {
         // zero-pad prefill is the reference semantics.
         if cache.fused_conv_decode && self.l_cache > 0 && seq_len <= 4 && cache.use_kv_cache {
             if let Some(prev) = cache.conv_states[block_idx].clone() {
+                // One line per process, so a live run PROVES this path executed
+                // (the harness A/B can't certify the shipped app; a log line can).
+                static FUSED_ANNOUNCED: std::sync::Once = std::sync::Once::new();
+                FUSED_ANNOUNCED.call_once(|| {
+                    eprintln!(
+                        "[voice] fused conv decode kernel active \
+                         (candle-flashfftconv causal_conv1d_update, {:?})",
+                        bcx.device().location()
+                    );
+                });
                 let w = self.conv_weight.squeeze(1)?; // (H, K)
                 let bcx = bcx.contiguous()?;
                 let (y, new_state) =
