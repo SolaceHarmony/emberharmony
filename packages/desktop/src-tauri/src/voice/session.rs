@@ -336,7 +336,16 @@ pub async fn run_turn(
                 Step::TimedOut => return Err("session reply timed out".into()),
                 Step::Ignore => {}
             },
-            Ok(Ok(None)) => return Err("session event stream closed".into()),
+            Ok(Ok(None)) => {
+                // `next_event` yields Ok(None) BOTH for a closed SSE stream and for
+                // a cancellation racing the read — a user Stop mid-delegation must
+                // end the turn quietly, not surface as a session error.
+                if cancel.load(Ordering::SeqCst) {
+                    abort_prompt(&client, &cfg).await;
+                    return Ok(());
+                }
+                return Err("session event stream closed".into());
+            }
             Ok(Err(error)) => return Err(error),
             Err(_) => {
                 if matches!(reducer.tick(elapsed_ms(start)), Step::TimedOut) {

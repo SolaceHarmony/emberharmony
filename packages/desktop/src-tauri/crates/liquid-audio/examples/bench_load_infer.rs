@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use candle_core::{DType, Device, Tensor};
+use candle_core::{Device, Tensor};
 use liquid_audio::moshi::demo::chat::decode_audio_reply;
 use liquid_audio::moshi::models::MimiModel;
 use liquid_audio::{from_pretrained, ChatState, GenParams, GenToken};

@@ -2980,22 +2980,40 @@ async fn local_webrtc_output_loopback() -> Result<LocalWebRtcOutputState, String
     })
 }
 
+/// Holders of the shared factory-level ADM playout. The Settings speaker probe
+/// creates a short-lived `LocalWebRtcOutputState` WHILE a live voice session owns
+/// one — an unconditional stop on the probe's drop would silence the live session.
+/// Playout stops only when the last holder releases it.
+static LOCAL_PLAYOUT_HOLDERS: Mutex<usize> = Mutex::new(0);
+
 fn start_local_webrtc_playout() -> Result<(), String> {
-    let runtime = LkRuntime::instance();
-    let factory = runtime.pc_factory();
-    factory.set_adm_playout_enabled(true);
-    if !factory.playout_is_initialized() && !factory.init_playout() {
-        return Err("local WebRTC speaker playout init failed".into());
+    let mut holders = LOCAL_PLAYOUT_HOLDERS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if *holders == 0 {
+        let runtime = LkRuntime::instance();
+        let factory = runtime.pc_factory();
+        factory.set_adm_playout_enabled(true);
+        if !factory.playout_is_initialized() && !factory.init_playout() {
+            return Err("local WebRTC speaker playout init failed".into());
+        }
+        if !factory.start_playout() {
+            return Err("local WebRTC speaker playout start failed".into());
+        }
     }
-    if !factory.start_playout() {
-        return Err("local WebRTC speaker playout start failed".into());
-    }
+    *holders += 1;
     Ok(())
 }
 
 fn stop_local_webrtc_playout() {
-    let runtime = LkRuntime::instance();
-    let _ = runtime.pc_factory().stop_playout();
+    let mut holders = LOCAL_PLAYOUT_HOLDERS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *holders = holders.saturating_sub(1);
+    if *holders == 0 {
+        let runtime = LkRuntime::instance();
+        let _ = runtime.pc_factory().stop_playout();
+    }
 }
 
 async fn exchange_loopback_ice(
@@ -3052,6 +3070,8 @@ struct LocalWebRtcInputState {
 
 impl Drop for LocalWebRtcInputState {
     fn drop(&mut self) {
+        // Paired with the explicit start_recording in local_webrtc_mic_loop.
+        let _ = self._audio.stop_recording();
         self.remote_track.set_enabled(false);
         self.sender.close();
         self.receiver.close();
@@ -3191,6 +3211,15 @@ async fn local_webrtc_mic_loop(
     };
     if let Err(error) = configure_livekit_audio(&audio) {
         let message = format!("WebRTC audio processing failed: {error}");
+        send_local_webrtc_ready(&mut ready, Err(message.clone()));
+        return Err(message);
+    }
+    // Explicitly start ADM recording, like the native LiveKit mic path does
+    // (livekit_set_mic). Without it, capture only runs incidentally via the track
+    // and an OS-level denial would surface as silent no-frames instead of an
+    // error — and the APM capture chain (AEC/NS/AGC) may not fully engage.
+    if let Err(error) = audio.start_recording() {
+        let message = format!("WebRTC microphone start failed: {error}");
         send_local_webrtc_ready(&mut ready, Err(message.clone()));
         return Err(message);
     }

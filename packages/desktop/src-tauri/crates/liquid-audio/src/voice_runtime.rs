@@ -1644,6 +1644,7 @@ fn start_output(audio: Stats, flush: Arc<AtomicBool>) -> Res<(HostStream, Ring, 
             let audio = audio.clone();
             let mut started = false;
             let mut empty_frames = 0usize;
+            let mut starve_ticks = 0usize;
             dev.build_output_stream(
                 &cfg,
                 move |data: &mut [$t], _: &cpal::OutputCallbackInfo| {
@@ -1653,17 +1654,33 @@ fn start_output(audio: Stats, flush: Arc<AtomicBool>) -> Res<(HostStream, Ring, 
                         playback.set_idle();
                         started = false;
                         empty_frames = 0;
+                        starve_ticks = 0;
                     }
                     if !started {
-                        if ring.len() < prebuffer {
+                        let queued = ring.len();
+                        if queued >= prebuffer {
+                            started = true;
+                        } else if queued > 0 {
+                            // A reply SHORTER than the prebuffer never crosses the
+                            // threshold on its own and would sit queued forever.
+                            // After a few callbacks with data waiting and nothing
+                            // arriving, start anyway.
+                            starve_ticks += 1;
+                            if starve_ticks >= 3 {
+                                started = true;
+                            }
+                        } else {
+                            starve_ticks = 0;
+                        }
+                        if !started {
                             playback.set_idle();
                             for out in data.iter_mut() {
                                 *out = silence;
                             }
                             return;
                         }
-                        started = true;
                         empty_frames = 0;
+                        starve_ticks = 0;
                     }
                     let mut played = false;
                     let mut played_frames = 0usize;
