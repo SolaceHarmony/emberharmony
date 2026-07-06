@@ -138,32 +138,40 @@ fn resident_lfm2(
     dir: &Path,
     device_setting: &Lfm2Device,
 ) -> Result<(Arc<LFM2AudioModel>, Arc<LFM2AudioProcessor>, Device), String> {
-    let mut slot = LFM2_RESIDENT
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(resident) = slot.as_ref() {
-        if resident.dir == dir && &resident.device_setting == device_setting {
-            // Per-session ground truth in the log: which silicon this session's
-            // model actually lives on (the settings store can say one thing and
-            // a stale resident another — this line is the arbiter).
+    // Double-checked resident init (#148). Hold the lock ONLY to check for a hit
+    // and clone handles out — never across `from_pretrained`, a multi-second
+    // Metal load. Holding it there stalled anything else touching the slot and
+    // pinned a tokio worker for the whole load.
+    {
+        let slot = LFM2_RESIDENT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(resident) = slot.as_ref() {
+            if resident.dir == dir && &resident.device_setting == device_setting {
+                // Per-session ground truth in the log: which silicon this session's
+                // model actually lives on (the settings store can say one thing and
+                // a stale resident another — this line is the arbiter).
+                eprintln!(
+                    "[voice] LFM2 session: setting {:?} -> resident model reused on {:?}",
+                    device_setting,
+                    resident.device.location()
+                );
+                return Ok((
+                    resident.model.clone(),
+                    resident.proc.clone(),
+                    resident.device.clone(),
+                ));
+            }
             eprintln!(
-                "[voice] LFM2 session: setting {:?} -> resident model reused on {:?}",
-                device_setting,
-                resident.device.location()
+                "[voice] LFM2 session: setting changed ({:?} -> {:?}); reloading model",
+                resident.device_setting, device_setting
             );
-            return Ok((
-                resident.model.clone(),
-                resident.proc.clone(),
-                resident.device.clone(),
-            ));
         }
-        eprintln!(
-            "[voice] LFM2 session: setting changed ({:?} -> {:?}); reloading model",
-            resident.device_setting, device_setting
-        );
-    }
-    // First load (or dir/device change): create the device HERE so it lives and
-    // dies with the resident weights — one queue, one kernel cache, one pool.
+    } // lock released before the load
+
+    // First load (or dir/device change), OUTSIDE the lock: create the device HERE
+    // so it lives and dies with the resident weights — one queue, one kernel
+    // cache, one pool.
     let device = select_device(device_setting)?;
     eprintln!(
         "[voice] LFM2 session: setting {:?} -> loading model onto {:?}",
@@ -173,6 +181,28 @@ fn resident_lfm2(
     let (model, proc) =
         from_pretrained(dir, &device).map_err(|e| format!("failed to load LFM2-Audio: {e}"))?;
     let (model, proc) = (Arc::new(model), Arc::new(proc));
+
+    // Re-lock to publish. Double-check: a concurrent start may have loaded the
+    // SAME dir+device while we were loading — if so, adopt theirs and drop ours,
+    // so the app keeps exactly ONE resident device instance (the whole point of
+    // the resident cache). Serialized starts never hit this; the check makes the
+    // rare race correct instead of leaking a second device.
+    let mut slot = LFM2_RESIDENT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(resident) = slot.as_ref() {
+        if resident.dir == dir && &resident.device_setting == device_setting {
+            eprintln!(
+                "[voice] LFM2 session: concurrent load raced; adopting the resident model on {:?}",
+                resident.device.location()
+            );
+            return Ok((
+                resident.model.clone(),
+                resident.proc.clone(),
+                resident.device.clone(),
+            ));
+        }
+    }
     *slot = Some(ResidentLfm2 {
         dir: dir.to_path_buf(),
         device_setting: device_setting.clone(),

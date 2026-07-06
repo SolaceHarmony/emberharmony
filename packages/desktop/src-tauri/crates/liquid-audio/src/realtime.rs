@@ -43,14 +43,87 @@ const CONTROL_QUEUE_CAP: usize = 2;
 const EVENT_QUEUE_CAP: usize = 128;
 const FRAME_QUEUE_CAP: usize = 8;
 
-fn try_send_event(tx: &Sender<VoiceEvent>, ev: VoiceEvent, cancel: &AtomicBool) -> bool {
-    match tx.try_send(ev) {
-        Ok(()) => true,
-        Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
-            cancel.store(true, Ordering::SeqCst);
-            false
+struct EventEmitter<'a> {
+    tx: &'a Sender<VoiceEvent>,
+    cancel: &'a AtomicBool,
+    blocked: bool,
+}
+
+impl<'a> EventEmitter<'a> {
+    fn new(tx: &'a Sender<VoiceEvent>, cancel: &'a AtomicBool) -> Self {
+        Self {
+            tx,
+            cancel,
+            blocked: false,
         }
     }
+
+    fn emit(&mut self, ev: VoiceEvent) -> bool {
+        if self.blocked {
+            return false;
+        }
+        match self.tx.try_send(ev) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
+                self.cancel.store(true, Ordering::SeqCst);
+                self.blocked = true;
+                false
+            }
+        }
+    }
+
+    fn blocked(&self) -> bool {
+        self.blocked
+    }
+}
+
+fn interrupt_epoch(cancel: &AtomicBool, epoch: &AtomicU64) -> u64 {
+    let next = epoch.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+    cancel.store(true, Ordering::SeqCst);
+    next
+}
+
+struct WorkerSignals {
+    cancel: Arc<AtomicBool>,
+    epoch: Arc<AtomicU64>,
+    shutdown_tx: Option<Sender<()>>,
+}
+
+impl WorkerSignals {
+    fn new(shutdown_tx: Sender<()>) -> Self {
+        Self {
+            cancel: Arc::new(AtomicBool::new(false)),
+            epoch: Arc::new(AtomicU64::new(0)),
+            shutdown_tx: Some(shutdown_tx),
+        }
+    }
+
+    fn cancel(&self) -> Arc<AtomicBool> {
+        self.cancel.clone()
+    }
+
+    fn epoch(&self) -> Arc<AtomicU64> {
+        self.epoch.clone()
+    }
+
+    fn current_epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Acquire)
+    }
+
+    fn interrupt(&self) -> u64 {
+        interrupt_epoch(&self.cancel, &self.epoch)
+    }
+
+    fn shutdown(&mut self) {
+        self.interrupt();
+        drop(self.shutdown_tx.take());
+    }
+}
+
+#[cfg(test)]
+fn try_send_event(tx: &Sender<VoiceEvent>, ev: VoiceEvent, cancel: &AtomicBool) -> bool {
+    let mut events = EventEmitter::new(tx, cancel);
+    events.emit(ev)
 }
 
 /// A captured user utterance handed to the worker: mono f32 samples + their sample rate.
@@ -205,15 +278,8 @@ enum Control {
 pub struct RealtimePipeline {
     utt_tx: Option<Sender<QueuedUtterance>>,
     ctl_tx: Option<Sender<Control>>,
-    /// Held ONLY by the pipeline, never cloned into handles: dropping it is the
-    /// worker's unconditional stop signal. Shutdown must not depend on the data
-    /// channels disconnecting — handle clones keep those alive, and a `Drop`
-    /// that waited on them deadlocked whenever a handle outlived the pipeline
-    /// on the same stack (the native-LiveKit teardown did exactly that).
-    shutdown_tx: Option<Sender<()>>,
+    signals: WorkerSignals,
     event_rx: Receiver<VoiceEvent>,
-    cancel: Arc<AtomicBool>,
-    epoch: Arc<AtomicU64>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -254,8 +320,7 @@ impl RealtimePipelineHandle {
 
     /// Request barge-in: abort the in-flight reply.
     pub fn interrupt(&self) {
-        self.epoch.fetch_add(1, Ordering::AcqRel);
-        self.cancel.store(true, Ordering::SeqCst);
+        interrupt_epoch(&self.cancel, &self.epoch);
     }
 }
 
@@ -302,6 +367,7 @@ fn serve_utterance<E: VoiceEngine>(
     cancel_worker: &AtomicBool,
     event_tx: &Sender<VoiceEvent>,
 ) -> Served {
+    let mut events = EventEmitter::new(event_tx, cancel_worker);
     let latest_epoch = epoch_worker.load(Ordering::Acquire);
     if epoch < latest_epoch {
         // A stale utterance implies any speculative prefill is stale too —
@@ -311,12 +377,12 @@ fn serve_utterance<E: VoiceEngine>(
             *current_epoch = latest_epoch;
             match interrupt_engine(engine, cancel_worker) {
                 Ok(()) => {
-                    if !try_send_event(event_tx, VoiceEvent::Interrupted, cancel_worker) {
+                    if !events.emit(VoiceEvent::Interrupted) {
                         return Served::Stop;
                     }
                 }
                 Err(error) => {
-                    if !try_send_event(event_tx, VoiceEvent::Error(error), cancel_worker) {
+                    if !events.emit(VoiceEvent::Error(error)) {
                         return Served::Stop;
                     }
                 }
@@ -328,12 +394,12 @@ fn serve_utterance<E: VoiceEngine>(
         *current_epoch = epoch;
         match interrupt_engine(engine, cancel_worker) {
             Ok(()) => {
-                if !try_send_event(event_tx, VoiceEvent::Interrupted, cancel_worker) {
+                if !events.emit(VoiceEvent::Interrupted) {
                     return Served::Stop;
                 }
             }
             Err(error) => {
-                if !try_send_event(event_tx, VoiceEvent::Error(error), cancel_worker) {
+                if !events.emit(VoiceEvent::Error(error)) {
                     return Served::Stop;
                 }
                 return Served::Continue;
@@ -353,31 +419,25 @@ fn serve_utterance<E: VoiceEngine>(
         engine.discard_prepared();
         match interrupt_engine(engine, cancel_worker) {
             Ok(()) => {
-                if !try_send_event(event_tx, VoiceEvent::Interrupted, cancel_worker) {
+                if !events.emit(VoiceEvent::Interrupted) {
                     return Served::Stop;
                 }
             }
             Err(error) => {
-                if !try_send_event(event_tx, VoiceEvent::Error(error), cancel_worker) {
+                if !events.emit(VoiceEvent::Error(error)) {
                     return Served::Stop;
                 }
             }
         }
         return Served::Continue;
     }
-    let mut event_backpressure = false;
     let responded = {
         let mut emit = |ev: VoiceEvent| {
-            if event_backpressure {
-                return;
-            }
-            if !try_send_event(event_tx, ev, cancel_worker) {
-                event_backpressure = true;
-            }
+            events.emit(ev);
         };
         engine.respond(&utt, cancel_worker, &mut emit)
     };
-    let terminal = if event_backpressure {
+    let terminal = if events.blocked() {
         VoiceEvent::Error("voice event queue full or disconnected".into())
     } else {
         match responded {
@@ -397,7 +457,7 @@ fn serve_utterance<E: VoiceEngine>(
             Err(e) => VoiceEvent::Error(e),
         }
     };
-    if !try_send_event(event_tx, terminal, cancel_worker) {
+    if !events.emit(terminal) {
         return Served::Stop; // consumer hung up — nothing left to serve.
     }
     Served::Continue
@@ -423,10 +483,9 @@ impl RealtimePipeline {
         let (ctl_tx, ctl_rx) = bounded::<Control>(CONTROL_QUEUE_CAP);
         let (shutdown_tx, shutdown_rx) = bounded::<()>(0);
         let (event_tx, event_rx) = bounded::<VoiceEvent>(EVENT_QUEUE_CAP);
-        let cancel = Arc::new(AtomicBool::new(false));
-        let cancel_worker = cancel.clone();
-        let epoch = Arc::new(AtomicU64::new(0));
-        let epoch_worker = epoch.clone();
+        let signals = WorkerSignals::new(shutdown_tx);
+        let cancel_worker = signals.cancel();
+        let epoch_worker = signals.epoch();
 
         let worker = std::thread::Builder::new()
             .name("lfm2-inference".into())
@@ -538,10 +597,8 @@ impl RealtimePipeline {
         Ok(Self {
             utt_tx: Some(utt_tx),
             ctl_tx: Some(ctl_tx),
-            shutdown_tx: Some(shutdown_tx),
+            signals,
             event_rx,
-            cancel,
-            epoch,
             worker: Some(worker),
         })
     }
@@ -552,7 +609,7 @@ impl RealtimePipeline {
         let Some(tx) = self.utt_tx.as_ref() else {
             return false;
         };
-        let epoch = self.epoch.load(Ordering::Acquire);
+        let epoch = self.signals.current_epoch();
         match tx.try_send(QueuedUtterance { utt, epoch }) {
             Ok(()) => true,
             Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => false,
@@ -568,7 +625,7 @@ impl RealtimePipeline {
         let Some(tx) = self.ctl_tx.as_ref() else {
             return false;
         };
-        let epoch = self.epoch.load(Ordering::Acquire);
+        let epoch = self.signals.current_epoch();
         tx.try_send(Control::Prepare { utt, epoch }).is_ok()
     }
 
@@ -586,8 +643,7 @@ impl RealtimePipeline {
     /// early, after which the worker emits [`VoiceEvent::Interrupted`]. Call this before
     /// submitting the interrupting utterance.
     pub fn interrupt(&self) {
-        self.epoch.fetch_add(1, Ordering::AcqRel);
-        self.cancel.store(true, Ordering::SeqCst);
+        self.signals.interrupt();
     }
 
     /// The stream of reply events; drain it in the consumer (UI / playback feeder).
@@ -601,8 +657,8 @@ impl RealtimePipeline {
             (Some(utt_tx), Some(ctl_tx)) => Some(RealtimePipelineHandle {
                 utt_tx: utt_tx.clone(),
                 ctl_tx: ctl_tx.clone(),
-                cancel: self.cancel.clone(),
-                epoch: self.epoch.clone(),
+                cancel: self.signals.cancel(),
+                epoch: self.signals.epoch(),
             }),
             _ => None,
         }
@@ -616,9 +672,7 @@ impl Drop for RealtimePipeline {
         // handle clones keep those alive, and a join gated on them deadlocks
         // when a handle outlives the pipeline on the same stack (the
         // native-LiveKit session teardown did exactly that).
-        self.epoch.fetch_add(1, Ordering::AcqRel);
-        self.cancel.store(true, Ordering::SeqCst);
-        drop(self.shutdown_tx.take());
+        self.signals.shutdown();
         drop(self.ctl_tx.take());
         drop(self.utt_tx.take());
         if let Some(worker) = self.worker.take() {
@@ -631,11 +685,8 @@ impl Drop for RealtimePipeline {
 /// keeps the model advancing on exact PCM frames instead of waiting for a VAD utterance.
 pub struct RealtimeFramePipeline {
     frame_tx: Option<Sender<FrameCommand>>,
-    /// Worker stop signal, never cloned into handles — see [`RealtimePipeline`].
-    shutdown_tx: Option<Sender<()>>,
+    signals: WorkerSignals,
     event_rx: Receiver<VoiceEvent>,
-    cancel: Arc<AtomicBool>,
-    epoch: Arc<AtomicU64>,
     cfg: FrameConfig,
     worker: Option<JoinHandle<()>>,
 }
@@ -674,8 +725,7 @@ impl RealtimeFramePipelineHandle {
     /// any in-flight `respond_frame` stops emitting promptly. Moshi's Mimi/LM state
     /// is preserved; a full session stop tears down the whole worker instead.
     pub fn interrupt(&self) {
-        let epoch = self.epoch.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
-        self.cancel.store(true, Ordering::SeqCst);
+        let epoch = interrupt_epoch(&self.cancel, &self.epoch);
         let _ = self.frame_tx.try_send(FrameCommand::Interrupt { epoch });
     }
 }
@@ -695,10 +745,9 @@ impl RealtimeFramePipeline {
         let (frame_tx, frame_rx) = bounded::<FrameCommand>(FRAME_QUEUE_CAP);
         let (shutdown_tx, shutdown_rx) = bounded::<()>(0);
         let (event_tx, event_rx) = bounded::<VoiceEvent>(EVENT_QUEUE_CAP);
-        let cancel = Arc::new(AtomicBool::new(false));
-        let cancel_worker = cancel.clone();
-        let epoch = Arc::new(AtomicU64::new(0));
-        let epoch_worker = epoch.clone();
+        let signals = WorkerSignals::new(shutdown_tx);
+        let cancel_worker = signals.cancel();
+        let epoch_worker = signals.epoch();
 
         let worker = std::thread::Builder::new()
             .name("moshi-frame-inference".into())
@@ -721,7 +770,8 @@ impl RealtimeFramePipeline {
                             }
                             current_epoch = epoch;
                             cancel_worker.store(false, Ordering::SeqCst);
-                            if !try_send_event(&event_tx, VoiceEvent::Interrupted, &cancel_worker) {
+                            let mut events = EventEmitter::new(&event_tx, &cancel_worker);
+                            if !events.emit(VoiceEvent::Interrupted) {
                                 break;
                             }
                         }
@@ -731,11 +781,8 @@ impl RealtimeFramePipeline {
                                 if latest_epoch > current_epoch {
                                     current_epoch = latest_epoch;
                                     cancel_worker.store(false, Ordering::SeqCst);
-                                    if !try_send_event(
-                                        &event_tx,
-                                        VoiceEvent::Interrupted,
-                                        &cancel_worker,
-                                    ) {
+                                    let mut events = EventEmitter::new(&event_tx, &cancel_worker);
+                                    if !events.emit(VoiceEvent::Interrupted) {
                                         break;
                                     }
                                 }
@@ -744,33 +791,21 @@ impl RealtimeFramePipeline {
                             if epoch > current_epoch {
                                 current_epoch = epoch;
                                 cancel_worker.store(false, Ordering::SeqCst);
-                                let _ = try_send_event(
-                                    &event_tx,
-                                    VoiceEvent::Interrupted,
-                                    &cancel_worker,
-                                );
+                                let mut events = EventEmitter::new(&event_tx, &cancel_worker);
+                                events.emit(VoiceEvent::Interrupted);
                             }
                             cancel_worker.store(false, Ordering::SeqCst);
-                            let mut event_backpressure = false;
+                            let mut events = EventEmitter::new(&event_tx, &cancel_worker);
                             let responded = {
                                 let mut emit = |ev: VoiceEvent| {
-                                    if event_backpressure {
-                                        return;
-                                    }
-                                    if !try_send_event(&event_tx, ev, &cancel_worker) {
-                                        event_backpressure = true;
-                                    }
+                                    events.emit(ev);
                                 };
                                 engine.respond_frame(&frame, &cancel_worker, &mut emit)
                             };
-                            if event_backpressure {
-                                let _ = try_send_event(
-                                    &event_tx,
-                                    VoiceEvent::Error(
-                                        "voice event queue full or disconnected".into(),
-                                    ),
-                                    &cancel_worker,
-                                );
+                            if events.blocked() {
+                                events.emit(VoiceEvent::Error(
+                                    "voice event queue full or disconnected".into(),
+                                ));
                                 break;
                             }
                             match responded {
@@ -781,20 +816,12 @@ impl RealtimeFramePipeline {
                                         current_epoch = latest_epoch;
                                     }
                                     cancel_worker.store(false, Ordering::SeqCst);
-                                    if !try_send_event(
-                                        &event_tx,
-                                        VoiceEvent::Interrupted,
-                                        &cancel_worker,
-                                    ) {
+                                    if !events.emit(VoiceEvent::Interrupted) {
                                         break;
                                     }
                                 }
                                 Err(e) => {
-                                    if !try_send_event(
-                                        &event_tx,
-                                        VoiceEvent::Error(e),
-                                        &cancel_worker,
-                                    ) {
+                                    if !events.emit(VoiceEvent::Error(e)) {
                                         break;
                                     }
                                 }
@@ -807,10 +834,8 @@ impl RealtimeFramePipeline {
 
         Ok(Self {
             frame_tx: Some(frame_tx),
-            shutdown_tx: Some(shutdown_tx),
+            signals,
             event_rx,
-            cancel,
-            epoch,
             cfg,
             worker: Some(worker),
         })
@@ -827,7 +852,7 @@ impl RealtimeFramePipeline {
         let Some(tx) = self.frame_tx.as_ref() else {
             return Err(FrameSubmitError::Disconnected);
         };
-        let epoch = self.epoch.load(Ordering::Acquire);
+        let epoch = self.signals.current_epoch();
         match tx.try_send(FrameCommand::Pcm { pcm, epoch }) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(_)) => Err(FrameSubmitError::Full),
@@ -842,8 +867,7 @@ impl RealtimeFramePipeline {
     /// Soft-interrupt frame output without resetting the engine stream. See
     /// [`RealtimeFramePipelineHandle::interrupt`].
     pub fn interrupt(&self) {
-        let epoch = self.epoch.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
-        self.cancel.store(true, Ordering::SeqCst);
+        let epoch = self.signals.interrupt();
         if let Some(tx) = self.frame_tx.as_ref() {
             let _ = tx.try_send(FrameCommand::Interrupt { epoch });
         }
@@ -858,8 +882,8 @@ impl RealtimeFramePipeline {
             .as_ref()
             .map(|frame_tx| RealtimeFramePipelineHandle {
                 frame_tx: frame_tx.clone(),
-                cancel: self.cancel.clone(),
-                epoch: self.epoch.clone(),
+                cancel: self.signals.cancel(),
+                epoch: self.signals.epoch(),
                 cfg: self.cfg,
             })
     }
@@ -867,11 +891,9 @@ impl RealtimeFramePipeline {
 
 impl Drop for RealtimeFramePipeline {
     fn drop(&mut self) {
-        self.epoch.fetch_add(1, Ordering::AcqRel);
-        self.cancel.store(true, Ordering::SeqCst);
         // Stop signal first — see RealtimePipeline::drop: never gate the join
         // on data-channel disconnect while handle clones may be alive.
-        drop(self.shutdown_tx.take());
+        self.signals.shutdown();
         drop(self.frame_tx.take());
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
@@ -905,7 +927,50 @@ pub struct ConversationState {
     pub modality_flag: Tensor,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ConversationMark {
+    text: usize,
+    modality: usize,
+    audio_out: usize,
+    audio_segments: usize,
+}
+
 impl ConversationState {
+    pub fn from_chat(chat: &ChatState<'_>) -> Self {
+        Self {
+            text: chat.text.clone(),
+            audio_in: chat.audio_in.clone(),
+            audio_in_lens: chat.audio_in_lens.clone(),
+            audio_out: chat.audio_out.clone(),
+            modality_flag: chat.modality_flag.clone(),
+        }
+    }
+
+    pub fn to_chat<'p>(
+        &self,
+        proc: &'p LFM2AudioProcessor,
+        codebooks: usize,
+    ) -> candle_core::Result<ChatState<'p>> {
+        ChatState::from_parts(
+            proc,
+            codebooks,
+            self.text.clone(),
+            self.audio_in.clone(),
+            self.audio_in_lens.clone(),
+            self.audio_out.clone(),
+            self.modality_flag.clone(),
+        )
+    }
+
+    fn mark(&self) -> ConversationMark {
+        ConversationMark {
+            text: self.text.dim(1).unwrap_or(usize::MAX),
+            modality: self.modality_flag.dim(1).unwrap_or(usize::MAX),
+            audio_out: self.audio_out.dim(1).unwrap_or(usize::MAX),
+            audio_segments: self.audio_in_lens.dim(0).unwrap_or(usize::MAX),
+        }
+    }
+
     /// Move all five tensors to `device` (no-op copies when already there).
     /// Used when restoring a vaulted conversation into an engine on a different
     /// compute device than the session that persisted it.
@@ -917,6 +982,15 @@ impl ConversationState {
             audio_out: self.audio_out.to_device(device)?,
             modality_flag: self.modality_flag.to_device(device)?,
         })
+    }
+}
+
+impl ConversationMark {
+    fn from_optional(conv: &Option<ConversationState>) -> Self {
+        match conv {
+            Some(conv) => conv.mark(),
+            None => Self::default(),
+        }
     }
 }
 
@@ -1002,9 +1076,9 @@ pub struct Lfm2VoiceEngine {
 struct PreparedTurn {
     /// Identity of the utterance this was built for ([`utterance_fingerprint`]).
     fingerprint: u64,
-    /// [`conv_mark`] of the conversation this was built on — a turn landing in
+    /// [`ConversationMark`] of the conversation this was built on — a turn landing in
     /// between (barge-in persistence) makes the prepared context stale.
-    conv_mark: (usize, usize, usize, usize),
+    conv_mark: ConversationMark,
     /// The prepared chat's five tensors (user turn + open assistant fence included).
     chat: ConversationState,
     cache: LfmCache,
@@ -1022,6 +1096,14 @@ struct PreparedTurn {
     tail_emb: Tensor,
 }
 
+struct TurnSetup<'p> {
+    chat: ChatState<'p>,
+    cache: LfmCache,
+    cursor: PrefillCursor,
+    input: Tensor,
+    continued: bool,
+}
+
 /// FNV-1a over the utterance PCM bits + rate + length — the identity check that
 /// lets a committed utterance consume the speculative prefill built for it.
 fn utterance_fingerprint(utt: &Utterance) -> u64 {
@@ -1036,27 +1118,10 @@ fn utterance_fingerprint(utt: &Utterance) -> u64 {
     h
 }
 
-/// Cheap staleness mark for a conversation: the dims of the five persisted
-/// tensors that grow with every appended turn.
-fn conv_mark(conv: &Option<ConversationState>) -> (usize, usize, usize, usize) {
-    match conv {
-        None => (0, 0, 0, 0),
-        Some(c) => (
-            c.text.dim(1).unwrap_or(usize::MAX),
-            c.modality_flag.dim(1).unwrap_or(usize::MAX),
-            c.audio_out.dim(1).unwrap_or(usize::MAX),
-            c.audio_in_lens.dim(0).unwrap_or(usize::MAX),
-        ),
-    }
-}
-
 /// The shared front half of [`Lfm2VoiceEngine::respond`] and `prepare`: build the
 /// turn context (conversation + the new spoken user turn + the open assistant
-/// fence) and select the backbone cache. Returns the transient chat, the cache to
-/// generate through, the turn-start cursor, the suffix embeddings still to be
-/// forwarded, and whether the PRIOR session cache was continued (vs a fresh cache
-/// built here).
-#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+/// fence) and select the backbone cache.
+#[allow(clippy::too_many_arguments)]
 fn setup_turn<'p>(
     proc: &'p LFM2AudioProcessor,
     model: &LFM2AudioModel,
@@ -1066,7 +1131,7 @@ fn setup_turn<'p>(
     prior: &Option<ConversationState>,
     session_cache: Option<(LfmCache, PrefillCursor)>,
     utt: &Utterance,
-) -> Result<(ChatState<'p>, LfmCache, PrefillCursor, Tensor, bool), String> {
+) -> Result<TurnSetup<'p>, String> {
     let s = |e: candle_core::Error| e.to_string();
     let wave = Tensor::from_vec(utt.samples.clone(), (1, utt.samples.len()), device).map_err(s)?;
 
@@ -1081,16 +1146,7 @@ fn setup_turn<'p>(
             c.end_turn().map_err(s)?;
             c
         }
-        Some(conv) => ChatState::from_parts(
-            proc,
-            codebooks,
-            conv.text.clone(),
-            conv.audio_in.clone(),
-            conv.audio_in_lens.clone(),
-            conv.audio_out.clone(),
-            conv.modality_flag.clone(),
-        )
-        .map_err(s)?,
+        Some(conv) => conv.to_chat(proc, codebooks).map_err(s)?,
     };
     chat.new_turn("user").map_err(s)?;
     chat.add_audio(&wave, utt.rate).map_err(s)?; // CONTINUOUS audio-in (mel → Conformer)
@@ -1118,7 +1174,13 @@ fn setup_turn<'p>(
         Some(c) => c,
         None => model.make_cache(in_emb.dtype(), device).map_err(s)?,
     };
-    Ok((chat, cache, cursor, in_emb, continued))
+    Ok(TurnSetup {
+        chat,
+        cache,
+        cursor,
+        input: in_emb,
+        continued,
+    })
 }
 
 impl Lfm2VoiceEngine {
@@ -1184,7 +1246,7 @@ impl Lfm2VoiceEngine {
         let prior = self.conv.clone();
         let taken = self.session_cache.take();
         let prior_cursor = taken.as_ref().map(|(_, c)| *c);
-        let (chat, mut cache, cursor, in_emb, continued) = setup_turn(
+        let setup = setup_turn(
             &self.proc,
             &self.model,
             &self.device,
@@ -1194,26 +1256,27 @@ impl Lfm2VoiceEngine {
             taken,
             utt,
         )?;
+        let TurnSetup {
+            chat,
+            mut cache,
+            cursor,
+            input,
+            continued,
+        } = setup;
         let snapshot = cache.snapshot().map_err(s)?;
-        let n = in_emb.dim(1).map_err(s)?;
+        let n = input.dim(1).map_err(s)?;
         let mut index_pos = cursor.positions;
         let tail_emb = if n > 1 {
-            let head = in_emb.narrow(1, 0, n - 1).map_err(s)?;
+            let head = input.narrow(1, 0, n - 1).map_err(s)?;
             self.model
                 .forward_embeds(&head, index_pos, &mut cache)
                 .map_err(s)?;
             index_pos += n - 1;
-            in_emb.narrow(1, n - 1, 1).map_err(s)?
+            input.narrow(1, n - 1, 1).map_err(s)?
         } else {
-            in_emb
+            input
         };
-        let chat_parts = ConversationState {
-            text: chat.text.clone(),
-            audio_in: chat.audio_in.clone(),
-            audio_in_lens: chat.audio_in_lens.clone(),
-            audio_out: chat.audio_out.clone(),
-            modality_flag: chat.modality_flag.clone(),
-        };
+        let chat_parts = ConversationState::from_chat(&chat);
         drop(chat);
         crate::vtrace!(
             "engine: speculative prefill ready in {:.0}ms ({} suffix positions pre-forwarded)",
@@ -1222,7 +1285,7 @@ impl Lfm2VoiceEngine {
         );
         self.pending = Some(PreparedTurn {
             fingerprint: utterance_fingerprint(utt),
-            conv_mark: conv_mark(&prior),
+            conv_mark: ConversationMark::from_optional(&prior),
             chat: chat_parts,
             cache,
             snapshot,
@@ -1330,6 +1393,11 @@ impl VoiceEngine for Lfm2VoiceEngine {
         emit: &mut dyn FnMut(VoiceEvent),
     ) -> Result<bool, String> {
         let s = |e: candle_core::Error| e.to_string();
+        // Stage clock for #141 (turn-1 latency): respond entry → prefill done →
+        // first token → first audio frame, logged per turn under LIQUID_VOICE_TRACE.
+        // Attributes the turn-1 penalty to a stage (Metal first-generate warmup is
+        // the prime suspect: first token late, not decode late).
+        let respond_entry = std::time::Instant::now();
 
         // STREAMING decode is the Mimi codec — required, never optional. Mimi is the only
         // backend with a true `decode_step` (it carries codec state ACROSS frames for gapless
@@ -1364,7 +1432,8 @@ impl VoiceEngine for Lfm2VoiceEngine {
         // the cache); anything else → roll it back and take the normal path.
         let pending = self.pending.take();
         let use_pending = pending.as_ref().is_some_and(|p| {
-            p.fingerprint == utterance_fingerprint(utt) && p.conv_mark == conv_mark(&prior)
+            p.fingerprint == utterance_fingerprint(utt)
+                && p.conv_mark == ConversationMark::from_optional(&prior)
         });
         let (mut chat, mut cache, mut cursor, in_emb, mut index_pos) = if use_pending {
             let p = pending.expect("matched above");
@@ -1373,16 +1442,7 @@ impl VoiceEngine for Lfm2VoiceEngine {
                 "engine: consuming speculative prefill ({} positions pre-forwarded)",
                 p.index_pos - p.cursor.positions
             );
-            let chat = ChatState::from_parts(
-                &self.proc,
-                self.codebooks,
-                p.chat.text,
-                p.chat.audio_in,
-                p.chat.audio_in_lens,
-                p.chat.audio_out,
-                p.chat.modality_flag,
-            )
-            .map_err(s)?;
+            let chat = p.chat.to_chat(&self.proc, self.codebooks).map_err(s)?;
             (chat, p.cache, p.cursor, p.tail_emb, p.index_pos)
         } else {
             if let Some(p) = pending {
@@ -1393,7 +1453,7 @@ impl VoiceEngine for Lfm2VoiceEngine {
             // `take()` means any error path below leaves `session_cache = None` — the
             // next turn falls back to a full re-prefill from `conv` (source of truth).
             let taken = self.session_cache.take();
-            let (chat, cache, cursor, in_emb, _continued) = setup_turn(
+            let setup = setup_turn(
                 &self.proc,
                 &self.model,
                 &self.device,
@@ -1403,6 +1463,13 @@ impl VoiceEngine for Lfm2VoiceEngine {
                 taken,
                 utt,
             )?;
+            let TurnSetup {
+                chat,
+                cache,
+                cursor,
+                input: in_emb,
+                continued: _continued,
+            } = setup;
             let index_pos = cursor.positions;
             (chat, cache, cursor, in_emb, index_pos)
         };
@@ -1455,11 +1522,20 @@ impl VoiceEngine for Lfm2VoiceEngine {
             }
         }
         let turn_started = std::time::Instant::now();
+        crate::vtrace!(
+            "engine: prefill done in {:.0}ms (respond entry → generation start)",
+            respond_entry.elapsed().as_secs_f64() * 1e3
+        );
+        // First-token / first-audio-frame stage marks (set once inside the loop).
+        let (mut first_token_ms, mut first_audio_ms): (Option<f64>, Option<f64>) = (None, None);
 
         self.model
             .generate_with_cache(&mut cache, &mut index_pos, in_emb, &self.params, cancel, |tok| {
                 if cb_err.is_some() {
                     return;
+                }
+                if first_token_ms.is_none() {
+                    first_token_ms = Some(turn_started.elapsed().as_secs_f64() * 1e3);
                 }
                 match tok {
                     GenToken::Text(id) => {
@@ -1471,6 +1547,9 @@ impl VoiceEngine for Lfm2VoiceEngine {
                         }
                     }
                     GenToken::Audio(frame) => {
+                        if first_audio_ms.is_none() {
+                            first_audio_ms = Some(turn_started.elapsed().as_secs_f64() * 1e3);
+                        }
                         // Collect EVERY frame (incl. EOAudio) for `append` BEFORE the streaming
                         // skip — append needs the full audio_out; only PCM playback drops it.
                         modality_out.push(LFMModality::AudioOut as i64);
@@ -1565,15 +1644,16 @@ impl VoiceEngine for Lfm2VoiceEngine {
         }
         chat.end_turn().map_err(s)?;
 
-        let saved = ConversationState {
-            text: chat.text.clone(),
-            audio_in: chat.audio_in.clone(),
-            audio_in_lens: chat.audio_in_lens.clone(),
-            audio_out: chat.audio_out.clone(),
-            modality_flag: chat.modality_flag.clone(),
-        };
+        let saved = ConversationState::from_chat(&chat);
         drop(chat); // end the `&self.proc` borrow before writing `self.conv`.
         self.conv = Some(saved);
+        crate::vtrace!(
+            "engine: stage marks — prefill {:.0}ms, first-token {}ms, first-audio-frame {}ms \
+             (first-token/first-audio from generation start; #141 turn-1 attribution)",
+            turn_started.duration_since(respond_entry).as_secs_f64() * 1e3,
+            first_token_ms.map_or("-".into(), |m| format!("{m:.0}")),
+            first_audio_ms.map_or("-".into(), |m| format!("{m:.0}")),
+        );
         crate::vtrace!(
             "engine: turn-end in {:.2}s — generated {} text + {} audio frames, \
              completed {completed}, cache {} (cursor -> {} positions), vault {}",
@@ -1791,14 +1871,48 @@ impl StreamingPcmResampler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::conformer::processor::{FilterbankFeatures, MelConfig};
+    use std::collections::HashMap;
     use std::sync::{atomic::AtomicUsize, mpsc, Mutex};
     use std::time::Duration;
+    use tokenizers::models::wordlevel::WordLevel;
 
     fn utt(n: usize) -> Utterance {
         Utterance {
             samples: vec![0.0; n],
             rate: 16_000,
         }
+    }
+
+    fn test_processor() -> LFM2AudioProcessor {
+        let dev = Device::Cpu;
+        let mut vocab = HashMap::new();
+        vocab.insert("<unk>".to_string(), 0);
+        vocab.insert("<|startoftext|>".to_string(), 1);
+        let tokenizer = tokenizers::Tokenizer::new(
+            WordLevel::builder()
+                .vocab(vocab)
+                .unk_token("<unk>".to_string())
+                .build()
+                .unwrap(),
+        );
+        let audio = FilterbankFeatures::new(
+            MelConfig {
+                sample_rate: 16_000,
+                n_window_size: 400,
+                n_window_stride: 160,
+                n_fft: 512,
+                nfilt: 8,
+                preemph: 0.97,
+                log_zero_guard_value: 2f64.powi(-24),
+                mag_power: 2.0,
+                pad_to: 16,
+                exact_pad: false,
+            },
+            &dev,
+        )
+        .unwrap();
+        LFM2AudioProcessor::new(tokenizer, audio, None, None, dev)
     }
 
     /// Drain events until a terminal one (TurnComplete / Interrupted / Error), bounded by
@@ -2384,6 +2498,44 @@ mod tests {
         drop(handle);
     }
 
+    #[test]
+    fn shutdown_skips_queued_prepare() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let pipe = RealtimePipeline::spawn(RecordingEngine::blocking(
+            log.clone(),
+            entered_tx,
+            release_rx,
+        ))
+        .expect("spawn");
+        let handle = pipe.handle().expect("handle");
+
+        assert!(pipe.submit(utt(1)));
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("turn 1 started");
+        assert!(handle.prepare(utt(7)));
+
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            drop(pipe);
+            let _ = done_tx.send(());
+        });
+        release_tx.send(()).unwrap();
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("pipeline drop deadlocked with queued prepare");
+        drop(handle);
+
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            log.lock().unwrap().clone(),
+            vec!["respond:1".to_string()],
+            "shutdown must not run queued speculative prepare"
+        );
+    }
+
     /// Same contract for the frame pipeline (identical shutdown structure).
     #[test]
     fn frame_pipeline_drop_with_live_handle_joins_promptly() {
@@ -2581,6 +2733,37 @@ mod tests {
             round.text.flatten_all().unwrap().to_vec1::<i64>().unwrap(),
             vec![1, 2, 3]
         );
+    }
+
+    #[test]
+    fn conversation_state_round_trips_chat_state_dimensions_and_mark() {
+        let proc = test_processor();
+        let dev = proc.device();
+        let mut chat = ChatState::new(&proc, 8).unwrap();
+        let wave = Tensor::zeros((1, 320), DType::F32, dev).unwrap();
+        chat.new_turn("user").unwrap();
+        chat.add_audio(&wave, 16_000).unwrap();
+        chat.end_turn().unwrap();
+        chat.new_turn("assistant").unwrap();
+        let text = Tensor::from_vec(vec![0i64], (1, 1), dev).unwrap();
+        let audio = Tensor::zeros((8, 1), DType::I64, dev)
+            .unwrap()
+            .narrow(1, 0, 0)
+            .unwrap();
+        let modality = Tensor::from_vec(vec![LFMModality::Text as i64], (1, 1), dev).unwrap();
+        chat.append(&text, &audio, &modality).unwrap();
+        chat.end_turn().unwrap();
+
+        let saved = ConversationState::from_chat(&chat);
+        let restored = saved.to_chat(&proc, 8).unwrap();
+        let round = ConversationState::from_chat(&restored);
+
+        assert_eq!(saved.mark(), round.mark());
+        assert_eq!(saved.text.dims(), round.text.dims());
+        assert_eq!(saved.audio_in.dims(), round.audio_in.dims());
+        assert_eq!(saved.audio_in_lens.dims(), round.audio_in_lens.dims());
+        assert_eq!(saved.audio_out.dims(), round.audio_out.dims());
+        assert_eq!(saved.modality_flag.dims(), round.modality_flag.dims());
     }
 
     #[test]
