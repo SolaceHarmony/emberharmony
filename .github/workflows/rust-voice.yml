@@ -70,3 +70,12 @@ jobs:
       - name: Compile-check Accelerate feature (macOS)
         if: runner.os == 'macOS'
         run: cargo build --lib --features accelerate
+
+      # macOS only: the DEPLOYED numerics are bf16 Metal — the desktop app builds
+      # liquid-audio with `features=["metal"]`, and the flashfftconv Metal kernels
+      # (ShortConv's conv path — every backbone token) previously compiled in CI but
+      # were never EXECUTED. GitHub's arm64 macOS runners have a real Metal device;
+      # run the lib tests on it so the shipped code path is tested, not just built.
+      - name: Test (lib, Metal — the shipped code path)
+        if: runner.os == 'macOS'
+        run: cargo test --lib --features metal -- --nocapture
