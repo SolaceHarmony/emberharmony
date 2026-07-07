@@ -127,6 +127,12 @@ pub fn bf16_gemm_into(a: &[u16], b: &[u16], c: &mut [f32], m: usize, n: usize, k
     assert_eq!(a.len(), m * k, "bf16_gemm_into: a.len() != m*k");
     assert_eq!(b.len(), k * n, "bf16_gemm_into: b.len() != k*n");
     assert_eq!(c.len(), m * n, "bf16_gemm_into: c.len() != m*n");
+    // Fail loudly (panic) rather than SIGILL if a caller reaches this without FEAT_BF16. Not a
+    // fallback — the precondition simply must hold; the live path checks bf16_gemm_available().
+    assert!(
+        neon_features().bf16,
+        "bf16_gemm_into requires FEAT_BF16 (check bf16_gemm_available() first)"
+    );
     if m == 0 || n == 0 || k == 0 {
         return;
     }
@@ -229,6 +235,8 @@ pub fn fft_radix2(data: &mut [f32], inverse: bool) {
         "fft_radix2: n must be a power of two, got data.len()={}",
         data.len()
     );
+    // Fail loudly rather than SIGILL: the FCMLA butterfly kernel needs FEAT_FCMA.
+    assert!(neon_features().fcma, "fft_radix2 requires FEAT_FCMA");
     // SAFETY: n is an asserted power of two and data holds 2*n f32; the kernel stays in bounds.
     unsafe { lfm_fft_radix2_f32(data.as_mut_ptr(), n as i32, inverse as i32) };
 }
@@ -241,7 +249,9 @@ pub fn s8_gemm(a: &[i8], b: &[i8], c: &mut [i32], m: usize, n: usize, k: usize) 
     assert_eq!(a.len(), m * k, "s8_gemm: a.len() != m*k");
     assert_eq!(b.len(), k * n, "s8_gemm: b.len() != k*n");
     assert_eq!(c.len(), m * n, "s8_gemm: c.len() != m*n");
-    // SAFETY: slices sized M*K / K*N / M*N; FEAT_I8MM is the caller's precondition.
+    // Fail loudly rather than SIGILL: SMMLA needs FEAT_I8MM (absent on e.g. M1).
+    assert!(neon_features().i8mm, "s8_gemm requires FEAT_I8MM");
+    // SAFETY: slices sized M*K / K*N / M*N; FEAT_I8MM asserted above.
     unsafe {
         lfm_s8_gemm_s32(a.as_ptr(), b.as_ptr(), c.as_mut_ptr(), m as i32, n as i32, k as i32)
     };
@@ -268,7 +278,9 @@ pub fn depthwise_causal_conv1d_bf16(
     assert_eq!(w.len(), d * k, "conv1d: w.len() != D*K");
     assert_eq!(bias.len(), d, "conv1d: bias.len() != D");
     assert_eq!(out.len(), bn * d * lout, "conv1d: out.len() != B*D*Lout");
-    // SAFETY: pointers sized per the asserts; FEAT_BF16 is the caller's precondition.
+    // Fail loudly rather than SIGILL: the bf16/BFCVT kernel needs FEAT_BF16.
+    assert!(neon_features().bf16, "depthwise_causal_conv1d_bf16 requires FEAT_BF16");
+    // SAFETY: pointers sized per the asserts; FEAT_BF16 asserted above.
     unsafe {
         lfm_depthwise_causal_conv1d_bf16(
             u.as_ptr(),
