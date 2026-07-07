@@ -385,10 +385,10 @@ static void fft_impl(float *data, int n, int inverse) {
     }
 }
 
+// Radix-2 only: `n` must be a power of two (the Rust wrapper asserts this before calling).
+// n<=1 is the trivial identity base case.
 extern "C" void lfm_fft_radix2_f32(float *data, int n, int inverse) {
-    // Radix-2 requires a power-of-two length; a non-pow2 n would index past the buffer in the
-    // butterfly stages. Bail rather than corrupt memory (the Rust wrapper guards too).
-    if (n <= 1 || (n & (n - 1)) != 0) return;
+    if (n <= 1) return;
     fft_impl(data, n, inverse);
 }
 

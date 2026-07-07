@@ -55,15 +55,26 @@ opcodes are confined to functions carrying a per-compiler target attribute:
   `target("arch=…")`, so it keeps a low base march (`armv8.2-a`) and each opcode stays
   isolated to its function — nothing leaks into an ungated function.
 
-Every call is runtime-gated on `neon_zoo::NeonFeatures` (macOS `sysctl hw.optional.arm.FEAT_*`
-+ Linux `getauxval` HWCAP/HWCAP2 — the latter also fixes the old bf16 probe's Linux `false`).
-A binary stays portable: a feature-specific proc is never called on a core that lacks it.
+## No fallbacks
+
+The zoo is an aarch64 kernel library, not a portable one. Every procedure is
+`#[cfg(all(target_arch = "aarch64", has_neon_zoo))]` and calls straight into its NEON kernel —
+there is deliberately **no scalar fallback**. A silent scalar path would let a caller believe it
+is on the NEON happy path when it isn't, and would mask a missing feature instead of surfacing
+it. Off the hardware path the procedures simply do not exist; the caller uses a different code
+path (the live bf16 matmul does exactly this — `Bf16Gemm::cpu_fwd` checks availability and, when
+absent, returns `Ok(None)` so candle takes its own f32 path). Feature-gated procedures
+(FFT→FCMA, `s8_gemm`→I8MM, `conv1d`→BF16) document their precondition; verify
+`neon_zoo::NeonFeatures` (macOS `sysctl hw.optional.arm.FEAT_*` + Linux `getauxval` HWCAP/HWCAP2
+— the latter also fixes the old bf16 probe's Linux `false`) before calling.
 
 ## Verification
 
-* **Rust** (`src/neon_zoo.rs`, CI `cargo test --lib` on macos-arm64): `gemm_v2_matches_f32_bf16_ref`
-  (ragged + large-K), `rsqrt_matches_scalar`, `dd_sum_beats_naive`. Each self-skips when its
-  feature is absent.
+* **Rust** (`src/neon_zoo.rs`): the `#[cfg(test)] mod tests` is itself aarch64+zoo-gated, so it
+  runs on the macOS arm64 CI leg (`rust-voice.yml`) where the hardware executes the kernels — on
+  x86 CI the crate still builds, there is just nothing here to run. Feature-specific tests
+  (`gemm_v2`, `conv1d`, `s8_gemm`, `fft`) skip when the runner's CPU lacks the extension (e.g. an
+  M1 runner has FCMA but not BF16/I8MM); the baseline ones (`rsqrt`, `dd_sum`) always run.
 * **Standalone qemu harness** (development): cross-compile with `aarch64-linux-gnu-g++
   -march=armv8.2-a` and run under `qemu-aarch64 -cpu max` — 18 checks across all six groups
   vs scalar / f64 references (GEMM, GEMV, SMMLA, reductions, TBL, conv1d, FFT forward +

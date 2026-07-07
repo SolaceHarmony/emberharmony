@@ -116,8 +116,9 @@ pub fn bf16_gemm_available() -> bool {
 /// `C(M,N) f32 = A(M,K) bf16 · B(K,N) bf16` (raw bf16 bits as `u16`), row-major, f32
 /// accumulate. Dispatches `M==1 → BFDOT GEMV`, else the 8×8 BFMMLA micro-kernel tiled over
 /// M-row blocks with rayon (reusing the global pool sized by [`crate::threads`]). B is shared
-/// across blocks. Self-gates on FEAT_BF16 (falling back to a scalar f32-accumulate matmul when
-/// absent), so it is safe to call on any aarch64 CPU. Slices must be sized `M*K`, `K*N`, `M*N`.
+/// across blocks. **Precondition:** the running CPU has FEAT_BF16 — verify [`bf16_gemm_available`]
+/// (or [`neon_features`]) first; the BFMMLA/BFDOT kernels `SIGILL` without it. Slices must be
+/// sized `M*K`, `K*N`, `M*N`.
 #[cfg(all(target_arch = "aarch64", has_neon_zoo))]
 pub fn bf16_gemm_into(a: &[u16], b: &[u16], c: &mut [f32], m: usize, n: usize, k: usize) {
     use rayon::prelude::*;
@@ -127,22 +128,6 @@ pub fn bf16_gemm_into(a: &[u16], b: &[u16], c: &mut [f32], m: usize, n: usize, k
     assert_eq!(b.len(), k * n, "bf16_gemm_into: b.len() != k*n");
     assert_eq!(c.len(), m * n, "bf16_gemm_into: c.len() != m*n");
     if m == 0 || n == 0 || k == 0 {
-        return;
-    }
-    // The BFMMLA/BFDOT kernels SIGILL without FEAT_BF16; gate the FFI so this public wrapper is
-    // safe even if a caller skips `bf16_gemm_available()`. Scalar fallback keeps it correct.
-    if !neon_features().bf16 {
-        use half::bf16;
-        for i in 0..m {
-            for j in 0..n {
-                let mut s = 0f32;
-                for kk in 0..k {
-                    s += bf16::from_bits(a[i * k + kk]).to_f32()
-                        * bf16::from_bits(b[kk * n + j]).to_f32();
-                }
-                c[i * n + j] = s;
-            }
-        }
         return;
     }
     if m == 1 {
@@ -172,202 +157,100 @@ pub fn bf16_gemm_into(a: &[u16], b: &[u16], c: &mut [f32], m: usize, n: usize, k
         });
 }
 
-/// GPU-style fast reciprocal-sqrt (`1/√x`) over a slice (FRSQRTE + 2 Newton steps), or the
-/// scalar fallback off-aarch64. Directly usable for RMSNorm. `out` must match `x` in length.
+// The remaining zoo procedures are aarch64 + zoo only — there is no scalar fallback. Off the
+// hardware happy path a caller should use a different code path entirely, not a silent scalar
+// substitute that would mask a missing feature. Feature-specific ops (FFT→FCMA, s8_gemm→I8MM,
+// conv1d→BF16) document their precondition; verify [`neon_features`] before calling.
+
+/// GPU-style fast reciprocal-sqrt (`1/√x`) over a slice (FRSQRTE + 2 Newton steps). Directly
+/// usable for RMSNorm. `out` must match `x` in length.
+#[cfg(all(target_arch = "aarch64", has_neon_zoo))]
 pub fn rsqrt(x: &[f32], out: &mut [f32]) {
     assert_eq!(x.len(), out.len());
-    #[cfg(all(target_arch = "aarch64", has_neon_zoo))]
     // SAFETY: both slices are `n` f32; the kernel reads/writes exactly those bounds.
-    unsafe {
-        lfm_rsqrt_f32(x.as_ptr(), out.as_mut_ptr(), x.len() as i32);
-        return;
-    }
-    #[allow(unreachable_code)]
-    for (o, &v) in out.iter_mut().zip(x) {
-        *o = 1.0 / v.sqrt();
-    }
+    unsafe { lfm_rsqrt_f32(x.as_ptr(), out.as_mut_ptr(), x.len() as i32) };
 }
 
-/// Deterministic high-accuracy sum via double-double accumulation (FMA error-free
-/// transforms), or the scalar fallback off-aarch64.
-pub fn dd_sum(x: &[f32]) -> f32 {
-    #[cfg(all(target_arch = "aarch64", has_neon_zoo))]
-    // SAFETY: `x` is `n` contiguous f32.
-    return unsafe { lfm_dd_sum_f32(x.as_ptr(), x.len() as i32) };
-    // Fallback: compensated (Kahan) sum, so the high-accuracy contract holds off-aarch64 too.
-    #[allow(unreachable_code)]
-    {
-        let (mut sum, mut c) = (0f32, 0f32);
-        for &v in x {
-            let y = v - c;
-            let t = sum + y;
-            c = (t - sum) - y;
-            sum = t;
-        }
-        sum
-    }
-}
-
-/// Deterministic high-accuracy dot product (double-double accumulation), scalar fallback off-aarch64.
-pub fn dd_dot(a: &[f32], b: &[f32]) -> f32 {
-    assert_eq!(a.len(), b.len());
-    #[cfg(all(target_arch = "aarch64", has_neon_zoo))]
-    // SAFETY: `a`/`b` are both `n` contiguous f32.
-    return unsafe { lfm_dd_dot_f32(a.as_ptr(), b.as_ptr(), a.len() as i32) };
-    // Fallback: compensated (Kahan) dot, matching the high-accuracy contract off-aarch64.
-    #[allow(unreachable_code)]
-    {
-        let (mut sum, mut c) = (0f32, 0f32);
-        for (x, y) in a.iter().zip(b) {
-            let p = x * y;
-            let yy = p - c;
-            let t = sum + yy;
-            c = (t - sum) - yy;
-            sum = t;
-        }
-        sum
-    }
-}
-
-/// Horizontal sum (ADDV/FADDP), the NEON analog of a Metal threadgroup reduce. Scalar off-aarch64.
-pub fn reduce_sum(x: &[f32]) -> f32 {
-    #[cfg(all(target_arch = "aarch64", has_neon_zoo))]
-    // SAFETY: `x` is `n` contiguous f32.
-    return unsafe { lfm_reduce_sum_f32(x.as_ptr(), x.len() as i32) };
-    #[allow(unreachable_code)]
-    x.iter().sum()
-}
-
-/// Horizontal max (FMAXV/FMAXP). Returns `-inf` for an empty slice. Scalar off-aarch64.
-pub fn reduce_max(x: &[f32]) -> f32 {
-    #[cfg(all(target_arch = "aarch64", has_neon_zoo))]
-    // SAFETY: `x` is `n` contiguous f32.
-    return unsafe { lfm_reduce_max_f32(x.as_ptr(), x.len() as i32) };
-    #[allow(unreachable_code)]
-    x.iter().copied().fold(f32::NEG_INFINITY, f32::max)
-}
-
-/// GPU-style fast reciprocal (`1/x`) over a slice (FRECPE + 2 Newton steps). Scalar off-aarch64.
+/// GPU-style fast reciprocal (`1/x`) over a slice (FRECPE + 2 Newton steps).
+#[cfg(all(target_arch = "aarch64", has_neon_zoo))]
 pub fn recip(x: &[f32], out: &mut [f32]) {
     assert_eq!(x.len(), out.len());
-    #[cfg(all(target_arch = "aarch64", has_neon_zoo))]
     // SAFETY: both slices are `n` f32.
-    unsafe {
-        lfm_recip_f32(x.as_ptr(), out.as_mut_ptr(), x.len() as i32);
-        return;
-    }
-    #[allow(unreachable_code)]
-    for (o, &v) in out.iter_mut().zip(x) {
-        *o = 1.0 / v;
-    }
+    unsafe { lfm_recip_f32(x.as_ptr(), out.as_mut_ptr(), x.len() as i32) };
+}
+
+/// Deterministic high-accuracy sum via double-double accumulation (FMA error-free transforms).
+#[cfg(all(target_arch = "aarch64", has_neon_zoo))]
+pub fn dd_sum(x: &[f32]) -> f32 {
+    // SAFETY: `x` is `n` contiguous f32.
+    unsafe { lfm_dd_sum_f32(x.as_ptr(), x.len() as i32) }
+}
+
+/// Deterministic high-accuracy dot product (double-double accumulation).
+#[cfg(all(target_arch = "aarch64", has_neon_zoo))]
+pub fn dd_dot(a: &[f32], b: &[f32]) -> f32 {
+    assert_eq!(a.len(), b.len());
+    // SAFETY: `a`/`b` are both `n` contiguous f32.
+    unsafe { lfm_dd_dot_f32(a.as_ptr(), b.as_ptr(), a.len() as i32) }
+}
+
+/// Horizontal sum (ADDV/FADDP), the NEON analog of a Metal threadgroup reduce.
+#[cfg(all(target_arch = "aarch64", has_neon_zoo))]
+pub fn reduce_sum(x: &[f32]) -> f32 {
+    // SAFETY: `x` is `n` contiguous f32.
+    unsafe { lfm_reduce_sum_f32(x.as_ptr(), x.len() as i32) }
+}
+
+/// Horizontal max (FMAXV/FMAXP). Returns `-inf` for an empty slice.
+#[cfg(all(target_arch = "aarch64", has_neon_zoo))]
+pub fn reduce_max(x: &[f32]) -> f32 {
+    // SAFETY: `x` is `n` contiguous f32.
+    unsafe { lfm_reduce_max_f32(x.as_ptr(), x.len() as i32) }
 }
 
 /// In-register byte permute over a 16-entry table (TBL/TBX) — the NEON analog of Metal
-/// `simd_shuffle`. `out[i] = table16[idx[i]]` for `idx<16`, else 0. Scalar off-aarch64.
+/// `simd_shuffle`. `out[i] = table16[idx[i]]` for `idx<16`, else 0.
+#[cfg(all(target_arch = "aarch64", has_neon_zoo))]
 pub fn permute_u8(table16: &[u8; 16], idx: &[u8], out: &mut [u8]) {
     assert_eq!(idx.len(), out.len());
-    #[cfg(all(target_arch = "aarch64", has_neon_zoo))]
     // SAFETY: table is 16 bytes; idx/out are both `n` bytes.
-    unsafe {
-        lfm_permute_u8(table16.as_ptr(), idx.as_ptr(), out.as_mut_ptr(), idx.len() as i32);
-        return;
-    }
-    #[allow(unreachable_code)]
-    for (o, &i) in out.iter_mut().zip(idx) {
-        *o = if (i as usize) < 16 { table16[i as usize] } else { 0 };
-    }
+    unsafe { lfm_permute_u8(table16.as_ptr(), idx.as_ptr(), out.as_mut_ptr(), idx.len() as i32) };
 }
 
-/// In-place radix-2 Cooley-Tukey FFT on interleaved `[re,im]` f32 (complex butterfly via
-/// FCMLA on aarch64). `data.len()` must be even and `n = data.len()/2` a power of two;
-/// `inverse` scales by `1/n`. Non-power-of-two `n` is a no-op (radix-2 would index out of
-/// bounds). Falls back to a scalar radix-2 off-aarch64 / without FEAT_FCMA.
+/// In-place radix-2 Cooley-Tukey FFT on interleaved `[re,im]` f32 (complex butterfly via FCMLA).
+/// `data.len()` must be even and `n = data.len()/2` a power of two — asserted, since radix-2 has
+/// no meaning otherwise (and would index out of bounds). `inverse` scales by `1/n`.
+/// **Precondition:** FEAT_FCMA (check [`neon_features`]).
+#[cfg(all(target_arch = "aarch64", has_neon_zoo))]
 pub fn fft_radix2(data: &mut [f32], inverse: bool) {
     let n = data.len() / 2;
-    // Radix-2 requires a power-of-two n; refuse other sizes rather than read/write OOB.
-    if data.len() % 2 != 0 || n <= 1 || !n.is_power_of_two() {
-        return;
-    }
-    #[cfg(all(target_arch = "aarch64", has_neon_zoo))]
-    if neon_features().fcma {
-        // SAFETY: n is a checked power of two and data holds 2*n f32; the kernel stays in bounds.
-        unsafe { lfm_fft_radix2_f32(data.as_mut_ptr(), n as i32, inverse as i32) };
-        return;
-    }
-    // Scalar fallback (same math as the FCMLA kernel).
-    let mut j = 0usize;
-    for i in 1..n {
-        let mut bit = n >> 1;
-        while j & bit != 0 {
-            j ^= bit;
-            bit >>= 1;
-        }
-        j ^= bit;
-        if i < j {
-            data.swap(2 * i, 2 * j);
-            data.swap(2 * i + 1, 2 * j + 1);
-        }
-    }
-    let sign = if inverse { 1.0f32 } else { -1.0f32 };
-    let mut len = 2;
-    while len <= n {
-        let ang = sign * 2.0 * std::f32::consts::PI / (len as f32);
-        let mut i = 0;
-        while i < n {
-            for k in 0..len / 2 {
-                let (wr, wi) = ((ang * k as f32).cos(), (ang * k as f32).sin());
-                let (a, b) = (i + k, i + k + len / 2);
-                let (xr, xi) = (data[2 * b], data[2 * b + 1]);
-                let (tr, ti) = (wr * xr - wi * xi, wr * xi + wi * xr);
-                let (ur, ui) = (data[2 * a], data[2 * a + 1]);
-                data[2 * a] = ur + tr;
-                data[2 * a + 1] = ui + ti;
-                data[2 * b] = ur - tr;
-                data[2 * b + 1] = ui - ti;
-            }
-            i += len;
-        }
-        len <<= 1;
-    }
-    if inverse {
-        let inv = 1.0f32 / n as f32;
-        for v in data.iter_mut() {
-            *v *= inv;
-        }
-    }
+    assert!(
+        data.len() % 2 == 0 && n >= 1 && n.is_power_of_two(),
+        "fft_radix2: n must be a power of two, got data.len()={}",
+        data.len()
+    );
+    // SAFETY: n is an asserted power of two and data holds 2*n f32; the kernel stays in bounds.
+    unsafe { lfm_fft_radix2_f32(data.as_mut_ptr(), n as i32, inverse as i32) };
 }
 
-/// int8 tensor-core GEMM `C(M,N) s32 = A(M,K) s8 · B(K,N) s8` via SMMLA. Requires
-/// [`NeonFeatures::i8mm`]; leaves `c` untouched when unavailable.
+/// int8 tensor-core GEMM `C(M,N) s32 = A(M,K) s8 · B(K,N) s8` via SMMLA. Slices sized `M*K`,
+/// `K*N`, `M*N`. **Precondition:** FEAT_I8MM (check [`neon_features`]).
+#[cfg(all(target_arch = "aarch64", has_neon_zoo))]
 pub fn s8_gemm(a: &[i8], b: &[i8], c: &mut [i32], m: usize, n: usize, k: usize) {
     // Real asserts: the kernel indexes m*k / k*n / m*n through raw pointers.
     assert_eq!(a.len(), m * k, "s8_gemm: a.len() != m*k");
     assert_eq!(b.len(), k * n, "s8_gemm: b.len() != k*n");
     assert_eq!(c.len(), m * n, "s8_gemm: c.len() != m*n");
-    #[cfg(all(target_arch = "aarch64", has_neon_zoo))]
-    if neon_features().i8mm {
-        // SAFETY: slices sized M*K / K*N / M*N; FEAT_I8MM verified.
-        unsafe {
-            lfm_s8_gemm_s32(a.as_ptr(), b.as_ptr(), c.as_mut_ptr(), m as i32, n as i32, k as i32);
-        }
-        return;
-    }
-    // Scalar fallback (off-aarch64 or no FEAT_I8MM) so callers get a correct result, not a no-op.
-    for i in 0..m {
-        for j in 0..n {
-            let mut sum = 0i32;
-            for kk in 0..k {
-                sum += a[i * k + kk] as i32 * b[kk * n + j] as i32;
-            }
-            c[i * n + j] = sum;
-        }
-    }
+    // SAFETY: slices sized M*K / K*N / M*N; FEAT_I8MM is the caller's precondition.
+    unsafe {
+        lfm_s8_gemm_s32(a.as_ptr(), b.as_ptr(), c.as_mut_ptr(), m as i32, n as i32, k as i32)
+    };
 }
 
 /// Depthwise causal conv1d with bf16 storage and f32 accumulate (single bf16 RNE store),
 /// mirroring the Metal `depthwise_causal_conv1d_bf16`. `u:[B,D,L]`, `w:[D,K]`, `bias:[D]`,
-/// `out:[B,D,Lout]` — all raw bf16 bits. Uses the NEON kernel when FEAT_BF16 is present,
-/// else an equivalent scalar (`half::bf16`) fallback — never SIGILLs on a non-bf16 core.
+/// `out:[B,D,Lout]` — all raw bf16 bits. **Precondition:** FEAT_BF16 (check [`neon_features`]).
+#[cfg(all(target_arch = "aarch64", has_neon_zoo))]
 #[allow(clippy::too_many_arguments)]
 pub fn depthwise_causal_conv1d_bf16(
     u: &[u16],
@@ -385,60 +268,40 @@ pub fn depthwise_causal_conv1d_bf16(
     assert_eq!(w.len(), d * k, "conv1d: w.len() != D*K");
     assert_eq!(bias.len(), d, "conv1d: bias.len() != D");
     assert_eq!(out.len(), bn * d * lout, "conv1d: out.len() != B*D*Lout");
-    #[cfg(all(target_arch = "aarch64", has_neon_zoo))]
-    if neon_features().bf16 {
-        // SAFETY: pointers sized per the asserts above; FEAT_BF16 verified here (the kernel
-        // uses BF16/BFCVT instructions and would SIGILL otherwise).
-        unsafe {
-            lfm_depthwise_causal_conv1d_bf16(
-                u.as_ptr(),
-                w.as_ptr(),
-                bias.as_ptr(),
-                out.as_mut_ptr(),
-                bn as i32,
-                d as i32,
-                l as i32,
-                k as i32,
-                lout as i32,
-            );
-        }
-        return;
-    }
-    // Scalar fallback: bf16 load → f32 accumulate → bf16 RNE store (same regime as the kernel).
-    use half::bf16;
-    for b in 0..bn {
-        for di in 0..d {
-            let u_off = (b * d + di) * l;
-            let o_off = (b * d + di) * lout;
-            let bias_f = bf16::from_bits(bias[di]).to_f32();
-            for t in 0..lout {
-                let mut acc = bias_f;
-                for j in 0..k {
-                    let idx = t as isize - (k as isize - 1) + j as isize;
-                    if idx >= 0 && (idx as usize) < l {
-                        acc += bf16::from_bits(u[u_off + idx as usize]).to_f32()
-                            * bf16::from_bits(w[di * k + j]).to_f32();
-                    }
-                }
-                out[o_off + t] = bf16::from_f32(acc).to_bits();
-            }
-        }
+    // SAFETY: pointers sized per the asserts; FEAT_BF16 is the caller's precondition.
+    unsafe {
+        lfm_depthwise_causal_conv1d_bf16(
+            u.as_ptr(),
+            w.as_ptr(),
+            bias.as_ptr(),
+            out.as_mut_ptr(),
+            bn as i32,
+            d as i32,
+            l as i32,
+            k as i32,
+            lout as i32,
+        );
     }
 }
 
+// The zoo procedures only exist on aarch64 with the kernel built in, so the tests do too —
+// they run on the macOS arm64 CI leg (rust-voice.yml), where the hardware actually executes
+// BFMMLA/FCMLA/SMMLA. On x86 CI the crate still builds; there is simply nothing here to run.
 #[cfg(test)]
+#[cfg(all(target_arch = "aarch64", has_neon_zoo))]
 mod tests {
     use super::*;
     use half::bf16;
 
+    /// Skip a feature-gated test when the running CPU lacks the extension — e.g. an M1 CI
+    /// runner has FCMA but not FEAT_BF16/I8MM. The baseline ops (rsqrt/recip/reduce/dd) always run.
     fn skip(feat: bool, name: &str) -> bool {
         if !feat {
-            eprintln!("{name}: feature/kernel unavailable on this target — skipping");
+            eprintln!("{name}: CPU feature unavailable on this runner — skipping");
         }
         !feat
     }
 
-    #[cfg(all(target_arch = "aarch64", has_neon_zoo))]
     #[test]
     fn gemm_v2_matches_f32_bf16_ref() {
         if skip(bf16_gemm_available(), "gemm_v2") {
@@ -472,10 +335,7 @@ mod tests {
 
     #[test]
     fn rsqrt_matches_scalar() {
-        if skip(neon_features().fp16 || !cfg!(target_arch = "aarch64"), "rsqrt") {
-            // rsqrt is baseline NEON (no special feature) on aarch64; the scalar fallback
-            // is always exercised off-aarch64. Only skip if the whole path is unavailable.
-        }
+        // FRSQRTE + 2 Newton steps is baseline NEON (no feature gate) — always available here.
         let x: Vec<f32> = (1..=64).map(|i| i as f32 * 0.5).collect();
         let mut out = vec![0f32; x.len()];
         rsqrt(&x, &mut out);
@@ -498,8 +358,11 @@ mod tests {
     }
 
     #[test]
-    fn fft_round_trips_and_ignores_non_pow2() {
-        // forward then inverse recovers the input (kernel on aarch64, scalar fallback elsewhere).
+    fn fft_round_trips() {
+        if skip(neon_features().fcma, "fft") {
+            return;
+        }
+        // forward then inverse (via the FCMLA butterfly kernel) recovers the input.
         let orig: Vec<f32> = (0..16).map(|i| ((i * 37 % 11) as f32 / 11.0) - 0.5).collect();
         let mut d = orig.clone();
         fft_radix2(&mut d, false);
@@ -507,14 +370,22 @@ mod tests {
         for (g, o) in d.iter().zip(&orig) {
             assert!((g - o).abs() < 1e-3, "round-trip drift g={g} o={o}");
         }
-        // non-power-of-two n (len=12 → n=6) must be a safe no-op, not an OOB.
+    }
+
+    #[test]
+    #[should_panic(expected = "power of two")]
+    fn fft_rejects_non_pow2() {
+        // n=6 (data.len()=12) is not a radix-2 size; the wrapper must reject it loudly rather
+        // than silently no-op or index out of bounds.
         let mut bad = vec![1.0f32; 12];
         fft_radix2(&mut bad, false);
-        assert!(bad.iter().all(|&v| v == 1.0), "non-pow2 FFT must not touch data");
     }
 
     #[test]
     fn s8_gemm_matches_scalar() {
+        if skip(neon_features().i8mm, "s8_gemm") {
+            return;
+        }
         let (m, k, n) = (6usize, 19usize, 5usize);
         let a: Vec<i8> = (0..m * k).map(|i| (i as i8 % 15) - 7).collect();
         let b: Vec<i8> = (0..k * n).map(|i| (i as i8 % 13) - 6).collect();
@@ -530,7 +401,9 @@ mod tests {
 
     #[test]
     fn conv1d_bf16_matches_scalar() {
-        use half::bf16;
+        if skip(neon_features().bf16, "conv1d") {
+            return;
+        }
         let (bn, d, l, k) = (2usize, 3usize, 12usize, 4usize);
         let mk = |i: usize| bf16::from_f32(((i * 7 % 17) as f32 / 17.0) - 0.5);
         let u: Vec<u16> = (0..bn * d * l).map(|i| mk(i).to_bits()).collect();

@@ -9,11 +9,8 @@ run-name: rust-voice ${{ github.ref_name }} @ ${{ github.sha }}
 # so the run still proves the cfg fallbacks compile and the portable tests pass.
 
 on:
-  push:
-    paths:
-      - "packages/desktop/src-tauri/crates/liquid-audio/**"
-      - "experiments/lfm2-audio-voice/candle-flashfftconv/**"
-      - ".github/workflows/rust-voice.yml"
+  # PR-only (plus manual): the bare `push:` trigger fired on every commit to any branch,
+  # duplicating the pull_request run. PRs into dev/main already gate the crate.
   pull_request:
     branches: [dev, main]
     paths:
