@@ -10,45 +10,18 @@
 
 use candle_core::{CpuStorage, CustomOp2, DType, Layout, Result, Shape, Tensor};
 
-#[cfg(all(target_arch = "aarch64", has_bf16_kernel))]
+// Only wired in as the fallback when the tightened zoo GEMM was not built (see cpu_fwd).
+#[cfg(all(target_arch = "aarch64", has_bf16_kernel, not(has_neon_zoo)))]
 extern "C" {
     /// `C(M,N) f32 = A(M,K) bf16 · B(K,N) bf16`, all row-major. bf16 crosses as raw u16.
     fn lfm_bf16_gemm_f32(a: *const u16, b: *const u16, c: *mut f32, m: i32, n: i32, k: i32);
 }
 
-/// Whether the running CPU has the Arm BFloat16 extension (FEAT_BF16). Cached.
-#[cfg(target_arch = "aarch64")]
+/// Whether the running CPU has the Arm BFloat16 extension (FEAT_BF16). Delegates to the
+/// shared, cached [`crate::neon_zoo::neon_features`] probe (macOS sysctl + Linux getauxval),
+/// so this now reports correctly on Linux aarch64 too.
 pub fn has_feat_bf16() -> bool {
-    use std::sync::OnceLock;
-    static F: OnceLock<bool> = OnceLock::new();
-    *F.get_or_init(|| {
-        #[cfg(target_os = "macos")]
-        {
-            let mut val: libc::c_int = 0;
-            let mut len = std::mem::size_of::<libc::c_int>();
-            // SAFETY: valid C string + OUT params; no input buffer.
-            let rc = unsafe {
-                libc::sysctlbyname(
-                    c"hw.optional.arm.FEAT_BF16".as_ptr(),
-                    &mut val as *mut libc::c_int as *mut libc::c_void,
-                    &mut len,
-                    std::ptr::null_mut(),
-                    0,
-                )
-            };
-            rc == 0 && val == 1
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            // Linux aarch64 would read HWCAP2_BF16 via getauxval; not wired yet.
-            false
-        }
-    })
-}
-
-#[cfg(not(target_arch = "aarch64"))]
-pub fn has_feat_bf16() -> bool {
-    false
+    crate::neon_zoo::neon_features().bf16
 }
 
 /// `true` when the NEON bf16 GEMM is both **built in** and **supported** by this CPU —
@@ -96,8 +69,21 @@ impl CustomOp2 for Bf16Gemm {
         };
         let a = &a[l1.start_offset()..l1.start_offset() + m * k];
         let b = &b[l2.start_offset()..l2.start_offset() + k * n];
+        #[allow(unused_mut)] // `c` is mutated only on the aarch64 kernel paths below
         let mut c = vec![0f32; m * n];
-        #[cfg(all(target_arch = "aarch64", has_bf16_kernel))]
+        // Preferred path: the tightened NEON "zoo" GEMM (8×8 BFMMLA multi-accumulator + rayon
+        // row-block dispatch, or a BFDOT GEMV when M==1). Same bf16-exact-product / f32-accumulate
+        // numerics as the reference kernel; only the summation order differs.
+        #[cfg(all(target_arch = "aarch64", has_neon_zoo))]
+        {
+            // half::bf16 is repr(transparent) over u16, so the bit-slice view is sound.
+            let ab = unsafe { std::slice::from_raw_parts(a.as_ptr() as *const u16, a.len()) };
+            let bb = unsafe { std::slice::from_raw_parts(b.as_ptr() as *const u16, b.len()) };
+            crate::neon_zoo::bf16_gemm_into(ab, bb, &mut c, m, n, k);
+        }
+        // Fallback: the original single-file BFMMLA kernel (only reachable if the zoo TU failed
+        // to build but the reference kernel did).
+        #[cfg(all(target_arch = "aarch64", has_bf16_kernel, not(has_neon_zoo)))]
         // SAFETY: a/b are M*K / K*N contiguous bf16 (==u16) lanes; c is M*N f32; FEAT_BF16
         // verified above; the kernel reads/writes exactly those bounds.
         unsafe {
