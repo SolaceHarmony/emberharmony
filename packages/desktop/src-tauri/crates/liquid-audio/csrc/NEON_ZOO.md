@@ -79,3 +79,32 @@ absent, returns `Ok(None)` so candle takes its own f32 path). Feature-gated proc
   -march=armv8.2-a` and run under `qemu-aarch64 -cpu max` — 18 checks across all six groups
   vs scalar / f64 references (GEMM, GEMV, SMMLA, reductions, TBL, conv1d, FFT forward +
   round-trip, double-double vs f64, fast-math).
+
+## x86-64 sibling (`csrc/x86_zoo.cpp` + `src/x86_zoo.rs`)
+
+The Intel/AMD sibling exposes the **same `extern "C"` kernels** (identical symbol names), so the
+live `bf16_matmul` path and the Rust wrappers are arch-agnostic — `build.rs` compiles exactly one
+of the two per target, and `Bf16Gemm::cpu_fwd` dispatches to `neon_zoo` on aarch64 or `x86_zoo`
+on x86-64. The idiom → opcode map crosses over directly:
+
+| NEON | x86-64 |
+|---|---|
+| BFMMLA / BFDOT | **VDPBF16PS** (`_mm512_dpbf16_ps`, AVX-512-BF16), else AVX2 upconvert+FMA |
+| BFCVT (bf16 store) | **VCVTNEPS2BF16** |
+| TBL/TBX | **PSHUFB** (`_mm256_shuffle_epi8`) |
+| ADDV/FADDP | AVX horizontal reduce |
+| FRECPE / FRSQRTE + Newton | **RCPPS / RSQRTPS** (`_mm256_rcp_ps` / `_mm256_rsqrt_ps`) + Newton |
+| SMMLA | **VPMADDWD** (`_mm512_madd_epi16`, AVX-512-BW) |
+| double-double two_prod/two_sum | FMA error-free transforms (`_mm256_fmadd_ps` / `fmsub`) |
+
+**Fan-out.** The GPU threadgroup-grid dispatch maps to the CPU's cores: `x86_zoo::bf16_gemm_into`
+fans the GEMM out over M-row blocks with rayon (reusing `threads.rs`'s physical-core pool), one
+task per block running the SIMD micro-kernel — exactly as the NEON side does. The bf16 GEMM also
+dispatches internally on CPUID: VDPBF16PS when AVX-512-BF16 is present, else the AVX2 baseline
+(present on essentially all x86-64), so the same call works across the Intel/AMD fleet.
+
+Runtime-gated on `x86_zoo::X86Features` (`is_x86_feature_detected!`); baseline is AVX2 + FMA,
+with `s8_gemm` requiring AVX-512F/BW. **Verified natively** (this is x86, no emulation needed):
+`cargo test --lib` on an AVX-512-BF16 host — the live `bf16_gemm_matches_f32_reference` plus the
+`x86_zoo` suite (fan-out GEMM, GEMV, SMMLA, PSHUFB, FFT round-trip + non-pow2 rejection,
+double-double vs f64, fast-math, size-guard `should_panic`) all pass.

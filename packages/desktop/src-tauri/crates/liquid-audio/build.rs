@@ -1,10 +1,35 @@
-// Compile the NEON micro-kernels (csrc/*.c, csrc/*.cpp) on aarch64.
-// Sets `cfg(has_bf16_kernel)` / `cfg(has_neon_zoo)` so the Rust FFI is only wired in where
-// the kernels were actually built. Runtime feature detection (NeonFeatures) still gates calls.
+// Compile the SIMD micro-kernels on aarch64 (NEON) and x86-64 (AVX). Sets `cfg(has_bf16_kernel)`
+// / `cfg(has_neon_zoo)` / `cfg(has_x86_zoo)` so the Rust FFI is only wired in where a kernel was
+// actually built. Runtime feature detection (NeonFeatures / X86Features) still gates calls.
 fn main() {
     println!("cargo::rustc-check-cfg=cfg(has_bf16_kernel)");
     println!("cargo::rustc-check-cfg=cfg(has_neon_zoo)");
+    println!("cargo::rustc-check-cfg=cfg(has_x86_zoo)");
     let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+
+    // x86-64 "zoo" (csrc/x86_zoo.cpp) — the Intel/AMD sibling of the NEON zoo. Same isolation
+    // strategy as the NEON build: clang needs the features in the base -march to expose the
+    // intrinsics; gcc always declares them and honours per-function `target(...)`, so it keeps a
+    // minimal base (each per-function target is a superset of it).
+    if arch == "x86_64" {
+        println!("cargo::rerun-if-changed=csrc/x86_zoo.cpp");
+        let mut zoo = cc::Build::new();
+        zoo.file("csrc/x86_zoo.cpp")
+            .cpp(true)
+            .std("c++17")
+            .opt_level(3)
+            .warnings(false);
+        if zoo.get_compiler().is_like_clang() {
+            zoo.flag("-mavx2").flag("-mfma").flag("-mavx512f").flag("-mavx512bw")
+                .flag("-mavx512vl").flag("-mavx512bf16");
+        }
+        // gcc: default base; the in-file `target("avx2,fma")` / `target("avx512…")` attributes
+        // raise the ISA per function and stay supersets of the base.
+        zoo.compile("lfm_x86_zoo");
+        println!("cargo::rustc-cfg=has_x86_zoo");
+        return;
+    }
+
     if arch != "aarch64" {
         return;
     }

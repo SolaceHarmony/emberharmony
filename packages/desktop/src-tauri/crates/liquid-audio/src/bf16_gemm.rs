@@ -17,17 +17,41 @@ extern "C" {
     fn lfm_bf16_gemm_f32(a: *const u16, b: *const u16, c: *mut f32, m: i32, n: i32, k: i32);
 }
 
-/// Whether the running CPU has the Arm BFloat16 extension (FEAT_BF16). Delegates to the
-/// shared, cached [`crate::neon_zoo::neon_features`] probe (macOS sysctl + Linux getauxval),
-/// so this now reports correctly on Linux aarch64 too.
+/// Whether the running CPU has a native bf16 tensor extension: Arm FEAT_BF16 (BFMMLA) on
+/// aarch64, AVX-512-BF16 (VDPBF16PS) on x86-64. Cached probe. (On x86 the GEMM still runs
+/// without it via the AVX2 upconvert path — see [`bf16_gemm_available`].)
 pub fn has_feat_bf16() -> bool {
-    crate::neon_zoo::neon_features().bf16
+    #[cfg(target_arch = "aarch64")]
+    {
+        crate::neon_zoo::neon_features().bf16
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        crate::x86_zoo::x86_features().avx512bf16
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        false
+    }
 }
 
-/// `true` when the NEON bf16 GEMM is both **built in** and **supported** by this CPU —
-/// i.e. [`bf16_matmul`] takes the hardware path rather than returning `None`.
+/// `true` when a hardware bf16 GEMM is both **built in** and **usable** on this CPU — i.e.
+/// [`bf16_matmul`] takes the SIMD path rather than returning `None`. aarch64 requires
+/// FEAT_BF16 (BFMMLA is bf16-only); x86-64 requires just AVX2 + FMA (the kernel upconverts,
+/// and additionally uses VDPBF16PS when AVX-512-BF16 is present).
 pub fn bf16_gemm_available() -> bool {
-    cfg!(all(target_arch = "aarch64", has_bf16_kernel)) && has_feat_bf16()
+    #[cfg(target_arch = "aarch64")]
+    {
+        cfg!(all(target_arch = "aarch64", has_bf16_kernel)) && crate::neon_zoo::neon_features().bf16
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        crate::x86_zoo::bf16_gemm_available()
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        false
+    }
 }
 
 /// candle `CustomOp2` over the kernel: `bf16 (M,K) ⊗ bf16 (K,N) → f32 (M,N)` on CPU.
@@ -69,17 +93,25 @@ impl CustomOp2 for Bf16Gemm {
         };
         let a = &a[l1.start_offset()..l1.start_offset() + m * k];
         let b = &b[l2.start_offset()..l2.start_offset() + k * n];
-        #[allow(unused_mut)] // `c` is mutated only on the aarch64 kernel paths below
+        #[allow(unused_mut)] // `c` is mutated only on the SIMD kernel paths below
         let mut c = vec![0f32; m * n];
-        // Preferred path: the tightened NEON "zoo" GEMM (8×8 BFMMLA multi-accumulator + rayon
-        // row-block dispatch, or a BFDOT GEMV when M==1). Same bf16-exact-product / f32-accumulate
-        // numerics as the reference kernel; only the summation order differs.
+        // Preferred aarch64 path: the tightened NEON "zoo" GEMM (8×8 BFMMLA multi-accumulator +
+        // rayon row-block dispatch, or a BFDOT GEMV when M==1). Same bf16-exact-product /
+        // f32-accumulate numerics as the reference kernel; only the summation order differs.
         #[cfg(all(target_arch = "aarch64", has_neon_zoo))]
         {
             // half::bf16 is repr(transparent) over u16, so the bit-slice view is sound.
             let ab = unsafe { std::slice::from_raw_parts(a.as_ptr() as *const u16, a.len()) };
             let bb = unsafe { std::slice::from_raw_parts(b.as_ptr() as *const u16, b.len()) };
             crate::neon_zoo::bf16_gemm_into(ab, bb, &mut c, m, n, k);
+        }
+        // x86-64 path: the AVX-512-BF16 (VDPBF16PS) / AVX2 zoo GEMM, fanned out over M-row
+        // blocks with rayon. Same f32-accumulate numerics.
+        #[cfg(all(target_arch = "x86_64", has_x86_zoo))]
+        {
+            let ab = unsafe { std::slice::from_raw_parts(a.as_ptr() as *const u16, a.len()) };
+            let bb = unsafe { std::slice::from_raw_parts(b.as_ptr() as *const u16, b.len()) };
+            crate::x86_zoo::bf16_gemm_into(ab, bb, &mut c, m, n, k);
         }
         // Fallback: the original single-file BFMMLA kernel (only reachable if the zoo TU failed
         // to build but the reference kernel did).

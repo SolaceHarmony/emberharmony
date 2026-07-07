@@ -15,6 +15,7 @@ pub mod audio_out; // AudioDetokenizer trait + backends (LFM2 detok / Mimi)
 pub mod chat_template; // load-time verification vs the snapshot chat_template.jinja
 pub mod bf16_gemm; // NEON BFMMLA bf16 CPU matmul (closes candle's bf16 gemm gap)
 pub mod neon_zoo; // NEON "zoo" mirroring the Metal JIT kernels (8×8 GEMM, FFT, DD, fast-math)
+pub mod x86_zoo; // x86-64 (AVX2 / AVX-512-BF16) sibling of the NEON zoo, with rayon fan-out
 pub mod candle_ext; // vendored candle 0.10 backports + extensions (kept on the 0.9.2 pin)
 pub mod data; // data/ (data-pipeline value types)
 pub mod detokenizer; // detokenizer.py
