@@ -420,24 +420,27 @@ static inline ddv dd_add(ddv a, ddv b) {
     float32x4_t lo = vsubq_f32(s.lo, vsubq_f32(hi, s.hi));
     return {hi, lo};
 }
-// horizontal dd reduction of a 4-lane dd accumulator to a scalar dd, then hi+lo
-static inline float dd_hreduce(ddv acc) {
+// one scalar double-double accumulation step: fold (hi_i, lo_i) into the running (shi, slo).
+static inline void dd_step(float &shi, float &slo, float hi_i, float lo_i) {
+    float s = shi + hi_i;
+    float v = s - shi;
+    float e = (shi - (s - v)) + (hi_i - v);
+    shi = s;
+    slo += e + lo_i;
+    float t = shi + slo;
+    slo = slo - (t - shi);
+    shi = t;
+}
+// horizontal dd reduction of the 4-lane accumulator to a scalar (shi, slo) pair (deterministic
+// serial order). Returns the pair rather than a collapsed float so a ragged tail can keep
+// accumulating in double-double instead of falling back to lossy plain-f32 adds.
+static inline void dd_hreduce2(ddv acc, float &shi, float &slo) {
     float hi[4], lo[4];
     vst1q_f32(hi, acc.hi);
     vst1q_f32(lo, acc.lo);
-    // serial dd sum across the 4 lanes (deterministic)
-    float shi = 0.0f, slo = 0.0f;
-    for (int i = 0; i < 4; i++) {
-        float s = shi + hi[i];
-        float v = s - shi;
-        float e = (shi - (s - v)) + (hi[i] - v);
-        shi = s;
-        slo += e + lo[i];
-        float t = shi + slo;
-        slo = slo - (t - shi);
-        shi = t;
-    }
-    return shi + slo;
+    shi = 0.0f;
+    slo = 0.0f;
+    for (int i = 0; i < 4; i++) dd_step(shi, slo, hi[i], lo[i]);
 }
 } // namespace
 
@@ -448,9 +451,12 @@ extern "C" float lfm_dd_sum_f32(const float *x, int n) {
         ddv v = {vld1q_f32(x + i), vdupq_n_f32(0.0f)};
         acc = dd_add(acc, v);
     }
-    float r = dd_hreduce(acc);
-    for (; i < n; i++) r += x[i];
-    return r;
+    float shi, slo;
+    dd_hreduce2(acc, shi, slo);
+    // ragged tail: keep folding into the double-double accumulator. A plain-f32 `r += x[i]`
+    // would drop any tail element below r's ULP, defeating the high-accuracy contract.
+    for (; i < n; i++) dd_step(shi, slo, x[i], 0.0f);
+    return shi + slo;
 }
 
 extern "C" float lfm_dd_dot_f32(const float *a, const float *b, int n) {
@@ -459,9 +465,16 @@ extern "C" float lfm_dd_dot_f32(const float *a, const float *b, int n) {
     for (; i + 4 <= n; i += 4) {
         acc = dd_add(acc, two_prod(vld1q_f32(a + i), vld1q_f32(b + i)));
     }
-    float r = dd_hreduce(acc);
-    for (; i < n; i++) r += a[i] * b[i];
-    return r;
+    float shi, slo;
+    dd_hreduce2(acc, shi, slo);
+    // ragged tail: exact product (two_prod via fmaf) folded into the double-double accumulator.
+    for (; i < n; i++) {
+        float p = a[i] * b[i];
+        float e = fmaf(a[i], b[i], -p); // exact a*b - p
+        dd_step(shi, slo, p, 0.0f);
+        dd_step(shi, slo, e, 0.0f);
+    }
+    return shi + slo;
 }
 
 // =====================================================================================

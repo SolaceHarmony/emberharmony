@@ -124,21 +124,25 @@ pub fn bf16_gemm_into(a: &[u16], b: &[u16], c: &mut [f32], m: usize, n: usize, k
         });
 }
 
-/// GPU-style fast reciprocal-sqrt (`1/√x`) (RSQRTPS + 2 Newton steps). **Precondition:** AVX2.
+/// GPU-style fast reciprocal-sqrt (`1/√x`) (RSQRTPS + 2 Newton steps). **Precondition:** AVX2 +
+/// FMA — the C kernel is compiled `target("avx2,fma")` and the Newton steps use `_mm256_fnmadd_ps`.
 #[cfg(all(target_arch = "x86_64", has_x86_zoo))]
 pub fn rsqrt(x: &[f32], out: &mut [f32]) {
     assert_eq!(x.len(), out.len());
-    assert!(x86_features().avx2, "rsqrt requires AVX2");
-    // SAFETY: both slices are `n` f32.
+    let f = x86_features();
+    assert!(f.avx2 && f.fma, "rsqrt requires AVX2 + FMA");
+    // SAFETY: both slices are `n` f32; AVX2+FMA asserted above.
     unsafe { lfm_rsqrt_f32(x.as_ptr(), out.as_mut_ptr(), x.len() as i32) };
 }
 
-/// GPU-style fast reciprocal (`1/x`) (RCPPS + 2 Newton steps). **Precondition:** AVX2.
+/// GPU-style fast reciprocal (`1/x`) (RCPPS + 2 Newton steps). **Precondition:** AVX2 + FMA —
+/// the C kernel is compiled `target("avx2,fma")` and the Newton steps use `_mm256_fnmadd_ps`.
 #[cfg(all(target_arch = "x86_64", has_x86_zoo))]
 pub fn recip(x: &[f32], out: &mut [f32]) {
     assert_eq!(x.len(), out.len());
-    assert!(x86_features().avx2, "recip requires AVX2");
-    // SAFETY: both slices are `n` f32.
+    let f = x86_features();
+    assert!(f.avx2 && f.fma, "recip requires AVX2 + FMA");
+    // SAFETY: both slices are `n` f32; AVX2+FMA asserted above.
     unsafe { lfm_recip_f32(x.as_ptr(), out.as_mut_ptr(), x.len() as i32) };
 }
 
@@ -302,7 +306,7 @@ mod tests {
 
     #[test]
     fn rsqrt_matches_scalar() {
-        if skip(x86_features().avx2, "rsqrt") {
+        if skip(x86_features().avx2 && x86_features().fma, "rsqrt") {
             return;
         }
         let x: Vec<f32> = (1..=64).map(|i| i as f32 * 0.5).collect();
@@ -326,6 +330,31 @@ mod tests {
     }
 
     #[test]
+    fn dd_sum_and_dot_handle_ragged_tail() {
+        // Codex example: a large value then a non-multiple-of-8 tail of tiny values, each below
+        // the running sum's f32 ULP. A plain-f32 tail add drops them (returns exactly 1e4); the
+        // double-double tail must retain them. n = 1 + 7 = 8... use 13 (one full lane + 5 tail).
+        if skip(x86_features().avx2 && x86_features().fma, "dd_tail") {
+            return;
+        }
+        let mut x = vec![3e-4f32; 13];
+        x[0] = 1e4;
+        let want: f64 = x.iter().map(|&v| v as f64).sum(); // ≈ 10000.0036
+        let got = dd_sum(&x) as f64;
+        assert!((got - want).abs() < 1e-2, "dd_sum tail dropped: got={got} want={want}");
+        // the naive f32 running sum loses the tail entirely — confirm we beat it.
+        let naive: f32 = x.iter().fold(0f32, |a, &v| a + v);
+        assert!(
+            (got - want).abs() < (naive as f64 - want).abs(),
+            "dd_sum ({got}) no better than naive f32 ({naive}) vs {want}"
+        );
+        // dd_dot with a ragged tail: Σ x·1 == Σ x, same accuracy requirement.
+        let ones = vec![1f32; x.len()];
+        let dot = dd_dot(&x, &ones) as f64;
+        assert!((dot - want).abs() < 1e-2, "dd_dot tail dropped: got={dot} want={want}");
+    }
+
+    #[test]
     fn permute_matches_scalar() {
         if skip(x86_features().avx2, "permute") {
             return;
@@ -342,7 +371,10 @@ mod tests {
 
     #[test]
     fn s8_gemm_matches_scalar() {
-        if skip(x86_features().avx512f && x86_features().avx512bw, "s8_gemm") {
+        if skip(
+            x86_features().avx512f && x86_features().avx512bw && x86_features().avx512vl,
+            "s8_gemm",
+        ) {
             return;
         }
         let (m, k, n) = (6usize, 40usize, 5usize);

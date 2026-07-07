@@ -346,38 +346,53 @@ X86_TGT_AVX2 static inline ddv dd_add(ddv a, ddv b) {
     __m256 lo = _mm256_sub_ps(s.lo, _mm256_sub_ps(hi, s.hi));
     return {hi, lo};
 }
-X86_TGT_AVX2 static inline float dd_hreduce(ddv acc) {
+// one scalar double-double accumulation step: fold (hi_i, lo_i) into the running (shi, slo).
+X86_TGT_AVX2 static inline void dd_step(float &shi, float &slo, float hi_i, float lo_i) {
+    float s = shi + hi_i, v = s - shi;
+    float e = (shi - (s - v)) + (hi_i - v);
+    shi = s;
+    slo += e + lo_i;
+    float t = shi + slo;
+    slo = slo - (t - shi);
+    shi = t;
+}
+// horizontal double-double reduce of the 8 lanes into a scalar (shi, slo) pair (deterministic
+// serial order). Returns the pair rather than a collapsed float so a ragged tail can keep
+// accumulating in double-double instead of falling back to lossy plain-f32 adds.
+X86_TGT_AVX2 static inline void dd_hreduce2(ddv acc, float &shi, float &slo) {
     float hi[8], lo[8];
     _mm256_storeu_ps(hi, acc.hi);
     _mm256_storeu_ps(lo, acc.lo);
-    float shi = 0.0f, slo = 0.0f; // serial dd sum across the 8 lanes (deterministic)
-    for (int i = 0; i < 8; i++) {
-        float s = shi + hi[i], v = s - shi;
-        float e = (shi - (s - v)) + (hi[i] - v);
-        shi = s;
-        slo += e + lo[i];
-        float t = shi + slo;
-        slo = slo - (t - shi);
-        shi = t;
-    }
-    return shi + slo;
+    shi = 0.0f;
+    slo = 0.0f;
+    for (int i = 0; i < 8; i++) dd_step(shi, slo, hi[i], lo[i]);
 }
 } // namespace
 extern "C" X86_TGT_AVX2 float lfm_dd_sum_f32(const float *x, int n) {
     ddv acc = {_mm256_setzero_ps(), _mm256_setzero_ps()};
     int i = 0;
     for (; i + 8 <= n; i += 8) acc = dd_add(acc, {_mm256_loadu_ps(x + i), _mm256_setzero_ps()});
-    float r = dd_hreduce(acc);
-    for (; i < n; i++) r += x[i];
-    return r;
+    float shi, slo;
+    dd_hreduce2(acc, shi, slo);
+    // ragged tail: keep folding into the double-double accumulator. A plain-f32 `r += x[i]`
+    // would drop any tail element below r's ULP, defeating the high-accuracy contract.
+    for (; i < n; i++) dd_step(shi, slo, x[i], 0.0f);
+    return shi + slo;
 }
 extern "C" X86_TGT_AVX2 float lfm_dd_dot_f32(const float *a, const float *b, int n) {
     ddv acc = {_mm256_setzero_ps(), _mm256_setzero_ps()};
     int i = 0;
     for (; i + 8 <= n; i += 8) acc = dd_add(acc, two_prod(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i)));
-    float r = dd_hreduce(acc);
-    for (; i < n; i++) r += a[i] * b[i];
-    return r;
+    float shi, slo;
+    dd_hreduce2(acc, shi, slo);
+    // ragged tail: exact product (two_prod via fmaf) folded into the double-double accumulator.
+    for (; i < n; i++) {
+        float p = a[i] * b[i];
+        float e = fmaf(a[i], b[i], -p); // exact a*b - p
+        dd_step(shi, slo, p, 0.0f);
+        dd_step(shi, slo, e, 0.0f);
+    }
+    return shi + slo;
 }
 
 // =====================================================================================
