@@ -116,8 +116,8 @@ pub fn bf16_gemm_available() -> bool {
 /// `C(M,N) f32 = A(M,K) bf16 · B(K,N) bf16` (raw bf16 bits as `u16`), row-major, f32
 /// accumulate. Dispatches `M==1 → BFDOT GEMV`, else the 8×8 BFMMLA micro-kernel tiled over
 /// M-row blocks with rayon (reusing the global pool sized by [`crate::threads`]). B is shared
-/// across blocks. Caller must have verified [`bf16_gemm_available`] and sized the slices to
-/// `M*K`, `K*N`, `M*N`.
+/// across blocks. Self-gates on FEAT_BF16 (falling back to a scalar f32-accumulate matmul when
+/// absent), so it is safe to call on any aarch64 CPU. Slices must be sized `M*K`, `K*N`, `M*N`.
 #[cfg(all(target_arch = "aarch64", has_neon_zoo))]
 pub fn bf16_gemm_into(a: &[u16], b: &[u16], c: &mut [f32], m: usize, n: usize, k: usize) {
     use rayon::prelude::*;
@@ -127,6 +127,22 @@ pub fn bf16_gemm_into(a: &[u16], b: &[u16], c: &mut [f32], m: usize, n: usize, k
     assert_eq!(b.len(), k * n, "bf16_gemm_into: b.len() != k*n");
     assert_eq!(c.len(), m * n, "bf16_gemm_into: c.len() != m*n");
     if m == 0 || n == 0 || k == 0 {
+        return;
+    }
+    // The BFMMLA/BFDOT kernels SIGILL without FEAT_BF16; gate the FFI so this public wrapper is
+    // safe even if a caller skips `bf16_gemm_available()`. Scalar fallback keeps it correct.
+    if !neon_features().bf16 {
+        use half::bf16;
+        for i in 0..m {
+            for j in 0..n {
+                let mut s = 0f32;
+                for kk in 0..k {
+                    s += bf16::from_bits(a[i * k + kk]).to_f32()
+                        * bf16::from_bits(b[kk * n + j]).to_f32();
+                }
+                c[i * n + j] = s;
+            }
+        }
         return;
     }
     if m == 1 {
