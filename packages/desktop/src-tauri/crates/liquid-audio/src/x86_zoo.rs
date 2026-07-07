@@ -200,15 +200,19 @@ pub fn fft_radix2(data: &mut [f32], inverse: bool) {
 }
 
 /// int8 tensor GEMM `C(M,N) s32 = A(M,K) s8 · B(K,N) s8` via VPMADDWD. Slices sized `M*K`,
-/// `K*N`, `M*N`. **Precondition:** AVX-512F + AVX-512BW (check [`x86_features`]).
+/// `K*N`, `M*N`. **Precondition:** AVX-512F + AVX-512BW + AVX-512VL (check [`x86_features`]) —
+/// the C kernel is compiled `target("avx512f,avx512bw,avx512vl")` and may emit VL-width EVEX.
 #[cfg(all(target_arch = "x86_64", has_x86_zoo))]
 pub fn s8_gemm(a: &[i8], b: &[i8], c: &mut [i32], m: usize, n: usize, k: usize) {
     assert_eq!(a.len(), m * k, "s8_gemm: a.len() != m*k");
     assert_eq!(b.len(), k * n, "s8_gemm: b.len() != k*n");
     assert_eq!(c.len(), m * n, "s8_gemm: c.len() != m*n");
     let f = x86_features();
-    assert!(f.avx512f && f.avx512bw, "s8_gemm requires AVX-512F + AVX-512BW");
-    // SAFETY: slices sized M*K / K*N / M*N; AVX-512BW asserted above.
+    assert!(
+        f.avx512f && f.avx512bw && f.avx512vl,
+        "s8_gemm requires AVX-512F + AVX-512BW + AVX-512VL"
+    );
+    // SAFETY: slices sized M*K / K*N / M*N; AVX-512F/BW/VL asserted above.
     unsafe {
         lfm_s8_gemm_s32(a.as_ptr(), b.as_ptr(), c.as_mut_ptr(), m as i32, n as i32, k as i32)
     };

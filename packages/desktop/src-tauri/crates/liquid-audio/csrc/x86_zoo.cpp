@@ -25,15 +25,22 @@
 #include <vector>
 #include <cmath>
 
-#if defined(__clang__)
-#define X86_TGT_AVX2
-#define X86_TGT_BF16
-#define X86_TGT_AVX512
-#else
+// Every opcode-bearing function is confined to its own ISA via a per-function `target(...)`
+// attribute, so nothing above AVX2 ever leaks into an ungated function (notably the AVX2
+// bf16 fallback microkernel). This holds for BOTH gcc and clang on x86: clang honours
+// per-function target attributes and declares the immintrin intrinsics unconditionally — so,
+// unlike the aarch64 zoo where clang needs the feature in the base -march, here neither
+// compiler needs a raised base ISA (build.rs compiles this TU with NO global AVX-512 flags).
+// That is exactly what stops a clang binary from emitting zmm codegen inside gemm_bf16_avx2
+// and then SIGILL-ing on an AVX2-only CPU that legitimately passed the AVX2 feature gate.
+// MSVC understands none of this (no __attribute__, no __builtin_cpu_supports), so it is
+// deliberately excluded in build.rs; this #error is the backstop if that gate ever regresses.
+#if defined(_MSC_VER) && !defined(__clang__)
+#error "x86_zoo.cpp requires GCC/Clang target attributes; build.rs must not compile it with MSVC"
+#endif
 #define X86_TGT_AVX2 __attribute__((target("avx2,fma")))
 #define X86_TGT_BF16 __attribute__((target("avx512f,avx512bw,avx512vl,avx512bf16")))
 #define X86_TGT_AVX512 __attribute__((target("avx512f,avx512bw,avx512vl")))
-#endif
 
 // bf16 (upper 16 bits of the f32) -> f32, scalar.
 static inline float bf16_to_f32(uint16_t b) {

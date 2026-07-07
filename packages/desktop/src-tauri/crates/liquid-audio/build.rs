@@ -7,25 +7,33 @@ fn main() {
     println!("cargo::rustc-check-cfg=cfg(has_x86_zoo)");
     let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
 
-    // x86-64 "zoo" (csrc/x86_zoo.cpp) — the Intel/AMD sibling of the NEON zoo. Same isolation
-    // strategy as the NEON build: clang needs the features in the base -march to expose the
-    // intrinsics; gcc always declares them and honours per-function `target(...)`, so it keeps a
-    // minimal base (each per-function target is a superset of it).
+    // x86-64 "zoo" (csrc/x86_zoo.cpp) — the Intel/AMD sibling of the NEON zoo. Every opcode is
+    // confined to a per-function `target(...)` attribute (see the file header), so — on BOTH gcc
+    // and clang — the TU needs NO global AVX-512 flags. That isolation is the point: global
+    // -mavx512* would let clang emit zmm codegen inside the AVX2 fallback microkernel, which then
+    // SIGILLs on an AVX2-only CPU that legitimately passed the AVX2 runtime gate. MSVC accepts
+    // neither the attributes nor `__builtin_cpu_supports`, so on the MSVC toolchain the zoo is
+    // simply not built (has_x86_zoo stays unset → `bf16_gemm_available()` is false → the caller
+    // takes candle's own f32 path — the same arch-availability contract used off x86-64/aarch64).
     if arch == "x86_64" {
+        let env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+        if env == "msvc" {
+            println!(
+                "cargo::warning=liquid-audio: x86 SIMD zoo not built on the MSVC toolchain \
+                 (needs GCC/Clang target attributes); bf16 GEMM uses candle's f32 path here"
+            );
+            return;
+        }
         println!("cargo::rerun-if-changed=csrc/x86_zoo.cpp");
-        let mut zoo = cc::Build::new();
-        zoo.file("csrc/x86_zoo.cpp")
+        cc::Build::new()
+            .file("csrc/x86_zoo.cpp")
             .cpp(true)
             .std("c++17")
             .opt_level(3)
-            .warnings(false);
-        if zoo.get_compiler().is_like_clang() {
-            zoo.flag("-mavx2").flag("-mfma").flag("-mavx512f").flag("-mavx512bw")
-                .flag("-mavx512vl").flag("-mavx512bf16");
-        }
-        // gcc: default base; the in-file `target("avx2,fma")` / `target("avx512…")` attributes
-        // raise the ISA per function and stay supersets of the base.
-        zoo.compile("lfm_x86_zoo");
+            .warnings(false)
+            // No global ISA flags: each function's `target(...)` attribute raises the ISA only
+            // inside that function, so the AVX2 baseline stays AVX2 and AVX-512 never leaks in.
+            .compile("lfm_x86_zoo");
         println!("cargo::rustc-cfg=has_x86_zoo");
         return;
     }
