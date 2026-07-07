@@ -38,7 +38,11 @@ fn main() {
         // v8.3 base gives FCMA; add bf16 + i8mm so every intrinsic the zoo uses is exposed.
         zoo.flag("-march=armv8.3-a+bf16+i8mm");
     } else {
-        // gcc: low base; the in-file `target("arch=...")` attributes raise it per function.
+        // gcc: low base. Each per-function `target("arch=…")` attribute must be a SUPERSET of the
+        // base, so the base has to stay minimal — raising it to +bf16+i8mm makes the bf16-only
+        // functions a subset and triggers "target specific option mismatch" on always_inline libc
+        // calls (memcpy). gcc 13's arm_neon.h already declares bfloat16_t/MMLA types at global
+        // scope with this base, and the per-function attributes raise the arch where needed.
         zoo.flag("-march=armv8.2-a");
     }
     zoo.compile("lfm_neon_zoo");
