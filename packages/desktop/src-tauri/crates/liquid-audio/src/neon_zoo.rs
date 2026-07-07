@@ -441,4 +441,35 @@ mod tests {
             }
         }
     }
+
+    // The FFI size checks are real `assert_eq!` (not debug_assert), so a mismatched slice
+    // length panics before any raw-pointer FFI access — even in release. These fire on the size
+    // assert, which precedes the feature assert, so they hold regardless of the runner's CPU.
+    #[test]
+    #[should_panic(expected = "a.len() != m*k")]
+    fn gemm_into_rejects_mismatched_dims() {
+        let a = vec![0u16; 3]; // wrong: m*k = 2*4 = 8
+        let b = vec![0u16; 8];
+        let mut c = vec![0f32; 4];
+        bf16_gemm_into(&a, &b, &mut c, 2, 2, 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "a.len() != m*k")]
+    fn s8_gemm_rejects_mismatched_dims() {
+        let a = vec![0i8; 3]; // wrong: m*k = 2*4 = 8
+        let b = vec![0i8; 8];
+        let mut c = vec![0i32; 4];
+        s8_gemm(&a, &b, &mut c, 2, 2, 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "u.len() != B*D*L")]
+    fn conv1d_rejects_mismatched_dims() {
+        let u = vec![0u16; 5]; // wrong: B*D*L = 1*2*6 = 12
+        let w = vec![0u16; 2 * 3];
+        let bias = vec![0u16; 2];
+        let mut out = vec![0u16; 1 * 2 * 6];
+        depthwise_causal_conv1d_bf16(&u, &w, &bias, &mut out, 1, 2, 6, 3, 6);
+    }
 }
