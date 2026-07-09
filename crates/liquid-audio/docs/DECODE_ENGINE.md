@@ -341,13 +341,32 @@ per token; a missed worker wake SERIALIZES a stage onto one lane). Tile-count
 completion + epoch-CAS board fixed correctness; coordinator participation did not fix
 the chop (183k/102k/138k across three runs — committed with data).
 
-**The fix, per the original §2 design (build next):**
-1. Lane-uniform token pass: every worker runs the WHOLE layer-walk program (stage
-   bodies already exist as tile cases); in-arena generation barriers between HOT lanes
-   (bounded spin-then-futex — the GPU barrier idiom, distinct from banned idle-spin);
-   the team parks/wakes ONCE per token. Wake lottery: ~400 draws → 9.
+**The fix, per the original §2 design — BUILT 2026-07-09 (lane-uniform commit,
+post-reorg):** every lane runs the ENTIRE pass program; stages are separated by
+in-arena generation fences (bounded ~100µs spin, then a precise mask-declared park —
+the park declaration and the waker's mask exchange are RMWs on one word, so there is
+NO lost-wake window); tiles claim off a bare fetch_add counter (E-core stragglers
+self-balance); each fence's last arriver runs the boundary's serial ladder exactly
+once. Team parks once per token, wakes once per token. publish_stage / epoch-CAS
+board / worker claim loops deleted. lfm_engine_new(workers) now = TOTAL lanes
+(lane 0 = request loop + compute lane); the +1 core oversubscription is gone.
+Numerics untouched (tile-count formulas verbatim; claim order is bit-irrelevant):
+REF and PERF exact, 4/4 parity tests.
+
+**Result — the variance is dead.** Four consecutive audible CPU e2e runs, quiet
+machine: 25,600 / 24,832 / 26,112 / 26,880 underrun samples (was 102k-244k
+run-to-run on identical bits), last-latency 913-939ms, mean 1151-1214ms. CPU now
+leads the Metal clean baseline (25,856 / 1656ms) on both metrics. The ~25k floor is
+the turn-1 prefill window, not decode.
+
+**Build next:**
+1. Rim cut (task #4): resident per-layer state in the engine ctx (KV planes
+   pre-grown to max_ctx at install → stable pointers; cursors engine-owned); kill the
+   per-token Vec<LayerState> + out-buffer allocations + Tensor wraps in
+   lfm2_hf/lfm2_audio. Plus ctx-ownership guard (ctx_id tag; Drop clears only its own
+   install — the two-model clobber flagged in external review).
 2. kcoro patch 0005: precise parking in kc_sched (exact signal accounting, untimed
-   waits) so the remaining wakes are µs-bounded.
-3. Fold DepthDecode onto the same team; rim cuts (persistent state array, resident out
-   planes, no per-token Tensor wraps).
+   waits) so the ~5 remaining wakes/token are µs-bounded (today a lost token-start
+   wake costs ≤5ms once per token, absorbed by the fence).
+3. Fold DepthDecode onto the same lane team (drop rayon threadgroup + DISPATCH_LOCK).
 4. ST_LOGITS ladder decision (task #1), then sampler v2 (ChaCha12), then Mimi (E5).
