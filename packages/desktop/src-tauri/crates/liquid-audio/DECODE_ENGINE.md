@@ -297,3 +297,17 @@ shasum out.wav   # must print 2f9c907aad76919839993d9d92a53304b72f7608
 ```
 
 Re-verified 2026-07-09 (post kcoro vendoring + native stage-machine wiring): exact match.
+
+**Dual-path audible gate (scripts/gate.sh steps 4-5), clean-machine baseline 2026-07-09,
+post token-pass + epoch-CAS stage board — two-turn e2e, same clip, speaker drained:**
+
+| device | mean pause→first-audio | underrun samples | verdict |
+|---|---|---|---|
+| CPU (token-pass engine) | 1469 ms | 24,832 (~1.0 s) | clean |
+| Metal (candle kernels) | 1656 ms | 25,856 (~1.1 s) | clean |
+
+Correction for the record: the 167k-underrun Metal measurement that motivated the
+CPU-default flip was taken while a release build ran concurrently — contention, not
+Metal steady-state. The flip still stands (CPU leads both metrics on clean runs, idles
+at zero, and carries the engine roadmap), but the honest margin is modest, not 7×.
+Bench with the machine quiet or say so in the numbers.
