@@ -1,0 +1,11 @@
+[package]
+name = "kcoro-sys"
+version = "0.1.0"
+edition = "2021"
+links = "kcoro"
+description = "Build-only sys crate for the vendored kcoro coroutine runtime"
+license = "BSD-3-Clause"
+build = "build.rs"
+
+[build-dependencies]
+cc = "1"

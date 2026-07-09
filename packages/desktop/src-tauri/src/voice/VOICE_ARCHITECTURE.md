@@ -11,7 +11,7 @@
 > into the desktop app on real OS threads.
 >
 > It is the companion to `FRONTEND_DESIGN.md` (the webview/UX side) and supersedes the
-> scattered notes in `crates/liquid-audio/{ARCHAEOLOGY,PORT_STATUS,PYTHON_VS_RUST,THREADING_PARITY}.md`.
+> scattered notes in `crates/liquid-audio/docs/{ARCHAEOLOGY,PORT_STATUS,PYTHON_VS_RUST,THREADING_PARITY}.md`.
 
 ---
 
@@ -204,7 +204,7 @@ Rationale:
 
 | #   | From                                                                                                    | To                                                | Status                                                                                                                                                              |
 | --- | ------------------------------------------------------------------------------------------------------- | ------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 1   | `experiments/lfm2-audio-voice/liquid-audio-rs/` (the model crate)                                       | `packages/desktop/src-tauri/crates/liquid-audio/` | ✅ done — built into the desktop app (`Cargo.toml`: `liquid-audio = { path = "crates/liquid-audio", features = ["metal"] }`)                                        |
+| 1   | `experiments/lfm2-audio-voice/liquid-audio-rs/` (the model crate)                                       | `crates/liquid-audio/` | ✅ done — built into the desktop app (`Cargo.toml`: `liquid-audio = { path = "../../../crates/liquid-audio", features = ["metal"] }`)                                        |
 | 2   | `experiments/lfm2-audio-voice/src/` (the **orchestration layer**: `main.rs` routing, `glm.rs` subagent) | `packages/desktop/src-tauri/src/voice/`           | 🔧 partially wired — `session.rs` and `BridgeState` route `DELEGATE:` into the EmberHarmony session; the standalone `glm.rs` engineer choice/hardening remains open |
 
 Desktop‑only is acceptable for now: desktop is the sole test target and we are not supporting
@@ -426,21 +426,21 @@ differential dumps (`parity/dump_*.py` → `parity/golden/*.safetensors`, gitign
   NEON bridge. Audio sampling uses `temperature=1.0, top_k=4` (greedy audio is degenerate);
   text is greedy.
 
-The BF16 GEMM entry is `src/bf16_gemm.rs` (candle `CustomOp`s `Bf16Gemm` / `Bf16GemmNt`). The
-live kernel is the **tightened flashkern GEMM** (`csrc/flashkern_neon.cpp` on aarch64,
-`csrc/flashkern_x86.cpp` on x86‑64) — an 8×8 BFMMLA / VDPBF16PS multi‑accumulator fanned over
+The BF16 GEMM entry is `src/compute/bf16_gemm.rs` (candle `CustomOp`s `Bf16Gemm` / `Bf16GemmNt`). The
+live kernel is the **tightened flashkern GEMM** (`native/kernels/aarch64/flashkern_neon.cpp` on aarch64,
+`native/kernels/x86_64/flashkern_x86.cpp` on x86‑64) — an 8×8 BFMMLA / VDPBF16PS multi‑accumulator fanned over
 M‑row blocks with rayon, plus a native‑layout `[N,K]` decode form (`Bf16GemmNt`) that dots
 contiguous weight rows with **no transpose copy** at `M ≤ 4`. The original single‑file
-`csrc/bf16_gemm.c` remains only as the reference fallback (used when the flashkern TU failed to
+`native/reference/bf16_gemm.c` remains only as the reference fallback (used when the flashkern TU failed to
 build). `model::linear` routes BF16 CPU linears/logits through this bridge and keeps the 4‑D
 attention matmuls on the explicit F32 accumulation path. See
-[`crates/liquid-audio/csrc/FLASHKERN.md`](../../crates/liquid-audio/csrc/FLASHKERN.md) and
-[`crates/liquid-audio/DECODE_ENGINE.md`](../../crates/liquid-audio/DECODE_ENGINE.md).
+[`crates/liquid-audio/docs/FLASHKERN.md`](../../../../../crates/liquid-audio/docs/FLASHKERN.md) and
+[`crates/liquid-audio/docs/DECODE_ENGINE.md`](../../../../../crates/liquid-audio/docs/DECODE_ENGINE.md).
 
 ### 4.9 The conv kernels — `candle-flashfftconv`
 
 The convolution operators that ML stacks normally gate behind custom CUDA live in their own
-crate, `experiments/lfm2-audio-voice/candle-flashfftconv/` — candle `CustomOp`s that run on
+crate, `crates/candle-flashfftconv/` — candle `CustomOp`s that run on
 **CPU** (faithful reference) **and Metal** (real fused kernels), no CUDA, no torch. Two
 families:
 
@@ -460,7 +460,7 @@ backbone call site is the remaining step (§15).
 
 → Full kernel design, dataflow diagram, dispatch contract, edge‑tile handling, the global
 pipeline cache, and the precision regimes (fp32 / bf16‑faithful / double‑double): see
-[`candle-flashfftconv/ARCHITECTURE.md`](../../../../experiments/lfm2-audio-voice/candle-flashfftconv/ARCHITECTURE.md).
+[`candle-flashfftconv/docs/ARCHITECTURE.md`](../../../../../crates/candle-flashfftconv/docs/ARCHITECTURE.md).
 
 ---
 

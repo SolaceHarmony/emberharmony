@@ -14,8 +14,11 @@ on:
   pull_request:
     branches: [dev, main]
     paths:
-      - "packages/desktop/src-tauri/crates/liquid-audio/**"
-      - "experiments/lfm2-audio-voice/candle-flashfftconv/**"
+      - "crates/liquid-audio/**"
+      - "crates/candle-flashfftconv/**"
+      - "crates/kcoro-sys/**"
+      - "Cargo.toml"
+      - "rust-toolchain.toml"
       - ".github/workflows/rust-voice.yml"
   workflow_dispatch:
 
@@ -29,7 +32,7 @@ concurrency:
 defaults:
   run:
     shell: bash
-    working-directory: packages/desktop/src-tauri/crates/liquid-audio
+    working-directory: crates/liquid-audio
 
 jobs:
   test:
@@ -49,12 +52,15 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: packages/desktop/src-tauri/crates/liquid-audio
+          workspaces: .
 
       # cpal (dev-dep, used by the mic_chat example/tests) needs ALSA headers on Linux.
       - name: Linux audio deps (cpal/ALSA)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+
+      - name: Build kcoro sys crate
+        run: cargo build -p kcoro-sys
 
       - name: Build (lib + examples + tests)
         run: cargo build --all-targets
