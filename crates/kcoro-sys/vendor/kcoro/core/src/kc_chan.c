@@ -1230,6 +1230,7 @@ again_recv:
                     if (sw && sw->send_buf && sw->send_len >= (size_t)ch->elem_sz) {
                         memcpy(out, sw->send_buf, ch->elem_sz);
                         /* Count both sides of the transfer here */
+                        ch->rv_matches++; /* Patch 0006: this IS a rendezvous match */
                         kc_chan_update_send_stats_locked(ch);
                         kc_chan_update_recv_stats_locked(ch);
                         /* Mark sender as delivered and wake it */
@@ -1920,6 +1921,8 @@ again_recv_ptr:
                         kc_chan_update_send_stats_len_locked(ch, pm->len);
                         KC_COND_SIGNAL(&ch->cv_recv);
                         if (ch->wq_recv_head != NULL) wake_recv2 = kc_chan_wake_recv_locked(ch);
+                        /* Patch 0006: delivered-flag kept coherent on every commit path. */
+                        if (sw->kind == KC_WAITER_CORO && sw->co) sw->co->last_send_delivered = 1;
                         kc_waiter_dispose(sw);
                         wake_send = wake_s;
                     } else {
@@ -1951,7 +1954,11 @@ again_recv_ptr:
                         struct kc_chan_ptrmsg tmp; memcpy(&tmp, sw->send_buf, sizeof(tmp));
                         *out_ptr = tmp.ptr; *out_len = tmp.len;
                         ch->rv_matches++;
+                        /* Patch 0006: count BOTH sides — direct waiter handoff, no publish. */
+                        kc_chan_update_send_stats_len_locked(ch, tmp.len);
                         kc_chan_update_recv_stats_len_locked(ch, tmp.len);
+                        /* Patch 0006: delivered-flag kept coherent on every commit path. */
+                        if (sw->kind == KC_WAITER_CORO && sw->co) sw->co->last_send_delivered = 1;
                         kc_waiter_dispose(sw);
                         KC_MUTEX_UNLOCK(&ch->mu);
                         kc_chan_schedule_wake(wake_s);
@@ -1977,10 +1984,26 @@ again_recv_ptr:
                         struct kc_chan_ptrmsg tmp; memcpy(&tmp, sw->send_buf, sizeof(tmp));
                         *out_ptr = tmp.ptr; *out_len = tmp.len;
                         ch->rv_matches++;
+                        /* Patch 0006: count BOTH sides — this handoff bypasses the slot,
+                         * so the send is never counted at publish time. Mirrors the
+                         * value-mode pop-first ("Count both sides of the transfer"). */
+                        kc_chan_update_send_stats_len_locked(ch, tmp.len);
                         kc_chan_update_recv_stats_len_locked(ch, tmp.len);
-                        if (sw->kind == KC_WAITER_CORO && sw->co) { sw->co->last_send_delivered = 1; }
+                        /* Patch 0006: WAKE the committed sender. This path consumed its
+                         * payload, set its delivered flag, disposed its waiter — and never
+                         * unparked it, leaving it parked forever (the ptr send site returns
+                         * 0 unconditionally on resume, so the wake is its only exit). The
+                         * value-mode pop-first handoff collects and schedules exactly this
+                         * wake; this path lost it in transcription. */
+                        struct kc_wake wake_s = {0};
+                        if (sw->kind == KC_WAITER_CORO && sw->co) {
+                            sw->co->last_send_delivered = 1;
+                            wake_s.co = sw->co;
+                            kcoro_retain(wake_s.co);
+                        }
                         kc_waiter_dispose(sw);
                         KC_MUTEX_UNLOCK(&ch->mu);
+                        kc_chan_schedule_wake(wake_s);
                         return 0;
                     }
                     if (sw) { sw->next = ch->wq_send_head; ch->wq_send_head = sw; if (!ch->wq_send_tail) ch->wq_send_tail = sw; }
@@ -1994,7 +2017,11 @@ again_recv_ptr:
                         struct kc_chan_ptrmsg tmp; memcpy(&tmp, sw->send_buf, sizeof(tmp));
                         *out_ptr = tmp.ptr; *out_len = tmp.len;
                         ch->rv_matches++;
+                        /* Patch 0006: count BOTH sides — direct waiter handoff, no publish. */
+                        kc_chan_update_send_stats_len_locked(ch, tmp.len);
                         kc_chan_update_recv_stats_len_locked(ch, tmp.len);
+                        /* Patch 0006: delivered-flag kept coherent on every commit path. */
+                        if (sw->kind == KC_WAITER_CORO && sw->co) sw->co->last_send_delivered = 1;
                         kc_waiter_dispose(sw);
                         KC_MUTEX_UNLOCK(&ch->mu);
                         kc_chan_schedule_wake(wake_s);

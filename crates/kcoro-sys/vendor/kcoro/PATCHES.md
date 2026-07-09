@@ -164,3 +164,40 @@ that is a modulo by zero (UB). The scan is now skipped when `workers == 1`.
 **Verification.** Full crate suite green (168); engine bit-parity tests green through
 the doorbell path; audible dual-path e2e green with CPU underruns/latency holding the
 lane-uniform band across repeated runs (see DECODE_ENGINE.md state of play).
+
+## Patch 0006 — rendezvous direct-handoff: lost sender wake + split accounting
+
+**Symptom.** With the runtime made correct by 0001/0002/0005, two channel tests went
+from flaky to deterministically wedged: `test_chan_ptr_rendezvous_basic` froze at
+sends=0 recvs=1 every run; `test_chan_rv_metrics` asserted `rv_matches != expected`.
+Root-caused via KCORO_TRACE: the receiver's "pop-first direct handoff" consumed the
+parked sender's payload, set its `last_send_delivered` flag, disposed its waiter —
+and NEVER unparked it. The ptr-mode sender's park site returns 0 unconditionally on
+resume, so that wake was its only exit: parked forever. Before the runtime patches,
+the pre-0002 TLS corruption (post-switch writes poisoning another worker's
+`current_kcoro`) perturbed parks chaotically — which is the only reason these tests
+ever made partial progress. The correct runtime exposed the missing wake cleanly.
+
+**Fix.**
+1. ptr pop-first handoff: collect and schedule the committed sender's wake (exactly
+   the value-mode pop-first pattern, which had it; the ptr transcription lost it).
+2. Accounting drift, mirror-imaged between the two modes: value pop-first counted
+   both stats but not `rv_matches` (the metric its test asserts); ptr pop-first and
+   both ptr commit-handoffs counted `rv_matches` + recv stats but never the send
+   side (these handoffs bypass the slot, so the send is counted nowhere else). Both
+   directions now count match + send + recv on every direct handoff.
+3. `last_send_delivered` is now set on every commit path (it was set on two of
+   five), keeping the flag's contract coherent for the planned sender retry-loop.
+
+**Verification.** tests/: 5 rounds of the full battery. Both previously-wedged tests
+pass; all 800/800 messages flow in rv_metrics (was 33-51 before starving). Residual
+KNOWN GAP, out of scope here (waiters-rethink territory): rv_metrics still flakes
+(~3/5) on its `rv_cancels <= CONSUMERS` assert — receiver retry loops leak STALE
+WAITER NODES (`kc_waiter_token_reset` clears local status without dequeuing the
+node; a consumer woken via slot-publish rather than waiter-pop leaves its node
+behind and enqueues a fresh one next lap), and `kc_chan_close` counts every leftover
+node as an rv_cancel. That is the exact gap ARENA_ARCH_PLAN already tracks ("add
+checksum/generation fields so stale tickets are rejected") — the fix belongs to the
+waiter-token/token-kernel rework, not to this patch. The sender sites' park-without-
+recheck (`kcoro_park(); return 0;`) also remains by design pending that rework; it
+is sound only while every delivery wakes exactly once, which 0006 restores.
