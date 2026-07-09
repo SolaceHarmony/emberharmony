@@ -12,10 +12,14 @@ C++ kernel program run by a persistent lane team, handing back to Rust once per 
 
 A kernel is ONE native program executed by the resident lane team, owning all control flow
 between published stages — layer loop included. Rust builds the context, rings the doorbell,
-and reads rings; it does not run between stages. As-built today, the backbone FFN MLP is the
-first resident native stage-machine mount. ShortConv and DepthDecode still use native stage
-functions orchestrated from Rust lane closures; their math is kept, but their orchestration
-still needs to be demoted into the full program.
+and reads rings; it does not run between stages. AS-BUILT (2026-07-09, supersedes the line
+below): the WHOLE backbone token is one resident lane program (REQ_TOKEN_PASS: embed →
+every conv/attention layer → final norm), and DepthDecode rides the same team as a
+lane-uniform Rust program via the generic REQ_CALL + exported lane fence. The stage board
+described elsewhere in this file was replaced by generation fences (lane-uniform kernel);
+rayon executes nothing per-token. Current diagrams + numbers: DECODE_ENGINE.md §0.
+Historical (pre-arc): the backbone FFN MLP was the first resident mount, with ShortConv and
+DepthDecode orchestrated from Rust rayon lane closures.
 
 ## 1. The arena — one region, fixed capacities, stable pointers
 

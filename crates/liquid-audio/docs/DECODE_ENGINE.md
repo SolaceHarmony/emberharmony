@@ -16,6 +16,80 @@ the dispatch model, verification, and the build order.
 
 ---
 
+## 0. As-built architecture (2026-07-09, end of the lane-team arc)
+
+Both halves of every decode step run on ONE dispatcher: the kcoro lane team.
+The backbone token is `REQ_TOKEN_PASS` (a C++ lane program resident in the engine);
+the depthformer audio frame is `REQ_CALL` (the bit-pinned Rust ladders, dispatched as
+a lane program on the same team). rayon executes nothing per-token and sizes nothing
+per-token — its remaining tenancy is candle's prefill substrate and the fallback /
+parity-reference paths.
+
+```mermaid
+flowchart LR
+    subgraph turn["Per turn (candle territory)"]
+        MIC["mic + VAD"] --> CONF["conformer audio encoder"]
+        CONF --> PRE["prefill: candle graph<br/>matmuls on AMX via Accelerate"]
+    end
+    subgraph token["Per decode step (engine territory - one doorbell each)"]
+        TP["REQ_TOKEN_PASS<br/>embed → 16-layer walk → final norm<br/>kcoro lane team, generation fences"]
+        TP -- "hidden bits (Tensor storage = engine out plane)" --> HEAD["logits: candle tied head<br/>(ST_LOGITS dormant - RO-tree decision)"]
+        HEAD --> SAMP["seeded sampler"]
+        SAMP -- "next ids" --> TP
+        TP -- "audio step: hidden" --> DF["REQ_CALL: depthformer frame<br/>8 codebooks x 6 blocks, Rust ladders<br/>SAME lane team, sampler on lane 0"]
+        DF -- "8 audio tokens" --> MIMI["Mimi codec"]
+    end
+    PRE --> TP
+    MIMI --> RING["audio ring"] --> SPK["speaker output callback<br/>(plays every queued sample)"]
+```
+
+The thread model: 8 pthreads (torch's P-core policy; the M2 Max has 12 cores /
+12 hardware threads — no SMT — and the headroom belongs to the audio pipeline),
+each hosting exactly one lane coroutine. Between tokens the team parks; each token
+is one rim doorbell, one team wake, ~150 in-arena fences crossed on the spin path,
+and one condvar completion. The measured wake budget is what killed the chop.
+
+```mermaid
+flowchart TB
+    subgraph rim["Rim thread (decode loop, Rust)"]
+        R["write request slot<br/>kcoro_unpark(lane 0) - ONE doorbell<br/>pthread_cond_wait for completion"]
+    end
+    subgraph sched["kc_sched: 8 pthreads (P-cores, no SMT), one lane coroutine each, 512 KiB stacks"]
+        L0["lane 0<br/>request loop + full compute lane"]
+        LN["lanes 1..7<br/>parked between tokens"]
+        L0 -- "lane_gen++ then unpark x7<br/>(one team wake per token)" --> LN
+        L0 --- F
+        LN --- F
+        F{{"~150 generation fences per token<br/>bounded ~100us spin, then precise<br/>mask-declared park (no lost-wake window)<br/>tiles claimed off a bare fetch_add"}}
+    end
+    R -- "doorbell" --> L0
+    L0 -- "program-final fence, then condvar signal" --> R
+    subgraph others["Threads NOT in the token path"]
+        AUD["audio output callback (plays ring)"]
+        RAY["rayon global pool: candle prefill only<br/>(evicted from per-token work)"]
+        TIM["kc_sched timer thread (idle)"]
+    end
+```
+
+Request kinds: `REQ_TOKEN_PASS` (whole backbone token), `REQ_CALL` (generic
+lane-uniform program — the depthformer rides this), `REQ_MLP` / `REQ_CONV_LAYER` /
+`REQ_ATTN_LAYER` (per-block entries, kept for the bit-parity tests). The engine's
+contract surface is deliberately thin — park/unpark doorbells plus fences — because
+that is the exact seam the token-kernel/arena runtime (the GOSUB mainline; see the
+kcoro repo's docs) will serve later: this whole dispatch layer is SCAFFOLDING WITH
+RECEIPTS, kept excellent so voice ships while the correlation engine is built, and
+its patch ledger (kcoro PATCHES.md 0001-0006) is the requirements spec for that
+replacement.
+
+Standing numbers (audible dual-path e2e, quiet M2 Max): CPU 24.3k-26.9k underrun
+samples across nine consecutive runs, last-latency 913-1034 ms, mean 1151-1354 ms —
+ahead of the Metal clean baseline (25,856 / 1656 ms). Bit-exactness: REF
+`2f9c907a…` and PERF `45125c9e…` exact at every rung. Bandwidth ledger: ~66 GB/s
+effective of a ~250 GB/s CPU share (~3 GB weight reads/token ⇒ physics floor
+~12 ms/token ≈ 80 tok/s); the missing 4× is sync dead time (→ the frequency-band
+split), per-core GEMV throughput, and the AMX fast tier — NOT lane count (12-lane
+A/B measured catastrophic via rayon-pool resize + audio-pipeline starvation).
+
 ## 1. The root cause this engine answers
 
 CPU decode of LFM2.5-Audio-1.5B started at **0.13 tok/s** on strong Apple Silicon. Profiling
@@ -378,9 +452,24 @@ owner-only last_task slots; idle waits UNTIMED, the 5ms poll deleted. Wakes are 
 last-latency — the band holds with the poll gone. PATCHES.md 0005 has the full
 mechanism (upstream candidate, includes the workers==1 steal modulo-by-zero fix).
 
+**DepthDecode fold — BUILT (same day, commit cc24540a):** REQ_CALL runs the Rust
+frame program on the engine lanes (ladders untouched — anti-transcription-drift);
+lane count now comes from lfm_engine_lanes, not rayon. SpinBarrier + DISPATCH_LOCK
+survive only in the non-engine fallback. Both oracles exact through the new
+dispatch; audible CPU e2e ×4 in-band. rayon is out of the per-token path. Audio
+token budget raised to 2048 (audio spends tokens faster than text; 32,768-token
+context is the ceiling) and the desktop crate's rotted test suite repaired (42/42).
+
 **Build next:**
-1. Fold DepthDecode onto the same lane team (drop rayon threadgroup +
-   DISPATCH_LOCK) — after that, hidden can stay a raw plane and the last per-token
-   Tensor wrap dies.
-2. ST_LOGITS ladder decision (task #1 — Sydney's call: NT re-arm vs resident
-   transpose vs RO intrinsic), then sampler v2 (ChaCha12), then Mimi (E5).
+1. Frequency-band split (her Hyena shape): lanes own heads/channels/FFN-bands
+   END-TO-END, ~2 callback-joins per block instead of ~9 fences; reassembly =
+   f32 partials + one RNE round (or online-softmax for KV-split attention).
+   Changes reduction trees ⇒ fast-tier / deliberate hash re-arm.
+2. ST_LOGITS ladder decision (Sydney's call: NT re-arm vs resident transpose vs
+   RO intrinsic), then sampler v2 (ChaCha12), then Mimi (E5).
+3. Voice layer: echo provenance (spec-09 W6), then duplex ingest — mic audio
+   micro-prefilled into the KV planes at pass boundaries so the model attends to
+   incoming speech mid-generation (the doorbell contract already checks there).
+4. The GOSUB mainline: kcoro_arena rebuild per its handoff §9 (token-kernel /
+   correlation engine); this engine's seam (park/unpark + fences) is what it
+   replaces from underneath.
