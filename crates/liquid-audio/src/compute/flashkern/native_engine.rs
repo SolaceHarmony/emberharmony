@@ -110,6 +110,7 @@ extern "C" {
         h: usize,
         ffn: usize,
         max_ctx: usize,
+        out_id: *mut u64,
     ) -> i32;
     fn lfm_engine_attn_layer(
         e: *mut c_void,
@@ -124,7 +125,7 @@ extern "C" {
         out: *mut u16,
         lanes: usize,
     ) -> i32;
-    fn lfm_ctx_clear(e: *mut c_void);
+    fn lfm_ctx_clear(e: *mut c_void, id: u64);
     fn lfm_ctx_set_heads(
         e: *mut c_void,
         embed_w: *const u16,
@@ -251,11 +252,25 @@ impl NativeEngine {
 impl NativeEngine {
     /// Install the resident backbone layer table. The pointers must stay valid until
     /// [`Self::ctx_clear`] — the [`BackboneCtxGuard`] enforces clear-before-drop.
-    fn ctx_build(&self, descs: &[LayerDesc], h: usize, ffn: usize, max_ctx: usize) -> bool {
+    /// Single-tenant: returns the install id, or `None` while another install is
+    /// live (that caller keeps its bit-identical candle path).
+    fn ctx_build(&self, descs: &[LayerDesc], h: usize, ffn: usize, max_ctx: usize) -> Option<u64> {
         let _pass = self.pass_lock.lock().unwrap();
+        let mut id = 0u64;
         // SAFETY: descs copied by the C side before return; dims checked there.
-        let rc = unsafe { lfm_ctx_build(self.ptr, descs.as_ptr(), descs.len(), h, ffn, max_ctx) };
-        rc == 0
+        let rc = unsafe {
+            lfm_ctx_build(self.ptr, descs.as_ptr(), descs.len(), h, ffn, max_ctx, &mut id)
+        };
+        if rc == -4 {
+            // Observability for the one legitimate refusal: a CPU→CPU model swap
+            // where the previous model is still alive. That model decodes on the
+            // bit-identical candle path until the old install drops.
+            eprintln!(
+                "[flashkern] ctx install refused: another model's table is live; \
+                 this model decodes on the candle path"
+            );
+        }
+        (rc == 0).then_some(id)
     }
 
     /// Install the head tables (text embed / audio embed / final norm / tied logits).
@@ -365,11 +380,12 @@ impl NativeEngine {
         rc == 0
     }
 
-    fn ctx_clear(&self) {
-        // Serialized against passes: no pass can be in flight while we clear.
+    fn ctx_clear(&self, id: u64) {
+        // Serialized against passes: no pass can be in flight while we clear. The id
+        // keys ownership — a stale guard's clear is a no-op on the C side.
         let _pass = self.pass_lock.lock().unwrap();
         // SAFETY: engine pointer valid for the process lifetime.
-        unsafe { lfm_ctx_clear(self.ptr) };
+        unsafe { lfm_ctx_clear(self.ptr, id) };
     }
 
     /// One whole shortconv+MLP layer in a single doorbell — bit-identical to the
@@ -409,25 +425,39 @@ impl NativeEngine {
     }
 }
 
+/// Cache-resident scratch table of per-layer engine states — allocated once, entries
+/// rewritten every token. The raw pointers inside are meaningful ONLY during the
+/// single blocking `token_pass` call that follows their capture; between passes they
+/// are stale by contract and never dereferenced.
+///
+/// SAFETY (Send): moving the container between threads moves dead pointers; every
+/// live use happens on the capturing thread inside the blocking call.
+#[derive(Default)]
+pub struct StateTable(pub Vec<LayerState>);
+unsafe impl Send for StateTable {}
+
 /// Keeps the resident layer table's backing alive and clears the table before it dies.
 /// `held` owns tensors DERIVED at capture (e.g. the squeezed-contiguous conv weight);
 /// the undived model weights are owned by the model, which must own this guard so the
-/// guard drops (and clears the C table) before those weights do.
+/// guard drops (and clears the C table) before those weights do. The install id keys
+/// ownership: this drop can only clear ITS OWN install, never a later model's.
 pub struct BackboneCtxGuard {
+    id: u64,
     _held: Vec<candle_core::Tensor>,
 }
 
 impl Drop for BackboneCtxGuard {
     fn drop(&mut self) {
         if let Some(engine) = process_engine() {
-            engine.ctx_clear();
+            engine.ctx_clear(self.id);
         }
     }
 }
 
 /// Build + install the backbone layer table on the process engine. Returns the guard
 /// the MODEL must own (declared before its weight fields so it drops first), or `None`
-/// when the engine is unavailable or the build fails — callers keep the per-block path.
+/// when the engine is unavailable, the build fails, or another model's install is
+/// live (single-tenant) — callers keep the per-block path.
 pub fn install_backbone_ctx(
     descs: &[LayerDesc],
     h: usize,
@@ -436,11 +466,9 @@ pub fn install_backbone_ctx(
     held: Vec<candle_core::Tensor>,
 ) -> Option<BackboneCtxGuard> {
     let engine = process_engine()?;
-    if engine.ctx_build(descs, h, ffn, max_ctx) {
-        Some(BackboneCtxGuard { _held: held })
-    } else {
-        None
-    }
+    engine
+        .ctx_build(descs, h, ffn, max_ctx)
+        .map(|id| BackboneCtxGuard { id, _held: held })
 }
 
 impl Drop for NativeEngine {
@@ -726,10 +754,9 @@ mod tests {
             kn_w: cap_ptr(&kn_w),
             ..LayerDesc::attn_placeholder()
         }];
-        assert!(
-            engine.ctx_build(&descs, h, ffn, max_pos),
-            "ctx build failed"
-        );
+        let ctx_id = engine
+            .ctx_build(&descs, h, ffn, max_pos)
+            .expect("ctx build failed");
         let x_bits = bits_of(&x);
         let kp_eng = PtrLen::bf16(&k_plane_eng).unwrap().addr() as *mut u16;
         let vp_eng = PtrLen::bf16(&v_plane_eng).unwrap().addr() as *mut u16;
@@ -752,7 +779,7 @@ mod tests {
         assert_eq!(out_got, out_ref, "layer output");
         assert_eq!(bits_of(&k_plane_eng), kp_ref, "K plane after append");
         assert_eq!(bits_of(&v_plane_eng), vp_ref, "V plane after append");
-        engine.ctx_clear();
+        engine.ctx_clear(ctx_id);
     }
 
     #[test]
@@ -804,7 +831,7 @@ mod tests {
                     ..LayerDesc::attn_placeholder()
                 },
             ];
-            assert!(engine.ctx_build(&descs, h, i, 64), "ctx build failed");
+            let ctx_id = engine.ctx_build(&descs, h, i, 64).expect("ctx build failed");
 
             for lanes in [1usize, 3, 8] {
                 // Composed reference: the two fused blocks the layer runs today.
@@ -845,8 +872,71 @@ mod tests {
                 assert_eq!(state_got, state_ref, "state H={h} I={i} lanes={lanes}");
                 assert_eq!(out_got, out_ref, "out H={h} I={i} lanes={lanes}");
             }
-            engine.ctx_clear();
+            engine.ctx_clear(ctx_id);
         }
+    }
+
+    #[test]
+    fn native_engine_ctx_single_tenant() {
+        // Two installs cannot coexist (the two-model clobber): the second build is
+        // refused while the first is live; a refused/stale id cannot clear the
+        // owner's table; releasing the owner reopens the slot.
+        let _ctx = CTX_TEST_LOCK.lock().unwrap();
+        if !crate::flashkern::decode::fused_mlp_available() {
+            eprintln!("fused kernels unavailable — skipping");
+            return;
+        }
+        let engine = process_engine().expect("native engine init failed");
+        let h = 64usize;
+        let k = 3usize;
+        let i = 96usize;
+        let op_norm = vec![0x3f80u16; h];
+        let ffn_norm = vec![0x3f80u16; h];
+        let in_w = vec![0u16; 3 * h * h];
+        let conv_w = vec![0u16; h * k];
+        let out_w = vec![0u16; h * h];
+        let w1 = vec![0u16; i * h];
+        let w3 = vec![0u16; i * h];
+        let w2 = vec![0u16; h * i];
+        let descs = [LayerDesc {
+            kind: 0,
+            k: k as u32,
+            op_eps: 1e-5,
+            ffn_eps: 1e-5,
+            op_norm_w: op_norm.as_ptr(),
+            ffn_norm_w: ffn_norm.as_ptr(),
+            in_w: in_w.as_ptr(),
+            conv_w: conv_w.as_ptr(),
+            out_w: out_w.as_ptr(),
+            w1: w1.as_ptr(),
+            w3: w3.as_ptr(),
+            w2: w2.as_ptr(),
+            ..LayerDesc::attn_placeholder()
+        }];
+        let first = engine.ctx_build(&descs, h, i, 64).expect("first build");
+        assert!(
+            engine.ctx_build(&descs, h, i, 64).is_none(),
+            "second install must be refused while the first is live"
+        );
+        // A stale/foreign id must not release the owner's install.
+        engine.ctx_clear(first + 1);
+        let x = vec![0u16; h];
+        let state = vec![0u16; h * (k - 1)];
+        let mut state_out = vec![0u16; h * (k - 1)];
+        let mut out = vec![0u16; h];
+        assert!(
+            engine.conv_layer(0, &x, &state, &mut state_out, &mut out, 1),
+            "owner's table must survive a stale clear"
+        );
+        // The owner's clear releases the slot; a new install then succeeds.
+        engine.ctx_clear(first);
+        assert!(
+            !engine.conv_layer(0, &x, &state, &mut state_out, &mut out, 1),
+            "cleared table must refuse passes"
+        );
+        let second = engine.ctx_build(&descs, h, i, 64).expect("post-release build");
+        assert_ne!(first, second, "install ids must be unique");
+        engine.ctx_clear(second);
     }
 
     #[test]

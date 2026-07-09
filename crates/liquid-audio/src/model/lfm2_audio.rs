@@ -1398,39 +1398,46 @@ impl LFM2AudioModel {
         embed_kind: u32,
         want_logits: bool,
     ) -> Result<Option<(Tensor, Option<Tensor>)>> {
+        use half::slice::HalfFloatSliceExt;
         let vocab = self.lfm.embed_weight().dim(0)?;
         // Audio ids arrive RAW (per-codebook tokens); the engine's table is the flat
         // audio-embedding matrix, so apply the codebook offsets here — the same
-        // `t + offset` audio_frame_embed applies.
-        let offset_ids: Vec<u32>;
+        // `t + offset` audio_frame_embed applies. At most 8 codebooks: stack buffer.
+        let mut idbuf = [0u32; 8];
         let ids = if embed_kind == 1 {
-            offset_ids = ids
-                .iter()
-                .zip(&self.codebook_offsets)
-                .map(|(t, o)| (*t as i64 + o) as u32)
-                .collect();
-            &offset_ids[..]
+            if ids.len() > idbuf.len() {
+                return Ok(None);
+            }
+            for (slot, (t, o)) in idbuf.iter_mut().zip(ids.iter().zip(&self.codebook_offsets)) {
+                *slot = (*t as i64 + o) as u32;
+            }
+            &idbuf[..ids.len()]
         } else {
             ids
         };
-        let Some((hidden, logits)) =
-            self.lfm
-                .native_token_pass(cache, *index_pos, ids, embed_kind, want_logits, vocab)?
-        else {
-            return Ok(None);
-        };
-        *index_pos += 1;
-        let h_last = Tensor::from_vec(
-            hidden
-                .iter()
-                .map(|&b| half::bf16::from_bits(b))
-                .collect::<Vec<_>>(),
-            (self.hidden,),
-            &candle_core::Device::Cpu,
+        // The hidden Tensor's own storage doubles as the engine's out plane (bf16 is
+        // bit-transparent over u16) — the one allocation this step makes, and it is
+        // the Tensor the depthformer consumes. The Tensor boundary itself dies when
+        // the depthformer folds onto the lane team / ST_LOGITS revives.
+        let mut h_bits: Vec<half::bf16> = vec![half::bf16::ZERO; self.hidden];
+        let mut logits_buf: Vec<f32> = if want_logits { vec![0f32; vocab] } else { Vec::new() };
+        let served = self.lfm.native_token_pass(
+            cache,
+            *index_pos,
+            ids,
+            embed_kind,
+            h_bits.as_mut_slice().reinterpret_cast_mut(),
+            if want_logits { Some(&mut logits_buf) } else { None },
         )?;
-        let logits = match logits {
-            Some(l) => Some(Tensor::from_vec(l, (vocab,), &candle_core::Device::Cpu)?),
-            None => None,
+        if !served {
+            return Ok(None);
+        }
+        *index_pos += 1;
+        let h_last = Tensor::from_vec(h_bits, (self.hidden,), &candle_core::Device::Cpu)?;
+        let logits = if want_logits {
+            Some(Tensor::from_vec(logits_buf, (vocab,), &candle_core::Device::Cpu)?)
+        } else {
+            None
         };
         Ok(Some((h_last, logits)))
     }

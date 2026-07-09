@@ -171,6 +171,20 @@ pub struct Cache {
     cos: Tensor,
     sin: Tensor,
     device: Device,
+    /// Resident per-layer state table for the native token pass — capacity allocated
+    /// once, entries REWRITTEN each token (fresh pointer captures are the correctness
+    /// mechanism: rollback clones conv states, candle-path steps and KV growth move
+    /// storages; capturing per token self-heals against all of them). What this kills
+    /// is the per-token `Vec` allocation, not the captures.
+    #[cfg(all(
+        has_kcoro,
+        has_native_engine,
+        any(
+            all(target_arch = "aarch64", has_flashkern_neon),
+            all(target_arch = "x86_64", has_flashkern_x86)
+        )
+    ))]
+    pub(crate) native_states: crate::flashkern::native_engine::StateTable,
 }
 
 /// A layer's resident KV storage: preallocated `[B, n_kv, cap, head_dim]` bf16 planes (the
@@ -224,6 +238,15 @@ impl Cache {
             cos,
             sin,
             device: device.clone(),
+            #[cfg(all(
+                has_kcoro,
+                has_native_engine,
+                any(
+                    all(target_arch = "aarch64", has_flashkern_neon),
+                    all(target_arch = "x86_64", has_flashkern_x86)
+                )
+            ))]
+            native_states: Default::default(),
         })
     }
 
@@ -1345,10 +1368,13 @@ impl Model {
     }
 
     /// ONE token through the native engine: embed → every layer → final norm →
-    /// (optionally) logits. Returns the normed hidden bits and the f32 logits, or
-    /// `None` when any gate fails — the caller takes the candle path, bit-identical.
-    /// On success every attention cursor and nothing else has advanced; the caller
-    /// still owns `index_pos`.
+    /// (optionally) logits into the caller's buffers. Returns `Ok(false)` when any
+    /// gate fails — the caller takes the candle path, bit-identical. On success every
+    /// attention cursor and nothing else has advanced; the caller still owns
+    /// `index_pos`. Steady state this allocates NOTHING: the state table is
+    /// cache-resident (entries rewritten — fresh pointer captures each token are the
+    /// correctness mechanism against rollback clones, candle-path interleaves, and
+    /// KV growth) and the outputs land in caller-owned storage.
     #[cfg(all(
         has_kcoro,
         has_native_engine,
@@ -1363,24 +1389,27 @@ impl Model {
         index_pos: usize,
         ids: &[u32],
         embed_kind: u32,
-        want_logits: bool,
-        vocab: usize,
-    ) -> Result<Option<(Vec<u16>, Option<Vec<f32>>)>> {
+        out_hidden: &mut [u16],
+        out_logits: Option<&mut [f32]>,
+    ) -> Result<bool> {
         use crate::flashkern::decode::PtrLen;
         use crate::flashkern::native_engine::{process_engine, LayerState};
         let Some(engine) = process_engine() else {
-            return Ok(None);
+            return Ok(false);
         };
         if !(cache.grouped_gqa_decode
             && cache.use_kv_cache
             && cache.fused_conv_decode
             && crate::bf16_gemm::bf16_gemm_nt_available())
         {
-            return Ok(None);
+            return Ok(false);
         }
+        let hdim = self.embed_tokens.embeddings().dim(1)?;
+        assert_eq!(out_hidden.len(), hdim, "native_token_pass: out_hidden != H");
         // Per-layer state: ensure attention capacity FIRST (growth reallocates), then
-        // capture fresh pointers. Any miss → unserved.
-        let mut states = Vec::with_capacity(self.layers.len());
+        // capture fresh pointers into the resident table. Any miss → unserved.
+        cache.native_states.0.clear();
+        cache.native_states.0.reserve(self.layers.len());
         for (l, layer) in self.layers.iter().enumerate() {
             match &layer.kind {
                 LayerKind::Attention(a) => {
@@ -1394,16 +1423,16 @@ impl Model {
                         &candle_core::Device::Cpu,
                     )?;
                     let Some(sl) = cache.kvs[l].as_ref() else {
-                        return Ok(None);
+                        return Ok(false);
                     };
                     if sl.len != index_pos {
-                        return Ok(None);
+                        return Ok(false);
                     }
                     let (Some(kp), Some(vp)) = (PtrLen::bf16(&sl.k), PtrLen::bf16(&sl.v)) else {
-                        return Ok(None);
+                        return Ok(false);
                     };
                     let cap = sl.k.dim(2)?;
-                    states.push(LayerState {
+                    cache.native_states.0.push(LayerState {
                         k_plane: kp.addr() as *mut u16,
                         v_plane: vp.addr() as *mut u16,
                         head_stride: cap * a.head_dim,
@@ -1412,10 +1441,10 @@ impl Model {
                 }
                 LayerKind::ShortConv(_) => {
                     let Some(st) = cache.conv_states[l].as_ref() else {
-                        return Ok(None);
+                        return Ok(false);
                     };
                     let Some(sp) = PtrLen::bf16(st) else {
-                        return Ok(None);
+                        return Ok(false);
                     };
                     let mut ls = LayerState::none();
                     // SAFETY (in-place advance): the engine shifts the carried window
@@ -1423,44 +1452,34 @@ impl Model {
                     // candle's slice_set performs; decode is sequential and this
                     // thread blocks for the pass.
                     ls.conv_state = sp.addr() as *mut u16;
-                    states.push(ls);
+                    cache.native_states.0.push(ls);
                 }
             }
         }
         let (Some(cosp), Some(sinp)) = (PtrLen::bf16(&cache.cos), PtrLen::bf16(&cache.sin)) else {
-            return Ok(None);
-        };
-        let hdim = self.embed_tokens.embeddings().dim(1)?;
-        let mut hidden = vec![0u16; hdim];
-        let mut logits = if want_logits {
-            vec![0f32; vocab]
-        } else {
-            Vec::new()
+            return Ok(false);
         };
         let lanes = rayon::current_num_threads().max(1);
         let ok = engine.token_pass(
             ids,
             embed_kind,
-            &states,
+            &cache.native_states.0,
             index_pos,
             cosp.addr() as *const u16,
             sinp.addr() as *const u16,
-            &mut hidden,
-            if want_logits { Some(&mut logits) } else { None },
+            out_hidden,
+            out_logits,
             lanes,
         );
         if !ok {
-            return Ok(None);
+            return Ok(false);
         }
         for (l, layer) in self.layers.iter().enumerate() {
             if matches!(layer.kind, LayerKind::Attention(_)) {
                 cache.advance_kv_cursor(l);
             }
         }
-        Ok(Some((
-            hidden,
-            if want_logits { Some(logits) } else { None },
-        )))
+        Ok(true)
     }
 
     pub fn new(cfg: &Lfm2Config, vb: VarBuilder) -> Result<Self> {

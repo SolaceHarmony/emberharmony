@@ -333,6 +333,12 @@ struct Engine {
     TokenReq tok; // token-pass request payload
     size_t dim_h = 0, dim_ffn = 0, dim_kmax = 0;
     std::atomic<bool> ctx_live{false};
+    // Single-tenant ctx ownership: a build claims the slot and mints an id; only the
+    // matching clear releases it. A second model's install FAILS (that model keeps
+    // its bit-identical candle path) instead of silently replacing a live model's
+    // table — and a stale guard's drop can never clear the current owner's install.
+    uint64_t ctx_id = 0;
+    uint64_t ctx_seq = 0;
 
     // Persistent scratch backing. With a ctx built everything is sized ONCE there
     // (fixed-arena: no allocation during passes); the legacy per-call MLP entry still
@@ -1141,10 +1147,14 @@ int lfm_engine_mlp(void *ep, const uint16_t *x, const uint16_t *norm_w,
 // discipline: after a successful build, conv-layer passes allocate nothing.
 // The Rust rim serializes this against passes (pass_lock); pointers must stay valid
 // until lfm_ctx_clear (the model-side guard guarantees clear-before-drop).
+// SINGLE-TENANT: fails with -4 while another install is live; the winning install's
+// id lands in *out_id and is the only key that clears it.
 int lfm_ctx_build(void *ep, const LfmLayerDesc *descs, size_t n_layers, size_t h,
-                  size_t ffn, size_t max_ctx) {
+                  size_t ffn, size_t max_ctx, uint64_t *out_id) {
     Engine *e = (Engine *)ep;
-    if (!e || !descs || n_layers == 0 || h == 0 || ffn == 0 || max_ctx == 0) return -1;
+    if (!e || !descs || n_layers == 0 || h == 0 || ffn == 0 || max_ctx == 0 || !out_id)
+        return -1;
+    if (e->ctx_live.load(std::memory_order_acquire)) return -4;
     size_t kmax = 1, nh = 0, nkv = 0, hd = 0;
     for (size_t l = 0; l < n_layers; ++l) {
         if (descs[l].kind == 0) {
@@ -1198,6 +1208,8 @@ int lfm_ctx_build(void *ep, const LfmLayerDesc *descs, size_t n_layers, size_t h
     e->dim_nh = nh;
     e->dim_nkv = nkv;
     e->dim_hd = hd;
+    e->ctx_id = ++e->ctx_seq;
+    *out_id = e->ctx_id;
     e->ctx_live.store(true, std::memory_order_release);
     return 0;
 }
@@ -1224,10 +1236,13 @@ int lfm_ctx_set_heads(void *ep, const uint16_t *embed_w, size_t vocab,
 }
 
 // Clear the table (weight pointers are about to die with the model). Serialized by the
-// Rust rim's pass lock, so no pass is in flight here.
-void lfm_ctx_clear(void *ep) {
+// Rust rim's pass lock, so no pass is in flight here. Only the owning install's id
+// clears — a stale guard (its build was refused, or it was already superseded) is a
+// no-op instead of clobbering the live owner's table.
+void lfm_ctx_clear(void *ep, uint64_t id) {
     Engine *e = (Engine *)ep;
-    if (!e) return;
+    if (!e || id == 0 || id != e->ctx_id) return;
+    e->ctx_id = 0;
     e->ctx_live.store(false, std::memory_order_release);
     e->layers.clear();
     e->embed_w = nullptr;
