@@ -1,20 +1,24 @@
 // flashkern_engine.cpp — the resident native decode engine (ENGINE_DESIGN.md §2/§3),
-// as a RESIDENT STAGE MACHINE: the engine owns all mutable state; the schedule is an
-// epoch plus an atomic tile index; workers pull indices, never messages. No channels,
-// no descriptor staging, no malloc, no done tokens anywhere in the hot loop — the only
+// as a LANE-UNIFORM KERNEL: the engine owns all mutable state, and every lane runs
+// the ENTIRE pass program — embed, every layer, final norm — exactly the way a GPU
+// threadgroup runs a kernel. There is no coordinator publishing stages to workers:
+// stages are separated by in-arena generation fences (bounded spin, then park), tiles
+// are claimed off a bare fetch_add counter (so an E-core straggler simply claims
+// fewer), and each fence's last arriver runs that boundary's serial ladder work
+// (sumsq folds, conv update, qk-norm/rope/append, embed) exactly once. The only
 // runtime primitives are kcoro park/unpark, made sound by vendored patches 0001 (the
 // three-state park gate: an unpark racing a park parks as a NOTIFIED token, never
-// lost) and 0004 (unpark enqueues to the coroutine's OWNING scheduler, so both the
-// Rust rim's request doorbell and the last worker's stage-done doorbell are legal from
-// any context).
+// lost) and 0004 (unpark enqueues to the coroutine's OWNING scheduler, so doorbells
+// are legal from any context).
 //
-// Shape per pass: the Rust rim writes the request slot and unparks the coordinator
-// (ONE doorbell). The coordinator publishes a stage — kind/count/chunk stores, tile
-// counter to zero, remaining = workers, epoch bump (release) — and unparks the team;
-// workers race the tile counter dry (fetch_add work-stealing), the last one out
-// unparks the coordinator; repeat for the next stage; at the pass boundary the
-// coordinator signals the rim's condvar. Stop/shutdown is observed at pass boundaries
-// only — never polled inside ops.
+// Wake budget per pass: the Rust rim writes the request slot and unparks lane 0 (ONE
+// doorbell); lane 0 bumps the pass generation and unparks the team ONCE; the team
+// runs ~150 fences per token with zero scheduler traffic on the spin path; the
+// program-final fence proves completion and lane 0 signals the rim's condvar. The
+// previous coordinator-publishes model rode kc_sched's lossy park_cv ~400 times per
+// token, and each lost wake serialized a stage for up to 5 ms (the underrun lottery:
+// 24k vs 244k underrun samples on identical builds). Stop/shutdown is observed at
+// pass boundaries only — never polled inside ops.
 //
 // Numerics: stage bodies are line-for-line ports of src/compute/flashkern/decode.rs
 // (fused_mlp_decode) — same RNE bf16 rounding ladder, same FIXED tile count and
@@ -112,30 +116,42 @@ enum : uint32_t {
 };
 
 struct Stage {
-    // {epoch:32 | next:32} in ONE atomic: a tile claim is a CAS that only succeeds
-    // against the epoch it was read under. A straggler holding stage N's snapshot who
-    // races the publish of stage N+1 has its CAS fail on the epoch half and resyncs —
-    // it can never consume a new stage's tile to run old-stage work on it (the
-    // corruption the split epoch/next atomics allowed: tile 0 of the new stage ran
-    // the OLD kind and its real work never ran — caught by the ref oracle).
-    std::atomic<uint64_t> board{0};
-    std::atomic<uint32_t> remaining{0}; // TILES not yet completed — see below
-    uint32_t kind = ST_IDLE;           // written before the board's epoch bump
-    uint32_t count = 0;                // number of tiles this stage
-    uint32_t chunk = 0;                // band width for banded stages
+    // Bare tile-claim counter, reset in the opening fence's serial section. No epoch,
+    // no completion count: fences guarantee no lane can straddle two stages, so a
+    // claim can never be stale, and "all lanes arrived at the next fence" IS the
+    // completion proof (a lane only arrives after finishing its claimed tiles).
+    std::atomic<uint32_t> next{0};
+    uint32_t kind = ST_IDLE; // written in the fence serial, read after fence exit
+    uint32_t count = 0;      // number of tiles this stage
+    uint32_t chunk = 0;      // band width for banded stages
 };
-static inline uint64_t board_pack(uint32_t epoch, uint32_t next) {
-    return ((uint64_t)epoch << 32) | next;
+
+// The generation fence — the GPU barrier idiom on kcoro lanes. Lanes arrive
+// (fetch_add), spin a bounded budget on the generation word, then park; the LAST
+// arriver runs the boundary's serial section exactly once, resets the claim counter,
+// bumps the generation (release — this publishes every plane written before the
+// fence), and precisely unparks any lane that declared itself parked. The park
+// declaration and the waker's mask exchange are RMWs on the same word, so a lane
+// whose declaration lands after the exchange is guaranteed by the RMW chain to see
+// the new generation and never parks — no lost-wake window. Every park sits in a
+// recheck loop, so a stale NOTIFIED token from a bygone fence is one spurious spin,
+// never a correctness event.
+struct Fence {
+    std::atomic<uint32_t> arrived{0};
+    std::atomic<uint32_t> park_mask{0}; // lanes parked on this boundary (bit = lane)
+    std::atomic<uint64_t> gen{0};
+};
+
+static inline void cpu_relax() {
+#if defined(__aarch64__)
+    asm volatile("isb" ::: "memory");
+#else
+    asm volatile("pause" ::: "memory");
+#endif
 }
-static inline uint32_t board_epoch(uint64_t b) { return (uint32_t)(b >> 32); }
-static inline uint32_t board_next(uint64_t b) { return (uint32_t)b; }
-// Completion counts TILES, not workers. The original per-worker roll call required
-// EVERY worker to check in — a parked worker whose wake signal was lost (kc_sched's
-// park_cv has a 5ms timed-wait recovery) stalled the stage AFTER all tiles were done,
-// and at ~200 stage barriers per token under a loaded pipeline that turned bit-exact
-// decode into 54s of audio underruns. With tile-counting, a straggler simply finds the
-// stage drained and re-parks; the stage closes when the WORK is done — whoever
-// completes the last tile rings the coordinator.
+// ~100µs of isb on Apple Silicon: long enough that a one-tile straggler skew never
+// parks, short enough that a genuinely descheduled lane hands its core back.
+constexpr int FENCE_SPIN = 8192;
 
 enum : int {
     REQ_NONE = 0,
@@ -271,13 +287,27 @@ struct TokenReq {
     size_t lanes = 0;
 };
 
+struct Engine;
+struct LaneArg {
+    Engine *e;
+    uint32_t lane;
+};
+
 struct Engine {
     Pass pass;
     Stage stage;
+    Fence fence;
 
-    kcoro_t *coord = nullptr;
-    kcoro_t *workers[MAX_WORKERS] = {};
-    int n_workers = 0;
+    // The lane team. Lane 0 doubles as the request loop (coord_main); lanes 1.. are
+    // lane_main coroutines. lanes_total == dispatcher threads: every lane is runnable
+    // on its own thread for the whole pass — the fence model requires it.
+    kcoro_t *coord = nullptr;            // lane 0
+    kcoro_t *workers[MAX_WORKERS] = {};  // lanes 1..lanes_total-1
+    LaneArg largs[MAX_WORKERS] = {};
+    int n_workers = 0;      // worker COROUTINES (= lanes_total - 1)
+    uint32_t lanes_total = 1;
+    std::atomic<uint64_t> lane_gen{0}; // pass generation: bump + team unpark = go
+    int cur_req = REQ_NONE;            // which program the lanes run this generation
     kc_dispatcher_t *disp = nullptr;
     std::atomic<bool> retire{false}; // workers exit when set (observed while idle)
 
@@ -516,206 +546,173 @@ static void run_tile(uint32_t kind, uint32_t idx, const Stage *st, Engine *e) {
     }
 }
 
-// ---- workers -----------------------------------------------------------------------------
-static void worker_main(void *arg) {
-    Engine *e = (Engine *)arg;
-    uint32_t seen = 0;
-    for (;;) {
-        uint32_t ep = board_epoch(e->stage.board.load(std::memory_order_acquire));
-        if (ep == seen) {
-            if (e->retire.load(std::memory_order_acquire)) return;
-            // Idle: park. The coordinator's epoch-bump + unpark wakes us; the park
-            // gate turns an unpark that lands before this park into an immediate
-            // (spurious-safe) return.
-            kcoro_park();
-            continue;
+// ---- the lane fence -------------------------------------------------------------------
+static inline kcoro_t *lane_co(Engine *e, uint32_t lane) {
+    return lane == 0 ? e->coord : e->workers[lane - 1];
+}
+
+// One stage boundary. `serial` runs exactly once, on the last arriver, AFTER every
+// lane's pre-fence work is complete and BEFORE any lane crosses — the collective
+// serial section. Bit-determinism does not care which lane executes it: all operands
+// live in engine-owned planes and every ladder has a fixed internal order.
+template <typename F>
+static inline void lane_fence(Engine *e, uint32_t lane, F &&serial) {
+    Fence *f = &e->fence;
+    uint64_t g = f->gen.load(std::memory_order_relaxed);
+    if (f->arrived.fetch_add(1, std::memory_order_acq_rel) + 1 == e->lanes_total) {
+        serial();
+        f->arrived.store(0, std::memory_order_relaxed); // before the release below
+        f->gen.store(g + 1, std::memory_order_release);
+        // Precise wake: only lanes that declared a park. The exchange is ordered
+        // after the gen bump, so a declaration that misses this exchange is
+        // guaranteed (RMW chain on park_mask) to observe the new generation.
+        uint32_t m = f->park_mask.exchange(0, std::memory_order_acq_rel);
+        while (m) {
+            uint32_t b = (uint32_t)__builtin_ctz(m);
+            m &= m - 1;
+            kcoro_unpark(lane_co(e, b));
         }
-        seen = ep;
-        const uint32_t kind = e->stage.kind;
-        const uint32_t count = e->stage.count;
-        // Claim tiles with an epoch-checked CAS: the claim succeeds only against the
-        // epoch this snapshot was taken under.
-        uint64_t b = e->stage.board.load(std::memory_order_acquire);
-        for (;;) {
-            if (board_epoch(b) != ep) break; // a newer stage published — resync
-            uint32_t idx = board_next(b);
-            if (idx >= count) break; // drained
-            if (!e->stage.board.compare_exchange_weak(b, board_pack(ep, idx + 1),
-                                                      std::memory_order_acq_rel,
-                                                      std::memory_order_acquire)) {
-                continue; // b reloaded by the failed CAS
-            }
-            run_tile(kind, idx, &e->stage, e);
-            // Whoever completes the LAST tile closes the stage — workers that never
-            // woke are irrelevant to completion.
-            if (e->stage.remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-                kcoro_unpark(e->coord);
-            }
-            b = e->stage.board.load(std::memory_order_acquire);
-        }
+        return;
     }
+    for (int i = 0; i < FENCE_SPIN; ++i) {
+        if (f->gen.load(std::memory_order_acquire) != g) return;
+        cpu_relax();
+    }
+    // Slow path: declare, recheck, park. Parks recheck in a loop — a stale NOTIFIED
+    // token or a spurious unpark from a lingering declaration is absorbed here.
+    f->park_mask.fetch_or(1u << lane, std::memory_order_acq_rel);
+    while (f->gen.load(std::memory_order_acquire) == g) kcoro_park();
+    f->park_mask.fetch_and(~(1u << lane), std::memory_order_acq_rel);
 }
 
-// ---- coordinator ---------------------------------------------------------------------------
-static void publish_stage(Engine *e, uint32_t kind, uint32_t count, uint32_t chunk) {
-    if (count == 0) return; // nothing to run; wait_stage_done sees remaining == 0
-    e->stage.kind = kind;
-    e->stage.count = count;
-    e->stage.chunk = chunk;
-    e->stage.remaining.store(count, std::memory_order_relaxed);
-    uint32_t ep =
-        board_epoch(e->stage.board.load(std::memory_order_relaxed)) + 1;
-    // One release store publishes {new epoch, tile 0} atomically — stale claims
-    // CAS-fail on the epoch half.
-    e->stage.board.store(board_pack(ep, 0), std::memory_order_release);
-    for (int w = 0; w < e->n_workers; ++w) kcoro_unpark(e->workers[w]);
-}
-
-// The coordinator PARTICIPATES: after publishing it claims tiles off the same board
-// instead of parking. Stage START therefore never depends on a worker wake (the
-// coordinator is already running), and stage END usually needs no wake either — the
-// coordinator often runs the last tile itself. This collapses the per-stage critical
-// wake count from ~2 to ~0 and removes the run-to-run underrun lottery that kc_sched's
-// lossy park_cv signal (5ms timed-wait recovery) made of the CPU real-time path
-// (observed: same build, 24,832 vs 243,968 underrun samples across two runs).
-static void coord_run_tiles(Engine *e) {
-    const uint32_t kind = e->stage.kind;
-    const uint32_t count = e->stage.count;
-    uint64_t b = e->stage.board.load(std::memory_order_acquire);
-    const uint32_t ep = board_epoch(b);
+// One stage: fence in (serial section + claim-counter reset), then claim tiles off
+// the bare counter until dry. Every lane calls this with IDENTICAL (kind, count,
+// chunk) — all derived from shared engine state — so no lane needs a publish to
+// learn the schedule. Claim order is bit-irrelevant: tiles write disjoint cells and
+// every cross-tile fold happens serially in a later fence, in fixed tile order.
+template <typename F>
+static void run_stage(Engine *e, uint32_t lane, uint32_t kind, uint32_t count,
+                      uint32_t chunk, F &&pre) {
+    lane_fence(e, lane, [&] {
+        pre();
+        e->stage.kind = kind;
+        e->stage.count = count;
+        e->stage.chunk = chunk;
+        e->stage.next.store(0, std::memory_order_relaxed);
+    });
     for (;;) {
-        if (board_epoch(b) != ep) break;
-        uint32_t idx = board_next(b);
+        uint32_t idx = e->stage.next.fetch_add(1, std::memory_order_relaxed);
         if (idx >= count) break;
-        if (!e->stage.board.compare_exchange_weak(b, board_pack(ep, idx + 1),
-                                                  std::memory_order_acq_rel,
-                                                  std::memory_order_acquire)) {
-            continue;
-        }
         run_tile(kind, idx, &e->stage, e);
-        e->stage.remaining.fetch_sub(1, std::memory_order_acq_rel);
-        b = e->stage.board.load(std::memory_order_acquire);
     }
 }
 
-static void wait_stage_done(Engine *e) {
-    coord_run_tiles(e); // work first: the board is usually drained by the time we park
-    while (e->stage.remaining.load(std::memory_order_acquire) != 0) kcoro_park();
-}
-
-static void run_mlp(Engine *e) {
+// ---- the pass programs (every lane runs these, whole) ----------------------------------
+// `tiles` is computed identically by every lane from shared immutable state (it is
+// the partial-fold structure — pinned numerics); `first_pre` wires the Pass pointers
+// exactly once (fence serial) before any ST_SUMSQ tile runs.
+template <typename F>
+static void run_mlp(Engine *e, uint32_t lane, uint32_t tiles, F &&first_pre) {
     Pass *p = &e->pass;
-    const uint32_t tiles = (uint32_t)p->tiles;
 
-    publish_stage(e, ST_SUMSQ, tiles, 0);
-    wait_stage_done(e);
+    run_stage(e, lane, ST_SUMSQ, tiles, 0, std::forward<F>(first_pre));
 
-    // Serial fold in fixed tile order — matches the reference exactly.
-    float total = 0.f;
-    for (uint32_t l = 0; l < tiles; ++l) total += p->partials[l];
-    float rs = 1.0f / std::sqrt(total / (float)p->h + p->eps);
-    uint32_t rsb;
-    std::memcpy(&rsb, &rs, 4);
-    p->rs_bits.store(rsb, std::memory_order_release);
-
-    publish_stage(e, ST_NORM, tiles, 0);
-    wait_stage_done(e);
+    run_stage(e, lane, ST_NORM, tiles, 0, [&] {
+        // Serial fold in fixed tile order — matches the reference exactly.
+        float total = 0.f;
+        for (uint32_t l = 0; l < tiles; ++l) total += p->partials[l];
+        float rs = 1.0f / std::sqrt(total / (float)p->h + p->eps);
+        uint32_t rsb;
+        std::memcpy(&rsb, &rs, 4);
+        p->rs_bits.store(rsb, std::memory_order_release);
+    });
 
     uint32_t i_chunk = (uint32_t)((p->i + tiles - 1) / tiles);
-    publish_stage(e, ST_GATEUP, (uint32_t)((p->i + i_chunk - 1) / i_chunk), i_chunk);
-    wait_stage_done(e);
+    run_stage(e, lane, ST_GATEUP, (uint32_t)((p->i + i_chunk - 1) / i_chunk), i_chunk,
+              [] {});
 
     uint32_t h_chunk = (uint32_t)((p->h + tiles - 1) / tiles);
     if (h_chunk > DOWN_BAND_CAP) h_chunk = DOWN_BAND_CAP;
-    publish_stage(e, ST_DOWN, (uint32_t)((p->h + h_chunk - 1) / h_chunk), h_chunk);
-    wait_stage_done(e);
+    run_stage(e, lane, ST_DOWN, (uint32_t)((p->h + h_chunk - 1) / h_chunk), h_chunk,
+              [] {});
 }
 
-// One whole shortconv+MLP layer. Stage bodies are decode.rs::fused_shortconv_decode
-// ported verbatim: candle-order sumsq computed serially here (the reference computes it
-// once on lane 0), banded elementwise/GEMV stages on the board, the tiny conv update
-// serial here (reference: lane 0), then the MLP block on the layer's ffn weights with
-// the conv output as its input — all without leaving the engine.
-static void run_conv_block(Engine *e, const LfmLayerDesc *d, const uint16_t *x,
-                           const uint16_t *state_in, uint16_t *state_out, uint16_t *out,
-                           size_t lanes) {
+// One whole shortconv+MLP layer, lane-uniform. Stage bodies are
+// decode.rs::fused_shortconv_decode ported verbatim: candle-order sumsq and the tiny
+// conv update run in fence serial sections (the reference computes them once on lane
+// 0), banded elementwise/GEMV stages claim off the counter, then the MLP block on
+// the layer's ffn weights with the conv output as its input — all without leaving
+// the engine. Every lane executes this whole function with identical arguments.
+static void run_conv_block(Engine *e, uint32_t lane, const LfmLayerDesc *d,
+                           const uint16_t *x, const uint16_t *state_in,
+                           uint16_t *state_out, uint16_t *out, size_t lanes) {
     ScPass *c = &e->sc;
     const size_t h = e->dim_h;
-
-    // Wire the shortconv stage pointers for this pass.
-    c->x = x;
-    c->norm_w = d->op_norm_w;
-    c->in_w = d->in_w;
-    c->out_w = d->out_w;
-    c->state_out = state_out;
-    c->h = h;
-    c->k = d->k;
-    c->xn = e->sc_xn.data();
-    c->bcxf = e->sc_bcxf.data();
-    c->bcxb = e->sc_bcxb.data();
-    c->conv = e->sc_conv.data();
-    c->projf = e->sc_projf.data();
-    c->projb = e->sc_projb.data();
-    c->stage = e->sc_stage.data();
-    c->mid = e->sc_mid.data();
-
     if (lanes < 1) lanes = 1;
     uint32_t sc_tiles = (uint32_t)(lanes > h ? h : lanes);
-
-    // Stage 1 (serial, candle's exact reduction — reference runs it once on lane 0).
-    float total = lfm_bf16_sumsq_candle_f32(x, (int)h);
-    float inv_rms = 1.0f / std::sqrt(total / (float)h + d->op_eps);
-    uint32_t rsb;
-    std::memcpy(&rsb, &inv_rms, 4);
-    c->rs_bits.store(rsb, std::memory_order_release);
-
     uint32_t hc = (uint32_t)((h + sc_tiles - 1) / sc_tiles);
-    publish_stage(e, ST_SC_NORM, (uint32_t)((h + hc - 1) / hc), hc);
-    wait_stage_done(e);
-
     uint32_t pc = (uint32_t)((3 * h + sc_tiles - 1) / sc_tiles);
-    publish_stage(e, ST_SC_INPROJ, (uint32_t)((3 * h + pc - 1) / pc), pc);
-    wait_stage_done(e);
 
-    // Conv update (serial — ~0.1% of the block; reference: lane 0). In-place carried
-    // state is safe: this reads state_in fully before ST_SC_GATHER writes state_out.
-    lfm_conv1d_update_bf16(c->bcxb, state_in, d->conv_w, c->conv, 1, (int)h, 1,
-                           (int)d->k);
+    run_stage(e, lane, ST_SC_NORM, (uint32_t)((h + hc - 1) / hc), hc, [&] {
+        // Wire the shortconv stage pointers for this pass, then candle's exact
+        // serial reduction — the previous layer's writes are complete (fence).
+        c->x = x;
+        c->norm_w = d->op_norm_w;
+        c->in_w = d->in_w;
+        c->out_w = d->out_w;
+        c->state_out = state_out;
+        c->h = h;
+        c->k = d->k;
+        c->xn = e->sc_xn.data();
+        c->bcxf = e->sc_bcxf.data();
+        c->bcxb = e->sc_bcxb.data();
+        c->conv = e->sc_conv.data();
+        c->projf = e->sc_projf.data();
+        c->projb = e->sc_projb.data();
+        c->stage = e->sc_stage.data();
+        c->mid = e->sc_mid.data();
+        float total = lfm_bf16_sumsq_candle_f32(x, (int)h);
+        float inv_rms = 1.0f / std::sqrt(total / (float)h + d->op_eps);
+        uint32_t rsb;
+        std::memcpy(&rsb, &inv_rms, 4);
+        c->rs_bits.store(rsb, std::memory_order_release);
+    });
 
-    publish_stage(e, ST_SC_GATHER, (uint32_t)((h + hc - 1) / hc), hc);
-    wait_stage_done(e);
+    run_stage(e, lane, ST_SC_INPROJ, (uint32_t)((3 * h + pc - 1) / pc), pc, [] {});
 
-    publish_stage(e, ST_SC_OUTPROJ, (uint32_t)((h + hc - 1) / hc), hc);
-    wait_stage_done(e);
+    run_stage(e, lane, ST_SC_GATHER, (uint32_t)((h + hc - 1) / hc), hc, [&] {
+        // Conv update (serial — ~0.1% of the block; reference: lane 0). In-place
+        // carried state is safe: this reads state_in fully before any ST_SC_GATHER
+        // tile writes state_out.
+        lfm_conv1d_update_bf16(c->bcxb, state_in, d->conv_w, c->conv, 1, (int)h, 1,
+                               (int)d->k);
+    });
 
-    // MLP block on the layer's ffn weights: input = mid, output = out.
-    Pass *m = &e->pass;
+    run_stage(e, lane, ST_SC_OUTPROJ, (uint32_t)((h + hc - 1) / hc), hc, [] {});
+
+    // MLP block on the layer's ffn weights: input = mid, output = out. The wiring
+    // rides ST_SUMSQ's fence serial — the fence also proves ST_SC_OUTPROJ drained
+    // (xn reuse: pipelining these blocks would corrupt the plane).
     size_t cap = h < e->dim_ffn ? h : e->dim_ffn;
-    m->x = c->mid;
-    m->norm_w = d->ffn_norm_w;
-    m->w1 = d->w1;
-    m->w3 = d->w3;
-    m->w2 = d->w2;
-    m->out = out;
-    m->h = h;
-    m->i = e->dim_ffn;
-    m->eps = d->ffn_eps;
-    m->tiles = lanes > cap ? cap : lanes;
-    m->partials = e->sc_partials.data();
-    // xn reuse: SEQUENTIAL dependency — the MLP block must not start until
-    // ST_SC_OUTPROJ drains (wait_stage_done above). Pipelining these blocks would
-    // corrupt the plane.
-    m->xn = e->sc_xn.data();
-    m->gu = e->sc_gu.data();
-    m->t = e->sc_t.data();
-    m->rs_bits.store(0, std::memory_order_relaxed);
-    run_mlp(e);
-}
-
-static void run_conv_layer(Engine *e) {
-    const ConvReq *r = &e->conv;
-    run_conv_block(e, &e->layers[r->layer], r->x, r->state_in, r->state_out, r->out,
-                   r->lanes);
+    uint32_t m_tiles = (uint32_t)(lanes > cap ? cap : lanes);
+    run_mlp(e, lane, m_tiles, [&] {
+        Pass *m = &e->pass;
+        m->x = c->mid;
+        m->norm_w = d->ffn_norm_w;
+        m->w1 = d->w1;
+        m->w3 = d->w3;
+        m->w2 = d->w2;
+        m->out = out;
+        m->h = h;
+        m->i = e->dim_ffn;
+        m->eps = d->ffn_eps;
+        m->tiles = m_tiles;
+        m->partials = e->sc_partials.data();
+        m->xn = e->sc_xn.data();
+        m->gu = e->sc_gu.data();
+        m->t = e->sc_t.data();
+        m->rs_bits.store(0, std::memory_order_relaxed);
+    });
 }
 
 // Serial per-head helpers for the attention pass (tiny next to the GEMVs; the
@@ -757,12 +754,14 @@ static void rope_slow_row(uint16_t *x, const uint16_t *cos_row, const uint16_t *
     }
 }
 
-// One whole attention+MLP layer. Stage bodies are the candle wrapper ops and
-// attn_decode_bf16 ported at the same rounding points; the serial section (qk-norm,
-// rope, KV append) is per-head work two orders of magnitude below the GEMVs.
-static void run_attn_block(Engine *e, size_t layer_idx, const uint16_t *x,
-                           uint16_t *k_plane, uint16_t *v_plane, size_t head_stride,
-                           size_t pos, const uint16_t *cos_base,
+// One whole attention+MLP layer, lane-uniform. Stage bodies are the candle wrapper
+// ops and attn_decode_bf16 ported at the same rounding points; the serial section
+// (qk-norm, rope, KV append) is per-head work two orders of magnitude below the
+// GEMVs and rides ST_AT_HEAD's fence serial. Every lane executes this whole function
+// with identical arguments.
+static void run_attn_block(Engine *e, uint32_t lane, size_t layer_idx,
+                           const uint16_t *x, uint16_t *k_plane, uint16_t *v_plane,
+                           size_t head_stride, size_t pos, const uint16_t *cos_base,
                            const uint16_t *sin_base, uint16_t *out, size_t lanes) {
     const LfmLayerDesc *d = &e->layers[layer_idx];
     ScPass *c = &e->sc;
@@ -771,137 +770,133 @@ static void run_attn_block(Engine *e, size_t layer_idx, const uint16_t *x,
     const size_t nh = d->n_head, nkv = d->n_kv, hd = d->hd;
     if (lanes < 1) lanes = 1;
     uint32_t tiles = (uint32_t)(lanes > h ? h : lanes);
-
-    // Wire stage pointers. The conv pass planes are reused where shapes allow — a
-    // single request is in flight at a time, never both kinds at once.
-    c->x = x;
-    c->norm_w = d->op_norm_w;
-    c->h = h;
-    c->xn = e->sc_xn.data();
-    c->projf = e->sc_projf.data(); // ST_AT_OPROJ reuses the conv pass's proj planes
-    c->stage = e->sc_stage.data();
-    a->o_w = d->o_w;
-    a->qkvf = e->at_qkvf.data();
-    a->qkvb = e->at_qkvb.data();
-    a->ybits = e->at_y.data();
-    a->att = e->at_att.data();
-    a->x = x;
-    a->mid = e->sc_mid.data();
-    a->k_plane = k_plane;
-    a->v_plane = v_plane;
-    a->head_stride = head_stride;
-    a->att_len = pos + 1;
-    a->max_ctx = e->dim_maxctx;
-    a->h = h;
-    a->n_head = nh;
-    a->n_kv = nkv;
-    a->hd = hd;
-
-    // operator norm: candle-order sumsq (serial) + banded norm apply.
-    float total = lfm_bf16_sumsq_candle_f32(x, (int)h);
-    float inv_rms = 1.0f / std::sqrt(total / (float)h + d->op_eps);
-    uint32_t rsb;
-    std::memcpy(&rsb, &inv_rms, 4);
-    c->rs_bits.store(rsb, std::memory_order_release);
     uint32_t hc = (uint32_t)((h + tiles - 1) / tiles);
-    publish_stage(e, ST_SC_NORM, (uint32_t)((h + hc - 1) / hc), hc);
-    wait_stage_done(e);
+
+    run_stage(e, lane, ST_SC_NORM, (uint32_t)((h + hc - 1) / hc), hc, [&] {
+        // Wire stage pointers. The conv pass planes are reused where shapes allow —
+        // a single request is in flight at a time, never both kinds at once.
+        e->attn.layer = layer_idx; // ST_AT_QKV routes weights via this index
+        c->x = x;
+        c->norm_w = d->op_norm_w;
+        c->h = h;
+        c->xn = e->sc_xn.data();
+        c->projf = e->sc_projf.data(); // ST_AT_OPROJ reuses the conv proj planes
+        c->stage = e->sc_stage.data();
+        a->o_w = d->o_w;
+        a->qkvf = e->at_qkvf.data();
+        a->qkvb = e->at_qkvb.data();
+        a->ybits = e->at_y.data();
+        a->att = e->at_att.data();
+        a->x = x;
+        a->mid = e->sc_mid.data();
+        a->k_plane = k_plane;
+        a->v_plane = v_plane;
+        a->head_stride = head_stride;
+        a->att_len = pos + 1;
+        a->max_ctx = e->dim_maxctx;
+        a->h = h;
+        a->n_head = nh;
+        a->n_kv = nkv;
+        a->hd = hd;
+        // operator norm: candle-order sumsq, serial.
+        float total = lfm_bf16_sumsq_candle_f32(x, (int)h);
+        float inv_rms = 1.0f / std::sqrt(total / (float)h + d->op_eps);
+        uint32_t rsb;
+        std::memcpy(&rsb, &inv_rms, 4);
+        c->rs_bits.store(rsb, std::memory_order_release);
+    });
 
     // q|k|v projections, banded over the concatenated row space.
     size_t total_rows = (nh + 2 * nkv) * hd;
     uint32_t qc = (uint32_t)((total_rows + tiles - 1) / tiles);
-    publish_stage(e, ST_AT_QKV, (uint32_t)((total_rows + qc - 1) / qc), qc);
-    wait_stage_done(e);
+    run_stage(e, lane, ST_AT_QKV, (uint32_t)((total_rows + qc - 1) / qc), qc, [] {});
 
-    // Serial: per-head qk-norm + rope, then append this step's K/V rows at the cursor.
-    const uint16_t *cos_row = cos_base + pos * (hd / 2);
-    const uint16_t *sin_row = sin_base + pos * (hd / 2);
-    uint16_t *qrows = a->qkvb;
-    uint16_t *krows = a->qkvb + nh * hd;
-    const uint16_t *vrows = a->qkvb + (nh + nkv) * hd;
-    for (size_t qh = 0; qh < nh; ++qh) {
-        qk_norm_row(qrows + qh * hd, d->qn_w, qrows + qh * hd, hd, d->qk_eps);
-        rope_slow_row(qrows + qh * hd, cos_row, sin_row, hd);
-    }
-    for (size_t kh = 0; kh < nkv; ++kh) {
-        qk_norm_row(krows + kh * hd, d->kn_w, krows + kh * hd, hd, d->qk_eps);
-        rope_slow_row(krows + kh * hd, cos_row, sin_row, hd);
-        std::memcpy(k_plane + kh * head_stride + pos * hd, krows + kh * hd,
-                    hd * sizeof(uint16_t));
-        std::memcpy(v_plane + kh * head_stride + pos * hd, vrows + kh * hd,
-                    hd * sizeof(uint16_t));
-    }
-
-    // Attention: one tile per q head over the (now pos+1)-row planes.
-    publish_stage(e, ST_AT_HEAD, (uint32_t)nh, 1);
-    wait_stage_done(e);
+    // Attention: one tile per q head over the (then pos+1)-row planes; the fence
+    // serial first runs per-head qk-norm + rope and appends this step's K/V rows.
+    run_stage(e, lane, ST_AT_HEAD, (uint32_t)nh, 1, [&] {
+        const uint16_t *cos_row = cos_base + pos * (hd / 2);
+        const uint16_t *sin_row = sin_base + pos * (hd / 2);
+        uint16_t *qrows = a->qkvb;
+        uint16_t *krows = a->qkvb + nh * hd;
+        const uint16_t *vrows = a->qkvb + (nh + nkv) * hd;
+        for (size_t qh = 0; qh < nh; ++qh) {
+            qk_norm_row(qrows + qh * hd, d->qn_w, qrows + qh * hd, hd, d->qk_eps);
+            rope_slow_row(qrows + qh * hd, cos_row, sin_row, hd);
+        }
+        for (size_t kh = 0; kh < nkv; ++kh) {
+            qk_norm_row(krows + kh * hd, d->kn_w, krows + kh * hd, hd, d->qk_eps);
+            rope_slow_row(krows + kh * hd, cos_row, sin_row, hd);
+            std::memcpy(k_plane + kh * head_stride + pos * hd, krows + kh * hd,
+                        hd * sizeof(uint16_t));
+            std::memcpy(v_plane + kh * head_stride + pos * hd, vrows + kh * hd,
+                        hd * sizeof(uint16_t));
+        }
+    });
 
     // o_proj + residual → mid.
-    publish_stage(e, ST_AT_OPROJ, (uint32_t)((h + hc - 1) / hc), hc);
-    wait_stage_done(e);
+    run_stage(e, lane, ST_AT_OPROJ, (uint32_t)((h + hc - 1) / hc), hc, [] {});
 
     // MLP block on the layer's ffn weights: input = mid, output = the request's out.
-    Pass *m = &e->pass;
     size_t cap = h < e->dim_ffn ? h : e->dim_ffn;
-    m->x = a->mid;
-    m->norm_w = d->ffn_norm_w;
-    m->w1 = d->w1;
-    m->w3 = d->w3;
-    m->w2 = d->w2;
-    m->out = out;
-    m->h = h;
-    m->i = e->dim_ffn;
-    m->eps = d->ffn_eps;
-    m->tiles = lanes > cap ? cap : lanes;
-    m->partials = e->sc_partials.data();
-    m->xn = e->sc_xn.data();
-    m->gu = e->sc_gu.data();
-    m->t = e->sc_t.data();
-    m->rs_bits.store(0, std::memory_order_relaxed);
-    run_mlp(e);
-}
-
-static void run_attn_layer(Engine *e) {
-    const AttnReq *r = &e->attn;
-    run_attn_block(e, r->layer, r->x, r->k_plane, r->v_plane, r->head_stride, r->pos,
-                   r->cos_base, r->sin_base, r->out, r->lanes);
+    uint32_t m_tiles = (uint32_t)(lanes > cap ? cap : lanes);
+    run_mlp(e, lane, m_tiles, [&] {
+        Pass *m = &e->pass;
+        m->x = a->mid;
+        m->norm_w = d->ffn_norm_w;
+        m->w1 = d->w1;
+        m->w3 = d->w3;
+        m->w2 = d->w2;
+        m->out = out;
+        m->h = h;
+        m->i = e->dim_ffn;
+        m->eps = d->ffn_eps;
+        m->tiles = m_tiles;
+        m->partials = e->sc_partials.data();
+        m->xn = e->sc_xn.data();
+        m->gu = e->sc_gu.data();
+        m->t = e->sc_t.data();
+        m->rs_bits.store(0, std::memory_order_relaxed);
+    });
 }
 
 // THE token pass: embed → every layer (ping-pong hidden planes, per-layer state from
 // the request) → final embedding-norm → tied logits. One doorbell per token; the
-// doorbell (shutdown/cancel) is observed only between passes.
-static void run_token_pass(Engine *e) {
+// doorbell (shutdown/cancel) is observed only between passes. Lane-uniform: every
+// lane walks the identical layer program (control flow reads only shared state, so
+// the lanes' h0/h1 locals swap in lockstep).
+static void run_token_pass(Engine *e, uint32_t lane) {
     const TokenReq *t = &e->tok;
     const size_t h = e->dim_h;
     size_t lanes = t->lanes < 1 ? 1 : t->lanes;
     uint16_t *h0 = e->tk_h0.data();
     uint16_t *h1 = e->tk_h1.data();
 
-    // Embed (serial — at most 8 rows). Text: one table row copied verbatim. Audio:
-    // candle's `.sum(0)` over the gathered rows — sequential bf16 adds from a bf16
-    // zero, one RNE round per step (candle's in-dtype CPU reduction).
-    if (t->embed_kind == 0) {
-        std::memcpy(h0, e->embed_w + (size_t)t->ids[0] * h, h * sizeof(uint16_t));
-    } else {
-        for (size_t j = 0; j < h; ++j) h0[j] = 0;
-        for (size_t c = 0; c < t->n_ids; ++c) {
-            const uint16_t *row = e->audio_embed_w + (size_t)t->ids[c] * h;
-            for (size_t j = 0; j < h; ++j) {
-                h0[j] = rb_bits(bf16_f32(h0[j]) + bf16_f32(row[j]));
+    lane_fence(e, lane, [&] {
+        // Embed (serial — at most 8 rows). Text: one table row copied verbatim.
+        // Audio: candle's `.sum(0)` over the gathered rows — sequential bf16 adds
+        // from a bf16 zero, one RNE round per step (candle's in-dtype reduction).
+        if (t->embed_kind == 0) {
+            std::memcpy(h0, e->embed_w + (size_t)t->ids[0] * h, h * sizeof(uint16_t));
+        } else {
+            for (size_t j = 0; j < h; ++j) h0[j] = 0;
+            for (size_t c = 0; c < t->n_ids; ++c) {
+                const uint16_t *row = e->audio_embed_w + (size_t)t->ids[c] * h;
+                for (size_t j = 0; j < h; ++j) {
+                    h0[j] = rb_bits(bf16_f32(h0[j]) + bf16_f32(row[j]));
+                }
             }
         }
-    }
+    });
 
     // The layer walk. x = h0, out = h1, swap — no Tensor, no Rust, no copies.
     for (size_t l = 0; l < e->layers.size(); ++l) {
         const LfmLayerDesc *d = &e->layers[l];
         const LfmLayerState *st = &t->states[l];
         if (d->kind == 0) {
-            run_conv_block(e, d, h0, st->conv_state, st->conv_state, h1, lanes);
+            run_conv_block(e, lane, d, h0, st->conv_state, st->conv_state, h1, lanes);
         } else {
-            e->attn.layer = l; // ST_AT_QKV routes weights via this index
-            run_attn_block(e, l, h0, st->k_plane, st->v_plane, st->head_stride, t->pos,
-                           t->cos_base, t->sin_base, h1, lanes);
+            run_attn_block(e, lane, l, h0, st->k_plane, st->v_plane, st->head_stride,
+                           t->pos, t->cos_base, t->sin_base, h1, lanes);
         }
         uint16_t *tmp = h0;
         h0 = h1;
@@ -910,29 +905,82 @@ static void run_token_pass(Engine *e) {
 
     // Final embedding-norm (candle RmsNorm: f32 arithmetic, one bf16 round), banded.
     ScPass *c = &e->sc;
-    float total = lfm_bf16_sumsq_candle_f32(h0, (int)h);
-    float inv_rms = 1.0f / std::sqrt(total / (float)h + e->emb_norm_eps);
-    uint32_t rsb;
-    std::memcpy(&rsb, &inv_rms, 4);
-    c->rs_bits.store(rsb, std::memory_order_release);
-    c->x = h0;
-    c->norm_w = e->emb_norm_w;
-    c->h = h;
-    c->xn = t->out_hidden;
     uint32_t tiles = (uint32_t)(lanes > h ? h : lanes);
     uint32_t hc = (uint32_t)((h + tiles - 1) / tiles);
-    publish_stage(e, ST_SC_NORM, (uint32_t)((h + hc - 1) / hc), hc);
-    wait_stage_done(e);
+    run_stage(e, lane, ST_SC_NORM, (uint32_t)((h + hc - 1) / hc), hc, [&] {
+        float total = lfm_bf16_sumsq_candle_f32(h0, (int)h);
+        float inv_rms = 1.0f / std::sqrt(total / (float)h + e->emb_norm_eps);
+        uint32_t rsb;
+        std::memcpy(&rsb, &inv_rms, 4);
+        c->rs_bits.store(rsb, std::memory_order_release);
+        c->x = h0;
+        c->norm_w = e->emb_norm_w;
+        c->h = h;
+        c->xn = t->out_hidden;
+    });
 
     // Tied logits head over the normed hidden — the heavy stage; real row bands.
     if (t->out_logits && e->vocab > 0) {
         uint32_t vc = (uint32_t)((e->vocab + (size_t)e->n_workers * 4 - 1) /
                                  ((size_t)e->n_workers * 4));
-        publish_stage(e, ST_LOGITS, (uint32_t)((e->vocab + vc - 1) / vc), vc);
-        wait_stage_done(e);
+        run_stage(e, lane, ST_LOGITS, (uint32_t)((e->vocab + vc - 1) / vc), vc, [] {});
     }
 }
 
+// The per-generation program, dispatched identically on every lane; the final fence
+// proves ALL tiles landed before lane 0 signals the rim. Request payloads are written
+// by the rim before its doorbell and read-only for the whole generation.
+static void lane_program(Engine *e, uint32_t lane) {
+    switch (e->cur_req) {
+    case REQ_MLP:
+        // The rim wired the Pass (including tiles) before the doorbell.
+        run_mlp(e, lane, (uint32_t)e->pass.tiles, [] {});
+        break;
+    case REQ_CONV_LAYER: {
+        const ConvReq *r = &e->conv;
+        run_conv_block(e, lane, &e->layers[r->layer], r->x, r->state_in, r->state_out,
+                       r->out, r->lanes);
+        break;
+    }
+    case REQ_ATTN_LAYER: {
+        const AttnReq *r = &e->attn;
+        run_attn_block(e, lane, r->layer, r->x, r->k_plane, r->v_plane, r->head_stride,
+                       r->pos, r->cos_base, r->sin_base, r->out, r->lanes);
+        break;
+    }
+    case REQ_TOKEN_PASS:
+        run_token_pass(e, lane);
+        break;
+    default:
+        break;
+    }
+    lane_fence(e, lane, [] {});
+}
+
+// Lanes 1..: park at the token boundary, run the whole program on a generation bump.
+// The recheck loop makes every wake path sound: a lost unpark surfaces as kc_sched's
+// 5ms timed-wait recovery (once per TOKEN at worst — patch 0005 will retire even
+// that); a stale NOTIFIED token is one spurious loop.
+static void lane_main(void *arg) {
+    LaneArg *la = (LaneArg *)arg;
+    Engine *e = la->e;
+    const uint32_t lane = la->lane;
+    uint64_t seen = 0;
+    for (;;) {
+        uint64_t g = e->lane_gen.load(std::memory_order_acquire);
+        if (g != seen) {
+            seen = g;
+            lane_program(e, lane);
+            continue;
+        }
+        if (e->retire.load(std::memory_order_acquire)) return;
+        kcoro_park();
+    }
+}
+
+// Lane 0 doubles as the request loop: rim doorbell in, ONE team wake per pass, then
+// it runs the same program as everyone else, and the program-final fence lets it
+// signal completion.
 static void coord_main(void *arg) {
     Engine *e = (Engine *)arg;
     for (;;) {
@@ -948,10 +996,10 @@ static void coord_main(void *arg) {
                           // NOTIFIED token) wakes us
             continue;
         }
-        if (req == REQ_MLP) run_mlp(e);
-        if (req == REQ_CONV_LAYER) run_conv_layer(e);
-        if (req == REQ_ATTN_LAYER) run_attn_layer(e);
-        if (req == REQ_TOKEN_PASS) run_token_pass(e);
+        e->cur_req = req;
+        e->lane_gen.fetch_add(1, std::memory_order_release);
+        for (int w = 0; w < e->n_workers; ++w) kcoro_unpark(e->workers[w]);
+        lane_program(e, 0);
         // Pass boundary: hand back (signal from coroutine context never blocks).
         pthread_mutex_lock(&e->mu);
         e->finished = 1;
@@ -967,20 +1015,25 @@ extern "C" {
 
 void lfm_engine_free(void *ep);
 
+// `workers` is the TOTAL lane count (lane 0 = the request loop + a full compute
+// lane). Dispatcher threads == lanes: the fence model needs every lane runnable on
+// its own thread for the whole pass — the previous +1 oversubscribed the core budget.
 void *lfm_engine_new(int workers) {
     if (workers < 1) workers = 1;
     if (workers > MAX_WORKERS) workers = MAX_WORKERS;
     Engine *e = new (std::nothrow) Engine();
     if (!e) return nullptr;
-    e->n_workers = workers;
-    e->disp = kc_dispatcher_new(workers + 1); // +1 lane so the coordinator never
-                                              // starves the tile team
+    e->lanes_total = (uint32_t)workers;
+    e->n_workers = workers - 1;
+    e->disp = kc_dispatcher_new(workers);
     if (!e->disp) {
         delete e;
         return nullptr;
     }
-    for (int w = 0; w < workers; ++w) {
-        if (kc_dispatcher_spawn_co(e->disp, worker_main, e, 128 * 1024,
+    for (int w = 0; w < e->n_workers; ++w) {
+        e->largs[w].e = e;
+        e->largs[w].lane = (uint32_t)(w + 1);
+        if (kc_dispatcher_spawn_co(e->disp, lane_main, &e->largs[w], 128 * 1024,
                                    &e->workers[w]) != 0 ||
             !e->workers[w]) {
             lfm_engine_free(e);
