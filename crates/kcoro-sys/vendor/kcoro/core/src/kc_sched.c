@@ -120,6 +120,12 @@ struct kc_sched { /* unified */
     _Atomic(unsigned long) steals_probes, steals_succeeded, steals_failures;
     _Atomic(unsigned long) fastpath_hits, fastpath_misses, inject_pulls, donations;
     pthread_mutex_t park_mu; pthread_cond_t park_cv; _Atomic(int) idle_workers;
+    /* Patch 0005: outstanding wake tokens, guarded by park_mu. A producer that finds
+     * an idle worker mints one; a worker consumes one either just before waiting
+     * (covering the signal-before-wait window) or on wake. Tokens persist until
+     * consumed, so a wake can never be lost — which is what lets the idle wait be
+     * UNTIMED instead of a 5ms timed-wait recovery poll. */
+    unsigned park_tokens;
     pthread_mutex_t inject_mu; sched_task_t *inject_buf; uint32_t inject_cap, inject_head, inject_tail;
     pthread_mutex_t rq_mu; kcoro_t *rq_head, *rq_tail;
     /* Timer subsystem */
@@ -177,6 +183,60 @@ static inline uint32_t ws_rand(uint32_t *state){ uint32_t x=*state; x^=x<<13; x^
 #ifndef KC_SCHED_STEAL_SCAN_MAX
 #define KC_SCHED_STEAL_SCAN_MAX 4
 #endif
+
+/* ---- Patch 0005: precise parking --------------------------------------------------
+ * The old idle path had two lost-wake windows: (a) a producer that enqueued before a
+ * worker's idle_workers++ saw 0 idle and skipped the signal; (b) a signal issued
+ * between idle_workers++ and pthread_cond_wait found no waiter and evaporated. Both
+ * were papered over by a 5ms pthread_cond_timedwait poll — every lost wake stalled
+ * ready work for up to 5ms (the real-time audio "wake lottery"). The fix is exact
+ * accounting: wake tokens under park_mu close (b); a full re-check of every
+ * acquirable work source AFTER declaring idle closes (a) — the producer either sees
+ * the idle declaration (and mints a token) or the worker sees the enqueue. The wait
+ * itself is now untimed. */
+
+/* Wake for work ANY worker can acquire (ready queue, inject queue, stealable deque). */
+static void sched_wake_one(struct kc_sched *s){
+    if (atomic_load(&s->idle_workers) > 0) {
+        pthread_mutex_lock(&s->park_mu);
+        s->park_tokens++;
+        pthread_cond_signal(&s->park_cv);
+        pthread_mutex_unlock(&s->park_mu);
+    }
+}
+
+/* Wake for SLOT-TARGETED work (a worker's last_task fast slot). Only its owner can
+ * run it and cond_signal may pick any waiter, so broadcast: the owner is guaranteed
+ * to wake; non-owners re-check and re-park. The owner's own-slot test under park_mu
+ * in the idle path closes the fill-after-recheck window. */
+static void sched_wake_slot(struct kc_sched *s){
+    if (atomic_load(&s->idle_workers) > 0) {
+        pthread_mutex_lock(&s->park_mu);
+        s->park_tokens++;
+        pthread_cond_broadcast(&s->park_cv);
+        pthread_mutex_unlock(&s->park_mu);
+    }
+}
+
+/* Everything THIS worker could acquire right now. Deliberately excludes other
+ * workers' last_task slots — those are owner-only, and counting them here would spin
+ * a non-owner forever on work it cannot take (their delivery is sched_wake_slot's
+ * broadcast plus the owner's under-mutex slot check). */
+static int sched_work_pending(struct kc_sched *s, sched_worker_t *self){
+    if (atomic_load_explicit(&self->last_task, memory_order_acquire) != NULL) return 1;
+    pthread_mutex_lock(&s->rq_mu);
+    int rq = (s->rq_head != NULL);
+    pthread_mutex_unlock(&s->rq_mu);
+    if (rq) return 1;
+    pthread_mutex_lock(&s->inject_mu);
+    int inj = (s->inject_head != s->inject_tail);
+    pthread_mutex_unlock(&s->inject_mu);
+    if (inj) return 1;
+    for (int i = 0; i < s->workers; ++i) {
+        if (atomic_load_explicit(&s->w[i].dq.len, memory_order_acquire) != 0) return 1;
+    }
+    return 0;
+}
 
 static void* worker_main(void *arg){
     sched_worker_t *w = (sched_worker_t*)arg;
@@ -258,7 +318,9 @@ static void* worker_main(void *arg){
             continue;
         }
         int found = 0;
-        for (int attempt = 0; attempt < KC_SCHED_STEAL_SCAN_MAX; ++attempt) {
+        /* workers == 1: nobody to steal from (and the modulo below would be by 0). */
+        for (int attempt = 0; s->workers > 1 && attempt < KC_SCHED_STEAL_SCAN_MAX;
+             ++attempt) {
             uint32_t r32 = ws_rand(&rng);
             int victim = (w->id + 1 + (int)(r32 % (uint32_t)(s->workers - 1))) % s->workers;
             if (victim == w->id) continue;
@@ -280,12 +342,22 @@ static void* worker_main(void *arg){
             continue;
         }
         atomic_fetch_add(&s->idle_workers, 1);
+        /* Patch 0005 (Dekker with the producers): re-check every acquirable source
+         * AFTER declaring idle. A producer either observes the declaration and mints
+         * a token, or this re-check observes its enqueue — so the untimed wait below
+         * can never sleep on live work. */
+        if (sched_work_pending(s, w)) {
+            atomic_fetch_sub(&s->idle_workers, 1);
+            continue;
+        }
         pthread_mutex_lock(&s->park_mu);
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_nsec += 5 * 1000 * 1000;
-        if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
-        if (!atomic_load(&s->stop)) pthread_cond_timedwait(&s->park_cv, &s->park_mu, &ts);
+        if (s->park_tokens > 0) {
+            s->park_tokens--; /* a wake landed before we could wait */
+        } else if (!atomic_load(&s->stop) &&
+                   atomic_load_explicit(&w->last_task, memory_order_acquire) == NULL) {
+            pthread_cond_wait(&s->park_cv, &s->park_mu);
+            if (s->park_tokens > 0) s->park_tokens--;
+        }
         pthread_mutex_unlock(&s->park_mu);
         atomic_fetch_sub(&s->idle_workers, 1);
     }
@@ -460,7 +532,7 @@ void kc_sched_shutdown(kc_sched_t *s){
     free(s);
 }
 
-int kc_spawn(kc_sched_t *s, kc_task_fn fn, void *arg){ if(!s||!fn) return -1; static _Atomic(unsigned) rr=0; unsigned idx=atomic_fetch_add(&rr,1)%(unsigned)s->workers; sched_worker_t *w=&s->w[idx]; uint32_t qlen=atomic_load_explicit(&w->dq.len,memory_order_relaxed); const uint32_t DONATE_THRESHOLD=64; if(qlen>DONATE_THRESHOLD){ if(inject_push(s, fn, arg)!=0) return -1; atomic_fetch_add(&s->tasks_submitted,1); if(atomic_load(&s->idle_workers)>0){ pthread_mutex_lock(&s->park_mu); pthread_cond_signal(&s->park_cv); pthread_mutex_unlock(&s->park_mu);} return 0; } sched_task_t *t=(sched_task_t*)malloc(sizeof(sched_task_t)); if(!t) return -1; t->fn=(sched_task_fn)fn; t->arg=arg; sched_task_t *expected=NULL; if(!atomic_compare_exchange_strong_explicit(&w->last_task,&expected,t,memory_order_release,memory_order_relaxed)){ atomic_fetch_add(&s->fastpath_misses,1); free(t); if(deque_push(&w->dq,(sched_task_fn)fn,arg)!=0) return -1; } else { /* fast-path success counts as submission */ } atomic_fetch_add(&s->tasks_submitted,1); if(atomic_load(&s->idle_workers)>0){ pthread_mutex_lock(&s->park_mu); pthread_cond_signal(&s->park_cv); pthread_mutex_unlock(&s->park_mu);} return 0; }
+int kc_spawn(kc_sched_t *s, kc_task_fn fn, void *arg){ if(!s||!fn) return -1; static _Atomic(unsigned) rr=0; unsigned idx=atomic_fetch_add(&rr,1)%(unsigned)s->workers; sched_worker_t *w=&s->w[idx]; uint32_t qlen=atomic_load_explicit(&w->dq.len,memory_order_relaxed); const uint32_t DONATE_THRESHOLD=64; if(qlen>DONATE_THRESHOLD){ if(inject_push(s, fn, arg)!=0) return -1; atomic_fetch_add(&s->tasks_submitted,1); sched_wake_one(s); return 0; } sched_task_t *t=(sched_task_t*)malloc(sizeof(sched_task_t)); if(!t) return -1; t->fn=(sched_task_fn)fn; t->arg=arg; sched_task_t *expected=NULL; if(!atomic_compare_exchange_strong_explicit(&w->last_task,&expected,t,memory_order_release,memory_order_relaxed)){ atomic_fetch_add(&s->fastpath_misses,1); free(t); if(deque_push(&w->dq,(sched_task_fn)fn,arg)!=0) return -1; } else { /* fast-path success counts as submission */ } atomic_fetch_add(&s->tasks_submitted,1); /* patch 0005: last_task is owner-only — broadcast so the owner wakes */ sched_wake_slot(s); return 0; }
 
 void kc_yield(void){
     kcoro_t* cur = kcoro_current();
@@ -565,7 +637,7 @@ int kc_spawn_co(kc_sched_t* s, kcoro_fn_t fn, void* arg, size_t stack_size, kcor
     pthread_mutex_lock(&s->rq_mu);
     rq_push_locked(s,co);
     pthread_mutex_unlock(&s->rq_mu);
-    if(atomic_load(&s->idle_workers)>0){ pthread_mutex_lock(&s->park_mu); pthread_cond_signal(&s->park_cv); pthread_mutex_unlock(&s->park_mu);} return 0; }
+    sched_wake_one(s); return 0; }
 void kc_sched_enqueue_ready(kc_sched_t* s, kcoro_t* co)
 {
     if (!s || !co) return;
@@ -586,11 +658,7 @@ void kc_sched_enqueue_ready(kc_sched_t* s, kcoro_t* co)
     co->scheduler = (kcoro_sched_t*)s;
     rq_push_locked(s, co);
     pthread_mutex_unlock(&s->rq_mu);
-    if (atomic_load(&s->idle_workers) > 0) {
-        pthread_mutex_lock(&s->park_mu);
-        pthread_cond_signal(&s->park_cv);
-        pthread_mutex_unlock(&s->park_mu);
-    }
+    sched_wake_one(s); /* patch 0005: token + signal — the doorbell path (unpark) */
 }
 kc_sched_t* kc_sched_current(void){ return tls_current_sched; }
 

@@ -126,3 +126,41 @@ stage-done doorbell legal from non-coroutine contexts.
 **Verification.** The native engine's `native_engine_mlp_bit_parity` test runs through the
 external-thread request doorbell and the worker-to-coordinator stage doorbell; the bit-parity test
 passes against the threadgroup port.
+
+## Patch 0005 — precise parking: wake tokens + untimed idle waits
+
+**Symptom.** Bit-identical decode builds swung 24k → 244k audio underrun samples
+run-to-run (the "wake lottery"). Every doorbell (`kcoro_unpark` →
+`kc_sched_enqueue_ready`) rode a lossy handoff into the worker idle path, and each
+lost wake stalled ready work for up to 5 ms.
+
+**Root cause.** Two windows in `worker_main`'s idle path, both papered over by a 5 ms
+`pthread_cond_timedwait` recovery poll:
+1. A producer that enqueued BEFORE the worker's `idle_workers++` read 0 idle and
+   skipped the signal entirely; the worker then slept on live work.
+2. A signal issued between `idle_workers++` and `pthread_cond_wait` found no waiter
+   and evaporated (condvars carry no memory).
+A third, structural hazard: `kc_spawn`'s `last_task` fast slot is owner-only, but
+`pthread_cond_signal` wakes an arbitrary waiter — the wrong worker wakes, finds
+nothing, re-parks, and the owner's slot work waits for the poll.
+
+**Fix.** Exact signal accounting, three parts:
+- `park_tokens` (guarded by `park_mu`): producers that see an idle worker mint a
+  token with their signal; a worker consumes one just before waiting (covering
+  window 2) or on wake. Tokens persist until consumed — a wake cannot be lost.
+- Dekker re-check: after `idle_workers++`, the worker re-checks every source it can
+  acquire (own slot, ready queue, inject queue, all deques) before touching park_mu
+  — the producer either observes the idle declaration or the worker observes the
+  enqueue (window 1).
+- `sched_wake_slot` (broadcast) for `last_task` pushes, plus an owner's own-slot
+  check under `park_mu` right before waiting — the owner is guaranteed to wake and
+  cannot sleep on a slot filled after its re-check.
+With those in place the idle wait is UNTIMED: the 5 ms poll is gone, wakes are
+µs-bounded, and an idle scheduler consumes zero CPU.
+
+Drive-by: the steal scan divided by `workers - 1` — with a single-worker scheduler
+that is a modulo by zero (UB). The scan is now skipped when `workers == 1`.
+
+**Verification.** Full crate suite green (168); engine bit-parity tests green through
+the doorbell path; audible dual-path e2e green with CPU underruns/latency holding the
+lane-uniform band across repeated runs (see DECODE_ENGINE.md state of play).
