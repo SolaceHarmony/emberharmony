@@ -459,6 +459,9 @@ impl LFM2AudioModel {
         if model.depth_flash.is_some() {
             eprintln!("[voice] flashkern depthformer decoder active (pure-NEON audio frames)");
         }
+        // Resident native-engine layer table (same capture contract as depth_flash:
+        // Arc-heap storages, guard clears before the weights drop).
+        model.lfm.install_native_ctx();
         Ok(model)
     }
 

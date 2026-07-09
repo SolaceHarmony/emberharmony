@@ -427,6 +427,14 @@ impl PtrLen {
             _ => None,
         }
     }
+    /// The raw address (usize-stored; see the safety contract above).
+    pub(crate) fn addr(&self) -> usize {
+        self.ptr
+    }
+    /// Element count of the captured view.
+    pub(crate) fn size(&self) -> usize {
+        self.len
+    }
     /// Capture a contiguous CPU f32 tensor.
     pub fn f32(t: &candle_core::Tensor) -> Option<Self> {
         use candle_core::Storage;

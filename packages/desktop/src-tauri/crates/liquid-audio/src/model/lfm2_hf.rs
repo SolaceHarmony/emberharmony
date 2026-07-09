@@ -761,6 +761,19 @@ impl DecoderLayer {
                 && crate::bf16_gemm::bf16_gemm_nt_available()
                 && cache.conv_states[block_idx].is_some()
             {
+                // The whole layer in one native doorbell when the resident table is
+                // live (bit-identical to the composed fused blocks by parity test).
+                #[cfg(all(
+        has_kcoro,
+        has_native_engine,
+        any(
+            all(target_arch = "aarch64", has_flashkern_neon),
+            all(target_arch = "x86_64", has_flashkern_x86)
+        )
+    ))]
+                if let Some(y) = self.native_conv_layer(x, c, block_idx, cache)? {
+                    return Ok(y);
+                }
                 if let Some(y) = self.fused_shortconv_decode(x, c, block_idx, cache)? {
                     let x = y;
                     if x.device().is_cpu()
@@ -960,14 +973,180 @@ impl DecoderLayer {
     }
 }
 
+#[cfg(all(
+        has_kcoro,
+        has_native_engine,
+        any(
+            all(target_arch = "aarch64", has_flashkern_neon),
+            all(target_arch = "x86_64", has_flashkern_x86)
+        )
+    ))]
+impl DecoderLayer {
+    /// Capture this layer's weights for the resident native layer table. Conv layers
+    /// only; attention layers get a placeholder until rung 2. Derived tensors (the
+    /// squeezed-contiguous conv weight) are pushed into `held`, whose owner must keep
+    /// them alive for the table's lifetime.
+    fn native_conv_desc(
+        &self,
+        held: &mut Vec<Tensor>,
+    ) -> Option<crate::flashkern::native_engine::ConvLayerDesc> {
+        use crate::flashkern::decode::PtrLen;
+        use crate::flashkern::native_engine::ConvLayerDesc;
+        let LayerKind::ShortConv(conv) = &self.kind else {
+            return Some(ConvLayerDesc::attn_placeholder());
+        };
+        let w2d = conv.conv_weight.squeeze(1).ok()?.contiguous().ok()?;
+        let desc = ConvLayerDesc {
+            kind: 0,
+            k: conv.l_cache as u32,
+            op_eps: self.operator_norm.eps() as f32,
+            ffn_eps: self.ffn_norm.eps() as f32,
+            op_norm_w: PtrLen::bf16(self.operator_norm.weight())?.addr() as *const u16,
+            ffn_norm_w: PtrLen::bf16(self.ffn_norm.weight())?.addr() as *const u16,
+            in_w: PtrLen::bf16(conv.in_proj.weight())?.addr() as *const u16,
+            conv_w: PtrLen::bf16(&w2d)?.addr() as *const u16,
+            out_w: PtrLen::bf16(conv.out_proj.weight())?.addr() as *const u16,
+            w1: PtrLen::bf16(self.mlp.gate_proj.weight())?.addr() as *const u16,
+            w3: PtrLen::bf16(self.mlp.up_proj.weight())?.addr() as *const u16,
+            w2: PtrLen::bf16(self.mlp.down_proj.weight())?.addr() as *const u16,
+        };
+        held.push(w2d);
+        Some(desc)
+    }
+
+    /// The whole conv layer (shortconv + MLP) in ONE native doorbell — bit-identical
+    /// to the composed fused blocks. `Ok(None)` when the engine/ctx isn't live or an
+    /// operand isn't a contiguous CPU bf16 tensor (caller keeps the per-block path).
+    fn native_conv_layer(
+        &self,
+        x: &Tensor,
+        conv: &ShortConv,
+        block_idx: usize,
+        cache: &mut Cache,
+    ) -> Result<Option<Tensor>> {
+        let Some(engine) = crate::flashkern::native_engine::process_engine() else {
+            return Ok(None);
+        };
+        let k = conv.l_cache;
+        let hdim = x.dim(2)?;
+        let x = x.contiguous()?;
+        let state = cache.conv_states[block_idx].clone().expect("gated on Some");
+        let state = state.contiguous()?;
+        let (xs, xl) = x.storage_and_layout();
+        let (ss, sl) = state.storage_and_layout();
+        let bits = |g: &std::sync::RwLockReadGuard<'_, candle_core::Storage>,
+                    l: &candle_core::Layout|
+         -> Option<*const u16> {
+            match &**g {
+                candle_core::Storage::Cpu(candle_core::CpuStorage::BF16(v)) => {
+                    let (a, b) = l.contiguous_offsets()?;
+                    Some(v[a..b].as_ptr() as *const u16)
+                }
+                _ => None,
+            }
+        };
+        let (Some(xp), Some(sp)) = (bits(&xs, xl), bits(&ss, sl)) else {
+            return Ok(None);
+        };
+        // SAFETY: xp/sp point into guarded storages held live across the blocking call.
+        let (xb, sb) = unsafe {
+            (
+                std::slice::from_raw_parts(xp, hdim),
+                std::slice::from_raw_parts(sp, hdim * (k - 1)),
+            )
+        };
+        let mut out = vec![0u16; hdim];
+        let mut state_out = vec![0u16; hdim * (k - 1)];
+        let lanes = rayon::current_num_threads().max(1);
+        if !engine.conv_layer(block_idx, xb, sb, &mut state_out, &mut out, lanes) {
+            return Ok(None);
+        }
+        drop((xs, ss));
+        let state_out: Vec<half::bf16> =
+            state_out.iter().map(|&b| half::bf16::from_bits(b)).collect();
+        cache.conv_states[block_idx] =
+            Some(Tensor::from_vec(state_out, (1, hdim, k - 1), x.device())?);
+        let out: Vec<half::bf16> = out.iter().map(|&b| half::bf16::from_bits(b)).collect();
+        Ok(Some(Tensor::from_vec(out, (1, 1, hdim), x.device())?))
+    }
+}
+
 /// HF `Lfm2Model` — returns the all-position last hidden state (post embedding-norm).
 pub struct Model {
+    /// Resident native-engine layer table guard. MUST be declared before the weight
+    /// fields: Rust drops fields in declaration order, and the guard clears the C-side
+    /// pointer table before the weights it points into are freed.
+    #[cfg(all(
+        has_kcoro,
+        has_native_engine,
+        any(
+            all(target_arch = "aarch64", has_flashkern_neon),
+            all(target_arch = "x86_64", has_flashkern_x86)
+        )
+    ))]
+    native_ctx: Option<crate::flashkern::native_engine::BackboneCtxGuard>,
     embed_tokens: Embedding,
     layers: Vec<DecoderLayer>,
     embedding_norm: RmsNorm,
 }
 
 impl Model {
+    /// Build + install the resident native-engine layer table (rung 1: conv layers;
+    /// attention slots are placeholders). No-op when any capture fails or the engine
+    /// is unavailable — the per-block paths remain, bit-identical.
+    #[cfg(all(
+        has_kcoro,
+        has_native_engine,
+        any(
+            all(target_arch = "aarch64", has_flashkern_neon),
+            all(target_arch = "x86_64", has_flashkern_x86)
+        )
+    ))]
+    pub fn install_native_ctx(&mut self) {
+        if self.native_ctx.is_some() {
+            return;
+        }
+        let mut held = Vec::new();
+        let mut descs = Vec::with_capacity(self.layers.len());
+        let mut h = 0usize;
+        let mut ffn = 0usize;
+        for layer in &self.layers {
+            let Some(d) = layer.native_conv_desc(&mut held) else {
+                return; // a conv layer failed capture — table would be partial
+            };
+            if d.kind == 0 {
+                use crate::flashkern::decode::PtrLen;
+                if h == 0 {
+                    h = PtrLen::bf16(layer.operator_norm.weight())
+                        .map(|p| p.size())
+                        .unwrap_or(0);
+                    let w1_len = PtrLen::bf16(layer.mlp.gate_proj.weight())
+                        .map(|p| p.size())
+                        .unwrap_or(0);
+                    if h > 0 {
+                        ffn = w1_len / h;
+                    }
+                }
+            }
+            descs.push(d);
+        }
+        if h == 0 || ffn == 0 {
+            return;
+        }
+        self.native_ctx =
+            crate::flashkern::native_engine::install_backbone_ctx(&descs, h, ffn, held);
+    }
+
+    #[cfg(not(all(
+        has_kcoro,
+        has_native_engine,
+        any(
+            all(target_arch = "aarch64", has_flashkern_neon),
+            all(target_arch = "x86_64", has_flashkern_x86)
+        )
+    )))]
+    pub fn install_native_ctx(&mut self) {}
+
     pub fn new(cfg: &Lfm2Config, vb: VarBuilder) -> Result<Self> {
         // `lfm` is a bare HF `Lfm2Model` (not `Lfm2ForCausalLM`), so weights sit
         // directly under the given prefix — no `.model.` wrapper. Final norm is
@@ -981,6 +1160,15 @@ impl Model {
         }
         let embedding_norm = RmsNorm::new(cfg.hidden_size, cfg.norm_eps, vb.pp("embedding_norm"))?;
         Ok(Self {
+            #[cfg(all(
+        has_kcoro,
+        has_native_engine,
+        any(
+            all(target_arch = "aarch64", has_flashkern_neon),
+            all(target_arch = "x86_64", has_flashkern_x86)
+        )
+    ))]
+            native_ctx: None,
             embed_tokens,
             layers,
             embedding_norm,
