@@ -112,13 +112,30 @@ enum : uint32_t {
 };
 
 struct Stage {
-    std::atomic<uint32_t> epoch{0};    // bumped (release) to publish kind/count/chunk
-    std::atomic<uint32_t> next{0};     // tile index — workers fetch_add it dry
-    std::atomic<uint32_t> remaining{0}; // participating workers still draining
-    uint32_t kind = ST_IDLE;           // written before the epoch bump
+    // {epoch:32 | next:32} in ONE atomic: a tile claim is a CAS that only succeeds
+    // against the epoch it was read under. A straggler holding stage N's snapshot who
+    // races the publish of stage N+1 has its CAS fail on the epoch half and resyncs —
+    // it can never consume a new stage's tile to run old-stage work on it (the
+    // corruption the split epoch/next atomics allowed: tile 0 of the new stage ran
+    // the OLD kind and its real work never ran — caught by the ref oracle).
+    std::atomic<uint64_t> board{0};
+    std::atomic<uint32_t> remaining{0}; // TILES not yet completed — see below
+    uint32_t kind = ST_IDLE;           // written before the board's epoch bump
     uint32_t count = 0;                // number of tiles this stage
-    uint32_t chunk = 0;                // band width for GATEUP/DOWN
+    uint32_t chunk = 0;                // band width for banded stages
 };
+static inline uint64_t board_pack(uint32_t epoch, uint32_t next) {
+    return ((uint64_t)epoch << 32) | next;
+}
+static inline uint32_t board_epoch(uint64_t b) { return (uint32_t)(b >> 32); }
+static inline uint32_t board_next(uint64_t b) { return (uint32_t)b; }
+// Completion counts TILES, not workers. The original per-worker roll call required
+// EVERY worker to check in — a parked worker whose wake signal was lost (kc_sched's
+// park_cv has a 5ms timed-wait recovery) stalled the stage AFTER all tiles were done,
+// and at ~200 stage barriers per token under a loaded pipeline that turned bit-exact
+// decode into 54s of audio underruns. With tile-counting, a straggler simply finds the
+// stage drained and re-parks; the stage closes when the WORK is done — whoever
+// completes the last tile rings the coordinator.
 
 enum : int {
     REQ_NONE = 0,
@@ -504,7 +521,7 @@ static void worker_main(void *arg) {
     Engine *e = (Engine *)arg;
     uint32_t seen = 0;
     for (;;) {
-        uint32_t ep = e->stage.epoch.load(std::memory_order_acquire);
+        uint32_t ep = board_epoch(e->stage.board.load(std::memory_order_acquire));
         if (ep == seen) {
             if (e->retire.load(std::memory_order_acquire)) return;
             // Idle: park. The coordinator's epoch-bump + unpark wakes us; the park
@@ -516,25 +533,41 @@ static void worker_main(void *arg) {
         seen = ep;
         const uint32_t kind = e->stage.kind;
         const uint32_t count = e->stage.count;
-        uint32_t idx;
-        while ((idx = e->stage.next.fetch_add(1, std::memory_order_acq_rel)) < count) {
+        // Claim tiles with an epoch-checked CAS: the claim succeeds only against the
+        // epoch this snapshot was taken under.
+        uint64_t b = e->stage.board.load(std::memory_order_acquire);
+        for (;;) {
+            if (board_epoch(b) != ep) break; // a newer stage published — resync
+            uint32_t idx = board_next(b);
+            if (idx >= count) break; // drained
+            if (!e->stage.board.compare_exchange_weak(b, board_pack(ep, idx + 1),
+                                                      std::memory_order_acq_rel,
+                                                      std::memory_order_acquire)) {
+                continue; // b reloaded by the failed CAS
+            }
             run_tile(kind, idx, &e->stage, e);
-        }
-        // Last participant out closes the stage and rings the coordinator's doorbell.
-        if (e->stage.remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-            kcoro_unpark(e->coord);
+            // Whoever completes the LAST tile closes the stage — workers that never
+            // woke are irrelevant to completion.
+            if (e->stage.remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                kcoro_unpark(e->coord);
+            }
+            b = e->stage.board.load(std::memory_order_acquire);
         }
     }
 }
 
 // ---- coordinator ---------------------------------------------------------------------------
 static void publish_stage(Engine *e, uint32_t kind, uint32_t count, uint32_t chunk) {
+    if (count == 0) return; // nothing to run; wait_stage_done sees remaining == 0
     e->stage.kind = kind;
     e->stage.count = count;
     e->stage.chunk = chunk;
-    e->stage.next.store(0, std::memory_order_relaxed);
-    e->stage.remaining.store((uint32_t)e->n_workers, std::memory_order_relaxed);
-    e->stage.epoch.fetch_add(1, std::memory_order_release);
+    e->stage.remaining.store(count, std::memory_order_relaxed);
+    uint32_t ep =
+        board_epoch(e->stage.board.load(std::memory_order_relaxed)) + 1;
+    // One release store publishes {new epoch, tile 0} atomically — stale claims
+    // CAS-fail on the epoch half.
+    e->stage.board.store(board_pack(ep, 0), std::memory_order_release);
     for (int w = 0; w < e->n_workers; ++w) kcoro_unpark(e->workers[w]);
 }
 

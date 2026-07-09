@@ -295,10 +295,37 @@ fn e2e_voice_runtime_speaks_two_turns_through_real_speaker() {
         println!("[e2e] turn {} transcript: {transcript:?}", turn + 1);
     }
 
+    // Let the speaker DRAIN before teardown: the last reply's tail is still in the
+    // output queue, and stopping now truncates audible playback (and undercounts
+    // played_samples — earlier runs showed played < queued by ~28k samples). Poll
+    // until the output callback has delivered everything that was queued, with a
+    // bounded deadline so a stalled device fails loudly instead of hanging.
+    let drain_deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let s = runtime.audio_stats();
+        if s.played_samples >= s.queued_samples {
+            break;
+        }
+        assert!(
+            Instant::now() < drain_deadline,
+            "speaker did not drain: played {} of {} queued",
+            s.played_samples,
+            s.queued_samples
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
     let stats = runtime.audio_stats();
     feeder_stop.store(true, Ordering::SeqCst);
     runtime.stop();
     let _ = feeder.join();
+
+    // The drain gate, kept as a hard assertion: every decoded-and-queued sample must
+    // actually reach the hardware — a truncated reply is a product bug, not a flake.
+    assert_eq!(
+        stats.played_samples, stats.queued_samples,
+        "output truncated at teardown"
+    );
 
     println!(
         "[e2e] stats: decoded {} queued {} played {} dropped {} underruns {} | \
