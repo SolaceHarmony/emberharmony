@@ -1,8 +1,14 @@
-//! The engine chassis — flashkern kernels dispatched by kcoro, the Zero-Spin Coroutine
-//! Kernel (ENGINE_DESIGN.md §2). This is the corrected dispatch model: persistent
-//! micro-kernel workers consume tile-job DESCRIPTORS from channels and park when dry —
-//! no fork/join scopes, no spin barriers, no payload copies. Payloads never move: jobs
-//! carry addresses into the weight mmap and the arena; results land in place.
+//! PROTOTYPE / REFERENCE RUNG — NOT the live engine. This Rust-side kcoro chassis was
+//! the E1 proof that the parked descriptor-flow model works and stays bit-exact; the
+//! LIVE engine is the resident native stage machine (csrc/flashkern_engine.cpp via
+//! [`super::native_engine`]), which the model hot path reaches through
+//! `process_engine()`. Keep this module for its tests (channel-dispatch parity vs the
+//! direct kernels) and as the readable specification of the dispatch rules — do not
+//! optimize it, and do not mount new passes here.
+//!
+//! The original chassis notes: persistent micro-kernel workers consume tile-job
+//! DESCRIPTORS from channels and park when dry — no fork/join scopes, no spin
+//! barriers, no payload copies; jobs carry addresses, results land in place.
 //!
 //! kcoro's runtime contract (kc_chan.c): channel send/recv REQUIRE coroutine context —
 //! they park the calling coroutine, never a thread. So the split is exact:
@@ -12,7 +18,7 @@
 //!     (mutex-guarded, external-thread-safe: kc_sched.c) plus ONE Condvar block until
 //!     the pass completes. Zero spin on both sides of the boundary.
 //!
-//! Mounted so far:
+//! Prototype mounted so far:
 //!   * row-band GEMV tiles (the E1 smoke: linkage, dispatch model, descriptor handoff,
 //!     pass-boundary handback, parity + throughput gates);
 //!   * the fused-MLP decode block ([`TileEngine::fused_mlp`]) — the first token-pass
@@ -67,7 +73,6 @@ const KC_RENDEZVOUS: i32 = 0;
 /// register machines with byte-scale locals; double it for headroom and forget it.
 const CO_STACK: usize = 128 * 1024;
 
-
 // Job kinds. GEMV carries its operands inline; the MLP stages carry a pass-context
 // pointer and a tile/band range — payloads never ride the channel, only descriptors.
 const JK_GEMV: u32 = 1;
@@ -85,10 +90,10 @@ struct TileJob {
     kind: u32,
     r0: u32, // row band [r0, r1); for grid-stride stages r0 = tile index
     r1: u32,
-    k: u32, // GEMV reduction length
-    a: usize, // GEMV: x bits [k].       MLP: *const MlpPass
-    b: usize, // GEMV: w bits [n,k].     MLP: unused
-    c: usize, // GEMV: out f32 [n].      MLP: unused
+    k: u32,      // GEMV reduction length
+    a: usize,    // GEMV: x bits [k].       MLP: *const MlpPass
+    b: usize,    // GEMV: w bits [n,k].     MLP: unused
+    c: usize,    // GEMV: out f32 [n].      MLP: unused
     done: usize, // *mut kc_chan_t — per-pass completion channel; worker sends one token per job
 }
 
@@ -126,13 +131,13 @@ struct MlpPass {
     h: usize,
     i: usize,
     eps: f32,
-    tiles: usize,   // FIXED tile count — the deterministic partial/fold order
+    tiles: usize,    // FIXED tile count — the deterministic partial/fold order
     partials: usize, // *mut f32 [tiles]
-    xn: usize,      // *mut u16 [h]
-    gu: usize,      // *mut f32 [2i] — g in [0,i), u in [i,2i)
-    t: usize,       // *mut u16 [i]
-    out: usize,     // *mut u16 [h]
-    rs: AtomicU32,  // f32 bits of 1/sqrt(mean+eps); coordinator-published before NORM
+    xn: usize,       // *mut u16 [h]
+    gu: usize,       // *mut f32 [2i] — g in [0,i), u in [i,2i)
+    t: usize,        // *mut u16 [i]
+    out: usize,      // *mut u16 [h]
+    rs: AtomicU32,   // f32 bits of 1/sqrt(mean+eps); coordinator-published before NORM
 }
 
 /// Fused-MLP coordinator context.
@@ -247,7 +252,7 @@ extern "C" fn worker_main(arg: *mut c_void) {
                 let (r0, r1) = (job.r0 as usize, job.r1 as usize);
                 let n = r1 - r0;
                 let mut y = vec![0f32; n]; // tile-private accumulator
-                // SAFETY: t is stage-complete; w2 row slice in-bounds; out rows private.
+                                           // SAFETY: t is stage-complete; w2 row slice in-bounds; out rows private.
                 unsafe {
                     let x = p.x as *const u16;
                     let out = p.out as *mut u16;
@@ -260,9 +265,7 @@ extern "C" fn worker_main(arg: *mut c_void) {
                     );
                     for (j, &yv) in y.iter().enumerate() {
                         let d = super::decode::bf16_f32(super::decode::rb_bits(yv));
-                        let r = super::decode::rb_bits(
-                            d + super::decode::bf16_f32(*x.add(r0 + j)),
-                        );
+                        let r = super::decode::rb_bits(d + super::decode::bf16_f32(*x.add(r0 + j)));
                         *out.add(r0 + j) = r;
                     }
                 }
@@ -274,7 +277,11 @@ extern "C" fn worker_main(arg: *mut c_void) {
         let token = 1u8;
         // SAFETY: the done channel outlives the pass (caller-owned).
         unsafe {
-            kc_chan_send(job.done as *mut kc_chan_t, &token as *const u8 as *const c_void, -1)
+            kc_chan_send(
+                job.done as *mut kc_chan_t,
+                &token as *const u8 as *const c_void,
+                -1,
+            )
         };
     }
 }
@@ -372,7 +379,11 @@ extern "C" fn mlp_coord_main(arg: *mut c_void) {
     // Stage 1a: Σx² partials, one grid-stride tile each.
     let mut outstanding = 0usize;
     for l in 0..tiles {
-        let job = TileJob { kind: JK_MLP_SUMSQ, r0: l as u32, ..job0 };
+        let job = TileJob {
+            kind: JK_MLP_SUMSQ,
+            r0: l as u32,
+            ..job0
+        };
         unsafe { co_send_windowed(ctx.jobs, ctx.done, &job, &mut outstanding, ctx.window) };
     }
     unsafe { co_drain(ctx.done, outstanding) };
@@ -389,7 +400,11 @@ extern "C" fn mlp_coord_main(arg: *mut c_void) {
 
     // Stage 1c: apply the norm, grid-stride tiles.
     for l in 0..tiles {
-        let job = TileJob { kind: JK_MLP_NORM, r0: l as u32, ..job0 };
+        let job = TileJob {
+            kind: JK_MLP_NORM,
+            r0: l as u32,
+            ..job0
+        };
         unsafe { co_send_windowed(ctx.jobs, ctx.done, &job, &mut outstanding, ctx.window) };
     }
     unsafe { co_drain(ctx.done, outstanding) };
@@ -401,7 +416,12 @@ extern "C" fn mlp_coord_main(arg: *mut c_void) {
         let r0 = (l * i_chunk).min(p.i);
         let r1 = ((l + 1) * i_chunk).min(p.i);
         if r1 > r0 {
-            let job = TileJob { kind: JK_MLP_GATEUP, r0: r0 as u32, r1: r1 as u32, ..job0 };
+            let job = TileJob {
+                kind: JK_MLP_GATEUP,
+                r0: r0 as u32,
+                r1: r1 as u32,
+                ..job0
+            };
             unsafe { co_send_windowed(ctx.jobs, ctx.done, &job, &mut outstanding, ctx.window) };
         }
     }
@@ -414,7 +434,12 @@ extern "C" fn mlp_coord_main(arg: *mut c_void) {
         let r0 = (l * h_chunk).min(p.h);
         let r1 = ((l + 1) * h_chunk).min(p.h);
         if r1 > r0 {
-            let job = TileJob { kind: JK_MLP_DOWN, r0: r0 as u32, r1: r1 as u32, ..job0 };
+            let job = TileJob {
+                kind: JK_MLP_DOWN,
+                r0: r0 as u32,
+                r1: r1 as u32,
+                ..job0
+            };
             unsafe { co_send_windowed(ctx.jobs, ctx.done, &job, &mut outstanding, ctx.window) };
         }
     }
@@ -441,9 +466,8 @@ impl TileEngine {
         let workers = workers.clamp(1, 16);
         let mut jobs: *mut kc_chan_t = std::ptr::null_mut();
         // SAFETY: out-param construction; buffered channel of POD descriptors.
-        let rc = unsafe {
-            kc_chan_make(&mut jobs, KC_RENDEZVOUS, std::mem::size_of::<TileJob>(), 0)
-        };
+        let rc =
+            unsafe { kc_chan_make(&mut jobs, KC_RENDEZVOUS, std::mem::size_of::<TileJob>(), 0) };
         if rc != 0 || jobs.is_null() {
             return None;
         }
@@ -474,7 +498,11 @@ impl TileEngine {
                 return None;
             }
         }
-        Some(Self { dispatcher, jobs, workers })
+        Some(Self {
+            dispatcher,
+            jobs,
+            workers,
+        })
     }
 
     /// A fresh per-pass completion channel (rendezvous: worker sends park until the
@@ -483,7 +511,10 @@ impl TileEngine {
         let mut done: *mut kc_chan_t = std::ptr::null_mut();
         // SAFETY: out-param construction; 1-byte tokens.
         let rc = unsafe { kc_chan_make(&mut done, KC_RENDEZVOUS, 1, 0) };
-        assert!(rc == 0 && !done.is_null(), "engine: done channel create failed rc={rc}");
+        assert!(
+            rc == 0 && !done.is_null(),
+            "engine: done channel create failed rc={rc}"
+        );
         done
     }
 
@@ -516,7 +547,10 @@ impl TileEngine {
         // instead of waiting on the slowest — tile flow, not stage lockstep.
         let bands = (self.workers * 4).min(n);
         let band = n.div_ceil(bands);
-        let sync = PassSync { mu: Mutex::new(false), cv: Condvar::new() };
+        let sync = PassSync {
+            mu: Mutex::new(false),
+            cv: Condvar::new(),
+        };
         let done = self.make_done();
         let ctx = GemvCoord {
             jobs: self.jobs,
@@ -572,7 +606,10 @@ impl TileEngine {
         let mut gu = vec![0f32; 2 * i];
         let mut t = vec![0u16; i];
 
-        let sync = PassSync { mu: Mutex::new(false), cv: Condvar::new() };
+        let sync = PassSync {
+            mu: Mutex::new(false),
+            cv: Condvar::new(),
+        };
         let done = self.make_done();
         let pass = MlpPass {
             x: x.as_ptr() as usize,

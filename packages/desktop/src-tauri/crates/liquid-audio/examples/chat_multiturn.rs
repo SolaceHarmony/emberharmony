@@ -129,13 +129,9 @@ fn main() -> Res<()> {
     let model_ref = std::env::var("LFM_MODEL")
         .or_else(|_| std::env::var("LFM_MODEL_DIR"))
         .unwrap_or_else(|_| "LiquidAI/LFM2.5-Audio-1.5B".into());
-    let audio_path = std::env::args().nth(1).unwrap_or_else(|| {
-        concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/assets/question.wav"
-        )
-        .into()
-    });
+    let audio_path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| concat!(env!("CARGO_MANIFEST_DIR"), "/assets/question.wav").into());
     let max_new_tokens: usize = std::env::var("LFM_MAX_TOKENS")
         .ok()
         .and_then(|s| s.parse().ok())

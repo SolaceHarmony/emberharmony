@@ -327,7 +327,9 @@ impl RealtimePipelineHandle {
     /// the caller loses the head start, never correctness.
     pub fn prepare(&self, utt: Utterance) -> bool {
         let epoch = self.epoch.load(Ordering::Acquire);
-        self.ctl_tx.try_send(Control::Prepare { utt, epoch }).is_ok()
+        self.ctl_tx
+            .try_send(Control::Prepare { utt, epoch })
+            .is_ok()
     }
 
     /// Roll back a speculative prefill (the pause was not a turn end). Best-effort:
@@ -1553,52 +1555,59 @@ impl VoiceEngine for Lfm2VoiceEngine {
         let (mut first_token_ms, mut first_audio_ms): (Option<f64>, Option<f64>) = (None, None);
 
         self.model
-            .generate_with_cache(&mut cache, &mut index_pos, in_emb, &self.params, cancel, |tok| {
-                if cb_err.is_some() {
-                    return;
-                }
-                if first_token_ms.is_none() {
-                    first_token_ms = Some(turn_started.elapsed().as_secs_f64() * 1e3);
-                }
-                match tok {
-                    GenToken::Text(id) => {
-                        text_ids.push(id as i64);
-                        modality_out.push(LFMModality::Text as i64);
-                        match text.decode(&[id], true) {
-                            Ok(text) => emit(VoiceEvent::Text(text)),
-                            Err(e) => cb_err = Some(e.to_string()),
-                        }
+            .generate_with_cache(
+                &mut cache,
+                &mut index_pos,
+                in_emb,
+                &self.params,
+                cancel,
+                |tok| {
+                    if cb_err.is_some() {
+                        return;
                     }
-                    GenToken::Audio(frame) => {
-                        if first_audio_ms.is_none() {
-                            first_audio_ms = Some(turn_started.elapsed().as_secs_f64() * 1e3);
-                        }
-                        // Collect EVERY frame (incl. EOAudio) for `append` BEFORE the streaming
-                        // skip — append needs the full audio_out; only PCM playback drops it.
-                        modality_out.push(LFMModality::AudioOut as i64);
-                        audio_frames.push(frame.clone());
-                        // Decode the 8-code frame to PCM via the streaming detokenizer.
-                        let decoded = (|| -> candle_core::Result<Option<Vec<f32>>> {
-                            match decode_audio_frame(&mut stream, &frame, codebooks, device)? {
-                                Some(chunk) => {
-                                    let mut pcm = chunk
-                                        .flatten_all()?
-                                        .to_dtype(DType::F32)?
-                                        .to_vec1::<f32>()?;
-                                    pcm = resampler.process(pcm);
-                                    Ok(Some(pcm))
-                                }
-                                None => Ok(None),
+                    if first_token_ms.is_none() {
+                        first_token_ms = Some(turn_started.elapsed().as_secs_f64() * 1e3);
+                    }
+                    match tok {
+                        GenToken::Text(id) => {
+                            text_ids.push(id as i64);
+                            modality_out.push(LFMModality::Text as i64);
+                            match text.decode(&[id], true) {
+                                Ok(text) => emit(VoiceEvent::Text(text)),
+                                Err(e) => cb_err = Some(e.to_string()),
                             }
-                        })();
-                        match decoded {
-                            Ok(Some(pcm)) => emit(VoiceEvent::Audio(pcm)),
-                            Ok(None) => {}
-                            Err(e) => cb_err = Some(e.to_string()),
+                        }
+                        GenToken::Audio(frame) => {
+                            if first_audio_ms.is_none() {
+                                first_audio_ms = Some(turn_started.elapsed().as_secs_f64() * 1e3);
+                            }
+                            // Collect EVERY frame (incl. EOAudio) for `append` BEFORE the streaming
+                            // skip — append needs the full audio_out; only PCM playback drops it.
+                            modality_out.push(LFMModality::AudioOut as i64);
+                            audio_frames.push(frame.clone());
+                            // Decode the 8-code frame to PCM via the streaming detokenizer.
+                            let decoded = (|| -> candle_core::Result<Option<Vec<f32>>> {
+                                match decode_audio_frame(&mut stream, &frame, codebooks, device)? {
+                                    Some(chunk) => {
+                                        let mut pcm = chunk
+                                            .flatten_all()?
+                                            .to_dtype(DType::F32)?
+                                            .to_vec1::<f32>()?;
+                                        pcm = resampler.process(pcm);
+                                        Ok(Some(pcm))
+                                    }
+                                    None => Ok(None),
+                                }
+                            })();
+                            match decoded {
+                                Ok(Some(pcm)) => emit(VoiceEvent::Audio(pcm)),
+                                Ok(None) => {}
+                                Err(e) => cb_err = Some(e.to_string()),
+                            }
                         }
                     }
-                }
-            })
+                },
+            )
             .map_err(s)?;
 
         if let Some(e) = cb_err {
@@ -2804,7 +2813,10 @@ mod tests {
         // tensor from the fingerprint (adversarial-review finding).
         let mut wider = saved.clone();
         wider.audio_in = Tensor::zeros(
-            (saved.audio_in.dim(0).unwrap(), saved.audio_in.dim(1).unwrap() + 1),
+            (
+                saved.audio_in.dim(0).unwrap(),
+                saved.audio_in.dim(1).unwrap() + 1,
+            ),
             DType::F32,
             dev,
         )

@@ -31,9 +31,7 @@ use candle_core::{DType, Device, Tensor};
 use liquid_audio::model::lfm2_hf::Cache as LfmCache;
 use liquid_audio::moshi::demo::chat::decode_audio_reply;
 use liquid_audio::moshi::models::MimiModel;
-use liquid_audio::{
-    ChatState, GenParams, GenToken, LFM2AudioModel, LFMModality, PrefillCursor,
-};
+use liquid_audio::{ChatState, GenParams, GenToken, LFM2AudioModel, LFMModality, PrefillCursor};
 
 /// Minimal PCM16 WAV reader (mono-downmixed f32) — same as examples/generate.rs.
 fn read_wav_mono_f32(path: &Path) -> (Vec<f32>, u32) {
@@ -220,7 +218,10 @@ fn run_turn(
     // (cumulative across turns — equivalent to cache_equivalence's incremental
     // accounting, proven there against a full re-prefill).
     let forwarded = index_pos - n_ctx;
-    assert!(forwarded <= out.modality.len(), "cache advanced past emitted tokens");
+    assert!(
+        forwarded <= out.modality.len(),
+        "cache advanced past emitted tokens"
+    );
     let flags: Vec<i64> = chat.modality_flag.flatten_all().unwrap().to_vec1().unwrap();
     cursor.positions = index_pos;
     cursor.text = flags
@@ -274,7 +275,8 @@ fn run_conversation(
 
     let mut chat = ChatState::new(&proc, codebooks).expect("chat");
     chat.new_turn("system").unwrap();
-    chat.add_text("Respond with interleaved text and audio.").unwrap();
+    chat.add_text("Respond with interleaved text and audio.")
+        .unwrap();
     chat.end_turn().unwrap();
 
     let mut cache: Option<LfmCache> = None;
@@ -282,8 +284,17 @@ fn run_conversation(
     let turns: Vec<TurnOut> = (0..4)
         .map(|turn_idx| {
             run_turn(
-                &model, &mut chat, &mut cache, &mut cursor, &wave, rate, &params, codebooks,
-                device, fused_conv, turn_idx,
+                &model,
+                &mut chat,
+                &mut cache,
+                &mut cursor,
+                &wave,
+                rate,
+                &params,
+                codebooks,
+                device,
+                fused_conv,
+                turn_idx,
             )
         })
         .collect();
@@ -334,7 +345,10 @@ fn e2e_four_turns_real_speech_and_fused_conv_ab() {
     let level = rms(&pcm_a);
     println!("turn-4 reply audio: {dur:.2}s @ {mimi_rate} Hz, rms {level:.4}");
     assert!(dur > 0.2, "turn-4 reply audio implausibly short: {dur:.2}s");
-    assert!(level > 1e-4, "turn-4 reply audio decodes to silence (rms {level})");
+    assert!(
+        level > 1e-4,
+        "turn-4 reply audio decodes to silence (rms {level})"
+    );
 
     // ---- Phase B: composed candle ops (fused kernel off via the cache seam). ----
     let (b, text_b, _pcm_b, _) = run_conversation(&device, dir, false);

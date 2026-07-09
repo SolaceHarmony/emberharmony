@@ -207,8 +207,12 @@ fn e2e_voice_runtime_speaks_two_turns_through_real_speaker() {
     // Speculative-prefill counters, smuggled out of the engine the session
     // thread builds: the live proof that prepare-during-pause actually CONSUMES
     // (equivalence alone is satisfied by an accelerator that never fires).
-    let spec: Arc<std::sync::OnceLock<(Arc<std::sync::atomic::AtomicU64>, Arc<std::sync::atomic::AtomicU64>)>> =
-        Arc::new(std::sync::OnceLock::new());
+    let spec: Arc<
+        std::sync::OnceLock<(
+            Arc<std::sync::atomic::AtomicU64>,
+            Arc<std::sync::atomic::AtomicU64>,
+        )>,
+    > = Arc::new(std::sync::OnceLock::new());
     let spec_slot = spec.clone();
     let runtime = VoiceRuntime::start_with_input(
         RuntimeConfig::default(),
@@ -244,7 +248,13 @@ fn e2e_voice_runtime_speaks_two_turns_through_real_speaker() {
 
     let mut log = Vec::new();
     // Model load happens inside the session thread → generous first deadline.
-    wait_for_state(&rx, SessionState::Listening, Duration::from_secs(180), &mut log, |_| {});
+    wait_for_state(
+        &rx,
+        SessionState::Listening,
+        Duration::from_secs(180),
+        &mut log,
+        |_| {},
+    );
     println!("[e2e] session up and listening");
 
     let mut transcripts = [String::new(), String::new()];
@@ -253,21 +263,35 @@ fn e2e_voice_runtime_speaks_two_turns_through_real_speaker() {
         // "Speak" the question into the mock mic; the feeder's trailing zeros are
         // the end-of-turn silence the VAD commits on.
         feed.lock().unwrap().extend(utterance.iter().copied());
-        println!("[e2e] turn {}: speaking {:.2}s into the mock mic", turn + 1, utterance.len() as f32 / mic_rate as f32);
+        println!(
+            "[e2e] turn {}: speaking {:.2}s into the mock mic",
+            turn + 1,
+            utterance.len() as f32 / mic_rate as f32
+        );
 
         let utt_secs = utterance.len() as f32 / mic_rate as f32;
         let capture = Duration::from_secs_f32(utt_secs) + Duration::from_secs(30);
         wait_for_state(&rx, SessionState::Thinking, capture, &mut log, |_| {});
-        wait_for_state(&rx, SessionState::Speaking, Duration::from_secs(60), &mut log, |_| {});
+        wait_for_state(
+            &rx,
+            SessionState::Speaking,
+            Duration::from_secs(60),
+            &mut log,
+            |_| {},
+        );
         // Reply streams until the runtime reopens the mic (post playback + echo tail).
         let rms_slot = &mut audio_rms_max[turn];
-        wait_for_state(&rx, SessionState::Listening, Duration::from_secs(120), &mut log, |ev| {
-            match ev {
+        wait_for_state(
+            &rx,
+            SessionState::Listening,
+            Duration::from_secs(120),
+            &mut log,
+            |ev| match ev {
                 Ev::Transcript(t) => *transcript = t.clone(),
                 Ev::Audio { rms, .. } => *rms_slot = rms_slot.max(*rms),
                 _ => {}
-            }
-        });
+            },
+        );
         println!("[e2e] turn {} transcript: {transcript:?}", turn + 1);
     }
 

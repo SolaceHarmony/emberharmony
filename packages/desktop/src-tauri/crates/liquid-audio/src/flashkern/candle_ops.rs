@@ -107,8 +107,9 @@ impl CustomOp3 for FlashkernConv1dUpdate {
                 let w = contig::<half::bf16>(ws, wl)?;
                 let bcx_b =
                     unsafe { std::slice::from_raw_parts(bcx.as_ptr() as *const u16, bcx.len()) };
-                let state_b =
-                    unsafe { std::slice::from_raw_parts(state.as_ptr() as *const u16, state.len()) };
+                let state_b = unsafe {
+                    std::slice::from_raw_parts(state.as_ptr() as *const u16, state.len())
+                };
                 let w_b = unsafe { std::slice::from_raw_parts(w.as_ptr() as *const u16, w.len()) };
                 #[allow(unused_mut)]
                 let mut out = vec![0u16; out_len];
@@ -165,13 +166,24 @@ mod tests {
             return;
         }
         let dev = Device::Cpu;
-        for (b, d, t, k) in [(1usize, 8usize, 1usize, 3usize), (2, 5, 4, 4), (1, 2048, 1, 3)] {
-            let bcx: Vec<f32> = (0..b * 3 * d * t).map(|i| (i as f32 * 0.13).sin()).collect();
-            let st: Vec<f32> = (0..b * d * (k - 1)).map(|i| (i as f32 * 0.07).cos()).collect();
+        for (b, d, t, k) in [
+            (1usize, 8usize, 1usize, 3usize),
+            (2, 5, 4, 4),
+            (1, 2048, 1, 3),
+        ] {
+            let bcx: Vec<f32> = (0..b * 3 * d * t)
+                .map(|i| (i as f32 * 0.13).sin())
+                .collect();
+            let st: Vec<f32> = (0..b * d * (k - 1))
+                .map(|i| (i as f32 * 0.07).cos())
+                .collect();
             let wv: Vec<f32> = (0..d * k).map(|i| 0.1 + 0.002 * (i % 50) as f32).collect();
             for dtype in [DType::F32, DType::BF16] {
                 let mk = |v: &[f32], shape: (usize, usize, usize)| {
-                    Tensor::from_vec(v.to_vec(), shape, &dev).unwrap().to_dtype(dtype).unwrap()
+                    Tensor::from_vec(v.to_vec(), shape, &dev)
+                        .unwrap()
+                        .to_dtype(dtype)
+                        .unwrap()
                 };
                 let bcxt = mk(&bcx, (b, 3 * d, t));
                 let stt = mk(&st, (b, d, k - 1));
@@ -183,7 +195,12 @@ mod tests {
                     candle_flashfftconv::causal_conv1d_update_fused(&bcxt, &stt, &wt).unwrap();
                 let (y1, s1) = causal_conv1d_update_fused(&bcxt, &stt, &wt).unwrap();
                 let flat = |t: &Tensor| -> Vec<f32> {
-                    t.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1().unwrap()
+                    t.to_dtype(DType::F32)
+                        .unwrap()
+                        .flatten_all()
+                        .unwrap()
+                        .to_vec1()
+                        .unwrap()
                 };
                 let tol = if dtype == DType::F32 { 1e-5 } else { 1e-2 };
                 let dy = flat(&y0)

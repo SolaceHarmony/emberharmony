@@ -15,6 +15,7 @@
 ))]
 
 use std::ffi::c_void;
+use std::sync::Mutex;
 
 extern "C" {
     fn lfm_engine_new(workers: i32) -> *mut c_void;
@@ -35,11 +36,19 @@ extern "C" {
 }
 
 /// Handle to the persistent native engine. One per process is the intended shape
-/// (decode is sequential); the C side serializes a single pass in flight.
-pub struct NativeEngine(*mut c_void);
+/// (decode is sequential). The C side is a SINGLE-SLOT machine — one Pass, one
+/// scratch arena, one request word — so the wrapper serializes the entire native
+/// call under `pass_lock`; that lock is what makes the `Sync` below true.
+pub struct NativeEngine {
+    ptr: *mut c_void,
+    pass_lock: Mutex<()>,
+}
 
-// SAFETY: the C engine's request path is internally synchronized (mutex + atomics);
-// the handle is an opaque pointer to a heap object owned by the C side.
+// SAFETY: Send — the handle is an opaque pointer to a C-heap object with no thread
+// affinity. Sync — provided by `pass_lock` above serializing every call into the
+// SINGLE-SLOT C engine (one Pass, one scratch arena, one request word); the C side's
+// own mutex only covers the completion handshake, NOT concurrent request setup.
+// Removing the lock reintroduces the data race, whatever the C side looks like.
 unsafe impl Send for NativeEngine {}
 unsafe impl Sync for NativeEngine {}
 
@@ -50,19 +59,23 @@ impl NativeEngine {
         if p.is_null() {
             None
         } else {
-            Some(Self(p))
+            Some(Self {
+                ptr: p,
+                pass_lock: Mutex::new(()),
+            })
         }
     }
 
     /// One fused-MLP decode block, entirely native — bit-identical to
     /// [`super::decode::fused_mlp_decode`] at the same `lanes`.
+    #[must_use = "false = native pass did not run; caller must take the fallback"]
     pub fn fused_mlp(
         &self,
         x: &[u16],
         w: &super::decode::FusedMlpWeights,
         out: &mut [u16],
         lanes: usize,
-    ) {
+    ) -> bool {
         let h = x.len();
         let i = w.w1.len() / h;
         assert!(h > 0 && i > 0, "native fused_mlp: empty dims");
@@ -71,11 +84,14 @@ impl NativeEngine {
         assert_eq!(w.w3.len(), i * h, "native fused_mlp: w3.len() != I·H");
         assert_eq!(w.w2.len(), h * i, "native fused_mlp: w2.len() != H·I");
         assert_eq!(out.len(), h, "native fused_mlp: out.len() != H");
+        // The lock that makes `Sync` true: the C engine is single-slot, so the whole
+        // native call — request setup through completion — is serialized here.
+        let _pass = self.pass_lock.lock().unwrap();
         // SAFETY: slice extents checked above; the call blocks until the pass
         // completes, so every pointer outlives its use.
         let rc = unsafe {
             lfm_engine_mlp(
-                self.0,
+                self.ptr,
                 x.as_ptr(),
                 w.norm_w.as_ptr(),
                 w.w1.as_ptr(),
@@ -88,15 +104,39 @@ impl NativeEngine {
                 lanes,
             )
         };
-        assert_eq!(rc, 0, "native fused_mlp: engine call failed rc={rc}");
+        // rc != 0 = native-side failure (e.g. scratch growth failed): report it so
+        // the caller can take the bit-identical threadgroup path instead of dying.
+        rc == 0
     }
 }
 
 impl Drop for NativeEngine {
     fn drop(&mut self) {
-        // SAFETY: shuts the coordinator down, closes channels, joins the team.
-        unsafe { lfm_engine_free(self.0) };
+        // SAFETY: shuts the coordinator down, joins the team, releases the handles.
+        unsafe { lfm_engine_free(self.ptr) };
     }
+}
+
+/// The process-resident engine for the model hot path (the same residency pattern as
+/// rayon's global pool): built on first use, `None` when the runtime cannot come up —
+/// callers fall back to the threadgroup port, which is bit-identical by the parity
+/// test, so the fallback changes scheduling only, never numerics.
+///
+/// Lifetime is deliberately process-long: `OnceLock` never drops, so the team's
+/// threads live until exit — the daemon shape this crate ships in. Workers are sized
+/// by the crate's torch-parity thread policy (`threads::intraop_default_num_threads`:
+/// P-cores only on Apple Silicon via `hw.perflevel0.physicalcpu`) — NOT
+/// `available_parallelism`, which counts E-cores and reintroduces the tail-latency
+/// imbalance the runtime documents as harmful.
+pub fn process_engine() -> Option<&'static NativeEngine> {
+    use std::sync::OnceLock;
+    static ENGINE: OnceLock<Option<NativeEngine>> = OnceLock::new();
+    ENGINE
+        .get_or_init(|| {
+            let workers = crate::threads::intraop_default_num_threads().clamp(1, 16);
+            NativeEngine::new(workers)
+        })
+        .as_ref()
 }
 
 #[cfg(test)]
@@ -133,7 +173,7 @@ mod tests {
                 let mut want = vec![0u16; h];
                 crate::flashkern::decode::fused_mlp_decode(&x, &w, &mut want, lanes);
                 let mut got = vec![0u16; h];
-                engine.fused_mlp(&x, &w, &mut got, lanes);
+                assert!(engine.fused_mlp(&x, &w, &mut got, lanes));
                 assert_eq!(got, want, "H={h} I={i} lanes={lanes}");
             }
         }
@@ -157,7 +197,7 @@ mod tests {
         let lanes = 8;
         let t = std::time::Instant::now();
         for _ in 0..50 {
-            engine.fused_mlp(&x, &w, &mut out, lanes);
+            assert!(engine.fused_mlp(&x, &w, &mut out, lanes));
         }
         let native_ms = t.elapsed().as_secs_f64() * 1e3 / 50.0;
         let t = std::time::Instant::now();

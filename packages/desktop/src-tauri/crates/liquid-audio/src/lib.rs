@@ -12,12 +12,12 @@
 //! ```
 
 pub mod audio_out; // AudioDetokenizer trait + backends (LFM2 detok / Mimi)
-pub mod chat_template; // load-time verification vs the snapshot chat_template.jinja
 pub mod bf16_gemm; // NEON BFMMLA bf16 CPU matmul (closes candle's bf16 gemm gap)
-pub mod flashkern; // CPU replicas of the Metal JIT kernels (NEON / AVX SIMD + the GPU dispatch model)
 pub mod candle_ext; // vendored candle 0.10 backports + extensions (kept on the 0.9.2 pin)
+pub mod chat_template; // load-time verification vs the snapshot chat_template.jinja
 pub mod data; // data/ (data-pipeline value types)
 pub mod detokenizer; // detokenizer.py
+pub mod flashkern; // CPU replicas of the Metal JIT kernels (NEON / AVX SIMD + the GPU dispatch model)
 pub mod loader; // config.json + safetensors → model + processor
 pub mod model;
 pub mod moshi; // Liquid-Audio-facing facade over Kyutai's Rust moshi crate

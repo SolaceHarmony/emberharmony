@@ -205,7 +205,10 @@ fn main() -> Res<()> {
     let t0 = Instant::now();
     let (model, proc) = from_pretrained(&dir, &device)?;
     let (model, proc) = (Arc::new(model), Arc::new(proc));
-    eprintln!("[load] done in {:.1}s ({device:?}).", t0.elapsed().as_secs_f32());
+    eprintln!(
+        "[load] done in {:.1}s ({device:?}).",
+        t0.elapsed().as_secs_f32()
+    );
 
     let (_out_stream, ring, out_rate) = start_output()?;
     eprintln!("[spk] output @ {out_rate} Hz");

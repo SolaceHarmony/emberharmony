@@ -3,17 +3,19 @@
 //! `experiments/lfm2-audio-voice/candle-flashfftconv/` embeds its Metal kernels as MSL source
 //! strings inside `.rs` files and JIT-compiles them at runtime. This module is the CPU edition
 //! of that kernel library: each Metal kernel is replicated with the closest native SIMD idiom —
-//! NEON on aarch64 ([`neon`]), AVX2 / AVX-512 on x86-64 ([`x86`]) — and the multi-stage kernels
-//! run under a faithful CPU port of the GPU dispatch model ([`fanout`]: threadgroup grid →
-//! rayon, simdgroup lanes → a scoped thread team, `threadgroup_barrier` → `std::sync::Barrier`).
+//! NEON on aarch64 ([`neon`]), AVX2 / AVX-512 on x86-64 ([`x86`]). The older fused regions run
+//! under a faithful CPU port of the GPU dispatch model ([`fanout`]: threadgroup grid → rayon,
+//! simdgroup lanes → a scoped thread team, `threadgroup_barrier` → `std::sync::Barrier`). The
+//! live FFN decode mount is moving beyond that rung into the resident native stage machine
+//! ([`native_engine`]).
 //!
 //! Design docs + the Metal-idiom → opcode map: `csrc/FLASHKERN.md`.
 
 pub mod candle_ops; // candle CustomOp bridges — the seam the model wires through on CPU
 pub mod dd; // double-double toolkit (CPU port of double_double.metal) for the dd kernels
-pub mod decode; // fused decode blocks: one threadgroup dispatch per block, spin barriers
-pub mod engine; // the kcoro tile engine — the chassis (zero-spin dispatch, ENGINE_DESIGN.md §2)
-pub mod native_engine; // the resident native engine's Rust rim (csrc/flashkern_engine.cpp)
+pub mod decode; // fused decode blocks: threadgroup fallback + ShortConv/DepthDecode blocks
+pub mod engine; // prototype/reference kcoro channel engine; not the live production mount
+pub mod native_engine; // resident native stage-machine rim (csrc/flashkern_engine.cpp)
 
 pub(crate) use fanout::Shared;
 pub mod fanout; // GPU dispatch model on threads: grid fan-out, lane teams, real barriers

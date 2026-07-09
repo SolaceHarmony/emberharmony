@@ -154,10 +154,11 @@ pub struct Cache {
     /// the reference expanded form: byte-identical output (verified by wav hash).
     pub grouped_gqa_decode: bool,
     /// Per-layer RESIDENT KV storage (runtime-architecture audit, item 1): preallocated
-    /// f32 planes written in place, read as zero-copy narrows. This deliberately replaces
-    /// the reference `Tensor::cat` append — which recopied the whole accumulated cache per
-    /// layer per token (plus a full-cache f32 re-upcast) and made decode degrade with
-    /// context. History note: an earlier `candle_nn::KvCache` swap was reverted as a
+    /// planes in the incoming projection dtype, written in place and read as zero-copy
+    /// narrows. On the live CPU bf16 decode path these are bf16 planes. This deliberately
+    /// replaces the reference `Tensor::cat` append — which recopied the whole accumulated
+    /// cache per layer per token (plus a full-cache f32 re-upcast) and made decode degrade
+    /// with context. History note: an earlier `candle_nn::KvCache` swap was reverted as a
     /// parity deviation; this one is held to a stricter standard than that attempt — the
     /// narrow views feed attention byte-identical rows: with `grouped_gqa_decode=false`
     /// a greedy+seeded generate produces a BIT-IDENTICAL wav before/after this change, so
@@ -231,7 +232,11 @@ impl Cache {
     /// The KV tensors themselves are not copied — [`Self::rollback`] restores by
     /// narrowing back to the recorded lengths.
     pub fn snapshot(&self) -> Result<CacheSnapshot> {
-        let kv_lens = self.kvs.iter().map(|kv| kv.as_ref().map(|sl| sl.len)).collect();
+        let kv_lens = self
+            .kvs
+            .iter()
+            .map(|kv| kv.as_ref().map(|sl| sl.len))
+            .collect();
         Ok(CacheSnapshot {
             kv_lens,
             conv_states: self.conv_states.clone(),
@@ -317,7 +322,7 @@ impl Cache {
             None => {
                 let cap = need.next_power_of_two().max(256);
                 let k = Tensor::zeros((b, n_kv, cap, hd), kf.dtype(), kf.device())?;
-                let v = Tensor::zeros((b, n_kv, cap, hd), kf.dtype(), kf.device())?;
+                let v = Tensor::zeros((b, n_kv, cap, hd), vf.dtype(), vf.device())?;
                 *slot = Some(KvSlot { k, v, len: 0 });
             }
             Some(sl) => {
@@ -325,7 +330,7 @@ impl Cache {
                 if need > cap {
                     let ncap = need.next_power_of_two().max(cap * 2);
                     let k = Tensor::zeros((b, n_kv, ncap, hd), kf.dtype(), kf.device())?;
-                    let v = Tensor::zeros((b, n_kv, ncap, hd), kf.dtype(), kf.device())?;
+                    let v = Tensor::zeros((b, n_kv, ncap, hd), vf.dtype(), vf.device())?;
                     if sl.len > 0 {
                         // The narrow is strided across kv heads whenever len < cap (suffix
                         // appends can grow mid-plane); slice_set needs a contiguous source.
@@ -528,11 +533,15 @@ impl Attention {
         all(target_arch = "aarch64", has_flashkern_neon),
         all(target_arch = "x86_64", has_flashkern_x86)
     ))]
-    fn attn_decode_flash(&self, q: &Tensor, k: &Tensor, v: &Tensor, out_dtype: DType) -> Result<Tensor> {
+    fn attn_decode_flash(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        out_dtype: DType,
+    ) -> Result<Tensor> {
         use candle_core::Storage;
-        fn bits_view<'a>(
-            guard: &'a std::sync::RwLockReadGuard<'_, Storage>,
-        ) -> Result<&'a [u16]> {
+        fn bits_view<'a>(guard: &'a std::sync::RwLockReadGuard<'_, Storage>) -> Result<&'a [u16]> {
             match &**guard {
                 Storage::Cpu(candle_core::CpuStorage::BF16(vv)) => {
                     // SAFETY: half::bf16 is repr(transparent) over u16.
@@ -543,7 +552,8 @@ impl Attention {
         }
         let q = q.contiguous()?;
         let (qs, ql) = q.storage_and_layout();
-        let qb = &bits_view(&qs)?[ql.start_offset()..ql.start_offset() + self.n_head * self.head_dim];
+        let qb =
+            &bits_view(&qs)?[ql.start_offset()..ql.start_offset() + self.n_head * self.head_dim];
         let (ks, kl) = k.storage_and_layout();
         let (vs, vl) = v.storage_and_layout();
         let len = kl.dims()[2];
@@ -576,8 +586,16 @@ impl Attention {
         all(target_arch = "aarch64", has_flashkern_neon),
         all(target_arch = "x86_64", has_flashkern_x86)
     )))]
-    fn attn_decode_flash(&self, _q: &Tensor, _k: &Tensor, _v: &Tensor, _o: DType) -> Result<Tensor> {
-        candle_core::bail!("flashkern attention unavailable — the dispatch gate should prevent this")
+    fn attn_decode_flash(
+        &self,
+        _q: &Tensor,
+        _k: &Tensor,
+        _v: &Tensor,
+        _o: DType,
+    ) -> Result<Tensor> {
+        candle_core::bail!(
+            "flashkern attention unavailable — the dispatch gate should prevent this"
+        )
     }
 }
 
@@ -852,8 +870,10 @@ impl DecoderLayer {
             rayon::current_num_threads().max(1),
         );
         drop((xs, ns, is_, cs, os, ss));
-        let state_out: Vec<half::bf16> =
-            state_out.iter().map(|&b| half::bf16::from_bits(b)).collect();
+        let state_out: Vec<half::bf16> = state_out
+            .iter()
+            .map(|&b| half::bf16::from_bits(b))
+            .collect();
         cache.conv_states[block_idx] =
             Some(Tensor::from_vec(state_out, (1, hdim, k - 1), x.device())?);
         let out: Vec<half::bf16> = out.iter().map(|&b| half::bf16::from_bits(b)).collect();
@@ -906,12 +926,35 @@ impl DecoderLayer {
             eps: self.ffn_norm.eps() as f32,
         };
         let mut out = vec![0u16; hdim];
-        crate::flashkern::decode::fused_mlp_decode(
-            xb,
-            &weights,
-            &mut out,
-            rayon::current_num_threads().max(1),
-        );
+        let lanes = rayon::current_num_threads().max(1);
+        // The resident native stage machine when it is up — bit-identical to the
+        // threadgroup port by parity test, so the fallback changes scheduling only,
+        // never numerics.
+        #[cfg(all(
+            has_kcoro,
+            has_native_engine,
+            any(
+                all(target_arch = "aarch64", has_flashkern_neon),
+                all(target_arch = "x86_64", has_flashkern_x86)
+            )
+        ))]
+        {
+            let ran_native = crate::flashkern::native_engine::process_engine()
+                .map(|engine| engine.fused_mlp(xb, &weights, &mut out, lanes))
+                .unwrap_or(false);
+            if !ran_native {
+                crate::flashkern::decode::fused_mlp_decode(xb, &weights, &mut out, lanes);
+            }
+        }
+        #[cfg(not(all(
+            has_kcoro,
+            has_native_engine,
+            any(
+                all(target_arch = "aarch64", has_flashkern_neon),
+                all(target_arch = "x86_64", has_flashkern_x86)
+            )
+        )))]
+        crate::flashkern::decode::fused_mlp_decode(xb, &weights, &mut out, lanes);
         let out: Vec<half::bf16> = out.iter().map(|&b| half::bf16::from_bits(b)).collect();
         Ok(Some(Tensor::from_vec(out, (1, 1, hdim), x.device())?))
     }
@@ -1032,5 +1075,40 @@ mod tests {
             sc = sc.max(x.abs());
         }
         assert!(md / sc < 1e-5, "grouped vs expanded rel {}", md / sc);
+    }
+
+    #[test]
+    fn append_kv_growth_preserves_independent_v_dtype() {
+        let dev = Device::Cpu;
+        let cfg = Lfm2Config {
+            vocab_size: 16,
+            hidden_size: 2,
+            num_hidden_layers: 1,
+            num_attention_heads: 1,
+            num_key_value_heads: 1,
+            norm_eps: 1e-5,
+            rope_theta: 10_000.0,
+            max_position_embeddings: 8,
+            conv_l_cache: 3,
+            conv_bias: false,
+            layer_types: vec![LayerType::FullAttention],
+            block_ffn_dim_multiplier: 1.0,
+            block_multiple_of: 1,
+            block_ff_dim: 4,
+            block_auto_adjust_ff_dim: false,
+        };
+        let mut cache = Cache::new(true, DType::F32, &cfg, &dev).unwrap();
+
+        let k0 = Tensor::zeros((1, 1, 256, 2), DType::F32, &dev).unwrap();
+        let v0 = Tensor::zeros((1, 1, 256, 2), DType::BF16, &dev).unwrap();
+        cache.append_kv(0, &k0, &v0, 0).unwrap();
+
+        let k1 = Tensor::zeros((1, 1, 1, 2), DType::F32, &dev).unwrap();
+        let v1 = Tensor::zeros((1, 1, 1, 2), DType::BF16, &dev).unwrap();
+        let (k, v) = cache.append_kv(0, &k1, &v1, 256).unwrap();
+
+        assert_eq!(k.dtype(), DType::F32);
+        assert_eq!(v.dtype(), DType::BF16);
+        assert_eq!(cache.kvs[0].as_ref().unwrap().v.dtype(), DType::BF16);
     }
 }

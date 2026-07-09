@@ -77,7 +77,14 @@ extern "C" {
     fn lfm_fft_radix2_f32(data: *mut f32, n: i32, inverse: i32);
     fn lfm_complex_mul_f32(a: *const f32, b: *const f32, out: *mut f32, n: i32);
     fn lfm_depthwise3_f32(x: *const f32, k: *const f32, y: *mut f32, bn: i32, c: i32, l: i32);
-    fn lfm_depthwise3_causal_f32(x: *const f32, k: *const f32, y: *mut f32, bn: i32, c: i32, l: i32);
+    fn lfm_depthwise3_causal_f32(
+        x: *const f32,
+        k: *const f32,
+        y: *mut f32,
+        bn: i32,
+        c: i32,
+        l: i32,
+    );
     fn lfm_conv1d_update_f32(
         bcx: *const f32,
         state: *const f32,
@@ -102,7 +109,9 @@ extern "C" {
 
 /// `true` when flashkern's bf16 GEMM is built in and the CPU meets its baseline (AVX2 + FMA).
 pub fn bf16_gemm_available() -> bool {
-    cfg!(all(target_arch = "x86_64", has_flashkern_x86)) && x86_features().avx2 && x86_features().fma
+    cfg!(all(target_arch = "x86_64", has_flashkern_x86))
+        && x86_features().avx2
+        && x86_features().fma
 }
 
 /// `C(M,N) f32 = A(M,K) bf16 · B(K,N) bf16` (raw bf16 bits as `u16`), row-major, f32
@@ -173,21 +182,41 @@ pub fn bf16_gemm_nt_into(a: &[u16], w_nk: &[u16], c: &mut [f32], m: usize, n: us
                 let nn = cc.len();
                 // SAFETY: a is K; ww is nn*K rows aligned with cc; AVX2+FMA asserted above.
                 unsafe {
-                    lfm_bf16_gemm_nt_f32(a.as_ptr(), ww.as_ptr(), cc.as_mut_ptr(), 1, nn as i32, k as i32)
+                    lfm_bf16_gemm_nt_f32(
+                        a.as_ptr(),
+                        ww.as_ptr(),
+                        cc.as_mut_ptr(),
+                        1,
+                        nn as i32,
+                        k as i32,
+                    )
                 };
             });
         return;
     }
     // SAFETY: slices sized M*K / N*K / M*N per the asserts; AVX2+FMA asserted above.
     unsafe {
-        lfm_bf16_gemm_nt_f32(a.as_ptr(), w_nk.as_ptr(), c.as_mut_ptr(), m as i32, n as i32, k as i32)
+        lfm_bf16_gemm_nt_f32(
+            a.as_ptr(),
+            w_nk.as_ptr(),
+            c.as_mut_ptr(),
+            m as i32,
+            n as i32,
+            k as i32,
+        )
     };
 }
 
 /// Raw pointer form of the nt dot kernel for lane-team callers ([`super::decode`]) — see the
 /// NEON twin. SAFETY: caller guarantees sizes and the AVX2+FMA precondition.
 #[cfg(all(target_arch = "x86_64", has_flashkern_x86))]
-pub(crate) unsafe fn bf16_gemm_nt_raw(a: *const u16, w: *const u16, c: *mut f32, n: usize, k: usize) {
+pub(crate) unsafe fn bf16_gemm_nt_raw(
+    a: *const u16,
+    w: *const u16,
+    c: *mut f32,
+    n: usize,
+    k: usize,
+) {
     lfm_bf16_gemm_nt_f32(a, w, c, 1, n as i32, k as i32);
 }
 
@@ -216,7 +245,10 @@ pub fn recip(x: &[f32], out: &mut [f32]) {
 /// Deterministic high-accuracy sum via double-double (FMA error-free transforms). **Precondition:** AVX2+FMA.
 #[cfg(all(target_arch = "x86_64", has_flashkern_x86))]
 pub fn dd_sum(x: &[f32]) -> f32 {
-    assert!(x86_features().avx2 && x86_features().fma, "dd_sum requires AVX2+FMA");
+    assert!(
+        x86_features().avx2 && x86_features().fma,
+        "dd_sum requires AVX2+FMA"
+    );
     // SAFETY: `x` is `n` contiguous f32.
     unsafe { lfm_dd_sum_f32(x.as_ptr(), x.len() as i32) }
 }
@@ -225,7 +257,10 @@ pub fn dd_sum(x: &[f32]) -> f32 {
 #[cfg(all(target_arch = "x86_64", has_flashkern_x86))]
 pub fn dd_dot(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len());
-    assert!(x86_features().avx2 && x86_features().fma, "dd_dot requires AVX2+FMA");
+    assert!(
+        x86_features().avx2 && x86_features().fma,
+        "dd_dot requires AVX2+FMA"
+    );
     // SAFETY: `a`/`b` are both `n` contiguous f32.
     unsafe { lfm_dd_dot_f32(a.as_ptr(), b.as_ptr(), a.len() as i32) }
 }
@@ -253,7 +288,14 @@ pub fn permute_u8(table16: &[u8; 16], idx: &[u8], out: &mut [u8]) {
     assert_eq!(idx.len(), out.len());
     assert!(x86_features().avx2, "permute_u8 requires AVX2");
     // SAFETY: table is 16 bytes; idx/out are both `n` bytes.
-    unsafe { lfm_permute_u8(table16.as_ptr(), idx.as_ptr(), out.as_mut_ptr(), idx.len() as i32) };
+    unsafe {
+        lfm_permute_u8(
+            table16.as_ptr(),
+            idx.as_ptr(),
+            out.as_mut_ptr(),
+            idx.len() as i32,
+        )
+    };
 }
 
 /// In-place radix-2 Cooley-Tukey FFT on interleaved `[re,im]` f32. `data.len()` even and
@@ -285,7 +327,14 @@ pub fn s8_gemm(a: &[i8], b: &[i8], c: &mut [i32], m: usize, n: usize, k: usize) 
     );
     // SAFETY: slices sized M*K / K*N / M*N; AVX-512F/BW/VL asserted above.
     unsafe {
-        lfm_s8_gemm_s32(a.as_ptr(), b.as_ptr(), c.as_mut_ptr(), m as i32, n as i32, k as i32)
+        lfm_s8_gemm_s32(
+            a.as_ptr(),
+            b.as_ptr(),
+            c.as_mut_ptr(),
+            m as i32,
+            n as i32,
+            k as i32,
+        )
     };
 }
 
@@ -308,7 +357,10 @@ pub fn depthwise_causal_conv1d_bf16(
     assert_eq!(w.len(), d * k, "conv1d: w.len() != D*K");
     assert_eq!(bias.len(), d, "conv1d: bias.len() != D");
     assert_eq!(out.len(), bn * d * lout, "conv1d: out.len() != B*D*Lout");
-    assert!(x86_features().avx2 && x86_features().fma, "conv1d requires AVX2+FMA");
+    assert!(
+        x86_features().avx2 && x86_features().fma,
+        "conv1d requires AVX2+FMA"
+    );
     // SAFETY: pointers sized per the asserts; AVX2+FMA asserted above.
     unsafe {
         lfm_depthwise_causal_conv1d_bf16(
@@ -330,12 +382,22 @@ pub fn depthwise_causal_conv1d_bf16(
 /// `a`/`b`/`out` are interleaved `[re,im]`, equal even lengths. **Precondition:** AVX2.
 #[cfg(all(target_arch = "x86_64", has_flashkern_x86))]
 pub fn complex_mul(a: &[f32], b: &[f32], out: &mut [f32]) {
-    assert!(a.len() % 2 == 0, "complex_mul: interleaved [re,im] needs an even length");
+    assert!(
+        a.len() % 2 == 0,
+        "complex_mul: interleaved [re,im] needs an even length"
+    );
     assert_eq!(a.len(), b.len(), "complex_mul: a.len() != b.len()");
     assert_eq!(a.len(), out.len(), "complex_mul: out.len() != a.len()");
     assert!(x86_features().avx2, "complex_mul requires AVX2");
     // SAFETY: all three slices hold n interleaved complex pairs; AVX2 asserted above.
-    unsafe { lfm_complex_mul_f32(a.as_ptr(), b.as_ptr(), out.as_mut_ptr(), (a.len() / 2) as i32) };
+    unsafe {
+        lfm_complex_mul_f32(
+            a.as_ptr(),
+            b.as_ptr(),
+            out.as_mut_ptr(),
+            (a.len() / 2) as i32,
+        )
+    };
 }
 
 /// Deterministic 3-tap depthwise conv1d, forward window (`depthwise3`): `y[t] = x[t]·w0 +
@@ -348,7 +410,16 @@ pub fn depthwise3(x: &[f32], k: &[f32], y: &mut [f32], bn: usize, c: usize, l: u
     assert_eq!(y.len(), x.len(), "depthwise3: y.len() != x.len()");
     assert!(x86_features().avx2, "depthwise3 requires AVX2");
     // SAFETY: slices sized per the asserts; AVX2 asserted above.
-    unsafe { lfm_depthwise3_f32(x.as_ptr(), k.as_ptr(), y.as_mut_ptr(), bn as i32, c as i32, l as i32) };
+    unsafe {
+        lfm_depthwise3_f32(
+            x.as_ptr(),
+            k.as_ptr(),
+            y.as_mut_ptr(),
+            bn as i32,
+            c as i32,
+            l as i32,
+        )
+    };
 }
 
 /// Deterministic 3-tap depthwise conv1d, causal window (`depthwise3_causal`) — the LFM2
@@ -362,7 +433,14 @@ pub fn depthwise3_causal(x: &[f32], k: &[f32], y: &mut [f32], bn: usize, c: usiz
     assert!(x86_features().avx2, "depthwise3_causal requires AVX2");
     // SAFETY: slices sized per the asserts; AVX2 asserted above.
     unsafe {
-        lfm_depthwise3_causal_f32(x.as_ptr(), k.as_ptr(), y.as_mut_ptr(), bn as i32, c as i32, l as i32)
+        lfm_depthwise3_causal_f32(
+            x.as_ptr(),
+            k.as_ptr(),
+            y.as_mut_ptr(),
+            bn as i32,
+            c as i32,
+            l as i32,
+        )
     };
 }
 
@@ -382,12 +460,30 @@ pub fn conv1d_update_f32(
     t: usize,
     k: usize,
 ) {
-    assert!((1..=8).contains(&k), "conv1d_update: K={k} outside the register window 1..=8");
-    assert_eq!(bcx.len(), bn * 3 * d * t, "conv1d_update: bcx.len() != B*3D*T");
-    assert_eq!(state.len(), bn * d * (k - 1), "conv1d_update: state.len() != B*D*(K-1)");
+    assert!(
+        (1..=8).contains(&k),
+        "conv1d_update: K={k} outside the register window 1..=8"
+    );
+    assert_eq!(
+        bcx.len(),
+        bn * 3 * d * t,
+        "conv1d_update: bcx.len() != B*3D*T"
+    );
+    assert_eq!(
+        state.len(),
+        bn * d * (k - 1),
+        "conv1d_update: state.len() != B*D*(K-1)"
+    );
     assert_eq!(w.len(), d * k, "conv1d_update: w.len() != D*K");
-    assert_eq!(out.len(), bn * d * (t + k - 1), "conv1d_update: out.len() != B*D*(T+K-1)");
-    assert!(x86_features().avx2 && x86_features().fma, "conv1d_update requires AVX2+FMA");
+    assert_eq!(
+        out.len(),
+        bn * d * (t + k - 1),
+        "conv1d_update: out.len() != B*D*(T+K-1)"
+    );
+    assert!(
+        x86_features().avx2 && x86_features().fma,
+        "conv1d_update requires AVX2+FMA"
+    );
     // SAFETY: slices sized per the asserts; AVX2+FMA asserted above.
     unsafe {
         lfm_conv1d_update_f32(
@@ -418,12 +514,30 @@ pub fn conv1d_update_bf16(
     t: usize,
     k: usize,
 ) {
-    assert!((1..=8).contains(&k), "conv1d_update: K={k} outside the register window 1..=8");
-    assert_eq!(bcx.len(), bn * 3 * d * t, "conv1d_update: bcx.len() != B*3D*T");
-    assert_eq!(state.len(), bn * d * (k - 1), "conv1d_update: state.len() != B*D*(K-1)");
+    assert!(
+        (1..=8).contains(&k),
+        "conv1d_update: K={k} outside the register window 1..=8"
+    );
+    assert_eq!(
+        bcx.len(),
+        bn * 3 * d * t,
+        "conv1d_update: bcx.len() != B*3D*T"
+    );
+    assert_eq!(
+        state.len(),
+        bn * d * (k - 1),
+        "conv1d_update: state.len() != B*D*(K-1)"
+    );
     assert_eq!(w.len(), d * k, "conv1d_update: w.len() != D*K");
-    assert_eq!(out.len(), bn * d * (t + k - 1), "conv1d_update: out.len() != B*D*(T+K-1)");
-    assert!(x86_features().avx2 && x86_features().fma, "conv1d_update requires AVX2+FMA");
+    assert_eq!(
+        out.len(),
+        bn * d * (t + k - 1),
+        "conv1d_update: out.len() != B*D*(T+K-1)"
+    );
+    assert!(
+        x86_features().avx2 && x86_features().fma,
+        "conv1d_update requires AVX2+FMA"
+    );
     // SAFETY: slices sized per the asserts; AVX2+FMA asserted above.
     unsafe {
         lfm_conv1d_update_bf16(
@@ -503,8 +617,12 @@ mod tests {
         }
         for &l in &[1usize, 2, 3, 7, 11, 64] {
             let (bn, c) = (2usize, 3usize);
-            let x: Vec<f32> = (0..bn * c * l).map(|i| ((i * 31 % 17) as f32 / 17.0) - 0.5).collect();
-            let k: Vec<f32> = (0..c * 3).map(|i| ((i * 13 % 7) as f32 / 7.0) - 0.5).collect();
+            let x: Vec<f32> = (0..bn * c * l)
+                .map(|i| ((i * 31 % 17) as f32 / 17.0) - 0.5)
+                .collect();
+            let k: Vec<f32> = (0..c * 3)
+                .map(|i| ((i * 13 % 7) as f32 / 7.0) - 0.5)
+                .collect();
             let mut fwd = vec![0f32; x.len()];
             let mut cau = vec![0f32; x.len()];
             depthwise3(&x, &k, &mut fwd, bn, c, l);
@@ -515,7 +633,11 @@ mod tests {
                     let (w0, w1, w2) = (k[ci * 3], k[ci * 3 + 1], k[ci * 3 + 2]);
                     for t in 0..l {
                         let xf = |i: isize| {
-                            if i >= 0 && (i as usize) < l { row[i as usize] } else { 0.0 }
+                            if i >= 0 && (i as usize) < l {
+                                row[i as usize]
+                            } else {
+                                0.0
+                            }
                         };
                         let f = {
                             let acc = (xf(t as isize) * w0) + (xf(t as isize + 1) * w1);
@@ -559,14 +681,26 @@ mod tests {
                 win[..km1].copy_from_slice(srow);
                 for t in 0..t_len {
                     let bx = brow[t] * xrow[t];
-                    win[k - 1] = if bf16_regime { bf16::from_f32(bx).to_f32() } else { bx };
+                    win[k - 1] = if bf16_regime {
+                        bf16::from_f32(bx).to_f32()
+                    } else {
+                        bx
+                    };
                     let mut acc = 0f32;
                     for j in 0..k {
                         acc += w[c * k + j] * win[j];
                     }
-                    let cv = if bf16_regime { bf16::from_f32(acc).to_f32() } else { acc };
+                    let cv = if bf16_regime {
+                        bf16::from_f32(acc).to_f32()
+                    } else {
+                        acc
+                    };
                     let y = crow[t] * cv;
-                    orow[t] = if bf16_regime { bf16::from_f32(y).to_f32() } else { y };
+                    orow[t] = if bf16_regime {
+                        bf16::from_f32(y).to_f32()
+                    } else {
+                        y
+                    };
                     for j in 0..km1 {
                         win[j] = win[j + 1];
                     }
@@ -582,9 +716,17 @@ mod tests {
         if skip(x86_features().avx2 && x86_features().fma, "conv1d_update") {
             return;
         }
-        for &(bn, d, t_len, k) in &[(1usize, 8usize, 1usize, 3usize), (2, 5, 12, 4), (1, 3, 2, 3)] {
-            let bcx: Vec<f32> = (0..bn * 3 * d * t_len).map(|i| (i as f32 * 0.13).sin()).collect();
-            let st: Vec<f32> = (0..bn * d * (k - 1)).map(|i| (i as f32 * 0.07).cos()).collect();
+        for &(bn, d, t_len, k) in &[
+            (1usize, 8usize, 1usize, 3usize),
+            (2, 5, 12, 4),
+            (1, 3, 2, 3),
+        ] {
+            let bcx: Vec<f32> = (0..bn * 3 * d * t_len)
+                .map(|i| (i as f32 * 0.13).sin())
+                .collect();
+            let st: Vec<f32> = (0..bn * d * (k - 1))
+                .map(|i| (i as f32 * 0.07).cos())
+                .collect();
             let w: Vec<f32> = (0..d * k).map(|i| 0.1 + 0.02 * i as f32).collect();
             let mut out = vec![0f32; bn * d * (t_len + k - 1)];
             conv1d_update_f32(&bcx, &st, &w, &mut out, bn, d, t_len, k);
@@ -602,23 +744,32 @@ mod tests {
 
     #[test]
     fn conv1d_update_bf16_matches_reference() {
-        if skip(x86_features().avx2 && x86_features().fma, "conv1d_update_bf16") {
+        if skip(
+            x86_features().avx2 && x86_features().fma,
+            "conv1d_update_bf16",
+        ) {
             return;
         }
         let (bn, d, t_len, k) = (2usize, 6usize, 9usize, 3usize);
         let mk = |i: usize| bf16::from_f32(((i * 7 % 23) as f32 / 23.0) - 0.5);
         let bcx_b: Vec<u16> = (0..bn * 3 * d * t_len).map(|i| mk(i).to_bits()).collect();
-        let st_b: Vec<u16> = (0..bn * d * (k - 1)).map(|i| mk(i + 11).to_bits()).collect();
+        let st_b: Vec<u16> = (0..bn * d * (k - 1))
+            .map(|i| mk(i + 11).to_bits())
+            .collect();
         let w_b: Vec<u16> = (0..d * k).map(|i| mk(i + 29).to_bits()).collect();
         let mut out_b = vec![0u16; bn * d * (t_len + k - 1)];
         conv1d_update_bf16(&bcx_b, &st_b, &w_b, &mut out_b, bn, d, t_len, k);
-        let up = |v: &[u16]| -> Vec<f32> { v.iter().map(|&b| bf16::from_bits(b).to_f32()).collect() };
+        let up =
+            |v: &[u16]| -> Vec<f32> { v.iter().map(|&b| bf16::from_bits(b).to_f32()).collect() };
         let want = update_ref(&up(&bcx_b), &up(&st_b), &up(&w_b), bn, d, t_len, k, true);
         for (row, (g, r)) in out_b.iter().zip(&want).enumerate() {
             let got = bf16::from_bits(*g).to_f32();
             let pos = row % (t_len + k - 1);
             if pos < t_len {
-                assert!((got - r).abs() <= 1e-2 * r.abs().max(0.1), "y {row}: {got} vs {r}");
+                assert!(
+                    (got - r).abs() <= 1e-2 * r.abs().max(0.1),
+                    "y {row}: {got} vs {r}"
+                );
             } else {
                 assert_eq!(got.to_bits(), r.to_bits(), "state {row}: {got} vs {r}");
             }
@@ -678,7 +829,10 @@ mod tests {
         x[0] = 1e4;
         let reference: f64 = x.iter().map(|&v| v as f64).sum();
         let dd = dd_sum(&x) as f64;
-        assert!((dd - reference).abs() / reference < 1e-4, "dd={dd} ref={reference}");
+        assert!(
+            (dd - reference).abs() / reference < 1e-4,
+            "dd={dd} ref={reference}"
+        );
     }
 
     #[test]
@@ -693,7 +847,10 @@ mod tests {
         x[0] = 1e4;
         let want: f64 = x.iter().map(|&v| v as f64).sum(); // ≈ 10000.0036
         let got = dd_sum(&x) as f64;
-        assert!((got - want).abs() < 1e-2, "dd_sum tail dropped: got={got} want={want}");
+        assert!(
+            (got - want).abs() < 1e-2,
+            "dd_sum tail dropped: got={got} want={want}"
+        );
         // the naive f32 running sum loses the tail entirely — confirm we beat it.
         let naive: f32 = x.iter().fold(0f32, |a, &v| a + v);
         assert!(
@@ -703,7 +860,10 @@ mod tests {
         // dd_dot with a ragged tail: Σ x·1 == Σ x, same accuracy requirement.
         let ones = vec![1f32; x.len()];
         let dot = dd_dot(&x, &ones) as f64;
-        assert!((dot - want).abs() < 1e-2, "dd_dot tail dropped: got={dot} want={want}");
+        assert!(
+            (dot - want).abs() < 1e-2,
+            "dd_dot tail dropped: got={dot} want={want}"
+        );
     }
 
     #[test]
@@ -716,7 +876,11 @@ mod tests {
         let mut out = vec![0u8; idx.len()];
         permute_u8(&table, &idx, &mut out);
         for (o, &i) in out.iter().zip(&idx) {
-            let want = if (i as usize) < 16 { table[i as usize] } else { 0 };
+            let want = if (i as usize) < 16 {
+                table[i as usize]
+            } else {
+                0
+            };
             assert_eq!(*o, want);
         }
     }
@@ -736,7 +900,9 @@ mod tests {
         s8_gemm(&a, &b, &mut c, m, n, k);
         for i in 0..m {
             for j in 0..n {
-                let s: i32 = (0..k).map(|kk| a[i * k + kk] as i32 * b[kk * n + j] as i32).sum();
+                let s: i32 = (0..k)
+                    .map(|kk| a[i * k + kk] as i32 * b[kk * n + j] as i32)
+                    .sum();
                 assert_eq!(c[i * n + j], s);
             }
         }
@@ -744,7 +910,9 @@ mod tests {
 
     #[test]
     fn fft_round_trips_and_rejects_non_pow2() {
-        let orig: Vec<f32> = (0..16).map(|i| ((i * 37 % 11) as f32 / 11.0) - 0.5).collect();
+        let orig: Vec<f32> = (0..16)
+            .map(|i| ((i * 37 % 11) as f32 / 11.0) - 0.5)
+            .collect();
         let mut d = orig.clone();
         fft_radix2(&mut d, false);
         fft_radix2(&mut d, true);

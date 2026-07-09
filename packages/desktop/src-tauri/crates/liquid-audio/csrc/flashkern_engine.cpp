@@ -318,6 +318,13 @@ void lfm_engine_free(void *ep) {
             if (e->workers[w]) kcoro_unpark(e->workers[w]);
     }
     if (e->disp) kc_dispatcher_release(e->disp); // joins the team's threads
+    // Release the caller-owned coroutine handle refs (spawn_co's out_co retains for
+    // us). Safe strictly after dispatcher release: threads are joined and the
+    // scheduler's own queue refs are dropped (kcoro_destroy == kcoro_release —
+    // refcounted, so this is the ref that lets the stacks actually unmap).
+    for (int w = 0; w < e->n_workers; ++w)
+        if (e->workers[w]) kcoro_release(e->workers[w]);
+    if (e->coord) kcoro_release(e->coord);
     delete e;
 }
 
@@ -334,11 +341,18 @@ int lfm_engine_mlp(void *ep, const uint16_t *x, const uint16_t *norm_w,
     size_t cap = h < i ? h : i;
     if (tiles > cap) tiles = cap;
 
-    // Grow the persistent scratch outside execution (no allocation once warm).
-    e->sc_partials.resize(tiles);
-    e->sc_xn.resize(h);
-    e->sc_gu.resize(2 * i);
-    e->sc_t.resize(i);
+    // Grow the persistent scratch outside execution (no allocation once warm — the
+    // first pass at a given shape sizes it, every later pass is allocation-free).
+    // Allocation failure must NOT throw across the extern "C" boundary: report it
+    // and let the Rust rim take the bit-identical threadgroup path.
+    try {
+        e->sc_partials.resize(tiles);
+        e->sc_xn.resize(h);
+        e->sc_gu.resize(2 * i);
+        e->sc_t.resize(i);
+    } catch (const std::bad_alloc &) {
+        return -2;
+    }
 
     Pass *p = &e->pass;
     p->x = x;

@@ -185,10 +185,7 @@ fn main() -> Res<()> {
     let audio_path = std::env::var("LFM_BENCH_AUDIO")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
-            PathBuf::from(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/assets/question.wav"
-            ))
+            PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/question.wav"))
         });
     let max_new_tokens = env_usize("LFM_MAX_TOKENS", 64);
     let seed = env_u64("LFM_SEED", 0);

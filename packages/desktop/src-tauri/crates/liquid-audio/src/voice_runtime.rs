@@ -59,9 +59,7 @@ const PLAYBACK_ECHO_TAIL_MS: u64 = 700;
 /// with timestamps relative to session start. Zero cost when off.
 pub(crate) fn voice_trace_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var("LIQUID_VOICE_TRACE").is_ok_and(|v| !v.is_empty() && v != "0")
-    })
+    *ON.get_or_init(|| std::env::var("LIQUID_VOICE_TRACE").is_ok_and(|v| !v.is_empty() && v != "0"))
 }
 
 pub(crate) fn voice_trace_elapsed() -> f64 {
@@ -1171,9 +1169,7 @@ fn spawn_consumer<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
                                 );
                             }
                             if let Some(ms) = latency.first_word() {
-                                eprintln!(
-                                    "[voice-latency] first word {ms} ms after session start"
-                                );
+                                eprintln!("[voice-latency] first word {ms} ms after session start");
                             }
                         }
                         // ONE output path per I/O mode, no fallback chain:
@@ -1362,12 +1358,20 @@ fn vad_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
                     // echo as speech — demand sustained voice before barging in.
                     // When it's quiet, engage on the first voiced window as before.
                     let reference = reference_audio_active(assistant, playback, speaker);
-                    let needed = if reference { BARGE_IN_SUSTAIN_WINDOWS } else { 1 };
+                    let needed = if reference {
+                        BARGE_IN_SUSTAIN_WINDOWS
+                    } else {
+                        1
+                    };
                     if voiced_streak >= needed {
                         vtrace!(
                             "vad: speech-start (streak {voiced_streak}, threshold {threshold:.4}, \
                              reference-active {reference}{})",
-                            if reference { " -> BARGE-IN interrupt" } else { "" }
+                            if reference {
+                                " -> BARGE-IN interrupt"
+                            } else {
+                                ""
+                            }
                         );
                         if reference {
                             pipe.interrupt();
@@ -1376,8 +1380,7 @@ fn vad_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
                         speaking = true;
                         start = streak_start;
                         voiced_streak = 0;
-                        if !emit_or_stop(sink, stop, RuntimeEvent::State(SessionState::Listening))
-                        {
+                        if !emit_or_stop(sink, stop, RuntimeEvent::State(SessionState::Listening)) {
                             return;
                         }
                     }
@@ -2284,9 +2287,7 @@ mod tests {
         // drains the ring, calls write_mono_f32, and counts `played_samples`
         // AFTER the write returns Ok — wait for both.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while written.load(Ordering::SeqCst) < 2
-            || audio.snapshot().played_samples < 2
-        {
+        while written.load(Ordering::SeqCst) < 2 || audio.snapshot().played_samples < 2 {
             if std::time::Instant::now() >= deadline {
                 panic!("output thread did not drain + count the ring within 2s");
             }

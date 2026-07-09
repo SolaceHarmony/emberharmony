@@ -2,20 +2,20 @@
 
 This is the chassis design the piece-by-piece kernel work mounts onto. It is the concrete
 layer below DECODE_ENGINE.md's contract: the memory map, the kernel ABI, the tile library,
-and the adherence rules. Status: DESIGN FOR SIGN-OFF. Nothing here is built until each
-phase lands with its parity oracle.
+and the adherence rules. Status: living target plus as-built notes. A phase is only live when
+its code path and parity oracle have landed.
 
 The one-sentence spec: **one buffer, computed on through pointers and shared memory, by one
 C++ kernel program run by a persistent lane team, handing back to Rust once per pass.**
 
 ## 0. What "kernel" means here (the adherence rule that was broken)
 
-A kernel is ONE C++ program executed by every lane of the team, owning all control flow
-between barriers — layer loop included. Rust builds the context, rings the doorbell, and
-reads rings; it does not run between stages. The current fused blocks (MLP, ShortConv,
-DepthDecode) are stage functions orchestrated from Rust lane closures — native code, not
-kernels. They become device functions CALLED BY the kernel program; their math is kept,
-their orchestration is demoted.
+A kernel is ONE native program executed by the resident lane team, owning all control flow
+between published stages — layer loop included. Rust builds the context, rings the doorbell,
+and reads rings; it does not run between stages. As-built today, the backbone FFN MLP is the
+first resident native stage-machine mount. ShortConv and DepthDecode still use native stage
+functions orchestrated from Rust lane closures; their math is kept, but their orchestration
+still needs to be demoted into the full program.
 
 ## 1. The arena — one region, fixed capacities, stable pointers
 
@@ -45,40 +45,48 @@ makes "computation through pointers" legal). Layout for LFM2.5-Audio-1.5B, B=1,
 Total mutable arena ≈ 60–90 MB, dominated by fixed-cap KV. Every kernel argument is
 `arena_base + offset` or `mmap_base + offset`. Nothing else crosses the ABI.
 
-## 2. The kernel program — REVISED: the kcoro tile engine
+## 2. The kernel program — CURRENT: resident stage machine
 
-**Correction (2026-07-08, post-review):** the original §2 described a lockstep team with
-spin barriers. That is the anti-pattern of the actual reference runtime — kcoro, the
-Zero-Spin Coroutine Kernel (/Volumes/stuff/Projects/kcoro, Sydney's; applied to CPU
-inference in HierarchicalMemoryTransformer/CPU-SWAR-KCORO-GGUF.md). The engine's dispatch
-layer IS kcoro:
+**Correction (2026-07-09, after the Fable 5/kcoro-hop audit):** the Rust `TileEngine`
+channel chassis proved the parked descriptor model and exposed real kcoro bugs, but it is
+not the final hot-loop shape. A rendezvous channel hop still costs roughly 15-20 us
+(waiter allocation, mutex, ready queue, context switch). The live direction is the
+resident native stage machine in `csrc/flashkern_engine.cpp`: no channels, no descriptor
+staging, no malloc inside the published stages (and none once scratch is warm for the fixed
+shape), and no Rust between stages.
 
-- **Persistent micro-kernels**: `kc_dispatcher_new(P_cores)` — each worker loops
-  recv-job → run flashkern kernel → publish completion, and BLOCKS when dry. Zero
-  spinning anywhere in the engine.
-- **Tile flow, not stage lockstep**: the pass decomposes into tile jobs (GEMV row-bands,
-  attention heads, conv channel-blocks) published into `kc_chan` queues. Stages OVERLAP:
-  a layer's later tiles compute while its earlier consumers start — the pipelining that
-  saturates bandwidth, which barrier lockstep structurally cannot (measured: 23 GB/s of
-  150 under the barrier model). True dependencies are expressed by channel flow and
-  atomic completion counters, not team-wide barriers.
-- **Descriptors, not payloads**: jobs are small POD descriptors (offsets into the arena /
-  weight mmap); results land in arena planes and completions publish as descriptors
-  (kcoro zref / `kc_chan` ptr ops for the zero-copy path). Nothing is copied to move work.
-- **Doorbell = `kc_cancel_t`**: trigger from the rim; workers observe at job granularity
-  via the `_c` channel ops. Backpressure is channel capacity — a different mechanism from
-  cancellation by construction, which retires the old entangled-bit defect class.
-- **Rust at the rim only**: builds the ctx, publishes pass-request tokens, reads rings.
+- **Persistent native team**: `kc_dispatcher_new(P_cores + coordinator)` starts one
+  coordinator coroutine and a parked worker team. Workers are sized from the same P-core
+  policy as the rest of the CPU runtime, not logical-core `available_parallelism`.
+- **One request doorbell**: the Rust rim writes one request slot, unparks the coordinator,
+  then waits on a pthread condvar for the pass boundary. Stop/shutdown is a request observed
+  at the pass boundary, never per op.
+- **Stage board, not channels**: the coordinator publishes `{kind, count, chunk}`, resets
+  `next`, sets `remaining = workers`, then bumps an epoch. Workers wake, race
+  `next.fetch_add()` dry, and the last worker unparks the coordinator. That is the whole
+  stage-completion doorbell.
+- **Descriptors stay at the boundary**: rings still carry `(offset, len, epoch)` between
+  subsystems. Inside the engine hot loop, work is represented by shared stage state and raw
+  pointers into the mmap/arena, not per-tile messages.
+- **Determinism remains explicit**: reductions that affect bits fold in fixed order. Tile
+  over-decomposition is allowed only where rows are independent or the oracle pins the
+  exact reduction order.
+- **As-built/live mount**: the backbone FFN MLP routes through
+  `native_engine::process_engine()` when the native engine is built, with a bit-identical
+  threadgroup fallback. Attention, ShortConv, and DepthDecode are still outside the full
+  token-pass program.
 
 Linkage: kcoro is VENDORED at `vendor/kcoro/` and built by build.rs with the upstream
-Makefile's flags — no machine-local path. The vendored copy carries two local patches
-(vendor/kcoro/PATCHES.md, both upstream candidates): 0001 a three-state park gate that
-closes a park/unpark lost-wakeup race, 0002 fiber-safe TLS (no same-frame `__thread`
-access after `kcoro_switch` — the M:N migration poisoned the old thread's
-`current_kcoro`). `cfg(has_kcoro)` gates the engine exactly like `has_flashkern_*`
-gates kernels. Channel-kind rule: infinite-timeout waits go on KC_RENDEZVOUS — those
-paths truly park; the buffered infinite paths yield-poll (cooperative spin) and are
-banned on engine surfaces.
+Makefile's flags — no machine-local path. The vendored copy carries local runtime fixes
+documented in `vendor/kcoro/PATCHES.md` and source comments: 0001 a three-state park gate
+for lost wakeups, 0002 fiber-safe TLS after M:N migration, 0003 AAPCS64 FP-state save, and
+0004 enqueue-to-owning-scheduler so an external-thread `kcoro_unpark` is a legal doorbell.
+`cfg(has_kcoro)` and `cfg(has_native_engine)` gate the engine exactly like
+`has_flashkern_*` gates kernels.
+
+The older Rust `src/flashkern/engine.rs` `TileEngine` remains as a prototype/reference rung:
+it verifies channel-dispatch parity and documents kcoro channel rules. Do not mount new
+production passes there.
 
 ## 2-old. (superseded) The kernel program
 
@@ -177,9 +185,12 @@ equivalent" means, and it is the unit the rb-epilogue lands in.
 
 ## 5. Migration phases (each = one reviewable piece with an oracle)
 
-- **E1 chassis**: arena + WeightTable + persistent team + `lfm_token_pass` for the backbone
-  decode step (existing block math demoted to device functions). Oracle: flag-off wav-hash
-  byte parity; flag-on A/B vs current blocks.
+- **E1a native stage-machine mount**: ✅ **As-built for the FFN MLP only.** The model hot
+  path calls `native_engine::process_engine()` and falls back to the threadgroup port on
+  native-engine failure. Oracle: native MLP bit-parity vs the threadgroup port.
+- **E1b full token-pass chassis**: arena + WeightTable + persistent team +
+  `lfm_token_pass` for the backbone decode step (existing block math demoted to device
+  functions). Oracle: flag-off wav-hash byte parity; flag-on A/B vs current blocks.
 - **E2 frame pass**: DepthDecode into the program (v1 boundary sampling per codebook step
   batch; v2 in-pass RNG). Oracle: token-sequence A/B vs current DepthDecode.
 - **E3 rings**: token/PCM rings live; per-token tensor construction deleted from the loop;

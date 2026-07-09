@@ -42,7 +42,8 @@ pub fn has_feat_bf16() -> bool {
 pub fn bf16_gemm_available() -> bool {
     #[cfg(target_arch = "aarch64")]
     {
-        cfg!(all(target_arch = "aarch64", has_bf16_kernel)) && crate::flashkern::neon::neon_features().bf16
+        cfg!(all(target_arch = "aarch64", has_bf16_kernel))
+            && crate::flashkern::neon::neon_features().bf16
     }
     #[cfg(target_arch = "x86_64")]
     {
@@ -173,8 +174,11 @@ pub fn bf16_gemm_nt_available() -> bool {
 /// flashkern build (Accelerate is the sanctioned AMX dispatcher; off macOS the BFMMLA
 /// GEMM remains the prefill path — see ENGINE_DESIGN.md §3b).
 pub fn bf16_gemm_accel_available() -> bool {
-    cfg!(all(target_arch = "aarch64", target_os = "macos", has_flashkern_neon))
-        && bf16_gemm_available()
+    cfg!(all(
+        target_arch = "aarch64",
+        target_os = "macos",
+        has_flashkern_neon
+    )) && bf16_gemm_available()
 }
 
 /// Prefill twin of [`Bf16GemmNt`]: `A(M,K) · W(N,K)ᵀ → f32(M,N)` through Accelerate

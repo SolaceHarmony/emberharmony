@@ -243,9 +243,17 @@ mod tests {
         for i in 0..1000 {
             let (a, b) = (rnd(i) * 1e3, rnd(i + 7919) * 1e-3);
             let s = two_sum(a, b);
-            assert_eq!(s.hi as f64 + s.lo as f64, a as f64 + b as f64, "two_sum {a} {b}");
+            assert_eq!(
+                s.hi as f64 + s.lo as f64,
+                a as f64 + b as f64,
+                "two_sum {a} {b}"
+            );
             let p = two_prod(a, b);
-            assert_eq!(p.hi as f64 + p.lo as f64, a as f64 * b as f64, "two_prod {a} {b}");
+            assert_eq!(
+                p.hi as f64 + p.lo as f64,
+                a as f64 * b as f64,
+                "two_prod {a} {b}"
+            );
         }
     }
 
@@ -253,7 +261,9 @@ mod tests {
     fn dd_accumulation_tracks_f64() {
         // Summing 10k mixed-magnitude terms: dd must stay within a few f32 ulps of the f64
         // truth while the naive f32 sum drifts orders of magnitude further.
-        let terms: Vec<f32> = (0..10_000).map(|i| rnd(i) * 10f32.powi((i % 7) as i32 - 3)).collect();
+        let terms: Vec<f32> = (0..10_000)
+            .map(|i| rnd(i) * 10f32.powi((i % 7) as i32 - 3))
+            .collect();
         let f64_sum: f64 = terms.iter().map(|&x| x as f64).sum();
         let f32_sum: f32 = terms.iter().sum();
         let mut acc = Dd::default();
@@ -263,8 +273,14 @@ mod tests {
         let dd_err = (dd_to_f32(acc) as f64 - f64_sum).abs();
         let f32_err = (f32_sum as f64 - f64_sum).abs();
         let ulp = (f64_sum.abs() as f32).max(1e-30) * f32::EPSILON;
-        assert!(dd_err <= 4.0 * ulp as f64, "dd err {dd_err:e} vs ulp {ulp:e}");
-        assert!(dd_err < f32_err, "dd {dd_err:e} must beat naive f32 {f32_err:e}");
+        assert!(
+            dd_err <= 4.0 * ulp as f64,
+            "dd err {dd_err:e} vs ulp {ulp:e}"
+        );
+        assert!(
+            dd_err < f32_err,
+            "dd {dd_err:e} must beat naive f32 {f32_err:e}"
+        );
     }
 
     #[test]
@@ -280,8 +296,16 @@ mod tests {
             let (br, bi) = (b.re.hi as f64, b.im.hi as f64);
             let want_r = (ar * br - ai * bi) as f32;
             let want_i = (ar * bi + ai * br) as f32;
-            assert_eq!(gr.to_bits(), want_r.to_bits(), "re i={i}: {gr:e} vs {want_r:e}");
-            assert_eq!(gi.to_bits(), want_i.to_bits(), "im i={i}: {gi:e} vs {want_i:e}");
+            assert_eq!(
+                gr.to_bits(),
+                want_r.to_bits(),
+                "re i={i}: {gr:e} vs {want_r:e}"
+            );
+            assert_eq!(
+                gi.to_bits(),
+                want_i.to_bits(),
+                "im i={i}: {gi:e} vs {want_i:e}"
+            );
         }
     }
 
@@ -293,8 +317,14 @@ mod tests {
             for (j, t) in tw.iter().enumerate() {
                 let ang = -2.0 * std::f64::consts::PI * (j as f64) / (n as f64);
                 let (c, s) = (ang.cos(), ang.sin());
-                assert!((t.re.hi as f64 + t.re.lo as f64 - c).abs() < 1e-14, "cos n={n} j={j}");
-                assert!((t.im.hi as f64 + t.im.lo as f64 - s).abs() < 1e-14, "sin n={n} j={j}");
+                assert!(
+                    (t.re.hi as f64 + t.re.lo as f64 - c).abs() < 1e-14,
+                    "cos n={n} j={j}"
+                );
+                assert!(
+                    (t.im.hi as f64 + t.im.lo as f64 - s).abs() < 1e-14,
+                    "sin n={n} j={j}"
+                );
             }
             let itw = irfft_twiddles_dd(n);
             assert_eq!(itw.len(), n);

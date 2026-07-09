@@ -56,7 +56,11 @@ pub fn linear_logits(weight: &Tensor, x: &Tensor) -> Result<Tensor> {
         // from the NT path (reference-kernel-only build) falls through to the transposed
         // GEMM, which computes the same numbers.
         let rows = if x.rank() == 2 { x.dim(0)? } else { usize::MAX };
-        let nt = if rows <= NT_MAX_ROWS { bf16_matmul_nt(x, weight)? } else { None };
+        let nt = if rows <= NT_MAX_ROWS {
+            bf16_matmul_nt(x, weight)?
+        } else {
+            None
+        };
         if let Some(y) = nt {
             y
         } else {
@@ -189,7 +193,10 @@ mod tests {
     // A candle Linear with deterministic pseudo-random bf16 weight [out,in] (+ optional bias).
     fn mk_linear(inp: usize, out: usize, seed: u64, bias: bool) -> Linear {
         let w: Vec<f32> = (0..out * inp)
-            .map(|i| (((i as u64).wrapping_mul(2654435761).wrapping_add(seed) % 1000) as f32 / 500.0) - 1.0)
+            .map(|i| {
+                (((i as u64).wrapping_mul(2654435761).wrapping_add(seed) % 1000) as f32 / 500.0)
+                    - 1.0
+            })
             .collect();
         let w = Tensor::from_vec(w, (out, inp), &dev())
             .unwrap()
@@ -197,7 +204,10 @@ mod tests {
             .unwrap();
         let b = bias.then(|| {
             let bv: Vec<f32> = (0..out)
-                .map(|i| (((i as u64).wrapping_mul(40503).wrapping_add(seed) % 1000) as f32 / 1000.0) - 0.5)
+                .map(|i| {
+                    (((i as u64).wrapping_mul(40503).wrapping_add(seed) % 1000) as f32 / 1000.0)
+                        - 0.5
+                })
                 .collect();
             Tensor::from_vec(bv, (out,), &dev())
                 .unwrap()
@@ -210,7 +220,10 @@ mod tests {
     // bf16 input [rows, in].
     fn mk_input(rows: usize, inp: usize, seed: u64) -> Tensor {
         let x: Vec<f32> = (0..rows * inp)
-            .map(|i| (((i as u64).wrapping_mul(2246822519).wrapping_add(seed) % 1000) as f32 / 500.0) - 1.0)
+            .map(|i| {
+                (((i as u64).wrapping_mul(2246822519).wrapping_add(seed) % 1000) as f32 / 500.0)
+                    - 1.0
+            })
             .collect();
         Tensor::from_vec(x, (rows, inp), &dev())
             .unwrap()
@@ -231,10 +244,25 @@ mod tests {
     }
 
     fn max_rel(a: &Tensor, b: &Tensor) -> f32 {
-        let av: Vec<f32> = a.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1().unwrap();
-        let bv: Vec<f32> = b.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1().unwrap();
+        let av: Vec<f32> = a
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let bv: Vec<f32> = b
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
         assert_eq!(av.len(), bv.len());
-        let md = av.iter().zip(&bv).fold(0f32, |m, (x, y)| m.max((x - y).abs()));
+        let md = av
+            .iter()
+            .zip(&bv)
+            .fold(0f32, |m, (x, y)| m.max((x - y).abs()));
         let sc = bv.iter().fold(1e-6f32, |m, &x| m.max(x.abs()));
         md / sc
     }
@@ -253,8 +281,12 @@ mod tests {
         for &(m, k, n) in &[(64usize, 512usize, 384usize), (350, 2048, 512)] {
             let lin = mk_linear(k, n, 11, false);
             let x = mk_input(m, k, 17);
-            let a = bf16_matmul_accel(&x, lin.weight()).unwrap().expect("accel available");
-            let r = bf16_matmul(&x, &lin.weight().t().unwrap()).unwrap().expect("bfmmla available");
+            let a = bf16_matmul_accel(&x, lin.weight())
+                .unwrap()
+                .expect("accel available");
+            let r = bf16_matmul(&x, &lin.weight().t().unwrap())
+                .unwrap()
+                .expect("bfmmla available");
             let av: Vec<f32> = a.flatten_all().unwrap().to_vec1().unwrap();
             let rv: Vec<f32> = r.flatten_all().unwrap().to_vec1().unwrap();
             let (mut md, mut sc) = (0f32, 1e-6f32);
@@ -262,7 +294,11 @@ mod tests {
                 md = md.max((x - y).abs());
                 sc = sc.max(y.abs());
             }
-            assert!(md / sc < 1e-4, "m={m} k={k} n={n}: accel vs bfmmla rel {}", md / sc);
+            assert!(
+                md / sc < 1e-4,
+                "m={m} k={k} n={n}: accel vs bfmmla rel {}",
+                md / sc
+            );
         }
     }
 
@@ -280,12 +316,16 @@ mod tests {
             return;
         }
         // (rows, in, out): prefill batch×seq at model-scale K.
-        for &(rows, inp, out, bias) in &[(16usize, 2048usize, 512usize, true), (7, 320, 129, false)] {
+        for &(rows, inp, out, bias) in &[(16usize, 2048usize, 512usize, true), (7, 320, 129, false)]
+        {
             let lin = mk_linear(inp, out, 11, bias);
             let x = mk_input(rows, inp, 23);
             let got = linear_forward(&lin, &x).unwrap();
             let rel = max_rel(&got, &ref_linear(&lin, &x));
-            assert!(rel < 1e-2, "single_linear rows={rows} in={inp} out={out} rel={rel}");
+            assert!(
+                rel < 1e-2,
+                "single_linear rows={rows} in={inp} out={out} rel={rel}"
+            );
         }
     }
 

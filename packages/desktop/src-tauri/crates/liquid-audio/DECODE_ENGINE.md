@@ -36,9 +36,10 @@ Two principles fell out and drive every design choice below:
   must consume weights in checkpoint-native layout.
 - **The dispatch model is the intended execution model, not a demo.** Per-op candle
   fork/join (candle op → rayon fork/join → tensor alloc → bf16↔f32 cast, ~240 ops/token) is
-  exactly what a GPU never does. A GPU enters **one dispatch** per fused region and data flows
-  through threadgroup memory between barrier-fenced stages. The CPU decode path runs that way:
-  lanes on a persistent pool, spin barriers, shared scratch.
+  exactly what a GPU never does. A GPU enters once and data flows through shared state between
+  stage fences. The CPU path is moving in that direction in layers: first threadgroup-style
+  fused regions, now the resident native stage machine for the FFN MLP, and finally one
+  full-pass engine entry.
 
 Both were learned by measuring GB/s effective and sampling the live process, not by
 theorizing. See `csrc/FLASHKERN.md` for the kernel-side story.
@@ -58,10 +59,11 @@ as-built. Read this as the spec, not the changelog.
    as register accumulators (an rb-epilogue in every kernel). **KV planes are bf16** (torch's
    cache dtype — f32 KV was the wrong call twice over: memory *and* fidelity).
 3. **Dispatch.** `lfm_token_pass(ctx*)` — Rust hands off **once** per full pass (a text token,
-   or a whole 8-codebook audio frame). The persistent pinned P-core lane team runs the entire
-   chain with spin barriers inside, sampling on lane 0; results land in arena ring slots. The
-   doorbell (epoch + reason word) is checked at the **pass boundary and nowhere inside**; event
-   backpressure never touches it.
+   or a whole 8-codebook audio frame). The persistent pinned P-core lane team runs the chain as
+   a resident stage machine: publish stage state, bump epoch, workers pull tile indices with an
+   atomic counter, and the last worker rings the coordinator. Sampling lands on lane 0; results
+   land in arena ring slots. The doorbell (epoch + reason word) is checked at the **pass
+   boundary and nowhere inside**; event backpressure never touches it.
 4. **Transport.** Rings + `(offset, len, epoch)` descriptors, no owned `Vec` payloads on hot
    surfaces.
 
@@ -90,15 +92,17 @@ Where every byte lives on the decode path, from the most durable to the most eph
   `name → (offset, shape)`, candle dropped from the hot path) is *not* built; candle still owns
   the weight buffers.
 
-### Tier 1 — Resident KV + cursors (AS-BUILT; planes are f32, not yet bf16)
+### Tier 1 — Resident KV + cursors (AS-BUILT; bf16 on the CPU decode path)
 
 The backbone KV cache is preallocated resident storage, **not** a per-step concat:
 
 - `Cache.kvs: Vec<Option<KvSlot>>` (`src/model/lfm2_hf.rs`). A `KvSlot` is
   `{ k: Tensor, v: Tensor, len: usize }` over preallocated `[B, n_kv, cap, head_dim]` planes.
-- **Append is in place.** `append_kv` `slice_set`s the step's rows at the cursor and bumps
-  `len`; reads are zero-copy `narrow(2, 0, len)` views. Capacity starts at
-  `need.next_power_of_two().max(256)` and doubles on demand (one narrow-copy, amortized O(1)).
+- **Append is in place.** `append_kv` allocates the resident planes with the incoming row dtype
+  (`kf.dtype()`/`vf.dtype()`), `slice_set`s the step's rows at the cursor, and bumps `len`;
+  reads are zero-copy `narrow(2, 0, len)` views. On the live CPU bf16 decode path the planes
+  are bf16. Capacity starts at `need.next_power_of_two().max(256)` and doubles on demand (one
+  narrow-copy, amortized O(1)).
 - **Rollback is O(1)** — `snapshot`/`rollback` record and restore `len`; rows past the cursor
   are stale storage, never read. This backs speculative prefill (prefill the next utterance in
   the VAD pause; roll back if the user resumes).
@@ -108,12 +112,13 @@ The backbone KV cache is preallocated resident storage, **not** a per-step conca
   as a parity deviation; this resident slot is held to a stricter bar — with
   `grouped_gqa_decode = false` a greedy+seeded generate is **bit-identical** before/after the
   swap (wav hash), so the storage change is exact.
-- The depthformer's own KV (in `DepthDecode`) is tiny resident f32 `kplane`/`vplane`, cursor
-  reset per frame — zero allocation per frame.
+- The depthformer's own KV (in `DepthDecode`) is tiny resident bf16-bit `kplane`/`vplane`
+  storage (`Vec<u16>`), cursor reset per frame — zero allocation per frame.
 
-> **As-built vs contract:** the resident planes are **f32** today (`append_kv` allocates
-> `DType::F32`; `DepthScratch.kplane/vplane` are `Vec<f32>`). The contract calls for **bf16 KV**
-> (torch's cache dtype — memory + fidelity). bf16 KV is **planned**, not built.
+> **As-built nuance:** the backbone resident KV dtype follows the projection row dtype rather
+> than forcing `DType::BF16` in `append_kv`. That is bf16 for the live CPU bf16 path; if a
+> reference/device path produces f32 rows, the resident slot mirrors that path instead of
+> silently changing numerics.
 
 ### Tier 2 — Dispatch scratch + `Shared` + `SpinBarrier` (AS-BUILT)
 
@@ -127,28 +132,29 @@ The in-dispatch working set — the CPU analog of GPU threadgroup memory:
 - **`Shared<T>`** (`src/flashkern/fanout.rs`): a `Send` raw-pointer wrapper over the scratch
   planes so lanes co-own disjoint slices without a borrow-checker fight; every write is
   lane-private, every read post-barrier.
-- **Scratch** is per-region: `fused_mlp_decode` allocates its `partials/xn/gu/t` planes per
-  call; `DepthDecode` owns a persistent `RefCell<DepthScratch>` (all planes preallocated in
-  `DepthDecode::new`, borrowed once per frame — zero allocation in the frame loop).
+- **Scratch** is mixed during migration: the native MLP engine owns persistent `sc_*` planes
+  and grows them before publishing a pass (no allocation once warm for a fixed model/lane
+  shape); the bit-identical threadgroup fallback still allocates `partials/xn/gu/t` per call.
+  `DepthDecode` owns a persistent `DepthScratch` (all planes preallocated in `DepthDecode::new`,
+  borrowed once per frame — zero allocation in the frame loop).
 
 ### Tier 3 — Transport (PLANNED — open items)
 
 Rings + `(offset, len, epoch)` descriptors on the hot surfaces are **not built**. Today, decode
 results cross back as candle `Tensor`s / `Vec`s at the region boundary.
 
-### Thread model (AS-BUILT: rayon scope per region; PLANNED: persistent pinned team)
+### Thread model (AS-BUILT: mixed native stage machine + threadgroup regions)
 
-- **As-built.** Each fused region is `rayon::scope` over the persistent physical-core pool
-  (`src/threads.rs`), `lanes` concurrent workers spin-syncing inside — `lanes` from
-  `rayon::current_num_threads()` (clamped). One `rayon::scope` == one GPU
-  `dispatch_thread_groups`. The FFN block is one such dispatch (3 barriers); the whole
-  depthformer frame is one such dispatch (barriers between every codebook step / layer /
-  attention stage). Nothing else runs on the pool during the region.
+- **As-built.** The backbone FFN block uses the resident native stage machine when
+  `has_kcoro && has_native_engine && has_flashkern_*`: `process_engine()` writes one request,
+  unparks the coordinator, and waits for the pass boundary. If the native engine is unavailable
+  or reports failure, the same block takes the bit-identical threadgroup fallback.
+- **Still threadgroup regions.** ShortConv decode and `DepthDecode::frame` still use the
+  `rayon::scope` / shared-scratch / barrier model. The backbone token is still a candle forward
+  with fused sub-regions spliced in; attention is not yet inside the full native token pass.
 - **Planned.** A single persistent **pinned P-core** lane team owned by the engine, entered
   once per full token pass (`lfm_token_pass`), with the doorbell checked only at the pass
-  boundary. Today lanes are spun up per region via `rayon::scope`, and the backbone token is
-  still a candle forward with fused sub-regions spliced in (only the FFN is fused; attention
-  and ShortConv are still per-op candle).
+  boundary.
 
 ---
 
@@ -163,7 +169,7 @@ Verified in source. See `csrc/FLASHKERN.md` for the four flashkern kernels on th
 | backbone KV | resident `KvSlot` in-place append + narrow views (§3 tier 1) | `lfm2_hf.rs` |
 | backbone GQA (decode, `seq==1`) | regrouped-`q` view against shared KV heads — **no `repeat_kv`** materialization; gated by `grouped_gqa_decode` | `lfm2_hf.rs` `Attention::forward` |
 | ShortConv (decode) | fused `causal_conv1d_update` — flashkern NEON/AVX op on CPU, candle-flashfftconv (Metal JIT / scalar) otherwise; gated by `fused_conv_decode` | `flashkern/candle_ops.rs`, `lfm2_hf.rs` |
-| backbone FFN block (CPU decode, `b·s==1`) | `fused_mlp_decode` — one threadgroup dispatch, 3 barriers | `flashkern/decode.rs`, `lfm2_hf.rs` |
+| backbone FFN block (CPU decode, `b·s==1`) | resident native stage machine via `native_engine::process_engine()` when built; bit-identical `fused_mlp_decode` threadgroup fallback | `csrc/flashkern_engine.cpp`, `flashkern/native_engine.rs`, `flashkern/decode.rs`, `lfm2_hf.rs` |
 | audio frame (CPU, bf16) | `DepthDecode::frame` — the whole depthformer frame as ONE dispatch, sampling on lane 0 | `flashkern/decode.rs`, `lfm2_audio.rs` |
 | prefill; all Metal | candle / candle-flashfftconv (unchanged) | — |
 
@@ -206,8 +212,9 @@ deviation (a different, equally-sensible slogan on a 96-token run), which is exa
 - **Cross-op parity** (`flashkern/candle_ops.rs`): the flashkern conv1d_update op must agree
   with the candle-flashfftconv op it replaces on the CPU device — f32 tight (FMA-only slack),
   bf16 through the same rounding points.
-- **Fused-block parity** (`flashkern/decode.rs`): `fused_mlp_decode` vs the real candle op
-  chain (through the actual `linear_forward`) at bf16 resolution, across lane counts.
+- **Fused-block parity** (`flashkern/decode.rs`, `flashkern/native_engine.rs`):
+  `fused_mlp_decode` vs the real candle op chain (through the actual `linear_forward`) at bf16
+  resolution, across lane counts; native MLP vs the threadgroup port bit-for-bit.
 - **Lane determinism / bit-parity** (`flashkern/decode.rs`): the same dispatch shape twice is
   bit-identical (fixed row ownership, fixed reduce order).
 - **Pipeline parity** (`model/linear.rs`): synthetic tensors through the real `linear_forward`
@@ -218,7 +225,9 @@ deviation (a different, equally-sensible slogan on a 96-token run), which is exa
   TBL/conv1d/FFT/double-double, feature-gated so they skip on CPUs lacking the extension.
 - **e2e sound gates** (`e2e_voice_runtime`): audio audibly out the speaker, CPU and Metal.
 
-`cargo test --lib`: **159 tests green** at the time of writing.
+The exact crate-wide count changes with feature gates and integration-test selection; quote a
+fresh `cargo test` run when reviewing. The focused gates for this layer are the parity tests
+listed above.
 
 ---
 
@@ -233,6 +242,7 @@ extrapolate.
 | GEMV kernel, 2048×8192 call | **57.7 ms → 1.2 ms** | native-layout dot + row-stream axpy + rayon N-fanout |
 | CPU decode, after copies died | **~18.7 tok/s** | ~140×; the real-time sound test went un-runnable → passing |
 | FFN block fused | **54 → 18 ms/token** | per-op fork/join → one dispatch, 3 barriers |
+| resident native MLP stage machine | **~3.0 ms vs 16-34 ms** | focused debug parity signals, H=1024 I=4096, lanes=8; threadgroup+spin varies with contention |
 | CPU decode, mixed text+audio | **~21–22 tok/s** | real-time edge |
 | text-stretch | **~18 ms/token (~56 tok/s)** | |
 | audio frame | **~50 ms** | 23 GB/s effective — headroom left; E-core barrier lockstep suspected |
@@ -250,15 +260,16 @@ The agreed order to reach the §2 contract. Depthformer was mounted first as the
 1. **Kernels + fused regions on the live path.** ✅ **As-built.** nt matmul (no transpose),
    resident KV, fused FFN block, `DepthDecode` (whole depthformer frame), Group H, the parity
    seams. This is the §4 table.
-2. **Engine skeleton** — weight table + arena + persistent pinned team, depthformer mounted
-   first. ◻️ **Planned.** Today's dispatches are `rayon::scope` per region on the shared pool;
-   there is no `lfm_token_pass(ctx*)` full-pass handback, no standalone weight table, no arena
-   ring, no pinned P-core team.
+2. **Native stage-machine skeleton.** ✅ **Partial as-built.** The resident C++ team is live for
+   the backbone FFN MLP. ◻️ **Planned remainder:** weight table + arena + `lfm_token_pass(ctx*)`
+   full-pass handback, no standalone weight table yet, no arena ring yet.
 3. **Backbone attention folded into the fused dispatch.** ◻️ **Planned.** Today only the FFN
    block is fused on the backbone; attention and ShortConv are still per-op candle spliced
    around the resident-KV / grouped-GQA / fused-conv fast paths.
-4. **rb-epilogues + bf16 KV** (f32 only in registers; KV planes bf16). ◻️ **Planned.** KV
-   planes are f32 today (§3 tier 1).
+4. **rb-epilogues everywhere** (f32 only in registers; activation/KV planes bf16 unless a
+   reference path deliberately mirrors a wider dtype). ◻️ **Planned.** Backbone and depth KV are
+   bf16 on the live CPU decode path (§3 tier 1); remaining f32 planes are dispatch scratch and
+   kernel accumulators.
 5. **Transport rings** + `(offset, len, epoch)` descriptors. ◻️ **Planned** (§3 tier 3).
 
 **Out of scope for now.** Prefill stays on the candle / Metal path (the ~12 s wall); the engine
@@ -267,8 +278,8 @@ targets the decode hot loop, not prefill.
 ---
 
 *As-built claims verified against the working tree on branch
-`claude/optimize-bf16-neon-kernel-52h791`. The contract (§2) and the "planned" items above are
-agreed design, not running code.*
+`claude/optimize-bf16-neon-kernel-52h791`. The contract (§2) is the target; the build-order
+labels above identify which pieces are live now and which remain planned.*
 
 
 **Byte-oracle baseline (re-armed 2026-07-08, post-E4 accel prefill):** reference chain
@@ -285,4 +296,4 @@ LFM_DEVICE=cpu cargo run --release --example generate -- --reference
 shasum out.wav   # must print 2f9c907aad76919839993d9d92a53304b72f7608
 ```
 
-Re-verified 2026-07-09 (post kcoro vendoring + engine chassis): exact match.
+Re-verified 2026-07-09 (post kcoro vendoring + native stage-machine wiring): exact match.

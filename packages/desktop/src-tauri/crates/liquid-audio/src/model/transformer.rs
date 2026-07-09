@@ -506,7 +506,13 @@ impl Mha {
 
     /// Projections, attention geometry, and rope tables for the flashkern depth decoder.
     pub(crate) fn flash_parts(&self) -> (&Linear, &Linear, &BoundedAttention, &Tensor, &Tensor) {
-        (&self.qkv_proj, &self.out_proj, &self.attention, &self.cos, &self.sin)
+        (
+            &self.qkv_proj,
+            &self.out_proj,
+            &self.attention,
+            &self.cos,
+            &self.sin,
+        )
     }
 
     pub fn forward(&self, x: &Tensor, cache: Option<&mut LayerKvCache>) -> Result<Tensor> {
@@ -612,7 +618,12 @@ impl StandardBlock {
 
     /// Operator/FFN/norm handles for the flashkern depth decoder.
     pub(crate) fn flash_parts(&self) -> (&Mha, &Glu, &RmsNorm, &RmsNorm) {
-        (&self.operator, &self.feed_forward, &self.operator_norm, &self.ffn_norm)
+        (
+            &self.operator,
+            &self.feed_forward,
+            &self.operator_norm,
+            &self.ffn_norm,
+        )
     }
 
     pub fn forward(&self, x: &Tensor, cache: Option<&mut LayerKvCache>) -> Result<Tensor> {
@@ -683,7 +694,11 @@ impl SharedEmbedding {
 
     /// Embed table / pre-logits norm / tied head for the flashkern depth decoder.
     pub(crate) fn flash_parts(&self) -> (&Tensor, &RmsNorm, &Tensor) {
-        (self.embedding.embeddings(), &self.embedding_norm, self.to_logits.weight())
+        (
+            self.embedding.embeddings(),
+            &self.embedding_norm,
+            self.to_logits.weight(),
+        )
     }
 
     pub fn get_logits(&self, embeddings: &Tensor) -> Result<Tensor> {

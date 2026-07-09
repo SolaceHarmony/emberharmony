@@ -1306,7 +1306,10 @@ impl LFM2AudioModel {
         let err_cell = std::sync::Mutex::new(None);
         let dev = embedding.device().clone();
         let toks = ctx.frame(&bits, |logits_bits| {
-            let v: Vec<half::bf16> = logits_bits.iter().map(|&b| half::bf16::from_bits(b)).collect();
+            let v: Vec<half::bf16> = logits_bits
+                .iter()
+                .map(|&b| half::bf16::from_bits(b))
+                .collect();
             match Tensor::from_vec(v, (logits_bits.len(),), &dev).and_then(|t| sampler.sample(&t)) {
                 Ok(t) => t,
                 Err(e) => {
@@ -1484,9 +1487,7 @@ impl LFM2AudioModel {
             }
             modality_left -= 1;
             let seq_len = in_emb.dim(1)?;
-            let h = self
-                .lfm
-                .forward_embeds(&in_emb, *index_pos, cache, None)?; // (1, seq, D)
+            let h = self.lfm.forward_embeds(&in_emb, *index_pos, cache, None)?; // (1, seq, D)
             *index_pos += seq_len;
             let h_last = h.i((0, seq_len - 1))?.contiguous()?; // (D,)
 

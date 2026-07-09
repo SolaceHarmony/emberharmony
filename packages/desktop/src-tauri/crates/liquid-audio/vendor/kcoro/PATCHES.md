@@ -3,8 +3,9 @@
 Vendored 2026-07-08 from Sydney's kcoro tree (`/Volumes/stuff/Projects/kcoro`,
 BSD-3-Clause): `include/*.h`, `core/src/*.{c,h}`, `arch/{aarch64,x86_64}/kc_ctx_switch.S`.
 Built by this crate's `build.rs` with the upstream Makefile's flags
-(`-std=c11 -O2 -pthread -D_GNU_SOURCE -DKC_SCHED=1`). The engine chassis
-(`src/flashkern/engine.rs`) is the consumer.
+(`-std=c11 -O2 -pthread -D_GNU_SOURCE -DKC_SCHED=1`). The prototype channel chassis
+(`src/flashkern/engine.rs`) and resident native stage machine (`csrc/flashkern_engine.cpp`)
+are the consumers.
 
 ## Patch 0001 — park/unpark lost-wakeup race (candidate for upstream)
 
@@ -104,3 +105,23 @@ caller-saved, so data registers are fine there).
 
 **Verification.** Rendezvous stress 5×200 passes clean; crate suite 161/161; engine
 GEMV bit-parity unchanged.
+
+## Patch 0004 — unpark queues to the coroutine's owning scheduler
+
+**Symptom.** The resident native stage machine needs plain Rust/OS threads to ring a coroutine
+doorbell: write the request slot, then `kcoro_unpark(coord)`. The old unpark path could only
+enqueue on the caller's current scheduler. From an external thread that scheduler is `NULL`; with
+multiple dispatchers it can also be the wrong scheduler.
+
+**Root cause.** A coroutine already records its owning scheduler on spawn/resume, but unpark did
+not prefer that owner. That made external-thread doorbells depend on ambient scheduler context
+rather than the target coroutine's actual queue.
+
+**Fix.** `kcoro_unpark` now enqueues to `co->scheduler` first, falling back to
+`kc_sched_current()` only for manually-driven coroutines without an owner. No default scheduler is
+created implicitly. This is what makes the native engine's request doorbell and the last-worker
+stage-done doorbell legal from non-coroutine contexts.
+
+**Verification.** The native engine's `native_engine_mlp_bit_parity` test runs through the
+external-thread request doorbell and the worker-to-coordinator stage doorbell; the bit-parity test
+passes against the threadgroup port.

@@ -25,6 +25,16 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// barriers spin; parking (`std::sync::Barrier`) costs ~1-2 µs a crossing, which at
 /// hundreds of crossings per token is real money. AcqRel on the generation flip publishes
 /// each stage's shared-memory writes to every lane, same fence contract as the GPU.
+/// One threadgroup dispatch at a time, process-wide. A spin-barrier dispatch has a
+/// HARD scheduling requirement: all `lanes` tasks must run concurrently on the shared
+/// rayon pool. Two overlapping dispatches can fill the pool with spinners that each
+/// wait for the other's unstarted lanes — a livelock that burns every occupied core
+/// (observed: 249 CPU-minutes in 33 wall-minutes across two concurrent release-suite
+/// parity tests). Production decode is sequential, so this lock is uncontended there;
+/// it exists to make the requirement structural instead of hoped-for. The resident
+/// native stage machine has no such requirement — parked workers occupy nothing.
+pub(crate) static DISPATCH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub(crate) struct SpinBarrier {
     lanes: usize,
     count: AtomicUsize,
@@ -33,7 +43,11 @@ pub(crate) struct SpinBarrier {
 
 impl SpinBarrier {
     pub(crate) fn new(lanes: usize) -> Self {
-        Self { lanes, count: AtomicUsize::new(0), generation: AtomicUsize::new(0) }
+        Self {
+            lanes,
+            count: AtomicUsize::new(0),
+            generation: AtomicUsize::new(0),
+        }
     }
 
     #[inline]
@@ -126,6 +140,7 @@ pub fn fused_mlp_decode(x: &[u16], w: &FusedMlpWeights, out: &mut [u16], lanes: 
     let mut xn = vec![0u16; h];
     let mut gu = vec![0f32; 2 * i]; // g = gu[0..i], u = gu[i..2i]
     let mut t = vec![0u16; i];
+    let _dispatch = DISPATCH_LOCK.lock().unwrap();
     let sh_part = Shared(partials.as_mut_ptr());
     let sh_xn = Shared(xn.as_mut_ptr());
     let sh_gu = Shared(gu.as_mut_ptr());
@@ -182,8 +197,20 @@ pub fn fused_mlp_decode(x: &[u16], w: &FusedMlpWeights, out: &mut [u16], lanes: 
                     // SAFETY: xn is post-barrier read-only; g/u row ranges are lane-private;
                     // w1/w3 row slices are in-bounds by the entry asserts.
                     unsafe {
-                        nt_rows(sh_xn.ptr(), w.w1.as_ptr().add(r0 * h), sh_gu.ptr().add(r0), n, h);
-                        nt_rows(sh_xn.ptr(), w.w3.as_ptr().add(r0 * h), sh_gu.ptr().add(i + r0), n, h);
+                        nt_rows(
+                            sh_xn.ptr(),
+                            w.w1.as_ptr().add(r0 * h),
+                            sh_gu.ptr().add(r0),
+                            n,
+                            h,
+                        );
+                        nt_rows(
+                            sh_xn.ptr(),
+                            w.w3.as_ptr().add(r0 * h),
+                            sh_gu.ptr().add(i + r0),
+                            n,
+                            h,
+                        );
                         for r in r0..r1 {
                             let g = bf16_f32(rb_bits(sh_gu.get(r))); // linear-out round
                             let sg = rb_bits(g / (1.0 + (-g).exp())); // silu round
@@ -200,8 +227,8 @@ pub fn fused_mlp_decode(x: &[u16], w: &FusedMlpWeights, out: &mut [u16], lanes: 
                 if r1 > r0 {
                     let n = r1 - r0;
                     let mut y = vec![0f32; n]; // lane-private accumulator
-                    // SAFETY: t is post-barrier read-only; w2 row slice in-bounds; out rows
-                    // are lane-private.
+                                               // SAFETY: t is post-barrier read-only; w2 row slice in-bounds; out rows
+                                               // are lane-private.
                     unsafe {
                         nt_rows(sh_t.ptr(), w.w2.as_ptr().add(r0 * i), y.as_mut_ptr(), n, i);
                         for (j, &yv) in y.iter().enumerate() {
@@ -235,16 +262,28 @@ mod tests {
         let dev = Device::Cpu;
         let up = |bits: &[u16]| -> Vec<f32> { bits.iter().map(|&b| bf16_f32(b)).collect() };
         let t_bf16 = |v: Vec<f32>, shape: (usize, usize)| {
-            Tensor::from_vec(v, shape, &dev).unwrap().to_dtype(DType::BF16).unwrap()
+            Tensor::from_vec(v, shape, &dev)
+                .unwrap()
+                .to_dtype(DType::BF16)
+                .unwrap()
         };
         let xt = t_bf16(up(x), (1, h));
         // RmsNorm::forward: f32 → mean(x²) → rsqrt via sqrt+recip → ·x → ·w → bf16.
         let xf = xt.to_dtype(DType::F32).unwrap();
         let mean_sq = xf.sqr().unwrap().mean_keepdim(1).unwrap();
-        let rs = (mean_sq + w.eps as f64).unwrap().sqrt().unwrap().recip().unwrap();
+        let rs = (mean_sq + w.eps as f64)
+            .unwrap()
+            .sqrt()
+            .unwrap()
+            .recip()
+            .unwrap();
         let normed = xf.broadcast_mul(&rs).unwrap();
         let wn = Tensor::from_vec(up(w.norm_w), (h,), &dev).unwrap();
-        let xn = normed.broadcast_mul(&wn).unwrap().to_dtype(DType::BF16).unwrap();
+        let xn = normed
+            .broadcast_mul(&wn)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
         // SwiGLU through the real linear path.
         let lin = |wbits: &[u16], o: usize, k: usize| Linear::new(t_bf16(up(wbits), (o, k)), None);
         let gate = linear_forward(&lin(w.w1, i, h), &xn).unwrap();
@@ -270,11 +309,19 @@ mod tests {
         }
         let (h, i) = (128usize, 342usize); // odd I exercises ragged row ownership
         let mk = |n: usize, seed: usize| -> Vec<u16> {
-            (0..n).map(|j| bf16::from_f32(rnd(j, seed) * 0.25).to_bits()).collect()
+            (0..n)
+                .map(|j| bf16::from_f32(rnd(j, seed) * 0.25).to_bits())
+                .collect()
         };
         let x = mk(h, 3);
         let (norm_w, w1, w3, w2) = (mk(h, 7), mk(i * h, 11), mk(i * h, 13), mk(h * i, 17));
-        let w = FusedMlpWeights { norm_w: &norm_w, w1: &w1, w3: &w3, w2: &w2, eps: 1e-5 };
+        let w = FusedMlpWeights {
+            norm_w: &norm_w,
+            w1: &w1,
+            w3: &w3,
+            w2: &w2,
+            eps: 1e-5,
+        };
         let want = reference(&x, &w, h, i);
         for lanes in [1usize, 3, 8] {
             let mut got = vec![0u16; h];
@@ -286,7 +333,11 @@ mod tests {
             }
             // Everything rounds through bf16 at the same points; the only latitude is dot
             // summation order, so parity sits at bf16 resolution.
-            assert!(md / sc < 3e-2, "lanes={lanes}: fused vs op chain rel {}", md / sc);
+            assert!(
+                md / sc < 3e-2,
+                "lanes={lanes}: fused vs op chain rel {}",
+                md / sc
+            );
         }
     }
 
@@ -298,11 +349,19 @@ mod tests {
         }
         let (h, i) = (64usize, 96usize);
         let mk = |n: usize, seed: usize| -> Vec<u16> {
-            (0..n).map(|j| bf16::from_f32(rnd(j, seed) * 0.25).to_bits()).collect()
+            (0..n)
+                .map(|j| bf16::from_f32(rnd(j, seed) * 0.25).to_bits())
+                .collect()
         };
         let x = mk(h, 23);
         let (norm_w, w1, w3, w2) = (mk(h, 29), mk(i * h, 31), mk(i * h, 37), mk(h * i, 41));
-        let w = FusedMlpWeights { norm_w: &norm_w, w1: &w1, w3: &w3, w2: &w2, eps: 1e-5 };
+        let w = FusedMlpWeights {
+            norm_w: &norm_w,
+            w1: &w1,
+            w3: &w3,
+            w2: &w2,
+            eps: 1e-5,
+        };
         let (mut a, mut b) = (vec![0u16; h], vec![0u16; h]);
         fused_mlp_decode(&x, &w, &mut a, 4);
         fused_mlp_decode(&x, &w, &mut b, 4);
@@ -360,7 +419,10 @@ impl PtrLen {
         match &*s {
             Storage::Cpu(candle_core::CpuStorage::BF16(v)) => {
                 let (a, b) = l.contiguous_offsets()?;
-                Some(Self { ptr: v[a..b].as_ptr() as usize, len: b - a })
+                Some(Self {
+                    ptr: v[a..b].as_ptr() as usize,
+                    len: b - a,
+                })
             }
             _ => None,
         }
@@ -372,7 +434,10 @@ impl PtrLen {
         match &*s {
             Storage::Cpu(candle_core::CpuStorage::F32(v)) => {
                 let (a, b) = l.contiguous_offsets()?;
-                Some(Self { ptr: v[a..b].as_ptr() as usize, len: b - a })
+                Some(Self {
+                    ptr: v[a..b].as_ptr() as usize,
+                    len: b - a,
+                })
             }
             _ => None,
         }
@@ -524,11 +589,26 @@ impl DepthDecode {
     /// `sample` is called once per codebook with the rounded bf16 logits bits and must
     /// return the chosen token (the caller wraps its seeded Sampler — same RNG stream as
     /// the candle path). ONE dispatch; lanes walk steps/layers with spin barriers.
-    pub fn frame(&self, emb_bits: &[u16], mut sample: impl FnMut(&[u16]) -> u32 + Send) -> Vec<u32> {
-        assert_eq!(emb_bits.len(), self.backbone_dim, "depth frame: bad hidden size");
-        assert!(self.codebooks <= 64, "depth frame: att score buffer holds ≤64 steps");
-        assert!(self.hd <= 128, "depth frame: per-head buffers hold ≤128 lanes");
-        let (dim, heads, kvh, hd, cb_n) = (self.dim, self.heads, self.kv_heads, self.hd, self.codebooks);
+    pub fn frame(
+        &self,
+        emb_bits: &[u16],
+        mut sample: impl FnMut(&[u16]) -> u32 + Send,
+    ) -> Vec<u32> {
+        assert_eq!(
+            emb_bits.len(),
+            self.backbone_dim,
+            "depth frame: bad hidden size"
+        );
+        assert!(
+            self.codebooks <= 64,
+            "depth frame: att score buffer holds ≤64 steps"
+        );
+        assert!(
+            self.hd <= 128,
+            "depth frame: per-head buffers hold ≤128 lanes"
+        );
+        let (dim, heads, kvh, hd, cb_n) =
+            (self.dim, self.heads, self.kv_heads, self.hd, self.codebooks);
         let group = heads / kvh;
         let qkv_out = dim + 2 * kvh * hd;
         let scale = 1.0f32 / (hd as f32).sqrt();
@@ -557,11 +637,13 @@ impl DepthDecode {
         let sh_df = Shared(s.df_b.as_mut_ptr());
         let sh_part = Shared(s.partials.as_mut_ptr());
 
-        let tokens: Vec<std::sync::atomic::AtomicU32> =
-            (0..cb_n).map(|_| std::sync::atomic::AtomicU32::new(u32::MAX)).collect();
+        let tokens: Vec<std::sync::atomic::AtomicU32> = (0..cb_n)
+            .map(|_| std::sync::atomic::AtomicU32::new(u32::MAX))
+            .collect();
         let tokens = &tokens;
         // The sampler runs on lane 0 between barriers; hand it the &mut via a take-once slot.
         let sampler_cell = std::sync::Mutex::new(Some(&mut sample));
+        let _dispatch = DISPATCH_LOCK.lock().unwrap();
         let barrier = SpinBarrier::new(lanes);
         let barrier = &barrier;
         let this = &*self;
@@ -569,7 +651,13 @@ impl DepthDecode {
         rayon::scope(|scope| {
             for lane in 0..lanes {
                 let sampler_slot = if lane == 0 {
-                    Some(sampler_cell.lock().unwrap().take().expect("sampler taken once"))
+                    Some(
+                        sampler_cell
+                            .lock()
+                            .unwrap()
+                            .take()
+                            .expect("sampler taken once"),
+                    )
                 } else {
                     None
                 };
@@ -581,7 +669,12 @@ impl DepthDecode {
                     };
                     // GEMV helper over this lane's contiguous output rows: rows [r0,r1) of
                     // W[n,k] dotted with a bf16 bits vector, into an f32 plane.
-                    let gemv = |w: &PtrLen, x_bits: *const u16, out: Shared<f32>, n: usize, k: usize, l: usize| {
+                    let gemv = |w: &PtrLen,
+                                x_bits: *const u16,
+                                out: Shared<f32>,
+                                n: usize,
+                                k: usize,
+                                l: usize| {
                         let (r0, r1) = {
                             let c = n.div_ceil(lanes);
                             ((l * c).min(n), ((l + 1) * c).min(n))
@@ -589,13 +682,26 @@ impl DepthDecode {
                         if r1 > r0 {
                             // SAFETY: lane-private output rows; weight rows in bounds.
                             unsafe {
-                                nt_rows(x_bits, w.u16_ptr().add(r0 * k), out.ptr().add(r0), r1 - r0, k);
+                                nt_rows(
+                                    x_bits,
+                                    w.u16_ptr().add(r0 * k),
+                                    out.ptr().add(r0),
+                                    r1 - r0,
+                                    k,
+                                );
                             }
                         }
                     };
 
                     // ---- stage 0: din = rb(depth_linear·emb + bias) ----
-                    gemv(&this.depth_lin_w, emb_bits.as_ptr(), sh_projf, cb_n * dim, this.backbone_dim, lane);
+                    gemv(
+                        &this.depth_lin_w,
+                        emb_bits.as_ptr(),
+                        sh_projf,
+                        cb_n * dim,
+                        this.backbone_dim,
+                        lane,
+                    );
                     {
                         let (r0, r1) = own(cb_n * dim, lane);
                         // bias add in f32 (once per frame), then ONE slice round — the
@@ -603,13 +709,21 @@ impl DepthDecode {
                         for r in r0..r1 {
                             // SAFETY: lane-private rows.
                             unsafe {
-                                let b = f32::from_bits((*this.depth_lin_b.u16_ptr().add(r) as u32) << 16);
+                                let b = f32::from_bits(
+                                    (*this.depth_lin_b.u16_ptr().add(r) as u32) << 16,
+                                );
                                 sh_projf.set(r, sh_projf.get(r) + b);
                             }
                         }
                         if r1 > r0 {
                             // SAFETY: lane-private slice.
-                            unsafe { lfm_f32_to_bf16(sh_projf.ptr().add(r0), sh_din.ptr().add(r0), (r1 - r0) as i32) };
+                            unsafe {
+                                lfm_f32_to_bf16(
+                                    sh_projf.ptr().add(r0),
+                                    sh_din.ptr().add(r0),
+                                    (r1 - r0) as i32,
+                                )
+                            };
                         }
                         // df_token starts at zero.
                         let (d0, d1) = own(dim, lane);
@@ -640,14 +754,29 @@ impl DepthDecode {
                         for (li, lw) in this.layers.iter().enumerate() {
                             let kbase = (li * kvh) * cb_n * hd;
                             // ---- operator_norm(x) → xn ----
-                            this.norm_stage(sh_x.ptr(), lw.opnorm, sh_xn, sh_part, dim, lane, lanes, barrier);
+                            this.norm_stage(
+                                sh_x.ptr(),
+                                lw.opnorm,
+                                sh_xn,
+                                sh_part,
+                                dim,
+                                lane,
+                                lanes,
+                                barrier,
+                            );
                             // ---- qkv GEMV + per-row rb ----
                             gemv(&lw.qkv_w, sh_xn.ptr(), sh_qkvf, qkv_out, dim, lane);
                             {
                                 let (r0, r1) = own(qkv_out, lane);
                                 if r1 > r0 {
                                     // SAFETY: lane-private rows.
-                                    unsafe { lfm_f32_to_bf16(sh_qkvf.ptr().add(r0), sh_qkvb.ptr().add(r0), (r1 - r0) as i32) };
+                                    unsafe {
+                                        lfm_f32_to_bf16(
+                                            sh_qkvf.ptr().add(r0),
+                                            sh_qkvb.ptr().add(r0),
+                                            (r1 - r0) as i32,
+                                        )
+                                    };
                                 }
                             }
                             barrier.wait();
@@ -661,16 +790,36 @@ impl DepthDecode {
                                         if hh < heads {
                                             let src = sh_qkvb.ptr().add(hh * hd);
                                             let mut bits = [0u16; 128];
-                                            this.qk_head_bits(src, lw.q_ln, bits.as_mut_ptr(), hd, cb);
+                                            this.qk_head_bits(
+                                                src,
+                                                lw.q_ln,
+                                                bits.as_mut_ptr(),
+                                                hd,
+                                                cb,
+                                            );
                                             // q is consumed in f32 (the sdpa upcast point).
-                                            lfm_bf16_to_f32(bits.as_ptr(), sh_qf.ptr().add(hh * hd), hd as i32);
+                                            lfm_bf16_to_f32(
+                                                bits.as_ptr(),
+                                                sh_qf.ptr().add(hh * hd),
+                                                hd as i32,
+                                            );
                                         } else {
                                             let kh = hh - heads;
                                             let src = sh_qkvb.ptr().add(dim + kh * hd);
-                                            this.qk_head_bits(src, lw.k_ln, sh_k.ptr().add(kbase + (kh * cb_n + cb) * hd), hd, cb);
+                                            this.qk_head_bits(
+                                                src,
+                                                lw.k_ln,
+                                                sh_k.ptr().add(kbase + (kh * cb_n + cb) * hd),
+                                                hd,
+                                                cb,
+                                            );
                                             // V: the rb'd projection bits, verbatim (cache dtype).
                                             let vsrc = sh_qkvb.ptr().add(dim + kvh * hd + kh * hd);
-                                            std::ptr::copy_nonoverlapping(vsrc, sh_v.ptr().add(kbase + (kh * cb_n + cb) * hd), hd);
+                                            std::ptr::copy_nonoverlapping(
+                                                vsrc,
+                                                sh_v.ptr().add(kbase + (kh * cb_n + cb) * hd),
+                                                hd,
+                                            );
                                         }
                                     }
                                 }
@@ -709,7 +858,13 @@ impl DepthDecode {
                                 let (d0, d1) = own(dim, lane);
                                 if d1 > d0 {
                                     // SAFETY: lane-private cells; attn_f read-only post-barrier.
-                                    unsafe { lfm_f32_to_bf16(sh_attnf.ptr().add(d0), sh_attnb.ptr().add(d0), (d1 - d0) as i32) };
+                                    unsafe {
+                                        lfm_f32_to_bf16(
+                                            sh_attnf.ptr().add(d0),
+                                            sh_attnb.ptr().add(d0),
+                                            (d1 - d0) as i32,
+                                        )
+                                    };
                                 }
                             }
                             barrier.wait();
@@ -720,7 +875,11 @@ impl DepthDecode {
                                 if d1 > d0 {
                                     // SAFETY: lane-private slices; ladder: rb(out_proj), rb(+x).
                                     unsafe {
-                                        lfm_f32_to_bf16(sh_projf.ptr().add(d0), sh_yb.ptr().add(d0), (d1 - d0) as i32);
+                                        lfm_f32_to_bf16(
+                                            sh_projf.ptr().add(d0),
+                                            sh_yb.ptr().add(d0),
+                                            (d1 - d0) as i32,
+                                        );
                                         lfm_bf16_add(
                                             sh_yb.ptr().add(d0).cast_const(),
                                             sh_x.ptr().add(d0).cast_const(),
@@ -732,7 +891,16 @@ impl DepthDecode {
                             }
                             barrier.wait();
                             // ---- ffn_norm(h) → xn; w1/w3 → swiglu → t; w2 + residual → x ----
-                            this.norm_stage(sh_h.ptr(), lw.ffnnorm, sh_xn, sh_part, dim, lane, lanes, barrier);
+                            this.norm_stage(
+                                sh_h.ptr(),
+                                lw.ffnnorm,
+                                sh_xn,
+                                sh_part,
+                                dim,
+                                lane,
+                                lanes,
+                                barrier,
+                            );
                             gemv(&lw.w1, sh_xn.ptr(), sh_projf, this.ff, dim, lane);
                             gemv(&lw.w3, sh_xn.ptr(), sh_uf, this.ff, dim, lane);
                             {
@@ -756,7 +924,11 @@ impl DepthDecode {
                                 if d1 > d0 {
                                     // SAFETY: lane-private slices; ladder: rb(w2·t), rb(+h).
                                     unsafe {
-                                        lfm_f32_to_bf16(sh_projf.ptr().add(d0), sh_yb.ptr().add(d0), (d1 - d0) as i32);
+                                        lfm_f32_to_bf16(
+                                            sh_projf.ptr().add(d0),
+                                            sh_yb.ptr().add(d0),
+                                            (d1 - d0) as i32,
+                                        );
                                         lfm_bf16_add(
                                             sh_yb.ptr().add(d0).cast_const(),
                                             sh_h.ptr().add(d0).cast_const(),
@@ -771,21 +943,38 @@ impl DepthDecode {
 
                         // ---- get_logits: embedding_norm(x) → to_logits GEMV → rb → sample ----
                         let hw = &this.heads_w[cb];
-                        this.norm_stage(sh_x.ptr(), hw.norm, sh_xn, sh_part, dim, lane, lanes, barrier);
+                        this.norm_stage(
+                            sh_x.ptr(),
+                            hw.norm,
+                            sh_xn,
+                            sh_part,
+                            dim,
+                            lane,
+                            lanes,
+                            barrier,
+                        );
                         gemv(&hw.logits, sh_xn.ptr(), sh_projf, hw.vocab, dim, lane);
                         {
                             let (r0, r1) = own(hw.vocab, lane);
                             if r1 > r0 {
                                 // SAFETY: lane-private rows.
-                                unsafe { lfm_f32_to_bf16(sh_projf.ptr().add(r0), sh_log.ptr().add(r0), (r1 - r0) as i32) };
+                                unsafe {
+                                    lfm_f32_to_bf16(
+                                        sh_projf.ptr().add(r0),
+                                        sh_log.ptr().add(r0),
+                                        (r1 - r0) as i32,
+                                    )
+                                };
                             }
                         }
                         barrier.wait();
                         if let Some(sampler) = sampler_slot.as_mut() {
                             // SAFETY: post-barrier read-only logits view on lane 0.
-                            let logits =
-                                unsafe { std::slice::from_raw_parts(sh_log.ptr().cast_const(), hw.vocab) };
-                            tokens[cb].store((sampler)(logits), std::sync::atomic::Ordering::Release);
+                            let logits = unsafe {
+                                std::slice::from_raw_parts(sh_log.ptr().cast_const(), hw.vocab)
+                            };
+                            tokens[cb]
+                                .store((sampler)(logits), std::sync::atomic::Ordering::Release);
                         }
                         barrier.wait();
                         // ---- df_token = embed row of the sampled token ----
@@ -803,7 +992,10 @@ impl DepthDecode {
             }
         });
 
-        tokens.iter().map(|t| t.load(std::sync::atomic::Ordering::Acquire)).collect()
+        tokens
+            .iter()
+            .map(|t| t.load(std::sync::atomic::Ordering::Acquire))
+            .collect()
     }
 
     /// RMSNorm stage on the lane team: sumsq partials → same-order fold on every lane →
@@ -856,7 +1048,14 @@ impl DepthDecode {
     /// interleaved rope at position `pos` — output the rb'd bf16 BITS of the rotated head
     /// (`apply_rotary_emb`'s type_as round; the cache stores exactly these bits, torch's
     /// cache dtype). SAFETY: caller guarantees src/dst head slices are lane-private.
-    unsafe fn qk_head_bits(&self, src: *const u16, ln: PtrLen, dst_bits: *mut u16, hd: usize, pos: usize) {
+    unsafe fn qk_head_bits(
+        &self,
+        src: *const u16,
+        ln: PtrLen,
+        dst_bits: *mut u16,
+        hd: usize,
+        pos: usize,
+    ) {
         let mut normed = [0u16; 128];
         let mut rot = [0f32; 128];
         let ss = lfm_bf16_sumsq_f32(src, hd as i32);
@@ -899,8 +1098,16 @@ pub unsafe fn attn_decode_bf16(
     hd: usize,
     out_bits: &mut [u16],
 ) {
-    assert_eq!(q_bits.len(), n_head * hd, "attn_decode: q_bits.len() != n_head·hd");
-    assert_eq!(out_bits.len(), n_head * hd, "attn_decode: out_bits.len() != n_head·hd");
+    assert_eq!(
+        q_bits.len(),
+        n_head * hd,
+        "attn_decode: q_bits.len() != n_head·hd"
+    );
+    assert_eq!(
+        out_bits.len(),
+        n_head * hd,
+        "attn_decode: out_bits.len() != n_head·hd"
+    );
     assert!(len > 0 && n_head % n_kv == 0, "attn_decode: bad geometry");
     let group = n_head / n_kv;
     let scale = 1.0f32 / (hd as f32).sqrt();
@@ -910,9 +1117,21 @@ pub unsafe fn attn_decode_bf16(
     for qh in 0..n_head {
         let kh = qh / group;
         lfm_bf16_to_f32(q_bits.as_ptr().add(qh * hd), qf.as_mut_ptr(), hd as i32);
-        lfm_attn_qk_bf16(qf.as_ptr(), k_base.add(kh * head_stride), att.as_mut_ptr(), len as i32, hd as i32);
+        lfm_attn_qk_bf16(
+            qf.as_ptr(),
+            k_base.add(kh * head_stride),
+            att.as_mut_ptr(),
+            len as i32,
+            hd as i32,
+        );
         lfm_softmax_scaled_f32(att.as_mut_ptr(), len as i32, scale);
-        lfm_attn_av_bf16(att.as_ptr(), v_base.add(kh * head_stride), of.as_mut_ptr(), len as i32, hd as i32);
+        lfm_attn_av_bf16(
+            att.as_ptr(),
+            v_base.add(kh * head_stride),
+            of.as_mut_ptr(),
+            len as i32,
+            hd as i32,
+        );
         lfm_f32_to_bf16(of.as_ptr(), out_bits.as_mut_ptr().add(qh * hd), hd as i32);
     }
 }
@@ -954,11 +1173,27 @@ pub fn fused_shortconv_decode(
     let k = w.k;
     assert!(h > 0 && k >= 1 && k <= 8, "fused_shortconv: bad dims");
     assert_eq!(w.norm_w.len(), h, "fused_shortconv: norm_w.len() != H");
-    assert_eq!(w.in_w.len(), 3 * h * h, "fused_shortconv: in_w.len() != 3H·H");
-    assert_eq!(w.conv_w.len(), h * k, "fused_shortconv: conv_w.len() != H·K");
+    assert_eq!(
+        w.in_w.len(),
+        3 * h * h,
+        "fused_shortconv: in_w.len() != 3H·H"
+    );
+    assert_eq!(
+        w.conv_w.len(),
+        h * k,
+        "fused_shortconv: conv_w.len() != H·K"
+    );
     assert_eq!(w.out_w.len(), h * h, "fused_shortconv: out_w.len() != H·H");
-    assert_eq!(state_in.len(), h * (k - 1), "fused_shortconv: state_in.len() != H·(K-1)");
-    assert_eq!(state_out.len(), h * (k - 1), "fused_shortconv: state_out.len() != H·(K-1)");
+    assert_eq!(
+        state_in.len(),
+        h * (k - 1),
+        "fused_shortconv: state_in.len() != H·(K-1)"
+    );
+    assert_eq!(
+        state_out.len(),
+        h * (k - 1),
+        "fused_shortconv: state_out.len() != H·(K-1)"
+    );
     assert_eq!(out.len(), h, "fused_shortconv: out.len() != H");
     assert!(
         fused_mlp_available(),
@@ -985,6 +1220,7 @@ pub fn fused_shortconv_decode(
     let sh_projb = Shared(proj_b.as_mut_ptr());
     let sh_out = Shared(out.as_mut_ptr());
     let sh_state_out = Shared(state_out.as_mut_ptr());
+    let _dispatch = DISPATCH_LOCK.lock().unwrap();
     let barrier = SpinBarrier::new(lanes);
     let barrier = &barrier;
 
@@ -1029,8 +1265,18 @@ pub fn fused_shortconv_decode(
                 if p1 > p0 {
                     // SAFETY: lane-private rows; xn read-only post-barrier.
                     unsafe {
-                        nt_rows(sh_xn.ptr(), w.in_w.as_ptr().add(p0 * h), sh_bcxf.ptr().add(p0), p1 - p0, h);
-                        lfm_f32_to_bf16(sh_bcxf.ptr().add(p0), sh_bcxb.ptr().add(p0), (p1 - p0) as i32);
+                        nt_rows(
+                            sh_xn.ptr(),
+                            w.in_w.as_ptr().add(p0 * h),
+                            sh_bcxf.ptr().add(p0),
+                            p1 - p0,
+                            h,
+                        );
+                        lfm_f32_to_bf16(
+                            sh_bcxf.ptr().add(p0),
+                            sh_bcxb.ptr().add(p0),
+                            (p1 - p0) as i32,
+                        );
                     }
                 }
                 barrier.wait();
@@ -1070,11 +1316,21 @@ pub fn fused_shortconv_decode(
                 if r1 > r0 {
                     // SAFETY: lane-private rows; y bits read-only post-barrier.
                     unsafe {
-                        nt_rows(sh_projb.ptr().cast_const(), w.out_w.as_ptr().add(r0 * h), sh_projf.ptr().add(r0), r1 - r0, h);
+                        nt_rows(
+                            sh_projb.ptr().cast_const(),
+                            w.out_w.as_ptr().add(r0 * h),
+                            sh_projf.ptr().add(r0),
+                            r1 - r0,
+                            h,
+                        );
                         let mut yb = [0u16; 0];
                         let _ = &mut yb;
                         // rb(out_proj) then rb(+residual), slice-wide (reuse xn as staging).
-                        lfm_f32_to_bf16(sh_projf.ptr().add(r0), sh_xn.ptr().add(r0), (r1 - r0) as i32);
+                        lfm_f32_to_bf16(
+                            sh_projf.ptr().add(r0),
+                            sh_xn.ptr().add(r0),
+                            (r1 - r0) as i32,
+                        );
                         lfm_bf16_add(
                             sh_xn.ptr().add(r0).cast_const(),
                             x.as_ptr().add(r0),

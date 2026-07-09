@@ -134,8 +134,16 @@ fn prepare_is_a_pure_accelerator() {
         audio_top_k: Some(4),
         ..GenParams::default()
     };
-    let engine =
-        || Lfm2VoiceEngine::new(model.clone(), proc.clone(), params.clone(), codebooks, device.clone(), 24_000);
+    let engine = || {
+        Lfm2VoiceEngine::new(
+            model.clone(),
+            proc.clone(),
+            params.clone(),
+            codebooks,
+            device.clone(),
+            24_000,
+        )
+    };
 
     let wav_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/question.wav");
     let (samples, rate) = read_wav_mono_f32(&wav_path);
@@ -152,7 +160,10 @@ fn prepare_is_a_pure_accelerator() {
     // Reference: plain respond, fresh engine.
     let mut e_ref = engine();
     let r_ref = respond(&mut e_ref, &utt1);
-    assert!(!r_ref.first_text_run.trim().is_empty(), "no leading text run");
+    assert!(
+        !r_ref.first_text_run.trim().is_empty(),
+        "no leading text run"
+    );
     assert!(r_ref.n_audio_events > 0, "no audio generated");
     println!(
         "reference: {:.1}s wall, text {:?}",

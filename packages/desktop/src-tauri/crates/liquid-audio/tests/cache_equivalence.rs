@@ -135,8 +135,16 @@ fn suffix_cache_matches_full_prefill() -> anyhow::Result<()> {
     // Append the generated turn exactly as the engine does, then advance the cursor
     // with the engine's accounting: everything forwarded = context + all emitted
     // tokens except (possibly) the last.
-    let text_ids: Vec<i64> = toks1.iter().filter(|(t, _)| *t >= 0).map(|(t, _)| *t).collect();
-    let frames: Vec<&Vec<u32>> = toks1.iter().filter(|(t, _)| *t < 0).map(|(_, f)| f).collect();
+    let text_ids: Vec<i64> = toks1
+        .iter()
+        .filter(|(t, _)| *t >= 0)
+        .map(|(t, _)| *t)
+        .collect();
+    let frames: Vec<&Vec<u32>> = toks1
+        .iter()
+        .filter(|(t, _)| *t < 0)
+        .map(|(_, f)| f)
+        .collect();
     let text_t = Tensor::from_vec(text_ids.clone(), (1, text_ids.len()), &device)?;
     let mut flat = Vec::with_capacity(codebooks * frames.len());
     for c in 0..codebooks {
@@ -154,7 +162,10 @@ fn suffix_cache_matches_full_prefill() -> anyhow::Result<()> {
     chat.end_turn()?;
 
     let forwarded = index_pos - n_ctx1;
-    assert!(forwarded <= mods1.len(), "cache advanced past emitted tokens");
+    assert!(
+        forwarded <= mods1.len(),
+        "cache advanced past emitted tokens"
+    );
     // Engine accounting: cursor = per-modality totals at generation start + the
     // forwarded prefix of the emitted stream. `end_turn` added "<|im_end|>\n" AFTER
     // generation (never forwarded): pre-gen text total = text now − generated − trailing.
@@ -222,8 +233,7 @@ fn suffix_cache_matches_full_prefill() -> anyhow::Result<()> {
         let head = full_embeds.narrow(1, 0, n_full - n_suffix)?;
         let mut cache_split = model.make_cache(full_embeds.dtype(), &device)?;
         let _ = model.forward_embeds(&head, 0, &mut cache_split)?;
-        let h_split_tail =
-            model.forward_embeds(&suffix, n_full - n_suffix, &mut cache_split)?;
+        let h_split_tail = model.forward_embeds(&suffix, n_full - n_suffix, &mut cache_split)?;
 
         let e_forward = rel_err(&h_split_tail, &h_whole_tail);
         println!("chunked-vs-full forward rel-err: {e_forward:.3e}");
@@ -280,7 +290,10 @@ fn suffix_cache_matches_full_prefill() -> anyhow::Result<()> {
     let run_a = first_text_run(&toks_a);
     let run_b = first_text_run(&toks_b);
     println!("first text run: full-prefill {run_a:?} vs suffix-cache {run_b:?}");
-    assert!(!run_a.is_empty(), "reference path produced no leading text run");
+    assert!(
+        !run_a.is_empty(),
+        "reference path produced no leading text run"
+    );
     assert_eq!(run_a, run_b, "first text run diverged");
     Ok(())
 }

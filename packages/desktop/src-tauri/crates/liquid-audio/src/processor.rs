@@ -97,9 +97,9 @@ impl SpecialTokenIds {
             // than char-splitting it into ordinary text. Everything downstream
             // (turn boundaries, end-of-turn detection, the chat template) rides on
             // this round-trip, so a tokenizer that fails it must fail the load.
-            let enc = tokenizer.encode(name, false).map_err(|e| {
-                candle_core::Error::Msg(format!("tokenizer encode {name}: {e}"))
-            })?;
+            let enc = tokenizer
+                .encode(name, false)
+                .map_err(|e| candle_core::Error::Msg(format!("tokenizer encode {name}: {e}")))?;
             if enc.get_ids() != [id] {
                 return Err(candle_core::Error::Msg(format!(
                     "tokenizer does not round-trip {name}: encodes to {:?}, expected [{id}] \

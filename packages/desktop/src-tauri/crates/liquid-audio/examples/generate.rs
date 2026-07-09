@@ -130,10 +130,10 @@ fn main() -> Res<()> {
         .skip(1)
         .find(|a| !a.starts_with("--"))
         .unwrap_or_else(|| {
-        // The upstream reference clip, vendored in-crate. Resolved from
-        // CARGO_MANIFEST_DIR (compile-time, CWD-independent).
-        concat!(env!("CARGO_MANIFEST_DIR"), "/assets/question.wav").into()
-    });
+            // The upstream reference clip, vendored in-crate. Resolved from
+            // CARGO_MANIFEST_DIR (compile-time, CWD-independent).
+            concat!(env!("CARGO_MANIFEST_DIR"), "/assets/question.wav").into()
+        });
     let max_new_tokens: usize = std::env::var("LFM_MAX_TOKENS")
         .ok()
         .and_then(|s| s.parse().ok())

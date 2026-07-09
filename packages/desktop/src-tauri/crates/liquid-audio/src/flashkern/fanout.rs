@@ -61,7 +61,14 @@ impl<T: Copy> Shared<T> {
 // a larger lane team (the fused conv kernels) as well as from [`fft_threadgroup`]. Every
 // `barrier.wait()` is a `threadgroup_barrier`; `sign` is the twiddle sign (−1 forward, +1 for
 // the sign-flipped inverse form [`fused_fft`] uses).
-fn fft_lane(shared: Shared<f32>, n: usize, sign: f32, lane: usize, lanes: usize, barrier: &Barrier) {
+fn fft_lane(
+    shared: Shared<f32>,
+    n: usize,
+    sign: f32,
+    lane: usize,
+    lanes: usize,
+    barrier: &Barrier,
+) {
     let log2n = n.trailing_zeros();
     // Bit-reverse permutation (grid-stride over lanes; each pair swapped once by the
     // lower-index lane — disjoint, exactly as the Metal `if (tid < rev)` guard).
@@ -189,10 +196,16 @@ fn fft_threadgroup(data: &mut [f32], n: usize, inverse: bool, lanes: usize) {
 /// `lanes` is the simulated simdgroup width (Metal uses 32); 1 collapses to the serial kernel.
 pub fn fused_fft(data: &mut [f32], batch: usize, inverse: bool, lanes: usize) {
     use rayon::prelude::*;
-    assert!(batch > 0 && data.len() % batch == 0, "data.len() must be batch·2n");
+    assert!(
+        batch > 0 && data.len() % batch == 0,
+        "data.len() must be batch·2n"
+    );
     let per = data.len() / batch;
     let n = per / 2;
-    assert!(per % 2 == 0 && (n == 0 || n.is_power_of_two()), "each signal must be 2·(power of two)");
+    assert!(
+        per % 2 == 0 && (n == 0 || n.is_power_of_two()),
+        "each signal must be 2·(power of two)"
+    );
     let lanes = lanes.clamp(1, n.max(1));
     // Grid dispatch: one rayon task = one threadgroup (one (batch) index).
     data.par_chunks_mut(per).for_each(|sig| {
@@ -259,7 +272,7 @@ fn fft_conv_threadgroup(
                 let mut i = half_sz + lane;
                 while i < fft_size {
                     let mirror = fft_size - i; // in 1..half-1
-                    // SAFETY: reads first half (read-only this stage), writes own cell i.
+                                               // SAFETY: reads first half (read-only this stage), writes own cell i.
                     unsafe {
                         sh.set(2 * i, sh.get(2 * mirror));
                         sh.set(2 * i + 1, -sh.get(2 * mirror + 1));
@@ -309,11 +322,28 @@ pub fn fused_fft_conv(
 ) {
     use rayon::prelude::*;
     let half_sz = fft_size / 2 + 1;
-    assert!(batch > 0 && channels > 0 && seqlen > 0, "fused_fft_conv: empty dims");
-    assert!(fft_size.is_power_of_two(), "fused_fft_conv: fft_size must be a power of two");
-    assert!(fft_size >= seqlen, "fused_fft_conv: fft_size {fft_size} < seqlen {seqlen}");
-    assert_eq!(u.len(), batch * channels * seqlen, "fused_fft_conv: u.len() != B·C·seqlen");
-    assert_eq!(k_f.len(), channels * half_sz * 2, "fused_fft_conv: k_f.len() != C·(fft/2+1)·2");
+    assert!(
+        batch > 0 && channels > 0 && seqlen > 0,
+        "fused_fft_conv: empty dims"
+    );
+    assert!(
+        fft_size.is_power_of_two(),
+        "fused_fft_conv: fft_size must be a power of two"
+    );
+    assert!(
+        fft_size >= seqlen,
+        "fused_fft_conv: fft_size {fft_size} < seqlen {seqlen}"
+    );
+    assert_eq!(
+        u.len(),
+        batch * channels * seqlen,
+        "fused_fft_conv: u.len() != B·C·seqlen"
+    );
+    assert_eq!(
+        k_f.len(),
+        channels * half_sz * 2,
+        "fused_fft_conv: k_f.len() != C·(fft/2+1)·2"
+    );
     assert_eq!(d.len(), channels, "fused_fft_conv: d.len() != C");
     assert_eq!(y.len(), u.len(), "fused_fft_conv: y.len() != u.len()");
     let lanes = lanes.clamp(1, fft_size);
@@ -331,7 +361,10 @@ pub fn fused_fft_conv(
 /// Standalone real-input FFT — the CPU port of `rfft_kernel` in FFTConv.metal. `input` is
 /// `seqlen` reals (zero-padded to `n`); `out` receives the `n/2+1` interleaved complex bins.
 pub fn rfft(input: &[f32], out: &mut [f32], seqlen: usize, n: usize, lanes: usize) {
-    assert!(n.is_power_of_two() && n >= seqlen, "rfft: n must be a power of two ≥ seqlen");
+    assert!(
+        n.is_power_of_two() && n >= seqlen,
+        "rfft: n must be a power of two ≥ seqlen"
+    );
     assert_eq!(input.len(), seqlen, "rfft: input.len() != seqlen");
     let half_sz = n / 2 + 1;
     assert_eq!(out.len(), half_sz * 2, "rfft: out.len() != (n/2+1)·2");
@@ -349,7 +382,10 @@ pub fn rfft(input: &[f32], out: &mut [f32], seqlen: usize, n: usize, lanes: usiz
 /// (Hermitian), the conjugate-form inverse FFT runs, and `out` gets the first `seqlen` reals.
 pub fn irfft(input: &[f32], out: &mut [f32], n: usize, seqlen: usize, lanes: usize) {
     let half_sz = n / 2 + 1;
-    assert!(n.is_power_of_two() && seqlen <= n, "irfft: n must be a power of two ≥ seqlen");
+    assert!(
+        n.is_power_of_two() && seqlen <= n,
+        "irfft: n must be a power of two ≥ seqlen"
+    );
     assert_eq!(input.len(), half_sz * 2, "irfft: input.len() != (n/2+1)·2");
     assert_eq!(out.len(), seqlen, "irfft: out.len() != seqlen");
     let lanes = lanes.clamp(1, n);
@@ -379,7 +415,14 @@ pub fn irfft(input: &[f32], out: &mut [f32], n: usize, seqlen: usize, lanes: usi
 // threadgroup memory, the arithmetic is the dd toolkit's (`cdd_mul`/`cdd_add`/`cdd_sub`),
 // and the twiddles come from the host-precomputed f64→dd table (`tw[j] = exp(−2πi·j/n)`,
 // j < n/2) instead of in-kernel f32 cos/sin — index `k·(n >> (stage+1))` == `k·(n/len)`.
-fn fft_dd_lane(shared: Shared<CDd>, tw: &[CDd], n: usize, lane: usize, lanes: usize, barrier: &Barrier) {
+fn fft_dd_lane(
+    shared: Shared<CDd>,
+    tw: &[CDd],
+    n: usize,
+    lane: usize,
+    lanes: usize,
+    barrier: &Barrier,
+) {
     let log2n = n.trailing_zeros();
     let mut i = lane;
     while i < n {
@@ -426,7 +469,14 @@ fn fft_dd_lane(shared: Shared<CDd>, tw: &[CDd], n: usize, lane: usize, lanes: us
 
 // The per-lane dd inverse FFT — `ifft_radix2_dd`: conjugate, forward dd FFT, conjugate +
 // dd-scale by 1/n (exact in f32: n is a power of two).
-fn ifft_dd_lane(shared: Shared<CDd>, tw: &[CDd], n: usize, lane: usize, lanes: usize, barrier: &Barrier) {
+fn ifft_dd_lane(
+    shared: Shared<CDd>,
+    tw: &[CDd],
+    n: usize,
+    lane: usize,
+    lanes: usize,
+    barrier: &Barrier,
+) {
     let mut i = lane;
     while i < n {
         // SAFETY: each lane conjugates only its own grid-stride cells.
@@ -487,7 +537,11 @@ fn fft_conv_dd_threadgroup(
                     unsafe {
                         sh.set(
                             i,
-                            if i < seqlen { CDd::from_f32(u_bc[i], 0.0) } else { CDd::default() },
+                            if i < seqlen {
+                                CDd::from_f32(u_bc[i], 0.0)
+                            } else {
+                                CDd::default()
+                            },
                         );
                     }
                     i += lanes;
@@ -501,7 +555,10 @@ fn fft_conv_dd_threadgroup(
                     // SAFETY: lane reads+writes only its own cell i this stage.
                     unsafe {
                         let z = sh.get(i);
-                        sh.set(i, dd::cdd_mul(z, CDd::from_f32(kf_c[2 * i], kf_c[2 * i + 1])));
+                        sh.set(
+                            i,
+                            dd::cdd_mul(z, CDd::from_f32(kf_c[2 * i], kf_c[2 * i + 1])),
+                        );
                     }
                     i += lanes;
                 }
@@ -547,11 +604,28 @@ pub fn fused_fft_conv_dd(
 ) {
     use rayon::prelude::*;
     let half_sz = fft_size / 2 + 1;
-    assert!(batch > 0 && channels > 0 && seqlen > 0, "fused_fft_conv_dd: empty dims");
-    assert!(fft_size.is_power_of_two(), "fused_fft_conv_dd: fft_size must be a power of two");
-    assert!(fft_size >= seqlen, "fused_fft_conv_dd: fft_size {fft_size} < seqlen {seqlen}");
-    assert_eq!(u.len(), batch * channels * seqlen, "fused_fft_conv_dd: u.len() != B·C·seqlen");
-    assert_eq!(k_f.len(), channels * half_sz * 2, "fused_fft_conv_dd: k_f.len() != C·(fft/2+1)·2");
+    assert!(
+        batch > 0 && channels > 0 && seqlen > 0,
+        "fused_fft_conv_dd: empty dims"
+    );
+    assert!(
+        fft_size.is_power_of_two(),
+        "fused_fft_conv_dd: fft_size must be a power of two"
+    );
+    assert!(
+        fft_size >= seqlen,
+        "fused_fft_conv_dd: fft_size {fft_size} < seqlen {seqlen}"
+    );
+    assert_eq!(
+        u.len(),
+        batch * channels * seqlen,
+        "fused_fft_conv_dd: u.len() != B·C·seqlen"
+    );
+    assert_eq!(
+        k_f.len(),
+        channels * half_sz * 2,
+        "fused_fft_conv_dd: k_f.len() != C·(fft/2+1)·2"
+    );
     assert_eq!(d.len(), channels, "fused_fft_conv_dd: d.len() != C");
     assert_eq!(y.len(), u.len(), "fused_fft_conv_dd: y.len() != u.len()");
     let lanes = lanes.clamp(1, fft_size);
@@ -592,7 +666,11 @@ pub fn irfft_dd(re: &[f32], im: &[f32], out: &mut [f32], m: usize, n: usize, sca
             for k in 0..freq {
                 let idx = (k * j) % n;
                 let cs = tw[idx];
-                let a = if k == 0 || (n_even && k == nyq) { 1.0f32 } else { 2.0f32 };
+                let a = if k == 0 || (n_even && k == nyq) {
+                    1.0f32
+                } else {
+                    2.0f32
+                };
                 let re_dd = Dd::from_f32(re[r * freq + k]);
                 let im_dd = Dd::from_f32(im[r * freq + k]);
                 let mut t = dd::dd_sub(dd::dd_mul(re_dd, cs.re), dd::dd_mul(im_dd, cs.im));
@@ -722,9 +800,16 @@ pub fn fused_monarch_fwd(
 ) {
     use rayon::prelude::*;
     let nl = n * l;
-    assert!(bh > 0 && n > 0 && l > 0, "fused_monarch_fwd: B·H, N, L must be > 0");
+    assert!(
+        bh > 0 && n > 0 && l > 0,
+        "fused_monarch_fwd: B·H, N, L must be > 0"
+    );
     assert_eq!(u.len(), bh * nl, "fused_monarch_fwd: u.len() != B·H·N·L");
-    assert_eq!(out.len(), bh * nl * 2, "fused_monarch_fwd: out.len() != B·H·N·L·2");
+    assert_eq!(
+        out.len(),
+        bh * nl * 2,
+        "fused_monarch_fwd: out.len() != B·H·N·L·2"
+    );
     assert_eq!(dlr.len(), l * l, "fused_monarch_fwd: dlr.len() != L·L");
     assert_eq!(dli.len(), l * l, "fused_monarch_fwd: dli.len() != L·L");
     assert_eq!(dnr.len(), n * n, "fused_monarch_fwd: dnr.len() != N·N");
@@ -886,7 +971,8 @@ fn monarch_conv_threadgroup(
                     for k in 0..n {
                         let (dr, di) = (mats.dnr[r * n + k], mats.dni[r * n + k]);
                         // SAFETY: post-barrier read-only view of A.
-                        let (zr, zi) = unsafe { (sh.get(axr + k * l + c), sh.get(axi + k * l + c)) };
+                        let (zr, zi) =
+                            unsafe { (sh.get(axr + k * l + c), sh.get(axi + k * l + c)) };
                         m0 += dr * zr;
                         m1 += di * zi;
                         m2 += dr * zi;
@@ -923,7 +1009,8 @@ fn monarch_conv_threadgroup(
                     for k in 0..n {
                         let (dr, di) = (mats.idnr[r * n + k], mats.idni[r * n + k]);
                         // SAFETY: post-barrier read-only view of B.
-                        let (zr, zi) = unsafe { (sh.get(bxr + k * l + c), sh.get(bxi + k * l + c)) };
+                        let (zr, zi) =
+                            unsafe { (sh.get(bxr + k * l + c), sh.get(bxi + k * l + c)) };
                         m0 += dr * zr;
                         m1 += di * zi;
                         m2 += dr * zi;
@@ -961,7 +1048,8 @@ fn monarch_conv_threadgroup(
                     let (mut m0, mut m1) = (0f32, 0f32);
                     for k in 0..l {
                         // SAFETY: post-barrier read-only view of A.
-                        let (ar, ai) = unsafe { (sh.get(axr + r * l + k), sh.get(axi + r * l + k)) };
+                        let (ar, ai) =
+                            unsafe { (sh.get(axr + r * l + k), sh.get(axi + r * l + k)) };
                         m0 += ar * mats.idlr[k * l + c];
                         m1 += ai * mats.idli[k * l + c];
                     }
@@ -1014,11 +1102,22 @@ pub fn fused_monarch_conv(
 ) {
     use rayon::prelude::*;
     let nl = n * l;
-    assert!(bh > 0 && n > 0 && l > 0, "fused_monarch_conv: B·H, N, L must be > 0");
+    assert!(
+        bh > 0 && n > 0 && l > 0,
+        "fused_monarch_conv: B·H, N, L must be > 0"
+    );
     mats.validate(n, l);
     assert_eq!(u.len(), bh * nl, "fused_monarch_conv: u.len() != B·H·N·L");
-    assert_eq!(kf.len(), bh * nl * 2, "fused_monarch_conv: kf.len() != B·H·N·L·2");
-    assert_eq!(out.len(), bh * nl, "fused_monarch_conv: out.len() != B·H·N·L");
+    assert_eq!(
+        kf.len(),
+        bh * nl * 2,
+        "fused_monarch_conv: kf.len() != B·H·N·L·2"
+    );
+    assert_eq!(
+        out.len(),
+        bh * nl,
+        "fused_monarch_conv: out.len() != B·H·N·L"
+    );
     let lanes = lanes.clamp(1, nl.max(1));
     out.par_chunks_mut(nl)
         .zip(u.par_chunks(nl).zip(kf.par_chunks(nl * 2)))
@@ -1051,13 +1150,28 @@ pub fn fused_monarch_conv_padded(
 ) {
     use rayon::prelude::*;
     let (bh, nl) = (b * h, n * l);
-    assert!(bh > 0 && n > 0 && l > 0 && t_len > 0, "monarch conv padded: empty dims");
+    assert!(
+        bh > 0 && n > 0 && l > 0 && t_len > 0,
+        "monarch conv padded: empty dims"
+    );
     assert!(t_len <= nl, "monarch conv padded: t_len {t_len} > N·L {nl}");
     mats.validate(n, l);
     let slots = 1 + (gates & 1) as usize + ((gates >> 1) & 1) as usize;
-    assert_eq!(u_ext.len(), slots * bh * t_len, "monarch conv padded: u_ext.len() != G·B·H·T");
-    assert_eq!(kf.len(), bh * nl * 2, "monarch conv padded: kf.len() != B·H·N·L·2");
-    assert_eq!(out.len(), bh * t_len, "monarch conv padded: out.len() != B·H·T");
+    assert_eq!(
+        u_ext.len(),
+        slots * bh * t_len,
+        "monarch conv padded: u_ext.len() != G·B·H·T"
+    );
+    assert_eq!(
+        kf.len(),
+        bh * nl * 2,
+        "monarch conv padded: kf.len() != B·H·N·L·2"
+    );
+    assert_eq!(
+        out.len(),
+        bh * t_len,
+        "monarch conv padded: out.len() != B·H·T"
+    );
     let d = if gates & 4 != 0 {
         let d = dvec.expect("monarch conv padded: gates bit 2 set but no dvec");
         assert_eq!(d.len(), h, "monarch conv padded: dvec.len() != H");
@@ -1092,8 +1206,16 @@ pub fn fused_monarch_conv_padded(
 /// multiply-subtract and the final division are kept as the kernel writes them.
 pub fn row_idft_real(x: &[f32], id_f_l: &[f32], out: &mut [f32], bh: usize, n: usize, l: usize) {
     use rayon::prelude::*;
-    assert_eq!(x.len(), bh * n * l * 2, "row_idft_real: x.len() != B·H·N·L·2");
-    assert_eq!(id_f_l.len(), l * l * 2, "row_idft_real: id_f_l.len() != L·L·2");
+    assert_eq!(
+        x.len(),
+        bh * n * l * 2,
+        "row_idft_real: x.len() != B·H·N·L·2"
+    );
+    assert_eq!(
+        id_f_l.len(),
+        l * l * 2,
+        "row_idft_real: id_f_l.len() != L·L·2"
+    );
     assert_eq!(out.len(), bh * n * l, "row_idft_real: out.len() != B·H·N·L");
     out.par_chunks_mut(l).enumerate().for_each(|(row, orow)| {
         let x_base = row * l; // (bh·N + n) row of complex length-L cells
@@ -1125,14 +1247,20 @@ mod tests {
         // the single-lane serial run — proving the simulated threadgroup_barriers correctly order
         // the stages under real concurrency (and the disjoint-write discipline holds).
         for &n in &[8usize, 16, 64, 256] {
-            let orig: Vec<f32> = (0..2 * n).map(|i| ((i * 37 % 11) as f32 / 11.0) - 0.5).collect();
+            let orig: Vec<f32> = (0..2 * n)
+                .map(|i| ((i * 37 % 11) as f32 / 11.0) - 0.5)
+                .collect();
             let mut reference = orig.clone();
             ref_fft(&mut reference, n, false);
             for &lanes in &[2usize, 4, 8, 16] {
                 let mut d = orig.clone();
                 fft_threadgroup(&mut d, n, false, lanes);
                 for (g, r) in d.iter().zip(&reference) {
-                    assert_eq!(g.to_bits(), r.to_bits(), "n={n} lanes={lanes}: barrier race?");
+                    assert_eq!(
+                        g.to_bits(),
+                        r.to_bits(),
+                        "n={n} lanes={lanes}: barrier race?"
+                    );
                 }
             }
         }
@@ -1157,8 +1285,20 @@ mod tests {
         let t = |v: &[f32], r: usize, c: usize| Tensor::from_slice(v, (r, c), &d).unwrap();
         let x = t(xb, n, l);
         // stage 1: Y = X @ dL (real/imag).
-        let yr: Vec<f32> = x.matmul(&t(dlr, l, l)).unwrap().flatten_all().unwrap().to_vec1().unwrap();
-        let yi: Vec<f32> = x.matmul(&t(dli, l, l)).unwrap().flatten_all().unwrap().to_vec1().unwrap();
+        let yr: Vec<f32> = x
+            .matmul(&t(dlr, l, l))
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let yi: Vec<f32> = x
+            .matmul(&t(dli, l, l))
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
         // stage 2: twiddle.
         let (mut zr, mut zi) = (vec![0f32; n * l], vec![0f32; n * l]);
         for i in 0..n * l {
@@ -1205,7 +1345,11 @@ mod tests {
                 let mut got = vec![0f32; n * l * 2];
                 fused_monarch_fwd(&xb, &dlr, &dli, &dnr, &dni, &tw, &mut got, 1, n, l, lanes);
                 for (g, r) in got.iter().zip(&serial) {
-                    assert_eq!(g.to_bits(), r.to_bits(), "n={n} l={l} lanes={lanes}: barrier race?");
+                    assert_eq!(
+                        g.to_bits(),
+                        r.to_bits(),
+                        "n={n} l={l} lanes={lanes}: barrier race?"
+                    );
                 }
             }
         }
@@ -1266,10 +1410,16 @@ mod tests {
                         si += u[base + t] as f64 * ang.sin();
                     }
                     let (kr, ki) = if k < half {
-                        (k_f[(ci * half + k) * 2] as f64, k_f[(ci * half + k) * 2 + 1] as f64)
+                        (
+                            k_f[(ci * half + k) * 2] as f64,
+                            k_f[(ci * half + k) * 2 + 1] as f64,
+                        )
                     } else {
                         let m = fft_size - k;
-                        (k_f[(ci * half + m) * 2] as f64, -(k_f[(ci * half + m) * 2 + 1] as f64))
+                        (
+                            k_f[(ci * half + m) * 2] as f64,
+                            -(k_f[(ci * half + m) * 2 + 1] as f64),
+                        )
                     };
                     sre[k] = sr * kr - si * ki;
                     sim[k] = sr * ki + si * kr;
@@ -1295,8 +1445,12 @@ mod tests {
         fft_size: usize,
     ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
         let half = fft_size / 2 + 1;
-        let u: Vec<f32> = (0..batch * channels * seqlen).map(|i| rnd(i + 3) * 4.0).collect();
-        let kf: Vec<f32> = (0..channels * half * 2).map(|i| rnd(i + 41) * 2.0).collect();
+        let u: Vec<f32> = (0..batch * channels * seqlen)
+            .map(|i| rnd(i + 3) * 4.0)
+            .collect();
+        let kf: Vec<f32> = (0..channels * half * 2)
+            .map(|i| rnd(i + 41) * 2.0)
+            .collect();
         let d: Vec<f32> = (0..channels).map(|i| rnd(i + 97)).collect();
         (u, kf, d)
     }
@@ -1326,10 +1480,22 @@ mod tests {
         let (batch, channels, seqlen, fft_size) = (1usize, 2usize, 24usize, 64usize);
         let (u, kf, d) = conv_case(batch, channels, seqlen, fft_size);
         let mut serial = vec![0f32; u.len()];
-        fused_fft_conv(&u, &kf, &d, &mut serial, batch, channels, seqlen, fft_size, 1);
+        fused_fft_conv(
+            &u,
+            &kf,
+            &d,
+            &mut serial,
+            batch,
+            channels,
+            seqlen,
+            fft_size,
+            1,
+        );
         for &lanes in &[2usize, 4, 8, 32] {
             let mut got = vec![0f32; u.len()];
-            fused_fft_conv(&u, &kf, &d, &mut got, batch, channels, seqlen, fft_size, lanes);
+            fused_fft_conv(
+                &u, &kf, &d, &mut got, batch, channels, seqlen, fft_size, lanes,
+            );
             for (g, r) in got.iter().zip(&serial) {
                 assert_eq!(g.to_bits(), r.to_bits(), "lanes={lanes}: barrier race?");
             }
@@ -1377,11 +1543,16 @@ mod tests {
         fused_fft_conv_dd(&u, &kf, &d, &mut ydd, batch, channels, seqlen, fft_size, 4);
 
         let err = |y: &[f32]| {
-            y.iter().zip(&want).fold(0f64, |m, (g, w)| m.max((*g as f64 - w).abs()))
+            y.iter()
+                .zip(&want)
+                .fold(0f64, |m, (g, w)| m.max((*g as f64 - w).abs()))
         };
         let (e32, edd) = (err(&y32), err(&ydd));
         assert!(edd <= e32, "dd err {edd:e} must not exceed f32 err {e32:e}");
-        assert!(edd / sc < 1e-6, "dd err {edd:e} above the f32 rounding floor (scale {sc:e})");
+        assert!(
+            edd / sc < 1e-6,
+            "dd err {edd:e} above the f32 rounding floor (scale {sc:e})"
+        );
     }
 
     #[test]
@@ -1389,10 +1560,22 @@ mod tests {
         let (batch, channels, seqlen, fft_size) = (1usize, 2usize, 20usize, 32usize);
         let (u, kf, d) = conv_case(batch, channels, seqlen, fft_size);
         let mut serial = vec![0f32; u.len()];
-        fused_fft_conv_dd(&u, &kf, &d, &mut serial, batch, channels, seqlen, fft_size, 1);
+        fused_fft_conv_dd(
+            &u,
+            &kf,
+            &d,
+            &mut serial,
+            batch,
+            channels,
+            seqlen,
+            fft_size,
+            1,
+        );
         for &lanes in &[2usize, 4, 16] {
             let mut got = vec![0f32; u.len()];
-            fused_fft_conv_dd(&u, &kf, &d, &mut got, batch, channels, seqlen, fft_size, lanes);
+            fused_fft_conv_dd(
+                &u, &kf, &d, &mut got, batch, channels, seqlen, fft_size, lanes,
+            );
             for (g, r) in got.iter().zip(&serial) {
                 assert_eq!(g.to_bits(), r.to_bits(), "dd lanes={lanes}: barrier race?");
             }
@@ -1409,13 +1592,24 @@ mod tests {
             let im: Vec<f32> = (0..m * freq).map(|i| rnd(i + 31) * 2.0).collect();
             let scale64 = 1.0 / n as f64;
             let mut got = vec![0f32; m * n];
-            irfft_dd(&re, &im, &mut got, m, n, crate::flashkern::dd::dd_from_f64(scale64));
+            irfft_dd(
+                &re,
+                &im,
+                &mut got,
+                m,
+                n,
+                crate::flashkern::dd::dd_from_f64(scale64),
+            );
             let two_pi = 2.0 * std::f64::consts::PI;
             for r in 0..m {
                 for j in 0..n {
                     let mut acc = 0f64;
                     for k in 0..freq {
-                        let a = if k == 0 || (n % 2 == 0 && k == n / 2) { 1.0 } else { 2.0 };
+                        let a = if k == 0 || (n % 2 == 0 && k == n / 2) {
+                            1.0
+                        } else {
+                            2.0
+                        };
                         let ang = two_pi * k as f64 * j as f64 / n as f64;
                         acc += re[r * freq + k] as f64 * a * ang.cos()
                             - im[r * freq + k] as f64 * a * ang.sin();
@@ -1434,7 +1628,13 @@ mod tests {
     // f64 straight-loop oracle for the 7-stage Monarch conv pipeline over ONE staged [N,L]
     // signal (independent of the kernel's f32 four-sum structure). Returns the [N,L] real grid
     // BEFORE any store-side mapping (truncation/skip/output gate).
-    fn ref_monarch_conv_f64(ux: &[f64], m: &MonarchConvMats, kfb: &[f32], n: usize, l: usize) -> Vec<f64> {
+    fn ref_monarch_conv_f64(
+        ux: &[f64],
+        m: &MonarchConvMats,
+        kfb: &[f32],
+        n: usize,
+        l: usize,
+    ) -> Vec<f64> {
         let nl = n * l;
         let (mut ar, mut ai) = (vec![0f64; nl], vec![0f64; nl]);
         for r in 0..n {
@@ -1511,7 +1711,18 @@ mod tests {
     // Random (non-DFT) conv operand set — math parity doesn't require true DFT matrices,
     // and random operands keep the oracle independent of any FFT identity.
     fn conv_mats(n: usize, l: usize, seed: usize) -> Vec<Vec<f32>> {
-        let sizes = [l * l, l * l, n * n, n * n, n * l * 2, n * n, n * n, l * l, l * l, n * l * 2];
+        let sizes = [
+            l * l,
+            l * l,
+            n * n,
+            n * n,
+            n * l * 2,
+            n * n,
+            n * n,
+            l * l,
+            l * l,
+            n * l * 2,
+        ];
         sizes
             .iter()
             .enumerate()
@@ -1552,7 +1763,11 @@ mod tests {
                 md = md.max((*g as f64 - w).abs());
                 sc = sc.max(w.abs());
             }
-            assert!(md / sc < 1e-4, "bh={b}: monarch conv vs f64 rel {}", md / sc);
+            assert!(
+                md / sc < 1e-4,
+                "bh={b}: monarch conv vs f64 rel {}",
+                md / sc
+            );
         }
     }
 
@@ -1570,7 +1785,11 @@ mod tests {
             let mut got = vec![0f32; bh * nl];
             fused_monarch_conv(&u, &mats, &kf, &mut got, bh, n, l, lanes);
             for (g, r) in got.iter().zip(&serial) {
-                assert_eq!(g.to_bits(), r.to_bits(), "conv lanes={lanes}: barrier race?");
+                assert_eq!(
+                    g.to_bits(),
+                    r.to_bits(),
+                    "conv lanes={lanes}: barrier race?"
+                );
             }
         }
     }
@@ -1589,7 +1808,18 @@ mod tests {
         let dvec: Vec<f32> = (0..h).map(|i| rnd(i + 811)).collect();
         let mut got = vec![0f32; bh * t_len];
         fused_monarch_conv_padded(
-            &u_ext, &mats, &kf, &mut got, b, h, t_len, gates, Some(&dvec), n, l, 8,
+            &u_ext,
+            &mats,
+            &kf,
+            &mut got,
+            b,
+            h,
+            t_len,
+            gates,
+            Some(&dvec),
+            n,
+            l,
+            8,
         );
         for bhi in 0..bh {
             let xb = &u_ext[bhi * t_len..(bhi + 1) * t_len];
@@ -1605,7 +1835,8 @@ mod tests {
                     }
                 }
             }
-            let grid = ref_monarch_conv_f64(&ux, &mats, &kf[bhi * nl * 2..(bhi + 1) * nl * 2], n, l);
+            let grid =
+                ref_monarch_conv_f64(&ux, &mats, &kf[bhi * nl * 2..(bhi + 1) * nl * 2], n, l);
             let (mut md, mut sc) = (0f64, 1e-6f64);
             for r in 0..n {
                 for c in 0..l {
@@ -1618,7 +1849,11 @@ mod tests {
                     }
                 }
             }
-            assert!(md / sc < 1e-4, "bh={bhi}: padded conv vs f64 rel {}", md / sc);
+            assert!(
+                md / sc < 1e-4,
+                "bh={bhi}: padded conv vs f64 rel {}",
+                md / sc
+            );
         }
     }
 

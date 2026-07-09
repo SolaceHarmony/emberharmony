@@ -108,7 +108,10 @@ impl AudioDetokenizer for MimiDetokenizer {
 
     /// Reset the moshi Mimi streaming conv/transformer state (turn boundary).
     fn reset_stream(&self) {
-        self.inner.lock().unwrap_or_else(|p| p.into_inner()).reset_state();
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .reset_state();
     }
 
     /// Real streaming decode via moshi's `Mimi::decode_step` — keeps codec state
