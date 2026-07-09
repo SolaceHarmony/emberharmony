@@ -64,11 +64,12 @@ pub enum Lfm2Device {
 
 impl Default for Lfm2Device {
     fn default() -> Self {
-        if cfg!(target_os = "macos") {
-            Self::Metal
-        } else {
-            Self::Cpu
-        }
+        // CPU on every platform, macOS included. Measured A/B on the two-turn speaker
+        // e2e (same clip, same stack, 2026-07-09): CPU 24k underrun samples / 1508 ms
+        // mean pause→first-audio vs Metal 167k underruns / 2043 ms — GPU dispatch
+        // jitter lands directly in the audio at batch-of-one real-time decode. Metal
+        // remains a user-selectable choice for prefill-heavy/offline use.
+        Self::Cpu
     }
 }
 
