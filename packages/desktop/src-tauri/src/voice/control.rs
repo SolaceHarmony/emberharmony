@@ -353,7 +353,7 @@ impl TurnMode {
     pub fn max_new_tokens(self) -> usize {
         match self {
             TurnMode::Asr => 100,
-            TurnMode::Tts | TurnMode::Interleaved => 1024,
+            TurnMode::Tts | TurnMode::Interleaved => 2048,
         }
     }
 }
@@ -510,6 +510,13 @@ mod tests {
     use crate::settings::{Lfm2Settings, LiveKitSettings};
 
     fn settings(provider: VoiceProvider, model_dir: Option<&str>) -> VoiceSettings {
+        // Computed before the struct literal: `provider` moves into the struct on
+        // the first field, so it cannot be read again for the url two fields later.
+        let livekit_url = if provider == VoiceProvider::Livekit {
+            Some("wss://livekit.invalid".into())
+        } else {
+            None
+        };
         VoiceSettings {
             provider,
             lfm2: Lfm2Settings {
@@ -517,11 +524,7 @@ mod tests {
                 ..Default::default()
             },
             livekit: LiveKitSettings {
-                url: if provider == VoiceProvider::Livekit {
-                    Some("wss://livekit.invalid".into())
-                } else {
-                    None
-                },
+                url: livekit_url,
                 ..Default::default()
             },
             ..Default::default()
@@ -547,7 +550,12 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("config.json"), "{}").unwrap();
         let path = dir.to_string_lossy().into_owned();
-        assert!(plan(&settings(VoiceProvider::Lfm2, Some(&path))).ready);
+        // This test exercises the LFM2-Audio readiness path; the DEFAULT local
+        // engine is Moshi realtime (which inspects a different snapshot), so pin
+        // the engine the test is named for.
+        let mut s = settings(VoiceProvider::Lfm2, Some(&path));
+        s.lfm2.engine = crate::settings::LocalVoiceEngine::Lfm2Interleaved;
+        assert!(plan(&s).ready);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
