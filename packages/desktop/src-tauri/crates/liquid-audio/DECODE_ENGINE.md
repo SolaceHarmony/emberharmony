@@ -311,3 +311,43 @@ CPU-default flip was taken while a release build ran concurrently — contention
 Metal steady-state. The flip still stands (CPU leads both metrics on clean runs, idles
 at zero, and carries the engine roadmap), but the honest margin is modest, not 7×.
 Bench with the machine quiet or say so in the numbers.
+
+## State of play (2026-07-09, end of token-pass arc) — the complete inventory
+
+**Native math, live on the CPU decode path (all bit-proven by REF 2f9c907a… / PERF
+45125c9e…):**
+- REQ_TOKEN_PASS: ONE doorbell per decode token — embed (text row copy; audio =
+  candle's exact sequential-bf16 sum(0), probe-pinned), every conv layer, every
+  attention layer (incl. NeoX rope 3-round ladder, per-head qk-norm, in-place KV
+  appends), final embedding-norm. Hidden state ping-pongs engine planes.
+- Depthformer: FULLY native NEON (DepthDecode — 8 codebook steps × 6 blocks, one
+  dispatch/frame, sampling on lane 0). Dispatch = rayon threadgroup + DISPATCH_LOCK,
+  not yet the kcoro team.
+- Resident bf16 KV planes (in-place append, O(1) rollback), in-place conv windows.
+- AMX, via Accelerate (E4): ALL prefill matmuls rows>4 — measured 19-28×,
+  ~1-1.5 TFLOP/s. Live since E4; unaffected by the engine work.
+
+**Still candle inside the decode loop:** logits head (rank-1 h_last hits the BFMMLA
+path — RO-tree ladder; options in task list), sampler (LogitsProcessor; ChaCha12 port
+planned), two Tensor wraps + a rebuilt state array per token (rim overhead).
+**Still candle at turn level:** conformer audio-in, prefill graph (Accelerate-backed),
+Mimi codec.
+
+**The open problem is DISPATCH, not math.** Pre-engine threadgroup build: 1508ms mean /
+~24k underruns, consistently clean. Engine builds: bit-identical output, 1.7-2.2s /
+102k-244k underruns with run-to-run variance = kcoro's wake path (lossy park_cv signal,
+5ms timed-wait recovery; ~200 coordinator-published stages ⇒ ~400 wake opportunities
+per token; a missed worker wake SERIALIZES a stage onto one lane). Tile-count
+completion + epoch-CAS board fixed correctness; coordinator participation did not fix
+the chop (183k/102k/138k across three runs — committed with data).
+
+**The fix, per the original §2 design (build next):**
+1. Lane-uniform token pass: every worker runs the WHOLE layer-walk program (stage
+   bodies already exist as tile cases); in-arena generation barriers between HOT lanes
+   (bounded spin-then-futex — the GPU barrier idiom, distinct from banned idle-spin);
+   the team parks/wakes ONCE per token. Wake lottery: ~400 draws → 9.
+2. kcoro patch 0005: precise parking in kc_sched (exact signal accounting, untimed
+   waits) so the remaining wakes are µs-bounded.
+3. Fold DepthDecode onto the same team; rim cuts (persistent state array, resident out
+   planes, no per-token Tensor wraps).
+4. ST_LOGITS ladder decision (task #1), then sampler v2 (ChaCha12), then Mimi (E5).
