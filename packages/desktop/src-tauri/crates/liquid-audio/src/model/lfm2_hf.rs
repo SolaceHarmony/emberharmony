@@ -288,6 +288,54 @@ impl Cache {
     /// `index_pos == 0` begins a new stream (cursor reset; the buffer is reused when the
     /// geometry matches). `kf`/`vf` are the step's `[B, n_kv, s, hd]` bf16 rows;
     /// `index_pos` must equal the slot cursor (the streaming contract).
+    /// Pre-grow (or create) a layer's KV slot so rows `0..need` fit — the native
+    /// attention path captures raw plane pointers and must never trigger growth while
+    /// they are live. Same alloc/grow/copy logic as [`Self::append_kv`], no row writes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ensure_kv_capacity(
+        &mut self,
+        block_idx: usize,
+        b: usize,
+        n_kv: usize,
+        hd: usize,
+        need: usize,
+        dtype: DType,
+        device: &Device,
+    ) -> Result<()> {
+        let slot = &mut self.kvs[block_idx];
+        match slot.as_mut() {
+            None => {
+                let cap = need.next_power_of_two().max(256);
+                let k = Tensor::zeros((b, n_kv, cap, hd), dtype, device)?;
+                let v = Tensor::zeros((b, n_kv, cap, hd), dtype, device)?;
+                *slot = Some(KvSlot { k, v, len: 0 });
+            }
+            Some(sl) => {
+                let cap = sl.k.dim(2)?;
+                if need > cap {
+                    let ncap = need.next_power_of_two().max(cap * 2);
+                    let k = Tensor::zeros((b, n_kv, ncap, hd), sl.k.dtype(), sl.k.device())?;
+                    let v = Tensor::zeros((b, n_kv, ncap, hd), sl.v.dtype(), sl.v.device())?;
+                    if sl.len > 0 {
+                        k.slice_set(&sl.k.narrow(2, 0, sl.len)?.contiguous()?, 2, 0)?;
+                        v.slice_set(&sl.v.narrow(2, 0, sl.len)?.contiguous()?, 2, 0)?;
+                    }
+                    sl.k = k;
+                    sl.v = v;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Advance a layer's KV cursor by one row — the native attention path wrote the
+    /// step's rows directly into the planes; the ledger stays here.
+    pub fn advance_kv_cursor(&mut self, block_idx: usize) {
+        if let Some(sl) = self.kvs[block_idx].as_mut() {
+            sl.len += 1;
+        }
+    }
+
     fn append_kv(
         &mut self,
         block_idx: usize,
@@ -791,6 +839,23 @@ impl DecoderLayer {
                 }
             }
         }
+        // Whole attention layer in one native doorbell (grouped/ulp tier; the
+        // reference chain and prefill keep the candle path below).
+        #[cfg(all(
+        has_kcoro,
+        has_native_engine,
+        any(
+            all(target_arch = "aarch64", has_flashkern_neon),
+            all(target_arch = "x86_64", has_flashkern_x86)
+        )
+    ))]
+        if let LayerKind::Attention(a) = &self.kind {
+            if add_mask.is_none() {
+                if let Some(y) = self.native_attn_layer(x, a, index_pos, block_idx, cache)? {
+                    return Ok(y);
+                }
+            }
+        }
         let h = self.operator_norm.forward(x)?;
         let h = match &self.kind {
             LayerKind::Attention(a) => a.forward(&h, index_pos, block_idx, cache, add_mask)?,
@@ -989,14 +1054,47 @@ impl DecoderLayer {
     fn native_conv_desc(
         &self,
         held: &mut Vec<Tensor>,
-    ) -> Option<crate::flashkern::native_engine::ConvLayerDesc> {
+    ) -> Option<crate::flashkern::native_engine::LayerDesc> {
         use crate::flashkern::decode::PtrLen;
-        use crate::flashkern::native_engine::ConvLayerDesc;
-        let LayerKind::ShortConv(conv) = &self.kind else {
-            return Some(ConvLayerDesc::attn_placeholder());
+        use crate::flashkern::native_engine::LayerDesc;
+        let conv = match &self.kind {
+            LayerKind::ShortConv(c) => c,
+            LayerKind::Attention(a) => {
+                // Attention capture (rung 2). Any failure degrades THIS slot to
+                // unserved (q_w null) — conv layers still run natively.
+                let attn = (|| -> Option<LayerDesc> {
+                    Some(LayerDesc {
+                        kind: 1,
+                        k: 0,
+                        op_eps: self.operator_norm.eps() as f32,
+                        ffn_eps: self.ffn_norm.eps() as f32,
+                        op_norm_w: PtrLen::bf16(self.operator_norm.weight())?.addr()
+                            as *const u16,
+                        ffn_norm_w: PtrLen::bf16(self.ffn_norm.weight())?.addr()
+                            as *const u16,
+                        in_w: std::ptr::null(),
+                        conv_w: std::ptr::null(),
+                        out_w: std::ptr::null(),
+                        w1: PtrLen::bf16(self.mlp.gate_proj.weight())?.addr() as *const u16,
+                        w3: PtrLen::bf16(self.mlp.up_proj.weight())?.addr() as *const u16,
+                        w2: PtrLen::bf16(self.mlp.down_proj.weight())?.addr() as *const u16,
+                        n_head: a.n_head as u32,
+                        n_kv: a.n_kv as u32,
+                        hd: a.head_dim as u32,
+                        qk_eps: a.q_norm.eps() as f32,
+                        q_w: PtrLen::bf16(a.q_proj.weight())?.addr() as *const u16,
+                        k_w: PtrLen::bf16(a.k_proj.weight())?.addr() as *const u16,
+                        v_w: PtrLen::bf16(a.v_proj.weight())?.addr() as *const u16,
+                        o_w: PtrLen::bf16(a.o_proj.weight())?.addr() as *const u16,
+                        qn_w: PtrLen::bf16(a.q_norm.weight())?.addr() as *const u16,
+                        kn_w: PtrLen::bf16(a.k_norm.weight())?.addr() as *const u16,
+                    })
+                })();
+                return Some(attn.unwrap_or_else(LayerDesc::attn_placeholder));
+            }
         };
         let w2d = conv.conv_weight.squeeze(1).ok()?.contiguous().ok()?;
-        let desc = ConvLayerDesc {
+        let desc = LayerDesc {
             kind: 0,
             k: conv.l_cache as u32,
             op_eps: self.operator_norm.eps() as f32,
@@ -1009,9 +1107,103 @@ impl DecoderLayer {
             w1: PtrLen::bf16(self.mlp.gate_proj.weight())?.addr() as *const u16,
             w3: PtrLen::bf16(self.mlp.up_proj.weight())?.addr() as *const u16,
             w2: PtrLen::bf16(self.mlp.down_proj.weight())?.addr() as *const u16,
+            ..LayerDesc::attn_placeholder()
         };
         held.push(w2d);
         Some(desc)
+    }
+
+    /// The whole attention layer (attention + MLP) in ONE native doorbell. The
+    /// engine replicates the GROUPED decode path (ulp tier), so this only runs when
+    /// `grouped_gqa_decode` is on — the reference chain keeps the candle path.
+    /// `Ok(None)` = unserved (caller keeps the existing mixed path, bit-identical).
+    fn native_attn_layer(
+        &self,
+        x: &Tensor,
+        attn: &Attention,
+        index_pos: usize,
+        block_idx: usize,
+        cache: &mut Cache,
+    ) -> Result<Option<Tensor>> {
+        let Some(engine) = crate::flashkern::native_engine::process_engine() else {
+            return Ok(None);
+        };
+        if !(cache.grouped_gqa_decode
+            && cache.use_kv_cache
+            && x.device().is_cpu()
+            && x.dtype() == DType::BF16
+            && x.dims3().map(|(b, s, _)| b * s == 1).unwrap_or(false)
+            && crate::bf16_gemm::bf16_gemm_nt_available())
+        {
+            return Ok(None);
+        }
+        let hdim = x.dim(2)?;
+        let (n_kv, hd) = (attn.n_kv, attn.head_dim);
+        // Grow BEFORE capturing plane pointers — growth reallocates the planes.
+        cache.ensure_kv_capacity(block_idx, 1, n_kv, hd, index_pos + 1, x.dtype(), x.device())?;
+        let Some(sl) = cache.kvs[block_idx].as_ref() else {
+            return Ok(None);
+        };
+        if sl.len != index_pos {
+            return Ok(None); // cursor out of step — let the candle path sort it out
+        }
+        let cap = sl.k.dim(2)?;
+        let head_stride = cap * hd;
+
+        let x = x.contiguous()?;
+        let (xs, xl) = x.storage_and_layout();
+        let (ks, kl) = sl.k.storage_and_layout();
+        let (vs, vl) = sl.v.storage_and_layout();
+        let (cs, cl) = cache.cos.storage_and_layout();
+        let (ss, sl2) = cache.sin.storage_and_layout();
+        let bits = |g: &std::sync::RwLockReadGuard<'_, candle_core::Storage>,
+                    l: &candle_core::Layout|
+         -> Option<*const u16> {
+            match &**g {
+                candle_core::Storage::Cpu(candle_core::CpuStorage::BF16(v)) => {
+                    let (a, b) = l.contiguous_offsets()?;
+                    Some(v[a..b].as_ptr() as *const u16)
+                }
+                _ => None,
+            }
+        };
+        let (Some(xp), Some(kp), Some(vp), Some(cp), Some(sp)) = (
+            bits(&xs, xl),
+            bits(&ks, kl),
+            bits(&vs, vl),
+            bits(&cs, cl),
+            bits(&ss, sl2),
+        ) else {
+            return Ok(None);
+        };
+        // SAFETY (plane mutation): the engine writes this step's K/V rows at the
+        // cursor through these pointers — the same in-place storage mutation candle's
+        // own `slice_set` performs through `&Tensor` (append_kv's mechanism). Decode
+        // is sequential and this thread blocks for the pass's duration while holding
+        // the storage guards: no other reader or writer exists.
+        let (kp, vp) = (kp as *mut u16, vp as *mut u16);
+        let xb = unsafe { std::slice::from_raw_parts(xp, hdim) };
+        let mut out = vec![0u16; hdim];
+        let lanes = rayon::current_num_threads().max(1);
+        let ok = engine.attn_layer(
+            block_idx,
+            xb,
+            kp,
+            vp,
+            head_stride,
+            index_pos,
+            cp,
+            sp,
+            &mut out,
+            lanes,
+        );
+        drop((xs, ks, vs, cs, ss));
+        if !ok {
+            return Ok(None);
+        }
+        cache.advance_kv_cursor(block_idx);
+        let out: Vec<half::bf16> = out.iter().map(|&b| half::bf16::from_bits(b)).collect();
+        Ok(Some(Tensor::from_vec(out, (1, 1, hdim), x.device())?))
     }
 
     /// The whole conv layer (shortconv + MLP) in ONE native doorbell — bit-identical
@@ -1102,7 +1294,7 @@ impl Model {
             all(target_arch = "x86_64", has_flashkern_x86)
         )
     ))]
-    pub fn install_native_ctx(&mut self) {
+    pub fn install_native_ctx(&mut self, max_ctx: usize) {
         if self.native_ctx.is_some() {
             return;
         }
@@ -1133,8 +1325,9 @@ impl Model {
         if h == 0 || ffn == 0 {
             return;
         }
-        self.native_ctx =
-            crate::flashkern::native_engine::install_backbone_ctx(&descs, h, ffn, held);
+        self.native_ctx = crate::flashkern::native_engine::install_backbone_ctx(
+            &descs, h, ffn, max_ctx, held,
+        );
     }
 
     #[cfg(not(all(
@@ -1145,7 +1338,7 @@ impl Model {
             all(target_arch = "x86_64", has_flashkern_x86)
         )
     )))]
-    pub fn install_native_ctx(&mut self) {}
+    pub fn install_native_ctx(&mut self, _max_ctx: usize) {}
 
     pub fn new(cfg: &Lfm2Config, vb: VarBuilder) -> Result<Self> {
         // `lfm` is a bare HF `Lfm2Model` (not `Lfm2ForCausalLM`), so weights sit

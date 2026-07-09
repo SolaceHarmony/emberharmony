@@ -461,7 +461,7 @@ impl LFM2AudioModel {
         }
         // Resident native-engine layer table (same capture contract as depth_flash:
         // Arc-heap storages, guard clears before the weights drop).
-        model.lfm.install_native_ctx();
+        model.lfm.install_native_ctx(model.lfm_cfg.max_position_embeddings);
         Ok(model)
     }
 

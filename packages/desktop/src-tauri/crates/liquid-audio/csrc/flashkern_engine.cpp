@@ -48,6 +48,12 @@ extern "C" void lfm_bf16_add(const uint16_t *a, const uint16_t *b, uint16_t *out
 extern "C" void lfm_conv1d_update_bf16(const uint16_t *bcx, const uint16_t *state,
                                        const uint16_t *w, uint16_t *out, int bn, int d,
                                        int t, int k);
+extern "C" void lfm_bf16_to_f32(const uint16_t *x, float *out, int n);
+extern "C" void lfm_softmax_scaled_f32(float *x, int n, float scale);
+extern "C" void lfm_attn_qk_bf16(const float *q, const uint16_t *k, float *att, int len,
+                                 int hd);
+extern "C" void lfm_attn_av_bf16(const float *att, const uint16_t *v, float *out,
+                                 int len, int hd);
 
 namespace {
 
@@ -98,6 +104,10 @@ enum : uint32_t {
     ST_SC_INPROJ = 6,  // in_proj rows band: nt + f32→bf16 round
     ST_SC_GATHER = 7,  // y gather ([c][0]) + carried-state copy ([c][1..K]) band
     ST_SC_OUTPROJ = 8, // out_proj rows band: nt + round + residual add
+    // Attention block stages (attn_decode_bf16 + its candle wrapper ops, ported).
+    ST_AT_QKV = 9,    // q|k|v projection rows band (3-segment routing) + round
+    ST_AT_HEAD = 10,  // one q head: qk dots over the K plane, softmax, av, round
+    ST_AT_OPROJ = 11, // o_proj rows band (k = nh·hd) + round + residual add
 };
 
 struct Stage {
@@ -109,7 +119,13 @@ struct Stage {
     uint32_t chunk = 0;                // band width for GATEUP/DOWN
 };
 
-enum : int { REQ_NONE = 0, REQ_MLP = 1, REQ_CONV_LAYER = 2, REQ_SHUTDOWN = -1 };
+enum : int {
+    REQ_NONE = 0,
+    REQ_MLP = 1,
+    REQ_CONV_LAYER = 2,
+    REQ_ATTN_LAYER = 3,
+    REQ_SHUTDOWN = -1
+};
 
 // ---- the resident layer table (C ABI) ------------------------------------------------
 // One entry per backbone block, indexed by block_idx. Pointers are PtrLen-style
@@ -118,7 +134,7 @@ enum : int { REQ_NONE = 0, REQ_MLP = 1, REQ_CONV_LAYER = 2, REQ_SHUTDOWN = -1 };
 // Rust-side guard). Rung 1 serves conv layers (kind 0); attention slots (kind 1) are
 // placeholders until rung 2.
 extern "C" {
-struct LfmConvLayerDesc {
+struct LfmLayerDesc {
     uint32_t kind; // 0 = shortconv+mlp, 1 = attention (unserved this rung)
     uint32_t k;    // conv kernel size
     float op_eps;
@@ -131,6 +147,18 @@ struct LfmConvLayerDesc {
     const uint16_t *w1;         // [I, H]
     const uint16_t *w3;         // [I, H]
     const uint16_t *w2;         // [H, I]
+    // Attention fields (kind 1). q_w == NULL means "attention not served for this
+    // slot" (capture failed at install): conv layers still run; attn requests bail.
+    uint32_t n_head;
+    uint32_t n_kv;
+    uint32_t hd;
+    float qk_eps;
+    const uint16_t *q_w;  // [nh·hd, H]
+    const uint16_t *k_w;  // [nkv·hd, H]
+    const uint16_t *v_w;  // [nkv·hd, H]
+    const uint16_t *o_w;  // [H, nh·hd]
+    const uint16_t *qn_w; // [hd] per-head q RmsNorm
+    const uint16_t *kn_w; // [hd]
 };
 }
 
@@ -165,6 +193,37 @@ struct ScPass {
     std::atomic<uint32_t> rs_bits{0};
 };
 
+// Attention-layer request: per-generation state (KV planes, rope tables, cursor)
+// rides HERE — it lives in the per-cache objects, not the load-time table. The engine
+// appends the step's K/V rows at `pos` and attends over pos+1 entries.
+struct AttnReq {
+    size_t layer = 0;
+    const uint16_t *x = nullptr;
+    uint16_t *k_plane = nullptr; // [n_kv, cap, hd] bf16 bits, head stride = cap·hd
+    uint16_t *v_plane = nullptr;
+    size_t head_stride = 0;
+    size_t pos = 0; // cursor: rows 0..pos live; this step appends row `pos`
+    const uint16_t *cos_base = nullptr; // [max_pos, hd/2] bf16
+    const uint16_t *sin_base = nullptr;
+    uint16_t *out = nullptr;
+    size_t lanes = 0;
+};
+
+// Attention stage pointers for the workers.
+struct AtPass {
+    const uint16_t *o_w = nullptr; // [H, nh·hd]
+    uint16_t *qkvb = nullptr;      // rounded q|k|v rows [(nh+2·nkv)·hd]
+    float *qkvf = nullptr;
+    uint16_t *ybits = nullptr;     // attention output per q head [nh·hd]
+    float *att = nullptr;          // per-head score scratch [nh · max_ctx]
+    const uint16_t *x = nullptr;   // residual input [H]
+    uint16_t *mid = nullptr;       // block output = MLP input [H]
+    const uint16_t *k_plane = nullptr;
+    const uint16_t *v_plane = nullptr;
+    size_t head_stride = 0, att_len = 0, max_ctx = 0;
+    size_t h = 0, n_head = 0, n_kv = 0, hd = 0;
+};
+
 struct Engine {
     Pass pass;
     Stage stage;
@@ -182,10 +241,12 @@ struct Engine {
     int finished = 0;
 
     ConvReq conv;  // conv-layer request payload
+    AttnReq attn;  // attention-layer request payload
     ScPass sc;     // shortconv stage pointers
+    AtPass at;     // attention stage pointers
 
     // Resident layer table + dims (lfm_ctx_build); cleared before model drop.
-    std::vector<LfmConvLayerDesc> layers;
+    std::vector<LfmLayerDesc> layers;
     size_t dim_h = 0, dim_ffn = 0, dim_kmax = 0;
     std::atomic<bool> ctx_live{false};
 
@@ -197,6 +258,11 @@ struct Engine {
     // shortconv planes (ctx build): see ScPass.
     std::vector<float> sc_bcxf, sc_projf;
     std::vector<uint16_t> sc_bcxb, sc_conv, sc_projb, sc_stage, sc_mid;
+    // attention planes (ctx build): qkv f32/bits [(nh+2·nkv)·hd], y bits [nh·hd],
+    // per-head score scratch [nh · max_ctx] f32
+    std::vector<float> at_qkvf, at_att;
+    std::vector<uint16_t> at_qkvb, at_y;
+    size_t dim_maxctx = 0, dim_nh = 0, dim_nkv = 0, dim_hd = 0;
 };
 
 // ---- tile bodies (identical math to decode.rs) ----------------------------------------
@@ -299,6 +365,80 @@ static void run_tile(uint32_t kind, uint32_t idx, const Stage *st, Engine *e) {
         lfm_bf16_add(c->stage + r0, c->x + r0, c->mid + r0, (int)(r1 - r0));
         break;
     }
+    case ST_AT_QKV: {
+        // One band over the concatenated q|k|v projection row space; segments route to
+        // their own weight matrices. Each row is the same linear_forward ladder the
+        // candle path runs: nt dot (f32) then one bf16 storage round.
+        AtPass *a = &e->at;
+        const LfmLayerDesc *d = &e->layers[e->attn.layer];
+        size_t qrows = a->n_head * a->hd, kvrows = a->n_kv * a->hd;
+        size_t total = qrows + 2 * kvrows;
+        size_t r0 = (size_t)idx * st->chunk;
+        size_t r1 = r0 + st->chunk < total ? r0 + st->chunk : total;
+        size_t r = r0;
+        while (r < r1) {
+            const uint16_t *w;
+            size_t seg0, seglen;
+            if (r < qrows) {
+                w = d->q_w;
+                seg0 = 0;
+                seglen = qrows;
+            } else if (r < qrows + kvrows) {
+                w = d->k_w;
+                seg0 = qrows;
+                seglen = kvrows;
+            } else {
+                w = d->v_w;
+                seg0 = qrows + kvrows;
+                seglen = kvrows;
+            }
+            size_t seg_end = seg0 + seglen;
+            size_t stop = r1 < seg_end ? r1 : seg_end;
+            lfm_bf16_gemm_nt_f32(e->sc_xn.data(), w + (r - seg0) * a->h, a->qkvf + r, 1,
+                                 (int)(stop - r), (int)a->h);
+            lfm_f32_to_bf16(a->qkvf + r, a->qkvb + r, (int)(stop - r));
+            r = stop;
+        }
+        break;
+    }
+    case ST_AT_HEAD: {
+        // One q head, exactly attn_decode_bf16's per-head body: widen q, dots over the
+        // K plane (grouped kv head), scaled softmax, weighted V sum, one round out.
+        AtPass *a = &e->at;
+        size_t qh = idx;
+        if (qh >= a->n_head) break;
+        size_t group = a->n_head / a->n_kv;
+        size_t kh = qh / group;
+        float scale = 1.0f / std::sqrt((float)a->hd);
+        float qf[512]; // hd cap (hd = 64 on this family; 512 is generous)
+        lfm_bf16_to_f32(a->qkvb + qh * a->hd, qf, (int)a->hd);
+        float *att = a->att + qh * a->max_ctx;
+        lfm_attn_qk_bf16(qf, a->k_plane + kh * a->head_stride, att, (int)a->att_len,
+                         (int)a->hd);
+        lfm_softmax_scaled_f32(att, (int)a->att_len, scale);
+        float of[512];
+        lfm_attn_av_bf16(att, a->v_plane + kh * a->head_stride, of, (int)a->att_len,
+                         (int)a->hd);
+        lfm_f32_to_bf16(of, a->ybits + qh * a->hd, (int)a->hd);
+        break;
+    }
+    case ST_AT_OPROJ: {
+        // o_proj rows band over the attention output, then rb(+residual) — the same
+        // ladder the candle path's linear_forward + residual add runs.
+        AtPass *a = &e->at;
+        size_t r0 = (size_t)idx * st->chunk;
+        size_t r1 = r0 + st->chunk < a->h ? r0 + st->chunk : a->h;
+        if (r1 <= r0) break;
+        size_t kdim = a->n_head * a->hd;
+        float yf[DOWN_BAND_CAP];
+        (void)yf;
+        ScPass *c = &e->sc; // reuse projf/stage planes (conv pass is never concurrent)
+        lfm_bf16_gemm_nt_f32(a->ybits, a->o_w + r0 * kdim, c->projf + r0, 1,
+                             (int)(r1 - r0), (int)kdim);
+        lfm_f32_to_bf16(c->projf + r0, c->stage + r0, (int)(r1 - r0));
+        lfm_bf16_add(c->stage + r0, a->x + r0, a->mid + r0, (int)(r1 - r0));
+        break;
+    }
     default:
         break;
     }
@@ -382,7 +522,7 @@ static void run_mlp(Engine *e) {
 // the conv output as its input — all without leaving the engine.
 static void run_conv_layer(Engine *e) {
     const ConvReq *r = &e->conv;
-    const LfmConvLayerDesc *d = &e->layers[r->layer];
+    const LfmLayerDesc *d = &e->layers[r->layer];
     ScPass *c = &e->sc;
     const size_t h = e->dim_h;
 
@@ -445,7 +585,151 @@ static void run_conv_layer(Engine *e) {
     m->eps = d->ffn_eps;
     m->tiles = lanes > cap ? cap : lanes;
     m->partials = e->sc_partials.data();
-    m->xn = e->sc_xn.data(); // xn reuse after the conv block is done with it
+    // xn reuse: SEQUENTIAL dependency — the MLP block must not start until
+    // ST_SC_OUTPROJ drains (wait_stage_done above). Pipelining these blocks would
+    // corrupt the plane.
+    m->xn = e->sc_xn.data();
+    m->gu = e->sc_gu.data();
+    m->t = e->sc_t.data();
+    m->rs_bits.store(0, std::memory_order_relaxed);
+    run_mlp(e);
+}
+
+// Serial per-head helpers for the attention pass (tiny next to the GEMVs; the
+// reference computes these as whole-tensor candle ops — the math below is the exact
+// per-element ladder those ops perform).
+
+// candle RmsNorm::forward over one head row: ALL f32 arithmetic (upcast, mean via the
+// candle-order sum, +eps, sqrt, recip, muls), ONE bf16 storage round at the end.
+static void qk_norm_row(const uint16_t *x, const uint16_t *w, uint16_t *out, size_t hd,
+                        float eps) {
+    float total = lfm_bf16_sumsq_candle_f32(x, (int)hd);
+    float inv = 1.0f / std::sqrt(total / (float)hd + eps);
+    for (size_t j = 0; j < hd; ++j) {
+        out[j] = rb_bits(bf16_f32(x[j]) * inv * bf16_f32(w[j]));
+    }
+}
+
+// candle rotary_emb::rope_slow over one head row, NeoX half-split, computed in bf16
+// exactly as the tensor ops do: cos2 = [cos|cos], out = x⊙cos2 + rotate_half(x)⊙sin2,
+// where every bf16 multiply and the add each round once (half-crate semantics:
+// f32 compute, RNE back to bf16). rotate_half = [-x2 | x1]; negation is exact.
+static void rope_slow_row(uint16_t *x, const uint16_t *cos_row, const uint16_t *sin_row,
+                          size_t hd) {
+    size_t half = hd / 2;
+    // In-place needs the original bits of both halves for the cross terms.
+    uint16_t orig[512];
+    std::memcpy(orig, x, hd * sizeof(uint16_t));
+    for (size_t j = 0; j < half; ++j) {
+        float c = bf16_f32(cos_row[j]);
+        float sn = bf16_f32(sin_row[j]);
+        // j < half: rotate_half[j] = -x[j+half]
+        float p1 = bf16_f32(rb_bits(bf16_f32(orig[j]) * c));
+        float p2 = bf16_f32(rb_bits(-bf16_f32(orig[j + half]) * sn));
+        x[j] = rb_bits(p1 + p2);
+        // j + half: cos2/sin2 reuse row [j]; rotate_half[j+half] = x[j]
+        float q1 = bf16_f32(rb_bits(bf16_f32(orig[j + half]) * c));
+        float q2 = bf16_f32(rb_bits(bf16_f32(orig[j]) * sn));
+        x[j + half] = rb_bits(q1 + q2);
+    }
+}
+
+// One whole attention+MLP layer. Stage bodies are the candle wrapper ops and
+// attn_decode_bf16 ported at the same rounding points; the serial section (qk-norm,
+// rope, KV append) is per-head work two orders of magnitude below the GEMVs.
+static void run_attn_layer(Engine *e) {
+    const AttnReq *r = &e->attn;
+    const LfmLayerDesc *d = &e->layers[r->layer];
+    ScPass *c = &e->sc;
+    AtPass *a = &e->at;
+    const size_t h = e->dim_h;
+    const size_t nh = d->n_head, nkv = d->n_kv, hd = d->hd;
+    size_t lanes = r->lanes < 1 ? 1 : r->lanes;
+    uint32_t tiles = (uint32_t)(lanes > h ? h : lanes);
+
+    // Wire stage pointers. The conv pass planes are reused where shapes allow — a
+    // single request is in flight at a time, never both kinds at once.
+    c->x = r->x;
+    c->norm_w = d->op_norm_w;
+    c->h = h;
+    c->xn = e->sc_xn.data();
+    c->projf = e->sc_projf.data(); // ST_AT_OPROJ reuses the conv pass's proj planes
+    c->stage = e->sc_stage.data();
+    a->o_w = d->o_w;
+    a->qkvf = e->at_qkvf.data();
+    a->qkvb = e->at_qkvb.data();
+    a->ybits = e->at_y.data();
+    a->att = e->at_att.data();
+    a->x = r->x;
+    a->mid = e->sc_mid.data();
+    a->k_plane = r->k_plane;
+    a->v_plane = r->v_plane;
+    a->head_stride = r->head_stride;
+    a->att_len = r->pos + 1;
+    a->max_ctx = e->dim_maxctx;
+    a->h = h;
+    a->n_head = nh;
+    a->n_kv = nkv;
+    a->hd = hd;
+
+    // operator norm: candle-order sumsq (serial) + banded norm apply.
+    float total = lfm_bf16_sumsq_candle_f32(r->x, (int)h);
+    float inv_rms = 1.0f / std::sqrt(total / (float)h + d->op_eps);
+    uint32_t rsb;
+    std::memcpy(&rsb, &inv_rms, 4);
+    c->rs_bits.store(rsb, std::memory_order_release);
+    uint32_t hc = (uint32_t)((h + tiles - 1) / tiles);
+    publish_stage(e, ST_SC_NORM, (uint32_t)((h + hc - 1) / hc), hc);
+    wait_stage_done(e);
+
+    // q|k|v projections, banded over the concatenated row space.
+    size_t total_rows = (nh + 2 * nkv) * hd;
+    uint32_t qc = (uint32_t)((total_rows + tiles - 1) / tiles);
+    publish_stage(e, ST_AT_QKV, (uint32_t)((total_rows + qc - 1) / qc), qc);
+    wait_stage_done(e);
+
+    // Serial: per-head qk-norm + rope, then append this step's K/V rows at the cursor.
+    const uint16_t *cos_row = r->cos_base + r->pos * (hd / 2);
+    const uint16_t *sin_row = r->sin_base + r->pos * (hd / 2);
+    uint16_t *qrows = a->qkvb;
+    uint16_t *krows = a->qkvb + nh * hd;
+    const uint16_t *vrows = a->qkvb + (nh + nkv) * hd;
+    for (size_t qh = 0; qh < nh; ++qh) {
+        qk_norm_row(qrows + qh * hd, d->qn_w, qrows + qh * hd, hd, d->qk_eps);
+        rope_slow_row(qrows + qh * hd, cos_row, sin_row, hd);
+    }
+    for (size_t kh = 0; kh < nkv; ++kh) {
+        qk_norm_row(krows + kh * hd, d->kn_w, krows + kh * hd, hd, d->qk_eps);
+        rope_slow_row(krows + kh * hd, cos_row, sin_row, hd);
+        std::memcpy(r->k_plane + kh * r->head_stride + r->pos * hd, krows + kh * hd,
+                    hd * sizeof(uint16_t));
+        std::memcpy(r->v_plane + kh * r->head_stride + r->pos * hd, vrows + kh * hd,
+                    hd * sizeof(uint16_t));
+    }
+
+    // Attention: one tile per q head over the (now pos+1)-row planes.
+    publish_stage(e, ST_AT_HEAD, (uint32_t)nh, 1);
+    wait_stage_done(e);
+
+    // o_proj + residual → mid.
+    publish_stage(e, ST_AT_OPROJ, (uint32_t)((h + hc - 1) / hc), hc);
+    wait_stage_done(e);
+
+    // MLP block on the layer's ffn weights: input = mid, output = the request's out.
+    Pass *m = &e->pass;
+    size_t cap = h < e->dim_ffn ? h : e->dim_ffn;
+    m->x = a->mid;
+    m->norm_w = d->ffn_norm_w;
+    m->w1 = d->w1;
+    m->w3 = d->w3;
+    m->w2 = d->w2;
+    m->out = r->out;
+    m->h = h;
+    m->i = e->dim_ffn;
+    m->eps = d->ffn_eps;
+    m->tiles = lanes > cap ? cap : lanes;
+    m->partials = e->sc_partials.data();
+    m->xn = e->sc_xn.data();
     m->gu = e->sc_gu.data();
     m->t = e->sc_t.data();
     m->rs_bits.store(0, std::memory_order_relaxed);
@@ -469,6 +753,7 @@ static void coord_main(void *arg) {
         }
         if (req == REQ_MLP) run_mlp(e);
         if (req == REQ_CONV_LAYER) run_conv_layer(e);
+        if (req == REQ_ATTN_LAYER) run_attn_layer(e);
         // Pass boundary: hand back (signal from coroutine context never blocks).
         pthread_mutex_lock(&e->mu);
         e->finished = 1;
@@ -552,11 +837,20 @@ int lfm_engine_mlp(void *ep, const uint16_t *x, const uint16_t *norm_w,
     // first pass at a given shape sizes it, every later pass is allocation-free).
     // Allocation failure must NOT throw across the extern "C" boundary: report it
     // and let the Rust rim take the bit-identical threadgroup path.
+    // GROW-ONLY: a ctx build (lfm_ctx_build) sizes these planes for the resident
+    // model; a legacy per-call MLP with smaller dims must never shrink them — the
+    // next conv/attention layer pass would write past the shrunken planes.
     try {
-        e->sc_partials.resize(tiles);
-        e->sc_xn.resize(h);
-        e->sc_gu.resize(2 * i);
-        e->sc_t.resize(i);
+        auto grow_f = [](std::vector<float> &v, size_t n) {
+            if (v.size() < n) v.resize(n);
+        };
+        auto grow_u = [](std::vector<uint16_t> &v, size_t n) {
+            if (v.size() < n) v.resize(n);
+        };
+        grow_f(e->sc_partials, tiles);
+        grow_u(e->sc_xn, h);
+        grow_f(e->sc_gu, 2 * i);
+        grow_u(e->sc_t, i);
     } catch (const std::bad_alloc &) {
         return -2;
     }
@@ -596,11 +890,11 @@ int lfm_engine_mlp(void *ep, const uint16_t *x, const uint16_t *norm_w,
 // discipline: after a successful build, conv-layer passes allocate nothing.
 // The Rust rim serializes this against passes (pass_lock); pointers must stay valid
 // until lfm_ctx_clear (the model-side guard guarantees clear-before-drop).
-int lfm_ctx_build(void *ep, const LfmConvLayerDesc *descs, size_t n_layers, size_t h,
-                  size_t ffn) {
+int lfm_ctx_build(void *ep, const LfmLayerDesc *descs, size_t n_layers, size_t h,
+                  size_t ffn, size_t max_ctx) {
     Engine *e = (Engine *)ep;
-    if (!e || !descs || n_layers == 0 || h == 0 || ffn == 0) return -1;
-    size_t kmax = 1;
+    if (!e || !descs || n_layers == 0 || h == 0 || ffn == 0 || max_ctx == 0) return -1;
+    size_t kmax = 1, nh = 0, nkv = 0, hd = 0;
     for (size_t l = 0; l < n_layers; ++l) {
         if (descs[l].kind == 0) {
             if (!descs[l].op_norm_w || !descs[l].ffn_norm_w || !descs[l].in_w ||
@@ -608,6 +902,17 @@ int lfm_ctx_build(void *ep, const LfmConvLayerDesc *descs, size_t n_layers, size
                 !descs[l].w2 || descs[l].k < 1 || descs[l].k > 8)
                 return -1;
             if (descs[l].k > kmax) kmax = descs[l].k;
+        } else if (descs[l].q_w) {
+            // Attention slot with capture: all fields or nothing (q_w NULL = unserved).
+            if (!descs[l].op_norm_w || !descs[l].ffn_norm_w || !descs[l].k_w ||
+                !descs[l].v_w || !descs[l].o_w || !descs[l].qn_w || !descs[l].kn_w ||
+                !descs[l].w1 || !descs[l].w3 || !descs[l].w2 || descs[l].n_head == 0 ||
+                descs[l].n_kv == 0 || descs[l].hd == 0 || descs[l].hd > 512 ||
+                descs[l].n_head % descs[l].n_kv != 0 || descs[l].hd % 2 != 0)
+                return -1;
+            nh = descs[l].n_head;
+            nkv = descs[l].n_kv;
+            hd = descs[l].hd;
         }
     }
     try {
@@ -623,6 +928,12 @@ int lfm_ctx_build(void *ep, const LfmConvLayerDesc *descs, size_t n_layers, size
         e->sc_projb.resize(h);
         e->sc_stage.resize(h);
         e->sc_mid.resize(h);
+        if (nh > 0) {
+            e->at_qkvf.resize((nh + 2 * nkv) * hd);
+            e->at_qkvb.resize((nh + 2 * nkv) * hd);
+            e->at_y.resize(nh * hd);
+            e->at_att.resize(nh * max_ctx);
+        }
     } catch (const std::bad_alloc &) {
         e->layers.clear();
         return -2;
@@ -630,6 +941,10 @@ int lfm_ctx_build(void *ep, const LfmConvLayerDesc *descs, size_t n_layers, size
     e->dim_h = h;
     e->dim_ffn = ffn;
     e->dim_kmax = kmax;
+    e->dim_maxctx = max_ctx;
+    e->dim_nh = nh;
+    e->dim_nkv = nkv;
+    e->dim_hd = hd;
     e->ctx_live.store(true, std::memory_order_release);
     return 0;
 }
@@ -667,6 +982,46 @@ int lfm_engine_conv_layer(void *ep, size_t layer, const uint16_t *x,
     pthread_mutex_unlock(&e->mu);
 
     e->req.store(REQ_CONV_LAYER, std::memory_order_release);
+    kcoro_unpark(e->coord);
+
+    pthread_mutex_lock(&e->mu);
+    while (!e->finished) pthread_cond_wait(&e->cv, &e->mu);
+    pthread_mutex_unlock(&e->mu);
+    return 0;
+}
+
+// One whole attention+MLP layer. Per-generation state (planes, rope tables, cursor)
+// arrives per request; the engine appends the step's K/V rows at `pos` and attends
+// over pos+1 entries. Rows beyond `pos` must already fit the planes (the caller
+// pre-grows capacity BEFORE capturing the plane pointers). Returns 0 on success;
+// -3 when unserved (no ctx / not an attention slot / capture was null / pos over cap).
+int lfm_engine_attn_layer(void *ep, size_t layer, const uint16_t *x, uint16_t *k_plane,
+                          uint16_t *v_plane, size_t head_stride, size_t pos,
+                          const uint16_t *cos_base, const uint16_t *sin_base,
+                          uint16_t *out, size_t lanes) {
+    Engine *e = (Engine *)ep;
+    if (!e || !x || !k_plane || !v_plane || !cos_base || !sin_base || !out) return -1;
+    if (!e->ctx_live.load(std::memory_order_acquire) || layer >= e->layers.size() ||
+        e->layers[layer].kind != 1 || !e->layers[layer].q_w ||
+        pos + 1 > e->dim_maxctx)
+        return -3;
+
+    e->attn.layer = layer;
+    e->attn.x = x;
+    e->attn.k_plane = k_plane;
+    e->attn.v_plane = v_plane;
+    e->attn.head_stride = head_stride;
+    e->attn.pos = pos;
+    e->attn.cos_base = cos_base;
+    e->attn.sin_base = sin_base;
+    e->attn.out = out;
+    e->attn.lanes = lanes < 1 ? 1 : (lanes > MAX_WORKERS ? MAX_WORKERS : lanes);
+
+    pthread_mutex_lock(&e->mu);
+    e->finished = 0;
+    pthread_mutex_unlock(&e->mu);
+
+    e->req.store(REQ_ATTN_LAYER, std::memory_order_release);
     kcoro_unpark(e->coord);
 
     pthread_mutex_lock(&e->mu);

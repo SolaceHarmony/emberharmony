@@ -17,12 +17,12 @@
 use std::ffi::c_void;
 use std::sync::Mutex;
 
-/// Mirror of the C `LfmConvLayerDesc` (flashkern_engine.cpp) — one per backbone block,
+/// Mirror of the C `LfmLayerDesc` (flashkern_engine.cpp) — one per backbone block,
 /// indexed by block_idx. Field order/types must match the C struct exactly.
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct ConvLayerDesc {
-    pub kind: u32, // 0 = shortconv+mlp, 1 = attention (placeholder until rung 2)
+pub struct LayerDesc {
+    pub kind: u32, // 0 = shortconv+mlp, 1 = attention
     pub k: u32,
     pub op_eps: f32,
     pub ffn_eps: f32,
@@ -34,9 +34,20 @@ pub struct ConvLayerDesc {
     pub w1: *const u16,
     pub w3: *const u16,
     pub w2: *const u16,
+    // Attention fields (kind 1); q_w null ⇒ slot unserved (conv layers still run).
+    pub n_head: u32,
+    pub n_kv: u32,
+    pub hd: u32,
+    pub qk_eps: f32,
+    pub q_w: *const u16,
+    pub k_w: *const u16,
+    pub v_w: *const u16,
+    pub o_w: *const u16,
+    pub qn_w: *const u16,
+    pub kn_w: *const u16,
 }
 
-impl ConvLayerDesc {
+impl LayerDesc {
     /// An attention-slot placeholder (kind 1, everything null) — keeps the table
     /// indexed by block_idx.
     pub fn attn_placeholder() -> Self {
@@ -53,6 +64,16 @@ impl ConvLayerDesc {
             w1: std::ptr::null(),
             w3: std::ptr::null(),
             w2: std::ptr::null(),
+            n_head: 0,
+            n_kv: 0,
+            hd: 0,
+            qk_eps: 0.0,
+            q_w: std::ptr::null(),
+            k_w: std::ptr::null(),
+            v_w: std::ptr::null(),
+            o_w: std::ptr::null(),
+            qn_w: std::ptr::null(),
+            kn_w: std::ptr::null(),
         }
     }
 }
@@ -62,10 +83,24 @@ extern "C" {
     fn lfm_engine_free(e: *mut c_void);
     fn lfm_ctx_build(
         e: *mut c_void,
-        descs: *const ConvLayerDesc,
+        descs: *const LayerDesc,
         n_layers: usize,
         h: usize,
         ffn: usize,
+        max_ctx: usize,
+    ) -> i32;
+    fn lfm_engine_attn_layer(
+        e: *mut c_void,
+        layer: usize,
+        x: *const u16,
+        k_plane: *mut u16,
+        v_plane: *mut u16,
+        head_stride: usize,
+        pos: usize,
+        cos_base: *const u16,
+        sin_base: *const u16,
+        out: *mut u16,
+        lanes: usize,
     ) -> i32;
     fn lfm_ctx_clear(e: *mut c_void);
     fn lfm_engine_conv_layer(
@@ -170,10 +205,51 @@ impl NativeEngine {
 impl NativeEngine {
     /// Install the resident backbone layer table. The pointers must stay valid until
     /// [`Self::ctx_clear`] — the [`BackboneCtxGuard`] enforces clear-before-drop.
-    fn ctx_build(&self, descs: &[ConvLayerDesc], h: usize, ffn: usize) -> bool {
+    fn ctx_build(&self, descs: &[LayerDesc], h: usize, ffn: usize, max_ctx: usize) -> bool {
         let _pass = self.pass_lock.lock().unwrap();
         // SAFETY: descs copied by the C side before return; dims checked there.
-        let rc = unsafe { lfm_ctx_build(self.ptr, descs.as_ptr(), descs.len(), h, ffn) };
+        let rc =
+            unsafe { lfm_ctx_build(self.ptr, descs.as_ptr(), descs.len(), h, ffn, max_ctx) };
+        rc == 0
+    }
+
+    /// One whole attention+MLP layer in a single doorbell. The engine appends the
+    /// step's K/V rows at `pos` into the caller's planes (capacity pre-grown by the
+    /// caller) and attends over pos+1 entries. Caller advances its cursor on success.
+    #[must_use = "false = native pass did not run; caller must take the fallback"]
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_layer(
+        &self,
+        layer: usize,
+        x: &[u16],
+        k_plane: *mut u16,
+        v_plane: *mut u16,
+        head_stride: usize,
+        pos: usize,
+        cos_base: *const u16,
+        sin_base: *const u16,
+        out: &mut [u16],
+        lanes: usize,
+    ) -> bool {
+        assert_eq!(out.len(), x.len(), "native attn_layer: out.len() != H");
+        let _pass = self.pass_lock.lock().unwrap();
+        // SAFETY: plane/table pointers are captured from live storages held across this
+        // blocking call; rows 0..=pos fit the pre-grown capacity by the caller's gate.
+        let rc = unsafe {
+            lfm_engine_attn_layer(
+                self.ptr,
+                layer,
+                x.as_ptr(),
+                k_plane,
+                v_plane,
+                head_stride,
+                pos,
+                cos_base,
+                sin_base,
+                out.as_mut_ptr(),
+                lanes,
+            )
+        };
         rc == 0
     }
 
@@ -241,13 +317,14 @@ impl Drop for BackboneCtxGuard {
 /// the MODEL must own (declared before its weight fields so it drops first), or `None`
 /// when the engine is unavailable or the build fails — callers keep the per-block path.
 pub fn install_backbone_ctx(
-    descs: &[ConvLayerDesc],
+    descs: &[LayerDesc],
     h: usize,
     ffn: usize,
+    max_ctx: usize,
     held: Vec<candle_core::Tensor>,
 ) -> Option<BackboneCtxGuard> {
     let engine = process_engine()?;
-    if engine.ctx_build(descs, h, ffn) {
+    if engine.ctx_build(descs, h, ffn, max_ctx) {
         Some(BackboneCtxGuard { _held: held })
     } else {
         None
@@ -287,8 +364,222 @@ pub fn process_engine() -> Option<&'static NativeEngine> {
 mod tests {
     use super::*;
 
+    // The process engine holds ONE resident layer table; tests that build/clear it
+    // must not interleave. (Each individual call is pass_lock-serialized; this guards
+    // the build→use→clear SEQUENCE.)
+    static CTX_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn native_engine_attn_layer_bit_parity() {
+        let _ctx = CTX_TEST_LOCK.lock().unwrap();
+        use candle_core::{DType, Device, Tensor, D};
+        use half::bf16;
+        if !crate::flashkern::decode::fused_mlp_available() {
+            eprintln!("fused kernels unavailable — skipping");
+            return;
+        }
+        let Some(engine) = process_engine() else {
+            eprintln!("native engine init failed — skipping");
+            return;
+        };
+        let dev = Device::Cpu;
+        let (h, nh, nkv, hd, ffn, max_pos) = (256usize, 4usize, 2usize, 64usize, 512usize, 64usize);
+        let pos = 3usize; // three rows already resident; this step appends row 3
+        let cap = 8usize;
+        let rnd = |i: usize, seed: usize| -> f32 {
+            (((i.wrapping_mul(2654435761).wrapping_add(seed)) % 2000) as f32 / 1000.0) - 1.0
+        };
+        let bf = |v: Vec<f32>, shape: Vec<usize>| -> Tensor {
+            Tensor::from_vec(v, shape, &dev).unwrap().to_dtype(DType::BF16).unwrap()
+        };
+        let mk = |n: usize, seed: usize| -> Vec<f32> { (0..n).map(|j| rnd(j, seed)).collect() };
+
+        // Weights (bf16 tensors — the engine captures their storages).
+        let op_norm = bf(mk(h, 1), vec![h]);
+        let ffn_norm = bf(mk(h, 2), vec![h]);
+        let q_w = bf(mk(nh * hd * h, 3), vec![nh * hd, h]);
+        let k_w = bf(mk(nkv * hd * h, 4), vec![nkv * hd, h]);
+        let v_w = bf(mk(nkv * hd * h, 5), vec![nkv * hd, h]);
+        let o_w = bf(mk(h * nh * hd, 6), vec![h, nh * hd]);
+        let qn_w = bf(mk(hd, 7), vec![hd]);
+        let kn_w = bf(mk(hd, 8), vec![hd]);
+        let w1 = bf(mk(ffn * h, 9), vec![ffn, h]);
+        let w3 = bf(mk(ffn * h, 10), vec![ffn, h]);
+        let w2 = bf(mk(h * ffn, 11), vec![h, ffn]);
+        // rope tables [max_pos, hd/2] bf16 (both sides share the same tables).
+        let angles: Vec<f32> = (0..max_pos * hd / 2).map(|j| rnd(j, 12) * 3.0).collect();
+        let cos = bf(angles.iter().map(|a| a.cos()).collect(), vec![max_pos, hd / 2]);
+        let sin = bf(angles.iter().map(|a| a.sin()).collect(), vec![max_pos, hd / 2]);
+        // input + pre-existing plane rows
+        let x = bf(mk(h, 13), vec![1, 1, h]);
+        let mut kplane_init = vec![0f32; nkv * cap * hd];
+        let mut vplane_init = vec![0f32; nkv * cap * hd];
+        for kh in 0..nkv {
+            for r in 0..pos {
+                for j in 0..hd {
+                    kplane_init[kh * cap * hd + r * hd + j] = rnd(kh * 131 + r * 17 + j, 14);
+                    vplane_init[kh * cap * hd + r * hd + j] = rnd(kh * 131 + r * 17 + j, 15);
+                }
+            }
+        }
+        let k_plane_ref = bf(kplane_init.clone(), vec![1, nkv, cap, hd]);
+        let v_plane_ref = bf(vplane_init.clone(), vec![1, nkv, cap, hd]);
+        let k_plane_eng = bf(kplane_init, vec![1, nkv, cap, hd]);
+        let v_plane_eng = bf(vplane_init, vec![1, nkv, cap, hd]);
+
+        let bits_of = |t: &Tensor| -> Vec<u16> {
+            t.flatten_all()
+                .unwrap()
+                .to_vec1::<bf16>()
+                .unwrap()
+                .iter()
+                .map(|b| b.to_bits())
+                .collect()
+        };
+
+        // ---- Reference: the exact op sequence Attention::forward runs on the live
+        // mixed path (candle wrappers + attn_decode_bf16 core + fused MLP block). ----
+        let rms = |t: &Tensor, w: &Tensor, eps: f64| -> Tensor {
+            let tf = t.to_dtype(DType::F32).unwrap();
+            let mean_sq = tf.sqr().unwrap().mean_keepdim(D::Minus1).unwrap();
+            let rsqrt = (mean_sq + eps).unwrap().sqrt().unwrap().recip().unwrap();
+            let normed = tf.broadcast_mul(&rsqrt).unwrap();
+            normed
+                .broadcast_mul(&w.to_dtype(DType::F32).unwrap())
+                .unwrap()
+                .to_dtype(DType::BF16)
+                .unwrap()
+        };
+        let linear = |wt: &Tensor, t: &Tensor| -> Tensor {
+            crate::model::linear::linear_forward(&candle_nn::Linear::new(wt.clone(), None), t)
+                .unwrap()
+        };
+        let xn = rms(&x, &op_norm, 1e-5);
+        let q = linear(&q_w, &xn)
+            .reshape((1, 1, nh, hd))
+            .unwrap()
+            .transpose(1, 2)
+            .unwrap();
+        let kk = linear(&k_w, &xn)
+            .reshape((1, 1, nkv, hd))
+            .unwrap()
+            .transpose(1, 2)
+            .unwrap();
+        let vv = linear(&v_w, &xn)
+            .reshape((1, 1, nkv, hd))
+            .unwrap()
+            .transpose(1, 2)
+            .unwrap()
+            .contiguous()
+            .unwrap();
+        let q = rms(&q.contiguous().unwrap(), &qn_w, 1e-5);
+        let kk = rms(&kk.contiguous().unwrap(), &kn_w, 1e-5);
+        let cos_row = cos.narrow(0, pos, 1).unwrap();
+        let sin_row = sin.narrow(0, pos, 1).unwrap();
+        let q = candle_nn::rotary_emb::rope_slow(&q.contiguous().unwrap(), &cos_row, &sin_row)
+            .unwrap();
+        let kk = candle_nn::rotary_emb::rope_slow(&kk.contiguous().unwrap(), &cos_row, &sin_row)
+            .unwrap();
+        // append at cursor (slice_set — the append_kv mechanism)
+        k_plane_ref.slice_set(&kk, 2, pos).unwrap();
+        v_plane_ref.slice_set(&vv, 2, pos).unwrap();
+        // attention core over the planes
+        let q_bits = bits_of(&q);
+        let kp_ref = bits_of(&k_plane_ref);
+        let vp_ref = bits_of(&v_plane_ref);
+        let mut y_bits = vec![0u16; nh * hd];
+        unsafe {
+            crate::flashkern::decode::attn_decode_bf16(
+                &q_bits,
+                kp_ref.as_ptr(),
+                vp_ref.as_ptr(),
+                cap * hd,
+                pos + 1,
+                nh,
+                nkv,
+                hd,
+                &mut y_bits,
+            );
+        }
+        let y = Tensor::from_vec(
+            y_bits.iter().map(|&b| bf16::from_bits(b)).collect::<Vec<_>>(),
+            (1, nh, 1, hd),
+            &dev,
+        )
+        .unwrap();
+        let y = y
+            .transpose(1, 2)
+            .unwrap()
+            .reshape((1, 1, nh * hd))
+            .unwrap();
+        let attn_out = linear(&o_w, &y);
+        let mid = (attn_out + &x).unwrap();
+        // MLP block (the engine's MLP is already parity-pinned to this)
+        let mid_bits = bits_of(&mid);
+        let mlpw = crate::flashkern::decode::FusedMlpWeights {
+            norm_w: &bits_of(&ffn_norm),
+            w1: &bits_of(&w1),
+            w3: &bits_of(&w3),
+            w2: &bits_of(&w2),
+            eps: 1e-5,
+        };
+        let lanes = 8usize;
+        let mut out_ref = vec![0u16; h];
+        crate::flashkern::decode::fused_mlp_decode(&mid_bits, &mlpw, &mut out_ref, lanes);
+
+        // ---- Engine: install the table, run the layer, compare bits. ----
+        use crate::flashkern::decode::PtrLen;
+        let cap_ptr = |t: &Tensor| PtrLen::bf16(t).unwrap().addr() as *const u16;
+        let descs = [LayerDesc {
+            kind: 1,
+            op_eps: 1e-5,
+            ffn_eps: 1e-5,
+            op_norm_w: cap_ptr(&op_norm),
+            ffn_norm_w: cap_ptr(&ffn_norm),
+            w1: cap_ptr(&w1),
+            w3: cap_ptr(&w3),
+            w2: cap_ptr(&w2),
+            n_head: nh as u32,
+            n_kv: nkv as u32,
+            hd: hd as u32,
+            qk_eps: 1e-5,
+            q_w: cap_ptr(&q_w),
+            k_w: cap_ptr(&k_w),
+            v_w: cap_ptr(&v_w),
+            o_w: cap_ptr(&o_w),
+            qn_w: cap_ptr(&qn_w),
+            kn_w: cap_ptr(&kn_w),
+            ..LayerDesc::attn_placeholder()
+        }];
+        assert!(engine.ctx_build(&descs, h, ffn, max_pos), "ctx build failed");
+        let x_bits = bits_of(&x);
+        let kp_eng = PtrLen::bf16(&k_plane_eng).unwrap().addr() as *mut u16;
+        let vp_eng = PtrLen::bf16(&v_plane_eng).unwrap().addr() as *mut u16;
+        let mut out_got = vec![0u16; h];
+        assert!(
+            engine.attn_layer(
+                0,
+                &x_bits,
+                kp_eng,
+                vp_eng,
+                cap * hd,
+                pos,
+                cap_ptr(&cos),
+                cap_ptr(&sin),
+                &mut out_got,
+                lanes,
+            ),
+            "engine refused attn_layer"
+        );
+        assert_eq!(out_got, out_ref, "layer output");
+        assert_eq!(bits_of(&k_plane_eng), kp_ref, "K plane after append");
+        assert_eq!(bits_of(&v_plane_eng), vp_ref, "V plane after append");
+        engine.ctx_clear();
+    }
+
     #[test]
     fn native_engine_conv_layer_bit_parity() {
+        let _ctx = CTX_TEST_LOCK.lock().unwrap();
         use half::bf16;
         if !crate::flashkern::decode::fused_mlp_available() {
             eprintln!("fused kernels unavailable — skipping");
@@ -319,8 +610,8 @@ mod tests {
 
             // Table with an attention placeholder at 0 so the index path is exercised.
             let descs = [
-                ConvLayerDesc::attn_placeholder(),
-                ConvLayerDesc {
+                LayerDesc::attn_placeholder(),
+                LayerDesc {
                     kind: 0,
                     k: k as u32,
                     op_eps: 1e-5,
@@ -333,9 +624,10 @@ mod tests {
                     w1: w1.as_ptr(),
                     w3: w3.as_ptr(),
                     w2: w2.as_ptr(),
+                    ..LayerDesc::attn_placeholder()
                 },
             ];
-            assert!(engine.ctx_build(&descs, h, i), "ctx build failed");
+            assert!(engine.ctx_build(&descs, h, i, 64), "ctx build failed");
 
             for lanes in [1usize, 3, 8] {
                 // Composed reference: the two fused blocks the layer runs today.
