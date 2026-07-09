@@ -1,4 +1,4 @@
-// NEON "zoo" — a library of aarch64 SIMD procedures that mirror the GPU idioms of the
+// NEON flashkern — a library of aarch64 SIMD procedures that mirror the GPU idioms of the
 // crate's JIT-embedded Metal kernels (experiments/lfm2-audio-voice/candle-flashfftconv),
 // mapping each Metal construct to its closest — deliberately obscure — NEON opcode:
 //
@@ -14,10 +14,10 @@
 //   Metal threadgroup shared memory + barrier + grid dispatch             ->  packed panels + PRFM;
 //                                                                             rayon tiling (Rust side)
 //
-// All entry points are `extern "C"` (flat FFI to src/neon_zoo.rs). C++17 internally for the
+// All entry points are `extern "C"` (flat FFI to src/flashkern/neon.rs). C++17 internally for the
 // double-double struct. Each feature-specific block is confined to a function carrying a
 // per-compiler target attribute so no gated opcode leaks into an ungated function; callers
-// runtime-gate on NeonFeatures (src/neon_zoo.rs). Verified with aarch64-linux-gnu-g++ +
+// runtime-gate on NeonFeatures (src/flashkern/neon.rs). Verified with aarch64-linux-gnu-g++ +
 // qemu-aarch64 -cpu max; ships compiled by build.rs on aarch64 (clang on macOS).
 
 #include <arm_neon.h>
@@ -32,13 +32,13 @@
 // empty. GCC always declares the intrinsics (target-pragma-wrapped in arm_neon.h) and honours
 // a per-function `target("arch=...")`, keeping the base march low and each opcode isolated.
 #if defined(__clang__)
-#define ZOO_TGT_BF16
-#define ZOO_TGT_I8MM
-#define ZOO_TGT_FCMA
+#define FK_TGT_BF16
+#define FK_TGT_I8MM
+#define FK_TGT_FCMA
 #else
-#define ZOO_TGT_BF16 __attribute__((target("arch=armv8.2-a+bf16")))
-#define ZOO_TGT_I8MM __attribute__((target("arch=armv8.2-a+i8mm")))
-#define ZOO_TGT_FCMA __attribute__((target("arch=armv8.3-a")))
+#define FK_TGT_BF16 __attribute__((target("arch=armv8.2-a+bf16")))
+#define FK_TGT_I8MM __attribute__((target("arch=armv8.2-a+i8mm")))
+#define FK_TGT_FCMA __attribute__((target("arch=armv8.3-a")))
 #endif
 
 // bf16 (upper 16 bits of the f32) -> f32, scalar. No dedicated bf16->f32 instruction exists.
@@ -51,7 +51,7 @@ static inline float bf16_to_f32(uint16_t b) {
 
 // f32 -> bf16 *bit pattern* via hardware BFCVT (round-to-nearest-even). Returned as raw
 // uint16_t (not the __bf16 type — assigning __bf16 to uint16_t would convert numerically).
-ZOO_TGT_BF16
+FK_TGT_BF16
 static inline uint16_t f32_to_bf16_bits(float f) {
     bfloat16_t b = vcvth_bf16_f32(f);
     uint16_t u;
@@ -103,7 +103,7 @@ static void pack_b(const bfloat16_t *B, int K, int N, int Np, int Kp, bfloat16_t
     }
 }
 
-ZOO_TGT_BF16
+FK_TGT_BF16
 static void gemm_tiles(const bfloat16_t *Ap, const bfloat16_t *Bp, float *C,
                        int M, int N, int Mp, int Np, int Kp) {
     const int kb = Kp / 4;
@@ -168,32 +168,102 @@ void lfm_bf16_gemv_f32(const uint16_t *A_, const uint16_t *B_, float *C, int N, 
 
 } // extern "C"
 
-ZOO_TGT_BF16
-static void gemv_impl(const bfloat16_t *A, const bfloat16_t *B, float *C, int N, int K) {
-    const int Kp = (K + 7) & ~7;
-    static thread_local std::vector<bfloat16_t> Bt;   // [N][Kp] col-major, zero-padded
-    static thread_local std::vector<bfloat16_t> Aa;   // [Kp] zero-padded copy of A
-    Bt.assign((size_t)N * Kp, (bfloat16_t)0);
-    Aa.assign((size_t)Kp, (bfloat16_t)0);
-    for (int k = 0; k < K; k++) Aa[k] = A[k];
-    for (int n = 0; n < N; n++)
-        for (int k = 0; k < K; k++) Bt[(size_t)n * Kp + k] = B[(size_t)k * N + n];
-    for (int n = 0; n < N; n++) {
-        const bfloat16_t *bcol = Bt.data() + (size_t)n * Kp;
-        float32x4_t acc = vdupq_n_f32(0.0f);
-        for (int k = 0; k < Kp; k += 8) {
-            bfloat16x8_t a8 = vld1q_bf16(Aa.data() + k);
-            bfloat16x8_t b8 = vld1q_bf16(bcol + k);
-            acc = vbfdotq_f32(acc, a8, b8);
+// Row-streaming "axpy" GEMV: for each k the CONTIGUOUS weight row B[k,·] is widened
+// (bf16 = the top 16 bits of the f32, so widen is a shift — baseline NEON, no FEAT_BF16
+// opcode needed) and FMA'd into the f32 accumulator vector C with the broadcast scalar
+// A[k]. B is read exactly once, contiguously, with NO per-call transpose or staging copy.
+//
+// The previous form transposed the whole K×N weight into a thread-local column-major
+// buffer on EVERY call to feed BFDOT — a cache-hostile scalar repack ~100× the cost of the
+// dot products themselves. M==1 is every decode-step matmul, so that repack was the entire
+// CPU decode budget (measured 0.6 GB/s effective; this form is bandwidth-bound).
+// Numerics: bf16 products exact in f32; per-column accumulation ascending k (one FMA
+// rounding per row) — within the kernel's documented summation-order latitude.
+static inline float32x4_t bf16_row_lo(uint16x8_t b) {
+    return vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(b), 16));
+}
+static inline float32x4_t bf16_row_hi(uint16x8_t b) {
+    return vreinterpretq_f32_u32(vshll_high_n_u16(b, 16));
+}
+
+static void gemv_impl(const uint16_t *A, const uint16_t *B, float *C, int N, int K) {
+    memset(C, 0, (size_t)N * sizeof(float));
+    int k = 0;
+    for (; k + 2 <= K; k += 2) { // two rows per pass for ILP on the C read-modify-write
+        const float a0 = bf16_to_f32(A[k]), a1 = bf16_to_f32(A[k + 1]);
+        const uint16_t *r0 = B + (size_t)k * N;
+        const uint16_t *r1 = r0 + N;
+        int n = 0;
+        for (; n + 8 <= N; n += 8) {
+            __builtin_prefetch(r1 + n + 256, 0, 0);
+            float32x4_t c0 = vld1q_f32(C + n), c1 = vld1q_f32(C + n + 4);
+            uint16x8_t b0 = vld1q_u16(r0 + n);
+            c0 = vfmaq_n_f32(c0, bf16_row_lo(b0), a0);
+            c1 = vfmaq_n_f32(c1, bf16_row_hi(b0), a0);
+            uint16x8_t b1 = vld1q_u16(r1 + n);
+            c0 = vfmaq_n_f32(c0, bf16_row_lo(b1), a1);
+            c1 = vfmaq_n_f32(c1, bf16_row_hi(b1), a1);
+            vst1q_f32(C + n, c0);
+            vst1q_f32(C + n + 4, c1);
         }
-        C[n] = vaddvq_f32(acc);
+        for (; n < N; n++) { // same per-column op order as the vector body: k, then k+1
+            float t = fmaf(a0, bf16_to_f32(r0[n]), C[n]);
+            C[n] = fmaf(a1, bf16_to_f32(r1[n]), t);
+        }
+    }
+    if (k < K) { // odd trailing row
+        const float a0 = bf16_to_f32(A[k]);
+        const uint16_t *r0 = B + (size_t)k * N;
+        int n = 0;
+        for (; n + 8 <= N; n += 8) {
+            float32x4_t c0 = vld1q_f32(C + n), c1 = vld1q_f32(C + n + 4);
+            uint16x8_t b0 = vld1q_u16(r0 + n);
+            c0 = vfmaq_n_f32(c0, bf16_row_lo(b0), a0);
+            c1 = vfmaq_n_f32(c1, bf16_row_hi(b0), a0);
+            vst1q_f32(C + n, c0);
+            vst1q_f32(C + n + 4, c1);
+        }
+        for (; n < N; n++) C[n] = fmaf(a0, bf16_to_f32(r0[n]), C[n]);
     }
 }
 
 extern "C" void lfm_bf16_gemv_f32(const uint16_t *A_, const uint16_t *B_, float *C,
                                   int N, int K) {
     if (N <= 0 || K <= 0) return;
-    gemv_impl((const bfloat16_t *)A_, (const bfloat16_t *)B_, C, N, K);
+    gemv_impl(A_, B_, C, N, K);
+}
+
+// Native-layout small-M matmul: C(M,N) f32 = A(M,K) bf16 · W(N,K)ᵀ, with W kept in its
+// checkpoint row-major [N,K] layout — each output C[m][n] is a dot over the CONTIGUOUS row
+// W[n,·], so NO transpose exists anywhere on this path. (The candle-side alternative was
+// `w.t().contiguous()`: a full strided weight copy per linear per call — measured as ~97%
+// of CPU decode time.) Intended for decode-side small M (1 per decode step, ≤4 for suffix
+// chunks); W rows stream once, reused across the M activation rows. Baseline NEON.
+static void gemm_nt_impl(const uint16_t *A, const uint16_t *W, float *C, int M, int N, int K) {
+    for (int n = 0; n < N; n++) {
+        const uint16_t *wr = W + (size_t)n * K;
+        __builtin_prefetch(wr + K, 0, 0);
+        for (int m = 0; m < M; m++) {
+            const uint16_t *ar = A + (size_t)m * K;
+            float32x4_t acc0 = vdupq_n_f32(0.0f), acc1 = vdupq_n_f32(0.0f);
+            int k = 0;
+            for (; k + 8 <= K; k += 8) {
+                uint16x8_t wb = vld1q_u16(wr + k);
+                uint16x8_t ab = vld1q_u16(ar + k);
+                acc0 = vfmaq_f32(acc0, bf16_row_lo(ab), bf16_row_lo(wb));
+                acc1 = vfmaq_f32(acc1, bf16_row_hi(ab), bf16_row_hi(wb));
+            }
+            float acc = vaddvq_f32(vaddq_f32(acc0, acc1));
+            for (; k < K; k++) acc = fmaf(bf16_to_f32(ar[k]), bf16_to_f32(wr[k]), acc);
+            C[(size_t)m * N + n] = acc;
+        }
+    }
+}
+
+extern "C" void lfm_bf16_gemm_nt_f32(const uint16_t *A, const uint16_t *W, float *C,
+                                     int M, int N, int K) {
+    if (M <= 0 || N <= 0 || K <= 0) return;
+    gemm_nt_impl(A, W, C, M, N, K);
 }
 
 // Stretch: int8 tensor-core MAC — same 8×8 idiom via SMMLA, showing the pattern generalizes
@@ -201,7 +271,7 @@ extern "C" void lfm_bf16_gemv_f32(const uint16_t *A_, const uint16_t *B_, float 
 extern "C" void lfm_s8_gemm_s32(const int8_t *A, const int8_t *B, int32_t *C,
                                 int M, int N, int K);
 
-ZOO_TGT_I8MM
+FK_TGT_I8MM
 static void s8_gemm_impl(const int8_t *A, const int8_t *B, int32_t *C, int M, int N, int K) {
     const int Mp = (M + 1) & ~1, Np = (N + 1) & ~1, Kp = (K + 7) & ~7, kb = Kp / 8;
     static thread_local std::vector<int8_t> Ap, Bp;
@@ -285,7 +355,7 @@ extern "C" void lfm_depthwise_causal_conv1d_bf16(const uint16_t *u, const uint16
                                                  const uint16_t *bias, uint16_t *out,
                                                  int Bn, int D, int L, int K, int Lout);
 
-ZOO_TGT_BF16
+FK_TGT_BF16
 static void conv1d_channel(const uint16_t *urow, const uint16_t *wrow, float biasf,
                            uint16_t *orow, int L, int K, int Lout) {
     // interior t in [K-1, min(Lout,L)) has all taps in-bounds -> vectorize 4 outputs at a time
@@ -340,13 +410,13 @@ extern "C" void lfm_depthwise_causal_conv1d_bf16(const uint16_t *u, const uint16
 // =====================================================================================
 
 // single complex multiply a*b via two FCMLA (rot0 then rot90-accumulate)
-ZOO_TGT_FCMA
+FK_TGT_FCMA
 static inline float32x2_t cmul_fcma(float32x2_t a, float32x2_t b) {
     float32x2_t acc = vcmla_f32(vdup_n_f32(0.0f), a, b);
     return vcmla_rot90_f32(acc, a, b);
 }
 
-ZOO_TGT_FCMA
+FK_TGT_FCMA
 static void fft_impl(float *data, int n, int inverse) {
     // bit-reverse permutation
     for (int i = 1, j = 0; i < n; i++) {
@@ -503,4 +573,528 @@ extern "C" void lfm_rsqrt_f32(const float *x, float *out, int n) {
         vst1q_f32(out + i, r);
     }
     for (; i < n; i++) out[i] = 1.0f / sqrtf(x[i]);
+}
+
+// =====================================================================================
+// Group G — flat-grid conv kernels (ComplexMul.metal, Depthwise3.metal, conv1d_update.rs).
+// One thread per output on the GPU -> a plain SIMD loop here (no threadgroup state).
+// =====================================================================================
+
+// Elementwise complex multiply — ComplexMul.metal's FIXED evaluation order, deliberately
+// NO FMA: out = ((ar·br) − (ai·bi), (ar·bi) + (ai·br)), every product and sum rounded
+// separately. vld2q de-interleaves 4 complexes; vmulq/vsubq/vaddq keep the separate
+// roundings (the fused FCMLA path in Group D is exactly what this kernel must NOT use).
+// a/b/out are n interleaved [re,im] pairs.
+extern "C" void lfm_complex_mul_f32(const float *a, const float *b, float *out, int n) {
+    int i = 0;
+    for (; i + 4 <= n; i += 4) {
+        float32x4x2_t av = vld2q_f32(a + 2 * i);
+        float32x4x2_t bv = vld2q_f32(b + 2 * i);
+        float32x4x2_t ov;
+        ov.val[0] = vsubq_f32(vmulq_f32(av.val[0], bv.val[0]), vmulq_f32(av.val[1], bv.val[1]));
+        ov.val[1] = vaddq_f32(vmulq_f32(av.val[0], bv.val[1]), vmulq_f32(av.val[1], bv.val[0]));
+        vst2q_f32(out + 2 * i, ov);
+    }
+    for (; i < n; i++) {
+        float ar = a[2 * i], ai = a[2 * i + 1], br = b[2 * i], bi = b[2 * i + 1];
+        out[2 * i] = (ar * br) - (ai * bi);
+        out[2 * i + 1] = (ar * bi) + (ai * br);
+    }
+}
+
+// Deterministic 3-tap depthwise conv1d — Depthwise3.metal, both window directions, with the
+// kernel's fixed multiply-add order ((x0·w0) + (x1·w1), then + (x2·w2)) and NO FMA, so the
+// SIMD body is bit-identical to the scalar edges. x[B,C,L], k[C,3], y[B,C,L].
+namespace {
+// forward window (zero-pad right): y[t] = x[t]·w0 + x[t+1]·w1 + x[t+2]·w2.
+static void dw3_row(const float *x, const float *w, float *y, int L) {
+    const float32x4_t w0 = vdupq_n_f32(w[0]), w1 = vdupq_n_f32(w[1]), w2 = vdupq_n_f32(w[2]);
+    int t = 0;
+    for (; t + 6 <= L; t += 4) { // outputs t..t+3 read x[t..t+5], all in-bounds
+        float32x4_t acc = vaddq_f32(vmulq_f32(vld1q_f32(x + t), w0),
+                                    vmulq_f32(vld1q_f32(x + t + 1), w1));
+        acc = vaddq_f32(acc, vmulq_f32(vld1q_f32(x + t + 2), w2));
+        vst1q_f32(y + t, acc);
+    }
+    for (; t < L; t++) {
+        float x0 = x[t];
+        float x1 = (t + 1 < L) ? x[t + 1] : 0.0f;
+        float x2 = (t + 2 < L) ? x[t + 2] : 0.0f;
+        float acc = (x0 * w[0]) + (x1 * w[1]);
+        y[t] = acc + (x2 * w[2]);
+    }
+}
+// causal window (left-pad K-1=2): y[t] = x[t-2]·w0 + x[t-1]·w1 + x[t]·w2 — the LFM2
+// short-conv orientation (Depthwise3.metal `depthwise3_causal`).
+static void dw3_causal_row(const float *x, const float *w, float *y, int L) {
+    const float32x4_t w0 = vdupq_n_f32(w[0]), w1 = vdupq_n_f32(w[1]), w2 = vdupq_n_f32(w[2]);
+    int t = 0;
+    for (; t < 2 && t < L; t++) {
+        float x0 = (t >= 2) ? x[t - 2] : 0.0f;
+        float x1 = (t >= 1) ? x[t - 1] : 0.0f;
+        float acc = (x0 * w[0]) + (x1 * w[1]);
+        y[t] = acc + (x[t] * w[2]);
+    }
+    for (; t + 4 <= L; t += 4) { // outputs t..t+3 read x[t-2..t+3], in-bounds for t >= 2
+        float32x4_t acc = vaddq_f32(vmulq_f32(vld1q_f32(x + t - 2), w0),
+                                    vmulq_f32(vld1q_f32(x + t - 1), w1));
+        acc = vaddq_f32(acc, vmulq_f32(vld1q_f32(x + t), w2));
+        vst1q_f32(y + t, acc);
+    }
+    for (; t < L; t++) {
+        float acc = (x[t - 2] * w[0]) + (x[t - 1] * w[1]);
+        y[t] = acc + (x[t] * w[2]);
+    }
+}
+} // namespace
+
+extern "C" void lfm_depthwise3_f32(const float *x, const float *k, float *y,
+                                   int Bn, int C, int L) {
+    for (int b = 0; b < Bn; b++)
+        for (int c = 0; c < C; c++)
+            dw3_row(x + ((size_t)b * C + c) * L, k + (size_t)c * 3,
+                    y + ((size_t)b * C + c) * L, L);
+}
+
+extern "C" void lfm_depthwise3_causal_f32(const float *x, const float *k, float *y,
+                                          int Bn, int C, int L) {
+    for (int b = 0; b < Bn; b++)
+        for (int c = 0; c < C; c++)
+            dw3_causal_row(x + ((size_t)b * C + c) * L, k + (size_t)c * 3,
+                           y + ((size_t)b * C + c) * L, L);
+}
+
+// Fused LFM2 ShortConv decode-step update — conv1d_update.rs's kernel: per (b,c) row,
+// `y[t] = C[t] · Σ_j w[j]·win[t+j]` over the extended window `win = [state | B⊙x]`, with the
+// carried state advanced functionally (`out = [y | new_state]`, new_state = the last K-1 conv
+// inputs). Rewritten from the GPU's per-t register shift into a K-tap FIR over the extended
+// buffer — same ascending-tap accumulation, same values. The multiply-adds are FMA
+// (contractible IS the trained regime — Tri Dao's CUDA kernel compiles to FMA; the strict-order
+// instrument is `lfm_depthwise3_causal_f32` above). bcx[B,3D,T] rows B|C|x, state[B,D,K-1],
+// w[D,K], out[B,D,T+K-1].
+namespace {
+thread_local std::vector<float> g_bx; // [K-1 + T] extended conv-input window, per worker
+
+// f32: gate, FIR, gate — no storage rounding anywhere (float is the storage dtype).
+static void update_row_f32(const float *brow, const float *crow, const float *xrow,
+                           const float *srow, const float *wrow, float *orow, int T, int K) {
+    const int km1 = K - 1;
+    g_bx.resize((size_t)km1 + T);
+    float *bx = g_bx.data();
+    for (int j = 0; j < km1; j++) bx[j] = srow[j];
+    int t = 0;
+    for (; t + 4 <= T; t += 4)
+        vst1q_f32(bx + km1 + t, vmulq_f32(vld1q_f32(brow + t), vld1q_f32(xrow + t)));
+    for (; t < T; t++) bx[km1 + t] = brow[t] * xrow[t];
+    t = 0;
+    for (; t + 4 <= T; t += 4) {
+        float32x4_t acc = vdupq_n_f32(0.0f);
+        for (int j = 0; j < K; j++)
+            acc = vaddq_f32(acc, vmulq_f32(vld1q_f32(bx + t + j), vdupq_n_f32(wrow[j])));
+        vst1q_f32(orow + t, vmulq_f32(vld1q_f32(crow + t), acc));
+    }
+    for (; t < T; t++) {
+        float acc = 0.0f;
+        for (int j = 0; j < K; j++) acc = acc + wrow[j] * bx[t + j];
+        orow[t] = crow[t] * acc;
+    }
+    for (int j = 0; j < km1; j++) orow[T + j] = bx[T + j];
+}
+
+// bf16 storage: compute in f32, but round B⊙x through bf16 BEFORE it enters the window and
+// the conv output through bf16 BEFORE the C gate — torch materializes both as bf16 tensors,
+// so the trained regime includes those roundings (conv1d_update.rs kernel_source).
+// Round-to-nearest-even via the integer trick (same as f32_to_bf16_bits), vectorized.
+static inline float32x4_t round_bf16_f32x4(float32x4_t v) {
+    uint32x4_t u = vreinterpretq_u32_f32(v);
+    uint32x4_t lsb = vandq_u32(vshrq_n_u32(u, 16), vdupq_n_u32(1));
+    u = vaddq_u32(u, vaddq_u32(lsb, vdupq_n_u32(0x7fff)));
+    u = vandq_u32(u, vdupq_n_u32(0xFFFF0000u));
+    return vreinterpretq_f32_u32(u);
+}
+static inline uint16x4_t bf16_bits_f32x4(float32x4_t v) {
+    uint32x4_t u = vreinterpretq_u32_f32(v);
+    uint32x4_t lsb = vandq_u32(vshrq_n_u32(u, 16), vdupq_n_u32(1));
+    u = vaddq_u32(u, vaddq_u32(lsb, vdupq_n_u32(0x7fff)));
+    return vmovn_u32(vshrq_n_u32(u, 16));
+}
+static inline float32x4_t bf16_widen4(const uint16_t *p) {
+    return vreinterpretq_f32_u32(vshll_n_u16(vld1_u16(p), 16));
+}
+// scalar RNE round kept-as-f32 (for edges) — same integer trick.
+static inline float round_bf16_scalar(float f) {
+    uint32_t u;
+    memcpy(&u, &f, sizeof(u));
+    u += 0x7fff + ((u >> 16) & 1);
+    u &= 0xFFFF0000u;
+    memcpy(&f, &u, sizeof(f));
+    return f;
+}
+static inline uint16_t bf16_bits_scalar(float f) {
+    uint32_t u;
+    memcpy(&u, &f, sizeof(u));
+    u += 0x7fff + ((u >> 16) & 1);
+    return (uint16_t)(u >> 16);
+}
+
+static void update_row_bf16(const uint16_t *brow, const uint16_t *crow, const uint16_t *xrow,
+                            const uint16_t *srow, const float *wf, uint16_t *orow, int T, int K) {
+    const int km1 = K - 1;
+    g_bx.resize((size_t)km1 + T);
+    float *bx = g_bx.data();
+    for (int j = 0; j < km1; j++) bx[j] = bf16_to_f32(srow[j]);
+    int t = 0;
+    for (; t + 4 <= T; t += 4) {
+        float32x4_t prod = vmulq_f32(bf16_widen4(brow + t), bf16_widen4(xrow + t));
+        vst1q_f32(bx + km1 + t, round_bf16_f32x4(prod)); // Bx rounds through bf16 storage
+    }
+    for (; t < T; t++) bx[km1 + t] = round_bf16_scalar(bf16_to_f32(brow[t]) * bf16_to_f32(xrow[t]));
+    t = 0;
+    for (; t + 4 <= T; t += 4) {
+        float32x4_t acc = vdupq_n_f32(0.0f);
+        for (int j = 0; j < K; j++)
+            acc = vaddq_f32(acc, vmulq_f32(vld1q_f32(bx + t + j), vdupq_n_f32(wf[j])));
+        acc = round_bf16_f32x4(acc); // conv output rounds through bf16 before the C gate
+        float32x4_t y = vmulq_f32(bf16_widen4(crow + t), acc);
+        vst1_u16(orow + t, bf16_bits_f32x4(y));
+    }
+    for (; t < T; t++) {
+        float acc = 0.0f;
+        for (int j = 0; j < K; j++) acc = acc + wf[j] * bx[t + j];
+        acc = round_bf16_scalar(acc);
+        orow[t] = bf16_bits_scalar(bf16_to_f32(crow[t]) * acc);
+    }
+    // new_state values are already bf16-rounded, so the store round-trips exactly.
+    for (int j = 0; j < km1; j++) orow[T + j] = bf16_bits_scalar(bx[T + j]);
+}
+} // namespace
+
+namespace {
+// T==1, K==3 — the LFM2 decode step, vectorized ACROSS CHANNELS (t-vectorization is
+// degenerate at T==1). With T==1 the B/C/x rows are contiguous across channels; the state
+// [c][2] de-interleaves with vld2q, the taps [c][3] with vld3q, and each channel's output
+// triple [y | s1 | bx] stores as one interleaved vst3q. Same ascending-tap FMA accumulation
+// as the general row kernel.
+static void update_step_k3_f32(const float *ball, const float *call, const float *xall,
+                               const float *state, const float *w, float *out, int D) {
+    int c = 0;
+    for (; c + 4 <= D; c += 4) {
+        float32x4x2_t s = vld2q_f32(state + 2 * c);
+        float32x4x3_t wv = vld3q_f32(w + 3 * c);
+        float32x4_t bx = vmulq_f32(vld1q_f32(ball + c), vld1q_f32(xall + c));
+        float32x4_t acc = vmulq_f32(s.val[0], wv.val[0]);
+        acc = vaddq_f32(acc, vmulq_f32(s.val[1], wv.val[1]));
+        acc = vaddq_f32(acc, vmulq_f32(bx, wv.val[2]));
+        float32x4x3_t o;
+        o.val[0] = vmulq_f32(vld1q_f32(call + c), acc); // y
+        o.val[1] = s.val[1];                            // new_state[0] = old state[1]
+        o.val[2] = bx;                                  // new_state[1] = this step's Bx
+        vst3q_f32(out + 3 * c, o);
+    }
+    for (; c < D; c++) {
+        float bx = ball[c] * xall[c];
+        float acc = w[3 * c + 0] * state[2 * c + 0];
+        acc = acc + w[3 * c + 1] * state[2 * c + 1];
+        acc = acc + w[3 * c + 2] * bx;
+        out[3 * c + 0] = call[c] * acc;
+        out[3 * c + 1] = state[2 * c + 1];
+        out[3 * c + 2] = bx;
+    }
+}
+} // namespace
+
+extern "C" void lfm_conv1d_update_f32(const float *bcx, const float *state, const float *w,
+                                      float *out, int Bn, int D, int T, int K) {
+    if (T == 1 && K == 3) {
+        for (int b = 0; b < Bn; b++) {
+            const float *base = bcx + (size_t)b * 3 * D;
+            update_step_k3_f32(base, base + D, base + 2 * D, state + (size_t)b * D * 2, w,
+                               out + (size_t)b * D * 3, D);
+        }
+        return;
+    }
+    for (int b = 0; b < Bn; b++)
+        for (int c = 0; c < D; c++) {
+            const float *brow = bcx + (((size_t)b * 3 + 0) * D + c) * T;
+            const float *crow = bcx + (((size_t)b * 3 + 1) * D + c) * T;
+            const float *xrow = bcx + (((size_t)b * 3 + 2) * D + c) * T;
+            update_row_f32(brow, crow, xrow, state + ((size_t)b * D + c) * (K - 1),
+                           w + (size_t)c * K, out + ((size_t)b * D + c) * (T + K - 1), T, K);
+        }
+}
+
+namespace {
+// bf16 widen for a 4-lane bit vector already in a register.
+static inline float32x4_t bf16_widen_bits4(uint16x4_t bits) {
+    return vreinterpretq_f32_u32(vshll_n_u16(bits, 16));
+}
+// bits of an ALREADY-bf16-rounded f32 vector (low 16 bits zero) — pure truncation, no rounding.
+static inline uint16x4_t bits_of_rounded4(float32x4_t v) {
+    return vmovn_u32(vshrq_n_u32(vreinterpretq_u32_f32(v), 16));
+}
+
+// T==1, K==3 decode step, bf16 storage — channel-vectorized like the f32 twin, with the
+// trained-regime rounding points (Bx and conv-out round through bf16) and the carried
+// state's old s1 passed through as RAW bits (already bf16 — exact).
+static void update_step_k3_bf16(const uint16_t *ball, const uint16_t *call, const uint16_t *xall,
+                                const uint16_t *state, const uint16_t *w, uint16_t *out, int D) {
+    int c = 0;
+    for (; c + 4 <= D; c += 4) {
+        uint16x4x2_t sb = vld2_u16(state + 2 * c);
+        uint16x4x3_t wb = vld3_u16(w + 3 * c);
+        float32x4_t bx = round_bf16_f32x4(
+            vmulq_f32(bf16_widen4(ball + c), bf16_widen4(xall + c)));
+        float32x4_t acc = vmulq_f32(bf16_widen_bits4(sb.val[0]), bf16_widen_bits4(wb.val[0]));
+        acc = vaddq_f32(acc, vmulq_f32(bf16_widen_bits4(sb.val[1]), bf16_widen_bits4(wb.val[1])));
+        acc = vaddq_f32(acc, vmulq_f32(bx, bf16_widen_bits4(wb.val[2])));
+        acc = round_bf16_f32x4(acc);
+        float32x4_t y = vmulq_f32(bf16_widen4(call + c), acc);
+        uint16x4x3_t o;
+        o.val[0] = bf16_bits_f32x4(y);
+        o.val[1] = sb.val[1];            // raw pass-through: already bf16
+        o.val[2] = bits_of_rounded4(bx);
+        vst3_u16(out + 3 * c, o);
+    }
+    for (; c < D; c++) {
+        float bx = round_bf16_scalar(bf16_to_f32(ball[c]) * bf16_to_f32(xall[c]));
+        float acc = bf16_to_f32(w[3 * c + 0]) * bf16_to_f32(state[2 * c + 0]);
+        acc = acc + bf16_to_f32(w[3 * c + 1]) * bf16_to_f32(state[2 * c + 1]);
+        acc = acc + bf16_to_f32(w[3 * c + 2]) * bx;
+        acc = round_bf16_scalar(acc);
+        out[3 * c + 0] = bf16_bits_scalar(bf16_to_f32(call[c]) * acc);
+        out[3 * c + 1] = state[2 * c + 1];
+        out[3 * c + 2] = bf16_bits_scalar(bx);
+    }
+}
+} // namespace
+
+extern "C" void lfm_conv1d_update_bf16(const uint16_t *bcx, const uint16_t *state,
+                                       const uint16_t *w, uint16_t *out,
+                                       int Bn, int D, int T, int K) {
+    if (T == 1 && K == 3) {
+        for (int b = 0; b < Bn; b++) {
+            const uint16_t *base = bcx + (size_t)b * 3 * D;
+            update_step_k3_bf16(base, base + D, base + 2 * D, state + (size_t)b * D * 2, w,
+                                out + (size_t)b * D * 3, D);
+        }
+        return;
+    }
+    float wf[16];
+    for (int b = 0; b < Bn; b++)
+        for (int c = 0; c < D; c++) {
+            for (int j = 0; j < K; j++) wf[j] = bf16_to_f32(w[(size_t)c * K + j]);
+            const uint16_t *brow = bcx + (((size_t)b * 3 + 0) * D + c) * T;
+            const uint16_t *crow = bcx + (((size_t)b * 3 + 1) * D + c) * T;
+            const uint16_t *xrow = bcx + (((size_t)b * 3 + 2) * D + c) * T;
+            update_row_bf16(brow, crow, xrow, state + ((size_t)b * D + c) * (K - 1), wf,
+                            out + ((size_t)b * D + c) * (T + K - 1), T, K);
+        }
+}
+
+// =====================================================================================
+// Group H — decode stage kernels: the per-stage device functions of the pure-NEON decode
+// step (no candle op in the token loop). Each consumes/produces bf16 bit planes or f32
+// scratch exactly at the torch rounding points; lane teams (Rust side) slice rows and
+// barrier between stages, these do the math.
+// =====================================================================================
+
+// Σ f32(x)² over a bf16 plane — the RMSNorm reduction.
+extern "C" float lfm_bf16_sumsq_f32(const uint16_t *x, int n) {
+    float32x4_t a0 = vdupq_n_f32(0.0f), a1 = vdupq_n_f32(0.0f);
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        uint16x8_t b = vld1q_u16(x + i);
+        float32x4_t lo = bf16_row_lo(b), hi = bf16_row_hi(b);
+        a0 = vfmaq_f32(a0, lo, lo);
+        a1 = vfmaq_f32(a1, hi, hi);
+    }
+    float acc = vaddvq_f32(vaddq_f32(a0, a1));
+    for (; i < n; i++) {
+        float v = bf16_to_f32(x[i]);
+        acc = fmaf(v, v, acc);
+    }
+    return acc;
+}
+
+// RMSNorm apply: out = rb(f32(x) · inv_rms · f32(w)) — f32 throughout, ONE bf16 round
+// (transformer.rs RmsNorm::forward's ladder).
+extern "C" void lfm_bf16_rmsnorm(const uint16_t *x, const uint16_t *w, uint16_t *out,
+                                 int n, float inv_rms) {
+    const float32x4_t rs = vdupq_n_f32(inv_rms);
+    int i = 0;
+    for (; i + 4 <= n; i += 4) {
+        float32x4_t xv = bf16_widen4(x + i);
+        float32x4_t wv = bf16_widen4(w + i);
+        vst1_u16(out + i, bf16_bits_f32x4(vmulq_f32(vmulq_f32(xv, rs), wv)));
+    }
+    for (; i < n; i++)
+        out[i] = bf16_bits_scalar(bf16_to_f32(x[i]) * inv_rms * bf16_to_f32(w[i]));
+}
+
+// bf16 elementwise add (the residual ladder): out = rb(f32(a) + f32(b)).
+extern "C" void lfm_bf16_add(const uint16_t *a, const uint16_t *b, uint16_t *out, int n) {
+    int i = 0;
+    for (; i + 4 <= n; i += 4)
+        vst1_u16(out + i, bf16_bits_f32x4(vaddq_f32(bf16_widen4(a + i), bf16_widen4(b + i))));
+    for (; i < n; i++) out[i] = bf16_bits_scalar(bf16_to_f32(a[i]) + bf16_to_f32(b[i]));
+}
+
+// SwiGLU gate ladder over post-GEMV f32 planes: out = rb(rb(silu(rb(g))) · rb(u)) — the
+// candle op chain's rounds (linear-out, silu, linear-out, gating mul). expf is libm
+// (matches candle's per-element silu).
+extern "C" void lfm_swiglu_bf16(const float *g, const float *u, uint16_t *out, int n) {
+    for (int i = 0; i < n; i++) {
+        float gv = bf16_to_f32(bf16_bits_scalar(g[i]));
+        float sg = bf16_to_f32(bf16_bits_scalar(gv / (1.0f + expf(-gv))));
+        float uv = bf16_to_f32(bf16_bits_scalar(u[i]));
+        out[i] = bf16_bits_scalar(sg * uv);
+    }
+}
+
+// Softmax with folded pre-scale, in place, f32: x = softmax(x · scale). Exact libm expf
+// (candle's softmax path), max-subtracted for stability.
+extern "C" void lfm_softmax_scaled_f32(float *x, int n, float scale) {
+    float mx = -INFINITY;
+    for (int i = 0; i < n; i++) {
+        x[i] *= scale;
+        if (x[i] > mx) mx = x[i];
+    }
+    float sum = 0.0f;
+    for (int i = 0; i < n; i++) {
+        x[i] = expf(x[i] - mx);
+        sum += x[i];
+    }
+    float inv = 1.0f / sum;
+    for (int i = 0; i < n; i++) x[i] *= inv;
+}
+
+// Attention value gather: out[hd] += att[t] · V[t,·] for t in [0,len) — axpy over the
+// resident f32 V plane rows (V row-major [len, hd]).
+extern "C" void lfm_attn_av_f32(const float *att, const float *v, float *out, int len, int hd) {
+    memset(out, 0, (size_t)hd * sizeof(float));
+    for (int t = 0; t < len; t++) {
+        const float a = att[t];
+        const float *row = v + (size_t)t * hd;
+        int i = 0;
+        for (; i + 4 <= hd; i += 4)
+            vst1q_f32(out + i, vfmaq_n_f32(vld1q_f32(out + i), vld1q_f32(row + i), a));
+        for (; i < hd; i++) out[i] = fmaf(a, row[i], out[i]);
+    }
+}
+
+// Attention scores: att[t] = dot(q, K[t,·]) for t in [0,len) over the resident f32 K
+// plane — the q·Kᵀ row of scaled-dot-product attention (scale folds into softmax).
+extern "C" void lfm_attn_qk_f32(const float *q, const float *k, float *att, int len, int hd) {
+    for (int t = 0; t < len; t++) {
+        const float *row = k + (size_t)t * hd;
+        float32x4_t acc = vdupq_n_f32(0.0f);
+        int i = 0;
+        for (; i + 4 <= hd; i += 4)
+            acc = vfmaq_f32(acc, vld1q_f32(q + i), vld1q_f32(row + i));
+        float s = vaddvq_f32(acc);
+        for (; i < hd; i++) s = fmaf(q[i], row[i], s);
+        att[t] = s;
+    }
+}
+
+// Interleaved (GPT-J) rotary on ONE head row, f32 in place: pairs (2i, 2i+1) rotated by
+// (cos[i], sin[i]) — `apply_rotary_emb`'s real-valued rope_i. cos/sin are the model's
+// precomputed f32 tables at this position, hd/2 entries.
+extern "C" void lfm_rope_i_f32(float *x, const float *cos_p, const float *sin_p, int hd) {
+    for (int i = 0; i + 1 < hd; i += 2) {
+        float c = cos_p[i / 2], s = sin_p[i / 2];
+        float x0 = x[i], x1 = x[i + 1];
+        x[i] = x0 * c - x1 * s;
+        x[i + 1] = x0 * s + x1 * c;
+    }
+}
+
+// bf16 plane → f32 plane (the fp32-upcast points of the torch ladder), and back with RNE.
+extern "C" void lfm_bf16_to_f32(const uint16_t *x, float *out, int n) {
+    int i = 0;
+    for (; i + 4 <= n; i += 4) vst1q_f32(out + i, bf16_widen4(x + i));
+    for (; i < n; i++) out[i] = bf16_to_f32(x[i]);
+}
+extern "C" void lfm_f32_to_bf16(const float *x, uint16_t *out, int n) {
+    int i = 0;
+    for (; i + 4 <= n; i += 4) vst1_u16(out + i, bf16_bits_f32x4(vld1q_f32(x + i)));
+    for (; i < n; i++) out[i] = bf16_bits_scalar(x[i]);
+}
+
+// bf16-plane attention: K/V stay in checkpoint dtype (torch's cache dtype — half the
+// bytes, half the read bandwidth of f32 planes); rows widen to f32 IN REGISTERS during
+// the dot (a shift — free). q is f32 (the sdpa upcast point). Same math as the f32 forms.
+extern "C" void lfm_attn_qk_bf16(const float *q, const uint16_t *k, float *att, int len, int hd) {
+    for (int t = 0; t < len; t++) {
+        const uint16_t *row = k + (size_t)t * hd;
+        float32x4_t a0 = vdupq_n_f32(0.0f), a1 = vdupq_n_f32(0.0f);
+        int i = 0;
+        for (; i + 8 <= hd; i += 8) {
+            uint16x8_t b = vld1q_u16(row + i);
+            a0 = vfmaq_f32(a0, vld1q_f32(q + i), bf16_row_lo(b));
+            a1 = vfmaq_f32(a1, vld1q_f32(q + i + 4), bf16_row_hi(b));
+        }
+        float s = vaddvq_f32(vaddq_f32(a0, a1));
+        for (; i < hd; i++) s = fmaf(q[i], bf16_to_f32(row[i]), s);
+        att[t] = s;
+    }
+}
+
+extern "C" void lfm_attn_av_bf16(const float *att, const uint16_t *v, float *out, int len, int hd) {
+    memset(out, 0, (size_t)hd * sizeof(float));
+    for (int t = 0; t < len; t++) {
+        const float a = att[t];
+        const uint16_t *row = v + (size_t)t * hd;
+        int i = 0;
+        for (; i + 8 <= hd; i += 8) {
+            uint16x8_t b = vld1q_u16(row + i);
+            vst1q_f32(out + i, vfmaq_n_f32(vld1q_f32(out + i), bf16_row_lo(b), a));
+            vst1q_f32(out + i + 4, vfmaq_n_f32(vld1q_f32(out + i + 4), bf16_row_hi(b), a));
+        }
+        for (; i < hd; i++) out[i] = fmaf(a, bf16_to_f32(row[i]), out[i]);
+    }
+}
+
+// Sequential-order sumsq matching candle's `sqr().sum()` ladder EXACTLY: each square
+// rounded (separate mul), each add rounded (no FMA, no vector partials). This is the
+// token-exact norm reduction for fused blocks that must bit-match the composed op chain;
+// the FMA/partials form (lfm_bf16_sumsq_f32) is the fast ulp-tier form.
+extern "C" float lfm_bf16_sumsq_seq_f32(const uint16_t *x, int n) {
+    float acc = 0.0f;
+    for (int i = 0; i < n; i++) {
+        float v = bf16_to_f32(x[i]);
+        float sq = v * v;
+        acc = acc + sq;
+    }
+    return acc;
+}
+
+// Sumsq in CANDLE's exact f32 reduction order (cpu/neon.rs vec_sum over a sqr() tensor):
+// four float32x4 accumulators over 16-element steps, pairwise tree (x0+=x1, x2+=x3,
+// x0+=x2), ADDV, then sequential leftovers. Each square rounds before accumulating (the
+// sqr() tensor's values). This is the token-exact norm reduction for fused blocks that
+// must bit-match the composed candle chain on aarch64.
+extern "C" float lfm_bf16_sumsq_candle_f32(const uint16_t *x, int n) {
+    const int np = n & ~15;
+    float32x4_t sum0 = vdupq_n_f32(0.0f), sum1 = vdupq_n_f32(0.0f);
+    float32x4_t sum2 = vdupq_n_f32(0.0f), sum3 = vdupq_n_f32(0.0f);
+    for (int i = 0; i < np; i += 16) {
+        float32x4_t x0 = bf16_widen4(x + i);
+        float32x4_t x1 = bf16_widen4(x + i + 4);
+        float32x4_t x2 = bf16_widen4(x + i + 8);
+        float32x4_t x3 = bf16_widen4(x + i + 12);
+        sum0 = vaddq_f32(sum0, vmulq_f32(x0, x0));
+        sum1 = vaddq_f32(sum1, vmulq_f32(x1, x1));
+        sum2 = vaddq_f32(sum2, vmulq_f32(x2, x2));
+        sum3 = vaddq_f32(sum3, vmulq_f32(x3, x3));
+    }
+    sum0 = vaddq_f32(sum0, sum1);
+    sum2 = vaddq_f32(sum2, sum3);
+    sum0 = vaddq_f32(sum0, sum2);
+    float acc = vaddvq_f32(sum0);
+    for (int i = np; i < n; i++) {
+        float v = bf16_to_f32(x[i]);
+        acc = acc + v * v;
+    }
+    return acc;
 }

@@ -10,8 +10,8 @@
 
 use candle_core::{CpuStorage, CustomOp2, DType, Layout, Result, Shape, Tensor};
 
-// Only wired in as the fallback when the tightened zoo GEMM was not built (see cpu_fwd).
-#[cfg(all(target_arch = "aarch64", has_bf16_kernel, not(has_neon_zoo)))]
+// Only wired in as the fallback when the tightened flashkern GEMM was not built (see cpu_fwd).
+#[cfg(all(target_arch = "aarch64", has_bf16_kernel, not(has_flashkern_neon)))]
 extern "C" {
     /// `C(M,N) f32 = A(M,K) bf16 · B(K,N) bf16`, all row-major. bf16 crosses as raw u16.
     fn lfm_bf16_gemm_f32(a: *const u16, b: *const u16, c: *mut f32, m: i32, n: i32, k: i32);
@@ -23,11 +23,11 @@ extern "C" {
 pub fn has_feat_bf16() -> bool {
     #[cfg(target_arch = "aarch64")]
     {
-        crate::neon_zoo::neon_features().bf16
+        crate::flashkern::neon::neon_features().bf16
     }
     #[cfg(target_arch = "x86_64")]
     {
-        crate::x86_zoo::x86_features().avx512bf16
+        crate::flashkern::x86::x86_features().avx512bf16
     }
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
@@ -42,11 +42,11 @@ pub fn has_feat_bf16() -> bool {
 pub fn bf16_gemm_available() -> bool {
     #[cfg(target_arch = "aarch64")]
     {
-        cfg!(all(target_arch = "aarch64", has_bf16_kernel)) && crate::neon_zoo::neon_features().bf16
+        cfg!(all(target_arch = "aarch64", has_bf16_kernel)) && crate::flashkern::neon::neon_features().bf16
     }
     #[cfg(target_arch = "x86_64")]
     {
-        crate::x86_zoo::bf16_gemm_available()
+        crate::flashkern::x86::bf16_gemm_available()
     }
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
@@ -95,27 +95,28 @@ impl CustomOp2 for Bf16Gemm {
         let b = &b[l2.start_offset()..l2.start_offset() + k * n];
         #[allow(unused_mut)] // `c` is mutated only on the SIMD kernel paths below
         let mut c = vec![0f32; m * n];
-        // Preferred aarch64 path: the tightened NEON "zoo" GEMM (8×8 BFMMLA multi-accumulator +
-        // rayon row-block dispatch, or a BFDOT GEMV when M==1). Same bf16-exact-product /
+        // Preferred aarch64 path: the tightened NEON flashkern GEMM (8×8 BFMMLA multi-accumulator +
+        // rayon row-block dispatch, or the row-streaming axpy GEMV when M==1; the decode-side
+        // small-M route uses Bf16GemmNt instead — no transpose). Same bf16-exact-product /
         // f32-accumulate numerics as the reference kernel; only the summation order differs.
-        #[cfg(all(target_arch = "aarch64", has_neon_zoo))]
+        #[cfg(all(target_arch = "aarch64", has_flashkern_neon))]
         {
             // half::bf16 is repr(transparent) over u16, so the bit-slice view is sound.
             let ab = unsafe { std::slice::from_raw_parts(a.as_ptr() as *const u16, a.len()) };
             let bb = unsafe { std::slice::from_raw_parts(b.as_ptr() as *const u16, b.len()) };
-            crate::neon_zoo::bf16_gemm_into(ab, bb, &mut c, m, n, k);
+            crate::flashkern::neon::bf16_gemm_into(ab, bb, &mut c, m, n, k);
         }
-        // x86-64 path: the AVX-512-BF16 (VDPBF16PS) / AVX2 zoo GEMM, fanned out over M-row
+        // x86-64 path: the AVX-512-BF16 (VDPBF16PS) / AVX2 flashkern GEMM, fanned out over M-row
         // blocks with rayon. Same f32-accumulate numerics.
-        #[cfg(all(target_arch = "x86_64", has_x86_zoo))]
+        #[cfg(all(target_arch = "x86_64", has_flashkern_x86))]
         {
             let ab = unsafe { std::slice::from_raw_parts(a.as_ptr() as *const u16, a.len()) };
             let bb = unsafe { std::slice::from_raw_parts(b.as_ptr() as *const u16, b.len()) };
-            crate::x86_zoo::bf16_gemm_into(ab, bb, &mut c, m, n, k);
+            crate::flashkern::x86::bf16_gemm_into(ab, bb, &mut c, m, n, k);
         }
-        // Fallback: the original single-file BFMMLA kernel (only reachable if the zoo TU failed
+        // Fallback: the original single-file BFMMLA kernel (only reachable if flashkern TU failed
         // to build but the reference kernel did).
-        #[cfg(all(target_arch = "aarch64", has_bf16_kernel, not(has_neon_zoo)))]
+        #[cfg(all(target_arch = "aarch64", has_bf16_kernel, not(has_flashkern_neon)))]
         // SAFETY: a/b are M*K / K*N contiguous bf16 (==u16) lanes; c is M*N f32; FEAT_BF16
         // verified above; the kernel reads/writes exactly those bounds.
         unsafe {
@@ -144,6 +145,175 @@ pub fn bf16_matmul(a: &Tensor, b: &Tensor) -> Result<Option<Tensor>> {
     let a16 = a.to_dtype(DType::BF16)?.contiguous()?;
     let b16 = b.to_dtype(DType::BF16)?.contiguous()?;
     Ok(Some(a16.apply_op2_no_bwd(&b16, &Bf16Gemm)?))
+}
+
+/// `true` when the flashkern NT kernel specifically is built and supported — STRICTER than
+/// [`bf16_gemm_available`], which on aarch64 is also satisfied by the reference BFMMLA
+/// fallback (`has_bf16_kernel` without `has_flashkern_neon`). The reference kernel has no
+/// NT form, so gating NT paths on the looser check would let [`Bf16GemmNt`] run with no
+/// kernel body at all (zero-filled output) in a fallback-only build.
+pub fn bf16_gemm_nt_available() -> bool {
+    #[cfg(target_arch = "aarch64")]
+    {
+        cfg!(all(target_arch = "aarch64", has_flashkern_neon))
+            && crate::flashkern::neon::neon_features().bf16
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        // Already flashkern-specific: cfg(has_flashkern_x86) + AVX2 + FMA.
+        crate::flashkern::x86::bf16_gemm_available()
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        false
+    }
+}
+
+/// `true` when the Accelerate-backed prefill GEMM is available: macOS aarch64 with the
+/// flashkern build (Accelerate is the sanctioned AMX dispatcher; off macOS the BFMMLA
+/// GEMM remains the prefill path — see ENGINE_DESIGN.md §3b).
+pub fn bf16_gemm_accel_available() -> bool {
+    cfg!(all(target_arch = "aarch64", target_os = "macos", has_flashkern_neon))
+        && bf16_gemm_available()
+}
+
+/// Prefill twin of [`Bf16GemmNt`]: `A(M,K) · W(N,K)ᵀ → f32(M,N)` through Accelerate
+/// `cblas_sgemm` (AMX). Native weight layout — no transpose; f32-tier numerics
+/// (bf16-exact inputs widened, f32 accumulate in AMX order; measured rel ≈ 1e-5 vs the
+/// BFMMLA chain). Compute-bound shapes only — the caller routes M ≤ 4 to the nt kernel.
+pub struct Bf16GemmAccel;
+
+impl CustomOp2 for Bf16GemmAccel {
+    fn name(&self) -> &'static str {
+        "bf16-gemm-accel"
+    }
+
+    fn cpu_fwd(
+        &self,
+        s1: &CpuStorage,
+        l1: &Layout,
+        s2: &CpuStorage,
+        l2: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        if !bf16_gemm_accel_available() {
+            candle_core::bail!("bf16-gemm-accel: Accelerate backend unavailable on this target");
+        }
+        let (d1, d2) = (l1.dims(), l2.dims());
+        if d1.len() != 2 || d2.len() != 2 || d1[1] != d2[1] {
+            candle_core::bail!("bf16-gemm-accel expects (M,K)·(N,K), got {d1:?}·{d2:?}");
+        }
+        if !l1.is_contiguous() || !l2.is_contiguous() {
+            candle_core::bail!("bf16-gemm-accel requires contiguous inputs");
+        }
+        let (m, k, n) = (d1[0], d1[1], d2[0]);
+        let a = match s1 {
+            CpuStorage::BF16(v) => v,
+            _ => candle_core::bail!("bf16-gemm-accel: lhs must be bf16"),
+        };
+        let w = match s2 {
+            CpuStorage::BF16(v) => v,
+            _ => candle_core::bail!("bf16-gemm-accel: rhs must be bf16"),
+        };
+        let a = &a[l1.start_offset()..l1.start_offset() + m * k];
+        let w = &w[l2.start_offset()..l2.start_offset() + n * k];
+        #[allow(unused_mut)]
+        let mut c = vec![0f32; m * n];
+        #[cfg(all(target_arch = "aarch64", target_os = "macos", has_flashkern_neon))]
+        {
+            let ab = unsafe { std::slice::from_raw_parts(a.as_ptr() as *const u16, a.len()) };
+            let wb = unsafe { std::slice::from_raw_parts(w.as_ptr() as *const u16, w.len()) };
+            crate::flashkern::neon::bf16_gemm_accel_into(ab, wb, &mut c, m, n, k);
+        }
+        let _ = (a, w);
+        Ok((CpuStorage::F32(c), Shape::from((m, n))))
+    }
+}
+
+/// bf16 matmul against an untransposed weight through the Accelerate/AMX backend —
+/// the prefill entry. Same `Ok(None)` availability contract as its siblings.
+pub fn bf16_matmul_accel(a: &Tensor, w_nk: &Tensor) -> Result<Option<Tensor>> {
+    if !bf16_gemm_accel_available() || !a.device().is_cpu() || !w_nk.device().is_cpu() {
+        return Ok(None);
+    }
+    let a16 = a.to_dtype(DType::BF16)?.contiguous()?;
+    let w16 = w_nk.to_dtype(DType::BF16)?.contiguous()?;
+    Ok(Some(a16.apply_op2_no_bwd(&w16, &Bf16GemmAccel)?))
+}
+
+/// Native-layout twin of [`Bf16Gemm`] for the decode step: `A(M,K) · W(N,K)ᵀ → f32(M,N)` with
+/// the weight in its checkpoint row-major `[N,K]` layout. Each output dots a CONTIGUOUS weight
+/// row, so this op takes the weight AS STORED — no `.t()`, no `.contiguous()` copy. The
+/// transposed alternative re-copies the entire weight per call, which profiling showed was
+/// ~97% of CPU decode time (`Tensor::contiguous → copy_strided_src` under every linear).
+pub struct Bf16GemmNt;
+
+impl CustomOp2 for Bf16GemmNt {
+    fn name(&self) -> &'static str {
+        "bf16-gemm-nt"
+    }
+
+    fn cpu_fwd(
+        &self,
+        s1: &CpuStorage,
+        l1: &Layout,
+        s2: &CpuStorage,
+        l2: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        if !bf16_gemm_nt_available() {
+            // The strict gate: the reference-kernel-only build satisfies bf16_gemm_available()
+            // but has no NT kernel — running here would return silent zeros.
+            candle_core::bail!("bf16-gemm-nt: flashkern NT kernel unavailable on this target");
+        }
+        let (d1, d2) = (l1.dims(), l2.dims());
+        if d1.len() != 2 || d2.len() != 2 || d1[1] != d2[1] {
+            candle_core::bail!("bf16-gemm-nt expects (M,K)·(N,K), got {d1:?}·{d2:?}");
+        }
+        if !l1.is_contiguous() || !l2.is_contiguous() {
+            candle_core::bail!("bf16-gemm-nt requires contiguous inputs");
+        }
+        let (m, k, n) = (d1[0], d1[1], d2[0]);
+        let a = match s1 {
+            CpuStorage::BF16(v) => v,
+            _ => candle_core::bail!("bf16-gemm-nt: lhs must be bf16"),
+        };
+        let w = match s2 {
+            CpuStorage::BF16(v) => v,
+            _ => candle_core::bail!("bf16-gemm-nt: rhs must be bf16"),
+        };
+        let a = &a[l1.start_offset()..l1.start_offset() + m * k];
+        let w = &w[l2.start_offset()..l2.start_offset() + n * k];
+        #[allow(unused_mut)] // `c` is mutated only on the SIMD kernel paths below
+        let mut c = vec![0f32; m * n];
+        #[cfg(all(target_arch = "aarch64", has_flashkern_neon))]
+        {
+            // half::bf16 is repr(transparent) over u16, so the bit-slice view is sound.
+            let ab = unsafe { std::slice::from_raw_parts(a.as_ptr() as *const u16, a.len()) };
+            let wb = unsafe { std::slice::from_raw_parts(w.as_ptr() as *const u16, w.len()) };
+            crate::flashkern::neon::bf16_gemm_nt_into(ab, wb, &mut c, m, n, k);
+        }
+        #[cfg(all(target_arch = "x86_64", has_flashkern_x86))]
+        {
+            let ab = unsafe { std::slice::from_raw_parts(a.as_ptr() as *const u16, a.len()) };
+            let wb = unsafe { std::slice::from_raw_parts(w.as_ptr() as *const u16, w.len()) };
+            crate::flashkern::x86::bf16_gemm_nt_into(ab, wb, &mut c, m, n, k);
+        }
+        // Off aarch64/x86 flashkern builds, bf16_gemm_available() is false and the top guard
+        // already bailed — same contract as Bf16Gemm.
+        let _ = (a, w);
+        Ok((CpuStorage::F32(c), Shape::from((m, n))))
+    }
+}
+
+/// bf16 matmul against an UNTRANSPOSED weight: `a(M,K) · w(N,K)ᵀ → f32(M,N)`, CPU only —
+/// the decode-path entry ([`Bf16GemmNt`]). `w` passes through as stored (already contiguous
+/// for checkpoint weights — no copy); same `Ok(None)` availability contract as [`bf16_matmul`].
+pub fn bf16_matmul_nt(a: &Tensor, w_nk: &Tensor) -> Result<Option<Tensor>> {
+    if !bf16_gemm_nt_available() || !a.device().is_cpu() || !w_nk.device().is_cpu() {
+        return Ok(None);
+    }
+    let a16 = a.to_dtype(DType::BF16)?.contiguous()?;
+    let w16 = w_nk.to_dtype(DType::BF16)?.contiguous()?;
+    Ok(Some(a16.apply_op2_no_bwd(&w16, &Bf16GemmNt)?))
 }
 
 #[cfg(test)]
