@@ -462,6 +462,7 @@ impl LFM2AudioModel {
         // Resident native-engine layer table (same capture contract as depth_flash:
         // Arc-heap storages, guard clears before the weights drop).
         model.lfm.install_native_ctx(model.lfm_cfg.max_position_embeddings);
+        model.install_native_heads();
         Ok(model)
     }
 
@@ -1327,6 +1328,136 @@ impl LFM2AudioModel {
         Ok(toks)
     }
 
+    /// Install the head tables on the native engine (text embed = tied logits head,
+    /// audio embed table, final embedding-norm). No-op when captures fail — the token
+    /// pass simply stays unserved.
+    #[cfg(all(
+        has_kcoro,
+        has_native_engine,
+        any(
+            all(target_arch = "aarch64", has_flashkern_neon),
+            all(target_arch = "x86_64", has_flashkern_x86)
+        )
+    ))]
+    fn install_native_heads(&self) {
+        use crate::flashkern::decode::PtrLen;
+        let Some(engine) = crate::flashkern::native_engine::process_engine() else {
+            return;
+        };
+        let embed = self.lfm.embed_weight();
+        let audio = self.audio_embedding.flash_parts().0;
+        let norm = self.lfm.embedding_norm();
+        let (Some(ep), Some(ap), Some(np)) = (
+            PtrLen::bf16(embed),
+            PtrLen::bf16(audio),
+            PtrLen::bf16(norm.weight()),
+        ) else {
+            return;
+        };
+        let (Ok(vocab), Ok(arows)) = (embed.dim(0), audio.dim(0)) else {
+            return;
+        };
+        let _ = engine.set_heads(
+            ep.addr() as *const u16,
+            vocab,
+            ap.addr() as *const u16,
+            arows,
+            np.addr() as *const u16,
+            norm.eps() as f32,
+        );
+    }
+
+    #[cfg(not(all(
+        has_kcoro,
+        has_native_engine,
+        any(
+            all(target_arch = "aarch64", has_flashkern_neon),
+            all(target_arch = "x86_64", has_flashkern_x86)
+        )
+    )))]
+    fn install_native_heads(&self) {}
+
+    /// The native token pass for the generate loop: ids in, `(h_last, logits?)` out.
+    /// `Ok(None)` = unserved (any gate failed) — caller builds `in_emb` and takes the
+    /// candle path, bit-identical. On success `index_pos` has been advanced.
+    #[cfg(all(
+        has_kcoro,
+        has_native_engine,
+        any(
+            all(target_arch = "aarch64", has_flashkern_neon),
+            all(target_arch = "x86_64", has_flashkern_x86)
+        )
+    ))]
+    fn native_token_step(
+        &self,
+        cache: &mut LfmCache,
+        index_pos: &mut usize,
+        ids: &[u32],
+        embed_kind: u32,
+        want_logits: bool,
+    ) -> Result<Option<(Tensor, Option<Tensor>)>> {
+        let vocab = self.lfm.embed_weight().dim(0)?;
+        // Audio ids arrive RAW (per-codebook tokens); the engine's table is the flat
+        // audio-embedding matrix, so apply the codebook offsets here — the same
+        // `t + offset` audio_frame_embed applies.
+        let offset_ids: Vec<u32>;
+        let ids = if embed_kind == 1 {
+            offset_ids = ids
+                .iter()
+                .zip(&self.codebook_offsets)
+                .map(|(t, o)| (*t as i64 + o) as u32)
+                .collect();
+            &offset_ids[..]
+        } else {
+            ids
+        };
+        let Some((hidden, logits)) = self.lfm.native_token_pass(
+            cache,
+            *index_pos,
+            ids,
+            embed_kind,
+            want_logits,
+            vocab,
+        )?
+        else {
+            return Ok(None);
+        };
+        *index_pos += 1;
+        let h_last = Tensor::from_vec(
+            hidden
+                .iter()
+                .map(|&b| half::bf16::from_bits(b))
+                .collect::<Vec<_>>(),
+            (self.hidden,),
+            &candle_core::Device::Cpu,
+        )?;
+        let logits = match logits {
+            Some(l) => Some(Tensor::from_vec(l, (vocab,), &candle_core::Device::Cpu)?),
+            None => None,
+        };
+        Ok(Some((h_last, logits)))
+    }
+
+    #[cfg(not(all(
+        has_kcoro,
+        has_native_engine,
+        any(
+            all(target_arch = "aarch64", has_flashkern_neon),
+            all(target_arch = "x86_64", has_flashkern_x86)
+        )
+    )))]
+    #[allow(clippy::too_many_arguments)]
+    fn native_token_step(
+        &self,
+        _cache: &mut LfmCache,
+        _index_pos: &mut usize,
+        _ids: &[u32],
+        _embed_kind: u32,
+        _want_logits: bool,
+    ) -> Result<Option<(Tensor, Option<Tensor>)>> {
+        Ok(None)
+    }
+
     fn audio_frame_embed(&self, tokens: &[u32]) -> Result<Tensor> {
         // audio_embedding(tokens + offsets).sum(0) → (D,) → (1,1,D)
         let dev = self.lfm.embed_weight().device();
@@ -1482,21 +1613,58 @@ impl LFM2AudioModel {
         let mut current = LFMModality::Text;
         let mut modality_left = self.interleaved_n_text as i64;
         let mut text_done = false;
+        // Sampled ids waiting to become the next step's input: `(raw ids, embed_kind)`.
+        // The native token pass consumes ids directly (embed absorbed into the engine);
+        // the candle path derives `in_emb` from them on demand.
+        let mut pending: Option<(Vec<u32>, u32)> = None;
 
         for _ in 0..params.max_new_tokens {
             // Barge-in: a new utterance asked us to stop — drop this reply mid-stream.
+            // (The pass-boundary doorbell: never checked inside a token.)
             if cancel.load(Ordering::Acquire) {
                 break;
             }
             modality_left -= 1;
-            let seq_len = in_emb.dim(1)?;
-            let h = self.lfm.forward_embeds(&in_emb, *index_pos, cache, None)?; // (1, seq, D)
-            *index_pos += seq_len;
-            let h_last = h.i((0, seq_len - 1))?.contiguous()?; // (D,)
+            // Logits stay on the candle head for now: at rank-1 h_last, linear_logits
+            // takes the BFMMLA GEMM whose reduction order the engine's NT-row logits
+            // stage does NOT replicate — absorbing it flipped the perf-chain hash.
+            // The walk is the win; the head is one GEMV per text token.
+            let want_logits = false;
+            let stepped = match pending.as_ref() {
+                Some((ids, kind)) => {
+                    self.native_token_step(cache, index_pos, ids, *kind, want_logits)?
+                }
+                None => None,
+            };
+            let (h_last, native_logits) = match stepped {
+                Some((h, lg)) => {
+                    pending = None;
+                    (h, lg)
+                }
+                None => {
+                    // The candle path (prefill step, or any native gate failed):
+                    // derive in_emb from the pending ids first if there are any.
+                    if let Some((ids, kind)) = pending.take() {
+                        in_emb = if kind == 0 {
+                            let tok = Tensor::from_vec(vec![ids[0]], (1,), in_emb.device())?;
+                            self.lfm.embed(&tok)?.reshape((1, 1, self.hidden))?
+                        } else {
+                            self.audio_frame_embed(&ids)?
+                        };
+                    }
+                    let seq_len = in_emb.dim(1)?;
+                    let h = self.lfm.forward_embeds(&in_emb, *index_pos, cache, None)?;
+                    *index_pos += seq_len;
+                    (h.i((0, seq_len - 1))?.contiguous()?, None)
+                }
+            };
 
             match current {
                 LFMModality::Text => {
-                    let logits = self.text_logits(&h_last)?;
+                    let logits = match native_logits {
+                        Some(l) => l,
+                        None => self.text_logits(&h_last)?,
+                    };
                     let next = self.sample_text_token(&logits, &mut text_sampler)?;
                     if next == self.special.im_end {
                         break; // <|im_end|>
@@ -1509,8 +1677,7 @@ impl LFM2AudioModel {
                         current = LFMModality::AudioOut;
                         modality_left = self.interleaved_n_audio as i64;
                     }
-                    let tok = Tensor::from_vec(vec![next], (1,), in_emb.device())?;
-                    in_emb = self.lfm.embed(&tok)?.reshape((1, 1, self.hidden))?;
+                    pending = Some((vec![next], 0));
                 }
                 LFMModality::AudioOut => {
                     let mut frame = self.sample_audio_frame(&h_last, &mut audio_sampler)?;
@@ -1525,7 +1692,7 @@ impl LFM2AudioModel {
                         current = LFMModality::Text;
                     }
                     on_token(GenToken::Audio(frame.clone()));
-                    in_emb = self.audio_frame_embed(&frame)?;
+                    pending = Some((frame, 1));
                 }
                 LFMModality::AudioIn => unreachable!(),
             }

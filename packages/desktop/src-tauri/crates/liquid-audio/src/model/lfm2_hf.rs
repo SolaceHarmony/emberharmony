@@ -1340,6 +1340,125 @@ impl Model {
     )))]
     pub fn install_native_ctx(&mut self, _max_ctx: usize) {}
 
+    /// Final pre-logits norm (head-table capture for the native token pass).
+    pub(crate) fn embedding_norm(&self) -> &RmsNorm {
+        &self.embedding_norm
+    }
+
+    /// ONE token through the native engine: embed → every layer → final norm →
+    /// (optionally) logits. Returns the normed hidden bits and the f32 logits, or
+    /// `None` when any gate fails — the caller takes the candle path, bit-identical.
+    /// On success every attention cursor and nothing else has advanced; the caller
+    /// still owns `index_pos`.
+    #[cfg(all(
+        has_kcoro,
+        has_native_engine,
+        any(
+            all(target_arch = "aarch64", has_flashkern_neon),
+            all(target_arch = "x86_64", has_flashkern_x86)
+        )
+    ))]
+    pub(crate) fn native_token_pass(
+        &self,
+        cache: &mut Cache,
+        index_pos: usize,
+        ids: &[u32],
+        embed_kind: u32,
+        want_logits: bool,
+        vocab: usize,
+    ) -> Result<Option<(Vec<u16>, Option<Vec<f32>>)>> {
+        use crate::flashkern::decode::PtrLen;
+        use crate::flashkern::native_engine::{process_engine, LayerState};
+        let Some(engine) = process_engine() else {
+            return Ok(None);
+        };
+        if !(cache.grouped_gqa_decode
+            && cache.use_kv_cache
+            && cache.fused_conv_decode
+            && crate::bf16_gemm::bf16_gemm_nt_available())
+        {
+            return Ok(None);
+        }
+        // Per-layer state: ensure attention capacity FIRST (growth reallocates), then
+        // capture fresh pointers. Any miss → unserved.
+        let mut states = Vec::with_capacity(self.layers.len());
+        for (l, layer) in self.layers.iter().enumerate() {
+            match &layer.kind {
+                LayerKind::Attention(a) => {
+                    cache.ensure_kv_capacity(
+                        l,
+                        1,
+                        a.n_kv,
+                        a.head_dim,
+                        index_pos + 1,
+                        DType::BF16,
+                        &candle_core::Device::Cpu,
+                    )?;
+                    let Some(sl) = cache.kvs[l].as_ref() else {
+                        return Ok(None);
+                    };
+                    if sl.len != index_pos {
+                        return Ok(None);
+                    }
+                    let (Some(kp), Some(vp)) = (PtrLen::bf16(&sl.k), PtrLen::bf16(&sl.v))
+                    else {
+                        return Ok(None);
+                    };
+                    let cap = sl.k.dim(2)?;
+                    states.push(LayerState {
+                        k_plane: kp.addr() as *mut u16,
+                        v_plane: vp.addr() as *mut u16,
+                        head_stride: cap * a.head_dim,
+                        conv_state: std::ptr::null_mut(),
+                    });
+                }
+                LayerKind::ShortConv(_) => {
+                    let Some(st) = cache.conv_states[l].as_ref() else {
+                        return Ok(None);
+                    };
+                    let Some(sp) = PtrLen::bf16(st) else {
+                        return Ok(None);
+                    };
+                    let mut ls = LayerState::none();
+                    // SAFETY (in-place advance): the engine shifts the carried window
+                    // through this pointer — the same in-place storage mutation
+                    // candle's slice_set performs; decode is sequential and this
+                    // thread blocks for the pass.
+                    ls.conv_state = sp.addr() as *mut u16;
+                    states.push(ls);
+                }
+            }
+        }
+        let (Some(cosp), Some(sinp)) = (PtrLen::bf16(&cache.cos), PtrLen::bf16(&cache.sin))
+        else {
+            return Ok(None);
+        };
+        let hdim = self.embed_tokens.embeddings().dim(1)?;
+        let mut hidden = vec![0u16; hdim];
+        let mut logits = if want_logits { vec![0f32; vocab] } else { Vec::new() };
+        let lanes = rayon::current_num_threads().max(1);
+        let ok = engine.token_pass(
+            ids,
+            embed_kind,
+            &states,
+            index_pos,
+            cosp.addr() as *const u16,
+            sinp.addr() as *const u16,
+            &mut hidden,
+            if want_logits { Some(&mut logits) } else { None },
+            lanes,
+        );
+        if !ok {
+            return Ok(None);
+        }
+        for (l, layer) in self.layers.iter().enumerate() {
+            if matches!(layer.kind, LayerKind::Attention(_)) {
+                cache.advance_kv_cursor(l);
+            }
+        }
+        Ok(Some((hidden, if want_logits { Some(logits) } else { None })))
+    }
+
     pub fn new(cfg: &Lfm2Config, vb: VarBuilder) -> Result<Self> {
         // `lfm` is a bare HF `Lfm2Model` (not `Lfm2ForCausalLM`), so weights sit
         // directly under the given prefix — no `.model.` wrapper. Final norm is

@@ -78,6 +78,28 @@ impl LayerDesc {
     }
 }
 
+/// Mirror of the C `LfmLayerState` — per-layer per-generation state for the token
+/// pass. Pointers are captured fresh each token AFTER capacity is ensured.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct LayerState {
+    pub k_plane: *mut u16,
+    pub v_plane: *mut u16,
+    pub head_stride: usize,
+    pub conv_state: *mut u16,
+}
+
+impl LayerState {
+    pub fn none() -> Self {
+        Self {
+            k_plane: std::ptr::null_mut(),
+            v_plane: std::ptr::null_mut(),
+            head_stride: 0,
+            conv_state: std::ptr::null_mut(),
+        }
+    }
+}
+
 extern "C" {
     fn lfm_engine_new(workers: i32) -> *mut c_void;
     fn lfm_engine_free(e: *mut c_void);
@@ -103,6 +125,29 @@ extern "C" {
         lanes: usize,
     ) -> i32;
     fn lfm_ctx_clear(e: *mut c_void);
+    fn lfm_ctx_set_heads(
+        e: *mut c_void,
+        embed_w: *const u16,
+        vocab: usize,
+        audio_embed_w: *const u16,
+        audio_rows: usize,
+        emb_norm_w: *const u16,
+        emb_norm_eps: f32,
+    ) -> i32;
+    fn lfm_engine_token_pass(
+        e: *mut c_void,
+        ids: *const u32,
+        n_ids: usize,
+        embed_kind: u32,
+        states: *const LayerState,
+        n_states: usize,
+        pos: usize,
+        cos_base: *const u16,
+        sin_base: *const u16,
+        out_hidden: *mut u16,
+        out_logits: *mut f32,
+        lanes: usize,
+    ) -> i32;
     fn lfm_engine_conv_layer(
         e: *mut c_void,
         layer: usize,
@@ -210,6 +255,65 @@ impl NativeEngine {
         // SAFETY: descs copied by the C side before return; dims checked there.
         let rc =
             unsafe { lfm_ctx_build(self.ptr, descs.as_ptr(), descs.len(), h, ffn, max_ctx) };
+        rc == 0
+    }
+
+    /// Install the head tables (text embed / audio embed / final norm / tied logits).
+    pub fn set_heads(
+        &self,
+        embed_w: *const u16,
+        vocab: usize,
+        audio_embed_w: *const u16,
+        audio_rows: usize,
+        emb_norm_w: *const u16,
+        emb_norm_eps: f32,
+    ) -> bool {
+        let _pass = self.pass_lock.lock().unwrap();
+        // SAFETY: pointers guarded live by the same BackboneCtxGuard contract.
+        let rc = unsafe {
+            lfm_ctx_set_heads(self.ptr, embed_w, vocab, audio_embed_w, audio_rows, emb_norm_w, emb_norm_eps)
+        };
+        rc == 0
+    }
+
+    /// ONE token through the whole backbone — embed, every layer, final norm, and
+    /// (when `out_logits` is `Some`) the tied logits head. Sampling stays with the
+    /// caller. `states[l]` carries fresh per-generation pointers; the caller ensured
+    /// plane capacity BEFORE capture and advances its cursors on success.
+    #[must_use = "false = native pass did not run; caller must take the fallback"]
+    #[allow(clippy::too_many_arguments)]
+    pub fn token_pass(
+        &self,
+        ids: &[u32],
+        embed_kind: u32,
+        states: &[LayerState],
+        pos: usize,
+        cos_base: *const u16,
+        sin_base: *const u16,
+        out_hidden: &mut [u16],
+        out_logits: Option<&mut [f32]>,
+        lanes: usize,
+    ) -> bool {
+        let _pass = self.pass_lock.lock().unwrap();
+        let logits_ptr = out_logits.map_or(std::ptr::null_mut(), |l| l.as_mut_ptr());
+        // SAFETY: slice extents by contract with the installed ctx (out_hidden = [H],
+        // out_logits = [vocab]); every pointer outlives this blocking call.
+        let rc = unsafe {
+            lfm_engine_token_pass(
+                self.ptr,
+                ids.as_ptr(),
+                ids.len(),
+                embed_kind,
+                states.as_ptr(),
+                states.len(),
+                pos,
+                cos_base,
+                sin_base,
+                out_hidden.as_mut_ptr(),
+                logits_ptr,
+                lanes,
+            )
+        };
         rc == 0
     }
 
@@ -368,6 +472,62 @@ mod tests {
     // must not interleave. (Each individual call is pass_lock-serialized; this guards
     // the build→use→clear SEQUENCE.)
     static CTX_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn probe_candle_bf16_sum_ladder() {
+        use candle_core::{DType, Device, Tensor};
+        use half::bf16;
+        let dev = Device::Cpu;
+        let (rows, h) = (8usize, 2048usize);
+        let vals: Vec<f32> = (0..rows * h)
+            .map(|j| (((j * 2654435761usize.wrapping_add(7)) % 2000) as f32 / 700.0) - 1.4)
+            .collect();
+        let t = Tensor::from_vec(vals.clone(), (rows, h), &dev)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let want: Vec<u16> = t
+            .sum(0)
+            .unwrap()
+            .to_vec1::<bf16>()
+            .unwrap()
+            .iter()
+            .map(|b| b.to_bits())
+            .collect();
+        let bits: Vec<u16> = t
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<bf16>()
+            .unwrap()
+            .iter()
+            .map(|b| b.to_bits())
+            .collect();
+        // ladder A: sequential bf16 rounds (what the engine does today)
+        let mut seq_bf = vec![0u16; h];
+        for r in 0..rows {
+            for j in 0..h {
+                let a = f32::from_bits((seq_bf[j] as u32) << 16);
+                let b = f32::from_bits((bits[r * h + j] as u32) << 16);
+                let sum = a + b;
+                let u = sum.to_bits();
+                seq_bf[j] = ((u.wrapping_add(0x7fff + ((u >> 16) & 1))) >> 16) as u16;
+            }
+        }
+        // ladder B: f32 accumulate, one final round
+        let mut f32acc = vec![0u16; h];
+        for j in 0..h {
+            let mut acc = 0f32;
+            for r in 0..rows {
+                acc += f32::from_bits((bits[r * h + j] as u32) << 16);
+            }
+            let u = acc.to_bits();
+            f32acc[j] = ((u.wrapping_add(0x7fff + ((u >> 16) & 1))) >> 16) as u16;
+        }
+        let a_match = seq_bf == want;
+        let b_match = f32acc == want;
+        eprintln!("candle sum(0) bf16: sequential-bf16 ladder match = {a_match}, f32-accumulate match = {b_match}");
+        assert!(a_match || b_match, "neither ladder matches candle sum(0)");
+    }
 
     #[test]
     fn native_engine_attn_layer_bit_parity() {

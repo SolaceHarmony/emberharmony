@@ -108,6 +108,7 @@ enum : uint32_t {
     ST_AT_QKV = 9,    // q|k|v projection rows band (3-segment routing) + round
     ST_AT_HEAD = 10,  // one q head: qk dots over the K plane, softmax, av, round
     ST_AT_OPROJ = 11, // o_proj rows band (k = nh·hd) + round + residual add
+    ST_LOGITS = 12,   // tied-head rows band: nt → bf16 round → exact f32 widen
 };
 
 struct Stage {
@@ -124,6 +125,7 @@ enum : int {
     REQ_MLP = 1,
     REQ_CONV_LAYER = 2,
     REQ_ATTN_LAYER = 3,
+    REQ_TOKEN_PASS = 4,
     REQ_SHUTDOWN = -1
 };
 
@@ -224,6 +226,34 @@ struct AtPass {
     size_t h = 0, n_head = 0, n_kv = 0, hd = 0;
 };
 
+// Per-layer per-generation state for the token pass (planes live in the per-cache
+// objects; pointers are captured fresh each token AFTER capacity is ensured).
+extern "C" {
+struct LfmLayerState {
+    uint16_t *k_plane; // attention layers; null for conv
+    uint16_t *v_plane;
+    size_t head_stride;
+    uint16_t *conv_state; // conv layers: carried window, advanced IN PLACE; null for attn
+};
+}
+
+// Token-pass request: ONE doorbell per token — embed → every layer → final norm →
+// logits. Sampling stays at the rim (RNG-stream parity).
+struct TokenReq {
+    const uint32_t *ids = nullptr; // text: 1 id; audio: n pre-offset audio-embed rows
+    size_t n_ids = 0;
+    uint32_t embed_kind = 0; // 0 = text table, 1 = audio table (sum of rows)
+    const LfmLayerState *states = nullptr;
+    size_t n_states = 0;
+    size_t pos = 0;
+    const uint16_t *cos_base = nullptr;
+    const uint16_t *sin_base = nullptr;
+    uint16_t *out_hidden = nullptr; // [H] post embedding-norm bits
+    float *out_logits = nullptr;    // [vocab] f32 (bf16-rounded then widened — the
+                                    // linear_logits ladder)
+    size_t lanes = 0;
+};
+
 struct Engine {
     Pass pass;
     Stage stage;
@@ -247,6 +277,13 @@ struct Engine {
 
     // Resident layer table + dims (lfm_ctx_build); cleared before model drop.
     std::vector<LfmLayerDesc> layers;
+    // Head tables (lfm_ctx_set_heads): embed / audio-embed / final norm / tied logits.
+    const uint16_t *embed_w = nullptr;      // [vocab, H]
+    const uint16_t *audio_embed_w = nullptr; // [audio_rows, H]
+    const uint16_t *emb_norm_w = nullptr;   // [H]
+    float emb_norm_eps = 0.f;
+    size_t vocab = 0, audio_rows = 0;
+    TokenReq tok; // token-pass request payload
     size_t dim_h = 0, dim_ffn = 0, dim_kmax = 0;
     std::atomic<bool> ctx_live{false};
 
@@ -262,6 +299,8 @@ struct Engine {
     // per-head score scratch [nh · max_ctx] f32
     std::vector<float> at_qkvf, at_att;
     std::vector<uint16_t> at_qkvb, at_y;
+    std::vector<uint16_t> tk_h0, tk_h1; // token-pass hidden ping-pong [H]
+    std::vector<float> tk_logf;         // logits GEMV accumulators [vocab] (staging)
     size_t dim_maxctx = 0, dim_nh = 0, dim_nkv = 0, dim_hd = 0;
 };
 
@@ -439,6 +478,22 @@ static void run_tile(uint32_t kind, uint32_t idx, const Stage *st, Engine *e) {
         lfm_bf16_add(c->stage + r0, a->x + r0, a->mid + r0, (int)(r1 - r0));
         break;
     }
+    case ST_LOGITS: {
+        // linear_logits ladder: M==1 GEMV rows (f32 accum) → bf16 storage round →
+        // exact widen to the f32 logits plane. Input = the final normed hidden bits.
+        Engine *ee = e;
+        const TokenReq *t = &ee->tok;
+        size_t r0 = (size_t)idx * st->chunk;
+        size_t r1 = r0 + st->chunk < ee->vocab ? r0 + st->chunk : ee->vocab;
+        if (r1 <= r0) break;
+        float *acc = ee->tk_logf.data() + r0;
+        lfm_bf16_gemm_nt_f32(t->out_hidden, ee->embed_w + r0 * ee->dim_h, acc, 1,
+                             (int)(r1 - r0), (int)ee->dim_h);
+        for (size_t r = r0; r < r1; ++r) {
+            t->out_logits[r] = bf16_f32(rb_bits(ee->tk_logf[r]));
+        }
+        break;
+    }
     default:
         break;
     }
@@ -520,18 +575,18 @@ static void run_mlp(Engine *e) {
 // once on lane 0), banded elementwise/GEMV stages on the board, the tiny conv update
 // serial here (reference: lane 0), then the MLP block on the layer's ffn weights with
 // the conv output as its input — all without leaving the engine.
-static void run_conv_layer(Engine *e) {
-    const ConvReq *r = &e->conv;
-    const LfmLayerDesc *d = &e->layers[r->layer];
+static void run_conv_block(Engine *e, const LfmLayerDesc *d, const uint16_t *x,
+                           const uint16_t *state_in, uint16_t *state_out, uint16_t *out,
+                           size_t lanes) {
     ScPass *c = &e->sc;
     const size_t h = e->dim_h;
 
     // Wire the shortconv stage pointers for this pass.
-    c->x = r->x;
+    c->x = x;
     c->norm_w = d->op_norm_w;
     c->in_w = d->in_w;
     c->out_w = d->out_w;
-    c->state_out = r->state_out;
+    c->state_out = state_out;
     c->h = h;
     c->k = d->k;
     c->xn = e->sc_xn.data();
@@ -543,11 +598,11 @@ static void run_conv_layer(Engine *e) {
     c->stage = e->sc_stage.data();
     c->mid = e->sc_mid.data();
 
-    size_t lanes = r->lanes < 1 ? 1 : r->lanes;
+    if (lanes < 1) lanes = 1;
     uint32_t sc_tiles = (uint32_t)(lanes > h ? h : lanes);
 
     // Stage 1 (serial, candle's exact reduction — reference runs it once on lane 0).
-    float total = lfm_bf16_sumsq_candle_f32(r->x, (int)h);
+    float total = lfm_bf16_sumsq_candle_f32(x, (int)h);
     float inv_rms = 1.0f / std::sqrt(total / (float)h + d->op_eps);
     uint32_t rsb;
     std::memcpy(&rsb, &inv_rms, 4);
@@ -561,8 +616,9 @@ static void run_conv_layer(Engine *e) {
     publish_stage(e, ST_SC_INPROJ, (uint32_t)((3 * h + pc - 1) / pc), pc);
     wait_stage_done(e);
 
-    // Conv update (serial — ~0.1% of the block; reference: lane 0).
-    lfm_conv1d_update_bf16(c->bcxb, r->state_in, d->conv_w, c->conv, 1, (int)h, 1,
+    // Conv update (serial — ~0.1% of the block; reference: lane 0). In-place carried
+    // state is safe: this reads state_in fully before ST_SC_GATHER writes state_out.
+    lfm_conv1d_update_bf16(c->bcxb, state_in, d->conv_w, c->conv, 1, (int)h, 1,
                            (int)d->k);
 
     publish_stage(e, ST_SC_GATHER, (uint32_t)((h + hc - 1) / hc), hc);
@@ -571,7 +627,7 @@ static void run_conv_layer(Engine *e) {
     publish_stage(e, ST_SC_OUTPROJ, (uint32_t)((h + hc - 1) / hc), hc);
     wait_stage_done(e);
 
-    // MLP block on the layer's ffn weights: input = mid, output = the request's out.
+    // MLP block on the layer's ffn weights: input = mid, output = out.
     Pass *m = &e->pass;
     size_t cap = h < e->dim_ffn ? h : e->dim_ffn;
     m->x = c->mid;
@@ -579,7 +635,7 @@ static void run_conv_layer(Engine *e) {
     m->w1 = d->w1;
     m->w3 = d->w3;
     m->w2 = d->w2;
-    m->out = r->out;
+    m->out = out;
     m->h = h;
     m->i = e->dim_ffn;
     m->eps = d->ffn_eps;
@@ -593,6 +649,12 @@ static void run_conv_layer(Engine *e) {
     m->t = e->sc_t.data();
     m->rs_bits.store(0, std::memory_order_relaxed);
     run_mlp(e);
+}
+
+static void run_conv_layer(Engine *e) {
+    const ConvReq *r = &e->conv;
+    run_conv_block(e, &e->layers[r->layer], r->x, r->state_in, r->state_out, r->out,
+                   r->lanes);
 }
 
 // Serial per-head helpers for the attention pass (tiny next to the GEMVs; the
@@ -637,19 +699,21 @@ static void rope_slow_row(uint16_t *x, const uint16_t *cos_row, const uint16_t *
 // One whole attention+MLP layer. Stage bodies are the candle wrapper ops and
 // attn_decode_bf16 ported at the same rounding points; the serial section (qk-norm,
 // rope, KV append) is per-head work two orders of magnitude below the GEMVs.
-static void run_attn_layer(Engine *e) {
-    const AttnReq *r = &e->attn;
-    const LfmLayerDesc *d = &e->layers[r->layer];
+static void run_attn_block(Engine *e, size_t layer_idx, const uint16_t *x,
+                           uint16_t *k_plane, uint16_t *v_plane, size_t head_stride,
+                           size_t pos, const uint16_t *cos_base,
+                           const uint16_t *sin_base, uint16_t *out, size_t lanes) {
+    const LfmLayerDesc *d = &e->layers[layer_idx];
     ScPass *c = &e->sc;
     AtPass *a = &e->at;
     const size_t h = e->dim_h;
     const size_t nh = d->n_head, nkv = d->n_kv, hd = d->hd;
-    size_t lanes = r->lanes < 1 ? 1 : r->lanes;
+    if (lanes < 1) lanes = 1;
     uint32_t tiles = (uint32_t)(lanes > h ? h : lanes);
 
     // Wire stage pointers. The conv pass planes are reused where shapes allow — a
     // single request is in flight at a time, never both kinds at once.
-    c->x = r->x;
+    c->x = x;
     c->norm_w = d->op_norm_w;
     c->h = h;
     c->xn = e->sc_xn.data();
@@ -660,12 +724,12 @@ static void run_attn_layer(Engine *e) {
     a->qkvb = e->at_qkvb.data();
     a->ybits = e->at_y.data();
     a->att = e->at_att.data();
-    a->x = r->x;
+    a->x = x;
     a->mid = e->sc_mid.data();
-    a->k_plane = r->k_plane;
-    a->v_plane = r->v_plane;
-    a->head_stride = r->head_stride;
-    a->att_len = r->pos + 1;
+    a->k_plane = k_plane;
+    a->v_plane = v_plane;
+    a->head_stride = head_stride;
+    a->att_len = pos + 1;
     a->max_ctx = e->dim_maxctx;
     a->h = h;
     a->n_head = nh;
@@ -673,7 +737,7 @@ static void run_attn_layer(Engine *e) {
     a->hd = hd;
 
     // operator norm: candle-order sumsq (serial) + banded norm apply.
-    float total = lfm_bf16_sumsq_candle_f32(r->x, (int)h);
+    float total = lfm_bf16_sumsq_candle_f32(x, (int)h);
     float inv_rms = 1.0f / std::sqrt(total / (float)h + d->op_eps);
     uint32_t rsb;
     std::memcpy(&rsb, &inv_rms, 4);
@@ -689,8 +753,8 @@ static void run_attn_layer(Engine *e) {
     wait_stage_done(e);
 
     // Serial: per-head qk-norm + rope, then append this step's K/V rows at the cursor.
-    const uint16_t *cos_row = r->cos_base + r->pos * (hd / 2);
-    const uint16_t *sin_row = r->sin_base + r->pos * (hd / 2);
+    const uint16_t *cos_row = cos_base + pos * (hd / 2);
+    const uint16_t *sin_row = sin_base + pos * (hd / 2);
     uint16_t *qrows = a->qkvb;
     uint16_t *krows = a->qkvb + nh * hd;
     const uint16_t *vrows = a->qkvb + (nh + nkv) * hd;
@@ -701,9 +765,9 @@ static void run_attn_layer(Engine *e) {
     for (size_t kh = 0; kh < nkv; ++kh) {
         qk_norm_row(krows + kh * hd, d->kn_w, krows + kh * hd, hd, d->qk_eps);
         rope_slow_row(krows + kh * hd, cos_row, sin_row, hd);
-        std::memcpy(r->k_plane + kh * r->head_stride + r->pos * hd, krows + kh * hd,
+        std::memcpy(k_plane + kh * head_stride + pos * hd, krows + kh * hd,
                     hd * sizeof(uint16_t));
-        std::memcpy(r->v_plane + kh * r->head_stride + r->pos * hd, vrows + kh * hd,
+        std::memcpy(v_plane + kh * head_stride + pos * hd, vrows + kh * hd,
                     hd * sizeof(uint16_t));
     }
 
@@ -723,7 +787,7 @@ static void run_attn_layer(Engine *e) {
     m->w1 = d->w1;
     m->w3 = d->w3;
     m->w2 = d->w2;
-    m->out = r->out;
+    m->out = out;
     m->h = h;
     m->i = e->dim_ffn;
     m->eps = d->ffn_eps;
@@ -734,6 +798,78 @@ static void run_attn_layer(Engine *e) {
     m->t = e->sc_t.data();
     m->rs_bits.store(0, std::memory_order_relaxed);
     run_mlp(e);
+}
+
+static void run_attn_layer(Engine *e) {
+    const AttnReq *r = &e->attn;
+    run_attn_block(e, r->layer, r->x, r->k_plane, r->v_plane, r->head_stride, r->pos,
+                   r->cos_base, r->sin_base, r->out, r->lanes);
+}
+
+// THE token pass: embed → every layer (ping-pong hidden planes, per-layer state from
+// the request) → final embedding-norm → tied logits. One doorbell per token; the
+// doorbell (shutdown/cancel) is observed only between passes.
+static void run_token_pass(Engine *e) {
+    const TokenReq *t = &e->tok;
+    const size_t h = e->dim_h;
+    size_t lanes = t->lanes < 1 ? 1 : t->lanes;
+    uint16_t *h0 = e->tk_h0.data();
+    uint16_t *h1 = e->tk_h1.data();
+
+    // Embed (serial — at most 8 rows). Text: one table row copied verbatim. Audio:
+    // candle's `.sum(0)` over the gathered rows — sequential bf16 adds from a bf16
+    // zero, one RNE round per step (candle's in-dtype CPU reduction).
+    if (t->embed_kind == 0) {
+        std::memcpy(h0, e->embed_w + (size_t)t->ids[0] * h, h * sizeof(uint16_t));
+    } else {
+        for (size_t j = 0; j < h; ++j) h0[j] = 0;
+        for (size_t c = 0; c < t->n_ids; ++c) {
+            const uint16_t *row = e->audio_embed_w + (size_t)t->ids[c] * h;
+            for (size_t j = 0; j < h; ++j) {
+                h0[j] = rb_bits(bf16_f32(h0[j]) + bf16_f32(row[j]));
+            }
+        }
+    }
+
+    // The layer walk. x = h0, out = h1, swap — no Tensor, no Rust, no copies.
+    for (size_t l = 0; l < e->layers.size(); ++l) {
+        const LfmLayerDesc *d = &e->layers[l];
+        const LfmLayerState *st = &t->states[l];
+        if (d->kind == 0) {
+            run_conv_block(e, d, h0, st->conv_state, st->conv_state, h1, lanes);
+        } else {
+            e->attn.layer = l; // ST_AT_QKV routes weights via this index
+            run_attn_block(e, l, h0, st->k_plane, st->v_plane, st->head_stride, t->pos,
+                           t->cos_base, t->sin_base, h1, lanes);
+        }
+        uint16_t *tmp = h0;
+        h0 = h1;
+        h1 = tmp;
+    }
+
+    // Final embedding-norm (candle RmsNorm: f32 arithmetic, one bf16 round), banded.
+    ScPass *c = &e->sc;
+    float total = lfm_bf16_sumsq_candle_f32(h0, (int)h);
+    float inv_rms = 1.0f / std::sqrt(total / (float)h + e->emb_norm_eps);
+    uint32_t rsb;
+    std::memcpy(&rsb, &inv_rms, 4);
+    c->rs_bits.store(rsb, std::memory_order_release);
+    c->x = h0;
+    c->norm_w = e->emb_norm_w;
+    c->h = h;
+    c->xn = t->out_hidden;
+    uint32_t tiles = (uint32_t)(lanes > h ? h : lanes);
+    uint32_t hc = (uint32_t)((h + tiles - 1) / tiles);
+    publish_stage(e, ST_SC_NORM, (uint32_t)((h + hc - 1) / hc), hc);
+    wait_stage_done(e);
+
+    // Tied logits head over the normed hidden — the heavy stage; real row bands.
+    if (t->out_logits && e->vocab > 0) {
+        uint32_t vc = (uint32_t)((e->vocab + (size_t)e->n_workers * 4 - 1) /
+                                 ((size_t)e->n_workers * 4));
+        publish_stage(e, ST_LOGITS, (uint32_t)((e->vocab + vc - 1) / vc), vc);
+        wait_stage_done(e);
+    }
 }
 
 static void coord_main(void *arg) {
@@ -754,6 +890,7 @@ static void coord_main(void *arg) {
         if (req == REQ_MLP) run_mlp(e);
         if (req == REQ_CONV_LAYER) run_conv_layer(e);
         if (req == REQ_ATTN_LAYER) run_attn_layer(e);
+        if (req == REQ_TOKEN_PASS) run_token_pass(e);
         // Pass boundary: hand back (signal from coroutine context never blocks).
         pthread_mutex_lock(&e->mu);
         e->finished = 1;
@@ -934,6 +1071,8 @@ int lfm_ctx_build(void *ep, const LfmLayerDesc *descs, size_t n_layers, size_t h
             e->at_y.resize(nh * hd);
             e->at_att.resize(nh * max_ctx);
         }
+        e->tk_h0.resize(h);
+        e->tk_h1.resize(h);
     } catch (const std::bad_alloc &) {
         e->layers.clear();
         return -2;
@@ -949,6 +1088,27 @@ int lfm_ctx_build(void *ep, const LfmLayerDesc *descs, size_t n_layers, size_t h
     return 0;
 }
 
+// Install the head tables (embed / audio-embed / final norm / tied logits) — the
+// token pass needs them; the per-layer entries do not. Serialized by the rim.
+int lfm_ctx_set_heads(void *ep, const uint16_t *embed_w, size_t vocab,
+                      const uint16_t *audio_embed_w, size_t audio_rows,
+                      const uint16_t *emb_norm_w, float emb_norm_eps) {
+    Engine *e = (Engine *)ep;
+    if (!e || !embed_w || !emb_norm_w || vocab == 0) return -1;
+    try {
+        e->tk_logf.resize(vocab);
+    } catch (const std::bad_alloc &) {
+        return -2;
+    }
+    e->embed_w = embed_w;
+    e->vocab = vocab;
+    e->audio_embed_w = audio_embed_w;
+    e->audio_rows = audio_rows;
+    e->emb_norm_w = emb_norm_w;
+    e->emb_norm_eps = emb_norm_eps;
+    return 0;
+}
+
 // Clear the table (weight pointers are about to die with the model). Serialized by the
 // Rust rim's pass lock, so no pass is in flight here.
 void lfm_ctx_clear(void *ep) {
@@ -956,6 +1116,11 @@ void lfm_ctx_clear(void *ep) {
     if (!e) return;
     e->ctx_live.store(false, std::memory_order_release);
     e->layers.clear();
+    e->embed_w = nullptr;
+    e->audio_embed_w = nullptr;
+    e->emb_norm_w = nullptr;
+    e->vocab = 0;
+    e->audio_rows = 0;
 }
 
 // One whole shortconv+MLP layer: request slot → doorbell → park. Returns 0 on
@@ -1022,6 +1187,63 @@ int lfm_engine_attn_layer(void *ep, size_t layer, const uint16_t *x, uint16_t *k
     pthread_mutex_unlock(&e->mu);
 
     e->req.store(REQ_ATTN_LAYER, std::memory_order_release);
+    kcoro_unpark(e->coord);
+
+    pthread_mutex_lock(&e->mu);
+    while (!e->finished) pthread_cond_wait(&e->cv, &e->mu);
+    pthread_mutex_unlock(&e->mu);
+    return 0;
+}
+
+// ONE token through the whole backbone: embed → every layer → final norm → logits.
+// `states` is one LfmLayerState per table slot (fresh pointers each token — the caller
+// ensures plane capacity BEFORE capture). Returns 0 on success; -3 when unserved (no
+// ctx/heads, an attention slot without capture, bad ids, or pos over capacity).
+int lfm_engine_token_pass(void *ep, const uint32_t *ids, size_t n_ids,
+                          uint32_t embed_kind, const LfmLayerState *states,
+                          size_t n_states, size_t pos, const uint16_t *cos_base,
+                          const uint16_t *sin_base, uint16_t *out_hidden,
+                          float *out_logits, size_t lanes) {
+    Engine *e = (Engine *)ep;
+    if (!e || !ids || n_ids == 0 || !states || !out_hidden) return -1;
+    if (!e->ctx_live.load(std::memory_order_acquire) || !e->embed_w || !e->emb_norm_w ||
+        n_states != e->layers.size() || pos + 1 > e->dim_maxctx)
+        return -3;
+    if (embed_kind == 0) {
+        if (ids[0] >= e->vocab) return -3;
+    } else {
+        if (!e->audio_embed_w || n_ids > 8) return -3;
+        for (size_t c = 0; c < n_ids; ++c)
+            if (ids[c] >= e->audio_rows) return -3;
+    }
+    // Every attention slot must be served and carry planes; conv slots need state.
+    for (size_t l = 0; l < e->layers.size(); ++l) {
+        if (e->layers[l].kind == 1) {
+            if (!e->layers[l].q_w || !states[l].k_plane || !states[l].v_plane ||
+                !cos_base || !sin_base)
+                return -3;
+        } else if (!states[l].conv_state) {
+            return -3;
+        }
+    }
+
+    e->tok.ids = ids;
+    e->tok.n_ids = n_ids;
+    e->tok.embed_kind = embed_kind;
+    e->tok.states = states;
+    e->tok.n_states = n_states;
+    e->tok.pos = pos;
+    e->tok.cos_base = cos_base;
+    e->tok.sin_base = sin_base;
+    e->tok.out_hidden = out_hidden;
+    e->tok.out_logits = out_logits;
+    e->tok.lanes = lanes < 1 ? 1 : (lanes > MAX_WORKERS ? MAX_WORKERS : lanes);
+
+    pthread_mutex_lock(&e->mu);
+    e->finished = 0;
+    pthread_mutex_unlock(&e->mu);
+
+    e->req.store(REQ_TOKEN_PASS, std::memory_order_release);
     kcoro_unpark(e->coord);
 
     pthread_mutex_lock(&e->mu);
