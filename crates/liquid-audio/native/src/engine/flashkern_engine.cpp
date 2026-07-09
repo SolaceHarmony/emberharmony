@@ -159,7 +159,18 @@ enum : int {
     REQ_CONV_LAYER = 2,
     REQ_ATTN_LAYER = 3,
     REQ_TOKEN_PASS = 4,
+    // Generic lane-uniform call: every lane runs fn(ctx, lane, lanes_total); the
+    // program synchronizes itself via lfm_lane_fence. This is what lets OTHER
+    // lane-uniform programs (the Rust depthformer frame) ride the SAME team —
+    // one dispatcher for the whole token, no foreign thread pools in the hot path.
+    REQ_CALL = 5,
     REQ_SHUTDOWN = -1
+};
+
+typedef void (*LfmLaneFn)(void *ctx, uint32_t lane, uint32_t lanes_total);
+struct CallReq {
+    LfmLaneFn fn = nullptr;
+    void *ctx = nullptr;
 };
 
 // ---- the resident layer table (C ABI) ------------------------------------------------
@@ -319,6 +330,7 @@ struct Engine {
 
     ConvReq conv;  // conv-layer request payload
     AttnReq attn;  // attention-layer request payload
+    CallReq call;  // generic lane-uniform call payload
     ScPass sc;     // shortconv stage pointers
     AtPass at;     // attention stage pointers
 
@@ -957,6 +969,9 @@ static void lane_program(Engine *e, uint32_t lane) {
     case REQ_TOKEN_PASS:
         run_token_pass(e, lane);
         break;
+    case REQ_CALL:
+        e->call.fn(e->call.ctx, lane, e->lanes_total);
+        break;
     default:
         break;
     }
@@ -1036,22 +1051,61 @@ void *lfm_engine_new(int workers) {
         delete e;
         return nullptr;
     }
+    // 512 KiB lane stacks: REQ_CALL runs caller-supplied Rust lane programs on these
+    // stacks (the depthformer frame samples with candle ops on lane 0). mmap'd —
+    // untouched pages cost nothing.
     for (int w = 0; w < e->n_workers; ++w) {
         e->largs[w].e = e;
         e->largs[w].lane = (uint32_t)(w + 1);
-        if (kc_dispatcher_spawn_co(e->disp, lane_main, &e->largs[w], 128 * 1024,
+        if (kc_dispatcher_spawn_co(e->disp, lane_main, &e->largs[w], 512 * 1024,
                                    &e->workers[w]) != 0 ||
             !e->workers[w]) {
             lfm_engine_free(e);
             return nullptr;
         }
     }
-    if (kc_dispatcher_spawn_co(e->disp, coord_main, e, 256 * 1024, &e->coord) != 0 ||
+    if (kc_dispatcher_spawn_co(e->disp, coord_main, e, 512 * 1024, &e->coord) != 0 ||
         !e->coord) {
         lfm_engine_free(e);
         return nullptr;
     }
     return e;
+}
+
+// Run a caller-supplied lane-uniform program on the whole team: fn(ctx, lane, lanes)
+// on every lane, synchronized internally via lfm_lane_fence. One doorbell, one
+// completion — the same contract as every other pass. The caller's ctx must stay
+// valid for the (blocking) duration of this call.
+int lfm_engine_call(void *ep, LfmLaneFn fn, void *ctx) {
+    Engine *e = (Engine *)ep;
+    if (!e || !fn) return -1;
+
+    e->call.fn = fn;
+    e->call.ctx = ctx;
+
+    pthread_mutex_lock(&e->mu);
+    e->finished = 0;
+    pthread_mutex_unlock(&e->mu);
+
+    e->req.store(REQ_CALL, std::memory_order_release);
+    kcoro_unpark(e->coord);
+
+    pthread_mutex_lock(&e->mu);
+    while (!e->finished) pthread_cond_wait(&e->cv, &e->mu);
+    pthread_mutex_unlock(&e->mu);
+    return 0;
+}
+
+// The team fence, exported for REQ_CALL programs: pure barrier (empty serial
+// section). Callable ONLY from within a lane program on this engine's team.
+void lfm_lane_fence(void *ep, uint32_t lane) {
+    Engine *e = (Engine *)ep;
+    lane_fence(e, lane, [] {});
+}
+
+uint32_t lfm_engine_lanes(void *ep) {
+    Engine *e = (Engine *)ep;
+    return e ? e->lanes_total : 0;
 }
 
 void lfm_engine_free(void *ep) {

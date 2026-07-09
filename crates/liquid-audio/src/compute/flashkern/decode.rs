@@ -64,6 +64,44 @@ impl SpinBarrier {
     }
 }
 
+/// Stage fence for lane-uniform programs: the engine team's fence when the program
+/// rides the kcoro lanes (bounded spin, then a precise parked wake — the engine's
+/// own barrier), or the spinning [`SpinBarrier`] on the rayon threadgroup fallback.
+/// Numerics never depend on which — banding and ladders are identical.
+pub(crate) trait LaneFence: Sync {
+    fn wait(&self, lane: usize);
+}
+
+impl LaneFence for SpinBarrier {
+    fn wait(&self, _lane: usize) {
+        SpinBarrier::wait(self);
+    }
+}
+
+#[cfg(all(
+    has_kcoro,
+    has_native_engine,
+    any(
+        all(target_arch = "aarch64", has_flashkern_neon),
+        all(target_arch = "x86_64", has_flashkern_x86)
+    )
+))]
+struct EngineFence<'a>(&'a crate::flashkern::native_engine::NativeEngine);
+
+#[cfg(all(
+    has_kcoro,
+    has_native_engine,
+    any(
+        all(target_arch = "aarch64", has_flashkern_neon),
+        all(target_arch = "x86_64", has_flashkern_x86)
+    )
+))]
+impl LaneFence for EngineFence<'_> {
+    fn wait(&self, lane: usize) {
+        self.0.lane_fence(lane);
+    }
+}
+
 /// `true` when the fused decode blocks can run: the STRICT nt-kernel gate — the looser
 /// [`bf16_gemm_available`](crate::bf16_gemm::bf16_gemm_available) is also satisfied by the
 /// reference-kernel-only aarch64 build, which has no nt kernel and would panic in
@@ -622,6 +660,29 @@ impl DepthDecode {
         let scale = 1.0f32 / (hd as f32).sqrt();
         let mut s = self.scratch.lock().expect("depth scratch poisoned");
         let s = &mut *s;
+        // Lane count comes from OUR team when the engine is up — a foreign pool has
+        // no authority over this kernel's width. Non-engine builds keep rayon sizing.
+        // Both size from the P-core count, so banding (and therefore bits) agrees.
+        #[cfg(all(
+        has_kcoro,
+        has_native_engine,
+        any(
+            all(target_arch = "aarch64", has_flashkern_neon),
+            all(target_arch = "x86_64", has_flashkern_x86)
+        )
+        ))]
+        let lanes = crate::flashkern::native_engine::process_engine()
+            .map(|e| e.lanes_total())
+            .unwrap_or_else(|| rayon::current_num_threads())
+            .clamp(1, 16);
+        #[cfg(not(all(
+        has_kcoro,
+        has_native_engine,
+        any(
+            all(target_arch = "aarch64", has_flashkern_neon),
+            all(target_arch = "x86_64", has_flashkern_x86)
+        )
+        )))]
         let lanes = rayon::current_num_threads().clamp(1, 16);
 
         // din = rb(depth_linear(emb) + bias): one GEMV over the backbone hidden, rounded
@@ -651,26 +712,24 @@ impl DepthDecode {
         let tokens = &tokens;
         // The sampler runs on lane 0 between barriers; hand it the &mut via a take-once slot.
         let sampler_cell = std::sync::Mutex::new(Some(&mut sample));
-        let _dispatch = DISPATCH_LOCK.lock().unwrap();
-        let barrier = SpinBarrier::new(lanes);
-        let barrier = &barrier;
         let this = &*self;
 
-        rayon::scope(|scope| {
-            for lane in 0..lanes {
-                let sampler_slot = if lane == 0 {
-                    Some(
-                        sampler_cell
-                            .lock()
-                            .unwrap()
-                            .take()
-                            .expect("sampler taken once"),
-                    )
-                } else {
-                    None
-                };
-                scope.spawn(move |_| {
-                    let mut sampler_slot = sampler_slot;
+        // The lane-uniform frame program: every lane runs the whole walk, `fence`
+        // separates the stages. On the engine team this is ONE doorbell per frame on
+        // the same kcoro lanes as the backbone — no rayon, no SpinBarrier, no
+        // DISPATCH_LOCK in the production path.
+        let run_lane = |lane: usize, fence: &dyn LaneFence| {
+                    let mut sampler_slot = if lane == 0 {
+                        Some(
+                            sampler_cell
+                                .lock()
+                                .unwrap()
+                                .take()
+                                .expect("sampler taken once"),
+                        )
+                    } else {
+                        None
+                    };
                     let own = |n: usize, l: usize| -> (usize, usize) {
                         let c = n.div_ceil(lanes);
                         ((l * c).min(n), ((l + 1) * c).min(n))
@@ -739,7 +798,7 @@ impl DepthDecode {
                             unsafe { sh_df.set(i, 0) };
                         }
                     }
-                    barrier.wait();
+                    fence.wait(lane);
 
                     for cb in 0..cb_n {
                         // ---- cur = rb(din[cb] + df_token) → x ----
@@ -757,7 +816,7 @@ impl DepthDecode {
                                 }
                             }
                         }
-                        barrier.wait();
+                        fence.wait(lane);
 
                         for (li, lw) in this.layers.iter().enumerate() {
                             let kbase = (li * kvh) * cb_n * hd;
@@ -770,7 +829,7 @@ impl DepthDecode {
                                 dim,
                                 lane,
                                 lanes,
-                                barrier,
+                                fence,
                             );
                             // ---- qkv GEMV + per-row rb ----
                             gemv(&lw.qkv_w, sh_xn.ptr(), sh_qkvf, qkv_out, dim, lane);
@@ -787,7 +846,7 @@ impl DepthDecode {
                                     };
                                 }
                             }
-                            barrier.wait();
+                            fence.wait(lane);
                             // ---- per-head qk-norm + rope; K/V rows into the resident planes ----
                             {
                                 let total_heads = heads + kvh; // q heads then k heads
@@ -832,7 +891,7 @@ impl DepthDecode {
                                     }
                                 }
                             }
-                            barrier.wait();
+                            fence.wait(lane);
                             // ---- attention per q-head over the planes ----
                             {
                                 let (h0, h1) = own(heads, lane);
@@ -861,7 +920,7 @@ impl DepthDecode {
                                     }
                                 }
                             }
-                            barrier.wait();
+                            fence.wait(lane);
                             {
                                 let (d0, d1) = own(dim, lane);
                                 if d1 > d0 {
@@ -875,7 +934,7 @@ impl DepthDecode {
                                     };
                                 }
                             }
-                            barrier.wait();
+                            fence.wait(lane);
                             // ---- out_proj + residual → h ----
                             gemv(&lw.out_w, sh_attnb.ptr(), sh_projf, dim, dim, lane);
                             {
@@ -897,7 +956,7 @@ impl DepthDecode {
                                     }
                                 }
                             }
-                            barrier.wait();
+                            fence.wait(lane);
                             // ---- ffn_norm(h) → xn; w1/w3 → swiglu → t; w2 + residual → x ----
                             this.norm_stage(
                                 sh_h.ptr(),
@@ -907,7 +966,7 @@ impl DepthDecode {
                                 dim,
                                 lane,
                                 lanes,
-                                barrier,
+                                fence,
                             );
                             gemv(&lw.w1, sh_xn.ptr(), sh_projf, this.ff, dim, lane);
                             gemv(&lw.w3, sh_xn.ptr(), sh_uf, this.ff, dim, lane);
@@ -925,7 +984,7 @@ impl DepthDecode {
                                     }
                                 }
                             }
-                            barrier.wait();
+                            fence.wait(lane);
                             gemv(&lw.w2, sh_tb.ptr(), sh_projf, dim, this.ff, lane);
                             {
                                 let (d0, d1) = own(dim, lane);
@@ -946,7 +1005,7 @@ impl DepthDecode {
                                     }
                                 }
                             }
-                            barrier.wait();
+                            fence.wait(lane);
                         }
 
                         // ---- get_logits: embedding_norm(x) → to_logits GEMV → rb → sample ----
@@ -959,7 +1018,7 @@ impl DepthDecode {
                             dim,
                             lane,
                             lanes,
-                            barrier,
+                            fence,
                         );
                         gemv(&hw.logits, sh_xn.ptr(), sh_projf, hw.vocab, dim, lane);
                         {
@@ -975,7 +1034,7 @@ impl DepthDecode {
                                 };
                             }
                         }
-                        barrier.wait();
+                        fence.wait(lane);
                         if let Some(sampler) = sampler_slot.as_mut() {
                             // SAFETY: post-barrier read-only logits view on lane 0.
                             let logits = unsafe {
@@ -984,7 +1043,7 @@ impl DepthDecode {
                             tokens[cb]
                                 .store((sampler)(logits), std::sync::atomic::Ordering::Release);
                         }
-                        barrier.wait();
+                        fence.wait(lane);
                         // ---- df_token = embed row of the sampled token ----
                         let tok = tokens[cb].load(std::sync::atomic::Ordering::Acquire) as usize;
                         {
@@ -994,11 +1053,38 @@ impl DepthDecode {
                                 unsafe { sh_df.set(i, *hw.emb.u16_ptr().add(tok * dim + i)) };
                             }
                         }
-                        barrier.wait();
+                        fence.wait(lane);
                     }
-                });
+        };
+
+        // Engine team first: the depthformer rides the SAME lanes as the backbone.
+        // Fallback (engine absent): the original rayon + SpinBarrier threadgroup,
+        // bit-identical banding, still caged by DISPATCH_LOCK.
+        let mut dispatched = false;
+        #[cfg(all(
+            has_kcoro,
+            has_native_engine,
+            any(
+                all(target_arch = "aarch64", has_flashkern_neon),
+                all(target_arch = "x86_64", has_flashkern_x86)
+            )
+        ))]
+        if let Some(engine) = crate::flashkern::native_engine::process_engine() {
+            if engine.lanes_total() == lanes {
+                dispatched = engine.run_lanes(|lane| run_lane(lane, &EngineFence(engine)));
             }
-        });
+        }
+        if !dispatched {
+            let _dispatch = DISPATCH_LOCK.lock().unwrap();
+            let barrier = SpinBarrier::new(lanes);
+            let barrier = &barrier;
+            let run_lane = &run_lane;
+            rayon::scope(|scope| {
+                for lane in 0..lanes {
+                    scope.spawn(move |_| run_lane(lane, barrier));
+                }
+            });
+        }
 
         tokens
             .iter()
@@ -1019,7 +1105,7 @@ impl DepthDecode {
         n: usize,
         lane: usize,
         lanes: usize,
-        barrier: &SpinBarrier,
+        fence: &dyn LaneFence,
     ) {
         let c = n.div_ceil(lanes);
         let (r0, r1) = ((lane * c).min(n), ((lane + 1) * c).min(n));
@@ -1030,7 +1116,7 @@ impl DepthDecode {
             0.0
         };
         unsafe { part.set(lane, p) };
-        barrier.wait();
+        fence.wait(lane);
         let mut total = 0f32;
         for l in 0..lanes {
             // SAFETY: post-barrier read-only partials.
@@ -1049,7 +1135,7 @@ impl DepthDecode {
                 );
             }
         }
-        barrier.wait();
+        fence.wait(lane);
     }
 
     /// One q/k head: qk RMSNorm over `hd` (per-head, the BoundedAttention ladder) then

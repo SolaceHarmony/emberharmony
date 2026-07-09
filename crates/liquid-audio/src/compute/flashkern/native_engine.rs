@@ -126,6 +126,13 @@ extern "C" {
         lanes: usize,
     ) -> i32;
     fn lfm_ctx_clear(e: *mut c_void, id: u64);
+    fn lfm_engine_call(
+        e: *mut c_void,
+        f: unsafe extern "C" fn(*mut c_void, u32, u32),
+        ctx: *mut c_void,
+    ) -> i32;
+    fn lfm_lane_fence(e: *mut c_void, lane: u32);
+    fn lfm_engine_lanes(e: *mut c_void) -> u32;
     fn lfm_ctx_set_heads(
         e: *mut c_void,
         embed_w: *const u16,
@@ -386,6 +393,56 @@ impl NativeEngine {
         let _pass = self.pass_lock.lock().unwrap();
         // SAFETY: engine pointer valid for the process lifetime.
         unsafe { lfm_ctx_clear(self.ptr, id) };
+    }
+
+    /// The team's lane count — the ONE authority for lane-uniform program sizing.
+    /// (Previously programs asked rayon, i.e. a foreign pool, for our kernel's width.)
+    pub fn lanes_total(&self) -> usize {
+        // SAFETY: engine pointer valid for the process lifetime; pure read.
+        unsafe { lfm_engine_lanes(self.ptr) as usize }
+    }
+
+    /// The team fence, for use INSIDE a [`Self::run_lanes`] program only: pure
+    /// barrier across all lanes, release/acquire on both sides.
+    pub fn lane_fence(&self, lane: usize) {
+        // SAFETY: contract above — caller is a lane program on this engine's team.
+        unsafe { lfm_lane_fence(self.ptr, lane as u32) };
+    }
+
+    /// Run a lane-uniform program on the whole team: `f(lane)` executes concurrently
+    /// on every lane (0..lanes_total), synchronizing itself via [`Self::lane_fence`].
+    /// Blocks until every lane completes (the engine's program-final fence). One
+    /// doorbell in, one completion out — the same wake budget as a token pass.
+    /// A panic in `f` aborts the process (it cannot unwind across the C boundary).
+    #[must_use = "false = engine refused; caller must take the fallback dispatch"]
+    pub fn run_lanes<F: Fn(usize) + Sync>(&self, f: F) -> bool {
+        unsafe extern "C" fn trampoline<F: Fn(usize) + Sync>(
+            ctx: *mut c_void,
+            lane: u32,
+            _lanes: u32,
+        ) {
+            let call = || {
+                // SAFETY: ctx is &F, valid for the blocking duration of run_lanes.
+                let f = unsafe { &*(ctx as *const F) };
+                f(lane as usize);
+            };
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(call)).is_err() {
+                // Unwinding into kcoro/C++ frames is UB; die loudly instead.
+                eprintln!("[flashkern] panic in lane program (lane {lane}); aborting");
+                std::process::abort();
+            }
+        }
+        let _pass = self.pass_lock.lock().unwrap();
+        // SAFETY: single-slot engine serialized by pass_lock; &f outlives the
+        // blocking call; trampoline::<F> matches the C ABI.
+        let rc = unsafe {
+            lfm_engine_call(
+                self.ptr,
+                trampoline::<F>,
+                &f as *const F as *mut c_void,
+            )
+        };
+        rc == 0
     }
 
     /// One whole shortconv+MLP layer in a single doorbell — bit-identical to the
