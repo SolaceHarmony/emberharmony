@@ -571,7 +571,35 @@ static void publish_stage(Engine *e, uint32_t kind, uint32_t count, uint32_t chu
     for (int w = 0; w < e->n_workers; ++w) kcoro_unpark(e->workers[w]);
 }
 
+// The coordinator PARTICIPATES: after publishing it claims tiles off the same board
+// instead of parking. Stage START therefore never depends on a worker wake (the
+// coordinator is already running), and stage END usually needs no wake either — the
+// coordinator often runs the last tile itself. This collapses the per-stage critical
+// wake count from ~2 to ~0 and removes the run-to-run underrun lottery that kc_sched's
+// lossy park_cv signal (5ms timed-wait recovery) made of the CPU real-time path
+// (observed: same build, 24,832 vs 243,968 underrun samples across two runs).
+static void coord_run_tiles(Engine *e) {
+    const uint32_t kind = e->stage.kind;
+    const uint32_t count = e->stage.count;
+    uint64_t b = e->stage.board.load(std::memory_order_acquire);
+    const uint32_t ep = board_epoch(b);
+    for (;;) {
+        if (board_epoch(b) != ep) break;
+        uint32_t idx = board_next(b);
+        if (idx >= count) break;
+        if (!e->stage.board.compare_exchange_weak(b, board_pack(ep, idx + 1),
+                                                  std::memory_order_acq_rel,
+                                                  std::memory_order_acquire)) {
+            continue;
+        }
+        run_tile(kind, idx, &e->stage, e);
+        e->stage.remaining.fetch_sub(1, std::memory_order_acq_rel);
+        b = e->stage.board.load(std::memory_order_acquire);
+    }
+}
+
 static void wait_stage_done(Engine *e) {
+    coord_run_tiles(e); // work first: the board is usually drained by the time we park
     while (e->stage.remaining.load(std::memory_order_acquire) != 0) kcoro_park();
 }
 
