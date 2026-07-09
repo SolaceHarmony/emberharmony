@@ -359,14 +359,28 @@ run-to-run on identical bits), last-latency 913-939ms, mean 1151-1214ms. CPU now
 leads the Metal clean baseline (25,856 / 1656ms) on both metrics. The ~25k floor is
 the turn-1 prefill window, not decode.
 
+**Rim cut — BUILT (same day):** the native step's per-token Rust work is now gate
+checks, pointer captures, one FFI call, cursor advances. Killed per token: the
+Vec<LayerState> rebuild (cache-resident StateTable, entries rewritten in place —
+fresh captures stay, they self-heal against rollback clones/candle interleaves/KV
+growth), the hidden out-buffer + bf16 conversion copy (the hidden Tensor's own
+storage IS the engine's out plane), the audio offset-id Vec (stack). The one
+remaining per-token allocation is the hidden Tensor's storage — that boundary dies
+when the depthformer folds onto the lane team / ST_LOGITS revives. Ctx ownership is
+single-tenant with an install id (second install refused + logged; only the owning
+guard clears) — kills the two-model clobber; regression test
+native_engine_ctx_single_tenant.
+
+**kcoro patch 0005 — BUILT (same day):** precise parking in kc_sched. Wake tokens
+under park_mu + Dekker re-check after the idle declaration + broadcast for
+owner-only last_task slots; idle waits UNTIMED, the 5ms poll deleted. Wakes are now
+µs-bounded; four CPU e2e runs under 0005: 24.3k-26.4k underruns, 917-988ms
+last-latency — the band holds with the poll gone. PATCHES.md 0005 has the full
+mechanism (upstream candidate, includes the workers==1 steal modulo-by-zero fix).
+
 **Build next:**
-1. Rim cut (task #4): resident per-layer state in the engine ctx (KV planes
-   pre-grown to max_ctx at install → stable pointers; cursors engine-owned); kill the
-   per-token Vec<LayerState> + out-buffer allocations + Tensor wraps in
-   lfm2_hf/lfm2_audio. Plus ctx-ownership guard (ctx_id tag; Drop clears only its own
-   install — the two-model clobber flagged in external review).
-2. kcoro patch 0005: precise parking in kc_sched (exact signal accounting, untimed
-   waits) so the ~5 remaining wakes/token are µs-bounded (today a lost token-start
-   wake costs ≤5ms once per token, absorbed by the fence).
-3. Fold DepthDecode onto the same lane team (drop rayon threadgroup + DISPATCH_LOCK).
-4. ST_LOGITS ladder decision (task #1), then sampler v2 (ChaCha12), then Mimi (E5).
+1. Fold DepthDecode onto the same lane team (drop rayon threadgroup +
+   DISPATCH_LOCK) — after that, hidden can stay a raw plane and the last per-token
+   Tensor wrap dies.
+2. ST_LOGITS ladder decision (task #1 — Sydney's call: NT re-arm vs resident
+   transpose vs RO intrinsic), then sampler v2 (ChaCha12), then Mimi (E5).
