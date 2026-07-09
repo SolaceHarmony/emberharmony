@@ -144,17 +144,45 @@ pub struct Cache {
     /// A per-cache field so tests A/B the two paths on the same weights by
     /// constructing a cache per path; never an ambient/global toggle.
     pub fused_conv_decode: bool,
-    /// Per-layer KV cache, faithful to candle-transformers/HF: append new K/V by
-    /// concatenating on the sequence axis. This intentionally does not use
-    /// `candle_nn::kv_cache::KvCache`; that preallocated cache changes the reference
-    /// structure and was previously reverted as a parity deviation.
-    kvs: Vec<Option<(Tensor, Tensor)>>,
+    /// Decode-step GQA path selector: `true` (production default) computes attention with
+    /// q regrouped `[b, n_kv, group, hd]` against the SHARED kv heads — no `repeat_kv`
+    /// materialization (two full-cache copies per step). Same dot products; the GEMM
+    /// reduction order differs, so outputs sit at the f32-ulp floor rather than byte-parity
+    /// with the expanded form (rel < 1e-5, pinned by `grouped_gqa_matches_expanded_at_f32_ulp`).
+    /// Ulps CAN flip a near-tied greedy argmax and WILL diverge sampled streams — measured:
+    /// a 96-token greedy+seeded run picks different (equally sensible) slogans. `false` pins
+    /// the reference expanded form: byte-identical output (verified by wav hash).
+    pub grouped_gqa_decode: bool,
+    /// Per-layer RESIDENT KV storage (runtime-architecture audit, item 1): preallocated
+    /// f32 planes written in place, read as zero-copy narrows. This deliberately replaces
+    /// the reference `Tensor::cat` append — which recopied the whole accumulated cache per
+    /// layer per token (plus a full-cache f32 re-upcast) and made decode degrade with
+    /// context. History note: an earlier `candle_nn::KvCache` swap was reverted as a
+    /// parity deviation; this one is held to a stricter standard than that attempt — the
+    /// narrow views feed attention byte-identical rows: with `grouped_gqa_decode=false`
+    /// a greedy+seeded generate produces a BIT-IDENTICAL wav before/after this change, so
+    /// the storage swap itself is exact; only the storage shape deviates from the
+    /// reference, by design and on the record.
+    kvs: Vec<Option<KvSlot>>,
     conv_states: Vec<Option<Tensor>>,
     // Memoized boolean causal masks, keyed by (seq_len, kv_len) — see `mask`.
     masks: HashMap<(usize, usize), Tensor>,
     cos: Tensor,
     sin: Tensor,
     device: Device,
+}
+
+/// A layer's resident KV storage: preallocated `[B, n_kv, cap, head_dim]` bf16 planes (the
+/// checkpoint/cache dtype — half the bytes and read bandwidth of f32 for identical values,
+/// since bf16→f32 widening is exact) with a
+/// length cursor. Appends write in place (`slice_set`); reads are zero-copy narrows past the
+/// cursor; rollback is a cursor move (rows beyond it are stale and never read). Capacity
+/// doubles on demand — one narrow-copy, amortized O(1) per stream.
+#[derive(Clone)]
+struct KvSlot {
+    k: Tensor,
+    v: Tensor,
+    len: usize,
 }
 
 /// Rollback point for a [`Cache`] — see [`Cache::snapshot`] / [`Cache::rollback`].
@@ -188,6 +216,7 @@ impl Cache {
         Ok(Self {
             use_kv_cache,
             fused_conv_decode: true,
+            grouped_gqa_decode: true,
             kvs: vec![None; cfg.num_hidden_layers],
             conv_states: vec![None; cfg.num_hidden_layers],
             masks: HashMap::new(),
@@ -202,11 +231,7 @@ impl Cache {
     /// The KV tensors themselves are not copied — [`Self::rollback`] restores by
     /// narrowing back to the recorded lengths.
     pub fn snapshot(&self) -> Result<CacheSnapshot> {
-        let kv_lens = self
-            .kvs
-            .iter()
-            .map(|kv| kv.as_ref().map(|(k, _)| k.dim(2)).transpose())
-            .collect::<Result<Vec<_>>>()?;
+        let kv_lens = self.kvs.iter().map(|kv| kv.as_ref().map(|sl| sl.len)).collect();
         Ok(CacheSnapshot {
             kv_lens,
             conv_states: self.conv_states.clone(),
@@ -229,26 +254,95 @@ impl Cache {
             );
         }
         for (kv, len) in self.kvs.iter_mut().zip(&snap.kv_lens) {
-            match (kv.as_ref(), len) {
-                (_, None) => *kv = None,
-                (Some((k, v)), Some(n)) => {
-                    let cur = k.dim(2)?;
-                    if cur < *n {
-                        candle_core::bail!(
-                            "cache rollback: KV shrank below snapshot ({cur} < {n})"
-                        );
+            match len {
+                None => *kv = None,
+                Some(n) => match kv.as_mut() {
+                    Some(sl) => {
+                        if sl.len < *n {
+                            candle_core::bail!(
+                                "cache rollback: KV shrank below snapshot ({} < {n})",
+                                sl.len
+                            );
+                        }
+                        // O(1): rows past the cursor are stale storage, never read.
+                        sl.len = *n;
                     }
-                    if cur > *n {
-                        *kv = Some((k.narrow(2, 0, *n)?, v.narrow(2, 0, *n)?));
+                    None => {
+                        candle_core::bail!("cache rollback: KV lost since snapshot (had len {n})")
                     }
-                }
-                (None, Some(n)) => {
-                    candle_core::bail!("cache rollback: KV lost since snapshot (had len {n})")
-                }
+                },
             }
         }
         self.conv_states = snap.conv_states.clone();
         Ok(())
+    }
+
+    /// Append this step's K/V rows IN PLACE into the layer's resident slot and return
+    /// zero-copy views of the live rows — no `Tensor::cat`, no dtype conversion, no
+    /// clone-back. The planes hold bf16 (checkpoint/cache dtype); the rows land verbatim.
+    /// `index_pos == 0` begins a new stream (cursor reset; the buffer is reused when the
+    /// geometry matches). `kf`/`vf` are the step's `[B, n_kv, s, hd]` bf16 rows;
+    /// `index_pos` must equal the slot cursor (the streaming contract).
+    fn append_kv(
+        &mut self,
+        block_idx: usize,
+        kf: &Tensor,
+        vf: &Tensor,
+        index_pos: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        let (b, n_kv, s_new, hd) = kf.dims4()?;
+        let slot = &mut self.kvs[block_idx];
+        if index_pos == 0 {
+            if let Some(sl) = slot.as_mut() {
+                let (sb, sn, _, sh) = sl.k.dims4()?;
+                if sb == b && sn == n_kv && sh == hd {
+                    sl.len = 0; // new stream, same geometry: reuse the planes
+                } else {
+                    *slot = None;
+                }
+            }
+        }
+        match (slot.as_ref(), index_pos) {
+            (Some(sl), p) if sl.len != p => candle_core::bail!(
+                "kv append: cursor {} != index_pos {p} (layer {block_idx})",
+                sl.len
+            ),
+            (None, p) if p != 0 => {
+                candle_core::bail!("kv append: empty slot at index_pos {p} (layer {block_idx})")
+            }
+            _ => {}
+        }
+        let need = index_pos + s_new;
+        match slot.as_mut() {
+            None => {
+                let cap = need.next_power_of_two().max(256);
+                let k = Tensor::zeros((b, n_kv, cap, hd), kf.dtype(), kf.device())?;
+                let v = Tensor::zeros((b, n_kv, cap, hd), kf.dtype(), kf.device())?;
+                *slot = Some(KvSlot { k, v, len: 0 });
+            }
+            Some(sl) => {
+                let cap = sl.k.dim(2)?;
+                if need > cap {
+                    let ncap = need.next_power_of_two().max(cap * 2);
+                    let k = Tensor::zeros((b, n_kv, ncap, hd), kf.dtype(), kf.device())?;
+                    let v = Tensor::zeros((b, n_kv, ncap, hd), kf.dtype(), kf.device())?;
+                    if sl.len > 0 {
+                        // The narrow is strided across kv heads whenever len < cap (suffix
+                        // appends can grow mid-plane); slice_set needs a contiguous source.
+                        // One copy per growth, amortized O(1) per stream.
+                        k.slice_set(&sl.k.narrow(2, 0, sl.len)?.contiguous()?, 2, 0)?;
+                        v.slice_set(&sl.v.narrow(2, 0, sl.len)?.contiguous()?, 2, 0)?;
+                    }
+                    sl.k = k;
+                    sl.v = v;
+                }
+            }
+        }
+        let sl = slot.as_mut().expect("slot allocated above");
+        sl.k.slice_set(&kf.contiguous()?, 2, sl.len)?;
+        sl.v.slice_set(&vf.contiguous()?, 2, sl.len)?;
+        sl.len += s_new;
+        Ok((sl.k.narrow(2, 0, sl.len)?, sl.v.narrow(2, 0, sl.len)?))
     }
 
     /// Memoized boolean causal mask `(seq_len, kv_len)`, faithful to `lfm2.rs`'s
@@ -371,46 +465,119 @@ impl Attention {
         let q = self.rope(&q, index_pos, cache)?;
         let k = self.rope(&k, index_pos, cache)?;
 
+        // Resident KV (audit item 1): the step's rows are upcast ONCE (bf16→f32 is exact)
+        // and written IN PLACE into the layer slot; attention reads a zero-copy narrow of
+        // exactly the rows `Tensor::cat` used to rebuild — identical values, no per-token
+        // O(ctx) copy, no full-cache re-upcast, no clone-back.
+        // Resident KV stays in CHECKPOINT dtype (bf16 — torch's cache dtype): the step's
+        // rb'd rows are written in place verbatim; no dtype conversion exists on the
+        // append at all. f32 KV doubled every cache byte and every attention-read byte
+        // for identical values (bf16→f32 is exact) — reverted on review.
         let (k, v) = if cache.use_kv_cache {
-            let (k, v) = match &cache.kvs[block_idx] {
-                Some((kc, vc)) if index_pos > 0 => (
-                    Tensor::cat(&[kc, &k], 2)?.contiguous()?,
-                    Tensor::cat(&[vc, &v], 2)?.contiguous()?,
-                ),
-                _ => (k, v),
-            };
-            cache.kvs[block_idx] = Some((k.clone(), v.clone()));
-            (k, v)
+            cache.append_kv(block_idx, &k, &v, index_pos)?
         } else {
             (k, v)
         };
 
-        let k = repeat_kv(k, self.n_head / self.n_kv)?;
-        let v = repeat_kv(v, self.n_head / self.n_kv)?;
-
-        let q = q.to_dtype(DType::F32)?;
-        let k = k.to_dtype(DType::F32)?;
-        let v = v.to_dtype(DType::F32)?;
-        let att = (q.matmul(&k.t()?)? / (self.head_dim as f64).sqrt())?;
-        let att = match add_mask {
-            // Detokenizer's sliding window: an *additive* f32 mask supplied by the caller
-            // (our documented deviation — the reference has no custom-mask path).
-            Some(m) => att.broadcast_add(&m.to_dtype(DType::F32)?)?,
-            None if seq_len == 1 => att,
-            // Causal: the reference's memoized boolean mask + masked_fill(-inf).
-            None => {
-                let mask = cache.mask(seq_len, index_pos)?.broadcast_as(att.shape())?;
-                masked_fill(&att, &mask, f32::NEG_INFINITY)?
-            }
+        let group = self.n_head / self.n_kv;
+        let scale = (self.head_dim as f64).sqrt();
+        // Decode shape: at seq_len==1 (no mask) the flag-on path runs flashkern attention
+        // straight over the resident bf16 planes — per-head dots with in-register widening,
+        // no repeat_kv materialization, no cache upcast, no candle op. Flag off pins the
+        // reference expanded chain (upcast + repeat_kv + candle matmul) for parity runs.
+        let flashkern_path = cache.grouped_gqa_decode
+            && seq_len == 1
+            && add_mask.is_none()
+            && b == 1
+            && x.device().is_cpu()
+            && x.dtype() == DType::BF16
+            && crate::bf16_gemm::bf16_gemm_nt_available();
+        let y = if flashkern_path {
+            self.attn_decode_flash(&q, &k, &v, x.dtype())?
+        } else {
+            let q = q.to_dtype(DType::F32)?;
+            let k = repeat_kv(k.to_dtype(DType::F32)?.contiguous()?, group)?;
+            let v = repeat_kv(v.to_dtype(DType::F32)?.contiguous()?, group)?;
+            let att = (q.matmul(&k.t()?)? / scale)?;
+            let att = match add_mask {
+                // Detokenizer's sliding window: an *additive* f32 mask supplied by the caller
+                // (our documented deviation — the reference has no custom-mask path).
+                Some(m) => att.broadcast_add(&m.to_dtype(DType::F32)?)?,
+                None if seq_len == 1 => att,
+                // Causal: the reference's memoized boolean mask + masked_fill(-inf).
+                None => {
+                    let mask = cache.mask(seq_len, index_pos)?.broadcast_as(att.shape())?;
+                    masked_fill(&att, &mask, f32::NEG_INFINITY)?
+                }
+            };
+            // `softmax` (differentiable), NOT `softmax_last_dim` (fused no_bwd): backbone
+            // attention is trained. Same forward values.
+            let att = candle_nn::ops::softmax(&att, candle_core::D::Minus1)?;
+            att.matmul(&v.contiguous()?)?.to_dtype(x.dtype())?
         };
-        // `softmax` (differentiable), NOT `softmax_last_dim` (fused no_bwd): backbone
-        // attention is trained. Same forward values.
-        let att = candle_nn::ops::softmax(&att, candle_core::D::Minus1)?;
-        let y = att.matmul(&v.contiguous()?)?.to_dtype(x.dtype())?;
         let y = y
             .transpose(1, 2)?
             .reshape((b, seq_len, self.n_head * self.head_dim))?;
         linear_forward(&self.o_proj, &y)
+    }
+
+    /// The flag-on decode attention: flashkern per-head dots over the resident bf16 KV
+    /// planes (`flashkern::decode::attn_decode_bf16`) — q's post-rope bf16 bits in, one
+    /// bf16 round at the per-head store out. Zero copies of K/V at any width.
+    #[cfg(any(
+        all(target_arch = "aarch64", has_flashkern_neon),
+        all(target_arch = "x86_64", has_flashkern_x86)
+    ))]
+    fn attn_decode_flash(&self, q: &Tensor, k: &Tensor, v: &Tensor, out_dtype: DType) -> Result<Tensor> {
+        use candle_core::Storage;
+        fn bits_view<'a>(
+            guard: &'a std::sync::RwLockReadGuard<'_, Storage>,
+        ) -> Result<&'a [u16]> {
+            match &**guard {
+                Storage::Cpu(candle_core::CpuStorage::BF16(vv)) => {
+                    // SAFETY: half::bf16 is repr(transparent) over u16.
+                    Ok(unsafe { std::slice::from_raw_parts(vv.as_ptr() as *const u16, vv.len()) })
+                }
+                _ => candle_core::bail!("attn_decode_flash: expected CPU bf16 storage"),
+            }
+        }
+        let q = q.contiguous()?;
+        let (qs, ql) = q.storage_and_layout();
+        let qb = &bits_view(&qs)?[ql.start_offset()..ql.start_offset() + self.n_head * self.head_dim];
+        let (ks, kl) = k.storage_and_layout();
+        let (vs, vl) = v.storage_and_layout();
+        let len = kl.dims()[2];
+        let head_stride = kl.stride()[1]; // cap·hd — the slot plane's head pitch
+        debug_assert_eq!(head_stride, vl.stride()[1]);
+        let kb = bits_view(&ks)?[kl.start_offset()..].as_ptr();
+        let vb = bits_view(&vs)?[vl.start_offset()..].as_ptr();
+        let mut out = vec![0u16; self.n_head * self.head_dim];
+        // SAFETY: plane geometry from the narrow views' own layouts; storage guards live
+        // until after the call; q/out sized by the asserts inside.
+        unsafe {
+            crate::flashkern::decode::attn_decode_bf16(
+                qb,
+                kb,
+                vb,
+                head_stride,
+                len,
+                self.n_head,
+                self.n_kv,
+                self.head_dim,
+                &mut out,
+            );
+        }
+        drop((qs, ks, vs));
+        let out: Vec<half::bf16> = out.iter().map(|&x| half::bf16::from_bits(x)).collect();
+        Tensor::from_vec(out, (1, self.n_head, 1, self.head_dim), q.device())?.to_dtype(out_dtype)
+    }
+
+    #[cfg(not(any(
+        all(target_arch = "aarch64", has_flashkern_neon),
+        all(target_arch = "x86_64", has_flashkern_x86)
+    )))]
+    fn attn_decode_flash(&self, _q: &Tensor, _k: &Tensor, _v: &Tensor, _o: DType) -> Result<Tensor> {
+        candle_core::bail!("flashkern attention unavailable — the dispatch gate should prevent this")
     }
 }
 
@@ -448,6 +615,14 @@ impl ShortConv {
         // zero-pad prefill is the reference semantics.
         if cache.fused_conv_decode && self.l_cache > 0 && seq_len <= 4 && cache.use_kv_cache {
             if let Some(prev) = cache.conv_states[block_idx].clone() {
+                // CPU device with the flashkern SIMD kernel built + supported → the
+                // liquid-audio CustomOp (channel-vectorized NEON/AVX decode step); otherwise
+                // the candle-flashfftconv op (JIT Metal kernel on Metal, scalar CPU
+                // reference where flashkern isn't available). Same shapes, same
+                // trained-regime rounding points — gated on availability, never degrading
+                // silently (the flashkern op errors rather than falling back).
+                let use_flashkern = bcx.device().is_cpu()
+                    && crate::flashkern::candle_ops::conv1d_update_available();
                 // One line per DEVICE (not per process): a live run PROVES this
                 // path executed and on which silicon. Per-device matters — the
                 // app can switch compute device between sessions, and a
@@ -459,16 +634,21 @@ impl ShortConv {
                 if let Ok(mut last) = FUSED_ANNOUNCED.lock() {
                     if *last != Some(loc) {
                         *last = Some(loc);
-                        eprintln!(
-                            "[voice] fused conv decode kernel active \
-                             (candle-flashfftconv causal_conv1d_update, {loc:?})"
-                        );
+                        let kernel = if use_flashkern {
+                            "flashkern conv1d_update"
+                        } else {
+                            "candle-flashfftconv causal_conv1d_update"
+                        };
+                        eprintln!("[voice] fused conv decode kernel active ({kernel}, {loc:?})");
                     }
                 }
                 let w = self.conv_weight.squeeze(1)?; // (H, K)
                 let bcx = bcx.contiguous()?;
-                let (y, new_state) =
-                    candle_flashfftconv::causal_conv1d_update_fused(&bcx, &prev, &w)?;
+                let (y, new_state) = if use_flashkern {
+                    crate::flashkern::candle_ops::causal_conv1d_update_fused(&bcx, &prev, &w)?
+                } else {
+                    candle_flashfftconv::causal_conv1d_update_fused(&bcx, &prev, &w)?
+                };
                 cache.conv_states[block_idx] = Some(new_state);
                 let y = y.transpose(1, 2)?.contiguous()?;
                 return linear_forward(&self.out_proj, &y);
@@ -551,15 +731,189 @@ impl DecoderLayer {
         add_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
         let residual = x;
+        // Fused ShortConv residual block (flashkern): norm → in_proj → conv update →
+        // out_proj → residual as ONE dispatch — no candle op, no transposes. Same gates as
+        // the op-chain fast path (carried state exists, decode shape); sequence START keeps
+        // the composed path (its zero-pad prefill is the reference semantics).
+        if let LayerKind::ShortConv(c) = &self.kind {
+            if cache.fused_conv_decode
+                && x.device().is_cpu()
+                && x.dtype() == DType::BF16
+                && x.dims3().map(|(b, s, _)| b * s == 1).unwrap_or(false)
+                && crate::bf16_gemm::bf16_gemm_nt_available()
+                && cache.conv_states[block_idx].is_some()
+            {
+                if let Some(y) = self.fused_shortconv_decode(x, c, block_idx, cache)? {
+                    let x = y;
+                    if x.device().is_cpu()
+                        && x.dtype() == DType::BF16
+                        && crate::flashkern::decode::fused_mlp_available()
+                        && x.dims3().map(|(b, s, _)| b * s == 1).unwrap_or(false)
+                    {
+                        if let Some(y) = self.fused_mlp_decode(&x)? {
+                            return Ok(y);
+                        }
+                    }
+                    let residual = &x;
+                    let h = self.mlp.forward(&self.ffn_norm.forward(&x)?)?;
+                    return h + residual;
+                }
+            }
+        }
         let h = self.operator_norm.forward(x)?;
         let h = match &self.kind {
             LayerKind::Attention(a) => a.forward(&h, index_pos, block_idx, cache, add_mask)?,
             LayerKind::ShortConv(c) => c.forward(&h, block_idx, cache)?,
         };
         let x = (h + residual)?;
+        // Fused FFN residual block on the flashkern GPU-dispatch model: ONE threadgroup
+        // dispatch (lanes + spin barriers + shared scratch) replaces the eight-op candle
+        // chain (norm, 3 linears + casts, silu, gating mul, residual add) — CPU decode only;
+        // Metal and prefill keep the op chain. Same bf16 rounding points, so numerics stay
+        // in the trained regime; only the dispatch shape changes.
+        if x.device().is_cpu()
+            && x.dtype() == DType::BF16
+            && crate::flashkern::decode::fused_mlp_available()
+            && x.dims3().map(|(b, s, _)| b * s == 1).unwrap_or(false)
+        {
+            if let Some(y) = self.fused_mlp_decode(&x)? {
+                return Ok(y);
+            }
+        }
         let residual = &x;
         let h = self.mlp.forward(&self.ffn_norm.forward(&x)?)?;
         h + residual
+    }
+
+    /// The CPU-decode fused ShortConv block: zero-copy weight views into
+    /// [`flashkern::decode::fused_shortconv_decode`] — norm, in_proj, the fused conv
+    /// update (same kernel as the op path), out_proj, residual, in one dispatch. Returns
+    /// `Ok(None)` if any operand isn't a contiguous CPU bf16 tensor.
+    fn fused_shortconv_decode(
+        &self,
+        x: &Tensor,
+        conv: &ShortConv,
+        block_idx: usize,
+        cache: &mut Cache,
+    ) -> Result<Option<Tensor>> {
+        use candle_core::Storage;
+        fn bits<'a>(
+            guard: &'a std::sync::RwLockReadGuard<'_, Storage>,
+            layout: &candle_core::Layout,
+        ) -> Option<&'a [u16]> {
+            match &**guard {
+                Storage::Cpu(candle_core::CpuStorage::BF16(v)) => {
+                    let (s, e) = layout.contiguous_offsets()?;
+                    let sl = &v[s..e];
+                    // SAFETY: half::bf16 is repr(transparent) over u16.
+                    Some(unsafe { std::slice::from_raw_parts(sl.as_ptr() as *const u16, sl.len()) })
+                }
+                _ => None,
+            }
+        }
+        let k = conv.l_cache;
+        let hdim = x.dim(2)?;
+        let x = x.contiguous()?;
+        let w2d = conv.conv_weight.squeeze(1)?.contiguous()?;
+        let state = cache.conv_states[block_idx].clone().expect("gated on Some");
+        let state = state.contiguous()?;
+        let (xs, xl) = x.storage_and_layout();
+        let (ns, nl) = self.operator_norm.weight().storage_and_layout();
+        let (is_, il) = conv.in_proj.weight().storage_and_layout();
+        let (cs, cl) = w2d.storage_and_layout();
+        let (os, ol) = conv.out_proj.weight().storage_and_layout();
+        let (ss, sl) = state.storage_and_layout();
+        let (Some(xb), Some(nb), Some(iw), Some(cw), Some(ow), Some(sb)) = (
+            bits(&xs, xl),
+            bits(&ns, nl),
+            bits(&is_, il),
+            bits(&cs, cl),
+            bits(&os, ol),
+            bits(&ss, sl),
+        ) else {
+            return Ok(None);
+        };
+        let weights = crate::flashkern::decode::FusedShortConvWeights {
+            norm_w: nb,
+            in_w: iw,
+            conv_w: cw,
+            out_w: ow,
+            eps: self.operator_norm.eps() as f32,
+            k,
+        };
+        let mut out = vec![0u16; hdim];
+        let mut state_out = vec![0u16; hdim * (k - 1)];
+        crate::flashkern::decode::fused_shortconv_decode(
+            xb,
+            &weights,
+            sb,
+            &mut state_out,
+            &mut out,
+            rayon::current_num_threads().max(1),
+        );
+        drop((xs, ns, is_, cs, os, ss));
+        let state_out: Vec<half::bf16> =
+            state_out.iter().map(|&b| half::bf16::from_bits(b)).collect();
+        cache.conv_states[block_idx] =
+            Some(Tensor::from_vec(state_out, (1, hdim, k - 1), x.device())?);
+        let out: Vec<half::bf16> = out.iter().map(|&b| half::bf16::from_bits(b)).collect();
+        Ok(Some(Tensor::from_vec(out, (1, 1, hdim), x.device())?))
+    }
+
+    /// The CPU-decode fused FFN block: zero-copy bf16 views of the checkpoint weights
+    /// (`storage_and_layout`) into [`flashkern::decode::fused_mlp_decode`]. Returns
+    /// `Ok(None)` if any operand isn't a contiguous CPU bf16 tensor (caller keeps the op
+    /// chain) — an availability gate, not a silent numeric fallback.
+    fn fused_mlp_decode(&self, x: &Tensor) -> Result<Option<Tensor>> {
+        use candle_core::Storage;
+
+        fn bits<'a>(
+            guard: &'a std::sync::RwLockReadGuard<'_, Storage>,
+            layout: &candle_core::Layout,
+        ) -> Option<&'a [u16]> {
+            match &**guard {
+                Storage::Cpu(candle_core::CpuStorage::BF16(v)) => {
+                    let (s, e) = layout.contiguous_offsets()?;
+                    let sl = &v[s..e];
+                    // SAFETY: half::bf16 is repr(transparent) over u16.
+                    Some(unsafe { std::slice::from_raw_parts(sl.as_ptr() as *const u16, sl.len()) })
+                }
+                _ => None,
+            }
+        }
+
+        let x = x.contiguous()?;
+        let hdim = x.dim(2)?;
+        let (xs, xl) = x.storage_and_layout();
+        let (ns, nl) = self.ffn_norm.weight().storage_and_layout();
+        let (g1, l1) = self.mlp.gate_proj.weight().storage_and_layout();
+        let (g3, l3) = self.mlp.up_proj.weight().storage_and_layout();
+        let (g2, l2) = self.mlp.down_proj.weight().storage_and_layout();
+        let (Some(xb), Some(nb), Some(w1), Some(w3), Some(w2)) = (
+            bits(&xs, xl),
+            bits(&ns, nl),
+            bits(&g1, l1),
+            bits(&g3, l3),
+            bits(&g2, l2),
+        ) else {
+            return Ok(None);
+        };
+        let weights = crate::flashkern::decode::FusedMlpWeights {
+            norm_w: nb,
+            w1,
+            w3,
+            w2,
+            eps: self.ffn_norm.eps() as f32,
+        };
+        let mut out = vec![0u16; hdim];
+        crate::flashkern::decode::fused_mlp_decode(
+            xb,
+            &weights,
+            &mut out,
+            rayon::current_num_threads().max(1),
+        );
+        let out: Vec<half::bf16> = out.iter().map(|&b| half::bf16::from_bits(b)).collect();
+        Ok(Some(Tensor::from_vec(out, (1, 1, hdim), x.device())?))
     }
 }
 
@@ -631,5 +985,52 @@ impl Model {
     pub fn last_hidden(&self, hidden: &Tensor) -> Result<Tensor> {
         let seq_len = hidden.dim(1)?;
         hidden.i((.., seq_len - 1, ..))?.contiguous()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grouped_gqa_matches_expanded_at_f32_ulp() {
+        // The grouped_gqa_decode path must compute the SAME per-head attention as the
+        // reference expanded (repeat_kv) form — identical dot products, different GEMM
+        // tiling — so the divergence budget is f32 summation-order ulps, not structure.
+        // This test pins that bound in-tree; byte-parity runs pin grouped_gqa_decode=false.
+        let dev = Device::Cpu;
+        let (b, nh, nkv, hd, len) = (1usize, 32usize, 8usize, 64usize, 333usize);
+        let group = nh / nkv;
+        let rnd = |n: usize, s: u64| -> Vec<f32> {
+            (0..n)
+                .map(|i| {
+                    let x = (i as u64).wrapping_mul(6364136223846793005).wrapping_add(s);
+                    ((x >> 33) as f32 / 2f32.powi(30)) - 1.0
+                })
+                .collect()
+        };
+        let q = Tensor::from_vec(rnd(b * nh * hd, 1), (b, nh, 1, hd), &dev).unwrap();
+        let k = Tensor::from_vec(rnd(b * nkv * len * hd, 2), (b, nkv, len, hd), &dev).unwrap();
+        let v = Tensor::from_vec(rnd(b * nkv * len * hd, 3), (b, nkv, len, hd), &dev).unwrap();
+        let scale = (hd as f64).sqrt();
+        // reference: expanded heads via repeat_kv (the s>1 / parity-pinned form)
+        let ke = repeat_kv(k.clone(), group).unwrap();
+        let ve = repeat_kv(v.clone(), group).unwrap();
+        let att = (q.matmul(&ke.t().unwrap()).unwrap() / scale).unwrap();
+        let att = candle_nn::ops::softmax(&att, candle_core::D::Minus1).unwrap();
+        let ye = att.matmul(&ve.contiguous().unwrap()).unwrap();
+        // decode path: grouped view, no materialization
+        let qg = q.reshape((b, nkv, group, hd)).unwrap();
+        let att = (qg.matmul(&k.t().unwrap()).unwrap() / scale).unwrap();
+        let att = candle_nn::ops::softmax(&att, candle_core::D::Minus1).unwrap();
+        let yg = att.matmul(&v).unwrap().reshape((b, nh, 1, hd)).unwrap();
+        let a: Vec<f32> = ye.flatten_all().unwrap().to_vec1().unwrap();
+        let g: Vec<f32> = yg.flatten_all().unwrap().to_vec1().unwrap();
+        let (mut md, mut sc) = (0f32, 1e-6f32);
+        for (x, y) in a.iter().zip(&g) {
+            md = md.max((x - y).abs());
+            sc = sc.max(x.abs());
+        }
+        assert!(md / sc < 1e-5, "grouped vs expanded rel {}", md / sc);
     }
 }

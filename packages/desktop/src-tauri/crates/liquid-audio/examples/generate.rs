@@ -126,7 +126,10 @@ fn main() -> Res<()> {
     let model_ref = std::env::var("LFM_MODEL")
         .or_else(|_| std::env::var("LFM_MODEL_DIR"))
         .unwrap_or_else(|_| "LiquidAI/LFM2.5-Audio-1.5B".into());
-    let audio_path = std::env::args().nth(1).unwrap_or_else(|| {
+    let audio_path = std::env::args()
+        .skip(1)
+        .find(|a| !a.starts_with("--"))
+        .unwrap_or_else(|| {
         // The upstream reference clip, vendored in-crate. Resolved from
         // CARGO_MANIFEST_DIR (compile-time, CWD-independent).
         concat!(env!("CARGO_MANIFEST_DIR"), "/assets/question.wav").into()
@@ -152,7 +155,15 @@ fn main() -> Res<()> {
         dir.display()
     );
     let t0 = std::time::Instant::now();
-    let (model, proc) = from_pretrained(&dir, &device)?;
+    #[allow(unused_mut)]
+    let (mut model, proc) = from_pretrained(&dir, &device)?;
+    // `--reference`: the byte-parity reference chain (DECODE_ENGINE.md §5) — every
+    // ulp-tier decode deviation pinned off so the run reproduces the recorded
+    // wav-hash baseline bit-for-bit.
+    if std::env::args().any(|a| a == "--reference") {
+        model.set_reference_numerics(true);
+        eprintln!("[mode] reference numerics: grouped-GQA off, depth-flash off");
+    }
     let mimi = MimiModel::new(
         proc.mimi()
             .ok_or("Mimi codec not loaded — required by liquid_audio/demo/chat.py")?,

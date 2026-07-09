@@ -1,7 +1,14 @@
 use candle_core::{DType, Result, Tensor};
 use candle_nn::{Conv1d, Conv2d, Linear, Module};
 
-use crate::bf16_gemm::bf16_matmul;
+use crate::bf16_gemm::{bf16_matmul, bf16_matmul_accel, bf16_matmul_nt};
+
+/// Decode-side row-count bound for the no-transpose matmul: at small M the weight-transpose
+/// copy (`w.t().contiguous()`) dominates the actual math — profiled at ~97% of CPU decode
+/// time — so `[rows ≤ 4]` (decode steps and suffix chunks) dots the weight in its native
+/// `[N,K]` layout instead. Prefill-scale M keeps the BFMMLA GEMM, where one transpose
+/// amortizes over the M rows.
+const NT_MAX_ROWS: usize = 4;
 
 #[derive(Clone, Debug)]
 pub struct Bf16Linear {
@@ -44,12 +51,22 @@ pub fn linear_forward(linear: &Linear, x: &Tensor) -> Result<Tensor> {
 
 pub fn linear_logits(weight: &Tensor, x: &Tensor) -> Result<Tensor> {
     let y = if weight.device().is_cpu() && x.device().is_cpu() && weight.dtype() == DType::BF16 {
-        let Some(y) = bf16_matmul(x, &weight.t()?)? else {
-            candle_core::bail!(
-                "CPU bf16 linear requested but the NEON BFMMLA kernel is unavailable"
-            );
-        };
-        y
+        // Same small-M dispatch as matmul_flat: at decode the logits head is M==1 against
+        // the biggest weight in the model — the transpose copy hurts the most here. A `None`
+        // from the NT path (reference-kernel-only build) falls through to the transposed
+        // GEMM, which computes the same numbers.
+        let rows = if x.rank() == 2 { x.dim(0)? } else { usize::MAX };
+        let nt = if rows <= NT_MAX_ROWS { bf16_matmul_nt(x, weight)? } else { None };
+        if let Some(y) = nt {
+            y
+        } else {
+            let Some(y) = bf16_matmul(x, &weight.t()?)? else {
+                candle_core::bail!(
+                    "CPU bf16 linear requested but the NEON BFMMLA kernel is unavailable"
+                );
+            };
+            y
+        }
     } else {
         x.matmul(&weight.t()?)?
     };
@@ -117,6 +134,21 @@ fn needs_bf16_cpu_conv(weight: &Tensor, x: &Tensor) -> bool {
 }
 
 fn matmul_flat(linear: &Linear, x: &Tensor) -> Result<Tensor> {
+    if x.dim(0)? <= NT_MAX_ROWS {
+        // `None` here means the flashkern NT kernel specifically isn't built (the
+        // reference-kernel-only build): the transposed path below still computes the same
+        // bf16-exact-product / f32-accumulate numbers through the fallback GEMM — an
+        // availability gate between equal-numerics kernels, not a silent degradation.
+        if let Some(y) = bf16_matmul_nt(x, linear.weight())? {
+            return Ok(y);
+        }
+    }
+    // Prefill-scale M: the Accelerate/AMX backend (ENGINE_DESIGN.md §E4 — measured
+    // 19–28× the BFMMLA chain, native [N,K] weight, no transpose copy). `None` off
+    // macOS → the BFMMLA path below, same numerics tier as always.
+    if let Some(y) = bf16_matmul_accel(x, linear.weight())? {
+        return Ok(y);
+    }
     let Some(y) = bf16_matmul(x, &linear.weight().t()?)? else {
         candle_core::bail!("CPU bf16 linear requested but the NEON BFMMLA kernel is unavailable");
     };
@@ -207,6 +239,33 @@ mod tests {
         md / sc
     }
 
+    #[test]
+    fn accel_prefill_matches_bfmmla_at_f32_tier() {
+        // The E4 backend contract: Accelerate sgemm (AMX order) vs the BFMMLA chain over
+        // the SAME bf16 inputs — identical products, different accumulation order, so the
+        // bound is the f32 tier (measured ≈1e-5 at prefill shapes). Direct fn A/B — the
+        // reference path needs no runtime flag.
+        if !crate::bf16_gemm::bf16_gemm_accel_available() {
+            eprintln!("accel backend unavailable — skipping");
+            return;
+        }
+        use crate::bf16_gemm::{bf16_matmul, bf16_matmul_accel};
+        for &(m, k, n) in &[(64usize, 512usize, 384usize), (350, 2048, 512)] {
+            let lin = mk_linear(k, n, 11, false);
+            let x = mk_input(m, k, 17);
+            let a = bf16_matmul_accel(&x, lin.weight()).unwrap().expect("accel available");
+            let r = bf16_matmul(&x, &lin.weight().t().unwrap()).unwrap().expect("bfmmla available");
+            let av: Vec<f32> = a.flatten_all().unwrap().to_vec1().unwrap();
+            let rv: Vec<f32> = r.flatten_all().unwrap().to_vec1().unwrap();
+            let (mut md, mut sc) = (0f32, 1e-6f32);
+            for (x, y) in av.iter().zip(&rv) {
+                md = md.max((x - y).abs());
+                sc = sc.max(y.abs());
+            }
+            assert!(md / sc < 1e-4, "m={m} k={k} n={n}: accel vs bfmmla rel {}", md / sc);
+        }
+    }
+
     fn skip() -> bool {
         if !crate::bf16_gemm::bf16_gemm_available() {
             eprintln!("bf16 GEMM kernel unavailable on this target — skipping pipeline parity");
@@ -268,7 +327,7 @@ mod tests {
         if skip() {
             return;
         }
-        // M==1 single-token decode — the hot GEMV path (BFDOT on NEON, VDPBF16PS on x86).
+        // M==1 single-token decode — the hot path (Bf16GemmNt native-layout dot; widening FMA).
         let (inp, out) = (2048usize, 2048usize);
         let lin = mk_linear(inp, out, 9, true);
         let x = mk_input(1, inp, 13);

@@ -150,6 +150,17 @@ impl RmsNorm {
     pub fn forward_cached(&self, x: &Tensor) -> Result<(Tensor, LayerCache)> {
         Ok((self.forward(x)?, None))
     }
+
+    /// The learned scale — read by the fused flashkern decode blocks, which fold this norm
+    /// into their first barrier-fenced stage instead of running it as a separate op.
+    pub fn weight(&self) -> &Tensor {
+        &self.weight
+    }
+
+    /// The variance epsilon (same consumer as [`Self::weight`]).
+    pub fn eps(&self) -> f64 {
+        self.eps
+    }
 }
 
 /// `GLU` (SwiGLU feed-forward). The `ff_dim` sizing mirrors the Python so the
@@ -162,6 +173,11 @@ pub struct Glu {
 }
 
 impl Glu {
+    /// Gate/down/up projections for the flashkern depth decoder (swiglu form only).
+    pub(crate) fn flash_parts(&self) -> (&Linear, &Linear, Option<&Linear>, bool) {
+        (&self.w1, &self.w2, self.w3.as_ref(), self.use_swiglu)
+    }
+
     pub fn new(
         dim: usize,
         ff_dim: Option<usize>,
@@ -311,6 +327,17 @@ pub struct BoundedAttention {
 }
 
 impl BoundedAttention {
+    /// Geometry + per-head norms for the flashkern depth decoder (zero-copy weight capture).
+    pub(crate) fn flash_parts(&self) -> (usize, usize, usize, Option<&RmsNorm>, Option<&RmsNorm>) {
+        (
+            self.num_heads,
+            self.kv_heads(),
+            self.head_dim,
+            self.q_layernorm.as_ref(),
+            self.k_layernorm.as_ref(),
+        )
+    }
+
     pub fn new(
         dim: usize,
         num_heads: usize,
@@ -477,6 +504,11 @@ impl Mha {
         self.dim
     }
 
+    /// Projections, attention geometry, and rope tables for the flashkern depth decoder.
+    pub(crate) fn flash_parts(&self) -> (&Linear, &Linear, &BoundedAttention, &Tensor, &Tensor) {
+        (&self.qkv_proj, &self.out_proj, &self.attention, &self.cos, &self.sin)
+    }
+
     pub fn forward(&self, x: &Tensor, cache: Option<&mut LayerKvCache>) -> Result<Tensor> {
         let seq_len = x.dim(1)?;
         let x = linear_forward(&self.qkv_proj, x)?;
@@ -578,6 +610,11 @@ impl StandardBlock {
         })
     }
 
+    /// Operator/FFN/norm handles for the flashkern depth decoder.
+    pub(crate) fn flash_parts(&self) -> (&Mha, &Glu, &RmsNorm, &RmsNorm) {
+        (&self.operator, &self.feed_forward, &self.operator_norm, &self.ffn_norm)
+    }
+
     pub fn forward(&self, x: &Tensor, cache: Option<&mut LayerKvCache>) -> Result<Tensor> {
         let h = (self
             .operator
@@ -642,6 +679,11 @@ impl SharedEmbedding {
 
     pub fn embed(&self, tokens: &Tensor) -> Result<Tensor> {
         self.embedding.forward(tokens)
+    }
+
+    /// Embed table / pre-logits norm / tied head for the flashkern depth decoder.
+    pub(crate) fn flash_parts(&self) -> (&Tensor, &RmsNorm, &Tensor) {
+        (self.embedding.embeddings(), &self.embedding_norm, self.to_logits.weight())
     }
 
     pub fn get_logits(&self, embeddings: &Tensor) -> Result<Tensor> {

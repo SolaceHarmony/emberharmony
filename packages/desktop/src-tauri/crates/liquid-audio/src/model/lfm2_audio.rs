@@ -314,6 +314,15 @@ pub struct LFM2AudioModel {
     /// scalars (Python `LFM2AudioConfig`). Read only by `forward`.
     text_loss_multiplier: f64,
     audio_loss_multiplier: f64,
+    /// Pure-NEON depthformer frame decoder (flashkern): zero-copy views of the depthformer
+    /// weights + persistent scratch, built once at load when the CPU kernels are available.
+    /// `None` ⇒ the candle op-chain path runs (also the parity reference).
+    depth_flash: Option<crate::flashkern::decode::DepthDecode>,
+    /// Byte-parity reference chain (DECODE_ENGINE.md §5): pins every ulp-tier decode
+    /// deviation off — `grouped_gqa_decode=false` on each internally-built cache and
+    /// depth-flash disabled — so greedy text + seeded audio reproduces the recorded
+    /// wav-hash baseline bit-for-bit. Token-exact tiers (fused conv/MLP) stay on.
+    reference_numerics: bool,
 }
 
 impl LFM2AudioModel {
@@ -422,7 +431,7 @@ impl LFM2AudioModel {
         };
         let audio_loss_weights = Tensor::from_vec(weights, (codebooks,), dev)?;
 
-        Ok(Self {
+        let mut model = Self {
             lfm,
             lfm_cfg,
             conformer,
@@ -441,7 +450,120 @@ impl LFM2AudioModel {
             audio_loss_weights,
             text_loss_multiplier: loss_conf.text_loss_multiplier,
             audio_loss_multiplier: loss_conf.audio_loss_multiplier,
-        })
+            depth_flash: None,
+            reference_numerics: false,
+        };
+        // Built AFTER assembly: the ctx captures raw views into tensors the model now owns
+        // (Arc-heap storages — stable across moves of `model`).
+        model.depth_flash = model.build_depth_flash();
+        if model.depth_flash.is_some() {
+            eprintln!("[voice] flashkern depthformer decoder active (pure-NEON audio frames)");
+        }
+        Ok(model)
+    }
+
+    /// Capture the depthformer as a flashkern [`DepthDecode`] — every weight a zero-copy
+    /// bf16 view in checkpoint layout. Any non-conforming tensor (wrong device/dtype/
+    /// layout, non-swiglu Glu, missing qk-norms) ⇒ `None`, and the candle path runs.
+    #[cfg(any(
+        all(target_arch = "aarch64", has_flashkern_neon),
+        all(target_arch = "x86_64", has_flashkern_x86)
+    ))]
+    fn build_depth_flash(&self) -> Option<crate::flashkern::decode::DepthDecode> {
+        use crate::flashkern::decode::{DepthDecode, DepthHead, DepthLayer, PtrLen};
+        if !crate::bf16_gemm::bf16_gemm_nt_available() {
+            return None;
+        }
+        let mut layers = Vec::with_capacity(self.depthformer.layers.len());
+        let mut geom = None;
+        let mut cos_sin = None;
+        for blk in &self.depthformer.layers {
+            let (mha, glu, opn, ffnn) = blk.flash_parts();
+            let (qkv, out, ba, cos, sin) = mha.flash_parts();
+            let (heads, kvh, hd, qln, kln) = ba.flash_parts();
+            let (w1, w2, w3, swiglu) = glu.flash_parts();
+            if !swiglu || heads * hd != self.depthformer_dim {
+                return None;
+            }
+            let w3 = w3?;
+            geom = Some((heads, kvh, hd, w1.weight().dim(0).ok()?, opn.eps() as f32));
+            cos_sin = Some((PtrLen::f32(cos)?, PtrLen::f32(sin)?));
+            layers.push(DepthLayer {
+                qkv_w: PtrLen::bf16(qkv.weight())?,
+                out_w: PtrLen::bf16(out.weight())?,
+                q_ln: PtrLen::bf16(qln?.weight())?,
+                k_ln: PtrLen::bf16(kln?.weight())?,
+                opnorm: PtrLen::bf16(opn.weight())?,
+                ffnnorm: PtrLen::bf16(ffnn.weight())?,
+                w1: PtrLen::bf16(w1.weight())?,
+                w3: PtrLen::bf16(w3.weight())?,
+                w2: PtrLen::bf16(w2.weight())?,
+            });
+        }
+        let (heads, kvh, hd, ff, eps) = geom?;
+        let (cos, sin) = cos_sin?;
+        let mut heads_w = Vec::with_capacity(self.codebooks);
+        for se in &self.depth_embeddings {
+            let (emb, norm, logits) = se.flash_parts();
+            let vocab = emb.dim(0).ok()?;
+            if logits.dim(0).ok()? != vocab || emb.dim(1).ok()? != self.depthformer_dim {
+                return None;
+            }
+            heads_w.push(DepthHead {
+                emb: PtrLen::bf16(emb)?,
+                norm: PtrLen::bf16(norm.weight())?,
+                logits: PtrLen::bf16(logits)?,
+                vocab,
+            });
+        }
+        Some(DepthDecode::new(
+            self.depthformer_dim,
+            heads,
+            kvh,
+            ff,
+            self.codebooks,
+            self.hidden,
+            eps,
+            layers,
+            heads_w,
+            PtrLen::bf16(self.depth_linear.weight())?,
+            PtrLen::bf16(self.depth_linear.bias()?)?,
+            cos,
+            sin,
+        ))
+    }
+
+    #[cfg(not(any(
+        all(target_arch = "aarch64", has_flashkern_neon),
+        all(target_arch = "x86_64", has_flashkern_x86)
+    )))]
+    fn build_depth_flash(&self) -> Option<crate::flashkern::decode::DepthDecode> {
+        None
+    }
+
+    /// Test/parity seam: disable the flashkern depthformer so the candle op chain runs.
+    /// Select the byte-parity reference chain (see the `reference_numerics` field).
+    pub fn set_reference_numerics(&mut self, on: bool) {
+        self.reference_numerics = on;
+        self.set_depth_flash_enabled(!on);
+    }
+
+    /// Internally-built caches route through this so the reference chain pins the
+    /// ulp-tier flags in ONE place.
+    fn new_cache(&self, dtype: DType, device: &Device) -> Result<LfmCache> {
+        let mut cache = LfmCache::new(true, dtype, &self.lfm_cfg, device)?;
+        if self.reference_numerics {
+            cache.grouped_gqa_decode = false;
+        }
+        Ok(cache)
+    }
+
+    pub fn set_depth_flash_enabled(&mut self, on: bool) {
+        if !on {
+            self.depth_flash = None;
+        } else if self.depth_flash.is_none() {
+            self.depth_flash = self.build_depth_flash();
+        }
     }
 
     /// `from_pretrained(dir, device)` — load the model + processor from a
@@ -491,7 +613,7 @@ impl LFM2AudioModel {
     /// returning the normed all-position hidden state — for backbone parity.
     #[doc(hidden)]
     pub fn backbone_forward_embeds(&self, embeds: &Tensor) -> Result<Tensor> {
-        let mut cache = LfmCache::new(true, embeds.dtype(), &self.lfm_cfg, embeds.device())?;
+        let mut cache = self.new_cache(embeds.dtype(), embeds.device())?;
         self.lfm.forward_embeds(embeds, 0, &mut cache, None)
     }
 
@@ -549,7 +671,7 @@ impl LFM2AudioModel {
     /// (spec 09, W2a) so each turn only forwards the context *suffix* it has not
     /// seen yet, instead of re-prefilling the whole conversation.
     pub fn make_cache(&self, dtype: DType, device: &Device) -> Result<LfmCache> {
-        LfmCache::new(true, dtype, &self.lfm_cfg, device)
+        self.new_cache(dtype, device)
     }
 
     /// Build prefill embeddings for the context SUFFIX past `cursor` — the positions a
@@ -1121,6 +1243,14 @@ impl LFM2AudioModel {
     /// `_sample_audio_frame`: per-codebook draw via the audio [`Sampler`]
     /// (greedy/temperature/top-k held by the sampler).
     fn sample_audio_frame(&self, embedding: &Tensor, sampler: &mut Sampler) -> Result<Vec<u32>> {
+        // Pure-NEON path: the whole frame (8 codebook steps × 6 blocks) as one flashkern
+        // dispatch — no candle op runs. Same rounding ladder; the seeded Sampler is shared,
+        // so the RNG stream matches the candle path.
+        if let Some(ctx) = &self.depth_flash {
+            if embedding.device().is_cpu() && embedding.dtype() == DType::BF16 {
+                return self.sample_audio_frame_flash(ctx, embedding, sampler);
+            }
+        }
         // depth_linear(embedding) → (codebooks, depthformer_dim). `embedding` is a
         // 1-D (D,) lfm hidden; candle's Linear needs a 2-D input, so add a row dim
         // (Python's nn.Linear accepts the 1-D vector directly).
@@ -1149,6 +1279,48 @@ impl LFM2AudioModel {
         Ok(out)
     }
 
+    /// One frame through [`crate::flashkern::decode::DepthDecode::frame`]: extract the
+    /// backbone hidden's bf16 bits, run the dispatch, and sample per codebook via the
+    /// SAME seeded sampler over the rb'd logits (rebuilt as a tiny bf16 tensor so the
+    /// LogitsProcessor sees byte-identical inputs to the candle path's `get_logits`).
+    fn sample_audio_frame_flash(
+        &self,
+        ctx: &crate::flashkern::decode::DepthDecode,
+        embedding: &Tensor,
+        sampler: &mut Sampler,
+    ) -> Result<Vec<u32>> {
+        use candle_core::Storage;
+        let flat = embedding.flatten_all()?.contiguous()?;
+        let bits: Vec<u16> = {
+            let (st, l) = flat.storage_and_layout();
+            match &*st {
+                Storage::Cpu(candle_core::CpuStorage::BF16(v)) => {
+                    let (a, b) = l
+                        .contiguous_offsets()
+                        .ok_or_else(|| candle_core::Error::Msg("hidden not contiguous".into()))?;
+                    v[a..b].iter().map(|x| x.to_bits()).collect()
+                }
+                _ => candle_core::bail!("depth flash: hidden must be CPU bf16"),
+            }
+        };
+        let err_cell = std::sync::Mutex::new(None);
+        let dev = embedding.device().clone();
+        let toks = ctx.frame(&bits, |logits_bits| {
+            let v: Vec<half::bf16> = logits_bits.iter().map(|&b| half::bf16::from_bits(b)).collect();
+            match Tensor::from_vec(v, (logits_bits.len(),), &dev).and_then(|t| sampler.sample(&t)) {
+                Ok(t) => t,
+                Err(e) => {
+                    *err_cell.lock().unwrap() = Some(e);
+                    0
+                }
+            }
+        });
+        if let Some(e) = err_cell.lock().unwrap().take() {
+            return Err(e);
+        }
+        Ok(toks)
+    }
+
     fn audio_frame_embed(&self, tokens: &[u32]) -> Result<Tensor> {
         // audio_embedding(tokens + offsets).sum(0) → (D,) → (1,1,D)
         let dev = self.lfm.embed_weight().device();
@@ -1173,7 +1345,7 @@ impl LFM2AudioModel {
     ) -> Result<()> {
         let mut in_emb = self.prefill(chat)?;
         let mut index_pos = 0usize;
-        let mut cache = LfmCache::new(true, in_emb.dtype(), &self.lfm_cfg, in_emb.device())?;
+        let mut cache = self.new_cache(in_emb.dtype(), in_emb.device())?;
         // Text and audio carry independent samplers (the Python uses one generator;
         // for greedy — the default — both are argmax and the RNG is unused).
         let mut text_sampler =
@@ -1275,7 +1447,7 @@ impl LFM2AudioModel {
         cancel: &AtomicBool,
         on_token: F,
     ) -> Result<()> {
-        let mut cache = LfmCache::new(true, in_emb.dtype(), &self.lfm_cfg, in_emb.device())?;
+        let mut cache = self.new_cache(in_emb.dtype(), in_emb.device())?;
         let mut index_pos = 0usize;
         self.generate_with_cache(&mut cache, &mut index_pos, in_emb, params, cancel, on_token)
     }
