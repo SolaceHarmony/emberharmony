@@ -29,7 +29,7 @@ use liquid_audio::{
 };
 
 const CTX_TARGET: u64 = 30_000; // proves the climb; ceiling is 32,768
-const MAX_TURNS: usize = 64;
+const MAX_TURNS: usize = 256; // short conversational turns grow ctx ~150-250/turn
 const FEED_RATE: u32 = 24_000; // Mimi's output rate — replies loop back natively
 
 /// Minimal PCM16 WAV reader (mono-downmixed f32) — same as the two-turn e2e.
@@ -199,6 +199,12 @@ fn e2e_self_talk_reaches_32k_context() {
                 max_new_tokens: 8192,
                 audio_temperature: Some(1.0),
                 audio_top_k: Some(4),
+                // Greedy text made the self-conversation converge to a
+                // pleasantry fixed point ("Glad that works for you…" forever).
+                // Natural self-talk needs sampled text — the same reason the
+                // audio side samples.
+                text_temperature: Some(0.8),
+                text_top_k: Some(50),
                 ..GenParams::default()
             };
             let engine = Lfm2VoiceEngine::new(model, proc, params, codebooks, device, out_rate);

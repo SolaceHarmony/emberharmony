@@ -74,18 +74,39 @@ impl AudioDetokenizer for LFM2AudioDetokenizer {
     }
 }
 
-/// Wraps the `moshi` crate's Mimi codec so it satisfies our trait, with interior
-/// mutability for Mimi's streaming conv/transformer state (mirrors the Python
-/// `mimi.streaming(1)` mutation). `reset_state` first ⇒ independent decodes.
+/// The Mimi codec behind the shared trait. The STREAMING decode path — the
+/// per-frame hot path the realtime pipeline runs — is the native C++/NEON/AMX
+/// kernel ([`crate::mimi_native::NativeMimi`], ~14 ms/frame, parity-gated
+/// against moshi at ≤ 4.2e-6 worst PCM error). The moshi-Rust codec remains
+/// ONLY for turn-level tooling: `encode` (the trainer's data mapper) and the
+/// one-shot whole-clip `decode` (the byte-oracle example pins its bytes).
+/// There is no cross-fallback in either direction (no-fallbacks doctrine).
 pub struct MimiDetokenizer {
     inner: Mutex<::moshi::mimi::Mimi>,
+    native: crate::mimi_native::NativeMimi,
 }
 
 impl MimiDetokenizer {
-    pub fn new(mimi: ::moshi::mimi::Mimi) -> Self {
+    pub fn new(mimi: ::moshi::mimi::Mimi, native: crate::mimi_native::NativeMimi) -> Self {
         Self {
             inner: Mutex::new(mimi),
+            native,
         }
+    }
+}
+
+impl MimiDetokenizer {
+    /// Slice-native streaming decode — no tensor plumbing in either direction
+    /// (review P1: the codes already exist as host integers in the generation
+    /// loop, and every consumer wants host PCM; the Tensor round-trip added
+    /// two device syncs per frame on Metal). The trait's `decode_step` is the
+    /// Tensor adapter over this.
+    pub fn decode_step_codes(
+        &self,
+        codes: &[u32],
+    ) -> std::result::Result<Option<Vec<f32>>, String> {
+        let pcm = self.native.decode_step(codes)?;
+        Ok(if pcm.is_empty() { None } else { Some(pcm) })
     }
 }
 
@@ -106,25 +127,32 @@ impl AudioDetokenizer for MimiDetokenizer {
         m.encode(wav)
     }
 
-    /// Reset the moshi Mimi streaming conv/transformer state (turn boundary).
+    /// Turn boundary: re-arm the NATIVE streaming state (conv carries, KV ring)
+    /// — the hot path — and the moshi state alongside it so the tooling-tier
+    /// codec stays coherent for any interleaved `encode` use.
     fn reset_stream(&self) {
+        self.native.reset();
         self.inner
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .reset_state();
     }
 
-    /// Real streaming decode via moshi's `Mimi::decode_step` — keeps codec state
-    /// across calls (no `reset_state` here; [`reset_stream`](Self::reset_stream)
-    /// does that at the turn boundary). `frame` is `(1, codebooks, 1)`; the codec's
-    /// warmup latency means the first call(s) yield `None`.
+    /// Streaming decode on the NATIVE kernel — the per-frame production path
+    /// (the deprecated moshi `decode_step` call is gone from the pipeline).
+    /// `frame` is `(1, codebooks, 1)`; state is kept across calls, reset at
+    /// the turn boundary by [`reset_stream`](Self::reset_stream).
     fn decode_step(&self, frame: &Tensor) -> Result<Option<Tensor>> {
-        let codes = frame.to_dtype(DType::U32)?; // RVQ index_select wants u32
-        let mut m = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let out = m.decode_step(
-            &::moshi::StreamTensor::from_tensor(codes),
-            &::moshi::StreamMask::empty(),
-        )?;
-        Ok(out.as_option().cloned())
+        let codes: Vec<u32> = frame.to_dtype(DType::U32)?.flatten_all()?.to_vec1()?;
+        match self.decode_step_codes(&codes).map_err(candle_core::Error::Msg)? {
+            Some(pcm) => {
+                let n = pcm.len();
+                // ALWAYS a CPU tensor (review P1): the consumer downloads to
+                // host samples immediately — materializing PCM on frame.device()
+                // (Metal) added an upload+download sync pair per frame.
+                Ok(Some(Tensor::from_vec(pcm, (1, 1, n), &candle_core::Device::Cpu)?))
+            }
+            None => Ok(None),
+        }
     }
 }

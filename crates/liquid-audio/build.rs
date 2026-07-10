@@ -23,6 +23,14 @@ fn main() {
         );
     }
 
+    // Accelerate is a macOS fact, not an aarch64 fact: the Mimi kernel calls
+    // cblas under __APPLE__ on BOTH arches (review P1: an x86_64-apple-darwin
+    // link dies on cblas_sgemm$NEWLAPACK with this directive inside the arm
+    // branch only).
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        println!("cargo::rustc-link-lib=framework=Accelerate");
+    }
+
     if arch == "x86_64" {
         println!("cargo::rerun-if-changed=native/kernels/x86_64/flashkern_x86.cpp");
         cc::Build::new()
@@ -34,18 +42,6 @@ fn main() {
             .flag("-ffp-contract=off")
             .compile("lfm_flashkern_x86");
     } else {
-        if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
-            println!("cargo::rustc-link-lib=framework=Accelerate");
-        }
-
-        println!("cargo::rerun-if-changed=native/reference/bf16_gemm.c");
-        cc::Build::new()
-            .file("native/reference/bf16_gemm.c")
-            .flag("-march=armv8.2-a+bf16")
-            .opt_level(3)
-            .warnings(false)
-            .compile("lfm_bf16_gemm");
-
         println!("cargo::rerun-if-changed=native/kernels/aarch64/flashkern_neon.cpp");
         let mut kern = cc::Build::new();
         kern.file("native/kernels/aarch64/flashkern_neon.cpp")
@@ -81,4 +77,26 @@ fn main() {
         .flag("-pthread")
         .include("../kcoro-sys/vendor/kcoro/include")
         .compile("lfm_flashkern_engine");
+
+    // The native Mimi decode kernel (docs/MIMI_PORT.md): five active units;
+    // mimi_kv.cpp stays parked (the streaming path owns a RotatingKvCache port
+    // inside mimi_transformer.cpp). -ffp-contract=off is LOAD-BEARING here:
+    // the scalar parity siblings are only oracles of the Rust reference if
+    // clang can't contract a*b+c into fma (rustc never does).
+    println!("cargo::rerun-if-changed=native/src/mimi");
+    cc::Build::new()
+        .files([
+            "native/src/mimi/mimi_quant.cpp",
+            "native/src/mimi/mimi_conv.cpp",
+            "native/src/mimi/mimi_seanet.cpp",
+            "native/src/mimi/mimi_transformer.cpp",
+            "native/src/mimi/mimi_decode.cpp",
+        ])
+        .cpp(true)
+        .std("c++23")
+        .opt_level(3)
+        .warnings(false)
+        .flag("-ffp-contract=off")
+        .include("native/src/mimi")
+        .compile("lfm_mimi");
 }
