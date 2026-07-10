@@ -338,7 +338,15 @@ void kcoro_unpark(kcoro_t* co)
     if (atomic_exchange(&co->park_notify, KC_PARK_NOTIFIED) != KC_PARK_PARKED) {
         return;
     }
-    co->state = KCORO_READY;
+    /* Patch 0008: do NOT write co->state here. `state` is a plain (non-atomic)
+     * enum; writing it from this (often EXTERNAL) thread races the owning
+     * worker's own reads/writes of state in kcoro_park and the scheduler loop —
+     * a data race the park_notify gate's operational ordering does not make
+     * legal in C. The write was pure redundancy: the worker promotes PARKED ->
+     * READY itself when it resumes the coroutine (kc_sched.c, the NOTIFIED-gate
+     * check), and the wake is carried by the atomic gate + this enqueue + the
+     * running_flag CAS. `state` is now single-owner (only the worker currently
+     * holding the coroutine touches it). */
     /* Patch 0004: enqueue to the coroutine's OWN scheduler first. The caller's
      * scheduler (kc_sched_current) is NULL on external threads and may be a different
      * instance under multiple dispatchers — either way the wake belongs to the
@@ -356,6 +364,18 @@ void kcoro_unpark(kcoro_t* co)
 
 int kcoro_is_parked(const kcoro_t* co)
 {
+    /* NOTE (patch 0008, residual — deliberately NOT changed here): this
+     * cross-thread READ of the non-atomic `state` enum still races the owning
+     * worker's writes in kcoro_park; it is the READ half of the data race the
+     * audit flagged. The COMPLETE fix is making `state` atomic (relaxed) so
+     * this stays value-identical to today (state == KCORO_PARKED) but legal —
+     * a ~38-site conversion across kcoro_core/kc_sched/kc_chan, its own careful
+     * pass. The gate-based alternative (park_notify == KC_PARK_PARKED) was
+     * tried and REVERTED: the gate goes PARKED a beat before the coroutine
+     * switches out, widening the "is parked" window enough to fire a rendezvous
+     * direct-handoff early and DROP the final message (test_chan_rv_metrics:
+     * sends=800 recvs=799). is_parked's timing is load-bearing in kc_chan's
+     * handoff — only a value-neutral change (atomic state) is safe. */
     return co && co->state == KCORO_PARKED;
 }
 
