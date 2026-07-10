@@ -96,6 +96,8 @@ cpal = { version = "0.15", optional = true }
 anyhow = "1"
 # Native mic capture + speaker playback for the live `mic_chat` example.
 cpal = "0.15"
+# getrusage for the engine zero-spin idle oracle (tests/engine_idle_zero_spin.rs).
+libc = "0.2"
 
 [features]
 default = ["download"]
