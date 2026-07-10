@@ -33,6 +33,13 @@
 // -framework Accelerate. Guarded so the file still builds off-Apple (falling
 // back to the scalar _ref path).
 #ifdef __APPLE__
+// Opt into the modern (non-deprecated) CBLAS interface. LP64 only — do NOT set
+// ACCELERATE_LAPACK_ILP64, so cblas args stay 32-bit `int` and match the
+// header's int M/K/N ABI. Without this, cblas_sgemm/sgemv warn as deprecated on
+// macOS 13.3+.
+#ifndef ACCELERATE_NEW_LAPACK
+#define ACCELERATE_NEW_LAPACK 1
+#endif
 #include <Accelerate/Accelerate.h>
 #endif
 
@@ -122,13 +129,17 @@ extern "C" const MimiWeight *mimi_weight_find(const MimiWeightTable *t,
 // (c) Shared infrastructure — math primitives
 //
 // Numerics tier: "faithful" (mimi_kernel.h / MIMI_PORT.md). f32 in, f32
-// accumulate, documented loop order. NEON inner loops on aarch64 with scalar
-// `_ref` siblings for parity bisecting: build with -DMIMI_SCALAR_REF to force
-// the reference path and diff against the NEON path.
+// accumulate, documented loop order. "Math is assembly at every step":
+//   - GEMM/GEMV : Apple Accelerate cblas (AMX matrix coprocessor).
+//   - sweeps / softmax / layer-norm : NEON intrinsics, transcendentals applied
+//     LANE-WISE with libm erff/expf (no polynomial vector approximations — that
+//     would move the numerics off the faithful tier).
+// Parity-bisect: build -DMIMI_SCALAR_REF to force the scalar reference bodies
+// (and, off-Apple, the scalar gemm/gemv _ref siblings) and diff against them.
 // ===========================================================================
 
 // -------- gemv: y[m] = sum_k w[m*k + k] * x[k] (+ bias[m]); W row-major [M,K] --
-
+// Scalar reference (parity-bisect path + off-Apple fallback).
 [[maybe_unused]] static void mimi_gemv_f32_ref(const float *w, const float *x,
                                                const float *bias, float *y,
                                                int m, int k) {
@@ -145,40 +156,25 @@ extern "C" const MimiWeight *mimi_weight_find(const MimiWeightTable *t,
     }
 }
 
-#if defined(MIMI_HAVE_NEON) && !defined(MIMI_SCALAR_REF)
-static void mimi_gemv_f32_neon(const float *w, const float *x, const float *bias,
-                               float *y, int m, int k) {
-    for (int i = 0; i < m; ++i) {
-        const float *wr = w + (size_t)i * (size_t)k;
-        float32x4_t acc = vdupq_n_f32(0.0f);
-        int j = 0;
-        for (; j + 4 <= k; j += 4) {
-            acc = vmlaq_f32(acc, vld1q_f32(wr + j), vld1q_f32(x + j));
-        }
-        float s = vaddvq_f32(acc);  // horizontal sum of the 4 lanes
-        for (; j < k; ++j) {
-            s += wr[j] * x[j];
-        }
-        if (bias) {
-            s += bias[i];
-        }
-        y[i] = s;
-    }
-}
-#endif
-
 extern "C" void mimi_gemv_f32(const float *w, const float *x,
                               const float *bias_or_null, float *y, int m, int k) {
-#if defined(MIMI_HAVE_NEON) && !defined(MIMI_SCALAR_REF)
-    mimi_gemv_f32_neon(w, x, bias_or_null, y, m, k);
+#if defined(__APPLE__) && !defined(MIMI_SCALAR_REF)
+    // W is row-major [M,K] == an M-by-K cblas matrix, lda = K, no transpose.
+    // beta 0 => cblas overwrites y with W*x (y is not read). Bias is a separate
+    // explicit loop AFTER the cblas call (the AMX matmul carries no bias term).
+    cblas_sgemv(CblasRowMajor, CblasNoTrans, m, k, 1.0f, w, k, x, 1, 0.0f, y, 1);
+    if (bias_or_null) {
+        for (int i = 0; i < m; ++i) {
+            y[i] += bias_or_null[i];
+        }
+    }
 #else
     mimi_gemv_f32_ref(w, x, bias_or_null, y, m, k);
 #endif
 }
 
 // -------- gemm: C[M,N] = A[M,K]*B[K,N] (beta 0) or += (beta 1); row-major -----
-// Loop order i-k-j: stream B[k,:] and C[i,:] contiguously, vectorize over j.
-
+// Scalar reference (parity-bisect path + off-Apple fallback), loop order i-k-j.
 [[maybe_unused]] static void mimi_gemm_f32_ref(const float *a, const float *b,
                                                float *c, int m, int k, int n,
                                                int beta) {
@@ -199,67 +195,19 @@ extern "C" void mimi_gemv_f32(const float *w, const float *x,
     }
 }
 
-#if defined(MIMI_HAVE_NEON) && !defined(MIMI_SCALAR_REF)
-static void mimi_gemm_f32_neon(const float *a, const float *b, float *c, int m,
-                               int k, int n, int beta) {
-    for (int i = 0; i < m; ++i) {
-        float *cr = c + (size_t)i * (size_t)n;
-        if (beta == 0) {
-            memset(cr, 0, (size_t)n * sizeof(float));
-        }
-        for (int p = 0; p < k; ++p) {
-            const float aval = a[(size_t)i * (size_t)k + (size_t)p];
-            const float32x4_t va = vdupq_n_f32(aval);
-            const float *br = b + (size_t)p * (size_t)n;
-            int j = 0;
-            for (; j + 4 <= n; j += 4) {
-                float32x4_t cv = vld1q_f32(cr + j);
-                cv = vmlaq_f32(cv, va, vld1q_f32(br + j));
-                vst1q_f32(cr + j, cv);
-            }
-            for (; j < n; ++j) {
-                cr[j] += aval * br[j];
-            }
-        }
-    }
-}
-#endif
-
 extern "C" void mimi_gemm_f32(const float *a, const float *b, float *c, int m,
                               int k, int n, int beta) {
-#if defined(MIMI_HAVE_NEON) && !defined(MIMI_SCALAR_REF)
-    mimi_gemm_f32_neon(a, b, c, m, k, n, beta);
+#if defined(__APPLE__) && !defined(MIMI_SCALAR_REF)
+    // Direct row-major mapping, NO transpose (weights are a buffer, movement is
+    // theft): A[M,K] lda=K, B[K,N] ldb=N, C[M,N] ldc=N; beta 0 overwrite / 1 acc.
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, m, n, k, 1.0f, a,
+                k, b, n, (float)beta, c, n);
 #else
     mimi_gemm_f32_ref(a, b, c, m, k, n, beta);
 #endif
 }
 
-// -------- softmax: in place, max-subtracted, f32 sum -------------------------
-
-extern "C" void mimi_softmax_f32(float *x, int n) {
-    if (n <= 0) {
-        return;
-    }
-    float mx = x[0];
-    for (int i = 1; i < n; ++i) {
-        if (x[i] > mx) {
-            mx = x[i];
-        }
-    }
-    float sum = 0.0f;
-    for (int i = 0; i < n; ++i) {
-        float e = expf(x[i] - mx);
-        x[i] = e;
-        sum += e;
-    }
-    // sum > 0 always (at least the max element contributes expf(0) == 1).
-    float inv = 1.0f / sum;
-    for (int i = 0; i < n; ++i) {
-        x[i] *= inv;
-    }
-}
-
-// -------- gelu (erf form) & elu ---------------------------------------------
+// -------- scalar per-element helpers (tail/lane + _ref building blocks) -------
 
 extern "C" float mimi_gelu_erf_f32(float x) {
     // 0.5 * x * (1 + erf(x / sqrt(2))); candle's `gelu_erf`. 1/sqrt(2) constant.
@@ -272,8 +220,179 @@ extern "C" float mimi_elu_f32(float x, float alpha) {
     return x > 0.0f ? x : alpha * (expf(x) - 1.0f);
 }
 
-// -------- layer norm: two-pass mean/var --------------------------------------
+// -------- gelu sweep: y[i] = gelu_erf(x[i]) -----------------------------------
+// NEON vectorizes the 0.5*x*(1+e) arithmetic; erff is applied lane-wise (no
+// vector-poly substitution). Tail via the scalar helper.
+extern "C" void mimi_gelu_erf_vec_f32(const float *x, float *y, int n) {
+#if defined(MIMI_HAVE_NEON) && !defined(MIMI_SCALAR_REF)
+    const float32x4_t half = vdupq_n_f32(0.5f);
+    const float32x4_t one = vdupq_n_f32(1.0f);
+    const float32x4_t inv_sqrt2 = vdupq_n_f32(0.70710678118654752440f);
+    int i = 0;
+    for (; i + 4 <= n; i += 4) {
+        float32x4_t vx = vld1q_f32(x + i);
+        float32x4_t arg = vmulq_f32(vx, inv_sqrt2);
+        float lanes[4];
+        vst1q_f32(lanes, arg);
+        lanes[0] = erff(lanes[0]);
+        lanes[1] = erff(lanes[1]);
+        lanes[2] = erff(lanes[2]);
+        lanes[3] = erff(lanes[3]);
+        float32x4_t e = vld1q_f32(lanes);
+        // 0.5 * x * (1 + e)
+        float32x4_t res = vmulq_f32(vmulq_f32(half, vx), vaddq_f32(one, e));
+        vst1q_f32(y + i, res);
+    }
+    for (; i < n; ++i) {
+        y[i] = mimi_gelu_erf_f32(x[i]);
+    }
+#else
+    for (int i = 0; i < n; ++i) {
+        y[i] = mimi_gelu_erf_f32(x[i]);
+    }
+#endif
+}
 
+// -------- elu sweep: y[i] = elu(x[i], alpha) ----------------------------------
+// NEON select between the x>0 and alpha*(exp(x)-1) branches; expf lane-wise.
+extern "C" void mimi_elu_vec_f32(const float *x, float *y, int n, float alpha) {
+#if defined(MIMI_HAVE_NEON) && !defined(MIMI_SCALAR_REF)
+    const float32x4_t one = vdupq_n_f32(1.0f);
+    const float32x4_t zero = vdupq_n_f32(0.0f);
+    int i = 0;
+    for (; i + 4 <= n; i += 4) {
+        float32x4_t vx = vld1q_f32(x + i);
+        float lanes[4];
+        vst1q_f32(lanes, vx);
+        lanes[0] = expf(lanes[0]);
+        lanes[1] = expf(lanes[1]);
+        lanes[2] = expf(lanes[2]);
+        lanes[3] = expf(lanes[3]);
+        float32x4_t ve = vld1q_f32(lanes);
+        // alpha * (exp(x) - 1)  for the negative branch
+        float32x4_t neg = vmulq_n_f32(vsubq_f32(ve, one), alpha);
+        uint32x4_t gt = vcgtq_f32(vx, zero);  // x > 0 mask
+        float32x4_t res = vbslq_f32(gt, vx, neg);
+        vst1q_f32(y + i, res);
+    }
+    for (; i < n; ++i) {
+        y[i] = mimi_elu_f32(x[i], alpha);
+    }
+#else
+    for (int i = 0; i < n; ++i) {
+        y[i] = mimi_elu_f32(x[i], alpha);
+    }
+#endif
+}
+
+// -------- add sweep: y[i] = a[i] + b[i] (streaming skip / residual add) --------
+extern "C" void mimi_add_vec_f32(const float *a, const float *b, float *y,
+                                 int n) {
+#if defined(MIMI_HAVE_NEON) && !defined(MIMI_SCALAR_REF)
+    int i = 0;
+    for (; i + 4 <= n; i += 4) {
+        vst1q_f32(y + i, vaddq_f32(vld1q_f32(a + i), vld1q_f32(b + i)));
+    }
+    for (; i < n; ++i) {
+        y[i] = a[i] + b[i];
+    }
+#else
+    for (int i = 0; i < n; ++i) {
+        y[i] = a[i] + b[i];
+    }
+#endif
+}
+
+// -------- scale sweep: y[i] = x[i] * s[i] elementwise (LayerScale) -------------
+extern "C" void mimi_scale_vec_f32(const float *x, const float *s, float *y,
+                                   int n) {
+#if defined(MIMI_HAVE_NEON) && !defined(MIMI_SCALAR_REF)
+    int i = 0;
+    for (; i + 4 <= n; i += 4) {
+        vst1q_f32(y + i, vmulq_f32(vld1q_f32(x + i), vld1q_f32(s + i)));
+    }
+    for (; i < n; ++i) {
+        y[i] = x[i] * s[i];
+    }
+#else
+    for (int i = 0; i < n; ++i) {
+        y[i] = x[i] * s[i];
+    }
+#endif
+}
+
+// -------- softmax: in place, max-subtracted, f32 sum --------------------------
+// NEON max reduction, NEON sum reduction, lane-wise expf.
+extern "C" void mimi_softmax_f32(float *x, int n) {
+    if (n <= 0) {
+        return;
+    }
+#if defined(MIMI_HAVE_NEON) && !defined(MIMI_SCALAR_REF)
+    // pass 1: max
+    float32x4_t vmax = vdupq_n_f32(x[0]);
+    int i = 0;
+    for (; i + 4 <= n; i += 4) {
+        vmax = vmaxq_f32(vmax, vld1q_f32(x + i));
+    }
+    float mx = vmaxvq_f32(vmax);
+    for (; i < n; ++i) {
+        if (x[i] > mx) {
+            mx = x[i];
+        }
+    }
+    // pass 2: e = expf(x - mx) (lane-wise), store, accumulate sum (NEON)
+    const float32x4_t vmx = vdupq_n_f32(mx);
+    float32x4_t vsum = vdupq_n_f32(0.0f);
+    i = 0;
+    for (; i + 4 <= n; i += 4) {
+        float32x4_t d = vsubq_f32(vld1q_f32(x + i), vmx);
+        float lanes[4];
+        vst1q_f32(lanes, d);
+        lanes[0] = expf(lanes[0]);
+        lanes[1] = expf(lanes[1]);
+        lanes[2] = expf(lanes[2]);
+        lanes[3] = expf(lanes[3]);
+        float32x4_t ve = vld1q_f32(lanes);
+        vst1q_f32(x + i, ve);
+        vsum = vaddq_f32(vsum, ve);
+    }
+    float sum = vaddvq_f32(vsum);
+    for (; i < n; ++i) {
+        float e = expf(x[i] - mx);
+        x[i] = e;
+        sum += e;
+    }
+    // pass 3: multiply by 1/sum  (sum > 0: the max element contributes >= 1)
+    const float32x4_t vinv = vdupq_n_f32(1.0f / sum);
+    i = 0;
+    for (; i + 4 <= n; i += 4) {
+        vst1q_f32(x + i, vmulq_f32(vld1q_f32(x + i), vinv));
+    }
+    const float inv = 1.0f / sum;
+    for (; i < n; ++i) {
+        x[i] *= inv;
+    }
+#else
+    float mx = x[0];
+    for (int i = 1; i < n; ++i) {
+        if (x[i] > mx) {
+            mx = x[i];
+        }
+    }
+    float sum = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        float e = expf(x[i] - mx);
+        x[i] = e;
+        sum += e;
+    }
+    float inv = 1.0f / sum;
+    for (int i = 0; i < n; ++i) {
+        x[i] *= inv;
+    }
+#endif
+}
+
+// -------- layer norm: two-pass mean/var, NEON mean/var/apply ------------------
 extern "C" void mimi_layer_norm_f32(const float *x, const float *w,
                                     const float *b, float *y, int n, float eps) {
     // candle_nn::LayerNorm forward, matched term-for-term:
@@ -281,11 +400,54 @@ extern "C" void mimi_layer_norm_f32(const float *x, const float *w,
     //   var  = sum((x-mean)^2)/n          (BIASED — divide by n, not n-1)
     //   y    = (x-mean)/sqrt(var+eps) * w + b   (eps added to var BEFORE sqrt)
     // `eps` is supplied by the consumer (unit 4 passes the transformer's LN
-    // eps). f32 accumulation, sequential order, to track candle's CPU reduce.
-    // w/b may be NULL -> treated as 1 / 0 (elementwise_affine off).
+    // eps). f32 accumulation. w/b may be NULL -> treated as 1 / 0 (affine off).
     if (n <= 0) {
         return;
     }
+#if defined(MIMI_HAVE_NEON) && !defined(MIMI_SCALAR_REF)
+    // pass 1: mean
+    float32x4_t vs = vdupq_n_f32(0.0f);
+    int i = 0;
+    for (; i + 4 <= n; i += 4) {
+        vs = vaddq_f32(vs, vld1q_f32(x + i));
+    }
+    float sum = vaddvq_f32(vs);
+    for (; i < n; ++i) {
+        sum += x[i];
+    }
+    const float mean = sum / (float)n;
+    const float32x4_t vmean = vdupq_n_f32(mean);
+    // pass 2: variance
+    float32x4_t vv = vdupq_n_f32(0.0f);
+    i = 0;
+    for (; i + 4 <= n; i += 4) {
+        float32x4_t d = vsubq_f32(vld1q_f32(x + i), vmean);
+        vv = vmlaq_f32(vv, d, d);
+    }
+    float var = vaddvq_f32(vv);
+    for (; i < n; ++i) {
+        float d = x[i] - mean;
+        var += d * d;
+    }
+    var /= (float)n;
+    const float inv_std = 1.0f / sqrtf(var + eps);
+    const float32x4_t vinv = vdupq_n_f32(inv_std);
+    // pass 3: apply  y = (x-mean)*inv_std * w + b
+    i = 0;
+    for (; i + 4 <= n; i += 4) {
+        float32x4_t d = vsubq_f32(vld1q_f32(x + i), vmean);
+        float32x4_t normed = vmulq_f32(d, vinv);
+        float32x4_t vw = w ? vld1q_f32(w + i) : vdupq_n_f32(1.0f);
+        float32x4_t vb = b ? vld1q_f32(b + i) : vdupq_n_f32(0.0f);
+        vst1q_f32(y + i, vmlaq_f32(vb, normed, vw));  // vb + normed*vw
+    }
+    for (; i < n; ++i) {
+        float normed = (x[i] - mean) * inv_std;
+        float wi = w ? w[i] : 1.0f;
+        float bi = b ? b[i] : 0.0f;
+        y[i] = normed * wi + bi;
+    }
+#else
     float mean = 0.0f;
     for (int i = 0; i < n; ++i) {
         mean += x[i];
@@ -304,6 +466,7 @@ extern "C" void mimi_layer_norm_f32(const float *x, const float *w,
         float bi = b ? b[i] : 0.0f;
         y[i] = normed * wi + bi;
     }
+#endif
 }
 
 // ===========================================================================
@@ -425,18 +588,23 @@ extern "C" int mimi_decoder_step(MimiDecoder *d, const uint32_t *codes,
     // dequantize (no streaming state), so exactly 1 frame out.
     mimi_quant_decode(d->quant, codes, d->emb_buf);
     const int n_emb = 1;
+    // --- fence F0 (post-quant): emb_buf[MIMI_DIM, n_emb], see NOTES (f) ---
 
     // upsample.step: [MIMI_DIM, n_emb] -> [MIMI_DIM, n_up]. Stride 2 => 2 frames
     // out per input frame in steady state (n_up == 2).
     int n_up = mimi_upsample_step(d->upsample, d->emb_buf, n_emb, d->up_buf);
+    // --- fence F1 (post-upsample): up_buf[MIMI_DIM, n_up] ---
 
     // decoder_transformer.step: [MIMI_DIM, n_up] -> [MIMI_DIM, n_tr]. Causal KV
-    // transformer preserves the frame count (n_tr == n_up).
+    // transformer preserves the frame count (n_tr == n_up). Intra: per-layer F2.
     int n_tr = mimi_transformer_step(d->transformer, d->up_buf, n_up, d->tr_buf);
+    // --- fence F2 (post-transformer): tr_buf[MIMI_DIM, n_tr] ---
 
     // decoder(seanet).step: [MIMI_DIM, n_tr] -> pcm[1, n_pcm]. x960 upsample =>
     // n_pcm == n_tr * 960 in steady state (== MIMI_FRAME_OUT for n_tr == 2).
+    // Intra: per {upsample+resnet} layer F3.
     int n_pcm = mimi_seanet_step(d->seanet, d->tr_buf, n_tr, pcm_out);
+    // --- fence F4 (post-seanet): pcm_out[1, n_pcm] — pass-boundary doorbell ---
 
     return n_pcm;
 }
@@ -485,8 +653,11 @@ extern "C" void mimi_decoder_free(MimiDecoder *d) {
  *  StreamTensor(Option<Tensor>) (streaming.rs)| explicit int n_in/n_out counts
  *  StreamTensor::empty() propagation          | a stage handed 0 returns 0
  *  candle weight-norm fold (conv.rs:27,133)   | units fold into arena at init
- *  candle_nn::LayerNorm                       | mimi_layer_norm_f32
- *  candle gelu_erf / Elu / softmax_last_dim   | mimi_gelu_erf_f32 / _elu_ / _softmax_
+ *  candle matmul / linear                     | mimi_gemm_f32 / mimi_gemv_f32 (AMX cblas)
+ *  candle_nn::LayerNorm                       | mimi_layer_norm_f32 (NEON)
+ *  candle gelu_erf / Elu / softmax_last_dim   | mimi_gelu_erf_vec_f32 / _elu_vec_ / _softmax_
+ *  candle add (residual/skip) / LayerScale mul| mimi_add_vec_f32 / mimi_scale_vec_f32
+ *  candle gelu_erf / Elu (per element)        | mimi_gelu_erf_f32 / mimi_elu_f32 (lane/tail)
  *
  *  The Rust ALWAYS calls each `.step` regardless of emptiness; this file mirrors
  *  that by always invoking each stage with the prior stage's count. `StreamMask`
@@ -557,23 +728,37 @@ extern "C" void mimi_decoder_free(MimiDecoder *d) {
  *  (true need ~16 MiB). Tighten once those two decisions lock. The bump
  *  allocator aborts on overflow, so an undersized constant fails at init.
  *
- * (d) PRIMITIVE-KERNEL LOOP ORDERS
- * --------------------------------
- *  gemv (y[M] = W[M,K]*x + b): outer m, inner k. NEON accumulates 4 lanes with
- *    vmlaq_f32 then vaddvq_f32 horizontal sum + scalar k-remainder + bias.
- *    Scalar `_ref` sums sequentially low->high k. -DMIMI_SCALAR_REF forces ref.
- *  gemm (C[M,N] = A[M,K]*B[K,N], beta 0=overwrite / 1=accumulate): i-k-j.
- *    B[k,:] and C[i,:] stream contiguously; NEON vectorizes j (vld/vmla/vst),
- *    beta==0 zeros the C row first (memset). Not a blocked/tiled gemm — first
- *    pass favors a documented, reproducible order over cache tricks; the AMX/
- *    cblas path (if adopted for the transformer) is a unit-4 decision.
- *  softmax (in place): pass 1 max, pass 2 expf(x-max) with f32 running sum,
- *    pass 3 multiply by 1/sum. Max-subtracted for stability.
- *  gelu_erf: 0.5*x*(1+erff(x*(1/sqrt2))), 1/sqrt2 = 0.70710678118654752440f.
- *  elu: x>0 ? x : alpha*(expf(x)-1).
- *  layer_norm: two-pass. pass 1 mean=sum/n; pass 2 var=sum((x-mean)^2)/n
- *    (BIASED, /n — matches candle_nn::LayerNorm); y=(x-mean)/sqrt(var+eps)*w+b,
- *    eps added to var BEFORE sqrt, eps supplied by the caller. NULL w/b => 1/0.
+ * (d) PRIMITIVE-KERNEL LOOP ORDERS  ("math is assembly at every step")
+ * --------------------------------------------------------------------
+ *  gemv (y[M] = W[M,K]*x + b): Accelerate cblas_sgemv(CblasRowMajor,
+ *    CblasNoTrans, m, k, 1, W, lda=k, x, 1, beta=0, y, 1) — routes to the AMX
+ *    coprocessor. No transpose (row-major maps 1:1; movement is theft). Bias is
+ *    a SEPARATE explicit loop after the call (AMX carries no bias term). Scalar
+ *    `_ref` (outer m / inner k, sequential accumulate) is the parity path.
+ *  gemm (C[M,N] = A[M,K]*B[K,N], beta 0=overwrite / 1=accumulate): cblas_sgemm(
+ *    CblasRowMajor, CblasNoTrans, CblasNoTrans, m, n, k, 1, A, lda=k, B, ldb=n,
+ *    beta, C, ldc=n) — AMX, direct row-major, no transpose copies. Scalar `_ref`
+ *    is i-k-j. Off-Apple or -DMIMI_SCALAR_REF selects the _ref siblings.
+ *  softmax (in place): NEON. pass 1 vmaxq + vmaxvq max reduction; pass 2
+ *    expf(x-max) LANE-WISE with a vaddq/vaddvq f32 sum reduction; pass 3 NEON
+ *    multiply by 1/sum. Max-subtracted for stability.
+ *  gelu sweep (mimi_gelu_erf_vec_f32): NEON 0.5*x*(1+e); erff applied lane-wise
+ *    (store arg, 4x erff, reload) — NO vector-poly. Tail via mimi_gelu_erf_f32.
+ *  elu sweep (mimi_elu_vec_f32): NEON vbslq select on (x>0); expf lane-wise on
+ *    the negative branch; alpha via vmulq_n_f32. Tail via mimi_elu_f32.
+ *  add sweep (mimi_add_vec_f32): NEON vaddq, scalar tail.
+ *  scale sweep (mimi_scale_vec_f32): NEON vmulq, elementwise s[i] (LayerScale),
+ *    scalar tail.
+ *  gelu_erf (scalar/lane): 0.5*x*(1+erff(x*(1/sqrt2))), 1/sqrt2=0.7071067811865.
+ *  elu (scalar/lane): x>0 ? x : alpha*(expf(x)-1).
+ *  layer_norm: NEON two-pass. pass 1 mean=sum/n (vaddq/vaddvq); pass 2
+ *    var=sum((x-mean)^2)/n via vmlaq (BIASED, /n — matches candle_nn::LayerNorm);
+ *    pass 3 y=(x-mean)/sqrt(var+eps)*w+b via vmlaq(vb, normed, vw), eps added to
+ *    var BEFORE sqrt, eps supplied by the caller. NULL w/b => 1/0.
+ *  LINKING: gemm/gemv need `-framework Accelerate`. Compiling this .cpp does NOT
+ *    (cblas is header-only decls); the arbiter's build.rs adds the framework.
+ *  Every scalar body above is gated to the _ref/-DMIMI_SCALAR_REF path or a
+ *  sub-vector tail; the hot path is cblas (AMX) or NEON only.
  *
  * (e) UNCERTAINTIES / ARBITER RECONCILIATION
  * ------------------------------------------
@@ -592,16 +777,60 @@ extern "C" void mimi_decoder_free(MimiDecoder *d) {
  *     double-emit step cannot overflow the latent buffers or pcm_out. If the
  *     arbiter proves emit is bounded at 2, this can drop to 2 (buffers shrink,
  *     pcm capacity stays per header).
- *  4. Accumulation order for parity. gemv/gemm/layernorm use sequential f32
- *     accumulation; candle's CPU reduce order (and any NEON lane-sum vs scalar
- *     order in gemv) will differ at ULP level — expected under the "faithful"
- *     tier, bisect with -DMIMI_SCALAR_REF. The transformer softmax uses
- *     softmax_last_dim in candle; my max-subtracted 3-pass matches its formula.
+ *  4. Accumulation order for parity. gemm/gemv run on AMX via cblas (its
+ *     internal reduction order is opaque and differs from candle's blocked gemm
+ *     — the manifest already accepts this: "candle's blocked gemm is not
+ *     economically bit-reproducible", ulp-band tier). NEON reductions
+ *     (softmax/layernorm lane-sums) also differ from a strict sequential sum.
+ *     Bisect with -DMIMI_SCALAR_REF (forces scalar gemm/gemv _ref + scalar
+ *     sweep bodies). Transcendentals are libm erff/expf lane-wise (NOT vector
+ *     polynomials) to stay on the faithful tier. Softmax is max-subtracted
+ *     3-pass matching candle's softmax_last_dim formula.
  *  5. Quantizer emptiness. mimi_decoder_step assumes `codes` is a present single
  *     frame (true on our path). There is no ABI way to pass "empty codes" to
  *     mimi_quant_decode, so the None-codes arm of Rust decode_step is not
  *     reachable here; if a future caller needs it, add an n_in to the quant ABI.
  *  6. reset ordering. Reset order among decoder/transformer/upsample is
  *     immaterial (independent state) but mirrors the Rust for auditability.
+ *
+ * (f) LANE-TEAM INTEGRATION MAP (kcoro engine, native C++ lane program)
+ * --------------------------------------------------------------------
+ *  This kernel is meant to ride the same kcoro lane team as the backbone /
+ *  depthformer, so the arbiter needs to know where the natural fences fall if
+ *  each stage becomes a lane-team stage under its own REQ kind.
+ *
+ *  Stateless / sub-range safe: the sweep + reduction primitives
+ *  (mimi_add_vec_f32, mimi_scale_vec_f32, mimi_elu_vec_f32,
+ *  mimi_gelu_erf_vec_f32, and the mimi_gemm/gemv cblas calls) hold NO global or
+ *  static state — they operate purely on (pointer, length). So the integration
+ *  layer may BAND any of them across lanes by slicing [base+off, len] per lane
+ *  with no cross-lane hazard. The NEON idiom is the house one: full float32x4_t
+ *  register chunks + scalar tail, so a band boundary that isn't 4-aligned still
+ *  computes correctly (each lane runs its own tail).
+ *
+ *  Fence points inside mimi_decoder_step (doorbell / hand-back boundaries),
+ *  in execution order:
+ *    F0  post-quant     : after mimi_quant_decode -> emb_buf[MIMI_DIM, 1].
+ *                         RVQ decode is embarrassingly bandable over the 8
+ *                         codebooks (accumulate into emb); fence before upsample.
+ *    F1  post-upsample  : after mimi_upsample_step -> up_buf[MIMI_DIM, n_up].
+ *                         Frame count expands 1->2 here; fence carries n_up.
+ *    F2  per-transformer-layer : the transformer is 8 residual layers; the
+ *                         natural intra-stage fences are per layer (attn + MLP),
+ *                         matching the depthformer's per-layer doorbell cadence.
+ *                         Coarser option: one fence F2 before / after the whole
+ *                         transformer (post-upsample -> post-transformer).
+ *    F3  per-seanet-layer : the SEANET decoder is init_conv, then 4 {upsample +
+ *                         resnet} layers (ratios 8/6/5/4), then final_conv. Each
+ *                         {upsample, resnet} pair is a natural fence; the frame
+ *                         count multiplies by the ratio at each, so a lane band
+ *                         re-widens per stage (2 -> 16 -> 96 -> 480 -> 1920).
+ *    F4  post-seanet    : pcm_out[1, n_pcm]; hand back the sample count. This is
+ *                         the pass-boundary doorbell (one latent frame consumed,
+ *                         n_pcm samples produced) — the engine's REQ retire point.
+ *  The COUNTS contract in (b) is what each fence must carry (frames on the
+ *  latent side, samples after F4). Cross-frame state (conv left-context, KV
+ *  ring) lives in the arena and is owned by the unit between passes — a fence is
+ *  a data hand-off, never a state copy.
  * ============================================================================
  */
