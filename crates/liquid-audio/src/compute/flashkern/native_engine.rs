@@ -499,8 +499,8 @@ impl Drop for BackboneCtxGuard {
 
 /// Build + install the backbone layer table on the process engine. Returns the guard
 /// the MODEL must own (declared before its weight fields so it drops first), or `None`
-/// when the engine is unavailable, the build fails, or another model's install is
-/// live (single-tenant) — callers keep the per-block path.
+/// when the build fails or another model's install is live (single-tenant) —
+/// callers keep the per-block path. Engine presence is unconditional.
 pub fn install_backbone_ctx(
     descs: &[LayerDesc],
     h: usize,
@@ -623,9 +623,7 @@ mod tests {
             eprintln!("fused kernels unavailable — skipping");
             return;
         }
-        let engine = process_engine().expect(
-            "native engine init failed on a target with fused kernels; check kcoro link/init",
-        );
+        let engine = process_engine();
         let dev = Device::Cpu;
         let (h, nh, nkv, hd, ffn, max_pos) = (256usize, 4usize, 2usize, 64usize, 512usize, 64usize);
         let pos = 3usize; // three rows already resident; this step appends row 3
@@ -839,9 +837,7 @@ mod tests {
             eprintln!("fused kernels unavailable — skipping");
             return;
         }
-        let engine = process_engine().expect(
-            "native engine init failed on a target with fused kernels; check kcoro link/init",
-        );
+        let engine = process_engine();
         let rnd = |i: usize, seed: usize| -> u16 {
             bf16::from_f32(
                 (((i.wrapping_mul(2654435761).wrapping_add(seed)) % 2000) as f32 / 1000.0) - 1.0,
@@ -935,7 +931,7 @@ mod tests {
             eprintln!("fused kernels unavailable — skipping");
             return;
         }
-        let engine = process_engine().expect("native engine init failed");
+        let engine = process_engine();
         let h = 64usize;
         let k = 3usize;
         let i = 96usize;

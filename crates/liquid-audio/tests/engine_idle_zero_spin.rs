@@ -9,9 +9,8 @@
 //!
 //! An integration test so the process contains ONLY this test's threads —
 //! the getrusage(RUSAGE_SELF) delta is attributable to the lane team, not to
-//! parallel unit tests. Gated on aarch64 macOS, where the engine build cfgs
-//! (has_kcoro + has_native_engine + target_arch = "aarch64") always hold; absent
-//! engine here is a build regression, so the test panics rather than skips.
+//! parallel unit tests. Gated on aarch64 macOS (getrusage semantics); the
+//! engine itself is unconditional — the substrate builds or the build fails.
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
 
 use std::time::{Duration, Instant};
@@ -39,8 +38,7 @@ fn idle_window_pct(window: Duration) -> f64 {
 fn engine_lanes_are_silent_at_idle() {
     const IDLE_MAX_PCT: f64 = 0.5;
 
-    let engine = process_engine()
-        .expect("native engine required on aarch64 macOS — kcoro link/init regressed");
+    let engine = process_engine(); // infallible: the engine is the substrate
     let lanes = engine.lanes_total();
     assert!(lanes >= 2, "expected a real lane team, got {lanes}");
 
