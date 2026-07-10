@@ -233,7 +233,11 @@ fn e2e_voice_runtime_speaks_two_turns_through_real_speaker() {
                 .as_u64()
                 .ok_or("config.json: missing `codebooks`")? as usize;
             let params = GenParams {
-                max_new_tokens: 128,
+                // Production parity (desktop TurnMode budget): the model speaks
+                // until <|im_end|>, never a mid-sentence cap — the old 128 cut
+                // turn 2 off at a comma and shipped as a green test. 8192 lets
+                // long self-talk genuinely stress the 32,768-token context.
+                max_new_tokens: 8192,
                 audio_temperature: Some(1.0),
                 audio_top_k: Some(4),
                 ..GenParams::default()

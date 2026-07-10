@@ -353,7 +353,7 @@ impl TurnMode {
     pub fn max_new_tokens(self) -> usize {
         match self {
             TurnMode::Asr => 100,
-            TurnMode::Tts | TurnMode::Interleaved => 2048,
+            TurnMode::Tts | TurnMode::Interleaved => 8192,
         }
     }
 }

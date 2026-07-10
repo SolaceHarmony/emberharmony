@@ -506,7 +506,7 @@ impl LFM2AudioModel {
                 w2: PtrLen::bf16(w2.weight())?,
             });
         }
-        let (heads, kvh, hd, ff, eps) = geom?;
+        let (heads, kvh, _hd, ff, eps) = geom?;
         let (cos, sin) = cos_sin?;
         let mut heads_w = Vec::with_capacity(self.codebooks);
         for se in &self.depth_embeddings {
@@ -1440,6 +1440,7 @@ impl LFM2AudioModel {
 
         let mut current = LFMModality::Text;
 
+        let mut ended = false;
         for _ in 0..params.max_new_tokens {
             let seq_len = in_emb.dim(1)?;
             let h = self
@@ -1457,6 +1458,7 @@ impl LFM2AudioModel {
                         current = LFMModality::AudioOut; // <|audio_start|>
                     }
                     if next == self.special.im_end {
+                        ended = true;
                         break; // <|im_end|>
                     }
                     let tok = Tensor::from_vec(vec![next], (1,), in_emb.device())?;
@@ -1475,6 +1477,13 @@ impl LFM2AudioModel {
                 }
                 LFMModality::AudioIn => unreachable!(),
             }
+        }
+        if !ended {
+            eprintln!(
+                "[voice] max_new_tokens ({}) EXHAUSTED mid-reply — the turn was \
+                 truncated before <|im_end|>; raise the token budget",
+                params.max_new_tokens
+            );
         }
         Ok(())
     }
@@ -1565,11 +1574,16 @@ impl LFM2AudioModel {
         // The native token pass consumes ids directly (embed absorbed into the engine);
         // the candle path derives `in_emb` from them on demand.
         let mut pending: Option<(Vec<u32>, u32)> = None;
+        // Distinguishes a natural end (<|im_end|> or barge-in) from silently
+        // exhausting the token budget — a truncated reply must be LOUD, never
+        // "the model just stopped talking".
+        let mut ended = false;
 
         for _ in 0..params.max_new_tokens {
             // Barge-in: a new utterance asked us to stop — drop this reply mid-stream.
             // (The pass-boundary doorbell: never checked inside a token.)
             if cancel.load(Ordering::Acquire) {
+                ended = true;
                 break;
             }
             modality_left -= 1;
@@ -1585,10 +1599,7 @@ impl LFM2AudioModel {
                 None => None,
             };
             let (h_last, native_logits) = match stepped {
-                Some((h, lg)) => {
-                    pending = None;
-                    (h, lg)
-                }
+                Some((h, lg)) => (h, lg),
                 None => {
                     // The candle path (prefill step, or any native gate failed):
                     // derive in_emb from the pending ids first if there are any.
@@ -1615,6 +1626,7 @@ impl LFM2AudioModel {
                     };
                     let next = self.sample_text_token(&logits, &mut text_sampler)?;
                     if next == self.special.im_end {
+                        ended = true;
                         break; // <|im_end|>
                     }
                     on_token(GenToken::Text(next));
@@ -1644,6 +1656,13 @@ impl LFM2AudioModel {
                 }
                 LFMModality::AudioIn => unreachable!(),
             }
+        }
+        if !ended {
+            eprintln!(
+                "[voice] max_new_tokens ({}) EXHAUSTED mid-reply — the turn was \
+                 truncated before <|im_end|>; raise the token budget",
+                params.max_new_tokens
+            );
         }
         Ok(())
     }

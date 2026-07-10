@@ -214,9 +214,11 @@ impl Default for Lfm2Settings {
             device: Lfm2Device::default(),
             vad_threshold: 0.012,
             // Audio needs more tokens per second than text: the vendor's 512-token
-            // audio default truncates spoken replies mid-sentence. 2048 keeps full
-            // sentences flowing; the model's 32,768-token context is the real ceiling.
-            max_tokens: 2048,
+            // audio default truncates spoken replies mid-sentence. 8192 lets a
+            // long turn run ~10 minutes of interleaved speech before the cap —
+            // the model's 32,768-token context is the real ceiling, and hitting
+            // the cap is LOUD now ("max_new_tokens EXHAUSTED"), never silent.
+            max_tokens: 8192,
             model: Some(DEFAULT_LFM2_MODEL.to_string()),
             seed: None,
             revision: None,
@@ -338,7 +340,7 @@ mod tests {
         assert_eq!(json["provider"], "off");
         assert_eq!(json["lastProvider"], "lfm2");
         assert_eq!(json["lfm2"]["engine"], "moshiRealtime");
-        assert_eq!(json["lfm2"]["maxTokens"], 2048);
+        assert_eq!(json["lfm2"]["maxTokens"], 8192);
         // CPU on every platform since the measured flip (engine work, 2026-07-09):
         // the lane-team engine leads Metal on both latency and underruns.
         assert_eq!(json["lfm2"]["device"], "cpu");
@@ -358,7 +360,7 @@ mod tests {
         assert_eq!(v.last_provider, Some(VoiceProvider::Lfm2));
         assert_eq!(v.lfm2.device, Lfm2Device::Metal);
         assert_eq!(v.lfm2.vad_threshold, 0.012); // filled from Default
-        assert_eq!(v.lfm2.max_tokens, 2048);
+        assert_eq!(v.lfm2.max_tokens, 8192);
         assert_eq!(v.lfm2.engine, LocalVoiceEngine::MoshiRealtime);
         assert_eq!(v.lfm2.moshi_model.as_deref(), Some(DEFAULT_MOSHI_MODEL));
     }

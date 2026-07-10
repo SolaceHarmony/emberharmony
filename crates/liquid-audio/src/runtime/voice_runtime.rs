@@ -1114,7 +1114,17 @@ fn spawn_consumer<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
         .spawn(move || {
             let mut transcript = String::new();
             let mut speaking = false;
-            for event in events.iter() {
+            // An event set aside during the turn-complete drain wait (barge-in or
+            // the next turn arriving while the tail plays) — processed next pass.
+            let mut carried: Option<VoiceEvent> = None;
+            loop {
+                let event = match carried.take() {
+                    Some(ev) => ev,
+                    None => match events.recv() {
+                        Ok(ev) => ev,
+                        Err(_) => break,
+                    },
+                };
                 if consumer_stop.load(Ordering::SeqCst) {
                     break;
                 }
@@ -1205,6 +1215,61 @@ fn spawn_consumer<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
                         }
                     }
                     VoiceEvent::TurnComplete | VoiceEvent::Interrupted => {
+                        if is_turn_complete {
+                            // DRAIN BEFORE DONE (her rule): TurnComplete means
+                            // GENERATION finished — the speaker ring may still
+                            // hold seconds of tail. Don't drop the assistant
+                            // flag, go idle, or re-arm the mic until every
+                            // queued sample has been played. Bounded by the
+                            // backlog's own duration + margin; a barge-in (or
+                            // any next event) ends the wait and is carried into
+                            // the next loop pass.
+                            let backlog = audio
+                                .queued_samples
+                                .load(Ordering::Relaxed)
+                                .saturating_sub(audio.played_samples.load(Ordering::Relaxed));
+                            if backlog > 0 {
+                                let deadline = std::time::Instant::now()
+                                    + std::time::Duration::from_secs_f64(
+                                        backlog as f64 / out_rate as f64 + 2.0,
+                                    );
+                                vtrace!(
+                                    "consumer: turn-complete with {backlog} samples queued — draining before done"
+                                );
+                                loop {
+                                    let q = audio.queued_samples.load(Ordering::Relaxed);
+                                    let p = audio.played_samples.load(Ordering::Relaxed);
+                                    if p >= q || consumer_stop.load(Ordering::SeqCst) {
+                                        break;
+                                    }
+                                    if std::time::Instant::now() >= deadline {
+                                        eprintln!(
+                                            "[voice] output drain timed out with {} samples unplayed — completing turn anyway",
+                                            q.saturating_sub(p)
+                                        );
+                                        break;
+                                    }
+                                    match events.try_recv() {
+                                        Ok(ev) => {
+                                            carried = Some(ev);
+                                            break;
+                                        }
+                                        Err(_) => {
+                                            std::thread::sleep(std::time::Duration::from_millis(5));
+                                        }
+                                    }
+                                }
+                            }
+                            // An interrupt/error that arrived mid-drain supersedes
+                            // this turn's idle/ready — its own arm does that work
+                            // (and the barge-in path flushes the ring).
+                            if matches!(
+                                carried,
+                                Some(VoiceEvent::Interrupted) | Some(VoiceEvent::Error(_))
+                            ) {
+                                continue;
+                            }
+                        }
                         vtrace!(
                             "consumer: {} -> playback idle (echo tail {}ms)",
                             if is_turn_complete {
