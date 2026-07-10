@@ -130,6 +130,10 @@ const float *find_req(const MimiWeightTable *w, const char *name,
                      (unsigned long long)expect_len);
         return nullptr;
     }
+    if (e->data == nullptr) {  // review P2: never hand back a null span
+        if (errlen) snprintf(err, errlen, "mimi_quant: weight '%s' has null data", name);
+        return nullptr;
+    }
     return e->data;
 }
 

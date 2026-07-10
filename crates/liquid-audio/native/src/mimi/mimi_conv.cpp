@@ -39,8 +39,19 @@
 
 // Cap on frames-per-step for the convtr time-axis reduction scratch. The
 // largest input to any decoder transposed conv is 480 (ratio-4 layer); this
-// gives 4x headroom. Asserted-by-construction, not a hot-path bound.
+// gives 4x headroom. ENFORCED at the ABI (review P1): convtr/upsample steps
+// refuse n_in beyond it instead of overrunning the arena-carved g scratch.
 enum { MIMI_CONV_MAX_NIN = MIMI_FRAME_OUT };
+
+// GEMM-route bound: steps with n_in (or num_frames) at or below this AND wide
+// reductions ride AMX via mimi_gemm_f32 instead of time-axis NEON. Rationale
+// (review P1, measured): the widest decoder layers (init conv 512->1024 k7,
+// convtr 1024->512 k16) receive only n=2 time samples, so a 4-lane time-axis
+// AXPY runs entirely in its scalar tail — ~45 ms of the ~70 ms frame. The
+// GEMM formulation moves the in_c*k reduction onto the matrix unit. It
+// REORDERS the K reduction (cblas blocking vs kk-outer/ic-inner) — faithful
+// tier; re-measured against the proven ~4e-6 whole-chain parity bar.
+enum { MIMI_CONV_GEMM_MAX_N = 512 };
 
 /* ======================================================================== *
  *  NEON contiguous primitives (primary path; scalar under MIMI_SCALAR_REF)
@@ -153,16 +164,25 @@ static void weight_norm_fold(const float *v, const float *g, float *out,
     }
 }
 
+// Exact-shape check (review P2: the header promises rejection of misshaped
+// weights, not just wrong element counts): 3-D, dims match, data non-null.
+static int wcheck3(const MimiWeight *ww, int64_t d0, int64_t d1, int64_t d2) {
+    return ww && ww->data && ww->ndim == 3 && ww->shape &&
+           ww->shape[0] == d0 && ww->shape[1] == d1 && ww->shape[2] == d2;
+}
+
 // Resolve the (possibly weight-normed) weight under `base`. Zero-copy if a
-// folded ".weight" exists; else fold weight_g/weight_v into the arena. n0 is
-// the fold broadcast dim (out_c for conv1d, in_c for convtr).
+// folded ".weight" exists; else fold weight_g/weight_v into the arena.
+// Expected shape [d0, d1, d2]; d0 is the fold broadcast dim (out_c for conv1d,
+// in_c for convtr).
 static const float *resolve_weight(const MimiWeightTable *w, const char *base,
-                                   int n0, int rest, MimiArena *a,
-                                   char *err, size_t errlen) {
+                                   int64_t d0, int64_t d1, int64_t d2,
+                                   MimiArena *a, char *err, size_t errlen) {
+    const int rest = (int)(d1 * d2);
     const MimiWeight *ww = wfind(w, base, ".weight");
     if (ww) {
-        if (ww->len != (uint64_t)n0 * (uint64_t)rest) {
-            fail(err, errlen, "conv weight has unexpected element count");
+        if (!wcheck3(ww, d0, d1, d2)) {
+            fail(err, errlen, "conv weight shape mismatch (expect 3-D [d0,d1,d2])");
             return NULL;
         }
         return ww->data;
@@ -173,12 +193,12 @@ static const float *resolve_weight(const MimiWeightTable *w, const char *base,
         fail(err, errlen, "conv weight (nor weight_g/weight_v) not found");
         return NULL;
     }
-    if (vv->len != (uint64_t)n0 * (uint64_t)rest || vg->len != (uint64_t)n0) {
+    if (!wcheck3(vv, d0, d1, d2) || !vg->data || vg->len != (uint64_t)d0) {
         fail(err, errlen, "conv weight_v/weight_g shape mismatch");
         return NULL;
     }
-    float *folded = (float *)mimi_arena_alloc(a, (size_t)n0 * rest * sizeof(float));
-    weight_norm_fold(vv->data, vg->data, folded, n0, rest);
+    float *folded = (float *)mimi_arena_alloc(a, (size_t)d0 * rest * sizeof(float));
+    weight_norm_fold(vv->data, vg->data, folded, (int)d0, rest);
     return folded;
 }
 
@@ -218,6 +238,11 @@ struct MimiConvState {
     float *cbuf;         // [in_c, carry_cap] scratch for the next carry gather
     int prev_len;        // # carried time steps currently in prev  (< kernel_eff)
     int left_pad_applied;
+    // AMX route (short-time wide layers): C[out_c,nf] = W[out_c,ic*k] x B.
+    // W rows are ALREADY (ic,kk)-contiguous in checkpoint layout — zero-copy A;
+    // only the im2col gather B is staged (activation marshalling, like candle).
+    int route_gemm;      // groups==1 && cin_g*ksize wide enough
+    float *im2col;       // [cin_g*ksize, MIMI_CONV_GEMM_MAX_N]
 };
 
 int mimi_conv_init(MimiConvState **st, const MimiWeightTable *w,
@@ -239,19 +264,25 @@ int mimi_conv_init(MimiConvState **st, const MimiWeightTable *w,
 
     char base[256];
     snprintf(base, sizeof(base), "%s.conv.conv", prefix);
-    const int rest = s->cin_g * ksize;
-    s->w = resolve_weight(w, base, out_c, rest, a, err, errlen);
+    s->w = resolve_weight(w, base, out_c, s->cin_g, ksize, a, err, errlen);
     if (!s->w) return 1;
     const MimiWeight *b = wfind(w, base, ".bias");
     if (b) {
-        if (b->len != (uint64_t)out_c)
-            return fail(err, errlen, "conv1d bias length mismatch");
+        if (!b->data || b->len != (uint64_t)out_c)
+            return fail(err, errlen, "conv1d bias missing data or length mismatch");
         s->bias = b->data;
     }
     s->prev = (float *)mimi_arena_alloc(a, (size_t)in_c * s->carry_cap * sizeof(float));
     s->cbuf = (float *)mimi_arena_alloc(a, (size_t)in_c * s->carry_cap * sizeof(float));
     s->prev_len = 0;
     s->left_pad_applied = 0;
+    // AMX route for the wide layers: at n=2 (the seanet entry shapes) the
+    // time-axis AXPY is all scalar tail; the GEMM moves the ic*k reduction
+    // onto the matrix unit. Narrow convs (final 64->1 k3) stay NEON.
+    s->route_gemm = (groups == 1) && ((size_t)s->cin_g * ksize >= 1024);
+    if (s->route_gemm)
+        s->im2col = (float *)mimi_arena_alloc(
+            a, (size_t)s->cin_g * ksize * MIMI_CONV_GEMM_MAX_N * sizeof(float));
     *st = s;
     return 0;
 }
@@ -269,6 +300,9 @@ static inline float conv_read(const MimiConvState *s, const float *xs, int n_in,
 }
 
 int mimi_conv_step(MimiConvState *s, const float *xs, int n_in, float *y) {
+    // Empty StreamTensor propagation: 0 in => 0 out, no state change (the Rust
+    // step short-circuits on None BEFORE the first-step pad).
+    if (n_in <= 0) return 0;
     // First step: prepend padding_total zeros on the LEFT (PadMode::Constant),
     // modelled by pre-loading prev with zeros (cat2(empty, pad1d(xs,pt,0))==pad).
     if (!s->left_pad_applied) {
@@ -282,6 +316,38 @@ int mimi_conv_step(MimiConvState *s, const float *xs, int n_in, float *y) {
     const int stride = s->stride, dil = s->dilation, ke = s->kernel_eff;
     const int seq_len = s->prev_len + n_in;
     const int num_frames = (seq_len + stride >= ke) ? (seq_len + stride - ke) / stride : 0;
+
+    if (num_frames > 0 && s->route_gemm && num_frames <= MIMI_CONV_GEMM_MAX_N) {
+        // AMX route: B[(ic*k + kk), f] = logical[ic][f*stride + kk*dil] gathered
+        // once (row order matches W's (ic,kk) checkpoint layout — zero-copy A),
+        // then C[out_c, nf] = W x B on the matrix unit, bias broadcast after.
+        const int nf = num_frames, k = s->ksize;
+        const int kdim = s->cin_g * k;
+        for (int ic = 0; ic < s->cin_g; ++ic)
+            for (int kk = 0; kk < k; ++kk) {
+                float *brow = s->im2col + ((size_t)ic * k + kk) * nf;
+                const int base = kk * dil;
+                for (int f = 0; f < nf; ++f)
+                    brow[f] = conv_read(s, xs, n_in, ic, f * stride + base);
+            }
+        mimi_gemm_f32(s->w, s->im2col, y, s->out_c, kdim, nf, 0);
+        if (s->bias)
+            for (int oc = 0; oc < s->out_c; ++oc)
+                vadd_scalar(y + (size_t)oc * nf, s->bias[oc], nf);
+        // carry update below is shared with the NEON route.
+        const int offset = num_frames * stride;
+        const int carry_len = seq_len - offset;
+        for (int c = 0; c < s->in_c; ++c) {
+            float *dst = s->cbuf + (size_t)c * s->carry_cap;
+            for (int j = 0; j < carry_len; ++j)
+                dst[j] = conv_read(s, xs, n_in, c, offset + j);
+        }
+        for (int c = 0; c < s->in_c; ++c)
+            memcpy(s->prev + (size_t)c * s->carry_cap,
+                   s->cbuf + (size_t)c * s->carry_cap, carry_len * sizeof(float));
+        s->prev_len = carry_len;
+        return nf;
+    }
 
     if (num_frames > 0) {
         const int nf = num_frames;
@@ -386,6 +452,13 @@ struct MimiConvTrState {
     float *carry_scratch;// [out_c, invalid] next-carry accumulator
     float *g;            // [MIMI_CONV_MAX_NIN] per-(oc,kk) time reduction
     int prev_valid;
+    // AMX route (short-time wide layers): G[k*out_c, n] = W_r x X in ONE GEMM
+    // (X is the caller's [in_c, n] — zero-copy B), then the same per-oc
+    // scatter/bias/overlap/commit. W_r is re-armed ONCE at init to
+    // [kk][oc][ic] contiguous — an init-time repack, not per-step movement.
+    int route_gemm;
+    const float *w_rearm;// [ksize*out_c, in_c]
+    float *g_gemm;       // [ksize*out_c, MIMI_CONV_GEMM_MAX_N]
 };
 
 int mimi_convtr_init(MimiConvTrState **st, const MimiWeightTable *w,
@@ -401,12 +474,12 @@ int mimi_convtr_init(MimiConvTrState **st, const MimiWeightTable *w,
 
     char base[256];
     snprintf(base, sizeof(base), "%s.convtr.convtr", prefix);
-    s->w = resolve_weight(w, base, in_c, out_c * ksize, a, err, errlen);  // dim0=in_c
+    s->w = resolve_weight(w, base, in_c, out_c, ksize, a, err, errlen);  // dim0=in_c
     if (!s->w) return 1;
     const MimiWeight *b = wfind(w, base, ".bias");
     if (b) {
-        if (b->len != (uint64_t)out_c)
-            return fail(err, errlen, "convtr bias length mismatch");
+        if (!b->data || b->len != (uint64_t)out_c)
+            return fail(err, errlen, "convtr bias missing data or length mismatch");
         s->bias = b->data;
     }
     const int inv = s->invalid > 0 ? s->invalid : 1;   // avoid 0-byte alloc
@@ -414,6 +487,21 @@ int mimi_convtr_init(MimiConvTrState **st, const MimiWeightTable *w,
     s->carry_scratch = (float *)mimi_arena_alloc(a, (size_t)out_c * inv * sizeof(float));
     s->g = (float *)mimi_arena_alloc(a, (size_t)MIMI_CONV_MAX_NIN * sizeof(float));
     s->prev_valid = 0;
+    // AMX route for the wide layers (the ratio-8 convtr receives n=2: its
+    // time-axis AXPY was all scalar tail — the measured ~31 ms hot spot).
+    s->route_gemm = (in_c >= 128);
+    if (s->route_gemm) {
+        float *wr = (float *)mimi_arena_alloc(
+            a, (size_t)ksize * out_c * in_c * sizeof(float));
+        for (int kk = 0; kk < ksize; ++kk)
+            for (int o = 0; o < out_c; ++o)
+                for (int c = 0; c < in_c; ++c)
+                    wr[(((size_t)kk * out_c) + o) * in_c + c] =
+                        s->w[((size_t)c * out_c + o) * ksize + kk];
+        s->w_rearm = wr;
+        s->g_gemm = (float *)mimi_arena_alloc(
+            a, (size_t)ksize * out_c * MIMI_CONV_GEMM_MAX_N * sizeof(float));
+    }
     *st = s;
     return 0;
 }
@@ -421,11 +509,21 @@ int mimi_convtr_init(MimiConvTrState **st, const MimiWeightTable *w,
 void mimi_convtr_reset(MimiConvTrState *s) { s->prev_valid = 0; }
 
 int mimi_convtr_step(MimiConvTrState *s, const float *xs, int n_in, float *y) {
+    // ABI bounds (review P1): g/g_gemm scratch would overrun past
+    // MIMI_CONV_MAX_NIN. 0 in = 0 out (empty StreamTensor propagation).
+    if (n_in <= 0) return 0;
+    if (n_in > MIMI_CONV_MAX_NIN) return -1;
     const int stride = s->stride, k = s->ksize, oc_n = s->out_c, in_c = s->in_c;
     const int emit_len = n_in * stride;
     const int invalid = s->invalid;                 // ot = emit_len + invalid
     const int inv_row = invalid > 0 ? invalid : 1;
     float *g = s->g;                                // per-lane-private (see NOTES g)
+
+    // AMX route: the whole (kk,oc) x ic reduction as ONE GEMM up front —
+    // G[kk*oc_n + oc, l] = sum_ic W_r[kk*oc_n+oc, ic] * X[ic, l].
+    const int use_gemm = s->route_gemm && n_in <= MIMI_CONV_GEMM_MAX_N;
+    if (use_gemm)
+        mimi_gemm_f32(s->w_rearm, xs, s->g_gemm, k * oc_n, in_c, n_in, 0);
 
     // LANE-BAND AXIS = output channel oc: this loop body is fully independent
     // per oc (reduce -> scatter -> bias -> overlap -> commit its own carry row),
@@ -436,18 +534,25 @@ int mimi_convtr_step(MimiConvTrState *s, const float *xs, int n_in, float *y) {
         memset(yrow, 0, (size_t)emit_len * sizeof(float));
         if (invalid > 0) memset(crow, 0, (size_t)invalid * sizeof(float));
 
-        // per kk: g[l] = sum_ic X[ic,l]*w[ic,oc,kk] (NEON AXPY over the
-        // contiguous time axis l), then scatter to out_t = l*stride+kk.
-        // Per fixed oc the kk-ascending / ic-ascending order matches candle.
+        // per kk: g[l] = sum_ic X[ic,l]*w[ic,oc,kk], then scatter to
+        // out_t = l*stride+kk. GEMM route reads the AMX-computed rows;
+        // NEON route accumulates over the contiguous time axis. Per fixed oc
+        // the kk-ascending scatter order matches candle either way.
         for (int kk = 0; kk < k; ++kk) {
-            memset(g, 0, (size_t)n_in * sizeof(float));
-            const float *wp = s->w + (size_t)oc * k + kk;   // w[ic,oc,kk], ic stride out_c*k
-            for (int ic = 0; ic < in_c; ++ic)
-                vaxpy(g, xs + (size_t)ic * n_in, wp[(size_t)ic * oc_n * k], n_in);
+            const float *grow;
+            if (use_gemm) {
+                grow = s->g_gemm + (((size_t)kk * oc_n) + oc) * n_in;
+            } else {
+                memset(g, 0, (size_t)n_in * sizeof(float));
+                const float *wp = s->w + (size_t)oc * k + kk;   // w[ic,oc,kk], ic stride out_c*k
+                for (int ic = 0; ic < in_c; ++ic)
+                    vaxpy(g, xs + (size_t)ic * n_in, wp[(size_t)ic * oc_n * k], n_in);
+                grow = g;
+            }
             for (int l = 0; l < n_in; ++l) {
                 const int out_t = l * stride + kk;
-                if (out_t < emit_len) yrow[out_t] += g[l];
-                else                  crow[out_t - emit_len] += g[l];
+                if (out_t < emit_len) yrow[out_t] += grow[l];
+                else                  crow[out_t - emit_len] += grow[l];
             }
         }
         // bias broadcast-added to every raw position (emit region + tail carry).
@@ -529,6 +634,10 @@ int mimi_upsample_init(MimiUpsampleState **st, const MimiWeightTable *w,
 void mimi_upsample_reset(MimiUpsampleState *s) { s->prev_valid = 0; }
 
 int mimi_upsample_step(MimiUpsampleState *s, const float *xs, int n_in, float *y) {
+    // ABI bounds (review P1): the n_in>1 fallback's g scratch would overrun
+    // past MIMI_CONV_MAX_NIN. 0 in = 0 out (empty StreamTensor propagation).
+    if (n_in <= 0) return 0;
+    if (n_in > MIMI_CONV_MAX_NIN) return -1;
     const int stride = s->stride, k = s->ksize, dim = s->dim, invalid = s->invalid;
     const int emit_len = n_in * stride;             // ot = emit_len + invalid
 
