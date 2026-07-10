@@ -469,15 +469,22 @@ context is the ceiling) and the desktop crate's rotted test suite repaired (42/4
 **Build next:**
 0. RAYON GONE — the control-plane goal (her directive): REQ_CALL keeps the
    depthformer's control flow in Rust (deliberate anti-transcription interim);
-   the destination is a native control plane. Ladder: delete the depthformer
-   rayon-scope fallback (no-fallbacks doctrine — engine REQUIRED for depth-flash;
-   absent engine ⇒ the candle reference path, loudly) → ST_LOGITS + ChaCha12
-   sampler native → kcoro-rs takes the control plane → rayon leaves Cargo.toml
-   when candle CPU compute is fully demoted (prefill stays candle/Accelerate
-   until then — turn-level, not token-level). Two-barrier doctrine stands: Rust
-   lane programs spin pure (never enter kcoro — no frame migration); native
-   programs bounded-spin then precisely park. Acceptance oracle: kcoro_arena
-   8e19a35 (PR-122 cpu-monitor + zero-spin verification, idle ≈0.000% CPU).
+   the destination is a native control plane. Ladder: ~~delete the depthformer
+   rayon-scope fallback~~ DONE (no-fallbacks doctrine — engine REQUIRED for
+   depth-flash: `build_depth_flash` refuses without the engine and the candle
+   reference chain runs loudly; `DepthDecode::frame` is engine-only, the
+   rayon+DISPATCH_LOCK branch is deleted) → ST_LOGITS + ChaCha12 sampler native
+   → kcoro-rs takes the control plane → rayon leaves Cargo.toml when candle CPU
+   compute is fully demoted (prefill stays candle/Accelerate until then —
+   turn-level, not token-level). Two-barrier doctrine stands: Rust lane programs
+   spin pure (never enter kcoro — no frame migration); native programs
+   bounded-spin then precisely park. Acceptance oracle: the PR-122 zero-spin
+   criterion, now MEASURED LOCALLY on both trees (the arena import 8e19a35 is
+   /proc-based — vacuous on macOS; the Darwin-real ports carry the verdict):
+   kcoro `tests/test_zero_spin_idle.c` (fd7861f — 8 workers: cold idle 0.004%,
+   post-burst 0.003%, 1-task/200ms trickle 0.089%) and this crate's
+   `tests/engine_idle_zero_spin.rs` (8 engine lanes parked at the doorbell:
+   cold 0.006%, after a full REQ_CALL pass 0.005%). kcoro-rs R1 must match.
 1. Frequency-band split (her Hyena shape): lanes own heads/channels/FFN-bands
    END-TO-END, ~2 callback-joins per block instead of ~9 fences; reassembly =
    f32 partials + one RNE round (or online-softmax for KV-split attention).

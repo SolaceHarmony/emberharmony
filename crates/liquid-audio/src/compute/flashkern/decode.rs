@@ -612,6 +612,39 @@ impl DepthDecode {
     /// `sample` is called once per codebook with the rounded bf16 logits bits and must
     /// return the chosen token (the caller wraps its seeded Sampler — same RNG stream as
     /// the candle path). ONE dispatch; lanes walk steps/layers with spin barriers.
+    ///
+    /// Non-engine builds never construct a `DepthDecode` (`build_depth_flash` is
+    /// engine-gated), so this stub is a broken invariant, not a slow path.
+    #[cfg(not(all(
+        has_kcoro,
+        has_native_engine,
+        any(
+            all(target_arch = "aarch64", has_flashkern_neon),
+            all(target_arch = "x86_64", has_flashkern_x86)
+        )
+    )))]
+    pub fn frame(
+        &self,
+        _emb_bits: &[u16],
+        _sample: impl FnMut(&[u16]) -> u32 + Send,
+    ) -> Vec<u32> {
+        unreachable!(
+            "depth-flash without the native engine build — build_depth_flash must return None here"
+        )
+    }
+
+    /// One audio frame: backbone hidden (bf16 bits, `[backbone_dim]`) → `codebooks` tokens.
+    /// `sample` is called once per codebook with the rounded bf16 logits bits and must
+    /// return the chosen token (the caller wraps its seeded Sampler — same RNG stream as
+    /// the candle path). ONE dispatch; lanes walk steps/layers with spin barriers.
+    #[cfg(all(
+        has_kcoro,
+        has_native_engine,
+        any(
+            all(target_arch = "aarch64", has_flashkern_neon),
+            all(target_arch = "x86_64", has_flashkern_x86)
+        )
+    ))]
     pub fn frame(
         &self,
         emb_bits: &[u16],
@@ -637,30 +670,16 @@ impl DepthDecode {
         let scale = 1.0f32 / (hd as f32).sqrt();
         let mut s = self.scratch.lock().expect("depth scratch poisoned");
         let s = &mut *s;
-        // Lane count comes from OUR team when the engine is up — a foreign pool has
-        // no authority over this kernel's width. Non-engine builds keep rayon sizing.
-        // Both size from the P-core count, so banding (and therefore bits) agrees.
-        #[cfg(all(
-        has_kcoro,
-        has_native_engine,
-        any(
-            all(target_arch = "aarch64", has_flashkern_neon),
-            all(target_arch = "x86_64", has_flashkern_x86)
-        )
-        ))]
-        let lanes = crate::flashkern::native_engine::process_engine()
-            .map(|e| e.lanes_total())
-            .unwrap_or_else(|| rayon::current_num_threads())
-            .clamp(1, 16);
-        #[cfg(not(all(
-        has_kcoro,
-        has_native_engine,
-        any(
-            all(target_arch = "aarch64", has_flashkern_neon),
-            all(target_arch = "x86_64", has_flashkern_x86)
-        )
-        )))]
-        let lanes = rayon::current_num_threads().clamp(1, 16);
+        // Lane count comes from OUR team, nothing else — depth-flash exists only on
+        // the engine (construction is engine-gated in build_depth_flash); a foreign
+        // pool has no authority over this kernel's width.
+        let engine = crate::flashkern::native_engine::process_engine()
+            .expect("DepthDecode::frame: native engine gone after engine-gated construction");
+        let lanes = engine.lanes_total();
+        assert!(
+            (1..=16).contains(&lanes),
+            "depth frame: lane team width {lanes} outside the program's banding range"
+        );
 
         // din = rb(depth_linear(emb) + bias): one GEMV over the backbone hidden, rounded
         // per element — the linear_forward ladder. Fanned over lanes below (row slices).
@@ -1034,45 +1053,27 @@ impl DepthDecode {
                     }
         };
 
-        // Engine team first: the depthformer rides the SAME lanes as the backbone.
-        // Fallback (engine absent): the original rayon + SpinBarrier threadgroup,
-        // bit-identical banding, still caged by DISPATCH_LOCK.
-        let mut dispatched = false;
-        #[cfg(all(
-            has_kcoro,
-            has_native_engine,
-            any(
-                all(target_arch = "aarch64", has_flashkern_neon),
-                all(target_arch = "x86_64", has_flashkern_x86)
-            )
-        ))]
-        if let Some(engine) = crate::flashkern::native_engine::process_engine() {
-            if engine.lanes_total() == lanes {
-                // SPIN-ONLY fences under Rust frames (review P1): a lane that PARKS
-                // inside a fence lands on kc_sched's global ready queue and can be
-                // resumed on a DIFFERENT worker pthread — migrating a live Rust
-                // frame (sampler included) across threads, the exact TLS hazard
-                // class kcoro patch 0002 fixed for the runtime's own C frames.
-                // Native (C++) engine programs are written to tolerate that; Rust
-                // programs are not, so they never park mid-frame: the engine
-                // provides the dispatch, the stage barrier stays a pure spin —
-                // exactly the pre-fold SpinBarrier semantics, on our lanes.
-                let barrier = SpinBarrier::new(lanes);
-                let barrier = &barrier;
-                dispatched = engine.run_lanes(|lane| run_lane(lane, barrier));
-            }
-        }
-        if !dispatched {
-            let _dispatch = DISPATCH_LOCK.lock().unwrap();
-            let barrier = SpinBarrier::new(lanes);
-            let barrier = &barrier;
-            let run_lane = &run_lane;
-            rayon::scope(|scope| {
-                for lane in 0..lanes {
-                    scope.spawn(move |_| run_lane(lane, barrier));
-                }
-            });
-        }
+        // The depthformer rides the SAME lanes as the backbone: ONE doorbell per
+        // frame, no rayon, no DISPATCH_LOCK. There is no threadgroup fallback —
+        // absent engine, build_depth_flash returns None and the candle reference
+        // chain runs. A silent rayon pool here would be a second, foreign control
+        // plane (no-fallbacks doctrine).
+        //
+        // SPIN-ONLY fences under Rust frames (review P1): a lane that PARKS
+        // inside a fence lands on kc_sched's global ready queue and can be
+        // resumed on a DIFFERENT worker pthread — migrating a live Rust
+        // frame (sampler included) across threads, the exact TLS hazard
+        // class kcoro patch 0002 fixed for the runtime's own C frames.
+        // Native (C++) engine programs are written to tolerate that; Rust
+        // programs are not, so they never park mid-frame: the engine
+        // provides the dispatch, the stage barrier stays a pure spin —
+        // exactly the pre-fold SpinBarrier semantics, on our lanes.
+        let barrier = SpinBarrier::new(lanes);
+        let barrier = &barrier;
+        assert!(
+            engine.run_lanes(|lane| run_lane(lane, barrier)),
+            "DepthDecode::frame: engine refused the frame program"
+        );
 
         tokens
             .iter()

@@ -480,6 +480,22 @@ impl LFM2AudioModel {
         if !crate::bf16_gemm::bf16_gemm_nt_available() {
             return None;
         }
+        // Depth-flash rides the native engine's lane team — REQUIRED. Absent
+        // engine (a build without it, or init failure) the depthformer runs the
+        // candle reference chain, loudly. Never a silent rayon threadgroup: a
+        // foreign pool under this kernel is a second control plane (no-fallbacks
+        // doctrine).
+        #[cfg(all(has_kcoro, has_native_engine))]
+        let engine_up = crate::flashkern::native_engine::process_engine().is_some();
+        #[cfg(not(all(has_kcoro, has_native_engine)))]
+        let engine_up = false;
+        if !engine_up {
+            eprintln!(
+                "[voice] flashkern depthformer DISABLED — native engine unavailable; \
+                 depthformer takes the candle reference path"
+            );
+            return None;
+        }
         let mut layers = Vec::with_capacity(self.depthformer.layers.len());
         let mut geom = None;
         let mut cos_sin = None;
