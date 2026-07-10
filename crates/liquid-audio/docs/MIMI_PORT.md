@@ -138,12 +138,22 @@ streaming.rs (`StreamTensor` = Option<Tensor>) becomes explicit
       assembly-at-every-step rule); NEON max reduction (exact-equal for
       non-NaN rows). Everything else in the transformer chain is bit-matched
       by construction.
-      Review perf finding, deferred POST-parity: the widest seanet layers
-      (model.0 conv k7, model.2 convtr) receive only n=2 time samples, so
-      time-axis NEON runs entirely in the scalar tail there — fix is
-      channel-axis vectorization or the per-kk AMX GEMM formulation already
-      sketched in mimi_conv.cpp NOTES; the deep layers (16..1920 samples) are
-      properly vectorized today.
+      Review perf finding — FIXED (a4a11d43, was deferred until the final
+      verdict measured it at 3.3x slower than Rust/moshi): the widest seanet
+      layers receive n=2 time samples, so time-axis NEON ran in its scalar
+      tail (~45 of ~70 ms). AMX routes via mimi_gemm_f32: conv1d im2col +
+      single GEMM (weight rows already (ic,kk)-contiguous — zero-copy A);
+      convtr re-armed once at init to [kk][oc][ic] + ONE GEMM, zero-copy X.
+      Measured, real checkpoint, 130 frames across the KV wrap:
+      **76.5 -> 13.8 ms median/frame (max 14.2; old spiked to 103), vs
+      Rust/moshi ~20.8 ms** — 5.6x on ourselves, 1.5x on candle, 5.8x
+      real-time headroom, single-threaded, before any lane banding.
+      Route-parity vs the proven build: 2.5e-6 (chain bar vs moshi 4.1e-6).
+      Verdict's remaining P1s also closed this pass: convtr/upsample n_in
+      ABI bounds (arena overrun), exact-shape + null-data weight validation.
+      Still open from the verdict: AMX dispatch is inferred from the 5.6x on
+      GEMM-bound shapes, not proven by counters; cold init ~665 ms (page
+      faults + re-arm) needs one measurement pass at integration.
 - [ ] build wiring (build.rs, with -ffp-contract=off) + parity harness
 - [ ] chain parity + thresholds recorded here
 - [ ] her wav-hash re-arm decision
