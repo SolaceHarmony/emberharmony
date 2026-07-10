@@ -467,6 +467,17 @@ token budget raised to 2048 (audio spends tokens faster than text; 32,768-token
 context is the ceiling) and the desktop crate's rotted test suite repaired (42/42).
 
 **Build next:**
+0. RAYON GONE — the control-plane goal (her directive): REQ_CALL keeps the
+   depthformer's control flow in Rust (deliberate anti-transcription interim);
+   the destination is a native control plane. Ladder: delete the depthformer
+   rayon-scope fallback (no-fallbacks doctrine — engine REQUIRED for depth-flash;
+   absent engine ⇒ the candle reference path, loudly) → ST_LOGITS + ChaCha12
+   sampler native → kcoro-rs takes the control plane → rayon leaves Cargo.toml
+   when candle CPU compute is fully demoted (prefill stays candle/Accelerate
+   until then — turn-level, not token-level). Two-barrier doctrine stands: Rust
+   lane programs spin pure (never enter kcoro — no frame migration); native
+   programs bounded-spin then precisely park. Acceptance oracle: kcoro_arena
+   8e19a35 (PR-122 cpu-monitor + zero-spin verification, idle ≈0.000% CPU).
 1. Frequency-band split (her Hyena shape): lanes own heads/channels/FFN-bands
    END-TO-END, ~2 callback-joins per block instead of ~9 fences; reassembly =
    f32 partials + one RNE round (or online-softmax for KV-split attention).
