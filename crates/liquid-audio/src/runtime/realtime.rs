@@ -1093,6 +1093,10 @@ pub struct Lfm2VoiceEngine {
     /// the e2e test) can still observe them from outside.
     spec_consumed: Arc<AtomicU64>,
     spec_discarded: Arc<AtomicU64>,
+    // Conversation context length (cursor.positions) mirrored at each turn end —
+    // the 32k-soak seam: tests watch the context grow toward
+    // max_position_embeddings without reaching into the worker thread.
+    ctx_positions: Arc<AtomicU64>,
 }
 
 /// See [`Lfm2VoiceEngine::pending`]: the turn context is fully assembled and every
@@ -1235,6 +1239,7 @@ impl Lfm2VoiceEngine {
             pending: None,
             spec_consumed: Arc::new(AtomicU64::new(0)),
             spec_discarded: Arc::new(AtomicU64::new(0)),
+            ctx_positions: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -1253,6 +1258,13 @@ impl Lfm2VoiceEngine {
     /// actually happened (not just that replies were equivalent).
     pub fn speculative_counters(&self) -> (Arc<AtomicU64>, Arc<AtomicU64>) {
         (self.spec_consumed.clone(), self.spec_discarded.clone())
+    }
+
+    /// Handle to the conversation context length (positions), updated at each
+    /// turn end — cloneable BEFORE the engine moves into a pipeline. The
+    /// 32k-context soak watches this climb toward `max_position_embeddings`.
+    pub fn context_positions(&self) -> Arc<AtomicU64> {
+        self.ctx_positions.clone()
     }
 
     /// Speculative prefill of a PROBABLE next utterance (the VAD saw a pause that
@@ -1651,6 +1663,7 @@ impl VoiceEngine for Lfm2VoiceEngine {
                 }
             }
             cursor.positions = index_pos;
+            self.ctx_positions.store(index_pos as u64, Ordering::Relaxed);
         }
 
         // Even a genuinely empty generation commits the turn: the user's utterance is
