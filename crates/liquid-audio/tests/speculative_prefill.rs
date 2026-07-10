@@ -98,7 +98,7 @@ fn respond(engine: &mut Lfm2VoiceEngine, utt: &Utterance) -> Reply {
                     first_text_run.push_str(&t);
                 }
             }
-            VoiceEvent::Audio(_) => n_audio += 1,
+            VoiceEvent::Audio { .. } => n_audio += 1,
             _ => {}
         })
         .expect("respond");

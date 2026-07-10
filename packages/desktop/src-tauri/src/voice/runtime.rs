@@ -1265,9 +1265,14 @@ fn spawn_native_livekit_agent_events(
                         break;
                     }
                 }
-                Ok(RealtimeEvent::Audio(pcm)) => {
+                Ok(RealtimeEvent::Audio { pcm, rate }) => {
                     bridge_state.handle_realtime_audio();
-                    playback.observe(&pcm, LIVEKIT_AGENT_AUDIO_RATE);
+                    // Rate-honest hand-off (the real-deal bug): consume the rate
+                    // the event CARRIES — never re-assert the constant. The
+                    // engine is built with LIVEKIT_AGENT_AUDIO_RATE, so a
+                    // mismatch here is a wiring bug; write() below hard-errors
+                    // on it rather than playing half-speed rumble.
+                    playback.observe(&pcm, rate);
                     if !send(
                         &channel,
                         VoiceEvent::State {
@@ -1278,9 +1283,22 @@ fn spawn_native_livekit_agent_events(
                         break;
                     }
                     let rms = rms_f32(&pcm);
+                    if rate != LIVEKIT_AGENT_AUDIO_RATE {
+                        let _ = send(
+                            &channel,
+                            VoiceEvent::Error {
+                                message: format!(
+                                    "engine audio at {rate} Hz, output track at {} Hz — rate wiring bug",
+                                    LIVEKIT_AGENT_AUDIO_RATE
+                                ),
+                            },
+                        );
+                        done.store(true, Ordering::SeqCst);
+                        break;
+                    }
                     for frame in livekit_audio_frames(
                         &pcm,
-                        LIVEKIT_AGENT_AUDIO_RATE,
+                        rate,
                         LIVEKIT_AGENT_AUDIO_CHANNELS,
                     ) {
                         if done.load(Ordering::SeqCst) {

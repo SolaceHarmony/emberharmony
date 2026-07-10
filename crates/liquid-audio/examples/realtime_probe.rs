@@ -98,7 +98,7 @@ impl VoiceEngine for LoopEngine {
             if cancel.load(Ordering::Acquire) {
                 return Ok(false);
             }
-            emit(VoiceEvent::Audio(vec![0.0]));
+            emit(VoiceEvent::Audio { pcm: vec![0.0], rate: 24_000 });
             std::thread::sleep(Duration::from_millis(1));
         }
         Ok(true)
@@ -115,7 +115,7 @@ fn handle_interrupt_probe() -> Result<(), String> {
         return Err("utterance should enter interrupt probe".into());
     }
     match recv_event(pipe.events())? {
-        VoiceEvent::Audio(_) => {}
+        VoiceEvent::Audio { pcm: _, .. } => {}
         ev => {
             return Err(format!(
                 "expected streaming audio before interrupt, got {ev:?}"

@@ -164,7 +164,11 @@ pub enum VoiceEvent {
     /// A decoded text fragment (one or more detokenized text tokens).
     Text(String),
     /// A decoded PCM chunk (mono f32) at the pipeline's output rate.
-    Audio(Vec<f32>),
+    /// One decoded PCM chunk. `rate` is the ACTUAL sample rate of `pcm` —
+    /// carried on every hand-off so no consumer re-asserts a constant it
+    /// merely believes (the half-speed-rumble bug class: producer and
+    /// consumer agreeing by coincidence until one side changes).
+    Audio { pcm: Vec<f32>, rate: u32 },
     /// The reply for the current utterance finished normally (`chat.py`'s `q.put(None)`).
     /// Frame-fed Moshi pipelines do not synthesize this on silence; the stream is continuous.
     TurnComplete,
@@ -1515,6 +1519,7 @@ impl VoiceEngine for Lfm2VoiceEngine {
         let device = &self.device;
         let codebooks = self.codebooks;
         let mut resampler = StreamingPcmResampler::new(mimi_rate, self.out_rate);
+        let out_rate = self.out_rate; // captured for the emit closure (rate-honest events)
         let mut cb_err: Option<String> = None;
 
         // Collect the generated stream for `chat.append` (the discrete `audio_out` → context
@@ -1612,7 +1617,7 @@ impl VoiceEngine for Lfm2VoiceEngine {
                                 }
                             })();
                             match decoded {
-                                Ok(Some(pcm)) => emit(VoiceEvent::Audio(pcm)),
+                                Ok(Some(pcm)) => emit(VoiceEvent::Audio { pcm, rate: out_rate }),
                                 Ok(None) => {}
                                 Err(e) => cb_err = Some(e.to_string()),
                             }
@@ -1811,7 +1816,10 @@ impl MoshiVoiceEngine {
                     } else {
                         self.out_resampler.process(pcm)
                     };
-                    emit(VoiceEvent::Audio(pcm));
+                    emit(VoiceEvent::Audio {
+                        pcm,
+                        rate: self.out_rate,
+                    });
                 }
             }
         }
@@ -2261,7 +2269,7 @@ mod tests {
         ) -> Result<bool, String> {
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
             if call == 0 {
-                emit(VoiceEvent::Audio(vec![0.0, 0.0]));
+                emit(VoiceEvent::Audio { pcm: vec![0.0, 0.0], rate: 24_000 });
             }
             Ok(true)
         }
@@ -2280,7 +2288,7 @@ mod tests {
         }
         assert_eq!(
             pipe.events().recv_timeout(Duration::from_secs(5)).unwrap(),
-            VoiceEvent::Audio(vec![0.0, 0.0])
+            VoiceEvent::Audio { pcm: vec![0.0, 0.0], rate: 24_000 }
         );
 
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -2373,7 +2381,7 @@ mod tests {
         ) -> Result<bool, String> {
             self.turns.fetch_add(1, Ordering::SeqCst);
             emit(VoiceEvent::Text(format!("got {}", utt.samples.len())));
-            emit(VoiceEvent::Audio(vec![0.1, 0.2, 0.3]));
+            emit(VoiceEvent::Audio { pcm: vec![0.1, 0.2, 0.3], rate: 24_000 });
             Ok(true)
         }
     }
@@ -2390,7 +2398,7 @@ mod tests {
             collect_turn(pipe.events()),
             vec![
                 VoiceEvent::Text("got 5".into()),
-                VoiceEvent::Audio(vec![0.1, 0.2, 0.3]),
+                VoiceEvent::Audio { pcm: vec![0.1, 0.2, 0.3], rate: 24_000 },
                 VoiceEvent::TurnComplete,
             ]
         );
@@ -2906,7 +2914,7 @@ mod tests {
                 if cancel.load(Ordering::Acquire) {
                     return Ok(false);
                 }
-                emit(VoiceEvent::Audio(vec![0.0]));
+                emit(VoiceEvent::Audio { pcm: vec![0.0], rate: 24_000 });
                 std::thread::sleep(Duration::from_millis(1));
             }
             Ok(true)
@@ -2922,7 +2930,7 @@ mod tests {
             .events()
             .recv_timeout(Duration::from_secs(5))
             .expect("turn should start");
-        assert!(matches!(first, VoiceEvent::Audio(_)));
+        assert!(matches!(first, VoiceEvent::Audio { .. }));
 
         pipe.interrupt();
 

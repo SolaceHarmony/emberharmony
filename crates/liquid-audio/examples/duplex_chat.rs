@@ -229,7 +229,7 @@ fn main() -> Res<()> {
                         print!("{t}");
                         std::io::stdout().flush().ok();
                     }
-                    VoiceEvent::Audio(pcm) => {
+                    VoiceEvent::Audio { pcm: pcm, .. } => {
                         active.store(true, Ordering::SeqCst);
                         ring.lock().unwrap().extend(pcm);
                     }

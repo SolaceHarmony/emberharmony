@@ -78,7 +78,7 @@ fn read_wav_mono_f32(path: &Path) -> (Vec<f32>, u32) {
 enum Ev {
     State(SessionState),
     Transcript(String),
-    Audio(Vec<f32>),
+    Audio { pcm: Vec<f32>, rate: u32 },
     Ended(Option<String>),
     Error(String),
 }
@@ -88,7 +88,7 @@ fn forward_events(tx: Sender<Ev>) -> impl FnMut(RuntimeEvent) -> bool + Send + '
         let ev = match event {
             RuntimeEvent::State(s) => Some(Ev::State(s)),
             RuntimeEvent::Transcript(t) => Some(Ev::Transcript(t)),
-            RuntimeEvent::Audio { pcm, .. } => Some(Ev::Audio(pcm)),
+            RuntimeEvent::Audio { pcm, rate } => Some(Ev::Audio { pcm, rate }),
             RuntimeEvent::Level(_) => None,
             RuntimeEvent::Ended(reason) => Some(Ev::Ended(reason)),
             RuntimeEvent::Error(e) => Some(Ev::Error(e)),
@@ -216,6 +216,8 @@ fn e2e_self_talk_reaches_32k_context() {
     let soak_t0 = Instant::now();
     let mut next_utterance: Vec<f32> = seed;
     let mut reached = false;
+    let mut last_transcript = String::new();
+    let mut repeats = 0usize;
     for turn in 1..=MAX_TURNS {
         let utt_secs = next_utterance.len() as f32 / FEED_RATE as f32;
         feed.lock().unwrap().extend(next_utterance.iter().copied());
@@ -228,6 +230,7 @@ fn e2e_self_talk_reaches_32k_context() {
         // Collect the whole reply until the runtime reopens the mic (which, per
         // the drain guarantee, means every queued sample was played).
         let mut reply: Vec<f32> = Vec::new();
+        let mut reply_rate: u32 = FEED_RATE;
         let mut transcript = String::new();
         wait_for_state(
             &rx,
@@ -235,11 +238,22 @@ fn e2e_self_talk_reaches_32k_context() {
             Duration::from_secs(900),
             turn,
             |ev| match ev {
-                Ev::Audio(pcm) => reply.extend_from_slice(pcm),
+                Ev::Audio { pcm, rate } => {
+                    reply_rate = *rate;
+                    reply.extend_from_slice(pcm);
+                }
                 Ev::Transcript(t) => transcript = t.clone(),
                 _ => {}
             },
         );
+        // THE bug this harness caught in production shape: the reply arrives at
+        // the OUTPUT DEVICE rate (the event carries it) — feeding it back at an
+        // assumed 24 kHz played it half-speed and the model heard rumble
+        // ("I'm sorry, I didn't catch your words", forever). Resample by the
+        // carried rate before it becomes the next utterance.
+        if reply_rate != FEED_RATE {
+            reply = liquid_audio::resample::resample_slice(&reply, reply_rate, FEED_RATE);
+        }
         let rms = if reply.is_empty() {
             0.0
         } else {
@@ -249,6 +263,21 @@ fn e2e_self_talk_reaches_32k_context() {
             !reply.is_empty() && rms > 1e-4,
             "turn {turn}: silent/empty reply (rms {rms:.2e}) — the conversation died"
         );
+        // Degeneracy tripwire: a self-conversation stuck on one sentence
+        // (e.g. the "didn't catch your words" apology loop) fails FAST with a
+        // diagnosis instead of burning an hour reaching MAX_TURNS.
+        if transcript == last_transcript {
+            repeats += 1;
+            assert!(
+                repeats < 3,
+                "turn {turn}: transcript identical 3 turns running — the \
+                 conversation degenerated (audio unintelligible to the model, \
+                 or template/turn-structure bug): {transcript:?}"
+            );
+        } else {
+            repeats = 0;
+            last_transcript = transcript.clone();
+        }
         let pos = ctx.load(Ordering::Relaxed);
         println!(
             "[soak] turn {turn}: reply {:.1}s (rms {rms:.3}), ctx {pos}/32768, {:.1} min elapsed — {:?}",

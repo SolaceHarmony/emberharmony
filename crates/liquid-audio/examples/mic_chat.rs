@@ -281,7 +281,7 @@ fn main() -> Res<()> {
                 print!("{t}");
                 std::io::stdout().flush().ok();
             }
-            VoiceEvent::Audio(pcm) => {
+            VoiceEvent::Audio { pcm: pcm, .. } => {
                 ring.lock().unwrap().extend(pcm);
             }
             // `respond`'s callback only emits Text/Audio; these terminal variants come from the

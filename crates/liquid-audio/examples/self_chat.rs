@@ -287,7 +287,7 @@ fn main() -> Res<()> {
                 std::io::stdout().flush().ok();
                 transcript.push_str(&t);
             }
-            VoiceEvent::Audio(chunk) => {
+            VoiceEvent::Audio { pcm: chunk, .. } => {
                 first_audio_ms.get_or_insert_with(|| tg.elapsed().as_millis() as u64);
                 ring.lock().unwrap().extend(chunk.iter().copied());
                 pcm.extend(chunk);

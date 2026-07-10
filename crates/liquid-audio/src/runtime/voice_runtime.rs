@@ -1151,7 +1151,20 @@ fn spawn_consumer<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
                             break;
                         }
                     }
-                    VoiceEvent::Audio(pcm) => {
+                    VoiceEvent::Audio { pcm, rate } => {
+                        // Rate-honest hand-off: the engine was constructed with
+                        // THIS runtime's out_rate — a mismatch is a wiring bug,
+                        // surfaced loudly, never resampled over (no-fallbacks).
+                        if rate != out_rate {
+                            let msg = format!(
+                                "engine emitted audio at {rate} Hz but the output \
+                                 path runs at {out_rate} Hz — rate wiring bug"
+                            );
+                            if !emit_or_stop(&sink, &consumer_stop, RuntimeEvent::Error(msg)) {
+                                break;
+                            }
+                            continue;
+                        }
                         assistant.store(true, Ordering::SeqCst);
                         if !speaking {
                             speaking = true;
@@ -2021,6 +2034,8 @@ pub fn play_output_probe(
 
 #[cfg(test)]
 mod tests {
+    /// The out_rate every test consumer is spawned with (see spawn_consumer calls).
+    const TEST_OUT_RATE: u32 = 48_000;
     use super::*;
 
     #[test]
@@ -2274,7 +2289,7 @@ mod tests {
             None,
         )
         .expect("spawn consumer");
-        tx.send(VoiceEvent::Audio(vec![0.25, -0.25])).unwrap();
+        tx.send(VoiceEvent::Audio { pcm: vec![0.25, -0.25], rate: TEST_OUT_RATE }).unwrap();
         drop(tx);
         consumer.join().unwrap();
 
@@ -2344,7 +2359,7 @@ mod tests {
             Some(output),
         )
         .expect("spawn consumer");
-        tx.send(VoiceEvent::Audio(vec![0.25, -0.25])).unwrap();
+        tx.send(VoiceEvent::Audio { pcm: vec![0.25, -0.25], rate: TEST_OUT_RATE }).unwrap();
         drop(tx);
         consumer.join().unwrap();
 
@@ -2416,7 +2431,7 @@ mod tests {
             Some(output),
         )
         .expect("spawn consumer");
-        tx.send(VoiceEvent::Audio(vec![0.25, -0.25])).unwrap();
+        tx.send(VoiceEvent::Audio { pcm: vec![0.25, -0.25], rate: TEST_OUT_RATE }).unwrap();
         drop(tx);
         consumer.join().unwrap();
 
@@ -2539,13 +2554,13 @@ mod tests {
             Some(output),
         )
         .expect("spawn consumer");
-        tx.send(VoiceEvent::Audio(vec![0.25, -0.25])).unwrap();
+        tx.send(VoiceEvent::Audio { pcm: vec![0.25, -0.25], rate: TEST_OUT_RATE }).unwrap();
         entered_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("first write started");
 
         flush.store(true, Ordering::SeqCst);
-        tx.send(VoiceEvent::Audio(vec![0.5, -0.5])).unwrap();
+        tx.send(VoiceEvent::Audio { pcm: vec![0.5, -0.5], rate: TEST_OUT_RATE }).unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
         while audio.snapshot().queued_samples < 4 {
             if Instant::now() >= deadline {
@@ -2636,13 +2651,13 @@ mod tests {
         .expect("spawn consumer");
 
         // Chunk 1 → worker grabs it and blocks in the first write.
-        tx.send(VoiceEvent::Audio(vec![0.1, 0.1])).unwrap();
+        tx.send(VoiceEvent::Audio { pcm: vec![0.1, 0.1], rate: TEST_OUT_RATE }).unwrap();
         entered_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("first write started");
         // Chunks 2 & 3 → pile up in the output ring as the residual tail.
-        tx.send(VoiceEvent::Audio(vec![0.2, 0.2])).unwrap();
-        tx.send(VoiceEvent::Audio(vec![0.3, 0.3])).unwrap();
+        tx.send(VoiceEvent::Audio { pcm: vec![0.2, 0.2], rate: TEST_OUT_RATE }).unwrap();
+        tx.send(VoiceEvent::Audio { pcm: vec![0.3, 0.3], rate: TEST_OUT_RATE }).unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
         while audio.snapshot().queued_samples < 6 {
             if Instant::now() >= deadline {
