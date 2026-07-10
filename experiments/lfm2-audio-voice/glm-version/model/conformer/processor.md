@@ -108,8 +108,8 @@ math and [`glm-version/model/conformer/encoder.md`](encoder.md).
 | `FilterbankFeatures.forward` | `FilterbankFeatures::forward` (`:278`) | identical (1:1) | — |
 | `normalize_batch` with `normalize_type` string | `normalize_batch` with `NormalizeType` enum (`:393`) — `PerFeature`/`AllFeatures`/`Fixed`/`None` | **deliberate: string → enum** | Rust's enum is the idiomatic analog of Python's string dispatch. |
 | `log_zero_guard_value_fn(self, x)` (string `"tiny"`/`"eps"` resolved via `torch.finfo`) | `log_zero_guard_value_fn(&self, _x)` returns the pre-resolved `f64` (`:265`) | **deliberate: pre-resolved** | the checkpoint configs use the numeric default `2**-24`; the string branches are pre-resolved at config load into `MelConfig.log_zero_guard_value`. The `_x` arg is kept for 1:1 signature parity but unused. |
-| `save_to`/`restore_from` (NeMo pickle) | no-op stubs (`:564-575`) | **deliberate: no-op** | persistence is safetensors + `from_pretrained`; NeMo pickle has no candle analog. Kept for 1:1 inventory. |
-| `input_example` | no-op stub | **deliberate: no-op** | ONNX export hook; no export path. |
+| `save_to`/`restore_from` (NeMo pickle) | omitted | **deliberate omission** | persistence is safetensors + `from_pretrained`; NeMo pickle has no candle analog. |
+| `input_example` | omitted | **deliberate omission** | ONNX export hook; no export path for this preprocessor. |
 | dither, narrowband augmentation, frame splicing | skipped (inference-only) | **deliberate: skipped** | training-only; `self.training` guards in Python, simply not ported. |
 | device/dtype hardcoded `cuda`/`bf16` | device/dtype-agnostic; f32 on device | **deliberate** | §2.1. The chain runs on `Device::Cpu` or Metal; no host round-trip. |
 | `exact_pad=True` pre-pads the raw signal | `stft_pad_amount` from `MelConfig` (`:50-56`) | identical | the centered (`exact_pad=False`) path pads inside `stft`; the exact_pad path pre-pads the signal and uses `center_pad=0`. |

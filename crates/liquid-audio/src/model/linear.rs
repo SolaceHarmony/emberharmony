@@ -52,9 +52,7 @@ pub fn linear_forward(linear: &Linear, x: &Tensor) -> Result<Tensor> {
 pub fn linear_logits(weight: &Tensor, x: &Tensor) -> Result<Tensor> {
     let y = if weight.device().is_cpu() && x.device().is_cpu() && weight.dtype() == DType::BF16 {
         // Same small-M dispatch as matmul_flat: at decode the logits head is M==1 against
-        // the biggest weight in the model — the transpose copy hurts the most here. A `None`
-        // from the NT path (reference-kernel-only build) falls through to the transposed
-        // GEMM, which computes the same numbers.
+        // the biggest weight in the model — the transpose copy hurts the most here.
         let rows = if x.rank() == 2 { x.dim(0)? } else { usize::MAX };
         let nt = if rows <= NT_MAX_ROWS {
             bf16_matmul_nt(x, weight)?
@@ -139,10 +137,7 @@ fn needs_bf16_cpu_conv(weight: &Tensor, x: &Tensor) -> bool {
 
 fn matmul_flat(linear: &Linear, x: &Tensor) -> Result<Tensor> {
     if x.dim(0)? <= NT_MAX_ROWS {
-        // `None` here means the flashkern NT kernel specifically isn't built (the
-        // reference-kernel-only build): the transposed path below still computes the same
-        // bf16-exact-product / f32-accumulate numbers through the fallback GEMM — an
-        // availability gate between equal-numerics kernels, not a silent degradation.
+        // `None` means the runtime CPU feature gate rejected the native-layout kernel.
         if let Some(y) = bf16_matmul_nt(x, linear.weight())? {
             return Ok(y);
         }

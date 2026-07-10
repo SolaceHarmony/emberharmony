@@ -37,7 +37,7 @@ Internal promotions: the whole chain is f32 (NeMo precision pin); `fb`, `window`
 
 ## Python ↔ Rust
 Symbol map:
-- `AudioToMelSpectrogramPreprocessor` → `AudioToMelSpectrogramPreprocessor` (wraps a `FilterbankFeatures`; `save_to`/`restore_from`/`input_example` are no-op stubs kept for 1:1 inventory, `processor.rs:564-575`).
+- `AudioToMelSpectrogramPreprocessor` → `AudioToMelSpectrogramPreprocessor` (wraps a `FilterbankFeatures`; NeMo pickle and ONNX dummy-input hooks are omitted because this runtime has no corresponding subsystem).
 - `AudioPreprocessor` (abstract base) → `AudioPreprocessor` struct (Rust composition for Python's `super().__init__`; the f32 input-guard `forward` is preserved, `processor.rs:511-520`).
 - `FilterbankFeatures.forward` → `FilterbankFeatures::forward` (`processor.rs:278`).
 - `FilterbankFeatures.stft` → `FilterbankFeatures::stft` (`processor.rs:240`).

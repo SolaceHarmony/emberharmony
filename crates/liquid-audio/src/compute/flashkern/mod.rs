@@ -23,6 +23,7 @@ pub mod neon; // aarch64 bridge to native/kernels/aarch64/flashkern_neon.cpp (BF
 pub mod x86; // x86-64 bridge to native/kernels/x86_64/flashkern_x86.cpp (VDPBF16PS / AVX2 sibling)
 
 /// Arch-dispatched nt GEMV over full rows (test/support helper for the engine smoke).
+#[cfg(test)]
 pub(crate) fn neon_or_x86_gemv(x: &[u16], w: &[u16], out: &mut [f32], n: usize, k: usize) {
     #[cfg(target_arch = "aarch64")]
     neon::bf16_gemm_nt_into(x, w, out, 1, n, k);

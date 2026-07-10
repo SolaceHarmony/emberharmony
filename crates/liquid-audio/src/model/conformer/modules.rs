@@ -35,11 +35,6 @@ impl ConformerFeedForward {
         let x = silu(&x)?;
         linear_forward(&self.linear2, &x)
     }
-
-    /// PORT: `reset_parameters_ff` — Xavier/uniform weight re-initialization at
-    /// construction (training). The port loads pretrained weights via VarBuilder,
-    /// so there is nothing to re-initialize; no-op, preserved for 1:1 inventory.
-    pub fn reset_parameters_ff(&self) {}
 }
 
 /// `ConformerConvolution`: pointwise→GLU→(pad mask)→depthwise→BatchNorm→SiLU→pointwise.
@@ -123,11 +118,6 @@ impl ConformerConvolution {
     pub fn set_cache_drop_size(&mut self, n: usize) {
         self.depthwise_conv.set_cache_drop_size(n);
     }
-
-    /// PORT: `reset_parameters_conv` — conv weight re-initialization at
-    /// construction (training). The port loads pretrained weights, so this is a
-    /// no-op, preserved for 1:1 inventory.
-    pub fn reset_parameters_conv(&self) {}
 }
 
 /// Padding modes for [`CausalConv1D`], mirroring the Python `padding` arg:

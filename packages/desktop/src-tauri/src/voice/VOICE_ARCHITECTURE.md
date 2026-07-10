@@ -430,9 +430,9 @@ The BF16 GEMM entry is `src/compute/bf16_gemm.rs` (candle `CustomOp`s `Bf16Gemm`
 live kernel is the **tightened flashkern GEMM** (`native/kernels/aarch64/flashkern_neon.cpp` on aarch64,
 `native/kernels/x86_64/flashkern_x86.cpp` on x86‑64) — an 8×8 BFMMLA / VDPBF16PS multi‑accumulator fanned over
 M‑row blocks with rayon, plus a native‑layout `[N,K]` decode form (`Bf16GemmNt`) that dots
-contiguous weight rows with **no transpose copy** at `M ≤ 4`. The original single‑file
-`native/reference/bf16_gemm.c` remains only as the reference fallback (used when the flashkern TU failed to
-build). `model::linear` routes BF16 CPU linears/logits through this bridge and keeps the 4‑D
+contiguous weight rows with **no transpose copy** at `M ≤ 4`. There is no separately
+compiled reference fallback: failure to build the architecture kernel fails the build.
+`model::linear` routes BF16 CPU linears/logits through this bridge and keeps the 4‑D
 attention matmuls on the explicit F32 accumulation path. See
 [`crates/liquid-audio/docs/FLASHKERN.md`](../../../../../crates/liquid-audio/docs/FLASHKERN.md) and
 [`crates/liquid-audio/docs/DECODE_ENGINE.md`](../../../../../crates/liquid-audio/docs/DECODE_ENGINE.md).

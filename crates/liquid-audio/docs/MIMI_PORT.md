@@ -154,8 +154,28 @@ streaming.rs (`StreamTensor` = Option<Tensor>) becomes explicit
       Still open from the verdict: AMX dispatch is inferred from the 5.6x on
       GEMM-bound shapes, not proven by counters; cold init ~665 ms (page
       faults + re-arm) needs one measurement pass at integration.
-- [ ] build wiring (build.rs, with -ffp-contract=off) + parity harness
-- [ ] chain parity + thresholds recorded here
-- [ ] her wav-hash re-arm decision
-- [ ] engine integration (lane program; REQ kind at F4, fence map in
-      mimi_decode.cpp NOTES (f))
+- [x] build wiring: build.rs compiles the five active units (c++23,
+      -ffp-contract=off — load-bearing); Rust rim = src/mimi_native.rs
+      (zero-copy weight table over the mmap'd checkpoint, infallible-or-Err
+      init, Mutex'd single-slot decoder).
+- [x] PRODUCTION SWAP: MimiDetokenizer::decode_step runs the NATIVE kernel —
+      the moshi decode_step call is out of the streaming pipeline. moshi
+      remains ONLY turn-level tooling (encode for the trainer; one-shot
+      whole-clip decode, which the byte-oracle example pins — so REF/PERF
+      hashes did NOT move this rung; they re-arm if/when one-shot decode
+      goes native).
+- [x] chain parity, in-repo (tests/mimi_native_parity.rs, gate rung 2/6):
+      130 frames across the 250-slot KV wrap through the production FFI —
+      worst |Δ| = 3.085e-6 (assert 5e-5), post-reset 2.9e-7. Tighter than
+      the shadow review's 4.11e-6: the sequential-layernorm fix landed in
+      between (lane-blocked reduction NaN'd on near-constant rows — probe-
+      proven; accumulation now bit-matches candle's sequential order, apply
+      stays NEON). Final verdict's P2s also closed: stage errors propagate
+      through mimi_decoder_step (negative rc never reads as priming);
+      upsample weight validated exact-shape + non-null.
+- [ ] engine integration (the remaining rung): mimi as a native C++ lane
+      program on the SAME kcoro engine team — REQ_MIMI at the F4 doorbell,
+      units band-split per the NOTES maps (conv: out-channel; attention:
+      head; sweeps: sub-range), parked fences (native program, two-barrier
+      doctrine). Today the kernel is serial-with-AMX inside one rim call —
+      correct and fast (13.8 ms/frame), but not yet ON the lane team.

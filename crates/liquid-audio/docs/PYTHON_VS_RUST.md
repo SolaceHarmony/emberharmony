@@ -2,11 +2,10 @@
 
 Scope: the pure-Rust **candle** port of Liquid AI's `liquid_audio` (LFM2.5-Audio-1.5B)
 against the upstream Python. "Same" = verified numerically/structurally identical;
-"Differ" = a deliberate substitution, with the reason. No torch, no folding, no
-silent omissions.
+"Differ" = a deliberate substitution, with the reason. No torch and no callable
+no-op shims for Python-only framework bookkeeping.
 
 All figures below were regenerated, not recalled:
-- `python parity/compare_symbols.py --scope core` → **170/170 covered, 0 missing**
 - `cargo test --lib` → **31 passed**
 - `cargo test --test parity --release -- --ignored` (vs Python-dumped golden tensors,
   on `Device::Cpu`, f32) → **8/8 passed**
@@ -15,12 +14,11 @@ All figures below were regenerated, not recalled:
 
 ## 1. Where we are the SAME
 
-### 1.1 Symbol coverage (function-for-function)
-`compare_symbols.py` maps every top-level Python function and class method to a Rust
-counterpart (by normalized name, with `__init__→new`, `__call__→call`, etc.). Core
-scope (everything except the vendored `moshi/` and the `demo/`):
+### 1.1 Runtime coverage
 
-> **170 / 170 covered, 0 missing.**
+Runtime model/data operations have Rust counterparts. Python-only `nn.Module`, NeMo
+pickle, ONNX dummy-input, activation-checkpoint, and training-initializer methods are
+intentional omissions rather than empty Rust methods.
 
 ### 1.2 Numerical parity (byte-for-byte vs Python reference tensors)
 
@@ -165,14 +163,15 @@ then** cast. At bf16 those differ, so the port composes the RMSNorm from candle 
 ops in liquid_audio's order. f32 parity is unaffected; bf16 runtime is *more* faithful
 than a candle/moshi wrap would be.
 
-### 2.5 Off-path NeMo machinery → inventory stubs
+### 2.5 Off-path NeMo machinery
 `conformer/encoder.py` is ~4160 words of which most is cache-aware streaming + ONNX
 export + dynamic attention reconfiguration (`setup_streaming_params`,
 `change_attention_model`, `get_initial_cache_state`, `forward_for_export`,
 `input_example`, `disabled_deployment_*`). LFM2-Audio's **offline** forward never calls
-these, so the Rust ports them as documented inventory stubs (symbols present → 170/170)
-while the on-path `forward`/`forward_internal`/`_create_masks` are fully implemented and
-parity-verified (8.25e-7). This is the source of the only "thin" word-count file (see §3).
+these. Helpers that perform real cache/mask/export-shape work remain implemented;
+framework-only no-ops such as pickle persistence and dummy preprocessor export inputs
+are omitted. The on-path `forward`/`forward_internal`/`_create_masks` are fully
+implemented and parity-verified (8.25e-7).
 
 ### 2.6 Trainer — `accelerate`/torch → candle, loss on the model
 - `torch.optim.AdamW(fused=True)` → `candle_nn::AdamW` (same math, no fused kernel).
@@ -314,7 +313,6 @@ code path runs the faithful regime on CPU and Metal.
 ```sh
 cd liquid-audio-rs
 export LFM_MODEL_DIR=../model
-python parity/compare_symbols.py --scope core          # 170/170
 cargo test --lib                                       # 31 passed
 cargo test --test parity --release -- --ignored --nocapture   # 8/8 byte-exact
 LFM_MODEL_DIR=../model cargo run --release --example generate # end-to-end, CPU BF16 via NEON

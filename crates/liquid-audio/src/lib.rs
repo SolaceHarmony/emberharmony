@@ -23,6 +23,7 @@ pub mod detokenizer; // detokenizer.py
 pub mod flashkern; // CPU replicas of the Metal JIT kernels (NEON / AVX SIMD + the GPU dispatch model)
 pub mod loader; // config.json + safetensors → model + processor
 pub mod model;
+pub mod mimi_native; // native C++/NEON/AMX Mimi decode kernel rim (native/src/mimi)
 pub mod moshi; // Liquid-Audio-facing facade over Kyutai's Rust moshi crate
 pub mod processor; // processor.py
 #[path = "runtime/realtime.rs"]

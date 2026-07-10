@@ -280,14 +280,6 @@ pub fn reshape_for_broadcast(freqs_cis: &Tensor, x: &Tensor) -> Result<Tensor> {
     freqs_cis.reshape(shape)
 }
 
-/// PORT: `wrap_activation_checkpoint` — training-only gradient (activation)
-/// checkpointing (`torch.utils.checkpoint`). There is no autograd/backward pass
-/// on the candle inference path, so there is nothing to checkpoint; this is an
-/// identity wrapper, preserved for 1:1 inventory.
-pub fn wrap_activation_checkpoint<T>(module: T) -> T {
-    module
-}
-
 fn repeat_kv(x: &Tensor, n_rep: usize) -> Result<Tensor> {
     if n_rep == 1 {
         return Ok(x.clone());
@@ -808,17 +800,6 @@ impl RawLmBackbone {
 /// per-layer cache vector — a faithful port of the functional cache contract that
 /// `RawLMBackbone.forward_cached` (py 554) builds on.
 pub trait SequenceModel {
-    /// `SequenceModel.__init__(*args, **kwargs)` (py 28-29) — the abstract base's
-    /// constructor is just `super().__init__()` (nn.Module bookkeeping), which has
-    /// no candle referent in an inference port. Faithfully a no-op; concrete models
-    /// construct via their own `new`. (`where Self: Sized` keeps the trait
-    /// object-safe.)
-    fn new()
-    where
-        Self: Sized,
-    {
-    }
-
     fn dim(&self) -> usize;
     fn dim_out(&self) -> usize;
     fn forward(&self, x: &Tensor, cache: Option<&mut [LayerKvCache]>) -> Result<Tensor>;

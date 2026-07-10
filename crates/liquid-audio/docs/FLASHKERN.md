@@ -11,7 +11,7 @@ thread team, `threadgroup_barrier` → `std::sync::Barrier`). The double-double 
 
 Four flashkern kernels sit on the LIVE model path today:
 
-* the **tightened bf16 GEMM**, replacing the reference kernel (`bf16_gemm.c`) on the CPU
+* the **bf16 GEMM** on the CPU
   bf16-matmul path (`Bf16Gemm::cpu_fwd`, reached from `model/linear.rs` `bf16_matmul` /
   `linear_logits`); its native-layout twin `Bf16GemmNt` (`A[M,K] · W[N,K]ᵀ`, no weight
   transpose) is the decode-step form — `matmul_flat` / `linear_logits` route `M ≤ 4`
@@ -108,7 +108,7 @@ regime is contracted (`conv1d_update`, GEMM) or that need exact FMA residuals (d
 8×8 output tile is a 4×4 grid of BFMMLA 2×2 sub-tiles → **16 independent `float32x4_t`
 accumulators**, mirroring `simdgroup_float8x8`. Per 4-deep K-block: 8 bf16 loads (4 A
 row-pairs + 4 B col-pairs) feed 16 `vbfmmlaq_f32` with independent accumulator chains — the
-instruction-level parallelism the 2×2 reference kernel lacks. A/B are packed **once** into
+instruction-level parallelism a single 2×2 accumulator lacks. A/B are packed **once** into
 thread-local scratch (reused across same-shape calls, no per-call `calloc`), zero-padded to
 8×8×(K→4) so full tiles are always in-bounds; the ragged edge is masked on store. Rust
 parallelizes over M-row blocks with rayon (`bf16_gemm_into`), one block per task == one Metal
@@ -153,7 +153,8 @@ under identical `extern "C"` names, so `DepthDecode` is arch-agnostic exactly as
 
 ## Build & feature gating
 
-`build.rs` compiles `flashkern_neon.cpp` only on aarch64 (`cfg(has_flashkern_neon)`). Feature-specific
+`build.rs` compiles `flashkern_neon.cpp` on aarch64 and `flashkern_x86.cpp` on x86-64.
+Unsupported architectures fail the build. Feature-specific
 opcodes are confined to functions carrying a per-compiler target attribute:
 
 * **clang** (macOS, the shipped build) exposes ACLE intrinsics only when the base `-march`
@@ -165,13 +166,11 @@ opcodes are confined to functions carrying a per-compiler target attribute:
 
 ## No fallbacks
 
-flashkern is an aarch64 kernel library, not a portable one. Every procedure is
-`#[cfg(all(target_arch = "aarch64", has_flashkern_neon))]` and calls straight into its NEON kernel —
-there is deliberately **no scalar fallback**. A silent scalar path would let a caller believe it
-is on the NEON happy path when it isn't, and would mask a missing feature instead of surfacing
-it. Off the hardware path the procedures simply do not exist; the caller uses a different code
-path (the live bf16 matmul does exactly this — `Bf16Gemm::cpu_fwd` checks availability and, when
-absent, returns `Ok(None)` so candle takes its own f32 path). Feature-gated procedures
+flashkern is an architecture-kernel library, not a scalar portability layer. Procedures
+compile under plain `#[cfg(target_arch)]` and call the matching NEON or x86 kernel; there
+is deliberately **no scalar implementation masquerading as flashkern**. Runtime feature
+checks prevent feature-specific procedures from executing on unsupported cores.
+Feature-gated procedures
 (FFT→FCMA, `s8_gemm`→I8MM, `conv1d`→BF16) document their precondition; verify
 `flashkern::neon::NeonFeatures` (macOS `sysctl hw.optional.arm.FEAT_*` + Linux `getauxval` HWCAP/HWCAP2
 — the latter also fixes the old bf16 probe's Linux `false`) before calling.

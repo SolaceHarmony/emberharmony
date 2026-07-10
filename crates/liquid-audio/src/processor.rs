@@ -421,7 +421,7 @@ impl<'a> ChatState<'a> {
         let mut audio_run: Option<(i64, usize)> = None; // (modality, len)
         let mut ti = 0usize;
 
-        let mut flush_text = |out: &mut String, run: &mut Vec<u32>| -> Result<()> {
+        let flush_text = |out: &mut String, run: &mut Vec<u32>| -> Result<()> {
             if run.is_empty() {
                 return Ok(());
             }
@@ -584,19 +584,6 @@ impl LFM2AudioProcessor {
             })?
             .encode(wav)
     }
-
-    /// PORT: `to(device, dtype)` — the Python in-place device/dtype move. Candle
-    /// places tensors on the selected device at load, while persistent weight dtype
-    /// comes from safetensors; there is no in-place move. No-op, preserved for 1:1
-    /// inventory.
-    pub fn to(&self) {}
-
-    /// PORT: `eval` / `train` — torch training-mode toggle. Inference is always
-    /// eval (dropout/BatchNorm are eval here); no-op, preserved for 1:1 inventory.
-    pub fn eval(&self) {}
-
-    /// See [`Self::eval`].
-    pub fn train(&self) {}
 }
 
 impl ChatState<'_> {

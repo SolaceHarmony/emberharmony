@@ -1,14 +1,15 @@
 # liquid_audio → Rust port status
 
-Faithful, **class-for-class and function-for-function** on candle (no folding of
-bases into subclasses, no silent omissions). Same IO model (the model is a
+Faithful on the executable inference/training surface, without compatibility
+methods that only returned their inputs or did nothing. Same IO model (the model is a
 **synchronous streaming generator** — async only at the websocket transport, per
-upstream). All modules compile (0 warnings).
+upstream). Python-only framework hooks are documented omissions rather than callable
+Rust no-ops. All modules compile without warnings.
 **Faithful = numerically verified** against Python — see PARITY.md.
 
 ## 1:1 inventory (38/38 in-scope classes mapped)
 
-Every class and function in the in-scope Python modules (`utils`, `detokenizer`,
+Every runtime class and operation in the in-scope Python modules (`utils`, `detokenizer`,
 `processor`, `model/mlp`, `model/transformer`, `model/lfm2_audio`, and all of
 `model/conformer/`) has a Rust counterpart. Python **inheritance** is modelled by
 **composition** (the subclass holds its base and calls its methods, where Python
@@ -27,23 +28,16 @@ uses `super()`); Python **ABCs** become Rust **traits**:
 The un-fold **changed structure only**: the full parity suite re-ran byte-identical
 afterward (conformer 8.25e-7, backbone 6.6e-6, depthformer token-exact, prefill 1.1e-6).
 
-### `// PORT:` markers — members with no candle/Rust referent
+### Python-only framework hooks
 
-A handful of Python members are genuinely untranslatable and are present as
-documented `// PORT:` stubs so the inventory is complete, not silently dropped:
-- **torch autocast** (`avoid_float16_autocast_context`) — candle has no autocast;
-  compute dtype is explicit.
-- **autograd checkpointing** (`wrap_activation_checkpoint`) — no backward pass.
-- **NeMo pickle serialization** (`save_to`/`restore_from`) — persistence is
-  safetensors + `from_pretrained`.
-- **ONNX export / deployment hooks** (`input_example`, `forward_for_export`,
-  `disabled_deployment_*`) — no export path.
-- **cache-aware streaming** (`setup_streaming_params`, `get_initial_cache_state`,
-  `update_cache` on the offline path, …) — offline encode is single-shot.
-- **weight re-init** (`reset_parameters*`) — weights are loaded, not initialized.
-- **training loss** (`LFM2AudioModel.forward` / `logits(batch)`) — consumes a
-  `data/`-pipeline training batch (`LFM2AudioModelInput`), the training subsystem
-  outside this inference port; the output type is provided for the inventory.
+Members with no candle behavior are omitted instead of exposed as callable no-ops:
+
+- torch activation-checkpoint wrappers and `nn.Module` mode/device bookkeeping;
+- NeMo pickle persistence and the preprocessor's ONNX dummy-input hook;
+- training-time weight re-initializers (weights are loaded from safetensors).
+
+The concrete Conformer streaming/export helpers remain because they construct real
+masks, cache tensors, and outputs; they are not inventory placeholders.
 
 The IO model (sync streaming generator) is the only deliberate semantic mapping:
 Python's `forward_cached(x, cache) -> (out, cache)` is Rust's in-place

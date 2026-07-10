@@ -78,7 +78,7 @@ So the depthformer runs **8 sequential single-token steps per audio frame**, the
 | `apply_rotary_emb` (`view_as_complex`) | `rope_i_slow(q,cos,sin)` | candle has no complex dtype → interleaved real rotary; **`rope_i_slow` not fused `rope_i`** because the depthformer runs inside the trainable graph and the fused op severs autograd (test `rotary_is_differentiable`) |
 | `precompute_freqs_cis` → complex64 | returns `(cos,sin)` f32 | same `polar(1,outer(t,inv_freq))` math |
 | `scaled_dot_product_attention(enable_gqa)` | manual matmul SDPA + `repeat_kv` | eager **sdpa/no-flash** math, the path the f32 goldens were dumped from (§2.2) |
-| `wrap_activation_checkpoint` | identity passthrough | train-only, no autograd on inference path (§2.5) |
+| `wrap_activation_checkpoint` | omitted | train-only, no autograd on inference path (§2.5) |
 
 **Deliberate divergences** (all from PYTHON_VS_RUST.md): device-agnostic (no hard-coded `.cuda()`), CUDA kernels → portable candle ops (§2.2), KV-cache reuse via `ConcatKvCache` (§2.3), the RMSNorm bf16 weight-multiply order (§2.4). Rust also hardens `RawLMBackbone.forward` to **error on cache-length mismatch** rather than silently running a prefix (Python's `zip(strict=True)` would raise; candle's `zip` would not). Parity: backbone hidden 6.558e-6, text logits 5.505e-6, **depthformer audio frame token-EXACT** `[213,836,182,416,782,1796,202,578]`.
 

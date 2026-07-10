@@ -975,7 +975,6 @@ impl DecoderLayer {
             eps: self.ffn_norm.eps() as f32,
         };
         let mut out = vec![0u16; hdim];
-        let lanes = rayon::current_num_threads().max(1);
         // The resident native stage machine when it is up — bit-identical to the
         // threadgroup port by parity test, so the fallback changes scheduling only,
         // never numerics.

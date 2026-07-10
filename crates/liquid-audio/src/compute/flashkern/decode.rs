@@ -78,11 +78,7 @@ impl LaneFence for SpinBarrier {
     }
 }
 
-
-/// `true` when the fused decode blocks can run: the STRICT nt-kernel gate — the looser
-/// [`bf16_gemm_available`](crate::bf16_gemm::bf16_gemm_available) is also satisfied by the
-/// reference-kernel-only aarch64 build, which has no nt kernel and would panic in
-/// [`fused_mlp_decode`]'s lane bodies.
+/// `true` when the fused decode blocks can run through the native-layout kernel.
 pub fn fused_mlp_available() -> bool {
     crate::bf16_gemm::bf16_gemm_nt_available()
 }
@@ -393,14 +389,11 @@ mod tests {
 
 extern "C" {
     fn lfm_bf16_sumsq_f32(x: *const u16, n: i32) -> f32;
-    fn lfm_bf16_sumsq_seq_f32(x: *const u16, n: i32) -> f32;
     fn lfm_bf16_sumsq_candle_f32(x: *const u16, n: i32) -> f32;
     fn lfm_bf16_rmsnorm(x: *const u16, w: *const u16, out: *mut u16, n: i32, inv_rms: f32);
     fn lfm_bf16_add(a: *const u16, b: *const u16, out: *mut u16, n: i32);
     fn lfm_swiglu_bf16(g: *const f32, u: *const f32, out: *mut u16, n: i32);
     fn lfm_softmax_scaled_f32(x: *mut f32, n: i32, scale: f32);
-    fn lfm_attn_av_f32(att: *const f32, v: *const f32, out: *mut f32, len: i32, hd: i32);
-    fn lfm_attn_qk_f32(q: *const f32, k: *const f32, att: *mut f32, len: i32, hd: i32);
     fn lfm_attn_qk_bf16(q: *const f32, k: *const u16, att: *mut f32, len: i32, hd: i32);
     fn lfm_attn_av_bf16(att: *const f32, v: *const u16, out: *mut f32, len: i32, hd: i32);
     fn lfm_rope_i_f32(x: *mut f32, cos_p: *const f32, sin_p: *const f32, hd: i32);

@@ -12,7 +12,19 @@
 //! transcript.json land in `self_chat_out/`.
 //!
 //! The conversation is HARD-CAPPED: `LFM_SELF_TURNS` (default 6, clamped to
-//! 1..=20) total replies, so it can never run away.
+//! 1..=1000) total replies, so it can never run away.
+//!
+//! THE 32K SOAK rides this harness (her design: two instances, the output of
+//! one is the input of the other, audio only — a conversation, not a
+//! rehearsal): set `LFM_SELF_TARGET_CTX` (e.g. 30000) and a high turn cap,
+//! and the run stops as soon as EITHER side's conversation context reaches
+//! the target — proving the climb toward the model's 32,768 ceiling on the
+//! real two-party path. Per-turn budgets via `LFM_SELF_MAX_NEW` (default
+//! 160/112 assistant/human; the truncation warning is loud if it binds).
+//!
+//!   LFM_DEVICE=cpu LFM_MODEL_DIR=/path/to/model LFM_SELF_TURNS=400 \
+//!     LFM_SELF_TARGET_CTX=30000 \
+//!     cargo run --release --features accelerate --example self_chat
 //!
 //! Run (Apple GPU bf16 — audible):
 //!   LFM_DEVICE=metal LFM_MODEL_DIR=/path/to/model \
@@ -186,12 +198,23 @@ fn main() -> Res<()> {
     let model_ref = std::env::var("LFM_MODEL")
         .or_else(|_| std::env::var("LFM_MODEL_DIR"))
         .unwrap_or_else(|_| "LiquidAI/LFM2.5-Audio-1.5B".into());
-    // The hard cap Sydney asked for: the conversation can NEVER exceed 20 replies.
+    // The hard cap Sydney asked for: bounded ALWAYS (default stays 6); the
+    // 32k soak raises it explicitly — the ceiling exists so no invocation can
+    // run away.
     let max_turns: usize = std::env::var("LFM_SELF_TURNS")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(6)
-        .clamp(1, 20);
+        .clamp(1, 1000);
+    // 32k soak: stop as soon as EITHER side's context reaches this.
+    let target_ctx: u64 = std::env::var("LFM_SELF_TARGET_CTX")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let max_new: usize = std::env::var("LFM_SELF_MAX_NEW")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
     let device = select_device()?;
 
     eprintln!("[load] resolving model `{model_ref}`…");
@@ -216,8 +239,8 @@ fn main() -> Res<()> {
     // Production decoding regime (the app's settings defaults): sampled text at
     // 1.0 (vendor demo), sampled audio 1.0/top-k 4. Different seeds per engine so
     // the two voices don't mirror each other.
-    let gen = |max_new_tokens, seed| GenParams {
-        max_new_tokens,
+    let gen = |max_new_tokens: usize, seed| GenParams {
+        max_new_tokens: if max_new > 0 { max_new } else { max_new_tokens },
         text_temperature: Some(1.0),
         text_top_k: None,
         audio_temperature: Some(1.0),
@@ -235,12 +258,14 @@ fn main() -> Res<()> {
         out_rate,
     );
     // Engine B: the "human" — same model role-playing the user side of the call.
+    let ctx_a = assistant.context_positions();
     let mut human = Lfm2VoiceEngine::new(model, proc, gen(112, 1337), codebooks, device, out_rate)
         .with_system_prompt(
             "You are a curious person having a casual spoken conversation. React briefly \
              to what you just heard and ask one natural follow-up question. Respond with \
              interleaved text and audio.",
         );
+    let ctx_b = human.context_positions();
 
     let out_dir = Path::new("self_chat_out");
     std::fs::create_dir_all(out_dir)?;
@@ -331,6 +356,21 @@ fn main() -> Res<()> {
                 break;
             }
             std::thread::sleep(Duration::from_millis(50));
+        }
+
+        // Context climb (the 32k soak's whole point): report both sides,
+        // stop the moment either reaches the target.
+        let (pa, pb) = (
+            ctx_a.load(std::sync::atomic::Ordering::Relaxed),
+            ctx_b.load(std::sync::atomic::Ordering::Relaxed),
+        );
+        eprintln!("[turn {turn:02}] ctx assistant {pa} | human {pb} / 32768");
+        if target_ctx > 0 && (pa >= target_ctx || pb >= target_ctx) {
+            eprintln!(
+                "[soak] CTX TARGET REACHED: assistant {pa}, human {pb} \
+                 (target {target_ctx}) after {turn} turns"
+            );
+            break;
         }
 
         // The other side hears exactly what was played.

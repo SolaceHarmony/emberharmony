@@ -225,10 +225,9 @@ results cross back as candle `Tensor`s / `Vec`s at the region boundary.
 
 ### Thread model (AS-BUILT: mixed native stage machine + threadgroup regions)
 
-- **As-built.** The backbone FFN block uses the resident native stage machine when
-  `has_kcoro && has_native_engine && has_flashkern_*`: `process_engine()` writes one request,
-  unparks the coordinator, and waits for the pass boundary. If the native engine is unavailable
-  or reports failure, the same block takes the bit-identical threadgroup fallback.
+- **As-built.** On supported targets, the resident native stage machine is mandatory:
+  `process_engine()` writes one request, unparks the coordinator, and waits for the pass
+  boundary. Engine initialization failure is fatal rather than selecting a missing-engine branch.
 - **Still threadgroup regions.** ShortConv decode and `DepthDecode::frame` still use the
   `rayon::scope` / shared-scratch / barrier model. The backbone token is still a candle forward
   with fused sub-regions spliced in; attention is not yet inside the full native token pass.

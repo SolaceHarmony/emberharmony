@@ -612,28 +612,23 @@ extern "C" void mimi_layer_norm_f32(const float *x, const float *w,
     //   mean = sum/n ; var = sum2/n − mean² (naive variance, biased)
     //   inv_std = recip(sqrt(var + eps))
     //   y = (x−mean)·inv_std·w + b          (unfused: mul, mul, separate add)
-    // NEON lane-blocking of the two sums is the declared faithful-tier
-    // freedom; per-element operations stay unfused (rustc never contracts —
-    // build with -ffp-contract=off so scalar tails/_ref match too).
-    // w/b may be NULL -> treated as 1 / 0 (affine off).
+    // The two accumulations are STRICTLY SEQUENTIAL SCALAR — not a shortcut,
+    // a numerical requirement (review P1, probe-proven): var = sum2/n − mean²
+    // is cancellation-critical on near-constant rows; a 512-wide row of
+    // ~10 ± 1e-5 sat on the var ≈ −eps knife edge where candle's sequential
+    // rounding stayed finite and a NEON lane-blocked reduction produced NaN
+    // (another case diverged by 0.11 — unbounded, not ulp-band). Bit-matching
+    // candle's exact accumulation order inherits the reference's survival
+    // characteristics; the elementwise apply below stays NEON (order-exact).
+    // Per-element ops stay unfused (rustc never contracts — build with
+    // -ffp-contract=off). w/b may be NULL -> treated as 1 / 0 (affine off).
     if (n <= 0) {
         return;
     }
-#if defined(MIMI_HAVE_NEON) && !defined(MIMI_SCALAR_REF)
-    // ONE pass: sum and sum-of-squares (unfused: vmul then vadd, no vmla —
-    // candle's `sum2 += v*v` rounds the product before accumulating).
-    float32x4_t vs = vdupq_n_f32(0.0f);
-    float32x4_t vs2 = vdupq_n_f32(0.0f);
-    int i = 0;
-    for (; i + 4 <= n; i += 4) {
-        float32x4_t v = vld1q_f32(x + i);
-        vs = vaddq_f32(vs, v);
-        vs2 = vaddq_f32(vs2, vmulq_f32(v, v));
-    }
-    float sum = vaddvq_f32(vs);
-    float sum2 = vaddvq_f32(vs2);
-    for (; i < n; ++i) {
-        float v = x[i];
+    float sum = 0.0f;
+    float sum2 = 0.0f;
+    for (int j = 0; j < n; ++j) {
+        float v = x[j];
         sum += v;
         float vv = v * v;
         sum2 += vv;
@@ -641,10 +636,11 @@ extern "C" void mimi_layer_norm_f32(const float *x, const float *w,
     const float mean = sum / (float)n;
     const float var = sum2 / (float)n - mean * mean;
     const float inv_std = 1.0f / sqrtf(var + eps);
+#if defined(MIMI_HAVE_NEON) && !defined(MIMI_SCALAR_REF)
     const float32x4_t vmean = vdupq_n_f32(mean);
     const float32x4_t vinv = vdupq_n_f32(inv_std);
     // apply: y = ((x−mean)·inv_std)·w + b, unfused adds (vaddq, not vmlaq).
-    i = 0;
+    int i = 0;
     for (; i + 4 <= n; i += 4) {
         float32x4_t d = vsubq_f32(vld1q_f32(x + i), vmean);
         float32x4_t normed = vmulq_f32(d, vinv);
@@ -660,17 +656,6 @@ extern "C" void mimi_layer_norm_f32(const float *x, const float *w,
         y[i] = t + bi;
     }
 #else
-    float sum = 0.0f;
-    float sum2 = 0.0f;
-    for (int i = 0; i < n; ++i) {
-        float v = x[i];
-        sum += v;
-        float vv = v * v;
-        sum2 += vv;
-    }
-    float mean = sum / (float)n;
-    float var = sum2 / (float)n - mean * mean;
-    float inv_std = 1.0f / sqrtf(var + eps);
     for (int i = 0; i < n; ++i) {
         float normed = (x[i] - mean) * inv_std;
         float wi = w ? w[i] : 1.0f;
@@ -805,11 +790,15 @@ extern "C" int mimi_decoder_step(MimiDecoder *d, const uint32_t *codes,
     // upsample.step: [MIMI_DIM, n_emb] -> [MIMI_DIM, n_up]. Stride 2 => 2 frames
     // out per input frame in steady state (n_up == 2).
     int n_up = mimi_upsample_step(d->upsample, d->emb_buf, n_emb, d->up_buf);
+    if (n_up < 0) return n_up;  // stage misuse/bounds error — NEVER folded into
+                                // "0 = priming" (review P2: a failed decode must
+                                // not read as valid empty output)
     // --- fence F1 (post-upsample): up_buf[MIMI_DIM, n_up] ---
 
     // decoder_transformer.step: [MIMI_DIM, n_up] -> [MIMI_DIM, n_tr]. Causal KV
     // transformer preserves the frame count (n_tr == n_up). Intra: per-layer F2.
     int n_tr = mimi_transformer_step(d->transformer, d->up_buf, n_up, d->tr_buf);
+    if (n_tr < 0) return n_tr;  // propagate stage error (see above)
     // --- fence F2 (post-transformer): tr_buf[MIMI_DIM, n_tr] ---
 
     // decoder(seanet).step: [MIMI_DIM, n_tr] -> pcm[1, n_pcm]. x960 upsample =>

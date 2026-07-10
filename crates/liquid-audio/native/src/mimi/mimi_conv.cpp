@@ -614,8 +614,11 @@ int mimi_upsample_init(MimiUpsampleState **st, const MimiWeightTable *w,
     s->invalid = ksize - stride;
     const MimiWeight *ww = mimi_weight_find(w, "upsample.convtr.convtr.convtr.weight");
     if (!ww) return fail(err, errlen, "upsample weight not found");
-    if (ww->len != (uint64_t)dim * ksize)
-        return fail(err, errlen, "upsample weight shape mismatch (expect [dim,1,2*stride])");
+    // Exact-shape + data validation (review P2: element count alone let a
+    // null span reach the repack loop): [MIMI_DIM, 1, 2*stride], data non-null.
+    if (!wcheck3(ww, dim, 1, ksize))
+        return fail(err, errlen,
+                    "upsample weight shape mismatch (expect [dim,1,2*stride] with data)");
     s->w = ww->data;
     // repack [dim,k] -> [k,dim] once (init-time marshalling).
     s->wrep = (float *)mimi_arena_alloc(a, (size_t)ksize * dim * sizeof(float));

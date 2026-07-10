@@ -252,8 +252,7 @@ pub struct ConvSubsampling {
     /// `True` for vggnet/dw_striding/striding; `False` for the `*_conv1d` schemes.
     conv2d_subsampling: bool,
     subsampling_factor: usize,
-    /// mirrors Python `_sampling_num` (kept for 1:1 inventory; cold on the path).
-    #[allow(dead_code)]
+    /// Number of subsampling stages used by streaming length tracking.
     sampling_num: usize,
     kernel_size: usize,
     stride: usize,
@@ -261,9 +260,6 @@ pub struct ConvSubsampling {
     all_paddings: i64,
     /// `_ceil_mode` — vggnet (MaxPool) is ceil; the strided-conv schemes are floor.
     ceil_mode: bool,
-    /// mirrors Python `_conv_channels` (kept for 1:1 inventory; cold on the path).
-    #[allow(dead_code)]
-    conv_channels: usize,
     subsampling_conv_chunking_factor: i64,
     is_causal: bool,
 }
@@ -588,7 +584,6 @@ impl ConvSubsampling {
             stride,
             all_paddings: (left_padding + right_padding) as i64,
             ceil_mode,
-            conv_channels,
             subsampling_conv_chunking_factor: 1,
             is_causal,
         })
@@ -649,11 +644,6 @@ impl ConvSubsampling {
     pub fn get_streaming_cache_size(&self) -> [usize; 2] {
         [0, self.subsampling_factor + 1]
     }
-
-    /// PORT: `reset_parameters` — uniform weight init for `dw_striding`
-    /// (training). The port loads pretrained weights via VarBuilder, so there is
-    /// nothing to re-initialize; no-op, preserved for 1:1 inventory.
-    pub fn reset_parameters(&self) {}
 
     /// `change_subsampling_conv_chunking_factor`: must be `-1`, `1`, or a power of 2.
     pub fn change_subsampling_conv_chunking_factor(&mut self, factor: i64) -> Result<()> {

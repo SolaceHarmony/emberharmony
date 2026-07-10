@@ -591,19 +591,6 @@ impl AudioToMelSpectrogramPreprocessor {
     pub fn filter_banks(&self) -> &Tensor {
         self.featurizer.filter_banks()
     }
-
-    /// PORT: `save_to` — NeMo `.nemo` archive (tar + yaml config + pickled
-    /// weights). No candle/Rust analog; persistence is via safetensors +
-    /// `from_pretrained`. No-op, preserved for 1:1 inventory.
-    pub fn save_to(&self, _save_path: &str) {}
-
-    /// PORT: `restore_from` — load from a NeMo `.nemo` archive (classmethod).
-    /// No candle analog (see `save_to`); use `from_pretrained`. Preserved for 1:1.
-    pub fn restore_from(_restore_path: &str) {}
-
-    /// PORT: `input_example` — ONNX-export dummy input (random tensor for tracing).
-    /// No export path here; preserved for 1:1 inventory.
-    pub fn input_example(&self, _max_batch: usize, _max_dim: usize, _min_length: usize) {}
 }
 
 impl AudioToMelSpectrogramPreprocessor {

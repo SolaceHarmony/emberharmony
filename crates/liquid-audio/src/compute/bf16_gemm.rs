@@ -3,19 +3,11 @@
 //! candle's CPU matmul allowlist is `F16 | F32 | F64` (`cpu_backend/mod.rs`); bf16 falls
 //! through to `UnsupportedDTypeForOp`, so BF16 CPU linears route through this bridge instead
 //! of stock candle matmul. The Arm BFloat16 extension (FEAT_BF16) has `BFMMLA`, which does
-//! a 2×4·4×2 bf16 matmul with **f32 accumulate**. We compile a small C micro-kernel
-//! (`native/reference/bf16_gemm.c`, via build.rs `cc` with `-march=armv8.2-a+bf16`) and call it here.
-//! Build-gated on aarch64 (`cfg(target_arch = "aarch64")`) and **runtime**-gated on
-//! FEAT_BF16 (BFMMLA `SIGILL`s without it), so a binary stays portable.
+//! a 2×4·4×2 bf16 matmul with **f32 accumulate**. The architecture kernels live in
+//! `native/kernels/{aarch64,x86_64}` and are **runtime**-gated on the required CPU
+//! features, so feature-specific instructions are never called on unsupported cores.
 
 use candle_core::{CpuStorage, CustomOp2, DType, Layout, Result, Shape, Tensor};
-
-// Only wired in as the fallback when the tightened flashkern GEMM was not built (see cpu_fwd).
-#[cfg(all(target_arch = "aarch64", target_arch = "aarch64", not(target_arch = "aarch64")))]
-extern "C" {
-    /// `C(M,N) f32 = A(M,K) bf16 · B(K,N) bf16`, all row-major. bf16 crosses as raw u16.
-    fn lfm_bf16_gemm_f32(a: *const u16, b: *const u16, c: *mut f32, m: i32, n: i32, k: i32);
-}
 
 /// Whether the running CPU has a native bf16 tensor extension: Arm FEAT_BF16 (BFMMLA) on
 /// aarch64, AVX-512-BF16 (VDPBF16PS) on x86-64. Cached probe. (On x86 the GEMM still runs
@@ -38,8 +30,7 @@ pub fn has_feat_bf16() -> bool {
 pub fn bf16_gemm_available() -> bool {
     #[cfg(target_arch = "aarch64")]
     {
-        cfg!(all(target_arch = "aarch64", target_arch = "aarch64"))
-            && crate::flashkern::neon::neon_features().bf16
+        crate::flashkern::neon::neon_features().bf16
     }
     #[cfg(target_arch = "x86_64")]
     {
@@ -86,12 +77,10 @@ impl CustomOp2 for Bf16Gemm {
         };
         let a = &a[l1.start_offset()..l1.start_offset() + m * k];
         let b = &b[l2.start_offset()..l2.start_offset() + k * n];
-        #[allow(unused_mut)] // `c` is mutated only on the SIMD kernel paths below
         let mut c = vec![0f32; m * n];
         // Preferred aarch64 path: the tightened NEON flashkern GEMM (8×8 BFMMLA multi-accumulator +
         // rayon row-block dispatch, or the row-streaming axpy GEMV when M==1; the decode-side
-        // small-M route uses Bf16GemmNt instead — no transpose). Same bf16-exact-product /
-        // f32-accumulate numerics as the reference kernel; only the summation order differs.
+        // small-M route uses Bf16GemmNt instead — no transpose). bf16 products accumulate in f32.
         #[cfg(target_arch = "aarch64")]
         {
             // half::bf16 is repr(transparent) over u16, so the bit-slice view is sound.
@@ -107,22 +96,6 @@ impl CustomOp2 for Bf16Gemm {
             let bb = unsafe { std::slice::from_raw_parts(b.as_ptr() as *const u16, b.len()) };
             crate::flashkern::x86::bf16_gemm_into(ab, bb, &mut c, m, n, k);
         }
-        // Fallback: the original single-file BFMMLA kernel (only reachable if flashkern TU failed
-        // to build but the reference kernel did).
-        #[cfg(all(target_arch = "aarch64", target_arch = "aarch64", not(target_arch = "aarch64")))]
-        // SAFETY: a/b are M*K / K*N contiguous bf16 (==u16) lanes; c is M*N f32; FEAT_BF16
-        // verified above; the kernel reads/writes exactly those bounds.
-        unsafe {
-            lfm_bf16_gemm_f32(
-                a.as_ptr() as *const u16,
-                b.as_ptr() as *const u16,
-                c.as_mut_ptr(),
-                m as i32,
-                n as i32,
-                k as i32,
-            );
-        }
-        let _ = (a, b);
         Ok((CpuStorage::F32(c), Shape::from((m, n))))
     }
 }
@@ -141,19 +114,15 @@ pub fn bf16_matmul(a: &Tensor, b: &Tensor) -> Result<Option<Tensor>> {
 }
 
 /// `true` when the flashkern NT kernel specifically is built and supported — STRICTER than
-/// [`bf16_gemm_available`], which on aarch64 is also satisfied by the reference BFMMLA
-/// fallback (`target_arch = "aarch64"` without `target_arch = "aarch64"`). The reference kernel has no
-/// NT form, so gating NT paths on the looser check would let [`Bf16GemmNt`] run with no
-/// kernel body at all (zero-filled output) in a fallback-only build.
+/// [`bf16_gemm_available`] only in name: it documents that callers require the native-layout
+/// kernel rather than an arbitrary future matmul backend.
 pub fn bf16_gemm_nt_available() -> bool {
     #[cfg(target_arch = "aarch64")]
     {
-        cfg!(target_arch = "aarch64")
-            && crate::flashkern::neon::neon_features().bf16
+        crate::flashkern::neon::neon_features().bf16
     }
     #[cfg(target_arch = "x86_64")]
     {
-        // Already flashkern-specific: cfg(target_arch = "x86_64") + AVX2 + FMA.
         crate::flashkern::x86::bf16_gemm_available()
     }
 }
@@ -162,11 +131,7 @@ pub fn bf16_gemm_nt_available() -> bool {
 /// flashkern build (Accelerate is the sanctioned AMX dispatcher; off macOS the BFMMLA
 /// GEMM remains the prefill path — see ENGINE_DESIGN.md §3b).
 pub fn bf16_gemm_accel_available() -> bool {
-    cfg!(all(
-        target_arch = "aarch64",
-        target_os = "macos",
-        target_arch = "aarch64"
-    )) && bf16_gemm_available()
+    cfg!(all(target_arch = "aarch64", target_os = "macos")) && bf16_gemm_available()
 }
 
 /// Prefill twin of [`Bf16GemmNt`]: `A(M,K) · W(N,K)ᵀ → f32(M,N)` through Accelerate
@@ -210,7 +175,7 @@ impl CustomOp2 for Bf16GemmAccel {
         let w = &w[l2.start_offset()..l2.start_offset() + n * k];
         #[allow(unused_mut)]
         let mut c = vec![0f32; m * n];
-        #[cfg(all(target_arch = "aarch64", target_os = "macos", target_arch = "aarch64"))]
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
         {
             let ab = unsafe { std::slice::from_raw_parts(a.as_ptr() as *const u16, a.len()) };
             let wb = unsafe { std::slice::from_raw_parts(w.as_ptr() as *const u16, w.len()) };
@@ -252,8 +217,6 @@ impl CustomOp2 for Bf16GemmNt {
         l2: &Layout,
     ) -> Result<(CpuStorage, Shape)> {
         if !bf16_gemm_nt_available() {
-            // The strict gate: the reference-kernel-only build satisfies bf16_gemm_available()
-            // but has no NT kernel — running here would return silent zeros.
             candle_core::bail!("bf16-gemm-nt: flashkern NT kernel unavailable on this target");
         }
         let (d1, d2) = (l1.dims(), l2.dims());

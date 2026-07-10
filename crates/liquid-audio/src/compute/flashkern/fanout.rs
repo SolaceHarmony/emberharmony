@@ -195,7 +195,6 @@ fn fft_threadgroup(data: &mut [f32], n: usize, inverse: bool, lanes: usize) {
 ///
 /// `lanes` is the simulated simdgroup width (Metal uses 32); 1 collapses to the serial kernel.
 pub fn fused_fft(data: &mut [f32], batch: usize, inverse: bool, lanes: usize) {
-    use rayon::prelude::*;
     assert!(
         batch > 0 && data.len() % batch == 0,
         "data.len() must be batch·2n"
@@ -208,7 +207,7 @@ pub fn fused_fft(data: &mut [f32], batch: usize, inverse: bool, lanes: usize) {
     );
     let lanes = lanes.clamp(1, n.max(1));
     // Grid dispatch: one rayon task = one threadgroup (one (batch) index).
-    data.par_chunks_mut(per).for_each(|sig| {
+    data.chunks_mut(per).for_each(|sig| {
         fft_threadgroup(sig, n, inverse, lanes);
     });
 }
@@ -320,7 +319,6 @@ pub fn fused_fft_conv(
     fft_size: usize,
     lanes: usize,
 ) {
-    use rayon::prelude::*;
     let half_sz = fft_size / 2 + 1;
     assert!(
         batch > 0 && channels > 0 && seqlen > 0,
@@ -348,8 +346,8 @@ pub fn fused_fft_conv(
     assert_eq!(y.len(), u.len(), "fused_fft_conv: y.len() != u.len()");
     let lanes = lanes.clamp(1, fft_size);
     // Grid dispatch: one rayon task == one threadgroup == one (b,c) index.
-    y.par_chunks_mut(seqlen)
-        .zip(u.par_chunks(seqlen))
+    y.chunks_mut(seqlen)
+        .zip(u.chunks(seqlen))
         .enumerate()
         .for_each(|(bc, (y_bc, u_bc))| {
             let c = bc % channels;
@@ -602,7 +600,6 @@ pub fn fused_fft_conv_dd(
     fft_size: usize,
     lanes: usize,
 ) {
-    use rayon::prelude::*;
     let half_sz = fft_size / 2 + 1;
     assert!(
         batch > 0 && channels > 0 && seqlen > 0,
@@ -631,14 +628,21 @@ pub fn fused_fft_conv_dd(
     let lanes = lanes.clamp(1, fft_size);
     // Host-side dd twiddle table (the "DD Taylor series" TODO, done in f64), shared read-only.
     let tw = dd::fft_twiddles_dd(fft_size);
-    y.par_chunks_mut(seqlen)
-        .zip(u.par_chunks(seqlen))
-        .enumerate()
-        .for_each(|(bc, (y_bc, u_bc))| {
-            let c = bc % channels;
-            let kf_c = &k_f[c * half_sz * 2..(c + 1) * half_sz * 2];
-            fft_conv_dd_threadgroup(u_bc, kf_c, d[c], y_bc, &tw, seqlen, fft_size, lanes);
-        });
+    // One grid item per (batch,channel) signal on the KCORO LANE TEAM (rayon gone):
+    // signals write disjoint `seqlen` output rows and share only read-only tables, so
+    // any partition is bit-identical. The per-signal FFT (fft_conv_dd_threadgroup) is
+    // unchanged — its own `lanes` is an INTERNAL width, run serially within an item.
+    let n_sig = batch * channels;
+    let y_addr = y.as_mut_ptr() as usize;
+    let engine = crate::flashkern::native_engine::process_engine();
+    engine.grid(n_sig, move |bc| {
+        // SAFETY: disjoint output row [bc*seqlen, (bc+1)*seqlen); u/k_f/d/tw read-only.
+        let y_bc = unsafe { std::slice::from_raw_parts_mut((y_addr as *mut f32).add(bc * seqlen), seqlen) };
+        let u_bc = &u[bc * seqlen..(bc + 1) * seqlen];
+        let c = bc % channels;
+        let kf_c = &k_f[c * half_sz * 2..(c + 1) * half_sz * 2];
+        fft_conv_dd_threadgroup(u_bc, kf_c, d[c], y_bc, &tw, seqlen, fft_size, lanes);
+    });
 }
 
 /// Double-double inverse real FFT — the CPU port of `irfft_dd` in IrfftDd.metal (torch's
@@ -650,7 +654,6 @@ pub fn fused_fft_conv_dd(
 /// double-double, rounded once per sample. `re`/`im` are `[m, n/2+1]`; `out` is `[m, n]`.
 /// `scale` is the dd norm factor (backward = `dd_from_f64(1/n)`).
 pub fn irfft_dd(re: &[f32], im: &[f32], out: &mut [f32], m: usize, n: usize, scale: Dd) {
-    use rayon::prelude::*;
     let freq = n / 2 + 1;
     assert!(m > 0 && n > 0, "irfft_dd: empty dims");
     assert_eq!(re.len(), m * freq, "irfft_dd: re.len() != M·(n/2+1)");
@@ -660,7 +663,14 @@ pub fn irfft_dd(re: &[f32], im: &[f32], out: &mut [f32], m: usize, n: usize, sca
     let nyq = n / 2;
     // tw[mm] = (cos, sin) of +2π·mm/n in dd; angle 2πkj/n folds to index (k·j) mod n.
     let tw = dd::irfft_twiddles_dd(n);
-    out.par_chunks_mut(n).enumerate().for_each(|(r, row)| {
+    // One grid item per output row on the KCORO LANE TEAM (rayon gone; flat grid, no
+    // barriers): rows write disjoint `n`-sample spans over read-only re/im/tw, so any
+    // partition is bit-identical. The inner per-sample dd math is untouched.
+    let out_addr = out.as_mut_ptr() as usize;
+    let engine = crate::flashkern::native_engine::process_engine();
+    engine.grid(m, move |r| {
+        // SAFETY: disjoint output row [r*n, (r+1)*n); re/im/tw read-only.
+        let row = unsafe { std::slice::from_raw_parts_mut((out_addr as *mut f32).add(r * n), n) };
         for (j, o) in row.iter_mut().enumerate() {
             let mut acc = Dd::default();
             for k in 0..freq {
@@ -681,6 +691,7 @@ pub fn irfft_dd(re: &[f32], im: &[f32], out: &mut [f32], m: usize, n: usize, sca
         }
     });
 }
+// irfft_dd grid closure end.
 
 // One threadgroup: the fused forward Monarch butterfly for a single (batch,head) —
 // row-DFT along L → twiddle → col-DFT along N — a line-for-line CPU port of
@@ -798,7 +809,6 @@ pub fn fused_monarch_fwd(
     l: usize,
     lanes: usize,
 ) {
-    use rayon::prelude::*;
     let nl = n * l;
     assert!(
         bh > 0 && n > 0 && l > 0,
@@ -817,8 +827,8 @@ pub fn fused_monarch_fwd(
     assert_eq!(tw.len(), nl * 2, "fused_monarch_fwd: tw.len() != N·L·2");
     let lanes = lanes.clamp(1, nl.max(1));
     // Grid dispatch: one rayon task == one threadgroup == one (b,h) index.
-    out.par_chunks_mut(nl * 2)
-        .zip(u.par_chunks(nl))
+    out.chunks_mut(nl * 2)
+        .zip(u.chunks(nl))
         .for_each(|(ob, xb)| {
             monarch_fwd_threadgroup(xb, dlr, dli, dnr, dni, tw, ob, n, l, lanes);
         });
@@ -1100,7 +1110,6 @@ pub fn fused_monarch_conv(
     l: usize,
     lanes: usize,
 ) {
-    use rayon::prelude::*;
     let nl = n * l;
     assert!(
         bh > 0 && n > 0 && l > 0,
@@ -1119,8 +1128,8 @@ pub fn fused_monarch_conv(
         "fused_monarch_conv: out.len() != B·H·N·L"
     );
     let lanes = lanes.clamp(1, nl.max(1));
-    out.par_chunks_mut(nl)
-        .zip(u.par_chunks(nl).zip(kf.par_chunks(nl * 2)))
+    out.chunks_mut(nl)
+        .zip(u.chunks(nl).zip(kf.chunks(nl * 2)))
         .for_each(|(ob, (xb, kfb))| {
             monarch_conv_threadgroup(xb, mats, kfb, ob, &MonarchIo::Plain, n, l, lanes);
         });
@@ -1148,7 +1157,6 @@ pub fn fused_monarch_conv_padded(
     l: usize,
     lanes: usize,
 ) {
-    use rayon::prelude::*;
     let (bh, nl) = (b * h, n * l);
     assert!(
         bh > 0 && n > 0 && l > 0 && t_len > 0,
@@ -1180,8 +1188,8 @@ pub fn fused_monarch_conv_padded(
         None
     };
     let lanes = lanes.clamp(1, nl.max(1));
-    out.par_chunks_mut(t_len)
-        .zip(kf.par_chunks(nl * 2))
+    out.chunks_mut(t_len)
+        .zip(kf.chunks(nl * 2))
         .enumerate()
         .for_each(|(bhi, (ob, kfb))| {
             let xb = &u_ext[bhi * t_len..(bhi + 1) * t_len];
@@ -1205,7 +1213,6 @@ pub fn fused_monarch_conv_padded(
 /// `id_f_l` `[L,L,2]` (indexed `[l_out, k]`), `out` `[BH,N,L]`; the interleaved
 /// multiply-subtract and the final division are kept as the kernel writes them.
 pub fn row_idft_real(x: &[f32], id_f_l: &[f32], out: &mut [f32], bh: usize, n: usize, l: usize) {
-    use rayon::prelude::*;
     assert_eq!(
         x.len(),
         bh * n * l * 2,
@@ -1217,7 +1224,7 @@ pub fn row_idft_real(x: &[f32], id_f_l: &[f32], out: &mut [f32], bh: usize, n: u
         "row_idft_real: id_f_l.len() != L·L·2"
     );
     assert_eq!(out.len(), bh * n * l, "row_idft_real: out.len() != B·H·N·L");
-    out.par_chunks_mut(l).enumerate().for_each(|(row, orow)| {
+    out.chunks_mut(l).enumerate().for_each(|(row, orow)| {
         let x_base = row * l; // (bh·N + n) row of complex length-L cells
         for (l_out, o) in orow.iter_mut().enumerate() {
             let mut sr = 0f32;

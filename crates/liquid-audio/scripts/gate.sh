@@ -25,25 +25,28 @@ fi
 [ -n "$LFM_MODEL_DIR" ] || { echo "gate: no model dir (set LFM_MODEL_DIR)"; exit 1; }
 export LFM_MODEL_DIR
 
-echo "== [1/5] release suite =="
+echo "== [1/6] release suite =="
 cargo test --release --lib
 
-echo "== [2/5] byte oracle: reference chain =="
+echo "== [2/6] mimi native parity (vs moshi, across the KV wrap) =="
+cargo test --release --test mimi_native_parity -- --nocapture
+
+echo "== [3/6] byte oracle: reference chain =="
 LFM_DEVICE=cpu cargo run --release --example generate -- --reference >/dev/null 2>&1
 got=$(shasum out.wav | awk '{print $1}')
 [ "$got" = "$REF_HASH" ] || { echo "REF ORACLE MISMATCH: $got"; exit 1; }
 echo "ref oracle exact: $got"
 
-echo "== [3/5] byte oracle: perf chain =="
+echo "== [4/6] byte oracle: perf chain =="
 LFM_DEVICE=cpu cargo run --release --example generate >/dev/null 2>&1
 got=$(shasum out.wav | awk '{print $1}')
 [ "$got" = "$PERF_HASH" ] || { echo "PERF ORACLE MISMATCH: $got"; exit 1; }
 echo "perf oracle exact: $got"
 
-echo "== [4/5] audible e2e: CPU (two turns through the real speaker) =="
+echo "== [5/6] audible e2e: CPU (two turns through the real speaker, NATIVE mimi) =="
 LFM_DEVICE=cpu cargo test --release --features audio-io --test e2e_voice_runtime -- --nocapture
 
-echo "== [5/5] audible e2e: Metal =="
+echo "== [6/6] audible e2e: Metal =="
 LFM_DEVICE=metal cargo test --release --features metal,audio-io --test e2e_voice_runtime -- --nocapture
 
 echo "== gate stack: ALL GREEN =="

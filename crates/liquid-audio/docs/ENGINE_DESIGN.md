@@ -86,8 +86,9 @@ carries local runtime fixes documented in `crates/kcoro-sys/vendor/kcoro/PATCHES
 source comments: 0001 a three-state park gate for lost wakeups, 0002 fiber-safe TLS after
 M:N migration, 0003 AAPCS64 FP-state save, and 0004 enqueue-to-owning-scheduler so an
 external-thread `kcoro_unpark` is a legal doorbell.
-`cfg(has_kcoro)` and `cfg(has_native_engine)` gate the engine exactly like
-`has_flashkern_*` gates kernels.
+On supported `aarch64`/`x86_64` GCC/Clang targets, kcoro, the architecture kernel,
+and the native engine are built unconditionally. Unsupported targets fail the build;
+there is no `has_*` cfg or degraded engine branch.
 
 The older Rust `src/compute/flashkern/engine.rs` `TileEngine` remains as a prototype/reference rung:
 it verifies channel-dispatch parity and documents kcoro channel rules. Do not mount new

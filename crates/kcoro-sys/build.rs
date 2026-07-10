@@ -1,5 +1,4 @@
 fn main() {
-    println!("cargo::rustc-check-cfg=cfg(has_kcoro)");
     println!("cargo::rerun-if-changed=vendor/kcoro");
 
     if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
@@ -41,6 +40,4 @@ fn main() {
         .define("KC_SCHED", "1")
         .warnings(false)
         .compile("kcoro");
-
-    println!("cargo::rustc-cfg=has_kcoro");
 }

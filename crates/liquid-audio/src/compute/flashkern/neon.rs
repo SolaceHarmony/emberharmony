@@ -152,7 +152,6 @@ pub fn bf16_gemm_available() -> bool {
 /// sized `M*K`, `K*N`, `M*N`.
 #[cfg(target_arch = "aarch64")]
 pub fn bf16_gemm_into(a: &[u16], b: &[u16], c: &mut [f32], m: usize, n: usize, k: usize) {
-    use rayon::prelude::*;
     // Real asserts (not debug_assert): the kernel reads m*k / k*n and writes m*n through raw
     // pointers, so a size mismatch would be an out-of-bounds FFI access in release builds.
     assert_eq!(a.len(), m * k, "bf16_gemm_into: a.len() != m*k");
@@ -172,26 +171,31 @@ pub fn bf16_gemm_into(a: &[u16], b: &[u16], c: &mut [f32], m: usize, n: usize, k
         unsafe { lfm_bf16_gemv_f32(a.as_ptr(), b.as_ptr(), c.as_mut_ptr(), n as i32, k as i32) };
         return;
     }
-    // Row-block dispatch: one rayon task per block of rows (== one Metal threadgroup per
-    // (batch,head)). par_chunks keeps A- and C-row blocks aligned, so no raw pointers escape.
-    let threads = rayon::current_num_threads().max(1);
-    let rows = (m.div_ceil(threads)).max(8); // ≥8 keeps whole 8-row tiles per task
-    c.par_chunks_mut(rows * n)
-        .zip(a.par_chunks(rows * k))
-        .for_each(|(cc, aa)| {
-            let mm = cc.len() / n;
-            // SAFETY: aa is mm*K, b is K*N, cc is mm*N; FEAT_BF16 verified by the caller.
-            unsafe {
-                lfm_bf16_gemm_f32_v2(
-                    aa.as_ptr(),
-                    b.as_ptr(),
-                    cc.as_mut_ptr(),
-                    mm as i32,
-                    n as i32,
-                    k as i32,
-                );
-            }
-        });
+    // Row-block dispatch on the KCORO LANE TEAM (rayon gone): one grid item per row
+    // block (== one Metal threadgroup per (batch,head)). Each output row is an
+    // independent dot, so any row partition is bit-identical — the tile size is a
+    // schedule choice, not numerics. ≥8 keeps whole 8-row tiles per item. Pointer
+    // addresses captured as usize (Send+Sync); each item writes a disjoint C block.
+    let engine = crate::flashkern::native_engine::process_engine();
+    let rows = (m.div_ceil(engine.lanes_total().max(1))).max(8);
+    let n_tiles = m.div_ceil(rows);
+    let (a_addr, b_addr, c_addr) = (a.as_ptr() as usize, b.as_ptr() as usize, c.as_mut_ptr() as usize);
+    engine.grid(n_tiles, move |tile| {
+        let r0 = tile * rows;
+        let mm = rows.min(m - r0);
+        // SAFETY: disjoint C row-block [r0,r0+mm); A row-block aligned; b read-only
+        // K*N; FEAT_BF16 verified above. Bit-for-bit the old par_chunks task body.
+        unsafe {
+            lfm_bf16_gemm_f32_v2(
+                (a_addr as *const u16).add(r0 * k),
+                b_addr as *const u16,
+                (c_addr as *mut f32).add(r0 * n),
+                mm as i32,
+                n as i32,
+                k as i32,
+            );
+        }
+    });
 }
 
 /// Native-layout small-M matmul: `C(M,N) f32 = A(M,K) bf16 · W(N,K)ᵀ` with the weight kept in
@@ -199,9 +203,7 @@ pub fn bf16_gemm_into(a: &[u16], b: &[u16], c: &mut [f32], m: usize, n: usize, k
 /// path needs **no transpose and no copy of W** (the `w.t().contiguous()` alternative copies
 /// the whole weight per call — measured as ~97% of CPU decode time). Intended for decode-side
 /// small `M` (1 per decode step, ≤4 suffix chunks); use [`bf16_gemm_into`] for prefill-scale M.
-/// **Precondition:** FEAT_BF16 — callers gate on `bf16_gemm_nt_available()`, the strict
-/// flashkern-build check (NOT `bf16_gemm_available()`, which the reference-kernel-only
-/// build also satisfies).
+/// **Precondition:** FEAT_BF16 — callers gate on `bf16_gemm_nt_available()`.
 #[cfg(target_arch = "aarch64")]
 pub fn bf16_gemm_nt_into(a: &[u16], w_nk: &[u16], c: &mut [f32], m: usize, n: usize, k: usize) {
     // Real asserts: the kernel indexes m*k / n*k / m*n through raw pointers.
@@ -219,25 +221,28 @@ pub fn bf16_gemm_nt_into(a: &[u16], w_nk: &[u16], c: &mut [f32], m: usize, n: us
     // fan out over N-chunks with rayon (each task gets its own contiguous C/W slice; the
     // per-output math is identical, so the result is deterministic regardless of the split).
     if m == 1 {
-        use rayon::prelude::*;
-        let threads = rayon::current_num_threads().max(1);
-        let cols = n.div_ceil(threads).max(64);
-        c.par_chunks_mut(cols)
-            .zip(w_nk.par_chunks(cols * k))
-            .for_each(|(cc, ww)| {
-                let nn = cc.len();
-                // SAFETY: a is K; ww is nn*K rows aligned with cc (same chunk index).
-                unsafe {
-                    lfm_bf16_gemm_nt_f32(
-                        a.as_ptr(),
-                        ww.as_ptr(),
-                        cc.as_mut_ptr(),
-                        1,
-                        nn as i32,
-                        k as i32,
-                    )
-                };
-            });
+        // N-chunk dispatch on the KCORO LANE TEAM (rayon gone): the N outputs are
+        // independent dots over disjoint W rows, so any column split is bit-identical.
+        let engine = crate::flashkern::native_engine::process_engine();
+        let cols = n.div_ceil(engine.lanes_total().max(1)).max(64);
+        let n_tiles = n.div_ceil(cols);
+        let (a_addr, w_addr, c_addr) =
+            (a.as_ptr() as usize, w_nk.as_ptr() as usize, c.as_mut_ptr() as usize);
+        engine.grid(n_tiles, move |tile| {
+            let c0 = tile * cols;
+            let nn = cols.min(n - c0);
+            // SAFETY: a is K; disjoint C cols [c0,c0+nn); W rows aligned to c0.
+            unsafe {
+                lfm_bf16_gemm_nt_f32(
+                    a_addr as *const u16,
+                    (w_addr as *const u16).add(c0 * k),
+                    (c_addr as *mut f32).add(c0),
+                    1,
+                    nn as i32,
+                    k as i32,
+                )
+            };
+        });
         return;
     }
     // SAFETY: slices sized M*K / N*K / M*N per the asserts.
@@ -260,7 +265,7 @@ pub fn bf16_gemm_nt_into(a: &[u16], w_nk: &[u16], c: &mut [f32], m: usize, n: us
 /// movement is the bf16→f32 widening into reusable thread-local scratch — the single cited
 /// entry on the design's weight-movement exception list (tile/turn-transient, never a
 /// resident f32 copy). Compute-bound M>4 only; decode stays on the nt kernel.
-#[cfg(all(target_arch = "aarch64", target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 pub fn bf16_gemm_accel_into(a: &[u16], w_nk: &[u16], c: &mut [f32], m: usize, n: usize, k: usize) {
     use std::cell::RefCell;
     assert_eq!(a.len(), m * k, "bf16_gemm_accel_into: a.len() != m*k");
@@ -1199,7 +1204,7 @@ mod tests {
 
 // Accelerate cblas — the sanctioned route to the AMX/SME matrix units on macOS. Used by
 // the prefill-tile bench below and (pending the E4 measurement) the prefill GEMM backend.
-#[cfg(all(target_arch = "aarch64", target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 extern "C" {
     fn cblas_sgemm(
         order: i32,

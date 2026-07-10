@@ -433,6 +433,37 @@ impl NativeEngine {
         rc == 0
     }
 
+    /// Fan a flat grid of `n` INDEPENDENT items across the lane team: `f(item)`
+    /// runs for every `item` in `0..n`, each on whichever lane claims it via a
+    /// strided partition (`lane, lane+lanes, …`). The items must be genuinely
+    /// disjoint (no shared mutable state, no cross-item ordering) — then the
+    /// result is byte-identical to any serial or foreign-pool fan-out, which is
+    /// what lets this REPLACE rayon `par_chunks` grids without moving a bit.
+    ///
+    /// This is the prefill/grid analog of [`run_lanes`](Self::run_lanes): same
+    /// team, same doorbell, zero-spin when idle. Like `run_lanes`, `f` must not
+    /// call into kcoro, and — because this itself dispatches on the team — it
+    /// must NOT be called from inside a lane program (that would re-enter the
+    /// single-slot engine and deadlock). All current callers are candle
+    /// CustomOps at graph scope; none run inside a lane program.
+    pub fn grid<F: Fn(usize) + Sync>(&self, n: usize, f: F) {
+        if n == 0 {
+            return;
+        }
+        let lanes = self.lanes_total().max(1);
+        let dispatched = self.run_lanes(|lane| {
+            let mut item = lane;
+            while item < n {
+                f(item);
+                item += lanes;
+            }
+        });
+        // The engine is the substrate — run_lanes only returns false on a hard
+        // C-side failure, which for a resident team is a broken invariant, not
+        // a slow path. Surface it; do NOT silently drop the grid's work.
+        assert!(dispatched, "engine.grid: lane-team dispatch refused");
+    }
+
     /// One whole shortconv+MLP layer in a single doorbell — bit-identical to the
     /// composed `fused_shortconv_decode` + `fused_mlp_decode` at the same `lanes`.
     #[must_use = "false = native pass did not run; caller must take the fallback"]

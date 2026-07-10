@@ -232,7 +232,7 @@ pub fn from_pretrained(
     // No silent fallback for full snapshots: a present `audio_detokenizer/`
     // propagates any load error rather than quietly dropping to Mimi.
     let mimi: Option<Box<dyn AudioDetokenizer>> = load_mimi(dir, codebooks, device)?
-        .map(|m| Box::new(MimiDetokenizer::new(m)) as Box<dyn AudioDetokenizer>);
+        .map(|m| Box::new(m) as Box<dyn AudioDetokenizer>);
     let audio_out: Option<Box<dyn AudioDetokenizer>> = if dir.join("audio_detokenizer").is_dir() {
         Some(Box::new(load_detokenizer(dir, device)?))
     } else {
@@ -363,7 +363,7 @@ pub fn from_pretrained_trainable(dir: &Path, device: &Device) -> Result<Trainabl
     // Mimi codec + LFM2 detokenizer loaded independently (see `from_pretrained`):
     // training preprocessing also encodes audio-out via `processor.mimi.encode`.
     let mimi: Option<Box<dyn AudioDetokenizer>> = load_mimi(dir, codebooks, device)?
-        .map(|m| Box::new(MimiDetokenizer::new(m)) as Box<dyn AudioDetokenizer>);
+        .map(|m| Box::new(m) as Box<dyn AudioDetokenizer>);
     let audio_out: Option<Box<dyn AudioDetokenizer>> = if dir.join("audio_detokenizer").is_dir() {
         Some(Box::new(load_detokenizer(dir, device)?))
     } else {
@@ -389,7 +389,7 @@ pub fn from_pretrained_trainable(dir: &Path, device: &Device) -> Result<Trainabl
 /// `liquid_audio/moshi`, so it loads the moshi-format checkpoint). Returns `None`
 /// if the file is absent; propagates a real load error (no silent fallback) if
 /// the file exists but can't be loaded.
-fn load_mimi(dir: &Path, codebooks: usize, device: &Device) -> Result<Option<::moshi::mimi::Mimi>> {
+fn load_mimi(dir: &Path, codebooks: usize, device: &Device) -> Result<Option<MimiDetokenizer>> {
     let path = dir.join("tokenizer-e351c8d8-checkpoint125.safetensors");
     if !path.exists() {
         return Ok(None);
@@ -397,7 +397,13 @@ fn load_mimi(dir: &Path, codebooks: usize, device: &Device) -> Result<Option<::m
     let p = path
         .to_str()
         .ok_or_else(|| err("non-utf8 mimi weights path"))?;
-    Ok(Some(get_mimi(p, codebooks, device)?))
+    // Both halves from the same checkpoint: the moshi codec (turn-level tooling:
+    // encode + the one-shot decode the byte oracles pin) and the NATIVE streaming
+    // decoder (the per-frame hot path). Native init failure is a hard load error —
+    // the kernel is the streaming substrate, not an optional acceleration.
+    let mimi = get_mimi(p, codebooks, device)?;
+    let native = crate::mimi_native::NativeMimi::new(&path, codebooks).map_err(err)?;
+    Ok(Some(MimiDetokenizer::new(mimi, native)))
 }
 
 /// Load the LFM2.5 audio detokenizer from `<dir>/audio_detokenizer/` if present.

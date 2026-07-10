@@ -187,8 +187,9 @@ describe("desktop voice context boundary", () => {
     const ci = await root(".github/workflows/rust-voice.yml")
 
     expect(cargo).toContain('kcoro-sys = { path = "../kcoro-sys" }')
-    expect(build).toContain("println!(\"cargo::rustc-cfg=has_kcoro\")")
+    expect(build).toContain('.file("native/src/engine/flashkern_engine.cpp")')
     expect(build).toContain(".include(\"../kcoro-sys/vendor/kcoro/include\")")
+    expect(build).not.toContain("cargo::rustc-cfg=")
     expect(native).toContain("kcoro_sys::link_anchor")
     expect(native).toContain("fn lfm_engine_new")
     expect(native).toContain("pub fn process_engine()")

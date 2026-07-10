@@ -40,10 +40,8 @@ types, so it's a candle choice, not a `gemm` limit.)
 The M2 Max has **FEAT_BF16** (`sysctl hw.optional.arm.FEAT_BF16 = 1`) → `BFMMLA`. So we wrote
 a real kernel instead of falling back to f32:
 
-- **`native/reference/bf16_gemm.c`** — a NEON `vbfmmlaq_f32` micro-kernel: packs A/B into BFMMLA tile
-  order (2×4 · 4×2 → 2×2), **bf16 inputs, f32 accumulate** (torch's bf16-matmul numerics),
-  zero-padded edges for M%2/N%2/K%4. Compiled by **`build.rs`** (`cc`, `-march=armv8.2-a+bf16`),
-  gated to aarch64 via `cfg(has_bf16_kernel)`.
+- **`native/kernels/aarch64/flashkern_neon.cpp`** — the live BFMMLA kernel library,
+  including packed GEMM/GEMV and native-layout decode forms with bf16 inputs and f32 accumulation.
 - **`src/compute/bf16_gemm.rs`** — FFI + **runtime FEAT_BF16 gate** (`has_feat_bf16()` via sysctl; a
   binary stays portable, BFMMLA `SIGILL`s without it) + `Bf16Gemm` **`CustomOp2`** (the single
   FFI site, composes as a candle tensor op) + `bf16_matmul(&a,&b) -> Option<Tensor>` wrapper.
@@ -136,7 +134,7 @@ model and adds explicit barge-in, rather than imposing Moshi's frame loop on it.
 
 ## Files
 
-`src/compute/threads.rs`, `src/compute/bf16_gemm.rs`, `native/reference/bf16_gemm.c`, `build.rs`, `src/runtime/realtime.rs`,
+`src/compute/threads.rs`, `src/compute/bf16_gemm.rs`, `native/kernels/aarch64/flashkern_neon.cpp`, `build.rs`, `src/runtime/realtime.rs`,
 `src/runtime/voice_runtime.rs`, `examples/duplex_chat.rs`, `examples/chat_multiturn.rs`,
 `examples/text_chat.rs`, `Cargo.toml` (`rayon`/`num_cpus`/`libc`/`half`/`crossbeam-channel`
 deps, `cc` build-dep, `accelerate`/`metal` features), `src/model/lfm2_audio.rs`

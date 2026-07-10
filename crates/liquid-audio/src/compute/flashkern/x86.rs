@@ -121,7 +121,6 @@ pub fn bf16_gemm_available() -> bool {
 /// `K*N`, `M*N`.
 #[cfg(target_arch = "x86_64")]
 pub fn bf16_gemm_into(a: &[u16], b: &[u16], c: &mut [f32], m: usize, n: usize, k: usize) {
-    use rayon::prelude::*;
     assert_eq!(a.len(), m * k, "bf16_gemm_into: a.len() != m*k");
     assert_eq!(b.len(), k * n, "bf16_gemm_into: b.len() != k*n");
     assert_eq!(c.len(), m * n, "bf16_gemm_into: c.len() != m*n");
@@ -135,26 +134,27 @@ pub fn bf16_gemm_into(a: &[u16], b: &[u16], c: &mut [f32], m: usize, n: usize, k
         unsafe { lfm_bf16_gemv_f32(a.as_ptr(), b.as_ptr(), c.as_mut_ptr(), n as i32, k as i32) };
         return;
     }
-    // CPU fan-out: one rayon task per block of rows (== one GPU threadgroup per (batch,head)).
-    // par_chunks keeps A- and C-row blocks aligned, so no raw pointers escape a task.
-    let threads = rayon::current_num_threads().max(1);
-    let rows = (m.div_ceil(threads)).max(1);
-    c.par_chunks_mut(rows * n)
-        .zip(a.par_chunks(rows * k))
-        .for_each(|(cc, aa)| {
-            let mm = cc.len() / n;
-            // SAFETY: aa is mm*K, b is K*N, cc is mm*N; AVX2+FMA asserted above.
-            unsafe {
-                lfm_bf16_gemm_f32_v2(
-                    aa.as_ptr(),
-                    b.as_ptr(),
-                    cc.as_mut_ptr(),
-                    mm as i32,
-                    n as i32,
-                    k as i32,
-                );
-            }
-        });
+    // Row-block dispatch on the KCORO LANE TEAM (rayon gone; NEON twin's shape): each
+    // output row is an independent dot, so any row partition is bit-identical.
+    let engine = crate::flashkern::native_engine::process_engine();
+    let rows = (m.div_ceil(engine.lanes_total().max(1))).max(1);
+    let n_tiles = m.div_ceil(rows);
+    let (a_addr, b_addr, c_addr) = (a.as_ptr() as usize, b.as_ptr() as usize, c.as_mut_ptr() as usize);
+    engine.grid(n_tiles, move |tile| {
+        let r0 = tile * rows;
+        let mm = rows.min(m - r0);
+        // SAFETY: disjoint C row-block [r0,r0+mm); A aligned; b read-only K*N.
+        unsafe {
+            lfm_bf16_gemm_f32_v2(
+                (a_addr as *const u16).add(r0 * k),
+                b_addr as *const u16,
+                (c_addr as *mut f32).add(r0 * n),
+                mm as i32,
+                n as i32,
+                k as i32,
+            );
+        }
+    });
 }
 
 /// Native-layout small-M matmul: `C(M,N) f32 = A(M,K) bf16 · W(N,K)ᵀ` with the weight in its
@@ -173,25 +173,28 @@ pub fn bf16_gemm_nt_into(a: &[u16], w_nk: &[u16], c: &mut [f32], m: usize, n: us
     // M==1: independent output dots over disjoint W rows — rayon over N-chunks (identical
     // per-output math, deterministic regardless of split). Same shape as the NEON twin.
     if m == 1 {
-        use rayon::prelude::*;
-        let threads = rayon::current_num_threads().max(1);
-        let cols = n.div_ceil(threads).max(64);
-        c.par_chunks_mut(cols)
-            .zip(w_nk.par_chunks(cols * k))
-            .for_each(|(cc, ww)| {
-                let nn = cc.len();
-                // SAFETY: a is K; ww is nn*K rows aligned with cc; AVX2+FMA asserted above.
-                unsafe {
-                    lfm_bf16_gemm_nt_f32(
-                        a.as_ptr(),
-                        ww.as_ptr(),
-                        cc.as_mut_ptr(),
-                        1,
-                        nn as i32,
-                        k as i32,
-                    )
-                };
-            });
+        // N-chunk dispatch on the KCORO LANE TEAM (rayon gone; NEON twin's shape):
+        // independent output dots over disjoint W rows, bit-identical for any split.
+        let engine = crate::flashkern::native_engine::process_engine();
+        let cols = n.div_ceil(engine.lanes_total().max(1)).max(64);
+        let n_tiles = n.div_ceil(cols);
+        let (a_addr, w_addr, c_addr) =
+            (a.as_ptr() as usize, w_nk.as_ptr() as usize, c.as_mut_ptr() as usize);
+        engine.grid(n_tiles, move |tile| {
+            let c0 = tile * cols;
+            let nn = cols.min(n - c0);
+            // SAFETY: a is K; disjoint C cols [c0,c0+nn); W rows aligned to c0.
+            unsafe {
+                lfm_bf16_gemm_nt_f32(
+                    a_addr as *const u16,
+                    (w_addr as *const u16).add(c0 * k),
+                    (c_addr as *mut f32).add(c0),
+                    1,
+                    nn as i32,
+                    k as i32,
+                )
+            };
+        });
         return;
     }
     // SAFETY: slices sized M*K / N*K / M*N per the asserts; AVX2+FMA asserted above.
