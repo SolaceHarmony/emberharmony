@@ -32,11 +32,11 @@ flowchart LR
         CONF --> PRE["prefill: candle graph<br/>matmuls on AMX via Accelerate"]
     end
     subgraph token["Per decode step (engine territory - one doorbell each)"]
-        TP["REQ_TOKEN_PASS<br/>embed → 16-layer walk → final norm<br/>kcoro lane team, generation fences"]
+        TP["REQ_TOKEN_PASS<br/>embed → 16-layer walk → final norm<br/>kcoro lane team, parked generation fences (C++)"]
         TP -- "hidden bits (Tensor storage = engine out plane)" --> HEAD["logits: candle tied head<br/>(ST_LOGITS dormant - RO-tree decision)"]
         HEAD --> SAMP["seeded sampler"]
         SAMP -- "next ids" --> TP
-        TP -- "audio step: hidden" --> DF["REQ_CALL: depthformer frame<br/>8 codebooks x 6 blocks, Rust ladders<br/>SAME lane team, sampler on lane 0"]
+        TP -- "audio step: hidden" --> DF["REQ_CALL: depthformer frame<br/>8 codebooks x 6 blocks, Rust ladders<br/>SAME lane team, spin-only fences, sampler on lane 0"]
         DF -- "8 audio tokens" --> MIMI["Mimi codec"]
     end
     PRE --> TP
@@ -44,17 +44,23 @@ flowchart LR
 ```
 
 The thread model: 8 pthreads (torch's P-core policy; the M2 Max has 12 cores /
-12 hardware threads — no SMT — and the headroom belongs to the audio pipeline),
-each hosting exactly one lane coroutine. Between tokens the team parks; each token
-is one rim doorbell, one team wake, ~150 in-arena fences crossed on the spin path,
-and one condvar completion. The measured wake budget is what killed the chop.
+12 hardware threads — no SMT — and the headroom belongs to the audio pipeline)
+carrying 8 lane coroutines **M:N, with no affinity**: a lane that PARKS (in a
+fence's slow path or between tokens) lands on kc_sched's global ready queue and
+may resume on a different worker pthread. The engine's C++ programs are written
+for that (no TLS across switches — the patch-0002 discipline). Rust `REQ_CALL`
+programs are NOT: they never park mid-frame — their stage barriers are pure
+spins — so a live Rust frame never migrates; the coroutine parks again only
+after the Rust program returns. Between tokens the team parks; each token is one
+rim doorbell, one team wake, ~150 in-arena fences (spin path), one condvar
+completion. The measured wake budget is what killed the chop.
 
 ```mermaid
 flowchart TB
     subgraph rim["Rim thread (decode loop, Rust)"]
         R["write request slot<br/>kcoro_unpark(lane 0) - ONE doorbell<br/>pthread_cond_wait for completion"]
     end
-    subgraph sched["kc_sched: 8 pthreads (P-cores, no SMT), one lane coroutine each, 512 KiB stacks"]
+    subgraph sched["kc_sched: 8 pthreads (P-cores, no SMT) carrying 8 lane coroutines M:N (no affinity), 512 KiB stacks"]
         L0["lane 0<br/>request loop + full compute lane"]
         LN["lanes 1..7<br/>parked between tokens"]
         L0 -- "lane_gen++ then unpark x7<br/>(one team wake per token)" --> LN

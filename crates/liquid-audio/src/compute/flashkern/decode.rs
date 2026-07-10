@@ -78,29 +78,6 @@ impl LaneFence for SpinBarrier {
     }
 }
 
-#[cfg(all(
-    has_kcoro,
-    has_native_engine,
-    any(
-        all(target_arch = "aarch64", has_flashkern_neon),
-        all(target_arch = "x86_64", has_flashkern_x86)
-    )
-))]
-struct EngineFence<'a>(&'a crate::flashkern::native_engine::NativeEngine);
-
-#[cfg(all(
-    has_kcoro,
-    has_native_engine,
-    any(
-        all(target_arch = "aarch64", has_flashkern_neon),
-        all(target_arch = "x86_64", has_flashkern_x86)
-    )
-))]
-impl LaneFence for EngineFence<'_> {
-    fn wait(&self, lane: usize) {
-        self.0.lane_fence(lane);
-    }
-}
 
 /// `true` when the fused decode blocks can run: the STRICT nt-kernel gate — the looser
 /// [`bf16_gemm_available`](crate::bf16_gemm::bf16_gemm_available) is also satisfied by the
@@ -1071,7 +1048,18 @@ impl DepthDecode {
         ))]
         if let Some(engine) = crate::flashkern::native_engine::process_engine() {
             if engine.lanes_total() == lanes {
-                dispatched = engine.run_lanes(|lane| run_lane(lane, &EngineFence(engine)));
+                // SPIN-ONLY fences under Rust frames (review P1): a lane that PARKS
+                // inside a fence lands on kc_sched's global ready queue and can be
+                // resumed on a DIFFERENT worker pthread — migrating a live Rust
+                // frame (sampler included) across threads, the exact TLS hazard
+                // class kcoro patch 0002 fixed for the runtime's own C frames.
+                // Native (C++) engine programs are written to tolerate that; Rust
+                // programs are not, so they never park mid-frame: the engine
+                // provides the dispatch, the stage barrier stays a pure spin —
+                // exactly the pre-fold SpinBarrier semantics, on our lanes.
+                let barrier = SpinBarrier::new(lanes);
+                let barrier = &barrier;
+                dispatched = engine.run_lanes(|lane| run_lane(lane, barrier));
             }
         }
         if !dispatched {

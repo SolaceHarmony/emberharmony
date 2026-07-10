@@ -22,7 +22,22 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
+
+/* C++ consumers (e.g. the flashkern engine TU): gcc's <stdatomic.h> does not
+ * provide ::atomic_int in C++ mode before C++23 (clang's does — which is how
+ * this went unnoticed on macOS). Alias the one atomic type this header's structs
+ * use to std::atomic<int>, which is layout-compatible with C11 atomic_int on
+ * every ABI we target (asserted below). C++ code must not touch these fields
+ * directly — they are the runtime's; the alias exists only so the struct parses. */
+#ifdef __cplusplus
+#include <atomic>
+typedef std::atomic<int> kc_atomic_int;
+static_assert(sizeof(kc_atomic_int) == sizeof(int) && alignof(kc_atomic_int) == alignof(int),
+              "std::atomic<int> must be layout-compatible with C11 atomic_int");
+#else
 #include <stdatomic.h>
+typedef atomic_int kc_atomic_int;
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -60,12 +75,12 @@ struct kcoro {
     kcoro_t* main_co;            /* Main coroutine (yield target) */
     kcoro_sched_t* scheduler;    /* Owning scheduler */
     bool ready_enqueued;         /* Scheduler ready-queue flag */
-    atomic_int running_flag;     /* 0 = idle, 1 = running */
-    atomic_int park_notify;      /* park gate: 0 empty / 1 notified / 2 parked. The whole
+    kc_atomic_int running_flag;     /* 0 = idle, 1 = running */
+    kc_atomic_int park_notify;      /* park gate: 0 empty / 1 notified / 2 parked. The whole
                                     park/unpark handshake serializes on this one atomic so
                                     a wake can never race the park switch (liquid-audio
                                     patch 0001, see crates/kcoro-sys/vendor/kcoro/PATCHES.md) */
-    atomic_int refcount;         /* Reference count for lifetime management */
+    kc_atomic_int refcount;         /* Reference count for lifetime management */
 
     /* Stack management */
     void* stack_ptr;             /* Private stack (if not using shared) */

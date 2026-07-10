@@ -131,7 +131,6 @@ extern "C" {
         f: unsafe extern "C" fn(*mut c_void, u32, u32),
         ctx: *mut c_void,
     ) -> i32;
-    fn lfm_lane_fence(e: *mut c_void, lane: u32);
     fn lfm_engine_lanes(e: *mut c_void) -> u32;
     fn lfm_ctx_set_heads(
         e: *mut c_void,
@@ -402,17 +401,15 @@ impl NativeEngine {
         unsafe { lfm_engine_lanes(self.ptr) as usize }
     }
 
-    /// The team fence, for use INSIDE a [`Self::run_lanes`] program only: pure
-    /// barrier across all lanes, release/acquire on both sides.
-    pub fn lane_fence(&self, lane: usize) {
-        // SAFETY: contract above — caller is a lane program on this engine's team.
-        unsafe { lfm_lane_fence(self.ptr, lane as u32) };
-    }
-
     /// Run a lane-uniform program on the whole team: `f(lane)` executes concurrently
-    /// on every lane (0..lanes_total), synchronizing itself via [`Self::lane_fence`].
-    /// Blocks until every lane completes (the engine's program-final fence). One
-    /// doorbell in, one completion out — the same wake budget as a token pass.
+    /// on every lane (0..lanes_total). Blocks until every lane completes (the
+    /// engine's program-final fence). One doorbell in, one completion out.
+    ///
+    /// CONTRACT (review P1): `f` must never call into kcoro — no parks, no engine
+    /// fences. A parked lane can be resumed on a different worker pthread,
+    /// migrating the live Rust frame across threads (the patch-0002 TLS hazard
+    /// class). Synchronize between lanes with pure spin barriers only
+    /// (`decode::SpinBarrier`); the coroutine parks again only after `f` returns.
     /// A panic in `f` aborts the process (it cannot unwind across the C boundary).
     #[must_use = "false = engine refused; caller must take the fallback dispatch"]
     pub fn run_lanes<F: Fn(usize) + Sync>(&self, f: F) -> bool {
