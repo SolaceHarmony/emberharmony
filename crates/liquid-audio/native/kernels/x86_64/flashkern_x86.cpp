@@ -200,6 +200,12 @@ extern "C" void lfm_bf16_gemv_f32(const uint16_t *A, const uint16_t *B, float *C
     gemv_axpy(A, B, C, N, K);
 }
 
+// Forward decl at file scope (matching hsum256's definition scope): it is defined with the
+// reductions (Group B) further down, but the decode GEMM's tail reduction below is its first
+// use. Declaring it inside the anonymous namespace would name a different symbol and fail to
+// link, so it must sit at file scope like the definition.
+X86_TGT_AVX2 static inline float hsum256(__m256 v);
+
 // Native-layout small-M matmul: C(M,N) = A(M,K) · W(N,K)ᵀ with W in its checkpoint
 // row-major layout — each output dots a CONTIGUOUS W row; no transpose anywhere (see the
 // NEON twin for the decode-path rationale). W rows stream once, reused across the M rows.
