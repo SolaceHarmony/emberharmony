@@ -43,7 +43,7 @@ conv-block transformer variants (config says None/LayerNorm/false), LSTM
 | 2 | `mimi_conv.cpp` | conv.rs | `NormConv1d`/`NormConvTranspose1d` forward math incl. weight-norm fold semantics, `StreamableConv1d::step`, `StreamableConvTranspose1d::step` (pending/partial-frame state carry), `ConvTrUpsample1d::step` | `ConvDownsample1d` (encode-only), batched mask paths |
 | 3 | `mimi_seanet.cpp` | seanet.rs | `SeaNetResnetBlock::step`, `SeaNetDecoder::step` (+ ELU), reset | `SeaNetEncoder` |
 | 4 | `mimi_transformer.cpp` | transformer.rs | `LayerScale`, `RotaryEmbedding`/`Rope` (rope_i interleaved), `StreamingMultiheadAttention::forward` (causal, kv_repeat 1), `Mlp::NoGating` (gelu_erf), `LayerNorm`, `StreamingTransformerLayer`, `StreamingTransformer::step`, `ProjectedTransformer::step` (projs are None at 512↔512) | cross-attn, gating, RmsNorm, conv-block, batched |
-| 5 | `mimi_kv.cpp` | kv_cache.rs | `ScatteredKvCache` + `ScatteredCacheBuilder` (append/indices_and_mask/reset), specialized batch=1 but semantics faithful | batched reset_batch_index fast paths |
+| 5 | `mimi_kv.cpp` | kv_cache.rs | ~~ScatteredKvCache~~ **PARKED** — unit 5's port proved the streaming path never uses it: transformer.rs imports `kv_cache::KvCache` = an enum over **candle_nn `RotatingKvCache`**, mask built inline in StreamingTransformer::step (t==1 no-mask fast path; allow-rule `last_reset_pos <= k_pos <= t_pos <= k_pos+context`). The real cache is ported inside unit 4 from candle-nn-0.9.2 kv_cache.rs:336 + the inline mask. mimi_kv.cpp stays in-tree unwired (correct work, batched-serving consumer only). | |
 | 6 | `mimi_decode.cpp` | mimi.rs (+ streaming.rs as reference) | `Mimi::decode_step` orchestration over units 1–5, `reset_state` (decoder half), config `v0_1(8)` constants | `encode*`, `load*` (weights arrive via the table), batching |
 
 Shared contract: `native/src/mimi/mimi_kernel.h` (arbiter-authored) — weight
@@ -61,11 +61,17 @@ streaming.rs (`StreamTensor` = Option<Tensor>) becomes explicit
 - **Zero allocation in steady state**: all streaming state (conv left-context,
   partial-frame pendings, KV rings, scratch) lives in ONE arena sized at init.
   State structs are POD and explicitly serializable (hibernation-friendly).
-- **Math**: f32 in, f32 accumulate, NEON (aarch64) with a scalar reference path
-  compiled alongside for parity bisecting; AMX via Accelerate cblas_sgemm is
-  permitted for the transformer GEMMs (turn-level init decides). FPU
-  transcendentals (erff, expf) — document exactly which libm calls replace
-  candle's `gelu_erf`/`elu`/softmax.
+- **Math**: f32 in, f32 accumulate. **Assembly at every step** (her rule,
+  2026-07-09): no tensor-op thinking — NEON/aarch64 has an equivalent for
+  every one of them. GEMM/GEMV tier is **AMX via Accelerate**
+  (`cblas_sgemm`/`cblas_sgemv`) — we have a matrix coprocessor, nobody
+  hand-rolls a vanilla GEMM. EVERYTHING else — conv inner loops, softmax
+  reductions, layernorm, RoPE rotation, ELU/GELU sweeps, elementwise
+  add/scale — is hand NEON intrinsics from the FIRST pass; scalar C++ exists
+  only in the `_ref` parity siblings and sub-vector tails. Transcendentals
+  (erff/expf) stay lane-wise libm inside the NEON sweeps on the faithful tier;
+  polynomial vector approximations are fast-tier, admitted only behind the
+  parity gate.
 - **Accumulation order is documented per kernel.** Target numerics tier:
   *faithful* — ulp-band parity vs moshi-Rust per module (candle's blocked gemm
   is not economically bit-reproducible); thresholds measured by the harness,

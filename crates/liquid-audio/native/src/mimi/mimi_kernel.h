@@ -12,9 +12,16 @@
 //     arena; nothing repacks per step.
 //   - Zero allocation in steady state: every stream state and scratch lives
 //     in ONE arena sized at init. State is POD (hibernatable).
-//   - f32 math, f32 accumulation, documented loop order. NEON encouraged in
-//     inner loops, but EVERY kernel keeps a scalar reference sibling
-//     (`..._ref`) compiled under MIMI_SCALAR_REF for parity bisecting.
+//   - f32 math, f32 accumulation, documented loop order. MATH IS ASSEMBLY AT
+//     EVERY STEP (her rule): no tensor-op thinking, no scalar C++ loops as a
+//     primary path — every sweep/reduction/activation is aarch64 NEON
+//     intrinsics (float32x4_t: fmla/vmax/vsub, vectorized loads/stores), and
+//     GEMM/GEMV ride AMX via Accelerate. Scalar code exists in exactly two
+//     places: the `..._ref` parity siblings under MIMI_SCALAR_REF, and
+//     sub-vector tail remainders. Transcendentals (erff/expf): lane-wise libm
+//     calls INSIDE the NEON sweep on the first pass (faithful tier — a
+//     polynomial vector exp/erf changes numerics; it enters later, behind the
+//     parity gate, as a fast-tier variant).
 //   - No exceptions across this ABI. No candle. Return codes, not throws.
 #ifndef MIMI_KERNEL_H
 #define MIMI_KERNEL_H
@@ -85,18 +92,30 @@ typedef struct MimiArena {
 void *mimi_arena_alloc(MimiArena *a, size_t bytes); /* aborts on overflow: sizing bug */
 
 /* ---- shared math primitives (mimi_decode.cpp owns impls; units call) -----
- * First pass: correct + documented accumulation order beats clever.
+ * GEMM/GEMV are AMX-backed on Apple: implement over Accelerate cblas_sgemm /
+ * cblas_sgemv (-framework Accelerate) — never a hand-rolled vanilla GEMM; the
+ * machine has a matrix coprocessor and prefill already runs on it (E4).
+ * Scalar _ref siblings under MIMI_SCALAR_REF remain the parity-bisect path.
  *   y[m] = sum_k w[m*k_stride + k] * x[k] (+ b[m])  — row-major W [M,K] */
 void mimi_gemv_f32(const float *w, const float *x, const float *bias_or_null,
                    float *y, int m, int k);
 /* C[MxN] += / = A[MxK] * B[KxN], row-major, f32 accumulate. beta 0 or 1. */
 void mimi_gemm_f32(const float *a, const float *b, float *c,
                    int m, int k, int n, int beta);
-void mimi_softmax_f32(float *x, int n);            /* in place, max-subtracted */
+void mimi_softmax_f32(float *x, int n);            /* in place, max-subtracted;
+                                                      NEON max/sum reductions,
+                                                      lane-wise expf */
+/* scalar per-element forms: tail/lane helpers + _ref building blocks ONLY —
+ * hot loops call the NEON sweep forms below, never these in a loop. */
 float mimi_gelu_erf_f32(float x);                  /* 0.5x(1+erf(x/sqrt(2))) — erff */
 float mimi_elu_f32(float x, float alpha);          /* x>0 ? x : alpha*(expf(x)-1) */
+/* NEON sweep forms (primary path for activations/elementwise): */
+void mimi_gelu_erf_vec_f32(const float *x, float *y, int n);
+void mimi_elu_vec_f32(const float *x, float *y, int n, float alpha);
+void mimi_add_vec_f32(const float *a, const float *b, float *y, int n);
+void mimi_scale_vec_f32(const float *x, const float *s, float *y, int n); /* y=x*s elementwise (LayerScale) */
 void mimi_layer_norm_f32(const float *x, const float *w, const float *b,
-                         float *y, int n, float eps);
+                         float *y, int n, float eps); /* NEON mean/var/apply */
 
 /* ---- unit entry points ---------------------------------------------------
  * Streaming convention (replaces StreamTensor): every step takes
