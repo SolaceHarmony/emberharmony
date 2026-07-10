@@ -103,9 +103,24 @@ streaming.rs (`StreamTensor` = Option<Tensor>) becomes explicit
 
 ## Status
 
-- [ ] first passes (6 agents, one file each) — IN FLIGHT
-- [ ] arbiter review vs Rust source, per file
-- [ ] build wiring (build.rs) + parity harness
+- [x] first passes (6 agents, one file each) — ALL LANDED
+- [x] arbiter review vs Rust source, per file: quant ✅ seanet ✅ decode ✅
+      transformer ✅ conv ✅ (kv parked — RotatingKvCache ruling, see unit 5
+      row). Whole-kernel link green (5 objects + Accelerate).
+      Arbiter catches recorded: layer_norm two-candles fork (unit 6 matched
+      the slow tensor-op path; the REAL path is ops.rs cpu_fwd — one-pass
+      sum/sum², naive var, recip(sqrt)) — rewritten; softmax final op is
+      per-element DIVISION (`*d /= sum_exp`), not reciprocal-multiply —
+      rewritten; **builds MUST use `-ffp-contract=off`** (clang default
+      contracts a*b+c into fma even in scalar _ref paths; rustc never does —
+      without this flag the parity siblings are not oracles). Checkpoint
+      stores PRE-FOLDED conv weights (0 weight_g/v) — fold path dormant,
+      arena tightens toward ~16 MiB zero-copy.
+      Prefix seam reconciled: seanet passes streamable-node prefixes, conv
+      appends `.conv.conv`/`.convtr.convtr` — both sides chose the same
+      convention independently.
+- [ ] build wiring (build.rs, with -ffp-contract=off) + parity harness
 - [ ] chain parity + thresholds recorded here
 - [ ] her wav-hash re-arm decision
-- [ ] engine integration (lane program)
+- [ ] engine integration (lane program; REQ kind at F4, fence map in
+      mimi_decode.cpp NOTES (f))

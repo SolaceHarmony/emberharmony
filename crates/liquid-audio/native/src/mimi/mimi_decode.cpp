@@ -362,15 +362,17 @@ extern "C" void mimi_softmax_f32(float *x, int n) {
         x[i] = e;
         sum += e;
     }
-    // pass 3: multiply by 1/sum  (sum > 0: the max element contributes >= 1)
-    const float32x4_t vinv = vdupq_n_f32(1.0f / sum);
+    // pass 3: DIVIDE by sum — candle's SoftmaxLastDim CPU kernel does
+    // `*d /= sum_exp` per element (ops.rs); reciprocal-multiply rounds
+    // differently (two roundings vs one). vdivq_f32 divides per lane with
+    // scalar-division rounding. (Arbiter fix: was *= 1/sum.)
+    const float32x4_t vsumq = vdupq_n_f32(sum);
     i = 0;
     for (; i + 4 <= n; i += 4) {
-        vst1q_f32(x + i, vmulq_f32(vld1q_f32(x + i), vinv));
+        vst1q_f32(x + i, vdivq_f32(vld1q_f32(x + i), vsumq));
     }
-    const float inv = 1.0f / sum;
     for (; i < n; ++i) {
-        x[i] *= inv;
+        x[i] /= sum;
     }
 #else
     float mx = x[0];
@@ -385,86 +387,88 @@ extern "C" void mimi_softmax_f32(float *x, int n) {
         x[i] = e;
         sum += e;
     }
-    float inv = 1.0f / sum;
     for (int i = 0; i < n; ++i) {
-        x[i] *= inv;
+        x[i] /= sum;
     }
 #endif
 }
 
-// -------- layer norm: two-pass mean/var, NEON mean/var/apply ------------------
+// -------- layer norm: ONE-pass sum/sum² (candle's CPU fast kernel) -----------
 extern "C" void mimi_layer_norm_f32(const float *x, const float *w,
                                     const float *b, float *y, int n, float eps) {
-    // candle_nn::LayerNorm forward, matched term-for-term:
-    //   mean = sum(x)/n
-    //   var  = sum((x-mean)^2)/n          (BIASED — divide by n, not n-1)
-    //   y    = (x-mean)/sqrt(var+eps) * w + b   (eps added to var BEFORE sqrt)
-    // `eps` is supplied by the consumer (unit 4 passes the transformer's LN
-    // eps). f32 accumulation. w/b may be NULL -> treated as 1 / 0 (affine off).
+    // candle_nn::ops::layer_norm CPU kernel (ops.rs LayerNorm::cpu_fwd) —
+    // the path that ACTUALLY runs (bias present + contiguous f32); the
+    // tensor-op fallback in layer_norm.rs is the slow path and rounds
+    // differently. Matched term-for-term (arbiter fix: was two-pass centered):
+    //   sum  = Σx ; sum2 = Σ x·x            (ONE pass, unfused mul-then-add)
+    //   mean = sum/n ; var = sum2/n − mean² (naive variance, biased)
+    //   inv_std = recip(sqrt(var + eps))
+    //   y = (x−mean)·inv_std·w + b          (unfused: mul, mul, separate add)
+    // NEON lane-blocking of the two sums is the declared faithful-tier
+    // freedom; per-element operations stay unfused (rustc never contracts —
+    // build with -ffp-contract=off so scalar tails/_ref match too).
+    // w/b may be NULL -> treated as 1 / 0 (affine off).
     if (n <= 0) {
         return;
     }
 #if defined(MIMI_HAVE_NEON) && !defined(MIMI_SCALAR_REF)
-    // pass 1: mean
+    // ONE pass: sum and sum-of-squares (unfused: vmul then vadd, no vmla —
+    // candle's `sum2 += v*v` rounds the product before accumulating).
     float32x4_t vs = vdupq_n_f32(0.0f);
+    float32x4_t vs2 = vdupq_n_f32(0.0f);
     int i = 0;
     for (; i + 4 <= n; i += 4) {
-        vs = vaddq_f32(vs, vld1q_f32(x + i));
+        float32x4_t v = vld1q_f32(x + i);
+        vs = vaddq_f32(vs, v);
+        vs2 = vaddq_f32(vs2, vmulq_f32(v, v));
     }
     float sum = vaddvq_f32(vs);
+    float sum2 = vaddvq_f32(vs2);
     for (; i < n; ++i) {
-        sum += x[i];
+        float v = x[i];
+        sum += v;
+        float vv = v * v;
+        sum2 += vv;
     }
     const float mean = sum / (float)n;
-    const float32x4_t vmean = vdupq_n_f32(mean);
-    // pass 2: variance
-    float32x4_t vv = vdupq_n_f32(0.0f);
-    i = 0;
-    for (; i + 4 <= n; i += 4) {
-        float32x4_t d = vsubq_f32(vld1q_f32(x + i), vmean);
-        vv = vmlaq_f32(vv, d, d);
-    }
-    float var = vaddvq_f32(vv);
-    for (; i < n; ++i) {
-        float d = x[i] - mean;
-        var += d * d;
-    }
-    var /= (float)n;
+    const float var = sum2 / (float)n - mean * mean;
     const float inv_std = 1.0f / sqrtf(var + eps);
+    const float32x4_t vmean = vdupq_n_f32(mean);
     const float32x4_t vinv = vdupq_n_f32(inv_std);
-    // pass 3: apply  y = (x-mean)*inv_std * w + b
+    // apply: y = ((x−mean)·inv_std)·w + b, unfused adds (vaddq, not vmlaq).
     i = 0;
     for (; i + 4 <= n; i += 4) {
         float32x4_t d = vsubq_f32(vld1q_f32(x + i), vmean);
         float32x4_t normed = vmulq_f32(d, vinv);
         float32x4_t vw = w ? vld1q_f32(w + i) : vdupq_n_f32(1.0f);
         float32x4_t vb = b ? vld1q_f32(b + i) : vdupq_n_f32(0.0f);
-        vst1q_f32(y + i, vmlaq_f32(vb, normed, vw));  // vb + normed*vw
+        vst1q_f32(y + i, vaddq_f32(vmulq_f32(normed, vw), vb));
     }
     for (; i < n; ++i) {
         float normed = (x[i] - mean) * inv_std;
         float wi = w ? w[i] : 1.0f;
         float bi = b ? b[i] : 0.0f;
-        y[i] = normed * wi + bi;
+        float t = normed * wi;
+        y[i] = t + bi;
     }
 #else
-    float mean = 0.0f;
+    float sum = 0.0f;
+    float sum2 = 0.0f;
     for (int i = 0; i < n; ++i) {
-        mean += x[i];
+        float v = x[i];
+        sum += v;
+        float vv = v * v;
+        sum2 += vv;
     }
-    mean /= (float)n;
-    float var = 0.0f;
-    for (int i = 0; i < n; ++i) {
-        float d = x[i] - mean;
-        var += d * d;
-    }
-    var /= (float)n;
+    float mean = sum / (float)n;
+    float var = sum2 / (float)n - mean * mean;
     float inv_std = 1.0f / sqrtf(var + eps);
     for (int i = 0; i < n; ++i) {
         float normed = (x[i] - mean) * inv_std;
         float wi = w ? w[i] : 1.0f;
         float bi = b ? b[i] : 0.0f;
-        y[i] = normed * wi + bi;
+        float t = normed * wi;
+        y[i] = t + bi;
     }
 #endif
 }
