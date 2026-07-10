@@ -1040,6 +1040,11 @@ impl DecoderLayer {
             )
         ))]
         {
+            // One lanes value for the attempt AND its parity fallback (the contract is
+            // "bit-identical at the same lanes") — sized from OUR team when it exists.
+            let lanes = crate::flashkern::native_engine::process_engine()
+                .map(|e| e.lanes_total().max(1))
+                .unwrap_or(lanes);
             let ran_native = crate::flashkern::native_engine::process_engine()
                 .map(|engine| engine.fused_mlp(xb, &weights, &mut out, lanes))
                 .unwrap_or(false);
@@ -1205,7 +1210,7 @@ impl DecoderLayer {
         let (kp, vp) = (kp as *mut u16, vp as *mut u16);
         let xb = unsafe { std::slice::from_raw_parts(xp, hdim) };
         let mut out = vec![0u16; hdim];
-        let lanes = rayon::current_num_threads().max(1);
+        let lanes = engine.lanes_total().max(1);
         let ok = engine.attn_layer(
             block_idx,
             xb,
@@ -1270,7 +1275,7 @@ impl DecoderLayer {
         };
         let mut out = vec![0u16; hdim];
         let mut state_out = vec![0u16; hdim * (k - 1)];
-        let lanes = rayon::current_num_threads().max(1);
+        let lanes = engine.lanes_total().max(1);
         if !engine.conv_layer(block_idx, xb, sb, &mut state_out, &mut out, lanes) {
             return Ok(None);
         }
@@ -1459,7 +1464,9 @@ impl Model {
         let (Some(cosp), Some(sinp)) = (PtrLen::bf16(&cache.cos), PtrLen::bf16(&cache.sin)) else {
             return Ok(false);
         };
-        let lanes = rayon::current_num_threads().max(1);
+        // Tile counts come from OUR team's width, not a foreign pool's. Both resolve
+        // to the P-core count today, so the pinned banding is unchanged.
+        let lanes = engine.lanes_total().max(1);
         let ok = engine.token_pass(
             ids,
             embed_kind,

@@ -82,7 +82,7 @@ its patch ledger (kcoro PATCHES.md 0001-0006) is the requirements spec for that
 replacement.
 
 Standing numbers (audible dual-path e2e, quiet M2 Max): CPU 24.3k-26.9k underrun
-samples across nine consecutive runs, last-latency 913-1034 ms, mean 1151-1354 ms —
+samples across thirteen consecutive runs, last-latency 913-1034 ms, mean 1151-1354 ms —
 ahead of the Metal clean baseline (25,856 / 1656 ms). Bit-exactness: REF
 `2f9c907a…` and PERF `45125c9e…` exact at every rung. Bandwidth ledger: ~66 GB/s
 effective of a ~250 GB/s CPU share (~3 GB weight reads/token ⇒ physics floor
