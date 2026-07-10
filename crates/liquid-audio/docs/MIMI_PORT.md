@@ -92,9 +92,14 @@ streaming.rs (`StreamTensor` = Option<Tensor>) becomes explicit
    left-context, KV ring wrap at 250).
 3. e2e: perf-chain wav vs current PERF hash — expected to move; the audible
    dual-path e2e + her ear bless the re-arm.
-4. Integration (after parity): the frame program rides the engine lane team
-   (REQ_CALL first, own REQ kind if the fence map wants it) — Mimi decode
-   joins the same doorbell discipline as the depthformer.
+4. Integration (after parity — her directive, structural not optional): the
+   Mimi kernel runs INSIDE the same kcoro engine as the backbone/depthformer
+   (flashkern_engine.cpp) — same persistent lane team, same doorbell, its own
+   REQ kind at the pass boundary. Because it is a native C++ program (no Rust
+   frames cross the fences), its lane fences PARK precisely after the bounded
+   spin per the two-barrier doctrine — the depthformer's pure-spin barrier
+   compromise does not apply here. Unit inner loops are written
+   band-splittable so lane-cutting is a schedule change, not a math change.
 
 ## Status
 

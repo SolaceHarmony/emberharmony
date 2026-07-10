@@ -23,6 +23,24 @@
 //     polynomial vector exp/erf changes numerics; it enters later, behind the
 //     parity gate, as a fast-tier variant).
 //   - No exceptions across this ABI. No candle. Return codes, not throws.
+//   - ENGINE PLACEMENT (her directive): this kernel runs INSIDE the same kcoro
+//     engine as the backbone/depthformer (flashkern_engine.cpp) — same
+//     persistent lane team, same doorbell, a REQ kind at the pass boundary.
+//     Because this is a native C++ program (no Rust frames), its lane fences
+//     PARK precisely after the bounded spin (two-barrier doctrine) — unlike
+//     the Rust depthformer program, which must spin pure. First-pass unit
+//     APIs are single-call; write inner loops BAND-SPLITTABLE (channel/row
+//     bands with no incidental cross-band sequential dependence) so the
+//     arbiter integration step can cut them across lanes without re-deriving
+//     the math.
+//
+// House NEON idiom (arm_neon.h, hers verbatim — chunks of a full register,
+// tail handled scalar after):
+//   for (int i = 0; i + 4 <= n; i += 4) {
+//       float32x4_t va = vld1q_f32(&a[i]);
+//       float32x4_t vb = vld1q_f32(&b[i]);
+//       vst1q_f32(&r[i], vaddq_f32(va, vb));
+//   }
 #ifndef MIMI_KERNEL_H
 #define MIMI_KERNEL_H
 
