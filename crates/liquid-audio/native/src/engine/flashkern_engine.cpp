@@ -544,8 +544,14 @@ static void run_tile(uint32_t kind, uint32_t idx, const Stage *st, Engine *e) {
         break;
     }
     case ST_LOGITS: {
-        // linear_logits ladder: M==1 GEMV rows (f32 accum) → bf16 storage round →
-        // exact widen to the f32 logits plane. Input = the final normed hidden bits.
+        // linear_logits ladder EXACTLY: M==1 GEMV rows, f32 accumulate, RAW f32
+        // out. The pinned Rust head (linear_logits -> Bf16GemmNt) emits the
+        // kernel's f32 directly — the bf16 storage round this stage used to add
+        // was an EXTRA round the reference never performs, and it is what
+        // flipped the perf-chain hash when the head was first absorbed. Same
+        // kernel, same per-row K-reduction (row banding cannot reorder a row's
+        // accumulation), no round: bit-identical to the candle-head path — the
+        // PERF oracle is the proof.
         Engine *ee = e;
         const TokenReq *t = &ee->tok;
         size_t r0 = (size_t)idx * st->chunk;
@@ -555,7 +561,7 @@ static void run_tile(uint32_t kind, uint32_t idx, const Stage *st, Engine *e) {
         lfm_bf16_gemm_nt_f32(t->out_hidden, ee->embed_w + r0 * ee->dim_h, acc, 1,
                              (int)(r1 - r0), (int)ee->dim_h);
         for (size_t r = r0; r < r1; ++r) {
-            t->out_logits[r] = bf16_f32(rb_bits(ee->tk_logf[r]));
+            t->out_logits[r] = ee->tk_logf[r];
         }
         break;
     }

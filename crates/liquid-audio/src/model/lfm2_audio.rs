@@ -1587,11 +1587,13 @@ impl LFM2AudioModel {
                 break;
             }
             modality_left -= 1;
-            // Logits stay on the candle head for now: at rank-1 h_last, linear_logits
-            // takes the BFMMLA GEMM whose reduction order the engine's NT-row logits
-            // stage does NOT replicate — absorbing it flipped the perf-chain hash.
-            // The walk is the win; the head is one GEMV per text token.
-            let want_logits = false;
+            // Text logits ride the engine (kcoro audit finding): ST_LOGITS runs
+            // the SAME lfm_bf16_gemm_nt_f32 as linear_logits and now emits raw
+            // f32 — the extra bf16 round that flipped the perf hash is gone, so
+            // the native head is bit-identical to the candle head (PERF oracle
+            // = the proof). Audio steps skip the head (the depthformer wants
+            // hidden, not logits).
+            let want_logits = matches!(current, LFMModality::Text);
             let stepped = match pending.as_ref() {
                 Some((ids, kind)) => {
                     self.native_token_step(cache, index_pos, ids, *kind, want_logits)?

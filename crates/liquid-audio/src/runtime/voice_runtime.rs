@@ -1079,7 +1079,16 @@ fn spawn_consumer<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
                         // Drain a chunk from the ring (non-blocking pop)
                         let chunk = thread_ring.drain_all();
                         if chunk.is_empty() {
-                            std::thread::sleep(std::time::Duration::from_millis(5));
+                            // Zero-spin (the kcoro doctrine at the OUTER layer):
+                            // park on the ring's wake channel — push_slice()
+                            // notifies on every producer write, and the flush
+                            // flag is only ever set immediately before a push,
+                            // so both events wake us. The 100 ms heartbeat
+                            // exists solely so teardown's stop flag is seen
+                            // promptly; idle cost drops from 200 polls/s to 10
+                            // heartbeats/s with instant wake on real work.
+                            let _ = thread_ring
+                                .wait_for_input(std::time::Duration::from_millis(100));
                             continue;
                         }
                         if let Err(e) = output.write_mono_f32(&chunk) {

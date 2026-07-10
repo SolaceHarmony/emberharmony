@@ -478,14 +478,31 @@ kc_sched_t* kc_sched_init(const kc_sched_opts_t *opts){
     /* Workers */
     s->w=(sched_worker_t*)calloc((size_t)n,sizeof(sched_worker_t));
     if(!s->w){ free(s); return NULL; }
+    /* Patch 0007a: the inject queue must exist BEFORE any worker runs — a
+     * worker that reached inject_pop first locked a zero-initialized mutex
+     * (UB) over a NULL buffer. Init-order, not luck. */
+    if(inject_init(s,0)!=0){ free(s->w); free(s); return NULL; }
     atomic_store(&s->alive, 0);
     for(int i=0;i<n;i++){
         sched_worker_t *w=&s->w[i];
         w->id=i; w->sched=s; atomic_store(&w->last_task,NULL);
-        if(deque_init(&w->dq,256)!=0){}
-        if(pthread_create(&w->thr,NULL,worker_main,w)!=0){}
+        /* Patch 0007b: a swallowed thread/deque failure leaves a PARTIAL team;
+         * every fence sized for n lanes then waits forever on lanes that never
+         * existed. Fail construction loudly instead — the callers treat a NULL
+         * scheduler as a hard error (the engine panics: substrate, no
+         * fallback). */
+        if(deque_init(&w->dq,256)!=0){
+            s->workers=i;
+            kc_sched_shutdown(s);
+            return NULL;
+        }
+        if(pthread_create(&w->thr,NULL,worker_main,w)!=0){
+            deque_destroy(&w->dq);
+            s->workers=i;
+            kc_sched_shutdown(s);
+            return NULL;
+        }
     }
-    if(inject_init(s,0)!=0){}
     return s;
 }
 

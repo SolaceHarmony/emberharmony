@@ -8,6 +8,17 @@ Built by this crate's `build.rs` with the upstream Makefile's flags
 (`crates/liquid-audio/native/src/engine/flashkern_engine.cpp`)
 are the consumers.
 
+## Patch 0007 — scheduler construction integrity (init order + loud partial-team failure)
+
+Found by a read-only concurrency audit (2026-07-10); fixed upstream (kcoro
+9ac4272) and mirrored here byte-identically. 0007a: the inject queue is
+initialized BEFORE workers spawn (a worker reaching inject_pop early locked a
+zero-initialized mutex — UB — over a NULL buffer). 0007b: deque_init /
+pthread_create failures were checked into empty braces — a partial team makes
+every n-lane fence wait forever; construction now tears down and returns
+NULL, which lfm_engine_new turns into the engine's hard init failure
+(substrate, no fallback).
+
 ## Patch 0001 — park/unpark lost-wakeup race (candidate for upstream)
 
 **Symptom.** Rendezvous-channel producer/consumer deadlocks: both sides parked forever.
