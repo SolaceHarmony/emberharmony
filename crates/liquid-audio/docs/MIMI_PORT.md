@@ -4,8 +4,8 @@ The mission clause this executes: the voice pipeline decode path ports to
 kcoro/NEON/C++ as a tight kernel. After the backbone (REQ_TOKEN_PASS) and the
 depthformer (REQ_CALL), **Mimi is the largest candle compute left per frame**:
 every 80 ms audio frame runs a full candle graph (moshi crate) → PCM. This
-manifest scopes the port; the first pass is swarmed one-file-per-agent
-(Opus 4.8), arbitered locally, then parity-gated.
+manifest scopes the port; the first pass is swarmed one-file-per-agent,
+arbitered locally, then parity-gated.
 
 ## Source of truth
 
@@ -119,6 +119,31 @@ streaming.rs (`StreamTensor` = Option<Tensor>) becomes explicit
       Prefix seam reconciled: seanet passes streamable-node prefixes, conv
       appends `.conv.conv`/`.convtr.convtr` — both sides chose the same
       convention independently.
+- [x] Shadow-review disposition (independent review she commissioned;
+      findings verified against candle source, never taken on faith):
+      score-alias + layernorm
+      findings already fixed before the review landed; its two NEW catches
+      confirmed against candle source and fixed: (1) gelu_erf — candle calls
+      the RUST-libm erff (erf_f32 == libm::erff, whose erfc2 uses libm's own
+      expf), and associates ((erf+1)·0.5)·v — Rust-libm erff/expf/scalbnf now
+      ported VERBATIM (SunPro float ports, selftest vs reference values green
+      across all branches) and the association fixed in scalar + NEON sweeps;
+      (2) softmax — candle exps the WHOLE row then reduces separately with
+      vec_sum's exact NEON blocking (STEP=16, four q-accumulators, tree
+      reduce, scalar leftovers appended) — restructured to match bit-exactly.
+      Also: elu selects on is_sign_positive (sign-bit, not x>0) — matched.
+      Declared remaining ulp sources (thresholds ledger): AMX cblas GEMMs vs
+      candle's gemm crate blocking; layernorm's NEON lane-blocked sums vs
+      candle's strictly-sequential scalar sums (kept NEON per the
+      assembly-at-every-step rule); NEON max reduction (exact-equal for
+      non-NaN rows). Everything else in the transformer chain is bit-matched
+      by construction.
+      Review perf finding, deferred POST-parity: the widest seanet layers
+      (model.0 conv k7, model.2 convtr) receive only n=2 time samples, so
+      time-axis NEON runs entirely in the scalar tail there — fix is
+      channel-axis vectorization or the per-kk AMX GEMM formulation already
+      sketched in mimi_conv.cpp NOTES; the deep layers (16..1920 samples) are
+      properly vectorized today.
 - [ ] build wiring (build.rs, with -ffp-contract=off) + parity harness
 - [ ] chain parity + thresholds recorded here
 - [ ] her wav-hash re-arm decision

@@ -209,15 +209,201 @@ extern "C" void mimi_gemm_f32(const float *a, const float *b, float *c, int m,
 
 // -------- scalar per-element helpers (tail/lane + _ref building blocks) -------
 
+/* ---- Rust-libm verbatim ports (bit-parity with candle) ----------------------
+ * candle's gelu_erf (candle-core op.rs GeluErf::f32) calls
+ * crate::cpu::erf::erf_f32 == libm::erff — the RUST libm crate (FreeBSD msun
+ * s_erff.c float port), NOT the system libm. Apple's erff is a different
+ * polynomial; using it is a systematic ulp bias at every activation. erff's
+ * erfc2 branch internally calls libm::expf (e_expf.c) — ported too, with its
+ * scalbnf. Verbatim structure and constants; do not "improve".
+ *
+ * ====================================================
+ * Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved.
+ * Developed at SunPro, a Sun Microsystems, Inc. business.
+ * Permission to use, copy, modify, and distribute this
+ * software is freely granted, provided that this notice
+ * is preserved.
+ * ==================================================== */
+static inline float rl_scalbnf(float x, int n) {
+    /* musl scalbnf semantics (libm generic/scalbn.rs reduces to this for f32) */
+    if (n > 127) {
+        x *= 0x1p127f;
+        n -= 127;
+        if (n > 127) {
+            x *= 0x1p127f;
+            n -= 127;
+            if (n > 127) n = 127;
+        }
+    } else if (n < -126) {
+        x *= 0x1p-126f * 0x1p24f;
+        n += 126 - 24;
+        if (n < -126) {
+            x *= 0x1p-126f * 0x1p24f;
+            n += 126 - 24;
+            if (n < -126) n = -126;
+        }
+    }
+    union { float f; uint32_t i; } u;
+    u.i = (uint32_t)(0x7f + n) << 23;
+    return x * u.f;
+}
+
+static float rl_expf(float x) {
+    /* libm 0.2.16 expf (FreeBSD e_expf.c) */
+    static const float half_arr[2] = {0.5f, -0.5f};
+    const float ln2_hi = 6.9314575195e-01f;  /* 0x3f317200 */
+    const float ln2_lo = 1.4286067653e-06f;  /* 0x35bfbe8e */
+    const float inv_ln2 = 1.4426950216e+00f; /* 0x3fb8aa3b */
+    const float p1 = 1.6666625440e-1f;
+    const float p2 = -2.7667332906e-3f;
+
+    union { float f; uint32_t i; } ux;
+    ux.f = x;
+    uint32_t hx = ux.i;
+    int sign = (int)(hx >> 31);
+    hx &= 0x7fffffff;
+
+    if (hx >= 0x42aeac50) { /* |x| >= -87.33655f or NaN */
+        if (hx > 0x7f800000) return x; /* NaN */
+        if (hx >= 0x42b17218 && !sign) { /* x >= 88.722839f: overflow */
+            return x * 0x1p127f;
+        }
+        if (sign && hx >= 0x42cff1b5) { /* x <= -103.972084f: underflow to 0 */
+            return 0.0f;
+        }
+    }
+
+    int k;
+    float hi, lo;
+    if (hx > 0x3eb17218) { /* |x| > 0.5 ln2 */
+        if (hx > 0x3f851592) { /* |x| > 1.5 ln2 */
+            k = (int)(inv_ln2 * x + half_arr[sign]);
+        } else {
+            k = 1 - sign - sign;
+        }
+        float kf = (float)k;
+        hi = x - kf * ln2_hi; /* k*ln2hi is exact here */
+        lo = kf * ln2_lo;
+        x = hi - lo;
+    } else if (hx > 0x39000000) { /* |x| > 2**-14 */
+        k = 0;
+        hi = x;
+        lo = 0.0f;
+    } else {
+        return 1.0f + x;
+    }
+
+    float xx = x * x;
+    float c = x - xx * (p1 + xx * p2);
+    float y = 1.0f + (x * c / (2.0f - c) - lo + hi);
+    return (k == 0) ? y : rl_scalbnf(y, k);
+}
+
+/* erff coefficients (s_erff.c) */
+static const float RL_ERX = 8.4506291151e-01f;
+static const float RL_EFX8 = 1.0270333290e+00f;
+static const float RL_PP0 = 1.2837916613e-01f, RL_PP1 = -3.2504209876e-01f,
+                   RL_PP2 = -2.8481749818e-02f, RL_PP3 = -5.7702702470e-03f,
+                   RL_PP4 = -2.3763017452e-05f;
+static const float RL_QQ1 = 3.9791721106e-01f, RL_QQ2 = 6.5022252500e-02f,
+                   RL_QQ3 = 5.0813062117e-03f, RL_QQ4 = 1.3249473704e-04f,
+                   RL_QQ5 = -3.9602282413e-06f;
+static const float RL_PA0 = -2.3621185683e-03f, RL_PA1 = 4.1485610604e-01f,
+                   RL_PA2 = -3.7220788002e-01f, RL_PA3 = 3.1834661961e-01f,
+                   RL_PA4 = -1.1089469492e-01f, RL_PA5 = 3.5478305072e-02f,
+                   RL_PA6 = -2.1663755178e-03f;
+static const float RL_QA1 = 1.0642088205e-01f, RL_QA2 = 5.4039794207e-01f,
+                   RL_QA3 = 7.1828655899e-02f, RL_QA4 = 1.2617121637e-01f,
+                   RL_QA5 = 1.3637083583e-02f, RL_QA6 = 1.1984500103e-02f;
+static const float RL_RA0 = -9.8649440333e-03f, RL_RA1 = -6.9385856390e-01f,
+                   RL_RA2 = -1.0558626175e+01f, RL_RA3 = -6.2375331879e+01f,
+                   RL_RA4 = -1.6239666748e+02f, RL_RA5 = -1.8460508728e+02f,
+                   RL_RA6 = -8.1287437439e+01f, RL_RA7 = -9.8143291473e+00f;
+static const float RL_SA1 = 1.9651271820e+01f, RL_SA2 = 1.3765776062e+02f,
+                   RL_SA3 = 4.3456588745e+02f, RL_SA4 = 6.4538726807e+02f,
+                   RL_SA5 = 4.2900814819e+02f, RL_SA6 = 1.0863500214e+02f,
+                   RL_SA7 = 6.5702495575e+00f, RL_SA8 = -6.0424413532e-02f;
+static const float RL_RB0 = -9.8649431020e-03f, RL_RB1 = -7.9928326607e-01f,
+                   RL_RB2 = -1.7757955551e+01f, RL_RB3 = -1.6063638306e+02f,
+                   RL_RB4 = -6.3756646729e+02f, RL_RB5 = -1.0250950928e+03f,
+                   RL_RB6 = -4.8351919556e+02f;
+static const float RL_SB1 = 3.0338060379e+01f, RL_SB2 = 3.2579251099e+02f,
+                   RL_SB3 = 1.5367296143e+03f, RL_SB4 = 3.1998581543e+03f,
+                   RL_SB5 = 2.5530502930e+03f, RL_SB6 = 4.7452853394e+02f,
+                   RL_SB7 = -2.2440952301e+01f;
+
+static float rl_erfc1(float x) {
+    float s = fabsf(x) - 1.0f;
+    float p = RL_PA0 + s * (RL_PA1 + s * (RL_PA2 + s * (RL_PA3 + s * (RL_PA4 + s * (RL_PA5 + s * RL_PA6)))));
+    float q = 1.0f + s * (RL_QA1 + s * (RL_QA2 + s * (RL_QA3 + s * (RL_QA4 + s * (RL_QA5 + s * RL_QA6)))));
+    return 1.0f - RL_ERX - p / q;
+}
+
+static float rl_erfc2(uint32_t ix, float x) {
+    if (ix < 0x3fa00000) { /* |x| < 1.25 */
+        return rl_erfc1(x);
+    }
+    x = fabsf(x);
+    float s = 1.0f / (x * x);
+    float r, big_s;
+    if (ix < 0x4036db6d) { /* |x| < 1/0.35 */
+        r = RL_RA0 + s * (RL_RA1 + s * (RL_RA2 + s * (RL_RA3 + s * (RL_RA4 + s * (RL_RA5 + s * (RL_RA6 + s * RL_RA7))))));
+        big_s = 1.0f + s * (RL_SA1 + s * (RL_SA2 + s * (RL_SA3 + s * (RL_SA4 + s * (RL_SA5 + s * (RL_SA6 + s * (RL_SA7 + s * RL_SA8)))))));
+    } else { /* |x| >= 1/0.35 */
+        r = RL_RB0 + s * (RL_RB1 + s * (RL_RB2 + s * (RL_RB3 + s * (RL_RB4 + s * (RL_RB5 + s * RL_RB6)))));
+        big_s = 1.0f + s * (RL_SB1 + s * (RL_SB2 + s * (RL_SB3 + s * (RL_SB4 + s * (RL_SB5 + s * (RL_SB6 + s * RL_SB7))))));
+    }
+    union { float f; uint32_t i; } ux;
+    ux.f = x;
+    union { float f; uint32_t i; } uz;
+    uz.i = ux.i & 0xffffe000;
+    float z = uz.f;
+    return rl_expf(-z * z - 0.5625f) * rl_expf((z - x) * (z + x) + r / big_s) / x;
+}
+
+static float rl_erff(float x) {
+    union { float f; uint32_t i; } ux;
+    ux.f = x;
+    uint32_t ix = ux.i;
+    int sign = (int)(ix >> 31);
+    ix &= 0x7fffffff;
+    if (ix >= 0x7f800000) { /* erf(nan)=nan, erf(+-inf)=+-1 */
+        return 1.0f - 2.0f * (float)sign + 1.0f / x;
+    }
+    if (ix < 0x3f580000) { /* |x| < 0.84375 */
+        if (ix < 0x31800000) { /* |x| < 2**-28 */
+            return 0.125f * (8.0f * x + RL_EFX8 * x);
+        }
+        float z = x * x;
+        float r = RL_PP0 + z * (RL_PP1 + z * (RL_PP2 + z * (RL_PP3 + z * RL_PP4)));
+        float s = 1.0f + z * (RL_QQ1 + z * (RL_QQ2 + z * (RL_QQ3 + z * (RL_QQ4 + z * RL_QQ5))));
+        float y = r / s;
+        return x + x * y;
+    }
+    float y;
+    if (ix < 0x40c00000) { /* |x| < 6 */
+        y = 1.0f - rl_erfc2(ix, x);
+    } else {
+        const float x1p_120 = 0x1p-120f;
+        y = 1.0f - x1p_120;
+    }
+    return sign ? -y : y;
+}
+
 extern "C" float mimi_gelu_erf_f32(float x) {
-    // 0.5 * x * (1 + erf(x / sqrt(2))); candle's `gelu_erf`. 1/sqrt(2) constant.
-    const float inv_sqrt2 = 0.70710678118654752440f;
-    return 0.5f * x * (1.0f + erff(x * inv_sqrt2));
+    // candle GeluErf::f32 EXACTLY (op.rs):
+    //   (erf_f32(v * FRAC_1_SQRT_2) + 1.) * 0.5 * v
+    // Left-associated ((erf+1)*0.5)*v — NOT 0.5*x*(1+erf), which rounds
+    // differently. erf_f32 == Rust libm erff (ported above), not Apple erff.
+    const float frac_1_sqrt_2 = 0.70710678118654752440f; /* rounds to 0x3f3504f3 */
+    return (rl_erff(x * frac_1_sqrt_2) + 1.0f) * 0.5f * x;
 }
 
 extern "C" float mimi_elu_f32(float x, float alpha) {
-    // candle Elu(alpha): x > 0 ? x : alpha * (exp(x) - 1).
-    return x > 0.0f ? x : alpha * (expf(x) - 1.0f);
+    // candle cpu_backend elu EXACTLY: is_sign_positive() selects (true for
+    // +0.0, false for -0.0 — not `x > 0`), else (exp(x) - 1) * alpha.
+    // v.exp() is Rust std = the system expf — NOT rl_expf.
+    return !std::signbit(x) ? x : (expf(x) - 1.0f) * alpha;
 }
 
 // -------- gelu sweep: y[i] = gelu_erf(x[i]) -----------------------------------
@@ -234,13 +420,13 @@ extern "C" void mimi_gelu_erf_vec_f32(const float *x, float *y, int n) {
         float32x4_t arg = vmulq_f32(vx, inv_sqrt2);
         float lanes[4];
         vst1q_f32(lanes, arg);
-        lanes[0] = erff(lanes[0]);
-        lanes[1] = erff(lanes[1]);
-        lanes[2] = erff(lanes[2]);
-        lanes[3] = erff(lanes[3]);
+        lanes[0] = rl_erff(lanes[0]);
+        lanes[1] = rl_erff(lanes[1]);
+        lanes[2] = rl_erff(lanes[2]);
+        lanes[3] = rl_erff(lanes[3]);
         float32x4_t e = vld1q_f32(lanes);
-        // 0.5 * x * (1 + e)
-        float32x4_t res = vmulq_f32(vmulq_f32(half, vx), vaddq_f32(one, e));
+        // candle order: ((e + 1) * 0.5) * x — same association as the scalar.
+        float32x4_t res = vmulq_f32(vmulq_f32(vaddq_f32(e, one), half), vx);
         vst1q_f32(y + i, res);
     }
     for (; i < n; ++i) {
@@ -258,7 +444,6 @@ extern "C" void mimi_gelu_erf_vec_f32(const float *x, float *y, int n) {
 extern "C" void mimi_elu_vec_f32(const float *x, float *y, int n, float alpha) {
 #if defined(MIMI_HAVE_NEON) && !defined(MIMI_SCALAR_REF)
     const float32x4_t one = vdupq_n_f32(1.0f);
-    const float32x4_t zero = vdupq_n_f32(0.0f);
     int i = 0;
     for (; i + 4 <= n; i += 4) {
         float32x4_t vx = vld1q_f32(x + i);
@@ -269,10 +454,13 @@ extern "C" void mimi_elu_vec_f32(const float *x, float *y, int n, float alpha) {
         lanes[2] = expf(lanes[2]);
         lanes[3] = expf(lanes[3]);
         float32x4_t ve = vld1q_f32(lanes);
-        // alpha * (exp(x) - 1)  for the negative branch
+        // candle: (exp(x) - 1) * alpha for the sign-negative branch, selected
+        // by is_sign_positive() — a SIGN-BIT test, not x > 0 (+0.0 takes the
+        // identity branch, -0.0 the exp branch).
         float32x4_t neg = vmulq_n_f32(vsubq_f32(ve, one), alpha);
-        uint32x4_t gt = vcgtq_f32(vx, zero);  // x > 0 mask
-        float32x4_t res = vbslq_f32(gt, vx, neg);
+        uint32x4_t signbits =
+            vtstq_u32(vreinterpretq_u32_f32(vx), vdupq_n_u32(0x80000000u));
+        float32x4_t res = vbslq_f32(signbits, neg, vx);
         vst1q_f32(y + i, res);
     }
     for (; i < n; ++i) {
@@ -340,9 +528,11 @@ extern "C" void mimi_softmax_f32(float *x, int n) {
             mx = x[i];
         }
     }
-    // pass 2: e = expf(x - mx) (lane-wise), store, accumulate sum (NEON)
+    // pass 2: e = expf(x - mx), store ALL first (candle exps the whole row,
+    // THEN reduces — the sum is a separate pass over dst, not fused).
+    // expf = system libm: candle's `.exp()` is Rust std, which lowers to the
+    // platform expf on aarch64-darwin — unlike erf, which is Rust-libm.
     const float32x4_t vmx = vdupq_n_f32(mx);
-    float32x4_t vsum = vdupq_n_f32(0.0f);
     i = 0;
     for (; i + 4 <= n; i += 4) {
         float32x4_t d = vsubq_f32(vld1q_f32(x + i), vmx);
@@ -352,15 +542,33 @@ extern "C" void mimi_softmax_f32(float *x, int n) {
         lanes[1] = expf(lanes[1]);
         lanes[2] = expf(lanes[2]);
         lanes[3] = expf(lanes[3]);
-        float32x4_t ve = vld1q_f32(lanes);
-        vst1q_f32(x + i, ve);
-        vsum = vaddq_f32(vsum, ve);
+        vst1q_f32(x + i, vld1q_f32(lanes));
     }
-    float sum = vaddvq_f32(vsum);
     for (; i < n; ++i) {
-        float e = expf(x[i] - mx);
-        x[i] = e;
-        sum += e;
+        x[i] = expf(x[i] - mx);
+    }
+    // pass 2b: sum with candle's EXACT vec_sum blocking (cpu/mod.rs vec_sum +
+    // neon.rs CurrentCpu: STEP=16, four q-register accumulators, tree reduce
+    // x0+=x1 / x2+=x3 / x0+=x2, vaddvq, then SCALAR leftovers appended after).
+    // A single-accumulator sum rounds differently — this is the bit-matched
+    // reduction for the softmax row.
+    const int np = n & ~15;
+    float32x4_t acc0 = vdupq_n_f32(0.0f);
+    float32x4_t acc1 = vdupq_n_f32(0.0f);
+    float32x4_t acc2 = vdupq_n_f32(0.0f);
+    float32x4_t acc3 = vdupq_n_f32(0.0f);
+    for (i = 0; i + 16 <= n; i += 16) {
+        acc0 = vaddq_f32(acc0, vld1q_f32(x + i));
+        acc1 = vaddq_f32(acc1, vld1q_f32(x + i + 4));
+        acc2 = vaddq_f32(acc2, vld1q_f32(x + i + 8));
+        acc3 = vaddq_f32(acc3, vld1q_f32(x + i + 12));
+    }
+    acc0 = vaddq_f32(acc0, acc1);
+    acc2 = vaddq_f32(acc2, acc3);
+    acc0 = vaddq_f32(acc0, acc2);
+    float sum = vaddvq_f32(acc0);
+    for (i = np; i < n; ++i) {
+        sum += x[i];
     }
     // pass 3: DIVIDE by sum — candle's SoftmaxLastDim CPU kernel does
     // `*d /= sum_exp` per element (ops.rs); reciprocal-multiply rounds
