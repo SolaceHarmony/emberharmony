@@ -5,15 +5,6 @@
 //! internally: write the request slot, `kcoro_unpark` the parked coordinator (the
 //! doorbell), park on a condvar until the pass boundary. No Rust between stages.
 
-#![cfg(all(
-    has_kcoro,
-    has_native_engine,
-    any(
-        all(target_arch = "aarch64", has_flashkern_neon),
-        all(target_arch = "x86_64", has_flashkern_x86)
-    )
-))]
-
 use std::ffi::c_void;
 use std::sync::Mutex;
 
@@ -502,9 +493,7 @@ pub struct BackboneCtxGuard {
 
 impl Drop for BackboneCtxGuard {
     fn drop(&mut self) {
-        if let Some(engine) = process_engine() {
-            engine.ctx_clear(self.id);
-        }
+        process_engine().ctx_clear(self.id);
     }
 }
 
@@ -519,8 +508,7 @@ pub fn install_backbone_ctx(
     max_ctx: usize,
     held: Vec<candle_core::Tensor>,
 ) -> Option<BackboneCtxGuard> {
-    let engine = process_engine()?;
-    engine
+    process_engine()
         .ctx_build(descs, h, ffn, max_ctx)
         .map(|id| BackboneCtxGuard { id, _held: held })
 }
@@ -543,15 +531,22 @@ impl Drop for NativeEngine {
 /// P-cores only on Apple Silicon via `hw.perflevel0.physicalcpu`) — NOT
 /// `available_parallelism`, which counts E-cores and reintroduces the tail-latency
 /// imbalance the runtime documents as harmful.
-pub fn process_engine() -> Option<&'static NativeEngine> {
+/// INFALLIBLE (her substrate rule): the kcoro engine is part of the whole
+/// thing, not an optional acceleration. If the team can't stand up, the
+/// process is broken — panic with the reason instead of handing callers an
+/// Option whose `None` arm ships a decode path that shouldn't exist.
+pub fn process_engine() -> &'static NativeEngine {
     use std::sync::OnceLock;
-    static ENGINE: OnceLock<Option<NativeEngine>> = OnceLock::new();
-    ENGINE
-        .get_or_init(|| {
-            let workers = crate::threads::intraop_default_num_threads().clamp(1, 16);
-            NativeEngine::new(workers)
+    static ENGINE: OnceLock<NativeEngine> = OnceLock::new();
+    ENGINE.get_or_init(|| {
+        let workers = crate::threads::intraop_default_num_threads().clamp(1, 16);
+        NativeEngine::new(workers).unwrap_or_else(|| {
+            panic!(
+                "kcoro native engine failed to initialize ({workers} lanes) — \
+                 the engine is the decode substrate; there is no fallback path"
+            )
         })
-        .as_ref()
+    })
 }
 
 #[cfg(test)]

@@ -104,15 +104,10 @@ pub(crate) fn rb_bits(f: f32) -> u16 {
 // SAFETY: caller guarantees a=[K], w=n·K rows at `w`, c=n f32 at `c`, availability checked.
 #[allow(unused_variables)]
 pub(crate) unsafe fn nt_rows(a: *const u16, w: *const u16, c: *mut f32, n: usize, k: usize) {
-    #[cfg(all(target_arch = "aarch64", has_flashkern_neon))]
+    #[cfg(target_arch = "aarch64")]
     super::neon::bf16_gemm_nt_raw(a, w, c, n, k);
-    #[cfg(all(target_arch = "x86_64", has_flashkern_x86))]
+    #[cfg(target_arch = "x86_64")]
     super::x86::bf16_gemm_nt_raw(a, w, c, n, k);
-    #[cfg(not(any(
-        all(target_arch = "aarch64", has_flashkern_neon),
-        all(target_arch = "x86_64", has_flashkern_x86)
-    )))]
-    unreachable!("fused decode called without a flashkern kernel — gate on fused_mlp_available()");
 }
 
 /// The LFM2 FFN residual block's weights, zero-copy bf16 bit slices in checkpoint layout:
@@ -396,10 +391,6 @@ mod tests {
 // value-equivalent at the same tier as the fused MLP block.
 // ======================================================================================
 
-#[cfg(any(
-    all(target_arch = "aarch64", has_flashkern_neon),
-    all(target_arch = "x86_64", has_flashkern_x86)
-))]
 extern "C" {
     fn lfm_bf16_sumsq_f32(x: *const u16, n: i32) -> f32;
     fn lfm_bf16_sumsq_seq_f32(x: *const u16, n: i32) -> f32;
@@ -542,10 +533,6 @@ pub struct DepthDecode {
 // borrow flag, per review). Dereferencing the PtrLen views remains the documented contract:
 // the owning model outlives the ctx and candle storages are Arc-heap.
 
-#[cfg(any(
-    all(target_arch = "aarch64", has_flashkern_neon),
-    all(target_arch = "x86_64", has_flashkern_x86)
-))]
 impl DepthDecode {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -612,39 +599,6 @@ impl DepthDecode {
     /// `sample` is called once per codebook with the rounded bf16 logits bits and must
     /// return the chosen token (the caller wraps its seeded Sampler — same RNG stream as
     /// the candle path). ONE dispatch; lanes walk steps/layers with spin barriers.
-    ///
-    /// Non-engine builds never construct a `DepthDecode` (`build_depth_flash` is
-    /// engine-gated), so this stub is a broken invariant, not a slow path.
-    #[cfg(not(all(
-        has_kcoro,
-        has_native_engine,
-        any(
-            all(target_arch = "aarch64", has_flashkern_neon),
-            all(target_arch = "x86_64", has_flashkern_x86)
-        )
-    )))]
-    pub fn frame(
-        &self,
-        _emb_bits: &[u16],
-        _sample: impl FnMut(&[u16]) -> u32 + Send,
-    ) -> Vec<u32> {
-        unreachable!(
-            "depth-flash without the native engine build — build_depth_flash must return None here"
-        )
-    }
-
-    /// One audio frame: backbone hidden (bf16 bits, `[backbone_dim]`) → `codebooks` tokens.
-    /// `sample` is called once per codebook with the rounded bf16 logits bits and must
-    /// return the chosen token (the caller wraps its seeded Sampler — same RNG stream as
-    /// the candle path). ONE dispatch; lanes walk steps/layers with spin barriers.
-    #[cfg(all(
-        has_kcoro,
-        has_native_engine,
-        any(
-            all(target_arch = "aarch64", has_flashkern_neon),
-            all(target_arch = "x86_64", has_flashkern_x86)
-        )
-    ))]
     pub fn frame(
         &self,
         emb_bits: &[u16],
@@ -673,8 +627,7 @@ impl DepthDecode {
         // Lane count comes from OUR team, nothing else — depth-flash exists only on
         // the engine (construction is engine-gated in build_depth_flash); a foreign
         // pool has no authority over this kernel's width.
-        let engine = crate::flashkern::native_engine::process_engine()
-            .expect("DepthDecode::frame: native engine gone after engine-gated construction");
+        let engine = crate::flashkern::native_engine::process_engine();
         let lanes = engine.lanes_total();
         assert!(
             (1..=16).contains(&lanes),
@@ -1165,10 +1118,6 @@ impl DepthDecode {
 /// SAFETY: `k_base`/`v_base` point at the slot planes (`[1, n_kv, cap, hd]` bf16 bits,
 /// head stride `cap·hd`); the first `len` rows of each head are live; `q_bits`/`out_bits`
 /// are `n_head·hd`. Caller holds the storage borrow for the duration.
-#[cfg(any(
-    all(target_arch = "aarch64", has_flashkern_neon),
-    all(target_arch = "x86_64", has_flashkern_x86)
-))]
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn attn_decode_bf16(
     q_bits: &[u16],
@@ -1240,10 +1189,6 @@ pub struct FusedShortConvWeights<'a> {
 ///
 /// `x`/`out` are `[H]` bf16 bits; `state_in`/`state_out` are `[H, K-1]` bf16 bits (the
 /// carried Bx window — same contract as the candle op's functional state).
-#[cfg(any(
-    all(target_arch = "aarch64", has_flashkern_neon),
-    all(target_arch = "x86_64", has_flashkern_x86)
-))]
 pub fn fused_shortconv_decode(
     x: &[u16],
     w: &FusedShortConvWeights,
@@ -1430,10 +1375,6 @@ pub fn fused_shortconv_decode(
 // Raw single-step call into the existing fused conv kernel: bcx is [1, 3H, 1] (== the
 // contiguous [3H] plane in B|C|x row order), state [1, H, K-1], w [H, K], out [1, H, K].
 // SAFETY: caller guarantees the plane sizes and availability.
-#[cfg(any(
-    all(target_arch = "aarch64", has_flashkern_neon),
-    all(target_arch = "x86_64", has_flashkern_x86)
-))]
 unsafe fn conv1d_update_bf16_raw(
     bcx: *const u16,
     state: *const u16,
@@ -1442,8 +1383,8 @@ unsafe fn conv1d_update_bf16_raw(
     h: usize,
     k: usize,
 ) {
-    #[cfg(all(target_arch = "aarch64", has_flashkern_neon))]
+    #[cfg(target_arch = "aarch64")]
     super::neon::conv1d_update_bf16_ptr(bcx, state, w, out, h, k);
-    #[cfg(all(target_arch = "x86_64", has_flashkern_x86))]
+    #[cfg(target_arch = "x86_64")]
     super::x86::conv1d_update_bf16_ptr(bcx, state, w, out, h, k);
 }

@@ -471,31 +471,15 @@ impl LFM2AudioModel {
     /// Capture the depthformer as a flashkern [`DepthDecode`] — every weight a zero-copy
     /// bf16 view in checkpoint layout. Any non-conforming tensor (wrong device/dtype/
     /// layout, non-swiglu Glu, missing qk-norms) ⇒ `None`, and the candle path runs.
-    #[cfg(any(
-        all(target_arch = "aarch64", has_flashkern_neon),
-        all(target_arch = "x86_64", has_flashkern_x86)
-    ))]
     fn build_depth_flash(&self) -> Option<crate::flashkern::decode::DepthDecode> {
         use crate::flashkern::decode::{DepthDecode, DepthHead, DepthLayer, PtrLen};
         if !crate::bf16_gemm::bf16_gemm_nt_available() {
             return None;
         }
-        // Depth-flash rides the native engine's lane team — REQUIRED. Absent
-        // engine (a build without it, or init failure) the depthformer runs the
-        // candle reference chain, loudly. Never a silent rayon threadgroup: a
-        // foreign pool under this kernel is a second control plane (no-fallbacks
-        // doctrine).
-        #[cfg(all(has_kcoro, has_native_engine))]
-        let engine_up = crate::flashkern::native_engine::process_engine().is_some();
-        #[cfg(not(all(has_kcoro, has_native_engine)))]
-        let engine_up = false;
-        if !engine_up {
-            eprintln!(
-                "[voice] flashkern depthformer DISABLED — native engine unavailable; \
-                 depthformer takes the candle reference path"
-            );
-            return None;
-        }
+        // Depth-flash rides the native engine's lane team. The engine is the
+        // SUBSTRATE — process_engine() panics at init if it can't stand up, so
+        // there is no "engine absent" branch here; `None` below means only
+        // tensor nonconformance (wrong dtype/layout), never a missing runtime.
         let mut layers = Vec::with_capacity(self.depthformer.layers.len());
         let mut geom = None;
         let mut cos_sin = None;
@@ -553,14 +537,6 @@ impl LFM2AudioModel {
             cos,
             sin,
         ))
-    }
-
-    #[cfg(not(any(
-        all(target_arch = "aarch64", has_flashkern_neon),
-        all(target_arch = "x86_64", has_flashkern_x86)
-    )))]
-    fn build_depth_flash(&self) -> Option<crate::flashkern::decode::DepthDecode> {
-        None
     }
 
     /// Test/parity seam: disable the flashkern depthformer so the candle op chain runs.
@@ -1349,19 +1325,9 @@ impl LFM2AudioModel {
     /// Install the head tables on the native engine (text embed = tied logits head,
     /// audio embed table, final embedding-norm). No-op when captures fail — the token
     /// pass simply stays unserved.
-    #[cfg(all(
-        has_kcoro,
-        has_native_engine,
-        any(
-            all(target_arch = "aarch64", has_flashkern_neon),
-            all(target_arch = "x86_64", has_flashkern_x86)
-        )
-    ))]
     fn install_native_heads(&self) {
         use crate::flashkern::decode::PtrLen;
-        let Some(engine) = crate::flashkern::native_engine::process_engine() else {
-            return;
-        };
+        let engine = crate::flashkern::native_engine::process_engine();
         let embed = self.lfm.embed_weight();
         let audio = self.audio_embedding.flash_parts().0;
         let norm = self.lfm.embedding_norm();
@@ -1385,27 +1351,9 @@ impl LFM2AudioModel {
         );
     }
 
-    #[cfg(not(all(
-        has_kcoro,
-        has_native_engine,
-        any(
-            all(target_arch = "aarch64", has_flashkern_neon),
-            all(target_arch = "x86_64", has_flashkern_x86)
-        )
-    )))]
-    fn install_native_heads(&self) {}
-
     /// The native token pass for the generate loop: ids in, `(h_last, logits?)` out.
     /// `Ok(None)` = unserved (any gate failed) — caller builds `in_emb` and takes the
     /// candle path, bit-identical. On success `index_pos` has been advanced.
-    #[cfg(all(
-        has_kcoro,
-        has_native_engine,
-        any(
-            all(target_arch = "aarch64", has_flashkern_neon),
-            all(target_arch = "x86_64", has_flashkern_x86)
-        )
-    ))]
     fn native_token_step(
         &self,
         cache: &mut LfmCache,
@@ -1456,26 +1404,6 @@ impl LFM2AudioModel {
             None
         };
         Ok(Some((h_last, logits)))
-    }
-
-    #[cfg(not(all(
-        has_kcoro,
-        has_native_engine,
-        any(
-            all(target_arch = "aarch64", has_flashkern_neon),
-            all(target_arch = "x86_64", has_flashkern_x86)
-        )
-    )))]
-    #[allow(clippy::too_many_arguments)]
-    fn native_token_step(
-        &self,
-        _cache: &mut LfmCache,
-        _index_pos: &mut usize,
-        _ids: &[u32],
-        _embed_kind: u32,
-        _want_logits: bool,
-    ) -> Result<Option<(Tensor, Option<Tensor>)>> {
-        Ok(None)
     }
 
     fn audio_frame_embed(&self, tokens: &[u32]) -> Result<Tensor> {

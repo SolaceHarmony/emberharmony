@@ -13,21 +13,14 @@ use candle_core::{CpuStorage, CustomOp3, Layout, Result, Shape, Tensor};
 /// baseline NEON on aarch64 (no FEAT gate — the bf16 rounding uses integer RNE), AVX2+FMA on
 /// x86-64. The decode wiring in `lfm2_hf.rs` checks this before choosing the CPU op.
 pub fn conv1d_update_available() -> bool {
-    #[cfg(all(target_arch = "aarch64", has_flashkern_neon))]
+    #[cfg(target_arch = "aarch64")]
     {
         true
     }
-    #[cfg(all(target_arch = "x86_64", has_flashkern_x86))]
+    #[cfg(target_arch = "x86_64")]
     {
         let f = super::x86::x86_features();
         f.avx2 && f.fma
-    }
-    #[cfg(not(any(
-        all(target_arch = "aarch64", has_flashkern_neon),
-        all(target_arch = "x86_64", has_flashkern_x86)
-    )))]
-    {
-        false
     }
 }
 
@@ -93,9 +86,9 @@ impl CustomOp3 for FlashkernConv1dUpdate {
                 let w = contig::<f32>(ws, wl)?;
                 #[allow(unused_mut)]
                 let mut out = vec![0f32; out_len];
-                #[cfg(all(target_arch = "aarch64", has_flashkern_neon))]
+                #[cfg(target_arch = "aarch64")]
                 super::neon::conv1d_update_f32(bcx, state, w, &mut out, b, d, t, k);
-                #[cfg(all(target_arch = "x86_64", has_flashkern_x86))]
+                #[cfg(target_arch = "x86_64")]
                 super::x86::conv1d_update_f32(bcx, state, w, &mut out, b, d, t, k);
                 Ok((CpuStorage::F32(out), shape))
             }
@@ -113,9 +106,9 @@ impl CustomOp3 for FlashkernConv1dUpdate {
                 let w_b = unsafe { std::slice::from_raw_parts(w.as_ptr() as *const u16, w.len()) };
                 #[allow(unused_mut)]
                 let mut out = vec![0u16; out_len];
-                #[cfg(all(target_arch = "aarch64", has_flashkern_neon))]
+                #[cfg(target_arch = "aarch64")]
                 super::neon::conv1d_update_bf16(bcx_b, state_b, w_b, &mut out, b, d, t, k);
-                #[cfg(all(target_arch = "x86_64", has_flashkern_x86))]
+                #[cfg(target_arch = "x86_64")]
                 super::x86::conv1d_update_bf16(bcx_b, state_b, w_b, &mut out, b, d, t, k);
                 let out: Vec<half::bf16> = out.iter().map(|&v| half::bf16::from_bits(v)).collect();
                 Ok((CpuStorage::BF16(out), shape))

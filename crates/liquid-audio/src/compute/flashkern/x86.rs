@@ -9,7 +9,7 @@
 //! running the single-threaded SIMD micro-kernel. B is shared across blocks. Wider machines
 //! simply get more blocks in flight.
 //!
-//! Build-gated on x86_64 (`cfg(has_flashkern_x86)`, set by `build.rs`) and runtime-gated on the CPU
+//! Build-gated on x86_64 (`cfg(target_arch = "x86_64")`, set by `build.rs`) and runtime-gated on the CPU
 //! feature via [`X86Features`] (`is_x86_feature_detected!`). The C kernel additionally
 //! dispatches internally: the bf16 GEMM takes VDPBF16PS when AVX-512-BF16 is present, else an
 //! AVX2 upconvert+FMA micro-kernel (baseline on essentially all x86-64).
@@ -50,7 +50,7 @@ fn detect_features() -> X86Features {
 }
 
 // ---- FFI to native/kernels/x86_64/flashkern_x86.cpp (x86_64, kernel built in) ----------------------------------
-#[cfg(all(target_arch = "x86_64", has_flashkern_x86))]
+#[cfg(target_arch = "x86_64")]
 extern "C" {
     fn lfm_bf16_gemm_f32_v2(a: *const u16, b: *const u16, c: *mut f32, m: i32, n: i32, k: i32);
     fn lfm_bf16_gemv_f32(a: *const u16, b: *const u16, c: *mut f32, n: i32, k: i32);
@@ -109,7 +109,7 @@ extern "C" {
 
 /// `true` when flashkern's bf16 GEMM is built in and the CPU meets its baseline (AVX2 + FMA).
 pub fn bf16_gemm_available() -> bool {
-    cfg!(all(target_arch = "x86_64", has_flashkern_x86))
+    cfg!(target_arch = "x86_64")
         && x86_features().avx2
         && x86_features().fma
 }
@@ -119,7 +119,7 @@ pub fn bf16_gemm_available() -> bool {
 /// SIMD micro-kernel (VDPBF16PS when AVX-512-BF16 is present, else AVX2). B is shared.
 /// **Precondition:** AVX2 + FMA — verify [`bf16_gemm_available`] first. Slices sized `M*K`,
 /// `K*N`, `M*N`.
-#[cfg(all(target_arch = "x86_64", has_flashkern_x86))]
+#[cfg(target_arch = "x86_64")]
 pub fn bf16_gemm_into(a: &[u16], b: &[u16], c: &mut [f32], m: usize, n: usize, k: usize) {
     use rayon::prelude::*;
     assert_eq!(a.len(), m * k, "bf16_gemm_into: a.len() != m*k");
@@ -160,7 +160,7 @@ pub fn bf16_gemm_into(a: &[u16], b: &[u16], c: &mut [f32], m: usize, n: usize, k
 /// Native-layout small-M matmul: `C(M,N) f32 = A(M,K) bf16 · W(N,K)ᵀ` with the weight in its
 /// checkpoint row-major layout — no transpose, no weight copy (see the NEON twin for the
 /// decode-path rationale). **Precondition:** AVX2 + FMA (same gate as [`bf16_gemm_available`]).
-#[cfg(all(target_arch = "x86_64", has_flashkern_x86))]
+#[cfg(target_arch = "x86_64")]
 pub fn bf16_gemm_nt_into(a: &[u16], w_nk: &[u16], c: &mut [f32], m: usize, n: usize, k: usize) {
     assert_eq!(a.len(), m * k, "bf16_gemm_nt_into: a.len() != m*k");
     assert_eq!(w_nk.len(), n * k, "bf16_gemm_nt_into: w.len() != n*k");
@@ -209,7 +209,7 @@ pub fn bf16_gemm_nt_into(a: &[u16], w_nk: &[u16], c: &mut [f32], m: usize, n: us
 
 /// Raw pointer form of the nt dot kernel for lane-team callers ([`super::decode`]) — see the
 /// NEON twin. SAFETY: caller guarantees sizes and the AVX2+FMA precondition.
-#[cfg(all(target_arch = "x86_64", has_flashkern_x86))]
+#[cfg(target_arch = "x86_64")]
 pub(crate) unsafe fn bf16_gemm_nt_raw(
     a: *const u16,
     w: *const u16,
@@ -222,7 +222,7 @@ pub(crate) unsafe fn bf16_gemm_nt_raw(
 
 /// GPU-style fast reciprocal-sqrt (`1/√x`) (RSQRTPS + 2 Newton steps). **Precondition:** AVX2 +
 /// FMA — the C kernel is compiled `target("avx2,fma")` and the Newton steps use `_mm256_fnmadd_ps`.
-#[cfg(all(target_arch = "x86_64", has_flashkern_x86))]
+#[cfg(target_arch = "x86_64")]
 pub fn rsqrt(x: &[f32], out: &mut [f32]) {
     assert_eq!(x.len(), out.len());
     let f = x86_features();
@@ -233,7 +233,7 @@ pub fn rsqrt(x: &[f32], out: &mut [f32]) {
 
 /// GPU-style fast reciprocal (`1/x`) (RCPPS + 2 Newton steps). **Precondition:** AVX2 + FMA —
 /// the C kernel is compiled `target("avx2,fma")` and the Newton steps use `_mm256_fnmadd_ps`.
-#[cfg(all(target_arch = "x86_64", has_flashkern_x86))]
+#[cfg(target_arch = "x86_64")]
 pub fn recip(x: &[f32], out: &mut [f32]) {
     assert_eq!(x.len(), out.len());
     let f = x86_features();
@@ -243,7 +243,7 @@ pub fn recip(x: &[f32], out: &mut [f32]) {
 }
 
 /// Deterministic high-accuracy sum via double-double (FMA error-free transforms). **Precondition:** AVX2+FMA.
-#[cfg(all(target_arch = "x86_64", has_flashkern_x86))]
+#[cfg(target_arch = "x86_64")]
 pub fn dd_sum(x: &[f32]) -> f32 {
     assert!(
         x86_features().avx2 && x86_features().fma,
@@ -254,7 +254,7 @@ pub fn dd_sum(x: &[f32]) -> f32 {
 }
 
 /// Deterministic high-accuracy dot product (double-double). **Precondition:** AVX2+FMA.
-#[cfg(all(target_arch = "x86_64", has_flashkern_x86))]
+#[cfg(target_arch = "x86_64")]
 pub fn dd_dot(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len());
     assert!(
@@ -266,7 +266,7 @@ pub fn dd_dot(a: &[f32], b: &[f32]) -> f32 {
 }
 
 /// Horizontal sum (AVX reduce), the analog of a Metal threadgroup reduce. **Precondition:** AVX2.
-#[cfg(all(target_arch = "x86_64", has_flashkern_x86))]
+#[cfg(target_arch = "x86_64")]
 pub fn reduce_sum(x: &[f32]) -> f32 {
     assert!(x86_features().avx2, "reduce_sum requires AVX2");
     // SAFETY: `x` is `n` contiguous f32.
@@ -274,7 +274,7 @@ pub fn reduce_sum(x: &[f32]) -> f32 {
 }
 
 /// Horizontal max. Returns `-inf` for an empty slice. **Precondition:** AVX2.
-#[cfg(all(target_arch = "x86_64", has_flashkern_x86))]
+#[cfg(target_arch = "x86_64")]
 pub fn reduce_max(x: &[f32]) -> f32 {
     assert!(x86_features().avx2, "reduce_max requires AVX2");
     // SAFETY: `x` is `n` contiguous f32.
@@ -283,7 +283,7 @@ pub fn reduce_max(x: &[f32]) -> f32 {
 
 /// In-register byte permute over a 16-entry table (PSHUFB) — the x86 analog of NEON TBL.
 /// `out[i] = table16[idx[i]]` for `idx<16`, else 0. **Precondition:** AVX2.
-#[cfg(all(target_arch = "x86_64", has_flashkern_x86))]
+#[cfg(target_arch = "x86_64")]
 pub fn permute_u8(table16: &[u8; 16], idx: &[u8], out: &mut [u8]) {
     assert_eq!(idx.len(), out.len());
     assert!(x86_features().avx2, "permute_u8 requires AVX2");
@@ -300,7 +300,7 @@ pub fn permute_u8(table16: &[u8; 16], idx: &[u8], out: &mut [u8]) {
 
 /// In-place radix-2 Cooley-Tukey FFT on interleaved `[re,im]` f32. `data.len()` even and
 /// `n = data.len()/2` a power of two (asserted). `inverse` scales by `1/n`.
-#[cfg(all(target_arch = "x86_64", has_flashkern_x86))]
+#[cfg(target_arch = "x86_64")]
 pub fn fft_radix2(data: &mut [f32], inverse: bool) {
     let n = data.len() / 2;
     assert!(
@@ -315,7 +315,7 @@ pub fn fft_radix2(data: &mut [f32], inverse: bool) {
 /// int8 tensor GEMM `C(M,N) s32 = A(M,K) s8 · B(K,N) s8` via VPMADDWD. Slices sized `M*K`,
 /// `K*N`, `M*N`. **Precondition:** AVX-512F + AVX-512BW + AVX-512VL (check [`x86_features`]) —
 /// the C kernel is compiled `target("avx512f,avx512bw,avx512vl")` and may emit VL-width EVEX.
-#[cfg(all(target_arch = "x86_64", has_flashkern_x86))]
+#[cfg(target_arch = "x86_64")]
 pub fn s8_gemm(a: &[i8], b: &[i8], c: &mut [i32], m: usize, n: usize, k: usize) {
     assert_eq!(a.len(), m * k, "s8_gemm: a.len() != m*k");
     assert_eq!(b.len(), k * n, "s8_gemm: b.len() != k*n");
@@ -340,7 +340,7 @@ pub fn s8_gemm(a: &[i8], b: &[i8], c: &mut [i32], m: usize, n: usize, k: usize) 
 
 /// Depthwise causal conv1d, bf16 storage / f32 accumulate / bf16 store. `u:[B,D,L]`,
 /// `w:[D,K]`, `bias:[D]`, `out:[B,D,Lout]` — raw bf16 bits. **Precondition:** AVX2+FMA.
-#[cfg(all(target_arch = "x86_64", has_flashkern_x86))]
+#[cfg(target_arch = "x86_64")]
 #[allow(clippy::too_many_arguments)]
 pub fn depthwise_causal_conv1d_bf16(
     u: &[u16],
@@ -380,7 +380,7 @@ pub fn depthwise_causal_conv1d_bf16(
 /// Elementwise complex multiply in ComplexMul.metal's FIXED evaluation order (no FMA) —
 /// MOVELDUP/MOVEHDUP + one ADDSUBPS per 4 complexes, bit-identical to the same-order scalar.
 /// `a`/`b`/`out` are interleaved `[re,im]`, equal even lengths. **Precondition:** AVX2.
-#[cfg(all(target_arch = "x86_64", has_flashkern_x86))]
+#[cfg(target_arch = "x86_64")]
 pub fn complex_mul(a: &[f32], b: &[f32], out: &mut [f32]) {
     assert!(
         a.len() % 2 == 0,
@@ -403,7 +403,7 @@ pub fn complex_mul(a: &[f32], b: &[f32], out: &mut [f32]) {
 /// Deterministic 3-tap depthwise conv1d, forward window (`depthwise3`): `y[t] = x[t]·w0 +
 /// x[t+1]·w1 + x[t+2]·w2`, fixed order, no FMA. `x`/`y` `[B,C,L]`, `k` `[C,3]`.
 /// **Precondition:** AVX2.
-#[cfg(all(target_arch = "x86_64", has_flashkern_x86))]
+#[cfg(target_arch = "x86_64")]
 pub fn depthwise3(x: &[f32], k: &[f32], y: &mut [f32], bn: usize, c: usize, l: usize) {
     assert_eq!(x.len(), bn * c * l, "depthwise3: x.len() != B*C*L");
     assert_eq!(k.len(), c * 3, "depthwise3: k.len() != C*3");
@@ -425,7 +425,7 @@ pub fn depthwise3(x: &[f32], k: &[f32], y: &mut [f32], bn: usize, c: usize, l: u
 /// Deterministic 3-tap depthwise conv1d, causal window (`depthwise3_causal`) — the LFM2
 /// short-conv orientation, fixed order, no FMA: the bit-exactness instrument (the FMA path is
 /// [`conv1d_update_f32`]). **Precondition:** AVX2.
-#[cfg(all(target_arch = "x86_64", has_flashkern_x86))]
+#[cfg(target_arch = "x86_64")]
 pub fn depthwise3_causal(x: &[f32], k: &[f32], y: &mut [f32], bn: usize, c: usize, l: usize) {
     assert_eq!(x.len(), bn * c * l, "depthwise3_causal: x.len() != B*C*L");
     assert_eq!(k.len(), c * 3, "depthwise3_causal: k.len() != C*3");
@@ -448,7 +448,7 @@ pub fn depthwise3_causal(x: &[f32], k: &[f32], y: &mut [f32], bn: usize, c: usiz
 /// w, state)`, state advanced functionally (`out = [y | new_state]`). FMA-contracted — the
 /// trained regime. `bcx` `[B,3D,T]` (B|C|x), `state` `[B,D,K−1]`, `w` `[D,K]`, `out`
 /// `[B,D,T+K−1]`; `K ≤ 8`. **Precondition:** AVX2 + FMA.
-#[cfg(all(target_arch = "x86_64", has_flashkern_x86))]
+#[cfg(target_arch = "x86_64")]
 #[allow(clippy::too_many_arguments)]
 pub fn conv1d_update_f32(
     bcx: &[f32],
@@ -502,7 +502,7 @@ pub fn conv1d_update_f32(
 /// bf16-storage variant of [`conv1d_update_f32`] (raw bf16 bits): compute f32, round `B⊙x`
 /// and the conv output through bf16 at the torch-materialized points (trained regime).
 /// **Precondition:** AVX2 + FMA (RNE via integer round — no AVX-512-BF16 needed).
-#[cfg(all(target_arch = "x86_64", has_flashkern_x86))]
+#[cfg(target_arch = "x86_64")]
 #[allow(clippy::too_many_arguments)]
 pub fn conv1d_update_bf16(
     bcx: &[u16],
@@ -557,7 +557,7 @@ pub fn conv1d_update_bf16(
 /// ([`super::decode`]): bcx `[1,3H,1]` == a contiguous `[3H]` B|C|x plane, T==1.
 /// SAFETY: caller guarantees plane sizes (bcx 3H, state H·(K-1), w H·K, out H·K) and
 /// kernel availability.
-#[cfg(all(target_arch = "x86_64", has_flashkern_x86))]
+#[cfg(target_arch = "x86_64")]
 pub(crate) unsafe fn conv1d_update_bf16_ptr(
     bcx: *const u16,
     state: *const u16,
@@ -572,7 +572,7 @@ pub(crate) unsafe fn conv1d_update_bf16_ptr(
 // Tests run NATIVELY (this crate builds on x86-64), unlike the NEON side which needs a device
 // or an emulator. Feature-specific tests skip when the runner CPU lacks the extension.
 #[cfg(test)]
-#[cfg(all(target_arch = "x86_64", has_flashkern_x86))]
+#[cfg(target_arch = "x86_64")]
 mod tests {
     use super::*;
     use half::bf16;

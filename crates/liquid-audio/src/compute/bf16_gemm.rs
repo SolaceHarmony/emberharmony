@@ -5,13 +5,13 @@
 //! of stock candle matmul. The Arm BFloat16 extension (FEAT_BF16) has `BFMMLA`, which does
 //! a 2×4·4×2 bf16 matmul with **f32 accumulate**. We compile a small C micro-kernel
 //! (`native/reference/bf16_gemm.c`, via build.rs `cc` with `-march=armv8.2-a+bf16`) and call it here.
-//! Build-gated on aarch64 (`cfg(has_bf16_kernel)`) and **runtime**-gated on
+//! Build-gated on aarch64 (`cfg(target_arch = "aarch64")`) and **runtime**-gated on
 //! FEAT_BF16 (BFMMLA `SIGILL`s without it), so a binary stays portable.
 
 use candle_core::{CpuStorage, CustomOp2, DType, Layout, Result, Shape, Tensor};
 
 // Only wired in as the fallback when the tightened flashkern GEMM was not built (see cpu_fwd).
-#[cfg(all(target_arch = "aarch64", has_bf16_kernel, not(has_flashkern_neon)))]
+#[cfg(all(target_arch = "aarch64", target_arch = "aarch64", not(target_arch = "aarch64")))]
 extern "C" {
     /// `C(M,N) f32 = A(M,K) bf16 · B(K,N) bf16`, all row-major. bf16 crosses as raw u16.
     fn lfm_bf16_gemm_f32(a: *const u16, b: *const u16, c: *mut f32, m: i32, n: i32, k: i32);
@@ -29,10 +29,6 @@ pub fn has_feat_bf16() -> bool {
     {
         crate::flashkern::x86::x86_features().avx512bf16
     }
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    {
-        false
-    }
 }
 
 /// `true` when a hardware bf16 GEMM is both **built in** and **usable** on this CPU — i.e.
@@ -42,16 +38,12 @@ pub fn has_feat_bf16() -> bool {
 pub fn bf16_gemm_available() -> bool {
     #[cfg(target_arch = "aarch64")]
     {
-        cfg!(all(target_arch = "aarch64", has_bf16_kernel))
+        cfg!(all(target_arch = "aarch64", target_arch = "aarch64"))
             && crate::flashkern::neon::neon_features().bf16
     }
     #[cfg(target_arch = "x86_64")]
     {
         crate::flashkern::x86::bf16_gemm_available()
-    }
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    {
-        false
     }
 }
 
@@ -100,7 +92,7 @@ impl CustomOp2 for Bf16Gemm {
         // rayon row-block dispatch, or the row-streaming axpy GEMV when M==1; the decode-side
         // small-M route uses Bf16GemmNt instead — no transpose). Same bf16-exact-product /
         // f32-accumulate numerics as the reference kernel; only the summation order differs.
-        #[cfg(all(target_arch = "aarch64", has_flashkern_neon))]
+        #[cfg(target_arch = "aarch64")]
         {
             // half::bf16 is repr(transparent) over u16, so the bit-slice view is sound.
             let ab = unsafe { std::slice::from_raw_parts(a.as_ptr() as *const u16, a.len()) };
@@ -109,7 +101,7 @@ impl CustomOp2 for Bf16Gemm {
         }
         // x86-64 path: the AVX-512-BF16 (VDPBF16PS) / AVX2 flashkern GEMM, fanned out over M-row
         // blocks with rayon. Same f32-accumulate numerics.
-        #[cfg(all(target_arch = "x86_64", has_flashkern_x86))]
+        #[cfg(target_arch = "x86_64")]
         {
             let ab = unsafe { std::slice::from_raw_parts(a.as_ptr() as *const u16, a.len()) };
             let bb = unsafe { std::slice::from_raw_parts(b.as_ptr() as *const u16, b.len()) };
@@ -117,7 +109,7 @@ impl CustomOp2 for Bf16Gemm {
         }
         // Fallback: the original single-file BFMMLA kernel (only reachable if flashkern TU failed
         // to build but the reference kernel did).
-        #[cfg(all(target_arch = "aarch64", has_bf16_kernel, not(has_flashkern_neon)))]
+        #[cfg(all(target_arch = "aarch64", target_arch = "aarch64", not(target_arch = "aarch64")))]
         // SAFETY: a/b are M*K / K*N contiguous bf16 (==u16) lanes; c is M*N f32; FEAT_BF16
         // verified above; the kernel reads/writes exactly those bounds.
         unsafe {
@@ -150,23 +142,19 @@ pub fn bf16_matmul(a: &Tensor, b: &Tensor) -> Result<Option<Tensor>> {
 
 /// `true` when the flashkern NT kernel specifically is built and supported — STRICTER than
 /// [`bf16_gemm_available`], which on aarch64 is also satisfied by the reference BFMMLA
-/// fallback (`has_bf16_kernel` without `has_flashkern_neon`). The reference kernel has no
+/// fallback (`target_arch = "aarch64"` without `target_arch = "aarch64"`). The reference kernel has no
 /// NT form, so gating NT paths on the looser check would let [`Bf16GemmNt`] run with no
 /// kernel body at all (zero-filled output) in a fallback-only build.
 pub fn bf16_gemm_nt_available() -> bool {
     #[cfg(target_arch = "aarch64")]
     {
-        cfg!(all(target_arch = "aarch64", has_flashkern_neon))
+        cfg!(target_arch = "aarch64")
             && crate::flashkern::neon::neon_features().bf16
     }
     #[cfg(target_arch = "x86_64")]
     {
-        // Already flashkern-specific: cfg(has_flashkern_x86) + AVX2 + FMA.
+        // Already flashkern-specific: cfg(target_arch = "x86_64") + AVX2 + FMA.
         crate::flashkern::x86::bf16_gemm_available()
-    }
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    {
-        false
     }
 }
 
@@ -177,7 +165,7 @@ pub fn bf16_gemm_accel_available() -> bool {
     cfg!(all(
         target_arch = "aarch64",
         target_os = "macos",
-        has_flashkern_neon
+        target_arch = "aarch64"
     )) && bf16_gemm_available()
 }
 
@@ -222,7 +210,7 @@ impl CustomOp2 for Bf16GemmAccel {
         let w = &w[l2.start_offset()..l2.start_offset() + n * k];
         #[allow(unused_mut)]
         let mut c = vec![0f32; m * n];
-        #[cfg(all(target_arch = "aarch64", target_os = "macos", has_flashkern_neon))]
+        #[cfg(all(target_arch = "aarch64", target_os = "macos", target_arch = "aarch64"))]
         {
             let ab = unsafe { std::slice::from_raw_parts(a.as_ptr() as *const u16, a.len()) };
             let wb = unsafe { std::slice::from_raw_parts(w.as_ptr() as *const u16, w.len()) };
@@ -288,14 +276,14 @@ impl CustomOp2 for Bf16GemmNt {
         let w = &w[l2.start_offset()..l2.start_offset() + n * k];
         #[allow(unused_mut)] // `c` is mutated only on the SIMD kernel paths below
         let mut c = vec![0f32; m * n];
-        #[cfg(all(target_arch = "aarch64", has_flashkern_neon))]
+        #[cfg(target_arch = "aarch64")]
         {
             // half::bf16 is repr(transparent) over u16, so the bit-slice view is sound.
             let ab = unsafe { std::slice::from_raw_parts(a.as_ptr() as *const u16, a.len()) };
             let wb = unsafe { std::slice::from_raw_parts(w.as_ptr() as *const u16, w.len()) };
             crate::flashkern::neon::bf16_gemm_nt_into(ab, wb, &mut c, m, n, k);
         }
-        #[cfg(all(target_arch = "x86_64", has_flashkern_x86))]
+        #[cfg(target_arch = "x86_64")]
         {
             let ab = unsafe { std::slice::from_raw_parts(a.as_ptr() as *const u16, a.len()) };
             let wb = unsafe { std::slice::from_raw_parts(w.as_ptr() as *const u16, w.len()) };

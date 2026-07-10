@@ -27,14 +27,6 @@
 //!     completion channel between stages; workers never barrier at all. Stage math is
 //!     verbatim [`super::decode::fused_mlp_decode`], so the result is bit-identical.
 
-#![cfg(all(
-    has_kcoro,
-    any(
-        all(target_arch = "aarch64", has_flashkern_neon),
-        all(target_arch = "x86_64", has_flashkern_x86)
-    )
-))]
-
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Condvar, Mutex};

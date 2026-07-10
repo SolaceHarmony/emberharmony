@@ -176,14 +176,6 @@ pub struct Cache {
     /// mechanism: rollback clones conv states, candle-path steps and KV growth move
     /// storages; capturing per token self-heals against all of them). What this kills
     /// is the per-token `Vec` allocation, not the captures.
-    #[cfg(all(
-        has_kcoro,
-        has_native_engine,
-        any(
-            all(target_arch = "aarch64", has_flashkern_neon),
-            all(target_arch = "x86_64", has_flashkern_x86)
-        )
-    ))]
     pub(crate) native_states: crate::flashkern::native_engine::StateTable,
 }
 
@@ -238,14 +230,6 @@ impl Cache {
             cos,
             sin,
             device: device.clone(),
-            #[cfg(all(
-                has_kcoro,
-                has_native_engine,
-                any(
-                    all(target_arch = "aarch64", has_flashkern_neon),
-                    all(target_arch = "x86_64", has_flashkern_x86)
-                )
-            ))]
             native_states: Default::default(),
         })
     }
@@ -600,10 +584,6 @@ impl Attention {
     /// The flag-on decode attention: flashkern per-head dots over the resident bf16 KV
     /// planes (`flashkern::decode::attn_decode_bf16`) — q's post-rope bf16 bits in, one
     /// bf16 round at the per-head store out. Zero copies of K/V at any width.
-    #[cfg(any(
-        all(target_arch = "aarch64", has_flashkern_neon),
-        all(target_arch = "x86_64", has_flashkern_x86)
-    ))]
     fn attn_decode_flash(
         &self,
         q: &Tensor,
@@ -651,22 +631,6 @@ impl Attention {
         drop((qs, ks, vs));
         let out: Vec<half::bf16> = out.iter().map(|&x| half::bf16::from_bits(x)).collect();
         Tensor::from_vec(out, (1, self.n_head, 1, self.head_dim), q.device())?.to_dtype(out_dtype)
-    }
-
-    #[cfg(not(any(
-        all(target_arch = "aarch64", has_flashkern_neon),
-        all(target_arch = "x86_64", has_flashkern_x86)
-    )))]
-    fn attn_decode_flash(
-        &self,
-        _q: &Tensor,
-        _k: &Tensor,
-        _v: &Tensor,
-        _o: DType,
-    ) -> Result<Tensor> {
-        candle_core::bail!(
-            "flashkern attention unavailable — the dispatch gate should prevent this"
-        )
     }
 }
 
@@ -834,14 +798,6 @@ impl DecoderLayer {
             {
                 // The whole layer in one native doorbell when the resident table is
                 // live (bit-identical to the composed fused blocks by parity test).
-                #[cfg(all(
-                    has_kcoro,
-                    has_native_engine,
-                    any(
-                        all(target_arch = "aarch64", has_flashkern_neon),
-                        all(target_arch = "x86_64", has_flashkern_x86)
-                    )
-                ))]
                 if let Some(y) = self.native_conv_layer(x, c, block_idx, cache)? {
                     return Ok(y);
                 }
@@ -864,14 +820,6 @@ impl DecoderLayer {
         }
         // Whole attention layer in one native doorbell (grouped/ulp tier; the
         // reference chain and prefill keep the candle path below).
-        #[cfg(all(
-            has_kcoro,
-            has_native_engine,
-            any(
-                all(target_arch = "aarch64", has_flashkern_neon),
-                all(target_arch = "x86_64", has_flashkern_x86)
-            )
-        ))]
         if let LayerKind::Attention(a) = &self.kind {
             if add_mask.is_none() {
                 if let Some(y) = self.native_attn_layer(x, a, index_pos, block_idx, cache)? {
@@ -1031,49 +979,21 @@ impl DecoderLayer {
         // The resident native stage machine when it is up — bit-identical to the
         // threadgroup port by parity test, so the fallback changes scheduling only,
         // never numerics.
-        #[cfg(all(
-            has_kcoro,
-            has_native_engine,
-            any(
-                all(target_arch = "aarch64", has_flashkern_neon),
-                all(target_arch = "x86_64", has_flashkern_x86)
-            )
-        ))]
         {
             // One lanes value for the attempt AND its parity fallback (the contract is
             // "bit-identical at the same lanes") — sized from OUR team when it exists.
-            let lanes = crate::flashkern::native_engine::process_engine()
-                .map(|e| e.lanes_total().max(1))
-                .unwrap_or(lanes);
-            let ran_native = crate::flashkern::native_engine::process_engine()
-                .map(|engine| engine.fused_mlp(xb, &weights, &mut out, lanes))
-                .unwrap_or(false);
+            let engine = crate::flashkern::native_engine::process_engine();
+            let lanes = engine.lanes_total().max(1);
+            let ran_native = engine.fused_mlp(xb, &weights, &mut out, lanes);
             if !ran_native {
                 crate::flashkern::decode::fused_mlp_decode(xb, &weights, &mut out, lanes);
             }
         }
-        #[cfg(not(all(
-            has_kcoro,
-            has_native_engine,
-            any(
-                all(target_arch = "aarch64", has_flashkern_neon),
-                all(target_arch = "x86_64", has_flashkern_x86)
-            )
-        )))]
-        crate::flashkern::decode::fused_mlp_decode(xb, &weights, &mut out, lanes);
         let out: Vec<half::bf16> = out.iter().map(|&b| half::bf16::from_bits(b)).collect();
         Ok(Some(Tensor::from_vec(out, (1, 1, hdim), x.device())?))
     }
 }
 
-#[cfg(all(
-    has_kcoro,
-    has_native_engine,
-    any(
-        all(target_arch = "aarch64", has_flashkern_neon),
-        all(target_arch = "x86_64", has_flashkern_x86)
-    )
-))]
 impl DecoderLayer {
     /// Capture this layer's weights for the resident native layer table. Conv layers
     /// only; attention layers get a placeholder until rung 2. Derived tensors (the
@@ -1151,9 +1071,7 @@ impl DecoderLayer {
         block_idx: usize,
         cache: &mut Cache,
     ) -> Result<Option<Tensor>> {
-        let Some(engine) = crate::flashkern::native_engine::process_engine() else {
-            return Ok(None);
-        };
+        let engine = crate::flashkern::native_engine::process_engine();
         if !(cache.grouped_gqa_decode
             && cache.use_kv_cache
             && x.device().is_cpu()
@@ -1242,9 +1160,7 @@ impl DecoderLayer {
         block_idx: usize,
         cache: &mut Cache,
     ) -> Result<Option<Tensor>> {
-        let Some(engine) = crate::flashkern::native_engine::process_engine() else {
-            return Ok(None);
-        };
+        let engine = crate::flashkern::native_engine::process_engine();
         let k = conv.l_cache;
         let hdim = x.dim(2)?;
         let x = x.contiguous()?;
@@ -1296,14 +1212,6 @@ pub struct Model {
     /// Resident native-engine layer table guard. MUST be declared before the weight
     /// fields: Rust drops fields in declaration order, and the guard clears the C-side
     /// pointer table before the weights it points into are freed.
-    #[cfg(all(
-        has_kcoro,
-        has_native_engine,
-        any(
-            all(target_arch = "aarch64", has_flashkern_neon),
-            all(target_arch = "x86_64", has_flashkern_x86)
-        )
-    ))]
     native_ctx: Option<crate::flashkern::native_engine::BackboneCtxGuard>,
     embed_tokens: Embedding,
     layers: Vec<DecoderLayer>,
@@ -1314,14 +1222,6 @@ impl Model {
     /// Build + install the resident native-engine layer table (rung 1: conv layers;
     /// attention slots are placeholders). No-op when any capture fails or the engine
     /// is unavailable — the per-block paths remain, bit-identical.
-    #[cfg(all(
-        has_kcoro,
-        has_native_engine,
-        any(
-            all(target_arch = "aarch64", has_flashkern_neon),
-            all(target_arch = "x86_64", has_flashkern_x86)
-        )
-    ))]
     pub fn install_native_ctx(&mut self, max_ctx: usize) {
         if self.native_ctx.is_some() {
             return;
@@ -1357,16 +1257,6 @@ impl Model {
             crate::flashkern::native_engine::install_backbone_ctx(&descs, h, ffn, max_ctx, held);
     }
 
-    #[cfg(not(all(
-        has_kcoro,
-        has_native_engine,
-        any(
-            all(target_arch = "aarch64", has_flashkern_neon),
-            all(target_arch = "x86_64", has_flashkern_x86)
-        )
-    )))]
-    pub fn install_native_ctx(&mut self, _max_ctx: usize) {}
-
     /// Final pre-logits norm (head-table capture for the native token pass).
     pub(crate) fn embedding_norm(&self) -> &RmsNorm {
         &self.embedding_norm
@@ -1380,14 +1270,6 @@ impl Model {
     /// cache-resident (entries rewritten — fresh pointer captures each token are the
     /// correctness mechanism against rollback clones, candle-path interleaves, and
     /// KV growth) and the outputs land in caller-owned storage.
-    #[cfg(all(
-        has_kcoro,
-        has_native_engine,
-        any(
-            all(target_arch = "aarch64", has_flashkern_neon),
-            all(target_arch = "x86_64", has_flashkern_x86)
-        )
-    ))]
     pub(crate) fn native_token_pass(
         &self,
         cache: &mut Cache,
@@ -1399,9 +1281,7 @@ impl Model {
     ) -> Result<bool> {
         use crate::flashkern::decode::PtrLen;
         use crate::flashkern::native_engine::{process_engine, LayerState};
-        let Some(engine) = process_engine() else {
-            return Ok(false);
-        };
+        let engine = process_engine();
         if !(cache.grouped_gqa_decode
             && cache.use_kv_cache
             && cache.fused_conv_decode
@@ -1502,14 +1382,6 @@ impl Model {
         }
         let embedding_norm = RmsNorm::new(cfg.hidden_size, cfg.norm_eps, vb.pp("embedding_norm"))?;
         Ok(Self {
-            #[cfg(all(
-                has_kcoro,
-                has_native_engine,
-                any(
-                    all(target_arch = "aarch64", has_flashkern_neon),
-                    all(target_arch = "x86_64", has_flashkern_x86)
-                )
-            ))]
             native_ctx: None,
             embed_tokens,
             layers,

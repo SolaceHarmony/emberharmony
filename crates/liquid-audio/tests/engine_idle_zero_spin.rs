@@ -10,7 +10,7 @@
 //! An integration test so the process contains ONLY this test's threads —
 //! the getrusage(RUSAGE_SELF) delta is attributable to the lane team, not to
 //! parallel unit tests. Gated on aarch64 macOS, where the engine build cfgs
-//! (has_kcoro + has_native_engine + has_flashkern_neon) always hold; absent
+//! (has_kcoro + has_native_engine + target_arch = "aarch64") always hold; absent
 //! engine here is a build regression, so the test panics rather than skips.
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
 

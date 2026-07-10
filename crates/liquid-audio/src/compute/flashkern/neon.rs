@@ -5,7 +5,7 @@
 //! TBL for `simd_shuffle`, FCMLA for the complex butterfly, FMA error-free transforms for
 //! double-double, FRECPE/FRSQRTE for GPU fast-math, SMMLA for the int tensor-core.
 //!
-//! Everything is **build-gated** on aarch64 (`cfg(has_flashkern_neon)`, set by `build.rs`) and
+//! Everything is **build-gated** on aarch64 (`cfg(target_arch = "aarch64")`, set by `build.rs`) and
 //! **runtime-gated** on the relevant CPU feature ([`NeonFeatures`]); a binary stays portable
 //! because a feature-specific proc is never *called* on a core that lacks it (and its opcodes
 //! never leak into another function — see the C++ file header).
@@ -82,7 +82,7 @@ fn detect_features() -> NeonFeatures {
 }
 
 // ---- FFI to native/kernels/aarch64/flashkern_neon.cpp (aarch64, kernel built in) --------------------------------
-#[cfg(all(target_arch = "aarch64", has_flashkern_neon))]
+#[cfg(target_arch = "aarch64")]
 extern "C" {
     fn lfm_bf16_gemm_f32_v2(a: *const u16, b: *const u16, c: *mut f32, m: i32, n: i32, k: i32);
     fn lfm_bf16_gemv_f32(a: *const u16, b: *const u16, c: *mut f32, n: i32, k: i32);
@@ -141,7 +141,7 @@ extern "C" {
 
 /// `true` when flashkern's bf16 GEMM path is both built in and supported by this CPU.
 pub fn bf16_gemm_available() -> bool {
-    cfg!(all(target_arch = "aarch64", has_flashkern_neon)) && neon_features().bf16
+    cfg!(target_arch = "aarch64") && neon_features().bf16
 }
 
 /// `C(M,N) f32 = A(M,K) bf16 · B(K,N) bf16` (raw bf16 bits as `u16`), row-major, f32
@@ -150,7 +150,7 @@ pub fn bf16_gemm_available() -> bool {
 /// across blocks. **Precondition:** the running CPU has FEAT_BF16 — verify [`bf16_gemm_available`]
 /// (or [`neon_features`]) first; the BFMMLA/BFDOT kernels `SIGILL` without it. Slices must be
 /// sized `M*K`, `K*N`, `M*N`.
-#[cfg(all(target_arch = "aarch64", has_flashkern_neon))]
+#[cfg(target_arch = "aarch64")]
 pub fn bf16_gemm_into(a: &[u16], b: &[u16], c: &mut [f32], m: usize, n: usize, k: usize) {
     use rayon::prelude::*;
     // Real asserts (not debug_assert): the kernel reads m*k / k*n and writes m*n through raw
@@ -202,7 +202,7 @@ pub fn bf16_gemm_into(a: &[u16], b: &[u16], c: &mut [f32], m: usize, n: usize, k
 /// **Precondition:** FEAT_BF16 — callers gate on `bf16_gemm_nt_available()`, the strict
 /// flashkern-build check (NOT `bf16_gemm_available()`, which the reference-kernel-only
 /// build also satisfies).
-#[cfg(all(target_arch = "aarch64", has_flashkern_neon))]
+#[cfg(target_arch = "aarch64")]
 pub fn bf16_gemm_nt_into(a: &[u16], w_nk: &[u16], c: &mut [f32], m: usize, n: usize, k: usize) {
     // Real asserts: the kernel indexes m*k / n*k / m*n through raw pointers.
     assert_eq!(a.len(), m * k, "bf16_gemm_nt_into: a.len() != m*k");
@@ -260,7 +260,7 @@ pub fn bf16_gemm_nt_into(a: &[u16], w_nk: &[u16], c: &mut [f32], m: usize, n: us
 /// movement is the bf16→f32 widening into reusable thread-local scratch — the single cited
 /// entry on the design's weight-movement exception list (tile/turn-transient, never a
 /// resident f32 copy). Compute-bound M>4 only; decode stays on the nt kernel.
-#[cfg(all(target_arch = "aarch64", target_os = "macos", has_flashkern_neon))]
+#[cfg(all(target_arch = "aarch64", target_os = "macos", target_arch = "aarch64"))]
 pub fn bf16_gemm_accel_into(a: &[u16], w_nk: &[u16], c: &mut [f32], m: usize, n: usize, k: usize) {
     use std::cell::RefCell;
     assert_eq!(a.len(), m * k, "bf16_gemm_accel_into: a.len() != m*k");
@@ -313,7 +313,7 @@ pub fn bf16_gemm_accel_into(a: &[u16], w_nk: &[u16], c: &mut [f32], m: usize, n:
 /// carve disjoint row ranges out of shared threadgroup scratch — the slice-based wrapper
 /// can't express those aliasing-free splits. SAFETY: caller guarantees `a` is `K` bf16,
 /// `w` is `n·K` bf16 rows, `c` is `n` f32, and FEAT_BF16 availability was checked.
-#[cfg(all(target_arch = "aarch64", has_flashkern_neon))]
+#[cfg(target_arch = "aarch64")]
 pub(crate) unsafe fn bf16_gemm_nt_raw(
     a: *const u16,
     w: *const u16,
@@ -331,7 +331,7 @@ pub(crate) unsafe fn bf16_gemm_nt_raw(
 
 /// GPU-style fast reciprocal-sqrt (`1/√x`) over a slice (FRSQRTE + 2 Newton steps). Directly
 /// usable for RMSNorm. `out` must match `x` in length.
-#[cfg(all(target_arch = "aarch64", has_flashkern_neon))]
+#[cfg(target_arch = "aarch64")]
 pub fn rsqrt(x: &[f32], out: &mut [f32]) {
     assert_eq!(x.len(), out.len());
     // SAFETY: both slices are `n` f32; the kernel reads/writes exactly those bounds.
@@ -339,7 +339,7 @@ pub fn rsqrt(x: &[f32], out: &mut [f32]) {
 }
 
 /// GPU-style fast reciprocal (`1/x`) over a slice (FRECPE + 2 Newton steps).
-#[cfg(all(target_arch = "aarch64", has_flashkern_neon))]
+#[cfg(target_arch = "aarch64")]
 pub fn recip(x: &[f32], out: &mut [f32]) {
     assert_eq!(x.len(), out.len());
     // SAFETY: both slices are `n` f32.
@@ -347,14 +347,14 @@ pub fn recip(x: &[f32], out: &mut [f32]) {
 }
 
 /// Deterministic high-accuracy sum via double-double accumulation (FMA error-free transforms).
-#[cfg(all(target_arch = "aarch64", has_flashkern_neon))]
+#[cfg(target_arch = "aarch64")]
 pub fn dd_sum(x: &[f32]) -> f32 {
     // SAFETY: `x` is `n` contiguous f32.
     unsafe { lfm_dd_sum_f32(x.as_ptr(), x.len() as i32) }
 }
 
 /// Deterministic high-accuracy dot product (double-double accumulation).
-#[cfg(all(target_arch = "aarch64", has_flashkern_neon))]
+#[cfg(target_arch = "aarch64")]
 pub fn dd_dot(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len());
     // SAFETY: `a`/`b` are both `n` contiguous f32.
@@ -362,14 +362,14 @@ pub fn dd_dot(a: &[f32], b: &[f32]) -> f32 {
 }
 
 /// Horizontal sum (ADDV/FADDP), the NEON analog of a Metal threadgroup reduce.
-#[cfg(all(target_arch = "aarch64", has_flashkern_neon))]
+#[cfg(target_arch = "aarch64")]
 pub fn reduce_sum(x: &[f32]) -> f32 {
     // SAFETY: `x` is `n` contiguous f32.
     unsafe { lfm_reduce_sum_f32(x.as_ptr(), x.len() as i32) }
 }
 
 /// Horizontal max (FMAXV/FMAXP). Returns `-inf` for an empty slice.
-#[cfg(all(target_arch = "aarch64", has_flashkern_neon))]
+#[cfg(target_arch = "aarch64")]
 pub fn reduce_max(x: &[f32]) -> f32 {
     // SAFETY: `x` is `n` contiguous f32.
     unsafe { lfm_reduce_max_f32(x.as_ptr(), x.len() as i32) }
@@ -377,7 +377,7 @@ pub fn reduce_max(x: &[f32]) -> f32 {
 
 /// In-register byte permute over a 16-entry table (TBL/TBX) — the NEON analog of Metal
 /// `simd_shuffle`. `out[i] = table16[idx[i]]` for `idx<16`, else 0.
-#[cfg(all(target_arch = "aarch64", has_flashkern_neon))]
+#[cfg(target_arch = "aarch64")]
 pub fn permute_u8(table16: &[u8; 16], idx: &[u8], out: &mut [u8]) {
     assert_eq!(idx.len(), out.len());
     // SAFETY: table is 16 bytes; idx/out are both `n` bytes.
@@ -395,7 +395,7 @@ pub fn permute_u8(table16: &[u8; 16], idx: &[u8], out: &mut [u8]) {
 /// `data.len()` must be even and `n = data.len()/2` a power of two — asserted, since radix-2 has
 /// no meaning otherwise (and would index out of bounds). `inverse` scales by `1/n`.
 /// **Precondition:** FEAT_FCMA (check [`neon_features`]).
-#[cfg(all(target_arch = "aarch64", has_flashkern_neon))]
+#[cfg(target_arch = "aarch64")]
 pub fn fft_radix2(data: &mut [f32], inverse: bool) {
     let n = data.len() / 2;
     assert!(
@@ -411,7 +411,7 @@ pub fn fft_radix2(data: &mut [f32], inverse: bool) {
 
 /// int8 tensor-core GEMM `C(M,N) s32 = A(M,K) s8 · B(K,N) s8` via SMMLA. Slices sized `M*K`,
 /// `K*N`, `M*N`. **Precondition:** FEAT_I8MM (check [`neon_features`]).
-#[cfg(all(target_arch = "aarch64", has_flashkern_neon))]
+#[cfg(target_arch = "aarch64")]
 pub fn s8_gemm(a: &[i8], b: &[i8], c: &mut [i32], m: usize, n: usize, k: usize) {
     // Real asserts: the kernel indexes m*k / k*n / m*n through raw pointers.
     assert_eq!(a.len(), m * k, "s8_gemm: a.len() != m*k");
@@ -435,7 +435,7 @@ pub fn s8_gemm(a: &[i8], b: &[i8], c: &mut [i32], m: usize, n: usize, k: usize) 
 /// Depthwise causal conv1d with bf16 storage and f32 accumulate (single bf16 RNE store),
 /// mirroring the Metal `depthwise_causal_conv1d_bf16`. `u:[B,D,L]`, `w:[D,K]`, `bias:[D]`,
 /// `out:[B,D,Lout]` — all raw bf16 bits. **Precondition:** FEAT_BF16 (check [`neon_features`]).
-#[cfg(all(target_arch = "aarch64", has_flashkern_neon))]
+#[cfg(target_arch = "aarch64")]
 #[allow(clippy::too_many_arguments)]
 pub fn depthwise_causal_conv1d_bf16(
     u: &[u16],
@@ -478,7 +478,7 @@ pub fn depthwise_causal_conv1d_bf16(
 /// `out = ((ar·br) − (ai·bi), (ar·bi) + (ai·br))`, each rounding separate — deterministic,
 /// bit-identical to the same-order scalar. `a`/`b`/`out` are interleaved `[re,im]`, equal even
 /// lengths. Baseline NEON (no feature gate).
-#[cfg(all(target_arch = "aarch64", has_flashkern_neon))]
+#[cfg(target_arch = "aarch64")]
 pub fn complex_mul(a: &[f32], b: &[f32], out: &mut [f32]) {
     assert!(
         a.len() % 2 == 0,
@@ -500,7 +500,7 @@ pub fn complex_mul(a: &[f32], b: &[f32], out: &mut [f32]) {
 /// Deterministic 3-tap depthwise conv1d, forward window (`depthwise3` in Depthwise3.metal):
 /// `y[t] = x[t]·w0 + x[t+1]·w1 + x[t+2]·w2` with zero-pad on the right — fixed multiply-add
 /// order, no FMA. `x`/`y` are `[B,C,L]`, `k` is `[C,3]`. Baseline NEON.
-#[cfg(all(target_arch = "aarch64", has_flashkern_neon))]
+#[cfg(target_arch = "aarch64")]
 pub fn depthwise3(x: &[f32], k: &[f32], y: &mut [f32], bn: usize, c: usize, l: usize) {
     assert_eq!(x.len(), bn * c * l, "depthwise3: x.len() != B*C*L");
     assert_eq!(k.len(), c * 3, "depthwise3: k.len() != C*3");
@@ -521,7 +521,7 @@ pub fn depthwise3(x: &[f32], k: &[f32], y: &mut [f32], bn: usize, c: usize, l: u
 /// Deterministic 3-tap depthwise conv1d, causal window (`depthwise3_causal`): `y[t] =
 /// x[t−2]·w0 + x[t−1]·w1 + x[t]·w2` (left-pad 2) — the LFM2 short-conv orientation, fixed
 /// order, no FMA: this is the bit-exactness instrument; the FMA path is [`conv1d_update_f32`].
-#[cfg(all(target_arch = "aarch64", has_flashkern_neon))]
+#[cfg(target_arch = "aarch64")]
 pub fn depthwise3_causal(x: &[f32], k: &[f32], y: &mut [f32], bn: usize, c: usize, l: usize) {
     assert_eq!(x.len(), bn * c * l, "depthwise3_causal: x.len() != B*C*L");
     assert_eq!(k.len(), c * 3, "depthwise3_causal: k.len() != C*3");
@@ -545,7 +545,7 @@ pub fn depthwise3_causal(x: &[f32], k: &[f32], y: &mut [f32], bn: usize, c: usiz
 /// new_state]`. Multiply-adds are FMA-contracted — the trained regime (Tri Dao's CUDA kernel);
 /// use [`depthwise3_causal`] when bit-exact strict order matters. `K ≤ 8` (the register-window
 /// bound the GPU kernel shares).
-#[cfg(all(target_arch = "aarch64", has_flashkern_neon))]
+#[cfg(target_arch = "aarch64")]
 #[allow(clippy::too_many_arguments)]
 pub fn conv1d_update_f32(
     bcx: &[f32],
@@ -595,7 +595,7 @@ pub fn conv1d_update_f32(
 /// bf16-storage variant of [`conv1d_update_f32`] (raw bf16 bits): compute in f32, with `B⊙x`
 /// and the conv output rounded through bf16 exactly where torch materializes them — the
 /// trained regime's rounding points. Baseline NEON (RNE via integer round, no FEAT_BF16 needed).
-#[cfg(all(target_arch = "aarch64", has_flashkern_neon))]
+#[cfg(target_arch = "aarch64")]
 #[allow(clippy::too_many_arguments)]
 pub fn conv1d_update_bf16(
     bcx: &[u16],
@@ -646,7 +646,7 @@ pub fn conv1d_update_bf16(
 /// ([`super::decode`]): bcx `[1,3H,1]` == a contiguous `[3H]` B|C|x plane, T==1.
 /// SAFETY: caller guarantees plane sizes (bcx 3H, state H·(K-1), w H·K, out H·K) and
 /// kernel availability.
-#[cfg(all(target_arch = "aarch64", has_flashkern_neon))]
+#[cfg(target_arch = "aarch64")]
 pub(crate) unsafe fn conv1d_update_bf16_ptr(
     bcx: *const u16,
     state: *const u16,
@@ -662,7 +662,7 @@ pub(crate) unsafe fn conv1d_update_bf16_ptr(
 // they run on the macOS arm64 CI leg (rust-voice.yml), where the hardware actually executes
 // BFMMLA/FCMLA/SMMLA. On x86 CI the crate still builds; there is simply nothing here to run.
 #[cfg(test)]
-#[cfg(all(target_arch = "aarch64", has_flashkern_neon))]
+#[cfg(target_arch = "aarch64")]
 mod tests {
     use super::*;
     use half::bf16;
@@ -1199,7 +1199,7 @@ mod tests {
 
 // Accelerate cblas — the sanctioned route to the AMX/SME matrix units on macOS. Used by
 // the prefill-tile bench below and (pending the E4 measurement) the prefill GEMM backend.
-#[cfg(all(target_arch = "aarch64", target_os = "macos", has_flashkern_neon))]
+#[cfg(all(target_arch = "aarch64", target_os = "macos", target_arch = "aarch64"))]
 extern "C" {
     fn cblas_sgemm(
         order: i32,
