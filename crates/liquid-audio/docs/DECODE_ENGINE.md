@@ -470,6 +470,17 @@ context is the ceiling) and the desktop crate's rotted test suite repaired (42/4
 3. Voice layer: echo provenance (spec-09 W6), then duplex ingest — mic audio
    micro-prefilled into the KV planes at pass boundaries so the model attends to
    incoming speech mid-generation (the doorbell contract already checks there).
-4. The GOSUB mainline: kcoro_arena rebuild per its handoff §9 (token-kernel /
-   correlation engine); this engine's seam (park/unpark + fences) is what it
-   replaces from underneath.
+4. The GOSUB mainline — **kcoro-rs, the native Rust port** (supersedes the C
+   arena rebuild; same design, memory-safe substrate). The convergence is total:
+   patch 0001's gate IS std's thread parker, ticket/callback IS Waker, the token
+   kernel IS a purpose-built executor (NOT tokio — ~1-2k lines), kc_op_t IS a
+   Future, and kcoro_arena's hand-rolled continuation macros are what rustc's
+   async lowering generates. Rungs: R1 lane team + precise parking + fences
+   (ABI-compatible under this engine's doorbell) → R2 correlation-table ticket
+   kernel (channels, per the zero-spin spec §22) → R3 explicit serde-able
+   continuation records (hibernatable, VERSIONED token-routines — BizTalk
+   dehydration; async state machines aren't serializable, so routines own their
+   state enums) → R4 the engine rim natively on it, FFI seam retired.
+   Requirements spec: kcoro PATCHES.md 0001-0006 + the kcoro_arena handoff §9 +
+   the salvage verdict's contract tables. This engine's thin seam (park/unpark +
+   fences) is exactly what R1 replaces from underneath.
