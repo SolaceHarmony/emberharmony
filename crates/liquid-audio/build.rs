@@ -23,7 +23,7 @@ fn main() {
         cc::Build::new()
             .file("native/kernels/x86_64/flashkern_x86.cpp")
             .cpp(true)
-            .std("c++17")
+            .std("c++23")
             .opt_level(3)
             .warnings(false)
             .flag("-ffp-contract=off")
@@ -54,7 +54,7 @@ fn main() {
     let mut kern = cc::Build::new();
     kern.file("native/kernels/aarch64/flashkern_neon.cpp")
         .cpp(true)
-        .std("c++17")
+        .std("c++23")
         .opt_level(3)
         .warnings(false)
         .flag("-ffp-contract=off");
@@ -80,10 +80,17 @@ fn build_native_engine(arch: &str) {
     println!("cargo::rustc-cfg=has_kcoro");
     println!("cargo::rerun-if-changed=native/src/engine/flashkern_engine.cpp");
     println!("cargo::rerun-if-changed=../kcoro-sys/vendor/kcoro/include");
+    // C++23, not a style choice: this TU includes kcoro headers, and C++23 is
+    // the FIRST standard that requires <stdatomic.h> to work in C++ and expose
+    // ::atomic_int (gcc 13 implements it only under -std=c++23; c++20 is not
+    // enough). libc++/clang provides the typedefs at c++17 as an extension —
+    // which is why macOS was green while the ubuntu-gcc leg was red: libc++ vs
+    // libstdc++, not Apple vs Linux. All native C++ in this crate stays on the
+    // same std for consistency.
     cc::Build::new()
         .file("native/src/engine/flashkern_engine.cpp")
         .cpp(true)
-        .std("c++17")
+        .std("c++23")
         .opt_level(3)
         .warnings(false)
         .flag("-ffp-contract=off")
