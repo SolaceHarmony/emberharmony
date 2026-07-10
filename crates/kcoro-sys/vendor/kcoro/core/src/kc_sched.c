@@ -36,12 +36,15 @@ static int kc_get_nprocs(void)
 
 static int kc_sched_debug_enabled(void)
 {
-    static int cached = -1;
-    if (__builtin_expect(cached == -1, 0)) {
+    /* Patch 0009: atomic (relaxed) — see kcoro_ref_debug_enabled. */
+    static kc_atomic_int cached = -1;
+    int v = atomic_load_explicit(&cached, memory_order_relaxed);
+    if (__builtin_expect(v == -1, 0)) {
         const char *env = getenv("KC_SCHED_DEBUG");
-        cached = (env && *env && env[0] != '0');
+        v = (env && *env && env[0] != '0');
+        atomic_store_explicit(&cached, v, memory_order_relaxed);
     }
-    return cached;
+    return v;
 }
 
 #define KC_SCHED_DEBUG(fmt, ...)                                                     \
@@ -268,7 +271,7 @@ static void* worker_main(void *arg){
         kcoro_t *co = rq_pop_locked(s);
         pthread_mutex_unlock(&s->rq_mu);
         if (co) {
-            KC_SCHED_DEBUG("worker %d resume co=%p state=%d tail=%p head=%p", w->id, (void*)co, co->state, (void*)s->rq_tail, (void*)s->rq_head);
+            KC_SCHED_DEBUG("worker %d resume co=%p state=%d tail=%p head=%p", w->id, (void*)co, (int)kc_co_state(co), (void*)s->rq_tail, (void*)s->rq_head);
             int expected = 0;
             if (!atomic_compare_exchange_strong_explicit(&co->running_flag, &expected, 1,
                                                          memory_order_acq_rel, memory_order_relaxed)) {
@@ -282,26 +285,26 @@ static void* worker_main(void *arg){
 
             co->main_co = w->main_co;
             kcoro_set_thread_main(w->main_co);
-            co->scheduler = (kcoro_sched_t*)s;
+            kc_co_sched_set(co, (kcoro_sched_t*)s);
             kcoro_resume(co);
             /* Patch 0001 (defense in depth): the coroutine has fully switched out
              * here. If its park gate holds a NOTIFIED token (1) — a wake landed but
              * lost every other race — promote it back to READY. Only consume NOTIFIED;
              * PARKED (2) is the coroutine's own marker and must stay. */
-            if (co->state == KCORO_PARKED) {
+            if (kc_co_state(co) == KCORO_PARKED) {
                 int gate = 1; /* KC_PARK_NOTIFIED */
                 if (atomic_compare_exchange_strong(&co->park_notify, &gate, 0)) {
-                    co->state = KCORO_READY;
+                    kc_co_state_set(co, KCORO_READY);
                 }
             }
-            if (co->state == KCORO_READY || co->state == KCORO_SUSPENDED) {
+            if (kc_co_state(co) == KCORO_READY || kc_co_state(co) == KCORO_SUSPENDED) {
                 kcoro_retain(co);
                 pthread_mutex_lock(&s->rq_mu);
                 rq_push_locked(s, co);
                 pthread_mutex_unlock(&s->rq_mu);
                 atomic_store_explicit(&co->running_flag, 0, memory_order_release);
                 kcoro_release(co);
-            } else if (co->state == KCORO_FINISHED) {
+            } else if (kc_co_state(co) == KCORO_FINISHED) {
                 atomic_store_explicit(&co->running_flag, 0, memory_order_release);
                 kcoro_release(co);
                 atomic_fetch_sub_explicit(&s->alive, 1, memory_order_acq_rel);
@@ -646,7 +649,7 @@ int kc_spawn_co(kc_sched_t* s, kcoro_fn_t fn, void* arg, size_t stack_size, kcor
     if(!s||!fn) return -1;
     kcoro_t *co=kcoro_create(fn,arg,stack_size);
     if(!co) return -1;
-    co->scheduler = (kcoro_sched_t*)s;
+    kc_co_sched_set(co, (kcoro_sched_t*)s);
     if(out_co) *out_co=co;
     atomic_fetch_add_explicit(&s->alive, 1, memory_order_acq_rel);
     /* Ready queue takes ownership; retain before enqueue so rq_pop_locked releases the queue hold. */
@@ -659,20 +662,20 @@ void kc_sched_enqueue_ready(kc_sched_t* s, kcoro_t* co)
 {
     if (!s || !co) return;
     pthread_mutex_lock(&s->rq_mu);
-    if (co->state == KCORO_RUNNING || co->ready_enqueued) {
+    if (kc_co_state(co) == KCORO_RUNNING || co->ready_enqueued) {
         pthread_mutex_unlock(&s->rq_mu);
         return;
     }
-    if (co->state == KCORO_FINISHED) {
+    if (kc_co_state(co) == KCORO_FINISHED) {
         KC_SCHED_DEBUG("skip enqueue finished co=%p", (void*)co);
         pthread_mutex_unlock(&s->rq_mu);
         return;
     }
-    if (co->state != KCORO_READY && co->state != KCORO_RUNNING) {
-        co->state = KCORO_READY;
+    if (kc_co_state(co) != KCORO_READY && kc_co_state(co) != KCORO_RUNNING) {
+        kc_co_state_set(co, KCORO_READY);
     }
     kcoro_retain(co);
-    co->scheduler = (kcoro_sched_t*)s;
+    kc_co_sched_set(co, (kcoro_sched_t*)s);
     rq_push_locked(s, co);
     pthread_mutex_unlock(&s->rq_mu);
     sched_wake_one(s); /* patch 0005: token + signal — the doorbell path (unpark) */

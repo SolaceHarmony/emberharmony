@@ -8,6 +8,40 @@ Built by this crate's `build.rs` with the upstream Makefile's flags
 (`crates/liquid-audio/native/src/engine/flashkern_engine.cpp`)
 are the consumers.
 
+## Patch 0010 — x86_64 switcher: post-return SP + SysV entry alignment
+
+Mirrored byte-identically from upstream (full entry there). The x86 switcher
+saved rsp with the RA still on-stack and push+ret'd a duplicate RIP — every
+resumed frame ran 8 bytes low (SIGBUS on first SSE spill under Rosetta); and
+kcoro_create seeded x86 entry rsp % 16 == 0 where SysV demands 8. Now: save
+post-return SP, restore via plain `jmp`, per-arch entry seeding in
+kcoro_create (AArch64 branch token-identical to before — this crate's built
+output on Apple Silicon is unchanged). Verified under Rosetta: 10k-hop
+alignment/SSE/canary harness + positive control on the old code, sched_basic,
+zero-spin idle, buffered + ptr-rendezvous channel tests.
+
+## Patch 0009 — atomic cross-thread fields: state, scheduler, debug caches (completes 0008)
+
+Mirrored byte-identically from upstream (full entry in upstream PATCHES.md).
+`co->state` → `kc_atomic_int`, `co->scheduler` → `kc_atomic_sched_ptr`, the
+lazy debug-env caches → relaxed atomics. ALL accesses relaxed via the
+`kc_co_state`/`kc_co_state_set`/`kc_co_sched`/`kc_co_sched_set` accessors —
+identical plain load/store codegen, so every timing edge of the park/handoff
+protocol is untouched (`kcoro_is_parked` disassembles instruction-identical;
+struct layout asserted unchanged). TSan: 0 warnings on sched_basic and the
+full rv_metrics stress (was 2 and 42). rv_metrics hammer n=30: 0 message
+drops; the drop/hang flake is pre-existing on pristine HEAD (measured n=35:
+3 drops, 12 hangs) — waiter-rethink territory, hers.
+
+## Patch 0008 — co->state race: cross-thread WRITE removed (upstream 72086d5)
+
+kcoro_unpark no longer writes the (then non-atomic) `co->state` from the
+external doorbell thread — redundant with the worker's own PARKED->READY
+promotion; the wake rides the atomic gate + ready-enqueue + running_flag CAS.
+The gate-based is_parked shortcut was tried and REVERTED: its PARKED edge
+lands a beat early and fired a rendezvous direct-handoff into dropping the
+final message (sends=800 recvs=799). Full entry upstream; completed by 0009.
+
 ## Patch 0007 — scheduler construction integrity (init order + loud partial-team failure)
 
 Found by a read-only concurrency audit (2026-07-10); fixed upstream (kcoro

@@ -36,7 +36,8 @@ static uint64_t next_kcoro_id = 1;
 
 /* Patch 0001: park-gate states. All transitions are seq_cst exchanges on
  * co->park_notify, the single source of truth for the park/unpark handshake —
- * co->state alone is a plain int and cannot order a wake against the park switch. */
+ * co->state (atomic since patch 0009, but always RELAXED) cannot order a wake
+ * against the park switch. */
 #define KC_PARK_EMPTY    0
 #define KC_PARK_NOTIFIED 1
 #define KC_PARK_PARKED   2
@@ -58,7 +59,7 @@ __attribute__((noinline)) static kcoro_t* kc_tls_main_fresh(void)
 void kcoro_funcp_protector(void)
 {
     kcoro_t *current = current_kcoro;
-    int state = current ? (int)current->state : -1;
+    int state = current ? (int)kc_co_state(current) : -1;
     fprintf(stderr,
             "kcoro: coroutine function returned unexpectedly (co=%p state=%d main=%p fn=%p)\n",
             (void*)current,
@@ -78,7 +79,7 @@ kcoro_t* kcoro_create_main(void)
 
     /* Initialize main coroutine */
     memset(main_co->reg, 0, sizeof(main_co->reg));
-    main_co->state = KCORO_RUNNING;
+    atomic_init(&main_co->state, KCORO_RUNNING);
     main_co->fn = NULL;  /* Main has no function */
     main_co->arg = NULL;
     main_co->id = 0;     /* Special ID for main */
@@ -88,6 +89,7 @@ kcoro_t* kcoro_create_main(void)
     atomic_init(&main_co->running_flag, 0);
     atomic_init(&main_co->park_notify, 0);
     atomic_init(&main_co->refcount, 1);
+    atomic_init(&main_co->scheduler, NULL);
     main_co->last_send_delivered = 0;
     
     /* Set as current */
@@ -127,7 +129,7 @@ kcoro_t* kcoro_create(kcoro_fn_t fn, void* arg, size_t stack_size)
     
     /* Initialize coroutine */
     memset(co->reg, 0, sizeof(co->reg));
-    co->state = KCORO_CREATED;
+    atomic_init(&co->state, KCORO_CREATED);
     co->fn = fn;
     co->arg = arg;
     co->id = __sync_fetch_and_add(&next_kcoro_id, 1);
@@ -138,16 +140,28 @@ kcoro_t* kcoro_create(kcoro_fn_t fn, void* arg, size_t stack_size)
     atomic_init(&co->running_flag, 0);
     atomic_init(&co->park_notify, 0);
     atomic_init(&co->refcount, 1);
+    atomic_init(&co->scheduler, NULL);
     co->last_send_delivered = 0;
     
-    /* Set up stack and entry point (ARM64 ABI compliant) */
+    /* Set up stack and entry point */
     uintptr_t stack_top = (uintptr_t)stack_mem + total_size;
     stack_top = stack_top & ~0xFUL;  /* 16-byte align */
     stack_top -= 16;  /* Leave space */
-    
+
+#if defined(__x86_64__)
+    /* SysV x86-64 function entry expects %rsp % 16 == 8 (as if a `call` just
+     * pushed the return address). The switcher jumps straight to reg[13] with
+     * rsp = reg[14], so seed that entry state here; rbp = 0 roots the frame
+     * chain for backtraces. (AArch64 below wants SP % 16 == 0 at all times —
+     * the split is the ABI difference, not a style choice.) */
+    co->reg[14] = (void*)(stack_top - 8);     /* RSP at reg[14] - entry state */
+    co->reg[15] = NULL;                       /* RBP at reg[15] */
+    co->reg[13] = (void*)kcoro_trampoline;    /* RIP at reg[13] - entry point */
+#else
     co->reg[14] = (void*)stack_top;           /* SP at reg[14] */
-    co->reg[15] = (void*)stack_top;           /* FP at reg[15] */  
+    co->reg[15] = (void*)stack_top;           /* FP at reg[15] */
     co->reg[13] = (void*)kcoro_trampoline;    /* LR at reg[13] - entry point */
+#endif
     
     return co;
 }
@@ -169,12 +183,17 @@ static void kcoro_free(kcoro_t* co)
 
 static int kcoro_ref_debug_enabled(void)
 {
-    static int cached = -1;
-    if (__builtin_expect(cached == -1, 0)) {
+    /* Patch 0009: atomic (relaxed) — every worker thread races through here on
+     * first use. Two threads may both compute the value; getenv is stable, so
+     * the double-store is idempotent. */
+    static kc_atomic_int cached = -1;
+    int v = atomic_load_explicit(&cached, memory_order_relaxed);
+    if (__builtin_expect(v == -1, 0)) {
         const char *env = getenv("KCORO_REF_DEBUG");
-        cached = (env && *env && env[0] != '0');
+        v = (env && *env && env[0] != '0');
+        atomic_store_explicit(&cached, v, memory_order_relaxed);
     }
-    return cached;
+    return v;
 }
 
 void kcoro_destroy(kcoro_t* co)
@@ -222,7 +241,7 @@ void kcoro_release(kcoro_t* co)
 
 void kcoro_resume(kcoro_t* co)
 {
-    if (!co || co->state == KCORO_FINISHED) return;
+    if (!co || kc_co_state(co) == KCORO_FINISHED) return;
     
     kcoro_t* yield_co = current_kcoro;
     kcoro_t* from_co = yield_co ? yield_co : main_kcoro;
@@ -232,9 +251,9 @@ void kcoro_resume(kcoro_t* co)
     
     /* Update states */
     if (yield_co && yield_co != co) {
-        yield_co->state = KCORO_SUSPENDED;
+        kc_co_state_set(yield_co, KCORO_SUSPENDED);
     }
-    co->state = KCORO_RUNNING;
+    kc_co_state_set(co, KCORO_RUNNING);
     current_kcoro = co;
     
     /* Context switch */
@@ -243,9 +262,9 @@ void kcoro_resume(kcoro_t* co)
     /* Returned from context switch - restore current */
     current_kcoro = yield_co ? yield_co : main_kcoro;
     if (yield_co) {
-        yield_co->state = KCORO_RUNNING;
+        kc_co_state_set(yield_co, KCORO_RUNNING);
     } else if (main_kcoro) {
-        main_kcoro->state = KCORO_RUNNING;
+        kc_co_state_set(main_kcoro, KCORO_RUNNING);
     }
 }
 
@@ -259,8 +278,8 @@ void kcoro_yield(void)
     }
 
     /* Update states */
-    current->state = KCORO_SUSPENDED;
-    main_co->state = KCORO_RUNNING;
+    kc_co_state_set(current, KCORO_SUSPENDED);
+    kc_co_state_set(main_co, KCORO_RUNNING);
     current_kcoro = main_co;
     
     /* Context switch back to main */
@@ -270,7 +289,7 @@ void kcoro_yield(void)
      * this frame — the resuming thread's kcoro_resume already set its own TLS to this
      * coroutine before switching in, and this frame's cached TLS address may belong to
      * the thread we parked on, not the one we resumed on. */
-    current->state = KCORO_RUNNING;
+    kc_co_state_set(current, KCORO_RUNNING);
 }
 
 void kcoro_yield_to(kcoro_t* target_co)
@@ -281,9 +300,9 @@ void kcoro_yield_to(kcoro_t* target_co)
     
     /* Update states */
     if (current) {
-        current->state = KCORO_SUSPENDED;
+        kc_co_state_set(current, KCORO_SUSPENDED);
     }
-    target_co->state = KCORO_RUNNING;
+    kc_co_state_set(target_co, KCORO_RUNNING);
     current_kcoro = target_co;
     
     /* Context switch */
@@ -292,7 +311,7 @@ void kcoro_yield_to(kcoro_t* target_co)
     /* When resumed, restore our state (Patch 0002: no TLS writes post-switch — see
      * kcoro_yield). */
     if (current) {
-        current->state = KCORO_RUNNING;
+        kc_co_state_set(current, KCORO_RUNNING);
     }
 }
 
@@ -302,7 +321,7 @@ void kcoro_park(void)
     kcoro_t* current = current_kcoro;
     kcoro_t* main_co = main_kcoro ? main_kcoro : (current ? current->main_co : NULL);
     if (!current || !main_co) return;
-    if (current->state == KCORO_FINISHED) return;
+    if (kc_co_state(current) == KCORO_FINISHED) return;
     /* Patch 0001: publish park intent on the gate FIRST. If a notification already
      * landed, consume it and do not park — every park caller loops and re-checks its
      * condition, so a spurious return is safe. */
@@ -310,17 +329,17 @@ void kcoro_park(void)
         atomic_store(&current->park_notify, KC_PARK_EMPTY);
         return;
     }
-    current->state = KCORO_PARKED;
-    main_co->state = KCORO_RUNNING;
+    kc_co_state_set(current, KCORO_PARKED);
+    kc_co_state_set(main_co, KCORO_RUNNING);
     current_kcoro = main_co;
     kcoro_switch(current, main_co);
     /* Patch 0001: resumed — retire this park cycle. A notification that arrived while
      * we were parked coalesces into this resume (all park sites re-check under lock). */
     atomic_store(&current->park_notify, KC_PARK_EMPTY);
     /* When unparked & resumed, state will be set by kcoro_unpark before scheduling */
-    if (current->state == KCORO_PARKED) {
+    if (kc_co_state(current) == KCORO_PARKED) {
         /* Defensive: if resumed without state change, mark running */
-        current->state = KCORO_RUNNING;
+        kc_co_state_set(current, KCORO_RUNNING);
     }
     /* Patch 0002: no TLS writes post-switch — see kcoro_yield. */
 }
@@ -328,8 +347,8 @@ void kcoro_park(void)
 void kcoro_unpark(kcoro_t* co)
 {
     if (!co) return;
-    /* Patch 0001: the gate decides, not co->state (a plain int that cannot order a
-     * wake against the park switch). Exchange to NOTIFIED:
+    /* Patch 0001: the gate decides, not co->state (relaxed-atomic since 0009 —
+     * still cannot order a wake against the park switch). Exchange to NOTIFIED:
      *   prev EMPTY/NOTIFIED — the target is running (or already has a wake pending):
      *     the token is stored; kcoro_park consumes it on entry. Nothing to schedule.
      *   prev PARKED — the target parked (or is mid-switch): ready it. If it is still
@@ -338,15 +357,15 @@ void kcoro_unpark(kcoro_t* co)
     if (atomic_exchange(&co->park_notify, KC_PARK_NOTIFIED) != KC_PARK_PARKED) {
         return;
     }
-    /* Patch 0008: do NOT write co->state here. `state` is a plain (non-atomic)
-     * enum; writing it from this (often EXTERNAL) thread races the owning
-     * worker's own reads/writes of state in kcoro_park and the scheduler loop —
-     * a data race the park_notify gate's operational ordering does not make
-     * legal in C. The write was pure redundancy: the worker promotes PARKED ->
-     * READY itself when it resumes the coroutine (kc_sched.c, the NOTIFIED-gate
-     * check), and the wake is carried by the atomic gate + this enqueue + the
-     * running_flag CAS. `state` is now single-owner (only the worker currently
-     * holding the coroutine touches it). */
+    /* Patch 0008: do NOT write co->state here — and keep it that way even now
+     * that state is atomic (0009). The write was pure redundancy: the worker
+     * promotes PARKED -> READY itself when it resumes the coroutine (kc_sched.c,
+     * the NOTIFIED-gate check), and the wake is carried by the atomic gate +
+     * this enqueue + the running_flag CAS. Writers of state are the owning
+     * worker plus kc_sched_enqueue_ready's PARKED->READY promotion (under
+     * rq_mu); a bare cross-thread store HERE would bypass both the mutex and
+     * the enqueue's state checks. Atomicity (0009) exists for the cross-thread
+     * readers (kcoro_is_parked), not to license new writers. */
     /* Patch 0004: enqueue to the coroutine's OWN scheduler first. The caller's
      * scheduler (kc_sched_current) is NULL on external threads and may be a different
      * instance under multiple dispatchers — either way the wake belongs to the
@@ -355,7 +374,7 @@ void kcoro_unpark(kcoro_t* co)
      * request slot, unpark the parked coordinator). No auto-created default scheduler
      * — manually-driven coroutines (co->scheduler == NULL off-runtime) keep the old
      * behavior of not enqueueing. */
-    kc_sched_t* s = (kc_sched_t*)co->scheduler;
+    kc_sched_t* s = (kc_sched_t*)kc_co_sched(co);
     if (!s) s = kc_sched_current();
     if (s) {
         kc_sched_enqueue_ready(s, co);
@@ -364,19 +383,16 @@ void kcoro_unpark(kcoro_t* co)
 
 int kcoro_is_parked(const kcoro_t* co)
 {
-    /* NOTE (patch 0008, residual — deliberately NOT changed here): this
-     * cross-thread READ of the non-atomic `state` enum still races the owning
-     * worker's writes in kcoro_park; it is the READ half of the data race the
-     * audit flagged. The COMPLETE fix is making `state` atomic (relaxed) so
-     * this stays value-identical to today (state == KCORO_PARKED) but legal —
-     * a ~38-site conversion across kcoro_core/kc_sched/kc_chan, its own careful
-     * pass. The gate-based alternative (park_notify == KC_PARK_PARKED) was
-     * tried and REVERTED: the gate goes PARKED a beat before the coroutine
-     * switches out, widening the "is parked" window enough to fire a rendezvous
+    /* Patch 0009 (closes the 0008 residual): this cross-thread READ was the
+     * remaining half of the state data race; `state` is atomic now, and this
+     * relaxed load is value-identical to the old plain read. Do NOT "improve"
+     * this to the park gate (park_notify == KC_PARK_PARKED) — that was tried
+     * and REVERTED: the gate goes PARKED a beat before the coroutine switches
+     * out, widening the "is parked" window enough to fire a rendezvous
      * direct-handoff early and DROP the final message (test_chan_rv_metrics:
-     * sends=800 recvs=799). is_parked's timing is load-bearing in kc_chan's
-     * handoff — only a value-neutral change (atomic state) is safe. */
-    return co && co->state == KCORO_PARKED;
+     * sends=800 recvs=799). is_parked's timing edge is load-bearing in
+     * kc_chan's handoff; only value-AND-timing-neutral changes are safe here. */
+    return co && kc_co_state(co) == KCORO_PARKED;
 }
 
 /* Internal coroutine trampoline function */
@@ -386,11 +402,11 @@ static void kcoro_trampoline(void)
     assert(current && current->fn);
     
     /* Mark as running and call the function */
-    current->state = KCORO_RUNNING;
+    kc_co_state_set(current, KCORO_RUNNING);
     current->fn(current->arg);
     
     /* Function completed - mark as finished */
-    current->state = KCORO_FINISHED;
+    kc_co_state_set(current, KCORO_FINISHED);
     
     /* Yield back to main coroutine. Patch 0002: this frame started on the FIRST
      * thread that ever ran the coroutine and may be finishing on a different one, so
@@ -399,7 +415,7 @@ static void kcoro_trampoline(void)
     {
         kcoro_t* main_co = kc_tls_main_fresh();
         if (main_co) {
-            main_co->state = KCORO_RUNNING;
+            kc_co_state_set(main_co, KCORO_RUNNING);
             kcoro_switch(current, main_co);
             return;
         }

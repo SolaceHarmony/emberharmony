@@ -11,15 +11,23 @@
  *     reg[14]    : rsp (stack pointer)
  *     reg[15]    : rbp (frame/base pointer)
  *
- * Save from_co's callee-saved regs, RIP (from [rsp]), and RSP/RBP.
- * Restore to_co's RSP/RBP and callee-saved regs, then transfer control to
- * its saved continuation. To make the continuation look like a normal call
- * target w.r.t. ABI stack alignment, we push the saved rip and `ret` to it.
+ * Save from_co's callee-saved regs, RIP (from [rsp]), and the POST-RETURN
+ * RSP/RBP. Restore to_co's RSP/RBP and callee-saved regs, then jump straight
+ * to its saved continuation.
  *
  * Notes:
- *  - System V AMD64: caller ensures 16-byte alignment before `call`. At function
- *    entry, after the return address is pushed, RSP % 16 == 8. By pushing the
- *    saved continuation and using `ret`, we preserve the expected entry state.
+ *  - reg[14] holds the stack pointer AS THE CONTINUATION EXPECTS IT — i.e. the
+ *    value rsp has when execution stands at reg[13]. For a resumed frame that
+ *    is the post-`ret` rsp (the caller's rsp with the return-address slot
+ *    consumed, ≡ 0 mod 16 at the instruction after `call`); for a fresh
+ *    coroutine kcoro_create seeds SysV function-entry state (≡ 8 mod 16, as if
+ *    a call had just pushed the return address). The restore is therefore a
+ *    plain `jmp` — nothing pushed, nothing duplicated.
+ *  - The previous revision saved rsp WITH the return address still on it and
+ *    push+ret'd a COPY of the RA on restore, leaving every resumed frame 8
+ *    bytes low: shifted locals and rsp % 16 == 8 where the ABI demands 0 —
+ *    the first SSE spill (movaps) faulted, SIGBUS on the first yield/resume
+ *    under Rosetta.
  *  - We do not save/restore XMM/FPU state here; kcoro avoids relying on it across
  *    switches (mirrors the ARM64 implementation policy).
  */
@@ -69,8 +77,10 @@ LABEL(kcoro_switch):
     movq (%rsp), %rax
     movq %rax, REG_RIP(%rdi)
 
-    /* Save stack pointers */
-    movq %rsp, %rax
+    /* Save the POST-RETURN stack pointer: the continuation resumes at the
+       instruction after our caller's `call`, where the RA slot is consumed.
+       Saving rsp itself here is the 8-byte-low bug described above. */
+    leaq 8(%rsp), %rax
     movq %rax, REG_RSP(%rdi)
     /* Mirror rbp in reg[15] for parity with kcoro_core.c setup */
     movq %rbp, %rax
@@ -89,10 +99,11 @@ LABEL(kcoro_switch):
     movq REG_RBX(%rsi), %rbx
     /* rbp already restored */
 
-    /* Transfer to continuation: push RIP then ret to keep ABI entry semantics */
+    /* Transfer to continuation: rsp already holds the continuation's expected
+       value (post-return for resumed frames, function-entry for fresh ones) —
+       jump without touching the stack. */
     movq REG_RIP(%rsi), %rax
-    pushq %rax
-    ret
+    jmp *%rax
 
 FUNC_SIZE(LABEL(kcoro), .-LABEL(kcoro))
 FUNC_SIZE(LABEL(kcoro_switch), .-LABEL(kcoro_switch))

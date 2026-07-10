@@ -37,6 +37,8 @@ static_assert(sizeof(kc_atomic_int) == sizeof(int) && alignof(kc_atomic_int) == 
 #else
 #include <stdatomic.h>
 typedef atomic_int kc_atomic_int;
+_Static_assert(sizeof(kc_atomic_int) == sizeof(int) && _Alignof(kc_atomic_int) == _Alignof(int),
+               "atomic_int must be layout-compatible with int (struct kcoro ABI)");
 #endif
 
 #ifdef __cplusplus
@@ -46,6 +48,25 @@ extern "C" {
 /* Forward declarations */
 typedef struct kcoro kcoro_t;
 typedef struct kcoro_sched kcoro_sched_t;
+
+/* Patch 0009: atomic owner-scheduler pointer. kcoro_unpark reads it UNLOCKED
+ * from external threads (the doorbell path) while workers reassign it at every
+ * resume and enqueue — a formal data race as a plain pointer (TSan: worker_main
+ * write vs kc_sched_enqueue_ready write vs kcoro_unpark read). Relaxed
+ * everywhere: same plain load/store codegen, no timing change; the writes are
+ * same-value in a single-scheduler process, and under multiple dispatchers any
+ * observed value is a live owner per patch 0004's semantics. */
+#ifdef __cplusplus
+typedef std::atomic<kcoro_sched_t*> kc_atomic_sched_ptr;
+static_assert(sizeof(kc_atomic_sched_ptr) == sizeof(kcoro_sched_t*) &&
+              alignof(kc_atomic_sched_ptr) == alignof(kcoro_sched_t*),
+              "std::atomic<T*> must be layout-compatible with T* (struct kcoro ABI)");
+#else
+typedef _Atomic(kcoro_sched_t*) kc_atomic_sched_ptr;
+_Static_assert(sizeof(kc_atomic_sched_ptr) == sizeof(kcoro_sched_t*) &&
+               _Alignof(kc_atomic_sched_ptr) == _Alignof(kcoro_sched_t*),
+               "_Atomic(T*) must be layout-compatible with T* (struct kcoro ABI)");
+#endif
 
 /* Coroutine function type */
 typedef void (*kcoro_fn_t)(void* arg);
@@ -66,14 +87,23 @@ struct kcoro {
     void* reg[32];               /* ARM64: x19-x28, x30, sp, x29 at specific indices */
     
     /* Coroutine metadata */
-    kcoro_state_t state;         /* Current execution state */
+    kc_atomic_int state;         /* Current execution state (holds kcoro_state_t values).
+                                    Atomic since patch 0009: kcoro_is_parked reads it from
+                                    OTHER threads (kc_chan's rendezvous direct-handoff
+                                    probe), a C data race while this was a plain enum. All
+                                    runtime accesses are RELAXED — on our targets that is
+                                    the same plain load/store codegen as the old enum, so
+                                    every timing edge of the park/handoff protocol is
+                                    untouched (patch 0008 lesson: is_parked's PARKED edge
+                                    is load-bearing). Ordering is carried by park_notify,
+                                    running_flag, and the scheduler locks — never by state. */
     kcoro_fn_t fn;               /* Task function */
     void* arg;                   /* Task argument */
     uint64_t id;                 /* Unique coroutine ID */
 
     /* Execution context */
     kcoro_t* main_co;            /* Main coroutine (yield target) */
-    kcoro_sched_t* scheduler;    /* Owning scheduler */
+    kc_atomic_sched_ptr scheduler; /* Owning scheduler (relaxed atomic — patch 0009) */
     bool ready_enqueued;         /* Scheduler ready-queue flag */
     kc_atomic_int running_flag;     /* 0 = idle, 1 = running */
     kc_atomic_int park_notify;      /* park gate: 0 empty / 1 notified / 2 parked. The whole
@@ -101,6 +131,17 @@ struct kcoro {
      * core lock structure unchanged. */
     int last_send_delivered;     /* 1 if last parked send was delivered by recv */
 };
+
+/* Patch 0009 (runtime-internal, C only): the ONLY sanctioned accessors for
+ * co->state. Relaxed, deliberately — state never carries ordering; substituting
+ * anything stronger (or a different source, like the park gate) changes the
+ * protocol's timing edges. C++ consumers must not touch the field at all. */
+#ifndef __cplusplus
+#define kc_co_state(co)        ((kcoro_state_t)atomic_load_explicit(&(co)->state, memory_order_relaxed))
+#define kc_co_state_set(co, v) atomic_store_explicit(&(co)->state, (v), memory_order_relaxed)
+#define kc_co_sched(co)        atomic_load_explicit(&(co)->scheduler, memory_order_relaxed)
+#define kc_co_sched_set(co, v) atomic_store_explicit(&(co)->scheduler, (v), memory_order_relaxed)
+#endif
 
 /** ARM64 assembly context switching primitive (internal). */
 extern void* kcoro_switch(kcoro_t* from_co, kcoro_t* to_co);
