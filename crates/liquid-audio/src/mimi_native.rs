@@ -4,11 +4,10 @@
 //! 1920 f32 samples at 24 kHz out, ~14 ms/frame on the M2 Max — measured
 //! against moshi-Rust at ≤ 4.2e-6 worst PCM error across the 250-slot KV wrap.
 //!
-//! Weights are a buffer (the engine discipline): the checkpoint safetensors is
-//! mmap'd once and every decoder tensor is handed to C as a zero-copy f32 span
-//! in checkpoint layout. The C side folds/re-arms what it needs ONCE at init
-//! into its own arena; nothing repacks per step. This struct owns the mmap for
-//! the decoder's whole life — the C side keeps pointers into it.
+//! Weights are a native-owned buffer (the engine discipline): C++ reads the
+//! checkpoint directly into one aligned resident image, parses tensor spans in
+//! place, and keeps that image alive inside the decoder. Rust passes one path;
+//! it never constructs Candle tensors or safetensors descriptors for this path.
 //!
 //! The kernel is the SUBSTRATE for streaming audio-out (no-fallbacks): if it
 //! can't initialize, loading fails loudly. There is no moshi fallback on the
@@ -18,27 +17,10 @@
 use std::ffi::{c_char, c_void, CString};
 use std::sync::Mutex;
 
-/// Mirror of the C `MimiWeight` (mimi_kernel.h). Field order/types exact.
-#[repr(C)]
-struct FfiMimiWeight {
-    name: *const c_char,
-    data: *const f32,
-    shape: *const i64,
-    ndim: u32,
-    len: u64,
-}
-
-/// Mirror of the C `MimiWeightTable`.
-#[repr(C)]
-struct FfiMimiWeightTable {
-    entries: *const FfiMimiWeight,
-    count: u32,
-}
-
 extern "C" {
-    fn mimi_decoder_new(
+    fn mimi_decoder_new_from_file(
         d: *mut *mut c_void,
-        w: *const FfiMimiWeightTable,
+        checkpoint: *const c_char,
         err: *mut c_char,
         errlen: usize,
     ) -> i32;
@@ -55,10 +37,6 @@ const PCM_CAP: usize = 1920 * 2;
 pub struct NativeMimi {
     dec: Mutex<*mut c_void>,
     codebooks: usize,
-    // Keep-alive for the zero-copy weight spans the C side holds pointers into.
-    _mmap: candle_core::safetensors::MmapedSafetensors,
-    _names: Vec<CString>,
-    _shapes: Vec<Vec<i64>>,
 }
 
 // SAFETY: the decoder pointer is only ever used under `dec`'s lock (single-slot
@@ -82,54 +60,16 @@ impl NativeMimi {
                 "mimi native: kernel ABI is fixed at 8 codebooks (MIMI_NQ), config says {codebooks}"
             ));
         }
-        // SAFETY: same contract as every other mmap'd-weights load in this
-        // stack (the file must not be truncated/mutated while mapped — the
-        // checkpoint is a read-only model artifact).
-        let mmap = unsafe { candle_core::safetensors::MmapedSafetensors::new(checkpoint) }
-            .map_err(|e| format!("mimi native: mmap {checkpoint:?}: {e}"))?;
-        let views = mmap.tensors();
-        let mut names: Vec<CString> = Vec::with_capacity(views.len());
-        let mut shapes: Vec<Vec<i64>> = Vec::with_capacity(views.len());
-        // Two passes so the entry pointers reference FINAL storage addresses
-        // (names/shapes vectors must not reallocate after we take pointers).
-        for (name, view) in &views {
-            if view.dtype() != safetensors::Dtype::F32 {
-                return Err(format!(
-                    "mimi native: tensor '{name}' is {:?}, expected F32 \
-                     (this checkpoint ships f32; a converted export needs a rim cast)",
-                    view.dtype()
-                ));
-            }
-            names.push(
-                CString::new(name.as_str())
-                    .map_err(|_| format!("mimi native: NUL in tensor name '{name}'"))?,
-            );
-            shapes.push(view.shape().iter().map(|&d| d as i64).collect());
-        }
-        let entries: Vec<FfiMimiWeight> = views
-            .iter()
-            .enumerate()
-            .map(|(i, (_, view))| FfiMimiWeight {
-                name: names[i].as_ptr(),
-                data: view.data().as_ptr() as *const f32,
-                shape: shapes[i].as_ptr(),
-                ndim: shapes[i].len() as u32,
-                len: (view.data().len() / 4) as u64,
-            })
-            .collect();
-        let table = FfiMimiWeightTable {
-            entries: entries.as_ptr(),
-            count: entries.len() as u32,
-        };
+        let path = CString::new(checkpoint.as_os_str().as_encoded_bytes())
+            .map_err(|_| format!("mimi native: NUL in checkpoint path {checkpoint:?}"))?;
         let mut dec: *mut c_void = std::ptr::null_mut();
         let mut err = [0i8; 512];
-        // SAFETY: table/entries/names/shapes all outlive this call; the C side
-        // copies what it needs at init and keeps only WEIGHT-DATA pointers,
-        // which `_mmap` keeps alive for the decoder's lifetime.
+        // SAFETY: path is NUL-terminated for the call. The returned decoder owns
+        // the native resident weight image and releases it in mimi_decoder_free.
         let rc = unsafe {
-            mimi_decoder_new(
+            mimi_decoder_new_from_file(
                 &mut dec,
-                &table,
+                path.as_ptr(),
                 err.as_mut_ptr() as *mut c_char,
                 err.len(),
             )
@@ -144,9 +84,6 @@ impl NativeMimi {
         Ok(Self {
             dec: Mutex::new(dec),
             codebooks,
-            _mmap: mmap,
-            _names: names,
-            _shapes: shapes,
         })
     }
 

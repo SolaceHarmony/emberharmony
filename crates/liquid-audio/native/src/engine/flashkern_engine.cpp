@@ -159,10 +159,14 @@ enum : int {
     REQ_CONV_LAYER = 2,
     REQ_ATTN_LAYER = 3,
     REQ_TOKEN_PASS = 4,
-    // Generic lane-uniform call: every lane runs fn(ctx, lane, lanes_total); the
-    // program synchronizes itself via lfm_lane_fence. This is what lets OTHER
-    // lane-uniform programs (the Rust depthformer frame) ride the SAME team —
-    // one dispatcher for the whole token, no foreign thread pools in the hot path.
+    // Generic lane-uniform call: every lane runs fn(ctx, lane, lanes_total). The
+    // program synchronizes ITSELF — and for Rust callers that means SpinBarrier
+    // ONLY, never lfm_lane_fence or any kcoro call: an M:N-migrated park under a
+    // live Rust frame is the patch-0002 TLS hazard (run_lanes' contract; every
+    // current caller complies). lfm_lane_fence stays exported for future NATIVE
+    // C++ callers. This is what lets other lane-uniform programs (the Rust
+    // depthformer frame, the grid) ride the SAME team — one dispatcher for the
+    // whole token, no foreign thread pools in the hot path.
     REQ_CALL = 5,
     REQ_SHUTDOWN = -1
 };
@@ -1079,9 +1083,12 @@ void *lfm_engine_new(int workers) {
 }
 
 // Run a caller-supplied lane-uniform program on the whole team: fn(ctx, lane, lanes)
-// on every lane, synchronized internally via lfm_lane_fence. One doorbell, one
-// completion — the same contract as every other pass. The caller's ctx must stay
-// valid for the (blocking) duration of this call.
+// on every lane. The program synchronizes itself — Rust callers via SpinBarrier
+// only (kcoro parks under live Rust frames are forbidden: the patch-0002 TLS
+// hazard; see run_lanes in native_engine.rs); native C++ callers may use
+// lfm_lane_fence. One doorbell, one completion — the same contract as every
+// other pass. The caller's ctx must stay valid for the (blocking) duration of
+// this call.
 int lfm_engine_call(void *ep, LfmLaneFn fn, void *ctx) {
     Engine *e = (Engine *)ep;
     if (!e || !fn) return -1;

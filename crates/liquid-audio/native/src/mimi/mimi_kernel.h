@@ -8,8 +8,8 @@
 //
 // Discipline (engine rules apply verbatim):
 //   - Weights are a buffer: flat name -> {f32*, len} table, zero-copy views
-//     into the mmap'd safetensors. Weight-norm folds ONCE at init into the
-//     arena; nothing repacks per step.
+//     into the native resident safetensors image. Weight-norm folds ONCE at
+//     init into the arena; nothing repacks per step.
 //   - Zero allocation in steady state: every stream state and scratch lives
 //     in ONE arena sized at init. State is POD (hibernatable).
 //   - f32 math, f32 accumulation, documented loop order. MATH IS ASSEMBLY AT
@@ -52,8 +52,8 @@ extern "C" {
 #endif
 
 /* ---- weight table -------------------------------------------------------
- * The Rust rim (or the parity harness) captures every decoder tensor as a
- * named f32 span in checkpoint layout and hands the whole table down once.
+ * The native safetensors loader (or the parity harness) captures every decoder
+ * tensor as a named f32 span in checkpoint layout and hands the table down once.
  * Names are the safetensors keys (e.g. "decoder.model.0.conv.weight",
  * "decoder_transformer.transformer.layers.3.self_attn.in_proj_weight",
  * "quantizer.rvq_first.vq.layers.0._codebook.embedding_sum", ...).
@@ -61,7 +61,7 @@ extern "C" {
 typedef struct MimiWeight {
     const char *name;   /* safetensors key, NUL-terminated */
     const float *data;  /* f32, checkpoint layout, read-only, process-long */
-    const int64_t *shape; /* dims, length ndim */
+    const uint64_t *shape; /* dims, length ndim */
     uint32_t ndim;
     uint64_t len;       /* total element count */
 } MimiWeight;
@@ -192,6 +192,10 @@ void mimi_seanet_reset(MimiSeanetState *st);
 typedef struct MimiDecoder MimiDecoder;
 int  mimi_decoder_new(MimiDecoder **d, const MimiWeightTable *w,
                       char *err, size_t errlen);
+/* Production constructor: C++ owns file loading, parsing, and the process-long
+ * resident weight image. No Rust/Candle tensor descriptors participate. */
+int  mimi_decoder_new_from_file(MimiDecoder **d, const char *checkpoint,
+                                char *err, size_t errlen);
 /* one latent frame of codes [MIMI_NQ] -> n_out samples (0 while priming);
  * pcm_out capacity MIMI_FRAME_OUT * 2 (drain headroom). */
 int  mimi_decoder_step(MimiDecoder *d, const uint32_t *codes, float *pcm_out);

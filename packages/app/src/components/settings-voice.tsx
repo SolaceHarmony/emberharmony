@@ -1,4 +1,4 @@
-import { Component, createMemo, createResource, createSignal, onCleanup, Show, type JSX } from "solid-js"
+import { Component, createMemo, createResource, createSignal, For, onCleanup, Show, type JSX } from "solid-js"
 import { Button } from "@thesolaceproject/emberharmony-ui/button"
 import { Select } from "@thesolaceproject/emberharmony-ui/select"
 import { Switch } from "@thesolaceproject/emberharmony-ui/switch"
@@ -25,6 +25,7 @@ import {
   setVoiceSettings,
   type DelegateSettings,
   type Lfm2Device,
+  type Lfm2ModeSampling,
   type Lfm2Settings,
   type VoiceEngineMode,
   type VoiceProvider,
@@ -295,6 +296,19 @@ export const SettingsVoice: Component = () => {
 
   const updateDelegate = (patch: Partial<DelegateSettings>) =>
     updateLfm2({ delegate: { ...lfm2().delegate, ...patch } })
+
+  // One row descriptor per decoding knob; 0 = off (greedy / no cutoff), so
+  // every knob except the budget accepts 0.
+  const samplingKnobs: readonly { field: keyof Lfm2ModeSampling; min: number; integer: boolean }[] = [
+    { field: "maxTokens", min: 1, integer: true },
+    { field: "textTemperature", min: 0, integer: false },
+    { field: "textTopK", min: 0, integer: true },
+    { field: "audioTemperature", min: 0, integer: false },
+    { field: "audioTopK", min: 0, integer: true },
+  ]
+
+  const updateModeSampling = (mode: "asr" | "tts" | "interleaved", patch: Partial<Lfm2ModeSampling>) =>
+    updateLfm2({ [mode]: { ...lfm2()[mode], ...patch } })
 
   async function update(patch: Record<string, unknown>) {
     if (desktop) {
@@ -703,23 +717,59 @@ export const SettingsVoice: Component = () => {
                   }}
                 />
               </SettingsRow>
-              <Show when={localEngine() === "lfm2Interleaved"}>
-                <SettingsRow
-                  title={language.t("settings.voice.row.maxTokens.title")}
-                  description={language.t("settings.voice.row.maxTokens.description")}
-                >
-                  <TextField
-                    hideLabel
-                    label={language.t("settings.voice.row.maxTokens.title")}
-                    defaultValue={String(lfm2().maxTokens)}
-                    onFocusOut={(e: FocusEvent) => {
-                      const n = numberFromInput(e)
-                      if (n !== undefined && n >= 1) updateLfm2({ maxTokens: Math.floor(n) })
-                    }}
-                  />
-                </SettingsRow>
-              </Show>
+              <SettingsRow
+                title={language.t("settings.voice.row.trace.title")}
+                description={language.t("settings.voice.row.trace.description")}
+              >
+                <Switch hideLabel checked={lfm2().trace} onChange={(checked) => updateLfm2({ trace: checked })}>
+                  {language.t("settings.voice.row.trace.title")}
+                </Switch>
+              </SettingsRow>
             </div>
+
+            {/* Per-mode decoding regimes: interleaved (the live conversation
+                path) first, then TTS and ASR. Every knob is a settings change,
+                never a rebuild; 0 = off (greedy / no cutoff). */}
+            <Show when={localEngine() === "lfm2Interleaved"}>
+              <For
+                each={
+                  [
+                    { key: "interleaved", knobs: samplingKnobs },
+                    { key: "tts", knobs: samplingKnobs },
+                    { key: "asr", knobs: samplingKnobs.filter((k) => !k.field.startsWith("audio")) },
+                  ] as const
+                }
+              >
+                {(mode) => (
+                  <>
+                    <h3 class="text-14-medium text-text-strong pb-2 pt-2">
+                      {language.t(`settings.voice.section.mode.${mode.key}`)}
+                    </h3>
+                    <div class="bg-surface-raised-base px-4 rounded-lg">
+                      <For each={mode.knobs}>
+                        {(knob) => (
+                          <SettingsRow
+                            title={language.t(`settings.voice.row.${knob.field}.title`)}
+                            description={language.t(`settings.voice.row.${knob.field}.description`)}
+                          >
+                            <TextField
+                              hideLabel
+                              label={language.t(`settings.voice.row.${knob.field}.title`)}
+                              defaultValue={String(lfm2()[mode.key][knob.field])}
+                              onFocusOut={(e: FocusEvent) => {
+                                const n = numberFromInput(e)
+                                if (n !== undefined && n >= knob.min)
+                                  updateModeSampling(mode.key, { [knob.field]: knob.integer ? Math.floor(n) : n })
+                              }}
+                            />
+                          </SettingsRow>
+                        )}
+                      </For>
+                    </div>
+                  </>
+                )}
+              </For>
+            </Show>
           </div>
 
           <Show when={localEngine() === "lfm2Interleaved"}>

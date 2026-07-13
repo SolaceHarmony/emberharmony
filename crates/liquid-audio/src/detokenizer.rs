@@ -18,6 +18,7 @@ use candle_nn::{linear, Embedding, Linear, Module, VarBuilder};
 
 use crate::model::lfm2_hf::{Cache, Lfm2Config, Model as Lfm2Model};
 use crate::model::linear::linear_forward;
+use crate::weights::{NativeWeightImage, ResidentWeights};
 
 const AUDIO_VOCAB: usize = 2048;
 const CODEBOOKS: usize = 8;
@@ -223,10 +224,30 @@ pub struct LFM2AudioDetokenizer {
     lin: Linear,
     istft: Istft,
     sliding_window: usize,
+    resident: Option<ResidentWeights>,
 }
 
 impl LFM2AudioDetokenizer {
     pub fn new(backbone_cfg: Lfm2Config, sliding_window: usize, vb: VarBuilder) -> Result<Self> {
+        Self::build(backbone_cfg, sliding_window, vb, None)
+    }
+
+    pub fn new_resident(
+        backbone_cfg: Lfm2Config,
+        sliding_window: usize,
+        resident: ResidentWeights,
+        device: &candle_core::Device,
+    ) -> Result<Self> {
+        let vb = resident.candle_builder(device);
+        Self::build(backbone_cfg, sliding_window, vb, Some(resident))
+    }
+
+    fn build(
+        backbone_cfg: Lfm2Config,
+        sliding_window: usize,
+        vb: VarBuilder,
+        resident: Option<ResidentWeights>,
+    ) -> Result<Self> {
         let emb = FusedEmbedding::new(vb.pp("emb"))?;
         let lfm = Lfm2Model::new(&backbone_cfg, vb.pp("lfm"))?;
         let lin = linear(EMB_DIM, 1282, vb.pp("lin"))?;
@@ -238,7 +259,19 @@ impl LFM2AudioDetokenizer {
             lin,
             istft,
             sliding_window,
+            resident,
         })
+    }
+
+    pub fn resident_weights(&self) -> Option<&NativeWeightImage> {
+        self.resident.as_ref().map(ResidentWeights::image)
+    }
+
+    pub fn compatibility_copies(&self) -> crate::weights::CompatibilityCopies {
+        self.resident
+            .as_ref()
+            .map(ResidentWeights::compatibility_copies)
+            .unwrap_or_default()
     }
 
     /// Additive sliding-window causal mask `(1,1,n,n)` — see [`build_sliding_mask`].

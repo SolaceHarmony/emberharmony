@@ -422,9 +422,11 @@ differential dumps (`parity/dump_*.py` → `parity/golden/*.safetensors`, gitign
 - **F32 remains intentional local math**, not persistent weight storage: audio PCM/front-end
   buffers, logits/sampling/loss calculations, attention-score/value matmuls, and BF16 matmul
   accumulation use F32 where the canonical path requires it.
-- `LFM_DEVICE=metal` selects Apple GPU execution; default/`cpu` uses CPU BF16 through the
-  NEON bridge. Audio sampling uses `temperature=1.0, top_k=4` (greedy audio is degenerate);
-  text is greedy.
+- Device selection is runtime policy: persisted Tauri `VoiceSettings.lfm2.device` is passed
+  through `select_device` when the engine is built. Cargo/target features only determine which
+  backends are available; they never select one. CPU uses the BF16 NEON bridge and Metal opens
+  the configured Apple GPU device. Sampling parameters likewise come from the per-mode settings
+  groups rather than the launching process environment.
 
 The BF16 GEMM entry is `src/compute/bf16_gemm.rs` (candle `CustomOp`s `Bf16Gemm` / `Bf16GemmNt`). The
 live kernel is the **tightened flashkern GEMM** (`native/kernels/aarch64/flashkern_neon.cpp` on aarch64,

@@ -34,6 +34,8 @@ pub mod resample; // torchaudio.functional.resample (windowed-sinc) port
 pub mod threads; // intra-op thread-pool parity with torch (at::intraop_default_num_threads)
 pub mod trainer; // trainer.py
 pub mod utils;
+#[path = "compute/weights.rs"]
+pub mod weights; // native resident checkpoint image + temporary Candle compatibility boundary
 #[path = "runtime/voice_runtime.rs"]
 pub mod voice_runtime; // in-process thread-managed voice service (external I/O, VAD, realtime)
 
@@ -51,7 +53,7 @@ pub use threads::{configure_intraop_threads, intraop_default_num_threads};
 pub use trainer::{Trainer, TrainerConfig};
 pub use utils::{get_model_dir, LFMModality};
 #[cfg(feature = "download")]
-pub use utils::{snapshot_download_with, DownloadProgress};
+pub use utils::{snapshot_download_to, snapshot_download_with, DownloadProgress};
 pub use voice_runtime::{
     AudioStatsSnapshot, ExternalAudioInput, ExternalAudioInputWriter, ExternalAudioOutput,
     RuntimeConfig, RuntimeEvent, SessionState, VoiceRuntime,

@@ -26,13 +26,32 @@ export interface DelegateSettings {
   target?: string
 }
 
+/** One turn mode's decoding regime. 0 = off (temperature 0 = greedy, top-k 0 = no cutoff). */
+export interface Lfm2ModeSampling {
+  /** Text sampling temperature; 0 = greedy decoding. */
+  textTemperature: number
+  /** Text top-k cutoff; 0 = no cutoff (full multinomial). */
+  textTopK: number
+  /** Audio sampling temperature; 0 = greedy (degenerate — unintelligible speech). */
+  audioTemperature: number
+  /** Audio top-k cutoff; 0 = no cutoff. */
+  audioTopK: number
+  /** Max tokens per turn; interleaved steps — every audio frame costs one. */
+  maxTokens: number
+}
+
 export interface Lfm2Settings {
   engine: VoiceEngineMode
   modelDir?: string
   moshiModelDir?: string
   device: Lfm2Device
   vadThreshold: number
-  maxTokens: number
+  /** Timestamped native voice call-graph diagnostics. */
+  trace: boolean
+  /** Per-mode decoding regimes; `interleaved` is the live conversation path. */
+  asr: Lfm2ModeSampling
+  tts: Lfm2ModeSampling
+  interleaved: Lfm2ModeSampling
   model?: string
   /** Download-source revision (branch/tag/commit); ignored once modelDir is set. */
   revision?: string
@@ -68,7 +87,13 @@ export const defaultVoiceSettings: VoiceSettings = {
     moshiModel: DEFAULT_MOSHI_MODEL,
     device: "metal",
     vadThreshold: 0.012,
-    maxTokens: 512,
+    trace: false,
+    // Per-mode defaults mirror the vendor demo (audio-model.js): ASR
+    // greedy/100, TTS text 0.7 + audio 0.8/top-64/1024. Interleaved keeps
+    // OUR raised 8192 budget (demo ships 1024).
+    asr: { textTemperature: 0, textTopK: 0, audioTemperature: 0, audioTopK: 0, maxTokens: 100 },
+    tts: { textTemperature: 0.7, textTopK: 0, audioTemperature: 0.8, audioTopK: 64, maxTokens: 1024 },
+    interleaved: { textTemperature: 1.0, textTopK: 0, audioTemperature: 1.0, audioTopK: 4, maxTokens: 8192 },
     delegate: { enabled: false },
   },
 }

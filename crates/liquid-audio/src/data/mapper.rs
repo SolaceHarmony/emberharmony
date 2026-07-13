@@ -633,26 +633,29 @@ mod tests {
 
     /// Multi-format decode (the soundfile-equivalent [P1] fix): decode real AIFF +
     /// ALAC/m4a files — formats the old WAV-only decoder rejected. Skips if the
-    /// fixtures aren't present (generate with: `afconvert -f AIFF question.wav
-    /// q.aiff` / `afconvert -f m4af -d alac question.wav q.m4a`).
+    /// repository fixtures aren't present (generate beside `question.wav` with
+    /// `afconvert -f AIFF question.wav question.aiff` and
+    /// `afconvert -f m4af -d alac question.wav question.m4a`).
     #[test]
     fn decodes_non_wav_containers() {
-        for env in ["LFM_TEST_AIFF", "LFM_TEST_M4A"] {
-            let Some(path) = std::env::var_os(env) else {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
+        for name in ["question.aiff", "question.m4a"] {
+            let path = root.join(name);
+            if !path.is_file() {
                 continue;
-            };
-            let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{env} {path:?}: {e}"));
+            }
+            let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{name} {path:?}: {e}"));
             let (wav, sr) = LFM2AudioChatMapper::load_audio_bytes(&bytes)
-                .unwrap_or_else(|e| panic!("decode {env} failed: {e}"));
-            assert_eq!(wav.dims().len(), 2, "{env}: expected (1, L)");
-            assert_eq!(wav.dim(0).unwrap(), 1, "{env}: expected mono row");
-            assert!(wav.dim(1).unwrap() > 1000, "{env}: too few samples");
-            assert!(sr >= 8000, "{env}: implausible sample rate {sr}");
+                .unwrap_or_else(|e| panic!("decode {name} failed: {e}"));
+            assert_eq!(wav.dims().len(), 2, "{name}: expected (1, L)");
+            assert_eq!(wav.dim(0).unwrap(), 1, "{name}: expected mono row");
+            assert!(wav.dim(1).unwrap() > 1000, "{name}: too few samples");
+            assert!(sr >= 8000, "{name}: implausible sample rate {sr}");
             let v = wav.flatten_all().unwrap().to_vec1::<f32>().unwrap();
             let peak = v.iter().fold(0f32, |m, &x| m.max(x.abs()));
-            assert!(peak.is_finite() && peak > 0.0, "{env}: silent/NaN decode");
+            assert!(peak.is_finite() && peak > 0.0, "{name}: silent/NaN decode");
             eprintln!(
-                "{env}: decoded {} samples @ {sr} Hz, peak {peak:.3}",
+                "{name}: decoded {} samples @ {sr} Hz, peak {peak:.3}",
                 v.len()
             );
         }

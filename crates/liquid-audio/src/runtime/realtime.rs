@@ -1435,7 +1435,7 @@ impl VoiceEngine for Lfm2VoiceEngine {
     ) -> Result<bool, String> {
         let s = |e: candle_core::Error| e.to_string();
         // Stage clock for #141 (turn-1 latency): respond entry → prefill done →
-        // first token → first audio frame, logged per turn under LIQUID_VOICE_TRACE.
+        // first token → first audio frame, logged per turn when runtime tracing is enabled.
         // Attributes the turn-1 penalty to a stage (Metal first-generate warmup is
         // the prime suspect: first token late, not decode late).
         let respond_entry = std::time::Instant::now();
@@ -2986,31 +2986,18 @@ mod tests {
     /// turn 1. This is the engine analog of `examples/chat_multiturn` and the only test that
     /// exercises `from_parts` + the collect→`append`→save path end-to-end.
     ///
-    /// `#[ignore]` (needs the model + is slow); run with:
-    ///   LFM_DEVICE=metal cargo test --features metal --lib -- --ignored engine_multiturn
-    /// (or `LFM_MODEL_DIR=/abs/model cargo test --lib -- --ignored engine_multiturn` on CPU BF16).
-    #[test]
-    #[ignore = "needs the real LFM2.5-Audio model; slow"]
-    fn engine_multiturn_grows_conv() {
-        use crate::{from_pretrained, get_model_dir, GenParams};
+    /// The caller supplies the device, just like the production settings boundary.
+    /// Backend features control availability only; they never select a device.
+    fn engine_multiturn_grows_conv_on(device: Device) {
+        use crate::{from_pretrained, GenParams};
 
-        // Device: Metal BF16 when built with the feature + LFM_DEVICE=metal; else CPU BF16.
-        let device = match std::env::var("LFM_DEVICE").ok().as_deref() {
-            #[cfg(feature = "metal")]
-            Some("metal") => Device::new_metal(0).expect("metal device"),
-            _ => {
-                assert!(
-                    crate::bf16_gemm::bf16_gemm_available(),
-                    "CPU BF16 needs the NEON BFMMLA kernel; use Metal on this Mac"
-                );
-                Device::Cpu
-            }
-        };
-
-        let model_ref = std::env::var("LFM_MODEL")
-            .or_else(|_| std::env::var("LFM_MODEL_DIR"))
-            .unwrap_or_else(|_| "LiquidAI/LFM2.5-Audio-1.5B".into());
-        let dir = get_model_dir(&model_ref, None).expect("resolve model dir");
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../experiments/lfm2-audio-voice/model");
+        assert!(
+            dir.join("config.json").is_file(),
+            "missing model fixture: {}",
+            dir.display()
+        );
         let cfg: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
                 .unwrap();
@@ -3069,6 +3056,27 @@ mod tests {
         assert!(t2 > t1, "turn 2 text must grow: {t1} -> {t2}");
         assert!(a2 > a1, "turn 2 audio_out must grow: {a1} -> {a2}");
         assert!(m2 > m1, "turn 2 modality_flag must grow: {m1} -> {m2}");
+    }
+
+    /// `#[ignore]` because it needs the repository model fixture and is slow.
+    /// Run with `cargo test --lib -- --ignored engine_multiturn_grows_conv_cpu`.
+    #[test]
+    #[ignore = "needs the real LFM2.5-Audio model; slow"]
+    fn engine_multiturn_grows_conv_cpu() {
+        assert!(
+            crate::bf16_gemm::bf16_gemm_available(),
+            "CPU BF16 needs the in-tree BFMMLA kernel"
+        );
+        engine_multiturn_grows_conv_on(Device::Cpu);
+    }
+
+    /// Run with
+    /// `cargo test --features metal --lib -- --ignored engine_multiturn_grows_conv_metal`.
+    #[cfg(feature = "metal")]
+    #[test]
+    #[ignore = "needs the real LFM2.5-Audio model; slow"]
+    fn engine_multiturn_grows_conv_metal() {
+        engine_multiturn_grows_conv_on(Device::new_metal(0).expect("metal device"));
     }
 
     #[test]

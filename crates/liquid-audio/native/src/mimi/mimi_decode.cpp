@@ -22,6 +22,7 @@
 // units (1–5), which may not exist yet — link-time resolution, not compile-time.
 
 #include "mimi_kernel.h"
+#include "lfm_safetensors.h"
 
 #include <cmath>    // erff, expf, sqrtf
 #include <cstdio>   // snprintf, fprintf, stderr
@@ -672,6 +673,9 @@ extern "C" void mimi_layer_norm_f32(const float *x, const float *w,
 
 struct MimiDecoder {
     MimiArena arena;
+    // Non-null only for mimi_decoder_new_from_file. Every unit keeps direct
+    // pointers into this image, so the decoder owns it for its whole lifetime.
+    LfmWeightImage *weights;
 
     // Unit states (all carved from `arena`; no per-unit heap ownership).
     MimiQuantState *quant;
@@ -769,6 +773,80 @@ extern "C" int mimi_decoder_new(MimiDecoder **d_out, const MimiWeightTable *w,
     return 0;
 }
 
+extern "C" int mimi_decoder_new_from_file(MimiDecoder **d_out,
+                                           const char *checkpoint,
+                                           char *err, size_t errlen) {
+    if (!d_out) return -1;
+    *d_out = NULL;
+    if (!checkpoint || checkpoint[0] == '\0') {
+        MIMI_ERR("mimi_decoder_new_from_file: empty checkpoint path");
+        return -1;
+    }
+
+    LfmWeightImage *image = NULL;
+    int rc = lfm_weights_open(checkpoint, &image, err, errlen);
+    if (rc != LFM_WEIGHT_OK) return rc;
+
+    const size_t count = lfm_weights_count(image);
+    if (count > UINT32_MAX) {
+        MIMI_ERR("mimi_decoder_new_from_file: too many tensors (%zu)", count);
+        lfm_weights_close(image);
+        return -3;
+    }
+
+    // Descriptor array only: tensor names, shapes, and payloads stay in the
+    // resident image. Unit initialization resolves direct payload pointers and
+    // does not retain this temporary table.
+    MimiWeight *entries = (MimiWeight *)calloc(count, sizeof(MimiWeight));
+    if (count != 0 && !entries) {
+        MIMI_ERR("mimi_decoder_new_from_file: OOM allocating %zu descriptors", count);
+        lfm_weights_close(image);
+        return -4;
+    }
+
+    for (size_t i = 0; i < count; ++i) {
+        LfmTensorView view = {};
+        rc = lfm_weights_at(image, i, &view);
+        if (rc != LFM_WEIGHT_OK) {
+            MIMI_ERR("mimi_decoder_new_from_file: tensor lookup %zu failed", i);
+            free(entries);
+            lfm_weights_close(image);
+            return rc;
+        }
+        if (view.dtype != LFM_DTYPE_F32) {
+            MIMI_ERR("mimi_decoder_new_from_file: tensor '%s' is %s, expected F32",
+                     view.name, lfm_weights_dtype_name(view.dtype));
+            free(entries);
+            lfm_weights_close(image);
+            return -3;
+        }
+        if (((uintptr_t)view.data & (alignof(float) - 1)) != 0) {
+            MIMI_ERR("mimi_decoder_new_from_file: tensor '%s' is not f32-aligned",
+                     view.name);
+            free(entries);
+            lfm_weights_close(image);
+            return -3;
+        }
+        entries[i] = MimiWeight{
+            view.name,
+            (const float *)view.data,
+            view.shape,
+            view.rank,
+            view.elements,
+        };
+    }
+
+    const MimiWeightTable table = {entries, (uint32_t)count};
+    rc = mimi_decoder_new(d_out, &table, err, errlen);
+    free(entries);
+    if (rc != 0) {
+        lfm_weights_close(image);
+        return rc;
+    }
+    (*d_out)->weights = image;
+    return 0;
+}
+
 extern "C" int mimi_decoder_step(MimiDecoder *d, const uint32_t *codes,
                                  float *pcm_out) {
     // Faithful port of Mimi::decode_step (mimi.rs:214). In our streaming path
@@ -830,6 +908,7 @@ extern "C" void mimi_decoder_free(MimiDecoder *d) {
     // Every unit state and folded weight lives in the single arena, so one free
     // reclaims all of it; the units own no separate heap.
     free(d->arena.base);
+    lfm_weights_close(d->weights);
     free(d);
 }
 

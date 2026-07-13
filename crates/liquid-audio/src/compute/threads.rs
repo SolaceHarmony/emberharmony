@@ -3,8 +3,7 @@
 //! candle's CPU compute is multi-threaded — `matmul` goes through the `gemm` crate
 //! (rayon feature) and conv/sort/many kernels call rayon directly — but it sizes the
 //! pool from `num_cpus::get()` (**all** logical cores). torch does **not**: ATen's
-//! `intraop_default_num_threads()` (`aten/src/ATen/ParallelCommon.cpp`) honours
-//! `OMP_NUM_THREADS` / `MKL_NUM_THREADS`, and otherwise calls
+//! `intraop_default_num_threads()` (`aten/src/ATen/ParallelCommon.cpp`) calls
 //! `TaskThreadPoolBase::defaultNumThreads()`, which on **Apple Silicon queries
 //! `hw.perflevel0.physicalcpu` — the performance cores only**, deliberately excluding
 //! the efficiency (E) cores. Scheduling compute-bound matmul onto the slow E-cores
@@ -15,22 +14,10 @@
 //! Call [`configure_intraop_threads`] once, before the first tensor op (e.g. at the top
 //! of `from_pretrained`). It is a no-op if the global pool was already built.
 
-/// Replicates torch `at::intraop_default_num_threads()`:
-/// 1. `OMP_NUM_THREADS`, then `MKL_NUM_THREADS` (torch's order); we also accept
-///    `RAYON_NUM_THREADS` since that is what candle/rayon otherwise read.
-/// 2. else `TaskThreadPoolBase::defaultNumThreads()` — on macOS the count of
-///    performance cores (`hw.perflevel0.physicalcpu`); elsewhere physical cores.
+/// Deterministic hardware policy: on macOS use the performance-core count
+/// (`hw.perflevel0.physicalcpu`); elsewhere use the physical-core count. Product
+/// configuration never comes from ambient OMP/MKL/Rayon environment variables.
 pub fn intraop_default_num_threads() -> usize {
-    for var in ["OMP_NUM_THREADS", "MKL_NUM_THREADS", "RAYON_NUM_THREADS"] {
-        if let Some(n) = std::env::var(var)
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-        {
-            if n > 0 {
-                return n;
-            }
-        }
-    }
     #[cfg(target_os = "macos")]
     {
         // torch's exact source on Apple Silicon. Fall back to the overall physical

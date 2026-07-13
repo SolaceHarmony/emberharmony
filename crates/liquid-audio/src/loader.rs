@@ -1,10 +1,13 @@
-//! Model loading — `config.json` → configs → safetensors VarBuilder → model.
+//! Model loading — `config.json` + one native resident weight image → model.
 //!
 //! Mirrors `LFM2AudioModel.from_pretrained` / `LFM2AudioProcessor.from_pretrained`:
-//! parse the config, construct the typed configs, memory-map the safetensors, and
-//! build the model + processor. Persistent model weights load at the floating
-//! dtype stored in the safetensors headers; callers do not choose a convenience
-//! dtype. BF16 CPU inference requires the in-tree NEON BFMMLA matmul bridge.
+//! parse the config, construct the typed configs, load safetensors once through
+//! the native C++ image, and build the model + processor. Remaining Candle model
+//! components use the explicit compatibility bridge in `compute/weights.rs`;
+//! production loading does not reparse or remap the checkpoint through Candle.
+//! Persistent model weights keep the floating dtype stored in the checkpoint.
+//! This module does not inspect process environment for model or device choices;
+//! its host resolves persisted application settings and passes both explicitly.
 //! Expects a local model directory (download the HF repo first; hf-hub
 //! auto-download is a follow-up).
 
@@ -24,6 +27,7 @@ use crate::model::lfm2_audio::{DepthformerConfig, LFM2AudioModel, LossConf};
 use crate::model::lfm2_hf::Lfm2Config;
 use crate::moshi::models::get_mimi;
 use crate::processor::{LFM2AudioProcessor, PreprocessorConfig};
+use crate::weights::ResidentWeights;
 
 fn err(e: impl std::fmt::Display) -> candle_core::Error {
     candle_core::Error::Msg(e.to_string())
@@ -157,8 +161,8 @@ pub fn from_pretrained(
     let config: Value =
         serde_json::from_str(&fs::read_to_string(dir.join("config.json")).map_err(err)?)
             .map_err(err)?;
-    let safes = model_safetensors_in(dir)?;
-    let dtype = safetensors_floating_dtype(&safes)?;
+    let resident = ResidentWeights::open(dir).map_err(err)?;
+    let dtype = resident.dtype();
     if dtype == DType::BF16 && device.is_cpu() && !crate::bf16_gemm::bf16_gemm_available() {
         return Err(err(
             "CPU bf16 inference requires the in-tree NEON BFMMLA matmul kernel, but it is \
@@ -213,10 +217,20 @@ pub fn from_pretrained(
     // the model off-distribution.
     crate::chat_template::verify_snapshot(dir, &tokenizer)?;
 
-    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&safes, dtype, device)? };
-    let model = LFM2AudioModel::new(
-        lfm_cfg, &enc_cfg, &depth_cfg, codebooks, n_text, n_audio, special, &loss_conf, vb,
+    let model = LFM2AudioModel::new_resident(
+        lfm_cfg, &enc_cfg, &depth_cfg, codebooks, n_text, n_audio, special, &loss_conf, resident,
+        device,
     )?;
+    let copies = model.compatibility_copies();
+    eprintln!(
+        "[voice] native checkpoint resident: {} tensors / {} bytes; Candle compatibility: {} tensors / {} bytes copied",
+        model.resident_weights().map_or(0, |weights| weights.len()),
+        model
+            .resident_weights()
+            .map_or(0, |weights| weights.resident_bytes()),
+        copies.tensors,
+        copies.bytes
+    );
 
     let prep: PreprocessorConfig =
         serde_json::from_value(config["preprocessor"].clone()).map_err(err)?;
@@ -231,8 +245,8 @@ pub fn from_pretrained(
     //    only) used by `decode`. `None` for v1, where `decode` falls back to `mimi`.
     // No silent fallback for full snapshots: a present `audio_detokenizer/`
     // propagates any load error rather than quietly dropping to Mimi.
-    let mimi: Option<Box<dyn AudioDetokenizer>> = load_mimi(dir, codebooks, device)?
-        .map(|m| Box::new(m) as Box<dyn AudioDetokenizer>);
+    let mimi: Option<Box<dyn AudioDetokenizer>> =
+        load_mimi(dir, codebooks, device)?.map(|m| Box::new(m) as Box<dyn AudioDetokenizer>);
     let audio_out: Option<Box<dyn AudioDetokenizer>> = if dir.join("audio_detokenizer").is_dir() {
         Some(Box::new(load_detokenizer(dir, device)?))
     } else {
@@ -362,8 +376,8 @@ pub fn from_pretrained_trainable(dir: &Path, device: &Device) -> Result<Trainabl
     let tokenizer = LFM2AudioProcessor::load_tokenizer(dir)?;
     // Mimi codec + LFM2 detokenizer loaded independently (see `from_pretrained`):
     // training preprocessing also encodes audio-out via `processor.mimi.encode`.
-    let mimi: Option<Box<dyn AudioDetokenizer>> = load_mimi(dir, codebooks, device)?
-        .map(|m| Box::new(m) as Box<dyn AudioDetokenizer>);
+    let mimi: Option<Box<dyn AudioDetokenizer>> =
+        load_mimi(dir, codebooks, device)?.map(|m| Box::new(m) as Box<dyn AudioDetokenizer>);
     let audio_out: Option<Box<dyn AudioDetokenizer>> = if dir.join("audio_detokenizer").is_dir() {
         Some(Box::new(load_detokenizer(dir, device)?))
     } else {
@@ -422,8 +436,6 @@ fn load_detokenizer(dir: &Path, device: &Device) -> Result<LFM2AudioDetokenizer>
     }
     let sliding_window = cfg["sliding_window"].as_u64().unwrap_or(30) as usize;
     let lfm_cfg: Lfm2Config = serde_json::from_value(cfg).map_err(err)?;
-    let safes = model_safetensors_in(&detok_dir)?;
-    let dtype = safetensors_floating_dtype(&safes)?;
-    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&safes, dtype, device)? };
-    LFM2AudioDetokenizer::new(lfm_cfg, sliding_window, vb)
+    let resident = ResidentWeights::open(&detok_dir).map_err(err)?;
+    LFM2AudioDetokenizer::new_resident(lfm_cfg, sliding_window, resident, device)
 }

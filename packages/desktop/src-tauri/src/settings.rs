@@ -96,6 +96,117 @@ pub struct DelegateSettings {
     pub target: Option<String>,
 }
 
+/// One turn mode's decoding regime. The vendor demo (`audio-model.js`) runs a
+/// DIFFERENT regime per mode — ASR greedy/100, TTS text 0.7 + audio 0.8/top-64,
+/// interleaved text 1.0 + audio 1.0/top-4 — so each mode gets its own group.
+/// Convention throughout: `0` = off (temperature 0 = greedy, top-k 0 = no cutoff).
+///
+/// Deliberately NOT `Deserialize`/`Default`: three modes have three different
+/// defaults, so a partial stored group must fill from ITS OWN mode's default —
+/// each `Lfm2Settings` field routes through a mode-specific `deserialize_with`
+/// merge. A shared `Default` would silently fill a sparse `tts`/`asr` group
+/// with interleaved values (and schema evolution makes EVERY store's groups
+/// partial the day a field is added).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Lfm2ModeSampling {
+    /// Text sampling temperature. `0` = greedy decoding — a repetition machine
+    /// at 1.2B in open conversation, but exactly right for ASR.
+    pub text_temperature: f64,
+    /// Text top-k cutoff. `0` = no cutoff (full multinomial over the vocabulary).
+    pub text_top_k: u32,
+    /// Audio sampling temperature. `0` = greedy — degenerate for the
+    /// Depthformer (unintelligible speech); the model is trained for sampled audio.
+    pub audio_temperature: f64,
+    /// Audio top-k cutoff. `0` = no cutoff.
+    pub audio_top_k: u32,
+    /// Max tokens per turn. Interleaved steps: every audio frame costs one.
+    pub max_tokens: u32,
+}
+
+impl Lfm2ModeSampling {
+    /// ASR (`audio-model.js`): greedy text, no audio out, 100-token budget.
+    fn asr_default() -> Self {
+        Self {
+            text_temperature: 0.0,
+            text_top_k: 0,
+            audio_temperature: 0.0,
+            audio_top_k: 0,
+            max_tokens: 100,
+        }
+    }
+
+    /// TTS (`audio-model.js`): text 0.7, audio 0.8/top-64, 1024-token budget.
+    fn tts_default() -> Self {
+        Self {
+            text_temperature: 0.7,
+            text_top_k: 0,
+            audio_temperature: 0.8,
+            audio_top_k: 64,
+            max_tokens: 1024,
+        }
+    }
+
+    /// Interleaved conversation — the live path. Text/audio sampling is the
+    /// demo regime (text 1.0 full multinomial, audio 1.0/top-4); the budget is
+    /// OUR raised 8192 ceiling (demo ships 1024 ≈ 1 min; the model's 32,768
+    /// context is the real limit and hitting the cap is LOUD, never silent).
+    fn interleaved_default() -> Self {
+        Self {
+            text_temperature: 1.0,
+            text_top_k: 0,
+            audio_temperature: 1.0,
+            audio_top_k: 4,
+            max_tokens: 8192,
+        }
+    }
+}
+
+/// A stored group as written (every field optional). Merging onto the mode's
+/// own default is what keeps a partial `tts` group a TTS regime.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Lfm2ModeSamplingPatch {
+    text_temperature: Option<f64>,
+    text_top_k: Option<u32>,
+    audio_temperature: Option<f64>,
+    audio_top_k: Option<u32>,
+    max_tokens: Option<u32>,
+}
+
+impl Lfm2ModeSampling {
+    fn merged(base: Self, patch: Lfm2ModeSamplingPatch) -> Self {
+        Self {
+            text_temperature: patch.text_temperature.unwrap_or(base.text_temperature),
+            text_top_k: patch.text_top_k.unwrap_or(base.text_top_k),
+            audio_temperature: patch.audio_temperature.unwrap_or(base.audio_temperature),
+            audio_top_k: patch.audio_top_k.unwrap_or(base.audio_top_k),
+            max_tokens: patch.max_tokens.unwrap_or(base.max_tokens),
+        }
+    }
+}
+
+fn de_asr<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Lfm2ModeSampling, D::Error> {
+    Ok(Lfm2ModeSampling::merged(
+        Lfm2ModeSampling::asr_default(),
+        Lfm2ModeSamplingPatch::deserialize(d)?,
+    ))
+}
+
+fn de_tts<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Lfm2ModeSampling, D::Error> {
+    Ok(Lfm2ModeSampling::merged(
+        Lfm2ModeSampling::tts_default(),
+        Lfm2ModeSamplingPatch::deserialize(d)?,
+    ))
+}
+
+fn de_interleaved<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Lfm2ModeSampling, D::Error> {
+    Ok(Lfm2ModeSampling::merged(
+        Lfm2ModeSampling::interleaved_default(),
+        Lfm2ModeSamplingPatch::deserialize(d)?,
+    ))
+}
+
 /// Local voice provider config — replaces the old `LFM_*` env vars.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -110,8 +221,21 @@ pub struct Lfm2Settings {
     pub device: Lfm2Device,
     /// Energy-VAD threshold (mic_chat default 0.012).
     pub vad_threshold: f32,
-    /// Max tokens per turn (mic_chat default 512).
-    pub max_tokens: u32,
+    /// Timestamped native voice call-graph diagnostics. Persisted and explicit;
+    /// never inferred from the desktop process environment.
+    pub trace: bool,
+    /// Per-mode decoding regimes (ASR / TTS / interleaved conversation).
+    /// Each field fills absent AND partial stored groups from its own mode's
+    /// default — see the `Lfm2ModeSampling` doc for why there is no shared one.
+    #[serde(deserialize_with = "de_asr", default = "Lfm2ModeSampling::asr_default")]
+    pub asr: Lfm2ModeSampling,
+    #[serde(deserialize_with = "de_tts", default = "Lfm2ModeSampling::tts_default")]
+    pub tts: Lfm2ModeSampling,
+    #[serde(
+        deserialize_with = "de_interleaved",
+        default = "Lfm2ModeSampling::interleaved_default"
+    )]
+    pub interleaved: Lfm2ModeSampling,
     /// Hugging Face model id used by the cache/download resolver.
     pub model: Option<String>,
     /// Optional fixed seed for reproducible generation.
@@ -213,12 +337,10 @@ impl Default for Lfm2Settings {
             moshi_model_dir: None,
             device: Lfm2Device::default(),
             vad_threshold: 0.012,
-            // Audio needs more tokens per second than text: the vendor's 512-token
-            // audio default truncates spoken replies mid-sentence. 8192 lets a
-            // long turn run ~10 minutes of interleaved speech before the cap —
-            // the model's 32,768-token context is the real ceiling, and hitting
-            // the cap is LOUD now ("max_new_tokens EXHAUSTED"), never silent.
-            max_tokens: 8192,
+            trace: false,
+            asr: Lfm2ModeSampling::asr_default(),
+            tts: Lfm2ModeSampling::tts_default(),
+            interleaved: Lfm2ModeSampling::interleaved_default(),
             model: Some(DEFAULT_LFM2_MODEL.to_string()),
             seed: None,
             revision: None,
@@ -340,7 +462,20 @@ mod tests {
         assert_eq!(json["provider"], "off");
         assert_eq!(json["lastProvider"], "lfm2");
         assert_eq!(json["lfm2"]["engine"], "moshiRealtime");
-        assert_eq!(json["lfm2"]["maxTokens"], 8192);
+        assert_eq!(json["lfm2"]["trace"], false);
+        // Per-mode regimes, camelCase groups. Interleaved = the live path.
+        assert_eq!(json["lfm2"]["interleaved"]["maxTokens"], 8192);
+        assert_eq!(json["lfm2"]["interleaved"]["textTemperature"], 1.0);
+        assert_eq!(json["lfm2"]["interleaved"]["textTopK"], 0);
+        assert_eq!(json["lfm2"]["interleaved"]["audioTemperature"], 1.0);
+        assert_eq!(json["lfm2"]["interleaved"]["audioTopK"], 4);
+        // ASR is greedy/short; TTS is the demo's 0.7 / 0.8+top-64 regime.
+        assert_eq!(json["lfm2"]["asr"]["textTemperature"], 0.0);
+        assert_eq!(json["lfm2"]["asr"]["maxTokens"], 100);
+        assert_eq!(json["lfm2"]["tts"]["textTemperature"], 0.7);
+        assert_eq!(json["lfm2"]["tts"]["audioTemperature"], 0.8);
+        assert_eq!(json["lfm2"]["tts"]["audioTopK"], 64);
+        assert_eq!(json["lfm2"]["tts"]["maxTokens"], 1024);
         // CPU on every platform since the measured flip (engine work, 2026-07-09):
         // the lane-team engine leads Metal on both latency and underruns.
         assert_eq!(json["lfm2"]["device"], "cpu");
@@ -360,9 +495,47 @@ mod tests {
         assert_eq!(v.last_provider, Some(VoiceProvider::Lfm2));
         assert_eq!(v.lfm2.device, Lfm2Device::Metal);
         assert_eq!(v.lfm2.vad_threshold, 0.012); // filled from Default
-        assert_eq!(v.lfm2.max_tokens, 8192);
+        assert!(!v.lfm2.trace); // diagnostics stay off unless the stored settings enable them
+        // Absent mode groups take the correct PER-MODE defaults (older
+        // stores predate the groups entirely).
+        assert_eq!(v.lfm2.interleaved.max_tokens, 8192);
+        assert_eq!(v.lfm2.interleaved.text_temperature, 1.0);
+        assert_eq!(v.lfm2.interleaved.audio_top_k, 4);
+        assert_eq!(v.lfm2.asr.text_temperature, 0.0);
+        assert_eq!(v.lfm2.asr.max_tokens, 100);
+        assert_eq!(v.lfm2.tts.audio_top_k, 64);
         assert_eq!(v.lfm2.engine, LocalVoiceEngine::MoshiRealtime);
         assert_eq!(v.lfm2.moshi_model.as_deref(), Some(DEFAULT_MOSHI_MODEL));
+    }
+
+    #[test]
+    fn partial_mode_group_fills_from_its_own_modes_default() {
+        // Sparse stored groups (hand edits today; EVERY store the day a field
+        // is added to Lfm2ModeSampling): explicit keys win, and the rest fill
+        // from that mode's OWN default — a sparse tts group must stay a TTS
+        // regime, never pick up interleaved values.
+        let json = serde_json::json!({
+            "lfm2": {
+                "interleaved": { "textTopK": 64, "textTemperature": 0.7 },
+                "tts": { "maxTokens": 512 },
+                "asr": { "maxTokens": 50 },
+            }
+        });
+        let v = decode_voice_settings(json).unwrap();
+        assert_eq!(v.lfm2.interleaved.text_top_k, 64);
+        assert_eq!(v.lfm2.interleaved.text_temperature, 0.7);
+        assert_eq!(v.lfm2.interleaved.max_tokens, 8192);
+        assert_eq!(v.lfm2.interleaved.audio_top_k, 4);
+        // The wrong-fill case: tts keeps its 0.7/0.8/top-64 shape.
+        assert_eq!(v.lfm2.tts.max_tokens, 512);
+        assert_eq!(v.lfm2.tts.text_temperature, 0.7);
+        assert_eq!(v.lfm2.tts.audio_temperature, 0.8);
+        assert_eq!(v.lfm2.tts.audio_top_k, 64);
+        // ASR stays greedy — a sampled-text fill would be a hallucinating
+        // transcriber.
+        assert_eq!(v.lfm2.asr.max_tokens, 50);
+        assert_eq!(v.lfm2.asr.text_temperature, 0.0);
+        assert_eq!(v.lfm2.asr.text_top_k, 0);
     }
 
     #[test]

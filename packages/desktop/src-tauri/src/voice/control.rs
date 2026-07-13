@@ -349,11 +349,15 @@ impl TurnMode {
         }
     }
 
-    /// The demo's per-mode token budget (`DEFAULT_MAX_TOKENS_*`).
-    pub fn max_new_tokens(self) -> usize {
+    /// The mode's decoding regime from Settings. Defaults per mode mirror the
+    /// demo (`audio-model.js`): ASR greedy/100, TTS text 0.7 + audio
+    /// 0.8/top-64/1024 — except the interleaved budget, which is OUR raised
+    /// 8192 (the demo ships `DEFAULT_MAX_TOKENS_AUDIO = 1024` ≈ 1 min).
+    pub fn sampling(self, lfm2: &settings::Lfm2Settings) -> &settings::Lfm2ModeSampling {
         match self {
-            TurnMode::Asr => 100,
-            TurnMode::Tts | TurnMode::Interleaved => 8192,
+            TurnMode::Asr => &lfm2.asr,
+            TurnMode::Tts => &lfm2.tts,
+            TurnMode::Interleaved => &lfm2.interleaved,
         }
     }
 }

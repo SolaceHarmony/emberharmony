@@ -19,8 +19,11 @@
 //! rehearsal): set `LFM_SELF_TARGET_CTX` (e.g. 30000) and a high turn cap,
 //! and the run stops as soon as EITHER side's conversation context reaches
 //! the target — proving the climb toward the model's 32,768 ceiling on the
-//! real two-party path. Per-turn budgets via `LFM_SELF_MAX_NEW` (default
-//! 160/112 assistant/human; the truncation warning is loud if it binds).
+//! real two-party path. Per-turn budget via `LFM_SELF_MAX_NEW` (default 512
+//! both sides — interleaved steps, every audio frame costs one, so 160 was an
+//! 8.5 s speech ceiling; the truncation warning is loud if it binds). Text
+//! sampling via `LFM_SELF_TEXT_TEMP` / `LFM_SELF_TEXT_TOPK` (0 = greedy / no
+//! cutoff; default is the production regime).
 //!
 //!   LFM_DEVICE=cpu LFM_MODEL_DIR=/path/to/model LFM_SELF_TURNS=400 \
 //!     LFM_SELF_TARGET_CTX=30000 \
@@ -238,11 +241,20 @@ fn main() -> Res<()> {
 
     // Production decoding regime (the app's settings defaults): sampled text at
     // 1.0 (vendor demo), sampled audio 1.0/top-k 4. Different seeds per engine so
-    // the two voices don't mirror each other.
-    let gen = |max_new_tokens: usize, seed| GenParams {
+    // the two voices don't mirror each other. Text sampling overridable for A/B
+    // runs: LFM_SELF_TEXT_TEMP (0 = greedy) and LFM_SELF_TEXT_TOPK (0 = no cutoff).
+    let text_temp: f64 = std::env::var("LFM_SELF_TEXT_TEMP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1.0);
+    let text_top_k: usize = std::env::var("LFM_SELF_TEXT_TOPK")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let gen = move |max_new_tokens: usize, seed| GenParams {
         max_new_tokens: if max_new > 0 { max_new } else { max_new_tokens },
-        text_temperature: Some(1.0),
-        text_top_k: None,
+        text_temperature: (text_temp > 0.0).then_some(text_temp),
+        text_top_k: (text_top_k > 0).then_some(text_top_k),
         audio_temperature: Some(1.0),
         audio_top_k: Some(4),
         seed,
@@ -252,14 +264,14 @@ fn main() -> Res<()> {
     let mut assistant = Lfm2VoiceEngine::new(
         model.clone(),
         proc.clone(),
-        gen(160, 42),
+        gen(512, 42),
         codebooks,
         device.clone(),
         out_rate,
     );
     // Engine B: the "human" — same model role-playing the user side of the call.
     let ctx_a = assistant.context_positions();
-    let mut human = Lfm2VoiceEngine::new(model, proc, gen(112, 1337), codebooks, device, out_rate)
+    let mut human = Lfm2VoiceEngine::new(model, proc, gen(512, 1337), codebooks, device, out_rate)
         .with_system_prompt(
             "You are a curious person having a casual spoken conversation. React briefly \
              to what you just heard and ask one natural follow-up question. Respond with \

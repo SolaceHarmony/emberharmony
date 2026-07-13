@@ -3626,7 +3626,6 @@ dependencies = [
  "moshi",
  "num_cpus",
  "rayon",
- "safetensors 0.7.0",
  "sentencepiece-rust",
  "serde",
  "serde_json",

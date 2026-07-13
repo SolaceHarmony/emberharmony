@@ -97,6 +97,24 @@ fn main() {
         .opt_level(3)
         .warnings(false)
         .flag("-ffp-contract=off")
+        .include("native/include")
         .include("native/src/mimi")
         .compile("lfm_mimi");
+
+    // Native checkpoint ownership: whole safetensors shards are read directly
+    // into one aligned resident image, then exposed as immutable tensor views.
+    // Build this archive after Mimi because Mimi's from-file constructor calls
+    // into it (static archive consumers must precede providers on GNU ld).
+    println!("cargo::rerun-if-changed=native/src/io/safetensors.cpp");
+    println!("cargo::rerun-if-changed=native/include/lfm_safetensors.h");
+    println!("cargo::rerun-if-changed=native/vendor/nlohmann");
+    cc::Build::new()
+        .file("native/src/io/safetensors.cpp")
+        .cpp(true)
+        .std("c++23")
+        .opt_level(3)
+        .warnings(false)
+        .include("native/include")
+        .include("native/vendor")
+        .compile("lfm_safetensors");
 }

@@ -28,3 +28,12 @@ Rust entrypoint at `packages/desktop/src-tauri`.
 - `reference/` — portable or historical reference kernels.
 
 Detailed design notes remain adjacent to the owning crate under `crates/*/docs/`.
+
+## Integration Guides
+
+- [`KCORO_ARENA_INTEGRATION.md`](KCORO_ARENA_INTEGRATION.md) - current and target
+  architecture, memory ownership, stackless lane migration, host adapters,
+  durable workflows, shutdown ordering, and verification gates.
+- [`10-stateful-multi-agent-runtime.md`](../../specs/10-stateful-multi-agent-runtime.md) -
+  one shared model with many conversation images, fast switching, perspective
+  forks, macro batching, delta hibernation, and WAL-backed orchestration.

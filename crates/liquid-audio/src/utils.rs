@@ -52,7 +52,8 @@ pub fn module_exists(name: &str) -> bool {
 /// an error, as in Python); otherwise `repo_or_path` is treated as a HF repo id
 /// and snapshot-downloaded (the `huggingface_hub.snapshot_download` analog), the
 /// snapshot directory being returned. The download branch requires the `download`
-/// feature (on by default).
+/// feature (on by default). Application hosts should use [`snapshot_download_to`]
+/// so cache and credential policy are explicit.
 pub fn get_model_dir(
     repo_or_path: &str,
     revision: Option<&str>,
@@ -81,38 +82,45 @@ pub struct DownloadProgress {
 }
 
 /// `snapshot_download(repo_id, revision=...)` — fetch every file in the repo into
-/// the HF cache and return the snapshot directory (parent of `config.json`). Ambient
-/// credential, no progress callback; the token-aware/progress-reporting form is
-/// [`snapshot_download_with`].
+/// hf-hub's conventional user cache and return the snapshot directory. This convenience
+/// path is always unauthenticated; application hosts use [`snapshot_download_to`].
 #[cfg(feature = "download")]
 fn download_snapshot(repo_id: &str, revision: Option<&str>) -> std::io::Result<std::path::PathBuf> {
     snapshot_download_with(repo_id, revision, None, |_| {})
 }
 
-/// `huggingface_hub.snapshot_download(repo_id, revision=, token=)` with a per-file progress
-/// callback. Fail-hard: any hf-hub error propagates; returns the snapshot directory. Some
-/// voice repos (Moshi/Mimi) intentionally do not have `config.json`, so the root is derived
-/// from the cached file path rather than from a particular config file. `token`, when `Some`,
-/// overrides the ambient credential (`HF_TOKEN` / `~/.cache/huggingface/token`); `None`
-/// leaves hf-hub's default ambient resolution intact (so an existing `huggingface-cli login`
-/// keeps working).
+/// Convenience download using hf-hub's conventional user cache. Credentials are
+/// explicit: `None` means unauthenticated and never falls back to a token file.
 #[cfg(feature = "download")]
 pub fn snapshot_download_with(
     repo_id: &str,
     revision: Option<&str>,
+    token: Option<&str>,
+    progress: impl FnMut(DownloadProgress),
+) -> std::io::Result<std::path::PathBuf> {
+    let cache = hf_hub::Cache::default();
+    snapshot_download_to(repo_id, revision, cache.path(), token, progress)
+}
+
+/// Download a complete snapshot into a host-selected cache directory. Cache,
+/// revision, and credential are all explicit inputs; this function never consults
+/// process environment or hf-hub's ambient token file.
+#[cfg(feature = "download")]
+pub fn snapshot_download_to(
+    repo_id: &str,
+    revision: Option<&str>,
+    cache: &std::path::Path,
     token: Option<&str>,
     mut progress: impl FnMut(DownloadProgress),
 ) -> std::io::Result<std::path::PathBuf> {
     use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
     let to_io = |e: hf_hub::api::sync::ApiError| std::io::Error::other(format!("hf-hub: {e}"));
 
-    // Only override the token when one is supplied — `with_token(None)` would *disable*
-    // ambient resolution, which is the opposite of what `token: None` means here.
-    let mut builder = ApiBuilder::new();
-    if let Some(t) = token {
-        builder = builder.with_token(Some(t.to_string()));
-    }
-    let api = builder.build().map_err(to_io)?;
+    let api = ApiBuilder::new()
+        .with_cache_dir(cache.to_path_buf())
+        .with_token(token.map(str::to_owned))
+        .build()
+        .map_err(to_io)?;
     let repo = match revision {
         Some(rev) => api.repo(Repo::with_revision(
             repo_id.to_string(),

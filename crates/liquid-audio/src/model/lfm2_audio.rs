@@ -287,6 +287,7 @@ fn torch_topk_mask(prs: &mut [f32], k: usize) {
 // mean-only `cross_entropy` lacks. `forward` (below) calls it for the text/audio
 // per-token NLL before the per-codebook weighting.
 use crate::candle_ext::loss::cross_entropy_none;
+use crate::weights::{NativeWeightImage, ResidentWeights};
 
 pub struct LFM2AudioModel {
     lfm: Lfm2Model,
@@ -323,6 +324,10 @@ pub struct LFM2AudioModel {
     /// depth-flash disabled — so greedy text + seeded audio reproduces the recorded
     /// wav-hash baseline bit-for-bit. Token-exact tiers (fused conv/MLP) stay on.
     reference_numerics: bool,
+    /// Owns the canonical checkpoint image for native binders. Candle-backed
+    /// components still own their measured compatibility copies. `None` is
+    /// reserved for trainable/tests.
+    resident: Option<ResidentWeights>,
 }
 
 impl LFM2AudioModel {
@@ -337,6 +342,63 @@ impl LFM2AudioModel {
         special: SpecialTokenIds,
         loss_conf: &LossConf,
         vb: VarBuilder,
+    ) -> Result<Self> {
+        Self::build(
+            lfm_cfg,
+            enc_cfg,
+            depth_cfg,
+            codebooks,
+            interleaved_n_text,
+            interleaved_n_audio,
+            special,
+            loss_conf,
+            vb,
+            None,
+        )
+    }
+
+    /// Production constructor: the native image is the checkpoint owner and
+    /// the Candle builder is only a measured compatibility adapter over it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_resident(
+        lfm_cfg: Lfm2Config,
+        enc_cfg: &ConformerEncoderConfig,
+        depth_cfg: &DepthformerConfig,
+        codebooks: usize,
+        interleaved_n_text: usize,
+        interleaved_n_audio: usize,
+        special: SpecialTokenIds,
+        loss_conf: &LossConf,
+        resident: ResidentWeights,
+        device: &Device,
+    ) -> Result<Self> {
+        let vb = resident.candle_builder(device);
+        Self::build(
+            lfm_cfg,
+            enc_cfg,
+            depth_cfg,
+            codebooks,
+            interleaved_n_text,
+            interleaved_n_audio,
+            special,
+            loss_conf,
+            vb,
+            Some(resident),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        lfm_cfg: Lfm2Config,
+        enc_cfg: &ConformerEncoderConfig,
+        depth_cfg: &DepthformerConfig,
+        codebooks: usize,
+        interleaved_n_text: usize,
+        interleaved_n_audio: usize,
+        special: SpecialTokenIds,
+        loss_conf: &LossConf,
+        vb: VarBuilder,
+        resident: Option<ResidentWeights>,
     ) -> Result<Self> {
         let hidden = lfm_cfg.hidden_size;
         let lfm = Lfm2Model::new(&lfm_cfg, vb.pp("lfm"))?;
@@ -452,6 +514,7 @@ impl LFM2AudioModel {
             audio_loss_multiplier: loss_conf.audio_loss_multiplier,
             depth_flash: None,
             reference_numerics: false,
+            resident,
         };
         // Built AFTER assembly: the ctx captures raw views into tensors the model now owns
         // (Arc-heap storages — stable across moves of `model`).
@@ -466,6 +529,17 @@ impl LFM2AudioModel {
             .install_native_ctx(model.lfm_cfg.max_position_embeddings);
         model.install_native_heads();
         Ok(model)
+    }
+
+    pub fn resident_weights(&self) -> Option<&NativeWeightImage> {
+        self.resident.as_ref().map(ResidentWeights::image)
+    }
+
+    pub fn compatibility_copies(&self) -> crate::weights::CompatibilityCopies {
+        self.resident
+            .as_ref()
+            .map(ResidentWeights::compatibility_copies)
+            .unwrap_or_default()
     }
 
     /// Capture the depthformer as a flashkern [`DepthDecode`] — every weight a zero-copy
@@ -1480,7 +1554,7 @@ impl LFM2AudioModel {
         }
         if !ended {
             eprintln!(
-                "[voice] max_new_tokens ({}) EXHAUSTED mid-reply — the turn was \
+                "\n[voice] max_new_tokens ({}) EXHAUSTED mid-reply — the turn was \
                  truncated before <|im_end|>; raise the token budget",
                 params.max_new_tokens
             );
@@ -1661,7 +1735,7 @@ impl LFM2AudioModel {
         }
         if !ended {
             eprintln!(
-                "[voice] max_new_tokens ({}) EXHAUSTED mid-reply — the turn was \
+                "\n[voice] max_new_tokens ({}) EXHAUSTED mid-reply — the turn was \
                  truncated before <|im_end|>; raise the token budget",
                 params.max_new_tokens
             );

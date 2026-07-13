@@ -54,12 +54,13 @@ const BARGE_IN_SUSTAIN_WINDOWS: usize = 2;
 /// Matches the LiveKit agent path's LIVEKIT_AGENT_ECHO_GATE_MS.
 const PLAYBACK_ECHO_TAIL_MS: u64 = 700;
 
-/// `LIQUID_VOICE_TRACE=1` — trace the voice call graph (VAD decisions, submits,
-/// pipeline turns, engine context/cursor movements, playback transitions) to stderr
-/// with timestamps relative to session start. Zero cost when off.
+/// Trace the voice call graph when the host enables `RuntimeConfig::trace`.
+/// Configuration is explicit so an inherited process environment cannot alter
+/// production timing or logging behavior.
+static VOICE_TRACE_ENABLED: AtomicBool = AtomicBool::new(false);
+
 pub(crate) fn voice_trace_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("LIQUID_VOICE_TRACE").is_ok_and(|v| !v.is_empty() && v != "0"))
+    VOICE_TRACE_ENABLED.load(Ordering::Relaxed)
 }
 
 pub(crate) fn voice_trace_elapsed() -> f64 {
@@ -613,6 +614,7 @@ pub struct RuntimeConfig {
     pub silence_ms: u64,
     pub min_utterance_s: f32,
     pub can_interrupt: bool,
+    pub trace: bool,
 }
 
 impl Default for RuntimeConfig {
@@ -627,6 +629,7 @@ impl Default for RuntimeConfig {
             silence_ms: 500,
             min_utterance_s: 0.3,
             can_interrupt: false,
+            trace: false,
         }
     }
 }
@@ -672,6 +675,7 @@ impl VoiceRuntime {
         build_engine: impl FnOnce(u32) -> Result<Box<dyn VoiceEngine>, String> + Send + 'static,
         sink: impl FnMut(RuntimeEvent) -> bool + Send + 'static,
     ) -> (VoiceRuntime, RuntimeMain) {
+        VOICE_TRACE_ENABLED.store(cfg.trace, Ordering::Relaxed);
         let stop = Arc::new(AtomicBool::new(false));
         let interrupt = Arc::new(AtomicBool::new(false));
         let mic_enabled = Arc::new(AtomicBool::new(true));

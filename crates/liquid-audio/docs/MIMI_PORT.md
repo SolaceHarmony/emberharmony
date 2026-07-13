@@ -54,7 +54,7 @@ streaming.rs (`StreamTensor` = Option<Tensor>) becomes explicit
 ## Discipline (same as the engine, non-negotiable)
 
 - **Weights are a buffer**: one flat `name → (f32*, len)` table captured
-  zero-copy from the mmap'd safetensors. Weight-norm folds ONCE at capture
+  zero-copy from the native resident safetensors image. Weight-norm folds ONCE at capture
   (g·v/‖v‖ per output channel), never per step. No transpose/repack per call —
   if a layout re-arm is needed, it happens once at init into the arena, and the
   manifest documents it.
@@ -156,7 +156,7 @@ streaming.rs (`StreamTensor` = Option<Tensor>) becomes explicit
       faults + re-arm) needs one measurement pass at integration.
 - [x] build wiring: build.rs compiles the five active units (c++23,
       -ffp-contract=off — load-bearing); Rust rim = src/mimi_native.rs
-      (zero-copy weight table over the mmap'd checkpoint, infallible-or-Err
+      (zero-copy weight table over the native-owned checkpoint image, infallible-or-Err
       init, Mutex'd single-slot decoder).
 - [x] PRODUCTION SWAP: MimiDetokenizer::decode_step runs the NATIVE kernel —
       the moshi decode_step call is out of the streaming pipeline. moshi
