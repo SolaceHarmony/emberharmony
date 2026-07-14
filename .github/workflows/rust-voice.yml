@@ -16,6 +16,7 @@ on:
     paths:
       - "crates/liquid-audio/**"
       - "crates/candle-flashfftconv/**"
+      - "crates/kcoro/**"
       - "crates/kcoro-sys/**"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -64,6 +65,11 @@ jobs:
       # Execute the production ticket and expected-value wait adapters on both hosts.
       - name: Test kcoro sys crate
         run: cargo test -p kcoro-sys --tests -- --nocapture
+
+      # The Rust coordinator is the realtime policy kernel. Its suite includes the
+      # 100,000-iteration terminal race, ring wrap/close gates, and stop admission.
+      - name: Test Rust kcoro coordinator
+        run: cargo test -p kcoro --all-targets -- --nocapture
 
       - name: Build (lib + examples + tests)
         run: cargo build --all-targets

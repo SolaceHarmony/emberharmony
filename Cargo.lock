@@ -1717,6 +1717,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "kcoro"
+version = "0.1.0"
+
+[[package]]
 name = "kcoro-sys"
 version = "0.1.0"
 dependencies = [

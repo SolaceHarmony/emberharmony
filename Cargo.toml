@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/candle-flashfftconv",
+    "crates/kcoro",
     "crates/kcoro-sys",
     "crates/liquid-audio",
 ]
