@@ -1838,6 +1838,7 @@ dependencies = [
  "crossbeam-channel",
  "half",
  "hf-hub",
+ "kcoro",
  "kcoro-sys",
  "libc",
  "minijinja",

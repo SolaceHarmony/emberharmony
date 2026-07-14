@@ -51,6 +51,31 @@ fn main() {
         .include("../kcoro-sys/vendor/kcoro_arena/include")
         .compile("lfm_flashkern_engine");
 
+    // Private Rust-kcoro/native docking leaf. The C++ translation unit owns the
+    // ring atomics and expected-value doorbells; the C anchor makes header
+    // compatibility and all layout assertions part of every build.
+    println!("cargo::rerun-if-changed=native/include/lfm_kernel_bridge.h");
+    println!("cargo::rerun-if-changed=native/src/runtime/kernel_bridge.cpp");
+    println!("cargo::rerun-if-changed=native/src/runtime/kernel_protocol_c.c");
+    cc::Build::new()
+        .file("native/src/runtime/kernel_bridge.cpp")
+        .cpp(true)
+        .std("c++23")
+        .opt_level(3)
+        .warnings(true)
+        .warnings_into_errors(true)
+        .flag("-pthread")
+        .include("native/include")
+        .include("../kcoro-sys/vendor/kcoro_arena/include")
+        .compile("lfm_kernel_bridge");
+    cc::Build::new()
+        .file("native/src/runtime/kernel_protocol_c.c")
+        .std("c11")
+        .warnings(true)
+        .warnings_into_errors(true)
+        .include("native/include")
+        .compile("lfm_kernel_protocol_c");
+
     // Flashkern's engine archive consumes the architecture kernels below. Keep
     // the provider after the consumer so GNU ld sees its symbols while they are
     // unresolved; Apple ld happens to tolerate the opposite order.

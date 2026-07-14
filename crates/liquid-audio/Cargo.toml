@@ -94,6 +94,7 @@ cpal = { version = "0.15", optional = true }
 
 [dev-dependencies]
 anyhow = "1"
+kcoro = { path = "../kcoro" }
 # Native mic capture + speaker playback for the live `mic_chat` example.
 cpal = "0.15"
 # getrusage for the engine zero-spin idle oracle (tests/engine_idle_zero_spin.rs).

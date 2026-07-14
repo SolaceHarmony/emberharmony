@@ -2,7 +2,7 @@ use kcoro::{
     ring, Cause, CommandKind, Completion, DescriptorId, Execution, Publication, ServiceClass,
     State, Submission, TerminalResultKind, TicketId, TicketKind, TryRecvError, TrySendError,
 };
-use std::mem::{align_of, size_of};
+use std::mem::{align_of, offset_of, size_of};
 
 fn submission(sequence: u64) -> Submission {
     Submission::new(
@@ -72,6 +72,16 @@ fn completion_cell_preserves_all_terminal_facts() {
     assert_eq!(size_of::<Completion>(), 128);
     assert_eq!(align_of::<Submission>(), 64);
     assert_eq!(align_of::<Completion>(), 64);
+    assert_eq!(offset_of!(Submission, ticket), 8);
+    assert_eq!(offset_of!(Submission, parent), 32);
+    assert_eq!(offset_of!(Submission, conversation_id), 56);
+    assert_eq!(offset_of!(Submission, descriptor), 72);
+    assert_eq!(offset_of!(Submission, deadline_ns), 96);
+    assert_eq!(offset_of!(Completion, ticket), 8);
+    assert_eq!(offset_of!(Completion, conversation_id), 32);
+    assert_eq!(offset_of!(Completion, execution), 56);
+    assert_eq!(offset_of!(Completion, results), 88);
+    assert_eq!(offset_of!(Completion, reserved), 120);
 }
 
 #[test]

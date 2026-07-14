@@ -15,6 +15,8 @@ pub mod candle_ops; // candle CustomOp bridges — the seam the model wires thro
 pub mod dd; // double-double toolkit (CPU port of double_double.metal) for the dd kernels
 pub mod decode; // fused decode blocks: threadgroup fallback + ShortConv/DepthDecode blocks
 pub mod native_engine; // resident native stage-machine rim (native/src/engine/flashkern_engine.cpp)
+#[cfg(test)]
+mod bridge; // private Rust-kcoro/native SQ/CQ conformance tests
 
 pub(crate) use fanout::Shared;
 pub mod fanout; // GPU dispatch model on threads: grid fan-out, lane teams, real barriers
