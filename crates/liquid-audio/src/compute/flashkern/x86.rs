@@ -560,7 +560,7 @@ pub fn conv1d_update_bf16(
 /// ([`super::decode`]): bcx `[1,3H,1]` == a contiguous `[3H]` B|C|x plane, T==1.
 /// SAFETY: caller guarantees plane sizes (bcx 3H, state H·(K-1), w H·K, out H·K) and
 /// kernel availability.
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(test, target_arch = "x86_64"))]
 pub(crate) unsafe fn conv1d_update_bf16_ptr(
     bcx: *const u16,
     state: *const u16,

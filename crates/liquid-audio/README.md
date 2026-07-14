@@ -26,4 +26,5 @@ runs the resulting tests explicitly through Rosetta:
 The script reports whether Rosetta exposes AVX2. When it does not, feature-gated
 SIMD tests skip; x86 compilation, linking, ABI, scheduler, and dispatch checks
 still run. Actual AVX2/AVX-512 instruction correctness requires an x86 runner
-that advertises those features.
+that advertises those features. Use `--require-avx2` when SIMD execution is the
+required gate; it fails instead of returning a partial green result.

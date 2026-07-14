@@ -1,16 +1,16 @@
 //! Fused decode blocks on the GPU dispatch model — the point of the exercise.
 //!
-//! The per-op execution the model otherwise uses on CPU (candle op → rayon fork/join →
+//! The per-op execution the model otherwise uses on CPU (candle op → scheduler fork/join →
 //! tensor alloc → bf16↔f32 cast, ×~240 ops per decode token) is exactly what a GPU never
 //! does: a GPU enters ONE dispatch per fused region and the data flows through threadgroup
 //! memory between barrier-fenced stages. This module runs the decode step that way on CPU:
 //!
-//! | Metal                       | here |
-//! |-----------------------------|------|
-//! | `dispatch_thread_groups`    | one rayon scope over the persistent pool — the dispatch |
-//! | simdgroup lanes             | exactly `lanes` concurrent workers, one per pool thread |
+//! | Metal                       | native engine |
+//! |-----------------------------|---------------|
+//! | `dispatch_thread_groups`    | one doorbell to the resident fixed lane team |
+//! | simdgroup lanes             | exactly `lanes` native workers |
 //! | `threadgroup float* shared` | the activation scratch the lanes co-own |
-//! | `threadgroup_barrier`       | [`SpinBarrier`] — spinning, like the GPU's, not parking |
+//! | `threadgroup_barrier`       | the engine's generation fence |
 //!
 //! Numerics: activations round through bf16 at EXACTLY the points the candle op chain
 //! rounds (linear outputs, silu, gating mul, the norm's single output round, the residual
@@ -21,20 +21,10 @@
 use super::Shared;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// A spinning generation barrier — `threadgroup_barrier(mem_threadgroup)` semantics. GPU
-/// barriers spin; parking (`std::sync::Barrier`) costs ~1-2 µs a crossing, which at
-/// hundreds of crossings per token is real money. AcqRel on the generation flip publishes
-/// each stage's shared-memory writes to every lane, same fence contract as the GPU.
-/// One threadgroup dispatch at a time, process-wide. A spin-barrier dispatch has a
-/// HARD scheduling requirement: all `lanes` tasks must run concurrently on the shared
-/// rayon pool. Two overlapping dispatches can fill the pool with spinners that each
-/// wait for the other's unstarted lanes — a livelock that burns every occupied core
-/// (observed: 249 CPU-minutes in 33 wall-minutes across two concurrent release-suite
-/// parity tests). Production decode is sequential, so this lock is uncontended there;
-/// it exists to make the requirement structural instead of hoped-for. The resident
-/// native stage machine has no such requirement — parked workers occupy nothing.
-pub(crate) static DISPATCH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
+/// A spinning generation barrier for the temporary Rust lane program hosted on the
+/// resident engine team. AcqRel on the generation flip publishes each stage's shared-memory
+/// writes to every lane. It must never be scheduled on a work-stealing pool: every participant
+/// already owns a native worker for the duration of the program.
 pub(crate) struct SpinBarrier {
     lanes: usize,
     count: AtomicUsize,
@@ -64,10 +54,8 @@ impl SpinBarrier {
     }
 }
 
-/// Stage fence for lane-uniform programs: the engine team's fence when the program
-/// rides the kcoro lanes (bounded spin, then a precise parked wake — the engine's
-/// own barrier), or the spinning [`SpinBarrier`] on the rayon threadgroup fallback.
-/// Numerics never depend on which — banding and ladders are identical.
+/// Stage fence for lane-uniform programs riding the resident engine team. Numerics never
+/// depend on the concrete fence implementation: banding and rounding ladders are identical.
 pub(crate) trait LaneFence: Sync {
     fn wait(&self, lane: usize);
 }
@@ -84,6 +72,7 @@ pub fn fused_mlp_available() -> bool {
 }
 
 #[inline]
+#[cfg(test)]
 pub(crate) fn bf16_f32(b: u16) -> f32 {
     f32::from_bits((b as u32) << 16)
 }
@@ -91,6 +80,7 @@ pub(crate) fn bf16_f32(b: u16) -> f32 {
 /// Round-to-nearest-even f32 → bf16 bits (the storage rounding the candle op chain applies
 /// after every op on the bf16 CPU path).
 #[inline]
+#[cfg(test)]
 pub(crate) fn rb_bits(f: f32) -> u16 {
     let u = f.to_bits();
     ((u.wrapping_add(0x7fff + ((u >> 16) & 1))) >> 16) as u16
@@ -116,27 +106,32 @@ pub struct FusedMlpWeights<'a> {
     pub eps: f32,
 }
 
-/// One decode step of the FFN residual block — `out = rb(x + w2·(silu(w1·xn) ⊙ w3·xn))`,
-/// `xn = rms_norm(x)·norm_w` — as a single threadgroup dispatch (3 barriers), replacing the
-/// eight candle ops (norm, 3 linears + casts, silu, mul, add) the per-op path runs.
+/// Test-only parity oracle for one FFN residual block. Production inference enters the
+/// resident C++ engine and never schedules this Rust lane program.
 ///
 /// `x`/`out` are `[H]` bf16 bits. Stage map (each lane grid-strides or owns row slices):
 /// 1. Σx² partials → all lanes reduce the `lanes` partials serially (same order — deterministic)
 ///    → `xn = rb(x · rsqrt(mean+eps) · w_norm)` (the real `RmsNorm::forward`'s single round).
 /// 2. Lane's gate/up rows: `t[r] = rb(rb(silu(rb(g_r))) · rb(u_r))` — the op chain's rounds.
 /// 3. Lane's down rows + residual: `out[r] = rb(rb(y_r) + x[r])`.
-pub fn fused_mlp_decode(x: &[u16], w: &FusedMlpWeights, out: &mut [u16], lanes: usize) {
+#[cfg(test)]
+pub(crate) fn fused_mlp_reference(
+    x: &[u16],
+    w: &FusedMlpWeights,
+    out: &mut [u16],
+    lanes: usize,
+) {
     let h = x.len();
     let i = w.w1.len() / h;
-    assert!(h > 0 && i > 0, "fused_mlp_decode: empty dims");
-    assert_eq!(w.norm_w.len(), h, "fused_mlp_decode: norm_w.len() != H");
-    assert_eq!(w.w1.len(), i * h, "fused_mlp_decode: w1.len() != I·H");
-    assert_eq!(w.w3.len(), i * h, "fused_mlp_decode: w3.len() != I·H");
-    assert_eq!(w.w2.len(), h * i, "fused_mlp_decode: w2.len() != H·I");
-    assert_eq!(out.len(), h, "fused_mlp_decode: out.len() != H");
+    assert!(h > 0 && i > 0, "fused_mlp_reference: empty dims");
+    assert_eq!(w.norm_w.len(), h, "fused_mlp_reference: norm_w.len() != H");
+    assert_eq!(w.w1.len(), i * h, "fused_mlp_reference: w1.len() != I·H");
+    assert_eq!(w.w3.len(), i * h, "fused_mlp_reference: w3.len() != I·H");
+    assert_eq!(w.w2.len(), h * i, "fused_mlp_reference: w2.len() != H·I");
+    assert_eq!(out.len(), h, "fused_mlp_reference: out.len() != H");
     assert!(
         fused_mlp_available(),
-        "fused_mlp_decode requires the flashkern nt kernel (gate on fused_mlp_available())"
+        "fused_mlp_reference requires the flashkern nt kernel (gate on fused_mlp_available())"
     );
     let lanes = lanes.clamp(1, h.min(i));
 
@@ -146,24 +141,25 @@ pub fn fused_mlp_decode(x: &[u16], w: &FusedMlpWeights, out: &mut [u16], lanes: 
     let mut xn = vec![0u16; h];
     let mut gu = vec![0f32; 2 * i]; // g = gu[0..i], u = gu[i..2i]
     let mut t = vec![0u16; i];
-    let _dispatch = DISPATCH_LOCK.lock().unwrap();
     let sh_part = Shared(partials.as_mut_ptr());
     let sh_xn = Shared(xn.as_mut_ptr());
     let sh_gu = Shared(gu.as_mut_ptr());
     let sh_t = Shared(t.as_mut_ptr());
     let sh_out = Shared(out.as_mut_ptr());
-    let barrier = SpinBarrier::new(lanes);
+    let barrier = std::sync::Barrier::new(lanes);
     let barrier = &barrier;
 
     // Row ownership: contiguous slices so each lane's nt call streams contiguous weight rows.
     let i_chunk = i.div_ceil(lanes);
     let h_chunk = h.div_ceil(lanes);
 
-    // dispatch_thread_groups == one rayon scope over the persistent pool; `lanes` concurrent
-    // workers spin-sync inside it. Nothing else runs on the pool during a decode step.
-    rayon::scope(|scope| {
+    // This is the portable parity/reference path, not the resident inference path. Give every
+    // barrier participant a real scoped thread and park at stage boundaries. A work-stealing
+    // pool cannot guarantee that all participants run concurrently and can deadlock when its
+    // first workers wait for tasks that are still queued.
+    std::thread::scope(|scope| {
         for lane in 0..lanes {
-            scope.spawn(move |_| {
+            scope.spawn(move || {
                 // stage 1a: Σx² partial (grid-stride, f32).
                 let mut s = 0f32;
                 let mut idx = lane;
@@ -331,7 +327,7 @@ mod tests {
         let want = reference(&x, &w, h, i);
         for lanes in [1usize, 3, 8] {
             let mut got = vec![0u16; h];
-            fused_mlp_decode(&x, &w, &mut got, lanes);
+            fused_mlp_reference(&x, &w, &mut got, lanes);
             let (mut md, mut sc) = (0f32, 1e-3f32);
             for (g, r) in got.iter().zip(&want) {
                 md = md.max((bf16_f32(*g) - bf16_f32(*r)).abs());
@@ -369,8 +365,8 @@ mod tests {
             eps: 1e-5,
         };
         let (mut a, mut b) = (vec![0u16; h], vec![0u16; h]);
-        fused_mlp_decode(&x, &w, &mut a, 4);
-        fused_mlp_decode(&x, &w, &mut b, 4);
+        fused_mlp_reference(&x, &w, &mut a, 4);
+        fused_mlp_reference(&x, &w, &mut b, 4);
         assert_eq!(a, b, "same dispatch shape must be bit-identical");
     }
 }
@@ -389,6 +385,7 @@ mod tests {
 
 extern "C" {
     fn lfm_bf16_sumsq_f32(x: *const u16, n: i32) -> f32;
+    #[cfg(test)]
     fn lfm_bf16_sumsq_candle_f32(x: *const u16, n: i32) -> f32;
     fn lfm_bf16_rmsnorm(x: *const u16, w: *const u16, out: *mut u16, n: i32, inv_rms: f32);
     fn lfm_bf16_add(a: *const u16, b: *const u16, out: *mut u16, n: i32);
@@ -658,8 +655,9 @@ impl DepthDecode {
 
         // The lane-uniform frame program: every lane runs the whole walk, `fence`
         // separates the stages. On the engine team this is ONE doorbell per frame on
-        // the same kcoro lanes as the backbone — no rayon, no SpinBarrier, no
-        // DISPATCH_LOCK in the production path.
+        // the same kcoro lanes as the backbone — no rayon or process-wide dispatch lock.
+        // The temporary Rust frame uses its local SpinBarrier only because every participant
+        // already owns one of the resident workers for the whole frame.
         let run_lane = |lane: usize, fence: &dyn LaneFence| {
                     let mut sampler_slot = if lane == 0 {
                         Some(
@@ -1164,7 +1162,8 @@ pub unsafe fn attn_decode_bf16(
 /// The ShortConv residual block's weights, zero-copy bf16 bit slices: `norm_w [H]` (the
 /// layer's operator norm), `in_w [3H, H]` (in_proj), `conv_w [H, K]` (depthwise taps,
 /// squeezed), `out_w [H, H]` (out_proj).
-pub struct FusedShortConvWeights<'a> {
+#[cfg(test)]
+pub(crate) struct FusedShortConvWeights<'a> {
     pub norm_w: &'a [u16],
     pub in_w: &'a [u16],
     pub conv_w: &'a [u16],
@@ -1173,7 +1172,7 @@ pub struct FusedShortConvWeights<'a> {
     pub k: usize,
 }
 
-/// One decode step of the ShortConv residual block — `out = rb(x + out_proj(C ⊙
+/// Test-only parity oracle for one ShortConv residual block — `out = rb(x + out_proj(C ⊙
 /// conv1d_causal(B ⊙ x_proj, w, state)))` with `xn = rms_norm(x)·norm_w` and the carried
 /// state advanced — as ONE threadgroup dispatch replacing the candle chain (norm, in_proj
 /// + transposes, the conv CustomOp, out_proj, residual). The conv itself is the existing
@@ -1182,7 +1181,8 @@ pub struct FusedShortConvWeights<'a> {
 ///
 /// `x`/`out` are `[H]` bf16 bits; `state_in`/`state_out` are `[H, K-1]` bf16 bits (the
 /// carried Bx window — same contract as the candle op's functional state).
-pub fn fused_shortconv_decode(
+#[cfg(test)]
+pub(crate) fn fused_shortconv_reference(
     x: &[u16],
     w: &FusedShortConvWeights,
     state_in: &[u16],
@@ -1218,7 +1218,7 @@ pub fn fused_shortconv_decode(
     assert_eq!(out.len(), h, "fused_shortconv: out.len() != H");
     assert!(
         fused_mlp_available(),
-        "fused_shortconv_decode requires the flashkern nt kernel"
+        "fused_shortconv_reference requires the flashkern nt kernel"
     );
     let lanes = lanes.clamp(1, h);
 
@@ -1241,13 +1241,14 @@ pub fn fused_shortconv_decode(
     let sh_projb = Shared(proj_b.as_mut_ptr());
     let sh_out = Shared(out.as_mut_ptr());
     let sh_state_out = Shared(state_out.as_mut_ptr());
-    let _dispatch = DISPATCH_LOCK.lock().unwrap();
-    let barrier = SpinBarrier::new(lanes);
+    let barrier = std::sync::Barrier::new(lanes);
     let barrier = &barrier;
 
-    rayon::scope(|scope| {
+    // Portable parity/reference path. Scoped threads plus a blocking barrier preserve the
+    // requested lane partition without depending on the capacity of Rayon's global pool.
+    std::thread::scope(|scope| {
         for lane in 0..lanes {
-            scope.spawn(move |_| {
+            scope.spawn(move || {
                 let own = |n: usize, l: usize| -> (usize, usize) {
                     let c = n.div_ceil(lanes);
                     ((l * c).min(n), ((l + 1) * c).min(n))
@@ -1368,6 +1369,7 @@ pub fn fused_shortconv_decode(
 // Raw single-step call into the existing fused conv kernel: bcx is [1, 3H, 1] (== the
 // contiguous [3H] plane in B|C|x row order), state [1, H, K-1], w [H, K], out [1, H, K].
 // SAFETY: caller guarantees the plane sizes and availability.
+#[cfg(test)]
 unsafe fn conv1d_update_bf16_raw(
     bcx: *const u16,
     state: *const u16,

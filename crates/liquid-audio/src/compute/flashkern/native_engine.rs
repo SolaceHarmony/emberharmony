@@ -262,9 +262,9 @@ impl NativeEngine {
         out
     }
 
-    /// One fused-MLP decode block, entirely native — bit-identical to
-    /// [`super::decode::fused_mlp_decode`] at the same `lanes`.
-    #[must_use = "false = native pass did not run; caller must take the fallback"]
+    /// One fused-MLP decode block, entirely native and parity-pinned against the
+    /// test-only reference implementation at the same `lanes`.
+    #[must_use = "false = native pass did not run; caller must surface the rejection"]
     pub fn fused_mlp(
         &self,
         x: &[u16],
@@ -554,9 +554,9 @@ impl NativeEngine {
         assert!(dispatched, "engine.grid: lane-team dispatch refused");
     }
 
-    /// One whole shortconv+MLP layer in a single doorbell — bit-identical to the
-    /// composed `fused_shortconv_decode` + `fused_mlp_decode` at the same `lanes`.
-    #[must_use = "false = native pass did not run; caller must take the fallback"]
+    /// One whole shortconv+MLP layer in a single doorbell, parity-pinned against the
+    /// composed test-only references at the same `lanes`.
+    #[must_use = "false = native pass did not run; caller must preserve state"]
     fn conv_layer(
         &self,
         id: u64,
@@ -764,10 +764,9 @@ impl Drop for NativeEngine {
     }
 }
 
-/// The process-resident engine for the model hot path (the same residency pattern as
-/// rayon's global pool): built on first use, `None` when the runtime cannot come up —
-/// callers fall back to the threadgroup port, which is bit-identical by the parity
-/// test, so the fallback changes scheduling only, never numerics.
+/// The process-resident engine for the model hot path, built on first use. Initialization
+/// failure is fatal: this is the decode substrate, not an optional acceleration with a
+/// second scheduler hidden behind it.
 ///
 /// Lifetime is deliberately process-long: `OnceLock` never drops, so the team's
 /// threads live until exit — the daemon shape this crate ships in. Workers are sized
@@ -1043,7 +1042,7 @@ mod tests {
         };
         let lanes = 8usize;
         let mut out_ref = vec![0u16; h];
-        crate::flashkern::decode::fused_mlp_decode(&mid_bits, &mlpw, &mut out_ref, lanes);
+        crate::flashkern::decode::fused_mlp_reference(&mid_bits, &mlpw, &mut out_ref, lanes);
 
         // ---- Engine: install the table, run the layer, compare bits. ----
         use crate::flashkern::decode::PtrLen;
@@ -1173,7 +1172,7 @@ mod tests {
                 };
                 let mut state_ref = vec![0u16; h * (k - 1)];
                 let mut mid = vec![0u16; h];
-                crate::flashkern::decode::fused_shortconv_decode(
+                crate::flashkern::decode::fused_shortconv_reference(
                     &x,
                     &scw,
                     &state,
@@ -1182,7 +1181,7 @@ mod tests {
                     lanes,
                 );
                 let mut out_ref = vec![0u16; h];
-                crate::flashkern::decode::fused_mlp_decode(&mid, &mlpw, &mut out_ref, lanes);
+                crate::flashkern::decode::fused_mlp_reference(&mid, &mlpw, &mut out_ref, lanes);
 
                 let mut state_got = vec![0u16; h * (k - 1)];
                 let mut out_got = vec![0u16; h];
@@ -1357,15 +1356,33 @@ mod tests {
             };
             for lanes in [1usize, 3, 8] {
                 let mut want = vec![0u16; h];
-                crate::flashkern::decode::fused_mlp_decode(&x, &w, &mut want, lanes);
+                crate::flashkern::decode::fused_mlp_reference(&x, &w, &mut want, lanes);
                 let mut got = vec![0u16; h];
                 assert!(engine.fused_mlp(&x, &w, &mut got, lanes));
                 assert_eq!(got, want, "H={h} I={i} lanes={lanes}");
             }
         }
+    }
 
-        // Timing at the real decode shape: native engine vs Rust-dispatched kcoro
-        // engine vs the rayon threadgroup port.
+    #[test]
+    #[ignore = "local performance measurement; run explicitly with --ignored --nocapture"]
+    fn native_engine_mlp_benchmark() {
+        use half::bf16;
+        if !crate::flashkern::decode::fused_mlp_available() {
+            eprintln!("fused mlp kernel unavailable — skipping");
+            return;
+        }
+        let engine = NativeEngine::new(8).expect(
+            "native engine init failed on a target with fused kernels; check kcoro link/init",
+        );
+        let rnd = |i: usize, seed: usize| -> u16 {
+            bf16::from_f32(
+                (((i.wrapping_mul(2654435761).wrapping_add(seed)) % 2000) as f32 / 1000.0) - 1.0,
+            )
+            .to_bits()
+        };
+        // Timing at the real decode shape: resident native engine versus the portable
+        // scoped-thread parity path. This is intentionally local-only, not a CI assertion.
         let (h, i) = (1024usize, 4096usize);
         let x: Vec<u16> = (0..h).map(|j| rnd(j, 1)).collect();
         let norm_w: Vec<u16> = (0..h).map(|j| rnd(j, 2)).collect();
@@ -1383,39 +1400,39 @@ mod tests {
         let lanes = 8;
         for _ in 0..20 {
             assert!(engine.fused_mlp(&x, &w, &mut out, lanes));
-            crate::flashkern::decode::fused_mlp_decode(&x, &w, &mut out, lanes);
+            crate::flashkern::decode::fused_mlp_reference(&x, &w, &mut out, lanes);
         }
 
         const SAMPLES: usize = 1_000;
         let mut native = Vec::with_capacity(SAMPLES);
-        let mut spun = Vec::with_capacity(SAMPLES);
+        let mut reference = Vec::with_capacity(SAMPLES);
         for sample in 0..SAMPLES {
             let mut measure = |native_path| {
                 let start = std::time::Instant::now();
                 if native_path {
                     assert!(engine.fused_mlp(&x, &w, &mut out, lanes));
                 } else {
-                    crate::flashkern::decode::fused_mlp_decode(&x, &w, &mut out, lanes);
+                    crate::flashkern::decode::fused_mlp_reference(&x, &w, &mut out, lanes);
                 }
                 start.elapsed().as_secs_f64() * 1e3
             };
             if sample % 2 == 0 {
                 native.push(measure(true));
-                spun.push(measure(false));
+                reference.push(measure(false));
             } else {
-                spun.push(measure(false));
+                reference.push(measure(false));
                 native.push(measure(true));
             }
         }
         native.sort_by(f64::total_cmp);
-        spun.sort_by(f64::total_cmp);
+        reference.sort_by(f64::total_cmp);
         let percentile =
             |samples: &[f64], percent: usize| samples[(samples.len() * percent).div_ceil(100) - 1];
         eprintln!(
-            "native engine fused_mlp p50/p95/p99 {:.3}/{:.3}/{:.3} ms ({:.3}-{:.3}) vs threadgroup+spin {:.3}/{:.3}/{:.3} ms ({:.3}-{:.3}) over {SAMPLES} passes (H=1024 I=4096, lanes=8)",
+            "native engine fused_mlp p50/p95/p99 {:.3}/{:.3}/{:.3} ms ({:.3}-{:.3}) vs scoped reference {:.3}/{:.3}/{:.3} ms ({:.3}-{:.3}) over {SAMPLES} passes (H=1024 I=4096, lanes=8)",
             percentile(&native, 50), percentile(&native, 95), percentile(&native, 99),
-            native[0], native[SAMPLES - 1], percentile(&spun, 50),
-            percentile(&spun, 95), percentile(&spun, 99), spun[0], spun[SAMPLES - 1]
+            native[0], native[SAMPLES - 1], percentile(&reference, 50),
+            percentile(&reference, 95), percentile(&reference, 99), reference[0], reference[SAMPLES - 1]
         );
     }
 

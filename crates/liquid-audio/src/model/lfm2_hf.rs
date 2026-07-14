@@ -795,10 +795,8 @@ impl DecoderLayer {
         native_ctx: Option<&crate::flashkern::native_engine::BackboneCtxGuard>,
     ) -> Result<Tensor> {
         let residual = x;
-        // Fused ShortConv residual block (flashkern): norm → in_proj → conv update →
-        // out_proj → residual as ONE dispatch — no candle op, no transposes. Same gates as
-        // the op-chain fast path (carried state exists, decode shape); sequence START keeps
-        // the composed path (its zero-pad prefill is the reference semantics).
+        // Native ShortConv residual block: norm → in_proj → conv update → MLP as one C++
+        // pass. Rust only validates the compatibility tensor boundary and rings the doorbell.
         if let LayerKind::ShortConv(c) = &self.kind {
             if cache.fused_conv_decode
                 && x.device().is_cpu()
@@ -807,25 +805,9 @@ impl DecoderLayer {
                 && crate::bf16_gemm::bf16_gemm_nt_available()
                 && cache.conv_states[block_idx].is_some()
             {
-                // The whole layer in one native doorbell when the resident table is
-                // live (bit-identical to the composed fused blocks by parity test).
+                // The whole layer in one native doorbell when the resident table is live.
                 if let Some(y) = self.native_conv_layer(x, c, block_idx, cache, native_ctx)? {
                     return Ok(y);
-                }
-                if let Some(y) = self.fused_shortconv_decode(x, c, block_idx, cache)? {
-                    let x = y;
-                    if x.device().is_cpu()
-                        && x.dtype() == DType::BF16
-                        && crate::flashkern::decode::fused_mlp_available()
-                        && x.dims3().map(|(b, s, _)| b * s == 1).unwrap_or(false)
-                    {
-                        if let Some(y) = self.fused_mlp_decode(&x)? {
-                            return Ok(y);
-                        }
-                    }
-                    let residual = &x;
-                    let h = self.mlp.forward(&self.ffn_norm.forward(&x)?)?;
-                    return h + residual;
                 }
             }
         }
@@ -846,17 +828,14 @@ impl DecoderLayer {
             LayerKind::ShortConv(c) => c.forward(&h, block_idx, cache)?,
         };
         let x = (h + residual)?;
-        // Fused FFN residual block on the flashkern GPU-dispatch model: ONE threadgroup
-        // dispatch (lanes + spin barriers + shared scratch) replaces the eight-op candle
-        // chain (norm, 3 linears + casts, silu, gating mul, residual add) — CPU decode only;
-        // Metal and prefill keep the op chain. Same bf16 rounding points, so numerics stay
-        // in the trained regime; only the dispatch shape changes.
+        // Native FFN residual block: one C++ doorbell replaces the per-op Candle chain.
+        // Non-contiguous compatibility tensors still use the transitional path below.
         if x.device().is_cpu()
             && x.dtype() == DType::BF16
             && crate::flashkern::decode::fused_mlp_available()
             && x.dims3().map(|(b, s, _)| b * s == 1).unwrap_or(false)
         {
-            if let Some(y) = self.fused_mlp_decode(&x)? {
+            if let Some(y) = self.native_mlp_decode(&x)? {
                 return Ok(y);
             }
         }
@@ -865,88 +844,10 @@ impl DecoderLayer {
         h + residual
     }
 
-    /// The CPU-decode fused ShortConv block: zero-copy weight views into
-    /// [`flashkern::decode::fused_shortconv_decode`] — norm, in_proj, the fused conv
-    /// update (same kernel as the op path), out_proj, residual, in one dispatch. Returns
-    /// `Ok(None)` if any operand isn't a contiguous CPU bf16 tensor.
-    fn fused_shortconv_decode(
-        &self,
-        x: &Tensor,
-        conv: &ShortConv,
-        block_idx: usize,
-        cache: &mut Cache,
-    ) -> Result<Option<Tensor>> {
-        use candle_core::Storage;
-        fn bits<'a>(
-            guard: &'a std::sync::RwLockReadGuard<'_, Storage>,
-            layout: &candle_core::Layout,
-        ) -> Option<&'a [u16]> {
-            match &**guard {
-                Storage::Cpu(candle_core::CpuStorage::BF16(v)) => {
-                    let (s, e) = layout.contiguous_offsets()?;
-                    let sl = &v[s..e];
-                    // SAFETY: half::bf16 is repr(transparent) over u16.
-                    Some(unsafe { std::slice::from_raw_parts(sl.as_ptr() as *const u16, sl.len()) })
-                }
-                _ => None,
-            }
-        }
-        let k = conv.l_cache;
-        let hdim = x.dim(2)?;
-        let x = x.contiguous()?;
-        let w2d = conv.conv_weight.squeeze(1)?.contiguous()?;
-        let state = cache.conv_states[block_idx].clone().expect("gated on Some");
-        let state = state.contiguous()?;
-        let (xs, xl) = x.storage_and_layout();
-        let (ns, nl) = self.operator_norm.weight().storage_and_layout();
-        let (is_, il) = conv.in_proj.weight().storage_and_layout();
-        let (cs, cl) = w2d.storage_and_layout();
-        let (os, ol) = conv.out_proj.weight().storage_and_layout();
-        let (ss, sl) = state.storage_and_layout();
-        let (Some(xb), Some(nb), Some(iw), Some(cw), Some(ow), Some(sb)) = (
-            bits(&xs, xl),
-            bits(&ns, nl),
-            bits(&is_, il),
-            bits(&cs, cl),
-            bits(&os, ol),
-            bits(&ss, sl),
-        ) else {
-            return Ok(None);
-        };
-        let weights = crate::flashkern::decode::FusedShortConvWeights {
-            norm_w: nb,
-            in_w: iw,
-            conv_w: cw,
-            out_w: ow,
-            eps: self.operator_norm.eps() as f32,
-            k,
-        };
-        let mut out = vec![0u16; hdim];
-        let mut state_out = vec![0u16; hdim * (k - 1)];
-        crate::flashkern::decode::fused_shortconv_decode(
-            xb,
-            &weights,
-            sb,
-            &mut state_out,
-            &mut out,
-            rayon::current_num_threads().max(1),
-        );
-        drop((xs, ns, is_, cs, os, ss));
-        let state_out: Vec<half::bf16> = state_out
-            .iter()
-            .map(|&b| half::bf16::from_bits(b))
-            .collect();
-        cache.conv_states[block_idx] =
-            Some(Tensor::from_vec(state_out, (1, hdim, k - 1), x.device())?);
-        let out: Vec<half::bf16> = out.iter().map(|&b| half::bf16::from_bits(b)).collect();
-        Ok(Some(Tensor::from_vec(out, (1, 1, hdim), x.device())?))
-    }
-
-    /// The CPU-decode fused FFN block: zero-copy bf16 views of the checkpoint weights
-    /// (`storage_and_layout`) into [`flashkern::decode::fused_mlp_decode`]. Returns
-    /// `Ok(None)` if any operand isn't a contiguous CPU bf16 tensor (caller keeps the op
-    /// chain) — an availability gate, not a silent numeric fallback.
-    fn fused_mlp_decode(&self, x: &Tensor) -> Result<Option<Tensor>> {
+    /// The CPU-decode native FFN block. Rust exposes zero-copy bf16 views from the
+    /// transitional Candle owner and invokes the resident C++ engine; it performs no math.
+    /// `Ok(None)` means the tensor is not representable at this compatibility boundary.
+    fn native_mlp_decode(&self, x: &Tensor) -> Result<Option<Tensor>> {
         use candle_core::Storage;
 
         fn bits<'a>(
@@ -988,18 +889,12 @@ impl DecoderLayer {
             eps: self.ffn_norm.eps() as f32,
         };
         let mut out = vec![0u16; hdim];
-        // The resident native stage machine when it is up — bit-identical to the
-        // threadgroup port by parity test, so the fallback changes scheduling only,
-        // never numerics.
-        {
-            // One lanes value for the attempt AND its parity fallback (the contract is
-            // "bit-identical at the same lanes") — sized from OUR team when it exists.
-            let engine = crate::flashkern::native_engine::process_engine();
-            let lanes = engine.lanes_total().max(1);
-            let ran_native = engine.fused_mlp(xb, &weights, &mut out, lanes);
-            if !ran_native {
-                crate::flashkern::decode::fused_mlp_decode(xb, &weights, &mut out, lanes);
-            }
+        let engine = crate::flashkern::native_engine::process_engine();
+        let lanes = engine.lanes_total().max(1);
+        if !engine.fused_mlp(xb, &weights, &mut out, lanes) {
+            return Err(candle_core::Error::Msg(
+                "native fused MLP pass was rejected".to_string(),
+            ));
         }
         let out: Vec<half::bf16> = out.iter().map(|&b| half::bf16::from_bits(b)).collect();
         Ok(Some(Tensor::from_vec(out, (1, 1, hdim), x.device())?))
