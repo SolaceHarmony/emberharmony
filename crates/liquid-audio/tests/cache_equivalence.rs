@@ -4,7 +4,7 @@
 //! not the port's faithfulness, which was proven and archived in the
 //! candle-audio-rs repository together with the golden-file parity tests.
 //!
-//! Run: LFM_MODEL_DIR=/path/to/model cargo test --release --test cache_equivalence -- --nocapture
+//! Run: LFM_MODEL_DIR=/path/to/model cargo test --release --test cache_equivalence -- --ignored --nocapture
 //! (LFM_DEVICE=metal for the deployed bf16 Metal numerics.)
 
 use std::path::Path;
@@ -77,6 +77,7 @@ fn collect_tokens<'a>(
 ///
 /// Run: LFM_MODEL_DIR=/path/to/model cargo test --release --test parity suffix_cache -- --nocapture
 #[test]
+#[ignore = "requires an LFM checkpoint selected by LFM_MODEL_DIR"]
 fn suffix_cache_matches_full_prefill() -> anyhow::Result<()> {
     use liquid_audio::{ChatState, GenParams, LFMModality, PrefillCursor};
     use std::sync::atomic::AtomicBool;

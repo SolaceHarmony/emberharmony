@@ -94,7 +94,7 @@ pub struct LFM2AudioConfig {
     pub audio_loss_multiplier: f64,
     pub interleaved_n_text: usize,
     pub interleaved_n_audio: usize,
-    pub preprocessor: crate::model::conformer::processor::MelConfig,
+    pub preprocessor: crate::processor::MelConfig,
     pub encoder: crate::model::conformer::encoder::ConformerEncoderConfig,
     pub lfm: crate::model::lfm2_hf::Lfm2Config,
     pub depthformer: DepthformerConfig,

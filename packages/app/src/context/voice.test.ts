@@ -3,7 +3,8 @@ import { describe, expect, test } from "bun:test"
 const source = () => Bun.file(new URL("./voice.tsx", import.meta.url)).text()
 const repo = new URL("../../../../", import.meta.url)
 const root = (path: string) => Bun.file(new URL(path, repo)).text()
-const liquid = (path: string) => root(`crates/liquid-audio/${path}`)
+const local = (path: string) => Bun.file(new URL(`crates/liquid-audio/${path}`, repo))
+const liquid = (path: string) => local(path).text()
 
 function between(text: string, start: string, end: string): string {
   const from = text.indexOf(start)
@@ -181,25 +182,41 @@ describe("desktop voice context boundary", () => {
   test("kcoro native engine is wired into production decode and test contracts", async () => {
     const cargo = await liquid("Cargo.toml")
     const build = await liquid("build.rs")
+    const kcoro = await root("crates/kcoro-sys/build.rs")
     const native = await liquid("src/compute/flashkern/native_engine.rs")
+    const engine = await liquid("native/src/engine/flashkern_engine.cpp")
     const model = await liquid("src/model/lfm2_audio.rs")
     const backbone = await liquid("src/model/lfm2_hf.rs")
     const ci = await root(".github/workflows/rust-voice.yml")
 
     expect(cargo).toContain('kcoro-sys = { path = "../kcoro-sys" }')
     expect(build).toContain('.file("native/src/engine/flashkern_engine.cpp")')
-    expect(build).toContain(".include(\"../kcoro-sys/vendor/kcoro/include\")")
+    expect(build).toContain(".include(\"../kcoro-sys/vendor/kcoro_arena/include\")")
+    expect(build).not.toContain("vendor/kcoro/include")
     expect(build).not.toContain("cargo::rustc-cfg=")
+    expect(kcoro).toContain('.compile("kcoro_arena_core")')
+    expect(kcoro).toContain('.compile("kcoro_arena_port_posix")')
+    expect(kcoro.indexOf('.compile("kcoro_arena_core")')).toBeLessThan(
+      kcoro.indexOf('.file("vendor/kcoro_arena/port/posix.c")'),
+    )
     expect(native).toContain("kcoro_sys::link_anchor")
     expect(native).toContain("fn lfm_engine_new")
     expect(native).toContain("pub fn process_engine()")
+    expect(engine).toContain("kc_ticket_create")
+    expect(engine).toContain("kc_ticket_complete")
+    expect(engine).toContain("kc_port_wait_u32")
+    expect(engine).toContain("kc_atomic_u32_fetch_add_release")
+    expect(engine).toContain("pthread_create")
+    expect(engine).not.toContain("kc_dispatcher")
+    expect(engine).not.toContain("kcoro_park")
+    expect(engine).not.toContain("kcoro_unpark")
     expect(native).toContain("native engine init failed on a target with fused kernels")
     expect(model).toContain(".install_native_ctx(model.lfm_cfg.max_position_embeddings)")
     expect(model).toContain("model.install_native_heads()")
     expect(model).toContain("self.native_token_step(cache, index_pos, ids, *kind, want_logits)?")
     expect(backbone).toContain("native_token_pass")
     expect(backbone).toContain("crate::flashkern::native_engine::process_engine()")
-    expect(ci).toContain("cargo build -p kcoro-sys")
+    expect(ci).toContain("cargo test -p kcoro-sys --tests -- --nocapture")
   })
 
   test("desktop local WebRTC setup does not block the async voice kernel", async () => {
@@ -265,10 +282,10 @@ describe("desktop voice context boundary", () => {
   })
 
   test("Moshi interruption resets model stream state instead of only flushing playback", async () => {
-    const moshi = await liquid("src/moshi/models/realtime.rs")
     const realtime = await liquid("src/runtime/realtime.rs")
+    const moshi = between(realtime, "mod moshi_model", "    #[cfg(test)]")
     const reset = between(moshi, "pub fn reset_stream(&mut self)", "pub fn warmup")
-    const interrupt = between(realtime, "fn interrupt_stream(&mut self)", "/// Stateful PCM conversion")
+    const engine = between(realtime, "impl VoiceEngine for MoshiVoiceEngine", "/// Stateful PCM conversion")
 
     expect(moshi).toContain("state: ::moshi::lm_generate_multistream::State")
     expect(moshi).toContain("lm: ::moshi::lm::LmModel")
@@ -280,12 +297,12 @@ describe("desktop voice context boundary", () => {
     expect(reset).toContain("self.mimi.reset_state()")
     expect(reset).toContain("self.state = Self::new_state(self.lm.clone(), self.params, self.config.clone())")
     expect(reset).toContain("self.text_token = self.config.text_start_token")
-    expect(interrupt).toContain("self.realtime.reset_stream()")
-    expect(interrupt).toContain("self.out_resampler.reset()")
+    expect(engine).toContain("self.realtime.reset_stream()")
+    expect(engine).toContain("self.out_resampler.reset()")
   })
 
   test("Moshi realtime first encoded frame follows upstream server loop", async () => {
-    const rust = await liquid("src/moshi/models/realtime.rs")
+    const rust = await liquid("src/runtime/realtime.rs")
     const step = between(rust, "pub fn step_pcm_frame", "fn step_codes")
     const codes = between(rust, "fn step_codes", "pub fn load_realtime_moshi")
     const reset = step.indexOf("self.mimi.reset_state()")
@@ -302,7 +319,7 @@ describe("desktop voice context boundary", () => {
   })
 
   test("Moshi realtime loader performs upstream server warmup before live frames", async () => {
-    const rust = await liquid("src/moshi/models/realtime.rs")
+    const rust = await liquid("src/runtime/realtime.rs")
     const warmup = between(rust, "pub fn warmup", "pub fn step_pcm_frame")
     const load = between(rust, "pub fn load_realtime_moshi", "fn is_floating_dtype")
 
@@ -314,6 +331,18 @@ describe("desktop voice context boundary", () => {
     expect(warmup).toContain("self.step_codes(codes, false)")
     expect(warmup).toContain("self.reset_stream()")
     expect(load).toContain("realtime.warmup(warmup_frames)?")
+  })
+
+  test("voice source has one canonical realtime and processor owner", async () => {
+    const realtime = await liquid("src/runtime/realtime.rs")
+    const processor = await liquid("src/processor.rs")
+
+    expect(await local("src/moshi/models/realtime.rs").exists()).toBe(false)
+    expect(await local("src/model/conformer/processor.rs").exists()).toBe(false)
+    expect(realtime).toContain("mod moshi_model")
+    expect(realtime).toContain("pub use moshi_model")
+    expect(processor).toContain("mod mel")
+    expect(processor).toContain("pub use mel")
   })
 
   test("utterance workers invalidate queued stale audio on interrupt", async () => {
@@ -1351,6 +1380,9 @@ describe("desktop voice context boundary", () => {
     const threads = await root("crates/liquid-audio/src/compute/threads.rs")
     const voice = await root("crates/liquid-audio/src/runtime/voice_runtime.rs")
     const realtime = await root("crates/liquid-audio/src/runtime/realtime.rs")
+    const pipeline = between(realtime, "use std::sync", "mod moshi_model")
+    const moshi = between(realtime, "mod moshi_model", "    #[cfg(test)]")
+    const engine = between(realtime, "pub use moshi_model", "\n#[cfg(test)]\nmod tests")
     const hub = await root("crates/liquid-audio/src/utils.rs")
     const runtime = await root("packages/desktop/src-tauri/src/voice/runtime.rs")
     const settings = await root("packages/desktop/src-tauri/src/settings.rs")
@@ -1359,7 +1391,9 @@ describe("desktop voice context boundary", () => {
     expect(loader).not.toContain("std::env")
     expect(threads).not.toContain("std::env")
     expect(voice).not.toContain("std::env")
-    expect(realtime).not.toContain("std::env")
+    expect(pipeline).not.toContain("std::env")
+    expect(moshi).not.toContain("std::env")
+    expect(engine).not.toContain("std::env")
     expect(hub).toContain(".with_cache_dir(cache.to_path_buf())")
     expect(hub).toContain(".with_token(token.map(str::to_owned))")
     expect(settings).toContain("pub fn lfm2_active_model_dir(settings: &Lfm2Settings)")

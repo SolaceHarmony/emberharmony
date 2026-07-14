@@ -3,9 +3,8 @@
 //! Companion to kcoro's `tests/test_zero_spin_idle.c` (the PR-122 oracle,
 //! measured real on Darwin): the engine's lane team must be as silent parked
 //! at the doorbell as bare kc_sched workers are parked on the ready queue.
-//! Between token passes every lane sits in an untimed `pthread_cond_wait`
-//! (kcoro patch 0005); the bounded ~100µs fence spin must have expired into a
-//! park, never a poll.
+//! Between token passes every lane sits in kcoro_arena's expected-value wait-word
+//! adapter. Command and fence waits park immediately; neither path polls.
 //!
 //! An integration test so the process contains ONLY this test's threads —
 //! the getrusage(RUSAGE_SELF) delta is attributable to the lane team, not to
@@ -36,7 +35,9 @@ fn idle_window_pct(window: Duration) -> f64 {
 
 #[test]
 fn engine_lanes_are_silent_at_idle() {
-    const IDLE_MAX_PCT: f64 = 0.5;
+    // The audited eight-lane baseline is about 0.002-0.005%. Keep enough CI
+    // headroom for the test harness while still detecting repeated wake/poll work.
+    const IDLE_MAX_PCT: f64 = 0.1;
 
     let engine = process_engine(); // infallible: the engine is the substrate
     let lanes = engine.lanes_total();

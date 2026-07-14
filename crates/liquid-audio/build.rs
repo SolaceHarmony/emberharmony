@@ -59,7 +59,7 @@ fn main() {
     }
 
     println!("cargo::rerun-if-changed=native/src/engine/flashkern_engine.cpp");
-    println!("cargo::rerun-if-changed=../kcoro-sys/vendor/kcoro/include");
+    println!("cargo::rerun-if-changed=../kcoro-sys/vendor/kcoro_arena/include");
     // C++23, not a style choice: this TU includes kcoro headers, and C++23 is
     // the FIRST standard that requires <stdatomic.h> to work in C++ and expose
     // ::atomic_int (gcc 13 implements it only under -std=c++23; c++20 is not
@@ -75,7 +75,7 @@ fn main() {
         .warnings(false)
         .flag("-ffp-contract=off")
         .flag("-pthread")
-        .include("../kcoro-sys/vendor/kcoro/include")
+        .include("../kcoro-sys/vendor/kcoro_arena/include")
         .compile("lfm_flashkern_engine");
 
     // The native Mimi decode kernel (docs/MIMI_PORT.md): five active units;

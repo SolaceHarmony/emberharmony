@@ -2,23 +2,18 @@
 // as a LANE-UNIFORM KERNEL: the engine owns all mutable state, and every lane runs
 // the ENTIRE pass program — embed, every layer, final norm — exactly the way a GPU
 // threadgroup runs a kernel. There is no coordinator publishing stages to workers:
-// stages are separated by in-arena generation fences (bounded spin, then park), tiles
+// stages are separated by generation fences on fixed OS threads, tiles
 // are claimed off a bare fetch_add counter (so an E-core straggler simply claims
 // fewer), and each fence's last arriver runs that boundary's serial ladder work
 // (sumsq folds, conv update, qk-norm/rope/append, embed) exactly once. The only
-// runtime primitives are kcoro park/unpark, made sound by vendored patches 0001 (the
-// three-state park gate: an unpark racing a park parks as a NOTIFIED token, never
-// lost) and 0004 (unpark enqueues to the coroutine's OWNING scheduler, so doorbells
-// are legal from any context).
+// runtime boundary is a retained kcoro_arena ticket: numerical lanes publish one
+// completion pointer and a coordination worker delivers the exact callback.
 //
-// Wake budget per pass: the Rust rim writes the request slot and unparks lane 0 (ONE
-// doorbell); lane 0 bumps the pass generation and unparks the team ONCE; the team
-// runs ~150 fences per token with zero scheduler traffic on the spin path; the
-// program-final fence proves completion and lane 0 signals the rim's condvar. The
-// previous coordinator-publishes model rode kc_sched's lossy park_cv ~400 times per
-// token, and each lost wake serialized a stage for up to 5 ms (the underrun lottery:
-// 24k vs 244k underrun samples on identical builds). Stop/shutdown is observed at
-// pass boundaries only — never polled inside ops.
+// Rust invokes one control ABI call. C++ claims the preallocated request slot before
+// writing it, creates one pass ticket, and release-rings the fixed lane team. The
+// program-final fence proves completion; lane 0 publishes the ticket and returns to
+// its blocking doorbell. Stop/shutdown remains a full-pass boundary decision and is
+// never polled inside SIMD operations.
 //
 // Numerics: stage bodies are line-for-line ports of src/compute/flashkern/decode.rs
 // (fused_mlp_decode) — same RNE bf16 rounding ladder, same FIXED tile count and
@@ -29,6 +24,7 @@
 // Build: -ffp-contract=off (the ladders promise separate roundings), C++17.
 
 #include <atomic>
+#include <cerrno>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -37,8 +33,7 @@
 #include <vector>
 
 extern "C" {
-#include "kcoro.h"
-#include "kcoro_dispatch.h"
+#include "kcoro_arena.h"
 }
 
 // Stage kernels from the flashkern TU (same image, plain calls).
@@ -126,32 +121,15 @@ struct Stage {
     uint32_t chunk = 0;      // band width for banded stages
 };
 
-// The generation fence — the GPU barrier idiom on kcoro lanes. Lanes arrive
-// (fetch_add), spin a bounded budget on the generation word, then park; the LAST
-// arriver runs the boundary's serial section exactly once, resets the claim counter,
-// bumps the generation (release — this publishes every plane written before the
-// fence), and precisely unparks any lane that declared itself parked. The park
-// declaration and the waker's mask exchange are RMWs on the same word, so a lane
-// whose declaration lands after the exchange is guaranteed by the RMW chain to see
-// the new generation and never parks — no lost-wake window. Every park sits in a
-// recheck loop, so a stale NOTIFIED token from a bygone fence is one spurious spin,
-// never a correctness event.
+// The generation fence — the GPU barrier idiom on fixed lanes. The last arriver runs
+// the boundary's serial section, release-publishes the next generation, and rings
+// each peer's cache-line-local expected-value word. kcoro_arena's port adapter closes
+// changed-before-park races and blocks without polling.
 struct Fence {
     std::atomic<uint32_t> arrived{0};
-    std::atomic<uint32_t> park_mask{0}; // lanes parked on this boundary (bit = lane)
+    std::atomic<uint32_t> park_mask{0};
     std::atomic<uint64_t> gen{0};
 };
-
-static inline void cpu_relax() {
-#if defined(__aarch64__)
-    asm volatile("isb" ::: "memory");
-#else
-    asm volatile("pause" ::: "memory");
-#endif
-}
-// ~100µs of isb on Apple Silicon: long enough that a one-tile straggler skew never
-// parks, short enough that a genuinely descheduled lane hands its core back.
-constexpr int FENCE_SPIN = 8192;
 
 enum : int {
     REQ_NONE = 0,
@@ -160,15 +138,10 @@ enum : int {
     REQ_ATTN_LAYER = 3,
     REQ_TOKEN_PASS = 4,
     // Generic lane-uniform call: every lane runs fn(ctx, lane, lanes_total). The
-    // program synchronizes ITSELF — and for Rust callers that means SpinBarrier
-    // ONLY, never lfm_lane_fence or any kcoro call: an M:N-migrated park under a
-    // live Rust frame is the patch-0002 TLS hazard (run_lanes' contract; every
-    // current caller complies). lfm_lane_fence stays exported for future NATIVE
-    // C++ callers. This is what lets other lane-uniform programs (the Rust
-    // depthformer frame, the grid) ride the SAME team — one dispatcher for the
-    // whole token, no foreign thread pools in the hot path.
+    // program may use lfm_lane_fence: each logical lane remains on one pthread, so
+    // ordinary nested C++/Rust frames and thread-local state never migrate. This
+    // transitional call remains until the depthformer program is fully native.
     REQ_CALL = 5,
-    REQ_SHUTDOWN = -1
 };
 
 typedef void (*LfmLaneFn)(void *ctx, uint32_t lane, uint32_t lanes_total);
@@ -303,6 +276,14 @@ struct TokenReq {
 };
 
 struct Engine;
+struct alignas(64) LaneWord {
+    uint32_t value = 0;
+    uint32_t observed = 0; // written only by this word's owning lane
+    kc_port_wait_word *wait = nullptr;
+    uint8_t padding[48] = {};
+};
+static_assert(sizeof(LaneWord) == 64, "lane doorbells must not share cache lines");
+
 struct LaneArg {
     Engine *e;
     uint32_t lane;
@@ -313,24 +294,30 @@ struct Engine {
     Stage stage;
     Fence fence;
 
-    // The lane team. Lane 0 doubles as the request loop (coord_main); lanes 1.. are
-    // lane_main coroutines. lanes_total == dispatcher threads: every lane is runnable
-    // on its own thread for the whole pass — the fence model requires it.
-    kcoro_t *coord = nullptr;            // lane 0
-    kcoro_t *workers[MAX_WORKERS] = {};  // lanes 1..lanes_total-1
+    // Stable logical lane i always runs on pthread i. kcoro_arena coordinates pass
+    // tickets; it never schedules or migrates these numerical call stacks.
+    pthread_t workers[MAX_WORKERS] = {};
+    LaneWord doorbells[MAX_WORKERS] = {};
     LaneArg largs[MAX_WORKERS] = {};
-    int n_workers = 0;      // worker COROUTINES (= lanes_total - 1)
+    int n_workers = 0;
+    int doorbells_prepared = 0;
+    int workers_started = 0;
     uint32_t lanes_total = 1;
-    std::atomic<uint64_t> lane_gen{0}; // pass generation: bump + team unpark = go
-    int cur_req = REQ_NONE;            // which program the lanes run this generation
-    kc_dispatcher_t *disp = nullptr;
-    std::atomic<bool> retire{false}; // workers exit when set (observed while idle)
+    std::atomic<uint64_t> lane_gen{0};
+    int cur_req = REQ_NONE;
+    std::atomic<bool> retire{false};
+    kc_runtime_t *runtime = nullptr;
+    kc_ticket_t *active_ticket = nullptr;
+    std::atomic<uint32_t> callback_refs{0};
+    std::atomic<bool> pass_claimed{false};
+    uint64_t submit_epoch = 0; // written only by the current pass claimant
 
-    // Rust-rim handshake: request slot + doorbell in, condvar back.
-    std::atomic<int> req{REQ_NONE};
+    // Rust-rim handshake: one ticket callback per full pass.
     pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
     pthread_cond_t cv = PTHREAD_COND_INITIALIZER;
     int finished = 0;
+    int result = 0;
+    uint64_t waiting_epoch = 0; // protected by mu
 
     ConvReq conv;  // conv-layer request payload
     AttnReq attn;  // attention-layer request payload
@@ -371,6 +358,31 @@ struct Engine {
     std::vector<uint16_t> tk_h0, tk_h1; // token-pass hidden ping-pong [H]
     std::vector<float> tk_logf;         // logits GEMV accumulators [vocab] (staging)
     size_t dim_maxctx = 0, dim_nh = 0, dim_nkv = 0, dim_hd = 0;
+};
+
+// Self-enforcing single-slot ownership at the raw C ABI. This claim must be acquired
+// before a caller reads or writes any engine-owned request, context, or scratch state;
+// the Rust pass_lock is an additional language-side guarantee, not the foundation.
+class PassClaim {
+  public:
+    explicit PassClaim(Engine *engine) : engine_(engine) {
+        bool expected = false;
+        held_ = engine_ && engine_->pass_claimed.compare_exchange_strong(
+                               expected, true, std::memory_order_acq_rel,
+                               std::memory_order_acquire);
+    }
+
+    ~PassClaim() {
+        if (held_) engine_->pass_claimed.store(false, std::memory_order_release);
+    }
+
+    explicit operator bool() const { return held_; }
+    PassClaim(const PassClaim &) = delete;
+    PassClaim &operator=(const PassClaim &) = delete;
+
+  private:
+    Engine *engine_ = nullptr;
+    bool held_ = false;
 };
 
 // ---- tile bodies (identical math to decode.rs) ----------------------------------------
@@ -574,9 +586,11 @@ static void run_tile(uint32_t kind, uint32_t idx, const Stage *st, Engine *e) {
     }
 }
 
-// ---- the lane fence -------------------------------------------------------------------
-static inline kcoro_t *lane_co(Engine *e, uint32_t lane) {
-    return lane == 0 ? e->coord : e->workers[lane - 1];
+// ---- fixed-lane doorbells and fence ----------------------------------------------------
+static inline void signal_lane(Engine *e, uint32_t lane) {
+    LaneWord *doorbell = &e->doorbells[lane];
+    kc_atomic_u32_fetch_add_release(&doorbell->value, 1);
+    kc_port_wake_u32_one(doorbell->wait);
 }
 
 // One stage boundary. `serial` runs exactly once, on the last arriver, AFTER every
@@ -591,26 +605,27 @@ static inline void lane_fence(Engine *e, uint32_t lane, F &&serial) {
         serial();
         f->arrived.store(0, std::memory_order_relaxed); // before the release below
         f->gen.store(g + 1, std::memory_order_release);
-        // Precise wake: only lanes that declared a park. The exchange is ordered
-        // after the gen bump, so a declaration that misses this exchange is
-        // guaranteed (RMW chain on park_mask) to observe the new generation.
-        uint32_t m = f->park_mask.exchange(0, std::memory_order_acq_rel);
-        while (m) {
-            uint32_t b = (uint32_t)__builtin_ctz(m);
-            m &= m - 1;
-            kcoro_unpark(lane_co(e, b));
+        uint32_t parked = f->park_mask.exchange(0, std::memory_order_acq_rel);
+        while (parked) {
+            uint32_t peer = (uint32_t)__builtin_ctz(parked);
+            parked &= parked - 1;
+            signal_lane(e, peer);
         }
         return;
     }
-    for (int i = 0; i < FENCE_SPIN; ++i) {
-        if (f->gen.load(std::memory_order_acquire) != g) return;
-        cpu_relax();
+    LaneWord *doorbell = &e->doorbells[lane];
+    uint32_t bit = 1u << lane;
+    f->park_mask.fetch_or(bit, std::memory_order_acq_rel);
+    if (f->gen.load(std::memory_order_acquire) != g) {
+        f->park_mask.fetch_and(~bit, std::memory_order_acq_rel);
+        return;
     }
-    // Slow path: declare, recheck, park. Parks recheck in a loop — a stale NOTIFIED
-    // token or a spurious unpark from a lingering declaration is absorbed here.
-    f->park_mask.fetch_or(1u << lane, std::memory_order_acq_rel);
-    while (f->gen.load(std::memory_order_acquire) == g) kcoro_park();
-    f->park_mask.fetch_and(~(1u << lane), std::memory_order_acq_rel);
+    while (f->gen.load(std::memory_order_acquire) == g) {
+        uint32_t expected = doorbell->observed;
+        (void)kc_port_wait_u32(doorbell->wait, expected, 0);
+        doorbell->observed = kc_atomic_u32_load_acquire(&doorbell->value);
+    }
+    f->park_mask.fetch_and(~bit, std::memory_order_acq_rel);
 }
 
 // One stage: fence in (serial section + claim-counter reset), then claim tiles off
@@ -988,55 +1003,113 @@ static void lane_program(Engine *e, uint32_t lane) {
     lane_fence(e, lane, [] {});
 }
 
-// Lanes 1..: park at the token boundary, run the whole program on a generation bump.
-// The recheck loop makes every wake path sound: a lost unpark surfaces as kc_sched's
-// 5ms timed-wait recovery (once per TOKEN at worst — patch 0005 will retire even
-// that); a stale NOTIFIED token is one spurious loop.
-static void lane_main(void *arg) {
+// Every fixed lane blocks on its own expected-value word between passes. The pass
+// generation remains the predicate; the word is only the edge that makes it recheck.
+static void *lane_main(void *arg) {
     LaneArg *la = (LaneArg *)arg;
     Engine *e = la->e;
     const uint32_t lane = la->lane;
+    LaneWord *doorbell = &e->doorbells[lane];
+    doorbell->observed = kc_atomic_u32_load_acquire(&doorbell->value);
     uint64_t seen = 0;
     for (;;) {
-        uint64_t g = e->lane_gen.load(std::memory_order_acquire);
-        if (g != seen) {
-            seen = g;
-            lane_program(e, lane);
-            continue;
+        while (e->lane_gen.load(std::memory_order_acquire) == seen &&
+               !e->retire.load(std::memory_order_acquire)) {
+            int rc = kc_port_wait_u32(doorbell->wait, doorbell->observed, 0);
+            doorbell->observed = kc_atomic_u32_load_acquire(&doorbell->value);
+            if (rc != 0 && e->retire.load(std::memory_order_acquire)) return nullptr;
         }
-        if (e->retire.load(std::memory_order_acquire)) return;
-        kcoro_park();
+        bool retire = e->retire.load(std::memory_order_acquire);
+        uint64_t generation = e->lane_gen.load(std::memory_order_acquire);
+        if (retire) return nullptr;
+        seen = generation;
+        lane_program(e, lane);
+        if (lane == 0) {
+            kc_ticket_completion_v1 completion = {
+                .size = sizeof(kc_ticket_completion_v1),
+                .abi_version = KC_ABI_VERSION,
+                .execution_status = KC_TICKET_EXECUTION_COMPLETED,
+                .state_status = KC_TICKET_STATE_COMMITTED,
+                .publication_status = KC_TICKET_PUBLICATION_COMMITTED,
+                .terminal_cause = KC_TICKET_CAUSE_SUCCESS,
+                .status_code = 0,
+            };
+            (void)kc_ticket_complete(e->active_ticket, &completion);
+        }
     }
 }
 
-// Lane 0 doubles as the request loop: rim doorbell in, ONE team wake per pass, then
-// it runs the same program as everyone else, and the program-final fence lets it
-// signal completion.
-static void coord_main(void *arg) {
+static void retain_engine_callback(void *arg) {
     Engine *e = (Engine *)arg;
-    for (;;) {
-        int req = e->req.exchange(REQ_NONE, std::memory_order_acq_rel);
-        if (req == REQ_SHUTDOWN) {
-            // Retire the team: flag + wake so parked workers observe it while idle.
-            e->retire.store(true, std::memory_order_release);
-            for (int w = 0; w < e->n_workers; ++w) kcoro_unpark(e->workers[w]);
-            return;
-        }
-        if (req == REQ_NONE) {
-            kcoro_park(); // the Rust rim's doorbell (or a just-written request's
-                          // NOTIFIED token) wakes us
-            continue;
-        }
-        e->cur_req = req;
-        e->lane_gen.fetch_add(1, std::memory_order_release);
-        for (int w = 0; w < e->n_workers; ++w) kcoro_unpark(e->workers[w]);
-        lane_program(e, 0);
-        // Pass boundary: hand back (signal from coroutine context never blocks).
-        pthread_mutex_lock(&e->mu);
+    e->callback_refs.fetch_add(1, std::memory_order_relaxed);
+}
+
+static void release_engine_callback(void *arg) {
+    Engine *e = (Engine *)arg;
+    e->callback_refs.fetch_sub(1, std::memory_order_release);
+}
+
+static void pass_complete(void *arg, const kc_ticket_event_v1 *event) {
+    Engine *e = (Engine *)arg;
+    pthread_mutex_lock(&e->mu);
+    if (event->epoch == e->waiting_epoch) {
+        e->result = event->status_code;
         e->finished = 1;
         pthread_cond_signal(&e->cv);
-        pthread_mutex_unlock(&e->mu);
     }
+    pthread_mutex_unlock(&e->mu);
+}
+
+static int submit_pass(Engine *e, int request) {
+    uint64_t epoch = ++e->submit_epoch;
+    pthread_mutex_lock(&e->mu);
+    e->finished = 0;
+    e->result = -1;
+    e->waiting_epoch = epoch;
+    pthread_mutex_unlock(&e->mu);
+
+    uint64_t generation = e->lane_gen.load(std::memory_order_relaxed) + 1;
+    kc_ticket_config_v1 config = {
+        .size = sizeof(kc_ticket_config_v1),
+        .abi_version = KC_ABI_VERSION,
+        .kind = (uint32_t)request,
+        .context_id = e->ctx_id,
+        .epoch = epoch,
+        .callback = pass_complete,
+        .callback_context = e,
+        .context_retain = retain_engine_callback,
+        .context_release = release_engine_callback,
+    };
+    kc_ticket_t *ticket = nullptr;
+    int rc = kc_ticket_create(e->runtime, &config, &ticket);
+    if (rc != 0) {
+        pthread_mutex_lock(&e->mu);
+        if (e->waiting_epoch == epoch) e->waiting_epoch = 0;
+        pthread_mutex_unlock(&e->mu);
+        return rc;
+    }
+    rc = kc_ticket_accept(ticket);
+    if (rc == 0) rc = kc_ticket_dispatch(ticket);
+    if (rc != 0) {
+        pthread_mutex_lock(&e->mu);
+        if (e->waiting_epoch == epoch) e->waiting_epoch = 0;
+        pthread_mutex_unlock(&e->mu);
+        kc_ticket_release(ticket);
+        return rc;
+    }
+    e->active_ticket = ticket;
+    e->cur_req = request;
+    e->lane_gen.store(generation, std::memory_order_release);
+    for (uint32_t lane = 0; lane < e->lanes_total; ++lane) signal_lane(e, lane);
+
+    pthread_mutex_lock(&e->mu);
+    while (!e->finished) pthread_cond_wait(&e->cv, &e->mu);
+    int result = e->result;
+    e->waiting_epoch = 0;
+    pthread_mutex_unlock(&e->mu);
+    e->active_ticket = nullptr;
+    kc_ticket_release(ticket);
+    return result;
 }
 
 } // namespace
@@ -1046,67 +1119,61 @@ extern "C" {
 
 void lfm_engine_free(void *ep);
 
-// `workers` is the TOTAL lane count (lane 0 = the request loop + a full compute
-// lane). Dispatcher threads == lanes: the fence model needs every lane runnable on
-// its own thread for the whole pass — the previous +1 oversubscribed the core budget.
+// `workers` is the total fixed lane count. Every logical lane owns one pthread for
+// the engine lifetime; kcoro_arena runs a separate single coordination worker for
+// ticket callbacks.
 void *lfm_engine_new(int workers) {
     if (workers < 1) workers = 1;
     if (workers > MAX_WORKERS) workers = MAX_WORKERS;
     Engine *e = new (std::nothrow) Engine();
     if (!e) return nullptr;
     e->lanes_total = (uint32_t)workers;
-    e->n_workers = workers - 1;
-    e->disp = kc_dispatcher_new(workers);
-    if (!e->disp) {
-        delete e;
-        return nullptr;
-    }
-    // 512 KiB lane stacks: REQ_CALL runs caller-supplied Rust lane programs on these
-    // stacks (the depthformer frame samples with candle ops on lane 0). mmap'd —
-    // untouched pages cost nothing.
-    for (int w = 0; w < e->n_workers; ++w) {
-        e->largs[w].e = e;
-        e->largs[w].lane = (uint32_t)(w + 1);
-        if (kc_dispatcher_spawn_co(e->disp, lane_main, &e->largs[w], 512 * 1024,
-                                   &e->workers[w]) != 0 ||
-            !e->workers[w]) {
+    e->n_workers = workers;
+    for (int lane = 0; lane < workers; ++lane) {
+        if (!kc_atomic_u32_is_lock_free(&e->doorbells[lane].value) ||
+            kc_port_wait_u32_prepare(&e->doorbells[lane].value,
+                                     &e->doorbells[lane].wait) != 0) {
             lfm_engine_free(e);
             return nullptr;
         }
+        e->doorbells_prepared++;
     }
-    if (kc_dispatcher_spawn_co(e->disp, coord_main, e, 512 * 1024, &e->coord) != 0 ||
-        !e->coord) {
+
+    kc_runtime_config runtime_config = {
+        .size = sizeof(kc_runtime_config),
+        .abi_version = KC_ABI_VERSION,
+        .worker_count = 1,
+        .ticket_capacity = 64,
+    };
+    if (kc_runtime_create(&runtime_config, &e->runtime) != 0 ||
+        kc_runtime_start(e->runtime) != 0) {
         lfm_engine_free(e);
         return nullptr;
+    }
+    for (int lane = 0; lane < workers; ++lane) {
+        e->largs[lane].e = e;
+        e->largs[lane].lane = (uint32_t)lane;
+        if (pthread_create(&e->workers[lane], nullptr, lane_main, &e->largs[lane]) != 0) {
+            lfm_engine_free(e);
+            return nullptr;
+        }
+        e->workers_started++;
     }
     return e;
 }
 
 // Run a caller-supplied lane-uniform program on the whole team: fn(ctx, lane, lanes)
-// on every lane. The program synchronizes itself — Rust callers via SpinBarrier
-// only (kcoro parks under live Rust frames are forbidden: the patch-0002 TLS
-// hazard; see run_lanes in native_engine.rs); native C++ callers may use
-// lfm_lane_fence. One doorbell, one completion — the same contract as every
-// other pass. The caller's ctx must stay valid for the (blocking) duration of
-// this call.
+// on every lane. Logical lanes are thread-stable, so ordinary language TLS remains
+// on its originating pthread. One ticket in, one exact completion out.
 int lfm_engine_call(void *ep, LfmLaneFn fn, void *ctx) {
     Engine *e = (Engine *)ep;
     if (!e || !fn) return -1;
+    PassClaim claim(e);
+    if (!claim) return -EBUSY;
 
     e->call.fn = fn;
     e->call.ctx = ctx;
-
-    pthread_mutex_lock(&e->mu);
-    e->finished = 0;
-    pthread_mutex_unlock(&e->mu);
-
-    e->req.store(REQ_CALL, std::memory_order_release);
-    kcoro_unpark(e->coord);
-
-    pthread_mutex_lock(&e->mu);
-    while (!e->finished) pthread_cond_wait(&e->cv, &e->mu);
-    pthread_mutex_unlock(&e->mu);
-    return 0;
+    return submit_pass(e, REQ_CALL);
 }
 
 // The team fence, exported for REQ_CALL programs: pure barrier (empty serial
@@ -1124,23 +1191,23 @@ uint32_t lfm_engine_lanes(void *ep) {
 void lfm_engine_free(void *ep) {
     Engine *e = (Engine *)ep;
     if (!e) return;
-    if (e->coord) {
-        e->req.store(REQ_SHUTDOWN, std::memory_order_release);
-        kcoro_unpark(e->coord);
-    } else {
-        // Coordinator never came up: retire workers directly.
-        e->retire.store(true, std::memory_order_release);
-        for (int w = 0; w < e->n_workers; ++w)
-            if (e->workers[w]) kcoro_unpark(e->workers[w]);
+    e->retire.store(true, std::memory_order_release);
+    e->lane_gen.fetch_add(1, std::memory_order_release);
+    for (int lane = 0; lane < e->doorbells_prepared; ++lane) signal_lane(e, lane);
+    for (int lane = 0; lane < e->workers_started; ++lane) {
+        pthread_join(e->workers[lane], nullptr);
     }
-    if (e->disp) kc_dispatcher_release(e->disp); // joins the team's threads
-    // Release the caller-owned coroutine handle refs (spawn_co's out_co retains for
-    // us). Safe strictly after dispatcher release: threads are joined and the
-    // scheduler's own queue refs are dropped (kcoro_destroy == kcoro_release —
-    // refcounted, so this is the ref that lets the stacks actually unmap).
-    for (int w = 0; w < e->n_workers; ++w)
-        if (e->workers[w]) kcoro_release(e->workers[w]);
-    if (e->coord) kcoro_release(e->coord);
+    if (e->runtime) {
+        (void)kc_runtime_run_until_idle(e->runtime);
+        (void)kc_runtime_join_all(e->runtime);
+        kc_runtime_request_stop(e->runtime);
+        (void)kc_runtime_join(e->runtime);
+        (void)kc_runtime_destroy(e->runtime);
+    }
+    for (int lane = e->doorbells_prepared - 1; lane >= 0; --lane)
+        kc_port_wait_u32_release(e->doorbells[lane].wait);
+    pthread_cond_destroy(&e->cv);
+    pthread_mutex_destroy(&e->mu);
     delete e;
 }
 
@@ -1152,6 +1219,8 @@ int lfm_engine_mlp(void *ep, const uint16_t *x, const uint16_t *norm_w,
     Engine *e = (Engine *)ep;
     if (!e || !x || !norm_w || !w1 || !w3 || !w2 || !out || h == 0 || i == 0)
         return -1;
+    PassClaim claim(e);
+    if (!claim) return -EBUSY;
     size_t tiles = lanes;
     if (tiles < 1) tiles = 1;
     size_t cap = h < i ? h : i;
@@ -1196,17 +1265,7 @@ int lfm_engine_mlp(void *ep, const uint16_t *x, const uint16_t *norm_w,
     p->t = e->sc_t.data();
     p->rs_bits.store(0, std::memory_order_relaxed);
 
-    pthread_mutex_lock(&e->mu);
-    e->finished = 0;
-    pthread_mutex_unlock(&e->mu);
-
-    e->req.store(REQ_MLP, std::memory_order_release);
-    kcoro_unpark(e->coord); // the doorbell (patch 0004: legal from this thread)
-
-    pthread_mutex_lock(&e->mu);
-    while (!e->finished) pthread_cond_wait(&e->cv, &e->mu);
-    pthread_mutex_unlock(&e->mu);
-    return 0;
+    return submit_pass(e, REQ_MLP);
 }
 
 // Build the resident layer table: one descriptor per backbone block (indexed by
@@ -1221,6 +1280,8 @@ int lfm_ctx_build(void *ep, const LfmLayerDesc *descs, size_t n_layers, size_t h
     Engine *e = (Engine *)ep;
     if (!e || !descs || n_layers == 0 || h == 0 || ffn == 0 || max_ctx == 0 || !out_id)
         return -1;
+    PassClaim claim(e);
+    if (!claim) return -EBUSY;
     if (e->ctx_live.load(std::memory_order_acquire)) return -4;
     size_t kmax = 1, nh = 0, nkv = 0, hd = 0;
     for (size_t l = 0; l < n_layers; ++l) {
@@ -1288,6 +1349,8 @@ int lfm_ctx_set_heads(void *ep, const uint16_t *embed_w, size_t vocab,
                       const uint16_t *emb_norm_w, float emb_norm_eps) {
     Engine *e = (Engine *)ep;
     if (!e || !embed_w || !emb_norm_w || vocab == 0) return -1;
+    PassClaim claim(e);
+    if (!claim) return -EBUSY;
     try {
         e->tk_logf.resize(vocab);
     } catch (const std::bad_alloc &) {
@@ -1306,9 +1369,12 @@ int lfm_ctx_set_heads(void *ep, const uint16_t *embed_w, size_t vocab,
 // Rust rim's pass lock, so no pass is in flight here. Only the owning install's id
 // clears — a stale guard (its build was refused, or it was already superseded) is a
 // no-op instead of clobbering the live owner's table.
-void lfm_ctx_clear(void *ep, uint64_t id) {
+int lfm_ctx_clear(void *ep, uint64_t id) {
     Engine *e = (Engine *)ep;
-    if (!e || id == 0 || id != e->ctx_id) return;
+    if (!e || id == 0) return -1;
+    PassClaim claim(e);
+    if (!claim) return -EBUSY;
+    if (id != e->ctx_id) return 0;
     e->ctx_id = 0;
     e->ctx_live.store(false, std::memory_order_release);
     e->layers.clear();
@@ -1317,6 +1383,7 @@ void lfm_ctx_clear(void *ep, uint64_t id) {
     e->emb_norm_w = nullptr;
     e->vocab = 0;
     e->audio_rows = 0;
+    return 0;
 }
 
 // One whole shortconv+MLP layer: request slot → doorbell → park. Returns 0 on
@@ -1327,6 +1394,8 @@ int lfm_engine_conv_layer(void *ep, size_t layer, const uint16_t *x,
                           size_t lanes) {
     Engine *e = (Engine *)ep;
     if (!e || !x || !state_in || !state_out || !out) return -1;
+    PassClaim claim(e);
+    if (!claim) return -EBUSY;
     if (!e->ctx_live.load(std::memory_order_acquire) || layer >= e->layers.size() ||
         e->layers[layer].kind != 0)
         return -3;
@@ -1338,17 +1407,7 @@ int lfm_engine_conv_layer(void *ep, size_t layer, const uint16_t *x,
     e->conv.out = out;
     e->conv.lanes = lanes < 1 ? 1 : (lanes > MAX_WORKERS ? MAX_WORKERS : lanes);
 
-    pthread_mutex_lock(&e->mu);
-    e->finished = 0;
-    pthread_mutex_unlock(&e->mu);
-
-    e->req.store(REQ_CONV_LAYER, std::memory_order_release);
-    kcoro_unpark(e->coord);
-
-    pthread_mutex_lock(&e->mu);
-    while (!e->finished) pthread_cond_wait(&e->cv, &e->mu);
-    pthread_mutex_unlock(&e->mu);
-    return 0;
+    return submit_pass(e, REQ_CONV_LAYER);
 }
 
 // One whole attention+MLP layer. Per-generation state (planes, rope tables, cursor)
@@ -1362,6 +1421,8 @@ int lfm_engine_attn_layer(void *ep, size_t layer, const uint16_t *x, uint16_t *k
                           uint16_t *out, size_t lanes) {
     Engine *e = (Engine *)ep;
     if (!e || !x || !k_plane || !v_plane || !cos_base || !sin_base || !out) return -1;
+    PassClaim claim(e);
+    if (!claim) return -EBUSY;
     if (!e->ctx_live.load(std::memory_order_acquire) || layer >= e->layers.size() ||
         e->layers[layer].kind != 1 || !e->layers[layer].q_w ||
         pos + 1 > e->dim_maxctx)
@@ -1378,17 +1439,7 @@ int lfm_engine_attn_layer(void *ep, size_t layer, const uint16_t *x, uint16_t *k
     e->attn.out = out;
     e->attn.lanes = lanes < 1 ? 1 : (lanes > MAX_WORKERS ? MAX_WORKERS : lanes);
 
-    pthread_mutex_lock(&e->mu);
-    e->finished = 0;
-    pthread_mutex_unlock(&e->mu);
-
-    e->req.store(REQ_ATTN_LAYER, std::memory_order_release);
-    kcoro_unpark(e->coord);
-
-    pthread_mutex_lock(&e->mu);
-    while (!e->finished) pthread_cond_wait(&e->cv, &e->mu);
-    pthread_mutex_unlock(&e->mu);
-    return 0;
+    return submit_pass(e, REQ_ATTN_LAYER);
 }
 
 // ONE token through the whole backbone: embed → every layer → final norm → logits.
@@ -1402,6 +1453,8 @@ int lfm_engine_token_pass(void *ep, const uint32_t *ids, size_t n_ids,
                           float *out_logits, size_t lanes) {
     Engine *e = (Engine *)ep;
     if (!e || !ids || n_ids == 0 || !states || !out_hidden) return -1;
+    PassClaim claim(e);
+    if (!claim) return -EBUSY;
     if (!e->ctx_live.load(std::memory_order_acquire) || !e->embed_w || !e->emb_norm_w ||
         n_states != e->layers.size() || pos + 1 > e->dim_maxctx)
         return -3;
@@ -1435,17 +1488,7 @@ int lfm_engine_token_pass(void *ep, const uint32_t *ids, size_t n_ids,
     e->tok.out_logits = out_logits;
     e->tok.lanes = lanes < 1 ? 1 : (lanes > MAX_WORKERS ? MAX_WORKERS : lanes);
 
-    pthread_mutex_lock(&e->mu);
-    e->finished = 0;
-    pthread_mutex_unlock(&e->mu);
-
-    e->req.store(REQ_TOKEN_PASS, std::memory_order_release);
-    kcoro_unpark(e->coord);
-
-    pthread_mutex_lock(&e->mu);
-    while (!e->finished) pthread_cond_wait(&e->cv, &e->mu);
-    pthread_mutex_unlock(&e->mu);
-    return 0;
+    return submit_pass(e, REQ_TOKEN_PASS);
 }
 
 } // extern "C"

@@ -1,5 +1,5 @@
 # conformer_processor (Rust port)
-**Source:** `liquid-audio/src/model/conformer/processor.rs` · **Python:** `upstream-liquid-audio/src/liquid_audio/model/conformer/processor.py` · **On the LFM2-Audio inference path:** yes
+**Source:** `crates/liquid-audio/src/processor.rs` · **Python:** `upstream-liquid-audio/src/liquid_audio/model/conformer/processor.py` · **On the LFM2-Audio inference path:** yes
 
 > Companion to [`wiki/model/conformer/processor.md`](../../../wiki/model/conformer/processor.md).
 

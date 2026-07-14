@@ -113,7 +113,7 @@ CUDA.
 
 ## Wiring (Rust)
 **Upstream — feeds this encoder:**
-- `model/conformer/processor.rs` → mel front-end produces per-clip log-mel
+- `crates/liquid-audio/src/processor.rs` → mel front-end produces per-clip log-mel
   `(128, F)` (stored bf16 in `ChatState`); `model/lfm2_audio.rs::prefill_inputs`
   casts each segment to model dtype and calls `self.conformer.forward(&seg)`
   (`lfm2_audio.rs:683`). See

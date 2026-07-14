@@ -24,7 +24,7 @@
 //! on the prefill under test) — the same standard as cache_equivalence.rs.
 //!
 //! Run: LFM_DEVICE=metal LFM_MODEL_DIR=/path/to/model \
-//!      cargo test --release --features metal --test speculative_prefill -- --nocapture
+//!      cargo test --release --features metal --test speculative_prefill -- --ignored --nocapture
 
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
@@ -112,6 +112,7 @@ fn respond(engine: &mut Lfm2VoiceEngine, utt: &Utterance) -> Reply {
 }
 
 #[test]
+#[ignore = "requires an LFM checkpoint selected by LFM_MODEL_DIR"]
 fn prepare_is_a_pure_accelerator() {
     let dir = std::env::var("LFM_MODEL_DIR").expect("set LFM_MODEL_DIR to the local model dir");
     let dir = Path::new(&dir);

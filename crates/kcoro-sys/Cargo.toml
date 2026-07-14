@@ -2,8 +2,8 @@
 name = "kcoro-sys"
 version = "0.1.0"
 edition = "2021"
-links = "kcoro"
-description = "Build-only sys crate for the vendored kcoro coroutine runtime"
+links = "kcoro_arena"
+description = "Build-only sys crate for the vendored kcoro_arena coordination runtime"
 license = "BSD-3-Clause"
 build = "build.rs"
 

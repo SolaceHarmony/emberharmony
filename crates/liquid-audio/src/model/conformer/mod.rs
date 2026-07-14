@@ -13,6 +13,5 @@
 pub mod encoder; // ConformerEncoder
 pub mod mha;
 pub mod modules; // ConformerLayer / ConformerConvolution / FeedForward / CausalConv1D
-pub mod processor; // AudioPreprocessor / AudioToMelSpectrogramPreprocessor (mel features)
 pub mod subsampling; // ConvSubsampling / MaskedConvSequential
 pub mod utils; // CacheAwareStreamingConfig, stochastic-depth, autocast guard

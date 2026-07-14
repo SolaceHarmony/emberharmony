@@ -10,7 +10,7 @@
 //! than "sounding a bit off".
 //!
 //! Run (needs the local model):
-//!   LFM_MODEL_DIR=/path/to/model cargo test --release --test mimi_native_parity
+//!   LFM_MODEL_DIR=/path/to/model cargo test --release --test mimi_native_parity -- --ignored
 #![cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 
 use candle_core::{DType, Device, Tensor};
@@ -21,6 +21,7 @@ const CODEBOOKS: usize = 8;
 const MAX_ABS: f32 = 5e-5;
 
 #[test]
+#[ignore = "requires a Mimi checkpoint selected by LFM_MODEL_DIR"]
 fn native_mimi_matches_moshi_across_kv_wrap() {
     let dir = std::env::var("LFM_MODEL_DIR").expect("set LFM_MODEL_DIR to the local model dir");
     let ckpt = std::path::Path::new(&dir).join("tokenizer-e351c8d8-checkpoint125.safetensors");

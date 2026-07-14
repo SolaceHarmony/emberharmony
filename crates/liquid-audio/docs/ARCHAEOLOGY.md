@@ -81,7 +81,7 @@ Mimi** — mic audio enters through the **conformer mel front-end**, not Mimi.
 
 | Direction | What's used | Python | Rust |
 |---|---|---|---|
-| **audio-IN** (mic → model) | conformer **mel** (128-bin), *not* Mimi | `processor.py:226-250` `ChatState.add_audio` → `self.proc.audio` | `processor.rs` `add_audio`; mel in `model/conformer/processor.rs` |
+| **audio-IN** (mic → model) | conformer **mel** (128-bin), *not* Mimi | `processor.py:226-250` `ChatState.add_audio` → `self.proc.audio` | `processor.rs` `add_audio`; mel in the same canonical `processor.rs` |
 | **audio-OUT** (codes → wav), LFM2.5 | **LFM2 detokenizer** (ISTFT vocoder) | `detokenizer.py:120-136`; dispatched `processor.py:165` | `detokenizer.rs`; dispatch `processor.rs:158` |
 | **audio-OUT**, v1/demo | **Mimi** streaming decode | `demo/chat.py:34` `mimi.decode(...)` | `audio_out.rs` `MimiDetokenizer` (moshi crate) |
 | **audio-OUT encode** (data prep) | **Mimi** encode | `data/mapper.py:229` `processor.mimi.encode` | `audio_out.rs::encode` |
@@ -221,7 +221,7 @@ or channel.
 | Backbone | `transformers.Lfm2Model` (`lfm2_audio.py:14,83`) | `model/lfm2_hf.rs` (candle_nn) |
 | Depthformer | `RawLMBackbone` (`lfm2_audio.py:121`) | `model/transformer.rs` `RawLmBackbone` |
 | Conformer enc | `model/conformer/encoder.py` | `model/conformer/encoder.rs` |
-| Mel front-end | NeMo `FilterbankFeatures` + `librosa.filters.mel` (`conformer/processor.py`) | `model/conformer/processor.rs` (native slaney mel, Conv1d DFT) |
+| Mel front-end | NeMo `FilterbankFeatures` + `librosa.filters.mel` (`conformer/processor.py`) | `src/processor.rs` (native slaney mel, Conv1d DFT) |
 | Weight load | `accelerate.load_checkpoint_in_model` (`lfm2_audio.py:167`) | `VarBuilder::from_mmaped_safetensors` (`loader.rs:136`) |
 | HF download | `huggingface_hub.snapshot_download` (`utils.py:48`) | `hf-hub` crate (`utils.rs:72`) |
 | Text tokenizer | `transformers.AutoTokenizer` (`processor.py:45`) | `tokenizers` crate (`processor.rs:114`) |

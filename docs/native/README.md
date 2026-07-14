@@ -6,15 +6,21 @@ Rust entrypoint at `packages/desktop/src-tauri`.
 
 ## Crates
 
-- `crates/liquid-audio` — LFM2.5-Audio model engine, runtime pipeline, and CPU native kernels.
-- `crates/candle-flashfftconv` — Candle CPU/Metal FlashFFTConv operators used by the voice path.
-- `crates/kcoro-sys` — build-only sys crate for the vendored kcoro C/assembly coroutine runtime.
+- `crates/liquid-audio` - current hybrid LFM2.5-Audio crate; target is a thin
+  Rust handle wrapper over the complete C++/SIMD/assembly local voice runtime.
+- `crates/candle-flashfftconv` - migration-only Candle operators, deleted when
+  the native production kernel gates pass.
+- `crates/kcoro-sys` - build-only sys crate for the vendored kcoro coordination,
+  ticket, fixed-executor, and host-port runtime; no safe Rust scheduler API.
 
 ## Boundaries
 
 - Bun/TypeScript calls Tauri commands; it does not import or build native crates directly.
-- Tauri depends on `liquid-audio` by path and owns desktop command/session orchestration.
-- `liquid-audio` owns model/runtime APIs and private C ABI declarations.
+- Tauri depends on `liquid-audio` by path and owns persisted settings, command
+  registration, opaque handle lifetime, and bounded event projection.
+- `liquid-audio` owns the private C ABI declarations; its C++ runtime owns model
+  loading, session state machines, pass/ticket orchestration, recurrence, and
+  numerical dispatch.
 - `kcoro-sys` owns compiling kcoro; it does not expose a safe Rust runtime API.
 
 ## Native Source Layout
@@ -25,15 +31,17 @@ Rust entrypoint at `packages/desktop/src-tauri`.
 - `src/engine/` — resident native stage-machine code.
 - `kernels/aarch64/` — NEON/AArch64 kernels.
 - `kernels/x86_64/` — AVX/x86-64 kernels.
-- `reference/` — portable or historical reference kernels.
+- `reference/` - test-only scalar oracles excluded from the production link map;
+  no historical production implementation is retained.
 
 Detailed design notes remain adjacent to the owning crate under `crates/*/docs/`.
 
 ## Integration Guides
 
 - [`KCORO_ARENA_INTEGRATION.md`](KCORO_ARENA_INTEGRATION.md) - current and target
-  architecture, memory ownership, stackless lane migration, host adapters,
-  durable workflows, shutdown ordering, and verification gates.
+  architecture, memory ownership, fixed Flashkern lanes, zero-spin waits,
+  tickets/callbacks, host adapters, Tauri observation, durable workflows,
+  shutdown ordering, and verification gates.
 - [`10-stateful-multi-agent-runtime.md`](../../specs/10-stateful-multi-agent-runtime.md) -
   one shared model with many conversation images, fast switching, perspective
   forks, macro batching, delta hibernation, and WAL-backed orchestration.

@@ -18,7 +18,7 @@
 //! Run (audible — needs a speaker and the local model; `audio-io` enables the
 //! built-in CPAL output device, same opt-in the standalone examples use):
 //!   LFM_DEVICE=metal LFM_MODEL_DIR=/path/to/model \
-//!     cargo test --release --features metal,audio-io --test e2e_voice_runtime -- --nocapture
+//!     cargo test --release --features metal,audio-io --test e2e_voice_runtime -- --ignored --nocapture
 #![cfg(feature = "audio-io")]
 
 use std::collections::VecDeque;
@@ -159,6 +159,7 @@ fn wait_for_state(
 }
 
 #[test]
+#[ignore = "requires an LFM checkpoint, microphone fixture, and audible output device"]
 fn e2e_voice_runtime_speaks_two_turns_through_real_speaker() {
     let dir = std::env::var("LFM_MODEL_DIR").expect("set LFM_MODEL_DIR to the local model dir");
     let dir = std::path::PathBuf::from(dir);

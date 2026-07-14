@@ -1,43 +1,50 @@
 fn main() {
-    println!("cargo::rerun-if-changed=vendor/kcoro");
+    println!("cargo::rerun-if-changed=vendor/kcoro_arena");
 
     if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
         return;
     }
 
-    let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
-    let asm = match arch.as_str() {
-        "aarch64" => "vendor/kcoro/arch/aarch64/kc_ctx_switch.S",
-        "x86_64" => "vendor/kcoro/arch/x86_64/kc_ctx_switch.S",
-        _ => return,
-    };
-
     let srcs = [
-        "kc_chan.c",
+        "kcoro_stackless.c",
+        "kc_runtime.c",
+        "kc_op.c",
+        "kc_ticket.c",
+        "koro_sched_stackless.c",
+        "kc_chan_stackless.c",
+        "kc_desc.c",
+        "kc_timer.c",
+        "kc_scope.c",
         "kc_actor.c",
         "kc_cancel.c",
-        "kc_sched.c",
-        "kcoro_core.c",
-        "kc_scope.c",
-        "kc_select.c",
-        "kc_zcopy.c",
-        "kc_runtime_config.c",
-        "kc_bench.c",
-        "kc_dispatch.c",
+        "kc_admin.c",
+        "kc_wal.c",
+        "kc_checkpoint.c",
+        "kc_durable.c",
+        "kc_workflow.c",
+        "kc_shared.c",
+        "kc_transport.c",
     ];
 
-    let mut build = cc::Build::new();
+    let mut core = cc::Build::new();
     for src in srcs {
-        build.file(format!("vendor/kcoro/core/src/{src}"));
+        core.file(format!("vendor/kcoro_arena/core/src/{src}"));
     }
-    build
-        .file(asm)
-        .include("vendor/kcoro/include")
+    core.include("vendor/kcoro_arena/include")
+        .include("vendor/kcoro_arena/core/src")
+        .std("c11")
+        .opt_level(2)
+        .define("_GNU_SOURCE", None)
+        .warnings(false)
+        .compile("kcoro_arena_core");
+
+    cc::Build::new()
+        .file("vendor/kcoro_arena/port/posix.c")
+        .include("vendor/kcoro_arena/include")
         .std("c11")
         .opt_level(2)
         .flag("-pthread")
         .define("_GNU_SOURCE", None)
-        .define("KC_SCHED", "1")
         .warnings(false)
-        .compile("kcoro");
+        .compile("kcoro_arena_port_posix");
 }

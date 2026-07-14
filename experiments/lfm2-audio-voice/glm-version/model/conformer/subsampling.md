@@ -91,7 +91,7 @@ computed in f32/f64 upstream and cast to `text_emb.dtype` before the conformer
 `[1,256,13,16]`, post-subsample/pos-enc **1.019e-6** at `[1,13,512]`.
 
 ## Wiring (Rust)
-**Upstream** — `model/conformer/processor.rs` produces the mel features
+**Upstream** — `crates/liquid-audio/src/processor.rs` produces the mel features
 `(B,128,T)`. They enter via `model/conformer/encoder.rs`, which transposes to
 `(B,T,128)` and calls `pre_encode(x, lengths)`. The caller path is
 `model/lfm2_audio.rs::prefill_inputs`: it splits per-clip, casts each segment

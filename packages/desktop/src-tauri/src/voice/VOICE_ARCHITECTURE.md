@@ -1,5 +1,15 @@
 # EmberHarmony Voice — Stack Architecture
 
+> **Current-hybrid document.** This file describes the shipped Rust/Candle/native
+> mixture while the replacement is being designed. The normative target is
+> [`specs/11-kcoro-native-migration.md`](../../../../../specs/11-kcoro-native-migration.md),
+> including the fixed Flashkern executor and ticket callback contract in
+> [document 03](../../../../../specs/11-kcoro-native-migration/03-scheduler-passes-and-recurrence.md)
+> and the Tauri/visualizer observer design in
+> [document 12](../../../../../specs/11-kcoro-native-migration/12-ticketed-orchestration-and-observability.md).
+> At cutover this document is rewritten in place; Git history is the old
+> architecture record.
+
 > Status legend used throughout: ✅ built & proven this stack · 🔧 in progress / partially
 > wired · ◻️ designed, not yet built · ⚠️ known gap / open question.
 >

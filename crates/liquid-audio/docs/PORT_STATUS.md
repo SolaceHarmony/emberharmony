@@ -19,7 +19,7 @@ uses `super()`); Python **ABCs** become Rust **traits**:
   `RelPositionMultiHeadAttention` — base structs composed by the rel-pos subclasses (`mha.rs`).
 - `SequenceModel` (ABC) → trait, impl'd by `RawLmBackbone` (`transformer.rs`).
 - `AudioPreprocessor` (ABC) → trait; `AudioToMelSpectrogramPreprocessor` wraps
-  `FilterbankFeatures` (`conformer/processor.rs`).
+  `FilterbankFeatures` (`src/processor.rs`).
 - `CausalConv1D` (`modules.rs`), `MaskedConvSequential` (`subsampling.rs`),
   `CacheAwareStreamingConfig` + stochastic-depth/autocast fns (`conformer/utils.rs`),
   `LFM2_HFConfig`/`LFM2AudioConfig`/`LFM2AudioModelOutput` (`lfm2_audio.rs`), and
@@ -54,7 +54,7 @@ Python's `forward_cached(x, cache) -> (out, cache)` is Rust's in-place
 | `model/conformer/modules.py` | 471 | `src/model/conformer/modules.rs` | ✅ done — ConformerLayer / Conv / FeedForward |
 | `model/conformer/subsampling.py` | 605 | `src/model/conformer/subsampling.rs` | ✅ done — dw_striding ConvSubsampling |
 | `model/conformer/encoder.py` | 1163 | `src/model/conformer/encoder.rs` | ✅ done — offline ConformerEncoder forward |
-| `model/conformer/processor.py` | 556 | `src/model/conformer/processor.rs` | ✅ done — mel featurizer (rustfft STFT, computed hann + slaney mel) |
+| `model/conformer/processor.py` | 556 | `src/processor.rs` | ✅ done — mel featurizer (rustfft STFT, computed hann + slaney mel) |
 | `detokenizer.py` | 136 | `src/detokenizer.rs` | ✅ done — FusedEmbedding + Vocos ISTFT (rustfft) + lfm2_hf backbone |
 | `processor.py` | 269 | `src/processor.rs` | ✅ done — tokenizer (`tokenizers`) + mel + `ChatState` + detok decode |
 | `model/lfm2_audio.py` | 534 | `src/model/lfm2_audio.rs` | ✅ done — LFM2AudioModel + prefill + `generate_interleaved` (callback stream) + depthformer |

@@ -95,7 +95,7 @@ stored as I64 (it's an enum, not a flag); `supervision_mask` is the real bool
 
 ## Precision / gotchas (Rust-specific)
 - **`audio_in` is F32 here, but the mel that fills it is precision-sensitive.**
-  The mel front-end (`conformer/processor.rs`) computes in f32 (with f64
+  The mel front-end (`crates/liquid-audio/src/processor.rs`) computes in f32 (with f64
   window/filterbank/twiddles) and only *materializes* f32 in this bundle; in
   `ChatState` (inference) the same mel is stored bf16. Do not conflate the
   storage dtype here (f32) with a license to compute mel in low precision.

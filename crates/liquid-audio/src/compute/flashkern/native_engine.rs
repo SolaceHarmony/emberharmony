@@ -1,9 +1,10 @@
 //! The Rust rim of the resident native decode engine (native/src/engine/flashkern_engine.cpp).
 //!
-//! Everything below the ABI line is C++: the persistent kcoro team, the block
+//! Everything below the ABI line is C++: the persistent fixed-lane team, the block
 //! schedules, the stage kernels. Rust's per-pass surface is one blocking call —
-//! internally: write the request slot, `kcoro_unpark` the parked coordinator (the
-//! doorbell), park on a condvar until the pass boundary. No Rust between stages.
+//! internally: write the request slot, submit one kcoro_arena ticket, ring the lane
+//! doorbells, and park until the ticket callback marks the pass boundary. No Rust
+//! between stages.
 
 use std::ffi::c_void;
 use std::sync::Mutex;
@@ -116,7 +117,7 @@ extern "C" {
         out: *mut u16,
         lanes: usize,
     ) -> i32;
-    fn lfm_ctx_clear(e: *mut c_void, id: u64);
+    fn lfm_ctx_clear(e: *mut c_void, id: u64) -> i32;
     fn lfm_engine_call(
         e: *mut c_void,
         f: unsafe extern "C" fn(*mut c_void, u32, u32),
@@ -173,7 +174,8 @@ extern "C" {
 /// Handle to the persistent native engine. One per process is the intended shape
 /// (decode is sequential). The C side is a SINGLE-SLOT machine — one Pass, one
 /// scratch arena, one request word — so the wrapper serializes the entire native
-/// call under `pass_lock`; that lock is what makes the `Sync` below true.
+/// call under `pass_lock`; that lock makes the `Sync` below true. The raw C ABI
+/// independently claims the slot before touching shared payload state.
 pub struct NativeEngine {
     ptr: *mut c_void,
     pass_lock: Mutex<()>,
@@ -181,9 +183,9 @@ pub struct NativeEngine {
 
 // SAFETY: Send — the handle is an opaque pointer to a C-heap object with no thread
 // affinity. Sync — provided by `pass_lock` above serializing every call into the
-// SINGLE-SLOT C engine (one Pass, one scratch arena, one request word); the C side's
-// own mutex only covers the completion handshake, NOT concurrent request setup.
-// Removing the lock reintroduces the data race, whatever the C side looks like.
+// SINGLE-SLOT C engine (one Pass, one scratch arena, one request word). The C side's
+// atomic claim rejects unsafe concurrent callers before request setup, but it does not
+// make two safe Rust borrows of the same output buffer legal or define queue ordering.
 unsafe impl Send for NativeEngine {}
 unsafe impl Sync for NativeEngine {}
 
@@ -256,7 +258,15 @@ impl NativeEngine {
         let mut id = 0u64;
         // SAFETY: descs copied by the C side before return; dims checked there.
         let rc = unsafe {
-            lfm_ctx_build(self.ptr, descs.as_ptr(), descs.len(), h, ffn, max_ctx, &mut id)
+            lfm_ctx_build(
+                self.ptr,
+                descs.as_ptr(),
+                descs.len(),
+                h,
+                ffn,
+                max_ctx,
+                &mut id,
+            )
         };
         if rc == -4 {
             // Observability for the one legitimate refusal: a CPU→CPU model swap
@@ -382,7 +392,11 @@ impl NativeEngine {
         // keys ownership — a stale guard's clear is a no-op on the C side.
         let _pass = self.pass_lock.lock().unwrap();
         // SAFETY: engine pointer valid for the process lifetime.
-        unsafe { lfm_ctx_clear(self.ptr, id) };
+        let rc = unsafe { lfm_ctx_clear(self.ptr, id) };
+        assert_eq!(
+            rc, 0,
+            "ctx_clear raced another raw engine operation; retained weight pointers cannot be dropped"
+        );
     }
 
     /// The team's lane count — the ONE authority for lane-uniform program sizing.
@@ -396,11 +410,10 @@ impl NativeEngine {
     /// on every lane (0..lanes_total). Blocks until every lane completes (the
     /// engine's program-final fence). One doorbell in, one completion out.
     ///
-    /// CONTRACT (review P1): `f` must never call into kcoro — no parks, no engine
-    /// fences. A parked lane can be resumed on a different worker pthread,
-    /// migrating the live Rust frame across threads (the patch-0002 TLS hazard
-    /// class). Synchronize between lanes with pure spin barriers only
-    /// (`decode::SpinBarrier`); the coroutine parks again only after `f` returns.
+    /// Each logical lane is pinned to one fixed pthread for the engine lifetime, so
+    /// this transitional Rust callback cannot migrate a live frame. New numerical
+    /// programs still belong in C++/assembly; this surface remains only until the
+    /// depthformer callback is ported.
     /// A panic in `f` aborts the process (it cannot unwind across the C boundary).
     #[must_use = "false = engine refused; caller must take the fallback dispatch"]
     pub fn run_lanes<F: Fn(usize) + Sync>(&self, f: F) -> bool {
@@ -423,13 +436,8 @@ impl NativeEngine {
         let _pass = self.pass_lock.lock().unwrap();
         // SAFETY: single-slot engine serialized by pass_lock; &f outlives the
         // blocking call; trampoline::<F> matches the C ABI.
-        let rc = unsafe {
-            lfm_engine_call(
-                self.ptr,
-                trampoline::<F>,
-                &f as *const F as *mut c_void,
-            )
-        };
+        let rc =
+            unsafe { lfm_engine_call(self.ptr, trampoline::<F>, &f as *const F as *mut c_void) };
         rc == 0
     }
 
@@ -546,7 +554,8 @@ pub fn install_backbone_ctx(
 
 impl Drop for NativeEngine {
     fn drop(&mut self) {
-        // SAFETY: shuts the coordinator down, joins the team, releases the handles.
+        // SAFETY: joins the fixed lane team, drains ticket callbacks, and destroys
+        // the private coordination runtime.
         unsafe { lfm_engine_free(self.ptr) };
     }
 }
@@ -583,11 +592,30 @@ pub fn process_engine() -> &'static NativeEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Condvar};
 
     // The process engine holds ONE resident layer table; tests that build/clear it
     // must not interleave. (Each individual call is pass_lock-serialized; this guards
     // the build→use→clear SEQUENCE.)
     static CTX_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    struct RawGate {
+        state: Mutex<(usize, bool)>,
+        ready: Condvar,
+    }
+
+    unsafe extern "C" fn block_raw_lane(ctx: *mut c_void, _lane: u32, _lanes: u32) {
+        // SAFETY: the test holds the Arc until both raw calls have returned.
+        let gate = unsafe { &*(ctx.cast::<RawGate>()) };
+        let mut state = gate.state.lock().unwrap();
+        state.0 += 1;
+        gate.ready.notify_all();
+        while !state.1 {
+            state = gate.ready.wait(state).unwrap();
+        }
+    }
+
+    unsafe extern "C" fn noop_raw_lane(_: *mut c_void, _: u32, _: u32) {}
 
     #[test]
     fn probe_candle_bf16_sum_ladder() {
@@ -907,7 +935,9 @@ mod tests {
                     ..LayerDesc::attn_placeholder()
                 },
             ];
-            let ctx_id = engine.ctx_build(&descs, h, i, 64).expect("ctx build failed");
+            let ctx_id = engine
+                .ctx_build(&descs, h, i, 64)
+                .expect("ctx build failed");
 
             for lanes in [1usize, 3, 8] {
                 // Composed reference: the two fused blocks the layer runs today.
@@ -1010,7 +1040,9 @@ mod tests {
             !engine.conv_layer(0, &x, &state, &mut state_out, &mut out, 1),
             "cleared table must refuse passes"
         );
-        let second = engine.ctx_build(&descs, h, i, 64).expect("post-release build");
+        let second = engine
+            .ctx_build(&descs, h, i, 64)
+            .expect("post-release build");
         assert_ne!(first, second, "install ids must be unique");
         engine.ctx_clear(second);
     }
@@ -1066,18 +1098,127 @@ mod tests {
         };
         let mut out = vec![0u16; h];
         let lanes = 8;
-        let t = std::time::Instant::now();
-        for _ in 0..50 {
+        for _ in 0..5 {
             assert!(engine.fused_mlp(&x, &w, &mut out, lanes));
-        }
-        let native_ms = t.elapsed().as_secs_f64() * 1e3 / 50.0;
-        let t = std::time::Instant::now();
-        for _ in 0..50 {
             crate::flashkern::decode::fused_mlp_decode(&x, &w, &mut out, lanes);
         }
-        let tg_ms = t.elapsed().as_secs_f64() * 1e3 / 50.0;
+
+        let mut native = Vec::with_capacity(9);
+        let mut spun = Vec::with_capacity(9);
+        for sample in 0..9 {
+            let mut measure = |native_path| {
+                let start = std::time::Instant::now();
+                for _ in 0..50 {
+                    if native_path {
+                        assert!(engine.fused_mlp(&x, &w, &mut out, lanes));
+                    } else {
+                        crate::flashkern::decode::fused_mlp_decode(&x, &w, &mut out, lanes);
+                    }
+                }
+                start.elapsed().as_secs_f64() * 1e3 / 50.0
+            };
+            if sample % 2 == 0 {
+                native.push(measure(true));
+                spun.push(measure(false));
+            } else {
+                spun.push(measure(false));
+                native.push(measure(true));
+            }
+        }
+        native.sort_by(f64::total_cmp);
+        spun.sort_by(f64::total_cmp);
         eprintln!(
-            "native engine fused_mlp {native_ms:.3} ms vs threadgroup+spin {tg_ms:.3} ms (H=1024 I=4096, lanes=8)"
+            "native engine fused_mlp median {:.3} ms ({:.3}-{:.3}) vs threadgroup+spin median {:.3} ms ({:.3}-{:.3}) (H=1024 I=4096, lanes=8)",
+            native[4], native[0], native[8], spun[4], spun[0], spun[8]
+        );
+    }
+
+    #[test]
+    fn raw_engine_rejects_concurrent_request_before_payload_write() {
+        let engine = NativeEngine::new(2).expect("native engine init");
+        let gate = Arc::new(RawGate {
+            state: Mutex::new((0, false)),
+            ready: Condvar::new(),
+        });
+        let engine_address = engine.ptr as usize;
+        let gate_address = Arc::as_ptr(&gate) as usize;
+        let first = std::thread::spawn(move || unsafe {
+            lfm_engine_call(
+                engine_address as *mut c_void,
+                block_raw_lane,
+                gate_address as *mut c_void,
+            )
+        });
+
+        let mut state = gate.state.lock().unwrap();
+        while state.0 != 2 {
+            state = gate.ready.wait(state).unwrap();
+        }
+        drop(state);
+
+        let (send, recv) = std::sync::mpsc::channel();
+        let contender = std::thread::spawn(move || {
+            let rc = unsafe {
+                lfm_engine_call(
+                    engine_address as *mut c_void,
+                    noop_raw_lane,
+                    std::ptr::null_mut(),
+                )
+            };
+            send.send(rc).unwrap();
+        });
+        let immediate = recv.recv_timeout(std::time::Duration::from_millis(100));
+
+        let mut state = gate.state.lock().unwrap();
+        state.1 = true;
+        gate.ready.notify_all();
+        drop(state);
+
+        let rc = immediate.unwrap_or_else(|_| {
+            recv.recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap()
+        });
+        assert_eq!(
+            rc,
+            -libc::EBUSY,
+            "raw contender entered the single-slot engine"
+        );
+        assert_eq!(first.join().unwrap(), 0);
+        contender.join().unwrap();
+    }
+
+    #[test]
+    fn native_engine_ticket_and_fence_soak() {
+        if !crate::flashkern::decode::fused_mlp_available() {
+            eprintln!("fused mlp kernel unavailable — skipping");
+            return;
+        }
+        let engine = NativeEngine::new(8).expect("native engine init");
+        let (h, i) = (16usize, 16usize);
+        let x = vec![0u16; h];
+        let norm_w = vec![0u16; h];
+        let w1 = vec![0u16; i * h];
+        let w3 = vec![0u16; i * h];
+        let w2 = vec![0u16; h * i];
+        let weights = crate::flashkern::decode::FusedMlpWeights {
+            norm_w: &norm_w,
+            w1: &w1,
+            w3: &w3,
+            w2: &w2,
+            eps: 1e-5,
+        };
+        let mut out = vec![u16::MAX; h];
+        let start = std::time::Instant::now();
+        for pass in 0..10_000 {
+            assert!(
+                engine.fused_mlp(&x, &weights, &mut out, 8),
+                "pass {pass} did not complete"
+            );
+        }
+        assert_eq!(out, x);
+        eprintln!(
+            "native ticket/fence soak: 10,000 passes in {:.3}s",
+            start.elapsed().as_secs_f64()
         );
     }
 }

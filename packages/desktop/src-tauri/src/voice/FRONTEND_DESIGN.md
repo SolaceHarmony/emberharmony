@@ -1,5 +1,12 @@
 # Voice Frontend Design
 
+> **Current-hybrid document.** This records the shipped frontend seam. The
+> normative native ticket observer and truthful capture/compute/playback meter
+> design is
+> [`specs/11-kcoro-native-migration/12-ticketed-orchestration-and-observability.md`](../../../../../specs/11-kcoro-native-migration/12-ticketed-orchestration-and-observability.md).
+> It is not an implementation claim. This file is updated in place when that
+> product gate passes; no legacy copy is retained.
+
 This document tracks the SolidJS side of the native desktop voice kernel described in
 `desktop-stack.md`. The key rule is simple: SolidJS is intent and rendering only. The Tauri
 process owns provider readiness, microphone truth, LiveKit rooms, LFM2 model lifecycle, stop

@@ -22,7 +22,7 @@
 //! re-prefill) actually served it.
 //!
 //! Run: LFM_DEVICE=metal LFM_MODEL_DIR=/path/to/model \
-//!      cargo test --release --features metal --test e2e_generate -- --nocapture
+//!      cargo test --release --features metal --test e2e_generate -- --ignored --nocapture
 
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
@@ -317,6 +317,7 @@ fn run_conversation(
 }
 
 #[test]
+#[ignore = "requires the LFM checkpoint and repository speech fixture"]
 fn e2e_four_turns_real_speech_and_fused_conv_ab() {
     let dir = std::env::var("LFM_MODEL_DIR").expect("set LFM_MODEL_DIR to the local model dir");
     let dir = Path::new(&dir);

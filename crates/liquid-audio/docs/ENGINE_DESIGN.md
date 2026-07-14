@@ -12,14 +12,12 @@ C++ kernel program run by a persistent lane team, handing back to Rust once per 
 
 A kernel is ONE native program executed by the resident lane team, owning all control flow
 between published stages — layer loop included. Rust builds the context, rings the doorbell,
-and reads rings; it does not run between stages. AS-BUILT (2026-07-09, supersedes the line
-below): the WHOLE backbone token is one resident lane program (REQ_TOKEN_PASS: embed →
+and reads rings; it does not run between stages. AS-BUILT (2026-07-13): the WHOLE
+backbone token is one resident lane program (REQ_TOKEN_PASS: embed →
 every conv/attention layer → final norm), and DepthDecode rides the same team as a
 lane-uniform Rust program via the generic REQ_CALL + exported lane fence. The stage board
 described elsewhere in this file was replaced by generation fences (lane-uniform kernel);
 rayon executes nothing per-token. Current diagrams + numbers: DECODE_ENGINE.md §0.
-Historical (pre-arc): the backbone FFN MLP was the first resident mount, with ShortConv and
-DepthDecode orchestrated from Rust rayon lane closures.
 
 ## 1. The arena — one region, fixed capacities, stable pointers
 
@@ -51,95 +49,37 @@ Total mutable arena ≈ 60–90 MB, dominated by fixed-cap KV. Every kernel argu
 
 ## 2. The kernel program — CURRENT: resident stage machine
 
-**Correction (2026-07-09, after the Fable 5/kcoro-hop audit):** the Rust `TileEngine`
-channel chassis proved the parked descriptor model and exposed real kcoro bugs, but it is
-not the final hot-loop shape. A rendezvous channel hop still costs roughly 15-20 us
-(waiter allocation, mutex, ready queue, context switch). The live direction is the
-resident native stage machine in `native/src/engine/flashkern_engine.cpp`: no channels, no descriptor
-staging, no malloc inside the published stages (and none once scratch is warm for the fixed
-shape), and no Rust between stages.
+The discarded Rust `TileEngine` prototype proved the descriptor model and exposed the
+cost of a channel operation per tile. It has been deleted; git history is the archive.
+The live engine is `native/src/engine/flashkern_engine.cpp`: no numerical channels, no
+descriptor staging, no allocation inside a warmed pass, and no Rust between native stages.
 
-- **Persistent native team**: `kc_dispatcher_new(P_cores + coordinator)` starts one
-  coordinator coroutine and a parked worker team. Workers are sized from the same P-core
-  policy as the rest of the CPU runtime, not logical-core `available_parallelism`.
-- **One request doorbell**: the Rust rim writes one request slot, unparks the coordinator,
-  then waits on a pthread condvar for the pass boundary. Stop/shutdown is a request observed
-  at the pass boundary, never per op.
-- **Stage board, not channels**: the coordinator publishes `{kind, count, chunk}`, resets
-  `next`, sets `remaining = workers`, then bumps an epoch. Workers wake, race
-  `next.fetch_add()` dry, and the last worker unparks the coordinator. That is the whole
-  stage-completion doorbell.
+- **Persistent native team**: one stable pthread per logical lane, sized from the same
+  P-core policy as the rest of the CPU runtime. Numerical call stacks never migrate.
+- **One ticket doorbell**: the Rust rim writes one request slot and submits one
+  preallocated `kcoro_arena` ticket. The final lane publishes it to the intrusive
+  completion queue; a coordination worker invokes the exact callback that releases the rim.
+- **Stage board, not channels**: every lane enters the same `run_stage`; the opening
+  fence's last arriver publishes `{kind, count, chunk}` and resets `next`. Workers race
+  `next.fetch_add()` dry, and the next generation fence proves all claimed tiles landed.
 - **Descriptors stay at the boundary**: rings still carry `(offset, len, epoch)` between
   subsystems. Inside the engine hot loop, work is represented by shared stage state and raw
   pointers into the mmap/arena, not per-tile messages.
 - **Determinism remains explicit**: reductions that affect bits fold in fixed order. Tile
   over-decomposition is allowed only where rows are independent or the oracle pins the
   exact reduction order.
-- **As-built/live mount**: the backbone FFN MLP routes through
-  `native_engine::process_engine()` when the native engine is built, with a bit-identical
-  threadgroup fallback. Attention, ShortConv, and DepthDecode are still outside the full
-  token-pass program.
+- **As-built/live mount**: `REQ_TOKEN_PASS` executes embed, every native ShortConv or
+  attention block, each MLP, final norm, and optional logits over one team entry.
+  DepthDecode remains the production `REQ_CALL` user and is the next typed native pass.
+  Per-block request entries remain as parity fixtures; there is no alternate engine.
 
-Linkage: kcoro is vendored in the sibling `kcoro-sys` crate and built by that crate's
-build script with the upstream Makefile's flags — no machine-local path. The vendored copy
-carries local runtime fixes documented in `crates/kcoro-sys/vendor/kcoro/PATCHES.md` and
-source comments: 0001 a three-state park gate for lost wakeups, 0002 fiber-safe TLS after
-M:N migration, 0003 AAPCS64 FP-state save, and 0004 enqueue-to-owning-scheduler so an
-external-thread `kcoro_unpark` is a legal doorbell.
+Linkage: the tested `kcoro_arena` source is vendored in the sibling `kcoro-sys` crate.
+That crate builds the stackless coordination core and host POSIX adapter; it contains no
+stackful dispatcher or architecture context-switch assembly. Flashkern links the ticket
+ABI but keeps its fixed numerical workers outside the coordination ready queue.
 On supported `aarch64`/`x86_64` GCC/Clang targets, kcoro, the architecture kernel,
 and the native engine are built unconditionally. Unsupported targets fail the build;
 there is no `has_*` cfg or degraded engine branch.
-
-The older Rust `src/compute/flashkern/engine.rs` `TileEngine` remains as a prototype/reference rung:
-it verifies channel-dispatch parity and documents kcoro channel rules. Do not mount new
-production passes there.
-
-## 2-old. (superseded) The kernel program
-
-```c
-// THE kernel. Uniform control flow; every lane runs this same program.
-void lfm_token_pass(const EngineCtx* ctx, uint32_t lane) {
-    for (l = 0; l < ctx->n_layers; l++) {
-        if (ctx->layer_kind[l] == ATTN) attn_block(ctx, l, lane);   // norm→qkv→rope→append→attend→out+res
-        else                            conv_block(ctx, l, lane);   // norm→in_proj→conv update→out+res
-        mlp_block(ctx, l, lane);                                    // norm→gate/up→swiglu→down+res
-    }
-    final_norm(ctx, lane);
-    logits_head(ctx, lane);            // rb'd bf16 logits → logits plane
-}   // barriers INSIDE; Rust re-entered only after return
-```
-
-- **Team**: P-core-count pthreads created at engine init, pinned, parked on a
-  spin-then-futex hybrid. `pass_seq` bump wakes the team; the team runs one pass; lane 0
-  publishes; all repark. One Rust handback per pass. Doorbell checked at the boundary only.
-- **Stage fences**: the existing SpinBarrier, now a C++ generation barrier in the arena.
-- **Audio frame pass**: `lfm_frame_pass` = the DepthDecode program (8 codebook steps × 6
-  blocks) as the same shape — already proven; it moves from Rust closures into the program.
-- **v1 sampling compromise (parity-driven)**: the pass ends at the logits plane; Rust
-  samples at the boundary (µs, once per pass) because the sampler must reproduce candle's
-  LogitsProcessor RNG stream bit-for-bit for the parity oracles. v2 ports the RNG into the
-  kernel and sampling moves inside — the frame pass needs this to be fully Rust-free.
-
-  **RNG decisions (deep-research verified, 2026-07-08; 105-agent adversarial pass):**
-  * *Deterministic stream (v2 port)*: ChaCha12 (6 double-rounds) + rand_core's PCG32
-    seed-expansion (MUL 6364136223846793005, INC 11634580027462260723, advance-then-output,
-    LE bytes) + one u32 per f32 uniform draw ([1,2) mantissa trick, 9 bits discarded) +
-    WeightedIndex partition_point over sequential f32 cumulative sums — all read directly
-    from the pinned crates. Fine details are locked by GOLDEN VECTORS generated from the
-    Rust crate (10k draws per seed), not by documentation: the research pass confirmed web
-    sources are unreliable at this level of detail.
-  * *Seed minting (production)*: `getentropy(2)` — FEAT_RNG/RNDR does NOT exist on any
-    Apple core (M1 confirmed by privileged ID-register dump; XNU contains zero FEAT_RNG
-    plumbing; the missing sysctl key on this M2 means "undefined", and executing RNDR would
-    SIGILL). Apple DTS explicitly endorses getentropy for exactly this seeding use case.
-    Never probe RNDR on Apple Silicon.
-  * *Future per-lane streams*: Philox4x32-10 — stateless (counter,key)→output, ≥2^64
-    independent streams, BigCrush-clean with a 3-round margin, published KAT vectors for
-    bit-parity of any NEON port, C++26 `std::philox_engine`. Adopt only when a kernel
-    genuinely needs lane-addressable streams (batch sampling/dropout); the decode sampler
-    stays a single sequential ChaCha12 stream for candle parity. Threefry/xoshiro noted as
-    faster alternatives where counter semantics aren't required — measurement decides, as
-    always.
 
 ## 3. The tile library — simdgroup_matrix on NEON (not yet built; this specifies it)
 

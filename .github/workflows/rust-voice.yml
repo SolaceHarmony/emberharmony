@@ -59,14 +59,22 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
 
-      - name: Build kcoro sys crate
-        run: cargo build -p kcoro-sys
+      # The link-only build used to leave kcoro's Cargo integration tests dormant.
+      # Execute the production ticket and expected-value wait adapters on both hosts.
+      - name: Test kcoro sys crate
+        run: cargo test -p kcoro-sys --tests -- --nocapture
 
       - name: Build (lib + examples + tests)
         run: cargo build --all-targets
 
-      - name: Test (lib)
+      - name: Test (library)
         run: cargo test --lib -- --nocapture
+
+      # `cargo build --all-targets` only proves that integration binaries compile.
+      # Execute the hermetic integration suite; checkpoint/hardware e2e gates are
+      # explicitly `ignored` and have dedicated invocation commands in their files.
+      - name: Test (integration)
+        run: cargo test --tests -- --nocapture
 
       # macOS only: the Accelerate (vecLib BLAS) CPU-matmul path is the torch backend on
       # Apple Silicon. Compile-check it so the feature wiring can't rot unnoticed.
@@ -82,3 +90,7 @@ jobs:
       - name: Test (lib, Metal — the shipped code path)
         if: runner.os == 'macOS'
         run: cargo test --lib --features metal -- --nocapture
+
+      - name: Test (integration, Metal)
+        if: runner.os == 'macOS'
+        run: cargo test --tests --features metal -- --nocapture
