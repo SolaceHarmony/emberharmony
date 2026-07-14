@@ -1,10 +1,12 @@
 # kcoro_arena Integration Runbook
 
-Status: live implementation runbook, verified against the 2026-07-13 working tree.
+Status: live implementation runbook, verified against committed source on
+2026-07-13.
 
-Baselines: EmberHarmony ancestry `321538f11749`; `kcoro_arena` ancestry
-`447d04f0246b`. The implementation described below includes the uncommitted
-kcoro+ integration layered on those commits.
+Audit ancestry: EmberHarmony `321538f11749`; `kcoro_arena` `447d04f0246b`.
+Pinned implementation: upstream arena `bd530f4c9196` (ticket/wait implementation
+`bcdc03d1a073`), Ember vendor `8d510f83`, shared-doorbell executor `d2c43abd`,
+and percentile harness `3625df4e`.
 
 Normative design:
 
@@ -32,7 +34,7 @@ Six facts prevent the wrong integration:
    stackless continuations may migrate; fixed numerical lanes may not.
 3. Removing 512 KiB stackful coroutine stacks does not require flattening the
    six-deep C++ lane call tower. Fixed workers retain ordinary OS stacks and
-   block on their own per-lane sequence words.
+   block on shared dispatch/fence generation words.
 4. The current single-pass executor reads one pointer-stable, engine-owned request
    slot and completes one preallocated single-shot ticket. It never uses
    copy-mode `KORO_SEND`. Cross-executor payloads must use retained descriptors,
@@ -51,19 +53,19 @@ product backend is kept after its replacement gate. Git commits are the archive.
 Read in this order before editing:
 
 1. `crates/liquid-audio/native/src/engine/flashkern_engine.cpp`
-   - `Pass`: line 74
-   - `Stage`: line 111
-   - `Fence`: line 126
-   - engine/lane ownership: line 288
-   - `lane_fence`/`run_stage`: lines 569 and 594
-   - nested lane program and wait loop: lines 933 and 965
-   - ticket submission: line 1018
-   - fixed-lane construction/destruction: lines 1069 and 1132
-   - transitional `REQ_CALL`: line 1111
+   - `Pass`: line 76
+   - `Stage`: line 113
+   - `Fence`: line 128
+   - engine/lane ownership: line 306
+   - `lane_fence`/`run_stage`: lines 622 and 658
+   - nested lane program and wait loop: lines 993 and 1029
+   - callback/ticket submission: lines 1073 and 1085
+   - fixed-lane construction/destruction: lines 1154 and 1243
+   - transitional `REQ_CALL`: line 1200
 2. `crates/liquid-audio/src/compute/flashkern/native_engine.rs`
-   - private FFI starts at line 96
-   - `run_lanes`: line 406
-   - process-wide engine: line 570
+   - private FFI starts at line 112
+   - `run_lanes`: line 452
+   - process-wide engine: line 611
 3. `crates/liquid-audio/src/model/lfm2_audio.rs`
    - sampler: lines 199-270
    - native one-token rim: lines 1428-1480
@@ -75,11 +77,11 @@ Read in this order before editing:
    - the vendored stackless arena core and POSIX adapter; no context-switch
      assembly or old dispatcher is linked
 6. Upstream `kcoro_arena`
-   - `core/src/kc_runtime.c:225`, `284`, `310`, and `327` for work signaling,
-     lifecycle signaling, suspension, and worker truth
-   - `core/src/kc_ticket.c:83`, `258`, and `371` for slab allocation,
-     completion arbitration, and callback delivery
-   - `port/posix.c:146-265` for expected-value wait-word registration and waits
+   - `core/src/kc_runtime.c:225`, `253`, `318`, and `327` for work signaling,
+     wake-token arbitration, suspension, and worker truth
+   - `core/src/kc_ticket.c:83`, `286`, `366`, and `427` for slab allocation,
+     generation-checked completion arbitration, and callback delivery
+   - `port/posix.c:156-305` for expected-value wait-word preparation and waits
    - `core/src/kc_op.c:79-95` and `188-235` for terminal arbitration
    - `core/src/kcoro_stackless.c:94-119` and `203-250` for copy-mode sends
    - `core/src/kc_actor.c:33-55` for actor fairness debt
@@ -135,19 +137,23 @@ The live engine now uses the first kcoro+ executor slice:
 - every numerical lane owns one stable pthread and an ordinary native call stack;
 - no stackful coroutine, 512 KiB saved stack, dispatcher, or context-switch
   assembly remains in the product build;
-- each lane owns one cache-line-separated `uint32_t` doorbell and one opaque wait
-  handle prepared before its worker starts;
+- the executor owns two cache-line-isolated `uint32_t` doorbells, one shared
+  dispatch word and one shared fence word, with opaque handles prepared before
+  workers start;
 - pass and barrier waits use `kc_port_wait_u32(handle, expected, 0)`. On the
   audited host the handle binds directly to Darwin's address-wait API; hot waits
   and wakes perform no registry search, allocation, or spin loop;
-- the last fence arriver release-publishes the next generation, increments each
-  declared parked peer's word, and wakes exactly that peer;
+- the last fence arriver release-publishes the next generation, exchanges the
+  logical park mask, and for a nonempty mask increments the shared fence word and
+  performs one address wake-all;
 - Rust invokes one control C ABI call. C++ acquires the raw single-pass claim
   before writing its engine-owned request slot and creates one arena ticket per
   full pass; lane 0 publishes completion only after the program-final fence;
 - the callback runs on the arena coordination worker, never on a compute lane;
 - request, weight, activation, KV, and scratch payloads remain pointer-resident;
   ticket delivery copies only fixed event metadata;
+- snapshot counters distinguish one host fence-wake call from the logical waiter
+  population represented by the park-mask bits;
 - sampling and recurrence still return to Rust;
 - transitional `REQ_CALL` still runs Rust callbacks on thread-stable native lanes
   until Depthformer and fan-out programs become typed C++ passes.
@@ -342,27 +348,40 @@ failed         + rolled_back + none      + fault
 failed         + poisoned    + none      + fault
 ```
 
+For a dispatched ticket, `kc_ticket_cancel` returning `1` means the cancellation
+request was newly accepted; it does not mean an active numerical pass was
+aborted or that cancellation itself published the terminal event. The full pass
+still calls `kc_ticket_complete`, which returns `1` when it publishes exactly one
+terminal event as canceled/stale. Consequently `complete_rc + cancel_rc == 1`
+is not this API's race invariant. The gate is: completion publishes once;
+cancel returns `0` or `1`; the callback is success iff no cancel request won and
+canceled iff one did; both outcomes occur across the stress run.
+
 A ticket is not reset for recurrence. The parent creates the next child ticket,
 which gives every completion-target delivery a distinct identity and precise
 readiness edge. The current retained-pointer API prevents slab reuse while a
-legal caller can dereference a ticket. Generation-checked ID lookup remains a
-required broker gate; generation is not a substitute for retaining the pointer.
+legal caller can dereference a ticket. Arena commit `bcdc03d1a073` also
+implements generation-checked `complete_id`/`cancel_id`; the future broker must
+use those APIs when it transports IDs. Generation is not a substitute for
+retaining a pointer in code that already owns one.
 
 ## Zero-Spin Stage Barrier
 
-Delete `FENCE_SPIN`. Each fixed lane owns a cache-line-isolated 32-bit wake
-sequence with exactly one waiter. The board retains a separate 64-bit logical
-stage generation. ABI v1 supports at most 64 lanes through one active mask.
+`FENCE_SPIN` is deleted. The fixed executor owns one cache-line-isolated shared
+dispatch word and one shared fence word. The board retains a separate logical
+stage generation plus a park mask; the mounted engine currently supports at most
+32 lanes because that mask is `uint32_t`.
 
 ```mermaid
 flowchart TD
     Tiles["finish all claimed tiles"] --> Last{"last active lane?"}
     Last -->|yes| Serial["run one serial transition"]
     Serial --> Publish["publish next stage and logical generation"]
-    Publish --> Wake["increment and wake each next-active lane word"]
-    Last -->|no| Expected["use sequence consumed at stage entry"]
-    Expected --> Block["wait on own word and that expected sequence"]
-    Block --> Recheck{"own sequence changed?"}
+    Publish --> Mask["exchange logical park mask"]
+    Mask --> Wake["if nonempty: increment shared fence word and wake-all"]
+    Last -->|no| Expected["read sequence, declare lane bit, recheck generation"]
+    Expected --> Block["wait on shared word and expected sequence"]
+    Block --> Recheck{"logical generation changed?"}
     Recheck -->|yes| Next["acquire board and continue"]
     Recheck -->|spurious| Block
     Wake --> Next
@@ -385,21 +404,20 @@ release may publish one terminal increment to drain an entered waiter. No code
 casts between C11 `_Atomic` and C++ `std::atomic` layouts, and assembly does not
 touch board synchronization words.
 
-Prepare every per-lane word during executor creation; barrier and idle waits
-allocate nothing and use no deadline. Shutdown increments and wakes every lane
-word, joins all fixed workers, releases each handle exactly once, and only then
-frees the board. A stop request during a pass does not wake these words early.
+Prepare both shared words during executor creation; barrier and idle waits
+allocate nothing and use no deadline. Shutdown advances and wakes the dispatch
+word, joins all fixed workers, releases both handles exactly once, and only then
+frees the board. A stop request during a pass does not wake the fence word early.
 
-The expected sequence is the value the lane consumed when it entered the current
-stage. It is never reloaded after countdown arrival. If the last lane has already
-advanced the word, changed-before-wait returns immediately; waiting on the new
-value would miss that transition.
+The expected fence sequence is read before a non-last lane publishes its park
+bit. It then rechecks logical generation. If the last lane has already advanced,
+the lane clears its bit and continues; if the address advances during wait entry,
+changed-before-wait returns immediately.
 
-The last lane release-publishes the next board state, then increments and
-wake-ones only the next-active lane words. Inactive lanes stay blocked across
-stage changes. Shutdown is the only normal wake-every-lane path. This is
-separate from the coordination worker herd, where one ready continuation must
-signal only one worker.
+The last lane release-publishes the next board state and exchanges the park mask.
+A nonempty mask causes one shared address wake, while the mask population records
+the logical peers that declared a park. This is separate from the coordination
+worker domain, where one ready continuation signals only one worker.
 
 The plan must also minimize true barriers. Lane-local chains stay fused; a
 barrier exists only for cross-lane data dependency, active-mask change, scratch
@@ -407,12 +425,12 @@ ownership transfer, or one serial transition. Record declared stages, true
 barriers, wait registrations, host blocks, and wakes per pass. Zero-spin with a
 barrier per tiny operator is still a failed design.
 
-Memory ordering is part of the ABI: the broker writes pass/first-stage state and
-release-increments only first-active lane words; each lane's stage countdown is
-acquire-release so the last lane observes every tile write; the last lane
-release-publishes next-stage state before incrementing next-active lane words;
-and ticket completion release-publishes final output before coordination reads
-it. Sleeping or a spurious wake cannot weaken those edges.
+Memory ordering is part of the ABI: the broker writes pass/first-stage state,
+release-publishes generation, then advances the shared dispatch word; each lane's
+stage countdown is acquire-release so the last lane observes every tile write;
+the last lane release-publishes next-stage state before advancing the shared
+fence word; and ticket completion release-publishes final output before
+coordination reads it. Sleeping or a spurious wake cannot weaken those edges.
 
 ## Full-Pass Interrupt And Recurrence
 
@@ -462,10 +480,10 @@ use the same native fence. Until each caller is ported, it obeys these constrain
 
 Port every production callback to a typed native pass. Delete `REQ_CALL`, the
 Rust trampoline, and compatibility request kind after the last fixture/parity
-gate. Expected-value waits, fixed lanes, and deletion of the saved stacks,
-dispatcher, and context-switch assembly are already complete and do not depend
-on flattening the ordinary callback stack. Do not reintroduce the old executor or
-retain a production selector.
+gate. At `d2c43abd`, expected-value waits, fixed lanes, and deletion of the saved
+stacks, dispatcher, and context-switch assembly are complete and do not depend
+on flattening the ordinary callback stack. Do not reintroduce the old executor
+or retain a production selector.
 
 ## Channels, Descriptors, Scopes, And Actors
 
@@ -598,13 +616,13 @@ lfm_voice            approved public C ABI product
 
 ### Phase A: Upstream kernel repairs
 
-Status: **partially implemented in the current upstream working tree.** Work and
-lifecycle wake domains, prepared zero-spin wait handles, the ticket
-slab/completion queue, ticket snapshots, exact callback delivery, and lease-before-
-recycle teardown are implemented and production tested. Descriptor-transfer
-send/select, actor fairness, operation-backed raw wait removal, ticket-ID
-resolution, build-configuration identity, and the remaining capability audit are
-still open.
+Status: **partially implemented at upstream `bd530f4c9196`.** Work/lifecycle
+wake domains, prepared zero-spin wait handles, ticket slab/completion queue,
+generation-checked ticket-ID completion/cancel, ticket snapshots, exact callback
+delivery, lease-before-recycle teardown, completion-drain budgeting, and
+build-configuration identity are committed and tested. Descriptor-transfer
+send/select, actor fairness, operation-backed raw wait removal, and the remaining
+capability audit are still open.
 
 - split coordination work and lifecycle waits;
 - replace all three shared-CV sites (`queue_locked`, `finish_cont`, and
@@ -622,9 +640,10 @@ and alternating-build tests pass.
 
 ### Phase B: Vendor and mount the coordination shell
 
-Status: **initial production mount implemented.** `kcoro-sys` now vendors the
-active `kcoro_arena` tree, builds the stackless core and POSIX adapter, and has no
-old stackful source tree. Flashkern creates an explicit one-worker arena runtime,
+Status: **initial production mount implemented at `8d510f83` and `d2c43abd`.**
+`kcoro-sys` vendors upstream `bd530f4c9196`, builds the stackless core and POSIX
+adapter, and has no old stackful source tree. Flashkern creates an explicit
+one-worker arena runtime,
 allocates pass tickets from its slab, and receives terminal callbacks through the
 arena completion queue. Splitting durable services from the final product link is
 still open.
@@ -635,7 +654,7 @@ still open.
 - add `NativeCoordinator`, ticket pools, pass slots, and completion ring;
 - leave current numerical engine behavior unchanged until lifecycle tests pass.
 
-Gate: explicit runtime lifecycle, retained-ticket reuse safety, future
+Gate: explicit runtime lifecycle, retained-ticket reuse safety,
 generation-checked ID resolution, exact callback, observer isolation, and
 teardown tests pass with no product fallback.
 
@@ -659,9 +678,10 @@ addresses, and no production `REQ_CALL` or Rust numerical callback symbol.
 
 ### Phase D: Convert Flashkern to fixed zero-spin workers
 
-Status: **executor conversion implemented; full product gate still open.** The
-engine now owns fixed pthread lanes, cache-line-local expected-value doorbells,
-generation fences, pointer-stable request slots, and pass-granularity tickets.
+Status: **executor conversion implemented at `d2c43abd`; full product gate still
+open.** The engine owns fixed pthread lanes, shared expected-value dispatch/fence
+doorbells, generation fences, pointer-stable request slots, and pass-granularity
+tickets.
 The dispatcher, saved stacks, old vendor tree, and context-switch assembly are
 deleted. The raw C ABI also owns an atomic single-pass claim acquired before any
 shared request payload write, and completion callbacks validate the submitted
@@ -682,17 +702,17 @@ Remaining:
 - move submission ownership from the blocking Rust rim to `NativeCoordinator`;
 - add a bounded SQ only when multiple native producers require one; the current
   single-producer/single-pass engine does not need a copied queue;
-- add generation-checked ticket-ID resolution before that broker accepts IDs;
+- require the future broker to use the committed generation-checked ticket-ID
+  APIs before it accepts IDs;
 - complete the million-pass, interrupt-boundary, and tail-latency gates;
-- finish the full token-pass latency gate. After removing the hot lifecycle
-  broadcast, the warmed alternating fused-MLP benchmark no longer reproduces the
-  review's 45% regression consistently, but its spin comparator is too variable
-  to close the product gate. G3 stays open until the full pass has stable
-  percentile evidence.
+- finish the full token/frame latency gate. The committed fused-MLP evidence
+  reports G3 p50 `0.439 ms`, p95 `0.524 ms`, and p99 `0.574 ms` versus G0
+  `0.330/0.576/0.732 ms`; the median remains slower while both tails improve.
+  Plan-level barrier fusion is next. G3 remains open for full-pass evidence.
 
-Gate: one million pass cycles, exact active-lane wakes, zero wait spin, zero hot
-allocations/copies, full-pass interrupt response, SQ/CQ race coverage, and the
-tail-latency budget.
+Gate: one million pass cycles, one host wake per nonempty logical fence mask,
+zero wait spin, zero hot allocations/copies, full-pass interrupt response, SQ/CQ
+race coverage, and the tail-latency budget.
 
 ### Phase E: Tauri and visualizer projection
 
@@ -788,9 +808,9 @@ on hosts that provide their documented model and hardware prerequisites.
 - one ready continuation signals one worker;
 - complete/cancel/timeout/stop/destroy races publish one terminal ticket and one
   callback;
-- retained ticket pointers prevent slot reuse while held; any future
-  ticket/subscription ID lookup rejects stale generations before retaining the
-  resolved object;
+- retained ticket pointers prevent slot reuse while held; committed
+  ticket-ID completion/cancel rejects stale generations, and any future
+  subscription lookup must do the same before retaining the resolved object;
 - actor flood cannot starve completion, timer, or stop;
 - stop with queued prepare skips prepare;
 - teardown reaches zero live objects.
@@ -800,7 +820,8 @@ on hosts that provide their documented model and hardware prerequisites.
 - all workers publish stable lane identity before readiness;
 - source/disassembly contains no spin wait;
 - every barrier interleaving crosses generation exactly once;
-- next-stage active mask equals actual wakes; inactive wakes remain zero;
+- each nonempty fence park mask produces one shared host wake and its population
+  equals the logical waiter counter;
 - one million pass cycles produce one completion each;
 - no allocation or payload copy occurs between submit and callback;
 - pointer poisoning/address tracing proves descriptor/regions are retained;
@@ -838,7 +859,8 @@ Reject an implementation if any answer is unclear:
 - Is there no `LaneFrame` control rewrite or movable compute continuation?
 - Does every wait register/recheck/block immediately with no spin tier?
 - Does one coordination enqueue wake one worker?
-- Does one stage wake only its active lane mask?
+- Does one nonempty stage park mask cause one shared host wake, with logical
+  waiter accounting equal to its population?
 - Is a pass submitted as a retained pointer descriptor?
 - Does every accepted pass own one single-shot child ticket?
 - Does the completion callback run on coordination, outside locks, never on a
@@ -860,7 +882,8 @@ Reject an implementation if any answer is unclear:
 
 ## Implementation Ledger
 
-Completed in this slice:
+Completed in upstream `bcdc03d1a073`, vendor `8d510f83`, and executor
+`d2c43abd`:
 
 1. Split coordination work/lifecycle conditions and signal one work permit.
 2. Add zero-spin expected-value wait words to the host-port contract.
@@ -874,8 +897,9 @@ Completed in this slice:
 7. Release ticket descriptor/result leases before slab reuse or lifecycle
    publication; a blocking host-release regression proves `join_all` still sees
    the ticket.
-8. Prepare direct host wait handles once and wake only the peers declared in the
-   fence park mask; remove the process-global address registry from the hot path.
+8. Prepare the shared dispatch/fence host wait handles once, exchange the logical
+   fence park mask, and fan its peers out with one host wake; remove the
+   process-global address registry from the hot path.
 9. Enforce the single request slot in the raw C ABI before payload mutation and
    reject stale completion epochs.
 
@@ -887,10 +911,13 @@ Still required before native recurrence and orchestration can move over:
    callbacks.
 4. Add the native parent-action coordinator, multiple conversation actors, Tauri
    observer projection, and durable context services in their gated phases.
-5. Add alternating normal/sanitizer build identity tests and the million-pass
-   executor soak.
+5. Add the million-pass executor soak. Alternating normal/sanitizer build
+   identity is already gated upstream at `bd530f4c9196`.
 
 ### Verification recorded 2026-07-13
+
+These results apply to upstream `bd530f4c9196` and Ember executor `d2c43abd`
+with percentile harness `3625df4e`:
 
 - Upstream `make test`, `make -C tests test-full`, public-symbol, and license
   gates pass.
@@ -909,11 +936,11 @@ Still required before native recurrence and orchestration can move over:
   after direct wait handles replaced registry lookup.
 - Eight idle fixed lanes measure approximately 0.005-0.006% process CPU before
   and after a real native pass on the audited Apple Silicon host.
-- The original one-shot review measured `0.406 ms` native versus `0.280 ms` spin.
-  Prepared handles, precise parked-lane wakes, and suppressing lifecycle
-  broadcasts outside teardown reduced three warmed alternating runs to native
-  medians of `0.343`, `0.352`, and `0.355 ms`; the spin medians varied from
-  `0.321` to `0.397 ms` with individual samples as high as `0.612 ms`. The 45%
-  regression is not reproduced, but the comparator is too noisy to claim a win.
-  Full token-pass percentiles remain a real open gate, not grounds to restore
-  polling.
+- The committed raw-sample reports are
+  [`G0_FENCE_SPIN_321538F1.md`](baselines/G0_FENCE_SPIN_321538F1.md) and
+  [`G3_SHARED_DOORBELLS_D2C43ABD.md`](baselines/G3_SHARED_DOORBELLS_D2C43ABD.md).
+  Across five 1,000-pass runs, median run-level G3 versus G0 is p50 `0.439` vs
+  `0.330 ms`, p95 `0.524` vs `0.576 ms`, and p99 `0.574` vs `0.732 ms`. The
+  slower median keeps the product-default G3 latency gate open; the improved
+  tail is positive evidence. Full token/frame percentiles remain open and are
+  not grounds to restore polling.
