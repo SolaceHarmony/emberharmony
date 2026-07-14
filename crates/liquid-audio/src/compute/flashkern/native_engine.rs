@@ -1136,24 +1136,23 @@ mod tests {
         };
         let mut out = vec![0u16; h];
         let lanes = 8;
-        for _ in 0..5 {
+        for _ in 0..20 {
             assert!(engine.fused_mlp(&x, &w, &mut out, lanes));
             crate::flashkern::decode::fused_mlp_decode(&x, &w, &mut out, lanes);
         }
 
-        let mut native = Vec::with_capacity(9);
-        let mut spun = Vec::with_capacity(9);
-        for sample in 0..9 {
+        const SAMPLES: usize = 1_000;
+        let mut native = Vec::with_capacity(SAMPLES);
+        let mut spun = Vec::with_capacity(SAMPLES);
+        for sample in 0..SAMPLES {
             let mut measure = |native_path| {
                 let start = std::time::Instant::now();
-                for _ in 0..50 {
-                    if native_path {
-                        assert!(engine.fused_mlp(&x, &w, &mut out, lanes));
-                    } else {
-                        crate::flashkern::decode::fused_mlp_decode(&x, &w, &mut out, lanes);
-                    }
+                if native_path {
+                    assert!(engine.fused_mlp(&x, &w, &mut out, lanes));
+                } else {
+                    crate::flashkern::decode::fused_mlp_decode(&x, &w, &mut out, lanes);
                 }
-                start.elapsed().as_secs_f64() * 1e3 / 50.0
+                start.elapsed().as_secs_f64() * 1e3
             };
             if sample % 2 == 0 {
                 native.push(measure(true));
@@ -1165,9 +1164,14 @@ mod tests {
         }
         native.sort_by(f64::total_cmp);
         spun.sort_by(f64::total_cmp);
+        let percentile = |samples: &[f64], percent: usize| {
+            samples[(samples.len() * percent).div_ceil(100) - 1]
+        };
         eprintln!(
-            "native engine fused_mlp median {:.3} ms ({:.3}-{:.3}) vs threadgroup+spin median {:.3} ms ({:.3}-{:.3}) (H=1024 I=4096, lanes=8)",
-            native[4], native[0], native[8], spun[4], spun[0], spun[8]
+            "native engine fused_mlp p50/p95/p99 {:.3}/{:.3}/{:.3} ms ({:.3}-{:.3}) vs threadgroup+spin {:.3}/{:.3}/{:.3} ms ({:.3}-{:.3}) over {SAMPLES} passes (H=1024 I=4096, lanes=8)",
+            percentile(&native, 50), percentile(&native, 95), percentile(&native, 99),
+            native[0], native[SAMPLES - 1], percentile(&spun, 50),
+            percentile(&spun, 95), percentile(&spun, 99), spun[0], spun[SAMPLES - 1]
         );
     }
 
