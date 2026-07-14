@@ -237,9 +237,6 @@ unsafe impl Sync for NativeEngine {}
 
 impl NativeEngine {
     pub fn new(workers: usize) -> Option<Self> {
-        if !crate::bf16_gemm::bf16_gemm_nt_available() {
-            return None;
-        }
         let _ = kcoro_sys::link_anchor as fn();
         // SAFETY: plain constructor call; null = failure.
         let p = unsafe { lfm_engine_new(workers as i32) };
@@ -275,6 +272,9 @@ impl NativeEngine {
         out: &mut [u16],
         lanes: usize,
     ) -> bool {
+        if !crate::bf16_gemm::bf16_gemm_nt_available() {
+            return false;
+        }
         let h = x.len();
         let i = w.w1.len() / h;
         assert!(h > 0 && i > 0, "native fused_mlp: empty dims");

@@ -268,8 +268,10 @@ mod tests {
         // the SAME bf16 inputs — identical products, different accumulation order, so the
         // bound is the f32 tier (measured ≈1e-5 at prefill shapes). Direct fn A/B — the
         // reference path needs no runtime flag.
-        if !crate::bf16_gemm::bf16_gemm_accel_available() {
-            eprintln!("accel backend unavailable — skipping");
+        if !(crate::bf16_gemm::bf16_gemm_accel_available()
+            && crate::bf16_gemm::bf16_gemm_available())
+        {
+            eprintln!("accel or bfmmla backend unavailable — skipping");
             return;
         }
         use crate::bf16_gemm::{bf16_matmul, bf16_matmul_accel};
