@@ -1,7 +1,7 @@
 // x86-64 flashkern — the Intel/AMD sibling of native/kernels/aarch64/flashkern_neon.cpp. Same public `extern "C"` API
 // and the same GPU-idiom → SIMD-opcode mapping, but expressed in SSE/AVX2/AVX-512 instead of
 // NEON. build.rs compiles exactly one of the two per target arch, so the Rust FFI is arch-
-// agnostic. Each function runtime-dispatches on CPUID (`__builtin_cpu_supports`) and is
+// agnostic. Each function runtime-dispatches on CPUID/XCR0 and is
 // confined behind a per-function `target(...)` attribute so no gated opcode leaks into an
 // ungated function.
 //
@@ -20,6 +20,7 @@
 // Both compute bf16 products with f32 accumulate — torch's CPU bf16-matmul numerics.
 
 #include <immintrin.h>
+#include <cpuid.h>
 #include <stdint.h>
 #include <string.h>
 #include <vector>
@@ -33,7 +34,7 @@
 // compiler needs a raised base ISA (build.rs compiles this TU with NO global AVX-512 flags).
 // That is exactly what stops a clang binary from emitting zmm codegen inside gemm_bf16_avx2
 // and then SIGILL-ing on an AVX2-only CPU that legitimately passed the AVX2 feature gate.
-// MSVC understands none of this (no __attribute__, no __builtin_cpu_supports), so it is
+// MSVC understands none of this (no __attribute__), so it is
 // deliberately excluded in build.rs; this #error is the backstop if that gate ever regresses.
 #if defined(_MSC_VER) && !defined(__clang__)
 #error "flashkern_x86.cpp requires GCC/Clang target attributes; build.rs must not compile it with MSVC"
@@ -62,6 +63,46 @@ static inline uint16_t f32_to_bf16_bits(float f) {
 // Group A — bf16 GEMM. C(M,N) f32 = A(M,K) bf16 · B(K,N) bf16, row-major, f32 accumulate.
 // =====================================================================================
 namespace {
+
+static inline uint64_t xgetbv0() {
+    uint32_t lo, hi;
+    __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
+    return ((uint64_t)hi << 32) | lo;
+}
+
+// Do not use __builtin_cpu_supports here: Apple clang lowers its AVX-512 feature
+// query to GCC's ___cpu_features2 runtime symbol, which Darwin does not provide.
+// Check both hardware support and the OS-owned extended register state directly.
+static bool cpu_has_avx512_bf16() {
+    static const bool available = [] {
+        if (__get_cpuid_max(0, nullptr) < 7) return false;
+
+        uint32_t eax, ebx, ecx, edx;
+        __cpuid_count(1, 0, eax, ebx, ecx, edx);
+        constexpr uint32_t osxsave = 1u << 27;
+        constexpr uint32_t avx = 1u << 28;
+        if ((ecx & (osxsave | avx)) != (osxsave | avx)) return false;
+
+        // XMM, YMM, opmask, ZMM_hi256, and hi16_ZMM must all be OS-managed.
+        constexpr uint64_t zmm_state = 0xe6;
+        if ((xgetbv0() & zmm_state) != zmm_state) return false;
+
+        __cpuid_count(7, 0, eax, ebx, ecx, edx);
+        const uint32_t max_subleaf = eax;
+        constexpr uint32_t avx512f = 1u << 16;
+        constexpr uint32_t avx512bw = 1u << 30;
+        constexpr uint32_t avx512vl = 1u << 31;
+        if ((ebx & (avx512f | avx512bw | avx512vl)) !=
+            (avx512f | avx512bw | avx512vl) || max_subleaf < 1) {
+            return false;
+        }
+
+        __cpuid_count(7, 1, eax, ebx, ecx, edx);
+        constexpr uint32_t avx512bf16 = 1u << 5;
+        return (eax & avx512bf16) != 0;
+    }();
+    return available;
+}
 
 // --- AVX-512-BF16 path: VDPBF16PS microkernel, 16 output columns per row. ---
 // Ap[m][kpair] = u32 packing (A[m][2p] | A[m][2p+1]<<16), broadcast to 16 lanes.
@@ -148,7 +189,7 @@ static void gemm_bf16_avx2(const uint16_t *A, const uint16_t *B, float *C,
 extern "C" void lfm_bf16_gemm_f32_v2(const uint16_t *A, const uint16_t *B, float *C,
                                      int M, int N, int K) {
     if (M <= 0 || N <= 0 || K <= 0) return;
-    if (__builtin_cpu_supports("avx512bf16"))
+    if (cpu_has_avx512_bf16())
         gemm_bf16_avx512(A, B, C, M, N, K);
     else
         gemm_bf16_avx2(A, B, C, M, N, K);
