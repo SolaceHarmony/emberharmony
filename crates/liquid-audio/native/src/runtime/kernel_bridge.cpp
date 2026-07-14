@@ -11,18 +11,6 @@
 
 namespace {
 
-constexpr uint32_t COMMAND_RUN_PASS = 1;
-constexpr uint32_t COMMAND_RUN_STANDING_ORDER = 2;
-constexpr uint32_t COMMAND_STOP = 7;
-constexpr uint32_t SERVICE_DEADLINE = 1;
-constexpr uint32_t SERVICE_BACKGROUND = 3;
-constexpr uint32_t TICKET_SESSION = 1;
-constexpr uint32_t TICKET_WORKFLOW = 7;
-constexpr uint32_t EXECUTION_FAILED = 2;
-constexpr uint32_t STATE_POISONED = 3;
-constexpr uint32_t PUBLICATION_STALE = 2;
-constexpr uint32_t CAUSE_FAULT = 6;
-constexpr uint32_t RESULT_CONTROL = 4;
 constexpr uint32_t ADMISSION_STOP = UINT32_C(1) << 31;
 constexpr uint32_t ADMISSION_COUNT = ADMISSION_STOP - 1;
 
@@ -42,7 +30,7 @@ bool ticket_equal(const KcTicketIdV1 &a, const KcTicketIdV1 &b) {
 
 bool ticket_valid(const KcTicketIdV1 &ticket) {
     return ticket.runtime_epoch != 0 && ticket.sequence != 0 && ticket.generation != 0 &&
-           ticket.kind >= TICKET_SESSION && ticket.kind <= TICKET_WORKFLOW;
+           ticket.kind >= KC_COORD_TICKET_SESSION && ticket.kind <= KC_COORD_TICKET_WORKFLOW;
 }
 
 bool ticket_none(const KcTicketIdV1 &ticket) {
@@ -55,15 +43,17 @@ bool submission_valid(const KcSubmissionV1 *submission) {
         submission->abi_version != KC_COORD_ABI_VERSION ||
         !ticket_valid(submission->ticket) ||
         (!ticket_none(submission->parent) && !ticket_valid(submission->parent)) ||
-        submission->command < COMMAND_RUN_PASS || submission->command > COMMAND_STOP ||
-        submission->service_class < SERVICE_DEADLINE ||
-        submission->service_class > SERVICE_BACKGROUND || submission->pass_budget == 0 ||
+        submission->command < KC_COORD_COMMAND_RUN_PASS ||
+        submission->command > KC_COORD_COMMAND_STOP ||
+        submission->service_class < KC_COORD_SERVICE_DEADLINE ||
+        submission->service_class > KC_COORD_SERVICE_BACKGROUND ||
+        submission->pass_budget == 0 ||
         submission->reserved[0] != 0 || submission->reserved[1] != 0 ||
         submission->reserved[2] != 0) {
         return false;
     }
-    if (submission->command == COMMAND_RUN_PASS ||
-        submission->command == COMMAND_RUN_STANDING_ORDER) {
+    if (submission->command == KC_COORD_COMMAND_RUN_PASS ||
+        submission->command == KC_COORD_COMMAND_RUN_STANDING_ORDER) {
         return submission->descriptor.slot != UINT32_MAX &&
                submission->descriptor.generation != 0;
     }
@@ -73,10 +63,12 @@ bool submission_valid(const KcSubmissionV1 *submission) {
 bool completion_valid(const KcCompletionV1 *completion) {
     return completion && completion->size == sizeof(*completion) &&
            completion->abi_version == KC_COORD_ABI_VERSION &&
-           ticket_valid(completion->ticket) && completion->execution <= EXECUTION_FAILED &&
-           completion->state <= STATE_POISONED &&
-           completion->publication <= PUBLICATION_STALE && completion->cause <= CAUSE_FAULT &&
-           completion->result_kind <= RESULT_CONTROL &&
+           ticket_valid(completion->ticket) &&
+           completion->execution <= KC_COORD_EXECUTION_FAILED &&
+           completion->state <= KC_COORD_STATE_POISONED &&
+           completion->publication <= KC_COORD_PUBLICATION_STALE &&
+           completion->cause <= KC_COORD_CAUSE_FAULT &&
+           completion->result_kind <= KC_COORD_RESULT_CONTROL &&
            completion->result_count <= KC_COORD_MAX_RESULTS && completion->reserved == 0;
 }
 

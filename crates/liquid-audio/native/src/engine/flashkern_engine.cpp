@@ -6,14 +6,14 @@
 // are claimed off a bare fetch_add counter (so an E-core straggler simply claims
 // fewer), and each fence's last arriver runs that boundary's serial ladder work
 // (sumsq folds, conv update, qk-norm/rope/append, embed) exactly once. The only
-// runtime boundary is a retained kcoro_arena ticket: numerical lanes publish one
-// completion pointer and a coordination worker delivers the exact callback.
+// runtime boundary is a fixed submission/completion bridge: a native dispatcher
+// release-rings one pass descriptor, and lane 0 publishes one exact CQ record after
+// the program-final fence.
 //
-// Rust invokes one control ABI call. C++ claims the preallocated request slot before
-// writing it, creates one pass ticket, and release-rings the fixed lane team. The
-// program-final fence proves completion; lane 0 publishes the ticket and returns to
-// its blocking doorbell. Stop/shutdown remains a full-pass boundary decision and is
-// never polled inside SIMD operations.
+// The compatibility Rust ABI still invokes one blocking control call. C++ claims the
+// preallocated request slot before writing it, publishes one fixed SQ cell, and parks
+// on the CQ edge while the dispatcher releases the fixed lane team. Stop/shutdown
+// remains a full-pass boundary decision and is never polled inside SIMD operations.
 //
 // Numerics: stage bodies are line-for-line ports of src/compute/flashkern/decode.rs
 // (fused_mlp_decode) — same RNE bf16 rounding ladder, same FIXED tile count and
@@ -26,14 +26,18 @@
 #include <atomic>
 #include <cerrno>
 #include <cmath>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <new>
 #include <pthread.h>
 #include <vector>
 
+#include "lfm_kernel_bridge.h"
+
 extern "C" {
-#include "kcoro_arena.h"
+#include "kc_atomic.h"
+#include "kc_port.h"
 }
 
 // Stage kernels from the flashkern TU (same image, plain calls).
@@ -58,6 +62,7 @@ namespace {
 
 constexpr int MAX_WORKERS = 16;
 constexpr size_t DOWN_BAND_CAP = 512; // worker-stack y[] extent
+std::atomic<uint64_t> next_engine_epoch{1};
 
 // ---- rounding helpers: exact ports of decode.rs ------------------------------------
 static inline float bf16_f32(uint16_t b) {
@@ -297,12 +302,12 @@ struct LfmEngineSnapshotV1 {
     uint32_t abi_version;
     uint64_t pass_submissions;
     uint64_t pass_completions;
-    uint64_t ticket_callbacks;
+    uint64_t bridge_dispatches;
     uint64_t dispatch_wakes;
     uint64_t fence_wake_calls;
     uint64_t fence_wakes;
     uint64_t fence_generations;
-    uint32_t max_ticket_generation;
+    uint32_t max_descriptor_generation;
     uint32_t pass_claimed;
 };
 
@@ -311,38 +316,34 @@ struct Engine {
     Stage stage;
     Fence fence;
 
-    // Stable logical lane i always runs on pthread i. kcoro_arena coordinates pass
-    // tickets; it never schedules or migrates these numerical call stacks.
+    // Stable logical lane i always runs on pthread i. The SQ/CQ dispatcher only
+    // release-rings full passes; it never schedules or migrates numerical call stacks.
     pthread_t workers[MAX_WORKERS] = {};
+    pthread_t bridge_worker{};
     WaitWord dispatch_word;
     WaitWord fence_word;
     LaneArg largs[MAX_WORKERS] = {};
     int n_workers = 0;
     int wait_words_prepared = 0;
     int workers_started = 0;
+    int bridge_started = 0;
     uint32_t lanes_total = 1;
     std::atomic<uint64_t> lane_gen{0};
     int cur_req = REQ_NONE;
     std::atomic<bool> retire{false};
-    kc_runtime_t *runtime = nullptr;
-    kc_ticket_t *active_ticket = nullptr;
-    std::atomic<uint32_t> callback_refs{0};
+    LfmKernelBridge *bridge = nullptr;
+    KcSubmissionV1 active_submission{};
     std::atomic<bool> pass_claimed{false};
-    uint64_t submit_epoch = 0; // written only by the current pass claimant
+    uint64_t runtime_epoch = 0;
+    uint64_t submit_sequence = 0; // written only by the current pass claimant
+    uint32_t descriptor_generation = 0;
     std::atomic<uint64_t> pass_submissions{0};
     std::atomic<uint64_t> pass_completions{0};
-    std::atomic<uint64_t> ticket_callbacks{0};
+    std::atomic<uint64_t> bridge_dispatches{0};
     std::atomic<uint64_t> dispatch_wakes{0};
     std::atomic<uint64_t> fence_wake_calls{0};
     std::atomic<uint64_t> fence_wakes{0};
-    std::atomic<uint32_t> max_ticket_generation{0};
-
-    // Rust-rim handshake: one ticket callback per full pass.
-    pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
-    pthread_cond_t cv = PTHREAD_COND_INITIALIZER;
-    int finished = 0;
-    int result = 0;
-    uint64_t waiting_epoch = 0; // protected by mu
+    std::atomic<uint32_t> max_descriptor_generation{0};
 
     ConvReq conv;  // conv-layer request payload
     AttnReq attn;  // attention-layer request payload
@@ -1048,100 +1049,119 @@ static void *lane_main(void *arg) {
         seen = generation;
         lane_program(e, lane);
         if (lane == 0) {
-            kc_ticket_completion_v1 completion = {
-                .size = sizeof(kc_ticket_completion_v1),
-                .abi_version = KC_ABI_VERSION,
-                .execution_status = KC_TICKET_EXECUTION_COMPLETED,
-                .state_status = KC_TICKET_STATE_COMMITTED,
-                .publication_status = KC_TICKET_PUBLICATION_COMMITTED,
-                .terminal_cause = KC_TICKET_CAUSE_SUCCESS,
-                .status_code = 0,
-            };
-            if (kc_ticket_complete(e->active_ticket, &completion) == 1)
-                e->pass_completions.fetch_add(1, std::memory_order_relaxed);
+            const KcSubmissionV1 submission = e->active_submission;
+            KcCompletionV1 completion{};
+            completion.size = sizeof(completion);
+            completion.abi_version = KC_COORD_ABI_VERSION;
+            completion.ticket = submission.ticket;
+            completion.conversation_id = submission.conversation_id;
+            completion.epoch = submission.epoch;
+            completion.pass_id = submission.ticket.sequence;
+            completion.execution = KC_COORD_EXECUTION_COMPLETED;
+            completion.state = KC_COORD_STATE_COMMITTED;
+            completion.publication = KC_COORD_PUBLICATION_COMMITTED;
+            completion.cause = KC_COORD_CAUSE_SUCCESS;
+            e->pass_completions.fetch_add(1, std::memory_order_relaxed);
+            if (lfm_kernel_bridge_publish_completion(e->bridge, &completion) != 0) {
+                // The sole accepted ticket owns a reserved CQ cell. Failure here
+                // would otherwise strand the caller forever, so surface the broken
+                // executor invariant as a process fault.
+                std::abort();
+            }
         }
     }
 }
 
-static void retain_engine_callback(void *arg) {
-    Engine *e = (Engine *)arg;
-    e->callback_refs.fetch_add(1, std::memory_order_relaxed);
+static bool ticket_equal(const KcTicketIdV1 &a, const KcTicketIdV1 &b) {
+    return a.runtime_epoch == b.runtime_epoch && a.sequence == b.sequence &&
+           a.generation == b.generation && a.kind == b.kind;
 }
 
-static void release_engine_callback(void *arg) {
-    Engine *e = (Engine *)arg;
-    e->callback_refs.fetch_sub(1, std::memory_order_release);
+static void publish_rejected(Engine *e, const KcSubmissionV1 &submission, int status) {
+    KcCompletionV1 completion{};
+    completion.size = sizeof(completion);
+    completion.abi_version = KC_COORD_ABI_VERSION;
+    completion.ticket = submission.ticket;
+    completion.conversation_id = submission.conversation_id;
+    completion.epoch = submission.epoch;
+    completion.execution = KC_COORD_EXECUTION_NOT_DISPATCHED;
+    completion.state = KC_COORD_STATE_NONE;
+    completion.publication = KC_COORD_PUBLICATION_NONE;
+    completion.cause = KC_COORD_CAUSE_REJECTED;
+    completion.status = status;
+    if (lfm_kernel_bridge_publish_completion(e->bridge, &completion) != 0) std::abort();
 }
 
-static void pass_complete(void *arg, const kc_ticket_event_v1 *event) {
+// The bridge dispatcher is mechanical: consume one retained descriptor, validate
+// its generation against the single request slot, and release-ring the lane team.
+// Policy and recurrence remain above this boundary.
+static void *bridge_main(void *arg) {
     Engine *e = (Engine *)arg;
-    e->ticket_callbacks.fetch_add(1, std::memory_order_relaxed);
-    pthread_mutex_lock(&e->mu);
-    if (event->epoch == e->waiting_epoch) {
-        e->result = event->status_code;
-        e->finished = 1;
-        pthread_cond_signal(&e->cv);
+    for (;;) {
+        KcSubmissionV1 submission{};
+        int rc = lfm_kernel_bridge_wait_submission(e->bridge, &submission, 0);
+        if (rc == -ECANCELED) return nullptr;
+        if (rc != 0) std::abort();
+
+        bool valid = submission.command == KC_COORD_COMMAND_RUN_PASS &&
+                     submission.pass_budget == 1 &&
+                     submission.ticket.kind == KC_COORD_TICKET_PASS &&
+                     submission.epoch != 0 &&
+                     submission.descriptor.slot == 0 &&
+                     submission.descriptor.generation == e->descriptor_generation &&
+                     e->cur_req > REQ_NONE && e->cur_req <= REQ_CALL;
+        if (!valid) {
+            publish_rejected(e, submission, -ESTALE);
+            continue;
+        }
+
+        e->active_submission = submission;
+        e->bridge_dispatches.fetch_add(1, std::memory_order_relaxed);
+        uint64_t generation = e->lane_gen.load(std::memory_order_relaxed) + 1;
+        e->lane_gen.store(generation, std::memory_order_release);
+        e->dispatch_wakes.fetch_add(1, std::memory_order_relaxed);
+        signal_all(&e->dispatch_word);
     }
-    pthread_mutex_unlock(&e->mu);
 }
 
 static int submit_pass(Engine *e, int request) {
-    uint64_t epoch = ++e->submit_epoch;
-    pthread_mutex_lock(&e->mu);
-    e->finished = 0;
-    e->result = -1;
-    e->waiting_epoch = epoch;
-    pthread_mutex_unlock(&e->mu);
+    uint64_t sequence = ++e->submit_sequence;
+    if (sequence == 0) sequence = ++e->submit_sequence;
+    uint32_t generation = ++e->descriptor_generation;
+    if (generation == 0) generation = ++e->descriptor_generation;
+    uint32_t maximum = e->max_descriptor_generation.load(std::memory_order_relaxed);
+    if (generation > maximum)
+        e->max_descriptor_generation.store(generation, std::memory_order_relaxed);
 
-    uint64_t generation = e->lane_gen.load(std::memory_order_relaxed) + 1;
-    kc_ticket_config_v1 config = {
-        .size = sizeof(kc_ticket_config_v1),
-        .abi_version = KC_ABI_VERSION,
-        .kind = (uint32_t)request,
-        .context_id = e->ctx_id,
-        .epoch = epoch,
-        .callback = pass_complete,
-        .callback_context = e,
-        .context_retain = retain_engine_callback,
-        .context_release = release_engine_callback,
-    };
-    kc_ticket_t *ticket = nullptr;
-    int rc = kc_ticket_create(e->runtime, &config, &ticket);
-    if (rc != 0) {
-        pthread_mutex_lock(&e->mu);
-        if (e->waiting_epoch == epoch) e->waiting_epoch = 0;
-        pthread_mutex_unlock(&e->mu);
-        return rc;
-    }
-    kc_ticket_id ticket_id = kc_ticket_id_get(ticket);
-    uint32_t max_generation = e->max_ticket_generation.load(std::memory_order_relaxed);
-    if (ticket_id.generation > max_generation)
-        e->max_ticket_generation.store(ticket_id.generation, std::memory_order_relaxed);
-    rc = kc_ticket_accept(ticket);
-    if (rc == 0) rc = kc_ticket_dispatch(ticket);
-    if (rc != 0) {
-        pthread_mutex_lock(&e->mu);
-        if (e->waiting_epoch == epoch) e->waiting_epoch = 0;
-        pthread_mutex_unlock(&e->mu);
-        (void)kc_ticket_cancel(ticket);
-        kc_ticket_release(ticket);
-        return rc;
-    }
-    e->pass_submissions.fetch_add(1, std::memory_order_relaxed);
-    e->active_ticket = ticket;
+    KcSubmissionV1 submission{};
+    submission.size = sizeof(submission);
+    submission.abi_version = KC_COORD_ABI_VERSION;
+    submission.ticket.runtime_epoch = e->runtime_epoch;
+    submission.ticket.sequence = sequence;
+    submission.ticket.generation = generation;
+    submission.ticket.kind = KC_COORD_TICKET_PASS;
+    submission.conversation_id = e->ctx_id;
+    submission.epoch = e->ctx_id == 0 ? 1 : e->ctx_id;
+    submission.descriptor.slot = 0;
+    submission.descriptor.generation = generation;
+    submission.command = KC_COORD_COMMAND_RUN_PASS;
+    submission.service_class = KC_COORD_SERVICE_INTERACTIVE;
+    submission.pass_budget = 1;
+
     e->cur_req = request;
-    e->lane_gen.store(generation, std::memory_order_release);
-    e->dispatch_wakes.fetch_add(1, std::memory_order_relaxed);
-    signal_all(&e->dispatch_word);
+    int rc = lfm_kernel_bridge_submit(e->bridge, &submission);
+    if (rc != 0) return rc;
+    e->pass_submissions.fetch_add(1, std::memory_order_relaxed);
 
-    pthread_mutex_lock(&e->mu);
-    while (!e->finished) pthread_cond_wait(&e->cv, &e->mu);
-    int result = e->result;
-    e->waiting_epoch = 0;
-    pthread_mutex_unlock(&e->mu);
-    e->active_ticket = nullptr;
-    kc_ticket_release(ticket);
-    return result;
+    KcCompletionV1 completion{};
+    rc = lfm_kernel_bridge_wait_completion(e->bridge, &completion, 0);
+    if (rc != 0) return rc;
+    if (!ticket_equal(completion.ticket, submission.ticket) ||
+        completion.conversation_id != submission.conversation_id ||
+        completion.epoch != submission.epoch) {
+        return -ESTALE;
+    }
+    return completion.status;
 }
 
 } // namespace
@@ -1152,13 +1172,15 @@ extern "C" {
 void lfm_engine_free(void *ep);
 
 // `workers` is the total fixed lane count. Every logical lane owns one pthread for
-// the engine lifetime; kcoro_arena runs a separate single coordination worker for
-// ticket callbacks.
+// the engine lifetime; one mechanical bridge dispatcher owns SQ consumption.
 void *lfm_engine_new(int workers) {
     if (workers < 1) workers = 1;
     if (workers > MAX_WORKERS) workers = MAX_WORKERS;
     Engine *e = new (std::nothrow) Engine();
     if (!e) return nullptr;
+    e->runtime_epoch = next_engine_epoch.fetch_add(1, std::memory_order_acq_rel);
+    if (e->runtime_epoch == 0)
+        e->runtime_epoch = next_engine_epoch.fetch_add(1, std::memory_order_acq_rel);
     e->lanes_total = (uint32_t)workers;
     e->n_workers = workers;
     if (!kc_atomic_u32_is_lock_free(&e->dispatch_word.value) ||
@@ -1174,17 +1196,21 @@ void *lfm_engine_new(int workers) {
     }
     e->wait_words_prepared++;
 
-    kc_runtime_config runtime_config = {
-        .size = sizeof(kc_runtime_config),
-        .abi_version = KC_ABI_VERSION,
-        .worker_count = 1,
-        .ticket_capacity = 64,
+    LfmKernelBridgeConfigV1 bridge_config = {
+        .size = sizeof(LfmKernelBridgeConfigV1),
+        .abi_version = KC_COORD_ABI_VERSION,
+        .capacity = 1,
+        .reserved = 0,
     };
-    if (kc_runtime_create(&runtime_config, &e->runtime) != 0 ||
-        kc_runtime_start(e->runtime) != 0) {
+    if (lfm_kernel_bridge_create(&bridge_config, &e->bridge) != 0) {
         lfm_engine_free(e);
         return nullptr;
     }
+    if (pthread_create(&e->bridge_worker, nullptr, bridge_main, e) != 0) {
+        lfm_engine_free(e);
+        return nullptr;
+    }
+    e->bridge_started = 1;
     for (int lane = 0; lane < workers; ++lane) {
         e->largs[lane].e = e;
         e->largs[lane].lane = (uint32_t)lane;
@@ -1231,13 +1257,13 @@ int lfm_engine_snapshot(void *ep, LfmEngineSnapshotV1 *out) {
         .abi_version = 1,
         .pass_submissions = e->pass_submissions.load(std::memory_order_relaxed),
         .pass_completions = e->pass_completions.load(std::memory_order_relaxed),
-        .ticket_callbacks = e->ticket_callbacks.load(std::memory_order_relaxed),
+        .bridge_dispatches = e->bridge_dispatches.load(std::memory_order_relaxed),
         .dispatch_wakes = e->dispatch_wakes.load(std::memory_order_relaxed),
         .fence_wake_calls = e->fence_wake_calls.load(std::memory_order_relaxed),
         .fence_wakes = e->fence_wakes.load(std::memory_order_relaxed),
         .fence_generations = e->fence.gen.load(std::memory_order_acquire),
-        .max_ticket_generation =
-            e->max_ticket_generation.load(std::memory_order_relaxed),
+        .max_descriptor_generation =
+            e->max_descriptor_generation.load(std::memory_order_relaxed),
         .pass_claimed = e->pass_claimed.load(std::memory_order_acquire) ? 1u : 0u,
     };
     return 0;
@@ -1246,23 +1272,17 @@ int lfm_engine_snapshot(void *ep, LfmEngineSnapshotV1 *out) {
 void lfm_engine_free(void *ep) {
     Engine *e = (Engine *)ep;
     if (!e) return;
+    if (e->bridge) lfm_kernel_bridge_request_stop(e->bridge);
+    if (e->bridge_started > 0) pthread_join(e->bridge_worker, nullptr);
     e->retire.store(true, std::memory_order_release);
     e->lane_gen.fetch_add(1, std::memory_order_release);
     if (e->wait_words_prepared > 0) signal_all(&e->dispatch_word);
     for (int lane = 0; lane < e->workers_started; ++lane) {
         pthread_join(e->workers[lane], nullptr);
     }
-    if (e->runtime) {
-        kc_runtime_request_stop(e->runtime);
-        (void)kc_runtime_run_until_idle(e->runtime);
-        (void)kc_runtime_join_all(e->runtime);
-        (void)kc_runtime_join(e->runtime);
-        (void)kc_runtime_destroy(e->runtime);
-    }
+    if (e->bridge && lfm_kernel_bridge_destroy(e->bridge) != 0) std::abort();
     if (e->wait_words_prepared > 1) kc_port_wait_u32_release(e->fence_word.wait);
     if (e->wait_words_prepared > 0) kc_port_wait_u32_release(e->dispatch_word.wait);
-    pthread_cond_destroy(&e->cv);
-    pthread_mutex_destroy(&e->mu);
     delete e;
 }
 

@@ -48,6 +48,7 @@ fn main() {
         .warnings(false)
         .flag("-ffp-contract=off")
         .flag("-pthread")
+        .include("native/include")
         .include("../kcoro-sys/vendor/kcoro_arena/include")
         .compile("lfm_flashkern_engine");
 

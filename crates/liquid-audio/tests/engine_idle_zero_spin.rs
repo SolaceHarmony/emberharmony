@@ -3,8 +3,9 @@
 //! Companion to kcoro's `tests/test_zero_spin_idle.c` (the PR-122 oracle,
 //! measured real on Darwin): the engine's lane team must be as silent parked
 //! at the doorbell as bare kc_sched workers are parked on the ready queue.
-//! Between token passes every lane sits in kcoro_arena's expected-value wait-word
-//! adapter. Command and fence waits park immediately; neither path polls.
+//! Between token passes every lane and the SQ dispatcher sit in kcoro_arena's
+//! expected-value wait-word adapter. SQ, command, and fence waits park immediately;
+//! none of the paths poll.
 //!
 //! An integration test so the process contains ONLY this test's threads —
 //! the getrusage(RUSAGE_SELF) delta is attributable to the lane team, not to

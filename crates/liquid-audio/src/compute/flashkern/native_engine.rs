@@ -2,9 +2,8 @@
 //!
 //! Everything below the ABI line is C++: the persistent fixed-lane team, the block
 //! schedules, the stage kernels. Rust's per-pass surface is one blocking call —
-//! internally: write the request slot, submit one kcoro_arena ticket, ring the lane
-//! doorbells, and park until the ticket callback marks the pass boundary. No Rust
-//! between stages.
+//! internally: write the request slot, publish one fixed SQ cell, and park on the CQ
+//! doorbell until lane 0 publishes the completed pass. No Rust between stages.
 
 use std::ffi::c_void;
 use std::sync::Mutex;
@@ -106,12 +105,12 @@ struct EngineSnapshot {
     abi_version: u32,
     pass_submissions: u64,
     pass_completions: u64,
-    ticket_callbacks: u64,
+    bridge_dispatches: u64,
     dispatch_wakes: u64,
     fence_wake_calls: u64,
     fence_wakes: u64,
     fence_generations: u64,
-    max_ticket_generation: u32,
+    max_descriptor_generation: u32,
     pass_claimed: u32,
 }
 
@@ -758,8 +757,8 @@ pub fn install_backbone_ctx(
 
 impl Drop for NativeEngine {
     fn drop(&mut self) {
-        // SAFETY: joins the fixed lane team, drains ticket callbacks, and destroys
-        // the private coordination runtime.
+        // SAFETY: stops and joins the bridge dispatcher, joins the fixed lane team,
+        // and destroys the drained SQ/CQ storage.
         unsafe { lfm_engine_free(self.ptr) };
     }
 }
@@ -1491,11 +1490,10 @@ mod tests {
     }
 
     #[test]
-    fn native_engine_ticket_and_fence_soak() {
+    fn native_engine_bridge_and_fence_soak() {
         let engine = NativeEngine::new(8).expect("native engine init");
         const PASSES: u64 = 10_000;
         const LANES: u64 = 8;
-        const TICKET_SLOTS: u64 = 64;
         const FENCES_PER_PASS: u64 = 2;
         let start = std::time::Instant::now();
         for pass in 0..PASSES {
@@ -1507,7 +1505,7 @@ mod tests {
         let stats = engine.snapshot();
         assert_eq!(stats.pass_submissions, PASSES);
         assert_eq!(stats.pass_completions, PASSES);
-        assert_eq!(stats.ticket_callbacks, PASSES);
+        assert_eq!(stats.bridge_dispatches, PASSES);
         assert_eq!(stats.dispatch_wakes, PASSES);
         assert_eq!(stats.fence_generations, PASSES * FENCES_PER_PASS);
         assert!(stats.fence_wake_calls > 0);
@@ -1515,12 +1513,10 @@ mod tests {
         assert!(stats.fence_wakes >= stats.fence_wake_calls);
         assert!(stats.fence_wakes > 0);
         assert!(stats.fence_wakes <= PASSES * FENCES_PER_PASS * (LANES - 1));
-        let minimum_reuse = PASSES.div_ceil(TICKET_SLOTS) as u32;
-        assert!(stats.max_ticket_generation >= minimum_reuse);
-        assert!(u64::from(stats.max_ticket_generation) <= PASSES);
+        assert_eq!(stats.max_descriptor_generation, PASSES as u32);
         assert_eq!(stats.pass_claimed, 0);
         eprintln!(
-            "native ticket/fence soak: {PASSES} passes, {} fence syscalls for {} waiters in {:.3}s",
+            "native bridge/fence soak: {PASSES} passes, {} fence syscalls for {} waiters in {:.3}s",
             stats.fence_wake_calls,
             stats.fence_wakes,
             start.elapsed().as_secs_f64(),
