@@ -7,6 +7,10 @@
 > [document 03](../../../../../specs/11-kcoro-native-migration/03-scheduler-passes-and-recurrence.md)
 > and the Tauri/visualizer observer design in
 > [document 12](../../../../../specs/11-kcoro-native-migration/12-ticketed-orchestration-and-observability.md).
+> The authoritative callback-only Rust-coordinator boundary is
+> [document 13](../../../../../specs/11-kcoro-native-migration/13-coordination-contract.md).
+> The Rust audio/Candle ownership described below is current implementation
+> truth, not the target architecture.
 > At cutover this document is rewritten in place; Git history is the old
 > architecture record.
 

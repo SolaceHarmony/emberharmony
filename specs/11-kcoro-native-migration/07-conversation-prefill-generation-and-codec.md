@@ -10,8 +10,9 @@ defines the native in-memory state that architecture will capture.
 
 ## Goal
 
-Create one native `LfmConversation` per live activity and keep the complete
-inference recurrence inside the native coordinator:
+Create one native `LfmConversation` per live activity. Keep every numerical
+step, sampler, and state mutation native while the Rust kcoro continuation owns
+the recurrence policy:
 
 ```text
 append input -> direct embedding assembly -> suffix prefill -> token pass
@@ -35,7 +36,7 @@ completed pass boundary; it does not reload weights or replay a text transcript.
 | full `prefill_inputs` | `lfm2_audio.rs:1169-1305` | Replace combined tensor + index selection with direct per-modality writes. |
 | suffix `prefill_suffix` | `lfm2_audio.rs:758-928` | Preserve cursor validation and encode only unforwarded ranges. |
 | native one-token rim | `lfm2_audio.rs:1428-1480` | Remove per-token `Vec`, Candle tensor reconstruction, and optional fallback. |
-| generation recurrence | `lfm2_audio.rs:1630-1743` | Move modality schedule, token pass, sample, and recurrence into C++. |
+| generation recurrence | `lfm2_audio.rs:1630-1743` | Move token pass, sample, append, and modality result production into C++; let Rust kcoro choose the next typed pass from compact CQ facts. |
 | sampling policy | `lfm2_audio.rs:199-270` | Preserve greedy rules, temperature, threshold top-k with ties, seeded multinomial, and separate text/audio streams. |
 | Depthformer fallback | `lfm2_audio.rs:1314-1352` | Delete after the existing native frame graph is mounted directly. |
 | native Depthformer rim | `lfm2_audio.rs:1354-1397` | Remove BF16 extraction, temporary tensors, and Rust sampling callback. |
@@ -255,34 +256,37 @@ Prepared work may occupy only a dedicated candidate slot. It cannot take the
 descriptor needed by a committed utterance. Stop has priority over queued
 prepare, preserving the shutdown rule already covered by the realtime tests.
 
-## Native Generation Recurrence
+## Callback-Driven Generation
 
-The coordinator, not Rust, owns this state machine:
+The resident coordinator owns this state machine. Native passes own every
+numerical box; Rust owns the policy edges between boxes:
 
 ```mermaid
 flowchart TD
-    READY["prefill complete"] --> DOOR{"stop or interrupt doorbell?"}
-    DOOR -->|yes| CLOSE["finish turn boundary"]
-    DOOR -->|no| TOKEN["backbone token pass"]
-    TOKEN --> MODE{"current modality"}
-    MODE -->|text| LOGITS["tied text logits and native sample"]
-    MODE -->|audio| DEPTH["Depthformer frame and native samples"]
-    LOGITS --> APPEND["append generated token"]
-    DEPTH --> APPEND
+    READY["prefill complete"] --> DOOR{"Rust scope current and work remains?"}
+    DOOR -->|yes| TOKEN["backbone token pass"]
+    DOOR -->|no| CLOSE["finish or stale turn boundary"]
+    TOKEN --> COMPLETE["native sample + state append + CQ"]
+    COMPLETE --> MODE{"Rust compact-result policy"}
+    MODE -->|text token| EVENT["publish bounded text event"]
+    MODE -->|audio modality| DEPTH["typed native Depthformer pass"]
+    DEPTH --> APPEND["native codebook state append + CQ"]
     APPEND --> CODEC{"audio frame and not EOAudio?"}
     CODEC -->|yes| PCM["decode into playback reservation"]
-    CODEC -->|no| EVENT["publish bounded event"]
+    CODEC -->|no| EVENT
     PCM --> EVENT
-    EVENT --> NEXT["advance modality schedule"]
+    EVENT --> NEXT["Rust continuation selects next typed pass"]
     NEXT --> DOOR
 ```
 
 A **full token pass** includes backbone recurrence, the selected head,
 sampling, and append to conversation state. It owns one single-shot child ticket
-under the turn action. Flashkern completion rings one native coordinator
-doorbell; the ticket callback commits or marks stale and permits the coordinator
-to create the next child. Stop/interrupt is inspected before dispatching the
-next token pass, not inside GEMV, attention, Depthformer, or codec kernels. A
+under the turn action. Flashkern completion publishes terminal facts and compact
+result IDs, then rings the Rust coordinator doorbell; the resumed continuation
+consumes that authoritative disposition and may create the next child.
+Stop/interrupt is inspected
+before dispatching the next token pass, not inside GEMV, attention, Depthformer,
+or codec kernels. A
 token whose pass completed is part of the model's thought even if an output
 epoch prevents its audio from being played.
 
@@ -360,8 +364,8 @@ int mimi_decode_into(const MimiDecodePlan *, MimiDecodeState *,
 
 `MimiDecodePlan` binds views into the model component loaded in document 02.
 `MimiDecodeState` contains only mutable streaming state and right-sized scratch.
-The native coordinator has exclusive ownership while the codec pass runs, so no
-Rust mutex is involved.
+The fixed native executor has exclusive ownership while the codec pass runs, so
+no Rust mutex is involved in codec arithmetic or state mutation.
 
 Before decode, reserve a contiguous playback block of at least the codec's
 declared maximum output. `mimi_decode_into` writes directly to that reservation;
@@ -426,8 +430,9 @@ model-state pages.
 4. Implement direct modality embedding for a full context.
 5. Add native multi-token backbone prefill and compare every layer/cache boundary.
 6. Add suffix prefill with strict cursor/mark validation.
-7. Move text head, sampling, modality schedule, and recurrence into the native
-   coordinator.
+7. Move text head, sampling, append, and modality result production into typed
+   native passes; route compact completion facts to the Rust coordinator for
+   recurrence policy.
 8. Mount Depthformer without `REQ_CALL` or Rust sampling callbacks.
 9. Split Mimi plan/state ownership and decode directly to playback blocks.
 10. Move native tokenizer piece decoding into the notification continuation.
@@ -454,7 +459,8 @@ model-state pages.
   no leaked pages, and no stale cache publication.
 - Greedy and stochastic sampling match stored seed/draw fixtures, including
   top-k boundary ties.
-- Native recurrence can produce an entire turn without returning to Rust.
+- Recurrence can produce an entire turn through exact native-CQ-to-Rust edges
+  with zero Tauri/webview IPC, polling, or numerical payload crossing.
 - Stop and interrupt are observed only between complete token passes; an active
   pass is never left half-mutated.
 - A partial generated response is present in conversation state even when its

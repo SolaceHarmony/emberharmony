@@ -2,8 +2,50 @@
 
 Status: normative contract. This document governs the Rust coordinator
 direction and binds every layer boundary. Subsystem documents own their
-mechanics; where an older document conflicts with this contract, the delta
-list at the end names the reconciliation owed.
+mechanics. The package head and documents 00, 01, 03, 07, 10, 11, and 12 are
+reconciled to this contract in the same implementation series.
+
+## Implemented Foundation And Open Mount
+
+Commit `3a5b1431` adds `crates/kcoro` as a dependency-free Rust coordination
+kernel:
+
+- fixed task capacity, dedicated workers, bounded drain per wake, and
+  generation-protected slot reuse;
+- one preallocated waker per spawned task, with no coordinator allocation on
+  publish, wake, or resume;
+- exact-once promise arbitration with a 100,000-iteration two-cause race;
+- inherited O(1)-update pause/cancel words that descendants observe by lineage;
+- bounded single-owner SPSC rings with register/recheck/wake behavior;
+- cache-aligned 128-byte submission and completion records. Submission carries
+  only descriptor identity and policy. Completion preserves execution, state,
+  publication, and cause plus up to eight inline token/codebook IDs.
+
+That commit is foundation evidence, not a product-mount claim. The following
+remain open:
+
+- expose the ring leaves through the private C ABI and bind them to Flashkern's
+  native doorbell/wait-word adapter;
+- replace the blocking `NativeEngine` rim with one Rust broker per fixed board;
+- connect scope transitions to one exact control doorbell and bounded wake
+  propagation;
+- implement service-class fairness, age promotion, pinned QoS, and measured
+  callback-to-continuation budgets;
+- move child ticket ownership out of `flashkern_engine.cpp`, then delete the C
+  policy scheduler from the product path while retaining its tests as the
+  conformance oracle.
+
+### Foundation source map
+
+| Contract | Implemented source | Evidence |
+|---|---|---|
+| explicit bounded runtime lifecycle | `crates/kcoro/src/executor.rs:197-313` | zero workers/capacity/drain are rejected; stop admission is serialized before join and teardown |
+| no concurrent resume and no wake-time allocation | `executor.rs:324-573` | one waker is created at spawn; state arbitration distinguishes scheduled, running, and notified |
+| exact terminal claim and lost-wake-safe promise | `crates/kcoro/src/promise.rs:68-139` | one CAS winner, register/recheck future, and blocking wake ordered before user waker invocation |
+| single-owner bounded SQ/CQ semantics | `crates/kcoro/src/ring.rs:141-307` | release/acquire cells, full/closed results, register/recheck async waits, no endpoint cloning |
+| inherited pause/cancel epochs | `crates/kcoro/src/scope.rs:61-110` | one local word update; descendants derive the strongest ancestor control at a pass boundary |
+| fixed control records | `crates/kcoro/src/protocol.rs:135-260` | 128-byte aligned cells, generation-protected descriptor identity, four terminal facts, eight inline results |
+| race and lifecycle gates | `crates/kcoro/tests/terminal_race.rs:30`, `edge_runtime.rs:19`, `scope_control.rs:4`, `sq_cq.rs:20` | 100,000 terminal races plus wake, panic, stop, scope, capacity, wrap, and ABI tests |
 
 ## The Contract
 
@@ -109,22 +151,22 @@ flowchart TB
   neither: a parked parent's children must keep running — they are what
   resolves its promise.
 
-## What This Changes (deltas owed)
+## Reconciliation Map
 
 | Document | Delta |
 |---|---|
 | 01 | The serialized host-callback table remains for lifecycle/semantic events; the hot boundary becomes the ring ABI. Ring layout, doorbell words, and token kinds become versioned structs. |
-| 03 | Coordinator ownership moves to Rust; native recurrence is re-expressed as standing orders. The fixed-lane executor contract is unchanged. |
-| 07 | Recurrence mechanics stay native and unchanged; the decision inputs (budgets, priorities, epochs) arrive as standing-order parameters. |
-| 10 | Rust is no longer "control-only"; it is the coordination owner. Static enforcement rewords from "no per-token FFI" to "zero Tauri crossings and zero serialized IPC for realtime progress; zero arbitrary Rust on native realtime threads," and the no-math rule is unchanged. |
+| 03 | Coordinator ownership is Rust; native passes sample and mutate state, then CQ facts resolve the next Rust policy decision. Standing orders are an optional measured deadline tool. The fixed-lane executor contract is unchanged. |
+| 07 | Sampling, state append, Depthformer, and codec stay native. Rust receives compact result IDs and chooses the next typed pass without receiving logits or payload state. |
+| 10 | Rust is the coordination owner, while Tauri is only the host. Static enforcement requires zero Tauri/serialized-IPC progress edges, zero arbitrary Rust on native realtime threads, and zero numerical payload or math in Rust. |
 | 12 | Ticket lifecycle ownership moves to the Rust coordinator; the three planes, the four-fact terminal record, and the observer rules carry over verbatim. |
-| Mission (spec 11 head) | "Recur inside the native coordinator without returning to Rust per token/frame" becomes "realtime progress never depends on Tauri, serialized IPC, polling, or monitoring; progress occurs only when an event resolves a registered continuation." |
+| Mission (spec 11 head) | Realtime progress never depends on Tauri, serialized IPC, polling, or monitoring; progress occurs only when an event resolves a registered continuation. |
 
 ## Non-Goals
 
 - No Tokio, async-std, or generic executor in the coordinator. The Rust
-  kcoro executor preserves the arena semantics: intrusive storage,
-  exact-once completion, generation fencing, address-based sleeping,
+  kcoro executor preserves the arena semantics: fixed preallocated slots,
+  exact-once completion, generation fencing, blocking worker waits,
   bounded draining, no allocation on wake paths. The committed C substrate
   is its conformance oracle; its race suites are the port's fixtures.
 - No webview participation in any completion path, ever.

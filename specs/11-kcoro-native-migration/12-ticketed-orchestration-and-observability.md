@@ -1,8 +1,9 @@
 # Ticketed Orchestration, Tauri Observability, And Visualizer Contract
 
 Status: normative design. Pass-level arena tickets and exact native callbacks are
-implemented at upstream `bd530f4c9196` and executor `d2c43abd`; parent actors,
-native recurrence, Tauri projection, and the visualizer contract remain open.
+implemented at upstream `bd530f4c9196` and executor `d2c43abd`; the Rust
+coordination foundation is implemented at `3a5b1431`. Cross-language mounting,
+parent actors, recurrence, Tauri projection, and the visualizer remain open.
 
 Baselines: EmberHarmony `321538f11749`; `kcoro_arena` `447d04f0246b`.
 
@@ -13,10 +14,11 @@ Upstream contracts:
 
 ## Goal
 
-Give every native action a stable, exact readiness edge without involving Rust
-or the webview in numerical progress. A BizTalk-like ticket represents accepted
-work, owns the pointer descriptor through completion, and wakes native
-orchestration exactly once when the next decision is legal.
+Give every native action a stable, exact readiness edge without involving
+Tauri, webview IPC, polling, or monitoring in realtime progress. A BizTalk-like
+Rust ticket represents accepted work, retains a generation-protected native
+descriptor lease through completion, and wakes one Rust orchestration
+continuation when the next decision is legal.
 
 Tauri receives a bounded projection of that truth for status, diagnostics, and
 the voice visualizer. It is never the callback that permits recurrence.
@@ -33,7 +35,7 @@ The first child-pass slice is committed at upstream `bd530f4c9196`, vendor
   one reserved terminal-delivery reference;
 - `kcoro_arena/core/src/kc_runtime.c:327-370` delivers callbacks on coordination
   workers, separate from numerical lanes;
-- `flashkern_engine.cpp:1085-1141` creates one child ticket per full pass, and
+- `flashkern_engine.cpp:1088-1144` creates one child ticket per full pass, and
   lane 0 completes it only after the program-final fence;
 - a one-slot, 100,000-iteration complete/cancel race and the Cargo integration
   test prove one callback and no slot-reuse gap after `run_until_idle`.
@@ -44,20 +46,28 @@ completion may both return `1`; completion then publishes the sole terminal
 event with canceled/stale disposition. Tests therefore correlate both return
 codes with the one callback cause rather than asserting their sum is one.
 
-This slice is deliberately not yet the parent orchestration shown below. The
-Rust caller still blocks for the child callback, and no ticket telemetry crosses
-Tauri. Those are the next native coordinator and observer phases.
+Commit `3a5b1431` adds the matching Rust-side primitives: exact promises,
+generation-fenced task slots, bounded SPSC edge semantics, inherited scope
+words, and 128-byte command/completion records. The CQ record preserves the
+four terminal facts and up to eight inline token/codebook IDs; it intentionally
+contains no timing telemetry.
+
+Neither substrate is mounted as the parent orchestration shown below. The
+production Rust caller still blocks for the C child callback, the Rust ring is
+not yet shared with C++, and no ticket telemetry crosses Tauri.
 
 ```mermaid
 flowchart LR
-    Command["Tauri control command"] --> ABI["thin Rust handle call"]
-    ABI --> Actor["native session/action actor"]
+    Command["Tauri control command"] --> Dock["in-process docking ring"]
+    Dock --> Actor["Rust kcoro session/action future"]
     Actor --> Ticket["parent action ticket"]
     Ticket --> Pass["child pass ticket + pointer descriptor"]
-    Pass --> Flash["fixed Flashkern lane team"]
+    Pass --> SQ["bounded SQ descriptor ID"]
+    SQ --> Flash["fixed Flashkern lane team"]
     Flash --> Board["fixed-size administrative board"]
     Flash --> Complete["completion doorbell"]
-    Complete --> Actor
+    Complete --> CQ["bounded CQ terminal facts + token IDs"]
+    CQ --> Actor
     Actor --> Next["commit, recur, switch, or stop"]
     Actor --> Semantic["reliable semantic event"]
     Actor --> Observe["post-arbitration ticket projection"]
@@ -99,7 +109,7 @@ Keep three communication planes separate:
 PCM, weights, activations, KV, mel, codebooks, model pages, pass descriptors,
 and ticket handles cross none of these host planes.
 
-## Native Ticket Model
+## Ticket Model
 
 ### IDs and phases
 
@@ -161,8 +171,10 @@ typedef enum LfmTicketCauseV1 {
 } LfmTicketCauseV1;
 ```
 
-The native C++ layer may retain a private `kc_ticket_t *`. Rust and TypeScript
-see only IDs and snapshots. A generation mismatch makes a stale ID invalid.
+Rust kcoro owns the mutable ticket table and terminal promises. Native C++ sees
+only the ticket value ID embedded in the command and the generation-protected
+pass descriptor ID. Tauri and TypeScript see only bounded IDs and snapshots. A
+generation mismatch makes a stale ticket or descriptor invalid.
 
 ### Parent and child tickets
 
@@ -180,14 +192,15 @@ flowchart TB
 ```
 
 A child pass ticket is never reset and reused as another pass. The runtime
-returns its slab slot only after terminal callback or continuation consumption,
-waiter release, descriptor release/transfer, and a fixed-size telemetry value
-has been copied or dropped. It never waits for Rust, Tauri, or webview delivery.
-This removes ABA and makes each completion an unambiguous "you may decide what
-comes next" edge.
+returns its Rust slab slot only after CQ consumption, terminal promise delivery,
+native descriptor release/transfer, and any fixed-size observer value has been
+copied or dropped. It never waits for Tauri or webview delivery. This removes
+ABA and makes each completion an unambiguous "you may decide what comes next"
+edge.
 
-The turn/frame parent can remain active over many child passes. Its coordinator
-uses the child completion to recur without crossing the C ABI.
+The turn/frame parent can remain active over many child passes. Its Rust
+continuation uses each child completion to recur through the fixed ring ABI,
+without a one-shot host call or serialized IPC.
 
 ### Execution and publication
 
@@ -223,50 +236,53 @@ previously durable image.
 
 The pass slot is preallocated inside the native session. Its descriptor retains
 the model, conversation, scratch, input, output, and any provider regions by
-lease. Submission places the ticket pointer or descriptor pointer in a bounded
-SPSC submission queue (SQ); it never copies the descriptor bytes into a waiter
-buffer. Many callers first enter the broker's intrusive MPSC admission queue,
-which is a scheduling frontier and is not the executor SQ.
+lease. Rust retains an opaque lease while the ticket is admitted. Submission
+copies a fixed command cell containing the descriptor's slot/generation into a
+bounded SPSC SQ; it never copies descriptor or payload bytes into a waiter
+buffer. Many Rust actors first enter the broker's bounded service-class
+admission queues, which are a scheduling frontier and are not the executor SQ.
 
 ```mermaid
 flowchart TB
     Pool["session pass-slot pool"] --> Slot["PassDescriptor slot + generation"]
     Regions["model/context/audio regions"] --> Lease["retained region leases"]
     Lease --> Slot
-    Slot --> Ticket["kc_ticket owns descriptor lease"]
-    Ticket --> SQ["executor SQ stores retained pointer"]
+    Slot --> Ticket["Rust ticket retains opaque descriptor lease"]
+    Ticket --> SQ["SQ copies slot + generation"]
     SQ --> Lanes["Flashkern lanes read same descriptor"]
     Lanes --> Final["kernels mutate final destinations"]
-    Final --> CQ["executor CQ stores retained ticket pointer"]
-    CQ --> Callback["native completion continuation"]
+    Final --> CQ["CQ copies terminal facts + token IDs"]
+    CQ --> Callback["Rust completion continuation"]
     Callback --> Release["release/transfer leases; recycle slot"]
 ```
 
-The canonical kcoro APIs added by the upstream ticket design retain existing
-descriptors. Ember may use a private fixed-executor submit call, but it may not
-fall back to `KORO_SEND`, whose baseline implementation copies at
-`kcoro_arena/core/src/kcoro_stackless.c:94-107`.
+The private bridge must provide retain/release operations for native descriptor
+IDs. It may not fall back to `KORO_SEND`, whose C baseline implementation copies
+at `kcoro_arena/core/src/kcoro_stackless.c:94-107`.
 
 ## Completion Callback Path
 
-The callback that informs orchestration is native and exact:
+The completion edge that informs Rust orchestration is exact:
 
 1. The final active Flashkern lane release-publishes output and final stage
    generation.
-2. It claims `DISPATCHED -> COMPLETING` on the child ticket.
-3. It appends the already allocated ticket pointer to the bounded SPSC
-   completion queue (CQ), whose slot was reserved before SQ publication.
+2. It fills the reserved CQ cell with ticket ID, pass ID, four terminal facts,
+   status, and any compact token/codebook results. Sampling and native state
+   append already happened inside the pass.
+3. It release-publishes the CQ cell; capacity was reserved before SQ publication.
 4. It rings one coordinator doorbell and returns to the fixed executor wait.
-5. A kcoro coordination continuation validates pass generation and epoch.
-6. It commits or marks stale, publishes the ticket terminal state, and wakes the
-   parent action continuation once.
-7. The parent decides whether to sample, append, dispatch another pass, switch
+5. The named Rust kcoro continuation validates descriptor generation, ticket
+   generation, and scope epoch.
+6. It claims the exact-once terminal promise, releases/transfers the native
+   descriptor lease, and wakes the parent action continuation once.
+7. The parent decides whether to dispatch another typed pass, switch
    conversations, complete a cognitive barrier, or stop.
 8. Only after that decision does the notification continuation project host
    semantic and observer events.
 
-No compute lane invokes Rust, Tauri, TypeScript, storage, tokenizer display
-formatting, or an arbitrary host callback.
+No compute lane invokes arbitrary Rust, Tauri, TypeScript, storage, tokenizer
+display formatting, or a host callback. Its only upward operation is bounded CQ
+publication plus one doorbell.
 
 The CQ has one logical producer, not one permanently designated lane. The
 one-active-pass permit prevents concurrent final-lane publication, and the next
@@ -274,9 +290,9 @@ pass cannot dispatch until coordination consumes the prior CQ entry. A design
 that overlaps passes uses independent SQ/CQ pairs or a separately proven
 multiproducer structure.
 
-Callbacks run outside executor/ticket locks. They are bounded and measured. A
-callback can enqueue a future action but cannot recursively call the executor
-on the completing stack.
+Rust continuations run outside native executor locks and terminal arbitration
+locks. They are bounded and measured. A continuation can enqueue a future
+action but cannot recursively call the native executor on the completing stack.
 
 ## Full-Pass Stop And Interrupt
 
@@ -649,50 +665,53 @@ high-water mark so a model plan cannot silently consume the lifecycle reserve.
 
 1. **Implemented substrate (`bd530f4c9196`, vendored by `8d510f83`):** the upstream `kc_ticket` and expected-value wait
    contracts are vendored and built by `crates/kcoro-sys`; raw kcoro APIs remain
-   private to the native boundary.
+   a conformance oracle and native wait-word substrate.
 2. **Partly implemented (`d2c43abd`):** Flashkern owns one private child ticket per blocking
-   pass and binds final-fence completion to one arena-worker callback. Move this
-   ownership from `flashkern_engine.cpp` into
-   `crates/liquid-audio/native/src/runtime/` with the native coordinator.
-3. Extend `crates/liquid-audio/native/include/lfm_voice.h` with value ticket IDs,
+   pass and binds final-fence completion to one arena-worker callback. Replace
+   that transitional ownership with the Rust ticket and CQ path.
+3. **Implemented foundation (`3a5b1431`):** `crates/kcoro` owns exact promises,
+   bounded workers/rings, scope words, and the 128-byte SQ/CQ record definitions.
+   Its C++ ring leaf and Flashkern mount remain open.
+4. Extend `crates/liquid-audio/native/include/lfm_voice.h` with private ring-leaf
+   functions, descriptor retain/release, value ticket IDs,
    bounded kernel snapshots, observer registration, and capability bits. Do not
    export pass descriptors or ticket handles.
-4. Add semantic and telemetry sink classes to native notification code. Give
+5. Add semantic and telemetry sink classes to coordinator/notification code. Give
    telemetry independent capacity, coalescing, and drop counters.
-5. Add `native/observe.rs` and `native/status.rs` under
+6. Add `native/observe.rs` and `native/status.rs` under
    `packages/desktop/src-tauri/src/voice/`; keep the existing reliable
    `VoiceEvent` bridge logically separate.
-6. Add `voice_kernel_status`, `voice_kernel_observe`, and
+7. Add `voice_kernel_status`, `voice_kernel_observe`, and
    `voice_kernel_unobserve` commands beside the current command definitions in
    `voice/control.rs:365-516` and register them in the command list at
    `packages/desktop/src-tauri/src/lib.rs:293-316`.
-7. Add nested `KernelSettings` defaults/validation/round-trip tests in
+8. Add nested `KernelSettings` defaults/validation/round-trip tests in
    `packages/desktop/src-tauri/src/settings.rs`, then add the corresponding
    advanced controls to `packages/app/src/components/settings-voice.tsx` and
    localized labels.
-8. Add TypeScript observer types/functions beside
+9. Add TypeScript observer types/functions beside
    `packages/app/src/lib/voice-settings.ts:179-240`.
-9. Add coalesced kernel state to `createDesktopVoice` at
+10. Add coalesced kernel state to `createDesktopVoice` at
    `packages/app/src/context/voice.tsx:88-164`; do not add it to the browser
    provider.
-10. Extend the `NativeVoiceMeter` invocation at
+11. Extend the `NativeVoiceMeter` invocation at
    `prompt-input.tsx:2130-2144` and implementation at `2253-2274` with truthful
    signal selection.
-11. Add diagnostics only through bounded snapshots. Do not render or serialize
+12. Add diagnostics only through bounded snapshots. Do not render or serialize
     region pointers, payload bytes, per-tile events, or raw native structs.
-12. Update `VOICE_ARCHITECTURE.md` and `FRONTEND_DESIGN.md` in place at product
+13. Update `VOICE_ARCHITECTURE.md` and `FRONTEND_DESIGN.md` in place at product
     cutover; Git history is the old architecture record.
 
 ## Acceptance Gates
 
-- Every accepted pass has one terminal delivery. Ember's continuation-backed
-  target produces one parent wake, and that resumed parent invokes its bounded
-  native completion handler once; no independent duplicate ticket callback is
-  scheduled.
+- Every accepted pass has one CQ delivery. It claims one Rust terminal promise,
+  produces one parent wake, and invokes the bounded completion handler once; no
+  independent duplicate callback is scheduled.
 - Stop/interrupt before dispatch produces no kernel entry; during dispatch it
   permits one complete pass and no old-epoch recurrence.
-- One recurrent 1,000-token run crosses Rust/Tauri zero times per token and
-  still reports bounded sampled progress.
+- One recurrent 1,000-token run has exactly the declared native-CQ-to-Rust edges
+  and zero Tauri/webview IPC, polling, or observer edges per token while still
+  reporting bounded sampled progress.
 - Descriptor addresses are identical from pass submission through lane reads;
   payload-copy instrumentation remains zero after the named hardware callback.
 - Telemetry flood, closed observer channel, Rust observer panic, and webview

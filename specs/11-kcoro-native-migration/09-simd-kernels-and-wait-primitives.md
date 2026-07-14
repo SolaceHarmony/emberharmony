@@ -27,12 +27,13 @@ Fix the compute substrate for every native stage in documents 03 through 07:
 - **Waiting is zero-spin.** A fence or doorbell reads its generation once,
   registers and rechecks, then blocks through the host wait-word adapter. There
   is no bounded spin or monitor-wait budget before parking.
-- **The call graph is Rust -> C ABI -> C++ coordinator -> kernel table.** Rust's
-  only relevant responsibility is converting persisted settings into ABI
-  structs and invoking control methods. C++ owns model loading, pointer binding,
-  stage planning, recurrence, and dispatch. No numerical kernel, SIMD intrinsic,
-  payload-bearing FFI method, or unsafe math block exists in production Rust;
-  transitional Rust rims are deleted per documents 02 and 07, not optimized.
+- **The numerical call graph is native pass descriptor -> C++ fixed executor ->
+  kernel table.** Rust converts settings, coordinates tickets/scopes, publishes
+  descriptor IDs, and consumes compact terminal facts. C++ owns model loading,
+  pointer binding, stage planning, sampling, state mutation, and dispatch. No
+  numerical kernel, SIMD intrinsic, payload-bearing FFI method, or unsafe math
+  block exists in production Rust; transitional Rust rims are deleted per
+  documents 02 and 07, not optimized.
 
 ## Current Ownership Debt
 
@@ -45,7 +46,7 @@ lifecycle notification at
 `crates/kcoro-sys/vendor/kcoro_arena/core/src/kc_runtime.c:225-324`.
 Flashkern commit `d2c43abd` owns cache-line-isolated shared dispatch and fence
 words and blocks through prepared `kc_port_wait_u32` handles at
-`native/src/engine/flashkern_engine.cpp:622-650` and `1029-1046`;
+`native/src/engine/flashkern_engine.cpp:625-653` and `1032-1049`;
 `FENCE_SPIN`, `kcoro_park`, and `kcoro_unpark` are absent.
 
 | Current work in Rust | Evidence | Required native owner |
@@ -53,7 +54,7 @@ words and blocks through prepared `kc_port_wait_u32` handles at
 | resampling and audio accumulation | `crates/liquid-audio/src/processor.rs:1089-1163` | native frontend plan and SIMD resampler |
 | DFT, mel filtering, log, and normalization | `crates/liquid-audio/src/processor.rs:254-472` | native mel stages and reduction kernels |
 | Conformer and adapter tensor graph | `crates/liquid-audio/src/model/conformer/encoder.rs:185-317` and `crates/liquid-audio/src/model/lfm2_audio.rs:403-419` | C++ pass plan over kernel-table entries |
-| sampling and token recurrence | `crates/liquid-audio/src/model/lfm2_audio.rs:199-262` and `1630-1733` | native sampler state and coordinator recurrence |
+| sampling and token recurrence | `crates/liquid-audio/src/model/lfm2_audio.rs:199-262` and `1630-1733` | native sampler/state append plus Rust kcoro recurrence policy over compact result IDs |
 | Moshi frame arithmetic/state | `crates/liquid-audio/src/runtime/realtime.rs:1850-2065` | native Moshi pass program |
 | native pass entered through Rust capture/trampoline | `crates/liquid-audio/src/compute/flashkern/native_engine.rs:94-170` and `300-394` | model-bound C++ plan with no Rust callback |
 | aarch64 feature flags applied to the whole kernel translation unit | `crates/liquid-audio/build.rs:45-58` | baseline and BF16/I8MM objects compiled separately; C++ binds one table after capability checks |
@@ -329,9 +330,9 @@ hardware callbacks. Hardware callbacks never wait.
 - The link/symbol audit passes: no tensor-framework, BLAS (outside Accelerate
   on Apple), SLEEF/SVML, or vector-libm symbol in the production native
   library.
-- A call-stack/symbol test proves the local numerical path enters through the C
-  ABI, remains in C++ coordination and native kernel code, and contains no Rust
-  frame or payload-bearing Rust FFI symbol.
+- A call-stack/symbol test proves the local numerical path begins at descriptor
+  dispatch in the fixed C++ executor, remains in native stage and kernel code,
+  and contains no Rust frame or payload-bearing Rust FFI symbol.
 - The release link map contains no scalar oracle objects. Unsupported ISA
   selection fails before model readiness rather than falling back.
 - bf16 expand path is bit-exact against the shift-expand definition on both

@@ -1,4 +1,4 @@
-# Rust Host Seam and Candle Removal
+# Rust Coordination Seam and Candle Removal
 
 Status: normative design.
 
@@ -6,25 +6,30 @@ Baseline: EmberHarmony `321538f11749`.
 
 ## Goal
 
-Reduce production Rust to a host control plane around opaque native handles.
-Rust reads persisted Tauri settings, resolves app-owned resources, calls the
-versioned C ABI, converts bounded native notifications into existing Tauri
-events, and owns orderly handle destruction. It does not own model tensors,
-audio buffers, inference recurrence, local audio callbacks, local voice workers,
-conversation state, or polling loops.
+Split production Rust into two explicit layers. The Tauri host reads persisted
+settings, resolves app-owned resources, projects bounded events, and owns
+orderly product-handle destruction. The resident `crates/kcoro` runtime owns
+conversation scopes, promises, tickets, broker policy, and recurrence. Neither
+layer owns model tensors, audio buffers, local audio callbacks, conversation
+payload state, or numerical loops.
 
 The direction of every local inference call is fixed:
 
 ```text
-TypeScript/Tauri command -> Rust control wrapper -> C ABI -> C++ runtime
+TypeScript/Tauri command -> in-process docking ring -> Rust kcoro continuation
+    -> versioned SQ command -> C++ fixed executor
     -> immutable native plan -> architecture kernel table -> SIMD/assembly
+    -> versioned CQ completion -> Rust kcoro continuation
 ```
 
-Rust passes paths, enums, scalar settings, callbacks, and opaque handles. C++
-opens and binds the model files, owns every numerical pointer, dispatches every
-pass, and invokes the selected architecture kernels. No Rust function accepts a
-weight, activation, KV, PCM, mel, logits, token-sampling, or codec payload for
-local inference. Rust is not a slow-path math fallback.
+Rust passes paths, enums, scalar settings, fixed control records, callbacks, and
+opaque handles. C++ opens and binds model files, owns every numerical pointer,
+executes every pass, samples tokens, mutates model state, and invokes selected
+architecture kernels. No Rust function accepts a weight, activation, KV, PCM,
+mel, logits, probability distribution, sampler state, or codec payload for local
+inference. Up to eight token/codebook IDs may be copied inline in a CQ record;
+that is control metadata, not a tensor boundary. Rust is not a slow-path math
+fallback.
 
 Keep the TypeScript/Bun boundary equally clear: web code edits settings and
 invokes Tauri commands. It never receives a model pointer or PCM payload and
@@ -53,14 +58,14 @@ separate audit proves no remaining host work needs it.
 | `VoiceEngineMode` | `voice/control.rs:103-117` | Map directly to the native engine enum. |
 | readiness `plan` | `voice/control.rs:131-186` | Query compiled capabilities and persisted settings, not Candle devices. |
 | Tauri commands | `voice/control.rs:372-520` | Preserve command names and frontend contract. |
-| Tauri runtime actor | `packages/desktop/src-tauri/src/voice/runtime.rs:217-440` | May remain a bounded control actor; it stores opaque native handles only for local voice. |
+| Tauri runtime actor | `packages/desktop/src-tauri/src/voice/runtime.rs:217-440` | Reduce to docking-ring commands, opaque product handles, and host projections; it is not the realtime scheduler. |
 | `Lfm2Session` | `voice/runtime.rs:2301-2450` | Replace Rust audio/thread/runtime fields with one native session wrapper. |
 | `local_runtime_config` | `voice/runtime.rs:2725-2736` | Map all persisted fields into `LfmSessionConfigV1`. |
 | `build_engine` | `voice/runtime.rs:2738-2808` | Replace model object construction with native model/conversation open. |
 | `select_device` | `voice/runtime.rs:2810-2829` | Delete; backend choice is an ABI enum selected at runtime. |
 | local WebRTC I/O | `voice/runtime.rs:2965-3419` | Replace with the native platform-audio adapter. |
 | Rust `VoiceRuntime` | `crates/liquid-audio/src/runtime/voice_runtime.rs:637-1038` | Delete from production after native session lifecycle passes. |
-| Rust turn/frame workers | `crates/liquid-audio/src/runtime/realtime.rs:488-920` | Delete from production after native continuations pass. |
+| Rust turn/frame workers | `crates/liquid-audio/src/runtime/realtime.rs:488-920` | Delete after equivalent scopes run on the dedicated `crates/kcoro` executor without Candle payloads. |
 | direct desktop Candle dependency | `packages/desktop/src-tauri/Cargo.toml:47` | Remove. |
 | liquid-audio Candle graph | `crates/liquid-audio/Cargo.toml:18-93` | Capture fixtures, then delete; the production package has no inference framework. |
 | current public module fanout | `crates/liquid-audio/src/lib.rs:14-57` | Replace with native handles/status/config only; removed APIs remain available through git history, not a backup crate. |
@@ -73,11 +78,17 @@ delete replaced Rust inference sources once their gates pass:
 
 ```text
 crates/
+  kcoro/
+    src/executor.rs            # bounded dedicated policy executor
+    src/promise.rs             # exact-once completion arbitration
+    src/protocol.rs            # versioned SQ/CQ control records
+    src/ring.rs                # bounded edge-woken SPSC endpoints
+    src/scope.rs               # inherited pause/cancel epochs
   liquid-audio/
     Cargo.toml                 # thin production Rust package, no Candle
     build.rs                   # builds/links the native library
     src/
-      lib.rs                   # status/config/opaque wrappers only
+      lib.rs                   # status/config/opaque wrappers only; no math
       ffi.rs                   # private raw declarations
       handles.rs               # Runtime/Model/Conversation/Session RAII
     native/
@@ -111,9 +122,8 @@ manifest. `build.rs` invokes it and emits the resulting library/link metadata to
 Cargo. CMake defines:
 
 ```text
-lfm_voice_coord      stackless coordination, operations/tickets, actors, timers,
-                     channels, cancellation, and the selected host port adapter
-lfm_voice_exec       fixed executor shell, private SQ/CQ, stage board, wait adapter,
+lfm_voice_bridge     private C ABI ring leaves, doorbells, descriptors, and wait adapter
+lfm_voice_exec       fixed executor shell, native SQ/CQ ingress, stage board,
                      completion ingress, and libkcoro_kernel
 lfm_voice_kernels    numerical C++/SIMD/assembly leaf kernels and approved Apple
                      numerical adapters; no kcoro or host callback symbols
@@ -125,12 +135,13 @@ lfm_voice_oracles    test-only scalar C++ kernels; never linked into lfm_voice
 lfm_voice_tests      native unit/parity/race tests plus lfm_voice_oracles
 ```
 
-The link direction is one-way: `lfm_voice_core` submits through
-`lfm_voice_coord` to `lfm_voice_exec`; the executor invokes
-`lfm_voice_kernels`; durable services depend on coordination but never on the
-executor or numerical kernels. The executor shell necessarily owns ticket/CQ
-completion integration. The numerical Flashkern target does not link kcoro and
-never routes a fence through a channel.
+The call direction is one-way: Rust `kcoro` publishes through
+`lfm_voice_bridge` to `lfm_voice_exec`; the executor invokes
+`lfm_voice_kernels`; CQ publication returns through the bridge and wakes a Rust
+continuation. Durable services may submit policy work to Rust coordination but
+never run on the executor or numerical kernels. The numerical Flashkern target
+does not link the Rust executor or the C actor runtime and never routes a fence
+through a general channel.
 
 Requirements:
 
@@ -141,9 +152,10 @@ Requirements:
   `crates/liquid-audio/build.rs:81-102`.
 - platform and architecture sources are selected by the build target;
   runtime ISA dispatch chooses among compiled kernels where supported.
-- C++ runtime/model code may coordinate passes and perform bounds/index
-  arithmetic, but production numerical loops live only in the selected kernel
-  target or an explicitly approved Apple native-library adapter.
+- C++ runtime/model code may sequence the stages inside one admitted typed pass
+  and perform bounds/index arithmetic, but cross-pass admission and recurrence
+  policy remain in Rust kcoro. Production numerical loops live only in the
+  selected kernel target or an explicitly approved Apple native-library adapter.
 - the fixed executor's hot lane call graph may enter only board/wait helpers,
   prebound numerical kernels, and bounded ticket completion ingress. It cannot
   enter general channels, actors, workflow code, WAL, storage, Tauri callbacks,
@@ -197,6 +209,28 @@ sample slice, raw model-region pointer, kernel callback, or per-token/per-frame
 method. `Model` is returned by `lfm_model_open`; Rust never allocates or fills
 the resident weight image.
 
+## Production Rust Coordinator
+
+`crates/kcoro` is a separate resident kernel, not a Tauri async task and not a
+generic application executor. Commit `3a5b1431` provides:
+
+- explicit nonzero worker and task capacity;
+- generation-protected task slots and one waker allocated at spawn;
+- exact-once promise arbitration and no concurrent poll of one continuation;
+- bounded drain per wake and stop-serialized admission/teardown;
+- inherited pause/cancel words and fixed 128-byte SQ/CQ records;
+- single-owner ring endpoints that register, recheck, and wake without polling.
+
+The implementation allocates futures and wakers only when spawning bounded
+coordination work. Publish, wake, and resume reuse preallocated storage. The
+remaining product mount must add platform QoS, service-class fairness,
+scope-doorbell subscriptions, and private C ABI ring leaves. Until those exist,
+the current blocking `NativeEngine` rim remains production truth.
+
+The coordinator may handle token IDs, ticket IDs, epochs, causes, service
+classes, deadlines, and descriptor IDs. It may not dereference a descriptor or
+accept logits, PCM, mel, KV, weights, activations, sampler state, or codec state.
+
 ## Settings Flow
 
 ```mermaid
@@ -238,12 +272,12 @@ runtime policy; Cargo features advertise compiled capability only.
 Keep the public command names used by
 `packages/app/src/lib/voice-settings.ts:161-240`:
 
-| Command | Native action |
+| Command | Coordinator/native action |
 |---|---|
 | `voice_start` | open/retain model and conversation, create session, register callback, start |
-| `voice_stop` | request stop, await native join off the async executor if needed, destroy session |
-| `voice_interrupt` | ring session interrupt/output-epoch doorbell |
-| `voice_set_mic_enabled` | set native capture policy and wake coordinator |
+| `voice_stop` | write cancel to the root scope, ring one control doorbell, await coordinator/native joins, destroy session |
+| `voice_interrupt` | advance the session/output epoch through the docking ring; native barge-in may perform the same reflex first |
+| `voice_set_mic_enabled` | set the native privacy gate through a docking-ring token; attention is a separate coordinator policy |
 | `voice_begin_typed_input` | atomically pause mic plus interrupt through one native control operation |
 | `voice_status` | read bounded native snapshot and map to `VoicePlan` |
 | `voice_kernel_status` | read one bounded ticket/executor snapshot; never required for progress |
@@ -259,10 +293,11 @@ Rust/TypeScript documentation to “an active native session.”
 
 ## Callback and Event Seam
 
-Native code owns a bounded notification ring. A notification continuation calls
-one registered host sink with small immutable event views. Rust immediately
-copies text/error/state metadata it needs beyond the callback and returns a
-status. It never retains the native pointer.
+The Rust coordinator owns bounded semantic ordering after authoritative native
+completion. A separate notification continuation calls one registered Tauri
+host sink with small immutable event values. The host copies text/error/state
+metadata it needs beyond the callback and returns a status. It never retains a
+native pointer or a coordinator ticket.
 
 The callback shim:
 
@@ -324,9 +359,9 @@ The ownership statements that must change are concrete:
 
 | Current text | Location | G10 replacement truth |
 |---|---|---|
-| “native Rust voice stack” | `packages/desktop/src-tauri/src/voice/VOICE_ARCHITECTURE.md:6-11` | Native C++/assembly local voice data plane controlled through a thin Tauri Rust host; remote LiveKit remains a separate Rust provider. |
-| local Candle/Metal path in the philosophy diagram | `VOICE_ARCHITECTURE.md:93-101` | Local model path enters the versioned C ABI, stays in C++ plans/kernels, and returns only bounded metadata events. |
-| “Why native Rust” decision and realtime-audio ownership | `VOICE_ARCHITECTURE.md:190-217` | Rename the layer around native in-process ownership; C++ platform adapters own local realtime audio and C++ kernel tables own math. Rust owns commands, settings, handles, and events. |
+| “native Rust voice stack” | `packages/desktop/src-tauri/src/voice/VOICE_ARCHITECTURE.md:6-11` | Native C++/assembly local voice data plane coordinated by resident Rust kcoro and hosted by Tauri; remote LiveKit remains a separate provider. |
+| local Candle/Metal path in the philosophy diagram | `VOICE_ARCHITECTURE.md:93-101` | Local policy travels through the docking ring and Rust coordinator; numerical descriptors enter C++ plans/kernels through SQ and return compact CQ facts. |
+| “Why native Rust” decision and realtime-audio ownership | `VOICE_ARCHITECTURE.md:190-217` | Rust owns scopes, promises, tickets, recurrence policy, commands, settings, and projections. C++ platform adapters own local realtime audio, C++ kernel tables own math, and Tauri owns neither progress path. |
 | desktop Cargo comment describing pure-Rust realtime and Candle Metal | `packages/desktop/src-tauri/Cargo.toml:65-75` | Describe the linked native runtime and runtime-selected backend capability without claiming a Rust numerical owner. |
 
 Keep and update the model-semantic sections for mel, Conformer, interleaved
@@ -368,16 +403,18 @@ Add release-graph checks that fail when:
 
 - `cargo tree --manifest-path packages/desktop/src-tauri/Cargo.toml --target all`
   reaches any Candle/Moshi package from the desktop production target;
-- a production Rust file imports `candle_*`, `moshi`, `cpal`, model modules, or
-  raw kcoro APIs;
+- a production Rust inference file imports `candle_*`, `moshi`, `cpal`, or model
+  modules; raw `kcoro-sys` APIs are restricted to the private native bridge, and
+  coordination uses only `crates/kcoro`;
 - a production Rust local-voice function accepts or returns a weight, tensor,
   PCM, mel, KV, logits, codebook, or sampling payload;
 - a production numerical symbol is implemented in Rust, linked from the
   test-only scalar oracle target, or exported through the C ABI;
 - `lfm_voice_kernels` links a kcoro/channel/WAL/callback symbol, or an executor
   fence/stage routes through a general coordination channel;
-- `std::thread::spawn` or `ThreadManager::spawn` appears in the local native
-  session path;
+- `std::thread::spawn` or `ThreadManager::spawn` appears in the Tauri local
+  session path; dedicated worker creation is allowlisted only inside
+  `crates/kcoro/src/executor.rs`;
 - a product source reads `LFM_*` or a voice backend/device env var;
 - exported native symbols exceed the approved `lfm_voice.h` surface;
 - a C ABI declaration lacks a linked symbol or Rust declaration;
@@ -404,8 +441,9 @@ tests is not a gate.
   produce one terminal native outcome with no callback after destroy.
 - Local `voice_start` creates no Rust audio, inference, consumer, drain, or stop
   worker.
-- The local inference call graph is Rust control wrapper -> C ABI -> C++
-  coordinator -> selected native kernel; Rust appears in no numerical stack.
+- The local inference call graph is native pass descriptor -> C++ fixed executor
+  -> selected native kernel. Rust appears at SQ publication and CQ consumption,
+  but in no numerical stack and with no numerical payload.
 - Release link maps contain architecture kernels and approved native adapters,
   but no test oracle object and no scalar or Rust fallback.
 - Release link maps prove numerical kernel objects are kcoro-free, the executor
