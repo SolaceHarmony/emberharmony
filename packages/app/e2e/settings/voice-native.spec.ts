@@ -16,6 +16,7 @@ type Settings = {
   lastProvider?: Provider
   livekit: { url?: string }
   lfm2: {
+    engine: "lfm2Interleaved"
     model: string
     modelDir?: string
     device: "metal"
@@ -38,6 +39,7 @@ async function install(page: Page, lastProvider: Provider) {
         lastProvider: input.lastProvider,
         livekit: { url: "wss://livekit.invalid" },
         lfm2: {
+          engine: "lfm2Interleaved",
           model: "LiquidAI/LFM2.5-Audio-1.5B",
           modelDir: "/tmp/lfm2-audio-e2e",
           device: "metal",
