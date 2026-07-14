@@ -45,3 +45,11 @@ Detailed design notes remain adjacent to the owning crate under `crates/*/docs/`
 - [`10-stateful-multi-agent-runtime.md`](../../specs/10-stateful-multi-agent-runtime.md) -
   one shared model with many conversation images, fast switching, perspective
   forks, macro batching, delta hibernation, and WAL-backed orchestration.
+
+## Performance Evidence
+
+- [`G0_FENCE_SPIN_321538F1.md`](baselines/G0_FENCE_SPIN_321538F1.md) - frozen
+  spin-era latency, wake, allocation, and raw percentile baseline.
+- [`G3_SHARED_DOORBELLS_D2C43ABD.md`](baselines/G3_SHARED_DOORBELLS_D2C43ABD.md) -
+  committed shared-doorbell contract, exact wake accounting, zero-spin idle
+  behavior, and the G0 percentile comparison.
