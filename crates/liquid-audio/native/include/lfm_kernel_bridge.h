@@ -114,6 +114,10 @@ typedef struct LFM_KERNEL_ALIGNAS(64) KcCompletionV1 {
 
 typedef struct LfmKernelBridge LfmKernelBridge;
 
+typedef int (*LfmKernelSubmitFn)(void *context,
+                                 const KcSubmissionV1 *submission,
+                                 KcCompletionV1 *completion);
+
 typedef void (*LfmKernelDescriptorReleaseFn)(void *payload, void *context);
 
 typedef struct LfmKernelDescriptorSpecV1 {

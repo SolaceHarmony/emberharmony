@@ -10,10 +10,11 @@
 // release-rings one pass descriptor, and lane 0 publishes one exact CQ record after
 // the program-final fence.
 //
-// The compatibility Rust ABI still invokes one blocking control call. C++ claims the
-// preallocated request slot before writing it, publishes one fixed SQ cell, and parks
-// on the CQ edge while the dispatcher releases the fixed lane team. Stop/shutdown
-// remains a full-pass boundary decision and is never polled inside SIMD operations.
+// The compatibility Rust ABI still invokes one blocking control call so its borrowed
+// tensor pointers remain live. C++ claims the preallocated request slot, then invokes
+// the registered Rust coordinator. That coordinator alone owns SQ submission and CQ
+// ingress; the callback resolves only after the exact completion arrives. Stop remains
+// a full-pass boundary decision and is never polled inside SIMD operations.
 //
 // Numerics: stage bodies are line-for-line ports of src/compute/flashkern/decode.rs
 // (fused_mlp_decode) — same RNE bf16 rounding ladder, same FIXED tile count and
@@ -338,6 +339,8 @@ struct Engine {
     int cur_req = REQ_NONE;
     std::atomic<bool> retire{false};
     LfmKernelBridge *bridge = nullptr;
+    LfmKernelSubmitFn submitter = nullptr;
+    void *submitter_context = nullptr;
     KcSubmissionV1 active_submission{};
     std::atomic<bool> pass_claimed{false};
     uint64_t runtime_epoch = 0;
@@ -1170,16 +1173,14 @@ static int submit_pass(Engine *e, int request) {
     submission.service_class = KC_COORD_SERVICE_INTERACTIVE;
     submission.pass_budget = 1;
 
-    rc = lfm_kernel_bridge_submit(e->bridge, &submission);
-    int release_rc =
-        lfm_kernel_bridge_descriptor_release(e->bridge, submission.descriptor);
+    KcCompletionV1 completion{};
+    rc = e->submitter ? e->submitter(e->submitter_context, &submission, &completion)
+                      : -ENOTCONN;
+    int release_rc = lfm_kernel_bridge_descriptor_release(e->bridge, descriptor);
     if (release_rc != 0) std::abort();
     if (rc != 0) return rc;
     e->pass_submissions.fetch_add(1, std::memory_order_relaxed);
 
-    KcCompletionV1 completion{};
-    rc = lfm_kernel_bridge_wait_completion(e->bridge, &completion, 0);
-    if (rc != 0) return rc;
     if (!ticket_equal(completion.ticket, submission.ticket) ||
         completion.conversation_id != submission.conversation_id ||
         completion.epoch != submission.epoch) {
@@ -1245,6 +1246,35 @@ void *lfm_engine_new(int workers) {
         e->workers_started++;
     }
     return e;
+}
+
+void *lfm_engine_bridge(void *ep) {
+    Engine *e = (Engine *)ep;
+    return e ? e->bridge : nullptr;
+}
+
+int lfm_engine_set_submitter(void *ep, LfmKernelSubmitFn submitter, void *context) {
+    Engine *e = (Engine *)ep;
+    if (!e || !submitter || !context) return -EINVAL;
+    if (e->pass_claimed.load(std::memory_order_acquire) || e->submitter) return -EBUSY;
+    e->submitter_context = context;
+    e->submitter = submitter;
+    return 0;
+}
+
+int lfm_engine_clear_submitter(void *ep, void *context) {
+    Engine *e = (Engine *)ep;
+    if (!e || !context) return -EINVAL;
+    if (e->pass_claimed.load(std::memory_order_acquire)) return -EBUSY;
+    if (e->submitter_context != context) return -ESTALE;
+    e->submitter = nullptr;
+    e->submitter_context = nullptr;
+    return 0;
+}
+
+void lfm_engine_request_stop(void *ep) {
+    Engine *e = (Engine *)ep;
+    if (e && e->bridge) lfm_kernel_bridge_request_stop(e->bridge);
 }
 
 // Run a caller-supplied lane-uniform program on the whole team: fn(ctx, lane, lanes)

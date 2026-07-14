@@ -1,10 +1,12 @@
 //! The Rust rim of the resident native decode engine (native/src/engine/flashkern_engine.cpp).
 //!
 //! Everything below the ABI line is C++: the persistent fixed-lane team, the block
-//! schedules, the stage kernels. Rust's per-pass surface is one blocking call —
-//! internally: write the request slot, publish one fixed SQ cell, and park on the CQ
-//! doorbell until lane 0 publishes the completed pass. No Rust between stages.
+//! schedules, the stage kernels. Rust's per-pass surface is one blocking call while
+//! borrowed tensor pointers remain in use. Internally, the callback-driven coordinator
+//! is the sole SQ producer and its ingress thread is the sole CQ consumer. No Rust runs
+//! numerical stages and no application event loop makes progress for the kernel.
 
+use super::coordinator::{self, Coordinator};
 use std::ffi::c_void;
 use std::sync::Mutex;
 
@@ -123,6 +125,18 @@ struct EngineSnapshot {
 extern "C" {
     fn lfm_engine_new(workers: i32) -> *mut c_void;
     fn lfm_engine_free(e: *mut c_void);
+    fn lfm_engine_bridge(e: *mut c_void) -> *mut c_void;
+    fn lfm_engine_set_submitter(
+        e: *mut c_void,
+        submitter: unsafe extern "C" fn(
+            *mut c_void,
+            *const kcoro::Submission,
+            *mut kcoro::Completion,
+        ) -> i32,
+        context: *mut c_void,
+    ) -> i32;
+    fn lfm_engine_clear_submitter(e: *mut c_void, context: *mut c_void) -> i32;
+    fn lfm_engine_request_stop(e: *mut c_void);
     fn lfm_ctx_build(
         e: *mut c_void,
         descs: *const LayerDesc,
@@ -229,6 +243,7 @@ extern "C" {
 /// independently claims the slot before touching shared payload state.
 pub struct NativeEngine {
     ptr: *mut c_void,
+    coordinator: Coordinator,
     pass_lock: Mutex<()>,
 }
 
@@ -246,13 +261,36 @@ impl NativeEngine {
         // SAFETY: plain constructor call; null = failure.
         let p = unsafe { lfm_engine_new(workers as i32) };
         if p.is_null() {
-            None
-        } else {
-            Some(Self {
-                ptr: p,
-                pass_lock: Mutex::new(()),
-            })
+            return None;
         }
+        // SAFETY: `p` names the just-created engine and therefore its live bridge.
+        let bridge = unsafe { lfm_engine_bridge(p) };
+        let mut coordinator = match Coordinator::new(bridge, 8) {
+            Ok(coordinator) => coordinator,
+            Err(error) => {
+                eprintln!("[flashkern] coordinator init failed: {error}");
+                // SAFETY: constructor rollback owns the unpublished engine.
+                unsafe { lfm_engine_free(p) };
+                return None;
+            }
+        };
+        let context = coordinator.context();
+        // SAFETY: the context points into `coordinator`'s stable Arc allocation. It
+        // remains live until Drop clears the callback and joins both endpoint owners.
+        let rc = unsafe { lfm_engine_set_submitter(p, coordinator::submit, context) };
+        if rc != 0 {
+            // SAFETY: stop closes bridge admission before coordinator teardown.
+            unsafe { lfm_engine_request_stop(p) };
+            coordinator.shutdown();
+            // SAFETY: all Rust endpoint owners have joined.
+            unsafe { lfm_engine_free(p) };
+            return None;
+        }
+        Some(Self {
+            ptr: p,
+            coordinator,
+            pass_lock: Mutex::new(()),
+        })
     }
 
     #[cfg(test)]
@@ -763,8 +801,22 @@ pub fn install_backbone_ctx(
 
 impl Drop for NativeEngine {
     fn drop(&mut self) {
-        // SAFETY: stops and joins the bridge dispatcher, joins the fixed lane team,
-        // and destroys the drained SQ/CQ storage.
+        let _pass = self
+            .pass_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let context = self.coordinator.context();
+        // SAFETY: pass_lock excludes every safe Rust call. Clearing the callback
+        // prevents C++ from retaining a pointer into the coordinator during teardown.
+        let rc = unsafe { lfm_engine_clear_submitter(self.ptr, context) };
+        if rc != 0 {
+            std::process::abort();
+        }
+        // SAFETY: closes native admission and wakes both endpoint doorbells.
+        unsafe { lfm_engine_request_stop(self.ptr) };
+        self.coordinator.shutdown();
+        // SAFETY: Rust SQ/CQ owners are joined; this joins the native dispatcher and
+        // fixed lane team, then destroys the fully drained bridge.
         unsafe { lfm_engine_free(self.ptr) };
     }
 }
@@ -1496,6 +1548,31 @@ mod tests {
     }
 
     #[test]
+    fn raw_engine_requires_a_coordinator_without_leaking_its_descriptor() {
+        // SAFETY: this test deliberately exercises the unpublished C constructor so
+        // the no-submitter failure path cannot hide behind NativeEngine::new.
+        let raw = unsafe { lfm_engine_new(2) };
+        assert!(!raw.is_null());
+        let rc = unsafe { lfm_engine_call(raw, noop_raw_lane, std::ptr::null_mut()) };
+        assert_eq!(rc, -libc::ENOTCONN);
+
+        let mut snapshot = EngineSnapshot {
+            size: std::mem::size_of::<EngineSnapshot>() as u32,
+            abi_version: 1,
+            ..EngineSnapshot::default()
+        };
+        assert_eq!(unsafe { lfm_engine_snapshot(raw, &mut snapshot) }, 0);
+        assert_eq!(snapshot.pass_submissions, 0);
+        assert_eq!(snapshot.bridge_dispatches, 0);
+        assert_eq!(snapshot.descriptor_acquires, 1);
+        assert_eq!(snapshot.descriptor_retains, 0);
+        assert_eq!(snapshot.descriptor_releases, 1);
+        assert_eq!(snapshot.descriptors_live, 0);
+        // SAFETY: no bridge ticket was accepted and the descriptor pool is settled.
+        unsafe { lfm_engine_free(raw) };
+    }
+
+    #[test]
     fn native_engine_bridge_and_fence_soak() {
         let engine = NativeEngine::new(8).expect("native engine init");
         const PASSES: u64 = 10_000;
@@ -1509,6 +1586,7 @@ mod tests {
             assert_eq!(rc, 0, "pass {pass} did not complete");
         }
         let stats = engine.snapshot();
+        let coordinator = engine.coordinator.snapshot();
         assert_eq!(stats.pass_submissions, PASSES);
         assert_eq!(stats.pass_completions, PASSES);
         assert_eq!(stats.bridge_dispatches, PASSES);
@@ -1527,6 +1605,17 @@ mod tests {
         assert_eq!(stats.descriptor_callbacks, 0);
         assert_eq!(stats.max_descriptor_generation, PASSES as u32);
         assert_eq!(stats.pass_claimed, 0);
+        assert_eq!(coordinator.admitted, PASSES);
+        assert_eq!(coordinator.native_submissions, PASSES);
+        assert_eq!(coordinator.native_completions, PASSES);
+        assert_eq!(coordinator.resolved, PASSES);
+        assert_eq!(coordinator.failed, 0);
+        assert_eq!(coordinator.edge_signals, PASSES);
+        assert_eq!(coordinator.live, 0);
+        assert_eq!(coordinator.max_generation, PASSES as u32);
+        assert!(coordinator.executor_polls > PASSES);
+        assert!(coordinator.executor_wakes > 0);
+        assert!(!coordinator.fault);
         eprintln!(
             "native bridge/fence soak: {PASSES} passes, {} fence syscalls for {} waiters in {:.3}s",
             stats.fence_wake_calls,

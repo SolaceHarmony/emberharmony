@@ -12,6 +12,7 @@
 //! Design docs + the Metal-idiom → opcode map: `docs/FLASHKERN.md`.
 
 pub mod candle_ops; // candle CustomOp bridges — the seam the model wires through on CPU
+mod coordinator; // Rust policy broker + native CQ ingress; no numerical work
 pub mod dd; // double-double toolkit (CPU port of double_double.metal) for the dd kernels
 pub mod decode; // fused decode blocks: threadgroup fallback + ShortConv/DepthDecode blocks
 pub mod native_engine; // resident native stage-machine rim (native/src/engine/flashkern_engine.cpp)
