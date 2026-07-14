@@ -235,7 +235,8 @@ impl Cache {
     }
 
     /// Capture a rollback point for speculative prefill: per-layer KV sequence
-    /// lengths plus a clone of the carried conv states (tiny `[B,D,K-1]` tensors).
+    /// lengths plus independent copies of the carried conv states (tiny
+    /// `[B,D,K-1]` tensors).
     /// The KV tensors themselves are not copied — [`Self::rollback`] restores by
     /// narrowing back to the recorded lengths.
     pub fn snapshot(&self) -> Result<CacheSnapshot> {
@@ -244,9 +245,14 @@ impl Cache {
             .iter()
             .map(|kv| kv.as_ref().map(|sl| sl.len))
             .collect();
+        let conv_states = self
+            .conv_states
+            .iter()
+            .map(|state| state.as_ref().map(Tensor::copy).transpose())
+            .collect::<Result<Vec<_>>>()?;
         Ok(CacheSnapshot {
             kv_lens,
-            conv_states: self.conv_states.clone(),
+            conv_states,
         })
     }
 
@@ -285,7 +291,11 @@ impl Cache {
                 },
             }
         }
-        self.conv_states = snap.conv_states.clone();
+        self.conv_states = snap
+            .conv_states
+            .iter()
+            .map(|state| state.as_ref().map(Tensor::copy).transpose())
+            .collect::<Result<Vec<_>>>()?;
         Ok(())
     }
 
@@ -782,6 +792,7 @@ impl DecoderLayer {
         block_idx: usize,
         cache: &mut Cache,
         add_mask: Option<&Tensor>,
+        native_ctx: Option<&crate::flashkern::native_engine::BackboneCtxGuard>,
     ) -> Result<Tensor> {
         let residual = x;
         // Fused ShortConv residual block (flashkern): norm → in_proj → conv update →
@@ -798,7 +809,7 @@ impl DecoderLayer {
             {
                 // The whole layer in one native doorbell when the resident table is
                 // live (bit-identical to the composed fused blocks by parity test).
-                if let Some(y) = self.native_conv_layer(x, c, block_idx, cache)? {
+                if let Some(y) = self.native_conv_layer(x, c, block_idx, cache, native_ctx)? {
                     return Ok(y);
                 }
                 if let Some(y) = self.fused_shortconv_decode(x, c, block_idx, cache)? {
@@ -822,7 +833,9 @@ impl DecoderLayer {
         // reference chain and prefill keep the candle path below).
         if let LayerKind::Attention(a) = &self.kind {
             if add_mask.is_none() {
-                if let Some(y) = self.native_attn_layer(x, a, index_pos, block_idx, cache)? {
+                if let Some(y) =
+                    self.native_attn_layer(x, a, index_pos, block_idx, cache, native_ctx)?
+                {
                     return Ok(y);
                 }
             }
@@ -1069,8 +1082,8 @@ impl DecoderLayer {
         index_pos: usize,
         block_idx: usize,
         cache: &mut Cache,
+        native_ctx: Option<&crate::flashkern::native_engine::BackboneCtxGuard>,
     ) -> Result<Option<Tensor>> {
-        let engine = crate::flashkern::native_engine::process_engine();
         if !(cache.grouped_gqa_decode
             && cache.use_kv_cache
             && x.device().is_cpu()
@@ -1080,6 +1093,9 @@ impl DecoderLayer {
         {
             return Ok(None);
         }
+        let Some(ctx) = native_ctx else {
+            return Ok(None);
+        };
         let hdim = x.dim(2)?;
         let (n_kv, hd) = (attn.n_kv, attn.head_dim);
         // Grow BEFORE capturing plane pointers — growth reallocates the planes.
@@ -1101,16 +1117,16 @@ impl DecoderLayer {
         let (ss, sl2) = cache.sin.storage_and_layout();
         let bits = |g: &std::sync::RwLockReadGuard<'_, candle_core::Storage>,
                     l: &candle_core::Layout|
-         -> Option<*const u16> {
+         -> Option<(*const u16, usize)> {
             match &**g {
                 candle_core::Storage::Cpu(candle_core::CpuStorage::BF16(v)) => {
                     let (a, b) = l.contiguous_offsets()?;
-                    Some(v[a..b].as_ptr() as *const u16)
+                    Some((v[a..b].as_ptr() as *const u16, b - a))
                 }
                 _ => None,
             }
         };
-        let (Some(xp), Some(kp), Some(vp), Some(cp), Some(sp)) = (
+        let (Some((xp, xl)), Some((kp, kl)), Some((vp, vl)), Some((cp, cl)), Some((sp, sl))) = (
             bits(&xs, xl),
             bits(&ks, kl),
             bits(&vs, vl),
@@ -1119,28 +1135,35 @@ impl DecoderLayer {
         ) else {
             return Ok(None);
         };
-        // SAFETY (plane mutation): the engine writes this step's K/V rows at the
-        // cursor through these pointers — the same in-place storage mutation candle's
-        // own `slice_set` performs through `&Tensor` (append_kv's mechanism). Decode
-        // is sequential and this thread blocks for the pass's duration while holding
-        // the storage guards: no other reader or writer exists.
+        drop((xs, ks, vs, cs, ss));
+        if xl != hdim {
+            return Ok(None);
+        }
+        // SAFETY (transitional Candle rim): `&mut Cache` gives this call exclusive
+        // ownership of the K/V tensors, and the tensors keep their allocations alive
+        // after the read guards used for pointer capture are dropped. C++ validates
+        // every supplied extent and the owning context id before mutating a row.
         let (kp, vp) = (kp as *mut u16, vp as *mut u16);
         let xb = unsafe { std::slice::from_raw_parts(xp, hdim) };
         let mut out = vec![0u16; hdim];
-        let lanes = engine.lanes_total().max(1);
-        let ok = engine.attn_layer(
-            block_idx,
-            xb,
-            kp,
-            vp,
-            head_stride,
-            index_pos,
-            cp,
-            sp,
-            &mut out,
-            lanes,
-        );
-        drop((xs, ks, vs, cs, ss));
+        let lanes = ctx.lanes_total().max(1);
+        let ok = unsafe {
+            ctx.attn_layer(
+                block_idx,
+                xb,
+                kp,
+                kl,
+                vp,
+                vl,
+                head_stride,
+                index_pos,
+                cp,
+                sp,
+                cl.min(sl),
+                &mut out,
+                lanes,
+            )
+        };
         if !ok {
             return Ok(None);
         }
@@ -1158,8 +1181,11 @@ impl DecoderLayer {
         conv: &ShortConv,
         block_idx: usize,
         cache: &mut Cache,
+        native_ctx: Option<&crate::flashkern::native_engine::BackboneCtxGuard>,
     ) -> Result<Option<Tensor>> {
-        let engine = crate::flashkern::native_engine::process_engine();
+        let Some(ctx) = native_ctx else {
+            return Ok(None);
+        };
         let k = conv.l_cache;
         let hdim = x.dim(2)?;
         let x = x.contiguous()?;
@@ -1190,8 +1216,8 @@ impl DecoderLayer {
         };
         let mut out = vec![0u16; hdim];
         let mut state_out = vec![0u16; hdim * (k - 1)];
-        let lanes = engine.lanes_total().max(1);
-        if !engine.conv_layer(block_idx, xb, sb, &mut state_out, &mut out, lanes) {
+        let lanes = ctx.lanes_total().max(1);
+        if !ctx.conv_layer(block_idx, xb, sb, &mut state_out, &mut out, lanes) {
             return Ok(None);
         }
         drop((xs, ss));
@@ -1261,6 +1287,10 @@ impl Model {
         &self.embedding_norm
     }
 
+    pub(crate) fn native_ctx(&self) -> Option<&crate::flashkern::native_engine::BackboneCtxGuard> {
+        self.native_ctx.as_ref()
+    }
+
     /// ONE token through the native engine: embed → every layer → final norm →
     /// (optionally) logits into the caller's buffers. Returns `Ok(false)` when any
     /// gate fails — the caller takes the candle path, bit-identical. On success every
@@ -1279,8 +1309,7 @@ impl Model {
         out_logits: Option<&mut [f32]>,
     ) -> Result<bool> {
         use crate::flashkern::decode::PtrLen;
-        use crate::flashkern::native_engine::{process_engine, LayerState};
-        let engine = process_engine();
+        use crate::flashkern::native_engine::LayerState;
         if !(cache.grouped_gqa_decode
             && cache.use_kv_cache
             && cache.fused_conv_decode
@@ -1288,6 +1317,9 @@ impl Model {
         {
             return Ok(false);
         }
+        let Some(ctx) = self.native_ctx.as_ref() else {
+            return Ok(false);
+        };
         let hdim = self.embed_tokens.embeddings().dim(1)?;
         assert_eq!(out_hidden.len(), hdim, "native_token_pass: out_hidden != H");
         // Per-layer state: ensure attention capacity FIRST (growth reallocates), then
@@ -1320,7 +1352,10 @@ impl Model {
                         k_plane: kp.addr() as *mut u16,
                         v_plane: vp.addr() as *mut u16,
                         head_stride: cap * a.head_dim,
+                        k_len: kp.size(),
+                        v_len: vp.size(),
                         conv_state: std::ptr::null_mut(),
+                        conv_len: 0,
                     });
                 }
                 LayerKind::ShortConv(_) => {
@@ -1336,6 +1371,7 @@ impl Model {
                     // candle's slice_set performs; decode is sequential and this
                     // thread blocks for the pass.
                     ls.conv_state = sp.addr() as *mut u16;
+                    ls.conv_len = sp.size();
                     cache.native_states.0.push(ls);
                 }
             }
@@ -1345,18 +1381,24 @@ impl Model {
         };
         // Tile counts come from OUR team's width, not a foreign pool's. Both resolve
         // to the P-core count today, so the pinned banding is unchanged.
-        let lanes = engine.lanes_total().max(1);
-        let ok = engine.token_pass(
-            ids,
-            embed_kind,
-            &cache.native_states.0,
-            index_pos,
-            cosp.addr() as *const u16,
-            sinp.addr() as *const u16,
-            out_hidden,
-            out_logits,
-            lanes,
-        );
+        let lanes = ctx.lanes_total().max(1);
+        // SAFETY: all raw pointers were captured from live cache/model tensors after
+        // capacity growth; `&mut Cache` excludes concurrent state access. C++ checks
+        // the context id and every extent before dispatch.
+        let ok = unsafe {
+            ctx.token_pass(
+                ids,
+                embed_kind,
+                &cache.native_states.0,
+                index_pos,
+                cosp.addr() as *const u16,
+                sinp.addr() as *const u16,
+                cosp.size().min(sinp.size()),
+                out_hidden,
+                out_logits,
+                lanes,
+            )
+        };
         if !ok {
             return Ok(false);
         }
@@ -1409,7 +1451,14 @@ impl Model {
     ) -> Result<Tensor> {
         let mut hidden = embeds.clone();
         for (block_idx, layer) in self.layers.iter().enumerate() {
-            hidden = layer.forward(&hidden, index_pos, block_idx, cache, add_mask)?;
+            hidden = layer.forward(
+                &hidden,
+                index_pos,
+                block_idx,
+                cache,
+                add_mask,
+                self.native_ctx.as_ref(),
+            )?;
         }
         self.embedding_norm.forward(&hidden)
     }
@@ -1435,6 +1484,78 @@ impl Model {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_snapshot_owns_independent_conv_state() {
+        use crate::flashkern::decode::PtrLen;
+        use half::bf16;
+
+        let dev = Device::Cpu;
+        let cfg = Lfm2Config {
+            vocab_size: 16,
+            hidden_size: 2,
+            num_hidden_layers: 1,
+            num_attention_heads: 1,
+            num_key_value_heads: 1,
+            norm_eps: 1e-5,
+            rope_theta: 10_000.0,
+            max_position_embeddings: 8,
+            conv_l_cache: 3,
+            conv_bias: false,
+            layer_types: vec![LayerType::Conv],
+            block_ffn_dim_multiplier: 1.0,
+            block_multiple_of: 1,
+            block_ff_dim: 4,
+            block_auto_adjust_ff_dim: false,
+        };
+        let mut cache = Cache::new(true, DType::BF16, &cfg, &dev).unwrap();
+        cache.conv_states[0] = Some(
+            Tensor::from_vec(
+                vec![
+                    bf16::from_f32(1.0),
+                    bf16::from_f32(2.0),
+                    bf16::from_f32(3.0),
+                    bf16::from_f32(4.0),
+                ],
+                (1, 2, 2),
+                &dev,
+            )
+            .unwrap(),
+        );
+
+        let live = PtrLen::bf16(cache.conv_states[0].as_ref().unwrap())
+            .unwrap()
+            .addr();
+        let snap = cache.snapshot().unwrap();
+        let saved = PtrLen::bf16(snap.conv_states[0].as_ref().unwrap())
+            .unwrap()
+            .addr();
+        assert_ne!(live, saved, "snapshot must not alias in-place native state");
+
+        cache.rollback(&snap).unwrap();
+        let restored = PtrLen::bf16(cache.conv_states[0].as_ref().unwrap())
+            .unwrap()
+            .addr();
+        assert_ne!(
+            saved, restored,
+            "rollback must preserve a reusable snapshot"
+        );
+        assert_eq!(
+            cache.conv_states[0]
+                .as_ref()
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<bf16>()
+                .unwrap(),
+            vec![
+                bf16::from_f32(1.0),
+                bf16::from_f32(2.0),
+                bf16::from_f32(3.0),
+                bf16::from_f32(4.0),
+            ]
+        );
+    }
 
     #[test]
     fn grouped_gqa_matches_expanded_at_f32_ulp() {

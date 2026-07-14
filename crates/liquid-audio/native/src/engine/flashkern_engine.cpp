@@ -21,7 +21,7 @@
 // tile), same kernels (lfm_bf16_gemm_nt_f32, linked in-image). The Rust parity test
 // pins this bit-identical to the threadgroup port, itself pinned to the candle chain.
 //
-// Build: -ffp-contract=off (the ladders promise separate roundings), C++17.
+// Build: -ffp-contract=off (the ladders promise separate roundings), C++23.
 
 #include <atomic>
 #include <cerrno>
@@ -254,7 +254,10 @@ struct LfmLayerState {
     uint16_t *k_plane; // attention layers; null for conv
     uint16_t *v_plane;
     size_t head_stride;
+    size_t k_len;
+    size_t v_len;
     uint16_t *conv_state; // conv layers: carried window, advanced IN PLACE; null for attn
+    size_t conv_len;
 };
 }
 
@@ -1396,13 +1399,23 @@ int lfm_ctx_build(void *ep, const LfmLayerDesc *descs, size_t n_layers, size_t h
 
 // Install the head tables (embed / audio-embed / final norm / tied logits) — the
 // token pass needs them; the per-layer entries do not. Serialized by the rim.
-int lfm_ctx_set_heads(void *ep, const uint16_t *embed_w, size_t vocab,
-                      const uint16_t *audio_embed_w, size_t audio_rows,
-                      const uint16_t *emb_norm_w, float emb_norm_eps) {
+int lfm_ctx_set_heads(void *ep, uint64_t id, const uint16_t *embed_w,
+                      size_t embed_len, size_t vocab, const uint16_t *audio_embed_w,
+                      size_t audio_embed_len, size_t audio_rows,
+                      const uint16_t *emb_norm_w, size_t emb_norm_len,
+                      float emb_norm_eps) {
     Engine *e = (Engine *)ep;
-    if (!e || !embed_w || !emb_norm_w || vocab == 0) return -1;
+    if (!e || id == 0 || !embed_w || !emb_norm_w || vocab == 0) return -1;
     PassClaim claim(e);
     if (!claim) return -EBUSY;
+    if (!e->ctx_live.load(std::memory_order_acquire) || id != e->ctx_id) return -3;
+    if (vocab > SIZE_MAX / e->dim_h || embed_len < vocab * e->dim_h ||
+        emb_norm_len < e->dim_h)
+        return -1;
+    if (audio_rows > 0 &&
+        (!audio_embed_w || audio_rows > SIZE_MAX / e->dim_h ||
+         audio_embed_len < audio_rows * e->dim_h))
+        return -1;
     try {
         e->tk_logf.resize(vocab);
     } catch (const std::bad_alloc &) {
@@ -1441,16 +1454,24 @@ int lfm_ctx_clear(void *ep, uint64_t id) {
 // One whole shortconv+MLP layer: request slot → doorbell → park. Returns 0 on
 // success; -3 when no ctx is live or the slot is not a conv layer (caller takes the
 // bit-identical per-block path).
-int lfm_engine_conv_layer(void *ep, size_t layer, const uint16_t *x,
-                          const uint16_t *state_in, uint16_t *state_out, uint16_t *out,
-                          size_t lanes) {
+int lfm_engine_conv_layer(void *ep, uint64_t id, size_t layer, const uint16_t *x,
+                          size_t x_len, const uint16_t *state_in, size_t state_in_len,
+                          uint16_t *state_out, size_t state_out_len, uint16_t *out,
+                          size_t out_len, size_t lanes) {
     Engine *e = (Engine *)ep;
-    if (!e || !x || !state_in || !state_out || !out) return -1;
+    if (!e || id == 0 || !x || !state_in || !state_out || !out) return -1;
     PassClaim claim(e);
     if (!claim) return -EBUSY;
-    if (!e->ctx_live.load(std::memory_order_acquire) || layer >= e->layers.size() ||
-        e->layers[layer].kind != 0)
+    if (!e->ctx_live.load(std::memory_order_acquire) || id != e->ctx_id ||
+        layer >= e->layers.size() || e->layers[layer].kind != 0)
         return -3;
+    const size_t k = e->layers[layer].k;
+    const size_t tail = k > 0 ? k - 1 : 0;
+    if (k < 1 || (tail > 0 && e->dim_h > SIZE_MAX / tail)) return -1;
+    const size_t state_len = e->dim_h * tail;
+    if (x_len != e->dim_h || out_len != e->dim_h || state_in_len != state_len ||
+        state_out_len != state_len)
+        return -1;
 
     e->conv.layer = layer;
     e->conv.x = x;
@@ -1467,18 +1488,28 @@ int lfm_engine_conv_layer(void *ep, size_t layer, const uint16_t *x,
 // over pos+1 entries. Rows beyond `pos` must already fit the planes (the caller
 // pre-grows capacity BEFORE capturing the plane pointers). Returns 0 on success;
 // -3 when unserved (no ctx / not an attention slot / capture was null / pos over cap).
-int lfm_engine_attn_layer(void *ep, size_t layer, const uint16_t *x, uint16_t *k_plane,
-                          uint16_t *v_plane, size_t head_stride, size_t pos,
-                          const uint16_t *cos_base, const uint16_t *sin_base,
-                          uint16_t *out, size_t lanes) {
+int lfm_engine_attn_layer(void *ep, uint64_t id, size_t layer, const uint16_t *x,
+                          size_t x_len, uint16_t *k_plane, size_t k_len,
+                          uint16_t *v_plane, size_t v_len, size_t head_stride,
+                          size_t pos, const uint16_t *cos_base, const uint16_t *sin_base,
+                          size_t rope_len, uint16_t *out, size_t out_len, size_t lanes) {
     Engine *e = (Engine *)ep;
-    if (!e || !x || !k_plane || !v_plane || !cos_base || !sin_base || !out) return -1;
+    if (!e || id == 0 || !x || !k_plane || !v_plane || !cos_base || !sin_base || !out)
+        return -1;
     PassClaim claim(e);
     if (!claim) return -EBUSY;
-    if (!e->ctx_live.load(std::memory_order_acquire) || layer >= e->layers.size() ||
-        e->layers[layer].kind != 1 || !e->layers[layer].q_w ||
+    if (!e->ctx_live.load(std::memory_order_acquire) || id != e->ctx_id ||
+        layer >= e->layers.size() || e->layers[layer].kind != 1 ||
+        !e->layers[layer].q_w ||
         pos + 1 > e->dim_maxctx)
         return -3;
+    const LfmLayerDesc *d = &e->layers[layer];
+    if (x_len != e->dim_h || out_len != e->dim_h || d->hd == 0 ||
+        pos + 1 > SIZE_MAX / d->hd || head_stride < (pos + 1) * d->hd ||
+        d->n_kv > SIZE_MAX / head_stride || k_len < d->n_kv * head_stride ||
+        v_len < d->n_kv * head_stride || pos + 1 > SIZE_MAX / (d->hd / 2) ||
+        rope_len < (pos + 1) * (d->hd / 2))
+        return -1;
 
     e->attn.layer = layer;
     e->attn.x = x;
@@ -1498,18 +1529,24 @@ int lfm_engine_attn_layer(void *ep, size_t layer, const uint16_t *x, uint16_t *k
 // `states` is one LfmLayerState per table slot (fresh pointers each token — the caller
 // ensures plane capacity BEFORE capture). Returns 0 on success; -3 when unserved (no
 // ctx/heads, an attention slot without capture, bad ids, or pos over capacity).
-int lfm_engine_token_pass(void *ep, const uint32_t *ids, size_t n_ids,
+int lfm_engine_token_pass(void *ep, uint64_t id, const uint32_t *ids, size_t n_ids,
                           uint32_t embed_kind, const LfmLayerState *states,
                           size_t n_states, size_t pos, const uint16_t *cos_base,
-                          const uint16_t *sin_base, uint16_t *out_hidden,
-                          float *out_logits, size_t lanes) {
+                          const uint16_t *sin_base, size_t rope_len,
+                          uint16_t *out_hidden, size_t out_hidden_len,
+                          float *out_logits, size_t out_logits_len, size_t lanes) {
     Engine *e = (Engine *)ep;
-    if (!e || !ids || n_ids == 0 || !states || !out_hidden) return -1;
+    if (!e || id == 0 || !ids || n_ids == 0 || !states || !out_hidden) return -1;
     PassClaim claim(e);
     if (!claim) return -EBUSY;
-    if (!e->ctx_live.load(std::memory_order_acquire) || !e->embed_w || !e->emb_norm_w ||
-        n_states != e->layers.size() || pos + 1 > e->dim_maxctx)
+    if (!e->ctx_live.load(std::memory_order_acquire) || id != e->ctx_id ||
+        !e->embed_w || !e->emb_norm_w || n_states != e->layers.size() ||
+        pos + 1 > e->dim_maxctx)
         return -3;
+    if (out_hidden_len != e->dim_h ||
+        (out_logits && out_logits_len < e->vocab) ||
+        (!out_logits && out_logits_len != 0))
+        return -1;
     if (embed_kind == 0) {
         if (ids[0] >= e->vocab) return -3;
     } else {
@@ -1523,8 +1560,23 @@ int lfm_engine_token_pass(void *ep, const uint32_t *ids, size_t n_ids,
             if (!e->layers[l].q_w || !states[l].k_plane || !states[l].v_plane ||
                 !cos_base || !sin_base)
                 return -3;
+            const size_t hd = e->layers[l].hd;
+            const size_t nkv = e->layers[l].n_kv;
+            if (hd == 0 || pos + 1 > SIZE_MAX / hd ||
+                states[l].head_stride < (pos + 1) * hd ||
+                nkv > SIZE_MAX / states[l].head_stride ||
+                states[l].k_len < nkv * states[l].head_stride ||
+                states[l].v_len < nkv * states[l].head_stride ||
+                pos + 1 > SIZE_MAX / (hd / 2) || rope_len < (pos + 1) * (hd / 2))
+                return -1;
         } else if (!states[l].conv_state) {
             return -3;
+        } else {
+            const size_t k = e->layers[l].k;
+            const size_t tail = k > 0 ? k - 1 : 0;
+            if (k < 1 || (tail > 0 && e->dim_h > SIZE_MAX / tail) ||
+                states[l].conv_len < e->dim_h * tail)
+                return -1;
         }
     }
 

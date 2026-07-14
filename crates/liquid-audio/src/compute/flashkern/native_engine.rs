@@ -78,7 +78,10 @@ pub struct LayerState {
     pub k_plane: *mut u16,
     pub v_plane: *mut u16,
     pub head_stride: usize,
+    pub k_len: usize,
+    pub v_len: usize,
     pub conv_state: *mut u16,
+    pub conv_len: usize,
 }
 
 impl LayerState {
@@ -87,7 +90,10 @@ impl LayerState {
             k_plane: std::ptr::null_mut(),
             v_plane: std::ptr::null_mut(),
             head_stride: 0,
+            k_len: 0,
+            v_len: 0,
             conv_state: std::ptr::null_mut(),
+            conv_len: 0,
         }
     }
 }
@@ -123,15 +129,21 @@ extern "C" {
     ) -> i32;
     fn lfm_engine_attn_layer(
         e: *mut c_void,
+        id: u64,
         layer: usize,
         x: *const u16,
+        x_len: usize,
         k_plane: *mut u16,
+        k_len: usize,
         v_plane: *mut u16,
+        v_len: usize,
         head_stride: usize,
         pos: usize,
         cos_base: *const u16,
         sin_base: *const u16,
+        rope_len: usize,
         out: *mut u16,
+        out_len: usize,
         lanes: usize,
     ) -> i32;
     fn lfm_ctx_clear(e: *mut c_void, id: u64) -> i32;
@@ -147,15 +159,20 @@ extern "C" {
     fn lfm_lane_fence(e: *mut c_void, lane: u32);
     fn lfm_ctx_set_heads(
         e: *mut c_void,
+        id: u64,
         embed_w: *const u16,
+        embed_len: usize,
         vocab: usize,
         audio_embed_w: *const u16,
+        audio_embed_len: usize,
         audio_rows: usize,
         emb_norm_w: *const u16,
+        emb_norm_len: usize,
         emb_norm_eps: f32,
     ) -> i32;
     fn lfm_engine_token_pass(
         e: *mut c_void,
+        id: u64,
         ids: *const u32,
         n_ids: usize,
         embed_kind: u32,
@@ -164,17 +181,25 @@ extern "C" {
         pos: usize,
         cos_base: *const u16,
         sin_base: *const u16,
+        rope_len: usize,
         out_hidden: *mut u16,
+        out_hidden_len: usize,
         out_logits: *mut f32,
+        out_logits_len: usize,
         lanes: usize,
     ) -> i32;
     fn lfm_engine_conv_layer(
         e: *mut c_void,
+        id: u64,
         layer: usize,
         x: *const u16,
+        x_len: usize,
         state_in: *const u16,
+        state_in_len: usize,
         state_out: *mut u16,
+        state_out_len: usize,
         out: *mut u16,
+        out_len: usize,
         lanes: usize,
     ) -> i32;
     fn lfm_engine_mlp(
@@ -212,6 +237,9 @@ unsafe impl Sync for NativeEngine {}
 
 impl NativeEngine {
     pub fn new(workers: usize) -> Option<Self> {
+        if !crate::bf16_gemm::bf16_gemm_nt_available() {
+            return None;
+        }
         let _ = kcoro_sys::link_anchor as fn();
         // SAFETY: plain constructor call; null = failure.
         let p = unsafe { lfm_engine_new(workers as i32) };
@@ -314,25 +342,32 @@ impl NativeEngine {
     }
 
     /// Install the head tables (text embed / audio embed / final norm / tied logits).
-    pub fn set_heads(
+    unsafe fn set_heads(
         &self,
+        id: u64,
         embed_w: *const u16,
+        embed_len: usize,
         vocab: usize,
         audio_embed_w: *const u16,
+        audio_embed_len: usize,
         audio_rows: usize,
         emb_norm_w: *const u16,
+        emb_norm_len: usize,
         emb_norm_eps: f32,
     ) -> bool {
         let _pass = self.pass_lock.lock().unwrap();
-        // SAFETY: pointers guarded live by the same BackboneCtxGuard contract.
         let rc = unsafe {
             lfm_ctx_set_heads(
                 self.ptr,
+                id,
                 embed_w,
+                embed_len,
                 vocab,
                 audio_embed_w,
+                audio_embed_len,
                 audio_rows,
                 emb_norm_w,
+                emb_norm_len,
                 emb_norm_eps,
             )
         };
@@ -345,25 +380,28 @@ impl NativeEngine {
     /// plane capacity BEFORE capture and advances its cursors on success.
     #[must_use = "false = native pass did not run; caller must take the fallback"]
     #[allow(clippy::too_many_arguments)]
-    pub fn token_pass(
+    unsafe fn token_pass(
         &self,
+        id: u64,
         ids: &[u32],
         embed_kind: u32,
         states: &[LayerState],
         pos: usize,
         cos_base: *const u16,
         sin_base: *const u16,
+        rope_len: usize,
         out_hidden: &mut [u16],
         out_logits: Option<&mut [f32]>,
         lanes: usize,
     ) -> bool {
         let _pass = self.pass_lock.lock().unwrap();
-        let logits_ptr = out_logits.map_or(std::ptr::null_mut(), |l| l.as_mut_ptr());
-        // SAFETY: slice extents by contract with the installed ctx (out_hidden = [H],
-        // out_logits = [vocab]); every pointer outlives this blocking call.
+        let (logits_ptr, logits_len) = out_logits
+            .map(|l| (l.as_mut_ptr(), l.len()))
+            .unwrap_or((std::ptr::null_mut(), 0));
         let rc = unsafe {
             lfm_engine_token_pass(
                 self.ptr,
+                id,
                 ids.as_ptr(),
                 ids.len(),
                 embed_kind,
@@ -372,8 +410,11 @@ impl NativeEngine {
                 pos,
                 cos_base,
                 sin_base,
+                rope_len,
                 out_hidden.as_mut_ptr(),
+                out_hidden.len(),
                 logits_ptr,
+                logits_len,
                 lanes,
             )
         };
@@ -385,35 +426,43 @@ impl NativeEngine {
     /// caller) and attends over pos+1 entries. Caller advances its cursor on success.
     #[must_use = "false = native pass did not run; caller must take the fallback"]
     #[allow(clippy::too_many_arguments)]
-    pub fn attn_layer(
+    unsafe fn attn_layer(
         &self,
+        id: u64,
         layer: usize,
         x: &[u16],
         k_plane: *mut u16,
+        k_len: usize,
         v_plane: *mut u16,
+        v_len: usize,
         head_stride: usize,
         pos: usize,
         cos_base: *const u16,
         sin_base: *const u16,
+        rope_len: usize,
         out: &mut [u16],
         lanes: usize,
     ) -> bool {
         assert_eq!(out.len(), x.len(), "native attn_layer: out.len() != H");
         let _pass = self.pass_lock.lock().unwrap();
-        // SAFETY: plane/table pointers are captured from live storages held across this
-        // blocking call; rows 0..=pos fit the pre-grown capacity by the caller's gate.
         let rc = unsafe {
             lfm_engine_attn_layer(
                 self.ptr,
+                id,
                 layer,
                 x.as_ptr(),
+                x.len(),
                 k_plane,
+                k_len,
                 v_plane,
+                v_len,
                 head_stride,
                 pos,
                 cos_base,
                 sin_base,
+                rope_len,
                 out.as_mut_ptr(),
+                out.len(),
                 lanes,
             )
         };
@@ -508,8 +557,9 @@ impl NativeEngine {
     /// One whole shortconv+MLP layer in a single doorbell — bit-identical to the
     /// composed `fused_shortconv_decode` + `fused_mlp_decode` at the same `lanes`.
     #[must_use = "false = native pass did not run; caller must take the fallback"]
-    pub fn conv_layer(
+    fn conv_layer(
         &self,
+        id: u64,
         layer: usize,
         x: &[u16],
         state_in: &[u16],
@@ -530,11 +580,16 @@ impl NativeEngine {
         let rc = unsafe {
             lfm_engine_conv_layer(
                 self.ptr,
+                id,
                 layer,
                 x.as_ptr(),
+                x.len(),
                 state_in.as_ptr(),
+                state_in.len(),
                 state_out.as_mut_ptr(),
+                state_out.len(),
                 out.as_mut_ptr(),
+                out.len(),
                 lanes,
             )
         };
@@ -561,6 +616,122 @@ unsafe impl Send for StateTable {}
 pub struct BackboneCtxGuard {
     id: u64,
     _held: Vec<candle_core::Tensor>,
+}
+
+impl BackboneCtxGuard {
+    pub(crate) fn lanes_total(&self) -> usize {
+        process_engine().lanes_total()
+    }
+
+    /// # Safety
+    /// Every pointer must refer to the owning model's live, contiguous bf16 storage
+    /// for at least the supplied extent. This guard keeps the owning context selected;
+    /// the model keeps the underlying tensors alive.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn set_heads(
+        &self,
+        embed_w: *const u16,
+        embed_len: usize,
+        vocab: usize,
+        audio_embed_w: *const u16,
+        audio_embed_len: usize,
+        audio_rows: usize,
+        emb_norm_w: *const u16,
+        emb_norm_len: usize,
+        emb_norm_eps: f32,
+    ) -> bool {
+        unsafe {
+            process_engine().set_heads(
+                self.id,
+                embed_w,
+                embed_len,
+                vocab,
+                audio_embed_w,
+                audio_embed_len,
+                audio_rows,
+                emb_norm_w,
+                emb_norm_len,
+                emb_norm_eps,
+            )
+        }
+    }
+
+    /// # Safety
+    /// Raw state and rope pointers must remain live, correctly aligned, and exclusively
+    /// mutable where written for the duration of this blocking native pass.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn token_pass(
+        &self,
+        ids: &[u32],
+        embed_kind: u32,
+        states: &[LayerState],
+        pos: usize,
+        cos_base: *const u16,
+        sin_base: *const u16,
+        rope_len: usize,
+        out_hidden: &mut [u16],
+        out_logits: Option<&mut [f32]>,
+        lanes: usize,
+    ) -> bool {
+        unsafe {
+            process_engine().token_pass(
+                self.id, ids, embed_kind, states, pos, cos_base, sin_base, rope_len, out_hidden,
+                out_logits, lanes,
+            )
+        }
+    }
+
+    /// # Safety
+    /// The K/V and rope pointers must name the supplied live extents. K/V must be
+    /// exclusively mutable for the blocking call.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn attn_layer(
+        &self,
+        layer: usize,
+        x: &[u16],
+        k_plane: *mut u16,
+        k_len: usize,
+        v_plane: *mut u16,
+        v_len: usize,
+        head_stride: usize,
+        pos: usize,
+        cos_base: *const u16,
+        sin_base: *const u16,
+        rope_len: usize,
+        out: &mut [u16],
+        lanes: usize,
+    ) -> bool {
+        unsafe {
+            process_engine().attn_layer(
+                self.id,
+                layer,
+                x,
+                k_plane,
+                k_len,
+                v_plane,
+                v_len,
+                head_stride,
+                pos,
+                cos_base,
+                sin_base,
+                rope_len,
+                out,
+                lanes,
+            )
+        }
+    }
+
+    pub(crate) fn conv_layer(
+        &self,
+        layer: usize,
+        x: &[u16],
+        state_in: &[u16],
+        state_out: &mut [u16],
+        out: &mut [u16],
+        lanes: usize,
+    ) -> bool {
+        process_engine().conv_layer(self.id, layer, x, state_in, state_out, out, lanes)
+    }
 }
 
 impl Drop for BackboneCtxGuard {
@@ -906,18 +1077,24 @@ mod tests {
         let vp_eng = PtrLen::bf16(&v_plane_eng).unwrap().addr() as *mut u16;
         let mut out_got = vec![0u16; h];
         assert!(
-            engine.attn_layer(
-                0,
-                &x_bits,
-                kp_eng,
-                vp_eng,
-                cap * hd,
-                pos,
-                cap_ptr(&cos),
-                cap_ptr(&sin),
-                &mut out_got,
-                lanes,
-            ),
+            unsafe {
+                engine.attn_layer(
+                    ctx_id,
+                    0,
+                    &x_bits,
+                    kp_eng,
+                    nkv * cap * hd,
+                    vp_eng,
+                    nkv * cap * hd,
+                    cap * hd,
+                    pos,
+                    cap_ptr(&cos),
+                    cap_ptr(&sin),
+                    max_pos * hd / 2,
+                    &mut out_got,
+                    lanes,
+                )
+            },
             "engine refused attn_layer"
         );
         assert_eq!(out_got, out_ref, "layer output");
@@ -1010,7 +1187,7 @@ mod tests {
                 let mut state_got = vec![0u16; h * (k - 1)];
                 let mut out_got = vec![0u16; h];
                 assert!(
-                    engine.conv_layer(1, &x, &state, &mut state_got, &mut out_got, lanes),
+                    engine.conv_layer(ctx_id, 1, &x, &state, &mut state_got, &mut out_got, lanes,),
                     "engine refused conv_layer"
                 );
                 assert_eq!(state_got, state_ref, "state H={h} I={i} lanes={lanes}");
@@ -1069,13 +1246,81 @@ mod tests {
         let mut state_out = vec![0u16; h * (k - 1)];
         let mut out = vec![0u16; h];
         assert!(
-            engine.conv_layer(0, &x, &state, &mut state_out, &mut out, 1),
+            engine.conv_layer(first, 0, &x, &state, &mut state_out, &mut out, 1),
             "owner's table must survive a stale clear"
+        );
+        assert!(
+            !engine.conv_layer(first + 1, 0, &x, &state, &mut state_out, &mut out, 1),
+            "a foreign context id must not execute against the live table"
+        );
+        let short_input = vec![0u16; state.len() - 1];
+        let mut short_state = vec![0u16; state.len() - 1];
+        assert!(
+            !engine.conv_layer(first, 0, &x, &short_input, &mut short_state, &mut out, 1,),
+            "the native boundary must reject an undersized conv state"
+        );
+
+        let vocab = 4usize;
+        let embed = vec![0u16; vocab * h];
+        let norm = vec![0x3f80u16; h];
+        assert!(!unsafe {
+            engine.set_heads(
+                first + 1,
+                embed.as_ptr(),
+                embed.len(),
+                vocab,
+                std::ptr::null(),
+                0,
+                0,
+                norm.as_ptr(),
+                norm.len(),
+                1e-5,
+            )
+        });
+        assert!(unsafe {
+            engine.set_heads(
+                first,
+                embed.as_ptr(),
+                embed.len(),
+                vocab,
+                std::ptr::null(),
+                0,
+                0,
+                norm.as_ptr(),
+                norm.len(),
+                1e-5,
+            )
+        });
+        let mut token_state = state.clone();
+        let states = [LayerState {
+            conv_state: token_state.as_mut_ptr(),
+            conv_len: token_state.len(),
+            ..LayerState::none()
+        }];
+        let mut hidden = vec![0u16; h];
+        let mut short_logits = vec![0f32; vocab - 1];
+        assert!(
+            !unsafe {
+                engine.token_pass(
+                    first,
+                    &[0],
+                    0,
+                    &states,
+                    0,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    0,
+                    &mut hidden,
+                    Some(&mut short_logits),
+                    1,
+                )
+            },
+            "the native boundary must reject an undersized logits buffer"
         );
         // The owner's clear releases the slot; a new install then succeeds.
         engine.ctx_clear(first);
         assert!(
-            !engine.conv_layer(0, &x, &state, &mut state_out, &mut out, 1),
+            !engine.conv_layer(first, 0, &x, &state, &mut state_out, &mut out, 1),
             "cleared table must refuse passes"
         );
         let second = engine
@@ -1164,9 +1409,8 @@ mod tests {
         }
         native.sort_by(f64::total_cmp);
         spun.sort_by(f64::total_cmp);
-        let percentile = |samples: &[f64], percent: usize| {
-            samples[(samples.len() * percent).div_ceil(100) - 1]
-        };
+        let percentile =
+            |samples: &[f64], percent: usize| samples[(samples.len() * percent).div_ceil(100) - 1];
         eprintln!(
             "native engine fused_mlp p50/p95/p99 {:.3}/{:.3}/{:.3} ms ({:.3}-{:.3}) vs threadgroup+spin {:.3}/{:.3}/{:.3} ms ({:.3}-{:.3}) over {SAMPLES} passes (H=1024 I=4096, lanes=8)",
             percentile(&native, 50), percentile(&native, 95), percentile(&native, 99),

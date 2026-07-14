@@ -127,11 +127,10 @@ pub fn bf16_gemm_nt_available() -> bool {
     }
 }
 
-/// `true` when the Accelerate-backed prefill GEMM is available: macOS aarch64 with the
-/// flashkern build (Accelerate is the sanctioned AMX dispatcher; off macOS the BFMMLA
-/// GEMM remains the prefill path — see ENGINE_DESIGN.md §3b).
+/// `true` when the Accelerate-backed prefill GEMM is available. This path widens bf16
+/// storage to f32 before calling `cblas_sgemm`, so it does not require FEAT_BF16.
 pub fn bf16_gemm_accel_available() -> bool {
-    cfg!(all(target_arch = "aarch64", target_os = "macos")) && bf16_gemm_available()
+    cfg!(all(target_arch = "aarch64", target_os = "macos"))
 }
 
 /// Prefill twin of [`Bf16GemmNt`]: `A(M,K) · W(N,K)ᵀ → f32(M,N)` through Accelerate

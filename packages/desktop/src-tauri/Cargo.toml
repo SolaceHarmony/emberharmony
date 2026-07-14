@@ -69,8 +69,8 @@ window-vibrancy = "0.7"
 # real-time. See the root `crates/liquid-audio` native engine.
 liquid-audio = { path = "../../../crates/liquid-audio", features = ["metal"] }
 
-# Same engine on non-macOS, CPU path (no Metal); below real-time for a 1.5B model but
-# keeps the desktop building everywhere.
+# Linux CPU build of the same native runtime. Windows/MSVC is intentionally not a
+# release target until kcoro and flashkern have a real Windows port.
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 liquid-audio = { path = "../../../crates/liquid-audio" }
 

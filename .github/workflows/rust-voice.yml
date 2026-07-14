@@ -18,6 +18,7 @@ on:
       - "crates/candle-flashfftconv/**"
       - "crates/kcoro-sys/**"
       - "Cargo.toml"
+      - "Cargo.lock"
       - "rust-toolchain.toml"
       - ".github/workflows/rust-voice.yml"
   workflow_dispatch:

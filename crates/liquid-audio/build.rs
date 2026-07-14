@@ -31,6 +31,29 @@ fn main() {
         println!("cargo::rustc-link-lib=framework=Accelerate");
     }
 
+    println!("cargo::rerun-if-changed=native/src/engine/flashkern_engine.cpp");
+    println!("cargo::rerun-if-changed=../kcoro-sys/vendor/kcoro_arena/include");
+    // C++23, not a style choice: this TU includes kcoro headers, and C++23 is
+    // the FIRST standard that requires <stdatomic.h> to work in C++ and expose
+    // ::atomic_int (gcc 13 implements it only under -std=c++23; c++20 is not
+    // enough). libc++/clang provides the typedefs at c++17 as an extension —
+    // which is why macOS was green while the ubuntu-gcc leg was red: libc++ vs
+    // libstdc++, not Apple vs Linux. All native C++ in this crate stays on the
+    // same std for consistency.
+    cc::Build::new()
+        .file("native/src/engine/flashkern_engine.cpp")
+        .cpp(true)
+        .std("c++23")
+        .opt_level(3)
+        .warnings(false)
+        .flag("-ffp-contract=off")
+        .flag("-pthread")
+        .include("../kcoro-sys/vendor/kcoro_arena/include")
+        .compile("lfm_flashkern_engine");
+
+    // Flashkern's engine archive consumes the architecture kernels below. Keep
+    // the provider after the consumer so GNU ld sees its symbols while they are
+    // unresolved; Apple ld happens to tolerate the opposite order.
     if arch == "x86_64" {
         println!("cargo::rerun-if-changed=native/kernels/x86_64/flashkern_x86.cpp");
         cc::Build::new()
@@ -57,26 +80,6 @@ fn main() {
         }
         kern.compile("lfm_flashkern_neon");
     }
-
-    println!("cargo::rerun-if-changed=native/src/engine/flashkern_engine.cpp");
-    println!("cargo::rerun-if-changed=../kcoro-sys/vendor/kcoro_arena/include");
-    // C++23, not a style choice: this TU includes kcoro headers, and C++23 is
-    // the FIRST standard that requires <stdatomic.h> to work in C++ and expose
-    // ::atomic_int (gcc 13 implements it only under -std=c++23; c++20 is not
-    // enough). libc++/clang provides the typedefs at c++17 as an extension —
-    // which is why macOS was green while the ubuntu-gcc leg was red: libc++ vs
-    // libstdc++, not Apple vs Linux. All native C++ in this crate stays on the
-    // same std for consistency.
-    cc::Build::new()
-        .file("native/src/engine/flashkern_engine.cpp")
-        .cpp(true)
-        .std("c++23")
-        .opt_level(3)
-        .warnings(false)
-        .flag("-ffp-contract=off")
-        .flag("-pthread")
-        .include("../kcoro-sys/vendor/kcoro_arena/include")
-        .compile("lfm_flashkern_engine");
 
     // The native Mimi decode kernel (docs/MIMI_PORT.md): five active units;
     // mimi_kv.cpp stays parked (the streaming path owns a RotatingKvCache port

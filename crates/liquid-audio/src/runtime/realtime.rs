@@ -2109,7 +2109,10 @@ mod moshi_model {
             .and_then(|ext| ext.to_str())
             .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
         {
-            return Ok(());
+            return Err(Error::Msg(
+                "native realtime Moshi requires safetensors weights; GGUF checkpoints are unsupported"
+                    .into(),
+            ));
         }
 
         let tensors = unsafe { candle_core::safetensors::MmapedSafetensors::multi(&[path])? };
@@ -2408,6 +2411,20 @@ mod moshi_model {
             let err = realtime_moshi_files(&dir).unwrap_err().to_string();
             assert!(err.contains("PyTorch weight layout"), "{err}");
             assert!(err.contains("kyutai/moshiko-candle-bf16"), "{err}");
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn realtime_moshi_files_rejects_gguf_before_dtype_probe() {
+            let dir = temp_dir("emberharmony-moshi-gguf");
+            std::fs::write(dir.join("config.json"), r#"{ "moshi_name": "model.gguf" }"#).unwrap();
+            touch(&dir.join("model.gguf"));
+            touch(&dir.join(DEFAULT_MIMI_NAME));
+            touch(&dir.join(DEFAULT_TEXT_TOKENIZER_NAME));
+
+            let err = realtime_moshi_files(&dir).unwrap_err().to_string();
+            assert!(err.contains("requires safetensors"), "{err}");
+            assert!(err.contains("GGUF"), "{err}");
             std::fs::remove_dir_all(dir).unwrap();
         }
 

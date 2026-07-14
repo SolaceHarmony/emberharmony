@@ -330,6 +330,14 @@ pub fn causal_conv1d_update_fused(
     state: &Tensor,
     w: &Tensor,
 ) -> Result<(Tensor, Tensor)> {
+    if state.dtype() != bcx.dtype() || w.dtype() != bcx.dtype() {
+        candle_core::bail!(
+            "conv1d_update: dtype mismatch bcx {:?} state {:?} w {:?}",
+            bcx.dtype(),
+            state.dtype(),
+            w.dtype()
+        );
+    }
     let bcx = bcx.contiguous()?;
     let state = state.contiguous()?;
     let w = w.contiguous()?;
@@ -345,7 +353,7 @@ pub fn causal_conv1d_update_fused(
 mod tests {
     use super::*;
     use crate::depthwise_conv1d_stream;
-    use candle_core::{Device, Tensor};
+    use candle_core::{DType, Device, Tensor};
 
     fn composed_reference(
         bcx: &Tensor,
@@ -399,6 +407,18 @@ mod tests {
             assert!(dy < 1e-5, "(b{b} d{d} t{t} k{k}) y diff {dy}");
             assert!(ds < 1e-6, "(b{b} d{d} t{t} k{k}) state diff {ds}");
         }
+    }
+
+    #[test]
+    fn fused_update_rejects_mixed_dtypes_before_dispatch() {
+        let dev = Device::Cpu;
+        let bcx = Tensor::zeros((1, 12, 1), DType::F32, &dev).unwrap();
+        let state = Tensor::zeros((1, 4, 2), DType::BF16, &dev).unwrap();
+        let w = Tensor::zeros((4, 3), DType::F32, &dev).unwrap();
+        let err = causal_conv1d_update_fused(&bcx, &state, &w)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("dtype mismatch"), "{err}");
     }
 
     #[cfg(feature = "metal")]

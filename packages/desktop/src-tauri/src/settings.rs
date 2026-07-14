@@ -102,11 +102,9 @@ pub struct DelegateSettings {
 /// Convention throughout: `0` = off (temperature 0 = greedy, top-k 0 = no cutoff).
 ///
 /// Deliberately NOT `Deserialize`/`Default`: three modes have three different
-/// defaults, so a partial stored group must fill from ITS OWN mode's default —
-/// each `Lfm2Settings` field routes through a mode-specific `deserialize_with`
-/// merge. A shared `Default` would silently fill a sparse `tts`/`asr` group
-/// with interleaved values (and schema evolution makes EVERY store's groups
-/// partial the day a field is added).
+/// defaults, so a partial stored group must fill from ITS OWN mode's default.
+/// [`Lfm2Settings`] performs that merge while also migrating the legacy top-level
+/// `maxTokens` field into the interleaved group.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Lfm2ModeSampling {
@@ -208,8 +206,8 @@ fn de_interleaved<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Lfm2ModeSamp
 }
 
 /// Local voice provider config — replaces the old `LFM_*` env vars.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Lfm2Settings {
     pub engine: LocalVoiceEngine,
     /// Optional local snapshot directory containing `config.json`, weights, and tokenizer files.
@@ -227,14 +225,8 @@ pub struct Lfm2Settings {
     /// Per-mode decoding regimes (ASR / TTS / interleaved conversation).
     /// Each field fills absent AND partial stored groups from its own mode's
     /// default — see the `Lfm2ModeSampling` doc for why there is no shared one.
-    #[serde(deserialize_with = "de_asr", default = "Lfm2ModeSampling::asr_default")]
     pub asr: Lfm2ModeSampling,
-    #[serde(deserialize_with = "de_tts", default = "Lfm2ModeSampling::tts_default")]
     pub tts: Lfm2ModeSampling,
-    #[serde(
-        deserialize_with = "de_interleaved",
-        default = "Lfm2ModeSampling::interleaved_default"
-    )]
     pub interleaved: Lfm2ModeSampling,
     /// Hugging Face model id used by the cache/download resolver.
     pub model: Option<String>,
@@ -247,6 +239,93 @@ pub struct Lfm2Settings {
     pub moshi_model: Option<String>,
     pub moshi_revision: Option<String>,
     pub delegate: DelegateSettings,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct Lfm2SettingsSerde {
+    engine: LocalVoiceEngine,
+    model_dir: Option<String>,
+    moshi_model_dir: Option<String>,
+    device: Lfm2Device,
+    vad_threshold: f32,
+    trace: bool,
+    #[serde(deserialize_with = "de_asr", default = "Lfm2ModeSampling::asr_default")]
+    asr: Lfm2ModeSampling,
+    #[serde(deserialize_with = "de_tts", default = "Lfm2ModeSampling::tts_default")]
+    tts: Lfm2ModeSampling,
+    #[serde(
+        deserialize_with = "de_interleaved",
+        default = "Lfm2ModeSampling::interleaved_default"
+    )]
+    interleaved: Lfm2ModeSampling,
+    model: Option<String>,
+    seed: Option<u64>,
+    revision: Option<String>,
+    moshi_model: Option<String>,
+    moshi_revision: Option<String>,
+    delegate: DelegateSettings,
+}
+
+impl Default for Lfm2SettingsSerde {
+    fn default() -> Self {
+        let value = Lfm2Settings::default();
+        Self {
+            engine: value.engine,
+            model_dir: value.model_dir,
+            moshi_model_dir: value.moshi_model_dir,
+            device: value.device,
+            vad_threshold: value.vad_threshold,
+            trace: value.trace,
+            asr: value.asr,
+            tts: value.tts,
+            interleaved: value.interleaved,
+            model: value.model,
+            seed: value.seed,
+            revision: value.revision,
+            moshi_model: value.moshi_model,
+            moshi_revision: value.moshi_revision,
+            delegate: value.delegate,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Lfm2Settings {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+
+        let mut value = serde_json::Value::deserialize(deserializer)?;
+        if let Some(object) = value.as_object_mut() {
+            if !object.contains_key("interleaved") {
+                if let Some(max_tokens) = object.remove("maxTokens") {
+                    object.insert(
+                        "interleaved".into(),
+                        serde_json::json!({ "maxTokens": max_tokens }),
+                    );
+                }
+            } else {
+                object.remove("maxTokens");
+            }
+        }
+        let value: Lfm2SettingsSerde = serde_json::from_value(value).map_err(D::Error::custom)?;
+        Ok(Self {
+            engine: value.engine,
+            model_dir: value.model_dir,
+            moshi_model_dir: value.moshi_model_dir,
+            device: value.device,
+            vad_threshold: value.vad_threshold,
+            trace: value.trace,
+            asr: value.asr,
+            tts: value.tts,
+            interleaved: value.interleaved,
+            model: value.model,
+            seed: value.seed,
+            revision: value.revision,
+            moshi_model: value.moshi_model,
+            moshi_revision: value.moshi_revision,
+            delegate: value.delegate,
+        })
+    }
 }
 
 fn home_dir() -> Option<PathBuf> {
@@ -506,6 +585,34 @@ mod tests {
         assert_eq!(v.lfm2.tts.audio_top_k, 64);
         assert_eq!(v.lfm2.engine, LocalVoiceEngine::MoshiRealtime);
         assert_eq!(v.lfm2.moshi_model.as_deref(), Some(DEFAULT_MOSHI_MODEL));
+    }
+
+    #[test]
+    fn legacy_max_tokens_migrates_to_interleaved_budget() {
+        let json = serde_json::json!({
+            "lfm2": {
+                "maxTokens": 1536
+            }
+        });
+        let value = decode_voice_settings(json).unwrap();
+        assert_eq!(value.lfm2.interleaved.max_tokens, 1536);
+        assert_eq!(value.lfm2.interleaved.audio_top_k, 4);
+
+        let stored = serde_json::to_value(value).unwrap();
+        assert_eq!(stored["lfm2"]["interleaved"]["maxTokens"], 1536);
+        assert!(stored["lfm2"].get("maxTokens").is_none());
+    }
+
+    #[test]
+    fn interleaved_group_wins_over_legacy_max_tokens() {
+        let json = serde_json::json!({
+            "lfm2": {
+                "maxTokens": 1536,
+                "interleaved": { "maxTokens": 4096 }
+            }
+        });
+        let value = decode_voice_settings(json).unwrap();
+        assert_eq!(value.lfm2.interleaved.max_tokens, 4096);
     }
 
     #[test]
