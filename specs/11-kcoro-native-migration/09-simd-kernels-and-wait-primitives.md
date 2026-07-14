@@ -46,7 +46,7 @@ lifecycle notification at
 `crates/kcoro-sys/vendor/kcoro_arena/core/src/kc_runtime.c:225-324`.
 Flashkern commit `d2c43abd` owns cache-line-isolated shared dispatch and fence
 words and blocks through prepared `kc_port_wait_u32` handles at
-`native/src/engine/flashkern_engine.cpp:625-653` and `1032-1049`;
+`native/src/engine/flashkern_engine.cpp:634-662` and `1041-1052`;
 `FENCE_SPIN`, `kcoro_park`, and `kcoro_unpark` are absent.
 
 | Current work in Rust | Evidence | Required native owner |
@@ -56,7 +56,7 @@ words and blocks through prepared `kc_port_wait_u32` handles at
 | Conformer and adapter tensor graph | `crates/liquid-audio/src/model/conformer/encoder.rs:185-317` and `crates/liquid-audio/src/model/lfm2_audio.rs:403-419` | C++ pass plan over kernel-table entries |
 | sampling and token recurrence | `crates/liquid-audio/src/model/lfm2_audio.rs:199-262` and `1630-1733` | native sampler/state append plus Rust kcoro recurrence policy over compact result IDs |
 | Moshi frame arithmetic/state | `crates/liquid-audio/src/runtime/realtime.rs:1850-2065` | native Moshi pass program |
-| native pass entered through Rust capture/trampoline | `crates/liquid-audio/src/compute/flashkern/native_engine.rs:94-170` and `300-394` | model-bound C++ plan with no Rust callback |
+| native pass entered through Rust capture/trampoline | `crates/liquid-audio/src/compute/flashkern/native_engine.rs:544-593` and `native/src/engine/flashkern_engine.cpp:1283-1291` | model-bound C++ plan with no Rust callback |
 | aarch64 feature flags applied to the whole kernel translation unit | `crates/liquid-audio/build.rs:45-58` | baseline and BF16/I8MM objects compiled separately; C++ binds one table after capability checks |
 | hot-call panel storage and packing | `crates/liquid-audio/native/kernels/aarch64/flashkern_neon.cpp:74-162` and `native/kernels/x86_64/flashkern_x86.cpp:74-154` | prepack immutable weights at model open and reserve mutable scratch in the plan; no `std::vector`, resize, assign, or payload repack in a pass |
 | scalar/libm activation and softmax loops | `flashkern_neon.cpp:942-968` and `flashkern_x86.cpp:756-788` | fixed-shape house vector transcendental kernels with test-only scalar oracle |

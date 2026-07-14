@@ -30,6 +30,7 @@ The migration starts with useful tests, not a blank slate:
 | lane/fanout numerical tests | `src/compute/flashkern/fanout.rs:1251-1888` and architecture kernel modules | Move stable fixture vectors into native tests. |
 | engine idle/zero-spin test | `tests/engine_idle_zero_spin.rs` | Extend to coordination signal-one and fixed-executor blocking wait/syscall assertions. |
 | Rust coordinator races and edge tests | `crates/kcoro/tests/` at `3a5b1431` | Preserve 100,000 terminal races, ring wrap/full/close, self-wake exclusion, and stop-admission teardown on every host. Extend with cross-language and scope-doorbell gates. |
+| mounted Rust broker/CQ lifecycle | `src/compute/flashkern/coordinator.rs` and `native_engine.rs:1551-1625` at `4f06a3d5` | Preserve missing-broker rejection, exact descriptor cleanup, 10,000 mounted passes, zero live slots, endpoint joins, arm64/x86 execution, and idle-CPU checks. Extend to one million passes and stop-during-active-pass races. |
 | speculative prefill and cache tests | `tests/speculative_prefill.rs`, `tests/cache_equivalence.rs` | Re-express against native conversation marks and suffix state. |
 | end-to-end generation | `tests/e2e_generate.rs` | Pin full token/text/audio-code traces and state hashes. |
 | native Mimi parity | `tests/mimi_native_parity.rs` | Retain full-length comparison, KV wrap, and direct-output variant. |
@@ -230,6 +231,12 @@ Both 100,000-iteration operation and ticket terminal-race gates run inside each
 sanitizer job. A lower default iteration count is not evidence for this gate; if
 a runner cannot complete it, move the job to a supported runner rather than
 self-skipping green.
+
+Current evidence at `4f06a3d5` is deliberately narrower: the native C++ bridge
+harness passes ASan+UBSan and TSan at 10,000 passes. A whole-program Rust TSan
+build with sanitizer-built `std` faults before test startup on the local macOS
+toolchain, so it is not a passing mount result. The supported Linux/macOS CI gate
+above remains required.
 
 ## Interrupt and Lifecycle Matrix
 

@@ -5,7 +5,7 @@ direction and binds every layer boundary. Subsystem documents own their
 mechanics. The package head and documents 00, 01, 03, 07, 10, 11, and 12 are
 reconciled to this contract in the same implementation series.
 
-## Implemented Foundation And Open Mount
+## Implemented Foundation And First Production Mount
 
 Commit `3a5b1431` adds `crates/kcoro` as a dependency-free Rust coordination
 kernel:
@@ -21,19 +21,31 @@ kernel:
   only descriptor identity and policy. Completion preserves execution, state,
   publication, and cause plus up to eight inline token/codebook IDs.
 
-That commit is foundation evidence, not a product-mount claim. The following
-remain open:
+Commits `2a2adcea`, `95069bd5`, and `fa35a624` add the native SQ/CQ leaf,
+Flashkern mount, and retained descriptor pool. Commit `4f06a3d5` mounts the
+first production Rust endpoint owner:
 
-- expose the ring leaves through the private C ABI and bind them to Flashkern's
-  native doorbell/wait-word adapter;
-- replace the blocking `NativeEngine` rim with one Rust broker per fixed board;
+- one fixed-capacity broker future is the sole native SQ producer;
+- one dedicated ingress thread is the sole native CQ consumer and blocks in
+  the expected-value wait adapter without polling;
+- callback admission uses preallocated generation-protected result slots;
+- ingress validates ticket, conversation, and epoch before resolving exactly
+  one slot and waking the broker continuation;
+- teardown clears the C++ callback, closes bridge admission, joins ingress and
+  the Rust executor, then permits native bridge/lane destruction;
+- the C++ compatibility call remains synchronously blocked only because its
+  current pass descriptor borrows Candle-owned tensor pointers.
+
+The following remain open:
+
+- replace borrowed request storage with retained native pass slots and remove
+  the blocking compatibility caller;
 - connect scope transitions to one exact control doorbell and bounded wake
   propagation;
 - implement service-class fairness, age promotion, pinned QoS, and measured
   callback-to-continuation budgets;
-- move child ticket ownership out of `flashkern_engine.cpp`, then delete the C
-  policy scheduler from the product path while retaining its tests as the
-  conformance oracle.
+- move child ticket identity and recurrence policy out of `flashkern_engine.cpp`;
+- mount Tauri's persistent docking ring, native audio, and the full scope tree.
 
 ### Foundation source map
 
@@ -46,6 +58,9 @@ remain open:
 | inherited pause/cancel epochs | `crates/kcoro/src/scope.rs:61-110` | one local word update; descendants derive the strongest ancestor control at a pass boundary |
 | fixed control records | `crates/kcoro/src/protocol.rs:135-260` | 128-byte aligned cells, generation-protected descriptor identity, four terminal facts, eight inline results |
 | race and lifecycle gates | `crates/kcoro/tests/terminal_race.rs:30`, `edge_runtime.rs:19`, `scope_control.rs:4`, `sq_cq.rs:20` | 100,000 terminal races plus wake, panic, stop, scope, capacity, wrap, and ABI tests |
+| sole SQ producer and exact slot admission | `crates/liquid-audio/src/compute/flashkern/coordinator.rs:155-380` at `4f06a3d5` | fixed slots/ring, nonwrapping generations, no per-pass allocation, one pending native command |
+| sole CQ ingress and teardown | `coordinator.rs:383-431`, `542-568`; `native_engine.rs:802-826` at `4f06a3d5` | blocking edge wait, exact identity validation, callback clearing, endpoint joins before bridge destroy |
+| mounted lifecycle gates | `native_engine.rs:1551-1625` at `4f06a3d5` | missing broker rejects without a descriptor leak; 10,000 mounted passes prove SQ/CQ/descriptor/result accounting |
 
 ## The Contract
 

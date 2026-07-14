@@ -8,7 +8,8 @@ Audit ancestry: EmberHarmony `321538f11749`; `kcoro_arena` `447d04f0246b`.
 Committed substrate: upstream arena `bd530f4c9196` (ticket/wait implementation
 `bcdc03d1a073`), Ember vendor `8d510f83`, shared-doorbell executor `d2c43abd`,
 percentile harness `3625df4e`, Rust coordinator foundation `3a5b1431`, native
-SQ/CQ leaf `2a2adcea`, and production bridge mount `95069bd5`.
+SQ/CQ leaf `2a2adcea`, production bridge mount `95069bd5`, retained descriptor
+pool `fa35a624`, and production Rust broker/CQ mount `4f06a3d5`.
 
 ## Mission
 
@@ -353,11 +354,17 @@ zero inference file I/O.
   task reuse, inherited scope words, 128-byte submission/completion records, and
   edge-woken bounded SPSC rings. Its 100,000 terminal races, self-wake,
   stop-admission, wrap/full/close, and scope tests run in CI.
-- **Committed bridge (`2a2adcea`, `95069bd5`):** the C ABI mirrors Rust's
+- **Committed bridge (`2a2adcea`, `95069bd5`, `fa35a624`):** the C ABI mirrors Rust's
   fixed records; a native-owned bounded SQ/CQ with prepared doorbells is mounted
-  in Flashkern, reserves CQ capacity before admission, and replaces the C arena
-  ticket/callback detour. Rust endpoint ownership and CQ promise routing remain
-  open.
+  in Flashkern, reserves CQ capacity before admission, retains generation-checked
+  descriptor leases through CQ consumption, and replaces the C arena
+  ticket/callback detour.
+- **Committed first Rust mount (`4f06a3d5`):** one fixed-capacity Rust broker is
+  the sole SQ producer and one dedicated zero-poll ingress thread is the sole CQ
+  consumer. The C++ compatibility call enters a preallocated Rust result slot
+  and blocks only to keep its borrowed tensor pointers live; CQ ingress resolves
+  that exact slot and wakes the broker continuation. C++ no longer calls the SQ
+  submit or CQ wait leaf directly.
 - Connect scope pause/cancel transitions to one root control doorbell and bounded
   continuation propagation; `3a5b1431` implements the inherited words but not
   the mounted wake subscription.
@@ -365,8 +372,9 @@ zero inference file I/O.
   budgets. `ServiceClass` is currently an ABI fact, not implemented scheduling.
 - Keep the persistent fixed-worker executor on ordinary C++ stacks with no
   `LaneFrame` PCs. The mounted single-slot compatibility rim copies one bounded
-  control record and no payload; the Rust broker must take sole SQ ownership
-  and replace its blocking CQ wait.
+  control record and no payload. Rust now owns SQ/CQ progress; the remaining
+  block is the caller-lifetime guard for borrowed Candle pointers, not queue
+  ownership.
 - Preserve atomic tile claim boards and generation correctness while using the
   committed shared dispatch/fence words and immediate register/recheck/block.
 - Move single-shot child ticket ownership into Rust, retain native pass slots by
@@ -379,10 +387,11 @@ zero inference file I/O.
   transitional typed-callback boundary on ordinary fixed worker stacks; D8
   removes it after independent parity fixtures.
 
-Exit: the mounted native substrate portion of G3 has committed race, parity,
-idle, wake-accounting, sanitizer, Rosetta, and percentile evidence. The Rust
-broker/CQ ingress, retained descriptor pool, scope doorbell, million-pass, and
-full token/frame gates remain open and run again at D8 product cutover.
+Exit: the mounted native substrate and first Rust endpoint owner have committed
+race, parity, idle, wake-accounting, sanitizer, Rosetta, and percentile evidence.
+Scope doorbells, service-class fairness, Rust-owned recurrence/child tickets,
+million-pass, and full token/frame gates remain open and run again at D8 product
+cutover.
 
 ### D4 - Native kernel and wait substrate
 
@@ -445,11 +454,15 @@ Exit: the model-frontend portion of G6.
 - **Implemented deletion (`d2c43abd` ancestry):** the stackful dispatcher, 512
   KiB saved lane stacks, context-switch assembly, and old kcoro source tree are
   gone.
-- **Implemented bridge cutover (`2a2adcea`, `95069bd5`):** final-lane
+- **Implemented bridge cutover (`2a2adcea`, `95069bd5`, `fa35a624`):** final-lane
   completion now enters the native CQ, and the C arena runtime/ticket/callback
-  path is absent from the production engine archive. Mount callback-driven
-  recurrence in Rust kcoro, then delete the remaining blocking compatibility
-  handback. Git history is the only fallback.
+  path is absent from the production engine archive. Descriptor leases survive
+  through CQ consumption.
+- **Implemented endpoint ownership (`4f06a3d5`):** the Rust broker submits SQ
+  cells and dedicated Rust ingress consumes CQ cells and wakes the exact
+  continuation. Callback-driven recurrence, scope control, and owned native
+  pass slots remain before the borrowed-pointer compatibility handback can be
+  deleted. Git history is the only fallback.
 
 Exit: G3, G7, and G8 run on the mounted product path. An entire multiturn LFM2
 reply runs without Tauri/webview participation and with no host polling; release

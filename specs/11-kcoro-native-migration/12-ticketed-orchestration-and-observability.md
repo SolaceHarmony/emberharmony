@@ -3,8 +3,10 @@
 Status: normative design. The C arena ticket machinery is retained as a
 conformance oracle at upstream `bd530f4c9196`; the Rust coordination foundation
 is implemented at `3a5b1431`, and the native SQ/CQ leaf is implemented and
-mounted at `2a2adcea` and `95069bd5`. Rust broker ownership, parent actors,
-recurrence, Tauri projection, and the visualizer remain open.
+mounted at `2a2adcea` and `95069bd5`. Retained descriptors land at `fa35a624`,
+and first Rust broker/CQ ownership lands at `4f06a3d5`. Parent actors,
+service-class policy, recurrence, Tauri projection, and the visualizer remain
+open.
 
 Baselines: EmberHarmony `321538f11749`; `kcoro_arena` `447d04f0246b`.
 
@@ -57,10 +59,11 @@ SQ/CQ in Flashkern. `submit_pass` publishes one fixed command cell;
 lane 0 publishes one exact completion after the program-final fence. The
 production engine archive no longer imports `kc_ticket_*` or `kc_runtime_*`.
 
-The native leaf is mounted, but the parent orchestration shown below is not.
-The production Rust caller still blocks on the compatibility CQ wait, the Rust
-executor does not yet own SQ admission or CQ promise routing, and no ticket
-telemetry crosses Tauri.
+At `4f06a3d5`, the Rust executor owns SQ admission and dedicated CQ ingress owns
+exact result routing. The compatibility caller still blocks on its preallocated
+result slot because the current pass borrows Candle pointers; it does not own or
+poll the CQ. Parent orchestration, service queues, recurrence, and ticket
+telemetry across Tauri are not mounted.
 
 ```mermaid
 flowchart LR
@@ -679,35 +682,37 @@ high-water mark so a model plan cannot silently consume the lifecycle reserve.
    ticket/callback path is deleted from the production engine.
 3. **Implemented foundation (`3a5b1431`):** `crates/kcoro` owns exact promises,
    bounded workers/rings, scope words, and the 128-byte SQ/CQ record definitions.
-   Its protocol is mirrored by the mounted native leaf; production endpoint and
-   promise ownership remain open.
-4. Extend the private bridge ABI with descriptor retain/release, value ticket IDs,
-   bounded kernel snapshots, observer registration, and capability bits. Do not
-   export pass descriptors or ticket handles.
-5. Add semantic and telemetry sink classes to coordinator/notification code. Give
+4. **Implemented endpoint mount (`fa35a624`, `4f06a3d5`):** the private bridge
+   retains descriptor leases through CQ consumption; one Rust broker owns SQ,
+   one ingress thread owns CQ, and exact preallocated result slots close the
+   callback-to-continuation edge. Parent/child recurrence policy remains open.
+5. Extend the private bridge ABI with bounded kernel snapshots, observer
+   registration, and capability bits. Do not export pass descriptors or ticket
+   handles.
+6. Add semantic and telemetry sink classes to coordinator/notification code. Give
    telemetry independent capacity, coalescing, and drop counters.
-6. Add `native/observe.rs` and `native/status.rs` under
+7. Add `native/observe.rs` and `native/status.rs` under
    `packages/desktop/src-tauri/src/voice/`; keep the existing reliable
    `VoiceEvent` bridge logically separate.
-7. Add `voice_kernel_status`, `voice_kernel_observe`, and
+8. Add `voice_kernel_status`, `voice_kernel_observe`, and
    `voice_kernel_unobserve` commands beside the current command definitions in
    `voice/control.rs:365-516` and register them in the command list at
    `packages/desktop/src-tauri/src/lib.rs:293-316`.
-8. Add nested `KernelSettings` defaults/validation/round-trip tests in
+9. Add nested `KernelSettings` defaults/validation/round-trip tests in
    `packages/desktop/src-tauri/src/settings.rs`, then add the corresponding
    advanced controls to `packages/app/src/components/settings-voice.tsx` and
    localized labels.
-9. Add TypeScript observer types/functions beside
+10. Add TypeScript observer types/functions beside
    `packages/app/src/lib/voice-settings.ts:179-240`.
-10. Add coalesced kernel state to `createDesktopVoice` at
+11. Add coalesced kernel state to `createDesktopVoice` at
    `packages/app/src/context/voice.tsx:88-164`; do not add it to the browser
    provider.
-11. Extend the `NativeVoiceMeter` invocation at
+12. Extend the `NativeVoiceMeter` invocation at
    `prompt-input.tsx:2130-2144` and implementation at `2253-2274` with truthful
    signal selection.
-12. Add diagnostics only through bounded snapshots. Do not render or serialize
+13. Add diagnostics only through bounded snapshots. Do not render or serialize
     region pointers, payload bytes, per-tile events, or raw native structs.
-13. Update `VOICE_ARCHITECTURE.md` and `FRONTEND_DESIGN.md` in place at product
+14. Update `VOICE_ARCHITECTURE.md` and `FRONTEND_DESIGN.md` in place at product
     cutover; Git history is the old architecture record.
 
 ## Acceptance Gates

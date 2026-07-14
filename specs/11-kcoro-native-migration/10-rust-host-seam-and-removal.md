@@ -223,12 +223,15 @@ generic application executor. Commit `3a5b1431` provides:
 - single-owner ring endpoints that register, recheck, and wake without polling.
 
 The implementation allocates futures and wakers only when spawning bounded
-coordination work. Publish, wake, and resume reuse preallocated storage. The
-remaining product mount must add platform QoS, service-class fairness,
-scope-doorbell subscriptions, retained native descriptors, and Rust ownership
-of the mounted C ABI ring leaf. Commits `2a2adcea` and `95069bd5` implement and
-mount that native leaf, but the current blocking `NativeEngine` compatibility
-rim remains production truth until dedicated CQ ingress resolves Rust promises.
+coordination work. Publish, wake, and resume reuse preallocated storage. Commits
+`2a2adcea`, `95069bd5`, and `fa35a624` implement the native ring and retained
+descriptor leaf. Commit `4f06a3d5` makes one Rust broker the sole SQ producer
+and one dedicated ingress thread the sole CQ consumer; callback admission and
+result routing use preallocated generation-protected slots. The current
+`NativeEngine` compatibility call still blocks, but only to retain borrowed
+Candle pointers until the exact completion arrives. Remaining mount work is
+owned native pass storage, platform QoS, service-class fairness, scope-doorbell
+subscriptions, recurrence, and the Tauri docking ring.
 
 The coordinator may handle token IDs, ticket IDs, epochs, causes, service
 classes, deadlines, and descriptor IDs. It may not dereference a descriptor or
