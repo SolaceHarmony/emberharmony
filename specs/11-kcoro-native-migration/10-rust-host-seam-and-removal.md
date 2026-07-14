@@ -162,7 +162,8 @@ Requirements:
   or the movable coordination ready queue.
 - a release link-map audit rejects `kc_*`, channel, ticket callback, WAL, store,
   and workflow symbols from `lfm_voice_kernels`. The executor target may link the
-  narrow kernel/ticket completion core but not durable services.
+  narrow SQ/CQ bridge and wait-word core but not the C actor/ticket runtime or
+  durable services.
 - test oracles are separate object code and absent from the release link graph.
   A missing production ISA returns `LFM_UNSUPPORTED_BACKEND`; it never selects a
   scalar C++ or Rust implementation.
@@ -224,8 +225,10 @@ generic application executor. Commit `3a5b1431` provides:
 The implementation allocates futures and wakers only when spawning bounded
 coordination work. Publish, wake, and resume reuse preallocated storage. The
 remaining product mount must add platform QoS, service-class fairness,
-scope-doorbell subscriptions, and private C ABI ring leaves. Until those exist,
-the current blocking `NativeEngine` rim remains production truth.
+scope-doorbell subscriptions, retained native descriptors, and Rust ownership
+of the mounted C ABI ring leaf. Commits `2a2adcea` and `95069bd5` implement and
+mount that native leaf, but the current blocking `NativeEngine` compatibility
+rim remains production truth until dedicated CQ ingress resolves Rust promises.
 
 The coordinator may handle token IDs, ticket IDs, epochs, causes, service
 classes, deadlines, and descriptor IDs. It may not dereference a descriptor or
@@ -447,7 +450,7 @@ tests is not a gate.
 - Release link maps contain architecture kernels and approved native adapters,
   but no test oracle object and no scalar or Rust fallback.
 - Release link maps prove numerical kernel objects are kcoro-free, the executor
-  contains only the narrow SQ/CQ/ticket completion dependency, and durable
+  contains only the narrow SQ/CQ and wait-word dependency, and durable
   objects are absent from the realtime graph unless the configured capability is
   enabled.
 - TypeScript/Bun receives no PCM or model-state payload.

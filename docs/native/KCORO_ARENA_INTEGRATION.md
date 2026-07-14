@@ -9,7 +9,8 @@ Pinned foundations:
 - Ember vendor `8d510f83`;
 - fixed shared-doorbell Flashkern executor `d2c43abd`;
 - percentile harness `3625df4e`;
-- Rust kcoro coordinator foundation `3a5b1431`.
+- Rust kcoro coordinator foundation `3a5b1431`;
+- native SQ/CQ bridge `2a2adcea` and Flashkern mount `95069bd5`.
 
 Normative design:
 
@@ -33,8 +34,9 @@ Eight facts prevent the wrong integration:
    frames.
 2. `crates/kcoro` is the target product policy scheduler. It owns Rust futures,
    scopes, tickets, promises, service policy, and recurrence decisions.
-3. `kcoro_arena` is the C conformance oracle and current native wait/ticket
-   substrate. Its actor scheduler is not the target product policy owner.
+3. `kcoro_arena` is the C conformance oracle and current native wait-word
+   substrate. Its ticket/actor runtime is no longer on Flashkern's production
+   pass path and is not the target product policy owner.
 4. Tauri is a host, not a scheduler. Realtime progress cannot require a Tauri
    task, webview IPC, telemetry delivery, polling, or a monitoring loop.
 5. C++ owns every numerical pointer and operation, including sampling and state
@@ -57,22 +59,26 @@ The production path is still transitional:
   `crates/liquid-audio/src/compute/flashkern/native_engine.rs:225-790` wraps one
   process-wide native engine and serializes blocking calls with `pass_lock`;
 - `submit_pass` at
-  `crates/liquid-audio/native/src/engine/flashkern_engine.cpp:1088` creates one C
-  arena ticket, rings the fixed lanes, and blocks the Rust caller until
-  `pass_complete` at line 1076 publishes the callback;
-- the native engine has one pointer-stable `Pass` at line 76, one `Stage` board
-  at line 113, one `Fence` at line 128, and one single-pass claim at lines
-  395-401;
+  `crates/liquid-audio/native/src/engine/flashkern_engine.cpp:1127` publishes one
+  128-byte SQ cell and blocks the compatibility caller on the CQ edge;
+- `bridge_main` at `flashkern_engine.cpp:1098-1124` validates the native
+  descriptor generation and rings the fixed lanes; lane 0 publishes the exact
+  completion at `1049-1072`;
+- the native engine has one pointer-stable `Pass` at line 81, one `Stage` board
+  at line 118, one `Fence` at line 133, and one single-pass claim at lines
+  392-402;
 - `lane_fence` at line 625 performs immediate expected-value blocking with no
   spin tier; `run_stage` at line 661 retains atomic tile fan-out;
-- `REQ_CALL` remains request kind 5 at line 144 and enters Rust callbacks through
-  `lfm_engine_call` at lines 1203-1211;
+- `REQ_CALL` remains request kind 5 at line 149 and enters Rust callbacks through
+  `lfm_engine_call` at lines 1229-1237;
 - sampling, turn/frame policy, audio ownership, and large parts of model
   inference still live in Rust/Candle;
-- `crates/kcoro` is built and tested but is not yet connected to Flashkern.
+- `crates/kcoro` protocol records are mirrored by the mounted C ABI, but its
+  executor, promises, scopes, service policy, and broker are not yet the
+  production owner.
 
-Do not describe `crates/kcoro` as production-mounted until the private C bridge,
-broker, and product lifecycle gates below pass.
+Do not describe the Rust coordinator as production-mounted until the broker,
+dedicated CQ ingress, and product lifecycle gates below pass.
 
 ## Implemented Rust Foundation
 
@@ -90,7 +96,7 @@ Commit `3a5b1431` adds a dependency-free coordination kernel:
 
 The foundation deliberately does not yet provide:
 
-- a cross-language shared ring or private C bridge;
+- production ownership of the mounted native bridge or CQ ingress;
 - scope-change wake propagation;
 - deadline/interactive/background queue arbitration;
 - worker affinity or platform QoS;
@@ -209,24 +215,30 @@ The ingress thread is part of the runtime kernel, not Tauri. This shape avoids
 executing a Rust callback on the final compute lane while still making the CQ
 doorbell the only cause of forward progress.
 
-Suggested private leaf operations:
+Mounted private leaf operations (`2a2adcea`, `95069bd5`):
 
 ```c
 int lfm_kernel_bridge_create(const LfmKernelBridgeConfigV1 *,
                              LfmKernelBridge **out);
-int lfm_kernel_descriptor_retain(LfmKernelBridge *, LfmDescriptorIdV1);
-int lfm_kernel_descriptor_release(LfmKernelBridge *, LfmDescriptorIdV1);
-int lfm_kernel_submit(LfmKernelBridge *, const KcSubmissionV1 *);
-int lfm_kernel_wait_completion(LfmKernelBridge *, KcCompletionV1 *out,
-                               uint64_t deadline_ns);
-void lfm_kernel_request_stop(LfmKernelBridge *);
-int lfm_kernel_join(LfmKernelBridge *);
+int lfm_kernel_bridge_submit(LfmKernelBridge *, const KcSubmissionV1 *);
+int lfm_kernel_bridge_wait_submission(LfmKernelBridge *, KcSubmissionV1 *out,
+                                      uint64_t deadline_ns);
+int lfm_kernel_bridge_publish_completion(LfmKernelBridge *,
+                                         const KcCompletionV1 *);
+int lfm_kernel_bridge_wait_completion(LfmKernelBridge *, KcCompletionV1 *out,
+                                      uint64_t deadline_ns);
+void lfm_kernel_bridge_request_stop(LfmKernelBridge *);
+int lfm_kernel_bridge_snapshot(LfmKernelBridge *, LfmKernelBridgeSnapshotV1 *);
 int lfm_kernel_bridge_destroy(LfmKernelBridge *);
 ```
 
-`lfm_kernel_wait_completion` is a blocking edge wait, not a status query. It
+`lfm_kernel_bridge_wait_completion` is a blocking edge wait, not a status query. It
 returns one already published cell, stop, timeout for a declared timer, or a
 typed fault. A zero-duration retry loop is forbidden.
+
+The retained descriptor slot pool and its generation-checked retain/release
+operations remain the next bridge ABI slice. The current compatibility mount
+validates one native slot/generation and does not claim to implement that pool.
 
 ## Broker And Ticket Flow
 
@@ -292,7 +304,7 @@ the docking ring and has global scope. Neither waits on the other.
 
 The fixed lane team remains ordinary C++:
 
-- `Engine` at `flashkern_engine.cpp:309` owns stable workers, shared pass/stage
+- `Engine` at `flashkern_engine.cpp:314` owns stable workers, shared pass/stage
   state, scratch, and prepared wait words;
 - `lane_program` at line 1000 executes a complete typed request;
 - `lane_fence` at line 625 records arrival and the logical waiter mask, rechecks
@@ -405,30 +417,45 @@ Status: complete at `3a5b1431`.
 
 ### C. Private bridge and conformance
 
-Status: next.
+Status: native leaf mounted at `2a2adcea` and `95069bd5`; Rust ownership is open.
 
-1. Add the C mirror of `Submission`/`Completion` and layout tests.
-2. Add native descriptor slot/generation retain/release.
-3. Add one native-owned SQ/CQ pair and prepared doorbell waits.
-4. Add the dedicated Rust CQ ingress thread.
-5. Run full/wrap/close/stale-generation/stop races across the real FFI.
-6. Prove pointer identity from descriptor slot through lane reads.
+Completed:
+
+1. C11/C++ mirror of `Submission`/`Completion`, with size, alignment, and offset
+   checks against Rust.
+2. Native-owned bounded SPSC SQ/CQ with admission-time CQ reservation and
+   prepared expected-value doorbells.
+3. Full, wrap, out-of-order, incompatible-ABI, stop, and 1,000 submit/stop race
+   tests across the real FFI.
+4. Production Flashkern dispatch through descriptor slot 0 with a monotonically
+   recycled generation; the C arena ticket/callback/condvar detour is deleted.
+5. 10,000-pass debug/release/arm64/x86-Rosetta soaks, ASan/UBSan, TSan, numerical
+   parity, raw concurrent-admission rejection, and 0.005-0.006% idle CPU evidence.
+
+Open:
+
+1. Replace the compatibility single slot with an explicit retained descriptor
+   slot pool and generation-checked retain/release API.
+2. Add the dedicated Rust CQ ingress owner and promise routing.
+3. Add stable-address and zero-payload-copy counters to the product snapshot.
 
 Gate: no payload copy, no polling, one CQ reservation per accepted SQ entry,
 one exact Rust promise resolution, zero callback execution on a compute lane.
+All but Rust promise routing and product descriptor-pool evidence have passed.
 
 ### D. Rust broker mount
 
-Status: open after C.
+Status: open on the mounted native leaf.
 
 1. Add one `KernelBroker` per board.
 2. Add bounded deadline/interactive/background admission.
-3. Route current blocking pass tests through broker SQ/CQ.
+3. Replace the current blocking compatibility wait with broker submission and
+   dedicated CQ-to-promise routing.
 4. Compare output, state, wake counts, allocations, and p50/p95/p99/max against
    the frozen blocking baseline.
 5. Add scope doorbell, pause/resume/cancel, and stop-before-queued-prepare gates.
-6. Move child ticket ownership from C to Rust and remove the duplicate C policy
-   callback from the mounted path.
+6. Move child ticket ownership into Rust. The duplicate C ticket policy callback
+   was removed from the mounted path at `95069bd5`.
 
 Gate: one million pass cycles, 100,000 stop/complete races, no continuation
 overlap, bounded drain fairness, zero idle polling, and no teardown leaks.
@@ -556,6 +583,8 @@ Implemented and pinned:
 - fixed zero-spin executor: `d2c43abd`;
 - percentile harness: `3625df4e`;
 - Rust coordinator foundation: `3a5b1431`;
+- native SQ/CQ leaf and ABI gates: `2a2adcea`;
+- production Flashkern bridge mount and C ticket-runtime deletion: `95069bd5`;
 - Rust gates: 7 executor/lifecycle tests, 2 scope tests, 4 SQ/CQ/protocol
   tests, and 2 terminal tests including 100,000 races;
 - C Cargo gates: ticket lifecycle and wait-word tests;
@@ -564,11 +593,10 @@ Implemented and pinned:
 
 Still required before product cutover:
 
-1. private cross-language bridge and native-owned SQ/CQ;
-2. Rust CQ ingress and one broker per board;
-3. scope doorbell propagation and service-class fairness;
-4. child-ticket ownership transfer from C to Rust;
-5. typed pass replacement and `REQ_CALL` deletion;
-6. native audio/VAD and Tauri docking-ring mount;
-7. complete LFM2/Moshi Candle removal;
-8. million-pass, sanitizer/race, latency, app, and teardown evidence.
+1. retained native descriptor pool plus Rust CQ ingress and one broker per board;
+2. scope doorbell propagation and service-class fairness;
+3. child-ticket ownership and exact promise routing in Rust;
+4. typed pass replacement and `REQ_CALL` deletion;
+5. native audio/VAD and Tauri docking-ring mount;
+6. complete LFM2/Moshi Candle removal;
+7. million-pass, latency, app, and full product teardown evidence.

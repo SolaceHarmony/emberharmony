@@ -1,9 +1,10 @@
 # Ticketed Orchestration, Tauri Observability, And Visualizer Contract
 
-Status: normative design. Pass-level arena tickets and exact native callbacks are
-implemented at upstream `bd530f4c9196` and executor `d2c43abd`; the Rust
-coordination foundation is implemented at `3a5b1431`. Cross-language mounting,
-parent actors, recurrence, Tauri projection, and the visualizer remain open.
+Status: normative design. The C arena ticket machinery is retained as a
+conformance oracle at upstream `bd530f4c9196`; the Rust coordination foundation
+is implemented at `3a5b1431`, and the native SQ/CQ leaf is implemented and
+mounted at `2a2adcea` and `95069bd5`. Rust broker ownership, parent actors,
+recurrence, Tauri projection, and the visualizer remain open.
 
 Baselines: EmberHarmony `321538f11749`; `kcoro_arena` `447d04f0246b`.
 
@@ -25,8 +26,8 @@ the voice visualizer. It is never the callback that permits recurrence.
 
 ## Initial Implementation Status
 
-The first child-pass slice is committed at upstream `bd530f4c9196`, vendor
-`8d510f83`, and executor `d2c43abd`:
+The first exact-terminal oracle is committed at upstream `bd530f4c9196` and
+vendor `8d510f83`:
 
 - `kcoro_arena/include/kc_ticket.h` defines the versioned ticket/event/completion
   ABI and generation identity;
@@ -35,8 +36,6 @@ The first child-pass slice is committed at upstream `bd530f4c9196`, vendor
   one reserved terminal-delivery reference;
 - `kcoro_arena/core/src/kc_runtime.c:327-370` delivers callbacks on coordination
   workers, separate from numerical lanes;
-- `flashkern_engine.cpp:1088-1144` creates one child ticket per full pass, and
-  lane 0 completes it only after the program-final fence;
 - a one-slot, 100,000-iteration complete/cancel race and the Cargo integration
   test prove one callback and no slot-reuse gap after `run_until_idle`.
 
@@ -52,9 +51,16 @@ words, and 128-byte command/completion records. The CQ record preserves the
 four terminal facts and up to eight inline token/codebook IDs; it intentionally
 contains no timing telemetry.
 
-Neither substrate is mounted as the parent orchestration shown below. The
-production Rust caller still blocks for the C child callback, the Rust ring is
-not yet shared with C++, and no ticket telemetry crosses Tauri.
+Commits `2a2adcea` and `95069bd5` add the C mirror and mount one native-owned
+SQ/CQ in Flashkern. `submit_pass` publishes one fixed command cell;
+`bridge_main` validates the native descriptor generation and rings the lanes;
+lane 0 publishes one exact completion after the program-final fence. The
+production engine archive no longer imports `kc_ticket_*` or `kc_runtime_*`.
+
+The native leaf is mounted, but the parent orchestration shown below is not.
+The production Rust caller still blocks on the compatibility CQ wait, the Rust
+executor does not yet own SQ admission or CQ promise routing, and no ticket
+telemetry crosses Tauri.
 
 ```mermaid
 flowchart LR
@@ -663,17 +669,19 @@ high-water mark so a model plan cannot silently consume the lifecycle reserve.
 
 ## Source Changes
 
-1. **Implemented substrate (`bd530f4c9196`, vendored by `8d510f83`):** the upstream `kc_ticket` and expected-value wait
-   contracts are vendored and built by `crates/kcoro-sys`; raw kcoro APIs remain
-   a conformance oracle and native wait-word substrate.
-2. **Partly implemented (`d2c43abd`):** Flashkern owns one private child ticket per blocking
-   pass and binds final-fence completion to one arena-worker callback. Replace
-   that transitional ownership with the Rust ticket and CQ path.
+1. **Implemented oracle (`bd530f4c9196`, vendored by `8d510f83`):** the upstream
+   `kc_ticket` and expected-value wait contracts are vendored and built by
+   `crates/kcoro-sys`; raw ticket/runtime APIs remain a conformance oracle, not
+   the product policy path.
+2. **Implemented native leaf (`2a2adcea`, `95069bd5`):** Flashkern owns one
+   private bounded SQ/CQ, admits only with reserved completion capacity, and
+   binds final-fence completion to one CQ publication. The former C arena
+   ticket/callback path is deleted from the production engine.
 3. **Implemented foundation (`3a5b1431`):** `crates/kcoro` owns exact promises,
    bounded workers/rings, scope words, and the 128-byte SQ/CQ record definitions.
-   Its C++ ring leaf and Flashkern mount remain open.
-4. Extend `crates/liquid-audio/native/include/lfm_voice.h` with private ring-leaf
-   functions, descriptor retain/release, value ticket IDs,
+   Its protocol is mirrored by the mounted native leaf; production endpoint and
+   promise ownership remain open.
+4. Extend the private bridge ABI with descriptor retain/release, value ticket IDs,
    bounded kernel snapshots, observer registration, and capability bits. Do not
    export pass descriptors or ticket handles.
 5. Add semantic and telemetry sink classes to coordinator/notification code. Give

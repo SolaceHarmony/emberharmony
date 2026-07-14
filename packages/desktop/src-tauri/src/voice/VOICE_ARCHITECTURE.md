@@ -3,7 +3,7 @@
 > **Current-hybrid document.** This file describes the shipped Rust/Candle/native
 > mixture while the replacement is being designed. The normative target is
 > [`specs/11-kcoro-native-migration.md`](../../../../../specs/11-kcoro-native-migration.md),
-> including the fixed Flashkern executor and ticket callback contract in
+> including the fixed Flashkern executor and native SQ/CQ contract in
 > [document 03](../../../../../specs/11-kcoro-native-migration/03-scheduler-passes-and-recurrence.md)
 > and the Tauri/visualizer observer design in
 > [document 12](../../../../../specs/11-kcoro-native-migration/12-ticketed-orchestration-and-observability.md).
@@ -201,18 +201,27 @@ client/session lifecycle lives in Rust, not in the webview and not in a bundled 
 
 ---
 
-## 3. Layer 0 — Why native Rust (the migration)
+## 3. Layer 0 — Why the first native migration happened
 
-**Decision:** rebuild voice as one native Rust kernel inside `packages/desktop/src-tauri`.
-The LFM2 provider runs the local model in-process; the LiveKit provider runs the desktop
-LiveKit/WebRTC client in Rust. The thing being deleted is the _sidecar/frontend-owned voice
-runtime_ shape: Node agents, orphanable worker processes, and SolidJS-owned desktop rooms.
-Rationale:
+**Shipped first decision:** rebuild voice in-process under
+`packages/desktop/src-tauri`. The current LFM2 provider still runs substantial
+local inference and audio code in Rust/Candle; the LiveKit provider runs the
+desktop LiveKit/WebRTC client in Rust. The first migration deleted the
+_sidecar/frontend-owned voice runtime_ shape: Node agents, orphanable worker
+processes, and SolidJS-owned desktop rooms.
+
+The active second migration keeps Tauri as the host, moves local audio and all
+numerical inference into C++/assembly, and gives the dedicated Rust kcoro runtime
+only tickets, scopes, callbacks, and recurrence policy. See the normative
+documents linked at the top of this file.
+
+First-migration rationale:
 
 - Removes the cloud‑SFU **double round‑trip** for the local LFM2 assistant (mic→SFU→agent→SFU→spk).
 - Removes the Node worker (zombies/IPC/orphans), the bundled+codesigned voice runtime, and
   frontend-owned room/dispatch lifecycle for desktop.
-- Real OS threads are the right home for realtime audio; Tauri's Rust side has them.
+- Realtime audio needed resident OS threads rather than a frontend/sidecar
+  lifecycle. The target owner is now the native audio kernel, not Tauri.
 
 **Two migrations happened, and I initially only did the first:**
 
