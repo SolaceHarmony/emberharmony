@@ -92,6 +92,23 @@ impl LayerState {
     }
 }
 
+#[cfg(test)]
+#[repr(C)]
+#[derive(Default)]
+struct EngineSnapshot {
+    size: u32,
+    abi_version: u32,
+    pass_submissions: u64,
+    pass_completions: u64,
+    ticket_callbacks: u64,
+    dispatch_wakes: u64,
+    fence_wake_calls: u64,
+    fence_wakes: u64,
+    fence_generations: u64,
+    max_ticket_generation: u32,
+    pass_claimed: u32,
+}
+
 extern "C" {
     fn lfm_engine_new(workers: i32) -> *mut c_void;
     fn lfm_engine_free(e: *mut c_void);
@@ -124,6 +141,10 @@ extern "C" {
         ctx: *mut c_void,
     ) -> i32;
     fn lfm_engine_lanes(e: *mut c_void) -> u32;
+    #[cfg(test)]
+    fn lfm_engine_snapshot(e: *mut c_void, out: *mut EngineSnapshot) -> i32;
+    #[cfg(test)]
+    fn lfm_lane_fence(e: *mut c_void, lane: u32);
     fn lfm_ctx_set_heads(
         e: *mut c_void,
         embed_w: *const u16,
@@ -202,6 +223,18 @@ impl NativeEngine {
                 pass_lock: Mutex::new(()),
             })
         }
+    }
+
+    #[cfg(test)]
+    fn snapshot(&self) -> EngineSnapshot {
+        let mut out = EngineSnapshot {
+            size: std::mem::size_of::<EngineSnapshot>() as u32,
+            abi_version: 1,
+            ..EngineSnapshot::default()
+        };
+        // SAFETY: `out` is the ABI-sized destination and the engine outlives the call.
+        assert_eq!(unsafe { lfm_engine_snapshot(self.ptr, &mut out) }, 0);
+        out
     }
 
     /// One fused-MLP decode block, entirely native — bit-identical to
@@ -616,6 +649,11 @@ mod tests {
     }
 
     unsafe extern "C" fn noop_raw_lane(_: *mut c_void, _: u32, _: u32) {}
+
+    unsafe extern "C" fn fence_raw_lane(ctx: *mut c_void, lane: u32, _: u32) {
+        // SAFETY: `ctx` is this live engine and the callback runs on one of its lanes.
+        unsafe { lfm_lane_fence(ctx, lane) };
+    }
 
     #[test]
     fn probe_candle_bf16_sum_ladder() {
@@ -1189,36 +1227,38 @@ mod tests {
 
     #[test]
     fn native_engine_ticket_and_fence_soak() {
-        if !crate::flashkern::decode::fused_mlp_available() {
-            eprintln!("fused mlp kernel unavailable — skipping");
-            return;
-        }
         let engine = NativeEngine::new(8).expect("native engine init");
-        let (h, i) = (16usize, 16usize);
-        let x = vec![0u16; h];
-        let norm_w = vec![0u16; h];
-        let w1 = vec![0u16; i * h];
-        let w3 = vec![0u16; i * h];
-        let w2 = vec![0u16; h * i];
-        let weights = crate::flashkern::decode::FusedMlpWeights {
-            norm_w: &norm_w,
-            w1: &w1,
-            w3: &w3,
-            w2: &w2,
-            eps: 1e-5,
-        };
-        let mut out = vec![u16::MAX; h];
+        const PASSES: u64 = 10_000;
+        const LANES: u64 = 8;
+        const TICKET_SLOTS: u64 = 64;
+        const FENCES_PER_PASS: u64 = 2;
         let start = std::time::Instant::now();
-        for pass in 0..10_000 {
-            assert!(
-                engine.fused_mlp(&x, &weights, &mut out, 8),
-                "pass {pass} did not complete"
-            );
+        for pass in 0..PASSES {
+            // SAFETY: the engine is live, no other caller shares it, and `ctx` is the
+            // same engine pointer consumed synchronously by every fixed lane.
+            let rc = unsafe { lfm_engine_call(engine.ptr, fence_raw_lane, engine.ptr) };
+            assert_eq!(rc, 0, "pass {pass} did not complete");
         }
-        assert_eq!(out, x);
+        let stats = engine.snapshot();
+        assert_eq!(stats.pass_submissions, PASSES);
+        assert_eq!(stats.pass_completions, PASSES);
+        assert_eq!(stats.ticket_callbacks, PASSES);
+        assert_eq!(stats.dispatch_wakes, PASSES);
+        assert_eq!(stats.fence_generations, PASSES * FENCES_PER_PASS);
+        assert!(stats.fence_wake_calls > 0);
+        assert!(stats.fence_wake_calls <= stats.fence_generations);
+        assert!(stats.fence_wakes >= stats.fence_wake_calls);
+        assert!(stats.fence_wakes > 0);
+        assert!(stats.fence_wakes <= PASSES * FENCES_PER_PASS * (LANES - 1));
+        let minimum_reuse = PASSES.div_ceil(TICKET_SLOTS) as u32;
+        assert!(stats.max_ticket_generation >= minimum_reuse);
+        assert!(u64::from(stats.max_ticket_generation) <= PASSES);
+        assert_eq!(stats.pass_claimed, 0);
         eprintln!(
-            "native ticket/fence soak: 10,000 passes in {:.3}s",
-            start.elapsed().as_secs_f64()
+            "native ticket/fence soak: {PASSES} passes, {} fence syscalls for {} waiters in {:.3}s",
+            stats.fence_wake_calls,
+            stats.fence_wakes,
+            start.elapsed().as_secs_f64(),
         );
     }
 }

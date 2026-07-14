@@ -122,9 +122,9 @@ struct Stage {
 };
 
 // The generation fence — the GPU barrier idiom on fixed lanes. The last arriver runs
-// the boundary's serial section, release-publishes the next generation, and rings
-// each peer's cache-line-local expected-value word. kcoro_arena's port adapter closes
-// changed-before-park races and blocks without polling.
+// the boundary's serial section, release-publishes the next generation, and rings one
+// shared expected-value word. The host wakes only threads parked on that address, so
+// one syscall fans out to the actual waiter set without polling.
 struct Fence {
     std::atomic<uint32_t> arrived{0};
     std::atomic<uint32_t> park_mask{0};
@@ -276,17 +276,31 @@ struct TokenReq {
 };
 
 struct Engine;
-struct alignas(64) LaneWord {
+struct alignas(64) WaitWord {
     uint32_t value = 0;
-    uint32_t observed = 0; // written only by this word's owning lane
+    uint32_t reserved = 0;
     kc_port_wait_word *wait = nullptr;
     uint8_t padding[48] = {};
 };
-static_assert(sizeof(LaneWord) == 64, "lane doorbells must not share cache lines");
+static_assert(sizeof(WaitWord) == 64, "shared doorbells must not share cache lines");
 
 struct LaneArg {
     Engine *e;
     uint32_t lane;
+};
+
+struct LfmEngineSnapshotV1 {
+    uint32_t size;
+    uint32_t abi_version;
+    uint64_t pass_submissions;
+    uint64_t pass_completions;
+    uint64_t ticket_callbacks;
+    uint64_t dispatch_wakes;
+    uint64_t fence_wake_calls;
+    uint64_t fence_wakes;
+    uint64_t fence_generations;
+    uint32_t max_ticket_generation;
+    uint32_t pass_claimed;
 };
 
 struct Engine {
@@ -297,10 +311,11 @@ struct Engine {
     // Stable logical lane i always runs on pthread i. kcoro_arena coordinates pass
     // tickets; it never schedules or migrates these numerical call stacks.
     pthread_t workers[MAX_WORKERS] = {};
-    LaneWord doorbells[MAX_WORKERS] = {};
+    WaitWord dispatch_word;
+    WaitWord fence_word;
     LaneArg largs[MAX_WORKERS] = {};
     int n_workers = 0;
-    int doorbells_prepared = 0;
+    int wait_words_prepared = 0;
     int workers_started = 0;
     uint32_t lanes_total = 1;
     std::atomic<uint64_t> lane_gen{0};
@@ -311,6 +326,13 @@ struct Engine {
     std::atomic<uint32_t> callback_refs{0};
     std::atomic<bool> pass_claimed{false};
     uint64_t submit_epoch = 0; // written only by the current pass claimant
+    std::atomic<uint64_t> pass_submissions{0};
+    std::atomic<uint64_t> pass_completions{0};
+    std::atomic<uint64_t> ticket_callbacks{0};
+    std::atomic<uint64_t> dispatch_wakes{0};
+    std::atomic<uint64_t> fence_wake_calls{0};
+    std::atomic<uint64_t> fence_wakes{0};
+    std::atomic<uint32_t> max_ticket_generation{0};
 
     // Rust-rim handshake: one ticket callback per full pass.
     pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
@@ -587,10 +609,9 @@ static void run_tile(uint32_t kind, uint32_t idx, const Stage *st, Engine *e) {
 }
 
 // ---- fixed-lane doorbells and fence ----------------------------------------------------
-static inline void signal_lane(Engine *e, uint32_t lane) {
-    LaneWord *doorbell = &e->doorbells[lane];
-    kc_atomic_u32_fetch_add_release(&doorbell->value, 1);
-    kc_port_wake_u32_one(doorbell->wait);
+static inline void signal_all(WaitWord *word) {
+    kc_atomic_u32_fetch_add_release(&word->value, 1);
+    kc_port_wake_u32_all(word->wait);
 }
 
 // One stage boundary. `serial` runs exactly once, on the last arriver, AFTER every
@@ -606,24 +627,24 @@ static inline void lane_fence(Engine *e, uint32_t lane, F &&serial) {
         f->arrived.store(0, std::memory_order_relaxed); // before the release below
         f->gen.store(g + 1, std::memory_order_release);
         uint32_t parked = f->park_mask.exchange(0, std::memory_order_acq_rel);
-        while (parked) {
-            uint32_t peer = (uint32_t)__builtin_ctz(parked);
-            parked &= parked - 1;
-            signal_lane(e, peer);
+        if (parked) {
+            e->fence_wake_calls.fetch_add(1, std::memory_order_relaxed);
+            e->fence_wakes.fetch_add((uint32_t)__builtin_popcount(parked),
+                                     std::memory_order_relaxed);
+            signal_all(&e->fence_word);
         }
         return;
     }
-    LaneWord *doorbell = &e->doorbells[lane];
     uint32_t bit = 1u << lane;
+    uint32_t expected = kc_atomic_u32_load_acquire(&e->fence_word.value);
     f->park_mask.fetch_or(bit, std::memory_order_acq_rel);
     if (f->gen.load(std::memory_order_acquire) != g) {
         f->park_mask.fetch_and(~bit, std::memory_order_acq_rel);
         return;
     }
     while (f->gen.load(std::memory_order_acquire) == g) {
-        uint32_t expected = doorbell->observed;
-        (void)kc_port_wait_u32(doorbell->wait, expected, 0);
-        doorbell->observed = kc_atomic_u32_load_acquire(&doorbell->value);
+        (void)kc_port_wait_u32(e->fence_word.wait, expected, 0);
+        expected = kc_atomic_u32_load_acquire(&e->fence_word.value);
     }
     f->park_mask.fetch_and(~bit, std::memory_order_acq_rel);
 }
@@ -1009,14 +1030,13 @@ static void *lane_main(void *arg) {
     LaneArg *la = (LaneArg *)arg;
     Engine *e = la->e;
     const uint32_t lane = la->lane;
-    LaneWord *doorbell = &e->doorbells[lane];
-    doorbell->observed = kc_atomic_u32_load_acquire(&doorbell->value);
+    uint32_t observed = kc_atomic_u32_load_acquire(&e->dispatch_word.value);
     uint64_t seen = 0;
     for (;;) {
         while (e->lane_gen.load(std::memory_order_acquire) == seen &&
                !e->retire.load(std::memory_order_acquire)) {
-            int rc = kc_port_wait_u32(doorbell->wait, doorbell->observed, 0);
-            doorbell->observed = kc_atomic_u32_load_acquire(&doorbell->value);
+            int rc = kc_port_wait_u32(e->dispatch_word.wait, observed, 0);
+            observed = kc_atomic_u32_load_acquire(&e->dispatch_word.value);
             if (rc != 0 && e->retire.load(std::memory_order_acquire)) return nullptr;
         }
         bool retire = e->retire.load(std::memory_order_acquire);
@@ -1034,7 +1054,8 @@ static void *lane_main(void *arg) {
                 .terminal_cause = KC_TICKET_CAUSE_SUCCESS,
                 .status_code = 0,
             };
-            (void)kc_ticket_complete(e->active_ticket, &completion);
+            if (kc_ticket_complete(e->active_ticket, &completion) == 1)
+                e->pass_completions.fetch_add(1, std::memory_order_relaxed);
         }
     }
 }
@@ -1051,6 +1072,7 @@ static void release_engine_callback(void *arg) {
 
 static void pass_complete(void *arg, const kc_ticket_event_v1 *event) {
     Engine *e = (Engine *)arg;
+    e->ticket_callbacks.fetch_add(1, std::memory_order_relaxed);
     pthread_mutex_lock(&e->mu);
     if (event->epoch == e->waiting_epoch) {
         e->result = event->status_code;
@@ -1088,19 +1110,26 @@ static int submit_pass(Engine *e, int request) {
         pthread_mutex_unlock(&e->mu);
         return rc;
     }
+    kc_ticket_id ticket_id = kc_ticket_id_get(ticket);
+    uint32_t max_generation = e->max_ticket_generation.load(std::memory_order_relaxed);
+    if (ticket_id.generation > max_generation)
+        e->max_ticket_generation.store(ticket_id.generation, std::memory_order_relaxed);
     rc = kc_ticket_accept(ticket);
     if (rc == 0) rc = kc_ticket_dispatch(ticket);
     if (rc != 0) {
         pthread_mutex_lock(&e->mu);
         if (e->waiting_epoch == epoch) e->waiting_epoch = 0;
         pthread_mutex_unlock(&e->mu);
+        (void)kc_ticket_cancel(ticket);
         kc_ticket_release(ticket);
         return rc;
     }
+    e->pass_submissions.fetch_add(1, std::memory_order_relaxed);
     e->active_ticket = ticket;
     e->cur_req = request;
     e->lane_gen.store(generation, std::memory_order_release);
-    for (uint32_t lane = 0; lane < e->lanes_total; ++lane) signal_lane(e, lane);
+    e->dispatch_wakes.fetch_add(1, std::memory_order_relaxed);
+    signal_all(&e->dispatch_word);
 
     pthread_mutex_lock(&e->mu);
     while (!e->finished) pthread_cond_wait(&e->cv, &e->mu);
@@ -1129,15 +1158,18 @@ void *lfm_engine_new(int workers) {
     if (!e) return nullptr;
     e->lanes_total = (uint32_t)workers;
     e->n_workers = workers;
-    for (int lane = 0; lane < workers; ++lane) {
-        if (!kc_atomic_u32_is_lock_free(&e->doorbells[lane].value) ||
-            kc_port_wait_u32_prepare(&e->doorbells[lane].value,
-                                     &e->doorbells[lane].wait) != 0) {
-            lfm_engine_free(e);
-            return nullptr;
-        }
-        e->doorbells_prepared++;
+    if (!kc_atomic_u32_is_lock_free(&e->dispatch_word.value) ||
+        kc_port_wait_u32_prepare(&e->dispatch_word.value, &e->dispatch_word.wait) != 0) {
+        lfm_engine_free(e);
+        return nullptr;
     }
+    e->wait_words_prepared++;
+    if (!kc_atomic_u32_is_lock_free(&e->fence_word.value) ||
+        kc_port_wait_u32_prepare(&e->fence_word.value, &e->fence_word.wait) != 0) {
+        lfm_engine_free(e);
+        return nullptr;
+    }
+    e->wait_words_prepared++;
 
     kc_runtime_config runtime_config = {
         .size = sizeof(kc_runtime_config),
@@ -1188,24 +1220,44 @@ uint32_t lfm_engine_lanes(void *ep) {
     return e ? e->lanes_total : 0;
 }
 
+int lfm_engine_snapshot(void *ep, LfmEngineSnapshotV1 *out) {
+    Engine *e = (Engine *)ep;
+    if (!e || !out || out->size < sizeof(*out) || out->abi_version != 1) return -EINVAL;
+    *out = {
+        .size = sizeof(*out),
+        .abi_version = 1,
+        .pass_submissions = e->pass_submissions.load(std::memory_order_relaxed),
+        .pass_completions = e->pass_completions.load(std::memory_order_relaxed),
+        .ticket_callbacks = e->ticket_callbacks.load(std::memory_order_relaxed),
+        .dispatch_wakes = e->dispatch_wakes.load(std::memory_order_relaxed),
+        .fence_wake_calls = e->fence_wake_calls.load(std::memory_order_relaxed),
+        .fence_wakes = e->fence_wakes.load(std::memory_order_relaxed),
+        .fence_generations = e->fence.gen.load(std::memory_order_acquire),
+        .max_ticket_generation =
+            e->max_ticket_generation.load(std::memory_order_relaxed),
+        .pass_claimed = e->pass_claimed.load(std::memory_order_acquire) ? 1u : 0u,
+    };
+    return 0;
+}
+
 void lfm_engine_free(void *ep) {
     Engine *e = (Engine *)ep;
     if (!e) return;
     e->retire.store(true, std::memory_order_release);
     e->lane_gen.fetch_add(1, std::memory_order_release);
-    for (int lane = 0; lane < e->doorbells_prepared; ++lane) signal_lane(e, lane);
+    if (e->wait_words_prepared > 0) signal_all(&e->dispatch_word);
     for (int lane = 0; lane < e->workers_started; ++lane) {
         pthread_join(e->workers[lane], nullptr);
     }
     if (e->runtime) {
+        kc_runtime_request_stop(e->runtime);
         (void)kc_runtime_run_until_idle(e->runtime);
         (void)kc_runtime_join_all(e->runtime);
-        kc_runtime_request_stop(e->runtime);
         (void)kc_runtime_join(e->runtime);
         (void)kc_runtime_destroy(e->runtime);
     }
-    for (int lane = e->doorbells_prepared - 1; lane >= 0; --lane)
-        kc_port_wait_u32_release(e->doorbells[lane].wait);
+    if (e->wait_words_prepared > 1) kc_port_wait_u32_release(e->fence_word.wait);
+    if (e->wait_words_prepared > 0) kc_port_wait_u32_release(e->dispatch_word.wait);
     pthread_cond_destroy(&e->cv);
     pthread_mutex_destroy(&e->mu);
     delete e;
