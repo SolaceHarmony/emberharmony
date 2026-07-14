@@ -114,11 +114,47 @@ typedef struct LFM_KERNEL_ALIGNAS(64) KcCompletionV1 {
 
 typedef struct LfmKernelBridge LfmKernelBridge;
 
+typedef void (*LfmKernelDescriptorReleaseFn)(void *payload, void *context);
+
+typedef struct LfmKernelDescriptorSpecV1 {
+    uint32_t size;
+    uint32_t abi_version;
+    uint32_t kind;
+    uint32_t flags;
+    void *payload;
+    void *context;
+    LfmKernelDescriptorReleaseFn release;
+    uint64_t reserved[3];
+} LfmKernelDescriptorSpecV1;
+
+typedef struct LfmKernelDescriptorViewV1 {
+    uint32_t size;
+    uint32_t abi_version;
+    uint32_t kind;
+    uint32_t flags;
+    void *payload;
+    uint64_t reserved;
+} LfmKernelDescriptorViewV1;
+
+typedef struct LfmKernelDescriptorSnapshotV1 {
+    uint32_t size;
+    uint32_t abi_version;
+    uint32_t capacity;
+    uint32_t live;
+    uint64_t acquired;
+    uint64_t retained;
+    uint64_t released;
+    uint64_t callbacks;
+    uint32_t max_generation;
+    uint32_t retired;
+} LfmKernelDescriptorSnapshotV1;
+
 typedef struct LfmKernelBridgeConfigV1 {
     uint32_t size;
     uint32_t abi_version;
     uint32_t capacity;
-    uint32_t reserved;
+    /* Zero selects `capacity`; otherwise this is an independent fixed pool. */
+    uint32_t descriptor_capacity;
 } LfmKernelBridgeConfigV1;
 
 typedef struct LfmKernelBridgeSnapshotV1 {
@@ -141,6 +177,23 @@ typedef struct LfmKernelBridgeSnapshotV1 {
  */
 int lfm_kernel_bridge_create(const LfmKernelBridgeConfigV1 *config,
                              LfmKernelBridge **out);
+/*
+ * Creates one native-owned descriptor lease. Accepted pass submissions retain
+ * an additional queue lease until their completion cell is consumed.
+ */
+int lfm_kernel_bridge_descriptor_create(
+    LfmKernelBridge *bridge, const LfmKernelDescriptorSpecV1 *spec,
+    KcDescriptorIdV1 *out);
+int lfm_kernel_bridge_descriptor_retain(LfmKernelBridge *bridge,
+                                        KcDescriptorIdV1 descriptor);
+/* The returned view is borrowed and valid only while the caller owns a lease. */
+int lfm_kernel_bridge_descriptor_get(LfmKernelBridge *bridge,
+                                     KcDescriptorIdV1 descriptor,
+                                     LfmKernelDescriptorViewV1 *out);
+int lfm_kernel_bridge_descriptor_release(LfmKernelBridge *bridge,
+                                         KcDescriptorIdV1 descriptor);
+int lfm_kernel_bridge_descriptor_snapshot(
+    LfmKernelBridge *bridge, LfmKernelDescriptorSnapshotV1 *out);
 int lfm_kernel_bridge_submit(LfmKernelBridge *bridge,
                              const KcSubmissionV1 *submission);
 int lfm_kernel_bridge_wait_completion(LfmKernelBridge *bridge,
@@ -192,6 +245,12 @@ LFM_KERNEL_STATIC_ASSERT(offsetof(KcCompletionV1, results) == 88,
                          "KcCompletionV1 results offset");
 LFM_KERNEL_STATIC_ASSERT(offsetof(KcCompletionV1, reserved) == 120,
                          "KcCompletionV1 reserved offset");
+LFM_KERNEL_STATIC_ASSERT(sizeof(LfmKernelDescriptorSpecV1) == 64,
+                         "LfmKernelDescriptorSpecV1 size");
+LFM_KERNEL_STATIC_ASSERT(sizeof(LfmKernelDescriptorViewV1) == 32,
+                         "LfmKernelDescriptorViewV1 size");
+LFM_KERNEL_STATIC_ASSERT(sizeof(LfmKernelDescriptorSnapshotV1) == 56,
+                         "LfmKernelDescriptorSnapshotV1 size");
 
 #undef LFM_KERNEL_ALIGNAS
 #undef LFM_KERNEL_ALIGNOF

@@ -110,6 +110,12 @@ struct EngineSnapshot {
     fence_wake_calls: u64,
     fence_wakes: u64,
     fence_generations: u64,
+    descriptor_acquires: u64,
+    descriptor_retains: u64,
+    descriptor_releases: u64,
+    descriptor_callbacks: u64,
+    descriptor_capacity: u32,
+    descriptors_live: u32,
     max_descriptor_generation: u32,
     pass_claimed: u32,
 }
@@ -1513,6 +1519,12 @@ mod tests {
         assert!(stats.fence_wakes >= stats.fence_wake_calls);
         assert!(stats.fence_wakes > 0);
         assert!(stats.fence_wakes <= PASSES * FENCES_PER_PASS * (LANES - 1));
+        assert_eq!(stats.descriptor_capacity, 8);
+        assert_eq!(stats.descriptors_live, 0);
+        assert_eq!(stats.descriptor_acquires, PASSES);
+        assert_eq!(stats.descriptor_retains, PASSES);
+        assert_eq!(stats.descriptor_releases, PASSES * 2);
+        assert_eq!(stats.descriptor_callbacks, 0);
         assert_eq!(stats.max_descriptor_generation, PASSES as u32);
         assert_eq!(stats.pass_claimed, 0);
         eprintln!(

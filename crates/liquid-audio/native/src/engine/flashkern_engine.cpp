@@ -307,6 +307,12 @@ struct LfmEngineSnapshotV1 {
     uint64_t fence_wake_calls;
     uint64_t fence_wakes;
     uint64_t fence_generations;
+    uint64_t descriptor_acquires;
+    uint64_t descriptor_retains;
+    uint64_t descriptor_releases;
+    uint64_t descriptor_callbacks;
+    uint32_t descriptor_capacity;
+    uint32_t descriptors_live;
     uint32_t max_descriptor_generation;
     uint32_t pass_claimed;
 };
@@ -336,14 +342,13 @@ struct Engine {
     std::atomic<bool> pass_claimed{false};
     uint64_t runtime_epoch = 0;
     uint64_t submit_sequence = 0; // written only by the current pass claimant
-    uint32_t descriptor_generation = 0;
+    uint32_t ticket_generation = 0;
     std::atomic<uint64_t> pass_submissions{0};
     std::atomic<uint64_t> pass_completions{0};
     std::atomic<uint64_t> bridge_dispatches{0};
     std::atomic<uint64_t> dispatch_wakes{0};
     std::atomic<uint64_t> fence_wake_calls{0};
     std::atomic<uint64_t> fence_wakes{0};
-    std::atomic<uint32_t> max_descriptor_generation{0};
 
     ConvReq conv;  // conv-layer request payload
     AttnReq attn;  // attention-layer request payload
@@ -1103,18 +1108,25 @@ static void *bridge_main(void *arg) {
         if (rc == -ECANCELED) return nullptr;
         if (rc != 0) std::abort();
 
-        bool valid = submission.command == KC_COORD_COMMAND_RUN_PASS &&
+        LfmKernelDescriptorViewV1 descriptor = {
+            .size = sizeof(LfmKernelDescriptorViewV1),
+            .abi_version = KC_COORD_ABI_VERSION,
+        };
+        int descriptor_rc = lfm_kernel_bridge_descriptor_get(
+            e->bridge, submission.descriptor, &descriptor);
+        bool valid = descriptor_rc == 0 &&
+                     submission.command == KC_COORD_COMMAND_RUN_PASS &&
                      submission.pass_budget == 1 &&
                      submission.ticket.kind == KC_COORD_TICKET_PASS &&
                      submission.epoch != 0 &&
-                     submission.descriptor.slot == 0 &&
-                     submission.descriptor.generation == e->descriptor_generation &&
-                     e->cur_req > REQ_NONE && e->cur_req <= REQ_CALL;
+                     descriptor.payload == e && descriptor.flags == 0 &&
+                     descriptor.kind > REQ_NONE && descriptor.kind <= REQ_CALL;
         if (!valid) {
             publish_rejected(e, submission, -ESTALE);
             continue;
         }
 
+        e->cur_req = (int)descriptor.kind;
         e->active_submission = submission;
         e->bridge_dispatches.fetch_add(1, std::memory_order_relaxed);
         uint64_t generation = e->lane_gen.load(std::memory_order_relaxed) + 1;
@@ -1127,29 +1139,41 @@ static void *bridge_main(void *arg) {
 static int submit_pass(Engine *e, int request) {
     uint64_t sequence = ++e->submit_sequence;
     if (sequence == 0) sequence = ++e->submit_sequence;
-    uint32_t generation = ++e->descriptor_generation;
-    if (generation == 0) generation = ++e->descriptor_generation;
-    uint32_t maximum = e->max_descriptor_generation.load(std::memory_order_relaxed);
-    if (generation > maximum)
-        e->max_descriptor_generation.store(generation, std::memory_order_relaxed);
+    uint32_t ticket_generation = ++e->ticket_generation;
+    if (ticket_generation == 0) ticket_generation = ++e->ticket_generation;
+
+    LfmKernelDescriptorSpecV1 descriptor_spec = {
+        .size = sizeof(LfmKernelDescriptorSpecV1),
+        .abi_version = KC_COORD_ABI_VERSION,
+        .kind = (uint32_t)request,
+        .flags = 0,
+        .payload = e,
+        .context = nullptr,
+        .release = nullptr,
+        .reserved = {0, 0, 0},
+    };
+    KcDescriptorIdV1 descriptor{};
+    int rc = lfm_kernel_bridge_descriptor_create(e->bridge, &descriptor_spec, &descriptor);
+    if (rc != 0) return rc;
 
     KcSubmissionV1 submission{};
     submission.size = sizeof(submission);
     submission.abi_version = KC_COORD_ABI_VERSION;
     submission.ticket.runtime_epoch = e->runtime_epoch;
     submission.ticket.sequence = sequence;
-    submission.ticket.generation = generation;
+    submission.ticket.generation = ticket_generation;
     submission.ticket.kind = KC_COORD_TICKET_PASS;
     submission.conversation_id = e->ctx_id;
     submission.epoch = e->ctx_id == 0 ? 1 : e->ctx_id;
-    submission.descriptor.slot = 0;
-    submission.descriptor.generation = generation;
+    submission.descriptor = descriptor;
     submission.command = KC_COORD_COMMAND_RUN_PASS;
     submission.service_class = KC_COORD_SERVICE_INTERACTIVE;
     submission.pass_budget = 1;
 
-    e->cur_req = request;
-    int rc = lfm_kernel_bridge_submit(e->bridge, &submission);
+    rc = lfm_kernel_bridge_submit(e->bridge, &submission);
+    int release_rc =
+        lfm_kernel_bridge_descriptor_release(e->bridge, submission.descriptor);
+    if (release_rc != 0) std::abort();
     if (rc != 0) return rc;
     e->pass_submissions.fetch_add(1, std::memory_order_relaxed);
 
@@ -1200,7 +1224,7 @@ void *lfm_engine_new(int workers) {
         .size = sizeof(LfmKernelBridgeConfigV1),
         .abi_version = KC_COORD_ABI_VERSION,
         .capacity = 1,
-        .reserved = 0,
+        .descriptor_capacity = 8,
     };
     if (lfm_kernel_bridge_create(&bridge_config, &e->bridge) != 0) {
         lfm_engine_free(e);
@@ -1252,6 +1276,11 @@ uint32_t lfm_engine_lanes(void *ep) {
 int lfm_engine_snapshot(void *ep, LfmEngineSnapshotV1 *out) {
     Engine *e = (Engine *)ep;
     if (!e || !out || out->size < sizeof(*out) || out->abi_version != 1) return -EINVAL;
+    LfmKernelDescriptorSnapshotV1 descriptors = {
+        .size = sizeof(LfmKernelDescriptorSnapshotV1),
+        .abi_version = KC_COORD_ABI_VERSION,
+    };
+    if (lfm_kernel_bridge_descriptor_snapshot(e->bridge, &descriptors) != 0) return -EFAULT;
     *out = {
         .size = sizeof(*out),
         .abi_version = 1,
@@ -1262,8 +1291,13 @@ int lfm_engine_snapshot(void *ep, LfmEngineSnapshotV1 *out) {
         .fence_wake_calls = e->fence_wake_calls.load(std::memory_order_relaxed),
         .fence_wakes = e->fence_wakes.load(std::memory_order_relaxed),
         .fence_generations = e->fence.gen.load(std::memory_order_acquire),
-        .max_descriptor_generation =
-            e->max_descriptor_generation.load(std::memory_order_relaxed),
+        .descriptor_acquires = descriptors.acquired,
+        .descriptor_retains = descriptors.retained,
+        .descriptor_releases = descriptors.released,
+        .descriptor_callbacks = descriptors.callbacks,
+        .descriptor_capacity = descriptors.capacity,
+        .descriptors_live = descriptors.live,
+        .max_descriptor_generation = descriptors.max_generation,
         .pass_claimed = e->pass_claimed.load(std::memory_order_acquire) ? 1u : 0u,
     };
     return 0;
