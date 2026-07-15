@@ -1,0 +1,56 @@
+[
+  {
+    "audio_s": 8.479999542236328,
+    "first_audio_ms": 887,
+    "first_text_ms": 702,
+    "role": "assistant",
+    "transcript": "Sure! How about something like \"Transform your space with turn amazing woodworking ideas into reality\" or \"Build your dreams with quality woodworking solutions.\" If you have a particular style or service focus, feel free to share and I can help fine-tune it further",
+    "turn": 1,
+    "wall_s": 7.301416873931885
+  },
+  {
+    "audio_s": 6.880000114440918,
+    "first_audio_ms": 1243,
+    "first_text_ms": 992,
+    "role": "human",
+    "transcript": "That sounds like a handy start. How will you bring those woodworking concepts to life in your own space?",
+    "turn": 2,
+    "wall_s": 5.937570571899414
+  },
+  {
+    "audio_s": 8.479999542236328,
+    "first_audio_ms": 958,
+    "first_text_ms": 784,
+    "role": "assistant",
+    "transcript": "I’ll start by sketching realistic layouts, gathering all the tools and supplies you need, and mapping out the sequence for each project, then I’ll set up a space that matches the style you’re envisioning. Throughout the process I’ll ask you about their preferences",
+    "turn": 3,
+    "wall_s": 7.303301811218262
+  },
+  {
+    "audio_s": 6.400000095367432,
+    "first_audio_ms": 1082,
+    "first_text_ms": 906,
+    "role": "human",
+    "transcript": "That sounds like a thorough plan. Do you have a specific project in mind you’d like to start with?",
+    "turn": 4,
+    "wall_s": 5.443445205688477
+  },
+  {
+    "audio_s": 8.960000038146973,
+    "first_audio_ms": 975,
+    "first_text_ms": 790,
+    "role": "assistant",
+    "transcript": "I’m ready to dive in—it could be a bookshelf for a quiet spot, a reclaimed‑wood coffee table, or a wall‑mounted mounted workbench. Which of those sounds most appealing to you right now?",
+    "turn": 5,
+    "wall_s": 7.886100769042969
+  },
+  {
+    "audio_s": 5.760000228881836,
+    "first_audio_ms": 1139,
+    "first_text_ms": 972,
+    "role": "human",
+    "transcript": "Those three each have nice unique possibilities. What size are you looking for or what materials do you have on hand? Knowing how much you’d like the shelf to hold versus a wall‑mounted desk",
+    "turn": 6,
+    "wall_s": 5.458676338195801
+  }
+]

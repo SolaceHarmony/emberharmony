@@ -3,6 +3,7 @@ import { tmpdir } from "../fixture/fixture"
 import { Instance } from "../../src/project/instance"
 import { Agent } from "../../src/agent/agent"
 import { PermissionNext } from "../../src/permission/next"
+import { inheritedDenyRules } from "../../src/tool/task"
 
 // Helper to evaluate permission for a tool with wildcard pattern
 function evalPerm(agent: Agent.Info | undefined, permission: string): PermissionNext.Action | undefined {
@@ -43,7 +44,7 @@ test("build agent has correct default properties", async () => {
   })
 })
 
-test("plan agent denies edits except .emberharmony/plans/*", async () => {
+test("plan agent denies edits and bash except .emberharmony/plans/*", async () => {
   await using tmp = await tmpdir()
   await Instance.provide({
     directory: tmp.path,
@@ -52,8 +53,52 @@ test("plan agent denies edits except .emberharmony/plans/*", async () => {
       expect(plan).toBeDefined()
       // Wildcard is denied
       expect(evalPerm(plan, "edit")).toBe("deny")
+      expect(evalPerm(plan, "bash")).toBe("deny")
       // But specific path is allowed
       expect(PermissionNext.evaluate("edit", ".emberharmony/plans/foo.md", plan!.permission).action).toBe("allow")
+    },
+  })
+})
+
+test("plan delegated subagents inherit effective deny rules", async () => {
+  await using tmp = await tmpdir()
+  await Instance.provide({
+    directory: tmp.path,
+    fn: async () => {
+      const plan = await Agent.get("plan")
+      const explore = await Agent.get("explore")
+      expect(plan).toBeDefined()
+      expect(explore).toBeDefined()
+
+      const inherited = inheritedDenyRules(plan!.permission)
+      const ruleset = PermissionNext.merge(explore!.permission, inherited)
+
+      expect(PermissionNext.evaluate("task", "explore", plan!.permission).action).toBe("allow")
+      expect(PermissionNext.evaluate("bash", "*", explore!.permission).action).toBe("allow")
+      expect(PermissionNext.evaluate("bash", "*", ruleset).action).toBe("deny")
+      expect(PermissionNext.evaluate("edit", "*", ruleset).action).toBe("deny")
+    },
+  })
+})
+
+test("inherited deny rules respect later allow overrides", async () => {
+  await using tmp = await tmpdir({
+    config: {
+      permission: {
+        bash: "allow",
+      },
+    },
+  })
+  await Instance.provide({
+    directory: tmp.path,
+    fn: async () => {
+      const plan = await Agent.get("plan")
+      expect(plan).toBeDefined()
+
+      const inherited = inheritedDenyRules(plan!.permission)
+
+      expect(PermissionNext.evaluate("bash", "*", plan!.permission).action).toBe("allow")
+      expect(inherited.some((rule) => rule.permission === "bash" && rule.pattern === "*")).toBe(false)
     },
   })
 })

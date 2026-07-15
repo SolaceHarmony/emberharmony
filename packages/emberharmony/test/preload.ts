@@ -26,6 +26,9 @@ process.env["XDG_CACHE_HOME"] = path.join(dir, "cache")
 process.env["XDG_CONFIG_HOME"] = path.join(dir, "config")
 process.env["XDG_STATE_HOME"] = path.join(dir, "state")
 
+// Unit tests assert the checked-in model catalog, never mutable network state.
+process.env["EMBERHARMONY_DISABLE_MODELS_FETCH"] = "true"
+
 // Write the cache version file to prevent global/index.ts from clearing the cache
 const cacheDir = path.join(dir, "cache", "emberharmony")
 await fs.mkdir(cacheDir, { recursive: true })

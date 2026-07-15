@@ -13,10 +13,12 @@ import {
 import * as livekit from "@livekit/agents-plugin-livekit"
 import * as silero from "@livekit/agents-plugin-silero"
 import { llm } from "@livekit/agents"
+import { RoomEvent } from "@livekit/rtc-node"
 import { Flag } from "../flag/flag"
 import { SessionLLM } from "./bridge"
 import { VoiceRegistry } from "./registry"
-import { VOICE_AGENT_NAME } from "./constants"
+import { VOICE_AGENT_NAME, VOICE_CONTROL_INTERRUPT } from "./constants"
+import { parseVoiceControl } from "./control"
 import { VoiceWorkflow, VOICE_SYSTEM_PROMPT } from "./workflow"
 import { createServer as createIpcServer, type Server as IpcServer } from "node:net"
 import { chmodSync } from "node:fs"
@@ -62,7 +64,7 @@ export default defineAgent({
     if (!sessionID || !directory || !serverUrl) {
       throw new Error(
         `voice agent dispatched without session metadata (got: ${ctx.job.metadata || "<empty>"}) — ` +
-          "rooms must be created through EmberHarmony's POST /voice/token endpoint",
+          "rooms must be created through EmberHarmony's desktop LiveKit grant or POST /voice/token path",
       )
     }
 
@@ -95,7 +97,12 @@ export default defineAgent({
       // make agent() await route() resolving for the current turn.)
       turnHandling: { preemptiveGeneration: { enabled: false } },
     })
+    const onControl = (payload: Uint8Array, _participant?: unknown, _kind?: unknown, topic?: string) => {
+      if (parseVoiceControl(topic, payload) !== VOICE_CONTROL_INTERRUPT) return
+      session.interrupt({ force: true }).await.catch(() => {})
+    }
 
+    ctx.room.on(RoomEvent.DataReceived, onControl)
     await session.start({ agent: new EmberHarmonyAgent(workflow), room: ctx.room })
     await ctx.connect()
     session.say(

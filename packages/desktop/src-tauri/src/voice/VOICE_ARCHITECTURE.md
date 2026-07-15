@@ -1,0 +1,1348 @@
+# EmberHarmony Voice — Stack Architecture
+
+> **Current-hybrid document.** This file describes the shipped Rust/Candle/native
+> mixture while the replacement is being designed. The normative target is
+> [`specs/11-kcoro-native-migration.md`](../../../../../specs/11-kcoro-native-migration.md),
+> including the fixed Flashkern executor and native SQ/CQ contract in
+> [document 03](../../../../../specs/11-kcoro-native-migration/03-scheduler-passes-and-recurrence.md)
+> and the Tauri/visualizer observer design in
+> [document 12](../../../../../specs/11-kcoro-native-migration/12-ticketed-orchestration-and-observability.md).
+> The authoritative callback-only Rust-coordinator boundary is
+> [document 13](../../../../../specs/11-kcoro-native-migration/13-coordination-contract.md).
+> The source-exact mounted pass sequence and its current capacities are in the
+> [native integration runbook](../../../../../docs/native/KCORO_ARENA_INTEGRATION.md#mounted-pass-sequence-4f06a3d5).
+> The Rust audio/Candle ownership described below is current implementation
+> truth, not the target architecture.
+> At cutover this document is rewritten in place; Git history is the old
+> architecture record.
+
+> Status legend used throughout: ✅ built & proven this stack · 🔧 in progress / partially
+> wired · ◻️ designed, not yet built · ⚠️ known gap / open question.
+>
+> This document describes the **native Rust voice stack**: the faithful in‑tree port of
+> Liquid AI's **LFM2.5‑Audio** model (the `liquid-audio` crate), the native LiveKit/WebRTC
+> provider path, the generation and context machinery built on top of LFM2, the
+> **orchestration layer** that lets a 1.5B speech model actually _do work_ by delegating
+> to a capable model, the **audio I/O**, and the **Tauri integration** that fuses all of it
+> into the desktop app on real OS threads.
+>
+> It is the companion to `FRONTEND_DESIGN.md` (the webview/UX side) and supersedes the
+> scattered notes in `crates/liquid-audio/docs/{ARCHAEOLOGY,PORT_STATUS,PYTHON_VS_RUST,THREADING_PARITY}.md`.
+
+---
+
+## Table of contents
+
+```
+ 0.  How to read this document
+ 1.  Philosophy — the inversion of the brain
+ 2.  The 10,000‑foot view (master diagram)
+ 3.  Layer 0 — Why native Rust (the migration)
+ 4.  Layer 1 — The model engine (the liquid-audio crate)
+       4.1  What LFM2.5‑Audio actually is
+       4.2  Continuous audio‑in:  mel → ConvSubsampling → Conformer → adapter
+       4.3  The LFM2 backbone (hybrid short‑conv + GQA)
+       4.4  The two output heads:  text head + Depthformer
+       4.5  Mimi — the discrete audio codec
+       4.6  Full forward diagram
+       4.7  The faithful‑port procedure
+       4.8  Numerics: candle 0.9.2, bf16 Metal, f32 CPU parity
+       4.9  The conv kernels — candle-flashfftconv
+ 5.  Layer 2 — Generation (the interleaved modality machine)
+ 6.  Layer 3 — Context is prior thoughts (the heart of the design)
+       6.1  The principle
+       6.2  ChatState — the five fields
+       6.3  Continuous‑in vs discrete‑out (image‑embedding vs RVQ tokens)
+       6.4  audio_embedding (context) vs Mimi (sound) — two sinks
+       6.5  The prefill scatter
+       6.6  Multi‑turn: append / from_parts / persistent conv
+       6.7  I/O‑independence (the barge‑in fix)
+ 7.  Layer 4 — The KV cache and the memory problem
+ 8.  Layer 5 — The orchestration layer (voice‑as‑agent + delegation)
+ 9.  Layer 6 — Audio I/O (native callbacks)
+10.  Layer 7 — The Tauri integration (pipeline + bridge)
+11.  Threading model
+12.  Phasing — LFM2 turn loop now, Moshi frame‑duplex later
+13.  File & module map
+14.  Verification & proofs
+15.  Open questions / next moves
+16.  Glossary
+```
+
+---
+
+## 0. How to read this document
+
+The stack is seven layers. Each layer below is independently comprehensible, but they stack:
+
+```
+   Layer 7   Tauri integration   (desktop commands, Channel<VoiceEvent>, State)
+   Layer 6   Audio I/O           (native mic capture, speaker playback, VAD)
+   Layer 5   Orchestration       (LFM front + DELEGATE marker + capable‑model subagent)
+   Layer 4   KV cache / memory   (resident KvSlot, inter‑turn persistence)
+   Layer 3   Context             (ChatState; prior thoughts; multi‑turn)
+   Layer 2   Generation          (interleaved text+audio; the modality machine)
+   Layer 1   Model engine        (mel→Conformer→LFM2→text head+Depthformer→Mimi)
+   Layer 0   Native runtime       (Tauri voice kernel, LFM2 + native LiveKit, no Node/Python worker)
+```
+
+Read top‑down for "what does the app call," bottom‑up for "how does the model work." The
+heart of the whole thing is **Layer 3** — everything else exists to feed, generate, or speak
+the model's _prior thoughts_.
+
+---
+
+## 1. Philosophy — the inversion of the brain
+
+The earlier voice architecture (on the LiveKit branch) was **dumb I/O bridged to a big brain**:
+
+```
+   mic ─► WebRTC ─► LiveKit Cloud SFU ─► agent worker (Node) ─► SessionLLM "brain"
+                                                                      │
+   speaker ◄─ WebRTC ◄─ LiveKit Cloud SFU ◄─ TTS ◄────────────────────┘
+```
+
+Every utterance from a _local_ user made **two** round‑trips to a cloud SFU, plus a Node
+worker, plus token/room/dispatch plumbing, plus a bundled voice runtime that had to be code‑
+signed. The microphone was a dumb pipe; all intelligence lived elsewhere.
+
+**We inverted it.** The new design runs a **small, local, conversational model as the agent
+itself**, and treats "doing hard work" as a _delegated tool_, not the default path:
+
+```
+   mic ─► LFM2.5‑Audio (LOCAL, hybrid Rust/Candle + native C++/SIMD)
+            │  it IS the agent: ears, voice, small talk, and judgement about when to hand off
+            ├─ ordinary turn        ─► speak its own reply            (small talk, quick answers)
+            └─ "DELEGATE: <task>"   ─► capable model / EmberHarmony agent does the work
+                                          └─► LFM speaks the result back
+```
+
+Two facts force this shape:
+
+1. **LFM2.5‑Audio is ~1.5B and cannot code, reason deeply, or touch the system.** It is a
+   _speech_ model. It converses; it does not engineer. Pretending otherwise produces confident
+   nonsense. So real work **must** be delegated to a capable model.
+2. **LFM2.5‑Audio has no native function calling.** (Liquid ships tool calling only in separate
+   text models, e.g. `LFM2‑1.2B‑Tool`.) So delegation cannot use a tool‑call API on the audio
+   model. Instead it rides a **one‑line text convention** the small model _can_ reliably follow:
+   it emits `DELEGATE: <task>` on its text channel, and the orchestrator routes that to the
+   engineer.
+
+The consequence is a **two‑tier agent**: a fast local _interface tier_ (the voice) and a
+capable _worker tier_ (the delegate). The interface tier is always‑on and cheap; the worker
+tier is invoked only when there is genuine work. This is the whole thesis of the stack.
+
+> The standalone `lfm-voice` binary that prototyped this (in `experiments/lfm2-audio-voice/`)
+> is _scaffolding_. The **layer** — voice‑front + delegation routing + capable‑model subagent —
+> is the architecture, and it migrates into the desktop build (Layer 5 / Layer 7).
+
+---
+
+## 2. The 10,000‑foot view (master diagram)
+
+```mermaid
+flowchart TB
+  UI["SolidJS webview\nbuttons, transcript, level meter"]
+  Cmd["Tauri voice_* commands\nstart / stop / interrupt / mic / settings"]
+  Events["tauri::ipc::Channel<VoiceEvent>\nstate, transcript, levels, audio clips"]
+  Settings["Tauri settings + keychain\nprovider, model dir, LiveKit URL + credentials"]
+
+  subgraph Kernel["src-tauri/src/voice — one desktop VoiceRuntime kernel"]
+    Queue["bounded tokio::sync::mpsc<RuntimeCommand>\ncapacity 16, try_send backpressure"]
+    Snap["tokio::sync::watch<RuntimeSnapshot>\nrunning, provider, mic, session"]
+    Router["single active VoiceSession\nLfm2 | Livekit"]
+    Threads["ThreadManager\nblocking stop/reap/join work"]
+  end
+
+  UI --> Cmd --> Queue --> Router
+  Settings --> Router
+  Router --> Snap
+  Router --> Events --> UI
+  Threads --> Router
+
+  subgraph LFM2["VoiceSession::Lfm2 — local LFM2-Audio provider"]
+    MicCb["OS audio input callback"]
+    MicRing["bounded SPSC mic PCM ring\nnon-blocking push/read"]
+    Vad["VAD / turn detector\nbarge-in + flush"]
+    UttQ["bounded utterance queue\nsize 1"]
+    Infer["persistent inference std::thread\nowns outer Lfm2VoiceEngine + ChatState + Mimi"]
+    Rim["blocking CPU pass rim\nborrowed model buffers"]
+    Coord["Rust kcoro\nSQ broker + CQ ingress"]
+    Bridge["native descriptor pool\n1-cell SQ/CQ + doorbells"]
+    Flash["fixed C++ Flashkern lanes\nNEON / AVX / assembly"]
+    EventQ["bounded crossbeam event queue"]
+    OutRing["bounded SPSC speaker PCM ring"]
+    SpkCb["OS audio output callback"]
+
+    MicCb --> MicRing --> Vad --> UttQ --> Infer
+    Infer --> Rim
+    Rim -->|"registered submit callback"| Coord
+    Coord -->|"128-byte SQ cell"| Bridge
+    Bridge --> Flash
+    Flash -->|"128-byte CQ cell"| Bridge
+    Bridge -->|"blocking CQ edge"| Coord
+    Coord -->|"resolve result slot"| Rim
+    Rim --> Infer
+    Infer --> EventQ
+    Infer --> OutRing --> SpkCb
+  end
+
+  subgraph LiveKit["VoiceSession::Livekit — native Rust/WebRTC provider"]
+    LkCmd["bounded tokio::sync::mpsc<LiveKitCommand>\ninterrupt / mic / stop"]
+    LkTask["ThreadManager-owned service thread\nblock_on Room::connect + state loop"]
+    LkAudio["livekit PlatformAudio\nLocalAudioTrack microphone"]
+    LkMedia["WebRTC/native media worker threads"]
+    LkMeter["NativeAudioStream monitor\nremote audio RMS -> VoiceEvent::Level"]
+
+    LkCmd --> LkTask
+    LkTask <--> LkMedia
+    LkAudio --> LkMedia
+    LkMedia --> LkMeter
+  end
+
+  Router --> LFM2
+  Router --> LiveKit
+  EventQ --> Events
+  LkTask --> Events
+  LkMeter --> Events
+```
+
+Everything in the kernel box is **owned by the Tauri process**. SolidJS never owns a LiveKit
+`Room`, never owns microphone truth, never chooses provider availability, and never decides when a
+provider mismatch should stop a native session; it sends intent and renders the event stream.
+The LiveKit provider may still use a LiveKit SFU when that provider is selected, but the desktop
+client/session lifecycle lives in Rust, not in the webview and not in a bundled Node/Python sidecar.
+
+The broker loop in this diagram is mounted only for eligible CPU Flashkern passes.
+The outer call remains synchronous because its numerical pointers are still
+borrowed from model-owned storage. Text and Depthformer sampling now execute inside
+their typed native passes. Outer turn recurrence, model lifecycle, audio, and Tauri
+observation remain outside this pass edge; the target documents describe their
+removal or remounting.
+
+---
+
+## 3. Layer 0 — Why the first native migration happened
+
+**Shipped first decision:** rebuild voice in-process under
+`packages/desktop/src-tauri`. The current LFM2 provider still runs substantial
+local inference and audio code in Rust/Candle; the LiveKit provider runs the
+desktop LiveKit/WebRTC client in Rust. The first migration deleted the
+_sidecar/frontend-owned voice runtime_ shape: Node agents, orphanable worker
+processes, and SolidJS-owned desktop rooms.
+
+The active second migration keeps Tauri as the host, moves local audio and all
+numerical inference into C++/assembly, and gives the dedicated Rust kcoro runtime
+only tickets, scopes, callbacks, and recurrence policy. See the normative
+documents linked at the top of this file.
+
+First-migration rationale:
+
+- Removes the cloud‑SFU **double round‑trip** for the local LFM2 assistant (mic→SFU→agent→SFU→spk).
+- Removes the Node worker (zombies/IPC/orphans), the bundled+codesigned voice runtime, and
+  frontend-owned room/dispatch lifecycle for desktop.
+- Realtime audio needed resident OS threads rather than a frontend/sidecar
+  lifecycle. The target owner is now the native audio kernel, not Tauri.
+
+**Two migrations happened, and I initially only did the first:**
+
+| #   | From                                                                                                    | To                                                | Status                                                                                                                                                              |
+| --- | ------------------------------------------------------------------------------------------------------- | ------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | `experiments/lfm2-audio-voice/liquid-audio-rs/` (the model crate)                                       | `crates/liquid-audio/` | ✅ done — built into the desktop app (`Cargo.toml`: `liquid-audio = { path = "../../../crates/liquid-audio", features = ["metal"] }`)                                        |
+| 2   | `experiments/lfm2-audio-voice/src/` (the **orchestration layer**: `main.rs` routing, `glm.rs` subagent) | `packages/desktop/src-tauri/src/voice/`           | 🔧 partially wired — `session.rs` and `BridgeState` route `DELEGATE:` into the EmberHarmony session; the standalone `glm.rs` engineer choice/hardening remains open |
+
+Desktop‑only is acceptable for now: desktop is the sole test target and we are not supporting
+multi‑backend / cross‑platform voice yet. The pure‑web deployment can't run Rust threads; if
+voice is ever needed there it's a separate path.
+
+A third, _internal_ migration is implied by the native engine: the prototype's `lfm.rs` shelled
+out to an external `llama-liquid-audio-cli` (llama.cpp GGUF). The native `liquid-audio` engine
+**obsoletes that** — ASR/TTS/interleaved all run in‑process on candle+Metal, no subprocess, no
+GGUF. The orchestration around it stays; only the runtime swaps.
+
+---
+
+## 4. Layer 1 — The model engine (the `liquid-audio` crate)
+
+### 4.1 What LFM2.5‑Audio actually is
+
+It is **not** a text LLM with a bolted‑on codec. It is a multimodal _interleaved‑generation_
+model with three distinct modalities flowing through one shared backbone:
+
+- **continuous audio‑in** — raw waveform → mel → Conformer → adapter → backbone embeddings
+  (an _analog_ representation, like a base‑64 image embedded in context);
+- **text** — ordinary token embeddings;
+- **discrete audio‑out** — 8 residual‑vector‑quantized (RVQ) codes per 80 ms frame, produced by
+  a _second_ autoregressive transformer (the Depthformer) and embedded by the model's own
+  `audio_embedding` table.
+
+These three share **one LFM2 backbone**. Two heads read the backbone's hidden state: a **text
+head** and the **Depthformer**. The model weaves text and audio into a single interleaved
+stream. A separate codec (**Mimi**, from the `moshi` crate) turns audio‑out codes into a
+playable waveform — but Mimi is a _playback_ device, not part of the model's reasoning (see
+§6.4).
+
+```
+   modality        representation            produced by            consumed by
+   ───────────     ───────────────────       ───────────────        ──────────────
+   audio‑in        mel → Conformer embeds    user's microphone      backbone (read)
+   text            token embeddings          text head (output)     backbone (read+write)
+   audio‑out       8 RVQ codes / frame       Depthformer (output)   backbone (read+write) + Mimi (playback)
+```
+
+### 4.2 Continuous audio‑in: mel → ConvSubsampling → Conformer → adapter
+
+The audio‑in front end is a faithful port of NeMo's FastConformer preprocessing + a Conformer
+encoder + a small MLP "audio adapter" that projects encoder features into the backbone's
+embedding space.
+
+```
+   waveform (1, L) @ 16 kHz
+        │  FilterbankFeatures  (processor.rs)  — torch.stft as a strided DFT‑basis conv1d,
+        │     Hann window folded into the kernel, slaney mel filterbank, log, 128 mel bins
+        ▼
+   mel  (128, T)                         T = get_seq_len(L)   (valid centered frames)
+        │  ConvSubsampling 8×            (model/conformer/subsampling.rs)
+        ▼
+   sub  (d, T/8)
+        │  ConformerEncoder             (model/conformer/encoder.rs)  — relative‑pos MHA,
+        │     conv module, FFN×2, streaming‑capable att‑context sizing
+        ▼
+   enc  (T', d)
+        │  audio_adapter  (MLP)         (model/mlp.rs)
+        ▼
+   audio‑in embeddings  (T', hidden)    ← scattered into the backbone sequence at AUDIO_IN positions
+```
+
+Key invariant (PR thread T20, ✅ fixed): the number of audio‑in tokens must be
+`mel2emb_len(get_seq_len(L))`, the count of **valid** centered frames — not the raw returned mel
+width, which the centered STFT pads with zero columns. Both the data mapper and
+`ChatState::add_audio_16k` now narrow to `get_seq_len` before storing mel frames, lengths, and
+AUDIO_IN modality flags.
+
+### 4.3 The LFM2 backbone (hybrid short‑conv + GQA)
+
+`model/lfm2_hf.rs` is a faithful adaptation of candle‑transformers' `lfm2.rs` (itself a port of
+HF `modeling_lfm2.py`) onto plain `candle_nn` 0.9.2. The backbone is **hybrid**: most layers are
+GQA attention; some are a **short causal convolution** ("ShortConv") instead of attention. Each
+layer is one of:
+
+```
+   Attention layer                         ShortConv layer
+   ───────────────                         ───────────────
+   q/k/v proj → q_norm/k_norm (RMS)        in_proj → (B·gate · x)  (gated input)
+   RoPE (NeoX half‑split, differentiable)  causal depthwise conv1d, l_cache = 3
+   resident KV append (in‑place slice_set)  conv‑state cache (small, cat‑based)
+   GQA repeat_kv → scaled‑dot attn (f32)   out_proj
+   o_proj
+```
+
+Per‑layer state lives in a single `Cache` struct (`lfm2_hf.rs`):
+
+```
+   struct Cache {
+     use_kv_cache:      bool,
+     fused_conv_decode: bool,              // ✅ fused conv1d_update decode path (§4.3); false = composed ref
+     grouped_gqa_decode:bool,              // ✅ regrouped‑q GQA view, no repeat_kv (§7); false = expanded ref
+     kvs:               Vec<Option<KvSlot>>, // ✅ resident KV planes (preallocated, in‑place slice_set; §7)
+     conv_states:       Vec<Option<Tensor>>, // ShortConv state (l_cache=3, tiny)
+     masks:             HashMap<(usize,usize), Tensor>,  // memoized causal masks (shape‑keyed)
+     cos, sin:          Tensor,            // RoPE tables
+   }
+```
+
+The **text head** is weight‑tied to `embed_tokens` (the text logits are `hidden · embedᵀ`).
+
+### 4.4 The two output heads: text head + Depthformer
+
+At each generated position the backbone produces a hidden vector `h_last`. **Both** heads read
+the _same_ `h_last`:
+
+```
+                          ┌────────────► text head:  logits = linear(h_last, embed_tokensᵀ)
+   backbone ─► h_last ────┤                          → sample text token (greedy)
+                          └────────────► Depthformer:  a 2nd autoregressive transformer that,
+                                          conditioned on h_last, emits the 8 RVQ codebook codes
+                                          for this 80 ms audio frame, one codebook at a time
+                                          (its own tiny KV cache = ConcatKvCache, §7)
+```
+
+This is why "the model reasons over both at once" is literally true: the heads diverge only at
+the last step; the _reasoning_ (the backbone state) is shared and has attended over the entire
+interleaved history of text **and** audio.
+
+The Depthformer's audio vocabulary is `AUDIO_VOCAB_SIZE = 2048 + 1` (the `+1` is the **EOAudio**
+terminator, code 2048) per codebook, with `codebooks = 8`. Codes from codebook _c_ are shifted
+into a shared embedding table by `codebook_offsets[c] = c · AUDIO_VOCAB_SIZE`.
+
+### 4.5 Mimi — the discrete audio codec
+
+Mimi (Kyutai's codec, reused from the `moshi` crate) turns the 8‑code frames into a 24 kHz
+waveform. It ships as `tokenizer-…checkpoint125.safetensors` in the model dir and is loaded
+**independently** of the model weights. Two crucial properties:
+
+- It has a **true streaming `decode_step`** that keeps codec state _across_ frames, for gapless
+  realtime playback — exactly the Python demo's `with mimi.streaming(1): mimi.decode(frame)`
+  loop (`chat.py`).
+- It is **playback only** (§6.4). The model never reads Mimi's waveform; it reads the _codes_ via
+  its own `audio_embedding`. Mimi is a sink, never a source of context.
+
+> **Hard rule:** Mimi always ships and is _required_ for streaming audio‑out. The streaming
+> path uses `proc.mimi()` directly and hard‑errors if absent — **no fallback** to the LFM2
+> detokenizer's degenerate one‑shot decode. A fallback would mask a broken build behind choppy
+> audio. (See `no-fallbacks-mimi-required`.)
+
+### 4.6 Full forward diagram
+
+```
+   ┌─────────────────────────── INPUTS (one interleaved sequence) ───────────────────────────┐
+   │   text tokens          audio‑in (mel→Conformer→adapter)        audio‑out (RVQ codes)     │
+   │       │                          │                                     │                 │
+   │   embed_tokens            audio‑in embeddings              audio_embedding(codes+offsets) │
+   │       │                          │                                .sum(over 8 codebooks)  │
+   │       └──────────────┬───────────┴──────────────┬──────────────────────┘                 │
+   │                      ▼  scatter by modality_flag ▼                                        │
+   │              in_emb  (1, L, hidden)   ← the woven multimodal sequence                     │
+   └──────────────────────────────────────┬───────────────────────────────────────────────────┘
+                                           ▼
+                          ┌────────────────────────────────────┐
+                          │  LFM2 backbone (hybrid conv + GQA)  │   per‑layer resident KvSlot / conv state
+                          └───────────────┬────────────────────┘
+                                          ▼  h_last (1, hidden)
+                        ┌─────────────────┴──────────────────┐
+                        ▼                                     ▼
+                  text head                             Depthformer (8 RVQ codes)
+                        │                                     │
+                  GenToken::Text(u32)                  GenToken::Audio(Vec<u32>)
+                        │                                     │
+                        │                                     ├─► append to context (audio_embedding)
+                        │                                     └─► Mimi.decode_step → PCM → speaker
+                        └──────────── interleaved stream ─────┘
+```
+
+### 4.7 The faithful‑port procedure
+
+The port follows a strict procedure (memory `lfm2-rust-port-faithfulness-guardrails`), _no_
+resemblance‑guessing:
+
+```
+   1. Read, line for line, what the Python does AND what its libraries do.
+   2. Does candle (0.9.2, our pin) already have the EXACT thing?  → use it.
+   3. Does a newer candle (0.10.2) have it and we need it?        → vendor that code in,
+                                                                     rewire to 0.9.2.
+   4. Is it only *similar* but not exact?                         → write our own; never
+                                                                     bring code that merely
+                                                                     resembles it.
+```
+
+Concrete applications of the rule in this stack:
+
+- `candle_ext/transformers_utils.rs` — vendored `build_causal_mask` + `repeat_kv` from
+  candle‑transformers (exact), rewired to 0.9.2.
+- `candle_ext/kv_cache.rs` — vendored `ConcatKvCache` from candle‑nn 0.10.2 (the cat‑based cache,
+  exact match to Python's `LayerKVCache.update`), used by the Depthformer.
+- `candle_ext/tensor_ext.rs` — `to_vec4` written ourselves (candle 0.10.2 has no exact match;
+  it's `narrow + to_vec3` per slice, the same math as `torch/numpy .tolist()`).
+- Backbone KV cache — a **custom resident `KvSlot`** (preallocated f32 planes, in‑place
+  `slice_set` append, O(1) cursor rollback; `lfm2_hf.rs`, §7). An earlier `candle_nn::KvCache`
+  swap was tried and **reverted** as a parity deviation; the resident slot is held to a
+  stricter bar (byte‑identical wav with `grouped_gqa_decode=false`).
+
+Faithfulness is gated **behaviorally**, not by structural similarity: ported tests + golden
+differential dumps (`parity/dump_*.py` → `parity/golden/*.safetensors`, gitignored, regenerable)
+
+- real end‑to‑end runs. Structural/AST distance is a shadow and is cheatable; we don't use it.
+
+### 4.8 Numerics: safetensor dtype, bf16 Metal/CPU, f32 local math
+
+- **candle 0.9.2** is the pin (transitively via `moshi`). Everything is built against it.
+- **Persistent model weights keep the floating dtype stored in the safetensors headers.** The
+  Rust loader does not accept a caller-selected model dtype and does not use config metadata to
+  upcast BF16 weights.
+- **bf16 on Metal** is the deployed path; the model ships bf16 and Metal runs it in real time.
+- **bf16 on CPU** uses the in-tree NEON `BFMMLA` bridge for 2-D linear/logit matmuls when the
+  CPU exposes FEAT_BF16. If that CPU feature is missing, CPU LFM2 inference fails clearly rather
+  than loading a second F32 model copy.
+- **F32 remains intentional local math**, not persistent weight storage: audio PCM/front-end
+  buffers, logits/sampling/loss calculations, attention-score/value matmuls, and BF16 matmul
+  accumulation use F32 where the canonical path requires it.
+- Device selection is runtime policy: persisted Tauri `VoiceSettings.lfm2.device` is passed
+  through `select_device` when the engine is built. Cargo/target features only determine which
+  backends are available; they never select one. CPU uses the BF16 NEON bridge and Metal opens
+  the configured Apple GPU device. Sampling parameters likewise come from the per-mode settings
+  groups rather than the launching process environment.
+
+The BF16 GEMM entry is `src/compute/bf16_gemm.rs` (candle `CustomOp`s `Bf16Gemm` / `Bf16GemmNt`). The
+live kernel is the **tightened flashkern GEMM** (`native/kernels/aarch64/flashkern_neon.cpp` on aarch64,
+`native/kernels/x86_64/flashkern_x86.cpp` on x86‑64) — an 8×8 BFMMLA / VDPBF16PS multi‑accumulator fanned over
+M‑row blocks with rayon, plus a native‑layout `[N,K]` decode form (`Bf16GemmNt`) that dots
+contiguous weight rows with **no transpose copy** at `M ≤ 4`. There is no separately
+compiled reference fallback: failure to build the architecture kernel fails the build.
+`model::linear` routes BF16 CPU linears/logits through this bridge and keeps the 4‑D
+attention matmuls on the explicit F32 accumulation path. See
+[`crates/liquid-audio/docs/FLASHKERN.md`](../../../../../crates/liquid-audio/docs/FLASHKERN.md) and
+[`crates/liquid-audio/docs/DECODE_ENGINE.md`](../../../../../crates/liquid-audio/docs/DECODE_ENGINE.md).
+
+### 4.9 The conv kernels — `candle-flashfftconv`
+
+The convolution operators that ML stacks normally gate behind custom CUDA live in their own
+crate, `crates/candle-flashfftconv/` — candle `CustomOp`s that run on
+**CPU** (faithful reference) **and Metal** (real fused kernels), no CUDA, no torch. Two
+families:
+
+- **Short conv** — `depthwise_conv1d` (the LFM2 short‑filter / `conv_L_cache` path). metal == cpu, 5.96e‑8.
+- **Long conv** — the FlashFFTConv Monarch FFT path, ported CUDA → MLX‑oracle → candle. The
+  headline is **`monarch_conv_fused`**: the full `IFFT(FFT(u) ⊙ k_f)` collapsed into **one**
+  tiled `simdgroup_matrix` (Apple tensor‑core) dispatch — every sub‑DFT an 8×8 fp32‑accumulate
+  GEMM, the `[N,L]` intermediate resident in threadgroup memory, the `×k_f` multiply fused
+  in‑kernel, edge tiles zero‑filled so any `N,L` works with no caller padding. Drop‑in for the
+  un‑fused `monarch_conv`. Verified `metal == monarch_conv` (1.5e‑8, incl. non‑mult‑of‑8 dims)
+  and `== circular convolution` (9.7e‑8); 30/30 tests green.
+
+Pipelines are compiled **once process‑wide** and shared across threads (the compiled kernel vs.
+per‑dispatch instances; `warmup()` moves the one compile to engine init). Like the bf16‑CPU
+kernel above, the fused tensor‑core conv is **built and verified**; wiring it into the LFM2
+backbone call site is the remaining step (§15).
+
+→ Full kernel design, dataflow diagram, dispatch contract, edge‑tile handling, the global
+pipeline cache, and the precision regimes (fp32 / bf16‑faithful / double‑double): see
+[`candle-flashfftconv/docs/ARCHITECTURE.md`](../../../../../crates/candle-flashfftconv/docs/ARCHITECTURE.md).
+
+---
+
+## 5. Layer 2 — Generation (the interleaved modality machine)
+
+`generate_interleaved` weaves text and audio into one stream by **time‑multiplexing** the two
+heads. The model config sets the cadence: `interleaved_n_text = 6`, `interleaved_n_audio = 12`.
+
+```
+   current = TEXT, modality_left = 6
+   ┌──────────────────────────────────────────────────────────────────────────────┐
+   │ loop (≤ max_new_tokens):                                                       │
+   │   h_last = backbone(in_emb, cache)         # one forward, KV cache appended    │
+   │                                                                                │
+   │   if current == TEXT:                                                          │
+   │       tok = sample_text(text_head(h_last)) # greedy                            │
+   │       if tok == 7  (<|im_end|>):  break     # end of turn                      │
+   │       emit Text(tok)                                                            │
+   │       if tok == 130 (<|text_end|>): text_done = true                           │
+   │       if --modality_left == 0 or text_done: current = AUDIO; modality_left = 12 │
+   │       in_emb = embed_tokens(tok)                                                │
+   │                                                                                │
+   │   elif current == AUDIO:                                                        │
+   │       frame = sample_audio(Depthformer(h_last))   # 8 codes, temp 1.0 / topk 4  │
+   │       if --modality_left == 0 and not text_done: current = TEXT; modality_left=6│
+   │       if frame[0] == 2048:  frame = [2048;8]; current = TEXT   # EOAudio        │
+   │       emit Audio(frame)                                                          │
+   │       in_emb = audio_embedding(frame + offsets).sum(0)   # feed own audio back   │
+   └──────────────────────────────────────────────────────────────────────────────┘
+```
+
+```
+   modality timeline (one turn):
+     TEXT TEXT TEXT TEXT TEXT TEXT │ AUD AUD AUD … (×12) │ TEXT … │ AUD …  │ … │ <|im_end|>
+     └──── 6 text tokens ────────┘ └─── 12 audio frames ─┘
+     (text may finish early via <|text_end|>, then audio‑only to EOAudio / im_end)
+```
+
+The stream is delivered to callers as a `GenToken`:
+
+```
+   enum GenToken { Text(u32), Audio(Vec<u32>) }    // Audio = the 8 RVQ codes of one frame
+```
+
+Two variants exist: `generate_interleaved` (text‑first conversational) and `generate_sequential`
+(used by the demo's ASR/TTS modes — text fully, then audio). Each has a `*_cancellable` form
+that polls an `AtomicBool` every step and breaks promptly on **barge‑in**, instead of running to
+`max_new_tokens` and tying up the P‑cores.
+
+The **EOAudio** frame (all‑2048, code 2048 in codebook 0) is _yielded_ to the caller before the
+modality flips back to text — both Python (`lfm2_audio.py`) and our Rust (`lfm2_audio.rs`) emit
+it. It matters for context (§6.6): the full audio‑out _including_ the EOAudio terminator goes
+into history; only the Mimi _decode_ drops it (`audio_out[:-1]`).
+
+---
+
+## 6. Layer 3 — Context is prior thoughts (the heart of the design)
+
+### 6.1 The principle
+
+> **Context = the model's prior thoughts = its own generated outputs (text AND emitted audio).
+> What enters context is decided by what the model GENERATED — never by I/O state (mic open?
+> speaker muted? turn interrupted?).**
+
+A chat model's context is user‑inputs _and_ its own prior responses. For this model the response
+is text _and_ the audio it can't help but emit — co‑generated off one backbone (the "hebbian"
+point: dropping either modality is brain damage). And the audio it emits is a **thought**, not
+disposable output‑to‑play: it lives in the prefix, as audio, as part of the reasoning. Muting a
+speaker or interrupting a turn must not change what the model remembers of itself.
+
+(Memory: `context-is-thoughts-not-io`.)
+
+### 6.2 ChatState — the five fields
+
+`ChatState` (processor.rs) accumulates the model inputs across a conversation. It mirrors the
+Python fields exactly; `**chat` unpacking becomes direct field access in `generate_*`:
+
+```
+   struct ChatState<'a> {
+     proc:           &'a LFM2AudioProcessor,   // borrowed; transient per call (no Arc)
+     codebooks:      usize,                    // 8
+     text:           Tensor,   // (1, n)        i64 token ids               (torch.long)
+     audio_in:       Tensor,   // (128, frames) f32 mel (continuous in)
+     audio_in_lens:  Tensor,   // (k,)          i64 frame lengths per segment
+     audio_out:      Tensor,   // (8, m)        i64 RVQ codes (discrete out)
+     modality_flag:  Tensor,   // (1, n+…)      i64 LFMModality per position (the interleave order)
+   }
+```
+
+Builder methods mirror the Python usage: `new_turn(role)` / `add_text` / `add_audio` /
+`end_turn` / `append`. `LFMModality` = `{ Text=1, AudioIn=2, AudioOut=3 }`.
+
+### 6.3 Continuous‑in vs discrete‑out (image‑embedding vs RVQ tokens)
+
+This distinction is the single most important thing to understand about the model:
+
+```
+   USER's voice (audio‑IN)                     MODEL's voice (audio‑OUT)
+   ───────────────────────                     ─────────────────────────
+   continuous embeddings                        discrete RVQ codes (8 per frame)
+   mel → Conformer → adapter                    Depthformer output
+   "like a base‑64 image in context"            "tokens, embedded by audio_embedding"
+   modality AUDIO_IN                            modality AUDIO_OUT
+   re‑encoded through the Conformer on prefill  embedded via audio_embedding+offsets on prefill
+```
+
+The user's voice is **not transcribed** to text — that would be lossy and slow. It stays as
+analog embeddings the backbone attends to directly, exactly like an embedded image. The model's
+own voice is **not** kept as a waveform — it is kept as the _codes_ it generated, embedded by
+the model's own table.
+
+### 6.4 `audio_embedding` (context) vs Mimi (sound) — two sinks of the same codes
+
+The same 8‑code frame fans out to **two disjoint consumers**:
+
+```
+                       frame = 8 RVQ codes  (GenToken::Audio)
+                               │
+              ┌────────────────┴───────────────────┐
+              ▼                                     ▼
+   CONTEXT path (reasoning)               PLAYBACK path (sound)
+   audio_embedding.embed(codes+offsets)   Mimi.decode_step(codes) → PCM
+        .sum(over 8 codebooks) → (D,)      → resample → speaker ring
+        = the model's OWN audio token      = disposable; never written to ChatState
+   ─────────────────────────────────────  ─────────────────────────────────────
+   model weights (vb.pp("audio_embedding"))   moshi codec (tokenizer-…checkpoint125)
+   in the prefix forever                       gone after it's heard
+```
+
+`audio_embedding` is a `SharedEmbedding(hidden, AUDIO_VOCAB_SIZE × codebooks)` — part of the
+**model**, not Mimi. So: _codes → audio_embedding → prefix_ (thought); _codes → Mimi → sound_
+(output). Muting the speaker skips only the right‑hand branch; the prefix is byte‑identical.
+
+### 6.5 The prefill scatter
+
+`prefill_inputs` (lfm2_audio.rs) reconstructs the woven input sequence from the three separated
+streams using `modality_flag` as the order:
+
+```
+   text_emb   = embed_tokens(text)                              # (n_text, D)
+   ai_emb     = [Conformer(adapter) per audio_in segment]       # (n_ai,   D)
+   ao_emb     = audio_embedding(audio_out + offsets).sum(0)     # (n_ao,   D)
+
+   combined   = cat[ text_emb ; ai_emb ; ao_emb ]               # (n_total, D)
+   index[pos] = for each modality_flag position, the next index into the matching block
+   in_emb     = combined.index_select(index)                    # (1, L, D)  ← the woven sequence
+```
+
+So the backbone sees text, the user's continuous audio, and the model's prior discrete audio,
+**all interleaved in the exact order they occurred** — one multimodal context, nothing flattened.
+
+### 6.6 Multi‑turn: append / from_parts / persistent conv
+
+Single‑turn never exercises the discrete‑audio‑context path. The model's real use is multi‑turn,
+feeding its own generated audio back as context. Two mechanisms make this work in the engine:
+
+```
+   ChatState::append(text, audio_out, modality_flag)     ✅ processor.rs
+     ── cats the generated text + discrete audio_out (FULL, incl. EOAudio) + interleaved flags
+        onto the persistent state.  (Python: chat.append(...) ; chat.end_turn())
+
+   ChatState::from_parts(proc, codebooks, 5 tensors)     ✅ processor.rs
+     ── rebuild a transient ChatState from a persisted conversation (no fresh <|startoftext|>).
+        ChatState borrows the processor, so it can't be stored beside it; the engine holds the
+        five tensors (ConversationState) and rebuilds a ChatState each turn via from_parts.
+```
+
+The engine (`Lfm2VoiceEngine`, realtime.rs) holds `conv: Option<ConversationState>`:
+
+```
+   TURN 1 (cold start)                         TURN n (warm)
+   ───────────────────                         ─────────────
+   ChatState::new + system turn (once)         ChatState::from_parts(conv.clone())
+   add_audio(user)                              new_turn(user) + add_audio(user)
+   generate_interleaved → collect              generate_interleaved → collect
+      text_ids, audio_frames(incl EOAudio),        (same)
+      modality_out (interleaved order)
+   append(text, audio_out, modality)            append(...)
+   save → self.conv                             save → self.conv
+```
+
+```
+  ┌── the discrete audio_out → context loop across turns ───────────────────────────────────┐
+  │                                                                                          │
+  │  TURN 1   question.wav ─►add_audio─► [Conformer] ──┐ CONTINUOUS in                        │
+  │           system/user text ─►tokenizer ───────────┤                                      │
+  │                                                    ▼                                      │
+  │                                            [LFM2 backbone] ─► hidden                       │
+  │                                        ┌───────────┴───────────┐                          │
+  │                                        ▼                       ▼                          │
+  │                                   [text head]          [Depthformer] 8 codes/frame        │
+  │                                        │                       │  DISCRETE out             │
+  │                                        └──── interleaved ──────┘                          │
+  │                          collect: text(1,n) · audio_out(8,m) · modality(1,n+m)            │
+  │                                   ┌────────────┴─────────────┐                            │
+  │                                   ▼                          ▼                            │
+  │                       Mimi.decode(audio_out[:-1])      chat.append(...) ─► persistent conv │
+  │                          ─► answer1 (sound)                  │                            │
+  │  TURN 2  add_text("…chairs…") ──────────────────────┐       │                            │
+  │                                                     ▼       ▼                            │
+  │             prefill scatters [ text | audio_in | audio_out(→audio_embedding) ]            │
+  │                                          ◄── turn 1's audio = CONTEXT                     │
+  │                                                     ▼                                      │
+  │                          [LFM2 backbone]  (conditioned on its own prior audio)            │
+  │                                                     ▼                                      │
+  │                              interleaved text + audio ─► answer2 (chairs‑conditioned)      │
+  └──────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+✅ Proven: `examples/chat_multiturn` on Metal bf16 — turn 1 "Handcrafted Excellence, Every Day"
+(woodworking), turn 2 a _chairs/seating_ slogan, conditioned on turn 1's appended audio. Plus
+`realtime::tests::engine_multiturn_grows_conv` (real model, `#[ignore]`, ~41 s) asserting `conv`
+text/audio_out/modality all grow turn‑1→turn‑2.
+
+### 6.7 I/O‑independence (the barge‑in fix)
+
+Persistence is keyed on what the model **generated**, not on I/O:
+
+- Audio frames are collected for `append` at _generation_ time, **before** the EOAudio/playback
+  branch — so a muted speaker changes nothing about what enters context. ✅
+- Persistence is **not** gated on clean completion. Previously `if completed { append }` _discarded_
+  the model's partial response on barge‑in — making context depend on an I/O event (the
+  interrupt). Fixed: append whenever the model generated anything (`!text_ids.is_empty() ||
+!audio_frames.is_empty()`), complete or cut short. A thought the model started is still a prior
+  thought. ✅
+
+---
+
+## 7. Layer 4 — The KV cache and the memory problem
+
+There are **two** distinct quadratic costs; they were conflated and must not be.
+
+### 7.1 Intra‑generation: the cat cache (a _speed_ waste)
+
+The backbone originally hand‑rolled the KV cache as `Tensor::cat(whole cache, new) +
+(k.clone(), v.clone())` every attention step — 2× O(L) copies per step ⇒ O(L²) memory _traffic_
+over a generation. This is GLM's "death of prefill." It is bandwidth, not gigabytes.
+
+✅ **Fixed:** the backbone now uses a **custom resident `KvSlot`** — preallocated planes with an
+in‑place cursor. (A `candle_nn::KvCache` swap was tried first and **reverted** as a parity
+deviation; the hand‑rolled resident slot is held to a stricter bar — see below.)
+
+```
+   cat cache (old)                          resident KvSlot (now)
+   ──────────────                           ─────────────────────
+   every step:                              every step:
+     cat([cache, new]) → O(L) alloc+copy      slice_set(new) at cursor → O(new)
+     (k.clone(), v.clone()) → O(L) copy        return narrow(2, 0..len) view (no copy)
+   = O(L²) traffic / generation             = O(L) traffic / generation
+```
+
+`Cache.kvs: Vec<Option<KvSlot>>`, each `{ k, v: Tensor, len: usize }` over preallocated
+`[B, n_kv, cap, head_dim]` f32 planes; capacity starts at `need.next_power_of_two().max(256)`
+and doubles on demand; `snapshot`/`rollback` are O(1) cursor moves (backing speculative
+prefill). Parity verified to a **stricter** standard than the reverted candle‑nn attempt: with
+`grouped_gqa_decode=false` a greedy+seeded generate is **bit‑identical** (wav hash) before/after
+the swap, so the storage change is exact — only the storage *shape* deviates from the reference,
+by design. The **Depthformer** keeps the cat‑based `ConcatKvCache` (faithful to Python's
+`LayerKVCache`, and its sequences are 8 codes long — no O(N²) there). `ConcatKvCache` stays.
+
+### 7.2 Inter‑turn: re‑prefill (the _14 GB_ monster)
+
+The live multi‑turn test ballooned `mic_chat` to **14 GB resident + 4.3 GB compressed**. That is
+**not** the cat cache (the KV tensors are a few MB/layer). It is the attention **score matrix**:
+`q·kᵀ` materializes `(heads, L, L)` and is upcast to **f32**; at L≈5–6 k tokens × heads × 4 B
+that is multiple GB _per layer_, transiently stacked. And the engine **re‑prefills the entire
+conversation every turn** — rebuilds `ChatState` from `conv`, re‑encodes _all_ prior audio, runs
+the _whole_ accumulated context through the backbone with a fresh cache. So turn 15 pays the full
+O(L²) score matrix over 15 turns. That is the 14 GB and the 9 s→23 s slowdown.
+
+◻️ **The real fix (next):** **inter‑turn KV persistence** — keep the backbone `KvSlot` (and conv
+state) across turns; each turn encodes + prefills only the _new_ turn and appends. `L` per turn
+stays small → the score matrix stays small → memory flat, speed flat. The resident‑`KvSlot`
+rewire (§7.1) is the _prerequisite_ that makes this a small, surgical change.
+
+```
+   re‑prefill (now)                         persisted KV (next)
+   ────────────────                         ───────────────────
+   turn n: prefill( all of turns 1..n )      turn n: prefill( only turn n's new tokens )
+           score matrix (Lₜₒₜ, Lₜₒₜ)                 attend new queries against cached K
+           = O(Lₜₒₜ²)  → 14 GB                       = O(Lₜₒₜ) per new token  → flat
+```
+
+A context **bound** (cap/trim oldest turns) is the cheap stopgap; KV persistence is the answer.
+candle‑nn 0.9.2 also ships `RotatingKvCache` (a bounded ring buffer) if we later want a hard cap.
+
+---
+
+## 8. Layer 5 — The orchestration layer (voice‑as‑agent + delegation)
+
+This is the layer wrongly left in `experiments/`; it migrates into `src-tauri/src/voice/`.
+
+### 8.1 Why delegation exists
+
+LFM2.5‑Audio is the _interface_, not the _worker_. It cannot code, do research, or touch the
+system, and it has no native function calling. So it gets one primitive — a **text‑marker tool**.
+The system prompt instructs it: chat naturally and answer simple questions itself, but for _real
+engineering, coding, research, or file/system work_, **do not attempt it**; say "I'll get my
+engineer on it" and emit exactly one line:
+
+```
+   DELEGATE: <a clear, self‑contained description of the task>
+```
+
+The orchestrator watches the **text channel** (the model's own text stream — the same prior‑
+thoughts stream from §6) for that marker and routes accordingly.
+
+### 8.2 The routing loop
+
+```
+   ┌──────────────────────────────────────────────────────────────────────────────────────┐
+   │  mic ─► record_utterance ─► engine.respond(utt)  (interleaved: speech + text channel)  │
+   │                                  │                                                     │
+   │                            text channel                                                │
+   │                                  ▼                                                      │
+   │                        extract_delegation(text)                                        │
+   │                       ┌──────────┴───────────┐                                         │
+   │                  no marker               "DELEGATE: task"                              │
+   │                       │                       │                                        │
+   │              play LFM's own reply    (1) play LFM's ack in its OWN voice (if produced) │
+   │              (small talk)            (2) engineer.run(task)   ◄── the capable model     │
+   │                                      (3) LFM speaks the engineer's result (TTS)         │
+   └──────────────────────────────────────────────────────────────────────────────────────┘
+
+   routes:  marker (default) · chat (LFM only, never delegate) · delegate (everything → engineer)
+```
+
+The "ack first, then delegate" step is deliberate barge‑in feel: the user hears LFM say "on it"
+immediately, _then_ the round‑trip happens, instead of dead air.
+
+### 8.3 The subagent (the engineer)
+
+`glm.rs` is a real **agentic tool loop**, not a one‑shot call:
+
+```
+   run_subagent(task, allow_exec, cwd, max_steps):
+     messages = [ system(engineer), user(task) ]
+     tools    = bash_tool  iff  LFM_ALLOW_EXEC=1
+     loop (≤ max_steps):
+        msg = chat.completions(messages, tools)        # OpenAI‑compatible HTTP
+        if msg has no tool_calls:  return msg.content   # short, speakable summary
+        for call in msg.tool_calls:                     # e.g. bash
+            result = run(call); append tool result to messages
+```
+
+- **Pluggable backend by design:** `GLM_BASE_URL` (default `https://ollama.com/v1`), `GLM_MODEL`
+  (default `glm-5.1`), key from `$OLLAMA_API_KEY` or the EmberHarmony auth store. It is "GLM **or
+  any other user's model**" over the OpenAI‑compatible API.
+- The engineer returns a **short, plain‑spoken** summary (no markdown/code fences) so LFM can read
+  it aloud.
+
+### 8.4 ⚠️ The open question — who is the engineer?
+
+Three candidate delegation targets, in increasing integration:
+
+```
+   (a) GLM/ollama‑cloud subagent as written      → a voice toy that can run bash
+   (b) any user‑configured OpenAI‑compatible model→ generic, BYO‑model
+   (c) EmberHarmony's OWN agent loop             → talk to EmberHarmony; it does the real work
+        (file tools, session, context, the same brain the text UI drives)
+```
+
+Recommendation: **(c)/(b)** — the `DELEGATE:` marker should hand to the real EmberHarmony agent
+(or the user's configured model), with the GLM HTTP subagent as one concrete backend. That is the
+difference between "a voice front that shells out" and "_talk to EmberHarmony_ and it does the
+work." This decision drives how much of `glm.rs` stays as‑is vs becomes a thin adapter onto the
+real brain. **This is the next decision to make before wiring Layer 5 into Layer 7.**
+
+### 8.5 Hardening (the PR threads on this layer)
+
+Real defects to fix as this layer comes into the build (not won't‑fix):
+
+- UTF‑8 char‑boundary panics in byte‑indexed truncations (`glm.rs` tool output / error body,
+  `lfm.rs` stderr) — cut on `char_indices` boundaries. ⚠️
+- Unbounded delegated `bash` (`.output()` with no timeout/cap) — bound with timeout + output
+  cap/kill. ⚠️
+- Auth path ignores `XDG_DATA_HOME` — resolve the same data dir as the main auth code. ⚠️
+- `lfm.rs` (external `llama-liquid-audio-cli`) and `setup.sh`/GGUFs — **retired**, replaced by the
+  native engine.
+
+---
+
+## 9. Layer 6 — Audio I/O (native callbacks)
+
+Native mic/speaker callbacks own realtime capture/playback. The current desktop LFM2 path feeds
+microphone frames from the same Rust WebRTC/PlatformAudio device stack used by LiveKit and routes
+assistant PCM into a local WebRTC loopback through `NativeAudioSource`; CPAL remains only as the
+standalone example fallback. The architectural invariant is the native media ownership, not the
+frontend owning `MediaStreamTrack`s. To be **unified** into one module (not duplicated) as Layer 5
+lands.
+
+```
+   CAPTURE                                          PLAYBACK
+   ───────                                          ────────
+   PlatformAudio device track                       default output device
+   NativeAudioStream → mono f32 frames               bounded SPSC PCM ring
+   RMS gate: start on first speech (rms ≥ thr),       generate loop pushes decoded PCM chunks
+     end after ~0.8–1.0 s silence (or max cap)        output callback drains ring → all channels
+   resample 48 kHz → model rate                       resample 24 kHz (Mimi) → device rate
+   → bounded local utterance buffer                   barge‑in: output callback flush + interrupt
+```
+
+- **Desktop LFM2 mode:** native audio callbacks own capture+playback in Rust; only
+  `VoiceEvent` state/transcript/level/audio metadata crosses into the webview. The webview is
+  not the microphone owner.
+- **Desktop LiveKit mode:** the Rust `livekit` SDK owns the room/session, publishes the native
+  microphone track, and reports remote audio level/state back over `VoiceEvent`. SolidJS does not
+  construct or retain a desktop `Room`.
+
+VAD today is a simple energy/RMS gate. Open question: keep it, or add a real VAD (Silero via
+`ort`) for live mode endpointing.
+
+---
+
+## 10. Layer 7 — The Tauri integration (pipeline + bridge)
+
+### 10.1 The realtime pipeline
+
+`RealtimePipeline` (realtime.rs) is a faithful restructuring of `chat.py`'s producer/consumer
+threading: a **persistent inference worker thread** owns the model and loops
+`recv utterance → respond (emit text + decode audio → emit PCM) → TurnComplete`. Because the model
+lives on its own thread, capture and playback are never blocked by generation (full‑duplex), and
+a new utterance can request **barge‑in** via an `AtomicBool` the generate loop polls.
+
+```
+   ┌──────────────────────────── RealtimePipeline ────────────────────────────────────────┐
+   │   submit(Utterance) ──► crossbeam bounded(1) ─►  worker thread (owns Lfm2VoiceEngine)  │
+   │                                                     for utt in rx.iter():              │
+   │                                                        cancel.store(false)             │
+   │                                                        engine.respond(utt, &cancel,    │
+   │                                                           |ev| try_send_event(ev))      │
+   │                                                        send terminal (TurnComplete |    │
+   │                                                                       Interrupted |     │
+   │                                                                       Error)            │
+   │   interrupt() ──► cancel.store(true)  (barge‑in: respond breaks, emits Interrupted)    │
+   │   events() ──► bounded crossbeam Receiver<VoiceEvent>  (consumer/bridge drains it)      │
+   │   Drop: cancel + close utt channel + join worker  (no detached thread, no leak)         │
+   └────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+`VoiceEngine` is a trait so the threading is unit‑tested with fakes (no model needed):
+`ScriptEngine`, `LoopEngine`, `ErrEngine`, `GuardedEngine` cover ordering, persistence across
+turns, barge‑in, error survival, and Drop‑joins‑worker. `Lfm2VoiceEngine` is the real
+implementation (owns model + processor + Mimi + the persistent `conv`).
+
+### 10.2 The crossbeam → Tauri `Channel` bridge
+
+```
+   pipeline events (crossbeam Receiver<realtime::VoiceEvent>)
+        │   consumer/bridge maps RuntimeEvent -> control::VoiceEvent
+        ▼
+   bounded tokio::mpsc<control::VoiceEvent>  (UI_EVENT_CAP, try_send backpressure)
+        │   one async fanout task drains in order
+        ▼
+   tauri::ipc::Channel<control::VoiceEvent>   (ordered, high‑throughput, webview‑facing)
+```
+
+The model/audio/provider loops never synchronously own webview IPC. They `try_send` into the
+bounded native event queue; a single async fanout task owns the Tauri `Channel` and drains events
+in order. Full queues apply backpressure instead of allowing unbounded UI latency. One bridge per
+session (there is only ever one active session — the demo's `isGenerating` guard — so no competing
+consumers steal events).
+
+### 10.3 Event mapping (the four gaps)
+
+`realtime::VoiceEvent {Text, Audio, TurnComplete, Interrupted, Error}` → `control::VoiceEvent
+{State, Transcript, Level, AudioClip, Ended, Error}` is **not** 1:1:
+
+```
+   realtime                control                            note
+   ────────                ───────                            ────
+   Text(frag)          →   Transcript{Assistant, CUMULATIVE}  bridge accumulates a per‑turn string
+   Audio(pcm)          →   live:  native ring + Level{rms}    PLAY it; only a scalar crosses IPC
+                           turn:  accumulate → AudioClip{wav} encode at TurnComplete
+   TurnComplete        →   turn: AudioClip then State{Idle}; live: State{Listening}
+   Interrupted         →   turn: State{Idle};                live: State{Listening}
+   (synthesized)       →   State{Thinking} on submit, State{Speaking} on first Audio
+```
+
+### 10.4 The resolved design decisions
+
+```
+   1. Ownership         → one Tauri VoiceRuntime kernel; SolidJS is control/display only.
+   2. Provider routing  → voice_start reads settings and starts VoiceSession::Lfm2 or ::Livekit.
+   3. Backpressure      → bounded RuntimeCommand queue; full queue returns an error, not latency.
+   4. Status            → voice_status merges settings/keychain readiness with RuntimeSnapshot.
+   5. Events            → both providers emit the same Channel<VoiceEvent> stream.
+   6. Stop/mic/interrupt→ route through the active VoiceSession, never through frontend state.
+   7. Settings changes  → voice_settings_set serializes the settings, sends
+                          RuntimeCommand::ApplySettings, and only persists after the kernel
+                          accepts the update. ApplySettings compares the active session's
+                          start-time config and stops stale native sessions inside the kernel.
+                          LiveKit keychain credential changes send
+                          RuntimeCommand::InvalidateProvider(Livekit).
+```
+
+### 10.5 Command surface
+
+```
+   voice_status(app, runtime)
+       -> VoicePlan { provider, enabled, surface, running, runningProvider, micEnabled, ready, detail }
+
+   voice_start(app, runtime, server, ctx, channel)
+       -> VoiceStartResult::{ Lfm2 | Livekit }
+
+   voice_stop(runtime)
+       -> stop and drop the active VoiceSession
+
+   voice_interrupt(runtime)
+       -> cancel/interrupt the current native reply without disconnecting
+
+   voice_set_mic_enabled(runtime, enabled)
+       -> pause/resume native microphone capture or LiveKit mic publication
+
+   voice_begin_typed_input(runtime)
+       -> pause native microphone capture and interrupt the active voice turn before text submit
+
+   voice_settings_get / voice_settings_state / voice_settings_set
+
+   voice_livekit_credentials_set / voice_livekit_credentials_status
+       -> set/read presence of LiveKit API credentials in the OS keychain; credential writes
+          invalidate an active native LiveKit session so new tokens/config are used on restart
+```
+
+`TurnMode {Asr, Tts, Interleaved}` (control.rs) carries the demo's three system prompts
+(`"Perform ASR."` / `"Perform TTS. Use the UK …​ voice."` / `"Respond with interleaved text and
+audio."`) and per‑mode `max_new_tokens` (100 / 1024 / 1024). The engine holds a `system_prompt`
+field (default interleaved) settable via `with_system_prompt`; the desktop layer maps `TurnMode →
+(prompt, budget)` because the crate can't depend on the desktop's `TurnMode` (dependency points
+the other way).
+
+---
+
+## 11. Threading model
+
+The desktop voice stack is one native kernel loop. Rust's `asyncio` equivalent here is Tokio:
+`tokio::spawn`, `tokio::sync::mpsc`, `tokio::sync::watch`, and `tokio::sync::oneshot`.
+That does not mean every audio operation becomes async. The rule is: Tokio owns orchestration,
+while realtime audio and model inference run on dedicated native threads with bounded,
+non-blocking handoff buffers.
+
+```mermaid
+flowchart LR
+  UI["SolidJS webview\nintent + rendering only"]
+  Cmd["Tauri command handlers\nvoice_start / stop / interrupt / mic / settings"]
+  CmdQ["bounded tokio::mpsc<RuntimeCommand>\ncapacity 16, try_send"]
+  Reply["tokio::oneshot replies\nper command"]
+  State["tokio::watch<RuntimeSnapshot>\nrunning/provider/mic/session"]
+  Events["tauri Channel<VoiceEvent>\nstate, transcript, level, audio"]
+
+  subgraph Tauri["Tauri desktop process"]
+    subgraph Kernel["VoiceRuntime kernel loop\nsingle active VoiceSession"]
+      Router["provider router\nLfm2 | Livekit"]
+      Reaper["ThreadManager\nstop/reap/join blocking work"]
+    end
+
+    subgraph Lfm2["VoiceSession::Lfm2\nlocal model provider"]
+      LMic["OS mic callback thread"]
+      LMicRing["bounded SPSC PCM ring\nnon-blocking push"]
+      LVad["turn detector / VAD loop"]
+      LUtt["bounded crossbeam utterance queue\ncapacity 1"]
+      LInfer["persistent std::thread\nowns Lfm2VoiceEngine + ChatState + Mimi"]
+      LEv["bounded crossbeam event queue"]
+      LOut["ExternalAudioOutput\nNativeAudioSource"]
+      LSpk["WebRTC PlatformAudio\nlocal loopback"]
+    end
+
+    subgraph LiveKit["VoiceSession::Livekit\nnative Rust/WebRTC provider"]
+      LkCmd["bounded tokio::mpsc<LiveKitCommand>\ninterrupt / mic / stop"]
+      LkGrant["native token/config builder\nsettings URL + keychain credentials + local LFM2 model"]
+      LkTask["ThreadManager-owned service thread\nblock_on user + agent rooms"]
+      LkUser["user participant\nPlatformAudio + LocalAudioTrack microphone"]
+      LkAgent["native agent participant\nRealtimePipeline + NativeAudioSource"]
+      LkControl["direct RealtimePipelineHandle interrupt\nplus reliable LiveKit data packet compatibility"]
+      LkMedia["WebRTC/native media threads"]
+      LkMic["NativeAudioStream task\nuser mic PCM -> LFM2 utterances"]
+      LkMon["NativeAudioStream monitor task\nassistant PCM RMS"]
+    end
+  end
+
+  UI --> Cmd
+  Cmd --> CmdQ
+  Cmd --> Reply
+  CmdQ --> Router
+  Router --> State
+  State --> Cmd
+  Router --> Events
+  Events --> UI
+  Reaper --> Router
+
+  Router --> Lfm2
+  Router --> LiveKit
+
+  LMic --> LMicRing --> LVad --> LUtt --> LInfer
+  LInfer --> LEv --> Events
+  LInfer --> LOut --> LSpk
+
+  LkGrant --> LkTask
+  LkCmd --> LkTask
+  LkTask --> LkControl
+  LkTask <--> LkMedia
+  LkUser --> LkMedia
+  LkMedia --> LkMic --> LkAgent
+  LkAgent --> LkMedia
+  LkMedia --> LkMon --> Events
+  LkTask --> Events
+```
+
+```mermaid
+sequenceDiagram
+  participant UI as SolidJS webview
+  participant Cmd as Tauri command handler
+  participant Kernel as VoiceRuntime kernel loop
+  participant LFM as LFM2 inference thread
+  participant LK as LiveKit service thread
+  participant Agent as Native LiveKit agent participant
+  participant Media as OS/WebRTC/audio callbacks
+  participant Events as Channel<VoiceEvent>
+
+  UI->>Cmd: invoke voice_start/stop/interrupt/mic
+  Cmd->>Kernel: try_send RuntimeCommand over bounded Tokio mpsc
+  Kernel->>Kernel: own exactly one VoiceSession
+
+  alt provider = lfm2
+    Kernel->>LFM: spawn Lfm2Runtime/RealtimePipeline session
+    Media->>LFM: mic PCM via bounded SPSC ring + utterance queue
+    LFM->>Media: speaker PCM via NativeAudioSource loopback
+    LFM->>Events: text/audio/state/level events
+  else provider = livekit
+    Kernel->>LK: mint token/config from Tauri settings + keychain
+    Kernel->>LK: spawn ThreadManager-owned LiveKitSession
+    Cmd->>LK: try_send LiveKitCommand over bounded Tokio mpsc
+    LK->>Media: user Room::connect, PlatformAudio, LocalAudioTrack
+    LK->>Agent: agent Room::connect, RealtimePipeline, NativeAudioSource
+    Media->>Agent: user mic NativeAudioStream frames
+    Agent->>Media: assistant PCM as WebRTC AudioFrame
+    LK->>Agent: interrupt via RealtimePipelineHandle
+    LK->>Media: optional reliable LiveKit data topic
+    Media->>LK: RoomEvent + NativeAudioStream frames
+    LK->>Events: error + ended if native agent audio track does not subscribe
+    LK->>Events: state/level/error/ended events
+  end
+
+  Events->>UI: ordered render stream
+```
+
+- The desktop kernel uses `tokio::sync::mpsc` for bounded command/control and
+  `tokio::sync::watch` for the current status snapshot. That is Rust's equivalent lane for
+  Python `asyncio` orchestration in this app.
+- Hot audio/model work is not "just async": LFM2 generation runs on dedicated `std::thread`s
+  that own the model pipeline, the LiveKit control loop runs in a ThreadManager-owned service
+  thread that drives Tokio signaling, OS audio callbacks run on callback threads, and
+  LiveKit/WebRTC owns native media worker threads under the Rust SDK.
+- The LFM2 path uses bounded `crossbeam-channel` queues for utterances/events, a bounded SPSC PCM
+  ring for standalone capture/playback fallback, and desktop WebRTC `ExternalAudioInput` /
+  `ExternalAudioOutput` hooks for mic and speaker media. Full queues apply backpressure or cancel
+  stale work instead of accumulating unbounded latency.
+- The LiveKit path mirrors that control shape with native token/config minting from Tauri
+  settings plus keychain credentials and a local LFM2 model. A bounded `LiveKitCommand` queue
+  controls the active room pair: the user participant publishes `PlatformAudio` microphone frames,
+  while the native agent participant owns `RealtimePipeline`, subscribes to those mic frames via
+  `NativeAudioStream`, and publishes assistant PCM through `NativeAudioSource`. Assistant PCM also
+  feeds a native playback reference that raises the agent mic VAD threshold during playback, so
+  ordinary speaker echo does not become the next user utterance while louder real barge-in can still
+  clear the gate. Interrupt directly calls `RealtimePipelineHandle::interrupt`, also sending a
+  reliable in-room control packet for compatibility, clears the playback reference, and keeps the room
+  alive; if the native agent audio track does not subscribe within the bounded startup window, the
+  session emits an error and ends instead of leaving a connected dead mic; stop closes both rooms.
+  Remaining deeper media parity is sample-accurate validation against the upstream Moshi realtime
+  loop under sustained interruption and barge-in.
+- Intra‑op thread count mirrors torch's policy (`threads.rs`) so CPU numerics/perf track the
+  Python reference. BF16 model weights stay BF16; the in-tree NEON `BFMMLA` bridge is used for
+  BF16 CPU 2-D linears/logits where the safetensor dtype requires it, while local math that is
+  canonically accumulated in f32 stays local f32 math.
+
+---
+
+## 12. Phasing — LFM2 turn loop now, Moshi frame‑duplex later
+
+```
+   LFM2 provider (NOW)
+       native audio callbacks + VAD produce user turns
+       RealtimePipeline owns a persistent model worker
+       generate_interleaved emits one modality at a time
+       barge-in cancels the current turn and flushes output
+
+   Moshi provider/layer (NEXT)
+       true frame-duplex speech model
+       processes input AND output streams every frame
+       emits text + audio codebooks in parallel streams
+       should reuse the same VoiceRuntime/VoiceSession/VoiceEvent kernel surface
+```
+
+LFM2 vs Moshi, precisely:
+
+```
+   LFM2 provider (now)                       Moshi provider (next)
+   ──────────                                ───────────────
+   reasons over both per step (shared        same shared reasoning, PLUS
+     backbone) but EMITS one modality        emits text + all audio codebooks EVERY frame
+     per step (time‑multiplex 6:12)            (parallel streams, inner monologue aligned)
+   turn‑based + a VAD loop                   architecturally frame‑duplex
+```
+
+The event‑driven core (`VoiceRuntime` + `VoiceSession` + `VoiceEvent`) is shared across providers.
+Moshi should be another native provider/session under the same kernel, not a second frontend
+voice stack.
+
+---
+
+## 13. File & module map
+
+```
+   packages/desktop/src-tauri/
+   ├─ Cargo.toml                         liquid-audio dep (features=["metal"] on macOS)
+   ├─ .cargo/config.toml                  macOS LiveKit/WebRTC link args (-ObjC)
+   ├─ src/voice/
+   │   ├─ VOICE_ARCHITECTURE.md          ← this document
+   │   ├─ FRONTEND_DESIGN.md             webview/UX design + the resolved Phase‑1 decisions
+   │   ├─ control.rs                     voice_status/voice_start/stop/interrupt/mic + provider plan
+   │   ├─ livekit.rs                     native LiveKit URL/keychain credentials + room token minting
+   │   ├─ runtime.rs                     VoiceRuntime kernel, Lfm2Session, LiveKitSession
+   │   ├─ threads.rs                     shared ThreadManager for provider/helper/download threads
+   │   ├─ model.rs                       HF token, model directory picker, ThreadManager-owned download
+   │   ├─ session.rs                     session bridge reducer/runner for delegated turns
+   │   │                                 plus current DELEGATE routing target
+   │   └─ engineer.rs        ◻️           future standalone capable-model subagent, if kept
+   └─ crates/liquid-audio/               the native model engine (Layers 1‑4)
+       ├─ src/
+       │   ├─ loader.rs                  config.json + safetensors → model + processor
+       │   ├─ processor.rs               LFM2AudioProcessor + ChatState (new/append/from_parts/add_*)
+       │   ├─ realtime.rs                RealtimePipeline + Lfm2VoiceEngine + VoiceEvent  (Layer 7 seam)
+       │   ├─ detokenizer.rs             LFM2 audio detokenizer (one‑shot decode backend)
+       │   ├─ audio_out.rs               AudioDetokenizer trait + MimiDetokenizer (moshi)
+       │   ├─ resample.rs                torchaudio.functional.resample (windowed‑sinc) port
+       │   ├─ threads.rs                 intra‑op thread parity with torch
+       │   ├─ bf16_gemm.rs (+ csrc/)     NEON BFMMLA bf16 CPU GEMM for BF16 2-D linears/logits (§4.8)
+       │   ├─ candle_ext/                vendored candle 0.10 backports on the 0.9.2 pin
+       │   │   ├─ kv_cache.rs            ConcatKvCache (Depthformer)
+       │   │   ├─ transformers_utils.rs  build_causal_mask + repeat_kv
+       │   │   └─ tensor_ext.rs          to_vec4
+       │   ├─ model/
+       │   │   ├─ lfm2_audio.rs          generate_* · prefill_inputs · Depthformer · GenParams
+       │   │   ├─ lfm2_hf.rs             LFM2 backbone (hybrid conv+GQA) + Cache (resident KvSlot + grouped‑GQA)
+       │   │   ├─ transformer.rs         shared blocks · LayerKvCache (wraps ConcatKvCache)
+       │   │   ├─ mlp.rs                 audio_adapter
+       │   │   └─ conformer/             subsampling · encoder · mha · processor (mel)
+       │   └─ data/                      mapper · dataloader · arrow_io  (training preprocessing)
+       ├─ examples/
+       │   ├─ generate.rs                ✅ single‑turn end‑to‑end (the canonical proof)
+       │   ├─ chat_multiturn.rs          ✅ canonical 2‑turn discrete‑audio‑context proof
+       │   ├─ mic_chat.rs                ✅ live mic loop (now engine‑backed, persistent memory)
+       │   ├─ duplex_chat.rs             full‑duplex barge‑in loop (RealtimePipeline)
+       │   └─ text_chat.rs               text→text proof
+       └─ parity/                        dump_*.py + golden/*.safetensors (gitignored, regenerable)
+
+   experiments/lfm2-audio-voice/         the prototype this stack supersedes
+   ├─ src/{main,glm,lfm,audio}.rs        ← Layer 5 source‑of‑truth to migrate (main+glm); lfm/audio retired
+   ├─ setup.sh                           builds llama.cpp PR #18641 + GGUFs — retired (native engine)
+   └─ upstream-liquid-audio/             the Python reference we port from (kept, not shipped)
+```
+
+---
+
+## 14. Verification & proofs
+
+```
+   ✅ text→text            examples/text_chat        tokenizer→backbone→text head coherent
+   ✅ single‑turn E2E      examples/generate         "Handcrafted Excellence, Every Day" + 7.7 s Mimi WAV,
+                                                     Metal bf16, ~15 tok/s
+   ✅ multi‑turn discrete  examples/chat_multiturn    turn 2 chairs‑conditioned on turn 1's appended audio
+   ✅ engine persistence   realtime::tests::engine_multiturn_grows_conv  (real model, #[ignore], ~41 s):
+                                                     conv text/audio_out/modality all grow t1→t2
+   ✅ live mic             desktop local path + examples/mic_chat real conversation on hardware:
+                                                     WebRTC mic in Tauri / fallback mic in examples → model-rate →
+                                                     Depthformer → Mimi streaming → speaker, real‑time
+   ✅ resident KvSlot      cargo build --features metal + lib tests + BYTE‑identical wav (grouped_gqa_decode=false)
+   ✅ threading            realtime::tests           ordering · persistence · barge‑in · error survival · Drop
+```
+
+Faithfulness is gated on **behavior** (ported tests, golden differential dumps, real runs), never
+on structural/AST similarity (a cheatable shadow). Heavy/real tests are **run**, not stubbed and
+ignored.
+
+---
+
+## 15. Open questions / next moves
+
+```
+   ◻️ #1  The engineer (§8.4): GLM subagent / any user model / EmberHarmony's own agent?
+            → drives where Layer 5 plugs into Layer 7 and how much of glm.rs survives.
+   ◻️ #2  Inter‑turn KV persistence (§7.2): the real 14 GB fix; prerequisite (resident KvSlot) is done.
+   🔧 #3  Finish Layer 5 hardening: `session.rs`/BridgeState now wire DELEGATE into the
+            EmberHarmony session; the standalone glm.rs engineer choice and hardening remain.
+   🔧 #4  Desktop media parity: provider-routed voice_start, native LiveKit room/mic, local
+            WebRTC mic capture, local WebRTC speaker loopback, LFM2 playback-reference VAD
+            gate, and LiveKit assistant playback-reference VAD gate are wired; sustained
+            realtime Moshi parity and barge-in validation remain.
+   ⚠️ #5  Crate hardening (PR threads): zero‑length Metal tensors (T8/T22),
+            encoder setup_streaming_params (T24),
+            loader tokenizer‑* skip (T3), detok mask cache (T1).
+   ⚠️ #6  Orchestration hardening (§8.5): UTF‑8 boundaries, bounded bash, XDG auth path.
+   ◻️ #7  CI: macOS cargo build --features metal (T23); wiki scripts or remove workflow (T7).
+   ◻️ #8  Bring in the Moshi LM as another native VoiceSession for true full‑duplex streams.
+   🔧 #9  Keep the BF16 path locked to safetensor dtype: 2-D CPU linears/logits use the NEON
+            BFMMLA bridge when weights are BF16; local canonical f32 accumulation remains local
+            math. Continue auditing for accidental whole-checkpoint f32 reloads.
+```
+
+---
+
+## 16. Glossary
+
+```
+   audio‑in            the user's voice; CONTINUOUS mel→Conformer embeddings (modality AUDIO_IN)
+   audio‑out           the model's voice; DISCRETE 8 RVQ codes/frame (modality AUDIO_OUT)
+   audio_embedding     the MODEL's learned audio token table (codes → backbone input) — CONTEXT
+   ChatState           the five accumulating model‑input tensors (text/audio_in/lens/audio_out/flag)
+   Conformer           the audio‑in encoder (ConvSubsampling + relative‑pos MHA + conv + FFN)
+   ConcatKvCache       cat‑based KV cache (Depthformer; faithful to Python LayerKVCache)
+   conv (engine)       ConversationState: the persisted five tensors carried across turns
+   DELEGATE:           the one‑line text‑marker primitive the voice model uses to hand off work
+   Depthformer         the 2nd autoregressive transformer; emits the 8 RVQ codes per frame
+   EOAudio             code 2048 / all‑2048 frame; the end‑of‑audio terminator
+   GenToken            Text(u32) | Audio(Vec<u32>) — the generation stream item
+   interleaved_n_*     6 text : 12 audio — the modality time‑multiplex cadence
+   KvSlot              custom RESIDENT KV planes (preallocated, in‑place slice_set, O(1) cursor rollback; backbone)
+   LFM2 backbone       the hybrid short‑conv + GQA transformer shared by both heads
+   Lfm2VoiceEngine     the real VoiceEngine: owns model+proc+Mimi+persistent conv (realtime.rs)
+   Mimi                the codec (codes → 24 kHz waveform) for PLAYBACK only (moshi crate)
+   modality_flag       per‑position LFMModality; the order the prefill scatter rebuilds
+   RealtimePipeline    the worker‑thread pipeline (submit/interrupt/events)
+   VoiceEvent          the streamed reply item (realtime: Text/Audio/…; control: State/Transcript/…)
+```
+
+---
+
+_End of stack architecture. The heart is Layer 3: everything feeds, generates, or speaks the
+model's prior thoughts; the orchestration layer is what lets those thoughts turn into work._

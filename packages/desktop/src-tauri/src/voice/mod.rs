@@ -1,15 +1,23 @@
 //! Native (desktop-only) voice pipeline.
 //!
-//! Replaces the LiveKit + `@livekit/agents` Node worker with a pure Rust pipeline
-//! running on real tokio tasks inside the Tauri process:
+//! Replaces voice-side worker processes with services owned by the Tauri desktop
+//! process:
 //!
 //! ```text
-//! cpal mic -> Silero VAD (ort) -> [turn detector] -> STT
-//!          -> session sidecar (HTTP /prompt_async + /event SSE)   <- this module
-//!          -> TTS -> cpal playback        (barge-in -> stop TTS + POST /abort)
+//! Solid UI -> Tauri command -> VoiceRuntime kernel
+//!                         -> LFM2: native mic -> Rust VAD -> RealtimePipeline worker
+//!                         -> LiveKit: Rust Room + PlatformAudio + native WebRTC media
+//!                         -> Tauri Channel state/events
 //! ```
 //!
-//! Phase 0 (this module's `session`) is the bridge to the EmberHarmony session
-//! sidecar — a direct port of `packages/emberharmony/src/voice/bridge.ts`, whose
-//! 16-test harness is the behavioural spec. The audio/STT/TTS phases land on top.
+//! `control` is the settings-driven command seam. `runtime` is the managed
+//! service layer: provider sessions, audio callbacks, VAD, playback,
+//! interruption, model inference, LiveKit media, and cleanup all live in Rust.
+//! `session` is the reducer/runner for delegated turns into the EmberHarmony
+//! session backend, not the desktop media owner.
+pub mod control;
+pub mod livekit;
+pub mod model;
+pub mod runtime;
 pub mod session;
+mod threads;

@@ -251,7 +251,9 @@ if (process.platform === "darwin" && !noDmg) {
   await $`cp -R ${appBundle} ${stagingDir}/`
   await $`ln -s /Applications ${stagingDir}/Applications`
 
-  await $`hdiutil create -volname "EmberHarmony Dev" -srcfolder ${stagingDir} -ov -format UDZO ${dmgPath}`
+  const stagingMb = Number((await $`du -sm ${stagingDir}`.text()).trim().split(/\s+/)[0])
+  const dmgSize = `${Math.ceil(stagingMb * 1.35) + 128}m`
+  await $`hdiutil create -volname "EmberHarmony Dev" -srcfolder ${stagingDir} -ov -format UDZO -fs HFS+ -size ${dmgSize} ${dmgPath}`
   await $`rm -rf ${stagingDir}`
 
   console.log(`[build-local] DMG created: ${dmgPath}`)
