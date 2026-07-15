@@ -3,10 +3,16 @@
 > **Current-hybrid document.** This file describes the shipped Rust/Candle/native
 > mixture while the replacement is being designed. The normative target is
 > [`specs/11-kcoro-native-migration.md`](../../../../../specs/11-kcoro-native-migration.md),
-> including the fixed Flashkern executor and ticket callback contract in
+> including the fixed Flashkern executor and native SQ/CQ contract in
 > [document 03](../../../../../specs/11-kcoro-native-migration/03-scheduler-passes-and-recurrence.md)
 > and the Tauri/visualizer observer design in
 > [document 12](../../../../../specs/11-kcoro-native-migration/12-ticketed-orchestration-and-observability.md).
+> The authoritative callback-only Rust-coordinator boundary is
+> [document 13](../../../../../specs/11-kcoro-native-migration/13-coordination-contract.md).
+> The source-exact mounted pass sequence and its current capacities are in the
+> [native integration runbook](../../../../../docs/native/KCORO_ARENA_INTEGRATION.md#mounted-pass-sequence-4f06a3d5).
+> The Rust audio/Candle ownership described below is current implementation
+> truth, not the target architecture.
 > At cutover this document is rewritten in place; Git history is the old
 > architecture record.
 
@@ -104,7 +110,7 @@ signed. The microphone was a dumb pipe; all intelligence lived elsewhere.
 itself**, and treats "doing hard work" as a _delegated tool_, not the default path:
 
 ```
-   mic ─► LFM2.5‑Audio (LOCAL, native Rust, candle+Metal)
+   mic ─► LFM2.5‑Audio (LOCAL, hybrid Rust/Candle + native C++/SIMD)
             │  it IS the agent: ears, voice, small talk, and judgement about when to hand off
             ├─ ordinary turn        ─► speak its own reply            (small talk, quick answers)
             └─ "DELEGATE: <task>"   ─► capable model / EmberHarmony agent does the work
@@ -159,12 +165,24 @@ flowchart TB
     MicRing["bounded SPSC mic PCM ring\nnon-blocking push/read"]
     Vad["VAD / turn detector\nbarge-in + flush"]
     UttQ["bounded utterance queue\nsize 1"]
-    Infer["persistent inference std::thread\nowns Lfm2VoiceEngine + ChatState + Mimi"]
+    Infer["persistent inference std::thread\nowns outer Lfm2VoiceEngine + ChatState + Mimi"]
+    Rim["blocking CPU pass rim\nborrowed model buffers"]
+    Coord["Rust kcoro\nSQ broker + CQ ingress"]
+    Bridge["native descriptor pool\n1-cell SQ/CQ + doorbells"]
+    Flash["fixed C++ Flashkern lanes\nNEON / AVX / assembly"]
     EventQ["bounded crossbeam event queue"]
     OutRing["bounded SPSC speaker PCM ring"]
     SpkCb["OS audio output callback"]
 
     MicCb --> MicRing --> Vad --> UttQ --> Infer
+    Infer --> Rim
+    Rim -->|"registered submit callback"| Coord
+    Coord -->|"128-byte SQ cell"| Bridge
+    Bridge --> Flash
+    Flash -->|"128-byte CQ cell"| Bridge
+    Bridge -->|"blocking CQ edge"| Coord
+    Coord -->|"resolve result slot"| Rim
+    Rim --> Infer
     Infer --> EventQ
     Infer --> OutRing --> SpkCb
   end
@@ -195,20 +213,36 @@ provider mismatch should stop a native session; it sends intent and renders the 
 The LiveKit provider may still use a LiveKit SFU when that provider is selected, but the desktop
 client/session lifecycle lives in Rust, not in the webview and not in a bundled Node/Python sidecar.
 
+The broker loop in this diagram is mounted only for eligible CPU Flashkern passes.
+The outer call remains synchronous because its numerical pointers are still
+borrowed from model-owned storage. Text and Depthformer sampling now execute inside
+their typed native passes. Outer turn recurrence, model lifecycle, audio, and Tauri
+observation remain outside this pass edge; the target documents describe their
+removal or remounting.
+
 ---
 
-## 3. Layer 0 — Why native Rust (the migration)
+## 3. Layer 0 — Why the first native migration happened
 
-**Decision:** rebuild voice as one native Rust kernel inside `packages/desktop/src-tauri`.
-The LFM2 provider runs the local model in-process; the LiveKit provider runs the desktop
-LiveKit/WebRTC client in Rust. The thing being deleted is the _sidecar/frontend-owned voice
-runtime_ shape: Node agents, orphanable worker processes, and SolidJS-owned desktop rooms.
-Rationale:
+**Shipped first decision:** rebuild voice in-process under
+`packages/desktop/src-tauri`. The current LFM2 provider still runs substantial
+local inference and audio code in Rust/Candle; the LiveKit provider runs the
+desktop LiveKit/WebRTC client in Rust. The first migration deleted the
+_sidecar/frontend-owned voice runtime_ shape: Node agents, orphanable worker
+processes, and SolidJS-owned desktop rooms.
+
+The active second migration keeps Tauri as the host, moves local audio and all
+numerical inference into C++/assembly, and gives the dedicated Rust kcoro runtime
+only tickets, scopes, callbacks, and recurrence policy. See the normative
+documents linked at the top of this file.
+
+First-migration rationale:
 
 - Removes the cloud‑SFU **double round‑trip** for the local LFM2 assistant (mic→SFU→agent→SFU→spk).
 - Removes the Node worker (zombies/IPC/orphans), the bundled+codesigned voice runtime, and
   frontend-owned room/dispatch lifecycle for desktop.
-- Real OS threads are the right home for realtime audio; Tauri's Rust side has them.
+- Realtime audio needed resident OS threads rather than a frontend/sidecar
+  lifecycle. The target owner is now the native audio kernel, not Tauri.
 
 **Two migrations happened, and I initially only did the first:**
 

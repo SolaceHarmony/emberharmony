@@ -109,5 +109,8 @@ fn native_mimi_matches_moshi_across_kv_wrap() {
         .map(|(&a, &b)| (a - b).abs())
         .fold(0f32, f32::max);
     eprintln!("[mimi-parity] post-reset frame: worst |Δ| = {worst_reset:.3e}");
-    assert!(worst_reset <= MAX_ABS, "post-reset divergence {worst_reset:.3e}");
+    assert!(
+        worst_reset <= MAX_ABS,
+        "post-reset divergence {worst_reset:.3e}"
+    );
 }

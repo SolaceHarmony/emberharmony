@@ -104,6 +104,27 @@ static bool cpu_has_avx512_bf16() {
     return available;
 }
 
+static bool cpu_has_avx2_fma() {
+    static const bool available = [] {
+        if (__get_cpuid_max(0, nullptr) < 7) return false;
+
+        uint32_t eax, ebx, ecx, edx;
+        __cpuid_count(1, 0, eax, ebx, ecx, edx);
+        constexpr uint32_t fma = 1u << 12;
+        constexpr uint32_t osxsave = 1u << 27;
+        constexpr uint32_t avx = 1u << 28;
+        if ((ecx & (fma | osxsave | avx)) != (fma | osxsave | avx)) return false;
+
+        // XMM and YMM state must both be owned by the host OS before an AVX
+        // opcode can execute. Rosetta currently fails this gate by design.
+        if ((xgetbv0() & 0x6) != 0x6) return false;
+        __cpuid_count(7, 0, eax, ebx, ecx, edx);
+        constexpr uint32_t avx2 = 1u << 5;
+        return (ebx & avx2) != 0;
+    }();
+    return available;
+}
+
 // --- AVX-512-BF16 path: VDPBF16PS microkernel, 16 output columns per row. ---
 // Ap[m][kpair] = u32 packing (A[m][2p] | A[m][2p+1]<<16), broadcast to 16 lanes.
 // Bp per 16-col block, per k-pair: 16 lanes × (B[2p][col] | B[2p+1][col]<<16).
@@ -275,6 +296,10 @@ extern "C" void lfm_bf16_gemm_nt_f32(const uint16_t *A, const uint16_t *W, float
     gemm_nt_impl(A, W, C, M, N, K);
 }
 
+extern "C" int lfm_bf16_gemm_available(void) {
+    return cpu_has_avx2_fma() ? 1 : 0;
+}
+
 // int8 tensor MAC via VPMADDWD (AVX-512-BW): C(M,N) s32 = A(M,K) s8 · B(K,N) s8.
 namespace {
 X86_TGT_AVX512
@@ -395,6 +420,98 @@ extern "C" X86_TGT_AVX2 void lfm_depthwise_causal_conv1d_bf16(
                 orow[t] = f32_to_bf16_bits(acc);
             }
         }
+}
+
+namespace {
+X86_TGT_AVX2
+static void depthwise_stream_copy(const uint16_t *src, uint16_t *dst, int count) {
+    int i = 0;
+    for (; i + 16 <= count; i += 16) {
+        const __m256i values = _mm256_loadu_si256((const __m256i *)(src + i));
+        _mm256_storeu_si256((__m256i *)(dst + i), values);
+    }
+    volatile uint16_t *tail = dst;
+    for (; i < count; ++i) tail[i] = src[i];
+}
+
+X86_TGT_AVX2
+static void depthwise_stream_zero(uint16_t *dst, int count) {
+    volatile uint16_t *tail = dst;
+    for (int i = 0; i < count; ++i) tail[i] = 0;
+}
+
+X86_TGT_AVX2
+static void depthwise_stream_state(const uint16_t *xrow, const uint16_t *crow,
+                                   uint16_t *next_row, int T, int P) {
+    if (P == 0) return;
+    if (T >= P) {
+        depthwise_stream_copy(xrow + T - P, next_row, P);
+        return;
+    }
+    const int retained = P - T;
+    if (crow)
+        depthwise_stream_copy(crow + T, next_row, retained);
+    else
+        depthwise_stream_zero(next_row, retained);
+    depthwise_stream_copy(xrow, next_row + retained, T);
+}
+
+} // namespace
+
+extern "C" int lfm_depthwise_stream_bf16_available(void) {
+    return lfm_bf16_gemm_available();
+}
+
+// CPU translation of the streaming depthwise grid. The x86 contract requires
+// AVX2/FMA; Rosetta does not advertise those opcodes and must skip this leaf.
+extern "C" X86_TGT_AVX2 void lfm_depthwise_stream_bf16(
+    const uint16_t *x, const uint16_t *cache, const uint16_t *weights,
+    uint16_t *out, uint16_t *next, int Bn, int D, int T, int K) {
+    const int P = K - 1;
+    const int rows = Bn * D;
+    for (int row = 0; row < rows; ++row) {
+        const int channel = row % D;
+        const uint16_t *xrow = x + (size_t)row * T;
+        const uint16_t *crow = cache ? cache + (size_t)row * P : nullptr;
+        const uint16_t *wrow = weights + (size_t)channel * K;
+        uint16_t *orow = out + (size_t)row * T;
+        int t = 0;
+
+        for (; t < T && t < P; ++t) {
+            float acc = 0.0f;
+            for (int j = 0; j < K; ++j) {
+                const int source = t + j;
+                const float value = source < P
+                                        ? (crow ? bf16_to_f32(crow[source]) : 0.0f)
+                                        : bf16_to_f32(xrow[source - P]);
+                acc = std::fma(value, bf16_to_f32(wrow[j]), acc);
+            }
+            orow[t] = f32_to_bf16_bits(acc);
+        }
+        for (; t + 8 <= T; t += 8) {
+            __m256 acc = _mm256_setzero_ps();
+            for (int j = 0; j < K; ++j) {
+                const int source = t - P + j;
+                acc = _mm256_fmadd_ps(upconv8(xrow + source),
+                                      _mm256_set1_ps(bf16_to_f32(wrow[j])), acc);
+            }
+            float values[8];
+            _mm256_storeu_ps(values, acc);
+            for (int i = 0; i < 8; ++i)
+                orow[t + i] = f32_to_bf16_bits(values[i]);
+        }
+        for (; t < T; ++t) {
+            float acc = 0.0f;
+            for (int j = 0; j < K; ++j) {
+                acc = std::fma(bf16_to_f32(xrow[t - P + j]),
+                               bf16_to_f32(wrow[j]), acc);
+            }
+            orow[t] = f32_to_bf16_bits(acc);
+        }
+
+        depthwise_stream_state(xrow, crow,
+                               P ? next + (size_t)row * P : nullptr, T, P);
+    }
 }
 
 // =====================================================================================
@@ -935,4 +1052,83 @@ extern "C" X86_TGT_AVX2 float lfm_bf16_sumsq_candle_f32(const uint16_t *x, int n
         acc = acc + v * v;
     }
     return acc;
+}
+
+// Baseline-SSE sampling leaves: these deliberately avoid AVX2 so the local
+// Rosetta conformance path exercises the same contract on every x86-64 Mac.
+extern "C" uint32_t lfm_sampler_argmax_f32(const float *x, size_t count) {
+    if (count == 0) return 0;
+    __m128 maximum4 = _mm_set1_ps(-INFINITY);
+    size_t i = 0;
+    for (; i + 4 <= count; i += 4) maximum4 = _mm_max_ps(maximum4, _mm_loadu_ps(x + i));
+    float lanes[4];
+    _mm_storeu_ps(lanes, maximum4);
+    float maximum = lanes[0];
+    for (size_t lane = 1; lane < 4; ++lane)
+        if (lanes[lane] > maximum) maximum = lanes[lane];
+    for (; i < count; ++i)
+        if (x[i] > maximum) maximum = x[i];
+    for (i = 0; i < count; ++i)
+        if (x[i] == maximum) return (uint32_t)i;
+    return 0;
+}
+
+extern "C" uint32_t lfm_sampler_argmax_bf16(const uint16_t *x, size_t count) {
+    if (count == 0) return 0;
+    float maximum = -INFINITY;
+    for (size_t i = 0; i < count; ++i)
+        if (bf16_to_f32(x[i]) > maximum) maximum = bf16_to_f32(x[i]);
+    for (size_t i = 0; i < count; ++i)
+        if (bf16_to_f32(x[i]) == maximum) return (uint32_t)i;
+    return 0;
+}
+
+extern "C" float lfm_sampler_exp_sum_f32(const float *x, float *weights,
+                                           size_t count, float scale,
+                                           float maximum, float threshold) {
+    float sum = 0.0f;
+    size_t i = 0;
+    const __m128 factor = _mm_set1_ps(scale);
+    for (; i + 4 <= count; i += 4) {
+        float values[4];
+        _mm_storeu_ps(values, _mm_mul_ps(_mm_loadu_ps(x + i), factor));
+        for (size_t j = 0; j < 4; ++j) {
+            float weight = values[j] >= threshold ? expf(values[j] - maximum) : 0.0f;
+            weights[i + j] = weight;
+            sum += weight;
+        }
+    }
+    for (; i < count; ++i) {
+        float value = x[i] * scale;
+        float weight = value >= threshold ? expf(value - maximum) : 0.0f;
+        weights[i] = weight;
+        sum += weight;
+    }
+    return sum;
+}
+
+extern "C" float lfm_sampler_exp_sum_bf16(const uint16_t *x, float *weights,
+                                            size_t count, uint16_t bf16_scale,
+                                            float maximum, float threshold) {
+    float scale = bf16_to_f32(bf16_scale);
+    float sum = 0.0f;
+    for (size_t i = 0; i < count; ++i) {
+        float value = bf16_to_f32(f32_to_bf16_bits(bf16_to_f32(x[i]) * scale));
+        float weight = value >= threshold ? expf(value - maximum) : 0.0f;
+        weights[i] = weight;
+        sum += weight;
+    }
+    return sum;
+}
+
+extern "C" uint32_t lfm_sampler_prefix_pick(const float *weights, size_t count,
+                                              float target) {
+    float prefix = 0.0f;
+    uint32_t last = 0;
+    for (size_t i = 0; i < count; ++i) {
+        if (weights[i] > 0.0f) last = (uint32_t)i;
+        prefix += weights[i];
+        if (target < prefix) return (uint32_t)i;
+    }
+    return last;
 }

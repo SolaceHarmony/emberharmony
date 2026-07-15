@@ -10,10 +10,11 @@ Baseline: EmberHarmony `321538f11749`.
 
 Fix the compute substrate for every native stage in documents 03 through 07:
 
-- **No tensor library anywhere in the production voice path.** No Candle, no
-  Eigen, no MLX-on-CPU, no generic tensor-object or expression-template
-  framework, no SLEEF/SVML. A "tensor" in production native code is a pointer,
-  a shape fact recorded in a plan, and a kernel.
+- **No tensor library in the production CPU path.** No Candle, Eigen, MLX-on-CPU,
+  generic tensor-object or expression-template framework, or SLEEF/SVML enters
+  Flashkern. A CPU "tensor" is a pointer, a shape fact recorded in a plan, and a
+  kernel. Apple GPU matrix coprocessing is mandatory and belongs to a separate
+  MLX C++/Metal device engine, never inside Flashkern.
 - **Math is house SIMD.** aarch64 NEON and x86_64 AVX2/AVX-512 kernels are
   written as `.S` where hand scheduling matters and as fixed-shape intrinsic
   translation units where compiler output is measured and disassembled. Scalar
@@ -27,12 +28,13 @@ Fix the compute substrate for every native stage in documents 03 through 07:
 - **Waiting is zero-spin.** A fence or doorbell reads its generation once,
   registers and rechecks, then blocks through the host wait-word adapter. There
   is no bounded spin or monitor-wait budget before parking.
-- **The call graph is Rust -> C ABI -> C++ coordinator -> kernel table.** Rust's
-  only relevant responsibility is converting persisted settings into ABI
-  structs and invoking control methods. C++ owns model loading, pointer binding,
-  stage planning, recurrence, and dispatch. No numerical kernel, SIMD intrinsic,
-  payload-bearing FFI method, or unsafe math block exists in production Rust;
-  transitional Rust rims are deleted per documents 02 and 07, not optimized.
+- **The numerical call graph is native pass descriptor -> C++ fixed executor ->
+  kernel table.** Rust converts settings, coordinates tickets/scopes, publishes
+  descriptor IDs, and consumes compact terminal facts. C++ owns model loading,
+  pointer binding, stage planning, sampling, state mutation, and dispatch. No
+  numerical kernel, SIMD intrinsic, payload-bearing FFI method, or unsafe math
+  block exists in production Rust; transitional Rust rims are deleted per
+  documents 02 and 07, not optimized.
 
 ## Current Ownership Debt
 
@@ -45,7 +47,7 @@ lifecycle notification at
 `crates/kcoro-sys/vendor/kcoro_arena/core/src/kc_runtime.c:225-324`.
 Flashkern commit `d2c43abd` owns cache-line-isolated shared dispatch and fence
 words and blocks through prepared `kc_port_wait_u32` handles at
-`native/src/engine/flashkern_engine.cpp:622-650` and `1029-1046`;
+`native/src/engine/flashkern_engine.cpp:634-662` and `1041-1052`;
 `FENCE_SPIN`, `kcoro_park`, and `kcoro_unpark` are absent.
 
 | Current work in Rust | Evidence | Required native owner |
@@ -53,30 +55,34 @@ words and blocks through prepared `kc_port_wait_u32` handles at
 | resampling and audio accumulation | `crates/liquid-audio/src/processor.rs:1089-1163` | native frontend plan and SIMD resampler |
 | DFT, mel filtering, log, and normalization | `crates/liquid-audio/src/processor.rs:254-472` | native mel stages and reduction kernels |
 | Conformer and adapter tensor graph | `crates/liquid-audio/src/model/conformer/encoder.rs:185-317` and `crates/liquid-audio/src/model/lfm2_audio.rs:403-419` | C++ pass plan over kernel-table entries |
-| sampling and token recurrence | `crates/liquid-audio/src/model/lfm2_audio.rs:199-262` and `1630-1733` | native sampler state and coordinator recurrence |
+| sampling and token recurrence | Native collective: `native/src/engine/flashkern_engine.cpp:776-896`; transitional owner/recurrence: `crates/liquid-audio/src/model/lfm2_audio.rs:199-281` and `1630-1743` | sampler math is mounted; move opaque RNG/state append into native conversation state and retain Rust kcoro only for recurrence policy over compact result IDs |
 | Moshi frame arithmetic/state | `crates/liquid-audio/src/runtime/realtime.rs:1850-2065` | native Moshi pass program |
-| native pass entered through Rust capture/trampoline | `crates/liquid-audio/src/compute/flashkern/native_engine.rs:94-170` and `300-394` | model-bound C++ plan with no Rust callback |
+| native pass entered through Rust capture/trampoline | `crates/liquid-audio/src/compute/flashkern/native_engine.rs:544-593` and `native/src/engine/flashkern_engine.cpp:1283-1291` | model-bound C++ plan with no Rust callback |
 | aarch64 feature flags applied to the whole kernel translation unit | `crates/liquid-audio/build.rs:45-58` | baseline and BF16/I8MM objects compiled separately; C++ binds one table after capability checks |
 | hot-call panel storage and packing | `crates/liquid-audio/native/kernels/aarch64/flashkern_neon.cpp:74-162` and `native/kernels/x86_64/flashkern_x86.cpp:74-154` | prepack immutable weights at model open and reserve mutable scratch in the plan; no `std::vector`, resize, assign, or payload repack in a pass |
 | scalar/libm activation and softmax loops | `flashkern_neon.cpp:942-968` and `flashkern_x86.cpp:756-788` | fixed-shape house vector transcendental kernels with test-only scalar oracle |
+| sampler and PRNG | Native ChaCha20 block kernels are implemented in `native/kernels/{aarch64,x86_64}/flashkern_prng.S`; `run_sampler` is mounted inside token and Depthformer passes, with `REQ_SAMPLE` as a standalone fallback/conformance leaf. | move the one shared stream image from the Rust generation rim into each native conversation; never issue a pass ticket per random draw or codebook |
+| CPU streaming short-conv | `REQ_DEPTHWISE_STREAM`, `lfm_depthwise_stream_bf16`, and `flashkern_conv.h` borrow split state/input/weight planes and write output/state directly | keep this CPU-only; replace the sibling Candle Metal route with MLX C++/Metal rather than adding Metal dispatch to Flashkern |
 
 ## The Library Law
 
 | Category | Production voice path | Native test target | Baseline fixture capture |
 |---|---|---|---|
-| Candle, Moshi-Candle, MLX-CPU, Eigen, tensor frameworks | Banned | Not linked or called | May run only from a pinned Git worktree; deleted code is never copied forward |
+| Candle, Moshi-Candle, MLX-CPU, Eigen, CPU tensor frameworks | Banned from Flashkern and final CPU inference | Not linked or called | May run only from a pinned Git worktree; deleted code is never copied forward |
+| MLX C++/Metal device backend | Required peer backend; never linked into Flashkern | Allowed in its own device tests | Temporary Candle Metal may supply migration fixtures |
 | Accelerate BLAS (`cblas_sgemm` family) on Apple | Allowed only for profile-selected matmul stages that beat house kernels and pass parity | Allowed | Not applicable |
 | Accelerate vDSP/vForce/BNNS | Not used initially; vDSP FFT requires document 05's separate parity gate | Allowed | Not applicable |
 | External BLAS on x86_64 (MKL, OpenBLAS) | Not used; house kernels own x86_64 | Allowed as a benchmark oracle only | Not applicable |
 | `<arm_neon.h>`, `<immintrin.h>`, inline asm, `.S` | Production substrate | Allowed | Not applicable |
-| scalar C++ and scalar libm transcendentals | Not linked | Test-only oracle | Not applicable |
+| scalar C++ and scalar libm transcendentals | **Temporary migration exception:** current native softmax/activation compatibility paths still call scalar platform functions. Replace with fixture-pinned house vector kernels before production cutover. | Allowed as oracle | Not applicable |
 
 Transcendentals used by the model — `exp` (softmax), `tanh`, exact-`erf` GELU,
-`log` (mel guard) — are house vector kernels with stored fixtures. Their
+`log` (mel guard) — must become house vector kernels with stored fixtures. Their
 polynomial/range-reduction choices are recorded per kernel and gated against
 committed fixtures plus the test-only scalar C++ oracle. Baseline fixtures may
 have been generated by the pinned Rust/Candle commit, but native tests never
-call that code. The scalar oracle may call libm; production may not.
+call that code. The current scalar calls are an explicit migration debt, not an
+as-built claim of compliance; the completed production path may not retain them.
 
 ## The Byte-Movement Law
 
@@ -108,6 +114,7 @@ One decision rule, applied once per stage when the plan is built at model open
 | Depthwise/short convolution | Mixed | House NEON | House AVX |
 | Resampler polyphase taps | Compute (small) | House NEON `FMLA` | House FMA3 |
 | Format conversion, downmix (capture callback) | Bandwidth | `LD2`/`LD4` de-interleave + convert | `PMOVZX`/`CVTDQ2PS` family |
+| ChaCha20 PRNG block | Register/latency | Hand-written AArch64 scalar-register block; `SecRandomCopyBytes` only seeds/reseeds outside passes | Four-row SSE2 block; platform CSPRNG only seeds/reseeds outside passes |
 
 The DFT-basis mel stage is a GEMM in disguise — `(2·bins × window) ×
 (window × frames)` — so it is eligible for the same plan-time Apple comparison
@@ -205,8 +212,13 @@ coordination work   one ready permit -> signal one kcoro worker
 fixed compute       generation unchanged -> register/recheck -> block wait word
 ```
 
-Neither path has a spin tier. `PAUSE`, `YIELD`, repeated loads, WFE/UMWAIT time
-budgets, and timed polling are absent from the generated wait code.
+Neither canonical path has a spin tier. `PAUSE`, `YIELD`, repeated loads,
+WFE/UMWAIT time budgets, and timed polling are absent from the generated native
+wait code. The former `REQ_CALL` Depthformer exception is gone:
+`run_depth_frame` uses `lane_fence` for every cross-lane dependency, and the Rust
+`SpinBarrier`/lane callback were deleted together. The former GEMM and DD FFT
+grids are typed native passes. DD FFT bit reversal and butterfly stages use the
+same zero-spin generation fence; no generic callback or third wait primitive remains.
 
 The host adapter supplies operations equivalent to:
 
@@ -292,21 +304,26 @@ hardware callbacks. Hardware callbacks never wait.
    and re-homed here, not rewritten.
 3. `native/kernels/x86_64/`: AVX2 baseline of the same families; AVX-512
    variants behind runtime dispatch.
-4. `native/src/runtime/wait.{h,cpp}`: one register/recheck/block wrapper used by
+4. **As built:** `flashkern_prng.S` on both architectures expands one
+   snapshot-stable ChaCha20 stream block with no allocation or syscall. The
+   Apple entropy thunk calls `SecRandomCopyBytes` only at conversation creation
+   or explicit reseed. `run_sampler` is absorbed into token and Depthformer
+   passes and adds no per-draw or per-codebook scheduling.
+5. `native/src/runtime/wait.{h,cpp}`: one register/recheck/block wrapper used by
    shared fixed-executor generations and audio doorbells; host wait-word adapter
    below it, with no spin or monitor-wait inlines. Add C/C++ address-identity and
    memory-order litmus tests proving one selected atomic helper owns every board
    access.
-5. Accelerate stage adapter: `cblas_sgemm` calls as declared stages with
+6. Accelerate stage adapter: `cblas_sgemm` calls as declared stages with
    plan-recorded shapes and tiling, Apple-only, behind the same pass contract.
    A versioned tuning profile records the measured house/Accelerate winner; an
    unknown machine defaults to a startup benchmark before readiness, never a
    per-pass race.
-6. Link/symbol audit in CI: Apple production binary links Accelerate and
+7. Link/symbol audit in CI: Apple production binary links Accelerate and
    nothing else numerical; x86_64 links no BLAS; no `cblas_` symbol outside
    the Accelerate adapter; no libm vector calls in kernel objects; `memcpy`
    audit passes on kernel directories.
-7. Bandwidth and fence microbenchmarks recorded per machine: GEMV kernels
+8. Bandwidth and fence microbenchmarks recorded per machine: GEMV kernels
    against measured STREAM bandwidth; blocking fence p50/p99, syscall/wake
    counts, logical park-mask population, and idle CPU.
 
@@ -314,6 +331,9 @@ hardware callbacks. Hardware callbacks never wait.
 
 - Every kernel family passes its stored-fixture parity gate against the scalar
   oracle on both architectures before entering any pass program.
+- PRNG known-answer tests pin exact block bytes and post-draw state on both
+  architectures; snapshot replay is exact and the warmed expansion path has no
+  entropy call, allocation, payload copy, or per-draw scheduler edge.
 - Decode GEMV sustains its recorded fraction of measured memory bandwidth on
   the target machine; regressions against the recorded baseline fail the gate.
 - Accelerate-dispatched stages meet the same per-stage tolerance fixtures as
@@ -329,9 +349,9 @@ hardware callbacks. Hardware callbacks never wait.
 - The link/symbol audit passes: no tensor-framework, BLAS (outside Accelerate
   on Apple), SLEEF/SVML, or vector-libm symbol in the production native
   library.
-- A call-stack/symbol test proves the local numerical path enters through the C
-  ABI, remains in C++ coordination and native kernel code, and contains no Rust
-  frame or payload-bearing Rust FFI symbol.
+- A call-stack/symbol test proves the local numerical path begins at descriptor
+  dispatch in the fixed C++ executor, remains in native stage and kernel code,
+  and contains no Rust frame or payload-bearing Rust FFI symbol.
 - The release link map contains no scalar oracle objects. Unsupported ISA
   selection fails before model readiness rather than falling back.
 - bf16 expand path is bit-exact against the shift-expand definition on both

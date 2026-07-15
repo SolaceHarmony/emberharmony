@@ -1,8 +1,8 @@
 # Mimi → C++/NEON port manifest
 
 The mission clause this executes: the voice pipeline decode path ports to
-kcoro/NEON/C++ as a tight kernel. After the backbone (REQ_TOKEN_PASS) and the
-depthformer (REQ_CALL), **Mimi is the largest candle compute left per frame**:
+kcoro/NEON/C++ as a tight kernel. After the backbone (`REQ_TOKEN_PASS`) and the
+typed Depthformer (`REQ_DEPTH_FRAME`), **Mimi is the largest Candle compute left per frame**:
 every 80 ms audio frame runs a full candle graph (moshi crate) → PCM. This
 manifest scopes the port; the first pass is swarmed one-file-per-agent,
 arbitered locally, then parity-gated.
@@ -93,12 +93,13 @@ streaming.rs (`StreamTensor` = Option<Tensor>) becomes explicit
 3. e2e: perf-chain wav vs current PERF hash — expected to move; the audible
    dual-path e2e + her ear bless the re-arm.
 4. Integration (after parity — her directive, structural not optional): the
-   Mimi kernel runs INSIDE the same kcoro engine as the backbone/depthformer
-   (flashkern_engine.cpp) — same persistent lane team, same doorbell, its own
-   REQ kind at the pass boundary. Because it is a native C++ program (no Rust
-   frames cross the fences), its lane fences PARK precisely after the bounded
-   spin per the two-barrier doctrine — the depthformer's pure-spin barrier
-   compromise does not apply here. Unit inner loops are written
+   Mimi kernel runs as a typed pass on the same Flashkern lane team as the
+   backbone, crossing the mounted Rust-broker/native-SQ/CQ boundary — same
+   persistent lanes and doorbells, its own REQ kind at the pass boundary.
+   Because it is a native C++ program (no Rust frames cross the fences), its lane
+   fences use the shared expected-value word and block without a spin tier — the
+   depthformer's transitional pure-spin barrier does not apply here. Unit inner
+   loops are written
    band-splittable so lane-cutting is a schedule change, not a math change.
 
 ## Status
@@ -173,9 +174,10 @@ streaming.rs (`StreamTensor` = Option<Tensor>) becomes explicit
       stays NEON). Final verdict's P2s also closed: stage errors propagate
       through mimi_decoder_step (negative rc never reads as priming);
       upsample weight validated exact-shape + non-null.
-- [ ] engine integration (the remaining rung): mimi as a native C++ lane
-      program on the SAME kcoro engine team — REQ_MIMI at the F4 doorbell,
+- [ ] engine integration (the remaining rung): Mimi as a native C++ lane
+      program on the same Flashkern team through the Rust broker/native SQ/CQ —
+      REQ_MIMI at the F4 doorbell,
       units band-split per the NOTES maps (conv: out-channel; attention:
-      head; sweeps: sub-range), parked fences (native program, two-barrier
-      doctrine). Today the kernel is serial-with-AMX inside one rim call —
+      head; sweeps: sub-range), zero-spin parked fences. Today the kernel is
+      serial-with-AMX inside one rim call —
       correct and fast (13.8 ms/frame), but not yet ON the lane team.

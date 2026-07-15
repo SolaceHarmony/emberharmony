@@ -203,7 +203,7 @@ The exact thresholds continue to come from `LfmSessionConfigV1`, populated by
 ### Predictive pause as a ticketed candidate
 
 Speculative preparation is an ordinary coordination action, not a second VAD or
-scheduler mechanism. When `Pause -> Prepared` occurs, the native coordinator:
+scheduler mechanism. When `Pause -> Prepared` occurs, the Rust coordinator:
 
 1. freezes a `CandidateMark` containing the conversation/context mark, retained
    PCM end, candidate epoch, and output epoch;

@@ -1,52 +1,50 @@
 # flashkern — CPU replicas of the Metal JIT kernels (aarch64 NEON + x86-64 AVX)
 
-`crates/candle-flashfftconv/` embeds its Metal kernels as MSL source
-strings inside `.rs` files and JIT-compiles them at runtime. flashkern is the CPU edition of
-that kernel library: every JIT kernel replicated either with native SIMD
-(`native/kernels/aarch64/flashkern_neon.cpp` / `native/kernels/x86_64/flashkern_x86.cpp`, bridged by `src/compute/flashkern/{neon,x86}.rs`)
-or, for the multi-stage kernels, as a pure-Rust port under a faithful CPU model of the GPU
-dispatch (`src/compute/flashkern/fanout.rs`: threadgroup grid → rayon, simdgroup lanes → a scoped
-thread team, `threadgroup_barrier` → `std::sync::Barrier`). The double-double toolkit
-(`double_double.metal`) lives at `src/compute/flashkern/dd.rs`. The build is wired in `build.rs`.
+`crates/candle-flashfftconv/` embeds the migration-era Metal kernels as MSL
+source. Flashkern is the CPU kernel library: native SIMD lives in
+`native/kernels/{aarch64,x86_64}/`, while `fanout.rs`, `dd.rs`, and the Rust
+reference programs preserve parity fixtures during the native migration.
+`build.rs` wires the native objects into `liquid-audio`.
 
-Four flashkern kernels sit on the LIVE model path today:
+**Backend boundary:** Flashkern is CPU-only. Metal source is a numerical and
+dispatch-shape oracle for CPU translation; no Metal API, Metal command queue, MLX
+object, or Metal dependency belongs inside Flashkern. Matrix acceleration is not
+optional: aarch64 uses BFMMLA/BFDOT/NEON and x86_64 uses AVX2/AVX-512-BF16. The
+required Apple GPU peer is a separate future MLX C++/Metal engine selected above
+Flashkern. Until it lands, Candle Metal remains a temporary sibling backend.
 
-* the **bf16 GEMM** on the CPU
-  bf16-matmul path (`Bf16Gemm::cpu_fwd`, reached from `model/linear.rs` `bf16_matmul` /
-  `linear_logits`); its native-layout twin `Bf16GemmNt` (`A[M,K] · W[N,K]ᵀ`, no weight
-  transpose) is the decode-step form — `matmul_flat` / `linear_logits` route `M ≤ 4`
-  through it via `bf16_matmul_nt`, gated on the strict `bf16_gemm_nt_available()`;
-* the **fused conv1d decode update**: on a CPU device `ShortConv::forward` (lfm2_hf.rs)
-  routes its fused decode step through `flashkern::candle_ops::causal_conv1d_update_fused`
-  (channel-vectorized T=1/K=3 NEON fast path) when `conv1d_update_available()`, and through
-  the candle-flashfftconv op (JIT Metal kernel / scalar CPU reference) otherwise. The
-  announce line `[voice] fused conv decode kernel active (…)` names the kernel + device a
-  live run actually executed.
+The current CPU decode path has two coarse execution forms:
 
-* the **fused FFN residual block** (`src/compute/flashkern/decode.rs`): on CPU decode,
-  `DecoderLayer::forward` runs norm → gate/up → silu·mul → down → residual as ONE
-  threadgroup dispatch — `lanes` workers on the persistent rayon pool, spin barriers
-  (`threadgroup_barrier` semantics), activations in shared scratch, weights read zero-copy
-  in checkpoint layout via the nt dot kernel, bf16 rounds at exactly the op chain's points.
-  This is the dispatch model applied to the LIVE model, not per-op fork/join: the candle
-  chain's ~8 ops/block (each a pool round-trip + tensor alloc + dtype cast) collapse into
-  one dispatch with 3 barriers. Measured: decode 54 → 18 ms/token on LFM2.5-Audio-1.5B.
-  Wired from `model/lfm2_hf.rs` `DecoderLayer::forward` (CPU decode, `b·s == 1`) via
-  `fused_mlp_decode`, which hands the checkpoint weights in as zero-copy bf16 views.
+* **Native backbone token pass.** `Lfm2Model::native_token_pass` enters
+  `REQ_TOKEN_PASS` once for embed, every ShortConv/attention/MLP block, final norm,
+  and optional logits. The fixed C++ lane team executes the whole program using
+  the NEON/AVX procedures below. Its request crosses the mounted safe Rust kcoro
+  broker and native SQ/CQ; it does not run the old Rust fused-MLP dispatch. The
+  `fused_mlp_reference` function in `decode.rs` is test-only.
+* **Native Depthformer frame pass.** `DepthDecode::frame` enters
+  `REQ_DEPTH_FRAME` once. `run_depth_frame` owns projection, every codebook and
+  transformer layer, tiny KV planes, logits, sampling, and sampled-embedding
+  recurrence on the fixed C++ lane team. Weight payloads and the backbone hidden
+  row are borrowed by pointer through the exact completion; mutable scratch is
+  reserved at plan build. Stage boundaries use the same zero-spin native
+  generation fence as the backbone. Rust performs no frame arithmetic.
+* **Native streaming short-conv pass.** CPU bf16 prefill/continuation enters
+  `REQ_DEPTHWISE_STREAM` once. Lanes own complete `(batch, channel)` rows and call
+  `lfm_depthwise_stream_bf16`; the prior `K-1` state, incoming samples, weights,
+  output, and next-state are separate borrowed planes. No `[cache | x]` tensor is
+  constructed. The program-final generation fence produces one ticket completion.
+* **Typed matrix and DD FFT passes.** `REQ_GEMM` owns KN GEMM, checkpoint-native
+  NK GEMM, and the M=1 GEMV specialization. `REQ_FFT_CONV_DD` and `REQ_IRFFT_DD`
+  own the double-double fan-out paths and f64-split twiddles. FFT convolution uses
+  one shared reusable work plane: every fixed lane grid-strides bit reversal and
+  butterflies, then crosses the generation fence at each radix-2 stage. The whole
+  signal grid remains one ticket. The deleted generic callback cannot put a Rust
+  frame on a compute lane.
 
-* the **pure-NEON depthformer frame decoder** (`DepthDecode`, `src/compute/flashkern/decode.rs`):
-  the whole audio frame — `codebooks` codebook steps × the depthformer's StandardBlocks
-  (operator-norm → qkv → per-head qk-RMSNorm + interleaved RoPE → attention over resident
-  KV planes → out-proj+residual → ffn-norm → SwiGLU → down+residual), pre-logits norm, tied
-  logits head, and sampling on lane 0 — as ONE threadgroup dispatch per frame. No candle op
-  runs in the frame loop. KV lives in tiny resident f32 planes reset per frame (zero
-  allocation); weights are read zero-copy via `PtrLen` views in checkpoint layout; the
-  per-stage math is the Group H C kernels below. Built once from the model tensors
-  (`model/lfm2_audio.rs` `build_depth_flash`) and dispatched from `sample_audio_frame`
-  (`sample_audio_frame_flash`); `set_depth_flash_enabled(false)` is the parity seam that
-  drops back to the candle depthformer.
-
-The rest ship as a tested, adoptable library.
+Individual Candle custom-op and pure-Rust fanout paths still exist for unfinished
+prefill/Metal/reference surfaces and strict-gate fallbacks. They are not the target
+CPU executor. `set_depth_flash_enabled(false)` remains a parity seam that selects
+the Candle depthformer reference.
 
 ## Coverage — the full Metal JIT kernel inventory
 
@@ -62,6 +60,7 @@ The rest ship as a tested, adoptable library.
 | `complex_mul_dd` (dd_complex_mul.rs) | `dd::cdd_mul` (correctly-rounded, tested) | dd.rs |
 | `depthwise3` / `depthwise3_causal` (Depthwise3.metal) | `lfm_depthwise3(_causal)_f32` — fixed order, **no FMA** | both `.cpp` |
 | `depthwise_causal_conv1d_bf16` (conv1d.rs) | `lfm_depthwise_causal_conv1d_bf16` | both `.cpp` |
+| streaming `depthwise_conv1d_stream` contract (conv1d.rs) | `REQ_DEPTHWISE_STREAM` + `lfm_depthwise_stream_bf16`; split state/input pointers, one fixed-team ticket | engine + both `.cpp` |
 | `causal_conv1d_update_fused_{float,bfloat}` (conv1d_update.rs) | `lfm_conv1d_update_{f32,bf16}` — FMA (trained regime) | both `.cpp` |
 | `monarch_fused_fwd_f32` (fused_monarch.rs) | `fused_monarch_fwd` | fanout.rs |
 | `monarch_fused_conv_f32` / `_padded_f32` (gates + u·D skip) | `fused_monarch_conv` / `_padded` | fanout.rs |
@@ -96,11 +95,12 @@ regime is contracted (`conv1d_update`, GEMM) or that need exact FMA residuals (d
 | threadgroup reduce (would-be `simd_sum`) | `lfm_reduce_sum_f32` / `_max_f32` | **ADDV/FADDP** `vaddvq_f32` | baseline |
 | `simd_shuffle` / gather | `lfm_permute_u8` | **TBL/TBX** `vqtbl1q_u8` | baseline |
 | bf16-store / f32-accum conv1d, `conv1d.rs` | `lfm_depthwise_causal_conv1d_bf16` | FMA + **BFCVT** `vcvth_bf16_f32` | FEAT_BF16 |
+| streaming depthwise rows | `lfm_depthwise_stream_bf16` | NEON FMA+BFCVT / AVX2 FMA | FEAT_BF16 / AVX2+FMA |
 | radix-2 complex butterfly, `FFTConv.metal` | `lfm_fft_radix2_f32` | **FCMLA** `vcmla_f32`+`_rot90` | FEAT_FCMA |
 | double-double `two_prod`/`two_sum`, `double_double.metal` | `lfm_dd_sum_f32` / `lfm_dd_dot_f32` | FMA error-free transforms | baseline |
 | GPU `rcp` / `rsqrt` fast-math | `lfm_recip_f32` / `lfm_rsqrt_f32` | **FRECPE/FRSQRTE** + Newton | baseline |
 | `threadgroup` shared memory + staging | thread-local packed panels + **PRFM** (`__builtin_prefetch`) | — | — |
-| `threadgroup_barrier` + `dispatch_thread_groups` | rayon row-block tiling (Rust side, reuses `threads.rs`) | — | — |
+| `threadgroup_barrier` + `dispatch_thread_groups` | fixed native generation fence in production; rayon/scoped threads in reference ports | — | — |
 
 ## The tightened GEMM
 
@@ -129,12 +129,11 @@ reference, verified inside `rel < 1e-2` up to K=512.
 
 ## Group H — the decode stage kernels
 
-Group H is the per-stage device-function library the pure-NEON depthformer decoder
-(`DepthDecode`, `src/compute/flashkern/decode.rs`) executes between spin barriers — the CPU analog of
-a GPU kernel's inner device functions. Each consumes/produces bf16 bit planes or f32 scratch
+Group H is the per-stage device-function library the typed C++ Depthformer
+program in `native/src/engine/flashkern_engine.cpp` executes between native
+zero-spin generation fences. Each kernel consumes/produces bf16 bit planes or f32 scratch
 **exactly at the torch rounding points**, so the flash frame is value-equivalent to the candle
-op chain at bf16 resolution; the Rust lane team slices rows and barriers between stages, these
-do the math:
+op chain at bf16 resolution; the fixed C++ lane team slices rows and fences between stages:
 
 | kernel | stage | ladder |
 |---|---|---|
@@ -147,9 +146,10 @@ do the math:
 | `lfm_rope_i_f32` | interleaved RoPE | in-place rotate at `pos` against the shared cos/sin table |
 | `lfm_bf16_to_f32` / `lfm_f32_to_bf16` | dtype crossings | exact upcast / RNE store (bf16 `type_as`) |
 
-The `inv_rms` and per-frame reductions are folded in Rust (same serial order on every lane →
-deterministic); these kernels are the vectorized bodies. Both `.cpp` TUs carry the full set
-under identical `extern "C"` names, so `DepthDecode` is arch-agnostic exactly as the GEMM is.
+`run_depth_frame` folds `inv_rms` and per-frame reductions in fixed lane order,
+then calls these vectorized bodies. Both architecture TUs carry the full set under
+identical `extern "C"` names, so the typed frame program is arch-agnostic exactly
+as the GEMM is.
 
 ## Build & feature gating
 
@@ -174,6 +174,9 @@ Feature-gated procedures
 (FFT→FCMA, `s8_gemm`→I8MM, `conv1d`→BF16) document their precondition; verify
 `flashkern::neon::NeonFeatures` (macOS `sysctl hw.optional.arm.FEAT_*` + Linux `getauxval` HWCAP/HWCAP2
 — the latter also fixes the old bf16 probe's Linux `false`) before calling.
+The x86 streaming pass returns `ENOTSUP` before submission when AVX2/FMA is not
+advertised. Rosetta therefore skips that opcode leaf; it does not run a scalar
+substitute and does not weaken the x86 production contract.
 
 ## Verification
 
@@ -186,6 +189,18 @@ Feature-gated procedures
   -march=armv8.2-a` and run under `qemu-aarch64 -cpu max` — 18 checks across all six groups
   vs scalar / f64 references (GEMM, GEMV, SMMLA, reductions, TBL, conv1d, FFT forward +
   round-trip, double-double vs f64, fast-math).
+* **Typed streaming parity:**
+  `typed_depthwise_stream_matches_split_buffer_oracle_and_uses_one_ticket` pins
+  fresh/resumed state, `T < K-1`, `K=1`, output bits, next-state bits, and exactly
+  one SQ/CQ completion per pass. `typed_stream_matches_metal_reference_contract_across_chunks`
+  compares chunked CPU output/state against the temporary reference backend.
+* **Typed launch accounting:**
+  `typed_gemm_layouts_and_gemv_use_one_ticket_each` and
+  `typed_fft_grids_use_one_ticket_each` prove one submission/completion per
+  matrix or FFT grid and zero live descriptors afterward.
+  `typed_fft_is_bit_exact_across_physical_lane_counts` proves the cooperative
+  one-worker and four-worker transforms are bit-identical and records every
+  threadgroup-equivalent stage fence. DD FFT/IRFFT retain their f64-oracle gates.
 
 ## x86-64 sibling (`native/kernels/x86_64/flashkern_x86.cpp` + `src/compute/flashkern/x86.rs`)
 

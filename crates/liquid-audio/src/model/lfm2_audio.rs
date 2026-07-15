@@ -10,13 +10,13 @@
 //! Sampling: faithful to the upstream `_sample_text_token` / `_sample_audio_frame`
 //! — greedy (argmax) when `temperature` is None/≤0 or `top_k == 1`, otherwise
 //! `logits /= temperature`, top-k mask (keep ≥ the k-th largest, rest → -inf),
-//! softmax, and `torch.multinomial`-equivalent draw via a seeded `StdRng`.
+//! softmax, and one seeded native ChaCha draw. The sampler is a Flashkern
+//! threadgroup collective; Rust carries only its policy and opaque state blob.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use candle_core::{DType, Device, IndexOp, Result, Tensor};
 use candle_nn::{linear, Linear, Module, VarBuilder};
-use candle_transformers::generation::{LogitsProcessor, Sampling};
 
 use crate::model::conformer::encoder::{ConformerEncoder, ConformerEncoderConfig};
 use crate::model::lfm2_hf::{Cache as LfmCache, Lfm2Config, Model as Lfm2Model};
@@ -196,10 +196,10 @@ impl GenParams {
     }
 }
 
-/// `Sampler` — the next-token sampler, built on `candle_transformers`'
-/// [`LogitsProcessor`] (the same sampler `moshi` uses for depformer decoding)
-/// rather than a private softmax+multinomial. Faithful to `_sample_text_token` and
-/// the per-codebook step of `_sample_audio_frame`:
+/// Sampling policy for one modality. The math lives in Flashkern: native lanes
+/// read the existing logits plane, apply temperature/top-k, and advance the
+/// conversation's shared ChaCha stream once in a generation-fence serial section.
+/// Faithful to `_sample_text_token` and each `_sample_audio_frame` codebook step:
 /// ```python
 /// greedy = temperature is None or temperature <= 0 or top_k == 1
 /// if greedy: next = logits.argmax()
@@ -210,52 +210,55 @@ impl GenParams {
 ///         logits[logits < min_score] = -inf       # threshold-style: ties kept
 ///     next = torch.multinomial(logits.softmax(0), 1)
 /// ```
-/// Greedy uses `argmax(-1)`, byte-identical to the previous greedy path, so generation
-/// parity (incl. the token-exact depthformer) is preserved. Stochastic draws share
-/// one [`SamplingStream`] across text and every audio codebook, matching the single
-/// upstream generator rather than restarting the seed per modality. Torch's
-/// *threshold* top-k is injected through [`LogitsProcessor::sample_f`]: candle's built-in
-/// `Sampling::TopK` keeps exactly `k` tokens, whereas Torch keeps every token `≥`
-/// the k-th largest (ties included), so the mask is applied via the `sample_f`
-/// extension hook rather than forking the sampler.
+/// Stochastic draws share one [`SamplingStream`] across text and every audio
+/// codebook, matching the single upstream generator rather than reseeding per
+/// modality. Top-k remains threshold-style: ties at the k-th value are retained.
 struct Sampler {
-    temperature: Option<f64>,
-    /// Torch threshold top-k bound, applied on the stochastic path only.
-    top_k: Option<usize>,
-    greedy: bool,
+    config: crate::flashkern::native_engine::SampleConfig,
 }
 
 impl Sampler {
     fn new(temperature: Option<f64>, top_k: Option<usize>) -> Self {
-        let greedy = match (temperature, top_k) {
-            (None, _) => true,
-            (Some(t), _) if t <= 0.0 => true,
-            (_, Some(1)) => true,
-            _ => false,
-        };
         Self {
-            temperature,
-            top_k,
-            greedy,
+            config: crate::flashkern::native_engine::SampleConfig::new(temperature, top_k),
         }
     }
 
-    /// Sample one token from 1-D `logits` (`V,`).
+    /// Sample one token from a contiguous CPU F32/BF16 logits vector. No tensor
+    /// conversion or payload copy occurs: the native pass borrows the storage
+    /// pointer until its kcoro completion resolves.
     fn sample(&self, stream: &mut SamplingStream, logits: &Tensor) -> Result<u32> {
-        if self.greedy {
-            return logits.argmax(candle_core::D::Minus1)?.to_scalar::<u32>();
-        }
-        let logits = (logits
-            / self
-                .temperature
-                .expect("non-greedy sampler must have a positive temperature"))?;
-        match self.top_k {
-            // Stochastic + top-k: inject Torch's threshold mask via the sample_f hook.
-            Some(k) => stream
-                .processor
-                .sample_f(&logits, move |prs| torch_topk_mask(prs, k)),
-            None => stream.processor.sample(&logits),
-        }
+        use candle_core::Storage;
+        let logits = logits.flatten_all()?.contiguous()?;
+        let (storage, layout) = logits.storage_and_layout();
+        let (start, end) = layout.contiguous_offsets().ok_or_else(|| {
+            candle_core::Error::Msg("native sampler requires contiguous logits".into())
+        })?;
+        let engine = crate::flashkern::native_engine::process_engine();
+        let sampled = match &*storage {
+            Storage::Cpu(candle_core::CpuStorage::F32(values)) => {
+                engine.sample_f32(&values[start..end], &self.config, &mut stream.state)
+            }
+            Storage::Cpu(candle_core::CpuStorage::BF16(values)) => {
+                // SAFETY: `half::bf16` is a transparent 16-bit storage value and
+                // the read guard keeps this range live through completion.
+                let bits = unsafe {
+                    std::slice::from_raw_parts(
+                        values.as_ptr().add(start).cast::<u16>(),
+                        end - start,
+                    )
+                };
+                engine.sample_bf16(bits, &self.config, &mut stream.state)
+            }
+            _ => {
+                return Err(candle_core::Error::Msg(
+                    "native sampler requires CPU F32 or BF16 logits".into(),
+                ));
+            }
+        };
+        sampled.map_err(|status| {
+            candle_core::Error::Msg(format!("native sampler pass failed ({status})"))
+        })
     }
 }
 
@@ -263,34 +266,14 @@ impl Sampler {
 /// while draw order belongs to the conversation and therefore crosses modality
 /// boundaries without reseeding.
 struct SamplingStream {
-    processor: LogitsProcessor,
+    state: crate::flashkern::native_engine::PrngState,
 }
 
 impl SamplingStream {
     fn new(seed: u64) -> Self {
         Self {
-            processor: LogitsProcessor::from_sampling(seed, Sampling::All { temperature: 1.0 }),
-        }
-    }
-}
-
-/// Torch `topk(logits, k).values[-1]` threshold applied to the probability vector:
-/// zero every probability below the k-th largest. softmax is monotonic, so the
-/// logit threshold and the probability threshold select the same tokens; ties at
-/// the boundary are *kept*, matching `logits[logits < min_score] = -inf`. The kept
-/// probabilities need no renormalization — multinomial (`WeightedIndex`) samples
-/// proportionally, so the resulting distribution equals Python's softmax-after-mask.
-fn torch_topk_mask(prs: &mut [f32], k: usize) {
-    let k = k.min(prs.len());
-    if k == 0 {
-        return;
-    }
-    let mut sorted: Vec<f32> = prs.to_vec();
-    sorted.sort_unstable_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-    let min_score = sorted[k - 1];
-    for p in prs.iter_mut() {
-        if *p < min_score {
-            *p = 0.0;
+            state: crate::flashkern::native_engine::PrngState::from_seed(seed)
+                .expect("native deterministic sampler seed must initialize"),
         }
     }
 }
@@ -303,6 +286,10 @@ use crate::candle_ext::loss::cross_entropy_none;
 use crate::weights::{NativeWeightImage, ResidentWeights};
 
 pub struct LFM2AudioModel {
+    /// Resident native Depthformer plan guard. MUST precede every weight owner:
+    /// Rust drops fields in declaration order, so this clears retained C++
+    /// pointers before their Candle compatibility storages are freed.
+    depth_flash: Option<crate::flashkern::decode::DepthDecode>,
     lfm: Lfm2Model,
     lfm_cfg: Lfm2Config,
     conformer: ConformerEncoder,
@@ -328,10 +315,6 @@ pub struct LFM2AudioModel {
     /// scalars (Python `LFM2AudioConfig`). Read only by `forward`.
     text_loss_multiplier: f64,
     audio_loss_multiplier: f64,
-    /// Pure-NEON depthformer frame decoder (flashkern): zero-copy views of the depthformer
-    /// weights + persistent scratch, built once at load when the CPU kernels are available.
-    /// `None` ⇒ the candle op-chain path runs (also the parity reference).
-    depth_flash: Option<crate::flashkern::decode::DepthDecode>,
     /// Byte-parity reference chain (DECODE_ENGINE.md §5): pins every ulp-tier decode
     /// deviation off — `grouped_gqa_decode=false` on each internally-built cache and
     /// depth-flash disabled — so greedy text + seeded audio reproduces the recorded
@@ -533,7 +516,7 @@ impl LFM2AudioModel {
         // (Arc-heap storages — stable across moves of `model`).
         model.depth_flash = model.build_depth_flash();
         if model.depth_flash.is_some() {
-            eprintln!("[voice] flashkern depthformer decoder active (pure-NEON audio frames)");
+            eprintln!("[voice] flashkern typed depthformer frame pass active");
         }
         // Resident native-engine layer table (same capture contract as depth_flash:
         // Arc-heap storages, guard clears before the weights drop).
@@ -609,7 +592,7 @@ impl LFM2AudioModel {
                 vocab,
             });
         }
-        Some(DepthDecode::new(
+        DepthDecode::new(
             self.depthformer_dim,
             heads,
             kvh,
@@ -623,7 +606,7 @@ impl LFM2AudioModel {
             PtrLen::bf16(self.depth_linear.bias()?)?,
             cos,
             sin,
-        ))
+        )
     }
 
     /// Test/parity seam: disable the flashkern depthformer so the candle op chain runs.
@@ -655,8 +638,8 @@ impl LFM2AudioModel {
     /// local model directory (Python `LFM2AudioModel.from_pretrained`, 135-169).
     /// A thin delegation to [`crate::loader::from_pretrained`], which parses
     /// `config.json` (including `codebook_weight` / `semantic_codebook_factor` /
-    /// `text_loss_multiplier` / `audio_loss_multiplier`), memory-maps the
-    /// safetensors, and constructs both the model and its [`LFM2AudioProcessor`]
+    /// `text_loss_multiplier` / `audio_loss_multiplier`), opens the native resident
+    /// safetensors image, and constructs both the model and its [`LFM2AudioProcessor`]
     /// (Python returns just the model; the processor is loaded alongside here, as
     /// the rest of this crate's entry points do). No loader logic is duplicated.
     pub fn from_pretrained(
@@ -1376,9 +1359,9 @@ impl LFM2AudioModel {
     }
 
     /// One frame through [`crate::flashkern::decode::DepthDecode::frame`]: extract the
-    /// backbone hidden's bf16 bits, run the dispatch, and sample per codebook via the
-    /// SAME seeded sampler over the rb'd logits (rebuilt as a tiny bf16 tensor so the
-    /// LogitsProcessor sees byte-identical inputs to the candle path's `get_logits`).
+    /// backbone hidden's bf16 bits and run one lane-uniform dispatch. Each codebook's
+    /// rounded logits feed the nested native sampler collective in place; no Tensor,
+    /// callback, allocation, or extra kcoro ticket exists between logits and token.
     fn sample_audio_frame_flash(
         &self,
         ctx: &crate::flashkern::decode::DepthDecode,
@@ -1388,39 +1371,19 @@ impl LFM2AudioModel {
     ) -> Result<Vec<u32>> {
         use candle_core::Storage;
         let flat = embedding.flatten_all()?.contiguous()?;
-        let bits: Vec<u16> = {
-            let (st, l) = flat.storage_and_layout();
-            match &*st {
-                Storage::Cpu(candle_core::CpuStorage::BF16(v)) => {
-                    let (a, b) = l
-                        .contiguous_offsets()
-                        .ok_or_else(|| candle_core::Error::Msg("hidden not contiguous".into()))?;
-                    v[a..b].iter().map(|x| x.to_bits()).collect()
-                }
-                _ => candle_core::bail!("depth flash: hidden must be CPU bf16"),
-            }
+        let (storage, layout) = flat.storage_and_layout();
+        let Storage::Cpu(candle_core::CpuStorage::BF16(values)) = &*storage else {
+            candle_core::bail!("depth flash: hidden must be CPU bf16");
         };
-        let err_cell = std::sync::Mutex::new(None);
-        let dev = embedding.device().clone();
-        let toks = ctx.frame(&bits, |logits_bits| {
-            let v: Vec<half::bf16> = logits_bits
-                .iter()
-                .map(|&b| half::bf16::from_bits(b))
-                .collect();
-            match Tensor::from_vec(v, (logits_bits.len(),), &dev)
-                .and_then(|t| sampler.sample(stream, &t))
-            {
-                Ok(t) => t,
-                Err(e) => {
-                    *err_cell.lock().unwrap() = Some(e);
-                    0
-                }
-            }
-        });
-        if let Some(e) = err_cell.lock().unwrap().take() {
-            return Err(e);
-        }
-        Ok(toks)
+        let (start, end) = layout
+            .contiguous_offsets()
+            .ok_or_else(|| candle_core::Error::Msg("hidden not contiguous".into()))?;
+        // SAFETY: `half::bf16` is transparent over u16. The storage read guard
+        // remains live until the blocking typed pass receives its completion.
+        let bits = unsafe {
+            std::slice::from_raw_parts(values.as_ptr().add(start).cast::<u16>(), end - start)
+        };
+        Ok(ctx.frame(bits, &sampler.config, &mut stream.state))
     }
 
     /// Install the head tables on the native engine (text embed = tied logits head,
@@ -1461,7 +1424,7 @@ impl LFM2AudioModel {
         };
     }
 
-    /// The native token pass for the generate loop: ids in, `(h_last, logits?)` out.
+    /// The native token pass for the generate loop: ids in, `(h_last, token?)` out.
     /// `Ok(None)` = unserved (any gate failed) — caller builds `in_emb` and takes the
     /// candle path, bit-identical. On success `index_pos` has been advanced.
     fn native_token_step(
@@ -1470,10 +1433,10 @@ impl LFM2AudioModel {
         index_pos: &mut usize,
         ids: &[u32],
         embed_kind: u32,
-        want_logits: bool,
-    ) -> Result<Option<(Tensor, Option<Tensor>)>> {
+        sampler: Option<&Sampler>,
+        stream: Option<&mut SamplingStream>,
+    ) -> Result<Option<(Tensor, Option<u32>)>> {
         use half::slice::HalfFloatSliceExt;
-        let vocab = self.lfm.embed_weight().dim(0)?;
         // Audio ids arrive RAW (per-codebook tokens); the engine's table is the flat
         // audio-embedding matrix, so apply the codebook offsets here — the same
         // `t + offset` audio_frame_embed applies. At most 8 codebooks: stack buffer.
@@ -1490,42 +1453,30 @@ impl LFM2AudioModel {
             ids
         };
         // The hidden Tensor's own storage doubles as the engine's out plane (bf16 is
-        // bit-transparent over u16) — the one allocation this step makes, and it is
-        // the Tensor the depthformer consumes. The Tensor boundary itself dies when
-        // the depthformer folds onto the lane team / ST_LOGITS revives.
+        // bit-transparent over u16). This outer allocation disappears when generation
+        // writes directly into a native conversation output reservation.
         let mut h_bits: Vec<half::bf16> = vec![half::bf16::ZERO; self.hidden];
-        let mut logits_buf: Vec<f32> = if want_logits {
-            vec![0f32; vocab]
-        } else {
-            Vec::new()
-        };
+        let mut token = 0u32;
+        let config = sampler.map(|value| &value.config);
+        let state = stream.map(|value| &mut value.state);
+        let out = sampler.map(|_| &mut token);
         let served = self.lfm.native_token_pass(
             cache,
             *index_pos,
             ids,
             embed_kind,
             h_bits.as_mut_slice().reinterpret_cast_mut(),
-            if want_logits {
-                Some(&mut logits_buf)
-            } else {
-                None
-            },
+            None,
+            config,
+            state,
+            out,
         )?;
         if !served {
             return Ok(None);
         }
         *index_pos += 1;
         let h_last = Tensor::from_vec(h_bits, (self.hidden,), &candle_core::Device::Cpu)?;
-        let logits = if want_logits {
-            Some(Tensor::from_vec(
-                logits_buf,
-                (vocab,),
-                &candle_core::Device::Cpu,
-            )?)
-        } else {
-            None
-        };
-        Ok(Some((h_last, logits)))
+        Ok(Some((h_last, sampler.map(|_| token))))
     }
 
     fn audio_frame_embed(&self, tokens: &[u32]) -> Result<Tensor> {
@@ -1706,21 +1657,26 @@ impl LFM2AudioModel {
                 break;
             }
             modality_left -= 1;
-            // Text logits ride the engine (kcoro audit finding): ST_LOGITS runs
-            // the SAME lfm_bf16_gemm_nt_f32 as linear_logits and now emits raw
-            // f32 — the extra bf16 round that flipped the perf hash is gone, so
-            // the native head is bit-identical to the candle head (PERF oracle
-            // = the proof). Audio steps skip the head (the depthformer wants
-            // hidden, not logits).
-            let want_logits = matches!(current, LFMModality::Text);
+            // Text logits and the categorical draw stay inside this one native
+            // pass. Audio steps skip the text head; the Depthformer consumes
+            // hidden and performs its own nested sampler collectives.
             let stepped = match pending.as_ref() {
+                Some((ids, kind)) if matches!(current, LFMModality::Text) => self
+                    .native_token_step(
+                        cache,
+                        index_pos,
+                        ids,
+                        *kind,
+                        Some(&text_sampler),
+                        Some(&mut sampling),
+                    )?,
                 Some((ids, kind)) => {
-                    self.native_token_step(cache, index_pos, ids, *kind, want_logits)?
+                    self.native_token_step(cache, index_pos, ids, *kind, None, None)?
                 }
                 None => None,
             };
-            let (h_last, native_logits) = match stepped {
-                Some((h, lg)) => (h, lg),
+            let (h_last, native_token) = match stepped {
+                Some((h, token)) => (h, token),
                 None => {
                     // The candle path (prefill step, or any native gate failed):
                     // derive in_emb from the pending ids first if there are any.
@@ -1741,11 +1697,13 @@ impl LFM2AudioModel {
 
             match current {
                 LFMModality::Text => {
-                    let logits = match native_logits {
-                        Some(l) => l,
-                        None => self.text_logits(&h_last)?,
+                    let next = match native_token {
+                        Some(token) => token,
+                        None => {
+                            let logits = self.text_logits(&h_last)?;
+                            self.sample_text_token(&logits, &text_sampler, &mut sampling)?
+                        }
                     };
-                    let next = self.sample_text_token(&logits, &text_sampler, &mut sampling)?;
                     if next == self.special.im_end {
                         ended = true;
                         break; // <|im_end|>

@@ -188,9 +188,10 @@ The product graph then becomes:
 - write generated audio IDs into one fixed frame slot;
 - send those IDs directly to `mimi_decode_into` from document 07.
 
-No `Vec<u32>`, `RealtimeMoshiEvent` vector, or Tensor exists between stages. The
-native recurrence can dispatch the next internal codebook step immediately at a
-barrier, which uses the CPU scheduler's ability to recur based on live state.
+No `Vec<u32>`, `RealtimeMoshiEvent` vector, or Tensor exists between stages. One
+typed native frame pass can advance its sequential internal codebook stages
+immediately at a barrier. That is fixed-executor stage sequencing, not a policy
+callback or another Rust ticket.
 
 ## Frame Clock and Input Backpressure
 

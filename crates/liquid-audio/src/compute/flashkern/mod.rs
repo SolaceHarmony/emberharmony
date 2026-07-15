@@ -11,12 +11,14 @@
 //!
 //! Design docs + the Metal-idiom → opcode map: `docs/FLASHKERN.md`.
 
+#[cfg(test)]
+mod bridge;
 pub mod candle_ops; // candle CustomOp bridges — the seam the model wires through on CPU
+mod coordinator; // Rust policy broker + native CQ ingress; no numerical work
 pub mod dd; // double-double toolkit (CPU port of double_double.metal) for the dd kernels
 pub mod decode; // fused decode blocks: threadgroup fallback + ShortConv/DepthDecode blocks
-pub mod native_engine; // resident native stage-machine rim (native/src/engine/flashkern_engine.cpp)
+pub mod native_engine; // resident native stage-machine rim (native/src/engine/flashkern_engine.cpp) // private Rust-kcoro/native SQ/CQ conformance tests
 
-pub(crate) use fanout::Shared;
 pub mod fanout; // GPU dispatch model on threads: grid fan-out, lane teams, real barriers
 pub mod neon; // aarch64 bridge to native/kernels/aarch64/flashkern_neon.cpp (BFMMLA GEMM, FFT, DD, fast-math)
 pub mod x86; // x86-64 bridge to native/kernels/x86_64/flashkern_x86.cpp (VDPBF16PS / AVX2 sibling)

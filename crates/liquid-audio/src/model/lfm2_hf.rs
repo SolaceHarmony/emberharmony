@@ -15,13 +15,10 @@
 //!   binds the short-conv (`conv_L_cache`) to the `causal_conv1d` kernel when it is
 //!   importable. Here attention is the eager matmul+softmax math (the kernel-free
 //!   `sdpa`/no-flash path, *not* flash-attn's reordered online-softmax) and the
-//!   short-conv routes through the FlashFFTConv `depthwise_conv1d_stream` CustomOp (CPU
-//!   reference + one Metal kernel) for BOTH prefill and single-step decode — one causal
-//!   depthwise path, the prior K-1 inputs streamed via the conv cache. Identical math to
-//!   candle's `Conv1d` (matched bit-exact — see `tests/short_conv_parity.rs`). The op
-//!   carries a CPU reference, so the backbone still runs on
-//!   `Device::Cpu` (LFM2's "no GPU needed" design point, which the CUDA-gated reference
-//!   stack cannot deliver as shipped). Verified: backbone parity 6.558e-6.
+//!   CPU bf16 short-conv enters typed `REQ_DEPTHWISE_STREAM` on the resident
+//!   Flashkern lane team. Prior state and input remain split pointer planes. Metal
+//!   is selected above Flashkern and stays on the temporary device backend until
+//!   the MLX C++/Metal engine lands. See `tests/short_conv_parity.rs`.
 
 use std::collections::HashMap;
 
@@ -665,53 +662,34 @@ impl ShortConv {
     }
 
     fn forward(&self, x: &Tensor, block_idx: usize, cache: &mut Cache) -> Result<Tensor> {
-        let (_b, seq_len, _h) = x.dims3()?;
+        let (_b, _seq_len, _h) = x.dims3()?;
         let bcx = linear_forward(&self.in_proj, x)?.transpose(1, 2)?;
 
-        // Fused decode fast path (candle-flashfftconv `conv1d_update`): when a carried
-        // conv state exists (mid-stream continuation — decode steps and short suffix
-        // chunks) do `B⊙x → K-tap causal conv → C⊙` in ONE dispatch with a register
-        // window — no `[state|x]` concat staging, no gate intermediates. ~3.3× the
-        // composed path at LFM2 shape (D=2048, K=3, bf16 Metal); rounding count
-        // matches the CUDA-trained regime (Bx and conv-out round through bf16).
-        // Sequence START (conv_states None) stays on the composed path below, whose
-        // zero-pad prefill is the reference semantics.
-        if cache.fused_conv_decode && self.l_cache > 0 && seq_len <= 4 && cache.use_kv_cache {
+        // The Metal migration backend keeps its fused decode shader until that
+        // device path moves into the native kernel. CPU continuation and prefill
+        // share the typed Flashkern stream pass below; the resident one-token pass
+        // normally bypasses this compatibility function entirely.
+        #[cfg(feature = "metal")]
+        if !bcx.device().is_cpu()
+            && cache.fused_conv_decode
+            && self.l_cache > 0
+            && _seq_len <= 4
+            && cache.use_kv_cache
+        {
             if let Some(prev) = cache.conv_states[block_idx].clone() {
-                // CPU device with the flashkern SIMD kernel built + supported → the
-                // liquid-audio CustomOp (channel-vectorized NEON/AVX decode step); otherwise
-                // the candle-flashfftconv op (JIT Metal kernel on Metal, scalar CPU
-                // reference where flashkern isn't available). Same shapes, same
-                // trained-regime rounding points — gated on availability, never degrading
-                // silently (the flashkern op errors rather than falling back).
-                let use_flashkern = bcx.device().is_cpu()
-                    && crate::flashkern::candle_ops::conv1d_update_available();
-                // One line per DEVICE (not per process): a live run PROVES this
-                // path executed and on which silicon. Per-device matters — the
-                // app can switch compute device between sessions, and a
-                // process-wide `Once` would keep showing the first session's
-                // device forever (exactly the misdirection that hid a CPU run).
                 static FUSED_ANNOUNCED: std::sync::Mutex<Option<candle_core::DeviceLocation>> =
                     std::sync::Mutex::new(None);
                 let loc = bcx.device().location();
                 if let Ok(mut last) = FUSED_ANNOUNCED.lock() {
                     if *last != Some(loc) {
                         *last = Some(loc);
-                        let kernel = if use_flashkern {
-                            "flashkern conv1d_update"
-                        } else {
-                            "candle-flashfftconv causal_conv1d_update"
-                        };
-                        eprintln!("[voice] fused conv decode kernel active ({kernel}, {loc:?})");
+                        eprintln!("[voice] migration Metal conv1d_update kernel active ({loc:?})");
                     }
                 }
                 let w = self.conv_weight.squeeze(1)?; // (H, K)
                 let bcx = bcx.contiguous()?;
-                let (y, new_state) = if use_flashkern {
-                    crate::flashkern::candle_ops::causal_conv1d_update_fused(&bcx, &prev, &w)?
-                } else {
-                    candle_flashfftconv::causal_conv1d_update_fused(&bcx, &prev, &w)?
-                };
+                let (y, new_state) =
+                    candle_flashfftconv::causal_conv1d_update_fused(&bcx, &prev, &w)?;
                 cache.conv_states[block_idx] = Some(new_state);
                 let y = y.transpose(1, 2)?.contiguous()?;
                 return linear_forward(&self.out_proj, &y);
@@ -723,23 +701,26 @@ impl ShortConv {
         let x_proj = bcx.narrow(1, 2 * self.hidden_size, self.hidden_size)?;
         let bx = (bgate * &x_proj)?.contiguous()?;
 
-        // One causal depthwise short-conv path for prefill, decode, AND multi-token
-        // continuation, through the FlashFFTConv `depthwise_conv1d_stream` kernel in the
-        // model's NATIVE dtype — bf16 on Metal runs f32-accumulate / bf16-store (the
-        // deployed, trained-around regime), no upcast. The carried state is keyed on
-        // presence, not seq_len: at sequence start `conv_states` is `None` (fresh or
-        // cleared cache) so prefill zero-pads exactly as the reference; when a suffix
-        // chunk continues an existing stream (persistent cross-turn cache), the carried
-        // K-1 inputs make chunked forward numerically equal to one full-sequence forward
-        // — causal conv has no other cross-boundary dependence.
+        // Device routing remains above Flashkern. CPU bf16 enters one typed
+        // Flashkern pass; the temporary Metal backend stays independent until
+        // the MLX C++ device engine replaces it. Neither path stages a Rust
+        // `[state | bx]` Tensor on the CPU.
         let w = self.conv_weight.squeeze(1)?; // (H, K)
         let prev = if self.l_cache > 0 {
             cache.conv_states[block_idx].clone()
         } else {
             None
         };
-        let (conv_out, new_cache) =
-            candle_flashfftconv::depthwise_conv1d_stream(&bx, &w, prev.as_ref())?;
+        let (conv_out, new_cache) = if bx.device().is_cpu() {
+            crate::flashkern::candle_ops::depthwise_conv1d_stream(&bx, &w, prev.as_ref())?
+        } else {
+            #[cfg(feature = "metal")]
+            {
+                candle_flashfftconv::depthwise_conv1d_stream(&bx, &w, prev.as_ref())?
+            }
+            #[cfg(not(feature = "metal"))]
+            candle_core::bail!("non-CPU short-conv requires the metal feature");
+        };
         if cache.use_kv_cache && self.l_cache > 0 {
             cache.conv_states[block_idx] = Some(new_cache);
         }
@@ -1202,6 +1183,9 @@ impl Model {
         embed_kind: u32,
         out_hidden: &mut [u16],
         out_logits: Option<&mut [f32]>,
+        sampler: Option<&crate::flashkern::native_engine::SampleConfig>,
+        sample_state: Option<&mut crate::flashkern::native_engine::PrngState>,
+        out_token: Option<&mut u32>,
     ) -> Result<bool> {
         use crate::flashkern::decode::PtrLen;
         use crate::flashkern::native_engine::LayerState;
@@ -1291,6 +1275,9 @@ impl Model {
                 cosp.size().min(sinp.size()),
                 out_hidden,
                 out_logits,
+                sampler,
+                sample_state,
+                out_token,
                 lanes,
             )
         };

@@ -10,18 +10,27 @@ Rust entrypoint at `packages/desktop/src-tauri`.
   Rust handle wrapper over the complete C++/SIMD/assembly local voice runtime.
 - `crates/candle-flashfftconv` - migration-only Candle operators, deleted when
   the native production kernel gates pass.
-- `crates/kcoro-sys` - build-only sys crate for the vendored kcoro coordination,
-  ticket, fixed-executor, and host-port runtime; no safe Rust scheduler API.
+- `crates/kcoro` - dependency-free safe Rust coordination kernel. Its first
+  production mount owns the sole Flashkern SQ broker future and exact CQ wake
+  edge; scopes, child tickets, recurrence, and service policy remain open.
+- `crates/kcoro-sys` - build-only sys crate for the vendored C conformance
+  oracle and expected-value host waits. Its C ticket scheduler is tested but is
+  not on Flashkern's production pass path.
 
 ## Boundaries
 
 - Bun/TypeScript calls Tauri commands; it does not import or build native crates directly.
 - Tauri depends on `liquid-audio` by path and owns persisted settings, command
   registration, opaque handle lifetime, and bounded event projection.
-- `liquid-audio` owns the private C ABI declarations; its C++ runtime owns model
-  loading, session state machines, pass/ticket orchestration, recurrence, and
-  numerical dispatch.
-- `kcoro-sys` owns compiling kcoro; it does not expose a safe Rust runtime API.
+- `liquid-audio` currently owns the hybrid Rust/Candle model rim, the safe Rust
+  coordinator endpoint, and the private C ABI. C++ owns the resident checkpoint
+  image, native SQ/CQ and descriptors, fixed numerical lanes, and SIMD/assembly
+  dispatch.
+- `crates/kcoro` owns product coordination. At the current mount it routes one
+  synchronous borrowed-pointer pass; at cutover it owns scopes, tickets, and
+  recurrence without owning model math.
+- `kcoro-sys` compiles the C oracle and platform wait adapter. It is not the
+  product policy scheduler.
 
 ## Native Source Layout
 
@@ -39,9 +48,9 @@ Detailed design notes remain adjacent to the owning crate under `crates/*/docs/`
 ## Integration Guides
 
 - [`KCORO_ARENA_INTEGRATION.md`](KCORO_ARENA_INTEGRATION.md) - current and target
-  architecture, memory ownership, fixed Flashkern lanes, zero-spin waits,
-  tickets/callbacks, host adapters, Tauri observation, durable workflows,
-  shutdown ordering, and verification gates.
+  architecture, the source-exact mounted pass sequence, memory ownership, fixed
+  Flashkern lanes, wait exceptions, tickets/callbacks, host adapters, Tauri
+  observation, durable workflows, shutdown ordering, and verification gates.
 - [`10-stateful-multi-agent-runtime.md`](../../specs/10-stateful-multi-agent-runtime.md) -
   one shared model with many conversation images, fast switching, perspective
   forks, macro batching, delta hibernation, and WAL-backed orchestration.

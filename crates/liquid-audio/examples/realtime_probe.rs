@@ -98,7 +98,10 @@ impl VoiceEngine for LoopEngine {
             if cancel.load(Ordering::Acquire) {
                 return Ok(false);
             }
-            emit(VoiceEvent::Audio { pcm: vec![0.0], rate: 24_000 });
+            emit(VoiceEvent::Audio {
+                pcm: vec![0.0],
+                rate: 24_000,
+            });
             std::thread::sleep(Duration::from_millis(1));
         }
         Ok(true)

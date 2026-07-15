@@ -1,12 +1,14 @@
 # Current State Audit
 
 Status: audited migration baseline with committed scheduler-substrate deltas
-recorded through 2026-07-13.
+recorded through 2026-07-14.
 
 Audited against EmberHarmony commit `321538f11749` and `kcoro_arena` commit
 `447d04f0246b`. Scheduler deltas are pinned to upstream `bd530f4c9196`, Ember
-vendor `8d510f83`, executor `d2c43abd`, and harness `3625df4e`. Line references
-in this design point to the named revision for the claim. When a referenced
+vendor `8d510f83`, executor `d2c43abd`, harness `3625df4e`, native bridge
+`2a2adcea`, production bridge mount `95069bd5`, retained descriptors
+`fa35a624`, and Rust endpoint mount `4f06a3d5`. Line references in this design
+point to the named revision for the claim. When a referenced
 implementation file moves, the change that moves it must update the
 corresponding citation here.
 
@@ -33,6 +35,8 @@ The current implementation is a hybrid:
 - Tauri settings correctly choose the model, mode, and device at runtime.
 - C++ owns an immutable safetensors image and several fused CPU kernels.
 - C++/assembly runs eligible one-token backbone and native Mimi decode work.
+- Eligible Flashkern passes traverse the mounted Rust SQ broker and CQ ingress,
+  but the outer call remains synchronous to retain borrowed Candle buffers.
 - Rust still owns audio I/O, VAD, queues, utterance materialization, mel,
   Conformer, conversation assembly, generation control, sampling, and Moshi.
 - Candle still owns nearly all model tensor objects and all paths not explicitly
@@ -49,9 +53,15 @@ flowchart LR
     VAD --> TENSOR["Candle PCM tensor"]
     TENSOR --> MEL["Rust/Candle resample and mel"]
     MEL --> CONF["Rust/Candle Conformer and adapter"]
-    CONF --> PREFILL["Rust/Candle modality scatter and prefill"]
-    PREFILL --> FK["C++ Flashkern eligible passes"]
-    FK --> GEN["Rust sampler and generation loop"]
+    CONF --> MODEL["Rust/Candle prefill and generation"]
+    MODEL --> RIM["blocking native-engine rim"]
+    RIM --> CPP["C++ single request slot"]
+    CPP -->|"registered callback"| KCORO["Rust result slot and SQ broker"]
+    KCORO -->|"SQ doorbell"| FK["C++ Flashkern fixed lanes"]
+    FK -->|"CQ doorbell"| INGRESS["dedicated Rust CQ ingress"]
+    INGRESS -->|"resolve slot and broker edge"| CPP
+    CPP -->|"return logits/status"| GEN["Rust sampler and generation loop"]
+    GEN --> MODEL
     GEN --> MIMI["Native Mimi decode through Rust adapter"]
     MIMI --> OUT["Rust output queue and audio device"]
 ```
@@ -73,9 +83,10 @@ flowchart LR
 | Conformer | `LFM2AudioModel` stores `ConformerEncoder` and `audio_adapter` at `crates/liquid-audio/src/model/lfm2_audio.rs:292-330`; construction is at `391-425`; production prefill calls them at `758-917` and `1172-1305`. | Bind weights once and execute both stages through native passes. |
 | Conversation state | Five Candle tensors are held by `ConversationState` at `crates/liquid-audio/src/runtime/realtime.rs:940-1021`; `Lfm2VoiceEngine` also owns cache, pending prepare, and vault state at `1053-1185`. | Replace tensor cloning/cat with one generation-protected native conversation arena. |
 | Full and suffix prefill | `prefill_suffix` builds vectors, tensors, concatenations, and scatter indices at `crates/liquid-audio/src/model/lfm2_audio.rs:749-918`; `prefill_inputs` repeats full-context assembly at `1172-1305`. | Port direct modality dispatch into preallocated embedding planes. |
-| Generation and sampling | `Sampler` wraps Candle `LogitsProcessor` at `crates/liquid-audio/src/model/lfm2_audio.rs:199-262`; `generate_with_cache` owns recurrence at `1630-1733`. | Sampler RNG state and recurrence move into `LfmConversation`; Rust is not called per token. |
-| Backbone fast path | `lfm_engine_token_pass` is a real fused native pass at `crates/liquid-audio/native/src/engine/flashkern_engine.cpp:1394-1429`; Rust captures state and calls it through `crates/liquid-audio/src/compute/flashkern/native_engine.rs:300-394`. | Extend this owner outward; do not wrap it in more Rust queues. |
-| Scheduler | At `d2c43abd`, the live engine owns stable pthread lanes plus one shared dispatch word and one shared fence word at `flashkern_engine.cpp:306-335`. `lane_fence` records the logical waiter mask and performs at most one address wake per nonempty generation at `622-650`; `submit_pass` creates one arena ticket, release-publishes the request generation, rings the shared dispatch word once, and blocks the transitional Rust rim for the exact callback at `1073-1141`. The stackful dispatcher, saved stacks, context-switch assembly, and old kcoro vendor tree are deleted. | Keep kcoro on coarse coordination and the ordinary nested C++ lane program. Move recurrence and pass submission from the blocking Rust rim into `NativeCoordinator`; do not introduce movable lane frames. |
+| Generation and sampling | `Sampler` wraps Candle `LogitsProcessor` at `crates/liquid-audio/src/model/lfm2_audio.rs:199-262`; `generate_with_cache` owns recurrence at `1630-1733`. | Sampling/RNG/state append move into native passes. Compact result IDs wake the resident Rust coordinator per declared pass; Tauri and numerical payloads do not cross that edge. |
+| Backbone fast path | `lfm_engine_token_pass` is a real fused native pass at `crates/liquid-audio/native/src/engine/flashkern_engine.cpp:1616-1680`; Rust calls it through `crates/liquid-audio/src/compute/flashkern/native_engine.rs:420-465` and the retained-context guard at `706-725`. | Extend this owner outward; do not wrap it in more Rust queues. |
+| Scheduler | At `4f06a3d5`, the live engine owns stable pthread lanes, one mechanical SQ dispatcher, one shared dispatch word, one shared fence word, and one native-owned one-slot SQ/CQ at `flashkern_engine.cpp:321-399`. `bridge_main` validates the retained descriptor generation and rings the lanes at `1106-1140`; lane 0 publishes one completion at `1043-1084`. `submit_pass` at `1142-1190` creates a descriptor and invokes the registered Rust submitter; it no longer calls SQ submit or CQ wait. The compatibility caller remains blocked inside that callback so its borrowed request pointers stay live. | Keep ordinary nested C++ lane programs and the native ring leaf. Replace borrowed request storage with owned native pass slots before deleting the blocking compatibility call; do not introduce movable lane frames. |
+| Rust coordinator mount | `crates/kcoro` at `3a5b1431` supplies fixed-capacity workers, exact promises, inherited scope words, bounded SPSC rings, and 128-byte records. Retained descriptors landed at `fa35a624`. At `4f06a3d5`, `coordinator.rs:304-431` gives one Rust broker sole SQ ownership and one dedicated ingress thread sole CQ ownership; `native_engine.rs:259-305` registers it and `802-826` clears, stops, and joins it before native destruction. | The first production endpoint owner is connected and zero-poll. Service-class arbitration, scope-change wake propagation, Rust-owned child recurrence, QoS, and removal of the borrowed-pointer block remain open. |
 | Mimi output | C++ already owns streaming Mimi decode through `mimi_decoder_step` in `crates/liquid-audio/native/src/mimi/mimi_decode.cpp:776-911`; the Rust adapter allocates output `Vec<f32>` at `crates/liquid-audio/src/mimi_native.rs:92-109`. | Keep the decoder, change it to write into a reserved playback span, and remove the vector adapter. |
 | Moshi | `RealtimeMoshi` owns Candle Mimi, the Moshi LM, multistream state, and samplers at `crates/liquid-audio/src/runtime/realtime.rs:1850-1921`; each PCM frame is copied into a Candle tensor at `1954-2026`. | Moshi must be ported to the same native model/session contract before Candle can leave production. |
 
@@ -137,9 +148,13 @@ The local path currently composes several independent thread systems:
 - turn or frame inference worker (`runtime/realtime.rs:491-922`).
 - event consumer and optional output worker (`voice_runtime.rs:1040-1343`).
 - WebRTC microphone and media workers (`voice/runtime.rs:2965-3419`).
-- Flashkern's fixed pthread lane team and one arena coordination worker
-  (`flashkern_engine.cpp:1029-1195`). The former stackful dispatcher and saved
-  lane stacks have been deleted.
+- Flashkern's fixed pthread lane team and one mechanical SQ dispatcher
+  (`flashkern_engine.cpp:1041-1248`).
+- one dedicated Rust kcoro broker worker and one blocking CQ ingress owner
+  (`coordinator.rs:343-431`, constructed at `463-535`).
+- The C arena coordination worker, former
+  stackful dispatcher, and saved lane stacks have been deleted from the product
+  pass path.
 
 This is why a fast kernel can still stutter: the complete frame/turn crosses
 several allocators, queues, condition variables, and ownership domains before
@@ -154,14 +169,21 @@ The migration must preserve these existing decisions:
   `packages/desktop/src-tauri/src/settings.rs:210-250`.
 - Native safetensors bytes are immutable and bit exact.
 - Flashkern tile fan-out uses a shared atomic claim counter, not one channel
-  message per tile (`flashkern_engine.cpp:118-127`, `622-641`).
+  message per tile (`flashkern_engine.cpp:119-128`, `670-684`).
 - At executor commit `d2c43abd`, the generation fence closes the declared-park
   lost-wake race with a precise logical park mask and one prepared shared fence
-  handle (`flashkern_engine.cpp:128-132`, `622-650`). Dispatch uses a second
-  prepared shared word at `1029-1046` and `1127-1132`. `FENCE_SPIN`, stackful
+  handle (`flashkern_engine.cpp:134-138`, `634-662`). At bridge mount
+  `95069bd5`, dispatch uses the prepared SQ doorbell at `bridge_main:1106-1140`
+  and the lane word at `1041-1081`. `FENCE_SPIN`, stackful
   park/unpark, and the process-global wait registry are gone. G0/G3 percentile
   evidence is pinned under `docs/native/baselines/`; barrier economy remains the
   next measured optimization.
+- At `4f06a3d5`, production pass progress crosses only registered edges: the
+  C++ callback admits a preallocated slot, the Rust ring wakes its broker, the
+  native CQ doorbell wakes dedicated ingress, and ingress resolves the exact
+  slot plus broker continuation. The 10,000-pass debug/release/arm64/Rosetta
+  soak, no-submitter descriptor cleanup test, and 0.001-0.004% idle gate passed
+  locally; remote CI remains the authority for cross-host production status.
 - Shutdown wins over queued turn preparation in the Rust worker; that behavior
   remains a regression gate during replacement.
 - Frame interruption drops stale frames without resetting the continuous model

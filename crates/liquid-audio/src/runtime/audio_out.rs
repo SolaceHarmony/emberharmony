@@ -144,13 +144,20 @@ impl AudioDetokenizer for MimiDetokenizer {
     /// the turn boundary by [`reset_stream`](Self::reset_stream).
     fn decode_step(&self, frame: &Tensor) -> Result<Option<Tensor>> {
         let codes: Vec<u32> = frame.to_dtype(DType::U32)?.flatten_all()?.to_vec1()?;
-        match self.decode_step_codes(&codes).map_err(candle_core::Error::Msg)? {
+        match self
+            .decode_step_codes(&codes)
+            .map_err(candle_core::Error::Msg)?
+        {
             Some(pcm) => {
                 let n = pcm.len();
                 // ALWAYS a CPU tensor (review P1): the consumer downloads to
                 // host samples immediately — materializing PCM on frame.device()
                 // (Metal) added an upload+download sync pair per frame.
-                Ok(Some(Tensor::from_vec(pcm, (1, 1, n), &candle_core::Device::Cpu)?))
+                Ok(Some(Tensor::from_vec(
+                    pcm,
+                    (1, 1, n),
+                    &candle_core::Device::Cpu,
+                )?))
             }
             None => Ok(None),
         }

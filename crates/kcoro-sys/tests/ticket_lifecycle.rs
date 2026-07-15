@@ -212,7 +212,10 @@ fn cargo_links_exact_ticket_completion() {
         reserved: 0,
         result: std::ptr::null_mut(),
     };
-    assert_eq!(unsafe { kc_ticket_complete_id(runtime, id, &completion) }, 1);
+    assert_eq!(
+        unsafe { kc_ticket_complete_id(runtime, id, &completion) },
+        1
+    );
     assert_eq!(unsafe { kc_ticket_complete(ticket, &completion) }, 0);
 
     let producer = std::thread::current().id();

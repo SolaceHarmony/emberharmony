@@ -1,8 +1,11 @@
-# Scheduler, Passes, Tickets, And Native Recurrence
+# Scheduler, Passes, Tickets, And Callback-Driven Recurrence
 
-Status: normative design with the fixed-lane/ticket substrate implemented at
-upstream `bd530f4c9196`, vendor `8d510f83`, and executor `d2c43abd`. Native
-recurrence remains incomplete.
+Status: normative design with the fixed-lane substrate at `d2c43abd`, Rust
+coordination foundation at `3a5b1431`, native SQ/CQ leaf at `2a2adcea`, and
+production bridge mount at `95069bd5`. Retained descriptor pooling is committed
+at `fa35a624`, and first Rust broker/CQ ownership is mounted at `4f06a3d5`.
+Service scheduling, scope wakes, owned pass slots, and product recurrence remain
+incomplete.
 
 Baselines: EmberHarmony `321538f11749`; `kcoro_arena` `447d04f0246b`.
 
@@ -13,16 +16,23 @@ Upstream contracts:
 
 ## Goal
 
-Use two deliberately different native executors:
+Use two deliberately different resident executors:
 
-- kcoro stackless continuations for coarse orchestration, tickets, timers,
-  audio coordination, callbacks, cancellation, and workflows;
+- Rust kcoro futures for coarse orchestration, tickets, timers, audio policy,
+  callbacks, cancellation, and workflows;
 - a persistent fixed Flashkern worker team for model stages, shared scratch,
   tile fan-out, SIMD, and assembly.
 
-Move token/frame recurrence into the native coordinator. Rust rings coarse
-command doorbells and receives bounded metadata. It is never in the one-token,
-one-frame, one-stage, or one-ticket completion loop.
+Flashkern is specifically the CPU compute device. The required Apple GPU peer is
+a separate MLX C++/Metal executor selected by the model/device layer; Metal command
+submission never enters Flashkern. Both devices speak the same coarse ticket and
+descriptor laws to Rust kcoro, but they do not share numerical worker machinery.
+
+Move token/frame recurrence into the resident Rust coordinator while every
+numerical operation stays native. Rust publishes compact commands and consumes
+compact completions through SQ/CQ rings. Tauri rings coarse policy tokens and
+receives bounded metadata; it is never in a token, frame, stage, or ticket
+completion loop.
 
 The CPU runtime can do something a static GPU command list cannot: after one
 full pass it can inspect live context, modality, workflow, deadline, and
@@ -42,9 +52,10 @@ those lanes onto the general kcoro ready queue would add continuation state,
 worker migration, queue arbitration, and wake routing without exposing useful
 parallelism.
 
-The fixed team therefore keeps ordinary nested C++ call stacks. kcoro schedules
-the coarse pass ticket and receives the completion doorbell. Flashkern schedules
-the numerical stage and tiles. No `LaneFrame` rewrite is required.
+The fixed team therefore keeps ordinary nested C++ call stacks. Rust kcoro
+schedules the coarse pass ticket and receives the completion doorbell.
+Flashkern schedules the numerical stage and tiles. No `LaneFrame` rewrite is
+required.
 
 This also follows from the serialization boundary. Conversation images are legal
 only when no pass is active; the capture gate in document 11 requires quiescence,
@@ -59,16 +70,17 @@ are empty of pass work whenever capture is admitted.
 
 | Current symbol | Evidence | Design action |
 |---|---|---|
-| `Pass` | `crates/liquid-audio/native/src/engine/flashkern_engine.cpp:76` stores borrowed pointers and shared scratch. | Current single-pass slot is pointer-stable. Promote it to a generation-protected slot pool when the native coordinator admits multiple producers. |
-| `Stage` | `flashkern_engine.cpp:113` uses one atomic tile claim counter. | Preserve as the micro-scheduler; add an active-lane mask only for plans that intentionally use a subset. |
-| `Fence` | `flashkern_engine.cpp:128` stores arrival, logical generation, and park mask. | Implemented at `d2c43abd`: last arriver publishes generation and fans declared waiters through one shared expected-value word without spin. |
-| Request kinds | `flashkern_engine.cpp:136-145` includes MLP, layer, token, and transitional callback requests. | Replace `REQ_CALL` with typed Depthformer/fan-out passes; keep pass-granularity ticket IDs. |
-| Engine ownership | `flashkern_engine.cpp:306-383` stores fixed pthreads, shared doorbells, arena runtime/ticket, request slots, plans, and scratch. | Fixed executor is implemented at `d2c43abd`; split out the multi-session `NativeCoordinator`. |
-| `lane_fence` | `flashkern_engine.cpp:622-650`. | Implemented at `d2c43abd`: immediate shared expected-value block preserves generation/last-arriver correctness. |
-| `run_stage` | `flashkern_engine.cpp:658-672`. | Keep atomic disjoint tile claiming and one serial transition. |
-| Nested lane program | `flashkern_engine.cpp:993-1025`. | Keep ordinary C++ calls; port the remaining Rust callback bodies without flattening this tower. |
-| Engine construction | `flashkern_engine.cpp:1154-1195` creates fixed pthreads and two prepared shared wait words. | Implemented at `d2c43abd`; add readiness/affinity policy and million-pass soak. |
-| External handback | `submit_pass` at `flashkern_engine.cpp:1085-1141` uses one arena ticket but still blocks the Rust caller; `lfm_engine_call` remains at line 1200. | Move recurrence to native ticket callbacks, then delete the blocking Rust handback and `REQ_CALL`. |
+| `Pass` | `crates/liquid-audio/native/src/engine/flashkern_engine.cpp:94` stores borrowed pointers and shared scratch. | Current single-pass slot is pointer-stable. Promote it to an owned generation-protected slot pool before the Rust broker admits multiple producers or the compatibility caller returns asynchronously. |
+| `Stage` | `flashkern_engine.cpp:131` uses one atomic tile claim counter. | Preserve as the micro-scheduler; add an active-lane mask only for plans that intentionally use a subset. |
+| `Fence` | `flashkern_engine.cpp:146` stores arrival, logical generation, and park mask. | Implemented at `d2c43abd`: last arriver publishes generation and fans declared waiters through one shared expected-value word without spin. |
+| Request kinds | `flashkern_engine.cpp` includes typed MLP, layer, token, sampler, Depthformer, streaming-conv, GEMM, and DD FFT requests. | Request kind 5 and the generic callback ABI are deleted. Keep pass-granularity ticket IDs. |
+| Engine ownership | At `4f06a3d5`, `flashkern_engine.cpp:321-399` stores fixed pthreads, one mechanical SQ dispatcher, shared doorbells, one native bridge, request slots, plans, and scratch. `coordinator.rs:343-431` owns the Rust SQ broker and CQ ingress. Neither path stores a C arena runtime or ticket. | Keep this two-machine boundary. Move ticket identity/recurrence policy into Rust without routing stages or tiles through it. |
+| `lane_fence` | `flashkern_engine.cpp:735-769`. | Implemented at `d2c43abd`: immediate shared expected-value block preserves generation/last-arriver correctness. |
+| typed Depthformer stage waits | `run_depth_frame` in `flashkern_engine.cpp` uses `lane_fence`; `DepthDecode::frame` is a pointer-only ABI rim. | Implemented: the Rust `SpinBarrier`, lane arithmetic, nested sampler ABI, and callback were deleted. Keep remaining typed passes on this zero-spin pattern. |
+| `run_stage` | `flashkern_engine.cpp:771-791`. | Keep atomic disjoint tile claiming and one serial transition. |
+| Nested lane program | `lane_program` and its typed `run_*` bodies in `flashkern_engine.cpp`. | Keep ordinary C++ calls and native stage fences; no Rust frame enters this tower. |
+| Engine construction | `flashkern_engine.cpp:1201-1247` creates the native bridge, mechanical dispatcher, fixed pthreads, and two prepared lane wait words; `native_engine.rs:259-305` adds and registers the Rust coordinator. | Add readiness/affinity policy and million-pass soak. |
+| External handback | `submit_pass` invokes the registered Rust broker; `coordinator.rs` admits a fixed slot, submits through the sole broker, blocks on CQ ingress, and resolves the exact caller. | CQ ownership and typed-pass cutover are complete. Replace borrowed request storage with owned pass slots, then make the public rim asynchronous. |
 
 The coordination API is vendored under
 `crates/kcoro-sys/vendor/kcoro_arena/include/`. Work and lifecycle conditions are
@@ -81,19 +93,19 @@ worker. The ticket slab and intrusive completion queue live in
 
 | Level | Owner | Unit of work | Worker identity |
 |---|---|---|---|
-| Macro | kcoro coordination runtime | session command, actor step, timer, action ticket, full pass ticket, callback, context switch, snapshot capture request | movable stackless continuation |
+| Macro | Rust kcoro coordinator | session command, actor step, timer, action ticket, full pass ticket, callback, context switch, snapshot capture request | movable Rust future on dedicated workers |
 | Micro | Flashkern fixed executor | pass stage, GEMV rows, convolution channels, attention heads, FFT/mel bins, adapter rows | stable logical lane on stable OS worker |
 
 A kcoro channel/ticket per tile, tensor operation, layer, or SIMD block is
 forbidden. All fixed lanes observe one read-only pass descriptor, claim disjoint
 tiles from one board, and write declared shared destinations.
 
-## Object And Lifetime Graph
+## Target Object And Lifetime Graph
 
 ```mermaid
 flowchart TB
     Runtime["LfmRuntime"]
-    Coord["NativeCoordinator + kc_runtime"]
+    Coord["Rust kcoro coordinator"]
     Exec["FlashkernExecutor fixed lanes"]
     Model["immutable ModelPlan"]
     Session["LfmSession"]
@@ -116,17 +128,18 @@ flowchart TB
     Slot --> ConvA
 ```
 
-`LfmRuntime` owns the coordination and fixed executors. The model plan and
+`LfmRuntime` owns the Rust coordination and native fixed executors. The model plan and
 weight image are immutable. Each conversation owns mutable context. A pass
 ticket retains its pass slot and context through completion-target consumption.
 Session stop joins active tickets and both executors before releasing any owner.
 
-## Coordination Runtime
+## Target Coordination Runtime
 
-Each `LfmRuntime` owns an explicit `kc_runtime_t`; no process-global `koro_go`
-helper is used.
+Each product `LfmRuntime` owns a fixed-capacity `kcoro::Executor`; it does not
+mount the C actor scheduler as its policy runtime. The C substrate remains the
+conformance oracle and supplies native expected-value wait helpers.
 
-The upstream repair ledger is:
+The C oracle repair ledger is:
 
 1. **Done (`bcdc03d1a073`):** split `work_cv` from `lifecycle_cv` in `kc_runtime`.
 2. **Done (`bcdc03d1a073`):** signal one work waiter for each newly runnable continuation or
@@ -135,21 +148,29 @@ The upstream repair ledger is:
    arena-worker callbacks, cancel/deadline/stop disposition, and snapshots.
 4. **Done (`bcdc03d1a073`):** add raw-word atomics and zero-spin expected-value waits with precise
    teardown in the host adapter.
-5. **Open:** remove unregistered `KORO_WAIT_UNTIL` at
+5. **Not mounted in product:** unregistered `KORO_WAIT_UNTIL` at
    `include/kcoro_stackless.h:125-133`; every park owns a retained operation,
    ticket, timer, channel wait, or explicit doorbell subscription.
-6. **Open:** add actor message/time quanta because `actor_step` at
+6. **Not mounted in product:** `actor_step` at
    `core/src/kc_actor.c:33-55` can otherwise monopolize a worker while a mailbox
    is continuously replenished.
-7. **Open:** make configured capabilities truthful; `core/src/kc_admin.c:11-18` currently reports
+7. **Open in the oracle:** make configured capabilities truthful; `core/src/kc_admin.c:11-18` currently reports
    optional durable/transport services unconditionally.
 
-Coordination-worker count and fixed kernel-lane count are separate persisted
-runtime settings. The current `kc_runtime_create` default of one at
-`core/src/kc_runtime.c:170` is not interpreted as CPU autodetection or reused as
-the numerical lane policy.
+Rust commit `3a5b1431` implements fixed capacity, nonzero explicit worker count,
+bounded draining, generation-protected task reuse, preallocated task wakers,
+exact-once promises, inherited scope words, and edge-woken SPSC rings. Commits
+`2a2adcea` and `95069bd5` mirror the protocol in C and mount a native-owned ring
+leaf in Flashkern. `fa35a624` adds retained descriptors, and `4f06a3d5` mounts
+the sole Rust SQ broker plus dedicated CQ ingress. Open work is scope-control
+doorbell subscription, child-ticket recurrence, service-class fairness,
+multi-board admission, and platform QoS binding.
 
-## Fixed Flashkern Executor
+Coordination-worker count and fixed kernel-lane count are separate persisted
+runtime settings. A zero worker count is rejected; it never means one worker or
+CPU autodetection.
+
+## Target Fixed Flashkern Executor
 
 ```c++
 struct FlashkernExecutor {
@@ -190,7 +211,7 @@ Thread affinity and performance-core policy are host-adapter settings. Stable
 logical lane identity is mandatory even when the OS declines a requested CPU
 binding.
 
-## Pass Descriptor And Ticket
+## Target Pass Descriptor And Ticket
 
 ```c++
 enum class PassKind : uint32_t {
@@ -222,29 +243,34 @@ struct PassDescriptor {
 };
 ```
 
-The slot is preallocated and remains alive through callback. A private
-`kc_ticket_t *` owns its descriptor lease. The submission queue carries one pointer,
-not a copied descriptor. Weights, activations, KV, PCM, and scratch never enter
-either queue.
+The target slot is preallocated and remains alive through completion
+consumption. A Rust child ticket owns its opaque native descriptor lease. The
+submission queue copies only the fixed control cell containing that descriptor
+ID; it never copies the descriptor or payload. Weights, activations, KV, PCM,
+and scratch never enter either queue. The mounted path already has an eight-slot,
+generation-protected descriptor pool whose queue lease survives CQ consumption.
+Its descriptor payload is currently only `Engine*` plus the request kind; the
+actual numerical pointers remain in one borrowed engine request slot. It is not
+yet the owned `PassDescriptor` slot or region-lease graph described here.
 
 The upstream baseline `koro_send_begin_ex` always copies through
 `kc_descriptor_create_copy` at `kcoro_arena/core/src/kcoro_stackless.c:94-107`.
 The product executor must use the new descriptor-transfer/ticket submission
 surface, never this copy-mode helper.
 
-### SQ/CQ boundary
+### Target SQ/CQ Boundary
 
 The executor boundary is an explicit submission-queue/completion-queue pair,
 matching a command processor rather than a general actor channel:
 
 ```text
 many session/workflow actors
-    -> bounded intrusive MPSC broker admission
+    -> bounded Rust broker admission by service class
     -> policy selects one retained ticket
     -> bounded SPSC SQ: broker -> fixed executor
     -> one full native pass
-    -> bounded SPSC CQ: final lane -> completion continuation
-    -> ticket terminal publication and exact coordinator wake
+    -> bounded SPSC CQ: final lane -> Rust completion continuation
+    -> ticket terminal publication and exact Rust coordinator wake
 ```
 
 The admission queue is not the SQ. It holds schedulable tickets while one board
@@ -252,8 +278,11 @@ is busy. ABI v1 may use a one-slot, generation-protected SQ because a board has
 one dispatched pass. The CQ has completion capacity reserved before SQ
 publication. SQ release-publication orders the pass descriptor before the first
 lane wake; CQ release-publication orders state/output writes before coordination
-reads them. Entries are retained pointers, producer/consumer sequences are
-cache-line separated, and neither edge calls copy-mode `KORO_SEND`.
+reads them. The SQ copies one fixed control cell containing a
+generation-protected native descriptor ID; the descriptor and payload remain in
+place. The CQ copies terminal facts and at most eight token/codebook IDs.
+Producer/consumer sequences are cache-line separated, and neither edge calls
+copy-mode `KORO_SEND`.
 
 SPSC describes logical endpoint ownership. The last-arriving lane may differ
 between passes, but only one pass can complete at a time, the dispatch permit is
@@ -262,7 +291,7 @@ publication transfers completion-producer ownership through acquire/release
 edges. If a later design overlaps passes, it must use independent SQ/CQ pairs or
 a separately proven multiproducer completion structure.
 
-The CQ rings the native continuation that makes progress. A Tauri or visualizer
+The CQ rings the Rust continuation that makes progress. A Tauri or visualizer
 callback is a separate, sampled observer after arbitration and can never be the
 callback that makes computation progress.
 
@@ -287,7 +316,7 @@ restore, or poison. In-place state that cannot be restored is marked poisoned;
 the coordinator cannot recur or snapshot it and may only destroy it or restore
 a previously durable image.
 
-## Stage Board
+## Target Stage Board
 
 Each immutable plan stage declares:
 
@@ -356,10 +385,14 @@ One barrier per tensor expression, helper function, or assembly call is
 forbidden. Each immutable plan records declared stage/barrier count and active
 mask so a model change cannot silently multiply host waits.
 
-## Zero-Spin Barrier
+## Native Zero-Spin Barrier
 
-`FENCE_SPIN = 8192` is removed. There is no bounded spin, `YIELD`, `PAUSE`, WFE
-budget, UMWAIT budget, timed poll, or repeated atomic-load loop.
+`FENCE_SPIN = 8192` is removed from the native Flashkern fence. There is no
+bounded spin, `YIELD`, `PAUSE`, WFE budget, UMWAIT budget, timed poll, or
+repeated atomic-load loop in the C++ dispatch/fence waits. The transitional
+Depthformer spin exception has also been removed: `REQ_DEPTH_FRAME` uses the
+same native fence. The generic Rust callback request is deleted, so there is no
+third wait primitive or language callback on the compute team.
 
 ```mermaid
 flowchart TD
@@ -411,47 +444,53 @@ immediately; waiting without the logical recheck would be a lost-wake bug.
 3. The last lane release-publishes serial output and the next logical generation,
    exchanges the park mask, and advances the shared fence word once when that
    mask is nonempty; awakened lanes acquire generation before claiming work.
-4. Final output writes happen before release-published ticket completion; the
-   coordination continuation acquires completion before commit/stale policy.
+4. Final output writes and full-pass epoch disposition happen before the native
+   executor release-publishes the CQ cell; the Rust ingress thread acquires that
+   cell before resolving the mounted result slot or, after recurrence lands, the
+   target terminal promise.
 
 The host wait primitive may return spuriously but cannot weaken these edges.
 SIMD/assembly kernels inherit synchronized pointer views and add no hidden
 publication protocol.
 
-## Full Pass
+## Target Full Pass
 
-A full pass starts when the coordinator publishes one pass pointer and ends when
-all stages have reached a valid model-state boundary and the ticket completion
-has been enqueued.
+A full pass starts when the coordinator publishes one SQ cell naming a retained
+pass descriptor and ends when all stages have reached a valid model-state
+boundary and the reserved CQ completion cell has been published.
 
 No host callback, Tauri event, disk write, CRC, cancellation poll, descriptor
 allocation, or payload copy occurs during that interval.
 
-The last pass lane performs bounded completion ingress:
+The last pass lane performs bounded completion publication:
 
 1. release-publish final destination writes and pass status;
-2. claim the ticket's `DISPATCHED -> COMPLETING` edge;
-3. append the ticket pointer to the preallocated CQ;
-4. ring one coordinator doorbell;
+2. compare the pass epoch with the native bridge's control/output epochs and
+   apply the pass plan's committed, rolled-back, stale, or fault disposition;
+3. fill the pre-reserved 128-byte CQ cell with the ticket ID, four terminal
+   facts, status, and compact results;
+4. release-publish that cell and ring one coordinator doorbell;
 5. block on the next executor command.
 
-It never invokes arbitrary callbacks. The coordination continuation finishes
-the ticket outside executor locks.
+It never invokes arbitrary callbacks. The Rust ingress thread drains the cell
+and resolves the ticket promise outside native executor locks.
 
-## Doorbells And Interrupts
+## Target Doorbells And Interrupts
 
 An interrupt is an epoch doorbell:
 
-1. `lfm_session_interrupt` atomically increments `requested_epoch`.
-2. It wakes the session coordinator exactly once.
+1. A Rust scope transition or native VAD reflex atomically advances the relevant
+   control/output epoch and rings one prepared doorbell.
+2. It wakes the session coordinator or native reflex handler exactly once.
 3. A queued old-epoch pass is canceled before dispatch.
 4. Lanes finish one already-dispatched full pass.
-5. The completion continuation compares the pass epoch to `requested_epoch`.
+5. At the full-pass boundary, native code compares the descriptor epoch with
+   the current bridge/output epoch.
 6. If stale, it discards unpublished output, applies the declared rollback or
-   continuous-state policy, flushes old-epoch playback, and publishes the ticket
-   as completed with committed or rolled-back state and stale publication.
-7. The parent action receives one terminal delivery through its configured
-   completion target and does not create another old-epoch child ticket.
+   continuous-state policy, flushes old-epoch playback, and publishes the CQ
+   cell as completed with committed or rolled-back state and stale publication.
+7. The parent Rust action receives one terminal promise resolution and does not
+   create another old-epoch child ticket.
 
 Stop follows the same full-pass rule and has priority over queued prepare/start
 work. There is no stop load inside `run_tile`, GEMV, attention, FFT, mel, layer,
@@ -466,24 +505,25 @@ state as declared by the plan. Fault wins if no valid boundary exists. Otherwise
 the unclaimed boundary precedence is runtime stop, stale epoch, explicit cancel,
 then hard timeout. None of these are polled by a lane.
 
-## Native Recurrence
+## Target Callback-Driven Recurrence
 
 The current path returns logits to Rust so `Sampler` and
 `generate_with_cache` choose the next token at
 `crates/liquid-audio/src/model/lfm2_audio.rs:1308-1500` and `1630-1733`.
-The target coordinator owns recurrence:
+The target native pass owns sampling and state append. Its completion cell
+carries only the selected token/codebook IDs and terminal facts. The Rust
+coordinator owns the policy decision that follows:
 
 ```mermaid
 stateDiagram-v2
     [*] --> Ready
     Ready --> Dispatch: create child pass ticket
-    Dispatch --> Complete: fixed lanes finish full pass
+    Dispatch --> Complete: fixed lanes finish, sample, and append
     Complete --> Stop: stop epoch observed
     Complete --> Stale: interrupt epoch observed
-    Complete --> Commit: current epoch
-    Commit --> Sample: backbone logits ready
-    Sample --> Depth: audio modality
-    Sample --> Text: text modality
+    Complete --> Commit: current epoch and compact result ready
+    Commit --> Depth: audio result needs typed depth/codec pass
+    Commit --> Text: text result continues token policy
     Depth --> Dispatch: depth/codebook pass
     Text --> Ready: append and recur
     Depth --> Decode: frame complete
@@ -494,12 +534,13 @@ stateDiagram-v2
     Stop --> [*]
 ```
 
-The serial sampler runs on the coordinator or a declared serial stage. It writes
-the selected token into native conversation state and submits the next pass
-pointer. UI text notification is a separate side effect and never gates the
-next pass.
+The serial sampler runs only as a declared native serial stage. It writes the
+selected token into native conversation state before CQ publication. Rust never
+receives logits, probabilities, RNG state, or tensor views. The resumed Rust
+continuation reads compact result IDs and submits the next descriptor. UI text
+notification is a separate side effect and never gates the next pass.
 
-## Conversation Switching And Branches
+## Target Conversation Switching And Branches
 
 At any completed child ticket, the coordinator may replace the pass context
 pointer while retaining the same immutable model plan and weights. It may:
@@ -517,15 +558,15 @@ raw KV merge.
 
 ### One broker, many hot contexts
 
-One Flashkern stage board executes one full pass at a time. A native
-`KernelBroker` actor is its sole command producer. Session, frame, and cognitive
-actors submit retained child-ticket pointers through bounded coordination
-queues; the broker publishes one pass pointer through an SPSC command handoff,
-and the fixed team returns completions through a separate SPSC pointer ring.
+One Flashkern stage board executes one full pass at a time. A Rust
+`KernelBroker` future is its sole command producer. Session, frame, and cognitive
+futures submit retained child tickets through bounded service-class admission;
+the broker publishes one fixed command cell naming a native pass slot, and the
+fixed team returns one fixed completion cell through the CQ.
 
-Admission uses intrusive linkage in the retained ticket, not `KORO_SEND` or a
-copied pointer descriptor. One ticket can be linked to only one broker; bounded
-queue rejection leaves caller ownership and every lease unchanged.
+Admission uses preallocated ticket slots, not `KORO_SEND` or a copied payload
+descriptor. One ticket can be admitted to only one broker; bounded queue
+rejection leaves caller ownership and every native lease unchanged.
 
 The broker schedules deadline-sensitive audio first within its service class,
 then interactive work, then bounded advisor/maintenance work. Runtime settings
@@ -547,57 +588,57 @@ claim that one shared scratch board runs two passes concurrently. Multiple
 passes may execute at once only when the runtime creates independent executors
 with separate workers, boards, scratch, and broker bindings.
 
-## `REQ_CALL` Disposition
+## Generic Callback Disposition
 
-`REQ_CALL` at `flashkern_engine.cpp:1200-1208` lets Rust callbacks execute on the
-fixed lane team. Current users enter through `NativeEngine::run_lanes`/`grid`
-starting at `crates/liquid-audio/src/compute/flashkern/native_engine.rs:452`.
-
-Migration rules:
-
-1. Treat every current production call site as explicit migration debt; add no
-   new caller.
-2. A callback is non-suspending, non-reentrant, and cannot unwind
-   across C.
-3. It runs to completion on its lane's ordinary OS stack and may not call kcoro,
-   Tauri, storage, or model recurrence.
-4. Port every production callback into a typed native pass.
-5. Delete `REQ_CALL`, its Rust trampoline, and production callback request kind
-   when the last call site is gone. Do not preserve a legacy mode.
-6. At `d2c43abd`, fixed lanes, expected-value waits, and deletion of the
-   stackful dispatcher, saved stacks, and context-switch assembly are complete.
-   They do not require flattening or preserving `REQ_CALL`.
+Complete in the current branch working tree; pin the commit hash when landed.
+Request kind 5, `lfm_engine_call`, `lfm_lane_fence`, and Rust
+`run_lanes/grid` are deleted. Four GEMM launch closures became `REQ_GEMM`; DD
+FFT convolution and inverse FFT became `REQ_FFT_CONV_DD` and `REQ_IRFFT_DD`.
+All carry borrowed planes and publish one completion for the complete grid. DD
+FFT convolution maps bit reversal and every butterfly stage across the complete
+fixed lane team, reuses one shared work plane, and crosses the zero-spin generation
+fence at each threadgroup-equivalent boundary. No compatibility mode survives.
 
 ## Source Changes
 
 1. **Done (`8d510f83`):** vendor arena `bd530f4c9196` explicit runtime, ticket,
    and wait-word contracts into `crates/kcoro-sys`; delete the old runtime tree.
-2. **Done (`bcdc03d1a073`, mounted by `d2c43abd`):** split work/lifecycle
-   waits, add the ticket slab/completion queue, and mount exact callbacks in
-   Flashkern. **Open:** retained-descriptor channel transfer and actor fairness.
-3. **Open:** add `native/src/runtime/native_coordinator.{h,cpp}` as the only local layer
-   calling `kc_runtime_*`, ticket, timer, actor, or callback APIs.
-4. **Open:** port all production `REQ_CALL` users into typed native passes, move
-   sampling and recurrence native as specified in document 07, and delete the
-   Rust lane trampoline.
-5. **Partly done (`d2c43abd`):** `flashkern_engine.cpp:306-383` owns fixed
-   workers, one pointer-stable request slot, stage board, two shared zero-spin
-   wait words, and ticket CQ ingress. Extract coordinator/executor files when the
-   native actor is added; do not flatten `lane_program` into stackless PCs.
-6. **Done (`d2c43abd`):** the fence at `flashkern_engine.cpp:622-650` uses the
+2. **Done oracle (`bcdc03d1a073`):** split work/lifecycle waits and add the C
+   ticket slab/completion queue and exact callback fixtures. The product mount
+   no longer links that ticket/runtime path; retained-descriptor channel
+   transfer and actor fairness remain oracle cleanup, not product dependencies.
+3. **Done (`3a5b1431`):** add `crates/kcoro` with the bounded
+   Rust executor, exact promises, scope words, protocol records, and SPSC edge
+   semantics.
+4. **Done first mount (`2a2adcea`, `95069bd5`, `fa35a624`, `4f06a3d5`):** add
+   and mount the private native-owned SQ/CQ leaf with prepared doorbells, CQ
+   reservation, stop races, exact final-lane publication, retained descriptors,
+   one Rust broker, and dedicated CQ-to-slot/promise routing. Add service queues,
+   Rust-owned child recurrence, and scope-control doorbells next.
+5. **Done in current working tree; pin on commit:** typed `REQ_DEPTH_FRAME`,
+   integrated sampling, streaming convolution, GEMM/GEMV, DD FFT convolution,
+   and DD inverse FFT are built. The Rust lane trampoline is deleted.
+6. **Partly done (`d2c43abd`, `95069bd5`, `4f06a3d5`):**
+   `flashkern_engine.cpp:321-399` owns fixed workers, one pointer-stable request
+   slot, stage board, two shared zero-spin lane words, and the native SQ/CQ leaf.
+   The Rust broker now owns endpoints; preserve this executor and do not
+   flatten `lane_program` into stackless PCs.
+7. **Done (`d2c43abd`):** the fence at `flashkern_engine.cpp:634-662` uses the
    shared raw-word atomic helper, logical park mask, and immediate expected-value
    block. Address identity is covered by upstream and Cargo wait-word tests.
-7. **Done (`d2c43abd` ancestry):** remove the stackful dispatcher, lane-stack
+8. **Done (`d2c43abd` ancestry):** remove the stackful dispatcher, lane-stack
    allocation, old vendor tree, and context-switch assembly; retain only OS
    worker stacks.
-8. **Partly done (`d2c43abd`):** each blocking Rust submission owns a
-   generation-protected child ticket and reserved CQ ingress. Native recurrence
-   and a multi-producer SQ remain open.
-9. **Open:** add post-transition ticket projections and generation-checked periodic board
+9. **Partly done (`fa35a624`, `4f06a3d5`):** each blocking compatibility
+   submission carries independent ticket and descriptor generations, owns a
+   native CQ reservation before dispatch, and resolves one preallocated Rust
+   result slot. Rust-owned parent/child ticket policy, scope identity, and
+   recurrence remain open.
+10. **Open:** add post-transition ticket projections and generation-checked periodic board
    sampling per document 12; no UI callback enters this executor, and an
    inconsistent board read is skipped rather than retried.
-10. **Open:** delete the blocking Rust request surface and every `REQ_CALL`
-    artifact after independent fixtures pass; keep no product or source fallback.
+11. **Open:** replace the blocking borrowed-pointer request rim with owned native
+    pass slots after native multi-token prefill and context state are mounted.
 
 ## Acceptance Gates
 
@@ -613,11 +654,11 @@ Migration rules:
 - C/C++ layout, address-identity, memory-order litmus, and TSan tests prove every
   board word uses one selected atomic helper and the wait adapter blocks on that
   exact storage without reinterpret-casting an atomic object.
-- One coordination enqueue wakes one worker. `finish_cont` and `suspend_cont`
-  wake no work waiter while lifecycle waiters still observe idle/join/stop
-  predicate changes. One nonempty fence park mask causes one shared host wake;
-  logical waiter count equals the mask population and no coordination worker is
-  touched by that fan-out.
+- One Rust coordination enqueue wakes one worker and never polls one
+  continuation concurrently. The C oracle's `finish_cont`/`suspend_cont` and
+  lifecycle tests remain conformance fixtures. One nonempty fence park mask
+  causes one shared host wake; logical waiter count equals the mask population
+  and no coordination worker is touched by that fan-out.
 - SQ/CQ full, wrap, stale-generation, stop, and completion races never overwrite
   an entry; each accepted dispatch already owns one CQ reservation.
 - Declared barriers correspond one-for-one with audited cross-lane dependencies;
@@ -630,16 +671,19 @@ Migration rules:
 - Stop before dispatch yields no kernel entry. Stop/interrupt during a pass
   permits one full completion and no old-epoch recurrence.
 - Queued prepare/start is skipped when stop has already advanced the epoch.
-- Current attention, convolution, MLP, full token, Depthformer, fan-out, and
-  temporary `REQ_CALL` parity tests pass during migration.
+- Current attention, convolution, MLP, full token, Depthformer, typed GEMM, and
+  typed DD FFT parity tests pass during migration.
+- Physical one-lane and multi-lane DD FFT executions are bit-identical; snapshot
+  counters prove every declared butterfly-stage barrier executed under one ticket.
 - The final production symbol/call-graph audit contains no `REQ_CALL`, Rust lane
   trampoline, stackful kcoro context switch, or saved lane-stack allocation.
-- A recurrent 1,000-token loop performs zero Rust/Tauri crossings per token and
+- A recurrent 1,000-token loop performs one exact CQ-to-Rust continuation edge
+  per declared pass and zero Tauri, webview IPC, polling, or observer edges; it
   responds at the next full-pass boundary.
 - Two hot conversations alternate at every pass without changing a weight
   address or corrupting state.
-- A callback cannot run on a compute/audio/store thread, overlap itself, or fire
-  after joined destruction.
+- A Rust continuation cannot run on a compute/audio/store thread, overlap
+  itself, or fire after joined destruction.
 - Actor flood tests cannot starve completion publication, timers, or stop.
 - ASan, UBSan, and TSan report no concurrent lane identity, retained-ticket reuse,
   use-after-free, missed wake, or live object after teardown.

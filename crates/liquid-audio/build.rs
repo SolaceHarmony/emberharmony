@@ -29,9 +29,17 @@ fn main() {
     // branch only).
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
         println!("cargo::rustc-link-lib=framework=Accelerate");
+        println!("cargo::rustc-link-lib=framework=Security");
+    }
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        println!("cargo::rustc-link-lib=bcrypt");
     }
 
     println!("cargo::rerun-if-changed=native/src/engine/flashkern_engine.cpp");
+    println!("cargo::rerun-if-changed=native/include/flashkern_conv.h");
+    println!("cargo::rerun-if-changed=native/include/flashkern_depth.h");
+    println!("cargo::rerun-if-changed=native/include/flashkern_fft.h");
+    println!("cargo::rerun-if-changed=native/include/flashkern_gemm.h");
     println!("cargo::rerun-if-changed=../kcoro-sys/vendor/kcoro_arena/include");
     // C++23, not a style choice: this TU includes kcoro headers, and C++23 is
     // the FIRST standard that requires <stdatomic.h> to work in C++ and expose
@@ -48,16 +56,60 @@ fn main() {
         .warnings(false)
         .flag("-ffp-contract=off")
         .flag("-pthread")
+        .include("native/include")
         .include("../kcoro-sys/vendor/kcoro_arena/include")
         .compile("lfm_flashkern_engine");
+
+    // Private Rust-kcoro/native docking leaf. The C++ translation unit owns the
+    // ring atomics and expected-value doorbells; the C anchor makes header
+    // compatibility and all layout assertions part of every build.
+    println!("cargo::rerun-if-changed=native/include/lfm_kernel_bridge.h");
+    println!("cargo::rerun-if-changed=native/src/runtime/kernel_bridge.cpp");
+    println!("cargo::rerun-if-changed=native/src/runtime/kernel_protocol_c.c");
+    cc::Build::new()
+        .file("native/src/runtime/kernel_bridge.cpp")
+        .cpp(true)
+        .std("c++23")
+        .opt_level(3)
+        .warnings(true)
+        .warnings_into_errors(true)
+        .flag("-pthread")
+        .include("native/include")
+        .include("../kcoro-sys/vendor/kcoro_arena/include")
+        .compile("lfm_kernel_bridge");
+    cc::Build::new()
+        .file("native/src/runtime/kernel_protocol_c.c")
+        .std("c11")
+        .warnings(true)
+        .warnings_into_errors(true)
+        .include("native/include")
+        .compile("lfm_kernel_protocol_c");
+
+    // Snapshotable ChaCha20 CSPRNG state/refill. Apple entropy enters through a
+    // tiny architecture assembly thunk to SecRandomCopyBytes; every hot draw is
+    // expanded by the assembly block kernel added to the architecture archive.
+    println!("cargo::rerun-if-changed=native/include/flashkern_prng.h");
+    println!("cargo::rerun-if-changed=native/include/flashkern_sampler.h");
+    println!("cargo::rerun-if-changed=native/src/engine/flashkern_prng.cpp");
+    cc::Build::new()
+        .file("native/src/engine/flashkern_prng.cpp")
+        .cpp(true)
+        .std("c++23")
+        .opt_level(3)
+        .warnings(true)
+        .warnings_into_errors(true)
+        .include("native/include")
+        .compile("lfm_flashkern_prng");
 
     // Flashkern's engine archive consumes the architecture kernels below. Keep
     // the provider after the consumer so GNU ld sees its symbols while they are
     // unresolved; Apple ld happens to tolerate the opposite order.
     if arch == "x86_64" {
         println!("cargo::rerun-if-changed=native/kernels/x86_64/flashkern_x86.cpp");
+        println!("cargo::rerun-if-changed=native/kernels/x86_64/flashkern_prng.S");
         cc::Build::new()
             .file("native/kernels/x86_64/flashkern_x86.cpp")
+            .file("native/kernels/x86_64/flashkern_prng.S")
             .cpp(true)
             .std("c++23")
             .opt_level(3)
@@ -66,8 +118,10 @@ fn main() {
             .compile("lfm_flashkern_x86");
     } else {
         println!("cargo::rerun-if-changed=native/kernels/aarch64/flashkern_neon.cpp");
+        println!("cargo::rerun-if-changed=native/kernels/aarch64/flashkern_prng.S");
         let mut kern = cc::Build::new();
         kern.file("native/kernels/aarch64/flashkern_neon.cpp")
+            .file("native/kernels/aarch64/flashkern_prng.S")
             .cpp(true)
             .std("c++23")
             .opt_level(3)
