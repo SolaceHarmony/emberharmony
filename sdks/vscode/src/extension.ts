@@ -118,5 +118,3 @@ export function activate(context: vscode.ExtensionContext) {
     return `${ref}#L${startLine}-${endLine}`
   }
 }
-
-export function deactivate() {}

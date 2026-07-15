@@ -4,16 +4,26 @@ import { modKey } from "../utils"
 
 type Provider = "lfm2" | "livekit"
 type Call = { cmd: string; args?: unknown }
+type ModeSampling = {
+  textTemperature: number
+  textTopK: number
+  audioTemperature: number
+  audioTopK: number
+  maxTokens: number
+}
 type Settings = {
   provider: "off" | Provider
   lastProvider?: Provider
   livekit: { url?: string }
   lfm2: {
+    engine: "lfm2Interleaved"
     model: string
     modelDir?: string
     device: "metal"
     vadThreshold: number
-    maxTokens: number
+    asr: ModeSampling
+    tts: ModeSampling
+    interleaved: ModeSampling
     delegate: { enabled: boolean }
   }
 }
@@ -29,11 +39,14 @@ async function install(page: Page, lastProvider: Provider) {
         lastProvider: input.lastProvider,
         livekit: { url: "wss://livekit.invalid" },
         lfm2: {
+          engine: "lfm2Interleaved",
           model: "LiquidAI/LFM2.5-Audio-1.5B",
           modelDir: "/tmp/lfm2-audio-e2e",
           device: "metal",
           vadThreshold: 0.012,
-          maxTokens: 256,
+          asr: { textTemperature: 0, textTopK: 0, audioTemperature: 0, audioTopK: 0, maxTokens: 100 },
+          tts: { textTemperature: 0.7, textTopK: 0, audioTemperature: 0.8, audioTopK: 64, maxTokens: 1024 },
+          interleaved: { textTemperature: 1.0, textTopK: 0, audioTemperature: 1.0, audioTopK: 4, maxTokens: 8192 },
           delegate: { enabled: false },
         },
       }

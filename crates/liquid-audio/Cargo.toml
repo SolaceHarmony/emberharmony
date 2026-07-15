@@ -1,0 +1,116 @@
+# Faithful Rust port of Liquid AI's `liquid_audio` (LFM2.5-Audio).
+# Module-for-module with the Python package under src/liquid_audio/.
+[package]
+name = "liquid-audio"
+version = "0.1.0"
+edition = "2021"
+description = "Faithful Rust port of liquid_audio (LFM2.5-Audio) on candle + the moshi crate"
+build = "build.rs" # compiles native SIMD kernels under native/
+
+[build-dependencies]
+cc = "1"
+
+[lib]
+name = "liquid_audio"
+path = "src/lib.rs"
+
+[dependencies]
+# Tensor substrate (matches the moshi crate's candle 0.9.x).
+candle-core = "0.9"
+candle-nn = "0.9"
+# `generation::LogitsProcessor` (argmax / temperature / top-k / top-p / multinomial)
+# — the same sampler `moshi` uses for depformer decoding. Reused for next-token
+# sampling instead of a private softmax+multinomial. Already in-tree via moshi (0.9),
+# so no new candle version. (Its `lfm2` is quantized-only even at 0.10, so the
+# full-precision backbone stays ported in-tree — see the moshi note below.)
+candle-transformers = "0.9"
+# config.json (model hyperparameters) deserialization.
+minijinja = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# text tokenizer (HF AutoTokenizer equivalent — loads tokenizer.json).
+tokenizers = "0.20"
+# Pure Rust SentencePiece inference for upstream Moshi text tokens
+# (`tokenizer_spm_32k_3.model`), no Python/C++ runtime.
+sentencepiece-rust = "0.1"
+# HF snapshot download (huggingface_hub.snapshot_download equivalent) for
+# get_model_dir's repo-id branch. Sync (ureq) backend = faithful to the
+# synchronous Python call. Optional (feature `download`, on by default).
+# 0.4 (vs 0.3.2) handles HF's current Xet storage redirects; 0.3.2 fails them
+# with "RelativeUrlWithoutBase". rustls TLS to avoid a system OpenSSL dep.
+hf-hub = { version = "0.4", optional = true, default-features = false, features = ["ureq", "rustls-tls"] }
+# Mimi neural audio codec for the v1 audio-out path (`processor.mimi`). Kyutai's
+# own `moshi` crate. candle-transformers ships the *same* Mimi algorithm, but the
+# two differ in the RVQ weight-path names: moshi reads `quantizer.rvq_first.*` /
+# `quantizer.rvq_rest.*`, while candle-transformers reads
+# `…semantic_residual_vector_quantizer.*` / `…acoustic_…`. This model's codec
+# checkpoint (`tokenizer-…-checkpoint125.safetensors`) is verified to use the
+# `quantizer.rvq_first`/`rvq_rest` naming (0 HF-format keys), so `moshi::mimi`
+# loads it natively — using the upstream crate, not a vendored fork. (Vendoring
+# candle-transformers' Mimi would re-port ~2.6k lines 0.10→0.9 + add a weight-name
+# remap, for the identical algorithm — a fork, the opposite of "use upstream".)
+# moshi 0.6.4 pins candle ^0.9.1 → shares my candle 0.9.2 (no version split). Pure
+# candle, no torch. (candle-transformers' `lfm2` is quantized-only at every version,
+# so the full-precision backbone stays ported in-tree.)
+moshi = "0.6"
+# `soundfile.read` equivalent for `data/mapper::_load_audio_bytes`: decode an
+# encoded-audio byte stream (WAV/FLAC/OGG-Vorbis/AIFF/… — the containers libsndfile
+# reads, and more) to f32 samples. Pure Rust, no C deps, no torch.
+symphonia = { version = "0.5", features = ["all"] }
+# Apache Arrow (pure Rust, no C deps) — `data/preprocess` writes the dataset in
+# HuggingFace `datasets.save_to_disk` format (Arrow IPC stream + dataset_info.json
+# + state.json), which `data/dataloader::load_from_disk` reads back. The trimmed
+# IPC-only set (array/schema/ipc) ≈ 13s cold build, vs Python's pyarrow C++ blob.
+arrow-array = "53"
+arrow-schema = "53"
+arrow-ipc = "53"
+# Intra-op thread-pool control to match torch's `at::intraop_default_num_threads`
+# (ATen ParallelCommon.cpp). candle's matmul (`gemm`) + conv/sort use rayon's GLOBAL
+# pool; we size it like torch — Apple-Silicon performance cores via `hw.perflevel0.
+# physicalcpu` (libc sysctl), NOT all logical cores (rayon/num_cpus default) which
+# would schedule compute-bound work onto the slow efficiency cores. See `threads.rs`.
+rayon = "1"
+num_cpus = "1"
+libc = "0.2"
+# `half::bf16` — read bf16 tensor lanes to feed the NEON BFMMLA GEMM kernel. Same
+# version candle uses, so cargo unifies to one `half`.
+half = "2"
+# MPSC channels for the realtime worker-thread pipeline (`realtime.rs`) — the Rust
+# analog of `chat.py`'s `queue.Queue` between the inference producer and the playback
+# consumer. crossbeam over `std::sync::mpsc` for `recv_timeout`/`select` and `Sync`
+# receivers; its `crossbeam-utils` is already in-tree via rayon, so no new subtree.
+crossbeam-channel = "0.5"
+# FlashFFTConv kernels ported to candle (CPU + Metal). The LFM2 short-conv (`conv.weight`,
+# causal depthwise, `conv_l_cache`) routes its full-sequence prefill through this crate's
+# verified `depthwise_conv1d` (one Metal kernel; metal == cpu 5.96e-8) instead of candle's
+# generic `Conv1d`. Same candle 0.9.2 pin → one tensor substrate. f32-only kernel, so the
+# bf16 Metal path upcasts for the conv and casts back.
+candle-flashfftconv = { path = "../candle-flashfftconv" }
+# Vendored kcoro C/assembly runtime; liquid-audio owns the private FFI layer.
+kcoro-sys = { path = "../kcoro-sys" }
+# Native mic capture + speaker playback for the in-process `VoiceRuntime`
+# service. Optional so non-voice consumers don't pull a media backend.
+cpal = { version = "0.15", optional = true }
+
+[dev-dependencies]
+anyhow = "1"
+# Native mic capture + speaker playback for the live `mic_chat` example.
+cpal = "0.15"
+# getrusage for the engine zero-spin idle oracle (tests/engine_idle_zero_spin.rs).
+libc = "0.2"
+
+[features]
+default = ["download"]
+# hf-hub snapshot download in get_model_dir (huggingface_hub.snapshot_download).
+download = ["dep:hf-hub"]
+# Mirrors the Python `module_exists("flash_attn")` optional path.
+flash-attn = []
+# Apple vecLib (Accelerate) BLAS for the CPU matmul path — torch's CPU backend on
+# Apple Silicon (multi-threaded, hand-tuned). Without it candle falls back to the
+# pure-Rust `gemm`; with it, CPU-mode matmul matches torch's throughput. macOS only.
+accelerate = ["candle-core/accelerate", "candle-nn/accelerate"]
+# Metal (Apple GPU) acceleration — bf16, the deployed dtype — for real-time
+# generation. Enables candle + moshi Metal kernels. `LFM_DEVICE=metal` at runtime.
+metal = ["candle-core/metal", "candle-nn/metal", "moshi/metal", "candle-flashfftconv/metal"]
+# CPAL-backed mic capture + speaker playback + VAD/barge-in service.
+audio-io = ["dep:cpal"]

@@ -1,6 +1,6 @@
 <!-- topic: Conformer Encoder -->
 # CF04 · FilterbankFeatures mel front-end
-**Code:** `CF04` · **Source:** `model/conformer/processor.py` · **Rust:** `model/conformer/processor.rs` · **On the LFM2-Audio inference path:** yes
+**Code:** `CF04` · **Source:** `model/conformer/processor.py` · **Rust:** `crates/liquid-audio/src/processor.rs` · **On the LFM2-Audio inference path:** yes
 
 ## Role
 This is the **mel front-end** for audio-IN: it turns mic PCM into the 128-bin log-mel spectrogram the FastConformer encoder eats. It is a faithful copy of NeMo's `AudioToMelSpectrogramPreprocessor` → `FilterbankFeatures` chain (preemphasis → STFT → power → slaney mel → log → per-feature normalize). It exists because LFM2-Audio's *input* audio path is **conformer-mel, not Mimi** — mic audio never touches the codec; only audio-OUT codes round-trip through Mimi/the LFM2 detokenizer. The module is deliberately precision-pinned: NeMo warns the featurizer "is not robust to low precision mathematics," so it always runs in f32 even when the rest of the model is bf16 (`processor.py:62-67`).
@@ -37,7 +37,7 @@ Internal promotions: the whole chain is f32 (NeMo precision pin); `fb`, `window`
 
 ## Python ↔ Rust
 Symbol map:
-- `AudioToMelSpectrogramPreprocessor` → `AudioToMelSpectrogramPreprocessor` (wraps a `FilterbankFeatures`; `save_to`/`restore_from`/`input_example` are no-op stubs kept for 1:1 inventory, `processor.rs:564-575`).
+- `AudioToMelSpectrogramPreprocessor` → `AudioToMelSpectrogramPreprocessor` (wraps a `FilterbankFeatures`; NeMo pickle and ONNX dummy-input hooks are omitted because this runtime has no corresponding subsystem).
 - `AudioPreprocessor` (abstract base) → `AudioPreprocessor` struct (Rust composition for Python's `super().__init__`; the f32 input-guard `forward` is preserved, `processor.rs:511-520`).
 - `FilterbankFeatures.forward` → `FilterbankFeatures::forward` (`processor.rs:278`).
 - `FilterbankFeatures.stft` → `FilterbankFeatures::stft` (`processor.rs:240`).

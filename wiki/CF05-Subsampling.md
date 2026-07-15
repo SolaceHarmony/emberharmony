@@ -50,7 +50,7 @@ Symbol map (all in `subsampling.rs`):
 - `forward` → `ConvSubsampling::forward` (`subsampling.rs:443`): unsqueeze channel, `forward_conv`, `transpose(1,2).reshape(b,t,c*f)`, `out` Linear.
 - `calc_length` → `calc_length` (`subsampling.rs:17`, `f64` recurrence); `out_lengths` (`subsampling.rs:433`) is the per-clip length helper for streaming.
 - `MaskedConvSequential.forward` → `MaskedConvSequential::forward` (`subsampling.rs:184`, the masked length-tracking path, reads each conv's own `config()` to skip length updates on pointwise convs). `_create_mask`/`apply_channel_mask`/`calculate_conv_output_size` → same names.
-- `reset_parameters` → no-op (`subsampling.rs:477`; weights come from VarBuilder).
+- Training-only `reset_parameters` is omitted; weights come from `VarBuilder`.
 
 **Deliberate divergences (not bugs):**
 - **Single-clip fast path.** The offline path uses `forward_conv` (no mask, `subsampling.rs:136`): for one clip the length-mask is all-ones, so it is numerically identical to the masked path (parity 5.6e-7) — verified, intentional.

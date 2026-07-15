@@ -1,0 +1,8 @@
+[workspace]
+members = [
+    "crates/candle-flashfftconv",
+    "crates/kcoro-sys",
+    "crates/liquid-audio",
+]
+exclude = ["packages/desktop/src-tauri"]
+resolver = "2"

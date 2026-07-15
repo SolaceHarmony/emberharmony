@@ -41,3 +41,7 @@ logs/
 /packages/desktop/src-tauri/crates/liquid-audio/out.wav
 /experiments/lfm2-audio-voice/upstream-liquid-audio
 .voice-runtime-stage/
+# clang --analyze droppings (static-analysis runs)
+/*.plist
+# self-chat soak output: keep transcripts, never the audio
+self_chat_out*/*.wav

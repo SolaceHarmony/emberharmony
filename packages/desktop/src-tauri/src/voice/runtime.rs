@@ -1265,9 +1265,14 @@ fn spawn_native_livekit_agent_events(
                         break;
                     }
                 }
-                Ok(RealtimeEvent::Audio(pcm)) => {
+                Ok(RealtimeEvent::Audio { pcm, rate }) => {
                     bridge_state.handle_realtime_audio();
-                    playback.observe(&pcm, LIVEKIT_AGENT_AUDIO_RATE);
+                    // Rate-honest hand-off (the real-deal bug): consume the rate
+                    // the event CARRIES — never re-assert the constant. The
+                    // engine is built with LIVEKIT_AGENT_AUDIO_RATE, so a
+                    // mismatch here is a wiring bug; write() below hard-errors
+                    // on it rather than playing half-speed rumble.
+                    playback.observe(&pcm, rate);
                     if !send(
                         &channel,
                         VoiceEvent::State {
@@ -1278,9 +1283,22 @@ fn spawn_native_livekit_agent_events(
                         break;
                     }
                     let rms = rms_f32(&pcm);
+                    if rate != LIVEKIT_AGENT_AUDIO_RATE {
+                        let _ = send(
+                            &channel,
+                            VoiceEvent::Error {
+                                message: format!(
+                                    "engine audio at {rate} Hz, output track at {} Hz — rate wiring bug",
+                                    LIVEKIT_AGENT_AUDIO_RATE
+                                ),
+                            },
+                        );
+                        done.store(true, Ordering::SeqCst);
+                        break;
+                    }
                     for frame in livekit_audio_frames(
                         &pcm,
-                        LIVEKIT_AGENT_AUDIO_RATE,
+                        rate,
                         LIVEKIT_AGENT_AUDIO_CHANNELS,
                     ) {
                         if done.load(Ordering::SeqCst) {
@@ -2688,10 +2706,27 @@ fn send_runtime(channel: &UiChannel, event: RuntimeEvent) -> bool {
     }
 }
 
+/// Map one mode's settings group onto the engine's `GenParams`. Settings use
+/// `0` = off (temperature 0 = greedy, top-k 0 = no cutoff); `GenParams` uses
+/// `None` for the same.
+fn gen_params(mode: &settings::Lfm2ModeSampling, seed: Option<u64>) -> GenParams {
+    GenParams {
+        // The UI enforces >= 1; a hand-edited store must not mute the voice
+        // (0 would end every turn instantly with only an EXHAUSTED warning).
+        max_new_tokens: (mode.max_tokens as usize).max(1),
+        text_temperature: (mode.text_temperature > 0.0).then_some(mode.text_temperature),
+        text_top_k: (mode.text_top_k > 0).then_some(mode.text_top_k as usize),
+        audio_temperature: (mode.audio_temperature > 0.0).then_some(mode.audio_temperature),
+        audio_top_k: (mode.audio_top_k > 0).then_some(mode.audio_top_k as usize),
+        seed: seed.unwrap_or(0),
+    }
+}
+
 fn local_runtime_config(settings: &VoiceSettings) -> RuntimeConfig {
     RuntimeConfig {
         vad_threshold: settings.lfm2.vad_threshold,
         can_interrupt: can_interrupt_playback(settings),
+        trace: settings.lfm2.trace,
         ..RuntimeConfig::default()
     }
 }
@@ -2747,18 +2782,12 @@ fn build_engine(
     // command queue, one built-in kernel cache, one buffer pool) for the app's
     // lifetime — sessions borrow it, never mint their own.
     let (model, proc, device) = resident_lfm2(&dir, &settings.lfm2.device)?;
-    let params = GenParams {
-        max_new_tokens: settings.lfm2.max_tokens as usize,
-        // Sampled text, NOT greedy — vendor-exact: LiquidAI's transformers-js
-        // conversational demo runs textTemperature = 1.0 (full multinomial).
-        // Greedy text at 1.2B is a repetition machine: the model re-emits its
-        // favorite phrasings every turn regardless of context.
-        text_temperature: Some(1.0),
-        text_top_k: None,
-        audio_temperature: Some(1.0),
-        audio_top_k: Some(4),
-        seed: settings.lfm2.seed.unwrap_or(0),
-    };
+    // Decoding regime comes from Settings — the `interleaved` group is the
+    // live conversation path (defaults there are the vendor demo's regime).
+    // Greedy text at 1.2B is a repetition machine, and greedy audio is
+    // degenerate for the Depthformer — both stay reachable (temperature 0)
+    // but are the user's explicit choice, never the default.
+    let params = gen_params(&settings.lfm2.interleaved, settings.lfm2.seed);
     let mut engine = Lfm2VoiceEngine::new(model, proc, params, codebooks, device, out_rate);
     if let Some(vault) = vault {
         engine = engine.with_conversation_vault(vault);
@@ -3436,7 +3465,18 @@ mod tests {
             .unwrap();
 
         done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        threads.reap().unwrap();
+        // The done_tx.send above races with actual OS-thread termination:
+        // is_finished() can still be false right after the recv. Poll reap
+        // until the finished thread is gone (bounded, so a real regression
+        // still fails fast).
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            threads.reap().unwrap();
+            if threads.tracked_len() == 1 || std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert_eq!(threads.tracked_len(), 1);
 
         release_tx.send(()).unwrap();
@@ -3516,5 +3556,17 @@ mod tests {
         assert!(start.elapsed() < Duration::from_millis(100));
         assert!(done.load(Ordering::SeqCst));
         assert!(bridge_cancel.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn local_runtime_config_comes_from_persisted_settings() {
+        let mut settings = VoiceSettings::default();
+        settings.lfm2.vad_threshold = 0.027;
+        settings.lfm2.trace = true;
+
+        let cfg = local_runtime_config(&settings);
+        assert_eq!(cfg.vad_threshold, 0.027);
+        assert!(cfg.trace);
+        assert_eq!(cfg.can_interrupt, can_interrupt_playback(&settings));
     }
 }

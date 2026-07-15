@@ -185,18 +185,13 @@ abstract class BaseSerializeHandler {
       this._rowEnd(row, row === endRow)
     }
 
-    this._afterSerialize()
-
     return this._serializeString(excludeFinalCursorPosition)
   }
 
-  protected _nextCell(_cell: IBufferCell, _oldCell: IBufferCell, _row: number, _col: number): void {}
-  protected _rowEnd(_row: number, _isLastRow: boolean): void {}
-  protected _beforeSerialize(_rows: number, _startRow: number, _endRow: number): void {}
-  protected _afterSerialize(): void {}
-  protected _serializeString(_excludeFinalCursorPosition?: boolean): string {
-    return ""
-  }
+  protected abstract _nextCell(cell: IBufferCell, oldCell: IBufferCell, row: number, col: number): void
+  protected abstract _rowEnd(row: number, isLastRow: boolean): void
+  protected abstract _beforeSerialize(rows: number, startRow: number, endRow: number): void
+  protected abstract _serializeString(excludeFinalCursorPosition?: boolean): string
 }
 
 // ============================================================================

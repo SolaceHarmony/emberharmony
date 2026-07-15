@@ -35,7 +35,7 @@ Every requirement is declared in the repo; nothing relies on ad-hoc global insta
 |---|---|---|
 | Bun | `packageManager` in the root `package.json` | The only supported package manager — npm cannot resolve this workspace's `catalog:` versions |
 | Tauri CLI | `@tauri-apps/cli` devDependency | Installed by `bun install`; build scripts invoke it via `bun run tauri`, resolving strictly from `node_modules/.bin` (never `bunx`, which auto-installs from the registry, and not the cargo-installed `cargo tauri`) |
-| Rust toolchain | `src-tauri/rust-toolchain.toml` | rustup picks the pinned version up automatically; install rustup via <https://rustup.rs> |
+| Rust toolchain | root `rust-toolchain.toml` | rustup picks the pinned version up automatically; install rustup via <https://rustup.rs> |
 | Platform libraries | [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) | OS packages (e.g. webkit2gtk on Linux) |
 
 `scripts/build-local.ts` verifies all of this up front (preflight) and fails with

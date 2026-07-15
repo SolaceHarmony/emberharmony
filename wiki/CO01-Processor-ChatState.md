@@ -45,7 +45,7 @@ Internal promotions: tokenizer ids are **int64** and every id-derived field inhe
 - `mimi.encode` (data prep) routes to [moshi_compression](MM01-Mimi-Codec) for building `audio_out` targets.
 
 ## Python ↔ Rust
-Symbol map: `LFM2AudioProcessor`→`LFM2AudioProcessor` (`processor.rs:63`); `from_pretrained`→`from_pretrained` (delegates to `loader::from_pretrained`, `processor.rs:109`); `add_text/add_audio/new_turn/end_turn/append`→same on `ChatState<'a>` (`processor.rs:166-323`); `decode`→`decode` (`processor.rs:138`); the lazy `mimi`/`audio_detokenizer` properties → the two `Option<Box<dyn AudioDetokenizer>>` fields `mimi` and `audio_out` (`processor.rs:70-76`); `to`/`eval`/`train` → no-op stubs (candle places dtype/device at load, inference is always eval).
+Symbol map: `LFM2AudioProcessor`→`LFM2AudioProcessor` (`processor.rs:63`); `from_pretrained`→`from_pretrained` (delegates to `loader::from_pretrained`, `processor.rs:109`); `add_text/add_audio/new_turn/end_turn/append`→same on `ChatState<'a>` (`processor.rs:166-323`); `decode`→`decode` (`processor.rs:138`); the lazy `mimi`/`audio_detokenizer` properties → the two `Option<Box<dyn AudioDetokenizer>>` fields `mimi` and `audio_out` (`processor.rs:70-76`). Python's `to`/`eval`/`train` bookkeeping is omitted because candle places tensors at load and inference mode is explicit.
 
 Deliberate divergences (PYTHON_VS_RUST.md):
 - **§2.1 device/dtype.** Python hard-codes `device="cuda"` and `.cuda()` on the detok (`processor.py:151`) — won't boot CPU-only. Rust is device-agnostic; every loader takes `device:&Device`+`dtype:DType`, default `(Cpu,F32)`, Metal opt-in. CPU→f32 is correct (no candle CPU bf16 matmul) and matches Python's f32-pinned mel.

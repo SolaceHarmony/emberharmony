@@ -9,7 +9,7 @@
 
 use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State};
 
 use super::threads::ThreadManager;
 
@@ -117,16 +117,18 @@ impl ModelDownloadRuntime {
     }
 }
 
-/// Download a model snapshot into the HF cache with per-file progress.
+/// Download a model snapshot into Tauri's application cache with per-file progress.
 ///
 /// `source` is a repo id or a pasted Hub URL; `revision` (if non-empty) overrides any
-/// revision parsed from the URL. The token is read natively from the keychain — it is never
-/// passed from the webview. Returns after the worker thread is spawned; the terminal
+/// revision parsed from the URL. The cache root comes from Tauri and the token is read natively
+/// from the keychain; neither comes from the process environment. Returns after the worker
+/// thread is spawned; the terminal
 /// `Done { dir }` / `Error { message }` over `channel` is authoritative. On `Done`, the
 /// caller persists `dir` as the active `model_dir`. Fail-hard: a partial/failed download
 /// never yields a `Done`.
 #[tauri::command]
 pub async fn voice_model_download(
+    app: AppHandle,
     runtime: State<'_, ModelDownloadRuntime>,
     source: String,
     revision: Option<String>,
@@ -138,11 +140,20 @@ pub async fn voice_model_download(
         .filter(|r| !r.is_empty())
         .or(url_rev);
     let token = hf_token()?;
+    let cache = app
+        .path()
+        .app_cache_dir()
+        .map_err(|e| format!("failed to resolve application cache: {e}"))?
+        .join("voice-models")
+        .join("huggingface");
+    std::fs::create_dir_all(&cache)
+        .map_err(|e| format!("failed to create voice model cache {}: {e}", cache.display()))?;
 
     runtime.spawn(move || {
-        let result = liquid_audio::snapshot_download_with(
+        let result = liquid_audio::snapshot_download_to(
             &repo_id,
             revision.as_deref(),
+            &cache,
             token.as_deref(),
             |p| {
                 if p.index == 0 {

@@ -1,0 +1,56 @@
+[
+  {
+    "audio_s": 12.0,
+    "first_audio_ms": 1476,
+    "first_text_ms": 1107,
+    "role": "assistant",
+    "transcript": "Sure! How about something like \"Turning Wood into Wonderful Homes,\" or \"Craftsmanship Meets Modern Spaces.\" Does one of these capture the vibe you’re looking for?",
+    "turn": 1,
+    "wall_s": 9.708303451538086
+  },
+  {
+    "audio_s": 15.920000076293945,
+    "first_audio_ms": 1509,
+    "first_text_ms": 1320,
+    "role": "human",
+    "transcript": "Both ideas have a nice vibe, but I’m leaning toward the craftsmanship idea—there’s a tactile, art‑is‑making feel that really stands out. Does that resonate with you, or would you prefer to explore other angles?",
+    "turn": 2,
+    "wall_s": 13.47178840637207
+  },
+  {
+    "audio_s": 20.639999389648438,
+    "first_audio_ms": 1573,
+    "first_text_ms": 1410,
+    "role": "assistant",
+    "transcript": "I hear you – the tactile, artisan vibe really stands out. If that’s a good fit, we could craft a tagline like “Crafted with Care, Your Home”, or maybe something like “Hand‑crafted Spaces, Your Vision”. Let me know which direction feels right for you or if you’d like to explore a different angle.",
+    "turn": 3,
+    "wall_s": 15.24923324584961
+  },
+  {
+    "audio_s": 20.31999969482422,
+    "first_audio_ms": 2032,
+    "first_text_ms": 1867,
+    "role": "human",
+    "transcript": "Both options have a nice feel. “Crafted with care, your home” suggests a warm, personal vibe, while “Handcrafted spaces, your vision” leans more modern and inventive. We could blend the two into something like “Crafted with care, your home, your vision.” Does that hit the mark for you, or would you prefer a different direction?",
+    "turn": 4,
+    "wall_s": 17.4932861328125
+  },
+  {
+    "audio_s": 21.280000686645508,
+    "first_audio_ms": 2151,
+    "first_text_ms": 1962,
+    "role": "assistant",
+    "transcript": "I think the blend works nicely—it feels warm, personal and modern at the same time. If that hits the mark, we can lock it in as your tagline, or we could try a couple of variations like “Handcrafted, Hand‑crafted, Home” or “Crafted with Care, Vision‑driven”. Which direction feels right for you?",
+    "turn": 5,
+    "wall_s": 17.13964080810547
+  },
+  {
+    "audio_s": 13.84000015258789,
+    "first_audio_ms": 2441,
+    "first_text_ms": 2136,
+    "role": "human",
+    "transcript": "That blend does feel nicely warm and modern. I think “Crafted with care, your home” captures the blend you’re after. Let me know if you’d like to tweak it further or try another version.",
+    "turn": 6,
+    "wall_s": 12.183910369873047
+  }
+]

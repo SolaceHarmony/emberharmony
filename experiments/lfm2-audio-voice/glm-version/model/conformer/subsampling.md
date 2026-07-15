@@ -71,8 +71,7 @@ runs the same `calc_length` recurrence on the *time* lengths.
   `config()` is what keeps the pointwise convs from shrinking the length.
 
 **No norm / no attention / no RoPE here.** This module is pure conv + ReLU +
-one Linear. `reset_parameters` is a no-op (`:477`); weights come from
-`VarBuilder`.
+one Linear. Training-only `reset_parameters` is omitted; weights come from `VarBuilder`.
 
 ## Dtypes & shapes (Rust)
 | stage | dtype | shape |
@@ -92,7 +91,7 @@ computed in f32/f64 upstream and cast to `text_emb.dtype` before the conformer
 `[1,256,13,16]`, post-subsample/pos-enc **1.019e-6** at `[1,13,512]`.
 
 ## Wiring (Rust)
-**Upstream** — `model/conformer/processor.rs` produces the mel features
+**Upstream** — `crates/liquid-audio/src/processor.rs` produces the mel features
 `(B,128,T)`. They enter via `model/conformer/encoder.rs`, which transposes to
 `(B,T,128)` and calls `pre_encode(x, lengths)`. The caller path is
 `model/lfm2_audio.rs::prefill_inputs`: it splits per-clip, casts each segment
@@ -119,7 +118,7 @@ stream. Net: `subsampling → encoder layers → audio_adapter → backbone`.
 | `calc_length` in `torch.float` then cast to int | `calc_length` in `f64` (`:17-25`) | **deliberate: f64** | Rust does the recurrence in `f64` (no `torch.float`); `f64` is strictly more precise, and the `floor` is exact either way. |
 | `apply_channel_mask` broadcasts `(B,T,F)` over channels | `apply_channel_mask` (`:29`): `mask.unsqueeze(1)?.broadcast_as((b,c,t,f))?` then `broadcast_mul` | identical | — |
 | `calculate_conv_output_size` | `calculate_conv_output_size` (`:36`) | identical | — |
-| `reset_parameters` (NeMo uniform init, training only) | no-op (`:477`) | **deliberate** | weights come from `VarBuilder`; init is dead at inference. |
+| `reset_parameters` (NeMo uniform init, training only) | omitted | **deliberate omission** | weights come from `VarBuilder`; init is dead at inference. |
 | pytorch#80020 batch/channel tiling (`conv_split_by_batch`/`conv_split_by_channel`/`channel_chunked_conv`) | return the plain un-tiled conv (`:495-519`) | **deliberate** | candle has no 2³¹ limit; the tiling workarounds are unnecessary. Output-equal. |
 | `CausalConv2D` (imported-but-undefined upstream) | `causal_conv2d_unsupported` error (`:92`) | **deliberate: error loudly** | NeMo's `CausalConv2D` has no source to port; the Rust errors rather than guessing. LFM2 uses `is_causal=false`, so this never triggers. |
 | `MaxPool2d(ceil_mode=True)` (vggnet) | `ceil_pool2d` (`:74`): edge-replicate odd dim then floor-pool | **deliberate** | candle's `max_pool2d` is floor-mode only; the edge-replication reproduces torch's ceil mode bit-identically for `k=s=2`. Off the LFM2 path. |

@@ -1,5 +1,15 @@
 # EmberHarmony Voice — Stack Architecture
 
+> **Current-hybrid document.** This file describes the shipped Rust/Candle/native
+> mixture while the replacement is being designed. The normative target is
+> [`specs/11-kcoro-native-migration.md`](../../../../../specs/11-kcoro-native-migration.md),
+> including the fixed Flashkern executor and ticket callback contract in
+> [document 03](../../../../../specs/11-kcoro-native-migration/03-scheduler-passes-and-recurrence.md)
+> and the Tauri/visualizer observer design in
+> [document 12](../../../../../specs/11-kcoro-native-migration/12-ticketed-orchestration-and-observability.md).
+> At cutover this document is rewritten in place; Git history is the old
+> architecture record.
+
 > Status legend used throughout: ✅ built & proven this stack · 🔧 in progress / partially
 > wired · ◻️ designed, not yet built · ⚠️ known gap / open question.
 >
@@ -11,7 +21,7 @@
 > into the desktop app on real OS threads.
 >
 > It is the companion to `FRONTEND_DESIGN.md` (the webview/UX side) and supersedes the
-> scattered notes in `crates/liquid-audio/{ARCHAEOLOGY,PORT_STATUS,PYTHON_VS_RUST,THREADING_PARITY}.md`.
+> scattered notes in `crates/liquid-audio/docs/{ARCHAEOLOGY,PORT_STATUS,PYTHON_VS_RUST,THREADING_PARITY}.md`.
 
 ---
 
@@ -63,7 +73,7 @@ The stack is seven layers. Each layer below is independently comprehensible, but
    Layer 7   Tauri integration   (desktop commands, Channel<VoiceEvent>, State)
    Layer 6   Audio I/O           (native mic capture, speaker playback, VAD)
    Layer 5   Orchestration       (LFM front + DELEGATE marker + capable‑model subagent)
-   Layer 4   KV cache / memory   (preallocated KvCache, inter‑turn persistence)
+   Layer 4   KV cache / memory   (resident KvSlot, inter‑turn persistence)
    Layer 3   Context             (ChatState; prior thoughts; multi‑turn)
    Layer 2   Generation          (interleaved text+audio; the modality machine)
    Layer 1   Model engine        (mel→Conformer→LFM2→text head+Depthformer→Mimi)
@@ -204,7 +214,7 @@ Rationale:
 
 | #   | From                                                                                                    | To                                                | Status                                                                                                                                                              |
 | --- | ------------------------------------------------------------------------------------------------------- | ------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 1   | `experiments/lfm2-audio-voice/liquid-audio-rs/` (the model crate)                                       | `packages/desktop/src-tauri/crates/liquid-audio/` | ✅ done — built into the desktop app (`Cargo.toml`: `liquid-audio = { path = "crates/liquid-audio", features = ["metal"] }`)                                        |
+| 1   | `experiments/lfm2-audio-voice/liquid-audio-rs/` (the model crate)                                       | `crates/liquid-audio/` | ✅ done — built into the desktop app (`Cargo.toml`: `liquid-audio = { path = "../../../crates/liquid-audio", features = ["metal"] }`)                                        |
 | 2   | `experiments/lfm2-audio-voice/src/` (the **orchestration layer**: `main.rs` routing, `glm.rs` subagent) | `packages/desktop/src-tauri/src/voice/`           | 🔧 partially wired — `session.rs` and `BridgeState` route `DELEGATE:` into the EmberHarmony session; the standalone `glm.rs` engineer choice/hardening remains open |
 
 Desktop‑only is acceptable for now: desktop is the sole test target and we are not supporting
@@ -288,7 +298,7 @@ layer is one of:
    ───────────────                         ───────────────
    q/k/v proj → q_norm/k_norm (RMS)        in_proj → (B·gate · x)  (gated input)
    RoPE (NeoX half‑split, differentiable)  causal depthwise conv1d, l_cache = 3
-   KvCache.append  (preallocated)          conv‑state cache (small, cat‑based)
+   resident KV append (in‑place slice_set)  conv‑state cache (small, cat‑based)
    GQA repeat_kv → scaled‑dot attn (f32)   out_proj
    o_proj
 ```
@@ -297,11 +307,13 @@ Per‑layer state lives in a single `Cache` struct (`lfm2_hf.rs`):
 
 ```
    struct Cache {
-     use_kv_cache: bool,
-     kvs:          Vec<KvCache>,           // ✅ candle_nn::kv_cache::KvCache (preallocated; §7)
-     conv_states:  Vec<Option<Tensor>>,    // ShortConv state (l_cache=3, tiny)
-     masks:        HashMap<(usize,usize), Tensor>,  // memoized causal masks (shape‑keyed)
-     cos, sin:     Tensor,                 // RoPE tables
+     use_kv_cache:      bool,
+     fused_conv_decode: bool,              // ✅ fused conv1d_update decode path (§4.3); false = composed ref
+     grouped_gqa_decode:bool,              // ✅ regrouped‑q GQA view, no repeat_kv (§7); false = expanded ref
+     kvs:               Vec<Option<KvSlot>>, // ✅ resident KV planes (preallocated, in‑place slice_set; §7)
+     conv_states:       Vec<Option<Tensor>>, // ShortConv state (l_cache=3, tiny)
+     masks:             HashMap<(usize,usize), Tensor>,  // memoized causal masks (shape‑keyed)
+     cos, sin:          Tensor,            // RoPE tables
    }
 ```
 
@@ -360,7 +372,7 @@ waveform. It ships as `tokenizer-…checkpoint125.safetensors` in the model dir 
    └──────────────────────────────────────┬───────────────────────────────────────────────────┘
                                            ▼
                           ┌────────────────────────────────────┐
-                          │  LFM2 backbone (hybrid conv + GQA)  │   per‑layer KvCache / conv state
+                          │  LFM2 backbone (hybrid conv + GQA)  │   per‑layer resident KvSlot / conv state
                           └───────────────┬────────────────────┘
                                           ▼  h_last (1, hidden)
                         ┌─────────────────┴──────────────────┐
@@ -397,8 +409,10 @@ Concrete applications of the rule in this stack:
   exact match to Python's `LayerKVCache.update`), used by the Depthformer.
 - `candle_ext/tensor_ext.rs` — `to_vec4` written ourselves (candle 0.10.2 has no exact match;
   it's `narrow + to_vec3` per slice, the same math as `torch/numpy .tolist()`).
-- Backbone KV cache — uses candle‑nn 0.9.2's **own** preallocated `KvCache` (it was there all
-  along; §7).
+- Backbone KV cache — a **custom resident `KvSlot`** (preallocated f32 planes, in‑place
+  `slice_set` append, O(1) cursor rollback; `lfm2_hf.rs`, §7). An earlier `candle_nn::KvCache`
+  swap was tried and **reverted** as a parity deviation; the resident slot is held to a
+  stricter bar (byte‑identical wav with `grouped_gqa_decode=false`).
 
 Faithfulness is gated **behaviorally**, not by structural similarity: ported tests + golden
 differential dumps (`parity/dump_*.py` → `parity/golden/*.safetensors`, gitignored, regenerable)
@@ -418,18 +432,27 @@ differential dumps (`parity/dump_*.py` → `parity/golden/*.safetensors`, gitign
 - **F32 remains intentional local math**, not persistent weight storage: audio PCM/front-end
   buffers, logits/sampling/loss calculations, attention-score/value matmuls, and BF16 matmul
   accumulation use F32 where the canonical path requires it.
-- `LFM_DEVICE=metal` selects Apple GPU execution; default/`cpu` uses CPU BF16 through the
-  NEON bridge. Audio sampling uses `temperature=1.0, top_k=4` (greedy audio is degenerate);
-  text is greedy.
+- Device selection is runtime policy: persisted Tauri `VoiceSettings.lfm2.device` is passed
+  through `select_device` when the engine is built. Cargo/target features only determine which
+  backends are available; they never select one. CPU uses the BF16 NEON bridge and Metal opens
+  the configured Apple GPU device. Sampling parameters likewise come from the per-mode settings
+  groups rather than the launching process environment.
 
-The NEON BF16 GEMM is `src/bf16_gemm.rs` plus `csrc/bf16_gemm.c`, compiled by `build.rs` with
-`-march=armv8.2-a+bf16`. `model::linear` routes BF16 CPU linears/logits through that bridge and
-keeps the 4-D attention matmuls on the explicit F32 accumulation path.
+The BF16 GEMM entry is `src/compute/bf16_gemm.rs` (candle `CustomOp`s `Bf16Gemm` / `Bf16GemmNt`). The
+live kernel is the **tightened flashkern GEMM** (`native/kernels/aarch64/flashkern_neon.cpp` on aarch64,
+`native/kernels/x86_64/flashkern_x86.cpp` on x86‑64) — an 8×8 BFMMLA / VDPBF16PS multi‑accumulator fanned over
+M‑row blocks with rayon, plus a native‑layout `[N,K]` decode form (`Bf16GemmNt`) that dots
+contiguous weight rows with **no transpose copy** at `M ≤ 4`. There is no separately
+compiled reference fallback: failure to build the architecture kernel fails the build.
+`model::linear` routes BF16 CPU linears/logits through this bridge and keeps the 4‑D
+attention matmuls on the explicit F32 accumulation path. See
+[`crates/liquid-audio/docs/FLASHKERN.md`](../../../../../crates/liquid-audio/docs/FLASHKERN.md) and
+[`crates/liquid-audio/docs/DECODE_ENGINE.md`](../../../../../crates/liquid-audio/docs/DECODE_ENGINE.md).
 
 ### 4.9 The conv kernels — `candle-flashfftconv`
 
 The convolution operators that ML stacks normally gate behind custom CUDA live in their own
-crate, `experiments/lfm2-audio-voice/candle-flashfftconv/` — candle `CustomOp`s that run on
+crate, `crates/candle-flashfftconv/` — candle `CustomOp`s that run on
 **CPU** (faithful reference) **and Metal** (real fused kernels), no CUDA, no torch. Two
 families:
 
@@ -449,7 +472,7 @@ backbone call site is the remaining step (§15).
 
 → Full kernel design, dataflow diagram, dispatch contract, edge‑tile handling, the global
 pipeline cache, and the precision regimes (fp32 / bf16‑faithful / double‑double): see
-[`candle-flashfftconv/ARCHITECTURE.md`](../../../../experiments/lfm2-audio-voice/candle-flashfftconv/ARCHITECTURE.md).
+[`candle-flashfftconv/docs/ARCHITECTURE.md`](../../../../../crates/candle-flashfftconv/docs/ARCHITECTURE.md).
 
 ---
 
@@ -688,21 +711,26 @@ The backbone originally hand‑rolled the KV cache as `Tensor::cat(whole cache, 
 (k.clone(), v.clone())` every attention step — 2× O(L) copies per step ⇒ O(L²) memory _traffic_
 over a generation. This is GLM's "death of prefill." It is bandwidth, not gigabytes.
 
-✅ **Fixed:** the backbone now uses **candle‑nn 0.9.2's own preallocated `KvCache`** — it was in
-our pin all along; the backbone simply wasn't using it (the "vendored but never rewired" gap).
+✅ **Fixed:** the backbone now uses a **custom resident `KvSlot`** — preallocated planes with an
+in‑place cursor. (A `candle_nn::KvCache` swap was tried first and **reverted** as a parity
+deviation; the hand‑rolled resident slot is held to a stricter bar — see below.)
 
 ```
-   cat cache (old)                          preallocated KvCache (now)
-   ──────────────                           ──────────────────────────
+   cat cache (old)                          resident KvSlot (now)
+   ──────────────                           ─────────────────────
    every step:                              every step:
-     cat([cache, new]) → O(L) alloc+copy      slice_set(new) into a fixed buffer → O(new)
-     (k.clone(), v.clone()) → O(L) copy        return narrow(0..len) view (no copy)
+     cat([cache, new]) → O(L) alloc+copy      slice_set(new) at cursor → O(new)
+     (k.clone(), v.clone()) → O(L) copy        return narrow(2, 0..len) view (no copy)
    = O(L²) traffic / generation             = O(L) traffic / generation
 ```
 
-`Cache.kvs: Vec<KvCache>`, `KvCache::new(dim=2, KV_CACHE_INITIAL_CAP=512)` per layer, grown
-geometrically. Parity verified: identical greedy text ("Handcrafted Excellence, Every Day"); 62
-lib tests green. The **Depthformer** keeps the cat‑based `ConcatKvCache` (faithful to Python's
+`Cache.kvs: Vec<Option<KvSlot>>`, each `{ k, v: Tensor, len: usize }` over preallocated
+`[B, n_kv, cap, head_dim]` f32 planes; capacity starts at `need.next_power_of_two().max(256)`
+and doubles on demand; `snapshot`/`rollback` are O(1) cursor moves (backing speculative
+prefill). Parity verified to a **stricter** standard than the reverted candle‑nn attempt: with
+`grouped_gqa_decode=false` a greedy+seeded generate is **bit‑identical** (wav hash) before/after
+the swap, so the storage change is exact — only the storage *shape* deviates from the reference,
+by design. The **Depthformer** keeps the cat‑based `ConcatKvCache` (faithful to Python's
 `LayerKVCache`, and its sequences are 8 codes long — no O(N²) there). `ConcatKvCache` stays.
 
 ### 7.2 Inter‑turn: re‑prefill (the _14 GB_ monster)
@@ -715,9 +743,9 @@ conversation every turn** — rebuilds `ChatState` from `conv`, re‑encodes _al
 the _whole_ accumulated context through the backbone with a fresh cache. So turn 15 pays the full
 O(L²) score matrix over 15 turns. That is the 14 GB and the 9 s→23 s slowdown.
 
-◻️ **The real fix (next):** **inter‑turn KV persistence** — keep the backbone `KvCache` (and conv
+◻️ **The real fix (next):** **inter‑turn KV persistence** — keep the backbone `KvSlot` (and conv
 state) across turns; each turn encodes + prefills only the _new_ turn and appends. `L` per turn
-stays small → the score matrix stays small → memory flat, speed flat. The preallocated‑KvCache
+stays small → the score matrix stays small → memory flat, speed flat. The resident‑`KvSlot`
 rewire (§7.1) is the _prerequisite_ that makes this a small, surgical change.
 
 ```
@@ -1188,7 +1216,7 @@ voice stack.
        │   │   └─ tensor_ext.rs          to_vec4
        │   ├─ model/
        │   │   ├─ lfm2_audio.rs          generate_* · prefill_inputs · Depthformer · GenParams
-       │   │   ├─ lfm2_hf.rs             LFM2 backbone (hybrid conv+GQA) + Cache (KvCache)
+       │   │   ├─ lfm2_hf.rs             LFM2 backbone (hybrid conv+GQA) + Cache (resident KvSlot + grouped‑GQA)
        │   │   ├─ transformer.rs         shared blocks · LayerKvCache (wraps ConcatKvCache)
        │   │   ├─ mlp.rs                 audio_adapter
        │   │   └─ conformer/             subsampling · encoder · mha · processor (mel)
@@ -1221,7 +1249,7 @@ voice stack.
    ✅ live mic             desktop local path + examples/mic_chat real conversation on hardware:
                                                      WebRTC mic in Tauri / fallback mic in examples → model-rate →
                                                      Depthformer → Mimi streaming → speaker, real‑time
-   ✅ KvCache rewire       cargo build --features metal + 62 lib tests + identical greedy text (parity)
+   ✅ resident KvSlot      cargo build --features metal + lib tests + BYTE‑identical wav (grouped_gqa_decode=false)
    ✅ threading            realtime::tests           ordering · persistence · barge‑in · error survival · Drop
 ```
 
@@ -1236,7 +1264,7 @@ ignored.
 ```
    ◻️ #1  The engineer (§8.4): GLM subagent / any user model / EmberHarmony's own agent?
             → drives where Layer 5 plugs into Layer 7 and how much of glm.rs survives.
-   ◻️ #2  Inter‑turn KV persistence (§7.2): the real 14 GB fix; prerequisite (KvCache) is done.
+   ◻️ #2  Inter‑turn KV persistence (§7.2): the real 14 GB fix; prerequisite (resident KvSlot) is done.
    🔧 #3  Finish Layer 5 hardening: `session.rs`/BridgeState now wire DELEGATE into the
             EmberHarmony session; the standalone glm.rs engineer choice and hardening remain.
    🔧 #4  Desktop media parity: provider-routed voice_start, native LiveKit room/mic, local
@@ -1271,7 +1299,7 @@ ignored.
    EOAudio             code 2048 / all‑2048 frame; the end‑of‑audio terminator
    GenToken            Text(u32) | Audio(Vec<u32>) — the generation stream item
    interleaved_n_*     6 text : 12 audio — the modality time‑multiplex cadence
-   KvCache             candle‑nn 0.9.2 PREALLOCATED KV cache (slice_set; backbone)
+   KvSlot              custom RESIDENT KV planes (preallocated, in‑place slice_set, O(1) cursor rollback; backbone)
    LFM2 backbone       the hybrid short‑conv + GQA transformer shared by both heads
    Lfm2VoiceEngine     the real VoiceEngine: owns model+proc+Mimi+persistent conv (realtime.rs)
    Mimi                the codec (codes → 24 kHz waveform) for PLAYBACK only (moshi crate)

@@ -88,7 +88,7 @@ interleave pattern lives **only in the modality flag**.
 
 ## Wiring (Rust)
 **Upstream:** `data/types.rs` (`ChatMessage`/`ChatContentSegment`), `processor.rs`
-(tokenizer + mel + Mimi), `model/conformer/processor.rs` (mel front-end),
+(tokenizer + mel + Mimi), `crates/liquid-audio/src/processor.rs` (mel front-end),
 `audio_out.rs::MimiDetokenizer` (codec encode), `utils.rs` (`LFMModality` +
 `mel2emb_len`).
 

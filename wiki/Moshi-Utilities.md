@@ -203,7 +203,7 @@ There is **no Rust file** for this component — by design (`PYTHON_VS_RUST.md �
 |---|---|---|
 | `CUDAGraphed`, `cuda_graph` | — (none) | candle runs Mimi (the `moshi` crate) **eager**; no CUDA-graph capture layer exists. `disable = device.type != 'cuda'` (`compression.py:220`) means Python *itself* runs this eager off-CUDA, so on CPU/Metal the two are identical execution (`PYTHON_VS_RUST.md §2.1`). |
 | `torch_compile_lazy`, `no_compile` | — (none) | no JIT-compile concept in candle; ops are dispatched directly. The decorated kernels (RoPE, codec RMSNorm, gated FFN) are ported as plain candle ops in the `moshi` crate / `transformer.rs`. |
-| `Checkpoint`, `simple_checkpoint` | `// PORT:` stub (`wrap_activation_checkpoint`, `PORT_STATUS.md §"// PORT: markers"`) | no autograd/backward in the inference port → no activation checkpointing. |
+| `Checkpoint`, `simple_checkpoint` | — (omitted) | no autograd/backward in the inference port → no activation checkpointing. |
 | `in_cuda_graph`/`no_cuda_graph`/`_is_cuda_graph_enabled` | — | no graph state machine to gate. |
 
 This is the same class of divergence as `moshi_util_autocast` (`TorchAutocast` → candle no-op) — torch execution-mode plumbing with no semantic effect on the numbers.

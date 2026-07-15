@@ -72,7 +72,7 @@ Symbol map (`modules.py` → `modules.rs`):
 - `ConformerConvolution.forward` → `ConformerConvolution::forward`/`forward_cache` (`modules.rs:73-100`). **GLU is hand-rolled** as `a * sigmoid(b)` via `narrow` on dim 1 (`modules.rs:84-87`) since candle has no `F.glu`. `nn.SiLU` → `candle_nn::ops::silu`. `nn.BatchNorm1d` → `candle_nn::BatchNorm` with `forward_t(x, false)` (inference/frozen-stats mode).
 - `ConformerFeedForward` → `ConformerFeedForward` (`modules.rs:19-42`); `Linear→silu→Linear`.
 - `CausalConv1D` (`nn.Conv1d` subclass) → `CausalConv1D` struct wrapping a `padding=0` `Conv1d` plus manual `pad_with_zeros` (`modules.rs:130-199`), with a `CausalPadding` enum mirroring Python's `None`/`int`/`[l,r]` cases. `update_cache`/`forward`/`set_cache_drop_size` are 1:1.
-- `reset_parameters_ff`/`reset_parameters_conv` → no-op stubs (`modules.rs:41,110`): they are training-time uniform weight re-inits; the port loads pretrained weights via `VarBuilder`, so there is nothing to initialize. Kept for the 170/170 symbol inventory.
+- `reset_parameters_ff`/`reset_parameters_conv` are omitted: they are training-time uniform weight re-inits, while the port loads pretrained weights via `VarBuilder`.
 
 **Deliberate divergences** (PYTHON_VS_RUST.md §2.2, §2.5): the Python `scaled_dot_product_attention` (CUDA-gated) inside the rel-pos MHA becomes hand-rolled eager SDPA in candle (`mha.rs`); the entire cache-aware streaming/ONNX-export apparatus around these blocks (§2.5) is cold off-path. The offline conformer is parity-verified to f32 floor: conformer layer 0 = 1.056e-6, final = 8.25e-7 vs Python golden tensors (PYTHON_VS_RUST.md §1.2).
 

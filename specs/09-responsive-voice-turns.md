@@ -97,7 +97,7 @@ speaker-tagged at commit time, audio-grounded.
 
 ### 2.4 Our pipeline today
 
-`packages/desktop/src-tauri/crates/liquid-audio/src/` and
+`crates/liquid-audio/src/` and
 `packages/desktop/src-tauri/src/voice/runtime.rs`:
 
 **Already right:**
