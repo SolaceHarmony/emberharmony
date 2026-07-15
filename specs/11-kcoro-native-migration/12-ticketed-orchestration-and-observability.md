@@ -65,6 +65,29 @@ result slot because the current pass borrows Candle pointers; it does not own or
 poll the CQ. Parent orchestration, service queues, recurrence, and ticket
 telemetry across Tauri are not mounted.
 
+The exact current mount is narrower than the target ticket model:
+
+- C++ mints each pass ticket; `parent`, deadline, flags, and inline results remain
+  zero;
+- every submission is `RUN_PASS`, `INTERACTIVE`, and `pass_budget = 1`;
+- the native descriptor pool is real, but each descriptor currently retains only
+  `Engine*` plus request kind while the single engine request slot borrows the
+  numerical pointers;
+- production completion routing uses one pending identity and a preallocated
+  Condvar-backed result slot, not the foundation's exact-once `Promise` or a
+  production parent/child ticket table;
+- successful CQ cells currently contain
+  `completed + committed + committed + success` and no token/codebook IDs;
+  sampling and recurrence still occur in the Rust/Candle caller.
+
+The source-exact sequence and capacities are in
+[`KCORO_ARENA_INTEGRATION.md`](../../docs/native/KCORO_ARENA_INTEGRATION.md#mounted-pass-sequence-4f06a3d5).
+
+### Target Orchestration Flow
+
+The following diagram is the intended parent-ticket, recurrence, observer, and
+Tauri flow. Only its Rust-broker/native-SQ/CQ segment is mounted today.
+
 ```mermaid
 flowchart LR
     Command["Tauri control command"] --> Dock["in-process docking ring"]
@@ -180,12 +203,16 @@ typedef enum LfmTicketCauseV1 {
 } LfmTicketCauseV1;
 ```
 
-Rust kcoro owns the mutable ticket table and terminal promises. Native C++ sees
-only the ticket value ID embedded in the command and the generation-protected
-pass descriptor ID. Tauri and TypeScript see only bounded IDs and snapshots. A
-generation mismatch makes a stale ticket or descriptor invalid.
+In the target runtime, Rust kcoro owns the mutable ticket table and terminal
+promises. Native C++ sees only the ticket value ID embedded in the command and
+the generation-protected pass descriptor ID. Tauri and TypeScript see only
+bounded IDs and snapshots. A generation mismatch makes a stale ticket or
+descriptor invalid.
 
-### Parent and child tickets
+The mounted path does not yet instantiate this production ticket table; it
+correlates the C++-minted pass value through one pending Rust result slot.
+
+### Target Parent And Child Tickets
 
 One session action owns a parent ticket. Every model pass is a single-shot child
 ticket:
@@ -211,7 +238,7 @@ The turn/frame parent can remain active over many child passes. Its Rust
 continuation uses each child completion to recur through the fixed ring ABI,
 without a one-shot host call or serialized IPC.
 
-### Execution and publication
+### Target Execution And Publication
 
 An active pass always reaches a valid full-pass boundary unless a fatal kernel
 fault occurs. Its terminal value records four independent facts:
@@ -222,6 +249,11 @@ state_status       none | committed | rolled_back | poisoned
 publication_status none | committed | stale
 terminal_cause     success | rejected | canceled | timed_out | stale_epoch | stop | fault
 ```
+
+The ABI enums and four fields exist now, but the mounted success path always
+publishes `completed + committed + committed + success`; dispatcher validation
+can publish `not_dispatched + none + none + rejected`. Scope-driven stale,
+cancel, timeout, rollback, and poison disposition remain target behavior.
 
 If interrupt arrives during a pass, `execution_status=completed` and
 `state_status=committed` with `publication_status=stale` is valid for a
@@ -241,9 +273,9 @@ or the conversation/session must be poisoned. Poisoned state cannot recur,
 switch back into service, or be snapshotted; it is destroyed or restored from a
 previously durable image.
 
-## Pointer Descriptor Lifetime
+## Target Pointer Descriptor Lifetime
 
-The pass slot is preallocated inside the native session. Its descriptor retains
+The target pass slot is preallocated inside the native session. Its descriptor retains
 the model, conversation, scratch, input, output, and any provider regions by
 lease. Rust retains an opaque lease while the ticket is admitted. Submission
 copies a fixed command cell containing the descriptor's slot/generation into a
@@ -265,11 +297,12 @@ flowchart TB
     Callback --> Release["release/transfer leases; recycle slot"]
 ```
 
-The private bridge must provide retain/release operations for native descriptor
-IDs. It may not fall back to `KORO_SEND`, whose C baseline implementation copies
+The mounted private bridge provides generation-checked retain/release operations
+for native descriptor IDs. Target owned pass slots use those operations and may
+not fall back to `KORO_SEND`, whose C baseline implementation copies
 at `kcoro_arena/core/src/kcoro_stackless.c:94-107`.
 
-## Completion Callback Path
+## Target Completion Callback Path
 
 The completion edge that informs Rust orchestration is exact:
 
@@ -303,7 +336,7 @@ Rust continuations run outside native executor locks and terminal arbitration
 locks. They are bounded and measured. A continuation can enqueue a future
 action but cannot recursively call the native executor on the completing stack.
 
-## Full-Pass Stop And Interrupt
+## Target Full-Pass Stop And Interrupt
 
 Stop and interrupt are epoch doorbells:
 
@@ -335,7 +368,7 @@ Queue-only deadlines become miss metrics after dispatch, and soft deadlines
 never claim terminal state. If a fault prevents a valid boundary, fault/poison
 policy wins over every pending control request.
 
-## Cognitive And Workflow Tickets
+## Target Cognitive And Workflow Tickets
 
 The same primitive supports the multi-agent design in
 `specs/10-stateful-multi-agent-runtime.md`:

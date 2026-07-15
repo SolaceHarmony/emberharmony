@@ -655,8 +655,8 @@ impl LFM2AudioModel {
     /// local model directory (Python `LFM2AudioModel.from_pretrained`, 135-169).
     /// A thin delegation to [`crate::loader::from_pretrained`], which parses
     /// `config.json` (including `codebook_weight` / `semantic_codebook_factor` /
-    /// `text_loss_multiplier` / `audio_loss_multiplier`), memory-maps the
-    /// safetensors, and constructs both the model and its [`LFM2AudioProcessor`]
+    /// `text_loss_multiplier` / `audio_loss_multiplier`), opens the native resident
+    /// safetensors image, and constructs both the model and its [`LFM2AudioProcessor`]
     /// (Python returns just the model; the processor is loaded alongside here, as
     /// the rest of this crate's entry points do). No loader logic is duplicated.
     pub fn from_pretrained(

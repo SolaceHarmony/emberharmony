@@ -16,46 +16,58 @@ the dispatch model, verification, and the build order.
 
 ---
 
-## 0. As-built architecture (2026-07-13)
+## 0. As-built architecture (2026-07-14, `4f06a3d5`)
 
-The CPU engine now has two intentionally different schedulers:
+The CPU engine now has two intentionally different scheduling domains:
 
 - Flashkern owns one stable pthread per numerical lane. Every lane runs the same
   ordinary C++ pass program, claims disjoint tiles, and blocks on a cache-line-local
   expected-value word between passes and at straggler fences.
-- kcoro_arena owns stackless coordination and a preallocated ticket slab. One full
-  pass creates one ticket; lane 0 completes it only after the final fence, and an
-  arena worker invokes the callback exactly once.
+- the safe Rust `kcoro::Executor` owns one broker future as the sole SQ producer.
+  A dedicated `kcoro-cq` ingress thread blocks on the native CQ doorbell, resolves
+  one preallocated result slot, and wakes that broker edge. The vendored C
+  `kcoro_arena` ticket scheduler is a conformance oracle, not this production path.
 
 There is no stackful dispatcher, coroutine stack, architecture context switch,
-per-tile channel message, bounded spin tier, or copied pass payload. The Rust rim
-writes a pointer-stable request slot and currently blocks for the ticket callback.
-Moving that recurrence into a native coordinator is the next control-plane step.
+per-tile channel message, copied pass payload, or per-pass heap allocation. The
+C++ rim writes one borrowed request slot, creates a generation-protected descriptor
+whose payload is `Engine*`, and invokes the registered Rust submitter. That callback
+blocks on a precreated result-slot `Condvar` until CQ ingress resolves it.
+
+The native lane idle wait and C++ generation fence are zero-spin. The remaining
+exception is explicit: `DepthDecode` runs through transitional `REQ_CALL` and uses
+the Rust `SpinBarrier` between its internal stages. It spins only during that active
+pass, but it still violates the final zero-spin contract and leaves with `REQ_CALL`.
 
 ```mermaid
 flowchart LR
-    Rust["Rust rim<br/>write request slot"] --> Ticket["kcoro_arena pass ticket"]
-    Ticket --> Doorbell["release increment lane words"]
+    Caller["Rust/Candle caller"] --> Rim["C++ single borrowed request slot"]
+    Rim -->|"registered callback"| Broker["Rust result slot + kcoro broker"]
+    Broker -->|"128-byte SQ cell"| Bridge["native SQ/CQ + retained descriptor"]
+    Bridge --> Doorbell["release-publish generation + wake"]
     Doorbell --> Team["fixed Flashkern pthread lanes"]
     Team --> Board["shared stage board<br/>atomic tile claims"]
     Board --> Fence["generation fence<br/>expected-value park"]
     Fence --> Kernels["NEON / AVX / assembly"]
     Kernels --> Final["program-final fence"]
-    Final --> CQ["intrusive completion queue"]
-    CQ --> Coord["arena coordination worker callback"]
-    Coord --> Rust
+    Final --> CQ["128-byte CQ cell + doorbell"]
+    CQ --> Ingress["dedicated Rust CQ ingress"]
+    Ingress --> Broker
+    Broker -->|"resolve blocking callback"| Rim
+    Rim --> Caller
 ```
 
 `REQ_TOKEN_PASS` executes embed, the native 16-layer ShortConv/attention/MLP walk,
 final norm, and optional logits in one team entry. `REQ_MLP`, `REQ_CONV_LAYER`, and
 `REQ_ATTN_LAYER` remain parity fixtures. `REQ_CALL` is the explicit migration debt:
-Depthformer and fan-out Rust programs run on these same thread-stable lanes and use
-the same zero-spin native fence, but must become typed C++ passes before Rust leaves
-the token/frame recurrence loop.
+Depthformer and fan-out Rust programs run on these same thread-stable lanes. Their
+program-final native fence is zero-spin, but `DepthDecode`'s internal Rust stage
+barriers are not. They must become typed C++ passes before Rust leaves the
+token/frame recurrence loop.
 
 The idle contract is measured, not inferred: the production-backed macOS test sees
 0.002% process CPU with eight lanes parked both before and after a pass. Native MLP
-bit parity still passes with the ticketed fixed executor. Historical performance
+bit parity still passes through the brokered fixed executor. Historical performance
 measurements remain in git history; new latency numbers must name this executor and
 its exact model/test configuration.
 
@@ -94,10 +106,11 @@ theorizing. See `docs/FLASHKERN.md` for the kernel-side story.
 The settled architecture for the decode engine. This is the target; §4 says how much is
 as-built. Read this as the spec, not the changelog.
 
-1. **Weights.** ONE mmap buffer for the process; the engine owns a flat
-   `name → (offset, shape)` table parsed straight from safetensors. candle stays only for
-   prefill / Metal. Reads are the floor; any weight movement is theft on top of it.
-2. **Compute.** mmap bytes → SIMD registers → f32 accumulates **in registers** → one
+1. **Weights.** ONE resident raw image for the process; the native loader owns a flat
+   `name → (offset, shape)` table parsed straight from safetensors. Candle is a
+   migration oracle, not a target production owner. Reads are the floor; any
+   weight movement is theft on top of it.
+2. **Compute.** resident bytes → SIMD registers → f32 accumulates **in registers** → one
    round-to-nearest-even → KB-scale bf16 activation writes. f32 never exists as *planes*, only
    as register accumulators (an rb-epilogue in every kernel). **KV planes are bf16** (torch's
    cache dtype — f32 KV was the wrong call twice over: memory *and* fidelity).
@@ -121,19 +134,21 @@ flashkern's `fanout`/`dd` ports already embody these.
 
 Where every byte lives on the decode path, from the most durable to the most ephemeral.
 
-### Tier 0 — Weights (AS-BUILT: candle mmap; PLANNED: engine weight table)
+### Tier 0 — Weights (AS-BUILT: native image plus counted compatibility copies)
 
-- **As-built.** Weights are memory-mapped by candle's safetensors `VarBuilder` at load
-  (`src/loader.rs`), and stay bf16 on CPU. The fused/flash kernels read them **zero-copy in
-  checkpoint layout**: `fused_mlp_decode` takes `storage_and_layout()` bf16 slices of the FFN
-  weights; `DepthDecode` captures every depthformer tensor as a `PtrLen` (a raw
-  `(ptr, len)` into candle's `Arc`-heap CPU storage — `src/compute/flashkern/decode.rs`). No
-  transpose, no repack, no dtype copy. The `Bf16GemmNt` / `bf16_gemm_nt` path consumes the
-  weight in its native `[N,K]` layout so `matmul_flat` / `linear_logits` never call `.t()` at
-  `M ≤ 4`.
-- **Planned.** The standalone engine weight table (one process mmap + flat
-  `name → (offset, shape)`, candle dropped from the hot path) is *not* built; candle still owns
-  the weight buffers.
+- **As-built ownership.** `safetensors.cpp:480-519` reads all selected shards once
+  into one 64-byte-aligned C++ allocation and builds immutable tensor descriptors
+  over it. `ResidentWeights` owns that image for the model lifetime; production
+  loading does not reparse or remap the checkpoint through Candle.
+- **Current compatibility cost.** Components that still instantiate Candle modules
+  call `ResidentWeights::candle_builder`. Every requested tensor is copied from the
+  native image into Candle storage and counted at `compute/weights.rs:477-535`.
+  `DepthDecode` and the native backbone context currently capture raw `PtrLen` views
+  into those stable Candle storages, so they avoid per-pass transpose/repack but do
+  not yet bind every weight directly from the native image.
+- **Target.** Native model plans bind offsets in the resident C++ image directly.
+  The counted compatibility copies and Candle weight owners are then deleted; mmap
+  is not a requirement.
 
 ### Tier 1 — Resident KV + cursors (AS-BUILT; bf16 on the CPU decode path)
 
@@ -167,37 +182,45 @@ The backbone KV cache is preallocated resident storage, **not** a per-step conca
 
 The in-dispatch working set — the CPU analog of GPU threadgroup memory:
 
-- **Native fence** (`native/src/engine/flashkern_engine.cpp:569-589`): arrival and
+- **Native fence** (`native/src/engine/flashkern_engine.cpp:634-662`): arrival and
   generation are acquire/release atomics. The last arriver runs the fixed serial
   transition, publishes the next generation, and rings only the other lanes.
-- **Wait words**: each lane owns a cache-line-separated raw `uint32_t`. The kcoro
-  host adapter checks the expected value under its park protocol and blocks
-  immediately. There is no spin budget or timed poll.
+- **Wait words**: the engine prepares one shared dispatch word and one shared fence
+  word. The kcoro host adapter checks the expected value under its park protocol
+  and blocks immediately; the logical mask identifies actual fence waiters. There
+  is no spin budget or timed poll in these native waits.
 - **Scratch**: the engine owns persistent `sc_*`, attention, token, and logits
   planes. Context build reserves model-shape storage; warmed passes do not allocate.
   `DepthDecode` still owns persistent Rust scratch until its typed native pass lands.
 
-### Tier 3 — Transport (PLANNED — open items)
+### Tier 3 — Transport (PARTLY BUILT)
 
-Rings + `(offset, len, epoch)` descriptors on the hot surfaces are **not built**. Today, decode
-results cross back as candle `Tensor`s / `Vec`s at the region boundary.
+The private 128-byte control SQ/CQ, expected-value doorbells, CQ reservation, and
+generation-protected descriptor pool are mounted. The descriptor payload is still
+only `Engine*`; numerical pointers remain in one borrowed C++ request slot, and
+decode results still return to Candle `Tensor`/`Vec` owners at the outer region
+boundary. Owned native pass slots and retained numerical region descriptors remain
+open.
 
-### Thread model (AS-BUILT: fixed numerical lanes + stackless coordination)
+### Thread model (AS-BUILT: fixed numerical lanes + safe Rust coordination)
 
 - **As-built.** The resident stage machine is mandatory on supported targets. One
   stable pthread owns each lane; the team enters once for a full token pass and
   checks no stop condition inside it.
-- **Coordination.** A separate one-worker `kc_runtime_t` delivers pass callbacks
-  from a preallocated ticket completion queue. It never executes numerical frames.
+- **Coordination.** One safe Rust `kcoro::Executor` worker runs the broker future;
+  one dedicated Rust ingress thread blocks on CQ. The C arena runtime does not
+  schedule production passes, and neither Rust thread executes numerical frames.
 - **Remaining Rust callback.** `DepthDecode::frame` uses `REQ_CALL` on the same
-  fixed lane team. Its Rust body is non-suspending and must be ported to a typed
-  C++ pass; there is no rayon or alternate dispatcher branch.
+  fixed lane team. Its Rust body is non-suspending and its local `SpinBarrier`
+  polls during active internal stages. It must be ported to a typed C++ pass;
+  there is no rayon or alternate production dispatcher branch.
 
 ---
 
 ## 4. What is on the live decode path today (AS-BUILT)
 
-Verified in source. See `docs/FLASHKERN.md` for the four flashkern kernels on the live path.
+Verified in source. See `docs/FLASHKERN.md` for the native token program,
+transitional DepthDecode program, and lower-level kernel inventory.
 
 | Region | As-built path | Where |
 |---|---|---|
@@ -291,15 +314,17 @@ extrapolate.
 
 ## 7. Build order
 
-1. **Fixed numerical executor and kcoro+ ticket boundary: built.** Stable pthread
-   lanes, zero-spin expected-value waits, pointer-stable request slots, exact
-   arena-worker callbacks, and deletion of the stackful runtime are live.
+1. **Fixed numerical executor and first Rust broker boundary: built.** Stable
+   pthread lanes, zero-spin native expected-value waits, one pointer-stable
+   request slot, native SQ/CQ, retained descriptors, one safe Rust broker, one CQ
+   ingress owner, and deletion of the stackful runtime are live.
 2. **Typed native Depthformer/fan-out passes: next.** Port every `REQ_CALL` user,
    preserve bit and seeded-token parity, then delete the callback request kind and
    Rust lane trampolines.
-3. **Native recurrence and parent action coordinator.** Let child ticket completion
-   decide recur, switch conversation, interrupt, or stop without waking Rust. Add
-   bounded submission only when more than one native producer exists.
+3. **Rust recurrence and parent action coordinator.** Move parent/child tickets,
+   scope epochs, service classes, and recurrence into the dedicated Rust kcoro
+   runtime. Native completion wakes that registered continuation directly; Tauri
+   and serialized IPC remain outside progress.
 4. **Complete native model path.** Finish the standalone weight table, sampler,
    Conformer, mel, codec, prefill, and remaining math described by migration
    documents 02 and 04 through 08. Candle is an oracle during migration, not a
@@ -310,7 +335,8 @@ extrapolate.
 6. **Tauri observation and durable context.** Project bounded ticket snapshots
    without gating progress, then add snapshot/WAL services on non-realtime workers.
 
-Every rung lands with implementation-backed tests. The current scheduler gates are
-`kcoro_arena`'s normal suite, 100,000 terminal races, 100,000 ticket races,
-Cargo ticket/wait-word linkage, native bit parity, zero-spin idle CPU, and the
-source-contract test in `packages/app/src/context/voice.test.ts`.
+Every rung lands with implementation-backed tests. The current scheduler gates
+cover the safe Rust kcoro executor/protocol suites, the C arena's conformance and
+wait-word suites, 100,000 terminal races, Cargo linkage, native bridge races,
+mounted numerical parity, zero-spin idle CPU, Rosetta, and the source-contract
+test in `packages/app/src/context/voice.test.ts`.

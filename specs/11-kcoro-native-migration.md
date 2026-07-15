@@ -64,7 +64,9 @@ The audit also corrected four easy overclaims:
    (`crates/liquid-audio/native/src/io/README.md:48-66`).
 2. The current native engine owns eligible one-token backbone work, not full
    prefill, mel, Conformer, sampling, or the voice lifecycle
-   (`crates/liquid-audio/src/compute/flashkern/native_engine.rs:94-170`).
+   (`crates/liquid-audio/native/src/engine/flashkern_engine.cpp:1616-1680` and
+   `crates/liquid-audio/src/compute/flashkern/native_engine.rs:420-465`,
+   `706-725`).
 3. Native Mimi decode is real, but Moshi's encoder, LM, generation state,
    Depformer, tokenizer, and frame pipeline remain Rust/Candle
    (`crates/liquid-audio/src/runtime/realtime.rs:1850-2065`).
@@ -85,7 +87,7 @@ this file owns only cross-system decisions and phase order.
 | [00 - Current state audit](11-kcoro-native-migration/00-current-state-audit.md) | Verified production owners, copies, threads, existing strengths, and forbidden claims. |
 | [01 - Runtime ABI and settings](11-kcoro-native-migration/01-runtime-abi-and-settings.md) | Opaque handles, versioned structs, capabilities, lifecycle, callbacks, statuses, and persisted configuration. |
 | [02 - Model residency and loader](11-kcoro-native-migration/02-model-residency-and-loader.md) | Complete-file load, resident image, native schema binding, CPU/MLX residency, tokenizer/config, and codec components. |
-| [03 - Scheduler, passes, and recurrence](11-kcoro-native-migration/03-scheduler-passes-and-recurrence.md) | Rust kcoro coordination, persistent fixed Flashkern lanes, zero-spin barriers, SQ/CQ passes, full-pass doorbells, and recurrence. |
+| [03 - Scheduler, passes, and recurrence](11-kcoro-native-migration/03-scheduler-passes-and-recurrence.md) | Rust kcoro coordination, persistent fixed Flashkern lanes, target zero-spin barriers, SQ/CQ passes, full-pass doorbells, and recurrence. |
 | [04 - PCM, audio I/O, and VAD](11-kcoro-native-migration/04-pcm-audio-io-and-vad.md) | Platform adapters, sole callback copy, capture/playback rings, VAD, frame clock, flush, and reference audio. |
 | [05 - Native mel frontend](11-kcoro-native-migration/05-native-mel-frontend.md) | Exact resampling, DFT/mel, normalization truth, candidate rollback, layouts, and zero-copy handoff. |
 | [06 - Native Conformer and adapter](11-kcoro-native-migration/06-native-conformer-and-adapter.md) | Subsampling, relative attention, Conformer layers, adapter, stage layout, offline-first and later streaming policy. |
@@ -113,10 +115,21 @@ flowchart LR
     UI["Tauri settings and commands"] --> RUST["Rust voice runtime"]
     RUST --> AUDIO["Rust PlatformAudio / PCM queues / VAD"]
     AUDIO --> CANDLE["Candle mel, Conformer, prefill, Moshi"]
-    CANDLE --> NATIVE["eligible Flashkern passes and Mimi decode"]
-    NATIVE --> LOOP["Rust sampling, events, output queues"]
+    CANDLE --> RIM["blocking Rust/Candle native rim"]
+    RIM --> CPP["C++ single request slot"]
+    CPP -->|"registered submit callback"| KCORO["Rust kcoro result slot + SQ broker + CQ ingress"]
+    KCORO -->|"128-byte SQ + doorbell"| NATIVE["eligible Flashkern fixed-lane passes"]
+    NATIVE -->|"128-byte CQ + doorbell"| KCORO
+    KCORO -->|"notify result slot"| CPP
+    CPP -->|"blocking call returns"| LOOP["Rust sampling, events, output queues"]
+    CANDLE --> MIMI["native Mimi decode through Rust adapter"]
+    MIMI --> LOOP
     LOOP --> AUDIO
 ```
+
+The exact mounted pass sequence, capacities, descriptor lifetime, and teardown
+order are pinned in
+[the integration runbook](../docs/native/KCORO_ARENA_INTEGRATION.md#mounted-pass-sequence-4f06a3d5).
 
 ### Target
 
@@ -353,7 +366,9 @@ zero inference file I/O.
   fixed-capacity dedicated executor, exact-once promises, generation-protected
   task reuse, inherited scope words, 128-byte submission/completion records, and
   edge-woken bounded SPSC rings. Its 100,000 terminal races, self-wake,
-  stop-admission, wrap/full/close, and scope tests run in CI.
+  stop-admission, wrap/full/close, and scope tests. The workflow is configured to
+  run them on Linux and macOS; a passing remote run of the mounted branch remains
+  a cutover gate.
 - **Committed bridge (`2a2adcea`, `95069bd5`, `fa35a624`):** the C ABI mirrors Rust's
   fixed records; a native-owned bounded SQ/CQ with prepared doorbells is mounted
   in Flashkern, reserves CQ capacity before admission, retains generation-checked
@@ -387,11 +402,12 @@ zero inference file I/O.
   transitional typed-callback boundary on ordinary fixed worker stacks; D8
   removes it after independent parity fixtures.
 
-Exit: the mounted native substrate and first Rust endpoint owner have committed
-race, parity, idle, wake-accounting, sanitizer, Rosetta, and percentile evidence.
-Scope doorbells, service-class fairness, Rust-owned recurrence/child tickets,
-million-pass, and full token/frame gates remain open and run again at D8 product
-cutover.
+Current evidence: the mounted Rust endpoint has debug/release/arm64/Rosetta
+10,000-pass, parity, idle, and wake-accounting results. The native bridge harness
+has ASan+UBSan and TSan results. Whole-program Rust TSan, a mounted
+p50/p95/p99/max comparison, remote CI, scope doorbells, service-class fairness,
+Rust-owned recurrence/child tickets, million-pass, and full token/frame gates
+remain open and run again at D8 product cutover.
 
 ### D4 - Native kernel and wait substrate
 

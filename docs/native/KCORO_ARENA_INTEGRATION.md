@@ -27,29 +27,31 @@ This file is the source-facing mount guide. It describes one current tree and
 one target. Replaced designs are in Git history, not parallel source or legacy
 sections.
 
-## Read This First
+## Target Laws
 
-Eight facts prevent the wrong integration:
+These eight laws govern product cutover. They are not claims that the current
+hybrid already satisfies every boundary; the source-pinned mounted truth follows
+immediately afterward.
 
 1. `flashkern_engine.cpp` is the live CPU executor. Its fixed numerical lanes
    keep ordinary C++ stacks. They do not become Rust futures or stackless lane
    frames.
-2. `crates/kcoro` is the target product policy scheduler. It owns Rust futures,
-   scopes, tickets, promises, service policy, and recurrence decisions.
+2. `crates/kcoro` is the target product policy scheduler. At cutover it owns Rust
+   futures, scopes, tickets, promises, service policy, and recurrence decisions.
 3. `kcoro_arena` is the C conformance oracle and current native wait-word
    substrate. Its ticket/actor runtime is no longer on Flashkern's production
    pass path and is not the target product policy owner.
 4. Tauri is a host, not a scheduler. Realtime progress cannot require a Tauri
    task, webview IPC, telemetry delivery, polling, or a monitoring loop.
-5. C++ owns every numerical pointer and operation, including sampling and state
-   append. Rust receives compact terminal facts and at most eight token/codebook
-   IDs, never logits or model state.
-6. SQ/CQ cells copy small control records. Pass descriptors, weights,
+5. At cutover C++ owns every numerical pointer and operation, including sampling
+   and state append. Rust receives compact terminal facts and at most eight
+   token/codebook IDs, never logits or model state.
+6. Target SQ/CQ cells copy small control records. Pass descriptors, weights,
    activations, KV, PCM, mel, codec state, and snapshot pages stay in native
    memory and are named by generation-protected IDs.
-7. Stop and interrupt are checked at complete-pass boundaries. Inner kernels,
-   tiles, stages, and barriers do not poll cancellation.
-8. A legal checkpoint has zero active passes. Rust future state and native
+7. Target stop and interrupt are checked at complete-pass boundaries. Inner
+   kernels, tiles, stages, and barriers do not poll cancellation.
+8. A legal target checkpoint has zero active passes. Rust future state and native
    compute stacks are not serialized; explicit conversation pages and workflow
    state are.
 
@@ -85,6 +87,66 @@ The production path is still transitional:
 - Rust now owns the first production pass broker and CQ ingress, but service
   classes, scope wake propagation, child recurrence, native audio, and the Tauri
   docking ring are not mounted.
+
+### Mounted Pass Sequence (`4f06a3d5`)
+
+This is the exact production Flashkern pass edge today. It is callback-driven and
+has no queue-monitor polling, but it is still synchronous at the outer C++/Rust rim
+so Candle-owned inputs, outputs, and request fields cannot expire before completion.
+
+```mermaid
+sequenceDiagram
+    participant Caller as Rust/Candle caller
+    participant Cpp as C++ request rim
+    participant Slot as Rust result slot
+    participant Broker as Rust broker future
+    participant Bridge as Native bridge and descriptor pool
+    participant Dispatch as C++ bridge dispatcher
+    participant Lanes as Fixed Flashkern lanes
+    participant Ingress as Rust CQ ingress
+
+    Caller->>Cpp: blocking typed FFI with borrowed buffers
+    Cpp->>Cpp: claim and fill the single engine request slot
+    Cpp->>Bridge: create descriptor with payload = Engine* and owner lease
+    Cpp->>Slot: invoke registered Rust submitter
+    Note over Cpp,Slot: C++ remains blocked until the result slot resolves
+    Slot->>Slot: acquire generation slot and copy Submission
+    Slot->>Broker: enqueue slot Key and wake executor
+    Slot-->>Slot: block on precreated Condvar
+    Broker->>Bridge: publish 128-byte SQ cell, retain queue lease, ring doorbell
+    Broker-->>Broker: await completion Edge
+    Bridge->>Dispatch: blocking wait_submission returns one cell
+    Dispatch->>Bridge: descriptor_get and mounted-field validation
+    Dispatch->>Lanes: publish request and generation, wake fixed team
+    Lanes->>Lanes: execute pass and program-final fence
+    Lanes->>Bridge: lane 0 publishes 128-byte CQ cell and rings doorbell
+    Bridge->>Ingress: blocking wait_completion consumes cell and queue lease
+    Ingress->>Slot: validate ticket/conversation/epoch, store result, notify one
+    Ingress->>Broker: signal completion Edge
+    Slot-->>Cpp: submitter returns Completion
+    Cpp->>Bridge: release owner descriptor lease
+    Cpp-->>Caller: return status; borrowed buffers may leave scope
+```
+
+| Mounted fact | Value at `4f06a3d5` | Source |
+|---|---|---|
+| Native SQ/CQ capacity | `1` | `flashkern_engine.cpp:1224-1229` |
+| Native descriptor slots | `8` | `flashkern_engine.cpp:1224-1229` |
+| Rust result/ring slots | `8` | `native_engine.rs:267-280` |
+| Rust coordination threads | one `kcoro-kernel` worker plus one `kcoro-cq` ingress | `coordinator.rs:463-527` |
+| Active native work | one `PassClaim`, one pending Rust command, one fixed board | `flashkern_engine.cpp:397-414`; `coordinator.rs:283-301` |
+| Submission policy | `RUN_PASS`, `INTERACTIVE`, `pass_budget = 1`; no parent or deadline | `flashkern_engine.cpp:1162-1174` |
+| Descriptor payload | `Engine*` plus request kind; numerical pointers remain in the borrowed engine request slot | `flashkern_engine.cpp:1148-1159` |
+| Successful completion | `completed + committed + committed + success`, no inline token/codebook result | `flashkern_engine.cpp:1059-1078` |
+| Recurrence and scope policy | still owned by existing linear Rust/Candle callers; service queues, child tickets, and scope doorbells are not mounted | `coordinator.rs:343-380` and the open work below |
+| Remaining active spin | transitional `REQ_CALL` programs such as `DepthDecode` use a Rust `SpinBarrier` between internal stages | `decode.rs:24-67`, `1001-1019` |
+
+No Tauri edge, queue-monitor polling loop, payload copy through SQ/CQ, or per-pass
+heap allocation appears in this sequence. Native lane idle and C++ generation
+fences block without spin. The transitional `REQ_CALL` exception above still
+polls an in-pass Rust generation word and must be deleted with the Rust lane
+program. The mount is not yet asynchronous multi-conversation execution: bridge
+capacity and native request ownership still enforce one pass.
 
 ## Implemented Rust Foundation
 
@@ -147,7 +209,7 @@ Hard boundaries:
 - fixed lanes publish one CQ edge and never invoke arbitrary Rust;
 - numerical kernels know nothing about kcoro, Tauri, WAL, tickets, or callbacks.
 
-## Runtime Topology
+## Target Runtime Topology
 
 Use three worker domains:
 
@@ -186,35 +248,45 @@ The canonical Rust layout is in `crates/kcoro/src/protocol.rs`.
 - result kind, count, and up to eight inline `u32` results.
 
 It does not carry timing telemetry. Queue, compute, and callback latency belong
-in the sampled observer plane. It does not carry a parent ID because Rust's
-ticket table already owns that relation.
+in the sampled observer plane. It does not carry a parent ID because the target
+Rust ticket table owns that relation. The mounted path leaves `parent` zero and
+has no production parent/child table yet.
 
-The private C header must mirror these fields with `_Static_assert` / C++
-`static_assert` checks for size, alignment, and offsets. Public ABI structs may
+The private C header mirrors these fields with `_Static_assert` / C++
+`static_assert` checks for size, alignment, and offsets at
+`native/include/lfm_kernel_bridge.h:224-257`. Public ABI structs may
 not embed Rust atomics, C `_Atomic`, or C++ `std::atomic`; native ring atomics
 remain private to their implementation owner.
 
 ## Private Native Bridge
 
-Do not expose the kernel ring as a generic tensor API. Add a private bridge under
-`crates/liquid-audio/native/include/` and private Rust FFI declarations.
+The kernel ring is a private control ABI under
+`crates/liquid-audio/native/include/`; it is not a generic tensor API.
 
-Required behavior:
+Mounted behavior:
 
 1. Native code owns SQ/CQ storage and the exact atomic implementation.
 2. Rust submits one fixed `Submission` cell. `EAGAIN` occurs before native
    descriptor ownership transfer.
-3. The bridge validates ABI, descriptor generation, ticket generation, command
-   kind, and scope epoch before dispatch.
-4. One board admits one dispatched pass. Its CQ reservation exists before SQ
+3. `kernel_bridge.cpp:63-82` validates record shape, ticket shape, command and
+   service ranges, pass budget, and descriptor presence. Submission retains the
+   generation-checked descriptor at `469-503`; `bridge_main` validates the live
+   descriptor view, `RUN_PASS`, budget one, pass-ticket kind, nonzero epoch,
+   engine identity, and request kind at `flashkern_engine.cpp:1106-1129`.
+4. The mounted bridge has one board and SQ/CQ capacity one. Its CQ reservation
+   exists before SQ
    publication.
-5. Final-lane publication writes native results, release-publishes one
+5. Lane 0 after the program-final fence release-publishes one
    `Completion`, advances a doorbell word, and wakes the prepared waiter.
 6. A dedicated Rust ingress thread blocks in the native expected-value wait
-   adapter. It does not poll. On wake it drains a bounded number of completion
-   cells and resolves their Rust promises.
+   adapter. It does not poll. Capacity one means each successful wait consumes
+   one completion, resolves one result slot, and signals the broker edge.
 7. Runtime stop wakes the ingress wait, rejects new SQ submissions, lets one
    active pass reach its boundary, drains terminal completions, then joins.
+
+The mounted bridge does not yet compare `epoch` against a scope-control word;
+nonzero epoch is the current native admission check. Scope epoch arbitration is
+open work and must not be inferred from the ABI field alone.
 
 The ingress thread is part of the runtime kernel, not Tauri. This shape avoids
 executing a Rust callback on the final compute lane while still making the CQ
@@ -225,6 +297,13 @@ Mounted private leaf operations (`2a2adcea`, `95069bd5`, `fa35a624`):
 ```c
 int lfm_kernel_bridge_create(const LfmKernelBridgeConfigV1 *,
                              LfmKernelBridge **out);
+int lfm_kernel_bridge_descriptor_create(LfmKernelBridge *,
+                                        const LfmKernelDescriptorSpecV1 *,
+                                        KcDescriptorIdV1 *out);
+int lfm_kernel_bridge_descriptor_retain(LfmKernelBridge *, KcDescriptorIdV1);
+int lfm_kernel_bridge_descriptor_get(LfmKernelBridge *, KcDescriptorIdV1,
+                                     LfmKernelDescriptorViewV1 *out);
+int lfm_kernel_bridge_descriptor_release(LfmKernelBridge *, KcDescriptorIdV1);
 int lfm_kernel_bridge_submit(LfmKernelBridge *, const KcSubmissionV1 *);
 int lfm_kernel_bridge_wait_submission(LfmKernelBridge *, KcSubmissionV1 *out,
                                       uint64_t deadline_ns);
@@ -235,6 +314,11 @@ int lfm_kernel_bridge_wait_completion(LfmKernelBridge *, KcCompletionV1 *out,
 void lfm_kernel_bridge_request_stop(LfmKernelBridge *);
 int lfm_kernel_bridge_snapshot(LfmKernelBridge *, LfmKernelBridgeSnapshotV1 *);
 int lfm_kernel_bridge_destroy(LfmKernelBridge *);
+
+void *lfm_engine_bridge(void *engine);
+int lfm_engine_set_submitter(void *engine, LfmKernelSubmitFn, void *context);
+int lfm_engine_clear_submitter(void *engine, void *context);
+void lfm_engine_request_stop(void *engine);
 ```
 
 `lfm_kernel_bridge_wait_completion` is a blocking edge wait, not a status query. It
@@ -246,11 +330,13 @@ submissions retain a queue lease until CQ consumption; the original owner lease
 is released when the blocking C++ callback returns. Slot generations never wrap:
 a slot retires at `UINT32_MAX` rather than admitting an ABA identity.
 
-## Broker And Ticket Flow
+## Target Broker And Ticket Flow
 
-One Rust `KernelBroker` future owns each fixed board. Session, frame, advisor,
-and maintenance futures submit child tickets to bounded service-class queues.
-The broker alone publishes SQ commands.
+The mounted sequence above has one broker but no production parent/child ticket
+tree or service-class admission queues. The target adds one Rust `KernelBroker`
+future per fixed board. Session, frame, advisor, and maintenance futures submit
+child tickets to bounded service-class queues; the broker alone publishes SQ
+commands.
 
 ```mermaid
 sequenceDiagram
@@ -285,7 +371,7 @@ Rules:
 - a completion flood receives bounded drain per wake and cannot starve scope
   control, timers, or another conversation indefinitely.
 
-## Park, Pause, And Cancel
+## Target Park, Pause, And Cancel
 
 Do not collapse these operations:
 
@@ -324,7 +410,7 @@ No spin tier, `PAUSE`, `YIELD`, WFE budget, UMWAIT budget, or timed polling is
 added. A measured short barrier is a reason to fuse stages or improve native
 wait primitives, not permission to burn cores.
 
-## Full-Pass Interruption
+## Target Full-Pass Interruption
 
 Every submission carries a scope/output epoch. On stop or interrupt:
 
@@ -355,7 +441,7 @@ Rules:
   and the request kind when the last production caller is gone;
 - retain no compatibility feature. Git history is the archive.
 
-## Tauri Docking Ring
+## Target Tauri Docking Ring
 
 Tauri and Rust kcoro are in one process but have different responsibilities.
 Use one persistent bounded docking ring in each direction:
@@ -376,8 +462,9 @@ continues for barge-in/reference logic.
 
 ## Role Of kcoro_arena
 
-Keep `crates/kcoro-sys` while it supplies current production tickets, native
-expected-value waits, and cross-language conformance fixtures. Its source proves
+Keep `crates/kcoro-sys` while it supplies native expected-value waits and
+cross-language ticket/wait conformance fixtures. The C ticket scheduler is not
+on the production pass path. Its source proves
 valuable failure classes:
 
 - exact terminal claim/publish;
@@ -419,7 +506,8 @@ Status: complete at `3a5b1431`.
 - bounded SPSC edge semantics;
 - inherited scope words;
 - versioned command/completion cells;
-- CI execution on Linux and macOS.
+- CI workflow execution configured for Linux and macOS; a passing remote run of
+  the mounted commit remains a cutover gate.
 
 ### C. Private bridge and conformance
 
@@ -449,7 +537,7 @@ Open:
 2. Promote the borrowed engine request slot to an owned native pass-slot pool.
 
 Gate: no payload copy, no polling, one CQ reservation per accepted SQ entry,
-one exact Rust promise resolution, zero callback execution on a compute lane.
+one exact Rust result-slot resolution, zero callback execution on a compute lane.
 The first exact Rust result routing and descriptor-pool evidence have passed;
 scope and product recurrence gates remain in section D.
 
@@ -510,9 +598,29 @@ Status: open after in-memory quiesce and context switching pass.
 - the lazy writer has independent low-priority workers and cannot steal audio,
   coordination, or compute capacity.
 
-## Shutdown Order
+## Current NativeEngine Teardown
 
-Session stop:
+The process engine is stored in a `OnceLock` and normally lives until process
+exit (`native_engine.rs:824-846`). Its implemented `Drop` path, exercised by
+directly owned test engines, is:
+
+1. acquire `pass_lock`, so no safe caller or borrowed request is active;
+2. clear the registered C++ submitter/context pair;
+3. request bridge stop, closing admission and waking SQ/CQ waiters;
+4. close the Rust broker sender and join the blocking CQ ingress;
+5. terminally resolve any queued result slots, signal the broker edge, then join
+   the broker task and kcoro executor;
+6. enter `lfm_engine_free`, join the mechanical bridge dispatcher, retire and
+   wake the fixed lanes, then join every lane;
+7. destroy the bridge only after queues, waits, and descriptor leases settle;
+8. release the prepared fence/dispatch waits and delete the engine.
+
+Sources: `native_engine.rs:802-820`, `coordinator.rs:147-153`, `542-568`, and
+`flashkern_engine.cpp:1336-1350`.
+
+## Target Session Shutdown Order
+
+Target session stop:
 
 1. advance root cancel epoch and ring the control doorbell;
 2. stop native capture admission and flush stale output epoch;

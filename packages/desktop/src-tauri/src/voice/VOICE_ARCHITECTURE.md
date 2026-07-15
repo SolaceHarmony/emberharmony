@@ -9,6 +9,8 @@
 > [document 12](../../../../../specs/11-kcoro-native-migration/12-ticketed-orchestration-and-observability.md).
 > The authoritative callback-only Rust-coordinator boundary is
 > [document 13](../../../../../specs/11-kcoro-native-migration/13-coordination-contract.md).
+> The source-exact mounted pass sequence and its current capacities are in the
+> [native integration runbook](../../../../../docs/native/KCORO_ARENA_INTEGRATION.md#mounted-pass-sequence-4f06a3d5).
 > The Rust audio/Candle ownership described below is current implementation
 > truth, not the target architecture.
 > At cutover this document is rewritten in place; Git history is the old
@@ -108,7 +110,7 @@ signed. The microphone was a dumb pipe; all intelligence lived elsewhere.
 itself**, and treats "doing hard work" as a _delegated tool_, not the default path:
 
 ```
-   mic ─► LFM2.5‑Audio (LOCAL, native Rust, candle+Metal)
+   mic ─► LFM2.5‑Audio (LOCAL, hybrid Rust/Candle + native C++/SIMD)
             │  it IS the agent: ears, voice, small talk, and judgement about when to hand off
             ├─ ordinary turn        ─► speak its own reply            (small talk, quick answers)
             └─ "DELEGATE: <task>"   ─► capable model / EmberHarmony agent does the work
@@ -163,12 +165,24 @@ flowchart TB
     MicRing["bounded SPSC mic PCM ring\nnon-blocking push/read"]
     Vad["VAD / turn detector\nbarge-in + flush"]
     UttQ["bounded utterance queue\nsize 1"]
-    Infer["persistent inference std::thread\nowns Lfm2VoiceEngine + ChatState + Mimi"]
+    Infer["persistent inference std::thread\nowns outer Lfm2VoiceEngine + ChatState + Mimi"]
+    Rim["blocking CPU pass rim\nborrowed Candle buffers"]
+    Coord["Rust kcoro\nSQ broker + CQ ingress"]
+    Bridge["native descriptor pool\n1-cell SQ/CQ + doorbells"]
+    Flash["fixed C++ Flashkern lanes\nNEON / AVX / assembly"]
     EventQ["bounded crossbeam event queue"]
     OutRing["bounded SPSC speaker PCM ring"]
     SpkCb["OS audio output callback"]
 
     MicCb --> MicRing --> Vad --> UttQ --> Infer
+    Infer --> Rim
+    Rim -->|"registered submit callback"| Coord
+    Coord -->|"128-byte SQ cell"| Bridge
+    Bridge --> Flash
+    Flash -->|"128-byte CQ cell"| Bridge
+    Bridge -->|"blocking CQ edge"| Coord
+    Coord -->|"resolve result slot"| Rim
+    Rim --> Infer
     Infer --> EventQ
     Infer --> OutRing --> SpkCb
   end
@@ -198,6 +212,12 @@ Everything in the kernel box is **owned by the Tauri process**. SolidJS never ow
 provider mismatch should stop a native session; it sends intent and renders the event stream.
 The LiveKit provider may still use a LiveKit SFU when that provider is selected, but the desktop
 client/session lifecycle lives in Rust, not in the webview and not in a bundled Node/Python sidecar.
+
+The broker loop in this diagram is mounted only for eligible CPU Flashkern passes.
+The outer call remains synchronous because its numerical pointers are still
+borrowed from Candle-owned storage. Sampling, recurrence, model lifecycle, audio,
+and Tauri observation remain outside this pass edge; the target documents describe
+their removal or remounting.
 
 ---
 

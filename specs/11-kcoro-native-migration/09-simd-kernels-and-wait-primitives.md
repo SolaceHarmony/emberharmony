@@ -206,8 +206,12 @@ coordination work   one ready permit -> signal one kcoro worker
 fixed compute       generation unchanged -> register/recheck -> block wait word
 ```
 
-Neither path has a spin tier. `PAUSE`, `YIELD`, repeated loads, WFE/UMWAIT time
-budgets, and timed polling are absent from the generated wait code.
+Neither canonical path has a spin tier. `PAUSE`, `YIELD`, repeated loads,
+WFE/UMWAIT time budgets, and timed polling are absent from the generated native
+wait code. Current `REQ_CALL` Depthformer work is the explicit exception:
+`decode.rs:24-67`, `1001-1019` uses a Rust `SpinBarrier` between active stages.
+Document 03 requires that callback program and barrier to be deleted together;
+they are not an allowed third wait primitive.
 
 The host adapter supplies operations equivalent to:
 

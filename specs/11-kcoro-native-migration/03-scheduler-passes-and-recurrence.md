@@ -71,6 +71,7 @@ are empty of pass work whenever capture is admitted.
 | Request kinds | `flashkern_engine.cpp:140-150` includes MLP, layer, token, and transitional callback requests. | Replace `REQ_CALL` with typed Depthformer/fan-out passes; keep pass-granularity ticket IDs. |
 | Engine ownership | At `4f06a3d5`, `flashkern_engine.cpp:321-399` stores fixed pthreads, one mechanical SQ dispatcher, shared doorbells, one native bridge, request slots, plans, and scratch. `coordinator.rs:343-431` owns the Rust SQ broker and CQ ingress. Neither path stores a C arena runtime or ticket. | Keep this two-machine boundary. Move ticket identity/recurrence policy into Rust without routing stages or tiles through it. |
 | `lane_fence` | `flashkern_engine.cpp:634-662`. | Implemented at `d2c43abd`: immediate shared expected-value block preserves generation/last-arriver correctness. |
+| transitional `REQ_CALL` stage wait | `crates/liquid-audio/src/compute/flashkern/decode.rs:24-67`, `1001-1019` uses a local Rust `SpinBarrier` for `DepthDecode`. | This is the remaining active-spin exception. Port the program to a typed C++ pass and delete the barrier with `REQ_CALL`; add no new user. |
 | `run_stage` | `flashkern_engine.cpp:670-684`. | Keep atomic disjoint tile claiming and one serial transition. |
 | Nested lane program | `flashkern_engine.cpp:1009-1037`. | Keep ordinary C++ calls; port the remaining Rust callback bodies without flattening this tower. |
 | Engine construction | `flashkern_engine.cpp:1201-1247` creates the native bridge, mechanical dispatcher, fixed pthreads, and two prepared lane wait words; `native_engine.rs:259-305` adds and registers the Rust coordinator. | Add readiness/affinity policy and million-pass soak. |
@@ -94,7 +95,7 @@ A kcoro channel/ticket per tile, tensor operation, layer, or SIMD block is
 forbidden. All fixed lanes observe one read-only pass descriptor, claim disjoint
 tiles from one board, and write declared shared destinations.
 
-## Object And Lifetime Graph
+## Target Object And Lifetime Graph
 
 ```mermaid
 flowchart TB
@@ -127,7 +128,7 @@ weight image are immutable. Each conversation owns mutable context. A pass
 ticket retains its pass slot and context through completion-target consumption.
 Session stop joins active tickets and both executors before releasing any owner.
 
-## Coordination Runtime
+## Target Coordination Runtime
 
 Each product `LfmRuntime` owns a fixed-capacity `kcoro::Executor`; it does not
 mount the C actor scheduler as its policy runtime. The C substrate remains the
@@ -164,7 +165,7 @@ Coordination-worker count and fixed kernel-lane count are separate persisted
 runtime settings. A zero worker count is rejected; it never means one worker or
 CPU autodetection.
 
-## Fixed Flashkern Executor
+## Target Fixed Flashkern Executor
 
 ```c++
 struct FlashkernExecutor {
@@ -205,7 +206,7 @@ Thread affinity and performance-core policy are host-adapter settings. Stable
 logical lane identity is mandatory even when the OS declines a requested CPU
 binding.
 
-## Pass Descriptor And Ticket
+## Target Pass Descriptor And Ticket
 
 ```c++
 enum class PassKind : uint32_t {
@@ -241,16 +242,18 @@ The target slot is preallocated and remains alive through completion
 consumption. A Rust child ticket owns its opaque native descriptor lease. The
 submission queue copies only the fixed control cell containing that descriptor
 ID; it never copies the descriptor or payload. Weights, activations, KV, PCM,
-and scratch never enter either queue. The mounted compatibility path currently
-uses one native slot with a monotonically recycled generation; it is not yet the
-retained pool described here.
+and scratch never enter either queue. The mounted path already has an eight-slot,
+generation-protected descriptor pool whose queue lease survives CQ consumption.
+Its descriptor payload is currently only `Engine*` plus the request kind; the
+actual numerical pointers remain in one borrowed engine request slot. It is not
+yet the owned `PassDescriptor` slot or region-lease graph described here.
 
 The upstream baseline `koro_send_begin_ex` always copies through
 `kc_descriptor_create_copy` at `kcoro_arena/core/src/kcoro_stackless.c:94-107`.
 The product executor must use the new descriptor-transfer/ticket submission
 surface, never this copy-mode helper.
 
-### SQ/CQ boundary
+### Target SQ/CQ Boundary
 
 The executor boundary is an explicit submission-queue/completion-queue pair,
 matching a command processor rather than a general actor channel:
@@ -308,7 +311,7 @@ restore, or poison. In-place state that cannot be restored is marked poisoned;
 the coordinator cannot recur or snapshot it and may only destroy it or restore
 a previously durable image.
 
-## Stage Board
+## Target Stage Board
 
 Each immutable plan stage declares:
 
@@ -377,10 +380,13 @@ One barrier per tensor expression, helper function, or assembly call is
 forbidden. Each immutable plan records declared stage/barrier count and active
 mask so a model change cannot silently multiply host waits.
 
-## Zero-Spin Barrier
+## Native Zero-Spin Barrier
 
-`FENCE_SPIN = 8192` is removed. There is no bounded spin, `YIELD`, `PAUSE`, WFE
-budget, UMWAIT budget, timed poll, or repeated atomic-load loop.
+`FENCE_SPIN = 8192` is removed from the native Flashkern fence. There is no
+bounded spin, `YIELD`, `PAUSE`, WFE budget, UMWAIT budget, timed poll, or
+repeated atomic-load loop in the C++ dispatch/fence waits. The transitional
+Rust `REQ_CALL` exception is recorded in the current scheduler map and does not
+weaken the target: it is deleted, not generalized.
 
 ```mermaid
 flowchart TD
@@ -434,13 +440,14 @@ immediately; waiting without the logical recheck would be a lost-wake bug.
    mask is nonempty; awakened lanes acquire generation before claiming work.
 4. Final output writes and full-pass epoch disposition happen before the native
    executor release-publishes the CQ cell; the Rust ingress thread acquires that
-   cell before resolving the terminal promise or admitting future work.
+   cell before resolving the mounted result slot or, after recurrence lands, the
+   target terminal promise.
 
 The host wait primitive may return spuriously but cannot weaken these edges.
 SIMD/assembly kernels inherit synchronized pointer views and add no hidden
 publication protocol.
 
-## Full Pass
+## Target Full Pass
 
 A full pass starts when the coordinator publishes one SQ cell naming a retained
 pass descriptor and ends when all stages have reached a valid model-state
@@ -462,7 +469,7 @@ The last pass lane performs bounded completion publication:
 It never invokes arbitrary callbacks. The Rust ingress thread drains the cell
 and resolves the ticket promise outside native executor locks.
 
-## Doorbells And Interrupts
+## Target Doorbells And Interrupts
 
 An interrupt is an epoch doorbell:
 
@@ -492,7 +499,7 @@ state as declared by the plan. Fault wins if no valid boundary exists. Otherwise
 the unclaimed boundary precedence is runtime stop, stale epoch, explicit cancel,
 then hard timeout. None of these are polled by a lane.
 
-## Callback-Driven Recurrence
+## Target Callback-Driven Recurrence
 
 The current path returns logits to Rust so `Sampler` and
 `generate_with_cache` choose the next token at
@@ -527,7 +534,7 @@ receives logits, probabilities, RNG state, or tensor views. The resumed Rust
 continuation reads compact result IDs and submits the next descriptor. UI text
 notification is a separate side effect and never gates the next pass.
 
-## Conversation Switching And Branches
+## Target Conversation Switching And Branches
 
 At any completed child ticket, the coordinator may replace the pass context
 pointer while retaining the same immutable model plan and weights. It may:
@@ -580,6 +587,10 @@ with separate workers, boards, scratch, and broker bindings.
 `REQ_CALL` at `flashkern_engine.cpp:1283-1291` lets Rust callbacks execute on the
 fixed lane team. Current users enter through `NativeEngine::run_lanes`/`grid`
 starting at `crates/liquid-audio/src/compute/flashkern/native_engine.rs:544`.
+`DepthDecode::frame` currently constructs a local `SpinBarrier` at
+`decode.rs:1001-1019`; therefore the mounted engine is zero-spin while idle and
+at native C++ fences, but not yet at every internal stage of this Rust callback
+program. That exception is one reason `REQ_CALL` cannot survive cutover.
 
 Migration rules:
 

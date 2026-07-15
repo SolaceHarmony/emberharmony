@@ -35,6 +35,8 @@ The current implementation is a hybrid:
 - Tauri settings correctly choose the model, mode, and device at runtime.
 - C++ owns an immutable safetensors image and several fused CPU kernels.
 - C++/assembly runs eligible one-token backbone and native Mimi decode work.
+- Eligible Flashkern passes traverse the mounted Rust SQ broker and CQ ingress,
+  but the outer call remains synchronous to retain borrowed Candle buffers.
 - Rust still owns audio I/O, VAD, queues, utterance materialization, mel,
   Conformer, conversation assembly, generation control, sampling, and Moshi.
 - Candle still owns nearly all model tensor objects and all paths not explicitly
@@ -51,9 +53,15 @@ flowchart LR
     VAD --> TENSOR["Candle PCM tensor"]
     TENSOR --> MEL["Rust/Candle resample and mel"]
     MEL --> CONF["Rust/Candle Conformer and adapter"]
-    CONF --> PREFILL["Rust/Candle modality scatter and prefill"]
-    PREFILL --> FK["C++ Flashkern eligible passes"]
-    FK --> GEN["Rust sampler and generation loop"]
+    CONF --> MODEL["Rust/Candle prefill and generation"]
+    MODEL --> RIM["blocking native-engine rim"]
+    RIM --> CPP["C++ single request slot"]
+    CPP -->|"registered callback"| KCORO["Rust result slot and SQ broker"]
+    KCORO -->|"SQ doorbell"| FK["C++ Flashkern fixed lanes"]
+    FK -->|"CQ doorbell"| INGRESS["dedicated Rust CQ ingress"]
+    INGRESS -->|"resolve slot and broker edge"| CPP
+    CPP -->|"return logits/status"| GEN["Rust sampler and generation loop"]
+    GEN --> MODEL
     GEN --> MIMI["Native Mimi decode through Rust adapter"]
     MIMI --> OUT["Rust output queue and audio device"]
 ```

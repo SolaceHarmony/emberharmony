@@ -62,6 +62,10 @@ The following remain open:
 | sole CQ ingress and teardown | `coordinator.rs:383-431`, `542-568`; `native_engine.rs:802-826` at `4f06a3d5` | blocking edge wait, exact identity validation, callback clearing, endpoint joins before bridge destroy |
 | mounted lifecycle gates | `native_engine.rs:1551-1625` at `4f06a3d5` | missing broker rejects without a descriptor leak; 10,000 mounted passes prove SQ/CQ/descriptor/result accounting |
 
+The exact mounted sequence, fixed capacities, synchronous borrowed-pointer
+guard, and current completion facts are recorded in
+[`KCORO_ARENA_INTEGRATION.md`](../../docs/native/KCORO_ARENA_INTEGRATION.md#mounted-pass-sequence-4f06a3d5).
+
 ## The Contract
 
 1. **Everything is an edge.** The only legal waits anywhere in the stack are
@@ -133,7 +137,7 @@ The following remain open:
     It may be lossy, coalesced, and late. It may never gate, wake, retain,
     or backpressure anything that computes.
 
-## Layer Diagram
+## Target Layer Diagram
 
 ```mermaid
 flowchart TB
@@ -148,7 +152,11 @@ flowchart TB
     Kernel -->|"reflex arcs act locally, report upward"| Kernel
 ```
 
-## Cancellation and Suspension Semantics
+Only the coordinator-to-kernel SQ/CQ segment has its first production mount.
+The Tauri docking ring, native microphone/audio reflexes, conversation scope
+tree, and observer projection in this diagram remain open.
+
+## Target Cancellation And Suspension Semantics
 
 - The tree: session → conversation → turn → pass / draft / branch / task.
 - Each node holds a child cancellation token; a parent's cancel is a
