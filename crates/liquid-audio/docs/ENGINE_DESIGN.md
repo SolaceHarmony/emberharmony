@@ -9,16 +9,24 @@ The one-sentence target: **one resident weight image plus fixed mutable arenas,
 computed through pointers and shared memory by one C++ kernel program on a
 persistent lane team, handing compact completion facts to Rust once per pass.**
 
+That sentence describes the CPU backend. Flashkern never owns Metal dispatch.
+Matrix coprocessing is a required peer path: CPU matrix opcodes remain first-class,
+and Apple GPU execution moves to a separate MLX C++/Metal engine selected by the
+model/device layer. The current Candle Metal path is temporary migration code.
+
 ## 0. What "kernel" means here (the adherence rule that was broken)
 
 A kernel is ONE native program executed by the resident lane team, owning all control flow
 between published stages — layer loop included. Rust builds the context, rings the doorbell,
-and reads rings; it does not run between stages. AS-BUILT (2026-07-13): the WHOLE
+and reads rings; it does not run between stages. AS-BUILT (2026-07-14): the WHOLE
 backbone token is one resident lane program (REQ_TOKEN_PASS: embed →
-every conv/attention layer → final norm), and DepthDecode rides the same team as a
-lane-uniform Rust program via the generic REQ_CALL + exported lane fence. The stage board
-described elsewhere in this file was replaced by generation fences (lane-uniform kernel);
-rayon executes nothing per-token. Current diagrams + numbers: DECODE_ENGINE.md §0.
+every conv/attention layer → final norm → optional sample), and the complete
+Depthformer frame is a typed C++ `REQ_DEPTH_FRAME` program: projection, every
+codebook/layer, KV recurrence, logits, sampling, and sampled-embedding feedback.
+Rust installs pointer descriptors and rings one pass; it runs no numerical frame.
+The stage board described elsewhere in this file was replaced by generation fences
+(lane-uniform kernel); rayon executes nothing per-token. Current diagrams + numbers:
+DECODE_ENGINE.md §0.
 
 ## 1. Target arena — fixed capacities and stable pointers
 
@@ -49,7 +57,8 @@ LFM2.5-Audio-1.5B, B=1,
 | rope tables | backbone [4096][32] f32; depth [4096][16] f32 | 1.3 MB | copied ONCE at build for locality (ends the 6× per-Mha duplication) |
 | token ring | 1024 × u32 + rd/wr seq | 4 KB | descriptors, not Vecs |
 | pcm ring | 10 s × 24 kHz f32 + rd/wr seq | 960 KB | native platform playback callback reads; reserve/commit API |
-| sampler state | two native ChaCha20 stream images + top-k scratch | 4 KB | 192-byte `LfmPrngStateV1` per stream is built; sampler integration remains open |
+| sampler state | one native ChaCha20 stream image per conversation/generation | 192 B each | one draw order crosses text and every audio codebook; the current Rust rim owns the opaque image until native conversation ownership lands |
+| sampler scratch | [largest vocab] f32 weights + [largest vocab] f32 top-k heap + lane partials | ~512 KB at vocab 65,536 | engine-owned and reserved when heads are installed; no logit payload copy or warmed-pass allocation |
 
 Target mutable arena size is approximately 60–90 MB, dominated by fixed-cap KV.
 Every target kernel argument is `arena_base + offset` or `image_base + offset`.
@@ -81,14 +90,25 @@ descriptor staging, no allocation inside a warmed pass, and no Rust between nati
   exact reduction order.
 - **As-built/live mount**: `REQ_TOKEN_PASS` executes embed, every native ShortConv or
   attention block, each MLP, final norm, and optional logits over one team entry.
-  DepthDecode remains the production `REQ_CALL` user and is the next typed native pass.
-- **As-built PRNG leaf (2026-07-14)**: `REQ_PRNG` carries a retained pointer to
-  conversation-owned `LfmPrngStateV1` and an output span through the same SQ/CQ
-  and fixed-team lifecycle. AArch64 and x86_64 assembly expand ChaCha20 blocks;
-  Apple `SecRandomCopyBytes` supplies key/nonce material only at seed time. This
-  is a conformance entry, not the final sampler path: token and Depthformer
-  programs must consume the stream in their existing serial stage with no
-  per-draw ticket or Rust numerical callback.
+  `REQ_DEPTH_FRAME` executes the complete Depthformer frame over the same fixed team.
+  Both backbone and Depthformer plans coexist by stable identity; a ticket selects
+  one immutable plan while the executor and scratch arena remain shared.
+- **As-built CPU streaming convolution**: `REQ_DEPTHWISE_STREAM` partitions full
+  `(batch, channel)` rows across the same fixed team. The C ABI borrows split
+  state/input/weight planes and separate output/state destinations, then publishes
+  one completion after the program-final fence. No Metal dispatch exists in this
+  request or anywhere else in Flashkern.
+- **As-built native sampler (2026-07-14)**: `run_sampler` at
+  `native/src/engine/flashkern_engine.cpp:831` is a fixed-lane collective over
+  pointer-borrowed F32/BF16 logits. Greedy selection uses one fence and no RNG;
+  stochastic selection uses three fences, engine-owned probability/top-k
+  scratch, and exactly one mutation of the shared ChaCha stream. The text head
+  calls it inside `REQ_TOKEN_PASS`; `run_depth_frame` calls it directly for each
+  codebook inside one `REQ_DEPTH_FRAME`, so neither path creates a per-draw or
+  per-codebook ticket. `REQ_SAMPLE` remains the standalone prefill/fallback and
+  conformance entry. `REQ_PRNG` independently pins stream/assembly behavior.
+  AArch64 and x86_64 assembly expand ChaCha20 blocks, and Apple
+  `SecRandomCopyBytes` supplies key/nonce material only at seed time.
   Per-block request entries remain as parity fixtures; there is no alternate engine.
 
 Linkage has two distinct kcoro roles. `crates/kcoro` is the safe Rust product
@@ -161,9 +181,14 @@ equivalent" means, and it is the unit the rb-epilogue lands in.
   backbone decode step on the persistent team. Weight pointers and mutable state
   still arrive through the borrowed compatibility request slot; direct resident
   image binding and the complete target arena remain open.
-- **E2 frame pass**: DepthDecode into the program. The assembly CSPRNG and
-  snapshot-stable native state are built; probability policy and in-pass stream
-  consumption remain to mount. Oracle: token-sequence A/B vs current DepthDecode.
+- **E2 frame pass**: ✅ **As-built typed frame.** `REQ_DEPTH_FRAME` owns the
+  projection, all Depthformer layers/codebooks, native zero-spin fences, logits,
+  sampler, and sampled-embedding recurrence. The Rust numerical callback,
+  `SpinBarrier`, logits Tensor rebuild, nested sampler ABI, and BF16 hidden copy
+  are deleted. The remaining outer migration is to bind the input/output slots and
+  shared RNG image directly to native conversation state instead of returning a
+  small Rust token `Vec`. Oracle: seeded token sequence plus the one-ticket typed
+  plan lifecycle test.
 - **E3 rings**: token/PCM rings live; per-token tensor construction deleted from the loop;
   sampler v2. Oracle: e2e gates + allocation counter == 0 in-pass.
 - **E4 prefill pass**: chunked `lfm_prefill_pass`, streams during capture (the
@@ -187,8 +212,9 @@ equivalent" means, and it is the unit the rb-epilogue lands in.
 ## 6. Candle disposition
 
 Candle currently supplies compatibility tensor owners, unfinished numerical paths,
-Metal execution, training tools, and parity references. That is migration state,
-not a permanent production boundary. The completed local inference runtime binds
-the native resident image and executes C++/SIMD/assembly without Candle or Rust
-numerical callbacks; references and training tooling may remain outside the
-shipped inference path.
+temporary Metal execution, training tools, and parity references. That is migration
+state, not a permanent production boundary. CPU inference binds the native resident
+image and executes Flashkern C++/SIMD/assembly without Candle or Rust numerical
+callbacks. Apple GPU inference remains mandatory, but its replacement is a separate
+MLX C++/Metal device engine with its own command/memory boundary. It is not compiled
+into Flashkern. References and training tooling may remain outside shipped inference.

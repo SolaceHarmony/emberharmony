@@ -398,9 +398,10 @@ zero inference file I/O.
 - Add one kernel broker per fixed board with persisted service classes,
   consecutive-pass limits, context quantum, and age promotion.
 - The stackful dispatcher, saved stacks, context-switch assembly, and duplicate
-  runtime tree are already deleted in `d2c43abd` ancestry. `REQ_CALL` remains a
-  transitional typed-callback boundary on ordinary fixed worker stacks; D8
-  removes it after independent parity fixtures.
+  runtime tree are already deleted in `d2c43abd` ancestry. In the current branch
+  working tree, all remaining GEMM and DD FFT callback bodies are typed native
+  passes and `REQ_CALL` plus its Rust trampolines are deleted. Pin the immutable
+  commit hash when this tranche lands.
 
 Current evidence: the mounted Rust endpoint has debug/release/arm64/Rosetta
 10,000-pass, parity, idle, and wake-accounting results. The native bridge harness
@@ -462,8 +463,11 @@ Exit: the model-frontend portion of G6.
   Depthformer.
 - Split native Mimi plans/state and decode into playback reservations.
 - Expose quiesce, context switch, and dirty-region hooks.
-- Port the final production Rust lane callbacks to typed native passes, capture
-  independent parity fixtures, then delete `REQ_CALL` and its Rust trampolines.
+- **Complete in the current branch working tree; pin on commit:** the final GEMM
+  and DD FFT Rust lane callbacks are typed pointer-borrowed native passes;
+  independent parity fixtures cover both matrix layouts, physical FFT lane
+  counts, exact ticket counts, and stage-fence execution. `REQ_CALL` and its Rust
+  trampolines are deleted with no compatibility mode.
 - **Implemented substrate (`d2c43abd`):** shared expected-value words now own
   command/fence blocking, and the fixed executor is the sole Flashkern lane
   owner. The committed G0/G3 report is under `docs/native/baselines/`.

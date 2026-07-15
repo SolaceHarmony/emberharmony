@@ -35,7 +35,8 @@ immediately afterward.
 
 1. `flashkern_engine.cpp` is the live CPU executor. Its fixed numerical lanes
    keep ordinary C++ stacks. They do not become Rust futures or stackless lane
-   frames.
+   frames, and Flashkern never owns Metal dispatch. Apple GPU execution is a
+   separate future MLX C++/Metal device backend selected above the CPU kernel.
 2. `crates/kcoro` is the target product policy scheduler. At cutover it owns Rust
    futures, scopes, tickets, promises, service policy, and recurrence decisions.
 3. `kcoro_arena` is the C conformance oracle and current native wait-word
@@ -71,19 +72,29 @@ The production path is still transitional:
   the blocking CQ edge. It validates ticket/conversation/epoch, resolves the
   exact result slot, and wakes the broker continuation;
 - the compatibility C++ caller remains blocked on that result slot solely so
-  its borrowed Candle pointers remain live. C++ no longer submits SQ cells or
-  waits on CQ directly;
-- `bridge_main` at `flashkern_engine.cpp:1106-1140` validates the native
+  its borrowed model, state, and result pointers remain live. C++ no longer
+  submits SQ cells or waits on CQ directly;
+- `bridge_main` at `flashkern_engine.cpp:1629-1682` validates the native
   descriptor generation and rings the fixed lanes; lane 0 publishes the exact
-  completion at `1043-1084`;
-- the native engine has one pointer-stable `Pass` at line 82, one `Stage` board
-  at line 119, one `Fence` at line 134, and one single-pass claim;
-- `lane_fence` at line 634 performs immediate expected-value blocking with no
-  spin tier; `run_stage` at line 670 retains atomic tile fan-out;
-- `REQ_CALL` remains request kind 5 at line 150 and enters Rust callbacks through
-  `lfm_engine_call` at lines 1283-1291;
-- sampling, turn/frame policy, audio ownership, and large parts of model
-  inference still live in Rust/Candle;
+  completion at `1573-1602`;
+- the native engine has one pointer-stable `Pass` at line 94, one `Stage` board
+  at line 131, one `Fence` at line 146, and one single-pass claim;
+- `lane_fence` at line 735 performs immediate expected-value blocking with no
+  spin tier; `run_stage` at line 771 retains atomic tile fan-out;
+- request kind 5, `REQ_CALL`, `lfm_engine_call`, `lfm_lane_fence`, and the Rust
+  `run_lanes/grid` trampolines are deleted; no Rust frame enters a compute lane;
+- `REQ_DEPTH_FRAME` is the typed native Depthformer program; Rust installs
+  descriptor tables and submits one pointer-borrowed frame ticket;
+- `REQ_DEPTHWISE_STREAM` is the typed CPU streaming-convolution program; it
+  borrows split state/input/weight planes, writes independent output/state
+  planes, and uses one pass ticket rather than one ticket per channel or cell;
+- `REQ_GEMM`, `REQ_FFT_CONV_DD`, and `REQ_IRFFT_DD` own the former callback
+  grids as typed pointer-borrowed programs with one completion per whole grid;
+  DD FFT convolution uses the complete fixed lane team, one shared work plane,
+  and one zero-spin generation fence after each radix-2 butterfly stage;
+- sampling math and PRNG consumption now run on the fixed native lane team;
+  opaque stream ownership, turn/frame policy, audio ownership, and large parts
+  of model inference still live in Rust/Candle;
 - Rust now owns the first production pass broker and CQ ingress, but service
   classes, scope wake propagation, child recurrence, native audio, and the Tauri
   docking ring are not mounted.
@@ -92,7 +103,7 @@ The production path is still transitional:
 
 This is the exact production Flashkern pass edge today. It is callback-driven and
 has no queue-monitor polling, but it is still synchronous at the outer C++/Rust rim
-so Candle-owned inputs, outputs, and request fields cannot expire before completion.
+so borrowed inputs, outputs, state, and request fields cannot expire before completion.
 
 ```mermaid
 sequenceDiagram
@@ -130,23 +141,24 @@ sequenceDiagram
 
 | Mounted fact | Value at `4f06a3d5` | Source |
 |---|---|---|
-| Native SQ/CQ capacity | `1` | `flashkern_engine.cpp:1224-1229` |
-| Native descriptor slots | `8` | `flashkern_engine.cpp:1224-1229` |
-| Rust result/ring slots | `8` | `native_engine.rs:267-280` |
+| Native SQ/CQ capacity | `1` | `flashkern_engine.cpp:1766-1770` |
+| Native descriptor slots | `8` | `flashkern_engine.cpp:1766-1770` |
+| Rust result/ring slots | `8` | `native_engine.rs:391` |
 | Rust coordination threads | one `kcoro-kernel` worker plus one `kcoro-cq` ingress | `coordinator.rs:463-527` |
 | Active native work | one `PassClaim`, one pending Rust command, one fixed board | `flashkern_engine.cpp:397-414`; `coordinator.rs:283-301` |
 | Submission policy | `RUN_PASS`, `INTERACTIVE`, `pass_budget = 1`; no parent or deadline | `flashkern_engine.cpp:1162-1174` |
 | Descriptor payload | `Engine*` plus request kind; numerical pointers remain in the borrowed engine request slot | `flashkern_engine.cpp:1148-1159` |
 | Successful completion | `completed + committed + committed + success`, no inline token/codebook result | `flashkern_engine.cpp:1059-1078` |
-| Recurrence and scope policy | still owned by existing linear Rust/Candle callers; service queues, child tickets, and scope doorbells are not mounted | `coordinator.rs:343-380` and the open work below |
-| Remaining active spin | transitional `REQ_CALL` programs such as `DepthDecode` use a Rust `SpinBarrier` between internal stages | `decode.rs:24-67`, `1001-1019` |
+| Sampling, recurrence, and scope policy | text and Depthformer sampling execute inside their typed native passes; outer turn recurrence remains in the Rust caller; service queues, child tickets, and scope doorbells are not mounted | `flashkern_engine.cpp:run_sampler`, `run_depth_frame`; `coordinator.rs:343-380` and the open work below |
+| Remaining active spin | none in native dispatch or typed numerical waits; no generic callback request remains | `flashkern_engine.cpp:lane_fence`, `lane_program` |
 
-No Tauri edge, queue-monitor polling loop, payload copy through SQ/CQ, or per-pass
-heap allocation appears in this sequence. Native lane idle and C++ generation
-fences block without spin. The transitional `REQ_CALL` exception above still
-polls an in-pass Rust generation word and must be deleted with the Rust lane
-program. The mount is not yet asynchronous multi-conversation execution: bridge
-capacity and native request ownership still enforce one pass.
+No Tauri edge, queue-monitor polling loop, or payload copy through SQ/CQ appears
+in this sequence. Native lane idle and C++ generation fences block without spin.
+The KN GEMM leaves still own thread-local panel vectors that resize and repack on
+first/new shapes; document 09 tracks their replacement with plan-owned prepacked
+weights and reserved lane scratch. The mount is not yet asynchronous multi-conversation
+execution: bridge capacity and native request ownership still enforce one pass,
+even though multiple immutable backbone and Depthformer plans now coexist.
 
 ## Implemented Rust Foundation
 
@@ -426,20 +438,15 @@ Every submission carries a scope/output epoch. On stop or interrupt:
 
 Nothing claims that a GEMV or attention kernel was canceled halfway through.
 
-## `REQ_CALL` Removal
+## Typed Callback Removal
 
-`REQ_CALL` executes Rust callbacks on fixed compute lanes. It is migration debt,
-not part of the coordinator design.
-
-Rules:
-
-- add no production caller;
-- keep each existing callback non-suspending and non-unwinding while it exists;
-- port Depthformer, fan-out, and remaining callback bodies into typed native
-  passes with independent fixtures;
-- delete `REQ_CALL`, `lfm_engine_call`, `lfm_lane_fence`, the Rust trampoline,
-  and the request kind when the last production caller is gone;
-- retain no compatibility feature. Git history is the archive.
+Complete in the current branch working tree; record the immutable commit hash
+when this tranche lands. `REQ_CALL`, `lfm_engine_call`, `lfm_lane_fence`,
+`NativeEngine::run_lanes`, and `NativeEngine::grid` are absent. Their four GEMM
+and two DD FFT callers are typed C++ programs. Independent fixtures cover KN/NK
+matrix layouts, GEMV, DD precision, native claim arbitration, exact ticket
+counts, physical one-lane/four-lane bit parity, exact stage-fence accounting, and
+descriptor teardown. There is no compatibility feature; Git history is the archive.
 
 ## Target Tauri Docking Ring
 
@@ -567,17 +574,21 @@ overlap, bounded drain fairness, zero idle polling, and no teardown leaks.
 
 ### E. Typed native passes and Candle removal
 
-Status: open.
+Status: in progress.
 
-- Native PRNG substrate landed 2026-07-14: Apple system entropy seeds a
-  pointer-free ChaCha20 state, architecture assembly expands the hot stream, and
-  `REQ_PRNG` proves the retained-descriptor/SQ/CQ/fixed-lane lifecycle. Treat
-  that request as a conformance leaf only; production sampling consumes the
-  conversation-owned stream inside token/Depthformer passes and creates no
-  ticket per draw.
-- port every `REQ_CALL` body;
-- keep sampling, PRNG, state append, mel, Conformer, Depthformer, Mimi, and Moshi
-  numerical work native;
+- Native PRNG and sampling landed 2026-07-14: Apple system entropy seeds a
+  pointer-free ChaCha20 state, architecture assembly expands the hot stream,
+  and `run_sampler` consumes pointer-borrowed logits as a fixed-lane collective.
+  Text sampling runs inside `REQ_TOKEN_PASS`; typed `REQ_DEPTH_FRAME` enters the
+  same collective for every codebook inside one outer frame ticket.
+  `REQ_PRNG` and standalone `REQ_SAMPLE` remain conformance/fallback leaves;
+  integrated sampling creates no ticket per draw or codebook.
+- Depthformer and every former `REQ_CALL` body are ported to typed native passes;
+- CPU bf16 streaming short-conv is ported as `REQ_DEPTHWISE_STREAM`; keep the
+  temporary Metal route outside Flashkern until the separate MLX C++ backend lands;
+- move the opaque sampler image from the Rust generation rim into native
+  conversation state, then keep state append, mel, Conformer, Depthformer,
+  Mimi, and Moshi numerical work native;
 - let Rust consume only compact result IDs and choose the next typed pass;
 - delete blocking per-pass wrappers, Rust model workers, and Candle owners only
   after each independent gate passes;
@@ -699,7 +710,7 @@ Before approving scheduler work, answer yes to each applicable item:
 - Can children continue while a parent is parked on their promise?
 - Is an in-flight pass allowed to finish but forbidden from old-epoch recurrence?
 - Are observer and semantic projections separate from progress?
-- Is `REQ_CALL` shrinking with no new caller?
+- Does the symbol audit continue to prove `REQ_CALL` and Rust lane trampolines absent?
 - Are current and target claims labeled honestly with immutable commit evidence?
 - Are replaced implementations deleted rather than retained as fallbacks?
 - Do CI jobs execute the Rust coordinator, C oracle, native integration, and
@@ -733,7 +744,7 @@ Still required before product cutover:
 1. owned native pass slots and removal of the synchronous borrowed-pointer rim;
 2. scope doorbell propagation and service-class fairness;
 3. Rust-owned child-ticket recurrence and multi-conversation policy;
-4. typed pass replacement and `REQ_CALL` deletion;
+4. native multi-token prefill and conversation-owned cache/state marks;
 5. native audio/VAD and Tauri docking-ring mount;
 6. complete LFM2/Moshi Candle removal;
 7. million-pass, latency, app, and full product teardown evidence.

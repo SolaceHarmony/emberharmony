@@ -87,7 +87,6 @@ pub struct LayerState {
 
 /// Snapshot-stable native ChaCha20 stream state. This belongs to one conversation,
 /// never to the process engine; native passes borrow it mutably for their duration.
-#[cfg(test)]
 #[repr(C, align(64))]
 #[derive(Clone, Copy)]
 pub(crate) struct PrngState {
@@ -100,13 +99,22 @@ pub(crate) struct PrngState {
     reserved: [u8; 48],
 }
 
-#[cfg(test)]
 const _: [(); 192] = [(); std::mem::size_of::<PrngState>()];
-#[cfg(test)]
 const _: [(); 64] = [(); std::mem::align_of::<PrngState>()];
 
-#[cfg(test)]
 impl PrngState {
+    pub(crate) fn from_seed(seed: u64) -> Result<Self, i32> {
+        let mut state = std::mem::MaybeUninit::<Self>::zeroed();
+        // SAFETY: native code initializes the complete aligned ABI object.
+        let rc = unsafe { lfm_prng_seed_u64(state.as_mut_ptr(), seed) };
+        if rc != 0 {
+            return Err(rc);
+        }
+        // SAFETY: success initialized every byte.
+        Ok(unsafe { state.assume_init() })
+    }
+
+    #[cfg(test)]
     pub(crate) fn from_system() -> Result<Self, i32> {
         let mut state = std::mem::MaybeUninit::<Self>::zeroed();
         // SAFETY: `state` is aligned storage for the complete C ABI object.
@@ -118,6 +126,7 @@ impl PrngState {
         Ok(unsafe { state.assume_init() })
     }
 
+    #[cfg(test)]
     fn from_material(key: &[u8; 32], nonce: &[u8; 8]) -> Result<Self, i32> {
         let mut state = std::mem::MaybeUninit::<Self>::zeroed();
         // SAFETY: all pointers name their fixed ABI extents for the call.
@@ -128,6 +137,34 @@ impl PrngState {
         }
         // SAFETY: success initializes every byte of the state.
         Ok(unsafe { state.assume_init() })
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct SampleConfig {
+    size: u32,
+    abi_version: u32,
+    flags: u32,
+    top_k: u32,
+    temperature: f64,
+    reserved: u64,
+}
+
+const _: [(); 32] = [(); std::mem::size_of::<SampleConfig>()];
+
+impl SampleConfig {
+    pub(crate) fn new(temperature: Option<f64>, top_k: Option<usize>) -> Self {
+        const GREEDY: u32 = 1;
+        let greedy = temperature.is_none_or(|value| value <= 0.0) || top_k == Some(1);
+        Self {
+            size: std::mem::size_of::<Self>() as u32,
+            abi_version: 1,
+            flags: if greedy { GREEDY } else { 0 },
+            top_k: top_k.unwrap_or(0).min(u32::MAX as usize) as u32,
+            temperature: temperature.unwrap_or(1.0),
+            reserved: 0,
+        }
     }
 }
 
@@ -169,10 +206,12 @@ struct EngineSnapshot {
 }
 
 extern "C" {
+    fn lfm_depthwise_stream_bf16_available() -> i32;
     #[cfg(test)]
     fn lfm_prng_seed_system(state: *mut PrngState) -> i32;
     #[cfg(test)]
     fn lfm_prng_seed_material(state: *mut PrngState, key: *const u8, nonce: *const u8) -> i32;
+    fn lfm_prng_seed_u64(state: *mut PrngState, seed: u64) -> i32;
     fn lfm_engine_new(workers: i32) -> *mut c_void;
     fn lfm_engine_free(e: *mut c_void);
     fn lfm_engine_bridge(e: *mut c_void) -> *mut c_void;
@@ -216,16 +255,9 @@ extern "C" {
         lanes: usize,
     ) -> i32;
     fn lfm_ctx_clear(e: *mut c_void, id: u64) -> i32;
-    fn lfm_engine_call(
-        e: *mut c_void,
-        f: unsafe extern "C" fn(*mut c_void, u32, u32),
-        ctx: *mut c_void,
-    ) -> i32;
     fn lfm_engine_lanes(e: *mut c_void) -> u32;
     #[cfg(test)]
     fn lfm_engine_snapshot(e: *mut c_void, out: *mut EngineSnapshot) -> i32;
-    #[cfg(test)]
-    fn lfm_lane_fence(e: *mut c_void, lane: u32);
     fn lfm_ctx_set_heads(
         e: *mut c_void,
         id: u64,
@@ -255,7 +287,93 @@ extern "C" {
         out_hidden_len: usize,
         out_logits: *mut f32,
         out_logits_len: usize,
+        sampler: *const SampleConfig,
+        sample_state: *mut PrngState,
+        out_token: *mut u32,
         lanes: usize,
+    ) -> i32;
+    fn lfm_engine_sample(
+        e: *mut c_void,
+        logits: *const c_void,
+        count: usize,
+        dtype: u32,
+        config: *const SampleConfig,
+        state: *mut PrngState,
+        out_token: *mut u32,
+    ) -> i32;
+    fn lfm_engine_depth_build(
+        e: *mut c_void,
+        plan: *const super::decode::DepthPlan,
+        out_id: *mut u64,
+    ) -> i32;
+    fn lfm_engine_depth_frame(
+        e: *mut c_void,
+        id: u64,
+        hidden: *const u16,
+        hidden_count: usize,
+        sampler: *const SampleConfig,
+        sample_state: *mut PrngState,
+        out_tokens: *mut u32,
+        out_token_count: usize,
+    ) -> i32;
+    fn lfm_engine_depth_clear(e: *mut c_void, id: u64) -> i32;
+    fn lfm_engine_depthwise_stream_bf16(
+        e: *mut c_void,
+        x: *const u16,
+        x_count: usize,
+        cache: *const u16,
+        cache_count: usize,
+        weights: *const u16,
+        weight_count: usize,
+        out: *mut u16,
+        out_count: usize,
+        next: *mut u16,
+        next_count: usize,
+        batch: usize,
+        channels: usize,
+        steps: usize,
+        kernel: usize,
+    ) -> i32;
+    fn lfm_engine_bf16_gemm_f32(
+        e: *mut c_void,
+        a: *const u16,
+        a_count: usize,
+        rhs: *const u16,
+        rhs_count: usize,
+        out: *mut f32,
+        out_count: usize,
+        m: usize,
+        n: usize,
+        k: usize,
+        rhs_layout: u32,
+    ) -> i32;
+    fn lfm_engine_fft_conv_dd(
+        e: *mut c_void,
+        input: *const f32,
+        input_count: usize,
+        kernel: *const f32,
+        kernel_count: usize,
+        skip: *const f32,
+        skip_count: usize,
+        out: *mut f32,
+        out_count: usize,
+        batch: usize,
+        channels: usize,
+        steps: usize,
+        fft_size: usize,
+    ) -> i32;
+    fn lfm_engine_irfft_dd(
+        e: *mut c_void,
+        real: *const f32,
+        real_count: usize,
+        imag: *const f32,
+        imag_count: usize,
+        out: *mut f32,
+        out_count: usize,
+        rows: usize,
+        fft_size: usize,
+        scale_hi: f32,
+        scale_lo: f32,
     ) -> i32;
     fn lfm_engine_conv_layer(
         e: *mut c_void,
@@ -291,6 +409,11 @@ extern "C" {
         out: *mut u64,
         count: usize,
     ) -> i32;
+}
+
+pub(crate) fn depthwise_stream_available() -> bool {
+    // SAFETY: capability query accepts no pointers and mutates no state.
+    unsafe { lfm_depthwise_stream_bf16_available() != 0 }
 }
 
 /// Handle to the persistent native engine. One per process is the intended shape
@@ -422,13 +545,273 @@ impl NativeEngine {
         // blocking SQ/CQ pass completes.
         unsafe { lfm_engine_prng_fill(self.ptr, state, out.as_mut_ptr(), out.len()) == 0 }
     }
+
+    fn sample(
+        &self,
+        logits: *const c_void,
+        count: usize,
+        dtype: u32,
+        config: &SampleConfig,
+        state: &mut PrngState,
+    ) -> Result<u32, i32> {
+        const F32: u32 = 1;
+        const BF16: u32 = 2;
+        assert!(dtype == F32 || dtype == BF16);
+        let _pass = self.pass_lock.lock().unwrap();
+        let mut token = 0;
+        // SAFETY: the typed wrappers below supply a live input extent; exclusive
+        // state/output borrows last through the blocking SQ/CQ completion.
+        let rc =
+            unsafe { lfm_engine_sample(self.ptr, logits, count, dtype, config, state, &mut token) };
+        if rc != 0 {
+            return Err(rc);
+        }
+        Ok(token)
+    }
+
+    pub(crate) fn sample_f32(
+        &self,
+        logits: &[f32],
+        config: &SampleConfig,
+        state: &mut PrngState,
+    ) -> Result<u32, i32> {
+        self.sample(logits.as_ptr().cast(), logits.len(), 1, config, state)
+    }
+
+    pub(crate) fn sample_bf16(
+        &self,
+        logits: &[u16],
+        config: &SampleConfig,
+        state: &mut PrngState,
+    ) -> Result<u32, i32> {
+        self.sample(logits.as_ptr().cast(), logits.len(), 2, config, state)
+    }
+
+    /// Borrow two bf16 matrices and write one f32 result through a single fixed-team
+    /// ticket. `rhs_nk` selects checkpoint-native `[N,K]`; false selects `[K,N]`.
+    pub(crate) fn bf16_gemm_f32(
+        &self,
+        a: &[u16],
+        rhs: &[u16],
+        out: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+        rhs_nk: bool,
+    ) -> bool {
+        const KN: u32 = 0;
+        const NK: u32 = 1;
+        let a_count = m.checked_mul(k).expect("bf16 gemm A extent overflow");
+        let rhs_count = n.checked_mul(k).expect("bf16 gemm RHS extent overflow");
+        let out_count = m.checked_mul(n).expect("bf16 gemm output extent overflow");
+        assert_eq!(a.len(), a_count, "bf16 gemm A extent");
+        assert_eq!(rhs.len(), rhs_count, "bf16 gemm RHS extent");
+        assert_eq!(out.len(), out_count, "bf16 gemm output extent");
+        if m == 0 || n == 0 || k == 0 {
+            return true;
+        }
+        let _pass = self.pass_lock.lock().unwrap();
+        // SAFETY: exact extents are checked above. Both inputs and the exclusive
+        // destination remain borrowed until the blocking CQ completion arrives.
+        unsafe {
+            lfm_engine_bf16_gemm_f32(
+                self.ptr,
+                a.as_ptr(),
+                a.len(),
+                rhs.as_ptr(),
+                rhs.len(),
+                out.as_mut_ptr(),
+                out.len(),
+                m,
+                n,
+                k,
+                if rhs_nk { NK } else { KN },
+            ) == 0
+        }
+    }
+
+    /// Run the complete double-double FFT convolution grid as one native ticket.
+    /// The fixed lane team shares one reusable work plane and fences every radix-2 stage.
+    pub(crate) fn fft_conv_dd(
+        &self,
+        input: &[f32],
+        kernel: &[f32],
+        skip: &[f32],
+        out: &mut [f32],
+        batch: usize,
+        channels: usize,
+        steps: usize,
+        fft_size: usize,
+    ) -> bool {
+        let _pass = self.pass_lock.lock().unwrap();
+        // SAFETY: the C boundary validates every extent. Safe borrows keep all
+        // inputs and the exclusive destination alive through exact completion.
+        unsafe {
+            lfm_engine_fft_conv_dd(
+                self.ptr,
+                input.as_ptr(),
+                input.len(),
+                kernel.as_ptr(),
+                kernel.len(),
+                skip.as_ptr(),
+                skip.len(),
+                out.as_mut_ptr(),
+                out.len(),
+                batch,
+                channels,
+                steps,
+                fft_size,
+            ) == 0
+        }
+    }
+
+    pub(crate) fn irfft_dd(
+        &self,
+        real: &[f32],
+        imag: &[f32],
+        out: &mut [f32],
+        rows: usize,
+        fft_size: usize,
+        scale: super::dd::Dd,
+    ) -> bool {
+        let _pass = self.pass_lock.lock().unwrap();
+        // SAFETY: the native boundary validates all row/frequency extents and
+        // consumes the two scale limbs by value before returning.
+        unsafe {
+            lfm_engine_irfft_dd(
+                self.ptr,
+                real.as_ptr(),
+                real.len(),
+                imag.as_ptr(),
+                imag.len(),
+                out.as_mut_ptr(),
+                out.len(),
+                rows,
+                fft_size,
+                scale.hi,
+                scale.lo,
+            ) == 0
+        }
+    }
+
+    /// Streaming depthwise convolution on the CPU kernel team.
+    /// The prior state and incoming chunk remain separate borrowed planes; native
+    /// lanes write output and next-state planes under one SQ/CQ ticket.
+    pub(crate) fn depthwise_stream_bf16(
+        &self,
+        x: &[u16],
+        cache: Option<&[u16]>,
+        weights: &[u16],
+        out: &mut [u16],
+        next: &mut [u16],
+        batch: usize,
+        channels: usize,
+        steps: usize,
+        kernel: usize,
+    ) -> bool {
+        if !depthwise_stream_available() {
+            return false;
+        }
+        assert!(batch > 0 && channels > 0 && steps > 0 && kernel > 0);
+        let rows = batch
+            .checked_mul(channels)
+            .expect("depthwise rows overflow");
+        let prior = kernel - 1;
+        assert_eq!(x.len(), rows * steps, "depthwise stream input extent");
+        assert_eq!(
+            weights.len(),
+            channels * kernel,
+            "depthwise stream weight extent"
+        );
+        if let Some(cache) = cache {
+            assert_eq!(cache.len(), rows * prior, "depthwise stream cache extent");
+        }
+        assert_eq!(out.len(), rows * steps, "depthwise stream output extent");
+        assert_eq!(
+            next.len(),
+            rows * prior,
+            "depthwise stream next-state extent"
+        );
+        let (cache_ptr, cache_count) = cache
+            .filter(|values| !values.is_empty())
+            .map(|values| (values.as_ptr(), values.len()))
+            .unwrap_or((std::ptr::null(), 0));
+        let next_ptr = if next.is_empty() {
+            std::ptr::null_mut()
+        } else {
+            next.as_mut_ptr()
+        };
+        let _pass = self.pass_lock.lock().unwrap();
+        // SAFETY: all extents were checked above; borrowed inputs and exclusive
+        // output remain live until the exact blocking completion returns.
+        unsafe {
+            lfm_engine_depthwise_stream_bf16(
+                self.ptr,
+                x.as_ptr(),
+                x.len(),
+                cache_ptr,
+                cache_count,
+                weights.as_ptr(),
+                weights.len(),
+                out.as_mut_ptr(),
+                out.len(),
+                next_ptr,
+                next.len(),
+                batch,
+                channels,
+                steps,
+                kernel,
+            ) == 0
+        }
+    }
+
+    pub(crate) fn depth_build(&self, plan: &super::decode::DepthPlan) -> Option<u64> {
+        let _pass = self.pass_lock.lock().unwrap();
+        let mut id = 0;
+        // SAFETY: native code copies every descriptor before returning. The
+        // pointed-to weight payloads remain owned by the model.
+        let rc = unsafe { lfm_engine_depth_build(self.ptr, plan, &mut id) };
+        (rc == 0).then_some(id)
+    }
+
+    pub(crate) fn depth_frame(
+        &self,
+        id: u64,
+        hidden: &[u16],
+        sampler: &SampleConfig,
+        state: &mut PrngState,
+        out: &mut [u32],
+    ) -> bool {
+        let _pass = self.pass_lock.lock().unwrap();
+        // SAFETY: all slices and the exclusive sampler state borrow remain live
+        // until the blocking typed pass receives its exact completion.
+        unsafe {
+            lfm_engine_depth_frame(
+                self.ptr,
+                id,
+                hidden.as_ptr(),
+                hidden.len(),
+                sampler,
+                state,
+                out.as_mut_ptr(),
+                out.len(),
+            ) == 0
+        }
+    }
+
+    pub(crate) fn depth_clear(&self, id: u64) {
+        let _pass = self.pass_lock.lock().unwrap();
+        // SAFETY: pass_lock excludes all frame use; id ownership is checked natively.
+        let rc = unsafe { lfm_engine_depth_clear(self.ptr, id) };
+        assert_eq!(rc, 0, "depth plan clear raced a native pass");
+    }
 }
 
 impl NativeEngine {
     /// Install the resident backbone layer table. The pointers must stay valid until
     /// [`Self::ctx_clear`] — the [`BackboneCtxGuard`] enforces clear-before-drop.
-    /// Single-tenant: returns the install id, or `None` while another install is
-    /// live (that caller keeps its bit-identical candle path).
+    /// Multiple immutable plans may coexist; the returned identity selects one
+    /// plan for each native pass while the executor and scratch arena stay shared.
     fn ctx_build(&self, descs: &[LayerDesc], h: usize, ffn: usize, max_ctx: usize) -> Option<u64> {
         let _pass = self.pass_lock.lock().unwrap();
         let mut id = 0u64;
@@ -444,15 +827,6 @@ impl NativeEngine {
                 &mut id,
             )
         };
-        if rc == -4 {
-            // Observability for the one legitimate refusal: a CPU→CPU model swap
-            // where the previous model is still alive. That model decodes on the
-            // bit-identical candle path until the old install drops.
-            eprintln!(
-                "[flashkern] ctx install refused: another model's table is live; \
-                 this model decodes on the candle path"
-            );
-        }
         (rc == 0).then_some(id)
     }
 
@@ -507,12 +881,18 @@ impl NativeEngine {
         rope_len: usize,
         out_hidden: &mut [u16],
         out_logits: Option<&mut [f32]>,
+        sampler: Option<&SampleConfig>,
+        sample_state: Option<&mut PrngState>,
+        out_token: Option<&mut u32>,
         lanes: usize,
     ) -> bool {
         let _pass = self.pass_lock.lock().unwrap();
         let (logits_ptr, logits_len) = out_logits
             .map(|l| (l.as_mut_ptr(), l.len()))
             .unwrap_or((std::ptr::null_mut(), 0));
+        let sampler_ptr = sampler.map_or(std::ptr::null(), std::ptr::from_ref);
+        let state_ptr = sample_state.map_or(std::ptr::null_mut(), std::ptr::from_mut);
+        let token_ptr = out_token.map_or(std::ptr::null_mut(), std::ptr::from_mut);
         let rc = unsafe {
             lfm_engine_token_pass(
                 self.ptr,
@@ -530,6 +910,9 @@ impl NativeEngine {
                 out_hidden.len(),
                 logits_ptr,
                 logits_len,
+                sampler_ptr,
+                state_ptr,
+                token_ptr,
                 lanes,
             )
         };
@@ -601,72 +984,6 @@ impl NativeEngine {
     pub fn lanes_total(&self) -> usize {
         // SAFETY: engine pointer valid for the process lifetime; pure read.
         unsafe { lfm_engine_lanes(self.ptr) as usize }
-    }
-
-    /// Run a lane-uniform program on the whole team: `f(lane)` executes concurrently
-    /// on every lane (0..lanes_total). Blocks until every lane completes (the
-    /// engine's program-final fence). One doorbell in, one completion out.
-    ///
-    /// Each logical lane is pinned to one fixed pthread for the engine lifetime, so
-    /// this transitional Rust callback cannot migrate a live frame. New numerical
-    /// programs still belong in C++/assembly; this surface remains only until the
-    /// depthformer callback is ported.
-    /// A panic in `f` aborts the process (it cannot unwind across the C boundary).
-    #[must_use = "false = engine refused; caller must take the fallback dispatch"]
-    pub fn run_lanes<F: Fn(usize) + Sync>(&self, f: F) -> bool {
-        unsafe extern "C" fn trampoline<F: Fn(usize) + Sync>(
-            ctx: *mut c_void,
-            lane: u32,
-            _lanes: u32,
-        ) {
-            let call = || {
-                // SAFETY: ctx is &F, valid for the blocking duration of run_lanes.
-                let f = unsafe { &*(ctx as *const F) };
-                f(lane as usize);
-            };
-            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(call)).is_err() {
-                // Unwinding into kcoro/C++ frames is UB; die loudly instead.
-                eprintln!("[flashkern] panic in lane program (lane {lane}); aborting");
-                std::process::abort();
-            }
-        }
-        let _pass = self.pass_lock.lock().unwrap();
-        // SAFETY: single-slot engine serialized by pass_lock; &f outlives the
-        // blocking call; trampoline::<F> matches the C ABI.
-        let rc =
-            unsafe { lfm_engine_call(self.ptr, trampoline::<F>, &f as *const F as *mut c_void) };
-        rc == 0
-    }
-
-    /// Fan a flat grid of `n` INDEPENDENT items across the lane team: `f(item)`
-    /// runs for every `item` in `0..n`, each on whichever lane claims it via a
-    /// strided partition (`lane, lane+lanes, …`). The items must be genuinely
-    /// disjoint (no shared mutable state, no cross-item ordering) — then the
-    /// result is byte-identical to any serial or foreign-pool fan-out, which is
-    /// what lets this REPLACE rayon `par_chunks` grids without moving a bit.
-    ///
-    /// This is the prefill/grid analog of [`run_lanes`](Self::run_lanes): same
-    /// team, same doorbell, zero-spin when idle. Like `run_lanes`, `f` must not
-    /// call into kcoro, and — because this itself dispatches on the team — it
-    /// must NOT be called from inside a lane program (that would re-enter the
-    /// single-slot engine and deadlock). All current callers are candle
-    /// CustomOps at graph scope; none run inside a lane program.
-    pub fn grid<F: Fn(usize) + Sync>(&self, n: usize, f: F) {
-        if n == 0 {
-            return;
-        }
-        let lanes = self.lanes_total().max(1);
-        let dispatched = self.run_lanes(|lane| {
-            let mut item = lane;
-            while item < n {
-                f(item);
-                item += lanes;
-            }
-        });
-        // The engine is the substrate — run_lanes only returns false on a hard
-        // C-side failure, which for a resident team is a broken invariant, not
-        // a slow path. Surface it; do NOT silently drop the grid's work.
-        assert!(dispatched, "engine.grid: lane-team dispatch refused");
     }
 
     /// One whole shortconv+MLP layer in a single doorbell, parity-pinned against the
@@ -786,12 +1103,27 @@ impl BackboneCtxGuard {
         rope_len: usize,
         out_hidden: &mut [u16],
         out_logits: Option<&mut [f32]>,
+        sampler: Option<&SampleConfig>,
+        sample_state: Option<&mut PrngState>,
+        out_token: Option<&mut u32>,
         lanes: usize,
     ) -> bool {
         unsafe {
             process_engine().token_pass(
-                self.id, ids, embed_kind, states, pos, cos_base, sin_base, rope_len, out_hidden,
-                out_logits, lanes,
+                self.id,
+                ids,
+                embed_kind,
+                states,
+                pos,
+                cos_base,
+                sin_base,
+                rope_len,
+                out_hidden,
+                out_logits,
+                sampler,
+                sample_state,
+                out_token,
+                lanes,
             )
         }
     }
@@ -857,8 +1189,8 @@ impl Drop for BackboneCtxGuard {
 
 /// Build + install the backbone layer table on the process engine. Returns the guard
 /// the MODEL must own (declared before its weight fields so it drops first), or `None`
-/// when the build fails or another model's install is live (single-tenant) —
-/// callers keep the per-block path. Engine presence is unconditional.
+/// when that model cannot be represented by the native ABI. Any number of immutable
+/// plans may coexist; one pass ticket selects one plan. Engine presence is unconditional.
 pub fn install_backbone_ctx(
     descs: &[LayerDesc],
     h: usize,
@@ -924,35 +1256,12 @@ pub fn process_engine() -> &'static NativeEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Condvar};
+    use std::sync::{Arc, Barrier};
 
     // The process engine holds ONE resident layer table; tests that build/clear it
     // must not interleave. (Each individual call is pass_lock-serialized; this guards
     // the build→use→clear SEQUENCE.)
     static CTX_TEST_LOCK: Mutex<()> = Mutex::new(());
-
-    struct RawGate {
-        state: Mutex<(usize, bool)>,
-        ready: Condvar,
-    }
-
-    unsafe extern "C" fn block_raw_lane(ctx: *mut c_void, _lane: u32, _lanes: u32) {
-        // SAFETY: the test holds the Arc until both raw calls have returned.
-        let gate = unsafe { &*(ctx.cast::<RawGate>()) };
-        let mut state = gate.state.lock().unwrap();
-        state.0 += 1;
-        gate.ready.notify_all();
-        while !state.1 {
-            state = gate.ready.wait(state).unwrap();
-        }
-    }
-
-    unsafe extern "C" fn noop_raw_lane(_: *mut c_void, _: u32, _: u32) {}
-
-    unsafe extern "C" fn fence_raw_lane(ctx: *mut c_void, lane: u32, _: u32) {
-        // SAFETY: `ctx` is this live engine and the callback runs on one of its lanes.
-        unsafe { lfm_lane_fence(ctx, lane) };
-    }
 
     #[test]
     fn native_prng_matches_chacha20_and_replays_snapshot_through_kcoro() {
@@ -1028,6 +1337,389 @@ mod tests {
         assert_eq!(coordinator_after.failed - coordinator_before.failed, 0);
         assert_eq!(coordinator_after.live, 0);
         assert!(!coordinator_after.fault);
+    }
+
+    #[test]
+    fn native_sampler_is_deterministic_thresholded_and_snapshotable() {
+        let engine = NativeEngine::new(4).expect("native engine init");
+        let logits = [0.1f32, 5.0, 0.2, 3.0, -2.0, 3.0];
+        let greedy = SampleConfig::new(None, None);
+        let stochastic = SampleConfig::new(Some(1.0), Some(2));
+        let mut state = PrngState::from_seed(123).expect("seed");
+        let untouched = state;
+        assert_eq!(engine.sample_f32(&logits, &greedy, &mut state), Ok(1));
+        assert_eq!(
+            state.cursor, untouched.cursor,
+            "greedy must not consume RNG"
+        );
+        assert_eq!(state.core, untouched.core);
+
+        let snapshot = state;
+        let first = (0..32)
+            .map(|_| engine.sample_f32(&logits, &stochastic, &mut state).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            first,
+            [
+                1, 1, 1, 1, 1, 1, 1, 1, 1, 3, 1, 1, 5, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                1, 1, 1, 1,
+            ],
+            "seeded sampler sequence is an ABI-format fixture"
+        );
+        assert_eq!(state.cursor, 64);
+        assert_eq!(
+            state.core,
+            [
+                1634760805, 857760878, 2036477234, 1797285236, 1658732843, 3034356692, 4033853308,
+                4194450665, 3547450344, 3692221201, 2425913855, 2949776396, 4, 0, 2014243122,
+                2946713300,
+            ]
+        );
+        assert_eq!(
+            state.block,
+            [
+                2383642325, 43725645, 1286118100, 2469055513, 777813414, 2667126283, 129165302,
+                847218681, 4067806552, 303737036, 3222962614, 2784967409, 746176814, 3114314420,
+                2338605642, 352298425,
+            ]
+        );
+        assert!(
+            first.iter().all(|token| matches!(*token, 1 | 3 | 5)),
+            "threshold top-k must retain boundary ties and exclude lower logits"
+        );
+        let mut replay = snapshot;
+        let second = (0..32)
+            .map(|_| {
+                engine
+                    .sample_f32(&logits, &stochastic, &mut replay)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(first, second, "snapshot replay must preserve draw order");
+        assert_eq!(state.cursor, replay.cursor);
+        assert_eq!(state.core, replay.core);
+        assert_eq!(state.block, replay.block);
+    }
+
+    #[test]
+    fn typed_depthwise_stream_matches_split_buffer_oracle_and_uses_one_ticket() {
+        use half::bf16;
+
+        if !depthwise_stream_available() {
+            eprintln!("depthwise stream opcodes unavailable on this runner - skipping");
+            return;
+        }
+        let engine = NativeEngine::new(4).expect("native engine init");
+        let before = engine.snapshot();
+        let cases = [
+            (1usize, 3usize, 1usize, 3usize, false),
+            (2, 5, 4, 3, true),
+            (1, 2, 2, 5, true),
+            (1, 4, 9, 1, false),
+        ];
+        for (batch, channels, steps, kernel, resumed) in cases {
+            let rows = batch * channels;
+            let prior = kernel - 1;
+            let bits = |i: usize, salt: usize| {
+                bf16::from_f32((((i * 17 + salt * 11) % 41) as f32 - 20.0) / 13.0).to_bits()
+            };
+            let x = (0..rows * steps).map(|i| bits(i, 1)).collect::<Vec<_>>();
+            let weights = (0..channels * kernel)
+                .map(|i| bits(i, 2))
+                .collect::<Vec<_>>();
+            let cache = resumed.then(|| (0..rows * prior).map(|i| bits(i, 3)).collect::<Vec<_>>());
+            let mut got = vec![0u16; rows * steps];
+            let mut got_state = vec![0u16; rows * prior];
+            assert!(engine.depthwise_stream_bf16(
+                &x,
+                cache.as_deref(),
+                &weights,
+                &mut got,
+                &mut got_state,
+                batch,
+                channels,
+                steps,
+                kernel,
+            ));
+
+            let mut expected = vec![0u16; got.len()];
+            let mut expected_state = vec![0u16; got_state.len()];
+            for row in 0..rows {
+                let channel = row % channels;
+                for t in 0..steps {
+                    let mut acc = 0.0f32;
+                    for j in 0..kernel {
+                        let source = t + j;
+                        let value = if source < prior {
+                            cache
+                                .as_ref()
+                                .map(|values| {
+                                    bf16::from_bits(values[row * prior + source]).to_f32()
+                                })
+                                .unwrap_or(0.0)
+                        } else {
+                            bf16::from_bits(x[row * steps + source - prior]).to_f32()
+                        };
+                        let weight = bf16::from_bits(weights[channel * kernel + j]).to_f32();
+                        acc = value.mul_add(weight, acc);
+                    }
+                    expected[row * steps + t] = bf16::from_f32(acc).to_bits();
+                }
+                for i in 0..prior {
+                    let source = steps + i;
+                    expected_state[row * prior + i] = if source < prior {
+                        cache
+                            .as_ref()
+                            .map(|values| values[row * prior + source])
+                            .unwrap_or(0)
+                    } else {
+                        x[row * steps + source - prior]
+                    };
+                }
+            }
+            assert_eq!(
+                got, expected,
+                "split stream mismatch for B={batch} D={channels} T={steps} K={kernel}"
+            );
+            assert_eq!(
+                got_state, expected_state,
+                "next-state mismatch for B={batch} D={channels} T={steps} K={kernel}"
+            );
+        }
+        let after = engine.snapshot();
+        assert_eq!(
+            after.pass_submissions - before.pass_submissions,
+            cases.len() as u64
+        );
+        assert_eq!(
+            after.pass_completions - before.pass_completions,
+            cases.len() as u64
+        );
+        assert_eq!(
+            after.bridge_dispatches - before.bridge_dispatches,
+            cases.len() as u64
+        );
+        assert!(after.fence_generations - before.fence_generations >= cases.len() as u64);
+    }
+
+    #[test]
+    fn typed_gemm_layouts_and_gemv_use_one_ticket_each() {
+        if !crate::bf16_gemm::bf16_gemm_available() {
+            eprintln!("native bf16 GEMM opcodes unavailable - skipping");
+            return;
+        }
+        let engine = NativeEngine::new(4).expect("native engine init");
+        let bits = |values: &[f32]| {
+            values
+                .iter()
+                .map(|value| half::bf16::from_f32(*value).to_bits())
+                .collect::<Vec<_>>()
+        };
+        let a = bits(&[1.0, 2.0, 3.0, 4.0]);
+        let b_kn = bits(&[5.0, 6.0, 7.0, 8.0, 9.0, 10.0]);
+        let w_nk = bits(&[5.0, 8.0, 6.0, 9.0, 7.0, 10.0]);
+        let expected = [21.0, 24.0, 27.0, 47.0, 54.0, 61.0];
+        let before = engine.snapshot();
+
+        let mut kn = [0.0f32; 6];
+        assert!(engine.bf16_gemm_f32(&a, &b_kn, &mut kn, 2, 3, 2, false));
+        assert_eq!(kn, expected);
+
+        let mut nk = [0.0f32; 6];
+        assert!(engine.bf16_gemm_f32(&a, &w_nk, &mut nk, 2, 3, 2, true));
+        assert_eq!(nk, expected);
+
+        let mut gemv = [0.0f32; 3];
+        assert!(engine.bf16_gemm_f32(&a[..2], &b_kn, &mut gemv, 1, 3, 2, false));
+        assert_eq!(gemv, expected[..3]);
+
+        let after = engine.snapshot();
+        assert_eq!(after.pass_submissions - before.pass_submissions, 3);
+        assert_eq!(after.pass_completions - before.pass_completions, 3);
+        assert_eq!(after.bridge_dispatches - before.bridge_dispatches, 3);
+        assert_eq!(after.descriptors_live, 0);
+    }
+
+    #[test]
+    fn typed_fft_grids_use_one_ticket_each() {
+        let engine = NativeEngine::new(4).expect("native engine init");
+        let (batch, channels, steps, fft) = (1usize, 2usize, 4usize, 8usize);
+        let input = [1.0f32, -2.0, 3.0, -4.0, 2.0, 4.0, -6.0, -8.0];
+        let kernel = vec![0.0f32; channels * (fft / 2 + 1) * 2];
+        let skip = [1.0f32, -0.5];
+        let mut conv = [0.0f32; 8];
+        let before = engine.snapshot();
+        assert!(engine.fft_conv_dd(&input, &kernel, &skip, &mut conv, batch, channels, steps, fft,));
+        assert_eq!(conv, [1.0, -2.0, 3.0, -4.0, -1.0, -2.0, 3.0, 4.0]);
+
+        let rows = 3usize;
+        let frequency = fft / 2 + 1;
+        let real = vec![0.0f32; rows * frequency];
+        let imag = vec![0.0f32; rows * frequency];
+        let mut inverse = vec![1.0f32; rows * fft];
+        assert!(engine.irfft_dd(
+            &real,
+            &imag,
+            &mut inverse,
+            rows,
+            fft,
+            crate::flashkern::dd::Dd::from_f32(1.0 / fft as f32),
+        ));
+        assert!(inverse.iter().all(|value| *value == 0.0));
+
+        let after = engine.snapshot();
+        assert_eq!(after.pass_submissions - before.pass_submissions, 2);
+        assert_eq!(after.pass_completions - before.pass_completions, 2);
+        assert_eq!(after.bridge_dispatches - before.bridge_dispatches, 2);
+        assert_eq!(after.descriptors_live, 0);
+        // fft=8 has three radix-2 stages in each direction. Every signal crosses
+        // init, bit-reversal/stages, product/mirror, inverse, and output barriers;
+        // lane_program adds the one pass-completion fence.
+        // The typed IRFFT pass below contributes its final pass fence as well.
+        assert_eq!(after.fence_generations - before.fence_generations, 30);
+    }
+
+    #[test]
+    fn typed_fft_is_bit_exact_across_physical_lane_counts() {
+        let single = NativeEngine::new(1).expect("single-lane native engine init");
+        let group = NativeEngine::new(4).expect("four-lane native engine init");
+        let (batch, channels, steps, fft) = (2usize, 2usize, 7usize, 16usize);
+        let input = (0..batch * channels * steps)
+            .map(|i| ((i * 17 + 3) % 29) as f32 * 0.0625 - 0.75)
+            .collect::<Vec<_>>();
+        let kernel = (0..channels * (fft / 2 + 1) * 2)
+            .map(|i| ((i * 11 + 5) % 23) as f32 * 0.03125 - 0.25)
+            .collect::<Vec<_>>();
+        let skip = [0.375f32, -0.625];
+        let mut expected = vec![0.0f32; input.len()];
+        let mut actual = vec![0.0f32; input.len()];
+        assert!(single.fft_conv_dd(
+            &input,
+            &kernel,
+            &skip,
+            &mut expected,
+            batch,
+            channels,
+            steps,
+            fft,
+        ));
+        let before = group.snapshot();
+        assert!(group.fft_conv_dd(
+            &input,
+            &kernel,
+            &skip,
+            &mut actual,
+            batch,
+            channels,
+            steps,
+            fft,
+        ));
+        let after = group.snapshot();
+        assert_eq!(
+            actual
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(after.pass_submissions - before.pass_submissions, 1);
+        assert_eq!(after.pass_completions - before.pass_completions, 1);
+        assert_eq!(after.bridge_dispatches - before.bridge_dispatches, 1);
+        // Four signals, four radix-2 stages in each direction, plus the final
+        // pass fence. This proves the physical lane team executed the staged grid.
+        assert_eq!(after.fence_generations - before.fence_generations, 65);
+        assert_eq!(after.descriptors_live, 0);
+    }
+
+    #[test]
+    fn typed_depth_plans_coexist_and_use_one_ticket_per_frame() {
+        use crate::flashkern::decode::{DepthHead, DepthLayer, DepthPlan, PtrLen};
+
+        let engine = NativeEngine::new(4).expect("native engine init");
+        let (dim, ffn, codebooks, backbone) = (4usize, 4usize, 2usize, 4usize);
+        let (heads, kv_heads, head_dim, vocab) = (1usize, 1usize, 4usize, 3usize);
+        let qkv = dim + 2 * kv_heads * head_dim;
+        let zeros_qkv = vec![0u16; qkv * dim];
+        let zeros_square = vec![0u16; dim * dim];
+        let ones = vec![0x3f80u16; dim];
+        let zeros_ffn = vec![0u16; ffn * dim];
+        let layer = DepthLayer {
+            qkv_w: PtrLen::from_u16(&zeros_qkv),
+            out_w: PtrLen::from_u16(&zeros_square),
+            q_ln: PtrLen::from_u16(&ones),
+            k_ln: PtrLen::from_u16(&ones),
+            opnorm: PtrLen::from_u16(&ones),
+            ffnnorm: PtrLen::from_u16(&ones),
+            w1: PtrLen::from_u16(&zeros_ffn),
+            w3: PtrLen::from_u16(&zeros_ffn),
+            w2: PtrLen::from_u16(&zeros_ffn),
+        };
+        let layers = [layer];
+        let table = vec![0u16; vocab * dim];
+        let depth_heads = [
+            DepthHead {
+                emb: PtrLen::from_u16(&table),
+                norm: PtrLen::from_u16(&ones),
+                logits: PtrLen::from_u16(&table),
+                vocab,
+            },
+            DepthHead {
+                emb: PtrLen::from_u16(&table),
+                norm: PtrLen::from_u16(&ones),
+                logits: PtrLen::from_u16(&table),
+                vocab,
+            },
+        ];
+        let depth_w = vec![0u16; codebooks * dim * backbone];
+        let depth_b = vec![0u16; codebooks * dim];
+        let rope_cos = vec![1.0f32; codebooks * head_dim / 2];
+        let rope_sin = vec![0.0f32; rope_cos.len()];
+        let plan = DepthPlan {
+            size: std::mem::size_of::<DepthPlan>() as u32,
+            abi_version: 1,
+            dim: dim as u32,
+            heads: heads as u32,
+            kv_heads: kv_heads as u32,
+            head_dim: head_dim as u32,
+            ffn_dim: ffn as u32,
+            codebooks: codebooks as u32,
+            backbone_dim: backbone as u32,
+            eps: 1e-5,
+            depth_linear_w: PtrLen::from_u16(&depth_w),
+            depth_linear_b: PtrLen::from_u16(&depth_b),
+            rope_cos: PtrLen::from_f32(&rope_cos),
+            rope_sin: PtrLen::from_f32(&rope_sin),
+            layers: layers.as_ptr(),
+            layer_count: layers.len(),
+            codebook_heads: depth_heads.as_ptr(),
+            codebook_head_count: depth_heads.len(),
+        };
+
+        let first = engine.depth_build(&plan).expect("first depth plan");
+        let second = engine.depth_build(&plan).expect("second depth plan");
+        assert_ne!(first, second, "depth plan identities must be unique");
+        let hidden = [0u16; 4];
+        let config = SampleConfig::new(None, None);
+        let mut state = PrngState::from_seed(17).expect("seed");
+        let mut tokens = [u32::MAX; 2];
+        let before = engine.snapshot();
+        assert!(engine.depth_frame(first, &hidden, &config, &mut state, &mut tokens));
+        let after = engine.snapshot();
+        assert_eq!(tokens, [0, 0]);
+        assert_eq!(after.pass_submissions - before.pass_submissions, 1);
+        assert_eq!(after.pass_completions - before.pass_completions, 1);
+        assert_eq!(after.bridge_dispatches - before.bridge_dispatches, 1);
+        assert!(after.fence_generations > before.fence_generations);
+        assert_eq!(after.descriptors_live, 0);
+
+        engine.depth_clear(first);
+        assert!(!engine.depth_frame(first, &hidden, &config, &mut state, &mut tokens));
+        assert!(engine.depth_frame(second, &hidden, &config, &mut state, &mut tokens));
+        engine.depth_clear(second);
+        assert!(!engine.depth_frame(second, &hidden, &config, &mut state, &mut tokens));
     }
 
     #[test]
@@ -1452,135 +2144,159 @@ mod tests {
     }
 
     #[test]
-    fn native_engine_ctx_single_tenant() {
-        // Two installs cannot coexist (the two-model clobber): the second build is
-        // refused while the first is live; a refused/stale id cannot clear the
-        // owner's table; releasing the owner reopens the slot.
+    fn native_engine_keeps_multiple_model_plans_resident() {
+        // Different geometries force every pass to resolve its own plan. Alternating
+        // them catches both the old single-slot refusal and accidental reuse of the
+        // most recently selected descriptor table.
         let _ctx = CTX_TEST_LOCK.lock().unwrap();
         if !crate::flashkern::decode::fused_mlp_available() {
             eprintln!("fused kernels unavailable — skipping");
             return;
         }
         let engine = process_engine();
-        let h = 64usize;
-        let k = 3usize;
-        let i = 96usize;
-        let op_norm = vec![0x3f80u16; h];
-        let ffn_norm = vec![0x3f80u16; h];
-        let in_w = vec![0u16; 3 * h * h];
-        let conv_w = vec![0u16; h * k];
-        let out_w = vec![0u16; h * h];
-        let w1 = vec![0u16; i * h];
-        let w3 = vec![0u16; i * h];
-        let w2 = vec![0u16; h * i];
-        let descs = [LayerDesc {
+        let (h1, i1, k1) = (64usize, 96usize, 3usize);
+        let op1 = vec![0x3f80u16; h1];
+        let fn1 = vec![0x3f80u16; h1];
+        let in1 = vec![0u16; 3 * h1 * h1];
+        let conv1 = vec![0u16; h1 * k1];
+        let out1w = vec![0u16; h1 * h1];
+        let w11 = vec![0u16; i1 * h1];
+        let w31 = vec![0u16; i1 * h1];
+        let w21 = vec![0u16; h1 * i1];
+        let desc1 = [LayerDesc {
             kind: 0,
-            k: k as u32,
+            k: k1 as u32,
             op_eps: 1e-5,
             ffn_eps: 1e-5,
-            op_norm_w: op_norm.as_ptr(),
-            ffn_norm_w: ffn_norm.as_ptr(),
-            in_w: in_w.as_ptr(),
-            conv_w: conv_w.as_ptr(),
-            out_w: out_w.as_ptr(),
-            w1: w1.as_ptr(),
-            w3: w3.as_ptr(),
-            w2: w2.as_ptr(),
+            op_norm_w: op1.as_ptr(),
+            ffn_norm_w: fn1.as_ptr(),
+            in_w: in1.as_ptr(),
+            conv_w: conv1.as_ptr(),
+            out_w: out1w.as_ptr(),
+            w1: w11.as_ptr(),
+            w3: w31.as_ptr(),
+            w2: w21.as_ptr(),
             ..LayerDesc::attn_placeholder()
         }];
-        let first = engine.ctx_build(&descs, h, i, 64).expect("first build");
-        assert!(
-            engine.ctx_build(&descs, h, i, 64).is_none(),
-            "second install must be refused while the first is live"
-        );
-        // A stale/foreign id must not release the owner's install.
-        engine.ctx_clear(first + 1);
-        let x = vec![0u16; h];
-        let state = vec![0u16; h * (k - 1)];
-        let mut state_out = vec![0u16; h * (k - 1)];
-        let mut out = vec![0u16; h];
-        assert!(
-            engine.conv_layer(first, 0, &x, &state, &mut state_out, &mut out, 1),
-            "owner's table must survive a stale clear"
-        );
-        assert!(
-            !engine.conv_layer(first + 1, 0, &x, &state, &mut state_out, &mut out, 1),
-            "a foreign context id must not execute against the live table"
-        );
-        let short_input = vec![0u16; state.len() - 1];
-        let mut short_state = vec![0u16; state.len() - 1];
-        assert!(
-            !engine.conv_layer(first, 0, &x, &short_input, &mut short_state, &mut out, 1,),
-            "the native boundary must reject an undersized conv state"
-        );
+        let first = engine.ctx_build(&desc1, h1, i1, 64).expect("first build");
 
-        let vocab = 4usize;
-        let embed = vec![0u16; vocab * h];
-        let norm = vec![0x3f80u16; h];
-        assert!(!unsafe {
+        let (h2, i2, k2) = (96usize, 128usize, 2usize);
+        let op2 = vec![0x3f80u16; h2];
+        let fn2 = vec![0x3f80u16; h2];
+        let in2 = vec![0u16; 3 * h2 * h2];
+        let conv2 = vec![0u16; h2 * k2];
+        let out2w = vec![0u16; h2 * h2];
+        let w12 = vec![0u16; i2 * h2];
+        let w32 = vec![0u16; i2 * h2];
+        let w22 = vec![0u16; h2 * i2];
+        let desc2 = [LayerDesc {
+            kind: 0,
+            k: k2 as u32,
+            op_eps: 1e-5,
+            ffn_eps: 1e-5,
+            op_norm_w: op2.as_ptr(),
+            ffn_norm_w: fn2.as_ptr(),
+            in_w: in2.as_ptr(),
+            conv_w: conv2.as_ptr(),
+            out_w: out2w.as_ptr(),
+            w1: w12.as_ptr(),
+            w3: w32.as_ptr(),
+            w2: w22.as_ptr(),
+            ..LayerDesc::attn_placeholder()
+        }];
+        let second = engine.ctx_build(&desc2, h2, i2, 96).expect("second build");
+        assert_ne!(first, second, "resident plan identities must be unique");
+
+        const VOCAB: usize = 4;
+        let embed1 = vec![0u16; VOCAB * h1];
+        let norm1 = vec![0x3f80u16; h1];
+        let embed2 = vec![0u16; VOCAB * h2];
+        let norm2 = vec![0x3f80u16; h2];
+        assert!(unsafe {
             engine.set_heads(
-                first + 1,
-                embed.as_ptr(),
-                embed.len(),
-                vocab,
+                first,
+                embed1.as_ptr(),
+                embed1.len(),
+                VOCAB,
                 std::ptr::null(),
                 0,
                 0,
-                norm.as_ptr(),
-                norm.len(),
+                norm1.as_ptr(),
+                norm1.len(),
                 1e-5,
             )
         });
         assert!(unsafe {
             engine.set_heads(
-                first,
-                embed.as_ptr(),
-                embed.len(),
-                vocab,
+                second,
+                embed2.as_ptr(),
+                embed2.len(),
+                VOCAB,
                 std::ptr::null(),
                 0,
                 0,
-                norm.as_ptr(),
-                norm.len(),
+                norm2.as_ptr(),
+                norm2.len(),
                 1e-5,
             )
         });
-        let mut token_state = state.clone();
+
+        let x1 = vec![0u16; h1];
+        let state1 = vec![0u16; h1 * (k1 - 1)];
+        let mut next1 = vec![0u16; state1.len()];
+        let mut y1 = vec![0u16; h1];
+        let x2 = vec![0u16; h2];
+        let state2 = vec![0u16; h2 * (k2 - 1)];
+        let mut next2 = vec![0u16; state2.len()];
+        let mut y2 = vec![0u16; h2];
+        assert!(engine.conv_layer(first, 0, &x1, &state1, &mut next1, &mut y1, 1));
+        assert!(engine.conv_layer(second, 0, &x2, &state2, &mut next2, &mut y2, 1));
+        assert!(engine.conv_layer(first, 0, &x1, &state1, &mut next1, &mut y1, 1));
+        assert!(
+            !engine.conv_layer(first, 0, &x2, &state2, &mut next2, &mut y2, 1),
+            "ticket identity must select the first plan's geometry"
+        );
+
+        engine.ctx_clear(u64::MAX);
+        let mut token_state = state2.clone();
         let states = [LayerState {
             conv_state: token_state.as_mut_ptr(),
             conv_len: token_state.len(),
             ..LayerState::none()
         }];
-        let mut hidden = vec![0u16; h];
-        let mut short_logits = vec![0f32; vocab - 1];
-        assert!(
-            !unsafe {
-                engine.token_pass(
-                    first,
-                    &[0],
-                    0,
-                    &states,
-                    0,
-                    std::ptr::null(),
-                    std::ptr::null(),
-                    0,
-                    &mut hidden,
-                    Some(&mut short_logits),
-                    1,
-                )
-            },
-            "the native boundary must reject an undersized logits buffer"
-        );
-        // The owner's clear releases the slot; a new install then succeeds.
+        let mut hidden = vec![0u16; h2];
+        let config = SampleConfig::new(None, None);
+        let mut sampling = PrngState::from_seed(9).expect("seed");
+        let mut token = u32::MAX;
+        assert!(unsafe {
+            engine.token_pass(
+                second,
+                &[0],
+                0,
+                &states,
+                0,
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                &mut hidden,
+                None,
+                Some(&config),
+                Some(&mut sampling),
+                Some(&mut token),
+                1,
+            )
+        });
+        assert_eq!(token, 0, "flat tied logits must choose the first argmax");
+
         engine.ctx_clear(first);
         assert!(
-            !engine.conv_layer(first, 0, &x, &state, &mut state_out, &mut out, 1),
-            "cleared table must refuse passes"
+            !engine.conv_layer(first, 0, &x1, &state1, &mut next1, &mut y1, 1),
+            "cleared plan must refuse passes"
         );
-        let second = engine
-            .ctx_build(&descs, h, i, 64)
-            .expect("post-release build");
-        assert_ne!(first, second, "install ids must be unique");
+        assert!(
+            engine.conv_layer(second, 0, &x2, &state2, &mut next2, &mut y2, 1),
+            "clearing one plan must leave the other resident"
+        );
         engine.ctx_clear(second);
     }
 
@@ -1694,55 +2410,48 @@ mod tests {
     #[test]
     fn raw_engine_rejects_concurrent_request_before_payload_write() {
         let engine = NativeEngine::new(2).expect("native engine init");
-        let gate = Arc::new(RawGate {
-            state: Mutex::new((0, false)),
-            ready: Condvar::new(),
-        });
         let engine_address = engine.ptr as usize;
-        let gate_address = Arc::as_ptr(&gate) as usize;
-        let first = std::thread::spawn(move || unsafe {
-            lfm_engine_call(
-                engine_address as *mut c_void,
-                block_raw_lane,
-                gate_address as *mut c_void,
-            )
-        });
-
-        let mut state = gate.state.lock().unwrap();
-        while state.0 != 2 {
-            state = gate.ready.wait(state).unwrap();
-        }
-        drop(state);
-
-        let (send, recv) = std::sync::mpsc::channel();
-        let contender = std::thread::spawn(move || {
-            let rc = unsafe {
-                lfm_engine_call(
-                    engine_address as *mut c_void,
-                    noop_raw_lane,
-                    std::ptr::null_mut(),
-                )
-            };
-            send.send(rc).unwrap();
-        });
-        let immediate = recv.recv_timeout(std::time::Duration::from_millis(100));
-
-        let mut state = gate.state.lock().unwrap();
-        state.1 = true;
-        gate.ready.notify_all();
-        drop(state);
-
-        let rc = immediate.unwrap_or_else(|_| {
-            recv.recv_timeout(std::time::Duration::from_secs(2))
-                .unwrap()
-        });
-        assert_eq!(
-            rc,
-            -libc::EBUSY,
-            "raw contender entered the single-slot engine"
-        );
-        assert_eq!(first.join().unwrap(), 0);
-        contender.join().unwrap();
+        const N: usize = 1024;
+        const ROWS: usize = 8;
+        let frequency = N / 2 + 1;
+        let real = Arc::new(vec![0.25f32; ROWS * frequency]);
+        let imag = Arc::new(vec![-0.125f32; ROWS * frequency]);
+        let start = Arc::new(Barrier::new(3));
+        let calls = (0..2)
+            .map(|_| {
+                let real = Arc::clone(&real);
+                let imag = Arc::clone(&imag);
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    let mut out = vec![0.0f32; ROWS * N];
+                    start.wait();
+                    // SAFETY: this deliberately bypasses the Rust pass lock to prove
+                    // the native claim protects request storage before payload writes.
+                    unsafe {
+                        lfm_engine_irfft_dd(
+                            engine_address as *mut c_void,
+                            real.as_ptr(),
+                            real.len(),
+                            imag.as_ptr(),
+                            imag.len(),
+                            out.as_mut_ptr(),
+                            out.len(),
+                            ROWS,
+                            N,
+                            1.0 / N as f32,
+                            0.0,
+                        )
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        start.wait();
+        let mut results = calls
+            .into_iter()
+            .map(|call| call.join().unwrap())
+            .collect::<Vec<_>>();
+        results.sort_unstable();
+        assert_eq!(results, [-libc::EBUSY, 0]);
     }
 
     #[test]
@@ -1751,7 +2460,9 @@ mod tests {
         // the no-submitter failure path cannot hide behind NativeEngine::new.
         let raw = unsafe { lfm_engine_new(2) };
         assert!(!raw.is_null());
-        let rc = unsafe { lfm_engine_call(raw, noop_raw_lane, std::ptr::null_mut()) };
+        let mut state = PrngState::from_seed(7).expect("seed");
+        let mut value = 0u64;
+        let rc = unsafe { lfm_engine_prng_fill(raw, &mut state, &mut value, 1) };
         assert_eq!(rc, -libc::ENOTCONN);
 
         let mut snapshot = EngineSnapshot {
@@ -1777,11 +2488,13 @@ mod tests {
         const LANES: u64 = 8;
         const FENCES_PER_PASS: u64 = 2;
         let start = std::time::Instant::now();
+        let mut state = PrngState::from_seed(11).expect("seed");
+        let mut value = [0u64; 1];
         for pass in 0..PASSES {
-            // SAFETY: the engine is live, no other caller shares it, and `ctx` is the
-            // same engine pointer consumed synchronously by every fixed lane.
-            let rc = unsafe { lfm_engine_call(engine.ptr, fence_raw_lane, engine.ptr) };
-            assert_eq!(rc, 0, "pass {pass} did not complete");
+            assert!(
+                engine.prng_fill(&mut state, &mut value),
+                "pass {pass} did not complete"
+            );
         }
         let stats = engine.snapshot();
         let coordinator = engine.coordinator.snapshot();

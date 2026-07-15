@@ -1,5 +1,5 @@
-//! GPU dispatch model, simulated on the CPU. flashkern's single-stage ops (GEMM, reductions)
-//! only need SIMD lanes + a rayon fan-out. The *multi-stage* Metal kernels — `FFTConv.metal`'s
+//! GPU dispatch model on the CPU. Flashkern's single-stage ops use SIMD leaves under typed
+//! fixed-team tickets. The *multi-stage* Metal kernels — `FFTConv.metal`'s
 //! `fft_radix2`/`fft_conv` (a `threadgroup_barrier` between every stage), the double-double
 //! `fft_conv_dd`, and `fused_monarch`'s forward and full-convolution pipelines (barriers +
 //! ping-pong through `threadgroup` memory) — need the full model. This module reproduces it
@@ -7,7 +7,7 @@
 //!
 //! | Metal                                   | here |
 //! |-----------------------------------------|------|
-//! | `dispatch_thread_groups(grid=(B,1,1))`  | rayon fan-out, one task per threadgroup |
+//! | `dispatch_thread_groups(grid=(B,1,1))`  | fixed native lanes or scoped reference teams |
 //! | one threadgroup = one simdgroup (lanes) | a scoped **thread team** of `lanes` workers |
 //! | `threadgroup float* shared`             | a shared `&mut [f32]` the lanes co-own |
 //! | `thread_position_in_threadgroup` (tid)  | the lane index; `for i=lane; i<N; i+=lanes` grid-stride |
@@ -17,13 +17,13 @@
 //! stage, and the `Barrier` (with its Acquire/Release fence) guarantees a stage's writes are
 //! visible before the next stage reads them — the exact contract of `threadgroup_barrier`.
 
-use super::dd::{self, CDd, Dd};
+use super::dd::Dd;
 use std::sync::Barrier;
 
 /// A `*mut T` shared across the lane team — the CPU analog of `threadgroup` memory. Lanes
 /// write disjoint indices within a barrier-delimited stage, so aliasing never occurs; the
 /// `Barrier` between stages provides the fence that makes writes visible (as on the GPU).
-/// (`T` is `f32` for the f32 kernels, [`CDd`] for the double-double ones.)
+/// (`T` is `f32` in the remaining Rust reference kernels.)
 pub(crate) struct Shared<T>(pub(crate) *mut T);
 // SAFETY: sharing is sound because (a) within a stage every lane touches a disjoint index set
 // and (b) `Barrier` fences separate stages, so there is never a concurrent read+write or
@@ -43,6 +43,7 @@ impl<T: Copy> Shared<T> {
     /// precise capture would otherwise capture the bare `*mut` field (not `Shared`) and
     /// lose the Send/Sync impls this wrapper exists to carry.
     #[inline]
+    #[cfg(test)]
     pub(crate) fn ptr(self) -> *mut T {
         self.0
     }
@@ -408,182 +409,6 @@ pub fn irfft(input: &[f32], out: &mut [f32], n: usize, seqlen: usize, lanes: usi
     }
 }
 
-// The per-lane radix-2 FFT in DOUBLE-DOUBLE — the CPU port of `fft_radix2_dd` in
-// FFTConvDd.metal. Same butterfly structure as [`fft_lane`], but the state is [`CDd`]
-// threadgroup memory, the arithmetic is the dd toolkit's (`cdd_mul`/`cdd_add`/`cdd_sub`),
-// and the twiddles come from the host-precomputed f64→dd table (`tw[j] = exp(−2πi·j/n)`,
-// j < n/2) instead of in-kernel f32 cos/sin — index `k·(n >> (stage+1))` == `k·(n/len)`.
-fn fft_dd_lane(
-    shared: Shared<CDd>,
-    tw: &[CDd],
-    n: usize,
-    lane: usize,
-    lanes: usize,
-    barrier: &Barrier,
-) {
-    let log2n = n.trailing_zeros();
-    let mut i = lane;
-    while i < n {
-        let mut rev = 0usize;
-        for bit in 0..log2n {
-            rev |= ((i >> bit) & 1) << (log2n - 1 - bit);
-        }
-        if i < rev {
-            // SAFETY: only lane `i` touches the (i,rev) pair; no other lane aliases it.
-            unsafe {
-                let (a, b) = (shared.get(i), shared.get(rev));
-                shared.set(i, b);
-                shared.set(rev, a);
-            }
-        }
-        i += lanes;
-    }
-    barrier.wait(); // threadgroup_barrier — bit-reverse visible before the butterflies
-
-    let mut len = 2usize;
-    while len <= n {
-        let half = len / 2;
-        let mut bf = lane;
-        while bf < n / 2 {
-            let g = bf / half;
-            let j = bf % half;
-            let a = g * len + j;
-            let b = a + half;
-            // twiddle(j, len) = exp(−2πi·j/len) = tw[j·(n/len)].
-            let w = tw[j * (n / len)];
-            // SAFETY: (a,b) is this butterfly's private pair for this stage.
-            unsafe {
-                let t = dd::cdd_mul(w, shared.get(b));
-                let u = shared.get(a);
-                shared.set(a, dd::cdd_add(u, t));
-                shared.set(b, dd::cdd_sub(u, t));
-            }
-            bf += lanes;
-        }
-        barrier.wait(); // threadgroup_barrier between butterfly stages
-        len <<= 1;
-    }
-}
-
-// The per-lane dd inverse FFT — `ifft_radix2_dd`: conjugate, forward dd FFT, conjugate +
-// dd-scale by 1/n (exact in f32: n is a power of two).
-fn ifft_dd_lane(
-    shared: Shared<CDd>,
-    tw: &[CDd],
-    n: usize,
-    lane: usize,
-    lanes: usize,
-    barrier: &Barrier,
-) {
-    let mut i = lane;
-    while i < n {
-        // SAFETY: each lane conjugates only its own grid-stride cells.
-        unsafe {
-            let z = shared.get(i);
-            shared.set(i, CDd::new(z.re, dd::dd_neg(z.im)));
-        }
-        i += lanes;
-    }
-    barrier.wait();
-
-    fft_dd_lane(shared, tw, n, lane, lanes, barrier);
-
-    let scale = Dd::from_f32(1.0 / n as f32);
-    let mut i = lane;
-    while i < n {
-        // SAFETY: each lane scales only its own grid-stride cells.
-        unsafe {
-            let z = shared.get(i);
-            shared.set(
-                i,
-                CDd::new(dd::dd_mul(z.re, scale), dd::dd_neg(dd::dd_mul(z.im, scale))),
-            );
-        }
-        i += lanes;
-    }
-    barrier.wait();
-}
-
-// One threadgroup: the double-double FFT convolution for one (batch, channel) — the CPU port
-// of `fft_conv_dd` in FFTConvDd.metal. Identical staging to [`fft_conv_threadgroup`], but the
-// whole rfft → ⊙k_f → irfft pipeline runs in dd ([`super::dd`]) with the f64→dd twiddle
-// table, and rounds ONCE at the store: `y = dd_to_float(re) + u·D`.
-#[allow(clippy::too_many_arguments)]
-fn fft_conv_dd_threadgroup(
-    u_bc: &[f32],
-    kf_c: &[f32],
-    d_c: f32,
-    y_bc: &mut [f32],
-    tw: &[CDd],
-    seqlen: usize,
-    fft_size: usize,
-    lanes: usize,
-) {
-    let half_sz = fft_size / 2 + 1;
-    // threadgroup complex_dd* shared.
-    let mut shared = vec![CDd::default(); fft_size];
-    let sh = Shared(shared.as_mut_ptr());
-    let y_sh = Shared(y_bc.as_mut_ptr());
-    let barrier = Barrier::new(lanes);
-    std::thread::scope(|scope| {
-        for lane in 0..lanes {
-            let barrier = &barrier;
-            scope.spawn(move || {
-                let mut i = lane;
-                while i < fft_size {
-                    // SAFETY: cell i is this lane's private grid-stride slot.
-                    unsafe {
-                        sh.set(
-                            i,
-                            if i < seqlen {
-                                CDd::from_f32(u_bc[i], 0.0)
-                            } else {
-                                CDd::default()
-                            },
-                        );
-                    }
-                    i += lanes;
-                }
-                barrier.wait();
-
-                fft_dd_lane(sh, tw, fft_size, lane, lanes, barrier);
-
-                let mut i = lane;
-                while i < half_sz {
-                    // SAFETY: lane reads+writes only its own cell i this stage.
-                    unsafe {
-                        let z = sh.get(i);
-                        sh.set(
-                            i,
-                            dd::cdd_mul(z, CDd::from_f32(kf_c[2 * i], kf_c[2 * i + 1])),
-                        );
-                    }
-                    i += lanes;
-                }
-                barrier.wait();
-
-                let mut i = half_sz + lane;
-                while i < fft_size {
-                    let mirror = fft_size - i;
-                    // SAFETY: reads first half (read-only this stage), writes own cell i.
-                    unsafe { sh.set(i, dd::cdd_conj(sh.get(mirror))) };
-                    i += lanes;
-                }
-                barrier.wait();
-
-                ifft_dd_lane(sh, tw, fft_size, lane, lanes, barrier);
-
-                let mut t = lane;
-                while t < seqlen {
-                    // SAFETY: output cell t is this lane's private grid-stride slot.
-                    unsafe { y_sh.set(t, dd::dd_to_f32(sh.get(t).re) + u_bc[t] * d_c) };
-                    t += lanes;
-                }
-            });
-        }
-    });
-}
-
 /// Double-double fused FFT convolution — the CPU port of `fft_conv_dd` in FFTConvDd.metal:
 /// same contract as [`fused_fft_conv`], but every butterfly, spectrum multiply, and the final
 /// normalization run in double-double with host-f64 twiddles, so the f32 output is the
@@ -625,24 +450,15 @@ pub fn fused_fft_conv_dd(
     );
     assert_eq!(d.len(), channels, "fused_fft_conv_dd: d.len() != C");
     assert_eq!(y.len(), u.len(), "fused_fft_conv_dd: y.len() != u.len()");
-    let lanes = lanes.clamp(1, fft_size);
-    // Host-side dd twiddle table (the "DD Taylor series" TODO, done in f64), shared read-only.
-    let tw = dd::fft_twiddles_dd(fft_size);
-    // One grid item per (batch,channel) signal on the KCORO LANE TEAM (rayon gone):
-    // signals write disjoint `seqlen` output rows and share only read-only tables, so
-    // any partition is bit-identical. The per-signal FFT (fft_conv_dd_threadgroup) is
-    // unchanged — its own `lanes` is an INTERNAL width, run serially within an item.
-    let n_sig = batch * channels;
-    let y_addr = y.as_mut_ptr() as usize;
+    // `lanes` remains in the compatibility API, but the resident engine is the
+    // authority for physical width. One typed ticket carries borrowed planes;
+    // C++ owns twiddles, scratch, double-double arithmetic, and signal fan-out.
+    let _ = lanes;
     let engine = crate::flashkern::native_engine::process_engine();
-    engine.grid(n_sig, move |bc| {
-        // SAFETY: disjoint output row [bc*seqlen, (bc+1)*seqlen); u/k_f/d/tw read-only.
-        let y_bc = unsafe { std::slice::from_raw_parts_mut((y_addr as *mut f32).add(bc * seqlen), seqlen) };
-        let u_bc = &u[bc * seqlen..(bc + 1) * seqlen];
-        let c = bc % channels;
-        let kf_c = &k_f[c * half_sz * 2..(c + 1) * half_sz * 2];
-        fft_conv_dd_threadgroup(u_bc, kf_c, d[c], y_bc, &tw, seqlen, fft_size, lanes);
-    });
+    assert!(
+        engine.fft_conv_dd(u, k_f, d, y, batch, channels, seqlen, fft_size),
+        "fused_fft_conv_dd: typed native pass refused"
+    );
 }
 
 /// Double-double inverse real FFT — the CPU port of `irfft_dd` in IrfftDd.metal (torch's
@@ -659,37 +475,11 @@ pub fn irfft_dd(re: &[f32], im: &[f32], out: &mut [f32], m: usize, n: usize, sca
     assert_eq!(re.len(), m * freq, "irfft_dd: re.len() != M·(n/2+1)");
     assert_eq!(im.len(), m * freq, "irfft_dd: im.len() != M·(n/2+1)");
     assert_eq!(out.len(), m * n, "irfft_dd: out.len() != M·n");
-    let n_even = n % 2 == 0;
-    let nyq = n / 2;
-    // tw[mm] = (cos, sin) of +2π·mm/n in dd; angle 2πkj/n folds to index (k·j) mod n.
-    let tw = dd::irfft_twiddles_dd(n);
-    // One grid item per output row on the KCORO LANE TEAM (rayon gone; flat grid, no
-    // barriers): rows write disjoint `n`-sample spans over read-only re/im/tw, so any
-    // partition is bit-identical. The inner per-sample dd math is untouched.
-    let out_addr = out.as_mut_ptr() as usize;
     let engine = crate::flashkern::native_engine::process_engine();
-    engine.grid(m, move |r| {
-        // SAFETY: disjoint output row [r*n, (r+1)*n); re/im/tw read-only.
-        let row = unsafe { std::slice::from_raw_parts_mut((out_addr as *mut f32).add(r * n), n) };
-        for (j, o) in row.iter_mut().enumerate() {
-            let mut acc = Dd::default();
-            for k in 0..freq {
-                let idx = (k * j) % n;
-                let cs = tw[idx];
-                let a = if k == 0 || (n_even && k == nyq) {
-                    1.0f32
-                } else {
-                    2.0f32
-                };
-                let re_dd = Dd::from_f32(re[r * freq + k]);
-                let im_dd = Dd::from_f32(im[r * freq + k]);
-                let mut t = dd::dd_sub(dd::dd_mul(re_dd, cs.re), dd::dd_mul(im_dd, cs.im));
-                t = dd::dd_mul(t, Dd::from_f32(a));
-                acc = dd::dd_add(acc, t);
-            }
-            *o = dd::dd_to_f32(dd::dd_mul(acc, scale));
-        }
-    });
+    assert!(
+        engine.irfft_dd(re, im, out, m, n, scale),
+        "irfft_dd: typed native pass refused"
+    );
 }
 // irfft_dd grid closure end.
 

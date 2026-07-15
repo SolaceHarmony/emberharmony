@@ -1091,8 +1091,8 @@ fn spawn_consumer<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
                             // exists solely so teardown's stop flag is seen
                             // promptly; idle cost drops from 200 polls/s to 10
                             // heartbeats/s with instant wake on real work.
-                            let _ = thread_ring
-                                .wait_for_input(std::time::Duration::from_millis(100));
+                            let _ =
+                                thread_ring.wait_for_input(std::time::Duration::from_millis(100));
                             continue;
                         }
                         if let Err(e) = output.write_mono_f32(&chunk) {
@@ -2302,7 +2302,11 @@ mod tests {
             None,
         )
         .expect("spawn consumer");
-        tx.send(VoiceEvent::Audio { pcm: vec![0.25, -0.25], rate: TEST_OUT_RATE }).unwrap();
+        tx.send(VoiceEvent::Audio {
+            pcm: vec![0.25, -0.25],
+            rate: TEST_OUT_RATE,
+        })
+        .unwrap();
         drop(tx);
         consumer.join().unwrap();
 
@@ -2372,7 +2376,11 @@ mod tests {
             Some(output),
         )
         .expect("spawn consumer");
-        tx.send(VoiceEvent::Audio { pcm: vec![0.25, -0.25], rate: TEST_OUT_RATE }).unwrap();
+        tx.send(VoiceEvent::Audio {
+            pcm: vec![0.25, -0.25],
+            rate: TEST_OUT_RATE,
+        })
+        .unwrap();
         drop(tx);
         consumer.join().unwrap();
 
@@ -2444,7 +2452,11 @@ mod tests {
             Some(output),
         )
         .expect("spawn consumer");
-        tx.send(VoiceEvent::Audio { pcm: vec![0.25, -0.25], rate: TEST_OUT_RATE }).unwrap();
+        tx.send(VoiceEvent::Audio {
+            pcm: vec![0.25, -0.25],
+            rate: TEST_OUT_RATE,
+        })
+        .unwrap();
         drop(tx);
         consumer.join().unwrap();
 
@@ -2567,13 +2579,21 @@ mod tests {
             Some(output),
         )
         .expect("spawn consumer");
-        tx.send(VoiceEvent::Audio { pcm: vec![0.25, -0.25], rate: TEST_OUT_RATE }).unwrap();
+        tx.send(VoiceEvent::Audio {
+            pcm: vec![0.25, -0.25],
+            rate: TEST_OUT_RATE,
+        })
+        .unwrap();
         entered_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("first write started");
 
         flush.store(true, Ordering::SeqCst);
-        tx.send(VoiceEvent::Audio { pcm: vec![0.5, -0.5], rate: TEST_OUT_RATE }).unwrap();
+        tx.send(VoiceEvent::Audio {
+            pcm: vec![0.5, -0.5],
+            rate: TEST_OUT_RATE,
+        })
+        .unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
         while audio.snapshot().queued_samples < 4 {
             if Instant::now() >= deadline {
@@ -2664,13 +2684,25 @@ mod tests {
         .expect("spawn consumer");
 
         // Chunk 1 → worker grabs it and blocks in the first write.
-        tx.send(VoiceEvent::Audio { pcm: vec![0.1, 0.1], rate: TEST_OUT_RATE }).unwrap();
+        tx.send(VoiceEvent::Audio {
+            pcm: vec![0.1, 0.1],
+            rate: TEST_OUT_RATE,
+        })
+        .unwrap();
         entered_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("first write started");
         // Chunks 2 & 3 → pile up in the output ring as the residual tail.
-        tx.send(VoiceEvent::Audio { pcm: vec![0.2, 0.2], rate: TEST_OUT_RATE }).unwrap();
-        tx.send(VoiceEvent::Audio { pcm: vec![0.3, 0.3], rate: TEST_OUT_RATE }).unwrap();
+        tx.send(VoiceEvent::Audio {
+            pcm: vec![0.2, 0.2],
+            rate: TEST_OUT_RATE,
+        })
+        .unwrap();
+        tx.send(VoiceEvent::Audio {
+            pcm: vec![0.3, 0.3],
+            rate: TEST_OUT_RATE,
+        })
+        .unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
         while audio.snapshot().queued_samples < 6 {
             if Instant::now() >= deadline {

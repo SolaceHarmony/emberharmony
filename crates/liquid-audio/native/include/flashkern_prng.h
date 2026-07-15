@@ -49,6 +49,11 @@ int lfm_prng_seed_system(LfmPrngStateV1 *state);
 int lfm_prng_seed_material(LfmPrngStateV1 *state, const uint8_t *key,
                            const uint8_t *nonce);
 
+/* Deterministic conversation seed. SplitMix64 expands the public 64-bit seed
+ * into the ChaCha key and nonce; generation then uses the same snapshotable
+ * stream as system-seeded conversations. */
+int lfm_prng_seed_u64(LfmPrngStateV1 *state, uint64_t seed);
+
 /* Fill caller-owned output and advance `state` in place. ChaCha block expansion
  * is implemented by the selected architecture assembly kernel. */
 int lfm_prng_fill_u64(LfmPrngStateV1 *state, uint64_t *out, size_t count);

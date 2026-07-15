@@ -166,7 +166,7 @@ flowchart TB
     Vad["VAD / turn detector\nbarge-in + flush"]
     UttQ["bounded utterance queue\nsize 1"]
     Infer["persistent inference std::thread\nowns outer Lfm2VoiceEngine + ChatState + Mimi"]
-    Rim["blocking CPU pass rim\nborrowed Candle buffers"]
+    Rim["blocking CPU pass rim\nborrowed model buffers"]
     Coord["Rust kcoro\nSQ broker + CQ ingress"]
     Bridge["native descriptor pool\n1-cell SQ/CQ + doorbells"]
     Flash["fixed C++ Flashkern lanes\nNEON / AVX / assembly"]
@@ -215,9 +215,10 @@ client/session lifecycle lives in Rust, not in the webview and not in a bundled 
 
 The broker loop in this diagram is mounted only for eligible CPU Flashkern passes.
 The outer call remains synchronous because its numerical pointers are still
-borrowed from Candle-owned storage. Sampling, recurrence, model lifecycle, audio,
-and Tauri observation remain outside this pass edge; the target documents describe
-their removal or remounting.
+borrowed from model-owned storage. Text and Depthformer sampling now execute inside
+their typed native passes. Outer turn recurrence, model lifecycle, audio, and Tauri
+observation remain outside this pass edge; the target documents describe their
+removal or remounting.
 
 ---
 

@@ -52,8 +52,7 @@ fn detect_features() -> X86Features {
 // ---- FFI to native/kernels/x86_64/flashkern_x86.cpp (x86_64, kernel built in) ----------------------------------
 #[cfg(target_arch = "x86_64")]
 extern "C" {
-    fn lfm_bf16_gemm_f32_v2(a: *const u16, b: *const u16, c: *mut f32, m: i32, n: i32, k: i32);
-    fn lfm_bf16_gemv_f32(a: *const u16, b: *const u16, c: *mut f32, n: i32, k: i32);
+    #[cfg(test)]
     fn lfm_bf16_gemm_nt_f32(a: *const u16, w: *const u16, c: *mut f32, m: i32, n: i32, k: i32);
     fn lfm_s8_gemm_s32(a: *const i8, b: *const i8, c: *mut i32, m: i32, n: i32, k: i32);
     fn lfm_reduce_sum_f32(x: *const f32, n: i32) -> f32;
@@ -109,14 +108,12 @@ extern "C" {
 
 /// `true` when flashkern's bf16 GEMM is built in and the CPU meets its baseline (AVX2 + FMA).
 pub fn bf16_gemm_available() -> bool {
-    cfg!(target_arch = "x86_64")
-        && x86_features().avx2
-        && x86_features().fma
+    cfg!(target_arch = "x86_64") && x86_features().avx2 && x86_features().fma
 }
 
 /// `C(M,N) f32 = A(M,K) bf16 · B(K,N) bf16` (raw bf16 bits as `u16`), row-major, f32
-/// accumulate. Fans out over M-row blocks with rayon (the CPU fan-out); each block runs the
-/// SIMD micro-kernel (VDPBF16PS when AVX-512-BF16 is present, else AVX2). B is shared.
+/// accumulate. One typed kcoro ticket fans native row bands into the SIMD micro-kernel
+/// (VDPBF16PS when AVX-512-BF16 is present, otherwise AVX2). B remains borrowed and shared.
 /// **Precondition:** AVX2 + FMA — verify [`bf16_gemm_available`] first. Slices sized `M*K`,
 /// `K*N`, `M*N`.
 #[cfg(target_arch = "x86_64")]
@@ -129,32 +126,11 @@ pub fn bf16_gemm_into(a: &[u16], b: &[u16], c: &mut [f32], m: usize, n: usize, k
     if m == 0 || n == 0 || k == 0 {
         return;
     }
-    if m == 1 {
-        // SAFETY: slices sized K / K*N / N; AVX2+FMA asserted above.
-        unsafe { lfm_bf16_gemv_f32(a.as_ptr(), b.as_ptr(), c.as_mut_ptr(), n as i32, k as i32) };
-        return;
-    }
-    // Row-block dispatch on the KCORO LANE TEAM (rayon gone; NEON twin's shape): each
-    // output row is an independent dot, so any row partition is bit-identical.
     let engine = crate::flashkern::native_engine::process_engine();
-    let rows = (m.div_ceil(engine.lanes_total().max(1))).max(1);
-    let n_tiles = m.div_ceil(rows);
-    let (a_addr, b_addr, c_addr) = (a.as_ptr() as usize, b.as_ptr() as usize, c.as_mut_ptr() as usize);
-    engine.grid(n_tiles, move |tile| {
-        let r0 = tile * rows;
-        let mm = rows.min(m - r0);
-        // SAFETY: disjoint C row-block [r0,r0+mm); A aligned; b read-only K*N.
-        unsafe {
-            lfm_bf16_gemm_f32_v2(
-                (a_addr as *const u16).add(r0 * k),
-                b_addr as *const u16,
-                (c_addr as *mut f32).add(r0 * n),
-                mm as i32,
-                n as i32,
-                k as i32,
-            );
-        }
-    });
+    assert!(
+        engine.bf16_gemm_f32(a, b, c, m, n, k, false),
+        "bf16_gemm_into: typed native pass refused"
+    );
 }
 
 /// Native-layout small-M matmul: `C(M,N) f32 = A(M,K) bf16 · W(N,K)ᵀ` with the weight in its
@@ -170,49 +146,17 @@ pub fn bf16_gemm_nt_into(a: &[u16], w_nk: &[u16], c: &mut [f32], m: usize, n: us
     if m == 0 || n == 0 || k == 0 {
         return;
     }
-    // M==1: independent output dots over disjoint W rows — rayon over N-chunks (identical
-    // per-output math, deterministic regardless of split). Same shape as the NEON twin.
-    if m == 1 {
-        // N-chunk dispatch on the KCORO LANE TEAM (rayon gone; NEON twin's shape):
-        // independent output dots over disjoint W rows, bit-identical for any split.
-        let engine = crate::flashkern::native_engine::process_engine();
-        let cols = n.div_ceil(engine.lanes_total().max(1)).max(64);
-        let n_tiles = n.div_ceil(cols);
-        let (a_addr, w_addr, c_addr) =
-            (a.as_ptr() as usize, w_nk.as_ptr() as usize, c.as_mut_ptr() as usize);
-        engine.grid(n_tiles, move |tile| {
-            let c0 = tile * cols;
-            let nn = cols.min(n - c0);
-            // SAFETY: a is K; disjoint C cols [c0,c0+nn); W rows aligned to c0.
-            unsafe {
-                lfm_bf16_gemm_nt_f32(
-                    a_addr as *const u16,
-                    (w_addr as *const u16).add(c0 * k),
-                    (c_addr as *mut f32).add(c0),
-                    1,
-                    nn as i32,
-                    k as i32,
-                )
-            };
-        });
-        return;
-    }
-    // SAFETY: slices sized M*K / N*K / M*N per the asserts; AVX2+FMA asserted above.
-    unsafe {
-        lfm_bf16_gemm_nt_f32(
-            a.as_ptr(),
-            w_nk.as_ptr(),
-            c.as_mut_ptr(),
-            m as i32,
-            n as i32,
-            k as i32,
-        )
-    };
+    let engine = crate::flashkern::native_engine::process_engine();
+    assert!(
+        engine.bf16_gemm_f32(a, w_nk, c, m, n, k, true),
+        "bf16_gemm_nt_into: typed native pass refused"
+    );
 }
 
 /// Raw pointer form of the nt dot kernel for lane-team callers ([`super::decode`]) — see the
 /// NEON twin. SAFETY: caller guarantees sizes and the AVX2+FMA precondition.
 #[cfg(target_arch = "x86_64")]
+#[cfg(test)]
 pub(crate) unsafe fn bf16_gemm_nt_raw(
     a: *const u16,
     w: *const u16,

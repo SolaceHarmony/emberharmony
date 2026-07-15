@@ -78,7 +78,9 @@ The exact current mount is narrower than the target ticket model:
   production parent/child ticket table;
 - successful CQ cells currently contain
   `completed + committed + committed + success` and no token/codebook IDs;
-  sampling and recurrence still occur in the Rust/Candle caller.
+  sampled IDs are written to borrowed result spans, sampling occurs inside the
+  typed native token and Depthformer passes, and outer turn recurrence remains
+  in the Rust caller.
 
 The source-exact sequence and capacities are in
 [`KCORO_ARENA_INTEGRATION.md`](../../docs/native/KCORO_ARENA_INTEGRATION.md#mounted-pass-sequence-4f06a3d5).

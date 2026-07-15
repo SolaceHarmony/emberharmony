@@ -18,53 +18,8 @@
 //! Weights are read zero-copy in their checkpoint-native `[N,K]` layout via the nt dot
 //! kernel; each lane owns a contiguous slice of output rows.
 
-use super::Shared;
-use std::sync::atomic::{AtomicUsize, Ordering};
-
-/// A spinning generation barrier for the temporary Rust lane program hosted on the
-/// resident engine team. AcqRel on the generation flip publishes each stage's shared-memory
-/// writes to every lane. It must never be scheduled on a work-stealing pool: every participant
-/// already owns a native worker for the duration of the program.
-pub(crate) struct SpinBarrier {
-    lanes: usize,
-    count: AtomicUsize,
-    generation: AtomicUsize,
-}
-
-impl SpinBarrier {
-    pub(crate) fn new(lanes: usize) -> Self {
-        Self {
-            lanes,
-            count: AtomicUsize::new(0),
-            generation: AtomicUsize::new(0),
-        }
-    }
-
-    #[inline]
-    pub(crate) fn wait(&self) {
-        let gen = self.generation.load(Ordering::Acquire);
-        if self.count.fetch_add(1, Ordering::AcqRel) + 1 == self.lanes {
-            self.count.store(0, Ordering::Relaxed);
-            self.generation.fetch_add(1, Ordering::AcqRel); // release the cohort
-        } else {
-            while self.generation.load(Ordering::Acquire) == gen {
-                std::hint::spin_loop();
-            }
-        }
-    }
-}
-
-/// Stage fence for lane-uniform programs riding the resident engine team. Numerics never
-/// depend on the concrete fence implementation: banding and rounding ladders are identical.
-pub(crate) trait LaneFence: Sync {
-    fn wait(&self, lane: usize);
-}
-
-impl LaneFence for SpinBarrier {
-    fn wait(&self, _lane: usize) {
-        SpinBarrier::wait(self);
-    }
-}
+#[cfg(test)]
+use super::fanout::Shared;
 
 /// `true` when the fused decode blocks can run through the native-layout kernel.
 pub fn fused_mlp_available() -> bool {
@@ -89,6 +44,7 @@ pub(crate) fn rb_bits(f: f32) -> u16 {
 // The nt dot kernel over a lane's row range, arch-dispatched.
 // SAFETY: caller guarantees a=[K], w=n·K rows at `w`, c=n f32 at `c`, availability checked.
 #[allow(unused_variables)]
+#[cfg(test)]
 pub(crate) unsafe fn nt_rows(a: *const u16, w: *const u16, c: *mut f32, n: usize, k: usize) {
     #[cfg(target_arch = "aarch64")]
     super::neon::bf16_gemm_nt_raw(a, w, c, n, k);
@@ -115,12 +71,7 @@ pub struct FusedMlpWeights<'a> {
 /// 2. Lane's gate/up rows: `t[r] = rb(rb(silu(rb(g_r))) · rb(u_r))` — the op chain's rounds.
 /// 3. Lane's down rows + residual: `out[r] = rb(rb(y_r) + x[r])`.
 #[cfg(test)]
-pub(crate) fn fused_mlp_reference(
-    x: &[u16],
-    w: &FusedMlpWeights,
-    out: &mut [u16],
-    lanes: usize,
-) {
+pub(crate) fn fused_mlp_reference(x: &[u16], w: &FusedMlpWeights, out: &mut [u16], lanes: usize) {
     let h = x.len();
     let i = w.w1.len() / h;
     assert!(h > 0 && i > 0, "fused_mlp_reference: empty dims");
@@ -372,28 +323,24 @@ mod tests {
 }
 
 // ======================================================================================
-// Pure-NEON depthformer decode — candle stripped from the audio-frame hot loop.
+// Typed native Depthformer descriptors — Candle stripped from the audio-frame hot loop.
 //
 // Profiling showed `sample_audio_frame` (8 sequential codebook steps × 6 StandardBlocks,
-// per audio frame) dominating decode, every op a candle dispatch. This section runs the
-// whole frame as ONE threadgroup dispatch: lanes walk the codebook steps and layers with
-// spin barriers between stages; weights are read zero-copy from the checkpoint tensors;
-// KV lives in tiny resident f32 planes (cursor reset per frame — zero allocation); every
-// bf16 round sits exactly where the candle op chain rounds, so the flash path is
-// value-equivalent at the same tier as the fused MLP block.
+// per audio frame) dominating decode, every op a Candle dispatch. Rust now installs only
+// immutable pointer descriptors; C++ owns the frame program, scratch, KV planes, zero-spin
+// generation fences, and integrated sampler under one typed kcoro ticket.
 // ======================================================================================
 
 extern "C" {
-    fn lfm_bf16_sumsq_f32(x: *const u16, n: i32) -> f32;
     #[cfg(test)]
     fn lfm_bf16_sumsq_candle_f32(x: *const u16, n: i32) -> f32;
+    #[cfg(test)]
     fn lfm_bf16_rmsnorm(x: *const u16, w: *const u16, out: *mut u16, n: i32, inv_rms: f32);
+    #[cfg(test)]
     fn lfm_bf16_add(a: *const u16, b: *const u16, out: *mut u16, n: i32);
-    fn lfm_swiglu_bf16(g: *const f32, u: *const f32, out: *mut u16, n: i32);
     fn lfm_softmax_scaled_f32(x: *mut f32, n: i32, scale: f32);
     fn lfm_attn_qk_bf16(q: *const f32, k: *const u16, att: *mut f32, len: i32, hd: i32);
     fn lfm_attn_av_bf16(att: *const f32, v: *const u16, out: *mut f32, len: i32, hd: i32);
-    fn lfm_rope_i_f32(x: *mut f32, cos_p: *const f32, sin_p: *const f32, hd: i32);
     fn lfm_bf16_to_f32(x: *const u16, out: *mut f32, n: i32);
     fn lfm_f32_to_bf16(x: *const f32, out: *mut u16, n: i32);
 }
@@ -401,6 +348,7 @@ extern "C" {
 /// A raw view of a checkpoint tensor's storage, stored as `usize` so the ctx stays `Send`.
 /// SAFETY CONTRACT: the owning model outlives the ctx (both live in `LFM2AudioModel`), and
 /// candle storages are `Arc`-heap — moves of the model don't move the data.
+#[repr(C)]
 #[derive(Clone, Copy)]
 pub struct PtrLen {
     ptr: usize,
@@ -446,17 +394,27 @@ impl PtrLen {
             _ => None,
         }
     }
-    #[inline]
-    fn u16_ptr(&self) -> *const u16 {
-        self.ptr as *const u16
+
+    #[cfg(test)]
+    pub(crate) fn from_u16(values: &[u16]) -> Self {
+        Self {
+            ptr: values.as_ptr() as usize,
+            len: values.len(),
+        }
     }
-    #[inline]
-    fn f32_ptr(&self) -> *const f32 {
-        self.ptr as *const f32
+
+    #[cfg(test)]
+    pub(crate) fn from_f32(values: &[f32]) -> Self {
+        Self {
+            ptr: values.as_ptr() as usize,
+            len: values.len(),
+        }
     }
 }
 
-/// One depthformer StandardBlock's weights (bf16 bits, checkpoint layout).
+/// One depthformer StandardBlock's zero-copy weight descriptors. Layout mirrors
+/// `LfmDepthLayerV1`; the native build copies these descriptors, never payloads.
+#[repr(C)]
 pub struct DepthLayer {
     pub qkv_w: PtrLen,   // [dim + 2·kvh·hd, dim]
     pub out_w: PtrLen,   // [dim, dim]
@@ -470,6 +428,7 @@ pub struct DepthLayer {
 }
 
 /// One codebook's `SharedEmbedding` (embed table + pre-logits norm + tied head).
+#[repr(C)]
 pub struct DepthHead {
     pub emb: PtrLen,    // [vocab, dim]
     pub norm: PtrLen,   // [dim]
@@ -477,51 +436,40 @@ pub struct DepthHead {
     pub vocab: usize,
 }
 
-struct DepthScratch {
-    x: Vec<u16>,        // [dim] running hidden (bf16 bits)
-    h: Vec<u16>,        // [dim] post-attention residual
-    xn: Vec<u16>,       // [dim] normed input to qkv / glu
-    qkv_f: Vec<f32>,    // [qkv_out] GEMV accumulators
-    qkv_b: Vec<u16>,    // [qkv_out] rounded linear outputs
-    u_f: Vec<f32>,      // [ff] up-projection plane (w3)
-    y_b: Vec<u16>,      // [max plane] rounded-bits staging for residual adds
-    q_f: Vec<f32>,      // [heads·hd] post-rope f32 queries
-    attn_f: Vec<f32>,   // [dim] attention output (f32, per-head slices)
-    attn_b: Vec<u16>,   // [dim]
-    proj_f: Vec<f32>,   // [max(dim, ff, vocab)] general GEMV plane
-    t_b: Vec<u16>,      // [ff] gated intermediate
-    kplane: Vec<u16>,   // [layers][kvh][cap][hd] bf16 bits — torch's cache dtype
-    vplane: Vec<u16>,   // same
-    logits_b: Vec<u16>, // [vocab]
-    din_b: Vec<u16>,    // [codebooks·dim]
-    df_b: Vec<u16>,     // [dim] running depth token embedding
-    partials: Vec<f32>, // [lanes]
+#[repr(C)]
+pub(crate) struct DepthPlan {
+    pub(crate) size: u32,
+    pub(crate) abi_version: u32,
+    pub(crate) dim: u32,
+    pub(crate) heads: u32,
+    pub(crate) kv_heads: u32,
+    pub(crate) head_dim: u32,
+    pub(crate) ffn_dim: u32,
+    pub(crate) codebooks: u32,
+    pub(crate) backbone_dim: u32,
+    pub(crate) eps: f32,
+    pub(crate) depth_linear_w: PtrLen,
+    pub(crate) depth_linear_b: PtrLen,
+    pub(crate) rope_cos: PtrLen,
+    pub(crate) rope_sin: PtrLen,
+    pub(crate) layers: *const DepthLayer,
+    pub(crate) layer_count: usize,
+    pub(crate) codebook_heads: *const DepthHead,
+    pub(crate) codebook_head_count: usize,
 }
 
-/// The pure-NEON depthformer frame decoder. Built once from the model's tensors; per
-/// frame it runs one dispatch with zero allocation and zero candle ops.
+const _: [(); 16] = [(); std::mem::size_of::<PtrLen>()];
+const _: [(); 144] = [(); std::mem::size_of::<DepthLayer>()];
+const _: [(); 56] = [(); std::mem::size_of::<DepthHead>()];
+const _: [(); 136] = [(); std::mem::size_of::<DepthPlan>()];
+
+/// Resident typed Depthformer plan. C++ owns its mutable planes and copied
+/// descriptors; the model keeps the immutable checkpoint storage alive.
 pub struct DepthDecode {
-    pub dim: usize,
-    pub heads: usize,
-    pub kv_heads: usize,
-    pub hd: usize,
-    pub ff: usize,
-    pub codebooks: usize,
-    pub backbone_dim: usize,
-    pub eps: f32,
-    pub layers: Vec<DepthLayer>,
-    pub heads_w: Vec<DepthHead>,
-    pub depth_lin_w: PtrLen, // [codebooks·dim, backbone_dim]
-    pub depth_lin_b: PtrLen, // [codebooks·dim]
-    pub cos: PtrLen,         // [max_seq, hd/2] f32 rope table (layer-shared)
-    pub sin: PtrLen,
-    scratch: std::sync::Mutex<DepthScratch>,
+    id: u64,
+    backbone_dim: usize,
+    codebooks: usize,
 }
-
-// Send/Sync are compiler-derived: PtrLen stores addresses as usize, scratch sits behind a
-// Mutex (frame() locks it — concurrent frame() calls serialize instead of racing a RefCell
-// borrow flag, per review). Dereferencing the PtrLen views remains the documented contract:
-// the owning model outlives the ctx and candle storages are Arc-heap.
 
 impl DepthDecode {
     #[allow(clippy::too_many_arguments)]
@@ -539,564 +487,67 @@ impl DepthDecode {
         depth_lin_b: PtrLen,
         cos: PtrLen,
         sin: PtrLen,
-    ) -> Self {
-        let hd = dim / heads;
-        let qkv_out = dim + 2 * kv_heads * hd;
-        let vocab_max = heads_w.iter().map(|h| h.vocab).max().unwrap_or(0);
-        // proj_f serves every GEMV in the program — including stage 0's depth_linear whose
-        // output is codebooks·dim rows, the largest plane in the frame.
-        let plane = dim.max(ff).max(vocab_max).max(qkv_out).max(codebooks * dim);
-        let scratch = DepthScratch {
-            x: vec![0; dim],
-            h: vec![0; dim],
-            xn: vec![0; dim],
-            qkv_f: vec![0.0; qkv_out],
-            qkv_b: vec![0; qkv_out],
-            u_f: vec![0.0; ff],
-            y_b: vec![0; plane],
-            q_f: vec![0.0; heads * hd],
-            attn_f: vec![0.0; dim],
-            attn_b: vec![0; dim],
-            proj_f: vec![0.0; plane],
-            t_b: vec![0; ff],
-            kplane: vec![0; layers.len() * kv_heads * codebooks * hd],
-            vplane: vec![0; layers.len() * kv_heads * codebooks * hd],
-            logits_b: vec![0; vocab_max],
-            din_b: vec![0; codebooks * dim],
-            df_b: vec![0; dim],
-            partials: vec![0.0; 64],
-        };
-        Self {
-            dim,
-            heads,
-            kv_heads,
-            hd,
-            ff,
-            codebooks,
-            backbone_dim,
-            eps,
-            layers,
-            heads_w,
-            depth_lin_w,
-            depth_lin_b,
-            cos,
-            sin,
-            scratch: std::sync::Mutex::new(scratch),
+    ) -> Option<Self> {
+        const ABI: u32 = 1;
+        if heads == 0 || dim % heads != 0 || heads_w.len() != codebooks {
+            return None;
         }
+        let plan = DepthPlan {
+            size: std::mem::size_of::<DepthPlan>() as u32,
+            abi_version: ABI,
+            dim: dim.try_into().ok()?,
+            heads: heads.try_into().ok()?,
+            kv_heads: kv_heads.try_into().ok()?,
+            head_dim: (dim / heads).try_into().ok()?,
+            ffn_dim: ff.try_into().ok()?,
+            codebooks: codebooks.try_into().ok()?,
+            backbone_dim: backbone_dim.try_into().ok()?,
+            eps,
+            depth_linear_w: depth_lin_w,
+            depth_linear_b: depth_lin_b,
+            rope_cos: cos,
+            rope_sin: sin,
+            layers: layers.as_ptr(),
+            layer_count: layers.len(),
+            codebook_heads: heads_w.as_ptr(),
+            codebook_head_count: heads_w.len(),
+        };
+        crate::flashkern::native_engine::process_engine()
+            .depth_build(&plan)
+            .map(|id| Self {
+                id,
+                backbone_dim,
+                codebooks,
+            })
     }
 
-    /// One audio frame: backbone hidden (bf16 bits, `[backbone_dim]`) → `codebooks` tokens.
-    /// `sample` is called once per codebook with the rounded bf16 logits bits and must
-    /// return the chosen token (the caller wraps its seeded Sampler — same RNG stream as
-    /// the candle path). ONE dispatch; lanes walk steps/layers with spin barriers.
-    pub fn frame(
+    /// One typed native frame ticket. Hidden, sampler state, and the fixed token
+    /// result span remain borrowed until the exact kcoro completion resolves.
+    pub(crate) fn frame(
         &self,
         emb_bits: &[u16],
-        mut sample: impl FnMut(&[u16]) -> u32 + Send,
+        config: &crate::flashkern::native_engine::SampleConfig,
+        state: &mut crate::flashkern::native_engine::PrngState,
     ) -> Vec<u32> {
         assert_eq!(
             emb_bits.len(),
             self.backbone_dim,
             "depth frame: bad hidden size"
         );
+        let mut tokens = [u32::MAX; 64];
+        let out = &mut tokens[..self.codebooks];
         assert!(
-            self.codebooks <= 64,
-            "depth frame: att score buffer holds ≤64 steps"
+            crate::flashkern::native_engine::process_engine()
+                .depth_frame(self.id, emb_bits, config, state, out),
+            "DepthDecode::frame: native typed pass rejected"
         );
-        assert!(
-            self.hd <= 128,
-            "depth frame: per-head buffers hold ≤128 lanes"
-        );
-        let (dim, heads, kvh, hd, cb_n) =
-            (self.dim, self.heads, self.kv_heads, self.hd, self.codebooks);
-        let group = heads / kvh;
-        let qkv_out = dim + 2 * kvh * hd;
-        let scale = 1.0f32 / (hd as f32).sqrt();
-        let mut s = self.scratch.lock().expect("depth scratch poisoned");
-        let s = &mut *s;
-        // Lane count comes from OUR team, nothing else — depth-flash exists only on
-        // the engine (construction is engine-gated in build_depth_flash); a foreign
-        // pool has no authority over this kernel's width.
-        let engine = crate::flashkern::native_engine::process_engine();
-        let lanes = engine.lanes_total();
-        assert!(
-            (1..=16).contains(&lanes),
-            "depth frame: lane team width {lanes} outside the program's banding range"
-        );
-
-        // din = rb(depth_linear(emb) + bias): one GEMV over the backbone hidden, rounded
-        // per element — the linear_forward ladder. Fanned over lanes below (row slices).
-        let sh_din = Shared(s.din_b.as_mut_ptr());
-        let sh_x = Shared(s.x.as_mut_ptr());
-        let sh_h = Shared(s.h.as_mut_ptr());
-        let sh_xn = Shared(s.xn.as_mut_ptr());
-        let sh_qkvf = Shared(s.qkv_f.as_mut_ptr());
-        let sh_qkvb = Shared(s.qkv_b.as_mut_ptr());
-        let sh_uf = Shared(s.u_f.as_mut_ptr());
-        let sh_yb = Shared(s.y_b.as_mut_ptr());
-        let sh_qf = Shared(s.q_f.as_mut_ptr());
-        let sh_attnf = Shared(s.attn_f.as_mut_ptr());
-        let sh_attnb = Shared(s.attn_b.as_mut_ptr());
-        let sh_projf = Shared(s.proj_f.as_mut_ptr());
-        let sh_tb = Shared(s.t_b.as_mut_ptr());
-        let sh_k = Shared(s.kplane.as_mut_ptr());
-        let sh_v = Shared(s.vplane.as_mut_ptr());
-        let sh_log = Shared(s.logits_b.as_mut_ptr());
-        let sh_df = Shared(s.df_b.as_mut_ptr());
-        let sh_part = Shared(s.partials.as_mut_ptr());
-
-        let tokens: Vec<std::sync::atomic::AtomicU32> = (0..cb_n)
-            .map(|_| std::sync::atomic::AtomicU32::new(u32::MAX))
-            .collect();
-        let tokens = &tokens;
-        // The sampler runs on lane 0 between barriers; hand it the &mut via a take-once slot.
-        let sampler_cell = std::sync::Mutex::new(Some(&mut sample));
-        let this = &*self;
-
-        // The lane-uniform frame program: every lane runs the whole walk, `fence`
-        // separates the stages. On the engine team this is ONE doorbell per frame on
-        // the same kcoro lanes as the backbone — no rayon or process-wide dispatch lock.
-        // The temporary Rust frame uses its local SpinBarrier only because every participant
-        // already owns one of the resident workers for the whole frame.
-        let run_lane = |lane: usize, fence: &dyn LaneFence| {
-                    let mut sampler_slot = if lane == 0 {
-                        Some(
-                            sampler_cell
-                                .lock()
-                                .unwrap()
-                                .take()
-                                .expect("sampler taken once"),
-                        )
-                    } else {
-                        None
-                    };
-                    let own = |n: usize, l: usize| -> (usize, usize) {
-                        let c = n.div_ceil(lanes);
-                        ((l * c).min(n), ((l + 1) * c).min(n))
-                    };
-                    // GEMV helper over this lane's contiguous output rows: rows [r0,r1) of
-                    // W[n,k] dotted with a bf16 bits vector, into an f32 plane.
-                    let gemv = |w: &PtrLen,
-                                x_bits: *const u16,
-                                out: Shared<f32>,
-                                n: usize,
-                                k: usize,
-                                l: usize| {
-                        let (r0, r1) = {
-                            let c = n.div_ceil(lanes);
-                            ((l * c).min(n), ((l + 1) * c).min(n))
-                        };
-                        if r1 > r0 {
-                            // SAFETY: lane-private output rows; weight rows in bounds.
-                            unsafe {
-                                nt_rows(
-                                    x_bits,
-                                    w.u16_ptr().add(r0 * k),
-                                    out.ptr().add(r0),
-                                    r1 - r0,
-                                    k,
-                                );
-                            }
-                        }
-                    };
-
-                    // ---- stage 0: din = rb(depth_linear·emb + bias) ----
-                    gemv(
-                        &this.depth_lin_w,
-                        emb_bits.as_ptr(),
-                        sh_projf,
-                        cb_n * dim,
-                        this.backbone_dim,
-                        lane,
-                    );
-                    {
-                        let (r0, r1) = own(cb_n * dim, lane);
-                        // bias add in f32 (once per frame), then ONE slice round — the
-                        // linear_forward ladder: rb(dot + bias), a single rounding.
-                        for r in r0..r1 {
-                            // SAFETY: lane-private rows.
-                            unsafe {
-                                let b = f32::from_bits(
-                                    (*this.depth_lin_b.u16_ptr().add(r) as u32) << 16,
-                                );
-                                sh_projf.set(r, sh_projf.get(r) + b);
-                            }
-                        }
-                        if r1 > r0 {
-                            // SAFETY: lane-private slice.
-                            unsafe {
-                                lfm_f32_to_bf16(
-                                    sh_projf.ptr().add(r0),
-                                    sh_din.ptr().add(r0),
-                                    (r1 - r0) as i32,
-                                )
-                            };
-                        }
-                        // df_token starts at zero.
-                        let (d0, d1) = own(dim, lane);
-                        for i in d0..d1 {
-                            unsafe { sh_df.set(i, 0) };
-                        }
-                    }
-                    fence.wait(lane);
-
-                    for cb in 0..cb_n {
-                        // ---- cur = rb(din[cb] + df_token) → x ----
-                        {
-                            let (d0, d1) = own(dim, lane);
-                            if d1 > d0 {
-                                // SAFETY: lane-private cells; din row cb read-only.
-                                unsafe {
-                                    lfm_bf16_add(
-                                        sh_din.ptr().add(cb * dim + d0),
-                                        sh_df.ptr().add(d0),
-                                        sh_x.ptr().add(d0),
-                                        (d1 - d0) as i32,
-                                    );
-                                }
-                            }
-                        }
-                        fence.wait(lane);
-
-                        for (li, lw) in this.layers.iter().enumerate() {
-                            let kbase = (li * kvh) * cb_n * hd;
-                            // ---- operator_norm(x) → xn ----
-                            this.norm_stage(
-                                sh_x.ptr(),
-                                lw.opnorm,
-                                sh_xn,
-                                sh_part,
-                                dim,
-                                lane,
-                                lanes,
-                                fence,
-                            );
-                            // ---- qkv GEMV + per-row rb ----
-                            gemv(&lw.qkv_w, sh_xn.ptr(), sh_qkvf, qkv_out, dim, lane);
-                            {
-                                let (r0, r1) = own(qkv_out, lane);
-                                if r1 > r0 {
-                                    // SAFETY: lane-private rows.
-                                    unsafe {
-                                        lfm_f32_to_bf16(
-                                            sh_qkvf.ptr().add(r0),
-                                            sh_qkvb.ptr().add(r0),
-                                            (r1 - r0) as i32,
-                                        )
-                                    };
-                                }
-                            }
-                            fence.wait(lane);
-                            // ---- per-head qk-norm + rope; K/V rows into the resident planes ----
-                            {
-                                let total_heads = heads + kvh; // q heads then k heads
-                                let (h0, h1) = own(total_heads, lane);
-                                for hh in h0..h1 {
-                                    // SAFETY: each head's slices are lane-private this stage.
-                                    unsafe {
-                                        if hh < heads {
-                                            let src = sh_qkvb.ptr().add(hh * hd);
-                                            let mut bits = [0u16; 128];
-                                            this.qk_head_bits(
-                                                src,
-                                                lw.q_ln,
-                                                bits.as_mut_ptr(),
-                                                hd,
-                                                cb,
-                                            );
-                                            // q is consumed in f32 (the sdpa upcast point).
-                                            lfm_bf16_to_f32(
-                                                bits.as_ptr(),
-                                                sh_qf.ptr().add(hh * hd),
-                                                hd as i32,
-                                            );
-                                        } else {
-                                            let kh = hh - heads;
-                                            let src = sh_qkvb.ptr().add(dim + kh * hd);
-                                            this.qk_head_bits(
-                                                src,
-                                                lw.k_ln,
-                                                sh_k.ptr().add(kbase + (kh * cb_n + cb) * hd),
-                                                hd,
-                                                cb,
-                                            );
-                                            // V: the rb'd projection bits, verbatim (cache dtype).
-                                            let vsrc = sh_qkvb.ptr().add(dim + kvh * hd + kh * hd);
-                                            std::ptr::copy_nonoverlapping(
-                                                vsrc,
-                                                sh_v.ptr().add(kbase + (kh * cb_n + cb) * hd),
-                                                hd,
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                            fence.wait(lane);
-                            // ---- attention per q-head over the planes ----
-                            {
-                                let (h0, h1) = own(heads, lane);
-                                let len = cb + 1;
-                                let mut att = [0f32; 64];
-                                for qh in h0..h1 {
-                                    let kh = qh / group;
-                                    // SAFETY: score buf lane-local; planes read-only post-barrier;
-                                    // out slice lane-private.
-                                    unsafe {
-                                        lfm_attn_qk_bf16(
-                                            sh_qf.ptr().add(qh * hd),
-                                            sh_k.ptr().add(kbase + kh * cb_n * hd).cast_const(),
-                                            att.as_mut_ptr(),
-                                            len as i32,
-                                            hd as i32,
-                                        );
-                                        lfm_softmax_scaled_f32(att.as_mut_ptr(), len as i32, scale);
-                                        lfm_attn_av_bf16(
-                                            att.as_ptr(),
-                                            sh_v.ptr().add(kbase + kh * cb_n * hd).cast_const(),
-                                            sh_attnf.ptr().add(qh * hd),
-                                            len as i32,
-                                            hd as i32,
-                                        );
-                                    }
-                                }
-                            }
-                            fence.wait(lane);
-                            {
-                                let (d0, d1) = own(dim, lane);
-                                if d1 > d0 {
-                                    // SAFETY: lane-private cells; attn_f read-only post-barrier.
-                                    unsafe {
-                                        lfm_f32_to_bf16(
-                                            sh_attnf.ptr().add(d0),
-                                            sh_attnb.ptr().add(d0),
-                                            (d1 - d0) as i32,
-                                        )
-                                    };
-                                }
-                            }
-                            fence.wait(lane);
-                            // ---- out_proj + residual → h ----
-                            gemv(&lw.out_w, sh_attnb.ptr(), sh_projf, dim, dim, lane);
-                            {
-                                let (d0, d1) = own(dim, lane);
-                                if d1 > d0 {
-                                    // SAFETY: lane-private slices; ladder: rb(out_proj), rb(+x).
-                                    unsafe {
-                                        lfm_f32_to_bf16(
-                                            sh_projf.ptr().add(d0),
-                                            sh_yb.ptr().add(d0),
-                                            (d1 - d0) as i32,
-                                        );
-                                        lfm_bf16_add(
-                                            sh_yb.ptr().add(d0).cast_const(),
-                                            sh_x.ptr().add(d0).cast_const(),
-                                            sh_h.ptr().add(d0),
-                                            (d1 - d0) as i32,
-                                        );
-                                    }
-                                }
-                            }
-                            fence.wait(lane);
-                            // ---- ffn_norm(h) → xn; w1/w3 → swiglu → t; w2 + residual → x ----
-                            this.norm_stage(
-                                sh_h.ptr(),
-                                lw.ffnnorm,
-                                sh_xn,
-                                sh_part,
-                                dim,
-                                lane,
-                                lanes,
-                                fence,
-                            );
-                            gemv(&lw.w1, sh_xn.ptr(), sh_projf, this.ff, dim, lane);
-                            gemv(&lw.w3, sh_xn.ptr(), sh_uf, this.ff, dim, lane);
-                            {
-                                let (r0, r1) = own(this.ff, lane);
-                                if r1 > r0 {
-                                    // SAFETY: lane-private rows.
-                                    unsafe {
-                                        lfm_swiglu_bf16(
-                                            sh_projf.ptr().add(r0).cast_const(),
-                                            sh_uf.ptr().add(r0).cast_const(),
-                                            sh_tb.ptr().add(r0),
-                                            (r1 - r0) as i32,
-                                        );
-                                    }
-                                }
-                            }
-                            fence.wait(lane);
-                            gemv(&lw.w2, sh_tb.ptr(), sh_projf, dim, this.ff, lane);
-                            {
-                                let (d0, d1) = own(dim, lane);
-                                if d1 > d0 {
-                                    // SAFETY: lane-private slices; ladder: rb(w2·t), rb(+h).
-                                    unsafe {
-                                        lfm_f32_to_bf16(
-                                            sh_projf.ptr().add(d0),
-                                            sh_yb.ptr().add(d0),
-                                            (d1 - d0) as i32,
-                                        );
-                                        lfm_bf16_add(
-                                            sh_yb.ptr().add(d0).cast_const(),
-                                            sh_h.ptr().add(d0).cast_const(),
-                                            sh_x.ptr().add(d0),
-                                            (d1 - d0) as i32,
-                                        );
-                                    }
-                                }
-                            }
-                            fence.wait(lane);
-                        }
-
-                        // ---- get_logits: embedding_norm(x) → to_logits GEMV → rb → sample ----
-                        let hw = &this.heads_w[cb];
-                        this.norm_stage(
-                            sh_x.ptr(),
-                            hw.norm,
-                            sh_xn,
-                            sh_part,
-                            dim,
-                            lane,
-                            lanes,
-                            fence,
-                        );
-                        gemv(&hw.logits, sh_xn.ptr(), sh_projf, hw.vocab, dim, lane);
-                        {
-                            let (r0, r1) = own(hw.vocab, lane);
-                            if r1 > r0 {
-                                // SAFETY: lane-private rows.
-                                unsafe {
-                                    lfm_f32_to_bf16(
-                                        sh_projf.ptr().add(r0),
-                                        sh_log.ptr().add(r0),
-                                        (r1 - r0) as i32,
-                                    )
-                                };
-                            }
-                        }
-                        fence.wait(lane);
-                        if let Some(sampler) = sampler_slot.as_mut() {
-                            // SAFETY: post-barrier read-only logits view on lane 0.
-                            let logits = unsafe {
-                                std::slice::from_raw_parts(sh_log.ptr().cast_const(), hw.vocab)
-                            };
-                            tokens[cb]
-                                .store((sampler)(logits), std::sync::atomic::Ordering::Release);
-                        }
-                        fence.wait(lane);
-                        // ---- df_token = embed row of the sampled token ----
-                        let tok = tokens[cb].load(std::sync::atomic::Ordering::Acquire) as usize;
-                        {
-                            let (d0, d1) = own(dim, lane);
-                            for i in d0..d1 {
-                                // SAFETY: lane-private cells; embed row read-only.
-                                unsafe { sh_df.set(i, *hw.emb.u16_ptr().add(tok * dim + i)) };
-                            }
-                        }
-                        fence.wait(lane);
-                    }
-        };
-
-        // The depthformer rides the SAME lanes as the backbone: ONE doorbell per
-        // frame, no rayon, no DISPATCH_LOCK. There is no threadgroup fallback —
-        // absent engine, build_depth_flash returns None and the candle reference
-        // chain runs. A silent rayon pool here would be a second, foreign control
-        // plane (no-fallbacks doctrine).
-        //
-        // SPIN-ONLY fences under Rust frames (review P1): a lane that PARKS
-        // inside a fence lands on kc_sched's global ready queue and can be
-        // resumed on a DIFFERENT worker pthread — migrating a live Rust
-        // frame (sampler included) across threads, the exact TLS hazard
-        // class kcoro patch 0002 fixed for the runtime's own C frames.
-        // Native (C++) engine programs are written to tolerate that; Rust
-        // programs are not, so they never park mid-frame: the engine
-        // provides the dispatch, the stage barrier stays a pure spin —
-        // exactly the pre-fold SpinBarrier semantics, on our lanes.
-        let barrier = SpinBarrier::new(lanes);
-        let barrier = &barrier;
-        assert!(
-            engine.run_lanes(|lane| run_lane(lane, barrier)),
-            "DepthDecode::frame: engine refused the frame program"
-        );
-
-        tokens
-            .iter()
-            .map(|t| t.load(std::sync::atomic::Ordering::Acquire))
-            .collect()
+        out.to_vec()
     }
+}
 
-    /// RMSNorm stage on the lane team: sumsq partials → same-order fold on every lane →
-    /// per-slice apply with ONE bf16 round (the transformer RmsNorm ladder: 1/sqrt(mean+eps)
-    /// as sqrt-then-divide, matching `recip(sqrt(z))`).
-    #[allow(clippy::too_many_arguments)]
-    fn norm_stage(
-        &self,
-        x: *mut u16,
-        w: PtrLen,
-        out: Shared<u16>,
-        part: Shared<f32>,
-        n: usize,
-        lane: usize,
-        lanes: usize,
-        fence: &dyn LaneFence,
-    ) {
-        let c = n.div_ceil(lanes);
-        let (r0, r1) = ((lane * c).min(n), ((lane + 1) * c).min(n));
-        // SAFETY: lane-private slice sumsq; partials slot lane-private.
-        let p = if r1 > r0 {
-            unsafe { lfm_bf16_sumsq_f32(x.add(r0).cast_const(), (r1 - r0) as i32) }
-        } else {
-            0.0
-        };
-        unsafe { part.set(lane, p) };
-        fence.wait(lane);
-        let mut total = 0f32;
-        for l in 0..lanes {
-            // SAFETY: post-barrier read-only partials.
-            total += unsafe { part.get(l) };
-        }
-        let inv_rms = 1.0f32 / (total / n as f32 + self.eps).sqrt();
-        if r1 > r0 {
-            // SAFETY: lane-private slices.
-            unsafe {
-                lfm_bf16_rmsnorm(
-                    x.add(r0).cast_const(),
-                    w.u16_ptr().add(r0),
-                    out.ptr().add(r0),
-                    (r1 - r0) as i32,
-                    inv_rms,
-                );
-            }
-        }
-        fence.wait(lane);
-    }
-
-    /// One q/k head: qk RMSNorm over `hd` (per-head, the BoundedAttention ladder) then
-    /// interleaved rope at position `pos` — output the rb'd bf16 BITS of the rotated head
-    /// (`apply_rotary_emb`'s type_as round; the cache stores exactly these bits, torch's
-    /// cache dtype). SAFETY: caller guarantees src/dst head slices are lane-private.
-    unsafe fn qk_head_bits(
-        &self,
-        src: *const u16,
-        ln: PtrLen,
-        dst_bits: *mut u16,
-        hd: usize,
-        pos: usize,
-    ) {
-        let mut normed = [0u16; 128];
-        let mut rot = [0f32; 128];
-        let ss = lfm_bf16_sumsq_f32(src, hd as i32);
-        let inv_rms = 1.0f32 / (ss / hd as f32 + self.eps).sqrt();
-        lfm_bf16_rmsnorm(src, ln.u16_ptr(), normed.as_mut_ptr(), hd as i32, inv_rms);
-        lfm_bf16_to_f32(normed.as_ptr(), rot.as_mut_ptr(), hd as i32);
-        let half = hd / 2;
-        lfm_rope_i_f32(
-            rot.as_mut_ptr(),
-            self.cos.f32_ptr().add(pos * half),
-            self.sin.f32_ptr().add(pos * half),
-            hd as i32,
-        );
-        lfm_f32_to_bf16(rot.as_ptr(), dst_bits, hd as i32);
+impl Drop for DepthDecode {
+    fn drop(&mut self) {
+        crate::flashkern::native_engine::process_engine().depth_clear(self.id);
     }
 }
 

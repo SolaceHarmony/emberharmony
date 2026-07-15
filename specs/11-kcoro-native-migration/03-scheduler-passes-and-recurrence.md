@@ -23,6 +23,11 @@ Use two deliberately different resident executors:
 - a persistent fixed Flashkern worker team for model stages, shared scratch,
   tile fan-out, SIMD, and assembly.
 
+Flashkern is specifically the CPU compute device. The required Apple GPU peer is
+a separate MLX C++/Metal executor selected by the model/device layer; Metal command
+submission never enters Flashkern. Both devices speak the same coarse ticket and
+descriptor laws to Rust kcoro, but they do not share numerical worker machinery.
+
 Move token/frame recurrence into the resident Rust coordinator while every
 numerical operation stays native. Rust publishes compact commands and consumes
 compact completions through SQ/CQ rings. Tauri rings coarse policy tokens and
@@ -65,17 +70,17 @@ are empty of pass work whenever capture is admitted.
 
 | Current symbol | Evidence | Design action |
 |---|---|---|
-| `Pass` | `crates/liquid-audio/native/src/engine/flashkern_engine.cpp:82` stores borrowed pointers and shared scratch. | Current single-pass slot is pointer-stable. Promote it to an owned generation-protected slot pool before the Rust broker admits multiple producers or the compatibility caller returns asynchronously. |
-| `Stage` | `flashkern_engine.cpp:119` uses one atomic tile claim counter. | Preserve as the micro-scheduler; add an active-lane mask only for plans that intentionally use a subset. |
-| `Fence` | `flashkern_engine.cpp:134` stores arrival, logical generation, and park mask. | Implemented at `d2c43abd`: last arriver publishes generation and fans declared waiters through one shared expected-value word without spin. |
-| Request kinds | `flashkern_engine.cpp:140-150` includes MLP, layer, token, and transitional callback requests. | Replace `REQ_CALL` with typed Depthformer/fan-out passes; keep pass-granularity ticket IDs. |
+| `Pass` | `crates/liquid-audio/native/src/engine/flashkern_engine.cpp:94` stores borrowed pointers and shared scratch. | Current single-pass slot is pointer-stable. Promote it to an owned generation-protected slot pool before the Rust broker admits multiple producers or the compatibility caller returns asynchronously. |
+| `Stage` | `flashkern_engine.cpp:131` uses one atomic tile claim counter. | Preserve as the micro-scheduler; add an active-lane mask only for plans that intentionally use a subset. |
+| `Fence` | `flashkern_engine.cpp:146` stores arrival, logical generation, and park mask. | Implemented at `d2c43abd`: last arriver publishes generation and fans declared waiters through one shared expected-value word without spin. |
+| Request kinds | `flashkern_engine.cpp` includes typed MLP, layer, token, sampler, Depthformer, streaming-conv, GEMM, and DD FFT requests. | Request kind 5 and the generic callback ABI are deleted. Keep pass-granularity ticket IDs. |
 | Engine ownership | At `4f06a3d5`, `flashkern_engine.cpp:321-399` stores fixed pthreads, one mechanical SQ dispatcher, shared doorbells, one native bridge, request slots, plans, and scratch. `coordinator.rs:343-431` owns the Rust SQ broker and CQ ingress. Neither path stores a C arena runtime or ticket. | Keep this two-machine boundary. Move ticket identity/recurrence policy into Rust without routing stages or tiles through it. |
-| `lane_fence` | `flashkern_engine.cpp:634-662`. | Implemented at `d2c43abd`: immediate shared expected-value block preserves generation/last-arriver correctness. |
-| transitional `REQ_CALL` stage wait | `crates/liquid-audio/src/compute/flashkern/decode.rs:24-67`, `1001-1019` uses a local Rust `SpinBarrier` for `DepthDecode`. | This is the remaining active-spin exception. Port the program to a typed C++ pass and delete the barrier with `REQ_CALL`; add no new user. |
-| `run_stage` | `flashkern_engine.cpp:670-684`. | Keep atomic disjoint tile claiming and one serial transition. |
-| Nested lane program | `flashkern_engine.cpp:1009-1037`. | Keep ordinary C++ calls; port the remaining Rust callback bodies without flattening this tower. |
+| `lane_fence` | `flashkern_engine.cpp:735-769`. | Implemented at `d2c43abd`: immediate shared expected-value block preserves generation/last-arriver correctness. |
+| typed Depthformer stage waits | `run_depth_frame` in `flashkern_engine.cpp` uses `lane_fence`; `DepthDecode::frame` is a pointer-only ABI rim. | Implemented: the Rust `SpinBarrier`, lane arithmetic, nested sampler ABI, and callback were deleted. Keep remaining typed passes on this zero-spin pattern. |
+| `run_stage` | `flashkern_engine.cpp:771-791`. | Keep atomic disjoint tile claiming and one serial transition. |
+| Nested lane program | `lane_program` and its typed `run_*` bodies in `flashkern_engine.cpp`. | Keep ordinary C++ calls and native stage fences; no Rust frame enters this tower. |
 | Engine construction | `flashkern_engine.cpp:1201-1247` creates the native bridge, mechanical dispatcher, fixed pthreads, and two prepared lane wait words; `native_engine.rs:259-305` adds and registers the Rust coordinator. | Add readiness/affinity policy and million-pass soak. |
-| External handback | At `4f06a3d5`, `submit_pass` at `flashkern_engine.cpp:1142-1190` invokes the registered Rust callback. `coordinator.rs:304-431` admits a fixed slot, submits through the sole broker, blocks on CQ ingress, and resolves the exact caller. | CQ ownership is complete. Replace borrowed `Pass` storage with owned pass slots, then make the public rim asynchronous and delete `REQ_CALL`. |
+| External handback | `submit_pass` invokes the registered Rust broker; `coordinator.rs` admits a fixed slot, submits through the sole broker, blocks on CQ ingress, and resolves the exact caller. | CQ ownership and typed-pass cutover are complete. Replace borrowed request storage with owned pass slots, then make the public rim asynchronous. |
 
 The coordination API is vendored under
 `crates/kcoro-sys/vendor/kcoro_arena/include/`. Work and lifecycle conditions are
@@ -385,8 +390,9 @@ mask so a model change cannot silently multiply host waits.
 `FENCE_SPIN = 8192` is removed from the native Flashkern fence. There is no
 bounded spin, `YIELD`, `PAUSE`, WFE budget, UMWAIT budget, timed poll, or
 repeated atomic-load loop in the C++ dispatch/fence waits. The transitional
-Rust `REQ_CALL` exception is recorded in the current scheduler map and does not
-weaken the target: it is deleted, not generalized.
+Depthformer spin exception has also been removed: `REQ_DEPTH_FRAME` uses the
+same native fence. The generic Rust callback request is deleted, so there is no
+third wait primitive or language callback on the compute team.
 
 ```mermaid
 flowchart TD
@@ -582,30 +588,16 @@ claim that one shared scratch board runs two passes concurrently. Multiple
 passes may execute at once only when the runtime creates independent executors
 with separate workers, boards, scratch, and broker bindings.
 
-## `REQ_CALL` Disposition
+## Generic Callback Disposition
 
-`REQ_CALL` at `flashkern_engine.cpp:1283-1291` lets Rust callbacks execute on the
-fixed lane team. Current users enter through `NativeEngine::run_lanes`/`grid`
-starting at `crates/liquid-audio/src/compute/flashkern/native_engine.rs:544`.
-`DepthDecode::frame` currently constructs a local `SpinBarrier` at
-`decode.rs:1001-1019`; therefore the mounted engine is zero-spin while idle and
-at native C++ fences, but not yet at every internal stage of this Rust callback
-program. That exception is one reason `REQ_CALL` cannot survive cutover.
-
-Migration rules:
-
-1. Treat every current production call site as explicit migration debt; add no
-   new caller.
-2. A callback is non-suspending, non-reentrant, and cannot unwind
-   across C.
-3. It runs to completion on its lane's ordinary OS stack and may not call kcoro,
-   Tauri, storage, or model recurrence.
-4. Port every production callback into a typed native pass.
-5. Delete `REQ_CALL`, its Rust trampoline, and production callback request kind
-   when the last call site is gone. Do not preserve a legacy mode.
-6. At `d2c43abd`, fixed lanes, expected-value waits, and deletion of the
-   stackful dispatcher, saved stacks, and context-switch assembly are complete.
-   They do not require flattening or preserving `REQ_CALL`.
+Complete in the current branch working tree; pin the commit hash when landed.
+Request kind 5, `lfm_engine_call`, `lfm_lane_fence`, and Rust
+`run_lanes/grid` are deleted. Four GEMM launch closures became `REQ_GEMM`; DD
+FFT convolution and inverse FFT became `REQ_FFT_CONV_DD` and `REQ_IRFFT_DD`.
+All carry borrowed planes and publish one completion for the complete grid. DD
+FFT convolution maps bit reversal and every butterfly stage across the complete
+fixed lane team, reuses one shared work plane, and crosses the zero-spin generation
+fence at each threadgroup-equivalent boundary. No compatibility mode survives.
 
 ## Source Changes
 
@@ -623,9 +615,9 @@ Migration rules:
    reservation, stop races, exact final-lane publication, retained descriptors,
    one Rust broker, and dedicated CQ-to-slot/promise routing. Add service queues,
    Rust-owned child recurrence, and scope-control doorbells next.
-5. **Open:** port all production `REQ_CALL` users into typed native passes, keep
-   sampling native as specified in document 07, and delete the Rust lane
-   trampoline.
+5. **Done in current working tree; pin on commit:** typed `REQ_DEPTH_FRAME`,
+   integrated sampling, streaming convolution, GEMM/GEMV, DD FFT convolution,
+   and DD inverse FFT are built. The Rust lane trampoline is deleted.
 6. **Partly done (`d2c43abd`, `95069bd5`, `4f06a3d5`):**
    `flashkern_engine.cpp:321-399` owns fixed workers, one pointer-stable request
    slot, stage board, two shared zero-spin lane words, and the native SQ/CQ leaf.
@@ -645,8 +637,8 @@ Migration rules:
 10. **Open:** add post-transition ticket projections and generation-checked periodic board
    sampling per document 12; no UI callback enters this executor, and an
    inconsistent board read is skipped rather than retried.
-11. **Open:** delete the blocking Rust request surface and every `REQ_CALL`
-    artifact after independent fixtures pass; keep no product or source fallback.
+11. **Open:** replace the blocking borrowed-pointer request rim with owned native
+    pass slots after native multi-token prefill and context state are mounted.
 
 ## Acceptance Gates
 
@@ -679,8 +671,10 @@ Migration rules:
 - Stop before dispatch yields no kernel entry. Stop/interrupt during a pass
   permits one full completion and no old-epoch recurrence.
 - Queued prepare/start is skipped when stop has already advanced the epoch.
-- Current attention, convolution, MLP, full token, Depthformer, fan-out, and
-  temporary `REQ_CALL` parity tests pass during migration.
+- Current attention, convolution, MLP, full token, Depthformer, typed GEMM, and
+  typed DD FFT parity tests pass during migration.
+- Physical one-lane and multi-lane DD FFT executions are bit-identical; snapshot
+  counters prove every declared butterfly-stage barrier executed under one ticket.
 - The final production symbol/call-graph audit contains no `REQ_CALL`, Rust lane
   trampoline, stackful kcoro context switch, or saved lane-stack allocation.
 - A recurrent 1,000-token loop performs one exact CQ-to-Rust continuation edge

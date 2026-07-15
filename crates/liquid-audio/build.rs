@@ -36,6 +36,10 @@ fn main() {
     }
 
     println!("cargo::rerun-if-changed=native/src/engine/flashkern_engine.cpp");
+    println!("cargo::rerun-if-changed=native/include/flashkern_conv.h");
+    println!("cargo::rerun-if-changed=native/include/flashkern_depth.h");
+    println!("cargo::rerun-if-changed=native/include/flashkern_fft.h");
+    println!("cargo::rerun-if-changed=native/include/flashkern_gemm.h");
     println!("cargo::rerun-if-changed=../kcoro-sys/vendor/kcoro_arena/include");
     // C++23, not a style choice: this TU includes kcoro headers, and C++23 is
     // the FIRST standard that requires <stdatomic.h> to work in C++ and expose
@@ -85,6 +89,7 @@ fn main() {
     // tiny architecture assembly thunk to SecRandomCopyBytes; every hot draw is
     // expanded by the assembly block kernel added to the architecture archive.
     println!("cargo::rerun-if-changed=native/include/flashkern_prng.h");
+    println!("cargo::rerun-if-changed=native/include/flashkern_sampler.h");
     println!("cargo::rerun-if-changed=native/src/engine/flashkern_prng.cpp");
     cc::Build::new()
         .file("native/src/engine/flashkern_prng.cpp")

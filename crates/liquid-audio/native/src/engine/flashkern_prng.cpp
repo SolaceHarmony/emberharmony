@@ -30,6 +30,17 @@ static uint32_t load_le32(const uint8_t *src) {
            ((uint32_t)src[2] << 16) | ((uint32_t)src[3] << 24);
 }
 
+static void store_le64(uint8_t *dst, uint64_t value) {
+    for (size_t i = 0; i < 8; ++i) dst[i] = (uint8_t)(value >> (i * 8));
+}
+
+static uint64_t splitmix64(uint64_t *state) {
+    uint64_t z = (*state += UINT64_C(0x9e3779b97f4a7c15));
+    z = (z ^ (z >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
+    z = (z ^ (z >> 27)) * UINT64_C(0x94d049bb133111eb);
+    return z ^ (z >> 31);
+}
+
 static bool state_valid(const LfmPrngStateV1 *state) {
     if (!state || state->size != sizeof(*state) ||
         state->abi_version != LFM_PRNG_ABI_VERSION ||
@@ -105,6 +116,18 @@ extern "C" int lfm_prng_seed_material(LfmPrngStateV1 *state,
                                         const uint8_t *nonce) {
     if (!state || !key || !nonce) return -EINVAL;
     seed_material(state, key, nonce, 0);
+    return 0;
+}
+
+extern "C" int lfm_prng_seed_u64(LfmPrngStateV1 *state, uint64_t seed) {
+    if (!state) return -EINVAL;
+    alignas(8) uint8_t material[40];
+    uint64_t stream = seed;
+    for (size_t i = 0; i < 5; ++i) {
+        store_le64(material + i * 8, splitmix64(&stream));
+    }
+    seed_material(state, material, material + 32, 0);
+    erase(material, sizeof(material));
     return 0;
 }
 

@@ -15,7 +15,10 @@
 
 use std::time::{Duration, Instant};
 
-use liquid_audio::flashkern::native_engine::process_engine;
+use liquid_audio::flashkern::{
+    decode::{fused_mlp_available, FusedMlpWeights},
+    native_engine::process_engine,
+};
 
 /// Process CPU time (all threads, user+system) in milliseconds.
 fn proc_cpu_ms() -> f64 {
@@ -54,10 +57,26 @@ fn engine_lanes_are_silent_at_idle() {
         "engine burns {cold:.3}% CPU while idle (limit {IDLE_MAX_PCT}%) — a lane is spinning, not parked"
     );
 
-    // Ring the doorbell once — a full REQ_CALL pass with a no-op program —
-    // then prove the team re-parks instead of lingering hot.
-    let ran = engine.run_lanes(|_lane| {});
-    assert!(ran, "run_lanes refused a trivial program");
+    // Ring the doorbell through a real typed numerical pass, then prove the team
+    // re-parks instead of lingering hot. No callback-only probe exists in production.
+    assert!(fused_mlp_available(), "typed native MLP unavailable");
+    let width = lanes;
+    let x = vec![0u16; width];
+    let norm = vec![0x3f80u16; width];
+    let matrix = vec![0u16; width * width];
+    let weights = FusedMlpWeights {
+        norm_w: &norm,
+        w1: &matrix,
+        w3: &matrix,
+        w2: &matrix,
+        eps: 1e-5,
+    };
+    let mut out = vec![1u16; width];
+    assert!(
+        engine.fused_mlp(&x, &weights, &mut out, lanes),
+        "typed MLP pass refused the idle probe"
+    );
+    assert_eq!(out, x);
     std::thread::sleep(Duration::from_millis(300));
 
     let reparked = idle_window_pct(Duration::from_secs(1));

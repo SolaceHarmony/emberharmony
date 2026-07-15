@@ -25,6 +25,11 @@
 #include <string.h>
 #include <vector>
 #include <cmath>
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#elif defined(__linux__)
+#include <sys/auxv.h>
+#endif
 
 // --- Per-function target gating -------------------------------------------------------
 // clang exposes the ACLE intrinsics only when the *base* -march enables the feature, so on
@@ -266,6 +271,20 @@ extern "C" void lfm_bf16_gemm_nt_f32(const uint16_t *A, const uint16_t *W, float
     gemm_nt_impl(A, W, C, M, N, K);
 }
 
+extern "C" int lfm_bf16_gemm_available(void) {
+#if defined(__APPLE__)
+    int value = 0;
+    size_t size = sizeof(value);
+    return sysctlbyname("hw.optional.arm.FEAT_BF16", &value, &size, nullptr, 0) == 0 &&
+           value == 1;
+#elif defined(__linux__)
+    constexpr unsigned long HWCAP2_BF16 = 1ul << 14;
+    return (getauxval(AT_HWCAP2) & HWCAP2_BF16) != 0;
+#else
+    return 0;
+#endif
+}
+
 // Stretch: int8 tensor-core MAC — same 8×8 idiom via SMMLA, showing the pattern generalizes
 // across dtypes. C(M,N) s32 = A(M,K) s8 · B(K,N) s8. Reference-quality (2×2 SMMLA tile).
 extern "C" void lfm_s8_gemm_s32(const int8_t *A, const int8_t *B, int32_t *C,
@@ -400,6 +419,93 @@ extern "C" void lfm_depthwise_causal_conv1d_bf16(const uint16_t *u, const uint16
             uint16_t *orow = out + ((size_t)b * D + d) * Lout;
             conv1d_channel(urow, w + (size_t)d * K, bf16_to_f32(bias[d]), orow, L, K, Lout);
         }
+    }
+}
+
+static inline void depthwise_stream_copy(const uint16_t *src, uint16_t *dst, int count) {
+    int i = 0;
+    for (; i + 8 <= count; i += 8)
+        vst1q_u16(dst + i, vld1q_u16(src + i));
+    volatile uint16_t *tail = dst;
+    for (; i < count; ++i) tail[i] = src[i];
+}
+
+static inline void depthwise_stream_zero(uint16_t *dst, int count) {
+    volatile uint16_t *tail = dst;
+    for (int i = 0; i < count; ++i) tail[i] = 0;
+}
+
+// CPU streaming depthwise grid. The virtual input row is
+// `[cache | x]`, but the two payloads remain split: no staging concat is constructed.
+// Each architecture call owns complete rows, vectorizing the all-x interior while
+// preserving explicit FMA accumulation and one final bf16 rounding per output cell.
+extern "C" int lfm_depthwise_stream_bf16_available(void) {
+    return lfm_bf16_gemm_available();
+}
+
+FK_TGT_BF16
+extern "C" void lfm_depthwise_stream_bf16(const uint16_t *x, const uint16_t *cache,
+                                           const uint16_t *weights, uint16_t *out,
+                                           uint16_t *next,
+                                           int Bn, int D, int T, int K) {
+    const int P = K - 1;
+    const int rows = Bn * D;
+    for (int row = 0; row < rows; ++row) {
+        const int channel = row % D;
+        const uint16_t *xrow = x + (size_t)row * T;
+        const uint16_t *crow = cache ? cache + (size_t)row * P : nullptr;
+        const uint16_t *wrow = weights + (size_t)channel * K;
+        uint16_t *orow = out + (size_t)row * T;
+        int t = 0;
+
+        // Boundary cells still read prior-stream state.
+        for (; t < T && t < P; ++t) {
+            float acc = 0.0f;
+            for (int j = 0; j < K; ++j) {
+                const int source = t + j;
+                const float value = source < P
+                                        ? (crow ? bf16_to_f32(crow[source]) : 0.0f)
+                                        : bf16_to_f32(xrow[source - P]);
+                acc = std::fma(value, bf16_to_f32(wrow[j]), acc);
+            }
+            orow[t] = f32_to_bf16_bits(acc);
+        }
+
+        // Once t >= P every tap is a contiguous read from the incoming chunk.
+        for (; t + 4 <= T; t += 4) {
+            float32x4_t acc = vdupq_n_f32(0.0f);
+            for (int j = 0; j < K; ++j) {
+                const int source = t - P + j;
+                const uint16x4_t bits = vld1_u16(xrow + source);
+                const float32x4_t values =
+                    vreinterpretq_f32_u32(vshll_n_u16(bits, 16));
+                acc = vfmaq_n_f32(acc, values, bf16_to_f32(wrow[j]));
+            }
+            const bfloat16x4_t rounded = vcvt_bf16_f32(acc);
+            vst1_bf16((bfloat16_t *)(orow + t), rounded);
+        }
+        for (; t < T; ++t) {
+            float acc = 0.0f;
+            for (int j = 0; j < K; ++j) {
+                acc = std::fma(bf16_to_f32(xrow[t - P + j]),
+                               bf16_to_f32(wrow[j]), acc);
+            }
+            orow[t] = f32_to_bf16_bits(acc);
+        }
+
+        // The only state movement: K-1 cells, written directly into the result plane.
+        if (P == 0) continue;
+        uint16_t *next_row = next + (size_t)row * P;
+        if (T >= P) {
+            depthwise_stream_copy(xrow + T - P, next_row, P);
+            continue;
+        }
+        const int retained = P - T;
+        if (crow)
+            depthwise_stream_copy(crow + T, next_row, retained);
+        else
+            depthwise_stream_zero(next_row, retained);
+        depthwise_stream_copy(xrow, next_row + retained, T);
     }
 }
 
@@ -1097,4 +1203,81 @@ extern "C" float lfm_bf16_sumsq_candle_f32(const uint16_t *x, int n) {
         acc = acc + v * v;
     }
     return acc;
+}
+
+// Sampling leaves. Vocabulary bands stay in the checkpoint/logit plane; only
+// derived weights are written. NEON handles the comparison sweeps while expf
+// remains the platform scalar primitive used by Candle's CPU softmax.
+extern "C" uint32_t lfm_sampler_argmax_f32(const float *x, size_t count) {
+    if (count == 0) return 0;
+    float maximum = -INFINITY;
+    size_t i = 0;
+    for (; i + 4 <= count; i += 4) maximum = vmaxvq_f32(vmaxq_f32(vdupq_n_f32(maximum), vld1q_f32(x + i)));
+    for (; i < count; ++i)
+        if (x[i] > maximum) maximum = x[i];
+    for (i = 0; i < count; ++i)
+        if (x[i] == maximum) return (uint32_t)i;
+    return 0;
+}
+
+extern "C" uint32_t lfm_sampler_argmax_bf16(const uint16_t *x, size_t count) {
+    if (count == 0) return 0;
+    float maximum = -INFINITY;
+    size_t i = 0;
+    for (; i + 4 <= count; i += 4) maximum = vmaxvq_f32(vmaxq_f32(vdupq_n_f32(maximum), bf16_widen4(x + i)));
+    for (; i < count; ++i)
+        if (bf16_to_f32(x[i]) > maximum) maximum = bf16_to_f32(x[i]);
+    for (i = 0; i < count; ++i)
+        if (bf16_to_f32(x[i]) == maximum) return (uint32_t)i;
+    return 0;
+}
+
+extern "C" float lfm_sampler_exp_sum_f32(const float *x, float *weights,
+                                           size_t count, float scale,
+                                           float maximum, float threshold) {
+    float sum = 0.0f;
+    size_t i = 0;
+    for (; i + 4 <= count; i += 4) {
+        float32x4_t scaled = vmulq_n_f32(vld1q_f32(x + i), scale);
+        float values[4];
+        vst1q_f32(values, scaled);
+        for (size_t j = 0; j < 4; ++j) {
+            float weight = values[j] >= threshold ? expf(values[j] - maximum) : 0.0f;
+            weights[i + j] = weight;
+            sum += weight;
+        }
+    }
+    for (; i < count; ++i) {
+        float value = x[i] * scale;
+        float weight = value >= threshold ? expf(value - maximum) : 0.0f;
+        weights[i] = weight;
+        sum += weight;
+    }
+    return sum;
+}
+
+extern "C" float lfm_sampler_exp_sum_bf16(const uint16_t *x, float *weights,
+                                            size_t count, uint16_t bf16_scale,
+                                            float maximum, float threshold) {
+    float scale = bf16_to_f32(bf16_scale);
+    float sum = 0.0f;
+    for (size_t i = 0; i < count; ++i) {
+        float value = bf16_to_f32(bf16_bits_scalar(bf16_to_f32(x[i]) * scale));
+        float weight = value >= threshold ? expf(value - maximum) : 0.0f;
+        weights[i] = weight;
+        sum += weight;
+    }
+    return sum;
+}
+
+extern "C" uint32_t lfm_sampler_prefix_pick(const float *weights, size_t count,
+                                              float target) {
+    float prefix = 0.0f;
+    uint32_t last = 0;
+    for (size_t i = 0; i < count; ++i) {
+        if (weights[i] > 0.0f) last = (uint32_t)i;
+        prefix += weights[i];
+        if (target < prefix) return (uint32_t)i;
+    }
+    return last;
 }

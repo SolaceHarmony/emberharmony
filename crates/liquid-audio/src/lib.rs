@@ -22,8 +22,8 @@ pub mod detokenizer; // detokenizer.py
 #[path = "compute/flashkern/mod.rs"]
 pub mod flashkern; // CPU replicas of the Metal JIT kernels (NEON / AVX SIMD + the GPU dispatch model)
 pub mod loader; // config.json + safetensors → model + processor
-pub mod model;
 pub mod mimi_native; // native C++/NEON/AMX Mimi decode kernel rim (native/src/mimi)
+pub mod model;
 pub mod moshi; // Liquid-Audio-facing facade over Kyutai's Rust moshi crate
 pub mod processor; // processor.py
 #[path = "runtime/realtime.rs"]
@@ -34,10 +34,10 @@ pub mod resample; // torchaudio.functional.resample (windowed-sinc) port
 pub mod threads; // intra-op thread-pool parity with torch (at::intraop_default_num_threads)
 pub mod trainer; // trainer.py
 pub mod utils;
-#[path = "compute/weights.rs"]
-pub mod weights; // native resident checkpoint image + temporary Candle compatibility boundary
 #[path = "runtime/voice_runtime.rs"]
-pub mod voice_runtime; // in-process thread-managed voice service (external I/O, VAD, realtime)
+pub mod voice_runtime;
+#[path = "compute/weights.rs"]
+pub mod weights; // native resident checkpoint image + temporary Candle compatibility boundary // in-process thread-managed voice service (external I/O, VAD, realtime)
 
 pub use audio_out::{AudioDetokenizer, MimiDetokenizer};
 pub use detokenizer::LFM2AudioDetokenizer;

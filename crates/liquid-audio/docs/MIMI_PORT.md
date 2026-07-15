@@ -1,8 +1,8 @@
 # Mimi → C++/NEON port manifest
 
 The mission clause this executes: the voice pipeline decode path ports to
-kcoro/NEON/C++ as a tight kernel. After the backbone (REQ_TOKEN_PASS) and the
-depthformer (REQ_CALL), **Mimi is the largest candle compute left per frame**:
+kcoro/NEON/C++ as a tight kernel. After the backbone (`REQ_TOKEN_PASS`) and the
+typed Depthformer (`REQ_DEPTH_FRAME`), **Mimi is the largest Candle compute left per frame**:
 every 80 ms audio frame runs a full candle graph (moshi crate) → PCM. This
 manifest scopes the port; the first pass is swarmed one-file-per-agent,
 arbitered locally, then parity-gated.

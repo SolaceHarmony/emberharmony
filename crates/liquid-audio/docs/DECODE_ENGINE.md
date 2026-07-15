@@ -16,7 +16,7 @@ the dispatch model, verification, and the build order.
 
 ---
 
-## 0. As-built architecture (2026-07-14, `4f06a3d5`)
+## 0. As-built architecture (2026-07-14 working tree)
 
 The CPU engine now has two intentionally different scheduling domains:
 
@@ -34,10 +34,13 @@ C++ rim writes one borrowed request slot, creates a generation-protected descrip
 whose payload is `Engine*`, and invokes the registered Rust submitter. That callback
 blocks on a precreated result-slot `Condvar` until CQ ingress resolves it.
 
-The native lane idle wait and C++ generation fence are zero-spin. The remaining
-exception is explicit: `DepthDecode` runs through transitional `REQ_CALL` and uses
-the Rust `SpinBarrier` between its internal stages. It spins only during that active
-pass, but it still violates the final zero-spin contract and leaves with `REQ_CALL`.
+The native lane idle wait and every C++ generation fence are zero-spin.
+Depthformer now runs as typed `REQ_DEPTH_FRAME`; its former Rust `SpinBarrier`,
+lane callback, and nested sampler ABI have been deleted.
+
+Flashkern is the CPU executor, never the Metal executor. CPU kernels retain NEON,
+BFMMLA/BFDOT, AVX2, and AVX-512-BF16 paths. The required GPU/matrix-coprocessor
+backend is a separate future MLX C++/Metal engine; device routing stays above both.
 
 ```mermaid
 flowchart LR
@@ -59,11 +62,16 @@ flowchart LR
 
 `REQ_TOKEN_PASS` executes embed, the native 16-layer ShortConv/attention/MLP walk,
 final norm, and optional logits in one team entry. `REQ_MLP`, `REQ_CONV_LAYER`, and
-`REQ_ATTN_LAYER` remain parity fixtures. `REQ_CALL` is the explicit migration debt:
-Depthformer and fan-out Rust programs run on these same thread-stable lanes. Their
-program-final native fence is zero-spin, but `DepthDecode`'s internal Rust stage
-barriers are not. They must become typed C++ passes before Rust leaves the
-token/frame recurrence loop.
+`REQ_ATTN_LAYER` remain parity fixtures. `REQ_DEPTH_FRAME` executes projection,
+every Depthformer codebook/layer, resident KV recurrence, logits, native sampling,
+and sampled-embedding feedback in one team entry. Request kind 5 and its generic
+Rust lane callback are deleted. `REQ_GEMM`, `REQ_FFT_CONV_DD`, and `REQ_IRFFT_DD`
+now own the former grid/fan-out call sites as typed pointer-borrowed native passes.
+DD FFT convolution runs every radix-2 stage cooperatively across the fixed lane
+team, with one shared scratch plane and a generation fence between stages.
+`REQ_DEPTHWISE_STREAM` is the first prefill-scale operator translated from the
+temporary Metal/reference implementation: one CPU ticket, split state/input
+pointers, disjoint channel rows, and one final generation fence.
 
 The idle contract is measured, not inferred: the production-backed macOS test sees
 0.002% process CPU with eight lanes parked both before and after a pass. Native MLP
@@ -170,8 +178,9 @@ The backbone KV cache is preallocated resident storage, **not** a per-step conca
   as a parity deviation; this resident slot is held to a stricter bar — with
   `grouped_gqa_decode = false` a greedy+seeded generate is **bit-identical** before/after the
   swap (wav hash), so the storage change is exact.
-- The depthformer's own KV (in `DepthDecode`) is tiny resident bf16-bit `kplane`/`vplane`
-  storage (`Vec<u16>`), cursor reset per frame — zero allocation per frame.
+- The depthformer's own KV is tiny resident bf16-bit `k_plane`/`v_plane` storage
+  owned by each native `DepthPlan`, indexed by layer/KV head/codebook and reused
+  without allocation for every frame.
 
 > **As-built nuance:** the backbone resident KV dtype follows the projection row dtype rather
 > than forcing `DType::BF16` in `append_kv`. That is bf16 for the live CPU bf16 path; if a
@@ -190,8 +199,9 @@ The in-dispatch working set — the CPU analog of GPU threadgroup memory:
   and blocks immediately; the logical mask identifies actual fence waiters. There
   is no spin budget or timed poll in these native waits.
 - **Scratch**: the engine owns persistent `sc_*`, attention, token, and logits
-  planes. Context build reserves model-shape storage; warmed passes do not allocate.
-  `DepthDecode` still owns persistent Rust scratch until its typed native pass lands.
+  planes plus every Depthformer activation, KV, and sampler plane. Plan build
+  reserves model-shape storage; warmed passes do not allocate. Rust owns no
+  Depthformer numerical scratch.
 
 ### Tier 3 — Transport (PARTLY BUILT)
 
@@ -210,28 +220,29 @@ open.
 - **Coordination.** One safe Rust `kcoro::Executor` worker runs the broker future;
   one dedicated Rust ingress thread blocks on CQ. The C arena runtime does not
   schedule production passes, and neither Rust thread executes numerical frames.
-- **Remaining Rust callback.** `DepthDecode::frame` uses `REQ_CALL` on the same
-  fixed lane team. Its Rust body is non-suspending and its local `SpinBarrier`
-  polls during active internal stages. It must be ported to a typed C++ pass;
-  there is no rayon or alternate production dispatcher branch.
+- **Typed numerical passes.** `DepthDecode::frame` is a pointer-only Rust rim over
+  `REQ_DEPTH_FRAME`; GEMM, DD FFT convolution, DD inverse FFT, and streaming
+  convolution have their own typed request records. The complete programs and
+  all waits are native. No Rust closure executes on a compute lane.
 
 ---
 
 ## 4. What is on the live decode path today (AS-BUILT)
 
-Verified in source. See `docs/FLASHKERN.md` for the native token program,
-transitional DepthDecode program, and lower-level kernel inventory.
+Verified in source. See `docs/FLASHKERN.md` for the native token and typed
+Depthformer programs plus the lower-level kernel inventory.
 
 | Region | As-built path | Where |
 |---|---|---|
-| bf16 linears (prefill-scale `M`) | tightened NEON/AVX BFMMLA GEMM (`Bf16Gemm`) | `bf16_gemm.rs`, `linear.rs` |
-| bf16 linears (decode, `M ≤ 4`) | native-layout `Bf16GemmNt` — no weight transpose (`bf16_matmul_nt`), fall-through to transposed GEMM if the strict nt gate is unmet | `bf16_gemm.rs`, `linear.rs` (`NT_MAX_ROWS = 4`) |
+| bf16 linears (prefill-scale `M`) | one `REQ_GEMM`; fixed native lanes invoke NEON BFMMLA/BFDOT or x86 AVX2/AVX-512-BF16 leaves | `flashkern_gemm.h`, `native_engine.rs`, architecture TUs |
+| bf16 linears (decode, `M ≤ 4`) | one `REQ_GEMM` over checkpoint-native `[N,K]`; no weight transpose | `bf16_gemm.rs`, `linear.rs` (`NT_MAX_ROWS = 4`) |
 | backbone KV | resident `KvSlot` in-place append + narrow views (§3 tier 1) | `lfm2_hf.rs` |
 | backbone GQA (decode, `seq==1`) | regrouped-`q` view against shared KV heads — **no `repeat_kv`** materialization; gated by `grouped_gqa_decode` | `lfm2_hf.rs` `Attention::forward` |
-| ShortConv (decode) | fused `causal_conv1d_update` — flashkern NEON/AVX op on CPU, candle-flashfftconv (Metal JIT / scalar) otherwise; gated by `fused_conv_decode` | `flashkern/candle_ops.rs`, `lfm2_hf.rs` |
+| ShortConv (CPU bf16 prefill/continuation) | one `REQ_DEPTHWISE_STREAM`; NEON/AVX rows read split state/input and write output/next-state directly | `flashkern/candle_ops.rs`, `native/include/flashkern_conv.h`, `flashkern_engine.cpp`, both architecture TUs |
+| ShortConv (temporary Metal backend) | selected in `lfm2_hf.rs`, outside Flashkern; replaced by MLX C++/Metal | `lfm2_hf.rs`, optional `candle-flashfftconv` dependency |
 | backbone token (CPU decode, `b·s==1`) | one `REQ_TOKEN_PASS`: embed, native ShortConv/attention/MLP layer walk, final norm, optional logits | `native/src/engine/flashkern_engine.cpp`, `flashkern/native_engine.rs`, `lfm2_hf.rs` |
-| audio frame (CPU, bf16) | `DepthDecode::frame` — the whole depthformer frame as ONE dispatch, sampling on lane 0 | `flashkern/decode.rs`, `lfm2_audio.rs` |
-| prefill; all Metal | candle / candle-flashfftconv (unchanged) | — |
+| audio frame (CPU, bf16) | one `REQ_DEPTH_FRAME`: projection, all Depthformer codebooks/layers, KV recurrence, collective sampling, embedding feedback | `native/src/engine/flashkern_engine.cpp`, `flashkern/decode.rs`, `lfm2_audio.rs` |
+| remaining prefill and Metal device graph | mixed Candle migration path; streaming CPU short-conv is already native | model modules; optional Metal dependency |
 
 ### Parity flags & seams (AS-BUILT)
 
@@ -269,9 +280,9 @@ deviation (a different, equally-sensible slogan on a 96-token run), which is exa
 
 ### Standing tests
 
-- **Cross-op parity** (`flashkern/candle_ops.rs`): the flashkern conv1d_update op must agree
-  with the candle-flashfftconv op it replaces on the CPU device — f32 tight (FMA-only slack),
-  bf16 through the same rounding points.
+- **Streaming-conv parity** (`flashkern/candle_ops.rs`, `flashkern/native_engine.rs`):
+  split-buffer CPU results and next state match the reference contract across chunk
+  boundaries; the engine snapshot proves one ticket/completion per invocation.
 - **Fused-block parity** (`flashkern/decode.rs`, `flashkern/native_engine.rs`):
   `fused_mlp_decode` vs the real candle op chain (through the actual `linear_forward`) at bf16
   resolution, across lane counts; native MLP vs the threadgroup port bit-for-bit.
@@ -306,7 +317,7 @@ extrapolate.
 | CPU decode, mixed text+audio | **~21–22 tok/s** | real-time edge |
 | text-stretch | **~18 ms/token (~56 tok/s)** | |
 | audio frame | **~50 ms** | 23 GB/s effective — headroom left; E-core barrier lockstep suspected |
-| prefill | **~12 s** | still candle / Metal (known wall; §7) |
+| prefill | **~12 s historical baseline** | still mixed; CPU streaming short-conv is native, remaining graph is migration work (§7) |
 | e2e sound, CPU | **~52–60 s**, 2 audible turns | passes |
 | e2e sound, Metal | **~28–30 s**, mean latency ~1.3–1.6 s | passes |
 
@@ -318,15 +329,16 @@ extrapolate.
    pthread lanes, zero-spin native expected-value waits, one pointer-stable
    request slot, native SQ/CQ, retained descriptors, one safe Rust broker, one CQ
    ingress owner, and deletion of the stackful runtime are live.
-2. **Typed native Depthformer/fan-out passes: next.** Port every `REQ_CALL` user,
-   preserve bit and seeded-token parity, then delete the callback request kind and
-   Rust lane trampolines.
+2. **Typed native passes and callback deletion: built.** Depthformer, streaming
+   convolution, GEMM/GEMV, DD FFT convolution, and DD inverse FFT use typed
+   pointer-borrowed requests. `REQ_CALL`, `NativeEngine::run_lanes/grid`, and the
+   exported callback fence are deleted.
 3. **Rust recurrence and parent action coordinator.** Move parent/child tickets,
    scope epochs, service classes, and recurrence into the dedicated Rust kcoro
    runtime. Native completion wakes that registered continuation directly; Tauri
    and serialized IPC remain outside progress.
-4. **Complete native model path.** Finish the standalone weight table, sampler,
-   Conformer, mel, codec, prefill, and remaining math described by migration
+4. **Complete native model path.** Build multi-token full/suffix prefill next,
+   then finish Conformer, mel, codec, and remaining math described by migration
    documents 02 and 04 through 08. Candle is an oracle during migration, not a
    permanent production owner.
 5. **Descriptor transport and multi-conversation scheduling.** Carry retained
