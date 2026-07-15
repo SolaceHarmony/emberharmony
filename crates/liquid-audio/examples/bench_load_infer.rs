@@ -53,7 +53,7 @@ fn select_device() -> Res<Device> {
             }
         }
         Some("cpu") | None => {
-            if liquid_audio::bf16_gemm::bf16_gemm_available() {
+            if liquid_audio::flashkern::native_engine::bf16_gemm_available() {
                 Ok(Device::Cpu)
             } else {
                 Err("CPU BF16 needs the NEON BFMMLA kernel; use Metal on this Mac".into())
@@ -319,7 +319,7 @@ fn main() -> Res<()> {
         "model_ref": model_ref,
         "model_dir": dir.display().to_string(),
         "device": format!("{device:?}"),
-        "bf16_gemm_available": liquid_audio::bf16_gemm::bf16_gemm_available(),
+        "bf16_gemm_available": liquid_audio::flashkern::native_engine::bf16_gemm_available(),
         "audio_path": audio_path.display().to_string(),
         "input_seconds": sample_count as f64 / rate as f64,
         "max_new_tokens": max_new_tokens,

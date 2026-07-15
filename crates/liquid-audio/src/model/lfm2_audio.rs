@@ -22,9 +22,7 @@ use crate::model::conformer::encoder::{ConformerEncoder, ConformerEncoderConfig}
 use crate::model::lfm2_hf::{Cache as LfmCache, Lfm2Config, Model as Lfm2Model};
 use crate::model::linear::{linear_forward, linear_logits};
 use crate::model::mlp::MLP;
-use crate::model::transformer::{
-    HeadStyle, LayerKvCache, Mha, RawLmBackbone, SharedEmbedding, StandardBlock,
-};
+use crate::model::transformer::{HeadStyle, Mha, RawLmBackbone, SharedEmbedding, StandardBlock};
 use crate::processor::{ChatState, SpecialTokenIds};
 use crate::utils::{mel2emb_len, LFMModality};
 
@@ -278,6 +276,81 @@ impl SamplingStream {
     }
 }
 
+fn build_depth_decode(
+    depthformer: &RawLmBackbone,
+    depth_linear: &Linear,
+    depth_embeddings: &[SharedEmbedding],
+    depthformer_dim: usize,
+    codebooks: usize,
+    backbone_dim: usize,
+) -> Option<crate::flashkern::decode::DepthDecode> {
+    use crate::flashkern::decode::{DepthDecode, DepthHead, DepthLayer, PtrLen};
+
+    if !crate::flashkern::native_engine::bf16_gemm_available() {
+        return None;
+    }
+    let mut layers = Vec::with_capacity(depthformer.layers.len());
+    let mut geom = None;
+    let mut cos_sin = None;
+    for blk in &depthformer.layers {
+        let (mha, glu, opn, ffnn) = blk.flash_parts();
+        let (qkv, out, ba, cos, sin) = mha.flash_parts();
+        let (heads, kvh, hd, qln, kln) = ba.flash_parts();
+        let (w1, w2, w3, swiglu) = glu.flash_parts();
+        if !swiglu || heads * hd != depthformer_dim {
+            return None;
+        }
+        let current = (heads, kvh, hd, w1.weight().dim(0).ok()?, opn.eps() as f32);
+        if geom.is_some_and(|expected| expected != current) {
+            return None;
+        }
+        geom = Some(current);
+        cos_sin = Some((PtrLen::f32(cos)?, PtrLen::f32(sin)?));
+        layers.push(DepthLayer {
+            qkv_w: PtrLen::bf16(qkv.weight())?,
+            out_w: PtrLen::bf16(out.weight())?,
+            q_ln: PtrLen::bf16(qln?.weight())?,
+            k_ln: PtrLen::bf16(kln?.weight())?,
+            opnorm: PtrLen::bf16(opn.weight())?,
+            ffnnorm: PtrLen::bf16(ffnn.weight())?,
+            w1: PtrLen::bf16(w1.weight())?,
+            w3: PtrLen::bf16(w3?.weight())?,
+            w2: PtrLen::bf16(w2.weight())?,
+        });
+    }
+    let (heads, kvh, _hd, ff, eps) = geom?;
+    let (cos, sin) = cos_sin?;
+    let mut heads_w = Vec::with_capacity(codebooks);
+    for embedding in depth_embeddings {
+        let (table, norm, logits) = embedding.flash_parts();
+        let vocab = table.dim(0).ok()?;
+        if logits.dim(0).ok()? != vocab || table.dim(1).ok()? != depthformer_dim {
+            return None;
+        }
+        heads_w.push(DepthHead {
+            emb: PtrLen::bf16(table)?,
+            norm: PtrLen::bf16(norm.weight())?,
+            logits: PtrLen::bf16(logits)?,
+            vocab,
+        });
+    }
+    DepthDecode::new(
+        depthformer_dim,
+        heads,
+        kvh,
+        ff,
+        codebooks,
+        backbone_dim,
+        eps,
+        layers,
+        heads_w,
+        PtrLen::bf16(depth_linear.weight())?,
+        PtrLen::bf16(depth_linear.bias()?)?,
+        cos,
+        sin,
+    )
+}
+
 // `nn.functional.cross_entropy(..., reduction="none")` lives in
 // [`crate::candle_ext::loss::cross_entropy_none`] — the reduction candle's
 // mean-only `cross_entropy` lacks. `forward` (below) calls it for the text/audio
@@ -319,7 +392,6 @@ pub struct LFM2AudioModel {
     /// deviation off — `grouped_gqa_decode=false` on each internally-built cache and
     /// depth-flash disabled — so greedy text + seeded audio reproduces the recorded
     /// wav-hash baseline bit-for-bit. Token-exact tiers (fused conv/MLP) stay on.
-    reference_numerics: bool,
     /// Owns the canonical checkpoint image for native binders. Candle-backed
     /// components still own their measured compatibility copies. `None` is
     /// reserved for trainable/tests.
@@ -509,7 +581,6 @@ impl LFM2AudioModel {
             text_loss_multiplier: loss_conf.text_loss_multiplier,
             audio_loss_multiplier: loss_conf.audio_loss_multiplier,
             depth_flash: None,
-            reference_numerics: false,
             resident,
         };
         // Built AFTER assembly: the ctx captures raw views into tensors the model now owns
@@ -540,98 +611,20 @@ impl LFM2AudioModel {
 
     /// Capture the depthformer as a flashkern [`DepthDecode`] — every weight a zero-copy
     /// bf16 view in checkpoint layout. Any non-conforming tensor (wrong device/dtype/
-    /// layout, non-swiglu Glu, missing qk-norms) ⇒ `None`, and the candle path runs.
+    /// layout, non-swiglu Glu, missing qk-norms) rejects native inference.
     fn build_depth_flash(&self) -> Option<crate::flashkern::decode::DepthDecode> {
-        use crate::flashkern::decode::{DepthDecode, DepthHead, DepthLayer, PtrLen};
-        if !crate::bf16_gemm::bf16_gemm_nt_available() {
-            return None;
-        }
-        // Depth-flash rides the native engine's lane team. The engine is the
-        // SUBSTRATE — process_engine() panics at init if it can't stand up, so
-        // there is no "engine absent" branch here; `None` below means only
-        // tensor nonconformance (wrong dtype/layout), never a missing runtime.
-        let mut layers = Vec::with_capacity(self.depthformer.layers.len());
-        let mut geom = None;
-        let mut cos_sin = None;
-        for blk in &self.depthformer.layers {
-            let (mha, glu, opn, ffnn) = blk.flash_parts();
-            let (qkv, out, ba, cos, sin) = mha.flash_parts();
-            let (heads, kvh, hd, qln, kln) = ba.flash_parts();
-            let (w1, w2, w3, swiglu) = glu.flash_parts();
-            if !swiglu || heads * hd != self.depthformer_dim {
-                return None;
-            }
-            let w3 = w3?;
-            geom = Some((heads, kvh, hd, w1.weight().dim(0).ok()?, opn.eps() as f32));
-            cos_sin = Some((PtrLen::f32(cos)?, PtrLen::f32(sin)?));
-            layers.push(DepthLayer {
-                qkv_w: PtrLen::bf16(qkv.weight())?,
-                out_w: PtrLen::bf16(out.weight())?,
-                q_ln: PtrLen::bf16(qln?.weight())?,
-                k_ln: PtrLen::bf16(kln?.weight())?,
-                opnorm: PtrLen::bf16(opn.weight())?,
-                ffnnorm: PtrLen::bf16(ffnn.weight())?,
-                w1: PtrLen::bf16(w1.weight())?,
-                w3: PtrLen::bf16(w3.weight())?,
-                w2: PtrLen::bf16(w2.weight())?,
-            });
-        }
-        let (heads, kvh, _hd, ff, eps) = geom?;
-        let (cos, sin) = cos_sin?;
-        let mut heads_w = Vec::with_capacity(self.codebooks);
-        for se in &self.depth_embeddings {
-            let (emb, norm, logits) = se.flash_parts();
-            let vocab = emb.dim(0).ok()?;
-            if logits.dim(0).ok()? != vocab || emb.dim(1).ok()? != self.depthformer_dim {
-                return None;
-            }
-            heads_w.push(DepthHead {
-                emb: PtrLen::bf16(emb)?,
-                norm: PtrLen::bf16(norm.weight())?,
-                logits: PtrLen::bf16(logits)?,
-                vocab,
-            });
-        }
-        DepthDecode::new(
+        build_depth_decode(
+            &self.depthformer,
+            &self.depth_linear,
+            &self.depth_embeddings,
             self.depthformer_dim,
-            heads,
-            kvh,
-            ff,
             self.codebooks,
             self.hidden,
-            eps,
-            layers,
-            heads_w,
-            PtrLen::bf16(self.depth_linear.weight())?,
-            PtrLen::bf16(self.depth_linear.bias()?)?,
-            cos,
-            sin,
         )
     }
 
-    /// Test/parity seam: disable the flashkern depthformer so the candle op chain runs.
-    /// Select the byte-parity reference chain (see the `reference_numerics` field).
-    pub fn set_reference_numerics(&mut self, on: bool) {
-        self.reference_numerics = on;
-        self.set_depth_flash_enabled(!on);
-    }
-
-    /// Internally-built caches route through this so the reference chain pins the
-    /// ulp-tier flags in ONE place.
     fn new_cache(&self, dtype: DType, device: &Device) -> Result<LfmCache> {
-        let mut cache = LfmCache::new(true, dtype, &self.lfm_cfg, device)?;
-        if self.reference_numerics {
-            cache.grouped_gqa_decode = false;
-        }
-        Ok(cache)
-    }
-
-    pub fn set_depth_flash_enabled(&mut self, on: bool) {
-        if !on {
-            self.depth_flash = None;
-        } else if self.depth_flash.is_none() {
-            self.depth_flash = self.build_depth_flash();
-        }
+        LfmCache::new(true, dtype, &self.lfm_cfg, device)
     }
 
     /// `from_pretrained(dir, device)` — load the model + processor from a
@@ -1322,40 +1315,13 @@ impl LFM2AudioModel {
         sampler: &Sampler,
         stream: &mut SamplingStream,
     ) -> Result<Vec<u32>> {
-        // Pure-NEON path: the whole frame (8 codebook steps × 6 blocks) as one flashkern
-        // dispatch — no candle op runs. Same rounding ladder; the seeded Sampler is shared,
-        // so the RNG stream matches the candle path.
-        if let Some(ctx) = &self.depth_flash {
-            if embedding.device().is_cpu() && embedding.dtype() == DType::BF16 {
-                return self.sample_audio_frame_flash(ctx, embedding, sampler, stream);
-            }
+        let Some(ctx) = &self.depth_flash else {
+            candle_core::bail!("native Depthformer plan is required for inference");
+        };
+        if !embedding.device().is_cpu() || embedding.dtype() != DType::BF16 {
+            candle_core::bail!("native Depthformer requires a resident CPU bf16 hidden plane");
         }
-        // depth_linear(embedding) → (codebooks, depthformer_dim). `embedding` is a
-        // 1-D (D,) lfm hidden; candle's Linear needs a 2-D input, so add a row dim
-        // (Python's nn.Linear accepts the 1-D vector directly).
-        let emb2d = embedding.flatten_all()?.unsqueeze(0)?; // (1, D)
-        let din = linear_forward(&self.depth_linear, &emb2d)?
-            .reshape((self.codebooks, self.depthformer_dim))?;
-        let mut df_token = Tensor::zeros((self.depthformer_dim,), din.dtype(), din.device())?;
-        let mut caches: Vec<LayerKvCache> = (0..self.depthformer.layers.len())
-            .map(|_| LayerKvCache::new())
-            .collect();
-        let mut out = Vec::with_capacity(self.codebooks);
-        for i in 0..self.codebooks {
-            let cur = (din.i(i)? + &df_token)?.reshape((1, 1, self.depthformer_dim))?;
-            let dout = self
-                .depthformer
-                .forward(&cur, Some(caches.as_mut_slice()))?; // (1,1,dim)
-            let dout = dout.reshape((1, self.depthformer_dim))?;
-            let logits = self.depth_embeddings[i].get_logits(&dout)?.i(0)?; // (vocab,)
-            let token = sampler.sample(stream, &logits)?;
-            out.push(token);
-            let tok = Tensor::from_vec(vec![token], (1,), din.device())?;
-            df_token = self.depth_embeddings[i]
-                .embed(&tok)?
-                .reshape((self.depthformer_dim,))?;
-        }
-        Ok(out)
+        self.sample_audio_frame_flash(ctx, embedding, sampler, stream)
     }
 
     /// One frame through [`crate::flashkern::decode::DepthDecode::frame`]: extract the

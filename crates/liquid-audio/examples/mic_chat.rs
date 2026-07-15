@@ -45,7 +45,7 @@ fn select_device() -> Res<Device> {
             }
         }
         Some("cpu") | None => {
-            if liquid_audio::bf16_gemm::bf16_gemm_available() {
+            if liquid_audio::flashkern::native_engine::bf16_gemm_available() {
                 Ok(Device::Cpu)
             } else {
                 Err("CPU BF16 needs the NEON BFMMLA kernel; use Metal on this Mac".into())

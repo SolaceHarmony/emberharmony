@@ -163,7 +163,10 @@ pub fn from_pretrained(
             .map_err(err)?;
     let resident = ResidentWeights::open(dir).map_err(err)?;
     let dtype = resident.dtype();
-    if dtype == DType::BF16 && device.is_cpu() && !crate::bf16_gemm::bf16_gemm_available() {
+    if dtype == DType::BF16
+        && device.is_cpu()
+        && !crate::flashkern::native_engine::bf16_gemm_available()
+    {
         return Err(err(
             "CPU bf16 inference requires the in-tree NEON BFMMLA matmul kernel, but it is \
              unavailable on this machine. Use Metal or a CPU with FEAT_BF16.",

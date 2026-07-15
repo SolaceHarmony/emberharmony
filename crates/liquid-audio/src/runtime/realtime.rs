@@ -3906,7 +3906,7 @@ mod tests {
     #[ignore = "needs the real LFM2.5-Audio model; slow"]
     fn engine_multiturn_grows_conv_cpu() {
         assert!(
-            crate::bf16_gemm::bf16_gemm_available(),
+            crate::flashkern::native_engine::bf16_gemm_available(),
             "CPU BF16 needs the in-tree BFMMLA kernel"
         );
         engine_multiturn_grows_conv_on(Device::Cpu);

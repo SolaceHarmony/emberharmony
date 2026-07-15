@@ -558,7 +558,7 @@ impl Attention {
             && b == 1
             && x.device().is_cpu()
             && x.dtype() == DType::BF16
-            && crate::bf16_gemm::bf16_gemm_nt_available();
+            && crate::flashkern::native_engine::bf16_gemm_available();
         let y = if flashkern_path {
             self.attn_decode_flash(&q, &k, &v, x.dtype())?
         } else {
@@ -783,7 +783,7 @@ impl DecoderLayer {
                 && x.device().is_cpu()
                 && x.dtype() == DType::BF16
                 && x.dims3().map(|(b, s, _)| b * s == 1).unwrap_or(false)
-                && crate::bf16_gemm::bf16_gemm_nt_available()
+                && crate::flashkern::native_engine::bf16_gemm_available()
                 && cache.conv_states[block_idx].is_some()
             {
                 // The whole layer in one native doorbell when the resident table is live.
@@ -965,7 +965,7 @@ impl DecoderLayer {
             && x.device().is_cpu()
             && x.dtype() == DType::BF16
             && x.dims3().map(|(b, s, _)| b * s == 1).unwrap_or(false)
-            && crate::bf16_gemm::bf16_gemm_nt_available())
+            && crate::flashkern::native_engine::bf16_gemm_available())
         {
             return Ok(None);
         }
@@ -1192,7 +1192,7 @@ impl Model {
         if !(cache.grouped_gqa_decode
             && cache.use_kv_cache
             && cache.fused_conv_decode
-            && crate::bf16_gemm::bf16_gemm_nt_available())
+            && crate::flashkern::native_engine::bf16_gemm_available())
         {
             return Ok(false);
         }

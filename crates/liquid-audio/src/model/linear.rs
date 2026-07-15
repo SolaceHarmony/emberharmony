@@ -1,14 +1,5 @@
-use candle_core::{DType, Result, Tensor};
+use candle_core::{CpuStorage, DType, Result, Storage, Tensor};
 use candle_nn::{Conv1d, Conv2d, Linear, Module};
-
-use crate::bf16_gemm::{bf16_matmul, bf16_matmul_accel, bf16_matmul_nt};
-
-/// Decode-side row-count bound for the no-transpose matmul: at small M the weight-transpose
-/// copy (`w.t().contiguous()`) dominates the actual math — profiled at ~97% of CPU decode
-/// time — so `[rows ≤ 4]` (decode steps and suffix chunks) dots the weight in its native
-/// `[N,K]` layout instead. Prefill-scale M keeps the BFMMLA GEMM, where one transpose
-/// amortizes over the M rows.
-const NT_MAX_ROWS: usize = 4;
 
 #[derive(Clone, Debug)]
 pub struct Bf16Linear {
@@ -51,24 +42,7 @@ pub fn linear_forward(linear: &Linear, x: &Tensor) -> Result<Tensor> {
 
 pub fn linear_logits(weight: &Tensor, x: &Tensor) -> Result<Tensor> {
     let y = if weight.device().is_cpu() && x.device().is_cpu() && weight.dtype() == DType::BF16 {
-        // Same small-M dispatch as matmul_flat: at decode the logits head is M==1 against
-        // the biggest weight in the model — the transpose copy hurts the most here.
-        let rows = if x.rank() == 2 { x.dim(0)? } else { usize::MAX };
-        let nt = if rows <= NT_MAX_ROWS {
-            bf16_matmul_nt(x, weight)?
-        } else {
-            None
-        };
-        if let Some(y) = nt {
-            y
-        } else {
-            let Some(y) = bf16_matmul(x, &weight.t()?)? else {
-                candle_core::bail!(
-                    "CPU bf16 linear requested but the NEON BFMMLA kernel is unavailable"
-                );
-            };
-            y
-        }
+        ticket_matmul(x, weight)?
     } else {
         x.matmul(&weight.t()?)?
     };
@@ -136,22 +110,61 @@ fn needs_bf16_cpu_conv(weight: &Tensor, x: &Tensor) -> bool {
 }
 
 fn matmul_flat(linear: &Linear, x: &Tensor) -> Result<Tensor> {
-    if x.dim(0)? <= NT_MAX_ROWS {
-        // `None` means the runtime CPU feature gate rejected the native-layout kernel.
-        if let Some(y) = bf16_matmul_nt(x, linear.weight())? {
-            return Ok(y);
-        }
+    ticket_matmul(x, linear.weight())
+}
+
+/// Temporary Candle ownership rim around one typed Flashkern ticket. Rust only
+/// borrows storage and allocates the compatibility output tensor; C++ owns the
+/// pass and architecture assembly owns every numerical operation.
+fn ticket_matmul(x: &Tensor, weight: &Tensor) -> Result<Tensor> {
+    if !crate::flashkern::native_engine::bf16_gemm_available() {
+        candle_core::bail!("CPU bf16 linear requires the native Flashkern GEMM backend");
     }
-    // Prefill-scale M: the Accelerate/AMX backend (ENGINE_DESIGN.md §E4 — measured
-    // 19–28× the BFMMLA chain, native [N,K] weight, no transpose copy). `None` off
-    // macOS → the BFMMLA path below, same numerics tier as always.
-    if let Some(y) = bf16_matmul_accel(x, linear.weight())? {
-        return Ok(y);
+    let x = x.to_dtype(DType::BF16)?.contiguous()?;
+    let weight = weight.to_dtype(DType::BF16)?.contiguous()?;
+    let (rows, inner) = x.dims2()?;
+    let (output, weight_inner) = weight.dims2()?;
+    if inner != weight_inner {
+        candle_core::bail!(
+            "native linear expects (M,K) x (N,K), got {:?} x {:?}",
+            x.shape(),
+            weight.shape()
+        );
     }
-    let Some(y) = bf16_matmul(x, &linear.weight().t()?)? else {
-        candle_core::bail!("CPU bf16 linear requested but the NEON BFMMLA kernel is unavailable");
-    };
-    Ok(y)
+
+    fn bits<'a>(
+        storage: &'a std::sync::RwLockReadGuard<'_, Storage>,
+        layout: &candle_core::Layout,
+    ) -> Result<&'a [u16]> {
+        let Storage::Cpu(CpuStorage::BF16(values)) = &**storage else {
+            candle_core::bail!("native linear requires CPU bf16 storage");
+        };
+        let (start, end) = layout.contiguous_offsets().ok_or_else(|| {
+            candle_core::Error::Msg("native linear requires contiguous inputs".into())
+        })?;
+        // SAFETY: half::bf16 is transparent over its u16 representation.
+        Ok(unsafe {
+            std::slice::from_raw_parts(values[start..end].as_ptr().cast::<u16>(), end - start)
+        })
+    }
+
+    let (x_storage, x_layout) = x.storage_and_layout();
+    let (weight_storage, weight_layout) = weight.storage_and_layout();
+    let x_bits = bits(&x_storage, x_layout)?;
+    let weight_bits = bits(&weight_storage, weight_layout)?;
+    let mut values = vec![0.0f32; rows * output];
+    if !crate::flashkern::native_engine::process_engine().bf16_gemm_f32(
+        x_bits,
+        weight_bits,
+        &mut values,
+        rows,
+        output,
+        inner,
+        true,
+    ) {
+        candle_core::bail!("native Flashkern GEMM ticket was rejected");
+    }
+    Tensor::from_vec(values, (rows, output), x.device())
 }
 
 fn add_bias(linear: &Linear, y: &Tensor) -> Result<Tensor> {
@@ -173,8 +186,8 @@ fn cast_like_input(y: Tensor, dtype: DType) -> Result<Tensor> {
 mod tests {
     //! Pipeline parity for the bf16 GEMM kernel — the same methodology as
     //! `tests/short_conv_parity.rs`: synthetic candle tensors (no model weights) pushed through
-    //! the **real** consumer ([`linear_forward`], which routes bf16 CPU linears through the
-    //! NEON/x86 kernel via [`bf16_matmul`]), compared against an f32 reference that reproduces the
+    //! the **real** compatibility consumer ([`linear_forward`]), which submits one typed
+    //! Flashkern ticket, compared against an f32 reference that reproduces the
     //! kernel's numerics (bf16-rounded inputs, f32 accumulate, bf16-rounded output). Exercises the
     //! kernel where it's actually used: a single linear, a chained 2-layer stack, a gated MLP
     //! block, and the M==1 decode GEMV — at model-scale contraction depth (K≈2048).
@@ -262,45 +275,8 @@ mod tests {
         md / sc
     }
 
-    #[test]
-    fn accel_prefill_matches_bfmmla_at_f32_tier() {
-        // The E4 backend contract: Accelerate sgemm (AMX order) vs the BFMMLA chain over
-        // the SAME bf16 inputs — identical products, different accumulation order, so the
-        // bound is the f32 tier (measured ≈1e-5 at prefill shapes). Direct fn A/B — the
-        // reference path needs no runtime flag.
-        if !(crate::bf16_gemm::bf16_gemm_accel_available()
-            && crate::bf16_gemm::bf16_gemm_available())
-        {
-            eprintln!("accel or bfmmla backend unavailable — skipping");
-            return;
-        }
-        use crate::bf16_gemm::{bf16_matmul, bf16_matmul_accel};
-        for &(m, k, n) in &[(64usize, 512usize, 384usize), (350, 2048, 512)] {
-            let lin = mk_linear(k, n, 11, false);
-            let x = mk_input(m, k, 17);
-            let a = bf16_matmul_accel(&x, lin.weight())
-                .unwrap()
-                .expect("accel available");
-            let r = bf16_matmul(&x, &lin.weight().t().unwrap())
-                .unwrap()
-                .expect("bfmmla available");
-            let av: Vec<f32> = a.flatten_all().unwrap().to_vec1().unwrap();
-            let rv: Vec<f32> = r.flatten_all().unwrap().to_vec1().unwrap();
-            let (mut md, mut sc) = (0f32, 1e-6f32);
-            for (x, y) in av.iter().zip(&rv) {
-                md = md.max((x - y).abs());
-                sc = sc.max(y.abs());
-            }
-            assert!(
-                md / sc < 1e-4,
-                "m={m} k={k} n={n}: accel vs bfmmla rel {}",
-                md / sc
-            );
-        }
-    }
-
     fn skip() -> bool {
-        if !crate::bf16_gemm::bf16_gemm_available() {
+        if !crate::flashkern::native_engine::bf16_gemm_available() {
             eprintln!("bf16 GEMM kernel unavailable on this target — skipping pipeline parity");
             return true;
         }

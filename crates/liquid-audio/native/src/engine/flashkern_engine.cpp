@@ -39,6 +39,13 @@
 #include <utility>
 #include <vector>
 
+#ifdef __APPLE__
+#ifndef ACCELERATE_NEW_LAPACK
+#define ACCELERATE_NEW_LAPACK 1
+#endif
+#include <Accelerate/Accelerate.h>
+#endif
+
 #include "flashkern_conv.h"
 #include "flashkern_depth.h"
 #include "flashkern_fft.h"
@@ -47,6 +54,7 @@
 #include "flashkern_prng.h"
 #include "flashkern_sampler.h"
 #include "lfm_kernel_bridge.h"
+#include "lfm_model_plan.h"
 
 extern "C" {
 #include "kc_atomic.h"
@@ -219,11 +227,14 @@ struct DepthwiseStreamReq {
 struct GemmReq {
     const uint16_t *a = nullptr;
     const uint16_t *rhs = nullptr;
+    float *amx_a = nullptr;
+    float *amx_rhs = nullptr;
     float *out = nullptr;
     size_t m = 0;
     size_t n = 0;
     size_t k = 0;
     uint32_t rhs_layout = LFM_GEMM_RHS_KN;
+    bool use_amx = false;
 };
 
 struct Dd {
@@ -278,41 +289,6 @@ struct DepthPlan {
     std::vector<float> qkv_f, up_f, q_f, attn_f, proj_f;
     float partials[MAX_WORKERS] = {};
 };
-
-// ---- the resident layer table (C ABI) ------------------------------------------------
-// One entry per backbone block, indexed by block_idx. Pointers are PtrLen-style
-// captures into the model's Arc-stable weight storages, built ONCE at load
-// (lfm_ctx_build) and cleared before the model's weights drop (lfm_ctx_clear via the
-// Rust-side guard). Rung 1 serves conv layers (kind 0); attention slots (kind 1) are
-// placeholders until rung 2.
-extern "C" {
-struct LfmLayerDesc {
-    uint32_t kind; // 0 = shortconv+mlp, 1 = attention (unserved this rung)
-    uint32_t k;    // conv kernel size
-    float op_eps;
-    float ffn_eps;
-    const uint16_t *op_norm_w;  // [H]
-    const uint16_t *ffn_norm_w; // [H]
-    const uint16_t *in_w;       // [3H, H] (B|C|x row order)
-    const uint16_t *conv_w;     // [H, K]
-    const uint16_t *out_w;      // [H, H]
-    const uint16_t *w1;         // [I, H]
-    const uint16_t *w3;         // [I, H]
-    const uint16_t *w2;         // [H, I]
-    // Attention fields (kind 1). q_w == NULL means "attention not served for this
-    // slot" (capture failed at install): conv layers still run; attn requests bail.
-    uint32_t n_head;
-    uint32_t n_kv;
-    uint32_t hd;
-    float qk_eps;
-    const uint16_t *q_w;  // [nh·hd, H]
-    const uint16_t *k_w;  // [nkv·hd, H]
-    const uint16_t *v_w;  // [nkv·hd, H]
-    const uint16_t *o_w;  // [H, nh·hd]
-    const uint16_t *qn_w; // [hd] per-head q RmsNorm
-    const uint16_t *kn_w; // [hd]
-};
-}
 
 struct BackbonePlan {
     uint64_t id = 0;
@@ -390,20 +366,6 @@ struct AtPass {
     size_t h = 0, n_head = 0, n_kv = 0, hd = 0;
 };
 
-// Per-layer per-generation state for the token pass (planes live in the per-cache
-// objects; pointers are captured fresh each token AFTER capacity is ensured).
-extern "C" {
-struct LfmLayerState {
-    uint16_t *k_plane; // attention layers; null for conv
-    uint16_t *v_plane;
-    size_t head_stride;
-    size_t k_len;
-    size_t v_len;
-    uint16_t *conv_state; // conv layers: carried window, advanced IN PLACE; null for attn
-    size_t conv_len;
-};
-}
-
 // Token-pass request: ONE doorbell per token — embed → every layer → final norm →
 // logits. Sampling stays at the rim (RNG-stream parity).
 struct TokenReq {
@@ -455,6 +417,9 @@ struct LfmEngineSnapshotV1 {
     uint32_t descriptor_capacity;
     uint32_t descriptors_live;
     uint32_t max_descriptor_generation;
+    uint32_t attention_qkv_capacity;
+    uint32_t attention_y_capacity;
+    uint32_t attention_score_capacity;
     uint32_t pass_claimed;
 };
 
@@ -527,6 +492,10 @@ struct Engine {
     std::vector<float> tk_logf;         // logits GEMV accumulators [vocab] (staging)
     std::vector<float> sample_weights;  // derived exp weights [largest installed vocab]
     std::vector<float> sample_heap;     // top-k values only; no logit payload copy
+    // Apple matrix-matrix staging. Capacity grows before admission; numerical
+    // lanes only widen into these fixed planes, then one fence callback enters
+    // Accelerate/AMX. No Rust buffer or allocation participates.
+    std::vector<float> gemm_amx_a, gemm_amx_rhs;
     float sample_lane_value[MAX_WORKERS] = {};
     float sample_lane_sum[MAX_WORKERS] = {};
     uint32_t sample_lane_index[MAX_WORKERS] = {};
@@ -1559,6 +1528,35 @@ static void run_gemm(Engine *e, uint32_t lane) {
     const GemmReq &request = e->gemm;
     const size_t lanes = e->lanes_total;
 
+#ifdef __APPLE__
+    if (request.use_amx) {
+        const size_t a_count = request.m * request.k;
+        const size_t rhs_count = request.rhs_layout == LFM_GEMM_RHS_KN
+                                     ? request.k * request.n
+                                     : request.n * request.k;
+        const auto widen = [lane, lanes](const uint16_t *src, float *dst, size_t count) {
+            const size_t chunk = (count + lanes - 1) / lanes;
+            const size_t begin = (size_t)lane * chunk;
+            if (begin >= count) return;
+            const size_t width = std::min(chunk, count - begin);
+            lfm_bf16_to_f32(src + begin, dst + begin, (int)width);
+        };
+        widen(request.a, request.amx_a, a_count);
+        widen(request.rhs, request.amx_rhs, rhs_count);
+        lane_fence(e, lane, [&] {
+            cblas_sgemm(CblasRowMajor, CblasNoTrans,
+                        request.rhs_layout == LFM_GEMM_RHS_NK ? CblasTrans
+                                                              : CblasNoTrans,
+                        (int)request.m, (int)request.n, (int)request.k, 1.0f,
+                        request.amx_a, (int)request.k, request.amx_rhs,
+                        request.rhs_layout == LFM_GEMM_RHS_NK ? (int)request.k
+                                                              : (int)request.n,
+                        0.0f, request.out, (int)request.n);
+        });
+        return;
+    }
+#endif
+
     if (request.rhs_layout == LFM_GEMM_RHS_KN && request.m == 1) {
         if (lane == 0)
             lfm_bf16_gemv_f32(request.a, request.rhs, request.out,
@@ -2099,6 +2097,9 @@ int lfm_engine_snapshot(void *ep, LfmEngineSnapshotV1 *out) {
         .descriptor_capacity = descriptors.capacity,
         .descriptors_live = descriptors.live,
         .max_descriptor_generation = descriptors.max_generation,
+        .attention_qkv_capacity = (uint32_t)e->at_qkvf.size(),
+        .attention_y_capacity = (uint32_t)e->at_y.size(),
+        .attention_score_capacity = (uint32_t)e->at_att.size(),
         .pass_claimed = e->pass_claimed.load(std::memory_order_acquire) ? 1u : 0u,
     };
     return 0;
@@ -2243,7 +2244,11 @@ int lfm_engine_bf16_gemm_f32(
         m > INT_MAX || n > INT_MAX || k > INT_MAX ||
         (rhs_layout != LFM_GEMM_RHS_KN && rhs_layout != LFM_GEMM_RHS_NK))
         return -EINVAL;
+#ifdef __APPLE__
+    if (m == 1 && !lfm_bf16_gemm_available()) return -ENOTSUP;
+#else
     if (!lfm_bf16_gemm_available()) return -ENOTSUP;
+#endif
 
     size_t a_need = 0, rhs_need = 0, out_need = 0;
     if (!depth_mul(m, k, &a_need) ||
@@ -2256,14 +2261,29 @@ int lfm_engine_bf16_gemm_f32(
 
     PassClaim claim(e);
     if (!claim) return -EBUSY;
+    bool use_amx = false;
+#ifdef __APPLE__
+    if (m > 1) {
+        try {
+            e->gemm_amx_a.resize(a_need);
+            e->gemm_amx_rhs.resize(rhs_need);
+        } catch (const std::bad_alloc &) {
+            return -ENOMEM;
+        }
+        use_amx = true;
+    }
+#endif
     e->gemm = {
         .a = a,
         .rhs = rhs,
+        .amx_a = use_amx ? e->gemm_amx_a.data() : nullptr,
+        .amx_rhs = use_amx ? e->gemm_amx_rhs.data() : nullptr,
         .out = out,
         .m = m,
         .n = n,
         .k = k,
         .rhs_layout = rhs_layout,
+        .use_amx = use_amx,
     };
     return submit_pass(e, REQ_GEMM);
 }
@@ -2606,7 +2626,8 @@ int lfm_ctx_build(void *ep, const LfmLayerDesc *descs, size_t n_layers, size_t h
         return -1;
     PassClaim claim(e);
     if (!claim) return -EBUSY;
-    size_t kmax = 1, nh = 0, nkv = 0, hd = 0;
+    size_t kmax = 1;
+    size_t qkv_max = 0, y_max = 0, att_max = 0;
     for (size_t l = 0; l < n_layers; ++l) {
         if (descs[l].kind == 0) {
             if (!descs[l].op_norm_w || !descs[l].ffn_norm_w || !descs[l].in_w ||
@@ -2622,9 +2643,18 @@ int lfm_ctx_build(void *ep, const LfmLayerDesc *descs, size_t n_layers, size_t h
                 descs[l].n_kv == 0 || descs[l].hd == 0 || descs[l].hd > 512 ||
                 descs[l].n_head % descs[l].n_kv != 0 || descs[l].hd % 2 != 0)
                 return -1;
-            nh = descs[l].n_head;
-            nkv = descs[l].n_kv;
-            hd = descs[l].hd;
+            const size_t nh = descs[l].n_head;
+            const size_t nkv = descs[l].n_kv;
+            const size_t hd = descs[l].hd;
+            if (nkv > (SIZE_MAX - nh) / 2) return -EOVERFLOW;
+            size_t qkv = 0, y = 0, att = 0;
+            if (!depth_mul(nh + 2 * nkv, hd, &qkv) ||
+                !depth_mul(nh, hd, &y) ||
+                !depth_mul(nh, max_ctx, &att))
+                return -EOVERFLOW;
+            qkv_max = std::max(qkv_max, qkv);
+            y_max = std::max(y_max, y);
+            att_max = std::max(att_max, att);
         }
     }
     std::unique_ptr<BackbonePlan> next(new (std::nothrow) BackbonePlan());
@@ -2645,11 +2675,11 @@ int lfm_ctx_build(void *ep, const LfmLayerDesc *descs, size_t n_layers, size_t h
         grow(e->sc_projb, h);
         grow(e->sc_stage, h);
         grow(e->sc_mid, h);
-        if (nh > 0) {
-            grow(e->at_qkvf, (nh + 2 * nkv) * hd);
-            grow(e->at_qkvb, (nh + 2 * nkv) * hd);
-            grow(e->at_y, nh * hd);
-            grow(e->at_att, nh * max_ctx);
+        if (qkv_max > 0) {
+            grow(e->at_qkvf, qkv_max);
+            grow(e->at_qkvb, qkv_max);
+            grow(e->at_y, y_max);
+            grow(e->at_att, att_max);
         }
         grow(e->tk_h0, h);
         grow(e->tk_h1, h);

@@ -41,11 +41,14 @@ fn main() {
     }
 
     println!("cargo::rerun-if-changed=native/src/engine/flashkern_engine.cpp");
+    println!("cargo::rerun-if-changed=native/src/model/lfm_model.cpp");
     println!("cargo::rerun-if-changed=native/include/flashkern_conv.h");
     println!("cargo::rerun-if-changed=native/include/flashkern_depth.h");
     println!("cargo::rerun-if-changed=native/include/flashkern_fft.h");
     println!("cargo::rerun-if-changed=native/include/flashkern_gemm.h");
     println!("cargo::rerun-if-changed=native/include/flashkern_math.h");
+    println!("cargo::rerun-if-changed=native/include/lfm_model.h");
+    println!("cargo::rerun-if-changed=native/include/lfm_model_plan.h");
     println!("cargo::rerun-if-changed=../kcoro-sys/vendor/kcoro_arena/include");
     // C++23, not a style choice: this TU includes kcoro headers, and C++23 is
     // the FIRST standard that requires <stdatomic.h> to work in C++ and expose
@@ -56,6 +59,7 @@ fn main() {
     // same std for consistency.
     cc::Build::new()
         .file("native/src/engine/flashkern_engine.cpp")
+        .file("native/src/model/lfm_model.cpp")
         .cpp(true)
         .std("c++23")
         .opt_level(3)
@@ -63,6 +67,7 @@ fn main() {
         .flag("-ffp-contract=off")
         .flag("-pthread")
         .include("native/include")
+        .include("native/vendor")
         .include("../kcoro-sys/vendor/kcoro_arena/include")
         .compile("lfm_flashkern_engine");
 

@@ -13,14 +13,14 @@
 
 #[path = "runtime/audio_out.rs"]
 pub mod audio_out; // AudioDetokenizer trait + backends (LFM2 detok / Mimi)
-#[path = "compute/bf16_gemm.rs"]
-pub mod bf16_gemm; // native SIMD bf16 CPU matmul (closes candle's bf16 gemm gap)
 pub mod candle_ext; // vendored candle 0.10 backports + extensions (kept on the 0.9.2 pin)
 pub mod chat_template; // load-time verification vs the snapshot chat_template.jinja
 pub mod data; // data/ (data-pipeline value types)
 pub mod detokenizer; // detokenizer.py
+mod ffi;
 #[path = "compute/flashkern/mod.rs"]
-pub mod flashkern; // CPU replicas of the Metal JIT kernels (NEON / AVX SIMD + the GPU dispatch model)
+pub mod flashkern; // temporary Rust ABI rims for the native Flashkern engine
+pub mod handles;
 pub mod loader; // config.json + safetensors → model + processor
 pub mod mimi_native; // native C++/NEON/AMX Mimi decode kernel rim (native/src/mimi)
 pub mod model;
@@ -41,6 +41,10 @@ pub mod weights; // native resident checkpoint image + temporary Candle compatib
 
 pub use audio_out::{AudioDetokenizer, MimiDetokenizer};
 pub use detokenizer::LFM2AudioDetokenizer;
+pub use handles::{
+    ConversationConfig as NativeConversationConfig, EmbeddingKind, ModelInfo as NativeModelInfo,
+    NativeConversation, NativeError, NativeModel, TokenResult as NativeTokenResult,
+};
 pub use loader::{from_pretrained, from_pretrained_hub};
 pub use model::lfm2_audio::{GenParams, GenToken, LFM2AudioModel, PrefillCursor};
 pub use processor::{ChatState, LFM2AudioProcessor, SpecialTokenIds};

@@ -6,7 +6,7 @@ This document has two registers, kept strictly apart:
 
 - **As-built** sections describe what is in the working tree *now*, verified against the
   source (`src/compute/flashkern/`, `src/model/lfm2_hf.rs`, `src/model/lfm2_audio.rs`,
-  `src/compute/bf16_gemm.rs`, `native/kernels/*`). If it says "as-built", the code does it.
+  `src/model/linear.rs`, `native/kernels/*`). If it says "as-built", the code does it.
 - **The contract** and **Build order → Planned** sections describe *agreed design* that is
   not yet built. Nothing in a "planned" block is running today.
 
@@ -232,8 +232,7 @@ Depthformer programs plus the lower-level kernel inventory.
 
 | Region | As-built path | Where |
 |---|---|---|
-| bf16 linears (prefill-scale `M`) | one `REQ_GEMM`; fixed native lanes invoke NEON BFMMLA/BFDOT or x86 AVX2/AVX-512-BF16 leaves | `flashkern_gemm.h`, `native_engine.rs`, architecture TUs |
-| bf16 linears (decode, `M ≤ 4`) | one `REQ_GEMM` over checkpoint-native `[N,K]`; no weight transpose | `bf16_gemm.rs`, `linear.rs` (`NT_MAX_ROWS = 4`) |
+| bf16 linears (all row counts) | one `REQ_GEMM` over checkpoint-native `[N,K]`; native dispatch selects assembly GEMV or the matrix backend without a Rust numerical op | `flashkern_gemm.h`, `native_engine.rs`, `linear.rs`, architecture TUs |
 | backbone KV | resident `KvSlot` in-place append + narrow views (§3 tier 1) | `lfm2_hf.rs` |
 | backbone GQA (decode, `seq==1`) | regrouped-`q` view against shared KV heads — **no `repeat_kv`** materialization; gated by `grouped_gqa_decode` | `lfm2_hf.rs` `Attention::forward` |
 | ShortConv (CPU bf16 prefill/continuation) | one `REQ_DEPTHWISE_STREAM`; NEON/AVX rows read split state/input and write output/next-state directly | `flashkern/candle_ops.rs`, `native/include/flashkern_conv.h`, `flashkern_engine.cpp`, both architecture TUs |
@@ -257,10 +256,8 @@ are not product fallback modes and are deleted with the Candle owners:
   ops — the reference the fused conv1d_update kernel must match.
 - The former model-level Depthformer/reference switch is deleted. Native-plan
   construction failure now rejects inference instead of selecting Candle.
-- **`bf16_gemm_nt_available()`** is a *strict* gate (flashkern nt kernel built + FEAT present),
-  distinct from the looser `bf16_gemm_available()` (also satisfied by the reference-only
-  build). The nt paths gate on the strict one; the loose one would let them run with no kernel
-  body.
+- **`native_engine::bf16_gemm_available()`** queries the mounted native backend.
+  The former Rust `CustomOp2` capability and dispatch module is deleted.
 
 ---
 
@@ -286,9 +283,9 @@ deviation (a different, equally-sensible slogan on a 96-token run), which is exa
   resolution, across lane counts; native MLP vs the threadgroup port bit-for-bit.
 - **Lane determinism / bit-parity** (`flashkern/decode.rs`): the same dispatch shape twice is
   bit-identical (fixed row ownership, fixed reduce order).
-- **Pipeline parity** (`model/linear.rs`): synthetic tensors through the real `linear_forward`
-  vs an f32 reference reproducing the kernel numerics — single linear, 2-layer stack, gated
-  MLP, and the `M==1` decode GEMV.
+- **Pipeline parity** (`model/linear.rs`): synthetic compatibility tensors submit the real
+  typed native ticket and compare against an f32 oracle — single linear, 2-layer stack,
+  gated MLP, and the `M==1` decode GEMV.
 - **GQA ulp bound** (`model/lfm2_hf.rs` `grouped_gqa_matches_expanded_at_f32_ulp`).
 - **Kernel suites** (`flashkern/neon.rs`, `flashkern/x86.rs`): GEMM/GEMV/SMMLA/reductions/
   TBL/conv1d/FFT/double-double, feature-gated so they skip on CPUs lacking the extension.

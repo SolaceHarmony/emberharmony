@@ -200,10 +200,14 @@ struct EngineSnapshot {
     descriptor_capacity: u32,
     descriptors_live: u32,
     max_descriptor_generation: u32,
+    attention_qkv_capacity: u32,
+    attention_y_capacity: u32,
+    attention_score_capacity: u32,
     pass_claimed: u32,
 }
 
 extern "C" {
+    fn lfm_bf16_gemm_available() -> i32;
     #[cfg(test)]
     fn lfm_rsqrt_size(value: usize) -> f32;
     #[cfg(test)]
@@ -440,6 +444,13 @@ pub(crate) fn depthwise_stream_available() -> bool {
     unsafe { lfm_depthwise_stream_bf16_available() != 0 }
 }
 
+/// Native assembly GEMM capability. This is a property of the mounted
+/// Flashkern backend; Rust neither selects an implementation nor performs math.
+pub fn bf16_gemm_available() -> bool {
+    // SAFETY: capability query accepts no pointers and mutates no state.
+    unsafe { lfm_bf16_gemm_available() != 0 }
+}
+
 /// Handle to the persistent native engine. One per process is the intended shape
 /// (decode is sequential). The C side is a SINGLE-SLOT machine — one Pass, one
 /// scratch arena, one request word — so the wrapper serializes the entire native
@@ -459,6 +470,10 @@ unsafe impl Send for NativeEngine {}
 unsafe impl Sync for NativeEngine {}
 
 impl NativeEngine {
+    pub(crate) fn raw_ptr(&self) -> *mut c_void {
+        self.ptr
+    }
+
     pub fn new(workers: usize) -> Option<Self> {
         let _ = kcoro_sys::link_anchor as fn();
         // SAFETY: plain constructor call; null = failure.
@@ -494,7 +509,7 @@ impl NativeEngine {
         out: &mut [u16],
         lanes: usize,
     ) -> bool {
-        if !crate::bf16_gemm::bf16_gemm_nt_available() {
+        if !bf16_gemm_available() {
             return false;
         }
         let h = x.len();
@@ -1582,7 +1597,7 @@ mod tests {
 
     #[test]
     fn typed_gemm_layouts_and_gemv_use_one_ticket_each() {
-        if !crate::bf16_gemm::bf16_gemm_available() {
+        if !bf16_gemm_available() {
             eprintln!("native bf16 GEMM opcodes unavailable - skipping");
             return;
         }
@@ -2125,6 +2140,79 @@ mod tests {
         assert_eq!(bits_of(&k_plane_eng), kp_ref, "K plane after append");
         assert_eq!(bits_of(&v_plane_eng), vp_ref, "V plane after append");
         engine.ctx_clear(ctx_id);
+    }
+
+    #[test]
+    fn attention_scratch_uses_maximum_geometry_across_every_layer() {
+        if !crate::flashkern::decode::fused_mlp_available() {
+            eprintln!("fused kernels unavailable - skipping");
+            return;
+        }
+        let engine = NativeEngine::new(4).expect("native engine init");
+        let (h, ffn, max_ctx) = (8usize, 8usize, 8usize);
+        let norm = vec![0x3f80u16; h];
+        let matrix = vec![0x3d00u16; h * h * 2];
+        let square = vec![0x3c80u16; h * h];
+        let desc = |heads: u32| LayerDesc {
+            kind: 1,
+            op_eps: 1e-5,
+            ffn_eps: 1e-5,
+            op_norm_w: norm.as_ptr(),
+            ffn_norm_w: norm.as_ptr(),
+            w1: square.as_ptr(),
+            w3: square.as_ptr(),
+            w2: square.as_ptr(),
+            n_head: heads,
+            n_kv: 1,
+            hd: 4,
+            qk_eps: 1e-5,
+            q_w: matrix.as_ptr(),
+            k_w: matrix.as_ptr(),
+            v_w: matrix.as_ptr(),
+            o_w: square.as_ptr(),
+            qn_w: norm.as_ptr(),
+            kn_w: norm.as_ptr(),
+            ..LayerDesc::attn_placeholder()
+        };
+        // The larger layer deliberately precedes the smaller one. The old builder
+        // sized shared planes from the final descriptor and overran them on layer 0.
+        let descriptors = [desc(2), desc(1)];
+        let id = engine
+            .ctx_build(&descriptors, h, ffn, max_ctx)
+            .expect("mixed attention context");
+        let snapshot = engine.snapshot();
+        assert!(snapshot.attention_qkv_capacity as usize >= 16);
+        assert!(snapshot.attention_y_capacity as usize >= 8);
+        assert!(snapshot.attention_score_capacity as usize >= 2 * max_ctx);
+
+        let x = vec![0x3f00u16; h];
+        let rope_cos = vec![0x3f80u16; max_ctx * 2];
+        let rope_sin = vec![0u16; max_ctx * 2];
+        for (layer, heads) in [2usize, 1].into_iter().enumerate() {
+            let head_stride = max_ctx * 4;
+            let mut keys = vec![0u16; head_stride];
+            let mut values = vec![0u16; head_stride];
+            let mut out = vec![0u16; h];
+            assert!(unsafe {
+                engine.attn_layer(
+                    id,
+                    layer,
+                    &x,
+                    keys.as_mut_ptr(),
+                    keys.len(),
+                    values.as_mut_ptr(),
+                    values.len(),
+                    head_stride,
+                    0,
+                    rope_cos.as_ptr(),
+                    rope_sin.as_ptr(),
+                    rope_cos.len(),
+                    &mut out,
+                    heads,
+                )
+            });
+        }
+        engine.ctx_clear(id);
     }
 
     #[test]

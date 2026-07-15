@@ -42,15 +42,13 @@ a real kernel instead of falling back to f32:
 
 - **`native/kernels/aarch64/flashkern_neon.cpp`** — the live BFMMLA kernel library,
   including packed GEMM/GEMV and native-layout decode forms with bf16 inputs and f32 accumulation.
-- **`src/compute/bf16_gemm.rs`** — FFI + **runtime FEAT_BF16 gate** (`has_feat_bf16()` via sysctl; a
-  binary stays portable, BFMMLA `SIGILL`s without it) + `Bf16Gemm` **`CustomOp2`** (the single
-  FFI site, composes as a candle tensor op) + `bf16_matmul(&a,&b) -> Option<Tensor>` wrapper.
-- **Verified**: `bf16_gemm_matches_f32_reference` → **max 0.000e0 (rel 0.000e0)** vs the f32
-  reference (bf16-rounded inputs, f32 matmul) on 5×13×7 (exercises the padded edges).
+- **`flashkern/native_engine.rs`** exposes only the native capability query and typed
+  ticket ABI. `src/compute/bf16_gemm.rs` and its Candle `CustomOp2` are deleted.
+- **Verified**: typed `REQ_GEMM` fixtures cover checkpoint-native and transposed
+  layouts plus decode GEMV; AArch64 and Rosetta execute the same ABI.
 
-**Done (task #25):** backbone/depthformer/conformer/detokenizer linears now route BF16 CPU
-weights through `Bf16Gemm`/`bf16_matmul`, and `loader.rs` derives persistent weight dtype from
-safetensors instead of accepting a caller-selected dtype.
+The temporary Candle linear owner borrows contiguous storage and submits `REQ_GEMM`.
+No Rust numerical implementation or architecture selection remains in that route.
 
 **Caution.** The 2-D linear path is BF16 on CPU when the checkpoint is BF16 and FEAT_BF16 is
 available. The intentional F32 paths are local math/accumulation only: audio preprocessing,
@@ -134,7 +132,7 @@ model and adds explicit barge-in, rather than imposing Moshi's frame loop on it.
 
 ## Files
 
-`src/compute/threads.rs`, `src/compute/bf16_gemm.rs`, `native/kernels/aarch64/flashkern_neon.cpp`, `build.rs`, `src/runtime/realtime.rs`,
+`src/compute/threads.rs`, `src/compute/flashkern/native_engine.rs`, `native/kernels/aarch64/flashkern_neon.cpp`, `build.rs`, `src/runtime/realtime.rs`,
 `src/runtime/voice_runtime.rs`, `examples/duplex_chat.rs`, `examples/chat_multiturn.rs`,
 `examples/text_chat.rs`, `Cargo.toml` (`rayon`/`num_cpus`/`libc`/`half`/`crossbeam-channel`
 deps, `cc` build-dep, `accelerate`/`metal` features), `src/model/lfm2_audio.rs`

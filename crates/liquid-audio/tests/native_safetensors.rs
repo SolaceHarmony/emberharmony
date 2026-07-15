@@ -7,13 +7,37 @@ use liquid_audio::weights::{ResidentWeights, WeightDType};
 const OK: i32 = 0;
 const FORMAT: i32 = -3;
 const NOT_FOUND: i32 = -5;
-const ABI: u32 = 1;
+const WEIGHT_ABI: u32 = 1;
+const MODEL_ABI: u32 = 2;
 const BF16: u32 = 13;
 const F32: u32 = 16;
 
 #[repr(C)]
 struct WeightImage {
     _private: [u8; 0],
+}
+
+#[repr(C)]
+struct NativeModel {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct ModelInfo {
+    size: u32,
+    abi_version: u32,
+    resident_bytes: u64,
+    plan_id: u64,
+    depth_plan_id: u64,
+    hidden: u32,
+    ffn: u32,
+    layers: u32,
+    vocab: u32,
+    max_context: u32,
+    codebooks: u32,
+    capabilities: u32,
+    reserved: [u32; 5],
 }
 
 #[repr(C)]
@@ -58,6 +82,17 @@ extern "C" {
         out: *mut TensorView,
     ) -> i32;
     fn lfm_weights_dtype_name(dtype: u32) -> *const c_char;
+    fn lfm_engine_new(workers: i32) -> *mut c_void;
+    fn lfm_engine_free(engine: *mut c_void);
+    fn lfm_model_open(
+        engine: *mut c_void,
+        path: *const c_char,
+        out: *mut *mut NativeModel,
+        error: *mut c_char,
+        error_length: usize,
+    ) -> i32;
+    fn lfm_model_close(model: *mut NativeModel) -> i32;
+    fn lfm_model_info(model: *const NativeModel, out: *mut ModelInfo) -> i32;
 }
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -121,6 +156,25 @@ fn write_raw(path: &Path, header: serde_json::Value, data: &[u8]) {
     file.extend_from_slice(&header);
     file.extend_from_slice(data);
     std::fs::write(path, file).unwrap();
+}
+
+fn write_zero_bf16_model(path: &Path, tensors: &[(String, Vec<u64>)]) {
+    let mut root = serde_json::Map::new();
+    let mut data = Vec::new();
+    for (name, shape) in tensors {
+        let bytes = shape.iter().product::<u64>() as usize * 2;
+        let begin = data.len();
+        data.resize(begin + bytes, 0);
+        root.insert(
+            name.clone(),
+            serde_json::json!({
+                "dtype": "BF16",
+                "shape": shape,
+                "data_offsets": [begin, begin + bytes],
+            }),
+        );
+    }
+    write_raw(path, serde_json::Value::Object(root), &data);
 }
 
 struct Image(*mut WeightImage);
@@ -194,7 +248,7 @@ fn native_file_is_one_aligned_image_with_stable_views() {
 
     let view = image.find("backbone.weight").unwrap();
     assert_eq!(view.size as usize, std::mem::size_of::<TensorView>());
-    assert_eq!(view.abi_version, ABI);
+    assert_eq!(view.abi_version, WEIGHT_ABI);
     assert_eq!(view.dtype, BF16);
     assert_eq!(view.rank, 1);
     assert_eq!(view.elements, 2);
@@ -210,6 +264,194 @@ fn native_file_is_one_aligned_image_with_stable_views() {
         b"BF16"
     );
     assert_eq!(image.find("missing.weight").unwrap_err(), NOT_FOUND);
+}
+
+#[test]
+fn opaque_native_model_and_conversation_own_the_complete_token_state() {
+    let temp = Temp::new();
+    let hidden = 8u64;
+    let ffn = 12u64;
+    let vocab = 16u64;
+    let codebooks = 2u64;
+    let mut tensors = vec![
+        ("lfm.embed_tokens.weight".into(), vec![vocab, hidden]),
+        ("lfm.embedding_norm.weight".into(), vec![hidden]),
+    ];
+    for layer in 0..2 {
+        let root = format!("lfm.layers.{layer}.");
+        tensors.extend([
+            (format!("{root}operator_norm.weight"), vec![hidden]),
+            (format!("{root}ffn_norm.weight"), vec![hidden]),
+            (format!("{root}feed_forward.w1.weight"), vec![ffn, hidden]),
+            (format!("{root}feed_forward.w3.weight"), vec![ffn, hidden]),
+            (format!("{root}feed_forward.w2.weight"), vec![hidden, ffn]),
+        ]);
+    }
+    let attention = "lfm.layers.0.self_attn.";
+    tensors.extend([
+        (format!("{attention}q_proj.weight"), vec![hidden, hidden]),
+        (format!("{attention}k_proj.weight"), vec![4, hidden]),
+        (format!("{attention}v_proj.weight"), vec![4, hidden]),
+        (format!("{attention}out_proj.weight"), vec![hidden, hidden]),
+        (format!("{attention}q_layernorm.weight"), vec![4]),
+        (format!("{attention}k_layernorm.weight"), vec![4]),
+    ]);
+    let conv = "lfm.layers.1.conv.";
+    tensors.extend([
+        (format!("{conv}in_proj.weight"), vec![3 * hidden, hidden]),
+        (format!("{conv}conv.weight"), vec![hidden, 1, 3]),
+        (format!("{conv}out_proj.weight"), vec![hidden, hidden]),
+    ]);
+    let depth_dim = 8u64;
+    let depth_ffn = 256u64;
+    let depth_qkv = 16u64;
+    let depth_vocab = 11u64;
+    let depth = "depthformer.layers.0.";
+    tensors.extend([
+        (
+            format!("{depth}operator.qkv_proj.weight"),
+            vec![depth_qkv, depth_dim],
+        ),
+        (
+            format!("{depth}operator.out_proj.weight"),
+            vec![depth_dim, depth_dim],
+        ),
+        (
+            format!("{depth}operator.bounded_attention.q_layernorm.weight"),
+            vec![4],
+        ),
+        (
+            format!("{depth}operator.bounded_attention.k_layernorm.weight"),
+            vec![4],
+        ),
+        (format!("{depth}operator_norm.weight"), vec![depth_dim]),
+        (format!("{depth}ffn_norm.weight"), vec![depth_dim]),
+        (
+            format!("{depth}feed_forward.w1.weight"),
+            vec![depth_ffn, depth_dim],
+        ),
+        (
+            format!("{depth}feed_forward.w3.weight"),
+            vec![depth_ffn, depth_dim],
+        ),
+        (
+            format!("{depth}feed_forward.w2.weight"),
+            vec![depth_dim, depth_ffn],
+        ),
+        (
+            "depth_linear.weight".into(),
+            vec![codebooks * depth_dim, hidden],
+        ),
+        ("depth_linear.bias".into(), vec![codebooks * depth_dim]),
+    ]);
+    for codebook in 0..codebooks {
+        let root = format!("depth_embeddings.{codebook}.");
+        tensors.extend([
+            (
+                format!("{root}embedding.weight"),
+                vec![depth_vocab, depth_dim],
+            ),
+            (format!("{root}embedding_norm.weight"), vec![depth_dim]),
+            (
+                format!("{root}to_logits.weight"),
+                vec![depth_vocab, depth_dim],
+            ),
+        ]);
+    }
+    write_zero_bf16_model(&temp.0.join("model.safetensors"), &tensors);
+    std::fs::write(
+        temp.0.join("config.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "codebooks": codebooks,
+            "depthformer": {
+                "layers": 1,
+                "dim": depth_dim,
+                "heads": 2,
+                "kv_heads": 1
+            },
+            "lfm": {
+                "vocab_size": vocab,
+                "hidden_size": hidden,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 1,
+                "norm_eps": 1e-5,
+                "max_position_embeddings": 32,
+                "conv_L_cache": 3,
+                "layer_types": ["full_attention", "conv"],
+                "block_ff_dim": ffn,
+                "block_auto_adjust_ff_dim": false
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let engine = unsafe { lfm_engine_new(2) };
+    assert!(!engine.is_null());
+    let path = CString::new(temp.0.as_os_str().as_encoded_bytes()).unwrap();
+    let mut model = std::ptr::null_mut();
+    let mut error = [0i8; 512];
+    let status = unsafe {
+        lfm_model_open(
+            engine,
+            path.as_ptr(),
+            &mut model,
+            error.as_mut_ptr(),
+            error.len(),
+        )
+    };
+    assert_eq!(
+        status,
+        0,
+        "native model open failed: {}",
+        unsafe { CStr::from_ptr(error.as_ptr()) }.to_string_lossy()
+    );
+    assert!(!model.is_null());
+    let mut info = ModelInfo {
+        size: std::mem::size_of::<ModelInfo>() as u32,
+        abi_version: MODEL_ABI,
+        ..Default::default()
+    };
+    assert_eq!(unsafe { lfm_model_info(model, &mut info) }, 0);
+    assert_eq!(
+        (info.hidden, info.ffn, info.layers, info.vocab),
+        (8, 12, 2, 16)
+    );
+    assert_eq!(info.max_context, 32);
+    assert_eq!(info.codebooks, 2);
+    assert!(info.plan_id > 0);
+    assert!(info.depth_plan_id > 0);
+    assert_eq!(info.capabilities & 1, 1);
+    assert!(info.resident_bytes > 0);
+
+    assert_eq!(unsafe { lfm_model_close(model) }, 0);
+    unsafe { lfm_engine_free(engine) };
+
+    let model = liquid_audio::NativeModel::open(&temp.0).expect("safe opaque model");
+    let safe_info = model.info().expect("safe model info");
+    assert_eq!((safe_info.hidden, safe_info.layers), (8, 2));
+    assert!(safe_info.depthformer);
+    let mut conversation = model
+        .conversation(liquid_audio::NativeConversationConfig {
+            seed: Some(7),
+            temperature: None,
+            top_k: None,
+        })
+        .expect("native conversation");
+    let first = conversation
+        .step(&[3], liquid_audio::EmbeddingKind::Text)
+        .expect("first native token pass");
+    assert_eq!((first.position, first.sampled_token), (0, 0));
+    let second = conversation
+        .step(&[first.sampled_token], liquid_audio::EmbeddingKind::Text)
+        .expect("second native token pass");
+    assert_eq!((second.position, second.sampled_token), (1, 0));
+    conversation.reset().expect("native conversation reset");
+    let reset = conversation
+        .step(&[3], liquid_audio::EmbeddingKind::Text)
+        .expect("reset native token pass");
+    assert_eq!((reset.position, reset.sampled_token), (0, 0));
 }
 
 #[test]

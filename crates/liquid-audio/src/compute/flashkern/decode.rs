@@ -48,7 +48,7 @@ impl<T: Copy> Shared<T> {
 
 /// `true` when the fused decode blocks can run through the native-layout kernel.
 pub fn fused_mlp_available() -> bool {
-    crate::bf16_gemm::bf16_gemm_nt_available()
+    crate::flashkern::native_engine::bf16_gemm_available()
 }
 
 #[inline]
