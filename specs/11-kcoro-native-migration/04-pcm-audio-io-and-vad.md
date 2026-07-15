@@ -202,13 +202,13 @@ The exact thresholds continue to come from `LfmSessionConfigV1`, populated by
 
 ### Predictive pause as a ticketed candidate
 
-Speculative preparation is an ordinary coordination action, not a second VAD or
-scheduler mechanism. When `Pause -> Prepared` occurs, the Rust coordinator:
+Speculative preparation is an ordinary native coordination action, not a second
+VAD or scheduler mechanism. When `Pause -> Prepared` occurs, the native session:
 
 1. freezes a `CandidateMark` containing the conversation/context mark, retained
    PCM end, candidate epoch, and output epoch;
 2. creates one parent candidate ticket retaining that mark and input-span lease;
-3. submits frontend/prefill work as full-pass child tickets through the broker;
+3. submits frontend/prefill work as native full-pass child tickets;
 4. keeps completed prepared state private until endpoint commit wins;
 5. publishes no user turn, transcript, or playback merely because preparation
    completed.
@@ -218,7 +218,7 @@ speech, stop, and fault race through the same one-winner claim/publish machinery
 used by other kcoro operations. Numerical child completion is not that decision:
 it may finish before or after the VAD race.
 
-- If endpoint commit wins, the coordinator adopts a current-generation prepared
+- If endpoint commit wins, the native session adopts a current-generation prepared
   result or continues the missing child work, then submits the real response.
 - If resumed speech wins, it advances the candidate epoch and cancels the parent.
   Queued children never dispatch; an active child finishes its full pass and is

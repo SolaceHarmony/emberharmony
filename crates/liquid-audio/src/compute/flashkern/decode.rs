@@ -19,7 +19,32 @@
 //! kernel; each lane owns a contiguous slice of output rows.
 
 #[cfg(test)]
-use super::fanout::Shared;
+#[derive(Clone, Copy)]
+struct Shared<T>(*mut T);
+
+// SAFETY: reference lanes write disjoint indices between real blocking barriers.
+#[cfg(test)]
+unsafe impl<T> Send for Shared<T> {}
+#[cfg(test)]
+unsafe impl<T> Sync for Shared<T> {}
+
+#[cfg(test)]
+impl<T: Copy> Shared<T> {
+    #[inline]
+    fn ptr(self) -> *mut T {
+        self.0
+    }
+
+    #[inline]
+    unsafe fn get(self, index: usize) -> T {
+        *self.0.add(index)
+    }
+
+    #[inline]
+    unsafe fn set(self, index: usize, value: T) {
+        *self.0.add(index) = value;
+    }
+}
 
 /// `true` when the fused decode blocks can run through the native-layout kernel.
 pub fn fused_mlp_available() -> bool {

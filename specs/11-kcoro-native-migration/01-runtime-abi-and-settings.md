@@ -6,14 +6,14 @@ Baselines: EmberHarmony `321538f11749`; `kcoro_arena` `447d04f0246b`.
 
 ## Goal
 
-Define one stable product C ABI plus one private SQ/CQ leaf through which Rust
-controls the native voice runtime. Tauri remains the product host; the dedicated
-Rust kcoro runtime owns realtime policy. Rust validates persisted settings,
-resolves model directories and credentials, coordinates opaque descriptors, and
-forwards small events. It does not own model tensors, PCM, numerical inference
-state, or compute/audio worker loops. C++ opens model files and is the sole
-caller of numerical kernel tables; Rust exposes no DSP, model, sampler, codec,
-or payload-bearing math API.
+Define one stable product C ABI plus two deliberately separate private queue
+contracts. The native model SQ/CQ stays entirely native. The Rust/native docking
+ring carries only PCM/control leases. Tauri remains the product host; Rust owns
+OS audio streams, persisted settings, opaque handles, and bounded event
+projection. Rust kcoro parks and resumes audio/control I/O continuations only.
+It does not own model tensors, passes, tokens, recurrence, or numerical state.
+C++ opens model files and controls plans, buffers, barriers, and dispatch; every
+numerical body called by that control layer is architecture assembly.
 
 ## Current Boundary
 
@@ -48,15 +48,16 @@ or payload-bearing math API.
 8. The ABI is a control plane, not an operator API. It exposes lifecycle,
    commands, bounded metadata events, and snapshots; it has no generic tensor
    operation or numerical payload push/pull function.
-9. Rust kcoro owns action/pass ticket identity and terminal promises. Native pass
-   slots remain private handles named by generation-protected descriptor IDs;
-   Tauri receives only bounded value snapshots and metadata events.
+9. The native runtime owns model action/pass ticket identity and terminal
+   promises. Rust kcoro owns only audio/control I/O operation identity. Native
+   pass slots remain generation-protected private handles; Tauri receives only
+   bounded value snapshots and metadata events.
 10. Reliable semantic callbacks and lossy telemetry observers are separate sink
     classes. Observer failure can never stop or delay a session.
-11. A fixed lane may publish one CQ cell and ring its doorbell, but it never
-    invokes arbitrary Rust. The resulting Rust continuation runs on a dedicated
-    kcoro worker, never on a fixed compute lane, audio callback, storage writer,
-    or Tauri thread.
+11. A fixed lane may publish one native CQ cell and ring its doorbell, but it
+    never invokes Rust. A native continuation consumes that edge. Rust kcoro is
+    resumed only by the separate PCM/control dock, never by an internal model
+    pass completion.
 
 ## Handle Graph
 
@@ -65,14 +66,14 @@ flowchart TB
     Runtime["LfmRuntime: workers, capabilities, platform adapters"]
     Model["LfmModel: immutable config, tokenizers, weight images, plans"]
     Session["LfmSession: audio streams, rings, VAD, native state"]
-    Scope["Rust kcoro session/conversation scope"]
+    Scope["Rust kcoro audio/control scope"]
     Conv["LfmConversation: mutable context and model state"]
-    Action["parent action ticket: turn, frame, workflow"]
-    Pass["child pass ticket: one full numerical pass"]
+    Action["native action ticket: turn, frame, workflow"]
+    Pass["native child pass ticket"]
 
     Runtime --> Model
     Runtime --> Session
-    Runtime --> Scope
+    Session --> Scope
     Model --> Session
     Session --> Conv
     Scope --> Action
@@ -380,8 +381,8 @@ Semantics:
 - `destroy` performs no implicit unbounded join. It requires a joined object.
 - `on_stopped` is the final reliable semantic callback and occurs exactly once
   before join returns. Observer callbacks use their own detach/join contract.
-- action/pass terminal promises finish inside Rust kcoro coordination before
-  projected semantic or telemetry events reach the Tauri host;
+- model action/pass terminal promises finish inside native coordination before
+  PCM/control edges or projected telemetry reach the Rust host;
 - each pass ticket is single-shot and distinguishes numerical completion from
   committed versus stale publication.
 

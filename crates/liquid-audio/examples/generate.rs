@@ -155,15 +155,7 @@ fn main() -> Res<()> {
         dir.display()
     );
     let t0 = std::time::Instant::now();
-    #[allow(unused_mut)]
-    let (mut model, proc) = from_pretrained(&dir, &device)?;
-    // `--reference`: the byte-parity reference chain (DECODE_ENGINE.md §5) — every
-    // ulp-tier decode deviation pinned off so the run reproduces the recorded
-    // wav-hash baseline bit-for-bit.
-    if std::env::args().any(|a| a == "--reference") {
-        model.set_reference_numerics(true);
-        eprintln!("[mode] reference numerics: grouped-GQA off, depth-flash off");
-    }
+    let (model, proc) = from_pretrained(&dir, &device)?;
     let mimi = MimiModel::new(
         proc.mimi()
             .ok_or("Mimi codec not loaded — required by liquid_audio/demo/chat.py")?,

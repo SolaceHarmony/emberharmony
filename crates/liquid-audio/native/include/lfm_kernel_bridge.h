@@ -114,10 +114,6 @@ typedef struct LFM_KERNEL_ALIGNAS(64) KcCompletionV1 {
 
 typedef struct LfmKernelBridge LfmKernelBridge;
 
-typedef int (*LfmKernelSubmitFn)(void *context,
-                                 const KcSubmissionV1 *submission,
-                                 KcCompletionV1 *completion);
-
 typedef void (*LfmKernelDescriptorReleaseFn)(void *payload, void *context);
 
 typedef struct LfmKernelDescriptorSpecV1 {
@@ -175,9 +171,10 @@ typedef struct LfmKernelBridgeSnapshotV1 {
 } LfmKernelBridgeSnapshotV1;
 
 /*
- * Rust side. One broker is the sole SQ producer and one ingress thread is the
- * sole CQ consumer. Accepted submissions reserve one CQ cell until consumed.
- * A nonzero deadline is an absolute monotonic timestamp; zero waits forever.
+ * Native submission side. The model runtime is the sole SQ producer and CQ
+ * consumer in production. Rust bindings exercise this protocol only in tests.
+ * Accepted submissions reserve one CQ cell until consumed. A nonzero deadline
+ * is an absolute monotonic timestamp; zero waits forever.
  */
 int lfm_kernel_bridge_create(const LfmKernelBridgeConfigV1 *config,
                              LfmKernelBridge **out);

@@ -86,14 +86,15 @@ crossbeam-channel = "0.5"
 candle-flashfftconv = { path = "../candle-flashfftconv", optional = true }
 # Vendored kcoro C/assembly runtime; liquid-audio owns the private FFI layer.
 kcoro-sys = { path = "../kcoro-sys" }
-# Callback-driven Rust policy scheduler. Numerical work remains below the C ABI.
-kcoro = { path = "../kcoro" }
 # Native mic capture + speaker playback for the in-process `VoiceRuntime`
 # service. Optional so non-voice consumers don't pull a media backend.
 cpal = { version = "0.15", optional = true }
 
 [dev-dependencies]
 anyhow = "1"
+# Rust kcoro remains the conformance oracle for the raw docking-ring tests. The
+# production inference engine owns its SQ/CQ and progress entirely in native code.
+kcoro = { path = "../kcoro" }
 # Temporary reference oracle for CPU kernel translations.
 candle-flashfftconv = { path = "../candle-flashfftconv" }
 # Native mic capture + speaker playback for the live `mic_chat` example.

@@ -66,8 +66,9 @@ jobs:
       - name: Test kcoro sys crate
         run: cargo test -p kcoro-sys --tests -- --nocapture
 
-      # The Rust coordinator is the realtime policy kernel. Its suite includes the
-      # 100,000-iteration terminal race, ring wrap/close gates, and stop admission.
+      # Rust kcoro is the PCM/control docking runtime, not the model-pass broker.
+      # Its suite includes the 100,000-iteration terminal race, ring wrap/close
+      # gates, and stop admission used by asynchronous host I/O scopes.
       - name: Test Rust kcoro coordinator
         run: cargo test -p kcoro --all-targets -- --nocapture
 

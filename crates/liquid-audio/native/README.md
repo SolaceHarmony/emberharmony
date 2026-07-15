@@ -2,13 +2,15 @@
 
 - `include/` — shared native ABI headers.
 - `src/io/` — native model-file readers and resident weight-image construction.
-- `src/engine/` — resident native stage-machine implementation.
-- `kernels/aarch64/` — NEON/AArch64 kernels.
-- `kernels/x86_64/` — AVX/x86-64 kernels.
+- `src/engine/` — non-numerical resident control, stage, queue, and barrier implementation.
+- `kernels/aarch64/` — hand-written AArch64/NEON assembly math.
+- `kernels/x86_64/` — hand-written x86-64 assembly math.
 - `reference/` — reference or fallback kernels.
 
-Cargo builds these sources through `../build.rs`; symbol names are kept stable for
-the Rust FFI layer in `src/compute/flashkern`.
+Cargo builds these sources through `../build.rs`. Rust sees opaque engine/model
+handles and PCM/control docking records, never numerical kernel symbols. The
+remaining architecture `.cpp` numerical bodies are migration debt and must be
+deleted as their paired `.S` families land.
 
 ## Resident Weights
 

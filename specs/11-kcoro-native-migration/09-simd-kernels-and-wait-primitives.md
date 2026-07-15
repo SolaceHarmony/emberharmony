@@ -1,4 +1,4 @@
-# SIMD Kernels, Accelerate Dispatch, and Wait Primitives
+# Assembly Kernels, Accelerate Dispatch, and Wait Primitives
 
 Status: normative design. The zero-spin wait-word substrate is implemented at
 upstream `bd530f4c9196` and the fixed Flashkern lane mount at `d2c43abd`; the
@@ -15,10 +15,11 @@ Fix the compute substrate for every native stage in documents 03 through 07:
   Flashkern. A CPU "tensor" is a pointer, a shape fact recorded in a plan, and a
   kernel. Apple GPU matrix coprocessing is mandatory and belongs to a separate
   MLX C++/Metal device engine, never inside Flashkern.
-- **Math is house SIMD.** aarch64 NEON and x86_64 AVX2/AVX-512 kernels are
-  written as `.S` where hand scheduling matters and as fixed-shape intrinsic
-  translation units where compiler output is measured and disassembled. Scalar
-  C++ oracles exist only in the native test target.
+- **All math is assembly.** AArch64 NEON and x86_64 AVX2/AVX-512 numerical
+  kernels are hand-written `.S`. Production Rust and C++ contain no floating
+  arithmetic, SIMD intrinsics, scalar libm loop, tensor object, or compiler-owned
+  numerical body. Scalar oracles exist only in a separately linked native test
+  target.
 - **Accelerate is an Apple-native stage backend, not a tensor framework.** At
   model open, actual model shapes are benchmarked against house kernels from a
   versioned tuning profile. A stage binds `cblas_sgemm` only when parity passes
@@ -29,12 +30,11 @@ Fix the compute substrate for every native stage in documents 03 through 07:
   registers and rechecks, then blocks through the host wait-word adapter. There
   is no bounded spin or monitor-wait budget before parking.
 - **The numerical call graph is native pass descriptor -> C++ fixed executor ->
-  kernel table.** Rust converts settings, coordinates tickets/scopes, publishes
-  descriptor IDs, and consumes compact terminal facts. C++ owns model loading,
-  pointer binding, stage planning, sampling, state mutation, and dispatch. No
-  numerical kernel, SIMD intrinsic, payload-bearing FFI method, or unsafe math
-  block exists in production Rust; transitional Rust rims are deleted per
-  documents 02 and 07, not optimized.
+  assembly table.** Rust converts settings and owns PCM/control I/O scopes only.
+  C++ owns model loading, pointer binding, stage planning, state ownership, and
+  dispatch, but performs no arithmetic. Sampling, state transforms, and every
+  kernel leaf execute in assembly. Transitional Rust and C++ numerical bodies
+  are deleted per documents 02 and 07, not optimized.
 
 ## Current Ownership Debt
 
@@ -54,13 +54,13 @@ words and blocks through prepared `kc_port_wait_u32` handles at
 |---|---|---|
 | resampling and audio accumulation | `crates/liquid-audio/src/processor.rs:1089-1163` | native frontend plan and SIMD resampler |
 | DFT, mel filtering, log, and normalization | `crates/liquid-audio/src/processor.rs:254-472` | native mel stages and reduction kernels |
-| Conformer and adapter tensor graph | `crates/liquid-audio/src/model/conformer/encoder.rs:185-317` and `crates/liquid-audio/src/model/lfm2_audio.rs:403-419` | C++ pass plan over kernel-table entries |
-| sampling and token recurrence | Native collective: `native/src/engine/flashkern_engine.cpp:776-896`; transitional owner/recurrence: `crates/liquid-audio/src/model/lfm2_audio.rs:199-281` and `1630-1743` | sampler math is mounted; move opaque RNG/state append into native conversation state and retain Rust kcoro only for recurrence policy over compact result IDs |
+| Conformer and adapter tensor graph | `crates/liquid-audio/src/model/conformer/encoder.rs:185-317` and `crates/liquid-audio/src/model/lfm2_audio.rs:403-419` | C++ pass plan over assembly-table entries |
+| sampling and token recurrence | Native collective: `native/src/engine/flashkern_engine.cpp:806-970`; transitional owner/recurrence: `crates/liquid-audio/src/model/lfm2_audio.rs:199-281` and `1630-1743` | sampler leaves are assembly-mounted; move opaque RNG/state append and next-pass selection into native conversation control; Rust receives no per-pass result IDs |
 | Moshi frame arithmetic/state | `crates/liquid-audio/src/runtime/realtime.rs:1850-2065` | native Moshi pass program |
 | native pass entered through Rust capture/trampoline | `crates/liquid-audio/src/compute/flashkern/native_engine.rs:544-593` and `native/src/engine/flashkern_engine.cpp:1283-1291` | model-bound C++ plan with no Rust callback |
 | aarch64 feature flags applied to the whole kernel translation unit | `crates/liquid-audio/build.rs:45-58` | baseline and BF16/I8MM objects compiled separately; C++ binds one table after capability checks |
 | hot-call panel storage and packing | `crates/liquid-audio/native/kernels/aarch64/flashkern_neon.cpp:74-162` and `native/kernels/x86_64/flashkern_x86.cpp:74-154` | prepack immutable weights at model open and reserve mutable scratch in the plan; no `std::vector`, resize, assign, or payload repack in a pass |
-| scalar/libm activation and softmax loops | `flashkern_neon.cpp:942-968` and `flashkern_x86.cpp:756-788` | fixed-shape house vector transcendental kernels with test-only scalar oracle |
+| C++ intrinsic/libm activation and softmax loops | `flashkern_neon.cpp` and `flashkern_x86.cpp` | paired fixed-shape `.S` transcendental kernels with test-only scalar oracle; delete the C++ bodies |
 | sampler and PRNG | Native ChaCha20 block kernels are implemented in `native/kernels/{aarch64,x86_64}/flashkern_prng.S`; `run_sampler` is mounted inside token and Depthformer passes, with `REQ_SAMPLE` as a standalone fallback/conformance leaf. | move the one shared stream image from the Rust generation rim into each native conversation; never issue a pass ticket per random draw or codebook |
 | CPU streaming short-conv | `REQ_DEPTHWISE_STREAM`, `lfm_depthwise_stream_bf16`, and `flashkern_conv.h` borrow split state/input/weight planes and write output/state directly | keep this CPU-only; replace the sibling Candle Metal route with MLX C++/Metal rather than adding Metal dispatch to Flashkern |
 
@@ -70,11 +70,12 @@ words and blocks through prepared `kc_port_wait_u32` handles at
 |---|---|---|---|
 | Candle, Moshi-Candle, MLX-CPU, Eigen, CPU tensor frameworks | Banned from Flashkern and final CPU inference | Not linked or called | May run only from a pinned Git worktree; deleted code is never copied forward |
 | MLX C++/Metal device backend | Required peer backend; never linked into Flashkern | Allowed in its own device tests | Temporary Candle Metal may supply migration fixtures |
-| Accelerate BLAS (`cblas_sgemm` family) on Apple | Allowed only for profile-selected matmul stages that beat house kernels and pass parity | Allowed | Not applicable |
+| Accelerate BLAS (`cblas_sgemm` family) on Apple | Allowed only as a profile-selected opaque machine-code/AMX backend; C++ dispatches but performs no math | Allowed | Not applicable |
 | Accelerate vDSP/vForce/BNNS | Not used initially; vDSP FFT requires document 05's separate parity gate | Allowed | Not applicable |
 | External BLAS on x86_64 (MKL, OpenBLAS) | Not used; house kernels own x86_64 | Allowed as a benchmark oracle only | Not applicable |
-| `<arm_neon.h>`, `<immintrin.h>`, inline asm, `.S` | Production substrate | Allowed | Not applicable |
-| scalar C++ and scalar libm transcendentals | **Temporary migration exception:** current native softmax/activation compatibility paths still call scalar platform functions. Replace with fixture-pinned house vector kernels before production cutover. | Allowed as oracle | Not applicable |
+| architecture `.S` | Production numerical substrate | Allowed | Not applicable |
+| `<arm_neon.h>`, `<immintrin.h>`, C++ inline asm | Migration debt; absent at cutover | Allowed in a separately linked oracle/benchmark target | Not applicable |
+| scalar C++ and scalar libm transcendentals | Migration debt; absent at cutover | Allowed as oracle | Not applicable |
 
 Transcendentals used by the model — `exp` (softmax), `tanh`, exact-`erf` GELU,
 `log` (mel guard) — must become house vector kernels with stored fixtures. Their
@@ -350,8 +351,9 @@ hardware callbacks. Hardware callbacks never wait.
   on Apple), SLEEF/SVML, or vector-libm symbol in the production native
   library.
 - A call-stack/symbol test proves the local numerical path begins at descriptor
-  dispatch in the fixed C++ executor, remains in native stage and kernel code,
-  and contains no Rust frame or payload-bearing Rust FFI symbol.
+  dispatch in the fixed C++ executor, enters an architecture `.S` symbol before
+  touching payload values, and contains no Rust frame, C++ numerical body, or
+  payload-bearing Rust FFI symbol.
 - The release link map contains no scalar oracle objects. Unsupported ISA
   selection fails before model readiness rather than falling back.
 - bf16 expand path is bit-exact against the shift-expand definition on both

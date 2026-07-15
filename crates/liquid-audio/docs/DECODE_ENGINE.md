@@ -16,23 +16,23 @@ the dispatch model, verification, and the build order.
 
 ---
 
-## 0. As-built architecture (2026-07-14 working tree)
+## 0. As-built architecture (2026-07-15 working tree)
 
-The CPU engine now has two intentionally different scheduling domains:
+The CPU engine owns its model-pass scheduling domain entirely in native code:
 
 - Flashkern owns one stable pthread per numerical lane. Every lane runs the same
-  ordinary C++ pass program, claims disjoint tiles, and blocks on a cache-line-local
-  expected-value word between passes and at straggler fences.
-- the safe Rust `kcoro::Executor` owns one broker future as the sole SQ producer.
-  A dedicated `kcoro-cq` ingress thread blocks on the native CQ doorbell, resolves
-  one preallocated result slot, and wakes that broker edge. The vendored C
-  `kcoro_arena` ticket scheduler is a conformance oracle, not this production path.
+  non-numerical C++ control program, claims disjoint tiles, calls architecture
+  assembly, and blocks on a cache-line-local expected-value word between passes
+  and at straggler fences.
+- one native dispatcher consumes the private SQ, and the native submitter parks
+  on the private CQ. The vendored C `kcoro_arena` ticket scheduler remains a
+  conformance oracle; Rust kcoro is reserved for the outer PCM/control dock.
 
 There is no stackful dispatcher, coroutine stack, architecture context switch,
 per-tile channel message, copied pass payload, or per-pass heap allocation. The
 C++ rim writes one borrowed request slot, creates a generation-protected descriptor
-whose payload is `Engine*`, and invokes the registered Rust submitter. That callback
-blocks on a precreated result-slot `Condvar` until CQ ingress resolves it.
+whose payload is `Engine*`, submits it to the native SQ, and waits on the native CQ
+expected-value doorbell. The registered Rust submitter ABI is deleted.
 
 The native lane idle wait and every C++ generation fence are zero-spin.
 Depthformer now runs as typed `REQ_DEPTH_FRAME`; its former Rust `SpinBarrier`,
@@ -44,19 +44,16 @@ backend is a separate future MLX C++/Metal engine; device routing stays above bo
 
 ```mermaid
 flowchart LR
-    Caller["Rust/Candle caller"] --> Rim["C++ single borrowed request slot"]
-    Rim -->|"registered callback"| Broker["Rust result slot + kcoro broker"]
-    Broker -->|"128-byte SQ cell"| Bridge["native SQ/CQ + retained descriptor"]
+    Caller["temporary compatibility caller"] --> Rim["C++ single borrowed request slot"]
+    Rim -->|"128-byte SQ cell"| Bridge["native SQ/CQ + retained descriptor"]
     Bridge --> Doorbell["release-publish generation + wake"]
     Doorbell --> Team["fixed Flashkern pthread lanes"]
     Team --> Board["shared stage board<br/>atomic tile claims"]
     Board --> Fence["generation fence<br/>expected-value park"]
-    Fence --> Kernels["NEON / AVX / assembly"]
+    Fence --> Kernels["AArch64 / x86_64 assembly math"]
     Kernels --> Final["program-final fence"]
     Final --> CQ["128-byte CQ cell + doorbell"]
-    CQ --> Ingress["dedicated Rust CQ ingress"]
-    Ingress --> Broker
-    Broker -->|"resolve blocking callback"| Rim
+    CQ -->|"exact native wake"| Rim
     Rim --> Caller
 ```
 
@@ -75,7 +72,7 @@ pointers, disjoint channel rows, and one final generation fence.
 
 The idle contract is measured, not inferred: the production-backed macOS test sees
 0.002% process CPU with eight lanes parked both before and after a pass. Native MLP
-bit parity still passes through the brokered fixed executor. Historical performance
+bit parity still passes through the native fixed executor. Historical performance
 measurements remain in git history; new latency numbers must name this executor and
 its exact model/test configuration.
 
@@ -118,16 +115,17 @@ as-built. Read this as the spec, not the changelog.
    `name → (offset, shape)` table parsed straight from safetensors. Candle is a
    migration oracle, not a target production owner. Reads are the floor; any
    weight movement is theft on top of it.
-2. **Compute.** resident bytes → SIMD registers → f32 accumulates **in registers** → one
+2. **Compute.** resident bytes -> assembly vector registers -> f32 accumulates **in registers** -> one
    round-to-nearest-even → KB-scale bf16 activation writes. f32 never exists as *planes*, only
    as register accumulators (an rb-epilogue in every kernel). **KV planes are bf16** (torch's
    cache dtype — f32 KV was the wrong call twice over: memory *and* fidelity).
-3. **Dispatch.** `lfm_token_pass(ctx*)` — Rust hands off **once** per full pass (a text token,
-   or a whole 8-codebook audio frame). The persistent pinned P-core lane team runs the chain as
-   a resident stage machine: publish stage state, bump epoch, workers pull tile indices with an
-   atomic counter, and the last worker rings the coordinator. Sampling lands on lane 0; results
-   land in arena ring slots. The doorbell (epoch + reason word) is checked at the **pass
-   boundary and nowhere inside**; event backpressure never touches it.
+3. **Dispatch.** the native conversation submits and recurs full passes without a
+   Rust model-progress edge. The persistent pinned P-core lane team runs the
+   chain as a resident stage machine: publish stage state, bump epoch, workers
+   pull tile indices with an atomic counter, and the last worker rings the native
+   continuation. Sampling is an assembly collective; results land in native
+   ring slots. The doorbell (epoch + reason word) is checked at the **pass boundary
+   and nowhere inside**; event backpressure never touches it.
 4. **Transport.** Rings + `(offset, len, epoch)` descriptors, no owned `Vec` payloads on hot
    surfaces.
 
@@ -244,10 +242,11 @@ Depthformer programs plus the lower-level kernel inventory.
 | audio frame (CPU, bf16) | one `REQ_DEPTH_FRAME`: projection, all Depthformer codebooks/layers, KV recurrence, collective sampling, embedding feedback | `native/src/engine/flashkern_engine.cpp`, `flashkern/decode.rs`, `lfm2_audio.rs` |
 | remaining prefill and Metal device graph | mixed Candle migration path; streaming CPU short-conv is already native | model modules; optional Metal dependency |
 
-### Parity flags & seams (AS-BUILT)
+### Transitional parity seams (AS-BUILT debt)
 
-Every fast path has a switch that drops to a reference the fast path must match — never an
-ambient global; a per-`Cache` field or a per-model seam so tests A/B on the same weights:
+The remaining cache flags predate the no-legacy rule. They may support focused
+migration fixtures while their assembly replacements are being proven, but they
+are not product fallback modes and are deleted with the Candle owners:
 
 - **`Cache.grouped_gqa_decode`** (default `true`). `false` runs the expanded `repeat_kv`
   form — the byte-parity reference. The grouped view computes the same per-head dot products;
@@ -256,9 +255,8 @@ ambient global; a per-`Cache` field or a per-model seam so tests A/B on the same
   *will* diverge sampled streams — so byte-parity oracles pin `false`.
 - **`Cache.fused_conv_decode`** (default `true`). `false` runs the composed candle ShortConv
   ops — the reference the fused conv1d_update kernel must match.
-- **`LFM2AudioModel::set_depth_flash_enabled(bool)`**. `false` drops the `DepthDecode` path
-  and runs the candle depthformer op chain. The flash frame shares the *same seeded sampler*,
-  so the RNG stream matches the candle path token-for-token.
+- The former model-level Depthformer/reference switch is deleted. Native-plan
+  construction failure now rejects inference instead of selecting Candle.
 - **`bf16_gemm_nt_available()`** is a *strict* gate (flashkern nt kernel built + FEAT present),
   distinct from the looser `bf16_gemm_available()` (also satisfied by the reference-only
   build). The nt paths gate on the strict one; the loose one would let them run with no kernel
@@ -270,10 +268,10 @@ ambient global; a per-`Cache` field or a per-model seam so tests A/B on the same
 
 The oracle that caught the real bugs, plus the standing parity tests.
 
-### The wav-hash byte oracle
+### The wav-hash byte fixture
 
-Greedy text + **seeded** audio ⇒ `shasum out.wav` is a byte-level, whole-pipeline parity gate.
-It is cheap and decisive: run it before/after any numerics-adjacent change. It did real work —
+Greedy text + **seeded** audio produces a committed byte-level fixture. The
+production binary does not execute a Candle reference mode to obtain it. It did real work —
 it **split** the exact resident-KV append (bit-identical wav) from the grouped-GQA ulp
 deviation (a different, equally-sensible slogan on a 96-token run), which is exactly why
 `grouped_gqa_decode` exists as a flag with `false` pinned to byte-parity.
@@ -325,18 +323,18 @@ extrapolate.
 
 ## 7. Build order
 
-1. **Fixed numerical executor and first Rust broker boundary: built.** Stable
+1. **Fixed numerical executor and native SQ/CQ boundary: built.** Stable
    pthread lanes, zero-spin native expected-value waits, one pointer-stable
-   request slot, native SQ/CQ, retained descriptors, one safe Rust broker, one CQ
-   ingress owner, and deletion of the stackful runtime are live.
+   request slot, native SQ/CQ, retained descriptors, native endpoint ownership,
+   and deletion of the stackful runtime are live.
 2. **Typed native passes and callback deletion: built.** Depthformer, streaming
    convolution, GEMM/GEMV, DD FFT convolution, and DD inverse FFT use typed
    pointer-borrowed requests. `REQ_CALL`, `NativeEngine::run_lanes/grid`, and the
    exported callback fence are deleted.
-3. **Rust recurrence and parent action coordinator.** Move parent/child tickets,
-   scope epochs, service classes, and recurrence into the dedicated Rust kcoro
-   runtime. Native completion wakes that registered continuation directly; Tauri
-   and serialized IPC remain outside progress.
+3. **Native recurrence and parent action coordinator.** Move parent/child
+   tickets, scope epochs, service classes, and recurrence into the native
+   session. Native completion wakes that continuation directly. Rust kcoro docks
+   PCM/control only; Tauri and serialized IPC remain outside progress.
 4. **Complete native model path.** Build multi-token full/suffix prefill next,
    then finish Conformer, mel, codec, and remaining math described by migration
    documents 02 and 04 through 08. Candle is an oracle during migration, not a

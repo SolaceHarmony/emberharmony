@@ -11,9 +11,9 @@ than a close final waveform: it includes exact shapes, state progression,
 conversation semantics, full-pass interruption, bounded memory, precise wakes,
 no post-load disk traffic, no hidden fallback, and the actual Tauri microphone
 and speaker path. It also means the local numerical stack has the fixed shape
-native pass descriptor -> C++ fixed executor -> architecture kernel table. Rust
-may publish the descriptor ID and consume compact completion facts, but it has
-no arithmetic or payload-bearing math call.
+native session -> native pass descriptor -> C++ fixed executor -> architecture
+assembly. Rust publishes and consumes PCM/control leases only; it has no model
+descriptor, token, arithmetic, or payload-bearing math call.
 
 No phase becomes the production default because it compiles or wins a microbench.
 It advances only when its numerical, lifecycle, memory, latency, dependency, and
@@ -27,10 +27,11 @@ The migration starts with useful tests, not a blank slate:
 |---|---|---|
 | native safetensors image tests | `crates/liquid-audio/tests/native_safetensors.rs` | Convert to direct native-loader and malformed-input tests. |
 | native attention/conv/MLP parity | `src/compute/flashkern/native_engine.rs:592-1050` | Preserve as boundary fixtures independent of Candle calls. |
-| lane/fanout numerical tests | `src/compute/flashkern/fanout.rs:1251-1888` and architecture kernel modules | Move stable fixture vectors into native tests. |
+| former lane/fanout numerical tests | `fanout.rs` is deleted in the current working tree; architecture kernel modules retain the live fixtures | Keep stable fixture vectors in native/assembly tests; do not restore the Rust implementation. |
 | engine idle/zero-spin test | `tests/engine_idle_zero_spin.rs` | Extend to coordination signal-one and fixed-executor blocking wait/syscall assertions. |
-| Rust coordinator races and edge tests | `crates/kcoro/tests/` at `3a5b1431` | Preserve 100,000 terminal races, ring wrap/full/close, self-wake exclusion, and stop-admission teardown on every host. Extend with cross-language and scope-doorbell gates. |
-| mounted Rust broker/CQ lifecycle | `src/compute/flashkern/coordinator.rs` and `native_engine.rs:1551-1625` at `4f06a3d5` | Preserve missing-broker rejection, exact descriptor cleanup, 10,000 mounted passes, zero live slots, endpoint joins, arm64/x86 execution, and idle-CPU checks. Extend to one million passes and stop-during-active-pass races. |
+| Rust kcoro races and edge tests | `crates/kcoro/tests/` at `3a5b1431` | Preserve 100,000 terminal races, ring wrap/full/close, self-wake exclusion, and stop-admission teardown for the PCM/control dock. |
+| native SQ/CQ lifecycle | `flashkern_engine.cpp:1898-2003` and native-engine tests | Preserve raw no-Rust progress, exact descriptor cleanup, 10,000 passes, zero live slots, AArch64/x86 execution, and idle CPU. Extend to one million passes and stop-during-active-pass races. |
+| scalar assembly ABI | `scalar_assembly_math_abi_is_bit_exact_without_simd_feature_gates` | Run on AArch64 and x86_64/Rosetta even when feature-gated SIMD tests skip. |
 | speculative prefill and cache tests | `tests/speculative_prefill.rs`, `tests/cache_equivalence.rs` | Re-express against native conversation marks and suffix state. |
 | end-to-end generation | `tests/e2e_generate.rs` | Pin full token/text/audio-code traces and state hashes. |
 | native Mimi parity | `tests/mimi_native_parity.rs` | Retain full-length comparison, KV wrap, and direct-output variant. |
@@ -493,18 +494,20 @@ The migration is complete only when:
 
 - G0 through G11 pass on required architectures;
 - LFM2 and the product-selected Moshi path run entirely behind the native ABI;
-- runtime weights, activations, model state, PCM, logits, sampler state, and
-  codec state never enter Rust; recurrence policy may consume compact CQ facts;
-- Rust invokes control/config/lifecycle/coordination methods only; model loading
-  and every numerical operation are owned by C++ and the selected native kernel
-  table;
+- runtime weights, activations, model state, logits, sampler state, and codec
+  state never enter Rust; Rust owns only PCM streams/leases and control facts and
+  receives no internal model CQ records;
+- Rust invokes audio/config/lifecycle/control methods only; C++ owns loading,
+  plans, buffers, queues, barriers, and dispatch, while every numerical operation
+  is implemented by the selected architecture assembly table;
 - the release link map contains no scalar test oracle or numerical Rust symbol;
 - post-load inference performs no disk access;
 - after the one hardware callback copy, payload handoffs are pointer/offset
   descriptors and kernels write final destinations;
 - stop/interrupt decisions occur at full pass boundaries;
-- every accepted action/pass is represented by a single-shot Rust ticket and
-  its exact continuation runs only on dedicated kcoro workers;
+- every accepted model action/pass is represented by a single-shot native ticket
+  and resolves an exact native continuation; Rust kcoro tickets are limited to
+  PCM/control docking operations on dedicated workers;
 - one model serves multiple isolated hot conversations;
 - Rust/TypeScript public control behavior remains compatible;
 - the production dependency and symbol graph contains no Candle inference path,

@@ -1,7 +1,7 @@
-# Mimi → C++/NEON port manifest
+# Mimi Assembly Port Manifest
 
-The mission clause this executes: the voice pipeline decode path ports to
-kcoro/NEON/C++ as a tight kernel. After the backbone (`REQ_TOKEN_PASS`) and the
+The mission clause this executes: the voice pipeline decode path becomes
+non-numerical C++ control over kcoro-aware assembly stages. After the backbone (`REQ_TOKEN_PASS`) and the
 typed Depthformer (`REQ_DEPTH_FRAME`), **Mimi is the largest Candle compute left per frame**:
 every 80 ms audio frame runs a full candle graph (moshi crate) → PCM. This
 manifest scopes the port; the first pass is swarmed one-file-per-agent,
@@ -175,7 +175,7 @@ streaming.rs (`StreamTensor` = Option<Tensor>) becomes explicit
       through mimi_decoder_step (negative rc never reads as priming);
       upsample weight validated exact-shape + non-null.
 - [ ] engine integration (the remaining rung): Mimi as a native C++ lane
-      program on the same Flashkern team through the Rust broker/native SQ/CQ —
+      program on the same Flashkern team through the native SQ/CQ —
       REQ_MIMI at the F4 doorbell,
       units band-split per the NOTES maps (conv: out-channel; attention:
       head; sweeps: sub-range), zero-spin parked fences. Today the kernel is

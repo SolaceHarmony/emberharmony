@@ -6,13 +6,13 @@ Rust entrypoint at `packages/desktop/src-tauri`.
 
 ## Crates
 
-- `crates/liquid-audio` - current hybrid LFM2.5-Audio crate; target is a thin
-  Rust handle wrapper over the complete C++/SIMD/assembly local voice runtime.
+- `crates/liquid-audio` - current hybrid LFM2.5-Audio crate; target is a Rust
+  PCM/control host over non-numerical C++ control and assembly-only inference.
 - `crates/candle-flashfftconv` - migration-only Candle operators, deleted when
   the native production kernel gates pass.
-- `crates/kcoro` - dependency-free safe Rust coordination kernel. Its first
-  production mount owns the sole Flashkern SQ broker future and exact CQ wake
-  edge; scopes, child tickets, recurrence, and service policy remain open.
+- `crates/kcoro` - dependency-free safe Rust coordination kernel for PCM/control
+  docking and future Tauri-side asynchronous work. It does not broker Flashkern
+  model passes.
 - `crates/kcoro-sys` - build-only sys crate for the vendored C conformance
   oracle and expected-value host waits. Its C ticket scheduler is tested but is
   not on Flashkern's production pass path.
@@ -22,13 +22,11 @@ Rust entrypoint at `packages/desktop/src-tauri`.
 - Bun/TypeScript calls Tauri commands; it does not import or build native crates directly.
 - Tauri depends on `liquid-audio` by path and owns persisted settings, command
   registration, opaque handle lifetime, and bounded event projection.
-- `liquid-audio` currently owns the hybrid Rust/Candle model rim, the safe Rust
-  coordinator endpoint, and the private C ABI. C++ owns the resident checkpoint
-  image, native SQ/CQ and descriptors, fixed numerical lanes, and SIMD/assembly
-  dispatch.
-- `crates/kcoro` owns product coordination. At the current mount it routes one
-  synchronous borrowed-pointer pass; at cutover it owns scopes, tickets, and
-  recurrence without owning model math.
+- `liquid-audio` currently owns the hybrid Rust/Candle migration rim and private
+  C ABI. C++ owns the resident checkpoint image, native SQ/CQ, descriptors, and
+  fixed lane control; paired `.S` files increasingly own the numerical bodies.
+- `crates/kcoro` owns Rust PCM/control scopes and tickets. Model recurrence and
+  model pass tickets stay native.
 - `kcoro-sys` compiles the C oracle and platform wait adapter. It is not the
   product policy scheduler.
 
@@ -37,9 +35,9 @@ Rust entrypoint at `packages/desktop/src-tauri`.
 `crates/liquid-audio/native/` uses C++/assembly-friendly directories:
 
 - `include/` — native ABI headers when a C/C++ interface needs to be shared.
-- `src/engine/` — resident native stage-machine code.
-- `kernels/aarch64/` — NEON/AArch64 kernels.
-- `kernels/x86_64/` — AVX/x86-64 kernels.
+- `src/engine/` — resident non-numerical stage, queue, and barrier control.
+- `kernels/aarch64/` — AArch64/NEON assembly math.
+- `kernels/x86_64/` — x86-64 assembly math.
 - `reference/` - test-only scalar oracles excluded from the production link map;
   no historical production implementation is retained.
 

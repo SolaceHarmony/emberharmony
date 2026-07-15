@@ -1,12 +1,10 @@
 //! The Rust rim of the resident native decode engine (native/src/engine/flashkern_engine.cpp).
 //!
-//! Everything below the ABI line is C++: the persistent fixed-lane team, the block
-//! schedules, the stage kernels. Rust's per-pass surface is one blocking call while
-//! borrowed tensor pointers remain in use. Internally, the callback-driven coordinator
-//! is the sole SQ producer and its ingress thread is the sole CQ consumer. No Rust runs
-//! numerical stages and no application event loop makes progress for the kernel.
+//! Everything below the ABI line is native: C++ owns plans, lifetimes, and pass
+//! scheduling, while architecture-specific assembly owns model numerics. Rust is not
+//! an inference scheduler; this temporary rim disappears when callers dock PCM leases
+//! through the native audio-session ABI.
 
-use super::coordinator::{self, Coordinator};
 use std::ffi::c_void;
 use std::sync::Mutex;
 
@@ -206,6 +204,41 @@ struct EngineSnapshot {
 }
 
 extern "C" {
+    #[cfg(test)]
+    fn lfm_rsqrt_size(value: usize) -> f32;
+    #[cfg(test)]
+    fn lfm_inv_rms_f32(sum: f32, count: usize, epsilon: f32) -> f32;
+    #[cfg(test)]
+    fn lfm_sum_f32(values: *const f32, count: usize) -> f32;
+    #[cfg(test)]
+    fn lfm_bf16_sumsq_stride_f32(
+        values: *const u16,
+        count: usize,
+        start: usize,
+        stride: usize,
+    ) -> f32;
+    #[cfg(test)]
+    fn lfm_bf16_bias_add_f32(values: *mut f32, bias: *const u16, count: usize);
+    #[cfg(test)]
+    fn lfm_bf16_rope_neox(values: *mut u16, cosine: *const u16, sine: *const u16, head_dim: usize);
+    #[cfg(test)]
+    fn lfm_sampler_exp_sum_f32(
+        values: *const f32,
+        weights: *mut f32,
+        count: usize,
+        scale: f32,
+        maximum: f32,
+        threshold: f32,
+    ) -> f32;
+    #[cfg(test)]
+    fn lfm_sampler_exp_sum_bf16(
+        values: *const u16,
+        weights: *mut f32,
+        count: usize,
+        scale: u16,
+        maximum: f32,
+        threshold: f32,
+    ) -> f32;
     fn lfm_depthwise_stream_bf16_available() -> i32;
     #[cfg(test)]
     fn lfm_prng_seed_system(state: *mut PrngState) -> i32;
@@ -214,17 +247,6 @@ extern "C" {
     fn lfm_prng_seed_u64(state: *mut PrngState, seed: u64) -> i32;
     fn lfm_engine_new(workers: i32) -> *mut c_void;
     fn lfm_engine_free(e: *mut c_void);
-    fn lfm_engine_bridge(e: *mut c_void) -> *mut c_void;
-    fn lfm_engine_set_submitter(
-        e: *mut c_void,
-        submitter: unsafe extern "C" fn(
-            *mut c_void,
-            *const kcoro::Submission,
-            *mut kcoro::Completion,
-        ) -> i32,
-        context: *mut c_void,
-    ) -> i32;
-    fn lfm_engine_clear_submitter(e: *mut c_void, context: *mut c_void) -> i32;
     fn lfm_engine_request_stop(e: *mut c_void);
     fn lfm_ctx_build(
         e: *mut c_void,
@@ -347,6 +369,7 @@ extern "C" {
         k: usize,
         rhs_layout: u32,
     ) -> i32;
+    #[cfg(test)]
     fn lfm_engine_fft_conv_dd(
         e: *mut c_void,
         input: *const f32,
@@ -362,6 +385,7 @@ extern "C" {
         steps: usize,
         fft_size: usize,
     ) -> i32;
+    #[cfg(test)]
     fn lfm_engine_irfft_dd(
         e: *mut c_void,
         real: *const f32,
@@ -423,7 +447,6 @@ pub(crate) fn depthwise_stream_available() -> bool {
 /// independently claims the slot before touching shared payload state.
 pub struct NativeEngine {
     ptr: *mut c_void,
-    coordinator: Coordinator,
     pass_lock: Mutex<()>,
 }
 
@@ -443,32 +466,8 @@ impl NativeEngine {
         if p.is_null() {
             return None;
         }
-        // SAFETY: `p` names the just-created engine and therefore its live bridge.
-        let bridge = unsafe { lfm_engine_bridge(p) };
-        let mut coordinator = match Coordinator::new(bridge, 8) {
-            Ok(coordinator) => coordinator,
-            Err(error) => {
-                eprintln!("[flashkern] coordinator init failed: {error}");
-                // SAFETY: constructor rollback owns the unpublished engine.
-                unsafe { lfm_engine_free(p) };
-                return None;
-            }
-        };
-        let context = coordinator.context();
-        // SAFETY: the context points into `coordinator`'s stable Arc allocation. It
-        // remains live until Drop clears the callback and joins both endpoint owners.
-        let rc = unsafe { lfm_engine_set_submitter(p, coordinator::submit, context) };
-        if rc != 0 {
-            // SAFETY: stop closes bridge admission before coordinator teardown.
-            unsafe { lfm_engine_request_stop(p) };
-            coordinator.shutdown();
-            // SAFETY: all Rust endpoint owners have joined.
-            unsafe { lfm_engine_free(p) };
-            return None;
-        }
         Some(Self {
             ptr: p,
-            coordinator,
             pass_lock: Mutex::new(()),
         })
     }
@@ -632,6 +631,7 @@ impl NativeEngine {
 
     /// Run the complete double-double FFT convolution grid as one native ticket.
     /// The fixed lane team shares one reusable work plane and fences every radix-2 stage.
+    #[cfg(test)]
     pub(crate) fn fft_conv_dd(
         &self,
         input: &[f32],
@@ -665,6 +665,7 @@ impl NativeEngine {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn irfft_dd(
         &self,
         real: &[f32],
@@ -1209,18 +1210,10 @@ impl Drop for NativeEngine {
             .pass_lock
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let context = self.coordinator.context();
-        // SAFETY: pass_lock excludes every safe Rust call. Clearing the callback
-        // prevents C++ from retaining a pointer into the coordinator during teardown.
-        let rc = unsafe { lfm_engine_clear_submitter(self.ptr, context) };
-        if rc != 0 {
-            std::process::abort();
-        }
-        // SAFETY: closes native admission and wakes both endpoint doorbells.
+        // SAFETY: pass_lock excludes every safe Rust call. Native stop closes bridge
+        // admission, wakes the dispatcher, joins it and the lane team, then destroys
+        // the fully drained retained-descriptor rings.
         unsafe { lfm_engine_request_stop(self.ptr) };
-        self.coordinator.shutdown();
-        // SAFETY: Rust SQ/CQ owners are joined; this joins the native dispatcher and
-        // fixed lane team, then destroys the fully drained bridge.
         unsafe { lfm_engine_free(self.ptr) };
     }
 }
@@ -1264,12 +1257,97 @@ mod tests {
     static CTX_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
+    fn scalar_assembly_math_abi_is_bit_exact_without_simd_feature_gates() {
+        let values = [1.0f32, 2.0, 3.0];
+        let bf16 = [0x3f80u16, 0x4000, 0x4040, 0x4080];
+        let mut bias = [1.0f32, 2.0];
+        let bias_bits = [0x3f00u16, 0xbf80];
+        let mut rope = bf16;
+        let cosine = [0x3f80u16, 0x3f00];
+        let sine = [0u16, 0x3f00];
+
+        // SAFETY: every pointer names the complete fixed fixture for the declared count.
+        unsafe {
+            assert_eq!(lfm_rsqrt_size(4).to_bits(), 0x3f00_0000);
+            assert_eq!(lfm_inv_rms_f32(30.0, 4, 0.5).to_bits(), 0x3eb5_04f3);
+            assert_eq!(
+                lfm_sum_f32(values.as_ptr(), values.len()).to_bits(),
+                0x40c0_0000
+            );
+            assert_eq!(
+                lfm_bf16_sumsq_stride_f32(bf16.as_ptr(), bf16.len(), 0, 2).to_bits(),
+                0x4120_0000
+            );
+            assert_eq!(
+                lfm_bf16_sumsq_stride_f32(bf16.as_ptr(), bf16.len(), 1, 2).to_bits(),
+                0x41a0_0000
+            );
+            lfm_bf16_bias_add_f32(bias.as_mut_ptr(), bias_bits.as_ptr(), bias.len());
+            lfm_bf16_rope_neox(
+                rope.as_mut_ptr(),
+                cosine.as_ptr(),
+                sine.as_ptr(),
+                rope.len(),
+            );
+        }
+        assert_eq!(bias.map(f32::to_bits), [0x3fc0_0000, 0x3f80_0000]);
+        assert_eq!(rope, [0x3f80, 0xbf80, 0x4040, 0x4040]);
+    }
+
+    #[test]
+    fn sampler_assembly_exponential_is_a_fixed_cross_arch_fixture() {
+        let values = [0.0f32, -0.5, -1.0, -2.0, -4.0, -8.0, -16.0, -100.0];
+        let bf16 = [
+            0x0000u16, 0xbf00, 0xbf80, 0xc000, 0xc080, 0xc100, 0xc180, 0xc2c8,
+        ];
+        let mut f32_weights = [0.0f32; 8];
+        let mut bf16_weights = [0.0f32; 8];
+
+        // SAFETY: every pointer names the full fixed fixture and both destinations
+        // have exactly `values.len()` writable elements.
+        let f32_sum = unsafe {
+            lfm_sampler_exp_sum_f32(
+                values.as_ptr(),
+                f32_weights.as_mut_ptr(),
+                values.len(),
+                1.0,
+                0.0,
+                f32::NEG_INFINITY,
+            )
+        };
+        let bf16_sum = unsafe {
+            lfm_sampler_exp_sum_bf16(
+                bf16.as_ptr(),
+                bf16_weights.as_mut_ptr(),
+                bf16.len(),
+                0x3f80,
+                0.0,
+                f32::NEG_INFINITY,
+            )
+        };
+
+        let expected = [
+            0x3f80_0000,
+            0x3f1b_4598,
+            0x3ebc_5ab2,
+            0x3e0a_9555,
+            0x3c96_0aae,
+            0x39af_e108,
+            0x33f1_aad7,
+            0x0000_0000,
+        ];
+        assert_eq!(f32_weights.map(f32::to_bits), expected);
+        assert_eq!(bf16_weights.map(f32::to_bits), expected);
+        assert_eq!(f32_sum.to_bits(), 0x4008_37a5);
+        assert_eq!(bf16_sum.to_bits(), 0x4008_37a5);
+    }
+
+    #[test]
     fn native_prng_matches_chacha20_and_replays_snapshot_through_kcoro() {
         let engine = NativeEngine::new(4).expect("native engine init");
         let mut state = PrngState::from_material(&[0; 32], &[0; 8]).expect("material seed");
         let snapshot = state;
         let engine_before = engine.snapshot();
-        let coordinator_before = engine.coordinator.snapshot();
 
         // Original ChaCha20, zero key/nonce, counters 0 and 1. These are fixed
         // published block vectors interpreted as little-endian u64 draws.
@@ -1309,7 +1387,6 @@ mod tests {
 
         // Both fills traversed the real retained-descriptor and kcoro SQ/CQ path.
         let engine_after = engine.snapshot();
-        let coordinator_after = engine.coordinator.snapshot();
         assert_eq!(
             engine_after.pass_submissions - engine_before.pass_submissions,
             2
@@ -1328,19 +1405,12 @@ mod tests {
         );
         assert_eq!(engine_after.descriptors_live, 0);
         assert_eq!(engine_after.pass_claimed, 0);
-        assert_eq!(coordinator_after.admitted - coordinator_before.admitted, 2);
-        assert_eq!(
-            coordinator_after.native_completions - coordinator_before.native_completions,
-            2
-        );
-        assert_eq!(coordinator_after.resolved - coordinator_before.resolved, 2);
-        assert_eq!(coordinator_after.failed - coordinator_before.failed, 0);
-        assert_eq!(coordinator_after.live, 0);
-        assert!(!coordinator_after.fault);
     }
 
     #[test]
     fn native_sampler_is_deterministic_thresholded_and_snapshotable() {
+        use half::bf16;
+
         let engine = NativeEngine::new(4).expect("native engine init");
         let logits = [0.1f32, 5.0, 0.2, 3.0, -2.0, 3.0];
         let greedy = SampleConfig::new(None, None);
@@ -1353,6 +1423,14 @@ mod tests {
             "greedy must not consume RNG"
         );
         assert_eq!(state.core, untouched.core);
+
+        let tied = [f32::NAN, 5.0, 5.0, -3.0].map(|value| bf16::from_f32(value).to_bits());
+        let mut tied_state = PrngState::from_seed(456).expect("seed");
+        assert_eq!(
+            engine.sample_bf16(&tied, &greedy, &mut tied_state),
+            Ok(1),
+            "assembly argmax must ignore NaN and preserve the earliest maximum tie"
+        );
 
         let snapshot = state;
         let first = (0..32)
@@ -2455,15 +2533,15 @@ mod tests {
     }
 
     #[test]
-    fn raw_engine_requires_a_coordinator_without_leaking_its_descriptor() {
-        // SAFETY: this test deliberately exercises the unpublished C constructor so
-        // the no-submitter failure path cannot hide behind NativeEngine::new.
+    fn raw_engine_owns_its_sq_cq_without_rust_progress() {
+        // SAFETY: this test deliberately exercises the unpublished C constructor.
+        // A successful pass proves native progress has no Rust callback dependency.
         let raw = unsafe { lfm_engine_new(2) };
         assert!(!raw.is_null());
         let mut state = PrngState::from_seed(7).expect("seed");
         let mut value = 0u64;
         let rc = unsafe { lfm_engine_prng_fill(raw, &mut state, &mut value, 1) };
-        assert_eq!(rc, -libc::ENOTCONN);
+        assert_eq!(rc, 0);
 
         let mut snapshot = EngineSnapshot {
             size: std::mem::size_of::<EngineSnapshot>() as u32,
@@ -2471,13 +2549,14 @@ mod tests {
             ..EngineSnapshot::default()
         };
         assert_eq!(unsafe { lfm_engine_snapshot(raw, &mut snapshot) }, 0);
-        assert_eq!(snapshot.pass_submissions, 0);
-        assert_eq!(snapshot.bridge_dispatches, 0);
+        assert_eq!(snapshot.pass_submissions, 1);
+        assert_eq!(snapshot.pass_completions, 1);
+        assert_eq!(snapshot.bridge_dispatches, 1);
         assert_eq!(snapshot.descriptor_acquires, 1);
-        assert_eq!(snapshot.descriptor_retains, 0);
-        assert_eq!(snapshot.descriptor_releases, 1);
+        assert_eq!(snapshot.descriptor_retains, 1);
+        assert_eq!(snapshot.descriptor_releases, 2);
         assert_eq!(snapshot.descriptors_live, 0);
-        // SAFETY: no bridge ticket was accepted and the descriptor pool is settled.
+        // SAFETY: the accepted bridge ticket completed and both leases are settled.
         unsafe { lfm_engine_free(raw) };
     }
 
@@ -2497,7 +2576,6 @@ mod tests {
             );
         }
         let stats = engine.snapshot();
-        let coordinator = engine.coordinator.snapshot();
         assert_eq!(stats.pass_submissions, PASSES);
         assert_eq!(stats.pass_completions, PASSES);
         assert_eq!(stats.bridge_dispatches, PASSES);
@@ -2516,17 +2594,6 @@ mod tests {
         assert_eq!(stats.descriptor_callbacks, 0);
         assert_eq!(stats.max_descriptor_generation, PASSES as u32);
         assert_eq!(stats.pass_claimed, 0);
-        assert_eq!(coordinator.admitted, PASSES);
-        assert_eq!(coordinator.native_submissions, PASSES);
-        assert_eq!(coordinator.native_completions, PASSES);
-        assert_eq!(coordinator.resolved, PASSES);
-        assert_eq!(coordinator.failed, 0);
-        assert_eq!(coordinator.edge_signals, PASSES);
-        assert_eq!(coordinator.live, 0);
-        assert_eq!(coordinator.max_generation, PASSES as u32);
-        assert!(coordinator.executor_polls > PASSES);
-        assert!(coordinator.executor_wakes > 0);
-        assert!(!coordinator.fault);
         eprintln!(
             "native bridge/fence soak: {PASSES} passes, {} fence syscalls for {} waiters in {:.3}s",
             stats.fence_wake_calls,

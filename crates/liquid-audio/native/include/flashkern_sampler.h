@@ -25,10 +25,12 @@ typedef struct LfmSamplerConfigV1 {
     uint64_t reserved;
 } LfmSamplerConfigV1;
 
-/* Architecture leaves. The engine divides the vocabulary into contiguous
- * lane-owned bands and calls these over disjoint slices between generation
- * fences. `scale` is the f32 form of Candle's affine 1/temperature factor;
- * `bf16_scale` is that same factor rounded to bf16 for bf16 input parity. */
+/* Hand-written architecture-assembly leaves. The engine divides the vocabulary
+ * into contiguous lane-owned bands and calls these over disjoint slices between
+ * generation fences. `scale` is the f32 form of the pinned 1/temperature factor;
+ * `bf16_scale` is that same factor rounded to bf16 for fixture parity. The
+ * remaining C++ top-k/collective routing is tracked migration debt; the final
+ * sampler control path only partitions work, crosses fences, and calls assembly. */
 uint32_t lfm_sampler_argmax_f32(const float *x, size_t count);
 uint32_t lfm_sampler_argmax_bf16(const uint16_t *x, size_t count);
 float lfm_sampler_exp_sum_f32(const float *x, float *weights, size_t count,

@@ -10,11 +10,10 @@
 // release-rings one pass descriptor, and lane 0 publishes one exact CQ record after
 // the program-final fence.
 //
-// The compatibility Rust ABI still invokes one blocking control call so its borrowed
-// tensor pointers remain live. C++ claims the preallocated request slot, then invokes
-// the registered Rust coordinator. That coordinator alone owns SQ submission and CQ
-// ingress; the callback resolves only after the exact completion arrives. Stop remains
-// a full-pass boundary decision and is never polled inside SIMD operations.
+// The compatibility Rust ABI still invokes blocking test/conformance calls while its
+// borrowed buffers remain live. Native code owns SQ submission, CQ consumption, and
+// pass recurrence; Rust is not a numerical-progress dependency. Stop remains a
+// full-pass boundary decision and is never polled inside assembly operations.
 //
 // Numerics: stage bodies are line-for-line ports of src/compute/flashkern/decode.rs
 // (fused_mlp_decode) — same RNE bf16 rounding ladder, same FIXED tile count and
@@ -44,6 +43,7 @@
 #include "flashkern_depth.h"
 #include "flashkern_fft.h"
 #include "flashkern_gemm.h"
+#include "flashkern_math.h"
 #include "flashkern_prng.h"
 #include "flashkern_sampler.h"
 #include "lfm_kernel_bridge.h"
@@ -479,8 +479,6 @@ struct Engine {
     int cur_req = REQ_NONE;
     std::atomic<bool> retire{false};
     LfmKernelBridge *bridge = nullptr;
-    LfmKernelSubmitFn submitter = nullptr;
-    void *submitter_context = nullptr;
     KcSubmissionV1 active_submission{};
     std::atomic<bool> pass_claimed{false};
     std::atomic<int> active_status{0};
@@ -582,22 +580,20 @@ static void run_tile(uint32_t kind, uint32_t idx, const Stage *st, Engine *e) {
     Pass *p = &e->pass;
     switch (kind) {
     case ST_SUMSQ: {
-        float sum = 0.f;
-        for (size_t j = idx; j < p->h; j += p->tiles) {
-            float v = bf16_f32(p->x[j]);
-            sum += v * v;
-        }
-        p->partials[idx] = sum;
+        p->partials[idx] =
+            lfm_bf16_sumsq_stride_f32(p->x, p->h, idx, p->tiles);
         break;
     }
     case ST_NORM: {
+        size_t chunk = (p->h + p->tiles - 1) / p->tiles;
+        size_t begin = (size_t)idx * chunk;
+        size_t end = std::min(begin + chunk, p->h);
+        if (end <= begin) break;
         uint32_t rsb = p->rs_bits.load(std::memory_order_acquire);
         float rs;
         std::memcpy(&rs, &rsb, 4);
-        for (size_t j = idx; j < p->h; j += p->tiles) {
-            float v = bf16_f32(p->x[j]) * rs * bf16_f32(p->norm_w[j]);
-            p->xn[j] = rb_bits(v);
-        }
+        lfm_bf16_rmsnorm(p->x + begin, p->norm_w + begin, p->xn + begin,
+                         (int)(end - begin), rs);
         break;
     }
     case ST_GATEUP: {
@@ -608,12 +604,7 @@ static void run_tile(uint32_t kind, uint32_t idx, const Stage *st, Engine *e) {
         lfm_bf16_gemm_nt_f32(p->xn, p->w1 + r0 * p->h, p->gu + r0, 1, (int)n, (int)p->h);
         lfm_bf16_gemm_nt_f32(p->xn, p->w3 + r0 * p->h, p->gu + p->i + r0, 1, (int)n,
                              (int)p->h);
-        for (size_t r = r0; r < r1; ++r) {
-            float g = bf16_f32(rb_bits(p->gu[r]));            // linear-out round
-            uint16_t sg = rb_bits(g / (1.0f + std::exp(-g))); // silu round
-            uint16_t u = rb_bits(p->gu[p->i + r]);            // linear-out round
-            p->t[r] = rb_bits(bf16_f32(sg) * bf16_f32(u));    // gating-mul round
-        }
+        lfm_swiglu_bf16(p->gu + r0, p->gu + p->i + r0, p->t + r0, (int)n);
         break;
     }
     case ST_DOWN: {
@@ -622,11 +613,10 @@ static void run_tile(uint32_t kind, uint32_t idx, const Stage *st, Engine *e) {
         if (r1 <= r0) break;
         size_t n = r1 - r0;
         float y[DOWN_BAND_CAP]; // per-worker accumulator; chunk capped at publish
+        uint16_t rounded[DOWN_BAND_CAP];
         lfm_bf16_gemm_nt_f32(p->t, p->w2 + r0 * p->i, y, 1, (int)n, (int)p->i);
-        for (size_t j = 0; j < n; ++j) {
-            float d = bf16_f32(rb_bits(y[j]));                     // linear-out round
-            p->out[r0 + j] = rb_bits(d + bf16_f32(p->x[r0 + j])); // residual round
-        }
+        lfm_f32_to_bf16(y, rounded, (int)n);
+        lfm_bf16_add(rounded, p->x + r0, p->out + r0, (int)n);
         break;
     }
     case ST_SC_NORM: {
@@ -721,7 +711,7 @@ static void run_tile(uint32_t kind, uint32_t idx, const Stage *st, Engine *e) {
         if (qh >= a->n_head) break;
         size_t group = a->n_head / a->n_kv;
         size_t kh = qh / group;
-        float scale = 1.0f / std::sqrt((float)a->hd);
+        float scale = lfm_rsqrt_size(a->hd);
         float qf[512]; // hd cap (hd = 64 on this family; 512 is generous)
         lfm_bf16_to_f32(a->qkvb + qh * a->hd, qf, (int)a->hd);
         float *att = a->att + qh * a->max_ctx;
@@ -772,7 +762,8 @@ static void run_tile(uint32_t kind, uint32_t idx, const Stage *st, Engine *e) {
                              ee->model->embed_w + r0 * ee->model->h, acc, 1,
                              (int)(r1 - r0), (int)ee->model->h);
         if (t->out_logits)
-            for (size_t r = r0; r < r1; ++r) t->out_logits[r] = ee->tk_logf[r];
+            std::memcpy(t->out_logits + r0, ee->tk_logf.data() + r0,
+                        (r1 - r0) * sizeof(float));
         break;
     }
     default:
@@ -1043,9 +1034,8 @@ static void depth_norm(Engine *e, uint32_t lane, const uint16_t *x,
                            ? lfm_bf16_sumsq_f32(x + begin, (int)(end - begin))
                            : 0.0f;
     lane_fence(e, lane, [] {});
-    float total = 0.0f;
-    for (uint32_t l = 0; l < e->lanes_total; ++l) total += d.partials[l];
-    const float inv_rms = 1.0f / std::sqrt(total / (float)d.dim + d.eps);
+    float total = lfm_sum_f32(d.partials, e->lanes_total);
+    const float inv_rms = lfm_inv_rms_f32(total, d.dim, d.eps);
     if (end > begin)
         lfm_bf16_rmsnorm(x + begin, depth_u16(weight) + begin, out + begin,
                          (int)(end - begin), inv_rms);
@@ -1058,7 +1048,7 @@ static void depth_qk_head(const DepthPlan &d, const uint16_t *src,
     uint16_t normed[128];
     float rotated[128];
     const float sum = lfm_bf16_sumsq_f32(src, (int)d.hd);
-    const float inv_rms = 1.0f / std::sqrt(sum / (float)d.hd + d.eps);
+    const float inv_rms = lfm_inv_rms_f32(sum, d.hd, d.eps);
     lfm_bf16_rmsnorm(src, depth_u16(weight), normed, (int)d.hd, inv_rms);
     lfm_bf16_to_f32(normed, rotated, (int)d.hd);
     const size_t half = d.hd / 2;
@@ -1076,7 +1066,7 @@ static void run_depth_frame(Engine *e, uint32_t lane) {
     const uint32_t lanes = e->lanes_total;
     const size_t qkv_rows = d.dim + 2 * d.kv_heads * d.hd;
     const size_t group = d.heads_total / d.kv_heads;
-    const float attn_scale = 1.0f / std::sqrt((float)d.hd);
+    const float attn_scale = lfm_rsqrt_size(d.hd);
 
     // depth_linear(hidden) + bias -> one row per codebook.
     depth_gemv({reinterpret_cast<uintptr_t>(d.depth_linear_w),
@@ -1085,8 +1075,9 @@ static void run_depth_frame(Engine *e, uint32_t lane) {
                d.backbone_dim, lane, lanes);
     size_t begin = 0, end = 0;
     depth_band(d.codebooks * d.dim, lane, lanes, &begin, &end);
-    for (size_t i = begin; i < end; ++i)
-        d.proj_f[i] += bf16_f32(d.depth_linear_b[i]);
+    if (end > begin)
+        lfm_bf16_bias_add_f32(d.proj_f.data() + begin,
+                              d.depth_linear_b + begin, end - begin);
     if (end > begin)
         lfm_f32_to_bf16(d.proj_f.data() + begin, d.din_b.data() + begin,
                         (int)(end - begin));
@@ -1235,9 +1226,8 @@ static void run_mlp(Engine *e, uint32_t lane, uint32_t tiles, F &&first_pre) {
 
     run_stage(e, lane, ST_NORM, tiles, 0, [&] {
         // Serial fold in fixed tile order — matches the reference exactly.
-        float total = 0.f;
-        for (uint32_t l = 0; l < tiles; ++l) total += p->partials[l];
-        float rs = 1.0f / std::sqrt(total / (float)p->h + p->eps);
+        float total = lfm_sum_f32(p->partials, tiles);
+        float rs = lfm_inv_rms_f32(total, p->h, p->eps);
         uint32_t rsb;
         std::memcpy(&rsb, &rs, 4);
         p->rs_bits.store(rsb, std::memory_order_release);
@@ -1288,7 +1278,7 @@ static void run_conv_block(Engine *e, uint32_t lane, const LfmLayerDesc *d,
         c->stage = e->sc_stage.data();
         c->mid = e->sc_mid.data();
         float total = lfm_bf16_sumsq_candle_f32(x, (int)h);
-        float inv_rms = 1.0f / std::sqrt(total / (float)h + d->op_eps);
+        float inv_rms = lfm_inv_rms_f32(total, h, d->op_eps);
         uint32_t rsb;
         std::memcpy(&rsb, &inv_rms, 4);
         c->rs_bits.store(rsb, std::memory_order_release);
@@ -1340,10 +1330,8 @@ static void run_conv_block(Engine *e, uint32_t lane, const LfmLayerDesc *d,
 static void qk_norm_row(const uint16_t *x, const uint16_t *w, uint16_t *out, size_t hd,
                         float eps) {
     float total = lfm_bf16_sumsq_candle_f32(x, (int)hd);
-    float inv = 1.0f / std::sqrt(total / (float)hd + eps);
-    for (size_t j = 0; j < hd; ++j) {
-        out[j] = rb_bits(bf16_f32(x[j]) * inv * bf16_f32(w[j]));
-    }
+    float inv = lfm_inv_rms_f32(total, hd, eps);
+    lfm_bf16_rmsnorm(x, w, out, (int)hd, inv);
 }
 
 // candle rotary_emb::rope_slow over one head row, NeoX half-split, computed in bf16
@@ -1352,22 +1340,7 @@ static void qk_norm_row(const uint16_t *x, const uint16_t *w, uint16_t *out, siz
 // f32 compute, RNE back to bf16). rotate_half = [-x2 | x1]; negation is exact.
 static void rope_slow_row(uint16_t *x, const uint16_t *cos_row, const uint16_t *sin_row,
                           size_t hd) {
-    size_t half = hd / 2;
-    // In-place needs the original bits of both halves for the cross terms.
-    uint16_t orig[512];
-    std::memcpy(orig, x, hd * sizeof(uint16_t));
-    for (size_t j = 0; j < half; ++j) {
-        float c = bf16_f32(cos_row[j]);
-        float sn = bf16_f32(sin_row[j]);
-        // j < half: rotate_half[j] = -x[j+half]
-        float p1 = bf16_f32(rb_bits(bf16_f32(orig[j]) * c));
-        float p2 = bf16_f32(rb_bits(-bf16_f32(orig[j + half]) * sn));
-        x[j] = rb_bits(p1 + p2);
-        // j + half: cos2/sin2 reuse row [j]; rotate_half[j+half] = x[j]
-        float q1 = bf16_f32(rb_bits(bf16_f32(orig[j + half]) * c));
-        float q2 = bf16_f32(rb_bits(bf16_f32(orig[j]) * sn));
-        x[j + half] = rb_bits(q1 + q2);
-    }
+    lfm_bf16_rope_neox(x, cos_row, sin_row, hd);
 }
 
 // One whole attention+MLP layer, lane-uniform. Stage bodies are the candle wrapper
@@ -1416,7 +1389,7 @@ static void run_attn_block(Engine *e, uint32_t lane, size_t layer_idx,
         a->hd = hd;
         // operator norm: candle-order sumsq, serial.
         float total = lfm_bf16_sumsq_candle_f32(x, (int)h);
-        float inv_rms = 1.0f / std::sqrt(total / (float)h + d->op_eps);
+        float inv_rms = lfm_inv_rms_f32(total, h, d->op_eps);
         uint32_t rsb;
         std::memcpy(&rsb, &inv_rms, 4);
         c->rs_bits.store(rsb, std::memory_order_release);
@@ -1496,12 +1469,10 @@ static void run_token_pass(Engine *e, uint32_t lane) {
             std::memcpy(h0, model->embed_w + (size_t)t->ids[0] * h,
                         h * sizeof(uint16_t));
         } else {
-            for (size_t j = 0; j < h; ++j) h0[j] = 0;
+            std::memset(h0, 0, h * sizeof(uint16_t));
             for (size_t c = 0; c < t->n_ids; ++c) {
                 const uint16_t *row = model->audio_embed_w + (size_t)t->ids[c] * h;
-                for (size_t j = 0; j < h; ++j) {
-                    h0[j] = rb_bits(bf16_f32(h0[j]) + bf16_f32(row[j]));
-                }
+                lfm_bf16_add(h0, row, h0, (int)h);
             }
         }
     });
@@ -1527,7 +1498,7 @@ static void run_token_pass(Engine *e, uint32_t lane) {
     uint32_t hc = (uint32_t)((h + tiles - 1) / tiles);
     run_stage(e, lane, ST_SC_NORM, (uint32_t)((h + hc - 1) / hc), hc, [&] {
         float total = lfm_bf16_sumsq_candle_f32(h0, (int)h);
-        float inv_rms = 1.0f / std::sqrt(total / (float)h + model->emb_norm_eps);
+        float inv_rms = lfm_inv_rms_f32(total, h, model->emb_norm_eps);
         uint32_t rsb;
         std::memcpy(&rsb, &inv_rms, 4);
         c->rs_bits.store(rsb, std::memory_order_release);
@@ -1924,7 +1895,8 @@ static void publish_rejected(Engine *e, const KcSubmissionV1 &submission, int st
 
 // The bridge dispatcher is mechanical: consume one retained descriptor, validate
 // its generation against the single request slot, and release-ring the lane team.
-// Policy and recurrence remain above this boundary.
+// Model recurrence remains inside the native session; the host only docks audio
+// buffers and control tickets at the session boundary.
 static void *bridge_main(void *arg) {
     Engine *e = (Engine *)arg;
     for (;;) {
@@ -2016,12 +1988,14 @@ static int submit_pass(Engine *e, int request, uint64_t context_id = 0) {
     submission.pass_budget = 1;
 
     KcCompletionV1 completion{};
-    rc = e->submitter ? e->submitter(e->submitter_context, &submission, &completion)
-                      : -ENOTCONN;
+    rc = lfm_kernel_bridge_submit(e->bridge, &submission);
+    if (rc == 0) {
+        e->pass_submissions.fetch_add(1, std::memory_order_relaxed);
+        rc = lfm_kernel_bridge_wait_completion(e->bridge, &completion, 0);
+    }
     int release_rc = lfm_kernel_bridge_descriptor_release(e->bridge, descriptor);
     if (release_rc != 0) std::abort();
     if (rc != 0) return rc;
-    e->pass_submissions.fetch_add(1, std::memory_order_relaxed);
 
     if (!ticket_equal(completion.ticket, submission.ticket) ||
         completion.conversation_id != submission.conversation_id ||
@@ -2033,7 +2007,7 @@ static int submit_pass(Engine *e, int request, uint64_t context_id = 0) {
 
 } // namespace
 
-// ---- the C ABI (the Rust rim) ---------------------------------------------------------
+// ---- the C ABI ------------------------------------------------------------------------
 extern "C" {
 
 void lfm_engine_free(void *ep);
@@ -2088,30 +2062,6 @@ void *lfm_engine_new(int workers) {
         e->workers_started++;
     }
     return e;
-}
-
-void *lfm_engine_bridge(void *ep) {
-    Engine *e = (Engine *)ep;
-    return e ? e->bridge : nullptr;
-}
-
-int lfm_engine_set_submitter(void *ep, LfmKernelSubmitFn submitter, void *context) {
-    Engine *e = (Engine *)ep;
-    if (!e || !submitter || !context) return -EINVAL;
-    if (e->pass_claimed.load(std::memory_order_acquire) || e->submitter) return -EBUSY;
-    e->submitter_context = context;
-    e->submitter = submitter;
-    return 0;
-}
-
-int lfm_engine_clear_submitter(void *ep, void *context) {
-    Engine *e = (Engine *)ep;
-    if (!e || !context) return -EINVAL;
-    if (e->pass_claimed.load(std::memory_order_acquire)) return -EBUSY;
-    if (e->submitter_context != context) return -ESTALE;
-    e->submitter = nullptr;
-    e->submitter_context = nullptr;
-    return 0;
 }
 
 void lfm_engine_request_stop(void *ep) {
