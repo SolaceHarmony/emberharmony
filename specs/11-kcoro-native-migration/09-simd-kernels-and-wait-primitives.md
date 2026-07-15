@@ -60,6 +60,7 @@ words and blocks through prepared `kc_port_wait_u32` handles at
 | aarch64 feature flags applied to the whole kernel translation unit | `crates/liquid-audio/build.rs:45-58` | baseline and BF16/I8MM objects compiled separately; C++ binds one table after capability checks |
 | hot-call panel storage and packing | `crates/liquid-audio/native/kernels/aarch64/flashkern_neon.cpp:74-162` and `native/kernels/x86_64/flashkern_x86.cpp:74-154` | prepack immutable weights at model open and reserve mutable scratch in the plan; no `std::vector`, resize, assign, or payload repack in a pass |
 | scalar/libm activation and softmax loops | `flashkern_neon.cpp:942-968` and `flashkern_x86.cpp:756-788` | fixed-shape house vector transcendental kernels with test-only scalar oracle |
+| sampler PRNG | Native ChaCha20 block kernels are implemented in `native/kernels/{aarch64,x86_64}/flashkern_prng.S`; system seeding and snapshot state live in `native/src/engine/flashkern_prng.cpp` and `native/include/flashkern_prng.h`. `REQ_PRNG` is currently a typed SQ/CQ conformance leaf. | bind two native stream states to each conversation and consume them inside token/Depthformer sampling stages; never issue a pass ticket per random draw |
 
 ## The Library Law
 
@@ -109,6 +110,7 @@ One decision rule, applied once per stage when the plan is built at model open
 | Depthwise/short convolution | Mixed | House NEON | House AVX |
 | Resampler polyphase taps | Compute (small) | House NEON `FMLA` | House FMA3 |
 | Format conversion, downmix (capture callback) | Bandwidth | `LD2`/`LD4` de-interleave + convert | `PMOVZX`/`CVTDQ2PS` family |
+| ChaCha20 PRNG block | Register/latency | Hand-written AArch64 scalar-register block; `SecRandomCopyBytes` only seeds/reseeds outside passes | Four-row SSE2 block; platform CSPRNG only seeds/reseeds outside passes |
 
 The DFT-basis mel stage is a GEMM in disguise — `(2·bins × window) ×
 (window × frames)` — so it is eligible for the same plan-time Apple comparison
@@ -297,21 +299,26 @@ hardware callbacks. Hardware callbacks never wait.
    and re-homed here, not rewritten.
 3. `native/kernels/x86_64/`: AVX2 baseline of the same families; AVX-512
    variants behind runtime dispatch.
-4. `native/src/runtime/wait.{h,cpp}`: one register/recheck/block wrapper used by
+4. **As built:** `flashkern_prng.S` on both architectures expands one
+   snapshot-stable ChaCha20 stream block with no allocation or syscall. The
+   Apple entropy thunk calls `SecRandomCopyBytes` only at conversation creation
+   or explicit reseed. Final sampler mounting absorbs this leaf into token and
+   Depthformer passes rather than adding per-draw scheduling.
+5. `native/src/runtime/wait.{h,cpp}`: one register/recheck/block wrapper used by
    shared fixed-executor generations and audio doorbells; host wait-word adapter
    below it, with no spin or monitor-wait inlines. Add C/C++ address-identity and
    memory-order litmus tests proving one selected atomic helper owns every board
    access.
-5. Accelerate stage adapter: `cblas_sgemm` calls as declared stages with
+6. Accelerate stage adapter: `cblas_sgemm` calls as declared stages with
    plan-recorded shapes and tiling, Apple-only, behind the same pass contract.
    A versioned tuning profile records the measured house/Accelerate winner; an
    unknown machine defaults to a startup benchmark before readiness, never a
    per-pass race.
-6. Link/symbol audit in CI: Apple production binary links Accelerate and
+7. Link/symbol audit in CI: Apple production binary links Accelerate and
    nothing else numerical; x86_64 links no BLAS; no `cblas_` symbol outside
    the Accelerate adapter; no libm vector calls in kernel objects; `memcpy`
    audit passes on kernel directories.
-7. Bandwidth and fence microbenchmarks recorded per machine: GEMV kernels
+8. Bandwidth and fence microbenchmarks recorded per machine: GEMV kernels
    against measured STREAM bandwidth; blocking fence p50/p99, syscall/wake
    counts, logical park-mask population, and idle CPU.
 
@@ -319,6 +326,9 @@ hardware callbacks. Hardware callbacks never wait.
 
 - Every kernel family passes its stored-fixture parity gate against the scalar
   oracle on both architectures before entering any pass program.
+- PRNG known-answer tests pin exact block bytes and post-draw state on both
+  architectures; snapshot replay is exact and the warmed expansion path has no
+  entropy call, allocation, payload copy, or per-draw scheduler edge.
 - Decode GEMV sustains its recorded fraction of measured memory bandwidth on
   the target machine; regressions against the recorded baseline fail the gate.
 - Accelerate-dispatched stages meet the same per-stage tolerance fixtures as

@@ -85,6 +85,52 @@ pub struct LayerState {
     pub conv_len: usize,
 }
 
+/// Snapshot-stable native ChaCha20 stream state. This belongs to one conversation,
+/// never to the process engine; native passes borrow it mutably for their duration.
+#[cfg(test)]
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+pub(crate) struct PrngState {
+    size: u32,
+    abi_version: u32,
+    cursor: u32,
+    flags: u32,
+    core: [u32; 16],
+    block: [u32; 16],
+    reserved: [u8; 48],
+}
+
+#[cfg(test)]
+const _: [(); 192] = [(); std::mem::size_of::<PrngState>()];
+#[cfg(test)]
+const _: [(); 64] = [(); std::mem::align_of::<PrngState>()];
+
+#[cfg(test)]
+impl PrngState {
+    pub(crate) fn from_system() -> Result<Self, i32> {
+        let mut state = std::mem::MaybeUninit::<Self>::zeroed();
+        // SAFETY: `state` is aligned storage for the complete C ABI object.
+        let rc = unsafe { lfm_prng_seed_system(state.as_mut_ptr()) };
+        if rc != 0 {
+            return Err(rc);
+        }
+        // SAFETY: success initializes every byte of the state.
+        Ok(unsafe { state.assume_init() })
+    }
+
+    fn from_material(key: &[u8; 32], nonce: &[u8; 8]) -> Result<Self, i32> {
+        let mut state = std::mem::MaybeUninit::<Self>::zeroed();
+        // SAFETY: all pointers name their fixed ABI extents for the call.
+        let rc =
+            unsafe { lfm_prng_seed_material(state.as_mut_ptr(), key.as_ptr(), nonce.as_ptr()) };
+        if rc != 0 {
+            return Err(rc);
+        }
+        // SAFETY: success initializes every byte of the state.
+        Ok(unsafe { state.assume_init() })
+    }
+}
+
 impl LayerState {
     pub fn none() -> Self {
         Self {
@@ -123,6 +169,10 @@ struct EngineSnapshot {
 }
 
 extern "C" {
+    #[cfg(test)]
+    fn lfm_prng_seed_system(state: *mut PrngState) -> i32;
+    #[cfg(test)]
+    fn lfm_prng_seed_material(state: *mut PrngState, key: *const u8, nonce: *const u8) -> i32;
     fn lfm_engine_new(workers: i32) -> *mut c_void;
     fn lfm_engine_free(e: *mut c_void);
     fn lfm_engine_bridge(e: *mut c_void) -> *mut c_void;
@@ -233,6 +283,13 @@ extern "C" {
         i: usize,
         eps: f32,
         lanes: usize,
+    ) -> i32;
+    #[cfg(test)]
+    fn lfm_engine_prng_fill(
+        e: *mut c_void,
+        state: *mut PrngState,
+        out: *mut u64,
+        count: usize,
     ) -> i32;
 }
 
@@ -349,6 +406,21 @@ impl NativeEngine {
         // rc != 0 = native-side failure (e.g. scratch growth failed): report it so
         // the caller can take the bit-identical threadgroup path instead of dying.
         rc == 0
+    }
+
+    /// Advance one conversation-owned CSPRNG stream through a typed native pass.
+    /// Sampling calls this primitive inside its token pass once mounted; this
+    /// standalone entry pins assembly and kcoro lifecycle behavior independently.
+    #[cfg(test)]
+    #[must_use = "false = native pass rejected; the stream was not advanced"]
+    pub(crate) fn prng_fill(&self, state: &mut PrngState, out: &mut [u64]) -> bool {
+        if out.is_empty() {
+            return true;
+        }
+        let _pass = self.pass_lock.lock().unwrap();
+        // SAFETY: exclusive borrows keep state/output live and unaliased until the
+        // blocking SQ/CQ pass completes.
+        unsafe { lfm_engine_prng_fill(self.ptr, state, out.as_mut_ptr(), out.len()) == 0 }
     }
 }
 
@@ -880,6 +952,132 @@ mod tests {
     unsafe extern "C" fn fence_raw_lane(ctx: *mut c_void, lane: u32, _: u32) {
         // SAFETY: `ctx` is this live engine and the callback runs on one of its lanes.
         unsafe { lfm_lane_fence(ctx, lane) };
+    }
+
+    #[test]
+    fn native_prng_matches_chacha20_and_replays_snapshot_through_kcoro() {
+        let engine = NativeEngine::new(4).expect("native engine init");
+        let mut state = PrngState::from_material(&[0; 32], &[0; 8]).expect("material seed");
+        let snapshot = state;
+        let engine_before = engine.snapshot();
+        let coordinator_before = engine.coordinator.snapshot();
+
+        // Original ChaCha20, zero key/nonce, counters 0 and 1. These are fixed
+        // published block vectors interpreted as little-endian u64 draws.
+        let expected = [
+            0x903d_f1a0_ade0_b876,
+            0x28bd_8653_e56a_5d40,
+            0x1aed_8da0_b819_d2bd,
+            0xc70d_778b_ccef_36a8,
+            0x8d48_5751_7c59_41da,
+            0x374a_d8b8_3fe0_2477,
+            0x1ca1_1815_f4b8_436a,
+            0x8665_eeb2_69b6_87c3,
+            0x7a38_5155_bee7_079f,
+            0x0d08_2d73_7c97_ba98,
+            0x6965_e348_a029_0fcb,
+            0xed7a_ee32_3e53_c612,
+            0x434e_e69c_7621_b729,
+            0xd539_d874_b033_71d5,
+            0x45fb_0a51_281f_ed31,
+            0x6f4d_794b_1f0a_e1ac,
+        ];
+        let mut got = [0u64; 16];
+        assert!(engine.prng_fill(&mut state, &mut got));
+        assert_eq!(got, expected);
+        assert_eq!(state.cursor, 64, "two complete blocks must be consumed");
+        assert_eq!(state.core[12], 2, "next block counter");
+        assert_eq!(state.core[13], 0);
+
+        // A quiescent byte-copy of the state is the complete replay boundary.
+        let mut replay = snapshot;
+        let mut replayed = [0u64; 16];
+        assert!(engine.prng_fill(&mut replay, &mut replayed));
+        assert_eq!(replayed, got);
+        assert_eq!(replay.core, state.core);
+        assert_eq!(replay.block, state.block);
+        assert_eq!(replay.cursor, state.cursor);
+
+        // Both fills traversed the real retained-descriptor and kcoro SQ/CQ path.
+        let engine_after = engine.snapshot();
+        let coordinator_after = engine.coordinator.snapshot();
+        assert_eq!(
+            engine_after.pass_submissions - engine_before.pass_submissions,
+            2
+        );
+        assert_eq!(
+            engine_after.pass_completions - engine_before.pass_completions,
+            2
+        );
+        assert_eq!(
+            engine_after.bridge_dispatches - engine_before.bridge_dispatches,
+            2
+        );
+        assert_eq!(
+            engine_after.fence_generations - engine_before.fence_generations,
+            4
+        );
+        assert_eq!(engine_after.descriptors_live, 0);
+        assert_eq!(engine_after.pass_claimed, 0);
+        assert_eq!(coordinator_after.admitted - coordinator_before.admitted, 2);
+        assert_eq!(
+            coordinator_after.native_completions - coordinator_before.native_completions,
+            2
+        );
+        assert_eq!(coordinator_after.resolved - coordinator_before.resolved, 2);
+        assert_eq!(coordinator_after.failed - coordinator_before.failed, 0);
+        assert_eq!(coordinator_after.live, 0);
+        assert!(!coordinator_after.fault);
+    }
+
+    #[test]
+    fn native_prng_replays_a_partially_consumed_block() {
+        let engine = NativeEngine::new(3).expect("native engine init");
+        let mut state = PrngState::from_material(&[0; 32], &[0; 8]).expect("material seed");
+        let mut prefix = [0u64; 3];
+        assert!(engine.prng_fill(&mut state, &mut prefix));
+        assert_eq!(
+            prefix,
+            [
+                0x903d_f1a0_ade0_b876,
+                0x28bd_8653_e56a_5d40,
+                0x1aed_8da0_b819_d2bd,
+            ]
+        );
+        assert_eq!(state.cursor, 24);
+        assert_eq!(state.core[12], 1);
+
+        // The snapshot lands inside the cached block. Continuation consumes its
+        // remaining five draws, then crosses into the next assembly block.
+        let mut replay = state;
+        let mut continued = [0u64; 11];
+        let mut replayed = [0u64; 11];
+        assert!(engine.prng_fill(&mut state, &mut continued));
+        assert!(engine.prng_fill(&mut replay, &mut replayed));
+        assert_eq!(replayed, continued);
+        assert_eq!(replay.size, state.size);
+        assert_eq!(replay.abi_version, state.abi_version);
+        assert_eq!(replay.cursor, state.cursor);
+        assert_eq!(replay.flags, state.flags);
+        assert_eq!(replay.core, state.core);
+        assert_eq!(replay.block, state.block);
+        assert_eq!(replay.reserved, state.reserved);
+        assert_eq!(state.cursor, 48);
+        assert_eq!(state.core[12], 2);
+    }
+
+    #[test]
+    fn native_prng_accepts_system_entropy() {
+        let engine = NativeEngine::new(2).expect("native engine init");
+        let mut state = PrngState::from_system().expect("platform CSPRNG seed");
+        assert_eq!(state.size as usize, std::mem::size_of::<PrngState>());
+        assert_eq!(state.abi_version, 1);
+        assert_eq!(state.cursor, 64);
+        assert_eq!(state.flags & 1, 1, "system-seeded provenance bit");
+        let mut draws = [0u64; 8];
+        assert!(engine.prng_fill(&mut state, &mut draws));
+        assert_eq!(state.cursor, 64);
+        assert_eq!(state.core[12], 1);
     }
 
     #[test]

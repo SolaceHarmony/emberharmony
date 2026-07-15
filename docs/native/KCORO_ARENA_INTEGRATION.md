@@ -569,6 +569,12 @@ overlap, bounded drain fairness, zero idle polling, and no teardown leaks.
 
 Status: open.
 
+- Native PRNG substrate landed 2026-07-14: Apple system entropy seeds a
+  pointer-free ChaCha20 state, architecture assembly expands the hot stream, and
+  `REQ_PRNG` proves the retained-descriptor/SQ/CQ/fixed-lane lifecycle. Treat
+  that request as a conformance leaf only; production sampling consumes the
+  conversation-owned stream inside token/Depthformer passes and creates no
+  ticket per draw.
 - port every `REQ_CALL` body;
 - keep sampling, PRNG, state append, mel, Conformer, Depthformer, Mimi, and Moshi
   numerical work native;

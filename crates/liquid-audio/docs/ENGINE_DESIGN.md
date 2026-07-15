@@ -49,7 +49,7 @@ LFM2.5-Audio-1.5B, B=1,
 | rope tables | backbone [4096][32] f32; depth [4096][16] f32 | 1.3 MB | copied ONCE at build for locality (ends the 6× per-Mha duplication) |
 | token ring | 1024 × u32 + rd/wr seq | 4 KB | descriptors, not Vecs |
 | pcm ring | 10 s × 24 kHz f32 + rd/wr seq | 960 KB | native platform playback callback reads; reserve/commit API |
-| sampler state | rng words + top-k scratch | 4 KB | v2 (see §3) |
+| sampler state | two native ChaCha20 stream images + top-k scratch | 4 KB | 192-byte `LfmPrngStateV1` per stream is built; sampler integration remains open |
 
 Target mutable arena size is approximately 60–90 MB, dominated by fixed-cap KV.
 Every target kernel argument is `arena_base + offset` or `image_base + offset`.
@@ -82,6 +82,13 @@ descriptor staging, no allocation inside a warmed pass, and no Rust between nati
 - **As-built/live mount**: `REQ_TOKEN_PASS` executes embed, every native ShortConv or
   attention block, each MLP, final norm, and optional logits over one team entry.
   DepthDecode remains the production `REQ_CALL` user and is the next typed native pass.
+- **As-built PRNG leaf (2026-07-14)**: `REQ_PRNG` carries a retained pointer to
+  conversation-owned `LfmPrngStateV1` and an output span through the same SQ/CQ
+  and fixed-team lifecycle. AArch64 and x86_64 assembly expand ChaCha20 blocks;
+  Apple `SecRandomCopyBytes` supplies key/nonce material only at seed time. This
+  is a conformance entry, not the final sampler path: token and Depthformer
+  programs must consume the stream in their existing serial stage with no
+  per-draw ticket or Rust numerical callback.
   Per-block request entries remain as parity fixtures; there is no alternate engine.
 
 Linkage has two distinct kcoro roles. `crates/kcoro` is the safe Rust product
@@ -154,8 +161,9 @@ equivalent" means, and it is the unit the rb-epilogue lands in.
   backbone decode step on the persistent team. Weight pointers and mutable state
   still arrive through the borrowed compatibility request slot; direct resident
   image binding and the complete target arena remain open.
-- **E2 frame pass**: DepthDecode into the program (v1 boundary sampling per codebook step
-  batch; v2 in-pass RNG). Oracle: token-sequence A/B vs current DepthDecode.
+- **E2 frame pass**: DepthDecode into the program. The assembly CSPRNG and
+  snapshot-stable native state are built; probability policy and in-pass stream
+  consumption remain to mount. Oracle: token-sequence A/B vs current DepthDecode.
 - **E3 rings**: token/PCM rings live; per-token tensor construction deleted from the loop;
   sampler v2. Oracle: e2e gates + allocation counter == 0 in-pass.
 - **E4 prefill pass**: chunked `lfm_prefill_pass`, streams during capture (the

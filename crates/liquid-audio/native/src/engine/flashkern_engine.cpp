@@ -34,6 +34,7 @@
 #include <pthread.h>
 #include <vector>
 
+#include "flashkern_prng.h"
 #include "lfm_kernel_bridge.h"
 
 extern "C" {
@@ -148,12 +149,22 @@ enum : int {
     // ordinary nested C++/Rust frames and thread-local state never migrate. This
     // transitional call remains until the depthformer program is fully native.
     REQ_CALL = 5,
+    // Conversation-owned ChaCha state advances exactly once in a collective
+    // serial section. Production sampling consumes the same primitive inside
+    // token/depthformer passes; this typed pass is its SQ/CQ conformance leaf.
+    REQ_PRNG = 6,
 };
 
 typedef void (*LfmLaneFn)(void *ctx, uint32_t lane, uint32_t lanes_total);
 struct CallReq {
     LfmLaneFn fn = nullptr;
     void *ctx = nullptr;
+};
+
+struct PrngReq {
+    LfmPrngStateV1 *state = nullptr;
+    uint64_t *out = nullptr;
+    size_t count = 0;
 };
 
 // ---- the resident layer table (C ABI) ------------------------------------------------
@@ -343,6 +354,7 @@ struct Engine {
     void *submitter_context = nullptr;
     KcSubmissionV1 active_submission{};
     std::atomic<bool> pass_claimed{false};
+    std::atomic<int> active_status{0};
     uint64_t runtime_epoch = 0;
     uint64_t submit_sequence = 0; // written only by the current pass claimant
     uint32_t ticket_generation = 0;
@@ -356,6 +368,7 @@ struct Engine {
     ConvReq conv;  // conv-layer request payload
     AttnReq attn;  // attention-layer request payload
     CallReq call;  // generic lane-uniform call payload
+    PrngReq prng;  // caller-owned CSPRNG state and destination
     ScPass sc;     // shortconv stage pointers
     AtPass at;     // attention stage pointers
 
@@ -1003,6 +1016,13 @@ static void run_token_pass(Engine *e, uint32_t lane) {
     }
 }
 
+static void run_prng_pass(Engine *e, uint32_t lane) {
+    lane_fence(e, lane, [&] {
+        int status = lfm_prng_fill_u64(e->prng.state, e->prng.out, e->prng.count);
+        e->active_status.store(status, std::memory_order_release);
+    });
+}
+
 // The per-generation program, dispatched identically on every lane; the final fence
 // proves ALL tiles landed before lane 0 signals the rim. Request payloads are written
 // by the rim before its doorbell and read-only for the whole generation.
@@ -1029,6 +1049,9 @@ static void lane_program(Engine *e, uint32_t lane) {
         break;
     case REQ_CALL:
         e->call.fn(e->call.ctx, lane, e->lanes_total);
+        break;
+    case REQ_PRNG:
+        run_prng_pass(e, lane);
         break;
     default:
         break;
@@ -1065,10 +1088,18 @@ static void *lane_main(void *arg) {
             completion.conversation_id = submission.conversation_id;
             completion.epoch = submission.epoch;
             completion.pass_id = submission.ticket.sequence;
-            completion.execution = KC_COORD_EXECUTION_COMPLETED;
-            completion.state = KC_COORD_STATE_COMMITTED;
-            completion.publication = KC_COORD_PUBLICATION_COMMITTED;
-            completion.cause = KC_COORD_CAUSE_SUCCESS;
+            completion.status = e->active_status.load(std::memory_order_acquire);
+            if (completion.status == 0) {
+                completion.execution = KC_COORD_EXECUTION_COMPLETED;
+                completion.state = KC_COORD_STATE_COMMITTED;
+                completion.publication = KC_COORD_PUBLICATION_COMMITTED;
+                completion.cause = KC_COORD_CAUSE_SUCCESS;
+            } else {
+                completion.execution = KC_COORD_EXECUTION_FAILED;
+                completion.state = KC_COORD_STATE_NONE;
+                completion.publication = KC_COORD_PUBLICATION_NONE;
+                completion.cause = KC_COORD_CAUSE_FAULT;
+            }
             e->pass_completions.fetch_add(1, std::memory_order_relaxed);
             if (lfm_kernel_bridge_publish_completion(e->bridge, &completion) != 0) {
                 // The sole accepted ticket owns a reserved CQ cell. Failure here
@@ -1123,12 +1154,13 @@ static void *bridge_main(void *arg) {
                      submission.ticket.kind == KC_COORD_TICKET_PASS &&
                      submission.epoch != 0 &&
                      descriptor.payload == e && descriptor.flags == 0 &&
-                     descriptor.kind > REQ_NONE && descriptor.kind <= REQ_CALL;
+                     descriptor.kind > REQ_NONE && descriptor.kind <= REQ_PRNG;
         if (!valid) {
             publish_rejected(e, submission, -ESTALE);
             continue;
         }
 
+        e->active_status.store(0, std::memory_order_relaxed);
         e->cur_req = (int)descriptor.kind;
         e->active_submission = submission;
         e->bridge_dispatches.fetch_add(1, std::memory_order_relaxed);
@@ -1405,6 +1437,24 @@ int lfm_engine_mlp(void *ep, const uint16_t *x, const uint16_t *norm_w,
     p->rs_bits.store(0, std::memory_order_relaxed);
 
     return submit_pass(e, REQ_MLP);
+}
+
+// Fill from one conversation-owned CSPRNG stream through the same retained
+// descriptor -> kcoro SQ/CQ -> fixed-lane completion path as model passes.
+// The random stream itself is serial by definition, so the fence's last arriver
+// advances it exactly once; no lane races or per-draw tickets exist.
+int lfm_engine_prng_fill(void *ep, LfmPrngStateV1 *state, uint64_t *out,
+                         size_t count) {
+    Engine *e = (Engine *)ep;
+    if (!e || !state || !out || count == 0) return -EINVAL;
+    PassClaim claim(e);
+    if (!claim) return -EBUSY;
+    int valid = lfm_prng_fill_u64(state, nullptr, 0);
+    if (valid != 0) return valid;
+    e->prng.state = state;
+    e->prng.out = out;
+    e->prng.count = count;
+    return submit_pass(e, REQ_PRNG);
 }
 
 // Build the resident layer table: one descriptor per backbone block (indexed by

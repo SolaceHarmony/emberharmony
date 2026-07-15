@@ -313,6 +313,94 @@ resume at the next draw exactly.
 Sampling writes one token ID to a fixed result slot. The existing Rust callback
 inside `sample_audio_frame_flash` at `lfm2_audio.rs:1358-1397` is removed.
 
+### As-built PRNG foundation (2026-07-14)
+
+The first sampler component is now native, but the sampler itself is not yet
+mounted. `LfmPrngStateV1` at
+`crates/liquid-audio/native/include/flashkern_prng.h:33-62` is a pointer-free,
+64-byte-aligned, 192-byte ChaCha20 stream image. It contains the original
+64-bit-counter/64-bit-nonce core, the current 64-byte output block, and its
+cursor. Copying the complete object at a quiescent boundary therefore preserves
+the exact next draw; restoring a mark never reconstructs randomness from a draw
+count.
+
+`lfm_prng_seed_system` at
+`native/src/engine/flashkern_prng.cpp:111-119` obtains 40 bytes once: a 256-bit
+key and 64-bit nonce. On Apple, the architecture thunk at
+`native/kernels/aarch64/flashkern_prng.S:101-119` calls
+`SecRandomCopyBytes(kSecRandomDefault, count, bytes)` with the correct AAPCS64
+argument shuffle. The Security framework is the platform entropy boundary.
+Direct `RNDR` is not an Apple-Silicon baseline: it is absent on supported Macs
+including the audited M2 Max and traps when executed there. No entropy syscall,
+feature probe, allocation, or seed copy occurs during a draw.
+
+Hot expansion is assembly on both production architectures:
+
+- aarch64 keeps all sixteen ChaCha words in `w2-w17` and leaves Apple's reserved
+  `x18` untouched at `native/kernels/aarch64/flashkern_prng.S:38-96`;
+- x86_64 executes a four-row SSE2 block at
+  `native/kernels/x86_64/flashkern_prng.S:38-73`.
+
+`REQ_PRNG` at `native/src/engine/flashkern_engine.cpp:155`,
+`run_prng_pass` at `1019-1024`, and `lfm_engine_prng_fill` at `1446-1458`
+form a temporary typed conformance leaf. It proves retained descriptor -> Rust
+kcoro SQ -> fixed Flashkern lanes -> CQ completion without moving the state or
+output payload through a channel. It is deliberately **not** a ticket-per-draw
+product design. When sampling mounts, each native conversation owns separate
+text and audio `LfmPrngStateV1` objects; the token or Depthformer pass expands
+and consumes them inside its existing serial sampling stage before publishing
+one compact result ID. Rust never receives logits, probability arrays, random
+draws, or sampler state.
+
+The conformance tests at
+`crates/liquid-audio/src/compute/flashkern/native_engine.rs:959-1081` pin two
+published zero-key/zero-nonce blocks, exact state/cursor advancement, replay
+from both empty and partially consumed block snapshots, real SQ/CQ/fence
+counters, and Apple system seeding. They pass on aarch64 and through the
+repository's local-only x86_64 Rosetta gate
+(`crates/liquid-audio/scripts/test-rosetta.sh`). A native x86_64 runner remains
+required for ISA features that Rosetta does not advertise; the SSE2 ChaCha block
+itself executes and passes under Rosetta.
+
+### Sampler threadgroup program
+
+The probability policy mounts as one native subprogram of the token or
+Depthformer pass, not as a serial helper and not as a chain of kcoro tickets.
+The fixed Flashkern lanes are its CPU threadgroup. `lane_fence` is the exact
+equivalent of a GPU `threadgroup_barrier`: it publishes a logical generation,
+blocks declared peers through the zero-spin wait word, and lets the last arriver
+perform the bounded serial fold.
+
+The stage plan is:
+
+1. Partition the vocabulary into stable contiguous lane shards. Each lane reads
+   logits in place, applies the configured temperature, and writes its local
+   maximum plus fixed-capacity top-k candidates to lane-private scratch.
+2. Fence. The last arriver folds maxima and candidate lists in lane order. For
+   threshold top-k it publishes the kth score, retaining every equal-score tie;
+   no heap, sort vector, or exactly-k shortcut is permitted.
+3. Each lane computes masked `exp(logit - global_max)` weights and one local sum.
+   The selected approximation and F32 rounding ladder are fixture-pinned.
+4. Fence. The last arriver folds sums in lane order and publishes deterministic
+   per-lane prefix intervals plus the total mass.
+5. The serial section consumes exactly one value from the conversation's text or
+   audio `LfmPrngStateV1` and maps it into `[0, total_mass)`. The one lane owning
+   that interval scans only its shard to resolve the first crossing token.
+6. Fence. The winner publishes one token ID; native code appends it and advances
+   sampler/context state before the pass completion becomes visible.
+
+Greedy mode uses the same first reduction and deterministic index tie-break,
+then skips probability and PRNG stages. Invalid configuration, empty support,
+or nonfinite-policy failure is detected before sampler or conversation mutation.
+Barrier count is plan metadata and a regression metric; adjacent stages may be
+fused only when the same parity fixtures prove the published generation facts
+are unchanged.
+
+Kcoro is aware of this work only at pass granularity. Its retained ticket keeps
+the conversation and output slot alive, its scope epoch controls whether a
+completed result may publish, and its CQ edge resumes recurrence. No logit,
+candidate, probability, lane partial, or random draw enters the docking ring.
+
 ## Depthformer
 
 Mount the existing native Depthformer graph as ordinary stages in the same lane
@@ -430,9 +518,10 @@ model-state pages.
 4. Implement direct modality embedding for a full context.
 5. Add native multi-token backbone prefill and compare every layer/cache boundary.
 6. Add suffix prefill with strict cursor/mark validation.
-7. Move text head, sampling, append, and modality result production into typed
-   native passes; route compact completion facts to the Rust coordinator for
-   recurrence policy.
+7. Build on the landed native ChaCha20/entropy foundation: move text head,
+   probability policy, PRNG consumption, append, and modality result production
+   into typed native passes; route only compact completion facts to the Rust
+   coordinator for recurrence policy.
 8. Mount Depthformer without `REQ_CALL` or Rust sampling callbacks.
 9. Split Mimi plan/state ownership and decode directly to playback blocks.
 10. Move native tokenizer piece decoding into the notification continuation.
@@ -459,6 +548,9 @@ model-state pages.
   no leaked pages, and no stale cache publication.
 - Greedy and stochastic sampling match stored seed/draw fixtures, including
   top-k boundary ties.
+- ChaCha20 known-answer vectors match on aarch64 and x86_64; copying a quiescent
+  sampler state reproduces the exact next draw, while warmed draw paths perform
+  no system entropy call, allocation, or coordination ticket per draw.
 - Recurrence can produce an entire turn through exact native-CQ-to-Rust edges
   with zero Tauri/webview IPC, polling, or numerical payload crossing.
 - Stop and interrupt are observed only between complete token passes; an active
