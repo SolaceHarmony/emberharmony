@@ -1,27 +1,25 @@
-//! Faithful pure-Rust port of `torchaudio.functional.resample` (windowed-sinc).
+//! Rust rim over the native torchaudio-exact resampler
+//! (native/src/frontend/lfm_frontend.cpp + flashkern_frontend.S).
 //!
-//! `liquid_audio` resamples audio via `torchaudio.functional.resample` in two
-//! places: `ChatState.add_audio` / the processor (input waveform → 16 kHz) and
-//! `data/mapper` (`_load_audio_bytes` resample-to-16k and `_encode_audio_out`
-//! resample-to-Mimi-rate). torch is not a dependency in this port, so rather than
-//! approximate with linear interpolation this reproduces torchaudio's algorithm
-//! exactly: one windowed-sinc kernel per output phase (the library default
-//! `resampling_method="sinc_interp_hann"`, `lowpass_filter_width=6`,
-//! `rolloff=0.99`), applied as a strided conv1d over the gcd-reduced rates, then
-//! truncated to `ceil(new_freq * length / orig_freq)` samples.
-//!
-//! Ref: `torchaudio/functional/functional.py` — `_get_sinc_resample_kernel`
-//! (kernel construction) and `_apply_sinc_resample_kernel` (pad + conv1d).
+//! The former pure-Rust windowed-sinc implementation is DELETED; the native
+//! port reproduces `torchaudio.functional.resample` (sinc_interp_hann,
+//! `lowpass_filter_width=6`, `rolloff=0.99`, f64 kernels/accumulation,
+//! truncate to `ceil(new * len / orig)`) and is gated by the committed
+//! fixtures under native/tests/fixtures/resample/ (captured from the deleted
+//! implementation).
 
 use candle_core::{DType, Result, Tensor};
 
-fn gcd(mut a: u32, mut b: u32) -> u32 {
-    while b != 0 {
-        let t = b;
-        b = a % b;
-        a = t;
-    }
-    a
+unsafe extern "C" {
+    fn lfm_resample_f32(
+        x: *const f32,
+        length: u64,
+        orig_freq: u32,
+        new_freq: u32,
+        out: *mut f32,
+        out_capacity: u64,
+        out_length: *mut u64,
+    ) -> i32;
 }
 
 /// `torchaudio.functional.resample(wave, orig_freq, new_freq)` with the library
@@ -42,70 +40,45 @@ pub fn resample(wave: &Tensor, orig_freq: u32, new_freq: u32) -> Result<Tensor> 
     Tensor::from_vec(y, (1, n), &dev)
 }
 
-/// The torchaudio kernel construction + strided conv on a plain f32 slice.
+/// The native resample on a plain f32 slice. Rates must be non-zero (the
+/// tensor path validates; direct callers pass device/model rates that are
+/// non-zero by construction) — a native rejection is a programmer error and
+/// panics rather than degrading.
 pub fn resample_slice(x: &[f32], orig_freq: u32, new_freq: u32) -> Vec<f32> {
     if orig_freq == new_freq || x.is_empty() {
         return x.to_vec();
     }
-    use std::f64::consts::PI;
-    const LOWPASS_WIDTH: i64 = 6; // torchaudio default lowpass_filter_width
-    const ROLLOFF: f64 = 0.99; // torchaudio default rolloff
-
-    let g = gcd(orig_freq, new_freq);
-    let orig = (orig_freq / g) as i64;
-    let new = (new_freq / g) as i64;
-    let base_freq = (orig.min(new) as f64) * ROLLOFF;
-    let width = ((LOWPASS_WIDTH as f64) * (orig as f64) / base_freq).ceil() as i64;
-    let kernel_len = (2 * width + orig) as usize;
-    let scale = base_freq / (orig as f64);
-
-    // One kernel per output phase i in 0..new; index j runs over -width..(width+orig).
-    // t = (-i/new + idx/orig) * base_freq, clamped to ±lowpass_width; Hann window
-    // cos(t·π / lpw / 2)²; sinc = sin(πt)/(πt) (1 at t==0); kernel = sinc·window·scale.
-    let mut kernels = vec![vec![0f64; kernel_len]; new as usize];
-    for (i, k) in kernels.iter_mut().enumerate() {
-        for (j, idx) in (-width..(width + orig)).enumerate() {
-            let mut t = (-(i as f64) / (new as f64) + (idx as f64) / (orig as f64)) * base_freq;
-            t = t.clamp(-(LOWPASS_WIDTH as f64), LOWPASS_WIDTH as f64);
-            let window = (t * PI / (LOWPASS_WIDTH as f64) / 2.0).cos().powi(2);
-            let tp = t * PI;
-            let sinc = if tp == 0.0 { 1.0 } else { tp.sin() / tp };
-            k[j] = sinc * window * scale;
-        }
+    // ceil(len * new/orig) over gcd-reduced rates, exactly the target the
+    // native side truncates to — sizes the output buffer without a probe call.
+    let mut a = orig_freq;
+    let mut b = new_freq;
+    while b != 0 {
+        let t = b;
+        b = a % b;
+        a = t;
     }
-
-    // torchaudio pads (width, width + orig) then conv1d(stride=orig); the
-    // (new, 1, kernel_len) kernel + transpose/reshape interleave the phases so the
-    // output order is block0[phase0..new], block1[phase0..new], …
-    let length = x.len();
-    let pad_left = width as usize;
-    let pad_right = (width + orig) as usize;
-    let padded_len = pad_left + length + pad_right;
-    let mut padded = vec![0f64; padded_len];
-    for (i, &s) in x.iter().enumerate() {
-        padded[pad_left + i] = s as f64;
-    }
-
-    let stride = orig as usize;
-    let blocks = if padded_len >= kernel_len {
-        (padded_len - kernel_len) / stride + 1
-    } else {
-        0
+    let (orig, new) = ((orig_freq / a) as f64, (new_freq / a) as f64);
+    let target = ((new * x.len() as f64) / orig).ceil() as usize;
+    let mut out = vec![0f32; target];
+    let mut out_len: u64 = 0;
+    let rc = unsafe {
+        lfm_resample_f32(
+            x.as_ptr(),
+            x.len() as u64,
+            orig_freq,
+            new_freq,
+            out.as_mut_ptr(),
+            target as u64,
+            &mut out_len,
+        )
     };
-    let mut out: Vec<f32> = Vec::with_capacity(blocks * new as usize);
-    let mut start = 0usize;
-    while start + kernel_len <= padded_len {
-        for k in &kernels {
-            let mut acc = 0f64;
-            for (j, &kj) in k.iter().enumerate() {
-                acc += padded[start + j] * kj;
-            }
-            out.push(acc as f32);
-        }
-        start += stride;
-    }
-    let target = (((new as f64) * (length as f64)) / (orig as f64)).ceil() as usize;
-    out.truncate(target);
+    assert!(
+        rc == 0 && out_len as usize == target,
+        "native resample failed (status {rc}, {} -> {} Hz, {} samples)",
+        orig_freq,
+        new_freq,
+        x.len()
+    );
     out
 }
 

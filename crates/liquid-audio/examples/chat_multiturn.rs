@@ -181,9 +181,8 @@ fn main() -> Res<()> {
         samples.len(),
         samples.len() as f32 / rate as f32
     );
-    let wave = Tensor::from_vec(samples.clone(), (1, samples.len()), &device)?;
     chat.new_turn("user")?;
-    chat.add_audio(&wave, rate)?; // CONTINUOUS audio-in
+    chat.add_audio_slice(&samples, rate)?; // CONTINUOUS audio-in
     chat.end_turn()?;
     chat.new_turn("assistant")?;
 

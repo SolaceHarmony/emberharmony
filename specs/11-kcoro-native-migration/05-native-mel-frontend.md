@@ -1,6 +1,18 @@
 # Native Resampler and Mel Frontend
 
-Status: normative design.
+Status: normative design with the M1 math/span tranche implemented in the
+current working tree: `native/src/frontend/lfm_frontend.cpp` +
+`kernels/{aarch64,x86_64}/flashkern_frontend.S`, gated by
+`tests/native_frontend_parity.rs` over fixtures captured from the deleted Rust
+featurizer (`native/tests/fixtures/{mel,resample}/`). Realtime now borrows its
+retained PCM slice, reuses a high-water workspace, and requests a direct
+valid-frame destination; padded output remains a compatibility-only contract.
+M1 is not complete until document 06's native Conformer consumes that plane:
+the current rim still turns it into a Candle tensor (one host-to-model-device
+mel upload on Metal and a fresh destination allocation per pass). The current
+Rust compatibility owner also shares one mutex-protected workspace across
+engines and grows it on first/new-high-water use; per-session pre-reservation,
+the resampler plan/state, and M2 pause-candidate mounting remain design.
 
 Baseline: EmberHarmony `321538f11749`.
 
@@ -65,22 +77,23 @@ struct LfmMelPlan {
 };
 
 struct LfmMelWork {
-    float *resampled_pcm;
-    float *spectrum_real;
-    float *spectrum_imag;
-    float *power;
-    float *log_mel;
-    float *sum;
-    float *sum_sq;
+    // Lifetime-aliased planes, not one allocation per stage:
+    // A: padded/preemphasized PCM -> DFT real+imag -> power in real half.
+    // B: gathered frames -> per-bin mean/std.
+    float *plane_a;
+    float *plane_b;
+    uint64_t plane_a_values;
+    uint64_t plane_b_values;
     uint32_t frame_capacity;
 };
 
 struct LfmMelSegment {
     uint64_t segment_id;
     uint64_t epoch;
-    float *data;       // bins x padded_frames
+    float *data;       // bins x row_stride
     uint32_t valid_frames;
     uint32_t padded_frames;
+    uint32_t row_stride;
     uint32_t bins;
 };
 ```
@@ -162,7 +175,9 @@ The migration uses three honest stages:
 
 At endpoint, process the retained utterance span into exact normalized mel and
 hand it to Conformer. This removes Rust/Candle and payload copies without making
-a false incremental-parity claim.
+a false incremental-parity claim. The working tree has the exact native pass
+and pointer-through Rust seam, but the handoff still enters the Candle
+Conformer; therefore this milestone remains incomplete.
 
 ### M2: pause-candidate speculative frontend
 
@@ -185,22 +200,27 @@ used to claim parity with the current frontend.
 
 - Input is a retained `LfmPcmSpanV1`; no waveform tensor is created.
 - Resampled PCM is one preallocated destination.
-- DFT real/imag and power planes may alias when a stage has consumed the old
-  values and the plan declares the alias.
+- Signal storage is dead after framing and may become the DFT plane. Gathered
+  frames are dead after DFT and may become the statistics plane. Power aliases
+  the real DFT half only after each leaf has loaded the corresponding real and
+  imaginary values.
 - Log-mel is normalized in place after per-bin statistics are complete.
-- Padding writes zeros into reserved tail columns; it does not concatenate a
-  second tensor.
+- Mel GEMM writes the segment destination at its declared row stride; it never
+  builds a second dense mel plane. Compatibility padding writes zeros into
+  reserved tail columns rather than concatenating another tensor. A
+  valid-only consumer may set `row_stride == valid_frames` and omit the tail.
 - `LfmMelSegment` is published by pointer/offset and generation.
 - A speculative segment owns a rollback generation and cannot be attached to a
   different conversation mark.
 
 ## Integration with Conformer
 
-The frontend destination layout is `(bins, padded_frames)` row-major, matching
-the current `ChatState::audio_in` layout at `crates/liquid-audio/src/processor.rs:1004-1012`.
-Conformer consumes the segment directly; there is no transpose/copy at the
-subsystem boundary. The first Conformer stage chooses its tile indexing to read
-this layout.
+The frontend destination is row-major `(bins, row_stride)`. The current
+valid-only rim uses `row_stride == valid_frames`, matching `ChatState::audio_in`
+without a crop. A native session may reserve a padded stride for downstream
+tiling, provided valid frame count remains separate. Conformer consumes that
+segment directly; there is no transpose/copy at the subsystem boundary. The
+first Conformer stage chooses its tile indexing to read the declared stride.
 
 Valid frame count is separate from padded frame count. Modality positions use
 the same `mel2emb_len(valid_frames)` arithmetic currently used at

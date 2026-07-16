@@ -1,0 +1,585 @@
+{
+  "artifacts": [
+    {
+      "dtype": "f32le",
+      "file": "table_hann400.bin",
+      "len": 400
+    },
+    {
+      "dtype": "f32le",
+      "file": "table_hann400_padded512.bin",
+      "len": 512
+    },
+    {
+      "dtype": "f32le",
+      "file": "table_melfb_128x257.bin",
+      "len": 32896,
+      "shape": [
+        128,
+        257
+      ]
+    },
+    {
+      "dtype": "f32le",
+      "file": "table_dft_row0.bin",
+      "len": 512
+    },
+    {
+      "dtype": "f32le",
+      "file": "table_dft_row1.bin",
+      "len": 512
+    },
+    {
+      "dtype": "f32le",
+      "file": "table_dft_row128.bin",
+      "len": 512
+    },
+    {
+      "dtype": "f32le",
+      "file": "table_dft_row256.bin",
+      "len": 512
+    },
+    {
+      "dtype": "f32le",
+      "file": "table_dft_row257.bin",
+      "len": 512
+    },
+    {
+      "dtype": "f32le",
+      "file": "table_dft_row258.bin",
+      "len": 512
+    },
+    {
+      "dtype": "f32le",
+      "file": "table_dft_row385.bin",
+      "len": 512
+    },
+    {
+      "dtype": "f32le",
+      "file": "table_dft_row513.bin",
+      "len": 512
+    },
+    {
+      "dtype": "f32le",
+      "file": "input_tone440_8000.bin",
+      "len": 8000
+    },
+    {
+      "dtype": "f32le",
+      "file": "a_tone440_8000_forward.bin",
+      "len": 6528,
+      "shape": [
+        1,
+        128,
+        51
+      ]
+    },
+    {
+      "dtype": "f32le",
+      "file": "input_ramp_mix_4000.bin",
+      "len": 4000
+    },
+    {
+      "dtype": "f32le",
+      "file": "a_ramp_mix_4000_forward.bin",
+      "len": 3328,
+      "shape": [
+        1,
+        128,
+        26
+      ]
+    },
+    {
+      "dtype": "f32le",
+      "file": "input_impulse_800.bin",
+      "len": 800
+    },
+    {
+      "dtype": "f32le",
+      "file": "a_impulse_800_forward.bin",
+      "len": 768,
+      "shape": [
+        1,
+        128,
+        6
+      ]
+    },
+    {
+      "dtype": "f32le",
+      "file": "input_silence_1600.bin",
+      "len": 1600
+    },
+    {
+      "dtype": "f32le",
+      "file": "a_silence_1600_forward.bin",
+      "len": 1408,
+      "shape": [
+        1,
+        128,
+        11
+      ]
+    },
+    {
+      "dtype": "f32le",
+      "file": "input_single_200.bin",
+      "len": 200
+    },
+    {
+      "dtype": "f32le",
+      "file": "a_single_200_forward.bin",
+      "len": 256,
+      "shape": [
+        1,
+        128,
+        2
+      ]
+    },
+    {
+      "dtype": "f32le",
+      "file": "input_sub_300.bin",
+      "len": 300
+    },
+    {
+      "dtype": "f32le",
+      "file": "a_sub_300_forward.bin",
+      "len": 256,
+      "shape": [
+        1,
+        128,
+        2
+      ]
+    },
+    {
+      "dtype": "f32le",
+      "file": "a_tone440_8000_preemph.bin",
+      "len": 8000,
+      "role": "preemphasized+masked signal",
+      "seq_len": 50
+    },
+    {
+      "dtype": "f32le",
+      "file": "a_tone440_8000_stft_re.bin",
+      "len": 13107,
+      "shape": [
+        257,
+        51
+      ]
+    },
+    {
+      "dtype": "f32le",
+      "file": "a_tone440_8000_stft_im.bin",
+      "len": 13107,
+      "shape": [
+        257,
+        51
+      ]
+    },
+    {
+      "dtype": "f32le",
+      "file": "a_tone440_8000_power.bin",
+      "len": 13107,
+      "shape": [
+        257,
+        51
+      ]
+    },
+    {
+      "dtype": "f32le",
+      "file": "a_tone440_8000_mel_prelog.bin",
+      "len": 6528,
+      "shape": [
+        128,
+        51
+      ]
+    },
+    {
+      "dtype": "f32le",
+      "file": "a_tone440_8000_mel_log.bin",
+      "len": 6528,
+      "shape": [
+        128,
+        51
+      ]
+    },
+    {
+      "dtype": "f32le",
+      "file": "a_tone440_8000_mel_norm.bin",
+      "len": 6528,
+      "shape": [
+        128,
+        51
+      ]
+    },
+    {
+      "dtype": "f32le",
+      "file": "a_tone440_8000_mel_final.bin",
+      "len": 6528,
+      "shape": [
+        1,
+        128,
+        51
+      ]
+    },
+    {
+      "dtype": "f32le",
+      "file": "a_ramp_mix_4000_preemph.bin",
+      "len": 4000,
+      "role": "preemphasized+masked signal",
+      "seq_len": 25
+    },
+    {
+      "dtype": "f32le",
+      "file": "a_ramp_mix_4000_stft_re.bin",
+      "len": 6682,
+      "shape": [
+        257,
+        26
+      ]
+    },
+    {
+      "dtype": "f32le",
+      "file": "a_ramp_mix_4000_stft_im.bin",
+      "len": 6682,
+      "shape": [
+        257,
+        26
+      ]
+    },
+    {
+      "dtype": "f32le",
+      "file": "a_ramp_mix_4000_power.bin",
+      "len": 6682,
+      "shape": [
+        257,
+        26
+      ]
+    },
+    {
+      "dtype": "f32le",
+      "file": "a_ramp_mix_4000_mel_prelog.bin",
+      "len": 3328,
+      "shape": [
+        128,
+        26
+      ]
+    },
+    {
+      "dtype": "f32le",
+      "file": "a_ramp_mix_4000_mel_log.bin",
+      "len": 3328,
+      "shape": [
+        128,
+        26
+      ]
+    },
+    {
+      "dtype": "f32le",
+      "file": "a_ramp_mix_4000_mel_norm.bin",
+      "len": 3328,
+      "shape": [
+        128,
+        26
+      ]
+    },
+    {
+      "dtype": "f32le",
+      "file": "a_ramp_mix_4000_mel_final.bin",
+      "len": 3328,
+      "shape": [
+        1,
+        128,
+        26
+      ]
+    },
+    {
+      "dtype": "f32le",
+      "file": "a_single_200_preemph.bin",
+      "len": 200,
+      "role": "preemphasized+masked signal",
+      "seq_len": 1
+    },
+    {
+      "dtype": "f32le",
+      "file": "a_single_200_stft_re.bin",
+      "len": 514,
+      "shape": [
+        257,
+        2
+      ]
+    },
+    {
+      "dtype": "f32le",
+      "file": "a_single_200_stft_im.bin",
+      "len": 514,
+      "shape": [
+        257,
+        2
+      ]
+    },
+    {
+      "dtype": "f32le",
+      "file": "a_single_200_power.bin",
+      "len": 514,
+      "shape": [
+        257,
+        2
+      ]
+    },
+    {
+      "dtype": "f32le",
+      "file": "a_single_200_mel_prelog.bin",
+      "len": 256,
+      "shape": [
+        128,
+        2
+      ]
+    },
+    {
+      "dtype": "f32le",
+      "file": "a_single_200_mel_log.bin",
+      "len": 256,
+      "shape": [
+        128,
+        2
+      ]
+    },
+    {
+      "dtype": "f32le",
+      "file": "a_single_200_mel_norm.bin",
+      "len": 256,
+      "shape": [
+        128,
+        2
+      ]
+    },
+    {
+      "dtype": "f32le",
+      "file": "a_single_200_mel_final.bin",
+      "len": 256,
+      "shape": [
+        1,
+        128,
+        2
+      ]
+    },
+    {
+      "dtype": "f32le",
+      "file": "b_tone440_8000_preemph.bin",
+      "len": 8352,
+      "role": "preemphasized+masked signal",
+      "seq_len": 49
+    },
+    {
+      "dtype": "f32le",
+      "file": "b_tone440_8000_stft_re.bin",
+      "len": 12850,
+      "shape": [
+        257,
+        50
+      ]
+    },
+    {
+      "dtype": "f32le",
+      "file": "b_tone440_8000_stft_im.bin",
+      "len": 12850,
+      "shape": [
+        257,
+        50
+      ]
+    },
+    {
+      "dtype": "f32le",
+      "file": "b_tone440_8000_power.bin",
+      "len": 12850,
+      "shape": [
+        257,
+        50
+      ]
+    },
+    {
+      "dtype": "f32le",
+      "file": "b_tone440_8000_mel_prelog.bin",
+      "len": 6400,
+      "shape": [
+        128,
+        50
+      ]
+    },
+    {
+      "dtype": "f32le",
+      "file": "b_tone440_8000_mel_log.bin",
+      "len": 6400,
+      "shape": [
+        128,
+        50
+      ]
+    },
+    {
+      "dtype": "f32le",
+      "file": "b_tone440_8000_mel_norm.bin",
+      "len": 6400,
+      "shape": [
+        128,
+        50
+      ]
+    },
+    {
+      "dtype": "f32le",
+      "file": "b_tone440_8000_mel_final.bin",
+      "len": 8192,
+      "shape": [
+        1,
+        128,
+        64
+      ]
+    },
+    {
+      "dtype": "f32le",
+      "file": "b_single_200_preemph.bin",
+      "len": 552,
+      "role": "preemphasized+masked signal",
+      "seq_len": 0
+    },
+    {
+      "dtype": "f32le",
+      "file": "b_single_200_stft_re.bin",
+      "len": 257,
+      "shape": [
+        257,
+        1
+      ]
+    },
+    {
+      "dtype": "f32le",
+      "file": "b_single_200_stft_im.bin",
+      "len": 257,
+      "shape": [
+        257,
+        1
+      ]
+    },
+    {
+      "dtype": "f32le",
+      "file": "b_single_200_power.bin",
+      "len": 257,
+      "shape": [
+        257,
+        1
+      ]
+    },
+    {
+      "dtype": "f32le",
+      "file": "b_single_200_mel_prelog.bin",
+      "len": 128,
+      "shape": [
+        128,
+        1
+      ]
+    },
+    {
+      "dtype": "f32le",
+      "file": "b_single_200_mel_log.bin",
+      "len": 128,
+      "shape": [
+        128,
+        1
+      ]
+    },
+    {
+      "dtype": "f32le",
+      "file": "b_single_200_mel_norm.bin",
+      "len": 128,
+      "shape": [
+        128,
+        1
+      ]
+    },
+    {
+      "dtype": "f32le",
+      "file": "b_single_200_mel_final.bin",
+      "len": 2048,
+      "shape": [
+        1,
+        128,
+        16
+      ]
+    }
+  ],
+  "baseline": "working tree on e018540c; LFM2.5-Audio-1.5B c362a0625dfe preprocessor geometry",
+  "config_a": {
+    "exact_pad": false,
+    "log_zero_guard_value": "2^-24",
+    "mag_power": 2.0,
+    "n_fft": 512,
+    "n_window_size": 400,
+    "n_window_stride": 160,
+    "nfilt": 128,
+    "normalize": "per_feature",
+    "pad_to": 0,
+    "preemph": 0.97,
+    "sample_rate": 16000
+  },
+  "config_b": {
+    "same_as_a_except": {
+      "exact_pad": true,
+      "pad_to": 16
+    }
+  },
+  "generator": "processor.rs mel::tests::dump_mel_fixtures (dies with the Rust mel module)",
+  "get_seq_len": {
+    "config_a": [
+      0,
+      0,
+      0,
+      1,
+      1,
+      1,
+      1,
+      2,
+      2,
+      2,
+      3,
+      3,
+      5,
+      10,
+      25,
+      50
+    ],
+    "config_b": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      1,
+      1,
+      1,
+      2,
+      2,
+      4,
+      9,
+      24,
+      49
+    ],
+    "lens": [
+      0,
+      1,
+      159,
+      160,
+      199,
+      200,
+      300,
+      320,
+      399,
+      400,
+      480,
+      512,
+      800,
+      1600,
+      4000,
+      8000
+    ]
+  }
+}

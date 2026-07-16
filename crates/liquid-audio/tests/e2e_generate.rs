@@ -112,7 +112,7 @@ fn run_turn(
     chat: &mut ChatState,
     cache: &mut Option<LfmCache>,
     cursor: &mut PrefillCursor,
-    wave: &Tensor,
+    wave: &[f32],
     rate: u32,
     params: &GenParams,
     codebooks: usize,
@@ -121,7 +121,7 @@ fn run_turn(
     turn_idx: usize,
 ) -> TurnOut {
     chat.new_turn("user").unwrap();
-    chat.add_audio(wave, rate).unwrap();
+    chat.add_audio_slice(wave, rate).unwrap();
     chat.end_turn().unwrap();
     chat.new_turn("assistant").unwrap();
 
@@ -262,8 +262,6 @@ fn run_conversation(
         samples.len() as f32 / rate as f32 > 1.0,
         "question.wav should be > 1s of speech"
     );
-    let wave = Tensor::from_vec(samples.clone(), (1, samples.len()), device).unwrap();
-
     // README regime: greedy text (the A/B exactness target), sampled audio
     // (greedy audio is degenerate for the Depthformer), fixed seed.
     let params = GenParams {
@@ -288,7 +286,7 @@ fn run_conversation(
                 &mut chat,
                 &mut cache,
                 &mut cursor,
-                &wave,
+                &samples,
                 rate,
                 &params,
                 codebooks,

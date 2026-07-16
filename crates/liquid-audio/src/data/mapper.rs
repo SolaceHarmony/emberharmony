@@ -306,22 +306,10 @@ impl<'a> LFM2AudioChatMapper<'a> {
             wav
         };
 
-        // mel, mel_len = self.processor.audio(wav, wav_len). The crate's featurizer
-        // returns (1, nfilt, T_padded); `valid` (= floor(L/hop)) is the Python
-        // `mel_len` — the un-padded frame count — so we slice to it (Python:
-        // mel[0, :, :cur_len]).
-        let mel = self.processor.audio().forward(&wav)?; // (1, nfilt, T_padded)
-        let l = wav.elem_count();
-        // Use the featurizer-computed valid frame count (NeMo `get_seq_len`,
-        // = floor(L/hop)) rather than recomputing L/hop here.
-        let valid = self.processor.audio().get_seq_len(l);
-        let t_padded = mel.dim(2)?;
-        let cur_len = valid.min(t_padded);
-        let cur_mel = mel
-            .i(0)?
-            .narrow(1, 0, cur_len)?
-            .to_dtype(DType::F32)?
-            .contiguous()?; // (nfilt, cur_len)
+        // Native writes only the valid `(nfilt, mel_len)` destination. Do not
+        // upload centered/pad_to tail columns merely to crop-copy them here.
+        let cur_mel = self.processor.audio().forward_valid(&wav)?;
+        let cur_len = cur_mel.dim(1)?;
 
         acc.mel_parts.push(cur_mel);
         acc.audio_in_lens.push(cur_len as i64);

@@ -18,7 +18,7 @@
 
 use std::path::Path;
 
-use candle_core::{DType, Device, Tensor};
+use candle_core::{DType, Device};
 use liquid_audio::moshi::demo::chat::decode_audio_reply;
 use liquid_audio::moshi::models::MimiModel;
 use liquid_audio::{from_pretrained, ChatState, GenParams, GenToken};
@@ -168,16 +168,13 @@ fn main() -> Res<()> {
         samples.len(),
         samples.len() as f32 / rate as f32
     );
-    let n = samples.len();
-    let wave = Tensor::from_vec(samples, (1, n), &device)?;
-
     // chat: system instruction + user audio turn + open assistant turn (chat.py).
     let mut chat = ChatState::new(&proc, codebooks)?;
     chat.new_turn("system")?;
     chat.add_text("Respond with interleaved text and audio.")?;
     chat.end_turn()?;
     chat.new_turn("user")?;
-    chat.add_audio(&wave, rate)?;
+    chat.add_audio_slice(&samples, rate)?;
     chat.end_turn()?;
     chat.new_turn("assistant")?;
 

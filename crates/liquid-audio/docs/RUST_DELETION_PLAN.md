@@ -31,6 +31,22 @@ assembly ABI; a C++ numerical call site is not an exception.
 - Deleted `src/compute/bf16_gemm.rs` and its Candle `CustomOp2` owner. The
   temporary Candle rim now borrows storage and submits one typed `REQ_GEMM`;
   capability truth comes from the native Flashkern ABI.
+- **Mel frontend and resampler are native.** Deleted the in-crate featurizer
+  (hann/slaney/DFT tables, the candle STFT/normalization in `processor.rs`)
+  and the pure-Rust windowed-sinc resampler body. `lfm_frontend.{h,cpp}` +
+  `flashkern_frontend.S` (both arches) own the math: preemphasis, |X|^2,
+  log-guard, ddof-1 row statistics, normalization, and the f64 resample conv
+  are assembly leaves; the two matmul-shaped stages ride Accelerate on Apple
+  (mimi pattern). Table construction is init-time f64 C++ (the Mimi
+  weight-fold class) — its N2 extraction is a named follow-up, not a silent
+  exemption. Baselines: `native/tests/fixtures/{mel,resample}/` captured from
+  the deleted Rust; gates: `tests/native_frontend_parity.rs` (resampler
+  bitwise; mel padded/valid shape-first + tolerance policy). Realtime borrows
+  retained 16 kHz PCM directly; the frontend reuses a rim-owned high-water
+  workspace, aliases dead signal/DFT/power planes, and writes the valid mel
+  destination without a padded crop-copy. The Rust `FilterbankFeatures` /
+  `resample_slice` names survive as opaque-handle/transport rims only — the
+  remaining Metal mel upload dies with the Conformer cutover (doc 06).
 
 ## Current Production Violations
 
@@ -41,7 +57,7 @@ assembly ABI; a C++ numerical call site is not an exception.
 | `src/model/linear.rs` | A temporary Candle ownership rim still exposes tensor storage to `REQ_GEMM`; it performs no math. | Production callers use `NativeModel`/`NativeConversation`, then this rim is deleted. |
 | `src/compute/flashkern/candle_ops.rs` | ShortConv compatibility path still converts Candle storage. | Native conversation owns convolution carry and typed stage. |
 | `native_engine.rs` pass methods | Temporary tests and compatibility callers still submit numerical buffers from Rust. | Rust exposes only PCM/control dock and opaque handles. Numerical methods become native tests or are deleted. |
-| `processor/mel.rs`, `runtime/resample.rs` | Rust still computes frontend values. | Native frontend plan and assembly kernels. |
+| `processor.rs` mel rim, `runtime/resample.rs` rim | Frontend math is native. Realtime 16 kHz PCM is pointer-through and valid mel is direct, but the shared compatibility workspace can grow inside a pass and serialize engines; every pass allocates its Candle destination; Metal then uploads it. Non-16 kHz resampling still uses a temporary Rust output and per-call native work. Beyond transport, mel OWNERSHIP also remains Rust: the plan/workspace handles, `ChatState.audio_in` storage and `Tensor::cat` growth, the Candle Conformer feed, and cross-turn persistence in `ConversationState`. | Give each native session a pre-reserved workspace and mel segment, let the resampler write its first plane, and have Conformer consume that segment directly; then delete both rims. Storage/persistence residue (`ChatState`/`ConversationState` mel tensors) clears at the doc 07 conversation cutover; handle ownership transfers when a native session object exists. |
 | Rust Mimi/Moshi owners | Continuous model and codec state remain in Rust/Candle. | Native Moshi session and codec recurrence. |
 | Candle/moshi dependencies | Required by the remaining seams above. | Remove after every production owner is native and fixture gates pass. |
 

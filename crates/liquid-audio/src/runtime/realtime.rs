@@ -1163,7 +1163,6 @@ fn setup_turn<'p>(
     utt: &Utterance,
 ) -> Result<TurnSetup<'p>, String> {
     let s = |e: candle_core::Error| e.to_string();
-    let wave = Tensor::from_vec(utt.samples.clone(), (1, utt.samples.len()), device).map_err(s)?;
 
     // First turn → fresh `ChatState` + the system turn (added once, like Python);
     // later turns → seed from the accumulated state so the prior discrete
@@ -1179,7 +1178,9 @@ fn setup_turn<'p>(
         Some(conv) => conv.to_chat(proc, codebooks).map_err(s)?,
     };
     chat.new_turn("user").map_err(s)?;
-    chat.add_audio(&wave, utt.rate).map_err(s)?; // CONTINUOUS audio-in (mel → Conformer)
+    // Retain and borrow the utterance PCM in place. Constructing this on the
+    // model device would upload it only for native mel to download it again.
+    chat.add_audio_slice(&utt.samples, utt.rate).map_err(s)?;
     chat.end_turn().map_err(s)?;
     chat.new_turn("assistant").map_err(s)?;
 

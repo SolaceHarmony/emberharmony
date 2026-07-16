@@ -96,6 +96,24 @@ fn main() {
         .include("native/include")
         .compile("lfm_kernel_protocol_c");
 
+    // Native audio frontend: torchaudio-exact resampler + NeMo mel featurizer.
+    // Table build is init-time f64; hot loops live in flashkern_frontend.S; the
+    // matmul-shaped stages ride Accelerate on Apple (mimi_decode.cpp pattern).
+    // -ffp-contract=off is LOAD-BEARING: the parity fixtures were captured from
+    // uncontracted Rust ops.
+    println!("cargo::rerun-if-changed=native/include/lfm_frontend.h");
+    println!("cargo::rerun-if-changed=native/src/frontend/lfm_frontend.cpp");
+    cc::Build::new()
+        .file("native/src/frontend/lfm_frontend.cpp")
+        .cpp(true)
+        .std("c++23")
+        .opt_level(3)
+        .warnings(true)
+        .warnings_into_errors(true)
+        .flag("-ffp-contract=off")
+        .include("native/include")
+        .compile("lfm_frontend");
+
     // Snapshotable ChaCha20 CSPRNG state/refill. Apple entropy enters through a
     // tiny architecture assembly thunk to SecRandomCopyBytes; every hot draw is
     // expanded by the assembly block kernel added to the architecture archive.
@@ -122,12 +140,14 @@ fn main() {
         println!("cargo::rerun-if-changed=native/kernels/x86_64/flashkern_rope.S");
         println!("cargo::rerun-if-changed=native/kernels/x86_64/flashkern_math.S");
         println!("cargo::rerun-if-changed=native/kernels/x86_64/flashkern_sampler.S");
+        println!("cargo::rerun-if-changed=native/kernels/x86_64/flashkern_frontend.S");
         cc::Build::new()
             .file("native/kernels/x86_64/flashkern_x86.cpp")
             .file("native/kernels/x86_64/flashkern_prng.S")
             .file("native/kernels/x86_64/flashkern_rope.S")
             .file("native/kernels/x86_64/flashkern_math.S")
             .file("native/kernels/x86_64/flashkern_sampler.S")
+            .file("native/kernels/x86_64/flashkern_frontend.S")
             .cpp(true)
             .std("c++23")
             .opt_level(3)
@@ -140,12 +160,14 @@ fn main() {
         println!("cargo::rerun-if-changed=native/kernels/aarch64/flashkern_rope.S");
         println!("cargo::rerun-if-changed=native/kernels/aarch64/flashkern_math.S");
         println!("cargo::rerun-if-changed=native/kernels/aarch64/flashkern_sampler.S");
+        println!("cargo::rerun-if-changed=native/kernels/aarch64/flashkern_frontend.S");
         let mut kern = cc::Build::new();
         kern.file("native/kernels/aarch64/flashkern_neon.cpp")
             .file("native/kernels/aarch64/flashkern_prng.S")
             .file("native/kernels/aarch64/flashkern_rope.S")
             .file("native/kernels/aarch64/flashkern_math.S")
             .file("native/kernels/aarch64/flashkern_sampler.S")
+            .file("native/kernels/aarch64/flashkern_frontend.S")
             .cpp(true)
             .std("c++23")
             .opt_level(3)

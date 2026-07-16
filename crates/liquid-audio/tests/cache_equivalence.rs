@@ -105,8 +105,8 @@ fn suffix_cache_matches_full_prefill() -> anyhow::Result<()> {
             .map(|i| (std::f32::consts::TAU * hz * i as f32 / 16_000.0).sin() * 0.3)
             .collect()
     };
-    let wave1 = Tensor::from_vec(sine(440.0), (1, 8000), &device)?;
-    let wave2 = Tensor::from_vec(sine(660.0), (1, 8000), &device)?;
+    let wave1 = sine(440.0);
+    let wave2 = sine(660.0);
 
     // ---- Turn 1 (shared prefix): build context, generate with a fresh cache. ----
     let mut chat = ChatState::new(&proc, codebooks)?;
@@ -114,7 +114,7 @@ fn suffix_cache_matches_full_prefill() -> anyhow::Result<()> {
     chat.add_text("Respond with interleaved text and audio.")?;
     chat.end_turn()?;
     chat.new_turn("user")?;
-    chat.add_audio(&wave1, 16_000)?;
+    chat.add_audio_slice(&wave1, 16_000)?;
     chat.end_turn()?;
     chat.new_turn("assistant")?;
 
@@ -187,7 +187,7 @@ fn suffix_cache_matches_full_prefill() -> anyhow::Result<()> {
 
     // ---- Turn 2 context: another spoken user turn. ----
     chat.new_turn("user")?;
-    chat.add_audio(&wave2, 16_000)?;
+    chat.add_audio_slice(&wave2, 16_000)?;
     chat.end_turn()?;
     chat.new_turn("assistant")?;
 

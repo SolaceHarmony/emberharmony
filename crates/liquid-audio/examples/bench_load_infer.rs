@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use candle_core::{Device, Tensor};
+use candle_core::Device;
 use liquid_audio::moshi::demo::chat::decode_audio_reply;
 use liquid_audio::moshi::models::MimiModel;
 use liquid_audio::{from_pretrained, ChatState, GenParams, GenToken};
@@ -231,12 +231,6 @@ fn main() -> Res<()> {
         || read_wav_mono_f32(&audio_path),
     )?;
     let sample_count = samples.len();
-    let wave = measure(
-        &mut metrics,
-        "copy_audio_to_device",
-        json!({ "samples": sample_count, "sample_rate": rate }),
-        || Ok(Tensor::from_vec(samples, (1, sample_count), &device)?),
-    )?;
 
     let chat = measure(
         &mut metrics,
@@ -248,7 +242,7 @@ fn main() -> Res<()> {
             chat.add_text("Respond with interleaved text and audio.")?;
             chat.end_turn()?;
             chat.new_turn("user")?;
-            chat.add_audio(&wave, rate)?;
+            chat.add_audio_slice(&samples, rate)?;
             chat.end_turn()?;
             chat.new_turn("assistant")?;
             Ok(chat)
