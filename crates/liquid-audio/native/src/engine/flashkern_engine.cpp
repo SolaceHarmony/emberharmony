@@ -371,7 +371,8 @@ struct AtPass {
 struct TokenReq {
     const uint32_t *ids = nullptr; // text: 1 id; audio: n pre-offset audio-embed rows
     size_t n_ids = 0;
-    uint32_t embed_kind = 0; // 0 = text table, 1 = audio table (sum of rows)
+    uint32_t embed_kind = 0; // 0 = text table, 1 = audio table (sum), 2 = provided
+    const uint16_t *provided_embed = nullptr; // kind 2: [H] bf16 hidden fed verbatim
     const LfmLayerState *states = nullptr;
     size_t n_states = 0;
     size_t pos = 0;
@@ -1434,7 +1435,13 @@ static void run_token_pass(Engine *e, uint32_t lane) {
         // Embed (serial — at most 8 rows). Text: one table row copied verbatim.
         // Audio: candle's `.sum(0)` over the gathered rows — sequential bf16 adds
         // from a bf16 zero, one RNE round per step (candle's in-dtype reduction).
-        if (t->embed_kind == 0) {
+        if (t->embed_kind == 2) {
+            // Provided embedding (native audio-in prefill): the conformer/adapter
+            // hidden row is fed verbatim as a view into the source buffer — no
+            // table lookup. h0 is per-pass scratch, so loading it is not a copy of
+            // any weight; the source stays borrowed until the pass completes.
+            std::memcpy(h0, t->provided_embed, h * sizeof(uint16_t));
+        } else if (t->embed_kind == 0) {
             std::memcpy(h0, model->embed_w + (size_t)t->ids[0] * h,
                         h * sizeof(uint16_t));
         } else {
@@ -2840,7 +2847,7 @@ int lfm_engine_token_pass(void *ep, uint64_t id, const uint32_t *ids, size_t n_i
                           float *out_logits, size_t out_logits_len,
                           const LfmSamplerConfigV1 *sampler,
                           LfmPrngStateV1 *sample_state, uint32_t *out_token,
-                          size_t lanes) {
+                          size_t lanes, const uint16_t *provided_embed) {
     Engine *e = (Engine *)ep;
     if (!e || id == 0 || !ids || n_ids == 0 || !states || !out_hidden) return -1;
     PassClaim claim(e);
@@ -2865,10 +2872,14 @@ int lfm_engine_token_pass(void *ep, uint64_t id, const uint32_t *ids, size_t n_i
     }
     if (embed_kind == 0) {
         if (ids[0] >= model->vocab) return -3;
-    } else {
+    } else if (embed_kind == 1) {
         if (!model->audio_embed_w || n_ids > 8) return -3;
         for (size_t c = 0; c < n_ids; ++c)
             if (ids[c] >= model->audio_rows) return -3;
+    } else if (embed_kind == 2) {
+        if (!provided_embed) return -3; // native prefill audio-in: view required
+    } else {
+        return -3;
     }
     // Every attention slot must be served and carry planes; conv slots need state.
     for (size_t l = 0; l < model->layers.size(); ++l) {
@@ -2900,6 +2911,7 @@ int lfm_engine_token_pass(void *ep, uint64_t id, const uint32_t *ids, size_t n_i
     e->tok.ids = ids;
     e->tok.n_ids = n_ids;
     e->tok.embed_kind = embed_kind;
+    e->tok.provided_embed = provided_embed;
     e->tok.states = states;
     e->tok.n_states = n_states;
     e->tok.pos = pos;

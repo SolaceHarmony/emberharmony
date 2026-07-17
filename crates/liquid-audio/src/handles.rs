@@ -227,6 +227,33 @@ impl NativeConversation {
         })
     }
 
+    /// Prefill continuous audio-in embedding rows (the Conformer/adapter output,
+    /// `[row_count, hidden]` bf16, `row_count = rows.len() / hidden`) into KV via
+    /// the native provided-embedding pass — C++ owns the loop. `rows` is a
+    /// borrowed view the caller keeps alive across the call; nothing is copied.
+    /// Returns the new position.
+    pub fn prefill_audio(&mut self, rows: &[u16], hidden: usize) -> Result<u64, NativeError> {
+        if hidden == 0 || rows.is_empty() || rows.len() % hidden != 0 {
+            return Err(status_error(
+                -22,
+                "prefill_audio: rows not a positive multiple of hidden",
+            ));
+        }
+        let mut position = 0u64;
+        let status = unsafe {
+            ffi::lfm_conversation_prefill_audio(
+                self.pointer.as_ptr(),
+                rows.as_ptr(),
+                rows.len() / hidden,
+                &mut position,
+            )
+        };
+        if status != 0 {
+            return Err(status_error(status, "native audio-in prefill failed"));
+        }
+        Ok(position)
+    }
+
     pub fn reset(&mut self) -> Result<(), NativeError> {
         let status = unsafe { ffi::lfm_conversation_reset(self.pointer.as_ptr()) };
         if status != 0 {

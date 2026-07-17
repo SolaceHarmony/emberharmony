@@ -69,7 +69,7 @@ int lfm_engine_token_pass(void *engine, uint64_t id,
                           float *out_logits, size_t logit_elements,
                           const LfmSamplerConfigV1 *sampler,
                           LfmPrngStateV1 *prng, uint32_t *out_token,
-                          size_t lanes);
+                          size_t lanes, const uint16_t *provided_embed);
 
 #ifdef __cplusplus
 } /* extern "C" */

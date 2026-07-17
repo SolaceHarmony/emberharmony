@@ -24,7 +24,6 @@ use std::thread::JoinHandle;
 
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 
-use crate::moshi::demo::chat::decode_audio_frame;
 use crate::moshi::models::compression::MimiModel;
 
 #[cfg(test)]
@@ -1514,7 +1513,6 @@ impl VoiceEngine for Lfm2VoiceEngine {
         };
 
         let text = self.proc.text();
-        let device = &self.device;
         let codebooks = self.codebooks;
         let mut resampler = StreamingPcmResampler::new(mimi_rate, self.out_rate);
         let out_rate = self.out_rate; // captured for the emit closure (rate-honest events)
@@ -1600,17 +1598,12 @@ impl VoiceEngine for Lfm2VoiceEngine {
                             // skip — append needs the full audio_out; only PCM playback drops it.
                             modality_out.push(LFMModality::AudioOut as i64);
                             audio_frames.push(frame.clone());
-                            // Decode the 8-code frame to PCM via the streaming detokenizer.
+                            // Decode the 8-code frame to PCM via the streaming
+                            // detokenizer — host codes in, host PCM out, no Tensor
+                            // round-trip (the native Mimi kernel path).
                             let decoded = (|| -> candle_core::Result<Option<Vec<f32>>> {
-                                match decode_audio_frame(&mut stream, &frame, codebooks, device)? {
-                                    Some(chunk) => {
-                                        let mut pcm = chunk
-                                            .flatten_all()?
-                                            .to_dtype(DType::F32)?
-                                            .to_vec1::<f32>()?;
-                                        pcm = resampler.process(pcm);
-                                        Ok(Some(pcm))
-                                    }
+                                match stream.decode_codes(&frame)? {
+                                    Some(pcm) => Ok(Some(resampler.process(pcm))),
                                     None => Ok(None),
                                 }
                             })();

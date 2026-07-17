@@ -56,6 +56,17 @@ impl MimiStreaming<'_> {
     pub fn decode(&mut self, frame: &Tensor) -> Result<Option<Tensor>> {
         self.inner.decode_step(&frame.to_dtype(DType::U32)?)
     }
+
+    /// Host-codes streaming decode: `frame` is the raw `[codebooks]` code ids,
+    /// PCM comes back as `Vec<f32>` — no `Tensor` round-trip in either
+    /// direction. The end-of-audio sentinel (`2048`) yields `None`, matching the
+    /// former `decode_audio_frame`.
+    pub fn decode_codes(&mut self, frame: &[u32]) -> Result<Option<Vec<f32>>> {
+        if frame.contains(&2048) {
+            return Ok(None);
+        }
+        self.inner.decode_step_codes(frame)
+    }
 }
 
 impl Drop for MimiStreaming<'_> {

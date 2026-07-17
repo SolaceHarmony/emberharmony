@@ -317,6 +317,7 @@ extern "C" {
         sample_state: *mut PrngState,
         out_token: *mut u32,
         lanes: usize,
+        provided_embed: *const u16,
     ) -> i32;
     fn lfm_engine_sample(
         e: *mut c_void,
@@ -930,6 +931,11 @@ impl NativeEngine {
                 state_ptr,
                 token_ptr,
                 lanes,
+                // Rust decode never provides an embedding — token/audio-out ids
+                // embed via the native tables. The `embed_kind == 2` path (native
+                // audio-in prefill) is driven by C++ `lfm_conversation_prefill`,
+                // not this rim. This arg only keeps the decode call ABI-correct.
+                std::ptr::null(),
             )
         };
         rc == 0

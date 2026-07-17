@@ -3,7 +3,7 @@
 
 use candle_core::{Device, Result, Tensor};
 
-use crate::moshi::models::{MimiModel, MimiStreaming};
+use crate::moshi::models::MimiModel;
 
 /// Rust form of `torch.stack(audio_out[:-1], 1).unsqueeze(0)`.
 pub fn frames_to_codes(frames: &[Vec<u32>], codebooks: usize, device: &Device) -> Result<Tensor> {
@@ -38,19 +38,6 @@ pub fn decode_audio_reply(
     Ok(Some(mimi.decode(&codes)?))
 }
 
-/// Streaming demo decode for one generated frame.
-///
-/// Mirrors `chat.py`: collect the frame as model output, skip EOAudio for playback,
-/// then call `mimi.decode(t[None, :, None])` inside `mimi.streaming(1)`.
-pub fn decode_audio_frame(
-    stream: &mut MimiStreaming<'_>,
-    frame: &[u32],
-    codebooks: usize,
-    device: &Device,
-) -> Result<Option<Tensor>> {
-    if frame.contains(&2048) {
-        return Ok(None);
-    }
-    let codes = Tensor::from_vec(frame.to_vec(), (1, codebooks, 1), device)?;
-    stream.decode(&codes)
-}
+// The streaming per-frame decode is now `MimiStreaming::decode_codes` (host
+// codes → host PCM, no `Tensor` round-trip). The former `decode_audio_frame`
+// Tensor adapter is deleted.

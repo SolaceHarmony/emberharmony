@@ -455,6 +455,68 @@ fn opaque_native_model_and_conversation_own_the_complete_token_state() {
 }
 
 #[test]
+fn native_audio_prefill_matches_discrete_for_the_same_embedding() {
+    // The native audio-in prefill (`embed_kind == 2`, a provided embedding VIEW —
+    // the shape the Conformer/adapter output will use) must produce the SAME
+    // backbone state as the discrete text path (`embed_kind == 0`) when fed the
+    // same embedding: the text token's own `embed_tokens` row. Proven end-to-end
+    // through the native conversation (C++ owns the prefill loop), greedy so the
+    // sampler cannot diverge. This is the parity the eventual native prefill rests
+    // on. Skips without the real checkpoint.
+    let Ok(dir) = std::env::var("LFM_MODEL_DIR") else {
+        eprintln!("LFM_MODEL_DIR unset — native audio-in prefill parity skipped");
+        return;
+    };
+    let dir = PathBuf::from(dir);
+    let model = liquid_audio::NativeModel::open(&dir).expect("native model");
+    let hidden = model.info().expect("model info").hidden as usize;
+
+    // The exact embed_tokens row the discrete path would look up for token `t`.
+    let resident = ResidentWeights::open(&dir.join("model.safetensors")).expect("resident image");
+    let embed = resident
+        .image()
+        .find("lfm.embed_tokens.weight")
+        .expect("embed_tokens");
+    let bytes = embed.data();
+    let t: usize = 100; // any in-vocab token
+    let row: Vec<u16> = bytes[t * hidden * 2..(t + 1) * hidden * 2]
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    assert_eq!(row.len(), hidden);
+    let probe: u32 = 5; // token stepped after prefill to read out the state
+
+    let cfg = || liquid_audio::NativeConversationConfig {
+        seed: Some(7),
+        temperature: None, // greedy — no sampler draw to diverge on
+        top_k: None,
+    };
+
+    // Discrete: embed_kind==0 for token t (sampled token discarded), then probe.
+    let mut a = model.conversation(cfg()).expect("conv a");
+    a.step(&[t as u32], liquid_audio::EmbeddingKind::Text)
+        .expect("a discrete prefill");
+    let ta = a
+        .step(&[probe], liquid_audio::EmbeddingKind::Text)
+        .expect("a probe")
+        .sampled_token;
+
+    // Audio-in: embed_kind==2 with the identical embedding row, then probe.
+    let mut b = model.conversation(cfg()).expect("conv b");
+    let pos = b.prefill_audio(&row, hidden).expect("b audio-in prefill");
+    assert_eq!(pos, 1, "one row prefilled → position advances by one");
+    let tb = b
+        .step(&[probe], liquid_audio::EmbeddingKind::Text)
+        .expect("b probe")
+        .sampled_token;
+
+    assert_eq!(
+        ta, tb,
+        "audio-in prefill (embed_kind==2) diverged from the discrete embed for the same embedding"
+    );
+}
+
+#[test]
 fn rust_owner_drives_the_compatibility_builder_without_reopening_the_file() {
     let temp = Temp::new();
     let path = temp.0.join("weights.safetensors");

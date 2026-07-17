@@ -435,6 +435,20 @@ impl PtrLen {
             len: values.len(),
         }
     }
+
+    /// Capture an externally-owned contiguous view by raw pointer and element
+    /// count. Used to bind weights directly from the resident checkpoint image
+    /// (zero-copy, no Candle tensor) and to bind computed tables (e.g. rope).
+    /// SAFETY CONTRACT (same as the tensor constructors): the storage behind
+    /// `ptr` must outlive every native pass that reads this descriptor — for
+    /// resident weights that is the model's `ResidentWeights`, for computed
+    /// tables an owned buffer the model keeps alive.
+    pub fn from_raw(ptr: *const std::ffi::c_void, len: usize) -> Self {
+        Self {
+            ptr: ptr as usize,
+            len,
+        }
+    }
 }
 
 /// One depthformer StandardBlock's zero-copy weight descriptors. Layout mirrors

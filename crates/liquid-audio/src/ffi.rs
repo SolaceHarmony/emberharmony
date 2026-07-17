@@ -92,6 +92,12 @@ unsafe extern "C" {
         embedding_kind: u32,
         out: *mut TokenResult,
     ) -> i32;
+    pub(crate) fn lfm_conversation_prefill_audio(
+        conversation: *mut Conversation,
+        rows: *const u16,
+        row_count: usize,
+        out_position: *mut u64,
+    ) -> i32;
     pub(crate) fn lfm_conversation_reset(conversation: *mut Conversation) -> i32;
     pub(crate) fn lfm_conversation_close(conversation: *mut Conversation) -> i32;
 }

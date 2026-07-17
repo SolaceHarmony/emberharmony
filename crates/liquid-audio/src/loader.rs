@@ -21,9 +21,9 @@ use serde_json::Value;
 use crate::audio_out::{AudioDetokenizer, MimiDetokenizer};
 
 use crate::detokenizer::LFM2AudioDetokenizer;
-use crate::model::conformer::encoder::ConformerEncoderConfig;
 use crate::model::lfm2_audio::{DepthformerConfig, LFM2AudioModel, LossConf};
 use crate::model::lfm2_hf::Lfm2Config;
+use crate::model::native_conformer::ConformerEncoderConfig;
 use crate::moshi::models::get_mimi;
 use crate::processor::FilterbankFeatures;
 use crate::processor::{LFM2AudioProcessor, PreprocessorConfig};

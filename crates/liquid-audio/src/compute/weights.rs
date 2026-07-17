@@ -206,6 +206,13 @@ unsafe impl Send for NativeWeightImage {}
 unsafe impl Sync for NativeWeightImage {}
 
 impl NativeWeightImage {
+    /// Opaque `const LfmWeightImage *` for native components that bind views
+    /// directly (e.g. the native Conformer). The pointer is valid for the
+    /// lifetime of this owner; callers must not outlive it.
+    pub fn raw_image_ptr(&self) -> *const std::ffi::c_void {
+        self.raw.as_ptr() as *const std::ffi::c_void
+    }
+
     pub fn open(path: &Path) -> Result<Self, WeightError> {
         let path = CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| {
             WeightError::new(INVALID_ARGUMENT, "weight path contains an embedded NUL")
@@ -455,6 +462,13 @@ pub struct ResidentWeights {
 impl ResidentWeights {
     pub fn open(path: &Path) -> Result<Self, WeightError> {
         Self::from_image(NativeWeightImage::open(path)?)
+    }
+
+    /// Opaque `const LfmWeightImage *` into the resident image, for native
+    /// components that bind views directly. Valid while this `ResidentWeights`
+    /// (or a clone) is alive — the `Arc<NativeWeightImage>` keeps it resident.
+    pub fn raw_image_ptr(&self) -> *const std::ffi::c_void {
+        self.image.raw_image_ptr()
     }
 
     pub fn from_image(image: NativeWeightImage) -> Result<Self, WeightError> {

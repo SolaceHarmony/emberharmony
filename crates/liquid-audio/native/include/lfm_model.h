@@ -104,6 +104,12 @@ int lfm_conversation_step(LfmConversation *conversation,
 int lfm_conversation_prefill(LfmConversation *conversation,
                              const LfmInputV1 *inputs, size_t input_count,
                              uint64_t *out_position);
+/* Audio-in prefill: `rows` is a borrowed [row_count, hidden] bf16 view (the
+ * Conformer/adapter output); each row is prefilled via the provided-embedding
+ * pass. No payload crosses the ABI. */
+int lfm_conversation_prefill_audio(LfmConversation *conversation,
+                                   const uint16_t *rows, size_t row_count,
+                                   uint64_t *out_position);
 int lfm_conversation_audio_frame(LfmConversation *conversation,
                                  LfmAudioResultV1 *out);
 int lfm_conversation_reset(LfmConversation *conversation);

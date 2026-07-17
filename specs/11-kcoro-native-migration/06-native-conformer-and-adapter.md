@@ -1,6 +1,14 @@
 # Native Conformer and Audio Adapter
 
-Status: normative design.
+Status: normative design. C1 (offline segment, encoder + adapter) is implemented
+in the current working tree: `native/src/model/lfm_conformer.cpp` +
+`kernels/{aarch64,x86_64}/flashkern_conformer.S`, bound from the resident image,
+gated by `tests/native_conformer_parity.rs` over per-stage fixtures captured
+from the deleted Rust (`native/tests/fixtures/conformer/`, real checkpoint, BF16
+production ladder; worst relative divergence 5.1e-3). The Rust
+`src/model/conformer/*` and the adapter's Candle `MLP` are deleted. Remaining
+design: the C2/C3 speculative and streaming paths, and pulling the prefill seam
+to a borrowed embedding plane (currently one transport tensor, dies at doc 07).
 
 Baseline: EmberHarmony `321538f11749`.
 

@@ -15,6 +15,37 @@ assembly ABI; a C++ numerical call site is not an exception.
 
 ## Completed In This Tranche
 
+- **Mimi PCM `Tensor` round-trip deleted (P3 seam 1 of 3).** The streaming
+  per-frame decode on the production `respond` path now runs host codes
+  `&[u32]` → `MimiStreaming::decode_codes` → `AudioDetokenizer::decode_step_codes`
+  (native Mimi kernel) → `Vec<f32>` → resampler, with **no `Tensor` in either
+  direction**. `decode_step_codes` is now an `AudioDetokenizer` trait method
+  (default wraps the `Tensor` `decode_step` for non-native backends; the native
+  Mimi backend overrides it with the direct `&[u32]` → `Vec<f32>` kernel path).
+  The former `decode_audio_frame` `Tensor` adapter (`moshi/demo/chat.rs`) is
+  deleted (dead). Transport-only — PCM values unchanged (native Mimi still
+  produces the same `Vec<f32>`); 167 lib tests green. Remaining P3 seams:
+  mel→`Tensor` and adapter→`Tensor`, both prefill-coupled.
+- **Native audio-in prefill capability (P2/P4 enabler).**
+  `lfm_engine_token_pass` `embed_kind == 2` provided-embedding path +
+  `lfm_conversation_prefill_audio` (`NativeConversation::prefill_audio`) prefill
+  Conformer rows into KV as a borrowed view; parity-proven against the discrete
+  embed path (`native_audio_prefill_matches_discrete_for_the_same_embedding`).
+  Not yet adopted by production voice (the Candle backbone copy drop needs the
+  full `self.lfm` elimination — see doc 14 P2/P3).
+- **Depthformer Candle copy dropped on the resident path.**
+  `build_depth_decode_resident` (`model/lfm2_audio.rs`) binds the depth plan
+  directly from the resident checkpoint image by name (zero-copy), with rope from
+  the native `lfm_rope_table_f32` kernel — the same kernel `lfm_model.cpp` feeds
+  its native plan. It is now the production depth path; the Candle depth modules
+  (`depthformer` / `depth_linear` / `depth_embeddings`) became `Option`, built
+  only on the non-resident training path (guarded in the training `forward`).
+  Verified byte-identical to the Candle-bound plan by
+  `depth_resident_binder_matches_candle_binder` (greedy tokens, so identical
+  logits ⇒ identical argmax). Production Candle-copy ledger fell **231 → 151
+  tensors, 2.711 → 2.475 GB** (~236 MB of depth weights no longer duplicated). The
+  remaining ~2.475 GB is the backbone + audio embedding, whose copy is coupled to
+  native prefill (Candle still owns prefill/`forward_embeds`).
 - Deleted `src/compute/flashkern/coordinator.rs` and the registered Rust
   submitter callback ABI. `submit_pass` now uses the native SQ/CQ directly.
 - Added `raw_engine_owns_its_sq_cq_without_rust_progress`, proving a complete
@@ -31,6 +62,24 @@ assembly ABI; a C++ numerical call site is not an exception.
 - Deleted `src/compute/bf16_gemm.rs` and its Candle `CustomOp2` owner. The
   temporary Candle rim now borrows storage and submits one typed `REQ_GEMM`;
   capability truth comes from the native Flashkern ABI.
+- **Conformer encoder and audio adapter are native.** Deleted
+  `src/model/conformer/*` (encoder, mha, modules, subsampling, utils) and the
+  now-orphaned `src/model/mlp.rs` + `src/model/norm.rs`. `lfm_conformer.{h,cpp}`
+  binds all encoder+adapter weight views from the resident image and runs one
+  segment as a sequence of stages: subsampling (conv2d im2col + f32 GEMM +
+  depthwise/pointwise), rel-pos table, 17 Conformer layers (macaron FFN, rel-pos
+  attention, conv module with BatchNorm-eval + GLU + depthwise-k9), adapter
+  (LN + gelu-erf). Every value comes from `flashkern_conformer.S` (both arches:
+  LayerNorm, BatchNorm, SiLU, GLU, gelu-erf, softmax, residuals, dw-conv,
+  sgemm/sgemm-nt, pe-table, bias) or the engine bf16 GEMM pass, with the f32
+  matmul stages on Accelerate (Apple) / house sgemm leaf. Production BF16
+  ladder mirrored exactly (fixtures arbitrate). Baselines
+  `native/tests/fixtures/conformer/` (real LFM2.5-Audio checkpoint, per-stage,
+  captured from the deleted Rust); gate `tests/native_conformer_parity.rs`
+  (shape-first, adapter within BF16-ladder tolerance — measured worst relative
+  divergence 5.1e-3 across 1/4/7-row segments). The mel-plane transport tensor
+  at the prefill seam still exists; it dies at the doc 07 conversation cutover.
+
 - **Mel frontend and resampler are native.** Deleted the in-crate featurizer
   (hann/slaney/DFT tables, the candle STFT/normalization in `processor.rs`)
   and the pure-Rust windowed-sinc resampler body. `lfm_frontend.{h,cpp}` +
@@ -52,7 +101,7 @@ assembly ABI; a C++ numerical call site is not an exception.
 
 | Seam | Why it is still live | Replacement required before deletion |
 |---|---|---|
-| `src/model/**` | Rust/Candle still owns portions of model construction, tensors, and calls. | Native model/session owns tokenizer, frontend, all plans, recurrence, and state. |
+| `src/model/**` | Rust/Candle still owns backbone/depthformer construction, prefill/generation, sampling, and tensors. The Conformer encoder + adapter are now native (deleted). | Native model/session owns tokenizer, prefill, recurrence, sampling, and state. |
 | `src/compute/weights.rs` | Rust can still reconstruct Candle tensors from views into the native resident image. | Native plans bind immutable views directly; delete the Candle builder and tensor-copy adapter. |
 | `src/model/linear.rs` | A temporary Candle ownership rim still exposes tensor storage to `REQ_GEMM`; it performs no math. | Production callers use `NativeModel`/`NativeConversation`, then this rim is deleted. |
 | `src/compute/flashkern/candle_ops.rs` | ShortConv compatibility path still converts Candle storage. | Native conversation owns convolution carry and typed stage. |

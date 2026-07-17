@@ -16,12 +16,11 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use candle_core::{DType, Device, IndexOp, Result, Tensor};
-use candle_nn::{linear, Linear, Module, VarBuilder};
+use candle_nn::{linear, Linear, VarBuilder};
 
-use crate::model::conformer::encoder::{ConformerEncoder, ConformerEncoderConfig};
 use crate::model::lfm2_hf::{Cache as LfmCache, Lfm2Config, Model as Lfm2Model};
 use crate::model::linear::{linear_forward, linear_logits};
-use crate::model::mlp::MLP;
+use crate::model::native_conformer::ConformerEncoderConfig;
 use crate::model::transformer::{HeadStyle, Mha, RawLmBackbone, SharedEmbedding, StandardBlock};
 use crate::processor::{ChatState, SpecialTokenIds};
 use crate::utils::{mel2emb_len, LFMModality};
@@ -93,7 +92,7 @@ pub struct LFM2AudioConfig {
     pub interleaved_n_text: usize,
     pub interleaved_n_audio: usize,
     pub preprocessor: crate::processor::MelConfig,
-    pub encoder: crate::model::conformer::encoder::ConformerEncoderConfig,
+    pub encoder: crate::model::native_conformer::ConformerEncoderConfig,
     pub lfm: crate::model::lfm2_hf::Lfm2Config,
     pub depthformer: DepthformerConfig,
 }
@@ -276,6 +275,51 @@ impl SamplingStream {
     }
 }
 
+/// Construct the Candle depthformer modules (`RawLmBackbone` + `depth_linear` +
+/// per-codebook `SharedEmbedding`) from a `VarBuilder`. Used by the non-resident
+/// training path in `build`, and by the resident-vs-Candle depth parity test.
+/// Every tensor `get` here is a measured compatibility copy — which is exactly why
+/// the resident inference path does NOT call this.
+fn build_candle_depth(
+    vb: &VarBuilder,
+    dim: usize,
+    layers: usize,
+    codebooks: usize,
+    hidden: usize,
+) -> Result<(RawLmBackbone, Linear, Vec<SharedEmbedding>)> {
+    // RawLMBackbone(has_embedding=False) of StandardBlock(MHA(dim)).
+    let df_vb = vb.pp("depthformer").pp("layers");
+    let mut blocks = Vec::with_capacity(layers);
+    for i in 0..layers {
+        let lvb = df_vb.pp(i.to_string());
+        let mha = Mha::new(
+            dim,
+            32,
+            HeadStyle::Gqa,
+            true,
+            1e-5,
+            8,
+            128_000,
+            1_000_000.0,
+            lvb.pp("operator"),
+        )?;
+        blocks.push(StandardBlock::new(mha, None, true, 256, 1.0, 1e-5, lvb)?);
+    }
+    let depthformer = RawLmBackbone::new(blocks, None, dim);
+    let depth_linear = linear(hidden, dim * codebooks, vb.pp("depth_linear"))?;
+    let de_vb = vb.pp("depth_embeddings");
+    let mut depth_embeddings = Vec::with_capacity(codebooks);
+    for i in 0..codebooks {
+        depth_embeddings.push(SharedEmbedding::new(
+            dim,
+            AUDIO_VOCAB_SIZE,
+            1e-5,
+            de_vb.pp(i.to_string()),
+        )?);
+    }
+    Ok((depthformer, depth_linear, depth_embeddings))
+}
+
 fn build_depth_decode(
     depthformer: &RawLmBackbone,
     depth_linear: &Linear,
@@ -351,6 +395,152 @@ fn build_depth_decode(
     )
 }
 
+extern "C" {
+    // Architecture RoPE table kernel (native/include/flashkern_rope.h) — the SAME
+    // kernel `lfm_model.cpp` feeds its native depth plan, so the resident-bound
+    // depth path gets byte-identical rope to the native model without touching
+    // Candle. `cos`/`sin` each receive `positions * head_dim/2` f32 entries.
+    fn lfm_rope_table_f32(
+        positions: usize,
+        head_dim: usize,
+        theta: f32,
+        cos: *mut f32,
+        sin: *mut f32,
+    ) -> i32;
+}
+
+/// Depth rope geometry: positions = codebooks, head_dim = `dim / DEPTH_HEADS`,
+/// theta 1e6 — mirrors the Candle depth `Mha` construction. Returns
+/// `(cos, sin)`, empty on kernel failure.
+fn build_depth_rope(depthformer_dim: usize, codebooks: usize) -> (Vec<f32>, Vec<f32>) {
+    let head_dim = depthformer_dim / DEPTH_HEADS;
+    if head_dim == 0 || head_dim % 2 != 0 {
+        return (Vec::new(), Vec::new());
+    }
+    let count = codebooks * (head_dim / 2);
+    let mut cos = vec![0f32; count];
+    let mut sin = vec![0f32; count];
+    let rc = unsafe {
+        lfm_rope_table_f32(
+            codebooks,
+            head_dim,
+            DEPTH_ROPE_THETA,
+            cos.as_mut_ptr(),
+            sin.as_mut_ptr(),
+        )
+    };
+    if rc != 0 {
+        return (Vec::new(), Vec::new());
+    }
+    (cos, sin)
+}
+
+// Depth geometry constants — mirror the Candle depth construction in `build`
+// (`Mha::new(dim, 32, Gqa, .., 8, .., 1e6)`, StandardBlock eps 1e-5). Bind the
+// resident depth path against the same shape the Candle path was verified at.
+const DEPTH_HEADS: usize = 32;
+const DEPTH_KV_HEADS: usize = 8;
+const DEPTH_EPS: f32 = 1e-5;
+const DEPTH_ROPE_THETA: f32 = 1_000_000.0;
+
+/// Build the native [`DepthDecode`] by binding depth weights **directly from the
+/// resident checkpoint image** (zero-copy, no Candle tensor), with rope from the
+/// native kernel. Byte-parity with the Candle-bound path is what lets `build`
+/// stop constructing the Candle depth modules on the resident path. `rope_cos` /
+/// `rope_sin` must outlive the returned plan (the model owns them).
+fn build_depth_decode_resident(
+    resident: &ResidentWeights,
+    depthformer_dim: usize,
+    codebooks: usize,
+    backbone_dim: usize,
+    rope_cos: &[f32],
+    rope_sin: &[f32],
+) -> Option<crate::flashkern::decode::DepthDecode> {
+    use crate::flashkern::decode::{DepthDecode, DepthHead, DepthLayer, PtrLen};
+
+    if !crate::flashkern::native_engine::bf16_gemm_available()
+        || depthformer_dim % DEPTH_HEADS != 0
+        || rope_cos.is_empty()
+        || rope_sin.is_empty()
+    {
+        return None;
+    }
+    let image = resident.image();
+    // Bind one checkpoint tensor by name as a zero-copy view into the resident
+    // image (the depth weights are all bf16 — the Candle path proves it by taking
+    // `PtrLen::bf16` on the same tensors).
+    let bind = |name: &str| -> Option<PtrLen> {
+        let v = image.find(name).ok()?;
+        Some(PtrLen::from_raw(v.data_ptr(), v.elements() as usize))
+    };
+
+    let mut layers = Vec::new();
+    let mut ff = 0usize;
+    let mut li = 0usize;
+    loop {
+        let root = format!("depthformer.layers.{li}.");
+        // operator_norm marks a present layer; its absence ends the count.
+        if image.find(&format!("{root}operator_norm.weight")).is_err() {
+            break;
+        }
+        let op = format!("{root}operator.");
+        if li == 0 {
+            ff = *image
+                .find(&format!("{root}feed_forward.w1.weight"))
+                .ok()?
+                .shape()
+                .first()? as usize;
+        }
+        layers.push(DepthLayer {
+            qkv_w: bind(&format!("{op}qkv_proj.weight"))?,
+            out_w: bind(&format!("{op}out_proj.weight"))?,
+            q_ln: bind(&format!("{op}bounded_attention.q_layernorm.weight"))?,
+            k_ln: bind(&format!("{op}bounded_attention.k_layernorm.weight"))?,
+            opnorm: bind(&format!("{root}operator_norm.weight"))?,
+            ffnnorm: bind(&format!("{root}ffn_norm.weight"))?,
+            w1: bind(&format!("{root}feed_forward.w1.weight"))?,
+            w3: bind(&format!("{root}feed_forward.w3.weight"))?,
+            w2: bind(&format!("{root}feed_forward.w2.weight"))?,
+        });
+        li += 1;
+    }
+    if layers.is_empty() || ff == 0 {
+        return None;
+    }
+
+    let mut heads_w = Vec::with_capacity(codebooks);
+    for ci in 0..codebooks {
+        let root = format!("depth_embeddings.{ci}.");
+        let vocab = *image
+            .find(&format!("{root}embedding.weight"))
+            .ok()?
+            .shape()
+            .first()? as usize;
+        heads_w.push(DepthHead {
+            emb: bind(&format!("{root}embedding.weight"))?,
+            norm: bind(&format!("{root}embedding_norm.weight"))?,
+            logits: bind(&format!("{root}to_logits.weight"))?,
+            vocab,
+        });
+    }
+
+    DepthDecode::new(
+        depthformer_dim,
+        DEPTH_HEADS,
+        DEPTH_KV_HEADS,
+        ff,
+        codebooks,
+        backbone_dim,
+        DEPTH_EPS,
+        layers,
+        heads_w,
+        bind("depth_linear.weight")?,
+        bind("depth_linear.bias")?,
+        PtrLen::from_raw(rope_cos.as_ptr() as *const std::ffi::c_void, rope_cos.len()),
+        PtrLen::from_raw(rope_sin.as_ptr() as *const std::ffi::c_void, rope_sin.len()),
+    )
+}
+
 // `nn.functional.cross_entropy(..., reduction="none")` lives in
 // [`crate::candle_ext::loss::cross_entropy_none`] — the reduction candle's
 // mean-only `cross_entropy` lacks. `forward` (below) calls it for the text/audio
@@ -363,14 +553,23 @@ pub struct LFM2AudioModel {
     /// Rust drops fields in declaration order, so this clears retained C++
     /// pointers before their Candle compatibility storages are freed.
     depth_flash: Option<crate::flashkern::decode::DepthDecode>,
+    /// Owned rope tables for the resident-bound depth plan (`(cos, sin)`, f32).
+    /// Empty on the Candle/training path. Declared right after `depth_flash` so it
+    /// drops *after* the plan that references it — same discipline as the weights.
+    depth_rope: (Vec<f32>, Vec<f32>),
     lfm: Lfm2Model,
     lfm_cfg: Lfm2Config,
-    conformer: ConformerEncoder,
-    audio_adapter: MLP,
+    // Native Conformer encoder + audio adapter (fused). `None` on the
+    // resident-less trainable/test path, which cannot encode audio-in. The
+    // Rust Candle conformer is deleted.
+    audio: Option<crate::model::native_conformer::NativeConformer>,
     audio_embedding: SharedEmbedding,
-    depthformer: RawLmBackbone,
-    depth_linear: Linear,
-    depth_embeddings: Vec<SharedEmbedding>,
+    // Candle depthformer modules — `None` on the resident/inference path, which
+    // binds depth from the checkpoint image (`build_depth_decode_resident`).
+    // `Some` only on the non-resident training path (the Candle `forward`).
+    depthformer: Option<RawLmBackbone>,
+    depth_linear: Option<Linear>,
+    depth_embeddings: Option<Vec<SharedEmbedding>>,
     codebooks: usize,
     codebook_offsets: Vec<i64>,
     depthformer_dim: usize,
@@ -470,21 +669,38 @@ impl LFM2AudioModel {
     ) -> Result<Self> {
         let hidden = lfm_cfg.hidden_size;
         let lfm = Lfm2Model::new(&lfm_cfg, vb.pp("lfm"))?;
-        let conformer = ConformerEncoder::new(enc_cfg, vb.pp("conformer"))?;
-        let feat_out = if enc_cfg.feat_out > 0 && enc_cfg.feat_out != enc_cfg.d_model {
-            enc_cfg.feat_out
-        } else {
-            enc_cfg.d_model
+        // The native adapter input is `d_model`; this checkpoint has no encoder
+        // out_proj (feat_out == d_model). A model with feat_out != d_model would
+        // need the out_proj bound and the adapter input widened — out of scope.
+        if enc_cfg.feat_out > 0 && enc_cfg.feat_out != enc_cfg.d_model {
+            return Err(candle_core::Error::Msg(format!(
+                "native conformer: feat_out {} != d_model {} (encoder out_proj \
+                 not supported)",
+                enc_cfg.feat_out, enc_cfg.d_model
+            )));
+        }
+        // The Conformer encoder + audio adapter are native (bound from the
+        // resident image). Without a resident image (trainable/test path) the
+        // model has no audio encoder.
+        let audio = match &resident {
+            Some(res) => Some(crate::model::native_conformer::NativeConformer::new(
+                res.clone(),
+                crate::model::native_conformer::ConformerGeometry {
+                    feat_in: enc_cfg.feat_in,
+                    d_model: enc_cfg.d_model,
+                    n_layers: enc_cfg.n_layers,
+                    n_heads: enc_cfg.n_heads,
+                    d_ff: enc_cfg.d_model * enc_cfg.ff_expansion_factor,
+                    conv_kernel: enc_cfg.conv_kernel_size,
+                    subsampling: enc_cfg.subsampling_factor,
+                    conv_channels: enc_cfg.subsampling_conv_channels,
+                    adapter_hidden: hidden,
+                    adapter_out: hidden,
+                },
+                vb.device(),
+            )?),
+            None => None,
         };
-        let audio_adapter = MLP::new(
-            feat_out,
-            hidden,
-            &[hidden],
-            true,
-            true,
-            0.0,
-            vb.pp("audio_adapter"),
-        )?;
         let audio_embedding = SharedEmbedding::new(
             hidden,
             AUDIO_VOCAB_SIZE * codebooks,
@@ -492,38 +708,19 @@ impl LFM2AudioModel {
             vb.pp("audio_embedding"),
         )?;
 
-        // Depthformer: RawLMBackbone(has_embedding=False) of StandardBlock(MHA(dim)).
-        let df_vb = vb.pp("depthformer").pp("layers");
-        let mut layers = Vec::with_capacity(depth_cfg.layers);
-        for i in 0..depth_cfg.layers {
-            let lvb = df_vb.pp(i.to_string());
-            let mha = Mha::new(
-                depth_cfg.dim,
-                32,
-                HeadStyle::Gqa,
-                true,
-                1e-5,
-                8,
-                128_000,
-                1_000_000.0,
-                lvb.pp("operator"),
-            )?;
-            let block = StandardBlock::new(mha, None, true, 256, 1.0, 1e-5, lvb)?;
-            layers.push(block);
-        }
-        let depthformer = RawLmBackbone::new(layers, None, depth_cfg.dim);
-
-        let depth_linear = linear(hidden, depth_cfg.dim * codebooks, vb.pp("depth_linear"))?;
-        let de_vb = vb.pp("depth_embeddings");
-        let mut depth_embeddings = Vec::with_capacity(codebooks);
-        for i in 0..codebooks {
-            depth_embeddings.push(SharedEmbedding::new(
-                depth_cfg.dim,
-                AUDIO_VOCAB_SIZE,
-                1e-5,
-                de_vb.pp(i.to_string()),
-            )?);
-        }
+        // Depthformer Candle modules. The resident/inference path binds depth
+        // straight from the checkpoint image (`build_depth_decode_resident`,
+        // proven byte-identical by `depth_resident_binder_matches_candle_binder`),
+        // so building the Candle modules there would be a redundant multi-tensor
+        // copy. Build them only for the non-resident training path, which runs the
+        // Candle `forward`.
+        let (depthformer, depth_linear, depth_embeddings) = if resident.is_some() {
+            (None, None, None)
+        } else {
+            let (df, dl, de) =
+                build_candle_depth(&vb, depth_cfg.dim, depth_cfg.layers, codebooks, hidden)?;
+            (Some(df), Some(dl), Some(de))
+        };
 
         let codebook_offsets = (0..codebooks as i64)
             .map(|i| i * AUDIO_VOCAB_SIZE as i64)
@@ -561,11 +758,17 @@ impl LFM2AudioModel {
         };
         let audio_loss_weights = Tensor::from_vec(weights, (codebooks,), dev)?;
 
+        // Rope tables for the resident-bound depth plan (native kernel, byte-
+        // identical to `lfm_model.cpp`). Empty on the Candle/training path.
+        let depth_rope = if resident.is_some() {
+            build_depth_rope(depth_cfg.dim, codebooks)
+        } else {
+            (Vec::new(), Vec::new())
+        };
         let mut model = Self {
             lfm,
             lfm_cfg,
-            conformer,
-            audio_adapter,
+            audio,
             audio_embedding,
             depthformer,
             depth_linear,
@@ -581,6 +784,7 @@ impl LFM2AudioModel {
             text_loss_multiplier: loss_conf.text_loss_multiplier,
             audio_loss_multiplier: loss_conf.audio_loss_multiplier,
             depth_flash: None,
+            depth_rope,
             resident,
         };
         // Built AFTER assembly: the ctx captures raw views into tensors the model now owns
@@ -613,10 +817,23 @@ impl LFM2AudioModel {
     /// bf16 view in checkpoint layout. Any non-conforming tensor (wrong device/dtype/
     /// layout, non-swiglu Glu, missing qk-norms) rejects native inference.
     fn build_depth_flash(&self) -> Option<crate::flashkern::decode::DepthDecode> {
+        // Resident/inference path: bind depth weights straight from the checkpoint
+        // image (zero-copy), so the Candle depth modules are pure redundancy here.
+        // Non-resident/training path keeps the Candle-bound build.
+        if let Some(resident) = self.resident.as_ref() {
+            return build_depth_decode_resident(
+                resident,
+                self.depthformer_dim,
+                self.codebooks,
+                self.hidden,
+                &self.depth_rope.0,
+                &self.depth_rope.1,
+            );
+        }
         build_depth_decode(
-            &self.depthformer,
-            &self.depth_linear,
-            &self.depth_embeddings,
+            self.depthformer.as_ref()?,
+            self.depth_linear.as_ref()?,
+            self.depth_embeddings.as_ref()?,
             self.depthformer_dim,
             self.codebooks,
             self.hidden,
@@ -642,32 +859,22 @@ impl LFM2AudioModel {
         crate::loader::from_pretrained(dir, device)
     }
 
-    /// Run the FastConformer encoder over mel features `(B, feat_in, T)` →
-    /// `(B, d, T')`. Exposed for parity testing.
+    /// The native Conformer encoder + audio adapter, or a clear error on the
+    /// resident-less (trainable/test) path that cannot encode audio-in.
+    fn audio_encoder(&self) -> Result<&crate::model::native_conformer::NativeConformer> {
+        self.audio.as_ref().ok_or_else(|| {
+            candle_core::Error::Msg(
+                "audio-in requires the native Conformer, which needs a resident \
+                 model image (use new_resident / from_pretrained)"
+                    .into(),
+            )
+        })
+    }
+
+    /// Run the native Conformer encoder + adapter over one mel segment
+    /// `(1, feat_in, T)` → `(T', hidden)` adapted rows. Exposed for parity.
     pub fn conformer_encode(&self, mel: &Tensor) -> Result<Tensor> {
-        self.conformer.forward(mel)
-    }
-
-    /// The `ConformerEncoder` (Python `self.conformer`). Read access for the
-    /// streaming/export inventory methods (`get_initial_cache_state`,
-    /// `streaming_post_process`, `input_example`, …).
-    pub fn conformer(&self) -> &crate::model::conformer::encoder::ConformerEncoder {
-        &self.conformer
-    }
-
-    /// Debug: conformer stage intermediates for parity localization.
-    #[doc(hidden)]
-    pub fn conformer_stages(
-        &self,
-        mel: &Tensor,
-    ) -> Result<(Tensor, Tensor, Tensor, Tensor, Tensor)> {
-        self.conformer.forward_stages(mel)
-    }
-
-    /// Debug: conformer subsampling conv-stack output (pre flatten+linear).
-    #[doc(hidden)]
-    pub fn conformer_sub_conv(&self, mel: &Tensor) -> Result<Tensor> {
-        self.conformer.subsampling_conv_out(mel)
+        self.audio_encoder()?.forward_segment(mel)
     }
 
     /// Debug: full causal forward of the `lfm` backbone over `embeds` (1,L,H),
@@ -806,10 +1013,8 @@ impl LFM2AudioModel {
         for &len in &lens[cursor.audio_segments..] {
             let seg = chat.audio_in.narrow(1, frame_cursor, len as usize)?;
             frame_cursor += len as usize;
-            let seg = seg.unsqueeze(0)?.to_dtype(text_emb.dtype())?;
-            let enc = self.conformer.forward(&seg)?;
-            let enc = enc.i(0)?.transpose(0, 1)?.contiguous()?;
-            let adapted = self.audio_adapter.forward(&enc)?;
+            // Native Conformer + adapter (fused): (1, feat_in, frames) -> (T', hidden).
+            let adapted = self.audio_encoder()?.forward_segment(&seg)?;
             audio_in_rows.push(adapted);
         }
         let audio_in_emb = if audio_in_rows.is_empty() {
@@ -999,10 +1204,23 @@ impl LFM2AudioModel {
                 Tensor::zeros((0,), DType::U32, dev)?,
             )
         } else {
+            // Teacher-forced training runs the Candle depth modules; they exist
+            // only on the non-resident path (the resident model binds depth
+            // natively and has no Candle depth to teacher-force).
+            let err = || {
+                candle_core::Error::Msg(
+                    "LFM2AudioModel::forward (training) requires the Candle depth \
+                     modules, absent on a resident/inference model"
+                        .into(),
+                )
+            };
+            let depthformer = self.depthformer.as_ref().ok_or_else(err)?;
+            let depth_linear = self.depth_linear.as_ref().ok_or_else(err)?;
+            let depth_embeddings = self.depth_embeddings.as_ref().ok_or_else(err)?;
             let n_a = audio_rows.len();
             let aemb = out_emb_shifted
                 .index_select(&Tensor::from_vec(audio_rows.clone(), (n_a,), dev)?, 0)?; // (n_a, D)
-            let mut din = linear_forward(&self.depth_linear, &aemb)?.reshape((n_a, c, dd))?; // (n_a, C, dd)
+            let mut din = linear_forward(depth_linear, &aemb)?.reshape((n_a, c, dd))?; // (n_a, C, dd)
 
             // teacher tokens: audio_out[:C, audio_lbl] → (C, n_a); per-codebook embed → (n_a, C, dd)
             let albl = Tensor::from_vec(audio_lbl.clone(), (audio_lbl.len(),), dev)?;
@@ -1014,7 +1232,7 @@ impl LFM2AudioModel {
             let mut tok_rows = Vec::with_capacity(c);
             for ci in 0..c {
                 tok_rows.push(
-                    self.depth_embeddings[ci]
+                    depth_embeddings[ci]
                         .embed(&codes.i(ci)?)?
                         .reshape((n_a, 1, dd))?,
                 );
@@ -1040,7 +1258,7 @@ impl LFM2AudioModel {
             };
             let num_chunks = 1usize << (k.max(0) as usize);
             let dout = if num_chunks <= 1 {
-                self.depthformer.forward(&din, None)? // (n_a, C, dd), causally masked
+                depthformer.forward(&din, None)? // (n_a, C, dd), causally masked
             } else {
                 // `torch.chunk(num_chunks)` along dim 0: ceil(n/num_chunks)-sized
                 // pieces (the last may be smaller / chunks may be fewer). Run each
@@ -1051,7 +1269,7 @@ impl LFM2AudioModel {
                 while start < n {
                     let cur = chunk.min(n - start);
                     let part = din.narrow(0, start, cur)?;
-                    outs.push(self.depthformer.forward(&part, None)?);
+                    outs.push(depthformer.forward(&part, None)?);
                     start += cur;
                 }
                 Tensor::cat(&outs.iter().collect::<Vec<_>>(), 0)?
@@ -1059,7 +1277,7 @@ impl LFM2AudioModel {
             let mut clog = Vec::with_capacity(c);
             for ci in 0..c {
                 let logits_c =
-                    self.depth_embeddings[ci].get_logits(&dout.narrow(1, ci, 1)?.squeeze(1)?)?; // (n_a, Va)
+                    depth_embeddings[ci].get_logits(&dout.narrow(1, ci, 1)?.squeeze(1)?)?; // (n_a, Va)
                 clog.push(logits_c.unsqueeze(0)?);
             }
             let stacked = Tensor::cat(&clog.iter().collect::<Vec<_>>(), 0)?; // (C, n_a, Va)
@@ -1204,14 +1422,10 @@ impl LFM2AudioModel {
         for &len in &lens {
             let seg = audio_in.narrow(1, frame_cursor, len as usize)?; // (128, frames)
             frame_cursor += len as usize;
-            // Mel is built in f32 (the NeMo preprocessor runs in f32); cast to the
-            // model dtype before the conformer, matching Python's
-            // `self.conformer(padded_audio_in.mT.to(text_emb.dtype), …)`. No-op on
-            // the f32 CPU parity path; on bf16 (Metal) it avoids a conv dtype clash.
-            let seg = seg.unsqueeze(0)?.to_dtype(text_emb.dtype())?; // (1, 128, frames)
-            let enc = self.conformer.forward(&seg)?; // (1, d, T')
-            let enc = enc.i(0)?.transpose(0, 1)?.contiguous()?; // (T', d)
-            let adapted = self.audio_adapter.forward(&enc)?; // (T', hidden)
+            // Native Conformer + adapter (fused): the mel segment is consumed as
+            // BF16 internally (the production ladder). (1, feat_in, frames) ->
+            // (T', hidden) adapted embedding rows.
+            let adapted = self.audio_encoder()?.forward_segment(&seg)?; // (T', hidden)
             audio_in_rows.push(adapted);
         }
         let audio_in_emb = if audio_in_rows.is_empty() {
@@ -1747,6 +1961,70 @@ mod tests {
                 .sample(&mut stream, &l)
                 .unwrap(),
             1
+        );
+    }
+
+    #[test]
+    fn depth_resident_binder_matches_candle_binder() {
+        // Prove the resident-bound depth plan (weights from the checkpoint image,
+        // rope from the native kernel) yields byte-identical GREEDY tokens to the
+        // Candle-bound plan. Greedy removes the sampler — identical logits ⇒
+        // identical argmax — so this isolates whether the resident weights+rope
+        // equal the Candle path's. This is what licenses `build` to stop
+        // constructing the Candle depth modules on the resident path.
+        let Ok(dir) = std::env::var("LFM_MODEL_DIR") else {
+            eprintln!("LFM_MODEL_DIR unset — depth resident parity skipped");
+            return;
+        };
+        if !crate::flashkern::native_engine::bf16_gemm_available() {
+            eprintln!("bf16 gemv unavailable — depth resident parity skipped");
+            return;
+        }
+        let device = Device::Cpu;
+        let (m, _proc) = crate::from_pretrained(std::path::Path::new(&dir), &device)
+            .expect("load resident model");
+        let resident = m.resident.as_ref().expect("resident image");
+
+        let depth_res = build_depth_decode_resident(
+            resident,
+            m.depthformer_dim,
+            m.codebooks,
+            m.hidden,
+            &m.depth_rope.0,
+            &m.depth_rope.1,
+        )
+        .expect("resident depth plan");
+        // Candle-bound depth for comparison. The resident model no longer holds
+        // the Candle depth modules (that copy is exactly what this change drops),
+        // so rebuild them from a throwaway builder over the same image — a
+        // test-only copy — then bind.
+        let mut layers = 0usize;
+        while resident
+            .image()
+            .find(&format!("depthformer.layers.{layers}.operator_norm.weight"))
+            .is_ok()
+        {
+            layers += 1;
+        }
+        let vb = resident.candle_builder(&device);
+        let (df, dl, de) =
+            build_candle_depth(&vb, m.depthformer_dim, layers, m.codebooks, m.hidden)
+                .expect("candle depth modules");
+        let depth_cdl = build_depth_decode(&df, &dl, &de, m.depthformer_dim, m.codebooks, m.hidden)
+            .expect("candle depth plan");
+
+        // Deterministic hidden vector (bf16 bits), greedy sampler (PRNG unused).
+        let emb: Vec<u16> = (0..m.hidden)
+            .map(|i| half::bf16::from_f32(((i % 11) as f32 - 5.0) * 0.05).to_bits())
+            .collect();
+        let cfg = crate::flashkern::native_engine::SampleConfig::new(None, None);
+        let mut s1 = crate::flashkern::native_engine::PrngState::from_seed(7).unwrap();
+        let mut s2 = crate::flashkern::native_engine::PrngState::from_seed(7).unwrap();
+        let a = depth_res.frame(&emb, &cfg, &mut s1);
+        let b = depth_cdl.frame(&emb, &cfg, &mut s2);
+        assert_eq!(
+            a, b,
+            "resident-bound depth diverges from candle-bound depth (rope/weight mismatch)"
         );
     }
 

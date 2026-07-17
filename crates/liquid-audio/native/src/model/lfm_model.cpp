@@ -738,7 +738,7 @@ extern "C" int lfm_conversation_step(LfmConversation *conversation,
         conversation->rope_sin.empty() ? nullptr : conversation->rope_sin.data(),
         conversation->rope_cos.size(), conversation->hidden.data(),
         conversation->hidden.size(), nullptr, 0, &conversation->text_sampler,
-        &conversation->prng, &token, conversation->model->lanes);
+        &conversation->prng, &token, conversation->model->lanes, nullptr);
     if (status != 0) return status;
     const uint64_t completed_position = conversation->position++;
     conversation->hidden_ready = true;
@@ -786,7 +786,45 @@ extern "C" int lfm_conversation_prefill(LfmConversation *conversation,
             conversation->rope_sin.empty() ? nullptr : conversation->rope_sin.data(),
             conversation->rope_cos.size(), conversation->hidden.data(),
             conversation->hidden.size(), nullptr, 0, nullptr, nullptr, nullptr,
-            conversation->model->lanes);
+            conversation->model->lanes, nullptr);
+        if (status != 0) return status;
+        ++conversation->position;
+        conversation->hidden_ready = true;
+    }
+    *out_position = conversation->position;
+    return 0;
+}
+
+// Native audio-in prefill: prefill `row_count` continuous embedding rows (the
+// Conformer/adapter output, `[row_count, hidden]` bf16) into KV, one native token
+// pass per row via the provided-embedding path (`embed_kind == 2`). `rows` is a
+// borrowed VIEW into the caller's buffer — no payload crosses the ABI, and the
+// backbone reads it in place, exactly as the discrete-id prefill loops. Same
+// sequential-per-position shape as `lfm_conversation_prefill`.
+extern "C" int lfm_conversation_prefill_audio(LfmConversation *conversation,
+                                              const uint16_t *rows, size_t row_count,
+                                              uint64_t *out_position) {
+    if (!conversation || !rows || row_count == 0 || !out_position) return -EINVAL;
+    ConversationClaim claim(conversation);
+    if (!claim) return -EBUSY;
+    if (row_count > conversation->model->max_context - conversation->position) {
+        return -ENOSPC;
+    }
+    const size_t h = conversation->model->hidden;
+    // embed_kind==2 ignores `ids`, but the pass's entry guard requires a non-null
+    // id with count >= 1; a single dummy satisfies it without being read.
+    static const uint32_t kDummyId = 0;
+    for (size_t index = 0; index < row_count; ++index) {
+        const int status = lfm_engine_token_pass(
+            conversation->model->engine, conversation->model->plan_id,
+            &kDummyId, 1, /*embedding_kind=*/2,
+            conversation->states.data(), conversation->states.size(),
+            conversation->position,
+            conversation->rope_cos.empty() ? nullptr : conversation->rope_cos.data(),
+            conversation->rope_sin.empty() ? nullptr : conversation->rope_sin.data(),
+            conversation->rope_cos.size(), conversation->hidden.data(),
+            conversation->hidden.size(), nullptr, 0, nullptr, nullptr, nullptr,
+            conversation->model->lanes, rows + index * h);
         if (status != 0) return status;
         ++conversation->position;
         conversation->hidden_ready = true;

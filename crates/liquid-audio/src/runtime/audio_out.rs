@@ -62,6 +62,25 @@ pub trait AudioDetokenizer: Send + Sync {
     fn decode_step(&self, frame: &Tensor) -> Result<Option<Tensor>> {
         Ok(Some(self.decode(frame)?))
     }
+
+    /// Streaming decode from raw host codes `&[u32]` → optional host PCM
+    /// `Vec<f32>`, with **no `Tensor` round-trip**: the codes are already host
+    /// integers in the generation loop and every consumer wants host PCM, so
+    /// wrapping them into a `Tensor` and reading a `Tensor` back only adds
+    /// device syncs. The native Mimi backend overrides this with its direct
+    /// `&[u32]` → `Vec<f32>` kernel path. Default: wrap the `Tensor`
+    /// `decode_step` for backends without a host path.
+    fn decode_step_codes(&self, codes: &[u32]) -> Result<Option<Vec<f32>>> {
+        let frame = Tensor::from_vec(
+            codes.to_vec(),
+            (1, codes.len(), 1),
+            &candle_core::Device::Cpu,
+        )?;
+        match self.decode_step(&frame)? {
+            Some(pcm) => Ok(Some(pcm.flatten_all()?.to_dtype(DType::F32)?.to_vec1()?)),
+            None => Ok(None),
+        }
+    }
 }
 
 /// The in-tree LFM2-based detokenizer behind the shared trait. Its `forward`
@@ -95,22 +114,20 @@ impl MimiDetokenizer {
     }
 }
 
-impl MimiDetokenizer {
-    /// Slice-native streaming decode — no tensor plumbing in either direction
-    /// (review P1: the codes already exist as host integers in the generation
-    /// loop, and every consumer wants host PCM; the Tensor round-trip added
-    /// two device syncs per frame on Metal). The trait's `decode_step` is the
-    /// Tensor adapter over this.
-    pub fn decode_step_codes(
-        &self,
-        codes: &[u32],
-    ) -> std::result::Result<Option<Vec<f32>>, String> {
-        let pcm = self.native.decode_step(codes)?;
+impl AudioDetokenizer for MimiDetokenizer {
+    /// Native streaming decode from host codes — no `Tensor` in either
+    /// direction (review P1: the codes are already host integers in the
+    /// generation loop and every consumer wants host PCM; the `Tensor`
+    /// round-trip added two device syncs per frame on Metal). Overrides the
+    /// trait default's wrap-and-unwrap.
+    fn decode_step_codes(&self, codes: &[u32]) -> Result<Option<Vec<f32>>> {
+        let pcm = self
+            .native
+            .decode_step(codes)
+            .map_err(candle_core::Error::Msg)?;
         Ok(if pcm.is_empty() { None } else { Some(pcm) })
     }
-}
 
-impl AudioDetokenizer for MimiDetokenizer {
     fn decode(&self, codes: &Tensor) -> Result<Tensor> {
         let codes = codes.to_dtype(DType::U32)?; // RVQ index_select wants u32
         let mut m = self.inner.lock().unwrap_or_else(|p| p.into_inner());
@@ -144,10 +161,7 @@ impl AudioDetokenizer for MimiDetokenizer {
     /// the turn boundary by [`reset_stream`](Self::reset_stream).
     fn decode_step(&self, frame: &Tensor) -> Result<Option<Tensor>> {
         let codes: Vec<u32> = frame.to_dtype(DType::U32)?.flatten_all()?.to_vec1()?;
-        match self
-            .decode_step_codes(&codes)
-            .map_err(candle_core::Error::Msg)?
-        {
+        match self.decode_step_codes(&codes)? {
             Some(pcm) => {
                 let n = pcm.len();
                 // ALWAYS a CPU tensor (review P1): the consumer downloads to

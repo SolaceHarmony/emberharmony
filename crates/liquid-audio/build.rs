@@ -114,6 +114,23 @@ fn main() {
         .include("native/include")
         .compile("lfm_frontend");
 
+    // Native Conformer encoder + audio adapter over the resident image and the
+    // Flashkern GEMM pass. Same -ffp-contract=off contract: the parity
+    // fixtures came from uncontracted candle ops.
+    println!("cargo::rerun-if-changed=native/include/lfm_conformer.h");
+    println!("cargo::rerun-if-changed=native/src/model/lfm_conformer.cpp");
+    cc::Build::new()
+        .file("native/src/model/lfm_conformer.cpp")
+        .cpp(true)
+        .std("c++23")
+        .opt_level(3)
+        .warnings(true)
+        .warnings_into_errors(true)
+        .flag("-ffp-contract=off")
+        .include("native/include")
+        .include("native/vendor")
+        .compile("lfm_conformer");
+
     // Snapshotable ChaCha20 CSPRNG state/refill. Apple entropy enters through a
     // tiny architecture assembly thunk to SecRandomCopyBytes; every hot draw is
     // expanded by the assembly block kernel added to the architecture archive.
@@ -148,6 +165,7 @@ fn main() {
             .file("native/kernels/x86_64/flashkern_math.S")
             .file("native/kernels/x86_64/flashkern_sampler.S")
             .file("native/kernels/x86_64/flashkern_frontend.S")
+            .file("native/kernels/x86_64/flashkern_conformer.S")
             .cpp(true)
             .std("c++23")
             .opt_level(3)
@@ -168,6 +186,7 @@ fn main() {
             .file("native/kernels/aarch64/flashkern_math.S")
             .file("native/kernels/aarch64/flashkern_sampler.S")
             .file("native/kernels/aarch64/flashkern_frontend.S")
+            .file("native/kernels/aarch64/flashkern_conformer.S")
             .cpp(true)
             .std("c++23")
             .opt_level(3)
