@@ -1,0 +1,19 @@
+[package]
+name = "liquid-audio-oracle"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Workspace-only Candle oracle, training, and fixture-capture surface for liquid-audio"
+
+[lib]
+name = "liquid_audio_oracle"
+path = "src/lib.rs"
+
+[dependencies]
+liquid-audio = { path = "../liquid-audio", default-features = false, features = ["oracle"] }
+
+[features]
+default = []
+download = ["liquid-audio/download"]
+accelerate = ["liquid-audio/accelerate"]
+metal = ["liquid-audio/metal"]
