@@ -40,8 +40,39 @@ fn main() {
         println!("cargo::rustc-link-lib=m");
     }
 
+    // Product lifecycle + private PCM/control dock. Keep this consumer archive
+    // before the engine/model provider archive below for GNU static-link order.
+    println!("cargo::rerun-if-changed=native/include/lfm_types.h");
+    println!("cargo::rerun-if-changed=native/include/lfm_runtime.h");
+    println!("cargo::rerun-if-changed=native/include/lfm_session.h");
+    println!("cargo::rerun-if-changed=native/include/lfm_audio_dock.h");
+    println!("cargo::rerun-if-changed=native/src/runtime/voice_session.cpp");
+    println!("cargo::rerun-if-changed=native/src/runtime/voice_protocol_c.c");
+    cc::Build::new()
+        .file("native/src/runtime/voice_session.cpp")
+        .cpp(true)
+        .std("c++23")
+        .opt_level(3)
+        .warnings(true)
+        .warnings_into_errors(true)
+        .flag("-pthread")
+        .include("native/include")
+        .include("native/src/model")
+        .include("../kcoro-sys/vendor/kcoro_arena/include")
+        .compile("lfm_voice_session");
+    cc::Build::new()
+        .file("native/src/runtime/voice_protocol_c.c")
+        .std("c11")
+        .warnings(true)
+        .warnings_into_errors(true)
+        .include("native/include")
+        .compile("lfm_voice_protocol_c");
+
     println!("cargo::rerun-if-changed=native/src/engine/flashkern_engine.cpp");
     println!("cargo::rerun-if-changed=native/src/model/lfm_model.cpp");
+    println!("cargo::rerun-if-changed=native/src/model/lfm_model_internal.h");
+    println!("cargo::rerun-if-changed=native/src/model/lfm_model_legacy.h");
+    println!("cargo::rerun-if-changed=native/src/model/lfm_tokenizer.cpp");
     println!("cargo::rerun-if-changed=native/include/flashkern_conv.h");
     println!("cargo::rerun-if-changed=native/include/flashkern_depth.h");
     println!("cargo::rerun-if-changed=native/include/flashkern_fft.h");
@@ -60,6 +91,7 @@ fn main() {
     cc::Build::new()
         .file("native/src/engine/flashkern_engine.cpp")
         .file("native/src/model/lfm_model.cpp")
+        .file("native/src/model/lfm_tokenizer.cpp")
         .cpp(true)
         .std("c++23")
         .opt_level(3)
@@ -236,6 +268,7 @@ fn main() {
         .std("c++23")
         .opt_level(3)
         .warnings(false)
+        .flag("-pthread")
         .include("native/include")
         .include("native/vendor")
         .compile("lfm_safetensors");

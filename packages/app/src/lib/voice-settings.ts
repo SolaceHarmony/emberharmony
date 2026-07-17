@@ -82,10 +82,10 @@ export const defaultVoiceSettings: VoiceSettings = {
   // Desktop resolves the default `model` in Rust; this literal is only the
   // web-build display fallback when no Tauri runtime exists.
   lfm2: {
-    engine: "moshiRealtime",
+    engine: "lfm2Interleaved",
     model: DEFAULT_LFM2_MODEL,
     moshiModel: DEFAULT_MOSHI_MODEL,
-    device: "metal",
+    device: "cpu",
     vadThreshold: 0.012,
     trace: false,
     // Per-mode defaults mirror the vendor demo (audio-model.js): ASR

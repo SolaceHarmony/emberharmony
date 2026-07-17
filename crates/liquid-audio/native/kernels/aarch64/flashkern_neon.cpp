@@ -11,7 +11,7 @@
 //   GPU rcp / rsqrt fast-math                                             ->  FRECPE/FRSQRTE + Newton
 //   Metal int tensor-core (stretch)                                       ->  SMMLA (vmmlaq_s32)
 //   Metal `bfloat(acc)` RNE store                                         ->  BFCVT (vcvth_bf16_f32)
-//   Metal threadgroup shared memory + barrier + grid dispatch             ->  packed panels + PRFM;
+//   Metal threadgroup shared memory + barrier + grid dispatch             ->  direct row streams + PRFM;
 //                                                                             rayon tiling (Rust side)
 //
 // All entry points are `extern "C"` (flat FFI to src/compute/flashkern/neon.rs). C++17 internally for the
@@ -68,110 +68,10 @@ static inline uint16_t f32_to_bf16_bits(float f) {
 // Group A — GEMM (mirrors fused_monarch.rs simdgroup_float8x8 + simdgroup_multiply_accumulate)
 // =====================================================================================
 //
-// C(M,N) f32 = A(M,K) bf16 · B(K,N) bf16, all row-major, f32 accumulate — torch's CPU
-// bf16-matmul numerics. 8×8 output tile == a 4×4 grid of BFMMLA 2×2 sub-tiles => 16
-// independent `float32x4_t` accumulators (the ILP the 2×2 reference kernel lacks). A and B
-// are packed ONCE into thread-local scratch (reused across calls of matching size, no
-// per-call heap alloc after warmup) in BFMMLA tile order, zero-padded to 8×8×(K→4).
-
-namespace {
-
-// Thread-local packed panels (each rayon worker gets its own — no contention).
-thread_local std::vector<bfloat16_t> g_Ap;
-thread_local std::vector<bfloat16_t> g_Bp;
-
-// Pack A(M,K) row-major -> Ap: per 8-row panel, per 4-deep K block, 4 row-pairs ×
-// 8 bf16 = [row(2rp)[k..k+3], row(2rp+1)[k..k+3]]. Padded rows/cols are +0.0 (contribute 0).
-static void pack_a(const bfloat16_t *A, int M, int K, int Mp, int Kp, bfloat16_t *Ap) {
-    const int kb = Kp / 4;
-    memset(Ap, 0, (size_t)Mp * Kp * sizeof(bfloat16_t));
-    for (int i = 0; i < M; i++) {
-        const int panel = i / 8, rp = (i % 8) / 2, ir = i & 1;
-        bfloat16_t *base = Ap + ((size_t)panel * kb) * 32 + (size_t)rp * 8; // 8 bf16 per rowpair
-        for (int k = 0; k < K; k++) {
-            base[(size_t)(k / 4) * 32 + ir * 4 + (k & 3)] = A[(size_t)i * K + k];
-        }
-    }
-}
-
-// Pack B(K,N) row-major -> Bp: per 8-col panel, per 4-deep K block, 4 col-pairs ×
-// 8 bf16 = [col(2cp)[k..k+3], col(2cp+1)[k..k+3]].
-static void pack_b(const bfloat16_t *B, int K, int N, int Np, int Kp, bfloat16_t *Bp) {
-    const int kb = Kp / 4;
-    memset(Bp, 0, (size_t)Np * Kp * sizeof(bfloat16_t));
-    for (int j = 0; j < N; j++) {
-        const int panel = j / 8, cp = (j % 8) / 2, jc = j & 1;
-        bfloat16_t *base = Bp + ((size_t)panel * kb) * 32 + (size_t)cp * 8;
-        for (int k = 0; k < K; k++) {
-            base[(size_t)(k / 4) * 32 + jc * 4 + (k & 3)] = B[(size_t)k * N + j];
-        }
-    }
-}
-
-FK_TGT_BF16
-static void gemm_tiles(const bfloat16_t *Ap, const bfloat16_t *Bp, float *C,
-                       int M, int N, int Mp, int Np, int Kp) {
-    const int kb = Kp / 4;
-    for (int ip = 0; ip < Mp; ip += 8) {
-        const bfloat16_t *apanel = Ap + ((size_t)(ip / 8) * kb) * 32;
-        for (int jp = 0; jp < Np; jp += 8) {
-            const bfloat16_t *bpanel = Bp + ((size_t)(jp / 8) * kb) * 32;
-            float32x4_t acc[4][4];
-            for (int r = 0; r < 4; r++)
-                for (int c = 0; c < 4; c++) acc[r][c] = vdupq_n_f32(0.0f);
-            const bfloat16_t *ap = apanel, *bp = bpanel;
-            for (int b = 0; b < kb; b++) {
-                __builtin_prefetch(ap + 32 * 4, 0, 3);
-                __builtin_prefetch(bp + 32 * 4, 0, 3);
-                bfloat16x8_t av[4], bv[4];
-                for (int r = 0; r < 4; r++) av[r] = vld1q_bf16(ap + r * 8);
-                for (int c = 0; c < 4; c++) bv[c] = vld1q_bf16(bp + c * 8);
-                for (int r = 0; r < 4; r++)
-                    for (int c = 0; c < 4; c++)
-                        acc[r][c] = vbfmmlaq_f32(acc[r][c], av[r], bv[c]);
-                ap += 32;
-                bp += 32;
-            }
-            // scatter 2×2 sub-tiles: acc lane order [c00,c01,c10,c11]
-            for (int r = 0; r < 4; r++) {
-                for (int c = 0; c < 4; c++) {
-                    float out[4];
-                    vst1q_f32(out, acc[r][c]);
-                    const int r0 = ip + 2 * r, c0 = jp + 2 * c;
-                    if (r0 + 0 < M && c0 + 0 < N) C[(size_t)(r0 + 0) * N + c0 + 0] = out[0];
-                    if (r0 + 0 < M && c0 + 1 < N) C[(size_t)(r0 + 0) * N + c0 + 1] = out[1];
-                    if (r0 + 1 < M && c0 + 0 < N) C[(size_t)(r0 + 1) * N + c0 + 0] = out[2];
-                    if (r0 + 1 < M && c0 + 1 < N) C[(size_t)(r0 + 1) * N + c0 + 1] = out[3];
-                }
-            }
-        }
-    }
-}
-
-} // namespace
-
-extern "C" {
-
-// Full single-threaded 8×8 BFMMLA GEMM. Rust parallelizes by calling this over M-row blocks
-// (rayon), which is why packing lives inside (each block packs its own rows + a B copy).
-void lfm_bf16_gemm_f32_v2(const uint16_t *A_, const uint16_t *B_, float *C,
-                          int M, int N, int K) {
-    if (M <= 0 || N <= 0 || K <= 0) return;
-    const bfloat16_t *A = (const bfloat16_t *)A_;
-    const bfloat16_t *B = (const bfloat16_t *)B_;
-    const int Mp = (M + 7) & ~7, Np = (N + 7) & ~7, Kp = (K + 3) & ~3;
-    g_Ap.resize((size_t)Mp * Kp);
-    g_Bp.resize((size_t)Np * Kp);
-    pack_a(A, M, K, Mp, Kp, g_Ap.data());
-    pack_b(B, K, N, Np, Kp, g_Bp.data());
-    gemm_tiles(g_Ap.data(), g_Bp.data(), C, M, N, Mp, Np, Kp);
-}
-
-// GEMV (M==1): C[0..N) = Σ_k A[k]·B[k,N]. BFDOT over K, one column at a time. B is packed
-// column-major (bf16) so each column is contiguous; K padded to a multiple of 8.
-void lfm_bf16_gemv_f32(const uint16_t *A_, const uint16_t *B_, float *C, int N, int K);
-
-} // extern "C"
+// C(M,N) f32 = A(M,K) bf16 · B(K,N) bf16. Both matrices stay in their
+// caller-owned row-major storage. The leaf streams B rows directly and does not
+// allocate or create packed panels; model checkpoints use the separate direct
+// [N,K] leaf below.
 
 // Row-streaming "axpy" GEMV: for each k the CONTIGUOUS weight row B[k,·] is widened
 // (bf16 = the top 16 bits of the f32, so widen is a shift — baseline NEON, no FEAT_BF16
@@ -189,6 +89,18 @@ static inline float32x4_t bf16_row_lo(uint16x8_t b) {
 }
 static inline float32x4_t bf16_row_hi(uint16x8_t b) {
     return vreinterpretq_f32_u32(vshll_high_n_u16(b, 16));
+}
+
+static inline uint16x8_t load_bf16x8(const unsigned char *bytes) {
+    uint16x8_t words;
+    memcpy(&words, bytes, sizeof(words));
+    return words;
+}
+
+static inline uint16_t load_bf16_word(const unsigned char *bytes) {
+    uint16_t word;
+    memcpy(&word, bytes, sizeof(word));
+    return word;
 }
 
 static void gemv_impl(const uint16_t *A, const uint16_t *B, float *C, int N, int K) {
@@ -232,6 +144,14 @@ static void gemv_impl(const uint16_t *A, const uint16_t *B, float *C, int N, int
     }
 }
 
+extern "C" void lfm_bf16_gemm_f32_v2(const uint16_t *A, const uint16_t *B,
+                                      float *C, int M, int N, int K) {
+    if (M <= 0 || N <= 0 || K <= 0) return;
+    for (int m = 0; m < M; ++m) {
+        gemv_impl(A + (size_t)m * K, B, C + (size_t)m * N, N, K);
+    }
+}
+
 extern "C" void lfm_bf16_gemv_f32(const uint16_t *A_, const uint16_t *B_, float *C,
                                   int N, int K) {
     if (N <= 0 || K <= 0) return;
@@ -244,31 +164,60 @@ extern "C" void lfm_bf16_gemv_f32(const uint16_t *A_, const uint16_t *B_, float 
 // `w.t().contiguous()`: a full strided weight copy per linear per call — measured as ~97%
 // of CPU decode time.) Intended for decode-side small M (1 per decode step, ≤4 for suffix
 // chunks); W rows stream once, reused across the M activation rows. Baseline NEON.
-static void gemm_nt_impl(const uint16_t *A, const uint16_t *W, float *C, int M, int N, int K) {
+static void gemm_nt_impl(const uint16_t *A, const void *W, float *C,
+                         int M, int N, int K, int ldc) {
+    const unsigned char *weight_bytes = static_cast<const unsigned char *>(W);
     for (int n = 0; n < N; n++) {
-        const uint16_t *wr = W + (size_t)n * K;
-        __builtin_prefetch(wr + K, 0, 0);
-        for (int m = 0; m < M; m++) {
-            const uint16_t *ar = A + (size_t)m * K;
-            float32x4_t acc0 = vdupq_n_f32(0.0f), acc1 = vdupq_n_f32(0.0f);
+        const unsigned char *wr = weight_bytes + (size_t)n * K * sizeof(uint16_t);
+        __builtin_prefetch(wr + (size_t)K * sizeof(uint16_t), 0, 0);
+        for (int m0 = 0; m0 < M; m0 += 4) {
+            const int rows = M - m0 < 4 ? M - m0 : 4;
+            float32x4_t acc0[4], acc1[4];
+            for (int row = 0; row < rows; ++row) {
+                acc0[row] = vdupq_n_f32(0.0f);
+                acc1[row] = vdupq_n_f32(0.0f);
+            }
             int k = 0;
             for (; k + 8 <= K; k += 8) {
-                uint16x8_t wb = vld1q_u16(wr + k);
-                uint16x8_t ab = vld1q_u16(ar + k);
-                acc0 = vfmaq_f32(acc0, bf16_row_lo(ab), bf16_row_lo(wb));
-                acc1 = vfmaq_f32(acc1, bf16_row_hi(ab), bf16_row_hi(wb));
+                const uint16x8_t wb =
+                    load_bf16x8(wr + (size_t)k * sizeof(uint16_t));
+                const float32x4_t wlo = bf16_row_lo(wb);
+                const float32x4_t whi = bf16_row_hi(wb);
+                for (int row = 0; row < rows; ++row) {
+                    const uint16_t *ar = A + (size_t)(m0 + row) * K;
+                    const uint16x8_t ab = vld1q_u16(ar + k);
+                    acc0[row] = vfmaq_f32(acc0[row], bf16_row_lo(ab), wlo);
+                    acc1[row] = vfmaq_f32(acc1[row], bf16_row_hi(ab), whi);
+                }
             }
-            float acc = vaddvq_f32(vaddq_f32(acc0, acc1));
-            for (; k < K; k++) acc = fmaf(bf16_to_f32(ar[k]), bf16_to_f32(wr[k]), acc);
-            C[(size_t)m * N + n] = acc;
+            float sums[4];
+            for (int row = 0; row < rows; ++row)
+                sums[row] = vaddvq_f32(vaddq_f32(acc0[row], acc1[row]));
+            for (; k < K; ++k) {
+                const float weight = bf16_to_f32(load_bf16_word(
+                    wr + (size_t)k * sizeof(uint16_t)));
+                for (int row = 0; row < rows; ++row) {
+                    const uint16_t *ar = A + (size_t)(m0 + row) * K;
+                    sums[row] = fmaf(bf16_to_f32(ar[k]), weight, sums[row]);
+                }
+            }
+            for (int row = 0; row < rows; ++row)
+                C[(size_t)(m0 + row) * ldc + n] = sums[row];
         }
     }
 }
 
-extern "C" void lfm_bf16_gemm_nt_f32(const uint16_t *A, const uint16_t *W, float *C,
+extern "C" void lfm_bf16_gemm_nt_f32(const uint16_t *A, const void *W, float *C,
                                      int M, int N, int K) {
     if (M <= 0 || N <= 0 || K <= 0) return;
-    gemm_nt_impl(A, W, C, M, N, K);
+    gemm_nt_impl(A, W, C, M, N, K, N);
+}
+
+extern "C" void lfm_bf16_gemm_nt_strided_f32(const uint16_t *A, const void *W,
+                                               float *C, int M, int N, int K,
+                                               int ldc) {
+    if (M <= 0 || N <= 0 || K <= 0 || ldc < N) return;
+    gemm_nt_impl(A, W, C, M, N, K, ldc);
 }
 
 extern "C" int lfm_bf16_gemm_available(void) {
@@ -827,6 +776,11 @@ static inline uint16x4_t bf16_bits_f32x4(float32x4_t v) {
 static inline float32x4_t bf16_widen4(const uint16_t *p) {
     return vreinterpretq_f32_u32(vshll_n_u16(vld1_u16(p), 16));
 }
+static inline float32x4_t bf16_widen4_bytes(const unsigned char *p) {
+    uint16x4_t words;
+    memcpy(&words, p, sizeof(words));
+    return vreinterpretq_f32_u32(vshll_n_u16(words, 16));
+}
 // scalar RNE round kept-as-f32 (for edges) — same integer trick.
 static inline float round_bf16_scalar(float f) {
     uint32_t u;
@@ -943,11 +897,14 @@ static inline uint16x4_t bits_of_rounded4(float32x4_t v) {
 // trained-regime rounding points (Bx and conv-out round through bf16) and the carried
 // state's old s1 passed through as RAW bits (already bf16 — exact).
 static void update_step_k3_bf16(const uint16_t *ball, const uint16_t *call, const uint16_t *xall,
-                                const uint16_t *state, const uint16_t *w, uint16_t *out, int D) {
+                                const uint16_t *state, const unsigned char *weights,
+                                uint16_t *out, int D) {
     int c = 0;
     for (; c + 4 <= D; c += 4) {
         uint16x4x2_t sb = vld2_u16(state + 2 * c);
-        uint16x4x3_t wb = vld3_u16(w + 3 * c);
+        uint16_t local[12];
+        memcpy(local, weights + (size_t)3 * c * sizeof(uint16_t), sizeof(local));
+        uint16x4x3_t wb = vld3_u16(local);
         float32x4_t bx = round_bf16_f32x4(
             vmulq_f32(bf16_widen4(ball + c), bf16_widen4(xall + c)));
         float32x4_t acc = vmulq_f32(bf16_widen_bits4(sb.val[0]), bf16_widen_bits4(wb.val[0]));
@@ -963,9 +920,13 @@ static void update_step_k3_bf16(const uint16_t *ball, const uint16_t *call, cons
     }
     for (; c < D; c++) {
         float bx = round_bf16_scalar(bf16_to_f32(ball[c]) * bf16_to_f32(xall[c]));
-        float acc = bf16_to_f32(w[3 * c + 0]) * bf16_to_f32(state[2 * c + 0]);
-        acc = acc + bf16_to_f32(w[3 * c + 1]) * bf16_to_f32(state[2 * c + 1]);
-        acc = acc + bf16_to_f32(w[3 * c + 2]) * bx;
+        const unsigned char *row =
+            weights + (size_t)3 * c * sizeof(uint16_t);
+        float acc = bf16_to_f32(load_bf16_word(row)) *
+                    bf16_to_f32(state[2 * c + 0]);
+        acc = acc + bf16_to_f32(load_bf16_word(row + sizeof(uint16_t))) *
+                            bf16_to_f32(state[2 * c + 1]);
+        acc = acc + bf16_to_f32(load_bf16_word(row + 2 * sizeof(uint16_t))) * bx;
         acc = round_bf16_scalar(acc);
         out[3 * c + 0] = bf16_bits_scalar(bf16_to_f32(call[c]) * acc);
         out[3 * c + 1] = state[2 * c + 1];
@@ -975,12 +936,14 @@ static void update_step_k3_bf16(const uint16_t *ball, const uint16_t *call, cons
 } // namespace
 
 extern "C" void lfm_conv1d_update_bf16(const uint16_t *bcx, const uint16_t *state,
-                                       const uint16_t *w, uint16_t *out,
+                                       const void *weight_storage, uint16_t *out,
                                        int Bn, int D, int T, int K) {
+    const unsigned char *weights = static_cast<const unsigned char *>(weight_storage);
     if (T == 1 && K == 3) {
         for (int b = 0; b < Bn; b++) {
             const uint16_t *base = bcx + (size_t)b * 3 * D;
-            update_step_k3_bf16(base, base + D, base + 2 * D, state + (size_t)b * D * 2, w,
+            update_step_k3_bf16(base, base + D, base + 2 * D,
+                                state + (size_t)b * D * 2, weights,
                                 out + (size_t)b * D * 3, D);
         }
         return;
@@ -988,7 +951,11 @@ extern "C" void lfm_conv1d_update_bf16(const uint16_t *bcx, const uint16_t *stat
     float wf[16];
     for (int b = 0; b < Bn; b++)
         for (int c = 0; c < D; c++) {
-            for (int j = 0; j < K; j++) wf[j] = bf16_to_f32(w[(size_t)c * K + j]);
+            for (int j = 0; j < K; j++) {
+                const size_t index = (size_t)c * K + j;
+                wf[j] = bf16_to_f32(load_bf16_word(
+                    weights + index * sizeof(uint16_t)));
+            }
             const uint16_t *brow = bcx + (((size_t)b * 3 + 0) * D + c) * T;
             const uint16_t *crow = bcx + (((size_t)b * 3 + 1) * D + c) * T;
             const uint16_t *xrow = bcx + (((size_t)b * 3 + 2) * D + c) * T;
@@ -1024,25 +991,39 @@ extern "C" float lfm_bf16_sumsq_f32(const uint16_t *x, int n) {
 
 // RMSNorm apply: out = rb(f32(x) · inv_rms · f32(w)) — f32 throughout, ONE bf16 round
 // (transformer.rs RmsNorm::forward's ladder).
-extern "C" void lfm_bf16_rmsnorm(const uint16_t *x, const uint16_t *w, uint16_t *out,
+extern "C" void lfm_bf16_rmsnorm(const void *x_storage, const void *weight_storage,
+                                 uint16_t *out,
                                  int n, float inv_rms) {
+    const unsigned char *x = static_cast<const unsigned char *>(x_storage);
+    const unsigned char *w = static_cast<const unsigned char *>(weight_storage);
     const float32x4_t rs = vdupq_n_f32(inv_rms);
     int i = 0;
     for (; i + 4 <= n; i += 4) {
-        float32x4_t xv = bf16_widen4(x + i);
-        float32x4_t wv = bf16_widen4(w + i);
+        float32x4_t xv = bf16_widen4_bytes(x + (size_t)i * sizeof(uint16_t));
+        float32x4_t wv = bf16_widen4_bytes(w + (size_t)i * sizeof(uint16_t));
         vst1_u16(out + i, bf16_bits_f32x4(vmulq_f32(vmulq_f32(xv, rs), wv)));
     }
     for (; i < n; i++)
-        out[i] = bf16_bits_scalar(bf16_to_f32(x[i]) * inv_rms * bf16_to_f32(w[i]));
+        out[i] = bf16_bits_scalar(
+            bf16_to_f32(load_bf16_word(x + (size_t)i * sizeof(uint16_t))) * inv_rms *
+            bf16_to_f32(load_bf16_word(w + (size_t)i * sizeof(uint16_t))));
 }
 
 // bf16 elementwise add (the residual ladder): out = rb(f32(a) + f32(b)).
-extern "C" void lfm_bf16_add(const uint16_t *a, const uint16_t *b, uint16_t *out, int n) {
+extern "C" void lfm_bf16_add(const void *a_storage, const void *b_storage,
+                              uint16_t *out, int n) {
+    const unsigned char *a = static_cast<const unsigned char *>(a_storage);
+    const unsigned char *b = static_cast<const unsigned char *>(b_storage);
     int i = 0;
     for (; i + 4 <= n; i += 4)
-        vst1_u16(out + i, bf16_bits_f32x4(vaddq_f32(bf16_widen4(a + i), bf16_widen4(b + i))));
-    for (; i < n; i++) out[i] = bf16_bits_scalar(bf16_to_f32(a[i]) + bf16_to_f32(b[i]));
+        vst1_u16(out + i, bf16_bits_f32x4(vaddq_f32(
+            bf16_widen4_bytes(a + (size_t)i * sizeof(uint16_t)),
+            bf16_widen4_bytes(b + (size_t)i * sizeof(uint16_t)))));
+    for (; i < n; i++) {
+        out[i] = bf16_bits_scalar(
+            bf16_to_f32(load_bf16_word(a + (size_t)i * sizeof(uint16_t))) +
+            bf16_to_f32(load_bf16_word(b + (size_t)i * sizeof(uint16_t))));
+    }
 }
 
 // SwiGLU gate ladder over post-GEMV f32 planes: out = rb(rb(silu(rb(g))) · rb(u)) — the
@@ -1180,15 +1161,16 @@ extern "C" float lfm_bf16_sumsq_seq_f32(const uint16_t *x, int n) {
 // x0+=x2), ADDV, then sequential leftovers. Each square rounds before accumulating (the
 // sqr() tensor's values). This is the token-exact norm reduction for fused blocks that
 // must bit-match the composed candle chain on aarch64.
-extern "C" float lfm_bf16_sumsq_candle_f32(const uint16_t *x, int n) {
+extern "C" float lfm_bf16_sumsq_candle_f32(const void *storage, int n) {
+    const unsigned char *x = static_cast<const unsigned char *>(storage);
     const int np = n & ~15;
     float32x4_t sum0 = vdupq_n_f32(0.0f), sum1 = vdupq_n_f32(0.0f);
     float32x4_t sum2 = vdupq_n_f32(0.0f), sum3 = vdupq_n_f32(0.0f);
     for (int i = 0; i < np; i += 16) {
-        float32x4_t x0 = bf16_widen4(x + i);
-        float32x4_t x1 = bf16_widen4(x + i + 4);
-        float32x4_t x2 = bf16_widen4(x + i + 8);
-        float32x4_t x3 = bf16_widen4(x + i + 12);
+        float32x4_t x0 = bf16_widen4_bytes(x + (size_t)i * sizeof(uint16_t));
+        float32x4_t x1 = bf16_widen4_bytes(x + (size_t)(i + 4) * sizeof(uint16_t));
+        float32x4_t x2 = bf16_widen4_bytes(x + (size_t)(i + 8) * sizeof(uint16_t));
+        float32x4_t x3 = bf16_widen4_bytes(x + (size_t)(i + 12) * sizeof(uint16_t));
         sum0 = vaddq_f32(sum0, vmulq_f32(x0, x0));
         sum1 = vaddq_f32(sum1, vmulq_f32(x1, x1));
         sum2 = vaddq_f32(sum2, vmulq_f32(x2, x2));
@@ -1199,7 +1181,7 @@ extern "C" float lfm_bf16_sumsq_candle_f32(const uint16_t *x, int n) {
     sum0 = vaddq_f32(sum0, sum2);
     float acc = vaddvq_f32(sum0);
     for (int i = np; i < n; i++) {
-        float v = bf16_to_f32(x[i]);
+        float v = bf16_to_f32(load_bf16_word(x + (size_t)i * sizeof(uint16_t)));
         acc = acc + v * v;
     }
     return acc;

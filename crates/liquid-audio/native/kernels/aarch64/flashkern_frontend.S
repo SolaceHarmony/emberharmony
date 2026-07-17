@@ -215,24 +215,27 @@ LFM_SYM(lfm_norm_apply_f32):
 // void lfm_resample_conv_f64(const double *padded, uint64_t padded_len,
 //                            const double *kernels, uint64_t phases,
 //                            uint64_t klen, uint64_t stride,
-//                            float *out, uint64_t max_blocks)
+//                            float *out, uint64_t max_values)
 // The torchaudio strided conv: for each block start (step `stride`) while
 // start+klen <= padded_len, one f64 dot per phase kernel, narrowed to f32.
+// max_values permits the final partial phase block to land directly in the
+// caller's exact-size output instead of a copied convolution staging plane.
 .p2align 2
 .globl LFM_SYM(lfm_resample_conv_f64)
 LFM_SYM(lfm_resample_conv_f64):
     mov     x9, #0              // start
     mov     x10, #0             // block
+    mov     x16, #0             // values written
 1:
     add     x11, x9, x4
     cmp     x11, x1
     b.hi    8f
-    cmp     x10, x7
-    b.hs    8f
     mov     x12, #0             // phase
 2:
     cmp     x12, x3
     b.hs    5f
+    cmp     x16, x7
+    b.hs    8f
     mul     x13, x12, x4
     add     x13, x2, x13, lsl #3
     add     x14, x0, x9, lsl #3
@@ -250,6 +253,7 @@ LFM_SYM(lfm_resample_conv_f64):
 4:
     fcvt    s0, d0
     str     s0, [x6], #4
+    add     x16, x16, #1
     add     x12, x12, #1
     b       2b
 5:

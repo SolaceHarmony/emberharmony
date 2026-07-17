@@ -1,14 +1,22 @@
 use std::ffi::{c_char, c_void, CStr, CString};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Barrier};
 
+use liquid_audio::NativeVoiceSampling;
+
+#[cfg(feature = "oracle")]
 use liquid_audio::weights::{ResidentWeights, WeightDType};
 
 const OK: i32 = 0;
+const IO: i32 = -2;
 const FORMAT: i32 = -3;
 const NOT_FOUND: i32 = -5;
+const INVALID: i32 = -22;
 const WEIGHT_ABI: u32 = 1;
-const MODEL_ABI: u32 = 2;
+const RUNTIME_ABI: u32 = 1;
+const MODEL_ABI: u32 = 3;
 const BF16: u32 = 13;
 const F32: u32 = 16;
 
@@ -20,6 +28,78 @@ struct WeightImage {
 #[repr(C)]
 struct NativeModel {
     _private: [u8; 0],
+}
+
+#[repr(C)]
+struct NativeConversation {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
+struct NativeRuntime {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
+struct RuntimeConfig {
+    size: u32,
+    abi_version: u32,
+    coordination_workers: u32,
+    kernel_lanes: u32,
+    event_capacity: u32,
+    session_capacity: u32,
+    reserved0: u32,
+    reserved1: u32,
+    flags: u64,
+    reserved: [u64; 4],
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct RuntimeSnapshot {
+    size: u32,
+    abi_version: u32,
+    runtime_epoch: u64,
+    state: u32,
+    kernel_lanes: u32,
+    live_models: u32,
+    live_sessions: u32,
+    reserved: [u64; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SamplerConfig {
+    size: u32,
+    abi_version: u32,
+    flags: u32,
+    top_k: u32,
+    temperature: f64,
+    reserved: u64,
+}
+
+#[repr(C)]
+struct ConversationConfig {
+    size: u32,
+    abi_version: u32,
+    flags: u32,
+    reserved0: u32,
+    seed: u64,
+    text_sampler: SamplerConfig,
+    audio_sampler: SamplerConfig,
+    reserved: [u64; 4],
+}
+
+#[repr(C)]
+struct TokenResult {
+    size: u32,
+    abi_version: u32,
+    position: u64,
+    sampled_token: u32,
+    input_count: u32,
+    embedding_kind: u32,
+    flags: u32,
+    reserved: [u64; 4],
 }
 
 #[repr(C)]
@@ -41,6 +121,22 @@ struct ModelInfo {
 }
 
 #[repr(C)]
+#[derive(Default)]
+struct ModelMemory {
+    size: u32,
+    abi_version: u32,
+    source_bytes: u64,
+    resident_image_bytes: u64,
+    directly_bound_bytes: u64,
+    derived_immutable_bytes: u64,
+    compatibility_copied_bytes: u64,
+    load_ns: u64,
+    load_workers: u32,
+    load_tasks: u32,
+    reserved: [u64; 4],
+}
+
+#[repr(C)]
 #[derive(Debug, Default)]
 struct TensorView {
     size: u32,
@@ -57,7 +153,31 @@ struct TensorView {
     reserved: u32,
 }
 
+#[repr(C)]
+#[derive(Debug, Default)]
+struct LoadStats {
+    size: u32,
+    abi_version: u32,
+    source_bytes: u64,
+    resident_bytes: u64,
+    task_count: u32,
+    worker_count: u32,
+}
+
 extern "C" {
+    fn lfm_runtime_create(config: *const RuntimeConfig, out: *mut *mut NativeRuntime) -> i32;
+    fn lfm_runtime_start(runtime: *mut NativeRuntime) -> i32;
+    fn lfm_runtime_request_stop(runtime: *mut NativeRuntime);
+    fn lfm_runtime_join(runtime: *mut NativeRuntime) -> i32;
+    fn lfm_runtime_snapshot(runtime: *const NativeRuntime, out: *mut RuntimeSnapshot) -> i32;
+    fn lfm_runtime_destroy(runtime: *mut NativeRuntime) -> i32;
+    fn lfm_runtime_model_open(
+        runtime: *mut NativeRuntime,
+        path: *const c_char,
+        out: *mut *mut NativeModel,
+        error: *mut c_char,
+        error_length: usize,
+    ) -> i32;
     fn lfm_weights_open(
         path: *const c_char,
         out: *mut *mut WeightImage,
@@ -71,13 +191,28 @@ extern "C" {
         err: *mut c_char,
         errlen: usize,
     ) -> i32;
+    fn lfm_weights_open_bundle(
+        main_path: *const c_char,
+        codec_path: *const c_char,
+        out: *mut *mut WeightImage,
+        err: *mut c_char,
+        errlen: usize,
+    ) -> i32;
     fn lfm_weights_close(image: *mut WeightImage);
     fn lfm_weights_data(image: *const WeightImage) -> *const c_void;
     fn lfm_weights_resident_bytes(image: *const WeightImage) -> u64;
     fn lfm_weights_count(image: *const WeightImage) -> usize;
+    fn lfm_weights_component_count(image: *const WeightImage, component: u32) -> usize;
+    fn lfm_weights_load_stats(image: *const WeightImage, out: *mut LoadStats) -> i32;
     fn lfm_weights_at(image: *const WeightImage, index: usize, out: *mut TensorView) -> i32;
     fn lfm_weights_find(
         image: *const WeightImage,
+        name: *const c_char,
+        out: *mut TensorView,
+    ) -> i32;
+    fn lfm_weights_find_component(
+        image: *const WeightImage,
+        component: u32,
         name: *const c_char,
         out: *mut TensorView,
     ) -> i32;
@@ -93,10 +228,62 @@ extern "C" {
     ) -> i32;
     fn lfm_model_close(model: *mut NativeModel) -> i32;
     fn lfm_model_info(model: *const NativeModel, out: *mut ModelInfo) -> i32;
+    fn lfm_model_memory(model: *const NativeModel, out: *mut ModelMemory) -> i32;
+    fn lfm_conversation_create(
+        model: *mut NativeModel,
+        config: *const ConversationConfig,
+        out: *mut *mut NativeConversation,
+        error: *mut c_char,
+        error_length: usize,
+    ) -> i32;
+    fn lfm_conversation_step(
+        conversation: *mut NativeConversation,
+        ids: *const u32,
+        id_count: usize,
+        embedding_kind: u32,
+        out: *mut TokenResult,
+    ) -> i32;
+    fn lfm_conversation_close(conversation: *mut NativeConversation) -> i32;
+    fn mimi_weight_load_f32(bytes: *const u8, index: u64) -> f32;
+    fn mimi_weight_gemv_f32(
+        weights: *const u8,
+        input: *const f32,
+        bias: *const u8,
+        output: *mut f32,
+        rows: i32,
+        cols: i32,
+    );
+    fn mimi_weight_gemm_tn_f32(
+        weights: *const u8,
+        input: *const f32,
+        output: *mut f32,
+        rows: i32,
+        cols: i32,
+        width: i32,
+    );
+    fn lfm_bf16_unlift_bits(source_bytes: *const c_void) -> u32;
+    fn lfm_internal_weights_open_bundle_benchmark(
+        main_path: *const c_char,
+        codec_path: *const c_char,
+        workers: u32,
+        uncached: u32,
+        out: *mut *mut WeightImage,
+        err: *mut c_char,
+        errlen: usize,
+    ) -> i32;
+    fn lfm_internal_weights_open_fault_test(
+        path: *const c_char,
+        mode: u32,
+        scheduled: *mut u32,
+        completed: *mut u32,
+        err: *mut c_char,
+        errlen: usize,
+    ) -> i32;
 }
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(feature = "oracle")]
 fn workspace_model_dir() -> PathBuf {
     PathBuf::from("../../experiments/lfm2-audio-voice/model")
 }
@@ -105,6 +292,8 @@ struct Temp(PathBuf);
 
 impl Temp {
     fn new() -> Self {
+        std::hint::black_box(std::mem::size_of::<NativeVoiceSampling>());
+        kcoro_sys::link_anchor();
         const BASE: &str = "emberharmony-native-safetensors";
         let id = NEXT.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!("{BASE}-{}-{id}", std::process::id()));
@@ -158,18 +347,39 @@ fn write_raw(path: &Path, header: serde_json::Value, data: &[u8]) {
     std::fs::write(path, file).unwrap();
 }
 
-fn write_zero_bf16_model(path: &Path, tensors: &[(String, Vec<u64>)]) {
+fn payload_start(path: &Path) -> usize {
+    let mut prefix = [0u8; 8];
+    std::fs::File::open(path)
+        .unwrap()
+        .read_exact(&mut prefix)
+        .unwrap();
+    8 + u64::from_le_bytes(prefix) as usize
+}
+
+#[derive(Clone, Debug)]
+struct TinyTensor {
+    name: String,
+    dtype: &'static str,
+    shape: Vec<u64>,
+}
+
+fn write_zero_model(path: &Path, tensors: &[TinyTensor]) {
     let mut root = serde_json::Map::new();
     let mut data = Vec::new();
-    for (name, shape) in tensors {
-        let bytes = shape.iter().product::<u64>() as usize * 2;
+    for tensor in tensors {
+        let width = match tensor.dtype {
+            "BF16" | "F16" | "I16" | "U16" => 2,
+            "F32" | "I32" | "U32" => 4,
+            dtype => panic!("unsupported synthetic model dtype {dtype}"),
+        };
+        let bytes = tensor.shape.iter().product::<u64>() as usize * width;
         let begin = data.len();
         data.resize(begin + bytes, 0);
         root.insert(
-            name.clone(),
+            tensor.name.clone(),
             serde_json::json!({
-                "dtype": "BF16",
-                "shape": shape,
+                "dtype": tensor.dtype,
+                "shape": tensor.shape,
                 "data_offsets": [begin, begin + bytes],
             }),
         );
@@ -177,6 +387,178 @@ fn write_zero_bf16_model(path: &Path, tensors: &[(String, Vec<u64>)]) {
     write_raw(path, serde_json::Value::Object(root), &data);
 }
 
+fn tiny_model_tensors(layers: usize) -> Vec<TinyTensor> {
+    const HIDDEN: u64 = 8;
+    const FFN: u64 = 12;
+    const VOCAB: u64 = 16;
+    const CODEBOOKS: u64 = 2;
+    const DEPTH_DIM: u64 = 8;
+    const DEPTH_FFN: u64 = 256;
+    const DEPTH_VOCAB: u64 = 2049;
+    let tensor = |name: String, shape: Vec<u64>| TinyTensor {
+        name,
+        dtype: "BF16",
+        shape,
+    };
+    let mut tensors = vec![
+        tensor("lfm.embed_tokens.weight".into(), vec![VOCAB, HIDDEN]),
+        tensor("lfm.embedding_norm.weight".into(), vec![HIDDEN]),
+        tensor(
+            "audio_embedding.embedding.weight".into(),
+            vec![CODEBOOKS * 2049, HIDDEN],
+        ),
+    ];
+    for layer in 0..layers {
+        let root = format!("lfm.layers.{layer}.");
+        tensors.extend([
+            tensor(format!("{root}operator_norm.weight"), vec![HIDDEN]),
+            tensor(format!("{root}ffn_norm.weight"), vec![HIDDEN]),
+            tensor(format!("{root}feed_forward.w1.weight"), vec![FFN, HIDDEN]),
+            tensor(format!("{root}feed_forward.w3.weight"), vec![FFN, HIDDEN]),
+            tensor(format!("{root}feed_forward.w2.weight"), vec![HIDDEN, FFN]),
+        ]);
+    }
+    let attention = "lfm.layers.0.self_attn.";
+    tensors.extend([
+        tensor(format!("{attention}q_proj.weight"), vec![HIDDEN, HIDDEN]),
+        tensor(format!("{attention}k_proj.weight"), vec![4, HIDDEN]),
+        tensor(format!("{attention}v_proj.weight"), vec![4, HIDDEN]),
+        tensor(format!("{attention}out_proj.weight"), vec![HIDDEN, HIDDEN]),
+        tensor(format!("{attention}q_layernorm.weight"), vec![4]),
+        tensor(format!("{attention}k_layernorm.weight"), vec![4]),
+    ]);
+    for layer in 1..layers {
+        let conv = format!("lfm.layers.{layer}.conv.");
+        tensors.extend([
+            tensor(format!("{conv}in_proj.weight"), vec![3 * HIDDEN, HIDDEN]),
+            tensor(format!("{conv}conv.weight"), vec![HIDDEN, 1, 3]),
+            tensor(format!("{conv}out_proj.weight"), vec![HIDDEN, HIDDEN]),
+        ]);
+    }
+    let depth = "depthformer.layers.0.";
+    tensors.extend([
+        tensor(
+            format!("{depth}operator.qkv_proj.weight"),
+            vec![16, DEPTH_DIM],
+        ),
+        tensor(
+            format!("{depth}operator.out_proj.weight"),
+            vec![DEPTH_DIM, DEPTH_DIM],
+        ),
+        tensor(
+            format!("{depth}operator.bounded_attention.q_layernorm.weight"),
+            vec![4],
+        ),
+        tensor(
+            format!("{depth}operator.bounded_attention.k_layernorm.weight"),
+            vec![4],
+        ),
+        tensor(format!("{depth}operator_norm.weight"), vec![DEPTH_DIM]),
+        tensor(format!("{depth}ffn_norm.weight"), vec![DEPTH_DIM]),
+        tensor(
+            format!("{depth}feed_forward.w1.weight"),
+            vec![DEPTH_FFN, DEPTH_DIM],
+        ),
+        tensor(
+            format!("{depth}feed_forward.w3.weight"),
+            vec![DEPTH_FFN, DEPTH_DIM],
+        ),
+        tensor(
+            format!("{depth}feed_forward.w2.weight"),
+            vec![DEPTH_DIM, DEPTH_FFN],
+        ),
+        tensor(
+            "depth_linear.weight".into(),
+            vec![CODEBOOKS * DEPTH_DIM, HIDDEN],
+        ),
+        tensor("depth_linear.bias".into(), vec![CODEBOOKS * DEPTH_DIM]),
+    ]);
+    for codebook in 0..CODEBOOKS {
+        let root = format!("depth_embeddings.{codebook}.");
+        tensors.extend([
+            tensor(
+                format!("{root}embedding.weight"),
+                vec![DEPTH_VOCAB, DEPTH_DIM],
+            ),
+            tensor(format!("{root}embedding_norm.weight"), vec![DEPTH_DIM]),
+            tensor(
+                format!("{root}to_logits.weight"),
+                vec![DEPTH_VOCAB, DEPTH_DIM],
+            ),
+        ]);
+    }
+    tensors
+}
+
+fn write_tiny_model(temp: &Temp, layers: usize, mutate: impl FnOnce(&mut Vec<TinyTensor>)) {
+    let mut tensors = tiny_model_tensors(layers);
+    mutate(&mut tensors);
+    write_zero_model(&temp.0.join("model.safetensors"), &tensors);
+    let types = (0..layers)
+        .map(|layer| if layer == 0 { "full_attention" } else { "conv" })
+        .collect::<Vec<_>>();
+    std::fs::write(
+        temp.0.join("config.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "codebooks": 2,
+            "depthformer": {
+                "layers": 1,
+                "dim": 8,
+                "heads": 2,
+                "kv_heads": 1
+            },
+            "lfm": {
+                "vocab_size": 16,
+                "hidden_size": 8,
+                "num_hidden_layers": layers,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 1,
+                "norm_eps": 1e-5,
+                "max_position_embeddings": 32,
+                "conv_L_cache": 3,
+                "layer_types": types,
+                "block_ff_dim": 12,
+                "block_auto_adjust_ff_dim": false
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+fn open_tiny_model(temp: &Temp) -> (*mut c_void, *mut NativeModel, i32, String) {
+    let engine = unsafe { lfm_engine_new(2) };
+    assert!(!engine.is_null());
+    let path = CString::new(temp.0.as_os_str().as_encoded_bytes()).unwrap();
+    let mut model = std::ptr::null_mut();
+    let mut error = [0i8; 512];
+    let status = unsafe {
+        lfm_model_open(
+            engine,
+            path.as_ptr(),
+            &mut model,
+            error.as_mut_ptr(),
+            error.len(),
+        )
+    };
+    let message = unsafe { CStr::from_ptr(error.as_ptr()) }
+        .to_string_lossy()
+        .into_owned();
+    (engine, model, status, message)
+}
+
+fn assert_tiny_model_rejected(temp: &Temp, message: &str) {
+    let (engine, model, status, error) = open_tiny_model(temp);
+    assert_ne!(status, 0, "invalid model unexpectedly opened");
+    assert!(model.is_null(), "failed model open published a handle");
+    assert!(
+        error.contains(message),
+        "expected error containing {message:?}, got status {status}: {error}"
+    );
+    unsafe { lfm_engine_free(engine) };
+}
+
+#[derive(Debug)]
 struct Image(*mut WeightImage);
 
 impl Image {
@@ -267,146 +649,619 @@ fn native_file_is_one_aligned_image_with_stable_views() {
 }
 
 #[test]
-fn opaque_native_model_and_conversation_own_the_complete_token_state() {
+#[cfg(unix)]
+fn published_image_is_process_read_only() {
     let temp = Temp::new();
-    let hidden = 8u64;
-    let ffn = 12u64;
-    let vocab = 16u64;
-    let codebooks = 2u64;
-    let mut tensors = vec![
-        ("lfm.embed_tokens.weight".into(), vec![vocab, hidden]),
-        ("lfm.embedding_norm.weight".into(), vec![hidden]),
-    ];
-    for layer in 0..2 {
-        let root = format!("lfm.layers.{layer}.");
-        tensors.extend([
-            (format!("{root}operator_norm.weight"), vec![hidden]),
-            (format!("{root}ffn_norm.weight"), vec![hidden]),
-            (format!("{root}feed_forward.w1.weight"), vec![ffn, hidden]),
-            (format!("{root}feed_forward.w3.weight"), vec![ffn, hidden]),
-            (format!("{root}feed_forward.w2.weight"), vec![hidden, ffn]),
-        ]);
-    }
-    let attention = "lfm.layers.0.self_attn.";
-    tensors.extend([
-        (format!("{attention}q_proj.weight"), vec![hidden, hidden]),
-        (format!("{attention}k_proj.weight"), vec![4, hidden]),
-        (format!("{attention}v_proj.weight"), vec![4, hidden]),
-        (format!("{attention}out_proj.weight"), vec![hidden, hidden]),
-        (format!("{attention}q_layernorm.weight"), vec![4]),
-        (format!("{attention}k_layernorm.weight"), vec![4]),
-    ]);
-    let conv = "lfm.layers.1.conv.";
-    tensors.extend([
-        (format!("{conv}in_proj.weight"), vec![3 * hidden, hidden]),
-        (format!("{conv}conv.weight"), vec![hidden, 1, 3]),
-        (format!("{conv}out_proj.weight"), vec![hidden, hidden]),
-    ]);
-    let depth_dim = 8u64;
-    let depth_ffn = 256u64;
-    let depth_qkv = 16u64;
-    let depth_vocab = 11u64;
-    let depth = "depthformer.layers.0.";
-    tensors.extend([
-        (
-            format!("{depth}operator.qkv_proj.weight"),
-            vec![depth_qkv, depth_dim],
-        ),
-        (
-            format!("{depth}operator.out_proj.weight"),
-            vec![depth_dim, depth_dim],
-        ),
-        (
-            format!("{depth}operator.bounded_attention.q_layernorm.weight"),
-            vec![4],
-        ),
-        (
-            format!("{depth}operator.bounded_attention.k_layernorm.weight"),
-            vec![4],
-        ),
-        (format!("{depth}operator_norm.weight"), vec![depth_dim]),
-        (format!("{depth}ffn_norm.weight"), vec![depth_dim]),
-        (
-            format!("{depth}feed_forward.w1.weight"),
-            vec![depth_ffn, depth_dim],
-        ),
-        (
-            format!("{depth}feed_forward.w3.weight"),
-            vec![depth_ffn, depth_dim],
-        ),
-        (
-            format!("{depth}feed_forward.w2.weight"),
-            vec![depth_dim, depth_ffn],
-        ),
-        (
-            "depth_linear.weight".into(),
-            vec![codebooks * depth_dim, hidden],
-        ),
-        ("depth_linear.bias".into(), vec![codebooks * depth_dim]),
-    ]);
-    for codebook in 0..codebooks {
-        let root = format!("depth_embeddings.{codebook}.");
-        tensors.extend([
-            (
-                format!("{root}embedding.weight"),
-                vec![depth_vocab, depth_dim],
-            ),
-            (format!("{root}embedding_norm.weight"), vec![depth_dim]),
-            (
-                format!("{root}to_logits.weight"),
-                vec![depth_vocab, depth_dim],
-            ),
-        ]);
-    }
-    write_zero_bf16_model(&temp.0.join("model.safetensors"), &tensors);
-    std::fs::write(
-        temp.0.join("config.json"),
-        serde_json::to_vec(&serde_json::json!({
-            "codebooks": codebooks,
-            "depthformer": {
-                "layers": 1,
-                "dim": depth_dim,
-                "heads": 2,
-                "kv_heads": 1
-            },
-            "lfm": {
-                "vocab_size": vocab,
-                "hidden_size": hidden,
-                "num_hidden_layers": 2,
-                "num_attention_heads": 2,
-                "num_key_value_heads": 1,
-                "norm_eps": 1e-5,
-                "max_position_embeddings": 32,
-                "conv_L_cache": 3,
-                "layer_types": ["full_attention", "conv"],
-                "block_ff_dim": ffn,
-                "block_auto_adjust_ff_dim": false
-            }
-        }))
-        .unwrap(),
-    )
-    .unwrap();
+    let path = temp.0.join("weights.safetensors");
+    write_file(
+        &path,
+        &[Tensor {
+            name: "weight",
+            dtype: "BF16",
+            shape: &[2],
+            data: &[0x80, 0x3f, 0x00, 0x40],
+        }],
+    );
 
-    let engine = unsafe { lfm_engine_new(2) };
-    assert!(!engine.is_null());
+    let image = Image::open(&path).unwrap();
+    let base = unsafe { lfm_weights_data(image.0) };
+    assert!(!base.is_null());
+
+    // A child can probe the VM protection without taking down the test runner.
+    // It performs no allocator or lock work after fork: the first write must be
+    // rejected by the kernel because publication sealed the complete image.
+    let child = unsafe { libc::fork() };
+    assert!(child >= 0, "fork failed");
+    if child == 0 {
+        unsafe {
+            libc::memset(base.cast_mut(), 0xa5, 1);
+            libc::_exit(0);
+        }
+    }
+
+    let mut status = 0;
+    assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+    assert!(
+        libc::WIFSIGNALED(status),
+        "write unexpectedly succeeded: {status}"
+    );
+    let signal = libc::WTERMSIG(status);
+    assert!(
+        signal == libc::SIGSEGV || signal == libc::SIGBUS,
+        "read-only write terminated with signal {signal}"
+    );
+}
+
+#[test]
+fn bundle_scopes_duplicate_names_and_uses_one_image() {
+    const MAIN: u32 = 1;
+    const CODEC: u32 = 2;
+
+    let temp = Temp::new();
+    let main = temp.0.join("model.safetensors");
+    let codec = temp.0.join("tokenizer-e351c8d8-checkpoint125.safetensors");
+    let main_data = 1.25f32.to_le_bytes();
+    let codec_data = (-3.5f32).to_le_bytes();
+    write_file(
+        &main,
+        &[Tensor {
+            name: "shared.weight",
+            dtype: "F32",
+            shape: &[1],
+            data: &main_data,
+        }],
+    );
+    write_file(
+        &codec,
+        &[Tensor {
+            name: "shared.weight",
+            dtype: "F32",
+            shape: &[1],
+            data: &codec_data,
+        }],
+    );
+
+    let main_c = CString::new(main.as_os_str().as_encoded_bytes()).unwrap();
+    let codec_c = CString::new(codec.as_os_str().as_encoded_bytes()).unwrap();
+    let mut raw = std::ptr::null_mut();
+    let mut err = [0i8; 512];
+    assert_eq!(
+        unsafe {
+            lfm_weights_open_bundle(
+                main_c.as_ptr(),
+                codec_c.as_ptr(),
+                &mut raw,
+                err.as_mut_ptr(),
+                err.len(),
+            )
+        },
+        OK,
+        "{}",
+        unsafe { CStr::from_ptr(err.as_ptr()) }.to_string_lossy()
+    );
+    let image = Image(raw);
+    assert_eq!(unsafe { lfm_weights_count(image.0) }, 1);
+    assert_eq!(unsafe { lfm_weights_component_count(image.0, MAIN) }, 1);
+    assert_eq!(unsafe { lfm_weights_component_count(image.0, CODEC) }, 1);
+
+    let name = CString::new("shared.weight").unwrap();
+    let mut main_view = TensorView::default();
+    let mut codec_view = TensorView::default();
+    assert_eq!(
+        unsafe { lfm_weights_find(image.0, name.as_ptr(), &mut main_view) },
+        OK
+    );
+    assert_eq!(
+        unsafe { lfm_weights_find_component(image.0, CODEC, name.as_ptr(), &mut codec_view) },
+        OK
+    );
+    assert_ne!(main_view.data, codec_view.data);
+    assert_eq!(
+        unsafe { std::slice::from_raw_parts(main_view.data.cast::<u8>(), 4) },
+        main_data
+    );
+    assert_eq!(
+        unsafe { std::slice::from_raw_parts(codec_view.data.cast::<u8>(), 4) },
+        codec_data
+    );
+    let base = unsafe { lfm_weights_data(image.0) } as usize;
+    let resident = unsafe { lfm_weights_resident_bytes(image.0) } as usize;
+    assert!((main_view.data as usize) >= base);
+    assert!((codec_view.data as usize) < base + resident);
+
+    let open_benchmark = |workers| {
+        let mut raw = std::ptr::null_mut();
+        let mut error = [0i8; 512];
+        assert_eq!(
+            unsafe {
+                lfm_internal_weights_open_bundle_benchmark(
+                    main_c.as_ptr(),
+                    codec_c.as_ptr(),
+                    workers,
+                    0,
+                    &mut raw,
+                    error.as_mut_ptr(),
+                    error.len(),
+                )
+            },
+            OK,
+            "{}",
+            unsafe { CStr::from_ptr(error.as_ptr()) }.to_string_lossy()
+        );
+        Image(raw)
+    };
+    let serial = open_benchmark(1);
+    let parallel = open_benchmark(4);
+    let mut serial_stats = LoadStats::default();
+    let mut parallel_stats = LoadStats::default();
+    assert_eq!(
+        unsafe { lfm_weights_load_stats(serial.0, &mut serial_stats) },
+        OK
+    );
+    assert_eq!(
+        unsafe { lfm_weights_load_stats(parallel.0, &mut parallel_stats) },
+        OK
+    );
+    assert_eq!(serial_stats.worker_count, 1);
+    assert_eq!(parallel_stats.worker_count, 2);
+    assert_eq!(serial_stats.task_count, 2);
+    assert_eq!(parallel_stats.task_count, 2);
+    let serial_bytes = unsafe {
+        std::slice::from_raw_parts(
+            lfm_weights_data(serial.0).cast::<u8>(),
+            lfm_weights_resident_bytes(serial.0) as usize,
+        )
+    };
+    let parallel_bytes = unsafe {
+        std::slice::from_raw_parts(
+            lfm_weights_data(parallel.0).cast::<u8>(),
+            lfm_weights_resident_bytes(parallel.0) as usize,
+        )
+    };
+    assert_eq!(serial_bytes, parallel_bytes);
+}
+
+#[test]
+fn mimi_weight_leaves_read_unaligned_checkpoint_bytes_without_staging() {
+    let values = [1.5f32, -2.0, 0.25, 4.0, -1.0, 3.5];
+    let mut storage = vec![0xabu8];
+    storage.extend(values.iter().flat_map(|value| value.to_le_bytes()));
+    let weights = unsafe { storage.as_ptr().add(1) };
+    assert_ne!((weights as usize) & (std::mem::align_of::<f32>() - 1), 0);
+    for (index, expected) in values.iter().enumerate() {
+        assert_eq!(
+            unsafe { mimi_weight_load_f32(weights, index as u64) }.to_bits(),
+            expected.to_bits()
+        );
+    }
+
+    // W [2,3] * x [3].
+    let input = [2.0f32, -1.0, 0.5];
+    let mut output = [0.0f32; 2];
+    unsafe {
+        mimi_weight_gemv_f32(
+            weights,
+            input.as_ptr(),
+            std::ptr::null(),
+            output.as_mut_ptr(),
+            2,
+            3,
+        )
+    };
+    assert_eq!(output, [5.125, 10.75]);
+
+    // The same bytes viewed as W [K=2, rows=3], compute W^T * B [2,1].
+    let input = [2.0f32, -1.0];
+    let mut output = [0.0f32; 3];
+    unsafe { mimi_weight_gemm_tn_f32(weights, input.as_ptr(), output.as_mut_ptr(), 3, 2, 1) };
+    assert_eq!(output, [-1.0, -3.0, -3.0]);
+}
+
+#[test]
+fn bf16_unlift_is_bit_exact_from_unaligned_checkpoint_bytes() {
+    // +0, -0, the smallest subnormal, +/-infinity, and two NaN payloads.
+    let words = [0x0000u16, 0x8000, 0x0001, 0x7f80, 0xff80, 0x7f81, 0xffff];
+    let mut bytes = vec![0x5au8];
+    bytes.extend(words.iter().flat_map(|word| word.to_le_bytes()));
+
+    for (index, word) in words.into_iter().enumerate() {
+        let source = unsafe { bytes.as_ptr().add(1 + index * 2) };
+        assert_ne!((source as usize) & 1, 0);
+        assert_eq!(
+            unsafe { lfm_bf16_unlift_bits(source.cast()) },
+            u32::from(word) << 16
+        );
+    }
+}
+
+#[test]
+fn parallel_read_is_byte_exact_across_chunks_and_zeroes_only_padding() {
+    const CHUNK: usize = 8 * 1024 * 1024;
+
+    let temp = Temp::new();
+    let first = temp.0.join("model-00001-of-00002.safetensors");
+    let second = temp.0.join("model-00002-of-00002.safetensors");
+    let a = (0..2 * CHUNK + 37)
+        .map(|i| (i.wrapping_mul(31).wrapping_add(7) & 0xff) as u8)
+        .collect::<Vec<_>>();
+    let b = (0..CHUNK + 113)
+        .map(|i| (i.wrapping_mul(17).wrapping_add(19) & 0xff) as u8)
+        .collect::<Vec<_>>();
+    write_file(
+        &first,
+        &[Tensor {
+            name: "model.a",
+            dtype: "U8",
+            shape: &[a.len() as u64],
+            data: &a,
+        }],
+    );
+    write_file(
+        &second,
+        &[Tensor {
+            name: "model.b",
+            dtype: "U8",
+            shape: &[b.len() as u64],
+            data: &b,
+        }],
+    );
+
+    let first_file = std::fs::read(&first).unwrap();
+    let second_file = std::fs::read(&second).unwrap();
+    let image = Image::open(&temp.0).unwrap();
+    let base = unsafe { lfm_weights_data(image.0) }.cast::<u8>();
+    let resident = unsafe { lfm_weights_resident_bytes(image.0) } as usize;
+    let bytes = unsafe { std::slice::from_raw_parts(base, resident) };
+    let a_view = image.find("model.a").unwrap();
+    let b_view = image.find("model.b").unwrap();
+    let mut stats = LoadStats::default();
+    assert_eq!(unsafe { lfm_weights_load_stats(image.0, &mut stats) }, OK);
+    assert_eq!(stats.size as usize, std::mem::size_of::<LoadStats>());
+    assert_eq!(stats.abi_version, WEIGHT_ABI);
+    assert_eq!(
+        stats.source_bytes,
+        (first_file.len() + second_file.len()) as u64
+    );
+    assert_eq!(stats.resident_bytes, resident as u64);
+    let tasks = (first_file.len() + CHUNK - 1) / CHUNK + (second_file.len() + CHUNK - 1) / CHUNK;
+    assert_eq!(stats.task_count, tasks as u32);
+    assert_eq!(stats.worker_count, tasks.min(4) as u32);
+
+    assert!(
+        unsafe { std::slice::from_raw_parts(a_view.data.cast::<u8>(), a.len()) } == a.as_slice(),
+        "first payload changed across positioned-read chunks"
+    );
+    assert!(
+        unsafe { std::slice::from_raw_parts(b_view.data.cast::<u8>(), b.len()) } == b.as_slice(),
+        "second payload changed across positioned-read chunks"
+    );
+    assert!(
+        &bytes[..first_file.len()] == first_file.as_slice(),
+        "first complete source changed in the resident image"
+    );
+
+    let second_base = b_view.offset as usize - payload_start(&second);
+    assert_eq!(second_base & 63, 0);
+    assert!(bytes[first_file.len()..second_base]
+        .iter()
+        .all(|byte| *byte == 0));
+    assert!(
+        &bytes[second_base..second_base + second_file.len()] == second_file.as_slice(),
+        "second complete source changed in the resident image"
+    );
+    assert!(bytes[second_base + second_file.len()..]
+        .iter()
+        .all(|byte| *byte == 0));
+}
+
+#[test]
+fn concurrent_opens_publish_independent_complete_images() {
+    let temp = Temp::new();
+    let path = temp.0.join("model.safetensors");
+    let payload = (0usize..1024 * 1024 + 19)
+        .map(|index| (index.wrapping_mul(29).wrapping_add(11) & 0xff) as u8)
+        .collect::<Vec<_>>();
+    write_file(
+        &path,
+        &[Tensor {
+            name: "weight",
+            dtype: "U8",
+            shape: &[payload.len() as u64],
+            data: &payload,
+        }],
+    );
+
+    let start = Arc::new(Barrier::new(8));
+    let opened = Arc::new(Barrier::new(8));
+    let workers = (0..8)
+        .map(|_| {
+            let start = Arc::clone(&start);
+            let opened = Arc::clone(&opened);
+            let path = path.clone();
+            let expected = payload.clone();
+            std::thread::spawn(move || {
+                start.wait();
+                let image = Image::open(&path).expect("concurrent image open");
+                let view = image.find("weight").expect("concurrent tensor view");
+                let actual = unsafe {
+                    std::slice::from_raw_parts(view.data.cast::<u8>(), view.bytes as usize)
+                };
+                assert_eq!(actual, expected);
+                let base = unsafe { lfm_weights_data(image.0) as usize };
+                opened.wait();
+                base
+            })
+        })
+        .collect::<Vec<_>>();
+    let bases = workers
+        .into_iter()
+        .map(|worker| worker.join().expect("concurrent loader worker"))
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(bases.len(), 8, "each open must own its own final image");
+}
+
+#[test]
+fn changed_source_and_read_failure_join_the_complete_read_team() {
+    const CHUNK: usize = 8 * 1024 * 1024;
+
+    let temp = Temp::new();
+    let failed = temp.0.join("failed.safetensors");
+    let payload = vec![0x5au8; CHUNK + 1];
+    write_file(
+        &failed,
+        &[Tensor {
+            name: "weight",
+            dtype: "U8",
+            shape: &[payload.len() as u64],
+            data: &payload,
+        }],
+    );
+
+    let invoke = |path: &Path, mode| {
+        let path = CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        let mut scheduled = 0;
+        let mut completed = 0;
+        let mut error = [0i8; 512];
+        let status = unsafe {
+            lfm_internal_weights_open_fault_test(
+                path.as_ptr(),
+                mode,
+                &mut scheduled,
+                &mut completed,
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        (
+            status,
+            scheduled,
+            completed,
+            unsafe { CStr::from_ptr(error.as_ptr()) }
+                .to_string_lossy()
+                .into_owned(),
+        )
+    };
+
+    let (status, scheduled, completed, message) = invoke(&failed, 1);
+    assert_eq!(status, IO);
+    assert_eq!(scheduled, 2, "fixture must cross one 8 MiB boundary");
+    assert_eq!(
+        completed, scheduled,
+        "loader returned before every read task terminated"
+    );
+    assert!(message.contains("injected positioned-read failure"));
+
+    let changed = temp.0.join("changed.safetensors");
+    write_file(
+        &changed,
+        &[Tensor {
+            name: "weight",
+            dtype: "U8",
+            shape: &[32],
+            data: &[0x33; 32],
+        }],
+    );
+    let bytes = std::fs::metadata(&changed).unwrap().len();
+    let (status, scheduled, completed, message) = invoke(&changed, 2);
+    assert_eq!(status, IO);
+    assert_eq!(
+        completed, scheduled,
+        "source verification ran before the read team joined"
+    );
+    assert_eq!(std::fs::metadata(&changed).unwrap().len(), bytes + 1);
+    assert!(message.contains("file changed while loading"));
+}
+
+#[test]
+fn truncated_sources_and_shape_arithmetic_overflow_fail_closed() {
+    let temp = Temp::new();
+    let truncated = temp.0.join("truncated.safetensors");
+    write_file(
+        &truncated,
+        &[Tensor {
+            name: "weight",
+            dtype: "BF16",
+            shape: &[2],
+            data: &[0, 0, 0, 0],
+        }],
+    );
+    let bytes = std::fs::metadata(&truncated).unwrap().len();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&truncated)
+        .unwrap()
+        .set_len(bytes - 1)
+        .unwrap();
+    assert_eq!(
+        Image::open(&truncated)
+            .err()
+            .expect("truncated source accepted")
+            .0,
+        FORMAT
+    );
+
+    let overflow = temp.0.join("overflow.safetensors");
+    write_raw(
+        &overflow,
+        serde_json::json!({
+            "weight": {
+                "dtype": "BF16",
+                "shape": [u64::MAX, 2],
+                "data_offsets": [0, 0]
+            }
+        }),
+        &[],
+    );
+    let (status, message) = Image::open(&overflow)
+        .err()
+        .expect("overflowing tensor shape accepted");
+    assert_eq!(status, FORMAT);
+    assert!(message.contains("overflow"), "unexpected error: {message}");
+}
+
+#[test]
+fn model_schema_rejects_wrong_dtype_with_the_same_element_count() {
+    let temp = Temp::new();
+    write_tiny_model(&temp, 2, |tensors| {
+        tensors
+            .iter_mut()
+            .find(|tensor| tensor.name == "lfm.layers.0.operator_norm.weight")
+            .expect("operator norm fixture")
+            .dtype = "F16";
+    });
+    assert_tiny_model_rejected(
+        &temp,
+        "model tensor 'lfm.layers.0.operator_norm.weight' has the wrong dtype or rank",
+    );
+}
+
+#[test]
+fn model_schema_rejects_swapped_dimensions_with_the_same_element_count() {
+    let temp = Temp::new();
+    write_tiny_model(&temp, 2, |tensors| {
+        tensors
+            .iter_mut()
+            .find(|tensor| tensor.name == "lfm.layers.0.feed_forward.w1.weight")
+            .expect("FFN w1 fixture")
+            .shape = vec![8, 12];
+    });
+    assert_tiny_model_rejected(
+        &temp,
+        "model tensor 'lfm.layers.0.feed_forward.w1.weight' has the wrong shape",
+    );
+}
+
+#[test]
+fn model_schema_rejects_a_missing_middle_layer() {
+    let temp = Temp::new();
+    write_tiny_model(&temp, 3, |tensors| {
+        let index = tensors
+            .iter()
+            .position(|tensor| tensor.name == "lfm.layers.1.operator_norm.weight")
+            .expect("middle-layer norm fixture");
+        tensors.remove(index);
+    });
+    assert_tiny_model_rejected(
+        &temp,
+        "missing model tensor 'lfm.layers.1.operator_norm.weight'",
+    );
+}
+
+#[test]
+fn model_schema_rejects_short_or_extra_layer_type_entries() {
+    for types in [
+        serde_json::json!(["full_attention"]),
+        serde_json::json!(["full_attention", "conv", "conv"]),
+    ] {
+        let temp = Temp::new();
+        write_tiny_model(&temp, 2, |_| {});
+        let path = temp.0.join("config.json");
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        config["lfm"]["layer_types"] = types;
+        std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        assert_tiny_model_rejected(
+            &temp,
+            "lfm.layer_types length does not match num_hidden_layers",
+        );
+    }
+}
+
+#[test]
+fn model_schema_rejects_audio_vocabulary_codebook_mismatch() {
+    let temp = Temp::new();
+    write_tiny_model(&temp, 2, |tensors| {
+        tensors
+            .iter_mut()
+            .find(|tensor| tensor.name == "audio_embedding.embedding.weight")
+            .expect("audio embedding fixture")
+            .shape = vec![2 * 2049 - 1, 8];
+    });
+    assert_tiny_model_rejected(
+        &temp,
+        "audio embedding vocabulary does not match configured codebooks",
+    );
+}
+
+#[test]
+fn runtime_rejects_incomplete_voice_model_without_retaining_a_child() {
+    let temp = Temp::new();
+    write_tiny_model(&temp, 2, |_| {});
+    let config = RuntimeConfig {
+        size: std::mem::size_of::<RuntimeConfig>() as u32,
+        abi_version: RUNTIME_ABI,
+        coordination_workers: 1,
+        kernel_lanes: 2,
+        event_capacity: 2,
+        session_capacity: 1,
+        reserved0: 0,
+        reserved1: 0,
+        flags: 0,
+        reserved: [0; 4],
+    };
+    let mut runtime = std::ptr::null_mut();
+    assert_eq!(unsafe { lfm_runtime_create(&config, &mut runtime) }, 0);
+    assert_eq!(unsafe { lfm_runtime_start(runtime) }, 0);
     let path = CString::new(temp.0.as_os_str().as_encoded_bytes()).unwrap();
     let mut model = std::ptr::null_mut();
     let mut error = [0i8; 512];
-    let status = unsafe {
-        lfm_model_open(
-            engine,
-            path.as_ptr(),
-            &mut model,
-            error.as_mut_ptr(),
-            error.len(),
-        )
-    };
     assert_eq!(
-        status,
-        0,
-        "native model open failed: {}",
-        unsafe { CStr::from_ptr(error.as_ptr()) }.to_string_lossy()
+        unsafe {
+            lfm_runtime_model_open(
+                runtime,
+                path.as_ptr(),
+                &mut model,
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        },
+        INVALID
     );
+    assert!(model.is_null());
+    let message = unsafe { CStr::from_ptr(error.as_ptr()) }.to_string_lossy();
+    assert!(
+        message.contains("complete native LFM2 voice model"),
+        "unexpected lifecycle rejection: {message}"
+    );
+    let mut snapshot = RuntimeSnapshot {
+        size: std::mem::size_of::<RuntimeSnapshot>() as u32,
+        abi_version: RUNTIME_ABI,
+        ..Default::default()
+    };
+    assert_eq!(unsafe { lfm_runtime_snapshot(runtime, &mut snapshot) }, 0);
+    assert_eq!(snapshot.live_models, 0);
+    unsafe { lfm_runtime_request_stop(runtime) };
+    assert_eq!(unsafe { lfm_runtime_join(runtime) }, 0);
+    assert_eq!(unsafe { lfm_runtime_destroy(runtime) }, 0);
+}
+
+#[test]
+fn opaque_native_model_and_conversation_own_the_complete_token_state() {
+    let temp = Temp::new();
+    write_tiny_model(&temp, 2, |_| {});
+    let (engine, model, status, message) = open_tiny_model(&temp);
+    let mut error = [0i8; 512];
+    assert_eq!(status, 0, "native model open failed: {message}");
     assert!(!model.is_null());
     let mut info = ModelInfo {
         size: std::mem::size_of::<ModelInfo>() as u32,
@@ -424,37 +1279,137 @@ fn opaque_native_model_and_conversation_own_the_complete_token_state() {
     assert!(info.depth_plan_id > 0);
     assert_eq!(info.capabilities & 1, 1);
     assert!(info.resident_bytes > 0);
+    let mut memory = ModelMemory {
+        size: std::mem::size_of::<ModelMemory>() as u32,
+        abi_version: MODEL_ABI,
+        ..Default::default()
+    };
+    assert_eq!(unsafe { lfm_model_memory(model, &mut memory) }, 0);
+    assert!(memory.source_bytes > 0);
+    assert_eq!(memory.resident_image_bytes, info.resident_bytes);
+    assert!(memory.directly_bound_bytes > 0);
+    assert_eq!(memory.compatibility_copied_bytes, 0);
+    assert!(memory.load_ns > 0);
+    assert!(memory.load_workers > 0);
+    assert!(memory.load_tasks > 0);
+
+    let sampler = SamplerConfig {
+        size: std::mem::size_of::<SamplerConfig>() as u32,
+        abi_version: 1,
+        flags: 1,
+        top_k: 0,
+        temperature: 1.0,
+        reserved: 0,
+    };
+    let config = ConversationConfig {
+        size: std::mem::size_of::<ConversationConfig>() as u32,
+        abi_version: MODEL_ABI,
+        flags: 0,
+        reserved0: 0,
+        seed: 7,
+        text_sampler: sampler,
+        audio_sampler: sampler,
+        reserved: [0; 4],
+    };
+    let mut conversations = [std::ptr::null_mut(); 2];
+    for conversation in &mut conversations {
+        error.fill(0);
+        assert_eq!(
+            unsafe {
+                lfm_conversation_create(
+                    model,
+                    &config,
+                    conversation,
+                    error.as_mut_ptr(),
+                    error.len(),
+                )
+            },
+            0,
+            "native conversation failed: {}",
+            unsafe { CStr::from_ptr(error.as_ptr()) }.to_string_lossy()
+        );
+    }
+
+    // Both conversations share the one engine request slot. They must queue on
+    // the native expected-value ticket gate, not leak -EBUSY. Eighty passes also
+    // crosses the synthetic model's 32-row context and its 32-row runway, forcing
+    // one real KV compaction while externally visible positions stay monotonic.
+    let start = Arc::new(Barrier::new(2));
+    let threads: Vec<_> = conversations
+        .iter()
+        .map(|conversation| {
+            let pointer = *conversation as usize;
+            let start = start.clone();
+            std::thread::spawn(move || {
+                start.wait();
+                for expected in 0..80u64 {
+                    let id = 0u32;
+                    let mut result = TokenResult {
+                        size: std::mem::size_of::<TokenResult>() as u32,
+                        abi_version: MODEL_ABI,
+                        position: 0,
+                        sampled_token: 0,
+                        input_count: 0,
+                        embedding_kind: 0,
+                        flags: 0,
+                        reserved: [0; 4],
+                    };
+                    assert_eq!(
+                        unsafe {
+                            lfm_conversation_step(
+                                pointer as *mut NativeConversation,
+                                &id,
+                                1,
+                                0,
+                                &mut result,
+                            )
+                        },
+                        0
+                    );
+                    assert_eq!(result.position, expected);
+                }
+            })
+        })
+        .collect();
+    for thread in threads {
+        thread.join().expect("shared-model conversation worker");
+    }
+    for conversation in conversations {
+        assert_eq!(unsafe { lfm_conversation_close(conversation) }, 0);
+    }
 
     assert_eq!(unsafe { lfm_model_close(model) }, 0);
     unsafe { lfm_engine_free(engine) };
-
-    let model = liquid_audio::NativeModel::open(&temp.0).expect("safe opaque model");
-    let safe_info = model.info().expect("safe model info");
-    assert_eq!((safe_info.hidden, safe_info.layers), (8, 2));
-    assert!(safe_info.depthformer);
-    let mut conversation = model
-        .conversation(liquid_audio::NativeConversationConfig {
-            seed: Some(7),
-            temperature: None,
-            top_k: None,
-        })
-        .expect("native conversation");
-    let first = conversation
-        .step(&[3], liquid_audio::EmbeddingKind::Text)
-        .expect("first native token pass");
-    assert_eq!((first.position, first.sampled_token), (0, 0));
-    let second = conversation
-        .step(&[first.sampled_token], liquid_audio::EmbeddingKind::Text)
-        .expect("second native token pass");
-    assert_eq!((second.position, second.sampled_token), (1, 0));
-    conversation.reset().expect("native conversation reset");
-    let reset = conversation
-        .step(&[3], liquid_audio::EmbeddingKind::Text)
-        .expect("reset native token pass");
-    assert_eq!((reset.position, reset.sampled_token), (0, 0));
 }
 
 #[test]
+#[ignore = "requires LFM_MODEL_DIR and the complete LFM2-Audio plus Mimi checkpoint"]
+fn complete_runtime_model_reports_lifecycle_only_memory_accounting() {
+    let dir = PathBuf::from(
+        std::env::var_os("LFM_MODEL_DIR")
+            .expect("LFM_MODEL_DIR must name the complete LFM2-Audio checkpoint"),
+    );
+    let model = liquid_audio::NativeVoiceModel::open(&dir).expect("complete native voice model");
+    let first = model.memory().expect("native lifecycle memory report");
+    let second = model
+        .memory()
+        .expect("repeat native lifecycle memory report");
+    assert_eq!(
+        first, second,
+        "immutable model accounting changed after open"
+    );
+    assert!(first.source_bytes > 0);
+    assert!(first.resident_image_bytes >= first.source_bytes);
+    assert!(first.directly_bound_bytes > 0);
+    assert_eq!(first.compatibility_copied_bytes, 0);
+    assert!(first.load_ns > 0);
+    assert!((1..=4).contains(&first.load_workers));
+    assert!(first.load_tasks > 0);
+}
+
+#[test]
+#[cfg(feature = "oracle")]
+#[ignore = "requires LFM_MODEL_DIR and the real LFM2.5-Audio checkpoint"]
 fn native_audio_prefill_matches_discrete_for_the_same_embedding() {
     // The native audio-in prefill (`embed_kind == 2`, a provided embedding VIEW —
     // the shape the Conformer/adapter output will use) must produce the SAME
@@ -462,12 +1417,12 @@ fn native_audio_prefill_matches_discrete_for_the_same_embedding() {
     // same embedding: the text token's own `embed_tokens` row. Proven end-to-end
     // through the native conversation (C++ owns the prefill loop), greedy so the
     // sampler cannot diverge. This is the parity the eventual native prefill rests
-    // on. Skips without the real checkpoint.
-    let Ok(dir) = std::env::var("LFM_MODEL_DIR") else {
-        eprintln!("LFM_MODEL_DIR unset — native audio-in prefill parity skipped");
-        return;
-    };
-    let dir = PathBuf::from(dir);
+    // on. Checkpoint-free CI ignores this gate explicitly; a requested run fails
+    // rather than being reported as a pass.
+    let dir = PathBuf::from(
+        std::env::var_os("LFM_MODEL_DIR")
+            .expect("LFM_MODEL_DIR must name the real LFM2.5-Audio checkpoint"),
+    );
     let model = liquid_audio::NativeModel::open(&dir).expect("native model");
     let hidden = model.info().expect("model info").hidden as usize;
 
@@ -503,7 +1458,7 @@ fn native_audio_prefill_matches_discrete_for_the_same_embedding() {
 
     // Audio-in: embed_kind==2 with the identical embedding row, then probe.
     let mut b = model.conversation(cfg()).expect("conv b");
-    let pos = b.prefill_audio(&row, hidden).expect("b audio-in prefill");
+    let pos = b.prefill_audio(&row).expect("b audio-in prefill");
     assert_eq!(pos, 1, "one row prefilled → position advances by one");
     let tb = b
         .step(&[probe], liquid_audio::EmbeddingKind::Text)
@@ -517,6 +1472,7 @@ fn native_audio_prefill_matches_discrete_for_the_same_embedding() {
 }
 
 #[test]
+#[cfg(feature = "oracle")]
 fn rust_owner_drives_the_compatibility_builder_without_reopening_the_file() {
     let temp = Temp::new();
     let path = temp.0.join("weights.safetensors");
@@ -605,6 +1561,30 @@ fn checkpoint_index_loads_each_shard_into_the_same_image() {
     assert_ne!(first_view.shard, second_view.shard);
     assert_eq!(unsafe { *first_view.data.cast::<f32>() }, 3.0);
     assert_eq!(unsafe { *second_view.data.cast::<f32>() }, 7.0);
+
+    let resident = unsafe {
+        std::slice::from_raw_parts(
+            lfm_weights_data(image.0).cast::<u8>(),
+            lfm_weights_resident_bytes(image.0) as usize,
+        )
+    }
+    .to_vec();
+    std::fs::write(
+        temp.0.join("model.safetensors.index.json"),
+        br#"{"metadata":{"total_size":8},"weight_map":{"model.b":"model-00002-of-00002.safetensors","model.a":"model-00001-of-00002.safetensors"}}"#,
+    )
+    .unwrap();
+    let reordered = Image::open(&temp.0).unwrap();
+    let reordered_bytes = unsafe {
+        std::slice::from_raw_parts(
+            lfm_weights_data(reordered.0).cast::<u8>(),
+            lfm_weights_resident_bytes(reordered.0) as usize,
+        )
+    };
+    assert_eq!(
+        reordered_bytes, resident,
+        "index key order must not change the resident image digest"
+    );
 }
 
 #[test]
@@ -690,6 +1670,7 @@ fn indexed_view_iteration_uses_the_public_descriptor_surface() {
 
 #[test]
 #[ignore = "needs the repository LFM2.5-Audio fixture and about 3 GB of free memory"]
+#[cfg(feature = "oracle")]
 fn real_model_checkpoint_loads_without_candle() {
     let dir = workspace_model_dir();
     assert!(
@@ -728,6 +1709,7 @@ fn real_model_checkpoint_loads_without_candle() {
 
 #[test]
 #[ignore = "needs the repository LFM2.5-Audio fixture and about 8 GB of free memory"]
+#[cfg(feature = "oracle")]
 fn real_production_loader_retains_the_native_image() {
     let dir = workspace_model_dir();
     assert!(

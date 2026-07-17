@@ -73,37 +73,6 @@ static inline uint64_t xgetbv0() {
 // Do not use __builtin_cpu_supports here: Apple clang lowers its AVX-512 feature
 // query to GCC's ___cpu_features2 runtime symbol, which Darwin does not provide.
 // Check both hardware support and the OS-owned extended register state directly.
-static bool cpu_has_avx512_bf16() {
-    static const bool available = [] {
-        if (__get_cpuid_max(0, nullptr) < 7) return false;
-
-        uint32_t eax, ebx, ecx, edx;
-        __cpuid_count(1, 0, eax, ebx, ecx, edx);
-        constexpr uint32_t osxsave = 1u << 27;
-        constexpr uint32_t avx = 1u << 28;
-        if ((ecx & (osxsave | avx)) != (osxsave | avx)) return false;
-
-        // XMM, YMM, opmask, ZMM_hi256, and hi16_ZMM must all be OS-managed.
-        constexpr uint64_t zmm_state = 0xe6;
-        if ((xgetbv0() & zmm_state) != zmm_state) return false;
-
-        __cpuid_count(7, 0, eax, ebx, ecx, edx);
-        const uint32_t max_subleaf = eax;
-        constexpr uint32_t avx512f = 1u << 16;
-        constexpr uint32_t avx512bw = 1u << 30;
-        constexpr uint32_t avx512vl = 1u << 31;
-        if ((ebx & (avx512f | avx512bw | avx512vl)) !=
-            (avx512f | avx512bw | avx512vl) || max_subleaf < 1) {
-            return false;
-        }
-
-        __cpuid_count(7, 1, eax, ebx, ecx, edx);
-        constexpr uint32_t avx512bf16 = 1u << 5;
-        return (eax & avx512bf16) != 0;
-    }();
-    return available;
-}
-
 static bool cpu_has_avx2_fma() {
     static const bool available = [] {
         if (__get_cpuid_max(0, nullptr) < 7) return false;
@@ -125,55 +94,6 @@ static bool cpu_has_avx2_fma() {
     return available;
 }
 
-// --- AVX-512-BF16 path: VDPBF16PS microkernel, 16 output columns per row. ---
-// Ap[m][kpair] = u32 packing (A[m][2p] | A[m][2p+1]<<16), broadcast to 16 lanes.
-// Bp per 16-col block, per k-pair: 16 lanes × (B[2p][col] | B[2p+1][col]<<16).
-X86_TGT_BF16
-static void gemm_bf16_avx512(const uint16_t *A, const uint16_t *B, float *C,
-                             int M, int N, int K) {
-    const int Kp = (K + 1) & ~1, kp = Kp / 2;
-    const int Nb = (N + 15) / 16;
-    static thread_local std::vector<uint32_t> Ap; // [M][kp]
-    static thread_local std::vector<uint32_t> Bp; // [Nb][kp][16]
-    Ap.assign((size_t)M * kp, 0);
-    Bp.assign((size_t)Nb * kp * 16, 0);
-    for (int m = 0; m < M; m++)
-        for (int p = 0; p < kp; p++) {
-            uint32_t lo = (2 * p < K) ? A[(size_t)m * K + 2 * p] : 0;
-            uint32_t hi = (2 * p + 1 < K) ? A[(size_t)m * K + 2 * p + 1] : 0;
-            Ap[(size_t)m * kp + p] = lo | (hi << 16);
-        }
-    for (int nb = 0; nb < Nb; nb++)
-        for (int p = 0; p < kp; p++)
-            for (int c = 0; c < 16; c++) {
-                int n = nb * 16 + c;
-                if (n >= N) continue;
-                uint32_t lo = (2 * p < K) ? B[(size_t)(2 * p) * N + n] : 0;
-                uint32_t hi = (2 * p + 1 < K) ? B[(size_t)(2 * p + 1) * N + n] : 0;
-                Bp[((size_t)nb * kp + p) * 16 + c] = lo | (hi << 16);
-            }
-    for (int m = 0; m < M; m++) {
-        for (int nb = 0; nb < Nb; nb++) {
-            __m512 acc = _mm512_setzero_ps();
-            const uint32_t *bp = &Bp[((size_t)nb * kp) * 16];
-            const uint32_t *ap = &Ap[(size_t)m * kp];
-            for (int p = 0; p < kp; p++) {
-                __m512bh a = (__m512bh)_mm512_set1_epi32((int)ap[p]);
-                __m512bh b = (__m512bh)_mm512_loadu_si512((const void *)(bp + (size_t)p * 16));
-                acc = _mm512_dpbf16_ps(acc, a, b);
-            }
-            int n0 = nb * 16, cols = N - n0 < 16 ? N - n0 : 16;
-            if (cols == 16) {
-                _mm512_storeu_ps(&C[(size_t)m * N + n0], acc);
-            } else {
-                float tmp[16];
-                _mm512_storeu_ps(tmp, acc);
-                for (int c = 0; c < cols; c++) C[(size_t)m * N + n0 + c] = tmp[c];
-            }
-        }
-    }
-}
-
 // --- AVX2 baseline: upconvert bf16->f32 + FMA, 8 output columns per row. ---
 X86_TGT_AVX2
 static inline __m256 upconv8(const uint16_t *p) { // 8 bf16 -> 8 f32
@@ -181,27 +101,39 @@ static inline __m256 upconv8(const uint16_t *p) { // 8 bf16 -> 8 f32
     __m256i u32 = _mm256_cvtepu16_epi32(u16);
     return _mm256_castsi256_ps(_mm256_slli_epi32(u32, 16));
 }
+
+X86_TGT_AVX2
+static inline __m256 upconv8_bytes(const unsigned char *p) {
+    __m128i u16 = _mm_loadu_si128((const __m128i *)p);
+    __m256i u32 = _mm256_cvtepu16_epi32(u16);
+    return _mm256_castsi256_ps(_mm256_slli_epi32(u32, 16));
+}
+
+static inline uint16_t load_bf16_word(const unsigned char *bytes) {
+    uint16_t word;
+    memcpy(&word, bytes, sizeof(word));
+    return word;
+}
 X86_TGT_AVX2
 static void gemm_bf16_avx2(const uint16_t *A, const uint16_t *B, float *C,
                            int M, int N, int K) {
-    const int Nb = (N + 7) / 8;
-    static thread_local std::vector<uint16_t> Brow; // padded row of B: [K][Nb*8]
-    const int Np = Nb * 8;
-    Brow.assign((size_t)K * Np, 0);
-    for (int k = 0; k < K; k++)
-        for (int n = 0; n < N; n++) Brow[(size_t)k * Np + n] = B[(size_t)k * N + n];
     for (int m = 0; m < M; m++) {
-        for (int nb = 0; nb < Nb; nb++) {
-            __m256 acc = _mm256_setzero_ps();
-            for (int k = 0; k < K; k++) {
-                __m256 a = _mm256_set1_ps(bf16_to_f32(A[(size_t)m * K + k]));
-                __m256 b = upconv8(&Brow[(size_t)k * Np + nb * 8]);
-                acc = _mm256_fmadd_ps(a, b, acc);
+        float *row = C + (size_t)m * N;
+        memset(row, 0, (size_t)N * sizeof(float));
+        for (int k = 0; k < K; ++k) {
+            const __m256 a =
+                _mm256_set1_ps(bf16_to_f32(A[(size_t)m * K + k]));
+            const uint16_t *weights = B + (size_t)k * N;
+            int n = 0;
+            for (; n + 8 <= N; n += 8) {
+                const __m256 acc = _mm256_loadu_ps(row + n);
+                _mm256_storeu_ps(row + n,
+                                 _mm256_fmadd_ps(a, upconv8(weights + n), acc));
             }
-            int n0 = nb * 8, cols = N - n0 < 8 ? N - n0 : 8;
-            float tmp[8];
-            _mm256_storeu_ps(tmp, acc);
-            for (int c = 0; c < cols; c++) C[(size_t)m * N + n0 + c] = tmp[c];
+            for (; n < N; ++n) {
+                row[n] = fmaf(bf16_to_f32(A[(size_t)m * K + k]),
+                              bf16_to_f32(weights[n]), row[n]);
+            }
         }
     }
 }
@@ -210,17 +142,12 @@ static void gemm_bf16_avx2(const uint16_t *A, const uint16_t *B, float *C,
 extern "C" void lfm_bf16_gemm_f32_v2(const uint16_t *A, const uint16_t *B, float *C,
                                      int M, int N, int K) {
     if (M <= 0 || N <= 0 || K <= 0) return;
-    if (cpu_has_avx512_bf16())
-        gemm_bf16_avx512(A, B, C, M, N, K);
-    else
-        gemm_bf16_avx2(A, B, C, M, N, K);
+    gemm_bf16_avx2(A, B, C, M, N, K);
 }
 
-// GEMV (M==1) — row-streaming "axpy" form, NOT the GEMM: the GEMM packs B per call, which
-// at M==1 (every decode-step matmul) is a full K×N repack per token — the repack costs ~100×
-// the dot products (the NEON side measured 0.6 GB/s effective before this form). Here each
-// contiguous weight row is upconverted and FMA'd into the f32 accumulator with the broadcast
-// scalar A[k]; B is read once, contiguously, no staging.
+// GEMV (M==1) — row-streaming "axpy" form. The former GEMM packed B per call,
+// making decode pay a full K×N repack per token; both entry points now stream
+// each contiguous B row directly, widening only the current SIMD registers.
 namespace {
 X86_TGT_AVX2
 static void gemv_axpy(const uint16_t *A, const uint16_t *B, float *C, int N, int K) {
@@ -273,27 +200,84 @@ X86_TGT_AVX2 static inline float hsum256(__m256 v);
 // NEON twin for the decode-path rationale). W rows stream once, reused across the M rows.
 namespace {
 X86_TGT_AVX2
-static void gemm_nt_impl(const uint16_t *A, const uint16_t *W, float *C, int M, int N, int K) {
+static void gemm_nt_impl(const uint16_t *A, const void *W, float *C,
+                         int M, int N, int K, int ldc) {
+    const unsigned char *weight_bytes = static_cast<const unsigned char *>(W);
     for (int n = 0; n < N; n++) {
-        const uint16_t *wr = W + (size_t)n * K;
-        for (int m = 0; m < M; m++) {
-            const uint16_t *ar = A + (size_t)m * K;
-            __m256 acc = _mm256_setzero_ps();
+        const unsigned char *wr = weight_bytes + (size_t)n * K * sizeof(uint16_t);
+        for (int m0 = 0; m0 < M; m0 += 4) {
+            const int rows = M - m0 < 4 ? M - m0 : 4;
+            __m256 acc[4];
+            for (int row = 0; row < rows; ++row)
+                acc[row] = _mm256_setzero_ps();
             int k = 0;
-            for (; k + 8 <= K; k += 8)
-                acc = _mm256_fmadd_ps(upconv8(ar + k), upconv8(wr + k), acc);
-            float s = hsum256(acc);
-            for (; k < K; k++) s = fmaf(bf16_to_f32(ar[k]), bf16_to_f32(wr[k]), s);
-            C[(size_t)m * N + n] = s;
+            for (; k + 8 <= K; k += 8) {
+                const __m256 weights =
+                    upconv8_bytes(wr + (size_t)k * sizeof(uint16_t));
+                for (int row = 0; row < rows; ++row) {
+                    const uint16_t *ar = A + (size_t)(m0 + row) * K;
+                    acc[row] = _mm256_fmadd_ps(upconv8(ar + k), weights,
+                                               acc[row]);
+                }
+            }
+            float sums[4];
+            for (int row = 0; row < rows; ++row) sums[row] = hsum256(acc[row]);
+            for (; k < K; ++k) {
+                const float weight = bf16_to_f32(load_bf16_word(
+                    wr + (size_t)k * sizeof(uint16_t)));
+                for (int row = 0; row < rows; ++row) {
+                    const uint16_t *ar = A + (size_t)(m0 + row) * K;
+                    sums[row] = fmaf(bf16_to_f32(ar[k]), weight, sums[row]);
+                }
+            }
+            for (int row = 0; row < rows; ++row)
+                C[(size_t)(m0 + row) * ldc + n] = sums[row];
         }
     }
 }
 } // namespace
 
-extern "C" void lfm_bf16_gemm_nt_f32(const uint16_t *A, const uint16_t *W, float *C,
+extern "C" void lfm_bf16_gemm_nt_f32(const uint16_t *A, const void *W, float *C,
                                      int M, int N, int K) {
     if (M <= 0 || N <= 0 || K <= 0) return;
-    gemm_nt_impl(A, W, C, M, N, K);
+    gemm_nt_impl(A, W, C, M, N, K, N);
+}
+
+extern "C" void lfm_bf16_gemm_nt_strided_f32(const uint16_t *A, const void *W,
+                                               float *C, int M, int N, int K,
+                                               int ldc) {
+    if (M <= 0 || N <= 0 || K <= 0 || ldc < N) return;
+    gemm_nt_impl(A, W, C, M, N, K, ldc);
+}
+
+// SSE2-safe fallback for Rosetta/hosts whose OS does not publish AVX state.
+// The build disables contraction, matching the scalar assembly leaf's ordered
+// MULSS+ADDSS ladder, but hoists each checkpoint word across up to four row
+// accumulators so the fallback preserves the same single-read invariant.
+extern "C" void lfm_bf16_gemm_nt_strided_f32_scalar(
+    const uint16_t *A, const void *W, float *C, int M, int N, int K, int ldc) {
+    if (M <= 0 || N <= 0 || K <= 0 || ldc < N) return;
+    const unsigned char *weight_bytes = static_cast<const unsigned char *>(W);
+    for (int n = 0; n < N; ++n) {
+        const unsigned char *wr =
+            weight_bytes + (size_t)n * K * sizeof(uint16_t);
+        for (int m0 = 0; m0 < M; m0 += 4) {
+            const int rows = M - m0 < 4 ? M - m0 : 4;
+            float sums[4] = {};
+            for (int k = 0; k < K; ++k) {
+                const float weight = bf16_to_f32(load_bf16_word(
+                    wr + (size_t)k * sizeof(uint16_t)));
+                for (int row = 0; row < rows; ++row) {
+                    const float activation =
+                        bf16_to_f32(A[(size_t)(m0 + row) * K + k]);
+                    const float product = activation * weight;
+                    sums[row] = sums[row] + product;
+                }
+            }
+            for (int row = 0; row < rows; ++row)
+                C[(size_t)(m0 + row) * ldc + n] = sums[row];
+        }
+    }
 }
 
 extern "C" int lfm_bf16_gemm_available(void) {
@@ -856,12 +840,17 @@ extern "C" X86_TGT_AVX2 void lfm_conv1d_update_f32(const float *bcx, const float
 }
 
 extern "C" X86_TGT_AVX2 void lfm_conv1d_update_bf16(const uint16_t *bcx, const uint16_t *state,
-                                                    const uint16_t *w, uint16_t *out,
+                                                    const void *weight_storage, uint16_t *out,
                                                     int Bn, int D, int T, int K) {
+    const unsigned char *weights = static_cast<const unsigned char *>(weight_storage);
     float wf[16];
     for (int b = 0; b < Bn; b++)
         for (int c = 0; c < D; c++) {
-            for (int j = 0; j < K; j++) wf[j] = bf16_to_f32(w[(size_t)c * K + j]);
+            for (int j = 0; j < K; j++) {
+                const size_t index = (size_t)c * K + j;
+                wf[j] = bf16_to_f32(load_bf16_word(
+                    weights + index * sizeof(uint16_t)));
+            }
             const uint16_t *brow = bcx + (((size_t)b * 3 + 0) * D + c) * T;
             const uint16_t *crow = bcx + (((size_t)b * 3 + 1) * D + c) * T;
             const uint16_t *xrow = bcx + (((size_t)b * 3 + 2) * D + c) * T;
@@ -889,26 +878,41 @@ extern "C" X86_TGT_AVX2 float lfm_bf16_sumsq_f32(const uint16_t *x, int n) {
     return s;
 }
 
-extern "C" X86_TGT_AVX2 void lfm_bf16_rmsnorm(const uint16_t *x, const uint16_t *w,
+extern "C" X86_TGT_AVX2 void lfm_bf16_rmsnorm(const void *x_storage,
+                                              const void *weight_storage,
                                               uint16_t *out, int n, float inv_rms) {
+    const unsigned char *x = static_cast<const unsigned char *>(x_storage);
+    const unsigned char *w = static_cast<const unsigned char *>(weight_storage);
     const __m256 rs = _mm256_set1_ps(inv_rms);
     int i = 0;
     for (; i + 8 <= n; i += 8) {
-        __m256 v = _mm256_mul_ps(_mm256_mul_ps(upconv8(x + i), rs), upconv8(w + i));
+        __m256 v = _mm256_mul_ps(
+            _mm256_mul_ps(upconv8_bytes(x + (size_t)i * sizeof(uint16_t)), rs),
+            upconv8_bytes(w + (size_t)i * sizeof(uint16_t)));
         _mm_storeu_si128((__m128i *)(out + i), bf16_bits_x8(v));
     }
     for (; i < n; i++)
-        out[i] = f32_to_bf16_bits(bf16_to_f32(x[i]) * inv_rms * bf16_to_f32(w[i]));
+        out[i] = f32_to_bf16_bits(
+            bf16_to_f32(load_bf16_word(x + (size_t)i * sizeof(uint16_t))) * inv_rms *
+            bf16_to_f32(load_bf16_word(w + (size_t)i * sizeof(uint16_t))));
 }
 
-extern "C" X86_TGT_AVX2 void lfm_bf16_add(const uint16_t *a, const uint16_t *b,
+extern "C" X86_TGT_AVX2 void lfm_bf16_add(const void *a_storage, const void *b_storage,
                                           uint16_t *out, int n) {
+    const unsigned char *a = static_cast<const unsigned char *>(a_storage);
+    const unsigned char *b = static_cast<const unsigned char *>(b_storage);
     int i = 0;
     for (; i + 8 <= n; i += 8) {
-        __m256 v = _mm256_add_ps(upconv8(a + i), upconv8(b + i));
+        __m256 v = _mm256_add_ps(
+            upconv8_bytes(a + (size_t)i * sizeof(uint16_t)),
+            upconv8_bytes(b + (size_t)i * sizeof(uint16_t)));
         _mm_storeu_si128((__m128i *)(out + i), bf16_bits_x8(v));
     }
-    for (; i < n; i++) out[i] = f32_to_bf16_bits(bf16_to_f32(a[i]) + bf16_to_f32(b[i]));
+    for (; i < n; i++) {
+        out[i] = f32_to_bf16_bits(
+            bf16_to_f32(load_bf16_word(a + (size_t)i * sizeof(uint16_t))) +
+            bf16_to_f32(load_bf16_word(b + (size_t)i * sizeof(uint16_t))));
+    }
 }
 
 extern "C" void lfm_swiglu_bf16(const float *g, const float *u, uint16_t *out, int n) {
@@ -1027,15 +1031,16 @@ extern "C" float lfm_bf16_sumsq_seq_f32(const uint16_t *x, int n) {
 // Sumsq in CANDLE's exact f32 reduction order (cpu/avx.rs vec_sum over a sqr() tensor):
 // four __m256 accumulators over 32-element steps, pairwise tree, then candle's exact
 // horizontal (low128+high128, hadd, hadd), sequential leftovers. See the NEON twin.
-extern "C" X86_TGT_AVX2 float lfm_bf16_sumsq_candle_f32(const uint16_t *x, int n) {
+extern "C" X86_TGT_AVX2 float lfm_bf16_sumsq_candle_f32(const void *storage, int n) {
+    const unsigned char *x = static_cast<const unsigned char *>(storage);
     const int np = n & ~31;
     __m256 sum0 = _mm256_setzero_ps(), sum1 = _mm256_setzero_ps();
     __m256 sum2 = _mm256_setzero_ps(), sum3 = _mm256_setzero_ps();
     for (int i = 0; i < np; i += 32) {
-        __m256 x0 = upconv8(x + i);
-        __m256 x1 = upconv8(x + i + 8);
-        __m256 x2 = upconv8(x + i + 16);
-        __m256 x3 = upconv8(x + i + 24);
+        __m256 x0 = upconv8_bytes(x + (size_t)i * sizeof(uint16_t));
+        __m256 x1 = upconv8_bytes(x + (size_t)(i + 8) * sizeof(uint16_t));
+        __m256 x2 = upconv8_bytes(x + (size_t)(i + 16) * sizeof(uint16_t));
+        __m256 x3 = upconv8_bytes(x + (size_t)(i + 24) * sizeof(uint16_t));
         sum0 = _mm256_add_ps(sum0, _mm256_mul_ps(x0, x0));
         sum1 = _mm256_add_ps(sum1, _mm256_mul_ps(x1, x1));
         sum2 = _mm256_add_ps(sum2, _mm256_mul_ps(x2, x2));
@@ -1048,7 +1053,7 @@ extern "C" X86_TGT_AVX2 float lfm_bf16_sumsq_candle_f32(const uint16_t *x, int n
     __m128 t1 = _mm_hadd_ps(t0, t0);
     float acc = _mm_cvtss_f32(_mm_hadd_ps(t1, t1));
     for (int i = np; i < n; i++) {
-        float v = bf16_to_f32(x[i]);
+        float v = bf16_to_f32(load_bf16_word(x + (size_t)i * sizeof(uint16_t)));
         acc = acc + v * v;
     }
     return acc;

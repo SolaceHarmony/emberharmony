@@ -91,6 +91,12 @@ mod mel {
         fn lfm_frontend_destroy(frontend: *mut NativeFrontend) -> i32;
         fn lfm_frontend_workspace_create(out: *mut *mut NativeFrontendWorkspace) -> i32;
         fn lfm_frontend_workspace_destroy(workspace: *mut NativeFrontendWorkspace) -> i32;
+        fn lfm_frontend_workspace_reserve(
+            frontend: *const NativeFrontend,
+            workspace: *mut NativeFrontendWorkspace,
+            max_sample_count: u64,
+            flags: u32,
+        ) -> i32;
         fn lfm_frontend_seq_len(frontend: *const NativeFrontend, sample_count: u64) -> u64;
         fn lfm_frontend_out_frames(
             frontend: *const NativeFrontend,
@@ -219,6 +225,19 @@ mod mel {
                     "native mel frontend could not reserve {values} output values: {err}"
                 ))
             })?;
+            // This compatibility rim admits arbitrary offline clip lengths, so
+            // it explicitly raises the high-water mark before the strict hot
+            // call. Native sessions reserve their fixed PCM lease capacity once
+            // at readiness and never execute this branch per command.
+            let rc = unsafe {
+                lfm_frontend_workspace_reserve(self.handle, self.workspace, pcm.len() as u64, flags)
+            };
+            if rc != 0 {
+                return Err(candle_core::Error::Msg(format!(
+                    "native mel frontend workspace reserve failed (status {rc}, {} samples)",
+                    pcm.len()
+                )));
+            }
             let rc = unsafe {
                 lfm_frontend_forward_workspace(
                     self.handle,

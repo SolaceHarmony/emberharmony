@@ -1,31 +1,29 @@
 # 15 — The Weight Engine: Byte-Exact Load and High-Speed Streaming
 
-Status: **design, under review — not authoritative.** The byte-exact model is
-endorsed; the corrections to make before this is authoritative are (a) a stronger
-memory-ownership model and (b) sharper wake correctness — both added below (§0.1,
-§3c). Kept as-is per review: no Holo numerical re-encoding, direct parallel
-`pread` into final spans, profile-before-rewrite discipline, no runtime Candle
-fallback.
+Status: **authoritative for the LFM2 native loader and weight-consumption
+contract.** The working tree implements the byte-exact, one-image loader and
+direct BF16 consumers described here. Load-throughput tuning remains
+measurement-driven; it may not weaken the ownership or no-materialization
+rules.
 
 Substrate under P1 (residency) and the decode bandwidth ceiling. Investigates the
 provenance of `native/src/io/safetensors.cpp` and plans a high-speed path for
 getting weights off disk and streaming them through compute in the correct
 order — **byte-exact, no numerical transform.**
 
-## 0.1 Memory ownership — three tiers, plus separately-accounted derived storage
+## 0.1 Memory ownership — five tiers
 
-Not one blob. Four distinct lifetimes, each owned and accounted separately:
+Five distinct lifetimes are owned and accounted separately:
 
 1. **Immutable model image** — the byte-exact checkpoint bytes, one aligned
    allocation, exposed as unaligned pointer *views*. Never mutated, never copied
    after load. Shared read-only by every plan, every conversation.
-2. **Derived storage — separately accounted.** Anything computed *from* the image
-   that is not the checkpoint bytes: prefolded tables (BatchNorm denom, rope
-   cos/sin), Apple f32 GEMM staging, any re-laid buffer. This is real resident
-   memory and must be reported on its own line — `directly_bound_bytes` (tier 1)
-   vs a distinct derived/compat counter — never folded into "the model is 2.9 GB."
-   `compatibility_copied_bytes` must read 0 in production; derived storage is a
-   separate, legitimate, bounded number.
+2. **Derived storage — separately accounted.** Only formula-changing immutable
+   values computed from the image are admitted: rope/window/FFT tables, BatchNorm
+   denominators, and mathematically required weight-normalization folds. Apple
+   BF16-to-F32 staging, transposes, repacks, alignment copies, and any re-laid
+   weight buffer are forbidden compatibility materialization, not derived
+   storage. `compatibility_copied_bytes` must read 0 in production.
 3. **Immutable shared plans** — the bound weight descriptors + shape/stride facts
    for a stage (GEMV geometry, layer table). Built once at model open from tier 1,
    shared by all conversations, never mutated in a pass.
@@ -45,9 +43,9 @@ what keeps the accounting honest.
 The proposal — *address weights by shape/stride from one byte-exact blob, never
 convert them* — is already the loader's design, not a future state:
 
-- The whole checkpoint is read into one 64-byte-aligned allocation
-  (`AlignedBytes`, `posix_memalign`), each shard base 64-aligned, tensors packed
-  gapless (`safetensors.cpp`).
+- The whole checkpoint is read into one page-aligned virtual-memory allocation
+  (`mmap` / `VirtualAlloc`), each shard base 64-aligned, tensors packed gapless
+  (`safetensors.cpp`). Publication changes the complete allocation to read-only.
 - `fill_view` hands out a pure pointer plus metadata:
   `view.data = storage.data() + tensor.offset`, with `shape`, `elements`,
   `bytes`, `rank`, `dtype`, `shard`. **No copy. No conversion. bf16 stays bf16.**
@@ -57,10 +55,10 @@ convert them* — is already the loader's design, not a future state:
   `dtype` width." Row-major, so per-dim strides are derived from the element
   width — there is no stride table to store.
 
-The only place bytes are *converted* today is `CandleBridge`
-(`Tensor::from_raw_buffer(...).to_dtype()`) — the ~2.94 GB copy P1 deletes — and,
-at compute time, the Apple AMX path widening bf16→f32 into staging per GEMM. Load
-itself is already conversion-free.
+Production performs no whole-weight conversion. Architecture leaves load
+possibly unaligned little-endian BF16 words, shift them into the high half of an
+f32 register value, and accumulate in registers. The deleted compatibility path
+used `CandleBridge` and Apple F32 RHS staging; neither is an admissible fallback.
 
 ## 1. Provenance of `safetensors.cpp`
 
@@ -113,18 +111,24 @@ couple of ideas worth weighing (§4).
 
 ### 3a. Fast LOAD: parallel positioned read into the resident image
 
-The current loader reads each shard with a serial `read_file` into
-`storage.data() + source.offset`. For a ~3 GB checkpoint that is one thread
-against the SSD. The win is byte-exact and self-contained:
+The loader now opens and fingerprints every shard before allocating the image,
+then slices each shard into 8 MiB tasks consumed by at most four transient I/O
+workers. POSIX uses retrying `pread`; Windows uses positioned overlapped
+`ReadFile`. Every task lands **directly into its disjoint final image slice**.
+There is no staging buffer, per-chunk payload allocation, or application copy.
 
-- Slice each shard's byte range into fixed chunks (start ~8 MiB) and issue
-  **`pread` across a small fixed thread pool** (size = a few IO threads, not the
-  P-core compute lanes — IO is not the lane team's job), each `pread` landing
-  **directly into the final aligned image slice** (no staging buffer, no per-chunk
-  allocation — the destination already exists).
-- Bound outstanding IO with a small in-flight window and a global in-flight-bytes
-  cap (ember-ml's `LoadThrottle` idea) so a huge model can't spike resident RAM
-  during load.
+- Worker count is the complete concurrency bound. A byte throttle would not
+  reduce resident RAM because tasks borrow the already allocated destination;
+  it would only serialize I/O.
+- All workers are joined before an error can unwind the image. The loader then
+  re-stats the same open handles and reports the lowest source/offset failure
+  deterministically.
+- Only inter-source and trailing alignment padding is zeroed. Every source byte,
+  including its safetensors header, remains byte-exact.
+- `LfmWeightLoadStatsV1` publishes complete source bytes (excluding padding),
+  aligned resident bytes, and the actual task and worker counts for model-level
+  memory/load accounting; it is a transitional native C surface, not a Rust
+  tensor API.
 - Alignment is a non-issue for correctness: `pread` writes exact bytes at exact
   offsets; the 64-byte base alignment of the image is preserved because chunks
   are placed by absolute offset.
@@ -132,10 +136,10 @@ against the SSD. The win is byte-exact and self-contained:
   `tensor_ingress`; there is no descriptor/mailbox/worker needed for a synchronous
   positioned read into an existing buffer.
 
-*Gate:* load wall-clock drops toward SSD-parallel-bandwidth-bound (seconds, not
-tens of seconds); resident bytes and every tensor view are byte-identical to the
-serial loader (a checksum over the image proves it). Independent of P1–P4 — can
-land first.
+*Gate:* `parallel_read_is_byte_exact_across_chunks_and_zeroes_only_padding`
+crosses both the 8 and 16 MiB task boundaries, compares complete source slices
+and tensor payloads byte-for-byte, and verifies deterministic padding. Real
+checkpoint cold/warm wall-clock and throughput remain the hardware gate.
 
 ### 3b. High-speed STREAM: measure the 66→250 GB/s gap, then close it
 

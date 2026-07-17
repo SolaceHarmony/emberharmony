@@ -9,8 +9,8 @@
 // Threading: a created frontend is an immutable table plan and may be shared
 // by concurrent calls. Mutable run storage lives in a separate workspace; use
 // one workspace per session/lane. Calls sharing one workspace serialize while
-// borrowing its high-water planes. Warm calls allocate and zero-fill no
-// scratch memory.
+// borrowing its prepared high-water planes. Forward calls never allocate and
+// zero only mathematically required padding/tail cells.
 //
 // Numerics: tables are built once at create in f64 and stored f32, exactly as
 // the reference built them (hann periodic=false, librosa slaney norm, DFT basis
@@ -32,8 +32,19 @@ extern "C" {
 
 typedef struct LfmFrontend LfmFrontend;
 typedef struct LfmFrontendWorkspace LfmFrontendWorkspace;
+typedef struct LfmResampler LfmResampler;
+typedef struct LfmResamplerWorkspace LfmResamplerWorkspace;
 
 #define LFM_FRONTEND_FORWARD_VALID_ONLY 1u
+#define LFM_FRONTEND_WORKSPACE_BF16_OUTPUT 2u
+
+// A borrowed/read-only PCM span. Resampling publishes either the caller's
+// input span (equal rates) or the caller's destination span (different rates).
+// The span remains valid only as long as that corresponding caller allocation.
+typedef struct LfmF32Span {
+    const float *data;
+    uint64_t length;
+} LfmF32Span;
 
 typedef struct LfmFrontendConfig {
     uint32_t size;
@@ -57,11 +68,20 @@ typedef struct LfmFrontendConfig {
 int lfm_frontend_create(const LfmFrontendConfig *config, LfmFrontend **out);
 int lfm_frontend_destroy(LfmFrontend *frontend);
 
-// Reusable, session-owned run storage. It grows to the largest clip submitted
-// through it and then remains allocation-free. A workspace may be used with
-// any frontend plan, but concurrent lanes should own distinct workspaces.
+// Immutable formula-derived table bytes owned by the plan (mel filterbank and
+// windowed DFT basis). Source/model bytes are not included.
+uint64_t lfm_frontend_derived_bytes(const LfmFrontend *frontend);
+
+// Reusable, session-owned run storage. Reserve the maximum admitted clip at
+// session readiness; forward never allocates or grows it. A workspace may be
+// used with any frontend plan, but concurrent lanes should own distinct
+// workspaces. Reserve flags select padded f32 (0), tightly packed valid f32
+// (VALID_ONLY), or tightly packed valid BF16 (VALID_ONLY|BF16_OUTPUT).
 int lfm_frontend_workspace_create(LfmFrontendWorkspace **out);
 int lfm_frontend_workspace_destroy(LfmFrontendWorkspace *workspace);
+int lfm_frontend_workspace_reserve(const LfmFrontend *frontend,
+                                   LfmFrontendWorkspace *workspace,
+                                   uint64_t max_sample_count, uint32_t flags);
 
 // Valid mel frames for a clip of sample_count samples — the reference
 // get_seq_len floor-divide contract (integer arithmetic, single source of
@@ -100,10 +120,47 @@ int lfm_frontend_forward_workspace(const LfmFrontend *frontend,
                                    float *out_mel, uint64_t out_capacity_values,
                                    uint32_t flags);
 
+// Production Conformer seam: computes tightly packed valid mel rows in the
+// prepared workspace and rounds each normalized row directly into the caller's
+// BF16 destination. No f32 mel plane is published or copied. The workspace
+// must have been reserved with VALID_ONLY|BF16_OUTPUT.
+int lfm_frontend_forward_bf16_workspace(
+    const LfmFrontend *frontend, LfmFrontendWorkspace *workspace,
+    const float *pcm, uint64_t sample_count, uint16_t *out_mel,
+    uint64_t out_capacity_values);
+
+// Immutable, pair-specific torchaudio resampling plan. Formula-derived f64
+// phase kernels are built once here, never during execution.
+int lfm_resampler_create(uint32_t orig_freq, uint32_t new_freq,
+                         LfmResampler **out);
+int lfm_resampler_destroy(LfmResampler *resampler);
+uint64_t lfm_resampler_derived_bytes(const LfmResampler *resampler);
+int lfm_resampler_out_length(const LfmResampler *resampler,
+                             uint64_t sample_count, uint64_t *out_length);
+
+// Session-owned f64 padding plane. Reserve once before readiness. Processing
+// returns -ENOBUFS rather than allocating if a command exceeds that admission.
+int lfm_resampler_workspace_create(LfmResamplerWorkspace **out);
+int lfm_resampler_workspace_destroy(LfmResamplerWorkspace *workspace);
+int lfm_resampler_workspace_reserve(const LfmResampler *resampler,
+                                    LfmResamplerWorkspace *workspace,
+                                    uint64_t max_sample_count);
+
+// Allocation-free execution. With equal rates, destination may be null and
+// result aliases input exactly. With different rates, destination receives the
+// final convolution values directly (there is no intermediate/copy) and result
+// aliases destination.
+int lfm_resampler_process(const LfmResampler *resampler,
+                          LfmResamplerWorkspace *workspace,
+                          const float *input, uint64_t sample_count,
+                          float *destination, uint64_t destination_capacity,
+                          LfmF32Span *result);
+
 // torchaudio.functional.resample (sinc_interp_hann, lowpass_filter_width=6,
 // rolloff=0.99), f64 kernels and accumulation, truncated to
-// ceil(length * new_freq / orig_freq) samples. orig == new copies through.
-// Returns 0; -EINVAL on null/zero-rate args or undersized out capacity.
+// ceil(length * new_freq / orig_freq) samples. Transitional compatibility
+// wrapper: it constructs a temporary plan/workspace and must copy when equal
+// rates and output != input. Production uses the plan/span API above.
 int lfm_resample_f32(const float *x, uint64_t length, uint32_t orig_freq,
                      uint32_t new_freq, float *out, uint64_t out_capacity,
                      uint64_t *out_length);

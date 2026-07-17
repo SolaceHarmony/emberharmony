@@ -24,6 +24,7 @@
 #include "mimi_kernel.h"
 #include "lfm_safetensors.h"
 
+#include <cerrno>
 #include <cmath>    // erff, expf, sqrtf
 #include <cstdio>   // snprintf, fprintf, stderr
 #include <cstdlib>  // aligned_alloc, free, abort
@@ -63,17 +64,26 @@
 // stay consistent with that ceiling. Real steady value is 2.
 enum { MIMI_MAX_LATENT = 4 };
 
-// Generous arena ceiling. Under the "weight-norm folds ONCE at init into the
-// arena" discipline, the SEANET decoder's folded conv weights alone approach
-// ~59 MiB worst-case (if the checkpoint stores weight_g/weight_v rather than a
-// pre-folded "weight"), and a transformer GEMM re-arm (if any unit chooses one)
-// could add ~100 MiB. 256 MiB leaves comfortable slack over the ~170 MiB worst
-// case; the arbiter drops this to ~16 MiB once the fold/re-arm decisions lock
-// (see NOTES (c)). The bump allocator aborts on overflow, so an undersized
-// ceiling surfaces immediately as a sizing bug rather than corruption.
-static const size_t MIMI_ARENA_BYTES = (size_t)256 * 1024 * 1024;
+// Plan construction uses generous temporary ceilings, records the exact mutable
+// state and formula-derived footprints, then replaces both probes with their
+// exact published allocations. Neither ceiling is retained by a live model.
+static const size_t MIMI_STATE_ARENA_MAX = (size_t)256 * 1024 * 1024;
+static const size_t MIMI_DERIVED_ARENA_MAX = (size_t)128 * 1024 * 1024;
 static const size_t MIMI_ARENA_ALIGN = 64;
 static const size_t MIMI_ARENA_HEADROOM_MIN = (size_t)1 * 1024 * 1024;
+
+static bool mimi_align_checked(size_t bytes, size_t *out) {
+    if (!out || bytes > SIZE_MAX - (MIMI_ARENA_ALIGN - 1)) return false;
+    *out = (bytes + (MIMI_ARENA_ALIGN - 1)) & ~(MIMI_ARENA_ALIGN - 1);
+    return true;
+}
+
+struct MimiDerivedArena {
+    uint8_t *base;
+    size_t size;
+    size_t used;
+    int sealed;
+};
 
 #define MIMI_ERR(...)                              \
     do {                                           \
@@ -94,7 +104,7 @@ extern "C" void *mimi_arena_alloc(MimiArena *a, size_t bytes) {
     if (off > a->size || bytes > a->size - off) {
         fprintf(stderr,
                 "mimi_arena_alloc: overflow (used=%zu req=%zu size=%zu) — arena "
-                "sizing bug, raise MIMI_ARENA_BYTES\n",
+                "sizing bug, raise the state probe ceiling\n",
                 a->used, bytes, a->size);
         abort();
     }
@@ -104,6 +114,56 @@ extern "C" void *mimi_arena_alloc(MimiArena *a, size_t bytes) {
     memset(p, 0, bytes);
     a->used = off + bytes;
     return p;
+}
+
+extern "C" void *mimi_arena_alloc_derived(MimiArena *a, size_t bytes) {
+    MimiDerivedArena *derived = a ? a->derived : nullptr;
+    if (!derived) {
+        fprintf(stderr, "mimi_arena_alloc_derived: no plan arena\n");
+        abort();
+    }
+    const size_t off = (a->derived_cursor + (MIMI_ARENA_ALIGN - 1)) &
+                       ~(MIMI_ARENA_ALIGN - 1);
+    if (off > derived->size || bytes > derived->size - off) {
+        fprintf(stderr,
+                "mimi_arena_alloc_derived: overflow (cursor=%zu req=%zu size=%zu)\n",
+                a->derived_cursor, bytes, derived->size);
+        abort();
+    }
+    const size_t end = off + bytes;
+    if (derived->sealed) {
+        if (end > derived->used) {
+            fprintf(stderr, "mimi_arena_alloc_derived: replay exceeds sealed plan\n");
+            abort();
+        }
+    } else {
+        std::memset(derived->base + off, 0, bytes);
+        derived->used = end;
+    }
+    a->derived_cursor = end;
+    return derived->base + off;
+}
+
+extern "C" int mimi_arena_building_derived(const MimiArena *a) {
+    return a && a->derived && !a->derived->sealed;
+}
+
+static inline const float *mimi_aligned_f32(const uint8_t *bytes) {
+    if (!bytes || (reinterpret_cast<uintptr_t>(bytes) & (alignof(float) - 1)) != 0) {
+        return nullptr;
+    }
+    return reinterpret_cast<const float *>(bytes);
+}
+
+extern "C" float mimi_weight_load_f32(const uint8_t *bytes, uint64_t index) {
+    const uint8_t *p = bytes + index * 4;
+    const uint32_t bits = static_cast<uint32_t>(p[0]) |
+                          (static_cast<uint32_t>(p[1]) << 8) |
+                          (static_cast<uint32_t>(p[2]) << 16) |
+                          (static_cast<uint32_t>(p[3]) << 24);
+    float value;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
 }
 
 // ===========================================================================
@@ -206,6 +266,66 @@ extern "C" void mimi_gemm_f32(const float *a, const float *b, float *c, int m,
 #else
     mimi_gemm_f32_ref(a, b, c, m, k, n, beta);
 #endif
+}
+
+extern "C" void mimi_weight_gemv_f32(const uint8_t *w, const float *x,
+                                       const uint8_t *bias, float *y, int m,
+                                       int k) {
+    const float *direct = mimi_aligned_f32(w);
+    const float *direct_bias = mimi_aligned_f32(bias);
+    if (direct && (!bias || direct_bias)) {
+        mimi_gemv_f32(direct, x, direct_bias, y, m, k);
+        return;
+    }
+    for (int i = 0; i < m; ++i) {
+        float sum = 0.0f;
+        for (int j = 0; j < k; ++j) {
+            sum += mimi_weight_load_f32(w, static_cast<uint64_t>(i) * k + j) * x[j];
+        }
+        if (bias) sum += mimi_weight_load_f32(bias, i);
+        y[i] = sum;
+    }
+}
+
+extern "C" void mimi_weight_gemm_f32(const uint8_t *w, const float *b,
+                                       float *c, int m, int k, int n,
+                                       int beta) {
+    if (const float *direct = mimi_aligned_f32(w)) {
+        mimi_gemm_f32(direct, b, c, m, k, n, beta);
+        return;
+    }
+    for (int i = 0; i < m; ++i) {
+        float *row = c + static_cast<size_t>(i) * n;
+        if (!beta) std::memset(row, 0, static_cast<size_t>(n) * sizeof(float));
+        for (int p = 0; p < k; ++p) {
+            const float weight =
+                mimi_weight_load_f32(w, static_cast<uint64_t>(i) * k + p);
+            const float *input = b + static_cast<size_t>(p) * n;
+            for (int j = 0; j < n; ++j) row[j] += weight * input[j];
+        }
+    }
+}
+
+extern "C" void mimi_weight_gemm_tn_f32(const uint8_t *w, const float *b,
+                                          float *c, int rows, int k, int n) {
+    if (const float *direct = mimi_aligned_f32(w)) {
+#if defined(__APPLE__) && !defined(MIMI_SCALAR_REF)
+        cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans, rows, n, k, 1.0f,
+                    direct, rows, b, n, 0.0f, c, n);
+        return;
+#endif
+    }
+    for (int row = 0; row < rows; ++row) {
+        for (int j = 0; j < n; ++j) {
+            float sum = 0.0f;
+            for (int p = 0; p < k; ++p) {
+                const float weight = mimi_weight_load_f32(
+                    w, static_cast<uint64_t>(p) * rows + row);
+                sum += weight * b[static_cast<size_t>(p) * n + j];
+            }
+            c[static_cast<size_t>(row) * n + j] = sum;
+        }
+    }
 }
 
 // -------- scalar per-element helpers (tail/lane + _ref building blocks) -------
@@ -667,17 +787,55 @@ extern "C" void mimi_layer_norm_f32(const float *x, const float *w,
 #endif
 }
 
+extern "C" void mimi_weight_scale_vec_f32(const float *x, const uint8_t *s,
+                                            float *y, int n) {
+    if (const float *direct = mimi_aligned_f32(s)) {
+        mimi_scale_vec_f32(x, direct, y, n);
+        return;
+    }
+    for (int i = 0; i < n; ++i) y[i] = x[i] * mimi_weight_load_f32(s, i);
+}
+
+extern "C" void mimi_weight_layer_norm_f32(const float *x, const uint8_t *w,
+                                             const uint8_t *b, float *y, int n,
+                                             float eps) {
+    const float *direct_w = mimi_aligned_f32(w);
+    const float *direct_b = mimi_aligned_f32(b);
+    if ((!w || direct_w) && (!b || direct_b)) {
+        mimi_layer_norm_f32(x, direct_w, direct_b, y, n, eps);
+        return;
+    }
+    if (n <= 0) return;
+    float sum = 0.0f;
+    float sum2 = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        sum += x[i];
+        sum2 += x[i] * x[i];
+    }
+    const float mean = sum / static_cast<float>(n);
+    const float variance = sum2 / static_cast<float>(n) - mean * mean;
+    const float inv = 1.0f / sqrtf(variance + eps);
+    for (int i = 0; i < n; ++i) {
+        const float wi = w ? mimi_weight_load_f32(w, i) : 1.0f;
+        const float bi = b ? mimi_weight_load_f32(b, i) : 0.0f;
+        y[i] = ((x[i] - mean) * inv) * wi + bi;
+    }
+}
+
 // ===========================================================================
-// (d) Top level — MimiDecoder: owns the arena + the decoder chain
+// (d) Top level — immutable model plan + conversation-owned decode state
 // ===========================================================================
 
-struct MimiDecoder {
+struct MimiDecodePlan {
+    MimiWeight *entries;
+    MimiWeightTable table;
+    MimiDerivedArena derived;
+    size_t state_bytes;
+};
+
+struct MimiDecodeState {
+    const MimiDecodePlan *plan;
     MimiArena arena;
-    // Non-null only for mimi_decoder_new_from_file. Every unit keeps direct
-    // pointers into this image, so the decoder owns it for its whole lifetime.
-    LfmWeightImage *weights;
-
-    // Unit states (all carved from `arena`; no per-unit heap ownership).
     MimiQuantState *quant;
     MimiUpsampleState *upsample;
     MimiTransformerState *transformer;
@@ -693,83 +851,294 @@ struct MimiDecoder {
     // MIMI_FRAME_OUT*2), so no pcm scratch is carved here.
 };
 
-extern "C" int mimi_decoder_new(MimiDecoder **d_out, const MimiWeightTable *w,
-                                char *err, size_t errlen) {
-    if (!d_out) {
-        return -1;
-    }
-    *d_out = NULL;
-    if (!w) {
-        MIMI_ERR("mimi_decoder_new: null weight table");
-        return -1;
-    }
+struct MimiDecoder {
+    LfmWeightImage *weights;
+    MimiDecodePlan *plan;
+    MimiDecodeState *state;
+};
 
-    MimiDecoder *d = (MimiDecoder *)calloc(1, sizeof(MimiDecoder));
-    if (!d) {
-        MIMI_ERR("mimi_decoder_new: OOM allocating decoder struct");
+static size_t mimi_align_size(size_t bytes) {
+    if (bytes > SIZE_MAX - (MIMI_ARENA_ALIGN - 1)) return 0;
+    return (bytes + (MIMI_ARENA_ALIGN - 1)) & ~(MIMI_ARENA_ALIGN - 1);
+}
+
+static int mimi_state_init(MimiDecodeState **out, const MimiDecodePlan *plan,
+                           size_t capacity, char *err, size_t errlen) {
+    if (!out || !plan || !plan->table.entries || capacity == 0) return -1;
+    *out = nullptr;
+    MimiDecodeState *state =
+        static_cast<MimiDecodeState *>(calloc(1, sizeof(MimiDecodeState)));
+    if (!state) {
+        MIMI_ERR("mimi state: OOM allocating state descriptor");
         return -1;
     }
-
-    void *base = aligned_alloc(MIMI_ARENA_ALIGN, MIMI_ARENA_BYTES);
+    void *base = aligned_alloc(MIMI_ARENA_ALIGN, capacity);
     if (!base) {
-        MIMI_ERR("mimi_decoder_new: OOM allocating %zu-byte arena",
-                 MIMI_ARENA_BYTES);
-        free(d);
+        MIMI_ERR("mimi state: OOM allocating %zu-byte arena", capacity);
+        free(state);
         return -1;
     }
-    d->arena.base = (uint8_t *)base;
-    d->arena.size = MIMI_ARENA_BYTES;
-    d->arena.used = 0;
+    state->plan = plan;
+    state->arena = {static_cast<uint8_t *>(base), capacity, 0,
+                    const_cast<MimiDerivedArena *>(&plan->derived), 0};
 
-    // Inter-stage buffers first (deterministic base offsets, easy to reason
-    // about in a hibernation dump).
     const size_t latent_floats = (size_t)MIMI_DIM * (size_t)MIMI_MAX_LATENT;
-    d->emb_buf = (float *)mimi_arena_alloc(&d->arena, latent_floats * sizeof(float));
-    d->up_buf = (float *)mimi_arena_alloc(&d->arena, latent_floats * sizeof(float));
-    d->tr_buf = (float *)mimi_arena_alloc(&d->arena, latent_floats * sizeof(float));
+    state->emb_buf = static_cast<float *>(
+        mimi_arena_alloc(&state->arena, latent_floats * sizeof(float)));
+    state->up_buf = static_cast<float *>(
+        mimi_arena_alloc(&state->arena, latent_floats * sizeof(float)));
+    state->tr_buf = static_cast<float *>(
+        mimi_arena_alloc(&state->arena, latent_floats * sizeof(float)));
 
-    // Unit inits in decode order (quant -> upsample -> transformer -> seanet),
-    // each carving its own state (and folding weights into the arena as needed)
-    // and propagating its error string verbatim on failure.
-    int rc = mimi_quant_init(&d->quant, w, &d->arena, err, errlen);
+    int rc = mimi_quant_init(&state->quant, &plan->table, &state->arena, err, errlen);
     if (rc) {
         free(base);
-        free(d);
+        free(state);
         return rc;
     }
-    rc = mimi_upsample_init(&d->upsample, w, &d->arena, err, errlen);
+    rc = mimi_upsample_init(&state->upsample, &plan->table, &state->arena,
+                            err, errlen);
     if (rc) {
         free(base);
-        free(d);
+        free(state);
         return rc;
     }
-    rc = mimi_transformer_init(&d->transformer, w, &d->arena, err, errlen);
+    rc = mimi_transformer_init(&state->transformer, &plan->table,
+                               &state->arena, err, errlen);
     if (rc) {
         free(base);
-        free(d);
+        free(state);
         return rc;
     }
-    rc = mimi_seanet_init(&d->seanet, w, &d->arena, err, errlen);
+    rc = mimi_seanet_init(&state->seanet, &plan->table, &state->arena,
+                          err, errlen);
     if (rc) {
         free(base);
-        free(d);
+        free(state);
         return rc;
     }
-
-    // Assert headroom: if we came within MIMI_ARENA_HEADROOM_MIN of the ceiling
-    // the estimate is too tight — fail loudly so the constant gets raised rather
-    // than risking a steady-state abort under a differently-sized checkpoint.
-    size_t headroom = d->arena.size - d->arena.used;  // used <= size (bump guards)
-    if (headroom < MIMI_ARENA_HEADROOM_MIN) {
-        MIMI_ERR("mimi_decoder_new: arena headroom %zu < min %zu (used %zu/%zu) — "
-                 "raise MIMI_ARENA_BYTES",
-                 headroom, MIMI_ARENA_HEADROOM_MIN, d->arena.used, d->arena.size);
+    if (plan->derived.sealed &&
+        state->arena.derived_cursor != plan->derived.used) {
+        MIMI_ERR("mimi state: derived-plan replay mismatch (%zu != %zu)",
+                 state->arena.derived_cursor, plan->derived.used);
         free(base);
-        free(d);
+        free(state);
         return -2;
     }
+    *out = state;
+    return 0;
+}
 
-    *d_out = d;
+static void mimi_state_destroy(MimiDecodeState *state) {
+    if (!state) return;
+    free(state->arena.base);
+    free(state);
+}
+
+static int mimi_plan_new(MimiDecodePlan **out, const MimiWeightTable *weights,
+                         char *err, size_t errlen) {
+    if (!out || !weights || !weights->entries || weights->count == 0) return -1;
+    *out = nullptr;
+    MimiDecodePlan *plan =
+        static_cast<MimiDecodePlan *>(calloc(1, sizeof(MimiDecodePlan)));
+    if (!plan) return -1;
+    plan->entries = static_cast<MimiWeight *>(
+        calloc(weights->count, sizeof(MimiWeight)));
+    if (!plan->entries) {
+        free(plan);
+        return -1;
+    }
+    std::memcpy(plan->entries, weights->entries,
+                static_cast<size_t>(weights->count) * sizeof(MimiWeight));
+    plan->table = {plan->entries, weights->count};
+    plan->derived.base = static_cast<uint8_t *>(
+        aligned_alloc(MIMI_ARENA_ALIGN, MIMI_DERIVED_ARENA_MAX));
+    if (!plan->derived.base) {
+        free(plan->entries);
+        free(plan);
+        return -1;
+    }
+    plan->derived.size = MIMI_DERIVED_ARENA_MAX;
+
+    MimiDecodeState *probe = nullptr;
+    int rc = mimi_state_init(&probe, plan, MIMI_STATE_ARENA_MAX, err, errlen);
+    if (rc != 0) {
+        free(plan->derived.base);
+        free(plan->entries);
+        free(plan);
+        return rc;
+    }
+
+    const size_t headroom = probe->arena.size - probe->arena.used;
+    if (headroom < MIMI_ARENA_HEADROOM_MIN) {
+        MIMI_ERR("mimi plan: state probe headroom %zu < %zu", headroom,
+                 MIMI_ARENA_HEADROOM_MIN);
+        mimi_state_destroy(probe);
+        free(plan->derived.base);
+        free(plan->entries);
+        free(plan);
+        return -2;
+    }
+    plan->state_bytes = mimi_align_size(probe->arena.used);
+    size_t derived_bytes = 0;
+    if (!mimi_align_checked(plan->derived.used, &derived_bytes) ||
+        derived_bytes == 0) {
+        MIMI_ERR("mimi plan: invalid derived footprint %zu", plan->derived.used);
+        mimi_state_destroy(probe);
+        free(plan->derived.base);
+        free(plan->entries);
+        free(plan);
+        return -2;
+    }
+    uint8_t *derived = static_cast<uint8_t *>(
+        aligned_alloc(MIMI_ARENA_ALIGN, derived_bytes));
+    if (!derived) {
+        mimi_state_destroy(probe);
+        free(plan->derived.base);
+        free(plan->entries);
+        free(plan);
+        return -1;
+    }
+    std::memcpy(derived, plan->derived.base, plan->derived.used);
+    free(plan->derived.base);
+    plan->derived.base = derived;
+    plan->derived.size = derived_bytes;
+    plan->derived.sealed = 1;
+    mimi_state_destroy(probe);
+    if (plan->state_bytes == 0) {
+        free(plan->derived.base);
+        free(plan->entries);
+        free(plan);
+        return -2;
+    }
+    *out = plan;
+    return 0;
+}
+
+static int mimi_plan_new_from_component(MimiDecodePlan **out,
+                                        const LfmWeightImage *image,
+                                        uint32_t component, char *err,
+                                        size_t errlen) {
+    if (!out || !image) return -1;
+    *out = nullptr;
+    const size_t count = lfm_weights_component_count(image, component);
+    if (count > UINT32_MAX) {
+        MIMI_ERR("mimi decoder: too many tensors (%zu)", count);
+        return -3;
+    }
+
+    MimiWeight *entries = (MimiWeight *)calloc(count, sizeof(MimiWeight));
+    if (count != 0 && !entries) {
+        MIMI_ERR("mimi decoder: OOM allocating %zu descriptors", count);
+        return -4;
+    }
+
+    for (size_t i = 0; i < count; ++i) {
+        LfmTensorView view = {};
+        int rc = lfm_weights_at_component(image, component, i, &view);
+        if (rc != LFM_WEIGHT_OK) {
+            MIMI_ERR("mimi decoder: tensor lookup %zu failed", i);
+            free(entries);
+            return rc;
+        }
+        if (view.dtype != LFM_DTYPE_F32) {
+            MIMI_ERR("mimi decoder: tensor '%s' is %s, expected F32",
+                     view.name, lfm_weights_dtype_name(view.dtype));
+            free(entries);
+            return -3;
+        }
+        entries[i] = MimiWeight{
+            view.name,
+            static_cast<const uint8_t *>(view.data),
+            view.shape,
+            view.rank,
+            view.elements,
+        };
+    }
+
+    const MimiWeightTable table = {entries, (uint32_t)count};
+    const int rc = mimi_plan_new(out, &table, err, errlen);
+    free(entries);
+    return rc;
+}
+
+extern "C" int mimi_decode_plan_new_from_image(MimiDecodePlan **out,
+                                                const LfmWeightImage *image,
+                                                char *err, size_t errlen) {
+    return mimi_plan_new_from_component(out, image, LFM_WEIGHT_COMPONENT_CODEC,
+                                        err, errlen);
+}
+
+extern "C" void mimi_decode_plan_free(MimiDecodePlan *plan) {
+    if (!plan) return;
+    free(plan->derived.base);
+    free(plan->entries);
+    free(plan);
+}
+
+extern "C" uint64_t mimi_decode_plan_derived_bytes(const MimiDecodePlan *plan) {
+    return plan ? static_cast<uint64_t>(plan->derived.size) : 0;
+}
+
+extern "C" uint64_t mimi_decode_plan_compatibility_copied_bytes(
+    const MimiDecodePlan *) {
+    return 0;
+}
+
+extern "C" int mimi_decode_state_new(MimiDecodeState **out,
+                                      const MimiDecodePlan *plan, char *err,
+                                      size_t errlen) {
+    if (!plan || !plan->derived.sealed) return -1;
+    return mimi_state_init(out, plan, plan->state_bytes, err, errlen);
+}
+
+extern "C" void mimi_decode_state_free(MimiDecodeState *state) {
+    mimi_state_destroy(state);
+}
+
+extern "C" uint64_t mimi_decode_state_bytes(const MimiDecodeState *state) {
+    return state ? static_cast<uint64_t>(sizeof(MimiDecodeState) +
+                                         state->arena.size) : 0;
+}
+
+extern "C" int mimi_decoder_new(MimiDecoder **out, const MimiWeightTable *weights,
+                                 char *err, size_t errlen) {
+    if (!out) return -1;
+    *out = nullptr;
+    MimiDecoder *decoder =
+        static_cast<MimiDecoder *>(calloc(1, sizeof(MimiDecoder)));
+    if (!decoder) return -1;
+    int rc = mimi_plan_new(&decoder->plan, weights, err, errlen);
+    if (rc == 0) {
+        rc = mimi_decode_state_new(&decoder->state, decoder->plan, err, errlen);
+    }
+    if (rc != 0) {
+        mimi_decode_plan_free(decoder->plan);
+        free(decoder);
+        return rc;
+    }
+    *out = decoder;
+    return 0;
+}
+
+extern "C" int mimi_decoder_new_from_image(MimiDecoder **d_out,
+                                             const LfmWeightImage *image,
+                                             char *err, size_t errlen) {
+    if (!d_out || !image) return -1;
+    *d_out = nullptr;
+    MimiDecoder *decoder =
+        static_cast<MimiDecoder *>(calloc(1, sizeof(MimiDecoder)));
+    if (!decoder) return -1;
+    int rc = mimi_decode_plan_new_from_image(&decoder->plan, image, err, errlen);
+    if (rc == 0) {
+        rc = mimi_decode_state_new(&decoder->state, decoder->plan, err, errlen);
+    }
+    if (rc != 0) {
+        mimi_decode_plan_free(decoder->plan);
+        free(decoder);
+        return rc;
+    }
+    *d_out = decoder;
     return 0;
 }
 
@@ -782,82 +1151,40 @@ extern "C" int mimi_decoder_new_from_file(MimiDecoder **d_out,
         MIMI_ERR("mimi_decoder_new_from_file: empty checkpoint path");
         return -1;
     }
-
     LfmWeightImage *image = NULL;
     int rc = lfm_weights_open(checkpoint, &image, err, errlen);
     if (rc != LFM_WEIGHT_OK) return rc;
-
-    const size_t count = lfm_weights_count(image);
-    if (count > UINT32_MAX) {
-        MIMI_ERR("mimi_decoder_new_from_file: too many tensors (%zu)", count);
+    MimiDecoder *decoder =
+        static_cast<MimiDecoder *>(calloc(1, sizeof(MimiDecoder)));
+    if (!decoder) {
         lfm_weights_close(image);
-        return -3;
+        return -1;
     }
-
-    // Descriptor array only: tensor names, shapes, and payloads stay in the
-    // resident image. Unit initialization resolves direct payload pointers and
-    // does not retain this temporary table.
-    MimiWeight *entries = (MimiWeight *)calloc(count, sizeof(MimiWeight));
-    if (count != 0 && !entries) {
-        MIMI_ERR("mimi_decoder_new_from_file: OOM allocating %zu descriptors", count);
-        lfm_weights_close(image);
-        return -4;
+    rc = mimi_plan_new_from_component(&decoder->plan, image,
+                                      LFM_WEIGHT_COMPONENT_MAIN, err, errlen);
+    if (rc == 0) {
+        rc = mimi_decode_state_new(&decoder->state, decoder->plan, err, errlen);
     }
-
-    for (size_t i = 0; i < count; ++i) {
-        LfmTensorView view = {};
-        rc = lfm_weights_at(image, i, &view);
-        if (rc != LFM_WEIGHT_OK) {
-            MIMI_ERR("mimi_decoder_new_from_file: tensor lookup %zu failed", i);
-            free(entries);
-            lfm_weights_close(image);
-            return rc;
-        }
-        if (view.dtype != LFM_DTYPE_F32) {
-            MIMI_ERR("mimi_decoder_new_from_file: tensor '%s' is %s, expected F32",
-                     view.name, lfm_weights_dtype_name(view.dtype));
-            free(entries);
-            lfm_weights_close(image);
-            return -3;
-        }
-        if (((uintptr_t)view.data & (alignof(float) - 1)) != 0) {
-            MIMI_ERR("mimi_decoder_new_from_file: tensor '%s' is not f32-aligned",
-                     view.name);
-            free(entries);
-            lfm_weights_close(image);
-            return -3;
-        }
-        entries[i] = MimiWeight{
-            view.name,
-            (const float *)view.data,
-            view.shape,
-            view.rank,
-            view.elements,
-        };
-    }
-
-    const MimiWeightTable table = {entries, (uint32_t)count};
-    rc = mimi_decoder_new(d_out, &table, err, errlen);
-    free(entries);
     if (rc != 0) {
+        mimi_decode_plan_free(decoder->plan);
+        free(decoder);
         lfm_weights_close(image);
         return rc;
     }
-    (*d_out)->weights = image;
+    decoder->weights = image;
+    *d_out = decoder;
     return 0;
 }
 
-extern "C" int mimi_decoder_step(MimiDecoder *d, const uint32_t *codes,
-                                 float *pcm_out) {
+extern "C" int mimi_decode_state_step(MimiDecodeState *d,
+                                       const uint32_t *codes, float *pcm_out) {
     // Faithful port of Mimi::decode_step (mimi.rs:214). In our streaming path
     // (audio_out.rs) `codes` is always a present single latent frame, so the
     // Rust `codes.as_option()` is always Some and the quantizer always emits one
     // embedding frame. Each stage is still invoked with the previous stage's
     // reported count, so a 0 (priming) propagates 0 onward exactly as
     // StreamTensor::empty() does through the Rust `.step` chain.
-    if (!d || !codes || !pcm_out) {
-        return 0;
-    }
+    if (!d || !codes || !pcm_out) return -EINVAL;
 
     // quantizer.decode: codes[MIMI_NQ] -> emb[MIMI_DIM, 1]. Pure per-frame RVQ
     // dequantize (no streaming state), so exactly 1 frame out.
@@ -888,7 +1215,7 @@ extern "C" int mimi_decoder_step(MimiDecoder *d, const uint32_t *codes,
     return n_pcm;
 }
 
-extern "C" void mimi_decoder_reset(MimiDecoder *d) {
+extern "C" void mimi_decode_state_reset(MimiDecodeState *d) {
     // Decoder-half of Mimi::reset_state (mimi.rs:224). The Rust also resets the
     // encoder, encoder_transformer, and downsample — all out of scope here. The
     // quantizer has no streaming state (RVQ decode is stateless), so it has no
@@ -901,15 +1228,33 @@ extern "C" void mimi_decoder_reset(MimiDecoder *d) {
     mimi_upsample_reset(d->upsample);
 }
 
+extern "C" int mimi_decoder_step(MimiDecoder *decoder, const uint32_t *codes,
+                                   float *pcm_out) {
+    return decoder ? mimi_decode_state_step(decoder->state, codes, pcm_out)
+                   : -EINVAL;
+}
+
+extern "C" void mimi_decoder_reset(MimiDecoder *decoder) {
+    if (decoder) mimi_decode_state_reset(decoder->state);
+}
+
 extern "C" void mimi_decoder_free(MimiDecoder *d) {
     if (!d) {
         return;
     }
-    // Every unit state and folded weight lives in the single arena, so one free
-    // reclaims all of it; the units own no separate heap.
-    free(d->arena.base);
+    mimi_decode_state_free(d->state);
+    mimi_decode_plan_free(d->plan);
     lfm_weights_close(d->weights);
     free(d);
+}
+
+extern "C" uint64_t mimi_decoder_derived_bytes(const MimiDecoder *d) {
+    return d ? mimi_decode_plan_derived_bytes(d->plan) : 0;
+}
+
+extern "C" uint64_t mimi_decoder_compatibility_copied_bytes(
+    const MimiDecoder *) {
+    return 0;
 }
 
 /* NOTES
@@ -980,33 +1325,21 @@ extern "C" void mimi_decoder_free(MimiDecoder *d) {
  *  whatever emit schedule units 2–3 land on, and is why the buffers are sized
  *  for the doubled worst case rather than the steady value.
  *
- * (c) ARENA SIZING ESTIMATE (MIMI_ARENA_BYTES = 256 MiB)
- * ------------------------------------------------------
- *  The arena holds ALL mutable state + scratch + any folded/re-armed weights
- *  (per the header discipline "weight-norm folds ONCE at init into the arena").
- *  Worst-case breakdown (checkpoint stores weight_g/weight_v => convs folded):
- *    - SEANET decoder folded conv weights .............. ~59 MiB
- *        init_conv 1024x512x7 (14.7M f) dominant, + 4 transpose upsample convs
- *        (ratios 8/6/5/4) + 4 resnet blocks (k3,k1) + final_conv; ~14.7M floats.
- *    - Transformer, IF a unit re-arms GEMM weights into arena  ~100 MiB
- *        8 layers x (in_proj 3*512*512 + out_proj 512*512 + mlp 2*512*2048)
- *        = ~25.2M floats. If instead used zero-copy (cblas can take checkpoint
- *        layout), this term is 0.
- *    - Transformer KV cache ............................ ~8.2 MiB
- *        2(k,v) x 8 layers x 250 context x 512 = ~2.05M floats.
- *    - SEANET streaming conv left-context state ........ < 1 MiB
- *        sum over convs of (kernel_eff-1)*channels.
- *    - Quant scratch + in/out projections .............. < 1 MiB
- *        codebook embeddings are zero-copy weights (not arena).
- *    - Inter-stage latent buffers ...................... 24 KiB
- *        3 x MIMI_DIM x MIMI_MAX_LATENT x 4B = 3*512*4*4.
- *  Worst-worst total ~170 MiB; 256 MiB gives >80 MiB slack, checked by the
- *  MIMI_ARENA_HEADROOM_MIN (1 MiB) assertion after init. NOTE for the arbiter:
- *  the header example (64 MiB) is INSUFFICIENT if seanet convs fold into the
- *  arena AND the transformer re-arms; it is ample if the checkpoint stores
- *  pre-folded "weight" tensors (zero-copy) and the transformer stays zero-copy
- *  (true need ~16 MiB). Tighten once those two decisions lock. The bump
- *  allocator aborts on overflow, so an undersized constant fails at init.
+ * (c) PLAN / STATE ARENAS
+ * -----------------------
+ *  `MimiDecodePlan` owns only validated descriptors and formula-changing
+ *  immutable tables. The production checkpoint derives eight 2048x256
+ *  codebooks plus 32 RoPE inverse frequencies: 16,777,344 bytes total.
+ *  Layout, alignment, dtype, and transpose copies are absent.
+ *
+ *  Plan construction performs one temporary 256 MiB state probe while building
+ *  derived tables into a separate arena. It records the state high-water mark,
+ *  seals the derived arena, and discards the probe. Each conversation then gets
+ *  an exact-sized mutable arena. The production measurement is 48,808,616 bytes
+ *  including the state descriptor: KV rings, conv carry, and activation scratch.
+ *  State initialization replays derived offsets and never recomputes or writes
+ *  the sealed tables. Thus two conversations share one image and one derived
+ *  plan while retaining independent mutable recurrence.
  *
  * (d) PRIMITIVE-KERNEL LOOP ORDERS  ("math is assembly at every step")
  * --------------------------------------------------------------------
@@ -1042,17 +1375,13 @@ extern "C" void mimi_decoder_free(MimiDecoder *d) {
  *
  * (e) UNCERTAINTIES / ARBITER RECONCILIATION
  * ------------------------------------------
- *  1. Arena ceiling vs the header's 64 MiB example — see (c). Depends on whether
- *     the checkpoint stores folded "weight" (zero-copy) or weight_g/weight_v
- *     (fold into arena), and whether the transformer re-arms into the arena.
- *     I chose 256 MiB generous; arbiter tightens.
- *  2. Step return convention. I read every *_step's int return as n_out (frames
+ *  1. Step return convention. I read every *_step's int return as n_out (frames
  *     for upsample/transformer, samples for seanet), per the header's "reports
  *     n_out frames; 0 is legal" and conv's "returns n_out (>=0)". If a unit ever
  *     returns a negative error code from a step, this file passes it through
  *     unchanged (no steady-state error channel is defined). Please keep steps
  *     infallible (>=0) or the arbiter must add an error convention.
- *  3. MIMI_MAX_LATENT = 4 (not the steady 2). Sized to the header's pcm_out
+ *  2. MIMI_MAX_LATENT = 4 (not the steady 2). Sized to the header's pcm_out
  *     capacity MIMI_FRAME_OUT*2 = 4*960 "drain headroom", so a hypothetical
  *     double-emit step cannot overflow the latent buffers or pcm_out. If the
  *     arbiter proves emit is bounded at 2, this can drop to 2 (buffers shrink,

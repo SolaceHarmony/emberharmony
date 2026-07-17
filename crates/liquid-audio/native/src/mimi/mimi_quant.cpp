@@ -47,8 +47,8 @@ struct MimiQuantState {
     // output_proj: conv1d(qdim -> model_dim, kernel 1, no bias). With kernel 1
     // and T=1 this is a pure gemv; weight [512,256,1] collapses to [512,256]
     // row-major, exactly mimi_gemv_f32's [M=512,K=256] layout.
-    const float *out_proj_first;        // [kModelDim * kQDim]
-    const float *out_proj_rest;         // [kModelDim * kQDim]
+    const uint8_t *out_proj_first;      // [kModelDim * kQDim] f32 bytes
+    const uint8_t *out_proj_rest;       // [kModelDim * kQDim] f32 bytes
 
     // Scratch (arena).
     float *quant_rest;                  // [kQDim]  residual sum for rvq_rest
@@ -96,13 +96,16 @@ inline void vec_add(float *acc, const float *x, int n) {
 //   embedding = embedding_sum.broadcast_div(cluster_usage.maximum(1e-5))
 // with Maximum defined as `if v1 < v2 { v2 } else { v1 }` (v1=usage, v2=eps,
 // eps cast to f32 first) and Div as plain f32 v1/v2. Row loop k outer, d inner.
-void fold_codebook(float *dst, const float *emb_sum, const float *usage) {
+void fold_codebook(float *dst, const uint8_t *emb_sum, const uint8_t *usage) {
     for (int k = 0; k < kBins; ++k) {
-        const float u = usage[k];
+        const float u = mimi_weight_load_f32(usage, k);
         const float denom = (u < kCbEps) ? kCbEps : u;  // candle Maximum tie rule
-        const float *src = emb_sum + (size_t)k * kQDim;
         float *out = dst + (size_t)k * kQDim;
-        for (int d = 0; d < kQDim; ++d) out[d] = src[d] / denom;
+        for (int d = 0; d < kQDim; ++d) {
+            out[d] = mimi_weight_load_f32(
+                         emb_sum, static_cast<uint64_t>(k) * kQDim + d) /
+                     denom;
+        }
     }
 }
 
@@ -115,26 +118,33 @@ inline uint32_t clamp_code(uint32_t c) {
 
 // Look up + validate one required f32 weight span. Returns nullptr and writes
 // err on missing/misshaped weight (no-fallbacks: init hard-fails upstream).
-const float *find_req(const MimiWeightTable *w, const char *name,
-                      uint64_t expect_len, char *err, size_t errlen) {
+const uint8_t *find_req(const MimiWeightTable *w, const char *name,
+                        int64_t d0, int64_t d1, int64_t d2, char *err,
+                        size_t errlen) {
     const MimiWeight *e = mimi_weight_find(w, name);
     if (e == nullptr) {
         if (errlen) snprintf(err, errlen, "mimi_quant: missing weight '%s'", name);
         return nullptr;
     }
-    if (e->len != expect_len) {
+    const uint32_t rank = d1 < 0 ? 1u : (d2 < 0 ? 2u : 3u);
+    const uint64_t expected = static_cast<uint64_t>(d0) *
+                              (rank >= 2 ? static_cast<uint64_t>(d1) : 1) *
+                              (rank >= 3 ? static_cast<uint64_t>(d2) : 1);
+    const bool shape = e->shape && e->ndim == rank && e->shape[0] == (uint64_t)d0 &&
+                       (rank < 2 || e->shape[1] == (uint64_t)d1) &&
+                       (rank < 3 || e->shape[2] == (uint64_t)d2) &&
+                       e->len == expected;
+    if (!shape) {
         if (errlen)
             snprintf(err, errlen,
-                     "mimi_quant: weight '%s' has %llu elems, expected %llu",
-                     name, (unsigned long long)e->len,
-                     (unsigned long long)expect_len);
+                     "mimi_quant: weight '%s' has wrong rank or shape", name);
         return nullptr;
     }
-    if (e->data == nullptr) {  // review P2: never hand back a null span
+    if (e->bytes == nullptr) {  // review P2: never hand back a null span
         if (errlen) snprintf(err, errlen, "mimi_quant: weight '%s' has null data", name);
         return nullptr;
     }
-    return e->data;
+    return e->bytes;
 }
 
 // Fold one codebook by name-prefix into arena, returning the folded table (or
@@ -144,17 +154,18 @@ const float *fold_codebook_by_prefix(const MimiWeightTable *w, MimiArena *a,
                                      size_t errlen) {
     char name[256];
     snprintf(name, sizeof(name), "%s._codebook.embedding_sum", prefix);
-    const float *emb_sum =
-        find_req(w, name, (uint64_t)kBins * kQDim, err, errlen);
+    const uint8_t *emb_sum =
+        find_req(w, name, kBins, kQDim, -1, err, errlen);
     if (!emb_sum) return nullptr;
 
     snprintf(name, sizeof(name), "%s._codebook.cluster_usage", prefix);
-    const float *usage = find_req(w, name, (uint64_t)kBins, err, errlen);
+    const uint8_t *usage = find_req(w, name, kBins, -1, -1, err, errlen);
     if (!usage) return nullptr;
 
     float *folded =
-        (float *)mimi_arena_alloc(a, (size_t)kBins * kQDim * sizeof(float));
-    fold_codebook(folded, emb_sum, usage);
+        (float *)mimi_arena_alloc_derived(
+            a, (size_t)kBins * kQDim * sizeof(float));
+    if (mimi_arena_building_derived(a)) fold_codebook(folded, emb_sum, usage);
     return folded;
 }
 
@@ -182,7 +193,7 @@ int mimi_quant_init(MimiQuantState **out, const MimiWeightTable *w,
 
     st->out_proj_first =
         find_req(w, "quantizer.rvq_first.output_proj.weight",
-                 (uint64_t)kModelDim * kQDim, err, errlen);
+                 kModelDim, kQDim, 1, err, errlen);
     if (!st->out_proj_first) return 3;
 
     // ---- rvq_rest: 7 codebooks (layers 0..6) + output_proj ---------------
@@ -199,7 +210,7 @@ int mimi_quant_init(MimiQuantState **out, const MimiWeightTable *w,
 
     st->out_proj_rest =
         find_req(w, "quantizer.rvq_rest.output_proj.weight",
-                 (uint64_t)kModelDim * kQDim, err, errlen);
+                 kModelDim, kQDim, 1, err, errlen);
     if (!st->out_proj_rest) return 5;
 
     // ---- scratch ---------------------------------------------------------
@@ -233,8 +244,8 @@ void mimi_quant_decode(MimiQuantState *st, const uint32_t *codes,
     // The lone lookup row IS the 256-vec; project it straight through.
     const uint32_t c0 = clamp_code(codes[0]);
     const float *row_first = st->emb_first + (size_t)c0 * kQDim;
-    mimi_gemv_f32(st->out_proj_first, row_first, /*bias*/ nullptr,
-                  st->emb_first_out, kModelDim, kQDim);
+    mimi_weight_gemv_f32(st->out_proj_first, row_first, /*bias*/ nullptr,
+                         st->emb_first_out, kModelDim, kQDim);
 
     // ---- rvq_rest (sum 7 lookups in 256-space, then project) -------------
     // quant_rest = emb_rest[0][codes[1]], then += emb_rest[j][codes[1+j]].
@@ -246,8 +257,8 @@ void mimi_quant_decode(MimiQuantState *st, const uint32_t *codes,
         const uint32_t cj = clamp_code(codes[1 + j]);
         vec_add(st->quant_rest, st->emb_rest[j] + (size_t)cj * kQDim, kQDim);
     }
-    mimi_gemv_f32(st->out_proj_rest, st->quant_rest, /*bias*/ nullptr,
-                  st->emb_rest_out, kModelDim, kQDim);
+    mimi_weight_gemv_f32(st->out_proj_rest, st->quant_rest, /*bias*/ nullptr,
+                         st->emb_rest_out, kModelDim, kQDim);
 
     // ---- split sum in 512-space: first + rest ----------------------------
     std::memcpy(emb_out, st->emb_first_out, (size_t)kModelDim * sizeof(float));

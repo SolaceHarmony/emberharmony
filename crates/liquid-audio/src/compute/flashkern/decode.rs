@@ -221,7 +221,7 @@ pub(crate) fn fused_mlp_reference(x: &[u16], w: &FusedMlpWeights, out: &mut [u16
     });
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "oracle"))]
 mod tests {
     use super::*;
     use crate::model::linear::linear_forward;
@@ -382,6 +382,7 @@ pub struct PtrLen {
 
 impl PtrLen {
     /// Capture a contiguous CPU bf16 tensor as raw bits. `None` if it isn't one.
+    #[cfg(feature = "oracle")]
     pub fn bf16(t: &candle_core::Tensor) -> Option<Self> {
         use candle_core::Storage;
         let (s, l) = t.storage_and_layout();
@@ -405,6 +406,7 @@ impl PtrLen {
         self.len
     }
     /// Capture a contiguous CPU f32 tensor.
+    #[cfg(feature = "oracle")]
     pub fn f32(t: &candle_core::Tensor) -> Option<Self> {
         use candle_core::Storage;
         let (s, l) = t.storage_and_layout();
@@ -436,14 +438,35 @@ impl PtrLen {
         }
     }
 
-    /// Capture an externally-owned contiguous view by raw pointer and element
-    /// count. Used to bind weights directly from the resident checkpoint image
-    /// (zero-copy, no Candle tensor) and to bind computed tables (e.g. rope).
-    /// SAFETY CONTRACT (same as the tensor constructors): the storage behind
-    /// `ptr` must outlive every native pass that reads this descriptor — for
-    /// resident weights that is the model's `ResidentWeights`, for computed
-    /// tables an owned buffer the model keeps alive.
-    pub fn from_raw(ptr: *const std::ffi::c_void, len: usize) -> Self {
+    /// Capture a validated bf16 view from the immutable resident image. The
+    /// caller's model owner keeps the image alive until its native plan drops.
+    #[cfg(feature = "oracle")]
+    pub(crate) fn resident_bf16(view: &crate::weights::NativeTensor<'_>) -> Option<Self> {
+        if view.dtype().ok()? != crate::weights::WeightDType::BF16 {
+            return None;
+        }
+        let elements = usize::try_from(view.elements()).ok()?;
+        if view.bytes() != view.elements().checked_mul(2)? {
+            return None;
+        }
+        // SAFETY: NativeTensor is a loader-validated view into the immutable
+        // image. The containing model retains that image beyond plan teardown.
+        Some(unsafe { Self::from_raw(view.data_ptr(), elements) })
+    }
+
+    /// Capture an owned f32 table retained by the containing model.
+    pub(crate) fn f32_slice(values: &[f32]) -> Self {
+        // SAFETY: callers use this only for model-owned tables which precede the
+        // native plan in drop order. The typed slice supplies alignment/count.
+        unsafe { Self::from_raw(values.as_ptr().cast(), values.len()) }
+    }
+
+    /// Construct the descriptor after a typed owner has validated the storage.
+    ///
+    /// # Safety
+    /// `ptr` must address `len` elements of the dtype expected by the eventual
+    /// native field, and that storage must outlive every pass using the plan.
+    unsafe fn from_raw(ptr: *const std::ffi::c_void, len: usize) -> Self {
         Self {
             ptr: ptr as usize,
             len,

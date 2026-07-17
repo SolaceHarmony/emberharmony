@@ -111,6 +111,125 @@ LFM_SYM(lfm_rope_table_f32):
     movl    $-22, %eax
     ret
 
+.p2align 4
+.globl LFM_SYM(lfm_rope_range_f32)
+LFM_SYM(lfm_rope_range_f32):
+#ifdef _WIN32
+    movq    40(%rsp), %r10
+    movq    48(%rsp), %r11
+    movd    %xmm3, %eax
+#endif
+    pushq   %rbp
+    pushq   %rbx
+    pushq   %r12
+    pushq   %r13
+    pushq   %r14
+    pushq   %r15
+#ifdef _WIN32
+    subq    $56, %rsp
+    movq    %rcx, %r12
+    movq    %rdx, %r13
+    movq    %r8, %r14
+    movq    %r10, %r15
+    movq    %r11, %rbx
+    movl    %eax, 32(%rsp)
+#define LFM_RANGE_THETA 32
+#define LFM_RANGE_ANGLE 36
+#define LFM_RANGE_DIM 40
+#else
+    subq    $24, %rsp
+    movq    %rdi, %r12
+    movq    %rsi, %r13
+    movq    %rdx, %r14
+    movq    %rcx, %r15
+    movq    %r8, %rbx
+    movss   %xmm0, 0(%rsp)
+#define LFM_RANGE_THETA 0
+#define LFM_RANGE_ANGLE 4
+#define LFM_RANGE_DIM 8
+#endif
+    testq   %r13, %r13
+    jz      8f
+    testq   %r14, %r14
+    jz      8f
+    testq   $1, %r14
+    jnz     8f
+    testq   %r15, %r15
+    jz      8f
+    testq   %rbx, %rbx
+    jz      8f
+    xorps   %xmm1, %xmm1
+    movss   LFM_RANGE_THETA(%rsp), %xmm0
+    ucomiss %xmm1, %xmm0
+    jbe     8f
+    movq    %r13, %rax
+    decq    %rax
+    addq    %r12, %rax
+    jc      9f
+    testq   %rax, %rax
+    js      9f
+
+    xorl    %ebp, %ebp
+5:
+    movq    $0, LFM_RANGE_DIM(%rsp)
+6:
+    pxor    %xmm1, %xmm1
+    cvtsi2ssq LFM_RANGE_DIM(%rsp), %xmm1
+    addss   %xmm1, %xmm1
+    pxor    %xmm2, %xmm2
+    cvtsi2ssq %r14, %xmm2
+    divss   %xmm2, %xmm1
+    movss   LFM_RANGE_THETA(%rsp), %xmm0
+    call    LFM_CALL(powf)
+
+    leaq    (%r12,%rbp), %rax
+    pxor    %xmm1, %xmm1
+    cvtsi2ssq %rax, %xmm1
+    divss   %xmm0, %xmm1
+    movss   %xmm1, LFM_RANGE_ANGLE(%rsp)
+    movaps  %xmm1, %xmm0
+    call    LFM_CALL(cosf)
+    movss   %xmm0, (%r15)
+    movss   LFM_RANGE_ANGLE(%rsp), %xmm0
+    call    LFM_CALL(sinf)
+    movss   %xmm0, (%rbx)
+
+    addq    $4, %r15
+    addq    $4, %rbx
+    incq    LFM_RANGE_DIM(%rsp)
+    movq    %r14, %rax
+    shrq    $1, %rax
+    cmpq    %rax, LFM_RANGE_DIM(%rsp)
+    jb      6b
+    incq    %rbp
+    cmpq    %r13, %rbp
+    jb      5b
+    xorl    %eax, %eax
+    jmp     10f
+
+8:
+    movl    $-22, %eax
+    jmp     10f
+9:
+    movl    $-75, %eax
+10:
+#ifdef _WIN32
+    addq    $56, %rsp
+#else
+    addq    $24, %rsp
+#endif
+    popq    %r15
+    popq    %r14
+    popq    %r13
+    popq    %r12
+    popq    %rbx
+    popq    %rbp
+    ret
+
+#undef LFM_RANGE_THETA
+#undef LFM_RANGE_ANGLE
+#undef LFM_RANGE_DIM
+
 #if !defined(__APPLE__) && !defined(_WIN32)
 .section .note.GNU-stack,"",@progbits
 #endif

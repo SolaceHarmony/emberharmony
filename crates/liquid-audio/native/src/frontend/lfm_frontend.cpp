@@ -48,9 +48,10 @@ int lfm_rowstat_f32(const float *x, uint64_t rows, uint64_t cols, uint64_t valid
                     float constant, float *mean_out, float *std_out);
 void lfm_norm_apply_f32(float *x, const float *mean, const float *std,
                         uint64_t rows, uint64_t cols);
+void lfm_f32_to_bf16(const float *input, uint16_t *output, int count);
 void lfm_resample_conv_f64(const double *padded, uint64_t padded_len,
                            const double *kernels, uint64_t phases, uint64_t klen,
-                           uint64_t stride, float *out, uint64_t max_blocks);
+                           uint64_t stride, float *out, uint64_t max_values);
 }
 
 namespace {
@@ -102,6 +103,26 @@ struct LfmFrontendWorkspace {
     uint64_t capacity = 0;
 
     ~LfmFrontendWorkspace() { std::free(values); }
+};
+
+struct LfmResampler {
+    uint32_t orig_freq = 0;
+    uint32_t new_freq = 0;
+    uint64_t orig = 0;       // gcd-reduced input rate
+    uint64_t phases = 0;     // gcd-reduced output rate
+    uint64_t width = 0;
+    uint64_t kernel_len = 0;
+    double *kernels = nullptr;
+
+    ~LfmResampler() { std::free(kernels); }
+};
+
+struct LfmResamplerWorkspace {
+    std::mutex lock;
+    double *padded = nullptr;
+    uint64_t capacity = 0;
+
+    ~LfmResamplerWorkspace() { std::free(padded); }
 };
 
 namespace {
@@ -212,6 +233,136 @@ uint64_t seq_len_of(const LfmFrontendConfig &c, uint64_t l) {
     return c.n_window_stride > 0 ? numer / c.n_window_stride : 0;
 }
 
+struct FrontendRun {
+    uint64_t seq_len = 0;
+    uint64_t pad = 0;
+    uint64_t signal_len = 0;
+    uint64_t center = 0;
+    uint64_t frames = 0;
+    uint64_t out_frames = 0;
+    uint64_t cols = 0;
+    uint64_t stride = 0;
+    uint64_t power_values = 0;
+    uint64_t plane_a_values = 0;
+    uint64_t plane_b_values = 0;
+    uint64_t workspace_values = 0;
+    uint64_t output_values = 0;
+};
+
+int frontend_run(const LfmFrontend *f, uint64_t l, bool valid_only,
+                 bool bf16_output, FrontendRun *run) {
+    if (!f || !run || l == 0 || (bf16_output && !valid_only)) return -EINVAL;
+    const LfmFrontendConfig &c = f->cfg;
+    FrontendRun next{};
+    next.seq_len = seq_len_of(c, l);
+    next.pad = c.exact_pad
+                   ? ((uint64_t)c.n_fft - c.n_window_stride) / 2
+                   : 0;
+    uint64_t twice = 0;
+    if (!mul_u64(2, next.pad, &twice) ||
+        !add_u64(l, twice, &next.signal_len)) {
+        return -EOVERFLOW;
+    }
+    next.center = c.exact_pad ? 0 : (uint64_t)c.n_fft / 2;
+    if (!frame_count(c, next.signal_len, next.center, &next.frames)) {
+        return -EOVERFLOW;
+    }
+    if (next.frames == 0 || next.seq_len > next.frames) return -EINVAL;
+    next.out_frames = next.frames;
+    if (c.pad_to > 0 && next.frames % c.pad_to != 0 &&
+        !add_u64(next.frames, c.pad_to - next.frames % c.pad_to,
+                 &next.out_frames)) {
+        return -EOVERFLOW;
+    }
+    next.cols = valid_only ? next.seq_len : next.frames;
+    next.stride = valid_only ? next.seq_len : next.out_frames;
+    if (valid_only && next.seq_len == 0) return -EINVAL;
+
+    uint64_t frame_values = 0;
+    uint64_t stft_values = 0;
+    uint64_t stat_values = 0;
+    uint64_t mel_values = 0;
+    if (!mul_u64(c.n_fft, next.cols, &frame_values) ||
+        !mul_u64(2 * (uint64_t)f->freq, next.cols, &stft_values) ||
+        !mul_u64(f->freq, next.cols, &next.power_values) ||
+        !mul_u64(2, c.nfilt, &stat_values) ||
+        !mul_u64(c.nfilt, next.cols, &mel_values) ||
+        !mul_u64(c.nfilt, next.stride, &next.output_values)) {
+        return -EOVERFLOW;
+    }
+
+    // The signal plane becomes STFT/power. The frame plane becomes the f32 mel
+    // plane only for the BF16 production seam; after mel GEMM the now-dead
+    // power plane holds row statistics. No simultaneously-live values alias.
+    next.plane_a_values = std::max(next.signal_len, stft_values);
+    next.plane_b_values = std::max(frame_values, stat_values);
+    if (bf16_output) {
+        next.plane_a_values = std::max(next.plane_a_values, stat_values);
+        next.plane_b_values = std::max(next.plane_b_values, mel_values);
+    }
+    if (!add_u64(next.plane_a_values, next.plane_b_values,
+                 &next.workspace_values) ||
+        next.workspace_values >
+            std::numeric_limits<size_t>::max() / sizeof(float) ||
+        next.output_values >
+            std::numeric_limits<size_t>::max() /
+                (bf16_output ? sizeof(uint16_t) : sizeof(float)) ||
+        next.cols > INT_MAX || c.n_fft > INT_MAX || c.nfilt > INT_MAX ||
+        f->freq > INT_MAX || 2 * (uint64_t)f->freq > INT_MAX ||
+        next.stride > INT_MAX || (bf16_output && next.cols > INT_MAX)) {
+        return -EOVERFLOW;
+    }
+    *run = next;
+    return 0;
+}
+
+int reserve_frontend(const LfmFrontend *f, LfmFrontendWorkspace *workspace,
+                     uint64_t max_samples, uint32_t flags) {
+    if (!f || !workspace ||
+        (flags & ~(LFM_FRONTEND_FORWARD_VALID_ONLY |
+                   LFM_FRONTEND_WORKSPACE_BF16_OUTPUT)) ||
+        ((flags & LFM_FRONTEND_WORKSPACE_BF16_OUTPUT) &&
+         !(flags & LFM_FRONTEND_FORWARD_VALID_ONLY))) {
+        return -EINVAL;
+    }
+    FrontendRun run{};
+    const int status = frontend_run(
+        f, max_samples, (flags & LFM_FRONTEND_FORWARD_VALID_ONLY) != 0,
+        (flags & LFM_FRONTEND_WORKSPACE_BF16_OUTPUT) != 0, &run);
+    if (status != 0) return status;
+    std::lock_guard<std::mutex> guard(workspace->lock);
+    if (workspace->capacity >= run.workspace_values) return 0;
+    float *next = (float *)std::malloc((size_t)run.workspace_values * sizeof(float));
+    if (!next) return -ENOMEM;
+    std::free(workspace->values);
+    workspace->values = next;
+    workspace->capacity = run.workspace_values;
+    return 0;
+}
+
+bool resampler_out_length(const LfmResampler &r, uint64_t length,
+                          uint64_t *out) {
+    if (r.orig == 0 || r.phases == 0 || !out) return false;
+    const uint64_t whole = length / r.orig;
+    const uint64_t tail = length % r.orig;
+    uint64_t base = 0;
+    uint64_t tail_scaled = 0;
+    if (!mul_u64(whole, r.phases, &base) ||
+        !mul_u64(tail, r.phases, &tail_scaled)) {
+        return false;
+    }
+    const uint64_t extra = tail_scaled / r.orig +
+                           (tail_scaled % r.orig != 0 ? 1 : 0);
+    return add_u64(base, extra, out);
+}
+
+bool resampler_padded_length(const LfmResampler &r, uint64_t length,
+                             uint64_t *out) {
+    uint64_t edges = 0;
+    return add_u64(2 * r.width, r.orig, &edges) &&
+           add_u64(length, edges, out);
+}
+
 } // namespace
 
 extern "C" int lfm_frontend_create(const LfmFrontendConfig *config, LfmFrontend **out) {
@@ -264,6 +415,13 @@ extern "C" int lfm_frontend_destroy(LfmFrontend *f) {
     return 0;
 }
 
+extern "C" uint64_t lfm_frontend_derived_bytes(const LfmFrontend *f) {
+    if (!f) return 0;
+    const uint64_t fb = (uint64_t)f->cfg.nfilt * f->freq;
+    const uint64_t dft = (uint64_t)2 * f->freq * f->cfg.n_fft;
+    return (fb + dft) * sizeof(float);
+}
+
 extern "C" int lfm_frontend_workspace_create(LfmFrontendWorkspace **out) {
     if (!out) return -EINVAL;
     *out = new (std::nothrow) LfmFrontendWorkspace();
@@ -274,6 +432,12 @@ extern "C" int lfm_frontend_workspace_destroy(LfmFrontendWorkspace *workspace) {
     if (!workspace) return -EINVAL;
     delete workspace;
     return 0;
+}
+
+extern "C" int lfm_frontend_workspace_reserve(
+    const LfmFrontend *f, LfmFrontendWorkspace *workspace,
+    uint64_t max_sample_count, uint32_t flags) {
+    return reserve_frontend(f, workspace, max_sample_count, flags);
 }
 
 extern "C" uint64_t lfm_frontend_seq_len(const LfmFrontend *f, uint64_t l) {
@@ -301,119 +465,89 @@ extern "C" int lfm_frontend_out_frames(const LfmFrontend *f, uint64_t l,
 namespace {
 
 int frontend_forward(const LfmFrontend *f, LfmFrontendWorkspace *workspace,
-                     const float *pcm, uint64_t l, float *out_mel,
-                     uint64_t out_capacity_values, bool valid_only) {
+                     const float *pcm, uint64_t l, void *out_mel,
+                     uint64_t out_capacity_values, bool valid_only,
+                     bool bf16_output) {
     if (!f || !workspace || !pcm || !out_mel || l == 0) return -EINVAL;
     const LfmFrontendConfig &c = f->cfg;
     const uint64_t freq = f->freq;
-    const uint64_t seq_len = seq_len_of(c, l);
-
-    const uint64_t p = c.exact_pad ? ((uint64_t)c.n_fft - c.n_window_stride) / 2 : 0;
-    uint64_t twice = 0;
-    uint64_t li = 0;
-    if (!mul_u64(2, p, &twice) || !add_u64(l, twice, &li)) return -EOVERFLOW;
-    const uint64_t center = c.exact_pad ? 0 : (uint64_t)c.n_fft / 2;
-    uint64_t t = 0;
-    if (!frame_count(c, li, center, &t)) return -EOVERFLOW;
-    if (t == 0 || seq_len > t) return -EINVAL;
-    uint64_t t_out = t;
-    if (c.pad_to > 0 && t % c.pad_to != 0 &&
-        !add_u64(t, c.pad_to - t % c.pad_to, &t_out))
-        return -EOVERFLOW;
-    const uint64_t cols = valid_only ? seq_len : t;
-    const uint64_t stride = valid_only ? seq_len : t_out;
-    uint64_t output_values = 0;
-    if (!mul_u64(c.nfilt, stride, &output_values) ||
-        output_values > std::numeric_limits<size_t>::max() / sizeof(float))
-        return -EOVERFLOW;
-    if (out_capacity_values < output_values) return -EINVAL;
-    if (valid_only && seq_len == 0) return -EINVAL;
+    FrontendRun run{};
+    const int geometry = frontend_run(f, l, valid_only, bf16_output, &run);
+    if (geometry != 0) return geometry;
+    if (out_capacity_values < run.output_values) return -EINVAL;
 
     // seq_len == 0: the reference's normalization NaNs never survive because
     // the caller-side tail mask covers [0, t) — the entire clip. The defined
     // output is an all-zero plane; produce it without running the pipeline.
-    if (seq_len == 0) {
-        std::memset(out_mel, 0, (size_t)output_values * sizeof(float));
+    if (run.seq_len == 0) {
+        std::memset(out_mel, 0,
+                    (size_t)run.output_values *
+                        (bf16_output ? sizeof(uint16_t) : sizeof(float)));
         return 0;
     }
 
-    uint64_t n_frames = 0;
-    uint64_t n_stft = 0;
-    uint64_t n_power = 0;
-    uint64_t stats = 0;
-    if (!mul_u64(c.n_fft, cols, &n_frames) ||
-        !mul_u64(2 * freq, cols, &n_stft) ||
-        !mul_u64(freq, cols, &n_power) || !mul_u64(2, c.nfilt, &stats))
-        return -EOVERFLOW;
-    const uint64_t n_a = std::max(li, n_stft);
-    const uint64_t n_b = std::max(n_frames, stats);
-    uint64_t total = 0;
-    if (!add_u64(n_a, n_b, &total) ||
-        total > std::numeric_limits<size_t>::max() / sizeof(float) ||
-        cols > INT_MAX || c.n_fft > INT_MAX || c.nfilt > INT_MAX ||
-        freq > INT_MAX || 2 * freq > INT_MAX || stride > INT_MAX)
-        return -EOVERFLOW;
-
     std::lock_guard<std::mutex> guard(workspace->lock);
-    if (workspace->capacity < total) {
-        float *next = (float *)std::malloc((size_t)total * sizeof(float));
-        if (!next) return -ENOMEM;
-        std::free(workspace->values);
-        workspace->values = next;
-        workspace->capacity = total;
-    }
+    if (workspace->capacity < run.workspace_values) return -ENOBUFS;
     float *a = workspace->values; // signal, then DFT/power
-    float *b = a + n_a;           // frames, then row statistics
+    float *b = a + run.plane_a_values; // frames, then mel or row statistics
 
-    // Centered production reads PCM directly into the preemphasis leaf. Exact
-    // pad initializes only its actual prefix/suffix before applying that leaf
-    // in place. The reference's unusual post-preemphasis mask remains [L, Li).
+    // PCM is always borrowed. Exact padding is represented as a logical source
+    // offset during frame gather, not materialized with memcpy. Preemphasis can
+    // likewise write straight into its final logical offset because the first
+    // retained sample's predecessor is the virtual zero pad. The reference's
+    // unusual post-preemphasis mask remains the logical [L, Li) interval.
     const float *signal = pcm;
-    if (c.exact_pad) {
-        if (p > 0) std::memset(a, 0, (size_t)p * sizeof(float));
-        std::memcpy(a + p, pcm, (size_t)l * sizeof(float));
-        if (p > 0) std::memset(a + p + l, 0, (size_t)p * sizeof(float));
-        signal = a;
-        if (c.preemph != 0.0 && li > 1)
-            lfm_preemph_f32(a, a, li, (float)c.preemph);
-    } else if (c.preemph != 0.0 && li > 1) {
-        lfm_preemph_f32(pcm, a, li, (float)c.preemph);
-        signal = a;
+    const uint64_t signal_offset = c.exact_pad ? run.pad : 0;
+    if (c.preemph != 0.0 && l > 1) {
+        float *preemphasized = a + signal_offset;
+        lfm_preemph_f32(pcm, preemphasized, l, (float)c.preemph);
+        signal = preemphasized;
     }
-    if (li > l) std::memset(a + l, 0, (size_t)(li - l) * sizeof(float));
 
     // Every gathered cell is assigned; stale high-water workspace values are
     // never observed and the whole block does not need calloc/zero-fill.
-    for (uint64_t tt = 0; tt < cols; ++tt) {
+    for (uint64_t tt = 0; tt < run.cols; ++tt) {
         const uint64_t start = tt * c.n_window_stride; // index into ypad
         for (uint64_t n = 0; n < c.n_fft; ++n) {
             const uint64_t idx = start + n;
-            b[n * cols + tt] =
-                idx >= center && idx < center + li ? signal[idx - center] : 0.0f;
+            const uint64_t source = idx >= run.center ? idx - run.center : 0;
+            b[n * run.cols + tt] = idx >= run.center &&
+                                            source >= signal_offset && source < l
+                                        ? signal[source - signal_offset]
+                                        : 0.0f;
         }
     }
 
     // Frames are dead after DFT, and signal is dead before it: the two planes
     // alternate ownership. Power aliases the real DFT half exactly, and mel is
     // written directly into the caller's final row stride.
-    sgemm_rm((int)(2 * freq), (int)cols, (int)c.n_fft, f->dft,
-             (int)c.n_fft, b, (int)cols, a, (int)cols);
-    lfm_power_spec_f32(a, a + n_power, a, n_power);
-    sgemm_rm((int)c.nfilt, (int)cols, (int)freq, f->fb, (int)freq, a,
-             (int)cols, out_mel, (int)stride);
+    sgemm_rm((int)(2 * freq), (int)run.cols, (int)c.n_fft, f->dft,
+             (int)c.n_fft, b, (int)run.cols, a, (int)run.cols);
+    lfm_power_spec_f32(a, a + run.power_values, a, run.power_values);
+    float *mel = bf16_output ? b : static_cast<float *>(out_mel);
+    const uint64_t mel_stride = bf16_output ? run.cols : run.stride;
+    sgemm_rm((int)c.nfilt, (int)run.cols, (int)freq, f->fb, (int)freq,
+             a, (int)run.cols, mel, (int)mel_stride);
 
-    float *mean = b;
+    float *mean = bf16_output ? a : b;
     float *stdv = b + c.nfilt;
+    if (bf16_output) stdv = a + c.nfilt;
     for (uint64_t r = 0; r < c.nfilt; ++r) {
-        float *row = out_mel + r * stride;
-        if (lfm_log_add_f32(row, seq_len, (float)c.log_zero_guard_value) != 0 ||
-            lfm_rowstat_f32(row, 1, seq_len, seq_len, 1e-5f, mean + r,
+        float *row = mel + r * mel_stride;
+        if (lfm_log_add_f32(row, run.seq_len,
+                            (float)c.log_zero_guard_value) != 0 ||
+            lfm_rowstat_f32(row, 1, run.seq_len, run.seq_len, 1e-5f, mean + r,
                             stdv + r) != 0)
             return -EINVAL;
-        lfm_norm_apply_f32(row, mean + r, stdv + r, 1, seq_len);
-        if (!valid_only && stride > seq_len)
-            std::memset(row + seq_len, 0,
-                        (size_t)(stride - seq_len) * sizeof(float));
+        lfm_norm_apply_f32(row, mean + r, stdv + r, 1, run.seq_len);
+        if (bf16_output) {
+            lfm_f32_to_bf16(row,
+                            static_cast<uint16_t *>(out_mel) + r * run.cols,
+                            (int)run.cols);
+        } else if (!valid_only && run.stride > run.seq_len) {
+            std::memset(row + run.seq_len, 0,
+                        (size_t)(run.stride - run.seq_len) * sizeof(float));
+        }
     }
     return 0;
 }
@@ -426,15 +560,25 @@ extern "C" int lfm_frontend_forward_workspace(
     if (flags & ~LFM_FRONTEND_FORWARD_VALID_ONLY) return -EINVAL;
     return frontend_forward(f, workspace, pcm, l, out_mel,
                             out_capacity_values,
-                            (flags & LFM_FRONTEND_FORWARD_VALID_ONLY) != 0);
+                            (flags & LFM_FRONTEND_FORWARD_VALID_ONLY) != 0,
+                            false);
+}
+
+extern "C" int lfm_frontend_forward_bf16_workspace(
+    const LfmFrontend *f, LfmFrontendWorkspace *workspace, const float *pcm,
+    uint64_t l, uint16_t *out_mel, uint64_t out_capacity_values) {
+    return frontend_forward(f, workspace, pcm, l, out_mel,
+                            out_capacity_values, true, true);
 }
 
 extern "C" int lfm_frontend_forward(const LfmFrontend *f, const float *pcm,
                                     uint64_t l, float *out_mel,
                                     uint64_t out_capacity_values) {
     LfmFrontendWorkspace workspace;
+    const int reserved = reserve_frontend(f, &workspace, l, 0);
+    if (reserved != 0) return reserved;
     return frontend_forward(f, &workspace, pcm, l, out_mel,
-                            out_capacity_values, false);
+                            out_capacity_values, false, false);
 }
 
 extern "C" int lfm_frontend_forward_valid(const LfmFrontend *f,
@@ -442,72 +586,209 @@ extern "C" int lfm_frontend_forward_valid(const LfmFrontend *f,
                                           float *out_mel,
                                           uint64_t out_capacity_values) {
     LfmFrontendWorkspace workspace;
+    const int reserved = reserve_frontend(
+        f, &workspace, l, LFM_FRONTEND_FORWARD_VALID_ONLY);
+    if (reserved != 0) return reserved;
     return frontend_forward(f, &workspace, pcm, l, out_mel,
-                            out_capacity_values, true);
+                            out_capacity_values, true, false);
 }
 
-extern "C" int lfm_resample_f32(const float *x, uint64_t length, uint32_t orig_freq,
-                                uint32_t new_freq, float *out, uint64_t out_capacity,
-                                uint64_t *out_length) {
-    if (!x || !out || !out_length || orig_freq == 0 || new_freq == 0) return -EINVAL;
-    if (orig_freq == new_freq || length == 0) {
-        if (out_capacity < length) return -EINVAL;
-        std::memcpy(out, x, (size_t)length * sizeof(float));
-        *out_length = length;
+extern "C" int lfm_resampler_create(uint32_t orig_freq, uint32_t new_freq,
+                                    LfmResampler **out) {
+    if (!out || orig_freq == 0 || new_freq == 0) return -EINVAL;
+    *out = nullptr;
+    LfmResampler *r = new (std::nothrow) LfmResampler();
+    if (!r) return -ENOMEM;
+    r->orig_freq = orig_freq;
+    r->new_freq = new_freq;
+
+    uint64_t gcd = orig_freq;
+    uint64_t b = new_freq;
+    while (b != 0) {
+        const uint64_t next = gcd % b;
+        gcd = b;
+        b = next;
+    }
+    r->orig = orig_freq / gcd;
+    r->phases = new_freq / gcd;
+    if (orig_freq == new_freq) {
+        *out = r;
         return 0;
     }
-    // gcd-reduced rates; torchaudio defaults lowpass_filter_width=6, rolloff=0.99.
-    uint64_t a = orig_freq, b = new_freq;
-    while (b != 0) {
-        const uint64_t r = a % b;
-        a = b;
-        b = r;
+
+    const double base = (double)std::min(r->orig, r->phases) * 0.99;
+    r->width = (uint64_t)std::ceil(6.0 * (double)r->orig / base);
+    if (!add_u64(2 * r->width, r->orig, &r->kernel_len)) {
+        delete r;
+        return -EOVERFLOW;
     }
-    const int64_t orig = (int64_t)(orig_freq / a);
-    const int64_t nw = (int64_t)(new_freq / a);
-    const double base = (double)(orig < nw ? orig : nw) * 0.99;
-    const int64_t width = (int64_t)std::ceil(6.0 * (double)orig / base);
-    const uint64_t klen = (uint64_t)(2 * width + orig);
-    const double scale = base / (double)orig;
-
-    const uint64_t target =
-        (uint64_t)std::ceil(((double)nw * (double)length) / (double)orig);
-    if (out_capacity < target) return -EINVAL;
-
-    double *kernels = (double *)std::malloc((size_t)nw * klen * sizeof(double));
-    const uint64_t padded_len = (uint64_t)width + length + (uint64_t)(width + orig);
-    double *padded = (double *)std::calloc(padded_len, sizeof(double));
-    const uint64_t blocks = padded_len >= klen ? (padded_len - klen) / (uint64_t)orig + 1 : 0;
-    float *conv = (float *)std::malloc((size_t)(blocks * (uint64_t)nw + 1) * sizeof(float));
-    if (!kernels || !padded || !conv) {
-        std::free(kernels);
-        std::free(padded);
-        std::free(conv);
+    uint64_t kernel_values = 0;
+    if (!mul_u64(r->phases, r->kernel_len, &kernel_values) ||
+        kernel_values > std::numeric_limits<size_t>::max() / sizeof(double)) {
+        delete r;
+        return -EOVERFLOW;
+    }
+    r->kernels = (double *)std::malloc((size_t)kernel_values * sizeof(double));
+    if (!r->kernels) {
+        delete r;
         return -ENOMEM;
     }
-    // One kernel per output phase i: t = (-i/new + idx/orig)*base clamped to
-    // +/-6; hann^2 window; sinc; times scale. f64 throughout (the reference).
-    for (int64_t i = 0; i < nw; ++i) {
-        for (int64_t j = 0; j < 2 * width + orig; ++j) {
-            const int64_t idx = -width + j;
-            double tt = (-(double)i / (double)nw + (double)idx / (double)orig) * base;
+    const double scale = base / (double)r->orig;
+    for (uint64_t phase = 0; phase < r->phases; ++phase) {
+        for (uint64_t j = 0; j < r->kernel_len; ++j) {
+            const int64_t idx = -(int64_t)r->width + (int64_t)j;
+            double tt = (-(double)phase / (double)r->phases +
+                         (double)idx / (double)r->orig) *
+                        base;
             if (tt < -6.0) tt = -6.0;
             if (tt > 6.0) tt = 6.0;
-            const double window = std::pow(std::cos(tt * M_PI / 6.0 / 2.0), 2.0);
+            const double window =
+                std::pow(std::cos(tt * M_PI / 6.0 / 2.0), 2.0);
             const double tp = tt * M_PI;
             const double sinc = tp == 0.0 ? 1.0 : std::sin(tp) / tp;
-            kernels[(size_t)i * klen + (size_t)j] = sinc * window * scale;
+            r->kernels[(size_t)phase * r->kernel_len + (size_t)j] =
+                sinc * window * scale;
         }
     }
-    for (uint64_t i = 0; i < length; ++i) padded[(uint64_t)width + i] = (double)x[i];
-
-    lfm_resample_conv_f64(padded, padded_len, kernels, (uint64_t)nw, klen,
-                          (uint64_t)orig, conv, blocks);
-
-    std::memcpy(out, conv, (size_t)target * sizeof(float));
-    *out_length = target;
-    std::free(conv);
-    std::free(padded);
-    std::free(kernels);
+    *out = r;
     return 0;
+}
+
+extern "C" int lfm_resampler_destroy(LfmResampler *resampler) {
+    if (!resampler) return -EINVAL;
+    delete resampler;
+    return 0;
+}
+
+extern "C" uint64_t lfm_resampler_derived_bytes(
+    const LfmResampler *resampler) {
+    if (!resampler || !resampler->kernels) return 0;
+    uint64_t values = 0;
+    return mul_u64(resampler->phases, resampler->kernel_len, &values)
+               ? values * sizeof(double)
+               : 0;
+}
+
+extern "C" int lfm_resampler_out_length(const LfmResampler *resampler,
+                                         uint64_t sample_count,
+                                         uint64_t *out_length) {
+    if (!resampler || !out_length) return -EINVAL;
+    return resampler_out_length(*resampler, sample_count, out_length)
+               ? 0
+               : -EOVERFLOW;
+}
+
+extern "C" int lfm_resampler_workspace_create(
+    LfmResamplerWorkspace **out) {
+    if (!out) return -EINVAL;
+    *out = new (std::nothrow) LfmResamplerWorkspace();
+    return *out ? 0 : -ENOMEM;
+}
+
+extern "C" int lfm_resampler_workspace_destroy(
+    LfmResamplerWorkspace *workspace) {
+    if (!workspace) return -EINVAL;
+    delete workspace;
+    return 0;
+}
+
+extern "C" int lfm_resampler_workspace_reserve(
+    const LfmResampler *resampler, LfmResamplerWorkspace *workspace,
+    uint64_t max_sample_count) {
+    if (!resampler || !workspace) return -EINVAL;
+    if (resampler->orig_freq == resampler->new_freq) return 0;
+    uint64_t padded_len = 0;
+    if (!resampler_padded_length(*resampler, max_sample_count, &padded_len) ||
+        padded_len > std::numeric_limits<size_t>::max() / sizeof(double)) {
+        return -EOVERFLOW;
+    }
+    std::lock_guard<std::mutex> guard(workspace->lock);
+    if (workspace->capacity >= padded_len) return 0;
+    double *next = (double *)std::malloc((size_t)padded_len * sizeof(double));
+    if (!next) return -ENOMEM;
+    std::free(workspace->padded);
+    workspace->padded = next;
+    workspace->capacity = padded_len;
+    return 0;
+}
+
+extern "C" int lfm_resampler_process(
+    const LfmResampler *resampler, LfmResamplerWorkspace *workspace,
+    const float *input, uint64_t sample_count, float *destination,
+    uint64_t destination_capacity, LfmF32Span *result) {
+    if (!resampler || !workspace || !result ||
+        (!input && sample_count != 0)) {
+        return -EINVAL;
+    }
+    result->data = nullptr;
+    result->length = 0;
+    uint64_t target = 0;
+    if (!resampler_out_length(*resampler, sample_count, &target)) {
+        return -EOVERFLOW;
+    }
+    if (resampler->orig_freq == resampler->new_freq || sample_count == 0) {
+        result->data = input;
+        result->length = sample_count;
+        return 0;
+    }
+    if (!destination || destination_capacity < target) return -EINVAL;
+
+    uint64_t padded_len = 0;
+    if (!resampler_padded_length(*resampler, sample_count, &padded_len)) {
+        return -EOVERFLOW;
+    }
+    std::lock_guard<std::mutex> guard(workspace->lock);
+    if (workspace->capacity < padded_len) return -ENOBUFS;
+    double *padded = workspace->padded;
+    if (resampler->width > 0) {
+        std::memset(padded, 0, (size_t)resampler->width * sizeof(double));
+    }
+    for (uint64_t i = 0; i < sample_count; ++i) {
+        padded[resampler->width + i] = (double)input[i];
+    }
+    const uint64_t suffix = resampler->width + resampler->orig;
+    if (suffix > 0) {
+        std::memset(padded + resampler->width + sample_count, 0,
+                    (size_t)suffix * sizeof(double));
+    }
+    lfm_resample_conv_f64(
+        padded, padded_len, resampler->kernels, resampler->phases,
+        resampler->kernel_len, resampler->orig, destination, target);
+    result->data = destination;
+    result->length = target;
+    return 0;
+}
+
+extern "C" int lfm_resample_f32(const float *x, uint64_t length,
+                                uint32_t orig_freq, uint32_t new_freq,
+                                float *out, uint64_t out_capacity,
+                                uint64_t *out_length) {
+    if ((!x && length != 0) || !out || !out_length || orig_freq == 0 ||
+        new_freq == 0) {
+        return -EINVAL;
+    }
+    LfmResampler *plan = nullptr;
+    int status = lfm_resampler_create(orig_freq, new_freq, &plan);
+    if (status != 0) return status;
+    LfmResamplerWorkspace *workspace = nullptr;
+    status = lfm_resampler_workspace_create(&workspace);
+    if (status == 0) {
+        status = lfm_resampler_workspace_reserve(plan, workspace, length);
+    }
+    LfmF32Span span{};
+    if (status == 0) {
+        status = lfm_resampler_process(plan, workspace, x, length, out,
+                                       out_capacity, &span);
+    }
+    if (status == 0 && span.data != out) {
+        if (out_capacity < span.length) {
+            status = -EINVAL;
+        } else if (span.length != 0) {
+            std::memcpy(out, span.data, (size_t)span.length * sizeof(float));
+        }
+    }
+    if (status == 0) *out_length = span.length;
+    if (workspace) (void)lfm_resampler_workspace_destroy(workspace);
+    (void)lfm_resampler_destroy(plan);
+    return status;
 }

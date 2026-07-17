@@ -1,3 +1,5 @@
+#![cfg(feature = "oracle")]
+
 //! The REAL end-to-end: a mocked microphone and everything else live. The test
 //! streams `assets/question.wav` into the full `VoiceRuntime` service exactly as
 //! a mic driver would — 20 ms mono chunks at wall-clock cadence, silence between

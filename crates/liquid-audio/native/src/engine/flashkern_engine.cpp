@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cerrno>
 #include <climits>
 #include <cmath>
@@ -38,13 +39,6 @@
 #include <pthread.h>
 #include <utility>
 #include <vector>
-
-#ifdef __APPLE__
-#ifndef ACCELERATE_NEW_LAPACK
-#define ACCELERATE_NEW_LAPACK 1
-#endif
-#include <Accelerate/Accelerate.h>
-#endif
 
 #include "flashkern_conv.h"
 #include "flashkern_depth.h"
@@ -62,14 +56,15 @@ extern "C" {
 }
 
 // Stage kernels from the flashkern TU (same image, plain calls).
-extern "C" float lfm_bf16_sumsq_candle_f32(const uint16_t *x, int n);
+extern "C" float lfm_bf16_sumsq_candle_f32(const void *x_bytes, int n);
 extern "C" float lfm_bf16_sumsq_f32(const uint16_t *x, int n);
-extern "C" void lfm_bf16_rmsnorm(const uint16_t *x, const uint16_t *w, uint16_t *out,
+extern "C" void lfm_bf16_rmsnorm(const void *x_bytes, const void *weight_bytes, uint16_t *out,
                                  int n, float inv_rms);
 extern "C" void lfm_f32_to_bf16(const float *x, uint16_t *out, int n);
-extern "C" void lfm_bf16_add(const uint16_t *a, const uint16_t *b, uint16_t *out, int n);
+extern "C" void lfm_bf16_add(const void *a_bytes, const void *b_bytes,
+                              uint16_t *out, int n);
 extern "C" void lfm_conv1d_update_bf16(const uint16_t *bcx, const uint16_t *state,
-                                       const uint16_t *w, uint16_t *out, int bn, int d,
+                                       const void *weight_bytes, uint16_t *out, int bn, int d,
                                        int t, int k);
 extern "C" void lfm_bf16_to_f32(const uint16_t *x, float *out, int n);
 extern "C" void lfm_softmax_scaled_f32(float *x, int n, float scale);
@@ -84,7 +79,14 @@ namespace {
 
 constexpr int MAX_WORKERS = 16;
 constexpr size_t DOWN_BAND_CAP = 512; // worker-stack y[] extent
+constexpr size_t PREFILL_ROWS = LFM_PREFILL_MAX_ROWS;
 std::atomic<uint64_t> next_engine_epoch{1};
+
+static bool checked_size_product(size_t left, size_t right, size_t *out) {
+    if (left != 0 && right > SIZE_MAX / left) return false;
+    *out = left * right;
+    return true;
+}
 
 // ---- rounding helpers: exact ports of decode.rs ------------------------------------
 static inline float bf16_f32(uint16_t b) {
@@ -99,13 +101,48 @@ static inline uint16_t rb_bits(float f) {
     return (uint16_t)((u + (0x7fffu + ((u >> 16) & 1u))) >> 16);
 }
 
+using WeightBytes = const uint8_t *;
+
+static inline WeightBytes weight_offset(WeightBytes base, size_t elements) {
+    return base + elements * sizeof(uint16_t);
+}
+
+static inline WeightBytes activation_bytes(const uint16_t *values) {
+    return reinterpret_cast<WeightBytes>(values);
+}
+
+// An input to the first backbone layer is either an aligned activation plane or
+// a possibly byte-unaligned immutable embedding row. Keeping the two pointer
+// types distinct prevents C++ from ever manufacturing a dereferenceable
+// uint16_t* for checkpoint storage. Selection is once per stage, never per
+// element and never per dtype.
+struct Bf16Input {
+    const uint16_t *activation = nullptr;
+    WeightBytes resident = nullptr;
+
+    static Bf16Input from_activation(const uint16_t *values) {
+        return {.activation = values};
+    }
+    static Bf16Input from_resident(WeightBytes values) {
+        return {.resident = values};
+    }
+    const void *data() const {
+        return resident ? static_cast<const void *>(resident)
+                        : static_cast<const void *>(activation);
+    }
+    Bf16Input offset(size_t elements) const {
+        return resident ? from_resident(weight_offset(resident, elements))
+                        : from_activation(activation + elements);
+    }
+};
+
 // ---- the pass (engine-owned pointers; nothing here ever rides a message) ------------
 struct Pass {
     const uint16_t *x;      // [h] bf16 bits
-    const uint16_t *norm_w; // [h]
-    const uint16_t *w1;     // [i,h]
-    const uint16_t *w3;     // [i,h]
-    const uint16_t *w2;     // [h,i]
+    WeightBytes norm_w;      // [h], resident checkpoint bytes
+    WeightBytes w1;          // [i,h]
+    WeightBytes w3;          // [i,h]
+    WeightBytes w2;          // [h,i]
     uint16_t *out;          // [h]
     size_t h, i;
     size_t tiles; // FIXED — the deterministic partial/fold order
@@ -183,6 +220,7 @@ enum : int {
     REQ_GEMM = 10,
     REQ_FFT_CONV_DD = 11,
     REQ_IRFFT_DD = 12,
+    REQ_PREFILL = 13,
 };
 
 struct PrngReq {
@@ -226,15 +264,13 @@ struct DepthwiseStreamReq {
 
 struct GemmReq {
     const uint16_t *a = nullptr;
-    const uint16_t *rhs = nullptr;
-    float *amx_a = nullptr;
-    float *amx_rhs = nullptr;
+    const void *rhs = nullptr;
     float *out = nullptr;
     size_t m = 0;
     size_t n = 0;
     size_t k = 0;
     uint32_t rhs_layout = LFM_GEMM_RHS_KN;
-    bool use_amx = false;
+    bool direct = false;
 };
 
 struct Dd {
@@ -271,8 +307,8 @@ struct DepthPlan {
     uint64_t id = 0;
     std::vector<LfmDepthLayerV1> layers;
     std::vector<LfmDepthHeadV1> heads;
-    const uint16_t *depth_linear_w = nullptr;
-    const uint16_t *depth_linear_b = nullptr;
+    const uint8_t *depth_linear_w = nullptr;
+    const uint8_t *depth_linear_b = nullptr;
     const float *cos = nullptr;
     const float *sin = nullptr;
     size_t dim = 0;
@@ -293,15 +329,18 @@ struct DepthPlan {
 struct BackbonePlan {
     uint64_t id = 0;
     std::vector<LfmLayerDesc> layers;
-    const uint16_t *embed_w = nullptr;
-    const uint16_t *audio_embed_w = nullptr;
-    const uint16_t *emb_norm_w = nullptr;
+    WeightBytes embed_w = nullptr;
+    WeightBytes audio_embed_w = nullptr;
+    WeightBytes emb_norm_w = nullptr;
     float emb_norm_eps = 0.0f;
     size_t vocab = 0;
     size_t audio_rows = 0;
     size_t h = 0;
     size_t ffn = 0;
     size_t max_ctx = 0;
+    size_t qkv_max = 0;
+    size_t y_max = 0;
+    size_t kmax = 1;
 };
 
 // Conv-layer request payload: the whole shortconv+MLP layer in one doorbell; the
@@ -317,10 +356,10 @@ struct ConvReq {
 
 // Shortconv stage pointers for the workers (set by the coordinator per conv pass).
 struct ScPass {
-    const uint16_t *x = nullptr;       // block input [H]
-    const uint16_t *norm_w = nullptr;  // operator norm [H]
-    const uint16_t *in_w = nullptr;    // [3H, H]
-    const uint16_t *out_w = nullptr;   // [H, H]
+    Bf16Input x{};                     // block input [H]
+    WeightBytes norm_w = nullptr;      // operator norm [H]
+    WeightBytes in_w = nullptr;        // [3H, H]
+    WeightBytes out_w = nullptr;       // [H, H]
     uint16_t *state_out = nullptr;     // carried window out [H·(K-1)]
     size_t h = 0, k = 0;
     // planes
@@ -353,12 +392,12 @@ struct AttnReq {
 
 // Attention stage pointers for the workers.
 struct AtPass {
-    const uint16_t *o_w = nullptr; // [H, nh·hd]
+    WeightBytes o_w = nullptr;     // [H, nh·hd]
     uint16_t *qkvb = nullptr;      // rounded q|k|v rows [(nh+2·nkv)·hd]
     float *qkvf = nullptr;
     uint16_t *ybits = nullptr;     // attention output per q head [nh·hd]
     float *att = nullptr;          // per-head score scratch [nh · max_ctx]
-    const uint16_t *x = nullptr;   // residual input [H]
+    Bf16Input x{};                 // residual input [H]
     uint16_t *mid = nullptr;       // block output = MLP input [H]
     const uint16_t *k_plane = nullptr;
     const uint16_t *v_plane = nullptr;
@@ -381,6 +420,37 @@ struct TokenReq {
     uint16_t *out_hidden = nullptr; // [H] post embedding-norm bits
     float *out_logits = nullptr;    // [vocab] f32 (bf16-rounded then widened — the
                                     // linear_logits ladder)
+    const LfmSamplerConfigV1 *sampler = nullptr;
+    LfmPrngStateV1 *sample_state = nullptr;
+    uint32_t *out_token = nullptr;
+    size_t lanes = 0;
+};
+
+// Conversation-owned, fixed-capacity activation arena for one small-M prefill
+// group. It contains no weights and never grows after construction.
+struct PrefillWorkspace {
+    uint64_t model_id = 0;
+    size_t h = 0, ffn = 0, max_ctx = 0;
+    size_t qkv_max = 0, y_max = 0, kmax = 0;
+    size_t lane_count = 0;
+    std::vector<uint16_t> h0, h1, xn, gate, stage, mid;
+    std::vector<uint16_t> bcxb, projb;
+    std::vector<uint16_t> qkvb, att_y;
+    std::vector<float> gu, bcxf, projf, qkvf, scores, logits;
+};
+
+struct PrefillReq {
+    PrefillWorkspace *workspace = nullptr;
+    const uint32_t *ids = nullptr;
+    const uint16_t *provided_rows = nullptr;
+    size_t rows = 0;
+    uint32_t embed_kind = 0;
+    const LfmLayerState *states = nullptr;
+    size_t n_states = 0;
+    size_t pos = 0;
+    const uint16_t *cos_base = nullptr;
+    const uint16_t *sin_base = nullptr;
+    uint16_t *out_hidden = nullptr;
     const LfmSamplerConfigV1 *sampler = nullptr;
     LfmPrngStateV1 *sample_state = nullptr;
     uint32_t *out_token = nullptr;
@@ -476,6 +546,7 @@ struct Engine {
     BackbonePlan *model = nullptr;
     uint64_t model_seq = 0;
     TokenReq tok; // token-pass request payload
+    PrefillReq prefill;
 
     // Persistent scratch backing. With a ctx built everything is sized ONCE there
     // (fixed-arena: no allocation during passes); the legacy per-call MLP entry still
@@ -493,10 +564,6 @@ struct Engine {
     std::vector<float> tk_logf;         // logits GEMV accumulators [vocab] (staging)
     std::vector<float> sample_weights;  // derived exp weights [largest installed vocab]
     std::vector<float> sample_heap;     // top-k values only; no logit payload copy
-    // Apple matrix-matrix staging. Capacity grows before admission; numerical
-    // lanes only widen into these fixed planes, then one fence callback enters
-    // Accelerate/AMX. No Rust buffer or allocation participates.
-    std::vector<float> gemm_amx_a, gemm_amx_rhs;
     float sample_lane_value[MAX_WORKERS] = {};
     float sample_lane_sum[MAX_WORKERS] = {};
     uint32_t sample_lane_index[MAX_WORKERS] = {};
@@ -562,7 +629,7 @@ static void run_tile(uint32_t kind, uint32_t idx, const Stage *st, Engine *e) {
         uint32_t rsb = p->rs_bits.load(std::memory_order_acquire);
         float rs;
         std::memcpy(&rs, &rsb, 4);
-        lfm_bf16_rmsnorm(p->x + begin, p->norm_w + begin, p->xn + begin,
+        lfm_bf16_rmsnorm(p->x + begin, weight_offset(p->norm_w, begin), p->xn + begin,
                          (int)(end - begin), rs);
         break;
     }
@@ -571,8 +638,10 @@ static void run_tile(uint32_t kind, uint32_t idx, const Stage *st, Engine *e) {
         size_t r1 = r0 + st->chunk < p->i ? r0 + st->chunk : p->i;
         if (r1 <= r0) break;
         size_t n = r1 - r0;
-        lfm_bf16_gemm_nt_f32(p->xn, p->w1 + r0 * p->h, p->gu + r0, 1, (int)n, (int)p->h);
-        lfm_bf16_gemm_nt_f32(p->xn, p->w3 + r0 * p->h, p->gu + p->i + r0, 1, (int)n,
+        lfm_bf16_gemm_nt_f32(p->xn, weight_offset(p->w1, r0 * p->h), p->gu + r0,
+                             1, (int)n, (int)p->h);
+        lfm_bf16_gemm_nt_f32(p->xn, weight_offset(p->w3, r0 * p->h), p->gu + p->i + r0,
+                             1, (int)n,
                              (int)p->h);
         lfm_swiglu_bf16(p->gu + r0, p->gu + p->i + r0, p->t + r0, (int)n);
         break;
@@ -584,7 +653,8 @@ static void run_tile(uint32_t kind, uint32_t idx, const Stage *st, Engine *e) {
         size_t n = r1 - r0;
         float y[DOWN_BAND_CAP]; // per-worker accumulator; chunk capped at publish
         uint16_t rounded[DOWN_BAND_CAP];
-        lfm_bf16_gemm_nt_f32(p->t, p->w2 + r0 * p->i, y, 1, (int)n, (int)p->i);
+        lfm_bf16_gemm_nt_f32(p->t, weight_offset(p->w2, r0 * p->i), y,
+                             1, (int)n, (int)p->i);
         lfm_f32_to_bf16(y, rounded, (int)n);
         lfm_bf16_add(rounded, p->x + r0, p->out + r0, (int)n);
         break;
@@ -598,7 +668,8 @@ static void run_tile(uint32_t kind, uint32_t idx, const Stage *st, Engine *e) {
         uint32_t rsb = c->rs_bits.load(std::memory_order_acquire);
         float inv_rms;
         std::memcpy(&inv_rms, &rsb, 4);
-        lfm_bf16_rmsnorm(c->x + r0, c->norm_w + r0, c->xn + r0, (int)(r1 - r0), inv_rms);
+        lfm_bf16_rmsnorm(c->x.offset(r0).data(), weight_offset(c->norm_w, r0),
+                         c->xn + r0, (int)(r1 - r0), inv_rms);
         break;
     }
     case ST_SC_INPROJ: {
@@ -607,7 +678,7 @@ static void run_tile(uint32_t kind, uint32_t idx, const Stage *st, Engine *e) {
         size_t r0 = (size_t)idx * st->chunk;
         size_t r1 = r0 + st->chunk < rows ? r0 + st->chunk : rows;
         if (r1 <= r0) break;
-        lfm_bf16_gemm_nt_f32(c->xn, c->in_w + r0 * c->h, c->bcxf + r0, 1,
+        lfm_bf16_gemm_nt_f32(c->xn, weight_offset(c->in_w, r0 * c->h), c->bcxf + r0, 1,
                              (int)(r1 - r0), (int)c->h);
         lfm_f32_to_bf16(c->bcxf + r0, c->bcxb + r0, (int)(r1 - r0));
         break;
@@ -631,10 +702,11 @@ static void run_tile(uint32_t kind, uint32_t idx, const Stage *st, Engine *e) {
         size_t r0 = (size_t)idx * st->chunk;
         size_t r1 = r0 + st->chunk < c->h ? r0 + st->chunk : c->h;
         if (r1 <= r0) break;
-        lfm_bf16_gemm_nt_f32(c->projb, c->out_w + r0 * c->h, c->projf + r0, 1,
+        lfm_bf16_gemm_nt_f32(c->projb, weight_offset(c->out_w, r0 * c->h), c->projf + r0, 1,
                              (int)(r1 - r0), (int)c->h);
         lfm_f32_to_bf16(c->projf + r0, c->stage + r0, (int)(r1 - r0));
-        lfm_bf16_add(c->stage + r0, c->x + r0, c->mid + r0, (int)(r1 - r0));
+        lfm_bf16_add(c->stage + r0, c->x.offset(r0).data(), c->mid + r0,
+                     (int)(r1 - r0));
         break;
     }
     case ST_AT_QKV: {
@@ -649,7 +721,7 @@ static void run_tile(uint32_t kind, uint32_t idx, const Stage *st, Engine *e) {
         size_t r1 = r0 + st->chunk < total ? r0 + st->chunk : total;
         size_t r = r0;
         while (r < r1) {
-            const uint16_t *w;
+            WeightBytes w;
             size_t seg0, seglen;
             if (r < qrows) {
                 w = d->q_w;
@@ -666,7 +738,8 @@ static void run_tile(uint32_t kind, uint32_t idx, const Stage *st, Engine *e) {
             }
             size_t seg_end = seg0 + seglen;
             size_t stop = r1 < seg_end ? r1 : seg_end;
-            lfm_bf16_gemm_nt_f32(e->sc_xn.data(), w + (r - seg0) * a->h, a->qkvf + r, 1,
+            lfm_bf16_gemm_nt_f32(e->sc_xn.data(), weight_offset(w, (r - seg0) * a->h),
+                                 a->qkvf + r, 1,
                                  (int)(stop - r), (int)a->h);
             lfm_f32_to_bf16(a->qkvf + r, a->qkvb + r, (int)(stop - r));
             r = stop;
@@ -705,10 +778,11 @@ static void run_tile(uint32_t kind, uint32_t idx, const Stage *st, Engine *e) {
         float yf[DOWN_BAND_CAP];
         (void)yf;
         ScPass *c = &e->sc; // reuse projf/stage planes (conv pass is never concurrent)
-        lfm_bf16_gemm_nt_f32(a->ybits, a->o_w + r0 * kdim, c->projf + r0, 1,
+        lfm_bf16_gemm_nt_f32(a->ybits, weight_offset(a->o_w, r0 * kdim), c->projf + r0, 1,
                              (int)(r1 - r0), (int)kdim);
         lfm_f32_to_bf16(c->projf + r0, c->stage + r0, (int)(r1 - r0));
-        lfm_bf16_add(c->stage + r0, a->x + r0, a->mid + r0, (int)(r1 - r0));
+        lfm_bf16_add(c->stage + r0, a->x.offset(r0).data(), a->mid + r0,
+                     (int)(r1 - r0));
         break;
     }
     case ST_LOGITS: {
@@ -729,7 +803,7 @@ static void run_tile(uint32_t kind, uint32_t idx, const Stage *st, Engine *e) {
         if (r1 <= r0) break;
         float *acc = ee->tk_logf.data() + r0;
         lfm_bf16_gemm_nt_f32(t->out_hidden,
-                             ee->model->embed_w + r0 * ee->model->h, acc, 1,
+                             weight_offset(ee->model->embed_w, r0 * ee->model->h), acc, 1,
                              (int)(r1 - r0), (int)ee->model->h);
         if (t->out_logits)
             std::memcpy(t->out_logits + r0, ee->tk_logf.data() + r0,
@@ -970,8 +1044,8 @@ static void run_sampler(Engine *e, uint32_t lane, const SampleReq &sample) {
     });
 }
 
-static inline const uint16_t *depth_u16(const LfmDepthBufferV1 &view) {
-    return reinterpret_cast<const uint16_t *>(view.address);
+static inline const uint8_t *depth_bytes(const LfmDepthBufferV1 &view) {
+    return reinterpret_cast<const uint8_t *>(view.address);
 }
 
 static inline const float *depth_f32(const LfmDepthBufferV1 &view) {
@@ -991,8 +1065,9 @@ static inline void depth_gemv(const LfmDepthBufferV1 &weight, const uint16_t *x,
     size_t begin = 0, end = 0;
     depth_band(rows, lane, lanes, &begin, &end);
     if (end > begin)
-        lfm_bf16_gemm_nt_f32(x, depth_u16(weight) + begin * cols, out + begin,
-                             1, (int)(end - begin), (int)cols);
+        lfm_bf16_gemm_nt_f32(
+            x, depth_bytes(weight) + begin * cols * sizeof(uint16_t),
+            out + begin, 1, (int)(end - begin), (int)cols);
 }
 
 static void depth_norm(Engine *e, uint32_t lane, const uint16_t *x,
@@ -1007,8 +1082,9 @@ static void depth_norm(Engine *e, uint32_t lane, const uint16_t *x,
     float total = lfm_sum_f32(d.partials, e->lanes_total);
     const float inv_rms = lfm_inv_rms_f32(total, d.dim, d.eps);
     if (end > begin)
-        lfm_bf16_rmsnorm(x + begin, depth_u16(weight) + begin, out + begin,
-                         (int)(end - begin), inv_rms);
+        lfm_bf16_rmsnorm(
+            x + begin, depth_bytes(weight) + begin * sizeof(uint16_t),
+            out + begin, (int)(end - begin), inv_rms);
     lane_fence(e, lane, [] {});
 }
 
@@ -1019,7 +1095,7 @@ static void depth_qk_head(const DepthPlan &d, const uint16_t *src,
     float rotated[128];
     const float sum = lfm_bf16_sumsq_f32(src, (int)d.hd);
     const float inv_rms = lfm_inv_rms_f32(sum, d.hd, d.eps);
-    lfm_bf16_rmsnorm(src, depth_u16(weight), normed, (int)d.hd, inv_rms);
+    lfm_bf16_rmsnorm(src, depth_bytes(weight), normed, (int)d.hd, inv_rms);
     lfm_bf16_to_f32(normed, rotated, (int)d.hd);
     const size_t half = d.hd / 2;
     lfm_rope_i_f32(rotated, d.cos + position * half, d.sin + position * half,
@@ -1047,7 +1123,8 @@ static void run_depth_frame(Engine *e, uint32_t lane) {
     depth_band(d.codebooks * d.dim, lane, lanes, &begin, &end);
     if (end > begin)
         lfm_bf16_bias_add_f32(d.proj_f.data() + begin,
-                              d.depth_linear_b + begin, end - begin);
+                              d.depth_linear_b + begin * sizeof(uint16_t),
+                              end - begin);
     if (end > begin)
         lfm_f32_to_bf16(d.proj_f.data() + begin, d.din_b.data() + begin,
                         (int)(end - begin));
@@ -1178,8 +1255,10 @@ static void run_depth_frame(Engine *e, uint32_t lane) {
 
         const size_t token = request.out_tokens[codebook];
         depth_band(d.dim, lane, lanes, &begin, &end);
-        const uint16_t *embedding = depth_u16(head.embedding) + token * d.dim;
-        std::copy(embedding + begin, embedding + end, d.df_b.begin() + begin);
+        lfm_bf16_copy_bytes(
+            depth_bytes(head.embedding) +
+                (token * d.dim + begin) * sizeof(uint16_t),
+            d.df_b.data() + begin, end - begin);
         lane_fence(e, lane, [] {});
     }
 }
@@ -1220,7 +1299,7 @@ static void run_mlp(Engine *e, uint32_t lane, uint32_t tiles, F &&first_pre) {
 // the layer's ffn weights with the conv output as its input — all without leaving
 // the engine. Every lane executes this whole function with identical arguments.
 static void run_conv_block(Engine *e, uint32_t lane, const LfmLayerDesc *d,
-                           const uint16_t *x, const uint16_t *state_in,
+                           Bf16Input x, const uint16_t *state_in,
                            uint16_t *state_out, uint16_t *out, size_t lanes) {
     ScPass *c = &e->sc;
     const size_t h = e->model->h;
@@ -1247,7 +1326,7 @@ static void run_conv_block(Engine *e, uint32_t lane, const LfmLayerDesc *d,
         c->projb = e->sc_projb.data();
         c->stage = e->sc_stage.data();
         c->mid = e->sc_mid.data();
-        float total = lfm_bf16_sumsq_candle_f32(x, (int)h);
+        float total = lfm_bf16_sumsq_candle_f32(x.data(), (int)h);
         float inv_rms = lfm_inv_rms_f32(total, h, d->op_eps);
         uint32_t rsb;
         std::memcpy(&rsb, &inv_rms, 4);
@@ -1297,7 +1376,7 @@ static void run_conv_block(Engine *e, uint32_t lane, const LfmLayerDesc *d,
 
 // candle RmsNorm::forward over one head row: ALL f32 arithmetic (upcast, mean via the
 // candle-order sum, +eps, sqrt, recip, muls), ONE bf16 storage round at the end.
-static void qk_norm_row(const uint16_t *x, const uint16_t *w, uint16_t *out, size_t hd,
+static void qk_norm_row(const uint16_t *x, WeightBytes w, uint16_t *out, size_t hd,
                         float eps) {
     float total = lfm_bf16_sumsq_candle_f32(x, (int)hd);
     float inv = lfm_inv_rms_f32(total, hd, eps);
@@ -1319,7 +1398,7 @@ static void rope_slow_row(uint16_t *x, const uint16_t *cos_row, const uint16_t *
 // GEMVs and rides ST_AT_HEAD's fence serial. Every lane executes this whole function
 // with identical arguments.
 static void run_attn_block(Engine *e, uint32_t lane, size_t layer_idx,
-                           const uint16_t *x, uint16_t *k_plane, uint16_t *v_plane,
+                           Bf16Input x, uint16_t *k_plane, uint16_t *v_plane,
                            size_t head_stride, size_t pos, const uint16_t *cos_base,
                            const uint16_t *sin_base, uint16_t *out, size_t lanes) {
     const LfmLayerDesc *d = &e->model->layers[layer_idx];
@@ -1358,7 +1437,7 @@ static void run_attn_block(Engine *e, uint32_t lane, size_t layer_idx,
         a->n_kv = nkv;
         a->hd = hd;
         // operator norm: candle-order sumsq, serial.
-        float total = lfm_bf16_sumsq_candle_f32(x, (int)h);
+        float total = lfm_bf16_sumsq_candle_f32(x.data(), (int)h);
         float inv_rms = lfm_inv_rms_f32(total, h, d->op_eps);
         uint32_t rsb;
         std::memcpy(&rsb, &inv_rms, 4);
@@ -1428,44 +1507,50 @@ static void run_token_pass(Engine *e, uint32_t lane) {
     BackbonePlan *model = e->model;
     const size_t h = model->h;
     size_t lanes = t->lanes < 1 ? 1 : t->lanes;
-    uint16_t *h0 = e->tk_h0.data();
-    uint16_t *h1 = e->tk_h1.data();
+    uint16_t *plane0 = e->tk_h0.data();
+    uint16_t *plane1 = e->tk_h1.data();
+    Bf16Input hidden{};
+    uint16_t *next = plane1;
 
-    lane_fence(e, lane, [&] {
-        // Embed (serial — at most 8 rows). Text: one table row copied verbatim.
-        // Audio: candle's `.sum(0)` over the gathered rows — sequential bf16 adds
-        // from a bf16 zero, one RNE round per step (candle's in-dtype reduction).
-        if (t->embed_kind == 2) {
-            // Provided embedding (native audio-in prefill): the conformer/adapter
-            // hidden row is fed verbatim as a view into the source buffer — no
-            // table lookup. h0 is per-pass scratch, so loading it is not a copy of
-            // any weight; the source stays borrowed until the pass completes.
-            std::memcpy(h0, t->provided_embed, h * sizeof(uint16_t));
-        } else if (t->embed_kind == 0) {
-            std::memcpy(h0, model->embed_w + (size_t)t->ids[0] * h,
-                        h * sizeof(uint16_t));
-        } else {
-            std::memset(h0, 0, h * sizeof(uint16_t));
+    // Text and provided audio-in embeddings are immutable for the complete pass,
+    // so layer zero consumes their resident/borrowed rows directly. Only the
+    // multi-codebook audio embedding needs an activation plane because summation
+    // is real computation rather than transport.
+    if (t->embed_kind == 2) {
+        hidden = Bf16Input::from_activation(t->provided_embed);
+    } else if (t->embed_kind == 0) {
+        hidden = Bf16Input::from_resident(
+            weight_offset(model->embed_w, (size_t)t->ids[0] * h));
+    } else {
+        hidden = Bf16Input::from_activation(plane0);
+        lane_fence(e, lane, [&] {
+            // Embed (serial — at most 8 rows). Audio matches candle's `.sum(0)`:
+            // sequential BF16 adds from zero, with one RNE round per step.
+            std::memset(plane0, 0, h * sizeof(uint16_t));
             for (size_t c = 0; c < t->n_ids; ++c) {
-                const uint16_t *row = model->audio_embed_w + (size_t)t->ids[c] * h;
-                lfm_bf16_add(h0, row, h0, (int)h);
+                WeightBytes row =
+                    weight_offset(model->audio_embed_w, (size_t)t->ids[c] * h);
+                lfm_bf16_add(plane0, row, plane0, (int)h);
             }
-        }
-    });
+        });
+    }
 
-    // The layer walk. x = h0, out = h1, swap — no Tensor, no Rust, no copies.
+    // The layer walk. The first input may be a resident weight row or borrowed
+    // Conformer row; subsequent inputs alternate between the two activation
+    // planes. No transport copy is required at either boundary.
     for (size_t l = 0; l < model->layers.size(); ++l) {
         const LfmLayerDesc *d = &model->layers[l];
         const LfmLayerState *st = &t->states[l];
         if (d->kind == 0) {
-            run_conv_block(e, lane, d, h0, st->conv_state, st->conv_state, h1, lanes);
+            run_conv_block(e, lane, d, hidden, st->conv_state, st->conv_state,
+                           next, lanes);
         } else {
-            run_attn_block(e, lane, l, h0, st->k_plane, st->v_plane, st->head_stride,
-                           t->pos, t->cos_base, t->sin_base, h1, lanes);
+            run_attn_block(e, lane, l, hidden, st->k_plane, st->v_plane,
+                           st->head_stride, t->pos, t->cos_base, t->sin_base,
+                           next, lanes);
         }
-        uint16_t *tmp = h0;
-        h0 = h1;
-        h1 = tmp;
+        hidden = Bf16Input::from_activation(next);
+        next = next == plane0 ? plane1 : plane0;
     }
 
     // Final embedding-norm (candle RmsNorm: f32 arithmetic, one bf16 round), banded.
@@ -1473,12 +1558,12 @@ static void run_token_pass(Engine *e, uint32_t lane) {
     uint32_t tiles = (uint32_t)(lanes > h ? h : lanes);
     uint32_t hc = (uint32_t)((h + tiles - 1) / tiles);
     run_stage(e, lane, ST_SC_NORM, (uint32_t)((h + hc - 1) / hc), hc, [&] {
-        float total = lfm_bf16_sumsq_candle_f32(h0, (int)h);
+        float total = lfm_bf16_sumsq_candle_f32(hidden.data(), (int)h);
         float inv_rms = lfm_inv_rms_f32(total, h, model->emb_norm_eps);
         uint32_t rsb;
         std::memcpy(&rsb, &inv_rms, 4);
         c->rs_bits.store(rsb, std::memory_order_release);
-        c->x = h0;
+        c->x = hidden;
         c->norm_w = model->emb_norm_w;
         c->h = h;
         c->xn = t->out_hidden;
@@ -1499,6 +1584,366 @@ static void run_token_pass(Engine *e, uint32_t lane) {
             .config = *t->sampler,
             .state = t->sample_state,
             .out = t->out_token,
+        };
+        run_sampler(e, lane, sample);
+    }
+}
+
+struct PrefillInput {
+    WeightBytes embedding = nullptr;
+    const uint32_t *ids = nullptr;
+    const uint16_t *rows = nullptr;
+    size_t h = 0;
+
+    Bf16Input row(size_t index) const {
+        if (embedding) {
+            return Bf16Input::from_resident(
+                weight_offset(embedding, (size_t)ids[index] * h));
+        }
+        return Bf16Input::from_activation(rows + index * h);
+    }
+};
+
+static void prefill_band(size_t count, uint32_t lane, uint32_t lanes,
+                         size_t *begin, size_t *end) {
+    const size_t width = (count + lanes - 1) / lanes;
+    *begin = std::min((size_t)lane * width, count);
+    *end = std::min(*begin + width, count);
+}
+
+// C[M,N] = A[M,K] * W[N,K]^T. Each lane owns a disjoint W-row band, and the
+// explicit output stride lets the architecture leaf reuse every checkpoint row
+// across all M inputs without a scatter/copy plane.
+static void prefill_linear(Engine *e, uint32_t lane, const uint16_t *a,
+                           WeightBytes weight, float *out, size_t rows,
+                           size_t n, size_t k, size_t stride) {
+    size_t begin = 0, end = 0;
+    prefill_band(n, lane, e->lanes_total, &begin, &end);
+    if (end > begin) {
+        WeightBytes band = weight_offset(weight, begin * k);
+#if defined(__x86_64__) || defined(_M_X64)
+        if (!lfm_bf16_gemm_available()) {
+            lfm_bf16_gemm_nt_strided_f32_scalar(
+                a, band, out + begin, (int)rows, (int)(end - begin),
+                (int)k, (int)stride);
+        } else
+#endif
+        {
+            lfm_bf16_gemm_nt_strided_f32(
+                a, band, out + begin, (int)rows, (int)(end - begin),
+                (int)k, (int)stride);
+        }
+    }
+    lane_fence(e, lane, [] {});
+}
+
+static void prefill_round(Engine *e, uint32_t lane, const float *input,
+                          uint16_t *out, size_t count) {
+    size_t begin = 0, end = 0;
+    prefill_band(count, lane, e->lanes_total, &begin, &end);
+    if (end > begin)
+        lfm_f32_to_bf16(input + begin, out + begin, (int)(end - begin));
+    lane_fence(e, lane, [] {});
+}
+
+static float prefill_weight(WeightBytes weights, size_t index) {
+    const uint32_t bits = lfm_bf16_unlift_bits(weight_offset(weights, index));
+    return std::bit_cast<float>(bits);
+}
+
+static void prefill_norm(Engine *e, uint32_t lane, const PrefillInput &input,
+                         WeightBytes weight, float eps, uint16_t *out,
+                         size_t rows) {
+    for (size_t row = lane; row < rows; row += e->lanes_total) {
+        const Bf16Input source = input.row(row);
+        const float total = lfm_bf16_sumsq_candle_f32(source.data(), (int)input.h);
+        const float inv = lfm_inv_rms_f32(total, input.h, eps);
+        lfm_bf16_rmsnorm(source.data(), weight, out + row * input.h,
+                         (int)input.h, inv);
+    }
+    lane_fence(e, lane, [] {});
+}
+
+// The MLP norm intentionally has a different reduction contract from the
+// operator/final norms: decode partitions by a fixed logical tile count, then
+// folds partials in tile order. Reproduce that order independently per row.
+static void prefill_mlp_norm(Engine *e, uint32_t lane,
+                             const PrefillInput &input, WeightBytes weight,
+                             float eps, uint16_t *out, size_t rows) {
+    const size_t cap = std::min(input.h, e->model->ffn);
+    const size_t tiles = std::min(e->prefill.lanes, cap);
+    for (size_t row = lane; row < rows; row += e->lanes_total) {
+        const Bf16Input source = input.row(row);
+        // MLP inputs are activation planes. Keeping the assertion structural
+        // avoids manufacturing a typed pointer from resident checkpoint bytes.
+        const uint16_t *values = source.activation;
+        float partials[MAX_WORKERS] = {};
+        for (size_t tile = 0; tile < tiles; ++tile) {
+            partials[tile] = lfm_bf16_sumsq_stride_f32(
+                values, input.h, tile, tiles);
+        }
+        const float total = lfm_sum_f32(partials, tiles);
+        const float inv = lfm_inv_rms_f32(total, input.h, eps);
+        lfm_bf16_rmsnorm(values, weight, out + row * input.h,
+                         (int)input.h, inv);
+    }
+    lane_fence(e, lane, [] {});
+}
+
+static void prefill_add(Engine *e, uint32_t lane, const uint16_t *left,
+                        const PrefillInput &right, uint16_t *out, size_t rows) {
+    size_t begin = 0, end = 0;
+    prefill_band(right.h, lane, e->lanes_total, &begin, &end);
+    if (end > begin) {
+        for (size_t row = 0; row < rows; ++row) {
+            lfm_bf16_add(left + row * right.h + begin,
+                         right.row(row).offset(begin).data(),
+                         out + row * right.h + begin, (int)(end - begin));
+        }
+    }
+    lane_fence(e, lane, [] {});
+}
+
+static void run_prefill_mlp(Engine *e, uint32_t lane, const LfmLayerDesc *desc,
+                            const uint16_t *input, uint16_t *out, size_t rows) {
+    PrefillWorkspace *w = e->prefill.workspace;
+    const size_t h = e->model->h;
+    const size_t ffn = e->model->ffn;
+    const PrefillInput source = {.rows = input, .h = h};
+
+    prefill_mlp_norm(e, lane, source, desc->ffn_norm_w, desc->ffn_eps,
+                     w->xn.data(), rows);
+    prefill_linear(e, lane, w->xn.data(), desc->w1, w->gu.data(), rows,
+                   ffn, h, 2 * ffn);
+    prefill_linear(e, lane, w->xn.data(), desc->w3, w->gu.data() + ffn,
+                   rows, ffn, h, 2 * ffn);
+
+    size_t begin = 0, end = 0;
+    prefill_band(ffn, lane, e->lanes_total, &begin, &end);
+    if (end > begin) {
+        for (size_t row = 0; row < rows; ++row) {
+            lfm_swiglu_bf16(w->gu.data() + row * 2 * ffn + begin,
+                            w->gu.data() + row * 2 * ffn + ffn + begin,
+                            w->gate.data() + row * ffn + begin,
+                            (int)(end - begin));
+        }
+    }
+    lane_fence(e, lane, [] {});
+
+    prefill_linear(e, lane, w->gate.data(), desc->w2, w->projf.data(),
+                   rows, h, ffn, h);
+    prefill_round(e, lane, w->projf.data(), w->stage.data(), rows * h);
+    prefill_add(e, lane, w->stage.data(), source, out, rows);
+}
+
+static void run_prefill_conv(Engine *e, uint32_t lane,
+                             const LfmLayerDesc *desc,
+                             const PrefillInput &input, uint16_t *state,
+                             uint16_t *out, size_t rows) {
+    PrefillWorkspace *w = e->prefill.workspace;
+    const size_t h = e->model->h;
+    const size_t kernel = desc->k;
+
+    prefill_norm(e, lane, input, desc->op_norm_w, desc->op_eps,
+                 w->xn.data(), rows);
+    prefill_linear(e, lane, w->xn.data(), desc->in_w, w->bcxf.data(),
+                   rows, 3 * h, h, 3 * h);
+    prefill_round(e, lane, w->bcxf.data(), w->bcxb.data(), rows * 3 * h);
+
+    // Each channel owns one causal carry chain. Load its <=8 resident taps once,
+    // then advance rows in order with the exact Bx -> FIR -> C rounding ladder.
+    // This removes the generic one-row leaf's thread-local growable window and
+    // makes the complete prefill path allocation-free after workspace publish.
+    size_t begin = 0, end = 0;
+    prefill_band(h, lane, e->lanes_total, &begin, &end);
+#if defined(__aarch64__) || defined(_M_ARM64)
+    constexpr bool fast_k3 = true;
+#else
+    constexpr bool fast_k3 = false;
+#endif
+    for (size_t channel = begin; channel < end; ++channel) {
+        uint16_t carry[7];
+        const WeightBytes tap_row =
+            weight_offset(desc->conv_w, channel * kernel);
+        const float w0 = prefill_weight(tap_row, 0);
+        const float w1 = kernel > 1 ? prefill_weight(tap_row, 1) : 0.0f;
+        const float w2 = kernel > 2 ? prefill_weight(tap_row, 2) : 0.0f;
+        const float w3 = kernel > 3 ? prefill_weight(tap_row, 3) : 0.0f;
+        const float w4 = kernel > 4 ? prefill_weight(tap_row, 4) : 0.0f;
+        const float w5 = kernel > 5 ? prefill_weight(tap_row, 5) : 0.0f;
+        const float w6 = kernel > 6 ? prefill_weight(tap_row, 6) : 0.0f;
+        const float w7 = kernel > 7 ? prefill_weight(tap_row, 7) : 0.0f;
+        for (size_t tap = 0; tap + 1 < kernel; ++tap)
+            carry[tap] = state[channel * (kernel - 1) + tap];
+        for (size_t row = 0; row < rows; ++row) {
+            const uint16_t *bcx = w->bcxb.data() + row * 3 * h;
+            const uint16_t bx_bits = rb_bits(
+                bf16_f32(bcx[channel]) * bf16_f32(bcx[2 * h + channel]));
+            const float bx = bf16_f32(bx_bits);
+            const float v0 = kernel == 1 ? bx : bf16_f32(carry[0]);
+            // The AArch64 T=1,K=3 fast leaf starts from tap zero; the generic
+            // twins add it to +0. Preserve that signed-zero/NaN distinction.
+            float acc = fast_k3 && kernel == 3 ? w0 * v0 : 0.0f + w0 * v0;
+            if (kernel > 1)
+                acc = acc + w1 * (kernel == 2 ? bx : bf16_f32(carry[1]));
+            if (kernel > 2)
+                acc = acc + w2 * (kernel == 3 ? bx : bf16_f32(carry[2]));
+            if (kernel > 3)
+                acc = acc + w3 * (kernel == 4 ? bx : bf16_f32(carry[3]));
+            if (kernel > 4)
+                acc = acc + w4 * (kernel == 5 ? bx : bf16_f32(carry[4]));
+            if (kernel > 5)
+                acc = acc + w5 * (kernel == 6 ? bx : bf16_f32(carry[5]));
+            if (kernel > 6)
+                acc = acc + w6 * (kernel == 7 ? bx : bf16_f32(carry[6]));
+            if (kernel > 7) acc = acc + w7 * bx;
+            const uint16_t conv = rb_bits(acc);
+            w->projb[row * h + channel] = rb_bits(
+                bf16_f32(bcx[h + channel]) * bf16_f32(conv));
+            if (kernel > 1) {
+                for (size_t tap = 0; tap + 2 < kernel; ++tap)
+                    carry[tap] = carry[tap + 1];
+                carry[kernel - 2] = bx_bits;
+            }
+        }
+        for (size_t tap = 0; tap + 1 < kernel; ++tap)
+            state[channel * (kernel - 1) + tap] = carry[tap];
+    }
+    lane_fence(e, lane, [] {});
+
+    prefill_linear(e, lane, w->projb.data(), desc->out_w,
+                   w->projf.data(), rows, h, h, h);
+    prefill_round(e, lane, w->projf.data(), w->stage.data(), rows * h);
+    prefill_add(e, lane, w->stage.data(), input, w->mid.data(), rows);
+    run_prefill_mlp(e, lane, desc, w->mid.data(), out, rows);
+}
+
+static void run_prefill_attention(Engine *e, uint32_t lane, size_t layer,
+                                  const PrefillInput &input,
+                                  const LfmLayerState *state, uint16_t *out,
+                                  size_t rows) {
+    PrefillWorkspace *w = e->prefill.workspace;
+    const PrefillReq *request = &e->prefill;
+    const LfmLayerDesc *desc = &e->model->layers[layer];
+    const size_t h = e->model->h;
+    const size_t nh = desc->n_head;
+    const size_t nkv = desc->n_kv;
+    const size_t hd = desc->hd;
+    const size_t qrows = nh * hd;
+    const size_t kvrows = nkv * hd;
+    const size_t qkv = qrows + 2 * kvrows;
+
+    prefill_norm(e, lane, input, desc->op_norm_w, desc->op_eps,
+                 w->xn.data(), rows);
+    prefill_linear(e, lane, w->xn.data(), desc->q_w, w->qkvf.data(),
+                   rows, qrows, h, qkv);
+    prefill_linear(e, lane, w->xn.data(), desc->k_w,
+                   w->qkvf.data() + qrows, rows, kvrows, h, qkv);
+    prefill_linear(e, lane, w->xn.data(), desc->v_w,
+                   w->qkvf.data() + qrows + kvrows, rows, kvrows, h, qkv);
+    prefill_round(e, lane, w->qkvf.data(), w->qkvb.data(), rows * qkv);
+
+    const size_t norm_tasks = rows * (nh + nkv);
+    for (size_t task = lane; task < norm_tasks; task += e->lanes_total) {
+        const size_t row = task / (nh + nkv);
+        const size_t head = task % (nh + nkv);
+        const uint16_t *cos = request->cos_base +
+                              (request->pos + row) * (hd / 2);
+        const uint16_t *sin = request->sin_base +
+                              (request->pos + row) * (hd / 2);
+        uint16_t *base = w->qkvb.data() + row * qkv;
+        if (head < nh) {
+            uint16_t *query = base + head * hd;
+            qk_norm_row(query, desc->qn_w, query, hd, desc->qk_eps);
+            rope_slow_row(query, cos, sin, hd);
+            continue;
+        }
+        const size_t kh = head - nh;
+        uint16_t *key = base + qrows + kh * hd;
+        const uint16_t *value = base + qrows + kvrows + kh * hd;
+        qk_norm_row(key, desc->kn_w, key, hd, desc->qk_eps);
+        rope_slow_row(key, cos, sin, hd);
+        lfm_bf16_copy_bytes(key,
+                            state->k_plane + kh * state->head_stride +
+                                (request->pos + row) * hd,
+                            hd);
+        lfm_bf16_copy_bytes(value,
+                            state->v_plane + kh * state->head_stride +
+                                (request->pos + row) * hd,
+                            hd);
+    }
+    lane_fence(e, lane, [] {});
+
+    const size_t group = nh / nkv;
+    for (size_t task = lane; task < rows * nh; task += e->lanes_total) {
+        const size_t row = task / nh;
+        const size_t qh = task % nh;
+        const size_t kh = qh / group;
+        const size_t length = request->pos + row + 1;
+        const uint16_t *query = w->qkvb.data() + row * qkv + qh * hd;
+        float *score = w->scores.data() + lane * w->max_ctx;
+        float qf[512];
+        float value[512];
+        lfm_bf16_to_f32(query, qf, (int)hd);
+        lfm_attn_qk_bf16(qf, state->k_plane + kh * state->head_stride,
+                         score, (int)length, (int)hd);
+        lfm_softmax_scaled_f32(score, (int)length, lfm_rsqrt_size(hd));
+        lfm_attn_av_bf16(score, state->v_plane + kh * state->head_stride,
+                         value, (int)length, (int)hd);
+        lfm_f32_to_bf16(value,
+                        w->att_y.data() + row * (nh * hd) + qh * hd,
+                        (int)hd);
+    }
+    lane_fence(e, lane, [] {});
+
+    prefill_linear(e, lane, w->att_y.data(), desc->o_w, w->projf.data(),
+                   rows, h, nh * hd, h);
+    prefill_round(e, lane, w->projf.data(), w->stage.data(), rows * h);
+    prefill_add(e, lane, w->stage.data(), input, w->mid.data(), rows);
+    run_prefill_mlp(e, lane, desc, w->mid.data(), out, rows);
+}
+
+static void run_prefill(Engine *e, uint32_t lane) {
+    const PrefillReq *request = &e->prefill;
+    PrefillWorkspace *w = request->workspace;
+    const size_t rows = request->rows;
+    const size_t h = e->model->h;
+    const PrefillInput first = request->embed_kind == 0
+                                   ? PrefillInput{.embedding = e->model->embed_w,
+                                                  .ids = request->ids, .h = h}
+                                   : PrefillInput{.rows = request->provided_rows,
+                                                  .h = h};
+    PrefillInput hidden = first;
+    uint16_t *next = w->h1.data();
+
+    for (size_t layer = 0; layer < e->model->layers.size(); ++layer) {
+        const LfmLayerDesc *desc = &e->model->layers[layer];
+        const LfmLayerState *state = &request->states[layer];
+        if (desc->kind == 0) {
+            run_prefill_conv(e, lane, desc, hidden, state->conv_state,
+                             next, rows);
+        } else {
+            run_prefill_attention(e, lane, layer, hidden, state, next, rows);
+        }
+        hidden = {.rows = next, .h = h};
+        next = next == w->h0.data() ? w->h1.data() : w->h0.data();
+    }
+
+    const PrefillInput last = {.rows = hidden.row(rows - 1).activation, .h = h};
+    prefill_norm(e, lane, last, e->model->emb_norm_w,
+                 e->model->emb_norm_eps, request->out_hidden, 1);
+
+    if (request->out_token) {
+        prefill_linear(e, lane, request->out_hidden, e->model->embed_w,
+                       w->logits.data(), 1, e->model->vocab, h,
+                       e->model->vocab);
+        SampleReq sample = {
+            .logits = w->logits.data(),
+            .count = e->model->vocab,
+            .dtype = SAMPLE_F32,
+            .config = *request->sampler,
+            .state = request->sample_state,
+            .out = request->out_token,
         };
         run_sampler(e, lane, sample);
     }
@@ -1534,39 +1979,13 @@ static void run_depthwise_stream(Engine *e, uint32_t lane) {
 static void run_gemm(Engine *e, uint32_t lane) {
     const GemmReq &request = e->gemm;
     const size_t lanes = e->lanes_total;
-
-#ifdef __APPLE__
-    if (request.use_amx) {
-        const size_t a_count = request.m * request.k;
-        const size_t rhs_count = request.rhs_layout == LFM_GEMM_RHS_KN
-                                     ? request.k * request.n
-                                     : request.n * request.k;
-        const auto widen = [lane, lanes](const uint16_t *src, float *dst, size_t count) {
-            const size_t chunk = (count + lanes - 1) / lanes;
-            const size_t begin = (size_t)lane * chunk;
-            if (begin >= count) return;
-            const size_t width = std::min(chunk, count - begin);
-            lfm_bf16_to_f32(src + begin, dst + begin, (int)width);
-        };
-        widen(request.a, request.amx_a, a_count);
-        widen(request.rhs, request.amx_rhs, rhs_count);
-        lane_fence(e, lane, [&] {
-            cblas_sgemm(CblasRowMajor, CblasNoTrans,
-                        request.rhs_layout == LFM_GEMM_RHS_NK ? CblasTrans
-                                                              : CblasNoTrans,
-                        (int)request.m, (int)request.n, (int)request.k, 1.0f,
-                        request.amx_a, (int)request.k, request.amx_rhs,
-                        request.rhs_layout == LFM_GEMM_RHS_NK ? (int)request.k
-                                                              : (int)request.n,
-                        0.0f, request.out, (int)request.n);
-        });
-        return;
-    }
-#endif
+    const bool scalar_nt = request.direct && !lfm_bf16_gemm_available();
 
     if (request.rhs_layout == LFM_GEMM_RHS_KN && request.m == 1) {
         if (lane == 0)
-            lfm_bf16_gemv_f32(request.a, request.rhs, request.out,
+            lfm_bf16_gemv_f32(request.a,
+                              static_cast<const uint16_t *>(request.rhs),
+                              request.out,
                               (int)request.n, (int)request.k);
         return;
     }
@@ -1576,8 +1995,17 @@ static void run_gemm(Engine *e, uint32_t lane) {
         const size_t col = (size_t)lane * cols;
         if (col < request.n) {
             const size_t count = std::min(cols, request.n - col);
-            lfm_bf16_gemm_nt_f32(request.a, request.rhs + col * request.k,
-                                 request.out + col, 1, (int)count, (int)request.k);
+            const void *weights =
+                static_cast<const unsigned char *>(request.rhs) +
+                col * request.k * sizeof(uint16_t);
+            if (scalar_nt)
+                lfm_bf16_gemm_nt_f32_scalar(
+                    request.a, weights, request.out + col, 1, (int)count,
+                    (int)request.k);
+            else
+                lfm_bf16_gemm_nt_f32(request.a, weights,
+                                     request.out + col, 1, (int)count,
+                                     (int)request.k);
         }
         return;
     }
@@ -1591,14 +2019,22 @@ static void run_gemm(Engine *e, uint32_t lane) {
     if (row >= request.m) return;
     const size_t count = std::min(rows, request.m - row);
     if (request.rhs_layout == LFM_GEMM_RHS_KN) {
-        lfm_bf16_gemm_f32_v2(request.a + row * request.k, request.rhs,
+        lfm_bf16_gemm_f32_v2(
+                             request.a + row * request.k,
+                             static_cast<const uint16_t *>(request.rhs),
                              request.out + row * request.n, (int)count,
                              (int)request.n, (int)request.k);
         return;
     }
-    lfm_bf16_gemm_nt_f32(request.a + row * request.k, request.rhs,
-                         request.out + row * request.n, (int)count,
-                         (int)request.n, (int)request.k);
+    if (scalar_nt)
+        lfm_bf16_gemm_nt_f32_scalar(
+            request.a + row * request.k, request.rhs,
+            request.out + row * request.n, (int)count, (int)request.n,
+            (int)request.k);
+    else
+        lfm_bf16_gemm_nt_f32(request.a + row * request.k, request.rhs,
+                             request.out + row * request.n, (int)count,
+                             (int)request.n, (int)request.k);
 }
 
 static inline Dd dd_from_f32(float value) { return {value, 0.0f}; }
@@ -1786,18 +2222,23 @@ static void lane_program(Engine *e, uint32_t lane) {
         break;
     case REQ_CONV_LAYER: {
         const ConvReq *r = &e->conv;
-        run_conv_block(e, lane, &e->model->layers[r->layer], r->x, r->state_in,
+        run_conv_block(e, lane, &e->model->layers[r->layer],
+                       Bf16Input::from_activation(r->x), r->state_in,
                        r->state_out, r->out, r->lanes);
         break;
     }
     case REQ_ATTN_LAYER: {
         const AttnReq *r = &e->attn;
-        run_attn_block(e, lane, r->layer, r->x, r->k_plane, r->v_plane, r->head_stride,
+        run_attn_block(e, lane, r->layer, Bf16Input::from_activation(r->x),
+                       r->k_plane, r->v_plane, r->head_stride,
                        r->pos, r->cos_base, r->sin_base, r->out, r->lanes);
         break;
     }
     case REQ_TOKEN_PASS:
         run_token_pass(e, lane);
+        break;
+    case REQ_PREFILL:
+        run_prefill(e, lane);
         break;
     case REQ_PRNG:
         run_prng_pass(e, lane);
@@ -1923,12 +2364,13 @@ static void *bridge_main(void *arg) {
                      submission.epoch != 0 &&
                      descriptor.payload == e && descriptor.flags == 0 &&
                      descriptor.kind > REQ_NONE &&
-                     descriptor.kind <= REQ_IRFFT_DD;
+                     descriptor.kind <= REQ_PREFILL;
         if (valid) {
             switch (descriptor.kind) {
             case REQ_CONV_LAYER:
             case REQ_ATTN_LAYER:
             case REQ_TOKEN_PASS:
+            case REQ_PREFILL:
                 valid = e->model && submission.conversation_id == e->model->id &&
                         submission.epoch == e->model->id;
                 break;
@@ -2168,10 +2610,10 @@ int lfm_engine_mlp(void *ep, const uint16_t *x, const uint16_t *norm_w,
 
     Pass *p = &e->pass;
     p->x = x;
-    p->norm_w = norm_w;
-    p->w1 = w1;
-    p->w3 = w3;
-    p->w2 = w2;
+    p->norm_w = activation_bytes(norm_w);
+    p->w1 = activation_bytes(w1);
+    p->w3 = activation_bytes(w3);
+    p->w2 = activation_bytes(w2);
     p->out = out;
     p->h = h;
     p->i = i;
@@ -2241,21 +2683,26 @@ static bool depth_mul(size_t a, size_t b, size_t *out) {
     return true;
 }
 
-int lfm_engine_bf16_gemm_f32(
+static int submit_bf16_gemm_f32(
     void *ep, const uint16_t *a, size_t a_count,
-    const uint16_t *rhs, size_t rhs_count,
+    const void *rhs, size_t rhs_count,
     float *out, size_t out_count,
-    size_t m, size_t n, size_t k, uint32_t rhs_layout) {
+    size_t m, size_t n, size_t k, uint32_t rhs_layout, bool direct) {
     Engine *e = (Engine *)ep;
     if (!e || !a || !rhs || !out || m == 0 || n == 0 || k == 0 ||
         m > INT_MAX || n > INT_MAX || k > INT_MAX ||
         (rhs_layout != LFM_GEMM_RHS_KN && rhs_layout != LFM_GEMM_RHS_NK))
         return -EINVAL;
+    // The direct-NK contract has a baseline assembly fallback and therefore
+    // does not depend on a SIMD runtime gate. Existing generic behavior stays
+    // unchanged.
+    if (!direct) {
 #ifdef __APPLE__
-    if (m == 1 && !lfm_bf16_gemm_available()) return -ENOTSUP;
+        if (m == 1 && !lfm_bf16_gemm_available()) return -ENOTSUP;
 #else
-    if (!lfm_bf16_gemm_available()) return -ENOTSUP;
+        if (!lfm_bf16_gemm_available()) return -ENOTSUP;
 #endif
+    }
 
     size_t a_need = 0, rhs_need = 0, out_need = 0;
     if (!depth_mul(m, k, &a_need) ||
@@ -2268,31 +2715,34 @@ int lfm_engine_bf16_gemm_f32(
 
     PassClaim claim(e);
     if (!claim) return -EBUSY;
-    bool use_amx = false;
-#ifdef __APPLE__
-    if (m > 1) {
-        try {
-            e->gemm_amx_a.resize(a_need);
-            e->gemm_amx_rhs.resize(rhs_need);
-        } catch (const std::bad_alloc &) {
-            return -ENOMEM;
-        }
-        use_amx = true;
-    }
-#endif
     e->gemm = {
         .a = a,
         .rhs = rhs,
-        .amx_a = use_amx ? e->gemm_amx_a.data() : nullptr,
-        .amx_rhs = use_amx ? e->gemm_amx_rhs.data() : nullptr,
         .out = out,
         .m = m,
         .n = n,
         .k = k,
         .rhs_layout = rhs_layout,
-        .use_amx = use_amx,
+        .direct = direct,
     };
     return submit_pass(e, REQ_GEMM);
+}
+
+int lfm_engine_bf16_gemm_f32(
+    void *ep, const uint16_t *a, size_t a_count,
+    const uint16_t *rhs, size_t rhs_count,
+    float *out, size_t out_count,
+    size_t m, size_t n, size_t k, uint32_t rhs_layout) {
+    return submit_bf16_gemm_f32(ep, a, a_count, rhs, rhs_count, out,
+                                out_count, m, n, k, rhs_layout, false);
+}
+
+int lfm_engine_bf16_gemm_nt_direct_f32(
+    void *ep, const uint16_t *a, size_t a_count,
+    const void *weights, size_t weight_count,
+    float *out, size_t out_count, size_t m, size_t n, size_t k) {
+    return submit_bf16_gemm_f32(ep, a, a_count, weights, weight_count, out,
+                                out_count, m, n, k, LFM_GEMM_RHS_NK, true);
 }
 
 int lfm_engine_fft_conv_dd(
@@ -2550,8 +3000,8 @@ int lfm_engine_depth_build(void *ep, const LfmDepthPlanV1 *plan, uint64_t *out_i
         return -ENOMEM;
     }
 
-    next->depth_linear_w = depth_u16(plan->depth_linear_w);
-    next->depth_linear_b = depth_u16(plan->depth_linear_b);
+    next->depth_linear_w = depth_bytes(plan->depth_linear_w);
+    next->depth_linear_b = depth_bytes(plan->depth_linear_b);
     next->cos = depth_f32(plan->rope_cos);
     next->sin = depth_f32(plan->rope_sin);
     next->dim = dim;
@@ -2631,6 +3081,9 @@ int lfm_ctx_build(void *ep, const LfmLayerDesc *descs, size_t n_layers, size_t h
     Engine *e = (Engine *)ep;
     if (!e || !descs || n_layers == 0 || h == 0 || ffn == 0 || max_ctx == 0 || !out_id)
         return -1;
+    if (h > (size_t)INT_MAX / 3 || ffn > (size_t)INT_MAX ||
+        max_ctx > (size_t)INT_MAX)
+        return -EOVERFLOW;
     PassClaim claim(e);
     if (!claim) return -EBUSY;
     size_t kmax = 1;
@@ -2658,6 +3111,8 @@ int lfm_ctx_build(void *ep, const LfmLayerDesc *descs, size_t n_layers, size_t h
             if (!depth_mul(nh + 2 * nkv, hd, &qkv) ||
                 !depth_mul(nh, hd, &y) ||
                 !depth_mul(nh, max_ctx, &att))
+                return -EOVERFLOW;
+            if (qkv > (size_t)INT_MAX || y > (size_t)INT_MAX)
                 return -EOVERFLOW;
             qkv_max = std::max(qkv_max, qkv);
             y_max = std::max(y_max, y);
@@ -2696,6 +3151,9 @@ int lfm_ctx_build(void *ep, const LfmLayerDesc *descs, size_t n_layers, size_t h
     next->h = h;
     next->ffn = ffn;
     next->max_ctx = max_ctx;
+    next->qkv_max = qkv_max;
+    next->y_max = y_max;
+    next->kmax = kmax;
     next->id = ++e->model_seq;
     if (next->id == 0) next->id = ++e->model_seq;
     const uint64_t id = next->id;
@@ -2710,10 +3168,10 @@ int lfm_ctx_build(void *ep, const LfmLayerDesc *descs, size_t n_layers, size_t h
 
 // Install the head tables (embed / audio-embed / final norm / tied logits) — the
 // token pass needs them; the per-layer entries do not. Serialized by the rim.
-int lfm_ctx_set_heads(void *ep, uint64_t id, const uint16_t *embed_w,
-                      size_t embed_len, size_t vocab, const uint16_t *audio_embed_w,
+int lfm_ctx_set_heads(void *ep, uint64_t id, const uint8_t *embed_w,
+                      size_t embed_len, size_t vocab, const uint8_t *audio_embed_w,
                       size_t audio_embed_len, size_t audio_rows,
-                      const uint16_t *emb_norm_w, size_t emb_norm_len,
+                      const uint8_t *emb_norm_w, size_t emb_norm_len,
                       float emb_norm_eps) {
     Engine *e = (Engine *)ep;
     if (!e || id == 0 || !embed_w || !emb_norm_w || vocab == 0) return -1;
@@ -2721,7 +3179,8 @@ int lfm_ctx_set_heads(void *ep, uint64_t id, const uint16_t *embed_w,
     if (!claim) return -EBUSY;
     BackbonePlan *model = find_model(e, id);
     if (!model) return -3;
-    if (vocab > SIZE_MAX / model->h || embed_len < vocab * model->h ||
+    if (vocab > (size_t)INT_MAX || vocab > SIZE_MAX / model->h ||
+        embed_len < vocab * model->h ||
         emb_norm_len < model->h)
         return -1;
     if (audio_rows > 0 &&
@@ -2813,10 +3272,15 @@ int lfm_engine_attn_layer(void *ep, uint64_t id, size_t layer, const uint16_t *x
         !model->layers[layer].q_w || pos + 1 > model->max_ctx)
         return -3;
     const LfmLayerDesc *d = &model->layers[layer];
-    if (x_len != model->h || out_len != model->h || d->hd == 0 ||
-        pos + 1 > SIZE_MAX / d->hd || head_stride < (pos + 1) * d->hd ||
-        d->n_kv > SIZE_MAX / head_stride || k_len < d->n_kv * head_stride ||
-        v_len < d->n_kv * head_stride || pos + 1 > SIZE_MAX / (d->hd / 2) ||
+    if (d->hd == 0 || d->n_kv == 0 || pos + 1 > SIZE_MAX / d->hd) return -1;
+    const size_t live = (pos + 1) * d->hd;
+    const size_t prior_heads = d->n_kv - 1;
+    if (x_len != model->h || out_len != model->h || head_stride < live ||
+        prior_heads > SIZE_MAX / head_stride ||
+        prior_heads * head_stride > SIZE_MAX - live ||
+        k_len < prior_heads * head_stride + live ||
+        v_len < prior_heads * head_stride + live ||
+        pos + 1 > SIZE_MAX / (d->hd / 2) ||
         rope_len < (pos + 1) * (d->hd / 2))
         return -1;
 
@@ -2833,6 +3297,174 @@ int lfm_engine_attn_layer(void *ep, uint64_t id, size_t layer, const uint16_t *x
     e->attn.lanes = lanes < 1 ? 1 : (lanes > MAX_WORKERS ? MAX_WORKERS : lanes);
 
     return submit_pass(e, REQ_ATTN_LAYER, id);
+}
+
+int lfm_engine_prefill_workspace_create(void *ep, uint64_t id,
+                                        void **out_workspace) {
+    Engine *e = (Engine *)ep;
+    if (!e || id == 0 || !out_workspace) return -EINVAL;
+    *out_workspace = nullptr;
+    PassClaim claim(e);
+    if (!claim) return -EBUSY;
+    BackbonePlan *model = find_model(e, id);
+    if (!model || !model->embed_w || !model->emb_norm_w) return -ESTALE;
+
+    size_t rows_h = 0, rows_ffn = 0, rows_qkv = 0, rows_y = 0;
+    size_t rows_3h = 0, rows_2ffn = 0, scores = 0;
+    if (!checked_size_product(PREFILL_ROWS, model->h, &rows_h) ||
+        !checked_size_product(PREFILL_ROWS, model->ffn, &rows_ffn) ||
+        !checked_size_product(PREFILL_ROWS, model->qkv_max, &rows_qkv) ||
+        !checked_size_product(PREFILL_ROWS, model->y_max, &rows_y) ||
+        !checked_size_product(rows_h, 3, &rows_3h) ||
+        !checked_size_product(rows_ffn, 2, &rows_2ffn) ||
+        !checked_size_product(e->lanes_total, model->max_ctx, &scores)) {
+        return -EOVERFLOW;
+    }
+
+    std::unique_ptr<PrefillWorkspace> workspace(
+        new (std::nothrow) PrefillWorkspace());
+    if (!workspace) return -ENOMEM;
+    try {
+        workspace->h0.resize(rows_h);
+        workspace->h1.resize(rows_h);
+        workspace->xn.resize(rows_h);
+        workspace->gate.resize(rows_ffn);
+        workspace->stage.resize(rows_h);
+        workspace->mid.resize(rows_h);
+        workspace->bcxb.resize(rows_3h);
+        workspace->projb.resize(rows_h);
+        workspace->qkvb.resize(rows_qkv);
+        workspace->att_y.resize(rows_y);
+        workspace->gu.resize(rows_2ffn);
+        workspace->bcxf.resize(rows_3h);
+        workspace->projf.resize(rows_h);
+        workspace->qkvf.resize(rows_qkv);
+        workspace->scores.resize(scores);
+        workspace->logits.resize(model->vocab);
+    } catch (const std::bad_alloc &) {
+        return -ENOMEM;
+    }
+    workspace->model_id = id;
+    workspace->h = model->h;
+    workspace->ffn = model->ffn;
+    workspace->max_ctx = model->max_ctx;
+    workspace->qkv_max = model->qkv_max;
+    workspace->y_max = model->y_max;
+    workspace->kmax = model->kmax;
+    workspace->lane_count = e->lanes_total;
+    *out_workspace = workspace.release();
+    return 0;
+}
+
+void lfm_engine_prefill_workspace_destroy(void *workspace) {
+    delete static_cast<PrefillWorkspace *>(workspace);
+}
+
+int lfm_engine_prefill(void *ep, uint64_t id, void *workspace_pointer,
+                       const uint32_t *ids, const uint16_t *provided_rows,
+                       size_t row_count, uint32_t embed_kind,
+                       const LfmLayerState *states, size_t state_count,
+                       size_t pos, const uint16_t *cos_base,
+                       const uint16_t *sin_base, size_t rope_len,
+                       uint16_t *out_hidden, size_t out_hidden_len,
+                       const LfmSamplerConfigV1 *sampler,
+                       LfmPrngStateV1 *sample_state, uint32_t *out_token,
+                       size_t lanes) {
+    Engine *e = (Engine *)ep;
+    PrefillWorkspace *workspace =
+        static_cast<PrefillWorkspace *>(workspace_pointer);
+    if (!e || id == 0 || !workspace || row_count == 0 ||
+        row_count > PREFILL_ROWS || !states || !out_hidden) {
+        return -EINVAL;
+    }
+    PassClaim claim(e);
+    if (!claim) return -EBUSY;
+    BackbonePlan *model = find_model(e, id);
+    if (!model || !model->embed_w || !model->emb_norm_w ||
+        state_count != model->layers.size() || row_count > model->max_ctx ||
+        pos > model->max_ctx - row_count) {
+        return -ESTALE;
+    }
+    if (workspace->model_id != id || workspace->h != model->h ||
+        workspace->ffn != model->ffn || workspace->max_ctx != model->max_ctx ||
+        workspace->qkv_max != model->qkv_max ||
+        workspace->y_max != model->y_max || workspace->kmax != model->kmax ||
+        workspace->lane_count != e->lanes_total ||
+        workspace->logits.size() < model->vocab ||
+        out_hidden_len != model->h) {
+        return -EINVAL;
+    }
+    if (embed_kind == 0) {
+        if (!ids) return -EINVAL;
+        for (size_t row = 0; row < row_count; ++row)
+            if (ids[row] >= model->vocab) return -ERANGE;
+    } else if (embed_kind == 2) {
+        if (!provided_rows) return -EINVAL;
+    } else {
+        return -EINVAL;
+    }
+    if (out_token) {
+        if (!sample_config_valid(sampler)) return -EINVAL;
+        const bool stochastic =
+            (sampler->flags & LFM_SAMPLE_FLAG_GREEDY) == 0 &&
+            sampler->top_k != 1;
+        if (stochastic &&
+            (!sample_state || lfm_prng_fill_u64(sample_state, nullptr, 0) != 0)) {
+            return -EINVAL;
+        }
+    } else if (sampler || sample_state) {
+        return -EINVAL;
+    }
+
+    const size_t end_pos = pos + row_count;
+    for (size_t layer = 0; layer < model->layers.size(); ++layer) {
+        const LfmLayerDesc *desc = &model->layers[layer];
+        const LfmLayerState *state = &states[layer];
+        if (desc->kind == 1) {
+            if (!desc->q_w || !state->k_plane || !state->v_plane ||
+                !cos_base || !sin_base || desc->hd == 0 || desc->n_kv == 0 ||
+                end_pos > SIZE_MAX / desc->hd) {
+                return -ESTALE;
+            }
+            const size_t live = end_pos * desc->hd;
+            const size_t prior_heads = desc->n_kv - 1;
+            if (state->head_stride < live ||
+                prior_heads > SIZE_MAX / state->head_stride ||
+                prior_heads * state->head_stride > SIZE_MAX - live ||
+                state->k_len < prior_heads * state->head_stride + live ||
+                state->v_len < prior_heads * state->head_stride + live ||
+                end_pos > SIZE_MAX / (desc->hd / 2) ||
+                rope_len < end_pos * (desc->hd / 2)) {
+                return -EINVAL;
+            }
+            continue;
+        }
+        const size_t tail = desc->k > 0 ? desc->k - 1 : 0;
+        if (!state->conv_state || desc->k < 1 ||
+            (tail > 0 && model->h > SIZE_MAX / tail) ||
+            state->conv_len < model->h * tail) {
+            return -ESTALE;
+        }
+    }
+
+    e->model = model;
+    e->prefill.workspace = workspace;
+    e->prefill.ids = ids;
+    e->prefill.provided_rows = provided_rows;
+    e->prefill.rows = row_count;
+    e->prefill.embed_kind = embed_kind;
+    e->prefill.states = states;
+    e->prefill.n_states = state_count;
+    e->prefill.pos = pos;
+    e->prefill.cos_base = cos_base;
+    e->prefill.sin_base = sin_base;
+    e->prefill.out_hidden = out_hidden;
+    e->prefill.sampler = sampler;
+    e->prefill.sample_state = sample_state;
+    e->prefill.out_token = out_token;
+    e->prefill.lanes = lanes < 1 ? 1 :
+                           (lanes > MAX_WORKERS ? MAX_WORKERS : lanes);
+    return submit_pass(e, REQ_PREFILL, id);
 }
 
 // ONE token through the whole backbone: embed → every layer → final norm → logits.
@@ -2889,11 +3521,14 @@ int lfm_engine_token_pass(void *ep, uint64_t id, const uint32_t *ids, size_t n_i
                 return -3;
             const size_t hd = model->layers[l].hd;
             const size_t nkv = model->layers[l].n_kv;
-            if (hd == 0 || pos + 1 > SIZE_MAX / hd ||
-                states[l].head_stride < (pos + 1) * hd ||
-                nkv > SIZE_MAX / states[l].head_stride ||
-                states[l].k_len < nkv * states[l].head_stride ||
-                states[l].v_len < nkv * states[l].head_stride ||
+            if (hd == 0 || nkv == 0 || pos + 1 > SIZE_MAX / hd) return -1;
+            const size_t live = (pos + 1) * hd;
+            const size_t prior_heads = nkv - 1;
+            if (states[l].head_stride < live ||
+                prior_heads > SIZE_MAX / states[l].head_stride ||
+                prior_heads * states[l].head_stride > SIZE_MAX - live ||
+                states[l].k_len < prior_heads * states[l].head_stride + live ||
+                states[l].v_len < prior_heads * states[l].head_stride + live ||
                 pos + 1 > SIZE_MAX / (hd / 2) || rope_len < (pos + 1) * (hd / 2))
                 return -1;
         } else if (!states[l].conv_state) {

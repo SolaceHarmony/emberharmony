@@ -26,7 +26,7 @@ bundle, binds kernel plans, and returns an opaque `LfmModel`.
 | `ResidentWeights::candle_builder` | `weights.rs:449-503`. | Delete with the last production Candle module. |
 | `CandleBridge::load` | `weights.rs:504-536` constructs copied Candle tensors. | This is the measured copy boundary to eliminate, not preserve. |
 | Native safetensors ABI | `crates/liquid-audio/native/include/lfm_safetensors.h:13-92`. | Fold behind the private C++ model loader and extend for component bundles; do not generate Rust bindings for tensor views. |
-| Native image load | `crates/liquid-audio/native/src/io/safetensors.cpp:480-519`. | Retain the aligned resident-block approach. |
+| Native image load | `crates/liquid-audio/native/src/io/safetensors.cpp` opens every source first, then runs up to four 8 MiB positioned-read workers directly into one image; `LfmWeightLoadStatsV1` reports source/resident bytes and the actual team. | Retain the aligned resident-block approach and joined-before-unwind discipline; fold the transitional stats into model memory accounting. |
 | Native tensor view | `crates/liquid-audio/native/src/io/safetensors.cpp:522-536`; C ABI lookup at `623-629`. | Bind once at model open, never look up by name in a pass. |
 | Mimi load | `loader.rs:406-420` constructs both Rust Moshi Mimi and a native decoder from the same file. | Native model owns codec weights and codec plan; do not reopen the file from a Rust adapter. |
 | LFM2 detokenizer load | `loader.rs:424-440` opens a second `ResidentWeights` and Candle model. | Delete with the other replaced Rust owners; it is not on the shipped realtime path. |
@@ -114,7 +114,9 @@ must not repack a full weight merely to satisfy an assumed aligned-load contract
 2. Read and validate `config.json` for the selected engine.
 3. Resolve the exact set of main, codec, and tokenizer files.
 4. Plan final aligned file offsets and allocate `LfmModelImage` once.
-5. Read each complete file directly into its final image slice.
+5. Split every open source into 8 MiB positioned-read tasks and run at most four
+   transient workers, each writing directly into a disjoint final image slice.
+   Join the team, re-stat the same handles, and only then proceed.
 6. Parse and validate every safetensors header and payload span.
 7. Validate model-family invariants, required tensor names, shapes, dtypes,
    codebook counts, context sizes, and tokenizer control tokens.
@@ -125,10 +127,10 @@ must not repack a full weight merely to satisfy an assumed aligned-load contract
 10. Allocate no conversation or session state yet.
 11. Return only after all file I/O and backend ingress is complete.
 
-Failure unwinds all partial images and backend objects before returning. No
-exception crosses the C ABI. The existing `open_c` catch rim at
-`crates/liquid-audio/native/src/io/safetensors.cpp:538-563` is the pattern to
-retain.
+Failure unwinds all partial images and backend objects before returning. The
+loader never frees a destination while a positioned read may still target it,
+and no exception crosses the C ABI. The existing `open_c` catch rim is the
+pattern to retain.
 
 ## Native Schema
 

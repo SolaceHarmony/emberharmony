@@ -72,6 +72,25 @@ LFM_SYM(lfm_bf16_bias_add_f32):
 2:
     ret
 
+.p2align 2
+.globl LFM_SYM(lfm_bf16_copy_bytes)
+LFM_SYM(lfm_bf16_copy_bytes):
+    cbz     x2, 2f
+1:
+    ldrh    w3, [x0], #2
+    strh    w3, [x1], #2
+    subs    x2, x2, #1
+    b.ne    1b
+2:
+    ret
+
+.p2align 2
+.globl LFM_SYM(lfm_bf16_unlift_bits)
+LFM_SYM(lfm_bf16_unlift_bits):
+    ldrh    w0, [x0]
+    lsl     w0, w0, #16
+    ret
+
 .macro LFM_RNE_WIDEN source, target, bits, tie
     fmov    \bits, \source
     lsr     \tie, \bits, #16

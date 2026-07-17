@@ -118,6 +118,41 @@ LFM_SYM(lfm_bf16_bias_add_f32):
 2:
     ret
 
+.p2align 4
+.globl LFM_SYM(lfm_bf16_copy_bytes)
+LFM_SYM(lfm_bf16_copy_bytes):
+#ifdef _WIN32
+    movq      %rcx, %r10
+    movq      %rdx, %r11
+    movq      %r8, %rax
+#else
+    movq      %rdi, %r10
+    movq      %rsi, %r11
+    movq      %rdx, %rax
+#endif
+    testq     %rax, %rax
+    jz        2f
+1:
+    movzwl    (%r10), %r9d
+    movw      %r9w, (%r11)
+    addq      $2, %r10
+    addq      $2, %r11
+    decq      %rax
+    jnz       1b
+2:
+    ret
+
+.p2align 4
+.globl LFM_SYM(lfm_bf16_unlift_bits)
+LFM_SYM(lfm_bf16_unlift_bits):
+#ifdef _WIN32
+    movzwl    (%rcx), %eax
+#else
+    movzwl    (%rdi), %eax
+#endif
+    shll      $16, %eax
+    ret
+
 .macro LFM_WIDEN_BF16 address, target, bits
     movzwl    \address, \bits
     shll      $16, \bits

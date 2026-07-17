@@ -1,3 +1,5 @@
+#![cfg(feature = "oracle")]
+
 //! Parity gate for the LFM2 short-conv prefill swap: the FlashFFTConv `depthwise_conv1d`
 //! must reproduce candle's generic `Conv1d` (the op it replaces in `ShortConv::forward`)
 //! to f32 precision. This is the exact prefill math — causal depthwise, `padding = K-1`,

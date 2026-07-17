@@ -7,11 +7,11 @@
 // THIS header; propose changes in NOTES, do not fork the types.
 //
 // Discipline (engine rules apply verbatim):
-//   - Weights are a buffer: flat name -> {f32*, len} table, zero-copy views
+//   - Weights are a buffer: flat name -> {bytes, len} table, zero-copy views
 //     into the native resident safetensors image. Weight-norm folds ONCE at
-//     init into the arena; nothing repacks per step.
+//     plan construction into shared derived storage; nothing repacks.
 //   - Zero allocation in steady state: every stream state and scratch lives
-//     in ONE arena sized at init. State is POD (hibernatable).
+//     in one conversation arena sized at plan construction. State is POD.
 //   - f32 math, f32 accumulation, documented loop order. MATH IS ASSEMBLY AT
 //     EVERY STEP (her rule): no tensor-op thinking, no scalar C++ loops as a
 //     primary path — every sweep/reduction/activation is aarch64 NEON
@@ -60,7 +60,7 @@ extern "C" {
  * Lookup is init-time only — steady state touches raw pointers. */
 typedef struct MimiWeight {
     const char *name;   /* safetensors key, NUL-terminated */
-    const float *data;  /* f32, checkpoint layout, read-only, process-long */
+    const uint8_t *bytes; /* little-endian f32 bytes; may be unaligned */
     const uint64_t *shape; /* dims, length ndim */
     uint32_t ndim;
     uint64_t len;       /* total element count */
@@ -98,16 +98,24 @@ static const float MIMI_LAYER_SCALE_INIT = 0.01f; /* trained values come from we
 static const float MIMI_ELU_ALPHA = 1.0f;
 
 /* ---- arena --------------------------------------------------------------
- * One block, init-sized, owns ALL mutable state + scratch. Each unit declares
- * its state struct (POD) in its .cpp and carves it from the arena at init via
- * mimi_arena_alloc (bump allocator, 64-byte aligned, init-time only).
- * Steady state NEVER allocates. reset_state() zeroes states in place. */
+ * One exact-sized block owns one conversation's mutable state + scratch. A
+ * separate sealed plan arena supplies shared formula-derived immutable spans.
+ * Each unit carves its POD state at init; steady state never allocates. */
 typedef struct MimiArena {
     uint8_t *base;
     size_t size;
     size_t used;
+    struct MimiDerivedArena *derived;
+    size_t derived_cursor;
 } MimiArena;
 void *mimi_arena_alloc(MimiArena *a, size_t bytes); /* aborts on overflow: sizing bug */
+void *mimi_arena_alloc_derived(MimiArena *a, size_t bytes);
+int mimi_arena_building_derived(const MimiArena *a);
+
+/* Safe checkpoint load. This never forms a typed pointer for unaligned
+ * storage. Direct matrix calls specialize once on alignment and otherwise use
+ * the byte-load path without staging or repacking weights. */
+float mimi_weight_load_f32(const uint8_t *bytes, uint64_t index);
 
 /* ---- shared math primitives (mimi_decode.cpp owns impls; units call) -----
  * GEMM/GEMV are AMX-backed on Apple: implement over Accelerate cblas_sgemm /
@@ -120,6 +128,12 @@ void mimi_gemv_f32(const float *w, const float *x, const float *bias_or_null,
 /* C[MxN] += / = A[MxK] * B[KxN], row-major, f32 accumulate. beta 0 or 1. */
 void mimi_gemm_f32(const float *a, const float *b, float *c,
                    int m, int k, int n, int beta);
+void mimi_weight_gemv_f32(const uint8_t *w, const float *x,
+                          const uint8_t *bias_or_null, float *y, int m, int k);
+void mimi_weight_gemm_f32(const uint8_t *w, const float *b, float *c,
+                          int m, int k, int n, int beta);
+void mimi_weight_gemm_tn_f32(const uint8_t *w, const float *b, float *c,
+                             int rows, int k, int n);
 void mimi_softmax_f32(float *x, int n);            /* in place, max-subtracted;
                                                       NEON max/sum reductions,
                                                       lane-wise expf */
@@ -134,13 +148,17 @@ void mimi_add_vec_f32(const float *a, const float *b, float *y, int n);
 void mimi_scale_vec_f32(const float *x, const float *s, float *y, int n); /* y=x*s elementwise (LayerScale) */
 void mimi_layer_norm_f32(const float *x, const float *w, const float *b,
                          float *y, int n, float eps); /* NEON mean/var/apply */
+void mimi_weight_scale_vec_f32(const float *x, const uint8_t *s,
+                               float *y, int n);
+void mimi_weight_layer_norm_f32(const float *x, const uint8_t *w,
+                                const uint8_t *b, float *y, int n, float eps);
 
 /* ---- unit entry points ---------------------------------------------------
  * Streaming convention (replaces StreamTensor): every step takes
  * n_in frames and reports n_out frames; 0 is legal (module buffering).
  * Layout is conv layout throughout: [C, T] channel-major per frame batch=1.
  * Each unit: *_init carves state from the arena + captures weight pointers
- * (folding into arena if needed), *_step runs frames, *_reset re-arms state.
+ * (binding shared plan folds if needed), *_step runs frames, *_reset re-arms state.
  * Init returns 0 on success, nonzero + msg on missing/misshaped weights. */
 
 /* 1. quantization: codes [MIMI_NQ] u32 -> emb [MIMI_DIM, 1] */
@@ -188,12 +206,29 @@ int  mimi_seanet_init(MimiSeanetState **st, const MimiWeightTable *w,
 int  mimi_seanet_step(MimiSeanetState *st, const float *x, int n_in, float *pcm);
 void mimi_seanet_reset(MimiSeanetState *st);
 
-/* 6. top level (mimi_decode.cpp): owns the arena + the chain */
+/* 6. top level: model-lifetime plan + conversation-lifetime state */
 typedef struct MimiDecoder MimiDecoder;
+typedef struct MimiDecodePlan MimiDecodePlan;
+typedef struct MimiDecodeState MimiDecodeState;
+typedef struct LfmWeightImage LfmWeightImage;
+int mimi_decode_plan_new_from_image(MimiDecodePlan **plan,
+                                    const LfmWeightImage *image,
+                                    char *err, size_t errlen);
+void mimi_decode_plan_free(MimiDecodePlan *plan);
+uint64_t mimi_decode_plan_derived_bytes(const MimiDecodePlan *plan);
+uint64_t mimi_decode_plan_compatibility_copied_bytes(const MimiDecodePlan *plan);
+int mimi_decode_state_new(MimiDecodeState **state, const MimiDecodePlan *plan,
+                          char *err, size_t errlen);
+void mimi_decode_state_free(MimiDecodeState *state);
+int mimi_decode_state_step(MimiDecodeState *state, const uint32_t *codes,
+                           float *pcm_out);
+void mimi_decode_state_reset(MimiDecodeState *state);
+uint64_t mimi_decode_state_bytes(const MimiDecodeState *state);
 int  mimi_decoder_new(MimiDecoder **d, const MimiWeightTable *w,
                       char *err, size_t errlen);
-/* Production constructor: C++ owns file loading, parsing, and the process-long
- * resident weight image. No Rust/Candle tensor descriptors participate. */
+/* Transitional single-state wrappers used by parity tests. */
+int  mimi_decoder_new_from_image(MimiDecoder **d, const LfmWeightImage *image,
+                                 char *err, size_t errlen);
 int  mimi_decoder_new_from_file(MimiDecoder **d, const char *checkpoint,
                                 char *err, size_t errlen);
 /* one latent frame of codes [MIMI_NQ] -> n_out samples (0 while priming);
@@ -201,6 +236,8 @@ int  mimi_decoder_new_from_file(MimiDecoder **d, const char *checkpoint,
 int  mimi_decoder_step(MimiDecoder *d, const uint32_t *codes, float *pcm_out);
 void mimi_decoder_reset(MimiDecoder *d);
 void mimi_decoder_free(MimiDecoder *d);
+uint64_t mimi_decoder_derived_bytes(const MimiDecoder *d);
+uint64_t mimi_decoder_compatibility_copied_bytes(const MimiDecoder *d);
 
 #ifdef __cplusplus
 } /* extern "C" */

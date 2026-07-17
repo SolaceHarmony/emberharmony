@@ -10,7 +10,6 @@
 use std::{
     borrow::Cow,
     collections::HashMap,
-    fs,
     future::Future,
     path::{Path, PathBuf},
     sync::{
@@ -20,16 +19,15 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use candle_core::Device;
 use crossbeam_channel::{Receiver, RecvTimeoutError};
 use futures::StreamExt;
-use liquid_audio::moshi::models::{realtime_moshi_files, safetensors_floating_dtype};
 use liquid_audio::{
-    AudioStatsSnapshot, ConversationVault, ExternalAudioInput, ExternalAudioInputWriter,
-    ExternalAudioOutput, FrameSubmitError, GenParams, LFM2AudioModel, LFM2AudioProcessor,
-    Lfm2VoiceEngine, MoshiVoiceEngine, RealtimeFramePipeline, RealtimeFramePipelineHandle,
-    RealtimePipeline, RealtimePipelineHandle, RuntimeConfig, RuntimeEvent, SessionState, Utterance,
-    VoiceEngine, VoiceEvent as RealtimeEvent, VoiceRuntime as Lfm2Runtime, from_pretrained,
+    AudioStatsSnapshot, ExternalAudioInput, ExternalAudioInputWriter, ExternalAudioOutput,
+    FrameSubmitError, NativeConversationVault, NativeLfm2VoiceEngine, NativeVoiceModel,
+    NativeVoiceRuntimeConfig, NativeVoiceSampling, RealtimeFramePipeline,
+    RealtimeFramePipelineHandle, RealtimePipeline, RealtimePipelineHandle, RuntimeConfig,
+    RuntimeEvent, SessionState, Utterance, VoiceEngine, VoiceEvent as RealtimeEvent,
+    VoiceRuntime as Lfm2Runtime,
 };
 use livekit::{
     AudioProcessingOptions, ConnectionState, DataPacket, PlatformAudio, Room, RoomEvent,
@@ -87,34 +85,13 @@ const LIVEKIT_AGENT_SILENCE_MS: u64 = 800;
 const LIVEKIT_AGENT_MAX_UTTERANCE_SECONDS: usize = 30;
 const LIVEKIT_AGENT_ECHO_GATE_MS: u64 = 700;
 const LIVEKIT_AGENT_ECHO_MULTIPLIER: f32 = 2.5;
-const LFM2_CONVERSE_SYSTEM_PROMPT: &str = concat!(
-    "Respond with interleaved text and audio. You are a warm, brief voice assistant. ",
-    "Chat naturally and answer simple questions yourself in one or two short spoken sentences. ",
-    "But when the user asks for real engineering, coding, research, or file/system work, ",
-    "do NOT attempt it yourself. Instead, briefly say you'll get your engineer on it, ",
-    "and on the TEXT channel output exactly one line of the form: ",
-    "DELEGATE: <a clear, self-contained description of the task>. ",
-    "Only emit DELEGATE for genuine work, never for small talk."
-);
-
-/// Resident LFM2 weights (spec 09): loading 1.5B params takes seconds, so the loaded
-/// model lives for the app lifetime and every voice session borrows it via `Arc` —
-/// building an engine must never mean loading the model again. Keyed by (model dir,
-/// device); changing either in Settings reloads once. The ~3GB residency is the price
-/// of instant session starts.
+/// The one native resident image. The desktop never constructs the legacy
+/// Rust model, processor, or Candle device for this path.
 struct ResidentLfm2 {
     dir: PathBuf,
     device_setting: Lfm2Device,
-    /// The ONE candle Device for the app's lifetime. candle Metal state is
-    /// per-`MetalDevice` INSTANCE (command queue, built-in kernel cache, buffer
-    /// pool) — minting a fresh `Device::new_metal(0)` per session start left the
-    /// resident weights on the first instance while sessions ran on new ones:
-    /// candle recompiled its kernels every session and two live queues could
-    /// interleave. The compiled-kernel context is resident state, same as the
-    /// weights.
-    device: Device,
-    model: Arc<LFM2AudioModel>,
-    proc: Arc<LFM2AudioProcessor>,
+    runtime: NativeVoiceRuntimeConfig,
+    model: NativeVoiceModel,
 }
 
 static LFM2_RESIDENT: Mutex<Option<ResidentLfm2>> = Mutex::new(None);
@@ -122,9 +99,10 @@ static LFM2_RESIDENT: Mutex<Option<ResidentLfm2>> = Mutex::new(None);
 /// One conversation vault per chat session: the model's conversation must survive
 /// UI-driven voice session rebuilds (route changes, settings writes) — the upstream
 /// `chat.py` invariant, where `ChatState` outlives everything but an explicit reset.
-static CONVERSATION_VAULTS: Mutex<Option<HashMap<String, ConversationVault>>> = Mutex::new(None);
+static CONVERSATION_VAULTS: Mutex<Option<HashMap<String, NativeConversationVault>>> =
+    Mutex::new(None);
 
-fn conversation_vault(session_id: &str) -> ConversationVault {
+fn conversation_vault(session_id: &str) -> NativeConversationVault {
     let mut slot = CONVERSATION_VAULTS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -134,33 +112,30 @@ fn conversation_vault(session_id: &str) -> ConversationVault {
         .clone()
 }
 
-fn resident_lfm2(
-    dir: &Path,
-    device_setting: &Lfm2Device,
-) -> Result<(Arc<LFM2AudioModel>, Arc<LFM2AudioProcessor>, Device), String> {
-    // Double-checked resident init (#148). Hold the lock ONLY to check for a hit
-    // and clone handles out — never across `from_pretrained`, a multi-second
-    // Metal load. Holding it there stalled anything else touching the slot and
-    // pinned a tokio worker for the whole load.
+fn resident_lfm2(dir: &Path, device_setting: &Lfm2Device) -> Result<NativeVoiceModel, String> {
+    if *device_setting != Lfm2Device::Cpu {
+        return Err(
+            "Native LFM2 Metal/MLX is not available yet; select CPU. The desktop will not fall back to Candle Metal."
+                .into(),
+        );
+    }
+    let runtime = NativeVoiceRuntimeConfig::default();
+    // Double-checked resident init (#148). Hold the lock only to check for a hit
+    // and clone opaque handles out, never across the multi-second native load.
     {
         let slot = LFM2_RESIDENT
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(resident) = slot.as_ref() {
-            if resident.dir == dir && &resident.device_setting == device_setting {
+            if resident.dir == dir
+                && &resident.device_setting == device_setting
+                && resident.runtime == runtime
+            {
                 // Per-session ground truth in the log: which silicon this session's
                 // model actually lives on (the settings store can say one thing and
                 // a stale resident another — this line is the arbiter).
-                eprintln!(
-                    "[voice] LFM2 session: setting {:?} -> resident model reused on {:?}",
-                    device_setting,
-                    resident.device.location()
-                );
-                return Ok((
-                    resident.model.clone(),
-                    resident.proc.clone(),
-                    resident.device.clone(),
-                ));
+                eprintln!("[voice] LFM2 session: reusing native resident image");
+                return Ok(resident.model.clone());
             }
             eprintln!(
                 "[voice] LFM2 session: setting changed ({:?} -> {:?}); reloading model",
@@ -169,48 +144,35 @@ fn resident_lfm2(
         }
     } // lock released before the load
 
-    // First load (or dir/device change), OUTSIDE the lock: create the device HERE
-    // so it lives and dies with the resident weights — one queue, one kernel
-    // cache, one pool.
-    let device = select_device(device_setting)?;
-    eprintln!(
-        "[voice] LFM2 session: setting {:?} -> loading model onto {:?}",
-        device_setting,
-        device.location()
-    );
-    let (model, proc) =
-        from_pretrained(dir, &device).map_err(|e| format!("failed to load LFM2-Audio: {e}"))?;
-    let (model, proc) = (Arc::new(model), Arc::new(proc));
+    // The loader writes each shard directly into the final immutable native
+    // image. There is no Rust safetensors builder or Candle compatibility copy.
+    eprintln!("[voice] LFM2 session: loading native resident image");
+    let model = NativeVoiceModel::open_with_config(dir, runtime)
+        .map_err(|error| format!("failed to load native LFM2-Audio: {error}"))?;
 
     // Re-lock to publish. Double-check: a concurrent start may have loaded the
     // SAME dir+device while we were loading — if so, adopt theirs and drop ours,
-    // so the app keeps exactly ONE resident device instance (the whole point of
-    // the resident cache). Serialized starts never hit this; the check makes the
-    // rare race correct instead of leaking a second device.
+    // so the app keeps exactly one resident image/runtime. Serialized starts
+    // never hit this; the check makes the rare race correct.
     let mut slot = LFM2_RESIDENT
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(resident) = slot.as_ref() {
-        if resident.dir == dir && &resident.device_setting == device_setting {
-            eprintln!(
-                "[voice] LFM2 session: concurrent load raced; adopting the resident model on {:?}",
-                resident.device.location()
-            );
-            return Ok((
-                resident.model.clone(),
-                resident.proc.clone(),
-                resident.device.clone(),
-            ));
+        if resident.dir == dir
+            && &resident.device_setting == device_setting
+            && resident.runtime == runtime
+        {
+            eprintln!("[voice] LFM2 session: concurrent load raced; adopting resident image");
+            return Ok(resident.model.clone());
         }
     }
     *slot = Some(ResidentLfm2 {
         dir: dir.to_path_buf(),
         device_setting: device_setting.clone(),
-        device: device.clone(),
+        runtime,
         model: model.clone(),
-        proc: proc.clone(),
     });
-    Ok((model, proc, device))
+    Ok(model)
 }
 
 /// One active native voice service for the desktop app.
@@ -2706,19 +2668,18 @@ fn send_runtime(channel: &UiChannel, event: RuntimeEvent) -> bool {
     }
 }
 
-/// Map one mode's settings group onto the engine's `GenParams`. Settings use
-/// `0` = off (temperature 0 = greedy, top-k 0 = no cutoff); `GenParams` uses
-/// `None` for the same.
-fn gen_params(mode: &settings::Lfm2ModeSampling, seed: Option<u64>) -> GenParams {
-    GenParams {
+/// Map persisted sampling policy into the versioned native conversation/session
+/// configuration. No sampler or token loop runs in Rust.
+fn native_sampling(mode: &settings::Lfm2ModeSampling, seed: Option<u64>) -> NativeVoiceSampling {
+    NativeVoiceSampling {
         // The UI enforces >= 1; a hand-edited store must not mute the voice
         // (0 would end every turn instantly with only an EXHAUSTED warning).
-        max_new_tokens: (mode.max_tokens as usize).max(1),
+        max_new_tokens: mode.max_tokens.max(1),
         text_temperature: (mode.text_temperature > 0.0).then_some(mode.text_temperature),
-        text_top_k: (mode.text_top_k > 0).then_some(mode.text_top_k as usize),
+        text_top_k: (mode.text_top_k > 0).then_some(mode.text_top_k),
         audio_temperature: (mode.audio_temperature > 0.0).then_some(mode.audio_temperature),
-        audio_top_k: (mode.audio_top_k > 0).then_some(mode.audio_top_k as usize),
-        seed: seed.unwrap_or(0),
+        audio_top_k: (mode.audio_top_k > 0).then_some(mode.audio_top_k),
+        seed,
     }
 }
 
@@ -2737,61 +2698,21 @@ fn can_interrupt_playback(settings: &VoiceSettings) -> bool {
 
 fn build_engine(
     settings: VoiceSettings,
-    out_rate: u32,
-    vault: Option<ConversationVault>,
+    _out_rate: u32,
+    vault: Option<NativeConversationVault>,
 ) -> Result<Box<dyn VoiceEngine>, String> {
     // Fail-hard, no network at start: load ONLY a local snapshot dir. The repo id/revision are
     // the download source (Settings → Download), not a run-time fetch — never auto-download here.
     if settings.lfm2.engine == LocalVoiceEngine::MoshiRealtime {
-        let device = select_device(&settings.lfm2.device)?;
-        let dir = settings::moshi_model_dir(&settings.lfm2).ok_or_else(|| {
-            "No local Moshi realtime model — download Moshiko or select a Moshi snapshot directory in Settings."
-                .to_string()
-        })?;
-        let files = realtime_moshi_files(&dir)
-            .map_err(|e| format!("failed to inspect Moshi snapshot: {e}"))?
-            .ok_or_else(|| {
-                "Selected Moshi directory is not a realtime Moshi snapshot.".to_string()
-            })?;
-        let dtype = safetensors_floating_dtype(&files.moshi_weights)
-            .map_err(|e| format!("failed to read Moshi checkpoint dtype: {e}"))?;
-        let engine = MoshiVoiceEngine::from_files(
-            &files,
-            dtype,
-            &device,
-            files
-                .params
-                .with_seed(settings.lfm2.seed.unwrap_or(files.params.seed)),
-            out_rate,
-        )
-        .map_err(|e| format!("failed to load Moshi realtime model: {e}"))?;
-        return Ok(Box::new(engine));
+        return Err(
+            "Moshi realtime inference is offline-oracle only in this release; select native LFM2 interleaved. No Candle fallback is linked."
+                .into(),
+        );
     }
     let dir = settings::lfm2_active_model_dir(&settings.lfm2).ok_or_else(|| {
         "No local LFM2-Audio model — download a model or select a model directory in Settings."
             .to_string()
     })?;
-    if realtime_moshi_files(&dir)
-        .map_err(|e| format!("failed to inspect local voice model: {e}"))?
-        .is_some()
-    {
-        return Err("Selected local engine is LFM2-Audio, but the directory contains a Moshi realtime snapshot. Switch Local engine to Moshi realtime or choose an LFM2-Audio snapshot.".into());
-    }
-    let codebooks = codebooks(&dir)?;
-    // The Device rides the resident cache: ONE candle MetalDevice instance (one
-    // command queue, one built-in kernel cache, one buffer pool) for the app's
-    // lifetime — sessions borrow it, never mint their own.
-    let (model, proc, device) = resident_lfm2(&dir, &settings.lfm2.device)?;
-    // Decoding regime comes from Settings — the `interleaved` group is the
-    // live conversation path (defaults there are the vendor demo's regime).
-    // Greedy text at 1.2B is a repetition machine, and greedy audio is
-    // degenerate for the Depthformer — both stay reachable (temperature 0)
-    // but are the user's explicit choice, never the default.
-    let params = gen_params(&settings.lfm2.interleaved, settings.lfm2.seed);
-    let mut engine = Lfm2VoiceEngine::new(model, proc, params, codebooks, device, out_rate);
-    if let Some(vault) = vault {
-        engine = engine.with_conversation_vault(vault);
-    }
     if settings.lfm2.delegate.enabled
         && settings
             .lfm2
@@ -2800,47 +2721,15 @@ fn build_engine(
             .as_deref()
             .is_some_and(|target| !target.trim().is_empty())
     {
-        return Ok(Box::new(
-            engine.with_system_prompt(LFM2_CONVERSE_SYSTEM_PROMPT),
-        ));
+        return Err(
+            "Delegation requires a configurable native system-prompt command, which is not in the current session ABI. Native LFM2 will not instantiate the Candle engine as a fallback."
+                .into(),
+        );
     }
+    let model = resident_lfm2(&dir, &settings.lfm2.device)?;
+    let sampling = native_sampling(&settings.lfm2.interleaved, settings.lfm2.seed);
+    let engine: NativeLfm2VoiceEngine = model.engine(sampling, vault)?;
     Ok(Box::new(engine))
-}
-
-fn select_device(device: &Lfm2Device) -> Result<Device, String> {
-    match device {
-        Lfm2Device::Cpu => {
-            if liquid_audio::bf16_gemm::bf16_gemm_available() {
-                Ok(Device::Cpu)
-            } else {
-                Err(
-                    "CPU LFM2 voice requires the NEON BF16 matmul kernel; choose Metal on this Mac."
-                        .into(),
-                )
-            }
-        }
-        Lfm2Device::Metal => {
-            #[cfg(target_os = "macos")]
-            {
-                Device::new_metal(0).map_err(|e| format!("failed to open Metal device: {e}"))
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                Err("Metal voice inference is only available on macOS.".into())
-            }
-        }
-    }
-}
-
-fn codebooks(dir: &Path) -> Result<usize, String> {
-    let config = fs::read_to_string(dir.join("config.json"))
-        .map_err(|e| format!("failed to read model config: {e}"))?;
-    let json: serde_json::Value =
-        serde_json::from_str(&config).map_err(|e| format!("failed to parse model config: {e}"))?;
-    json["codebooks"]
-        .as_u64()
-        .map(|n| n as usize)
-        .ok_or_else(|| "model config is missing `codebooks`".to_string())
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -3446,6 +3335,21 @@ fn audio_frame_to_mono_f32(frame: &AudioFrame<'_>) -> Vec<f32> {
 mod tests {
     use super::*;
     use std::sync::Barrier;
+
+    #[test]
+    fn lfm2_desktop_factory_and_cache_are_native_only() {
+        const FACTORY: fn(&Path, &Lfm2Device) -> Result<NativeVoiceModel, String> = resident_lfm2;
+        fn cache_model(cache: &CachedLfm2Model) -> &NativeVoiceModel {
+            &cache.model
+        }
+
+        let _ = FACTORY;
+        let _ = cache_model;
+        let error = resident_lfm2(Path::new("unused-for-device-rejection"), &Lfm2Device::Metal)
+            .err()
+            .expect("Metal must fail instead of constructing a compatibility model");
+        assert!(error.contains("will not fall back to Candle Metal"));
+    }
 
     #[test]
     fn thread_manager_reaps_finished_threads_and_keeps_live_threads() {

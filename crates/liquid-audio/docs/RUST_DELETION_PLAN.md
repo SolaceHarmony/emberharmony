@@ -1,183 +1,184 @@
 # Rust inference deletion plan
 
-Status: active execution ledger, audited against the working tree on 2026-07-15.
+Status: **LFM2 production ownership cutover complete; follow-on ledger**, audited
+against the working tree on 2026-07-16.
 
 ## Ruling
 
-Rust owns audio streams in and out, opaque lifetimes, settings/control mapping,
-and host projection. It owns no model math, DSP, tensors, tokens, sampling,
-model-pass scheduling, or recurrence.
+Rust owns platform microphone/speaker callbacks, VAD/endpointing, opaque
+lifetimes, settings/control mapping, and host projection. It owns no production
+model math, DSP, tensor, weight, token, sampling, KV/codec state, model-pass
+scheduling, or recurrence.
 
-C++ owns native plans, state, queues, leases, stages, and recurrence. Every
-value-producing production operation belongs to an AArch64/x86_64 assembly
-leaf. Apple AMX machine code may be reached only through that architecture
-assembly ABI; a C++ numerical call site is not an exception.
+C++ owns native plans, immutable views, conversations, sessions, queues, leases,
+stages, and recurrence. Production pass arithmetic belongs to typed
+AArch64/x86_64 leaves; approved Apple matrix machinery is reached behind that
+leaf boundary. Formula-derived immutable tables may be constructed at readiness
+and are reported separately. Layout, alignment, dtype, transpose, framework
+ownership, or convenience copies of weights are forbidden.
 
-## Completed In This Tranche
+The default crate and desktop production graph are native-only. Candle, the old
+Rust inference implementation, training, fixture capture, and Moshi are isolated
+behind the opt-in `oracle` feature and workspace-only `liquid-audio-oracle` crate.
+An oracle is never a production fallback.
 
-- **Mimi PCM `Tensor` round-trip deleted (P3 seam 1 of 3).** The streaming
-  per-frame decode on the production `respond` path now runs host codes
-  `&[u32]` → `MimiStreaming::decode_codes` → `AudioDetokenizer::decode_step_codes`
-  (native Mimi kernel) → `Vec<f32>` → resampler, with **no `Tensor` in either
-  direction**. `decode_step_codes` is now an `AudioDetokenizer` trait method
-  (default wraps the `Tensor` `decode_step` for non-native backends; the native
-  Mimi backend overrides it with the direct `&[u32]` → `Vec<f32>` kernel path).
-  The former `decode_audio_frame` `Tensor` adapter (`moshi/demo/chat.rs`) is
-  deleted (dead). Transport-only — PCM values unchanged (native Mimi still
-  produces the same `Vec<f32>`); 167 lib tests green. Remaining P3 seams:
-  mel→`Tensor` and adapter→`Tensor`, both prefill-coupled.
-- **Native audio-in prefill capability (P2/P4 enabler).**
-  `lfm_engine_token_pass` `embed_kind == 2` provided-embedding path +
-  `lfm_conversation_prefill_audio` (`NativeConversation::prefill_audio`) prefill
-  Conformer rows into KV as a borrowed view; parity-proven against the discrete
-  embed path (`native_audio_prefill_matches_discrete_for_the_same_embedding`).
-  Not yet adopted by production voice (the Candle backbone copy drop needs the
-  full `self.lfm` elimination — see doc 14 P2/P3).
-- **Depthformer Candle copy dropped on the resident path.**
-  `build_depth_decode_resident` (`model/lfm2_audio.rs`) binds the depth plan
-  directly from the resident checkpoint image by name (zero-copy), with rope from
-  the native `lfm_rope_table_f32` kernel — the same kernel `lfm_model.cpp` feeds
-  its native plan. It is now the production depth path; the Candle depth modules
-  (`depthformer` / `depth_linear` / `depth_embeddings`) became `Option`, built
-  only on the non-resident training path (guarded in the training `forward`).
-  Verified byte-identical to the Candle-bound plan by
-  `depth_resident_binder_matches_candle_binder` (greedy tokens, so identical
-  logits ⇒ identical argmax). Production Candle-copy ledger fell **231 → 151
-  tensors, 2.711 → 2.475 GB** (~236 MB of depth weights no longer duplicated). The
-  remaining ~2.475 GB is the backbone + audio embedding, whose copy is coupled to
-  native prefill (Candle still owns prefill/`forward_embeds`).
-- Deleted `src/compute/flashkern/coordinator.rs` and the registered Rust
-  submitter callback ABI. `submit_pass` now uses the native SQ/CQ directly.
-- Added `raw_engine_owns_its_sq_cq_without_rust_progress`, proving a complete
-  pass needs no Rust callback.
-- Deleted the 1,693-line Rust `fanout.rs` implementation.
-- Reduced `dd.rs` from a Rust arithmetic implementation to a test-only ABI
-  record.
-- Removed the Candle fallback from audio-frame sampling.
-- Added AArch64/x86_64 assembly leaves for reciprocal RMS scaling, fixed-order
-  reduction, strided BF16 sum-of-squares, BF16 bias addition, and BF16 NeoX
-  rotary.
-- Added a no-feature-gate assembly ABI fixture that executes natively and under
-  Rosetta.
-- Deleted `src/compute/bf16_gemm.rs` and its Candle `CustomOp2` owner. The
-  temporary Candle rim now borrows storage and submits one typed `REQ_GEMM`;
-  capability truth comes from the native Flashkern ABI.
-- **Conformer encoder and audio adapter are native.** Deleted
-  `src/model/conformer/*` (encoder, mha, modules, subsampling, utils) and the
-  now-orphaned `src/model/mlp.rs` + `src/model/norm.rs`. `lfm_conformer.{h,cpp}`
-  binds all encoder+adapter weight views from the resident image and runs one
-  segment as a sequence of stages: subsampling (conv2d im2col + f32 GEMM +
-  depthwise/pointwise), rel-pos table, 17 Conformer layers (macaron FFN, rel-pos
-  attention, conv module with BatchNorm-eval + GLU + depthwise-k9), adapter
-  (LN + gelu-erf). Every value comes from `flashkern_conformer.S` (both arches:
-  LayerNorm, BatchNorm, SiLU, GLU, gelu-erf, softmax, residuals, dw-conv,
-  sgemm/sgemm-nt, pe-table, bias) or the engine bf16 GEMM pass, with the f32
-  matmul stages on Accelerate (Apple) / house sgemm leaf. Production BF16
-  ladder mirrored exactly (fixtures arbitrate). Baselines
-  `native/tests/fixtures/conformer/` (real LFM2.5-Audio checkpoint, per-stage,
-  captured from the deleted Rust); gate `tests/native_conformer_parity.rs`
-  (shape-first, adapter within BF16-ladder tolerance — measured worst relative
-  divergence 5.1e-3 across 1/4/7-row segments). The mel-plane transport tensor
-  at the prefill seam still exists; it dies at the doc 07 conversation cutover.
+## As-built / open-gaps ledger
 
-- **Mel frontend and resampler are native.** Deleted the in-crate featurizer
-  (hann/slaney/DFT tables, the candle STFT/normalization in `processor.rs`)
-  and the pure-Rust windowed-sinc resampler body. `lfm_frontend.{h,cpp}` +
-  `flashkern_frontend.S` (both arches) own the math: preemphasis, |X|^2,
-  log-guard, ddof-1 row statistics, normalization, and the f64 resample conv
-  are assembly leaves; the two matmul-shaped stages ride Accelerate on Apple
-  (mimi pattern). Table construction is init-time f64 C++ (the Mimi
-  weight-fold class) — its N2 extraction is a named follow-up, not a silent
-  exemption. Baselines: `native/tests/fixtures/{mel,resample}/` captured from
-  the deleted Rust; gates: `tests/native_frontend_parity.rs` (resampler
-  bitwise; mel padded/valid shape-first + tolerance policy). Realtime borrows
-  retained 16 kHz PCM directly; the frontend reuses a rim-owned high-water
-  workspace, aliases dead signal/DFT/power planes, and writes the valid mel
-  destination without a padded crop-copy. The Rust `FilterbankFeatures` /
-  `resample_slice` names survive as opaque-handle/transport rims only — the
-  remaining Metal mel upload dies with the Conformer cutover (doc 06).
-
-## Current Production Violations
-
-| Seam | Why it is still live | Replacement required before deletion |
+| Area | Working-tree state | Remaining work |
 |---|---|---|
-| `src/model/**` | Rust/Candle still owns backbone/depthformer construction, prefill/generation, sampling, and tensors. The Conformer encoder + adapter are now native (deleted). | Native model/session owns tokenizer, prefill, recurrence, sampling, and state. |
-| `src/compute/weights.rs` | Rust can still reconstruct Candle tensors from views into the native resident image. | Native plans bind immutable views directly; delete the Candle builder and tensor-copy adapter. |
-| `src/model/linear.rs` | A temporary Candle ownership rim still exposes tensor storage to `REQ_GEMM`; it performs no math. | Production callers use `NativeModel`/`NativeConversation`, then this rim is deleted. |
-| `src/compute/flashkern/candle_ops.rs` | ShortConv compatibility path still converts Candle storage. | Native conversation owns convolution carry and typed stage. |
-| `native_engine.rs` pass methods | Temporary tests and compatibility callers still submit numerical buffers from Rust. | Rust exposes only PCM/control dock and opaque handles. Numerical methods become native tests or are deleted. |
-| `processor.rs` mel rim, `runtime/resample.rs` rim | Frontend math is native. Realtime 16 kHz PCM is pointer-through and valid mel is direct, but the shared compatibility workspace can grow inside a pass and serialize engines; every pass allocates its Candle destination; Metal then uploads it. Non-16 kHz resampling still uses a temporary Rust output and per-call native work. Beyond transport, mel OWNERSHIP also remains Rust: the plan/workspace handles, `ChatState.audio_in` storage and `Tensor::cat` growth, the Candle Conformer feed, and cross-turn persistence in `ConversationState`. | Give each native session a pre-reserved workspace and mel segment, let the resampler write its first plane, and have Conformer consume that segment directly; then delete both rims. Storage/persistence residue (`ChatState`/`ConversationState` mel tensors) clears at the doc 07 conversation cutover; handle ownership transfers when a native session object exists. |
-| Rust Mimi/Moshi owners | Continuous model and codec state remain in Rust/Candle. | Native Moshi session and codec recurrence. |
-| Candle/moshi dependencies | Required by the remaining seams above. | Remove after every production owner is native and fixture gates pass. |
+| Main + codec weights | **Landed.** One byte-exact allocation, direct parallel positioned reads, component-scoped catalog, source handles closed, image page-table read-only after validation. | Keep real-checkpoint digest/load benchmarks as release gates. |
+| Typed binding | **Landed.** Exact BF16/F32 dtype, rank, shape, layer, codebook, and vocabulary checks; possibly unaligned tensors remain byte views. | None for LFM2. |
+| Weight consumption | **Landed.** Frontend, Conformer, backbone, Depthformer, and Mimi bind the same image; BF16 unlift occurs in registers. | `compatibility_copied_bytes == 0` remains an acceptance assertion. |
+| Native model chain | **Landed.** Resample, mel, Conformer/adapter, modality assembly, backbone, sampling, Depthformer, Mimi, and tokenizer are native-owned. | Multi-row prefill specialization is still open; correct prefill currently advances admitted rows through the native token pass. |
+| Conversation/session | **Landed.** Native KV/ShortConv/codec state, PRNG, cursor, recurrence, text/PCM tickets, reliable events, epochs, interrupt, stop, and join. Rust does not drive progress. | The native coordinator still synchronously parks on the engine's capacity-1 completion before calling the next pass. Capacity-2 completion continuations are open. |
+| Context rollover | **Landed.** Fixed capacity+runway BF16 state, monotonic cursor, absolute RoPE range generation, whole-action reservation, and in-place compaction. | None for the activation-state sliding-window contract. |
+| Shared model | **Landed.** Per-conversation state/scratch and a fair model-owned expected-value pass gate; engine `-EBUSY` does not leak as scheduling policy. | Capacity-2 continuations may improve overlap; fairness is already correct. |
+| Production graph | **Landed.** Desktop creates `NativeVoiceModel` and opaque native conversations/sessions only; default dependencies do not enable Candle or Moshi. | Native Metal/MLX remains a separate future backend and must fail explicitly until mounted. |
+| Physical audio dock | **Partial.** Native generation-checked capture/playback leases and zero-spin doorbells are live. | The Rust adapter still copies `Utterance.samples` into a capture lease and copies playback with `to_vec()` into crossbeam `Reply::Audio`/`VoiceEvent::Audio`. Replace it with direct kcoro device callbacks. |
+| Moshi | **Not ported.** It is offline/oracle-only and is not the shipped default. | A full native Moshi port is a subsequent tranche; this LFM2 ledger does not claim it. |
 
-## Execution Order
+## Completed LFM2 cutover
 
-### R0 - Native ownership and pass recurrence
+### One immutable model image
 
-1. Finish binding every model component from the resident safetensors image.
-2. Replace borrowed engine request storage with native pass slots and leases.
-3. Move tokenizer, prompt assembly, prefill, sampling, token/frame recurrence,
-   conversation marks, and context switching into the native session.
-4. Prove 1,000 native passes recur with no Rust callback or token crossing.
+- `native/src/io/safetensors.cpp` opens and fingerprints all selected shards,
+  computes checked 64-byte source bases, and allocates exactly one combined
+  main+codec image.
+- Up to four workers perform retrying 8 MiB positioned reads directly into
+  disjoint final spans. There are no chunk allocations, payload staging buffers,
+  payload zero-fill, or application payload `memcpy` calls. Only inter-source
+  alignment padding is zeroed.
+- Every worker joins before failure unwinds the image. The loader deterministically
+  selects failures, verifies the same open handles, closes them before publication,
+  validates metadata/spans, and seals the allocation read-only.
+- `LfmModelMemoryV1` reports source bytes, resident bytes, directly bound bytes,
+  formula-derived immutable bytes, compatibility-copied bytes, load time, worker
+  count, and task count.
 
-### R1 - Assembly extraction
+### Direct native consumers
 
-1. Move remaining engine/model floating-point expressions into typed assembly
-   leaves.
-2. Move hot architecture `.cpp` numerical bodies to `.S`; retain C++ only for
-   capability selection and invocation.
-3. Put AMX/Accelerate behind a narrow leaf so the scheduler never performs
-   numerical preparation during a pass.
-4. Reject scalar production fallbacks; keep scalar oracles test-only.
+- `LfmModel` is the sole image owner. Exact byte-addressed views bind embeddings,
+  every backbone layer, Conformer, Depthformer, and Mimi. No public production ABI
+  exposes names, shapes, weight pointers, mel rows, hidden rows, logits, KV, or
+  codec codes.
+- BF16 checkpoint storage is not widened, aligned, transposed, packed, or copied.
+  Architecture kernels load unaligned little-endian words and unlift them in
+  registers; scalar tails use safe byte loads.
+- Formula-changing tables—RoPE, frontend/window/FFT, BatchNorm denominators, and
+  Mimi folds—are the only admitted derived storage and are accounted separately.
+- Frontend power aliases dead STFT real storage, valid mel writes the BF16
+  Conformer destination, Conformer writes the native prefill plane, and Mimi
+  writes PCM directly into a playback reservation.
 
-### R2 - Frontend and codec
+### Native conversation and recurrence
 
-1. Native VAD, resample, FFT/mel, normalization.
-2. Native Conformer and adapter.
-3. Native Depthformer and Mimi/Moshi encode/decode state.
-4. End-to-end PCM ingress -> native model -> PCM egress fixtures.
+- `LfmConversation` owns fixed BF16 KV and ShortConv state, frontend/resampler/
+  Conformer/Mimi workspaces, bounded tokenizer storage, sampler PRNG, generation
+  cadence, context cursor, and epoch-sensitive state.
+- Text, PCM, and mixed text+PCM actions validate and reserve their complete row
+  requirement before the first backbone mutation. No caller supplies hidden
+  geometry.
+- `LfmSession` owns bounded commands, ticket-correlated reliable text/terminal
+  events, capture/playback leases, interruption epochs, stop, join, and the native
+  token → sample → Depthformer → Mimi recurrence loop. A stale pass may finish but
+  cannot publish.
+- All waits use shared expected-value predicates. The model pass gate, engine
+  SQ/CQ, lane fences, event capacity, command capacity, and PCM lease capacity do
+  not poll or spin.
 
-### R3 - Rust audio dock
+### Exact context contract
 
-1. Keep platform mic/speaker stream callbacks in Rust.
-2. Add preallocated PCM lease pools and callback-driven kcoro rings.
-3. Add one compact control ring and one lossy observer projection.
-4. Prove independent capture/playback/control tasks park without blocking each
-   other and root cancellation settles every child exactly once.
+- The live window keeps `position`, physical `start`, absolute `rope_base`, and a
+  monotonic public `cursor`. A fixed runway of
+  `min(configured_capacity, 256)` avoids copying on each eviction.
+- When the runway fills, retained K/V rows compact in place; ShortConv carry is
+  preserved. Retained keys are never re-rotated, and new absolute RoPE rows come
+  from `lfm_rope_range_f32` into preallocated scratch.
+- This is exact latest-window activation-state continuation. It is not presented
+  as raw-tail replay equivalence because retained K/V already encode evicted
+  history.
 
-### R4 - Delete owners immediately after each gate
+### Atomic product and dependency cutover
 
-1. Delete the remaining Candle linear ownership rim after native model callers land.
-2. Delete `candle_ops.rs` and Rust convolution state.
-3. Delete Rust model/frontend/codec modules as their native owners land.
-4. Delete numerical `native_engine.rs` methods and Rust arch wrappers.
-5. Remove Candle, candle-nn, candle-transformers, and moshi inference deps.
-6. Remove public token/model/generation exports. Git history is the reference.
+- `packages/desktop/src-tauri/src/voice/runtime.rs` caches one
+  `NativeVoiceModel`; it never constructs the old Rust `LFM2AudioModel`, processor,
+  Candle device, Rust safetensors builder, or a simultaneous compatibility image.
+- `liquid-audio` defaults to the opaque native lifecycle. Rust model/tensor/
+  generation exports and dependencies are `#[cfg(feature = "oracle")]` only.
+  `liquid-audio-oracle` is `publish = false` and opts into that feature for
+  training and fixture work.
+- Unsupported native Metal and Moshi selections fail explicitly. There is no
+  native/Candle, CPU/Metal, or model-version fallback chain.
 
-## Gates
+## Remaining LFM2 follow-ons
 
-- `cargo test -p liquid-audio --lib` and integration tests remain green during
-  each cut.
-- Rosetta executes x86 assembly fixtures even when AVX2 tests skip.
-- No Rust production FFI takes numerical/model payloads.
-- No C++ scheduler/model/session source performs production model arithmetic.
-- No allocation or scratch growth occurs after native readiness.
-- No model payload copy occurs at Rust/native boundaries.
-- Stop, interrupt, timeout, close, and completion settle tickets/leases once.
-- Full workspace and Tauri builds pass after Candle removal.
+### F1 — Capacity-2 completion continuations and multi-row prefill
 
-## Final Rust Surface
+The current C++ coordinator correctly owns recurrence and parks without spin, but
+it waits synchronously for each pass through the engine's single mutable request
+slot. Move to two native request/scratch slots so a completion can enqueue its
+follow-on directly. Preserve full-pass fairness and one scratch slot per in-flight
+ticket.
+
+Correct full/suffix/audio prefill is already native and production-owned. Add a
+checkpoint-layout BF16 multi-row specialization for long prompts without widening,
+packing, or changing row-commit order. This is a performance follow-on, not a
+reason to restore Rust recurrence or Candle ownership.
+
+### F2 — Physical kcoro audio-device adapter
+
+Keep platform device callbacks in Rust, but have them reserve/fill capture leases
+and drain playback leases directly. Delete the current `Vec<f32>` capture/playback
+copies, playback thread projection, crossbeam `Reply::Audio`, and legacy
+`VoiceEvent::Audio` bridge. Preserve bounded reliable transcript/control delivery;
+only waveform/telemetry observation may be lossy.
+
+### Subsequent — Native Moshi
+
+Moshi remains a supported future model, not part of this completed LFM2 tranche.
+Its full model and codec recurrence must move onto the same image/session/leaf
+discipline before it can return to the production graph. Until then it remains
+offline/oracle-only and cannot serve as fallback.
+
+## Gates and current evidence
+
+- On 2026-07-16, the focused default-graph aarch64 run passed **32 tests** with
+  two explicit opt-in tests ignored: native safetensors/schema 17/18,
+  session/lease 8/9, rollover 3/3, mixed-turn admission 2/2, and tokenizer 2/2.
+- The allocation-free lease gate completed 100,000 cycles in 0.030 s (about
+  3.38 million cycles/s). The separate one-million-cycle soak remains an explicit
+  opt-in gate.
+- `engine_idle_zero_spin` measured 0.003% cold-idle and 0.004% post-pass process
+  CPU with eight parked lanes.
+- Rollover and schema fixtures pass on both aarch64 and x86_64/Rosetta. They cover
+  absolute RoPE, latest-window retention, whole-action reservation, shared-model
+  fairness, dtype/shape swaps with equal byte counts, missing middle layers, and
+  vocabulary/codebook mismatch.
+- `cargo check -p liquid-audio --no-default-features` passes. The default feature
+  declaration does not enable Candle or Moshi.
+- The real-checkpoint `LFM_MODEL_DIR` gate is intentionally explicit. It checks
+  one complete main+Mimi lifecycle image and
+  `compatibility_copied_bytes == 0`; reviews must not report it as run when the
+  checkpoint is unavailable.
+- Stop, interruption, reliable-event saturation, capture/playback backpressure,
+  stale generations, callback failure, and exact join/release behavior have
+  implementation-backed tests. No ignored test is silently counted as green.
+
+## Current default Rust surface
 
 ```text
 src/
-  lib.rs       opaque handles + audio dock exports
-  ffi.rs       lifecycle/settings/control/PCM declarations only
-  handles.rs   RAII and status mapping
-  audio/
-    input.rs
-    output.rs
-    dock.rs
-  tauri.rs     small event/control projection
+  lib.rs                    native-only exports; oracle modules feature-gated
+  ffi.rs                    private opaque native declarations
+  native_voice.rs           RAII lifecycle + current PCM/event adapter
+  voice_api.rs              product VoiceEngine/VoiceEvent boundary
+  runtime/realtime.rs       generic host worker; Candle engine is oracle-only
+  runtime/voice_runtime.rs  platform audio, VAD, endpointing, control
+  runtime/resample.rs       host/device compatibility; oracle math gated
+  utils.rs                  model location/download helpers
 ```
 
-No legacy feature, backup crate, or alternate inference runtime remains.
+`src/model/**`, processor/training code, direct numerical Rust rims, Candle, and
+Moshi remain reachable only from the non-release oracle graph. Git history is the
+reference for deleted production ownership; the oracle is not an alternate
+inference runtime.

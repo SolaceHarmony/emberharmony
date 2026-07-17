@@ -504,6 +504,51 @@ LFM_SYM(lfm_sgemm_nt_f32):
 8:
     ret
 
+// Baseline direct bf16 checkpoint-layout GEMM. This leaf deliberately uses no
+// FEAT_BF16 opcode: each halfword is unlifted into an f32 register and weights
+// are never copied, packed, or widened into memory.
+// void lfm_bf16_gemm_nt_f32_scalar(const uint16_t *a, const uint16_t *w,
+//                                  float *c, int m, int n, int k)
+.p2align 2
+.globl LFM_SYM(lfm_bf16_gemm_nt_f32_scalar)
+LFM_SYM(lfm_bf16_gemm_nt_f32_scalar):
+    mov     x6, #0
+1:
+    cmp     w6, w3
+    b.hs    8f
+    mov     x7, #0
+2:
+    cmp     w7, w4
+    b.hs    5f
+    fmov    s0, wzr
+    mul     x9, x6, x5
+    add     x9, x0, x9, lsl #1
+    mul     x10, x7, x5
+    add     x10, x1, x10, lsl #1
+    mov     x8, #0
+3:
+    cmp     w8, w5
+    b.hs    4f
+    ldrh    w11, [x9, x8, lsl #1]
+    BF16_WIDEN w11, s1
+    ldrh    w12, [x10, x8, lsl #1]
+    BF16_WIDEN w12, s2
+    fmul    s1, s1, s2
+    fadd    s0, s0, s1
+    add     x8, x8, #1
+    b       3b
+4:
+    mul     x11, x6, x4
+    add     x11, x11, x7
+    str     s0, [x2, x11, lsl #2]
+    add     x7, x7, #1
+    b       2b
+5:
+    add     x6, x6, #1
+    b       1b
+8:
+    ret
+
 // void lfm_dwconv_tap_f32(const float *xpad, const float *w, float *y,
 //                         uint64_t channels, uint64_t t_out, uint64_t t_pad,
 //                         uint64_t k, uint64_t stride)
@@ -533,6 +578,51 @@ LFM_SYM(lfm_dwconv_tap_f32):
     b.hs    4f
     ldr     s1, [x13, x14, lsl #2]
     ldr     s2, [x10, x14, lsl #2]
+    fmul    s1, s1, s2
+    fadd    s0, s0, s1
+    add     x14, x14, #1
+    b       3b
+4:
+    str     s0, [x11, x12, lsl #2]
+    add     x12, x12, #1
+    b       2b
+5:
+    add     x8, x8, #1
+    b       1b
+8:
+    ret
+
+// Direct-bf16 twin of lfm_dwconv_tap_f32. Activations and checkpoint taps are
+// unlifted only in registers; the f32 destination preserves the reference
+// bias/round boundary in the caller.
+.p2align 2
+.globl LFM_SYM(lfm_dwconv_tap_bf16_f32)
+LFM_SYM(lfm_dwconv_tap_bf16_f32):
+    mov     x8, #0              // channel
+1:
+    cmp     x8, x3
+    b.hs    8f
+    mul     x9, x8, x5
+    add     x9, x0, x9, lsl #1  // bf16 xpad row
+    mul     x10, x8, x6
+    add     x10, x1, x10, lsl #1 // bf16 w row
+    mul     x11, x8, x4
+    add     x11, x2, x11, lsl #2 // f32 y row
+    mov     x12, #0
+2:
+    cmp     x12, x4
+    b.hs    5f
+    fmov    s0, wzr
+    mul     x13, x12, x7
+    add     x13, x9, x13, lsl #1
+    mov     x14, #0
+3:
+    cmp     x14, x6
+    b.hs    4f
+    ldrh    w15, [x13, x14, lsl #1]
+    BF16_WIDEN w15, s1
+    ldrh    w16, [x10, x14, lsl #1]
+    BF16_WIDEN w16, s2
     fmul    s1, s1, s2
     fadd    s0, s0, s1
     add     x14, x14, #1
@@ -597,6 +687,153 @@ LFM_SYM(lfm_dwconv2d_k3s2_f32):
     ldr     s1, [x25, x26, lsl #2]
     add     x27, x28, x26
     ldr     s2, [x10, x27, lsl #2]
+    fmul    s1, s1, s2
+    fadd    s0, s0, s1
+    add     x26, x26, #1
+    b       45b
+46:
+    add     x14, x14, #1
+    b       4b
+5:
+    mul     x14, x12, x7
+    add     x14, x14, x13
+    str     s0, [x11, x14, lsl #2]
+    add     x13, x13, #1
+    b       3b
+6:
+    add     x12, x12, #1
+    b       2b
+7:
+    add     x8, x8, #1
+    b       1b
+8:
+    ldp     x27, x28, [sp, #16]
+    ldp     x25, x26, [sp], #32
+    ret
+
+// Stem k3/s2: one padded bf16 input plane, resident (channels,1,3,3) bf16
+// taps, and channel-major f32 output. Both bf16 operands are unlifted at the
+// MAC; the checkpoint address may be byte-unaligned.
+.p2align 2
+.globl LFM_SYM(lfm_conv2d_stem_k3s2_bf16_f32)
+LFM_SYM(lfm_conv2d_stem_k3s2_bf16_f32):
+    stp     x25, x26, [sp, #-32]!
+    stp     x27, x28, [sp, #16]
+    mov     x8, #0
+1:
+    cmp     x8, x3
+    b.hs    8f
+    mov     x9, x0               // the stem has one shared input plane
+    mov     x10, #9
+    mul     x10, x10, x8
+    add     x10, x1, x10, lsl #1 // resident bf16 taps
+    mul     x11, x6, x7
+    mul     x11, x11, x8
+    add     x11, x2, x11, lsl #2 // f32 output plane
+    mov     x12, #0
+2:
+    cmp     x12, x6
+    b.hs    7f
+    mov     x13, #0
+3:
+    cmp     x13, x7
+    b.hs    6f
+    fmov    s0, wzr
+    mov     x14, #0
+4:
+    cmp     x14, #3
+    b.hs    5f
+    lsl     x25, x12, #1
+    add     x25, x25, x14
+    mul     x25, x25, x5
+    lsl     x26, x13, #1
+    add     x25, x25, x26
+    add     x25, x9, x25, lsl #1
+    mov     x27, #3
+    mul     x28, x14, x27
+    mov     x26, #0
+45:
+    cmp     x26, #3
+    b.hs    46f
+    ldrh    w15, [x25, x26, lsl #1]
+    BF16_WIDEN w15, s1
+    add     x27, x28, x26
+    ldrh    w16, [x10, x27, lsl #1]
+    BF16_WIDEN w16, s2
+    fmul    s1, s1, s2
+    fadd    s0, s0, s1
+    add     x26, x26, #1
+    b       45b
+46:
+    add     x14, x14, #1
+    b       4b
+5:
+    mul     x14, x12, x7
+    add     x14, x14, x13
+    str     s0, [x11, x14, lsl #2]
+    add     x13, x13, #1
+    b       3b
+6:
+    add     x12, x12, #1
+    b       2b
+7:
+    add     x8, x8, #1
+    b       1b
+8:
+    ldp     x27, x28, [sp, #16]
+    ldp     x25, x26, [sp], #32
+    ret
+
+// Direct-bf16 per-channel k3/s2 twin. The padded activation plane and the
+// resident checkpoint taps stay bf16; each value is unlifted at the MAC.
+.p2align 2
+.globl LFM_SYM(lfm_dwconv2d_k3s2_bf16_f32)
+LFM_SYM(lfm_dwconv2d_k3s2_bf16_f32):
+    stp     x25, x26, [sp, #-32]!
+    stp     x27, x28, [sp, #16]
+    mov     x8, #0
+1:
+    cmp     x8, x3
+    b.hs    8f
+    mul     x9, x4, x5
+    mul     x9, x9, x8
+    add     x9, x0, x9, lsl #1  // bf16 xpad plane
+    mov     x10, #9
+    mul     x10, x10, x8
+    add     x10, x1, x10, lsl #1 // bf16 taps
+    mul     x11, x6, x7
+    mul     x11, x11, x8
+    add     x11, x2, x11, lsl #2 // f32 output plane
+    mov     x12, #0
+2:
+    cmp     x12, x6
+    b.hs    7f
+    mov     x13, #0
+3:
+    cmp     x13, x7
+    b.hs    6f
+    fmov    s0, wzr
+    mov     x14, #0
+4:
+    cmp     x14, #3
+    b.hs    5f
+    lsl     x25, x12, #1
+    add     x25, x25, x14
+    mul     x25, x25, x5
+    lsl     x26, x13, #1
+    add     x25, x25, x26
+    add     x25, x9, x25, lsl #1
+    mov     x27, #3
+    mul     x28, x14, x27
+    mov     x26, #0
+45:
+    cmp     x26, #3
+    b.hs    46f
+    ldrh    w15, [x25, x26, lsl #1]
+    BF16_WIDEN w15, s1
+    add     x27, x28, x26
+    ldrh    w16, [x10, x27, lsl #1]
+    BF16_WIDEN w16, s2
     fmul    s1, s1, s2
     fadd    s0, s0, s1
     add     x26, x26, #1

@@ -282,7 +282,9 @@ LFM_SYM(lfm_norm_apply_f32):
 // void lfm_resample_conv_f64(const double *padded, uint64_t padded_len,
 //                            const double *kernels, uint64_t phases,
 //                            uint64_t klen, uint64_t stride,
-//                            float *out, uint64_t max_blocks)
+//                            float *out, uint64_t max_values)
+// max_values admits a partial final phase block, so output is the caller's
+// exact-size destination rather than a larger copied convolution plane.
 .p2align 4
 .globl LFM_SYM(lfm_resample_conv_f64)
 LFM_SYM(lfm_resample_conv_f64):
@@ -320,10 +322,10 @@ LFM_SYM(lfm_resample_conv_f64):
     movq      96(%rsp), %r8       // klen   (ret 8 + shadow 32 + 7 pushes 56)
     movq      104(%rsp), %r9      // stride
     movq      112(%rsp), %rbx     // out
-    movq      120(%rsp), %r12     // max_blocks
+    movq      120(%rsp), %r12     // max_values
 #else
     movq      48(%rsp), %rbx      // out   (ret 8 + 5 pushes 40 = 7th arg)
-    movq      56(%rsp), %r12      // max_blocks (8th arg)
+    movq      56(%rsp), %r12      // max_values (8th arg)
 #endif
     xorq      %r10, %r10          // start
     xorq      %r11, %r11          // block
@@ -331,12 +333,15 @@ LFM_SYM(lfm_resample_conv_f64):
     leaq      (%r10,%r8), %rax
     cmpq      %rsi, %rax
     ja        8f
-    cmpq      %r12, %r11
-    jae       8f
     xorq      %r13, %r13          // phase
 2:
     cmpq      %rcx, %r13
     jae       5f
+    movq      %r11, %rax
+    imulq     %rcx, %rax
+    addq      %r13, %rax
+    cmpq      %r12, %rax
+    jae       8f
     movq      %r13, %rax
     imulq     %r8, %rax
     leaq      (%rdx,%rax,8), %r14 // kernel row

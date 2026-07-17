@@ -169,8 +169,9 @@ describe("desktop voice context boundary", () => {
     const lib = await liquid("src/lib.rs")
     const voice = await liquid("src/runtime/voice_runtime.rs")
 
-    expect(cargo).toContain('liquid-audio = { path = "../../../crates/liquid-audio", features = ["metal"] }')
     expect(cargo).toContain('liquid-audio = { path = "../../../crates/liquid-audio" }')
+    expect(cargo).not.toContain('features = ["metal"]')
+    expect(cargo).not.toContain("candle-core")
     expect(cargo).not.toContain('"audio-io"')
     expect(lib).toContain("pub mod voice_runtime")
     expect(lib).not.toContain('#[cfg(feature = "audio-io")]\npub mod voice_runtime')
@@ -533,13 +534,13 @@ describe("desktop voice context boundary", () => {
     expect(tauri).toContain("settings.lfm2.engine != LocalVoiceEngine::MoshiRealtime")
   })
 
-  test("native LFM2 delegation prompt is wired in the Rust kernel", async () => {
+  test("native LFM2 rejects delegation until native prompt control exists", async () => {
     const text = await root("packages/desktop/src-tauri/src/voice/runtime.rs")
 
-    expect(text).toContain("const LFM2_CONVERSE_SYSTEM_PROMPT")
-    expect(text).toContain("DELEGATE: <a clear, self-contained description of the task>")
-    expect(text).toContain("Only emit DELEGATE for genuine work")
-    expect(text).toContain("engine.with_system_prompt(LFM2_CONVERSE_SYSTEM_PROMPT)")
+    expect(text).toContain("Delegation requires a configurable native system-prompt command")
+    expect(text).toContain("Native LFM2 will not instantiate the Candle engine as a fallback")
+    expect(text).not.toContain("LFM2_CONVERSE_SYSTEM_PROMPT")
+    expect(text).not.toContain("engine.with_system_prompt")
     expect(text).toContain("settings.lfm2.delegate.enabled")
     expect(text).toContain(".delegate")
     expect(text).toContain(".target")
@@ -1407,8 +1408,8 @@ describe("desktop voice context boundary", () => {
     expect(rust).toContain("pub last_provider: Option<VoiceProvider>")
     expect(rust).toContain("fn default_last_provider() -> Option<VoiceProvider>")
     expect(rust).toContain('assert_eq!(json["lastProvider"], "lfm2")')
-    expect(rust).toContain('assert_eq!(json["lfm2"]["engine"], "moshiRealtime")')
-    expect(rust).toContain("stored_voice_settings_without_engine_use_moshi_realtime_default")
+    expect(rust).toContain('assert_eq!(json["lfm2"]["engine"], "lfm2Interleaved")')
+    expect(rust).toContain("stored_voice_settings_without_engine_use_native_lfm2_default")
   })
 
   test("desktop voice settings save LiveKit configuration only through Tauri", async () => {
@@ -1518,6 +1519,21 @@ describe("desktop voice context boundary", () => {
     expect(runtime).toContain("trace: settings.lfm2.trace")
     expect(panel).toContain("checked={lfm2().trace}")
     expect(panel).toContain("updateLfm2({ trace: checked })")
+  })
+
+  test("desktop LFM2 construction opens only the opaque native model", async () => {
+    const runtime = await root("packages/desktop/src-tauri/src/voice/runtime.rs")
+    const lfm2 = between(runtime, "struct ResidentLfm2", "/// One active native voice service")
+    const build = between(runtime, "fn build_engine(", "#[derive(Debug, Clone, PartialEq, Serialize)]")
+
+    expect(lfm2).toContain("model: NativeVoiceModel")
+    expect(lfm2).toContain("NativeVoiceModel::open_with_config(dir, runtime)")
+    expect(lfm2).not.toContain("LFM2AudioModel")
+    expect(lfm2).not.toContain("LFM2AudioProcessor")
+    expect(lfm2).not.toContain("from_pretrained")
+    expect(build).toContain("let engine: NativeLfm2VoiceEngine = model.engine(sampling, vault)?")
+    expect(build).not.toContain("Lfm2VoiceEngine::new")
+    expect(build).not.toContain("from_pretrained")
   })
 
   test("desktop LFM2 model downloads are owned by a bounded native runtime", async () => {

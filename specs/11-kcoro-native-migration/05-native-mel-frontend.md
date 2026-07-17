@@ -1,18 +1,18 @@
 # Native Resampler and Mel Frontend
 
-Status: normative design with the M1 math/span tranche implemented in the
-current working tree: `native/src/frontend/lfm_frontend.cpp` +
+Status: normative design with the native committed-segment chain implemented
+in the current working tree: `native/src/frontend/lfm_frontend.cpp` +
 `kernels/{aarch64,x86_64}/flashkern_frontend.S`, gated by
 `tests/native_frontend_parity.rs` over fixtures captured from the deleted Rust
-featurizer (`native/tests/fixtures/{mel,resample}/`). Realtime now borrows its
-retained PCM slice, reuses a high-water workspace, and requests a direct
-valid-frame destination; padded output remains a compatibility-only contract.
-M1 is not complete until document 06's native Conformer consumes that plane:
-the current rim still turns it into a Candle tensor (one host-to-model-device
-mel upload on Metal and a fresh destination allocation per pass). The current
-Rust compatibility owner also shares one mutex-protected workspace across
-engines and grows it on first/new-high-water use; per-session pre-reservation,
-the resampler plan/state, and M2 pause-candidate mounting remain design.
+featurizer (`native/tests/fixtures/{mel,resample}/`). A native session prepares
+its pair-specific resampler plan, resampler scratch, frontend scratch, BF16 mel
+destination, and Conformer scratch before readiness. Hot calls cannot grow
+those planes. Equal-rate PCM remains the borrowed capture pointer; differing
+rates write convolution values directly into the session plane. The frontend
+rounds normalized valid rows directly into the Conformer BF16 destination;
+padded F32 output and the Rust/Candle tensor rim remain compatibility/oracle
+contracts only. M2 pause-candidate mounting and the atomic production deletion
+remain open.
 
 Baseline: EmberHarmony `321538f11749`.
 
@@ -55,11 +55,12 @@ struct LfmResamplerPlan {
     // Immutable phase kernels, built at model/session creation.
 };
 
-struct LfmResamplerState {
-    uint64_t input_cursor;
-    uint64_t output_cursor;
-    float carry[kMaximumFilterCarry];
-    uint32_t carry_count;
+struct LfmResamplerWorkspace {
+    // Prepared f64 logical-padding plane. No convolution-output plane: the
+    // assembly leaf writes the caller's exact final span, including a partial
+    // final phase block.
+    double *padded;
+    uint64_t padded_capacity;
 };
 
 struct LfmMelPlan {
@@ -78,29 +79,29 @@ struct LfmMelPlan {
 
 struct LfmMelWork {
     // Lifetime-aliased planes, not one allocation per stage:
-    // A: padded/preemphasized PCM -> DFT real+imag -> power in real half.
-    // B: gathered frames -> per-bin mean/std.
+    // A: preemphasis destination -> DFT real+imag -> power -> row stats.
+    // B: gathered frames -> transient normalized F32 mel for BF16 output.
     float *plane_a;
     float *plane_b;
     uint64_t plane_a_values;
     uint64_t plane_b_values;
-    uint32_t frame_capacity;
+    uint32_t frame_capacity; // sealed before session publication
 };
 
 struct LfmMelSegment {
     uint64_t segment_id;
     uint64_t epoch;
-    float *data;       // bins x row_stride
+    uint16_t *data;    // BF16 bits, bins x valid_frames
     uint32_t valid_frames;
-    uint32_t padded_frames;
-    uint32_t row_stride;
+    uint32_t row_stride; // valid_frames in production
     uint32_t bins;
 };
 ```
 
 Plans are immutable model/session state. Work buffers are allocated to the
-configured maximum utterance at session creation or grown only at a control
-boundary before accepting capture. The hot path does not allocate.
+configured maximum capture lease during session creation. A larger clip or a
+different live sample rate is rejected; the hot path never grows or rebuilds a
+plan.
 
 ## Stage Graph
 
@@ -114,37 +115,45 @@ flowchart LR
     MEL --> LOG["log(x + guard)"]
     LOG --> STAT["per-bin sum and sumsq"]
     STAT --> NORM["ddof=1 normalize in place"]
-    NORM --> PAD["mask and pad_to"]
-    PAD --> OUT["session mel segment"]
+    NORM --> CAST["BF16 round into valid destination"]
+    CAST --> OUT["Conformer input plane"]
 ```
 
-Each arrow is a shared-memory stage transition, not a channel message. One pass
-descriptor names PCM ranges, the plan, work planes, and destination. Lanes fan
-out over output samples, DFT bins/frames, mel bins/frames, and normalization bins
-using the common atomic tile board.
+Each arrow is a shared-memory stage transition, not a channel message. The
+current committed-segment call runs synchronously over the prepared planes. A
+future kcoro pass descriptor may fan these same ranges across the common tile
+board without changing ownership or introducing stage payload messages.
 
 ## Resampling
 
 Port the exact windowed-sinc behavior currently called through
 `crate::resample::resample` at `crates/liquid-audio/src/processor.rs:1152-1163`.
-The plan precomputes phase
-kernels for the configured device rate to 16 kHz. State carries only filter
-history and rational phase.
+The plan precomputes phase kernels for the configured session rate to 16 kHz.
+The current committed-utterance path needs no streaming filter history: its
+workspace retains only the prepared f64 logical-padding plane. Equal source and
+target rates return the input pointer rather than copying it. Other rate pairs
+write their exact target count directly from the convolution assembly leaf;
+there is no larger convolution buffer followed by `memcpy`.
 
 For Moshi's common 48 kHz to 24 kHz frame path, a dedicated measured 2:1 kernel
 may be selected, but it must have its own parity gate. The current pair averaging
 at `voice_runtime.rs:1757-1773` is a frame-runtime behavior, not automatically the
 LFM2 torchaudio-compatible resampler.
 
-The resampler reads a logical ring span that may resolve to two physical ranges.
-It writes directly into `LfmMelWork::resampled_pcm`; it does not first concatenate
-the input.
+The current capture lease resolves to one contiguous retained span. A future
+wrapped-ring integration must extend the convolution leaf to two physical
+ranges; it may not concatenate them first. Differing-rate output today lands
+directly in the conversation's prepared resampled plane.
 
 ## DFT and Mel Kernels
 
 Phase M1 ports the exact DFT-basis algorithm, not an optimized FFT replacement.
 That gives the shortest parity path because the Rust reference itself uses a
-strided DFT convolution (`crates/liquid-audio/src/processor.rs:254-286`). Implement:
+strided DFT convolution (`crates/liquid-audio/src/processor.rs:254-286`). The
+current parity tranche uses Accelerate SGEMM on Apple and the ordered scalar
+reference elsewhere for the two matrix stages. This is numerically admitted
+but is not the final assembly-only scheduling target. The remaining extraction
+is:
 
 - aarch64 NEON F32 frame/bin tiles;
 - x86_64 AVX2/AVX-512 tiles according to runtime ISA;
@@ -175,9 +184,10 @@ The migration uses three honest stages:
 
 At endpoint, process the retained utterance span into exact normalized mel and
 hand it to Conformer. This removes Rust/Candle and payload copies without making
-a false incremental-parity claim. The working tree has the exact native pass
-and pointer-through Rust seam, but the handoff still enters the Candle
-Conformer; therefore this milestone remains incomplete.
+a false incremental-parity claim. The native session working tree now performs
+this entire prepared PCM -> BF16 mel -> native Conformer handoff. M1 remains
+offline until the full-value end-to-end parity and atomic production cutover;
+the Rust compatibility frontend is not evidence of a production fallback.
 
 ### M2: pause-candidate speculative frontend
 
@@ -199,28 +209,31 @@ used to claim parity with the current frontend.
 ## In-Place and Buffer Rules
 
 - Input is a retained `LfmPcmSpanV1`; no waveform tensor is created.
-- Resampled PCM is one preallocated destination.
+- Equal-rate PCM is borrowed; otherwise resampled PCM is one preallocated final
+  destination.
+- Exact input padding is a logical gather offset. It is not a copied padded PCM
+  plane; preemphasis writes directly at the corresponding workspace offset.
 - Signal storage is dead after framing and may become the DFT plane. Gathered
   frames are dead after DFT and may become the statistics plane. Power aliases
   the real DFT half only after each leaf has loaded the corresponding real and
   imaginary values.
-- Log-mel is normalized in place after per-bin statistics are complete.
-- Mel GEMM writes the segment destination at its declared row stride; it never
-  builds a second dense mel plane. Compatibility padding writes zeros into
-  reserved tail columns rather than concatenating another tensor. A
-  valid-only consumer may set `row_stride == valid_frames` and omit the tail.
+- Log-mel is normalized in place after per-bin statistics are complete. In the
+  production BF16 seam the dead frame plane holds this transient F32 result and
+  each completed row is rounded directly into the Conformer destination. There
+  is no published F32 mel plane or second BF16 copy.
+- Compatibility F32 mel writes the caller destination at its declared row
+  stride. Padding zeros only reserved tail columns; valid-only execution omits
+  the tail completely.
 - `LfmMelSegment` is published by pointer/offset and generation.
 - A speculative segment owns a rollback generation and cannot be attached to a
   different conversation mark.
 
 ## Integration with Conformer
 
-The frontend destination is row-major `(bins, row_stride)`. The current
-valid-only rim uses `row_stride == valid_frames`, matching `ChatState::audio_in`
-without a crop. A native session may reserve a padded stride for downstream
-tiling, provided valid frame count remains separate. Conformer consumes that
-segment directly; there is no transpose/copy at the subsystem boundary. The
-first Conformer stage chooses its tile indexing to read the declared stride.
+The production frontend destination is row-major BF16
+`(bins, valid_frames)`. Conformer consumes it directly; no tensor,
+transpose/copy, or padded tail exists at the subsystem boundary. The F32
+padded/valid APIs survive only for fixture and transitional Rust consumers.
 
 Valid frame count is separate from padded frame count. Modality positions use
 the same `mel2emb_len(valid_frames)` arithmetic currently used at
@@ -228,10 +241,12 @@ the same `mel2emb_len(valid_frames)` arithmetic currently used at
 
 ## Implementation Map
 
-1. Add `native/src/frontend/resampler.{h,cpp}` and architecture kernels.
-2. Add `native/src/frontend/mel_plan.{h,cpp}` for exact config-derived constants.
-3. Add F32 reference implementations copied by behavior, not by calling Candle.
-4. Add unit fixtures for Hann, filterbank, frame count, DFT real/imag, power,
+1. Keep resampler and mel ownership together in `lfm_frontend.{h,cpp}` with the
+   architecture leaves in `flashkern_frontend.S`; split files only if another
+   consumer needs an independent plan.
+2. Retain exact config-derived constants in the immutable frontend plan.
+3. Keep F32 compatibility/reference entry points independent of Candle.
+4. Maintain fixtures for Hann, filterbank, frame count, DFT real/imag, power,
    log-mel, one-frame normalization, and padding.
 5. Add one native frontend pass over a retained PCM span.
 6. Wire the result to the native Conformer destination described in document 06.
@@ -253,7 +268,11 @@ the same `mel2emb_len(valid_frames)` arithmetic currently used at
   behavior.
 - A wrapped two-range PCM span produces the same mel as a contiguous fixture
   without concatenating the payload.
-- CPU frontend allocates zero bytes after session warmup.
+- Frontend and resampler execution allocate zero bytes after session readiness;
+  an oversized command returns `-ENOBUFS` rather than growing scratch.
+- Equal-rate resampling publishes the exact input address. Differing-rate
+  assembly preserves the canary after a partial final phase block.
+- Direct BF16 output equals rounding the parity-gated normalized F32 values.
 - Pause candidate reuse and rollback preserve the exact conversation/cache mark.
 - No Rust or Candle function appears in the capture-to-mel call graph.
 - Measured endpoint-to-mel latency and lane utilization are recorded by utterance
@@ -262,7 +281,8 @@ the same `mel2emb_len(valid_frames)` arithmetic currently used at
 ## Non-Goals
 
 - No hidden change from per-utterance to chunk normalization.
-- No BF16 frontend unless a separate model parity gate approves it; current mel
-  is deliberate F32.
+- No BF16 arithmetic substitution inside the frontend. DFT, mel, log, and
+  normalization remain F32; only the final valid values round to BF16 at the
+  already-required Conformer storage boundary, with a separate exact gate.
 - No disk or model-weight access during frontend execution.
 - No per-frame kcoro message; one frontend pass uses shared stages.

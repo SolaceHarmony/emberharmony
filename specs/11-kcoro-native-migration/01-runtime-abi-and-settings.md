@@ -97,8 +97,8 @@ Create these production headers under `crates/liquid-audio/native/include/`:
 
 ```text
 lfm_types.h       status, ABI version, IDs, spans, capability bits
-lfm_runtime.h     runtime lifecycle and snapshots
-lfm_model.h       synchronous model open and immutable metadata
+lfm_runtime.h     runtime/model lifecycle, snapshots, and memory accounting
+lfm_model.h       compatibility tombstone; includes lfm_runtime.h only
 lfm_session.h     audio session, commands, callbacks, statistics
 lfm_conversation.h conversation create/attach/reset/snapshot hooks
 lfm_observe.h     ticket IDs, bounded kernel snapshots, lossy observer sink
@@ -110,6 +110,11 @@ handwritten private declarations in
 `crates/liquid-audio/src/compute/weights.rs:25-71`, and
 `crates/liquid-audio/src/mimi_native.rs:19-30` are transitional and must not
 become three public ABIs.
+
+The transitional synchronous model-info, token-step, numerical prefill, and
+audio-code declarations live only in
+`crates/liquid-audio/native/src/model/lfm_model_legacy.h`. They remain linkable
+for offline oracle gates but are deliberately absent from the product headers.
 
 ## Core ABI Types
 

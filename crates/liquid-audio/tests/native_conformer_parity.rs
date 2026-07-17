@@ -1,10 +1,12 @@
+#![cfg(feature = "oracle")]
+
 //! Native Conformer parity gate: the native encoder+adapter vs the fixtures
 //! captured from the deleted Rust (native/tests/fixtures/conformer/, real
 //! checkpoint, BF16 production ladder).
 //!
-//! Requires the local LFM2.5-Audio snapshot (same one the fixture manifest
-//! cites). Skips with a clear message when absent so CI without the checkpoint
-//! stays green; the developer/soak run exercises it.
+//! Requires `LFM_MODEL_DIR` to name the local LFM2.5-Audio snapshot used by the
+//! fixture manifest. The gate is explicitly ignored in checkpoint-free CI;
+//! invoking it without the checkpoint is an error, never a silent pass.
 //!
 //! Policy: out_rows exact (shape-first, asserted before values); adapter
 //! values within a BF16-ladder tolerance across 17 layers. The comparison is
@@ -12,8 +14,6 @@
 
 use liquid_audio::model::native_conformer::{ConformerGeometry, NativeConformer};
 use liquid_audio::weights::ResidentWeights;
-
-const SNAPSHOT: &str = "/Users/sydneybach/.cache/huggingface/hub/models--LiquidAI--LFM2.5-Audio-1.5B/snapshots/c362a0625dfe45aa588dce5f0ada28a7e5707628";
 
 fn fixture_dir() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("native/tests/fixtures/conformer")
@@ -53,16 +53,24 @@ fn geometry() -> ConformerGeometry {
 }
 
 #[test]
+#[ignore = "requires LFM_MODEL_DIR and the real LFM2.5-Audio checkpoint"]
 fn native_conformer_matches_reference_fixtures() {
-    let snapshot = std::path::Path::new(SNAPSHOT);
-    if !snapshot.join("model.safetensors").is_file() {
-        eprintln!("LFM2.5-Audio snapshot absent — native conformer parity skipped");
-        return;
-    }
+    let snapshot = std::path::PathBuf::from(
+        std::env::var_os("LFM_MODEL_DIR")
+            .expect("LFM_MODEL_DIR must name the real LFM2.5-Audio checkpoint"),
+    );
     let resident =
         ResidentWeights::open(&snapshot.join("model.safetensors")).expect("open resident image");
     let dev = candle_core::Device::Cpu;
     let conf = NativeConformer::new(resident, geometry(), &dev).expect("native conformer");
+    let initial = conf.memory();
+    assert!(
+        initial.bound_weight_bytes > 0,
+        "checkpoint views must be bound"
+    );
+    assert_eq!(initial.derived_bytes, 17 * 512 * 2 + 256 * 4);
+    assert_eq!(initial.materialized_weight_bytes, 0);
+    assert_eq!(initial.direct_gemm_calls, 0);
 
     let cases = ["tone440", "ramp_mix", "single"];
     // The mel fixture planes are f32 (feat_in x T); the native path casts BF16
@@ -83,6 +91,8 @@ fn native_conformer_matches_reference_fixtures() {
     let m1_bf16 = liquid_audio::flashkern::native_engine::bf16_gemm_available();
 
     let mut worst = 0f64;
+    let mut prior = initial;
+    const DIRECT_GEMMS_PER_FORWARD: u64 = 3 + 17 * 11 + 2;
     for case in cases {
         let mel = read_f32(&mel_dir().join(plane_name(case)));
         let frames = mel.len() / 128;
@@ -95,6 +105,16 @@ fn native_conformer_matches_reference_fixtures() {
             }
             Err(e) => panic!("{case}: {e}"),
         };
+        let memory = conf.memory();
+        assert_eq!(memory.bound_weight_bytes, initial.bound_weight_bytes);
+        assert_eq!(memory.derived_bytes, initial.derived_bytes);
+        assert_eq!(memory.materialized_weight_bytes, 0);
+        assert_eq!(
+            memory.direct_gemm_calls - prior.direct_gemm_calls,
+            DIRECT_GEMMS_PER_FORWARD,
+            "{case}: every linear and pointwise pass must use the direct checkpoint-layout ticket"
+        );
+        prior = memory;
 
         let want = read_bf16(&fixture_dir().join(format!("{case}_adapter.bf16.bin")));
         let (rows, cols) = got.dims2().unwrap();

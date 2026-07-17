@@ -60,16 +60,16 @@ static const float TR_ATTN_SCALE = 0.125f; /* head_dim^-0.5 = 64^-0.5, exact */
 struct TrLayer {
     /* self_attn: in_proj packed [1536,512] rows = [q(512) | k(512) | v(512)],
      * each block head-major (h*64+dd). transformer.rs:421 + reshape :458. */
-    const float *in_proj_w;   /* [1536, 512] */
-    const float *out_proj_w;  /* [512, 512], bias_attn=false */
-    const float *norm1_w;     /* [512] */
-    const float *norm1_b;     /* [512] */
-    const float *norm2_w;     /* [512] */
-    const float *norm2_b;     /* [512] */
-    const float *ls1;         /* [512] layer_scale_1.scale */
-    const float *ls2;         /* [512] layer_scale_2.scale */
-    const float *lin1_w;      /* [2048, 512], bias_ff=false */
-    const float *lin2_w;      /* [512, 2048], bias_ff=false */
+    const uint8_t *in_proj_w; /* [1536, 512] f32 bytes */
+    const uint8_t *out_proj_w;/* [512, 512], bias_attn=false */
+    const uint8_t *norm1_w;   /* [512] */
+    const uint8_t *norm1_b;   /* [512] */
+    const uint8_t *norm2_w;   /* [512] */
+    const uint8_t *norm2_b;   /* [512] */
+    const uint8_t *ls1;       /* [512] layer_scale_1.scale */
+    const uint8_t *ls2;       /* [512] layer_scale_2.scale */
+    const uint8_t *lin1_w;    /* [2048, 512], bias_ff=false */
+    const uint8_t *lin2_w;    /* [512, 2048], bias_ff=false */
     /* KV ring, RotatingCache slot order: [head][slot][dd], slots 0..TR_CTX-1.
      * K stored POST-rope (transformer.rs:469-474: rope applied, then append). */
     float *k_ring;            /* [TR_H][TR_CTX][TR_HD] */
@@ -245,8 +245,9 @@ static void tr_err(char *err, size_t errlen, const char *msg, const char *name) 
 }
 
 /* find + shape-check a checkpoint tensor; d1 < 0 means 1-D [d0]. */
-static const float *tr_find(const MimiWeightTable *w, const char *name,
-                            int64_t d0, int64_t d1, char *err, size_t errlen) {
+static const uint8_t *tr_find(const MimiWeightTable *w, const char *name,
+                              int64_t d0, int64_t d1, char *err,
+                              size_t errlen) {
     const MimiWeight *mw = mimi_weight_find(w, name);
     if (mw == NULL) {
         tr_err(err, errlen, "missing weight", name);
@@ -254,15 +255,18 @@ static const float *tr_find(const MimiWeightTable *w, const char *name,
     }
     int ok;
     if (d1 < 0) {
-        ok = (mw->ndim == 1 && mw->shape[0] == d0);
+        ok = (mw->shape && mw->ndim == 1 && mw->shape[0] == d0 &&
+              mw->len == (uint64_t)d0);
     } else {
-        ok = (mw->ndim == 2 && mw->shape[0] == d0 && mw->shape[1] == d1);
+        ok = (mw->shape && mw->ndim == 2 && mw->shape[0] == d0 &&
+              mw->shape[1] == d1 &&
+              mw->len == (uint64_t)d0 * (uint64_t)d1);
     }
-    if (!ok || mw->data == NULL) {
+    if (!ok || mw->bytes == NULL) {
         tr_err(err, errlen, "bad shape for weight", name);
         return NULL;
     }
-    return mw->data;
+    return mw->bytes;
 }
 
 /* ---- init ---------------------------------------------------------------- */
@@ -329,10 +333,14 @@ extern "C" int mimi_transformer_init(MimiTransformerState **st,
      * inv_freq[j] = 1f32 / theta.powf((2j) as f32 / 64f32), j = 0..32.
      * (2j)/64 is exact in f32 (power-of-two divisor); powf is the platform
      * f32 pow, matching Rust f32::powf on this target. Init-time only. */
-    s->inv_freq = (float *)mimi_arena_alloc(a, TR_HD2 * sizeof(float));
-    for (int j = 0; j < TR_HD2; j++) {
-        s->inv_freq[j] =
-            1.0f / powf((float)MIMI_TR_MAX_PERIOD, (float)(2 * j) / (float)TR_HD);
+    s->inv_freq =
+        (float *)mimi_arena_alloc_derived(a, TR_HD2 * sizeof(float));
+    if (mimi_arena_building_derived(a)) {
+        for (int j = 0; j < TR_HD2; j++) {
+            s->inv_freq[j] = 1.0f /
+                powf((float)MIMI_TR_MAX_PERIOD,
+                     (float)(2 * j) / (float)TR_HD);
+        }
     }
 
     s->xt = (float *)mimi_arena_alloc(a, (size_t)TR_MAX_N * TR_D * sizeof(float));
@@ -481,16 +489,17 @@ extern "C" int mimi_transformer_step(MimiTransformerState *st, const float *x,
 
         /* norm1 (candle_nn LayerNorm fast path, see NOTES f) */
         for (int tp = 0; tp < t; tp++) {
-            mimi_layer_norm_f32(st->xt + (size_t)tp * TR_D, L->norm1_w,
-                                L->norm1_b, st->normb + (size_t)tp * TR_D,
-                                TR_D, TR_EPS);
+            mimi_weight_layer_norm_f32(
+                st->xt + (size_t)tp * TR_D, L->norm1_w, L->norm1_b,
+                st->normb + (size_t)tp * TR_D, TR_D, TR_EPS);
         }
 
         /* in_proj (AMX gemv): packed qkv = norm1(x) @ W^T, rows [q|k|v]
          * head-major. qkv[tp][s*512 + h*64 + dd] == candle reshape (b,t,3,h,d). */
         for (int tp = 0; tp < t; tp++) {
-            mimi_gemv_f32(L->in_proj_w, st->normb + (size_t)tp * TR_D, NULL,
-                          st->qkv + (size_t)tp * TR_QKV, TR_QKV, TR_D);
+            mimi_weight_gemv_f32(
+                L->in_proj_w, st->normb + (size_t)tp * TR_D, NULL,
+                st->qkv + (size_t)tp * TR_QKV, TR_QKV, TR_D);
         }
 
         /* rope_i on q and k blocks, in place (NEON, see tr_rope_block).
@@ -550,36 +559,39 @@ extern "C" int mimi_transformer_step(MimiTransformerState *st, const float *x,
          * x = x + layer_scale_1 * attn (header NEON sweeps; candle order:
          * broadcast_mul then add — two separate sweeps, no fma). */
         for (int tp = 0; tp < t; tp++) {
-            mimi_gemv_f32(L->out_proj_w, st->attn_cat + (size_t)tp * TR_D, NULL,
-                          st->branch + (size_t)tp * TR_D, TR_D, TR_D);
+            mimi_weight_gemv_f32(
+                L->out_proj_w, st->attn_cat + (size_t)tp * TR_D, NULL,
+                st->branch + (size_t)tp * TR_D, TR_D, TR_D);
         }
         for (int tp = 0; tp < t; tp++) {
             float *xr = st->xt + (size_t)tp * TR_D;
             float *br = st->branch + (size_t)tp * TR_D;
-            mimi_scale_vec_f32(br, L->ls1, br, TR_D); /* LayerScale, in place */
+            mimi_weight_scale_vec_f32(br, L->ls1, br, TR_D);
             mimi_add_vec_f32(xr, br, xr, TR_D);       /* residual, in place  */
         }
 
         /* mlp branch: x = x + layer_scale_2 * linear2(gelu_erf(linear1(norm2(x)))) */
         for (int tp = 0; tp < t; tp++) {
-            mimi_layer_norm_f32(st->xt + (size_t)tp * TR_D, L->norm2_w,
-                                L->norm2_b, st->normb + (size_t)tp * TR_D,
-                                TR_D, TR_EPS);
+            mimi_weight_layer_norm_f32(
+                st->xt + (size_t)tp * TR_D, L->norm2_w, L->norm2_b,
+                st->normb + (size_t)tp * TR_D, TR_D, TR_EPS);
         }
         for (int tp = 0; tp < t; tp++) {
-            mimi_gemv_f32(L->lin1_w, st->normb + (size_t)tp * TR_D, NULL,
-                          st->mlp_hidden + (size_t)tp * TR_FF, TR_FF, TR_D);
+            mimi_weight_gemv_f32(
+                L->lin1_w, st->normb + (size_t)tp * TR_D, NULL,
+                st->mlp_hidden + (size_t)tp * TR_FF, TR_FF, TR_D);
         }
         /* gelu_erf sweep (header NEON, lane-wise erff) */
         mimi_gelu_erf_vec_f32(st->mlp_hidden, st->mlp_hidden, t * TR_FF);
         for (int tp = 0; tp < t; tp++) {
-            mimi_gemv_f32(L->lin2_w, st->mlp_hidden + (size_t)tp * TR_FF, NULL,
-                          st->branch + (size_t)tp * TR_D, TR_D, TR_FF);
+            mimi_weight_gemv_f32(
+                L->lin2_w, st->mlp_hidden + (size_t)tp * TR_FF, NULL,
+                st->branch + (size_t)tp * TR_D, TR_D, TR_FF);
         }
         for (int tp = 0; tp < t; tp++) {
             float *xr = st->xt + (size_t)tp * TR_D;
             float *br = st->branch + (size_t)tp * TR_D;
-            mimi_scale_vec_f32(br, L->ls2, br, TR_D);
+            mimi_weight_scale_vec_f32(br, L->ls2, br, TR_D);
             mimi_add_vec_f32(xr, br, xr, TR_D);
         }
     }

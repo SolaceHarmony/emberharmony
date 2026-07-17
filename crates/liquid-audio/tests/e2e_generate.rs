@@ -1,3 +1,5 @@
+#![cfg(feature = "oracle")]
+
 //! End-to-end: real model + real SPEECH (`assets/question.wav`, the upstream
 //! reference clip) through the full changed stack — the wav-driven successor to
 //! the retired parity examples, kept as a standing regression gate for any

@@ -5,8 +5,10 @@ How `liquid-audio` decodes LFM2.5-Audio on the CPU at real-time edge, and where 
 This document has two registers, kept strictly apart:
 
 - **As-built** sections describe what is in the working tree *now*, verified against the
-  source (`src/compute/flashkern/`, `src/model/lfm2_hf.rs`, `src/model/lfm2_audio.rs`,
-  `src/model/linear.rs`, `native/kernels/*`). If it says "as-built", the code does it.
+  source (`native/src/io/safetensors.cpp`, `native/src/model/lfm_model.cpp`,
+  `native/src/runtime/voice_session.cpp`, `native/src/engine/flashkern_engine.cpp`,
+  `src/native_voice.rs`, and `native/kernels/*`). If it says "as-built", the code
+  does it.
 - **The contract** and **Build order → Planned** sections describe *agreed design* that is
   not yet built. Nothing in a "planned" block is running today.
 
@@ -16,65 +18,69 @@ the dispatch model, verification, and the build order.
 
 ---
 
-## 0. As-built architecture (2026-07-15 working tree)
+## 0. As-built architecture (2026-07-16 working tree)
 
-The CPU engine owns its model-pass scheduling domain entirely in native code:
+The shipped LFM2 CPU path is native from accepted text/PCM through emitted text/PCM.
+Rust owns opaque lifecycle, platform audio, VAD/endpointing, settings, and the current
+product observer adapter; it does not own weights, tensors, tokens, model state,
+sampling, or model recurrence.
 
-- Flashkern owns one stable pthread per numerical lane. Every lane runs the same
-  non-numerical C++ control program, claims disjoint tiles, calls architecture
-  assembly, and blocks on a cache-line-local expected-value word between passes
-  and at straggler fences.
-- one native dispatcher consumes the private SQ, and the native submitter parks
-  on the private CQ. The vendored C `kcoro_arena` ticket scheduler remains a
-  conformance oracle; Rust kcoro is reserved for the outer PCM/control dock.
+- `safetensors.cpp` loads main and codec sources into one byte-exact, page-table
+  read-only image. `LfmModel` owns that image and binds frontend, Conformer,
+  backbone, Depthformer, Mimi, and tokenizer plans directly from immutable typed
+  byte views.
+- `LfmConversation` owns BF16 KV/short-convolution state, frontend/Conformer/Mimi
+  workspaces, bounded tokenizer storage, sampler PRNG, the monotonic context cursor,
+  and sliding-window rollover. No Rust model object participates in a turn.
+- `LfmSession` owns text/PCM admission, ticket/epoch correlation, reliable events,
+  playback leases, interruption, stop, and the native generation loop. A C++
+  coordinator advances recurrence; Rust never waits on or interprets a numerical
+  completion.
+- Flashkern owns one stable pthread per numerical lane. Every lane claims disjoint
+  tiles, calls architecture leaves, and parks on expected-value words between passes
+  and at generation fences. A fair model-owned expected-value gate serializes legal
+  full-pass boundaries between conversations sharing the one mutable engine slot.
 
-There is no stackful dispatcher, coroutine stack, architecture context switch,
-per-tile channel message, copied pass payload, or per-pass heap allocation. The
-C++ rim writes one borrowed request slot, creates a generation-protected descriptor
-whose payload is `Engine*`, submits it to the native SQ, and waits on the native CQ
-expected-value doorbell. The registered Rust submitter ABI is deleted.
-
-The native lane idle wait and every C++ generation fence are zero-spin.
-Depthformer now runs as typed `REQ_DEPTH_FRAME`; its former Rust `SpinBarrier`,
-lane callback, and nested sampler ABI have been deleted.
+There is no per-pass heap allocation, copied pass payload, Rust lane callback,
+bounded spin, or polling. The current engine still has one borrowed request slot:
+the native coordinator synchronously parks for its exact CQ completion before it
+submits the next pass. Replacing that correct capacity-1 schedule with a capacity-2
+completion continuation is a remaining overlap/latency optimization, not a Rust
+recurrence or ownership gap.
 
 Flashkern is the CPU executor, never the Metal executor. CPU kernels retain NEON,
-BFMMLA/BFDOT, AVX2, and AVX-512-BF16 paths. The required GPU/matrix-coprocessor
-backend is a separate future MLX C++/Metal engine; device routing stays above both.
+BFMMLA/BFDOT, AVX2, and AVX-512-BF16 paths. Unsupported Metal selection fails
+explicitly; a future MLX C++/Metal peer must preserve the same native model/session
+boundary and may not fall back to Candle.
 
 ```mermaid
 flowchart LR
-    Caller["temporary compatibility caller"] --> Rim["C++ single borrowed request slot"]
-    Rim -->|"128-byte SQ cell"| Bridge["native SQ/CQ + retained descriptor"]
-    Bridge --> Doorbell["release-publish generation + wake"]
-    Doorbell --> Team["fixed Flashkern pthread lanes"]
+    Host["Rust platform audio / control"] -->|"current adapter copies into capture lease"| Dock["native PCM + text dock"]
+    Dock --> Session["native LfmSession<br/>tickets · epoch · recurrence"]
+    Session --> Conv["native LfmConversation<br/>KV · conv · PRNG · rollover"]
+    Conv --> Gate["fair expected-value model pass gate"]
+    Gate -->|"128-byte SQ cell"| Bridge["native SQ/CQ + retained descriptor"]
+    Bridge --> Team["fixed Flashkern pthread lanes"]
     Team --> Board["shared stage board<br/>atomic tile claims"]
-    Board --> Fence["generation fence<br/>expected-value park"]
-    Fence --> Kernels["AArch64 / x86_64 assembly math"]
-    Kernels --> Final["program-final fence"]
-    Final --> CQ["128-byte CQ cell + doorbell"]
-    CQ -->|"exact native wake"| Rim
-    Rim --> Caller
+    Board --> Kernels["AArch64 / x86_64 leaves"]
+    Kernels -->|"exact completion doorbell"| Conv
+    Conv -->|"Mimi PCM into playback lease"| Playback["native playback dock"]
+    Playback -->|"current Vec/VoiceEvent observer bridge"| Host
 ```
 
-`REQ_TOKEN_PASS` executes embed, the native 16-layer ShortConv/attention/MLP walk,
-final norm, and optional logits in one team entry. `REQ_MLP`, `REQ_CONV_LAYER`, and
-`REQ_ATTN_LAYER` remain parity fixtures. `REQ_DEPTH_FRAME` executes projection,
-every Depthformer codebook/layer, resident KV recurrence, logits, native sampling,
-and sampled-embedding feedback in one team entry. Request kind 5 and its generic
-Rust lane callback are deleted. `REQ_GEMM`, `REQ_FFT_CONV_DD`, and `REQ_IRFFT_DD`
-now own the former grid/fan-out call sites as typed pointer-borrowed native passes.
-DD FFT convolution runs every radix-2 stage cooperatively across the fixed lane
-team, with one shared scratch plane and a generation fence between stages.
-`REQ_DEPTHWISE_STREAM` is the first prefill-scale operator translated from the
-temporary Metal/reference implementation: one CPU ticket, split state/input
-pointers, disjoint channel rows, and one final generation fence.
+`REQ_TOKEN_PASS` executes embedding lookup/provided embedding, the native
+ShortConv/attention/MLP walk, final norm, and optional sampling in one team entry.
+`REQ_DEPTH_FRAME` executes projection, every Depthformer codebook/layer, resident KV
+recurrence, collective sampling, and sampled-embedding feedback. Native frontend,
+Conformer, and Mimi plans surround those full-team passes without exposing mel rows,
+hidden rows, logits, codes, or model pointers to Rust. Lower-level request kinds
+remain fixture and implementation seams, not the production orchestration surface.
 
-The idle contract is measured, not inferred: the production-backed macOS test sees
-0.002% process CPU with eight lanes parked both before and after a pass. Native MLP
-bit parity still passes through the native fixed executor. Historical performance
-measurements remain in git history; new latency numbers must name this executor and
-its exact model/test configuration.
+The idle contract is measured, not inferred. On the 2026-07-16 macOS run,
+`engine_idle_zero_spin` measured **0.003%** process CPU before a pass and **0.004%**
+afterward with eight lanes parked. Historical throughput measurements below remain
+useful lineage; new latency numbers must name this executor and exact model/test
+configuration.
 
 ## 1. The root cause this engine answers
 
@@ -111,10 +117,11 @@ theorizing. See `docs/FLASHKERN.md` for the kernel-side story.
 The settled architecture for the decode engine. This is the target; §4 says how much is
 as-built. Read this as the spec, not the changelog.
 
-1. **Weights.** ONE resident raw image for the process; the native loader owns a flat
-   `name → (offset, shape)` table parsed straight from safetensors. Candle is a
-   migration oracle, not a target production owner. Reads are the floor; any
-   weight movement is theft on top of it.
+1. **Weights.** ONE resident raw image for the process; the native loader owns a
+   component-scoped `(Main|Codec, name) → (offset, dtype, shape)` catalog parsed
+   straight from safetensors. This is as-built for LFM2. Candle is an offline
+   oracle, not a production owner. Reads are the floor; any weight movement is
+   theft on top of it.
 2. **Compute.** resident bytes -> assembly vector registers -> f32 accumulates **in registers** -> one
    round-to-nearest-even → KB-scale bf16 activation writes. f32 never exists as *planes*, only
    as register accumulators (an rb-epilogue in every kernel). **KV planes are bf16** (torch's
@@ -129,6 +136,13 @@ as-built. Read this as the spec, not the changelog.
 4. **Transport.** Rings + `(offset, len, epoch)` descriptors, no owned `Vec` payloads on hot
    surfaces.
 
+For LFM2, weight/compute ownership and native recurrence are built. The remaining
+contract gaps are deliberately narrow: completion-driven capacity-2 pass chaining
+(the correct native coordinator currently parks on capacity 1), multi-row prefill
+as a performance specialization, and replacement of the legacy Rust
+`Vec`/`VoiceEvent` audio observer with the physical kcoro audio-device adapter.
+This statement does not include a native Moshi port.
+
 **Lineage.** The learned lessons come from the sibling m2-bert-mlx project (same team as
 LFM2-Audio / Hyena / Monarch): whole-conv-in-one-dispatch vs streamed split at sync
 boundaries, exactly-one 1/N FFT normalization, double-double at the spectral multiply.
@@ -140,88 +154,97 @@ flashkern's `fanout`/`dd` ports already embody these.
 
 Where every byte lives on the decode path, from the most durable to the most ephemeral.
 
-### Tier 0 — Weights (AS-BUILT: native image plus counted compatibility copies)
+### Tier 0 — Weights (AS-BUILT: one immutable combined image)
 
-- **As-built ownership.** `safetensors.cpp:480-519` reads all selected shards once
-  into one 64-byte-aligned C++ allocation and builds immutable tensor descriptors
-  over it. `ResidentWeights` owns that image for the model lifetime; production
-  loading does not reparse or remap the checkpoint through Candle.
-- **Current compatibility cost.** Components that still instantiate Candle modules
-  call `ResidentWeights::candle_builder`. Every requested tensor is copied from the
-  native image into Candle storage and counted at `compute/weights.rs:477-535`.
-  `DepthDecode` and the native backbone context currently capture raw `PtrLen` views
-  into those stable Candle storages, so they avoid per-pass transpose/repack but do
-  not yet bind every weight directly from the native image.
-- **Target.** Native model plans bind offsets in the resident C++ image directly.
-  The counted compatibility copies and Candle weight owners are then deleted; mmap
-  is not a requirement.
+- `safetensors.cpp` opens and fingerprints every main and codec shard before
+  allocation, computes checked 64-byte source bases, and allocates exactly one
+  final image. Up to four workers issue retrying 8 MiB positioned reads directly
+  into disjoint final spans; there is no chunk buffer or application payload
+  `memcpy`.
+- All workers join before error unwinding. Failures are selected in source/offset
+  order, the same open handles are verified, alignment padding alone is zeroed,
+  metadata is parsed, and exact dtype/rank/shape spans are validated. Source
+  handles close before publication, after which `mprotect`/`VirtualProtect`
+  makes the image read-only.
+- `LfmModel` is the sole owner. Component-scoped names allow main and codec to
+  overlap without opening a second image. Plans retain byte-addressed views;
+  possibly unaligned checkpoint BF16 is never represented as a dereferenceable
+  C++ `uint16_t*`. Architecture kernels unlift little-endian words in registers.
+- `LfmModelMemoryV1` reports source, resident, directly bound, formula-derived,
+  compatibility-copied, load-time, worker, and task counts. Formula-derived rope,
+  frontend/FFT/window, Conformer denominator, and Mimi fold tables are counted
+  separately. Layout, alignment, dtype, transpose, and framework-owner copies are
+  forbidden. The production acceptance value is
+  `compatibility_copied_bytes == 0`.
 
-### Tier 1 — Resident KV + cursors (AS-BUILT; bf16 on the CPU decode path)
+### Tier 1 — Per-conversation recurrence state (AS-BUILT; BF16)
 
-The backbone KV cache is preallocated resident storage, **not** a per-step concat:
+`LfmConversation`, not a Rust `Cache`, owns the persistent model state:
 
-- `Cache.kvs: Vec<Option<KvSlot>>` (`src/model/lfm2_hf.rs`). A `KvSlot` is
-  `{ k: Tensor, v: Tensor, len: usize }` over preallocated `[B, n_kv, cap, head_dim]` planes.
-- **Append is in place.** `append_kv` allocates the resident planes with the incoming row dtype
-  (`kf.dtype()`/`vf.dtype()`), `slice_set`s the step's rows at the cursor, and bumps `len`;
-  reads are zero-copy `narrow(2, 0, len)` views. On the live CPU bf16 decode path the planes
-  are bf16. Capacity starts at `need.next_power_of_two().max(256)` and doubles on demand (one
-  narrow-copy, amortized O(1)).
-- **Rollback is O(1)** — `snapshot`/`rollback` record and restore `len`; rows past the cursor
-  are stale storage, never read. This backs speculative prefill (prefill the next utterance in
-  the VAD pause; roll back if the user resumes).
-- This deliberately **replaces** the reference `Tensor::cat(cache, new)` append, which recopied
-  the whole accumulated cache per layer per token (plus a full-cache f32 re-upcast) and made
-  decode degrade with context. An earlier `candle_nn::KvCache` swap was tried and **reverted**
-  as a parity deviation; this resident slot is held to a stricter bar — with
-  `grouped_gqa_decode = false` a greedy+seeded generate is **bit-identical** before/after the
-  swap (wav hash), so the storage change is exact.
-- The depthformer's own KV is tiny resident bf16-bit `k_plane`/`v_plane` storage
-  owned by each native `DepthPlan`, indexed by layer/KV head/codebook and reused
-  without allocation for every frame.
+- Every attention layer has fixed BF16 K/V planes sized for
+  `[n_kv, configured_capacity + runway, head_dim]`; every ShortConv layer has its
+  fixed carry. Depthformer and Mimi state are native and conversation-local.
+- `LfmContextWindowState` tracks live `position`, physical `start`, monotonic
+  `cursor`, and absolute `rope_base`. The runway is
+  `min(configured_capacity, 256)`. Once capacity is full, admission drops the
+  oldest logical rows; after the runway fills, retained K/V rows compact to row
+  zero without reallocating. ShortConv carry is preserved.
+- Whole text, PCM, and mixed text+PCM actions compute and reserve their total row
+  requirement before the first backbone mutation. Token ids, frontend geometry,
+  and Conformer output bounds fail before partial prefill.
+- RoPE uses absolute positions. Retained key rows are never re-rotated; compacted
+  BF16 rope rows move with the cache and new tail rows are generated through the
+  architecture `lfm_rope_range_f32` leaf into preallocated scratch.
 
-> **As-built nuance:** the backbone resident KV dtype follows the projection row dtype rather
-> than forcing `DType::BF16` in `append_kv`. That is bf16 for the live CPU bf16 path; if a
-> reference/device path produces f32 rows, the resident slot mirrors that path instead of
-> silently changing numerics.
+This is exact latest-window **activation-state continuation**. It is intentionally
+not claimed to equal re-prefilling a raw truncated token tail: retained K/V rows
+already encode attention to now-evicted history. Replay equivalence would require
+retaining inputs and recomputing the whole tail.
 
 ### Tier 2 — Native scratch + fixed-lane generation fence (AS-BUILT)
 
-The in-dispatch working set — the CPU analog of GPU threadgroup memory:
+- Engine attention, ShortConv, token, logits, Depthformer, and sampler planes are
+  plan-owned. Frontend, resampler, Conformer, bounded tokenizer, Mimi, hidden,
+  mel, and adapted planes are conversation-owned. Session creation reserves the
+  configured maximum PCM path before readiness; oversized or rate-changed work
+  fails instead of growing scratch in a pass.
+- Frontend power aliases the dead STFT real plane, valid mel writes directly into
+  the BF16 Conformer destination, Conformer writes the native prefill plane, and
+  Mimi writes PCM directly into a playback reservation. Weight planes are never
+  widened, packed, transposed, or copied.
+- Native generation fences use acquire/release generations and expected-value
+  parks. The last lane performs the fixed serial transition and wakes only actual
+  waiters. There is no spin budget or timed polling.
+- One fair expected-value `ExecutionGate` belongs to the model. Conversations
+  queue at legal pass boundaries rather than receiving the single-slot engine's
+  internal `-EBUSY`; each conversation retains private state/scratch.
 
-- **Native fence** (`native/src/engine/flashkern_engine.cpp:634-662`): arrival and
-  generation are acquire/release atomics. The last arriver runs the fixed serial
-  transition, publishes the next generation, and rings only the other lanes.
-- **Wait words**: the engine prepares one shared dispatch word and one shared fence
-  word. The kcoro host adapter checks the expected value under its park protocol
-  and blocks immediately; the logical mask identifies actual fence waiters. There
-  is no spin budget or timed poll in these native waits.
-- **Scratch**: the engine owns persistent `sc_*`, attention, token, and logits
-  planes plus every Depthformer activation, KV, and sampler plane. Plan build
-  reserves model-shape storage; warmed passes do not allocate. Rust owns no
-  Depthformer numerical scratch.
+### Tier 3 — Transport (AS-BUILT native dock; legacy device adapter remains)
 
-### Tier 3 — Transport (PARTLY BUILT)
+The native runtime/session owns bounded text commands, reliable event records,
+generation-checked capture/playback lease pools, ticket correlation, interruption
+epochs, and expected-value space/data doorbells. Reliable text and terminal records
+park for capacity; telemetry alone may be lossy. A stale epoch may finish a pass but
+cannot publish its value.
 
-The private 128-byte control SQ/CQ, expected-value doorbells, CQ reservation, and
-generation-protected descriptor pool are mounted. The descriptor payload is still
-only `Engine*`; numerical pointers remain in one borrowed C++ request slot, and
-decode results still return to Candle `Tensor`/`Vec` owners at the outer region
-boundary. Owned native pass slots and retained numerical region descriptors remain
-open.
+The remaining transport debt is outside model inference. Today
+`NativeLfm2VoiceEngine` copies an existing Rust `Utterance.samples` slice into a
+reserved native capture lease, and its playback thread copies a resolved native
+PCM lease with `to_vec()` before projecting `Reply::Audio`/`VoiceEvent::Audio`
+through a bounded crossbeam channel. The physical kcoro mic/speaker adapter must
+fill/drain native leases directly and retire that legacy `Vec` observer bridge.
 
-### Thread model (AS-BUILT: fixed numerical lanes + safe Rust coordination)
+### Thread model (AS-BUILT)
 
-- **As-built.** The resident stage machine is mandatory on supported targets. One
-  stable pthread owns each lane; the team enters once for a full token pass and
-  checks no stop condition inside it.
-- **Coordination.** One safe Rust `kcoro::Executor` worker runs the broker future;
-  one dedicated Rust ingress thread blocks on CQ. The C arena runtime does not
-  schedule production passes, and neither Rust thread executes numerical frames.
-- **Typed numerical passes.** `DepthDecode::frame` is a pointer-only Rust rim over
-  `REQ_DEPTH_FRAME`; GEMM, DD FFT convolution, DD inverse FFT, and streaming
-  convolution have their own typed request records. The complete programs and
-  all waits are native. No Rust closure executes on a compute lane.
+- One stable pthread owns each Flashkern lane. The team enters once for a full
+  token/Depthformer pass and checks interruption only at the pass boundary.
+- A native session coordinator owns admission and recurrence; a native
+  notification thread drains reliable records. Both use expected-value predicates.
+  The coordinator currently waits for each capacity-1 engine completion before
+  calling the next native continuation.
+- Rust callback/playback threads only adapt native events and PCM to the existing
+  product `VoiceEngine` surface. They do not submit model passes, hold KV, sample,
+  tokenize, or advance recurrence.
 
 ---
 
@@ -232,75 +255,88 @@ Depthformer programs plus the lower-level kernel inventory.
 
 | Region | As-built path | Where |
 |---|---|---|
-| bf16 linears (all row counts) | one `REQ_GEMM` over checkpoint-native `[N,K]`; native dispatch selects assembly GEMV or the matrix backend without a Rust numerical op | `flashkern_gemm.h`, `native_engine.rs`, `linear.rs`, architecture TUs |
-| backbone KV | resident `KvSlot` in-place append + narrow views (§3 tier 1) | `lfm2_hf.rs` |
-| backbone GQA (decode, `seq==1`) | regrouped-`q` view against shared KV heads — **no `repeat_kv`** materialization; gated by `grouped_gqa_decode` | `lfm2_hf.rs` `Attention::forward` |
-| ShortConv (CPU bf16 prefill/continuation) | one `REQ_DEPTHWISE_STREAM`; NEON/AVX rows read split state/input and write output/next-state directly | `flashkern/candle_ops.rs`, `native/include/flashkern_conv.h`, `flashkern_engine.cpp`, both architecture TUs |
-| ShortConv (temporary Metal backend) | selected in `lfm2_hf.rs`, outside Flashkern; replaced by MLX C++/Metal | `lfm2_hf.rs`, optional `candle-flashfftconv` dependency |
-| backbone token (CPU decode, `b·s==1`) | one `REQ_TOKEN_PASS`: embed, native ShortConv/attention/MLP layer walk, final norm, optional logits | `native/src/engine/flashkern_engine.cpp`, `flashkern/native_engine.rs`, `lfm2_hf.rs` |
-| audio frame (CPU, bf16) | one `REQ_DEPTH_FRAME`: projection, all Depthformer codebooks/layers, KV recurrence, collective sampling, embedding feedback | `native/src/engine/flashkern_engine.cpp`, `flashkern/decode.rs`, `lfm2_audio.rs` |
-| remaining prefill and Metal device graph | mixed Candle migration path; streaming CPU short-conv is already native | model modules; optional Metal dependency |
+| resident weights | one combined main+codec read-only image; exact typed byte views bind every LFM2 consumer; BF16 unlift happens in registers | `native/src/io/safetensors.cpp`, `native/src/model/lfm_model.cpp` |
+| resample + mel frontend | prepared native resampler/frontend workspaces; direct valid-only BF16 mel output with aliased activation planes | `native/src/frontend/lfm_frontend.cpp`, `native/kernels/*/flashkern_frontend.S` |
+| Conformer + adapter | exact image-bound plan and per-conversation workspace; adapter rows land directly in the native prefill plane | `native/src/model/lfm_conformer.cpp`, `native/kernels/*/flashkern_conformer.S` |
+| tokenizer + turn grammar | native byte-BPE tokenizer, bounded per-conversation workspace, native control-token grammar | `native/src/model/lfm_tokenizer.cpp`, `native/src/model/lfm_model.cpp` |
+| modality assembly + prefill | native text, PCM, and mixed-turn admission; rows are reserved atomically, then consumed as direct embedding/table views | `native/src/model/lfm_model.cpp` |
+| backbone recurrence | `REQ_TOKEN_PASS` over direct checkpoint BF16; native KV/ShortConv state, grouped GQA, final norm, and text sampling | `native/src/engine/flashkern_engine.cpp`, `native/src/model/lfm_model.cpp` |
+| context rollover | fixed capacity+runway BF16 state, monotonic cursor, absolute RoPE range generation, in-place compaction | `native/src/model/lfm_model.cpp`, `native/kernels/*/flashkern_rope.S` |
+| audio frame | `REQ_DEPTH_FRAME`: projection, every Depthformer codebook/layer, KV recurrence, native sampling, embedding feedback | `native/src/engine/flashkern_engine.cpp` |
+| Mimi decode | codec component views from the same image; conversation-local state; PCM writes directly into a playback lease | `native/src/mimi/`, `native/src/runtime/voice_session.cpp` |
+| generation/session | native ticketed text/PCM admission and recurrence, reliable events, interruption epochs, stop/join | `native/src/runtime/voice_session.cpp` |
+| desktop production host | opaque native runtime/model/conversation/session; no Rust model construction or Candle fallback | `src/native_voice.rs`, `packages/desktop/src-tauri/src/voice/runtime.rs` |
 
-### Transitional parity seams (AS-BUILT debt)
+### Default graph versus oracle graph
 
-The remaining cache flags predate the no-legacy rule. They may support focused
-migration fixtures while their assembly replacements are being proven, but they
-are not product fallback modes and are deleted with the Candle owners:
-
-- **`Cache.grouped_gqa_decode`** (default `true`). `false` runs the expanded `repeat_kv`
-  form — the byte-parity reference. The grouped view computes the same per-head dot products;
-  the GEMM reduction order differs, so it sits at the f32-ulp floor (`rel < 1e-5`, pinned by
-  `grouped_gqa_matches_expanded_at_f32_ulp`). Ulps *can* flip a near-tied greedy argmax and
-  *will* diverge sampled streams — so byte-parity oracles pin `false`.
-- **`Cache.fused_conv_decode`** (default `true`). `false` runs the composed candle ShortConv
-  ops — the reference the fused conv1d_update kernel must match.
-- The former model-level Depthformer/reference switch is deleted. Native-plan
-  construction failure now rejects inference instead of selecting Candle.
-- **`native_engine::bf16_gemm_available()`** queries the mounted native backend.
-  The former Rust `CustomOp2` capability and dispatch module is deleted.
+- The default `liquid-audio` feature graph contains the opaque native runtime and
+  does not enable Candle or Moshi. Desktop LFM2 construction calls
+  `NativeVoiceModel::open_with_config`; it never constructs `LFM2AudioModel`, a
+  Candle device, or a Rust safetensors builder.
+- Legacy Rust model, training, fixture capture, direct numerical rims, Candle, and
+  Moshi are compiled only by the opt-in `oracle` feature and the workspace-only
+  `liquid-audio-oracle` crate. They are comparison tools, not fallback branches.
+- Native LFM2 CPU is the shipped voice model. Native Metal/MLX is not mounted and
+  fails explicitly. The full Moshi-to-Flashkern port has **not** landed; Moshi is
+  offline/oracle-only rather than silently routed through Candle.
+- Multi-row prefill is still an optimization follow-up. Correct production
+  prefill is already native but submits the established token pass sequentially
+  for each admitted row.
 
 ---
 
 ## 5. Verification practices
 
-The oracle that caught the real bugs, plus the standing parity tests.
+The production graph is tested independently of the Candle oracle. Oracle parity
+tests remain valuable during kernel development, but passing them cannot make an
+oracle owner reachable from the release graph.
 
-### The wav-hash byte fixture
+### Current focused production gates
 
-Greedy text + **seeded** audio produces a committed byte-level fixture. The
-production binary does not execute a Candle reference mode to obtain it. It did real work —
-it **split** the exact resident-KV append (bit-identical wav) from the grouped-GQA ulp
-deviation (a different, equally-sensible slogan on a 96-token run), which is exactly why
-`grouped_gqa_decode` exists as a flag with `false` pinned to byte-parity.
+The 2026-07-16 aarch64 run used:
 
-### Standing tests
+```text
+cargo test -p liquid-audio \
+  --test native_voice_session --test native_mixed_turn \
+  --test native_tokenizer --test native_context_rollover \
+  --test native_safetensors -- --nocapture
+```
 
-- **Streaming-conv parity** (`flashkern/candle_ops.rs`, `flashkern/native_engine.rs`):
-  split-buffer CPU results and next state match the reference contract across chunk
-  boundaries; the engine snapshot proves one ticket/completion per invocation.
-- **Fused-block parity** (`flashkern/decode.rs`, `flashkern/native_engine.rs`):
-  `fused_mlp_decode` vs the real candle op chain (through the actual `linear_forward`) at bf16
-  resolution, across lane counts; native MLP vs the threadgroup port bit-for-bit.
-- **Lane determinism / bit-parity** (`flashkern/decode.rs`): the same dispatch shape twice is
-  bit-identical (fixed row ownership, fixed reduce order).
-- **Pipeline parity** (`model/linear.rs`): synthetic compatibility tensors submit the real
-  typed native ticket and compare against an f32 oracle — single linear, 2-layer stack,
-  gated MLP, and the `M==1` decode GEMV.
-- **GQA ulp bound** (`model/lfm2_hf.rs` `grouped_gqa_matches_expanded_at_f32_ulp`).
-- **Kernel suites** (`flashkern/neon.rs`, `flashkern/x86.rs`): GEMM/GEMV/SMMLA/reductions/
-  TBL/conv1d/FFT/double-double, feature-gated so they skip on CPUs lacking the extension.
-- **e2e sound gates** (`e2e_voice_runtime`): audio audibly out the speaker, CPU and Metal.
+It passed **32 tests** with two explicit opt-in gates ignored: 17/18 native image
+and schema tests, 8/9 session/lease tests, 3/3 rollover tests, 2/2 mixed-turn
+admission tests, and 2/2 native tokenizer tests. The session run measured 100,000
+allocation-free ticket/lease cycles in 0.030 s (about 3.38 million cycles/s).
+`engine_idle_zero_spin` separately passed at 0.003% cold-idle and 0.004%
+post-pass process CPU with eight parked lanes. `cargo check -p liquid-audio
+--no-default-features` also passed.
 
-The exact crate-wide count changes with feature gates and integration-test selection; quote a
-fresh `cargo test` run when reviewing. The focused gates for this layer are the parity tests
-listed above.
+The ignored gates are explicit rather than silent: the one-million-cycle soak is
+opt-in, and complete model memory accounting requires `LFM_MODEL_DIR` plus the
+main and Mimi checkpoint. The latter asserts one lifecycle-owned image and
+`compatibility_copied_bytes == 0` when the real fixture is supplied.
+
+The rollover and model-schema fixtures also pass through the x86_64/Rosetta
+build. They cover absolute RoPE range identity, latest-window retention,
+whole-action reservation, shared-model conversation fairness, equal-byte-count
+wrong dtypes/shapes, missing middle layers, and mixed vocabulary/codebook
+rejection. Do not generalize that statement into a full native Moshi gate.
+
+### Offline oracle gates
+
+`liquid-audio-oracle` retains captured Candle/reference comparisons for frontend,
+Conformer, ShortConv, GEMM/GEMV, Depthformer, Mimi, grouped GQA, and historical
+seeded waveform output. Those fixtures arbitrate numerical ports but are not
+linked by default and never run as a production fallback. Quote a fresh feature-
+specific run rather than carrying an old crate-wide count forward.
 
 ---
 
 ## 6. Measured performance history
 
-Real numbers only — measured on this machine, cited from the work that produced them. Do not
-extrapolate.
+Real numbers only — measured on this machine, cited from the work that produced
+them. Except for the final idle/lease rows, these are historical measurements from
+the migration path, not claims about the current single-image end-to-end runtime.
+Do not compare them across executors or extrapolate a current latency.
 
 | Stage | Measurement | Note |
 |---|---|---|
@@ -312,9 +348,11 @@ extrapolate.
 | CPU decode, mixed text+audio | **~21–22 tok/s** | real-time edge |
 | text-stretch | **~18 ms/token (~56 tok/s)** | |
 | audio frame | **~50 ms** | 23 GB/s effective — headroom left; E-core barrier lockstep suspected |
-| prefill | **~12 s historical baseline** | still mixed; CPU streaming short-conv is native, remaining graph is migration work (§7) |
-| e2e sound, CPU | **~52–60 s**, 2 audible turns | passes |
-| e2e sound, Metal | **~28–30 s**, mean latency ~1.3–1.6 s | passes |
+| prefill | **~12 s historical baseline** | former mixed Candle/native path; not a current native prefill benchmark |
+| e2e sound, CPU | **~52–60 s**, 2 audible turns | former oracle/product path |
+| e2e sound, Metal | **~28–30 s**, mean latency ~1.3–1.6 s | oracle Metal path; native Metal is not shipped |
+| parked native lanes, current | **0.003% cold / 0.004% post-pass CPU** | eight lanes, `engine_idle_zero_spin`, 2026-07-16 |
+| native ticket/lease hot path, current | **3.38 M cycles/s** | 100,000 allocation-free cycles, debug test run |
 
 ---
 
@@ -324,26 +362,30 @@ extrapolate.
    pthread lanes, zero-spin native expected-value waits, one pointer-stable
    request slot, native SQ/CQ, retained descriptors, native endpoint ownership,
    and deletion of the stackful runtime are live.
-2. **Typed native passes and callback deletion: built.** Depthformer, streaming
-   convolution, GEMM/GEMV, DD FFT convolution, and DD inverse FFT use typed
-   pointer-borrowed requests. `REQ_CALL`, `NativeEngine::run_lanes/grid`, and the
-   exported callback fence are deleted.
-3. **Native recurrence and parent action coordinator.** Move parent/child
-   tickets, scope epochs, service classes, and recurrence into the native
-   session. Native completion wakes that continuation directly. Rust kcoro docks
-   PCM/control only; Tauri and serialized IPC remain outside progress.
-4. **Complete native model path.** Build multi-token full/suffix prefill next,
-   then finish Conformer, mel, codec, and remaining math described by migration
-   documents 02 and 04 through 08. Candle is an oracle during migration, not a
-   permanent production owner.
-5. **Descriptor transport and multi-conversation scheduling.** Carry retained
-   region descriptors across coarse subsystem boundaries, keep one scratch board
-   single-pass, and interleave resident conversations only at full-pass tickets.
-6. **Tauri observation and durable context.** Project bounded ticket snapshots
+2. **One-image native LFM2 model: built.** The direct loader, typed BF16 views,
+   frontend, Conformer, backbone, Depthformer, Mimi, tokenizer, per-conversation
+   state, and memory accounting are mounted without a compatibility weight copy.
+3. **Native session and atomic product cutover: built.** Native text/PCM/mixed
+   admission, sampling, recurrence, tickets, epochs, reliable events, context
+   rollover, shared-model fairness, and stop/join are live. The default graph and
+   desktop construct only the opaque native LFM2 path; Candle/Moshi are oracle-only.
+4. **Completion continuation and batched prefill: next.** Increase the engine from
+   the correct capacity-1 synchronous native schedule to capacity 2, let a CQ
+   completion enqueue its follow-on without parking the coordinator, and add the
+   direct checkpoint-BF16 multi-row prefill specialization. These improve overlap
+   and long-prompt throughput; they do not move ownership out of Rust because Rust
+   already owns none of this recurrence.
+5. **Physical kcoro audio-device adapter: next.** Have mic/speaker callbacks
+   reserve and drain native PCM leases directly. Delete the `Utterance.samples`
+   copy, playback `to_vec()`, crossbeam `Reply::Audio`, and legacy
+   `VoiceEvent::Audio` observer bridge while preserving bounded reliable text and
+   control projection.
+6. **Native Moshi: subsequent independent tranche.** Port Moshi onto the same
+   image/session discipline before making it selectable in production. The LFM2
+   cutover neither implements Moshi nor permits a Candle fallback.
+7. **Observation and durable context: later.** Project bounded ticket snapshots
    without gating progress, then add snapshot/WAL services on non-realtime workers.
 
-Every rung lands with implementation-backed tests. The current scheduler gates
-cover the safe Rust kcoro executor/protocol suites, the C arena's conformance and
-wait-word suites, 100,000 terminal races, Cargo linkage, native bridge races,
-mounted numerical parity, zero-spin idle CPU, Rosetta, and the source-contract
-test in `packages/app/src/context/voice.test.ts`.
+Every rung lands with implementation-backed tests. Current evidence is recorded
+in §5; keep feature graph, real-checkpoint accounting, both architecture suites,
+zero-spin idle, interruption races, and ticket/lease soaks as explicit gates.

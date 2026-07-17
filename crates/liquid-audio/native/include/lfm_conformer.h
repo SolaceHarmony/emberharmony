@@ -11,11 +11,11 @@
 // f32 GEMM via Accelerate on Apple per the doc 09 split, lane-tiled scalar
 // leaf elsewhere).
 //
-// Numerics: the production ladder, not an idealization. Linears are bf16
-// GEMMs with f32 accumulate, f32 bias add, bf16 round (the linear_forward
-// contract). Convolutions run f32 (widened from bf16) with f32 bias, rounded
-// bf16, activation applied in the bf16 domain (the conv1d/2d_forward
-// contract). LayerNorm computes f32 statistics and applies weight/bias in
+// Numerics: the production ladder, not an idealization. Linears stream bf16
+// activations and checkpoint-layout weights directly, accumulate f32, add f32
+// bias, then round bf16. Convolutions likewise unlift bf16 activation/tap words
+// only in registers before the f32 bias and bf16 round boundaries. LayerNorm
+// computes f32 statistics and applies weight/bias in
 // bf16 arithmetic (layer_norm_slow). BatchNorm eval runs the all-bf16
 // broadcast chain. Attention scores/probs/aggregation are f32. SiLU and
 // gelu_erf round once; GLU rounds sigmoid then product (candle op-for-op).
@@ -61,10 +61,25 @@ int lfm_conformer_create(void *engine, const void *weights,
                          LfmConformer **out, char *error, size_t error_length);
 int lfm_conformer_destroy(LfmConformer *conformer);
 
-// Session-owned mutable planes. Grows to the largest segment submitted, then
-// allocation-free. One workspace per concurrent caller.
+// Immutable residency accounting. `derived_bytes` is limited to formula-
+// derived tables (BN denominators and relative-position frequencies). Bound
+// checkpoint bytes remain views into the owner image. Materialized bytes must
+// remain zero for every forward; direct GEMM calls is an execution witness for
+// steady-state tests.
+uint64_t lfm_conformer_bound_weight_bytes(const LfmConformer *conformer);
+uint64_t lfm_conformer_derived_bytes(const LfmConformer *conformer);
+uint64_t lfm_conformer_materialized_weight_bytes(const LfmConformer *conformer);
+uint64_t lfm_conformer_direct_gemm_calls(const LfmConformer *conformer);
+
+// Session-owned mutable planes. Production reserves the maximum admitted mel
+// segment before readiness; subsequent forwards never grow and return
+// -ENOBUFS if admission is violated. An unreserved workspace retains the
+// transitional grow-on-first-forward behavior used by parity tests.
 int lfm_conformer_workspace_create(LfmConformerWorkspace **out);
 int lfm_conformer_workspace_destroy(LfmConformerWorkspace *workspace);
+int lfm_conformer_workspace_reserve(const LfmConformer *conformer,
+                                    LfmConformerWorkspace *workspace,
+                                    uint64_t max_mel_frames);
 
 // Output rows for a mel segment of `mel_frames`: the dw_striding length chain
 // (three k3/s2/p1 stages), matching the Rust calc_length/mel2emb_len contract.

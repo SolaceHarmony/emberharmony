@@ -667,6 +667,72 @@ LFM_SYM(lfm_sgemm_nt_f32):
     popq      %rbx
     ret
 
+// Baseline direct bf16 checkpoint-layout GEMM. Uses only scalar SSE2 integer
+// shifts plus f32 arithmetic, so Rosetta can execute it even when its AVX state
+// gate rejects the tuned leaf. No operand is packed or widened into memory.
+.p2align 4
+.globl LFM_SYM(lfm_bf16_gemm_nt_f32_scalar)
+LFM_SYM(lfm_bf16_gemm_nt_f32_scalar):
+    pushq     %rbx
+    pushq     %r12
+    pushq     %r13
+    pushq     %r14
+    pushq     %r15
+#ifdef _WIN32
+    movq      %rcx, %rdi
+    movq      %rdx, %rsi
+    movq      %r8,  %rdx
+    movq      %r9,  %rcx
+    movq      80(%rsp), %r8
+    movq      88(%rsp), %r9
+#endif
+    xorq      %r10, %r10
+1:
+    cmpq      %rcx, %r10
+    jae       8f
+    xorq      %r11, %r11
+2:
+    cmpq      %r8, %r11
+    jae       5f
+    xorps     %xmm0, %xmm0
+    movq      %r10, %rax
+    imulq     %r9, %rax
+    leaq      (%rdi,%rax,2), %r12
+    movq      %r11, %rax
+    imulq     %r9, %rax
+    leaq      (%rsi,%rax,2), %r13
+    xorq      %r14, %r14
+3:
+    cmpq      %r9, %r14
+    jae       4f
+    pxor      %xmm1, %xmm1
+    pinsrw    $0, (%r12,%r14,2), %xmm1
+    pslld     $16, %xmm1
+    pxor      %xmm2, %xmm2
+    pinsrw    $0, (%r13,%r14,2), %xmm2
+    pslld     $16, %xmm2
+    mulss     %xmm2, %xmm1
+    addss     %xmm1, %xmm0
+    incq      %r14
+    jmp       3b
+4:
+    movq      %r10, %rax
+    imulq     %r8, %rax
+    addq      %r11, %rax
+    movss     %xmm0, (%rdx,%rax,4)
+    incq      %r11
+    jmp       2b
+5:
+    incq      %r10
+    jmp       1b
+8:
+    popq      %r15
+    popq      %r14
+    popq      %r13
+    popq      %r12
+    popq      %rbx
+    ret
+
 // void lfm_dwconv_tap_f32(xpad, w, y, channels, t_out, t_pad, k, stride)
 .p2align 4
 .globl LFM_SYM(lfm_dwconv_tap_f32)
@@ -718,6 +784,81 @@ LFM_SYM(lfm_dwconv_tap_f32):
     jae       4f
     movss     (%rbp,%rax,4), %xmm1
     mulss     (%r13,%rax,4), %xmm1
+    addss     %xmm1, %xmm0
+    incq      %rax
+    jmp       3b
+4:
+    movss     %xmm0, (%r14,%r15,4)
+    incq      %r15
+    jmp       2b
+5:
+    incq      %rbx
+    jmp       1b
+8:
+    popq      %rbp
+    popq      %r15
+    popq      %r14
+    popq      %r13
+    popq      %r12
+    popq      %rbx
+    ret
+
+// Direct-bf16 twin of lfm_dwconv_tap_f32. The source and resident taps remain
+// halfwords; each MAC unlift happens in an SSE register.
+.p2align 4
+.globl LFM_SYM(lfm_dwconv_tap_bf16_f32)
+LFM_SYM(lfm_dwconv_tap_bf16_f32):
+    pushq     %rbx
+    pushq     %r12
+    pushq     %r13
+    pushq     %r14
+    pushq     %r15
+    pushq     %rbp
+#ifdef _WIN32
+    movq      %rcx, %rdi
+    movq      %rdx, %rsi
+    movq      %r8,  %rdx
+    movq      %r9,  %rcx
+    movq      88(%rsp), %r8
+    movq      96(%rsp), %r9
+    movq      104(%rsp), %r10
+    movq      112(%rsp), %r11
+#else
+    movq      56(%rsp), %r10
+    movq      64(%rsp), %r11
+#endif
+    xorq      %rbx, %rbx
+1:
+    cmpq      %rcx, %rbx
+    jae       8f
+    movq      %rbx, %rax
+    imulq     %r9, %rax
+    leaq      (%rdi,%rax,2), %r12
+    movq      %rbx, %rax
+    imulq     %r10, %rax
+    leaq      (%rsi,%rax,2), %r13
+    movq      %rbx, %rax
+    imulq     %r8, %rax
+    leaq      (%rdx,%rax,4), %r14
+    xorq      %r15, %r15
+2:
+    cmpq      %r8, %r15
+    jae       5f
+    xorps     %xmm0, %xmm0
+    movq      %r15, %rax
+    imulq     %r11, %rax
+    leaq      (%r12,%rax,2), %rbp
+    xorq      %rax, %rax
+3:
+    cmpq      %r10, %rax
+    jae       4f
+    pxor      %xmm1, %xmm1
+    pinsrw    $0, (%rbp,%rax,2), %xmm1
+    pslld     $16, %xmm1
+    pxor      %xmm2, %xmm2
+    pinsrw    $0, (%r13,%rax,2), %xmm2
+    pslld     $16, %xmm2
+    mulss     %xmm2, %xmm1
     addss     %xmm1, %xmm0
     incq      %rax
     jmp       3b
@@ -820,6 +961,234 @@ LFM_SYM(lfm_dwconv2d_k3s2_f32):
     incq      %rax
     movss     8(%r10), %xmm1
     mulss     (%r13,%rax,4), %xmm1
+    addss     %xmm1, %xmm0
+    incq      %r8
+    jmp       4b
+5:
+    movq      %r15, %rax
+    imulq     32(%rsp), %rax
+    addq      %rcx, %rax
+    movss     %xmm0, (%r14,%rax,4)
+    incq      %rcx
+    jmp       3b
+6:
+    incq      %r15
+    jmp       2b
+7:
+    incq      %rbx
+    jmp       1b
+8:
+    addq      $48, %rsp
+    popq      %r15
+    popq      %r14
+    popq      %r13
+    popq      %r12
+    popq      %rbx
+    ret
+
+// Stem k3/s2: one padded bf16 input plane, resident (channels,1,3,3) bf16
+// taps, and channel-major f32 output. Both bf16 operands are unlifted at the
+// MAC; the checkpoint address may be byte-unaligned.
+.p2align 4
+.globl LFM_SYM(lfm_conv2d_stem_k3s2_bf16_f32)
+LFM_SYM(lfm_conv2d_stem_k3s2_bf16_f32):
+    pushq     %rbx
+    pushq     %r12
+    pushq     %r13
+    pushq     %r14
+    pushq     %r15
+    subq      $48, %rsp
+#ifdef _WIN32
+    movq      %rcx, %rdi
+    movq      %rdx, %rsi
+    movq      %r8,  %rdx
+    movq      %r9,  %rcx
+    movq      128(%rsp), %r8
+    movq      136(%rsp), %r9
+    movq      144(%rsp), %rax
+    movq      %rax, 24(%rsp)
+    movq      152(%rsp), %rax
+    movq      %rax, 32(%rsp)
+#else
+    movq      96(%rsp), %rax
+    movq      %rax, 24(%rsp)
+    movq      104(%rsp), %rax
+    movq      %rax, 32(%rsp)
+#endif
+    movq      %rcx, 0(%rsp)
+    movq      %r8, 8(%rsp)
+    movq      %r9, 16(%rsp)
+    xorq      %rbx, %rbx
+1:
+    cmpq      0(%rsp), %rbx
+    jae       8f
+    movq      %rdi, %r12          // the stem has one shared input plane
+    leaq      (%rbx,%rbx,8), %rax
+    leaq      (%rsi,%rax,2), %r13
+    movq      24(%rsp), %rax
+    imulq     32(%rsp), %rax
+    imulq     %rbx, %rax
+    leaq      (%rdx,%rax,4), %r14
+    xorq      %r15, %r15
+2:
+    cmpq      24(%rsp), %r15
+    jae       7f
+    xorq      %rcx, %rcx
+3:
+    cmpq      32(%rsp), %rcx
+    jae       6f
+    xorps     %xmm0, %xmm0
+    xorq      %r8, %r8
+4:
+    cmpq      $3, %r8
+    jae       5f
+    leaq      (%r15,%r15), %rax
+    addq      %r8, %rax
+    imulq     16(%rsp), %rax
+    leaq      (%rcx,%rcx), %r9
+    addq      %r9, %rax
+    leaq      (%r12,%rax,2), %r10
+    leaq      (%r8,%r8,2), %rax
+    pxor      %xmm1, %xmm1
+    pinsrw    $0, (%r10), %xmm1
+    pslld     $16, %xmm1
+    pxor      %xmm2, %xmm2
+    pinsrw    $0, (%r13,%rax,2), %xmm2
+    pslld     $16, %xmm2
+    mulss     %xmm2, %xmm1
+    addss     %xmm1, %xmm0
+    incq      %rax
+    pxor      %xmm1, %xmm1
+    pinsrw    $0, 2(%r10), %xmm1
+    pslld     $16, %xmm1
+    pxor      %xmm2, %xmm2
+    pinsrw    $0, (%r13,%rax,2), %xmm2
+    pslld     $16, %xmm2
+    mulss     %xmm2, %xmm1
+    addss     %xmm1, %xmm0
+    incq      %rax
+    pxor      %xmm1, %xmm1
+    pinsrw    $0, 4(%r10), %xmm1
+    pslld     $16, %xmm1
+    pxor      %xmm2, %xmm2
+    pinsrw    $0, (%r13,%rax,2), %xmm2
+    pslld     $16, %xmm2
+    mulss     %xmm2, %xmm1
+    addss     %xmm1, %xmm0
+    incq      %r8
+    jmp       4b
+5:
+    movq      %r15, %rax
+    imulq     32(%rsp), %rax
+    addq      %rcx, %rax
+    movss     %xmm0, (%r14,%rax,4)
+    incq      %rcx
+    jmp       3b
+6:
+    incq      %r15
+    jmp       2b
+7:
+    incq      %rbx
+    jmp       1b
+8:
+    addq      $48, %rsp
+    popq      %r15
+    popq      %r14
+    popq      %r13
+    popq      %r12
+    popq      %rbx
+    ret
+
+// Direct-bf16 per-channel k3/s2 twin. Input padding and checkpoint taps stay
+// bf16, while the destination remains f32 for the caller's bias/round ladder.
+.p2align 4
+.globl LFM_SYM(lfm_dwconv2d_k3s2_bf16_f32)
+LFM_SYM(lfm_dwconv2d_k3s2_bf16_f32):
+    pushq     %rbx
+    pushq     %r12
+    pushq     %r13
+    pushq     %r14
+    pushq     %r15
+    subq      $48, %rsp
+#ifdef _WIN32
+    movq      %rcx, %rdi
+    movq      %rdx, %rsi
+    movq      %r8,  %rdx
+    movq      %r9,  %rcx
+    movq      128(%rsp), %r8
+    movq      136(%rsp), %r9
+    movq      144(%rsp), %rax
+    movq      %rax, 24(%rsp)
+    movq      152(%rsp), %rax
+    movq      %rax, 32(%rsp)
+#else
+    movq      96(%rsp), %rax
+    movq      %rax, 24(%rsp)
+    movq      104(%rsp), %rax
+    movq      %rax, 32(%rsp)
+#endif
+    movq      %rcx, 0(%rsp)
+    movq      %r8, 8(%rsp)
+    movq      %r9, 16(%rsp)
+    xorq      %rbx, %rbx
+1:
+    cmpq      0(%rsp), %rbx
+    jae       8f
+    movq      8(%rsp), %rax
+    imulq     16(%rsp), %rax
+    imulq     %rbx, %rax
+    leaq      (%rdi,%rax,2), %r12
+    leaq      (%rbx,%rbx,8), %rax
+    leaq      (%rsi,%rax,2), %r13
+    movq      24(%rsp), %rax
+    imulq     32(%rsp), %rax
+    imulq     %rbx, %rax
+    leaq      (%rdx,%rax,4), %r14
+    xorq      %r15, %r15
+2:
+    cmpq      24(%rsp), %r15
+    jae       7f
+    xorq      %rcx, %rcx
+3:
+    cmpq      32(%rsp), %rcx
+    jae       6f
+    xorps     %xmm0, %xmm0
+    xorq      %r8, %r8
+4:
+    cmpq      $3, %r8
+    jae       5f
+    leaq      (%r15,%r15), %rax
+    addq      %r8, %rax
+    imulq     16(%rsp), %rax
+    leaq      (%rcx,%rcx), %r9
+    addq      %r9, %rax
+    leaq      (%r12,%rax,2), %r10
+    leaq      (%r8,%r8,2), %rax
+    pxor      %xmm1, %xmm1
+    pinsrw    $0, (%r10), %xmm1
+    pslld     $16, %xmm1
+    pxor      %xmm2, %xmm2
+    pinsrw    $0, (%r13,%rax,2), %xmm2
+    pslld     $16, %xmm2
+    mulss     %xmm2, %xmm1
+    addss     %xmm1, %xmm0
+    incq      %rax
+    pxor      %xmm1, %xmm1
+    pinsrw    $0, 2(%r10), %xmm1
+    pslld     $16, %xmm1
+    pxor      %xmm2, %xmm2
+    pinsrw    $0, (%r13,%rax,2), %xmm2
+    pslld     $16, %xmm2
+    mulss     %xmm2, %xmm1
+    addss     %xmm1, %xmm0
+    incq      %rax
+    pxor      %xmm1, %xmm1
+    pinsrw    $0, 4(%r10), %xmm1
+    pslld     $16, %xmm1
+    pxor      %xmm2, %xmm2
+    pinsrw    $0, (%r13,%rax,2), %xmm2
+    pslld     $16, %xmm2
+    mulss     %xmm2, %xmm1
     addss     %xmm1, %xmm0
     incq      %r8
     jmp       4b

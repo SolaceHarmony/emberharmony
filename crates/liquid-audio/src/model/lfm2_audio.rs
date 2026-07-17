@@ -411,13 +411,27 @@ extern "C" {
 
 /// Depth rope geometry: positions = codebooks, head_dim = `dim / DEPTH_HEADS`,
 /// theta 1e6 — mirrors the Candle depth `Mha` construction. Returns
-/// `(cos, sin)`, empty on kernel failure.
-fn build_depth_rope(depthformer_dim: usize, codebooks: usize) -> (Vec<f32>, Vec<f32>) {
+/// `(cos, sin)` or a load-time error before allocating invalid geometry.
+fn build_depth_rope(depthformer_dim: usize, codebooks: usize) -> Result<(Vec<f32>, Vec<f32>)> {
+    if depthformer_dim == 0
+        || depthformer_dim > u32::MAX as usize
+        || depthformer_dim % DEPTH_HEADS != 0
+        || codebooks == 0
+        || codebooks > 64
+    {
+        return Err(candle_core::Error::Msg(format!(
+            "resident depth rope: unsupported geometry dim={depthformer_dim}, codebooks={codebooks}"
+        )));
+    }
     let head_dim = depthformer_dim / DEPTH_HEADS;
     if head_dim == 0 || head_dim % 2 != 0 {
-        return (Vec::new(), Vec::new());
+        return Err(candle_core::Error::Msg(format!(
+            "resident depth rope: head dimension {head_dim} must be positive and even"
+        )));
     }
-    let count = codebooks * (head_dim / 2);
+    let count = codebooks.checked_mul(head_dim / 2).ok_or_else(|| {
+        candle_core::Error::Msg("resident depth rope element count overflowed usize".into())
+    })?;
     let mut cos = vec![0f32; count];
     let mut sin = vec![0f32; count];
     let rc = unsafe {
@@ -430,9 +444,11 @@ fn build_depth_rope(depthformer_dim: usize, codebooks: usize) -> (Vec<f32>, Vec<
         )
     };
     if rc != 0 {
-        return (Vec::new(), Vec::new());
+        return Err(candle_core::Error::Msg(format!(
+            "resident depth rope kernel rejected geometry with status {rc}"
+        )));
     }
-    (cos, sin)
+    Ok((cos, sin))
 }
 
 // Depth geometry constants — mirror the Candle depth construction in `build`
@@ -450,6 +466,7 @@ const DEPTH_ROPE_THETA: f32 = 1_000_000.0;
 /// `rope_sin` must outlive the returned plan (the model owns them).
 fn build_depth_decode_resident(
     resident: &ResidentWeights,
+    depthformer_layers: usize,
     depthformer_dim: usize,
     codebooks: usize,
     backbone_dim: usize,
@@ -457,70 +474,147 @@ fn build_depth_decode_resident(
     rope_sin: &[f32],
 ) -> Option<crate::flashkern::decode::DepthDecode> {
     use crate::flashkern::decode::{DepthDecode, DepthHead, DepthLayer, PtrLen};
+    use crate::weights::WeightDType;
 
     if !crate::flashkern::native_engine::bf16_gemm_available()
+        || depthformer_layers == 0
+        || depthformer_layers > u32::MAX as usize
+        || depthformer_dim == 0
+        || depthformer_dim > u32::MAX as usize
         || depthformer_dim % DEPTH_HEADS != 0
-        || rope_cos.is_empty()
-        || rope_sin.is_empty()
+        || DEPTH_HEADS % DEPTH_KV_HEADS != 0
+        || codebooks == 0
+        || codebooks > 64
+        || backbone_dim == 0
+        || backbone_dim > u32::MAX as usize
     {
         return None;
     }
+    let head_dim = depthformer_dim / DEPTH_HEADS;
+    if head_dim == 0 || head_dim % 2 != 0 {
+        return None;
+    }
+    let ff = depthformer_dim
+        .checked_mul(4)?
+        .checked_mul(2)?
+        .checked_div(3)?
+        .checked_add(255)?
+        .checked_div(256)?
+        .checked_mul(256)?;
+    let kv_width = 2usize.checked_mul(DEPTH_KV_HEADS)?.checked_mul(head_dim)?;
+    let qkv_rows = depthformer_dim.checked_add(kv_width)?;
+    let projection_rows = codebooks.checked_mul(depthformer_dim)?;
+    let rope_elements = codebooks.checked_mul(head_dim / 2)?;
+    if ff == 0
+        || ff > u32::MAX as usize
+        || qkv_rows > u32::MAX as usize
+        || projection_rows > u32::MAX as usize
+        || rope_cos.len() != rope_elements
+        || rope_sin.len() != rope_elements
+    {
+        return None;
+    }
+
     let image = resident.image();
-    // Bind one checkpoint tensor by name as a zero-copy view into the resident
-    // image (the depth weights are all bf16 — the Candle path proves it by taking
-    // `PtrLen::bf16` on the same tensors).
-    let bind = |name: &str| -> Option<PtrLen> {
+    // Reject any numeric layer outside the configured contiguous range. This
+    // catches extra layers and gapped inventories rather than treating the first
+    // absent operator_norm as an implicit end marker.
+    for index in 0..image.len() {
+        let tensor = image.at(index).ok()?;
+        let name = tensor.name().ok()?;
+        let Some(suffix) = name.strip_prefix("depthformer.layers.") else {
+            continue;
+        };
+        let Some((layer, _)) = suffix.split_once('.') else {
+            return None;
+        };
+        let Ok(layer) = layer.parse::<usize>() else {
+            return None;
+        };
+        if layer >= depthformer_layers {
+            return None;
+        }
+    }
+
+    // Bind one exact checkpoint tensor by name as a zero-copy view into the
+    // resident image. Count and byte checks are repeated here deliberately: a
+    // descriptor with the right count but wrong dtype or transposed shape must
+    // never reach the native plan.
+    let bind = |name: &str, shape: &[usize]| -> Option<PtrLen> {
         let v = image.find(name).ok()?;
-        Some(PtrLen::from_raw(v.data_ptr(), v.elements() as usize))
+        if v.dtype().ok()? != WeightDType::BF16 || v.shape().len() != shape.len() {
+            return None;
+        }
+        if v.shape()
+            .iter()
+            .zip(shape)
+            .any(|(&actual, &expected)| usize::try_from(actual).ok() != Some(expected))
+        {
+            return None;
+        }
+        let elements = shape
+            .iter()
+            .try_fold(1usize, |count, &axis| count.checked_mul(axis))?;
+        if usize::try_from(v.elements()).ok()? != elements
+            || v.bytes() != u64::try_from(elements).ok()?.checked_mul(2)?
+        {
+            return None;
+        }
+        PtrLen::resident_bf16(&v)
     };
 
-    let mut layers = Vec::new();
-    let mut ff = 0usize;
-    let mut li = 0usize;
-    loop {
+    let mut layers = Vec::with_capacity(depthformer_layers);
+    for li in 0..depthformer_layers {
         let root = format!("depthformer.layers.{li}.");
-        // operator_norm marks a present layer; its absence ends the count.
-        if image.find(&format!("{root}operator_norm.weight")).is_err() {
-            break;
-        }
         let op = format!("{root}operator.");
-        if li == 0 {
-            ff = *image
-                .find(&format!("{root}feed_forward.w1.weight"))
-                .ok()?
-                .shape()
-                .first()? as usize;
-        }
         layers.push(DepthLayer {
-            qkv_w: bind(&format!("{op}qkv_proj.weight"))?,
-            out_w: bind(&format!("{op}out_proj.weight"))?,
-            q_ln: bind(&format!("{op}bounded_attention.q_layernorm.weight"))?,
-            k_ln: bind(&format!("{op}bounded_attention.k_layernorm.weight"))?,
-            opnorm: bind(&format!("{root}operator_norm.weight"))?,
-            ffnnorm: bind(&format!("{root}ffn_norm.weight"))?,
-            w1: bind(&format!("{root}feed_forward.w1.weight"))?,
-            w3: bind(&format!("{root}feed_forward.w3.weight"))?,
-            w2: bind(&format!("{root}feed_forward.w2.weight"))?,
+            qkv_w: bind(
+                &format!("{op}qkv_proj.weight"),
+                &[qkv_rows, depthformer_dim],
+            )?,
+            out_w: bind(
+                &format!("{op}out_proj.weight"),
+                &[depthformer_dim, depthformer_dim],
+            )?,
+            q_ln: bind(
+                &format!("{op}bounded_attention.q_layernorm.weight"),
+                &[head_dim],
+            )?,
+            k_ln: bind(
+                &format!("{op}bounded_attention.k_layernorm.weight"),
+                &[head_dim],
+            )?,
+            opnorm: bind(&format!("{root}operator_norm.weight"), &[depthformer_dim])?,
+            ffnnorm: bind(&format!("{root}ffn_norm.weight"), &[depthformer_dim])?,
+            w1: bind(
+                &format!("{root}feed_forward.w1.weight"),
+                &[ff, depthformer_dim],
+            )?,
+            w3: bind(
+                &format!("{root}feed_forward.w3.weight"),
+                &[ff, depthformer_dim],
+            )?,
+            w2: bind(
+                &format!("{root}feed_forward.w2.weight"),
+                &[depthformer_dim, ff],
+            )?,
         });
-        li += 1;
-    }
-    if layers.is_empty() || ff == 0 {
-        return None;
     }
 
     let mut heads_w = Vec::with_capacity(codebooks);
     for ci in 0..codebooks {
         let root = format!("depth_embeddings.{ci}.");
-        let vocab = *image
-            .find(&format!("{root}embedding.weight"))
-            .ok()?
-            .shape()
-            .first()? as usize;
         heads_w.push(DepthHead {
-            emb: bind(&format!("{root}embedding.weight"))?,
-            norm: bind(&format!("{root}embedding_norm.weight"))?,
-            logits: bind(&format!("{root}to_logits.weight"))?,
-            vocab,
+            emb: bind(
+                &format!("{root}embedding.weight"),
+                &[AUDIO_VOCAB_SIZE, depthformer_dim],
+            )?,
+            norm: bind(&format!("{root}embedding_norm.weight"), &[depthformer_dim])?,
+            logits: bind(
+                &format!("{root}to_logits.weight"),
+                &[AUDIO_VOCAB_SIZE, depthformer_dim],
+            )?,
+            vocab: AUDIO_VOCAB_SIZE,
         });
     }
 
@@ -534,10 +628,10 @@ fn build_depth_decode_resident(
         DEPTH_EPS,
         layers,
         heads_w,
-        bind("depth_linear.weight")?,
-        bind("depth_linear.bias")?,
-        PtrLen::from_raw(rope_cos.as_ptr() as *const std::ffi::c_void, rope_cos.len()),
-        PtrLen::from_raw(rope_sin.as_ptr() as *const std::ffi::c_void, rope_sin.len()),
+        bind("depth_linear.weight", &[projection_rows, backbone_dim])?,
+        bind("depth_linear.bias", &[projection_rows])?,
+        PtrLen::f32_slice(rope_cos),
+        PtrLen::f32_slice(rope_sin),
     )
 }
 
@@ -572,6 +666,7 @@ pub struct LFM2AudioModel {
     depth_embeddings: Option<Vec<SharedEmbedding>>,
     codebooks: usize,
     codebook_offsets: Vec<i64>,
+    depthformer_layers: usize,
     depthformer_dim: usize,
     interleaved_n_text: usize,
     interleaved_n_audio: usize,
@@ -761,7 +856,7 @@ impl LFM2AudioModel {
         // Rope tables for the resident-bound depth plan (native kernel, byte-
         // identical to `lfm_model.cpp`). Empty on the Candle/training path.
         let depth_rope = if resident.is_some() {
-            build_depth_rope(depth_cfg.dim, codebooks)
+            build_depth_rope(depth_cfg.dim, codebooks)?
         } else {
             (Vec::new(), Vec::new())
         };
@@ -775,6 +870,7 @@ impl LFM2AudioModel {
             depth_embeddings,
             codebooks,
             codebook_offsets,
+            depthformer_layers: depth_cfg.layers,
             depthformer_dim: depth_cfg.dim,
             interleaved_n_text,
             interleaved_n_audio,
@@ -823,6 +919,7 @@ impl LFM2AudioModel {
         if let Some(resident) = self.resident.as_ref() {
             return build_depth_decode_resident(
                 resident,
+                self.depthformer_layers,
                 self.depthformer_dim,
                 self.codebooks,
                 self.hidden,
@@ -1938,6 +2035,14 @@ mod tests {
     }
 
     #[test]
+    fn depth_rope_rejects_invalid_geometry_without_overflowing() {
+        let error = build_depth_rope(usize::MAX, 64).unwrap_err();
+        assert!(error.to_string().contains("unsupported geometry"));
+        let error = build_depth_rope(1024, 0).unwrap_err();
+        assert!(error.to_string().contains("unsupported geometry"));
+    }
+
+    #[test]
     fn greedy_when_no_temperature() {
         let l = logits(&[0.1, 5.0, 0.2, 3.0]);
         let mut stream = SamplingStream::new(0);
@@ -1987,6 +2092,7 @@ mod tests {
 
         let depth_res = build_depth_decode_resident(
             resident,
+            m.depthformer_layers,
             m.depthformer_dim,
             m.codebooks,
             m.hidden,

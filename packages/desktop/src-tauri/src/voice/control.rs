@@ -11,7 +11,6 @@
 use crate::settings::{self, VoiceProvider, VoiceSettings};
 use crate::{ServerReadyData, ServerState};
 use liquid_audio::AudioStatsSnapshot;
-use liquid_audio::moshi::models::realtime_moshi_files;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, State};
 
@@ -193,22 +192,12 @@ fn local_model_ready(settings: &VoiceSettings) -> Result<bool, String> {
             let Some(dir) = settings::lfm2_active_model_dir(&settings.lfm2) else {
                 return Ok(false);
             };
-            if realtime_moshi_files(&dir)
-                .map_err(|e| format!("failed to inspect local voice model: {e}"))?
-                .is_some()
-            {
-                return Err("Selected local engine is LFM2-Audio, but the directory contains a Moshi realtime snapshot. Switch Local engine to Moshi realtime or choose an LFM2-Audio snapshot.".into());
-            }
-            Ok(true)
+            Ok(dir.is_dir())
         }
-        settings::LocalVoiceEngine::MoshiRealtime => {
-            let Some(dir) = settings::moshi_model_dir(&settings.lfm2) else {
-                return Ok(false);
-            };
-            realtime_moshi_files(&dir)
-                .map(|files| files.is_some())
-                .map_err(|e| format!("failed to inspect Moshi realtime snapshot: {e}"))
-        }
+        settings::LocalVoiceEngine::MoshiRealtime => Err(
+            "Moshi realtime inference is offline-oracle only in this release; select native LFM2 interleaved. No Candle fallback is linked."
+                .into(),
+        ),
     }
 }
 

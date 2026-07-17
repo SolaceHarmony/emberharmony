@@ -10,7 +10,8 @@
 
 #[cfg(test)]
 mod bridge;
-pub mod candle_ops; // candle CustomOp bridges — the seam the model wires through on CPU
+#[cfg(feature = "oracle")]
+pub mod candle_ops; // candle CustomOp bridges — oracle-only compatibility seam
 #[cfg(test)]
 pub mod dd; // ABI record used only by native DD conformance tests
 pub mod decode; // fused decode blocks: threadgroup fallback + ShortConv/DepthDecode blocks

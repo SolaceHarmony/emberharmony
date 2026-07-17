@@ -209,6 +209,15 @@ struct EngineSnapshot {
 extern "C" {
     fn lfm_bf16_gemm_available() -> i32;
     #[cfg(test)]
+    fn lfm_bf16_gemm_nt_f32_scalar(
+        a: *const u16,
+        weights: *const c_void,
+        out: *mut f32,
+        m: i32,
+        n: i32,
+        k: i32,
+    );
+    #[cfg(test)]
     fn lfm_rsqrt_size(value: usize) -> f32;
     #[cfg(test)]
     fn lfm_inv_rms_f32(sum: f32, count: usize, epsilon: f32) -> f32;
@@ -222,7 +231,9 @@ extern "C" {
         stride: usize,
     ) -> f32;
     #[cfg(test)]
-    fn lfm_bf16_bias_add_f32(values: *mut f32, bias: *const u16, count: usize);
+    fn lfm_bf16_bias_add_f32(values: *mut f32, bias: *const c_void, count: usize);
+    #[cfg(test)]
+    fn lfm_bf16_copy_bytes(source: *const c_void, destination: *mut u16, count: usize);
     #[cfg(test)]
     fn lfm_bf16_rope_neox(values: *mut u16, cosine: *const u16, sine: *const u16, head_dim: usize);
     #[cfg(test)]
@@ -319,6 +330,36 @@ extern "C" {
         lanes: usize,
         provided_embed: *const u16,
     ) -> i32;
+    #[cfg(test)]
+    fn lfm_engine_prefill_workspace_create(
+        e: *mut c_void,
+        id: u64,
+        out_workspace: *mut *mut c_void,
+    ) -> i32;
+    #[cfg(test)]
+    fn lfm_engine_prefill_workspace_destroy(workspace: *mut c_void);
+    #[cfg(test)]
+    fn lfm_engine_prefill(
+        e: *mut c_void,
+        id: u64,
+        workspace: *mut c_void,
+        ids: *const u32,
+        provided_rows: *const u16,
+        row_count: usize,
+        embed_kind: u32,
+        states: *const LayerState,
+        state_count: usize,
+        position: usize,
+        rope_cos: *const u16,
+        rope_sin: *const u16,
+        rope_elements: usize,
+        out_hidden: *mut u16,
+        hidden_elements: usize,
+        sampler: *const SampleConfig,
+        prng: *mut PrngState,
+        out_token: *mut u32,
+        lanes: usize,
+    ) -> i32;
     fn lfm_engine_sample(
         e: *mut c_void,
         logits: *const c_void,
@@ -373,6 +414,19 @@ extern "C" {
         n: usize,
         k: usize,
         rhs_layout: u32,
+    ) -> i32;
+    #[cfg(test)]
+    fn lfm_engine_bf16_gemm_nt_direct_f32(
+        e: *mut c_void,
+        a: *const u16,
+        a_count: usize,
+        weights: *const c_void,
+        weight_count: usize,
+        out: *mut f32,
+        out_count: usize,
+        m: usize,
+        n: usize,
+        k: usize,
     ) -> i32;
     #[cfg(test)]
     fn lfm_engine_fft_conv_dd(
@@ -645,6 +699,44 @@ impl NativeEngine {
         }
     }
 
+    #[cfg(test)]
+    fn bf16_gemm_nt_direct_f32(
+        &self,
+        a: &[u16],
+        weights: &[u16],
+        out: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> bool {
+        assert_eq!(a.len(), m.checked_mul(k).expect("direct GEMM A overflow"));
+        assert_eq!(
+            weights.len(),
+            n.checked_mul(k).expect("direct GEMM W overflow")
+        );
+        assert_eq!(
+            out.len(),
+            m.checked_mul(n).expect("direct GEMM output overflow")
+        );
+        let _pass = self.pass_lock.lock().unwrap();
+        // SAFETY: exact extents are asserted and all borrows outlive the
+        // blocking completion returned by the native ticket.
+        unsafe {
+            lfm_engine_bf16_gemm_nt_direct_f32(
+                self.ptr,
+                a.as_ptr(),
+                a.len(),
+                weights.as_ptr().cast(),
+                weights.len(),
+                out.as_mut_ptr(),
+                out.len(),
+                m,
+                n,
+                k,
+            ) == 0
+        }
+    }
+
     /// Run the complete double-double FFT convolution grid as one native ticket.
     /// The fixed lane team shares one reusable work plane and fences every radix-2 stage.
     #[cfg(test)]
@@ -768,7 +860,7 @@ impl NativeEngine {
                 x.len(),
                 cache_ptr,
                 cache_count,
-                weights.as_ptr(),
+                weights.as_ptr().cast(),
                 weights.len(),
                 out.as_mut_ptr(),
                 out.len(),
@@ -1059,7 +1151,9 @@ impl NativeEngine {
 /// SAFETY (Send): moving the container between threads moves dead pointers; every
 /// live use happens on the capturing thread inside the blocking call.
 #[derive(Default)]
+#[cfg(feature = "oracle")]
 pub struct StateTable(pub Vec<LayerState>);
+#[cfg(feature = "oracle")]
 unsafe impl Send for StateTable {}
 
 /// Keeps the resident layer table's backing alive and clears the table before it dies.
@@ -1067,11 +1161,13 @@ unsafe impl Send for StateTable {}
 /// the undived model weights are owned by the model, which must own this guard so the
 /// guard drops (and clears the C table) before those weights do. The install id keys
 /// ownership: this drop can only clear ITS OWN install, never a later model's.
+#[cfg(feature = "oracle")]
 pub struct BackboneCtxGuard {
     id: u64,
     _held: Vec<candle_core::Tensor>,
 }
 
+#[cfg(feature = "oracle")]
 impl BackboneCtxGuard {
     pub(crate) fn lanes_total(&self) -> usize {
         process_engine().lanes_total()
@@ -1203,6 +1299,7 @@ impl BackboneCtxGuard {
     }
 }
 
+#[cfg(feature = "oracle")]
 impl Drop for BackboneCtxGuard {
     fn drop(&mut self) {
         process_engine().ctx_clear(self.id);
@@ -1213,6 +1310,7 @@ impl Drop for BackboneCtxGuard {
 /// the MODEL must own (declared before its weight fields so it drops first), or `None`
 /// when that model cannot be represented by the native ABI. Any number of immutable
 /// plans may coexist; one pass ticket selects one plan. Engine presence is unconditional.
+#[cfg(feature = "oracle")]
 pub fn install_backbone_ctx(
     descs: &[LayerDesc],
     h: usize,
@@ -1303,7 +1401,7 @@ mod tests {
                 lfm_bf16_sumsq_stride_f32(bf16.as_ptr(), bf16.len(), 1, 2).to_bits(),
                 0x41a0_0000
             );
-            lfm_bf16_bias_add_f32(bias.as_mut_ptr(), bias_bits.as_ptr(), bias.len());
+            lfm_bf16_bias_add_f32(bias.as_mut_ptr(), bias_bits.as_ptr().cast(), bias.len());
             lfm_bf16_rope_neox(
                 rope.as_mut_ptr(),
                 cosine.as_ptr(),
@@ -1313,6 +1411,27 @@ mod tests {
         }
         assert_eq!(bias.map(f32::to_bits), [0x3fc0_0000, 0x3f80_0000]);
         assert_eq!(rope, [0x3f80, 0xbf80, 0x4040, 0x4040]);
+    }
+
+    #[test]
+    fn bf16_checkpoint_words_copy_bit_exactly_from_an_unaligned_view() {
+        let expected = [0x0000u16, 0x8000, 0x0001, 0x7f80, 0xff80, 0x7fc1];
+        let mut image = vec![0xa5u8; expected.len() * 2 + 1];
+        for (index, word) in expected.iter().enumerate() {
+            image[1 + index * 2..1 + index * 2 + 2].copy_from_slice(&word.to_le_bytes());
+        }
+        let mut actual = [0u16; 6];
+        // SAFETY: the deliberately odd source address still names `expected.len()`
+        // complete little-endian BF16 words; the assembly leaf uses unaligned
+        // halfword loads and writes the aligned activation destination.
+        unsafe {
+            lfm_bf16_copy_bytes(
+                image.as_ptr().add(1).cast(),
+                actual.as_mut_ptr(),
+                actual.len(),
+            );
+        }
+        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -1640,6 +1759,92 @@ mod tests {
     }
 
     #[test]
+    fn direct_nk_gemm_streams_checkpoint_words_without_an_isa_fallback_copy() {
+        let engine = NativeEngine::new(4).expect("native engine init");
+        let bits = |values: &[f32]| {
+            values
+                .iter()
+                .map(|value| half::bf16::from_f32(*value).to_bits())
+                .collect::<Vec<_>>()
+        };
+        let a = bits(&[1.0, 2.0, 3.0, 4.0]);
+        let w_nk = bits(&[5.0, 8.0, 6.0, 9.0, 7.0, 10.0]);
+        let before = engine.snapshot();
+        let mut out = [0.0f32; 6];
+        assert!(engine.bf16_gemm_nt_direct_f32(&a, &w_nk, &mut out, 2, 3, 2));
+        assert_eq!(out, [21.0, 24.0, 27.0, 47.0, 54.0, 61.0]);
+        let after = engine.snapshot();
+        assert_eq!(after.pass_submissions - before.pass_submissions, 1);
+        assert_eq!(after.pass_completions - before.pass_completions, 1);
+        assert_eq!(after.bridge_dispatches - before.bridge_dispatches, 1);
+        assert_eq!(after.descriptors_live, 0);
+    }
+
+    #[test]
+    fn direct_nk_scalar_leaf_accepts_byte_unaligned_checkpoint_views() {
+        let pack = |values: &[f32]| {
+            let mut bytes = vec![0xa5];
+            for value in values {
+                bytes.extend_from_slice(&half::bf16::from_f32(*value).to_bits().to_le_bytes());
+            }
+            bytes
+        };
+        let a = pack(&[1.0, 2.0, 3.0, 4.0]);
+        let weights = pack(&[5.0, 8.0, 6.0, 9.0, 7.0, 10.0]);
+        let mut out = [0.0f32; 6];
+        // SAFETY: the leaf contract explicitly permits unaligned bf16 byte
+        // views. Both prefixed byte buffers contain the complete 2x2 and 3x2
+        // little-endian matrices after byte zero.
+        unsafe {
+            lfm_bf16_gemm_nt_f32_scalar(
+                a.as_ptr().add(1).cast(),
+                weights.as_ptr().add(1).cast(),
+                out.as_mut_ptr(),
+                2,
+                3,
+                2,
+            );
+        }
+        assert_eq!(out, [21.0, 24.0, 27.0, 47.0, 54.0, 61.0]);
+    }
+
+    #[test]
+    fn direct_nk_ticket_accepts_byte_unaligned_checkpoint_weights() {
+        let engine = NativeEngine::new(4).expect("native engine init");
+        let bits = |values: &[f32]| {
+            values
+                .iter()
+                .map(|value| half::bf16::from_f32(*value).to_bits())
+                .collect::<Vec<_>>()
+        };
+        let a = bits(&[1.0, 2.0, 3.0, 4.0]);
+        let mut storage = vec![0x5a];
+        for word in bits(&[5.0, 8.0, 6.0, 9.0, 7.0, 10.0]) {
+            storage.extend_from_slice(&word.to_le_bytes());
+        }
+        let mut out = [0.0f32; 6];
+        let _pass = engine.pass_lock.lock().unwrap();
+        // SAFETY: byte one starts a complete unaligned 3x2 little-endian BF16
+        // checkpoint view. The ticket retains all buffers until completion.
+        let status = unsafe {
+            lfm_engine_bf16_gemm_nt_direct_f32(
+                engine.ptr,
+                a.as_ptr(),
+                a.len(),
+                storage.as_ptr().add(1).cast(),
+                6,
+                out.as_mut_ptr(),
+                out.len(),
+                2,
+                3,
+                2,
+            )
+        };
+        assert_eq!(status, 0);
+        assert_eq!(out, [21.0, 24.0, 27.0, 47.0, 54.0, 61.0]);
+    }
+
+    #[test]
     fn typed_fft_grids_use_one_ticket_each() {
         let engine = NativeEngine::new(4).expect("native engine init");
         let (batch, channels, steps, fft) = (1usize, 2usize, 4usize, 8usize);
@@ -1872,6 +2077,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "oracle")]
     fn probe_candle_bf16_sum_ladder() {
         use candle_core::{DType, Device, Tensor};
         use half::bf16;
@@ -1928,6 +2134,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "oracle")]
     fn native_engine_attn_layer_bit_parity() {
         let _ctx = CTX_TEST_LOCK.lock().unwrap();
         use candle_core::{DType, Device, Tensor, D};
@@ -2470,6 +2677,400 @@ mod tests {
             "clearing one plan must leave the other resident"
         );
         engine.ctx_clear(second);
+    }
+
+    #[test]
+    fn multirow_prefill_matches_sequential_hidden_kv_and_shortconv_carry() {
+        use half::bf16;
+
+        fn weights(count: usize, seed: usize, scale: f32) -> Vec<u16> {
+            (0..count)
+                .map(|index| {
+                    let value = ((index.wrapping_mul(37).wrapping_add(seed * 17)) % 29) as i32 - 14;
+                    bf16::from_f32(value as f32 * scale).to_bits()
+                })
+                .collect()
+        }
+
+        fn norms(count: usize, seed: usize) -> Vec<u16> {
+            (0..count)
+                .map(|index| {
+                    let value = ((index + seed) % 7) as f32 - 3.0;
+                    bf16::from_f32(1.0 + value * 0.015625).to_bits()
+                })
+                .collect()
+        }
+
+        struct Memory {
+            keys: Vec<u16>,
+            values: Vec<u16>,
+            carry: Vec<u16>,
+            stride: usize,
+        }
+
+        impl Memory {
+            fn new(hidden: usize, kernel: usize, stride: usize) -> Self {
+                Self {
+                    keys: vec![0; stride],
+                    values: vec![0; stride],
+                    carry: vec![0; hidden * (kernel - 1)],
+                    stride,
+                }
+            }
+
+            fn views(&mut self) -> [LayerState; 2] {
+                [
+                    LayerState {
+                        k_plane: self.keys.as_mut_ptr(),
+                        v_plane: self.values.as_mut_ptr(),
+                        head_stride: self.stride,
+                        k_len: self.keys.len(),
+                        v_len: self.values.len(),
+                        ..LayerState::none()
+                    },
+                    LayerState {
+                        conv_state: self.carry.as_mut_ptr(),
+                        conv_len: self.carry.len(),
+                        ..LayerState::none()
+                    },
+                ]
+            }
+        }
+
+        let _guard = CTX_TEST_LOCK.lock().unwrap();
+        let engine = NativeEngine::new(4).expect("native engine init");
+        let (h, ffn, max_ctx, kernel) = (32usize, 48usize, 16usize, 3usize);
+        let (nh, nkv, hd, vocab) = (4usize, 1usize, 8usize, 8usize);
+        let qrows = nh * hd;
+        let kvrows = nkv * hd;
+
+        let op0 = norms(h, 1);
+        let fn0 = norms(h, 2);
+        let q = weights(qrows * h, 3, 0.03125);
+        let k = weights(kvrows * h, 4, 0.03125);
+        let v = weights(kvrows * h, 5, 0.03125);
+        let o = weights(h * qrows, 6, 0.03125);
+        let qn = norms(hd, 3);
+        let kn = norms(hd, 4);
+        let aw1 = weights(ffn * h, 7, 0.0234375);
+        let aw3 = weights(ffn * h, 8, 0.0234375);
+        let aw2 = weights(h * ffn, 9, 0.0234375);
+
+        let op1 = norms(h, 5);
+        let fn1 = norms(h, 6);
+        let input = weights(3 * h * h, 10, 0.0234375);
+        let conv = weights(h * kernel, 11, 0.0625);
+        let output = weights(h * h, 12, 0.03125);
+        let cw1 = weights(ffn * h, 13, 0.0234375);
+        let cw3 = weights(ffn * h, 14, 0.0234375);
+        let cw2 = weights(h * ffn, 15, 0.0234375);
+
+        let descs = [
+            LayerDesc {
+                kind: 1,
+                op_eps: 1e-5,
+                ffn_eps: 1e-5,
+                op_norm_w: op0.as_ptr(),
+                ffn_norm_w: fn0.as_ptr(),
+                w1: aw1.as_ptr(),
+                w3: aw3.as_ptr(),
+                w2: aw2.as_ptr(),
+                n_head: nh as u32,
+                n_kv: nkv as u32,
+                hd: hd as u32,
+                qk_eps: 1e-5,
+                q_w: q.as_ptr(),
+                k_w: k.as_ptr(),
+                v_w: v.as_ptr(),
+                o_w: o.as_ptr(),
+                qn_w: qn.as_ptr(),
+                kn_w: kn.as_ptr(),
+                ..LayerDesc::attn_placeholder()
+            },
+            LayerDesc {
+                kind: 0,
+                k: kernel as u32,
+                op_eps: 1e-5,
+                ffn_eps: 1e-5,
+                op_norm_w: op1.as_ptr(),
+                ffn_norm_w: fn1.as_ptr(),
+                in_w: input.as_ptr(),
+                conv_w: conv.as_ptr(),
+                out_w: output.as_ptr(),
+                w1: cw1.as_ptr(),
+                w3: cw3.as_ptr(),
+                w2: cw2.as_ptr(),
+                ..LayerDesc::attn_placeholder()
+            },
+        ];
+        let id = engine
+            .ctx_build(&descs, h, ffn, max_ctx)
+            .expect("mixed plan build");
+        let embed = weights(vocab * h, 16, 0.078125);
+        let final_norm = norms(h, 7);
+        assert!(unsafe {
+            engine.set_heads(
+                id,
+                embed.as_ptr(),
+                embed.len(),
+                vocab,
+                std::ptr::null(),
+                0,
+                0,
+                final_norm.as_ptr(),
+                final_norm.len(),
+                1e-5,
+            )
+        });
+
+        let mut workspace = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { lfm_engine_prefill_workspace_create(engine.ptr, id, &mut workspace) },
+            0
+        );
+        assert!(!workspace.is_null());
+
+        let cosine = (0..max_ctx * hd / 2)
+            .map(|index| bf16::from_f32(0.875 + (index % 3) as f32 * 0.03125).to_bits())
+            .collect::<Vec<_>>();
+        let sine = (0..max_ctx * hd / 2)
+            .map(|index| bf16::from_f32((index % 5) as f32 * 0.015625).to_bits())
+            .collect::<Vec<_>>();
+        let ids = [1u32, 3, 2, 5, 4, 6, 0];
+        let stride = max_ctx * hd;
+
+        let mut sequential = Memory::new(h, kernel, stride);
+        let sequential_states = sequential.views();
+        let mut hidden = vec![0u16; h];
+        let mut hidden_steps = Vec::new();
+        let mut state_steps = Vec::new();
+        let sampler = SampleConfig::new(Some(0.8), Some(5));
+        let mut sequential_prng = PrngState::from_seed(0x5eed).expect("sequential seed");
+        let mut sequential_token = u32::MAX;
+        for (position, token) in ids.iter().enumerate() {
+            let sample = position + 1 == ids.len();
+            assert_eq!(
+                unsafe {
+                    lfm_engine_token_pass(
+                        engine.ptr,
+                        id,
+                        token,
+                        1,
+                        0,
+                        sequential_states.as_ptr(),
+                        sequential_states.len(),
+                        position,
+                        cosine.as_ptr(),
+                        sine.as_ptr(),
+                        cosine.len(),
+                        hidden.as_mut_ptr(),
+                        hidden.len(),
+                        std::ptr::null_mut(),
+                        0,
+                        if sample { &sampler } else { std::ptr::null() },
+                        if sample {
+                            &mut sequential_prng
+                        } else {
+                            std::ptr::null_mut()
+                        },
+                        if sample {
+                            &mut sequential_token
+                        } else {
+                            std::ptr::null_mut()
+                        },
+                        4,
+                        std::ptr::null(),
+                    )
+                },
+                0
+            );
+            hidden_steps.push(hidden.clone());
+            state_steps.push((
+                sequential.keys.clone(),
+                sequential.values.clone(),
+                sequential.carry.clone(),
+            ));
+        }
+
+        for count in 1..=4 {
+            let mut batched = Memory::new(h, kernel, stride);
+            let batched_states = batched.views();
+            let mut got = vec![0u16; h];
+            assert_eq!(
+                unsafe {
+                    lfm_engine_prefill(
+                        engine.ptr,
+                        id,
+                        workspace,
+                        ids.as_ptr(),
+                        std::ptr::null(),
+                        count,
+                        0,
+                        batched_states.as_ptr(),
+                        batched_states.len(),
+                        0,
+                        cosine.as_ptr(),
+                        sine.as_ptr(),
+                        cosine.len(),
+                        got.as_mut_ptr(),
+                        got.len(),
+                        std::ptr::null(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        4,
+                    )
+                },
+                0
+            );
+            assert_eq!(got, hidden_steps[count - 1], "text hidden, M={count}");
+            assert_eq!(batched.keys, state_steps[count - 1].0, "text K, M={count}");
+            assert_eq!(
+                batched.values,
+                state_steps[count - 1].1,
+                "text V, M={count}"
+            );
+            assert_eq!(
+                batched.carry,
+                state_steps[count - 1].2,
+                "text carry, M={count}"
+            );
+        }
+
+        let mut chunked = Memory::new(h, kernel, stride);
+        let chunked_states = chunked.views();
+        let mut chunked_hidden = vec![0u16; h];
+        let mut chunked_prng = PrngState::from_seed(0x5eed).expect("chunked seed");
+        let mut chunked_token = u32::MAX;
+        let submissions = engine.snapshot().pass_submissions;
+        for (position, chunk) in [(0usize, &ids[..4]), (4, &ids[4..])] {
+            let sample = position + chunk.len() == ids.len();
+            assert_eq!(
+                unsafe {
+                    lfm_engine_prefill(
+                        engine.ptr,
+                        id,
+                        workspace,
+                        chunk.as_ptr(),
+                        std::ptr::null(),
+                        chunk.len(),
+                        0,
+                        chunked_states.as_ptr(),
+                        chunked_states.len(),
+                        position,
+                        cosine.as_ptr(),
+                        sine.as_ptr(),
+                        cosine.len(),
+                        chunked_hidden.as_mut_ptr(),
+                        chunked_hidden.len(),
+                        if sample { &sampler } else { std::ptr::null() },
+                        if sample {
+                            &mut chunked_prng
+                        } else {
+                            std::ptr::null_mut()
+                        },
+                        if sample {
+                            &mut chunked_token
+                        } else {
+                            std::ptr::null_mut()
+                        },
+                        4,
+                    )
+                },
+                0
+            );
+        }
+        assert_eq!(engine.snapshot().pass_submissions, submissions + 2);
+        assert_eq!(
+            chunked_hidden,
+            *hidden_steps.last().unwrap(),
+            "text 4+3 hidden"
+        );
+        assert_eq!(chunked.keys, state_steps.last().unwrap().0, "text 4+3 K");
+        assert_eq!(chunked.values, state_steps.last().unwrap().1, "text 4+3 V");
+        assert_eq!(
+            chunked.carry,
+            state_steps.last().unwrap().2,
+            "text 4+3 carry"
+        );
+        assert_eq!(chunked_token, sequential_token, "text 4+3 sampled token");
+
+        let provided = weights(ids.len() * h, 23, 0.09375);
+        let mut sequential = Memory::new(h, kernel, stride);
+        let sequential_states = sequential.views();
+        let mut want = vec![0u16; h];
+        for position in 0..ids.len() {
+            assert_eq!(
+                unsafe {
+                    lfm_engine_token_pass(
+                        engine.ptr,
+                        id,
+                        ids.as_ptr(),
+                        1,
+                        2,
+                        sequential_states.as_ptr(),
+                        sequential_states.len(),
+                        position,
+                        cosine.as_ptr(),
+                        sine.as_ptr(),
+                        cosine.len(),
+                        want.as_mut_ptr(),
+                        want.len(),
+                        std::ptr::null_mut(),
+                        0,
+                        std::ptr::null(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        4,
+                        provided.as_ptr().add(position * h),
+                    )
+                },
+                0
+            );
+        }
+        let mut batched = Memory::new(h, kernel, stride);
+        let batched_states = batched.views();
+        let mut got = vec![0u16; h];
+        let submissions = engine.snapshot().pass_submissions;
+        for (position, range) in [(0usize, 0..4), (4, 4..ids.len())] {
+            assert_eq!(
+                unsafe {
+                    lfm_engine_prefill(
+                        engine.ptr,
+                        id,
+                        workspace,
+                        std::ptr::null(),
+                        provided.as_ptr().add(range.start * h),
+                        range.len(),
+                        2,
+                        batched_states.as_ptr(),
+                        batched_states.len(),
+                        position,
+                        cosine.as_ptr(),
+                        sine.as_ptr(),
+                        cosine.len(),
+                        got.as_mut_ptr(),
+                        got.len(),
+                        std::ptr::null(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        4,
+                    )
+                },
+                0
+            );
+        }
+        assert_eq!(
+            engine.snapshot().pass_submissions,
+            submissions + 2,
+            "seven provided rows must use exactly an M=4 ticket plus its tail"
+        );
+        assert_eq!(got, want, "provided-row hidden");
+        assert_eq!(batched.keys, sequential.keys, "provided-row K");
+        assert_eq!(batched.values, sequential.values, "provided-row V");
+        assert_eq!(batched.carry, sequential.carry, "provided-row carry");
+
+        unsafe { lfm_engine_prefill_workspace_destroy(workspace) };
+        engine.ctx_clear(id);
     }
 
     #[test]

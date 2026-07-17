@@ -4,6 +4,7 @@ members = [
     "crates/kcoro",
     "crates/kcoro-sys",
     "crates/liquid-audio",
+    "crates/liquid-audio-oracle",
 ]
 exclude = ["packages/desktop/src-tauri"]
 resolver = "2"

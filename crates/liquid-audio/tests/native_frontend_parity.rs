@@ -1,3 +1,5 @@
+#![cfg(feature = "oracle")]
+
 //! Native frontend parity gate: the native mel featurizer and resampler versus
 //! the fixtures captured from the deleted Rust implementation
 //! (native/tests/fixtures/{mel,resample}/, working tree e018540c).
@@ -13,9 +15,107 @@
 
 use liquid_audio::processor::{FilterbankFeatures, MelConfig};
 
+#[repr(C)]
+struct NativeFrontend {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
+struct NativeFrontendWorkspace {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
+struct NativeResampler {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
+struct NativeResamplerWorkspace {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
+struct NativeFrontendConfig {
+    size: u32,
+    abi_version: u32,
+    sample_rate: u32,
+    n_window_size: u32,
+    n_window_stride: u32,
+    n_fft: u32,
+    nfilt: u32,
+    exact_pad: u32,
+    pad_to: u32,
+    reserved0: u32,
+    preemph: f64,
+    log_zero_guard_value: f64,
+    mag_power: f64,
+    reserved: [u64; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct NativeF32Span {
+    data: *const f32,
+    length: u64,
+}
+
+const FRONTEND_ABI: u32 = 1;
+const VALID_ONLY: u32 = 1;
+const BF16_OUTPUT: u32 = 2;
+
 unsafe extern "C" {
     fn lfm_preemph_f32(x: *const f32, y: *mut f32, n: u64, coef: f32) -> i32;
     fn lfm_power_spec_f32(re: *const f32, im: *const f32, out: *mut f32, n: u64);
+    fn lfm_frontend_create(
+        config: *const NativeFrontendConfig,
+        out: *mut *mut NativeFrontend,
+    ) -> i32;
+    fn lfm_frontend_destroy(frontend: *mut NativeFrontend) -> i32;
+    fn lfm_frontend_workspace_create(out: *mut *mut NativeFrontendWorkspace) -> i32;
+    fn lfm_frontend_workspace_destroy(workspace: *mut NativeFrontendWorkspace) -> i32;
+    fn lfm_frontend_workspace_reserve(
+        frontend: *const NativeFrontend,
+        workspace: *mut NativeFrontendWorkspace,
+        max_sample_count: u64,
+        flags: u32,
+    ) -> i32;
+    fn lfm_frontend_seq_len(frontend: *const NativeFrontend, sample_count: u64) -> u64;
+    fn lfm_frontend_forward_workspace(
+        frontend: *const NativeFrontend,
+        workspace: *mut NativeFrontendWorkspace,
+        pcm: *const f32,
+        sample_count: u64,
+        out_mel: *mut f32,
+        out_capacity_values: u64,
+        flags: u32,
+    ) -> i32;
+    fn lfm_frontend_forward_bf16_workspace(
+        frontend: *const NativeFrontend,
+        workspace: *mut NativeFrontendWorkspace,
+        pcm: *const f32,
+        sample_count: u64,
+        out_mel: *mut u16,
+        out_capacity_values: u64,
+    ) -> i32;
+    fn lfm_resampler_create(orig_freq: u32, new_freq: u32, out: *mut *mut NativeResampler) -> i32;
+    fn lfm_resampler_destroy(resampler: *mut NativeResampler) -> i32;
+    fn lfm_resampler_workspace_create(out: *mut *mut NativeResamplerWorkspace) -> i32;
+    fn lfm_resampler_workspace_destroy(workspace: *mut NativeResamplerWorkspace) -> i32;
+    fn lfm_resampler_workspace_reserve(
+        resampler: *const NativeResampler,
+        workspace: *mut NativeResamplerWorkspace,
+        max_sample_count: u64,
+    ) -> i32;
+    fn lfm_resampler_process(
+        resampler: *const NativeResampler,
+        workspace: *mut NativeResamplerWorkspace,
+        input: *const f32,
+        sample_count: u64,
+        destination: *mut f32,
+        destination_capacity: u64,
+        result: *mut NativeF32Span,
+    ) -> i32;
 }
 
 fn fixture_dir(sub: &str) -> std::path::PathBuf {
@@ -60,6 +160,25 @@ fn cfg_b() -> MelConfig {
         pad_to: 16,
         exact_pad: true,
         ..cfg_a()
+    }
+}
+
+fn native_cfg(cfg: &MelConfig) -> NativeFrontendConfig {
+    NativeFrontendConfig {
+        size: std::mem::size_of::<NativeFrontendConfig>() as u32,
+        abi_version: FRONTEND_ABI,
+        sample_rate: cfg.sample_rate as u32,
+        n_window_size: cfg.n_window_size as u32,
+        n_window_stride: cfg.n_window_stride as u32,
+        n_fft: cfg.n_fft as u32,
+        nfilt: cfg.nfilt as u32,
+        exact_pad: cfg.exact_pad as u32,
+        pad_to: cfg.pad_to as u32,
+        reserved0: 0,
+        preemph: cfg.preemph,
+        log_zero_guard_value: cfg.log_zero_guard_value,
+        mag_power: cfg.mag_power,
+        reserved: [0; 4],
     }
 }
 
@@ -300,4 +419,201 @@ fn aliased_frontend_leaves_match_disjoint_outputs() {
         expected.map(f32::to_bits),
         "power must support exact out == re aliasing"
     );
+}
+
+#[test]
+fn prepared_resampler_borrows_equal_rate_and_writes_different_rate_directly() {
+    let input = read_f32(&fixture_dir("resample").join("input_ramp24_to16.bin"));
+
+    unsafe {
+        let mut same = std::ptr::null_mut();
+        assert_eq!(lfm_resampler_create(16_000, 16_000, &mut same), 0);
+        let mut same_ws = std::ptr::null_mut();
+        assert_eq!(lfm_resampler_workspace_create(&mut same_ws), 0);
+        assert_eq!(
+            lfm_resampler_workspace_reserve(same, same_ws, input.len() as u64),
+            0
+        );
+        let mut borrowed = NativeF32Span {
+            data: std::ptr::null(),
+            length: 0,
+        };
+        assert_eq!(
+            lfm_resampler_process(
+                same,
+                same_ws,
+                input.as_ptr(),
+                input.len() as u64,
+                std::ptr::null_mut(),
+                0,
+                &mut borrowed,
+            ),
+            0
+        );
+        assert_eq!(
+            borrowed.data,
+            input.as_ptr(),
+            "equal-rate PCM must alias input"
+        );
+        assert_eq!(borrowed.length as usize, input.len());
+        assert_eq!(lfm_resampler_workspace_destroy(same_ws), 0);
+        assert_eq!(lfm_resampler_destroy(same), 0);
+
+        let want = read_f32(&fixture_dir("resample").join("output_ramp24_to16.bin"));
+        let mut down = std::ptr::null_mut();
+        assert_eq!(lfm_resampler_create(24_000, 16_000, &mut down), 0);
+        let mut down_ws = std::ptr::null_mut();
+        assert_eq!(lfm_resampler_workspace_create(&mut down_ws), 0);
+        assert_eq!(
+            lfm_resampler_workspace_reserve(down, down_ws, input.len() as u64),
+            0
+        );
+        let mut output = vec![f32::NAN; want.len()];
+        let mut written = NativeF32Span {
+            data: std::ptr::null(),
+            length: 0,
+        };
+        assert_eq!(
+            lfm_resampler_process(
+                down,
+                down_ws,
+                input.as_ptr(),
+                input.len() as u64,
+                output.as_mut_ptr(),
+                output.len() as u64,
+                &mut written,
+            ),
+            0
+        );
+        assert_eq!(
+            written.data,
+            output.as_ptr(),
+            "resample must publish destination"
+        );
+        assert_eq!(written.length as usize, want.len());
+        for (got, expected) in output.iter().zip(&want) {
+            #[cfg(target_arch = "aarch64")]
+            assert_eq!(got.to_bits(), expected.to_bits());
+            #[cfg(not(target_arch = "aarch64"))]
+            assert!((*got - *expected).abs() <= 1e-9);
+        }
+
+        // 100 * 2/3 -> 67 exercises a partial final phase block. The assembly
+        // leaf must stop at the exact destination value count and preserve the
+        // adjacent canary (the removed staging plane used to hide this edge).
+        let mut partial = vec![0.0f32; 68];
+        partial[67] = f32::from_bits(0x7f12_3456);
+        assert_eq!(
+            lfm_resampler_process(
+                down,
+                down_ws,
+                input.as_ptr(),
+                100,
+                partial.as_mut_ptr(),
+                67,
+                &mut written,
+            ),
+            0
+        );
+        assert_eq!(written.length, 67);
+        assert_eq!(partial[67].to_bits(), 0x7f12_3456);
+
+        // Execution is strict: a larger unreserved command is rejected rather
+        // than growing the workspace in the hot call.
+        let larger = vec![0.0f32; input.len() * 2];
+        let mut larger_out = vec![0.0f32; want.len() * 2];
+        assert_ne!(
+            lfm_resampler_process(
+                down,
+                down_ws,
+                larger.as_ptr(),
+                larger.len() as u64,
+                larger_out.as_mut_ptr(),
+                larger_out.len() as u64,
+                &mut written,
+            ),
+            0,
+            "unprepared resample must not allocate"
+        );
+        assert_eq!(lfm_resampler_workspace_destroy(down_ws), 0);
+        assert_eq!(lfm_resampler_destroy(down), 0);
+    }
+}
+
+#[test]
+fn prepared_frontend_rounds_directly_into_bf16_destination() {
+    let cfg = cfg_a();
+    let native = native_cfg(&cfg);
+    let input = read_f32(&fixture_dir("mel").join("input_tone440_8000.bin"));
+    unsafe {
+        let mut frontend = std::ptr::null_mut();
+        assert_eq!(lfm_frontend_create(&native, &mut frontend), 0);
+        let mut workspace = std::ptr::null_mut();
+        assert_eq!(lfm_frontend_workspace_create(&mut workspace), 0);
+        assert_eq!(
+            lfm_frontend_workspace_reserve(
+                frontend,
+                workspace,
+                input.len() as u64,
+                VALID_ONLY | BF16_OUTPUT,
+            ),
+            0
+        );
+        let frames = lfm_frontend_seq_len(frontend, input.len() as u64) as usize;
+        let values = cfg.nfilt * frames;
+        let mut direct = vec![0u16; values];
+        assert_eq!(
+            lfm_frontend_forward_bf16_workspace(
+                frontend,
+                workspace,
+                input.as_ptr(),
+                input.len() as u64,
+                direct.as_mut_ptr(),
+                direct.len() as u64,
+            ),
+            0
+        );
+
+        // The BF16 run's larger alias layout also admits the f32 parity run.
+        // Both execute without changing workspace capacity.
+        let mut f32s = vec![0.0f32; values];
+        assert_eq!(
+            lfm_frontend_forward_workspace(
+                frontend,
+                workspace,
+                input.as_ptr(),
+                input.len() as u64,
+                f32s.as_mut_ptr(),
+                f32s.len() as u64,
+                VALID_ONLY,
+            ),
+            0
+        );
+        let expected: Vec<u16> = f32s
+            .iter()
+            .map(|value| half::bf16::from_f32(*value).to_bits())
+            .collect();
+        assert_eq!(
+            direct, expected,
+            "direct BF16 seam must round final mel exactly"
+        );
+
+        let larger = vec![0.0f32; input.len() * 2];
+        let larger_frames = lfm_frontend_seq_len(frontend, larger.len() as u64) as usize;
+        let mut larger_out = vec![0u16; cfg.nfilt * larger_frames];
+        assert_ne!(
+            lfm_frontend_forward_bf16_workspace(
+                frontend,
+                workspace,
+                larger.as_ptr(),
+                larger.len() as u64,
+                larger_out.as_mut_ptr(),
+                larger_out.len() as u64,
+            ),
+            0,
+            "unprepared frontend command must not allocate"
+        );
+        assert_eq!(lfm_frontend_workspace_destroy(workspace), 0);
+        assert_eq!(lfm_frontend_destroy(frontend), 0);
+    }
 }

@@ -34,6 +34,21 @@ pub struct ModelInfo {
     pub max_context: u32,
     pub codebooks: u32,
     pub depthformer: bool,
+    pub frontend: bool,
+    pub conformer: bool,
+    pub mimi: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelMemory {
+    pub source_bytes: u64,
+    pub resident_image_bytes: u64,
+    pub directly_bound_bytes: u64,
+    pub derived_immutable_bytes: u64,
+    pub compatibility_copied_bytes: u64,
+    pub load_ns: u64,
+    pub load_workers: u32,
+    pub load_tasks: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -130,7 +145,32 @@ impl NativeModel {
             vocab: raw.vocab,
             max_context: raw.max_context,
             codebooks: raw.codebooks,
-            depthformer: raw.depth_plan_id != 0,
+            depthformer: raw.capabilities & ffi::MODEL_CAP_DEPTHFORMER != 0,
+            frontend: raw.capabilities & ffi::MODEL_CAP_FRONTEND != 0,
+            conformer: raw.capabilities & ffi::MODEL_CAP_CONFORMER != 0,
+            mimi: raw.capabilities & ffi::MODEL_CAP_MIMI != 0,
+        })
+    }
+
+    pub fn memory(&self) -> Result<ModelMemory, NativeError> {
+        let mut raw = ffi::ModelMemory {
+            size: std::mem::size_of::<ffi::ModelMemory>() as u32,
+            abi_version: ffi::ABI,
+            ..Default::default()
+        };
+        let status = unsafe { ffi::lfm_model_memory(self.0 .0.as_ptr(), &mut raw) };
+        if status != 0 {
+            return Err(status_error(status, "native model memory query failed"));
+        }
+        Ok(ModelMemory {
+            source_bytes: raw.source_bytes,
+            resident_image_bytes: raw.resident_image_bytes,
+            directly_bound_bytes: raw.directly_bound_bytes,
+            derived_immutable_bytes: raw.derived_immutable_bytes,
+            compatibility_copied_bytes: raw.compatibility_copied_bytes,
+            load_ns: raw.load_ns,
+            load_workers: raw.load_workers,
+            load_tasks: raw.load_tasks,
         })
     }
 
@@ -227,24 +267,21 @@ impl NativeConversation {
         })
     }
 
-    /// Prefill continuous audio-in embedding rows (the Conformer/adapter output,
-    /// `[row_count, hidden]` bf16, `row_count = rows.len() / hidden`) into KV via
-    /// the native provided-embedding pass — C++ owns the loop. `rows` is a
-    /// borrowed view the caller keeps alive across the call; nothing is copied.
-    /// Returns the new position.
-    pub fn prefill_audio(&mut self, rows: &[u16], hidden: usize) -> Result<u64, NativeError> {
-        if hidden == 0 || rows.is_empty() || rows.len() % hidden != 0 {
-            return Err(status_error(
-                -22,
-                "prefill_audio: rows not a positive multiple of hidden",
-            ));
+    /// Prefill continuous audio-in embedding rows (the Conformer/adapter output)
+    /// into KV via the native provided-embedding pass. Rust supplies only the flat
+    /// bf16 span; C++ derives row geometry from the model and rejects a partial
+    /// row. The caller keeps `rows` alive across this synchronous borrowed-view
+    /// call; nothing is copied. Returns the new position.
+    pub fn prefill_audio(&mut self, rows: &[u16]) -> Result<u64, NativeError> {
+        if rows.is_empty() {
+            return Err(status_error(-22, "prefill_audio: rows are empty"));
         }
         let mut position = 0u64;
         let status = unsafe {
             ffi::lfm_conversation_prefill_audio(
                 self.pointer.as_ptr(),
                 rows.as_ptr(),
-                rows.len() / hidden,
+                rows.len(),
                 &mut position,
             )
         };

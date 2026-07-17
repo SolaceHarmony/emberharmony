@@ -8,6 +8,7 @@
 //! fixtures under native/tests/fixtures/resample/ (captured from the deleted
 //! implementation).
 
+#[cfg(feature = "oracle")]
 use candle_core::{DType, Result, Tensor};
 
 unsafe extern "C" {
@@ -24,6 +25,7 @@ unsafe extern "C" {
 
 /// `torchaudio.functional.resample(wave, orig_freq, new_freq)` with the library
 /// defaults. `wave` is `(1, L)` → `(1, L')` f32 with `L' = ceil(L * new/orig)`.
+#[cfg(feature = "oracle")]
 pub fn resample(wave: &Tensor, orig_freq: u32, new_freq: u32) -> Result<Tensor> {
     if orig_freq == 0 || new_freq == 0 {
         return Err(candle_core::Error::Msg(format!(
@@ -101,6 +103,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "oracle")]
     fn rejects_zero_sample_rate() {
         let x = Tensor::from_vec(vec![0.0f32, 1.0], (1, 2), &candle_core::Device::Cpu).unwrap();
         let err = resample(&x, 0, 16_000).unwrap_err().to_string();

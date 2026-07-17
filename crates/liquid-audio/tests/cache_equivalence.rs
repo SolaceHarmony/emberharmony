@@ -1,3 +1,5 @@
+#![cfg(feature = "oracle")]
+
 //! Cache-equivalence invariant (spec 09, W2a): the persistent cross-turn KV cache
 //! must be a pure accelerator. Kept after the Python-parity suite was retired —
 //! this guards OUR contract (suffix prefill + carried cache == full re-prefill),

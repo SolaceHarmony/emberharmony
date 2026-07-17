@@ -76,7 +76,7 @@ export const SettingsVoice: Component = () => {
   const effectiveUrl = () => url() ?? voice().livekit.url ?? (!desktop ? config()?.url : undefined) ?? ""
   const voice = (): VoiceSettings => tauriVoice()?.settings ?? defaultVoiceSettings
   const lfm2 = (): Lfm2Settings => voice().lfm2
-  const localEngine = (): VoiceEngineMode => lfm2().engine ?? "moshiRealtime"
+  const localEngine = (): VoiceEngineMode => lfm2().engine ?? "lfm2Interleaved"
   const modelDirValue = () => modelDirEdit() ?? lfm2().modelDir ?? ""
   const moshiModelDirValue = () => moshiModelDirEdit() ?? lfm2().moshiModelDir ?? ""
   const selectedModelDirValue = () => (localEngine() === "moshiRealtime" ? moshiModelDirValue() : modelDirValue())

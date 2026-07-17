@@ -24,7 +24,9 @@ use std::thread::JoinHandle;
 
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 
+#[cfg(feature = "oracle")]
 use crate::moshi::models::compression::MimiModel;
+pub use crate::voice_api::{FrameConfig, Utterance, VoiceEngine, VoiceEvent};
 
 #[cfg(test)]
 const MIMI_RATE: u32 = 24_000; // Mimi/LFM2 detokenizer output rate.
@@ -141,128 +143,6 @@ fn try_send_event(tx: &Sender<VoiceEvent>, ev: VoiceEvent, cancel: &AtomicBool) 
     events.emit(ev)
 }
 
-/// A captured user utterance handed to the worker: mono f32 samples + their sample rate.
-pub struct Utterance {
-    pub samples: Vec<f32>,
-    pub rate: u32,
-}
-
-/// Fixed-rate frame contract for models that are truly realtime.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FrameConfig {
-    pub sample_rate: u32,
-    pub frame_size: usize,
-}
-
-/// One streamed reply item the worker emits — the Rust analog of `chat.py`'s `q.put`.
-#[derive(Debug, Clone, PartialEq)]
-pub enum VoiceEvent {
-    /// A decoded text fragment (one or more detokenized text tokens).
-    Text(String),
-    /// A decoded PCM chunk (mono f32) at the pipeline's output rate.
-    /// One decoded PCM chunk. `rate` is the ACTUAL sample rate of `pcm` —
-    /// carried on every hand-off so no consumer re-asserts a constant it
-    /// merely believes (the half-speed-rumble bug class: producer and
-    /// consumer agreeing by coincidence until one side changes).
-    Audio { pcm: Vec<f32>, rate: u32 },
-    /// The reply for the current utterance finished normally (`chat.py`'s `q.put(None)`).
-    /// Frame-fed Moshi pipelines do not synthesize this on silence; the stream is continuous.
-    TurnComplete,
-    /// The reply/output stream was cut short by an explicit interrupt.
-    Interrupted,
-    /// The engine errored on this turn. The worker stays alive for the next utterance.
-    Error(String),
-}
-
-/// The model side of the pipeline, abstracted so the worker-thread machinery can be
-/// exercised with a fake. The real implementation ([`Lfm2VoiceEngine`]) owns the model +
-/// processor + detokenizer; it must be `Send` to move onto the worker thread.
-pub trait VoiceEngine: Send {
-    /// Respond to one utterance, calling `emit` for each [`VoiceEvent`] in order. Poll
-    /// `cancel` frequently and return `Ok(false)` promptly once it is set (barge-in);
-    /// return `Ok(true)` when the reply ran to completion. `Err` is surfaced as
-    /// [`VoiceEvent::Error`] and does not kill the worker.
-    fn respond(
-        &mut self,
-        utt: &Utterance,
-        cancel: &AtomicBool,
-        emit: &mut dyn FnMut(VoiceEvent),
-    ) -> Result<bool, String>;
-
-    /// Realtime engines advertise this to bypass utterance/VAD batching and receive exact
-    /// PCM frames continuously, matching upstream Moshi's sounddevice/WebRTC loop.
-    fn frame_config(&self) -> Option<FrameConfig> {
-        None
-    }
-
-    /// Process one fixed-size realtime PCM frame. Returning `Ok(false)` reports an
-    /// interruption to the event stream; ordinary realtime silence should return `Ok(true)`.
-    fn respond_frame(
-        &mut self,
-        _frame: &[f32],
-        _cancel: &AtomicBool,
-        _emit: &mut dyn FnMut(VoiceEvent),
-    ) -> Result<bool, String> {
-        Err("voice engine does not support realtime PCM frames".into())
-    }
-
-    /// Handle a hard pipeline interrupt/reset. Turn pipelines call this when aborting a
-    /// generated turn; frame pipelines deliberately skip it for soft output interrupts
-    /// so Moshi keeps its Mimi/LM stream state alive. The default only acknowledges it.
-    fn interrupt_stream(&mut self) -> Result<(), String> {
-        Ok(())
-    }
-
-    /// Optional speculative prefill: the VAD calls this when the user PAUSES —
-    /// before the pause has lasted long enough to commit as a turn end — so the
-    /// engine can prefill the utterance while the silence window runs out. A later
-    /// [`Self::respond`] with the identical utterance skips straight to generation.
-    /// Best-effort: engines without a prefill notion ignore it.
-    fn prepare(&mut self, _utt: &Utterance) -> Result<(), String> {
-        Ok(())
-    }
-
-    /// Drop any speculative prefill state (the pause was not a turn end — speech
-    /// resumed). Must restore the engine to exactly the state before `prepare`.
-    fn discard_prepared(&mut self) {}
-}
-
-impl<T: VoiceEngine + ?Sized> VoiceEngine for Box<T> {
-    fn respond(
-        &mut self,
-        utt: &Utterance,
-        cancel: &AtomicBool,
-        emit: &mut dyn FnMut(VoiceEvent),
-    ) -> Result<bool, String> {
-        (**self).respond(utt, cancel, emit)
-    }
-
-    fn frame_config(&self) -> Option<FrameConfig> {
-        (**self).frame_config()
-    }
-
-    fn prepare(&mut self, utt: &Utterance) -> Result<(), String> {
-        (**self).prepare(utt)
-    }
-
-    fn discard_prepared(&mut self) {
-        (**self).discard_prepared()
-    }
-
-    fn respond_frame(
-        &mut self,
-        frame: &[f32],
-        cancel: &AtomicBool,
-        emit: &mut dyn FnMut(VoiceEvent),
-    ) -> Result<bool, String> {
-        (**self).respond_frame(frame, cancel, emit)
-    }
-
-    fn interrupt_stream(&mut self) -> Result<(), String> {
-        (**self).interrupt_stream()
-    }
-}
-
 enum FrameCommand {
     Pcm { pcm: Vec<f32>, epoch: u64 },
     Interrupt { epoch: u64 },
@@ -298,6 +178,7 @@ pub struct RealtimePipeline {
     utt_tx: Option<Sender<QueuedUtterance>>,
     ctl_tx: Option<Sender<Control>>,
     signals: WorkerSignals,
+    interrupt: Option<Arc<dyn Fn() + Send + Sync>>,
     event_rx: Receiver<VoiceEvent>,
     worker: Option<JoinHandle<()>>,
 }
@@ -309,6 +190,7 @@ pub struct RealtimePipelineHandle {
     ctl_tx: Sender<Control>,
     cancel: Arc<AtomicBool>,
     epoch: Arc<AtomicU64>,
+    interrupt: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl RealtimePipelineHandle {
@@ -342,6 +224,9 @@ impl RealtimePipelineHandle {
     /// Request barge-in: abort the in-flight reply.
     pub fn interrupt(&self) {
         interrupt_epoch(&self.cancel, &self.epoch);
+        if let Some(interrupt) = self.interrupt.as_ref() {
+            interrupt();
+        }
     }
 }
 
@@ -500,6 +385,7 @@ impl RealtimePipeline {
         // cancel flag first; if this slot is still full, the caller gets backpressure instead
         // of silently growing latency. Speculative Prepare/Discard ride their own channel so
         // they can never occupy the utterance slot.
+        let interrupt = engine.interrupt_signal();
         let (utt_tx, utt_rx) = bounded::<QueuedUtterance>(UTTERANCE_QUEUE_CAP);
         let (ctl_tx, ctl_rx) = bounded::<Control>(CONTROL_QUEUE_CAP);
         let (shutdown_tx, shutdown_rx) = bounded::<()>(0);
@@ -615,6 +501,7 @@ impl RealtimePipeline {
             utt_tx: Some(utt_tx),
             ctl_tx: Some(ctl_tx),
             signals,
+            interrupt,
             event_rx,
             worker: Some(worker),
         })
@@ -661,6 +548,9 @@ impl RealtimePipeline {
     /// submitting the interrupting utterance.
     pub fn interrupt(&self) {
         self.signals.interrupt();
+        if let Some(interrupt) = self.interrupt.as_ref() {
+            interrupt();
+        }
     }
 
     /// The stream of reply events; drain it in the consumer (UI / playback feeder).
@@ -676,6 +566,7 @@ impl RealtimePipeline {
                 ctl_tx: ctl_tx.clone(),
                 cancel: self.signals.cancel(),
                 epoch: self.signals.epoch(),
+                interrupt: self.interrupt.clone(),
             }),
             _ => None,
         }
@@ -689,6 +580,9 @@ impl Drop for RealtimePipeline {
         // handle clones keep those alive, and a join gated on them deadlocks
         // when a handle outlives the pipeline on the same stack (the
         // native-LiveKit session teardown did exactly that).
+        if let Some(interrupt) = self.interrupt.as_ref() {
+            interrupt();
+        }
         self.signals.shutdown();
         drop(self.ctl_tx.take());
         drop(self.utt_tx.take());
@@ -921,6 +815,10 @@ impl Drop for RealtimeFramePipeline {
 // ---------------------------------------------------------------------------------------
 // Real engine
 // ---------------------------------------------------------------------------------------
+
+#[cfg(feature = "oracle")]
+mod oracle {
+use super::*;
 
 use candle_core::{DType, Device, Tensor};
 
@@ -2808,6 +2706,61 @@ mod tests {
         }
     }
 
+    struct NativeParkedEngine {
+        entered: mpsc::Sender<()>,
+        wake: mpsc::Receiver<()>,
+        signal: mpsc::Sender<()>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl VoiceEngine for NativeParkedEngine {
+        fn respond(
+            &mut self,
+            _utt: &Utterance,
+            _cancel: &AtomicBool,
+            _emit: &mut dyn FnMut(VoiceEvent),
+        ) -> Result<bool, String> {
+            self.entered.send(()).unwrap();
+            self.wake.recv().unwrap();
+            Ok(false)
+        }
+
+        fn interrupt_signal(&self) -> Option<Arc<dyn Fn() + Send + Sync>> {
+            let signal = self.signal.clone();
+            let calls = self.calls.clone();
+            Some(Arc::new(move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let _ = signal.send(());
+            }))
+        }
+    }
+
+    #[test]
+    fn interrupt_edge_wakes_a_native_parked_responder_without_polling() {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (wake_tx, wake_rx) = mpsc::channel();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let engine = NativeParkedEngine {
+            entered: entered_tx,
+            wake: wake_rx,
+            signal: wake_tx,
+            calls: calls.clone(),
+        };
+        let pipeline = RealtimePipeline::spawn(engine).unwrap();
+        let handle = pipeline.handle().unwrap();
+        assert!(handle.submit(utt(160)));
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        handle.interrupt();
+        assert_eq!(
+            pipeline
+                .events()
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            VoiceEvent::Interrupted
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
     #[test]
     fn streaming_resampler_keeps_integer_upsample_continuity() {
         let mut resampler = StreamingPcmResampler::new(24_000, 48_000);
@@ -3955,5 +3908,81 @@ mod tests {
             dropped.load(Ordering::SeqCst),
             "worker must drop the engine on shutdown"
         );
+    }
+}
+
+} // module oracle
+
+#[cfg(feature = "oracle")]
+pub use oracle::{
+    load_realtime_moshi, load_realtime_moshi_with_warmup, realtime_moshi_files,
+    safetensors_floating_dtype, ConversationVault, Lfm2VoiceEngine, MoshiVoiceEngine,
+    RealtimeMoshi, RealtimeMoshiEvent, RealtimeMoshiFiles, RealtimeMoshiParams,
+    REALTIME_MOSHI_WARMUP_FRAMES,
+};
+
+#[cfg(test)]
+mod native_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    struct NativeParkedEngine {
+        entered: mpsc::Sender<()>,
+        wake: mpsc::Receiver<()>,
+        signal: mpsc::Sender<()>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl VoiceEngine for NativeParkedEngine {
+        fn respond(
+            &mut self,
+            _utterance: &Utterance,
+            _cancel: &AtomicBool,
+            _emit: &mut dyn FnMut(VoiceEvent),
+        ) -> Result<bool, String> {
+            self.entered.send(()).unwrap();
+            self.wake.recv().unwrap();
+            Ok(false)
+        }
+
+        fn interrupt_signal(&self) -> Option<Arc<dyn Fn() + Send + Sync>> {
+            let signal = self.signal.clone();
+            let calls = self.calls.clone();
+            Some(Arc::new(move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let _ = signal.send(());
+            }))
+        }
+    }
+
+    #[test]
+    fn interrupt_edge_wakes_a_native_parked_responder_without_polling() {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (wake_tx, wake_rx) = mpsc::channel();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let engine = NativeParkedEngine {
+            entered: entered_tx,
+            wake: wake_rx,
+            signal: wake_tx,
+            calls: calls.clone(),
+        };
+        let pipeline = RealtimePipeline::spawn(engine).unwrap();
+        let handle = pipeline.handle().unwrap();
+        assert!(handle.submit(Utterance {
+            samples: vec![0.0; 160],
+            rate: 16_000,
+        }));
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        handle.interrupt();
+        assert_eq!(
+            pipeline
+                .events()
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            VoiceEvent::Interrupted
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }

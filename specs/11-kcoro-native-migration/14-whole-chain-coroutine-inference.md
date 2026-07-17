@@ -1,16 +1,15 @@
 # 14 — Whole-Chain Coroutine-Driven, Zero-Copy, Zero-Wait Inference
 
-Status: **design, under review — not authoritative.** Reviewed cover-to-cover;
-direction sound, corrections pending. The architecture must converge on:
-immutable byte-exact model image (unaligned views, *separately accounted* derived
-storage); immutable shared plans + per-conversation persistent state + per-ticket
-transient scratch; **native chunked capture/playback** (not turn-batched Rust
-plumbing), native recurrence, context rollover, and interruption; **reliable
-ticketed text/transcript events** — only telemetry and waveform visualization are
-lossy; expected-value parking on **shared predicates** (zero spin means parking
-correctly, not the absence of sleeping waits). The corrections below (Plane 3
-reliability, §3.5 chunked docks) apply that; residual turn-batched language is a
-known defect to sweep before this is made authoritative.
+Status: **authoritative target, with the LFM2 ownership cutover implemented.**
+The working tree now has the immutable combined main+codec image, exact typed
+views, native frontend/Conformer/backbone/Depthformer/Mimi, native tokenizer and
+recurrence, per-conversation state/rollover, fixed PCM leases, reliable ticketed
+events, interruption epochs, and expected-value parking. Two follow-ons remain
+explicit: the engine still advances passes through a synchronous native
+coordinator over its single request slot rather than a capacity-2 completion
+continuation queue, and the physical mic/speaker adapter still bridges the native
+dock into the legacy Rust `VoiceEvent` surface. The full Moshi port and physical
+kcoro device dock are subsequent tranches; neither permits a Candle fallback.
 
 This is the convergence target for specs 02, 03, 07, and 10 —
 the picture they are each a slice of. It describes the end state where the entire
@@ -21,16 +20,18 @@ loop, over one zero-copy weight pool.
 The load-bearing observation: **the substrate for this already exists.** Flashkern
 is already a GPU-threadgroup engine — a fixed P-core lane team, generation-fence
 barriers, atomic tile-claim, one dispatcher, expected-value doorbells, no spin
-tier. The SQ/CQ bridge with descriptor leases exists. The Mimi decoder already
-demonstrates the exact "one aligned pool, weights folded once, zero steady-state
-allocation" discipline this design generalizes. What is missing is not primitives.
-It is three things:
+tier. The SQ/CQ bridge with descriptor leases exists. The safetensors loader
+already demonstrates the required one-ingress-write discipline: a byte-exact
+resident image with immutable views. Mimi's private folded arena is not the
+model-image precedent and must not be generalized into a second weight pool.
+At the design baseline, what was missing was not primitives but three ownership
+cuts (retained here as historical rationale):
 
-1. Rust still drives recurrence by **blocking** on a **single-slot** pass.
-2. The graph is still **Candle above the assembly leaves** (prefill, modality
+1. Rust drove recurrence by **blocking** on a **single-slot** pass.
+2. The graph was **Candle above the assembly leaves** (prefill, modality
    scatter, the token/frame loop, KV ownership).
-3. The model is **resident twice** — a byte-exact native image *and* a ~2.94 GB
-   Candle copy that the backbone/depthformer passes actually run off of.
+3. The model was **resident twice** — a byte-exact native image *and* a ~2.94 GB
+   Candle copy that the backbone/depthformer passes actually ran off of.
 
 This document plans the collapse of all three.
 
@@ -83,8 +84,9 @@ those are the debt this retires.)
 
 ### 1.2 Non-functional
 
-- **Zero-copy.** Weights are bound once from a single aligned pool (Mimi-arena
-  discipline) in checkpoint-native `(N,K)` bf16; the Candle duplicate is deleted.
+- **Zero-copy after ingress.** Weights are bound from the single byte-exact
+  resident image in checkpoint-native `(N,K)` bf16; tensor starts may be
+  unaligned and kernels must accommodate that. The Candle duplicate is deleted.
   Activations live in engine-owned scratch planes and descriptor-leased rings and
   are passed between passes by pointer. No stage materializes a `Tensor`.
 - **Zero-wait.** No polling, no bounded spin, no host thread blocked on the
@@ -189,13 +191,13 @@ SQ capacity ≥ 2 · next pass queued by the continuation · zero host wait.
 
 | Component | What it is | Exists? |
 |---|---|---|
-| **Weight pool** | One 64B-aligned block; every weight re-placed once in `(N,K)` bf16, norms folded; borrowed pointer views. Kills the Candle duplicate. | Pattern exists (Mimi arena, `lfm_model.cpp`); not yet the one pool for all stages |
-| **Scratch arenas** | Per-plan bump arenas sized once at build; zero steady-state alloc; abort on overflow. | Exists for engine ctx / Depth / Backbone / Mimi / Conformer; needs to cover prefill + frontend |
-| **Session state machine** | One per conversation. Owns cursor, KV/conv plane pointers, sampler CSPRNG, codec state, publication epoch, pending continuation identity. Replaces `generate_with_cache`. | Spec'd (03, coordination contract); not built |
-| **Pass program set** | Lane-uniform passes for every stage: `RESAMPLE`, `MEL`, `CONFORMER`, `PREFILL`, `TOKEN_PASS`, `DEPTH_FRAME`, `MIMI_FRAME`. | `TOKEN_PASS`/`DEPTH_FRAME` exist; frontend + prefill + mimi-as-pass do not |
-| **SQ/CQ (capacity ≥ 2) + completion continuation** | The dispatcher gains a hook: a completion may enqueue the follow-on pass with no host round-trip. Capacity ≥ 2 double-buffers so the next pass is ready. | Bridge exists at capacity 1, blocking; needs the continuation hook + depth |
-| **Docks** | Mic → Rust ring → BORROWED descriptor region as the turn payload. Speaker ← native publishes a PCM lease the Rust dock drains. | `kc_descriptor` BORROWED regions exist; docks not wired |
-| **Host collapse** | `NativeEngine.pass_lock` and the blocking `submit_pass` rims are deleted; Rust submits a TURN ticket and services I/O. | The stated end state of spec 10 |
+| **Weight image** | One allocation containing byte-exact main+codec source files; tensor views are `base + offset` and may be unaligned. | **Landed; page-table read-only after validation.** |
+| **Scratch arenas** | Per-plan/per-conversation storage sized before readiness; zero steady-state growth. | **Landed for the complete LFM2 chain.** |
+| **Session state machine** | One per conversation. Owns cursor, KV/conv planes, sampler CSPRNG, codec state, epoch, and recurrence. | **Landed natively; Rust no longer drives model progress.** |
+| **Pass program set** | Native resample, mel, Conformer, prefill, token, Depthformer, and Mimi stages. | **Landed for LFM2.** Multi-row prefill optimization remains open. |
+| **SQ/CQ (capacity ≥ 2) + completion continuation** | A completion may enqueue its follow-on without a synchronous coordinator wait. | **Open.** Current native coordinator parks correctly on a capacity-1 engine slot. |
+| **Docks** | Generation-checked mic/speaker PCM leases and bounded control/events. | **Native dock landed.** Physical Rust device adapter remains a later tranche. |
+| **Host collapse** | Rust submits tickets, services PCM, and observes events; it owns no model state. | **Landed in the desktop production path; oracle rims are non-release.** |
 
 ---
 
@@ -203,24 +205,25 @@ SQ capacity ≥ 2 · next pass queued by the continuation · zero host wait.
 
 ### 3.1 The zero-copy weight pool
 
-Today the backbone and Depthformer run off raw pointers into **Candle** tensor
-storage (`PtrLen`), while a byte-exact native image sits beside it unused for
-those stages — the checkpoint is resident twice (~2.94 GB each). Only the
-Conformer binds the native image zero-copy.
+At the design baseline the backbone and Depthformer ran off `PtrLen` views into
+Candle-owned tensors while the native image sat beside them. The production path
+now binds every LFM2 and Mimi weight directly from the one image; `PtrLen` and
+Candle ownership survive only inside the offline oracle feature.
 
-Target: generalize the Mimi arena to the whole model.
+Target: make the resident image the sole weight owner for every plan.
 
-- **One aligned pool.** At load, place each weight tensor once, 64B-aligned, in
-  `(N,K)` bf16 checkpoint layout. (The resident image is 64B-aligned only at the
-  shard base; per-tensor views land at ≥2-byte granularity, so a re-placement
-  pass is required to give the asm leaves aligned tile bases.) Fold weight-norm /
-  batch-norm scale once here, as Mimi already does.
-- **Binding.** Plans carry compact `{ptr, n, k, layout=NK}` descriptors, not
-  Candle tensors. `lfm_model.cpp` already binds engine plans this way.
-- **Consumption.** Non-Apple asm leaves (`lfm_bf16_gemm_nt_f32`, `..._gemv_f32`)
-  consume `(N,K)` bf16 directly — the transpose is free in-kernel, no
-  `.t().contiguous()`. Apple AMX widens bf16→f32 per call into staging (see
-  Trade-off 5).
+- **One byte-exact image.** Complete source bytes land once in the final
+  allocation. Alignment padding exists only between sources; tensors remain at
+  their safetensors offsets. Alignment is never repaired by copying a weight.
+- **Binding.** Plans carry compact byte-addressed `{base/offset, bytes, dtype,
+  shape, layout=NK}` descriptors, not Candle tensors or unaligned C++ typed
+  pointers. `lfm_model.cpp` already performs most of the name/shape binding.
+- **Consumption.** Architecture leaves load BF16 words from `(N,K)` views and
+  unlift them in registers. No `.t().contiguous()`, packed RHS, F32 shadow, or
+  per-call whole-weight widening is admitted on Apple or non-Apple paths.
+- **Derived storage.** Only formula-changing immutable values such as rope
+  tables, window/FFT tables, BN denominators, or required weight-normalization
+  folds may persist. Their bytes are reported separately from the model image.
 - **Deletion.** `candle_builder` / `CandleBridge` and the ~2.94 GB copy go away;
   the loader stops copying; the working set halves — which matters at decode,
   where M=1 GEMV streams the whole model per token and cache thrash is the enemy.
@@ -364,11 +367,11 @@ receive PCM leases, submit control tickets. That is spec 10's end state.
 
 1. **Resident image vs the Candle duplicate.** Binding the resident image
    directly (no pool, no repack — spec 02) halves RAM, but `candle_builder` cannot
-   die until *every* consumer is native, and Candle owns prefill until P2/P3. So
-   the copy drops in two steps: the Depthformer's share at P1 (its only consumer
-   is already native), the backbone's share at P3 (when native prefill retires the
-   Candle model). Mitigation: keep Candle as an offline parity oracle; treat
-   `compatibility_copied_bytes` as the running ledger, not a single switch.
+   die until *every* consumer is native, and Candle owns prefill today. The
+   Depthformer share has already dropped; the remaining backbone/embedding copy
+   drops atomically when production adopts the completed native model. Adding a
+   second native model beside the Rust model is forbidden because it would create
+   a third main-checkpoint image. Candle remains an offline parity oracle only.
 2. **Native recurrence vs the Rust loop.** The whole point: removes the blocked
    host thread and enables overlap. Cost: the hardest code in the project — a
    native state machine replacing a readable Rust loop, harder to debug.
@@ -381,21 +384,20 @@ receive PCM leases, submit control tickets. That is spec 10's end state.
    complete. Resolution: Candle is a *build-time / offline* oracle, never wired as
    a runtime fallback. The runtime gate is "native or terminal error," consistent
    with the Mimi-required rule.
-5. **Apple per-call bf16→f32 widen.** Accelerate needs f32, so each Apple GEMM
-   stages bf16→f32 into `gemm_amx_*`. Pre-widening static weights to f32 would
-   remove the per-call widen but **double** the footprint we are halving. Keep the
-   per-call widen; it stages cache-friendly tiles. Revisit only if bandwidth
-   profiling demands it.
-6. **Prefill native vs leaving it Candle.** Prefill is per-turn, so the payoff is
-   smaller and the scatter is the hardest no-tensor code. Sequence it last; accept
-   one off-hot-loop Candle island until P4.
+5. **Apple direct BF16 kernels vs Accelerate staging.** The current M>1 path
+   widens the complete RHS into `gemm_amx_*`; that is weight materialization and
+   is forbidden by the image contract. Replace it with a checkpoint-layout BF16
+   kernel. Activation scratch may change precision when the numerical contract
+   requires it, but resident weights are loaded and unlifted only in registers.
+6. **Prefill native vs leaving it Candle.** Prefill is per-turn, but it is the
+   ownership gate for deleting the remaining compatibility image. Develop it
+   offline against Candle fixtures; do not ship a hybrid native/Candle fallback.
 7. **Moshi.** Moshi stays a **supported model** — it is not dropped. It is
    partially on Flashkern already and gets ported the rest of the way, but as its
    own later phase (P5), because it is a second whole model and would otherwise
-   stall the LFM2 hot-loop work. Decision: **unwire Moshi from the shipped default
-   now** (make LFM2 the wired path) so LFM2 gets the focus, then finish Moshi's
-   native port afterward. Unwired ≠ deleted — its Candle path stays buildable and
-   exercised offline until the port lands.
+   stall the LFM2 hot-loop work. Decision: flip the shipped default to LFM2 only
+   in the atomic native cutover. Moshi remains buildable and exercised offline
+   until its native port lands.
 
 ---
 
@@ -403,24 +405,21 @@ receive PCM leases, submit control tickets. That is spec 10's end state.
 
 ### 6.0 What already exists — and why it reorders the plan
 
-Reading the tree changes the sequencing. The destination is **partly built**:
+This section records the pre-cutover sequencing decision. The ownership work it
+describes is now landed for LFM2:
 
-- **A native LFM2 model already exists** — `native/src/model/lfm_model.cpp` binds
+- **A native LFM2 model exists** — `native/src/model/lfm_model.cpp` binds
   the whole backbone by name off the resident image (every layer's norms, FFN,
   short-conv, attention + qk-norms), plus embeddings, head, and Depthformer, all
-  zero-copy. It exposes a full recurrence ABI (`lfm_conversation_create` /
-  `_step` / `_prefill` / `_audio_frame` / `_reset`) reachable from Rust via
-  `handles.rs`, and it is exercised by `tests/native_safetensors.rs`.
+  zero-copy. The product surface is now opaque runtime/model/conversation/session
+  lifecycle plus PCM/control/event docks; numerical direct calls are oracle-only.
 - **No weight pool needs to be built.** Spec 02 is explicit: kernels bind the
   resident image *unaligned* and must not repack. The resident image is the pool.
   The earlier "build a re-aligned pool" framing was wrong; drop it.
-- **Production voice does not use any of this.** It runs the Candle
-  `LFM2AudioModel::generate_interleaved` path. The native model has the backbone,
-  Depthformer, and *discrete-token* recurrence, but is missing exactly two things:
-  **(a) audio-in continuous-embedding prefill** — `lfm_conversation_prefill` takes
-  only token IDs; there is no mel → Conformer → adapter → scatter path into it —
-  and **(b) the interleaved generate schedule**, which still lives in the Rust
-  `generate_interleaved` loop.
+- **Production voice now uses this path exclusively.** It constructs the native
+  runtime/model/conversation/session and fails hard for unsupported engines or
+  devices. Frontend, Conformer, Mimi, modality assembly, tokenizer, sampling,
+  recurrence, and context rollover are native-owned.
 
 The consequence: **`compatibility_copied_bytes == 0` cannot precede native
 prefill.** The Candle model is what performs prefill today, so its weight copy
@@ -511,15 +510,15 @@ Each phase ends at a gate and deletes the Rust/Candle owner it replaces.
   resident image, then delete Candle from the shipped graph entirely. Until then
   Moshi is unwired from the default but remains buildable / exercised offline.
 
-**Moshi unwiring (do this first, in P1's window):** flip the default engine from
-`MoshiRealtime` to `Lfm2Interleaved` and route `build_engine` so the shipped path
-is LFM2, leaving Moshi selectable/offline. Clears the field without touching
-Moshi's code.
+**Moshi default switch (atomic-cutover gate):** flip the default engine from
+`MoshiRealtime` to `Lfm2Interleaved` only when the native LFM2 session passes the
+product gate. Moshi remains selectable/offline until its native port replaces
+the Candle implementation; production never falls back between them.
 
 **Revisit as it grows:** SQ capacity (2 → N as multi-conversation load rises);
 arena high-water sizing under long contexts; an E-core `BACKGROUND` lane for
-speculative decode / telemetry (currently P-core only); the Apple pre-widen
-decision if profiling says the per-call widen is the bottleneck.
+speculative decode / telemetry (currently P-core only); direct-BF16 kernel tile
+geometry and prefetch distance when profiling identifies the bottleneck.
 
 ---
 
@@ -528,8 +527,8 @@ decision if profiling says the per-call widen is the bottleneck.
 - The checkpoint stays bf16 `(N,K)`; no retrain, no requant.
 - One model image serves all conversations; there is no per-conversation weight
   specialization.
-- Accelerate/AMX remains the matmul path on Apple; the asm bf16 leaves remain the
-  path elsewhere and for M=1.
+- Apple and non-Apple production weight paths consume checkpoint BF16 directly;
+  no backend may require a complete RHS conversion or repack.
 - Real-time targets follow the Sesame latency bands already encoded in the voice
   runtime.
 - Candle can be reduced to an offline oracle — nothing in the shipped product

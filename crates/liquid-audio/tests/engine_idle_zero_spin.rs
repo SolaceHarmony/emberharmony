@@ -13,12 +13,42 @@
 //! engine itself is unconditional — the substrate builds or the build fails.
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
 
+use std::ffi::c_void;
 use std::time::{Duration, Instant};
 
-use liquid_audio::flashkern::{
-    decode::{fused_mlp_available, FusedMlpWeights},
-    native_engine::process_engine,
-};
+use liquid_audio as _;
+
+unsafe extern "C" {
+    fn lfm_bf16_gemm_available() -> i32;
+    fn lfm_engine_new(workers: i32) -> *mut c_void;
+    fn lfm_engine_request_stop(engine: *mut c_void);
+    fn lfm_engine_free(engine: *mut c_void);
+    fn lfm_engine_lanes(engine: *mut c_void) -> u32;
+    fn lfm_engine_mlp(
+        engine: *mut c_void,
+        input: *const u16,
+        norm: *const u16,
+        w1: *const u16,
+        w3: *const u16,
+        w2: *const u16,
+        output: *mut u16,
+        hidden: usize,
+        ffn: usize,
+        epsilon: f32,
+        lanes: usize,
+    ) -> i32;
+}
+
+struct Engine(*mut c_void);
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        unsafe {
+            lfm_engine_request_stop(self.0);
+            lfm_engine_free(self.0);
+        }
+    }
+}
 
 /// Process CPU time (all threads, user+system) in milliseconds.
 fn proc_cpu_ms() -> f64 {
@@ -43,8 +73,9 @@ fn engine_lanes_are_silent_at_idle() {
     // headroom for the test harness while still detecting repeated wake/poll work.
     const IDLE_MAX_PCT: f64 = 0.1;
 
-    let engine = process_engine(); // infallible: the engine is the substrate
-    let lanes = engine.lanes_total();
+    let engine = Engine(unsafe { lfm_engine_new(8) });
+    assert!(!engine.0.is_null(), "native engine failed to initialize");
+    let lanes = unsafe { lfm_engine_lanes(engine.0) } as usize;
     assert!(lanes >= 2, "expected a real lane team, got {lanes}");
 
     // Let every lane reach its first doorbell park.
@@ -59,21 +90,29 @@ fn engine_lanes_are_silent_at_idle() {
 
     // Ring the doorbell through a real typed numerical pass, then prove the team
     // re-parks instead of lingering hot. No callback-only probe exists in production.
-    assert!(fused_mlp_available(), "typed native MLP unavailable");
+    assert_ne!(unsafe { lfm_bf16_gemm_available() }, 0, "typed native MLP unavailable");
     let width = lanes;
     let x = vec![0u16; width];
     let norm = vec![0x3f80u16; width];
     let matrix = vec![0u16; width * width];
-    let weights = FusedMlpWeights {
-        norm_w: &norm,
-        w1: &matrix,
-        w3: &matrix,
-        w2: &matrix,
-        eps: 1e-5,
-    };
     let mut out = vec![1u16; width];
-    assert!(
-        engine.fused_mlp(&x, &weights, &mut out, lanes),
+    assert_eq!(
+        unsafe {
+            lfm_engine_mlp(
+                engine.0,
+                x.as_ptr(),
+                norm.as_ptr(),
+                matrix.as_ptr(),
+                matrix.as_ptr(),
+                matrix.as_ptr(),
+                out.as_mut_ptr(),
+                width,
+                width,
+                1e-5,
+                lanes,
+            )
+        },
+        0,
         "typed MLP pass refused the idle probe"
     );
     assert_eq!(out, x);

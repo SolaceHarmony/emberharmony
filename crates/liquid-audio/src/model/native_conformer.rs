@@ -53,6 +53,10 @@ unsafe extern "C" {
         error_length: usize,
     ) -> i32;
     fn lfm_conformer_destroy(c: *mut RawConformer) -> i32;
+    fn lfm_conformer_bound_weight_bytes(c: *const RawConformer) -> u64;
+    fn lfm_conformer_derived_bytes(c: *const RawConformer) -> u64;
+    fn lfm_conformer_materialized_weight_bytes(c: *const RawConformer) -> u64;
+    fn lfm_conformer_direct_gemm_calls(c: *const RawConformer) -> u64;
     fn lfm_conformer_workspace_create(out: *mut *mut RawWorkspace) -> i32;
     fn lfm_conformer_workspace_destroy(w: *mut RawWorkspace) -> i32;
     fn lfm_conformer_out_rows(c: *const RawConformer, mel_frames: u64) -> u64;
@@ -98,6 +102,17 @@ pub struct ConformerGeometry {
     pub conv_channels: usize,
     pub adapter_hidden: usize,
     pub adapter_out: usize,
+}
+
+/// Audit counters for the immutable checkpoint-view contract. A production
+/// forward must leave `materialized_weight_bytes` at zero while increasing the
+/// direct-GEMM witness count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConformerMemory {
+    pub bound_weight_bytes: u64,
+    pub derived_bytes: u64,
+    pub materialized_weight_bytes: u64,
+    pub direct_gemm_calls: u64,
 }
 
 /// Native Conformer encoder + audio adapter. Holds the resident image alive
@@ -177,6 +192,19 @@ impl NativeConformer {
             device: device.clone(),
             _resident: resident,
         })
+    }
+
+    pub fn memory(&self) -> ConformerMemory {
+        // SAFETY: all four queries are read-only and `self.handle` remains live
+        // for the duration of the calls.
+        unsafe {
+            ConformerMemory {
+                bound_weight_bytes: lfm_conformer_bound_weight_bytes(self.handle),
+                derived_bytes: lfm_conformer_derived_bytes(self.handle),
+                materialized_weight_bytes: lfm_conformer_materialized_weight_bytes(self.handle),
+                direct_gemm_calls: lfm_conformer_direct_gemm_calls(self.handle),
+            }
+        }
     }
 
     /// One audio-in segment: `mel` is `(1, feat_in, T)` or `(feat_in, T)`,

@@ -12,6 +12,13 @@ extern "C" {
 
 typedef struct LfmWeightImage LfmWeightImage;
 
+typedef enum LfmWeightComponent {
+    LFM_WEIGHT_COMPONENT_INVALID = 0,
+    LFM_WEIGHT_COMPONENT_MAIN = 1,
+    LFM_WEIGHT_COMPONENT_CODEC = 2,
+    LFM_WEIGHT_COMPONENT_COUNT = 3,
+} LfmWeightComponent;
+
 typedef enum LfmWeightStatus {
     LFM_WEIGHT_OK = 0,
     LFM_WEIGHT_INVALID_ARGUMENT = -1,
@@ -63,10 +70,21 @@ typedef struct LfmTensorView {
     uint32_t reserved;
 } LfmTensorView;
 
+typedef struct LfmWeightLoadStatsV1 {
+    uint32_t size;
+    uint32_t abi_version;
+    uint64_t source_bytes;
+    uint64_t resident_bytes;
+    uint32_t task_count;
+    uint32_t worker_count;
+} LfmWeightLoadStatsV1;
+
 /* Open one .safetensors file, a model.safetensors.index.json file, or a
  * checkpoint directory. A directory prefers the Hugging Face shard index,
  * then model.safetensors, then sorted model-*.safetensors shards. All selected
- * files are read directly into one 64-byte-aligned resident allocation. */
+ * files are opened first and read by a bounded positioned-I/O team directly
+ * into one page-aligned resident region. After complete validation the region
+ * is sealed read-only; returned tensor views remain byte-exact and immutable. */
 int lfm_weights_open(const char *path, LfmWeightImage **out,
                      char *err, size_t errlen);
 
@@ -74,16 +92,32 @@ int lfm_weights_open(const char *path, LfmWeightImage **out,
 int lfm_weights_open_files(const char *const *paths, size_t count,
                            LfmWeightImage **out, char *err, size_t errlen);
 
+/* Load the model checkpoint and Mimi codec with one allocation and one read
+ * team. Tensor names are scoped by component, so identical keys in Main and
+ * Codec are legal while duplicates inside either component remain errors. */
+int lfm_weights_open_bundle(const char *main_path, const char *codec_path,
+                            LfmWeightImage **out, char *err, size_t errlen);
+
 void lfm_weights_close(LfmWeightImage *image);
 
 const void *lfm_weights_data(const LfmWeightImage *image);
 uint64_t lfm_weights_resident_bytes(const LfmWeightImage *image);
 size_t lfm_weights_count(const LfmWeightImage *image);
+size_t lfm_weights_component_count(const LfmWeightImage *image,
+                                   uint32_t component);
+/* Transitional native-only accounting. Source bytes exclude alignment padding;
+ * resident bytes include it. The function initializes the complete V1 output. */
+int lfm_weights_load_stats(const LfmWeightImage *image,
+                           LfmWeightLoadStatsV1 *out);
 
 int lfm_weights_at(const LfmWeightImage *image, size_t index,
                    LfmTensorView *out);
 int lfm_weights_find(const LfmWeightImage *image, const char *name,
                      LfmTensorView *out);
+int lfm_weights_at_component(const LfmWeightImage *image, uint32_t component,
+                             size_t index, LfmTensorView *out);
+int lfm_weights_find_component(const LfmWeightImage *image, uint32_t component,
+                               const char *name, LfmTensorView *out);
 
 const char *lfm_weights_dtype_name(uint32_t dtype);
 

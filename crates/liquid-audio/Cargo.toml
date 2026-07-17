@@ -4,8 +4,9 @@
 name = "liquid-audio"
 version = "0.1.0"
 edition = "2021"
-description = "Faithful Rust port of liquid_audio (LFM2.5-Audio) on candle + the moshi crate"
+description = "Native Flashkern runtime for LFM2-Audio"
 build = "build.rs" # compiles native SIMD kernels under native/
+autoexamples = false
 
 [build-dependencies]
 cc = "1"
@@ -16,23 +17,23 @@ path = "src/lib.rs"
 
 [dependencies]
 # Tensor substrate (matches the moshi crate's candle 0.9.x).
-candle-core = "0.9"
-candle-nn = "0.9"
+candle-core = { version = "0.9", optional = true }
+candle-nn = { version = "0.9", optional = true }
 # `generation::LogitsProcessor` (argmax / temperature / top-k / top-p / multinomial)
 # — the same sampler `moshi` uses for depformer decoding. Reused for next-token
 # sampling instead of a private softmax+multinomial. Already in-tree via moshi (0.9),
 # so no new candle version. (Its `lfm2` is quantized-only even at 0.10, so the
 # full-precision backbone stays ported in-tree — see the moshi note below.)
-candle-transformers = "0.9"
+candle-transformers = { version = "0.9", optional = true }
 # config.json (model hyperparameters) deserialization.
-minijinja = "2"
+minijinja = { version = "2", optional = true }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", optional = true }
 # text tokenizer (HF AutoTokenizer equivalent — loads tokenizer.json).
-tokenizers = "0.20"
+tokenizers = { version = "0.20", optional = true }
 # Pure Rust SentencePiece inference for upstream Moshi text tokens
 # (`tokenizer_spm_32k_3.model`), no Python/C++ runtime.
-sentencepiece-rust = "0.1"
+sentencepiece-rust = { version = "0.1", optional = true }
 # HF snapshot download (huggingface_hub.snapshot_download equivalent) for
 # get_model_dir's repo-id branch. Sync (ureq) backend = faithful to the
 # synchronous Python call. Optional (feature `download`, on by default).
@@ -52,29 +53,29 @@ hf-hub = { version = "0.4", optional = true, default-features = false, features 
 # moshi 0.6.4 pins candle ^0.9.1 → shares my candle 0.9.2 (no version split). Pure
 # candle, no torch. (candle-transformers' `lfm2` is quantized-only at every version,
 # so the full-precision backbone stays ported in-tree.)
-moshi = "0.6"
+moshi = { version = "0.6", optional = true }
 # `soundfile.read` equivalent for `data/mapper::_load_audio_bytes`: decode an
 # encoded-audio byte stream (WAV/FLAC/OGG-Vorbis/AIFF/… — the containers libsndfile
 # reads, and more) to f32 samples. Pure Rust, no C deps, no torch.
-symphonia = { version = "0.5", features = ["all"] }
+symphonia = { version = "0.5", features = ["all"], optional = true }
 # Apache Arrow (pure Rust, no C deps) — `data/preprocess` writes the dataset in
 # HuggingFace `datasets.save_to_disk` format (Arrow IPC stream + dataset_info.json
 # + state.json), which `data/dataloader::load_from_disk` reads back. The trimmed
 # IPC-only set (array/schema/ipc) ≈ 13s cold build, vs Python's pyarrow C++ blob.
-arrow-array = "53"
-arrow-schema = "53"
-arrow-ipc = "53"
+arrow-array = { version = "53", optional = true }
+arrow-schema = { version = "53", optional = true }
+arrow-ipc = { version = "53", optional = true }
 # Intra-op thread-pool control to match torch's `at::intraop_default_num_threads`
 # (ATen ParallelCommon.cpp). candle's matmul (`gemm`) + conv/sort use rayon's GLOBAL
 # pool; we size it like torch — Apple-Silicon performance cores via `hw.perflevel0.
 # physicalcpu` (libc sysctl), NOT all logical cores (rayon/num_cpus default) which
 # would schedule compute-bound work onto the slow efficiency cores. See `threads.rs`.
-rayon = "1"
-num_cpus = "1"
-libc = "0.2"
+rayon = { version = "1", optional = true }
+num_cpus = { version = "1", optional = true }
+libc = { version = "0.2", optional = true }
 # `half::bf16` — read bf16 tensor lanes to feed the NEON BFMMLA GEMM kernel. Same
 # version candle uses, so cargo unifies to one `half`.
-half = "2"
+half = { version = "2", optional = true }
 # MPSC channels for the realtime worker-thread pipeline (`realtime.rs`) — the Rust
 # analog of `chat.py`'s `queue.Queue` between the inference producer and the playback
 # consumer. crossbeam over `std::sync::mpsc` for `recv_timeout`/`select` and `Sync`
@@ -92,6 +93,8 @@ cpal = { version = "0.15", optional = true }
 
 [dev-dependencies]
 anyhow = "1"
+serde_json = "1"
+tokenizers = "0.20"
 # Rust kcoro remains the conformance oracle for the raw docking-ring tests. The
 # production inference engine owns its SQ/CQ and progress entirely in native code.
 kcoro = { path = "../kcoro" }
@@ -101,9 +104,80 @@ candle-flashfftconv = { path = "../candle-flashfftconv" }
 cpal = "0.15"
 # getrusage for the engine zero-spin idle oracle (tests/engine_idle_zero_spin.rs).
 libc = "0.2"
+sha2 = "0.10"
+
+[[example]]
+name = "bench_native_load"
+path = "examples/bench_native_load.rs"
+
+[[example]]
+name = "bench_load_infer"
+path = "examples/bench_load_infer.rs"
+required-features = ["oracle"]
+
+[[example]]
+name = "chat_multiturn"
+path = "examples/chat_multiturn.rs"
+required-features = ["oracle"]
+
+[[example]]
+name = "duplex_chat"
+path = "examples/duplex_chat.rs"
+required-features = ["oracle"]
+
+[[example]]
+name = "generate"
+path = "examples/generate.rs"
+required-features = ["oracle"]
+
+[[example]]
+name = "mic_chat"
+path = "examples/mic_chat.rs"
+required-features = ["oracle"]
+
+[[example]]
+name = "moshi_realtime_trace"
+path = "examples/moshi_realtime_trace.rs"
+required-features = ["oracle"]
+
+[[example]]
+name = "realtime_probe"
+path = "examples/realtime_probe.rs"
+required-features = ["oracle"]
+
+[[example]]
+name = "self_chat"
+path = "examples/self_chat.rs"
+required-features = ["oracle"]
+
+[[example]]
+name = "text_chat"
+path = "examples/text_chat.rs"
+required-features = ["oracle"]
 
 [features]
 default = ["download"]
+# The deleted Rust/Candle inference, training, and fixture-capture implementation is
+# deliberately an opt-in workspace oracle. Release consumers must not enable this
+# feature: the default library graph contains no Candle or Moshi dependency.
+oracle = [
+    "dep:candle-core",
+    "dep:candle-nn",
+    "dep:candle-transformers",
+    "dep:minijinja",
+    "dep:serde_json",
+    "dep:tokenizers",
+    "dep:sentencepiece-rust",
+    "dep:moshi",
+    "dep:symphonia",
+    "dep:arrow-array",
+    "dep:arrow-schema",
+    "dep:arrow-ipc",
+    "dep:rayon",
+    "dep:num_cpus",
+    "dep:libc",
+    "dep:half",
+]
 # hf-hub snapshot download in get_model_dir (huggingface_hub.snapshot_download).
 download = ["dep:hf-hub"]
 # Mirrors the Python `module_exists("flash_attn")` optional path.
@@ -111,9 +185,9 @@ flash-attn = []
 # Apple vecLib (Accelerate) BLAS for the CPU matmul path — torch's CPU backend on
 # Apple Silicon (multi-threaded, hand-tuned). Without it candle falls back to the
 # pure-Rust `gemm`; with it, CPU-mode matmul matches torch's throughput. macOS only.
-accelerate = ["candle-core/accelerate", "candle-nn/accelerate"]
+accelerate = ["oracle", "candle-core/accelerate", "candle-nn/accelerate"]
 # Temporary Apple GPU path. It remains separate from CPU-only Flashkern and is
 # replaced by the planned MLX C++/Metal device engine, not absorbed into Flashkern.
-metal = ["candle-core/metal", "candle-nn/metal", "moshi/metal", "dep:candle-flashfftconv", "candle-flashfftconv/metal"]
+metal = ["oracle", "candle-core/metal", "candle-nn/metal", "moshi/metal", "dep:candle-flashfftconv", "candle-flashfftconv/metal"]
 # CPAL-backed mic capture + speaker playback + VAD/barge-in service.
 audio-io = ["dep:cpal"]

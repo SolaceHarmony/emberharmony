@@ -83,7 +83,7 @@ pub enum LocalVoiceEngine {
 
 impl Default for LocalVoiceEngine {
     fn default() -> Self {
-        Self::MoshiRealtime
+        Self::Lfm2Interleaved
     }
 }
 
@@ -540,7 +540,7 @@ mod tests {
         let json = serde_json::to_value(&v).unwrap();
         assert_eq!(json["provider"], "off");
         assert_eq!(json["lastProvider"], "lfm2");
-        assert_eq!(json["lfm2"]["engine"], "moshiRealtime");
+        assert_eq!(json["lfm2"]["engine"], "lfm2Interleaved");
         assert_eq!(json["lfm2"]["trace"], false);
         // Per-mode regimes, camelCase groups. Interleaved = the live path.
         assert_eq!(json["lfm2"]["interleaved"]["maxTokens"], 8192);
@@ -583,7 +583,7 @@ mod tests {
         assert_eq!(v.lfm2.asr.text_temperature, 0.0);
         assert_eq!(v.lfm2.asr.max_tokens, 100);
         assert_eq!(v.lfm2.tts.audio_top_k, 64);
-        assert_eq!(v.lfm2.engine, LocalVoiceEngine::MoshiRealtime);
+        assert_eq!(v.lfm2.engine, LocalVoiceEngine::Lfm2Interleaved);
         assert_eq!(v.lfm2.moshi_model.as_deref(), Some(DEFAULT_MOSHI_MODEL));
     }
 
@@ -684,11 +684,11 @@ mod tests {
         assert_eq!(s.model_dir, None);
         assert_eq!(s.moshi_model.as_deref(), Some(DEFAULT_MOSHI_MODEL));
         assert_eq!(s.moshi_model_dir, None);
-        assert_eq!(s.engine, LocalVoiceEngine::MoshiRealtime);
+        assert_eq!(s.engine, LocalVoiceEngine::Lfm2Interleaved);
     }
 
     #[test]
-    fn stored_voice_settings_without_engine_use_moshi_realtime_default() {
+    fn stored_voice_settings_without_engine_use_native_lfm2_default() {
         let json = serde_json::json!({
             "provider": "lfm2",
             "lastProvider": "lfm2",
@@ -698,7 +698,7 @@ mod tests {
             }
         });
         let v = decode_voice_settings(json).unwrap();
-        assert_eq!(v.lfm2.engine, LocalVoiceEngine::MoshiRealtime);
+        assert_eq!(v.lfm2.engine, LocalVoiceEngine::Lfm2Interleaved);
     }
 
     #[test]

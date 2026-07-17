@@ -1,3 +1,5 @@
+#![cfg(feature = "oracle")]
+
 //! Speculative prefill (prepare-during-pause) correctness against the real model.
 //!
 //! The contract, stated honestly: whatever sequence of prepare/discard calls

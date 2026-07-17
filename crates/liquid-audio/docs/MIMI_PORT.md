@@ -51,13 +51,24 @@ table, state arena, C ABI. nn.rs collapses into the header's plain-f32 linear.
 streaming.rs (`StreamTensor` = Option<Tensor>) becomes explicit
 `n_in/n_out` frame counts — no optional-tensor plumbing in C++.
 
+Production ownership is split: `MimiDecodePlan` belongs to `LfmModel` and owns
+validated byte views plus the formula-derived immutable arena;
+`MimiDecodeState` belongs to one conversation and owns KV/carry/scratch. Plan
+construction probes the exact state arena size, seals derived storage, and
+subsequent state creation replays only the derived offsets—never the fold math.
+On the production checkpoint the measured accounting is 16,777,344 derived
+bytes once per model and 48,808,616 mutable bytes per conversation, with zero
+compatibility-copied weight bytes.
+
 ## Discipline (same as the engine, non-negotiable)
 
-- **Weights are a buffer**: one flat `name → (f32*, len)` table captured
-  zero-copy from the native resident safetensors image. Weight-norm folds ONCE at capture
-  (g·v/‖v‖ per output channel), never per step. No transpose/repack per call —
-  if a layout re-arm is needed, it happens once at init into the arena, and the
-  manifest documents it.
+- **Weights are bytes and typed views**: Mimi binds the Codec component of the
+  model-owned resident image as little-endian F32 byte spans. Unaligned views
+  use safe byte loads; aligned production views dispatch directly to AMX/NEON.
+  Weight-norm and codebook folds are formula-changing derived storage and are
+  accounted separately. Layout, alignment, dtype, and transpose copies are
+  forbidden. ConvTranspose uses the checkpoint matrix through a transposed
+  GEMM view; depthwise upsample deinterleaves checkpoint taps in registers.
 - **Zero allocation in steady state**: all streaming state (conv left-context,
   partial-frame pendings, KV rings, scratch) lives in ONE arena sized at init.
   State structs are POD and explicitly serializable (hibernation-friendly).
@@ -144,7 +155,8 @@ streaming.rs (`StreamTensor` = Option<Tensor>) becomes explicit
       layers receive n=2 time samples, so time-axis NEON ran in its scalar
       tail (~45 of ~70 ms). AMX routes via mimi_gemm_f32: conv1d im2col +
       single GEMM (weight rows already (ic,kk)-contiguous — zero-copy A);
-      convtr re-armed once at init to [kk][oc][ic] + ONE GEMM, zero-copy X.
+      convtr now presents checkpoint `[ic,oc,kk]` directly as the transpose of
+      `[ic,oc*kk]` to ONE GEMM, zero-copy X and zero weight re-arm.
       Measured, real checkpoint, 130 frames across the KV wrap:
       **76.5 -> 13.8 ms median/frame (max 14.2; old spiked to 103), vs
       Rust/moshi ~20.8 ms** — 5.6x on ourselves, 1.5x on candle, 5.8x
