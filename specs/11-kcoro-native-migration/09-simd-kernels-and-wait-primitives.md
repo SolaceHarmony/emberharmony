@@ -7,8 +7,26 @@ The continuation owns a packed `{generation,state}` slot lease across its
 callback and must atomically resubmit that same slot or release it before waking
 the waiter; adversarial tests cover peer admission, stale-owner ABA, stop, and
 capacity accounting.
-Moving the native session recurrence onto that continuation remains open in
-design 14; the full Moshi migration is a later tranche.
+The V2.0 substrate repair is also implemented in the working tree: hot
+wait/cache words and internal SQ/CQ storage cells have 128-byte Apple base alignment and stride
+through kcoro, the engine, bridge, session, and model gate; request, layer, and
+modality selectors are closed; invalid worker/logical-lane geometry rejects; and
+four physical workers preserve the eight-way logical fold with parity. The
+zero-spin gate remains green.
+The bounded production audio route now uses that continuation across
+`TOKEN_PASS -> DEPTH_FRAME -> MIMI_DECODE`: playback is reserved before
+admission, token context commits on its CQ, Mimi writes directly into the
+reserved PCM span, and the exact slot is released before reliable publication.
+This bounded implementation takes a route-exclusive producer lease and prepares
+all three immutable descriptors before the first SQ publication; its CQ callback
+does not acquire the submission or descriptor mutex. Peer admission is deferred
+to the broker/block-domain tranche rather than hidden behind this fast path.
+The coordinator still makes one outward expected-value wait for the terminal
+result. Its fixed conversation-owned result plus stack callback state is not the
+future pooled asynchronous ticket executor. Pooled routes/results, the broker,
+two `BLOCK4` domains and reverse-order per-block CQs, event-register waits, and
+concurrent numerical passes remain open in designs 14 and 16. The full Moshi
+migration is a later tranche.
 
 Baseline: EmberHarmony `321538f11749`.
 
@@ -33,8 +51,11 @@ Fix the compute substrate for every native stage in documents 03 through 07:
   and strides against our planes. Do not claim a private Apple execution unit;
   Accelerate's implementation is opaque.
 - **Waiting is zero-spin.** A fence or doorbell reads its generation once,
-  registers and rechecks, then blocks through the host wait-word adapter. There
-  is no bounded spin or monitor-wait budget before parking.
+  registers and rechecks, then parks through the selected wait-word backend.
+  The OS address wait is the correctness baseline. An architectural event wait
+  may be selected only after a guarded startup probe and a recorded latency,
+  idle-CPU, and power win; it must recheck the same expected-value predicate and
+  fall back to the OS backend. There is no bounded spin or timed polling tier.
 - **The numerical call graph is native pass descriptor -> C++ fixed executor ->
   assembly table.** Rust converts settings and owns PCM/control I/O scopes only.
   C++ owns model loading, pointer binding, stage planning, state ownership, and
@@ -51,10 +72,19 @@ Two substrate debts in the original audit are now closed. Vendor commit
 `8d510f83` pins arena `bd530f4c9196`, which separates signal-one `work_cv` from
 lifecycle notification at
 `crates/kcoro-sys/vendor/kcoro_arena/core/src/kc_runtime.c:225-324`.
-Flashkern commit `d2c43abd` owns cache-line-isolated shared dispatch and fence
-words and blocks through prepared `kc_port_wait_u32` handles at
+Flashkern commit `d2c43abd` introduced shared dispatch/fence words and prepared
+`kc_port_wait_u32` handles at
 `native/src/engine/flashkern_engine.cpp:634-662` and `1041-1052`;
-`FENCE_SPIN`, `kcoro_park`, and `kcoro_unpark` are absent.
+`FENCE_SPIN`, `kcoro_park`, and `kcoro_unpark` are absent. The working-tree V2.0
+repair replaces its insufficient 64-byte isolation with 128-byte Apple base
+alignment **and stride** and extends that rule to the hot kcoro ring, engine,
+bridge, session/model-gate, and SQ/CQ storage cells. ABI-v1 command/completion
+values retain their 64-byte caller alignment. The four-versus-eight lane parity
+and current-selector rejection gates pass. The bounded three-node production
+audio route now advances token through Depthformer and Mimi with a total outcome
+map and a pre-reserved playback span. The pooled asynchronous executor, two
+independent `BLOCK4` domains, and architectural event-wait backend are not
+implemented by this repair.
 
 | Current work in Rust | Evidence | Required native owner |
 |---|---|---|
@@ -179,19 +209,19 @@ Memory:
 | Primitive | Use |
 |---|---|
 | `PRFM PLDL1KEEP`/`PLDL1STRM` | Weight streaming reads (reads = floor); STRM for one-shot planes |
-| `STNP`/`LDNP` (non-temporal hint) | Write-once playback blocks and large scratch spills, so PCM/scratch traffic does not evict streamed weights. Kept vs. non-temporal is chosen by measurement per plane and recorded in the plan. |
+| `STNP`/`LDNP` (non-temporal hint) | Candidates for write-once playback blocks and large scratch spills. Cache effects are implementation-dependent; kept vs. non-temporal is chosen by measurement per plane and recorded in the plan. |
 | `DC ZVA` (block size from `DCZID_EL0`) | Bulk zeroing: silence fills, scratch init, ring block reset |
-| 128-byte alignment rule | Contended atomics (fence generation, ring cursors, tile counter) are `alignas(128)` — M-series lines are 128 B; on x86 this also defeats adjacent-line prefetch false sharing |
+| 128-byte Apple alignment rule | Every hot atomic has 128-byte base alignment and 128-byte array/member stride on both Apple slices, including x86_64 under Rosetta. Non-Apple targets bind a compile-time platform value and verify it at startup; a runtime value cannot define C++ object layout. |
 
 Concurrency (the "multitasking" set):
 
 | Primitive | Use |
 |---|---|
-| LSE `LDADD` | The tile-claim counter — one instruction per claim |
-| LSE `SWP`, `CAS`, `CASP` | Slot ownership; `CASP` publishes a 16-byte `{generation, offset}` descriptor atomically without a seqlock |
+| LSE `LDADD` | Optional relaxed tile-claim specialization after capability selection; stronger acquire/release forms are not required for a counter whose stage board is already published |
+| LSE `SWP`, `CAS` | Slot ownership using the narrowest atomic state actually required. `CASP` is reserved for a future proven 128-bit identity transition, not required by the current 64-bit packed lease. |
 | `LDAR`/`STLR` | Ring cursor publish/observe (release/acquire), matching document 04's ordering rules |
 | release/acquire shared doorbells and logical generations | Publish command/stage identity and fan out the exact declared waiter set through one blocking host wait-word edge |
-| host wait-word adapter | Immediate blocking for unchanged generation; no `WFE`, `YIELD`, or user-space polling loop is part of the kernel contract |
+| selected wait-word backend | OS expected-value address wait by default; optional guarded `LDXR`/`WFE` experiment on AArch64. Both recheck the predicate and neither admits a user-space polling loop. |
 
 ## x86_64 Primitive Inventory
 
@@ -219,9 +249,12 @@ coordination work   one ready permit -> signal one kcoro worker
 fixed compute       generation unchanged -> register/recheck -> block wait word
 ```
 
-Neither canonical path has a spin tier. `PAUSE`, `YIELD`, repeated loads,
-WFE/UMWAIT time budgets, and timed polling are absent from the generated native
-wait code. The former `REQ_CALL` Depthformer exception is gone:
+Neither canonical path has a spin tier. `PAUSE`, `YIELD`, repeated-load budgets,
+and timed polling are absent from the generated native wait code. A future
+capability-selected `LDXR`/`WFE` or `UMONITOR`/`UMWAIT` backend is a park
+implementation, not a pre-park budget; it is disabled unless it beats the OS
+expected-value wait without raising idle CPU or power. Rosetta and unsupported
+hosts take the OS path. The former `REQ_CALL` Depthformer exception is gone:
 `run_depth_frame` uses `lane_fence` for every cross-lane dependency, and the Rust
 `SpinBarrier`/lane callback were deleted together. The former GEMM and DD FFT
 grids are typed native passes. DD FFT bit reversal and butterfly stages use the
@@ -252,15 +285,20 @@ The build selects one board owner and one helper implementation. It does not mix
 C11 atomic objects, compiler builtins, and `atomic_ref` accesses on the same
 word.
 
-A prepared handle backed by a direct futex, supported platform wait, or
-condition-variable fallback may implement the contract. A C++ adapter may use
+A prepared handle backed by a direct futex, supported platform wait, guarded
+architectural event wait, or condition-variable fallback may implement the
+contract. Every backend waits while the word still equals `expected`, returns
+only after rechecking that predicate, and tolerates spurious wakeups. A C++
+adapter may use
 `std::atomic_ref<uint32_t>::wait/notify` over the aligned raw word only when the
 selected library implementation is audited to block immediately without a
 pre-block spin tier; it may not reinterpret the address as a distinct
 `std::atomic<uint32_t>` object. The adapter must close the register/recheck race
-and tolerate spurious returns. If the platform cannot supply a conforming
-blocking wait, the fixed-executor capability is unavailable; inference does not
-silently fall back to spinning.
+and tolerate spurious returns. An event-register backend must additionally clear
+or retire its monitor correctly on exit and pass lost-wake, spurious-wake, and
+stop tests. If the platform cannot supply a conforming blocking wait, the
+fixed-executor capability is unavailable; inference does not silently fall back
+to spinning.
 
 Prepare the shared dispatch and fence words during executor creation so backend
 selection and fallback allocation happen once. Hot waits and wakes use each
@@ -275,6 +313,15 @@ generation, and wait on the shared fence word. The last lane exchanges the mask;
 when nonempty it advances that word and performs one address wake-all. Peers that
 observed the new generation before blocking clear their own declarations. The
 logical generation carries identity; the shared word only delivers the edge.
+
+For design 16's block mode, a collective has fixed membership and one shared
+`{ticket, program, stage, generation}`. Every member reaches every stage fence;
+the last arrival runs the declared bounded mixer exactly once, advances the
+generation, and wakes the parked members. A lane may not yield, retire, or switch
+to an unrelated coroutine while it owes an arrival. Coroutines sequence
+reconverged stages; assembly owns complete tiles and never yields. Dynamic audio
+fragment assembly parks the route instance before admission and never holds a
+partially arrived numerical collective.
 
 The committed evidence is
 [`G0_FENCE_SPIN_321538F1.md`](../../docs/native/baselines/G0_FENCE_SPIN_321538F1.md)
@@ -316,11 +363,12 @@ hardware callbacks. Hardware callbacks never wait.
    Apple entropy thunk calls `SecRandomCopyBytes` only at conversation creation
    or explicit reseed. `run_sampler` is absorbed into token and Depthformer
    passes and adds no per-draw or per-codebook scheduling.
-5. `native/src/runtime/wait.{h,cpp}`: one register/recheck/block wrapper used by
-   shared fixed-executor generations and audio doorbells; host wait-word adapter
-   below it, with no spin or monitor-wait inlines. Add C/C++ address-identity and
-   memory-order litmus tests proving one selected atomic helper owns every board
-   access.
+5. `native/src/runtime/wait.{h,cpp}`: one register/recheck/park wrapper used by
+   shared fixed-executor generations and audio doorbells. Keep the OS wait-word
+   adapter as the baseline; admit an architectural event backend only through
+   capability probe plus the design-16 measurement gate. Add C/C++
+   address-identity and memory-order litmus tests proving one selected atomic
+   helper owns every board access.
 6. Accelerate stage adapter: `cblas_sgemm` calls as declared stages with
    plan-recorded shapes and tiling, Apple-only, behind the same pass contract.
    A versioned tuning profile records the measured house/Accelerate winner; an
@@ -349,7 +397,9 @@ hardware callbacks. Hardware callbacks never wait.
   envelope; each nonempty logical park mask causes at most one host wake and no
   coordination wake; idle CPU is indistinguishable from a blocked process.
 - Disassembly/source audit finds no compiled spin loop, `PAUSE`, `YIELD`,
-  WFE/UMWAIT budget, or timed polling in a fence, command wait, or doorbell.
+  monitor-wait budget, or timed polling in a fence, command wait, or doorbell.
+  If an event-register backend is selected, the audit instead proves one
+  arm-and-park loop around the expected-value predicate and an OS fallback.
 - C/C++ and TSan tests prove the wait adapter observes the same aligned raw word
   used by the selected atomic helper; no atomic-object reinterpret cast or mixed
   helper access exists.

@@ -53,6 +53,7 @@
 #include "lfm_kernel_bridge.h"
 #include "lfm_mimi.h"
 #include "lfm_model_plan.h"
+#include "../model/lfm_route_epoch.h"
 
 extern "C" {
 #include "kc_atomic.h"
@@ -83,10 +84,15 @@ namespace {
 
 constexpr int MAX_WORKERS = 16;
 constexpr size_t PASS_CAPACITY = 2;
+// Apple Silicon and every Apple-hosted slice (including Rosetta) run on
+// 128-byte cache lines.  Keeping this conservative size on other targets is
+// harmless and prevents adjacent expected-value words from sharing a line.
+constexpr size_t ENGINE_CACHELINE = 128;
 constexpr uint32_t PASS_ADMISSION_EXCLUSIVE = uint32_t{1} << 31;
 constexpr uint32_t PASS_ADMISSION_COUNT = PASS_ADMISSION_EXCLUSIVE - 1;
 constexpr size_t DOWN_BAND_CAP = 512; // worker-stack y[] extent
 constexpr size_t PREFILL_ROWS = LFM_PREFILL_MAX_ROWS;
+constexpr size_t TOKEN_INPUT_MAX_IDS = 8;
 std::atomic<uint64_t> next_engine_epoch{1};
 
 static bool checked_size_product(size_t left, size_t right, size_t *out) {
@@ -255,6 +261,32 @@ enum : int {
     REQ_AUDIO_ENCODE = 15,
 };
 
+static constexpr bool request_kind_valid(uint32_t kind) {
+    switch (kind) {
+    case REQ_MLP:
+    case REQ_CONV_LAYER:
+    case REQ_ATTN_LAYER:
+    case REQ_TOKEN_PASS:
+    case REQ_PRNG:
+    case REQ_SAMPLE:
+    case REQ_DEPTH_FRAME:
+    case REQ_DEPTHWISE_STREAM:
+    case REQ_GEMM:
+    case REQ_FFT_CONV_DD:
+    case REQ_IRFFT_DD:
+    case REQ_PREFILL:
+    case REQ_MIMI_DECODE:
+    case REQ_AUDIO_ENCODE:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static constexpr bool logical_lane_count_valid(size_t lanes) {
+    return lanes >= 1 && lanes <= static_cast<size_t>(MAX_WORKERS);
+}
+
 struct PrngReq {
     LfmPrngStateV1 *state = nullptr;
     uint64_t *out = nullptr;
@@ -280,6 +312,7 @@ struct DepthReq {
     LfmSamplerConfigV1 sampler{};
     LfmPrngStateV1 *sample_state = nullptr;
     uint32_t *out_tokens = nullptr;
+    int completion_status = 0; // private deterministic route-fault seam
 };
 
 struct DepthwiseStreamReq {
@@ -500,6 +533,7 @@ struct MimiReq {
     float *pcm = nullptr;
     size_t capacity = 0;
     size_t *out_samples = nullptr;
+    int completion_status = 0; // private deterministic route-fault seam
 };
 
 struct AudioReq {
@@ -541,13 +575,16 @@ struct ScratchBank {
 };
 
 struct Engine;
-struct alignas(64) WaitWord {
+struct alignas(ENGINE_CACHELINE) WaitWord {
     uint32_t value = 0;
     uint32_t reserved = 0;
     kc_port_wait_word *wait = nullptr;
-    uint8_t padding[48] = {};
+    uint8_t padding[ENGINE_CACHELINE - 16] = {};
 };
-static_assert(sizeof(WaitWord) == 64, "shared doorbells must not share cache lines");
+static_assert(sizeof(WaitWord) == ENGINE_CACHELINE,
+              "shared doorbells must occupy a complete cache line");
+static_assert(alignof(WaitWord) == ENGINE_CACHELINE,
+              "shared doorbells must start on a cache-line boundary");
 
 enum : uint32_t {
     PASS_SLOT_FREE = 0,
@@ -595,6 +632,10 @@ struct PassSlot {
      * can release its completed slot, pause before its destructor, and observe
      * the same physical slot RESERVED by a continuation. */
     std::atomic<uint64_t> reservation_sequence{0};
+    /* True only for the bounded audio route. Its caller owns the admission
+     * high bit until this exact slot is FREE, so releasing the slot must not
+     * decrement the ordinary low-bit lease count. */
+    bool exclusive_admission = false;
     WaitWord completion_word;
     WaitWord audio_word;
     KcSubmissionV1 submission{};
@@ -622,6 +663,10 @@ struct PassSlot {
     AudioReq audio;
     ScratchBank scratch;
 };
+static_assert(alignof(PassSlot) >= ENGINE_CACHELINE,
+              "pass-slot wait words require cache-line-aligned array elements");
+static_assert(sizeof(PassSlot) % ENGINE_CACHELINE == 0,
+              "pass-slot array stride must preserve wait-word isolation");
 
 /* Stack-scoped authority for the exact slot whose CQ record triggered a
  * continuation. The type never crosses a header or the product ABI. Keeping
@@ -741,6 +786,8 @@ struct Engine {
     std::atomic<uint32_t> test_claim_return_pause{0};
     std::atomic<uint32_t> test_continuation_pause{0};
     std::atomic<uint32_t> test_live_target{0};
+    std::atomic<int> test_audio_route_depth_status{0};
+    std::atomic<int> test_audio_route_mimi_status{0};
 
     ConvReq conv;  // conv-layer request payload
     AttnReq attn;  // attention-layer request payload
@@ -878,8 +925,24 @@ static void clear_slot_request(PassSlot *slot) {
     slot->audio.done.store(true, std::memory_order_relaxed);
 }
 
-static PassSlot *reserve_pass_slot(Engine *e) {
-    if (!enter_pass_admission(e)) return nullptr;
+static PassSlot *reserve_pass_slot(Engine *e,
+                                   bool allow_exclusive = false) {
+    if (!e) return nullptr;
+    if (allow_exclusive) {
+        if (e->pass_admission.load(std::memory_order_acquire) !=
+            PASS_ADMISSION_EXCLUSIVE) {
+            return nullptr;
+        }
+    } else {
+        /* This early check is repeated after the physical reservation. The
+         * admission CAS is authoritative; the two checks document and close
+         * the route-acquisition boundary for future reservation changes. */
+        if ((e->pass_admission.load(std::memory_order_acquire) &
+             PASS_ADMISSION_EXCLUSIVE) != 0 ||
+            !enter_pass_admission(e)) {
+            return nullptr;
+        }
+    }
     for (PassSlot &slot : e->slots) {
         uint64_t expected = pass_slot_lease(0, PASS_SLOT_FREE);
         if (!slot.lease.compare_exchange_strong(
@@ -887,6 +950,17 @@ static PassSlot *reserve_pass_slot(Engine *e) {
                 std::memory_order_acq_rel,
                 std::memory_order_acquire)) {
             continue;
+        }
+        const uint32_t admission =
+            e->pass_admission.load(std::memory_order_acquire);
+        const bool admitted = allow_exclusive
+            ? admission == PASS_ADMISSION_EXCLUSIVE
+            : (admission & PASS_ADMISSION_EXCLUSIVE) == 0;
+        if (!admitted) {
+            slot.lease.store(pass_slot_lease(0, PASS_SLOT_FREE),
+                             std::memory_order_release);
+            if (!allow_exclusive) leave_pass_admission(e);
+            return nullptr;
         }
         constexpr uint64_t max_generation =
             UINT64_MAX >> PASS_SLOT_STATE_BITS;
@@ -901,6 +975,7 @@ static PassSlot *reserve_pass_slot(Engine *e) {
             generation &= max_generation;
         }
         clear_slot_request(&slot);
+        slot.exclusive_admission = allow_exclusive;
         /* CLAIMING is deliberately non-releasable. A stale owner cannot see a
          * recycled RESERVED state until the new generation is published. */
         slot.lease.store(pass_slot_lease(generation, PASS_SLOT_RESERVED),
@@ -912,7 +987,7 @@ static PassSlot *reserve_pass_slot(Engine *e) {
             signal_all(&e->dispatch_word);
         return &slot;
     }
-    leave_pass_admission(e);
+    if (!allow_exclusive) leave_pass_admission(e);
     return nullptr;
 }
 
@@ -925,9 +1000,11 @@ static bool release_pass_slot(PassSlot *slot, uint64_t generation) {
                          PASS_SLOT_RELEASING)) {
         return false;
     }
+    const bool exclusive = slot->exclusive_admission;
     clear_slot_request(slot);
     e->pass_slots_live.fetch_sub(1, std::memory_order_acq_rel);
-    leave_pass_admission(e);
+    if (!exclusive) leave_pass_admission(e);
+    slot->exclusive_admission = false;
     /* FREE is the final publication edge. Publishing it before the accounting
      * decrements lets a recycler increment live 2 -> 3 on a two-slot engine. */
     slot->lease.store(pass_slot_lease(0, PASS_SLOT_FREE),
@@ -1114,6 +1191,108 @@ class PlanClaim {
   private:
     Engine *engine_ = nullptr;
     bool held_ = false;
+};
+
+/* The three-node audio route is the sole SQ producer from first admission to
+ * exact-slot retirement. Acquisition happens on the caller while holding the
+ * ordinary producer mutex; callbacks subsequently need neither that mutex nor
+ * the descriptor mutex. */
+class AudioRouteClaim {
+  public:
+    explicit AudioRouteClaim(Engine *engine) : engine_(engine) {
+        if (!engine_) return;
+        std::lock_guard<std::mutex> submit(engine_->submission_mutex);
+        bool idle = false;
+        if (!engine_->pass_claimed.compare_exchange_strong(
+                idle, true, std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            return;
+        }
+        if (engine_->pass_slots_live.load(std::memory_order_acquire) != 0) {
+            engine_->pass_claimed.store(false, std::memory_order_release);
+            return;
+        }
+        uint32_t admission = 0;
+        if (!engine_->pass_admission.compare_exchange_strong(
+                admission, PASS_ADMISSION_EXCLUSIVE,
+                std::memory_order_acq_rel, std::memory_order_acquire)) {
+            engine_->pass_claimed.store(false, std::memory_order_release);
+            return;
+        }
+        slot_ = reserve_pass_slot(engine_, true);
+        if (!slot_) {
+            const uint32_t previous = engine_->pass_admission.exchange(
+                0, std::memory_order_release);
+            if (previous != PASS_ADMISSION_EXCLUSIVE) std::abort();
+            engine_->pass_claimed.store(false, std::memory_order_release);
+            return;
+        }
+        generation_ = slot_generation(slot_);
+        held_ = true;
+    }
+
+    ~AudioRouteClaim() {
+        if (!held_) return;
+        if (slot_ && !release_pass_slot(slot_, generation_)) std::abort();
+        for (const KcDescriptorIdV1 descriptor : descriptors_) {
+            if (descriptor.generation != 0 &&
+                lfm_kernel_bridge_descriptor_release(engine_->bridge,
+                                                     descriptor) != 0) {
+                std::abort();
+            }
+        }
+        if (producer_ &&
+            lfm_kernel_bridge_producer_release(engine_->bridge) != 0) {
+            std::abort();
+        }
+        const uint32_t previous = engine_->pass_admission.exchange(
+            0, std::memory_order_release);
+        if (previous != PASS_ADMISSION_EXCLUSIVE) std::abort();
+        engine_->pass_claimed.store(false, std::memory_order_release);
+    }
+
+    int prepare_descriptors() {
+        if (!held_ || producer_) return -ESTALE;
+        constexpr std::array<uint32_t, 3> kinds = {
+            REQ_TOKEN_PASS, REQ_DEPTH_FRAME, REQ_MIMI_DECODE};
+        for (size_t index = 0; index < kinds.size(); ++index) {
+            LfmKernelDescriptorSpecV1 spec = {
+                .size = sizeof(LfmKernelDescriptorSpecV1),
+                .abi_version = KC_COORD_ABI_VERSION,
+                .kind = kinds[index],
+                .flags = 0,
+                .payload = slot_,
+                .context = nullptr,
+                .release = nullptr,
+                .reserved = {0, 0, 0},
+            };
+            const int status = lfm_kernel_bridge_descriptor_create(
+                engine_->bridge, &spec, &descriptors_[index]);
+            if (status != 0) return status;
+        }
+        const int status =
+            lfm_kernel_bridge_producer_acquire(engine_->bridge);
+        if (status != 0) return status;
+        producer_ = true;
+        return 0;
+    }
+
+    explicit operator bool() const { return held_; }
+    PassSlot *slot() const { return slot_; }
+    uint64_t generation() const { return generation_; }
+    const std::array<KcDescriptorIdV1, 3> &descriptors() const {
+        return descriptors_;
+    }
+    AudioRouteClaim(const AudioRouteClaim &) = delete;
+    AudioRouteClaim &operator=(const AudioRouteClaim &) = delete;
+
+  private:
+    Engine *engine_ = nullptr;
+    PassSlot *slot_ = nullptr;
+    uint64_t generation_ = 0;
+    std::array<KcDescriptorIdV1, 3> descriptors_{};
+    bool held_ = false;
+    bool producer_ = false;
 };
 
 // ---- tile bodies (identical math to decode.rs) ----------------------------------------
@@ -1807,6 +1986,9 @@ static void run_depth_frame(Engine *e, uint32_t lane) {
             scratch.df_b.data() + begin, end - begin);
         lane_fence(e, lane, [] {});
     }
+    if (lane == 0 && request.completion_status != 0)
+        e->active_status.store(request.completion_status,
+                               std::memory_order_release);
 }
 
 // ---- the pass programs (every lane runs these, whole) ----------------------------------
@@ -1849,7 +2031,6 @@ static void run_conv_block(Engine *e, uint32_t lane, const LfmLayerDesc *d,
                            uint16_t *state_out, uint16_t *out, size_t lanes) {
     ScPass *c = &e->sc;
     const size_t h = e->model->h;
-    if (lanes < 1) lanes = 1;
     uint32_t sc_tiles = (uint32_t)(lanes > h ? h : lanes);
     uint32_t hc = (uint32_t)((h + sc_tiles - 1) / sc_tiles);
     uint32_t pc = (uint32_t)((3 * h + sc_tiles - 1) / sc_tiles);
@@ -1952,7 +2133,6 @@ static void run_attn_block(Engine *e, uint32_t lane, size_t layer_idx,
     AtPass *a = &e->at;
     const size_t h = e->model->h;
     const size_t nh = d->n_head, nkv = d->n_kv, hd = d->hd;
-    if (lanes < 1) lanes = 1;
     uint32_t tiles = (uint32_t)(lanes > h ? h : lanes);
     uint32_t hc = (uint32_t)((h + tiles - 1) / tiles);
 
@@ -2052,7 +2232,7 @@ static void run_token_pass(Engine *e, uint32_t lane) {
     const TokenReq *t = &e->tok;
     BackbonePlan *model = e->model;
     const size_t h = model->h;
-    size_t lanes = t->lanes < 1 ? 1 : t->lanes;
+    const size_t lanes = t->lanes;
     uint16_t *plane0 = e->tk_h0.data();
     uint16_t *plane1 = e->tk_h1.data();
     Bf16Input hidden{};
@@ -2067,7 +2247,7 @@ static void run_token_pass(Engine *e, uint32_t lane) {
     } else if (t->embed_kind == 0) {
         hidden = Bf16Input::from_resident(
             weight_offset(model->embed_w, (size_t)t->ids[0] * h));
-    } else {
+    } else if (t->embed_kind == 1) {
         hidden = Bf16Input::from_activation(plane0);
         lane_fence(e, lane, [&] {
             // Embed (serial — at most 8 rows). Audio matches candle's `.sum(0)`:
@@ -2079,6 +2259,9 @@ static void run_token_pass(Engine *e, uint32_t lane) {
                 lfm_bf16_add(plane0, row, plane0, (int)h);
             }
         });
+    } else {
+        e->active_status.store(-EINVAL, std::memory_order_release);
+        return;
     }
 
     // The layer walk. The first input may be a resident weight row or borrowed
@@ -2090,10 +2273,13 @@ static void run_token_pass(Engine *e, uint32_t lane) {
         if (d->kind == 0) {
             run_conv_block(e, lane, d, hidden, st->conv_state, st->conv_state,
                            next, lanes);
-        } else {
+        } else if (d->kind == 1) {
             run_attn_block(e, lane, l, hidden, st->k_plane, st->v_plane,
                            st->head_stride, t->pos, t->cos_base, t->sin_base,
                            next, lanes);
+        } else {
+            e->active_status.store(-EINVAL, std::memory_order_release);
+            return;
         }
         hidden = Bf16Input::from_activation(next);
         next = next == plane0 ? plane1 : plane0;
@@ -2454,11 +2640,16 @@ static void run_prefill(Engine *e, uint32_t lane) {
     PrefillWorkspace *w = request->workspace;
     const size_t rows = request->rows;
     const size_t h = e->model->h;
-    const PrefillInput first = request->embed_kind == 0
-                                   ? PrefillInput{.embedding = e->model->embed_w,
-                                                  .ids = request->ids, .h = h}
-                                   : PrefillInput{.rows = request->provided_rows,
-                                                  .h = h};
+    PrefillInput first{};
+    if (request->embed_kind == 0) {
+        first = {.embedding = e->model->embed_w,
+                 .ids = request->ids, .h = h};
+    } else if (request->embed_kind == 2) {
+        first = {.rows = request->provided_rows, .h = h};
+    } else {
+        e->active_status.store(-EINVAL, std::memory_order_release);
+        return;
+    }
     PrefillInput hidden = first;
     uint16_t *next = w->h1.data();
 
@@ -2468,8 +2659,11 @@ static void run_prefill(Engine *e, uint32_t lane) {
         if (desc->kind == 0) {
             run_prefill_conv(e, lane, desc, hidden, state->conv_state,
                              next, rows);
-        } else {
+        } else if (desc->kind == 1) {
             run_prefill_attention(e, lane, layer, hidden, state, next, rows);
+        } else {
+            e->active_status.store(-EINVAL, std::memory_order_release);
+            return;
         }
         hidden = {.rows = next, .h = h};
         next = next == w->h0.data() ? w->h1.data() : w->h0.data();
@@ -2898,8 +3092,11 @@ static void lane_program(Engine *e, uint32_t lane) {
         break;
     case REQ_MIMI_DECODE:
         if (lane == 0) {
-            const int samples = mimi_decode_state_step(
-                e->mimi.state, e->mimi.codes, e->mimi.pcm);
+            const int samples = e->mimi.completion_status != 0
+                                    ? e->mimi.completion_status
+                                    : mimi_decode_state_step(
+                                          e->mimi.state, e->mimi.codes,
+                                          e->mimi.pcm);
             if (samples < 0) {
                 e->active_status.store(samples, std::memory_order_release);
             } else if (static_cast<size_t>(samples) > e->mimi.capacity) {
@@ -2913,6 +3110,11 @@ static void lane_program(Engine *e, uint32_t lane) {
         run_audio_encode(e, lane);
         break;
     default:
+        // A request selector is a closed protocol value.  This is a final
+        // defense behind submission/descriptor validation: corruption must
+        // become a failed completion, never a successful no-op.
+        if (lane == 0)
+            e->active_status.store(-EINVAL, std::memory_order_release);
         break;
     }
     lane_fence(e, lane, [] {});
@@ -3018,8 +3220,13 @@ static void *bridge_main(void *arg) {
             .size = sizeof(LfmKernelDescriptorViewV1),
             .abi_version = KC_COORD_ABI_VERSION,
         };
-        int descriptor_rc = lfm_kernel_bridge_descriptor_get(
-            e->bridge, submission.descriptor, &descriptor);
+        const bool borrowed_descriptor =
+            submission.flags == KC_COORD_SUBMISSION_BORROWED_DESCRIPTOR;
+        int descriptor_rc = borrowed_descriptor
+            ? lfm_kernel_bridge_descriptor_get_borrowed(
+                  e->bridge, submission.descriptor, &descriptor)
+            : lfm_kernel_bridge_descriptor_get(
+                  e->bridge, submission.descriptor, &descriptor);
         PassSlot *slot = descriptor_rc == 0
             ? slot_from_payload(e, descriptor.payload)
             : nullptr;
@@ -3031,16 +3238,19 @@ static void *bridge_main(void *arg) {
                      slot_state(slot) == PASS_SLOT_SUBMITTED;
         if (valid) {
             valid =
+                     request_kind_valid(descriptor.kind) &&
                      submission.command == KC_COORD_COMMAND_RUN_PASS &&
                      submission.pass_budget == 1 &&
+                     submission.flags ==
+                         (borrowed_descriptor
+                              ? KC_COORD_SUBMISSION_BORROWED_DESCRIPTOR
+                              : 0) &&
                      submission.ticket.kind == KC_COORD_TICKET_PASS &&
                      submission.epoch != 0 &&
                      descriptor.payload == slot && descriptor.flags == 0 &&
                      slot->engine == e && slot->request == (int)descriptor.kind &&
                      slot->context_id == submission.conversation_id &&
-                     ticket_equal(slot->submission.ticket, submission.ticket) &&
-                     descriptor.kind > REQ_NONE &&
-                     descriptor.kind <= REQ_AUDIO_ENCODE;
+                     ticket_equal(slot->submission.ticket, submission.ticket);
         }
         if (valid) {
             switch (descriptor.kind) {
@@ -3173,9 +3383,17 @@ static uint32_t next_generation(std::atomic<uint32_t> *counter) {
 static int submit_slot(Engine *e, PassSlot *slot, uint64_t generation,
                        int request, uint64_t context_id,
                        PassContinuation continuation,
-                       void *continuation_context) {
-    if (!e || !slot || slot->engine != e || request <= REQ_NONE ||
-        request > REQ_AUDIO_ENCODE || generation == 0 ||
+                       void *continuation_context,
+                       const KcDescriptorIdV1 *borrowed_descriptor = nullptr) {
+    if (!e || !slot || slot->engine != e ||
+        !request_kind_valid(static_cast<uint32_t>(request)) || generation == 0 ||
+        slot->exclusive_admission != (borrowed_descriptor != nullptr) ||
+        (borrowed_descriptor &&
+         e->pass_admission.load(std::memory_order_acquire) !=
+             PASS_ADMISSION_EXCLUSIVE) ||
+        (borrowed_descriptor &&
+         (borrowed_descriptor->slot == UINT32_MAX ||
+          borrowed_descriptor->generation == 0)) ||
         slot->lease.load(std::memory_order_acquire) !=
             pass_slot_lease(generation, PASS_SLOT_RESERVED)) {
         return -EINVAL;
@@ -3198,7 +3416,8 @@ static int submit_slot(Engine *e, PassSlot *slot, uint64_t generation,
         .release = nullptr,
         .reserved = {0, 0, 0},
     };
-    KcDescriptorIdV1 descriptor{};
+    KcDescriptorIdV1 descriptor =
+        borrowed_descriptor ? *borrowed_descriptor : KcDescriptorIdV1{};
     KcSubmissionV1 submission{};
     submission.size = sizeof(submission);
     submission.abi_version = KC_COORD_ABI_VERSION;
@@ -3211,6 +3430,9 @@ static int submit_slot(Engine *e, PassSlot *slot, uint64_t generation,
     submission.descriptor = descriptor;
     submission.command = KC_COORD_COMMAND_RUN_PASS;
     submission.service_class = KC_COORD_SERVICE_INTERACTIVE;
+    submission.flags = borrowed_descriptor
+        ? KC_COORD_SUBMISSION_BORROWED_DESCRIPTOR
+        : 0;
     submission.pass_budget = 1;
 
     slot->request = request;
@@ -3219,7 +3441,18 @@ static int submit_slot(Engine *e, PassSlot *slot, uint64_t generation,
     slot->continuation_context = continuation_context;
 
     int rc = 0;
-    {
+    if (borrowed_descriptor) {
+        submission.descriptor = descriptor;
+        slot->submission = submission;
+        slot->lease.store(pass_slot_lease(generation,
+                                          PASS_SLOT_SUBMITTED),
+                          std::memory_order_release);
+        rc = lfm_kernel_bridge_submit_borrowed(e->bridge, &submission);
+        if (rc != 0)
+            slot->lease.store(pass_slot_lease(generation,
+                                              PASS_SLOT_RESERVED),
+                              std::memory_order_release);
+    } else {
         // The bridge SQ is SPSC. Native recurrence and compatibility callers
         // share this tiny admission critical section; no model value or scratch
         // is copied while it is held.
@@ -3242,7 +3475,7 @@ static int submit_slot(Engine *e, PassSlot *slot, uint64_t generation,
                                   std::memory_order_release);
         }
     }
-    if (descriptor.generation != 0) {
+    if (!borrowed_descriptor && descriptor.generation != 0) {
         const int release_rc =
             lfm_kernel_bridge_descriptor_release(e->bridge, descriptor);
         if (release_rc != 0) std::abort();
@@ -3264,7 +3497,9 @@ static int submit_slot(Engine *e, PassSlot *slot, uint64_t generation,
 static int submit_continuation(PassContinuationPermit *permit, int request,
                                uint64_t context_id,
                                PassContinuation continuation,
-                               void *continuation_context) {
+                               void *continuation_context,
+                               const KcDescriptorIdV1 *borrowed_descriptor =
+                                   nullptr) {
     if (!permit || permit->consumed || !permit->engine || !permit->slot ||
         permit->slot->engine != permit->engine || permit->generation == 0 ||
         permit->slot->lease.load(std::memory_order_acquire) !=
@@ -3274,7 +3509,7 @@ static int submit_continuation(PassContinuationPermit *permit, int request,
     const int rc = submit_slot(permit->engine, permit->slot,
                                permit->generation, request,
                                context_id, continuation,
-                               continuation_context);
+                               continuation_context, borrowed_descriptor);
     if (rc == 0) permit->consumed = true;
     return rc;
 }
@@ -3394,6 +3629,227 @@ static void continue_prng_chain(PassContinuationPermit *permit,
     finish_prng_chain(chain, rc);
 }
 
+// The production audio route is deliberately smaller than a graph runtime:
+// three trusted coarse nodes and one total immutable outcome table.
+enum : uint32_t {
+    AUDIO_ROUTE_TOKEN = 0,
+    AUDIO_ROUTE_DEPTH = 1,
+    AUDIO_ROUTE_MIMI = 2,
+    AUDIO_ROUTE_NODE_COUNT = 3,
+};
+enum : uint32_t {
+    AUDIO_ROUTE_SUCCESS = 0,
+    AUDIO_ROUTE_FAILURE = 1,
+    AUDIO_ROUTE_EOAUDIO = 2,
+    AUDIO_ROUTE_STALE = 3,
+    AUDIO_ROUTE_OUTCOME_COUNT = 4,
+};
+enum : uint32_t {
+    AUDIO_ROUTE_TERMINAL = AUDIO_ROUTE_NODE_COUNT,
+};
+
+static constexpr std::array<std::array<uint8_t, AUDIO_ROUTE_OUTCOME_COUNT>,
+                            AUDIO_ROUTE_NODE_COUNT>
+    AUDIO_ROUTE_TABLE = {{
+        {{AUDIO_ROUTE_DEPTH, AUDIO_ROUTE_TERMINAL, AUDIO_ROUTE_TERMINAL,
+          AUDIO_ROUTE_TERMINAL}},
+        {{AUDIO_ROUTE_MIMI, AUDIO_ROUTE_TERMINAL, AUDIO_ROUTE_TERMINAL,
+          AUDIO_ROUTE_TERMINAL}},
+        {{AUDIO_ROUTE_TERMINAL, AUDIO_ROUTE_TERMINAL, AUDIO_ROUTE_TERMINAL,
+          AUDIO_ROUTE_TERMINAL}},
+    }};
+
+static bool audio_route_next(uint32_t node, uint32_t outcome,
+                             uint32_t *target) {
+    if (!target || node >= AUDIO_ROUTE_NODE_COUNT ||
+        outcome >= AUDIO_ROUTE_OUTCOME_COUNT) {
+        return false;
+    }
+    const uint32_t next = AUDIO_ROUTE_TABLE[node][outcome];
+    if (next > AUDIO_ROUTE_TERMINAL) return false;
+    *target = next;
+    return true;
+}
+
+struct AudioRouteInstance {
+    uint32_t node = AUDIO_ROUTE_TOKEN;
+    uint64_t depth_id = 0;
+    DepthPlan *depth = nullptr;
+    DepthReq depth_req{};
+    BackbonePlan *model = nullptr;
+    uint64_t model_id = 0;
+    MimiReq mimi_req{};
+    const LfmRouteEpoch *epoch = nullptr;
+    uint64_t expected_epoch = 0;
+    LfmAudioRouteResult *result = nullptr;
+    bool decode_mimi = false;
+    LfmTokenCommitRecord commit{};
+    uint32_t *token_completed = nullptr;
+    std::array<KcDescriptorIdV1, AUDIO_ROUTE_NODE_COUNT> descriptors{};
+    int status = -EINPROGRESS;
+};
+
+static int preflight_audio_route_commit(const LfmTokenCommitRecord *commit,
+                                        size_t position) {
+    if (!commit || !commit->window || !commit->token_committed) return -EINVAL;
+    const LfmContextWindowState *window = commit->window;
+    if (position != commit->expected_position ||
+        window->position != commit->expected_position ||
+        window->start != commit->expected_start ||
+        window->cursor != commit->expected_cursor ||
+        window->rope_base != commit->expected_rope_base) {
+        return -ESTALE;
+    }
+    return lfm_context_window_can_commit(window);
+}
+
+static int commit_audio_route_token(AudioRouteInstance *route) {
+    if (!route || !route->token_completed || !route->commit.window ||
+        !route->commit.token_committed ||
+        *route->commit.token_committed != 0) {
+        return -EINVAL;
+    }
+    *route->token_completed = 1;
+    LfmContextWindowState *window = route->commit.window;
+    if (window->position != route->commit.expected_position ||
+        window->start != route->commit.expected_start ||
+        window->cursor != route->commit.expected_cursor ||
+        window->rope_base != route->commit.expected_rope_base) {
+        return -ESTALE;
+    }
+    const int status = lfm_context_window_commit(window);
+    if (status == 0) *route->commit.token_committed = 1;
+    return status;
+}
+
+static void finish_audio_route(PassContinuationPermit *permit,
+                               AudioRouteInstance *route, int status) {
+    if (!permit || permit->consumed || !permit->slot || !route) std::abort();
+    route->status = status;
+    if (route->result) route->result->status = status;
+    if (!transition_slot(permit->slot, permit->generation,
+                         PASS_SLOT_RESERVED, PASS_SLOT_COMPLETE)) {
+        std::abort();
+    }
+    permit->consumed = true;
+    signal_all(&permit->slot->completion_word);
+}
+
+static void continue_audio_route(PassContinuationPermit *permit,
+                                 const KcCompletionV1 &completion,
+                                 void *context) noexcept {
+    AudioRouteInstance *route = static_cast<AudioRouteInstance *>(context);
+    if (!permit || !route) std::abort();
+    uint32_t outcome = completion.status == 0 ? AUDIO_ROUTE_SUCCESS
+                                              : AUDIO_ROUTE_FAILURE;
+    if (completion.status == 0 && route->node == AUDIO_ROUTE_TOKEN) {
+        const int commit_status = commit_audio_route_token(route);
+        if (commit_status != 0) {
+            finish_audio_route(permit, route, commit_status);
+            return;
+        }
+        if (route->decode_mimi &&
+            route->epoch->load(std::memory_order_acquire) !=
+                route->expected_epoch) {
+            outcome = AUDIO_ROUTE_STALE;
+        }
+    } else if (completion.status == 0 && route->node == AUDIO_ROUTE_DEPTH &&
+               route->decode_mimi) {
+        route->result->depth_completed = 1;
+        if (route->result->codes[0] == LFM_MIMI_CODE_VALUES) {
+            route->result->eoaudio = 1;
+            outcome = AUDIO_ROUTE_EOAUDIO;
+        } else if (route->epoch->load(std::memory_order_acquire) !=
+                   route->expected_epoch) {
+            outcome = AUDIO_ROUTE_STALE;
+        } else {
+            for (size_t index = 0; index < LFM_MIMI_CODEBOOKS; ++index) {
+                if (route->result->codes[index] >= LFM_MIMI_CODE_VALUES) {
+                    finish_audio_route(permit, route, -ERANGE);
+                    return;
+                }
+            }
+        }
+    } else if (completion.status == 0 && route->node == AUDIO_ROUTE_MIMI &&
+               route->decode_mimi) {
+        route->result->mimi_completed = 1;
+        if (route->epoch->load(std::memory_order_acquire) !=
+            route->expected_epoch) {
+            outcome = AUDIO_ROUTE_STALE;
+        }
+    }
+    uint32_t target = AUDIO_ROUTE_TERMINAL;
+    if (!audio_route_next(route->node, outcome, &target)) {
+        finish_audio_route(permit, route, -EPROTO);
+        return;
+    }
+    if (completion.status != 0) {
+        finish_audio_route(permit, route, completion.status);
+        return;
+    }
+    if (outcome == AUDIO_ROUTE_STALE) {
+        finish_audio_route(permit, route, -ESTALE);
+        return;
+    }
+    if (outcome == AUDIO_ROUTE_EOAUDIO) {
+        finish_audio_route(permit, route, 0);
+        return;
+    }
+    /* The retained two-node compatibility seam terminates after Depth. */
+    if (!route->decode_mimi && route->node == AUDIO_ROUTE_DEPTH) {
+        finish_audio_route(permit, route, 0);
+        return;
+    }
+    if (target == AUDIO_ROUTE_TERMINAL) {
+        finish_audio_route(permit, route, 0);
+        return;
+    }
+    int request = REQ_NONE;
+    uint64_t context_id = 0;
+    if (route->node == AUDIO_ROUTE_TOKEN && target == AUDIO_ROUTE_DEPTH &&
+        route->depth && route->depth_id != 0) {
+        permit->slot->depth = route->depth;
+        permit->slot->depth_req = route->depth_req;
+        route->node = AUDIO_ROUTE_DEPTH;
+        request = REQ_DEPTH_FRAME;
+        context_id = route->depth_id;
+    } else if (route->node == AUDIO_ROUTE_DEPTH && target == AUDIO_ROUTE_MIMI &&
+               route->decode_mimi && route->model && route->model_id != 0) {
+        permit->slot->model = route->model;
+        permit->slot->mimi = route->mimi_req;
+        route->node = AUDIO_ROUTE_MIMI;
+        request = REQ_MIMI_DECODE;
+        context_id = route->model_id;
+    } else {
+        finish_audio_route(permit, route, -EPROTO);
+        return;
+    }
+    const int status = submit_continuation(
+        permit, request, context_id, continue_audio_route, route,
+        &route->descriptors[target]);
+    if (status != 0) finish_audio_route(permit, route, status);
+}
+
+static int wait_audio_route(PassSlot *slot, uint64_t generation,
+                            const AudioRouteInstance &route) {
+    if (!slot || generation == 0) return -EINVAL;
+    uint32_t observed =
+        kc_atomic_u32_load_acquire(&slot->completion_word.value);
+    while (slot->lease.load(std::memory_order_acquire) !=
+           pass_slot_lease(generation, PASS_SLOT_COMPLETE)) {
+        const int status =
+            kc_port_wait_u32(slot->completion_word.wait, observed, 0);
+        observed =
+            kc_atomic_u32_load_acquire(&slot->completion_word.value);
+        if (status != 0 &&
+            slot->lease.load(std::memory_order_acquire) !=
+                pass_slot_lease(generation, PASS_SLOT_COMPLETE)) {
+            std::abort();
+        }
+    }
+    return route.status;
+}
+
 } // namespace
 
 // ---- the C ABI ------------------------------------------------------------------------
@@ -3404,8 +3860,7 @@ void lfm_engine_free(void *ep);
 // `workers` is the total fixed lane count. Every logical lane owns one pthread for
 // the engine lifetime; one mechanical bridge dispatcher owns SQ consumption.
 void *lfm_engine_new(int workers) {
-    if (workers < 1) workers = 1;
-    if (workers > MAX_WORKERS) workers = MAX_WORKERS;
+    if (workers < 1 || workers > MAX_WORKERS) return nullptr;
     Engine *e = new (std::nothrow) Engine();
     if (!e) return nullptr;
     e->runtime_epoch = next_engine_epoch.fetch_add(1, std::memory_order_acq_rel);
@@ -3578,6 +4033,76 @@ int lfm_internal_engine_wait_pass_slots_for_test(void *ep, uint32_t live) {
     return 0;
 }
 
+// Private implementation-backed protocol probes. Selector membership is
+// queried without dispatch: a valid request also requires a fully populated
+// typed payload, so submitting an empty test slot would be an unsafe probe.
+int lfm_internal_engine_request_kind_valid_for_test(uint32_t kind) {
+    return request_kind_valid(kind) ? 1 : 0;
+}
+
+int lfm_internal_engine_wait_word_layout_for_test(void *ep) {
+    Engine *e = static_cast<Engine *>(ep);
+    if (!e) return -EINVAL;
+    constexpr size_t WAIT_WORD_COUNT = 2 + PASS_CAPACITY * 2;
+    std::array<const WaitWord *, WAIT_WORD_COUNT> words{};
+    words[0] = &e->dispatch_word;
+    words[1] = &e->fence_word;
+    for (size_t slot = 0; slot < PASS_CAPACITY; ++slot) {
+        words[2 + slot * 2] = &e->slots[slot].completion_word;
+        words[3 + slot * 2] = &e->slots[slot].audio_word;
+    }
+    for (size_t left = 0; left < WAIT_WORD_COUNT; ++left) {
+        const uintptr_t address = reinterpret_cast<uintptr_t>(words[left]);
+        if (address % ENGINE_CACHELINE != 0) return -EFAULT;
+        for (size_t right = left + 1; right < WAIT_WORD_COUNT; ++right) {
+            const uintptr_t peer = reinterpret_cast<uintptr_t>(words[right]);
+            if (address / ENGINE_CACHELINE == peer / ENGINE_CACHELINE)
+                return -EFAULT;
+        }
+    }
+    return 0;
+}
+
+int lfm_internal_engine_audio_route_edge_for_test(uint32_t node,
+                                                  uint32_t outcome,
+                                                  uint32_t *target) {
+    return audio_route_next(node, outcome, target) ? 0 : -EINVAL;
+}
+
+int lfm_internal_engine_fail_audio_route_depth_for_test(void *ep, int status) {
+    Engine *e = static_cast<Engine *>(ep);
+    if (!e || status >= 0) return -EINVAL;
+    int idle = 0;
+    return e->test_audio_route_depth_status.compare_exchange_strong(
+               idle, status, std::memory_order_acq_rel,
+               std::memory_order_acquire)
+        ? 0
+        : -EBUSY;
+}
+
+int lfm_internal_engine_fail_audio_route_mimi_for_test(void *ep, int status) {
+    Engine *e = static_cast<Engine *>(ep);
+    if (!e || status >= 0) return -EINVAL;
+    int idle = 0;
+    return e->test_audio_route_mimi_status.compare_exchange_strong(
+               idle, status, std::memory_order_acq_rel,
+               std::memory_order_acquire)
+        ? 0
+        : -EBUSY;
+}
+
+void *lfm_internal_audio_route_epoch_new_for_test(uint64_t value) {
+    if (value == 0) return nullptr;
+    LfmRouteEpoch *epoch = new (std::nothrow) LfmRouteEpoch();
+    if (!epoch) return nullptr;
+    epoch->store(value, std::memory_order_release);
+    return epoch;
+}
+
+void lfm_internal_audio_route_epoch_free_for_test(void *opaque) {
+    delete static_cast<LfmRouteEpoch *>(opaque);
+}
+
 uint32_t lfm_engine_lanes(void *ep) {
     Engine *e = (Engine *)ep;
     return e ? e->lanes_total : 0;
@@ -3738,13 +4263,13 @@ int lfm_engine_mlp(void *ep, const uint16_t *x, const uint16_t *norm_w,
                    const uint16_t *w1, const uint16_t *w3, const uint16_t *w2,
                    uint16_t *out, size_t h, size_t i, float eps, size_t lanes) {
     Engine *e = (Engine *)ep;
-    if (!e || !x || !norm_w || !w1 || !w3 || !w2 || !out || h == 0 || i == 0)
-        return -1;
+    if (!e || !x || !norm_w || !w1 || !w3 || !w2 || !out || h == 0 || i == 0 ||
+        !logical_lane_count_valid(lanes))
+        return -EINVAL;
     PassClaim claim(e);
     if (!claim) return -EBUSY;
     PassSlot *slot = claim.slot();
     size_t tiles = lanes;
-    if (tiles < 1) tiles = 1;
     size_t cap = h < i ? h : i;
     if (tiles > cap) tiles = cap;
 
@@ -4280,6 +4805,224 @@ int lfm_engine_depth_frame(void *ep, uint64_t id, const uint16_t *hidden,
     return submit_pass(e, slot, REQ_DEPTH_FRAME, id);
 }
 
+static int run_audio_route(
+    void *ep, uint64_t model_id, uint64_t depth_id,
+    const uint32_t *ids, size_t id_count, uint32_t embedding_kind,
+    const LfmLayerState *states, size_t state_count, size_t position,
+    const uint16_t *rope_cos, const uint16_t *rope_sin,
+    size_t rope_elements, uint16_t *out_hidden, size_t hidden_elements,
+    const LfmSamplerConfigV1 *audio_sampler, LfmPrngStateV1 *prng,
+    uint32_t *out_codes, size_t code_count, size_t lanes,
+    const LfmTokenCommitRecord *commit, uint32_t *out_token_completed,
+    MimiDecodeState *mimi, const LfmAudioRouteTarget *target,
+    LfmAudioRouteResult *result) {
+    Engine *e = static_cast<Engine *>(ep);
+    const bool decode_mimi = mimi || target || result;
+    if (decode_mimi && (!mimi || !target || !result || !target->epoch ||
+                        !target->pcm || target->expected_epoch == 0 ||
+                        target->pcm_capacity < LFM_MIMI_PCM_CAPACITY ||
+                        out_codes != result->codes ||
+                        out_token_completed != &result->token_completed ||
+                        !commit || commit->token_committed !=
+                                       &result->token_committed ||
+                        code_count != LFM_MIMI_CODEBOOKS)) {
+        return -EINVAL;
+    }
+    if (result) {
+        std::memset(result, 0, sizeof(*result));
+        result->status = -EINPROGRESS;
+    }
+    if (!commit || !commit->token_committed || !out_token_completed) {
+        return -EINVAL;
+    }
+    *commit->token_committed = 0;
+    *out_token_completed = 0;
+    const LfmTokenCommitRecord bound_commit = *commit;
+    if (!e || model_id == 0 || depth_id == 0 || !ids || id_count == 0 ||
+        !states || !out_hidden || !out_codes || !bound_commit.window ||
+        !logical_lane_count_valid(lanes) ||
+        !sample_config_valid(audio_sampler)) {
+        return -EINVAL;
+    }
+    const bool stochastic =
+        (audio_sampler->flags & LFM_SAMPLE_FLAG_GREEDY) == 0 &&
+        audio_sampler->top_k != 1;
+    if (stochastic &&
+        (!prng || lfm_prng_fill_u64(prng, nullptr, 0) != 0)) {
+        return -EINVAL;
+    }
+    const int commit_status =
+        preflight_audio_route_commit(&bound_commit, position);
+    if (commit_status != 0) return commit_status;
+    if (decode_mimi &&
+        target->epoch->load(std::memory_order_acquire) !=
+            target->expected_epoch) {
+        return -ESTALE;
+    }
+
+    AudioRouteClaim claim(e);
+    if (!claim) return -EBUSY;
+    PassSlot *slot = claim.slot();
+    BackbonePlan *model = find_model(e, model_id);
+    DepthPlan *depth = nullptr;
+    for (const std::unique_ptr<DepthPlan> &candidate : e->depth_plans) {
+        if (candidate->id == depth_id) {
+            depth = candidate.get();
+            break;
+        }
+    }
+    if (!model || !model->embed_w || !model->emb_norm_w || !depth) {
+        return -ESTALE;
+    }
+    if (hidden_elements != model->h || hidden_elements != depth->backbone_dim ||
+        code_count != depth->codebooks || state_count != model->layers.size() ||
+        position >= model->max_ctx) {
+        return -EINVAL;
+    }
+    if (embedding_kind == 0) {
+        if (id_count != 1 || ids[0] >= model->vocab) return -ERANGE;
+    } else if (embedding_kind == 1) {
+        if (!model->audio_embed_w || id_count > TOKEN_INPUT_MAX_IDS) return -ERANGE;
+        for (size_t index = 0; index < id_count; ++index) {
+            if (ids[index] >= model->audio_rows) return -ERANGE;
+        }
+    } else {
+        return -EINVAL;
+    }
+    for (size_t layer = 0; layer < model->layers.size(); ++layer) {
+        const LfmLayerDesc &descriptor = model->layers[layer];
+        const LfmLayerState &state = states[layer];
+        if (descriptor.kind == 1) {
+            if (!descriptor.q_w || !state.k_plane || !state.v_plane ||
+                !rope_cos || !rope_sin || descriptor.hd == 0 ||
+                descriptor.n_kv == 0 || position + 1 > SIZE_MAX / descriptor.hd) {
+                return -ESTALE;
+            }
+            const size_t live = (position + 1) * descriptor.hd;
+            const size_t prior_heads = descriptor.n_kv - 1;
+            if (state.head_stride < live ||
+                prior_heads > SIZE_MAX / state.head_stride ||
+                prior_heads * state.head_stride > SIZE_MAX - live ||
+                state.k_len < prior_heads * state.head_stride + live ||
+                state.v_len < prior_heads * state.head_stride + live ||
+                position + 1 > SIZE_MAX / (descriptor.hd / 2) ||
+                rope_elements < (position + 1) * (descriptor.hd / 2)) {
+                return -EINVAL;
+            }
+        } else if (descriptor.kind == 0) {
+            const size_t tail = descriptor.k > 0 ? descriptor.k - 1 : 0;
+            if (!state.conv_state || descriptor.k < 1 ||
+                (tail > 0 && model->h > SIZE_MAX / tail) ||
+                state.conv_len < model->h * tail) {
+                return -ESTALE;
+            }
+        } else {
+            return -EPROTO;
+        }
+    }
+
+    const int descriptor_status = claim.prepare_descriptors();
+    if (descriptor_status != 0) return descriptor_status;
+
+    slot->model = model;
+    slot->tok = {
+        .ids = ids,
+        .n_ids = id_count,
+        .embed_kind = embedding_kind,
+        .provided_embed = nullptr,
+        .states = states,
+        .n_states = state_count,
+        .pos = position,
+        .cos_base = rope_cos,
+        .sin_base = rope_sin,
+        .out_hidden = out_hidden,
+        .out_logits = nullptr,
+        .sampler = nullptr,
+        .sample_state = nullptr,
+        .out_token = nullptr,
+        .lanes = lanes,
+    };
+    AudioRouteInstance route = {
+        .node = AUDIO_ROUTE_TOKEN,
+        .depth_id = depth_id,
+        .depth = depth,
+        .depth_req = {
+            .hidden = out_hidden,
+            .sampler = *audio_sampler,
+            .sample_state = prng,
+            .out_tokens = out_codes,
+            .completion_status =
+                e->test_audio_route_depth_status.exchange(
+                    0, std::memory_order_acq_rel),
+        },
+        .model = model,
+        .model_id = model_id,
+        .mimi_req = {
+            .state = mimi,
+            .codes = out_codes,
+            .pcm = decode_mimi ? target->pcm : nullptr,
+            .capacity = decode_mimi ? target->pcm_capacity : 0,
+            .out_samples = result ? &result->pcm_samples : nullptr,
+            .completion_status = decode_mimi
+                ? e->test_audio_route_mimi_status.exchange(
+                      0, std::memory_order_acq_rel)
+                : 0,
+        },
+        .epoch = decode_mimi ? target->epoch : nullptr,
+        .expected_epoch = decode_mimi ? target->expected_epoch : 0,
+        .result = result,
+        .decode_mimi = decode_mimi,
+        .commit = bound_commit,
+        .token_completed = out_token_completed,
+        .descriptors = claim.descriptors(),
+        .status = -EINPROGRESS,
+    };
+    const uint64_t generation = claim.generation();
+    int status = submit_slot(e, slot, generation, REQ_TOKEN_PASS, model_id,
+                             continue_audio_route, &route,
+                             &route.descriptors[AUDIO_ROUTE_TOKEN]);
+    if (status != 0) return status;
+    status = wait_audio_route(slot, generation, route);
+    return status;
+}
+
+int lfm_engine_audio_recurrence(
+    void *ep, uint64_t model_id, uint64_t depth_id,
+    const uint32_t *ids, size_t id_count, uint32_t embedding_kind,
+    const LfmLayerState *states, size_t state_count, size_t position,
+    const uint16_t *rope_cos, const uint16_t *rope_sin,
+    size_t rope_elements, uint16_t *out_hidden, size_t hidden_elements,
+    const LfmSamplerConfigV1 *audio_sampler, LfmPrngStateV1 *prng,
+    uint32_t *out_codes, size_t code_count, size_t lanes,
+    const LfmTokenCommitRecord *commit, uint32_t *out_token_completed) {
+    return run_audio_route(
+        ep, model_id, depth_id, ids, id_count, embedding_kind, states,
+        state_count, position, rope_cos, rope_sin, rope_elements, out_hidden,
+        hidden_elements, audio_sampler, prng, out_codes, code_count, lanes,
+        commit, out_token_completed, nullptr, nullptr, nullptr);
+}
+
+int lfm_engine_audio_route(
+    void *ep, uint64_t model_id, uint64_t depth_id,
+    const uint32_t *ids, size_t id_count, uint32_t embedding_kind,
+    const LfmLayerState *states, size_t state_count, size_t position,
+    const uint16_t *rope_cos, const uint16_t *rope_sin,
+    size_t rope_elements, uint16_t *out_hidden, size_t hidden_elements,
+    const LfmSamplerConfigV1 *audio_sampler, LfmPrngStateV1 *prng,
+    MimiDecodeState *mimi, const LfmAudioRouteTarget *target,
+    LfmAudioRouteResult *result, size_t lanes,
+    const LfmTokenCommitRecord *commit) {
+    if (!result) return -EINVAL;
+    const int status = run_audio_route(
+        ep, model_id, depth_id, ids, id_count, embedding_kind, states,
+        state_count, position, rope_cos, rope_sin, rope_elements, out_hidden,
+        hidden_elements, audio_sampler, prng, result->codes,
+        LFM_MIMI_CODEBOOKS, lanes, commit, &result->token_completed, mimi,
+        target, result);
+    if (result->status == -EINPROGRESS) result->status = status;
+    return status;
+}
+
 int lfm_engine_mimi_decode(void *ep, uint64_t model_id,
                            MimiDecodeState *state, const uint32_t *codes,
                            size_t code_count, float *pcm_out,
@@ -4342,6 +5085,7 @@ int lfm_ctx_build(void *ep, const LfmLayerDesc *descs, size_t n_layers, size_t h
     size_t kmax = 1;
     size_t qkv_max = 0, y_max = 0, att_max = 0;
     for (size_t l = 0; l < n_layers; ++l) {
+        if (descs[l].kind != 0 && descs[l].kind != 1) return -EINVAL;
         if (descs[l].kind == 0) {
             if (!descs[l].op_norm_w || !descs[l].ffn_norm_w || !descs[l].in_w ||
                 !descs[l].conv_w || !descs[l].out_w || !descs[l].w1 || !descs[l].w3 ||
@@ -4490,7 +5234,9 @@ int lfm_engine_conv_layer(void *ep, uint64_t id, size_t layer, const uint16_t *x
                           uint16_t *state_out, size_t state_out_len, uint16_t *out,
                           size_t out_len, size_t lanes) {
     Engine *e = (Engine *)ep;
-    if (!e || id == 0 || !x || !state_in || !state_out || !out) return -1;
+    if (!e || id == 0 || !x || !state_in || !state_out || !out ||
+        !logical_lane_count_valid(lanes))
+        return -EINVAL;
     PassClaim claim(e);
     if (!claim) return -EBUSY;
     PassSlot *slot = claim.slot();
@@ -4511,7 +5257,7 @@ int lfm_engine_conv_layer(void *ep, uint64_t id, size_t layer, const uint16_t *x
     slot->conv.state_in = state_in;
     slot->conv.state_out = state_out;
     slot->conv.out = out;
-    slot->conv.lanes = lanes < 1 ? 1 : (lanes > MAX_WORKERS ? MAX_WORKERS : lanes);
+    slot->conv.lanes = lanes;
 
     return submit_pass(e, slot, REQ_CONV_LAYER, id);
 }
@@ -4527,8 +5273,9 @@ int lfm_engine_attn_layer(void *ep, uint64_t id, size_t layer, const uint16_t *x
                           size_t pos, const uint16_t *cos_base, const uint16_t *sin_base,
                           size_t rope_len, uint16_t *out, size_t out_len, size_t lanes) {
     Engine *e = (Engine *)ep;
-    if (!e || id == 0 || !x || !k_plane || !v_plane || !cos_base || !sin_base || !out)
-        return -1;
+    if (!e || id == 0 || !x || !k_plane || !v_plane || !cos_base || !sin_base || !out ||
+        !logical_lane_count_valid(lanes))
+        return -EINVAL;
     PassClaim claim(e);
     if (!claim) return -EBUSY;
     PassSlot *slot = claim.slot();
@@ -4559,7 +5306,7 @@ int lfm_engine_attn_layer(void *ep, uint64_t id, size_t layer, const uint16_t *x
     slot->attn.cos_base = cos_base;
     slot->attn.sin_base = sin_base;
     slot->attn.out = out;
-    slot->attn.lanes = lanes < 1 ? 1 : (lanes > MAX_WORKERS ? MAX_WORKERS : lanes);
+    slot->attn.lanes = lanes;
 
     return submit_pass(e, slot, REQ_ATTN_LAYER, id);
 }
@@ -4639,7 +5386,8 @@ int lfm_engine_prefill(void *ep, uint64_t id, void *workspace_pointer,
     PrefillWorkspace *workspace =
         static_cast<PrefillWorkspace *>(workspace_pointer);
     if (!e || id == 0 || !workspace || row_count == 0 ||
-        row_count > PREFILL_ROWS || !states || !out_hidden) {
+        row_count > PREFILL_ROWS || !states || !out_hidden ||
+        !logical_lane_count_valid(lanes)) {
         return -EINVAL;
     }
     PassClaim claim(e);
@@ -4728,8 +5476,7 @@ int lfm_engine_prefill(void *ep, uint64_t id, void *workspace_pointer,
     slot->prefill.sampler = sampler;
     slot->prefill.sample_state = sample_state;
     slot->prefill.out_token = out_token;
-    slot->prefill.lanes = lanes < 1 ? 1 :
-                              (lanes > MAX_WORKERS ? MAX_WORKERS : lanes);
+    slot->prefill.lanes = lanes;
     return submit_pass(e, slot, REQ_PREFILL, id);
 }
 
@@ -4747,7 +5494,9 @@ int lfm_engine_token_pass(void *ep, uint64_t id, const uint32_t *ids, size_t n_i
                           LfmPrngStateV1 *sample_state, uint32_t *out_token,
                           size_t lanes, const uint16_t *provided_embed) {
     Engine *e = (Engine *)ep;
-    if (!e || id == 0 || !ids || n_ids == 0 || !states || !out_hidden) return -1;
+    if (!e || id == 0 || !ids || n_ids == 0 || !states || !out_hidden ||
+        !logical_lane_count_valid(lanes))
+        return -EINVAL;
     PassClaim claim(e);
     if (!claim) return -EBUSY;
     PassSlot *slot = claim.slot();
@@ -4824,7 +5573,7 @@ int lfm_engine_token_pass(void *ep, uint64_t id, const uint32_t *ids, size_t n_i
     slot->tok.sampler = sampler;
     slot->tok.sample_state = sample_state;
     slot->tok.out_token = out_token;
-    slot->tok.lanes = lanes < 1 ? 1 : (lanes > MAX_WORKERS ? MAX_WORKERS : lanes);
+    slot->tok.lanes = lanes;
 
     return submit_pass(e, slot, REQ_TOKEN_PASS, id);
 }

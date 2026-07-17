@@ -6,6 +6,7 @@ use std::ffi::c_void;
 use std::mem::MaybeUninit;
 
 const ABI_VERSION: u32 = 1;
+const BORROWED_DESCRIPTOR: u32 = 1 << 31;
 
 #[repr(C)]
 struct Config {
@@ -83,12 +84,21 @@ extern "C" {
         descriptor: DescriptorId,
         out: *mut DescriptorView,
     ) -> i32;
+    fn lfm_kernel_bridge_descriptor_get_borrowed(
+        bridge: *mut c_void,
+        descriptor: DescriptorId,
+        out: *mut DescriptorView,
+    ) -> i32;
     fn lfm_kernel_bridge_descriptor_release(bridge: *mut c_void, descriptor: DescriptorId) -> i32;
     fn lfm_kernel_bridge_descriptor_snapshot(
         bridge: *mut c_void,
         out: *mut DescriptorSnapshot,
     ) -> i32;
+    fn lfm_kernel_bridge_producer_acquire(bridge: *mut c_void) -> i32;
+    fn lfm_kernel_bridge_producer_release(bridge: *mut c_void) -> i32;
     fn lfm_kernel_bridge_submit(bridge: *mut c_void, submission: *const Submission) -> i32;
+    fn lfm_kernel_bridge_submit_borrowed(bridge: *mut c_void, submission: *const Submission)
+        -> i32;
     fn lfm_kernel_bridge_wait_submission(
         bridge: *mut c_void,
         out: *mut Submission,
@@ -618,6 +628,69 @@ fn stop_and_submit_arbitrate_without_orphaning_accepted_work() {
         let output = completion(&accepted, sequence);
         assert_eq!(bridge.publish(&output), 0);
         assert_eq!(bridge.wait_completion().unwrap(), output);
+    }
+}
+
+#[test]
+fn stop_and_exclusive_borrowed_submit_never_orphan_a_ticket() {
+    for sequence in 1..=1_000 {
+        let bridge = Bridge::new(1);
+        let address = bridge.address();
+        let mut lease = bridge.descriptor(1);
+        assert_eq!(unsafe { lfm_kernel_bridge_producer_acquire(bridge.0) }, 0);
+        let mut view = DescriptorView {
+            size: std::mem::size_of::<DescriptorView>() as u32,
+            abi_version: ABI_VERSION,
+            kind: 0,
+            flags: 0,
+            payload: std::ptr::null_mut(),
+            reserved: 0,
+        };
+        assert_eq!(
+            unsafe { lfm_kernel_bridge_descriptor_get_borrowed(bridge.0, lease.id, &mut view) },
+            0
+        );
+        assert_eq!(view.kind, 1);
+
+        let mut input = submission(sequence, lease.id);
+        input.flags = BORROWED_DESCRIPTOR;
+        let start = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let submit_start = start.clone();
+        let submitter = std::thread::spawn(move || {
+            submit_start.wait();
+            unsafe { lfm_kernel_bridge_submit_borrowed(address as *mut c_void, &input) }
+        });
+        let address = bridge.address();
+        let stop_start = start.clone();
+        let stopper = std::thread::spawn(move || {
+            stop_start.wait();
+            unsafe { lfm_kernel_bridge_request_stop(address as *mut c_void) };
+        });
+        start.wait();
+        const CANCELED: i32 = -libc::ECANCELED;
+        const OK: i32 = 0;
+        let status = submitter.join().unwrap();
+        stopper.join().unwrap();
+        assert!(matches!(status, OK | CANCELED));
+        if status == OK {
+            let accepted = bridge.wait_submission().unwrap();
+            assert_eq!(accepted, input);
+            let output = completion(&accepted, sequence);
+            assert_eq!(bridge.publish(&output), 0);
+            assert_eq!(bridge.wait_completion().unwrap(), output);
+        } else {
+            assert_eq!(bridge.snapshot().submissions_accepted, 0);
+        }
+
+        let before = bridge.descriptor_snapshot();
+        assert_eq!(
+            (before.acquired, before.retained, before.released),
+            (1, 0, 0)
+        );
+        lease.release();
+        assert_eq!(unsafe { lfm_kernel_bridge_producer_release(bridge.0) }, 0);
+        let after = bridge.descriptor_snapshot();
+        assert_eq!((after.live, after.retained, after.released), (0, 0, 1));
     }
 }
 

@@ -8,11 +8,20 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll, Waker};
 
-#[repr(align(64))]
+// Apple Silicon, including an x86_64 binary running under Rosetta, has a
+// 128-byte destructive-interference line.  Keep the producer and consumer
+// cursors in distinct lines on every supported target; over-aligning on a
+// 64-byte x86 cache is harmless and avoids keying this layout off the ISA.
+#[repr(align(128))]
 struct CacheLine<T>(T);
 
+// Keep independently produced/consumed cells on distinct Apple cache lines
+// without changing the ABI alignment of the value stored inside the ring.
+#[repr(align(128))]
+struct Slot<T>(UnsafeCell<MaybeUninit<T>>);
+
 struct Inner<T> {
-    cells: Box<[UnsafeCell<MaybeUninit<T>>]>,
+    cells: Box<[Slot<T>]>,
     capacity: usize,
     head: CacheLine<AtomicUsize>,
     tail: CacheLine<AtomicUsize>,
@@ -32,7 +41,7 @@ impl<T> Drop for Inner<T> {
         while head != tail {
             let index = head % self.capacity;
             // SAFETY: cells in [head, tail) were initialized and not consumed.
-            unsafe { (*self.cells[index].get()).assume_init_drop() };
+            unsafe { (*self.cells[index].0.get()).assume_init_drop() };
             head = head.wrapping_add(1);
         }
     }
@@ -81,7 +90,7 @@ pub fn ring<T>(capacity: usize) -> Result<(Sender<T>, Receiver<T>), RingError> {
         return Err(RingError::ZeroCapacity);
     }
     let cells = (0..capacity)
-        .map(|_| UnsafeCell::new(MaybeUninit::uninit()))
+        .map(|_| Slot(UnsafeCell::new(MaybeUninit::uninit())))
         .collect::<Vec<_>>()
         .into_boxed_slice();
     let inner = Arc::new(Inner {
@@ -149,7 +158,7 @@ impl<T> Sender<T> {
         }
         let index = tail % self.inner.capacity;
         // SAFETY: SPSC ownership gives the sole sender this unoccupied cell.
-        unsafe { (*self.inner.cells[index].get()).write(value) };
+        unsafe { (*self.inner.cells[index].0.get()).write(value) };
         self.inner
             .tail
             .0
@@ -209,7 +218,7 @@ impl<T> Receiver<T> {
         }
         let index = head % self.inner.capacity;
         // SAFETY: SPSC ownership gives the sole receiver this initialized cell.
-        let value = unsafe { (*self.inner.cells[index].get()).assume_init_read() };
+        let value = unsafe { (*self.inner.cells[index].0.get()).assume_init_read() };
         self.inner
             .head
             .0
@@ -303,5 +312,20 @@ impl<T> Future for RecvFuture<'_, T> {
             register(&mut slot, cx.waker());
             return Poll::Pending;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CacheLine, Slot};
+    use std::mem::{align_of, size_of};
+    use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn ring_cursors_and_cells_occupy_distinct_apple_cache_lines() {
+        assert_eq!(align_of::<CacheLine<AtomicUsize>>(), 128);
+        assert_eq!(size_of::<CacheLine<AtomicUsize>>(), 128);
+        assert_eq!(align_of::<Slot<u64>>(), 128);
+        assert_eq!(size_of::<Slot<u64>>(), 128);
     }
 }

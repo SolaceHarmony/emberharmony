@@ -211,6 +211,53 @@ struct EngineSnapshot {
     continuation_submissions: u64,
 }
 
+#[cfg(test)]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ContextWindow {
+    capacity: u64,
+    runway: u64,
+    position: u64,
+    start: u64,
+    cursor: u64,
+    rope_base: u64,
+}
+
+#[cfg(test)]
+#[repr(C)]
+struct TokenCommitRecord {
+    window: *mut ContextWindow,
+    expected_position: u64,
+    expected_start: u64,
+    expected_cursor: u64,
+    expected_rope_base: u64,
+    token_committed: *mut u32,
+}
+
+#[cfg(test)]
+#[repr(C)]
+#[derive(Default)]
+struct AudioRouteResult {
+    status: i32,
+    token_completed: u32,
+    token_committed: u32,
+    depth_completed: u32,
+    mimi_completed: u32,
+    eoaudio: u32,
+    reserved: u32,
+    pcm_samples: usize,
+    codes: [u32; 8],
+}
+
+#[cfg(test)]
+#[repr(C)]
+struct AudioRouteTarget {
+    epoch: *const c_void,
+    expected_epoch: u64,
+    pcm: *mut f32,
+    pcm_capacity: usize,
+}
+
 extern "C" {
     fn lfm_bf16_gemm_available() -> i32;
     #[cfg(test)]
@@ -334,6 +381,54 @@ extern "C" {
         out_token: *mut u32,
         lanes: usize,
         provided_embed: *const u16,
+    ) -> i32;
+    #[cfg(test)]
+    fn lfm_engine_audio_recurrence(
+        e: *mut c_void,
+        model_id: u64,
+        depth_id: u64,
+        ids: *const u32,
+        id_count: usize,
+        embedding_kind: u32,
+        states: *const LayerState,
+        state_count: usize,
+        position: usize,
+        rope_cos: *const u16,
+        rope_sin: *const u16,
+        rope_elements: usize,
+        out_hidden: *mut u16,
+        hidden_elements: usize,
+        sampler: *const SampleConfig,
+        prng: *mut PrngState,
+        out_codes: *mut u32,
+        code_count: usize,
+        lanes: usize,
+        commit: *const TokenCommitRecord,
+        out_token_completed: *mut u32,
+    ) -> i32;
+    #[cfg(test)]
+    fn lfm_engine_audio_route(
+        e: *mut c_void,
+        model_id: u64,
+        depth_id: u64,
+        ids: *const u32,
+        id_count: usize,
+        embedding_kind: u32,
+        states: *const LayerState,
+        state_count: usize,
+        position: usize,
+        rope_cos: *const u16,
+        rope_sin: *const u16,
+        rope_elements: usize,
+        out_hidden: *mut u16,
+        hidden_elements: usize,
+        sampler: *const SampleConfig,
+        prng: *mut PrngState,
+        mimi: *mut c_void,
+        target: *const AudioRouteTarget,
+        result: *mut AudioRouteResult,
+        lanes: usize,
+        commit: *const TokenCommitRecord,
     ) -> i32;
     #[cfg(test)]
     fn lfm_engine_prefill_workspace_create(
@@ -509,6 +604,24 @@ extern "C" {
     #[cfg(test)]
     fn lfm_internal_engine_wait_pass_slots_for_test(e: *mut c_void, live: u32) -> i32;
     #[cfg(test)]
+    fn lfm_internal_engine_request_kind_valid_for_test(kind: u32) -> i32;
+    #[cfg(test)]
+    fn lfm_internal_engine_wait_word_layout_for_test(e: *mut c_void) -> i32;
+    #[cfg(test)]
+    fn lfm_internal_engine_audio_route_edge_for_test(
+        node: u32,
+        outcome: u32,
+        target: *mut u32,
+    ) -> i32;
+    #[cfg(test)]
+    fn lfm_internal_engine_fail_audio_route_depth_for_test(e: *mut c_void, status: i32) -> i32;
+    #[cfg(test)]
+    fn lfm_internal_engine_fail_audio_route_mimi_for_test(e: *mut c_void, status: i32) -> i32;
+    #[cfg(test)]
+    fn lfm_internal_audio_route_epoch_new_for_test(value: u64) -> *mut c_void;
+    #[cfg(test)]
+    fn lfm_internal_audio_route_epoch_free_for_test(epoch: *mut c_void);
+    #[cfg(test)]
     fn lfm_internal_engine_arm_lane_pause_for_test(e: *mut c_void) -> i32;
     #[cfg(test)]
     fn lfm_internal_engine_wait_lane_pause_for_test(e: *mut c_void) -> i32;
@@ -551,6 +664,9 @@ impl NativeEngine {
     }
 
     pub fn new(workers: usize) -> Option<Self> {
+        if !(1..=16).contains(&workers) {
+            return None;
+        }
         let _ = kcoro_sys::link_anchor as fn();
         // SAFETY: plain constructor call; null = failure.
         let p = unsafe { lfm_engine_new(workers as i32) };
@@ -2049,6 +2165,573 @@ mod tests {
     }
 
     #[test]
+    fn audio_recurrence_route_matches_split_passes_and_commits_before_depth_failure() {
+        use crate::flashkern::decode::{DepthHead, DepthLayer, DepthPlan, PtrLen};
+        use half::bf16;
+
+        fn weights(count: usize, seed: usize, scale: f32) -> Vec<u16> {
+            (0..count)
+                .map(|index| {
+                    let value = ((index.wrapping_mul(17).wrapping_add(seed * 11)) % 19) as i32 - 9;
+                    bf16::from_f32(value as f32 * scale).to_bits()
+                })
+                .collect()
+        }
+
+        let _guard = CTX_TEST_LOCK.lock().unwrap();
+        let (hidden, ffn, kernel, max_ctx, vocab) = (4usize, 4usize, 2usize, 8usize, 3usize);
+        let norm = vec![0x3f80u16; hidden];
+        let input = weights(3 * hidden * hidden, 1, 0.03125);
+        let conv = weights(hidden * kernel, 2, 0.0625);
+        let output = weights(hidden * hidden, 3, 0.03125);
+        let w1 = weights(ffn * hidden, 4, 0.03125);
+        let w3 = weights(ffn * hidden, 5, 0.03125);
+        let w2 = weights(hidden * ffn, 6, 0.03125);
+        let embed = weights(vocab * hidden, 7, 0.125);
+        let descriptor = LayerDesc {
+            kind: 0,
+            k: kernel as u32,
+            op_eps: 1e-5,
+            ffn_eps: 1e-5,
+            op_norm_w: norm.as_ptr(),
+            ffn_norm_w: norm.as_ptr(),
+            in_w: input.as_ptr(),
+            conv_w: conv.as_ptr(),
+            out_w: output.as_ptr(),
+            w1: w1.as_ptr(),
+            w3: w3.as_ptr(),
+            w2: w2.as_ptr(),
+            ..LayerDesc::attn_placeholder()
+        };
+
+        let (dim, depth_ffn, codebooks, depth_vocab) = (4usize, 4usize, 8usize, 5usize);
+        let (heads, kv_heads, head_dim) = (1usize, 1usize, 4usize);
+        let qkv = vec![0u16; (dim + 2 * kv_heads * head_dim) * dim];
+        let square = vec![0u16; dim * dim];
+        let feed = vec![0u16; depth_ffn * dim];
+        let depth_layer = DepthLayer {
+            qkv_w: PtrLen::from_u16(&qkv),
+            out_w: PtrLen::from_u16(&square),
+            q_ln: PtrLen::from_u16(&norm),
+            k_ln: PtrLen::from_u16(&norm),
+            opnorm: PtrLen::from_u16(&norm),
+            ffnnorm: PtrLen::from_u16(&norm),
+            w1: PtrLen::from_u16(&feed),
+            w3: PtrLen::from_u16(&feed),
+            w2: PtrLen::from_u16(&feed),
+        };
+        let depth_layers = [depth_layer];
+        let table = vec![0u16; depth_vocab * dim];
+        let depth_heads = (0..codebooks)
+            .map(|_| DepthHead {
+                emb: PtrLen::from_u16(&table),
+                norm: PtrLen::from_u16(&norm),
+                logits: PtrLen::from_u16(&table),
+                vocab: depth_vocab,
+            })
+            .collect::<Vec<_>>();
+        let depth_w = vec![0u16; codebooks * dim * hidden];
+        let depth_b = vec![0u16; codebooks * dim];
+        let rope_cos = vec![1.0f32; codebooks * head_dim / 2];
+        let rope_sin = vec![0.0f32; rope_cos.len()];
+        let depth_plan = DepthPlan {
+            size: std::mem::size_of::<DepthPlan>() as u32,
+            abi_version: 1,
+            dim: dim as u32,
+            heads: heads as u32,
+            kv_heads: kv_heads as u32,
+            head_dim: head_dim as u32,
+            ffn_dim: depth_ffn as u32,
+            codebooks: codebooks as u32,
+            backbone_dim: hidden as u32,
+            eps: 1e-5,
+            depth_linear_w: PtrLen::from_u16(&depth_w),
+            depth_linear_b: PtrLen::from_u16(&depth_b),
+            rope_cos: PtrLen::from_f32(&rope_cos),
+            rope_sin: PtrLen::from_f32(&rope_sin),
+            layers: depth_layers.as_ptr(),
+            layer_count: depth_layers.len(),
+            codebook_heads: depth_heads.as_ptr(),
+            codebook_head_count: depth_heads.len(),
+        };
+
+        let split = NativeEngine::new(4).expect("split engine init");
+        let routed = NativeEngine::new(4).expect("routed engine init");
+        let split_model = split
+            .ctx_build(&[descriptor], hidden, ffn, max_ctx)
+            .expect("split backbone plan");
+        let routed_model = routed
+            .ctx_build(&[descriptor], hidden, ffn, max_ctx)
+            .expect("routed backbone plan");
+        for (engine, id) in [(&split, split_model), (&routed, routed_model)] {
+            assert!(unsafe {
+                engine.set_heads(
+                    id,
+                    embed.as_ptr(),
+                    embed.len(),
+                    vocab,
+                    std::ptr::null(),
+                    0,
+                    0,
+                    norm.as_ptr(),
+                    norm.len(),
+                    1e-5,
+                )
+            });
+        }
+        let split_depth = split.depth_build(&depth_plan).expect("split depth plan");
+        let routed_depth = routed.depth_build(&depth_plan).expect("routed depth plan");
+
+        let ids = [1u32];
+        let initial_carry = weights(hidden * (kernel - 1), 8, 0.0625);
+        let mut stale_keys = vec![0x3555u16; max_ctx * hidden];
+        let mut stale_values = vec![0xb555u16; max_ctx * hidden];
+        let mut stale_carry = initial_carry.clone();
+        let stale_states = [LayerState {
+            k_plane: stale_keys.as_mut_ptr(),
+            v_plane: stale_values.as_mut_ptr(),
+            head_stride: max_ctx * hidden,
+            k_len: stale_keys.len(),
+            v_len: stale_values.len(),
+            conv_state: stale_carry.as_mut_ptr(),
+            conv_len: stale_carry.len(),
+        }];
+        let expected_keys = stale_keys.clone();
+        let expected_values = stale_values.clone();
+        let expected_carry = stale_carry.clone();
+        let mut stale_hidden = vec![0x7fc1u16; hidden];
+        let expected_hidden = stale_hidden.clone();
+        let sampler = SampleConfig::new(Some(1.0), None);
+        let mut stale_prng = PrngState::from_seed(0x51eed).expect("stale seed");
+        let expected_prng = stale_prng;
+        let mut stale_codes = vec![u32::MAX; codebooks];
+        let expected_codes = stale_codes.clone();
+        let mut stale_window = ContextWindow {
+            capacity: max_ctx as u64,
+            runway: 4,
+            position: 0,
+            start: 0,
+            cursor: 0,
+            rope_base: 0,
+        };
+        let stale_before = routed.snapshot();
+        for (position, expected_start) in [(1usize, 0u64), (0, 1)] {
+            let mut token_completed = 0u32;
+            let mut token_committed = 0u32;
+            let commit = TokenCommitRecord {
+                window: &mut stale_window,
+                expected_position: stale_window.position,
+                expected_start,
+                expected_cursor: stale_window.cursor,
+                expected_rope_base: stale_window.rope_base,
+                token_committed: &mut token_committed,
+            };
+            let status = {
+                let _pass = routed.pass_lock.lock().unwrap();
+                unsafe {
+                    lfm_engine_audio_recurrence(
+                        routed.ptr,
+                        routed_model,
+                        routed_depth,
+                        ids.as_ptr(),
+                        ids.len(),
+                        0,
+                        stale_states.as_ptr(),
+                        stale_states.len(),
+                        position,
+                        std::ptr::null(),
+                        std::ptr::null(),
+                        0,
+                        stale_hidden.as_mut_ptr(),
+                        stale_hidden.len(),
+                        &sampler,
+                        &mut stale_prng,
+                        stale_codes.as_mut_ptr(),
+                        stale_codes.len(),
+                        4,
+                        &commit,
+                        &mut token_completed,
+                    )
+                }
+            };
+            assert_eq!(status, -libc::ESTALE);
+            assert_eq!((token_completed, token_committed), (0, 0));
+        }
+        let stale_after = routed.snapshot();
+        assert_eq!(
+            stale_keys, expected_keys,
+            "KV keys changed before admission"
+        );
+        assert_eq!(
+            stale_values, expected_values,
+            "KV values changed before admission"
+        );
+        assert_eq!(
+            stale_carry, expected_carry,
+            "ShortConv carry changed before admission"
+        );
+        assert_eq!(
+            stale_hidden, expected_hidden,
+            "hidden output changed before admission"
+        );
+        assert_eq!(
+            stale_codes, expected_codes,
+            "Depth output changed before admission"
+        );
+        assert_eq!(stale_prng.cursor, expected_prng.cursor);
+        assert_eq!(stale_prng.core, expected_prng.core);
+        assert_eq!(stale_prng.block, expected_prng.block);
+        assert_eq!(
+            (
+                stale_window.position,
+                stale_window.start,
+                stale_window.cursor,
+                stale_window.rope_base,
+            ),
+            (0, 0, 0, 0)
+        );
+        assert_eq!(stale_after.pass_submissions, stale_before.pass_submissions);
+        assert_eq!(stale_after.pass_completions, stale_before.pass_completions);
+        assert_eq!(
+            stale_after.bridge_dispatches,
+            stale_before.bridge_dispatches
+        );
+        assert_eq!(stale_after.pass_slots_live, stale_before.pass_slots_live);
+        assert_eq!(stale_after.descriptors_live, stale_before.descriptors_live);
+
+        let mut split_carry = initial_carry.clone();
+        let split_states = [LayerState {
+            conv_state: split_carry.as_mut_ptr(),
+            conv_len: split_carry.len(),
+            ..LayerState::none()
+        }];
+        let mut routed_carry = initial_carry.clone();
+        let routed_states = [LayerState {
+            conv_state: routed_carry.as_mut_ptr(),
+            conv_len: routed_carry.len(),
+            ..LayerState::none()
+        }];
+        let mut split_hidden = vec![0u16; hidden];
+        let mut routed_hidden = vec![0u16; hidden];
+        let mut split_prng = PrngState::from_seed(0x51eed).expect("split seed");
+        let mut routed_prng = PrngState::from_seed(0x51eed).expect("routed seed");
+        let mut split_codes = vec![u32::MAX; codebooks];
+        let mut routed_codes = vec![u32::MAX; codebooks];
+
+        let split_before = split.snapshot();
+        assert!(unsafe {
+            split.token_pass(
+                split_model,
+                &ids,
+                0,
+                &split_states,
+                0,
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                &mut split_hidden,
+                None,
+                None,
+                None,
+                None,
+                4,
+            )
+        });
+        assert!(split.depth_frame(
+            split_depth,
+            &split_hidden,
+            &sampler,
+            &mut split_prng,
+            &mut split_codes,
+        ));
+        let split_after = split.snapshot();
+
+        let mut window = ContextWindow {
+            capacity: max_ctx as u64,
+            runway: 4,
+            position: 0,
+            start: 0,
+            cursor: 0,
+            rope_base: 0,
+        };
+        let mut token_completed = 0u32;
+        let mut token_committed = 0u32;
+        let commit = TokenCommitRecord {
+            window: &mut window,
+            expected_position: window.position,
+            expected_start: window.start,
+            expected_cursor: window.cursor,
+            expected_rope_base: window.rope_base,
+            token_committed: &mut token_committed,
+        };
+        let route_before = routed.snapshot();
+        let route_status = {
+            let _pass = routed.pass_lock.lock().unwrap();
+            unsafe {
+                lfm_engine_audio_recurrence(
+                    routed.ptr,
+                    routed_model,
+                    routed_depth,
+                    ids.as_ptr(),
+                    ids.len(),
+                    0,
+                    routed_states.as_ptr(),
+                    routed_states.len(),
+                    0,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    0,
+                    routed_hidden.as_mut_ptr(),
+                    routed_hidden.len(),
+                    &sampler,
+                    &mut routed_prng,
+                    routed_codes.as_mut_ptr(),
+                    routed_codes.len(),
+                    4,
+                    &commit,
+                    &mut token_completed,
+                )
+            }
+        };
+        let route_after = routed.snapshot();
+        assert_eq!(route_status, 0);
+        assert_eq!((token_completed, token_committed), (1, 1));
+        assert_eq!((window.position, window.cursor), (1, 1));
+        assert_eq!(routed_hidden, split_hidden);
+        assert_eq!(routed_carry, split_carry);
+        assert_eq!(routed_codes, split_codes);
+        assert_eq!(routed_prng.cursor, split_prng.cursor);
+        assert_eq!(routed_prng.core, split_prng.core);
+        assert_eq!(routed_prng.block, split_prng.block);
+        assert_eq!(
+            split_after.pass_submissions - split_before.pass_submissions,
+            2
+        );
+        assert_eq!(
+            split_after.pass_completions - split_before.pass_completions,
+            2
+        );
+        assert_eq!(
+            split_after.continuation_submissions - split_before.continuation_submissions,
+            0
+        );
+        assert_eq!(
+            route_after.pass_submissions - route_before.pass_submissions,
+            2
+        );
+        assert_eq!(
+            route_after.pass_completions - route_before.pass_completions,
+            2
+        );
+        assert_eq!(
+            route_after.bridge_dispatches - route_before.bridge_dispatches,
+            2
+        );
+        assert_eq!(
+            route_after.continuation_submissions - route_before.continuation_submissions,
+            2
+        );
+        assert_eq!(route_after.max_pass_slots_live, 1);
+        assert_eq!(route_after.pass_slots_live, 0);
+        assert_eq!(route_after.descriptors_live, 0);
+        assert_eq!(
+            route_after.descriptor_acquires - route_before.descriptor_acquires,
+            3
+        );
+        assert_eq!(
+            route_after.descriptor_retains - route_before.descriptor_retains,
+            0
+        );
+        assert_eq!(
+            route_after.descriptor_releases - route_before.descriptor_releases,
+            3
+        );
+
+        let mut failed_carry = initial_carry;
+        let failed_states = [LayerState {
+            conv_state: failed_carry.as_mut_ptr(),
+            conv_len: failed_carry.len(),
+            ..LayerState::none()
+        }];
+        let mut failed_hidden = vec![0u16; hidden];
+        let mut failed_prng = PrngState::from_seed(0x51eed).expect("failed seed");
+        let mut failed_codes = vec![u32::MAX; codebooks];
+        let mut failed_window = ContextWindow {
+            capacity: max_ctx as u64,
+            runway: 4,
+            position: 0,
+            start: 0,
+            cursor: 0,
+            rope_base: 0,
+        };
+        let mut failed_completed = 0u32;
+        let mut failed_committed = 0u32;
+        let failed_commit = TokenCommitRecord {
+            window: &mut failed_window,
+            expected_position: failed_window.position,
+            expected_start: failed_window.start,
+            expected_cursor: failed_window.cursor,
+            expected_rope_base: failed_window.rope_base,
+            token_committed: &mut failed_committed,
+        };
+        assert_eq!(
+            unsafe { lfm_internal_engine_fail_audio_route_depth_for_test(routed.ptr, -libc::EIO) },
+            0
+        );
+        let failed_before = routed.snapshot();
+        let failed_status = {
+            let _pass = routed.pass_lock.lock().unwrap();
+            unsafe {
+                lfm_engine_audio_recurrence(
+                    routed.ptr,
+                    routed_model,
+                    routed_depth,
+                    ids.as_ptr(),
+                    ids.len(),
+                    0,
+                    failed_states.as_ptr(),
+                    failed_states.len(),
+                    0,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    0,
+                    failed_hidden.as_mut_ptr(),
+                    failed_hidden.len(),
+                    &sampler,
+                    &mut failed_prng,
+                    failed_codes.as_mut_ptr(),
+                    failed_codes.len(),
+                    4,
+                    &failed_commit,
+                    &mut failed_completed,
+                )
+            }
+        };
+        let failed_after = routed.snapshot();
+        assert_eq!(failed_status, -libc::EIO);
+        assert_eq!((failed_completed, failed_committed), (1, 1));
+        assert_eq!((failed_window.position, failed_window.cursor), (1, 1));
+        assert_eq!(failed_hidden, split_hidden);
+        assert_eq!(failed_carry, split_carry);
+        assert_eq!(
+            failed_after.pass_submissions - failed_before.pass_submissions,
+            2
+        );
+        assert_eq!(
+            failed_after.pass_completions - failed_before.pass_completions,
+            2
+        );
+        assert_eq!(failed_after.pass_slots_live, 0);
+        assert_eq!(failed_after.descriptors_live, 0);
+
+        // Drive the real third SQ/lane/CQ node without a Mimi checkpoint. The
+        // one-shot fault is consumed by REQ_MIMI_DECODE before its opaque state
+        // is dereferenced, proving exact-slot routing and terminal cleanup.
+        let mut mimi_carry = weights(hidden * (kernel - 1), 8, 0.0625);
+        let mimi_states = [LayerState {
+            conv_state: mimi_carry.as_mut_ptr(),
+            conv_len: mimi_carry.len(),
+            ..LayerState::none()
+        }];
+        let mut mimi_hidden = vec![0u16; hidden];
+        let mut mimi_prng = PrngState::from_seed(0x51eed).expect("mimi seed");
+        let mut mimi_window = ContextWindow {
+            capacity: max_ctx as u64,
+            runway: 4,
+            position: 0,
+            start: 0,
+            cursor: 0,
+            rope_base: 0,
+        };
+        let mut result = AudioRouteResult::default();
+        let commit = TokenCommitRecord {
+            window: &mut mimi_window,
+            expected_position: 0,
+            expected_start: 0,
+            expected_cursor: 0,
+            expected_rope_base: 0,
+            token_committed: &mut result.token_committed,
+        };
+        let epoch = unsafe { lfm_internal_audio_route_epoch_new_for_test(7) };
+        assert!(!epoch.is_null());
+        let mut pcm = vec![0.0f32; 3840];
+        let target = AudioRouteTarget {
+            epoch,
+            expected_epoch: 7,
+            pcm: pcm.as_mut_ptr(),
+            pcm_capacity: pcm.len(),
+        };
+        assert_eq!(
+            unsafe { lfm_internal_engine_fail_audio_route_mimi_for_test(routed.ptr, -libc::EIO) },
+            0
+        );
+        let mimi_before = routed.snapshot();
+        let mimi_status = unsafe {
+            lfm_engine_audio_route(
+                routed.ptr,
+                routed_model,
+                routed_depth,
+                ids.as_ptr(),
+                ids.len(),
+                0,
+                mimi_states.as_ptr(),
+                mimi_states.len(),
+                0,
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                mimi_hidden.as_mut_ptr(),
+                mimi_hidden.len(),
+                &sampler,
+                &mut mimi_prng,
+                1usize as *mut c_void,
+                &target,
+                &mut result,
+                4,
+                &commit,
+            )
+        };
+        let mimi_after = routed.snapshot();
+        unsafe { lfm_internal_audio_route_epoch_free_for_test(epoch) };
+        assert_eq!(mimi_status, -libc::EIO);
+        assert_eq!(result.status, -libc::EIO);
+        assert_eq!((result.token_completed, result.token_committed), (1, 1));
+        assert_eq!(result.depth_completed, 1);
+        assert_eq!(
+            (result.mimi_completed, result.eoaudio, result.pcm_samples),
+            (0, 0, 0)
+        );
+        assert_eq!(mimi_window.position, 1);
+        assert_eq!(
+            mimi_after.pass_submissions - mimi_before.pass_submissions,
+            3
+        );
+        assert_eq!(
+            mimi_after.pass_completions - mimi_before.pass_completions,
+            3
+        );
+        assert_eq!(mimi_after.pass_slots_live, 0);
+        assert_eq!(mimi_after.descriptors_live, 0);
+        assert_eq!(
+            mimi_after.descriptor_acquires - mimi_before.descriptor_acquires,
+            3
+        );
+        assert_eq!(
+            mimi_after.descriptor_retains - mimi_before.descriptor_retains,
+            0
+        );
+        assert_eq!(
+            mimi_after.descriptor_releases - mimi_before.descriptor_releases,
+            3
+        );
+
+        split.depth_clear(split_depth);
+        routed.depth_clear(routed_depth);
+        split.ctx_clear(split_model);
+        routed.ctx_clear(routed_model);
+    }
+
+    #[test]
     fn native_prng_replays_a_partially_consumed_block() {
         let engine = NativeEngine::new(3).expect("native engine init");
         let mut state = PrngState::from_material(&[0; 32], &[0; 8]).expect("material seed");
@@ -3200,6 +3883,193 @@ mod tests {
             native[0], native[SAMPLES - 1], percentile(&reference, 50),
             percentile(&reference, 95), percentile(&reference, 99), reference[0], reference[SAMPLES - 1]
         );
+    }
+
+    #[test]
+    fn engine_protocol_selectors_are_closed_sets() {
+        // SAFETY: the private probe calls the exact closed-set predicate used by
+        // both native submission and descriptor admission without dispatching an
+        // uninitialized typed payload.
+        let raw = unsafe { lfm_engine_new(2) };
+        assert!(!raw.is_null());
+        for kind in [0, 5, 16, u32::MAX] {
+            assert_eq!(
+                unsafe { lfm_internal_engine_request_kind_valid_for_test(kind) },
+                0,
+                "request kind {kind}"
+            );
+        }
+        for kind in [1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15] {
+            assert_eq!(
+                unsafe { lfm_internal_engine_request_kind_valid_for_test(kind) },
+                1,
+                "request kind {kind}"
+            );
+        }
+
+        let mut descriptor = LayerDesc::attn_placeholder();
+        descriptor.kind = 2;
+        let mut id = 0;
+        assert_eq!(
+            unsafe { lfm_ctx_build(raw, &descriptor, 1, 1, 1, 1, &mut id) },
+            -libc::EINVAL
+        );
+        assert_eq!(id, 0);
+
+        let mut snapshot = EngineSnapshot {
+            size: std::mem::size_of::<EngineSnapshot>() as u32,
+            abi_version: 1,
+            ..EngineSnapshot::default()
+        };
+        assert_eq!(unsafe { lfm_engine_snapshot(raw, &mut snapshot) }, 0);
+        assert_eq!(snapshot.pass_submissions, 0);
+        assert_eq!(snapshot.bridge_dispatches, 0);
+        assert_eq!(snapshot.pass_slots_live, 0);
+        unsafe { lfm_engine_free(raw) };
+    }
+
+    #[test]
+    fn audio_route_forwarding_table_is_total_and_bounds_checked() {
+        const TOKEN: u32 = 0;
+        const DEPTH: u32 = 1;
+        const MIMI: u32 = 2;
+        const TERMINAL: u32 = 3;
+        const SUCCESS: u32 = 0;
+        const FAILURE: u32 = 1;
+        const EOAUDIO: u32 = 2;
+        const STALE: u32 = 3;
+        for (node, outcome, expected) in [
+            (TOKEN, SUCCESS, DEPTH),
+            (TOKEN, FAILURE, TERMINAL),
+            (TOKEN, EOAUDIO, TERMINAL),
+            (TOKEN, STALE, TERMINAL),
+            (DEPTH, SUCCESS, MIMI),
+            (DEPTH, FAILURE, TERMINAL),
+            (DEPTH, EOAUDIO, TERMINAL),
+            (DEPTH, STALE, TERMINAL),
+            (MIMI, SUCCESS, TERMINAL),
+            (MIMI, FAILURE, TERMINAL),
+            (MIMI, EOAUDIO, TERMINAL),
+            (MIMI, STALE, TERMINAL),
+        ] {
+            let mut target = u32::MAX;
+            assert_eq!(
+                unsafe {
+                    lfm_internal_engine_audio_route_edge_for_test(node, outcome, &mut target)
+                },
+                0
+            );
+            assert_eq!(target, expected);
+        }
+        let mut target = 0xfeed_beef;
+        assert_eq!(
+            unsafe { lfm_internal_engine_audio_route_edge_for_test(3, SUCCESS, &mut target) },
+            -libc::EINVAL
+        );
+        assert_eq!(target, 0xfeed_beef);
+        assert_eq!(
+            unsafe { lfm_internal_engine_audio_route_edge_for_test(TOKEN, 4, &mut target) },
+            -libc::EINVAL
+        );
+        assert_eq!(target, 0xfeed_beef);
+    }
+
+    #[test]
+    fn engine_wait_words_occupy_distinct_128_byte_lines() {
+        let raw = unsafe { lfm_engine_new(2) };
+        assert!(!raw.is_null());
+        assert_eq!(
+            unsafe { lfm_internal_engine_wait_word_layout_for_test(raw) },
+            0
+        );
+        unsafe { lfm_engine_free(raw) };
+    }
+
+    #[test]
+    fn lane_counts_are_rejected_instead_of_clamped() {
+        assert!(NativeEngine::new(0).is_none());
+        assert!(NativeEngine::new(17).is_none());
+        assert!(NativeEngine::new(usize::MAX).is_none());
+        assert!(unsafe { lfm_engine_new(-1) }.is_null());
+        assert!(unsafe { lfm_engine_new(17) }.is_null());
+
+        let raw = unsafe { lfm_engine_new(2) };
+        assert!(!raw.is_null());
+        let one = [0x3f80u16];
+        let mut out = [0xdead];
+        for lanes in [0, 17] {
+            assert_eq!(
+                unsafe {
+                    lfm_engine_mlp(
+                        raw,
+                        one.as_ptr(),
+                        one.as_ptr(),
+                        one.as_ptr(),
+                        one.as_ptr(),
+                        one.as_ptr(),
+                        out.as_mut_ptr(),
+                        1,
+                        1,
+                        1e-5,
+                        lanes,
+                    )
+                },
+                -libc::EINVAL
+            );
+        }
+        assert_eq!(out, [0xdead]);
+        let mut snapshot = EngineSnapshot {
+            size: std::mem::size_of::<EngineSnapshot>() as u32,
+            abi_version: 1,
+            ..EngineSnapshot::default()
+        };
+        assert_eq!(unsafe { lfm_engine_snapshot(raw, &mut snapshot) }, 0);
+        assert_eq!(snapshot.pass_submissions, 0);
+        unsafe { lfm_engine_free(raw) };
+    }
+
+    #[test]
+    fn logical_reduction_width_is_independent_of_physical_lane_count() {
+        use half::bf16;
+        if !crate::flashkern::decode::fused_mlp_available() {
+            eprintln!("fused mlp kernel unavailable — skipping");
+            return;
+        }
+        let four = NativeEngine::new(4).expect("four-lane engine");
+        let eight = NativeEngine::new(8).expect("eight-lane engine");
+        assert_eq!(four.lanes_total(), 4);
+        assert_eq!(eight.lanes_total(), 8);
+
+        const H: usize = 64;
+        const I: usize = 96;
+        const LOGICAL: usize = 8;
+        let bits = |index: usize, seed: usize| {
+            bf16::from_f32(
+                (((index.wrapping_mul(2_654_435_761).wrapping_add(seed)) % 2000) as f32 / 1000.0)
+                    - 1.0,
+            )
+            .to_bits()
+        };
+        let x = (0..H).map(|index| bits(index, 1)).collect::<Vec<_>>();
+        let norm = (0..H).map(|index| bits(index, 2)).collect::<Vec<_>>();
+        let w1 = (0..I * H).map(|index| bits(index, 3)).collect::<Vec<_>>();
+        let w3 = (0..I * H).map(|index| bits(index, 4)).collect::<Vec<_>>();
+        let w2 = (0..H * I).map(|index| bits(index, 5)).collect::<Vec<_>>();
+        let weights = crate::flashkern::decode::FusedMlpWeights {
+            norm_w: &norm,
+            w1: &w1,
+            w3: &w3,
+            w2: &w2,
+            eps: 1e-5,
+        };
+        let mut want = vec![0; H];
+        let mut got4 = vec![0; H];
+        let mut got8 = vec![0; H];
+        crate::flashkern::decode::fused_mlp_reference(&x, &weights, &mut want, LOGICAL);
+        assert!(four.fused_mlp(&x, &weights, &mut got4, LOGICAL));
+        assert!(eight.fused_mlp(&x, &weights, &mut got8, LOGICAL));
+        assert_eq!(got4, want);
+        assert_eq!(got8, want);
     }
 
     #[test]

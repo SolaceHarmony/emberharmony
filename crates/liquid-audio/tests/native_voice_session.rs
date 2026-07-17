@@ -616,6 +616,28 @@ fn lease_soak(iterations: u64) {
 }
 
 #[test]
+fn runtime_rejects_lane_counts_the_engine_cannot_construct() {
+    let config = RuntimeConfig {
+        size: std::mem::size_of::<RuntimeConfig>() as u32,
+        abi_version: ABI,
+        coordination_workers: 1,
+        kernel_lanes: 17,
+        event_capacity: 2,
+        session_capacity: 1,
+        reserved0: 0,
+        reserved1: 0,
+        flags: 0,
+        reserved: [0; 4],
+    };
+    let mut runtime = std::ptr::null_mut();
+    assert_eq!(
+        unsafe { lfm_runtime_create(&config, &mut runtime) },
+        INVALID
+    );
+    assert!(runtime.is_null());
+}
+
+#[test]
 fn joining_a_never_started_session_closes_every_admission_path() {
     let runtime = runtime();
     let config = dock_config();

@@ -126,6 +126,7 @@ fn main() {
     // compatibility and all layout assertions part of every build.
     println!("cargo::rerun-if-changed=native/include/lfm_kernel_bridge.h");
     println!("cargo::rerun-if-changed=native/src/runtime/kernel_bridge.cpp");
+    println!("cargo::rerun-if-changed=native/src/model/lfm_route_epoch.h");
     println!("cargo::rerun-if-changed=native/src/runtime/kernel_protocol_c.c");
     cc::Build::new()
         .file("native/src/runtime/kernel_bridge.cpp")

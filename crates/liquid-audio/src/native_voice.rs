@@ -34,6 +34,7 @@ const REPLY_CAPACITY: usize = 128;
 const TEXT_EVENT_MAX_BYTES: usize = 512;
 const UTF8_CARRY_MAX_BYTES: usize = 3;
 const EVENT_CAPACITY: u32 = 64;
+const MAX_KERNEL_LANES: u32 = 16;
 const CAPTURE_SLOTS: u32 = 1;
 const PLAYBACK_SLOTS: u32 = 8;
 const MAX_CAPTURE_FRAMES: u32 = 48_000 * 30;
@@ -297,6 +298,7 @@ impl Default for NativeVoiceSampling {
 pub struct NativeVoiceRuntimeConfig {
     /// ABI v1 has one native coordinator; values other than one are rejected.
     pub coordination_workers: u32,
+    /// Fixed native lane threads; the current engine accepts `1..=16`.
     pub kernel_lanes: u32,
     pub event_capacity: u32,
     pub session_capacity: u32,
@@ -372,7 +374,7 @@ impl NativeVoiceModel {
         let _ = kcoro_sys::link_anchor as fn();
         if runtime_config.coordination_workers != 1
             || runtime_config.kernel_lanes == 0
-            || runtime_config.kernel_lanes > 64
+            || runtime_config.kernel_lanes > MAX_KERNEL_LANES
             || runtime_config.event_capacity < 2
             || runtime_config.event_capacity > 64
             || runtime_config.session_capacity == 0

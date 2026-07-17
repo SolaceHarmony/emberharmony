@@ -129,7 +129,11 @@ impl DescriptorId {
     }
 }
 
-/// One inline command cell. Tensor, PCM, KV, and weight bytes never appear here.
+/// One inline command value. Tensor, PCM, KV, and weight bytes never appear here.
+///
+/// ABI v1 promises 64-byte value alignment. SQ/CQ implementations place values
+/// in 128-byte-aligned storage cells on Apple rather than silently strengthening
+/// the caller-facing ABI.
 #[repr(C, align(64))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Submission {

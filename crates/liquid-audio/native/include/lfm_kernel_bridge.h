@@ -77,6 +77,9 @@ typedef struct KcDescriptorIdV1 {
     uint32_t generation;
 } KcDescriptorIdV1;
 
+/* ABI-v1 values require 64-byte alignment. Internal SQ/CQ storage wraps each
+ * value in a 128-byte-aligned cell on Apple instead of strengthening this
+ * caller-facing contract in place. */
 typedef struct LFM_KERNEL_ALIGNAS(64) KcSubmissionV1 {
     uint32_t size;
     uint32_t abi_version;
@@ -92,6 +95,11 @@ typedef struct LFM_KERNEL_ALIGNAS(64) KcSubmissionV1 {
     uint64_t deadline_ns;
     uint64_t reserved[3];
 } KcSubmissionV1;
+
+/* Private native-engine marker. A borrowed descriptor remains owned by the
+ * route caller and is therefore neither retained by SQ admission nor released
+ * by CQ consumption. Generic bridge callers must not set this bit. */
+#define KC_COORD_SUBMISSION_BORROWED_DESCRIPTOR (UINT32_C(1) << 31)
 
 typedef struct LFM_KERNEL_ALIGNAS(64) KcCompletionV1 {
     uint32_t size;
@@ -191,12 +199,26 @@ int lfm_kernel_bridge_descriptor_retain(LfmKernelBridge *bridge,
 int lfm_kernel_bridge_descriptor_get(LfmKernelBridge *bridge,
                                      KcDescriptorIdV1 descriptor,
                                      LfmKernelDescriptorViewV1 *out);
+/* Route-only immutable view. The caller must retain the owner lease until the
+ * exact slot has completed and no executor can still read this descriptor. */
+int lfm_kernel_bridge_descriptor_get_borrowed(
+    LfmKernelBridge *bridge, KcDescriptorIdV1 descriptor,
+    LfmKernelDescriptorViewV1 *out);
 int lfm_kernel_bridge_descriptor_release(LfmKernelBridge *bridge,
                                          KcDescriptorIdV1 descriptor);
 int lfm_kernel_bridge_descriptor_snapshot(
     LfmKernelBridge *bridge, LfmKernelDescriptorSnapshotV1 *out);
+/* Acquires the route-only SPSC producer lease after all ordinary submissions
+ * have settled. The same admission word excludes generic producers without a
+ * second-lock race. */
+int lfm_kernel_bridge_producer_acquire(LfmKernelBridge *bridge);
+int lfm_kernel_bridge_producer_release(LfmKernelBridge *bridge);
 int lfm_kernel_bridge_submit(LfmKernelBridge *bridge,
                              const KcSubmissionV1 *submission);
+/* Route-only SPSC publication under caller-held exclusive producer authority.
+ * This deliberately performs no descriptor retain or queue-ledger release. */
+int lfm_kernel_bridge_submit_borrowed(
+    LfmKernelBridge *bridge, const KcSubmissionV1 *submission);
 int lfm_kernel_bridge_wait_completion(LfmKernelBridge *bridge,
                                       KcCompletionV1 *out,
                                       uint64_t deadline_ns);

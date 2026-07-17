@@ -2,6 +2,7 @@
 #define LFM_MODEL_INTERNAL_H
 
 #include "lfm_model_legacy.h"
+#include "lfm_model_plan.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -24,19 +25,6 @@ struct LfmNativeEmission {
 };
 
 struct MimiDecodeState;
-
-/* Private, pointer-free window state shared with focused native tests. `position`
- * is the live cache length; `cursor` is the monotonic number of committed model
- * passes. `start` is the physical row offset inside capacity+runway storage and
- * `rope_base` is the absolute position represented by logical row zero. */
-struct LfmContextWindowState {
-    uint64_t capacity;
-    uint64_t runway;
-    uint64_t position;
-    uint64_t start;
-    uint64_t cursor;
-    uint64_t rope_base;
-};
 
 struct LfmContextWindowMove {
     uint64_t dropped;
@@ -95,6 +83,11 @@ LFM_INTERNAL_API int lfm_conversation_begin_mixed_native(
 LFM_INTERNAL_API int
 lfm_conversation_next_native(LfmConversation *conversation,
                              LfmNativeEmission *out);
+LFM_INTERNAL_API int lfm_conversation_next_requires_playback_native(
+    LfmConversation *conversation);
+LFM_INTERNAL_API int lfm_conversation_next_into_native(
+    LfmConversation *conversation, const LfmAudioRouteTarget *target,
+    LfmNativeEmission *out, size_t *out_samples);
 LFM_INTERNAL_API int
 lfm_conversation_interrupt_native(LfmConversation *conversation);
 LFM_INTERNAL_API int lfm_conversation_decode_native(

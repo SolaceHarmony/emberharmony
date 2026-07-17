@@ -6,6 +6,7 @@
 #include "kc_port.h"
 #include "lfm_mimi.h"
 #include "lfm_model_internal.h"
+#include "../model/lfm_route_epoch.h"
 
 #include <atomic>
 #include <cerrno>
@@ -38,6 +39,9 @@ constexpr uint32_t COMMAND_TEXT = 1;
 constexpr uint32_t COMMAND_MIXED = 2;
 constexpr uint32_t EMISSION_AUDIO_END = 1;
 constexpr size_t EVENT_PAYLOAD_CAPACITY = 512;
+constexpr uint32_t MAX_KERNEL_LANES = 16;
+/* Apple arm64 and Rosetta execute on the same 128-byte cache-line hardware. */
+constexpr size_t HOT_ATOMIC_BYTES = 128;
 
 std::atomic<uint64_t> next_runtime_epoch{1};
 std::atomic<uint64_t> next_session_id{1};
@@ -49,10 +53,23 @@ constexpr uint32_t LEASE_NONCE_SHIFT = 8;
 constexpr uint64_t LEASE_INDEX_MASK = (UINT64_C(1) << LEASE_INDEX_BITS) - 1;
 constexpr uint64_t LEASE_NONCE_MAX = UINT64_MAX >> LEASE_NONCE_SHIFT;
 
-struct alignas(64) Doorbell {
+struct alignas(HOT_ATOMIC_BYTES) Doorbell {
     uint32_t value = 0;
     kc_port_wait_word *wait = nullptr;
 };
+static_assert(alignof(Doorbell) == HOT_ATOMIC_BYTES);
+static_assert(sizeof(Doorbell) == HOT_ATOMIC_BYTES,
+              "adjacent doorbells must not share an Apple cache line");
+
+template <typename T>
+struct alignas(HOT_ATOMIC_BYTES) Cursor {
+    std::atomic<T> value{0};
+};
+static_assert(alignof(Cursor<uint32_t>) == HOT_ATOMIC_BYTES);
+static_assert(sizeof(Cursor<uint32_t>) == HOT_ATOMIC_BYTES);
+static_assert(alignof(Cursor<uint64_t>) == HOT_ATOMIC_BYTES);
+static_assert(sizeof(Cursor<uint64_t>) == HOT_ATOMIC_BYTES,
+              "adjacent queue cursors must not share an Apple cache line");
 
 void ring(Doorbell *doorbell, bool all) {
     kc_atomic_u32_fetch_add_release(&doorbell->value, 1);
@@ -80,9 +97,9 @@ struct PcmPool {
     uint32_t capacity = 0;
     uint32_t samples_per_slot = 0;
     uint32_t direction = 0;
-    std::atomic<uint64_t> head{0};
-    std::atomic<uint64_t> tail{0};
-    std::atomic<uint32_t> cursor{0};
+    Cursor<uint64_t> head;
+    Cursor<uint64_t> tail;
+    Cursor<uint32_t> cursor;
     std::mutex push_mutex;
 };
 
@@ -99,8 +116,8 @@ struct EventRecord {
 struct EventRing {
     EventRecord *records = nullptr;
     uint32_t capacity = 0;
-    std::atomic<uint64_t> head{0};
-    std::atomic<uint64_t> tail{0};
+    Cursor<uint64_t> head;
+    Cursor<uint64_t> tail;
 };
 
 struct TextCommand {
@@ -155,20 +172,20 @@ bool ticket_equal(const LfmTicketIdV1 &a, const LfmTicketIdV1 &b) {
 
 bool pool_push(PcmPool *pool, const LfmPcmLeaseV1 &lease) {
     std::lock_guard<std::mutex> guard(pool->push_mutex);
-    uint64_t tail = pool->tail.load(std::memory_order_relaxed);
-    uint64_t head = pool->head.load(std::memory_order_acquire);
+    uint64_t tail = pool->tail.value.load(std::memory_order_relaxed);
+    uint64_t head = pool->head.value.load(std::memory_order_acquire);
     if (tail - head == pool->capacity) return false;
     pool->ring[tail % pool->capacity] = lease;
-    pool->tail.store(tail + 1, std::memory_order_release);
+    pool->tail.value.store(tail + 1, std::memory_order_release);
     return true;
 }
 
 bool pool_pop(PcmPool *pool, LfmPcmLeaseV1 *out) {
-    uint64_t head = pool->head.load(std::memory_order_relaxed);
-    uint64_t tail = pool->tail.load(std::memory_order_acquire);
+    uint64_t head = pool->head.value.load(std::memory_order_relaxed);
+    uint64_t tail = pool->tail.value.load(std::memory_order_acquire);
     if (head == tail) return false;
     *out = pool->ring[head % pool->capacity];
-    pool->head.store(head + 1, std::memory_order_release);
+    pool->head.value.store(head + 1, std::memory_order_release);
     return true;
 }
 
@@ -298,26 +315,26 @@ int claim_published(PcmPool *pool, const LfmPcmLeaseV1 *lease, PcmSlot **out) {
 }
 
 bool event_push(EventRing *ring, const EventRecord &record) {
-    uint64_t tail = ring->tail.load(std::memory_order_relaxed);
-    uint64_t head = ring->head.load(std::memory_order_acquire);
+    uint64_t tail = ring->tail.value.load(std::memory_order_relaxed);
+    uint64_t head = ring->head.value.load(std::memory_order_acquire);
     if (tail - head == ring->capacity) return false;
     ring->records[tail % ring->capacity] = record;
-    ring->tail.store(tail + 1, std::memory_order_release);
+    ring->tail.value.store(tail + 1, std::memory_order_release);
     return true;
 }
 
 bool event_pop(EventRing *ring, EventRecord *out) {
-    uint64_t head = ring->head.load(std::memory_order_relaxed);
-    uint64_t tail = ring->tail.load(std::memory_order_acquire);
+    uint64_t head = ring->head.value.load(std::memory_order_relaxed);
+    uint64_t tail = ring->tail.value.load(std::memory_order_acquire);
     if (head == tail) return false;
     *out = ring->records[head % ring->capacity];
-    ring->head.store(head + 1, std::memory_order_release);
+    ring->head.value.store(head + 1, std::memory_order_release);
     return true;
 }
 
 uint32_t event_depth(const EventRing &ring) {
-    uint64_t head = ring.head.load(std::memory_order_acquire);
-    uint64_t tail = ring.tail.load(std::memory_order_acquire);
+    uint64_t head = ring.head.value.load(std::memory_order_acquire);
+    uint64_t tail = ring.tail.value.load(std::memory_order_acquire);
     uint64_t depth = tail - head;
     return depth > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(depth);
 }
@@ -373,7 +390,7 @@ struct LfmSession {
     uint32_t generation = 1;
     bool dock_only = false;
     std::atomic<uint32_t> state{LFM_SESSION_CREATED};
-    std::atomic<uint64_t> epoch{1};
+    LfmRouteEpoch epoch{};
     std::atomic<uint64_t> sequence{1};
     std::atomic<bool> stop{false};
     std::atomic<bool> event_done{false};
@@ -669,15 +686,38 @@ bool publish_turn(LfmSession *session, uint64_t action_epoch,
                          &turn, sizeof(turn), flags, gate_epoch);
 }
 
+struct PreparedPlayback {
+    LfmPcmLeaseV1 lease{};
+    size_t samples = 0;
+    bool active = false;
+};
+
+void release_prepared(LfmSession *session, PreparedPlayback *playback) {
+    if (!playback || !playback->active) return;
+    (void)lfm_audio_dock_release(session, &playback->lease);
+    playback->active = false;
+    playback->samples = 0;
+}
+
 bool reserve_playback(LfmSession *session, uint64_t action_epoch,
                       LfmTicketIdV1 ticket, uint32_t playback_count,
                       uint32_t emitted, LfmPcmLeaseV1 *out) {
+    const auto reserve = [&]() -> int {
+        std::lock_guard<std::mutex> guard(session->publication_mutex);
+        if (session->stop.load(std::memory_order_acquire)) {
+            return LFM_STATUS_CANCELLED;
+        }
+        if (session->epoch.load(std::memory_order_acquire) != action_epoch) {
+            return LFM_STATUS_STALE;
+        }
+        return lfm_audio_dock_reserve(session, LFM_PCM_LEASE_PLAYBACK,
+                                      LFM_MIMI_PCM_CAPACITY, 24000, out);
+    };
     for (;;) {
-        int rc = lfm_audio_dock_reserve(session, LFM_PCM_LEASE_PLAYBACK,
-                                        LFM_MIMI_PCM_CAPACITY, 24000, out);
+        int rc = reserve();
         if (rc == 0) return true;
         if (rc != LFM_STATUS_WOULD_BLOCK) {
-            if (rc != LFM_STATUS_CANCELLED) {
+            if (rc != LFM_STATUS_CANCELLED && rc != LFM_STATUS_STALE) {
                 publish_action_failure(session, action_epoch, ticket, rc,
                                        "playback reservation failed",
                                        playback_count, emitted);
@@ -690,11 +730,10 @@ bool reserve_playback(LfmSession *session, uint64_t action_epoch,
             session->epoch.load(std::memory_order_acquire) != action_epoch) {
             return false;
         }
-        rc = lfm_audio_dock_reserve(session, LFM_PCM_LEASE_PLAYBACK,
-                                    LFM_MIMI_PCM_CAPACITY, 24000, out);
+        rc = reserve();
         if (rc == 0) return true;
         if (rc != LFM_STATUS_WOULD_BLOCK) {
-            if (rc != LFM_STATUS_CANCELLED) {
+            if (rc != LFM_STATUS_CANCELLED && rc != LFM_STATUS_STALE) {
                 publish_action_failure(session, action_epoch, ticket, rc,
                                        "playback reservation failed",
                                        playback_count, emitted);
@@ -702,7 +741,8 @@ bool reserve_playback(LfmSession *session, uint64_t action_epoch,
             return false;
         }
         rc = kc_port_wait_u32(session->playback_space_doorbell.wait, expected, 0);
-        if (rc != 0 && !session->stop.load(std::memory_order_acquire)) {
+        if (rc != 0 && !session->stop.load(std::memory_order_acquire) &&
+            session->epoch.load(std::memory_order_acquire) == action_epoch) {
             publish_action_failure(session, action_epoch, ticket, rc,
                                    "playback-space wait failed", playback_count,
                                    emitted);
@@ -713,50 +753,37 @@ bool reserve_playback(LfmSession *session, uint64_t action_epoch,
 
 bool publish_audio(LfmSession *session, const LfmNativeEmission &emission,
                    uint64_t action_epoch, LfmTicketIdV1 ticket,
-                   uint32_t playback_count, uint32_t emitted) {
+                   uint32_t playback_count, uint32_t emitted,
+                   PreparedPlayback *playback) {
     if (emission.code_count != LFM_MIMI_CODEBOOKS) {
+        release_prepared(session, playback);
         publish_action_failure(session, action_epoch, ticket, LFM_STATUS_INTERNAL,
                                "native audio code count mismatch", playback_count,
                                emitted);
         return false;
     }
-    LfmPcmLeaseV1 lease{};
-    if (!reserve_playback(session, action_epoch, ticket, playback_count, emitted,
-                          &lease)) {
-        return false;
-    }
-    float *pcm = nullptr;
-    size_t capacity = 0;
-    int rc = lfm_audio_dock_resolve_mut(session, &lease, &pcm, &capacity);
-    if (rc != 0) {
-        lfm_audio_dock_release(session, &lease);
-        publish_action_failure(session, action_epoch, ticket, rc,
-                               "playback lease resolve failed", playback_count,
-                               emitted);
-        return false;
-    }
-    size_t samples = 0;
-    rc = lfm_conversation_decode_native(session->conversation, emission.codes,
-                                        emission.code_count, pcm, capacity, &samples);
-    if (rc != 0 || samples == 0 || samples > UINT32_MAX) {
-        lfm_audio_dock_release(session, &lease);
+    if (!playback || !playback->active || playback->samples == 0 ||
+        playback->samples > UINT32_MAX) {
+        release_prepared(session, playback);
         publish_action_failure(session, action_epoch, ticket,
-                               rc != 0 ? rc : LFM_STATUS_INTERNAL,
-                               "native Mimi decode failed", playback_count,
+                               LFM_STATUS_INTERNAL,
+                               "native Mimi route produced invalid PCM",
+                               playback_count,
                                emitted);
         return false;
     }
     if (session->epoch.load(std::memory_order_acquire) != action_epoch) {
-        lfm_audio_dock_release(session, &lease);
+        release_prepared(session, playback);
         return false;
     }
-    lease.ticket = ticket;
-    lease.frames = static_cast<uint32_t>(samples);
-    lease.length_bytes = static_cast<uint32_t>(samples * sizeof(float));
-    lease.flags = LFM_PCM_LEASE_PLAYBACK;
-    rc = lfm_audio_dock_publish(session, &lease);
+    playback->lease.ticket = ticket;
+    playback->lease.frames = static_cast<uint32_t>(playback->samples);
+    playback->lease.length_bytes =
+        static_cast<uint32_t>(playback->samples * sizeof(float));
+    playback->lease.flags = LFM_PCM_LEASE_PLAYBACK;
+    const int rc = lfm_audio_dock_publish(session, &playback->lease);
     if (rc != 0) {
-        lfm_audio_dock_release(session, &lease);
+        release_prepared(session, playback);
         if (rc != LFM_STATUS_STALE && rc != LFM_STATUS_CANCELLED) {
             publish_action_failure(session, action_epoch, ticket, rc,
                                    "playback publication failed", playback_count,
@@ -764,23 +791,35 @@ bool publish_audio(LfmSession *session, const LfmNativeEmission &emission,
         }
         return false;
     }
+    playback->active = false;
+    playback->samples = 0;
     return true;
 }
 
 bool handle_emission(LfmSession *session, const LfmNativeEmission &emission,
                      uint64_t action_epoch, LfmTicketIdV1 ticket,
                      uint32_t *playback_count, uint32_t emitted,
-                     bool *finished) {
+                     bool *finished, PreparedPlayback *playback) {
     if (session->epoch.load(std::memory_order_acquire) != action_epoch) {
+        release_prepared(session, playback);
         session->capture_stale.fetch_add(1, std::memory_order_relaxed);
         *finished = true;
         return publish_turn(session, action_epoch, ticket, *playback_count, emitted,
                             0, LFM_STATUS_STALE);
     }
-    if (emission.kind == LFM_NATIVE_EMISSION_NONE) return true;
+    if (emission.kind == LFM_NATIVE_EMISSION_NONE) {
+        if (!playback || !playback->active) return true;
+        release_prepared(session, playback);
+        publish_action_failure(session, action_epoch, ticket,
+                               LFM_STATUS_INTERNAL,
+                               "audio route returned no emission",
+                               *playback_count, emitted);
+        return false;
+    }
     if (emission.kind == LFM_NATIVE_EMISSION_AUDIO_CODES) {
         const int needs_pcm = lfm_native_emission_needs_pcm(&emission);
         if (needs_pcm < 0) {
+            release_prepared(session, playback);
             publish_action_failure(session, action_epoch, ticket,
                                    LFM_STATUS_INTERNAL,
                                    "invalid native audio emission",
@@ -789,15 +828,26 @@ bool handle_emission(LfmSession *session, const LfmNativeEmission &emission,
         }
         // EOAudio is a recurrence/context sentinel. It must reach the next
         // native token pass, but it is not a codec frame and never reaches Mimi.
-        if (needs_pcm == 0) return true;
+        if (needs_pcm == 0) {
+            release_prepared(session, playback);
+            return true;
+        }
         if (!publish_audio(session, emission, action_epoch, ticket,
-                           *playback_count, emitted)) {
+                           *playback_count, emitted, playback)) {
             return false;
         }
         (*playback_count)++;
         return true;
     }
     if (emission.kind == LFM_NATIVE_EMISSION_TEXT) {
+        if (playback && playback->active) {
+            release_prepared(session, playback);
+            publish_action_failure(session, action_epoch, ticket,
+                                   LFM_STATUS_INTERNAL,
+                                   "audio route returned text",
+                                   *playback_count, emitted);
+            return false;
+        }
         if (emission.text_bytes > sizeof(emission.text)) {
             publish_action_failure(session, action_epoch, ticket,
                                    LFM_STATUS_INTERNAL,
@@ -809,12 +859,21 @@ bool handle_emission(LfmSession *session, const LfmNativeEmission &emission,
                              emission.text, emission.text_bytes, 0, true);
     }
     if (emission.kind == LFM_NATIVE_EMISSION_FINISHED) {
+        if (playback && playback->active) {
+            release_prepared(session, playback);
+            publish_action_failure(session, action_epoch, ticket,
+                                   LFM_STATUS_INTERNAL,
+                                   "audio route finished with a live lease",
+                                   *playback_count, emitted);
+            return false;
+        }
         *finished = true;
         return publish_turn(session, action_epoch, ticket, *playback_count, emitted, 0);
     }
     publish_action_failure(session, action_epoch, ticket, LFM_STATUS_INTERNAL,
                            "unknown native emission kind", *playback_count,
                            emitted);
+    release_prepared(session, playback);
     return false;
 }
 
@@ -823,6 +882,7 @@ void run_action(LfmSession *session, LfmNativeEmission emission,
     bool finished = false;
     uint32_t playback_count = 0;
     uint32_t emitted = 0;
+    PreparedPlayback playback{};
     for (;;) {
         if (emission.kind == LFM_NATIVE_EMISSION_TEXT ||
             (emission.kind == LFM_NATIVE_EMISSION_AUDIO_CODES &&
@@ -830,7 +890,7 @@ void run_action(LfmSession *session, LfmNativeEmission emission,
             emitted++;
         }
         if (!handle_emission(session, emission, action_epoch, ticket,
-                             &playback_count, emitted, &finished)) {
+                             &playback_count, emitted, &finished, &playback)) {
             if (session->stop.load(std::memory_order_acquire)) {
                 publish_turn(session, action_epoch, ticket, playback_count, emitted,
                              0, LFM_STATUS_CANCELLED);
@@ -873,8 +933,53 @@ void run_action(LfmSession *session, LfmNativeEmission emission,
             return;
         }
         emission = {};
-        int rc = lfm_conversation_next_native(session->conversation, &emission);
+        int needs_playback =
+            lfm_conversation_next_requires_playback_native(session->conversation);
+        if (needs_playback < 0) {
+            publish_action_failure(session, action_epoch, ticket, needs_playback,
+                                   "native route requirement failed",
+                                   playback_count, emitted);
+            request_stop(session, needs_playback);
+            return;
+        }
+        int rc = 0;
+        if (needs_playback != 0) {
+            if (!reserve_playback(session, action_epoch, ticket,
+                                  playback_count, emitted, &playback.lease)) {
+                if (session->epoch.load(std::memory_order_acquire) !=
+                    action_epoch) {
+                    publish_turn(session, action_epoch, ticket, playback_count,
+                                 emitted, 0, LFM_STATUS_STALE);
+                }
+                return;
+            }
+            playback.active = true;
+            float *pcm = nullptr;
+            size_t capacity = 0;
+            rc = lfm_audio_dock_resolve_mut(session, &playback.lease, &pcm,
+                                            &capacity);
+            if (rc == 0) {
+                const LfmAudioRouteTarget target = {
+                    .epoch = &session->epoch,
+                    .expected_epoch = action_epoch,
+                    .pcm = pcm,
+                    .pcm_capacity = capacity,
+                };
+                rc = lfm_conversation_next_into_native(
+                    session->conversation, &target, &emission,
+                    &playback.samples);
+            }
+        } else {
+            rc = lfm_conversation_next_native(session->conversation,
+                                              &emission);
+        }
         if (rc != 0) {
+            release_prepared(session, &playback);
+            if (session->epoch.load(std::memory_order_acquire) != action_epoch) {
+                publish_turn(session, action_epoch, ticket, playback_count,
+                             emitted, 0, LFM_STATUS_STALE);
+                return;
+            }
             publish_action_failure(session, action_epoch, ticket, rc,
                                    "native recurrence failed", playback_count,
                                    emitted);
@@ -1134,8 +1239,8 @@ void *coordinator_main(void *context) {
 
         uint32_t expected = kc_atomic_u32_load_acquire(&session->work_doorbell.value);
         if (session->stop.load(std::memory_order_acquire) ||
-            session->capture.head.load(std::memory_order_acquire) !=
-                session->capture.tail.load(std::memory_order_acquire) ||
+            session->capture.head.value.load(std::memory_order_acquire) !=
+                session->capture.tail.value.load(std::memory_order_acquire) ||
             !text_empty(&session->commands) ||
             session->epoch.load(std::memory_order_acquire) != applied_epoch) {
             continue;
@@ -1197,8 +1302,8 @@ void *notification_main(void *context) {
         }
         if (session->event_done.load(std::memory_order_acquire)) break;
         uint32_t expected = kc_atomic_u32_load_acquire(&session->event_doorbell.value);
-        if (session->events.head.load(std::memory_order_acquire) !=
-                session->events.tail.load(std::memory_order_acquire) ||
+        if (session->events.head.value.load(std::memory_order_acquire) !=
+                session->events.tail.value.load(std::memory_order_acquire) ||
             session->event_done.load(std::memory_order_acquire)) {
             continue;
         }
@@ -1402,7 +1507,7 @@ int lfm_runtime_create(const LfmRuntimeConfigV1 *config, LfmRuntime **out) {
         return LFM_STATUS_ABI_MISMATCH;
     }
     if (config->coordination_workers != 1 || config->kernel_lanes == 0 ||
-        config->kernel_lanes > 64 || config->event_capacity < 2 ||
+        config->kernel_lanes > MAX_KERNEL_LANES || config->event_capacity < 2 ||
         config->event_capacity > MAX_EVENT_CAPACITY || config->session_capacity == 0 ||
         config->session_capacity > MAX_RUNTIME_SESSIONS || config->reserved0 != 0 ||
         config->reserved1 != 0) {
@@ -1985,7 +2090,8 @@ int lfm_audio_dock_reserve(LfmSession *session, uint32_t direction,
         samples > pool->samples_per_slot) {
         return LFM_STATUS_INVALID_ARGUMENT;
     }
-    uint32_t start = pool->cursor.fetch_add(1, std::memory_order_relaxed) % pool->capacity;
+    uint32_t start =
+        pool->cursor.value.fetch_add(1, std::memory_order_relaxed) % pool->capacity;
     for (uint32_t offset = 0; offset < pool->capacity; ++offset) {
         uint32_t index = (start + offset) % pool->capacity;
         PcmSlot &slot = pool->slots[index];
@@ -2182,8 +2288,8 @@ int lfm_audio_dock_wait_playback(LfmSession *session, LfmPcmLeaseV1 *out) {
         }
         if (session->stop.load(std::memory_order_acquire)) return LFM_STATUS_CANCELLED;
         uint32_t expected = kc_atomic_u32_load_acquire(&session->playback_doorbell.value);
-        if (session->playback.head.load(std::memory_order_acquire) !=
-                session->playback.tail.load(std::memory_order_acquire) ||
+        if (session->playback.head.value.load(std::memory_order_acquire) !=
+                session->playback.tail.value.load(std::memory_order_acquire) ||
             session->stop.load(std::memory_order_acquire)) {
             continue;
         }

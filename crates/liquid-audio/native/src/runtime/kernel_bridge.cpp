@@ -14,20 +14,39 @@
 namespace {
 
 constexpr uint32_t ADMISSION_STOP = UINT32_C(1) << 31;
-constexpr uint32_t ADMISSION_COUNT = ADMISSION_STOP - 1;
+constexpr uint32_t ADMISSION_EXCLUSIVE = UINT32_C(1) << 30;
+constexpr uint32_t ADMISSION_COUNT = ADMISSION_EXCLUSIVE - 1;
 constexpr uint32_t DESCRIPTOR_FREE = 0;
 constexpr uint32_t DESCRIPTOR_LIVE = 1;
 constexpr uint32_t DESCRIPTOR_RELEASING = 2;
 constexpr uint32_t DESCRIPTOR_RETIRED = 3;
+/* Apple arm64 and Rosetta execute on the same 128-byte cache-line hardware. */
+constexpr size_t HOT_ATOMIC_BYTES = 128;
 
-struct alignas(64) Cursor {
+struct alignas(HOT_ATOMIC_BYTES) Cursor {
     std::atomic<uint64_t> value{0};
 };
+static_assert(alignof(Cursor) == HOT_ATOMIC_BYTES);
+static_assert(sizeof(Cursor) == HOT_ATOMIC_BYTES,
+              "adjacent queue cursors must not share an Apple cache line");
 
-struct alignas(64) Doorbell {
+struct alignas(HOT_ATOMIC_BYTES) Doorbell {
     uint32_t value = 0;
     kc_port_wait_word *wait = nullptr;
 };
+static_assert(alignof(Doorbell) == HOT_ATOMIC_BYTES);
+static_assert(sizeof(Doorbell) == HOT_ATOMIC_BYTES,
+              "adjacent doorbells must not share an Apple cache line");
+
+template <typename T>
+struct alignas(HOT_ATOMIC_BYTES) QueueCell {
+    T value{};
+};
+static_assert(alignof(QueueCell<KcSubmissionV1>) == HOT_ATOMIC_BYTES);
+static_assert(sizeof(QueueCell<KcSubmissionV1>) == HOT_ATOMIC_BYTES);
+static_assert(alignof(QueueCell<KcCompletionV1>) == HOT_ATOMIC_BYTES);
+static_assert(sizeof(QueueCell<KcCompletionV1>) == HOT_ATOMIC_BYTES,
+              "SQ/CQ storage must isolate ABI-v1 values without changing their alignment");
 
 bool ticket_equal(const KcTicketIdV1 &a, const KcTicketIdV1 &b) {
     return a.runtime_epoch == b.runtime_epoch && a.sequence == b.sequence &&
@@ -81,6 +100,12 @@ bool submission_valid(const KcSubmissionV1 *submission) {
     return true;
 }
 
+bool borrowed_submission_valid(const KcSubmissionV1 *submission) {
+    return submission_valid(submission) &&
+           submission->flags == KC_COORD_SUBMISSION_BORROWED_DESCRIPTOR &&
+           descriptor_required(submission->command);
+}
+
 bool completion_valid(const KcCompletionV1 *completion) {
     return completion && completion->size == sizeof(*completion) &&
            completion->abi_version == KC_COORD_ABI_VERSION &&
@@ -118,8 +143,8 @@ struct LfmKernelBridge {
 
     uint32_t capacity = 0;
     uint32_t descriptor_capacity = 0;
-    KcSubmissionV1 *submissions = nullptr;
-    KcCompletionV1 *completions = nullptr;
+    QueueCell<KcSubmissionV1> *submissions = nullptr;
+    QueueCell<KcCompletionV1> *completions = nullptr;
     KcTicketIdV1 *ledger = nullptr;
     KcDescriptorIdV1 *descriptor_ledger = nullptr;
     DescriptorSlot *descriptors = nullptr;
@@ -173,7 +198,8 @@ int retain_descriptor(LfmKernelBridge *bridge, KcDescriptorIdV1 descriptor) {
 bool enter_submission(LfmKernelBridge *bridge) {
     uint32_t state = bridge->admission.load(std::memory_order_acquire);
     for (;;) {
-        if (state & ADMISSION_STOP || (state & ADMISSION_COUNT) == ADMISSION_COUNT) {
+        if (state & (ADMISSION_STOP | ADMISSION_EXCLUSIVE) ||
+            (state & ADMISSION_COUNT) == ADMISSION_COUNT) {
             return false;
         }
         if (bridge->admission.compare_exchange_weak(
@@ -191,6 +217,27 @@ bool submissions_settled(const LfmKernelBridge *bridge) {
     return (bridge->admission.load(std::memory_order_acquire) & ADMISSION_COUNT) == 0;
 }
 
+bool producer_exclusive(const LfmKernelBridge *bridge) {
+    return (bridge->admission.load(std::memory_order_acquire) &
+            ADMISSION_EXCLUSIVE) != 0;
+}
+
+bool enter_borrowed_submission(LfmKernelBridge *bridge) {
+    uint32_t state = bridge->admission.load(std::memory_order_acquire);
+    for (;;) {
+        if ((state & ADMISSION_EXCLUSIVE) == 0 ||
+            (state & ADMISSION_STOP) != 0 ||
+            (state & ADMISSION_COUNT) == ADMISSION_COUNT) {
+            return false;
+        }
+        if (bridge->admission.compare_exchange_weak(
+                state, state + 1, std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            return true;
+        }
+    }
+}
+
 void leave_submission(LfmKernelBridge *bridge) {
     uint32_t previous = bridge->admission.fetch_sub(1, std::memory_order_acq_rel);
     if ((previous & ADMISSION_STOP) && (previous & ADMISSION_COUNT) == 1) {
@@ -203,7 +250,7 @@ int take_submission(LfmKernelBridge *bridge, KcSubmissionV1 *out) {
     uint64_t head = bridge->submission_head.value.load(std::memory_order_relaxed);
     uint64_t tail = bridge->submission_tail.value.load(std::memory_order_acquire);
     if (head == tail) return -EAGAIN;
-    *out = bridge->submissions[head % bridge->capacity];
+    *out = bridge->submissions[head % bridge->capacity].value;
     bridge->submission_head.value.store(head + 1, std::memory_order_release);
     return 0;
 }
@@ -213,7 +260,7 @@ int take_completion(LfmKernelBridge *bridge, KcCompletionV1 *out) {
     uint64_t tail = bridge->completion_tail.value.load(std::memory_order_acquire);
     if (head == tail) return -EAGAIN;
     size_t index = head % bridge->capacity;
-    *out = bridge->completions[index];
+    *out = bridge->completions[index].value;
     KcDescriptorIdV1 descriptor = bridge->descriptor_ledger[index];
     bridge->descriptor_ledger[index] = descriptor_none();
     bridge->completion_head.value.store(head + 1, std::memory_order_release);
@@ -272,8 +319,10 @@ int lfm_kernel_bridge_create(const LfmKernelBridgeConfigV1 *config,
     bridge->capacity = config->capacity;
     bridge->descriptor_capacity =
         config->descriptor_capacity == 0 ? config->capacity : config->descriptor_capacity;
-    bridge->submissions = new (std::nothrow) KcSubmissionV1[bridge->capacity];
-    bridge->completions = new (std::nothrow) KcCompletionV1[bridge->capacity];
+    bridge->submissions =
+        new (std::nothrow) QueueCell<KcSubmissionV1>[bridge->capacity];
+    bridge->completions =
+        new (std::nothrow) QueueCell<KcCompletionV1>[bridge->capacity];
     bridge->ledger = new (std::nothrow) KcTicketIdV1[bridge->capacity];
     bridge->descriptor_ledger = new (std::nothrow) KcDescriptorIdV1[bridge->capacity];
     bridge->descriptors =
@@ -394,6 +443,33 @@ int lfm_kernel_bridge_descriptor_get(LfmKernelBridge *bridge,
     return 0;
 }
 
+int lfm_kernel_bridge_descriptor_get_borrowed(
+    LfmKernelBridge *bridge, KcDescriptorIdV1 descriptor,
+    LfmKernelDescriptorViewV1 *out) {
+    if (!bridge || !out || descriptor.slot >= bridge->descriptor_capacity ||
+        descriptor.generation == 0 || out->size < sizeof(*out) ||
+        out->abi_version != KC_COORD_ABI_VERSION) {
+        return -EINVAL;
+    }
+    if (!producer_exclusive(bridge)) return -EPERM;
+    /* The route owner creates every descriptor before its first SQ release
+     * publication and releases them only after the exact slot reaches FREE.
+     * No field can mutate during this interval, so the executor may read the
+     * immutable view without taking descriptor_mutex. */
+    const LfmKernelBridge::DescriptorSlot &slot =
+        bridge->descriptors[descriptor.slot];
+    if (!descriptor_matches(bridge, descriptor, slot)) return -ESTALE;
+    *out = {
+        .size = sizeof(*out),
+        .abi_version = KC_COORD_ABI_VERSION,
+        .kind = slot.kind,
+        .flags = slot.flags,
+        .payload = slot.payload,
+        .reserved = 0,
+    };
+    return 0;
+}
+
 int lfm_kernel_bridge_descriptor_release(LfmKernelBridge *bridge,
                                          KcDescriptorIdV1 descriptor) {
     if (!bridge || descriptor.slot >= bridge->descriptor_capacity ||
@@ -469,6 +545,8 @@ int lfm_kernel_bridge_descriptor_snapshot(
 int lfm_kernel_bridge_submit(LfmKernelBridge *bridge,
                              const KcSubmissionV1 *submission) {
     if (!bridge || !submission_valid(submission)) return -EINVAL;
+    if ((submission->flags & KC_COORD_SUBMISSION_BORROWED_DESCRIPTOR) != 0)
+        return -EINVAL;
     if (!enter_submission(bridge)) return -ECANCELED;
 
     uint64_t tail = bridge->submission_tail.value.load(std::memory_order_relaxed);
@@ -496,7 +574,89 @@ int lfm_kernel_bridge_submit(LfmKernelBridge *bridge,
     bridge->descriptor_ledger[index] = descriptor_required(submission->command)
                                            ? submission->descriptor
                                            : descriptor_none();
-    bridge->submissions[index] = *submission;
+    bridge->submissions[index].value = *submission;
+    bridge->submission_tail.value.store(tail + 1, std::memory_order_release);
+    ring(&bridge->submission_doorbell, false);
+    leave_submission(bridge);
+    return 0;
+}
+
+int lfm_kernel_bridge_producer_acquire(LfmKernelBridge *bridge) {
+    if (!bridge) return -EINVAL;
+    uint32_t idle = 0;
+    if (!bridge->admission.compare_exchange_strong(
+            idle, ADMISSION_EXCLUSIVE, std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+        return (idle & ADMISSION_STOP) != 0 ? -ECANCELED : -EBUSY;
+    }
+    const bool settled =
+        bridge->submission_head.value.load(std::memory_order_acquire) ==
+            bridge->submission_tail.value.load(std::memory_order_acquire) &&
+        bridge->completion_head.value.load(std::memory_order_acquire) ==
+            bridge->completion_tail.value.load(std::memory_order_acquire) &&
+        bridge->completion_head.value.load(std::memory_order_acquire) ==
+            bridge->submission_tail.value.load(std::memory_order_acquire);
+    if (settled) return 0;
+    uint32_t owned = ADMISSION_EXCLUSIVE;
+    if (!bridge->admission.compare_exchange_strong(
+            owned, 0, std::memory_order_release, std::memory_order_relaxed)) {
+        if (owned == (ADMISSION_STOP | ADMISSION_EXCLUSIVE)) {
+            bridge->admission.store(ADMISSION_STOP, std::memory_order_release);
+        } else {
+            std::abort();
+        }
+    }
+    return -EBUSY;
+}
+
+int lfm_kernel_bridge_producer_release(LfmKernelBridge *bridge) {
+    if (!bridge) return -EINVAL;
+    uint32_t state = bridge->admission.load(std::memory_order_acquire);
+    for (;;) {
+        if ((state & ADMISSION_EXCLUSIVE) == 0 ||
+            (state & ADMISSION_COUNT) != 0) {
+            return -ESTALE;
+        }
+        const uint32_t next = state & ~ADMISSION_EXCLUSIVE;
+        if (bridge->admission.compare_exchange_weak(
+                state, next, std::memory_order_release,
+                std::memory_order_acquire)) {
+            if ((next & ADMISSION_STOP) != 0) {
+                ring(&bridge->submission_doorbell, true);
+                ring(&bridge->completion_doorbell, true);
+            }
+            return 0;
+        }
+    }
+}
+
+int lfm_kernel_bridge_submit_borrowed(
+    LfmKernelBridge *bridge, const KcSubmissionV1 *submission) {
+    if (!bridge || !borrowed_submission_valid(submission)) return -EINVAL;
+    if (!enter_borrowed_submission(bridge))
+        return stopping(bridge) ? -ECANCELED : -EPERM;
+
+    const uint64_t tail =
+        bridge->submission_tail.value.load(std::memory_order_relaxed);
+    const uint64_t completed =
+        bridge->completion_head.value.load(std::memory_order_acquire);
+    if (tail - completed >= bridge->capacity) {
+        leave_submission(bridge);
+        return -EAGAIN;
+    }
+    const uint64_t head =
+        bridge->submission_head.value.load(std::memory_order_acquire);
+    if (tail - head >= bridge->capacity) {
+        leave_submission(bridge);
+        return -EAGAIN;
+    }
+
+    const size_t index = tail % bridge->capacity;
+    bridge->ledger[index] = submission->ticket;
+    /* The outer route owner holds this descriptor through slot retirement.
+     * Marking the cell empty keeps CQ consumption entirely lock-free. */
+    bridge->descriptor_ledger[index] = descriptor_none();
+    bridge->submissions[index].value = *submission;
     bridge->submission_tail.value.store(tail + 1, std::memory_order_release);
     ring(&bridge->submission_doorbell, false);
     leave_submission(bridge);
@@ -527,7 +687,7 @@ int lfm_kernel_bridge_publish_completion(LfmKernelBridge *bridge,
 
     size_t index = tail % bridge->capacity;
     if (!ticket_equal(bridge->ledger[index], completion->ticket)) return -ESTALE;
-    bridge->completions[index] = *completion;
+    bridge->completions[index].value = *completion;
     bridge->completion_tail.value.store(tail + 1, std::memory_order_release);
     ring(&bridge->completion_doorbell, false);
     return 0;
@@ -581,7 +741,8 @@ int lfm_kernel_bridge_snapshot(LfmKernelBridge *bridge,
 
 int lfm_kernel_bridge_destroy(LfmKernelBridge *bridge) {
     if (!bridge) return -EINVAL;
-    if (!stopping(bridge) || !submissions_settled(bridge) ||
+    if (!stopping(bridge) || producer_exclusive(bridge) ||
+        !submissions_settled(bridge) ||
         bridge->active_waits.load(std::memory_order_acquire) != 0 ||
         bridge->submission_head.value.load(std::memory_order_acquire) !=
             bridge->submission_tail.value.load(std::memory_order_acquire) ||
