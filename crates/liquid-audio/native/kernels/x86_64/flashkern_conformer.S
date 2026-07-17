@@ -1,3 +1,5 @@
+#include "lfm_asm_visibility.h"
+
 // Conformer/adapter leaves, x86_64 twin of aarch64/flashkern_conformer.S.
 // Scalar SSE2, strictly ordered, RNE bf16 rounding at exactly the points the
 // candle ladder rounds. SysV plus Win64-GNU arg normalization (the sibling
@@ -28,6 +30,7 @@
 // void lfm_bf16_widen_f32(const uint16_t *x, float *y, uint64_t n)
 .p2align 4
 .globl LFM_SYM(lfm_bf16_widen_f32)
+LFM_PRIVATE(LFM_SYM(lfm_bf16_widen_f32))
 LFM_SYM(lfm_bf16_widen_f32):
 #ifdef _WIN32
     movq      %rcx, %rdi
@@ -53,6 +56,7 @@ LFM_SYM(lfm_bf16_widen_f32):
 // 5th arg 40(%rsp), 6th 48(%rsp)}, eps is 7th -> 56(%rsp).
 .p2align 4
 .globl LFM_SYM(lfm_ln_bf16)
+LFM_PRIVATE(LFM_SYM(lfm_ln_bf16))
 LFM_SYM(lfm_ln_bf16):
 #ifdef _WIN32
     movq      %rcx, %rdi
@@ -157,6 +161,7 @@ LFM_SYM(lfm_ln_bf16):
 // Win64: rcx rdx r8 r9 + 40..64(%rsp).
 .p2align 4
 .globl LFM_SYM(lfm_bn_bf16)
+LFM_PRIVATE(LFM_SYM(lfm_bn_bf16))
 LFM_SYM(lfm_bn_bf16):
     pushq     %rbx
     pushq     %r12
@@ -234,6 +239,7 @@ LFM_SYM(lfm_bn_bf16):
 // void lfm_relu_bf16(uint16_t *x, uint64_t n)
 .p2align 4
 .globl LFM_SYM(lfm_relu_bf16)
+LFM_PRIVATE(LFM_SYM(lfm_relu_bf16))
 LFM_SYM(lfm_relu_bf16):
 #ifdef _WIN32
     movq      %rcx, %rdi
@@ -256,6 +262,7 @@ LFM_SYM(lfm_relu_bf16):
 // int lfm_silu_bf16(uint16_t *x, uint64_t n)
 .p2align 4
 .globl LFM_SYM(lfm_silu_bf16)
+LFM_PRIVATE(LFM_SYM(lfm_silu_bf16))
 LFM_SYM(lfm_silu_bf16):
 #ifdef _WIN32
     movq      %rcx, %rdi
@@ -302,6 +309,7 @@ LFM_SYM(lfm_silu_bf16):
 // int lfm_glu_bf16(const uint16_t *a, const uint16_t *b, uint16_t *y, uint64_t n)
 .p2align 4
 .globl LFM_SYM(lfm_glu_bf16)
+LFM_PRIVATE(LFM_SYM(lfm_glu_bf16))
 LFM_SYM(lfm_glu_bf16):
 #ifdef _WIN32
     movq      %rcx, %rdi
@@ -364,6 +372,7 @@ LFM_SYM(lfm_glu_bf16):
 // int lfm_gelu_erf_bf16(uint16_t *x, uint64_t n)
 .p2align 4
 .globl LFM_SYM(lfm_gelu_erf_bf16)
+LFM_PRIVATE(LFM_SYM(lfm_gelu_erf_bf16))
 LFM_SYM(lfm_gelu_erf_bf16):
 #ifdef _WIN32
     movq      %rcx, %rdi
@@ -412,6 +421,7 @@ LFM_SYM(lfm_gelu_erf_bf16):
 // void lfm_residual_half_bf16(uint16_t *r, const uint16_t *h, uint64_t n)
 .p2align 4
 .globl LFM_SYM(lfm_residual_half_bf16)
+LFM_PRIVATE(LFM_SYM(lfm_residual_half_bf16))
 LFM_SYM(lfm_residual_half_bf16):
 #ifdef _WIN32
     movq      %rcx, %rdi
@@ -446,6 +456,7 @@ LFM_SYM(lfm_residual_half_bf16):
 // void lfm_add_bf16(uint16_t *r, const uint16_t *h, uint64_t n)
 .p2align 4
 .globl LFM_SYM(lfm_add_bf16)
+LFM_PRIVATE(LFM_SYM(lfm_add_bf16))
 LFM_SYM(lfm_add_bf16):
 #ifdef _WIN32
     movq      %rcx, %rdi
@@ -474,6 +485,7 @@ LFM_SYM(lfm_add_bf16):
 // int lfm_softmax_rows_f32(float *x, uint64_t rows, uint64_t cols)
 .p2align 4
 .globl LFM_SYM(lfm_softmax_rows_f32)
+LFM_PRIVATE(LFM_SYM(lfm_softmax_rows_f32))
 LFM_SYM(lfm_softmax_rows_f32):
 #ifdef _WIN32
     movq      %rcx, %rdi
@@ -550,6 +562,7 @@ LFM_SYM(lfm_softmax_rows_f32):
 // void lfm_sgemm_f32(a, b, c, m, n, k) — C(MxN) = A(MxK).B(KxN), scalar.
 .p2align 4
 .globl LFM_SYM(lfm_sgemm_f32)
+LFM_PRIVATE(LFM_SYM(lfm_sgemm_f32))
 LFM_SYM(lfm_sgemm_f32):
     pushq     %rbx
     pushq     %r12
@@ -610,6 +623,7 @@ LFM_SYM(lfm_sgemm_f32):
 // void lfm_sgemm_nt_f32(a, bt, c, m, n, k) — C = A(MxK) . B(NxK)^T.
 .p2align 4
 .globl LFM_SYM(lfm_sgemm_nt_f32)
+LFM_PRIVATE(LFM_SYM(lfm_sgemm_nt_f32))
 LFM_SYM(lfm_sgemm_nt_f32):
     pushq     %rbx
     pushq     %r12
@@ -672,6 +686,7 @@ LFM_SYM(lfm_sgemm_nt_f32):
 // gate rejects the tuned leaf. No operand is packed or widened into memory.
 .p2align 4
 .globl LFM_SYM(lfm_bf16_gemm_nt_f32_scalar)
+LFM_PRIVATE(LFM_SYM(lfm_bf16_gemm_nt_f32_scalar))
 LFM_SYM(lfm_bf16_gemm_nt_f32_scalar):
     pushq     %rbx
     pushq     %r12
@@ -736,6 +751,7 @@ LFM_SYM(lfm_bf16_gemm_nt_f32_scalar):
 // void lfm_dwconv_tap_f32(xpad, w, y, channels, t_out, t_pad, k, stride)
 .p2align 4
 .globl LFM_SYM(lfm_dwconv_tap_f32)
+LFM_PRIVATE(LFM_SYM(lfm_dwconv_tap_f32))
 LFM_SYM(lfm_dwconv_tap_f32):
     pushq     %rbx
     pushq     %r12
@@ -807,6 +823,7 @@ LFM_SYM(lfm_dwconv_tap_f32):
 // halfwords; each MAC unlift happens in an SSE register.
 .p2align 4
 .globl LFM_SYM(lfm_dwconv_tap_bf16_f32)
+LFM_PRIVATE(LFM_SYM(lfm_dwconv_tap_bf16_f32))
 LFM_SYM(lfm_dwconv_tap_bf16_f32):
     pushq     %rbx
     pushq     %r12
@@ -883,6 +900,7 @@ LFM_SYM(lfm_dwconv_tap_bf16_f32):
 // pointers/indices (utterance-rate; clarity over register pressure).
 .p2align 4
 .globl LFM_SYM(lfm_dwconv2d_k3s2_f32)
+LFM_PRIVATE(LFM_SYM(lfm_dwconv2d_k3s2_f32))
 LFM_SYM(lfm_dwconv2d_k3s2_f32):
     pushq     %rbx
     pushq     %r12
@@ -991,6 +1009,7 @@ LFM_SYM(lfm_dwconv2d_k3s2_f32):
 // MAC; the checkpoint address may be byte-unaligned.
 .p2align 4
 .globl LFM_SYM(lfm_conv2d_stem_k3s2_bf16_f32)
+LFM_PRIVATE(LFM_SYM(lfm_conv2d_stem_k3s2_bf16_f32))
 LFM_SYM(lfm_conv2d_stem_k3s2_bf16_f32):
     pushq     %rbx
     pushq     %r12
@@ -1103,6 +1122,7 @@ LFM_SYM(lfm_conv2d_stem_k3s2_bf16_f32):
 // bf16, while the destination remains f32 for the caller's bias/round ladder.
 .p2align 4
 .globl LFM_SYM(lfm_dwconv2d_k3s2_bf16_f32)
+LFM_PRIVATE(LFM_SYM(lfm_dwconv2d_k3s2_bf16_f32))
 LFM_SYM(lfm_dwconv2d_k3s2_bf16_f32):
     pushq     %rbx
     pushq     %r12
@@ -1217,6 +1237,7 @@ LFM_SYM(lfm_dwconv2d_k3s2_bf16_f32):
 // void lfm_bias_rows_f32(float *y, const uint16_t *bias, uint64_t rows, uint64_t n)
 .p2align 4
 .globl LFM_SYM(lfm_bias_rows_f32)
+LFM_PRIVATE(LFM_SYM(lfm_bias_rows_f32))
 LFM_SYM(lfm_bias_rows_f32):
 #ifdef _WIN32
     movq      %rcx, %rdi
@@ -1252,6 +1273,7 @@ LFM_SYM(lfm_bias_rows_f32):
 // void lfm_bias_bcast_f32(float *y, const uint16_t *bias, uint64_t channels, uint64_t t)
 .p2align 4
 .globl LFM_SYM(lfm_bias_bcast_f32)
+LFM_PRIVATE(LFM_SYM(lfm_bias_bcast_f32))
 LFM_SYM(lfm_bias_bcast_f32):
 #ifdef _WIN32
     movq      %rcx, %rdi
@@ -1288,6 +1310,7 @@ LFM_SYM(lfm_bias_bcast_f32):
 //                        uint64_t cols, uint64_t addend_stride, float scale)
 .p2align 4
 .globl LFM_SYM(lfm_add_scale_f32)
+LFM_PRIVATE(LFM_SYM(lfm_add_scale_f32))
 LFM_SYM(lfm_add_scale_f32):
 #ifdef _WIN32
     movq      %rcx, %rdi
@@ -1324,6 +1347,7 @@ LFM_SYM(lfm_add_scale_f32):
 // void lfm_add_bias_hd_bf16(x, bias, y, t, heads, dk)
 .p2align 4
 .globl LFM_SYM(lfm_add_bias_hd_bf16)
+LFM_PRIVATE(LFM_SYM(lfm_add_bias_hd_bf16))
 LFM_SYM(lfm_add_bias_hd_bf16):
     pushq     %rbx
     pushq     %r12
@@ -1371,6 +1395,7 @@ LFM_SYM(lfm_add_bias_hd_bf16):
 // int lfm_pe_build_bf16(const float *div, uint64_t half, uint64_t t, uint16_t *out)
 .p2align 4
 .globl LFM_SYM(lfm_pe_build_bf16)
+LFM_PRIVATE(LFM_SYM(lfm_pe_build_bf16))
 LFM_SYM(lfm_pe_build_bf16):
 #ifdef _WIN32
     movq      %rcx, %rdi

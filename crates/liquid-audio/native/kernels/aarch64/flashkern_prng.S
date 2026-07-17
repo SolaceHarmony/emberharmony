@@ -1,3 +1,5 @@
+#include "lfm_asm_visibility.h"
+
 #if defined(__APPLE__)
 #define CNAME(name) _##name
 #else
@@ -32,6 +34,7 @@
 .endm
 
 .globl CNAME(lfm_chacha20_block)
+LFM_PRIVATE(CNAME(lfm_chacha20_block))
 #if !defined(__APPLE__)
 .type CNAME(lfm_chacha20_block), %function
 #endif
@@ -109,6 +112,7 @@ CNAME(lfm_chacha20_block):
  */
 .p2align 2
 .globl CNAME(lfm_apple_secure_random)
+LFM_PRIVATE(CNAME(lfm_apple_secure_random))
 CNAME(lfm_apple_secure_random):
     stp     x29, x30, [sp, #-16]!
     mov     x29, sp

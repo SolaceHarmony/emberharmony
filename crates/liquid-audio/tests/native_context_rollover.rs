@@ -26,6 +26,13 @@ struct Move {
 }
 
 unsafe extern "C" {
+    fn lfm_context_window_admit(window: *const Window, needed: usize) -> i32;
+    fn lfm_context_window_prefill_chunk(
+        window: *const Window,
+        remaining: usize,
+        max_rows: usize,
+        out_rows: *mut usize,
+    ) -> i32;
     fn lfm_context_window_reserve(window: *mut Window, needed: usize, movement: *mut Move) -> i32;
     fn lfm_context_window_commit(window: *mut Window) -> i32;
     fn lfm_context_compact_bf16(
@@ -51,6 +58,36 @@ unsafe extern "C" {
         cosine: *mut f32,
         sine: *mut f32,
     ) -> i32;
+}
+
+fn causal_lengths(mut window: Window, rows: usize, max_rows: usize) -> (Vec<u64>, Window) {
+    assert_eq!(unsafe { lfm_context_window_admit(&window, rows) }, 0);
+    let mut lengths = Vec::with_capacity(rows);
+    let mut completed = 0;
+    while completed < rows {
+        let mut chunk = 0;
+        assert_eq!(
+            unsafe {
+                lfm_context_window_prefill_chunk(&window, rows - completed, max_rows, &mut chunk)
+            },
+            0
+        );
+        assert!(chunk > 0 && chunk <= rows - completed);
+        let prior = window.position;
+        let movement = reserve(&mut window, chunk);
+        for row in 0..chunk {
+            lengths.push(window.position + row as u64 + 1);
+        }
+        for _ in 0..chunk {
+            assert_eq!(unsafe { lfm_context_window_commit(&mut window) }, 0);
+        }
+        assert_eq!(
+            movement.dropped,
+            (prior + chunk as u64).saturating_sub(window.capacity)
+        );
+        completed += chunk;
+    }
+    (lengths, window)
 }
 
 fn reserve(window: &mut Window, needed: usize) -> Move {
@@ -135,8 +172,8 @@ fn rollover_retains_the_exact_latest_window_and_monotonic_cursor() {
 }
 
 #[test]
-fn whole_action_reservation_evicts_before_any_new_pass() {
-    let mut window = Window {
+fn whole_action_admission_does_not_evict_before_the_first_pass() {
+    let window = Window {
         capacity: 4,
         runway: 2,
         position: 4,
@@ -144,21 +181,24 @@ fn whole_action_reservation_evicts_before_any_new_pass() {
         rope_base: 5,
         ..Window::default()
     };
-    let movement = reserve(&mut window, 3);
-    assert_eq!(
-        (movement.dropped, movement.source, movement.retained),
-        (3, 3, 1)
-    );
-    assert_eq!(movement.compact, 1);
-    assert_eq!(
-        (window.position, window.cursor, window.rope_base),
-        (1, 9, 8)
-    );
     let before = window;
+    assert_eq!(unsafe { lfm_context_window_admit(&window, 3) }, 0);
     assert_eq!(
-        unsafe { lfm_context_window_reserve(&mut window, 5, &mut Move::default()) },
-        -28
+        (
+            window.position,
+            window.start,
+            window.cursor,
+            window.rope_base,
+        ),
+        (
+            before.position,
+            before.start,
+            before.cursor,
+            before.rope_base,
+        ),
+        "whole-action validation must not discard causal history"
     );
+    assert_eq!(unsafe { lfm_context_window_admit(&window, 5) }, -28);
     assert_eq!(
         (
             window.position,
@@ -174,6 +214,70 @@ fn whole_action_reservation_evicts_before_any_new_pass() {
         ),
         "rejected whole-action admission must not mutate context state"
     );
+}
+
+#[test]
+fn batched_rollover_matches_sequential_causal_window_lengths() {
+    let full = Window {
+        capacity: 4,
+        runway: 4,
+        position: 4,
+        cursor: 4,
+        ..Window::default()
+    };
+    let (batched, batched_window) = causal_lengths(full, 3, 4);
+    let (sequential, sequential_window) = causal_lengths(full, 3, 1);
+    assert_eq!(batched, sequential);
+    assert_eq!(batched, [4, 4, 4]);
+    assert_eq!(
+        (
+            batched_window.position,
+            batched_window.start,
+            batched_window.cursor,
+            batched_window.rope_base,
+        ),
+        (
+            sequential_window.position,
+            sequential_window.start,
+            sequential_window.cursor,
+            sequential_window.rope_base,
+        )
+    );
+    assert_eq!(batched_window.cursor, 7);
+    assert_eq!(batched_window.rope_base, 3);
+}
+
+#[test]
+fn cursor_overflow_is_rejected_without_mutating_the_window() {
+    let mut window = Window {
+        capacity: 4,
+        runway: 2,
+        position: 3,
+        cursor: u64::MAX - 1,
+        rope_base: u64::MAX - 4,
+        ..Window::default()
+    };
+    let before = window;
+    let mut movement = Move::default();
+    assert_eq!(
+        unsafe { lfm_context_window_reserve(&mut window, 2, &mut movement) },
+        -libc::EOVERFLOW
+    );
+    assert_eq!(
+        (
+            window.position,
+            window.start,
+            window.cursor,
+            window.rope_base,
+        ),
+        (
+            before.position,
+            before.start,
+            before.cursor,
+            before.rope_base,
+        )
+    );
+    assert_eq!(movement.dropped, 0);
 }
 
 #[test]

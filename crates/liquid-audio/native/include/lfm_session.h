@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #include "lfm_types.h"
+#include "lfm_visibility.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -98,26 +99,30 @@ typedef struct LfmSessionSnapshotV1 {
 #define LFM_SESSION_THREADS_JOINED 3u
 #define LFM_SESSION_JOINED 4u
 
-int lfm_session_create(LfmRuntime *runtime, LfmModel *model,
-                       LfmConversation *conversation,
-                       const LfmSessionConfigV1 *config,
-                       const LfmCallbacksV1 *callbacks, LfmSession **out);
-int lfm_session_start(LfmSession *session);
+LFM_PUBLIC_API int lfm_session_create(
+    LfmRuntime *runtime, LfmModel *model, LfmConversation *conversation,
+    const LfmSessionConfigV1 *config, const LfmCallbacksV1 *callbacks,
+    LfmSession **out);
+LFM_PUBLIC_API int lfm_session_start(LfmSession *session);
 /* Compatibility try-submit. Returns WOULD_BLOCK when the fixed control ring is
  * full. New callers should use the expected-value blocking entry point below. */
-int lfm_session_submit_text(LfmSession *session, const char *utf8,
-                            size_t utf8_bytes, LfmTicketIdV1 *out_ticket);
+LFM_PUBLIC_API int lfm_session_submit_text(LfmSession *session,
+                                           const char *utf8,
+                                           size_t utf8_bytes,
+                                           LfmTicketIdV1 *out_ticket);
 /* Copies one bounded UTF-8 command into the fixed control ring and returns its
  * native action ticket. Full-ring admission parks without polling until the
  * consumer opens space, the session is interrupted, or the session stops. */
-int lfm_session_wait_submit_text(LfmSession *session, const char *utf8,
-                                 size_t utf8_bytes,
-                                 LfmTicketIdV1 *out_ticket);
-int lfm_session_interrupt(LfmSession *session, uint64_t *out_epoch);
-void lfm_session_request_stop(LfmSession *session);
-int lfm_session_join(LfmSession *session);
-int lfm_session_snapshot(const LfmSession *session, LfmSessionSnapshotV1 *out);
-int lfm_session_destroy(LfmSession *session);
+LFM_PUBLIC_API int lfm_session_wait_submit_text(
+    LfmSession *session, const char *utf8, size_t utf8_bytes,
+    LfmTicketIdV1 *out_ticket);
+LFM_PUBLIC_API int lfm_session_interrupt(LfmSession *session,
+                                         uint64_t *out_epoch);
+LFM_PUBLIC_API void lfm_session_request_stop(LfmSession *session);
+LFM_PUBLIC_API int lfm_session_join(LfmSession *session);
+LFM_PUBLIC_API int lfm_session_snapshot(const LfmSession *session,
+                                        LfmSessionSnapshotV1 *out);
+LFM_PUBLIC_API int lfm_session_destroy(LfmSession *session);
 
 #ifdef __cplusplus
 } /* extern "C" */

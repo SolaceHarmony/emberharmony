@@ -3,6 +3,7 @@
 
 #include "flashkern_depth.h"
 #include "flashkern_rope.h"
+#include "lfm_audio_pass.h"
 #include "lfm_conformer.h"
 #include "lfm_frontend.h"
 #include "lfm_mimi.h"
@@ -149,6 +150,8 @@ size_t multiply(size_t left, size_t right, const char *what) {
     return left * right;
 }
 
+/* A view is metadata only. It never owns checkpoint bytes; `value.data` and
+ * `value.shape` borrow the sealed LfmWeightImage for the model lifetime. */
 struct View {
     LfmTensorView value{};
 
@@ -157,8 +160,32 @@ struct View {
     }
 };
 
-View tensor(const LfmWeightImage *weights, const std::string &name,
-            std::initializer_list<uint64_t> shape) {
+struct BindingLedger {
+    struct Span {
+        const void *data;
+        uint64_t bytes;
+    };
+
+    std::vector<Span> spans;
+    uint64_t total = 0;
+
+    void add(const LfmTensorView &view) {
+        const auto found = std::find_if(
+            spans.begin(), spans.end(), [&](const Span &span) {
+                return span.data == view.data && span.bytes == view.bytes;
+            });
+        if (found != spans.end()) return;
+        if (view.bytes > UINT64_MAX - total) {
+            fail(-EOVERFLOW, "directly bound tensor byte accounting overflow");
+        }
+        spans.push_back({view.data, view.bytes});
+        total += view.bytes;
+    }
+};
+
+View bind_tensor(const LfmWeightImage *weights, const std::string &name,
+                 std::initializer_list<uint64_t> shape,
+                 BindingLedger *bindings) {
     View view;
     view.value.size = sizeof(view.value);
     view.value.abi_version = LFM_WEIGHT_ABI_VERSION;
@@ -176,18 +203,24 @@ View tensor(const LfmWeightImage *weights, const std::string &name,
         }
         ++axis;
     }
+    bindings->add(view.value);
     return view;
 }
 
-bool optional_tensor(const LfmWeightImage *weights, const std::string &name,
-                     View *out) {
+bool bind_optional_tensor(const LfmWeightImage *weights,
+                          const std::string &name, View *out,
+                          BindingLedger *bindings) {
     out->value.size = sizeof(out->value);
     out->value.abi_version = LFM_WEIGHT_ABI_VERSION;
-    return lfm_weights_find(weights, name.c_str(), &out->value) == LFM_WEIGHT_OK;
+    if (lfm_weights_find(weights, name.c_str(), &out->value) != LFM_WEIGHT_OK) {
+        return false;
+    }
+    bindings->add(out->value);
+    return true;
 }
 
-View matrix(const LfmWeightImage *weights, const std::string &name,
-            uint64_t columns) {
+View bind_matrix(const LfmWeightImage *weights, const std::string &name,
+                 uint64_t columns, BindingLedger *bindings) {
     View view;
     view.value.size = sizeof(view.value);
     view.value.abi_version = LFM_WEIGHT_ABI_VERSION;
@@ -197,6 +230,7 @@ View matrix(const LfmWeightImage *weights, const std::string &name,
         view.value.shape[0] == 0 || view.value.shape[1] != columns) {
         fail(-EINVAL, "model tensor '" + name + "' has the wrong matrix shape");
     }
+    bindings->add(view.value);
     return view;
 }
 
@@ -232,12 +266,19 @@ size_t ffn_size(const Json &config, size_t hidden) {
     const size_t multiple = integer(config, "block_multiple_of", 256, false);
     if (multiple == 0) fail(-EINVAL, "block_multiple_of must be nonzero");
     const double multiplier = number(config, "block_ffn_dim_multiplier", 1.0);
-    const double scaled = multiplier * (double)((2 * initial) / 3);
-    if (scaled < 0.0 || scaled > (double)std::numeric_limits<size_t>::max()) {
+    const size_t swiglu = multiply(2, initial, "adjusted FFN SwiGLU") / 3;
+    const double scaled = multiplier * (double)swiglu;
+    const double limit = std::ldexp(1.0, std::numeric_limits<size_t>::digits);
+    if (scaled < 0.0 || !std::isfinite(scaled) || scaled >= limit) {
         fail(-EOVERFLOW, "adjusted FFN size is out of range");
     }
     const size_t value = (size_t)scaled;
-    return ((value + multiple - 1) / multiple) * multiple;
+    const size_t bias = multiple - 1;
+    if (value > std::numeric_limits<size_t>::max() - bias) {
+        fail(-EOVERFLOW, "adjusted FFN rounding overflows size_t");
+    }
+    return multiply((value + bias) / multiple, multiple,
+                    "adjusted FFN rounding");
 }
 
 size_t depth_ffn_size(size_t hidden) {
@@ -264,37 +305,14 @@ void build_rope_f32(size_t positions, size_t head_dim, float theta,
     if (status != 0) fail(status, "architecture RoPE table kernel rejected geometry");
 }
 
-uint64_t image_payload_bytes(const LfmWeightImage *weights) {
-    uint64_t total = 0;
-    for (uint32_t component = LFM_WEIGHT_COMPONENT_MAIN;
-         component < LFM_WEIGHT_COMPONENT_COUNT; ++component) {
-        const size_t count = lfm_weights_component_count(weights, component);
-        for (size_t index = 0; index < count; ++index) {
-            LfmTensorView view = {
-                .size = sizeof(LfmTensorView),
-                .abi_version = LFM_WEIGHT_ABI_VERSION,
-            };
-            const int status = lfm_weights_at_component(weights, component,
-                                                        index, &view);
-            if (status != LFM_WEIGHT_OK) {
-                fail(status, "cannot enumerate resident model tensors");
-            }
-            if (view.bytes > std::numeric_limits<uint64_t>::max() - total) {
-                fail(-EOVERFLOW, "resident tensor byte accounting overflow");
-            }
-            total += view.bytes;
-        }
-    }
-    return total;
-}
-
 } // namespace
 
 namespace {
 
-/* A fair, expected-value pass gate. The executor intentionally has one mutable
- * request slot, so conversations sharing a model must queue at pass boundaries
- * rather than surfacing the engine's internal -EBUSY admission detail. */
+/* A fair, expected-value pass gate. The lane board intentionally executes one
+ * complete pass at a time even though the SQ and per-ticket scratch have depth
+ * two. The synchronous session path queues conversations at pass boundaries
+ * rather than surfacing compatibility admission details. */
 struct ExecutionGate {
     alignas(64) uint32_t next = 0;
     alignas(64) uint32_t serving = 0;
@@ -453,17 +471,38 @@ struct LfmConversation {
     }
 };
 
-extern "C" int lfm_context_window_reserve(LfmContextWindowState *window,
-                                           size_t needed,
-                                           LfmContextWindowMove *move) {
-    if (!window || !move || window->capacity == 0 ||
+extern "C" int lfm_context_window_admit(const LfmContextWindowState *window,
+                                         size_t needed) {
+    if (!window || window->capacity == 0 || needed == 0 ||
         window->position > window->capacity || window->start > window->runway ||
         window->position > UINT64_MAX - window->rope_base ||
         window->rope_base + window->position != window->cursor) {
         return -EINVAL;
     }
     if (needed > window->capacity) return -ENOSPC;
-    if ((uint64_t)needed > UINT64_MAX - window->position) return -EOVERFLOW;
+    if ((uint64_t)needed > UINT64_MAX - window->cursor) return -EOVERFLOW;
+    return 0;
+}
+
+extern "C" int lfm_context_window_prefill_chunk(
+    const LfmContextWindowState *window, size_t remaining, size_t max_rows,
+    size_t *out_rows) {
+    if (!out_rows || max_rows == 0) return -EINVAL;
+    *out_rows = 0;
+    const int status = lfm_context_window_admit(window, remaining);
+    if (status != 0) return status;
+    const size_t available = (size_t)(window->capacity - window->position);
+    const size_t causal = available == 0 ? 1 : available;
+    *out_rows = std::min({remaining, max_rows, causal});
+    return 0;
+}
+
+extern "C" int lfm_context_window_reserve(LfmContextWindowState *window,
+                                           size_t needed,
+                                           LfmContextWindowMove *move) {
+    if (!move) return -EINVAL;
+    const int status = lfm_context_window_admit(window, needed);
+    if (status != 0) return status;
     *move = {};
     if (needed <= window->capacity - window->position) return 0;
     const uint64_t dropped = window->position + needed - window->capacity;
@@ -694,6 +733,10 @@ int commit_context(LfmConversation &conversation) {
     return lfm_context_window_commit(&conversation.window);
 }
 
+int admit_context(const LfmConversation &conversation, size_t needed) {
+    return lfm_context_window_admit(&conversation.window, needed);
+}
+
 int reset_memory(LfmConversation &conversation) {
     for (ConversationLayer &layer : conversation.memory) {
         std::fill(layer.keys.begin(), layer.keys.end(), 0);
@@ -737,12 +780,17 @@ int prefill_rows_claimed(LfmConversation &conversation, const uint16_t *rows,
         return -EINVAL;
     }
     const size_t row_count = element_count / hidden;
-    int status = reserve_context(conversation, row_count);
+    int status = admit_context(conversation, row_count);
     if (status != 0) return status;
     ExecutionClaim execution(conversation.model->execution);
-    for (size_t index = 0; index < row_count; index += LFM_PREFILL_MAX_ROWS) {
-        const size_t count =
-            std::min((size_t)LFM_PREFILL_MAX_ROWS, row_count - index);
+    for (size_t index = 0; index < row_count;) {
+        size_t count = 0;
+        status = lfm_context_window_prefill_chunk(
+            &conversation.window, row_count - index, LFM_PREFILL_MAX_ROWS,
+            &count);
+        if (status != 0) return status;
+        status = reserve_context(conversation, count);
+        if (status != 0) return status;
         const bool sample = sample_last && index + count == row_count;
         status = lfm_engine_prefill(
             conversation.model->engine, conversation.model->plan_id,
@@ -768,6 +816,7 @@ int prefill_rows_claimed(LfmConversation &conversation, const uint16_t *rows,
             if (status != 0) return status;
         }
         conversation.hidden_ready = true;
+        index += count;
     }
     *out_position = conversation.window.cursor;
     return 0;
@@ -865,43 +914,34 @@ int prepare_pcm_rows_claimed(LfmConversation &conversation, const float *pcm,
     if (sample_rate != conversation.prepared_rate) return -EINVAL;
     if (sample_count > conversation.prepared_samples) return -ENOBUFS;
 
-    LfmF32Span span{};
-    int status = lfm_resampler_process(
-        conversation.resampler, conversation.resampler_workspace, pcm,
-        sample_count,
-        conversation.resampled.empty() ? nullptr : conversation.resampled.data(),
-        conversation.resampled.size(), &span);
+    uint64_t adapted_values = 0;
+    const LfmAudioEncodePassV1 pass = {
+        .size = sizeof(LfmAudioEncodePassV1),
+        .abi_version = LFM_AUDIO_PASS_ABI,
+        .resampler = conversation.resampler,
+        .resampler_workspace = conversation.resampler_workspace,
+        .frontend = model->frontend,
+        .frontend_workspace = conversation.frontend_workspace,
+        .conformer = model->conformer,
+        .conformer_workspace = conversation.conformer_workspace,
+        .pcm = pcm,
+        .sample_count = sample_count,
+        .resampled = conversation.resampled.empty()
+                         ? nullptr
+                         : conversation.resampled.data(),
+        .resampled_capacity = conversation.resampled.size(),
+        .mel = conversation.mel_bf16.data(),
+        .mel_capacity = conversation.mel_bf16.size(),
+        .adapted = conversation.adapted.data(),
+        .adapted_capacity = conversation.adapted.size(),
+        .out_adapted_values = &adapted_values,
+    };
+    ExecutionClaim execution(model->execution);
+    const int status = lfm_engine_audio_encode(model->engine, model->plan_id,
+                                               &pass);
     if (status != 0) return status;
-    const float *samples = span.data;
-    const uint64_t length = span.length;
-
-    const uint64_t frames = lfm_frontend_seq_len(model->frontend, length);
-    if (frames == 0 || frames > std::numeric_limits<size_t>::max() /
-                                  model->mel_features) {
-        return frames == 0 ? -EINVAL : -EOVERFLOW;
-    }
-    const size_t mel_values = (size_t)frames * model->mel_features;
-    if (mel_values > conversation.mel_bf16.size()) return -ENOBUFS;
-    status = lfm_frontend_forward_bf16_workspace(
-        model->frontend, conversation.frontend_workspace, samples, length,
-        conversation.mel_bf16.data(), conversation.mel_bf16.size());
-    if (status != 0) return status;
-
-    const uint64_t rows = lfm_conformer_out_rows(model->conformer, frames);
-    if (rows == 0 || rows > std::numeric_limits<size_t>::max() / model->hidden) {
-        return rows == 0 ? -EINVAL : -EOVERFLOW;
-    }
-    const size_t adapted_values = (size_t)rows * model->hidden;
-    if (adapted_values > conversation.adapted.size()) return -ENOBUFS;
-    {
-        ExecutionClaim execution(model->execution);
-        status = lfm_conformer_forward(
-            model->conformer, conversation.conformer_workspace,
-            conversation.mel_bf16.data(), frames, conversation.adapted.data(),
-            conversation.adapted.size());
-    }
-    if (status != 0) return status;
-    *out_values = adapted_values;
+    if (adapted_values > std::numeric_limits<size_t>::max()) return -EOVERFLOW;
+    *out_values = (size_t)adapted_values;
     return 0;
 }
 
@@ -955,13 +995,17 @@ int prefill_text_ids_claimed(LfmConversation &conversation,
         })) {
         return -ERANGE;
     }
-    int status = reserve_context(conversation, token_count);
+    int status = admit_context(conversation, token_count);
     if (status != 0) return status;
     ExecutionClaim execution(conversation.model->execution);
-    for (size_t index = 0; index < token_count;
-         index += LFM_PREFILL_MAX_ROWS) {
-        const size_t count =
-            std::min((size_t)LFM_PREFILL_MAX_ROWS, token_count - index);
+    for (size_t index = 0; index < token_count;) {
+        size_t count = 0;
+        status = lfm_context_window_prefill_chunk(
+            &conversation.window, token_count - index, LFM_PREFILL_MAX_ROWS,
+            &count);
+        if (status != 0) return status;
+        status = reserve_context(conversation, count);
+        if (status != 0) return status;
         const bool sample = sample_last && index + count == token_count;
         status = lfm_engine_prefill(
             conversation.model->engine, conversation.model->plan_id,
@@ -986,6 +1030,7 @@ int prefill_text_ids_claimed(LfmConversation &conversation,
             if (status != 0) return status;
         }
         conversation.hidden_ready = true;
+        index += count;
     }
     return 0;
 }
@@ -1041,6 +1086,15 @@ int forward_pending_claimed(LfmConversation &conversation, bool sample,
     status = commit_context(conversation);
     if (status != 0) return status;
     conversation.hidden_ready = true;
+    return 0;
+}
+
+int commit_pending_claimed(LfmConversation &conversation) {
+    if (conversation.pending_count == 0) return 0;
+    const int status = forward_pending_claimed(conversation, false, nullptr);
+    if (status != 0) return status;
+    conversation.pending_count = 0;
+    conversation.pending_kind = 0;
     return 0;
 }
 
@@ -1100,18 +1154,26 @@ int emit_audio_claimed(LfmConversation &conversation, LfmNativeEmission *out) {
     if (end) {
         std::fill(codes, codes + conversation.model->codebooks, 2048);
     }
+    uint32_t pending[LFM_AUDIO_TOKEN_CAPACITY] = {};
+    for (size_t codebook = 0; codebook < conversation.model->codebooks;
+         ++codebook) {
+        const uint64_t id = (uint64_t)codes[codebook] +
+                            conversation.model->codebook_offsets[codebook];
+        if (id > UINT32_MAX) return -EOVERFLOW;
+        if (id >= conversation.model->audio_rows) return -ERANGE;
+        pending[codebook] = (uint32_t)id;
+    }
+    /* Validate the complete tuple before mutating either the reliable emission
+     * or the recurrence state. A terminal schema error must not leave a
+     * half-written pending code frame for teardown to commit. */
     out->kind = LFM_NATIVE_EMISSION_AUDIO_CODES;
     out->code_count = conversation.model->codebooks;
     out->flags = end ? 1u : 0u;
     std::copy(codes, codes + conversation.model->codebooks, out->codes);
     conversation.pending_count = conversation.model->codebooks;
     conversation.pending_kind = 1;
-    for (size_t codebook = 0; codebook < conversation.model->codebooks; ++codebook) {
-        const uint64_t id = (uint64_t)codes[codebook] +
-                            conversation.model->codebook_offsets[codebook];
-        if (id > UINT32_MAX) return -EOVERFLOW;
-        conversation.pending_ids[codebook] = (uint32_t)id;
-    }
+    std::copy(pending, pending + conversation.model->codebooks,
+              conversation.pending_ids);
     ++conversation.generated;
     if (conversation.modality_left == 0 && !conversation.text_done) {
         conversation.modality = 1;
@@ -1132,11 +1194,15 @@ int next_emission_claimed(LfmConversation &conversation,
         uint32_t sampled = 0;
         const int status = forward_pending_claimed(conversation, true, &sampled);
         if (status != 0) return status;
+        conversation.pending_count = 0;
+        conversation.pending_kind = 0;
         out->position = conversation.window.cursor;
         return emit_text_claimed(conversation, sampled, out);
     }
     const int status = forward_pending_claimed(conversation, false, nullptr);
     if (status != 0) return status;
+    conversation.pending_count = 0;
+    conversation.pending_kind = 0;
     out->position = conversation.window.cursor;
     return emit_audio_claimed(conversation, out);
 }
@@ -1152,7 +1218,13 @@ int begin_generation_claimed(LfmConversation &conversation, uint32_t sampled,
     conversation.generation_active = true;
     conversation.generation_ended = false;
     clear_emission(out, conversation.window.cursor);
-    return emit_text_claimed(conversation, sampled, out);
+    const int status = emit_text_claimed(conversation, sampled, out);
+    if (status != 0) return status;
+    /* Candle created a fresh Mimi streaming decoder for every response. Keep
+     * that turn boundary here, after the turn has begun successfully and only
+     * once: interleaved audio runs within the turn must share codec state. */
+    if (conversation.mimi) mimi_decode_state_reset(conversation.mimi);
+    return 0;
 }
 
 int prefill_turn_prefix_claimed(LfmConversation &conversation) {
@@ -1216,9 +1288,9 @@ int lfm_conversation_begin_pcm_native(LfmConversation *conversation,
             model->max_context - prefix.size() - rows) {
         return -ENOSPC;
     }
-    status = reserve_context(*conversation,
-                             prefix.size() + rows +
-                                 model->assistant_tokens.size());
+    status = admit_context(*conversation,
+                           prefix.size() + rows +
+                               model->assistant_tokens.size());
     if (status != 0) return status;
 
     status = prefill_turn_prefix_claimed(*conversation);
@@ -1262,9 +1334,9 @@ int lfm_conversation_begin_text_native(LfmConversation *conversation,
             model->max_context - prefix.size() - text_tokens) {
         return -ENOSPC;
     }
-    status = reserve_context(*conversation,
-                             prefix.size() + text_tokens +
-                                 model->assistant_tokens.size());
+    status = admit_context(*conversation,
+                           prefix.size() + text_tokens +
+                               model->assistant_tokens.size());
     if (status != 0) return status;
     status = prefill_turn_prefix_claimed(*conversation);
     if (status != 0) return status;
@@ -1318,7 +1390,7 @@ int lfm_conversation_begin_mixed_native(
         model->max_context, prefix.size(), text_tokens, rows,
         model->assistant_tokens.size(), &plan);
     if (status != 0) return status;
-    status = reserve_context(*conversation, plan.total);
+    status = admit_context(*conversation, plan.total);
     if (status != 0) return status;
 
     status = prefill_turn_prefix_claimed(*conversation);
@@ -1347,9 +1419,100 @@ int lfm_conversation_interrupt_native(LfmConversation *conversation) {
     if (!conversation) return -EINVAL;
     ConversationClaim claim(conversation);
     if (!claim) return -EBUSY;
-    conversation->pending_count = 0;
+    /* An emission is published before it becomes the input to the following
+     * recurrence pass. Interrupt/truncation must close that one-pass seam: the
+     * already-produced token belongs in KV and ShortConv even though interrupt
+     * performs no sampling and publishes nothing. This also commits the
+     * recurrence-only EOAudio code tuple; im_end is terminal and is never put
+     * in pending_ids by emit_text_claimed. */
+    const int status = commit_pending_claimed(*conversation);
+    if (status != 0) return status;
     conversation->generation_active = false;
     conversation->generation_ended = true;
+    return 0;
+}
+
+/* Private implementation-backed test seams. They are intentionally absent
+ * from every product and transitional header. */
+extern "C" int lfm_internal_conversation_interrupt_for_test(
+    LfmConversation *conversation) {
+    return lfm_conversation_interrupt_native(conversation);
+}
+
+extern "C" int lfm_internal_conversation_stage_pending_for_test(
+    LfmConversation *conversation, const uint32_t *ids, size_t id_count,
+    uint32_t embedding_kind) {
+    if (!conversation || !ids || id_count == 0 ||
+        id_count > LFM_INPUT_MAX_IDS || embedding_kind > 1) {
+        return -EINVAL;
+    }
+    ConversationClaim claim(conversation);
+    if (!claim) return -EBUSY;
+    if (conversation->pending_count != 0 || conversation->generation_active) {
+        return -EALREADY;
+    }
+    if ((embedding_kind == 0 &&
+         (id_count != 1 || ids[0] >= conversation->model->vocab)) ||
+        (embedding_kind == 1 &&
+         std::any_of(ids, ids + id_count, [&](uint32_t id) {
+             return id >= conversation->model->audio_rows;
+         }))) {
+        return -ERANGE;
+    }
+    std::copy(ids, ids + id_count, conversation->pending_ids);
+    conversation->pending_count = (uint32_t)id_count;
+    conversation->pending_kind = embedding_kind;
+    conversation->generation_active = true;
+    conversation->generation_ended = false;
+    return 0;
+}
+
+extern "C" int lfm_internal_conversation_cache_digest_for_test(
+    LfmConversation *conversation, uint64_t *out) {
+    if (!conversation || !out) return -EINVAL;
+    ConversationClaim claim(conversation);
+    if (!claim) return -EBUSY;
+    uint64_t digest = UINT64_C(14695981039346656037);
+    const auto append = [&](const void *data, size_t bytes) {
+        const uint8_t *source = static_cast<const uint8_t *>(data);
+        for (size_t index = 0; index < bytes; ++index) {
+            digest ^= source[index];
+            digest *= UINT64_C(1099511628211);
+        }
+    };
+    append(&conversation->window, sizeof(conversation->window));
+    for (const ConversationLayer &layer : conversation->memory) {
+        const size_t key_bytes = layer.keys.size() * sizeof(uint16_t);
+        const size_t value_bytes = layer.values.size() * sizeof(uint16_t);
+        const size_t convolution_bytes =
+            layer.convolution.size() * sizeof(uint16_t);
+        append(&key_bytes, sizeof(key_bytes));
+        append(layer.keys.data(), key_bytes);
+        append(&value_bytes, sizeof(value_bytes));
+        append(layer.values.data(), value_bytes);
+        append(&convolution_bytes, sizeof(convolution_bytes));
+        append(layer.convolution.data(), convolution_bytes);
+    }
+    const size_t hidden_bytes = conversation->hidden.size() * sizeof(uint16_t);
+    append(&hidden_bytes, sizeof(hidden_bytes));
+    append(conversation->hidden.data(), hidden_bytes);
+    *out = digest;
+    return 0;
+}
+
+extern "C" int lfm_internal_conversation_prng_digest_for_test(
+    LfmConversation *conversation, uint64_t *out) {
+    if (!conversation || !out) return -EINVAL;
+    ConversationClaim claim(conversation);
+    if (!claim) return -EBUSY;
+    uint64_t digest = UINT64_C(14695981039346656037);
+    const uint8_t *bytes =
+        reinterpret_cast<const uint8_t *>(&conversation->prng);
+    for (size_t index = 0; index < sizeof(conversation->prng); ++index) {
+        digest ^= bytes[index];
+        digest *= UINT64_C(1099511628211);
+    }
+    *out = digest;
     return 0;
 }
 
@@ -1365,11 +1528,10 @@ int lfm_conversation_decode_native(LfmConversation *conversation,
     ConversationClaim claim(conversation);
     if (!claim) return -EBUSY;
     if (!conversation->mimi) return -ENOTSUP;
-    const int samples = mimi_decode_state_step(conversation->mimi, codes, pcm);
-    if (samples < 0) return samples;
-    if ((size_t)samples > pcm_capacity) return -EOVERFLOW;
-    *out_samples = (size_t)samples;
-    return 0;
+    ExecutionClaim execution(conversation->model->execution);
+    return lfm_engine_mimi_decode(
+        conversation->model->engine, conversation->model->plan_id,
+        conversation->mimi, codes, code_count, pcm, pcm_capacity, out_samples);
 }
 
 int lfm_conversation_belongs_to(const LfmConversation *conversation,
@@ -1391,7 +1553,23 @@ extern "C" int lfm_model_open(void *engine, const char *path, LfmModel **out,
     uint64_t depth_plan_id = 0;
     std::vector<float> depth_rope_cos;
     std::vector<float> depth_rope_sin;
+    BindingLedger bindings;
     try {
+        const auto tensor = [&bindings](const LfmWeightImage *image,
+                                        const std::string &name,
+                                        std::initializer_list<uint64_t> shape) {
+            return bind_tensor(image, name, shape, &bindings);
+        };
+        const auto optional_tensor = [&bindings](const LfmWeightImage *image,
+                                                 const std::string &name,
+                                                 View *out_view) {
+            return bind_optional_tensor(image, name, out_view, &bindings);
+        };
+        const auto matrix = [&bindings](const LfmWeightImage *image,
+                                        const std::string &name,
+                                        uint64_t columns) {
+            return bind_matrix(image, name, columns, &bindings);
+        };
         const fs::path root(path);
         const Json document = read_json(root / "config.json");
         if (!document.is_object() || !document.contains("lfm") ||
@@ -1807,7 +1985,17 @@ extern "C" int lfm_model_open(void *engine, const char *path, LfmModel **out,
         }
         model->resident_bytes = load_stats.resident_bytes;
         model->source_bytes = load_stats.source_bytes;
-        model->directly_bound_bytes = image_payload_bytes(weights);
+        const uint64_t bound_parts[] = {
+            bindings.total,
+            lfm_conformer_bound_weight_bytes(conformer),
+            mimi_decode_plan_bound_weight_bytes(mimi),
+        };
+        for (uint64_t bytes : bound_parts) {
+            if (bytes > UINT64_MAX - model->directly_bound_bytes) {
+                fail(-EOVERFLOW, "directly bound tensor byte accounting overflow");
+            }
+            model->directly_bound_bytes += bytes;
+        }
         const uint64_t derived_parts[] = {
             frontend_derived,
             lfm_conformer_derived_bytes(conformer),
@@ -2145,10 +2333,12 @@ extern "C" int lfm_conversation_prefill(LfmConversation *conversation,
             return -ERANGE;
         }
     }
-    int status = reserve_context(*conversation, input_count);
+    int status = admit_context(*conversation, input_count);
     if (status != 0) return status;
     for (size_t index = 0; index < input_count; ++index) {
         const LfmInputV1 &input = inputs[index];
+        status = reserve_context(*conversation, 1);
+        if (status != 0) return status;
         ExecutionClaim execution(conversation->model->execution);
         status = lfm_engine_token_pass(
             conversation->model->engine, conversation->model->plan_id,

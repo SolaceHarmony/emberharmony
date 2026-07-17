@@ -1,3 +1,5 @@
+#include "lfm_asm_visibility.h"
+
 #ifdef __APPLE__
 #define LFM_SYM(name) _##name
 #else
@@ -7,6 +9,7 @@
 .text
 .p2align 4
 .globl LFM_SYM(lfm_rsqrt_size)
+LFM_PRIVATE(LFM_SYM(lfm_rsqrt_size))
 LFM_SYM(lfm_rsqrt_size):
 #ifdef _WIN32
     pxor      %xmm1, %xmm1
@@ -23,6 +26,7 @@ LFM_SYM(lfm_rsqrt_size):
 
 .p2align 4
 .globl LFM_SYM(lfm_inv_rms_f32)
+LFM_PRIVATE(LFM_SYM(lfm_inv_rms_f32))
 LFM_SYM(lfm_inv_rms_f32):
 #ifdef _WIN32
     pxor      %xmm3, %xmm3
@@ -44,6 +48,7 @@ LFM_SYM(lfm_inv_rms_f32):
 
 .p2align 4
 .globl LFM_SYM(lfm_sum_f32)
+LFM_PRIVATE(LFM_SYM(lfm_sum_f32))
 LFM_SYM(lfm_sum_f32):
 #ifdef _WIN32
     movq      %rcx, %r10
@@ -65,6 +70,7 @@ LFM_SYM(lfm_sum_f32):
 
 .p2align 4
 .globl LFM_SYM(lfm_bf16_sumsq_stride_f32)
+LFM_PRIVATE(LFM_SYM(lfm_bf16_sumsq_stride_f32))
 LFM_SYM(lfm_bf16_sumsq_stride_f32):
 #ifdef _WIN32
     movq      %rcx, %r10
@@ -93,6 +99,7 @@ LFM_SYM(lfm_bf16_sumsq_stride_f32):
 
 .p2align 4
 .globl LFM_SYM(lfm_bf16_bias_add_f32)
+LFM_PRIVATE(LFM_SYM(lfm_bf16_bias_add_f32))
 LFM_SYM(lfm_bf16_bias_add_f32):
 #ifdef _WIN32
     movq      %rcx, %r10
@@ -120,6 +127,7 @@ LFM_SYM(lfm_bf16_bias_add_f32):
 
 .p2align 4
 .globl LFM_SYM(lfm_bf16_copy_bytes)
+LFM_PRIVATE(LFM_SYM(lfm_bf16_copy_bytes))
 LFM_SYM(lfm_bf16_copy_bytes):
 #ifdef _WIN32
     movq      %rcx, %r10
@@ -144,6 +152,7 @@ LFM_SYM(lfm_bf16_copy_bytes):
 
 .p2align 4
 .globl LFM_SYM(lfm_bf16_unlift_bits)
+LFM_PRIVATE(LFM_SYM(lfm_bf16_unlift_bits))
 LFM_SYM(lfm_bf16_unlift_bits):
 #ifdef _WIN32
     movzwl    (%rcx), %eax
@@ -173,6 +182,7 @@ LFM_SYM(lfm_bf16_unlift_bits):
 
 .p2align 4
 .globl LFM_SYM(lfm_bf16_rope_neox)
+LFM_PRIVATE(LFM_SYM(lfm_bf16_rope_neox))
 LFM_SYM(lfm_bf16_rope_neox):
 #ifdef _WIN32
     movq      %rcx, %r10

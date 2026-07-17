@@ -5,6 +5,11 @@ Status: normative design.
 Baselines: EmberHarmony `321538f11749`; local source reference
 `/Volumes/stuff/ukm/ember-ml` as inspected with this design.
 
+**Normative terminology:** a "tensor" in this document is only a borrowed
+typed view: byte base/span, dtype, shape, and derived strides. It owns no
+payload and cannot allocate, convert, align, transpose, repack, or relocate
+model bytes. The only weight-byte owner is the sealed resident image.
+
 ## Goal
 
 Make native code the sole owner of model files, parsed metadata, immutable weight
@@ -242,20 +247,16 @@ not call Rust to decide a sampled control token or decode a Moshi token fragment
 
 ## Mimi and Detokenizer Ownership
 
-`mimi_decoder_new_from_file` currently reopens its own image at
-`crates/liquid-audio/native/src/mimi/mimi_decode.cpp:776-904`. Add a constructor
-that accepts an `LfmModelImage` component and retained views:
+Production constructs `MimiDecodePlan` from the codec component of the same
+combined `LfmWeightImage` owned by `LfmModel`; each conversation owns only its
+mutable `MimiDecodeState`. Codec weights remain non-owning byte views, and PCM
+is written directly into the retained playback reservation.
 
-```c
-int mimi_decoder_create_from_component(const LfmModelImage *,
-                                       uint32_t component,
-                                       uint32_t codebooks,
-                                       MimiDecoder **out);
-```
-
-The decoder does not own a duplicate checkpoint image. The model owns the image;
-the codec plan retains the model. Keep the from-file constructor only in isolated
-native parity tests until those tests migrate.
+The legacy `mimi_decoder_new_from_file` route remains solely for offline
+Candle/Moshi parity. It is compiled only with `LFM_BUILD_ORACLE`, is absent from
+the shared native header, and is not present in the production native archive.
+It may own a standalone image because the oracle intentionally compares two
+independent implementations; no shipped session can reach it.
 
 The LFM2 custom detokenizer at `crates/liquid-audio/src/detokenizer.rs:219-310`
 is not on the shipped realtime path, which requires Mimi. Prove no Tauri command

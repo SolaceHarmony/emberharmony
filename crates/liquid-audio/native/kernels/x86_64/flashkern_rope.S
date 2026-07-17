@@ -1,3 +1,5 @@
+#include "lfm_asm_visibility.h"
+
 #ifdef __APPLE__
 #define LFM_SYM(name) _##name
 #define LFM_CALL(name) _##name
@@ -9,6 +11,7 @@
 .text
 .p2align 4
 .globl LFM_SYM(lfm_rope_table_f32)
+LFM_PRIVATE(LFM_SYM(lfm_rope_table_f32))
 LFM_SYM(lfm_rope_table_f32):
 #ifdef _WIN32
     movq    %rcx, %r10
@@ -113,6 +116,7 @@ LFM_SYM(lfm_rope_table_f32):
 
 .p2align 4
 .globl LFM_SYM(lfm_rope_range_f32)
+LFM_PRIVATE(LFM_SYM(lfm_rope_range_f32))
 LFM_SYM(lfm_rope_range_f32):
 #ifdef _WIN32
     movq    40(%rsp), %r10

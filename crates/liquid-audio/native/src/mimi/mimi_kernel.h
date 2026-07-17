@@ -15,10 +15,12 @@
 //   - f32 math, f32 accumulation, documented loop order. MATH IS ASSEMBLY AT
 //     EVERY STEP (her rule): no tensor-op thinking, no scalar C++ loops as a
 //     primary path — every sweep/reduction/activation is aarch64 NEON
-//     intrinsics (float32x4_t: fmla/vmax/vsub, vectorized loads/stores), and
-//     GEMM/GEMV ride AMX via Accelerate. Scalar code exists in exactly two
-//     places: the `..._ref` parity siblings under MIMI_SCALAR_REF, and
-//     sub-vector tail remainders. Transcendentals (erff/expf): lane-wise libm
+//     intrinsics (float32x4_t: fmla/vmax/vsub, vectorized loads/stores). Matrix
+//     operations over mutable f32 activations may ride AMX via Accelerate;
+//     resident weights stay byte-addressed and use NEON/SSE register loads.
+//     Scalar code exists in exactly two places: the `..._ref` parity siblings
+//     under MIMI_SCALAR_REF, and sub-vector tail remainders. Transcendentals
+//     (erff/expf): lane-wise libm
 //     calls INSIDE the NEON sweep on the first pass (faithful tier — a
 //     polynomial vector exp/erf changes numerics; it enters later, behind the
 //     parity gate, as a fast-tier variant).
@@ -47,6 +49,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "lfm_visibility.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -69,6 +73,10 @@ typedef struct MimiWeight {
 typedef struct MimiWeightTable {
     const MimiWeight *entries;
     uint32_t count;
+    /* Optional plan-construction bitmap. Lookup marks the exact checkpoint
+     * entries consumed by the schema so residency accounting excludes unused
+     * tensors without adding pass-time name lookup. */
+    uint8_t *bound;
 } MimiWeightTable;
 
 /* init-time helper (mimi_decode.cpp owns the impl): NULL if absent.
@@ -112,16 +120,16 @@ void *mimi_arena_alloc(MimiArena *a, size_t bytes); /* aborts on overflow: sizin
 void *mimi_arena_alloc_derived(MimiArena *a, size_t bytes);
 int mimi_arena_building_derived(const MimiArena *a);
 
-/* Safe checkpoint load. This never forms a typed pointer for unaligned
- * storage. Direct matrix calls specialize once on alignment and otherwise use
- * the byte-load path without staging or repacking weights. */
+/* Safe checkpoint load. Resident storage is always byte-addressed regardless
+ * of alignment; architecture paths reinterpret loaded register bits, and the
+ * scalar tail assembles little-endian u32. */
 float mimi_weight_load_f32(const uint8_t *bytes, uint64_t index);
 
 /* ---- shared math primitives (mimi_decode.cpp owns impls; units call) -----
- * GEMM/GEMV are AMX-backed on Apple: implement over Accelerate cblas_sgemm /
- * cblas_sgemv (-framework Accelerate) — never a hand-rolled vanilla GEMM; the
- * machine has a matrix coprocessor and prefill already runs on it (E4).
- * Scalar _ref siblings under MIMI_SCALAR_REF remain the parity-bisect path.
+ * Activation-only GEMM/GEMV may use Accelerate. The `mimi_weight_*` variants
+ * stream little-endian checkpoint bytes through architecture registers without
+ * a float pointer, alignment copy, staging plane, transpose, or repack.
+ * Scalar _ref/tail code remains the parity-bisect path.
  *   y[m] = sum_k w[m*k_stride + k] * x[k] (+ b[m])  — row-major W [M,K] */
 void mimi_gemv_f32(const float *w, const float *x, const float *bias_or_null,
                    float *y, int m, int k);
@@ -211,33 +219,41 @@ typedef struct MimiDecoder MimiDecoder;
 typedef struct MimiDecodePlan MimiDecodePlan;
 typedef struct MimiDecodeState MimiDecodeState;
 typedef struct LfmWeightImage LfmWeightImage;
-int mimi_decode_plan_new_from_image(MimiDecodePlan **plan,
-                                    const LfmWeightImage *image,
-                                    char *err, size_t errlen);
-void mimi_decode_plan_free(MimiDecodePlan *plan);
-uint64_t mimi_decode_plan_derived_bytes(const MimiDecodePlan *plan);
-uint64_t mimi_decode_plan_compatibility_copied_bytes(const MimiDecodePlan *plan);
-int mimi_decode_state_new(MimiDecodeState **state, const MimiDecodePlan *plan,
-                          char *err, size_t errlen);
-void mimi_decode_state_free(MimiDecodeState *state);
-int mimi_decode_state_step(MimiDecodeState *state, const uint32_t *codes,
-                           float *pcm_out);
-void mimi_decode_state_reset(MimiDecodeState *state);
-uint64_t mimi_decode_state_bytes(const MimiDecodeState *state);
-int  mimi_decoder_new(MimiDecoder **d, const MimiWeightTable *w,
-                      char *err, size_t errlen);
-/* Transitional single-state wrappers used by parity tests. */
-int  mimi_decoder_new_from_image(MimiDecoder **d, const LfmWeightImage *image,
-                                 char *err, size_t errlen);
-int  mimi_decoder_new_from_file(MimiDecoder **d, const char *checkpoint,
-                                char *err, size_t errlen);
+LFM_ORACLE_API int mimi_decode_plan_new_from_image(
+    MimiDecodePlan **plan, const LfmWeightImage *image, char *err,
+    size_t errlen);
+LFM_ORACLE_API void mimi_decode_plan_free(MimiDecodePlan *plan);
+LFM_ORACLE_API uint64_t
+mimi_decode_plan_derived_bytes(const MimiDecodePlan *plan);
+LFM_ORACLE_API uint64_t
+mimi_decode_plan_bound_weight_bytes(const MimiDecodePlan *plan);
+LFM_ORACLE_API uint64_t
+mimi_decode_plan_compatibility_copied_bytes(const MimiDecodePlan *plan);
+LFM_ORACLE_API int mimi_decode_state_new(MimiDecodeState **state,
+                                         const MimiDecodePlan *plan,
+                                         char *err, size_t errlen);
+LFM_ORACLE_API void mimi_decode_state_free(MimiDecodeState *state);
+LFM_ORACLE_API int mimi_decode_state_step(MimiDecodeState *state,
+                                          const uint32_t *codes,
+                                          float *pcm_out);
+LFM_ORACLE_API void mimi_decode_state_reset(MimiDecodeState *state);
+LFM_ORACLE_API uint64_t mimi_decode_state_bytes(const MimiDecodeState *state);
+#ifdef LFM_BUILD_ORACLE
+/* Offline parity-only wrapper. It may own a standalone checkpoint image and is
+ * intentionally absent from the production archive and shared native header. */
+LFM_ORACLE_API int mimi_decoder_new_from_file(MimiDecoder **d,
+                                              const char *checkpoint,
+                                              char *err, size_t errlen);
 /* one latent frame of codes [MIMI_NQ] -> n_out samples (0 while priming);
  * pcm_out capacity MIMI_FRAME_OUT * 2 (drain headroom). */
-int  mimi_decoder_step(MimiDecoder *d, const uint32_t *codes, float *pcm_out);
-void mimi_decoder_reset(MimiDecoder *d);
-void mimi_decoder_free(MimiDecoder *d);
-uint64_t mimi_decoder_derived_bytes(const MimiDecoder *d);
-uint64_t mimi_decoder_compatibility_copied_bytes(const MimiDecoder *d);
+LFM_ORACLE_API int mimi_decoder_step(MimiDecoder *d, const uint32_t *codes,
+                                     float *pcm_out);
+LFM_ORACLE_API void mimi_decoder_reset(MimiDecoder *d);
+LFM_ORACLE_API void mimi_decoder_free(MimiDecoder *d);
+LFM_ORACLE_API uint64_t mimi_decoder_derived_bytes(const MimiDecoder *d);
+LFM_ORACLE_API uint64_t
+mimi_decoder_compatibility_copied_bytes(const MimiDecoder *d);
+#endif
 
 #ifdef __cplusplus
 } /* extern "C" */

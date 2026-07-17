@@ -22,6 +22,7 @@
 #include "lfm_conformer.h"
 
 #include "flashkern_gemm.h"
+#include "lfm_audio_pass.h"
 #include "lfm_safetensors.h"
 
 #include <atomic>
@@ -124,6 +125,8 @@ inline uint16_t bf16_round_one(float f) {
     return (uint16_t)(bits >> 16);
 }
 
+/* Distilled immutable checkpoint view. The byte pointer borrows the model's
+ * sealed resident image; this record cannot allocate, convert, or repack it. */
 struct View {
     const unsigned char *bytes = nullptr;
     uint64_t rows = 0, cols = 0, elements = 0;
@@ -156,6 +159,14 @@ struct LfmConformer {
     std::vector<float> pe_div;
     uint64_t bound_weight_bytes = 0;
     uint64_t derived_bytes = 0;
+    // Weight bytes MATERIALIZED rather than bound as a view — F32 staging, a
+    // transpose/repack, an alignment copy, or any re-laid weight buffer. The
+    // doctrine requires this to stay 0 in production, and the model-level
+    // `compatibility_copied_bytes` acceptance gate reads it. It is a real tally,
+    // not a constant: ANY code that materializes a weight MUST add its bytes
+    // here, exactly as binding adds to `bound_weight_bytes` — otherwise the gate
+    // silently stops being able to fail.
+    uint64_t materialized_weight_bytes = 0;
     mutable std::atomic<uint64_t> direct_gemm_calls{0};
 };
 
@@ -270,14 +281,22 @@ int bind(const LfmWeightImage *img, const std::string &name, View &v,
 int bf16_linear(const LfmConformer *conformer, LfmConformerWorkspace *ws,
                 const uint16_t *x,
                 uint64_t rows, uint64_t k, const View &w, const View *bias,
-                uint16_t *out) {
+                uint16_t *out, bool engine_team) {
     const uint64_t n = w.rows;
     float *scratch = ws->f(rows * n);
     // Weight is checkpoint-native (N,K). The direct ticket never selects the
     // Apple F32 staging path and its baseline fallback also streams raw bf16.
-    if (lfm_engine_bf16_gemm_nt_direct_f32(
-            conformer->engine, x, rows * k, w.bytes, w.elements, scratch,
-            rows * n, rows, n, k) != 0)
+    // Inside the composite audio ticket the same request is release-published
+    // to peer lanes already resident in that ticket; recursively entering the
+    // one-slot SQ would deadlock and is therefore structurally impossible here.
+    const int status = engine_team
+        ? lfm_engine_conformer_gemm_team(
+              conformer->engine, x, rows * k, w.bytes, w.elements, scratch,
+              rows * n, rows, n, k)
+        : lfm_engine_bf16_gemm_nt_direct_f32(
+              conformer->engine, x, rows * k, w.bytes, w.elements, scratch,
+              rows * n, rows, n, k);
+    if (status != 0)
         return -EIO;
     conformer->direct_gemm_calls.fetch_add(1, std::memory_order_relaxed);
     if (bias && bias->bytes) lfm_bias_rows_f32(scratch, bias->bytes, rows, n);
@@ -467,8 +486,7 @@ extern "C" uint64_t lfm_conformer_derived_bytes(const LfmConformer *c) {
 }
 
 extern "C" uint64_t lfm_conformer_materialized_weight_bytes(const LfmConformer *c) {
-    (void)c;
-    return 0;
+    return c ? c->materialized_weight_bytes : 0;
 }
 
 extern "C" uint64_t lfm_conformer_direct_gemm_calls(const LfmConformer *c) {
@@ -506,11 +524,14 @@ extern "C" uint64_t lfm_conformer_out_rows(const LfmConformer *c, uint64_t t) {
     return (c && t) ? conv_len(conv_len(conv_len(t))) : 0;
 }
 
-extern "C" int lfm_conformer_forward(const LfmConformer *c,
-                                     LfmConformerWorkspace *ws,
-                                     const uint16_t *mel, uint64_t mel_frames,
-                                     uint16_t *out_rows_dst,
-                                     uint64_t out_capacity_values) {
+extern "C" uint64_t lfm_conformer_out_width(const LfmConformer *c) {
+    return c ? c->g.adapter_out : 0;
+}
+
+int conformer_forward(const LfmConformer *c, LfmConformerWorkspace *ws,
+                      const uint16_t *mel, uint64_t mel_frames,
+                      uint16_t *out_rows_dst, uint64_t out_capacity_values,
+                      bool engine_team) {
     if (!c || !ws || !mel || !out_rows_dst || mel_frames == 0) return -EINVAL;
     const LfmConformerGeometry &g = c->g;
     const uint64_t D = g.d_model, FF = g.d_ff, CC = g.conv_channels;
@@ -581,7 +602,7 @@ extern "C" int lfm_conformer_forward(const LfmConformer *c,
         uint16_t *out_rows = ws->b(positions * CC);
         channels_to_rows(dwb, CC, positions, in_rows);
         int stage_rc = bf16_linear(c, ws, in_rows, positions, CC, *s.pw_w,
-                                   s.pw_b, out_rows);
+                                   s.pw_b, out_rows, engine_team);
         if (stage_rc != 0) return stage_rc;
         lfm_relu_bf16(out_rows, positions * CC);
         rows_to_channels(out_rows, positions, CC, s.out);
@@ -600,7 +621,7 @@ extern "C" int lfm_conformer_forward(const LfmConformer *c,
     // pre_encode.out: bf16 linear (Tp x FLAT) x (D, FLAT) -> x (Tp x D).
     uint16_t *x = ws->b(Tp * D);
     int rc = bf16_linear(c, ws, flat_rows, Tp, FLAT, c->sub_out_w,
-                         &c->sub_out_b, x);
+                         &c->sub_out_b, x, engine_team);
     if (rc != 0) return rc;
 
     // rel-pos table (P x D) bf16 — sin/cos leaf; xscaling=false leaves x as-is.
@@ -622,10 +643,12 @@ extern "C" int lfm_conformer_forward(const LfmConformer *c,
         if (lfm_ln_bf16(x, L.norm_ff1_w.bytes, L.norm_ff1_b.bytes, tmp, Tp, D,
                         1e-5f) != 0)
             return -EIO;
-        rc = bf16_linear(c, ws, tmp, Tp, D, L.ff1_l1_w, &L.ff1_l1_b, h);
+        rc = bf16_linear(c, ws, tmp, Tp, D, L.ff1_l1_w, &L.ff1_l1_b, h,
+                         engine_team);
         if (rc != 0) return rc;
         if (lfm_silu_bf16(h, Tp * FF) != 0) return -EIO;
-        rc = bf16_linear(c, ws, h, Tp, FF, L.ff1_l2_w, &L.ff1_l2_b, tmp);
+        rc = bf16_linear(c, ws, h, Tp, FF, L.ff1_l2_w, &L.ff1_l2_b, tmp,
+                         engine_team);
         if (rc != 0) return rc;
         lfm_residual_half_bf16(x, tmp, Tp * D);
 
@@ -635,10 +658,17 @@ extern "C" int lfm_conformer_forward(const LfmConformer *c,
                         1e-5f) != 0)
             return -EIO;
         uint16_t *q = qkv, *k = qkv + Tp * D, *v = qkv + 2 * Tp * D;
-        rc = bf16_linear(c, ws, tmp, Tp, D, L.q_w, &L.q_b, q);
-        if (rc == 0) rc = bf16_linear(c, ws, tmp, Tp, D, L.k_w, &L.k_b, k);
-        if (rc == 0) rc = bf16_linear(c, ws, tmp, Tp, D, L.v_w, &L.v_b, v);
-        if (rc == 0) rc = bf16_linear(c, ws, pe, P, D, L.pos_w, nullptr, pproj);
+        rc = bf16_linear(c, ws, tmp, Tp, D, L.q_w, &L.q_b, q,
+                         engine_team);
+        if (rc == 0)
+            rc = bf16_linear(c, ws, tmp, Tp, D, L.k_w, &L.k_b, k,
+                             engine_team);
+        if (rc == 0)
+            rc = bf16_linear(c, ws, tmp, Tp, D, L.v_w, &L.v_b, v,
+                             engine_team);
+        if (rc == 0)
+            rc = bf16_linear(c, ws, pe, P, D, L.pos_w, nullptr, pproj,
+                             engine_team);
         if (rc != 0) return rc;
         // q+u / q+v in bf16 (broadcast add per (h, dk)).
         uint16_t *qu = ws->b(Tp * D), *qv = ws->b(Tp * D);
@@ -701,7 +731,8 @@ extern "C" int lfm_conformer_forward(const LfmConformer *c,
             ws->fo -= Tp * DK;
         }
         lfm_f32_to_bf16(att, tmp, (int)(Tp * D));
-        rc = bf16_linear(c, ws, tmp, Tp, D, L.out_w, &L.out_b, h);
+        rc = bf16_linear(c, ws, tmp, Tp, D, L.out_w, &L.out_b, h,
+                         engine_team);
         if (rc != 0) return rc;
         lfm_add_bf16(x, h, Tp * D);
 
@@ -712,7 +743,8 @@ extern "C" int lfm_conformer_forward(const LfmConformer *c,
                         1e-5f) != 0)
             return -EIO;
         uint16_t *y1b = ws->b(Tp * 2 * D);
-        rc = bf16_linear(c, ws, tmp, Tp, D, L.pw1_w, &L.pw1_b, y1b);
+        rc = bf16_linear(c, ws, tmp, Tp, D, L.pw1_w, &L.pw1_b, y1b,
+                         engine_team);
         if (rc != 0) return rc;
         uint16_t *glu_rows = ws->b(Tp * D);
         for (uint64_t t = 0; t < Tp; ++t)
@@ -737,7 +769,8 @@ extern "C" int lfm_conformer_forward(const LfmConformer *c,
         if (lfm_silu_bf16(bnb, D * Tp) != 0) return -EIO;
         uint16_t *pw2_in = ws->b(Tp * D);
         channels_to_rows(bnb, D, Tp, pw2_in);
-        rc = bf16_linear(c, ws, pw2_in, Tp, D, L.pw2_w, &L.pw2_b, tmp);
+        rc = bf16_linear(c, ws, pw2_in, Tp, D, L.pw2_w, &L.pw2_b, tmp,
+                         engine_team);
         if (rc != 0) return rc;
         lfm_add_bf16(x, tmp, Tp * D);
 
@@ -745,10 +778,12 @@ extern "C" int lfm_conformer_forward(const LfmConformer *c,
         if (lfm_ln_bf16(x, L.norm_ff2_w.bytes, L.norm_ff2_b.bytes, tmp, Tp, D,
                         1e-5f) != 0)
             return -EIO;
-        rc = bf16_linear(c, ws, tmp, Tp, D, L.ff2_l1_w, &L.ff2_l1_b, h);
+        rc = bf16_linear(c, ws, tmp, Tp, D, L.ff2_l1_w, &L.ff2_l1_b, h,
+                         engine_team);
         if (rc != 0) return rc;
         if (lfm_silu_bf16(h, Tp * FF) != 0) return -EIO;
-        rc = bf16_linear(c, ws, h, Tp, FF, L.ff2_l2_w, &L.ff2_l2_b, tmp);
+        rc = bf16_linear(c, ws, h, Tp, FF, L.ff2_l2_w, &L.ff2_l2_b, tmp,
+                         engine_team);
         if (rc != 0) return rc;
         lfm_residual_half_bf16(x, tmp, Tp * D);
         if (lfm_ln_bf16(x, L.norm_out_w.bytes, L.norm_out_b.bytes, tmp, Tp, D,
@@ -767,15 +802,34 @@ extern "C" int lfm_conformer_forward(const LfmConformer *c,
     if (lfm_ln_bf16(x, c->ad_ln_w.bytes, c->ad_ln_b.bytes, tmp, Tp, D, 1e-5f) != 0)
         return -EIO;
     uint16_t *ah = ws->b(Tp * g.adapter_hidden);
-    rc = bf16_linear(c, ws, tmp, Tp, D, c->ad_l1_w, &c->ad_l1_b, ah);
+    rc = bf16_linear(c, ws, tmp, Tp, D, c->ad_l1_w, &c->ad_l1_b, ah,
+                     engine_team);
     if (rc != 0) return rc;
     if (lfm_gelu_erf_bf16(ah, Tp * g.adapter_hidden) != 0) return -EIO;
-    rc = bf16_linear(c, ws, ah, Tp, g.adapter_hidden, c->ad_l2_w, &c->ad_l2_b,
-                     out_rows_dst);
+    rc = bf16_linear(c, ws, ah, Tp, g.adapter_hidden, c->ad_l2_w,
+                     &c->ad_l2_b, out_rows_dst, engine_team);
     if (rc != 0) return rc;
     // A workspace overflow means the reserved bound was too small — a sizing
     // bug (never silent corruption). It would have handed out an aliased
     // pointer, so the result is untrustworthy: fail loud.
     if (ws->overflow) return -ENOMEM;
     return 0;
+}
+
+extern "C" int lfm_conformer_forward(const LfmConformer *c,
+                                      LfmConformerWorkspace *ws,
+                                      const uint16_t *mel,
+                                      uint64_t mel_frames,
+                                      uint16_t *out_rows_dst,
+                                      uint64_t out_capacity_values) {
+    return conformer_forward(c, ws, mel, mel_frames, out_rows_dst,
+                             out_capacity_values, false);
+}
+
+extern "C" int lfm_conformer_forward_engine_team(
+    const LfmConformer *c, LfmConformerWorkspace *ws, const uint16_t *mel,
+    uint64_t mel_frames, uint16_t *out_rows_dst,
+    uint64_t out_capacity_values) {
+    return conformer_forward(c, ws, mel, mel_frames, out_rows_dst,
+                             out_capacity_values, true);
 }

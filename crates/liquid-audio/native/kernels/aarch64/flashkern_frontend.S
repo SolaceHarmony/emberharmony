@@ -1,3 +1,5 @@
+#include "lfm_asm_visibility.h"
+
 // Audio-frontend leaves (mel featurizer + resampler hot loops). Scalar on
 // purpose: these run once per utterance, not per token, and the parity oracle
 // (native/tests/fixtures/mel) was captured from strictly-ordered scalar-
@@ -19,6 +21,7 @@
 // int lfm_preemph_f32(const float *x, float *y, uint64_t n, float coef /*s0*/)
 // y[0] = x[0]; y[i] = x[i] - coef*x[i-1].
 .globl LFM_SYM(lfm_preemph_f32)
+LFM_PRIVATE(LFM_SYM(lfm_preemph_f32))
 LFM_SYM(lfm_preemph_f32):
     cbz     x0, 9f
     cbz     x1, 9f
@@ -47,6 +50,7 @@ LFM_SYM(lfm_preemph_f32):
 // out[i] = re[i]*re[i] + im[i]*im[i].
 .p2align 2
 .globl LFM_SYM(lfm_power_spec_f32)
+LFM_PRIVATE(LFM_SYM(lfm_power_spec_f32))
 LFM_SYM(lfm_power_spec_f32):
     cbz     x3, 8f
 1:
@@ -65,6 +69,7 @@ LFM_SYM(lfm_power_spec_f32):
 // x[i] = logf(x[i] + guard), in place. Calls libm logf (rope-leaf pattern).
 .p2align 2
 .globl LFM_SYM(lfm_log_add_f32)
+LFM_PRIVATE(LFM_SYM(lfm_log_add_f32))
 LFM_SYM(lfm_log_add_f32):
 #ifdef _WIN32
     .seh_proc LFM_SYM(lfm_log_add_f32)
@@ -133,6 +138,7 @@ LFM_SYM(lfm_log_add_f32):
 // reduction order.
 .p2align 2
 .globl LFM_SYM(lfm_rowstat_f32)
+LFM_PRIVATE(LFM_SYM(lfm_rowstat_f32))
 LFM_SYM(lfm_rowstat_f32):
     cbz     x0, 9f
     cbz     x1, 9f
@@ -189,6 +195,7 @@ LFM_SYM(lfm_rowstat_f32):
 // x[r][c] = (x[r][c] - mean[r]) / std[r], over ALL columns (broadcast).
 .p2align 2
 .globl LFM_SYM(lfm_norm_apply_f32)
+LFM_PRIVATE(LFM_SYM(lfm_norm_apply_f32))
 LFM_SYM(lfm_norm_apply_f32):
     mov     x5, #0
 1:
@@ -222,6 +229,7 @@ LFM_SYM(lfm_norm_apply_f32):
 // caller's exact-size output instead of a copied convolution staging plane.
 .p2align 2
 .globl LFM_SYM(lfm_resample_conv_f64)
+LFM_PRIVATE(LFM_SYM(lfm_resample_conv_f64))
 LFM_SYM(lfm_resample_conv_f64):
     mov     x9, #0              // start
     mov     x10, #0             // block

@@ -634,6 +634,7 @@ fn joining_a_never_started_session_closes_every_admission_path() {
         0
     );
     assert_eq!(unsafe { lfm_session_join(session) }, 0);
+    assert_eq!(unsafe { lfm_session_start(session) }, CANCELLED);
 
     let mut lease = Lease::default();
     assert_eq!(
@@ -655,6 +656,86 @@ fn joining_a_never_started_session_closes_every_admission_path() {
     unsafe { lfm_runtime_request_stop(runtime) };
     assert_eq!(unsafe { lfm_runtime_join(runtime) }, 0);
     assert_eq!(unsafe { lfm_runtime_destroy(runtime) }, 0);
+}
+
+#[test]
+fn stopping_a_created_session_permanently_prevents_start() {
+    let runtime = runtime();
+    let config = dock_config();
+    let mut session = std::ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            lfm_session_create(
+                runtime,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &config,
+                std::ptr::null(),
+                &mut session,
+            )
+        },
+        0
+    );
+    unsafe { lfm_session_request_stop(session) };
+    assert_eq!(unsafe { lfm_session_start(session) }, CANCELLED);
+    assert_eq!(unsafe { lfm_session_join(session) }, 0);
+    assert_eq!(unsafe { lfm_session_destroy(session) }, 0);
+    unsafe { lfm_runtime_request_stop(runtime) };
+    assert_eq!(unsafe { lfm_runtime_join(runtime) }, 0);
+    assert_eq!(unsafe { lfm_runtime_destroy(runtime) }, 0);
+}
+
+#[test]
+fn concurrent_session_start_and_join_have_one_linearization_order() {
+    for _ in 0..64 {
+        let runtime = runtime();
+        let config = dock_config();
+        let mut session = std::ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                lfm_session_create(
+                    runtime,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &config,
+                    std::ptr::null(),
+                    &mut session,
+                )
+            },
+            0
+        );
+
+        let edge = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let start_edge = edge.clone();
+        let start_address = session as usize;
+        let starter = std::thread::spawn(move || {
+            start_edge.wait();
+            unsafe { lfm_session_start(start_address as *mut Session) }
+        });
+        let join_edge = edge.clone();
+        let join_address = session as usize;
+        let joiner = std::thread::spawn(move || {
+            join_edge.wait();
+            unsafe { lfm_session_join(join_address as *mut Session) }
+        });
+        edge.wait();
+        let started = starter.join().unwrap();
+        let joined = joiner.join().unwrap();
+
+        if started == 0 {
+            assert_eq!(joined, BUSY);
+            unsafe { lfm_session_request_stop(session) };
+            assert_eq!(unsafe { lfm_session_join(session) }, 0);
+        } else {
+            assert_eq!(started, CANCELLED);
+            assert_eq!(joined, 0);
+            assert_eq!(unsafe { lfm_session_join(session) }, 0);
+        }
+        assert_eq!(unsafe { lfm_session_destroy(session) }, 0);
+        unsafe { lfm_runtime_request_stop(runtime) };
+        assert_eq!(unsafe { lfm_runtime_join(runtime) }, 0);
+        assert_eq!(unsafe { lfm_runtime_destroy(runtime) }, 0);
+    }
 }
 
 #[test]
@@ -737,6 +818,54 @@ fn session_geometry_rejects_lease_byte_length_overflow_before_allocating() {
     unsafe { lfm_runtime_request_stop(runtime) };
     assert_eq!(unsafe { lfm_runtime_join(runtime) }, 0);
     assert_eq!(unsafe { lfm_runtime_destroy(runtime) }, 0);
+}
+
+#[test]
+fn runtime_stop_and_session_start_have_one_linearization_order() {
+    for _ in 0..32 {
+        let runtime = runtime();
+        let config = dock_config();
+        let mut session = std::ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                lfm_session_create(
+                    runtime,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &config,
+                    std::ptr::null(),
+                    &mut session,
+                )
+            },
+            0
+        );
+
+        let edge = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let start_edge = edge.clone();
+        let start_session = session as usize;
+        let starter = std::thread::spawn(move || {
+            start_edge.wait();
+            unsafe { lfm_session_start(start_session as *mut Session) }
+        });
+        let stop_edge = edge.clone();
+        let stop_runtime = runtime as usize;
+        let stopper = std::thread::spawn(move || {
+            stop_edge.wait();
+            unsafe { lfm_runtime_request_stop(stop_runtime as *mut Runtime) };
+        });
+        edge.wait();
+        let started = starter.join().unwrap();
+        stopper.join().unwrap();
+        assert!(
+            started == 0 || started == BUSY,
+            "unexpected start status {started}"
+        );
+
+        assert_eq!(unsafe { lfm_session_join(session) }, 0);
+        assert_eq!(unsafe { lfm_session_destroy(session) }, 0);
+        assert_eq!(unsafe { lfm_runtime_join(runtime) }, 0);
+        assert_eq!(unsafe { lfm_runtime_destroy(runtime) }, 0);
+    }
 }
 
 #[test]
@@ -1040,6 +1169,59 @@ fn interrupt_stales_an_admitted_mixed_command_without_stale_output() {
     assert_eq!(snapshot.capture_stale, 1);
     assert_eq!(snapshot.text_commands_stale, 1);
     assert_eq!(snapshot.live_capture_leases, 0);
+    unsafe { stop_all(runtime, session, 0) };
+}
+
+#[test]
+fn interrupt_epoch_is_applied_before_a_fresh_command_in_the_same_drain() {
+    let sink = GateSink {
+        events: Mutex::new(Vec::new()),
+        edge: Condvar::new(),
+        blocked: Mutex::new(true),
+        release: Condvar::new(),
+    };
+    let runtime = runtime_with(2);
+    let session = gated_session(runtime, &sink);
+    let _fillers = saturate_reliable_ring(session);
+
+    let mut epoch = 0;
+    assert_eq!(unsafe { lfm_session_interrupt(session, &mut epoch) }, 0);
+    assert_eq!(epoch, 2);
+    let text = b"fresh epoch command";
+    let mut ticket = Ticket::default();
+    assert_eq!(
+        unsafe { lfm_session_submit_text(session, text.as_ptr().cast(), text.len(), &mut ticket,) },
+        0
+    );
+
+    *sink.blocked.lock().unwrap() = false;
+    sink.release.notify_all();
+    let interrupted = wait_gate_event(&sink, |event| {
+        event.kind == EVENT_STATE && event.epoch == epoch && event.payload == b"interrupted"
+    });
+    let terminal = wait_gate_event(&sink, |event| {
+        event.kind == EVENT_TURN && event.ticket == ticket
+    });
+    assert_eq!(interrupted.epoch, epoch);
+    assert_eq!(terminal.epoch, epoch);
+    assert_eq!(terminal.status, 0);
+
+    let events = sink.events.lock().unwrap();
+    let interrupted_index = events
+        .iter()
+        .position(|event| {
+            event.kind == EVENT_STATE && event.epoch == epoch && event.payload == b"interrupted"
+        })
+        .unwrap();
+    let terminal_index = events
+        .iter()
+        .position(|event| event.kind == EVENT_TURN && event.ticket == ticket)
+        .unwrap();
+    assert!(
+        interrupted_index < terminal_index,
+        "fresh command reached the coordinator before its epoch was applied: {events:#?}"
+    );
+    drop(events);
     unsafe { stop_all(runtime, session, 0) };
 }
 
@@ -1648,6 +1830,7 @@ fn reliable_callback_failure_stops_and_joins_exactly_once() {
     assert_eq!(unsafe { lfm_session_start(session) }, 0);
     let stopped = wait_event(&sink, |event| event.kind == EVENT_STOPPED);
     assert_eq!(stopped.status, HOST_SINK);
+    assert_eq!(unsafe { lfm_session_join(session) }, HOST_SINK);
     assert_eq!(unsafe { lfm_session_join(session) }, HOST_SINK);
     assert_eq!(unsafe { lfm_session_destroy(session) }, 0);
     unsafe { lfm_runtime_request_stop(runtime) };

@@ -204,6 +204,11 @@ struct EngineSnapshot {
     attention_y_capacity: u32,
     attention_score_capacity: u32,
     pass_claimed: u32,
+    bridge_capacity: u32,
+    pass_slot_capacity: u32,
+    pass_slots_live: u32,
+    max_pass_slots_live: u32,
+    continuation_submissions: u64,
 }
 
 extern "C" {
@@ -492,6 +497,21 @@ extern "C" {
         out: *mut u64,
         count: usize,
     ) -> i32;
+    #[cfg(test)]
+    fn lfm_internal_engine_prng_continuation_for_test(
+        e: *mut c_void,
+        state: *mut PrngState,
+        out: *mut u64,
+        pass_count: usize,
+    ) -> i32;
+    #[cfg(test)]
+    fn lfm_internal_engine_pause_boundary_for_test(e: *mut c_void, kind: u32, action: u32) -> i32;
+    #[cfg(test)]
+    fn lfm_internal_engine_wait_pass_slots_for_test(e: *mut c_void, live: u32) -> i32;
+    #[cfg(test)]
+    fn lfm_internal_engine_arm_lane_pause_for_test(e: *mut c_void) -> i32;
+    #[cfg(test)]
+    fn lfm_internal_engine_wait_lane_pause_for_test(e: *mut c_void) -> i32;
 }
 
 pub(crate) fn depthwise_stream_available() -> bool {
@@ -507,20 +527,21 @@ pub fn bf16_gemm_available() -> bool {
 }
 
 /// Handle to the persistent native engine. One per process is the intended shape
-/// (decode is sequential). The C side is a SINGLE-SLOT machine — one Pass, one
-/// scratch arena, one request word — so the wrapper serializes the entire native
-/// call under `pass_lock`; that lock makes the `Sync` below true. The raw C ABI
-/// independently claims the slot before touching shared payload state.
+/// (the lane team executes one full pass at a time). The C side owns two queued
+/// request/scratch slots and mounts exactly one onto the executor board. This
+/// compatibility wrapper serializes its blocking calls under `pass_lock`; native
+/// completion continuations do not require Rust progress. The raw C ABI independently
+/// claims a slot before touching request state.
 pub struct NativeEngine {
     ptr: *mut c_void,
     pass_lock: Mutex<()>,
 }
 
 // SAFETY: Send — the handle is an opaque pointer to a C-heap object with no thread
-// affinity. Sync — provided by `pass_lock` above serializing every call into the
-// SINGLE-SLOT C engine (one Pass, one scratch arena, one request word). The C side's
-// atomic claim rejects unsafe concurrent callers before request setup, but it does not
-// make two safe Rust borrows of the same output buffer legal or define queue ordering.
+// affinity. Sync — provided by `pass_lock` above serializing every compatibility
+// call. The C side's atomic claim rejects unsafe concurrent compatibility callers
+// before request setup, but it does not make two safe Rust borrows of the same output
+// buffer legal or define queue ordering.
 unsafe impl Send for NativeEngine {}
 unsafe impl Sync for NativeEngine {}
 
@@ -575,8 +596,9 @@ impl NativeEngine {
         assert_eq!(w.w3.len(), i * h, "native fused_mlp: w3.len() != I·H");
         assert_eq!(w.w2.len(), h * i, "native fused_mlp: w2.len() != H·I");
         assert_eq!(out.len(), h, "native fused_mlp: out.len() != H");
-        // The lock that makes `Sync` true: the C engine is single-slot, so the whole
-        // native call — request setup through completion — is serialized here.
+        // The compatibility lock that makes `Sync` true: this wrapper serializes
+        // its borrowed Rust slices through exact completion even though native
+        // continuations use the second request/scratch slot independently.
         let _pass = self.pass_lock.lock().unwrap();
         // SAFETY: slice extents checked above; the call blocks until the pass
         // completes, so every pointer outlives its use.
@@ -3251,7 +3273,283 @@ mod tests {
         assert_eq!(snapshot.descriptor_retains, 1);
         assert_eq!(snapshot.descriptor_releases, 2);
         assert_eq!(snapshot.descriptors_live, 0);
+        assert_eq!(snapshot.bridge_capacity, 2);
+        assert_eq!(snapshot.pass_slot_capacity, 2);
+        assert_eq!(snapshot.pass_slots_live, 0);
+        assert_eq!(snapshot.max_pass_slots_live, 1);
         // SAFETY: the accepted bridge ticket completed and both leases are settled.
+        unsafe { lfm_engine_free(raw) };
+    }
+
+    #[test]
+    fn exact_cq_continuation_refills_the_second_slot_without_rust_progress() {
+        const PASSES: usize = 64;
+        let oracle = NativeEngine::new(2).expect("oracle engine init");
+        let mut oracle_state = PrngState::from_seed(0x5eed).expect("oracle seed");
+        let mut expected = [0u64; PASSES];
+        assert!(oracle.prng_fill(&mut oracle_state, &mut expected));
+
+        // SAFETY: the private test seam borrows these fixed buffers until its
+        // terminal expected-value doorbell. No Rust callback advances the chain.
+        let raw = unsafe { lfm_engine_new(2) };
+        assert!(!raw.is_null());
+        let mut state = PrngState::from_seed(0x5eed).expect("chain seed");
+        let mut actual = [0u64; PASSES];
+        assert_eq!(
+            unsafe {
+                lfm_internal_engine_prng_continuation_for_test(
+                    raw,
+                    &mut state,
+                    actual.as_mut_ptr(),
+                    actual.len(),
+                )
+            },
+            0
+        );
+        assert_eq!(actual, expected);
+        assert_eq!(state.cursor, oracle_state.cursor);
+        assert_eq!(state.core, oracle_state.core);
+        assert_eq!(state.block, oracle_state.block);
+
+        let mut snapshot = EngineSnapshot {
+            size: std::mem::size_of::<EngineSnapshot>() as u32,
+            abi_version: 1,
+            ..EngineSnapshot::default()
+        };
+        assert_eq!(unsafe { lfm_engine_snapshot(raw, &mut snapshot) }, 0);
+        assert_eq!(snapshot.bridge_capacity, 2);
+        assert_eq!(snapshot.pass_slot_capacity, 2);
+        assert_eq!(snapshot.pass_submissions, PASSES as u64);
+        assert_eq!(snapshot.pass_completions, PASSES as u64);
+        assert_eq!(snapshot.bridge_dispatches, PASSES as u64);
+        assert_eq!(snapshot.continuation_submissions, PASSES as u64);
+        assert_eq!(snapshot.max_pass_slots_live, 1);
+        assert_eq!(snapshot.pass_slots_live, 0);
+        assert_eq!(snapshot.pass_claimed, 0);
+        assert_eq!(snapshot.descriptors_live, 0);
+        unsafe { lfm_engine_free(raw) };
+    }
+
+    #[test]
+    fn exact_cq_handoff_keeps_its_slot_from_a_competing_compatibility_call() {
+        const PASSES: usize = 32;
+        const CALLBACK: u32 = 2;
+        const ARM: u32 = 1;
+        const WAIT: u32 = 2;
+        const RELEASE: u32 = 3;
+
+        let oracle = NativeEngine::new(2).expect("oracle engine init");
+        let mut chain_oracle = PrngState::from_seed(0xabc1).expect("chain oracle");
+        let mut chain_expected = [0u64; PASSES];
+        assert!(oracle.prng_fill(&mut chain_oracle, &mut chain_expected));
+        let mut peer_oracle = PrngState::from_seed(0xabc2).expect("peer oracle");
+        let mut peer_expected = 0;
+        assert!(oracle.prng_fill(&mut peer_oracle, std::slice::from_mut(&mut peer_expected)));
+
+        let raw = unsafe { lfm_engine_new(2) };
+        assert!(!raw.is_null());
+        assert_eq!(
+            unsafe { lfm_internal_engine_pause_boundary_for_test(raw, CALLBACK, ARM) },
+            0
+        );
+        let address = raw as usize;
+        let chain = std::thread::spawn(move || {
+            let mut state = PrngState::from_seed(0xabc1).expect("chain seed");
+            let mut out = [0u64; PASSES];
+            let rc = unsafe {
+                lfm_internal_engine_prng_continuation_for_test(
+                    address as *mut c_void,
+                    &mut state,
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            (rc, state, out)
+        });
+        let callback_wait =
+            unsafe { lfm_internal_engine_pause_boundary_for_test(raw, CALLBACK, WAIT) };
+
+        let peer_address = raw as usize;
+        let peer = std::thread::spawn(move || {
+            let mut state = PrngState::from_seed(0xabc2).expect("peer seed");
+            let mut out = 0;
+            let rc = unsafe {
+                lfm_engine_prng_fill(peer_address as *mut c_void, &mut state, &mut out, 1)
+            };
+            (rc, state, out)
+        });
+        let live_wait = unsafe { lfm_internal_engine_wait_pass_slots_for_test(raw, 2) };
+        let release =
+            unsafe { lfm_internal_engine_pause_boundary_for_test(raw, CALLBACK, RELEASE) };
+        let (peer_rc, peer_state, peer_value) = peer.join().expect("peer join");
+        let (chain_rc, chain_state, chain_actual) = chain.join().expect("chain join");
+
+        assert_eq!(callback_wait, 0);
+        assert_eq!(live_wait, 0);
+        assert_eq!(release, 0);
+        assert_eq!(peer_rc, 0);
+        assert_eq!(peer_value, peer_expected);
+        assert_eq!(peer_state.cursor, peer_oracle.cursor);
+        assert_eq!(chain_rc, 0);
+        assert_eq!(chain_actual, chain_expected);
+        assert_eq!(chain_state.cursor, chain_oracle.cursor);
+
+        let mut snapshot = EngineSnapshot {
+            size: std::mem::size_of::<EngineSnapshot>() as u32,
+            abi_version: 1,
+            ..EngineSnapshot::default()
+        };
+        assert_eq!(unsafe { lfm_engine_snapshot(raw, &mut snapshot) }, 0);
+        assert_eq!(snapshot.max_pass_slots_live, 2);
+        assert_eq!(snapshot.pass_slots_live, 0);
+        assert_eq!(snapshot.pass_claimed, 0);
+        unsafe { lfm_engine_free(raw) };
+    }
+
+    #[test]
+    fn stale_claim_destructor_cannot_release_a_reowned_continuation_slot() {
+        const PASSES: usize = 16;
+        const CLAIM_RETURN: u32 = 1;
+        const CALLBACK: u32 = 2;
+        const ARM: u32 = 1;
+        const WAIT: u32 = 2;
+        const RELEASE: u32 = 3;
+
+        let oracle = NativeEngine::new(2).expect("oracle engine init");
+        let mut expected_state = PrngState::from_seed(0xdef1).expect("oracle seed");
+        let mut expected = [0u64; PASSES];
+        assert!(oracle.prng_fill(&mut expected_state, &mut expected));
+
+        let raw = unsafe { lfm_engine_new(2) };
+        assert!(!raw.is_null());
+        assert_eq!(
+            unsafe { lfm_internal_engine_pause_boundary_for_test(raw, CLAIM_RETURN, ARM) },
+            0
+        );
+        let address = raw as usize;
+        let old = std::thread::spawn(move || {
+            let mut state = PrngState::from_seed(0xdef0).expect("old seed");
+            let mut out = 0;
+            let rc =
+                unsafe { lfm_engine_prng_fill(address as *mut c_void, &mut state, &mut out, 1) };
+            (rc, out)
+        });
+        let old_wait =
+            unsafe { lfm_internal_engine_pause_boundary_for_test(raw, CLAIM_RETURN, WAIT) };
+
+        assert_eq!(
+            unsafe { lfm_internal_engine_pause_boundary_for_test(raw, CALLBACK, ARM) },
+            0
+        );
+        let chain_address = raw as usize;
+        let chain = std::thread::spawn(move || {
+            let mut state = PrngState::from_seed(0xdef1).expect("chain seed");
+            let mut out = [0u64; PASSES];
+            let rc = unsafe {
+                lfm_internal_engine_prng_continuation_for_test(
+                    chain_address as *mut c_void,
+                    &mut state,
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            (rc, state, out)
+        });
+        let callback_wait =
+            unsafe { lfm_internal_engine_pause_boundary_for_test(raw, CALLBACK, WAIT) };
+        let old_release =
+            unsafe { lfm_internal_engine_pause_boundary_for_test(raw, CLAIM_RETURN, RELEASE) };
+        let (old_rc, _) = old.join().expect("old claim join");
+
+        let mut paused = EngineSnapshot {
+            size: std::mem::size_of::<EngineSnapshot>() as u32,
+            abi_version: 1,
+            ..EngineSnapshot::default()
+        };
+        let paused_snapshot = unsafe { lfm_engine_snapshot(raw, &mut paused) };
+        let callback_release =
+            unsafe { lfm_internal_engine_pause_boundary_for_test(raw, CALLBACK, RELEASE) };
+        let (chain_rc, chain_state, actual) = chain.join().expect("chain join");
+
+        assert_eq!(old_wait, 0);
+        assert_eq!(callback_wait, 0);
+        assert_eq!(old_release, 0);
+        assert_eq!(old_rc, 0);
+        assert_eq!(paused_snapshot, 0);
+        assert_eq!(paused.pass_claimed, 0);
+        assert_eq!(paused.pass_slots_live, 1);
+        assert_eq!(callback_release, 0);
+        assert_eq!(chain_rc, 0);
+        assert_eq!(actual, expected);
+        assert_eq!(chain_state.cursor, expected_state.cursor);
+
+        let mut settled = EngineSnapshot {
+            size: std::mem::size_of::<EngineSnapshot>() as u32,
+            abi_version: 1,
+            ..EngineSnapshot::default()
+        };
+        assert_eq!(unsafe { lfm_engine_snapshot(raw, &mut settled) }, 0);
+        assert_eq!(settled.pass_slots_live, 0);
+        assert_eq!(settled.pass_claimed, 0);
+        unsafe { lfm_engine_free(raw) };
+    }
+
+    #[test]
+    fn stop_during_an_active_pass_drains_exact_cq_before_unmounting_scratch() {
+        const N: usize = 1024;
+        const ROWS: usize = 8;
+        let frequency = N / 2 + 1;
+        // SAFETY: the worker owns every borrowed input/output until the blocking
+        // pass returns. The main thread only observes atomic engine accounting.
+        let raw = unsafe { lfm_engine_new(2) };
+        assert!(!raw.is_null());
+        assert_eq!(
+            unsafe { lfm_internal_engine_arm_lane_pause_for_test(raw) },
+            0
+        );
+        let address = raw as usize;
+        let call = std::thread::spawn(move || {
+            let real = vec![0.25f32; ROWS * frequency];
+            let imag = vec![-0.125f32; ROWS * frequency];
+            let mut out = vec![0.0f32; ROWS * N];
+            let rc = unsafe {
+                lfm_engine_irfft_dd(
+                    address as *mut c_void,
+                    real.as_ptr(),
+                    real.len(),
+                    imag.as_ptr(),
+                    imag.len(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                    ROWS,
+                    N,
+                    1.0 / N as f32,
+                    0.0,
+                )
+            };
+            (rc, out)
+        });
+
+        // This is an expected-value wait, not a polling probe. Lane 0 publishes
+        // the pause only after the bridge mounted this ticket's scratch and rang
+        // the fixed team; peer lanes may already be consuming it.
+        assert_eq!(
+            unsafe { lfm_internal_engine_wait_lane_pause_for_test(raw) },
+            0
+        );
+        unsafe { lfm_engine_request_stop(raw) };
+        let (rc, out) = call.join().expect("active pass thread");
+        assert_eq!(rc, 0, "an accepted pass must drain after stop");
+        assert!(out.iter().all(|value| value.is_finite()));
+
+        let mut snapshot = EngineSnapshot {
+            size: std::mem::size_of::<EngineSnapshot>() as u32,
+            abi_version: 1,
+            ..EngineSnapshot::default()
+        };
+        assert_eq!(unsafe { lfm_engine_snapshot(raw, &mut snapshot) }, 0);
+        assert_eq!(snapshot.pass_completions, 1);
+        assert_eq!(snapshot.pass_slots_live, 0);
         unsafe { lfm_engine_free(raw) };
     }
 
@@ -3289,6 +3587,9 @@ mod tests {
         assert_eq!(stats.descriptor_callbacks, 0);
         assert_eq!(stats.max_descriptor_generation, PASSES as u32);
         assert_eq!(stats.pass_claimed, 0);
+        assert_eq!(stats.bridge_capacity, 2);
+        assert_eq!(stats.pass_slot_capacity, 2);
+        assert_eq!(stats.pass_slots_live, 0);
         eprintln!(
             "native bridge/fence soak: {PASSES} passes, {} fence syscalls for {} waiters in {:.3}s",
             stats.fence_wake_calls,

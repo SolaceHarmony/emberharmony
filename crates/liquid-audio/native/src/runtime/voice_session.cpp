@@ -406,6 +406,11 @@ struct LfmSession {
     bool coordinator_started = false;
     bool notification_started = false;
     bool threads_joined = false;
+    bool start_cleanup = false;
+    /* Lock order is runtime.children_mutex -> lifecycle_mutex. join_mutex is
+     * outermost only for concurrent join callers and is never acquired by
+     * start or stop. No native thread join holds lifecycle_mutex. */
+    mutable std::mutex lifecycle_mutex;
     mutable std::mutex join_mutex;
     mutable std::mutex publication_mutex;
 
@@ -774,16 +779,17 @@ bool handle_emission(LfmSession *session, const LfmNativeEmission &emission,
     }
     if (emission.kind == LFM_NATIVE_EMISSION_NONE) return true;
     if (emission.kind == LFM_NATIVE_EMISSION_AUDIO_CODES) {
-        if ((emission.flags & ~EMISSION_AUDIO_END) != 0) {
+        const int needs_pcm = lfm_native_emission_needs_pcm(&emission);
+        if (needs_pcm < 0) {
             publish_action_failure(session, action_epoch, ticket,
                                    LFM_STATUS_INTERNAL,
-                                   "native audio emission has unknown flags",
+                                   "invalid native audio emission",
                                    *playback_count, emitted);
             return false;
         }
         // EOAudio is a recurrence/context sentinel. It must reach the next
         // native token pass, but it is not a codec frame and never reaches Mimi.
-        if ((emission.flags & EMISSION_AUDIO_END) != 0) return true;
+        if (needs_pcm == 0) return true;
         if (!publish_audio(session, emission, action_epoch, ticket,
                            *playback_count, emitted)) {
             return false;
@@ -831,6 +837,12 @@ void run_action(LfmSession *session, LfmNativeEmission emission,
             } else if (session->epoch.load(std::memory_order_acquire) != action_epoch) {
                 publish_turn(session, action_epoch, ticket, playback_count, emitted,
                              0, LFM_STATUS_STALE);
+            } else {
+                /* A reliable text/PCM publication or codec failure cannot be
+                 * skipped while preserving the turn stream. Make the action
+                 * terminal; coordinator teardown commits any already-emitted
+                 * pending token before retiring the conversation. */
+                request_stop(session, LFM_STATUS_INTERNAL);
             }
             return;
         }
@@ -843,6 +855,7 @@ void run_action(LfmSession *session, LfmNativeEmission emission,
                 publish_action_failure(session, action_epoch, ticket, rc,
                                        "native generation limit interrupt failed",
                                        playback_count, emitted);
+                request_stop(session, rc);
                 return;
             }
             publish_turn(session, action_epoch, ticket, playback_count, emitted,
@@ -865,6 +878,7 @@ void run_action(LfmSession *session, LfmNativeEmission emission,
             publish_action_failure(session, action_epoch, ticket, rc,
                                    "native recurrence failed", playback_count,
                                    emitted);
+            request_stop(session, rc);
             return;
         }
     }
@@ -932,6 +946,24 @@ bool apply_epoch(LfmSession *session, uint64_t epoch) {
     return false;
 }
 
+bool synchronize_epoch(LfmSession *session, uint64_t *applied_epoch) {
+    for (;;) {
+        const uint64_t current_epoch =
+            session->epoch.load(std::memory_order_acquire);
+        if (current_epoch == *applied_epoch) return true;
+        if (!apply_epoch(session, current_epoch)) return false;
+        *applied_epoch = current_epoch;
+        static constexpr char interrupted[] = "interrupted";
+        if (!publish_event(session, LFM_EVENT_STATE, current_epoch,
+                           next_ticket(session, LFM_TICKET_CONTROL), 0,
+                           interrupted, sizeof(interrupted) - 1)) {
+            return false;
+        }
+        /* Publication can park behind reliable backpressure. Recheck the
+         * expected value before any command is allowed to reach inference. */
+    }
+}
+
 void process_capture(LfmSession *session, const LfmPcmLeaseV1 &lease) {
     PcmSlot *slot = nullptr;
     int rc = claim_published(&session->capture, &lease, &slot);
@@ -962,6 +994,7 @@ void process_capture(LfmSession *session, const LfmPcmLeaseV1 &lease) {
     if (rc != 0) {
         publish_action_failure(session, current_epoch, lease.ticket, rc,
                                "native PCM prefill failed");
+        request_stop(session, rc);
         return;
     }
     run_action(session, emission, current_epoch, lease.ticket);
@@ -987,6 +1020,7 @@ void process_text(LfmSession *session, const TextCommand &command) {
     if (rc != 0) {
         publish_action_failure(session, current_epoch, command.ticket, rc,
                                "native typed-input prefill failed");
+        request_stop(session, rc);
         return;
     }
     run_action(session, emission, current_epoch, command.ticket);
@@ -1038,6 +1072,7 @@ void process_mixed(LfmSession *session, const TextCommand &command) {
     if (rc != 0) {
         publish_action_failure(session, current_epoch, command.ticket, rc,
                                "native mixed text/PCM prefill failed");
+        request_stop(session, rc);
         return;
     }
     run_action(session, emission, current_epoch, command.ticket);
@@ -1065,33 +1100,36 @@ void *coordinator_main(void *context) {
                   running, sizeof(running) - 1);
 
     for (;;) {
-        uint64_t current_epoch = session->epoch.load(std::memory_order_acquire);
-        if (current_epoch != applied_epoch) {
-            if (!apply_epoch(session, current_epoch)) break;
-            applied_epoch = current_epoch;
-            static constexpr char interrupted[] = "interrupted";
-            if (!publish_event(session, LFM_EVENT_STATE, applied_epoch,
-                               next_ticket(session, LFM_TICKET_CONTROL), 0,
-                               interrupted, sizeof(interrupted) - 1)) {
-                break;
-            }
-        }
+        if (!synchronize_epoch(session, &applied_epoch)) break;
 
         bool progressed = false;
         TextCommand command{};
         while (text_pop(&session->commands, &command,
                         &session->command_space_doorbell)) {
             progressed = true;
+            /* An interrupt may race between the drain predicate and this pop.
+             * Apply it before the popped record can touch conversation state. */
+            if (!synchronize_epoch(session, &applied_epoch)) break;
             process_command(session, command);
-            if (session->stop.load(std::memory_order_acquire)) break;
+            if (session->stop.load(std::memory_order_acquire) ||
+                session->epoch.load(std::memory_order_acquire) != applied_epoch) {
+                break;
+            }
         }
+        if (session->stop.load(std::memory_order_acquire)) break;
+        if (session->epoch.load(std::memory_order_acquire) != applied_epoch) continue;
         LfmPcmLeaseV1 lease{};
         while (pool_pop(&session->capture, &lease)) {
             progressed = true;
+            if (!synchronize_epoch(session, &applied_epoch)) break;
             process_capture(session, lease);
-            if (session->stop.load(std::memory_order_acquire)) break;
+            if (session->stop.load(std::memory_order_acquire) ||
+                session->epoch.load(std::memory_order_acquire) != applied_epoch) {
+                break;
+            }
         }
         if (session->stop.load(std::memory_order_acquire)) break;
+        if (session->epoch.load(std::memory_order_acquire) != applied_epoch) continue;
         if (progressed) continue;
 
         uint32_t expected = kc_atomic_u32_load_acquire(&session->work_doorbell.value);
@@ -1111,7 +1149,11 @@ void *coordinator_main(void *context) {
         }
     }
 
-    if (!session->dock_only) (void)lfm_conversation_interrupt_native(session->conversation);
+    if (!session->dock_only) {
+        const int teardown =
+            lfm_conversation_interrupt_native(session->conversation);
+        if (teardown != 0) request_stop(session, teardown);
+    }
     flush_commands(session);
     flush_capture(session);
     flush_published(&session->capture);
@@ -1335,6 +1377,22 @@ int submit_mixed(LfmSession *session, const char *utf8, size_t utf8_bytes,
 } // namespace
 
 extern "C" {
+
+int lfm_native_emission_needs_pcm(const LfmNativeEmission *emission) {
+    if (!emission || emission->kind != LFM_NATIVE_EMISSION_AUDIO_CODES ||
+        emission->code_count != LFM_MIMI_CODEBOOKS ||
+        (emission->flags & ~EMISSION_AUDIO_END) != 0) {
+        return LFM_STATUS_INVALID_ARGUMENT;
+    }
+    const bool end = (emission->flags & EMISSION_AUDIO_END) != 0;
+    for (uint32_t index = 0; index < emission->code_count; ++index) {
+        if ((end && emission->codes[index] != LFM_MIMI_CODE_VALUES) ||
+            (!end && emission->codes[index] >= LFM_MIMI_CODE_VALUES)) {
+            return LFM_STATUS_INVALID_ARGUMENT;
+        }
+    }
+    return end ? 0 : 1;
+}
 
 int lfm_runtime_create(const LfmRuntimeConfigV1 *config, LfmRuntime **out) {
     if (!config || !out) return LFM_STATUS_INVALID_ARGUMENT;
@@ -1724,8 +1782,12 @@ int lfm_session_create(LfmRuntime *runtime, LfmModel *model,
 int lfm_session_start(LfmSession *session) {
     if (!session) return LFM_STATUS_INVALID_ARGUMENT;
     std::unique_lock<std::mutex> owner(session->runtime->children_mutex);
+    std::unique_lock<std::mutex> lifecycle(session->lifecycle_mutex);
     if (session->runtime->state.load(std::memory_order_acquire) != LFM_RUNTIME_STARTED) {
         return LFM_STATUS_BUSY;
+    }
+    if (session->stop.load(std::memory_order_acquire)) {
+        return LFM_STATUS_CANCELLED;
     }
     uint32_t expected = LFM_SESSION_CREATED;
     if (!session->state.compare_exchange_strong(expected, LFM_SESSION_RUNNING,
@@ -1744,11 +1806,15 @@ int lfm_session_start(LfmSession *session) {
         request_stop(session, rc);
         session->event_done.store(true, std::memory_order_release);
         ring(&session->event_doorbell, true);
+        session->start_cleanup = true;
         owner.unlock();
+        lifecycle.unlock();
         kc_port_thread_join(session->notification);
+        lifecycle.lock();
         session->notification = nullptr;
         session->notification_started = false;
         session->threads_joined = true;
+        session->start_cleanup = false;
         session->state.store(LFM_SESSION_THREADS_JOINED, std::memory_order_release);
         return rc;
     }
@@ -1801,22 +1867,33 @@ int lfm_session_interrupt(LfmSession *session, uint64_t *out_epoch) {
 
 void lfm_session_request_stop(LfmSession *session) {
     if (!session) return;
+    std::lock_guard<std::mutex> lifecycle(session->lifecycle_mutex);
     request_stop(session, 0);
 }
 
 int lfm_session_join(LfmSession *session) {
     if (!session) return LFM_STATUS_INVALID_ARGUMENT;
-    std::lock_guard<std::mutex> guard(session->join_mutex);
-    if (session->state.load(std::memory_order_acquire) == LFM_SESSION_JOINED) return 0;
-    if (session->state.load(std::memory_order_acquire) == LFM_SESSION_CREATED) {
-        // A never-started session still owns admission docks. Closing them here
-        // makes JOINED terminal for reserve, submit, and interrupt as promised.
-        request_stop(session, 0);
+    std::lock_guard<std::mutex> join(session->join_mutex);
+    {
+        std::lock_guard<std::mutex> lifecycle(session->lifecycle_mutex);
+        const uint32_t state = session->state.load(std::memory_order_acquire);
+        if (state == LFM_SESSION_JOINED) {
+            return session->terminal_status.load(std::memory_order_acquire);
+        }
+        if (session->start_cleanup) return LFM_STATUS_BUSY;
+        if (state == LFM_SESSION_CREATED) {
+            // A never-started session still owns admission docks. Closing them
+            // under the same transition lock as start makes that choice final.
+            request_stop(session, 0);
+        }
+        if (!session->stop.load(std::memory_order_acquire) &&
+            state != LFM_SESSION_CREATED) {
+            return LFM_STATUS_BUSY;
+        }
     }
-    if (!session->stop.load(std::memory_order_acquire) &&
-        session->state.load(std::memory_order_acquire) != LFM_SESSION_CREATED) {
-        return LFM_STATUS_BUSY;
-    }
+
+    /* Worker failure paths can call request_stop. Do not hold lifecycle_mutex
+     * while waiting for them; stop/state already make a later start impossible. */
     if (!session->threads_joined) {
         if (session->coordinator_started) {
             kc_port_thread_join(session->coordinator);
@@ -1828,13 +1905,18 @@ int lfm_session_join(LfmSession *session) {
             session->notification = nullptr;
             session->notification_started = false;
         }
+        std::lock_guard<std::mutex> lifecycle(session->lifecycle_mutex);
         session->threads_joined = true;
-        session->state.store(LFM_SESSION_THREADS_JOINED, std::memory_order_release);
+        session->state.store(LFM_SESSION_THREADS_JOINED,
+                             std::memory_order_release);
     }
     if (pool_live(session->capture) != 0 || pool_live(session->playback) != 0) {
         return LFM_STATUS_BUSY;
     }
-    session->state.store(LFM_SESSION_JOINED, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lifecycle(session->lifecycle_mutex);
+        session->state.store(LFM_SESSION_JOINED, std::memory_order_release);
+    }
     return session->terminal_status.load(std::memory_order_acquire);
 }
 

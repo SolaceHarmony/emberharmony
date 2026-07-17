@@ -243,6 +243,21 @@ extern "C" {
         embedding_kind: u32,
         out: *mut TokenResult,
     ) -> i32;
+    fn lfm_internal_conversation_interrupt_for_test(conversation: *mut NativeConversation) -> i32;
+    fn lfm_internal_conversation_stage_pending_for_test(
+        conversation: *mut NativeConversation,
+        ids: *const u32,
+        id_count: usize,
+        embedding_kind: u32,
+    ) -> i32;
+    fn lfm_internal_conversation_cache_digest_for_test(
+        conversation: *mut NativeConversation,
+        out: *mut u64,
+    ) -> i32;
+    fn lfm_internal_conversation_prng_digest_for_test(
+        conversation: *mut NativeConversation,
+        out: *mut u64,
+    ) -> i32;
     fn lfm_conversation_close(conversation: *mut NativeConversation) -> i32;
     fn mimi_weight_load_f32(bytes: *const u8, index: u64) -> f32;
     fn mimi_weight_gemv_f32(
@@ -253,6 +268,15 @@ extern "C" {
         rows: i32,
         cols: i32,
     );
+    fn mimi_weight_gemm_f32(
+        weights: *const u8,
+        input: *const f32,
+        output: *mut f32,
+        rows: i32,
+        cols: i32,
+        width: i32,
+        beta: i32,
+    );
     fn mimi_weight_gemm_tn_f32(
         weights: *const u8,
         input: *const f32,
@@ -260,6 +284,24 @@ extern "C" {
         rows: i32,
         cols: i32,
         width: i32,
+    );
+    fn mimi_scale_vec_f32(input: *const f32, scale: *const f32, output: *mut f32, count: i32);
+    fn mimi_weight_scale_vec_f32(input: *const f32, scale: *const u8, output: *mut f32, count: i32);
+    fn mimi_layer_norm_f32(
+        input: *const f32,
+        weight: *const f32,
+        bias: *const f32,
+        output: *mut f32,
+        count: i32,
+        epsilon: f32,
+    );
+    fn mimi_weight_layer_norm_f32(
+        input: *const f32,
+        weight: *const u8,
+        bias: *const u8,
+        output: *mut f32,
+        count: i32,
+        epsilon: f32,
     );
     fn lfm_bf16_unlift_bits(source_bytes: *const c_void) -> u32;
     fn lfm_internal_weights_open_bundle_benchmark(
@@ -558,6 +600,20 @@ fn assert_tiny_model_rejected(temp: &Temp, message: &str) {
     unsafe { lfm_engine_free(engine) };
 }
 
+fn tiny_model_memory(temp: &Temp) -> ModelMemory {
+    let (engine, model, status, message) = open_tiny_model(temp);
+    assert_eq!(status, 0, "native model open failed: {message}");
+    let mut memory = ModelMemory {
+        size: std::mem::size_of::<ModelMemory>() as u32,
+        abi_version: MODEL_ABI,
+        ..Default::default()
+    };
+    assert_eq!(unsafe { lfm_model_memory(model, &mut memory) }, 0);
+    assert_eq!(unsafe { lfm_model_close(model) }, 0);
+    unsafe { lfm_engine_free(engine) };
+    memory
+}
+
 #[derive(Debug)]
 struct Image(*mut WeightImage);
 
@@ -821,40 +877,168 @@ fn bundle_scopes_duplicate_names_and_uses_one_image() {
     assert_eq!(serial_bytes, parallel_bytes);
 }
 
-#[test]
-fn mimi_weight_leaves_read_unaligned_checkpoint_bytes_without_staging() {
-    let values = [1.5f32, -2.0, 0.25, 4.0, -1.0, 3.5];
-    let mut storage = vec![0xabu8];
-    storage.extend(values.iter().flat_map(|value| value.to_le_bytes()));
-    let weights = unsafe { storage.as_ptr().add(1) };
-    assert_ne!((weights as usize) & (std::mem::align_of::<f32>() - 1), 0);
-    for (index, expected) in values.iter().enumerate() {
-        assert_eq!(
-            unsafe { mimi_weight_load_f32(weights, index as u64) }.to_bits(),
-            expected.to_bits()
-        );
+fn resident_f32(values: &[f32], skew: usize) -> (Vec<u8>, usize) {
+    assert!(skew <= 1);
+    let mut storage = vec![0xa5; values.len() * size_of::<f32>() + 8];
+    let base = storage.as_ptr() as usize;
+    let aligned = (size_of::<f32>() - base % size_of::<f32>()) % size_of::<f32>();
+    let offset = aligned + skew;
+    for (index, value) in values.iter().enumerate() {
+        let start = offset + index * size_of::<f32>();
+        storage[start..start + size_of::<f32>()].copy_from_slice(&value.to_le_bytes());
     }
+    (storage, offset)
+}
 
-    // W [2,3] * x [3].
-    let input = [2.0f32, -1.0, 0.5];
-    let mut output = [0.0f32; 2];
-    unsafe {
-        mimi_weight_gemv_f32(
-            weights,
-            input.as_ptr(),
-            std::ptr::null(),
-            output.as_mut_ptr(),
-            2,
-            3,
-        )
-    };
-    assert_eq!(output, [5.125, 10.75]);
+#[test]
+fn mimi_weight_leaves_read_aligned_and_unaligned_checkpoint_bytes_without_staging() {
+    for skew in [0usize, 1] {
+        let gemv_values = [1.0f32; 16]
+            .into_iter()
+            .chain([0.5f32; 16])
+            .collect::<Vec<_>>();
+        let (gemv_storage, gemv_offset) = resident_f32(&gemv_values, skew);
+        let gemv = unsafe { gemv_storage.as_ptr().add(gemv_offset) };
+        assert_eq!((gemv as usize) % size_of::<f32>(), skew);
+        for (index, expected) in gemv_values.iter().enumerate() {
+            assert_eq!(
+                unsafe { mimi_weight_load_f32(gemv, index as u64) }.to_bits(),
+                expected.to_bits()
+            );
+        }
+        let input = std::array::from_fn::<_, 16, _>(|index| (index + 1) as f32);
+        let (bias_storage, bias_offset) = resident_f32(&[1.0, -2.0], skew);
+        let bias = unsafe { bias_storage.as_ptr().add(bias_offset) };
+        let mut output = [0.0f32; 2];
+        unsafe { mimi_weight_gemv_f32(gemv, input.as_ptr(), bias, output.as_mut_ptr(), 2, 16) };
+        assert_eq!(output, [137.0, 66.0]);
 
-    // The same bytes viewed as W [K=2, rows=3], compute W^T * B [2,1].
-    let input = [2.0f32, -1.0];
-    let mut output = [0.0f32; 3];
-    unsafe { mimi_weight_gemm_tn_f32(weights, input.as_ptr(), output.as_mut_ptr(), 3, 2, 1) };
-    assert_eq!(output, [-1.0, -3.0, -3.0]);
+        // C[2,4] = W[2,4] * identity[4,4].
+        let matrix = [1.0f32, 2.0, 3.0, 4.0, -1.0, 0.0, 1.0, 2.0];
+        let (matrix_storage, matrix_offset) = resident_f32(&matrix, skew);
+        let weights = unsafe { matrix_storage.as_ptr().add(matrix_offset) };
+        let identity = [
+            1.0f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+        ];
+        let mut product = [0.0f32; 8];
+        unsafe {
+            mimi_weight_gemm_f32(weights, identity.as_ptr(), product.as_mut_ptr(), 2, 4, 4, 0)
+        };
+        assert_eq!(product, matrix);
+
+        let pair_rhs = [1.0f32, 2.0, 3.0, 4.0, -1.0, 0.5, 2.0, -2.0];
+        let mut pair_product = [0.0f32; 4];
+        unsafe {
+            mimi_weight_gemm_f32(
+                weights,
+                pair_rhs.as_ptr(),
+                pair_product.as_mut_ptr(),
+                2,
+                4,
+                2,
+                0,
+            )
+        };
+        assert_eq!(pair_product, [12.0, 3.5, 2.0, -5.5]);
+
+        // C[4,2] = W[K=2,rows=4]^T * B[2,2]; n=2 exercises the hot
+        // row-vector transpose-GEMM path.
+        let transposed = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let (tn_storage, tn_offset) = resident_f32(&transposed, skew);
+        let tn = unsafe { tn_storage.as_ptr().add(tn_offset) };
+        let rhs = [2.0f32, 3.0, -1.0, 4.0];
+        let mut tn_product = [0.0f32; 8];
+        unsafe { mimi_weight_gemm_tn_f32(tn, rhs.as_ptr(), tn_product.as_mut_ptr(), 4, 2, 2) };
+        assert_eq!(tn_product, [-3.0, 23.0, -2.0, 30.0, -1.0, 37.0, 0.0, 44.0]);
+
+        let scale = [1.0f32, -1.0, 0.5, 2.0, -2.0, 0.25, 4.0, 0.0];
+        let (scale_storage, scale_offset) = resident_f32(&scale, skew);
+        let scale_bytes = unsafe { scale_storage.as_ptr().add(scale_offset) };
+        let values = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let mut expected_scale = [0.0f32; 8];
+        let mut got_scale = [0.0f32; 8];
+        unsafe {
+            mimi_scale_vec_f32(
+                values.as_ptr(),
+                scale.as_ptr(),
+                expected_scale.as_mut_ptr(),
+                8,
+            );
+            mimi_weight_scale_vec_f32(values.as_ptr(), scale_bytes, got_scale.as_mut_ptr(), 8);
+        }
+        assert_eq!(got_scale, expected_scale);
+
+        let norm_weight = [1.0f32, 0.5, -1.0, 2.0, 1.5, -0.5, 0.25, 3.0];
+        let norm_bias = [0.0f32, 1.0, -1.0, 0.5, -0.5, 2.0, 0.25, -2.0];
+        let (weight_storage, weight_offset) = resident_f32(&norm_weight, skew);
+        let (norm_bias_storage, norm_bias_offset) = resident_f32(&norm_bias, skew);
+        let weight_bytes = unsafe { weight_storage.as_ptr().add(weight_offset) };
+        let bias_bytes = unsafe { norm_bias_storage.as_ptr().add(norm_bias_offset) };
+        let mut expected_norm = [0.0f32; 8];
+        let mut got_norm = [0.0f32; 8];
+        unsafe {
+            mimi_layer_norm_f32(
+                values.as_ptr(),
+                norm_weight.as_ptr(),
+                norm_bias.as_ptr(),
+                expected_norm.as_mut_ptr(),
+                8,
+                1e-5,
+            );
+            mimi_weight_layer_norm_f32(
+                values.as_ptr(),
+                weight_bytes,
+                bias_bytes,
+                got_norm.as_mut_ptr(),
+                8,
+                1e-5,
+            );
+        }
+        assert_eq!(got_norm, expected_norm);
+    }
+}
+
+#[test]
+fn mimi_checkpoint_weights_never_become_typed_float_pointers() {
+    for (name, source) in [
+        (
+            "mimi_decode.cpp",
+            include_str!("../native/src/mimi/mimi_decode.cpp"),
+        ),
+        (
+            "mimi_conv.cpp",
+            include_str!("../native/src/mimi/mimi_conv.cpp"),
+        ),
+        (
+            "mimi_quant.cpp",
+            include_str!("../native/src/mimi/mimi_quant.cpp"),
+        ),
+        (
+            "mimi_seanet.cpp",
+            include_str!("../native/src/mimi/mimi_seanet.cpp"),
+        ),
+        (
+            "mimi_transformer.cpp",
+            include_str!("../native/src/mimi/mimi_transformer.cpp"),
+        ),
+        (
+            "mimi_kernel.h",
+            include_str!("../native/src/mimi/mimi_kernel.h"),
+        ),
+    ] {
+        for forbidden in [
+            "mimi_aligned_f32",
+            "reinterpret_cast<const float",
+            "static_cast<const float",
+            "(const float *)",
+            "(const float*)",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "{name} creates a typed checkpoint pointer via `{forbidden}`"
+            );
+        }
+    }
 }
 
 #[test]
@@ -1188,6 +1372,22 @@ fn model_schema_rejects_short_or_extra_layer_type_entries() {
 }
 
 #[test]
+fn model_config_rejects_adjusted_ffn_rounding_overflow() {
+    let temp = Temp::new();
+    write_tiny_model(&temp, 2, |_| {});
+    let path = temp.0.join("config.json");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    config["lfm"]["block_ff_dim"] = serde_json::json!(i64::MAX);
+    config["lfm"]["block_auto_adjust_ff_dim"] = serde_json::json!(true);
+    config["lfm"]["block_multiple_of"] = serde_json::json!(i64::MAX);
+    config["lfm"]["block_ffn_dim_multiplier"] = serde_json::json!(2.0);
+    std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+
+    assert_tiny_model_rejected(&temp, "adjusted FFN rounding overflows size_t");
+}
+
+#[test]
 fn model_schema_rejects_audio_vocabulary_codebook_mismatch() {
     let temp = Temp::new();
     write_tiny_model(&temp, 2, |tensors| {
@@ -1253,6 +1453,30 @@ fn runtime_rejects_incomplete_voice_model_without_retaining_a_child() {
     unsafe { lfm_runtime_request_stop(runtime) };
     assert_eq!(unsafe { lfm_runtime_join(runtime) }, 0);
     assert_eq!(unsafe { lfm_runtime_destroy(runtime) }, 0);
+}
+
+#[test]
+fn directly_bound_accounting_excludes_unused_checkpoint_tensors() {
+    let baseline = Temp::new();
+    write_tiny_model(&baseline, 2, |_| {});
+    let baseline_memory = tiny_model_memory(&baseline);
+
+    let extra = Temp::new();
+    write_tiny_model(&extra, 2, |tensors| {
+        tensors.push(TinyTensor {
+            name: "unused.audit.weight".into(),
+            dtype: "BF16",
+            shape: vec![1024],
+        });
+    });
+    let extra_memory = tiny_model_memory(&extra);
+
+    assert!(extra_memory.source_bytes > baseline_memory.source_bytes);
+    assert!(extra_memory.resident_image_bytes > baseline_memory.resident_image_bytes);
+    assert_eq!(
+        extra_memory.directly_bound_bytes, baseline_memory.directly_bound_bytes,
+        "unused checkpoint tensors must not masquerade as schema-bound weights"
+    );
 }
 
 #[test]
@@ -1378,6 +1602,138 @@ fn opaque_native_model_and_conversation_own_the_complete_token_state() {
         assert_eq!(unsafe { lfm_conversation_close(conversation) }, 0);
     }
 
+    assert_eq!(unsafe { lfm_model_close(model) }, 0);
+    unsafe { lfm_engine_free(engine) };
+}
+
+#[test]
+fn interrupt_commits_text_audio_and_eoaudio_pending_state_without_sampling() {
+    let temp = Temp::new();
+    write_tiny_model(&temp, 2, |_| {});
+    let (engine, model, status, message) = open_tiny_model(&temp);
+    assert_eq!(status, 0, "native model open failed: {message}");
+
+    let sampler = SamplerConfig {
+        size: std::mem::size_of::<SamplerConfig>() as u32,
+        abi_version: 1,
+        flags: 1,
+        top_k: 0,
+        temperature: 1.0,
+        reserved: 0,
+    };
+    let config = ConversationConfig {
+        size: std::mem::size_of::<ConversationConfig>() as u32,
+        abi_version: MODEL_ABI,
+        flags: 0,
+        reserved0: 0,
+        seed: 19,
+        text_sampler: sampler,
+        audio_sampler: sampler,
+        reserved: [0; 4],
+    };
+    let create = || {
+        let mut conversation = std::ptr::null_mut();
+        let mut error = [0i8; 512];
+        assert_eq!(
+            unsafe {
+                lfm_conversation_create(
+                    model,
+                    &config,
+                    &mut conversation,
+                    error.as_mut_ptr(),
+                    error.len(),
+                )
+            },
+            0,
+            "native conversation failed: {}",
+            unsafe { CStr::from_ptr(error.as_ptr()) }.to_string_lossy()
+        );
+        conversation
+    };
+    let baseline = create();
+    let interrupted = create();
+    let step = |conversation, ids: &[u32], kind| {
+        let mut result = TokenResult {
+            size: std::mem::size_of::<TokenResult>() as u32,
+            abi_version: MODEL_ABI,
+            position: 0,
+            sampled_token: 0,
+            input_count: 0,
+            embedding_kind: 0,
+            flags: 0,
+            reserved: [0; 4],
+        };
+        assert_eq!(
+            unsafe {
+                lfm_conversation_step(conversation, ids.as_ptr(), ids.len(), kind, &mut result)
+            },
+            0
+        );
+        result
+    };
+    let digest = |conversation| {
+        let mut value = 0;
+        assert_eq!(
+            unsafe { lfm_internal_conversation_cache_digest_for_test(conversation, &mut value) },
+            0
+        );
+        value
+    };
+    let prng = |conversation| {
+        let mut value = 0;
+        assert_eq!(
+            unsafe { lfm_internal_conversation_prng_digest_for_test(conversation, &mut value) },
+            0
+        );
+        value
+    };
+
+    // Audio IDs are already offset into the concatenated two-codebook
+    // embedding. The last tuple is the EOAudio recurrence sentinel and must be
+    // committed exactly like a nonterminal audio tuple, without reaching Mimi.
+    let cases: &[(&[u32], u32)] = &[(&[3], 0), (&[0, 2049], 1), (&[2048, 4097], 1)];
+    for (ids, kind) in cases {
+        let direct = step(baseline, ids, *kind);
+        assert_eq!(
+            unsafe {
+                lfm_internal_conversation_stage_pending_for_test(
+                    interrupted,
+                    ids.as_ptr(),
+                    ids.len(),
+                    *kind,
+                )
+            },
+            0
+        );
+        let prng_before = prng(interrupted);
+        assert_eq!(
+            unsafe { lfm_internal_conversation_interrupt_for_test(interrupted) },
+            0
+        );
+        assert_eq!(
+            prng(interrupted),
+            prng_before,
+            "interrupt sampled while committing pending kind {kind}"
+        );
+        assert_eq!(
+            digest(interrupted),
+            digest(baseline),
+            "interrupt did not commit pending kind {kind} into identical cache state"
+        );
+
+        // A following turn starts at the same cursor and produces the same
+        // complete KV/ShortConv/hidden state. This catches the former dropped
+        // row even when the synthetic zero weights make sampled logits equal.
+        let next_direct = step(baseline, &[5], 0);
+        let next_interrupted = step(interrupted, &[5], 0);
+        assert_eq!(next_interrupted.position, next_direct.position);
+        assert_eq!(next_interrupted.sampled_token, next_direct.sampled_token);
+        assert_eq!(digest(interrupted), digest(baseline));
+        assert!(next_direct.position > direct.position);
+    }
+
+    assert_eq!(unsafe { lfm_conversation_close(interrupted) }, 0);
+    assert_eq!(unsafe { lfm_conversation_close(baseline) }, 0);
     assert_eq!(unsafe { lfm_model_close(model) }, 0);
     unsafe { lfm_engine_free(engine) };
 }

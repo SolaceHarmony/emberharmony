@@ -24,6 +24,7 @@
 // Build: -ffp-contract=off (the ladders promise separate roundings), C++23.
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <cerrno>
@@ -35,6 +36,7 @@
 #include <functional>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <new>
 #include <pthread.h>
 #include <utility>
@@ -47,7 +49,9 @@
 #include "flashkern_math.h"
 #include "flashkern_prng.h"
 #include "flashkern_sampler.h"
+#include "lfm_audio_pass.h"
 #include "lfm_kernel_bridge.h"
+#include "lfm_mimi.h"
 #include "lfm_model_plan.h"
 
 extern "C" {
@@ -78,6 +82,9 @@ extern "C" void lfm_swiglu_bf16(const float *g, const float *u, uint16_t *out, i
 namespace {
 
 constexpr int MAX_WORKERS = 16;
+constexpr size_t PASS_CAPACITY = 2;
+constexpr uint32_t PASS_ADMISSION_EXCLUSIVE = uint32_t{1} << 31;
+constexpr uint32_t PASS_ADMISSION_COUNT = PASS_ADMISSION_EXCLUSIVE - 1;
 constexpr size_t DOWN_BAND_CAP = 512; // worker-stack y[] extent
 constexpr size_t PREFILL_ROWS = LFM_PREFILL_MAX_ROWS;
 std::atomic<uint64_t> next_engine_epoch{1};
@@ -155,6 +162,22 @@ struct Pass {
     std::atomic<uint32_t> rs_bits{0};
 };
 
+// Immutable-for-one-ticket MLP request metadata. The active `Pass` below also
+// carries fence-published scalar state and pointers into the selected scratch
+// bank, so it is assembled only when the dispatcher selects this ticket.
+struct MlpReq {
+    const uint16_t *x = nullptr;
+    WeightBytes norm_w = nullptr;
+    WeightBytes w1 = nullptr;
+    WeightBytes w3 = nullptr;
+    WeightBytes w2 = nullptr;
+    uint16_t *out = nullptr;
+    size_t h = 0;
+    size_t i = 0;
+    size_t tiles = 0;
+    float eps = 0.0f;
+};
+
 // ---- the stage board ------------------------------------------------------------------
 enum : uint32_t {
     ST_IDLE = 0,
@@ -221,6 +244,15 @@ enum : int {
     REQ_FFT_CONV_DD = 11,
     REQ_IRFFT_DD = 12,
     REQ_PREFILL = 13,
+    // One conversation-owned Mimi state step writes directly into a retained
+    // playback reservation. Lane 0 runs the stateful graph while peer lanes
+    // park at the pass fence; codec work therefore shares SQ/CQ ordering and
+    // cannot oversubscribe the backbone/Depthformer executor.
+    REQ_MIMI_DECODE = 14,
+    // One retained PCM view through prepared resample, frontend, and Conformer
+    // workspaces. Conformer GEMMs are fixed-team substages of this ticket and
+    // never recurse through the bridge.
+    REQ_AUDIO_ENCODE = 15,
 };
 
 struct PrngReq {
@@ -319,11 +351,16 @@ struct DepthPlan {
     size_t codebooks = 0;
     size_t backbone_dim = 0;
     float eps = 0.0f;
+};
 
+// Depthformer values are pass scratch, not model-plan state. Keeping them in
+// the plan made a second accepted ticket alias the first ticket's mutable
+// planes even though the resident weights themselves were immutable views.
+struct DepthScratch {
     std::vector<uint16_t> x, h, xn, qkv_b, y_b, attn_b, t_b;
     std::vector<uint16_t> k_plane, v_plane, logits_b, din_b, df_b;
     std::vector<float> qkv_f, up_f, q_f, attn_f, proj_f;
-    float partials[MAX_WORKERS] = {};
+    std::array<float, MAX_WORKERS> partials{};
 };
 
 struct BackbonePlan {
@@ -457,6 +494,52 @@ struct PrefillReq {
     size_t lanes = 0;
 };
 
+struct MimiReq {
+    MimiDecodeState *state = nullptr;
+    const uint32_t *codes = nullptr;
+    float *pcm = nullptr;
+    size_t capacity = 0;
+    size_t *out_samples = nullptr;
+};
+
+struct AudioReq {
+    LfmAudioEncodePassV1 pass{};
+    uint64_t start_gemm_generation = 0;
+    std::atomic<uint64_t> gemm_generation{0};
+    std::atomic<bool> done{false};
+};
+
+// Each admitted ticket owns one activation/sampling scratch bank until its
+// exact CQ record is consumed. The lane team remains single-pass, so dispatch
+// swaps precisely one bank onto the stage board; a queued follow-on never
+// aliases the completing ticket's values. These are activation buffers only --
+// resident weights remain borrowed byte views and are never copied here.
+struct ScratchBank {
+    std::vector<float> sc_partials, sc_gu;
+    std::vector<uint16_t> sc_xn, sc_t;
+    std::vector<float> sc_bcxf, sc_projf;
+    std::vector<uint16_t> sc_bcxb, sc_conv, sc_projb, sc_stage, sc_mid;
+    std::vector<float> at_qkvf, at_att;
+    std::vector<uint16_t> at_qkvb, at_y;
+    std::vector<uint16_t> tk_h0, tk_h1;
+    std::vector<float> tk_logf;
+    std::vector<float> sample_weights;
+    std::vector<float> sample_heap;
+    std::array<float, MAX_WORKERS> sample_lane_value{};
+    std::array<float, MAX_WORKERS> sample_lane_sum{};
+    std::array<uint32_t, MAX_WORKERS> sample_lane_index{};
+    float sample_maximum = 0.0f;
+    float sample_threshold = 0.0f;
+    float sample_target = 0.0f;
+    uint32_t sample_winner_lane = 0;
+    std::vector<ComplexDd> fft_twiddles;
+    std::vector<ComplexDd> irfft_twiddles;
+    std::vector<ComplexDd> fft_work;
+    size_t fft_twiddle_size = 0;
+    size_t irfft_twiddle_size = 0;
+    DepthScratch depth;
+};
+
 struct Engine;
 struct alignas(64) WaitWord {
     uint32_t value = 0;
@@ -465,6 +548,107 @@ struct alignas(64) WaitWord {
     uint8_t padding[48] = {};
 };
 static_assert(sizeof(WaitWord) == 64, "shared doorbells must not share cache lines");
+
+enum : uint32_t {
+    PASS_SLOT_FREE = 0,
+    PASS_SLOT_CLAIMING = 1,
+    PASS_SLOT_RESERVED = 2,
+    PASS_SLOT_SUBMITTING = 3,
+    PASS_SLOT_SUBMITTED = 4,
+    PASS_SLOT_RUNNING = 5,
+    PASS_SLOT_COMPLETING = 6,
+    PASS_SLOT_COMPLETE = 7,
+    PASS_SLOT_RELEASING = 8,
+};
+
+constexpr uint64_t PASS_SLOT_STATE_BITS = 8;
+constexpr uint64_t PASS_SLOT_STATE_MASK =
+    (UINT64_C(1) << PASS_SLOT_STATE_BITS) - 1;
+
+static constexpr uint64_t pass_slot_lease(uint64_t generation,
+                                          uint32_t state) {
+    return (generation << PASS_SLOT_STATE_BITS) | state;
+}
+
+static constexpr uint32_t pass_slot_state(uint64_t lease) {
+    return static_cast<uint32_t>(lease & PASS_SLOT_STATE_MASK);
+}
+
+static constexpr uint64_t pass_slot_generation(uint64_t lease) {
+    return lease >> PASS_SLOT_STATE_BITS;
+}
+
+struct PassSlot;
+struct PassContinuationPermit;
+using PassContinuation = void (*)(PassContinuationPermit *,
+                                  const KcCompletionV1 &, void *);
+
+struct PassSlot {
+    Engine *engine = nullptr;
+    uint32_t index = 0;
+    /* Generation and state are one CAS authority. Keeping them in separate
+     * atomics permits a stale owner to validate an old generation and then
+     * transition a newly recycled RESERVED state. */
+    std::atomic<uint64_t> lease{pass_slot_lease(0, PASS_SLOT_FREE)};
+    /* Every successful FREE -> RESERVED transition gets a distinct owner
+     * generation. State alone is not an ownership proof: a synchronous claim
+     * can release its completed slot, pause before its destructor, and observe
+     * the same physical slot RESERVED by a continuation. */
+    std::atomic<uint64_t> reservation_sequence{0};
+    WaitWord completion_word;
+    WaitWord audio_word;
+    KcSubmissionV1 submission{};
+    KcCompletionV1 completion{};
+    int request = REQ_NONE;
+    uint64_t context_id = 0;
+    PassContinuation continuation = nullptr;
+    void *continuation_context = nullptr;
+
+    MlpReq mlp;
+    ConvReq conv;
+    AttnReq attn;
+    PrngReq prng;
+    SampleReq sample;
+    DepthReq depth_req;
+    DepthwiseStreamReq depthwise_stream;
+    GemmReq gemm;
+    FftConvDdReq fft_conv_dd;
+    IrfftDdReq irfft_dd;
+    BackbonePlan *model = nullptr;
+    DepthPlan *depth = nullptr;
+    TokenReq tok;
+    PrefillReq prefill;
+    MimiReq mimi;
+    AudioReq audio;
+    ScratchBank scratch;
+};
+
+/* Stack-scoped authority for the exact slot whose CQ record triggered a
+ * continuation. The type never crosses a header or the product ABI. Keeping
+ * the slot RESERVED under the same generation makes resubmission atomic with
+ * respect to competing compatibility producers. */
+struct PassContinuationPermit {
+    Engine *engine = nullptr;
+    PassSlot *slot = nullptr;
+    uint64_t generation = 0;
+    bool consumed = false;
+};
+
+static uint32_t slot_state(const PassSlot *slot) {
+    return pass_slot_state(slot->lease.load(std::memory_order_acquire));
+}
+
+static uint64_t slot_generation(const PassSlot *slot) {
+    return pass_slot_generation(slot->lease.load(std::memory_order_acquire));
+}
+
+static bool transition_slot(PassSlot *slot, uint64_t generation,
+                            uint32_t from, uint32_t to) {
+    uint64_t expected = pass_slot_lease(generation, from);
+    return slot->lease.compare_exchange_strong(
+        expected, pass_slot_lease(generation, to), std::memory_order_acq_rel,
+        std::memory_order_acquire);
+}
 
 struct LaneArg {
     Engine *e;
@@ -492,6 +676,11 @@ struct LfmEngineSnapshotV1 {
     uint32_t attention_y_capacity;
     uint32_t attention_score_capacity;
     uint32_t pass_claimed;
+    uint32_t bridge_capacity;
+    uint32_t pass_slot_capacity;
+    uint32_t pass_slots_live;
+    uint32_t max_pass_slots_live;
+    uint64_t continuation_submissions;
 };
 
 struct Engine {
@@ -510,23 +699,48 @@ struct Engine {
     int wait_words_prepared = 0;
     int workers_started = 0;
     int bridge_started = 0;
+    int slot_waits_prepared = 0;
+    int audio_waits_prepared = 0;
     uint32_t lanes_total = 1;
     std::atomic<uint64_t> lane_gen{0};
     int cur_req = REQ_NONE;
     std::atomic<bool> retire{false};
     LfmKernelBridge *bridge = nullptr;
+    std::array<PassSlot, PASS_CAPACITY> slots;
+    PassSlot *active_slot = nullptr;
     KcSubmissionV1 active_submission{};
+    // Low bits count numerical ticket leases. The high bit is the exclusive
+    // plan/table mutation lease. This prevents a plan install, clear, or
+    // all-slot resize from racing a queued continuation that already borrowed
+    // its plan pointer and scratch bank.
+    std::atomic<uint32_t> pass_admission{0};
     std::atomic<bool> pass_claimed{false};
     std::atomic<int> active_status{0};
     uint64_t runtime_epoch = 0;
-    uint64_t submit_sequence = 0; // written only by the current pass claimant
-    uint32_t ticket_generation = 0;
+    std::atomic<uint64_t> submit_sequence{0};
+    std::atomic<uint32_t> ticket_generation{0};
+    std::mutex submission_mutex;
     std::atomic<uint64_t> pass_submissions{0};
     std::atomic<uint64_t> pass_completions{0};
     std::atomic<uint64_t> bridge_dispatches{0};
     std::atomic<uint64_t> dispatch_wakes{0};
     std::atomic<uint64_t> fence_wake_calls{0};
     std::atomic<uint64_t> fence_wakes{0};
+    std::atomic<uint32_t> attention_qkv_capacity{0};
+    std::atomic<uint32_t> attention_y_capacity{0};
+    std::atomic<uint32_t> attention_score_capacity{0};
+    std::atomic<uint32_t> pass_slots_live{0};
+    std::atomic<uint32_t> max_pass_slots_live{0};
+    std::atomic<uint64_t> continuation_submissions{0};
+    std::atomic<uint64_t> audio_encode_passes{0};
+    // Private deterministic stop-race handshake for the IRFFT conformance
+    // request only. Ordinary model passes never load or mutate this field.
+    std::atomic<uint32_t> test_lane_pause{0};
+    /* Private deterministic ownership-race seams. 0 idle, 1 armed, 2 parked,
+     * 3 released. They are never read by ordinary model passes. */
+    std::atomic<uint32_t> test_claim_return_pause{0};
+    std::atomic<uint32_t> test_continuation_pause{0};
+    std::atomic<uint32_t> test_live_target{0};
 
     ConvReq conv;  // conv-layer request payload
     AttnReq attn;  // attention-layer request payload
@@ -547,6 +761,7 @@ struct Engine {
     uint64_t model_seq = 0;
     TokenReq tok; // token-pass request payload
     PrefillReq prefill;
+    MimiReq mimi;
 
     // Persistent scratch backing. With a ctx built everything is sized ONCE there
     // (fixed-arena: no allocation during passes); the legacy per-call MLP entry still
@@ -564,9 +779,9 @@ struct Engine {
     std::vector<float> tk_logf;         // logits GEMV accumulators [vocab] (staging)
     std::vector<float> sample_weights;  // derived exp weights [largest installed vocab]
     std::vector<float> sample_heap;     // top-k values only; no logit payload copy
-    float sample_lane_value[MAX_WORKERS] = {};
-    float sample_lane_sum[MAX_WORKERS] = {};
-    uint32_t sample_lane_index[MAX_WORKERS] = {};
+    std::array<float, MAX_WORKERS> sample_lane_value{};
+    std::array<float, MAX_WORKERS> sample_lane_sum{};
+    std::array<uint32_t, MAX_WORKERS> sample_lane_index{};
     float sample_maximum = 0.0f;
     float sample_threshold = 0.0f;
     float sample_target = 0.0f;
@@ -579,7 +794,10 @@ struct Engine {
     std::vector<ComplexDd> fft_work;
     size_t fft_twiddle_size = 0;
     size_t irfft_twiddle_size = 0;
+    DepthScratch depth_scratch;
 };
+
+static inline void signal_all(WaitWord *word);
 
 static BackbonePlan *find_model(Engine *e, uint64_t id) {
     for (const std::unique_ptr<BackbonePlan> &model : e->models)
@@ -587,9 +805,243 @@ static BackbonePlan *find_model(Engine *e, uint64_t id) {
     return nullptr;
 }
 
-// Self-enforcing single-slot ownership at the raw C ABI. This claim must be acquired
-// before a caller reads or writes any engine-owned request, context, or scratch state;
-// the Rust pass_lock is an additional language-side guarantee, not the foundation.
+static void update_slot_high_water(Engine *e, uint32_t live) {
+    uint32_t high = e->max_pass_slots_live.load(std::memory_order_relaxed);
+    while (high < live &&
+           !e->max_pass_slots_live.compare_exchange_weak(
+               high, live, std::memory_order_relaxed,
+               std::memory_order_relaxed)) {
+    }
+}
+
+static void update_capacity_high_water(std::atomic<uint32_t> *counter,
+                                       size_t capacity) {
+    if (capacity > UINT32_MAX) capacity = UINT32_MAX;
+    const uint32_t requested = (uint32_t)capacity;
+    uint32_t high = counter->load(std::memory_order_relaxed);
+    while (high < requested &&
+           !counter->compare_exchange_weak(
+               high, requested, std::memory_order_relaxed,
+               std::memory_order_relaxed)) {
+    }
+}
+
+static bool enter_pass_admission(Engine *e) {
+    uint32_t state = e->pass_admission.load(std::memory_order_acquire);
+    for (;;) {
+        if ((state & PASS_ADMISSION_EXCLUSIVE) != 0 ||
+            (state & PASS_ADMISSION_COUNT) == PASS_ADMISSION_COUNT) {
+            return false;
+        }
+        if (e->pass_admission.compare_exchange_weak(
+                state, state + 1, std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            return true;
+        }
+    }
+}
+
+static void leave_pass_admission(Engine *e) {
+    const uint32_t previous =
+        e->pass_admission.fetch_sub(1, std::memory_order_acq_rel);
+    if ((previous & PASS_ADMISSION_EXCLUSIVE) != 0 ||
+        (previous & PASS_ADMISSION_COUNT) == 0) {
+        std::abort();
+    }
+}
+
+static void clear_slot_request(PassSlot *slot) {
+    slot->submission = {};
+    slot->completion = {};
+    slot->request = REQ_NONE;
+    slot->context_id = 0;
+    slot->continuation = nullptr;
+    slot->continuation_context = nullptr;
+    slot->mlp = {};
+    slot->conv = {};
+    slot->attn = {};
+    slot->prng = {};
+    slot->sample = {};
+    slot->depth_req = {};
+    slot->depthwise_stream = {};
+    slot->gemm = {};
+    slot->fft_conv_dd = {};
+    slot->irfft_dd = {};
+    slot->model = nullptr;
+    slot->depth = nullptr;
+    slot->tok = {};
+    slot->prefill = {};
+    slot->mimi = {};
+    slot->audio.pass = {};
+    slot->audio.start_gemm_generation =
+        slot->audio.gemm_generation.load(std::memory_order_relaxed);
+    slot->audio.done.store(true, std::memory_order_relaxed);
+}
+
+static PassSlot *reserve_pass_slot(Engine *e) {
+    if (!enter_pass_admission(e)) return nullptr;
+    for (PassSlot &slot : e->slots) {
+        uint64_t expected = pass_slot_lease(0, PASS_SLOT_FREE);
+        if (!slot.lease.compare_exchange_strong(
+                expected, pass_slot_lease(0, PASS_SLOT_CLAIMING),
+                std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            continue;
+        }
+        constexpr uint64_t max_generation =
+            UINT64_MAX >> PASS_SLOT_STATE_BITS;
+        uint64_t generation =
+            (slot.reservation_sequence.fetch_add(1,
+                                                 std::memory_order_acq_rel) +
+             1) & max_generation;
+        while (generation == 0) {
+            generation =
+                slot.reservation_sequence.fetch_add(1,
+                                                    std::memory_order_acq_rel) + 1;
+            generation &= max_generation;
+        }
+        clear_slot_request(&slot);
+        /* CLAIMING is deliberately non-releasable. A stale owner cannot see a
+         * recycled RESERVED state until the new generation is published. */
+        slot.lease.store(pass_slot_lease(generation, PASS_SLOT_RESERVED),
+                         std::memory_order_release);
+        const uint32_t live =
+            e->pass_slots_live.fetch_add(1, std::memory_order_acq_rel) + 1;
+        update_slot_high_water(e, live);
+        if (e->test_live_target.load(std::memory_order_relaxed) != 0)
+            signal_all(&e->dispatch_word);
+        return &slot;
+    }
+    leave_pass_admission(e);
+    return nullptr;
+}
+
+static bool release_pass_slot(PassSlot *slot, uint64_t generation) {
+    if (!slot || generation == 0) return false;
+    Engine *e = slot->engine;
+    if (!transition_slot(slot, generation, PASS_SLOT_RESERVED,
+                         PASS_SLOT_RELEASING) &&
+        !transition_slot(slot, generation, PASS_SLOT_COMPLETE,
+                         PASS_SLOT_RELEASING)) {
+        return false;
+    }
+    clear_slot_request(slot);
+    e->pass_slots_live.fetch_sub(1, std::memory_order_acq_rel);
+    leave_pass_admission(e);
+    /* FREE is the final publication edge. Publishing it before the accounting
+     * decrements lets a recycler increment live 2 -> 3 on a two-slot engine. */
+    slot->lease.store(pass_slot_lease(0, PASS_SLOT_FREE),
+                      std::memory_order_release);
+    if (e->test_live_target.load(std::memory_order_relaxed) != 0)
+        signal_all(&e->dispatch_word);
+    return true;
+}
+
+static void swap_depth_scratch(DepthScratch &left, DepthScratch &right) {
+    left.x.swap(right.x);
+    left.h.swap(right.h);
+    left.xn.swap(right.xn);
+    left.qkv_b.swap(right.qkv_b);
+    left.y_b.swap(right.y_b);
+    left.attn_b.swap(right.attn_b);
+    left.t_b.swap(right.t_b);
+    left.k_plane.swap(right.k_plane);
+    left.v_plane.swap(right.v_plane);
+    left.logits_b.swap(right.logits_b);
+    left.din_b.swap(right.din_b);
+    left.df_b.swap(right.df_b);
+    left.qkv_f.swap(right.qkv_f);
+    left.up_f.swap(right.up_f);
+    left.q_f.swap(right.q_f);
+    left.attn_f.swap(right.attn_f);
+    left.proj_f.swap(right.proj_f);
+    left.partials.swap(right.partials);
+}
+
+static void swap_scratch(Engine *e, ScratchBank &scratch) {
+    e->sc_partials.swap(scratch.sc_partials);
+    e->sc_gu.swap(scratch.sc_gu);
+    e->sc_xn.swap(scratch.sc_xn);
+    e->sc_t.swap(scratch.sc_t);
+    e->sc_bcxf.swap(scratch.sc_bcxf);
+    e->sc_projf.swap(scratch.sc_projf);
+    e->sc_bcxb.swap(scratch.sc_bcxb);
+    e->sc_conv.swap(scratch.sc_conv);
+    e->sc_projb.swap(scratch.sc_projb);
+    e->sc_stage.swap(scratch.sc_stage);
+    e->sc_mid.swap(scratch.sc_mid);
+    e->at_qkvf.swap(scratch.at_qkvf);
+    e->at_att.swap(scratch.at_att);
+    e->at_qkvb.swap(scratch.at_qkvb);
+    e->at_y.swap(scratch.at_y);
+    e->tk_h0.swap(scratch.tk_h0);
+    e->tk_h1.swap(scratch.tk_h1);
+    e->tk_logf.swap(scratch.tk_logf);
+    e->sample_weights.swap(scratch.sample_weights);
+    e->sample_heap.swap(scratch.sample_heap);
+    e->sample_lane_value.swap(scratch.sample_lane_value);
+    e->sample_lane_sum.swap(scratch.sample_lane_sum);
+    e->sample_lane_index.swap(scratch.sample_lane_index);
+    std::swap(e->sample_maximum, scratch.sample_maximum);
+    std::swap(e->sample_threshold, scratch.sample_threshold);
+    std::swap(e->sample_target, scratch.sample_target);
+    std::swap(e->sample_winner_lane, scratch.sample_winner_lane);
+    e->fft_twiddles.swap(scratch.fft_twiddles);
+    e->irfft_twiddles.swap(scratch.irfft_twiddles);
+    e->fft_work.swap(scratch.fft_work);
+    std::swap(e->fft_twiddle_size, scratch.fft_twiddle_size);
+    std::swap(e->irfft_twiddle_size, scratch.irfft_twiddle_size);
+    swap_depth_scratch(e->depth_scratch, scratch.depth);
+}
+
+static void activate_slot(Engine *e, PassSlot *slot) {
+    swap_scratch(e, slot->scratch);
+    e->active_slot = slot;
+    e->model = slot->model;
+    e->active_depth = slot->depth;
+    e->conv = slot->conv;
+    e->attn = slot->attn;
+    e->prng = slot->prng;
+    e->sample = slot->sample;
+    e->depth_req = slot->depth_req;
+    e->depthwise_stream = slot->depthwise_stream;
+    e->gemm = slot->gemm;
+    e->fft_conv_dd = slot->fft_conv_dd;
+    e->irfft_dd = slot->irfft_dd;
+    e->tok = slot->tok;
+    e->prefill = slot->prefill;
+    e->mimi = slot->mimi;
+    if (slot->request == REQ_MLP) {
+        Pass *pass = &e->pass;
+        pass->x = slot->mlp.x;
+        pass->norm_w = slot->mlp.norm_w;
+        pass->w1 = slot->mlp.w1;
+        pass->w3 = slot->mlp.w3;
+        pass->w2 = slot->mlp.w2;
+        pass->out = slot->mlp.out;
+        pass->h = slot->mlp.h;
+        pass->i = slot->mlp.i;
+        pass->tiles = slot->mlp.tiles;
+        pass->eps = slot->mlp.eps;
+        pass->partials = e->sc_partials.data();
+        pass->xn = e->sc_xn.data();
+        pass->gu = e->sc_gu.data();
+        pass->t = e->sc_t.data();
+        pass->rs_bits.store(0, std::memory_order_relaxed);
+    }
+}
+
+static void deactivate_slot(Engine *e, PassSlot *slot) {
+    e->active_slot = nullptr;
+    e->model = nullptr;
+    e->active_depth = nullptr;
+    swap_scratch(e, slot->scratch);
+}
+
+// Compatibility calls remain mutually exclusive at the raw C ABI, but their
+// request payload and scratch live in a capacity-2 PassSlot. Native
+// continuations bypass this compatibility claim and enter pass_admission
+// directly, so one synchronous caller may queue beside one native ticket.
 class PassClaim {
   public:
     explicit PassClaim(Engine *engine) : engine_(engine) {
@@ -597,15 +1049,67 @@ class PassClaim {
         held_ = engine_ && engine_->pass_claimed.compare_exchange_strong(
                                expected, true, std::memory_order_acq_rel,
                                std::memory_order_acquire);
+        if (held_) {
+            slot_ = reserve_pass_slot(engine_);
+            if (!slot_) {
+                engine_->pass_claimed.store(false, std::memory_order_release);
+                held_ = false;
+            } else {
+                generation_ = slot_generation(slot_);
+            }
+        }
     }
 
     ~PassClaim() {
-        if (held_) engine_->pass_claimed.store(false, std::memory_order_release);
+        if (!held_) return;
+        if (slot_) (void)release_pass_slot(slot_, generation_);
+        engine_->pass_claimed.store(false, std::memory_order_release);
     }
 
     explicit operator bool() const { return held_; }
+    PassSlot *slot() const { return slot_; }
     PassClaim(const PassClaim &) = delete;
     PassClaim &operator=(const PassClaim &) = delete;
+
+  private:
+    Engine *engine_ = nullptr;
+    PassSlot *slot_ = nullptr;
+    uint64_t generation_ = 0;
+    bool held_ = false;
+};
+
+// Plan installation/removal and all-slot sizing need stronger exclusion than a
+// compatibility PassClaim: an asynchronous continuation may exist without
+// pass_claimed. The admission high bit excludes both queued and running slots
+// and prevents a new slot from appearing until mutation is complete.
+class PlanClaim {
+  public:
+    explicit PlanClaim(Engine *engine) : engine_(engine) {
+        bool expected = false;
+        if (!engine_ || !engine_->pass_claimed.compare_exchange_strong(
+                            expected, true, std::memory_order_acq_rel,
+                            std::memory_order_acquire)) {
+            return;
+        }
+        uint32_t idle = 0;
+        held_ = engine_->pass_admission.compare_exchange_strong(
+            idle, PASS_ADMISSION_EXCLUSIVE, std::memory_order_acq_rel,
+            std::memory_order_acquire);
+        if (!held_)
+            engine_->pass_claimed.store(false, std::memory_order_release);
+    }
+
+    ~PlanClaim() {
+        if (!held_) return;
+        const uint32_t previous = engine_->pass_admission.exchange(
+            0, std::memory_order_release);
+        if (previous != PASS_ADMISSION_EXCLUSIVE) std::abort();
+        engine_->pass_claimed.store(false, std::memory_order_release);
+    }
+
+    explicit operator bool() const { return held_; }
+    PlanClaim(const PlanClaim &) = delete;
+    PlanClaim &operator=(const PlanClaim &) = delete;
 
   private:
     Engine *engine_ = nullptr;
@@ -819,6 +1323,23 @@ static void run_tile(uint32_t kind, uint32_t idx, const Stage *st, Engine *e) {
 static inline void signal_all(WaitWord *word) {
     kc_atomic_u32_fetch_add_release(&word->value, 1);
     kc_port_wake_u32_all(word->wait);
+}
+
+static void pause_test_boundary(Engine *e, std::atomic<uint32_t> *state) {
+    uint32_t armed = 1;
+    if (!state->compare_exchange_strong(armed, 2, std::memory_order_acq_rel,
+                                        std::memory_order_acquire)) {
+        return;
+    }
+    signal_all(&e->dispatch_word);
+    uint32_t observed = kc_atomic_u32_load_acquire(&e->dispatch_word.value);
+    while (state->load(std::memory_order_acquire) == 2 &&
+           !e->retire.load(std::memory_order_acquire)) {
+        (void)kc_port_wait_u32(e->dispatch_word.wait, observed, 0);
+        observed = kc_atomic_u32_load_acquire(&e->dispatch_word.value);
+    }
+    state->store(0, std::memory_order_release);
+    signal_all(&e->dispatch_word);
 }
 
 // One stage boundary. `serial` runs exactly once, on the last arriver, AFTER every
@@ -1073,13 +1594,14 @@ static inline void depth_gemv(const LfmDepthBufferV1 &weight, const uint16_t *x,
 static void depth_norm(Engine *e, uint32_t lane, const uint16_t *x,
                        const LfmDepthBufferV1 &weight, uint16_t *out) {
     DepthPlan &d = *e->active_depth;
+    DepthScratch &scratch = e->depth_scratch;
     size_t begin = 0, end = 0;
     depth_band(d.dim, lane, e->lanes_total, &begin, &end);
-    d.partials[lane] = end > begin
-                           ? lfm_bf16_sumsq_f32(x + begin, (int)(end - begin))
-                           : 0.0f;
+    scratch.partials[lane] =
+        end > begin ? lfm_bf16_sumsq_f32(x + begin, (int)(end - begin))
+                    : 0.0f;
     lane_fence(e, lane, [] {});
-    float total = lfm_sum_f32(d.partials, e->lanes_total);
+    float total = lfm_sum_f32(scratch.partials.data(), e->lanes_total);
     const float inv_rms = lfm_inv_rms_f32(total, d.dim, d.eps);
     if (end > begin)
         lfm_bf16_rmsnorm(
@@ -1108,6 +1630,7 @@ static void depth_qk_head(const DepthPlan &d, const uint16_t *src,
 // and recurrence, now using the zero-spin native fence.
 static void run_depth_frame(Engine *e, uint32_t lane) {
     DepthPlan &d = *e->active_depth;
+    DepthScratch &scratch = e->depth_scratch;
     const DepthReq &request = e->depth_req;
     const uint32_t lanes = e->lanes_total;
     const size_t qkv_rows = d.dim + 2 * d.kv_heads * d.hd;
@@ -1117,26 +1640,29 @@ static void run_depth_frame(Engine *e, uint32_t lane) {
     // depth_linear(hidden) + bias -> one row per codebook.
     depth_gemv({reinterpret_cast<uintptr_t>(d.depth_linear_w),
                 d.codebooks * d.dim * d.backbone_dim},
-               request.hidden, d.proj_f.data(), d.codebooks * d.dim,
+               request.hidden, scratch.proj_f.data(), d.codebooks * d.dim,
                d.backbone_dim, lane, lanes);
     size_t begin = 0, end = 0;
     depth_band(d.codebooks * d.dim, lane, lanes, &begin, &end);
     if (end > begin)
-        lfm_bf16_bias_add_f32(d.proj_f.data() + begin,
+        lfm_bf16_bias_add_f32(scratch.proj_f.data() + begin,
                               d.depth_linear_b + begin * sizeof(uint16_t),
                               end - begin);
     if (end > begin)
-        lfm_f32_to_bf16(d.proj_f.data() + begin, d.din_b.data() + begin,
+        lfm_f32_to_bf16(scratch.proj_f.data() + begin,
+                        scratch.din_b.data() + begin,
                         (int)(end - begin));
     depth_band(d.dim, lane, lanes, &begin, &end);
-    std::fill(d.df_b.begin() + begin, d.df_b.begin() + end, (uint16_t)0);
+    std::fill(scratch.df_b.begin() + begin, scratch.df_b.begin() + end,
+              (uint16_t)0);
     lane_fence(e, lane, [] {});
 
     for (size_t codebook = 0; codebook < d.codebooks; ++codebook) {
         depth_band(d.dim, lane, lanes, &begin, &end);
         if (end > begin)
-            lfm_bf16_add(d.din_b.data() + codebook * d.dim + begin,
-                         d.df_b.data() + begin, d.x.data() + begin,
+            lfm_bf16_add(scratch.din_b.data() + codebook * d.dim + begin,
+                         scratch.df_b.data() + begin,
+                         scratch.x.data() + begin,
                          (int)(end - begin));
         lane_fence(e, lane, [] {});
 
@@ -1144,12 +1670,15 @@ static void run_depth_frame(Engine *e, uint32_t lane) {
             const LfmDepthLayerV1 &weights = d.layers[layer];
             const size_t cache_base = layer * d.kv_heads * d.codebooks * d.hd;
 
-            depth_norm(e, lane, d.x.data(), weights.op_norm, d.xn.data());
-            depth_gemv(weights.qkv_w, d.xn.data(), d.qkv_f.data(), qkv_rows,
+            depth_norm(e, lane, scratch.x.data(), weights.op_norm,
+                       scratch.xn.data());
+            depth_gemv(weights.qkv_w, scratch.xn.data(), scratch.qkv_f.data(),
+                       qkv_rows,
                        d.dim, lane, lanes);
             depth_band(qkv_rows, lane, lanes, &begin, &end);
             if (end > begin)
-                lfm_f32_to_bf16(d.qkv_f.data() + begin, d.qkv_b.data() + begin,
+                lfm_f32_to_bf16(scratch.qkv_f.data() + begin,
+                                scratch.qkv_b.data() + begin,
                                 (int)(end - begin));
             lane_fence(e, lane, [] {});
 
@@ -1158,19 +1687,22 @@ static void run_depth_frame(Engine *e, uint32_t lane) {
             for (size_t head = begin; head < end; ++head) {
                 if (head < d.heads_total) {
                     uint16_t bits[128];
-                    depth_qk_head(d, d.qkv_b.data() + head * d.hd,
+                    depth_qk_head(d, scratch.qkv_b.data() + head * d.hd,
                                   weights.q_ln, bits, codebook);
-                    lfm_bf16_to_f32(bits, d.q_f.data() + head * d.hd, (int)d.hd);
+                    lfm_bf16_to_f32(bits,
+                                    scratch.q_f.data() + head * d.hd,
+                                    (int)d.hd);
                     continue;
                 }
                 const size_t kv = head - d.heads_total;
-                uint16_t *key = d.k_plane.data() + cache_base +
+                uint16_t *key = scratch.k_plane.data() + cache_base +
                                 (kv * d.codebooks + codebook) * d.hd;
-                depth_qk_head(d, d.qkv_b.data() + d.dim + kv * d.hd,
+                depth_qk_head(d,
+                              scratch.qkv_b.data() + d.dim + kv * d.hd,
                               weights.k_ln, key, codebook);
-                const uint16_t *value = d.qkv_b.data() + d.dim +
+                const uint16_t *value = scratch.qkv_b.data() + d.dim +
                                         d.kv_heads * d.hd + kv * d.hd;
-                std::memcpy(d.v_plane.data() + cache_base +
+                std::memcpy(scratch.v_plane.data() + cache_base +
                                 (kv * d.codebooks + codebook) * d.hd,
                             value, d.hd * sizeof(uint16_t));
             }
@@ -1181,70 +1713,84 @@ static void run_depth_frame(Engine *e, uint32_t lane) {
             for (size_t query = begin; query < end; ++query) {
                 float attention[64];
                 const size_t kv = query / group;
-                lfm_attn_qk_bf16(d.q_f.data() + query * d.hd,
-                                  d.k_plane.data() + cache_base +
+                lfm_attn_qk_bf16(scratch.q_f.data() + query * d.hd,
+                                  scratch.k_plane.data() + cache_base +
                                       kv * d.codebooks * d.hd,
                                   attention, live, (int)d.hd);
                 lfm_softmax_scaled_f32(attention, live, attn_scale);
                 lfm_attn_av_bf16(attention,
-                                  d.v_plane.data() + cache_base +
+                                  scratch.v_plane.data() + cache_base +
                                       kv * d.codebooks * d.hd,
-                                  d.attn_f.data() + query * d.hd, live, (int)d.hd);
+                                  scratch.attn_f.data() + query * d.hd, live,
+                                  (int)d.hd);
             }
             lane_fence(e, lane, [] {});
 
             depth_band(d.dim, lane, lanes, &begin, &end);
             if (end > begin)
-                lfm_f32_to_bf16(d.attn_f.data() + begin, d.attn_b.data() + begin,
+                lfm_f32_to_bf16(scratch.attn_f.data() + begin,
+                                scratch.attn_b.data() + begin,
                                 (int)(end - begin));
             lane_fence(e, lane, [] {});
 
-            depth_gemv(weights.out_w, d.attn_b.data(), d.proj_f.data(), d.dim,
+            depth_gemv(weights.out_w, scratch.attn_b.data(),
+                       scratch.proj_f.data(), d.dim,
                        d.dim, lane, lanes);
             depth_band(d.dim, lane, lanes, &begin, &end);
             if (end > begin) {
-                lfm_f32_to_bf16(d.proj_f.data() + begin, d.y_b.data() + begin,
+                lfm_f32_to_bf16(scratch.proj_f.data() + begin,
+                                scratch.y_b.data() + begin,
                                 (int)(end - begin));
-                lfm_bf16_add(d.y_b.data() + begin, d.x.data() + begin,
-                             d.h.data() + begin, (int)(end - begin));
+                lfm_bf16_add(scratch.y_b.data() + begin,
+                             scratch.x.data() + begin,
+                             scratch.h.data() + begin, (int)(end - begin));
             }
             lane_fence(e, lane, [] {});
 
-            depth_norm(e, lane, d.h.data(), weights.ffn_norm, d.xn.data());
-            depth_gemv(weights.w1, d.xn.data(), d.proj_f.data(), d.ffn, d.dim,
+            depth_norm(e, lane, scratch.h.data(), weights.ffn_norm,
+                       scratch.xn.data());
+            depth_gemv(weights.w1, scratch.xn.data(), scratch.proj_f.data(),
+                       d.ffn, d.dim,
                        lane, lanes);
-            depth_gemv(weights.w3, d.xn.data(), d.up_f.data(), d.ffn, d.dim,
+            depth_gemv(weights.w3, scratch.xn.data(), scratch.up_f.data(),
+                       d.ffn, d.dim,
                        lane, lanes);
             depth_band(d.ffn, lane, lanes, &begin, &end);
             if (end > begin)
-                lfm_swiglu_bf16(d.proj_f.data() + begin, d.up_f.data() + begin,
-                                d.t_b.data() + begin, (int)(end - begin));
+                lfm_swiglu_bf16(scratch.proj_f.data() + begin,
+                                scratch.up_f.data() + begin,
+                                scratch.t_b.data() + begin, (int)(end - begin));
             lane_fence(e, lane, [] {});
 
-            depth_gemv(weights.w2, d.t_b.data(), d.proj_f.data(), d.dim, d.ffn,
+            depth_gemv(weights.w2, scratch.t_b.data(), scratch.proj_f.data(),
+                       d.dim, d.ffn,
                        lane, lanes);
             depth_band(d.dim, lane, lanes, &begin, &end);
             if (end > begin) {
-                lfm_f32_to_bf16(d.proj_f.data() + begin, d.y_b.data() + begin,
+                lfm_f32_to_bf16(scratch.proj_f.data() + begin,
+                                scratch.y_b.data() + begin,
                                 (int)(end - begin));
-                lfm_bf16_add(d.y_b.data() + begin, d.h.data() + begin,
-                             d.x.data() + begin, (int)(end - begin));
+                lfm_bf16_add(scratch.y_b.data() + begin,
+                             scratch.h.data() + begin,
+                             scratch.x.data() + begin, (int)(end - begin));
             }
             lane_fence(e, lane, [] {});
         }
 
         const LfmDepthHeadV1 &head = d.heads[codebook];
-        depth_norm(e, lane, d.x.data(), head.norm, d.xn.data());
-        depth_gemv(head.logits, d.xn.data(), d.proj_f.data(), head.vocab, d.dim,
+        depth_norm(e, lane, scratch.x.data(), head.norm, scratch.xn.data());
+        depth_gemv(head.logits, scratch.xn.data(), scratch.proj_f.data(),
+                   head.vocab, d.dim,
                    lane, lanes);
         depth_band(head.vocab, lane, lanes, &begin, &end);
         if (end > begin)
-            lfm_f32_to_bf16(d.proj_f.data() + begin, d.logits_b.data() + begin,
+            lfm_f32_to_bf16(scratch.proj_f.data() + begin,
+                            scratch.logits_b.data() + begin,
                             (int)(end - begin));
         lane_fence(e, lane, [] {});
 
         SampleReq sample = {
-            .logits = d.logits_b.data(),
+            .logits = scratch.logits_b.data(),
             .count = head.vocab,
             .dtype = SAMPLE_BF16,
             .config = request.sampler,
@@ -1258,7 +1804,7 @@ static void run_depth_frame(Engine *e, uint32_t lane) {
         lfm_bf16_copy_bytes(
             depth_bytes(head.embedding) +
                 (token * d.dim + begin) * sizeof(uint16_t),
-            d.df_b.data() + begin, end - begin);
+            scratch.df_b.data() + begin, end - begin);
         lane_fence(e, lane, [] {});
     }
 }
@@ -2037,6 +2583,74 @@ static void run_gemm(Engine *e, uint32_t lane) {
                              (int)request.n, (int)request.k);
 }
 
+static int execute_audio_encode(Engine *e, AudioReq &audio) {
+    const LfmAudioEncodePassV1 &pass = audio.pass;
+    *pass.out_adapted_values = 0;
+
+    LfmF32Span samples{};
+    int status = lfm_resampler_process(
+        pass.resampler, pass.resampler_workspace, pass.pcm,
+        pass.sample_count, pass.resampled, pass.resampled_capacity, &samples);
+    if (status != 0) return status;
+
+    const uint64_t frames = lfm_frontend_seq_len(pass.frontend, samples.length);
+    if (frames == 0) return -EINVAL;
+    status = lfm_frontend_forward_bf16_workspace(
+        pass.frontend, pass.frontend_workspace, samples.data, samples.length,
+        pass.mel, pass.mel_capacity);
+    if (status != 0) return status;
+
+    const uint64_t rows = lfm_conformer_out_rows(pass.conformer, frames);
+    const uint64_t width = lfm_conformer_out_width(pass.conformer);
+    if (rows == 0 || width == 0 || rows > UINT64_MAX / width) {
+        return rows == 0 || width == 0 ? -EINVAL : -EOVERFLOW;
+    }
+    const uint64_t values = rows * width;
+    if (values > pass.adapted_capacity) return -ENOBUFS;
+    if (e->model && width != e->model->h) return -ESTALE;
+
+    status = lfm_conformer_forward_engine_team(
+        pass.conformer, pass.conformer_workspace, pass.mel, frames,
+        pass.adapted, pass.adapted_capacity);
+    if (status != 0) return status;
+    *pass.out_adapted_values = values;
+    return 0;
+}
+
+static void run_audio_encode(Engine *e, uint32_t lane) {
+    PassSlot *slot = e->active_slot;
+    if (!slot || slot->request != REQ_AUDIO_ENCODE) {
+        if (lane == 0) e->active_status.store(-EFAULT, std::memory_order_release);
+        return;
+    }
+    AudioReq &audio = slot->audio;
+    if (lane == 0) {
+        e->audio_encode_passes.fetch_add(1, std::memory_order_relaxed);
+        const int status = execute_audio_encode(e, audio);
+        e->active_status.store(status, std::memory_order_release);
+        audio.done.store(true, std::memory_order_release);
+        signal_all(&slot->audio_word);
+        return;
+    }
+
+    uint64_t seen = audio.start_gemm_generation;
+    uint32_t observed =
+        kc_atomic_u32_load_acquire(&slot->audio_word.value);
+    for (;;) {
+        const uint64_t generation =
+            audio.gemm_generation.load(std::memory_order_acquire);
+        if (generation != seen) {
+            seen = generation;
+            run_gemm(e, lane);
+            lane_fence(e, lane, [] {});
+            continue;
+        }
+        if (audio.done.load(std::memory_order_acquire)) return;
+        (void)kc_port_wait_u32(slot->audio_word.wait, observed, 0);
+        observed = kc_atomic_u32_load_acquire(&slot->audio_word.value);
+    }
+}
+
 static inline Dd dd_from_f32(float value) { return {value, 0.0f}; }
 
 static inline Dd dd_from_f64(double value) {
@@ -2211,6 +2825,24 @@ static void run_irfft_dd(Engine *e, uint32_t lane) {
     }
 }
 
+static void pause_irfft_lane_zero_for_test(Engine *e, uint32_t lane) {
+    if (lane != 0) return;
+    uint32_t armed = 1;
+    if (!e->test_lane_pause.compare_exchange_strong(
+            armed, 2, std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+        return;
+    }
+    signal_all(&e->dispatch_word);
+    while (e->test_lane_pause.load(std::memory_order_acquire) == 2 &&
+           !e->retire.load(std::memory_order_acquire)) {
+        const uint32_t observed =
+            kc_atomic_u32_load_acquire(&e->dispatch_word.value);
+        if (e->test_lane_pause.load(std::memory_order_acquire) != 2) break;
+        (void)kc_port_wait_u32(e->dispatch_word.wait, observed, 0);
+    }
+}
+
 // The per-generation program, dispatched identically on every lane; the final fence
 // proves ALL tiles landed before lane 0 signals the rim. Request payloads are written
 // by the rim before its doorbell and read-only for the whole generation.
@@ -2259,7 +2891,26 @@ static void lane_program(Engine *e, uint32_t lane) {
         run_fft_conv_dd(e, lane);
         break;
     case REQ_IRFFT_DD:
+        // Private deterministic shutdown-race seam. Ordinary model/audio/token
+        // requests never touch its atomic; only this conformance leaf checks it.
+        pause_irfft_lane_zero_for_test(e, lane);
         run_irfft_dd(e, lane);
+        break;
+    case REQ_MIMI_DECODE:
+        if (lane == 0) {
+            const int samples = mimi_decode_state_step(
+                e->mimi.state, e->mimi.codes, e->mimi.pcm);
+            if (samples < 0) {
+                e->active_status.store(samples, std::memory_order_release);
+            } else if (static_cast<size_t>(samples) > e->mimi.capacity) {
+                e->active_status.store(-EOVERFLOW, std::memory_order_release);
+            } else {
+                *e->mimi.out_samples = static_cast<size_t>(samples);
+            }
+        }
+        break;
+    case REQ_AUDIO_ENCODE:
+        run_audio_encode(e, lane);
         break;
     default:
         break;
@@ -2324,6 +2975,17 @@ static bool ticket_equal(const KcTicketIdV1 &a, const KcTicketIdV1 &b) {
            a.generation == b.generation && a.kind == b.kind;
 }
 
+static PassSlot *slot_from_payload(Engine *e, void *payload) {
+    if (!payload) return nullptr;
+    const uintptr_t base = reinterpret_cast<uintptr_t>(e->slots.data());
+    const uintptr_t address = reinterpret_cast<uintptr_t>(payload);
+    if (address < base) return nullptr;
+    const uintptr_t offset = address - base;
+    if (offset % sizeof(PassSlot) != 0) return nullptr;
+    const size_t index = offset / sizeof(PassSlot);
+    return index < e->slots.size() ? &e->slots[index] : nullptr;
+}
+
 static void publish_rejected(Engine *e, const KcSubmissionV1 &submission, int status) {
     KcCompletionV1 completion{};
     completion.size = sizeof(completion);
@@ -2339,10 +3001,11 @@ static void publish_rejected(Engine *e, const KcSubmissionV1 &submission, int st
     if (lfm_kernel_bridge_publish_completion(e->bridge, &completion) != 0) std::abort();
 }
 
-// The bridge dispatcher is mechanical: consume one retained descriptor, validate
-// its generation against the single request slot, and release-ring the lane team.
-// Model recurrence remains inside the native session; the host only docks audio
-// buffers and control tickets at the session boundary.
+// The bridge dispatcher is the sole SQ consumer and CQ consumer. It deliberately
+// dispatches one complete pass at a time: SQ depth buys a queued continuation,
+// never concurrent access to the lane board. Each descriptor names its immutable
+// PassSlot; that slot's scratch bank is mounted only for its exact ticket and is
+// returned before another ticket can execute.
 static void *bridge_main(void *arg) {
     Engine *e = (Engine *)arg;
     for (;;) {
@@ -2357,27 +3020,50 @@ static void *bridge_main(void *arg) {
         };
         int descriptor_rc = lfm_kernel_bridge_descriptor_get(
             e->bridge, submission.descriptor, &descriptor);
-        bool valid = descriptor_rc == 0 &&
+        PassSlot *slot = descriptor_rc == 0
+            ? slot_from_payload(e, descriptor.payload)
+            : nullptr;
+        const uint64_t slot_owner = slot ? slot_generation(slot) : 0;
+        // Acquiring the exact descriptor-named slot is what publishes its plain
+        // request fields. Never scan the other slot: its producer may be filling
+        // that independent record concurrently.
+        bool valid = slot &&
+                     slot_state(slot) == PASS_SLOT_SUBMITTED;
+        if (valid) {
+            valid =
                      submission.command == KC_COORD_COMMAND_RUN_PASS &&
                      submission.pass_budget == 1 &&
                      submission.ticket.kind == KC_COORD_TICKET_PASS &&
                      submission.epoch != 0 &&
-                     descriptor.payload == e && descriptor.flags == 0 &&
+                     descriptor.payload == slot && descriptor.flags == 0 &&
+                     slot->engine == e && slot->request == (int)descriptor.kind &&
+                     slot->context_id == submission.conversation_id &&
+                     ticket_equal(slot->submission.ticket, submission.ticket) &&
                      descriptor.kind > REQ_NONE &&
-                     descriptor.kind <= REQ_PREFILL;
+                     descriptor.kind <= REQ_AUDIO_ENCODE;
+        }
         if (valid) {
             switch (descriptor.kind) {
             case REQ_CONV_LAYER:
             case REQ_ATTN_LAYER:
             case REQ_TOKEN_PASS:
             case REQ_PREFILL:
-                valid = e->model && submission.conversation_id == e->model->id &&
-                        submission.epoch == e->model->id;
+            case REQ_MIMI_DECODE:
+                valid = slot->model &&
+                        submission.conversation_id == slot->model->id &&
+                        submission.epoch == slot->model->id;
+                break;
+            case REQ_AUDIO_ENCODE:
+                valid = slot->model
+                    ? submission.conversation_id == slot->model->id &&
+                          submission.epoch == slot->model->id
+                    : submission.conversation_id == 0 &&
+                          submission.epoch == 1;
                 break;
             case REQ_DEPTH_FRAME:
-                valid = e->active_depth &&
-                        submission.conversation_id == e->active_depth->id &&
-                        submission.epoch == e->active_depth->id;
+                valid = slot->depth &&
+                        submission.conversation_id == slot->depth->id &&
+                        submission.epoch == slot->depth->id;
                 break;
             default:
                 valid = submission.conversation_id == 0 && submission.epoch == 1;
@@ -2386,40 +3072,133 @@ static void *bridge_main(void *arg) {
         }
         if (!valid) {
             publish_rejected(e, submission, -ESTALE);
-            continue;
+        } else {
+            if (!transition_slot(slot, slot_owner, PASS_SLOT_SUBMITTED,
+                                 PASS_SLOT_RUNNING)) {
+                publish_rejected(e, submission, -ESTALE);
+                valid = false;
+            }
         }
 
-        e->active_status.store(0, std::memory_order_relaxed);
-        e->cur_req = (int)descriptor.kind;
-        e->active_submission = submission;
-        e->bridge_dispatches.fetch_add(1, std::memory_order_relaxed);
-        uint64_t generation = e->lane_gen.load(std::memory_order_relaxed) + 1;
-        e->lane_gen.store(generation, std::memory_order_release);
-        e->dispatch_wakes.fetch_add(1, std::memory_order_relaxed);
-        signal_all(&e->dispatch_word);
+        if (valid) {
+            activate_slot(e, slot);
+            e->active_status.store(0, std::memory_order_relaxed);
+            e->cur_req = slot->request;
+            e->active_submission = submission;
+            e->bridge_dispatches.fetch_add(1, std::memory_order_relaxed);
+            uint64_t generation = e->lane_gen.load(std::memory_order_relaxed) + 1;
+            e->lane_gen.store(generation, std::memory_order_release);
+            e->dispatch_wakes.fetch_add(1, std::memory_order_relaxed);
+            signal_all(&e->dispatch_word);
+        }
+
+        KcCompletionV1 completion{};
+        rc = lfm_kernel_bridge_wait_completion(e->bridge, &completion, 0);
+        if (rc != 0) {
+            // Once an SQ record is consumed, completion_head trails
+            // submission_tail until this exact record is published. Therefore
+            // bridge stop cannot satisfy wait_completion's cancellation
+            // predicate here. Never unmount scratch on an error edge while a
+            // lane could still hold its pointers.
+            std::abort();
+        }
+        if (valid) deactivate_slot(e, slot);
+        if (!slot || !ticket_equal(completion.ticket, submission.ticket) ||
+            completion.conversation_id != submission.conversation_id ||
+            completion.epoch != submission.epoch) {
+            std::abort();
+        }
+
+        slot->completion = completion;
+        const uint32_t completed_from = valid ? PASS_SLOT_RUNNING
+                                              : PASS_SLOT_SUBMITTED;
+        if (slot->continuation) {
+            if (!transition_slot(slot, slot_owner, completed_from,
+                                 PASS_SLOT_COMPLETING)) {
+                std::abort();
+            }
+            PassContinuation continuation = slot->continuation;
+            void *context = slot->continuation_context;
+            const uint64_t generation = slot_owner;
+            /* The CQ settles the old request, but not its slot lease. Reset the
+             * payload and hand the exact RESERVED slot to the callback under
+             * the same owner generation. No producer can steal it between CQ
+             * and a follow-on SQ publication. */
+            clear_slot_request(slot);
+            slot->lease.store(pass_slot_lease(generation,
+                                              PASS_SLOT_RESERVED),
+                              std::memory_order_release);
+            PassContinuationPermit permit = {
+                .engine = e,
+                .slot = slot,
+                .generation = generation,
+                .consumed = false,
+            };
+            try {
+                continuation(&permit, completion, context);
+            } catch (...) {
+                if (!permit.consumed &&
+                    !release_pass_slot(slot, generation)) {
+                    std::abort();
+                }
+                std::abort();
+            }
+            if (!permit.consumed) {
+                if (!release_pass_slot(slot, generation)) std::abort();
+            }
+            continue;
+        }
+        if (!transition_slot(slot, slot_owner, completed_from,
+                             PASS_SLOT_COMPLETE)) {
+            std::abort();
+        }
+        signal_all(&slot->completion_word);
     }
 }
 
-static int submit_pass(Engine *e, int request, uint64_t context_id = 0) {
-    uint64_t sequence = ++e->submit_sequence;
-    if (sequence == 0) sequence = ++e->submit_sequence;
-    uint32_t ticket_generation = ++e->ticket_generation;
-    if (ticket_generation == 0) ticket_generation = ++e->ticket_generation;
+static uint64_t next_sequence(std::atomic<uint64_t> *counter) {
+    uint64_t sequence = counter->fetch_add(1, std::memory_order_acq_rel) + 1;
+    while (sequence == 0)
+        sequence = counter->fetch_add(1, std::memory_order_acq_rel) + 1;
+    return sequence;
+}
+
+static uint32_t next_generation(std::atomic<uint32_t> *counter) {
+    uint32_t generation = counter->fetch_add(1, std::memory_order_acq_rel) + 1;
+    while (generation == 0)
+        generation = counter->fetch_add(1, std::memory_order_acq_rel) + 1;
+    return generation;
+}
+
+static int submit_slot(Engine *e, PassSlot *slot, uint64_t generation,
+                       int request, uint64_t context_id,
+                       PassContinuation continuation,
+                       void *continuation_context) {
+    if (!e || !slot || slot->engine != e || request <= REQ_NONE ||
+        request > REQ_AUDIO_ENCODE || generation == 0 ||
+        slot->lease.load(std::memory_order_acquire) !=
+            pass_slot_lease(generation, PASS_SLOT_RESERVED)) {
+        return -EINVAL;
+    }
+    if (!transition_slot(slot, generation, PASS_SLOT_RESERVED,
+                         PASS_SLOT_SUBMITTING)) {
+        return -ESTALE;
+    }
+
+    const uint64_t sequence = next_sequence(&e->submit_sequence);
+    const uint32_t ticket_generation = next_generation(&e->ticket_generation);
 
     LfmKernelDescriptorSpecV1 descriptor_spec = {
         .size = sizeof(LfmKernelDescriptorSpecV1),
         .abi_version = KC_COORD_ABI_VERSION,
         .kind = (uint32_t)request,
         .flags = 0,
-        .payload = e,
+        .payload = slot,
         .context = nullptr,
         .release = nullptr,
         .reserved = {0, 0, 0},
     };
     KcDescriptorIdV1 descriptor{};
-    int rc = lfm_kernel_bridge_descriptor_create(e->bridge, &descriptor_spec, &descriptor);
-    if (rc != 0) return rc;
-
     KcSubmissionV1 submission{};
     submission.size = sizeof(submission);
     submission.abi_version = KC_COORD_ABI_VERSION;
@@ -2434,22 +3213,185 @@ static int submit_pass(Engine *e, int request, uint64_t context_id = 0) {
     submission.service_class = KC_COORD_SERVICE_INTERACTIVE;
     submission.pass_budget = 1;
 
-    KcCompletionV1 completion{};
-    rc = lfm_kernel_bridge_submit(e->bridge, &submission);
-    if (rc == 0) {
-        e->pass_submissions.fetch_add(1, std::memory_order_relaxed);
-        rc = lfm_kernel_bridge_wait_completion(e->bridge, &completion, 0);
-    }
-    int release_rc = lfm_kernel_bridge_descriptor_release(e->bridge, descriptor);
-    if (release_rc != 0) std::abort();
-    if (rc != 0) return rc;
+    slot->request = request;
+    slot->context_id = context_id;
+    slot->continuation = continuation;
+    slot->continuation_context = continuation_context;
 
-    if (!ticket_equal(completion.ticket, submission.ticket) ||
-        completion.conversation_id != submission.conversation_id ||
-        completion.epoch != submission.epoch) {
+    int rc = 0;
+    {
+        // The bridge SQ is SPSC. Native recurrence and compatibility callers
+        // share this tiny admission critical section; no model value or scratch
+        // is copied while it is held.
+        std::lock_guard<std::mutex> submit(e->submission_mutex);
+        rc = lfm_kernel_bridge_descriptor_create(e->bridge, &descriptor_spec,
+                                                 &descriptor);
+        if (rc == 0) {
+            submission.descriptor = descriptor;
+            slot->submission = submission;
+            // This is the publication edge for every plain request field and
+            // the final descriptor-bearing submission. The SQ consumer acquires
+            // this exact state before reading any of them.
+            slot->lease.store(pass_slot_lease(generation,
+                                              PASS_SLOT_SUBMITTED),
+                              std::memory_order_release);
+            rc = lfm_kernel_bridge_submit(e->bridge, &submission);
+            if (rc != 0)
+                slot->lease.store(pass_slot_lease(generation,
+                                                  PASS_SLOT_RESERVED),
+                                  std::memory_order_release);
+        }
+    }
+    if (descriptor.generation != 0) {
+        const int release_rc =
+            lfm_kernel_bridge_descriptor_release(e->bridge, descriptor);
+        if (release_rc != 0) std::abort();
+    }
+    if (rc != 0) {
+        if (slot_state(slot) == PASS_SLOT_SUBMITTING) {
+            slot->lease.store(pass_slot_lease(generation,
+                                              PASS_SLOT_RESERVED),
+                              std::memory_order_release);
+        }
+        return rc;
+    }
+    e->pass_submissions.fetch_add(1, std::memory_order_relaxed);
+    if (continuation)
+        e->continuation_submissions.fetch_add(1, std::memory_order_relaxed);
+    return 0;
+}
+
+static int submit_continuation(PassContinuationPermit *permit, int request,
+                               uint64_t context_id,
+                               PassContinuation continuation,
+                               void *continuation_context) {
+    if (!permit || permit->consumed || !permit->engine || !permit->slot ||
+        permit->slot->engine != permit->engine || permit->generation == 0 ||
+        permit->slot->lease.load(std::memory_order_acquire) !=
+            pass_slot_lease(permit->generation, PASS_SLOT_RESERVED)) {
         return -ESTALE;
     }
-    return completion.status;
+    const int rc = submit_slot(permit->engine, permit->slot,
+                               permit->generation, request,
+                               context_id, continuation,
+                               continuation_context);
+    if (rc == 0) permit->consumed = true;
+    return rc;
+}
+
+static bool release_continuation(PassContinuationPermit *permit) {
+    if (!permit || permit->consumed || !permit->slot) return false;
+    if (!release_pass_slot(permit->slot, permit->generation)) return false;
+    permit->consumed = true;
+    return true;
+}
+
+static int wait_submitted_slot(PassSlot *slot, uint64_t generation);
+
+static int submit_pass(Engine *e, PassSlot *slot, int request,
+                       uint64_t context_id = 0) {
+    const uint64_t generation = slot ? slot_generation(slot) : 0;
+    int rc = submit_slot(e, slot, generation, request, context_id, nullptr,
+                         nullptr);
+    if (rc != 0) return rc;
+    rc = wait_submitted_slot(slot, generation);
+    if (!release_pass_slot(slot, generation)) std::abort();
+    /* The pause is after FREE publication but before the owning PassClaim's
+     * destructor. It deterministically exposes the historical ABA window. */
+    pause_test_boundary(e, &e->test_claim_return_pause);
+    return rc;
+}
+
+static int wait_submitted_slot(PassSlot *slot, uint64_t generation) {
+    if (!slot || generation == 0) return -EINVAL;
+    int rc = 0;
+
+    uint32_t observed =
+        kc_atomic_u32_load_acquire(&slot->completion_word.value);
+    while (slot->lease.load(std::memory_order_acquire) !=
+           pass_slot_lease(generation, PASS_SLOT_COMPLETE)) {
+        rc = kc_port_wait_u32(slot->completion_word.wait, observed, 0);
+        observed = kc_atomic_u32_load_acquire(&slot->completion_word.value);
+        if (rc != 0 &&
+            slot->lease.load(std::memory_order_acquire) !=
+                pass_slot_lease(generation, PASS_SLOT_COMPLETE)) {
+            // Infinite-deadline waits absorb interrupts. Any remaining wait
+            // failure cannot safely return borrowed buffers while this ticket
+            // may still be executing.
+            std::abort();
+        }
+    }
+    const KcCompletionV1 completion = slot->completion;
+
+    if (!ticket_equal(completion.ticket, slot->submission.ticket) ||
+        completion.conversation_id != slot->submission.conversation_id ||
+        completion.epoch != slot->submission.epoch) {
+        rc = -ESTALE;
+    } else {
+        rc = completion.status;
+    }
+    return rc;
+}
+
+// Private implementation-backed proof of the completion-continuation contract.
+// One exact slot is handed directly from CQ to its callback and resubmitted
+// without pass_claimed. Adversarial tests occupy the peer slot and delay an old
+// compatibility claim destructor to prove both capacity-2 ownership edges.
+struct PrngContinuationChain {
+    WaitWord done;
+    LfmPrngStateV1 *state = nullptr;
+    uint64_t *out = nullptr;
+    size_t count = 0;
+    size_t next = 0;
+    std::atomic<int> status{0};
+    std::atomic<bool> finished{false};
+};
+
+static void finish_prng_chain(PrngContinuationChain *chain, int status) {
+    if (status != 0) {
+        int expected = 0;
+        chain->status.compare_exchange_strong(
+            expected, status, std::memory_order_acq_rel,
+            std::memory_order_acquire);
+    }
+    chain->finished.store(true, std::memory_order_release);
+    signal_all(&chain->done);
+}
+
+static void continue_prng_chain(PassContinuationPermit *permit,
+                                const KcCompletionV1 &completion,
+                                void *context) noexcept {
+    PrngContinuationChain *chain =
+        static_cast<PrngContinuationChain *>(context);
+    if (!chain || completion.status != 0) {
+        const int status = completion.status != 0 ? completion.status : -EFAULT;
+        if (!release_continuation(permit)) std::abort();
+        if (chain) finish_prng_chain(chain, status);
+        return;
+    }
+    if (chain->next == chain->count) {
+        if (!release_continuation(permit)) std::abort();
+        finish_prng_chain(chain, 0);
+        return;
+    }
+
+    if (!permit || !permit->engine || !permit->slot) {
+        finish_prng_chain(chain, -ESTALE);
+        return;
+    }
+    pause_test_boundary(permit->engine,
+                        &permit->engine->test_continuation_pause);
+    const size_t index = chain->next++;
+    permit->slot->prng = {
+        .state = chain->state,
+        .out = chain->out + index,
+        .count = 1,
+    };
+    const int rc = submit_continuation(permit, REQ_PRNG, 0,
+                                       continue_prng_chain, chain);
+    if (rc == 0) return;
+    if (!release_continuation(permit)) std::abort();
+    finish_prng_chain(chain, rc);
 }
 
 } // namespace
@@ -2471,6 +3413,25 @@ void *lfm_engine_new(int workers) {
         e->runtime_epoch = next_engine_epoch.fetch_add(1, std::memory_order_acq_rel);
     e->lanes_total = (uint32_t)workers;
     e->n_workers = workers;
+    for (size_t index = 0; index < e->slots.size(); ++index) {
+        PassSlot &slot = e->slots[index];
+        slot.engine = e;
+        slot.index = (uint32_t)index;
+        if (!kc_atomic_u32_is_lock_free(&slot.completion_word.value) ||
+            kc_port_wait_u32_prepare(&slot.completion_word.value,
+                                     &slot.completion_word.wait) != 0) {
+            lfm_engine_free(e);
+            return nullptr;
+        }
+        e->slot_waits_prepared++;
+        if (!kc_atomic_u32_is_lock_free(&slot.audio_word.value) ||
+            kc_port_wait_u32_prepare(&slot.audio_word.value,
+                                     &slot.audio_word.wait) != 0) {
+            lfm_engine_free(e);
+            return nullptr;
+        }
+        e->audio_waits_prepared++;
+    }
     if (!kc_atomic_u32_is_lock_free(&e->dispatch_word.value) ||
         kc_port_wait_u32_prepare(&e->dispatch_word.value, &e->dispatch_word.wait) != 0) {
         lfm_engine_free(e);
@@ -2487,7 +3448,7 @@ void *lfm_engine_new(int workers) {
     LfmKernelBridgeConfigV1 bridge_config = {
         .size = sizeof(LfmKernelBridgeConfigV1),
         .abi_version = KC_COORD_ABI_VERSION,
-        .capacity = 1,
+        .capacity = (uint32_t)PASS_CAPACITY,
         .descriptor_capacity = 8,
     };
     if (lfm_kernel_bridge_create(&bridge_config, &e->bridge) != 0) {
@@ -2513,12 +3474,191 @@ void *lfm_engine_new(int workers) {
 
 void lfm_engine_request_stop(void *ep) {
     Engine *e = (Engine *)ep;
-    if (e && e->bridge) lfm_kernel_bridge_request_stop(e->bridge);
+    if (!e) return;
+    if (e->bridge) lfm_kernel_bridge_request_stop(e->bridge);
+    const bool wake_test =
+        e->test_lane_pause.exchange(0, std::memory_order_acq_rel) != 0 ||
+        e->test_claim_return_pause.exchange(0, std::memory_order_acq_rel) != 0 ||
+        e->test_continuation_pause.exchange(0,
+                                            std::memory_order_acq_rel) != 0 ||
+        e->test_live_target.exchange(0, std::memory_order_acq_rel) != 0;
+    if (wake_test)
+        signal_all(&e->dispatch_word);
+}
+
+int lfm_internal_engine_arm_lane_pause_for_test(void *ep) {
+    Engine *e = static_cast<Engine *>(ep);
+    if (!e) return -EINVAL;
+    uint32_t idle = 0;
+    return e->test_lane_pause.compare_exchange_strong(
+               idle, 1, std::memory_order_acq_rel,
+               std::memory_order_acquire)
+        ? 0
+        : -EBUSY;
+}
+
+int lfm_internal_engine_wait_lane_pause_for_test(void *ep) {
+    Engine *e = static_cast<Engine *>(ep);
+    if (!e) return -EINVAL;
+    for (;;) {
+        const uint32_t state =
+            e->test_lane_pause.load(std::memory_order_acquire);
+        if (state == 2) return 0;
+        if (state == 0) return -ECANCELED;
+        uint32_t observed =
+            kc_atomic_u32_load_acquire(&e->dispatch_word.value);
+        if (e->test_lane_pause.load(std::memory_order_acquire) != 1) continue;
+        const int rc = kc_port_wait_u32(e->dispatch_word.wait, observed, 0);
+        if (rc != 0 &&
+            e->test_lane_pause.load(std::memory_order_acquire) == 1) {
+            return rc;
+        }
+    }
+}
+
+int lfm_internal_engine_pause_boundary_for_test(void *ep, uint32_t kind,
+                                                uint32_t action) {
+    Engine *e = static_cast<Engine *>(ep);
+    if (!e || (kind != 1 && kind != 2) || action < 1 || action > 3) {
+        return -EINVAL;
+    }
+    std::atomic<uint32_t> *state = kind == 1
+        ? &e->test_claim_return_pause
+        : &e->test_continuation_pause;
+    if (action == 1) {
+        uint32_t idle = 0;
+        return state->compare_exchange_strong(
+                   idle, 1, std::memory_order_acq_rel,
+                   std::memory_order_acquire)
+            ? 0
+            : -EBUSY;
+    }
+    if (action == 3) {
+        uint32_t parked = 2;
+        if (!state->compare_exchange_strong(
+                parked, 3, std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            return parked == 0 ? -ECANCELED : -EBUSY;
+        }
+        signal_all(&e->dispatch_word);
+        return 0;
+    }
+
+    uint32_t observed = kc_atomic_u32_load_acquire(&e->dispatch_word.value);
+    for (;;) {
+        const uint32_t value = state->load(std::memory_order_acquire);
+        if (value == 2) return 0;
+        if (value == 0 || value == 3) return -ECANCELED;
+        const int rc = kc_port_wait_u32(e->dispatch_word.wait, observed, 0);
+        observed = kc_atomic_u32_load_acquire(&e->dispatch_word.value);
+        if (rc != 0 && state->load(std::memory_order_acquire) == 1) return rc;
+    }
+}
+
+int lfm_internal_engine_wait_pass_slots_for_test(void *ep, uint32_t live) {
+    Engine *e = static_cast<Engine *>(ep);
+    if (!e || live == 0 || live > PASS_CAPACITY) return -EINVAL;
+    uint32_t idle = 0;
+    if (!e->test_live_target.compare_exchange_strong(
+            idle, live, std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+        return -EBUSY;
+    }
+    uint32_t observed = kc_atomic_u32_load_acquire(&e->dispatch_word.value);
+    while (e->pass_slots_live.load(std::memory_order_acquire) != live) {
+        const int rc = kc_port_wait_u32(e->dispatch_word.wait, observed, 0);
+        observed = kc_atomic_u32_load_acquire(&e->dispatch_word.value);
+        if (rc != 0 &&
+            e->pass_slots_live.load(std::memory_order_acquire) != live) {
+            e->test_live_target.store(0, std::memory_order_release);
+            return rc;
+        }
+    }
+    e->test_live_target.store(0, std::memory_order_release);
+    return 0;
 }
 
 uint32_t lfm_engine_lanes(void *ep) {
     Engine *e = (Engine *)ep;
     return e ? e->lanes_total : 0;
+}
+
+uint64_t lfm_engine_audio_encode_passes(const void *ep) {
+    const Engine *e = static_cast<const Engine *>(ep);
+    return e ? e->audio_encode_passes.load(std::memory_order_relaxed) : 0;
+}
+
+int lfm_engine_conformer_gemm_team(
+    void *ep, const uint16_t *activation, size_t activation_count,
+    const void *weight_bytes, size_t weight_count, float *out,
+    size_t out_count, size_t rows, size_t columns, size_t inner) {
+    Engine *e = static_cast<Engine *>(ep);
+    size_t activation_need = 0, weight_need = 0, output_need = 0;
+    if (!e || !activation || !weight_bytes || !out || rows == 0 ||
+        columns == 0 || inner == 0 || rows > INT_MAX || columns > INT_MAX ||
+        inner > INT_MAX ||
+        !checked_size_product(rows, inner, &activation_need) ||
+        !checked_size_product(columns, inner, &weight_need) ||
+        !checked_size_product(rows, columns, &output_need) ||
+        activation_count != activation_need || weight_count != weight_need ||
+        out_count != output_need) {
+        return -EINVAL;
+    }
+    PassSlot *slot = e->active_slot;
+    if (!slot || slot->request != REQ_AUDIO_ENCODE ||
+        slot->audio.done.load(std::memory_order_acquire) ||
+        !pthread_equal(pthread_self(), e->workers[0])) {
+        return -EBUSY;
+    }
+
+    slot->gemm = {
+        .a = activation,
+        .rhs = weight_bytes,
+        .out = out,
+        .m = rows,
+        .n = columns,
+        .k = inner,
+        .rhs_layout = LFM_GEMM_RHS_NK,
+        .direct = true,
+    };
+    e->gemm = slot->gemm;
+    slot->audio.gemm_generation.fetch_add(1, std::memory_order_release);
+    signal_all(&slot->audio_word);
+    run_gemm(e, 0);
+    lane_fence(e, 0, [] {});
+    return 0;
+}
+
+int lfm_engine_audio_encode(void *ep, uint64_t model_id,
+                            const LfmAudioEncodePassV1 *pass) {
+    Engine *e = static_cast<Engine *>(ep);
+    if (!e || !pass || pass->size < sizeof(*pass) ||
+        pass->abi_version != LFM_AUDIO_PASS_ABI || !pass->resampler ||
+        !pass->resampler_workspace || !pass->frontend ||
+        !pass->frontend_workspace || !pass->conformer ||
+        !pass->conformer_workspace || !pass->pcm || pass->sample_count == 0 ||
+        (!pass->resampled && pass->resampled_capacity != 0) || !pass->mel ||
+        pass->mel_capacity == 0 || !pass->adapted ||
+        pass->adapted_capacity == 0 || !pass->out_adapted_values) {
+        return -EINVAL;
+    }
+
+    PassClaim claim(e);
+    if (!claim) return -EBUSY;
+    BackbonePlan *model = model_id == 0 ? nullptr : find_model(e, model_id);
+    if (model_id != 0 && !model) return -ESTALE;
+    if (model && lfm_conformer_out_width(pass->conformer) != model->h) {
+        return -ESTALE;
+    }
+
+    PassSlot *slot = claim.slot();
+    *pass->out_adapted_values = 0;
+    slot->model = model;
+    slot->audio.pass = *pass;
+    slot->audio.start_gemm_generation =
+        slot->audio.gemm_generation.load(std::memory_order_relaxed);
+    slot->audio.done.store(false, std::memory_order_relaxed);
+    return submit_pass(e, slot, REQ_AUDIO_ENCODE, model_id);
 }
 
 int lfm_engine_snapshot(void *ep, LfmEngineSnapshotV1 *out) {
@@ -2529,6 +3669,11 @@ int lfm_engine_snapshot(void *ep, LfmEngineSnapshotV1 *out) {
         .abi_version = KC_COORD_ABI_VERSION,
     };
     if (lfm_kernel_bridge_descriptor_snapshot(e->bridge, &descriptors) != 0) return -EFAULT;
+    LfmKernelBridgeSnapshotV1 bridge = {
+        .size = sizeof(LfmKernelBridgeSnapshotV1),
+        .abi_version = KC_COORD_ABI_VERSION,
+    };
+    if (lfm_kernel_bridge_snapshot(e->bridge, &bridge) != 0) return -EFAULT;
     *out = {
         .size = sizeof(*out),
         .abi_version = 1,
@@ -2546,10 +3691,20 @@ int lfm_engine_snapshot(void *ep, LfmEngineSnapshotV1 *out) {
         .descriptor_capacity = descriptors.capacity,
         .descriptors_live = descriptors.live,
         .max_descriptor_generation = descriptors.max_generation,
-        .attention_qkv_capacity = (uint32_t)e->at_qkvf.size(),
-        .attention_y_capacity = (uint32_t)e->at_y.size(),
-        .attention_score_capacity = (uint32_t)e->at_att.size(),
+        .attention_qkv_capacity =
+            e->attention_qkv_capacity.load(std::memory_order_relaxed),
+        .attention_y_capacity =
+            e->attention_y_capacity.load(std::memory_order_relaxed),
+        .attention_score_capacity =
+            e->attention_score_capacity.load(std::memory_order_relaxed),
         .pass_claimed = e->pass_claimed.load(std::memory_order_acquire) ? 1u : 0u,
+        .bridge_capacity = bridge.capacity,
+        .pass_slot_capacity = (uint32_t)e->slots.size(),
+        .pass_slots_live = e->pass_slots_live.load(std::memory_order_acquire),
+        .max_pass_slots_live =
+            e->max_pass_slots_live.load(std::memory_order_acquire),
+        .continuation_submissions =
+            e->continuation_submissions.load(std::memory_order_relaxed),
     };
     return 0;
 }
@@ -2566,6 +3721,12 @@ void lfm_engine_free(void *ep) {
         pthread_join(e->workers[lane], nullptr);
     }
     if (e->bridge && lfm_kernel_bridge_destroy(e->bridge) != 0) std::abort();
+    for (int index = 0; index < e->audio_waits_prepared; ++index) {
+        kc_port_wait_u32_release(e->slots[(size_t)index].audio_word.wait);
+    }
+    for (int index = 0; index < e->slot_waits_prepared; ++index) {
+        kc_port_wait_u32_release(e->slots[(size_t)index].completion_word.wait);
+    }
     if (e->wait_words_prepared > 1) kc_port_wait_u32_release(e->fence_word.wait);
     if (e->wait_words_prepared > 0) kc_port_wait_u32_release(e->dispatch_word.wait);
     delete e;
@@ -2581,6 +3742,7 @@ int lfm_engine_mlp(void *ep, const uint16_t *x, const uint16_t *norm_w,
         return -1;
     PassClaim claim(e);
     if (!claim) return -EBUSY;
+    PassSlot *slot = claim.slot();
     size_t tiles = lanes;
     if (tiles < 1) tiles = 1;
     size_t cap = h < i ? h : i;
@@ -2600,32 +3762,28 @@ int lfm_engine_mlp(void *ep, const uint16_t *x, const uint16_t *norm_w,
         auto grow_u = [](std::vector<uint16_t> &v, size_t n) {
             if (v.size() < n) v.resize(n);
         };
-        grow_f(e->sc_partials, tiles);
-        grow_u(e->sc_xn, h);
-        grow_f(e->sc_gu, 2 * i);
-        grow_u(e->sc_t, i);
+        grow_f(slot->scratch.sc_partials, tiles);
+        grow_u(slot->scratch.sc_xn, h);
+        grow_f(slot->scratch.sc_gu, 2 * i);
+        grow_u(slot->scratch.sc_t, i);
     } catch (const std::bad_alloc &) {
         return -2;
     }
 
-    Pass *p = &e->pass;
-    p->x = x;
-    p->norm_w = activation_bytes(norm_w);
-    p->w1 = activation_bytes(w1);
-    p->w3 = activation_bytes(w3);
-    p->w2 = activation_bytes(w2);
-    p->out = out;
-    p->h = h;
-    p->i = i;
-    p->eps = eps;
-    p->tiles = tiles;
-    p->partials = e->sc_partials.data();
-    p->xn = e->sc_xn.data();
-    p->gu = e->sc_gu.data();
-    p->t = e->sc_t.data();
-    p->rs_bits.store(0, std::memory_order_relaxed);
+    slot->mlp = {
+        .x = x,
+        .norm_w = activation_bytes(norm_w),
+        .w1 = activation_bytes(w1),
+        .w3 = activation_bytes(w3),
+        .w2 = activation_bytes(w2),
+        .out = out,
+        .h = h,
+        .i = i,
+        .tiles = tiles,
+        .eps = eps,
+    };
 
-    return submit_pass(e, REQ_MLP);
+    return submit_pass(e, slot, REQ_MLP);
 }
 
 // Fill from one conversation-owned CSPRNG stream through the same retained
@@ -2638,12 +3796,62 @@ int lfm_engine_prng_fill(void *ep, LfmPrngStateV1 *state, uint64_t *out,
     if (!e || !state || !out || count == 0) return -EINVAL;
     PassClaim claim(e);
     if (!claim) return -EBUSY;
+    PassSlot *slot = claim.slot();
     int valid = lfm_prng_fill_u64(state, nullptr, 0);
     if (valid != 0) return valid;
-    e->prng.state = state;
-    e->prng.out = out;
-    e->prng.count = count;
-    return submit_pass(e, REQ_PRNG);
+    slot->prng.state = state;
+    slot->prng.out = out;
+    slot->prng.count = count;
+    return submit_pass(e, slot, REQ_PRNG);
+}
+
+extern "C" int lfm_internal_engine_prng_continuation_for_test(
+    void *ep, LfmPrngStateV1 *state, uint64_t *out, size_t pass_count) {
+    Engine *e = static_cast<Engine *>(ep);
+    if (!e || !state || !out || pass_count < PASS_CAPACITY ||
+        lfm_prng_fill_u64(state, nullptr, 0) != 0) {
+        return -EINVAL;
+    }
+
+    PrngContinuationChain chain{};
+    if (!kc_atomic_u32_is_lock_free(&chain.done.value) ||
+        kc_port_wait_u32_prepare(&chain.done.value, &chain.done.wait) != 0) {
+        return -ENOTSUP;
+    }
+
+    /* Deliberately bypass PassClaim: this is the proof that a native CQ
+     * callback retains its own exact slot while compatibility producers may
+     * occupy the peer slot. */
+    PassSlot *slot = reserve_pass_slot(e);
+    if (!slot) {
+        kc_port_wait_u32_release(chain.done.wait);
+        return -EBUSY;
+    }
+    const uint64_t generation =
+        slot_generation(slot);
+
+    chain.state = state;
+    chain.out = out;
+    chain.count = pass_count;
+    chain.next = 1;
+    slot->prng = {.state = state, .out = out, .count = 1};
+
+    const int rc = submit_slot(e, slot, generation, REQ_PRNG, 0,
+                               continue_prng_chain, &chain);
+    if (rc != 0) {
+        if (!release_pass_slot(slot, generation)) std::abort();
+        kc_port_wait_u32_release(chain.done.wait);
+        return rc;
+    }
+
+    uint32_t observed = kc_atomic_u32_load_acquire(&chain.done.value);
+    while (!chain.finished.load(std::memory_order_acquire)) {
+        (void)kc_port_wait_u32(chain.done.wait, observed, 0);
+        observed = kc_atomic_u32_load_acquire(&chain.done.value);
+    }
+    const int chain_rc = chain.status.load(std::memory_order_acquire);
+    kc_port_wait_u32_release(chain.done.wait);
+    return chain_rc;
 }
 
 // Standalone sampling is used for prefill/fallback logits and conformance. It
@@ -2660,13 +3868,16 @@ int lfm_engine_sample(void *ep, const void *logits, size_t count, uint32_t dtype
     if (stochastic && (!state || lfm_prng_fill_u64(state, nullptr, 0) != 0)) return -EINVAL;
     PassClaim claim(e);
     if (!claim) return -EBUSY;
+    PassSlot *slot = claim.slot();
     try {
-        if (e->sample_weights.size() < count) e->sample_weights.resize(count);
-        if (e->sample_heap.size() < count) e->sample_heap.resize(count);
+        if (slot->scratch.sample_weights.size() < count)
+            slot->scratch.sample_weights.resize(count);
+        if (slot->scratch.sample_heap.size() < count)
+            slot->scratch.sample_heap.resize(count);
     } catch (const std::bad_alloc &) {
         return -ENOMEM;
     }
-    e->sample = {
+    slot->sample = {
         .logits = logits,
         .count = count,
         .dtype = dtype,
@@ -2674,7 +3885,7 @@ int lfm_engine_sample(void *ep, const void *logits, size_t count, uint32_t dtype
         .state = state,
         .out = out_token,
     };
-    return submit_pass(e, REQ_SAMPLE);
+    return submit_pass(e, slot, REQ_SAMPLE);
 }
 
 static bool depth_mul(size_t a, size_t b, size_t *out) {
@@ -2715,7 +3926,8 @@ static int submit_bf16_gemm_f32(
 
     PassClaim claim(e);
     if (!claim) return -EBUSY;
-    e->gemm = {
+    PassSlot *slot = claim.slot();
+    slot->gemm = {
         .a = a,
         .rhs = rhs,
         .out = out,
@@ -2725,7 +3937,7 @@ static int submit_bf16_gemm_f32(
         .rhs_layout = rhs_layout,
         .direct = direct,
     };
-    return submit_pass(e, REQ_GEMM);
+    return submit_pass(e, slot, REQ_GEMM);
 }
 
 int lfm_engine_bf16_gemm_f32(
@@ -2770,22 +3982,25 @@ int lfm_engine_fft_conv_dd(
 
     PassClaim claim(e);
     if (!claim) return -EBUSY;
+    PassSlot *slot = claim.slot();
     try {
-        if (e->fft_twiddle_size != fft_size) {
-            e->fft_twiddles.resize(fft_size / 2);
+        if (slot->scratch.fft_twiddle_size != fft_size) {
+            slot->scratch.fft_twiddles.resize(fft_size / 2);
             constexpr double pi = 3.141592653589793238462643383279502884;
             for (size_t i = 0; i < fft_size / 2; ++i) {
                 const double angle = -2.0 * pi * (double)i / (double)fft_size;
-                e->fft_twiddles[i] = {dd_from_f64(std::cos(angle)),
-                                      dd_from_f64(std::sin(angle))};
+                slot->scratch.fft_twiddles[i] = {
+                    dd_from_f64(std::cos(angle)),
+                    dd_from_f64(std::sin(angle))};
             }
-            e->fft_twiddle_size = fft_size;
+            slot->scratch.fft_twiddle_size = fft_size;
         }
-        if (e->fft_work.size() < fft_size) e->fft_work.resize(fft_size);
+        if (slot->scratch.fft_work.size() < fft_size)
+            slot->scratch.fft_work.resize(fft_size);
     } catch (const std::bad_alloc &) {
         return -ENOMEM;
     }
-    e->fft_conv_dd = {
+    slot->fft_conv_dd = {
         .input = input,
         .kernel = kernel,
         .skip = skip,
@@ -2795,7 +4010,7 @@ int lfm_engine_fft_conv_dd(
         .steps = steps,
         .fft_size = fft_size,
     };
-    return submit_pass(e, REQ_FFT_CONV_DD);
+    return submit_pass(e, slot, REQ_FFT_CONV_DD);
 }
 
 int lfm_engine_irfft_dd(
@@ -2819,21 +4034,23 @@ int lfm_engine_irfft_dd(
 
     PassClaim claim(e);
     if (!claim) return -EBUSY;
+    PassSlot *slot = claim.slot();
     try {
-        if (e->irfft_twiddle_size != fft_size) {
-            e->irfft_twiddles.resize(fft_size);
+        if (slot->scratch.irfft_twiddle_size != fft_size) {
+            slot->scratch.irfft_twiddles.resize(fft_size);
             constexpr double pi = 3.141592653589793238462643383279502884;
             for (size_t i = 0; i < fft_size; ++i) {
                 const double angle = 2.0 * pi * (double)i / (double)fft_size;
-                e->irfft_twiddles[i] = {dd_from_f64(std::cos(angle)),
-                                        dd_from_f64(std::sin(angle))};
+                slot->scratch.irfft_twiddles[i] = {
+                    dd_from_f64(std::cos(angle)),
+                    dd_from_f64(std::sin(angle))};
             }
-            e->irfft_twiddle_size = fft_size;
+            slot->scratch.irfft_twiddle_size = fft_size;
         }
     } catch (const std::bad_alloc &) {
         return -ENOMEM;
     }
-    e->irfft_dd = {
+    slot->irfft_dd = {
         .real = real,
         .imag = imag,
         .out = out,
@@ -2841,7 +4058,7 @@ int lfm_engine_irfft_dd(
         .fft_size = fft_size,
         .scale = {scale_hi, scale_lo},
     };
-    return submit_pass(e, REQ_IRFFT_DD);
+    return submit_pass(e, slot, REQ_IRFFT_DD);
 }
 
 static bool depth_view(const LfmDepthBufferV1 &view, size_t count) {
@@ -2879,7 +4096,8 @@ int lfm_engine_depthwise_stream_bf16(
 
     PassClaim claim(e);
     if (!claim) return -EBUSY;
-    e->depthwise_stream = {
+    PassSlot *slot = claim.slot();
+    slot->depthwise_stream = {
         .x = x,
         .cache = cache,
         .weights = weights,
@@ -2890,7 +4108,7 @@ int lfm_engine_depthwise_stream_bf16(
         .steps = steps,
         .kernel = kernel,
     };
-    return submit_pass(e, REQ_DEPTHWISE_STREAM);
+    return submit_pass(e, slot, REQ_DEPTHWISE_STREAM);
 }
 
 // Install one resident Depthformer plan. Descriptor tables are copied; weights
@@ -2909,7 +4127,7 @@ int lfm_engine_depth_build(void *ep, const LfmDepthPlanV1 *plan, uint64_t *out_i
         plan->codebook_head_count != plan->codebooks || !std::isfinite(plan->eps) ||
         plan->eps < 0.0f)
         return -EINVAL;
-    PassClaim claim(e);
+    PlanClaim claim(e);
     if (!claim) return -EBUSY;
     const size_t dim = plan->dim;
     const size_t kv_heads = plan->kv_heads;
@@ -2977,25 +4195,30 @@ int lfm_engine_depth_build(void *ep, const LfmDepthPlanV1 *plan, uint64_t *out_i
     try {
         next->layers.assign(plan->layers, plan->layers + plan->layer_count);
         next->heads.assign(plan->codebook_heads, plan->codebook_heads + codebooks);
-        next->x.resize(dim);
-        next->h.resize(dim);
-        next->xn.resize(dim);
-        next->qkv_f.resize(qkv_rows);
-        next->qkv_b.resize(qkv_rows);
-        next->up_f.resize(ffn);
-        next->y_b.resize(plane);
-        next->q_f.resize((size_t)plan->heads * hd);
-        next->attn_f.resize(dim);
-        next->attn_b.resize(dim);
-        next->proj_f.resize(plane);
-        next->t_b.resize(ffn);
-        next->k_plane.resize(cache_count);
-        next->v_plane.resize(cache_count);
-        next->logits_b.resize(vocab_max);
-        next->din_b.resize(projection_rows);
-        next->df_b.resize(dim);
-        if (e->sample_weights.size() < vocab_max) e->sample_weights.resize(vocab_max);
-        if (e->sample_heap.size() < vocab_max) e->sample_heap.resize(vocab_max);
+        for (PassSlot &slot : e->slots) {
+            DepthScratch &scratch = slot.scratch.depth;
+            scratch.x.resize(dim);
+            scratch.h.resize(dim);
+            scratch.xn.resize(dim);
+            scratch.qkv_f.resize(qkv_rows);
+            scratch.qkv_b.resize(qkv_rows);
+            scratch.up_f.resize(ffn);
+            scratch.y_b.resize(plane);
+            scratch.q_f.resize((size_t)plan->heads * hd);
+            scratch.attn_f.resize(dim);
+            scratch.attn_b.resize(dim);
+            scratch.proj_f.resize(plane);
+            scratch.t_b.resize(ffn);
+            scratch.k_plane.resize(cache_count);
+            scratch.v_plane.resize(cache_count);
+            scratch.logits_b.resize(vocab_max);
+            scratch.din_b.resize(projection_rows);
+            scratch.df_b.resize(dim);
+            if (slot.scratch.sample_weights.size() < vocab_max)
+                slot.scratch.sample_weights.resize(vocab_max);
+            if (slot.scratch.sample_heap.size() < vocab_max)
+                slot.scratch.sample_heap.resize(vocab_max);
+        }
     } catch (const std::bad_alloc &) {
         return -ENOMEM;
     }
@@ -3037,6 +4260,7 @@ int lfm_engine_depth_frame(void *ep, uint64_t id, const uint16_t *hidden,
         return -EINVAL;
     PassClaim claim(e);
     if (!claim) return -EBUSY;
+    PassSlot *slot = claim.slot();
     DepthPlan *depth = nullptr;
     for (const std::unique_ptr<DepthPlan> &candidate : e->depth_plans)
         if (candidate->id == id) {
@@ -3046,26 +4270,55 @@ int lfm_engine_depth_frame(void *ep, uint64_t id, const uint16_t *hidden,
     if (!depth) return -ESTALE;
     if (hidden_count != depth->backbone_dim || out_token_count != depth->codebooks)
         return -EINVAL;
-    e->active_depth = depth;
-    e->depth_req = {
+    slot->depth = depth;
+    slot->depth_req = {
         .hidden = hidden,
         .sampler = *sampler,
         .sample_state = sample_state,
         .out_tokens = out_tokens,
     };
-    return submit_pass(e, REQ_DEPTH_FRAME, id);
+    return submit_pass(e, slot, REQ_DEPTH_FRAME, id);
+}
+
+int lfm_engine_mimi_decode(void *ep, uint64_t model_id,
+                           MimiDecodeState *state, const uint32_t *codes,
+                           size_t code_count, float *pcm_out,
+                           size_t pcm_capacity, size_t *out_samples) {
+    Engine *e = static_cast<Engine *>(ep);
+    if (!e || model_id == 0 || !state || !codes || !pcm_out || !out_samples ||
+        code_count != LFM_MIMI_CODEBOOKS ||
+        pcm_capacity < LFM_MIMI_PCM_CAPACITY) {
+        return -EINVAL;
+    }
+    for (size_t index = 0; index < code_count; ++index) {
+        if (codes[index] >= LFM_MIMI_CODE_VALUES) return -ERANGE;
+    }
+    PassClaim claim(e);
+    if (!claim) return -EBUSY;
+    PassSlot *slot = claim.slot();
+    BackbonePlan *model = find_model(e, model_id);
+    if (!model) return -ESTALE;
+    *out_samples = 0;
+    slot->model = model;
+    slot->mimi = {
+        .state = state,
+        .codes = codes,
+        .pcm = pcm_out,
+        .capacity = pcm_capacity,
+        .out_samples = out_samples,
+    };
+    return submit_pass(e, slot, REQ_MIMI_DECODE, model_id);
 }
 
 int lfm_engine_depth_clear(void *ep, uint64_t id) {
     Engine *e = (Engine *)ep;
     if (!e || id == 0) return -EINVAL;
-    PassClaim claim(e);
+    PlanClaim claim(e);
     if (!claim) return -EBUSY;
     const auto found = std::find_if(
         e->depth_plans.begin(), e->depth_plans.end(),
         [id](const std::unique_ptr<DepthPlan> &candidate) { return candidate->id == id; });
     if (found == e->depth_plans.end()) return 0;
-    if (e->active_depth == found->get()) e->active_depth = nullptr;
     e->depth_plans.erase(found);
     return 0;
 }
@@ -3084,7 +4337,7 @@ int lfm_ctx_build(void *ep, const LfmLayerDesc *descs, size_t n_layers, size_t h
     if (h > (size_t)INT_MAX / 3 || ffn > (size_t)INT_MAX ||
         max_ctx > (size_t)INT_MAX)
         return -EOVERFLOW;
-    PassClaim claim(e);
+    PlanClaim claim(e);
     if (!claim) return -EBUSY;
     size_t kmax = 1;
     size_t qkv_max = 0, y_max = 0, att_max = 0;
@@ -3126,28 +4379,34 @@ int lfm_ctx_build(void *ep, const LfmLayerDesc *descs, size_t n_layers, size_t h
         const auto grow = [](auto &values, size_t count) {
             if (values.size() < count) values.resize(count);
         };
-        grow(e->sc_partials, MAX_WORKERS);
-        grow(e->sc_xn, h);
-        grow(e->sc_gu, 2 * ffn);
-        grow(e->sc_t, ffn);
-        grow(e->sc_bcxf, 3 * h);
-        grow(e->sc_bcxb, 3 * h);
-        grow(e->sc_conv, h * kmax);
-        grow(e->sc_projf, h);
-        grow(e->sc_projb, h);
-        grow(e->sc_stage, h);
-        grow(e->sc_mid, h);
-        if (qkv_max > 0) {
-            grow(e->at_qkvf, qkv_max);
-            grow(e->at_qkvb, qkv_max);
-            grow(e->at_y, y_max);
-            grow(e->at_att, att_max);
+        for (PassSlot &slot : e->slots) {
+            ScratchBank &scratch = slot.scratch;
+            grow(scratch.sc_partials, MAX_WORKERS);
+            grow(scratch.sc_xn, h);
+            grow(scratch.sc_gu, 2 * ffn);
+            grow(scratch.sc_t, ffn);
+            grow(scratch.sc_bcxf, 3 * h);
+            grow(scratch.sc_bcxb, 3 * h);
+            grow(scratch.sc_conv, h * kmax);
+            grow(scratch.sc_projf, h);
+            grow(scratch.sc_projb, h);
+            grow(scratch.sc_stage, h);
+            grow(scratch.sc_mid, h);
+            if (qkv_max > 0) {
+                grow(scratch.at_qkvf, qkv_max);
+                grow(scratch.at_qkvb, qkv_max);
+                grow(scratch.at_y, y_max);
+                grow(scratch.at_att, att_max);
+            }
+            grow(scratch.tk_h0, h);
+            grow(scratch.tk_h1, h);
         }
-        grow(e->tk_h0, h);
-        grow(e->tk_h1, h);
     } catch (const std::bad_alloc &) {
         return -ENOMEM;
     }
+    update_capacity_high_water(&e->attention_qkv_capacity, qkv_max);
+    update_capacity_high_water(&e->attention_y_capacity, y_max);
+    update_capacity_high_water(&e->attention_score_capacity, att_max);
     next->h = h;
     next->ffn = ffn;
     next->max_ctx = max_ctx;
@@ -3175,7 +4434,7 @@ int lfm_ctx_set_heads(void *ep, uint64_t id, const uint8_t *embed_w,
                       float emb_norm_eps) {
     Engine *e = (Engine *)ep;
     if (!e || id == 0 || !embed_w || !emb_norm_w || vocab == 0) return -1;
-    PassClaim claim(e);
+    PlanClaim claim(e);
     if (!claim) return -EBUSY;
     BackbonePlan *model = find_model(e, id);
     if (!model) return -3;
@@ -3188,9 +4447,14 @@ int lfm_ctx_set_heads(void *ep, uint64_t id, const uint8_t *embed_w,
          audio_embed_len < audio_rows * model->h))
         return -1;
     try {
-        if (e->tk_logf.size() < vocab) e->tk_logf.resize(vocab);
-        if (e->sample_weights.size() < vocab) e->sample_weights.resize(vocab);
-        if (e->sample_heap.size() < vocab) e->sample_heap.resize(vocab);
+        for (PassSlot &slot : e->slots) {
+            if (slot.scratch.tk_logf.size() < vocab)
+                slot.scratch.tk_logf.resize(vocab);
+            if (slot.scratch.sample_weights.size() < vocab)
+                slot.scratch.sample_weights.resize(vocab);
+            if (slot.scratch.sample_heap.size() < vocab)
+                slot.scratch.sample_heap.resize(vocab);
+        }
     } catch (const std::bad_alloc &) {
         return -2;
     }
@@ -3209,13 +4473,12 @@ int lfm_ctx_set_heads(void *ep, uint64_t id, const uint8_t *embed_w,
 int lfm_ctx_clear(void *ep, uint64_t id) {
     Engine *e = (Engine *)ep;
     if (!e || id == 0) return -1;
-    PassClaim claim(e);
+    PlanClaim claim(e);
     if (!claim) return -EBUSY;
     const auto found = std::find_if(
         e->models.begin(), e->models.end(),
         [id](const std::unique_ptr<BackbonePlan> &model) { return model->id == id; });
     if (found == e->models.end()) return 0;
-    if (e->model == found->get()) e->model = nullptr;
     e->models.erase(found);
     return 0;
 }
@@ -3230,6 +4493,7 @@ int lfm_engine_conv_layer(void *ep, uint64_t id, size_t layer, const uint16_t *x
     if (!e || id == 0 || !x || !state_in || !state_out || !out) return -1;
     PassClaim claim(e);
     if (!claim) return -EBUSY;
+    PassSlot *slot = claim.slot();
     BackbonePlan *model = find_model(e, id);
     if (!model || layer >= model->layers.size() || model->layers[layer].kind != 0)
         return -3;
@@ -3241,15 +4505,15 @@ int lfm_engine_conv_layer(void *ep, uint64_t id, size_t layer, const uint16_t *x
         state_out_len != state_len)
         return -1;
 
-    e->model = model;
-    e->conv.layer = layer;
-    e->conv.x = x;
-    e->conv.state_in = state_in;
-    e->conv.state_out = state_out;
-    e->conv.out = out;
-    e->conv.lanes = lanes < 1 ? 1 : (lanes > MAX_WORKERS ? MAX_WORKERS : lanes);
+    slot->model = model;
+    slot->conv.layer = layer;
+    slot->conv.x = x;
+    slot->conv.state_in = state_in;
+    slot->conv.state_out = state_out;
+    slot->conv.out = out;
+    slot->conv.lanes = lanes < 1 ? 1 : (lanes > MAX_WORKERS ? MAX_WORKERS : lanes);
 
-    return submit_pass(e, REQ_CONV_LAYER, id);
+    return submit_pass(e, slot, REQ_CONV_LAYER, id);
 }
 
 // One whole attention+MLP layer. Per-generation state (planes, rope tables, cursor)
@@ -3267,6 +4531,7 @@ int lfm_engine_attn_layer(void *ep, uint64_t id, size_t layer, const uint16_t *x
         return -1;
     PassClaim claim(e);
     if (!claim) return -EBUSY;
+    PassSlot *slot = claim.slot();
     BackbonePlan *model = find_model(e, id);
     if (!model || layer >= model->layers.size() || model->layers[layer].kind != 1 ||
         !model->layers[layer].q_w || pos + 1 > model->max_ctx)
@@ -3284,19 +4549,19 @@ int lfm_engine_attn_layer(void *ep, uint64_t id, size_t layer, const uint16_t *x
         rope_len < (pos + 1) * (d->hd / 2))
         return -1;
 
-    e->model = model;
-    e->attn.layer = layer;
-    e->attn.x = x;
-    e->attn.k_plane = k_plane;
-    e->attn.v_plane = v_plane;
-    e->attn.head_stride = head_stride;
-    e->attn.pos = pos;
-    e->attn.cos_base = cos_base;
-    e->attn.sin_base = sin_base;
-    e->attn.out = out;
-    e->attn.lanes = lanes < 1 ? 1 : (lanes > MAX_WORKERS ? MAX_WORKERS : lanes);
+    slot->model = model;
+    slot->attn.layer = layer;
+    slot->attn.x = x;
+    slot->attn.k_plane = k_plane;
+    slot->attn.v_plane = v_plane;
+    slot->attn.head_stride = head_stride;
+    slot->attn.pos = pos;
+    slot->attn.cos_base = cos_base;
+    slot->attn.sin_base = sin_base;
+    slot->attn.out = out;
+    slot->attn.lanes = lanes < 1 ? 1 : (lanes > MAX_WORKERS ? MAX_WORKERS : lanes);
 
-    return submit_pass(e, REQ_ATTN_LAYER, id);
+    return submit_pass(e, slot, REQ_ATTN_LAYER, id);
 }
 
 int lfm_engine_prefill_workspace_create(void *ep, uint64_t id,
@@ -3379,6 +4644,7 @@ int lfm_engine_prefill(void *ep, uint64_t id, void *workspace_pointer,
     }
     PassClaim claim(e);
     if (!claim) return -EBUSY;
+    PassSlot *slot = claim.slot();
     BackbonePlan *model = find_model(e, id);
     if (!model || !model->embed_w || !model->emb_norm_w ||
         state_count != model->layers.size() || row_count > model->max_ctx ||
@@ -3447,24 +4713,24 @@ int lfm_engine_prefill(void *ep, uint64_t id, void *workspace_pointer,
         }
     }
 
-    e->model = model;
-    e->prefill.workspace = workspace;
-    e->prefill.ids = ids;
-    e->prefill.provided_rows = provided_rows;
-    e->prefill.rows = row_count;
-    e->prefill.embed_kind = embed_kind;
-    e->prefill.states = states;
-    e->prefill.n_states = state_count;
-    e->prefill.pos = pos;
-    e->prefill.cos_base = cos_base;
-    e->prefill.sin_base = sin_base;
-    e->prefill.out_hidden = out_hidden;
-    e->prefill.sampler = sampler;
-    e->prefill.sample_state = sample_state;
-    e->prefill.out_token = out_token;
-    e->prefill.lanes = lanes < 1 ? 1 :
-                           (lanes > MAX_WORKERS ? MAX_WORKERS : lanes);
-    return submit_pass(e, REQ_PREFILL, id);
+    slot->model = model;
+    slot->prefill.workspace = workspace;
+    slot->prefill.ids = ids;
+    slot->prefill.provided_rows = provided_rows;
+    slot->prefill.rows = row_count;
+    slot->prefill.embed_kind = embed_kind;
+    slot->prefill.states = states;
+    slot->prefill.n_states = state_count;
+    slot->prefill.pos = pos;
+    slot->prefill.cos_base = cos_base;
+    slot->prefill.sin_base = sin_base;
+    slot->prefill.out_hidden = out_hidden;
+    slot->prefill.sampler = sampler;
+    slot->prefill.sample_state = sample_state;
+    slot->prefill.out_token = out_token;
+    slot->prefill.lanes = lanes < 1 ? 1 :
+                              (lanes > MAX_WORKERS ? MAX_WORKERS : lanes);
+    return submit_pass(e, slot, REQ_PREFILL, id);
 }
 
 // ONE token through the whole backbone: embed → every layer → final norm → logits.
@@ -3484,6 +4750,7 @@ int lfm_engine_token_pass(void *ep, uint64_t id, const uint32_t *ids, size_t n_i
     if (!e || id == 0 || !ids || n_ids == 0 || !states || !out_hidden) return -1;
     PassClaim claim(e);
     if (!claim) return -EBUSY;
+    PassSlot *slot = claim.slot();
     BackbonePlan *model = find_model(e, id);
     if (!model || !model->embed_w || !model->emb_norm_w ||
         n_states != model->layers.size() || pos + 1 > model->max_ctx)
@@ -3542,24 +4809,24 @@ int lfm_engine_token_pass(void *ep, uint64_t id, const uint32_t *ids, size_t n_i
         }
     }
 
-    e->model = model;
-    e->tok.ids = ids;
-    e->tok.n_ids = n_ids;
-    e->tok.embed_kind = embed_kind;
-    e->tok.provided_embed = provided_embed;
-    e->tok.states = states;
-    e->tok.n_states = n_states;
-    e->tok.pos = pos;
-    e->tok.cos_base = cos_base;
-    e->tok.sin_base = sin_base;
-    e->tok.out_hidden = out_hidden;
-    e->tok.out_logits = out_logits;
-    e->tok.sampler = sampler;
-    e->tok.sample_state = sample_state;
-    e->tok.out_token = out_token;
-    e->tok.lanes = lanes < 1 ? 1 : (lanes > MAX_WORKERS ? MAX_WORKERS : lanes);
+    slot->model = model;
+    slot->tok.ids = ids;
+    slot->tok.n_ids = n_ids;
+    slot->tok.embed_kind = embed_kind;
+    slot->tok.provided_embed = provided_embed;
+    slot->tok.states = states;
+    slot->tok.n_states = n_states;
+    slot->tok.pos = pos;
+    slot->tok.cos_base = cos_base;
+    slot->tok.sin_base = sin_base;
+    slot->tok.out_hidden = out_hidden;
+    slot->tok.out_logits = out_logits;
+    slot->tok.sampler = sampler;
+    slot->tok.sample_state = sample_state;
+    slot->tok.out_token = out_token;
+    slot->tok.lanes = lanes < 1 ? 1 : (lanes > MAX_WORKERS ? MAX_WORKERS : lanes);
 
-    return submit_pass(e, REQ_TOKEN_PASS, id);
+    return submit_pass(e, slot, REQ_TOKEN_PASS, id);
 }
 
 } // extern "C"

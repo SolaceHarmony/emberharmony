@@ -13,7 +13,7 @@ use std::{
     future::Future,
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -85,16 +85,162 @@ const LIVEKIT_AGENT_SILENCE_MS: u64 = 800;
 const LIVEKIT_AGENT_MAX_UTTERANCE_SECONDS: usize = 30;
 const LIVEKIT_AGENT_ECHO_GATE_MS: u64 = 700;
 const LIVEKIT_AGENT_ECHO_MULTIPLIER: f32 = 2.5;
-/// The one native resident image. The desktop never constructs the legacy
-/// Rust model, processor, or Candle device for this path.
-struct ResidentLfm2 {
+/// Identity of the one native resident image. The runtime configuration is part
+/// of the key because it controls native worker topology and dock capacities.
+#[derive(Clone, PartialEq)]
+struct ResidentLfm2Key {
     dir: PathBuf,
     device_setting: Lfm2Device,
     runtime: NativeVoiceRuntimeConfig,
-    model: NativeVoiceModel,
 }
 
-static LFM2_RESIDENT: Mutex<Option<ResidentLfm2>> = Mutex::new(None);
+struct ResidentLoad<K, V> {
+    key: K,
+    result: Mutex<Option<Result<V, String>>>,
+    ready: Condvar,
+}
+
+impl<K, V: Clone> ResidentLoad<K, V> {
+    fn wait(&self) -> Result<V, String> {
+        let mut result = self
+            .result
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while result.is_none() {
+            result = self
+                .ready
+                .wait(result)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        result
+            .as_ref()
+            .expect("resident load completed without a result")
+            .clone()
+    }
+
+    fn complete(&self, result: Result<V, String>) {
+        *self
+            .result
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(result);
+        self.ready.notify_all();
+    }
+}
+
+struct ResidentCacheState<K, V> {
+    resident: Option<(K, V)>,
+    load: Option<Arc<ResidentLoad<K, V>>>,
+}
+
+struct ResidentCache<K, V> {
+    state: Mutex<ResidentCacheState<K, V>>,
+}
+
+enum ResidentClaim<K, V> {
+    Resident(V),
+    Mismatch,
+    Wait {
+        load: Arc<ResidentLoad<K, V>>,
+        same_key: bool,
+    },
+    Load(Arc<ResidentLoad<K, V>>),
+}
+
+impl<K: Clone + PartialEq, V: Clone> ResidentCache<K, V> {
+    const fn new() -> Self {
+        Self {
+            state: Mutex::new(ResidentCacheState {
+                resident: None,
+                load: None,
+            }),
+        }
+    }
+
+    fn get_or_try_init(
+        &self,
+        key: K,
+        init: impl FnOnce() -> Result<V, String>,
+    ) -> Result<V, String> {
+        let mut init = Some(init);
+        loop {
+            let claim = {
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some((resident_key, resident)) = state.resident.as_ref() {
+                    if resident_key == &key {
+                        ResidentClaim::Resident(resident.clone())
+                    } else {
+                        /* Replacing a live cache entry would open the new
+                         * multi-gigabyte image before outstanding model/session
+                         * clones can release the old one. Refuse the reload so
+                         * the desktop's one-image invariant is physical, not
+                         * merely one pointer in this cache. */
+                        ResidentClaim::Mismatch
+                    }
+                } else if let Some(load) = state.load.as_ref() {
+                    ResidentClaim::Wait {
+                        same_key: load.key == key,
+                        load: load.clone(),
+                    }
+                } else {
+                    let load = Arc::new(ResidentLoad {
+                        key: key.clone(),
+                        result: Mutex::new(None),
+                        ready: Condvar::new(),
+                    });
+                    state.load = Some(load.clone());
+                    ResidentClaim::Load(load)
+                }
+            };
+
+            match claim {
+                ResidentClaim::Resident(resident) => return Ok(resident),
+                ResidentClaim::Mismatch => {
+                    return Err(
+                        "a different native LFM2 model is already resident; restart the desktop before changing the model path or runtime topology"
+                            .into(),
+                    );
+                }
+                ResidentClaim::Wait { load, same_key } => {
+                    let result = load.wait();
+                    if same_key {
+                        return result;
+                    }
+                }
+                ResidentClaim::Load(load) => {
+                    let init = init
+                        .take()
+                        .expect("resident initializer consumed before claiming the load");
+                    let result = init();
+                    {
+                        let mut state = self
+                            .state
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        if let Ok(resident) = result.as_ref() {
+                            state.resident = Some((key.clone(), resident.clone()));
+                        }
+                        if state
+                            .load
+                            .as_ref()
+                            .is_some_and(|active| Arc::ptr_eq(active, &load))
+                        {
+                            state.load = None;
+                        }
+                    }
+                    load.complete(result.clone());
+                    return result;
+                }
+            }
+        }
+    }
+}
+
+/// The one native resident image. Callers park behind the active loader, so the
+/// desktop can never transiently construct duplicate multi-gigabyte images.
+static LFM2_RESIDENT: ResidentCache<ResidentLfm2Key, NativeVoiceModel> = ResidentCache::new();
 
 /// One conversation vault per chat session: the model's conversation must survive
 /// UI-driven voice session rebuilds (route changes, settings writes) — the upstream
@@ -120,59 +266,18 @@ fn resident_lfm2(dir: &Path, device_setting: &Lfm2Device) -> Result<NativeVoiceM
         );
     }
     let runtime = NativeVoiceRuntimeConfig::default();
-    // Double-checked resident init (#148). Hold the lock only to check for a hit
-    // and clone opaque handles out, never across the multi-second native load.
-    {
-        let slot = LFM2_RESIDENT
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(resident) = slot.as_ref() {
-            if resident.dir == dir
-                && &resident.device_setting == device_setting
-                && resident.runtime == runtime
-            {
-                // Per-session ground truth in the log: which silicon this session's
-                // model actually lives on (the settings store can say one thing and
-                // a stale resident another — this line is the arbiter).
-                eprintln!("[voice] LFM2 session: reusing native resident image");
-                return Ok(resident.model.clone());
-            }
-            eprintln!(
-                "[voice] LFM2 session: setting changed ({:?} -> {:?}); reloading model",
-                resident.device_setting, device_setting
-            );
-        }
-    } // lock released before the load
-
-    // The loader writes each shard directly into the final immutable native
-    // image. There is no Rust safetensors builder or Candle compatibility copy.
-    eprintln!("[voice] LFM2 session: loading native resident image");
-    let model = NativeVoiceModel::open_with_config(dir, runtime)
-        .map_err(|error| format!("failed to load native LFM2-Audio: {error}"))?;
-
-    // Re-lock to publish. Double-check: a concurrent start may have loaded the
-    // SAME dir+device while we were loading — if so, adopt theirs and drop ours,
-    // so the app keeps exactly one resident image/runtime. Serialized starts
-    // never hit this; the check makes the rare race correct.
-    let mut slot = LFM2_RESIDENT
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(resident) = slot.as_ref() {
-        if resident.dir == dir
-            && &resident.device_setting == device_setting
-            && resident.runtime == runtime
-        {
-            eprintln!("[voice] LFM2 session: concurrent load raced; adopting resident image");
-            return Ok(resident.model.clone());
-        }
-    }
-    *slot = Some(ResidentLfm2 {
+    let key = ResidentLfm2Key {
         dir: dir.to_path_buf(),
         device_setting: device_setting.clone(),
         runtime,
-        model: model.clone(),
-    });
-    Ok(model)
+    };
+    LFM2_RESIDENT.get_or_try_init(key, || {
+        // The loader writes each shard directly into the final immutable native
+        // image. There is no Rust safetensors builder or Candle compatibility copy.
+        eprintln!("[voice] LFM2 session: loading native resident image");
+        NativeVoiceModel::open_with_config(dir, runtime)
+            .map_err(|error| format!("failed to load native LFM2-Audio: {error}"))
+    })
 }
 
 /// One active native voice service for the desktop app.
@@ -3334,21 +3439,76 @@ fn audio_frame_to_mono_f32(frame: &AudioFrame<'_>) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Barrier;
+    use std::sync::{
+        Barrier,
+        atomic::{AtomicUsize, Ordering as AtomicOrdering},
+    };
 
     #[test]
     fn lfm2_desktop_factory_and_cache_are_native_only() {
         const FACTORY: fn(&Path, &Lfm2Device) -> Result<NativeVoiceModel, String> = resident_lfm2;
-        fn cache_model(cache: &CachedLfm2Model) -> &NativeVoiceModel {
-            &cache.model
-        }
-
         let _ = FACTORY;
-        let _ = cache_model;
         let error = resident_lfm2(Path::new("unused-for-device-rejection"), &Lfm2Device::Metal)
             .err()
             .expect("Metal must fail instead of constructing a compatibility model");
         assert!(error.contains("will not fall back to Candle Metal"));
+    }
+
+    #[test]
+    fn resident_cache_single_flights_concurrent_same_key_loads() {
+        const CALLERS: usize = 16;
+        let cache = Arc::new(ResidentCache::<u8, usize>::new());
+        let start = Arc::new(Barrier::new(CALLERS + 1));
+        let release = Arc::new(Barrier::new(2));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let threads = (0..CALLERS)
+            .map(|_| {
+                let cache = cache.clone();
+                let start = start.clone();
+                let release = release.clone();
+                let calls = calls.clone();
+                let entered_tx = entered_tx.clone();
+                std::thread::spawn(move || {
+                    start.wait();
+                    cache
+                        .get_or_try_init(7, || {
+                            calls.fetch_add(1, AtomicOrdering::SeqCst);
+                            entered_tx.send(()).expect("announce active loader");
+                            release.wait();
+                            Ok(41)
+                        })
+                        .expect("single-flight load")
+                })
+            })
+            .collect::<Vec<_>>();
+
+        start.wait();
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("one caller must claim the load");
+        release.wait();
+
+        for thread in threads {
+            assert_eq!(thread.join().expect("resident cache caller"), 41);
+        }
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[test]
+    fn resident_cache_rejects_a_second_key_without_opening_it() {
+        let cache = ResidentCache::<u8, usize>::new();
+        assert_eq!(cache.get_or_try_init(1, || Ok(41)).unwrap(), 41);
+        let opened = AtomicUsize::new(0);
+        let error = cache
+            .get_or_try_init(2, || {
+                opened.fetch_add(1, AtomicOrdering::SeqCst);
+                Ok(42)
+            })
+            .unwrap_err();
+        assert_eq!(opened.load(AtomicOrdering::SeqCst), 0);
+        assert!(error.contains("already resident"));
+        assert_eq!(cache.get_or_try_init(1, || Ok(99)).unwrap(), 41);
     }
 
     #[test]

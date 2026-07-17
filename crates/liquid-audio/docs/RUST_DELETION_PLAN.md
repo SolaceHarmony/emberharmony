@@ -1,7 +1,8 @@
 # Rust inference deletion plan
 
-Status: **LFM2 production ownership cutover complete; follow-on ledger**, audited
-against the working tree on 2026-07-16.
+Status: **LFM2 production numerical ownership cutover complete; fixed-team and
+repository-structure follow-on ledger**, audited against the working tree on
+2026-07-16.
 
 ## Ruling
 
@@ -18,9 +19,11 @@ and are reported separately. Layout, alignment, dtype, transpose, framework
 ownership, or convenience copies of weights are forbidden.
 
 The default crate and desktop production graph are native-only. Candle, the old
-Rust inference implementation, training, fixture capture, and Moshi are isolated
-behind the opt-in `oracle` feature and workspace-only `liquid-audio-oracle` crate.
-An oracle is never a production fallback.
+Rust inference implementation, training, fixture capture, and Moshi are gated by
+the opt-in `oracle` feature; the workspace-only `liquid-audio-oracle` crate
+currently re-exports that feature rather than physically owning those sources.
+That source move remains repository-structure work. An oracle is never a
+production fallback.
 
 ## As-built / open-gaps ledger
 
@@ -28,10 +31,10 @@ An oracle is never a production fallback.
 |---|---|---|
 | Main + codec weights | **Landed.** One byte-exact allocation, direct parallel positioned reads, component-scoped catalog, source handles closed, image page-table read-only after validation. | Keep real-checkpoint digest/load benchmarks as release gates. |
 | Typed binding | **Landed.** Exact BF16/F32 dtype, rank, shape, layer, codebook, and vocabulary checks; possibly unaligned tensors remain byte views. | None for LFM2. |
-| Weight consumption | **Landed.** Frontend, Conformer, backbone, Depthformer, and Mimi bind the same image; BF16 unlift occurs in registers. | `compatibility_copied_bytes == 0` remains an acceptance assertion. |
-| Native model chain | **Landed.** Resample, mel, Conformer/adapter, modality assembly, backbone, sampling, Depthformer, Mimi, and tokenizer are native-owned. | Multi-row prefill specialization is still open; correct prefill currently advances admitted rows through the native token pass. |
-| Conversation/session | **Landed.** Native KV/ShortConv/codec state, PRNG, cursor, recurrence, text/PCM tickets, reliable events, epochs, interrupt, stop, and join. Rust does not drive progress. | The native coordinator still synchronously parks on the engine's capacity-1 completion before calling the next pass. Capacity-2 completion continuations are open. |
-| Context rollover | **Landed.** Fixed capacity+runway BF16 state, monotonic cursor, absolute RoPE range generation, whole-action reservation, and in-place compaction. | None for the activation-state sliding-window contract. |
+| Weight consumption | **Landed.** Frontend, Conformer, backbone, Depthformer, and Mimi bind the same image; BF16 unlift occurs in registers. | `compatibility_copied_bytes == 0` remains an acceptance assertion. Its counters were **stubs returning a literal 0** (review 2026-07-16) — the gate could not fail; now wired to real per-plan tallies. See "Accounting is a tally, not a constant" below. |
+| Native model chain | **Landed for numerical ownership.** One typed, model-correlated `REQ_AUDIO_ENCODE` pass owns resample → valid-only BF16 frontend → whole Conformer/adapter over borrowed spans and pre-reserved conversation buffers. Modality assembly, M≤4 checkpoint-BF16 prefill, backbone, sampling, Depthformer, Mimi, and tokenizer are also native-owned. | No remaining numerical-stage ownership gap for LFM2. The coordinator-to-continuation scheduling cut is tracked in the conversation/session row. |
+| Conversation/session | **Landed.** Native KV/ShortConv/codec state, PRNG, cursor, recurrence, text/PCM tickets, reliable events, epochs, interrupt, stop, and join. Rust does not drive progress. The engine now owns a capacity-2 SQ/CQ and two per-ticket request/scratch slots; an exact-CQ continuation retains and generation-checks its completed slot, then atomically resubmits that same slot or releases it before waking the waiter. | The session coordinator still uses the synchronous compatibility submission for each numerical pass. Move that existing recurrence state machine onto the landed continuation path. |
+| Context rollover | **Landed.** Fixed capacity+runway BF16 state, monotonic cursor, absolute RoPE range generation, nonmutating whole-action admission, causal row-by-row eviction, and in-place compaction. | None for the activation-state sliding-window contract. |
 | Shared model | **Landed.** Per-conversation state/scratch and a fair model-owned expected-value pass gate; engine `-EBUSY` does not leak as scheduling policy. | Capacity-2 continuations may improve overlap; fairness is already correct. |
 | Production graph | **Landed.** Desktop creates `NativeVoiceModel` and opaque native conversations/sessions only; default dependencies do not enable Candle or Moshi. | Native Metal/MLX remains a separate future backend and must fail explicitly until mounted. |
 | Physical audio dock | **Partial.** Native generation-checked capture/playback leases and zero-spin doorbells are live. | The Rust adapter still copies `Utterance.samples` into a capture lease and copies playback with `to_vec()` into crossbeam `Reply::Audio`/`VoiceEvent::Audio`. Replace it with direct kcoro device callbacks. |
@@ -53,7 +56,9 @@ An oracle is never a production fallback.
   validates metadata/spans, and seals the allocation read-only.
 - `LfmModelMemoryV1` reports source bytes, resident bytes, directly bound bytes,
   formula-derived immutable bytes, compatibility-copied bytes, load time, worker
-  count, and task count.
+  count, and task count. Directly bound bytes come from successful exact binders
+  (deduplicated by resident span), not from summing every checkpoint entry; unused
+  entries therefore remain source/resident bytes without masquerading as consumers.
 
 ### Direct native consumers
 
@@ -70,14 +75,46 @@ An oracle is never a production fallback.
   Conformer destination, Conformer writes the native prefill plane, and Mimi
   writes PCM directly into a playback reservation.
 
+### Accounting is a tally, not a constant
+
+Review finding (2026-07-16), fixed: `compatibility_copied_bytes` — the gate this
+ledger and spec 15 both cite as the proof that no weight is materialized — was a
+**compile-time constant 0**. Both contributors ignored their argument and
+returned a literal:
+
+- `lfm_conformer_materialized_weight_bytes(const LfmConformer *c) { (void)c; return 0; }`
+- `mimi_decode_plan_compatibility_copied_bytes(const MimiDecodePlan *) { return 0; }`
+
+`lfm_model.cpp` sums exactly those two, so `voice_session.cpp`'s
+`if (memory.compatibility_copied_bytes != 0) reject` was dead code and
+`native_safetensors.rs`'s `assert_eq!(…, 0)` asserted a literal. A staging
+buffer, transpose, repack, or alignment copy could have been reintroduced — the
+exact thing the doctrine forbids — and every gate would have stayed green.
+
+Both are now real per-object tallies (`LfmConformer::materialized_weight_bytes`,
+`MimiDecodePlan::compatibility_copied_bytes`), sitting beside the tallies that
+were already real (`bound_weight_bytes`, `derived_bytes`). They still read 0,
+because nothing materializes a weight today — but now that is a *measurement*.
+
+**Invariant:** any code that materializes a weight MUST add its bytes to the
+owning tally, exactly as binding adds to `bound_weight_bytes`. A weight-norm fold
+or formula table is DERIVED, not materialized, and belongs in `derived_bytes`.
+
+**Honest limit:** a runtime counter is only as strong as that discipline — it
+counts what someone increments, no more. The genuinely structural gate for "no
+Candle duplicate" is the dependency tree: the default build links **zero**
+candle (`cargo tree -p liquid-audio -e normal` → 0 `candle-core`), which is a
+fact no author can forget to update.
+
 ### Native conversation and recurrence
 
 - `LfmConversation` owns fixed BF16 KV and ShortConv state, frontend/resampler/
   Conformer/Mimi workspaces, bounded tokenizer storage, sampler PRNG, generation
   cadence, context cursor, and epoch-sensitive state.
-- Text, PCM, and mixed text+PCM actions validate and reserve their complete row
-  requirement before the first backbone mutation. No caller supplies hidden
-  geometry.
+- Text, PCM, and mixed text+PCM actions validate their complete row requirement
+  without mutating the window before the first backbone pass. Eviction then occurs
+  causally per row/chunk, so future input rows cannot evict context needed by the
+  first row. No caller supplies hidden geometry.
 - `LfmSession` owns bounded commands, ticket-correlated reliable text/terminal
   events, capture/playback leases, interruption epochs, stop, join, and the native
   token → sample → Depthformer → Mimi recurrence loop. A stale pass may finish but
@@ -106,24 +143,41 @@ An oracle is never a production fallback.
 - `liquid-audio` defaults to the opaque native lifecycle. Rust model/tensor/
   generation exports and dependencies are `#[cfg(feature = "oracle")]` only.
   `liquid-audio-oracle` is `publish = false` and opts into that feature for
-  training and fixture work.
+  training and fixture work. It is currently a thin re-export; physically move
+  the oracle/training sources there before calling the repository split complete.
 - Unsupported native Metal and Moshi selections fail explicitly. There is no
   native/Candle, CPU/Metal, or model-version fallback chain.
+- The standalone `mimi_decoder_new_from_file` parity wrapper is compiled only
+  with `oracle`; it is absent from the shared header and production native
+  archive. Shipped Mimi can bind only the codec component owned by `LfmModel`.
 
 ## Remaining LFM2 follow-ons
 
-### F1 — Capacity-2 completion continuations and multi-row prefill
+### F0 — Typed audio-input stage passes
 
-The current C++ coordinator correctly owns recurrence and parks without spin, but
-it waits synchronously for each pass through the engine's single mutable request
-slot. Move to two native request/scratch slots so a completion can enqueue its
-follow-on directly. Preserve full-pass fairness and one scratch slot per in-flight
-ticket.
+Resample, frontend, and whole-Conformer math is native and uses direct buffers,
+but `lfm_model.cpp` still invokes those orchestrators synchronously on the
+session coordinator. Add typed retained requests for those stage boundaries so
+the fixed lane team owns their complete pass lifetime; do not confuse native
+math ownership with Flashkern pass ownership.
 
-Correct full/suffix/audio prefill is already native and production-owned. Add a
-checkpoint-layout BF16 multi-row specialization for long prompts without widening,
-packing, or changing row-commit order. This is a performance follow-on, not a
-reason to restore Rust recurrence or Candle ownership.
+### F1 — Capacity-2 completion continuations
+
+The engine substrate is landed: two native request/scratch slots, a capacity-2
+SQ/CQ, exact-ticket completion routing, callback-driven follow-on admission, and
+full-pass serialization. Slot generation and state form one atomic lease; exact
+CQ retains that lease across the callback, and deterministic tests cover peer
+producer handoff, stale-owner ABA, stop during execution, and capacity
+accounting. The current C++ session coordinator still parks without spin on each
+compatibility call. Move its existing recurrence transitions onto the native
+continuation path. Preserve FIFO full-pass fairness and one scratch slot per
+admitted ticket.
+
+Correct full/suffix/audio prefill is native and production-owned. Its M≤4
+checkpoint-layout BF16 specialization reuses each loaded weight vector across
+the row group without widening or packing, preserves causal KV/ShortConv commit
+order, and chunks longer prompts (including 4+3 tails) under one conversation
+execution claim.
 
 ### F2 — Physical kcoro audio-device adapter
 
@@ -151,7 +205,7 @@ offline/oracle-only and cannot serve as fallback.
 - `engine_idle_zero_spin` measured 0.003% cold-idle and 0.004% post-pass process
   CPU with eight parked lanes.
 - Rollover and schema fixtures pass on both aarch64 and x86_64/Rosetta. They cover
-  absolute RoPE, latest-window retention, whole-action reservation, shared-model
+  absolute RoPE, latest-window retention, whole-action admission, shared-model
   fairness, dtype/shape swaps with equal byte counts, missing middle layers, and
   vocabulary/codebook mismatch.
 - `cargo check -p liquid-audio --no-default-features` passes. The default feature

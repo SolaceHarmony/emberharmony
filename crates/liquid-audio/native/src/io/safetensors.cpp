@@ -202,7 +202,9 @@ struct Source {
     uint32_t component{LFM_WEIGHT_COMPONENT_MAIN};
 };
 
-struct Tensor {
+// Safetensors catalog metadata only. Payload bytes remain owned exclusively by
+// the sealed resident image; this record never owns or materializes a tensor.
+struct TensorMeta {
     std::string name;
     std::vector<uint64_t> shape;
     uint64_t offset{0};
@@ -885,7 +887,7 @@ struct PendingTensor {
 struct LfmWeightImage {
     AlignedBytes storage;
     std::vector<Source> sources;
-    std::vector<Tensor> tensors;
+    std::vector<TensorMeta> tensors;
     std::unordered_map<std::string, size_t> names[LFM_WEIGHT_COMPONENT_COUNT];
     std::vector<size_t> components[LFM_WEIGHT_COMPONENT_COUNT];
     uint64_t source_bytes{0};
@@ -995,7 +997,7 @@ void parse_shard(LfmWeightImage &image, uint32_t shard) {
                  "duplicate tensor name inside weight component: '" + tensor.name + "'");
         }
 
-        Tensor resident;
+        TensorMeta resident;
         resident.name = std::move(tensor.name);
         resident.shape = std::move(tensor.shape);
         resident.offset = source.offset + payload_start + tensor.start;
@@ -1101,7 +1103,7 @@ std::unique_ptr<LfmWeightImage> load(Resolved resolved,
     return image;
 }
 
-void fill_view(const LfmWeightImage &image, const Tensor &tensor,
+void fill_view(const LfmWeightImage &image, const TensorMeta &tensor,
                LfmTensorView &view) {
     view = {};
     view.size = sizeof(LfmTensorView);

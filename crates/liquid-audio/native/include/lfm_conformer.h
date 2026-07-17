@@ -25,6 +25,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "lfm_visibility.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -56,34 +58,43 @@ typedef struct LfmConformerGeometry {
 // `engine` is the resident Flashkern engine (lfm_engine_new) whose lane team
 // executes segment passes. Returns 0; -EINVAL on nulls/bad geometry; -ENOENT
 // with `error` filled when a required tensor is missing or mis-shaped.
-int lfm_conformer_create(void *engine, const void *weights,
-                         const LfmConformerGeometry *geometry,
-                         LfmConformer **out, char *error, size_t error_length);
-int lfm_conformer_destroy(LfmConformer *conformer);
+LFM_ORACLE_API int lfm_conformer_create(
+    void *engine, const void *weights, const LfmConformerGeometry *geometry,
+    LfmConformer **out, char *error, size_t error_length);
+LFM_ORACLE_API int lfm_conformer_destroy(LfmConformer *conformer);
 
 // Immutable residency accounting. `derived_bytes` is limited to formula-
 // derived tables (BN denominators and relative-position frequencies). Bound
 // checkpoint bytes remain views into the owner image. Materialized bytes must
 // remain zero for every forward; direct GEMM calls is an execution witness for
 // steady-state tests.
-uint64_t lfm_conformer_bound_weight_bytes(const LfmConformer *conformer);
-uint64_t lfm_conformer_derived_bytes(const LfmConformer *conformer);
-uint64_t lfm_conformer_materialized_weight_bytes(const LfmConformer *conformer);
-uint64_t lfm_conformer_direct_gemm_calls(const LfmConformer *conformer);
+LFM_ORACLE_API uint64_t
+lfm_conformer_bound_weight_bytes(const LfmConformer *conformer);
+LFM_ORACLE_API uint64_t
+lfm_conformer_derived_bytes(const LfmConformer *conformer);
+LFM_ORACLE_API uint64_t
+lfm_conformer_materialized_weight_bytes(const LfmConformer *conformer);
+LFM_ORACLE_API uint64_t
+lfm_conformer_direct_gemm_calls(const LfmConformer *conformer);
 
 // Session-owned mutable planes. Production reserves the maximum admitted mel
 // segment before readiness; subsequent forwards never grow and return
 // -ENOBUFS if admission is violated. An unreserved workspace retains the
 // transitional grow-on-first-forward behavior used by parity tests.
-int lfm_conformer_workspace_create(LfmConformerWorkspace **out);
-int lfm_conformer_workspace_destroy(LfmConformerWorkspace *workspace);
-int lfm_conformer_workspace_reserve(const LfmConformer *conformer,
-                                    LfmConformerWorkspace *workspace,
-                                    uint64_t max_mel_frames);
+LFM_ORACLE_API int
+lfm_conformer_workspace_create(LfmConformerWorkspace **out);
+LFM_ORACLE_API int
+lfm_conformer_workspace_destroy(LfmConformerWorkspace *workspace);
+LFM_ORACLE_API int lfm_conformer_workspace_reserve(
+    const LfmConformer *conformer, LfmConformerWorkspace *workspace,
+    uint64_t max_mel_frames);
 
 // Output rows for a mel segment of `mel_frames`: the dw_striding length chain
 // (three k3/s2/p1 stages), matching the Rust calc_length/mel2emb_len contract.
-uint64_t lfm_conformer_out_rows(const LfmConformer *conformer, uint64_t mel_frames);
+LFM_ORACLE_API uint64_t
+lfm_conformer_out_rows(const LfmConformer *conformer, uint64_t mel_frames);
+LFM_ORACLE_API uint64_t
+lfm_conformer_out_width(const LfmConformer *conformer);
 
 // mel: row-major (feat_in x mel_frames) BF16 bits — exactly the ChatState
 // audio_in segment layout after the prefill BF16 cast.
@@ -91,10 +102,10 @@ uint64_t lfm_conformer_out_rows(const LfmConformer *conformer, uint64_t mel_fram
 // rows, written to the caller's destination (the borrowed prefill plane).
 // Blocks until the lane team completes the segment. Returns 0; -EINVAL on
 // nulls, zero frames, or undersized capacity.
-int lfm_conformer_forward(const LfmConformer *conformer,
-                          LfmConformerWorkspace *workspace,
-                          const uint16_t *mel, uint64_t mel_frames,
-                          uint16_t *out_rows, uint64_t out_capacity_values);
+LFM_ORACLE_API int lfm_conformer_forward(
+    const LfmConformer *conformer, LfmConformerWorkspace *workspace,
+    const uint16_t *mel, uint64_t mel_frames, uint16_t *out_rows,
+    uint64_t out_capacity_values);
 
 #ifdef __cplusplus
 }

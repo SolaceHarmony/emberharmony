@@ -4,6 +4,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "lfm_visibility.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -52,9 +54,11 @@ typedef enum LfmWeightDType {
     LFM_DTYPE_U64 = 20,
 } LfmWeightDType;
 
-/* Every pointer remains valid until lfm_weights_close(image). `offset` is
- * relative to lfm_weights_data(image), so native kernels may bind one base
- * pointer and keep compact offset descriptors instead of retaining C structs. */
+/* Metadata-only borrowed view: this descriptor owns no payload storage and
+ * performs no conversion, packing, alignment repair, or relocation. Every
+ * pointer remains valid until lfm_weights_close(image). `offset` is relative to
+ * lfm_weights_data(image), so native kernels may bind one base pointer and keep
+ * compact offset descriptors instead of retaining C structs. */
 typedef struct LfmTensorView {
     uint32_t size;
     uint32_t abi_version;
@@ -85,41 +89,48 @@ typedef struct LfmWeightLoadStatsV1 {
  * files are opened first and read by a bounded positioned-I/O team directly
  * into one page-aligned resident region. After complete validation the region
  * is sealed read-only; returned tensor views remain byte-exact and immutable. */
-int lfm_weights_open(const char *path, LfmWeightImage **out,
-                     char *err, size_t errlen);
+LFM_ORACLE_API int lfm_weights_open(const char *path, LfmWeightImage **out,
+                                    char *err, size_t errlen);
 
 /* Explicit multi-file entry point for hosts that already resolved a shard set. */
-int lfm_weights_open_files(const char *const *paths, size_t count,
-                           LfmWeightImage **out, char *err, size_t errlen);
+LFM_ORACLE_API int lfm_weights_open_files(const char *const *paths, size_t count,
+                                          LfmWeightImage **out, char *err,
+                                          size_t errlen);
 
 /* Load the model checkpoint and Mimi codec with one allocation and one read
  * team. Tensor names are scoped by component, so identical keys in Main and
  * Codec are legal while duplicates inside either component remain errors. */
-int lfm_weights_open_bundle(const char *main_path, const char *codec_path,
-                            LfmWeightImage **out, char *err, size_t errlen);
+LFM_ORACLE_API int lfm_weights_open_bundle(const char *main_path,
+                                           const char *codec_path,
+                                           LfmWeightImage **out, char *err,
+                                           size_t errlen);
 
-void lfm_weights_close(LfmWeightImage *image);
+LFM_ORACLE_API void lfm_weights_close(LfmWeightImage *image);
 
-const void *lfm_weights_data(const LfmWeightImage *image);
-uint64_t lfm_weights_resident_bytes(const LfmWeightImage *image);
-size_t lfm_weights_count(const LfmWeightImage *image);
-size_t lfm_weights_component_count(const LfmWeightImage *image,
-                                   uint32_t component);
+LFM_ORACLE_API const void *lfm_weights_data(const LfmWeightImage *image);
+LFM_ORACLE_API uint64_t
+lfm_weights_resident_bytes(const LfmWeightImage *image);
+LFM_ORACLE_API size_t lfm_weights_count(const LfmWeightImage *image);
+LFM_ORACLE_API size_t
+lfm_weights_component_count(const LfmWeightImage *image, uint32_t component);
 /* Transitional native-only accounting. Source bytes exclude alignment padding;
  * resident bytes include it. The function initializes the complete V1 output. */
-int lfm_weights_load_stats(const LfmWeightImage *image,
-                           LfmWeightLoadStatsV1 *out);
+LFM_ORACLE_API int lfm_weights_load_stats(const LfmWeightImage *image,
+                                          LfmWeightLoadStatsV1 *out);
 
-int lfm_weights_at(const LfmWeightImage *image, size_t index,
-                   LfmTensorView *out);
-int lfm_weights_find(const LfmWeightImage *image, const char *name,
-                     LfmTensorView *out);
-int lfm_weights_at_component(const LfmWeightImage *image, uint32_t component,
-                             size_t index, LfmTensorView *out);
-int lfm_weights_find_component(const LfmWeightImage *image, uint32_t component,
-                               const char *name, LfmTensorView *out);
+LFM_ORACLE_API int lfm_weights_at(const LfmWeightImage *image, size_t index,
+                                  LfmTensorView *out);
+LFM_ORACLE_API int lfm_weights_find(const LfmWeightImage *image,
+                                    const char *name, LfmTensorView *out);
+LFM_ORACLE_API int lfm_weights_at_component(const LfmWeightImage *image,
+                                            uint32_t component, size_t index,
+                                            LfmTensorView *out);
+LFM_ORACLE_API int lfm_weights_find_component(const LfmWeightImage *image,
+                                              uint32_t component,
+                                              const char *name,
+                                              LfmTensorView *out);
 
-const char *lfm_weights_dtype_name(uint32_t dtype);
+LFM_ORACLE_API const char *lfm_weights_dtype_name(uint32_t dtype);
 
 #ifdef __cplusplus
 } /* extern "C" */

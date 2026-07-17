@@ -4,11 +4,21 @@ Status: **authoritative target, with the LFM2 ownership cutover implemented.**
 The working tree now has the immutable combined main+codec image, exact typed
 views, native frontend/Conformer/backbone/Depthformer/Mimi, native tokenizer and
 recurrence, per-conversation state/rollover, fixed PCM leases, reliable ticketed
-events, interruption epochs, and expected-value parking. Two follow-ons remain
-explicit: the engine still advances passes through a synchronous native
-coordinator over its single request slot rather than a capacity-2 completion
-continuation queue, and the physical mic/speaker adapter still bridges the native
-dock into the legacy Rust `VoiceEvent` surface. The full Moshi port and physical
+events, interruption epochs, and expected-value parking. Resample, frontend, and
+whole-Conformer/adapter orchestration now enter Flashkern as one typed,
+model-correlated fixed-team SQ/CQ pass over borrowed pointer spans and sealed
+conversation workspaces. Its native coordinator caller still waits synchronously;
+this pass-boundary cut is not completion-continuation recurrence. The engine now
+has a capacity-2 SQ/CQ, two per-ticket request/scratch slots, and an exact-CQ
+callback substrate that retains a packed generation/state lease for its exact
+slot and can atomically resubmit that slot without Rust progress. Deterministic
+tests cover callback-slot theft, stale-owner ABA, stop, and live-slot accounting.
+That substrate is **not yet the production graph executor**: the only chained
+proof is a private test request, and production recurrence still enters blocking
+compatibility calls. Two follow-ons remain explicit: the session coordinator
+must adopt the immutable graph/per-ticket execution boundary specified below,
+and the physical mic/speaker adapter still bridges the native dock into the
+legacy Rust `VoiceEvent` surface. The full Moshi port and physical
 kcoro device dock are subsequent tranches; neither permits a Candle fallback.
 
 This is the convergence target for specs 02, 03, 07, and 10 —
@@ -16,6 +26,11 @@ the picture they are each a slice of. It describes the end state where the entir
 inference chain, microphone PCM to speaker PCM, runs as native passes on the
 fixed Flashkern lane team, clocked by completion doorbells rather than a Rust
 loop, over one zero-copy weight pool.
+
+**Terminology is normative:** where this document says "tensor view," it means
+only pointer + byte count + dtype + shape/derived-stride metadata over an existing
+buffer. It never means an owning tensor object, framework allocation, or a
+materialized payload. Production data moves as retained buffer spans.
 
 The load-bearing observation: **the substrate for this already exists.** Flashkern
 is already a GPU-threadgroup engine — a fixed P-core lane team, generation-fence
@@ -69,15 +84,17 @@ those are the debt this retires.)
 - Every stage of the chain runs as a lane-uniform native pass on the resident
   lane team: resample, mel, Conformer, adapter, prefill + modality scatter,
   backbone prefill, backbone decode, text sampling, Depthformer, Mimi decode.
-- **Recurrence is native.** The token/frame loop is a native session state
-  machine advanced by completion continuations: a pass completion enqueues the
-  next pass directly, without a host round-trip. This is the "device recurrence"
-  row of the Flashkern GPU-equivalence table, realized.
+- **Recurrence is native.** The token/frame loop is an eagerly submitted native
+  graph: an exact pass completion advances its fixed per-ticket instance and
+  enqueues an already-resolved next pass directly, without a host round-trip.
+  This is the "device recurrence" row of the Flashkern GPU-equivalence table,
+  realized.
 - **Rust's only production roles** are the two docks and the observer:
   - dock microphone PCM in as a borrowed descriptor lease,
   - drain speaker PCM out of a borrowed descriptor lease,
   - submit control tickets (start turn, interrupt, configure),
-  - observe transcript/telemetry on a lossy side channel.
+  - observe transcript on the reliable event channel and telemetry on a lossy
+    side channel.
   Rust never blocks on a numerical completion and never owns model state.
 - Multiple conversations share one model image and one lane team; completions
   route to the correct session by conversation id and epoch.
@@ -121,9 +138,11 @@ those are the debt this retires.)
 
 ## 2. High-level design
 
-The whole chain is **one native session state machine that submits a sequence of
-passes to the existing lane team, where each pass's completion continuation
-chooses the next pass.** A native dataflow graph clocked by doorbells.
+The whole chain is **one native session state machine eagerly executing an
+immutable, model-owned pass graph on the existing lane team.** Each accepted
+command owns a fixed per-ticket execution instance. Exact completions advance
+that instance; they do not invoke an allocated list of callbacks. This is a
+precompiled native dataflow graph clocked by doorbells, not a lazy evaluator.
 
 ### 2.1 Three planes (do not merge them)
 
@@ -152,7 +171,7 @@ waveform visualization may be lossy/coalescible.
 
 ### 2.2 The shift, in one picture
 
-**Today — Rust drives, blocking, one slot:**
+**Design baseline — Rust drove, blocking, one slot:**
 
 ```
 Rust generate_with_cache loop  (holds a thread the entire turn):
@@ -165,7 +184,7 @@ Rust generate_with_cache loop  (holds a thread the entire turn):
   SQ capacity = 1 · one pass in flight · no overlap · no native recurrence
 ```
 
-**Target — native recurrence, continuation-driven:**
+**Target — eager native graph execution, exact-CQ-driven:**
 
 ```
 Rust: submit TURN ticket  (borrowed mic PCM lease) ──┐
@@ -174,17 +193,22 @@ Rust: submit TURN ticket  (borrowed mic PCM lease) ──┐
                           │        NATIVE SESSION STATE MACHINE        │
                           │  cursor · KV/conv planes · CSPRNG · epoch  │
                           └──────────────────────────────────────────┘
-   on TURN accepted ─▶ PASS(resample→mel→conformer→adapter→prefill) ─▶ CQ ─┐
-                                                                            │ completion
-   ┌────────────────────────────────────────────────────────────────────┐ │ continuation
-   │ on prefill done ─▶ PASS(decode token t) ─▶ lanes ─▶ CQ ─────────────┼─┤
-   │ on token done   ─▶ (native sample) ─▶ PASS(depth frame t) ─▶ CQ ────┼─┤
-   │ on frame done   ─▶ PASS(mimi decode t) ─▶ lanes ─▶ CQ ──────────────┼─┤
-   │ on pcm ready    ─▶ publish PCM lease to speaker dock ───────────────┼─┤
-   │ if not EOS      ─▶ PASS(decode token t+1)   (native loop, no host) ─┘ │
-   └──────────────────────────────────────────────────────────────────────┘
+   TURN accepted ─▶ GraphInstance(graph=TURN, pc=AUDIO_ENCODE)
+                              │
+                              ├─▶ PASS(audio encode + prefill) ─▶ CQ ─┐
+                              │                                      │ exact-CQ:
+                              ├─▶ PASS(token + sample) ─▶ CQ ─────────┤ advance pc;
+                              │         │                            │ submit one
+                              │         ├─ text ─▶ fixed result cell ├ ready pass
+                              │         │                            │ or release
+                              │         └─ audio                     │ exact slot
+                              │              │ retained playback     │
+                              └◀─ recur ◀─ CQ(Mimi) ◀─ CQ(Depth) ◀───┘
+
+   session coordinator: result cell ─▶ reliable text / PCM publication
+                        external pressure ─▶ park instance, then re-admit
 Rust only: fills the mic lease, drains the speaker lease, reads the transcript.
-SQ capacity ≥ 2 · next pass queued by the continuation · zero host wait.
+SQ capacity ≥ 2 · no synchronous numerical wait · no bridge-thread I/O wait.
 ```
 
 ### 2.3 Components
@@ -194,10 +218,140 @@ SQ capacity ≥ 2 · next pass queued by the continuation · zero host wait.
 | **Weight image** | One allocation containing byte-exact main+codec source files; tensor views are `base + offset` and may be unaligned. | **Landed; page-table read-only after validation.** |
 | **Scratch arenas** | Per-plan/per-conversation storage sized before readiness; zero steady-state growth. | **Landed for the complete LFM2 chain.** |
 | **Session state machine** | One per conversation. Owns cursor, KV/conv planes, sampler CSPRNG, codec state, epoch, and recurrence. | **Landed natively; Rust no longer drives model progress.** |
-| **Pass program set** | Native resample, mel, Conformer, prefill, token, Depthformer, and Mimi stages. | **Landed for LFM2.** Multi-row prefill optimization remains open. |
-| **SQ/CQ (capacity ≥ 2) + completion continuation** | A completion may enqueue its follow-on without a synchronous coordinator wait. | **Open.** Current native coordinator parks correctly on a capacity-1 engine slot. |
+| **Pass program set** | Native resample, mel, Conformer, prefill, token, Depthformer, and Mimi stages. | **Typed boundary landed for LFM2.** Resample/frontend/whole-Conformer/adapter is one model-correlated SQ/CQ request over borrowed spans and conversation-owned workspace; its Conformer GEMMs are in-ticket team substages rather than recursive submissions. The native coordinator still submits and waits for that request synchronously, so graph-executor integration remains open. |
+| **Immutable execution graphs** | Model-owned, eagerly executed, prevalidated opcode/DAG descriptions over typed views; no callback objects, lazy evaluation, or per-turn graph construction. | **Not landed.** Production still encodes recurrence in `voice_session.cpp` / `lfm_model.cpp` call flow. |
+| **Per-ticket graph instances** | Fixed records carrying graph id, program counter/dependencies, epoch, conversation scratch lease, retained I/O leases, and terminal state. | **Not landed.** Current `PassSlot` owns one request and scratch bank, not a complete turn execution. |
+| **SQ/CQ (capacity ≥ 2) + exact-CQ callback substrate** | A completion can retain and tail-resubmit its exact slot without a synchronous coordinator wait. | **Engine substrate landed.** Capacity 2, exact ticket routing, generation-checked exact-slot resubmission, and per-ticket scratch are live and adversarially tested. The private PRNG chain proves the mechanism; session recurrence still submits through the synchronous compatibility rim. |
 | **Docks** | Generation-checked mic/speaker PCM leases and bounded control/events. | **Native dock landed.** Physical Rust device adapter remains a later tranche. |
 | **Host collapse** | Rust submits tickets, services PCM, and observes events; it owns no model state. | **Landed in the desktop production path; oracle rims are non-release.** |
+
+### 2.4 Ticket means a graph execution instance
+
+A production inference ticket does not name one C++ function call. It names one
+execution of a model-owned, immutable graph over prebound views. Graphs are built
+and validated when `LfmModel` becomes ready, then published read-only with the
+model plan:
+
+```c++
+struct GraphNode {
+    GraphOpcode opcode;          // preselected kernel/pass family
+    uint32_t dependency_mask;    // bounded graph, no pointer chasing
+    uint32_t input_bindings;     // indices into validated view/lease tables
+    uint32_t output_bindings;
+    uint32_t scratch_class;
+    CommitPolicy commit;
+    GraphEdge success;
+    GraphEdge alternate;         // bounded result branch: EOS/modality/etc.
+};
+
+struct GraphPlan {
+    GraphId id;
+    std::span<const GraphNode> nodes;
+    uint32_t entry;
+    uint32_t max_live_leases;
+    uint32_t max_scratch_class;
+};
+```
+
+The concrete representation may pack these fields, but the ownership law does
+not change. Plan construction resolves tensor dtype/shape/stride, kernel
+specialization, input/output alias legality, scratch high-water bounds, and all
+edge targets. Execution performs no tensor-name lookup, dtype branch, graph
+allocation, function-object allocation, or callback-list traversal. The graph
+is not a public JIT format and cannot contain arbitrary function pointers. A
+declared recurrence edge may return to an earlier node; all other dependency
+edges are acyclic and are validated as such.
+
+**Evaluation is eager.** Model-open resolves every opcode and edge into a
+private, direct-threaded/prelinked continuation table. An edge is a validated
+index into that closed table, not a late name lookup or heap callback. Once a
+command has retained its declared inputs, outputs, scratch, and result cells,
+submit dispatches the entry pass immediately. Compute opcodes are coarse fused
+passes such as audio-encode, token, Depthformer, and Mimi—not deferred scalar or
+tensor expressions. Coroutine tokens may suspend only on a real dependency:
+an exact CQ, an unavailable predeclared I/O/result lease, an epoch/control edge,
+or a conversation scheduling quantum. There is no deferred array, `eval`,
+partial evaluation, dynamic graph recording, on-demand output allocation, or
+first-use plan construction anywhere on the inference path.
+
+Each accepted turn uses a record from a fixed session-owned pool:
+
+```c++
+struct GraphInstance {
+    TicketId ticket;
+    GraphId graph;
+    uint32_t pc;
+    uint32_t ready_mask;
+    uint32_t complete_mask;
+    uint64_t epoch;
+    ConversationLease conversation;
+    ScratchLease scratch;
+    CaptureLease input;
+    PlaybackLease output;
+    CompletionCellLease result;
+    uint32_t quantum_left;
+    AtomicTerminal terminal;
+};
+```
+
+These are ownership fields, not necessarily the public layout. Every pointer
+read by a node is reachable through one retained lease in the instance. The
+instance is bound to exactly one conversation scratch generation and can borrow
+one exact engine `PassSlot` only while a node is queued or running. The graph
+instance outlives individual engine passes; the pass slot does not have to.
+
+This distinction is essential for capacity two: retaining an engine slot across
+an unbounded turn would leave only one slot for every other conversation. A
+bounded node quantum returns the instance to the native ready queue and releases
+the exact slot. Re-admission later restores the same `pc`, dependency facts,
+epoch, scratch generation, and leases without reconstructing the graph.
+
+### 2.5 The non-blocking completion boundary
+
+`bridge_main` is the sole native SQ consumer **and** CQ consumer. Therefore its
+exact-CQ callback has a deliberately tiny contract:
+
+1. validate the exact ticket, pass-slot generation, graph instance generation,
+   conversation id, and epoch;
+2. record the node terminal fact and apply its predeclared commit policy;
+3. advance `pc` / dependency bits;
+4. tail-submit at most one already-ready numerical node using the retained exact
+   slot, **or** release that slot and publish the instance to a pre-reserved
+   session completion/ready cell;
+5. ring one expected-value doorbell.
+
+It must never call a synchronous engine API, wait, allocate, tokenize or format
+text, reserve a PCM slot, publish into a potentially full reliable event ring,
+invoke Rust/Tauri, or run a user callback. In particular, calling the current
+`lfm_conversation_next_native` or `lfm_conversation_decode_native` from this
+callback would deadlock: both submit and synchronously wait on the same bridge
+thread that is executing the callback.
+
+The session coordinator owns all publication work that can encounter
+backpressure. It drains fixed graph-result cells, attempts reliable
+text/terminal or PCM publication, services control/interrupts, and re-admits
+graph instances whose external resource became available. A full destination
+parks that instance in a fixed set; it does not make the coordinator wait inside
+the publication call while unrelated ready work exists. The coordinator never
+waits synchronously for a numerical CQ. Only when no command, result,
+resource-ready edge, or graph instance is runnable does it park on the composite
+shared expected-value predicate. The bridge remains free to consume other SQ/CQ
+cells throughout.
+
+**Playback is admission, not a completion-side allocation.** Before a Mimi node
+may be submitted, its graph instance must already retain a playback reservation
+large enough for the complete fixed-capacity PCM result. The Mimi pass writes
+directly into that reservation. If the interleave schedule says an audio branch
+is next, the session reserves the output before admitting the branch; no space
+means the graph instance parks without holding an engine slot. If Depthformer
+produces EOAudio, the unused reservation is released exactly once. A stale epoch
+also releases rather than publishes it.
+
+Reliable text has the same pressure law even though its payload is small: a
+fixed graph-result cell is reserved before the producing node is admitted. If
+the reliable channel cannot accept that cell, the graph parks at the publication
+boundary and releases its compute slot. Telemetry may be dropped; text,
+terminal records, and PCM ownership facts may not.
 
 ---
 
@@ -248,9 +402,12 @@ pointers across the pass boundary instead.
 
 ### 3.3 The native recurrence loop (the heart)
 
-Replace the Rust `generate_with_cache` state machine with a native one. On each
-token-pass completion the session continuation, running on the bridge/dispatcher
-side with no host involvement:
+The Rust `generate_with_cache` state machine has been replaced by a native one.
+As built, the C++ session coordinator performs the following steps after parking
+for each exact completion through synchronous compatibility calls. The target
+does not transplant that loop into a bridge-thread callback. It encodes the
+ordered math as an immutable graph and lets the ticket's `GraphInstance` advance
+between nodes:
 
 1. reads the sampled token (sampling already native, folded into the pass),
 2. checks stop / EOS,
@@ -259,46 +416,78 @@ side with no host involvement:
    frame — per the interleave schedule.
 
 ```
-          ┌──────── token-pass CQ ────────┐
-          ▼                                │
-   [session.on_token] ── EOS? ──▶ yes ──▶ finish turn, publish terminal CQ
-          │  no                            ▲
-          ├─▶ submit DEPTH_FRAME ─▶ CQ ─▶ [session.on_frame]
-          │                                   │
-          │                                   ├─▶ submit MIMI_FRAME ─▶ CQ ─▶ [session.on_pcm]
-          │                                   │                                  │
-          │                                   │                        publish PCM lease ─▶ speaker dock
-          └─▶ submit TOKEN_PASS(t+1) ◀────────┘  (interleave per schedule)
+          ┌──────── token-pass CQ ──────────────┐
+          ▼                                      │
+   GraphInstance(pc=TOKEN_DONE) ── EOS? ─▶ terminal-result cell
+          │  no
+          ├─▶ ready(DEPTH_FRAME) ─▶ CQ ─▶ pc=DEPTH_DONE
+          │                                │
+          │                                ├─▶ ready(MIMI_FRAME,
+          │                                │          retained playback lease)
+          │                                │              │
+          │                                │              ▼ CQ
+          │                                │       completed-PCM result cell
+          └─▶ ready(TOKEN_PASS t+1) ◀──────┘
+
+session coordinator: drain fixed result cell → reliable publish / re-admit
 ```
 
-- **Interrupt / barge-in.** An interrupt marks the publication epoch stale
-  immediately. The in-flight pass reaches its fence, finds it cannot publish stale
-  audio, and rings a terminal completion; the session rolls back any speculative
-  branch. No assembly instruction is preempted mid-flight; correctness comes from
-  the epoch check at the fence, not from cancellation. (Self-interruption / echo
-  cancellation is a separate concern tracked elsewhere.)
-- **Backpressure.** If the speaker dock's lease ring is full (playback is behind),
-  the continuation parks the next Mimi pass on the dock's expected-value word —
-  zero-spin backpressure, resumed by the drain doorbell.
+The exact-CQ callback may take a ready edge only when every input, output,
+scratch, and result-cell lease for the destination node is already retained. If
+an edge requires external capacity, it releases the compute slot, places the
+instance in the session's fixed parked set, and rings the session doorbell. The
+session coordinator later re-admits the same instance; it does not rebuild the
+graph or replay a completed node.
 
-### 3.4 Prefill + modality scatter as a native pass
+### 3.4 Cancellation and resource retirement
 
-This is the largest remaining Candle island and the hardest "no tensors" code.
-Today `prefill_suffix` / `prefill_inputs` build the embedding plane by scattering
-text embeddings, native-Conformer audio-in rows, and audio-out codebook
-embeddings by modality flag — pure Candle `index`/`cat`/scatter — and the
-multi-token backbone walk takes the Candle path (only `seq==1` decode is native).
+- **Epoch first.** Interrupt / barge-in advances the publication epoch before
+  waking either coordinator. Every graph instance and every SQ record carries
+  its captured epoch. An already accepted assembly pass reaches its boundary,
+  but an old-epoch result cannot publish text or PCM and cannot enqueue another
+  numerical node.
+- **Commit is a node property.** Each graph node declares whether successful
+  conversational state commits before publication, commits only with reliable
+  publication, or is speculative and rolls back. An emission delivered before
+  interruption remains history: its pending token/code tuple is committed
+  without another sample so KV/ShortConv agrees with the reliable transcript and
+  audio stream. No generic cancellation path guesses this policy.
+- **One terminal winner.** Completion, stale epoch, interrupt, fault, and stop
+  race through one generation-checked terminal claim on the graph instance.
+  Losers do not publish or release resources a second time.
+- **Retire after the last possible reader.** A capture lease releases only after
+  its final frontend/prefill node completes. An unpublished playback reservation
+  releases on EOAudio, stale epoch, cancellation, or fault. A result-cell lease
+  releases after the coordinator consumes it. Conversation and scratch leases
+  release only after the final accepted CQ is consumed and no parked/publication
+  record can refer to them. Slot generation is recycled last.
+- **Stop closes admission, then drains.** Stop prevents new graph and pass
+  admission, advances the epoch, and wakes every parked predicate. Accepted
+  nodes settle; callbacks return their instances to the retirement queue instead
+  of taking recurrence edges. Join waits for zero live graph instances, engine
+  slots, descriptors, result cells, capture leases, and playback leases before
+  model/session destruction.
 
-Target: the scatter becomes an assembly gather leaf writing the embedding plane
-into scratch; the multi-token walk reuses the existing per-layer stages over
-`seq > 1`; the KV append is already a native plane, so ownership of the cache
-moves from the Candle `Cache` struct to the native session.
+No cancellation or stop path waits on the bridge thread, frees a pointer still
+reachable from an SQ/CQ record, or preempts an assembly operation.
 
-Because prefill is **per-turn, not per-token**, its latency payoff is smaller than
-the decode loop's — so it is sequenced late (P4), after the hot loop is fully
-native. It is the last thing that lets the chain be *called* native.
+### 3.5 Prefill + modality scatter as a native pass
 
-### 3.5 The docks (I/O plane) — kcoro-rs, no std channels
+The Candle scatter/cache owner is gone from production. C++ admits the whole
+turn without mutating the window, then feeds text embedding rows or
+Conformer-adapted BF16 buffer views into
+`REQ_PREFILL` in causal groups of at most four. The kernel reads checkpoint BF16
+directly, reuses each loaded weight vector across the group, and commits native
+KV/ShortConv state in order. Longer inputs are chunked without exposing an
+embedding plane to Rust.
+
+The data and typed-executor boundary is now closed: one model-correlated audio
+encode request carries resample, frontend, and whole-Conformer/adapter over
+borrowed pointer spans and sealed conversation workspace. The remaining boundary
+is recurrence ownership: the native coordinator still submits and waits for this
+request synchronously instead of advancing it through a graph instance.
+
+### 3.6 The docks (I/O plane) — kcoro-rs, no std channels
 
 The dock is where Rust std channels are dumped. Every hand-off below is a
 kcoro-rs `ring` (bounded SPSC, `SendFuture`/`RecvFuture` that park on wake) or a
@@ -327,11 +516,12 @@ The ~57 std-channel sites in the current voice runtime are retired here; the
 `ThreadManager`/`done_rx` polling that motivated the coroutine work in the first
 place is replaced by ring/promise waits.
 
-### 3.6 Host collapse
+### 3.7 Host collapse
 
-`NativeEngine.pass_lock` exists solely because the C engine is single-slot and
-Rust blocks per pass. Once the session drives recurrence natively and the SQ has
-depth, the lock and every blocking `submit_pass` rim are deleted. Rust's engine
+`NativeEngine.pass_lock` now protects only the blocking compatibility rim; the
+private exact-CQ proof can use the capacity-2 per-ticket slots directly. Once the
+session drives recurrence through immutable graph instances, the lock and every
+blocking `submit_pass` rim are deleted. Rust's engine
 surface collapses to: create session, submit TURN ticket with a mic lease,
 receive PCM leases, submit control tickets. That is spec 10's end state.
 
@@ -339,12 +529,39 @@ receive PCM leases, submit control tickets. That is spec 10's end state.
 
 ## 4. Scale & reliability
 
-- **Many conversations, one image.** One weight pool, one lane team. Completions
-  route by `conversation_id` / `epoch` to the right session continuation. Fairness
-  uses the existing service classes (`DEADLINE` / `INTERACTIVE` / `BACKGROUND`)
-  and ticket hierarchy; the dispatcher round-robins passes across live sessions.
-  The lane team still runs **one pass at a time** (it is a threadgroup) — SQ depth
-  buys queueing and overlap, not parallel passes.
+### 4.1 Scheduling and fairness
+
+One weight image and one lane team serve many conversations. The lane team still
+runs **one numerical pass at a time** (it is a threadgroup); SQ depth buys a
+queued successor and removes host round trips, not concurrent mutation of the
+stage board.
+
+The as-built exact-CQ substrate is FIFO over two descriptor-addressed pass slots.
+A private test continuation tail-submits its same slot, which lets an already
+queued peer run first. That is necessary, but it is not a broker and does not
+prove fairness for more than two live graph instances.
+
+The graph executor adds a fixed-capacity model/runtime ready broker:
+
+- ready instances are grouped by bounded service class (`DEADLINE`,
+  `INTERACTIVE`, `BACKGROUND`) and ordered FIFO within a conversation quantum;
+- a callback may retain its exact pass slot only for a bounded number of
+  immediately ready nodes;
+- at quantum exhaustion, external backpressure, cancellation, or a node that
+  lacks a retained resource, it releases the pass slot and returns the graph
+  instance to the broker/parked set;
+- age promotion prevents a continuously recurring conversation from starving a
+  third conversation when engine capacity is two;
+- an interrupt/control edge may outrank future numerical admission, but it does
+  not preempt a running assembly node;
+- dispatch always revalidates instance generation, conversation id, epoch, and
+  scratch generation before mounting views on the lane board.
+
+No fairness mechanism polls. Enqueue and quantum-return ring the broker's shared
+expected-value doorbell.
+
+### 4.2 Throughput and failure
+
 - **Bandwidth is the decode ceiling.** M2 Max is 400 GB/s; the engine currently
   realizes ~66 of a ~250 GB/s practical bound. Decode is M=1 GEMV — every token
   streams the whole model, so tok/s ≈ model_bytes / bandwidth. The pool does not
@@ -356,10 +573,55 @@ receive PCM leases, submit control tickets. That is spec 10's end state.
 - **Failure is terminal, not degraded.** No fallback. A rejected pass (stale
   epoch, unmet gate) is a terminal completion with a cause; the session decides
   (abort the turn), it never silently drops to Candle.
-- **Reliability harness** (already specified in 03 / 11): the 1M-pass soak, stop
-  during every submit/dispatch/fence/CQ phase, zero allocation after readiness,
-  two conversations scheduled fairly over one image, p50/p95/p99/max latency, and
-  ASan/UBSan/TSan across aarch64 / x86_64 / Rosetta.
+
+### 4.3 Deterministic graph-executor acceptance tests
+
+The current exact-slot theft, stale-owner ABA, active-pass stop/drain, and live
+slot accounting tests validate only the landed substrate. The graph cutover is
+not complete until deterministic tests also prove:
+
+1. **Plan validation:** bad node indices, undeclared cycles, missing kernel
+   specializations, wrong view dtype/shape/stride, illegal aliases, and scratch
+   or lease high-water overflow fail before model publication. The published
+   plan is immutable and has a stable digest.
+2. **Ordered graph math:** token → Depthformer → Mimi runs from one graph
+   instance with full hidden/logit/code/PCM parity, while every node receives the
+   exact prebound view and conversation scratch generation.
+3. **More-than-capacity fairness:** at least three multi-node graph instances run
+   through a capacity-2 engine with a quantum of one. A captured dispatch trace
+   proves bounded round-robin/age promotion; no instance retains a pass slot
+   across its quantum and all three make progress.
+4. **Peer arrival during recurrence:** a peer submitted after node 1 but before
+   node 2 is dispatched before the recurring instance can exceed its quantum.
+   Repeating this for more than two graph edges produces the same trace.
+5. **Backpressure split:** fill the reliable result ring and the playback ring,
+   separately. The affected instance parks with zero engine slots retained; the
+   sole bridge thread continues settling an unrelated ticket. Draining the exact
+   ring wakes and resumes only the parked instance—no retry loop.
+6. **Playback admission:** Mimi is never dispatched without a retained,
+   capacity-checked playback reservation. EOAudio, stale epoch, fault, and stop
+   each release an unused reservation exactly once; successful Mimi writes
+   directly into and publishes that same reservation.
+7. **Interrupt at every boundary:** advance epoch before submit, while queued,
+   while running, after CQ before resubmit, while parked for reliable output,
+   and while parked for playback. Accepted math may settle, but no stale graph
+   publishes or takes another numerical edge.
+8. **Stop and retirement:** stop from every state produces one terminal winner
+   and joins with zero graph instances, pass slots, descriptors, result cells,
+   capture leases, playback leases, and wait registrations. Owner-drop ordering
+   runs under ASan/UBSan/TSan.
+9. **No bridge blocking:** instrument the exact-CQ callback and fail if it calls
+   a synchronous engine/model API, waits, allocates, formats text, reserves a
+   dock slot, or invokes a host callback. A stalled session coordinator cannot
+   prevent the bridge from consuming another accepted SQ/CQ pair.
+10. **Steady state:** one million graph-node completions allocate nothing after
+    readiness, use no timed waits/sleeps/spin, leave every lease counter at zero,
+    and preserve the existing idle CPU gate on aarch64 and x86_64/Rosetta.
+
+Load tests continue to report p50/p95/p99/max latency. Two conversations sharing
+one image remain the numerical-isolation gate; the fairness gate uses at least
+three instances so it cannot accidentally pass because the SQ and slot capacity
+are both two.
 
 ---
 
@@ -384,11 +646,12 @@ receive PCM leases, submit control tickets. That is spec 10's end state.
    complete. Resolution: Candle is a *build-time / offline* oracle, never wired as
    a runtime fallback. The runtime gate is "native or terminal error," consistent
    with the Mimi-required rule.
-5. **Apple direct BF16 kernels vs Accelerate staging.** The current M>1 path
-   widens the complete RHS into `gemm_amx_*`; that is weight materialization and
-   is forbidden by the image contract. Replace it with a checkpoint-layout BF16
-   kernel. Activation scratch may change precision when the numerical contract
-   requires it, but resident weights are loaded and unlifted only in registers.
+5. **Apple direct BF16 kernels vs Accelerate staging.** Resolved in favor of the
+   image contract: the M≤4 path reads checkpoint-layout BF16 directly and reuses
+   each loaded weight vector across the active rows. It creates no widened RHS,
+   packing buffer, or layout copy. Activation scratch may change precision when
+   the numerical contract requires it, but resident weights are unlifted only in
+   registers.
 6. **Prefill native vs leaving it Candle.** Prefill is per-turn, but it is the
    ownership gate for deleting the remaining compatibility image. Develop it
    offline against Candle fixtures; do not ship a hybrid native/Candle fallback.
@@ -421,16 +684,26 @@ describes is now landed for LFM2:
   devices. Frontend, Conformer, Mimi, modality assembly, tokenizer, sampling,
   recurrence, and context rollover are native-owned.
 
-The consequence: **`compatibility_copied_bytes == 0` cannot precede native
-prefill.** The Candle model is what performs prefill today, so its weight copy
-cannot be deleted until prefill is native. A standalone "weight-pool P1" is
-therefore both unnecessary (no repack) and not isolatable (Candle owns prefill).
-The right shape is not "build a pool," it is **"close the native model's two gaps
-and adopt it"** — which deletes the Candle copy, the Candle prefill, and the Rust
-recurrence loop together, because native recurrence (`lfm_conversation_step` /
-`_audio_frame`) already exists.
+That sequencing constraint has now been discharged: native prefill and atomic
+desktop adoption landed together, so `compatibility_copied_bytes == 0` is the
+production gate rather than an aspirational counter. The resident image remains
+the only weight pool.
 
-### 6.1 Phases (reordered)
+### 6.1 Historical phase record and live follow-ons
+
+P0–P3 below are retained as migration rationale, not current-state claims. Their
+numerical ownership outcomes are landed; their asynchronous scheduling outcome
+is not. The live LFM2 work is now:
+
+1. build and validate the immutable, direct-threaded LFM2 graph set at
+   model-open, plus the fixed graph-instance/result-cell pools and fair ready
+   broker;
+2. route the landed coarse audio-encode, prefill, token, Depthformer, and Mimi
+   passes through those eager graph instances, with pre-retained playback/text
+   capacity and exact-CQ advancement, then delete synchronous coordinator waits;
+3. replace the transitional Rust PCM/`VoiceEvent` adapter with physical kcoro
+   audio-device docks;
+4. physically move oracle/training sources into `liquid-audio-oracle`.
 
 Each phase ends at a gate and deletes the Rust/Candle owner it replaces.
 
@@ -495,25 +768,27 @@ Each phase ends at a gate and deletes the Rust/Candle owner it replaces.
   gap b).** Move the interleaved generate schedule into the native session so
   `generate_with_cache` / `generate_interleaved` and the Candle
   `LFM2AudioModel` / `Lfm2Model` construction and `candle_builder` all delete
-  together; the SQ gains depth (capacity 2) and completion continuations chain
-  decode → depth → mimi; `pass_lock` and the blocking rims go. *Gate:*
+  together; the SQ gains depth (capacity 2) and an immutable eager graph chains
+  decode → depth → Mimi through exact-CQ advancement; `pass_lock` and the
+  blocking rims go. *Gate:*
   `compatibility_copied_bytes == 0` for LFM2; RAM halves; 1M-pass soak;
-  two-conversations-fair; zero-alloc-after-ready; idle `< 0.1%`; Rust no longer
-  blocks a numerical CQ. (This is the old P1+P2+P4 collapsed, because the native
-  vehicle already exists.)
-- **P4 — Zero-copy docks (kcoro-rs).** Mic/speaker descriptor leases over kcoro-rs
-  rings/promises; dump the std channels and the `ThreadManager`/`done_rx` polling;
-  delete the remaining `Tensor` round-trip at the Mimi seam. *Gate:* no `Tensor`
-  in the data plane and no std channel on the audio path (static audit).
+  at least three graph instances fair through the capacity-2 executor;
+  zero-alloc-after-ready; idle `< 0.1%`; no session coordinator blocks on a
+  numerical CQ. (This is the old P1+P2+P4 collapsed, because the native vehicle
+  already exists.)
+- **P4 — Physical zero-copy docks (open).** Native mic/speaker descriptor leases,
+  expected-value rings, and the direct Mimi-to-playback-reservation seam are
+  landed. Replace the remaining Rust device/`VoiceEvent` copies and std-channel
+  adapter with physical kcoro device callbacks. *Gate:* no owned PCM copy or std
+  channel on the audio path (static audit).
 - **P5 — Finish the Moshi port to Flashkern.** Moshi is a supported model; carry
   its partially-native pipeline the rest of the way onto the lane team and the
   resident image, then delete Candle from the shipped graph entirely. Until then
   Moshi is unwired from the default but remains buildable / exercised offline.
 
-**Moshi default switch (atomic-cutover gate):** flip the default engine from
-`MoshiRealtime` to `Lfm2Interleaved` only when the native LFM2 session passes the
-product gate. Moshi remains selectable/offline until its native port replaces
-the Candle implementation; production never falls back between them.
+**Moshi default-switch outcome:** the shipped default is native LFM2. Moshi is
+offline/oracle-only until its native port replaces the Candle implementation;
+production never falls back between them.
 
 **Revisit as it grows:** SQ capacity (2 → N as multi-conversation load rises);
 arena high-water sizing under long contexts; an E-core `BACKGROUND` lane for

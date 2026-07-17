@@ -23,6 +23,8 @@ struct LfmNativeEmission {
     uint32_t codes[LFM_AUDIO_TOKEN_CAPACITY];
 };
 
+struct MimiDecodeState;
+
 /* Private, pointer-free window state shared with focused native tests. `position`
  * is the live cache length; `cursor` is the monotonic number of committed model
  * passes. `start` is the physical row offset inside capacity+runway storage and
@@ -57,6 +59,11 @@ struct LfmMixedTurnPlan {
 extern "C" int lfm_context_window_reserve(LfmContextWindowState *window,
                                            size_t needed,
                                            LfmContextWindowMove *move);
+extern "C" int lfm_context_window_admit(const LfmContextWindowState *window,
+                                         size_t needed);
+extern "C" int lfm_context_window_prefill_chunk(
+    const LfmContextWindowState *window, size_t remaining, size_t max_rows,
+    size_t *out_rows);
 extern "C" int lfm_context_window_commit(LfmContextWindowState *window);
 extern "C" int lfm_context_compact_bf16(uint16_t *plane, size_t heads,
                                          size_t head_stride, size_t head_dim,
@@ -66,31 +73,42 @@ extern "C" int lfm_mixed_turn_plan(size_t capacity, size_t prefix_tokens,
                                      size_t text_tokens, size_t audio_rows,
                                      size_t assistant_tokens,
                                      LfmMixedTurnPlan *out);
+/* Private publication decision kept testable without exposing codec codes in
+ * the product ABI: 1 = decode/publish PCM, 0 = recurrence-only EOAudio. */
+extern "C" LFM_INTERNAL_API int lfm_native_emission_needs_pcm(
+    const LfmNativeEmission *emission);
 
 /* Private session/model seam. No declaration in the product or Rust ABI. */
-int lfm_conversation_prepare_pcm_native(LfmConversation *conversation,
-                                        size_t max_sample_count,
-                                        uint32_t sample_rate);
-int lfm_conversation_begin_pcm_native(LfmConversation *conversation,
-                                      const float *pcm, size_t sample_count,
-                                      uint32_t sample_rate,
-                                      LfmNativeEmission *out);
-int lfm_conversation_begin_text_native(LfmConversation *conversation,
-                                       const char *text, size_t text_bytes,
-                                       LfmNativeEmission *out);
-int lfm_conversation_begin_mixed_native(LfmConversation *conversation,
-                                        const char *text, size_t text_bytes,
-                                        const float *pcm, size_t sample_count,
-                                        uint32_t sample_rate,
-                                        LfmNativeEmission *out);
-int lfm_conversation_next_native(LfmConversation *conversation,
-                                 LfmNativeEmission *out);
-int lfm_conversation_interrupt_native(LfmConversation *conversation);
-int lfm_conversation_decode_native(LfmConversation *conversation,
-                                   const uint32_t *codes, size_t code_count,
-                                   float *pcm, size_t pcm_capacity,
-                                   size_t *out_samples);
-int lfm_conversation_belongs_to(const LfmConversation *conversation,
-                                const LfmModel *model);
+LFM_INTERNAL_API int lfm_conversation_prepare_pcm_native(
+    LfmConversation *conversation, size_t max_sample_count,
+    uint32_t sample_rate);
+LFM_INTERNAL_API int lfm_conversation_begin_pcm_native(
+    LfmConversation *conversation, const float *pcm, size_t sample_count,
+    uint32_t sample_rate, LfmNativeEmission *out);
+LFM_INTERNAL_API int lfm_conversation_begin_text_native(
+    LfmConversation *conversation, const char *text, size_t text_bytes,
+    LfmNativeEmission *out);
+LFM_INTERNAL_API int lfm_conversation_begin_mixed_native(
+    LfmConversation *conversation, const char *text, size_t text_bytes,
+    const float *pcm, size_t sample_count, uint32_t sample_rate,
+    LfmNativeEmission *out);
+LFM_INTERNAL_API int
+lfm_conversation_next_native(LfmConversation *conversation,
+                             LfmNativeEmission *out);
+LFM_INTERNAL_API int
+lfm_conversation_interrupt_native(LfmConversation *conversation);
+LFM_INTERNAL_API int lfm_conversation_decode_native(
+    LfmConversation *conversation, const uint32_t *codes, size_t code_count,
+    float *pcm, size_t pcm_capacity, size_t *out_samples);
+LFM_INTERNAL_API int
+lfm_conversation_belongs_to(const LfmConversation *conversation,
+                            const LfmModel *model);
+
+/* Private typed engine pass. Raw codec codes and playback reservations never
+ * cross the product lifecycle/session ABI. */
+extern "C" LFM_INTERNAL_API int lfm_engine_mimi_decode(
+    void *engine, uint64_t model_id, MimiDecodeState *state,
+    const uint32_t *codes, size_t code_count, float *pcm_out,
+    size_t pcm_capacity, size_t *out_samples);
 
 #endif /* LFM_MODEL_INTERNAL_H */

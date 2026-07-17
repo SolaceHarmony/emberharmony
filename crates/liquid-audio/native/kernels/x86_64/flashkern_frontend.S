@@ -1,3 +1,5 @@
+#include "lfm_asm_visibility.h"
+
 // Audio-frontend leaves, x86_64 twin of aarch64/flashkern_frontend.S.
 // Scalar SSE2 on purpose (utterance-rate, parity-oracle op order, no FMA).
 // Dual ABI like the sibling leaves: SysV (rdi rsi rdx rcx r8 r9 / xmm0-) and
@@ -16,6 +18,7 @@
 // int lfm_preemph_f32(const float *x, float *y, uint64_t n, float coef)
 .p2align 4
 .globl LFM_SYM(lfm_preemph_f32)
+LFM_PRIVATE(LFM_SYM(lfm_preemph_f32))
 LFM_SYM(lfm_preemph_f32):
 #ifdef _WIN32
     movq      %rcx, %r10
@@ -57,6 +60,7 @@ LFM_SYM(lfm_preemph_f32):
 // void lfm_power_spec_f32(const float *re, const float *im, float *out, uint64_t n)
 .p2align 4
 .globl LFM_SYM(lfm_power_spec_f32)
+LFM_PRIVATE(LFM_SYM(lfm_power_spec_f32))
 LFM_SYM(lfm_power_spec_f32):
 #ifdef _WIN32
     movq      %rcx, %r10
@@ -87,6 +91,7 @@ LFM_SYM(lfm_power_spec_f32):
 // int lfm_log_add_f32(float *x, uint64_t n, float guard)
 .p2align 4
 .globl LFM_SYM(lfm_log_add_f32)
+LFM_PRIVATE(LFM_SYM(lfm_log_add_f32))
 LFM_SYM(lfm_log_add_f32):
 #ifdef _WIN32
     .seh_proc LFM_SYM(lfm_log_add_f32)
@@ -151,6 +156,7 @@ LFM_SYM(lfm_log_add_f32):
 //                     uint64_t valid, float constant, float *mean, float *std)
 .p2align 4
 .globl LFM_SYM(lfm_rowstat_f32)
+LFM_PRIVATE(LFM_SYM(lfm_rowstat_f32))
 LFM_SYM(lfm_rowstat_f32):
 #ifdef _WIN32
     .seh_proc LFM_SYM(lfm_rowstat_f32)
@@ -233,6 +239,7 @@ LFM_SYM(lfm_rowstat_f32):
 //                         uint64_t rows, uint64_t cols)
 .p2align 4
 .globl LFM_SYM(lfm_norm_apply_f32)
+LFM_PRIVATE(LFM_SYM(lfm_norm_apply_f32))
 LFM_SYM(lfm_norm_apply_f32):
 #ifdef _WIN32
     .seh_proc LFM_SYM(lfm_norm_apply_f32)
@@ -287,6 +294,7 @@ LFM_SYM(lfm_norm_apply_f32):
 // exact-size destination rather than a larger copied convolution plane.
 .p2align 4
 .globl LFM_SYM(lfm_resample_conv_f64)
+LFM_PRIVATE(LFM_SYM(lfm_resample_conv_f64))
 LFM_SYM(lfm_resample_conv_f64):
 #ifdef _WIN32
     .seh_proc LFM_SYM(lfm_resample_conv_f64)

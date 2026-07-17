@@ -32,9 +32,15 @@
 
 #if defined(__aarch64__) && !defined(MIMI_SCALAR_REF)
 #define MIMI_NEON 1
+#define MIMI_SSE2 0
 #include <arm_neon.h>
+#elif (defined(__x86_64__) || defined(_M_X64)) && !defined(MIMI_SCALAR_REF)
+#define MIMI_NEON 0
+#define MIMI_SSE2 1
+#include <immintrin.h>
 #else
 #define MIMI_NEON 0
+#define MIMI_SSE2 0
 #endif
 
 // Cap on frames-per-step for the convtr time-axis reduction scratch. The
@@ -43,13 +49,13 @@
 // refuse n_in beyond it instead of overrunning the arena-carved g scratch.
 enum { MIMI_CONV_MAX_NIN = MIMI_FRAME_OUT };
 
-// GEMM-route bound: steps with n_in (or num_frames) at or below this AND wide
-// reductions ride AMX via mimi_gemm_f32 instead of time-axis NEON. Rationale
+// Matrix-route bound: steps with n_in (or num_frames) at or below this AND wide
+// reductions use the byte-load SIMD matrix leaf instead of time-axis NEON. Rationale
 // (review P1, measured): the widest decoder layers (init conv 512->1024 k7,
 // convtr 1024->512 k16) receive only n=2 time samples, so a 4-lane time-axis
 // AXPY runs entirely in its scalar tail — ~45 ms of the ~70 ms frame. The
-// GEMM formulation moves the in_c*k reduction onto the matrix unit. It
-// REORDERS the K reduction (cblas blocking vs kk-outer/ic-inner) — faithful
+// GEMM formulation moves the in_c*k reduction into a row/column SIMD kernel. It
+// REORDERS the K reduction (SIMD blocking vs kk-outer/ic-inner) — faithful
 // tier; re-measured against the proven ~4e-6 whole-chain parity bar.
 enum { MIMI_CONV_GEMM_MAX_N = 512 };
 
@@ -236,7 +242,7 @@ struct MimiConvState {
     float *cbuf;         // [in_c, carry_cap] scratch for the next carry gather
     int prev_len;        // # carried time steps currently in prev  (< kernel_eff)
     int left_pad_applied;
-    // AMX route (short-time wide layers): C[out_c,nf] = W[out_c,ic*k] x B.
+    // Matrix route (short-time wide layers): C[out_c,nf] = W[out_c,ic*k] x B.
     // W rows are ALREADY (ic,kk)-contiguous in checkpoint layout — zero-copy A;
     // only the im2col gather B is staged (activation marshalling, like candle).
     int route_gemm;      // groups==1 && cin_g*ksize wide enough
@@ -275,7 +281,7 @@ int mimi_conv_init(MimiConvState **st, const MimiWeightTable *w,
     s->cbuf = (float *)mimi_arena_alloc(a, (size_t)in_c * s->carry_cap * sizeof(float));
     s->prev_len = 0;
     s->left_pad_applied = 0;
-    // AMX route for the wide layers: at n=2 (the seanet entry shapes) the
+    // Matrix route for the wide layers: at n=2 (the seanet entry shapes) the
     // time-axis AXPY is all scalar tail; the GEMM moves the ic*k reduction
     // onto the matrix unit. Narrow convs (final 64->1 k3) stay NEON.
     s->route_gemm = (groups == 1) && ((size_t)s->cin_g * ksize >= 1024);
@@ -317,7 +323,7 @@ int mimi_conv_step(MimiConvState *s, const float *xs, int n_in, float *y) {
     const int num_frames = (seq_len + stride >= ke) ? (seq_len + stride - ke) / stride : 0;
 
     if (num_frames > 0 && s->route_gemm && num_frames <= MIMI_CONV_GEMM_MAX_N) {
-        // AMX route: B[(ic*k + kk), f] = logical[ic][f*stride + kk*dil] gathered
+        // Matrix route: B[(ic*k + kk), f] = logical[ic][f*stride + kk*dil] gathered
         // once (row order matches W's (ic,kk) checkpoint layout — zero-copy A),
         // then C[out_c, nf] = W x B on the matrix unit, bias broadcast after.
         const int nf = num_frames, k = s->ksize;
@@ -436,7 +442,7 @@ int mimi_conv_step(MimiConvState *s, const float *xs, int n_in, float *y) {
 //   g[l] = sum_ic X[ic,l] * w[ic,oc,kk]   (l = 0..n_in)
 // by accumulating, for each ic, wcoef * X[ic, :]  (X[ic,:] is contiguous in
 // [C,T]). g is then scattered to output positions l*stride+kk. This keeps the
-// heavy in_c reduction in NEON with NO weight repack. (A per-kk AMX GEMM over
+// heavy in_c reduction in NEON with NO weight repack. (A per-kk matrix pass over
 // mimi_gemm_f32 is the perf-tier alternative; it needs an init-time weight
 // transpose and changes the summation order, so it is deferred behind the
 // parity gate.) The scatter/bias/overlap are the elementwise NEON sweeps below.
@@ -454,7 +460,7 @@ struct MimiConvTrState {
     float *carry_scratch;// [out_c, invalid] next-carry accumulator
     float *g;            // [MIMI_CONV_MAX_NIN] per-(oc,kk) time reduction
     int prev_valid;
-    // AMX route (short-time wide layers): G[k*out_c, n] = W_r x X in ONE GEMM
+    // Matrix route (short-time wide layers): G[k*out_c, n] = W_r x X in one pass
     // (X is the caller's [in_c, n] — zero-copy B), then the same per-oc
     // scatter/bias/overlap/commit. The GEMM reads checkpoint [ic][oc][kk]
     // directly as the transpose of [ic, oc*kk]; no re-arm exists.
@@ -489,7 +495,7 @@ int mimi_convtr_init(MimiConvTrState **st, const MimiWeightTable *w,
     s->carry_scratch = (float *)mimi_arena_alloc(a, (size_t)out_c * inv * sizeof(float));
     s->g = (float *)mimi_arena_alloc(a, (size_t)MIMI_CONV_MAX_NIN * sizeof(float));
     s->prev_valid = 0;
-    // AMX route for the wide layers (the ratio-8 convtr receives n=2: its
+    // Matrix route for the wide layers (the ratio-8 convtr receives n=2: its
     // time-axis AXPY was all scalar tail — the measured ~31 ms hot spot).
     s->route_gemm = (in_c >= 128);
     if (s->route_gemm) {
@@ -513,7 +519,7 @@ int mimi_convtr_step(MimiConvTrState *s, const float *xs, int n_in, float *y) {
     const int inv_row = invalid > 0 ? invalid : 1;
     float *g = s->g;                                // per-lane-private (see NOTES g)
 
-    // AMX route: the whole (kk,oc) x ic reduction as ONE GEMM up front —
+    // Matrix route: the whole (kk,oc) x ic reduction as one GEMM up front —
     // G[kk*oc_n + oc, l] = sum_ic W_r[kk*oc_n+oc, ic] * X[ic, l].
     const int use_gemm = s->route_gemm && n_in <= MIMI_CONV_GEMM_MAX_N;
     if (use_gemm)
@@ -529,7 +535,7 @@ int mimi_convtr_step(MimiConvTrState *s, const float *xs, int n_in, float *y) {
         if (invalid > 0) memset(crow, 0, (size_t)invalid * sizeof(float));
 
         // per kk: g[l] = sum_ic X[ic,l]*w[ic,oc,kk], then scatter to
-        // out_t = l*stride+kk. GEMM route reads the AMX-computed rows;
+        // out_t = l*stride+kk. GEMM route reads the SIMD-computed rows;
         // NEON route accumulates over the contiguous time axis. Per fixed oc
         // the kk-ascending scatter order matches candle either way.
         for (int kk = 0; kk < k; ++kk) {
@@ -610,7 +616,8 @@ int mimi_upsample_init(MimiUpsampleState **st, const MimiWeightTable *w,
     const MimiWeight *ww = mimi_weight_find(w, "upsample.convtr.convtr.convtr.weight");
     if (!ww) return fail(err, errlen, "upsample weight not found");
     // Exact-shape + data validation (review P2: element count alone let a
-    // null span reach the repack loop): [MIMI_DIM, 1, 2*stride], data non-null.
+    // null span reach the direct byte-load loop): [MIMI_DIM, 1, 2*stride],
+    // data non-null.
     if (!wcheck3(ww, dim, 1, ksize))
         return fail(err, errlen,
                     "upsample weight shape mismatch (expect [dim,1,2*stride] with data)");
@@ -640,20 +647,56 @@ int mimi_upsample_step(MimiUpsampleState *s, const float *xs, int n_in, float *y
         // positions, so each y/carry slot is written ONCE (direct assign, no
         // pre-zero) -> per-channel rows are self-contained for lane banding.
 #if MIMI_NEON
-        if ((reinterpret_cast<uintptr_t>(s->w) & (alignof(float) - 1)) == 0 &&
-            k == 4 && emit_len == 2 && invalid == 2) {
-            const float *direct = reinterpret_cast<const float *>(s->w);
+        if (k == 4 && emit_len == 2 && invalid == 2) {
             for (int c = 0; c < dim; c += 4) {
-                const float32x4x4_t taps = vld4q_f32(direct + (size_t)c * 4);
+                const uint8_t *rows = s->w + (size_t)c * 4 * sizeof(float);
+                float32x4_t row0 = vreinterpretq_f32_u8(vld1q_u8(rows));
+                float32x4_t row1 = vreinterpretq_f32_u8(vld1q_u8(rows + 16));
+                float32x4_t row2 = vreinterpretq_f32_u8(vld1q_u8(rows + 32));
+                float32x4_t row3 = vreinterpretq_f32_u8(vld1q_u8(rows + 48));
+                const float32x4x2_t pair01 = vtrnq_f32(row0, row1);
+                const float32x4x2_t pair23 = vtrnq_f32(row2, row3);
+                float32x4_t taps0 = vcombine_f32(vget_low_f32(pair01.val[0]),
+                                                 vget_low_f32(pair23.val[0]));
+                float32x4_t taps1 = vcombine_f32(vget_low_f32(pair01.val[1]),
+                                                 vget_low_f32(pair23.val[1]));
+                float32x4_t taps2 = vcombine_f32(vget_high_f32(pair01.val[0]),
+                                                 vget_high_f32(pair23.val[0]));
+                float32x4_t taps3 = vcombine_f32(vget_high_f32(pair01.val[1]),
+                                                 vget_high_f32(pair23.val[1]));
                 const float32x4_t input = vld1q_f32(xs + c);
                 float32x4x2_t emit;
-                emit.val[0] = vmulq_f32(input, taps.val[0]);
-                emit.val[1] = vmulq_f32(input, taps.val[1]);
+                emit.val[0] = vmulq_f32(input, taps0);
+                emit.val[1] = vmulq_f32(input, taps1);
                 vst2q_f32(y + (size_t)c * 2, emit);
                 float32x4x2_t carry;
-                carry.val[0] = vmulq_f32(input, taps.val[2]);
-                carry.val[1] = vmulq_f32(input, taps.val[3]);
+                carry.val[0] = vmulq_f32(input, taps2);
+                carry.val[1] = vmulq_f32(input, taps3);
                 vst2q_f32(s->carry_scratch + (size_t)c * 2, carry);
+            }
+        } else
+#elif MIMI_SSE2
+        if (k == 4 && emit_len == 2 && invalid == 2) {
+            for (int c = 0; c < dim; c += 4) {
+                const uint8_t *rows = s->w + (size_t)c * 4 * sizeof(float);
+                __m128 taps0, taps1, taps2, taps3;
+                memcpy(&taps0, rows, sizeof(taps0));
+                memcpy(&taps1, rows + 16, sizeof(taps1));
+                memcpy(&taps2, rows + 32, sizeof(taps2));
+                memcpy(&taps3, rows + 48, sizeof(taps3));
+                _MM_TRANSPOSE4_PS(taps0, taps1, taps2, taps3);
+                const __m128 input = _mm_loadu_ps(xs + c);
+                const __m128 emit0 = _mm_mul_ps(input, taps0);
+                const __m128 emit1 = _mm_mul_ps(input, taps1);
+                _mm_storeu_ps(y + (size_t)c * 2, _mm_unpacklo_ps(emit0, emit1));
+                _mm_storeu_ps(y + (size_t)c * 2 + 4,
+                              _mm_unpackhi_ps(emit0, emit1));
+                const __m128 carry0 = _mm_mul_ps(input, taps2);
+                const __m128 carry1 = _mm_mul_ps(input, taps3);
+                _mm_storeu_ps(s->carry_scratch + (size_t)c * 2,
+                              _mm_unpacklo_ps(carry0, carry1));
+                _mm_storeu_ps(s->carry_scratch + (size_t)c * 2 + 4,
+                              _mm_unpackhi_ps(carry0, carry1));
             }
         } else
 #endif
@@ -837,11 +880,11 @@ int mimi_upsample_step(MimiUpsampleState *s, const float *xs, int n_in, float *y
  *   2. Scalar code lives ONLY in: the MIMI_SCALAR_REF build (every vNNN helper
  *      degrades to a scalar loop -> that build IS the `_ref` parity sibling for
  *      bisecting), sub-vector tail remainders inside the NEON helpers, and pure
- *      data marshalling (weight/carry gathers, strided scatters, init repacks —
- *      the same staging candle does with inp_cont/k_cont; not "math").
+ *      activation/carry marshalling (strided gathers and scatters). Resident
+ *      weights are never staged, repacked, transposed, widened, or aligned.
  *   3. Numerics are the *faithful* tier (ulp band), not bit-exact: NEON's 4-lane
  *      grouping of the AXPY accumulation differs from candle's f32 vec_dot lane
- *      order; the harness measures the band. A per-kk AMX GEMM (mimi_gemm_f32)
+ *      order; the harness measures the band. A per-kk byte-load SIMD GEMM
  *      for convtr is the perf-tier alternative — deferred: it needs an init-time
  *      weight transpose (+memory) and reorders the K reduction.
  *   4. PadMode: only Constant (zeros) is implemented — the sole decode-path mode.

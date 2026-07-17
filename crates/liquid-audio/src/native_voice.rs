@@ -31,6 +31,8 @@ const EVENT_HAS_AUDIO: u32 = 1;
 const EVENT_TRUNCATED: u32 = 2;
 const TICKET_CONTROL: u32 = 4;
 const REPLY_CAPACITY: usize = 128;
+const TEXT_EVENT_MAX_BYTES: usize = 512;
+const UTF8_CARRY_MAX_BYTES: usize = 3;
 const EVENT_CAPACITY: u32 = 64;
 const CAPTURE_SLOTS: u32 = 1;
 const PLAYBACK_SLOTS: u32 = 8;
@@ -576,10 +578,7 @@ fn sampler(temperature: Option<f64>, top_k: Option<u32>) -> SamplingPolicy {
     SamplingPolicy {
         size: std::mem::size_of::<SamplingPolicy>() as u32,
         abi_version: RUNTIME_ABI,
-        flags: temperature
-            .is_none()
-            .then_some(1)
-            .unwrap_or(0),
+        flags: temperature.is_none().then_some(1).unwrap_or(0),
         top_k: top_k.unwrap_or(0),
         temperature: temperature.unwrap_or(1.0),
         reserved: 0,
@@ -596,11 +595,7 @@ fn create_conversation(
     let options = ConversationOptions {
         size: std::mem::size_of::<ConversationOptions>() as u32,
         abi_version: RUNTIME_ABI,
-        flags: sampling
-            .seed
-            .is_none()
-            .then_some(1)
-            .unwrap_or(0),
+        flags: sampling.seed.is_none().then_some(1).unwrap_or(0),
         reserved0: 0,
         seed: sampling.seed.unwrap_or(0),
         text: sampler(sampling.text_temperature, sampling.text_top_k),
@@ -632,7 +627,7 @@ fn create_conversation(
 enum Reply {
     Text {
         ticket: Ticket,
-        text: String,
+        payload: TextPayload,
     },
     Audio {
         pcm: Vec<f32>,
@@ -646,9 +641,6 @@ enum Reply {
         truncated: bool,
         playback_leases: u32,
     },
-    Interrupted {
-        ticket: Ticket,
-    },
     Error {
         ticket: Option<Ticket>,
         error: String,
@@ -656,9 +648,109 @@ enum Reply {
     Stopped(i32),
 }
 
+struct TextPayload {
+    len: u16,
+    bytes: [u8; TEXT_EVENT_MAX_BYTES],
+}
+
+impl TextPayload {
+    fn new(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() > TEXT_EVENT_MAX_BYTES {
+            return None;
+        }
+        let mut payload = Self {
+            len: bytes.len() as u16,
+            bytes: [0; TEXT_EVENT_MAX_BYTES],
+        };
+        payload.bytes[..bytes.len()].copy_from_slice(bytes);
+        Some(payload)
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.len as usize]
+    }
+}
+
 struct EventSink {
     tx: Sender<Reply>,
     shutdown: Receiver<()>,
+}
+
+#[derive(Default)]
+struct Utf8Stream {
+    carry: [u8; UTF8_CARRY_MAX_BYTES],
+    len: usize,
+}
+
+impl Utf8Stream {
+    fn push<F>(&mut self, bytes: &[u8], emit: &mut F) -> Result<(), String>
+    where
+        F: FnMut(String) + ?Sized,
+    {
+        if bytes.len() > TEXT_EVENT_MAX_BYTES {
+            self.reset();
+            return Err("native text event exceeds its fixed payload bound".into());
+        }
+        if bytes.is_empty() {
+            return Ok(());
+        }
+
+        let mut joined = [0u8; TEXT_EVENT_MAX_BYTES + UTF8_CARRY_MAX_BYTES];
+        joined[..self.len].copy_from_slice(&self.carry[..self.len]);
+        joined[self.len..self.len + bytes.len()].copy_from_slice(bytes);
+        let total = self.len + bytes.len();
+        self.len = 0;
+
+        let mut offset = 0;
+        while offset < total {
+            match std::str::from_utf8(&joined[offset..total]) {
+                Ok(text) => {
+                    if !text.is_empty() {
+                        emit(text.to_owned());
+                    }
+                    return Ok(());
+                }
+                Err(error) => {
+                    const REPLACEMENT: &str = "\u{fffd}";
+                    let valid = error.valid_up_to();
+                    if valid != 0 {
+                        let text = std::str::from_utf8(&joined[offset..offset + valid])
+                            .expect("UTF-8 validator returned an invalid prefix");
+                        emit(text.to_owned());
+                        offset += valid;
+                    }
+                    let Some(invalid) = error.error_len() else {
+                        let tail = total - offset;
+                        debug_assert!(tail <= UTF8_CARRY_MAX_BYTES);
+                        if tail > UTF8_CARRY_MAX_BYTES {
+                            self.reset();
+                            return Err("native text event left an oversized UTF-8 carry".into());
+                        }
+                        self.carry[..tail].copy_from_slice(&joined[offset..total]);
+                        self.len = tail;
+                        return Ok(());
+                    };
+                    emit(REPLACEMENT.to_owned());
+                    offset += invalid;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn finish<F>(&mut self, emit: &mut F)
+    where
+        F: FnMut(String) + ?Sized,
+    {
+        if self.len != 0 {
+            emit("\u{fffd}".to_owned());
+        }
+        self.reset();
+    }
+
+    fn reset(&mut self) {
+        self.len = 0;
+    }
 }
 
 fn send_reply(tx: &Sender<Reply>, shutdown: &Receiver<()>, reply: Reply) -> Result<(), ()> {
@@ -691,13 +783,12 @@ unsafe extern "C" fn on_event(context: *mut c_void, event: *const NativeEvent) -
             }
         };
         let reply = match event.kind {
-            EVENT_STATE if bytes == b"interrupted" => Some(Reply::Interrupted {
-                ticket: event.ticket,
-            }),
+            // Epoch/state records describe the session, not any action. Only
+            // the terminal Turn carrying the submitted ticket can settle it.
             EVENT_STATE => None,
             EVENT_TEXT => Some(Reply::Text {
                 ticket: event.ticket,
-                text: String::from_utf8_lossy(bytes).into_owned(),
+                payload: TextPayload::new(bytes).ok_or(())?,
             }),
             EVENT_TURN => {
                 if bytes.len() != std::mem::size_of::<TurnEvent>() {
@@ -778,6 +869,7 @@ pub struct NativeLfm2VoiceEngine {
     _model: NativeVoiceModel,
     conversation: Option<ConversationOwner>,
     vault: Option<NativeConversationVault>,
+    healthy: bool,
     session: NonNull<Session>,
     control: Arc<SessionControl>,
     sink: Option<Box<EventSink>>,
@@ -861,6 +953,7 @@ impl NativeLfm2VoiceEngine {
             _model: model,
             conversation: Some(claim.into_conversation()),
             vault,
+            healthy: true,
             session,
             control,
             sink: Some(sink),
@@ -1011,19 +1104,31 @@ impl NativeLfm2VoiceEngine {
         let mut turn: Option<(Ticket, bool, u32)> = None;
         let mut audio_ticket: Option<Ticket> = None;
         let mut audio_count = 0u32;
+        let mut text = Utf8Stream::default();
         loop {
-            let reply = self
-                .replies
-                .recv()
-                .map_err(|_| "native voice event channel disconnected".to_string())?;
+            let reply = match self.replies.recv() {
+                Ok(reply) => reply,
+                Err(_) => {
+                    self.healthy = false;
+                    return Err("native voice event channel disconnected".into());
+                }
+            };
             if cancel.load(Ordering::Acquire) {
+                text.reset();
                 return Ok(false);
             }
             match reply {
                 Reply::Text {
                     ticket: reply_ticket,
-                    text,
-                } if reply_ticket == ticket && !text.is_empty() => emit(VoiceEvent::Text(text)),
+                    payload,
+                } if reply_ticket == ticket => {
+                    if let Err(error) = text.push(payload.as_bytes(), &mut |piece| {
+                        emit(VoiceEvent::Text(piece))
+                    }) {
+                        self.healthy = false;
+                        return Err(error);
+                    }
+                }
                 Reply::Text { .. } => {}
                 Reply::Audio {
                     pcm,
@@ -1043,26 +1148,27 @@ impl NativeLfm2VoiceEngine {
                     playback_leases,
                 } if reply_ticket == ticket => {
                     if status == STATUS_STALE || status == STATUS_CANCELLED {
+                        text.reset();
                         return Ok(false);
                     }
                     if status != 0 {
+                        text.reset();
+                        self.healthy = false;
                         return Err(format!("native turn failed with status {status}"));
                     }
+                    text.finish(&mut |piece| emit(VoiceEvent::Text(piece)));
                     if truncated {
                         crate::vtrace!("native turn reached max_new_tokens");
                     }
                     turn = Some((reply_ticket, has_audio, playback_leases));
                 }
                 Reply::Turn { .. } => {}
-                Reply::Interrupted {
-                    ticket: reply_ticket,
-                    ..
-                } if reply_ticket.sequence > ticket.sequence => return Ok(false),
-                Reply::Interrupted { .. } => {}
                 Reply::Error {
                     ticket: Some(reply_ticket),
                     error,
                 } if reply_ticket == ticket || reply_ticket.kind == TICKET_CONTROL => {
+                    text.reset();
+                    self.healthy = false;
                     return Err(error);
                 }
                 Reply::Error {
@@ -1071,8 +1177,14 @@ impl NativeLfm2VoiceEngine {
                 Reply::Error {
                     ticket: None,
                     error,
-                } => return Err(error),
+                } => {
+                    text.reset();
+                    self.healthy = false;
+                    return Err(error);
+                }
                 Reply::Stopped(status) => {
+                    text.reset();
+                    self.healthy = false;
                     return Err(format!("native voice session stopped with status {status}"));
                 }
             }
@@ -1206,6 +1318,7 @@ impl Drop for NativeLfm2VoiceEngine {
         }
         let join = unsafe { lfm_session_join(self.session.as_ptr()) };
         if join != 0 {
+            self.healthy = false;
             eprintln!("[flashkern] native voice session joined with status {join}");
         }
         let mut control = self
@@ -1227,11 +1340,22 @@ impl Drop for NativeLfm2VoiceEngine {
         let Some(vault) = self.vault.as_ref() else {
             return;
         };
+        if !self.healthy {
+            /* Begin/prefill and recurrence are not rollback-transactional. A
+             * terminal numerical/session error may therefore leave native
+             * cache planes partially advanced. Close that conversation after
+             * session teardown instead of putting it back in the vault. */
+            self.conversation.take();
+        }
         let mut state = vault
             .0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.conversation = self.conversation.take();
+        state.conversation = self.healthy.then(|| {
+            self.conversation
+                .take()
+                .expect("healthy native engine lost its conversation")
+        });
         state.claimed = false;
     }
 }
@@ -1252,4 +1376,106 @@ fn native_error(status: i32, error: &[i8]) -> String {
         return format!("native model open failed with status {status}");
     }
     format!("{message} (native status {status})")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn collect(stream: &mut Utf8Stream, chunks: &[&[u8]], finish: bool) -> String {
+        let mut pieces = Vec::new();
+        for chunk in chunks {
+            stream.push(chunk, &mut |piece| pieces.push(piece)).unwrap();
+        }
+        if finish {
+            stream.finish(&mut |piece| pieces.push(piece));
+        }
+        pieces.concat()
+    }
+
+    #[test]
+    fn text_stream_preserves_codepoints_split_across_events() {
+        let mut stream = Utf8Stream::default();
+        let text = collect(
+            &mut stream,
+            &[b"hello \xf0", b"\x9f", b"\x8c", b"\x8d!"],
+            true,
+        );
+        assert_eq!(text, "hello \u{1f30d}!");
+    }
+
+    #[test]
+    fn text_stream_matches_whole_buffer_lossy_decode() {
+        let chunks: [&[u8]; 4] = [b"\xe2", b"(\xa1ok\xf0", b"\x9f", b"tail"];
+        let mut bytes = Vec::new();
+        for chunk in chunks {
+            bytes.extend_from_slice(chunk);
+        }
+        let mut stream = Utf8Stream::default();
+        let text = collect(&mut stream, &chunks, true);
+        assert_eq!(text, String::from_utf8_lossy(&bytes));
+    }
+
+    #[test]
+    fn text_stream_reset_drops_cancelled_turn_carry() {
+        let mut stream = Utf8Stream::default();
+        assert_eq!(collect(&mut stream, &[b"\xf0\x9f"], false), "");
+        stream.reset();
+        assert_eq!(collect(&mut stream, &[b"next turn"], true), "next turn");
+    }
+
+    #[test]
+    fn text_stream_finish_flushes_incomplete_sequence() {
+        let mut stream = Utf8Stream::default();
+        assert_eq!(
+            collect(&mut stream, &[b"tail \xe2\x82"], true),
+            "tail \u{fffd}"
+        );
+    }
+
+    #[test]
+    fn text_stream_rejects_oversized_native_record() {
+        let mut stream = Utf8Stream::default();
+        let bytes = [b'x'; TEXT_EVENT_MAX_BYTES + 1];
+        let error = stream.push(&bytes, &mut |_| {}).unwrap_err();
+        assert!(error.contains("fixed payload bound"));
+    }
+
+    #[test]
+    fn later_interrupt_state_is_not_a_fresh_action_outcome() {
+        let (tx, replies) = bounded(1);
+        let (_shutdown_tx, shutdown) = bounded(0);
+        let mut sink = EventSink { tx, shutdown };
+        let payload = b"interrupted";
+        let event = NativeEvent {
+            size: std::mem::size_of::<NativeEvent>() as u32,
+            abi_version: RUNTIME_ABI,
+            kind: EVENT_STATE,
+            flags: 0,
+            session_id: 1,
+            epoch: 2,
+            ticket: Ticket {
+                runtime_epoch: 1,
+                sequence: 99,
+                generation: 1,
+                kind: TICKET_CONTROL,
+            },
+            payload: payload.as_ptr().cast(),
+            payload_bytes: payload.len() as u32,
+            status: 0,
+        };
+        assert_eq!(
+            unsafe {
+                on_event(
+                    std::ptr::from_mut(&mut sink).cast(),
+                    std::ptr::from_ref(&event),
+                )
+            },
+            0
+        );
+        assert!(matches!(
+            replies.try_recv(),
+            Err(crossbeam_channel::TryRecvError::Empty)
+        ));
+    }
 }

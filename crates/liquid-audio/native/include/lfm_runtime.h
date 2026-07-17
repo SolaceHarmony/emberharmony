@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #include "lfm_types.h"
+#include "lfm_visibility.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -84,35 +85,40 @@ typedef struct LfmConversationOptionsV1 {
 #define LFM_RUNTIME_STOPPING 2u
 #define LFM_RUNTIME_JOINED 3u
 
-int lfm_runtime_create(const LfmRuntimeConfigV1 *config, LfmRuntime **out);
-int lfm_runtime_start(LfmRuntime *runtime);
-void lfm_runtime_request_stop(LfmRuntime *runtime);
-int lfm_runtime_join(LfmRuntime *runtime);
-int lfm_runtime_snapshot(const LfmRuntime *runtime, LfmRuntimeSnapshotV1 *out);
-int lfm_runtime_destroy(LfmRuntime *runtime);
+LFM_PUBLIC_API int lfm_runtime_create(const LfmRuntimeConfigV1 *config,
+                                      LfmRuntime **out);
+LFM_PUBLIC_API int lfm_runtime_start(LfmRuntime *runtime);
+LFM_PUBLIC_API void lfm_runtime_request_stop(LfmRuntime *runtime);
+LFM_PUBLIC_API int lfm_runtime_join(LfmRuntime *runtime);
+LFM_PUBLIC_API int lfm_runtime_snapshot(const LfmRuntime *runtime,
+                                        LfmRuntimeSnapshotV1 *out);
+LFM_PUBLIC_API int lfm_runtime_destroy(LfmRuntime *runtime);
 
 /* Product lifecycle open. It publishes a model child only after validating
  * complete native LFM2 voice ownership and zero compatibility-copied weights;
  * the executor, tensor schema, and resident image remain private. */
-int lfm_runtime_model_open(LfmRuntime *runtime, const char *path,
-                           LfmModel **out, char *error, size_t error_length);
+LFM_PUBLIC_API int lfm_runtime_model_open(
+    LfmRuntime *runtime, const char *path, LfmModel **out, char *error,
+    size_t error_length);
 /* Lifecycle-only accounting query. The runtime must own `model`; no tensor,
  * shape, vocabulary, or numerical-plan metadata crosses this boundary. */
-int lfm_runtime_model_memory(const LfmRuntime *runtime,
-                             const LfmModel *model,
-                             LfmModelMemoryV1 *out);
-int lfm_runtime_model_close(LfmRuntime *runtime, LfmModel *model);
+LFM_PUBLIC_API int lfm_runtime_model_memory(const LfmRuntime *runtime,
+                                            const LfmModel *model,
+                                            LfmModelMemoryV1 *out);
+LFM_PUBLIC_API int lfm_runtime_model_close(LfmRuntime *runtime,
+                                           LfmModel *model);
 
 /* Runtime-scoped opaque conversation lifecycle. The runtime/model ownership
  * check is part of both calls, and an attached conversation cannot be closed
  * or attached to a second session. No token, tensor, cache, or codec state is
  * exposed through this boundary. */
-int lfm_runtime_conversation_create(LfmRuntime *runtime, LfmModel *model,
-                                    const LfmConversationOptionsV1 *options,
-                                    LfmConversation **out, char *error,
-                                    size_t error_length);
-int lfm_runtime_conversation_close(LfmRuntime *runtime,
-                                   LfmConversation *conversation);
+LFM_PUBLIC_API int lfm_runtime_conversation_create(
+    LfmRuntime *runtime, LfmModel *model,
+    const LfmConversationOptionsV1 *options, LfmConversation **out,
+    char *error, size_t error_length);
+LFM_PUBLIC_API int
+lfm_runtime_conversation_close(LfmRuntime *runtime,
+                               LfmConversation *conversation);
 
 #ifdef __cplusplus
 } /* extern "C" */

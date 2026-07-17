@@ -46,6 +46,15 @@ struct LoadStats {
     worker_count: u32,
 }
 
+#[link(name = "lfm_safetensors", kind = "static")]
+#[cfg_attr(target_os = "macos", link(name = "c++"))]
+#[cfg_attr(
+    any(
+        all(target_family = "unix", not(target_os = "macos")),
+        all(target_os = "windows", target_env = "gnu")
+    ),
+    link(name = "stdc++")
+)]
 unsafe extern "C" {
     // Benchmark-private native entry point: intentionally absent from every
     // installed/product header and from liquid-audio's Rust API.

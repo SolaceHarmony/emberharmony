@@ -1,8 +1,14 @@
 # Assembly Kernels, Accelerate Dispatch, and Wait Primitives
 
-Status: normative design. The zero-spin wait-word substrate is implemented at
-upstream `bd530f4c9196` and the fixed Flashkern lane mount at `d2c43abd`; the
-remaining native math migration is not.
+Status: normative design. The zero-spin wait-word substrate, fixed Flashkern
+lane mount, typed resample/frontend/whole-Conformer request, capacity-2 SQ/CQ,
+per-ticket scratch slots, and exact-CQ continuation primitive are implemented.
+The continuation owns a packed `{generation,state}` slot lease across its
+callback and must atomically resubmit that same slot or release it before waking
+the waiter; adversarial tests cover peer admission, stale-owner ABA, stop, and
+capacity accounting.
+Moving the native session recurrence onto that continuation remains open in
+design 14; the full Moshi migration is a later tranche.
 
 Baseline: EmberHarmony `321538f11749`.
 
@@ -59,7 +65,7 @@ words and blocks through prepared `kc_port_wait_u32` handles at
 | Moshi frame arithmetic/state | `crates/liquid-audio/src/runtime/realtime.rs:1850-2065` | native Moshi pass program |
 | native pass entered through Rust capture/trampoline | `crates/liquid-audio/src/compute/flashkern/native_engine.rs:544-593` and `native/src/engine/flashkern_engine.cpp:1283-1291` | model-bound C++ plan with no Rust callback |
 | aarch64 feature flags applied to the whole kernel translation unit | `crates/liquid-audio/build.rs:45-58` | baseline and BF16/I8MM objects compiled separately; C++ binds one table after capability checks |
-| hot-call panel storage and packing | `crates/liquid-audio/native/kernels/aarch64/flashkern_neon.cpp:74-162` and `native/kernels/x86_64/flashkern_x86.cpp:74-154` | prepack immutable weights at model open and reserve mutable scratch in the plan; no `std::vector`, resize, assign, or payload repack in a pass |
+| historical hot-call panel storage and packing | `crates/liquid-audio/native/kernels/aarch64/flashkern_neon.cpp:74-162` and `native/kernels/x86_64/flashkern_x86.cpp:74-154` | delete/bypass weight panels; plans retain only checkpoint-layout byte views and mutable activation scratch |
 | C++ intrinsic/libm activation and softmax loops | `flashkern_neon.cpp` and `flashkern_x86.cpp` | paired fixed-shape `.S` transcendental kernels with test-only scalar oracle; delete the C++ bodies |
 | sampler and PRNG | Native ChaCha20 block kernels are implemented in `native/kernels/{aarch64,x86_64}/flashkern_prng.S`; `run_sampler` is mounted inside token and Depthformer passes, with `REQ_SAMPLE` as a standalone fallback/conformance leaf. | move the one shared stream image from the Rust generation rim into each native conversation; never issue a pass ticket per random draw or codebook |
 | CPU streaming short-conv | `REQ_DEPTHWISE_STREAM`, `lfm_depthwise_stream_bf16`, and `flashkern_conv.h` borrow split state/input/weight planes and write output/state directly | keep this CPU-only; replace the sibling Candle Metal route with MLX C++/Metal rather than adding Metal dispatch to Flashkern |
@@ -361,8 +367,9 @@ hardware callbacks. Hardware callbacks never wait.
 - Non-temporal store selections are justified by a recorded measurement per
   plane; no plane uses NT stores without one.
 - Release kernels perform no `std::vector` growth, panel packing, weight
-  transpose, or dynamic allocation during a pass. Immutable repacking, when a
-  measured kernel requires it, occurs once at model open and is retained.
+  transpose, or dynamic allocation. Measurement may select a different direct
+  byte-view kernel, but never authorizes immutable weight repacking at model
+  open.
 
 ## Non-Goals
 

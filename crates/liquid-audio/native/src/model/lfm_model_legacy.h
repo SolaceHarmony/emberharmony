@@ -16,6 +16,7 @@
 
 #include "flashkern_sampler.h"
 #include "lfm_runtime.h"
+#include "lfm_visibility.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -87,34 +88,34 @@ typedef struct LfmModelInfoV1 {
     uint32_t reserved[5];
 } LfmModelInfoV1;
 
-int lfm_model_open(void *engine, const char *path, LfmModel **out,
-                   char *error, size_t error_length);
-int lfm_model_close(LfmModel *model);
-int lfm_model_info(const LfmModel *model, LfmModelInfoV1 *out);
-int lfm_model_memory(const LfmModel *model, LfmModelMemoryV1 *out);
+LFM_ORACLE_API int lfm_model_open(void *engine, const char *path,
+                                  LfmModel **out, char *error,
+                                  size_t error_length);
+LFM_ORACLE_API int lfm_model_close(LfmModel *model);
+LFM_ORACLE_API int lfm_model_info(const LfmModel *model, LfmModelInfoV1 *out);
+LFM_ORACLE_API int lfm_model_memory(const LfmModel *model,
+                                    LfmModelMemoryV1 *out);
 
-int lfm_conversation_create(LfmModel *model,
-                            const LfmConversationConfigV1 *config,
-                            LfmConversation **out,
-                            char *error, size_t error_length);
-int lfm_conversation_step(LfmConversation *conversation,
-                          const uint32_t *ids, size_t id_count,
-                          uint32_t embedding_kind,
-                          LfmTokenResultV1 *out);
-int lfm_conversation_prefill(LfmConversation *conversation,
-                             const LfmInputV1 *inputs, size_t input_count,
-                             uint64_t *out_position);
-int lfm_conversation_prefill_audio(LfmConversation *conversation,
-                                   const uint16_t *rows, size_t element_count,
-                                   uint64_t *out_position);
-int lfm_conversation_prefill_pcm_f32(LfmConversation *conversation,
-                                     const float *pcm, size_t sample_count,
-                                     uint32_t sample_rate,
-                                     uint64_t *out_position);
-int lfm_conversation_audio_frame(LfmConversation *conversation,
-                                 LfmAudioResultV1 *out);
-int lfm_conversation_reset(LfmConversation *conversation);
-int lfm_conversation_close(LfmConversation *conversation);
+LFM_ORACLE_API int lfm_conversation_create(
+    LfmModel *model, const LfmConversationConfigV1 *config,
+    LfmConversation **out, char *error, size_t error_length);
+LFM_ORACLE_API int lfm_conversation_step(LfmConversation *conversation,
+                                         const uint32_t *ids, size_t id_count,
+                                         uint32_t embedding_kind,
+                                         LfmTokenResultV1 *out);
+LFM_ORACLE_API int lfm_conversation_prefill(
+    LfmConversation *conversation, const LfmInputV1 *inputs,
+    size_t input_count, uint64_t *out_position);
+LFM_ORACLE_API int lfm_conversation_prefill_audio(
+    LfmConversation *conversation, const uint16_t *rows, size_t element_count,
+    uint64_t *out_position);
+LFM_ORACLE_API int lfm_conversation_prefill_pcm_f32(
+    LfmConversation *conversation, const float *pcm, size_t sample_count,
+    uint32_t sample_rate, uint64_t *out_position);
+LFM_ORACLE_API int lfm_conversation_audio_frame(
+    LfmConversation *conversation, LfmAudioResultV1 *out);
+LFM_ORACLE_API int lfm_conversation_reset(LfmConversation *conversation);
+LFM_ORACLE_API int lfm_conversation_close(LfmConversation *conversation);
 
 #ifdef __cplusplus
 } /* extern "C" */

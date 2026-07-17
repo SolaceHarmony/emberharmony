@@ -100,7 +100,7 @@ polled; stale publication is rejected at the next complete pass boundary.
 | Buffer | Owner | Access |
 |---|---|---|
 | resident safetensors image | native model | immutable assembly source |
-| packed weight panels | native model plan | immutable assembly source |
+| weight-view descriptors | native model plan | non-owning byte spans into the resident image |
 | KV and short-conv state | native conversation | assembly read/write at pass boundaries |
 | activation and scratch planes | native session/conversation | fixed lanes and assembly only |
 | logits and sampler scratch | native conversation | assembly only |

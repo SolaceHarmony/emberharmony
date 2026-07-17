@@ -437,27 +437,18 @@ lane program:
 sampler callback, BF16 hidden copy, Rust lane arithmetic, `SpinBarrier`, and
 `REQ_CALL` dependency have disappeared. Each model installs an immutable plan;
 multiple plans coexist by identity, while C++ owns mutable frame scratch and KV.
-The remaining Candle op chain at `lfm2_audio.rs:1335-1359` is a parity seam to
-delete after the token-exact/e2e gate, not a supported final mode.
+The old Candle op chain remains source-only behind the offline `oracle` feature;
+it is not linked or reachable in the production graph and still awaits the
+physical oracle-crate move tracked by design 14.
 
 ## Codec Plan and State
 
-The current `NativeMimi` has the right arithmetic and the wrong ownership for
-the final runtime:
-
-- `mimi_decoder_new_from_file` opens a second resident image
-  (`native/src/mimi/mimi_decode.cpp:776-850`);
-- `MimiDecoder` owns a fixed 256 MiB arena (`mimi_decode.cpp:674-729`);
-- Rust serializes it with a mutex and allocates `Vec<f32>` per frame
-  (`mimi_native.rs:35-45`, `92-109`).
-
-Split it into:
+The production plan/state split is landed:
 
 ```c++
 struct MimiDecodePlan {             // model lifetime
-    LfmModelImageRef image;
-    MimiWeightBindings weights;
-    MimiShape shape;
+    WeightViewBindings weights;     // non-owning codec-component views
+    DerivedTables tables;           // formula-changing and accounted
 };
 
 struct MimiDecodeState {            // conversation lifetime
@@ -475,13 +466,15 @@ int mimi_decode_into(const MimiDecodePlan *, MimiDecodeState *,
 
 `MimiDecodePlan` binds views into the model component loaded in document 02.
 `MimiDecodeState` contains only mutable streaming state and right-sized scratch.
-The fixed native executor has exclusive ownership while the codec pass runs, so
-no Rust mutex is involved in codec arithmetic or state mutation.
+Typed `REQ_MIMI_DECODE` gives the native executor exclusive ownership while the
+codec pass runs, so no Rust mutex is involved in product codec arithmetic or
+state mutation. The old from-file `NativeMimi` wrapper is compiled only for the
+offline oracle and is absent from the production archive.
 
 Before decode, reserve a contiguous playback block of at least the codec's
 declared maximum output. `mimi_decode_into` writes directly to that reservation;
-publication advances its ready state. No PCM `Vec`, CPU Tensor, event payload,
-or second ring copy exists. The current stage sequence at
+publication advances its ready state. No production PCM `Vec`, CPU tensor
+object, event payload, or second ring copy exists. The current stage sequence at
 `mimi_decode.cpp:850-889` remains quantizer -> upsample -> transformer -> SEANet.
 
 Codec reset is a conversation operation. Playback flush advances output epoch
@@ -549,7 +542,8 @@ model-state pages.
    lane arithmetic, `SpinBarrier`, hidden-row copy, or nested sampler ABI. Move
    its small result span and shared RNG image into native conversation state with
    the recurrence work in step 7.
-9. Split Mimi plan/state ownership and decode directly to playback blocks.
+9. **Complete:** split Mimi plan/state ownership and decode directly to playback
+   reservations through the typed native pass.
 10. Move native tokenizer piece decoding into the notification continuation.
 11. Mount speculative candidate commit/rollback.
 12. Expose quiesce, context switch, and dirty-range hooks needed by spec 10.
@@ -557,9 +551,11 @@ model-state pages.
     slots without mounting a disk writer on a model executor.
 14. Prove no Tauri command reaches the one-shot LFM2 custom detokenizer, capture
     any required fixtures, and delete it.
-15. Remove production `ChatState`, `ConversationState`, `Lfm2VoiceEngine`,
-   Candle cache, generation callbacks, and `NativeMimi` Rust rim only after all
-   gates pass.
+15. **Complete for the production graph:** remove `ChatState`,
+   `ConversationState`, `Lfm2VoiceEngine`, Candle cache, generation callbacks,
+   and the `NativeMimi` Rust rim from shipped inference. Remaining source is
+   oracle-feature-only and still needs the physical crate move tracked by
+   design 14.
 
 ## Acceptance Gates
 

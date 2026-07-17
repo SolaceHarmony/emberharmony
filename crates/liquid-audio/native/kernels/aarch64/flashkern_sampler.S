@@ -1,3 +1,5 @@
+#include "lfm_asm_visibility.h"
+
 #ifdef __APPLE__
 #define LFM_SYM(name) _##name
 #else
@@ -9,6 +11,7 @@
 /* uint32_t lfm_sampler_argmax_f32(const float *x, size_t count) */
 .p2align 2
 .globl LFM_SYM(lfm_sampler_argmax_f32)
+LFM_PRIVATE(LFM_SYM(lfm_sampler_argmax_f32))
 LFM_SYM(lfm_sampler_argmax_f32):
     cbnz    x1, 1f
     mov     w0, wzr
@@ -57,6 +60,7 @@ LFM_SYM(lfm_sampler_argmax_f32):
 /* uint32_t lfm_sampler_argmax_bf16(const uint16_t *x, size_t count) */
 .p2align 2
 .globl LFM_SYM(lfm_sampler_argmax_bf16)
+LFM_PRIVATE(LFM_SYM(lfm_sampler_argmax_bf16))
 LFM_SYM(lfm_sampler_argmax_bf16):
     cbnz    x1, 1f
     mov     w0, wzr
@@ -118,6 +122,7 @@ LFM_SYM(lfm_sampler_argmax_bf16):
  */
 .p2align 2
 .globl LFM_SYM(lfm_sampler_exp_sum_f32)
+LFM_PRIVATE(LFM_SYM(lfm_sampler_exp_sum_f32))
 LFM_SYM(lfm_sampler_exp_sum_f32):
     stp     x29, x30, [sp, #-96]!
     mov     x29, sp
@@ -164,6 +169,7 @@ LFM_SYM(lfm_sampler_exp_sum_f32):
  */
 .p2align 2
 .globl LFM_SYM(lfm_sampler_exp_sum_bf16)
+LFM_PRIVATE(LFM_SYM(lfm_sampler_exp_sum_bf16))
 LFM_SYM(lfm_sampler_exp_sum_bf16):
     stp     x29, x30, [sp, #-96]!
     mov     x29, sp
@@ -218,6 +224,7 @@ LFM_SYM(lfm_sampler_exp_sum_bf16):
 /* uint32_t lfm_sampler_prefix_pick(const float *weights, size_t count, float target) */
 .p2align 2
 .globl LFM_SYM(lfm_sampler_prefix_pick)
+LFM_PRIVATE(LFM_SYM(lfm_sampler_prefix_pick))
 LFM_SYM(lfm_sampler_prefix_pick):
     fmov    s1, wzr
     mov     w8, wzr

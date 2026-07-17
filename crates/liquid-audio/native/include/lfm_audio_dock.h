@@ -41,40 +41,38 @@ typedef struct LfmPcmLeaseV1 {
 } LfmPcmLeaseV1;
 
 /* Compatibility try-reserve. Returns WOULD_BLOCK when every slot is live. */
-int lfm_audio_dock_reserve(LfmSession *session, uint32_t direction,
-                           uint32_t frames, uint32_t sample_rate,
-                           LfmPcmLeaseV1 *out);
+LFM_PUBLIC_API int lfm_audio_dock_reserve(
+    LfmSession *session, uint32_t direction, uint32_t frames,
+    uint32_t sample_rate, LfmPcmLeaseV1 *out);
 /* Expected-value blocking reserve. It never probes on a timer and aborts an
  * admission wait when interrupt advances the stream epoch. */
-int lfm_audio_dock_wait_reserve(LfmSession *session, uint32_t direction,
-                                uint32_t frames, uint32_t sample_rate,
-                                LfmPcmLeaseV1 *out);
+LFM_PUBLIC_API int lfm_audio_dock_wait_reserve(
+    LfmSession *session, uint32_t direction, uint32_t frames,
+    uint32_t sample_rate, LfmPcmLeaseV1 *out);
 /* Atomically bind one bounded UTF-8 input and one RESERVED capture lease to
  * the lease's existing action ticket. On success the command owns the lease;
  * the caller must not publish or release it. On any failure the lease remains
  * RESERVED and caller-owned. The blocking form parks on command-ring space and
  * aborts when interrupt advances the lease epoch or the session stops. */
-int lfm_session_submit_mixed(LfmSession *session, const char *utf8,
-                             size_t utf8_bytes,
-                             const LfmPcmLeaseV1 *capture,
-                             LfmTicketIdV1 *out_ticket);
-int lfm_session_wait_submit_mixed(LfmSession *session, const char *utf8,
-                                  size_t utf8_bytes,
-                                  const LfmPcmLeaseV1 *capture,
-                                  LfmTicketIdV1 *out_ticket);
-int lfm_audio_dock_resolve_mut(LfmSession *session,
-                               const LfmPcmLeaseV1 *lease,
-                               float **out_samples, size_t *out_sample_capacity);
-int lfm_audio_dock_resolve(const LfmSession *session,
-                           const LfmPcmLeaseV1 *lease,
-                           const float **out_samples,
-                           size_t *out_sample_count);
-int lfm_audio_dock_publish(LfmSession *session,
-                           const LfmPcmLeaseV1 *lease);
+LFM_PUBLIC_API int lfm_session_submit_mixed(
+    LfmSession *session, const char *utf8, size_t utf8_bytes,
+    const LfmPcmLeaseV1 *capture, LfmTicketIdV1 *out_ticket);
+LFM_PUBLIC_API int lfm_session_wait_submit_mixed(
+    LfmSession *session, const char *utf8, size_t utf8_bytes,
+    const LfmPcmLeaseV1 *capture, LfmTicketIdV1 *out_ticket);
+LFM_PUBLIC_API int lfm_audio_dock_resolve_mut(
+    LfmSession *session, const LfmPcmLeaseV1 *lease, float **out_samples,
+    size_t *out_sample_capacity);
+LFM_PUBLIC_API int lfm_audio_dock_resolve(
+    const LfmSession *session, const LfmPcmLeaseV1 *lease,
+    const float **out_samples, size_t *out_sample_count);
+LFM_PUBLIC_API int lfm_audio_dock_publish(
+    LfmSession *session, const LfmPcmLeaseV1 *lease);
 /* Expected-value blocking playback receive. It never probes on a timer. */
-int lfm_audio_dock_wait_playback(LfmSession *session, LfmPcmLeaseV1 *out);
-int lfm_audio_dock_release(LfmSession *session,
-                           const LfmPcmLeaseV1 *lease);
+LFM_PUBLIC_API int lfm_audio_dock_wait_playback(LfmSession *session,
+                                                LfmPcmLeaseV1 *out);
+LFM_PUBLIC_API int lfm_audio_dock_release(
+    LfmSession *session, const LfmPcmLeaseV1 *lease);
 
 #ifdef __cplusplus
 } /* extern "C" */

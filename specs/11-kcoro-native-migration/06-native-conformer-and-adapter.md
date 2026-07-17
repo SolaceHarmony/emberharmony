@@ -6,9 +6,10 @@ in the current working tree: `native/src/model/lfm_conformer.cpp` +
 gated by `tests/native_conformer_parity.rs` over per-stage fixtures captured
 from the deleted Rust (`native/tests/fixtures/conformer/`, real checkpoint, BF16
 production ladder; worst relative divergence 5.1e-3). The Rust
-`src/model/conformer/*` and the adapter's Candle `MLP` are deleted. Remaining
-design: the C2/C3 speculative and streaming paths, and pulling the prefill seam
-to a borrowed embedding plane (currently one transport tensor, dies at doc 07).
+`src/model/conformer/*` and the adapter's Candle `MLP` are deleted, and the
+adapter writes directly into the borrowed native prefill plane. Remaining
+design: the C2/C3 speculative and streaming paths plus promotion of the whole
+Conformer orchestrator to a typed fixed-team request (design 14).
 
 Baseline: EmberHarmony `321538f11749`.
 
@@ -113,10 +114,10 @@ struct LfmConformerSegment {
 ```
 
 Every `LfmLinearPlan` is a validated descriptor into `LfmWeightImage`; it does
-not own a repacked tensor. A backend-specific model binding may create a
-persistent packed weight view during model open only when measurement proves it
-worthwhile. Such bytes are model-lifetime residency and must be reported as
-`backend_resident_bytes`, never hidden as a hot-path copy.
+not own or materialize a tensor. Backend-specific bindings must consume the
+checkpoint-layout byte view directly, including unaligned starts; packing,
+alignment, layout, transpose, and dtype copies are forbidden. Only
+formula-changing immutable tables may be derived and separately accounted.
 
 `LfmConformerWork` is sized from the configured maximum committed utterance. If
 that capacity must grow, capture is paused and the resize happens at a session

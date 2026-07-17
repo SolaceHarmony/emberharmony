@@ -1,3 +1,5 @@
+#include "lfm_asm_visibility.h"
+
 // Conformer/adapter leaves. Scalar, strictly ordered — the parity oracle
 // (native/tests/fixtures/conformer) was captured from candle's op-for-op
 // ladders, and bf16 rounding (RNE, the LFM_RNE_WIDEN convention from
@@ -34,6 +36,7 @@
 
 // void lfm_bf16_widen_f32(const uint16_t *x, float *y, uint64_t n)
 .globl LFM_SYM(lfm_bf16_widen_f32)
+LFM_PRIVATE(LFM_SYM(lfm_bf16_widen_f32))
 LFM_SYM(lfm_bf16_widen_f32):
     cbz     x2, 8f
 1:
@@ -51,6 +54,7 @@ LFM_SYM(lfm_bf16_widen_f32):
 // normalize f32, round bf16, then weight/bias in bf16 arithmetic.
 .p2align 2
 .globl LFM_SYM(lfm_ln_bf16)
+LFM_PRIVATE(LFM_SYM(lfm_ln_bf16))
 LFM_SYM(lfm_ln_bf16):
     cbz     x0, 9f
     cbz     x3, 9f
@@ -129,6 +133,7 @@ LFM_SYM(lfm_ln_bf16):
 // step rounds. x is (channels x t) channel-major.
 .p2align 2
 .globl LFM_SYM(lfm_bn_bf16)
+LFM_PRIVATE(LFM_SYM(lfm_bn_bf16))
 LFM_SYM(lfm_bn_bf16):
     mov     w14, #0x7fff
     mov     x8, #0              // channel
@@ -175,6 +180,7 @@ LFM_SYM(lfm_bn_bf16):
 // void lfm_relu_bf16(uint16_t *x, uint64_t n) — negative bf16 -> +0.
 .p2align 2
 .globl LFM_SYM(lfm_relu_bf16)
+LFM_PRIVATE(LFM_SYM(lfm_relu_bf16))
 LFM_SYM(lfm_relu_bf16):
     cbz     x1, 8f
 1:
@@ -191,6 +197,7 @@ LFM_SYM(lfm_relu_bf16):
 // int lfm_silu_bf16(uint16_t *x, uint64_t n) — x*sigmoid(x), f32, one round.
 .p2align 2
 .globl LFM_SYM(lfm_silu_bf16)
+LFM_PRIVATE(LFM_SYM(lfm_silu_bf16))
 LFM_SYM(lfm_silu_bf16):
     cbz     x0, 9f
     stp     x29, x30, [sp, #-48]!
@@ -227,6 +234,7 @@ LFM_SYM(lfm_silu_bf16):
 // candle order: sigmoid rounds to bf16, then the product rounds.
 .p2align 2
 .globl LFM_SYM(lfm_glu_bf16)
+LFM_PRIVATE(LFM_SYM(lfm_glu_bf16))
 LFM_SYM(lfm_glu_bf16):
     cbz     x0, 9f
     cbz     x1, 9f
@@ -274,6 +282,7 @@ LFM_SYM(lfm_glu_bf16):
 // 0.5 * x * (1 + erf(x / sqrt(2))), f32, one round.
 .p2align 2
 .globl LFM_SYM(lfm_gelu_erf_bf16)
+LFM_PRIVATE(LFM_SYM(lfm_gelu_erf_bf16))
 LFM_SYM(lfm_gelu_erf_bf16):
     cbz     x0, 9f
     stp     x29, x30, [sp, #-48]!
@@ -316,6 +325,7 @@ LFM_SYM(lfm_gelu_erf_bf16):
 // r = bf16(r + bf16(0.5*h)) — two rounds, candle op order.
 .p2align 2
 .globl LFM_SYM(lfm_residual_half_bf16)
+LFM_PRIVATE(LFM_SYM(lfm_residual_half_bf16))
 LFM_SYM(lfm_residual_half_bf16):
     cbz     x2, 8f
     mov     w14, #0x7fff
@@ -339,6 +349,7 @@ LFM_SYM(lfm_residual_half_bf16):
 // void lfm_add_bf16(uint16_t *r, const uint16_t *h, uint64_t n)
 .p2align 2
 .globl LFM_SYM(lfm_add_bf16)
+LFM_PRIVATE(LFM_SYM(lfm_add_bf16))
 LFM_SYM(lfm_add_bf16):
     cbz     x2, 8f
     mov     w14, #0x7fff
@@ -359,6 +370,7 @@ LFM_SYM(lfm_add_bf16):
 // candle ladder: max, subtract, exp (libm expf), sum, divide — all f32.
 .p2align 2
 .globl LFM_SYM(lfm_softmax_rows_f32)
+LFM_PRIVATE(LFM_SYM(lfm_softmax_rows_f32))
 LFM_SYM(lfm_softmax_rows_f32):
     cbz     x0, 9f
     cbz     x2, 9f
@@ -427,6 +439,7 @@ LFM_SYM(lfm_softmax_rows_f32):
 // C(MxN) = A(MxK) . B(KxN), scalar, k-ascending accumulate (off-Apple path).
 .p2align 2
 .globl LFM_SYM(lfm_sgemm_f32)
+LFM_PRIVATE(LFM_SYM(lfm_sgemm_f32))
 LFM_SYM(lfm_sgemm_f32):
     mov     x6, #0              // i
 1:
@@ -468,6 +481,7 @@ LFM_SYM(lfm_sgemm_f32):
 // C(MxN) = A(MxK) . B(NxK)^T — both operands row-contiguous dots.
 .p2align 2
 .globl LFM_SYM(lfm_sgemm_nt_f32)
+LFM_PRIVATE(LFM_SYM(lfm_sgemm_nt_f32))
 LFM_SYM(lfm_sgemm_nt_f32):
     mov     x6, #0
 1:
@@ -511,6 +525,7 @@ LFM_SYM(lfm_sgemm_nt_f32):
 //                                  float *c, int m, int n, int k)
 .p2align 2
 .globl LFM_SYM(lfm_bf16_gemm_nt_f32_scalar)
+LFM_PRIVATE(LFM_SYM(lfm_bf16_gemm_nt_f32_scalar))
 LFM_SYM(lfm_bf16_gemm_nt_f32_scalar):
     mov     x6, #0
 1:
@@ -554,6 +569,7 @@ LFM_SYM(lfm_bf16_gemm_nt_f32_scalar):
 //                         uint64_t k, uint64_t stride)
 .p2align 2
 .globl LFM_SYM(lfm_dwconv_tap_f32)
+LFM_PRIVATE(LFM_SYM(lfm_dwconv_tap_f32))
 LFM_SYM(lfm_dwconv_tap_f32):
     mov     x8, #0              // channel
 1:
@@ -597,6 +613,7 @@ LFM_SYM(lfm_dwconv_tap_f32):
 // bias/round boundary in the caller.
 .p2align 2
 .globl LFM_SYM(lfm_dwconv_tap_bf16_f32)
+LFM_PRIVATE(LFM_SYM(lfm_dwconv_tap_bf16_f32))
 LFM_SYM(lfm_dwconv_tap_bf16_f32):
     mov     x8, #0              // channel
 1:
@@ -643,6 +660,7 @@ LFM_SYM(lfm_dwconv_tap_bf16_f32):
 // Per-channel 3x3, stride 2, on a pre-padded plane.
 .p2align 2
 .globl LFM_SYM(lfm_dwconv2d_k3s2_f32)
+LFM_PRIVATE(LFM_SYM(lfm_dwconv2d_k3s2_f32))
 LFM_SYM(lfm_dwconv2d_k3s2_f32):
     stp     x25, x26, [sp, #-32]!
     stp     x27, x28, [sp, #16]
@@ -716,6 +734,7 @@ LFM_SYM(lfm_dwconv2d_k3s2_f32):
 // MAC; the checkpoint address may be byte-unaligned.
 .p2align 2
 .globl LFM_SYM(lfm_conv2d_stem_k3s2_bf16_f32)
+LFM_PRIVATE(LFM_SYM(lfm_conv2d_stem_k3s2_bf16_f32))
 LFM_SYM(lfm_conv2d_stem_k3s2_bf16_f32):
     stp     x25, x26, [sp, #-32]!
     stp     x27, x28, [sp, #16]
@@ -788,6 +807,7 @@ LFM_SYM(lfm_conv2d_stem_k3s2_bf16_f32):
 // resident checkpoint taps stay bf16; each value is unlifted at the MAC.
 .p2align 2
 .globl LFM_SYM(lfm_dwconv2d_k3s2_bf16_f32)
+LFM_PRIVATE(LFM_SYM(lfm_dwconv2d_k3s2_bf16_f32))
 LFM_SYM(lfm_dwconv2d_k3s2_bf16_f32):
     stp     x25, x26, [sp, #-32]!
     stp     x27, x28, [sp, #16]
@@ -862,6 +882,7 @@ LFM_SYM(lfm_dwconv2d_k3s2_bf16_f32):
 // y[r][i] += widen(bias[i]) — the f32 bias add of the linear contract.
 .p2align 2
 .globl LFM_SYM(lfm_bias_rows_f32)
+LFM_PRIVATE(LFM_SYM(lfm_bias_rows_f32))
 LFM_SYM(lfm_bias_rows_f32):
     cbz     x1, 8f
     mov     x4, #0              // row
@@ -889,6 +910,7 @@ LFM_SYM(lfm_bias_rows_f32):
 //                         uint64_t t) — y[c][*] += widen(bias[c]).
 .p2align 2
 .globl LFM_SYM(lfm_bias_bcast_f32)
+LFM_PRIVATE(LFM_SYM(lfm_bias_bcast_f32))
 LFM_SYM(lfm_bias_bcast_f32):
     cbz     x1, 8f
     mov     x4, #0
@@ -918,6 +940,7 @@ LFM_SYM(lfm_bias_bcast_f32):
 // combine (ac + bd[:, :T]) / sqrt(dk)).
 .p2align 2
 .globl LFM_SYM(lfm_add_scale_f32)
+LFM_PRIVATE(LFM_SYM(lfm_add_scale_f32))
 LFM_SYM(lfm_add_scale_f32):
     mov     x5, #0              // row
 1:
@@ -947,6 +970,7 @@ LFM_SYM(lfm_add_scale_f32):
 // y[t][h*dk+d] = bf16(x + bias[h][d]) — one round (bf16 broadcast_add).
 .p2align 2
 .globl LFM_SYM(lfm_add_bias_hd_bf16)
+LFM_PRIVATE(LFM_SYM(lfm_add_bias_hd_bf16))
 LFM_SYM(lfm_add_bias_hd_bf16):
     mov     w14, #0x7fff
     mul     x6, x4, x5          // D = heads*dk
@@ -978,6 +1002,7 @@ LFM_SYM(lfm_add_bias_hd_bf16):
 // pe[i][2j+1]=cos(...), f32 angles (libm sinf/cosf), stored bf16.
 .p2align 2
 .globl LFM_SYM(lfm_pe_build_bf16)
+LFM_PRIVATE(LFM_SYM(lfm_pe_build_bf16))
 LFM_SYM(lfm_pe_build_bf16):
     cbz     x0, 9f
     cbz     x1, 9f

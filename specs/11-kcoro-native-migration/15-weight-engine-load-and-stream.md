@@ -6,6 +6,10 @@ direct BF16 consumers described here. Load-throughput tuning remains
 measurement-driven; it may not weaken the ownership or no-materialization
 rules.
 
+**Terminology:** "tensor" below is shorthand for a non-owning typed view
+(pointer, byte length, dtype, shape, and derived strides). No production tensor
+container owns or materializes model bytes.
+
 Substrate under P1 (residency) and the decode bandwidth ceiling. Investigates the
 provenance of `native/src/io/safetensors.cpp` and plans a high-speed path for
 getting weights off disk and streaming them through compute in the correct
@@ -20,10 +24,11 @@ Five distinct lifetimes are owned and accounted separately:
    after load. Shared read-only by every plan, every conversation.
 2. **Derived storage — separately accounted.** Only formula-changing immutable
    values computed from the image are admitted: rope/window/FFT tables, BatchNorm
-   denominators, and mathematically required weight-normalization folds. Apple
-   BF16-to-F32 staging, transposes, repacks, alignment copies, and any re-laid
-   weight buffer are forbidden compatibility materialization, not derived
-   storage. `compatibility_copied_bytes` must read 0 in production.
+   denominators, Mimi effective-codebook folds, and mathematically required
+   weight-normalization folds. Apple BF16-to-F32 staging, transposes, repacks,
+   alignment copies, and any re-laid weight buffer are forbidden compatibility
+   materialization, not derived storage. `compatibility_copied_bytes` must read
+   0 in production.
 3. **Immutable shared plans** — the bound weight descriptors + shape/stride facts
    for a stage (GEMV geometry, layer table). Built once at model open from tier 1,
    shared by all conversations, never mutated in a pass.
@@ -76,9 +81,9 @@ drop was correct and stays correct (see §4).
 
 ember-ml's loader itself (for reference; `/Volumes/stuff/ukm/ember-ml`): pure
 `read`/`pread` (no `mmap`), a `ParallelFileReader` that slices a span into ~8 MiB
-chunks across a 4-thread pool with a small in-flight ring, a reusable-buffer
-chunk streamer, and a global in-flight-bytes throttle (~512 MiB). That parallel
-positioned-read is the transferable load technique (§3). Note the ember-ml tree
+chunks across a 4-thread pool. Its reusable-buffer streamer and byte throttle
+belong to a staged-copy design and are deliberately not borrowed here; only the
+parallel positioned-read technique transfers (§3). Note the ember-ml tree
 is mid-refactor: several referenced loader functions (`SafetensorsResidentBlock`,
 `build_safetensors_span_plan`) are declared but not defined — so we borrow the
 *technique*, there is no drop-in code.
@@ -161,12 +166,11 @@ bandwidth goes; the likely levers, in order of expected payoff:
    2-row ILP; a hand-written leaf can run 4×+ load streams, schedule PRFM
    distance explicitly, and keep more accumulators live to hide FMA latency.
    Only worth it if (1) shows the loop is compute/issue-bound, not DRAM-bound.
-3. **Cut the Apple AMX per-call widening traffic.** For M>1 (prefill, suffix
-   chunks) every GEMM widens bf16→f32 into `gemm_amx_*` staging per call — extra
-   write+read traffic Accelerate then re-reads. Options: keep it (staged tiles are
-   cache-friendly) vs. a one-time f32 shadow of the hot matrices (doubles their
-   footprint — rejected, see doc 14 Trade-off 5). Measure whether the widen is on
-   the critical path at all before touching it.
+3. **Direct small-M reuse is landed.** Prefill/suffix chunks of up to four rows
+   use checkpoint-layout BF16 kernels that load each weight vector once for the
+   active row group. Apple and x86/Rosetta create no `gemm_amx_*` widening plane,
+   one-time f32 shadow, pack, or transpose. Further tuning is a measured kernel
+   scheduling question, not permission to restore weight staging.
 4. **Prefetch-distance / stream-count tuning** on the existing leaf — cheap,
    measurable, no rewrite.
 
@@ -227,8 +231,7 @@ ever shows up in a profile.
 
 | Idea | Where it lands here |
 |---|---|
-| Parallel positioned `pread` into the final buffer, bounded in-flight | §3a — the load win |
-| In-flight-bytes throttle during load | §3a |
+| Parallel positioned `pread` into the final buffer, bounded by worker count | §3a — the load win |
 | Host-as-bus / persistent resident kernel owns compute | already the flashkern lane team |
 | Register-resident hot tile, explicit memory-crossing only | already the leaves; sharpen with hand-asm §3b |
 | Stream → consume → drop for load (pointer walk, bounded scratch) | §3a + the resident-image binding (P1) |
@@ -244,6 +247,7 @@ ever shows up in a profile.
 | `from_holo`/voxel array sink | Non-materializable — throws on raw pointer access. Antithetical to weight views. |
 | Drain-to-empty completion (no CQ) | Our SQ/**CQ** with epoch routing is strictly more capable. |
 | Producer busy-spin on flush | Our two-sided expected-value doorbell already blocks properly. |
+| In-flight-bytes load throttle | Direct reads borrow disjoint spans of the already-final image; worker count is the complete bound, so a byte throttle only serializes I/O. |
 | 6-slot bank / NEON-only / single-worker / no-fallback absolutism | Instance-specific limits; the pattern generalizes, this instance doesn't. |
 
 ## 5. How it fits the phases

@@ -40,6 +40,7 @@ extern "C" {
     ) -> i32;
     fn mimi_decode_plan_free(plan: *mut c_void);
     fn mimi_decode_plan_derived_bytes(plan: *const c_void) -> u64;
+    fn mimi_decode_plan_bound_weight_bytes(plan: *const c_void) -> u64;
     fn mimi_decode_plan_compatibility_copied_bytes(plan: *const c_void) -> u64;
     fn mimi_decode_state_new(
         state: *mut *mut c_void,
@@ -80,9 +81,10 @@ impl Drop for State {
 fn null_mimi_state_is_an_error_not_a_priming_frame() {
     let codes = [0u32; CODEBOOKS];
     let mut pcm = [0.0f32; 1];
-    assert!(unsafe {
-        mimi_decode_state_step(std::ptr::null_mut(), codes.as_ptr(), pcm.as_mut_ptr())
-    } < 0);
+    assert!(
+        unsafe { mimi_decode_state_step(std::ptr::null_mut(), codes.as_ptr(), pcm.as_mut_ptr()) }
+            < 0
+    );
 }
 
 #[test]
@@ -123,10 +125,12 @@ fn mimi_binds_codec_component_without_reopening_or_copying_weights() {
     );
     let plan = Plan(plan);
     let derived = unsafe { mimi_decode_plan_derived_bytes(plan.0) };
+    let bound = unsafe { mimi_decode_plan_bound_weight_bytes(plan.0) };
     assert!(
         derived > 0,
         "formula-derived codebooks/RoPE must be accounted"
     );
+    assert!(bound > 0, "required codec views must be accounted exactly");
     assert_eq!(
         unsafe { mimi_decode_plan_compatibility_copied_bytes(plan.0) },
         0,
@@ -152,7 +156,7 @@ fn mimi_binds_codec_component_without_reopening_or_copying_weights() {
         mimi_decode_state_bytes(second.0)
     });
     eprintln!(
-        "[mimi-image] derived={} bytes, state={} bytes/conversation, compatibility=0",
+        "[mimi-image] bound={bound} bytes, derived={} bytes, state={} bytes/conversation, compatibility=0",
         derived,
         unsafe { mimi_decode_state_bytes(first.0) }
     );
@@ -178,6 +182,10 @@ fn mimi_binds_codec_component_without_reopening_or_copying_weights() {
         assert!(pcm[..samples as usize]
             .iter()
             .all(|sample| sample.is_finite()));
+        assert_eq!(
+            unsafe { mimi_decode_plan_bound_weight_bytes(plan.0) },
+            bound
+        );
         assert_eq!(unsafe { mimi_decode_plan_derived_bytes(plan.0) }, derived);
         assert_eq!(
             unsafe { mimi_decode_plan_compatibility_copied_bytes(plan.0) },

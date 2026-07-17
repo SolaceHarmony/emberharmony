@@ -7,6 +7,32 @@ struct MixedTurnPlan {
     total: usize,
 }
 
+#[repr(C)]
+struct NativeEmission {
+    kind: u32,
+    text_bytes: u32,
+    code_count: u32,
+    flags: u32,
+    position: u64,
+    text: [u8; 512],
+    codes: [u32; 64],
+}
+
+impl NativeEmission {
+    fn audio(flags: u32) -> Self {
+        let codes = if flags == 1 { [2048; 64] } else { [0; 64] };
+        Self {
+            kind: 2,
+            text_bytes: 0,
+            code_count: 8,
+            flags,
+            position: 0,
+            text: [0; 512],
+            codes,
+        }
+    }
+}
+
 unsafe extern "C" {
     fn lfm_mixed_turn_plan(
         capacity: usize,
@@ -16,6 +42,7 @@ unsafe extern "C" {
         assistant_tokens: usize,
         out: *mut MixedTurnPlan,
     ) -> i32;
+    fn lfm_native_emission_needs_pcm(emission: *const NativeEmission) -> i32;
 }
 
 fn plan(
@@ -33,6 +60,23 @@ fn plan(
         return Err(status);
     }
     Ok(plan)
+}
+
+#[test]
+fn eo_audio_stays_in_recurrence_and_never_enters_mimi() {
+    use liquid_audio as _;
+    assert_eq!(
+        unsafe { lfm_native_emission_needs_pcm(&NativeEmission::audio(0)) },
+        1
+    );
+    assert_eq!(
+        unsafe { lfm_native_emission_needs_pcm(&NativeEmission::audio(1)) },
+        0
+    );
+    assert_eq!(
+        unsafe { lfm_native_emission_needs_pcm(&NativeEmission::audio(2)) },
+        -libc::EINVAL
+    );
 }
 
 #[test]
