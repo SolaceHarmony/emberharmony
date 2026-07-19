@@ -48,13 +48,18 @@ esac
 RUNNER='target.x86_64-apple-darwin.runner = ["/usr/bin/arch", "-x86_64"]'
 TARGET=x86_64-apple-darwin
 
-echo "== [1/3] kcoro x86 ticket and wait-word tests =="
+echo "== [1/4] kcoro x86 ticket and wait-word tests =="
 cargo --config "$RUNNER" test -p kcoro-sys --target "$TARGET" --tests -- --nocapture
 
-echo "== [2/3] candle-flashfftconv x86 tests =="
+echo "== [2/4] candle-flashfftconv x86 tests =="
 cargo --config "$RUNNER" test -p candle-flashfftconv --target "$TARGET" -- --nocapture
 
-echo "== [3/3] liquid-audio x86 library tests =="
+echo "== [3/4] liquid-audio direct BF16 epilogue parity =="
+cargo --config "$RUNNER" test -p liquid-audio --target "$TARGET" --features oracle --lib \
+    flashkern::native_engine::tests::direct_bf16_epilogues_match_materialized_primitives \
+    -- --exact --nocapture
+
+echo "== [4/4] liquid-audio x86 library tests =="
 cargo --config "$RUNNER" test -p liquid-audio --target "$TARGET" --lib -- --nocapture
 
 echo "== Rosetta x86 gate: ALL GREEN =="

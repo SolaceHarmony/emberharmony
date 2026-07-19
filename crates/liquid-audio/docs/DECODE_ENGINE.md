@@ -18,7 +18,7 @@ the dispatch model, verification, and the build order.
 
 ---
 
-## 0. As-built architecture (2026-07-16 working tree)
+## 0. As-built architecture (2026-07-19 working tree)
 
 The shipped LFM2 CPU path is native from accepted text/PCM through emitted text/PCM.
 Rust owns opaque lifecycle, platform audio, VAD/endpointing, settings, and the current
@@ -36,7 +36,7 @@ sampling, or model recurrence.
   playback leases, interruption, stop, and the native generation loop. A C++
   coordinator advances recurrence; Rust never waits on or interprets a numerical
   completion.
-- Flashkern owns one stable pthread per numerical lane. Typed audio encode,
+- kcoro owns one stable fixed-team worker per numerical lane. Typed audio encode,
   backbone, Depthformer, and Mimi requests enter that team and park on
   expected-value words between passes and at generation fences.
   `REQ_AUDIO_ENCODE` carries borrowed PCM/output spans through resample,
@@ -75,7 +75,7 @@ flowchart LR
     Team --> Board["shared stage board<br/>atomic tile claims"]
     Board --> Kernels["AArch64 / x86_64 leaves"]
     Kernels -->|"exact completion doorbell"| Conv
-    Conv -->|"Mimi PCM into playback lease"| Playback["native playback dock"]
+    Conv -->|"Mimi + native device-rate resample into lease"| Playback["native playback dock"]
     Playback -->|"current Vec/VoiceEvent observer bridge"| Host
 ```
 
@@ -83,8 +83,10 @@ flowchart LR
 ShortConv/attention/MLP walk, final norm, and optional sampling in one team entry.
 `REQ_DEPTH_FRAME` executes projection, every Depthformer codebook/layer, resident KV
 recurrence, collective sampling, and sampled-embedding feedback.
-`REQ_MIMI_DECODE` serializes conversation-local codec state through the same SQ/CQ
-and writes directly into its retained playback reservation. `REQ_AUDIO_ENCODE`
+`REQ_MIMI_DECODE` serializes conversation-local codec state through the same SQ/CQ.
+At 24 kHz it writes directly into the retained reservation; at another device
+rate it decodes into conversation-owned codec scratch and the same route's native
+retained streaming rate converter writes directly into the reservation. `REQ_AUDIO_ENCODE`
 precedes those passes without exposing mel rows, hidden rows, logits, codes, or
 model pointers to Rust. Lower-level request kinds
 remain fixture and implementation seams, not the production orchestration surface.
@@ -149,11 +151,11 @@ as-built. Read this as the spec, not the changelog.
 4. **Transport.** Rings + `(offset, len, epoch)` descriptors, no owned `Vec` payloads on hot
    surfaces.
 
-For LFM2, weight/compute ownership, the typed audio-input request, and native
-recurrence are built. The remaining contract gaps are adoption of the landed
-capacity-2 completion callback by the native session coordinator, and replacement
-of the legacy Rust `Vec`/`VoiceEvent` audio observer with the physical kcoro
-audio-device adapter.
+For LFM2, weight/compute ownership, the typed audio-input request, native
+recurrence, capacity-2 exact-completion route, and retained kcoro bridge/broker
+services are built. The remaining contract gap is the physical Rust audio dock:
+replace transitional `Vec`/event payload ownership with retained block leases and
+mount its bounded VAD/frame state machines on the same callback-resumed runtime.
 This statement does not include a native Moshi port.
 
 **Lineage.** The learned lessons come from the sibling m2-bert-mlx project (same team as
@@ -224,9 +226,12 @@ retaining inputs and recomputing the whole tail.
   configured maximum PCM path before readiness; oversized or rate-changed work
   fails instead of growing scratch in a pass.
 - Frontend power aliases the dead STFT real plane, valid mel writes directly into
-  the BF16 Conformer destination, Conformer writes the native prefill plane, and
-  Mimi writes PCM directly into a playback reservation. Weight planes are never
-  widened, packed, transposed, or copied.
+  the BF16 Conformer destination, and Conformer writes the native prefill plane.
+  M≤4 prefill linears publish their exact-RNE BF16 results directly into strided
+  `stage`, ShortConv, and Q/K/V consumer planes; no `bcxf`, `projf`, or `qkvf`
+  activation plane survives. Mimi writes direct at equal rates; otherwise native codec scratch feeds the
+  prepared output resampler, which writes the device-rate playback reservation.
+  Weight planes are never widened, packed, transposed, or copied.
 - Native generation fences use acquire/release generations and expected-value
   parks. The last lane performs the fixed serial transition and wakes only actual
   waiters. There is no spin budget or timed polling.

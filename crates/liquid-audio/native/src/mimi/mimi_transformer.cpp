@@ -19,11 +19,12 @@
 //   unit owns a self-contained ring reproducing RotatingCache semantics
 //   exactly; see /* NOTES */ (d) for the proof and the unit-5 reconciliation.
 //
-// Discipline: math is assembly at every step — GEMM/GEMV ride AMX via the
-// header's Accelerate-backed mimi_gemv_f32/mimi_gemm_f32 (projections,
-// attention scores, ws@v), every other sweep is NEON intrinsics as the
-// primary path (rope rotation, score scale+mask locally; layernorm, softmax,
-// gelu sweep, layer-scale, residual adds via the header NEON primitives).
+// Discipline: math is assembly at every step — activation-only attention
+// GEMM/GEMV ride AMX via Accelerate, while every resident projection streams
+// checkpoint bytes directly through architecture registers. Every other sweep
+// is NEON intrinsics as the primary path (rope rotation, score scale+mask
+// locally; layernorm, softmax, and gelu via the header primitives). Projection
+// scale/add epilogues write only their final residual values.
 // Scalar code exists only in the _ref parity siblings (MIMI_SCALAR_REF) and
 // sub-vector tails. Zero allocation in steady state (state + scratch carved
 // from MimiArena at init), POD state, f32 accumulate, documented orders.
@@ -50,7 +51,7 @@ enum {
     TR_L = MIMI_TR_LAYERS,              /* 8    num_layers                   */
     TR_CTX = MIMI_TR_CONTEXT,           /* 250  context == KV ring capacity  */
     TR_FF = MIMI_TR_FF,                 /* 2048 dim_feedforward              */
-    TR_QKV = 3 * MIMI_DIM,              /* 1536 packed in_proj output        */
+    TR_QKV = 3 * MIMI_DIM,              /* 1536 packed in_proj rows          */
     TR_MAX_N = 8,                       /* scratch headroom; steady n is 1|2 */
 };
 static const float TR_EPS = 1e-5f;      /* Norm::new_shortcut LayerNorm eps  */
@@ -94,10 +95,7 @@ struct MimiTransformerState {
     /* scratch (steady-state, no allocation) */
     float *xt;               /* [TR_MAX_N][TR_D] working activations [t,c]   */
     float *normb;            /* [TR_MAX_N][TR_D] norm1/norm2 output          */
-    float *qkv;              /* [TR_MAX_N][TR_QKV] packed q|k|v, post-rope   */
-    float *attn_cat;         /* [TR_MAX_N][TR_D] heads concatenated          */
-    float *branch;           /* [TR_MAX_N][TR_D] out_proj / linear2 output   */
-    float *mlp_hidden;       /* [TR_MAX_N][TR_FF]                            */
+    float *mlp_hidden;       /* [TR_MAX_N][TR_FF]; prefix is Q/attention     */
     float *scores;           /* [TR_H][TR_MAX_N][TR_CTX] score rows — banded
                               * per head so lanes never share a scratch row  */
     float *maskv;            /* [TR_MAX_N][TR_CTX] additive mask 0 / -inf    */
@@ -345,9 +343,6 @@ extern "C" int mimi_transformer_init(MimiTransformerState **st,
 
     s->xt = (float *)mimi_arena_alloc(a, (size_t)TR_MAX_N * TR_D * sizeof(float));
     s->normb = (float *)mimi_arena_alloc(a, (size_t)TR_MAX_N * TR_D * sizeof(float));
-    s->qkv = (float *)mimi_arena_alloc(a, (size_t)TR_MAX_N * TR_QKV * sizeof(float));
-    s->attn_cat = (float *)mimi_arena_alloc(a, (size_t)TR_MAX_N * TR_D * sizeof(float));
-    s->branch = (float *)mimi_arena_alloc(a, (size_t)TR_MAX_N * TR_D * sizeof(float));
     s->mlp_hidden = (float *)mimi_arena_alloc(a, (size_t)TR_MAX_N * TR_FF * sizeof(float));
     s->scores = (float *)mimi_arena_alloc(
         a, (size_t)TR_H * TR_MAX_N * TR_CTX * sizeof(float));
@@ -494,39 +489,50 @@ extern "C" int mimi_transformer_step(MimiTransformerState *st, const float *x,
                 st->normb + (size_t)tp * TR_D, TR_D, TR_EPS);
         }
 
-        /* in_proj (AMX gemv): packed qkv = norm1(x) @ W^T, rows [q|k|v]
-         * head-major. qkv[tp][s*512 + h*64 + dd] == candle reshape (b,t,3,h,d). */
+        /* in_proj: the checkpoint remains one packed byte view [q|k|v]. Q
+         * lands in each token row's first TR_D values of mlp_hidden. The MLP
+         * plane is dead until after attention and out-projection, so each
+         * completed attention head can overwrite the consumed Q span. K/V land
+         * directly in the head-private ring slot that consumes them. Splitting
+         * the output rows does not split a dot product: each row keeps the
+         * resident GEMV's reduction and bias boundary, and only its final store
+         * moves. This removes the former K/V staging planes and ring memcpy. */
         for (int tp = 0; tp < t; tp++) {
-            mimi_weight_gemv_f32(
-                L->in_proj_w, st->normb + (size_t)tp * TR_D, NULL,
-                st->qkv + (size_t)tp * TR_QKV, TR_QKV, TR_D);
-        }
-
-        /* rope_i on q and k blocks, in place (NEON, see tr_rope_block).
-         * v untouched. */
-        for (int tp = 0; tp < t; tp++) {
-            const float *crow = st->rope_cos + (size_t)tp * TR_HD2;
-            const float *srow = st->rope_sin + (size_t)tp * TR_HD2;
-            for (int qk = 0; qk < 2; qk++) { /* 0: q block, 1: k block */
-                float *blk = st->qkv + (size_t)tp * TR_QKV + (size_t)qk * TR_D;
-                for (int h = 0; h < TR_H; h++) {
-                    tr_rope_block(blk + (size_t)h * TR_HD, crow, srow);
-                }
+            const float *nr = st->normb + (size_t)tp * TR_D;
+            const uint32_t slot = (off + (uint32_t)tp) % TR_CTX;
+            mimi_weight_gemv_span_f32(L->in_proj_w, nr, NULL,
+                                      st->mlp_hidden + (size_t)tp * TR_FF,
+                                      0, TR_D, TR_D);
+            for (int h = 0; h < TR_H; h++) {
+                const int begin = TR_D + h * TR_HD;
+                float *kr = L->k_ring +
+                    ((size_t)h * TR_CTX + slot) * TR_HD;
+                mimi_weight_gemv_span_f32(L->in_proj_w, nr, NULL, kr,
+                                          begin, begin + TR_HD, TR_D);
+            }
+            for (int h = 0; h < TR_H; h++) {
+                const int begin = 2 * TR_D + h * TR_HD;
+                float *vr = L->v_ring +
+                    ((size_t)h * TR_CTX + slot) * TR_HD;
+                mimi_weight_gemv_span_f32(L->in_proj_w, nr, NULL, vr,
+                                          begin, begin + TR_HD, TR_D);
             }
         }
 
-        /* kv_cache.append (RotatingCache::append, seq_len < max_seq_len
-         * branch): write each new frame at slot (off + i) % TR_CTX. All
-         * layers use the same pre-step offset (lockstep caches). */
-        for (int i = 0; i < t; i++) {
-            const uint32_t slot = (off + (uint32_t)i) % TR_CTX;
-            const float *krow = st->qkv + (size_t)i * TR_QKV + TR_D;
-            const float *vrow = st->qkv + (size_t)i * TR_QKV + 2 * TR_D;
+        /* rope_i on the MLP plane's aliased Q/attention prefix and the K ring
+         * slots, in place
+         * (NEON, see tr_rope_block). V is already final and remains untouched. */
+        for (int tp = 0; tp < t; tp++) {
+            const float *crow = st->rope_cos + (size_t)tp * TR_HD2;
+            const float *srow = st->rope_sin + (size_t)tp * TR_HD2;
+            const uint32_t slot = (off + (uint32_t)tp) % TR_CTX;
             for (int h = 0; h < TR_H; h++) {
-                memcpy(L->k_ring + ((size_t)h * TR_CTX + slot) * TR_HD,
-                       krow + (size_t)h * TR_HD, TR_HD * sizeof(float));
-                memcpy(L->v_ring + ((size_t)h * TR_CTX + slot) * TR_HD,
-                       vrow + (size_t)h * TR_HD, TR_HD * sizeof(float));
+                tr_rope_block(st->mlp_hidden + (size_t)tp * TR_FF +
+                                  (size_t)h * TR_HD,
+                              crow, srow);
+                tr_rope_block(L->k_ring +
+                                  ((size_t)h * TR_CTX + slot) * TR_HD,
+                              crow, srow);
             }
         }
 
@@ -538,7 +544,8 @@ extern "C" int mimi_transformer_step(MimiTransformerState *st, const float *x,
             const float *kr = L->k_ring + (size_t)h * TR_CTX * TR_HD;
             const float *vr = L->v_ring + (size_t)h * TR_CTX * TR_HD;
             for (int tp = 0; tp < t; tp++) {
-                const float *qh = st->qkv + (size_t)tp * TR_QKV + (size_t)h * TR_HD;
+                const float *qh = st->mlp_hidden + (size_t)tp * TR_FF +
+                                  (size_t)h * TR_HD;
                 float *sc = st->scores + ((size_t)h * TR_MAX_N + (size_t)tp) * TR_CTX;
                 /* scores row = K[0..k_len) @ q — AMX gemv over the
                  * contiguous ring rows. */
@@ -547,27 +554,22 @@ extern "C" int mimi_transformer_step(MimiTransformerState *st, const float *x,
                 tr_scale_mask(sc, st->maskv + (size_t)tp * TR_CTX, k_len);
                 /* softmax_last_dim over the k_len window (header NEON) */
                 mimi_softmax_f32(sc, k_len);
-                /* ws @ v == C[1x64] = A[1xk_len] B[k_len x 64] — AMX gemm,
-                 * beta=0 writes the head section of attn_cat directly. */
+                /* ws @ v == C[1x64] = A[1xk_len] B[k_len x 64] — AMX gemm.
+                 * beta=0 overwrites the consumed Q head in the MLP plane. */
                 mimi_gemm_f32(sc, vr,
-                              st->attn_cat + (size_t)tp * TR_D + (size_t)h * TR_HD,
+                              st->mlp_hidden + (size_t)tp * TR_FF +
+                                  (size_t)h * TR_HD,
                               1, k_len, TR_HD, 0);
             }
         }
 
-        /* out_proj (AMX gemv, no bias), then
-         * x = x + layer_scale_1 * attn (header NEON sweeps; candle order:
-         * broadcast_mul then add — two separate sweeps, no fma). */
+        /* out_proj, layer scale, and residual publication. The resident row
+         * reducer is unchanged; only its completed value survives long enough
+         * for the separately-rounded scale and residual add. No branch plane. */
         for (int tp = 0; tp < t; tp++) {
-            mimi_weight_gemv_f32(
-                L->out_proj_w, st->attn_cat + (size_t)tp * TR_D, NULL,
-                st->branch + (size_t)tp * TR_D, TR_D, TR_D);
-        }
-        for (int tp = 0; tp < t; tp++) {
-            float *xr = st->xt + (size_t)tp * TR_D;
-            float *br = st->branch + (size_t)tp * TR_D;
-            mimi_weight_scale_vec_f32(br, L->ls1, br, TR_D);
-            mimi_add_vec_f32(xr, br, xr, TR_D);       /* residual, in place  */
+            mimi_weight_gemv_scale_residual_rows_f32(
+                L->out_proj_w, st->mlp_hidden + (size_t)tp * TR_FF, L->ls1,
+                st->xt + (size_t)tp * TR_D, 0, TR_D, TR_D);
         }
 
         /* mlp branch: x = x + layer_scale_2 * linear2(gelu_erf(linear1(norm2(x)))) */
@@ -584,15 +586,9 @@ extern "C" int mimi_transformer_step(MimiTransformerState *st, const float *x,
         /* gelu_erf sweep (header NEON, lane-wise erff) */
         mimi_gelu_erf_vec_f32(st->mlp_hidden, st->mlp_hidden, t * TR_FF);
         for (int tp = 0; tp < t; tp++) {
-            mimi_weight_gemv_f32(
-                L->lin2_w, st->mlp_hidden + (size_t)tp * TR_FF, NULL,
-                st->branch + (size_t)tp * TR_D, TR_D, TR_FF);
-        }
-        for (int tp = 0; tp < t; tp++) {
-            float *xr = st->xt + (size_t)tp * TR_D;
-            float *br = st->branch + (size_t)tp * TR_D;
-            mimi_weight_scale_vec_f32(br, L->ls2, br, TR_D);
-            mimi_add_vec_f32(xr, br, xr, TR_D);
+            mimi_weight_gemv_scale_residual_rows_f32(
+                L->lin2_w, st->mlp_hidden + (size_t)tp * TR_FF, L->ls2,
+                st->xt + (size_t)tp * TR_D, 0, TR_D, TR_FF);
         }
     }
 
@@ -626,10 +622,10 @@ extern "C" void mimi_transformer_reset(MimiTransformerState *st) {
  * =====
  *
  * (a) Rust -> C++ mapping (moshi 0.6.4 src/transformer.rs unless noted)
- *   LayerScale::forward (:90-94)            -> mimi_scale_vec_f32(branch, ls,
- *                                              branch) — separate sweep before
- *                                              the residual add (= candle's
- *                                              broadcast_mul then add, no fma).
+ *   LayerScale::forward (:90-94)            -> the final two operations of
+ *                                              mimi_weight_gemv_scale_residual_
+ *                                              rows_f32: rounded sum*scale,
+ *                                              then residual+scaled (no fma).
  *   RotaryEmbedding::new (:368-374)         -> inv_freq[] in init.
  *   RotaryEmbedding::rope (:376-384)        -> per-step rope_cos/rope_sin
  *                                              tables ([t,32], 1-D pos branch).
@@ -642,7 +638,9 @@ extern "C" void mimi_transformer_reset(MimiTransformerState *st) {
  *                                              mimi_transformer_step.
  *   KvCache::append / positions
  *     (kv_cache.rs:242-252 -> candle-nn
- *      kv_cache.rs RotatingCache)           -> k_ring/v_ring + ks[] block (see d).
+ *      kv_cache.rs RotatingCache)           -> direct K/V projection into the
+ *                                              selected k_ring/v_ring slots +
+ *                                              ks[] block (see d).
  *   Mlp::NoGating::forward (:565)           -> linear1 gemv ->
  *                                              mimi_gelu_erf_vec_f32 sweep ->
  *                                              linear2 gemv.
@@ -785,7 +783,7 @@ extern "C" void mimi_transformer_reset(MimiTransformerState *st) {
  *       layer_scale_1.scale [512], layer_scale_2.scale [512]
  *     decoder_transformer.input_proj / output_projs absent (512<->512) —
  *     confirmed not in the checkpoint listing. No repack/transpose at init:
- *     all weights consumed in checkpoint layout by the AMX gemv.
+ *     all weights remain byte views consumed in checkpoint layout.
  *
  * (f) reduction orders / primitive semantics this unit depends on
  *     - LayerNorm: candle takes ops::layer_norm's CPU fast path (contiguous
@@ -808,19 +806,22 @@ extern "C" void mimi_transformer_reset(MimiTransformerState *st) {
  *       matches candle's two tensor ops literally.
  *     - ws @ v: mimi_gemm_f32(sc [1 x k_len], V[k_len x 64], out, beta=0) —
  *       AMX/cblas accumulation order (unit 6's ledger); candle: gemm crate.
- *     - projections/MLP: per-token mimi_gemv_f32 (y[m] = sum_k w[m,k]x[k]);
- *       candle Linear is xs.matmul(w.t()) via the gemm crate — blocked and
- *       fma'd, so the cblas order is the faithful-tier freedom.
+ *     - projections/MLP: resident bytes feed one shared fixed SIMD row reducer.
+ *       The Q/K/V destination spans call it directly. Out-proj and linear2 use
+ *       mimi_weight_gemv_scale_residual_rows_f32, which keeps that reducer and
+ *       replaces only its completed-row store with two explicit f32 operations:
+ *       scaled = sum*layer_scale, then xt = xt+scaled (residual left, no fma).
+ *       Candle Linear is xs.matmul(w.t()) via the gemm crate, so the native
+ *       fixed SIMD reduction is faithful-tier freedom.
  *     - gelu_erf (candle-core op.rs GeluErf::f32): ((erff(x * (1/sqrt(2)))
  *       + 1.0f) * 0.5f) * x, all f32, candle calls the Rust libm crate's
  *       erff. mimi_gelu_erf_vec_f32 (unit 6) must be that exact expression
  *       lane-wise (system erff — see g.1); in-place x==y must be legal.
- *     - residual/LayerScale: mimi_scale_vec_f32 then mimi_add_vec_f32 — two
- *       separate elementwise NEON sweeps in that order (candle: broadcast_mul
- *       kernel, then add kernel; rustc does not contract, so the sweeps must
- *       not fuse mul+add into one fma either). Same-index in-place aliasing
- *       (y == x for scale, y == a for add) must be legal for these prims —
- *       ABI friction note for the arbiter: the header doesn't state it.
+ *     - residual/LayerScale: the direct projection epilogue preserves candle's
+ *       broadcast_mul-then-add rounding boundary without materializing either
+ *       intermediate: `scaled` is a distinct f32 result, and the following add
+ *       spells `prior + scaled` with residual as the left operand. The native
+ *       build's load-bearing -ffp-contract=off forbids contraction.
  *     - rope: local tr_rope_block (NEON vld2q/vst2q, unfused vmul/vsub/vadd),
  *       _ref sibling under MIMI_SCALAR_REF; table build is NEON vmul +
  *       lane-wise cosf/sinf.
@@ -830,6 +831,11 @@ extern "C" void mimi_transformer_reset(MimiTransformerState *st) {
  *       rope f32 cast has degraded ~2^24 long before that matters). The
  *       ks[]/positions bookkeeping itself stays scalar: branchy integer
  *       control-plane work that Rust also does with a scalar Vec loop.
+ *     - projection staging accounting: query scratch is TR_MAX_N*TR_D =
+ *       4096 f32 = 16 KiB. Direct K/V ring destinations removed 32 KiB from
+ *       the former 48 KiB packed-QKV plane. Direct out-proj/linear2 epilogues
+ *       remove the separate TR_MAX_N*TR_D branch plane, another 16 KiB. Rings
+ *       are persistent cache state required by the algorithm, not staging.
  *
  * (g) uncertainties
  *     1. Transcendental ulp drift: Rust f32::sin/cos/powf lower to the
@@ -838,11 +844,10 @@ extern "C" void mimi_transformer_reset(MimiTransformerState *st) {
  *        (portable Musl-derived polynomial) while ours is Apple libm erff —
  *        expect <=1-2 ulp differences feeding gelu; covered by the ulp-band
  *        harness, flagged here for the threshold ledger.
- *     2. AMX/cblas vs candle's gemm crate: different blocking and fma
- *        schedules — per-GEMM ulp-band drift is expected and is the accepted
- *        faithful-tier cost (manifest: "candle's blocked gemm is not
- *        economically bit-reproducible"). Bisect path: MIMI_SCALAR_REF
- *        builds + unit 6's _ref gemv/gemm.
+ *     2. Native resident-byte SIMD and activation-only AMX/cblas vs candle's
+ *        gemm crate use different blocking and fma schedules — per-GEMM
+ *        ulp-band drift is expected and is the accepted faithful-tier cost.
+ *        Bisect path: MIMI_SCALAR_REF builds + unit 6's _ref gemv/gemm.
  *     3. This unit's parity also depends on unit 6 honoring (f) exactly —
  *        especially layer_norm's naive one-pass sum/sum2 and softmax's
  *        divide-by-sum. If unit 6 shipped Welford or two-pass mean/var,
@@ -870,28 +875,27 @@ extern "C" void mimi_transformer_reset(MimiTransformerState *st) {
  *                         channel sweep inside mimi_layer_norm_f32 (its
  *                         reduction is the constraint); reads xt row, writes
  *                         disjoint normb rows.
- *       in_proj gemv:     band = output rows m of [1536,512] (ST_-style row
- *                         bands), or keep each whole gemv on one lane per
- *                         token — AMX calls likely stay whole per lane (one
- *                         cblas call per band is the sane cut; splitting an
- *                         AMX gemv across lanes buys nothing). Reads normb
- *                         (shared, read-only), writes disjoint qkv spans.
+ *       in_proj gemv:     band = Q output rows plus K/V head spans of the
+ *                         packed [1536,512] byte view. Reads normb shared and
+ *                         read-only; Q bands write q scratch while each K/V
+ *                         head band writes its disjoint ring slot directly.
  *       rope:             band = head h (x2 for q|k blocks x t rows = up to
  *                         32 independent tr_rope_block calls); disjoint
- *                         64-float blocks in qkv, rope tables read-only.
- *       kv append:        band = head h — disjoint ring bands
- *                         (k_ring/v_ring are head-major precisely so a head
- *                         band is one contiguous 250x64 region per lane).
+ *                         64-float blocks in the MLP plane's Q prefix / k_ring,
+ *                         rope tables
+ *                         read-only. The K rotation finalizes the direct ring
+ *                         write before attention can observe the slot.
  *       attention:        band = head h (8 heads -> 8 lanes, the natural
  *                         cut): each head touches only its ring band, its
  *                         own scores row (scores is [head][row][ctx] — NOT
  *                         shared across heads, privatized already), and its
- *                         own 64-wide attn_cat section. maskv/rope tables/
- *                         qkv are read-only shared.
- *       out_proj gemv:    band = output rows of [512,512] or whole-per-lane
- *                         (AMX, same call as in_proj); reads attn_cat.
- *       LayerScale+resid: band = token row (or channel sub-ranges of the
- *                         sweeps); xt row is the only read-write target.
+ *                         own 64-wide MLP-prefix section after consuming the Q
+ *                         value formerly resident there. maskv/rope tables
+ *                         are read-only shared.
+ *       out_proj+resid:   band = output rows of [512,512]; each completed row
+ *                         immediately applies its resident LayerScale value
+ *                         and updates the corresponding xt row. The MLP prefix and
+ *                         weight/scale views are shared read-only.
  *       MLP:              band = output rows (linear1 [2048,512] rows band
  *                         like the engine's ST_ stages; gelu sweep bands on
  *                         element ranges; linear2 [512,2048] rows likewise).
@@ -899,9 +903,9 @@ extern "C" void mimi_transformer_reset(MimiTransformerState *st) {
  *     (rings are written disjointly by head; seq_len/ring_offset advance is
  *     single-writer at the pass boundary — keep it on the closing lane after
  *     the barrier, exactly the two-barrier doctrine). Scratch is already
- *     banded: scores per head; normb/qkv/attn_cat/branch/mlp_hidden are
+ *     banded: scores per head; normb/mlp_hidden are
  *     written in disjoint spans per band. The only sequential dependences are
- *     the REAL ones: layer l -> l+1, and within a layer norm -> proj -> rope
- *     -> append -> attn -> out_proj -> residual -> norm2 -> mlp -> residual
+ *     the REAL ones: layer l -> l+1, and within a layer norm -> direct proj ->
+ *     rope/finalize K -> attn -> out_proj -> residual -> norm2 -> mlp -> residual
  *     (stage fences, not lane fences).
  */

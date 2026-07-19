@@ -3397,7 +3397,7 @@ async fn next_local_webrtc_mic_frame(
         if frame.sample_rate == 0 {
             continue;
         }
-        if audio_frame_to_mono_f32(&frame).is_empty() {
+        if frame.data.as_ref().is_empty() || frame.num_channels == 0 {
             continue;
         }
         return Some(frame);
@@ -3411,31 +3411,12 @@ fn push_local_webrtc_mic_frame(
     if frame.sample_rate == 0 {
         return false;
     }
-    let pcm = audio_frame_to_mono_f32(frame);
-    if pcm.is_empty() {
+    let channels = frame.num_channels as usize;
+    if channels == 0 || frame.data.as_ref().is_empty() {
         return false;
     }
-    let _ = writer.push_mono_f32(&pcm);
+    let _ = writer.push_interleaved_i16(frame.data.as_ref(), channels);
     true
-}
-
-fn audio_frame_to_mono_f32(frame: &AudioFrame<'_>) -> Vec<f32> {
-    let channels = (frame.num_channels as usize).max(1);
-    if channels == 1 {
-        return i16_to_f32(frame.data.as_ref());
-    }
-    frame
-        .data
-        .as_ref()
-        .chunks(channels)
-        .map(|chunk| {
-            let sum = chunk
-                .iter()
-                .map(|sample| *sample as f32 / i16::MAX as f32)
-                .sum::<f32>();
-            sum / chunk.len().max(1) as f32
-        })
-        .collect()
 }
 
 #[cfg(test)]

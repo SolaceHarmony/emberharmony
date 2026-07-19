@@ -52,7 +52,7 @@ static void queue_completion_locked(kc_ticket_t *ticket)
     }
     runtime->completion_tail = ticket;
     runtime->completion_queued++;
-    KC_COND_SIGNAL(&runtime->work_cv);
+    kc_runtime_ring_work_internal(runtime, 0);
 }
 
 static int publish_locked(kc_ticket_t *ticket,

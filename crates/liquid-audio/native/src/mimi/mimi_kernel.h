@@ -138,6 +138,33 @@ void mimi_gemm_f32(const float *a, const float *b, float *c,
                    int m, int k, int n, int beta);
 void mimi_weight_gemv_f32(const uint8_t *w, const float *x,
                           const uint8_t *bias_or_null, float *y, int m, int k);
+/* Output-row band of the same resident-weight GEMV. `row_begin..row_end`
+ * addresses the original [M,K] view and destination; accumulate==0 overwrites
+ * each destination row, accumulate==1 adds the completed dot product. This is
+ * the fixed-team seam: disjoint row bands share immutable x/W and never need a
+ * gather, repack, or intermediate output plane. */
+void mimi_weight_gemv_rows_f32(const uint8_t *w, const float *x,
+                               const uint8_t *bias_or_null, float *y,
+                               int row_begin, int row_end, int k,
+                               int accumulate);
+/* Project one output-row span of the original [M,K] resident byte view into a
+ * packed destination [row_end-row_begin]. Each dot has the same reduction and
+ * bias boundary as mimi_weight_gemv_f32; only the completed row's store moves.
+ * This permits direct writes into head-private KV ring slots without a QKV
+ * staging plane or a subsequent copy. */
+void mimi_weight_gemv_span_f32(const uint8_t *w, const float *x,
+                               const uint8_t *bias_or_null, float *y,
+                               int row_begin, int row_end, int k);
+/* Bias-free Transformer projection epilogue over an original output-row band:
+ *   sum = exact resident-weight row reducer(W[row], x)
+ *   scaled = sum * layer_scale[row]
+ *   residual[row] = residual[row] + scaled
+ * The multiply and add are distinct f32 operations under the load-bearing
+ * -ffp-contract=off build, and residual is deliberately the add's left operand.
+ * W and layer_scale remain potentially unaligned resident byte views. */
+void mimi_weight_gemv_scale_residual_rows_f32(
+    const uint8_t *w, const float *x, const uint8_t *scale, float *residual,
+    int row_begin, int row_end, int k);
 void mimi_weight_gemm_f32(const uint8_t *w, const float *b, float *c,
                           int m, int k, int n, int beta);
 void mimi_weight_gemm_tn_f32(const uint8_t *w, const float *b, float *c,
@@ -178,19 +205,33 @@ void mimi_quant_decode(MimiQuantState *st, const uint32_t *codes, float *emb_out
 /* 2. conv primitives: used by upsample + seanet (state structs in mimi_conv.cpp) */
 typedef struct MimiConvState MimiConvState;       /* StreamableConv1d */
 typedef struct MimiConvTrState MimiConvTrState;   /* StreamableConvTranspose1d */
+/* matrix_workspace is a borrowed f32 span retained by matrix-routed states and
+ * must outlive them. Each step admits the matrix backend only when its exact
+ * dynamic requirement fits; larger shapes use the allocation-free direct
+ * backend. Nonmatrix geometry may pass NULL,0. */
 int  mimi_conv_init(MimiConvState **st, const MimiWeightTable *w,
                     const char *prefix, int in_c, int out_c, int ksize,
                     int stride, int dilation, int groups, int causal,
+                    float *matrix_workspace, size_t matrix_workspace_floats,
                     MimiArena *a, char *err, size_t errlen);
 int  mimi_convtr_init(MimiConvTrState **st, const MimiWeightTable *w,
                       const char *prefix, int in_c, int out_c, int ksize,
-                      int stride, int causal, MimiArena *a,
+                      int stride, int causal, float *matrix_workspace,
+                      size_t matrix_workspace_floats, MimiArena *a,
                       char *err, size_t errlen);
 /* frames in [in_c, n_in] -> out [out_c, n_out]; returns n_out (>=0) */
 int  mimi_conv_step(MimiConvState *st, const float *x, int n_in, float *y);
 int  mimi_convtr_step(MimiConvTrState *st, const float *x, int n_in, float *y);
 void mimi_conv_reset(MimiConvState *st);
 void mimi_convtr_reset(MimiConvTrState *st);
+/* Bytes no longer copied by transposed-conv carry commits in one steady Mimi
+ * decode step. */
+uint64_t mimi_conv_carry_copy_bytes_saved(void);
+/* Bytes no longer copied by conv1d context commits in one steady SeaNet step. */
+uint64_t mimi_conv1d_carry_copy_bytes_saved(void);
+/* Conversation-arena bytes removed by replacing the six former fixed-width
+ * SeaNet matrix allocations with its already-live sequential b2 workspace. */
+uint64_t mimi_conv_matrix_workspace_bytes_saved(void);
 
 /* upsample wrapper (ConvTrUpsample1d: stride 2, dim 512, causal, learnt) */
 typedef struct MimiUpsampleState MimiUpsampleState;

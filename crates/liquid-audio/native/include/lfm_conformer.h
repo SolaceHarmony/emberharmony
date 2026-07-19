@@ -57,7 +57,7 @@ typedef struct LfmConformerGeometry {
 // after this call). `weights` is the LfmWeights handle from lfm_weights_open.
 // `engine` is the resident Flashkern engine (lfm_engine_new) whose lane team
 // executes segment passes. Returns 0; -EINVAL on nulls/bad geometry; -ENOENT
-// with `error` filled when a required tensor is missing or mis-shaped.
+// with `error` filled when a required weight field is missing or mis-shaped.
 LFM_ORACLE_API int lfm_conformer_create(
     void *engine, const void *weights, const LfmConformerGeometry *geometry,
     LfmConformer **out, char *error, size_t error_length);
@@ -66,8 +66,10 @@ LFM_ORACLE_API int lfm_conformer_destroy(LfmConformer *conformer);
 // Immutable residency accounting. `derived_bytes` is limited to formula-
 // derived tables (BN denominators and relative-position frequencies). Bound
 // checkpoint bytes remain views into the owner image. Materialized bytes must
-// remain zero for every forward; direct GEMM calls is an execution witness for
-// steady-state tests.
+// remain zero for every forward. `direct_gemm_calls` counts logical linear
+// operations (a cache-bounded compatibility rim may currently issue multiple
+// fixed-team accumulator tiles for one operation); it is an execution witness
+// for steady-state tests, not a physical-dispatch counter.
 LFM_ORACLE_API uint64_t
 lfm_conformer_bound_weight_bytes(const LfmConformer *conformer);
 LFM_ORACLE_API uint64_t

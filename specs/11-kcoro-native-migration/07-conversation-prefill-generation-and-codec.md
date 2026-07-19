@@ -579,8 +579,10 @@ model-state pages.
   pass is never left half-mutated.
 - A partial generated response is present in conversation state even when its
   playback epoch was flushed.
-- Mimi writes directly into the reserved playback block, allocates zero bytes
-  per frame, and shares immutable weights across conversations.
+- Mimi writes directly into an equal-rate playback block; otherwise its
+  conversation-owned codec plane feeds the prepared native resampler that writes
+  the device-rate block. Both paths allocate zero bytes per frame and share
+  immutable weights across conversations.
 - Switching between two hot conversations changes no model-weight address and
   resumes each at its exact next token/codec state.
 - Conversation quiesce reports zero active passes before image capture.

@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 #[cfg(feature = "audio-io")]
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use crossbeam_channel::{bounded, Receiver, Sender};
+use kcoro_sys::Doorbell;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -122,7 +122,17 @@ impl ExternalAudioInput {
         if rate == 0 {
             return Err("external audio input sample rate is zero".into());
         }
-        let mic = PcmRing::new(rate as usize * MIC_RING_SECONDS);
+        let wake = Arc::new(
+            Doorbell::new()
+                .map_err(|status| format!("prepare realtime PCM doorbell failed: {status}"))?,
+        );
+        if !wake.realtime_safe() {
+            return Err(
+                "the host has no realtime-safe expected-value wake backend for microphone input"
+                    .into(),
+            );
+        }
+        let mic = PcmRing::new_with_wake(rate as usize * MIC_RING_SECONDS, wake);
         Ok((
             Self {
                 mic: mic.clone(),
@@ -140,6 +150,31 @@ impl ExternalAudioInputWriter {
     /// Push mono f32 PCM into the capture ring. Returns the number of dropped samples.
     pub fn push_mono_f32(&mut self, samples: &[f32]) -> usize {
         self.mic.push_slice(samples)
+    }
+
+    /// Downmix one interleaved signed-16 callback block directly into the
+    /// capture ring. Admission is block-atomic: the return value is either zero
+    /// or the complete frame count, so a realtime callback never publishes a
+    /// prefix/suffix splice and never allocates an intermediate PCM vector.
+    pub fn push_interleaved_i16(&mut self, samples: &[i16], channels: usize) -> usize {
+        if samples.is_empty() {
+            return 0;
+        }
+        if channels == 0 {
+            return samples.len();
+        }
+        if samples.len() % channels != 0 {
+            return samples.len().div_ceil(channels);
+        }
+        let frames = samples.len() / channels;
+        self.mic.push_with(frames, |offset| {
+            let frame = &samples[offset * channels..(offset + 1) * channels];
+            frame
+                .iter()
+                .map(|sample| *sample as f32 / i16::MAX as f32)
+                .sum::<f32>()
+                / channels as f32
+        })
     }
 }
 
@@ -177,8 +212,7 @@ struct PcmRing {
     cap: usize,
     read: AtomicUsize,
     write: AtomicUsize,
-    wake_tx: Sender<()>,
-    wake_rx: Receiver<()>,
+    wake: Arc<Doorbell>,
 }
 
 // The runtime uses each ring as single-producer/single-consumer: mic input -> VAD,
@@ -189,19 +223,24 @@ unsafe impl Sync for PcmRing {}
 
 impl PcmRing {
     fn new(cap: usize) -> Ring {
+        Self::new_with_wake(
+            cap,
+            Arc::new(Doorbell::new().expect("prepare PCM docking-ring doorbell")),
+        )
+    }
+
+    fn new_with_wake(cap: usize, wake: Arc<Doorbell>) -> Ring {
         let cap = cap.max(1);
         let buf = (0..cap)
             .map(|_| UnsafeCell::new(0.0))
             .collect::<Vec<_>>()
             .into_boxed_slice();
-        let (wake_tx, wake_rx) = bounded(1);
         Arc::new(Self {
             buf,
             cap,
             read: AtomicUsize::new(0),
             write: AtomicUsize::new(0),
-            wake_tx,
-            wake_rx,
+            wake,
         })
     }
 
@@ -211,45 +250,68 @@ impl PcmRing {
         write.saturating_sub(read).min(self.cap)
     }
 
+    #[cfg(test)]
     fn push(&self, sample: f32) -> bool {
+        self.push_with(1, |_| sample) == 0
+    }
+
+    fn push_with(&self, count: usize, sample: impl Fn(usize) -> f32) -> usize {
+        if count == 0 {
+            return 0;
+        }
         let write = self.write.load(Ordering::Relaxed);
         let read = self.read.load(Ordering::Acquire);
-        if write.saturating_sub(read) >= self.cap {
-            return false;
+        if count > self.cap.saturating_sub(write.saturating_sub(read)) {
+            return count;
         }
-        unsafe {
-            *self.buf[write % self.cap].get() = sample;
+        for offset in 0..count {
+            unsafe {
+                *self.buf[write.wrapping_add(offset) % self.cap].get() = sample(offset);
+            }
         }
-        self.write.store(write.wrapping_add(1), Ordering::Release);
-        true
+        self.write
+            .store(write.wrapping_add(count), Ordering::Release);
+        self.notify();
+        0
     }
 
     fn push_slice(&self, samples: &[f32]) -> usize {
-        let mut dropped = 0usize;
-        for &sample in samples {
-            if !self.push(sample) {
-                dropped += 1;
+        if samples.is_empty() {
+            return 0;
+        }
+        let write = self.write.load(Ordering::Relaxed);
+        let read = self.read.load(Ordering::Acquire);
+        if samples.len() > self.cap.saturating_sub(write.saturating_sub(read)) {
+            return samples.len();
+        }
+        let index = write % self.cap;
+        let first = samples.len().min(self.cap - index);
+        unsafe {
+            std::ptr::copy_nonoverlapping(samples.as_ptr(), self.buf[index].get(), first);
+            if first != samples.len() {
+                std::ptr::copy_nonoverlapping(
+                    samples.as_ptr().add(first),
+                    self.buf[0].get(),
+                    samples.len() - first,
+                );
             }
         }
-        if !samples.is_empty() {
-            self.notify();
-        }
-        dropped
+        self.write
+            .store(write.wrapping_add(samples.len()), Ordering::Release);
+        self.notify();
+        0
     }
 
     fn notify(&self) {
-        let _ = self.wake_tx.try_send(());
+        self.wake.ring_all();
     }
 
-    fn wait_for_input(&self, timeout: Duration) -> bool {
-        if self.len() > 0 {
-            return true;
-        }
-        match self.wake_rx.recv_timeout(timeout) {
-            Ok(()) => true,
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => false,
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => self.len() > 0,
-        }
+    fn observe(&self) -> u32 {
+        self.wake.observe()
+    }
+
+    fn park(&self, expected: u32) {
+        let _ = self.wake.park(expected);
     }
 
     fn pop(&self) -> Option<f32> {
@@ -272,22 +334,41 @@ impl PcmRing {
         }
     }
 
-    /// Drain all available samples into a new Vec. Non-blocking; returns
-    /// empty if the ring has no data. Used by the output thread to pull
-    /// PCM chunks without blocking on the ring.
-    fn drain_all(&self) -> Vec<f32> {
-        let len = self.len();
-        if len == 0 {
-            return Vec::new();
+    /// Borrow the readable region as at most two contiguous spans. The
+    /// callback consumes each span synchronously before its cursor is retired;
+    /// no shuttle Vec or payload copy is created at the playback boundary.
+    fn drain_with<E>(&self, mut consume: impl FnMut(&[f32]) -> Result<(), E>) -> Result<usize, E> {
+        let mut read = self.read.load(Ordering::Relaxed);
+        let write = self.write.load(Ordering::Acquire);
+        let available = write.saturating_sub(read).min(self.cap);
+        if available == 0 {
+            return Ok(0);
         }
-        let mut out = Vec::with_capacity(len);
-        while let Some(sample) = self.pop() {
-            out.push(sample);
+        let mut consumed = 0;
+        while consumed < available {
+            let index = read % self.cap;
+            let count = (available - consumed).min(self.cap - index);
+            let span = unsafe { std::slice::from_raw_parts(self.buf[index].get(), count) };
+            if let Err(error) = consume(span) {
+                if consumed != 0 {
+                    self.notify();
+                }
+                return Err(error);
+            }
+            read = read.wrapping_add(count);
+            consumed += count;
+            self.read.store(read, Ordering::Release);
         }
-        out
+        self.notify();
+        Ok(consumed)
     }
 
     fn clear(&self) {
+        // Consumer-local cursor retirement is not a producer edge. In
+        // particular, capture gates clear and then park on their earlier
+        // observation; ringing here would make them wake themselves forever.
+        // Callers that expose newly-free capacity to another waiter ring it
+        // explicitly after publishing that predicate.
         let write = self.write.load(Ordering::Acquire);
         self.read.store(write, Ordering::Release);
     }
@@ -434,6 +515,7 @@ struct ConsumerThreads {
     consumer: JoinHandle<()>,
     output: Option<JoinHandle<()>>,
     output_ring: Option<Ring>,
+    output_done: Option<Arc<AtomicBool>>,
     stop: Arc<AtomicBool>,
 }
 
@@ -444,17 +526,24 @@ impl ConsumerThreads {
         // before we stop it, so the queued tail audio is written, not dropped.
         let result = self.consumer.join();
         if let Some(worker) = self.output {
-            if let Some(ring) = self.output_ring {
-                let deadline = Instant::now() + Duration::from_secs(2);
-                // Wait until the ring is drained OR the worker has already died
-                // (e.g. a mid-stream write failure). The `is_finished` guard
-                // means a dead worker returns immediately instead of stalling
-                // the full deadline on a ring nobody is draining.
-                while ring.len() > 0 && Instant::now() < deadline && !worker.is_finished() {
-                    std::thread::sleep(Duration::from_millis(5));
+            if let Some(ring) = self.output_ring.as_ref() {
+                loop {
+                    let expected = ring.observe();
+                    if ring.len() == 0
+                        || self
+                            .output_done
+                            .as_ref()
+                            .is_some_and(|done| done.load(Ordering::Acquire))
+                    {
+                        break;
+                    }
+                    ring.park(expected);
                 }
             }
             self.stop.store(true, Ordering::SeqCst);
+            if let Some(ring) = self.output_ring.as_ref() {
+                ring.notify();
+            }
             let _ = worker.join();
         }
         result
@@ -652,7 +741,7 @@ pub struct VoiceRuntime {
     interrupt: Arc<AtomicBool>,
     mic_enabled: Arc<AtomicBool>,
     playback_flush: Arc<AtomicBool>,
-    control: Option<Mic>,
+    control: Arc<Doorbell>,
     output: Option<ExternalAudioOutput>,
     audio: Stats,
     done: Arc<AtomicBool>,
@@ -694,14 +783,17 @@ impl VoiceRuntime {
         let playback_flush = Arc::new(AtomicBool::new(false));
         let audio = Arc::new(AudioStats::default());
         let done = Arc::new(AtomicBool::new(false));
-        let control = input.as_ref().map(|input| input.mic.clone());
+        let control = input.as_ref().map_or_else(
+            || Arc::new(Doorbell::new().expect("prepare voice control doorbell")),
+            |input| Arc::clone(&input.mic.wake),
+        );
         let live_output = output.clone();
         let live = VoiceRuntime {
             stop: stop.clone(),
             interrupt: interrupt.clone(),
             mic_enabled: mic_enabled.clone(),
             playback_flush: playback_flush.clone(),
-            control,
+            control: Arc::clone(&control),
             output: live_output,
             audio: audio.clone(),
             done: done.clone(),
@@ -717,6 +809,7 @@ impl VoiceRuntime {
                 mic_enabled,
                 playback_flush,
                 audio,
+                control,
                 input,
                 output,
             );
@@ -794,9 +887,7 @@ impl VoiceRuntime {
     }
 
     fn wake_control(&self) {
-        if let Some(control) = self.control.as_ref() {
-            control.notify();
-        }
+        self.control.ring_all();
     }
 }
 
@@ -839,6 +930,7 @@ fn session_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
     mic_enabled: Arc<AtomicBool>,
     playback_flush: Arc<AtomicBool>,
     audio: Stats,
+    control: Arc<Doorbell>,
     input: Option<ExternalAudioInput>,
     output: Option<ExternalAudioOutput>,
 ) {
@@ -971,7 +1063,7 @@ fn session_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
     }
     let (input_guard, mic, in_rate) = match input {
         Some(input) => (InputGuard { _stream: None }, input.mic, input.rate),
-        None => match start_input() {
+        None => match start_input(control) {
             Ok((stream, mic, rate)) => (
                 InputGuard {
                     _stream: Some(stream),
@@ -1157,45 +1249,70 @@ fn spawn_consumer<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
     // for its full deadline. `ConsumerThreads::join` drains the ring while the
     // worker is still running, THEN sets this flag to stop it.
     let output_stop = Arc::new(AtomicBool::new(false));
+    let output_done = Arc::new(AtomicBool::new(false));
     let (output_sink, output_worker, output_ring) = match output {
         Some(output) => {
             let thread_ring = ring.clone();
             let flush = output_flush.clone();
             let thread_stop = output_stop.clone();
+            let thread_done = output_done.clone();
             let thread_audio = audio.clone();
             let worker = std::thread::Builder::new()
                 .name("voice-output".into())
                 .spawn(move || {
-                    while !thread_stop.load(Ordering::SeqCst) {
+                    struct Completion {
+                        ring: Ring,
+                        done: Arc<AtomicBool>,
+                    }
+                    impl Drop for Completion {
+                        fn drop(&mut self) {
+                            // Join observes this edge even when a user-supplied
+                            // transport callback unwinds before the normal
+                            // worker epilogue. The ring length remains the
+                            // predicate; this is only its completion wake.
+                            self.done.store(true, Ordering::Release);
+                            self.ring.notify();
+                        }
+                    }
+                    let _completion = Completion {
+                        ring: thread_ring.clone(),
+                        done: thread_done,
+                    };
+                    loop {
+                        let expected = thread_ring.observe();
+                        if thread_stop.load(Ordering::SeqCst) {
+                            break;
+                        }
                         if flush.swap(false, Ordering::SeqCst) {
                             output.clear();
                             thread_ring.clear();
+                            // A joiner may be parked on the transition to an
+                            // empty playback ring. Clearing is otherwise a
+                            // consumer-local cursor update and must not wake
+                            // this same worker back into a gate loop.
+                            thread_ring.notify();
                         }
-                        // Drain a chunk from the ring (non-blocking pop)
-                        let chunk = thread_ring.drain_all();
-                        if chunk.is_empty() {
-                            // Zero-spin (the kcoro doctrine at the OUTER layer):
-                            // park on the ring's wake channel — push_slice()
-                            // notifies on every producer write, and the flush
-                            // flag is only ever set immediately before a push,
-                            // so both events wake us. The 100 ms heartbeat
-                            // exists solely so teardown's stop flag is seen
-                            // promptly; idle cost drops from 200 polls/s to 10
-                            // heartbeats/s with instant wake on real work.
-                            let _ =
-                                thread_ring.wait_for_input(std::time::Duration::from_millis(100));
+                        let drained = match thread_ring.drain_with(|span| {
+                            output.write_mono_f32(span)?;
+                            // Count as played only after the transport accepted
+                            // this exact borrowed span.
+                            thread_audio
+                                .played_samples
+                                .fetch_add(span.len() as u64, Ordering::Relaxed);
+                            Ok::<(), String>(())
+                        }) {
+                            Ok(drained) => drained,
+                            Err(error) => {
+                                eprintln!("[voice-output] speaker write failed: {error}");
+                                break;
+                            }
+                        };
+                        if drained == 0 {
+                            // Dormant until PCM publication, flush, or teardown
+                            // rings the shared kcoro expected-value doorbell.
+                            thread_ring.park(expected);
                             continue;
                         }
-                        if let Err(e) = output.write_mono_f32(&chunk) {
-                            eprintln!("[voice-output] speaker write failed: {e}");
-                            break;
-                        }
-                        // Count as played ONLY after the transport accepted the
-                        // write — counting at ring-push made `played_samples` mean
-                        // "queued, possibly never delivered" on this path.
-                        thread_audio
-                            .played_samples
-                            .fetch_add(chunk.len() as u64, Ordering::Relaxed);
                     }
                     output.clear();
                 })
@@ -1422,11 +1539,13 @@ fn spawn_consumer<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
             }
         })
         .map_err(|e| format!("spawn voice-consumer thread failed: {e}"))?;
+    let output_done = output_worker.as_ref().map(|_| output_done);
 
     Ok(ConsumerThreads {
         consumer,
         output: output_worker,
         output_ring,
+        output_done,
         stop: output_stop,
     })
 }
@@ -1449,18 +1568,18 @@ fn vad_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
 ) {
     let window = (in_rate as usize / 5).max(1);
     let max_local = (in_rate as usize * MAX_UTTERANCE_SECONDS).max(window);
-    let silence_stop = Duration::from_millis(cfg.silence_ms);
+    let silence_frames = ((in_rate as u64 * cfg.silence_ms) / 1_000) as usize;
     // Pause-onset speculative prefill (spec 09 W3 follow-on): after this much
     // silence the PROBABLE utterance is handed to the engine to prefill, so the
     // remaining `silence_ms − PREPARE_AFTER_MS` of the wait hides the prefill
     // cost instead of running in series with it. Must stay well under
     // `cfg.silence_ms` or the head start is worthless.
     const PREPARE_AFTER_MS: u64 = 200;
+    let prepare_frames = ((in_rate as u64 * PREPARE_AFTER_MS) / 1_000) as usize;
     let mut mic_buf = Vec::with_capacity(window * 2);
     let mut speaking = false;
     let mut start = 0usize;
     let mut read = 0usize;
-    let mut last_voice = Instant::now();
     // Sample index one past the last voiced window — the utterance's real end.
     // Both `prepare` and the commit trim to `voice_end + window`, so the
     // speculative prefill and the committed utterance are byte-identical.
@@ -1474,8 +1593,11 @@ fn vad_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
     // Trace-only: report gate transitions once, not every loop iteration.
     let mut traced_gate = false;
 
-    while !stop.load(Ordering::SeqCst) {
-        let _ = mic.wait_for_input(Duration::from_millis(40));
+    loop {
+        let expected = mic.observe();
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
 
         if interrupt.swap(false, Ordering::SeqCst) {
             vtrace!("vad: session interrupt -> pipe.interrupt + playback flush");
@@ -1505,6 +1627,7 @@ fn vad_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
             if prepared.take().is_some() {
                 pipe.discard_prepared();
             }
+            mic.park(expected);
             continue;
         }
 
@@ -1521,6 +1644,7 @@ fn vad_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
             if prepared.take().is_some() {
                 pipe.discard_prepared();
             }
+            mic.park(expected);
             continue;
         }
         traced_gate = false;
@@ -1567,7 +1691,6 @@ fn vad_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
                         }
                     }
                 }
-                last_voice = Instant::now();
                 latency.mark_voice();
                 voice_end = read + window;
                 // The pause was not a turn end after all — roll the speculative
@@ -1589,9 +1712,10 @@ fn vad_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
         // `voice_end` has actually been delivered (`n >= voice_end + window`) —
         // firing on wall-clock alone raced mic delivery jitter into a short
         // slice the commit could never match, a silently wasted prefill.
+        let silent_frames = n.saturating_sub(voice_end);
         if speaking
             && prepared.is_none()
-            && last_voice.elapsed() >= Duration::from_millis(PREPARE_AFTER_MS)
+            && silent_frames >= prepare_frames
             && n >= voice_end + window
         {
             let trim_end = voice_end + window;
@@ -1605,7 +1729,7 @@ fn vad_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
                         });
                     vtrace!(
                         "vad: pause {}ms -> speculative prepare ({dur_s:.2}s, sent {sent})",
-                        last_voice.elapsed().as_millis()
+                        silent_frames as u64 * 1_000 / in_rate as u64
                     );
                     // Mark attempted even when the control queue was full: the
                     // head start is lost either way, and retrying every ~40ms
@@ -1616,7 +1740,7 @@ fn vad_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
         }
 
         let forced_end = speaking && n >= max_local;
-        if speaking && (last_voice.elapsed() >= silence_stop || forced_end) {
+        if speaking && (silent_frames >= silence_frames || forced_end) {
             let end = read.min(n);
             // Trim the end-of-turn silence tail: the utterance ends one window past
             // the last voiced window — the same `voice_end + window` boundary
@@ -1680,6 +1804,7 @@ fn vad_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
                     if !emit_ready(sink, stop, mic_enabled) {
                         return;
                     }
+                    mic.park(expected);
                     continue;
                 }
             } else {
@@ -1695,6 +1820,9 @@ fn vad_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
             read = 0;
             voiced_streak = 0;
             voice_end = 0;
+        }
+        if mic.len() == 0 {
+            mic.park(expected);
         }
     }
 }
@@ -1720,8 +1848,6 @@ fn frame_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
     let mut model = Vec::with_capacity(frame.frame_size * 2);
     let mut resampler = InputFrameResampler::new(in_rate, frame.sample_rate);
     let mut backpressure_reported = false;
-    let interval = Duration::from_secs_f64(frame.frame_size as f64 / frame.sample_rate as f64);
-    let mut next_silence = Instant::now() + interval;
 
     // Full-duplex frame loop (Moshi semantics): the model receives user audio
     // continuously, regardless of whether the assistant is speaking. No VAD
@@ -1729,8 +1855,12 @@ fn frame_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
     // turn-taking natively — it processes user + assistant channels every frame.
     // Echo/AEC belongs below the model (hardware/WebRTC), not as model-input
     // zeroing. Explicit Stop/Interrupt are session-level controls only.
-    while !stop.load(Ordering::SeqCst) {
-        let has_input = mic.wait_for_input(Duration::from_millis(10));
+    loop {
+        let expected = mic.observe();
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
+        let has_input = mic.len() > 0;
 
         // Session-level interrupt (Stop button / typed input) — cuts queued
         // output/playback, but does NOT zero mic input or reset Mimi/LM state.
@@ -1750,23 +1880,21 @@ fn frame_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
         if !mic_enabled.load(Ordering::SeqCst) {
             mic.clear();
             input.clear();
+            mic.park(expected);
             continue;
         }
 
         if !has_input && mic.len() == 0 {
-            // No new audio from the native callback. Feed at most one silence
-            // frame per model frame interval so the stream clock can advance
-            // without flooding the bounded inference queue.
-            let now = Instant::now();
-            if now < next_silence {
-                continue;
-            }
-            pad_next_model_frame(&mut model, frame.frame_size);
-            next_silence = now + interval;
+            // A callback carries acoustic silence just like voiced PCM. No
+            // callback means the device stopped advancing, not that the user
+            // supplied silence; only a separate liveness source may fault it.
+            mic.park(expected);
+            continue;
         } else {
             let before = input.len();
             mic.drain_into(&mut input, (in_rate as usize / 4).max(1));
             if input.len() == before && mic.len() == 0 {
+                mic.park(expected);
                 continue;
             } else {
                 let chunk = input.split_off(before);
@@ -1790,7 +1918,6 @@ fn frame_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
             match pipe.try_submit_frame(next) {
                 Ok(()) => {
                     backpressure_reported = false;
-                    next_silence = Instant::now() + interval;
                     continue;
                 }
                 Err(FrameSubmitError::Full) => {
@@ -1813,20 +1940,10 @@ fn frame_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
         if input.len() > in_rate as usize {
             input.clear();
         }
+        if mic.len() == 0 {
+            mic.park(expected);
+        }
     }
-}
-
-fn pad_next_model_frame(model: &mut Vec<f32>, frame_size: usize) {
-    if frame_size == 0 {
-        return;
-    }
-    let partial = model.len() % frame_size;
-    let needed = if partial == 0 {
-        frame_size
-    } else {
-        frame_size - partial
-    };
-    model.resize(model.len() + needed, 0.0);
 }
 
 struct InputFrameResampler {
@@ -1922,7 +2039,12 @@ fn rms(samples: &[f32]) -> f32 {
 }
 
 #[cfg(feature = "audio-io")]
-fn start_input() -> Res<(HostStream, Mic, u32)> {
+fn start_input(wake: Arc<Doorbell>) -> Res<(HostStream, Mic, u32)> {
+    if !wake.realtime_safe() {
+        return Err(
+            "the host has no realtime-safe expected-value wake backend for microphone input".into(),
+        );
+    }
     let host = cpal::default_host();
     let dev = host
         .default_input_device()
@@ -1935,7 +2057,7 @@ fn start_input() -> Res<(HostStream, Mic, u32)> {
     let channels = supported.channels() as usize;
     let fmt = supported.sample_format();
     let cfg: cpal::StreamConfig = supported.into();
-    let mic = PcmRing::new(rate as usize * MIC_RING_SECONDS);
+    let mic = PcmRing::new_with_wake(rate as usize * MIC_RING_SECONDS, wake);
     let err = |e| eprintln!("[voice] input stream error: {e}");
 
     macro_rules! stream {
@@ -1945,17 +2067,14 @@ fn start_input() -> Res<(HostStream, Mic, u32)> {
                 &cfg,
                 move |data: &[$t], _: &cpal::InputCallbackInfo| {
                     if channels <= 1 {
-                        for &sample in data {
-                            mic.push($conv(sample));
-                        }
-                        mic.notify();
+                        let _ = mic.push_with(data.len(), |offset| $conv(data[offset]));
                         return;
                     }
-                    for frame in data.chunks(channels) {
-                        let sum = frame.iter().map(|&s| $conv(s)).sum::<f32>();
-                        mic.push(sum / frame.len() as f32);
-                    }
-                    mic.notify();
+                    let frames = data.len() / channels;
+                    let _ = mic.push_with(frames, |offset| {
+                        let frame = &data[offset * channels..(offset + 1) * channels];
+                        frame.iter().map(|&sample| $conv(sample)).sum::<f32>() / channels as f32
+                    });
                 },
                 err,
                 None,
@@ -1974,7 +2093,7 @@ fn start_input() -> Res<(HostStream, Mic, u32)> {
 }
 
 #[cfg(not(feature = "audio-io"))]
-fn start_input() -> Res<(HostStream, Mic, u32)> {
+fn start_input(_wake: Arc<Doorbell>) -> Res<(HostStream, Mic, u32)> {
     Err("liquid-audio was built without the `audio-io` fallback; external WebRTC audio input is required".into())
 }
 
@@ -2181,10 +2300,62 @@ mod tests {
     }
 
     #[test]
+    fn pcm_ring_admits_or_drops_each_callback_block_atomically() {
+        let ring = PcmRing::new(4);
+        assert_eq!(ring.push_slice(&[1.0, 2.0, 3.0]), 0);
+        assert_eq!(ring.push_slice(&[4.0, 5.0]), 2);
+        assert_eq!(ring.pop(), Some(1.0));
+        assert_eq!(ring.pop(), Some(2.0));
+        assert_eq!(ring.pop(), Some(3.0));
+        assert_eq!(ring.pop(), None);
+    }
+
+    #[test]
+    fn pcm_ring_drains_wraparound_as_borrowed_spans_without_a_payload_copy() {
+        let ring = PcmRing::new(4);
+        assert_eq!(ring.push_slice(&[1.0, 2.0, 3.0]), 0);
+        assert_eq!(ring.pop(), Some(1.0));
+        assert_eq!(ring.pop(), Some(2.0));
+        assert_eq!(ring.push_slice(&[4.0, 5.0, 6.0]), 0);
+        let mut calls = 0;
+        let mut seen = Vec::new();
+        assert_eq!(
+            ring.drain_with(|span| {
+                calls += 1;
+                seen.extend_from_slice(span);
+                Ok::<(), ()>(())
+            }),
+            Ok(4)
+        );
+        assert_eq!(calls, 2);
+        assert_eq!(seen, [3.0, 4.0, 5.0, 6.0]);
+        assert_eq!(ring.len(), 0);
+    }
+
+    #[test]
+    fn external_i16_callback_downmixes_directly_and_rejects_partial_frames() {
+        let (input, mut writer) = ExternalAudioInput::new(48_000).unwrap();
+        let stereo = [i16::MAX, i16::MAX, i16::MAX, -i16::MAX];
+        assert_eq!(writer.push_interleaved_i16(&stereo, 2), 0);
+        assert_eq!(input.mic.pop(), Some(1.0));
+        assert_eq!(input.mic.pop(), Some(0.0));
+        assert_eq!(input.mic.pop(), None);
+
+        assert_eq!(writer.push_interleaved_i16(&[1, 2, 3], 2), 2);
+        assert_eq!(input.mic.pop(), None);
+    }
+
+    #[test]
     fn pcm_ring_clear_drops_buffered_samples() {
         let ring = PcmRing::new(4);
         assert_eq!(ring.push_slice(&[1.0, 2.0, 3.0]), 0);
+        let observed = ring.observe();
         ring.clear();
+        assert_eq!(
+            ring.observe(),
+            observed,
+            "consumer-local clear must not self-wake"
+        );
         assert_eq!(ring.len(), 0);
         assert_eq!(ring.pop(), None);
         assert!(ring.push(4.0));
@@ -2322,21 +2493,6 @@ mod tests {
 
         mic.store(false, Ordering::SeqCst);
         assert_eq!(ready_state(&mic), SessionState::Idle);
-    }
-
-    #[test]
-    fn silence_padding_tops_off_one_model_frame() {
-        let mut partial = vec![1.0, 2.0, 3.0];
-        pad_next_model_frame(&mut partial, 5);
-        assert_eq!(partial, vec![1.0, 2.0, 3.0, 0.0, 0.0]);
-
-        let mut empty = Vec::new();
-        pad_next_model_frame(&mut empty, 4);
-        assert_eq!(empty, vec![0.0, 0.0, 0.0, 0.0]);
-
-        let mut aligned = vec![1.0, 2.0, 3.0, 4.0];
-        pad_next_model_frame(&mut aligned, 4);
-        assert_eq!(aligned, vec![1.0, 2.0, 3.0, 4.0, 0.0, 0.0, 0.0, 0.0]);
     }
 
     #[test]
@@ -2627,6 +2783,46 @@ mod tests {
         assert!(
             cleared.load(Ordering::SeqCst) > 0,
             "external output should be cleared when its worker exits"
+        );
+    }
+
+    #[test]
+    fn external_output_callback_panic_cannot_strand_join() {
+        let (tx, rx) = crossbeam_channel::bounded(4);
+        let output = ExternalAudioOutput::new(
+            48_000,
+            |_pcm, _rate| Ok(()),
+            || panic!("transport clear panic"),
+        )
+        .expect("external output");
+        let flush = Arc::new(AtomicBool::new(true));
+        let consumer = spawn_consumer(
+            rx,
+            PcmRing::new(16),
+            48_000,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AudioStats::default()),
+            Arc::new(Mutex::new(move |_event| true)),
+            Arc::new(AtomicBool::new(false)),
+            flush,
+            PlaybackReference::new(),
+            TurnLatency::new(),
+            Some(output),
+        )
+        .expect("spawn consumer");
+        tx.send(VoiceEvent::Audio {
+            pcm: vec![0.25, -0.25],
+            rate: TEST_OUT_RATE,
+        })
+        .unwrap();
+        drop(tx);
+
+        let started = Instant::now();
+        consumer.join().unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "a panicked output callback must still wake the join predicate"
         );
     }
 

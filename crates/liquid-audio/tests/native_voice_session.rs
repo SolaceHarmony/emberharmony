@@ -638,6 +638,31 @@ fn runtime_rejects_lane_counts_the_engine_cannot_construct() {
 }
 
 #[test]
+fn dock_only_session_requires_explicit_playback_geometry() {
+    let runtime = runtime();
+    let mut config = dock_config();
+    config.playback_frames_per_slot = 0;
+    let mut session = std::ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            lfm_session_create(
+                runtime,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &config,
+                std::ptr::null(),
+                &mut session,
+            )
+        },
+        INVALID
+    );
+    assert!(session.is_null());
+    unsafe { lfm_runtime_request_stop(runtime) };
+    assert_eq!(unsafe { lfm_runtime_join(runtime) }, 0);
+    assert_eq!(unsafe { lfm_runtime_destroy(runtime) }, 0);
+}
+
+#[test]
 fn joining_a_never_started_session_closes_every_admission_path() {
     let runtime = runtime();
     let config = dock_config();

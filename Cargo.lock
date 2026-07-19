@@ -1873,6 +1873,21 @@ dependencies = [
 name = "liquid-audio"
 version = "0.1.0"
 dependencies = [
+ "cc",
+ "cpal",
+ "crossbeam-channel",
+ "hf-hub",
+ "kcoro-sys",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
+name = "liquid-audio-oracle"
+version = "0.1.0"
+dependencies = [
  "anyhow",
  "arrow-array",
  "arrow-ipc",
@@ -1881,7 +1896,6 @@ dependencies = [
  "candle-flashfftconv",
  "candle-nn",
  "candle-transformers",
- "cc",
  "cpal",
  "crossbeam-channel",
  "half",
@@ -1889,6 +1903,7 @@ dependencies = [
  "kcoro",
  "kcoro-sys",
  "libc",
+ "liquid-audio",
  "minijinja",
  "moshi",
  "num_cpus",
@@ -1899,13 +1914,6 @@ dependencies = [
  "sha2",
  "symphonia",
  "tokenizers",
-]
-
-[[package]]
-name = "liquid-audio-oracle"
-version = "0.1.0"
-dependencies = [
- "liquid-audio",
 ]
 
 [[package]]

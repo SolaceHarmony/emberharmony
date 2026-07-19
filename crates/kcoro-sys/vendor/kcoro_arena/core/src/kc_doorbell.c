@@ -64,6 +64,13 @@ int kc_doorbell_wait(kc_doorbell_t *doorbell, uint32_t expected,
         : -EINVAL;
 }
 
+int kc_doorbell_realtime_safe(const kc_doorbell_t *doorbell)
+{
+    return doorbell
+        ? kc_port_wait_u32_wake_is_realtime_safe(doorbell->wait)
+        : 0;
+}
+
 void kc_doorbell_destroy(kc_doorbell_t *doorbell)
 {
     if (!doorbell) return;

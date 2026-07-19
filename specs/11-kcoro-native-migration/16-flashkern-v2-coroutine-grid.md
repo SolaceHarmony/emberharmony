@@ -309,7 +309,8 @@ Each step is independently gated and leaves a correct fallback geometry:
    four-worker/eight-logical-lane parity, and zero-spin are green.
 2. **V2.1 — bounded routed V1 audio, landed.** A total three-node/four-outcome
    table retains one exact slot across `TOKEN_PASS -> DEPTH_FRAME -> MIMI_DECODE`,
-   commits token context, writes Mimi PCM directly into pre-admitted playback,
+   commits token context, writes equal-rate Mimi PCM directly into pre-admitted
+   playback or native-resamples codec scratch into a device-rate reservation,
    and releases compute before publication. Its pre-created borrowed descriptors
    and exclusive producer lease keep the callback mutex-free. The coordinator
    originally waited once while an exclusive producer lease excluded the peer
@@ -325,9 +326,12 @@ Each step is independently gated and leaves a correct fallback geometry:
    sentence may call the two blocks independent executors.
 4. **V2.3 — block-mode kcoro, partial working-tree implementation.** Fixed-team
    thread lifecycle and shared generation reconvergence now belong to kcoro.
-   Extract two domain-local teams, per-domain ready rings, early-return
-   assertions, and optional measured event-wait backends; convert the bridge and
-   route pthread loops into kcoro-owned continuations.
+   The bridge and route pthread loops are replaced by retained kcoro services;
+   their production edges use setup-time realtime notifier leases and the
+   runtime-owned expected-value doorbell, so no intermediary thread, mutex, or
+   condition variable is on the progress path. Extract two domain-local teams,
+   per-domain ready rings, early-return assertions, and optional measured
+   event-wait backends.
 5. **V2.4 — two independent programs.** Admit two `BLOCK4` programs only for
    different conversations. Profile actual overlap and shared-bandwidth effects;
    retain gang mode when it wins latency or parity.

@@ -44,20 +44,22 @@
 #endif
 
 // Cap on frames-per-step for the convtr time-axis reduction scratch. The
-// largest input to any decoder transposed conv is 480 (ratio-4 layer); this
-// gives 4x headroom. ENFORCED at the ABI (review P1): convtr/upsample steps
-// refuse n_in beyond it instead of overrunning the arena-carved g scratch.
+// normal two-latent decode reaches 480 frames at the ratio-4 layer; the
+// supported four-latent boundary reaches 960, leaving 2x headroom. ENFORCED at
+// the ABI (review P1): convtr/upsample steps refuse n_in beyond it instead of
+// overrunning the arena-carved g scratch.
 enum { MIMI_CONV_MAX_NIN = MIMI_FRAME_OUT };
 
-// Matrix-route bound: steps with n_in (or num_frames) at or below this AND wide
-// reductions use the byte-load SIMD matrix leaf instead of time-axis NEON. Rationale
-// (review P1, measured): the widest decoder layers (init conv 512->1024 k7,
-// convtr 1024->512 k16) receive only n=2 time samples, so a 4-lane time-axis
-// AXPY runs entirely in its scalar tail — ~45 ms of the ~70 ms frame. The
-// GEMM formulation moves the in_c*k reduction into a row/column SIMD kernel. It
-// REORDERS the K reduction (SIMD blocking vs kk-outer/ic-inner) — faithful
-// tier; re-measured against the proven ~4e-6 whole-chain parity bar.
-enum { MIMI_CONV_GEMM_MAX_N = 512 };
+// Wide, short-time reductions use the byte-load SIMD matrix leaf when their
+// exact dynamic staging requirement fits the caller-owned workspace span.
+// Rationale (review P1, measured): the widest decoder layers (init conv
+// 512->1024 k7, convtr 1024->512 k16) receive only n=2 time samples, so a
+// 4-lane time-axis AXPY runs entirely in its scalar tail — ~45 ms of the ~70 ms
+// frame. The GEMM formulation moves the in_c*k reduction into a row/column SIMD
+// kernel. It REORDERS the K reduction (SIMD blocking vs kk-outer/ic-inner) —
+// faithful tier; re-measured against the proven ~4e-6 whole-chain parity bar.
+// A shape that does not fit takes the existing allocation-free direct backend;
+// capacity never changes arithmetic within either backend and never allocates.
 
 /* ======================================================================== *
  *  NEON contiguous primitives (primary path; scalar under MIMI_SCALAR_REF)
@@ -111,6 +113,23 @@ static inline void voverlap(float *y, const float *p, float c, int n) {
 #else
     for (int i = 0; i < n; ++i) y[i] += p[i] - c;
 #endif
+}
+
+// Rotate equal-shaped carry banks after every reader of `prev` has finished.
+// The returned scratch bank contains the now-dead prior carry and is completely
+// overwritten before its next commit; no sample value or arithmetic moves.
+static inline void flip(float *&prev, float *&scratch) {
+    float *old = prev;
+    prev = scratch;
+    scratch = old;
+}
+
+// Multiplication-free capacity admission: rows*cols fits iff
+// rows <= capacity/cols. This also rejects a missing span before any write and
+// avoids wrapping size_t for hostile standalone geometry.
+static inline int matrix_fits(const float *workspace, size_t capacity,
+                              size_t rows, int cols) {
+    return workspace && cols > 0 && rows <= capacity / (size_t)cols;
 }
 
 /* ======================================================================== *
@@ -226,7 +245,9 @@ static const uint8_t *resolve_weight(const MimiWeightTable *w, const char *base,
 //   seq_len - num_frames*stride is in [kernel_eff-stride, kernel_eff) when
 //   num_frames>0, and equals seq_len (< kernel_eff) when num_frames==0. The
 //   first-step left pad = padding_total = kernel_eff-stride < kernel_eff. So
-//   carry_cap = kernel_eff bounds prev for all time.
+//   carry_cap = kernel_eff bounds prev for all time. `prev` and `cbuf` are
+//   equal-shaped read/write banks: after the whole next carry is gathered, one
+//   pointer rotation publishes it without copying any sample values.
 struct MimiConvState {
     int in_c, out_c, ksize, stride, dilation, groups;
     int causal;          // stored for parity; step is inherently causal (Rust
@@ -238,20 +259,32 @@ struct MimiConvState {
     int carry_cap;       // = kernel_eff  (>= max carry, >= padding_total)
     const uint8_t *w;    // [out_c, in_c/groups, ksize] f32 bytes
     const uint8_t *bias; // [out_c] f32 bytes or NULL
-    float *prev;         // [in_c, carry_cap] left-context carry
-    float *cbuf;         // [in_c, carry_cap] scratch for the next carry gather
+    float *prev;         // [in_c, carry_cap] read bank: left-context carry
+    float *cbuf;         // [in_c, carry_cap] write bank: next carry gather
     int prev_len;        // # carried time steps currently in prev  (< kernel_eff)
     int left_pad_applied;
     // Matrix route (short-time wide layers): C[out_c,nf] = W[out_c,ic*k] x B.
     // W rows are ALREADY (ic,kk)-contiguous in checkpoint layout — zero-copy A;
-    // only the im2col gather B is staged (activation marshalling, like candle).
+    // only the activation gather B is staged (marshalling, like candle).
+    // The span is borrowed from SeaNet's sequential b2 liveness arena; direct
+    // primitive users must likewise provide it explicitly. It is never owned.
     int route_gemm;      // groups==1 && cin_g*ksize wide enough
-    float *im2col;       // [cin_g*ksize, MIMI_CONV_GEMM_MAX_N]
+    float *matrix;
+    size_t matrix_capacity; // floats, checked against cin_g*ksize*num_frames
 };
+
+// Publish a completely gathered carry prefix after every read of the old
+// logical context has finished. Old `prev` then becomes the next write bank;
+// tails outside `len` are never observed because prev_len is authoritative.
+static inline void publish(MimiConvState *s, int len) {
+    if (len > 0) flip(s->prev, s->cbuf);
+    s->prev_len = len;
+}
 
 int mimi_conv_init(MimiConvState **st, const MimiWeightTable *w,
                    const char *prefix, int in_c, int out_c, int ksize,
                    int stride, int dilation, int groups, int causal,
+                   float *matrix_workspace, size_t matrix_workspace_floats,
                    MimiArena *a, char *err, size_t errlen) {
     if (ksize < stride) return fail(err, errlen, "conv1d: kernel < stride");
     if (in_c % groups || out_c % groups)
@@ -285,9 +318,10 @@ int mimi_conv_init(MimiConvState **st, const MimiWeightTable *w,
     // time-axis AXPY is all scalar tail; the GEMM moves the ic*k reduction
     // onto the matrix unit. Narrow convs (final 64->1 k3) stay NEON.
     s->route_gemm = (groups == 1) && ((size_t)s->cin_g * ksize >= 1024);
-    if (s->route_gemm)
-        s->im2col = (float *)mimi_arena_alloc(
-            a, (size_t)s->cin_g * ksize * MIMI_CONV_GEMM_MAX_N * sizeof(float));
+    if (s->route_gemm && (!matrix_workspace || matrix_workspace_floats == 0))
+        return fail(err, errlen, "conv1d: matrix workspace span required");
+    s->matrix = matrix_workspace;
+    s->matrix_capacity = matrix_workspace_floats;
     *st = s;
     return 0;
 }
@@ -322,7 +356,11 @@ int mimi_conv_step(MimiConvState *s, const float *xs, int n_in, float *y) {
     const int seq_len = s->prev_len + n_in;
     const int num_frames = (seq_len + stride >= ke) ? (seq_len + stride - ke) / stride : 0;
 
-    if (num_frames > 0 && s->route_gemm && num_frames <= MIMI_CONV_GEMM_MAX_N) {
+    const size_t matrix_rows = (size_t)s->cin_g * (size_t)s->ksize;
+    const int use_matrix = num_frames > 0 && s->route_gemm &&
+                           matrix_fits(s->matrix, s->matrix_capacity,
+                                       matrix_rows, num_frames);
+    if (use_matrix) {
         // Matrix route: B[(ic*k + kk), f] = logical[ic][f*stride + kk*dil] gathered
         // once (row order matches W's (ic,kk) checkpoint layout — zero-copy A),
         // then C[out_c, nf] = W x B on the matrix unit, bias broadcast after.
@@ -330,12 +368,12 @@ int mimi_conv_step(MimiConvState *s, const float *xs, int n_in, float *y) {
         const int kdim = s->cin_g * k;
         for (int ic = 0; ic < s->cin_g; ++ic)
             for (int kk = 0; kk < k; ++kk) {
-                float *brow = s->im2col + ((size_t)ic * k + kk) * nf;
+                float *brow = s->matrix + ((size_t)ic * k + kk) * nf;
                 const int base = kk * dil;
                 for (int f = 0; f < nf; ++f)
                     brow[f] = conv_read(s, xs, n_in, ic, f * stride + base);
             }
-        mimi_weight_gemm_f32(s->w, s->im2col, y, s->out_c, kdim, nf, 0);
+        mimi_weight_gemm_f32(s->w, s->matrix, y, s->out_c, kdim, nf, 0);
         if (s->bias)
             for (int oc = 0; oc < s->out_c; ++oc)
                 vadd_scalar(y + (size_t)oc * nf,
@@ -348,10 +386,7 @@ int mimi_conv_step(MimiConvState *s, const float *xs, int n_in, float *y) {
             for (int j = 0; j < carry_len; ++j)
                 dst[j] = conv_read(s, xs, n_in, c, offset + j);
         }
-        for (int c = 0; c < s->in_c; ++c)
-            memcpy(s->prev + (size_t)c * s->carry_cap,
-                   s->cbuf + (size_t)c * s->carry_cap, carry_len * sizeof(float));
-        s->prev_len = carry_len;
+        publish(s, carry_len);
         return nf;
     }
 
@@ -403,10 +438,7 @@ int mimi_conv_step(MimiConvState *s, const float *xs, int n_in, float *y) {
             for (int j = 0; j < carry_len; ++j)
                 dst[j] = conv_read(s, xs, n_in, c, offset + j);
         }
-        for (int c = 0; c < s->in_c; ++c)
-            memcpy(s->prev + (size_t)c * s->carry_cap,
-                   s->cbuf + (size_t)c * s->carry_cap, carry_len * sizeof(float));
-        s->prev_len = carry_len;
+        publish(s, carry_len);
         return nf;
     } else {
         // priming: emit nothing, carry the whole logical sequence (Rust:
@@ -416,10 +448,7 @@ int mimi_conv_step(MimiConvState *s, const float *xs, int n_in, float *y) {
             for (int j = 0; j < seq_len; ++j)
                 dst[j] = conv_read(s, xs, n_in, c, j);
         }
-        for (int c = 0; c < s->in_c; ++c)
-            memcpy(s->prev + (size_t)c * s->carry_cap,
-                   s->cbuf + (size_t)c * s->carry_cap, seq_len * sizeof(float));
-        s->prev_len = seq_len;
+        publish(s, seq_len);
         return 0;
     }
 }
@@ -456,21 +485,24 @@ struct MimiConvTrState {
     int invalid;         // ksize - stride  (carry length once primed)
     const uint8_t *w;    // [in_c, out_c, ksize] f32 bytes
     const uint8_t *bias; // [out_c] f32 bytes or NULL
-    float *prev;         // [out_c, invalid] output overlap carry (bias INCLUDED)
-    float *carry_scratch;// [out_c, invalid] next-carry accumulator
+    float *prev;         // [out_c, invalid] read bank: prior carry (bias INCLUDED)
+    float *carry_scratch;// [out_c, invalid] write bank: next carry
     float *g;            // [MIMI_CONV_MAX_NIN] per-(oc,kk) time reduction
     int prev_valid;
     // Matrix route (short-time wide layers): G[k*out_c, n] = W_r x X in one pass
     // (X is the caller's [in_c, n] — zero-copy B), then the same per-oc
     // scatter/bias/overlap/commit. The GEMM reads checkpoint [ic][oc][kk]
-    // directly as the transpose of [ic, oc*kk]; no re-arm exists.
+    // directly as the transpose of [ic, oc*kk]; no re-arm exists. The borrowed
+    // workspace is admitted from the exact dynamic rows*n_in requirement.
     int route_gemm;
-    float *g_gemm;       // [ksize*out_c, MIMI_CONV_GEMM_MAX_N]
+    float *matrix;
+    size_t matrix_capacity; // floats, checked against ksize*out_c*n_in
 };
 
 int mimi_convtr_init(MimiConvTrState **st, const MimiWeightTable *w,
                      const char *prefix, int in_c, int out_c, int ksize,
-                     int stride, int causal, MimiArena *a,
+                     int stride, int causal, float *matrix_workspace,
+                     size_t matrix_workspace_floats, MimiArena *a,
                      char *err, size_t errlen) {
     if (ksize < stride) return fail(err, errlen, "convtr: kernel < stride");
     MimiConvTrState *s = (MimiConvTrState *)mimi_arena_alloc(a, sizeof(MimiConvTrState));
@@ -498,10 +530,10 @@ int mimi_convtr_init(MimiConvTrState **st, const MimiWeightTable *w,
     // Matrix route for the wide layers (the ratio-8 convtr receives n=2: its
     // time-axis AXPY was all scalar tail — the measured ~31 ms hot spot).
     s->route_gemm = (in_c >= 128);
-    if (s->route_gemm) {
-        s->g_gemm = (float *)mimi_arena_alloc(
-            a, (size_t)ksize * out_c * MIMI_CONV_GEMM_MAX_N * sizeof(float));
-    }
+    if (s->route_gemm && (!matrix_workspace || matrix_workspace_floats == 0))
+        return fail(err, errlen, "convtr: matrix workspace span required");
+    s->matrix = matrix_workspace;
+    s->matrix_capacity = matrix_workspace_floats;
     *st = s;
     return 0;
 }
@@ -509,7 +541,7 @@ int mimi_convtr_init(MimiConvTrState **st, const MimiWeightTable *w,
 void mimi_convtr_reset(MimiConvTrState *s) { s->prev_valid = 0; }
 
 int mimi_convtr_step(MimiConvTrState *s, const float *xs, int n_in, float *y) {
-    // ABI bounds (review P1): g/g_gemm scratch would overrun past
+    // ABI bounds (review P1): the direct backend's g scratch would overrun past
     // MIMI_CONV_MAX_NIN. 0 in = 0 out (empty StreamTensor propagation).
     if (n_in <= 0) return 0;
     if (n_in > MIMI_CONV_MAX_NIN) return -1;
@@ -521,12 +553,15 @@ int mimi_convtr_step(MimiConvTrState *s, const float *xs, int n_in, float *y) {
 
     // Matrix route: the whole (kk,oc) x ic reduction as one GEMM up front —
     // G[kk*oc_n + oc, l] = sum_ic W_r[kk*oc_n+oc, ic] * X[ic, l].
-    const int use_gemm = s->route_gemm && n_in <= MIMI_CONV_GEMM_MAX_N;
+    const size_t matrix_rows = (size_t)k * (size_t)oc_n;
+    const int use_gemm = s->route_gemm &&
+                         matrix_fits(s->matrix, s->matrix_capacity,
+                                     matrix_rows, n_in);
     if (use_gemm)
-        mimi_weight_gemm_tn_f32(s->w, xs, s->g_gemm, k * oc_n, in_c, n_in);
+        mimi_weight_gemm_tn_f32(s->w, xs, s->matrix, k * oc_n, in_c, n_in);
 
     // LANE-BAND AXIS = output channel oc: this loop body is fully independent
-    // per oc (reduce -> scatter -> bias -> overlap -> commit its own carry row),
+    // per oc (reduce -> scatter -> bias -> overlap -> write its next-carry row),
     // so the arbiter can cut [0,oc_n) into bands with no cross-oc dependence.
     for (int oc = 0; oc < oc_n; ++oc) {
         float *yrow = y + (size_t)oc * emit_len;
@@ -541,7 +576,7 @@ int mimi_convtr_step(MimiConvTrState *s, const float *xs, int n_in, float *y) {
         for (int kk = 0; kk < k; ++kk) {
             const float *grow;
             if (use_gemm) {
-                grow = s->g_gemm + (((size_t)oc * k) + kk) * n_in;
+                grow = s->matrix + (((size_t)oc * k) + kk) * n_in;
             } else {
                 memset(g, 0, (size_t)n_in * sizeof(float));
                 for (int ic = 0; ic < in_c; ++ic)
@@ -574,9 +609,16 @@ int mimi_convtr_step(MimiConvTrState *s, const float *xs, int n_in, float *y) {
             for (int t = nov; t < invalid; ++t)     // rare tail (invalid>emit_len)
                 crow[t - emit_len] += prow[t] - bv;
         }
-        // commit this oc's carry row (kept for the next step, bias included).
-        if (invalid > 0) memcpy(s->prev + (size_t)oc * invalid, crow, (size_t)invalid * sizeof(float));
     }
+    /* Liveness proof for the destination-direct commit:
+     *   - Every old-prev read is inside the completed oc loop above.
+     *   - Every next-carry row was initialized and fully accumulated there.
+     *   - After the loop, old prev is dead until the next step, where its bank
+     *     is the scratch destination and every row is zeroed before use.
+     * Therefore exchanging the two arena pointers is exactly the former copy's
+     * state transition, without moving any f32 carry values. A future banded
+     * caller performs this one flip on the closing lane after its barrier. */
+    if (invalid > 0) flip(s->prev, s->carry_scratch);
     s->prev_valid = 1;
     return emit_len;
 }
@@ -599,8 +641,8 @@ int mimi_convtr_step(MimiConvTrState *s, const float *xs, int n_in, float *y) {
 struct MimiUpsampleState {
     int dim, ksize, stride, invalid;
     const uint8_t *w;    // [dim, 1, ksize] checkpoint-layout f32 bytes
-    float *prev;         // [dim, invalid] overlap carry (no bias)
-    float *carry_scratch;// [dim, invalid]
+    float *prev;         // [dim, invalid] read bank: prior carry (no bias)
+    float *carry_scratch;// [dim, invalid] write bank: next carry
     float *g;            // [MIMI_CONV_MAX_NIN] n_in>1 fallback time reduction
     int prev_valid;
 };
@@ -743,9 +785,46 @@ int mimi_upsample_step(MimiUpsampleState *s, const float *xs, int n_in, float *y
             for (int t = nov; t < invalid; ++t) crow[t - emit_len] += prow[t];
         }
     }
-    memcpy(s->prev, s->carry_scratch, (size_t)dim * invalid * sizeof(float));
+    /* The hot n==1 path assigns every write-bank slot once; the fallback
+     * zeroes the entire bank before accumulation. All old-prev reads finished
+     * in the overlap loop, so the same two-bank liveness proof applies. */
+    if (invalid > 0) flip(s->prev, s->carry_scratch);
     s->prev_valid = 1;
     return emit_len;
+}
+
+extern "C" uint64_t mimi_conv_carry_copy_bytes_saved(void) {
+    // One steady decode step: top-level depthwise x2 carry plus SeaNet's
+    // four k=2*stride carries. The former commits copied each f32 once.
+    const uint64_t upsample = (uint64_t)MIMI_DIM * MIMI_UPSAMPLE_STRIDE;
+    const uint64_t seanet =
+        (uint64_t)512 * 8 + (uint64_t)256 * 6 +
+        (uint64_t)128 * 5 + (uint64_t)64 * 4;
+    return (upsample + seanet) * sizeof(float);
+}
+
+extern "C" uint64_t mimi_conv1d_carry_copy_bytes_saved(void) {
+    // One steady SeaNet decode: initial 512-channel k7 context, four residual
+    // k3 contexts, and the final 64-channel k3 context. The four k1 residual
+    // convs have no context and formerly issued only zero-byte memcpy calls.
+    const uint64_t initial = (uint64_t)512 * (7 - 1);
+    const uint64_t residual =
+        ((uint64_t)512 + 256 + 128 + 64) * (3 - 1);
+    const uint64_t final = (uint64_t)64 * (3 - 1);
+    return (initial + residual + final) * sizeof(float);
+}
+
+extern "C" uint64_t mimi_conv_matrix_workspace_bytes_saved(void) {
+    // The removed arenas were six independent 512-column planes: init conv +
+    // L0 residual gather, then one G plane for each transposed-conv layer.
+    // This is historical footprint accounting only; runtime backend admission
+    // uses the exact dynamic requirement and contains no fixed-width gate.
+    const uint64_t columns = 512;
+    const uint64_t conv_rows = (uint64_t)512 * 7 + (uint64_t)512 * 3;
+    const uint64_t convtr_rows =
+        (uint64_t)16 * 512 + (uint64_t)12 * 256 +
+        (uint64_t)10 * 128 + (uint64_t)8 * 64;
+    return (conv_rows + convtr_rows) * columns * sizeof(float);
 }
 
 /* ========================================================================= *
@@ -769,15 +848,21 @@ int mimi_upsample_step(MimiUpsampleState *s, const float *xs, int n_in, float *y
  *
  * (b) Per-struct pending/carry invariants (verify these hardest)
  *   MimiConvState (StreamableConv1d):
- *     * prev = [in_c, carry_cap] left-context carry; prev_len valid time steps.
+ *     * prev/cbuf are equal-shaped read/write banks. prev contains
+ *       [in_c, carry_cap] left context with prev_len valid time steps. The full
+ *       next prefix is gathered into cbuf while prev remains read-only; after
+ *       every channel completes, publish swaps the banks once. Old prev is
+ *       dead at that point, and tails outside prev_len are never read.
  *       INVARIANT: prev_len < kernel_eff always, so carry_cap = kernel_eff =
  *       (ksize-1)*dilation+1 never overflows. Proof: num_frames =
  *       (seq_len+stride-kernel_eff)/stride (floor, 0 when seq_len+stride<ke);
  *       retained carry = seq_len - num_frames*stride is in [ke-stride, ke) if
  *       num_frames>0 else = seq_len (< ke). First-step left pad = ke-stride.
  *     * left_pad_applied: false only before the first step; the first step
- *       pre-loads prev with padding_total zeros (PadMode::Constant), reproducing
- *       cat2(empty, pad1d(xs, padding_total, 0)).
+ *       pre-loads the current prev bank with padding_total zeros
+ *       (PadMode::Constant), reproducing cat2(empty,
+ *       pad1d(xs, padding_total, 0)). reset only clears length/pad state, so
+ *       whichever bank is current is zeroed before its first post-reset read.
  *     * logical sequence per step = [prev(prev_len) ++ xs(n_in)]; output frame f
  *       channel oc reads taps at logical pos f*stride + kk*dilation. Emits
  *       [out_c, num_frames] (0 while priming). New carry =
@@ -795,9 +880,15 @@ int mimi_upsample_step(MimiUpsampleState *s, const float *xs, int n_in, float *y
  *     * overlap-add: emitted[0..invalid] = raw[0..invalid] + (prev - bias); bias
  *       is subtracted from prev because the current raw re-adds it (Rust "Remove
  *       the bias as it will be applied multiple times"). Tail carry keeps bias.
+ *     * prev and carry_scratch are equal-shaped read/write banks. Every write
+ *       bank row is initialized before accumulation, and the read bank is dead
+ *       after overlap, so a pointer flip commits the whole carry without a copy.
+ *       reset only clears prev_valid; the first post-reset step ignores the read
+ *       bank, fully writes the other bank, and flips normally.
  *   MimiUpsampleState (ConvTrUpsample1d): same overlap-add carry as convtr but
  *     depthwise (out ch c <- in ch c only), NO bias, dim=512, stride=2, k=4,
- *     invalid=2. Each latent frame (n_in=1) -> emit_len=2 upsampled frames.
+ *     invalid=2. Each latent frame (n_in=1) -> emit_len=2 upsampled frames. Its
+ *     two carry banks obey the identical liveness/flip proof.
  *
  * (c) Weight names + shapes consumed (verified vs the moshiko-candle-bf16
  *     checkpoint tokenizer-e351c8d8-checkpoint125.safetensors):
@@ -854,21 +945,24 @@ int mimi_upsample_step(MimiUpsampleState *s, const float *xs, int n_in, float *y
  *                second phase banded over INPUT channel c (prev[c]/cbuf[c] rows
  *                disjoint). SHARED (read-only in compute): w, bias, prev, xs.
  *                PRIVATE: none — cbuf writes are per-input-channel disjoint, no
- *                cross-lane scratch. reset flags are step-boundary only.
+ *                cross-lane scratch. After the carry-gather barrier, one
+ *                closing lane publishes the banks; no interior lane owns the
+ *                pointer flip. reset flags are step-boundary only.
  *     convtr   : BAND AXIS = output channel oc (outer loop; self-contained
- *                reduce->scatter->bias->overlap->commit per oc). NEON axis =
+ *                reduce->scatter->bias->overlap->next-bank write per oc). NEON axis =
  *                TIME l (inner). PRIVATE per lane: the g[MIMI_CONV_MAX_NIN]
  *                reduction scratch (reused per oc) — one g per lane, or hoist g
  *                into per-lane scratch at the banding cut. SHARED: w, bias, xs;
- *                prev/carry_scratch rows are per-oc disjoint (shareable). Each
- *                oc reads only its own prev[oc] row and commits it, so the carry
- *                needs no cross-lane sync.
+ *                prev/carry_scratch rows are per-oc disjoint (shareable). A
+ *                future mounted team flips the two pointers once on its closing
+ *                lane after the existing stage barrier; no interior lane owns it.
  *     upsample : BAND AXIS = channel c (depthwise: channel c is fully
  *                independent) — this COINCIDES with the NEON axis, so a lane
  *                band is a contiguous channel sub-range and vmul/vscale operate
- *                on that sub-range directly. PRIVATE: prod[dim] (per-channel
- *                disjoint writes — shareable. SHARED: checkpoint weights,
- *                xs; prev/carry_scratch rows per-channel disjoint.
+ *                on that sub-range directly. PRIVATE: none; output and carry
+ *                writes are per-channel disjoint. SHARED: checkpoint weights,
+ *                xs, and the read-only prior carry. Its bank
+ *                flip is likewise a single post-barrier closing-lane action.
  *     In all three the single-call step API is unchanged; per-lane privatization
  *     is limited to the convtr `g` (and optionally upsample `prod`) scratch.
  *
@@ -892,8 +986,14 @@ int mimi_upsample_step(MimiUpsampleState *s, const float *xs, int n_in, float *y
  *   5. `causal` is stored but never read in either step, matching the Rust step
  *      functions (both are inherently causal: conv1d left-pads only; convtr's
  *      trim is the invalid-steps split, trim_right_ratio == 1).
- *   6. Buffers are tiny: conv1d prev/cbuf are O(in_c * kernel_eff); convtr/
- *      upsample carries are O(channels * invalid); the only time-sized scratch
- *      is g[MIMI_CONV_MAX_NIN] (convtr/upsample n_in>1). Outputs go straight to
- *      the caller's y, so no worst-case frame-sized arena is needed.
+ *   6. Owned buffers are tiny: conv1d prev/cbuf are O(in_c * kernel_eff);
+ *      convtr/upsample carries are O(channels * invalid), and their only owned
+ *      time-sized scratch is g[MIMI_CONV_MAX_NIN]. Matrix routes borrow one
+ *      caller-owned span sequentially; they never carve a per-layer plane.
+ *      Outputs go straight to the caller's y. Both carry
+ *      banks remain necessary within a step; rotating them removes 50,688 bytes
+ *      / 2,497 nonzero memcpy calls
+ *      from each steady one-latent Mimi decode without changing the state
+ *      footprint (30,208 bytes / 961 calls for transposed-conv carries plus
+ *      20,480 bytes / 1,536 calls for conv1d context).
  */

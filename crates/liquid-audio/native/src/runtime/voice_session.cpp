@@ -91,16 +91,21 @@ struct PcmSlot {
     LfmTicketIdV1 ticket{};
 };
 
+struct alignas(HOT_ATOMIC_BYTES) PcmRecordCell {
+    std::atomic<uint64_t> sequence{0};
+    LfmPcmLeaseV1 lease{};
+};
+static_assert(alignof(PcmRecordCell) == HOT_ATOMIC_BYTES);
+
 struct PcmPool {
     PcmSlot *slots = nullptr;
-    LfmPcmLeaseV1 *ring = nullptr;
+    PcmRecordCell *ring = nullptr;
     uint32_t capacity = 0;
     uint32_t samples_per_slot = 0;
     uint32_t direction = 0;
     Cursor<uint64_t> head;
     Cursor<uint64_t> tail;
     Cursor<uint32_t> cursor;
-    std::mutex push_mutex;
 };
 
 struct EventRecord {
@@ -171,22 +176,57 @@ bool ticket_equal(const LfmTicketIdV1 &a, const LfmTicketIdV1 &b) {
 }
 
 bool pool_push(PcmPool *pool, const LfmPcmLeaseV1 &lease) {
-    std::lock_guard<std::mutex> guard(pool->push_mutex);
     uint64_t tail = pool->tail.value.load(std::memory_order_relaxed);
-    uint64_t head = pool->head.value.load(std::memory_order_acquire);
-    if (tail - head == pool->capacity) return false;
-    pool->ring[tail % pool->capacity] = lease;
-    pool->tail.value.store(tail + 1, std::memory_order_release);
+    PcmRecordCell *cell = nullptr;
+    for (;;) {
+        cell = &pool->ring[tail % pool->capacity];
+        const uint64_t sequence = cell->sequence.load(std::memory_order_acquire);
+        const intptr_t difference =
+            static_cast<intptr_t>(sequence - tail);
+        if (difference == 0) {
+            if (pool->tail.value.compare_exchange_weak(
+                    tail, tail + 1, std::memory_order_relaxed,
+                    std::memory_order_relaxed)) {
+                break;
+            }
+            continue;
+        }
+        if (difference < 0) return false;
+        tail = pool->tail.value.load(std::memory_order_relaxed);
+    }
+    cell->lease = lease;
+    cell->sequence.store(tail + 1, std::memory_order_release);
     return true;
 }
 
 bool pool_pop(PcmPool *pool, LfmPcmLeaseV1 *out) {
     uint64_t head = pool->head.value.load(std::memory_order_relaxed);
-    uint64_t tail = pool->tail.value.load(std::memory_order_acquire);
-    if (head == tail) return false;
-    *out = pool->ring[head % pool->capacity];
-    pool->head.value.store(head + 1, std::memory_order_release);
+    PcmRecordCell *cell = nullptr;
+    for (;;) {
+        cell = &pool->ring[head % pool->capacity];
+        const uint64_t sequence = cell->sequence.load(std::memory_order_acquire);
+        const intptr_t difference =
+            static_cast<intptr_t>(sequence - (head + 1));
+        if (difference == 0) {
+            if (pool->head.value.compare_exchange_weak(
+                    head, head + 1, std::memory_order_relaxed,
+                    std::memory_order_relaxed)) {
+                break;
+            }
+            continue;
+        }
+        if (difference < 0) return false;
+        head = pool->head.value.load(std::memory_order_relaxed);
+    }
+    *out = cell->lease;
+    cell->sequence.store(head + pool->capacity, std::memory_order_release);
     return true;
+}
+
+bool pool_ready(const PcmPool &pool) {
+    const uint64_t head = pool.head.value.load(std::memory_order_acquire);
+    const PcmRecordCell &cell = pool.ring[head % pool.capacity];
+    return cell.sequence.load(std::memory_order_acquire) == head + 1;
 }
 
 uint32_t pool_live(const PcmPool &pool) {
@@ -211,12 +251,13 @@ void pool_destroy(PcmPool *pool) {
 int pool_create(PcmPool *pool, uint32_t capacity, uint32_t samples_per_slot,
                 uint32_t direction) {
     pool->slots = new (std::nothrow) PcmSlot[capacity];
-    pool->ring = new (std::nothrow) LfmPcmLeaseV1[capacity]();
+    pool->ring = new (std::nothrow) PcmRecordCell[capacity];
     if (!pool->slots || !pool->ring) return LFM_STATUS_OUT_OF_MEMORY;
     pool->capacity = capacity;
     pool->samples_per_slot = samples_per_slot;
     pool->direction = direction;
     for (uint32_t i = 0; i < capacity; ++i) {
+        pool->ring[i].sequence.store(i, std::memory_order_relaxed);
         pool->slots[i].samples = new (std::nothrow) float[samples_per_slot];
         if (!pool->slots[i].samples) return LFM_STATUS_OUT_OF_MEMORY;
     }
@@ -404,6 +445,7 @@ struct LfmSession {
     LfmCallbacksV1 callbacks{};
     uint64_t id = 0;
     uint32_t sample_rate = 0;
+    uint32_t playback_frames = 0;
     uint32_t channels = 0;
     uint32_t max_new_tokens = 0;
     uint32_t generation = 1;
@@ -723,7 +765,8 @@ int reserve_playback(LfmSession *session, uint64_t action_epoch,
         return LFM_STATUS_STALE;
     }
     return lfm_audio_dock_reserve(session, LFM_PCM_LEASE_PLAYBACK,
-                                  LFM_MIMI_PCM_CAPACITY, 24000, out);
+                                  session->playback_frames,
+                                  session->sample_rate, out);
 }
 
 bool publish_audio(LfmSession *session, const LfmNativeEmission &emission,
@@ -1309,8 +1352,7 @@ void *coordinator_main(void *context) {
 
         uint32_t expected = kc_atomic_u32_load_acquire(&session->work_doorbell.value);
         if (session->stop.load(std::memory_order_acquire) ||
-            session->capture.head.value.load(std::memory_order_acquire) !=
-                session->capture.tail.value.load(std::memory_order_acquire) ||
+            pool_ready(session->capture) ||
             !text_empty(&session->commands) || session->action.active ||
             session->epoch.load(std::memory_order_acquire) != applied_epoch) {
             continue;
@@ -1820,18 +1862,17 @@ int lfm_session_create(LfmRuntime *runtime, LfmModel *model,
         config->abi_version != LFM_RUNTIME_ABI_VERSION) {
         return LFM_STATUS_ABI_MISMATCH;
     }
+    const bool dock_only =
+        (config->flags & LFM_SESSION_FLAG_DOCK_ONLY) != 0;
     if (runtime->state.load(std::memory_order_acquire) >= LFM_RUNTIME_STOPPING ||
         config->capture_slots == 0 || config->capture_slots > MAX_PCM_SLOTS ||
         config->playback_slots == 0 || config->playback_slots > MAX_PCM_SLOTS ||
         config->capture_frames_per_slot == 0 ||
-        config->playback_frames_per_slot == 0 || config->pcm_channels != 1 ||
+        (dock_only && config->playback_frames_per_slot == 0) ||
+        config->pcm_channels != 1 ||
         config->pcm_sample_rate < 8000 || config->pcm_sample_rate > 192000 ||
         config->command_capacity == 0 || config->command_capacity > 64 ||
         config->max_new_tokens == 0 || config->reserved0 != 0) {
-        return LFM_STATUS_INVALID_ARGUMENT;
-    }
-    bool dock_only = (config->flags & LFM_SESSION_FLAG_DOCK_ONLY) != 0;
-    if (!dock_only && config->playback_frames_per_slot < LFM_MIMI_PCM_CAPACITY) {
         return LFM_STATUS_INVALID_ARGUMENT;
     }
     if (dock_only && (model || conversation)) return LFM_STATUS_INVALID_ARGUMENT;
@@ -1841,13 +1882,9 @@ int lfm_session_create(LfmRuntime *runtime, LfmModel *model,
         return LFM_STATUS_ABI_MISMATCH;
     }
     size_t capture_samples = 0;
-    size_t playback_samples = 0;
     if (!checked_samples(config->capture_frames_per_slot, config->pcm_channels,
                          &capture_samples) ||
-        capture_samples > UINT32_MAX / sizeof(float) ||
-        !checked_samples(config->playback_frames_per_slot, config->pcm_channels,
-                         &playback_samples) ||
-        playback_samples > UINT32_MAX / sizeof(float)) {
+        capture_samples > UINT32_MAX / sizeof(float)) {
         return LFM_STATUS_INVALID_ARGUMENT;
     }
     std::unique_lock<std::mutex> owner(runtime->children_mutex);
@@ -1869,10 +1906,25 @@ int lfm_session_create(LfmRuntime *runtime, LfmModel *model,
     if (runtime->session_count >= runtime->session_capacity) {
         return LFM_STATUS_BUSY;
     }
+    size_t playback_frames = config->playback_frames_per_slot;
+    size_t playback_capacity = config->playback_frames_per_slot;
     if (!dock_only) {
         int prepare = lfm_conversation_prepare_pcm_native(
-            conversation, capture_samples, config->pcm_sample_rate);
+            conversation, capture_samples, config->pcm_sample_rate,
+            &playback_frames);
         if (prepare != 0) return prepare;
+        if (playback_frames == 0 || playback_frames > UINT32_MAX ||
+            (playback_capacity != 0 && playback_frames > playback_capacity)) {
+            return LFM_STATUS_INVALID_ARGUMENT;
+        }
+        if (playback_capacity == 0) playback_capacity = playback_frames;
+    }
+    size_t playback_samples = 0;
+    if (!checked_samples(static_cast<uint32_t>(playback_capacity),
+                         config->pcm_channels,
+                         &playback_samples) ||
+        playback_samples > UINT32_MAX / sizeof(float)) {
+        return LFM_STATUS_INVALID_ARGUMENT;
     }
 
     LfmSession *session = new (std::nothrow) LfmSession();
@@ -1886,6 +1938,7 @@ int lfm_session_create(LfmRuntime *runtime, LfmModel *model,
                       : config->session_id;
     if (session->id == 0) session->id = next_session_id.fetch_add(1);
     session->sample_rate = config->pcm_sample_rate;
+    session->playback_frames = static_cast<uint32_t>(playback_frames);
     session->channels = config->pcm_channels;
     session->max_new_tokens = config->max_new_tokens;
     if (callbacks) session->callbacks = *callbacks;
@@ -2358,8 +2411,7 @@ int lfm_audio_dock_wait_playback(LfmSession *session, LfmPcmLeaseV1 *out) {
         }
         if (session->stop.load(std::memory_order_acquire)) return LFM_STATUS_CANCELLED;
         uint32_t expected = kc_atomic_u32_load_acquire(&session->playback_doorbell.value);
-        if (session->playback.head.value.load(std::memory_order_acquire) !=
-                session->playback.tail.value.load(std::memory_order_acquire) ||
+        if (pool_ready(session->playback) ||
             session->stop.load(std::memory_order_acquire)) {
             continue;
         }

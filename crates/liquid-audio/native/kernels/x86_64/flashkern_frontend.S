@@ -286,22 +286,28 @@ LFM_SYM(lfm_norm_apply_f32):
     .seh_endproc
 #endif
 
-// void lfm_resample_conv_f64(const double *padded, uint64_t padded_len,
+// void lfm_resample_conv_f32(const float *input, uint64_t input_len,
 //                            const double *kernels, uint64_t phases,
-//                            uint64_t klen, uint64_t stride,
-//                            float *out, uint64_t max_values)
-// max_values admits a partial final phase block, so output is the caller's
-// exact-size destination rather than a larger copied convolution plane.
+//                            uint64_t stride, uint64_t width,
+//                            uint64_t first_value, float *out,
+//                            uint64_t value_count)
+// Direct-span torchaudio convolution. Logical zero prefix/suffix taps are
+// skipped; in-span f32 samples are widened and accumulated in ascending-j f64
+// order. first_value/value_count admit independently scheduled output ranges.
 .p2align 4
-.globl LFM_SYM(lfm_resample_conv_f64)
-LFM_PRIVATE(LFM_SYM(lfm_resample_conv_f64))
-LFM_SYM(lfm_resample_conv_f64):
+.globl LFM_SYM(lfm_resample_conv_f32)
+LFM_PRIVATE(LFM_SYM(lfm_resample_conv_f32))
+LFM_SYM(lfm_resample_conv_f32):
 #ifdef _WIN32
-    .seh_proc LFM_SYM(lfm_resample_conv_f64)
+    .seh_proc LFM_SYM(lfm_resample_conv_f32)
 #endif
     pushq     %rbx
 #ifdef _WIN32
     .seh_pushreg %rbx
+#endif
+    pushq     %rbp
+#ifdef _WIN32
+    .seh_pushreg %rbp
 #endif
     pushq     %r12
 #ifdef _WIN32
@@ -318,72 +324,99 @@ LFM_SYM(lfm_resample_conv_f64):
     pushq     %r15
 #ifdef _WIN32
     .seh_pushreg %r15
+#endif
     pushq     %rdi
+#ifdef _WIN32
     .seh_pushreg %rdi
+#endif
     pushq     %rsi
+#ifdef _WIN32
     .seh_pushreg %rsi
     .seh_endprologue
-    movq      %rcx, %rdi          // padded
-    movq      %rdx, %rsi          // padded_len
-    movq      %r8,  %rdx          // kernels
+    movq      %rcx, %rdi          // input
+    movq      %rdx, %rsi          // input_len
+    movq      %r8,  %rbx          // kernels
     movq      %r9,  %rcx          // phases
-    movq      96(%rsp), %r8       // klen   (ret 8 + shadow 32 + 7 pushes 56)
-    movq      104(%rsp), %r9      // stride
-    movq      112(%rsp), %rbx     // out
-    movq      120(%rsp), %r12     // max_values
+    movq      104(%rsp), %r8      // stride (ret 8 + shadow 32 + pushes 64)
+    movq      112(%rsp), %r9      // width
+    movq      120(%rsp), %r10     // first_value
+    movq      128(%rsp), %r11     // out
+    movq      136(%rsp), %r12     // value_count
 #else
-    movq      48(%rsp), %rbx      // out   (ret 8 + 5 pushes 40 = 7th arg)
-    movq      56(%rsp), %r12      // max_values (8th arg)
+    movq      %rdx, %rbx          // kernels
+    movq      72(%rsp), %r10      // first_value (ret 8 + pushes 64)
+    movq      80(%rsp), %r11      // out
+    movq      88(%rsp), %r12      // value_count
 #endif
-    xorq      %r10, %r10          // start
-    xorq      %r11, %r11          // block
+    leaq      (%r8,%r9,2), %r13   // klen = stride + 2*width
+    addq      %r9, %rsi           // one-past logical input coordinate
+    movq      %r10, %rax
+    xorq      %rdx, %rdx
+    divq      %rcx
+    movq      %rax, %r10          // initial block
+    movq      %rdx, %r14          // initial phase
 1:
-    leaq      (%r10,%r8), %rax
+    testq     %r12, %r12
+    jz        8f
+    movq      %r14, %rax
+    imulq     %r13, %rax
+    leaq      (%rbx,%rax,8), %r15 // kernel row
+    movq      %r10, %rax
+    imulq     %r8, %rax            // logical padded-window start
+
     cmpq      %rsi, %rax
-    ja        8f
-    xorq      %r13, %r13          // phase
+    jae       6f                   // the entire window is suffix padding
+    movq      %rsi, %rdx
+    subq      %rax, %rdx           // first suffix j
+    cmpq      %r13, %rdx
+    jbe       2f
+    movq      %r13, %rdx           // j_end = min(klen, width+len-start)
 2:
-    cmpq      %rcx, %r13
-    jae       5f
-    movq      %r11, %rax
-    imulq     %rcx, %rax
-    addq      %r13, %rax
-    cmpq      %r12, %rax
-    jae       8f
-    movq      %r13, %rax
-    imulq     %r8, %rax
-    leaq      (%rdx,%rax,8), %r14 // kernel row
-    leaq      (%rdi,%r10,8), %r15 // padded + start
-    xorpd     %xmm0, %xmm0        // acc
-    xorq      %rax, %rax
+    cmpq      %r9, %rax
+    jae       3f
+    movq      %r9, %rbp
+    subq      %rax, %rbp           // j_begin = width - start
+    xorq      %rax, %rax          // input index 0
+    jmp       4f
 3:
-    cmpq      %r8, %rax
-    jae       4f
-    movsd     (%r15,%rax,8), %xmm1
-    movsd     (%r14,%rax,8), %xmm2
+    xorq      %rbp, %rbp          // j_begin = 0
+    subq      %r9, %rax           // input index = start - width
+4:
+    xorpd     %xmm0, %xmm0        // acc
+5:
+    cmpq      %rdx, %rbp
+    jae       7f
+    cvtss2sd  (%rdi,%rax,4), %xmm1
+    movsd     (%r15,%rbp,8), %xmm2
     mulsd     %xmm2, %xmm1
     addsd     %xmm1, %xmm0
     incq      %rax
-    jmp       3b
-4:
+    incq      %rbp
+    jmp       5b
+6:
+    xorpd     %xmm0, %xmm0
+7:
     cvtsd2ss  %xmm0, %xmm0
-    movss     %xmm0, (%rbx)
-    addq      $4, %rbx
-    incq      %r13
-    jmp       2b
-5:
-    addq      %r9, %r10
-    incq      %r11
+    movss     %xmm0, (%r11)
+    addq      $4, %r11
+    decq      %r12
+    incq      %r14
+    cmpq      %rcx, %r14
+    jb        1b
+    xorq      %r14, %r14
+    incq      %r10
     jmp       1b
 8:
 #ifdef _WIN32
+    // rsi/rdi are restored by the common epilogue below.
+#endif
     popq      %rsi
     popq      %rdi
-#endif
     popq      %r15
     popq      %r14
     popq      %r13
     popq      %r12
+    popq      %rbp
     popq      %rbx
     ret
 #ifdef _WIN32

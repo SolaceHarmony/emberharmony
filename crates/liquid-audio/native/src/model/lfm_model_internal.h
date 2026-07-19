@@ -69,7 +69,7 @@ extern "C" LFM_INTERNAL_API int lfm_native_emission_needs_pcm(
 /* Private session/model seam. No declaration in the product or Rust ABI. */
 LFM_INTERNAL_API int lfm_conversation_prepare_pcm_native(
     LfmConversation *conversation, size_t max_sample_count,
-    uint32_t sample_rate);
+    uint32_t sample_rate, size_t *out_playback_frames);
 LFM_INTERNAL_API int lfm_conversation_begin_pcm_native(
     LfmConversation *conversation, const float *pcm, size_t sample_count,
     uint32_t sample_rate, LfmNativeEmission *out);

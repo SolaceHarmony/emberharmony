@@ -20,6 +20,9 @@ void kc_doorbell_ring_one(kc_doorbell_t *doorbell);
 void kc_doorbell_ring_all(kc_doorbell_t *doorbell);
 int kc_doorbell_wait(kc_doorbell_t *doorbell, uint32_t expected,
                      uint64_t deadline_ns);
+/* Ring is allocation-free for every backend, but only direct address-wake
+ * backends are mutex-free and therefore admissible from realtime callbacks. */
+int kc_doorbell_realtime_safe(const kc_doorbell_t *doorbell);
 void kc_doorbell_destroy(kc_doorbell_t *doorbell);
 
 #ifdef __cplusplus

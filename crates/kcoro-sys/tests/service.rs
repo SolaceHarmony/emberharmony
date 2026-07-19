@@ -1,9 +1,22 @@
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicI32, AtomicPtr, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 const ABI: u32 = 1;
 const EBUSY: i32 = 16;
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+const EDEADLK: i32 = 11;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const EDEADLK: i32 = 35;
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "linux",
+    target_os = "android"
+)))]
+const EDEADLK: i32 = 35;
 const WAITING: u32 = 3;
 const DONE: u32 = 4;
 
@@ -110,6 +123,28 @@ struct Seen {
     changed: Condvar,
 }
 
+struct JoinProbe {
+    runtime: AtomicPtr<c_void>,
+    service: AtomicPtr<c_void>,
+    service_join: AtomicI32,
+    idle: AtomicI32,
+    join_all: AtomicI32,
+    runtime_join: AtomicI32,
+    done: Mutex<bool>,
+    changed: Condvar,
+}
+
+struct Count {
+    callbacks: AtomicU64,
+}
+
+struct Quota {
+    service: AtomicPtr<c_void>,
+    remaining: AtomicU64,
+    callbacks: AtomicU64,
+    status: AtomicI32,
+}
+
 unsafe extern "C" fn service_callback(context: *mut c_void) {
     let seen = unsafe { &*(context.cast::<Seen>()) };
     let mut gate = seen.gate.lock().unwrap();
@@ -125,10 +160,56 @@ unsafe extern "C" fn service_callback(context: *mut c_void) {
     seen.changed.notify_all();
 }
 
+unsafe extern "C" fn self_join_callback(context: *mut c_void) {
+    let probe = unsafe { &*(context.cast::<JoinProbe>()) };
+    let service = probe.service.load(Ordering::Acquire);
+    let runtime = probe.runtime.load(Ordering::Acquire);
+    unsafe { kc_service_request_stop(service) };
+    probe
+        .service_join
+        .store(unsafe { kc_service_join(service) }, Ordering::Release);
+    probe.idle.store(
+        unsafe { kc_runtime_run_until_idle(runtime) },
+        Ordering::Release,
+    );
+    probe
+        .join_all
+        .store(unsafe { kc_runtime_join_all(runtime) }, Ordering::Release);
+    probe
+        .runtime_join
+        .store(unsafe { kc_runtime_join(runtime) }, Ordering::Release);
+    *probe.done.lock().unwrap() = true;
+    probe.changed.notify_all();
+}
+
+unsafe extern "C" fn count_callback(context: *mut c_void) {
+    let count = unsafe { &*(context.cast::<Count>()) };
+    count.callbacks.fetch_add(1, Ordering::Release);
+}
+
+unsafe extern "C" fn quota_callback(context: *mut c_void) {
+    let quota = unsafe { &*(context.cast::<Quota>()) };
+    let remaining = quota.remaining.fetch_sub(1, Ordering::AcqRel);
+    quota.callbacks.fetch_add(1, Ordering::Release);
+    if remaining == 0 {
+        quota.status.store(-1, Ordering::Release);
+        return;
+    }
+    if remaining == 1 {
+        return;
+    }
+    let service = quota.service.load(Ordering::Acquire);
+    quota.status.store(
+        unsafe { kc_service_ready_again(service) },
+        Ordering::Release,
+    );
+}
+
 unsafe extern "C" {
     fn kc_runtime_create(config: *const RuntimeConfig, out: *mut *mut c_void) -> i32;
     fn kc_runtime_start(runtime: *mut c_void) -> i32;
     fn kc_runtime_run_until_idle(runtime: *mut c_void) -> i32;
+    fn kc_runtime_join_all(runtime: *mut c_void) -> i32;
     fn kc_runtime_request_stop(runtime: *mut c_void);
     fn kc_runtime_join(runtime: *mut c_void) -> i32;
     fn kc_runtime_destroy(runtime: *mut c_void) -> i32;
@@ -144,10 +225,193 @@ unsafe extern "C" {
     fn kc_service_notifier_create(service: *mut c_void, out: *mut *mut c_void) -> i32;
     fn kc_service_notifier_notify(notifier: *mut c_void) -> i32;
     fn kc_service_notifier_destroy(notifier: *mut c_void) -> i32;
+    fn kc_service_ready_again(service: *mut c_void) -> i32;
     fn kc_service_request_stop(service: *mut c_void);
     fn kc_service_join(service: *mut c_void) -> i32;
     fn kc_service_snapshot_get(service: *mut c_void, out: *mut ServiceSnapshot) -> i32;
     fn kc_service_destroy(service: *mut c_void) -> i32;
+}
+
+#[test]
+fn bounded_callback_can_reschedule_its_own_ready_predicate_without_an_external_edge() {
+    kcoro_sys::link_anchor();
+    const QUOTAS: u64 = 17;
+    let config = RuntimeConfig {
+        size: size_of::<RuntimeConfig>() as u32,
+        abi_version: ABI,
+        worker_count: 2,
+        arena_segment_size: 0,
+        ticket_capacity: 1,
+        reserved: 0,
+    };
+    let mut runtime = std::ptr::null_mut();
+    assert_eq!(unsafe { kc_runtime_create(&config, &mut runtime) }, 0);
+    let quota = Quota {
+        service: AtomicPtr::new(std::ptr::null_mut()),
+        remaining: AtomicU64::new(QUOTAS),
+        callbacks: AtomicU64::new(0),
+        status: AtomicI32::new(0),
+    };
+    let config = ServiceConfig {
+        size: size_of::<ServiceConfig>() as u32,
+        abi_version: ABI,
+        callback: Some(quota_callback),
+        context: (&quota as *const Quota).cast_mut().cast(),
+        reserved: 0,
+    };
+    let mut service = std::ptr::null_mut();
+    assert_eq!(
+        unsafe { kc_service_create(runtime, &config, &mut service) },
+        0
+    );
+    quota.service.store(service, Ordering::Release);
+    assert_eq!(unsafe { kc_service_start(service) }, 0);
+    assert_eq!(unsafe { kc_runtime_start(runtime) }, 0);
+    assert_eq!(unsafe { kc_service_notify(service) }, 0);
+    assert_eq!(unsafe { kc_runtime_run_until_idle(runtime) }, 0);
+
+    let mut snapshot = ServiceSnapshot {
+        size: size_of::<ServiceSnapshot>() as u32,
+        abi_version: ABI,
+        ..ServiceSnapshot::default()
+    };
+    assert_eq!(
+        unsafe { kc_service_snapshot_get(service, &mut snapshot) },
+        0
+    );
+    assert_eq!(quota.status.load(Ordering::Acquire), 0);
+    assert_eq!(quota.remaining.load(Ordering::Acquire), 0);
+    assert_eq!(quota.callbacks.load(Ordering::Acquire), QUOTAS);
+    assert_eq!(snapshot.notifications, QUOTAS);
+    assert_eq!(snapshot.handled_notifications, QUOTAS);
+    assert_eq!(snapshot.callbacks, QUOTAS);
+    assert_eq!(
+        unsafe { kc_service_ready_again(service) },
+        -1,
+        "only the service's active continuation may request a local reschedule"
+    );
+
+    unsafe { kc_service_request_stop(service) };
+    assert_eq!(unsafe { kc_service_join(service) }, 0);
+    assert_eq!(unsafe { kc_service_destroy(service) }, 0);
+    unsafe { kc_runtime_request_stop(runtime) };
+    assert_eq!(unsafe { kc_runtime_join(runtime) }, 0);
+    assert_eq!(unsafe { kc_runtime_destroy(runtime) }, 0);
+}
+
+#[test]
+fn callback_side_service_and_runtime_joins_fail_instead_of_deadlocking() {
+    kcoro_sys::link_anchor();
+    let config = RuntimeConfig {
+        size: size_of::<RuntimeConfig>() as u32,
+        abi_version: ABI,
+        worker_count: 1,
+        arena_segment_size: 0,
+        ticket_capacity: 1,
+        reserved: 0,
+    };
+    let mut runtime = std::ptr::null_mut();
+    assert_eq!(unsafe { kc_runtime_create(&config, &mut runtime) }, 0);
+    let probe = JoinProbe {
+        runtime: AtomicPtr::new(runtime),
+        service: AtomicPtr::new(std::ptr::null_mut()),
+        service_join: AtomicI32::new(i32::MIN),
+        idle: AtomicI32::new(i32::MIN),
+        join_all: AtomicI32::new(i32::MIN),
+        runtime_join: AtomicI32::new(i32::MIN),
+        done: Mutex::new(false),
+        changed: Condvar::new(),
+    };
+    let config = ServiceConfig {
+        size: size_of::<ServiceConfig>() as u32,
+        abi_version: ABI,
+        callback: Some(self_join_callback),
+        context: (&probe as *const JoinProbe).cast_mut().cast(),
+        reserved: 0,
+    };
+    let mut service = std::ptr::null_mut();
+    assert_eq!(
+        unsafe { kc_service_create(runtime, &config, &mut service) },
+        0
+    );
+    probe.service.store(service, Ordering::Release);
+    assert_eq!(unsafe { kc_service_start(service) }, 0);
+    assert_eq!(unsafe { kc_runtime_start(runtime) }, 0);
+    assert_eq!(unsafe { kc_service_notify(service) }, 0);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut done = probe.done.lock().unwrap();
+    while !*done {
+        let wait = deadline.saturating_duration_since(Instant::now());
+        assert!(!wait.is_zero(), "self-join callback did not finish");
+        done = probe.changed.wait_timeout(done, wait).unwrap().0;
+    }
+    drop(done);
+    assert_eq!(probe.service_join.load(Ordering::Acquire), -EDEADLK);
+    assert_eq!(probe.idle.load(Ordering::Acquire), -EDEADLK);
+    assert_eq!(probe.join_all.load(Ordering::Acquire), -EDEADLK);
+    assert_eq!(probe.runtime_join.load(Ordering::Acquire), -EDEADLK);
+
+    assert_eq!(unsafe { kc_service_join(service) }, 0);
+    assert_eq!(unsafe { kc_service_destroy(service) }, 0);
+    unsafe { kc_runtime_request_stop(runtime) };
+    assert_eq!(unsafe { kc_runtime_join(runtime) }, 0);
+    assert_eq!(unsafe { kc_runtime_destroy(runtime) }, 0);
+}
+
+#[test]
+fn run_until_idle_drains_every_realtime_edge_accepted_before_return() {
+    kcoro_sys::link_anchor();
+    let config = RuntimeConfig {
+        size: size_of::<RuntimeConfig>() as u32,
+        abi_version: ABI,
+        worker_count: 1,
+        arena_segment_size: 0,
+        ticket_capacity: 1,
+        reserved: 0,
+    };
+    let mut runtime = std::ptr::null_mut();
+    assert_eq!(unsafe { kc_runtime_create(&config, &mut runtime) }, 0);
+    let count = Count {
+        callbacks: AtomicU64::new(0),
+    };
+    let config = ServiceConfig {
+        size: size_of::<ServiceConfig>() as u32,
+        abi_version: ABI,
+        callback: Some(count_callback),
+        context: (&count as *const Count).cast_mut().cast(),
+        reserved: 0,
+    };
+    let mut service = std::ptr::null_mut();
+    assert_eq!(
+        unsafe { kc_service_create(runtime, &config, &mut service) },
+        0
+    );
+    assert_eq!(unsafe { kc_service_start(service) }, 0);
+    let mut notifier = std::ptr::null_mut();
+    assert_eq!(
+        unsafe { kc_service_notifier_create(service, &mut notifier) },
+        0
+    );
+    assert_eq!(unsafe { kc_runtime_start(runtime) }, 0);
+    assert_eq!(unsafe { kc_runtime_run_until_idle(runtime) }, 0);
+
+    for generation in 1..=512_u64 {
+        assert_eq!(unsafe { kc_service_notifier_notify(notifier) }, 0);
+        assert_eq!(unsafe { kc_runtime_run_until_idle(runtime) }, 0);
+        let snapshot = service_snapshot(service);
+        assert_eq!(snapshot.notifications, generation);
+        assert_eq!(snapshot.handled_notifications, generation);
+        assert_eq!(count.callbacks.load(Ordering::Acquire), generation);
+    }
+
+    assert_eq!(unsafe { kc_service_notifier_destroy(notifier) }, 0);
+    unsafe { kc_service_request_stop(service) };
+    assert_eq!(unsafe { kc_service_join(service) }, 0);
+    assert_eq!(unsafe { kc_service_destroy(service) }, 0);
+    unsafe { kc_runtime_request_stop(runtime) };
+    assert_eq!(unsafe { kc_runtime_join(runtime) }, 0);
+    assert_eq!(unsafe { kc_runtime_destroy(runtime) }, 0);
 }
 
 fn wait_for_calls(seen: &Seen, calls: usize) {
@@ -511,6 +775,20 @@ fn realtime_notify_callgraph_and_publication_order_are_source_gated() {
     let released = body.find("&service->realtime_gate, 1").unwrap();
     let ring = body.find("kc_runtime_ring_work_internal").unwrap();
     assert!(notified < released && released < ring);
+
+    let begin = service.find("int kc_service_ready_again").unwrap();
+    let end = service[begin..]
+        .find("void kc_service_request_stop")
+        .map(|offset| begin + offset)
+        .unwrap();
+    let body = &service[begin..end];
+    assert!(!body.contains("KC_MUTEX"));
+    assert!(!body.contains("kc_runtime_ring_work_internal"));
+    assert!(!body.contains("kc_port_wait"));
+    let notified = body.find("&service->notifications").unwrap();
+    let ready = body.find("->wake_pending").unwrap();
+    let released = body.find("&service->realtime_gate, 1").unwrap();
+    assert!(notified < ready && ready < released);
 
     let runtime = include_str!("../vendor/kcoro_arena/core/src/kc_runtime.c");
     assert!(!runtime.contains("work_cv"));

@@ -1,7 +1,7 @@
 // pipeline_probe.c — the scheduling spine, for real: a flashkern-style fixed
 // lane team parked on the actual in-repo kc_port doorbell (zero-spin), fanning a
 // decode projection out by atomic tile-claim, running BFDOT leaves. It links the
-// real kc_port (not kc_team, which is mid-migration) so the wake path is honest.
+// kc_port directly to isolate the lower-level wake path from kc_team orchestration.
 // Measures:
 //   (1) lane scaling 1->8 on a real decode layer (linear, or bandwidth-capped?)
 //   (2) per-generation orchestration overhead (dispatch + wake + barrier) — the

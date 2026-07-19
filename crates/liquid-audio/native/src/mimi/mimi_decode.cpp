@@ -293,65 +293,110 @@ extern "C" void mimi_gemm_f32(const float *a, const float *b, float *c, int m,
 #endif
 }
 
+static inline float mimi_weight_gemv_row_f32(const uint8_t *w,
+                                              const float *x,
+                                              const uint8_t *bias, int i,
+                                              int k) {
+    float sum = 0.0f;
+    int j = 0;
+#if defined(MIMI_HAVE_NEON) && !defined(MIMI_SCALAR_REF)
+    float32x4_t acc0 = vdupq_n_f32(0.0f);
+    float32x4_t acc1 = vdupq_n_f32(0.0f);
+    float32x4_t acc2 = vdupq_n_f32(0.0f);
+    float32x4_t acc3 = vdupq_n_f32(0.0f);
+    const uint8_t *row = w + static_cast<size_t>(i) * k * sizeof(float);
+    for (; j + 16 <= k; j += 16) {
+        acc0 = vaddq_f32(
+            acc0, vmulq_f32(mimi_weight_load4_f32(row + j * sizeof(float)),
+                            vld1q_f32(x + j)));
+        acc1 = vaddq_f32(
+            acc1, vmulq_f32(mimi_weight_load4_f32(row + (j + 4) * sizeof(float)),
+                            vld1q_f32(x + j + 4)));
+        acc2 = vaddq_f32(
+            acc2, vmulq_f32(mimi_weight_load4_f32(row + (j + 8) * sizeof(float)),
+                            vld1q_f32(x + j + 8)));
+        acc3 = vaddq_f32(
+            acc3, vmulq_f32(mimi_weight_load4_f32(row + (j + 12) * sizeof(float)),
+                            vld1q_f32(x + j + 12)));
+    }
+    acc0 = vaddq_f32(acc0, acc1);
+    acc2 = vaddq_f32(acc2, acc3);
+    sum = mimi_weight_sum4(vaddq_f32(acc0, acc2));
+#elif defined(MIMI_HAVE_SSE2) && !defined(MIMI_SCALAR_REF)
+    __m128 acc0 = _mm_setzero_ps();
+    __m128 acc1 = _mm_setzero_ps();
+    __m128 acc2 = _mm_setzero_ps();
+    __m128 acc3 = _mm_setzero_ps();
+    const uint8_t *row = w + static_cast<size_t>(i) * k * sizeof(float);
+    for (; j + 16 <= k; j += 16) {
+        acc0 = _mm_add_ps(
+            acc0, _mm_mul_ps(mimi_weight_load4_f32(row + j * sizeof(float)),
+                             _mm_loadu_ps(x + j)));
+        acc1 = _mm_add_ps(
+            acc1, _mm_mul_ps(mimi_weight_load4_f32(row + (j + 4) * sizeof(float)),
+                             _mm_loadu_ps(x + j + 4)));
+        acc2 = _mm_add_ps(
+            acc2, _mm_mul_ps(mimi_weight_load4_f32(row + (j + 8) * sizeof(float)),
+                             _mm_loadu_ps(x + j + 8)));
+        acc3 = _mm_add_ps(
+            acc3, _mm_mul_ps(mimi_weight_load4_f32(row + (j + 12) * sizeof(float)),
+                             _mm_loadu_ps(x + j + 12)));
+    }
+    acc0 = _mm_add_ps(acc0, acc1);
+    acc2 = _mm_add_ps(acc2, acc3);
+    sum = mimi_weight_sum4(_mm_add_ps(acc0, acc2));
+#endif
+    for (; j < k; ++j) {
+        sum += mimi_weight_load_f32(w, static_cast<uint64_t>(i) * k + j) * x[j];
+    }
+    if (bias) sum += mimi_weight_load_f32(bias, i);
+    return sum;
+}
+
+static void mimi_weight_gemv_range_f32(
+    const uint8_t *w, const float *x, const uint8_t *bias, float *y,
+    int row_begin, int row_end, int output_begin, int k, int accumulate) {
+    for (int i = row_begin; i < row_end; ++i) {
+        const float sum = mimi_weight_gemv_row_f32(w, x, bias, i, k);
+        float *out = y + (i - output_begin);
+        if (accumulate) {
+            *out += sum;
+        } else {
+            *out = sum;
+        }
+    }
+}
+
+extern "C" void mimi_weight_gemv_rows_f32(
+    const uint8_t *w, const float *x, const uint8_t *bias, float *y,
+    int row_begin, int row_end, int k, int accumulate) {
+    mimi_weight_gemv_range_f32(w, x, bias, y, row_begin, row_end,
+                               /*output_begin*/ 0, k, accumulate);
+}
+
+extern "C" void mimi_weight_gemv_span_f32(
+    const uint8_t *w, const float *x, const uint8_t *bias, float *y,
+    int row_begin, int row_end, int k) {
+    mimi_weight_gemv_range_f32(w, x, bias, y, row_begin, row_end,
+                               /*output_begin*/ row_begin, k,
+                               /*accumulate*/ 0);
+}
+
+extern "C" void mimi_weight_gemv_scale_residual_rows_f32(
+    const uint8_t *w, const float *x, const uint8_t *scale, float *residual,
+    int row_begin, int row_end, int k) {
+    for (int i = row_begin; i < row_end; ++i) {
+        const float sum = mimi_weight_gemv_row_f32(w, x, nullptr, i, k);
+        const float scaled = sum * mimi_weight_load_f32(scale, i);
+        const float prior = residual[i];
+        residual[i] = prior + scaled;
+    }
+}
+
 extern "C" void mimi_weight_gemv_f32(const uint8_t *w, const float *x,
                                        const uint8_t *bias, float *y, int m,
                                        int k) {
-    for (int i = 0; i < m; ++i) {
-        float sum = 0.0f;
-        int j = 0;
-#if defined(MIMI_HAVE_NEON) && !defined(MIMI_SCALAR_REF)
-        float32x4_t acc0 = vdupq_n_f32(0.0f);
-        float32x4_t acc1 = vdupq_n_f32(0.0f);
-        float32x4_t acc2 = vdupq_n_f32(0.0f);
-        float32x4_t acc3 = vdupq_n_f32(0.0f);
-        const uint8_t *row = w + static_cast<size_t>(i) * k * sizeof(float);
-        for (; j + 16 <= k; j += 16) {
-            acc0 = vaddq_f32(
-                acc0, vmulq_f32(mimi_weight_load4_f32(row + j * sizeof(float)),
-                                vld1q_f32(x + j)));
-            acc1 = vaddq_f32(
-                acc1, vmulq_f32(mimi_weight_load4_f32(row + (j + 4) * sizeof(float)),
-                                vld1q_f32(x + j + 4)));
-            acc2 = vaddq_f32(
-                acc2, vmulq_f32(mimi_weight_load4_f32(row + (j + 8) * sizeof(float)),
-                                vld1q_f32(x + j + 8)));
-            acc3 = vaddq_f32(
-                acc3, vmulq_f32(mimi_weight_load4_f32(row + (j + 12) * sizeof(float)),
-                                vld1q_f32(x + j + 12)));
-        }
-        acc0 = vaddq_f32(acc0, acc1);
-        acc2 = vaddq_f32(acc2, acc3);
-        sum = mimi_weight_sum4(vaddq_f32(acc0, acc2));
-#elif defined(MIMI_HAVE_SSE2) && !defined(MIMI_SCALAR_REF)
-        __m128 acc0 = _mm_setzero_ps();
-        __m128 acc1 = _mm_setzero_ps();
-        __m128 acc2 = _mm_setzero_ps();
-        __m128 acc3 = _mm_setzero_ps();
-        const uint8_t *row = w + static_cast<size_t>(i) * k * sizeof(float);
-        for (; j + 16 <= k; j += 16) {
-            acc0 = _mm_add_ps(
-                acc0, _mm_mul_ps(mimi_weight_load4_f32(row + j * sizeof(float)),
-                                 _mm_loadu_ps(x + j)));
-            acc1 = _mm_add_ps(
-                acc1, _mm_mul_ps(mimi_weight_load4_f32(row + (j + 4) * sizeof(float)),
-                                 _mm_loadu_ps(x + j + 4)));
-            acc2 = _mm_add_ps(
-                acc2, _mm_mul_ps(mimi_weight_load4_f32(row + (j + 8) * sizeof(float)),
-                                 _mm_loadu_ps(x + j + 8)));
-            acc3 = _mm_add_ps(
-                acc3, _mm_mul_ps(mimi_weight_load4_f32(row + (j + 12) * sizeof(float)),
-                                 _mm_loadu_ps(x + j + 12)));
-        }
-        acc0 = _mm_add_ps(acc0, acc1);
-        acc2 = _mm_add_ps(acc2, acc3);
-        sum = mimi_weight_sum4(_mm_add_ps(acc0, acc2));
-#endif
-        for (; j < k; ++j) {
-            sum += mimi_weight_load_f32(w, static_cast<uint64_t>(i) * k + j) * x[j];
-        }
-        if (bias) sum += mimi_weight_load_f32(bias, i);
-        y[i] = sum;
-    }
+    mimi_weight_gemv_rows_f32(w, x, bias, y, 0, m, k, 0);
 }
 
 extern "C" void mimi_weight_gemm_f32(const uint8_t *w, const float *b,
@@ -1088,12 +1133,11 @@ struct MimiDecodeState {
     MimiTransformerState *transformer;
     MimiSeanetState *seanet;
 
-    // Inter-stage latent buffers, conv layout [MIMI_DIM, MIMI_MAX_LATENT].
-    // Distinct buffers so transformer's "y == distinct buf" contract holds and
-    // no stage aliases its input.
-    float *emb_buf;  // quantizer.decode output
-    float *up_buf;   // upsample.step output
-    float *tr_buf;   // decoder_transformer.step output (seanet input)
+    // Inter-stage latent buffers. Quantizer decode always emits exactly one
+    // frame. The transformer's documented in-place contract lets up_buf carry
+    // both upsample output and final transformer output into SeaNet.
+    float *emb_buf;  // [MIMI_DIM], quantizer.decode output
+    float *up_buf;   // [MIMI_DIM, MIMI_MAX_LATENT], upsample -> transformer
     // The final PCM lands directly in the caller's pcm_out (capacity
     // MIMI_FRAME_OUT*2), so no pcm scratch is carved here.
 };
@@ -1131,12 +1175,10 @@ static int mimi_state_init(MimiDecodeState **out, const MimiDecodePlan *plan,
     state->arena = {static_cast<uint8_t *>(base), capacity, 0,
                     const_cast<MimiDerivedArena *>(&plan->derived), 0};
 
-    const size_t latent_floats = (size_t)MIMI_DIM * (size_t)MIMI_MAX_LATENT;
     state->emb_buf = static_cast<float *>(
-        mimi_arena_alloc(&state->arena, latent_floats * sizeof(float)));
+        mimi_arena_alloc(&state->arena, (size_t)MIMI_DIM * sizeof(float)));
+    const size_t latent_floats = (size_t)MIMI_DIM * (size_t)MIMI_MAX_LATENT;
     state->up_buf = static_cast<float *>(
-        mimi_arena_alloc(&state->arena, latent_floats * sizeof(float)));
-    state->tr_buf = static_cast<float *>(
         mimi_arena_alloc(&state->arena, latent_floats * sizeof(float)));
 
     int rc = mimi_quant_init(&state->quant, &plan->table, &state->arena, err, errlen);
@@ -1493,14 +1535,14 @@ extern "C" int mimi_decode_state_step(MimiDecodeState *d,
 
     // decoder_transformer.step: [MIMI_DIM, n_up] -> [MIMI_DIM, n_tr]. Causal KV
     // transformer preserves the frame count (n_tr == n_up). Intra: per-layer F2.
-    int n_tr = mimi_transformer_step(d->transformer, d->up_buf, n_up, d->tr_buf);
+    int n_tr = mimi_transformer_step(d->transformer, d->up_buf, n_up, d->up_buf);
     if (n_tr < 0) return n_tr;  // propagate stage error (see above)
-    // --- fence F2 (post-transformer): tr_buf[MIMI_DIM, n_tr] ---
+    // --- fence F2 (post-transformer): up_buf[MIMI_DIM, n_tr] ---
 
     // decoder(seanet).step: [MIMI_DIM, n_tr] -> pcm[1, n_pcm]. x960 upsample =>
     // n_pcm == n_tr * 960 in steady state (== MIMI_FRAME_OUT for n_tr == 2).
     // Intra: per {upsample+resnet} layer F3.
-    int n_pcm = mimi_seanet_step(d->seanet, d->tr_buf, n_tr, pcm_out);
+    int n_pcm = mimi_seanet_step(d->seanet, d->up_buf, n_tr, pcm_out);
     // --- fence F4 (post-seanet): pcm_out[1, n_pcm] — pass-boundary doorbell ---
 
     return n_pcm;
@@ -1575,7 +1617,8 @@ extern "C" uint64_t mimi_decoder_compatibility_copied_bytes(
  *  candle checkpoint linear                   | mimi_weight_* (byte-load NEON/SSE)
  *  candle_nn::LayerNorm                       | mimi_layer_norm_f32 (NEON)
  *  candle gelu_erf / Elu / softmax_last_dim   | mimi_gelu_erf_vec_f32 / _elu_vec_ / _softmax_
- *  candle add (residual/skip) / LayerScale mul| mimi_add_vec_f32 / mimi_scale_vec_f32
+ *  transformer projection + LayerScale + add | mimi_weight_gemv_scale_residual_rows_f32
+ *  other residual/skip and scale sweeps       | mimi_add_vec_f32 / mimi_scale_vec_f32
  *  candle gelu_erf / Elu (per element)        | mimi_gelu_erf_f32 / mimi_elu_f32 (lane/tail)
  *
  *  The Rust ALWAYS calls each `.step` regardless of emptiness; this file mirrors
@@ -1629,17 +1672,22 @@ extern "C" uint64_t mimi_decoder_compatibility_copied_bytes(
  *  Plan construction performs one temporary 256 MiB state probe while building
  *  derived tables into a separate arena. It records the state high-water mark,
  *  seals the derived arena, and discards the probe. Each conversation then gets
- *  an exact-sized mutable arena. The production measurement is 48,808,616 bytes
- *  including the state descriptor: KV rings, conv carry, and activation scratch.
- *  State initialization replays derived offsets and never recomputes or writes
- *  the sealed tables. Thus two conversations share one image and one derived
- *  plan while retaining independent mutable recurrence.
+ *  an exact-sized mutable arena. `mimi_decode_state_bytes` reports the sealed
+ *  high-water mark including the state descriptor, KV rings, conv carry, and
+ *  activation scratch; no hard-coded total is authoritative as scratch planes
+ *  are deleted. State initialization replays derived offsets and never
+ *  recomputes or writes the sealed tables. Thus two conversations share one
+ *  image and one derived plan while retaining independent mutable recurrence.
  *
  * (d) PRIMITIVE-KERNEL LOOP ORDERS  ("math is assembly at every step")
  * --------------------------------------------------------------------
  *  resident gemv (y[M] = W[M,K]*x + b): W remains `uint8_t*`; sixteen values
  *    are consumed as four byte-loaded NEON/SSE register blocks, then reduced.
  *    Bias and scalar tails use explicit little-endian loads.
+ *  transformer residual epilogue: that exact resident row reducer feeds a
+ *    separately-rounded sum*LayerScale followed by residual+scaled, with
+ *    residual as the left operand. It writes only the final activation row;
+ *    -ffp-contract=off forbids fma and no branch plane exists.
  *  resident gemm: row-major W streams one scalar register value per K while
  *    the mutable activation columns are vectorized. The transposed form uses
  *    contiguous four-row checkpoint loads for the hot n=2 route. No typed

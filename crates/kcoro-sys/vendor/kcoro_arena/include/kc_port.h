@@ -36,13 +36,18 @@ void kc_port_cond_broadcast(kc_port_cond *cond);
  * immediately when the value differs, parks without polling while it is equal,
  * and returns -ETIMEDOUT for an unchanged deadline. Release is exactly once; it
  * publishes one terminal increment and wakes operations that already entered the
- * wait object. No new operation may begin after release starts.
+ * wait object. Entry and release linearize through one packed closed/count
+ * gate. No new operation may begin after release starts, and the owner must
+ * quiesce every potential caller before releasing the registration.
  */
 int kc_port_wait_u32_prepare(uint32_t *address, kc_port_wait_word **out);
 int kc_port_wait_u32(kc_port_wait_word *word, uint32_t expected,
                      uint64_t deadline_ns);
 void kc_port_wake_u32_one(kc_port_wait_word *word);
 void kc_port_wake_u32_all(kc_port_wait_word *word);
+/* True only when wake uses the host's direct address primitive and cannot
+ * acquire the pthread fallback mutex. The result is immutable after prepare. */
+int kc_port_wait_u32_wake_is_realtime_safe(const kc_port_wait_word *word);
 void kc_port_wait_u32_release(kc_port_wait_word *word);
 
 int kc_port_thread_create(kc_port_thread **out, kc_port_thread_fn fn, void *arg);

@@ -18,6 +18,8 @@ typedef struct LfmSessionConfigV1 {
     uint32_t capture_slots;
     uint32_t playback_slots;
     uint32_t capture_frames_per_slot;
+    /* Zero lets a model-backed session derive its exact codec/rate capacity.
+     * Dock-only sessions must provide an explicit capacity. */
     uint32_t playback_frames_per_slot;
     uint32_t pcm_channels;
     uint32_t pcm_sample_rate;

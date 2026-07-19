@@ -3,6 +3,7 @@
 #include "kc_op_internal.h"
 #include "kc_channel_internal.h"
 #include "kc_scope_internal.h"
+#include "kc_service_internal.h"
 #include "kc_ticket_internal.h"
 #include "koro_internal.h"
 
@@ -11,6 +12,8 @@
 
 static kc_runtime_t *default_runtime;
 static atomic_uint_fast64_t next_runtime_epoch = ATOMIC_VAR_INIT(1);
+static _Thread_local kc_runtime_t *current_worker_runtime;
+static _Thread_local koro_cont_t *current_worker_continuation;
 enum { KC_COMPLETION_DRAIN_BUDGET = 64 };
 
 static void timer_remove_locked(kc_runtime_t *runtime, kc_op *op)
@@ -130,7 +133,7 @@ static void runtime_free(kc_runtime_t *runtime)
     KC_COND_DESTROY(&runtime->timer_cv);
     KC_MUTEX_DESTROY(&runtime->timer_mu);
     KC_COND_DESTROY(&runtime->lifecycle_cv);
-    KC_COND_DESTROY(&runtime->work_cv);
+    kc_doorbell_destroy(runtime->work_doorbell);
     KC_MUTEX_DESTROY(&runtime->mu);
     free(runtime);
 }
@@ -162,18 +165,19 @@ int kc_runtime_create(const kc_runtime_config *config, kc_runtime_t **out)
     for (size_t cause = 0; cause <= KC_CAUSE_FAILURE; cause++) {
         atomic_init(&runtime->terminal_causes[cause], 0);
     }
-    if (KC_MUTEX_INIT(&runtime->mu) != 0) {
+    int doorbell_status = kc_doorbell_create(&runtime->work_doorbell);
+    if (doorbell_status != 0) {
         free(runtime);
-        return -ENOMEM;
+        return doorbell_status;
     }
-    if (KC_COND_INIT(&runtime->work_cv) != 0) {
-        KC_MUTEX_DESTROY(&runtime->mu);
+    if (KC_MUTEX_INIT(&runtime->mu) != 0) {
+        kc_doorbell_destroy(runtime->work_doorbell);
         free(runtime);
         return -ENOMEM;
     }
     if (KC_COND_INIT(&runtime->lifecycle_cv) != 0) {
-        KC_COND_DESTROY(&runtime->work_cv);
         KC_MUTEX_DESTROY(&runtime->mu);
+        kc_doorbell_destroy(runtime->work_doorbell);
         free(runtime);
         return -ENOMEM;
     }
@@ -186,16 +190,16 @@ int kc_runtime_create(const kc_runtime_config *config, kc_runtime_t **out)
         ? config->ticket_capacity : 256;
     if (kc_ticket_runtime_init(runtime, ticket_capacity) != 0) {
         KC_COND_DESTROY(&runtime->lifecycle_cv);
-        KC_COND_DESTROY(&runtime->work_cv);
         KC_MUTEX_DESTROY(&runtime->mu);
+        kc_doorbell_destroy(runtime->work_doorbell);
         free(runtime);
         return -ENOMEM;
     }
     if (kc_descriptor_runtime_init(runtime) != 0) {
         kc_ticket_runtime_destroy(runtime);
         KC_COND_DESTROY(&runtime->lifecycle_cv);
-        KC_COND_DESTROY(&runtime->work_cv);
         KC_MUTEX_DESTROY(&runtime->mu);
+        kc_doorbell_destroy(runtime->work_doorbell);
         free(runtime);
         return -ENOMEM;
     }
@@ -203,8 +207,8 @@ int kc_runtime_create(const kc_runtime_config *config, kc_runtime_t **out)
         kc_descriptor_runtime_destroy(runtime);
         kc_ticket_runtime_destroy(runtime);
         KC_COND_DESTROY(&runtime->lifecycle_cv);
-        KC_COND_DESTROY(&runtime->work_cv);
         KC_MUTEX_DESTROY(&runtime->mu);
+        kc_doorbell_destroy(runtime->work_doorbell);
         free(runtime);
         return -ENOMEM;
     }
@@ -213,8 +217,8 @@ int kc_runtime_create(const kc_runtime_config *config, kc_runtime_t **out)
         kc_descriptor_runtime_destroy(runtime);
         kc_ticket_runtime_destroy(runtime);
         KC_COND_DESTROY(&runtime->lifecycle_cv);
-        KC_COND_DESTROY(&runtime->work_cv);
         KC_MUTEX_DESTROY(&runtime->mu);
+        kc_doorbell_destroy(runtime->work_doorbell);
         free(runtime);
         return -ENOMEM;
     }
@@ -230,11 +234,33 @@ static void queue_locked(kc_runtime_t *runtime, koro_cont_t *cont)
     else runtime->head = cont;
     runtime->tail = cont;
     runtime->queued++;
-    KC_COND_SIGNAL(&runtime->work_cv);
+    kc_runtime_ring_work_internal(runtime, 0);
 }
 
-int kc_runtime_enqueue_internal(kc_runtime_t *runtime, koro_cont_t *cont,
-                                int from_state)
+void kc_runtime_ring_work_internal(kc_runtime_t *runtime, int all)
+{
+    if (!runtime) return;
+    if (all) kc_doorbell_ring_all(runtime->work_doorbell);
+    else kc_doorbell_ring_one(runtime->work_doorbell);
+}
+
+int kc_runtime_work_realtime_safe_internal(const kc_runtime_t *runtime)
+{
+    return runtime && kc_doorbell_realtime_safe(runtime->work_doorbell);
+}
+
+int kc_runtime_is_current_worker_internal(const kc_runtime_t *runtime)
+{
+    return runtime && current_worker_runtime == runtime;
+}
+
+int kc_runtime_is_current_cont_internal(const koro_cont_t *continuation)
+{
+    return continuation && current_worker_continuation == continuation;
+}
+
+int kc_runtime_enqueue_locked_internal(kc_runtime_t *runtime,
+                                       koro_cont_t *cont, int from_state)
 {
     if (!runtime || !cont) return 0;
     int expected = from_state;
@@ -243,19 +269,25 @@ int kc_runtime_enqueue_internal(kc_runtime_t *runtime, koro_cont_t *cont,
                                                  memory_order_acq_rel,
                                                  memory_order_acquire)) return 0;
     koro_cont_retain(cont);
-    KC_MUTEX_LOCK(&runtime->mu);
     if (from_state == KORO_WAITING && runtime->waiting) runtime->waiting--;
     queue_locked(runtime, cont);
-    KC_MUTEX_UNLOCK(&runtime->mu);
     return 1;
 }
 
-void kc_runtime_wake_internal(koro_cont_t *cont)
+int kc_runtime_enqueue_internal(kc_runtime_t *runtime, koro_cont_t *cont,
+                                int from_state)
+{
+    if (!runtime || !cont) return 0;
+    KC_MUTEX_LOCK(&runtime->mu);
+    int queued = kc_runtime_enqueue_locked_internal(runtime, cont, from_state);
+    KC_MUTEX_UNLOCK(&runtime->mu);
+    return queued;
+}
+
+void kc_runtime_wake_locked_internal(koro_cont_t *cont)
 {
     if (!cont || !cont->runtime) return;
     kc_runtime_t *runtime = cont->runtime;
-    atomic_fetch_add_explicit(&runtime->wake_requests, 1, memory_order_relaxed);
-    KC_MUTEX_LOCK(&runtime->mu);
     int state = atomic_load_explicit(&cont->run_state, memory_order_acquire);
     if (state == KORO_RUNNING) {
         atomic_store_explicit(&cont->wake_pending, 1, memory_order_release);
@@ -267,6 +299,15 @@ void kc_runtime_wake_internal(koro_cont_t *cont)
         koro_cont_retain(cont);
         queue_locked(runtime, cont);
     }
+}
+
+void kc_runtime_wake_internal(koro_cont_t *cont)
+{
+    if (!cont || !cont->runtime) return;
+    kc_runtime_t *runtime = cont->runtime;
+    atomic_fetch_add_explicit(&runtime->wake_requests, 1, memory_order_relaxed);
+    KC_MUTEX_LOCK(&runtime->mu);
+    kc_runtime_wake_locked_internal(cont);
     KC_MUTEX_UNLOCK(&runtime->mu);
 }
 
@@ -329,16 +370,28 @@ static void *worker_main(void *arg)
 {
     kc_runtime_t *runtime = arg;
     unsigned completion_streak = 0;
+    current_worker_runtime = runtime;
     for (;;) {
+        /* Observe before rechecking every protected predicate. A producer that
+         * publishes after this snapshot changes the sequence, so the eventual
+         * expected-value park returns immediately instead of losing the edge. */
+        uint32_t observed = kc_doorbell_observe(runtime->work_doorbell);
         KC_MUTEX_LOCK(&runtime->mu);
-        while (!runtime->head && !runtime->completion_head &&
-               !runtime->worker_stop) {
-            KC_COND_WAIT(&runtime->work_cv, &runtime->mu);
-        }
+        kc_service_runtime_drain_realtime_locked(runtime);
         if (runtime->worker_stop && !runtime->head &&
             !runtime->completion_head) {
             KC_MUTEX_UNLOCK(&runtime->mu);
+            current_worker_runtime = NULL;
             return NULL;
+        }
+        if (!runtime->head && !runtime->completion_head) {
+            KC_MUTEX_UNLOCK(&runtime->mu);
+            int status = kc_doorbell_wait(runtime->work_doorbell, observed, 0);
+            if (status == 0) continue;
+            /* The doorbell is released only after every worker has joined.
+             * Any other terminal wait error means the runtime cannot preserve
+             * zero-spin progress. Silently retiring would strand active work. */
+            abort();
         }
         kc_ticket_t *ticket = NULL;
         if (runtime->completion_head &&
@@ -369,9 +422,11 @@ static void *worker_main(void *arg)
         }
         atomic_store_explicit(&cont->wake_pending, 0, memory_order_release);
         cont->suspend_kind = KORO_SUSPEND_WAIT;
+        current_worker_continuation = cont;
         void *result = atomic_load_explicit(&cont->destroy_requested,
                                             memory_order_acquire)
             ? (void *)1 : koro_cont_step(cont);
+        current_worker_continuation = NULL;
         if (result || cont->completed) finish_cont(runtime, cont);
         else suspend_cont(runtime, cont);
         koro_cont_release_internal(cont);
@@ -397,8 +452,8 @@ int kc_runtime_start(kc_runtime_t *runtime)
     if (started != runtime->worker_count) {
         KC_MUTEX_LOCK(&runtime->mu);
         runtime->worker_stop = 1;
-        KC_COND_BROADCAST(&runtime->work_cv);
         KC_MUTEX_UNLOCK(&runtime->mu);
+        kc_runtime_ring_work_internal(runtime, 1);
         for (unsigned i = 0; i < started; i++) kc_port_thread_join(runtime->workers[i]);
         free(runtime->workers);
         runtime->workers = NULL;
@@ -421,48 +476,67 @@ int kc_runtime_spawn_internal(kc_runtime_t *runtime, kc_runtime_step_fn step,
                               void (*completion)(void *), void *context)
 {
     if (!runtime || !step) return -EINVAL;
-    KC_MUTEX_LOCK(&runtime->mu);
-    int accepting = runtime->accepting;
-    KC_MUTEX_UNLOCK(&runtime->mu);
-    if (!accepting) return -ECANCELED;
     koro_cont_t *cont = koro_cont_create_on(runtime, step, arg, local_size);
     if (!cont) return -ENOMEM;
     cont->managed = 1;
     cont->completion = completion;
     cont->completion_context = context;
+
+    /* Admission, active accounting, and NEW -> QUEUED are one transaction.
+     * Stop closes `accepting` under this same mutex; it can therefore happen
+     * wholly before this enqueue or wholly after it, never in the old gap
+     * between a stale accepting check and publication. */
     KC_MUTEX_LOCK(&runtime->mu);
+    if (!runtime->accepting) {
+        KC_MUTEX_UNLOCK(&runtime->mu);
+        koro_cont_release_internal(cont);
+        return -ECANCELED;
+    }
     cont->tracked = 1;
     runtime->active++;
-    KC_MUTEX_UNLOCK(&runtime->mu);
-    if (!kc_runtime_enqueue_internal(runtime, cont, KORO_NEW)) {
-        KC_MUTEX_LOCK(&runtime->mu);
+    if (!kc_runtime_enqueue_locked_internal(runtime, cont, KORO_NEW)) {
         cont->tracked = 0;
         runtime->active--;
         KC_MUTEX_UNLOCK(&runtime->mu);
-        koro_cont_destroy(cont);
+        koro_cont_release_internal(cont);
         return -EAGAIN;
     }
+    KC_MUTEX_UNLOCK(&runtime->mu);
     return 0;
 }
 
 int kc_runtime_run_until_idle(kc_runtime_t *runtime)
 {
     if (!runtime) return -EINVAL;
+    if (kc_runtime_is_current_worker_internal(runtime)) return -EDEADLK;
     int rc = kc_runtime_start(runtime);
     if (rc != 0) return rc;
-    KC_MUTEX_LOCK(&runtime->mu);
-    while ((runtime->queued || runtime->running || runtime->completion_queued ||
-            runtime->completion_running) && !runtime->legacy_break) {
-        KC_COND_WAIT(&runtime->lifecycle_cv, &runtime->mu);
+    for (;;) {
+        /* Realtime publishers do not take runtime->mu. Snapshot the work
+         * generation before converting their predicates into ready
+         * continuations, then verify that no edge crossed the final idle
+         * observation. This gives run_until_idle a real linearization point
+         * instead of returning ahead of an accepted callback edge. */
+        uint32_t observed = kc_doorbell_observe(runtime->work_doorbell);
+        KC_MUTEX_LOCK(&runtime->mu);
+        kc_service_runtime_drain_realtime_locked(runtime);
+        if ((runtime->queued || runtime->running ||
+             runtime->completion_queued || runtime->completion_running) &&
+            !runtime->legacy_break) {
+            KC_COND_WAIT(&runtime->lifecycle_cv, &runtime->mu);
+            KC_MUTEX_UNLOCK(&runtime->mu);
+            continue;
+        }
+        runtime->legacy_break = 0;
+        KC_MUTEX_UNLOCK(&runtime->mu);
+        if (kc_doorbell_observe(runtime->work_doorbell) == observed) return 0;
     }
-    runtime->legacy_break = 0;
-    KC_MUTEX_UNLOCK(&runtime->mu);
-    return 0;
 }
 
 int kc_runtime_join_all(kc_runtime_t *runtime)
 {
     if (!runtime) return -EINVAL;
+    if (kc_runtime_is_current_worker_internal(runtime)) return -EDEADLK;
     int rc = kc_runtime_start(runtime);
     if (rc != 0) return rc;
     KC_MUTEX_LOCK(&runtime->mu);
@@ -484,9 +558,10 @@ void kc_runtime_request_stop(kc_runtime_t *runtime)
     runtime->accepting = 0;
     runtime->stop_requested = 1;
     kc_ticket_runtime_stop_locked(runtime);
-    KC_COND_BROADCAST(&runtime->work_cv);
+    kc_service_runtime_stop_locked(runtime);
     KC_COND_BROADCAST(&runtime->lifecycle_cv);
     KC_MUTEX_UNLOCK(&runtime->mu);
+    kc_runtime_ring_work_internal(runtime, 1);
     for (;;) {
         KC_MUTEX_LOCK(&runtime->mu);
         kc_op *op = runtime->ops_head;
@@ -502,6 +577,7 @@ void kc_runtime_request_stop(kc_runtime_t *runtime)
 int kc_runtime_join(kc_runtime_t *runtime)
 {
     if (!runtime) return -EINVAL;
+    if (kc_runtime_is_current_worker_internal(runtime)) return -EDEADLK;
     KC_MUTEX_LOCK(&runtime->mu);
     if (runtime->active || runtime->queued || runtime->running ||
         runtime->live_tickets || runtime->completion_queued ||
@@ -516,8 +592,8 @@ int kc_runtime_join(kc_runtime_t *runtime)
         return 0;
     }
     runtime->worker_stop = 1;
-    KC_COND_BROADCAST(&runtime->work_cv);
     KC_MUTEX_UNLOCK(&runtime->mu);
+    kc_runtime_ring_work_internal(runtime, 1);
     for (unsigned i = 0; i < runtime->worker_count; i++) {
         kc_port_thread_join(runtime->workers[i]);
     }
@@ -538,6 +614,7 @@ int kc_runtime_destroy(kc_runtime_t *runtime)
     int busy = runtime->active || runtime->queued || runtime->running ||
                runtime->waiting || runtime->live_operations ||
                runtime->live_channels || runtime->live_scopes ||
+               runtime->live_services ||
                runtime->live_tickets || runtime->completion_queued ||
                runtime->completion_running ||
                (runtime->started && !runtime->joined);

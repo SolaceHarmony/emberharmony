@@ -1,6 +1,6 @@
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Barrier};
 use std::time::Duration;
 
 extern "C" {
@@ -50,5 +50,40 @@ fn cargo_links_zero_spin_expected_value_waits() {
     closing.join().unwrap();
 
     // SAFETY: registration is released and every waiter has joined.
+    unsafe { drop(Box::from_raw(word)) };
+}
+
+#[test]
+fn release_drains_every_operation_admitted_through_the_packed_gate() {
+    kcoro_sys::link_anchor();
+    let word = Box::into_raw(Box::new(0_u32));
+    let mut wait = std::ptr::null_mut();
+    assert_eq!(unsafe { kc_port_wait_u32_prepare(word, &mut wait) }, 0);
+
+    const WAITERS: usize = 32;
+    let start = Arc::new(Barrier::new(WAITERS + 1));
+    let (send, recv) = mpsc::channel();
+    let handles = (0..WAITERS)
+        .map(|_| {
+            let start = Arc::clone(&start);
+            let send = send.clone();
+            let handle = wait as usize;
+            std::thread::spawn(move || {
+                start.wait();
+                let result = unsafe { kc_port_wait_u32(handle as *mut c_void, 0, 0) };
+                send.send(result).unwrap();
+            })
+        })
+        .collect::<Vec<_>>();
+    drop(send);
+    start.wait();
+    std::thread::sleep(Duration::from_millis(20));
+    unsafe { kc_port_wait_u32_release(wait) };
+    for _ in 0..WAITERS {
+        assert_eq!(recv.recv_timeout(Duration::from_secs(2)).unwrap(), 0);
+    }
+    for handle in handles {
+        handle.join().unwrap();
+    }
     unsafe { drop(Box::from_raw(word)) };
 }

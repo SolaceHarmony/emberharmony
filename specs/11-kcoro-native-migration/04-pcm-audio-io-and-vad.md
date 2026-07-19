@@ -6,10 +6,12 @@ Baseline: EmberHarmony `321538f11749`.
 
 ## Goal
 
-Move local capture, playback, PCM storage, VAD, endpointing, barge-in, and frame
-clocking into the native session. After the hardware callback copies a device
-buffer into a preallocated native ring, PCM is passed only by retained spans and
-is mutated only in declared destination buffers.
+Keep local capture/playback callbacks and speech policy in Rust, but mount them
+on kcoro's callback-resumed docking substrate. After a hardware callback copies
+a complete device block into its preallocated retained reservation, PCM is
+passed to the native session only by generation-checked spans and is mutated
+only in declared destination buffers. Rust never owns model math or numerical
+progress; C++ never owns the platform device callback.
 
 The remote LiveKit provider is a separate product transport and is not an
 inference fallback. This design removes the Rust WebRTC loopback used as the
@@ -21,58 +23,33 @@ local model's audio device; it does not silently change remote-provider policy.
 |---|---|---|
 | `ExternalAudioInput` / writer | `crates/liquid-audio/src/runtime/voice_runtime.rs:85-132` | Native capture adapter writes directly into native ring. |
 | `ExternalAudioOutput` | `voice_runtime.rs:94-160` | Native playback adapter drains native ring. |
-| `PcmRing` | `voice_runtime.rs:163-282` | Segmented fixed SPSC PCM region with generation-protected spans. |
+| `PcmRing` | `voice_runtime.rs:163-282` | Rust-owned segmented SPSC PCM region with generation-protected spans and kcoro doorbell. |
 | `PlaybackReference` | `voice_runtime.rs:284-341` | Native playback/echo-reference state updated by actual playback callback. |
 | `PlaybackOutput` / `OutputSink` | `voice_runtime.rs:343-419` | One native output owner, with platform adapter selected at session start. |
 | Consumer/output threads | `voice_runtime.rs:421-449`, `1040-1343` | Native notification and playback continuations; no Rust worker. |
 | `VoiceRuntime::interrupt` | `voice_runtime.rs:740-748` | Epoch doorbell plus native playback flush. |
-| Turn VAD | `voice_runtime.rs:1344-1596` | Native `TurnDetector` continuation reading retained ring windows. |
-| Frame clock/resampler | `voice_runtime.rs:1599-1775` | Native frame assembler and resampler writing fixed model-frame slots. |
-| CPAL callbacks | `voice_runtime.rs:1820-2000` | Native platform-specific callback adapter. |
+| Turn VAD | `voice_runtime.rs:1344-1596` | Fixed Rust `TurnDetector` continuation reading retained ring windows; commits only descriptors. |
+| Frame clock/resampler | `voice_runtime.rs:1599-1775` | Rust frame-dock continuation; numerical resampling remains a typed native pass. |
+| CPAL callbacks | `voice_runtime.rs:1820-2000` | Rust platform callback writing retained reservations and ringing kcoro. |
 | Desktop local WebRTC output | `packages/desktop/src-tauri/src/voice/runtime.rs:2965-3155` | Remove from local model path. |
 | Desktop local WebRTC input | `voice/runtime.rs:3158-3419` | Remove from local model path. |
 
-The current implementation is not payload-zero-copy. `PcmRing::drain_into`
-pushes into a `Vec` (`voice_runtime.rs:254-260`), VAD slices new utterance vectors
-(`1511`, `1542-1556`), frame mode creates a new vector per model frame
-(`1663-1686`), and external output drains into a new vector (`263-276`).
+The current implementation is not yet payload-zero-copy. Callback publication
+is block-atomic and wakes consumers through kcoro's expected-value doorbell;
+there is no Crossbeam wake token or timed progress heartbeat. Playback now
+borrows the ring's one or two readable spans directly, but `PcmRing::drain_into`
+still pushes capture into a `Vec`, VAD slices new utterance vectors, and frame
+mode creates a new vector per model frame. Those remaining payload owners
+disappear when capture callbacks write retained block reservations.
 
 ## Platform Adapter Boundary
 
-Define a native C++ platform interface, implemented inside the native library:
-
-```c++
-struct AudioFormat {
-    uint32_t sample_rate;
-    uint16_t channels;
-    SampleFormat format;
-    uint16_t frames_per_callback;
-};
-
-class AudioDevice {
-public:
-    virtual ~AudioDevice() = default;
-    virtual AudioCapabilities capabilities() const noexcept = 0;
-    virtual Status open(const AudioDeviceConfig &, CaptureSink *, PlaybackSource *) = 0;
-    virtual Status start() = 0;
-    virtual void request_stop() noexcept = 0;
-    virtual Status join() = 0;
-};
-```
-
-The virtual calls occur only at device lifecycle boundaries. Hardware callbacks
-call fixed nonvirtual sink/source functions. Platform files live under:
-
-```text
-native/src/platform/audio_device.h
-native/src/platform/macos/coreaudio_device.mm
-native/src/platform/linux/pipewire_device.cpp
-native/src/platform/windows/wasapi_device.cpp
-```
-
-Only implemented platform adapters are advertised through capability bits. A
-platform build with no local audio adapter may still expose model APIs for an
-explicit native transport adapter, but Tauri local voice start fails clearly.
+Rust owns the platform APIs (WebRTC/PlatformAudio today, CPAL fallback where
+enabled) and one non-cloneable producer endpoint per device stream. The endpoint
+reserves a stable PCM block, converts/downmixes directly into it, publishes one
+descriptor, rings `kc_doorbell`, and returns. Device objects, framework callback
+types, and temporary device pointers never cross the C ABI. C++ sees only the
+validated span record and its ticket/epoch.
 
 Echo cancellation, noise suppression, and gain control are capabilities, not
 assumptions. The current desktop code configures WebRTC audio processing at
@@ -156,9 +133,9 @@ Playback callback:
 5. Wake a blocked producer only when crossing a configured free-space threshold.
 6. Return.
 
-Callbacks may not call kcoro, allocate, lock a contended mutex, emit Tauri
-events, run VAD, resample, or enter the model. They only copy/convert and ring a
-realtime-safe doorbell.
+Callbacks may not allocate, lock, emit Tauri events, run VAD, resample, enter
+the model, or invoke a continuation directly. Their sole kcoro operation is the
+realtime-safe doorbell ring after publishing the block.
 
 The current CPAL callback behavior at `voice_runtime.rs:1842-1855` and
 `1906-1984` is the semantic reference for format conversion, underrun accounting,
@@ -303,10 +280,16 @@ space/drained edges from the playback owner.
 
 These edges use document 09's zero-spin wait-word contract. A waiter reads the
 ring generation once, registers/rechecks, and blocks. The hardware callback
-only publishes cursors/generation and rings the platform doorbell; it does not
-enter kcoro or invoke a ticket callback. A complete utterance/frame creates one
-parent action ticket, and each model/codec pass reports readiness through the
-native completion path in documents 03 and 12.
+only publishes cursors/generation and invokes its setup-time retained
+`kc_service_notifier` edge. That edge is a lock-free generation publication and
+direct address wake; it never runs the continuation inline, allocates, takes the
+runtime mutex, or invokes a ticket callback. Hosts without that direct wake
+backend fail microphone setup rather than falling back to a pthread wake in the
+hardware callback. The runtime worker drains a fixed quota. If the ring remains
+ready, `kc_service_ready_again` requeues that exact continuation after it yields,
+without a timer, mutex, external edge, or wait-word syscall. A complete
+utterance/frame creates one parent action ticket, and each model/codec pass
+reports readiness through the native completion path in documents 03 and 12.
 
 ## Implementation Map
 
@@ -316,19 +299,21 @@ native completion path in documents 03 and 12.
    duplicate model of it.
 3. Port stats and playback reference semantics from
    `voice_runtime.rs:284-341`, `533-580`, and `1877-2000`.
-4. Port turn VAD as a native continuation; compare endpoint and barge-in traces
-   against the current Rust implementation on recorded fixtures.
+4. Mount turn VAD as a fixed Rust docking continuation; compare endpoint and
+   barge-in traces against recorded fixtures.
 5. Add the candidate parent/decision operation, candidate-epoch check, and
    frontend/prefill child-ticket join before enabling speculative prepare.
-6. Port frame assembler/resampler behavior from `voice_runtime.rs:1599-1775`.
-7. Mount a native platform adapter and prove AEC/echo behavior in the actual
-   desktop app.
+6. Make the Rust frame assembler publish retained descriptors and mount
+   resampling as a typed native pass.
+7. Prove the Rust WebRTC/PlatformAudio callback dock and AEC/echo behavior in
+   the actual desktop app.
 8. Replace `start_local_webrtc_input` and `start_local_webrtc_output` calls at
    `packages/desktop/src-tauri/src/voice/runtime.rs:2339-2340`.
 9. Remove local WebRTC loopback helpers at `runtime.rs:2965-3419` from the local
    provider path.
-10. Remove `ExternalAudioInput`, `ExternalAudioOutput`, `PcmRing`, `vad_loop`,
-   `frame_loop`, `spawn_consumer`, and CPAL product code after app gates pass.
+10. Remove the transitional sample ring, `Vec` accumulators, worker channels,
+   and compatibility audio events after retained-block app gates pass. Keep the
+   Rust platform adapter and fixed VAD/frame docking continuations.
 11. Keep remote LiveKit code isolated under its provider boundary; it cannot be a
     fallback for local model audio.
 
@@ -339,8 +324,9 @@ native completion path in documents 03 and 12.
 - An utterance crossing ring wrap is processed from retained spans without
   concatenation.
 - Stale generation, overrun, underrun, and lease exhaustion fail deterministically.
-- No allocation, blocking mutex, kcoro call, or Tauri callback occurs on an audio
-  callback thread.
+- No allocation, blocking mutex, continuation execution, ticket callback, or
+  Tauri callback occurs on an audio callback thread; its only kcoro operation is
+  the retained notifier's lock-free publication/wake edge.
 - Turn endpoint traces match the current configured behavior on silence, false
   pause, short utterance, long utterance, and barge-in fixtures.
 - In 100,000 commit/resume/child-complete/stop races, one candidate decision

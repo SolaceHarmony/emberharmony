@@ -23,6 +23,7 @@
 #include "lfm_frontend.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <climits>
 #include <cmath>
@@ -49,9 +50,11 @@ int lfm_rowstat_f32(const float *x, uint64_t rows, uint64_t cols, uint64_t valid
 void lfm_norm_apply_f32(float *x, const float *mean, const float *std,
                         uint64_t rows, uint64_t cols);
 void lfm_f32_to_bf16(const float *input, uint16_t *output, int count);
-void lfm_resample_conv_f64(const double *padded, uint64_t padded_len,
-                           const double *kernels, uint64_t phases, uint64_t klen,
-                           uint64_t stride, float *out, uint64_t max_values);
+void lfm_resample_conv_f32(const float *input, uint64_t input_len,
+                           const double *kernels, uint64_t phases,
+                           uint64_t stride, uint64_t width,
+                           uint64_t first_value, float *out,
+                           uint64_t value_count);
 }
 
 namespace {
@@ -118,11 +121,19 @@ struct LfmResampler {
 };
 
 struct LfmResamplerWorkspace {
-    std::mutex lock;
-    double *padded = nullptr;
-    uint64_t capacity = 0;
+    // An admission watermark, not numerical storage. The resampler reads the
+    // caller's f32 span directly and treats samples outside it as logical zero.
+    std::atomic<uint64_t> capacity{0};
+};
 
-    ~LfmResamplerWorkspace() { std::free(padded); }
+struct LfmResamplerStream {
+    std::mutex lock;
+    uint64_t orig = 0;
+    uint64_t phases = 0;
+    uint64_t capacity = 0;
+    uint64_t phase = 0;
+    float previous = 0.0f;
+    bool ready = false;
 };
 
 namespace {
@@ -356,11 +367,18 @@ bool resampler_out_length(const LfmResampler &r, uint64_t length,
     return add_u64(base, extra, out);
 }
 
-bool resampler_padded_length(const LfmResampler &r, uint64_t length,
-                             uint64_t *out) {
-    uint64_t edges = 0;
-    return add_u64(2 * r.width, r.orig, &edges) &&
-           add_u64(length, edges, out);
+bool resampler_stream_length(uint64_t orig, uint64_t phases, uint64_t phase,
+                             uint64_t length, uint64_t *out) {
+    if (orig == 0 || phases == 0 || phase >= orig || !out) {
+        return false;
+    }
+    uint64_t scaled = 0;
+    if (!mul_u64(length, phases, &scaled) ||
+        !add_u64(phase, scaled, &scaled)) {
+        return false;
+    }
+    *out = scaled / orig;
+    return true;
 }
 
 } // namespace
@@ -697,18 +715,16 @@ extern "C" int lfm_resampler_workspace_reserve(
     uint64_t max_sample_count) {
     if (!resampler || !workspace) return -EINVAL;
     if (resampler->orig_freq == resampler->new_freq) return 0;
-    uint64_t padded_len = 0;
-    if (!resampler_padded_length(*resampler, max_sample_count, &padded_len) ||
-        padded_len > std::numeric_limits<size_t>::max() / sizeof(double)) {
+    if (max_sample_count >
+        std::numeric_limits<uint64_t>::max() - resampler->width) {
         return -EOVERFLOW;
     }
-    std::lock_guard<std::mutex> guard(workspace->lock);
-    if (workspace->capacity >= padded_len) return 0;
-    double *next = (double *)std::malloc((size_t)padded_len * sizeof(double));
-    if (!next) return -ENOMEM;
-    std::free(workspace->padded);
-    workspace->padded = next;
-    workspace->capacity = padded_len;
+    uint64_t capacity = workspace->capacity.load(std::memory_order_relaxed);
+    while (capacity < max_sample_count &&
+           !workspace->capacity.compare_exchange_weak(
+               capacity, max_sample_count, std::memory_order_release,
+               std::memory_order_relaxed)) {
+    }
     return 0;
 }
 
@@ -732,30 +748,128 @@ extern "C" int lfm_resampler_process(
         return 0;
     }
     if (!destination || destination_capacity < target) return -EINVAL;
-
-    uint64_t padded_len = 0;
-    if (!resampler_padded_length(*resampler, sample_count, &padded_len)) {
+    if (workspace->capacity.load(std::memory_order_acquire) < sample_count) {
+        return -ENOBUFS;
+    }
+    if (sample_count >
+        std::numeric_limits<uint64_t>::max() - resampler->width) {
         return -EOVERFLOW;
     }
-    std::lock_guard<std::mutex> guard(workspace->lock);
-    if (workspace->capacity < padded_len) return -ENOBUFS;
-    double *padded = workspace->padded;
-    if (resampler->width > 0) {
-        std::memset(padded, 0, (size_t)resampler->width * sizeof(double));
+    if (sample_count > UINTPTR_MAX / sizeof(float) ||
+        target > UINTPTR_MAX / sizeof(float)) {
+        return -EOVERFLOW;
     }
-    for (uint64_t i = 0; i < sample_count; ++i) {
-        padded[resampler->width + i] = (double)input[i];
+    const uintptr_t input_begin = reinterpret_cast<uintptr_t>(input);
+    const uintptr_t output_begin = reinterpret_cast<uintptr_t>(destination);
+    const uintptr_t input_bytes =
+        static_cast<uintptr_t>(sample_count * sizeof(float));
+    const uintptr_t output_bytes =
+        static_cast<uintptr_t>(target * sizeof(float));
+    if (input_begin > UINTPTR_MAX - input_bytes ||
+        output_begin > UINTPTR_MAX - output_bytes) {
+        return -EOVERFLOW;
     }
-    const uint64_t suffix = resampler->width + resampler->orig;
-    if (suffix > 0) {
-        std::memset(padded + resampler->width + sample_count, 0,
-                    (size_t)suffix * sizeof(double));
+    if (input_begin < output_begin + output_bytes &&
+        output_begin < input_begin + input_bytes) {
+        return -EINVAL;
     }
-    lfm_resample_conv_f64(
-        padded, padded_len, resampler->kernels, resampler->phases,
-        resampler->kernel_len, resampler->orig, destination, target);
+    lfm_resample_conv_f32(input, sample_count, resampler->kernels,
+                          resampler->phases, resampler->orig,
+                          resampler->width, 0, destination, target);
     result->data = destination;
     result->length = target;
+    return 0;
+}
+
+extern "C" int lfm_resampler_stream_create(
+    uint32_t orig_freq, uint32_t new_freq, uint64_t max_sample_count,
+    LfmResamplerStream **out) {
+    if (orig_freq == 0 || new_freq == 0 || max_sample_count == 0 || !out) {
+        return -EINVAL;
+    }
+    *out = nullptr;
+    LfmResamplerStream *stream = new (std::nothrow) LfmResamplerStream();
+    if (!stream) return -ENOMEM;
+    uint64_t gcd = orig_freq;
+    uint64_t divisor = new_freq;
+    while (divisor != 0) {
+        const uint64_t next = gcd % divisor;
+        gcd = divisor;
+        divisor = next;
+    }
+    stream->orig = orig_freq / gcd;
+    stream->phases = new_freq / gcd;
+    stream->capacity = max_sample_count;
+    stream->phase = stream->orig - 1;
+    *out = stream;
+    return 0;
+}
+
+extern "C" int lfm_resampler_stream_destroy(LfmResamplerStream *stream) {
+    if (!stream) return -EINVAL;
+    delete stream;
+    return 0;
+}
+
+extern "C" void lfm_resampler_stream_reset(LfmResamplerStream *stream) {
+    if (!stream) return;
+    std::lock_guard<std::mutex> guard(stream->lock);
+    stream->phase = stream->orig - 1;
+    stream->previous = 0.0f;
+    stream->ready = false;
+}
+
+extern "C" int lfm_resampler_stream_out_length(
+    LfmResamplerStream *stream, uint64_t sample_count,
+    uint64_t *out_length) {
+    if (!stream || !out_length) return -EINVAL;
+    std::lock_guard<std::mutex> guard(stream->lock);
+    if (sample_count > stream->capacity) return -ENOBUFS;
+    return resampler_stream_length(stream->orig, stream->phases, stream->phase,
+                                   sample_count, out_length)
+               ? 0
+               : -EOVERFLOW;
+}
+
+extern "C" int lfm_resampler_stream_process(
+    LfmResamplerStream *stream, const float *input, uint64_t sample_count,
+    float *destination, uint64_t destination_capacity,
+    LfmF32Span *result) {
+    if (!stream || !result || (!input && sample_count != 0)) return -EINVAL;
+    result->data = nullptr;
+    result->length = 0;
+    std::lock_guard<std::mutex> guard(stream->lock);
+    if (sample_count > stream->capacity) return -ENOBUFS;
+    uint64_t target = 0;
+    if (!resampler_stream_length(stream->orig, stream->phases, stream->phase,
+                                 sample_count, &target)) {
+        return -EOVERFLOW;
+    }
+    if (target != 0 && (!destination || destination_capacity < target)) {
+        return -ENOBUFS;
+    }
+
+    uint64_t written = 0;
+    for (uint64_t index = 0; index < sample_count; ++index) {
+        const float sample = input[index];
+        const float previous = stream->ready ? stream->previous : sample;
+        const uint64_t phase = stream->phase;
+        const uint64_t total = phase + stream->phases;
+        const uint64_t count = total / stream->orig;
+        for (uint64_t output = 1; output <= count; ++output) {
+            const uint64_t numerator = output * stream->orig - phase;
+            const float fraction = static_cast<float>(numerator) /
+                                   static_cast<float>(stream->phases);
+            destination[written++] =
+                previous + (sample - previous) * fraction;
+        }
+        stream->phase = total % stream->orig;
+        stream->previous = sample;
+        stream->ready = true;
+    }
+    if (written != target) return -EFAULT;
+    result->data = destination;
+    result->length = written;
     return 0;
 }
 

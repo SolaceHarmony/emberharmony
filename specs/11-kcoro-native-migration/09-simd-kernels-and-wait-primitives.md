@@ -15,8 +15,9 @@ four physical workers preserve the eight-way logical fold with parity. The
 zero-spin gate remains green.
 The bounded production audio route now uses that continuation across
 `TOKEN_PASS -> DEPTH_FRAME -> MIMI_DECODE`: playback is reserved before
-admission, token context commits on its CQ, Mimi writes directly into the
-reserved PCM span, and the exact slot is released before reliable publication.
+admission, token context commits on its CQ, and Mimi writes direct at equal rate
+or feeds a prepared native resampler that writes the reserved device-rate PCM
+span. The exact slot is released before reliable publication.
 This bounded implementation takes a route-exclusive producer lease and prepares
 all three immutable descriptors before the first SQ publication; its CQ callback
 does not acquire the submission or descriptor mutex. Peer admission is deferred
@@ -68,10 +69,13 @@ Fix the compute substrate for every native stage in documents 03 through 07:
 The new boundary replaces concrete production work rather than adding another
 native helper below it:
 
-Two substrate debts in the original audit are now closed. Vendor commit
-`8d510f83` pins arena `bd530f4c9196`, which separates signal-one `work_cv` from
-lifecycle notification at
-`crates/kcoro-sys/vendor/kcoro_arena/core/src/kc_runtime.c:225-324`.
+Two substrate debts in the original audit are now closed. Kcoro worker progress
+uses one runtime-owned expected-value doorbell: a worker observes its generation,
+rechecks the protected queues and retained-service predicates, then parks on that
+exact value. `lifecycle_cv` remains administration-only. A retained
+`kc_service_notifier` publishes a callback edge without allocation, a mutex, a
+deadline, or invoking the callback; creation rejects the pthread fallback, and
+its lifetime lease prevents service destruction until the producer is quiescent.
 Flashkern commit `d2c43abd` introduced shared dispatch/fence words and prepared
 `kc_port_wait_u32` handles at
 `native/src/engine/flashkern_engine.cpp:634-662` and `1041-1052`;
@@ -249,7 +253,9 @@ coordination work   one ready permit -> signal one kcoro worker
 fixed compute       generation unchanged -> register/recheck -> block wait word
 ```
 
-Neither canonical path has a spin tier. `PAUSE`, `YIELD`, repeated-load budgets,
+The coordination signal is the same expected-value doorbell used by the
+realtime notifier, not a condition-variable bridge. Neither canonical path has
+a spin tier. `PAUSE`, `YIELD`, repeated-load budgets,
 and timed polling are absent from the generated native wait code. A future
 capability-selected `LDXR`/`WFE` or `UMONITOR`/`UMWAIT` backend is a park
 implementation, not a pre-park budget; it is disabled unless it beats the OS

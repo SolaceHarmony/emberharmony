@@ -100,11 +100,13 @@ LFM_SYM(lfm_bf16_unlift_bits):
     lsl     w0, w0, #16
     ret
 
-.macro LFM_RNE_WIDEN source, target, bits, tie
+// `bias` is an explicit operand: callers may choose any scratch register, and
+// no macro expansion silently depends on a leaf-global w14 convention.
+.macro LFM_RNE_WIDEN source, target, bits, tie, bias
     fmov    \bits, \source
     lsr     \tie, \bits, #16
     and     \tie, \tie, #1
-    add     \bits, \bits, w14
+    add     \bits, \bits, \bias
     add     \bits, \bits, \tie
     lsr     \bits, \bits, #16
     lsl     \bits, \bits, #16
@@ -138,27 +140,248 @@ LFM_SYM(lfm_bf16_rope_neox):
     fmov    s3, w11
 
     fmul    s4, s0, s2
-    LFM_RNE_WIDEN s4, s4, w12, w13
+    LFM_RNE_WIDEN s4, s4, w12, w13, w14
     fneg    s5, s1
     fmul    s5, s5, s3
-    LFM_RNE_WIDEN s5, s5, w12, w13
+    LFM_RNE_WIDEN s5, s5, w12, w13, w14
     fadd    s4, s4, s5
-    LFM_RNE_WIDEN s4, s4, w12, w13
+    LFM_RNE_WIDEN s4, s4, w12, w13, w14
     lsr     w12, w12, #16
     strh    w12, [x0], #2
 
     fmul    s4, s1, s2
-    LFM_RNE_WIDEN s4, s4, w12, w13
+    LFM_RNE_WIDEN s4, s4, w12, w13, w14
     fmul    s5, s0, s3
-    LFM_RNE_WIDEN s5, s5, w12, w13
+    LFM_RNE_WIDEN s5, s5, w12, w13, w14
     fadd    s4, s4, s5
-    LFM_RNE_WIDEN s4, s4, w12, w13
+    LFM_RNE_WIDEN s4, s4, w12, w13, w14
     lsr     w12, w12, #16
     strh    w12, [x5], #2
 
     subs    x4, x4, #1
     b.ne    1b
 3:
+    ret
+
+// Decode projection superkernel. Four checkpoint rows share each activation
+// load while eight accumulators preserve gemm_nt_impl's per-row arithmetic
+// order. Both logical BF16 RNE boundaries remain register operations and only
+// terminal output is published.
+//
+// ABI: x0 input bytes, x1 checkpoint weight bytes, x2 residual bytes,
+//      x3 output bf16, x4 output rows, x5 reduction depth.
+// All source views tolerate byte-unaligned starts. v8-v15 are untouched, so the
+// leaf needs no frame and has no intermediate stores.
+.p2align 2
+.globl LFM_SYM(lfm_bf16_gemv_rne_bf16)
+LFM_PRIVATE(LFM_SYM(lfm_bf16_gemv_rne_bf16))
+LFM_SYM(lfm_bf16_gemv_rne_bf16):
+    // Adapt the five-argument no-residual ABI to the shared six-register body.
+    mov     x5, x4
+    mov     x4, x3
+    mov     x3, x2
+    mov     x2, xzr
+    b       .Lgemv_rne_body
+
+.p2align 2
+.globl LFM_SYM(lfm_bf16_gemv_rne_add_bf16)
+LFM_PRIVATE(LFM_SYM(lfm_bf16_gemv_rne_add_bf16))
+LFM_SYM(lfm_bf16_gemv_rne_add_bf16):
+.Lgemv_rne_body:
+    cbz     x4, 99f
+    cbz     x5, 99f
+    lsl     x6, x5, #1
+    lsr     x14, x4, #2
+    and     x4, x4, #3
+    mov     w15, #0x7fff
+    cbz     x14, 20f
+
+10: // Four output rows, eight accumulators, one activation stream.
+    mov     x7, x1
+    add     x8, x7, x6
+    add     x9, x8, x6
+    add     x10, x9, x6
+    mov     x11, x0
+    lsr     x12, x5, #3
+    and     x13, x5, #7
+    movi    v0.4s, #0
+    movi    v1.4s, #0
+    movi    v2.4s, #0
+    movi    v3.4s, #0
+    movi    v4.4s, #0
+    movi    v5.4s, #0
+    movi    v6.4s, #0
+    movi    v7.4s, #0
+    cbz     x12, 12f
+
+11: // One activation load feeds four immutable checkpoint rows.
+    ldr     q16, [x11], #16
+    ldr     q19, [x7], #16
+    ldr     q22, [x8], #16
+    ldr     q25, [x9], #16
+    ldr     q28, [x10], #16
+    shll    v17.4s, v16.4h, #16
+    shll2   v18.4s, v16.8h, #16
+    shll    v20.4s, v19.4h, #16
+    shll2   v21.4s, v19.8h, #16
+    fmla    v0.4s, v17.4s, v20.4s
+    fmla    v1.4s, v18.4s, v21.4s
+    shll    v23.4s, v22.4h, #16
+    shll2   v24.4s, v22.8h, #16
+    fmla    v2.4s, v17.4s, v23.4s
+    fmla    v3.4s, v18.4s, v24.4s
+    shll    v26.4s, v25.4h, #16
+    shll2   v27.4s, v25.8h, #16
+    fmla    v4.4s, v17.4s, v26.4s
+    fmla    v5.4s, v18.4s, v27.4s
+    shll    v29.4s, v28.4h, #16
+    shll2   v30.4s, v28.8h, #16
+    fmla    v6.4s, v17.4s, v29.4s
+    fmla    v7.4s, v18.4s, v30.4s
+    subs    x12, x12, #1
+    b.ne    11b
+
+12: // Match vaddvq_f32(vaddq_f32(low, high)) for every row.
+    fadd    v0.4s, v0.4s, v1.4s
+    faddp   v0.4s, v0.4s, v0.4s
+    faddp   s0, v0.2s
+    fadd    v2.4s, v2.4s, v3.4s
+    faddp   v2.4s, v2.4s, v2.4s
+    faddp   s2, v2.2s
+    fadd    v4.4s, v4.4s, v5.4s
+    faddp   v4.4s, v4.4s, v4.4s
+    faddp   s4, v4.2s
+    fadd    v6.4s, v6.4s, v7.4s
+    faddp   v6.4s, v6.4s, v6.4s
+    faddp   s6, v6.2s
+    cbz     x13, 14f
+
+13: // Scalar K tail remains after the vector reduction, as in production.
+    ldrh    w16, [x11], #2
+    lsl     w16, w16, #16
+    fmov    s16, w16
+    ldrh    w17, [x7], #2
+    lsl     w17, w17, #16
+    fmov    s17, w17
+    fmadd   s0, s16, s17, s0
+    ldrh    w17, [x8], #2
+    lsl     w17, w17, #16
+    fmov    s17, w17
+    fmadd   s2, s16, s17, s2
+    ldrh    w17, [x9], #2
+    lsl     w17, w17, #16
+    fmov    s17, w17
+    fmadd   s4, s16, s17, s4
+    ldrh    w17, [x10], #2
+    lsl     w17, w17, #16
+    fmov    s17, w17
+    fmadd   s6, s16, s17, s6
+    subs    x13, x13, #1
+    b.ne    13b
+
+14: // Pack four dots and perform both RNE stages entirely in registers.
+    mov     v16.s[0], v0.s[0]
+    mov     v16.s[1], v2.s[0]
+    mov     v16.s[2], v4.s[0]
+    mov     v16.s[3], v6.s[0]
+    ushr    v17.4s, v16.4s, #16
+    movi    v18.4s, #1
+    and     v17.16b, v17.16b, v18.16b
+    dup     v18.4s, w15
+    add     v16.4s, v16.4s, v17.4s
+    add     v16.4s, v16.4s, v18.4s
+    ushr    v16.4s, v16.4s, #16
+    shl     v16.4s, v16.4s, #16
+    cbz     x2, 15f
+    ldr     d17, [x2], #8
+    shll    v17.4s, v17.4h, #16
+    fadd    v16.4s, v16.4s, v17.4s
+    ushr    v17.4s, v16.4s, #16
+    movi    v18.4s, #1
+    and     v17.16b, v17.16b, v18.16b
+    dup     v18.4s, w15
+    add     v16.4s, v16.4s, v17.4s
+    add     v16.4s, v16.4s, v18.4s
+    ushr    v16.4s, v16.4s, #16
+    xtn     v16.4h, v16.4s
+    str     d16, [x3], #8
+    b       16f
+15:
+    ushr    v16.4s, v16.4s, #16
+    xtn     v16.4h, v16.4s
+    str     d16, [x3], #8
+
+16:
+    add     x1, x1, x6, lsl #2
+    subs    x14, x14, #1
+    b.ne    10b
+
+20: // N%4 tail: the same arithmetic and terminal-store-only contract.
+    cbz     x4, 99f
+21:
+    mov     x7, x1
+    mov     x11, x0
+    lsr     x12, x5, #3
+    and     x13, x5, #7
+    movi    v0.4s, #0
+    movi    v1.4s, #0
+    cbz     x12, 23f
+22:
+    ldr     q16, [x11], #16
+    ldr     q19, [x7], #16
+    shll    v17.4s, v16.4h, #16
+    shll2   v18.4s, v16.8h, #16
+    shll    v20.4s, v19.4h, #16
+    shll2   v21.4s, v19.8h, #16
+    fmla    v0.4s, v17.4s, v20.4s
+    fmla    v1.4s, v18.4s, v21.4s
+    subs    x12, x12, #1
+    b.ne    22b
+23:
+    fadd    v0.4s, v0.4s, v1.4s
+    faddp   v0.4s, v0.4s, v0.4s
+    faddp   s0, v0.2s
+    cbz     x13, 25f
+24:
+    ldrh    w16, [x11], #2
+    ldrh    w17, [x7], #2
+    lsl     w16, w16, #16
+    lsl     w17, w17, #16
+    fmov    s16, w16
+    fmov    s17, w17
+    fmadd   s0, s16, s17, s0
+    subs    x13, x13, #1
+    b.ne    24b
+25:
+    fmov    w16, s0
+    lsr     w17, w16, #16
+    and     w17, w17, #1
+    add     w16, w16, w15
+    add     w16, w16, w17
+    lsr     w17, w16, #16
+    cbz     x2, 26f
+    lsl     w18, w17, #16
+    fmov    s16, w18
+    ldrh    w18, [x2], #2
+    lsl     w18, w18, #16
+    fmov    s17, w18
+    fadd    s16, s16, s17
+    fmov    w16, s16
+    lsr     w17, w16, #16
+    and     w17, w17, #1
+    add     w16, w16, w15
+    add     w16, w16, w17
+    lsr     w17, w16, #16
+    strh    w17, [x3], #2
+    b       27f
+26:
+    strh    w17, [x3], #2
+27:
+    mov     x1, x7
+    subs    x4, x4, #1
+    b.ne    21b
+
+99:
     ret
 
 #if !defined(__APPLE__)

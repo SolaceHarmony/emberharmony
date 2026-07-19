@@ -57,11 +57,14 @@ int kc_runtime_create(const kc_runtime_config *config, kc_runtime_t **out);
 int kc_runtime_start(kc_runtime_t *runtime);
 int kc_runtime_spawn(kc_runtime_t *runtime, kc_runtime_step_fn step,
                      void *arg, size_t local_size);
-/* Wait until no work is runnable. Parked continuations may remain active. */
+/* Wait until no work is runnable. Parked continuations may remain active.
+ * Returns -EDEADLK from a callback executing on this runtime. */
 int kc_runtime_run_until_idle(kc_runtime_t *runtime);
-/* Wait until tracked continuations and all operation leases are released. */
+/* Wait until tracked continuations and all operation leases are released.
+ * Returns -EDEADLK from a callback executing on this runtime. */
 int kc_runtime_join_all(kc_runtime_t *runtime);
 void kc_runtime_request_stop(kc_runtime_t *runtime);
+/* Returns -EDEADLK from a callback executing on this runtime. */
 int kc_runtime_join(kc_runtime_t *runtime);
 int kc_runtime_destroy(kc_runtime_t *runtime);
 int kc_runtime_snapshot_get(kc_runtime_t *runtime, kc_runtime_snapshot *out);

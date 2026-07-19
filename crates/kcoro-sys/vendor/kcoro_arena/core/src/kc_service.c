@@ -271,6 +271,39 @@ int kc_service_notifier_destroy(kc_service_notifier_t *notifier)
     return 0;
 }
 
+int kc_service_ready_again(kc_service_t *service)
+{
+    if (!service) return -EINVAL;
+    if (!kc_runtime_is_current_cont_internal(service->continuation))
+        return -EPERM;
+
+    /* Use the same packed admission gate as the realtime producer edge, so a
+     * local reschedule linearizes cleanly against stop. Unlike an external
+     * notification, the current continuation needs no doorbell: publishing
+     * wake_pending before releasing the admission lease makes suspend_cont
+     * requeue it directly after this bounded callback returns. */
+    unsigned gate = atomic_load_explicit(&service->realtime_gate,
+                                         memory_order_acquire);
+    for (;;) {
+        if (gate & KC_SERVICE_RT_CLOSED) return -ECANCELED;
+        if ((gate & KC_SERVICE_RT_COUNT) == KC_SERVICE_RT_COUNT)
+            return -EAGAIN;
+        if (atomic_compare_exchange_weak_explicit(
+                &service->realtime_gate, &gate, gate + 1,
+                memory_order_acquire, memory_order_acquire)) break;
+    }
+
+    atomic_fetch_add_explicit(&service->notifications, 1,
+                              memory_order_release);
+    atomic_fetch_add_explicit(&service->runtime->wake_requests, 1,
+                              memory_order_relaxed);
+    atomic_store_explicit(&service->continuation->wake_pending, 1,
+                          memory_order_release);
+    atomic_fetch_sub_explicit(&service->realtime_gate, 1,
+                              memory_order_release);
+    return 0;
+}
+
 void kc_service_request_stop(kc_service_t *service)
 {
     if (!service) return;
@@ -283,6 +316,7 @@ int kc_service_join(kc_service_t *service)
 {
     if (!service) return -EINVAL;
     kc_runtime_t *runtime = service->runtime;
+    if (kc_runtime_is_current_worker_internal(runtime)) return -EDEADLK;
     KC_MUTEX_LOCK(&runtime->mu);
     unsigned phase = atomic_load_explicit(&service->phase, memory_order_acquire);
     if (phase == KC_SERVICE_JOINED) {

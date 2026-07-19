@@ -2,6 +2,7 @@
 #pragma once
 
 #include "kc_runtime.h"
+#include "kc_doorbell.h"
 #include "kc_descriptor_internal.h"
 #include "kcoro_port.h"
 #include "kcoro_stackless.h"
@@ -12,11 +13,12 @@ struct kc_op;
 struct kc_chan;
 struct kc_scope;
 struct kc_ticket;
+struct kc_service;
 
 struct kc_runtime {
     atomic_uint refs;
     KC_MUTEX_T mu;
-    KC_COND_T work_cv;
+    kc_doorbell_t *work_doorbell;
     KC_COND_T lifecycle_cv;
     koro_cont_t *head;
     koro_cont_t *tail;
@@ -30,6 +32,8 @@ struct kc_runtime {
     size_t live_channels;
     struct kc_scope *scopes_head;
     size_t live_scopes;
+    struct kc_service *services_head;
+    size_t live_services;
     struct kc_ticket *tickets;
     struct kc_ticket *completion_head;
     struct kc_ticket *completion_tail;
@@ -68,7 +72,16 @@ void kc_runtime_retain_internal(kc_runtime_t *runtime);
 void kc_runtime_release_internal(kc_runtime_t *runtime);
 int kc_runtime_enqueue_internal(kc_runtime_t *runtime, koro_cont_t *cont,
                                 int from_state);
+/* runtime->mu is held by the caller. */
+int kc_runtime_enqueue_locked_internal(kc_runtime_t *runtime,
+                                       koro_cont_t *cont, int from_state);
 void kc_runtime_wake_internal(koro_cont_t *cont);
+/* runtime->mu is held by the caller. */
+void kc_runtime_wake_locked_internal(koro_cont_t *cont);
+void kc_runtime_ring_work_internal(kc_runtime_t *runtime, int all);
+int kc_runtime_work_realtime_safe_internal(const kc_runtime_t *runtime);
+int kc_runtime_is_current_worker_internal(const kc_runtime_t *runtime);
+int kc_runtime_is_current_cont_internal(const koro_cont_t *continuation);
 void kc_runtime_legacy_break(kc_runtime_t *runtime);
 uint64_t kc_runtime_next_sequence(kc_runtime_t *runtime);
 void kc_runtime_register_op(kc_runtime_t *runtime, struct kc_op *op);

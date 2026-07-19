@@ -30,6 +30,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <initializer_list>
 #include <new>
 #include <string>
 #include <vector>
@@ -140,7 +141,7 @@ struct LayerWeights {
     View norm_conv_w, norm_conv_b;
     View pw1_w, pw1_b, dw_w, dw_b, pw2_w, pw2_b;
     View bn_mean, bn_w, bn_b;
-    std::vector<uint16_t> bn_denom;
+    const uint16_t *bn_denom = nullptr;
     View norm_ff2_w, norm_ff2_b, ff2_l1_w, ff2_l1_b, ff2_l2_w, ff2_l2_b;
     View norm_out_w, norm_out_b;
 };
@@ -150,13 +151,16 @@ inline uint64_t conv_len(uint64_t l) { return l >= 1 ? (l + 2 - 3) / 2 + 1 : 0; 
 } // namespace
 
 struct LfmConformer {
+    static constexpr size_t DERIVED_ALIGNMENT = 64;
     LfmConformerGeometry g;
     void *engine = nullptr;
     View stem_w, stem_b, dw1_w, dw1_b, pwa_w, pwa_b, dw2_w, dw2_b, pwb_w, pwb_b;
     View sub_out_w, sub_out_b;
     std::vector<LayerWeights> layers;
     View ad_ln_w, ad_ln_b, ad_l1_w, ad_l1_b, ad_l2_w, ad_l2_b;
-    std::vector<float> pe_div;
+    unsigned char *derived_arena = nullptr;
+    size_t derived_arena_bytes = 0;
+    float *pe_div = nullptr;
     uint64_t bound_weight_bytes = 0;
     uint64_t derived_bytes = 0;
     // Weight bytes MATERIALIZED rather than bound as a view — F32 staging, a
@@ -168,46 +172,76 @@ struct LfmConformer {
     // silently stops being able to fail.
     uint64_t materialized_weight_bytes = 0;
     mutable std::atomic<uint64_t> direct_gemm_calls{0};
+
+    ~LfmConformer() {
+        ::operator delete(derived_arena,
+                          std::align_val_t(DERIVED_ALIGNMENT));
+    }
 };
 
-// Bump arenas. Sized ONCE per forward to a safe high-water bound (reserve),
-// then f()/b() only advance the offset — never resize mid-pass, because a
-// resize would reallocate and dangle every pointer already handed out.
+// One byte arena, allocated once at readiness. Numerical "planes" are only
+// typed offset views into these bytes; they never own storage and the arena is
+// not zero-filled for values that the leaves completely overwrite. f()/b()
+// only advance offsets during a pass. A sealed production workspace cannot
+// grow, so every pointer remains stable across the complete audio ticket.
 struct LfmConformerWorkspace {
-    std::vector<float> f32;
-    std::vector<uint16_t> u16;
+    static constexpr size_t ALIGNMENT = 64;
+    unsigned char *arena = nullptr;
+    size_t arena_bytes = 0;
+    float *f32 = nullptr;
+    uint16_t *u16 = nullptr;
+    size_t fcap = 0, bcap = 0;
     size_t fo = 0, bo = 0;
     bool overflow = false;
     bool sealed = false;
+
+    ~LfmConformerWorkspace() {
+        ::operator delete(arena, std::align_val_t(ALIGNMENT));
+    }
+
     int begin(size_t need_f, size_t need_b) {
-        if (sealed && (f32.size() < need_f || u16.size() < need_b)) {
-            return -ENOBUFS;
-        }
-        try {
-            if (f32.size() < need_f) f32.assign(need_f, 0.0f);
-            if (u16.size() < need_b) u16.assign(need_b, 0);
-        } catch (const std::bad_alloc &) {
-            return -ENOMEM;
+        if (need_f > fcap || need_b > bcap) {
+            if (sealed) return -ENOBUFS;
+            if (need_f > SIZE_MAX / sizeof(float) ||
+                need_b > SIZE_MAX / sizeof(uint16_t))
+                return -EOVERFLOW;
+            const size_t fbytes = need_f * sizeof(float);
+            if (fbytes > SIZE_MAX - (ALIGNMENT - 1)) return -EOVERFLOW;
+            const size_t boffset =
+                (fbytes + (ALIGNMENT - 1)) & ~(ALIGNMENT - 1);
+            const size_t bbytes = need_b * sizeof(uint16_t);
+            if (boffset > SIZE_MAX - bbytes) return -EOVERFLOW;
+            const size_t bytes = boffset + bbytes;
+            auto *next = static_cast<unsigned char *>(::operator new(
+                bytes, std::align_val_t(ALIGNMENT), std::nothrow));
+            if (!next) return -ENOMEM;
+            ::operator delete(arena, std::align_val_t(ALIGNMENT));
+            arena = next;
+            arena_bytes = bytes;
+            f32 = reinterpret_cast<float *>(arena);
+            u16 = reinterpret_cast<uint16_t *>(arena + boffset);
+            fcap = need_f;
+            bcap = need_b;
         }
         fo = bo = 0;
         overflow = false;
         return 0;
     }
     float *f(size_t n) {
-        if (fo + n > f32.size()) {
+        if (n > fcap - fo) {
             overflow = true;
-            return f32.data(); // safe: caller checks overflow, forward bails
+            return f32; // sizing defect; forward rejects this pass
         }
-        float *p = f32.data() + fo;
+        float *p = f32 + fo;
         fo += n;
         return p;
     }
     uint16_t *b(size_t n) {
-        if (bo + n > u16.size()) {
+        if (n > bcap - bo) {
             overflow = true;
-            return u16.data();
+            return u16;
         }
-        uint16_t *p = u16.data() + bo;
+        uint16_t *p = u16 + bo;
         bo += n;
         return p;
     }
@@ -229,11 +263,10 @@ int workspace_needs(const LfmConformer *c, uint64_t frames,
     const __uint128_t DK = D / H;
     const __uint128_t max_tf = T1 * F1;
     const __uint128_t width = FF > 2 * D ? FF : 2 * D;
-    const __uint128_t bigrow = (Tp > P ? Tp : P) * width;
     const __uint128_t attn = H * (Tp * Tp + 2 * Tp * P + 5 * Tp * DK + P * DK);
     const __uint128_t flat = CC * F3;
     const __uint128_t need_f =
-        4 * CC * max_tf + 4 * bigrow + 2 * attn + 8 * D * Tp + 4096;
+        4 * CC * max_tf + 2 * attn + 8 * D * Tp + 4096;
     const __uint128_t need_b =
         6 * CC * max_tf + Tp * flat + 24 * Tp * width + 8 * P * D +
         4 * Tp * g.adapter_hidden + 4096;
@@ -246,7 +279,7 @@ int workspace_needs(const LfmConformer *c, uint64_t frames,
 }
 
 int bind(const LfmWeightImage *img, const std::string &name, View &v,
-         std::vector<uint64_t> expect, char *err, size_t errlen) {
+         std::initializer_list<uint64_t> expect, char *err, size_t errlen) {
     LfmTensorView tv{};
     tv.size = sizeof(tv);
     if (lfm_weights_find(img, name.c_str(), &tv) != 0) {
@@ -257,18 +290,21 @@ int bind(const LfmWeightImage *img, const std::string &name, View &v,
         std::snprintf(err, errlen, "conformer bind: '%s' not BF16", name.c_str());
         return -ENOENT;
     }
-    if (!expect.empty()) {
+    if (expect.size() != 0) {
         if (tv.rank != expect.size()) {
             std::snprintf(err, errlen, "conformer bind: '%s' rank %u != %zu",
                           name.c_str(), tv.rank, expect.size());
             return -ENOENT;
         }
-        for (size_t i = 0; i < expect.size(); ++i)
-            if (expect[i] != 0 && tv.shape[i] != expect[i]) {
+        size_t i = 0;
+        for (const uint64_t dimension : expect) {
+            if (dimension != 0 && tv.shape[i] != dimension) {
                 std::snprintf(err, errlen, "conformer bind: '%s' dim %zu mismatch",
                               name.c_str(), i);
                 return -ENOENT;
             }
+            ++i;
+        }
     }
     v.bytes = static_cast<const unsigned char *>(tv.data);
     v.elements = tv.elements;
@@ -277,31 +313,39 @@ int bind(const LfmWeightImage *img, const std::string &name, View &v,
     return 0;
 }
 
-// bf16 linear: X(rows x K) bf16 -> engine GEMM -> f32 -> +bias(f32) -> bf16.
+// BF16 linear destination contract:
+//   X[rows,K] BF16 x W[N,K] resident bytes -> f32 dot -> f32 bias -> BF16 RNE
+//   directly into out[rows,N].
+//
+// The engine fixed team owns disjoint output-column bands. Each architecture
+// leaf carries its F32 dot and optional BF16 bias through the one logical RNE
+// boundary, then publishes directly into the final strided BF16 destination.
+// No accumulator plane crosses either the nested-team or ordinary ticket ABI.
 int bf16_linear(const LfmConformer *conformer, LfmConformerWorkspace *ws,
                 const uint16_t *x,
                 uint64_t rows, uint64_t k, const View &w, const View *bias,
                 uint16_t *out, bool engine_team) {
     const uint64_t n = w.rows;
-    float *scratch = ws->f(rows * n);
-    // Weight is checkpoint-native (N,K). The direct ticket never selects the
-    // Apple F32 staging path and its baseline fallback also streams raw bf16.
-    // Inside the composite audio ticket the same request is release-published
-    // to peer lanes already resident in that ticket; recursively entering the
-    // one-slot SQ would deadlock and is therefore structurally impossible here.
+    if (rows == 0 || k == 0 || n == 0 || w.cols != k) return -EINVAL;
+    if (rows > SIZE_MAX / k || n > SIZE_MAX / k || rows > SIZE_MAX / n) {
+        return -EOVERFLOW;
+    }
+    if (w.elements != n * k) return -EINVAL;
+    if (w.elements > SIZE_MAX / sizeof(uint16_t)) return -EOVERFLOW;
+    (void)ws;
+    const void *bias_bytes = bias && bias->bytes ? bias->bytes : nullptr;
+    const size_t bias_count = bias_bytes ? (size_t)n : 0;
     const int status = engine_team
-        ? lfm_engine_conformer_gemm_team(
-              conformer->engine, x, rows * k, w.bytes, w.elements, scratch,
-              rows * n, rows, n, k)
-        : lfm_engine_bf16_gemm_nt_direct_f32(
-              conformer->engine, x, rows * k, w.bytes, w.elements, scratch,
-              rows * n, rows, n, k);
-    if (status != 0)
-        return -EIO;
+        ? lfm_engine_conformer_gemm_team_bf16(
+              conformer->engine, x, (size_t)(rows * k), w.bytes,
+              (size_t)w.elements, bias_bytes, bias_count, out,
+              (size_t)(rows * n), (size_t)rows, (size_t)n, (size_t)k)
+        : lfm_engine_bf16_gemm_nt_direct_bf16(
+              conformer->engine, x, (size_t)(rows * k), w.bytes,
+              (size_t)w.elements, bias_bytes, bias_count, out,
+              (size_t)(rows * n), (size_t)rows, (size_t)n, (size_t)k);
+    if (status != 0) return -EIO;
     conformer->direct_gemm_calls.fetch_add(1, std::memory_order_relaxed);
-    if (bias && bias->bytes) lfm_bias_rows_f32(scratch, bias->bytes, rows, n);
-    lfm_f32_to_bf16(scratch, out, (int)(rows * n));
-    ws->fo -= rows * n; // scratch is dead once rounded
     return 0;
 }
 
@@ -342,9 +386,41 @@ void rows_to_channels(const uint16_t *rows, uint64_t t, uint64_t c,
 
 } // namespace
 
+#if defined(LFM_BUILD_ORACLE)
+// Oracle-only two-sided gate for the actual direct-destination implementation.
+extern "C" LFM_INTERNAL_API int lfm_internal_conformer_linear_for_test(
+    void *engine, const uint16_t *activation, uint64_t rows, uint64_t inner,
+    const void *weight_bytes, uint64_t columns, const void *bias_bytes,
+    uint16_t *out) {
+    if (!engine || !activation || !weight_bytes || !out || rows == 0 ||
+        inner == 0 || columns == 0) {
+        return -EINVAL;
+    }
+    if (rows > SIZE_MAX / columns || columns > SIZE_MAX / inner)
+        return -EOVERFLOW;
+    LfmConformer conformer{};
+    conformer.engine = engine;
+    LfmConformerWorkspace workspace{};
+    const View weight = {
+        .bytes = static_cast<const unsigned char *>(weight_bytes),
+        .rows = columns,
+        .cols = inner,
+        .elements = columns * inner,
+    };
+    const View bias = {
+        .bytes = static_cast<const unsigned char *>(bias_bytes),
+        .rows = columns,
+        .cols = 1,
+        .elements = columns,
+    };
+    return bf16_linear(&conformer, &workspace, activation, rows, inner,
+                       weight, bias_bytes ? &bias : nullptr, out, false);
+}
+#endif
+
 extern "C" int lfm_conformer_create(void *engine, const void *weights,
-                                    const LfmConformerGeometry *geometry,
-                                    LfmConformer **out, char *error,
+                                     const LfmConformerGeometry *geometry,
+                                     LfmConformer **out, char *error,
                                     size_t error_length) {
     if (!engine || !weights || !geometry || !out) return -EINVAL;
     if (geometry->size < sizeof(LfmConformerGeometry) ||
@@ -361,15 +437,50 @@ extern "C" int lfm_conformer_create(void *engine, const void *weights,
     c->g = g;
     c->engine = engine;
 
+    // Formula-derived BN denominators and relative-position divisors share one
+    // immutable byte arena. Layer records retain pointer views into it; no
+    // numerical vector owns one table per layer.
+    const __uint128_t bn_bytes_wide =
+        (__uint128_t)g.n_layers * g.d_model * sizeof(uint16_t);
+    const __uint128_t pe_bytes_wide =
+        (__uint128_t)(g.d_model / 2) * sizeof(float);
+    if (bn_bytes_wide > SIZE_MAX || pe_bytes_wide > SIZE_MAX) {
+        delete c;
+        return -EOVERFLOW;
+    }
+    const size_t bn_bytes = (size_t)bn_bytes_wide;
+    if (bn_bytes > SIZE_MAX - (LfmConformer::DERIVED_ALIGNMENT - 1)) {
+        delete c;
+        return -EOVERFLOW;
+    }
+    const size_t pe_offset =
+        (bn_bytes + (LfmConformer::DERIVED_ALIGNMENT - 1)) &
+        ~(LfmConformer::DERIVED_ALIGNMENT - 1);
+    const size_t pe_bytes = (size_t)pe_bytes_wide;
+    if (pe_offset > SIZE_MAX - pe_bytes) {
+        delete c;
+        return -EOVERFLOW;
+    }
+    c->derived_arena_bytes = pe_offset + pe_bytes;
+    c->derived_arena = static_cast<unsigned char *>(::operator new(
+        c->derived_arena_bytes,
+        std::align_val_t(LfmConformer::DERIVED_ALIGNMENT), std::nothrow));
+    if (!c->derived_arena) {
+        delete c;
+        return -ENOMEM;
+    }
+    c->pe_div = reinterpret_cast<float *>(c->derived_arena + pe_offset);
+
     char localerr[256] = {0};
     char *err = (error && error_length) ? error : localerr;
     size_t errlen = (error && error_length) ? error_length : sizeof(localerr);
     const uint64_t D = g.d_model, FF = g.d_ff, CC = g.conv_channels;
 
     int rc = 0;
-    auto B = [&](const std::string &n, View &v, std::vector<uint64_t> e) {
+    auto B = [&](const std::string &n, View &v,
+                 std::initializer_list<uint64_t> shape) {
         if (rc != 0) return;
-        rc = bind(img, n, v, std::move(e), err, errlen);
+        rc = bind(img, n, v, shape, err, errlen);
         if (rc == 0) c->bound_weight_bytes += v.elements * sizeof(uint16_t);
     };
 
@@ -434,13 +545,15 @@ extern "C" int lfm_conformer_create(void *engine, const void *weights,
         if (rc == 0) {
             // BatchNorm eval prefold, candle op order with explicit bf16
             // rounding at each step: denom = bf16(sqrt(bf16(var + eps))).
-            L.bn_denom.resize(D);
+            auto *denom = reinterpret_cast<uint16_t *>(c->derived_arena) +
+                          (size_t)i * D;
+            L.bn_denom = denom;
             for (uint64_t j = 0; j < D; ++j) {
                 const float ve = bf16_widen_one(bf16_round_one(
                     bf16_widen_one(load_bf16(
                         bn_v.bytes + j * sizeof(uint16_t))) +
                     1e-5f));
-                L.bn_denom[j] = bf16_round_one(std::sqrt(ve));
+                denom[j] = bf16_round_one(std::sqrt(ve));
             }
             // running_var is consumed only to build the denominator table; it
             // is not retained as a pass-time checkpoint view.
@@ -462,11 +575,10 @@ extern "C" int lfm_conformer_create(void *engine, const void *weights,
     }
     // Rel-pos inverse frequencies (create_pe): exp(2i * -(ln(10000)/d)), f64
     // math stored f32 — init-time table (mel-pass precedent).
-    c->pe_div.resize(D / 2);
     for (uint64_t i = 0; i < D / 2; ++i)
         c->pe_div[i] =
             (float)std::exp(-(std::log(10000.0) / (double)D) * (double)(2 * i));
-    c->derived_bytes += c->pe_div.size() * sizeof(float);
+    c->derived_bytes += (D / 2) * sizeof(float);
     *out = c;
     return 0;
 }
@@ -626,7 +738,7 @@ int conformer_forward(const LfmConformer *c, LfmConformerWorkspace *ws,
 
     // rel-pos table (P x D) bf16 — sin/cos leaf; xscaling=false leaves x as-is.
     uint16_t *pe = ws->b(P * D);
-    if (lfm_pe_build_bf16(c->pe_div.data(), D / 2, Tp, pe) != 0) return -EIO;
+    if (lfm_pe_build_bf16(c->pe_div, D / 2, Tp, pe) != 0) return -EIO;
 
     // ---- layers -------------------------------------------------------------
     uint16_t *h = ws->b(Tp * (FF > 2 * D ? FF : 2 * D)); // stage output plane
@@ -764,7 +876,7 @@ int conformer_forward(const LfmConformer *c, LfmConformerWorkspace *ws,
         uint16_t *dwb = ws->b(D * Tp);
         lfm_f32_to_bf16(ydw, dwb, (int)(D * Tp));
         uint16_t *bnb = ws->b(D * Tp);
-        lfm_bn_bf16(dwb, L.bn_mean.bytes, L.bn_denom.data(), L.bn_w.bytes,
+        lfm_bn_bf16(dwb, L.bn_mean.bytes, L.bn_denom, L.bn_w.bytes,
                     L.bn_b.bytes, bnb, D, Tp);
         if (lfm_silu_bf16(bnb, D * Tp) != 0) return -EIO;
         uint16_t *pw2_in = ws->b(Tp * D);

@@ -1,7 +1,7 @@
 //! Opaque Rust host seam for the native LFM2 voice runtime.
 //!
 //! This module deliberately exposes lifecycle, sampling policy, PCM leases and
-//! semantic events only. Model bytes, tensor names, token ids, mel rows, codec
+//! semantic events only. Model bytes, weight-field names, token ids, mel rows, codec
 //! codes and recurrence never cross this boundary.
 
 use std::ffi::{c_char, c_void, CStr, CString};
@@ -38,7 +38,6 @@ const MAX_KERNEL_LANES: u32 = 16;
 const CAPTURE_SLOTS: u32 = 1;
 const PLAYBACK_SLOTS: u32 = 8;
 const MAX_CAPTURE_FRAMES: u32 = 48_000 * 30;
-const PLAYBACK_FRAMES: u32 = 3_840;
 
 #[repr(C)]
 struct Runtime {
@@ -977,7 +976,9 @@ impl NativeLfm2VoiceEngine {
             capture_slots: CAPTURE_SLOTS,
             playback_slots: PLAYBACK_SLOTS,
             capture_frames_per_slot: MAX_CAPTURE_FRAMES,
-            playback_frames_per_slot: PLAYBACK_FRAMES,
+            // Zero delegates model/codec/rate geometry to native readiness.
+            // Rust must not encode Mimi's frame capacity as model knowledge.
+            playback_frames_per_slot: 0,
             pcm_channels: 1,
             pcm_sample_rate: 48_000,
             command_capacity: 8,

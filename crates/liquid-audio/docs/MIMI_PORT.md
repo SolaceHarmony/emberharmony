@@ -1,11 +1,12 @@
-# Mimi Assembly Port Manifest
+# Native Mimi port manifest
 
-The mission clause this executes: the voice pipeline decode path becomes
-non-numerical C++ control over kcoro-aware assembly stages. After the backbone (`REQ_TOKEN_PASS`) and the
-typed Depthformer (`REQ_DEPTH_FRAME`), **Mimi is the largest Candle compute left per frame**:
-every 80 ms audio frame runs a full candle graph (moshi crate) → PCM. This
-manifest scopes the port; the first pass is swarmed one-file-per-agent,
-arbitered locally, then parity-gated.
+Production Mimi is native. After the backbone (`REQ_TOKEN_PASS`) and typed
+Depthformer (`REQ_DEPTH_FRAME`), `REQ_MIMI_DECODE` consumes byte-addressed
+views from the model's single immutable main-plus-codec image and publishes PCM
+without returning numerical work to Rust. This manifest records that completed
+ownership cut and the remaining performance rung: divide the already-native
+stateful graph across the fixed Flashkern team instead of running its interior
+serially on lane zero.
 
 ## Source of truth
 
@@ -28,8 +29,8 @@ entered from our `MimiDetokenizer` (src/runtime/audio_out.rs):
 - Weights: `tokenizer-e351c8d8-checkpoint125.safetensors`, f32, n_q=8
   (rvq_first 1 + rvq_rest 7), bins 2048, quantizer dim 256 ↔ model dim 512.
 
-**Out of scope (stays on the Rust moshi crate):** the encoder half
-(`encode*` — used only by training preprocessing, turn-level), batching >1,
+**Out of production scope (oracle/training only):** the encoder half
+(`encode*` — used only by training preprocessing), batching >1,
 `StreamMask` batched masking, quantized-weight paths (`MaybeQuantized*` —
 this checkpoint is unquantized f32), cross-attention / gating / RmsNorm /
 conv-block transformer variants (config says None/LayerNorm/false), LSTM
@@ -72,6 +73,12 @@ compatibility-copied weight bytes.
 - **Zero allocation in steady state**: all streaming state (conv left-context,
   partial-frame pendings, KV rings, scratch) lives in ONE arena sized at init.
   State structs are POD and explicitly serializable (hibernation-friendly).
+- **Destination-direct activations**: the transformer in-projection keeps only
+  its bounded Q plane (8×512 f32 = 16 KiB). Completed K and V head spans write
+  directly into their generation-selected ring slots from the packed resident
+  checkpoint view; K is then rotated in place. The former packed QKV plane and
+  both ring `memcpy` operations are gone. Remaining activation planes are
+  listed honestly in the status section rather than treated as tensors.
 - **Math**: f32 in, f32 accumulate. **Assembly at every step** (her rule,
   2026-07-09): no tensor-op thinking — NEON/aarch64 has an equivalent for
   every one of them. GEMM/GEMV tier is **AMX via Accelerate**
@@ -167,16 +174,15 @@ compatibility-copied weight bytes.
       Still open from the verdict: AMX dispatch is inferred from the 5.6x on
       GEMM-bound shapes, not proven by counters; cold init ~665 ms (page
       faults + re-arm) needs one measurement pass at integration.
-- [x] build wiring: build.rs compiles the five active units (c++23,
-      -ffp-contract=off — load-bearing); Rust rim = src/mimi_native.rs
-      (zero-copy weight table over the native-owned checkpoint image, infallible-or-Err
-      init, Mutex'd single-slot decoder).
-- [x] PRODUCTION SWAP: MimiDetokenizer::decode_step runs the NATIVE kernel —
-      the moshi decode_step call is out of the streaming pipeline. moshi
-      remains ONLY turn-level tooling (encode for the trainer; one-shot
-      whole-clip decode, which the byte-oracle example pins — so REF/PERF
-      hashes did NOT move this rung; they re-arm if/when one-shot decode
-      goes native).
+- [x] build wiring: build.rs compiles the five active units as C++23 with
+      `-ffp-contract=off` (load-bearing). Production constructs
+      `MimiDecodePlan` from the codec component of `LfmModel`'s one immutable
+      image and gives each `LfmConversation` its own `MimiDecodeState`. The
+      standalone file-opening decoder/rim is oracle-feature-only.
+- [x] PRODUCTION SWAP: native conversation recurrence invokes
+      `REQ_MIMI_DECODE`; the moshi `decode_step` graph is absent from the
+      shipped path. Rust moshi code remains only in the opt-in oracle/training
+      graph and is never a production fallback.
 - [x] chain parity, in-repo (tests/mimi_native_parity.rs, gate rung 2/6):
       130 frames across the 250-slot KV wrap through the production FFI —
       worst |Δ| = 3.085e-6 (assert 5e-5), post-reset 2.9e-7. Tighter than
@@ -186,10 +192,28 @@ compatibility-copied weight bytes.
       stays NEON). Final verdict's P2s also closed: stage errors propagate
       through mimi_decoder_step (negative rc never reads as priming);
       upsample weight validated exact-shape + non-null.
-- [x] engine integration: typed `REQ_MIMI_DECODE` runs through the native SQ/CQ
-      and writes directly into its retained playback reservation.
+- [x] engine integration: typed `REQ_MIMI_DECODE` runs through the native SQ/CQ.
+      Equal-rate output writes its retained playback reservation directly; the
+      48 kHz desktop path decodes into conversation-owned codec scratch and
+      stream-rate-converts directly into that same route's device-rate reservation.
+- [x] transformer QKV destination cut: Q uses a 16 KiB fixed scratch plane;
+      each K/V output head projects directly from the packed resident byte view
+      into its final rotating-cache slot. The original 48 KiB QKV plane is gone,
+      saving 32 KiB per state and deleting both K/V transport copies without
+      changing any dot-product, bias, RoPE, or ring-position boundary.
+- [x] convolution carry publication cut: Conv1d, ConvTranspose1d, and the
+      depthwise upsampler gather/accumulate the next carry in the existing
+      equal-shaped write bank, then rotate the read/write pointers after the
+      old bank's final read. Actual-kernel aligned/unaligned, priming,
+      multi-step, matrix-route, and reset goldens are bit exact. This removes
+      50,688 copied bytes and 2,497 nonzero `memcpy` calls per steady decode
+      without changing arithmetic or the two-bank state footprint.
 - [ ] cooperative interior (the remaining rung): split Mimi units across the
       fixed team using the NOTES maps (conv: out-channel; attention: head;
       sweeps: sub-range) with zero-spin generation fences. The mounted request
       is correct and fast (13.8 ms/frame), but its stateful graph still executes
-      serial-with-AMX on lane zero while peers park.
+      serial-with-AMX on lane zero while peers park. The remaining large mutable
+      planes are `attn_cat`, `branch`, MLP hidden storage, and SeaNet activation/
+      residual ping-pong. Carry banks remain necessary while old overlap and the
+      next tail coexist, but their publication is now pointer-only. Eliminate or
+      alias the other planes only where their last-consumer lifetimes prove it safe.

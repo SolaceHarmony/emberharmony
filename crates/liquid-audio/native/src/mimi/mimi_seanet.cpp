@@ -62,15 +62,15 @@
  * op's prev_lhs/prev_rhs buffers stay empty. See NOTES (a),(d).
  * ------------------------------------------------------------------------- */
 
-static const int NUM_LAYERS = 4;
+static constexpr int NUM_LAYERS = 4;
 
 // Per-layer upsample (convtranspose) geometry.
-static const int LAYER_UP_IN[NUM_LAYERS]  = {1024, 512, 256, 128}; // in channels
-static const int LAYER_UP_OUT[NUM_LAYERS] = { 512, 256, 128,  64}; // out channels = resnet dim
-static const int LAYER_UP_K[NUM_LAYERS]   = {  16,  12,  10,   8}; // ratio*2
-static const int LAYER_RATIO[NUM_LAYERS]  = {   8,   6,   5,   4}; // stride
-static const int LAYER_UP_IDX[NUM_LAYERS] = {   2,   5,   8,  11}; // decoder.model.N
-static const int LAYER_RES_IDX[NUM_LAYERS]= {   3,   6,   9,  12}; // decoder.model.N (resnet node)
+static constexpr int LAYER_UP_IN[NUM_LAYERS]  = {1024, 512, 256, 128}; // in channels
+static constexpr int LAYER_UP_OUT[NUM_LAYERS] = { 512, 256, 128,  64}; // out channels = resnet dim
+static constexpr int LAYER_UP_K[NUM_LAYERS]   = {  16,  12,  10,   8}; // ratio*2
+static constexpr int LAYER_RATIO[NUM_LAYERS]  = {   8,   6,   5,   4}; // stride
+static constexpr int LAYER_UP_IDX[NUM_LAYERS] = {   2,   5,   8,  11}; // decoder.model.N
+static constexpr int LAYER_RES_IDX[NUM_LAYERS]= {   3,   6,   9,  12}; // decoder.model.N (resnet node)
 
 // Init/final conv geometry.
 static const int INIT_IN = MIMI_DIM;          // 512
@@ -86,6 +86,26 @@ enum { MIMI_SEANET_MAX_N_IN = 4 };
 static const int MIMI_SEANET_MAX_ELEMS_PER_NIN = 61440;
 static const int MIMI_SEANET_BUF_ELEMS =
     MIMI_SEANET_MAX_ELEMS_PER_NIN * MIMI_SEANET_MAX_N_IN;
+// During L0 residual conv0, b2's output prefix is live while its matrix gather
+// is consumed. Reserve the worst supported prefix (256 hidden channels *
+// 4 latent frames * ratio 8); the suffix is still ample for the gather.
+static const int MIMI_SEANET_L0_RES_LIVE_ELEMS =
+    (LAYER_UP_OUT[0] / 2) * MIMI_SEANET_MAX_N_IN * LAYER_RATIO[0];
+static_assert(MIMI_SEANET_L0_RES_LIVE_ELEMS == 8192,
+              "SeaNet L0 b2 live-prefix geometry drifted");
+static_assert((size_t)MIMI_SEANET_L0_RES_LIVE_ELEMS +
+                      (size_t)LAYER_UP_OUT[0] * MIMI_RES_KERNEL *
+                          MIMI_SEANET_MAX_N_IN * LAYER_RATIO[0] <=
+                  MIMI_SEANET_BUF_ELEMS,
+              "SeaNet L0 residual gather no longer fits b2 suffix");
+static_assert((size_t)LAYER_UP_K[3] * LAYER_UP_OUT[3] *
+                      2 * LAYER_RATIO[0] * LAYER_RATIO[1] * LAYER_RATIO[2] ==
+                  MIMI_SEANET_BUF_ELEMS,
+              "two-latent deepest convtr must exactly fill shared b2");
+static_assert((size_t)LAYER_UP_K[2] * LAYER_UP_OUT[2] *
+                      MIMI_SEANET_MAX_N_IN * LAYER_RATIO[0] * LAYER_RATIO[1] ==
+                  MIMI_SEANET_BUF_ELEMS,
+              "four-latent L2 convtr must exactly fill shared b2");
 
 /* ---- POD streaming state (carved from the arena at init) ----------------- */
 struct MimiSeanetState {
@@ -95,7 +115,9 @@ struct MimiSeanetState {
     MimiConvState   *res_conv1[NUM_LAYERS]; // resnet block.3 (k=1, hidden -> dim)
     MimiConvState   *final_conv;
 
-    // Three ping-pong work buffers, each sized to the global worst case.
+    // Three ping-pong work buffers, each sized to the global worst case. b2 is
+    // also the single sequential matrix workspace: full for init/convtr and,
+    // while L0 hidden output is live, its suffix after the reserved prefix.
     float *b0;  // running chain tensor / resnet skip input
     float *b1;  // activation output / ys / convtr input
     float *b2;  // resnet hidden intermediate
@@ -120,13 +142,23 @@ int mimi_seanet_init(MimiSeanetState **st, const MimiWeightTable *w,
         static_cast<MimiSeanetState *>(mimi_arena_alloc(a, sizeof(MimiSeanetState)));
     *st = s;
 
+    // Carve the liveness buffers before child state so their spans can be
+    // borrowed by every matrix route. No convolution owns matrix scratch.
+    s->b0 = static_cast<float *>(
+        mimi_arena_alloc(a, MIMI_SEANET_BUF_ELEMS * sizeof(float)));
+    s->b1 = static_cast<float *>(
+        mimi_arena_alloc(a, MIMI_SEANET_BUF_ELEMS * sizeof(float)));
+    s->b2 = static_cast<float *>(
+        mimi_arena_alloc(a, MIMI_SEANET_BUF_ELEMS * sizeof(float)));
+
     char prefix[128];
 
     // decoder.model.0 : init conv  (512 -> 1024, k=7, s=1, d=1, g=1, causal)
     int rc = mimi_conv_init(&s->init_conv, w, "decoder.model.0",
                             INIT_IN, INIT_OUT, MIMI_KERNEL,
                             /*stride*/ 1, /*dilation*/ 1, /*groups*/ 1,
-                            /*causal*/ 1, a, err, errlen);
+                            /*causal*/ 1, s->b2, MIMI_SEANET_BUF_ELEMS,
+                            a, err, errlen);
     if (rc != 0) return rc;
 
     for (int L = 0; L < NUM_LAYERS; ++L) {
@@ -138,15 +170,19 @@ int mimi_seanet_init(MimiSeanetState **st, const MimiWeightTable *w,
         rc = mimi_convtr_init(&s->upsample[L], w, prefix,
                               LAYER_UP_IN[L], LAYER_UP_OUT[L], LAYER_UP_K[L],
                               /*stride*/ LAYER_RATIO[L], /*causal*/ 1,
-                              a, err, errlen);
+                              s->b2, MIMI_SEANET_BUF_ELEMS, a, err, errlen);
         if (rc != 0) return rc;
 
         // decoder.model.{RES_IDX}.block.1 : conv (dim -> hidden, k=3, d=1)
         snprintf(prefix, sizeof(prefix), "decoder.model.%d.block.1", LAYER_RES_IDX[L]);
+        float *matrix = L == 0 ? s->b2 + MIMI_SEANET_L0_RES_LIVE_ELEMS : nullptr;
+        const size_t matrix_capacity =
+            L == 0 ? MIMI_SEANET_BUF_ELEMS - MIMI_SEANET_L0_RES_LIVE_ELEMS : 0;
         rc = mimi_conv_init(&s->res_conv0[L], w, prefix,
                             dim, hidden, MIMI_RES_KERNEL,
                             /*stride*/ 1, /*dilation*/ 1, /*groups*/ 1,
-                            /*causal*/ 1, a, err, errlen);
+                            /*causal*/ 1, matrix, matrix_capacity,
+                            a, err, errlen);
         if (rc != 0) return rc;
 
         // decoder.model.{RES_IDX}.block.3 : conv (hidden -> dim, k=1, d=1)
@@ -154,7 +190,7 @@ int mimi_seanet_init(MimiSeanetState **st, const MimiWeightTable *w,
         rc = mimi_conv_init(&s->res_conv1[L], w, prefix,
                             hidden, dim, /*ksize*/ 1,
                             /*stride*/ 1, /*dilation*/ 1, /*groups*/ 1,
-                            /*causal*/ 1, a, err, errlen);
+                            /*causal*/ 1, nullptr, 0, a, err, errlen);
         if (rc != 0) return rc;
     }
 
@@ -162,12 +198,8 @@ int mimi_seanet_init(MimiSeanetState **st, const MimiWeightTable *w,
     rc = mimi_conv_init(&s->final_conv, w, "decoder.model.14",
                         FINAL_IN, FINAL_OUT, MIMI_LAST_KERNEL,
                         /*stride*/ 1, /*dilation*/ 1, /*groups*/ 1,
-                        /*causal*/ 1, a, err, errlen);
+                        /*causal*/ 1, nullptr, 0, a, err, errlen);
     if (rc != 0) return rc;
-
-    s->b0 = static_cast<float *>(mimi_arena_alloc(a, MIMI_SEANET_BUF_ELEMS * sizeof(float)));
-    s->b1 = static_cast<float *>(mimi_arena_alloc(a, MIMI_SEANET_BUF_ELEMS * sizeof(float)));
-    s->b2 = static_cast<float *>(mimi_arena_alloc(a, MIMI_SEANET_BUF_ELEMS * sizeof(float)));
     return 0;
 }
 

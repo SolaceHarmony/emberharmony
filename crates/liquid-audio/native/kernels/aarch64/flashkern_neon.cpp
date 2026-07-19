@@ -64,6 +64,15 @@ static inline uint16_t f32_to_bf16_bits(float f) {
     return u;
 }
 
+// Integer RNE used by the production logical-storage contract. Unlike BFCVT it
+// preserves the existing special-value payload rule as well as finite values.
+static inline uint16_t f32_to_bf16_integer_bits(float f) {
+    uint32_t u;
+    memcpy(&u, &f, sizeof(u));
+    u += 0x7fff + ((u >> 16) & 1);
+    return static_cast<uint16_t>(u >> 16);
+}
+
 // =====================================================================================
 // Group A — GEMM (mirrors fused_monarch.rs simdgroup_float8x8 + simdgroup_multiply_accumulate)
 // =====================================================================================
@@ -218,6 +227,60 @@ extern "C" void lfm_bf16_gemm_nt_strided_f32(const uint16_t *A, const void *W,
                                                int ldc) {
     if (M <= 0 || N <= 0 || K <= 0 || ldc < N) return;
     gemm_nt_impl(A, W, C, M, N, K, ldc);
+}
+
+extern "C" void lfm_bf16_gemm_nt_bias_bf16(
+    const uint16_t *A, const void *W, const void *bias_storage,
+    uint16_t *output, int M, int N, int K, int output_stride) {
+    if (!A || !W || !output || M <= 0 || N <= 0 || K <= 0 ||
+        output_stride < N)
+        return;
+    const auto *weights = static_cast<const unsigned char *>(W);
+    const auto *bias = static_cast<const unsigned char *>(bias_storage);
+    for (int n = 0; n < N; ++n) {
+        const unsigned char *wr =
+            weights + (size_t)n * K * sizeof(uint16_t);
+        for (int m0 = 0; m0 < M; m0 += 4) {
+            const int rows = M - m0 < 4 ? M - m0 : 4;
+            float32x4_t low[4], high[4];
+            for (int row = 0; row < rows; ++row) {
+                low[row] = vdupq_n_f32(0.0f);
+                high[row] = vdupq_n_f32(0.0f);
+            }
+            int k = 0;
+            for (; k + 8 <= K; k += 8) {
+                const uint16x8_t wb =
+                    load_bf16x8(wr + (size_t)k * sizeof(uint16_t));
+                const float32x4_t wl = bf16_row_lo(wb);
+                const float32x4_t wh = bf16_row_hi(wb);
+                for (int row = 0; row < rows; ++row) {
+                    const uint16x8_t ab =
+                        vld1q_u16(A + (size_t)(m0 + row) * K + k);
+                    low[row] = vfmaq_f32(low[row], bf16_row_lo(ab), wl);
+                    high[row] = vfmaq_f32(high[row], bf16_row_hi(ab), wh);
+                }
+            }
+            float sums[4];
+            for (int row = 0; row < rows; ++row)
+                sums[row] = vaddvq_f32(vaddq_f32(low[row], high[row]));
+            for (; k < K; ++k) {
+                const float weight = bf16_to_f32(load_bf16_word(
+                    wr + (size_t)k * sizeof(uint16_t)));
+                for (int row = 0; row < rows; ++row)
+                    sums[row] = fmaf(
+                        bf16_to_f32(A[(size_t)(m0 + row) * K + k]),
+                        weight, sums[row]);
+            }
+            const float offset = bias
+                ? bf16_to_f32(load_bf16_word(
+                      bias + (size_t)n * sizeof(uint16_t)))
+                : 0.0f;
+            for (int row = 0; row < rows; ++row)
+                output[(size_t)(m0 + row) * output_stride + n] =
+                    f32_to_bf16_integer_bits(bias ? sums[row] + offset
+                                                  : sums[row]);
+        }
+    }
 }
 
 extern "C" int lfm_bf16_gemm_available(void) {
@@ -964,6 +1027,85 @@ extern "C" void lfm_conv1d_update_bf16(const uint16_t *bcx, const uint16_t *stat
         }
 }
 
+// Decode-only split publication. The old T=1 path wrote [y | next-state] into
+// an HxK staging plane which the engine immediately gathered into two final
+// destinations. This leaf publishes those destinations directly and admits
+// disjoint channel bands, so the fixed team can run the FIR cooperatively.
+extern "C" void lfm_shortconv_update_split_bf16(
+    const uint16_t *ball, const uint16_t *call, const uint16_t *xall,
+    const uint16_t *state, const void *weight_storage, uint16_t *y,
+    uint16_t *next, int channels, int kernel) {
+    if (!ball || !call || !xall || !state || !weight_storage || !y || !next ||
+        channels <= 0 || kernel <= 1 || kernel > 16)
+        return;
+    const auto *weights = static_cast<const unsigned char *>(weight_storage);
+    if (kernel == 3) {
+        int channel = 0;
+        for (; channel + 4 <= channels; channel += 4) {
+            const uint16x4x2_t carried = vld2_u16(state + 2 * channel);
+            uint16_t local[12];
+            memcpy(local, weights + (size_t)3 * channel * sizeof(uint16_t),
+                   sizeof(local));
+            const uint16x4x3_t taps = vld3_u16(local);
+            const float32x4_t bx = round_bf16_f32x4(vmulq_f32(
+                bf16_widen4(ball + channel), bf16_widen4(xall + channel)));
+            float32x4_t acc = vmulq_f32(bf16_widen_bits4(carried.val[0]),
+                                        bf16_widen_bits4(taps.val[0]));
+            acc = vaddq_f32(acc,
+                            vmulq_f32(bf16_widen_bits4(carried.val[1]),
+                                      bf16_widen_bits4(taps.val[1])));
+            acc = vaddq_f32(acc,
+                            vmulq_f32(bx, bf16_widen_bits4(taps.val[2])));
+            acc = round_bf16_f32x4(acc);
+            vst1_u16(y + channel, bf16_bits_f32x4(vmulq_f32(
+                                           bf16_widen4(call + channel), acc)));
+            uint16x4x2_t published;
+            published.val[0] = carried.val[1];
+            published.val[1] = bits_of_rounded4(bx);
+            vst2_u16(next + 2 * channel, published);
+        }
+        for (; channel < channels; ++channel) {
+            const float bx = round_bf16_scalar(
+                bf16_to_f32(ball[channel]) * bf16_to_f32(xall[channel]));
+            const unsigned char *row =
+                weights + (size_t)3 * channel * sizeof(uint16_t);
+            float acc = bf16_to_f32(load_bf16_word(row)) *
+                        bf16_to_f32(state[2 * channel]);
+            acc = acc + bf16_to_f32(load_bf16_word(
+                                row + sizeof(uint16_t))) *
+                            bf16_to_f32(state[2 * channel + 1]);
+            acc = acc + bf16_to_f32(load_bf16_word(
+                                row + 2 * sizeof(uint16_t))) *
+                            bx;
+            acc = round_bf16_scalar(acc);
+            y[channel] = bf16_bits_scalar(bf16_to_f32(call[channel]) * acc);
+            next[2 * channel] = state[2 * channel + 1];
+            next[2 * channel + 1] = bf16_bits_scalar(bx);
+        }
+        return;
+    }
+    for (int channel = 0; channel < channels; ++channel) {
+        const int state_base = channel * (kernel - 1);
+        const float bx = round_bf16_scalar(
+            bf16_to_f32(ball[channel]) * bf16_to_f32(xall[channel]));
+        const unsigned char *row =
+            weights + (size_t)channel * kernel * sizeof(uint16_t);
+        float acc = 0.0f;
+        for (int tap = 0; tap + 1 < kernel; ++tap)
+            acc = acc + bf16_to_f32(load_bf16_word(
+                                row + (size_t)tap * sizeof(uint16_t))) *
+                            bf16_to_f32(state[state_base + tap]);
+        acc = acc + bf16_to_f32(load_bf16_word(
+                            row + (size_t)(kernel - 1) * sizeof(uint16_t))) *
+                        bx;
+        acc = round_bf16_scalar(acc);
+        y[channel] = bf16_bits_scalar(bf16_to_f32(call[channel]) * acc);
+        for (int tap = 0; tap + 2 < kernel; ++tap)
+            next[state_base + tap] = state[state_base + tap + 1];
+        next[state_base + kernel - 2] = bf16_bits_scalar(bx);
+    }
+}
+
 // =====================================================================================
 // Group H — decode stage kernels: the per-stage device functions of the pure-NEON decode
 // step (no candle op in the token loop). Each consumes/produces bf16 bit planes or f32
@@ -1035,6 +1177,172 @@ extern "C" void lfm_swiglu_bf16(const float *g, const float *u, uint16_t *out, i
         float sg = bf16_to_f32(bf16_bits_scalar(gv / (1.0f + expf(-gv))));
         float uv = bf16_to_f32(bf16_bits_scalar(u[i]));
         out[i] = bf16_bits_scalar(sg * uv);
+    }
+}
+
+extern "C" void lfm_bf16_gemv_pair_swiglu_bf16(
+    const void *input_storage, const void *gate_weight_storage,
+    const void *up_weight_storage, uint16_t *output, size_t rows,
+    size_t depth) {
+    if (!input_storage || !gate_weight_storage || !up_weight_storage ||
+        !output || rows == 0 || depth == 0)
+        return;
+    const auto *input = static_cast<const unsigned char *>(input_storage);
+    const auto *gate = static_cast<const unsigned char *>(gate_weight_storage);
+    const auto *up = static_cast<const unsigned char *>(up_weight_storage);
+    const size_t row_bytes = depth * sizeof(uint16_t);
+    for (size_t row = 0; row < rows; row += 2) {
+        const size_t count = rows - row < 2 ? rows - row : 2;
+        const unsigned char *g0 = gate + row * row_bytes;
+        const unsigned char *u0 = up + row * row_bytes;
+        const unsigned char *g1 = g0 + row_bytes;
+        const unsigned char *u1 = u0 + row_bytes;
+        float32x4_t gl0 = vdupq_n_f32(0.0f), gh0 = vdupq_n_f32(0.0f);
+        float32x4_t ul0 = vdupq_n_f32(0.0f), uh0 = vdupq_n_f32(0.0f);
+        float32x4_t gl1 = vdupq_n_f32(0.0f), gh1 = vdupq_n_f32(0.0f);
+        float32x4_t ul1 = vdupq_n_f32(0.0f), uh1 = vdupq_n_f32(0.0f);
+        size_t k = 0;
+        for (; k + 8 <= depth; k += 8) {
+            const uint16x8_t xb =
+                load_bf16x8(input + k * sizeof(uint16_t));
+            const float32x4_t xl = bf16_row_lo(xb);
+            const float32x4_t xh = bf16_row_hi(xb);
+            const uint16x8_t gw0 =
+                load_bf16x8(g0 + k * sizeof(uint16_t));
+            const uint16x8_t uw0 =
+                load_bf16x8(u0 + k * sizeof(uint16_t));
+            gl0 = vfmaq_f32(gl0, xl, bf16_row_lo(gw0));
+            gh0 = vfmaq_f32(gh0, xh, bf16_row_hi(gw0));
+            ul0 = vfmaq_f32(ul0, xl, bf16_row_lo(uw0));
+            uh0 = vfmaq_f32(uh0, xh, bf16_row_hi(uw0));
+            if (count == 1) continue;
+            const uint16x8_t gw1 =
+                load_bf16x8(g1 + k * sizeof(uint16_t));
+            const uint16x8_t uw1 =
+                load_bf16x8(u1 + k * sizeof(uint16_t));
+            gl1 = vfmaq_f32(gl1, xl, bf16_row_lo(gw1));
+            gh1 = vfmaq_f32(gh1, xh, bf16_row_hi(gw1));
+            ul1 = vfmaq_f32(ul1, xl, bf16_row_lo(uw1));
+            uh1 = vfmaq_f32(uh1, xh, bf16_row_hi(uw1));
+        }
+        float gates[2] = {
+            vaddvq_f32(vaddq_f32(gl0, gh0)),
+            vaddvq_f32(vaddq_f32(gl1, gh1)),
+        };
+        float ups[2] = {
+            vaddvq_f32(vaddq_f32(ul0, uh0)),
+            vaddvq_f32(vaddq_f32(ul1, uh1)),
+        };
+        for (; k < depth; ++k) {
+            const float value = bf16_to_f32(load_bf16_word(
+                input + k * sizeof(uint16_t)));
+            gates[0] = fmaf(value, bf16_to_f32(load_bf16_word(
+                                         g0 + k * sizeof(uint16_t))),
+                            gates[0]);
+            ups[0] = fmaf(value, bf16_to_f32(load_bf16_word(
+                                       u0 + k * sizeof(uint16_t))),
+                          ups[0]);
+            if (count == 1) continue;
+            gates[1] = fmaf(value, bf16_to_f32(load_bf16_word(
+                                         g1 + k * sizeof(uint16_t))),
+                            gates[1]);
+            ups[1] = fmaf(value, bf16_to_f32(load_bf16_word(
+                                       u1 + k * sizeof(uint16_t))),
+                          ups[1]);
+        }
+        for (size_t lane = 0; lane < count; ++lane) {
+            const float g = round_bf16_scalar(gates[lane]);
+            const float silu =
+                round_bf16_scalar(g / (1.0f + expf(-g)));
+            const float u = round_bf16_scalar(ups[lane]);
+            output[row + lane] = bf16_bits_scalar(silu * u);
+        }
+    }
+}
+
+extern "C" void lfm_shortconv_project_update_bf16(
+    const void *input_storage, const void *projection_weight_storage,
+    const uint16_t *state, const void *conv_weight_storage, uint16_t *y,
+    uint16_t *next, size_t hidden, size_t channel_begin,
+    size_t channel_count, size_t kernel) {
+    if (!input_storage || !projection_weight_storage || !state ||
+        !conv_weight_storage || !y || !next || hidden == 0 ||
+        channel_count == 0 || kernel <= 1 || kernel > 16 ||
+        channel_begin > hidden || channel_count > hidden - channel_begin)
+        return;
+    const auto *input = static_cast<const unsigned char *>(input_storage);
+    const auto *projection =
+        static_cast<const unsigned char *>(projection_weight_storage);
+    const auto *conv = static_cast<const unsigned char *>(conv_weight_storage);
+    const size_t row_bytes = hidden * sizeof(uint16_t);
+    for (size_t channel = channel_begin;
+         channel < channel_begin + channel_count; ++channel) {
+        const unsigned char *brow = projection + channel * row_bytes;
+        const unsigned char *crow = projection + (hidden + channel) * row_bytes;
+        const unsigned char *xrow = projection + (2 * hidden + channel) * row_bytes;
+        float32x4_t bl = vdupq_n_f32(0.0f), bh = vdupq_n_f32(0.0f);
+        float32x4_t cl = vdupq_n_f32(0.0f), ch = vdupq_n_f32(0.0f);
+        float32x4_t xl = vdupq_n_f32(0.0f), xh = vdupq_n_f32(0.0f);
+        size_t k = 0;
+        for (; k + 8 <= hidden; k += 8) {
+            const uint16x8_t values =
+                load_bf16x8(input + k * sizeof(uint16_t));
+            const float32x4_t value_lo = bf16_row_lo(values);
+            const float32x4_t value_hi = bf16_row_hi(values);
+            const uint16x8_t bw =
+                load_bf16x8(brow + k * sizeof(uint16_t));
+            const uint16x8_t cw =
+                load_bf16x8(crow + k * sizeof(uint16_t));
+            const uint16x8_t xw =
+                load_bf16x8(xrow + k * sizeof(uint16_t));
+            bl = vfmaq_f32(bl, value_lo, bf16_row_lo(bw));
+            bh = vfmaq_f32(bh, value_hi, bf16_row_hi(bw));
+            cl = vfmaq_f32(cl, value_lo, bf16_row_lo(cw));
+            ch = vfmaq_f32(ch, value_hi, bf16_row_hi(cw));
+            xl = vfmaq_f32(xl, value_lo, bf16_row_lo(xw));
+            xh = vfmaq_f32(xh, value_hi, bf16_row_hi(xw));
+        }
+        float b = vaddvq_f32(vaddq_f32(bl, bh));
+        float c = vaddvq_f32(vaddq_f32(cl, ch));
+        float x = vaddvq_f32(vaddq_f32(xl, xh));
+        for (; k < hidden; ++k) {
+            const float value = bf16_to_f32(load_bf16_word(
+                input + k * sizeof(uint16_t)));
+            b = fmaf(value, bf16_to_f32(load_bf16_word(
+                                brow + k * sizeof(uint16_t))), b);
+            c = fmaf(value, bf16_to_f32(load_bf16_word(
+                                crow + k * sizeof(uint16_t))), c);
+            x = fmaf(value, bf16_to_f32(load_bf16_word(
+                                xrow + k * sizeof(uint16_t))), x);
+        }
+        b = round_bf16_scalar(b);
+        c = round_bf16_scalar(c);
+        x = round_bf16_scalar(x);
+        const float bx = round_bf16_scalar(b * x);
+        const size_t state_base = channel * (kernel - 1);
+        const unsigned char *taps =
+            conv + channel * kernel * sizeof(uint16_t);
+        float acc = 0.0f;
+        if (kernel == 3) {
+            acc = bf16_to_f32(load_bf16_word(taps)) *
+                  bf16_to_f32(state[state_base]);
+            acc = acc + bf16_to_f32(load_bf16_word(
+                                taps + sizeof(uint16_t))) *
+                            bf16_to_f32(state[state_base + 1]);
+        } else {
+            for (size_t tap = 0; tap + 1 < kernel; ++tap)
+                acc = acc + bf16_to_f32(load_bf16_word(
+                                    taps + tap * sizeof(uint16_t))) *
+                                bf16_to_f32(state[state_base + tap]);
+        }
+        acc = acc + bf16_to_f32(load_bf16_word(
+                            taps + (kernel - 1) * sizeof(uint16_t))) *
+                        bx;
+        acc = round_bf16_scalar(acc);
+        y[channel] = bf16_bits_scalar(c * acc);
+        for (size_t tap = 0; tap + 2 < kernel; ++tap)
+            next[state_base + tap] = state[state_base + tap + 1];
+        next[state_base + kernel - 2] = bf16_bits_scalar(bx);
     }
 }
 

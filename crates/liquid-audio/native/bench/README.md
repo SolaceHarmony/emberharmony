@@ -218,8 +218,8 @@ real; it does not erase the input-layout constraint.
 Moves the question up a level: not "which leaf is fastest" but "does a
 flashkern-style fixed lane team, parked on the real in-repo `kc_port` doorbell,
 scale those leaves across the M2's cores with low, zero-spin overhead?" It links
-`kc_port` (`port/posix.c`) directly — not `kc_team`, which is mid-migration — so
-the dispatch/park/wake path is honest. Work is a decode projection fanned out by
+`kc_port` (`port/posix.c`) directly to isolate the lower-level wake path from
+`kc_team` orchestration. Work is a decode projection fanned out by
 an atomic tile-claim (flashkern's shared-counter pattern); leaves are BFDOT.
 Workers set `QOS_CLASS_USER_INTERACTIVE` to bias onto P-cores.
 
@@ -244,27 +244,207 @@ Workers set `QOS_CLASS_USER_INTERACTIVE` to bias onto P-cores.
 
 ### What it establishes
 
-1. **The doorbell spine adds no tax to the leaf.** One worker hits 40.7 GB/s —
-   the standalone BFDOT number. `kc_port` park/wake is genuinely zero-spin and
-   free at the compute level.
-2. **Scaling is weight-bandwidth-capped:** 8 workers give **3.56×, not 8×**, and
-   4→8 buys only +0.65×. The decode projection is bandwidth-bound, so neither
-   more NEON cores nor AMX escapes the ceiling (both read the same weights from
-   the same memory). The only lever past it is **weight reuse — batch at the
-   barrier** (read W once, serve M tokens), which raises arithmetic intensity.
-3. **The per-generation wake is ~3 µs/worker (~24 µs for 8).** Against a
-   bandwidth-bound decode layer (~34 µs of compute at 8 workers) that is ~40%
-   overhead — so **per-layer full-team dispatch is wasteful for small work.**
+1. One worker reaches the same range as the standalone BFDOT measurement. No
+   dispatch regression was resolved by this methodology; that is weaker than
+   claiming the doorbell is free.
+2. Eight workers give **3.56×, not 8×**, and 4→8 buys only +0.65×. This proves
+   sublinear scaling for this footprint. The 8 MiB weight image can fit in the
+   measured machine's 16 MiB cluster L2, and the probe has no cache-miss or DRAM
+   counters, so it does **not** prove a DRAM-bandwidth ceiling.
+3. The tiny-work round trip is orchestration-dominated and rises from 2.59 µs
+   at one worker to 23.62 µs at eight. It includes dispatch, the tiny leaf,
+   completion, and reconvergence; it is an upper bound for orchestration, not a
+   pure wake-latency measurement.
 
 ### Design consequence
 
-The fastest path is not "max workers per layer." It is: a **resident team with
-coarse generations** (dispatch a whole decode *step*, not one layer, so the ~24 µs
-wake amortizes — this is why the fence belongs at pass boundaries, not per op);
-**batching for reuse, not cores for parallelism** (the 3.56× ceiling says added
-cores are nearly spent by 4–8); and for a single bandwidth-bound layer, ~4 workers
-is the efficiency knee (2.91× at 16% overhead vs 3.56× at 40%).
+The result supports coarse resident-team generations instead of waking the full
+team for very small leaves. Four workers are the efficiency knee in this one
+shape. Weight reuse across already-ready rows is the next mechanism to test; it
+is not established here as the only possible way past the observed scaling.
 
 It does **not** yet measure the batched (weight-reuse) path, `kc_team`'s
 completion-callback edge, cross-conversation contention, or a heterogeneous
 AMX+NEON schedule — those are the next probes.
+
+## `monarch_fused_coop.c` — two FFT barrier strategies, measured head-to-head
+
+This AArch64 BF16 microbenchmark directly links the same vendored `kc_team` and
+`kc_collective` implementations used by the production flashkern engine. It
+creates a benchmark-local team, context, and storage; it is not dispatched
+through the engine request bridge or pass slots, and it does not replace the
+production FFT.
+
+For row-major input `x[n][l]`, the probe evaluates a columns-first two-factor
+forward transform: an N-point DFT down each column, the
+`W_(N*L)^(l*k2)` twiddle, then an L-point DFT across each intermediate row.
+Its output is the DFT of `x.flatten()` in natural order `K = k1*N + k2`.
+
+The earlier analysis incorrectly called the recovered MLX rows-first formula
+an impostor. It is instead the DFT of the factor-ordered input
+`x.T.flatten()`, in natural order `K = p*L + q`. The executable now checks both
+formulas against their proper O(points²) direct DFT oracles at up to 4096
+points, including the unequal `16x32` shape. It does not call or validate the
+MLX kernel itself.
+
+The same BFDOT arithmetic runs under two synchronization modes:
+
+- `coarse` uses two complete team generations. The host waits after stage A
+  and dispatches stage B.
+- `collective` uses one team generation. Each callback performs stage A,
+  rendezvous through `kc_collective_arrive`, and then stage B.
+
+Both modes explicitly materialize the BF16 complex intermediate in ordinary
+static storage. The boundary publishes those writes; it is not a physical
+transpose. The probe has no cache or traffic counters, so it does not establish
+L1/L2 residency or the absence of DRAM traffic. BFDOT is Arm's BF16 dot-product
+operation with FP32 accumulation, not an 8x8 tensor-matrix operation.
+
+Build from the repository root:
+
+```sh
+clang -O3 -std=c11 -Wall -Wextra -Wpedantic -Werror \
+  -ffp-contract=off -march=armv8.6-a+bf16 \
+  crates/liquid-audio/native/bench/monarch_fused_coop.c \
+  crates/kcoro-sys/vendor/kcoro_arena/core/src/kc_team.c \
+  crates/kcoro-sys/vendor/kcoro_arena/core/src/kc_collective.c \
+  crates/kcoro-sys/vendor/kcoro_arena/core/src/kc_doorbell.c \
+  crates/kcoro-sys/vendor/kcoro_arena/port/posix.c \
+  -Icrates/kcoro-sys/vendor/kcoro_arena/include \
+  -Icrates/kcoro-sys/vendor/kcoro_arena/port \
+  -pthread -lm -o /tmp/monarch_fused_coop
+/tmp/monarch_fused_coop
+```
+
+Add `-D_GNU_SOURCE` on Linux. Add `-DMFC_N=16 -DMFC_L=32` or
+`-DMFC_N=128 -DMFC_L=128` before the source argument for the other measured
+shapes.
+
+### M2 Max measurements, 2026-07-19
+
+| factors | points | double oracle, max abs | BF16 normalized max | mode | 1 lane | 8 lanes | 8-lane speedup | coarse / collective at 8 lanes |
+|---|---:|---:|---:|---|---:|---:|---:|---:|
+| `16x32` | 512 | `7.01e-12` | `1.54e-02` | coarse | 0.014 ms | 0.051 ms | 0.28x | 1.20x |
+| | | | | collective | 0.008 ms | 0.042 ms | 0.20x | |
+| `32x32` | 1024 | `3.26e-11` | `2.65e-02` | coarse | 0.019 ms | 0.051 ms | 0.36x | 1.18x |
+| | | | | collective | 0.015 ms | 0.043 ms | 0.36x | |
+| `128x128` | 16384 | skipped | `4.85e-02` | coarse | 0.581 ms | 0.150 ms | 3.88x | 1.00x |
+| | | | | collective | 0.569 ms | 0.150 ms | 3.79x | |
+
+Every measured lane count (1, 2, 4, and 8) was bit-identical to the single-lane
+leaf and between synchronization modes. Timings are best-of-five warm samples
+and remain scheduler-sensitive. The collective removes one host round-trip and
+gives a 1.18–1.20x coarse/collective ratio on the synchronization-bound small
+cases at eight lanes; the difference is lost in the compute cost at 16384
+points. The large case shows useful parallel
+scaling, while the small cases remain slower as more lanes are added.
+
+The executable now fails on convention mismatches, non-finite results, BF16
+error above its documented limit, partition differences, team errors, and a
+collective-generation mismatch. It establishes forward-factorization and
+fixed-member partition equivalence only: there is no inverse, frequency-domain
+multiply, real packing, overlap/save, end-to-end convolution, or product-buffer
+integration.
+
+## `register_cache_chain.cpp` + `.S` — register FIFO ground truth
+
+Tests the question the simpler pointwise cache probe could not answer: does a
+real chained computation benefit when live intermediates stay in NEON registers,
+and does a deliberately optimized multi-tile FIFO retain enough instruction-
+level parallelism to beat phase-separated planes?
+
+The representative chain is RMS normalization → multiplicative gate → causal
+ShortConv-3 → four-row projection. It compares:
+
+- one-tile fused assembly, with intermediates kept in registers;
+- the same arithmetic forced through 192 bytes of stack scratch;
+- rotating external scratch from 4 KiB through 64 MiB;
+- a naive per-tile fused batch;
+- phase-separated full intermediate planes; and
+- a four-tile register FIFO using all 32 NEON registers.
+
+Build and run with the shipping ISA contract:
+
+```
+clang++ -O3 -std=c++23 -Wall -Wextra -Wpedantic -Werror \
+  -ffp-contract=off -march=armv8.3-a+bf16+i8mm \
+  register_cache_chain.cpp register_cache_chain_aarch64.S \
+  -o /tmp/register_cache_chain
+/tmp/register_cache_chain
+```
+
+The four-tile FIFO keeps four activation tiles, four independent reductions,
+four projection accumulators, weights, shifts, and convolution state in
+`v0-v31`. Its public wrapper saves/restores `d8-d15` once per entire batch (128
+bytes total), not once per tile. Disassembly inspection confirms no call, no
+per-tile stack access, no intermediate store, and only terminal stores in the
+hot loop.
+
+### Measured ground truth on this M2 Max
+
+- Immediate register fusion is roughly 9 ns/tile. Forced stack or arena
+  materialization is roughly 11–12 ns/tile: materialization adds about 16–30%
+  in this small chain.
+- Naive one-tile fusion is roughly 8.0–8.4 ns/tile across the delayed-reuse
+  sweep. The optimized four-tile FIFO is roughly 6.4–6.7 ns/tile, a repeatable
+  **20–24%** improvement.
+- Full planes can tie or narrowly win at the very smallest footprints. From
+  roughly 120 KiB of live plane storage onward, the register FIFO wins in the
+  measured sweep; at 64–128 MiB it is about 20% faster than naive fusion and
+  19–24% faster than planes.
+- All variants produce bit-identical terminal spans across 257 randomized
+  immediate cases and 26 delayed footprints. Guard regions remain intact.
+
+The lesson is not merely “fuse.” Naive fusion can lose the instruction-level
+parallelism that phase separation exposes. Rotate several independent tiles
+through register roles so the out-of-order core can overlap dependency chains,
+then write only terminal values.
+
+Stack and arena storage are ordinary cache-backed virtual memory. The printed
+live bytes, address span, and reuse distance do not identify L1, L2, or DRAM;
+that requires hardware counters unavailable to this probe.
+
+## `down_projection_chain.cpp` + `.S` — production-chain proof
+
+Applies the register/cache idea to the current `ST_DOWN` numerical contract,
+not a synthetic affine loop:
+
+```
+checkpoint BF16 GEMV (pinned exact-two-accumulator order)
+  → integer BF16 RNE
+  → residual BF16 add
+  → integer BF16 RNE
+  → terminal BF16
+```
+
+The comparison includes the production three-leaf chain with stack scratch, the
+same leaves with a preallocated arena, a one-row final-store-only fused leaf,
+and a four-row register FIFO. Views are deliberately unaligned. No path widens,
+packs, transposes, or copies the immutable BF16 weight image.
+
+```
+clang++ -O3 -std=c++23 -Wall -Wextra -Wpedantic -Werror \
+  -ffp-contract=off -march=armv8.3-a+bf16+i8mm \
+  down_projection_chain.cpp down_projection_chain_aarch64.S \
+  ../kernels/aarch64/flashkern_neon.cpp -I../include \
+  -o /tmp/down_projection_chain
+/tmp/down_projection_chain
+```
+
+### Measured ground truth on this M2 Max
+
+| shape | three leaves | fused one row | fused four-row FIFO | activation reads |
+|---|---:|---:|---:|---:|
+| `N=256 K=8192` | 0.28–0.32 ms | 0.28–0.31 ms | **0.086–0.104 ms** | 4 MiB → 1 MiB |
+| `N=2048 K=8192` | 2.28–2.58 ms | 2.22–2.51 ms | **0.75–0.87 ms** | 32 MiB → 8 MiB |
+
+Deleting the small intermediate plane by itself buys only about 3–5% here. The
+roughly **3×** result comes from processing four output rows together so one
+activation load feeds four immutable weight rows, while independent exact-order
+accumulators expose ILP. Weight bytes are unchanged; activation reads fall 4×;
+only terminal BF16 is written. Every terminal word is bit-exact against the
+production chain, including non-multiple tails, and all canaries pass.
+
+That is the production rule this probe supports: keep each tile's live chain in
+registers, reuse resident input values across several independent rows, and
+materialize only at a true fan-out, cross-lane publication, or terminal output.

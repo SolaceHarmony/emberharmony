@@ -38,10 +38,16 @@ struct kc_port_wait_word {
     uint32_t *address;
     pthread_mutex_t mutex;
     pthread_cond_t cond;
-    atomic_uint active;
-    atomic_int closing;
+    /* One atomic linearizes operation admission against release. The high bit
+     * closes admission; the low bits are operations that crossed the gate.
+     * Separate `active` and `closing` atomics let release observe zero between
+     * an entrant's two updates and free the registration underneath it. */
+    atomic_uint gate;
     enum kc_wait_backend backend;
 };
+
+#define KC_WAIT_CLOSED UINT32_C(0x80000000)
+#define KC_WAIT_COUNT UINT32_C(0x7fffffff)
 
 static int kc_cond_init(pthread_cond_t *cond)
 {
@@ -81,8 +87,9 @@ static struct timespec kc_deadline_timespec(uint64_t deadline_ns)
 
 static void kc_wait_leave(kc_port_wait_word *word)
 {
-    if (atomic_fetch_sub_explicit(&word->active, 1, memory_order_acq_rel) != 1) return;
-    if (!atomic_load_explicit(&word->closing, memory_order_acquire)) return;
+    unsigned before = atomic_fetch_sub_explicit(&word->gate, 1,
+                                                memory_order_release);
+    if ((before & KC_WAIT_COUNT) != 1 || !(before & KC_WAIT_CLOSED)) return;
     pthread_mutex_lock(&word->mutex);
     pthread_cond_broadcast(&word->cond);
     pthread_mutex_unlock(&word->mutex);
@@ -91,10 +98,20 @@ static void kc_wait_leave(kc_port_wait_word *word)
 static int kc_wait_enter(kc_port_wait_word *word)
 {
     if (!word) return -EINVAL;
-    atomic_fetch_add_explicit(&word->active, 1, memory_order_acquire);
-    if (!atomic_load_explicit(&word->closing, memory_order_acquire)) return 0;
-    kc_wait_leave(word);
-    return -ECANCELED;
+    unsigned gate = atomic_load_explicit(&word->gate, memory_order_acquire);
+    for (;;) {
+        if (gate & KC_WAIT_CLOSED) return -ECANCELED;
+        if ((gate & KC_WAIT_COUNT) == KC_WAIT_COUNT) return -EAGAIN;
+        if (atomic_compare_exchange_weak_explicit(
+                &word->gate, &gate, gate + 1,
+                memory_order_acquire, memory_order_acquire)) return 0;
+    }
+}
+
+static int kc_wait_is_closing(const kc_port_wait_word *word)
+{
+    return (atomic_load_explicit(&word->gate, memory_order_acquire) &
+            KC_WAIT_CLOSED) != 0;
 }
 
 int kc_port_mutex_create(kc_port_mutex **out)
@@ -170,8 +187,7 @@ int kc_port_wait_u32_prepare(uint32_t *address, kc_port_wait_word **out)
         return -rc;
     }
     word->address = address;
-    atomic_init(&word->active, 0);
-    atomic_init(&word->closing, 0);
+    atomic_init(&word->gate, 0);
 #if defined(__APPLE__)
     if (__builtin_available(macOS 14.4, *)) word->backend = KC_WAIT_DARWIN;
 #elif defined(__linux__)
@@ -186,7 +202,7 @@ static int kc_wait_pthread(kc_port_wait_word *word, uint32_t expected,
 {
     int result = 0;
     pthread_mutex_lock(&word->mutex);
-    while (!atomic_load_explicit(&word->closing, memory_order_acquire) &&
+    while (!kc_wait_is_closing(word) &&
            kc_atomic_u32_load_acquire(word->address) == expected) {
         int rc;
         if (deadline_ns == 0) rc = pthread_cond_wait(&word->cond, &word->mutex);
@@ -209,7 +225,7 @@ static int kc_wait_pthread(kc_port_wait_word *word, uint32_t expected,
         }
     }
     if (kc_atomic_u32_load_acquire(word->address) != expected) result = 0;
-    else if (atomic_load_explicit(&word->closing, memory_order_acquire))
+    else if (kc_wait_is_closing(word))
         result = -ECANCELED;
     pthread_mutex_unlock(&word->mutex);
     return result;
@@ -222,7 +238,7 @@ static int kc_wait_darwin(kc_port_wait_word *word, uint32_t expected,
     if (__builtin_available(macOS 14.4, *)) {
         for (;;) {
             if (kc_atomic_u32_load_acquire(word->address) != expected) return 0;
-            if (atomic_load_explicit(&word->closing, memory_order_acquire))
+            if (kc_wait_is_closing(word))
                 return -ECANCELED;
             int rc;
             if (deadline_ns == 0) {
@@ -255,7 +271,7 @@ static int kc_wait_futex(kc_port_wait_word *word, uint32_t expected,
 {
     for (;;) {
         if (kc_atomic_u32_load_acquire(word->address) != expected) return 0;
-        if (atomic_load_explicit(&word->closing, memory_order_acquire))
+        if (kc_wait_is_closing(word))
             return -ECANCELED;
         struct timespec timeout;
         struct timespec *timeout_ptr = NULL;
@@ -347,16 +363,36 @@ static void kc_port_wake_u32(kc_port_wait_word *word, int all)
 void kc_port_wake_u32_one(kc_port_wait_word *word) { kc_port_wake_u32(word, 0); }
 void kc_port_wake_u32_all(kc_port_wait_word *word) { kc_port_wake_u32(word, 1); }
 
+int kc_port_wait_u32_wake_is_realtime_safe(const kc_port_wait_word *word)
+{
+    if (!word || !atomic_is_lock_free(&word->gate)) return 0;
+    switch (word->backend) {
+#if defined(__APPLE__)
+    case KC_WAIT_DARWIN:
+        return 1;
+#endif
+#if defined(__linux__)
+    case KC_WAIT_FUTEX:
+        return 1;
+#endif
+    default:
+        return 0;
+    }
+}
+
 void kc_port_wait_u32_release(kc_port_wait_word *word)
 {
     if (!word) return;
-    if (atomic_exchange_explicit(&word->closing, 1, memory_order_acq_rel)) return;
+    unsigned before = atomic_fetch_or_explicit(&word->gate, KC_WAIT_CLOSED,
+                                               memory_order_acq_rel);
+    if (before & KC_WAIT_CLOSED) return;
     kc_atomic_u32_fetch_add_release(word->address, 1);
     kc_wait_wake_native(word, 1);
 
     pthread_mutex_lock(&word->mutex);
     pthread_cond_broadcast(&word->cond);
-    while (atomic_load_explicit(&word->active, memory_order_acquire) != 0) {
+    while ((atomic_load_explicit(&word->gate, memory_order_acquire) &
+            KC_WAIT_COUNT) != 0) {
         pthread_cond_wait(&word->cond, &word->mutex);
     }
     pthread_mutex_unlock(&word->mutex);

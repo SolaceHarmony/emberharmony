@@ -62,7 +62,15 @@ int kc_service_notifier_create(kc_service_t *service,
                                kc_service_notifier_t **out);
 int kc_service_notifier_notify(kc_service_notifier_t *notifier);
 int kc_service_notifier_destroy(kc_service_notifier_t *notifier);
+/* Bounded-callback continuation edge. Callable only from this service's active
+ * callback. It publishes one coalescible local-ready generation and causes the
+ * same continuation to re-enter after yielding, without a mutex, timer,
+ * external producer, or wait-word syscall. This is the quota boundary for a
+ * callback whose owned predicate still contains work. */
+int kc_service_ready_again(kc_service_t *service);
 void kc_service_request_stop(kc_service_t *service);
+/* A runtime callback may request stop but must return before joining; join
+ * returns -EDEADLK when called from any callback on the owning runtime. */
 int kc_service_join(kc_service_t *service);
 int kc_service_snapshot_get(kc_service_t *service, kc_service_snapshot *out);
 int kc_service_destroy(kc_service_t *service);

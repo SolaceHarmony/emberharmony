@@ -54,8 +54,24 @@ The canonical public include is:
 - The core calls the compile-time `kc_port_*` contract. The BSD POSIX adapter
   under `port/` is linked separately and no OS threading symbol is admitted to
   the core archive.
-- Work arrivals signal one `work_cv` waiter. Idle/join/stop predicates use a
-  separate `lifecycle_cv`, so lifecycle transitions do not wake worker herds.
+- Work arrivals ring one runtime-owned, cache-isolated expected-value doorbell.
+  Workers observe, recheck every protected predicate, then park on the observed
+  generation, so realtime ingress has no mutex/condition-variable bridge and
+  cannot lose an edge. Idle/join/stop administration retains a separate
+  `lifecycle_cv`; it never drives worker progress.
+- Retained services mount stackless callbacks on that runtime. Ordinary
+  `kc_service_notify` is a control-plane operation that may lock. A setup-time
+  `kc_service_notifier` is the callback-side lifetime lease: on direct Darwin
+  address-wake or Linux futex backends its notify edge is lock-free,
+  allocation-free, deadline-free, and callback-free. Pthread-fallback runtimes
+  reject realtime notifier creation rather than silently taking a mutex. The
+  owner disconnects and quiesces every producer before releasing the lease;
+  fixed teams therefore join before notifier, service, and runtime teardown.
+  A bounded callback whose predicate remains ready uses
+  `kc_service_ready_again`: the exact currently-running continuation publishes
+  one coalescible local generation and requeues after yielding, without a
+  mutex, timer, external edge, or wait-word syscall. The safe Rust
+  `polling_service` wrapper exposes the same `Park`/`ReadyAgain` outcome.
 - Tickets are generation-protected slab entries with retained descriptor leases,
   checked ID completion/cancellation, and one reserved terminal-delivery
   reference. Completion queues the ticket itself and invokes its callback on an

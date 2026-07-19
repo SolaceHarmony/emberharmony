@@ -6,6 +6,7 @@
 
 #include "flashkern_prng.h"
 #include "flashkern_sampler.h"
+#include "lfm_frontend.h"
 #include "lfm_mimi.h"
 
 #ifdef __cplusplus
@@ -52,8 +53,17 @@ typedef struct LfmAudioRouteResult {
 typedef struct LfmAudioRouteTarget {
     const LfmRouteEpoch *epoch;
     uint64_t expected_epoch;
+    /* Final device-rate playback reservation. */
     float *pcm;
     size_t pcm_capacity;
+    /* When device and codec rates differ, Mimi writes its legal 24 kHz result
+     * here and the same retained route stream-converts directly into `pcm`.
+     * The stream owns only cross-call scalar history/phase. These are
+     * conversation-owned activation views, never weight or tensor
+     * materialization. All three fields are null/zero for direct 24 kHz output. */
+    float *codec_pcm;
+    size_t codec_pcm_capacity;
+    LfmResamplerStream *resampler_stream;
 } LfmAudioRouteTarget;
 
 /* Private non-owning handle for a route record retained by the native engine.

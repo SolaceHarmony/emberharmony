@@ -6,9 +6,6 @@ use std::sync::{Arc, Barrier};
 
 use liquid_audio::NativeVoiceSampling;
 
-#[cfg(feature = "oracle")]
-use liquid_audio::weights::{ResidentWeights, WeightDType};
-
 const OK: i32 = 0;
 const IO: i32 = -2;
 const FORMAT: i32 = -3;
@@ -268,6 +265,34 @@ extern "C" {
         rows: i32,
         cols: i32,
     );
+    fn mimi_weight_gemv_rows_f32(
+        weights: *const u8,
+        input: *const f32,
+        bias: *const u8,
+        output: *mut f32,
+        row_begin: i32,
+        row_end: i32,
+        cols: i32,
+        accumulate: i32,
+    );
+    fn mimi_weight_gemv_span_f32(
+        weights: *const u8,
+        input: *const f32,
+        bias: *const u8,
+        output: *mut f32,
+        row_begin: i32,
+        row_end: i32,
+        cols: i32,
+    );
+    fn mimi_weight_gemv_scale_residual_rows_f32(
+        weights: *const u8,
+        input: *const f32,
+        scale: *const u8,
+        residual: *mut f32,
+        row_begin: i32,
+        row_end: i32,
+        cols: i32,
+    );
     fn mimi_weight_gemm_f32(
         weights: *const u8,
         input: *const f32,
@@ -285,6 +310,7 @@ extern "C" {
         cols: i32,
         width: i32,
     );
+    fn mimi_add_vec_f32(left: *const f32, right: *const f32, output: *mut f32, count: i32);
     fn mimi_scale_vec_f32(input: *const f32, scale: *const f32, output: *mut f32, count: i32);
     fn mimi_weight_scale_vec_f32(input: *const f32, scale: *const u8, output: *mut f32, count: i32);
     fn mimi_layer_norm_f32(
@@ -324,11 +350,6 @@ extern "C" {
 }
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
-
-#[cfg(feature = "oracle")]
-fn workspace_model_dir() -> PathBuf {
-    PathBuf::from("../../experiments/lfm2-audio-voice/model")
-}
 
 struct Temp(PathBuf);
 
@@ -913,6 +934,28 @@ fn mimi_weight_leaves_read_aligned_and_unaligned_checkpoint_bytes_without_stagin
         unsafe { mimi_weight_gemv_f32(gemv, input.as_ptr(), bias, output.as_mut_ptr(), 2, 16) };
         assert_eq!(output, [137.0, 66.0]);
 
+        // Disjoint output bands leave untouched rows alone and may accumulate
+        // a completed projection directly into its final destination. This is
+        // the Mimi quantizer's no-intermediate-plane seam.
+        let mut banded = [11.0f32, 13.0];
+        unsafe {
+            mimi_weight_gemv_rows_f32(gemv, input.as_ptr(), bias, banded.as_mut_ptr(), 1, 2, 16, 0);
+        }
+        assert_eq!(banded, [11.0, 66.0]);
+        unsafe {
+            mimi_weight_gemv_rows_f32(gemv, input.as_ptr(), bias, banded.as_mut_ptr(), 0, 2, 16, 1);
+        }
+        assert_eq!(banded, [148.0, 132.0]);
+
+        // A packed destination span keeps the original checkpoint row index
+        // (including its bias) but stores from destination row zero. This is
+        // the transformer's K/V ring-slot projection seam.
+        let mut span = [f32::NAN];
+        unsafe {
+            mimi_weight_gemv_span_f32(gemv, input.as_ptr(), bias, span.as_mut_ptr(), 1, 2, 16);
+        }
+        assert_eq!(span[0].to_bits(), output[1].to_bits());
+
         // C[2,4] = W[2,4] * identity[4,4].
         let matrix = [1.0f32, 2.0, 3.0, 4.0, -1.0, 0.0, 1.0, 2.0];
         let (matrix_storage, matrix_offset) = resident_f32(&matrix, skew);
@@ -968,6 +1011,104 @@ fn mimi_weight_leaves_read_aligned_and_unaligned_checkpoint_bytes_without_stagin
         }
         assert_eq!(got_scale, expected_scale);
 
+        // The Transformer projection epilogue must be exactly the existing
+        // GEMV -> resident LayerScale -> residual-add sequence while storing
+        // no branch plane. Exercise a nonzero output-row band, a 16+tail K,
+        // deliberately unaligned W/scale views, residual-first NaN handling,
+        // signed zero, and untouched rows/guards.
+        const ROWS: usize = 6;
+        const COLS: usize = 19;
+        const BEGIN: usize = 1;
+        const END: usize = 5;
+        let mut fused_values = (0..ROWS * COLS)
+            .map(|index| {
+                let row = index / COLS;
+                if row == END - 1 {
+                    return 0.0;
+                }
+                let lane = ((index * 17 + 5) % 31) as i32 - 15;
+                lane as f32 * 0.03125
+            })
+            .collect::<Vec<_>>();
+        // Preserve a finite, deterministic K tail distinct from the SIMD body.
+        fused_values[BEGIN * COLS + COLS - 1] = -0.1875;
+        let (fused_storage, fused_offset) = resident_f32(&fused_values, skew);
+        let fused_weights = unsafe { fused_storage.as_ptr().add(fused_offset) };
+        let fused_input = std::array::from_fn::<_, COLS, _>(|index| {
+            let signed = index as i32 - 9;
+            signed as f32 * 0.0625
+        });
+        let fused_scales = [1.0f32, -0.5, 0.25, -2.0, -0.0, 0.75];
+        let (fused_scale_storage, fused_scale_offset) = resident_f32(&fused_scales, skew);
+        let fused_scale = unsafe { fused_scale_storage.as_ptr().add(fused_scale_offset) };
+        assert_eq!((fused_weights as usize) % size_of::<f32>(), skew);
+        assert_eq!((fused_scale as usize) % size_of::<f32>(), skew);
+
+        let guard_lo = f32::from_bits(0x4e12_3456);
+        let guard_hi = f32::from_bits(0xce65_4321);
+        let untouched_lo = f32::from_bits(0x3eaa_55aa);
+        let untouched_hi = f32::from_bits(0xbe55_aa55);
+        let nan = f32::from_bits(0x7fc1_2345);
+        let initial = [
+            guard_lo,
+            untouched_lo,
+            nan,
+            -0.0,
+            0.0,
+            -0.0,
+            untouched_hi,
+            guard_hi,
+        ];
+        let mut expected = initial;
+        let mut actual = initial;
+        let mut branch = [f32::from_bits(0x7fa5_5aa5); ROWS];
+        let expected_rows = unsafe { expected.as_mut_ptr().add(1) };
+        let actual_rows = unsafe { actual.as_mut_ptr().add(1) };
+        unsafe {
+            mimi_weight_gemv_rows_f32(
+                fused_weights,
+                fused_input.as_ptr(),
+                std::ptr::null(),
+                branch.as_mut_ptr(),
+                BEGIN as i32,
+                END as i32,
+                COLS as i32,
+                0,
+            );
+            mimi_weight_scale_vec_f32(
+                branch.as_ptr().add(BEGIN),
+                fused_scale.add(BEGIN * size_of::<f32>()),
+                branch.as_mut_ptr().add(BEGIN),
+                (END - BEGIN) as i32,
+            );
+            mimi_add_vec_f32(
+                expected_rows.add(BEGIN),
+                branch.as_ptr().add(BEGIN),
+                expected_rows.add(BEGIN),
+                (END - BEGIN) as i32,
+            );
+            mimi_weight_gemv_scale_residual_rows_f32(
+                fused_weights,
+                fused_input.as_ptr(),
+                fused_scale,
+                actual_rows,
+                BEGIN as i32,
+                END as i32,
+                COLS as i32,
+            );
+        }
+        assert_eq!(
+            actual.map(f32::to_bits),
+            expected.map(f32::to_bits),
+            "direct epilogue changed the established three-operation bits at skew {skew}"
+        );
+        assert_eq!(actual[0].to_bits(), guard_lo.to_bits());
+        assert_eq!(actual[1].to_bits(), untouched_lo.to_bits());
+        assert_eq!(actual[6].to_bits(), untouched_hi.to_bits());
+        assert_eq!(actual[7].to_bits(), guard_hi.to_bits());
+        assert_eq!(actual[2].to_bits(), nan.to_bits());
+        assert_eq!(actual[5].to_bits(), (-0.0f32).to_bits());
+
         let norm_weight = [1.0f32, 0.5, -1.0, 2.0, 1.5, -0.5, 0.25, 3.0];
         let norm_bias = [0.0f32, 1.0, -1.0, 0.5, -0.5, 2.0, 0.25, -2.0];
         let (weight_storage, weight_offset) = resident_f32(&norm_weight, skew);
@@ -996,6 +1137,31 @@ fn mimi_weight_leaves_read_aligned_and_unaligned_checkpoint_bytes_without_stagin
         }
         assert_eq!(got_norm, expected_norm);
     }
+}
+
+#[test]
+fn mimi_transformer_projection_uses_no_dedicated_staging_plane() {
+    let source = include_str!("../native/src/mimi/mimi_transformer.cpp");
+    assert!(source.contains("mimi_weight_gemv_span_f32"));
+    assert!(source.contains("mimi_weight_gemv_scale_residual_rows_f32"));
+    assert!(source.contains("prefix is Q/attention"));
+    assert!(!source.contains("float *qkv"));
+    assert!(!source.contains("float *q;"));
+    assert!(!source.contains("float *attn_cat"));
+    assert!(!source.contains("float *branch"));
+    assert!(!source.contains("memcpy(L->k_ring"));
+    assert!(!source.contains("memcpy(L->v_ring"));
+}
+
+#[test]
+fn mimi_decode_reuses_the_latent_plane_and_right_sizes_quant_output() {
+    let source = include_str!("../native/src/mimi/mimi_decode.cpp");
+    assert!(source.contains("mimi_arena_alloc(&state->arena, (size_t)MIMI_DIM * sizeof(float))"));
+    assert!(source.contains(
+        "mimi_transformer_step(d->transformer, d->up_buf, n_up, d->up_buf)"
+    ));
+    assert!(source.contains("mimi_seanet_step(d->seanet, d->up_buf, n_tr, pcm_out)"));
+    assert!(!source.contains("float *tr_buf"));
 }
 
 #[test]

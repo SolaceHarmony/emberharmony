@@ -8,7 +8,7 @@
 // #[cfg(target_arch)]; everything else is unconditional.
 fn main() {
     let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
-    let oracle = std::env::var_os("CARGO_FEATURE_ORACLE").is_some();
+    let oracle = std::env::var_os("CARGO_FEATURE_ORACLE_ABI").is_some();
     let out = std::env::var("OUT_DIR").expect("Cargo did not set OUT_DIR");
     println!("cargo::rustc-env=LFM_NATIVE_ARCHIVE_DIR={out}");
 

@@ -266,9 +266,13 @@ fn write_conformer(path: &Path) {
     for (suffix, shape) in [
         ("norm_feed_forward1.weight", vec![8]),
         ("norm_feed_forward1.bias", vec![8]),
-        ("feed_forward1.linear1.weight", vec![8, 8]),
-        ("feed_forward1.linear1.bias", vec![8]),
-        ("feed_forward1.linear2.weight", vec![8, 8]),
+        // Tp=2 and FF=4103 make the first projection 8,206 values: just over
+        // the Conformer's 8,192-f32 accumulator tile. This forces the typed
+        // fixed-team audio ticket through the multi-band path without making
+        // the fake checkpoint materially large.
+        ("feed_forward1.linear1.weight", vec![4103, 8]),
+        ("feed_forward1.linear1.bias", vec![4103]),
+        ("feed_forward1.linear2.weight", vec![8, 4103]),
         ("feed_forward1.linear2.bias", vec![8]),
         ("norm_self_att.weight", vec![8]),
         ("norm_self_att.bias", vec![8]),
@@ -297,9 +301,9 @@ fn write_conformer(path: &Path) {
         ("conv.batch_norm.running_var", vec![8]),
         ("norm_feed_forward2.weight", vec![8]),
         ("norm_feed_forward2.bias", vec![8]),
-        ("feed_forward2.linear1.weight", vec![8, 8]),
-        ("feed_forward2.linear1.bias", vec![8]),
-        ("feed_forward2.linear2.weight", vec![8, 8]),
+        ("feed_forward2.linear1.weight", vec![4103, 8]),
+        ("feed_forward2.linear1.bias", vec![4103]),
+        ("feed_forward2.linear2.weight", vec![8, 4103]),
         ("feed_forward2.linear2.bias", vec![8]),
         ("norm_out.weight", vec![8]),
         ("norm_out.bias", vec![8]),
@@ -368,7 +372,7 @@ fn typed_audio_encode_matches_stage_oracle_and_reuses_prepared_storage() {
         d_model: 8,
         n_layers: 1,
         n_heads: 1,
-        d_ff: 8,
+        d_ff: 4103,
         conv_kernel: 3,
         subsampling: 8,
         conv_channels: 1,

@@ -219,53 +219,66 @@ LFM_SYM(lfm_norm_apply_f32):
 8:
     ret
 
-// void lfm_resample_conv_f64(const double *padded, uint64_t padded_len,
+// void lfm_resample_conv_f32(const float *input, uint64_t input_len,
 //                            const double *kernels, uint64_t phases,
-//                            uint64_t klen, uint64_t stride,
-//                            float *out, uint64_t max_values)
-// The torchaudio strided conv: for each block start (step `stride`) while
-// start+klen <= padded_len, one f64 dot per phase kernel, narrowed to f32.
-// max_values permits the final partial phase block to land directly in the
-// caller's exact-size output instead of a copied convolution staging plane.
+//                            uint64_t stride, uint64_t width,
+//                            uint64_t first_value, float *out,
+//                            uint64_t value_count)
+// Torchaudio's strided f64 convolution over a direct f32 input view. Prefix and
+// suffix padding are logical zeros: only the in-span taps are loaded, widened,
+// and accumulated in the same ascending-j order as the materialized reference.
+// first_value/value_count make disjoint output ranges independently runnable.
 .p2align 2
-.globl LFM_SYM(lfm_resample_conv_f64)
-LFM_PRIVATE(LFM_SYM(lfm_resample_conv_f64))
-LFM_SYM(lfm_resample_conv_f64):
-    mov     x9, #0              // start
-    mov     x10, #0             // block
-    mov     x16, #0             // values written
+.globl LFM_SYM(lfm_resample_conv_f32)
+LFM_PRIVATE(LFM_SYM(lfm_resample_conv_f32))
+LFM_SYM(lfm_resample_conv_f32):
+    ldr     x8, [sp]            // value_count (ninth argument)
+    add     x9, x4, x5, lsl #1 // klen = stride + 2*width
+    udiv    x10, x6, x3         // initial block
+    msub    x11, x10, x3, x6   // initial phase
 1:
-    add     x11, x9, x4
-    cmp     x11, x1
-    b.hi    8f
-    mov     x12, #0             // phase
+    cbz     x8, 8f
+    mul     x12, x10, x4        // logical padded-window start
+    mul     x13, x11, x9
+    add     x13, x2, x13, lsl #3 // kernel row
+
+    cmp     x12, x5
+    b.hs    2f
+    sub     x14, x5, x12        // j_begin = width - start
+    mov     x15, #0             // input index 0
+    b       3f
 2:
-    cmp     x12, x3
-    b.hs    5f
-    cmp     x16, x7
-    b.hs    8f
-    mul     x13, x12, x4
-    add     x13, x2, x13, lsl #3
-    add     x14, x0, x9, lsl #3
-    fmov    d0, xzr
-    mov     x15, #0
+    mov     x14, #0             // j_begin = 0
+    sub     x15, x12, x5        // input index = start - width
 3:
-    cmp     x15, x4
-    b.hs    4f
-    ldr     d1, [x14, x15, lsl #3]
-    ldr     d2, [x13, x15, lsl #3]
+    add     x16, x5, x1         // one-past logical input coordinate
+    cmp     x12, x16
+    b.hs    6f                   // the entire window is suffix padding
+    sub     x16, x16, x12       // first suffix j
+    cmp     x16, x9
+    csel    x16, x16, x9, lo    // j_end = min(klen, width+len-start)
+    fmov    d0, xzr
+4:
+    cmp     x14, x16
+    b.hs    7f
+    ldr     s1, [x0, x15, lsl #2]
+    fcvt    d1, s1
+    ldr     d2, [x13, x14, lsl #3]
     fmul    d1, d1, d2
     fadd    d0, d0, d1
+    add     x14, x14, #1
     add     x15, x15, #1
-    b       3b
-4:
+    b       4b
+6:
+    fmov    d0, xzr
+7:
     fcvt    s0, d0
-    str     s0, [x6], #4
-    add     x16, x16, #1
-    add     x12, x12, #1
-    b       2b
-5:
-    add     x9, x9, x5
+    str     s0, [x7], #4
+    sub     x8, x8, #1
+    add     x11, x11, #1
+    cmp     x11, x3
+    b.lo    1b
+    mov     x11, #0
     add     x10, x10, #1
     b       1b
 8:

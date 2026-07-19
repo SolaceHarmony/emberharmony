@@ -271,29 +271,21 @@ int take_completion(LfmKernelBridge *bridge, KcCompletionV1 *out) {
     return 0;
 }
 
-template <typename Take, typename Done>
+template <typename Take>
 int wait_for_edge(LfmKernelBridge *bridge, Doorbell *doorbell, uint64_t deadline_ns,
-                  Take &&take, Done &&done) {
+                  Take &&take) {
     bridge->active_waits.fetch_add(1, std::memory_order_acq_rel);
     for (;;) {
         int rc = take();
-        if (rc == 0) {
+        if (rc != -EAGAIN) {
             bridge->active_waits.fetch_sub(1, std::memory_order_acq_rel);
-            return 0;
-        }
-        if (done()) {
-            bridge->active_waits.fetch_sub(1, std::memory_order_acq_rel);
-            return -ECANCELED;
+            return rc;
         }
         uint32_t expected = kc_atomic_u32_load_acquire(&doorbell->value);
         rc = take();
-        if (rc == 0) {
+        if (rc != -EAGAIN) {
             bridge->active_waits.fetch_sub(1, std::memory_order_acq_rel);
-            return 0;
-        }
-        if (done()) {
-            bridge->active_waits.fetch_sub(1, std::memory_order_acq_rel);
-            return -ECANCELED;
+            return rc;
         }
         rc = kc_port_wait_u32(doorbell->wait, expected, deadline_ns);
         if (rc != 0) {
@@ -668,12 +660,19 @@ int lfm_kernel_bridge_wait_submission(LfmKernelBridge *bridge, KcSubmissionV1 *o
     if (!bridge || !out) return -EINVAL;
     return wait_for_edge(
         bridge, &bridge->submission_doorbell, deadline_ns,
-        [&] { return take_submission(bridge, out); },
-        [&] {
-            return stopping(bridge) && submissions_settled(bridge) &&
+        [&] { return lfm_kernel_bridge_try_submission(bridge, out); });
+}
+
+int lfm_kernel_bridge_try_submission(LfmKernelBridge *bridge,
+                                     KcSubmissionV1 *out) {
+    if (!bridge || !out) return -EINVAL;
+    const int status = take_submission(bridge, out);
+    if (status != -EAGAIN) return status;
+    return stopping(bridge) && submissions_settled(bridge) &&
                    bridge->submission_head.value.load(std::memory_order_acquire) ==
-                       bridge->submission_tail.value.load(std::memory_order_acquire);
-        });
+                       bridge->submission_tail.value.load(std::memory_order_acquire)
+        ? -ECANCELED
+        : -EAGAIN;
 }
 
 int lfm_kernel_bridge_publish_completion(LfmKernelBridge *bridge,
@@ -698,12 +697,19 @@ int lfm_kernel_bridge_wait_completion(LfmKernelBridge *bridge, KcCompletionV1 *o
     if (!bridge || !out) return -EINVAL;
     return wait_for_edge(
         bridge, &bridge->completion_doorbell, deadline_ns,
-        [&] { return take_completion(bridge, out); },
-        [&] {
-            return stopping(bridge) && submissions_settled(bridge) &&
+        [&] { return lfm_kernel_bridge_try_completion(bridge, out); });
+}
+
+int lfm_kernel_bridge_try_completion(LfmKernelBridge *bridge,
+                                     KcCompletionV1 *out) {
+    if (!bridge || !out) return -EINVAL;
+    const int status = take_completion(bridge, out);
+    if (status != -EAGAIN) return status;
+    return stopping(bridge) && submissions_settled(bridge) &&
                    bridge->completion_head.value.load(std::memory_order_acquire) ==
-                       bridge->submission_tail.value.load(std::memory_order_acquire);
-        });
+                       bridge->submission_tail.value.load(std::memory_order_acquire)
+        ? -ECANCELED
+        : -EAGAIN;
 }
 
 void lfm_kernel_bridge_request_stop(LfmKernelBridge *bridge) {

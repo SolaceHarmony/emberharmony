@@ -19,8 +19,9 @@ without changing ABI-v1 value alignment; request, layer,
 and modality dispatch is closed; invalid worker/logical-lane geometry rejects;
 and four physical workers reproduce the eight-way logical fold. The bounded
 production audio branch now reserves playback before admission and retains one
-exact slot across `TOKEN_PASS -> DEPTH_FRAME -> MIMI_DECODE`; Mimi writes into
-that reservation and the coordinator publishes only after terminal slot release.
+exact slot across `TOKEN_PASS -> DEPTH_FRAME -> MIMI_DECODE`; Mimi writes direct
+at equal rate or feeds the route's native device-rate resampler, and the
+coordinator publishes only after terminal slot release.
 The bounded route holds exclusive SQ-producer authority and borrows three
 pre-created immutable descriptors, so the CQ callback performs no mutex-taking
 descriptor work or generic submission. That exclusivity is temporary migration
@@ -39,10 +40,12 @@ inference chain, microphone PCM to speaker PCM, runs as native passes on the
 fixed Flashkern lane team, clocked by completion doorbells rather than a Rust
 loop, over one zero-copy weight pool.
 
-**Terminology is normative:** where this document says "tensor view," it means
-only pointer + byte count + dtype + shape/derived-stride metadata over an existing
-buffer. It never means an owning tensor object, framework allocation, or a
-materialized payload. Production data moves as retained buffer spans.
+**Terminology is normative:** the production object is a **buffer view**:
+pointer/base offset + byte count + dtype + dimensions + derived byte strides
+over an existing buffer. Older text that says "tensor view" refers only to this
+same record; the tensor term is deprecated because it too easily implies an
+owner. There is no owning tensor object, framework allocation, or materialized
+payload. Production data moves as retained buffer spans.
 
 The load-bearing observation: **the substrate for this already exists.** Flashkern
 is already a GPU-threadgroup engine — a fixed P-core lane team, generation-fence
@@ -117,8 +120,13 @@ those are the debt this retires.)
 - **Zero-copy after ingress.** Weights are bound from the single byte-exact
   resident image in checkpoint-native `(N,K)` bf16; tensor starts may be
   unaligned and kernels must accommodate that. The Candle duplicate is deleted.
-  Activations live in engine-owned scratch planes and descriptor-leased rings and
-  are passed between passes by pointer. No stage materializes a `Tensor`.
+  A weight is only `image base + byte offset + dtype + dimensions + byte
+  strides`; no plan owns a numerical weight array. Fused leaf intermediates stay
+  in registers, with the stack reserved for small bounded lane-local state. An
+  activation is written to preallocated scratch only when it must survive a
+  barrier, fan-out, recurrence step, continuation, or register-sized tile.
+  Scratch spans alias after their last consumer. No stage materializes a
+  `Tensor` or grows a numerical `std::vector` on the progress path.
 - **Zero-wait.** No polling, no bounded spin, no host thread blocked on the
   progress path. Every wait is an expected-value doorbell. The idle lane team
   stays under the existing `< 0.1%` CPU gate (`engine_idle_zero_spin`).
@@ -230,7 +238,7 @@ SQ capacity ≥ 2 · no synchronous numerical wait · no bridge-thread I/O wait.
 | Component | What it is | Exists? |
 |---|---|---|
 | **Weight image** | One allocation containing byte-exact main+codec source files; tensor views are `base + offset` and may be unaligned. | **Landed; page-table read-only after validation.** |
-| **Scratch arenas** | Per-plan/per-conversation storage sized before readiness; zero steady-state growth. | **Landed for the complete LFM2 chain.** |
+| **Scratch arenas** | Per-plan/per-conversation storage sized before readiness; zero steady-state growth. | **Partially landed.** Mimi and Conformer use fixed arenas; engine/backbone and conversation activation regions still need consolidation from separately owned vectors into one liveness map. |
 | **Session state machine** | One per conversation. Owns cursor, KV/conv planes, sampler CSPRNG, codec state, epoch, and recurrence. | **Landed natively; Rust no longer drives model progress.** |
 | **Pass program set** | Native resample, mel, Conformer, prefill, token, Depthformer, and Mimi stages. | **Typed boundary landed for LFM2.** Resample/frontend/whole-Conformer/adapter is one model-correlated SQ/CQ request over borrowed spans and conversation-owned workspace; its Conformer GEMMs are in-ticket team substages rather than recursive submissions. The native coordinator still submits and waits for that request synchronously, so route-executor integration remains open. |
 | **Immutable forwarding tables** | Model-owned, eagerly executed, total outcome maps over coarse precompiled programs; no callback objects, DAG VM, lazy evaluation, or per-turn construction. | **Bounded production route landed.** The audio branch uses a closed three-node/four-outcome `TOKEN_PASS -> DEPTH_FRAME -> MIMI_DECODE` table with bounds-checked terminal edges. Full-turn token-class and publication routing remain open. |
@@ -443,12 +451,16 @@ Target: make the resident image the sole weight owner for every plan.
 ### 3.2 Scratch arena discipline
 
 One arena per pass-program, sized at ctx/plan build to a high-water bound,
-bump-allocated, **zero allocation in steady state**, abort on overflow. This is
-already true for the engine ctx scratch, `DepthPlan`, `BackbonePlan`, the Mimi
-256 MiB arena, and the Conformer workspace. Two extensions:
+bump-allocated, **zero allocation in steady state**, abort on overflow. Mimi's
+fixed arena and the Conformer workspace follow this ownership form. The engine
+and conversation still describe several readiness-sized numerical regions with
+independent `std::vector` owners; that is transitional even when those vectors
+never grow during a pass. They must become offset views over one liveness-planned
+arena. Two extensions:
 
-- Fold the Conformer's per-call `create/destroy` workspace into the resident
-  engine scratch so even audio-in prefill is allocation-free.
+- Keep the Conformer's conversation-owned byte arena sealed after readiness;
+  mount its offset views directly on the audio route rather than creating a
+  second engine-owned payload or rematerializing named stage planes.
 - Add frontend (resample, mel) and prefill scratch to the same discipline.
 
 Activations never become `Tensor`s. The mel plane, Conformer rows, adapter
@@ -457,6 +469,18 @@ scratch or caller-owned buffers and pass between stages by pointer. The three
 transport round-trips that exist today — mel→`u16` blob→`Tensor`, adapter
 out→`Tensor`, Mimi codes→`Tensor`→`Vec` — are deleted; the session holds the
 pointers across the pass boundary instead.
+
+This is a **register-first materialization law**, not permission to allocate a
+plane for every named expression in the reference graph. Within a fused leaf,
+load checkpoint bytes through their view, unlift/accumulate/normalize in
+registers, and write only the value that has a real downstream lifetime. Large
+cross-leaf values use one readiness-sized arena and an immutable liveness map;
+they do not use per-object vector ownership. Metadata arrays may describe views
+and lifetimes, but never become numerical payload owners. “Final” is scoped to
+one uninterrupted lifetime: a value may be written before a barrier, fan-out,
+recurrence update, coroutine suspension, or device publication because registers
+cannot carry it across that boundary. A function boundary by itself is not such
+a lifetime boundary and never justifies materialization.
 
 ### 3.3 The native recurrence loop (the heart)
 
@@ -690,8 +714,9 @@ until deterministic tests also prove:
    ring wakes and resumes only the parked instance—no retry loop.
 6. **Playback admission:** Mimi is never dispatched without a retained,
    capacity-checked playback reservation. EOAudio, stale epoch, fault, and stop
-   each release an unused reservation exactly once; successful Mimi writes
-   directly into and publishes that same reservation.
+   each release an unused reservation exactly once; successful equal-rate Mimi
+   writes directly into that reservation, while differing-rate output is written
+   there by the same retained route's prepared native resampler.
 7. **Interrupt at every boundary:** advance epoch before submit, while queued,
    while running, after CQ before resubmit, while parked for reliable output,
    and while parked for playback. Accepted math may settle and a

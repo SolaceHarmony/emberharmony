@@ -66,7 +66,7 @@ payload directly.
 ## Target Model Image
 
 Safetensors files for one product model include the main LFM2/Moshi model and
-Mimi. Tensor names can overlap across those components. Extend the current image
+Mimi. Weight-field names can overlap across those components. Extend the current image
 into one model bundle with component-scoped keys:
 
 ```c++
@@ -75,12 +75,13 @@ enum class WeightComponent : uint32_t {
     Codec = 2,
 };
 
-struct TensorView {
-    const std::byte *data;
+struct WeightView {
+    const std::byte *base;
     std::span<const uint64_t> shape;
-    uint64_t offset;
+    uint64_t byte_offset;
     uint64_t elements;
-    uint64_t bytes;
+    uint64_t byte_count;
+    std::span<const uint64_t> byte_strides;
     LfmDType dtype;
     WeightComponent component;
     uint32_t shard;
@@ -89,10 +90,13 @@ struct TensorView {
 
 These are private C++ model types, not declarations in `lfm_voice.h`. Rust sees
 only `LfmModel *`, typed status, and bounded nonnumerical metadata. There is no
-public tensor lookup, data pointer, shape pointer, or weight-buffer accessor.
+public weight-field lookup, data pointer, shape pointer, or weight-buffer accessor.
+`WeightView` owns nothing: the effective address of an element is
+`base + byte_offset + sum(index[i] * byte_strides[i])`. The selected leaf alone
+interprets dtype, and BF16 is unlifted in registers.
 
 `LfmModelImage` owns one 64-byte-aligned allocation containing every selected
-file, with padding between complete files. A tensor key is `(component, name)`,
+file, with padding between complete files. A weight-field key is `(component, name)`,
 so duplicate names in main and codec checkpoints are legal while duplicates
 inside one component remain an error.
 
@@ -180,7 +184,7 @@ struct LfmModelSchema {
 ```
 
 Use typed schema builders for LFM2 and Moshi. Name lookup is permitted only in
-these builders. A missing or malformed required tensor fails model open. There
+these builders. A missing or malformed required weight field fails model open. There
 is no per-layer fallback to Candle or a generic operator chain.
 
 ## CPU Binding
@@ -192,7 +196,7 @@ Activations and mutable state live elsewhere. Required rules:
 - BF16/F32 interpretation comes from the validated dtype;
 - a plan stores shape/stride facts once;
 - a pass receives the plan pointer and mutable destination/state pointers;
-- no tensor name, JSON value, filesystem path, or allocation is consulted in a
+- no weight-field name, JSON value, filesystem path, or allocation is consulted in a
   numerical pass;
 - `LfmModelImage` cannot be destroyed while a plan, session, or conversation
   retains it.
@@ -249,8 +253,10 @@ not call Rust to decide a sampled control token or decode a Moshi token fragment
 
 Production constructs `MimiDecodePlan` from the codec component of the same
 combined `LfmWeightImage` owned by `LfmModel`; each conversation owns only its
-mutable `MimiDecodeState`. Codec weights remain non-owning byte views, and PCM
-is written directly into the retained playback reservation.
+mutable `MimiDecodeState` plus fixed activation scratch. Codec weights remain
+non-owning byte views. Equal-rate PCM is written directly into the retained
+playback reservation; otherwise the prepared native resampler writes that final
+reservation from conversation-owned codec scratch without a transport copy.
 
 The legacy `mimi_decoder_new_from_file` route remains solely for offline
 Candle/Moshi parity. It is compiled only with `LFM_BUILD_ORACLE`, is absent from

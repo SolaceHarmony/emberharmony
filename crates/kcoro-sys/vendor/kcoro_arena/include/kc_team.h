@@ -19,6 +19,7 @@ typedef struct kc_team kc_team_t;
 
 typedef void (*kc_team_member_fn)(void *context, uint32_t member,
                                   uint32_t members, uint64_t generation);
+typedef void (*kc_team_completion_fn)(void *context, uint64_t generation);
 
 typedef struct kc_team_config {
     uint32_t size;
@@ -46,6 +47,15 @@ int kc_team_create(const kc_team_config *config, kc_team_t **out);
 int kc_team_start(kc_team_t *team);
 /* Exactly one generation may be active. Generations are non-zero and increasing. */
 int kc_team_dispatch(kc_team_t *team, uint64_t generation);
+/*
+ * The completion callback runs exactly once after completed_generation is
+ * release-published and the generation has retired. The callback is an edge:
+ * a resumed continuation may immediately dispatch the next generation. Team
+ * wait does not return until this callback has returned. Waiting on this team
+ * from its own completion callback returns -EDEADLK.
+ */
+int kc_team_dispatch_notify(kc_team_t *team, uint64_t generation,
+                            kc_team_completion_fn completion, void *context);
 /* Zero deadline means an indefinite expected-value park. */
 int kc_team_wait(kc_team_t *team, uint64_t generation, uint64_t deadline_ns);
 void kc_team_request_stop(kc_team_t *team);

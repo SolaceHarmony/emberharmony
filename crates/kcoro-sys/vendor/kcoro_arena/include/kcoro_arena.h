@@ -8,6 +8,7 @@
 #include "kc_identity.h"
 #include "kc_port.h"
 #include "kc_runtime.h"
+#include "kc_service.h"
 #include "kc_team.h"
 #include "kc_ticket.h"
 #include "kc_channel.h"

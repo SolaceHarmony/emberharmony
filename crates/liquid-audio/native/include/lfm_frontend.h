@@ -36,6 +36,7 @@ typedef struct LfmFrontend LfmFrontend;
 typedef struct LfmFrontendWorkspace LfmFrontendWorkspace;
 typedef struct LfmResampler LfmResampler;
 typedef struct LfmResamplerWorkspace LfmResamplerWorkspace;
+typedef struct LfmResamplerStream LfmResamplerStream;
 
 #define LFM_FRONTEND_FORWARD_VALID_ONLY 1u
 #define LFM_FRONTEND_WORKSPACE_BF16_OUTPUT 2u
@@ -147,8 +148,10 @@ LFM_ORACLE_API int lfm_resampler_out_length(const LfmResampler *resampler,
                                             uint64_t sample_count,
                                             uint64_t *out_length);
 
-// Session-owned f64 padding plane. Reserve once before readiness. Processing
-// returns -ENOBUFS rather than allocating if a command exceeds that admission.
+// Session-owned admission watermark. Reserve once before readiness; it owns no
+// numerical plane. Processing reads the caller's f32 span directly, treats the
+// prefix/suffix padding as logical zeros, and returns -ENOBUFS if a command
+// exceeds the prepared sample count.
 LFM_ORACLE_API int
 lfm_resampler_workspace_create(LfmResamplerWorkspace **out);
 LFM_ORACLE_API int
@@ -160,17 +163,39 @@ LFM_ORACLE_API int lfm_resampler_workspace_reserve(
 // Allocation-free execution. With equal rates, destination may be null and
 // result aliases input exactly. With different rates, destination receives the
 // final convolution values directly (there is no intermediate/copy) and result
-// aliases destination.
+// aliases destination. For different rates input and destination must not
+// overlap: preserving an overlapping source would require forbidden staging.
 LFM_ORACLE_API int lfm_resampler_process(
     const LfmResampler *resampler, LfmResamplerWorkspace *workspace,
     const float *input, uint64_t sample_count, float *destination,
     uint64_t destination_capacity, LfmF32Span *result);
 
+// Conversation-owned streaming rate converter. Unlike the offline sinc path
+// above, this retains the preceding sample and exact reduced-rate phase across
+// calls, so chunk boundaries are numerically invisible. The maximum admitted
+// input span is fixed at creation; execution writes directly into the caller's
+// final destination and never allocates or owns an output plane. Its immutable
+// rate plan and mutable continuity state are fixed scalars.
+LFM_ORACLE_API int lfm_resampler_stream_create(
+    uint32_t orig_freq, uint32_t new_freq, uint64_t max_sample_count,
+    LfmResamplerStream **out);
+LFM_ORACLE_API int
+lfm_resampler_stream_destroy(LfmResamplerStream *stream);
+LFM_ORACLE_API void lfm_resampler_stream_reset(LfmResamplerStream *stream);
+LFM_ORACLE_API int lfm_resampler_stream_out_length(
+    LfmResamplerStream *stream, uint64_t sample_count,
+    uint64_t *out_length);
+LFM_ORACLE_API int lfm_resampler_stream_process(
+    LfmResamplerStream *stream, const float *input, uint64_t sample_count,
+    float *destination, uint64_t destination_capacity,
+    LfmF32Span *result);
+
 // torchaudio.functional.resample (sinc_interp_hann, lowpass_filter_width=6,
 // rolloff=0.99), f64 kernels and accumulation, truncated to
 // ceil(length * new_freq / orig_freq) samples. Transitional compatibility
 // wrapper: it constructs a temporary plan/workspace and must copy when equal
-// rates and output != input. Production uses the plan/span API above.
+// rates and output != input. Production capture uses the prepared plan/span API;
+// streaming playback uses the retained scalar state above.
 LFM_ORACLE_API int lfm_resample_f32(
     const float *x, uint64_t length, uint32_t orig_freq, uint32_t new_freq,
     float *out, uint64_t out_capacity, uint64_t *out_length);

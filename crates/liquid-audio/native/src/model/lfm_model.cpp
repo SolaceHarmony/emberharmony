@@ -430,6 +430,7 @@ struct LfmConversation {
     LfmConformerWorkspace *conformer_workspace = nullptr;
     LfmResampler *resampler = nullptr;
     LfmResamplerWorkspace *resampler_workspace = nullptr;
+    LfmResamplerStream *playback_resampler_stream = nullptr;
     MimiDecodeState *mimi = nullptr;
     LfmAudioRouteResult audio_route{};
     uint32_t route_sampled = 0;
@@ -442,6 +443,7 @@ struct LfmConversation {
     std::vector<float> rope_sin_f32;
     std::vector<uint16_t> hidden;
     std::vector<float> resampled;
+    std::array<float, LFM_MIMI_PCM_CAPACITY> codec_pcm{};
     std::vector<uint16_t> mel_bf16;
     std::vector<uint16_t> adapted;
     std::array<uint32_t, LFM_TEXT_COMMAND_MAX_BYTES> token_scratch{};
@@ -454,6 +456,8 @@ struct LfmConversation {
     size_t rope_half = 0;
     size_t prepared_samples = 0;
     uint32_t prepared_rate = 0;
+    size_t playback_frames = 0;
+    uint32_t playback_rate = 0;
     bool hidden_ready = false;
     uint32_t modality = 1;
     uint32_t modality_left = 0;
@@ -474,6 +478,9 @@ struct LfmConversation {
             (void)lfm_resampler_workspace_destroy(resampler_workspace);
         }
         if (resampler) (void)lfm_resampler_destroy(resampler);
+        if (playback_resampler_stream) {
+            (void)lfm_resampler_stream_destroy(playback_resampler_stream);
+        }
         if (conformer_workspace) {
             (void)lfm_conformer_workspace_destroy(conformer_workspace);
         }
@@ -787,6 +794,9 @@ int reset_memory(LfmConversation &conversation) {
     conversation.generation_active = false;
     conversation.generation_ended = false;
     if (conversation.mimi) mimi_decode_state_reset(conversation.mimi);
+    if (conversation.playback_resampler_stream) {
+        lfm_resampler_stream_reset(conversation.playback_resampler_stream);
+    }
     return 0;
 }
 
@@ -841,8 +851,62 @@ int prefill_rows_claimed(LfmConversation &conversation, const uint16_t *rows,
     return 0;
 }
 
+int prepare_playback_claimed(LfmConversation &conversation,
+                             uint32_t sample_rate,
+                             size_t *out_playback_frames) {
+    LfmModel *model = conversation.model;
+    if (!model || model->sample_rate == 0 || sample_rate == 0 ||
+        !out_playback_frames) {
+        return -EINVAL;
+    }
+    if (conversation.playback_rate == sample_rate &&
+        conversation.playback_frames != 0 &&
+        ((sample_rate == model->sample_rate &&
+          !conversation.playback_resampler_stream) ||
+         (sample_rate != model->sample_rate &&
+          conversation.playback_resampler_stream))) {
+        *out_playback_frames = conversation.playback_frames;
+        return 0;
+    }
+
+    LfmResamplerStream *stream = nullptr;
+    /* Every route admits Mimi's complete documented 3,840-sample result. The
+     * rate-changing geometry therefore reserves the maximum corresponding
+     * device-rate span, even though steady-state steps usually return 1,920. */
+    uint64_t frames = LFM_MIMI_PCM_CAPACITY;
+    int status = 0;
+    if (sample_rate != model->sample_rate) {
+        status = lfm_resampler_stream_create(
+            model->sample_rate, sample_rate, LFM_MIMI_PCM_CAPACITY, &stream);
+        if (status == 0) {
+            status = lfm_resampler_stream_out_length(
+                stream, LFM_MIMI_PCM_CAPACITY, &frames);
+        }
+    }
+    if (status == 0 &&
+        (frames == 0 || frames > std::numeric_limits<size_t>::max() ||
+         frames > UINT32_MAX)) {
+        status = -EOVERFLOW;
+    }
+    if (status != 0) {
+        if (stream) (void)lfm_resampler_stream_destroy(stream);
+        return status;
+    }
+
+    if (conversation.playback_resampler_stream) {
+        (void)lfm_resampler_stream_destroy(
+            conversation.playback_resampler_stream);
+    }
+    conversation.playback_resampler_stream = stream;
+    conversation.playback_frames = (size_t)frames;
+    conversation.playback_rate = sample_rate;
+    *out_playback_frames = conversation.playback_frames;
+    return 0;
+}
+
 int prepare_pcm_claimed(LfmConversation &conversation, size_t max_sample_count,
-                        uint32_t sample_rate) {
+                        uint32_t sample_rate,
+                        size_t *out_playback_frames) {
     LfmModel *model = conversation.model;
     if (!model || !model->frontend || !model->conformer ||
         !conversation.frontend_workspace || !conversation.conformer_workspace ||
@@ -853,7 +917,8 @@ int prepare_pcm_claimed(LfmConversation &conversation, size_t max_sample_count,
     if (conversation.resampler && conversation.resampler_workspace &&
         conversation.prepared_rate == sample_rate &&
         conversation.prepared_samples >= max_sample_count) {
-        return 0;
+        return prepare_playback_claimed(conversation, sample_rate,
+                                        out_playback_frames);
     }
 
     LfmResampler *plan = nullptr;
@@ -916,7 +981,8 @@ int prepare_pcm_claimed(LfmConversation &conversation, size_t max_sample_count,
     conversation.resampler_workspace = workspace;
     conversation.prepared_samples = max_sample_count;
     conversation.prepared_rate = sample_rate;
-    return 0;
+    return prepare_playback_claimed(conversation, sample_rate,
+                                    out_playback_frames);
 }
 
 int prepare_pcm_rows_claimed(LfmConversation &conversation, const float *pcm,
@@ -1346,6 +1412,18 @@ int submit_next_emission_into_claimed(
         .expected_rope_base = conversation.window.rope_base,
         .token_committed = &result.token_committed,
     };
+    if (conversation.playback_rate == 0 || conversation.playback_frames == 0 ||
+        target.pcm_capacity < conversation.playback_frames) {
+        return -ENOBUFS;
+    }
+    LfmAudioRouteTarget bound_target = target;
+    bound_target.codec_pcm = nullptr;
+    bound_target.codec_pcm_capacity = 0;
+    bound_target.resampler_stream = conversation.playback_resampler_stream;
+    if (bound_target.resampler_stream) {
+        bound_target.codec_pcm = conversation.codec_pcm.data();
+        bound_target.codec_pcm_capacity = conversation.codec_pcm.size();
+    }
     if (async_handle) {
         status = lfm_engine_audio_route_submit(
             conversation.model->engine, conversation.model->plan_id,
@@ -1363,7 +1441,8 @@ int submit_next_emission_into_claimed(
                 conversation.window.start * conversation.rope_half,
             conversation.hidden.data(), conversation.hidden.size(),
             &conversation.audio_sampler, &conversation.prng,
-            conversation.mimi, &target, &result, conversation.model->lanes,
+            conversation.mimi, &bound_target, &result,
+            conversation.model->lanes,
             &commit, notify, notify_context, async_handle);
     } else {
         ExecutionClaim execution(conversation.model->execution);
@@ -1383,7 +1462,8 @@ int submit_next_emission_into_claimed(
                 conversation.window.start * conversation.rope_half,
             conversation.hidden.data(), conversation.hidden.size(),
             &conversation.audio_sampler, &conversation.prng,
-            conversation.mimi, &target, &result, conversation.model->lanes,
+            conversation.mimi, &bound_target, &result,
+            conversation.model->lanes,
             &commit);
     }
     return status;
@@ -1441,8 +1521,12 @@ int begin_generation_claimed(LfmConversation &conversation, uint32_t sampled,
     if (status != 0) return status;
     /* Candle created a fresh Mimi streaming decoder for every response. Keep
      * that turn boundary here, after the turn has begun successfully and only
-     * once: interleaved audio runs within the turn must share codec state. */
+     * once: interleaved audio runs within the turn share both codec and output
+     * rate-conversion state. */
     if (conversation.mimi) mimi_decode_state_reset(conversation.mimi);
+    if (conversation.playback_resampler_stream) {
+        lfm_resampler_stream_reset(conversation.playback_resampler_stream);
+    }
     return 0;
 }
 
@@ -1465,13 +1549,17 @@ int prefill_assistant_claimed(LfmConversation &conversation,
 
 int lfm_conversation_prepare_pcm_native(LfmConversation *conversation,
                                         size_t max_sample_count,
-                                        uint32_t sample_rate) {
-    if (!conversation || max_sample_count == 0 || sample_rate == 0) {
+                                        uint32_t sample_rate,
+                                        size_t *out_playback_frames) {
+    if (!conversation || max_sample_count == 0 || sample_rate == 0 ||
+        !out_playback_frames) {
         return -EINVAL;
     }
+    *out_playback_frames = 0;
     ConversationClaim claim(conversation);
     if (!claim) return -EBUSY;
-    return prepare_pcm_claimed(*conversation, max_sample_count, sample_rate);
+    return prepare_pcm_claimed(*conversation, max_sample_count, sample_rate,
+                               out_playback_frames);
 }
 
 int lfm_conversation_begin_pcm_native(LfmConversation *conversation,

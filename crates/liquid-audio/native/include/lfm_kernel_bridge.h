@@ -216,6 +216,11 @@ int lfm_kernel_bridge_submit(LfmKernelBridge *bridge,
  * This deliberately performs no descriptor retain or queue-ledger release. */
 int lfm_kernel_bridge_submit_borrowed(
     LfmKernelBridge *bridge, const KcSubmissionV1 *submission);
+/* Nonblocking CQ receive. Returns -EAGAIN while the queue is empty and
+ * -ECANCELED only after stop has closed submission admission and every
+ * accepted ticket has settled. */
+int lfm_kernel_bridge_try_completion(LfmKernelBridge *bridge,
+                                     KcCompletionV1 *out);
 int lfm_kernel_bridge_wait_completion(LfmKernelBridge *bridge,
                                       KcCompletionV1 *out,
                                       uint64_t deadline_ns);
@@ -225,6 +230,8 @@ int lfm_kernel_bridge_wait_completion(LfmKernelBridge *bridge,
  * These functions perform no policy work. A nonzero deadline is absolute
  * monotonic time; zero waits forever.
  */
+int lfm_kernel_bridge_try_submission(LfmKernelBridge *bridge,
+                                     KcSubmissionV1 *out);
 int lfm_kernel_bridge_wait_submission(LfmKernelBridge *bridge,
                                       KcSubmissionV1 *out,
                                       uint64_t deadline_ns);

@@ -61,6 +61,15 @@ LFM_INTERNAL_API int lfm_engine_conformer_gemm_team(
     const void *weight_bytes, size_t weight_count, float *out,
     size_t out_count, size_t rows, size_t columns, size_t inner);
 
+// Direct-destination counterpart used by production Conformer linears. The
+// fixed team owns disjoint output-column bands and publishes BF16 values
+// directly; no accumulator plane crosses this boundary.
+LFM_INTERNAL_API int lfm_engine_conformer_gemm_team_bf16(
+    void *engine, const uint16_t *activation, size_t activation_count,
+    const void *weight_bytes, size_t weight_count,
+    const void *bias_bytes, size_t bias_count, uint16_t *out,
+    size_t out_count, size_t rows, size_t columns, size_t inner);
+
 // Same numerical program as lfm_conformer_forward, but its direct BF16 linears
 // use the in-ticket fixed-team substage above instead of nested SQ submissions.
 LFM_INTERNAL_API int lfm_conformer_forward_engine_team(
