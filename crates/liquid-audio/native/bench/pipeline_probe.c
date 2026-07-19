@@ -19,7 +19,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#if defined(__APPLE__)
 #include <pthread/qos.h>
+#endif
 
 static uint16_t f2b(float f){ uint32_t x; memcpy(&x,&f,4); uint32_t l=(x>>16)&1u; x+=0x7fffu+l; return (uint16_t)(x>>16); }
 static void* am(size_t n){ void*p=NULL; if(posix_memalign(&p,128,n)){perror("alloc");exit(1);} return p; }
@@ -37,13 +39,19 @@ static float dot_bfdot(const uint16_t*w,const uint16_t*x,int K){
   return vaddvq_f32(vaddq_f32(vaddq_f32(c0,c1),vaddq_f32(c2,c3)));
 }
 
+// Each contended word gets its own 128-byte line — Apple cache-line size. Without
+// this the tile counter, completion counter, and both doorbell words share one
+// line and the team ping-pongs it across cores (the exact flashkern false-sharing
+// class); scaling and wake-cost numbers would then include self-inflicted traffic.
 typedef struct {
   int workers;
   const uint16_t *W,*x; float *y; int N,K,tile_rows;
-  atomic_int tile_next, completed;
-  uint32_t dispatch_val, done_val;      // doorbell addresses (raw u32, acquire/release accessed)
+  _Alignas(128) atomic_int tile_next;
+  _Alignas(128) atomic_int completed;
+  _Alignas(128) uint32_t dispatch_val;  // doorbell address (raw u32, acquire/release accessed)
+  _Alignas(128) uint32_t done_val;
   kc_port_wait_word *dispatch, *done;
-  atomic_int stop;
+  _Alignas(128) atomic_int stop;
 } Engine;
 
 static void run_tiles(Engine*e){
@@ -58,7 +66,9 @@ static void run_tiles(Engine*e){
 
 static void* worker_main(void*arg){
   Engine*e=(Engine*)arg;
-  pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE,0);   // bias to P-cores
+#if defined(__APPLE__)
+  pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE,0);   // bias to P-cores (macOS-only)
+#endif
   uint32_t last=0;
   for(;;){
     uint32_t cur=__atomic_load_n(&e->dispatch_val,__ATOMIC_ACQUIRE);

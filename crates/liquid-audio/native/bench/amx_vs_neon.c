@@ -14,6 +14,7 @@
 //
 // Build: clang -O3 -ffp-contract=off amx_vs_neon.c -framework Accelerate -o amx_vs_neon
 // Run:   ./amx_vs_neon        (measured results for M2 Max in bench/README.md)
+#define ACCELERATE_NEW_LAPACK 1   // non-deprecated cblas interface (32-bit ints)
 #include <Accelerate/Accelerate.h>
 #include <arm_neon.h>
 #include <stdio.h>
