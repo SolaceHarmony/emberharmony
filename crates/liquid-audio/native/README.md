@@ -6,6 +6,7 @@
 - `kernels/aarch64/` — hand-written AArch64/NEON assembly math.
 - `kernels/x86_64/` — hand-written x86-64 assembly math.
 - `reference/` — reference or fallback kernels.
+- `bench/` — standalone microbenchmarks/experiments (not built by `../build.rs`).
 
 Cargo builds these sources through `../build.rs`. Rust sees opaque engine/model
 handles and PCM/control docking records, never numerical kernel symbols. The
