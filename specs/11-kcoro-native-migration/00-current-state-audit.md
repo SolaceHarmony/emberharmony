@@ -91,7 +91,7 @@ flowchart LR
 | Product settings | `Lfm2Device`, `LocalVoiceEngine`, and `Lfm2Settings` are defined in `packages/desktop/src-tauri/src/settings.rs:60-250`; `local_runtime_config`, `build_engine`, and `select_device` consume them in `packages/desktop/src-tauri/src/voice/runtime.rs:2712-2829`. | Keep persisted settings as the only product source of truth. Device selection remains runtime policy. |
 | Top-level local session | `Lfm2Session::spawn` creates local WebRTC input/output and a `voice-session` thread in `packages/desktop/src-tauri/src/voice/runtime.rs:2312-2369`. | Replace the session body with one opaque native session handle. |
 | Rust runtime lifecycle | `VoiceRuntime` owns stop flags and a join handle at `crates/liquid-audio/src/runtime/voice_runtime.rs:637-802`; `session_loop` builds pipelines at `821-1038`. | Delete this lifecycle after the C ABI owns start, interrupt, stop, join, and destroy. |
-| PCM queues | `PcmRing` is an SPSC sample ring with a Crossbeam wake channel at `crates/liquid-audio/src/runtime/voice_runtime.rs:163-282`. | Preserve bounded SPSC storage as Rust-owned PCM lease pools. Connect them to the native session through exact kcoro docking-ring doorbells. |
+| PCM queues | `PcmRing` is a bounded SPSC sample region with block-atomic admission, one release publication, and a shared kcoro expected-value doorbell. The Crossbeam wake token and timed progress waits are gone; payload spans still drain into Rust vectors. | Replace sample storage with retained block leases so callback publication, VAD commit, native capture, and playback release exchange descriptors rather than payload copies. |
 | Local device callbacks | CPAL input copies/converts samples at `crates/liquid-audio/src/runtime/voice_runtime.rs:1820-1870`; CPAL output drains the ring at `1877-2000`. The desktop path instead builds Rust WebRTC/PlatformAudio loopbacks at `packages/desktop/src-tauri/src/voice/runtime.rs:2965-3419`. | Rust owns the platform stream callbacks. They perform only the required device-buffer/PCM-block copy and lease publication/release; native code owns VAD, DSP, model, and codec work. |
 | Turn VAD | `vad_loop` owns accumulation, pause detection, speculative prepare, utterance slicing, and submission in `crates/liquid-audio/src/runtime/voice_runtime.rs:1344-1596`. | Port endpointing and barge-in state into the native session state machine. |
 | Frame input | `frame_loop` allocates/resamples frame vectors and submits them to a Rust worker at `crates/liquid-audio/src/runtime/voice_runtime.rs:1599-1775`. | Frames become retained spans in the capture ring; no `Vec<f32>` crosses a queue. |
@@ -133,9 +133,10 @@ therefore the source image, not yet the production compute representation.
 These are the payload movements that must disappear from the local production
 path:
 
-1. The audio callback writes one sample at a time into `PcmRing`
-   (`voice_runtime.rs:1842-1855`). The device-to-ring copy is unavoidable, but
-   its scalar API is not.
+1. The audio callback converts a complete device block directly into `PcmRing`
+   and publishes it once; admission is all-or-drop. The unavoidable callback
+   copy still lands in transitional Rust sample storage rather than the final
+   generation-checked capture lease.
 2. `PcmRing::drain_into` appends samples into Rust vectors
    (`voice_runtime.rs:254-260`).
 3. VAD slices a new utterance vector (`voice_runtime.rs:1511`, `1542-1556`).

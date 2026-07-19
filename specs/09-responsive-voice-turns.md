@@ -141,8 +141,8 @@ speaker-tagged at commit time, audio-grounded.
 |---|---|---|
 | Echo identity guessed from loudness: barge-in requires mic RMS > max(3× base, 2.5× playback RMS) | `voice_runtime.rs:1267–1277` | Loud echo self-interrupts; quiet user can't interrupt |
 | Model goes deaf during own turn: `mic.clear()` while assistant speaks (default `can_interrupt=false`) | `voice_runtime.rs:1012–1018` | Overlapped user speech destroyed — never reaches context |
-| VAD uses 200ms analysis windows; sustained barge-in policy is 400ms | `voice_runtime.rs` VAD policy constants and `window = in_rate / 5` | Policy is frame-shaped, but the current consumer still uses a timed wake loop |
-| End-of-turn = 500ms silence (`silence_ms` default, reduced from 800ms after live testing) | `voice_runtime.rs` defaults | The duration is valid policy; discovering it through a 40ms timeout heartbeat is not |
+| VAD uses 200ms analysis windows; sustained barge-in policy is 400ms | `voice_runtime.rs` VAD policy constants and `window = in_rate / 5` | Policy is sample-clock state; callbacks advance it and a kcoro doorbell resumes the consumer |
+| End-of-turn = 500ms silence (`silence_ms` default, reduced from 800ms after live testing) | `voice_runtime.rs` defaults | The duration is converted to `silence_frames`; the former 40ms timeout heartbeat is deleted |
 | Full-utterance mel + prefill happens **after** end-of-turn | `realtime.rs:722–892` | O(utterance) work in the response-latency critical path |
 | AEC never verified; macOS uses software AEC3 (VPIO is iOS-only), AGC may amplify residual echo | `libwebrtc audio_source.rs` platform notes | Self-interruption persists despite AEC being "on" |
 | Moshi path: hard interrupt resets LM state entirely | `realtime.rs:433–437, 1022–1026` | Contradicts context-is-thoughts for the Moshi engine |
