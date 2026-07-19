@@ -26,8 +26,21 @@ pub enum VoiceEvent {
     Error(String),
 }
 
+/// Direct, borrowed PCM consumer installed by application orchestration.
+/// Implementations must consume the span synchronously; it names a retained
+/// native playback lease which is released as soon as this call returns.
+pub trait PcmSink: Send + Sync {
+    fn consume(&self, pcm: &[f32], rate: u32) -> bool;
+}
+
 /// Tensor-free model/session edge used by application orchestration.
 pub trait VoiceEngine: Send {
+    /// Install the direct PCM path when supported. `false` retains the semantic
+    /// `VoiceEvent::Audio` compatibility path used by offline/oracle engines.
+    fn install_pcm_sink(&mut self, _sink: Arc<dyn PcmSink>) -> bool {
+        false
+    }
+
     fn respond(
         &mut self,
         utterance: &Utterance,
@@ -64,6 +77,10 @@ pub trait VoiceEngine: Send {
 }
 
 impl<T: VoiceEngine + ?Sized> VoiceEngine for Box<T> {
+    fn install_pcm_sink(&mut self, sink: Arc<dyn PcmSink>) -> bool {
+        (**self).install_pcm_sink(sink)
+    }
+
     fn respond(
         &mut self,
         utterance: &Utterance,

@@ -19,7 +19,8 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    FrameSubmitError, RealtimeFramePipeline, RealtimePipeline, Utterance, VoiceEngine, VoiceEvent,
+    FrameSubmitError, PcmSink, RealtimeFramePipeline, RealtimePipeline, Utterance, VoiceEngine,
+    VoiceEvent,
 };
 
 type Res<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -32,6 +33,16 @@ pub type RuntimeMain = Box<dyn FnOnce() + Send + 'static>;
 type HostStream = cpal::Stream;
 #[cfg(not(feature = "audio-io"))]
 struct HostStream;
+
+struct DirectPcmSink {
+    consume: Box<dyn Fn(&[f32], u32) -> bool + Send + Sync>,
+}
+
+impl PcmSink for DirectPcmSink {
+    fn consume(&self, pcm: &[f32], rate: u32) -> bool {
+        (self.consume)(pcm, rate)
+    }
+}
 
 const MIC_RING_SECONDS: usize = 6;
 const SPEAKER_RING_SECONDS: usize = 4;
@@ -853,7 +864,7 @@ fn session_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
             return;
         }
     };
-    let engine = match build_engine(output.rate) {
+    let mut engine = match build_engine(output.rate) {
         Ok(engine) => engine,
         Err(error) => {
             if !emit_or_stop(
@@ -871,6 +882,68 @@ fn session_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
             return;
         }
     };
+    let assistant = Arc::new(AtomicBool::new(false));
+    let latency = TurnLatency::new();
+    const DIRECT_PCM: &str = "native direct PCM";
+    const DIRECT_RMS: f32 = TURN_LATENCY_AGENT_RMS;
+    const DIRECT_RATE_ERROR: &str = "native PCM rate does not match the output path";
+    const DIRECT_STATE_ERROR: &str = "native PCM state event was rejected";
+    let direct_ring = output.ring.clone();
+    let direct_rate = output.rate;
+    let direct_external = output.external.is_some();
+    let direct_audio = audio.clone();
+    let direct_playback = output.playback.clone();
+    let direct_assistant = assistant.clone();
+    let direct_latency = latency.clone();
+    let direct_sink = sink.clone();
+    let direct_stop = stop.clone();
+    let _ = engine.install_pcm_sink(Arc::new(DirectPcmSink {
+        consume: Box::new(move |pcm, rate| {
+            if rate != direct_rate {
+                let message =
+                    format!("{DIRECT_RATE_ERROR}: received {rate} Hz, expected {direct_rate} Hz");
+                return emit_or_stop(&direct_sink, &direct_stop, RuntimeEvent::Error(message));
+            }
+            let level = rms(pcm);
+            if !direct_assistant.swap(true, Ordering::SeqCst)
+                && !emit_or_stop(
+                    &direct_sink,
+                    &direct_stop,
+                    RuntimeEvent::State(SessionState::Speaking),
+                )
+            {
+                eprintln!("[{DIRECT_PCM}] {DIRECT_STATE_ERROR}");
+                return false;
+            }
+            if level > DIRECT_RMS {
+                if let Some(ms) = direct_latency.try_measure() {
+                    direct_audio.record_turn_latency(ms);
+                    eprintln!(
+                        "[voice-latency] pause→first-audio {ms} ms (rating {}/5)",
+                        turn_latency_rating(ms)
+                    );
+                }
+                if let Some(ms) = direct_latency.first_word() {
+                    eprintln!("[voice-latency] first word {ms} ms after session start");
+                }
+            }
+            let dropped = direct_ring.push_slice(pcm);
+            let queued = pcm.len().saturating_sub(dropped);
+            direct_audio
+                .decoded_samples
+                .fetch_add(pcm.len() as u64, Ordering::Relaxed);
+            direct_audio
+                .queued_samples
+                .fetch_add(queued as u64, Ordering::Relaxed);
+            direct_audio
+                .dropped_samples
+                .fetch_add(dropped as u64, Ordering::Relaxed);
+            if direct_external && dropped == 0 {
+                direct_playback.set_playing(level);
+            }
+            !direct_stop.load(Ordering::SeqCst)
+        }),
+    }));
     if stop.load(Ordering::SeqCst) {
         emit_or_stop(&sink, &stop, RuntimeEvent::Ended(None));
         return;
@@ -949,8 +1022,6 @@ fn session_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
             }
         }
     };
-    let assistant = Arc::new(AtomicBool::new(false));
-    let latency = TurnLatency::new();
     let events = match &pipeline {
         Pipeline::Turn(pipe) => pipe.events().clone(),
         Pipeline::Frame(pipe) => pipe.events().clone(),
@@ -1067,7 +1138,6 @@ fn spawn_consumer<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
     let output_stop = Arc::new(AtomicBool::new(false));
     let (output_sink, output_worker, output_ring) = match output {
         Some(output) => {
-            let ring = PcmRing::new(out_rate as usize * SPEAKER_RING_SECONDS);
             let thread_ring = ring.clone();
             let flush = output_flush.clone();
             let thread_stop = output_stop.clone();

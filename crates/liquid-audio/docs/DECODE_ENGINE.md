@@ -54,9 +54,10 @@ coarse node, marks its pooled route instance ready, and lets the native broker
 reacquire capacity in FIFO/age-promoted order. Its exact-CQ callback performs no
 submission, allocation, wait, or descriptor lock. Packed `{generation,state}`
 CAS transitions prevent slot theft and stale-destructor ABA, and `FREE` is the
-final accounting publication edge. The session coordinator still parks once for
-terminal route collection. Moving that final edge into the session event loop is
-the remaining orchestration cut, not a Rust recurrence or ownership gap.
+final accounting publication edge. Text and audio admission return a pooled
+handle; terminal notification rings the session work doorbell and the
+coordinator collects that exact generation. The coordinator never waits for a
+numerical pass or holds a compute slot across an external-resource boundary.
 
 Flashkern is the CPU executor, never the Metal executor. CPU kernels retain NEON,
 BFMMLA/BFDOT, AVX2, and AVX-512-BF16 paths. Unsupported Metal selection fails
@@ -241,12 +242,13 @@ epochs, and expected-value space/data doorbells. Reliable text and terminal reco
 park for capacity; telemetry alone may be lossy. A stale epoch may finish a pass but
 cannot publish its value.
 
-The remaining transport debt is outside model inference. Today
-`NativeLfm2VoiceEngine` copies an existing Rust `Utterance.samples` slice into a
-reserved native capture lease, and its playback thread copies a resolved native
-PCM lease with `to_vec()` before projecting `Reply::Audio`/`VoiceEvent::Audio`
-through a bounded crossbeam channel. The physical kcoro mic/speaker adapter must
-fill/drain native leases directly and retire that legacy `Vec` observer bridge.
+The remaining transport debt is capture-side. `NativeLfm2VoiceEngine` still
+copies an existing Rust `Utterance.samples` slice into a reserved native capture
+lease. Playback no longer materializes a `Vec`: its Rust sink consumes the
+resolved borrowed span synchronously, releases the lease, and sends only a
+ticket completion record. Direct callback-filled capture chunks require a
+separate VAD commit command; publishing a chunk cannot continue to imply
+"begin a turn."
 
 ### Thread model (AS-BUILT)
 
@@ -385,19 +387,17 @@ Do not compare them across executors or extrapolate a current latency.
    admission, sampling, recurrence, tickets, epochs, reliable events, context
    rollover, shared-model fairness, and stop/join are live. The default graph and
    desktop construct only the opaque native LFM2 path; Candle/Moshi are oracle-only.
-4. **Session continuation adoption: broker built; terminal edge next.** The
+4. **Session continuation adoption: built.** The
    engine has capacity 2, one scratch bank per admitted program, a fixed route
    pool, and an expected-value broker. Exact-CQ releases the slot before the next
-   node becomes ready, so peers may queue without Rust progress. Move terminal
-   route collection out of synchronous `run_action` and into the native session
-   event loop.
-   Batched M≤4 prefill is already direct checkpoint BF16. This removes the parked
-   coordinator from numerical progress; Rust already owns none of the recurrence.
-5. **Physical kcoro audio-device adapter: next.** Have mic/speaker callbacks
-   reserve and drain native PCM leases directly. Delete the `Utterance.samples`
-   copy, playback `to_vec()`, crossbeam `Reply::Audio`, and legacy
-   `VoiceEvent::Audio` observer bridge while preserving bounded reliable text and
-   control projection.
+   node becomes ready, so peers may queue without Rust progress. A
+   coordinator-owned `SessionAction` collects text and audio terminal handles
+   after a doorbell edge. Batched M≤4 prefill is already direct checkpoint BF16.
+5. **Physical kcoro audio-device adapter: capture half next.** Playback drains a
+   borrowed native lease through `PcmSink`; no PCM payload crosses the reply or
+   native event channels. Add callback-filled capture leases plus a VAD commit
+   command, then delete the remaining `Utterance.samples` copy while preserving
+   bounded reliable text and control projection.
 6. **Native Moshi: subsequent independent tranche.** Port Moshi onto the same
    image/session discipline before making it selectable in production. The LFM2
    cutover neither implements Moshi nor permits a Candle fallback.

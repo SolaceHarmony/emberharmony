@@ -33,11 +33,11 @@ production fallback.
 | Typed binding | **Landed.** Exact BF16/F32 dtype, rank, shape, layer, codebook, and vocabulary checks; possibly unaligned tensors remain byte views. | None for LFM2. |
 | Weight consumption | **Landed.** Frontend, Conformer, backbone, Depthformer, and Mimi bind the same image; BF16 unlift occurs in registers. | `compatibility_copied_bytes == 0` remains an acceptance assertion. Its counters were **stubs returning a literal 0** (review 2026-07-16) — the gate could not fail; now wired to real per-plan tallies. See "Accounting is a tally, not a constant" below. |
 | Native model chain | **Landed for numerical ownership.** One typed, model-correlated `REQ_AUDIO_ENCODE` pass owns resample → valid-only BF16 frontend → whole Conformer/adapter over borrowed spans and pre-reserved conversation buffers. Modality assembly, M≤4 checkpoint-BF16 prefill, backbone, sampling, Depthformer, Mimi, and tokenizer are also native-owned. | No remaining numerical-stage ownership gap for LFM2. The coordinator-to-continuation scheduling cut is tracked in the conversation/session row. |
-| Conversation/session | **Landed.** Native KV/ShortConv/codec state, PRNG, cursor, recurrence, text/PCM tickets, reliable events, epochs, interrupt, stop, and join. Rust does not drive progress. A fixed route pool and native expected-value broker release capacity between coarse nodes; exact-CQ callbacks only commit, retire the slot, and publish readiness. | The session coordinator still waits once for terminal route collection. Convert `run_action` to a session-owned asynchronous state machine. |
+| Conversation/session | **Landed.** Native KV/ShortConv/codec state, PRNG, cursor, recurrence, text/PCM tickets, reliable events, epochs, interrupt, stop, and join. Rust does not drive progress. A fixed route pool and native expected-value broker release capacity between coarse nodes; exact-CQ callbacks only commit, retire the slot, and publish readiness. Text and audio routes notify a coordinator-owned `SessionAction`, which collects the exact handle without a numerical wait. | V2 BlockDomains remain separate scheduler work. |
 | Context rollover | **Landed.** Fixed capacity+runway BF16 state, monotonic cursor, absolute RoPE range generation, nonmutating whole-action admission, causal row-by-row eviction, and in-place compaction. | None for the activation-state sliding-window contract. |
 | Shared model | **Landed.** Per-conversation state/scratch and a fair model-owned expected-value pass gate; engine `-EBUSY` does not leak as scheduling policy. | Capacity-2 continuations may improve overlap; fairness is already correct. |
 | Production graph | **Landed.** Desktop creates `NativeVoiceModel` and opaque native conversations/sessions only; default dependencies do not enable Candle or Moshi. | Native Metal/MLX remains a separate future backend and must fail explicitly until mounted. |
-| Physical audio dock | **Partial.** Native generation-checked capture/playback leases and zero-spin doorbells are live. | The Rust adapter still copies `Utterance.samples` into a capture lease and copies playback with `to_vec()` into crossbeam `Reply::Audio`/`VoiceEvent::Audio`. Replace it with direct kcoro device callbacks. |
+| Physical audio dock | **Partial.** Native generation-checked capture/playback leases and zero-spin doorbells are live. Playback is consumed synchronously from the borrowed native span by an installed Rust `PcmSink`; the lease is then released and only `Playback { ticket }` crosses the control channel. | Capture still copies `Utterance.samples` into a lease. Direct callback-filled chunks need a distinct VAD commit command so publishing a chunk does not incorrectly begin a turn. |
 | Moshi | **Not ported.** It is offline/oracle-only and is not the shipped default. | A full native Moshi port is a subsequent tranche; this LFM2 ledger does not claim it. |
 
 ## Completed LFM2 cutover
@@ -95,6 +95,12 @@ Both are now real per-object tallies (`LfmConformer::materialized_weight_bytes`,
 `MimiDecodePlan::compatibility_copied_bytes`), sitting beside the tallies that
 were already real (`bound_weight_bytes`, `derived_bytes`). They still read 0,
 because nothing materializes a weight today — but now that is a *measurement*.
+The positive oracle witness is
+`rust_owner_drives_the_compatibility_builder_without_reopening_the_file`: it
+starts at zero, drives the deliberately copying Candle bridge, and requires the
+counter to report exactly one tensor and its payload bytes. Production plan
+counters remain zero because there is intentionally no legal production
+copying path to exercise.
 
 **Invariant:** any code that materializes a weight MUST add its bytes to the
 owning tally, exactly as binding adds to `bound_weight_bytes`. A weight-norm fold
@@ -161,14 +167,15 @@ BF16 linears execute as fixed-team substages without nested SQ submission. The
 parity gate proves exact stage output and unchanged prepared-storage capacity on
 a second pass. No additional per-stage ticket split is required.
 
-### F1 — Pooled completion continuations — broker landed, session cut open
+### F1 — Pooled completion continuations — landed
 
 The engine substrate is landed: two native request/scratch slots, a capacity-2
 SQ/CQ, exact-ticket completion routing, callback-driven follow-on admission, and
 full-pass serialization. Slot generation and state form one atomic lease; exact
 CQ retains that lease across the callback, and deterministic tests cover peer
 producer handoff, stale-owner ABA, stop during execution, and capacity
-accounting. The bounded audio route now uses a fixed eight-instance pool and a
+accounting. The bounded route now uses a fixed 64-instance pool (the maximum
+runtime session count) and a
 native expected-value broker. An exact-CQ callback commits the declared state,
 releases its pass slot, marks only the next coarse node ready, and rings the
 broker; it does not submit, wait, allocate, or take either submission/descriptor
@@ -176,11 +183,13 @@ mutex. Ordinary bridge descriptors are created by the broker and live for one
 program. FIFO sequence order plus bounded age promotion chooses ready work, so a
 route does not retain either capacity-2 compute slot across a node boundary.
 
-The current C++ session coordinator still parks once for the route's terminal
-result. Convert `run_action` into a session-owned asynchronous route state
-machine so command/control progress no longer depends on that terminal wait.
-Preserve one mutating route per conversation and one scratch slot per admitted
-program.
+The C++ session coordinator owns one pooled `SessionAction`. Text uses a
+terminal single-node token route; audio uses token → Depthformer → Mimi. Both
+return after admission, ring the existing expected-value doorbell at terminal
+completion, and are collected by exact generation. No engine slot remains
+mounted while a route waits for playback or reliable-output capacity. One
+mutating route per conversation and one scratch slot per admitted program remain
+hard invariants.
 
 Correct full/suffix/audio prefill is native and production-owned. Its M≤4
 checkpoint-layout BF16 specialization reuses each loaded weight vector across
@@ -191,9 +200,11 @@ execution claim.
 ### F2 — Physical kcoro audio-device adapter
 
 Keep platform device callbacks in Rust, but have them reserve/fill capture leases
-and drain playback leases directly. Delete the current `Vec<f32>` capture/playback
-copies, playback thread projection, crossbeam `Reply::Audio`, and legacy
-`VoiceEvent::Audio` bridge. Preserve bounded reliable transcript/control delivery;
+and drain playback leases directly. Playback now drains its borrowed lease
+through `PcmSink` without `Vec<f32>`, `Reply::Audio`, or native
+`VoiceEvent::Audio` projection. Delete the remaining capture copy by separating
+callback-filled capture publication from the Rust-VAD turn-commit command.
+Preserve bounded reliable transcript/control delivery;
 only waveform/telemetry observation may be lossy.
 
 ### Subsequent — Native Moshi

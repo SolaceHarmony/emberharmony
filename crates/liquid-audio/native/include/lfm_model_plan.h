@@ -56,6 +56,18 @@ typedef struct LfmAudioRouteTarget {
     size_t pcm_capacity;
 } LfmAudioRouteTarget;
 
+/* Private non-owning handle for a route record retained by the native engine.
+ * Only the native session/model layer may hold it; Rust and product ABIs never
+ * observe route identity. */
+typedef struct LfmAudioRouteHandle {
+    void *record;
+    uint64_t generation;
+} LfmAudioRouteHandle;
+
+/* Terminal notification is an internal doorbell edge. Implementations must be
+ * nonblocking, allocation-free, and must not invoke a host callback. */
+typedef void (*LfmAudioRouteNotify)(void *context);
+
 int lfm_context_window_can_commit(const LfmContextWindowState *window);
 int lfm_context_window_commit(LfmContextWindowState *window);
 
@@ -154,6 +166,35 @@ int lfm_engine_audio_route(
     MimiDecodeState *mimi, const LfmAudioRouteTarget *target,
     LfmAudioRouteResult *result, size_t lanes,
     const struct LfmTokenCommitRecord *commit);
+
+int lfm_engine_audio_route_submit(
+    void *engine, uint64_t model_id, uint64_t depth_id,
+    const uint32_t *ids, size_t id_count, uint32_t embedding_kind,
+    const LfmLayerState *states, size_t state_count, size_t position,
+    const uint16_t *rope_cos, const uint16_t *rope_sin,
+    size_t rope_elements, uint16_t *out_hidden, size_t hidden_elements,
+    const LfmSamplerConfigV1 *audio_sampler, LfmPrngStateV1 *prng,
+    MimiDecodeState *mimi, const LfmAudioRouteTarget *target,
+    LfmAudioRouteResult *result, size_t lanes,
+    const struct LfmTokenCommitRecord *commit,
+    LfmAudioRouteNotify notify, void *notify_context,
+    LfmAudioRouteHandle *out_handle);
+
+int lfm_engine_audio_route_collect(void *engine,
+                                   LfmAudioRouteHandle *handle);
+
+/* Single-node sampled token continuation used by interleaved text output. It
+ * shares the same fixed route pool and completion handle as the audio route. */
+int lfm_engine_token_route_submit(
+    void *engine, uint64_t model_id, const uint32_t *ids, size_t id_count,
+    uint32_t embedding_kind, const LfmLayerState *states, size_t state_count,
+    size_t position, const uint16_t *rope_cos, const uint16_t *rope_sin,
+    size_t rope_elements, uint16_t *out_hidden, size_t hidden_elements,
+    const LfmSamplerConfigV1 *sampler, LfmPrngStateV1 *prng,
+    uint32_t *out_token, size_t lanes,
+    const struct LfmTokenCommitRecord *commit,
+    uint32_t *out_token_completed, LfmAudioRouteNotify notify,
+    void *notify_context, LfmAudioRouteHandle *out_handle);
 
 /* Private native prefill seam. The workspace is conversation-owned and fully
  * sized before readiness; production never exposes it or the row/state planes

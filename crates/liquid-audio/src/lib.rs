@@ -69,20 +69,20 @@ pub use native_voice::{
 };
 #[cfg(feature = "oracle")]
 pub use processor::{ChatState, LFM2AudioProcessor, SpecialTokenIds};
+#[cfg(feature = "oracle")]
+pub use realtime::{ConversationVault, Lfm2VoiceEngine, MoshiVoiceEngine};
 pub use realtime::{
     FrameSubmitError, RealtimeFramePipeline, RealtimeFramePipelineHandle, RealtimePipeline,
     RealtimePipelineHandle,
 };
 #[cfg(feature = "oracle")]
-pub use realtime::{ConversationVault, Lfm2VoiceEngine, MoshiVoiceEngine};
-#[cfg(feature = "oracle")]
 pub use threads::{configure_intraop_threads, intraop_default_num_threads};
 #[cfg(feature = "oracle")]
 pub use trainer::{Trainer, TrainerConfig};
 pub use utils::{get_model_dir, LFMModality};
-pub use voice_api::{FrameConfig, Utterance, VoiceEngine, VoiceEvent};
 #[cfg(feature = "download")]
 pub use utils::{snapshot_download_to, snapshot_download_with, DownloadProgress};
+pub use voice_api::{FrameConfig, PcmSink, Utterance, VoiceEngine, VoiceEvent};
 pub use voice_runtime::{
     AudioStatsSnapshot, ExternalAudioInput, ExternalAudioInputWriter, ExternalAudioOutput,
     RuntimeConfig, RuntimeEvent, SessionState, VoiceRuntime,

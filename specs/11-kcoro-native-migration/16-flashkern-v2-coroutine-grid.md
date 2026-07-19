@@ -15,23 +15,28 @@ worker/logical-lane geometry rejects; four physical workers reproduce the
 eight-way logical fold; and the zero-spin gate is green. A bounded production
 `TOKEN_PASS -> DEPTH_FRAME -> MIMI_DECODE` route now advances through exact CQs
 with a total three-node/four-outcome table, reserve-before-admit playback, and a
-direct Mimi write into the retained PCM span. The coordinator still makes one
-outward expected-value terminal wait; its fixed conversation result and stack
-callback are not the future asynchronous route pool. At the cited commit a
+direct Mimi write into the retained PCM span. At the cited commit the
+coordinator still made one outward expected-value terminal wait and its fixed
+conversation result and stack callback were not the future asynchronous route
+pool. At that revision a
 route-exclusive producer lease and three pre-created borrowed descriptors made
 that callback mutex-free while deliberately excluding peer admission; the
 working-tree broker follow-on below replaces that transitional ownership.
 
-**Broker follow-on landed in the working tree.** The route now comes from a
-fixed eight-instance pool. A native expected-value broker creates one ordinary
+**Broker and session follow-on landed in the working tree.** Routes now come
+from a fixed 64-instance pool, matching the maximum session count. A native
+expected-value broker creates one ordinary
 descriptor per coarse program, applies FIFO sequence order with bounded age
 promotion, and reacquires capacity only when the node is runnable. The exact-CQ
 callback commits declared state, releases the pass slot, and marks the next node
 ready; it never submits, waits, allocates, or takes a submission/descriptor
-mutex. The session coordinator still waits once for terminal collection.
+mutex. Text uses the same pool as a terminal single-node sampled-token route.
+Terminal notification only rings the session doorbell; its coordinator-owned
+`SessionAction` performs exact-generation collection and never waits for a
+numerical pass or playback capacity.
 
-**Open after the broker follow-on.** Session-facing asynchronous collection, two
-`BlockDomain`s and reverse-order per-block CQs, event-register waits, and
+**Open after the broker follow-on.** Two `BlockDomain`s and reverse-order
+per-block CQs, event-register waits, and
 concurrent numerical passes remain open.
 
 ## 0. Ground truth and its limits
@@ -293,7 +298,8 @@ Each step is independently gated and leaves a correct fallback geometry:
    slot. The working-tree follow-on replaces that lease with a fixed route pool
    and fair expected-value broker; each node releases its compute slot before it
    re-enters the ready set. Session-facing asynchronous terminal collection and
-   model-owned token-class maps remain before block concurrency.
+   total model-owned token classification are now mounted; block concurrency is
+   the next scheduler boundary.
 3. **V2.2 — extract block state.** Create two `BlockDomain`s, private SPSC CQs,
    and the gang lease. Run one active block/gang only; preserve the already-green
    eight-way logical-fold parity and prove exact reverse-order CQ routing.

@@ -84,7 +84,15 @@ namespace {
 
 constexpr int MAX_WORKERS = 16;
 constexpr size_t PASS_CAPACITY = 2;
-constexpr size_t ROUTE_CAPACITY = 8;
+/* Runtime admission permits at most 64 sessions and each conversation admits
+ * one mutating program. Matching that bound makes route admission lossless:
+ * backpressure occurs at the session queues, never as an unobservable broker
+ * retry after a playback lease has already been reserved. */
+constexpr size_t ROUTE_CAPACITY = 64;
+/* Starvation is measured in broker enqueue epochs, not pool occupancy. Keep the
+ * policy independent from ROUTE_CAPACITY so changing admission memory cannot
+ * silently retune service-class promotion. */
+constexpr uint64_t ROUTE_AGE_PROMOTION = 64;
 // Apple Silicon and every Apple-hosted slice (including Rosetta) run on
 // 128-byte cache lines.  Keeping this conservative size on other targets is
 // harmless and prevents adjacent expected-value words from sharing a line.
@@ -3638,6 +3646,9 @@ struct AudioRouteInstance {
     const LfmRouteEpoch *epoch = nullptr;
     uint64_t expected_epoch = 0;
     LfmAudioRouteResult *result = nullptr;
+    LfmAudioRouteNotify notify = nullptr;
+    void *notify_context = nullptr;
+    bool terminal_after_token = false;
     bool decode_mimi = false;
     LfmTokenCommitRecord commit{};
     uint32_t *token_completed = nullptr;
@@ -3697,6 +3708,7 @@ static void finish_audio_route(PassContinuationPermit *permit,
     }
     signal_all(&route->done);
     signal_all(&route->engine->route_word);
+    if (route->notify) route->notify(route->notify_context);
 }
 
 static void continue_audio_route(PassContinuationPermit *permit,
@@ -3710,6 +3722,10 @@ static void continue_audio_route(PassContinuationPermit *permit,
         const int commit_status = commit_audio_route_token(route);
         if (commit_status != 0) {
             finish_audio_route(permit, route, commit_status);
+            return;
+        }
+        if (route->terminal_after_token) {
+            finish_audio_route(permit, route, 0);
             return;
         }
         if (route->decode_mimi &&
@@ -3882,6 +3898,7 @@ class AudioRouteLease {
     explicit operator bool() const { return route_ != nullptr; }
     AudioRouteInstance *route() const { return route_; }
     uint64_t generation() const { return generation_; }
+    void detach() { route_ = nullptr; }
     AudioRouteLease(const AudioRouteLease &) = delete;
     AudioRouteLease &operator=(const AudioRouteLease &) = delete;
 
@@ -3901,6 +3918,18 @@ static void settle_audio_route(AudioRouteInstance *route, uint32_t from,
     }
     signal_all(&route->done);
     signal_all(&route->engine->route_word);
+    if (route->notify) route->notify(route->notify_context);
+}
+
+static uint64_t audio_route_age(uint64_t snapshot, uint64_t enqueued) {
+    return snapshot >= enqueued ? snapshot - enqueued : 0;
+}
+
+static uint32_t audio_route_service(uint64_t snapshot, uint64_t enqueued,
+                                    uint32_t service) {
+    return audio_route_age(snapshot, enqueued) >= ROUTE_AGE_PROMOTION
+        ? KC_COORD_SERVICE_DEADLINE
+        : service;
 }
 
 static AudioRouteInstance *select_audio_route(AudioRoutePool *pool) {
@@ -3911,10 +3940,11 @@ static AudioRouteInstance *select_audio_route(AudioRoutePool *pool) {
     for (AudioRouteInstance &route : pool->routes) {
         if (route.state.load(std::memory_order_acquire) != AUDIO_ROUTE_READY)
             continue;
-        const uint64_t age = now - route.enqueue_sequence;
-        const uint32_t service = age >= ROUTE_CAPACITY
-            ? KC_COORD_SERVICE_DEADLINE
-            : route.service_class;
+        /* A producer may enqueue after this scan latched `now`. That route is
+         * newer than the snapshot, not infinitely old; age zero prevents a
+         * fresh continuation from jumping genuinely-starved work. */
+        const uint32_t service = audio_route_service(
+            now, route.enqueue_sequence, route.service_class);
         if (!best || service < best_class ||
             (service == best_class &&
              route.enqueue_sequence < best_sequence)) {
@@ -3975,6 +4005,7 @@ static void *audio_route_main(void *context) {
                     route.status = -ECANCELED;
                     if (route.result) route.result->status = -ECANCELED;
                     signal_all(&route.done);
+                    if (route.notify) route.notify(route.notify_context);
                 }
             }
             return nullptr;
@@ -4299,6 +4330,11 @@ int lfm_internal_engine_audio_route_edge_for_test(uint32_t node,
 
 int lfm_internal_engine_audio_token_class_for_test(uint32_t token) {
     return (int)audio_token_class(token);
+}
+
+uint32_t lfm_internal_engine_audio_route_service_for_test(
+    uint64_t snapshot, uint64_t enqueued, uint32_t service) {
+    return audio_route_service(snapshot, enqueued, service);
 }
 
 int lfm_internal_engine_fail_audio_route_depth_for_test(void *ep, int status) {
@@ -5072,9 +5108,19 @@ static int run_audio_route(
     uint32_t *out_codes, size_t code_count, size_t lanes,
     const LfmTokenCommitRecord *commit, uint32_t *out_token_completed,
     MimiDecodeState *mimi, const LfmAudioRouteTarget *target,
-    LfmAudioRouteResult *result) {
+    LfmAudioRouteResult *result, LfmAudioRouteNotify notify = nullptr,
+    void *notify_context = nullptr,
+    LfmAudioRouteHandle *out_handle = nullptr,
+    uint32_t *terminal_sampled = nullptr) {
     Engine *e = static_cast<Engine *>(ep);
+    if (out_handle) *out_handle = {};
+    const bool terminal_after_token = terminal_sampled != nullptr;
     const bool decode_mimi = mimi || target || result;
+    if (terminal_after_token &&
+        (decode_mimi || depth_id != 0 || out_codes != nullptr ||
+         code_count != 0)) {
+        return -EINVAL;
+    }
     if (decode_mimi && (!mimi || !target || !result || !target->epoch ||
                         !target->pcm || target->expected_epoch == 0 ||
                         target->pcm_capacity < LFM_MIMI_PCM_CAPACITY ||
@@ -5095,8 +5141,9 @@ static int run_audio_route(
     *commit->token_committed = 0;
     *out_token_completed = 0;
     const LfmTokenCommitRecord bound_commit = *commit;
-    if (!e || model_id == 0 || depth_id == 0 || !ids || id_count == 0 ||
-        !states || !out_hidden || !out_codes || !bound_commit.window ||
+    if (!e || model_id == 0 || (!terminal_after_token && depth_id == 0) ||
+        !ids || id_count == 0 || !states || !out_hidden ||
+        (!terminal_after_token && !out_codes) || !bound_commit.window ||
         !logical_lane_count_valid(lanes) ||
         !sample_config_valid(audio_sampler)) {
         return -EINVAL;
@@ -5122,17 +5169,22 @@ static int run_audio_route(
     AudioRouteInstance *route = claim.route();
     BackbonePlan *model = find_model(e, model_id);
     DepthPlan *depth = nullptr;
-    for (const std::unique_ptr<DepthPlan> &candidate : e->depth_plans) {
-        if (candidate->id == depth_id) {
-            depth = candidate.get();
-            break;
+    if (!terminal_after_token) {
+        for (const std::unique_ptr<DepthPlan> &candidate : e->depth_plans) {
+            if (candidate->id == depth_id) {
+                depth = candidate.get();
+                break;
+            }
         }
     }
-    if (!model || !model->embed_w || !model->emb_norm_w || !depth) {
+    if (!model || !model->embed_w || !model->emb_norm_w ||
+        (!terminal_after_token && !depth)) {
         return -ESTALE;
     }
-    if (hidden_elements != model->h || hidden_elements != depth->backbone_dim ||
-        code_count != depth->codebooks || state_count != model->layers.size() ||
+    if (hidden_elements != model->h ||
+        (!terminal_after_token && hidden_elements != depth->backbone_dim) ||
+        (!terminal_after_token && code_count != depth->codebooks) ||
+        state_count != model->layers.size() ||
         position >= model->max_ctx) {
         return -EINVAL;
     }
@@ -5198,12 +5250,12 @@ static int run_audio_route(
         .sin_base = rope_sin,
         .out_hidden = out_hidden,
         .out_logits = nullptr,
-        .sampler = nullptr,
-        .sample_state = nullptr,
-        .out_token = nullptr,
+        .sampler = terminal_after_token ? audio_sampler : nullptr,
+        .sample_state = terminal_after_token ? prng : nullptr,
+        .out_token = terminal_sampled,
         .lanes = lanes,
     };
-    route->depth_req = {
+    if (!terminal_after_token) route->depth_req = {
             .hidden = out_hidden,
             .sampler = *audio_sampler,
             .sample_state = prng,
@@ -5226,19 +5278,29 @@ static int run_audio_route(
     route->epoch = decode_mimi ? target->epoch : nullptr;
     route->expected_epoch = decode_mimi ? target->expected_epoch : 0;
     route->result = result;
+    route->notify = notify;
+    route->notify_context = notify_context;
+    route->terminal_after_token = terminal_after_token;
     route->decode_mimi = decode_mimi;
     route->commit = bound_commit;
     route->token_completed = out_token_completed;
     route->status = -EINPROGRESS;
     route->enqueue_sequence =
         e->route_pool->sequence.fetch_add(1, std::memory_order_acq_rel) + 1;
+    if (out_handle) {
+        out_handle->record = route;
+        out_handle->generation = claim.generation();
+    }
     uint32_t claimed = AUDIO_ROUTE_CLAIMED;
     if (!route->state.compare_exchange_strong(
             claimed, AUDIO_ROUTE_READY, std::memory_order_acq_rel,
             std::memory_order_acquire)) {
+        if (out_handle) *out_handle = {};
         return -ESTALE;
     }
+    if (out_handle) claim.detach();
     signal_all(&e->route_word);
+    if (out_handle) return 0;
     return wait_audio_route(route, claim.generation());
 }
 
@@ -5276,6 +5338,75 @@ int lfm_engine_audio_route(
         LFM_MIMI_CODEBOOKS, lanes, commit, &result->token_completed, mimi,
         target, result);
     if (result->status == -EINPROGRESS) result->status = status;
+    return status;
+}
+
+int lfm_engine_audio_route_submit(
+    void *ep, uint64_t model_id, uint64_t depth_id,
+    const uint32_t *ids, size_t id_count, uint32_t embedding_kind,
+    const LfmLayerState *states, size_t state_count, size_t position,
+    const uint16_t *rope_cos, const uint16_t *rope_sin,
+    size_t rope_elements, uint16_t *out_hidden, size_t hidden_elements,
+    const LfmSamplerConfigV1 *audio_sampler, LfmPrngStateV1 *prng,
+    MimiDecodeState *mimi, const LfmAudioRouteTarget *target,
+    LfmAudioRouteResult *result, size_t lanes,
+    const LfmTokenCommitRecord *commit, LfmAudioRouteNotify notify,
+    void *notify_context, LfmAudioRouteHandle *out_handle) {
+    if (!result || !notify || !out_handle) return -EINVAL;
+    return run_audio_route(
+        ep, model_id, depth_id, ids, id_count, embedding_kind, states,
+        state_count, position, rope_cos, rope_sin, rope_elements, out_hidden,
+        hidden_elements, audio_sampler, prng, result->codes,
+        LFM_MIMI_CODEBOOKS, lanes, commit, &result->token_completed, mimi,
+        target, result, notify, notify_context, out_handle);
+}
+
+int lfm_engine_token_route_submit(
+    void *ep, uint64_t model_id, const uint32_t *ids, size_t id_count,
+    uint32_t embedding_kind, const LfmLayerState *states, size_t state_count,
+    size_t position, const uint16_t *rope_cos, const uint16_t *rope_sin,
+    size_t rope_elements, uint16_t *out_hidden, size_t hidden_elements,
+    const LfmSamplerConfigV1 *sampler, LfmPrngStateV1 *prng,
+    uint32_t *out_token, size_t lanes,
+    const LfmTokenCommitRecord *commit, uint32_t *out_token_completed,
+    LfmAudioRouteNotify notify, void *notify_context,
+    LfmAudioRouteHandle *out_handle) {
+    if (!out_token || !notify || !out_handle) return -EINVAL;
+    return run_audio_route(
+        ep, model_id, 0, ids, id_count, embedding_kind, states, state_count,
+        position, rope_cos, rope_sin, rope_elements, out_hidden,
+        hidden_elements, sampler, prng, nullptr, 0, lanes, commit,
+        out_token_completed, nullptr, nullptr, nullptr, notify,
+        notify_context, out_handle, out_token);
+}
+
+int lfm_engine_audio_route_collect(void *ep,
+                                   LfmAudioRouteHandle *handle) {
+    Engine *engine = static_cast<Engine *>(ep);
+    if (!engine || !handle || !handle->record || handle->generation == 0 ||
+        !engine->route_pool) {
+        return -EINVAL;
+    }
+    AudioRouteInstance *route =
+        static_cast<AudioRouteInstance *>(handle->record);
+    bool owned = false;
+    for (AudioRouteInstance &candidate : engine->route_pool->routes) {
+        if (&candidate == route) {
+            owned = true;
+            break;
+        }
+    }
+    if (!owned || route->engine != engine ||
+        route->generation.load(std::memory_order_acquire) !=
+            handle->generation) {
+        return -ESTALE;
+    }
+    if (route->state.load(std::memory_order_acquire) != AUDIO_ROUTE_DONE) {
+        return -EINPROGRESS;
+    }
+    const int status = route->status;
+    release_audio_route(route, handle->generation);
+    *handle = {};
     return status;
 }
 

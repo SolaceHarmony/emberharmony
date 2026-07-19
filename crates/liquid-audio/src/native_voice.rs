@@ -8,13 +8,13 @@ use std::ffi::{c_char, c_void, CStr, CString};
 use std::path::Path;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 
 use crossbeam_channel::{bounded, Receiver, Sender};
 
 use crate::ffi;
-use crate::voice_api::{Utterance, VoiceEngine, VoiceEvent};
+use crate::voice_api::{PcmSink, Utterance, VoiceEngine, VoiceEvent};
 
 const RUNTIME_ABI: u32 = 1;
 const STATUS_BUSY: i32 = -16;
@@ -631,9 +631,7 @@ enum Reply {
         ticket: Ticket,
         payload: TextPayload,
     },
-    Audio {
-        pcm: Vec<f32>,
-        rate: u32,
+    Playback {
         ticket: Ticket,
     },
     Turn {
@@ -878,6 +876,7 @@ pub struct NativeLfm2VoiceEngine {
     replies: Receiver<Reply>,
     shutdown: Option<Sender<()>>,
     playback: Option<JoinHandle<()>>,
+    pcm: Arc<OnceLock<Arc<dyn PcmSink>>>,
 }
 
 unsafe impl Send for NativeLfm2VoiceEngine {}
@@ -941,7 +940,8 @@ impl NativeLfm2VoiceEngine {
             return Err(error);
         }
         let control = Arc::new(SessionControl(Mutex::new(Some(session))));
-        let playback = match spawn_playback(session, tx, shutdown_rx) {
+        let pcm = Arc::new(OnceLock::new());
+        let playback = match spawn_playback(session, tx, shutdown_rx, pcm.clone()) {
             Ok(playback) => playback,
             Err(error) => {
                 drop(shutdown);
@@ -962,6 +962,7 @@ impl NativeLfm2VoiceEngine {
             replies,
             shutdown: Some(shutdown),
             playback: Some(playback),
+            pcm,
         })
     }
 
@@ -1104,8 +1105,8 @@ impl NativeLfm2VoiceEngine {
         emit: &mut dyn FnMut(VoiceEvent),
     ) -> Result<bool, String> {
         let mut turn: Option<(Ticket, bool, u32)> = None;
-        let mut audio_ticket: Option<Ticket> = None;
-        let mut audio_count = 0u32;
+        let mut playback_ticket: Option<Ticket> = None;
+        let mut playback_count = 0u32;
         let mut text = Utf8Stream::default();
         loop {
             let reply = match self.replies.recv() {
@@ -1132,16 +1133,13 @@ impl NativeLfm2VoiceEngine {
                     }
                 }
                 Reply::Text { .. } => {}
-                Reply::Audio {
-                    pcm,
-                    rate,
+                Reply::Playback {
                     ticket: reply_ticket,
                 } if reply_ticket == ticket => {
-                    audio_count = audio_count.saturating_add(1);
-                    audio_ticket = Some(reply_ticket);
-                    emit(VoiceEvent::Audio { pcm, rate });
+                    playback_count = playback_count.saturating_add(1);
+                    playback_ticket = Some(reply_ticket);
                 }
-                Reply::Audio { .. } => {}
+                Reply::Playback { .. } => {}
                 Reply::Turn {
                     ticket: reply_ticket,
                     status,
@@ -1194,7 +1192,7 @@ impl NativeLfm2VoiceEngine {
                 if !has_audio {
                     return Ok(true);
                 }
-                if audio_ticket == Some(turn_ticket) && audio_count >= playback_leases {
+                if playback_ticket == Some(turn_ticket) && playback_count >= playback_leases {
                     return Ok(true);
                 }
             }
@@ -1206,6 +1204,7 @@ fn spawn_playback(
     session: NonNull<Session>,
     tx: Sender<Reply>,
     shutdown: Receiver<()>,
+    pcm: Arc<OnceLock<Arc<dyn PcmSink>>>,
 ) -> Result<JoinHandle<()>, String> {
     let address = session.as_ptr() as usize;
     std::thread::Builder::new()
@@ -1247,12 +1246,33 @@ fn spawn_playback(
                     unsafe { lfm_session_request_stop(session) };
                     return;
                 }
-                let pcm = unsafe { std::slice::from_raw_parts(samples, count) }.to_vec();
-                let reply = Reply::Audio {
-                    pcm,
-                    rate: lease.sample_rate,
-                    ticket: lease.ticket,
+                let Some(sink) = pcm.get() else {
+                    let _ = unsafe { lfm_audio_dock_release(session, &lease) };
+                    let _ = send_reply(
+                        &tx,
+                        &shutdown,
+                        Reply::Error {
+                            ticket: Some(lease.ticket),
+                            error: "native playback has no installed PCM sink".into(),
+                        },
+                    );
+                    unsafe { lfm_session_request_stop(session) };
+                    return;
                 };
+                let span = unsafe { std::slice::from_raw_parts(samples, count) };
+                if !sink.consume(span, lease.sample_rate) {
+                    let _ = unsafe { lfm_audio_dock_release(session, &lease) };
+                    let _ = send_reply(
+                        &tx,
+                        &shutdown,
+                        Reply::Error {
+                            ticket: Some(lease.ticket),
+                            error: "native PCM sink rejected playback".into(),
+                        },
+                    );
+                    unsafe { lfm_session_request_stop(session) };
+                    return;
+                }
                 let release = unsafe { lfm_audio_dock_release(session, &lease) };
                 if release != 0 {
                     let _ = send_reply(
@@ -1266,7 +1286,15 @@ fn spawn_playback(
                     unsafe { lfm_session_request_stop(session) };
                     return;
                 }
-                if send_reply(&tx, &shutdown, reply).is_err() {
+                if send_reply(
+                    &tx,
+                    &shutdown,
+                    Reply::Playback {
+                        ticket: lease.ticket,
+                    },
+                )
+                .is_err()
+                {
                     return;
                 }
             }
@@ -1275,6 +1303,10 @@ fn spawn_playback(
 }
 
 impl VoiceEngine for NativeLfm2VoiceEngine {
+    fn install_pcm_sink(&mut self, sink: Arc<dyn PcmSink>) -> bool {
+        self.pcm.set(sink).is_ok()
+    }
+
     fn respond(
         &mut self,
         utterance: &Utterance,

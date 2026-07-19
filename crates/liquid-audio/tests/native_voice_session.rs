@@ -1869,6 +1869,50 @@ fn reliable_callback_failure_stops_and_joins_exactly_once() {
 }
 
 #[test]
+fn playback_space_release_rings_the_coordinator_work_doorbell() {
+    let sink = Sink {
+        events: Mutex::new(Vec::new()),
+        edge: Condvar::new(),
+        fail: false,
+    };
+    let runtime = runtime();
+    let session = session(runtime, &sink);
+    assert_eq!(unsafe { lfm_session_start(session) }, 0);
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let parked = loop {
+        let mut snapshot = SessionSnapshot::default();
+        assert_eq!(unsafe { lfm_session_snapshot(session, &mut snapshot) }, 0);
+        if snapshot.coordinator_parks > 0 {
+            break snapshot;
+        }
+        assert!(Instant::now() < deadline, "coordinator did not park");
+        std::thread::yield_now();
+    };
+    let mut lease = Lease::default();
+    assert_eq!(
+        unsafe { lfm_audio_dock_reserve(session, PLAYBACK, 32, 24_000, &mut lease) },
+        0
+    );
+    assert_eq!(unsafe { lfm_audio_dock_release(session, &lease) }, 0);
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let mut snapshot = SessionSnapshot::default();
+        assert_eq!(unsafe { lfm_session_snapshot(session, &mut snapshot) }, 0);
+        if snapshot.coordinator_wakes > parked.coordinator_wakes {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "playback release did not wake the coordinator"
+        );
+        std::thread::yield_now();
+    }
+    unsafe { stop_all(runtime, session, 0) };
+}
+
+#[test]
 fn ticket_lease_hot_path_is_allocation_free_for_100k_cycles() {
     lease_soak(100_000);
 }

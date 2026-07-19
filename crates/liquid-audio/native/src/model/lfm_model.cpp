@@ -432,6 +432,7 @@ struct LfmConversation {
     LfmResamplerWorkspace *resampler_workspace = nullptr;
     MimiDecodeState *mimi = nullptr;
     LfmAudioRouteResult audio_route{};
+    uint32_t route_sampled = 0;
     LfmTokenizerWorkspace *tokenizer_workspace = nullptr;
     std::vector<ConversationLayer> memory;
     std::vector<LfmLayerState> states;
@@ -1264,11 +1265,68 @@ int next_emission_claimed(LfmConversation &conversation,
     return emit_audio_claimed(conversation, codes, out);
 }
 
-int next_emission_into_claimed(LfmConversation &conversation,
-                               const LfmAudioRouteTarget &target,
-                               LfmNativeEmission *out, size_t *out_samples) {
+int submit_next_text_emission_claimed(
+    LfmConversation &conversation, LfmAudioRouteNotify notify,
+    void *notify_context, LfmAudioRouteHandle *handle) {
+    if (!conversation.generation_active || conversation.generation_ended ||
+        conversation.modality != 1 || !notify || !handle) {
+        return -EINVAL;
+    }
+    int status = validate_pending_claimed(conversation);
+    if (status != 0) return status;
+    status = reserve_context(conversation, 1);
+    if (status != 0) return status;
+    LfmAudioRouteResult &result = conversation.audio_route;
+    std::memset(&result, 0, sizeof(result));
+    conversation.route_sampled = 0;
+    const LfmTokenCommitRecord commit = {
+        .window = &conversation.window,
+        .expected_position = conversation.window.position,
+        .expected_start = conversation.window.start,
+        .expected_cursor = conversation.window.cursor,
+        .expected_rope_base = conversation.window.rope_base,
+        .token_committed = &result.token_committed,
+    };
+    return lfm_engine_token_route_submit(
+        conversation.model->engine, conversation.model->plan_id,
+        conversation.pending_ids, conversation.pending_count,
+        conversation.pending_kind, conversation.states.data(),
+        conversation.states.size(), (size_t)conversation.window.position,
+        conversation.rope_cos.empty() ? nullptr
+            : conversation.rope_cos.data() +
+                  conversation.window.start * conversation.rope_half,
+        conversation.rope_sin.empty() ? nullptr
+            : conversation.rope_sin.data() +
+                  conversation.window.start * conversation.rope_half,
+        conversation.rope_cos.size() -
+            conversation.window.start * conversation.rope_half,
+        conversation.hidden.data(), conversation.hidden.size(),
+        &conversation.text_sampler, &conversation.prng,
+        &conversation.route_sampled, conversation.model->lanes, &commit,
+        &result.token_completed, notify, notify_context, handle);
+}
+
+int finish_next_text_emission_claimed(LfmConversation &conversation,
+                                      int status, LfmNativeEmission *out) {
     clear_emission(out, conversation.window.cursor);
-    *out_samples = 0;
+    LfmAudioRouteResult &result = conversation.audio_route;
+    if (result.token_committed != 0) {
+        conversation.pending_count = 0;
+        conversation.pending_kind = 0;
+        conversation.hidden_ready = true;
+        out->position = conversation.window.cursor;
+    }
+    if (status != 0) return status;
+    if (result.token_completed == 0 || result.token_committed == 0) {
+        return -EFAULT;
+    }
+    return emit_text_claimed(conversation, conversation.route_sampled, out);
+}
+
+int submit_next_emission_into_claimed(
+    LfmConversation &conversation, const LfmAudioRouteTarget &target,
+    LfmAudioRouteNotify notify, void *notify_context,
+    LfmAudioRouteHandle *async_handle) {
     if (!conversation.generation_active || conversation.generation_ended ||
         conversation.modality != 3 || !conversation.mimi ||
         conversation.model->codebooks != LFM_MIMI_CODEBOOKS) {
@@ -1288,7 +1346,26 @@ int next_emission_into_claimed(LfmConversation &conversation,
         .expected_rope_base = conversation.window.rope_base,
         .token_committed = &result.token_committed,
     };
-    {
+    if (async_handle) {
+        status = lfm_engine_audio_route_submit(
+            conversation.model->engine, conversation.model->plan_id,
+            conversation.model->depth_plan_id, conversation.pending_ids,
+            conversation.pending_count, conversation.pending_kind,
+            conversation.states.data(), conversation.states.size(),
+            (size_t)conversation.window.position,
+            conversation.rope_cos.empty() ? nullptr
+                : conversation.rope_cos.data() +
+                      conversation.window.start * conversation.rope_half,
+            conversation.rope_sin.empty() ? nullptr
+                : conversation.rope_sin.data() +
+                      conversation.window.start * conversation.rope_half,
+            conversation.rope_cos.size() -
+                conversation.window.start * conversation.rope_half,
+            conversation.hidden.data(), conversation.hidden.size(),
+            &conversation.audio_sampler, &conversation.prng,
+            conversation.mimi, &target, &result, conversation.model->lanes,
+            &commit, notify, notify_context, async_handle);
+    } else {
         ExecutionClaim execution(conversation.model->execution);
         status = lfm_engine_audio_route(
             conversation.model->engine, conversation.model->plan_id,
@@ -1309,6 +1386,15 @@ int next_emission_into_claimed(LfmConversation &conversation,
             conversation.mimi, &target, &result, conversation.model->lanes,
             &commit);
     }
+    return status;
+}
+
+int finish_next_emission_into_claimed(LfmConversation &conversation,
+                                      int status, LfmNativeEmission *out,
+                                      size_t *out_samples) {
+    clear_emission(out, conversation.window.cursor);
+    *out_samples = 0;
+    LfmAudioRouteResult &result = conversation.audio_route;
     if (result.token_committed != 0) {
         conversation.pending_count = 0;
         conversation.pending_kind = 0;
@@ -1329,6 +1415,15 @@ int next_emission_into_claimed(LfmConversation &conversation,
         return -EFAULT;
     }
     return 0;
+}
+
+int next_emission_into_claimed(LfmConversation &conversation,
+                               const LfmAudioRouteTarget &target,
+                               LfmNativeEmission *out, size_t *out_samples) {
+    const int status = submit_next_emission_into_claimed(
+        conversation, target, nullptr, nullptr, nullptr);
+    return finish_next_emission_into_claimed(conversation, status, out,
+                                             out_samples);
 }
 
 int begin_generation_claimed(LfmConversation &conversation, uint32_t sampled,
@@ -1558,6 +1653,63 @@ int lfm_conversation_next_into_native(
     if (!claim) return -EBUSY;
     return next_emission_into_claimed(*conversation, *target, out,
                                       out_samples);
+}
+
+int lfm_conversation_next_submit_native(
+    LfmConversation *conversation, LfmAudioRouteNotify notify,
+    void *notify_context, LfmAudioRouteHandle *out_handle) {
+    if (!conversation || !notify || !out_handle) return -EINVAL;
+    *out_handle = {};
+    if (conversation->active.test_and_set(std::memory_order_acquire)) {
+        return -EBUSY;
+    }
+    const int status = submit_next_text_emission_claimed(
+        *conversation, notify, notify_context, out_handle);
+    if (status != 0) conversation->active.clear(std::memory_order_release);
+    return status;
+}
+
+int lfm_conversation_next_collect_native(
+    LfmConversation *conversation, LfmAudioRouteHandle *handle,
+    LfmNativeEmission *out) {
+    if (!conversation || !handle || !out) return -EINVAL;
+    const int status = lfm_engine_audio_route_collect(
+        conversation->model->engine, handle);
+    if (status == -EINPROGRESS) return status;
+    if (handle->record != nullptr) return status;
+    const int finish = finish_next_text_emission_claimed(
+        *conversation, status, out);
+    conversation->active.clear(std::memory_order_release);
+    return finish;
+}
+
+int lfm_conversation_next_into_submit_native(
+    LfmConversation *conversation, const LfmAudioRouteTarget *target,
+    LfmAudioRouteNotify notify, void *notify_context,
+    LfmAudioRouteHandle *out_handle) {
+    if (!conversation || !target || !notify || !out_handle) return -EINVAL;
+    *out_handle = {};
+    if (conversation->active.test_and_set(std::memory_order_acquire)) {
+        return -EBUSY;
+    }
+    const int status = submit_next_emission_into_claimed(
+        *conversation, *target, notify, notify_context, out_handle);
+    if (status != 0) conversation->active.clear(std::memory_order_release);
+    return status;
+}
+
+int lfm_conversation_next_into_collect_native(
+    LfmConversation *conversation, LfmAudioRouteHandle *handle,
+    LfmNativeEmission *out, size_t *out_samples) {
+    if (!conversation || !handle || !out || !out_samples) return -EINVAL;
+    const int status = lfm_engine_audio_route_collect(
+        conversation->model->engine, handle);
+    if (status == -EINPROGRESS) return status;
+    if (handle->record != nullptr) return status;
+    const int finish = finish_next_emission_into_claimed(
+        *conversation, status, out, out_samples);
+    conversation->active.clear(std::memory_order_release);
+    return finish;
 }
 
 int lfm_conversation_interrupt_native(LfmConversation *conversation) {

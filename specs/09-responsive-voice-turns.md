@@ -136,6 +136,29 @@ Ordering: measure first (W1), then the two latency workstreams (W2, W3), then
 conversational feel (W4, W5). W6 runs in parallel — it is cheap and
 de-risks everything else.
 
+**Cross-spec dependency (added 2026-07-17, refined after code read).** This
+ordering is internal to spec 09; W2 and W5 are additionally coupled to spec 11's
+native migration and are not independent of it. Two facts from the tree pin what
+actually blocks W2:
+- Mel math already has a native, parity-gated path (commit `a1b06fc7`), but the
+  Rust rim still materializes a full `Vec<f32>` + Candle `Tensor` per call
+  (`FilterbankFeatures`, `processor.rs`). Streaming/chunked mel needs that
+  transport rim cut (spec-11 doc 06, the Conformer cutover) — the math is not the
+  blocker; the materialization is.
+- Incremental/suffix prefill is **already native-owned** (`RUST_DELETION_PLAN.md`,
+  "Native model chain"). What prevents pipelining prefill *during* listen is not
+  prefill — it is that the C++ **session coordinator still parks once for the
+  route's terminal result** (F1 in `RUST_DELETION_PLAN.md`: convert `run_action`
+  to a session-owned asynchronous state machine). Until F1 lands, command/control
+  cannot advance while a prefill route is outstanding.
+
+So W2 is gated on **F1 (session async state machine) + the mel transport-rim
+cut**, not on prefill nativeness. Its Rust anchors (`ChatState::add_audio`,
+`Lfm2VoiceEngine::respond` in `realtime.rs`) are on spec 11's deletion list;
+build W2 against the native seam, not by extending them. Only W1
+(instrumentation) and W6 (AEC verification) are free of this dependency and can
+run now.
+
 ### W1 — Instrument Sesame's metric (baseline before touching anything)
 
 Implement exactly their measurement in `voice_runtime.rs`:

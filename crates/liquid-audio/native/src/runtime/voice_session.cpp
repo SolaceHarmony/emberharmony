@@ -378,6 +378,25 @@ struct LfmRuntime {
     uint32_t session_count = 0;
 };
 
+struct PreparedPlayback {
+    LfmPcmLeaseV1 lease{};
+    size_t samples = 0;
+    bool active = false;
+};
+
+struct SessionAction {
+    LfmNativeEmission emission{};
+    LfmAudioRouteHandle route{};
+    PreparedPlayback playback{};
+    LfmTicketIdV1 ticket{};
+    uint64_t epoch = 0;
+    uint32_t playback_count = 0;
+    uint32_t emitted = 0;
+    bool active = false;
+    bool route_pending = false;
+    bool route_audio = false;
+};
+
 struct LfmSession {
     LfmRuntime *runtime = nullptr;
     LfmModel *model = nullptr;
@@ -418,6 +437,7 @@ struct LfmSession {
     PcmPool playback;
     EventRing events;
     TextRing commands;
+    SessionAction action;
     kc_port_thread *coordinator = nullptr;
     kc_port_thread *notification = nullptr;
     bool coordinator_started = false;
@@ -686,12 +706,6 @@ bool publish_turn(LfmSession *session, uint64_t action_epoch,
                          &turn, sizeof(turn), flags, gate_epoch);
 }
 
-struct PreparedPlayback {
-    LfmPcmLeaseV1 lease{};
-    size_t samples = 0;
-    bool active = false;
-};
-
 void release_prepared(LfmSession *session, PreparedPlayback *playback) {
     if (!playback || !playback->active) return;
     (void)lfm_audio_dock_release(session, &playback->lease);
@@ -699,56 +713,17 @@ void release_prepared(LfmSession *session, PreparedPlayback *playback) {
     playback->samples = 0;
 }
 
-bool reserve_playback(LfmSession *session, uint64_t action_epoch,
-                      LfmTicketIdV1 ticket, uint32_t playback_count,
-                      uint32_t emitted, LfmPcmLeaseV1 *out) {
-    const auto reserve = [&]() -> int {
-        std::lock_guard<std::mutex> guard(session->publication_mutex);
-        if (session->stop.load(std::memory_order_acquire)) {
-            return LFM_STATUS_CANCELLED;
-        }
-        if (session->epoch.load(std::memory_order_acquire) != action_epoch) {
-            return LFM_STATUS_STALE;
-        }
-        return lfm_audio_dock_reserve(session, LFM_PCM_LEASE_PLAYBACK,
-                                      LFM_MIMI_PCM_CAPACITY, 24000, out);
-    };
-    for (;;) {
-        int rc = reserve();
-        if (rc == 0) return true;
-        if (rc != LFM_STATUS_WOULD_BLOCK) {
-            if (rc != LFM_STATUS_CANCELLED && rc != LFM_STATUS_STALE) {
-                publish_action_failure(session, action_epoch, ticket, rc,
-                                       "playback reservation failed",
-                                       playback_count, emitted);
-            }
-            return false;
-        }
-        uint32_t expected =
-            kc_atomic_u32_load_acquire(&session->playback_space_doorbell.value);
-        if (session->stop.load(std::memory_order_acquire) ||
-            session->epoch.load(std::memory_order_acquire) != action_epoch) {
-            return false;
-        }
-        rc = reserve();
-        if (rc == 0) return true;
-        if (rc != LFM_STATUS_WOULD_BLOCK) {
-            if (rc != LFM_STATUS_CANCELLED && rc != LFM_STATUS_STALE) {
-                publish_action_failure(session, action_epoch, ticket, rc,
-                                       "playback reservation failed",
-                                       playback_count, emitted);
-            }
-            return false;
-        }
-        rc = kc_port_wait_u32(session->playback_space_doorbell.wait, expected, 0);
-        if (rc != 0 && !session->stop.load(std::memory_order_acquire) &&
-            session->epoch.load(std::memory_order_acquire) == action_epoch) {
-            publish_action_failure(session, action_epoch, ticket, rc,
-                                   "playback-space wait failed", playback_count,
-                                   emitted);
-            return false;
-        }
+int reserve_playback(LfmSession *session, uint64_t action_epoch,
+                     LfmPcmLeaseV1 *out) {
+    std::lock_guard<std::mutex> guard(session->publication_mutex);
+    if (session->stop.load(std::memory_order_acquire)) {
+        return LFM_STATUS_CANCELLED;
     }
+    if (session->epoch.load(std::memory_order_acquire) != action_epoch) {
+        return LFM_STATUS_STALE;
+    }
+    return lfm_audio_dock_reserve(session, LFM_PCM_LEASE_PLAYBACK,
+                                  LFM_MIMI_PCM_CAPACITY, 24000, out);
 }
 
 bool publish_audio(LfmSession *session, const LfmNativeEmission &emission,
@@ -877,26 +852,94 @@ bool handle_emission(LfmSession *session, const LfmNativeEmission &emission,
     return false;
 }
 
-void run_action(LfmSession *session, LfmNativeEmission emission,
-                uint64_t action_epoch, LfmTicketIdV1 ticket) {
-    bool finished = false;
-    uint32_t playback_count = 0;
-    uint32_t emitted = 0;
-    PreparedPlayback playback{};
+void route_notify(void *context) {
+    LfmSession *session = static_cast<LfmSession *>(context);
+    ring(&session->work_doorbell, false);
+}
+
+void clear_action(LfmSession *session) {
+    release_prepared(session, &session->action.playback);
+    session->action = {};
+}
+
+void fail_action(LfmSession *session, int status, const char *message) {
+    SessionAction &action = session->action;
+    release_prepared(session, &action.playback);
+    if (session->stop.load(std::memory_order_acquire)) {
+        publish_turn(session, action.epoch, action.ticket,
+                     action.playback_count, action.emitted, 0,
+                     LFM_STATUS_CANCELLED);
+        clear_action(session);
+        return;
+    }
+    if (session->epoch.load(std::memory_order_acquire) != action.epoch) {
+        publish_turn(session, action.epoch, action.ticket,
+                     action.playback_count, action.emitted, 0,
+                     LFM_STATUS_STALE);
+        clear_action(session);
+        return;
+    }
+    publish_action_failure(session, action.epoch, action.ticket, status,
+                           message, action.playback_count, action.emitted);
+    clear_action(session);
+    request_stop(session, status);
+}
+
+/* Advance until the action either terminates or reaches an external/engine
+ * boundary. The coordinator never waits for a numerical pass or playback
+ * capacity; both completions ring work_doorbell and re-enter here. */
+bool advance_action(LfmSession *session) {
+    SessionAction &action = session->action;
+    if (!action.active) return false;
     for (;;) {
-        if (emission.kind == LFM_NATIVE_EMISSION_TEXT ||
-            (emission.kind == LFM_NATIVE_EMISSION_AUDIO_CODES &&
-             (emission.flags & EMISSION_AUDIO_END) == 0)) {
-            emitted++;
+        if (action.route_pending) {
+            action.emission = {};
+            int rc = action.route_audio
+                ? lfm_conversation_next_into_collect_native(
+                      session->conversation, &action.route, &action.emission,
+                      &action.playback.samples)
+                : lfm_conversation_next_collect_native(
+                      session->conversation, &action.route, &action.emission);
+            if (rc == -EINPROGRESS) return false;
+            action.route_pending = false;
+            if (rc != 0) {
+                fail_action(session, rc, "native recurrence failed");
+                return true;
+            }
         }
-        if (!handle_emission(session, emission, action_epoch, ticket,
-                             &playback_count, emitted, &finished, &playback)) {
+        if (session->stop.load(std::memory_order_acquire)) {
+            publish_turn(session, action.epoch, action.ticket,
+                         action.playback_count, action.emitted, 0,
+                         LFM_STATUS_CANCELLED);
+            clear_action(session);
+            return true;
+        }
+        if (session->epoch.load(std::memory_order_acquire) != action.epoch) {
+            publish_turn(session, action.epoch, action.ticket,
+                         action.playback_count, action.emitted, 0,
+                         LFM_STATUS_STALE);
+            clear_action(session);
+            return true;
+        }
+
+        bool finished = false;
+        if (action.emission.kind == LFM_NATIVE_EMISSION_TEXT ||
+            (action.emission.kind == LFM_NATIVE_EMISSION_AUDIO_CODES &&
+             (action.emission.flags & EMISSION_AUDIO_END) == 0)) {
+            action.emitted++;
+        }
+        if (!handle_emission(session, action.emission, action.epoch,
+                             action.ticket, &action.playback_count,
+                             action.emitted, &finished, &action.playback)) {
             if (session->stop.load(std::memory_order_acquire)) {
-                publish_turn(session, action_epoch, ticket, playback_count, emitted,
-                             0, LFM_STATUS_CANCELLED);
-            } else if (session->epoch.load(std::memory_order_acquire) != action_epoch) {
-                publish_turn(session, action_epoch, ticket, playback_count, emitted,
-                             0, LFM_STATUS_STALE);
+                publish_turn(session, action.epoch, action.ticket,
+                             action.playback_count, action.emitted, 0,
+                             LFM_STATUS_CANCELLED);
+            } else if (session->epoch.load(std::memory_order_acquire) !=
+                       action.epoch) {
+                publish_turn(session, action.epoch, action.ticket,
+                             action.playback_count, action.emitted, 0,
+                             LFM_STATUS_STALE);
             } else {
                 /* A reliable text/PCM publication or codec failure cannot be
                  * skipped while preserving the turn stream. Make the action
@@ -904,89 +947,97 @@ void run_action(LfmSession *session, LfmNativeEmission emission,
                  * pending token before retiring the conversation. */
                 request_stop(session, LFM_STATUS_INTERNAL);
             }
-            return;
+            clear_action(session);
+            return true;
         }
         if (finished) {
-            return;
+            clear_action(session);
+            return true;
         }
-        if (emitted >= session->max_new_tokens) {
+        action.emission = {};
+        if (action.emitted >= session->max_new_tokens) {
             int rc = lfm_conversation_interrupt_native(session->conversation);
             if (rc != 0) {
-                publish_action_failure(session, action_epoch, ticket, rc,
+                publish_action_failure(session, action.epoch, action.ticket, rc,
                                        "native generation limit interrupt failed",
-                                       playback_count, emitted);
+                                       action.playback_count, action.emitted);
+                clear_action(session);
                 request_stop(session, rc);
-                return;
+                return true;
             }
-            publish_turn(session, action_epoch, ticket, playback_count, emitted,
+            publish_turn(session, action.epoch, action.ticket,
+                         action.playback_count, action.emitted,
                          LFM_EVENT_FLAG_TRUNCATED);
-            return;
+            clear_action(session);
+            return true;
         }
-        if (session->stop.load(std::memory_order_acquire)) {
-            publish_turn(session, action_epoch, ticket, playback_count, emitted,
-                         0, LFM_STATUS_CANCELLED);
-            return;
-        }
-        if (session->epoch.load(std::memory_order_acquire) != action_epoch) {
-            publish_turn(session, action_epoch, ticket, playback_count, emitted,
-                         0, LFM_STATUS_STALE);
-            return;
-        }
-        emission = {};
         int needs_playback =
             lfm_conversation_next_requires_playback_native(session->conversation);
         if (needs_playback < 0) {
-            publish_action_failure(session, action_epoch, ticket, needs_playback,
-                                   "native route requirement failed",
-                                   playback_count, emitted);
-            request_stop(session, needs_playback);
-            return;
+            fail_action(session, needs_playback,
+                        "native route requirement failed");
+            return true;
         }
         int rc = 0;
         if (needs_playback != 0) {
-            if (!reserve_playback(session, action_epoch, ticket,
-                                  playback_count, emitted, &playback.lease)) {
-                if (session->epoch.load(std::memory_order_acquire) !=
-                    action_epoch) {
-                    publish_turn(session, action_epoch, ticket, playback_count,
-                                 emitted, 0, LFM_STATUS_STALE);
-                }
-                return;
+            rc = reserve_playback(session, action.epoch,
+                                  &action.playback.lease);
+            if (rc == LFM_STATUS_WOULD_BLOCK) return false;
+            if (rc != 0) {
+                fail_action(session, rc, "playback reservation failed");
+                return true;
             }
-            playback.active = true;
+            action.playback.active = true;
             float *pcm = nullptr;
             size_t capacity = 0;
-            rc = lfm_audio_dock_resolve_mut(session, &playback.lease, &pcm,
-                                            &capacity);
+            rc = lfm_audio_dock_resolve_mut(
+                session, &action.playback.lease, &pcm, &capacity);
             if (rc == 0) {
                 const LfmAudioRouteTarget target = {
                     .epoch = &session->epoch,
-                    .expected_epoch = action_epoch,
+                    .expected_epoch = action.epoch,
                     .pcm = pcm,
                     .pcm_capacity = capacity,
                 };
-                rc = lfm_conversation_next_into_native(
-                    session->conversation, &target, &emission,
-                    &playback.samples);
+                rc = lfm_conversation_next_into_submit_native(
+                    session->conversation, &target, route_notify, session,
+                    &action.route);
+                if (rc == 0) {
+                    action.route_audio = true;
+                    action.route_pending = true;
+                    return false;
+                }
             }
         } else {
-            rc = lfm_conversation_next_native(session->conversation,
-                                              &emission);
+            rc = lfm_conversation_next_submit_native(
+                session->conversation, route_notify, session, &action.route);
+            if (rc == 0) {
+                action.route_audio = false;
+                action.route_pending = true;
+                return false;
+            }
         }
         if (rc != 0) {
-            release_prepared(session, &playback);
-            if (session->epoch.load(std::memory_order_acquire) != action_epoch) {
-                publish_turn(session, action_epoch, ticket, playback_count,
-                             emitted, 0, LFM_STATUS_STALE);
-                return;
-            }
-            publish_action_failure(session, action_epoch, ticket, rc,
-                                   "native recurrence failed", playback_count,
-                                   emitted);
-            request_stop(session, rc);
-            return;
+            fail_action(session, rc, "native recurrence failed");
+            return true;
         }
     }
+}
+
+void start_action(LfmSession *session, LfmNativeEmission emission,
+                  uint64_t action_epoch, LfmTicketIdV1 ticket) {
+    if (session->action.active) {
+        publish_action_failure(session, action_epoch, ticket, LFM_STATUS_BUSY,
+                               "conversation already has a mutating route");
+        request_stop(session, LFM_STATUS_BUSY);
+        return;
+    }
+    session->action = {};
+    session->action.emission = emission;
+    session->action.ticket = ticket;
+    session->action.epoch = action_epoch;
+    session->action.active = true;
+    (void)advance_action(session);
 }
 
 void flush_capture(LfmSession *session) {
@@ -1102,7 +1153,7 @@ void process_capture(LfmSession *session, const LfmPcmLeaseV1 &lease) {
         request_stop(session, rc);
         return;
     }
-    run_action(session, emission, current_epoch, lease.ticket);
+    start_action(session, emission, current_epoch, lease.ticket);
 }
 
 void process_text(LfmSession *session, const TextCommand &command) {
@@ -1128,7 +1179,7 @@ void process_text(LfmSession *session, const TextCommand &command) {
         request_stop(session, rc);
         return;
     }
-    run_action(session, emission, current_epoch, command.ticket);
+    start_action(session, emission, current_epoch, command.ticket);
 }
 
 void process_mixed(LfmSession *session, const TextCommand &command) {
@@ -1180,7 +1231,7 @@ void process_mixed(LfmSession *session, const TextCommand &command) {
         request_stop(session, rc);
         return;
     }
-    run_action(session, emission, current_epoch, command.ticket);
+    start_action(session, emission, current_epoch, command.ticket);
 }
 
 void process_command(LfmSession *session, const TextCommand &command) {
@@ -1205,11 +1256,29 @@ void *coordinator_main(void *context) {
                   running, sizeof(running) - 1);
 
     for (;;) {
+        bool progressed = advance_action(session);
+        if (session->action.active) {
+            uint32_t expected =
+                kc_atomic_u32_load_acquire(&session->work_doorbell.value);
+            if (advance_action(session)) continue;
+            if (!session->action.active) continue;
+            session->coordinator_parks.fetch_add(1,
+                                                  std::memory_order_relaxed);
+            int rc = kc_port_wait_u32(session->work_doorbell.wait, expected, 0);
+            session->coordinator_wakes.fetch_add(1,
+                                                  std::memory_order_relaxed);
+            if (rc != 0 && !session->stop.load(std::memory_order_acquire)) {
+                publish_error(session, rc, "coordinator wait failed");
+                request_stop(session, rc);
+            }
+            continue;
+        }
+        if (session->stop.load(std::memory_order_acquire)) break;
         if (!synchronize_epoch(session, &applied_epoch)) break;
 
-        bool progressed = false;
         TextCommand command{};
-        while (text_pop(&session->commands, &command,
+        while (!session->action.active &&
+               text_pop(&session->commands, &command,
                         &session->command_space_doorbell)) {
             progressed = true;
             /* An interrupt may race between the drain predicate and this pop.
@@ -1224,7 +1293,7 @@ void *coordinator_main(void *context) {
         if (session->stop.load(std::memory_order_acquire)) break;
         if (session->epoch.load(std::memory_order_acquire) != applied_epoch) continue;
         LfmPcmLeaseV1 lease{};
-        while (pool_pop(&session->capture, &lease)) {
+        while (!session->action.active && pool_pop(&session->capture, &lease)) {
             progressed = true;
             if (!synchronize_epoch(session, &applied_epoch)) break;
             process_capture(session, lease);
@@ -1233,6 +1302,7 @@ void *coordinator_main(void *context) {
                 break;
             }
         }
+        if (session->action.active) continue;
         if (session->stop.load(std::memory_order_acquire)) break;
         if (session->epoch.load(std::memory_order_acquire) != applied_epoch) continue;
         if (progressed) continue;
@@ -1241,7 +1311,7 @@ void *coordinator_main(void *context) {
         if (session->stop.load(std::memory_order_acquire) ||
             session->capture.head.value.load(std::memory_order_acquire) !=
                 session->capture.tail.value.load(std::memory_order_acquire) ||
-            !text_empty(&session->commands) ||
+            !text_empty(&session->commands) || session->action.active ||
             session->epoch.load(std::memory_order_acquire) != applied_epoch) {
             continue;
         }
@@ -2315,8 +2385,12 @@ int lfm_audio_dock_release(LfmSession *session, const LfmPcmLeaseV1 *lease) {
                           : direction == LFM_PCM_LEASE_PLAYBACK
                                 ? &session->playback_space_doorbell
                                 : nullptr;
-    return pool ? release_slot(pool, lease, space, allowed)
-                : LFM_STATUS_INVALID_ARGUMENT;
+    if (!pool) return LFM_STATUS_INVALID_ARGUMENT;
+    const int status = release_slot(pool, lease, space, allowed);
+    if (status == 0 && direction == LFM_PCM_LEASE_PLAYBACK) {
+        ring(&session->work_doorbell, false);
+    }
+    return status;
 }
 
 } /* extern "C" */

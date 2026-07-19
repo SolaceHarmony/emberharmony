@@ -1,7 +1,10 @@
 # Current State Audit
 
 Status: audited migration baseline with committed scheduler-substrate deltas
-recorded through 2026-07-14.
+recorded through 2026-07-14. Post-baseline gated deltas and ungated working-tree
+deltas through 2026-07-17 are recorded in _What Is Already Correct_ and
+_Working-Tree Deltas Not Yet Gated_ below. The pinned baseline commit is left
+unchanged as the historical anchor.
 
 Audited against EmberHarmony commit `321538f11749` and `kcoro_arena` commit
 `447d04f0246b`. Scheduler deltas are pinned to upstream `bd530f4c9196`, Ember
@@ -22,6 +25,13 @@ describes the audited old behavior, not current implementation. If later code
 changes invalidate a line citation or measurement, update the claim and evidence
 in the same commit. Git history is the archive; do not retain duplicate source
 trees to make an old claim easier to reproduce.
+
+A committed hash is necessary but not sufficient. A safety or checkpoint commit
+whose own message states that no build or test gate was run (for example
+`1f6d1c5d` and `8a856160`) is evidence that the bytes existed, not that they
+work. Treat such commits as `uncommitted`-equivalent for status purposes: cite
+them for provenance and loss-prevention, never as `implemented`, `closed`, or
+`production-tested`.
 
 ## Purpose
 
@@ -68,6 +78,14 @@ flowchart LR
 
 ## Ownership Map
 
+> **Reconciliation note (2026-07-17):** this table is pinned to the audited
+> baseline and describes the state each owner is migrating *from*. Several owners
+> below have since moved behind the native ABI. For present committed status read
+> the landed/open ledger in `crates/liquid-audio/docs/RUST_DELETION_PLAN.md`
+> (rows: typed binding, weight consumption, native model chain,
+> conversation/session, context rollover, production graph, Moshi), and read
+> _Working-Tree Deltas Not Yet Gated_ below for ungated changes.
+
 | Area | Current owner and evidence | Migration consequence |
 |---|---|---|
 | Product settings | `Lfm2Device`, `LocalVoiceEngine`, and `Lfm2Settings` are defined in `packages/desktop/src-tauri/src/settings.rs:60-250`; `local_runtime_config`, `build_engine`, and `select_device` consume them in `packages/desktop/src-tauri/src/voice/runtime.rs:2712-2829`. | Keep persisted settings as the only product source of truth. Device selection remains runtime policy. |
@@ -79,7 +97,7 @@ flowchart LR
 | Frame input | `frame_loop` allocates/resamples frame vectors and submits them to a Rust worker at `crates/liquid-audio/src/runtime/voice_runtime.rs:1599-1775`. | Frames become retained spans in the capture ring; no `Vec<f32>` crosses a queue. |
 | Turn/frame workers | `RealtimePipeline::spawn` and `RealtimeFramePipeline::spawn` create dedicated Rust inference workers in `crates/liquid-audio/src/runtime/realtime.rs:488-920`. | Replace both with native continuations over one runtime. Preserve the different interrupt semantics. |
 | Committed utterance | `Utterance` stores `Vec<f32>` at `crates/liquid-audio/src/runtime/realtime.rs:146-153`; `vad_loop` creates copies at `voice_runtime.rs:1511` and `1542-1556`. | A committed utterance is a ring span descriptor plus an epoch, never a payload owner. |
-| Resampling and mel | `ChatState::add_audio` calls the Rust resampler at `crates/liquid-audio/src/processor.rs:1089-1163`; `FilterbankFeatures::forward` implements the Candle mel path at `crates/liquid-audio/src/processor.rs:311-472`. | Port as a fixed native plan writing directly into a session mel plane. |
+| Resampling and mel | Native mel math has landed and is parity-gated (commit `a1b06fc7`): `native/src/frontend/lfm_frontend.cpp` plus `native/kernels/{aarch64,x86_64}/flashkern_frontend.S`, checked against `crates/liquid-audio/tests/fixtures/mel/`. The Rust/Candle path still owns the **wiring**: `ChatState::add_audio` (`processor.rs:721`) resamples and `FilterbankFeatures` (`processor.rs:120-349`, `forward` at `290`) still holds allocation, `Tensor` materialization, and downstream storage. Math is off Rust; ownership is not. | Move allocation/materialization behind the native plan writing directly into a session mel plane, then retire `FilterbankFeatures` from the production path. |
 | Conformer | `LFM2AudioModel` stores `ConformerEncoder` and `audio_adapter` at `crates/liquid-audio/src/model/lfm2_audio.rs:292-330`; construction is at `391-425`; production prefill calls them at `758-917` and `1172-1305`. | Bind weights once and execute both stages through native passes. |
 | Conversation state | Five Candle tensors are held by `ConversationState` at `crates/liquid-audio/src/runtime/realtime.rs:940-1021`; `Lfm2VoiceEngine` also owns cache, pending prepare, and vault state at `1053-1185`. | Replace tensor cloning/cat with one generation-protected native conversation arena. |
 | Full and suffix prefill | `prefill_suffix` builds vectors, tensors, concatenations, and scatter indices at `crates/liquid-audio/src/model/lfm2_audio.rs:749-918`; `prefill_inputs` repeats full-context assembly at `1172-1305`. | Port direct modality dispatch into preallocated embedding planes. |
@@ -88,7 +106,7 @@ flowchart LR
 | Scheduler | The working tree owns stable pthread lanes, one mechanical native SQ dispatcher, shared dispatch/fence words, and one native-owned SQ/CQ. `bridge_main` validates retained descriptor generation at `flashkern_engine.cpp:1898-1951`; `submit_pass` directly submits and waits on native CQ at `1954-2003`. | Replace the borrowed single request slot with owned pass slots and a native session continuation; preserve ordinary nested lane programs and zero-spin fences. |
 | Rust kcoro role | `crates/kcoro` supplies fixed-capacity workers, exact promises, inherited scope words, and bounded SPSC rings. The inference-pass `coordinator.rs` mount is deleted in the working tree. | Use Rust kcoro only for PCM input/output, control, and observer docking tasks. It does not own tokens, model passes, or recurrence. |
 | Mimi output | C++ already owns streaming Mimi decode through `mimi_decoder_step` in `crates/liquid-audio/native/src/mimi/mimi_decode.cpp:776-911`; the Rust adapter allocates output `Vec<f32>` at `crates/liquid-audio/src/mimi_native.rs:92-109`. | Keep the decoder, change it to write into a reserved playback span, and remove the vector adapter. |
-| Moshi | `RealtimeMoshi` owns Candle Mimi, the Moshi LM, multistream state, and samplers at `crates/liquid-audio/src/runtime/realtime.rs:1850-1921`; each PCM frame is copied into a Candle tensor at `1954-2026`. | Moshi must be ported to the same native model/session contract before Candle can leave production. |
+| Moshi | `RealtimeMoshi` owns Candle Mimi, the Moshi LM, multistream state, and samplers at `crates/liquid-audio/src/runtime/realtime.rs:1850-1921`; each PCM frame is copied into a Candle tensor at `1954-2026`. | Moshi must be ported to the same native model/session contract before Candle can leave production. **Sequencing decision (2026-07-17):** Moshi stays a supported model, but its native port is a dedicated later Flashkern phase — LFM2-Audio leads the cutover and Moshi may be unwired from the product path meanwhile. Its acceptance gate already exists (G9, native Moshi, in `11-verification-and-rollout.md`), and the decision is already recorded in `crates/liquid-audio/docs/RUST_DELETION_PLAN.md` (rows "Production graph" and "Moshi", and the "Subsequent — Native Moshi" section). The only missing artifact is a dedicated Moshi design spec in the numbered hierarchy, parallel to the LFM2 mel/Conformer/prefill specs (05–07) — not the decision. |
 
 ## Weight Residency Truth
 
@@ -169,6 +187,12 @@ The migration must preserve these existing decisions:
   device. `Lfm2Settings` explicitly documents this at
   `packages/desktop/src-tauri/src/settings.rs:210-250`.
 - Native safetensors bytes are immutable and bit exact.
+- Native mel frontend math has landed and is parity-gated:
+  `native/src/frontend/lfm_frontend.cpp` and
+  `native/kernels/{aarch64,x86_64}/flashkern_frontend.S` at commit `a1b06fc7`,
+  checked against `crates/liquid-audio/tests/fixtures/mel/`. The arithmetic is
+  off Rust; `FilterbankFeatures` ownership, allocation, and `Tensor`
+  materialization in `processor.rs` are the remaining mel work, not the math.
 - Flashkern tile fan-out uses a shared atomic claim counter, not one channel
   message per tile (`flashkern_engine.cpp:119-128`, `670-684`).
 - At executor commit `d2c43abd`, the generation fence closes the declared-park
@@ -191,6 +215,36 @@ The migration must preserve these existing decisions:
   stream (`runtime/realtime.rs:788-849`, `888-895`).
 - Native Mimi streaming decode is a required production kernel, not an optional
   accelerator (`runtime/audio_out.rs:77-156`).
+
+## Working-Tree Deltas Not Yet Gated (2026-07-17)
+
+These changes exist in the working tree or in explicitly ungated safety commits.
+Per the Claims Policy they are `prototype`/`uncommitted`-equivalent and must not
+be described as native, closed, or production-tested until a gated commit lands.
+
+- **Flashkern V2.1 eager route broker.** `flashkern_engine.cpp` now carries an
+  64-entry `AudioRoutePool` served by a dedicated `audio_route_main` broker thread and a
+  vocabulary-validated `audio_token_class` map. It replaces the former exclusive
+  single-producer `AudioRouteClaim` lease so a route releases its compute slot
+  between nodes and the capacity-limited engine stays fair across conversations.
+  Landed as safety commits `1f6d1c5d` and `8a856160` with no gate run, and still
+  under active edit (`ROUTE_CAPACITY` moved 8 → 64 after `8a856160`). Text and
+  audio terminal routes now return pooled handles and notify the coordinator's
+  expected-value doorbell; exact-generation collection happens there without a
+  numerical wait. Because the
+  file is mid-rewrite, the Scheduler and Backbone fast-path row citations into
+  `flashkern_engine.cpp` remain pinned to the audited baseline revision and are
+  stale by line position; they are re-pinned when the V2 work reaches a gated
+  commit, not before. Design intent lives in
+  `specs/11-kcoro-native-migration/16-flashkern-v2-coroutine-grid.md`.
+- **Callback-only progress holds at the route/engine layer, not yet the session
+  layer.** The broker and its exact-CQ callbacks advance without spin, submit,
+  allocation, or mutex. Above them, the C++ session coordinator still parks once
+  for the route's terminal result (`run_action`); converting it to a
+  session-owned asynchronous state machine is the open item **F1** in
+  `crates/liquid-audio/docs/RUST_DELETION_PLAN.md`. Until F1 lands,
+  "callback-only progress" is a true statement about the route layer and not yet
+  about command/control above it.
 
 ## Claims That Are Not Yet Allowed
 

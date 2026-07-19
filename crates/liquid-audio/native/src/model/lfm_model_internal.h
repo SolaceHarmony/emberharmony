@@ -88,6 +88,19 @@ LFM_INTERNAL_API int lfm_conversation_next_requires_playback_native(
 LFM_INTERNAL_API int lfm_conversation_next_into_native(
     LfmConversation *conversation, const LfmAudioRouteTarget *target,
     LfmNativeEmission *out, size_t *out_samples);
+LFM_INTERNAL_API int lfm_conversation_next_submit_native(
+    LfmConversation *conversation, LfmAudioRouteNotify notify,
+    void *notify_context, LfmAudioRouteHandle *out_handle);
+LFM_INTERNAL_API int lfm_conversation_next_collect_native(
+    LfmConversation *conversation, LfmAudioRouteHandle *handle,
+    LfmNativeEmission *out);
+LFM_INTERNAL_API int lfm_conversation_next_into_submit_native(
+    LfmConversation *conversation, const LfmAudioRouteTarget *target,
+    LfmAudioRouteNotify notify, void *notify_context,
+    LfmAudioRouteHandle *out_handle);
+LFM_INTERNAL_API int lfm_conversation_next_into_collect_native(
+    LfmConversation *conversation, LfmAudioRouteHandle *handle,
+    LfmNativeEmission *out, size_t *out_samples);
 LFM_INTERNAL_API int
 lfm_conversation_interrupt_native(LfmConversation *conversation);
 LFM_INTERNAL_API int lfm_conversation_decode_native(

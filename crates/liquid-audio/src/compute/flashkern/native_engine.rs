@@ -264,6 +264,14 @@ struct AudioRouteTarget {
     pcm_capacity: usize,
 }
 
+#[cfg(test)]
+#[repr(C)]
+#[derive(Default)]
+struct AudioRouteHandle {
+    record: *mut c_void,
+    generation: u64,
+}
+
 extern "C" {
     fn lfm_bf16_gemm_available() -> i32;
     #[cfg(test)]
@@ -413,7 +421,7 @@ extern "C" {
         out_token_completed: *mut u32,
     ) -> i32;
     #[cfg(test)]
-    fn lfm_engine_audio_route(
+    fn lfm_engine_audio_route_submit(
         e: *mut c_void,
         model_id: u64,
         depth_id: u64,
@@ -435,6 +443,36 @@ extern "C" {
         result: *mut AudioRouteResult,
         lanes: usize,
         commit: *const TokenCommitRecord,
+        notify: extern "C" fn(*mut c_void),
+        notify_context: *mut c_void,
+        out_handle: *mut AudioRouteHandle,
+    ) -> i32;
+    #[cfg(test)]
+    fn lfm_engine_audio_route_collect(e: *mut c_void, handle: *mut AudioRouteHandle) -> i32;
+    #[cfg(test)]
+    fn lfm_engine_token_route_submit(
+        e: *mut c_void,
+        model_id: u64,
+        ids: *const u32,
+        id_count: usize,
+        embedding_kind: u32,
+        states: *const LayerState,
+        state_count: usize,
+        position: usize,
+        rope_cos: *const u16,
+        rope_sin: *const u16,
+        rope_elements: usize,
+        out_hidden: *mut u16,
+        hidden_elements: usize,
+        sampler: *const SampleConfig,
+        prng: *mut PrngState,
+        out_token: *mut u32,
+        lanes: usize,
+        commit: *const TokenCommitRecord,
+        out_token_completed: *mut u32,
+        notify: extern "C" fn(*mut c_void),
+        notify_context: *mut c_void,
+        out_handle: *mut AudioRouteHandle,
     ) -> i32;
     #[cfg(test)]
     fn lfm_engine_prefill_workspace_create(
@@ -621,6 +659,12 @@ extern "C" {
     ) -> i32;
     #[cfg(test)]
     fn lfm_internal_engine_audio_token_class_for_test(token: u32) -> i32;
+    #[cfg(test)]
+    fn lfm_internal_engine_audio_route_service_for_test(
+        snapshot: u64,
+        enqueued: u64,
+        service: u32,
+    ) -> u32;
     #[cfg(test)]
     fn lfm_internal_engine_fail_audio_route_depth_for_test(e: *mut c_void, status: i32) -> i32;
     #[cfg(test)]
@@ -2541,7 +2585,7 @@ mod tests {
         );
         assert_eq!(route_after.max_pass_slots_live, 1);
         assert_eq!(route_after.pass_slots_live, 0);
-        assert_eq!(route_after.route_capacity, 8);
+        assert_eq!(route_after.route_capacity, 64);
         assert_eq!((route_after.routes_live, route_after.routes_ready), (0, 0));
         assert_eq!(
             route_after.route_dispatches - route_before.route_dispatches,
@@ -2560,6 +2604,108 @@ mod tests {
             route_after.descriptor_releases - route_before.descriptor_releases,
             4
         );
+
+        // Text recurrence is the same broker with a terminal TOKEN node. Its
+        // callback is only a doorbell edge; the caller performs exact-handle
+        // collection and observes the committed state afterward.
+        extern "C" fn text_notify(context: *mut c_void) {
+            let notified = unsafe { &*(context as *const std::sync::atomic::AtomicU32) };
+            notified.store(1, std::sync::atomic::Ordering::Release);
+        }
+        let mut split_text_hidden = vec![0u16; hidden];
+        let mut routed_text_hidden = vec![0u16; hidden];
+        let mut split_text_prng = PrngState::from_seed(0x91eed).expect("split text seed");
+        let mut routed_text_prng = PrngState::from_seed(0x91eed).expect("route text seed");
+        let text_sampler = SampleConfig::new(None, None);
+        let mut split_token = u32::MAX;
+        assert!(unsafe {
+            split.token_pass(
+                split_model,
+                &ids,
+                0,
+                &split_states,
+                1,
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                &mut split_text_hidden,
+                None,
+                Some(&text_sampler),
+                Some(&mut split_text_prng),
+                Some(&mut split_token),
+                4,
+            )
+        });
+        let mut text_window = ContextWindow {
+            capacity: max_ctx as u64,
+            runway: 4,
+            position: 1,
+            start: 0,
+            cursor: 1,
+            rope_base: 0,
+        };
+        let mut text_completed = 0u32;
+        let mut text_committed = 0u32;
+        let mut routed_token = u32::MAX;
+        let text_commit = TokenCommitRecord {
+            window: &mut text_window,
+            expected_position: 1,
+            expected_start: 0,
+            expected_cursor: 1,
+            expected_rope_base: 0,
+            token_committed: &mut text_committed,
+        };
+        let text_notified = std::sync::atomic::AtomicU32::new(0);
+        let mut text_handle = AudioRouteHandle::default();
+        assert_eq!(
+            unsafe {
+                lfm_engine_token_route_submit(
+                    routed.ptr,
+                    routed_model,
+                    ids.as_ptr(),
+                    ids.len(),
+                    0,
+                    routed_states.as_ptr(),
+                    routed_states.len(),
+                    1,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    0,
+                    routed_text_hidden.as_mut_ptr(),
+                    routed_text_hidden.len(),
+                    &text_sampler,
+                    &mut routed_text_prng,
+                    &mut routed_token,
+                    4,
+                    &text_commit,
+                    &mut text_completed,
+                    text_notify,
+                    (&text_notified as *const std::sync::atomic::AtomicU32)
+                        .cast_mut()
+                        .cast(),
+                    &mut text_handle,
+                )
+            },
+            0
+        );
+        let text_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while text_notified.load(std::sync::atomic::Ordering::Acquire) == 0 {
+            assert!(
+                std::time::Instant::now() < text_deadline,
+                "text route timed out"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            unsafe { lfm_engine_audio_route_collect(routed.ptr, &mut text_handle) },
+            0
+        );
+        assert_eq!((text_completed, text_committed), (1, 1));
+        assert_eq!((text_window.position, text_window.cursor), (2, 2));
+        assert_eq!(routed_text_hidden, split_text_hidden);
+        assert_eq!(routed_carry, split_carry);
+        assert_eq!(routed_token, split_token);
+        assert_eq!(routed_text_prng.cursor, split_text_prng.cursor);
 
         let mut failed_carry = initial_carry;
         let failed_states = [LayerState {
@@ -2680,8 +2826,14 @@ mod tests {
             0
         );
         let mimi_before = routed.snapshot();
-        let mimi_status = unsafe {
-            lfm_engine_audio_route(
+        extern "C" fn notify(context: *mut c_void) {
+            let notified = unsafe { &*(context as *const std::sync::atomic::AtomicU32) };
+            notified.store(1, std::sync::atomic::Ordering::Release);
+        }
+        let notified = std::sync::atomic::AtomicU32::new(0);
+        let mut handle = AudioRouteHandle::default();
+        let submit_status = unsafe {
+            lfm_engine_audio_route_submit(
                 routed.ptr,
                 routed_model,
                 routed_depth,
@@ -2703,11 +2855,28 @@ mod tests {
                 &mut result,
                 4,
                 &commit,
+                notify,
+                (&notified as *const std::sync::atomic::AtomicU32)
+                    .cast_mut()
+                    .cast(),
+                &mut handle,
             )
         };
+        assert_eq!(submit_status, 0);
+        assert!(!handle.record.is_null());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while notified.load(std::sync::atomic::Ordering::Acquire) == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "route notification timed out"
+            );
+            std::thread::yield_now();
+        }
+        let mimi_status = unsafe { lfm_engine_audio_route_collect(routed.ptr, &mut handle) };
         let mimi_after = routed.snapshot();
         unsafe { lfm_internal_audio_route_epoch_free_for_test(epoch) };
         assert_eq!(mimi_status, -libc::EIO);
+        assert!(handle.record.is_null());
         assert_eq!(result.status, -libc::EIO);
         assert_eq!((result.token_completed, result.token_committed), (1, 1));
         assert_eq!(result.depth_completed, 1);
@@ -3931,7 +4100,7 @@ mod tests {
         let mut id = 0;
         assert_eq!(
             unsafe { lfm_ctx_build(raw, &descriptor, 1, 1, 1, 1, &mut id) },
-            -libc::EINVAL
+            -libc::ENOTSUP
         );
         assert_eq!(id, 0);
 
@@ -3991,7 +4160,10 @@ mod tests {
             -libc::EINVAL
         );
         assert_eq!(target, 0xfeed_beef);
-        assert_eq!(unsafe { lfm_internal_engine_audio_token_class_for_test(0) }, 0);
+        assert_eq!(
+            unsafe { lfm_internal_engine_audio_token_class_for_test(0) },
+            0
+        );
         assert_eq!(
             unsafe { lfm_internal_engine_audio_token_class_for_test(2047) },
             0
@@ -4007,6 +4179,23 @@ mod tests {
         assert_eq!(
             unsafe { lfm_internal_engine_audio_token_class_for_test(u32::MAX) },
             2
+        );
+        const DEADLINE: u32 = 1;
+        const INTERACTIVE: u32 = 2;
+        const BACKGROUND: u32 = 3;
+        assert_eq!(
+            unsafe { lfm_internal_engine_audio_route_service_for_test(100, 101, BACKGROUND) },
+            BACKGROUND,
+            "a route enqueued after the broker snapshot is new, not starved"
+        );
+        assert_eq!(
+            unsafe { lfm_internal_engine_audio_route_service_for_test(164, 100, BACKGROUND) },
+            DEADLINE,
+            "64 missed broker enqueue epochs promote genuinely waiting work"
+        );
+        assert_eq!(
+            unsafe { lfm_internal_engine_audio_route_service_for_test(163, 100, INTERACTIVE) },
+            INTERACTIVE
         );
     }
 
