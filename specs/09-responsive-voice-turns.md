@@ -1,8 +1,8 @@
 # 09 — Responsive voice turns
 
-How Sesame's CSM demo achieves sub-500ms conversational latency, why our voice
+What Sesame's recovered CSM client actually measures and rates, why our voice
 pipeline self-interrupts, and the ordered plan to close both gaps in the native
-Rust pipeline (`liquid-audio` + Tauri voice runtime).
+voice runtime.
 
 Sources examined 2026-07-05: the recovered Sesame demo client, Kyutai's moshi
 repo, SesameAILabs/csm + the HF Transformers CSM port, and our own pipeline.
@@ -27,9 +27,34 @@ Our self-interruption bug is a **labeling lie at the acoustic layer**: the
 model's own voice crosses speaker→room→mic and gets committed under the user's
 label. The model then correctly yields the floor to "the user" — itself.
 
-Our latency gap is a **work-scheduling error**: we do O(utterance) work
-(mel + full prefill) *after* the user stops talking, plus an 800ms wait just to
-decide they stopped, when both can happen *during* their turn.
+Our latency gap is a **work-scheduling error**: too much turn work remains after
+the user stops talking, plus a 500ms endpoint-silence policy before response
+generation. Speech policy and scheduler mechanics must not be conflated.
+
+### 1.1 Three meanings of time
+
+1. **Sesame telemetry:** the recovered client samples spectral telemetry every
+   20ms, measures last user voice to first agent voice, averages observations,
+   and assigns the `<300/<500/<1000/<3000ms` ratings below. The 20ms interval is
+   observer sampling only. It is never evidence for a scheduler heartbeat.
+2. **Speech policy:** endpoint silence, sustained barge-in, speculative
+   preparation, minimum utterance, and echo-tail durations describe acoustic
+   behavior. Production represents them as sample/frame counts at the capture
+   rate.
+3. **Scheduler mechanics:** timeout receives, periodic probes, drain heartbeats,
+   and retry sleeps are not speech policy. They must not cause progress.
+
+The governing rule is:
+
+> Human and acoustic durations are sample-clock state-machine thresholds.
+> Wall-clock observation may measure latency or detect a stalled device, but it
+> never advances speech or inference state. Every computational transition is
+> caused by capture, completion, capacity, control, or an explicit fault edge.
+
+Callbacks advance the capture cursor for voiced and silent device frames. An
+endpoint is therefore `capture_cursor - last_voiced_cursor >= endpoint_frames`;
+sustained barge-in is `consecutive_voiced_frames >= sustain_frames`. If device
+callbacks stop, that is a liveness fault—not synthetic acoustic silence.
 
 ## 2. What each system actually does (evidence)
 
@@ -116,19 +141,19 @@ speaker-tagged at commit time, audio-grounded.
 |---|---|---|
 | Echo identity guessed from loudness: barge-in requires mic RMS > max(3× base, 2.5× playback RMS) | `voice_runtime.rs:1267–1277` | Loud echo self-interrupts; quiet user can't interrupt |
 | Model goes deaf during own turn: `mic.clear()` while assistant speaks (default `can_interrupt=false`) | `voice_runtime.rs:1012–1018` | Overlapped user speech destroyed — never reaches context |
-| Barge-in is a one-window reflex (9.6ms RMS window → instant interrupt) | `voice_runtime.rs:1025–1038` | No duck-and-listen; echo blips can trigger it |
-| End-of-turn = 800ms silence (`silence_ms` default) | `voice_runtime.rs:336` | 800ms of the latency budget burned before any model work |
+| VAD uses 200ms analysis windows; sustained barge-in policy is 400ms | `voice_runtime.rs` VAD policy constants and `window = in_rate / 5` | Policy is frame-shaped, but the current consumer still uses a timed wake loop |
+| End-of-turn = 500ms silence (`silence_ms` default, reduced from 800ms after live testing) | `voice_runtime.rs` defaults | The duration is valid policy; discovering it through a 40ms timeout heartbeat is not |
 | Full-utterance mel + prefill happens **after** end-of-turn | `realtime.rs:722–892` | O(utterance) work in the response-latency critical path |
 | AEC never verified; macOS uses software AEC3 (VPIO is iOS-only), AGC may amplify residual echo | `libwebrtc audio_source.rs` platform notes | Self-interruption persists despite AEC being "on" |
 | Moshi path: hard interrupt resets LM state entirely | `realtime.rs:433–437, 1022–1026` | Contradicts context-is-thoughts for the Moshi engine |
 
-**Latency budget, ours vs Sesame's bar.** Sesame rates <300ms
-pause→first-word as excellent and measures it on every turn. Our LFM2 turn
-path spends: 800ms (silence wait) + mel of whole utterance + full prefill +
-first-frame generation + 30ms prebuffer (`SPEAKER_PREBUFFER_MS`,
-`voice_runtime.rs:1359`). We are over the "excellent" budget ~3× before the
-model starts. Note we have **no network**: Sesame pays 60–150ms RTT we don't.
-Structurally we should be *faster* than their demo.
+**Latency budget, ours vs Sesame's rating.** The recovered client rates an
+averaged pause→first-agent-voice interval below 300ms as excellent and below
+500ms as good; it does not prove what the Sesame server itself always achieves.
+Our runtime reports individual turns. The current path still pays the 500ms
+endpoint policy plus remaining post-endpoint work and first-frame generation.
+We have no relay-network requirement, so structurally the local path should be
+able to score well against those bands.
 
 ## 3. The plan
 
@@ -187,9 +212,11 @@ Move O(utterance) work inside the user's turn, CSM-style commit-as-you-go:
 *Acceptance:* post-EOT model work ≈ first-frame generation only; W1 metric
 shows the gap collapsing toward `silence_ms` + generation.
 
-### W3 — Adaptive end-of-turn
+### W3 — Sample-clock adaptive end-of-turn
 
-- Drop `silence_ms` 800 → 300–400 adaptive.
+- Express the current 500ms policy as `endpoint_frames` and tune toward a
+  measured 300–400ms adaptive range only when real-session false-cutoff data
+  supports it. The earlier 350ms value was too eager in live testing.
 - Optional second stage: tentative EOT at ~250ms → begin generating
   speculatively; if the user resumes before commit, cancel and **do not
   commit** the speculative output (it was never spoken nor a completed
@@ -197,8 +224,9 @@ shows the gap collapsing toward `silence_ms` + generation.
   at commit time — we've been bitten by preemptive reads of stale mode state
   before.
 
-*Acceptance:* median W1 latency <500ms without a rise in false end-of-turn
-(user cut-offs), measured over real sessions.
+*Acceptance:* no timed progress wake remains; median W1 latency is <500ms
+without a rise in false end-of-turn (user cut-offs), measured over real
+sessions.
 
 ### W4 — Never deaf: buffer overlap, commit as context
 

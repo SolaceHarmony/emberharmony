@@ -8,6 +8,10 @@ release-hardening and ABI-stability gates continue. Its first GPU-like substrate
 is active: precise work signaling, zero-spin expected-value waits, a preallocated
 ticket slab, and exact completion callbacks. EmberHarmony provides the first
 fixed-lane integration; generic broker submission and native recurrence remain.
+The working tree adds the first direct backport from Flashkern: a 128-byte
+cache-isolated `kc_doorbell`, a fixed-member `kc_collective`, and `kc_team`
+ownership of stable, non-stealing numerical workers. Flashkern now mounts its
+lane program on that team instead of creating lane pthreads itself.
 
 The ticket, precise-wake, prepared wait-word, and build-identity claims in this
 tree are anchored by implementation commit
@@ -25,6 +29,12 @@ The canonical public include is:
 - `kc_runtime` owns workers, the ready queue, operation identities, shutdown,
   and lifecycle accounting. There is no production process-global scheduler
   except the compatibility wrapper used by the small `koro_*` API.
+- `kc_team` is a separate fixed-member executor class. It owns resident member
+  threads, exact generation dispatch, expected-value dormancy, and ordered
+  stop/join. It never migrates a numerical continuation or steals work.
+- `kc_collective` owns arrive/reconverge semantics: the last member runs one
+  bounded finalizer, release-publishes the next generation, and wakes only
+  declared parked peers through `kc_doorbell`.
 - Every channel wait is a retained `kc_op`. Match, close, and cancellation
   arbitrate one terminal result while holding the channel mutex, then publish
   the wake after releasing it.
@@ -125,6 +135,9 @@ runs (`make -C fuzz run`).
 
 - `include/kcoro_arena.h`: canonical C API entry point
 - `core/src/kc_runtime.c`: explicit scheduler lifecycle and workers
+- `core/src/kc_team.c`: fixed-member, non-stealing execution ownership
+- `core/src/kc_collective.c`: generation reconvergence and last-arrival finalizer
+- `core/src/kc_doorbell.c`: cache-isolated expected-value edge
 - `core/src/kc_op.c`: retained operation identity and terminal publication
 - `core/src/kc_ticket.c`: pooled action receipts and exact callback delivery
 - `core/src/kc_chan_stackless.c`: all active channel policies

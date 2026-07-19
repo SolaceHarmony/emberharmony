@@ -1,6 +1,8 @@
 # 16 — Flashkern V2: The Eager Coroutine Grid
 
-Status: **V2.0–V2.1 landed; V2.2–V2.6 remain a design proposal.** V1 is one
+Status: **V2.0–V2.1 landed; the V2.2 gang-completion rung and the first V2.3
+kcoro-ownership rung are implemented in the working tree; independent block
+execution in V2.3–V2.6 remains incomplete.** V1 is one
 working fixed-team numerical execution domain. V2 extracts two independent
 logical four-lane blocks that can gang back into the existing eight-lane team,
 then drives them with design 14's compact forwarding table. It is an eager
@@ -35,9 +37,25 @@ Terminal notification only rings the session doorbell; its coordinator-owned
 `SessionAction` performs exact-generation collection and never waits for a
 numerical pass or playback capacity.
 
-**Open after the broker follow-on.** Two `BlockDomain`s and reverse-order
-per-block CQs, event-register waits, and
-concurrent numerical passes remain open.
+**Gang-completion follow-on implemented in the working tree.** An eight-lane
+engine creates two soft four-lane `BlockDomain`s. Each block leader publishes
+an exact-generation record to its private expected-value SPSC CQ; lane zero
+deliberately drains block 1 before block 0, and only then retires the matching
+gang lease and publishes the bridge CQ. The existing eight-lane stage board and
+fence still execute one numerical program, so this proves the completion and
+ownership protocol without claiming block concurrency. Private stage boards,
+per-domain ready rings, block-local collectives, event-register waits, and two
+simultaneous numerical programs remain open.
+
+**Kcoro ownership follow-on implemented in the working tree.** The stable
+numerical members are now created, generation-dispatched, parked, stopped, and
+joined by `kc_team`; Flashkern no longer owns lane pthread lifecycle. Every
+Flashkern stage reconverges through `kc_collective`, whose final arrival runs
+the bounded transition once, release-publishes its generation, and resumes
+declared parked peers through the shared 128-byte `kc_doorbell`. The bridge and
+route loops are still transitional pthreads, and the team is still one ganged
+execution domain. This is thread and synchronization ownership, not yet two
+independent block executors.
 
 ## 0. Ground truth and its limits
 
@@ -300,11 +318,16 @@ Each step is independently gated and leaves a correct fallback geometry:
    re-enters the ready set. Session-facing asynchronous terminal collection and
    total model-owned token classification are now mounted; block concurrency is
    the next scheduler boundary.
-3. **V2.2 — extract block state.** Create two `BlockDomain`s, private SPSC CQs,
-   and the gang lease. Run one active block/gang only; preserve the already-green
-   eight-way logical-fold parity and prove exact reverse-order CQ routing.
-4. **V2.3 — block-mode kcoro.** Add fixed-member continuations, per-domain ready
-   rings, early-return assertions, and optional measured event-wait backends.
+3. **V2.2 — extract block completion state (working-tree implementation).** Two
+   `BlockDomain`s, private SPSC CQs, and the exact-generation gang lease now gate
+   one active eight-lane program. The remaining extraction of private stage
+   boards, block-local fences, and scratch mounts belongs to V2.3; no current
+   sentence may call the two blocks independent executors.
+4. **V2.3 — block-mode kcoro, partial working-tree implementation.** Fixed-team
+   thread lifecycle and shared generation reconvergence now belong to kcoro.
+   Extract two domain-local teams, per-domain ready rings, early-return
+   assertions, and optional measured event-wait backends; convert the bridge and
+   route pthread loops into kcoro-owned continuations.
 5. **V2.4 — two independent programs.** Admit two `BLOCK4` programs only for
    different conversations. Profile actual overlap and shared-bandwidth effects;
    retain gang mode when it wins latency or parity.

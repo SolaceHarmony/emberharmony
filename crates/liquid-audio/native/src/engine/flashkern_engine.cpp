@@ -39,6 +39,7 @@
 #include <mutex>
 #include <new>
 #include <pthread.h>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -57,7 +58,9 @@
 
 extern "C" {
 #include "kc_atomic.h"
+#include "kc_collective.h"
 #include "kc_port.h"
+#include "kc_team.h"
 }
 
 // Stage kernels from the flashkern TU (same image, plain calls).
@@ -221,16 +224,6 @@ struct Stage {
     uint32_t kind = ST_IDLE; // written in the fence serial, read after fence exit
     uint32_t count = 0;      // number of tiles this stage
     uint32_t chunk = 0;      // band width for banded stages
-};
-
-// The generation fence — the GPU barrier idiom on fixed lanes. The last arriver runs
-// the boundary's serial section, release-publishes the next generation, and rings one
-// shared expected-value word. The host wakes only threads parked on that address, so
-// one syscall fans out to the actual waiter set without polling.
-struct Fence {
-    std::atomic<uint32_t> arrived{0};
-    std::atomic<uint32_t> park_mask{0};
-    std::atomic<uint64_t> gen{0};
 };
 
 enum : int {
@@ -610,6 +603,33 @@ static_assert(sizeof(WaitWord) == ENGINE_CACHELINE,
 static_assert(alignof(WaitWord) == ENGINE_CACHELINE,
               "shared doorbells must start on a cache-line boundary");
 
+constexpr size_t BLOCK_DOMAIN_COUNT = 2;
+constexpr size_t BLOCK_CQ_CAPACITY = 2;
+constexpr uint32_t BLOCK_LANES = 4;
+constexpr uint32_t GRID_LANES = BLOCK_DOMAIN_COUNT * BLOCK_LANES;
+
+struct BlockCompletion {
+    uint64_t generation = 0;
+    int32_t status = 0;
+    uint32_t block = 0;
+};
+
+/* One soft four-lane block. No field asserts physical cluster residency:
+ * macOS may scatter the fixed members and correctness remains address-based.
+ * The CQ is SPSC: the block leader publishes and lane zero drains. */
+struct alignas(ENGINE_CACHELINE) BlockDomain {
+    uint32_t id = 0;
+    uint32_t lane_begin = 0;
+    uint32_t lane_count = 0;
+    uint32_t reserved = 0;
+    WaitWord completion_word;
+    std::atomic<uint64_t> completion_head{0};
+    std::atomic<uint64_t> completion_tail{0};
+    std::array<BlockCompletion, BLOCK_CQ_CAPACITY> completions{};
+};
+static_assert(alignof(BlockDomain) == ENGINE_CACHELINE);
+static_assert(sizeof(BlockDomain) % ENGINE_CACHELINE == 0);
+
 enum : uint32_t {
     PASS_SLOT_FREE = 0,
     PASS_SLOT_CLAIMING = 1,
@@ -719,11 +739,6 @@ static bool transition_slot(PassSlot *slot, uint64_t generation,
         std::memory_order_acquire);
 }
 
-struct LaneArg {
-    Engine *e;
-    uint32_t lane;
-};
-
 struct LfmEngineSnapshotV1 {
     uint32_t size;
     uint32_t abi_version;
@@ -761,28 +776,30 @@ struct LfmEngineSnapshotV1 {
 struct Engine {
     Pass pass;
     Stage stage;
-    Fence fence;
+    kc_collective_t *collective = nullptr;
 
-    // Stable logical lane i always runs on pthread i. The SQ/CQ dispatcher only
-    // release-rings full passes; it never schedules or migrates numerical call stacks.
-    pthread_t workers[MAX_WORKERS] = {};
+    // Kcoro owns the fixed team and every resident lane thread. The SQ/CQ
+    // dispatcher only mounts full generations; numerical call stacks never
+    // migrate or enter the general continuation executor.
+    kc_team_t *team = nullptr;
     pthread_t bridge_worker{};
     pthread_t route_worker{};
     WaitWord dispatch_word;
-    WaitWord fence_word;
     WaitWord route_word;
-    LaneArg largs[MAX_WORKERS] = {};
+    std::array<BlockDomain, BLOCK_DOMAIN_COUNT> blocks;
     int n_workers = 0;
     int wait_words_prepared = 0;
-    int workers_started = 0;
     int bridge_started = 0;
     int route_started = 0;
     int route_wait_prepared = 0;
     int route_done_waits_prepared = 0;
     int slot_waits_prepared = 0;
     int audio_waits_prepared = 0;
+    int block_waits_prepared = 0;
+    uint32_t block_count = 1;
     uint32_t lanes_total = 1;
     std::atomic<uint64_t> lane_gen{0};
+    std::atomic<uint64_t> gang_lease{0};
     int cur_req = REQ_NONE;
     std::atomic<bool> retire{false};
     std::atomic<bool> route_retire{false};
@@ -806,14 +823,14 @@ struct Engine {
     std::atomic<uint64_t> pass_completions{0};
     std::atomic<uint64_t> bridge_dispatches{0};
     std::atomic<uint64_t> dispatch_wakes{0};
-    std::atomic<uint64_t> fence_wake_calls{0};
-    std::atomic<uint64_t> fence_wakes{0};
     std::atomic<uint32_t> attention_qkv_capacity{0};
     std::atomic<uint32_t> attention_y_capacity{0};
     std::atomic<uint32_t> attention_score_capacity{0};
     std::atomic<uint32_t> pass_slots_live{0};
     std::atomic<uint32_t> max_pass_slots_live{0};
     std::atomic<uint64_t> continuation_submissions{0};
+    std::atomic<uint64_t> block_completions{0};
+    std::atomic<uint64_t> gang_generations{0};
     std::atomic<uint64_t> route_dispatches{0};
     std::atomic<uint64_t> route_parks{0};
     std::atomic<uint64_t> audio_encode_passes{0};
@@ -1465,33 +1482,12 @@ static void pause_test_boundary(Engine *e, std::atomic<uint32_t> *state) {
 // live in engine-owned planes and every ladder has a fixed internal order.
 template <typename F>
 static inline void lane_fence(Engine *e, uint32_t lane, F &&serial) {
-    Fence *f = &e->fence;
-    uint64_t g = f->gen.load(std::memory_order_relaxed);
-    if (f->arrived.fetch_add(1, std::memory_order_acq_rel) + 1 == e->lanes_total) {
-        serial();
-        f->arrived.store(0, std::memory_order_relaxed); // before the release below
-        f->gen.store(g + 1, std::memory_order_release);
-        uint32_t parked = f->park_mask.exchange(0, std::memory_order_acq_rel);
-        if (parked) {
-            e->fence_wake_calls.fetch_add(1, std::memory_order_relaxed);
-            e->fence_wakes.fetch_add((uint32_t)__builtin_popcount(parked),
-                                     std::memory_order_relaxed);
-            signal_all(&e->fence_word);
-        }
-        return;
-    }
-    uint32_t bit = 1u << lane;
-    uint32_t expected = kc_atomic_u32_load_acquire(&e->fence_word.value);
-    f->park_mask.fetch_or(bit, std::memory_order_acq_rel);
-    if (f->gen.load(std::memory_order_acquire) != g) {
-        f->park_mask.fetch_and(~bit, std::memory_order_acq_rel);
-        return;
-    }
-    while (f->gen.load(std::memory_order_acquire) == g) {
-        (void)kc_port_wait_u32(e->fence_word.wait, expected, 0);
-        expected = kc_atomic_u32_load_acquire(&e->fence_word.value);
-    }
-    f->park_mask.fetch_and(~bit, std::memory_order_acq_rel);
+    using Callback = std::remove_reference_t<F>;
+    const int status = kc_collective_arrive(
+        e->collective, lane,
+        [](void *context) { (*static_cast<Callback *>(context))(); },
+        std::addressof(serial));
+    if (status < 0) std::abort();
 }
 
 // One stage: fence in (serial section + claim-counter reset), then claim tiles off
@@ -3058,54 +3054,125 @@ static void lane_program(Engine *e, uint32_t lane) {
     lane_fence(e, lane, [] {});
 }
 
-// Every fixed lane blocks on its own expected-value word between passes. The pass
-// generation remains the predicate; the word is only the edge that makes it recheck.
-static void *lane_main(void *arg) {
-    LaneArg *la = (LaneArg *)arg;
-    Engine *e = la->e;
-    const uint32_t lane = la->lane;
-    uint32_t observed = kc_atomic_u32_load_acquire(&e->dispatch_word.value);
-    uint64_t seen = 0;
-    for (;;) {
-        while (e->lane_gen.load(std::memory_order_acquire) == seen &&
-               !e->retire.load(std::memory_order_acquire)) {
-            int rc = kc_port_wait_u32(e->dispatch_word.wait, observed, 0);
-            observed = kc_atomic_u32_load_acquire(&e->dispatch_word.value);
-            if (rc != 0 && e->retire.load(std::memory_order_acquire)) return nullptr;
+static BlockDomain *block_for_lane(Engine *e, uint32_t lane) {
+    for (uint32_t index = 0; index < e->block_count; ++index) {
+        BlockDomain *block = &e->blocks[index];
+        if (lane >= block->lane_begin &&
+            lane < block->lane_begin + block->lane_count) {
+            return block;
         }
-        bool retire = e->retire.load(std::memory_order_acquire);
-        uint64_t generation = e->lane_gen.load(std::memory_order_acquire);
-        if (retire) return nullptr;
-        seen = generation;
-        lane_program(e, lane);
-        if (lane == 0) {
-            const KcSubmissionV1 submission = e->active_submission;
-            KcCompletionV1 completion{};
-            completion.size = sizeof(completion);
-            completion.abi_version = KC_COORD_ABI_VERSION;
-            completion.ticket = submission.ticket;
-            completion.conversation_id = submission.conversation_id;
-            completion.epoch = submission.epoch;
-            completion.pass_id = submission.ticket.sequence;
-            completion.status = e->active_status.load(std::memory_order_acquire);
-            if (completion.status == 0) {
-                completion.execution = KC_COORD_EXECUTION_COMPLETED;
-                completion.state = KC_COORD_STATE_COMMITTED;
-                completion.publication = KC_COORD_PUBLICATION_COMMITTED;
-                completion.cause = KC_COORD_CAUSE_SUCCESS;
-            } else {
-                completion.execution = KC_COORD_EXECUTION_FAILED;
-                completion.state = KC_COORD_STATE_NONE;
-                completion.publication = KC_COORD_PUBLICATION_NONE;
-                completion.cause = KC_COORD_CAUSE_FAULT;
-            }
-            e->pass_completions.fetch_add(1, std::memory_order_relaxed);
-            if (lfm_kernel_bridge_publish_completion(e->bridge, &completion) != 0) {
-                // The sole accepted ticket owns a reserved CQ cell. Failure here
-                // would otherwise strand the caller forever, so surface the broken
-                // executor invariant as a process fault.
+    }
+    return nullptr;
+}
+
+static void publish_block_completion(Engine *e, BlockDomain *block,
+                                     uint64_t generation, int status) {
+    const uint64_t head =
+        block->completion_head.load(std::memory_order_relaxed);
+    const uint64_t tail =
+        block->completion_tail.load(std::memory_order_acquire);
+    if (head - tail >= BLOCK_CQ_CAPACITY) std::abort();
+    block->completions[head % BLOCK_CQ_CAPACITY] = {
+        .generation = generation,
+        .status = status,
+        .block = block->id,
+    };
+    block->completion_head.store(head + 1, std::memory_order_release);
+    e->block_completions.fetch_add(1, std::memory_order_relaxed);
+    signal_all(&block->completion_word);
+}
+
+static BlockCompletion wait_block_completion(Engine *e, BlockDomain *block,
+                                             uint64_t generation) {
+    uint32_t observed =
+        kc_atomic_u32_load_acquire(&block->completion_word.value);
+    for (;;) {
+        const uint64_t tail =
+            block->completion_tail.load(std::memory_order_relaxed);
+        const uint64_t head =
+            block->completion_head.load(std::memory_order_acquire);
+        if (tail < head) {
+            const BlockCompletion completion =
+                block->completions[tail % BLOCK_CQ_CAPACITY];
+            block->completion_tail.store(tail + 1,
+                                         std::memory_order_release);
+            if (completion.generation != generation ||
+                completion.block != block->id) {
                 std::abort();
             }
+            return completion;
+        }
+        const int status = kc_port_wait_u32(block->completion_word.wait,
+                                            observed, 0);
+        observed =
+            kc_atomic_u32_load_acquire(&block->completion_word.value);
+        if (status != 0 && !e->retire.load(std::memory_order_acquire)) {
+            std::abort();
+        }
+    }
+}
+
+// Kcoro calls this once per stable member for each dispatched generation. It
+// owns the resident thread, expected-value park, stop, and join; Flashkern owns
+// only the lane-uniform numerical program and its model-specific completion.
+static void lane_member(void *context, uint32_t lane, uint32_t members,
+                        uint64_t generation) {
+    Engine *e = static_cast<Engine *>(context);
+    if (!e || members != e->lanes_total ||
+        generation != e->lane_gen.load(std::memory_order_acquire)) {
+        std::abort();
+    }
+    lane_program(e, lane);
+    BlockDomain *block = block_for_lane(e, lane);
+    if (!block) std::abort();
+    if (lane == block->lane_begin) {
+        publish_block_completion(
+            e, block, generation,
+            e->active_status.load(std::memory_order_acquire));
+    }
+    if (lane == 0) {
+        int status = 0;
+        // Drain in reverse block order deliberately. Completion order is
+        // not an ownership or publication condition; exact generation is.
+        for (uint32_t index = e->block_count; index > 0; --index) {
+            const BlockCompletion block_completion =
+                wait_block_completion(e, &e->blocks[index - 1], generation);
+            if (status == 0 && block_completion.status != 0) {
+                status = block_completion.status;
+            }
+        }
+        uint64_t lease = generation;
+        if (!e->gang_lease.compare_exchange_strong(
+                lease, 0, std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            std::abort();
+        }
+        const KcSubmissionV1 submission = e->active_submission;
+        KcCompletionV1 completion{};
+        completion.size = sizeof(completion);
+        completion.abi_version = KC_COORD_ABI_VERSION;
+        completion.ticket = submission.ticket;
+        completion.conversation_id = submission.conversation_id;
+        completion.epoch = submission.epoch;
+        completion.pass_id = submission.ticket.sequence;
+        completion.status = status;
+        if (completion.status == 0) {
+            completion.execution = KC_COORD_EXECUTION_COMPLETED;
+            completion.state = KC_COORD_STATE_COMMITTED;
+            completion.publication = KC_COORD_PUBLICATION_COMMITTED;
+            completion.cause = KC_COORD_CAUSE_SUCCESS;
+        } else {
+            completion.execution = KC_COORD_EXECUTION_FAILED;
+            completion.state = KC_COORD_STATE_NONE;
+            completion.publication = KC_COORD_PUBLICATION_NONE;
+            completion.cause = KC_COORD_CAUSE_FAULT;
+        }
+        e->pass_completions.fetch_add(1, std::memory_order_relaxed);
+        if (lfm_kernel_bridge_publish_completion(e->bridge, &completion) != 0) {
+            // The sole accepted ticket owns a reserved CQ cell. Failure here
+            // would otherwise strand the caller forever, so surface the broken
+            // executor invariant as a process fault.
+            std::abort();
         }
     }
 }
@@ -3229,15 +3296,26 @@ static void *bridge_main(void *arg) {
         }
 
         if (valid) {
+            const uint64_t previous =
+                e->lane_gen.load(std::memory_order_acquire);
+            if (previous != 0 && kc_team_wait(e->team, previous, 0) != 0)
+                std::abort();
             activate_slot(e, slot);
             e->active_status.store(0, std::memory_order_relaxed);
             e->cur_req = slot->request;
             e->active_submission = submission;
             e->bridge_dispatches.fetch_add(1, std::memory_order_relaxed);
             uint64_t generation = e->lane_gen.load(std::memory_order_relaxed) + 1;
+            uint64_t idle = 0;
+            if (!e->gang_lease.compare_exchange_strong(
+                    idle, generation, std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+                std::abort();
+            }
+            e->gang_generations.fetch_add(1, std::memory_order_relaxed);
             e->lane_gen.store(generation, std::memory_order_release);
             e->dispatch_wakes.fetch_add(1, std::memory_order_relaxed);
-            signal_all(&e->dispatch_word);
+            if (kc_team_dispatch(e->team, generation) != 0) std::abort();
         }
 
         KcCompletionV1 completion{};
@@ -4091,6 +4169,21 @@ void *lfm_engine_new(int workers) {
         e->runtime_epoch = next_engine_epoch.fetch_add(1, std::memory_order_acq_rel);
     e->lanes_total = (uint32_t)workers;
     e->n_workers = workers;
+    e->block_count = workers == (int)GRID_LANES ? 2u : 1u;
+    for (uint32_t index = 0; index < e->block_count; ++index) {
+        BlockDomain &block = e->blocks[index];
+        block.id = index;
+        block.lane_begin = e->block_count == 2 ? index * BLOCK_LANES : 0;
+        block.lane_count =
+            e->block_count == 2 ? BLOCK_LANES : (uint32_t)workers;
+        if (!kc_atomic_u32_is_lock_free(&block.completion_word.value) ||
+            kc_port_wait_u32_prepare(&block.completion_word.value,
+                                     &block.completion_word.wait) != 0) {
+            lfm_engine_free(e);
+            return nullptr;
+        }
+        e->block_waits_prepared++;
+    }
     e->route_pool = new (std::nothrow) AudioRoutePool();
     if (!e->route_pool) {
         lfm_engine_free(e);
@@ -4139,12 +4232,11 @@ void *lfm_engine_new(int workers) {
         return nullptr;
     }
     e->route_wait_prepared = 1;
-    if (!kc_atomic_u32_is_lock_free(&e->fence_word.value) ||
-        kc_port_wait_u32_prepare(&e->fence_word.value, &e->fence_word.wait) != 0) {
+    if (kc_collective_create(static_cast<uint32_t>(workers),
+                             &e->collective) != 0) {
         lfm_engine_free(e);
         return nullptr;
     }
-    e->wait_words_prepared++;
 
     LfmKernelBridgeConfigV1 bridge_config = {
         .size = sizeof(LfmKernelBridgeConfigV1),
@@ -4166,14 +4258,18 @@ void *lfm_engine_new(int workers) {
         return nullptr;
     }
     e->route_started = 1;
-    for (int lane = 0; lane < workers; ++lane) {
-        e->largs[lane].e = e;
-        e->largs[lane].lane = (uint32_t)lane;
-        if (pthread_create(&e->workers[lane], nullptr, lane_main, &e->largs[lane]) != 0) {
-            lfm_engine_free(e);
-            return nullptr;
-        }
-        e->workers_started++;
+    const kc_team_config team_config = {
+        .size = sizeof(kc_team_config),
+        .abi_version = 1,
+        .member_count = static_cast<uint32_t>(workers),
+        .reserved = 0,
+        .member = lane_member,
+        .context = e,
+    };
+    if (kc_team_create(&team_config, &e->team) != 0 ||
+        kc_team_start(e->team) != 0) {
+        lfm_engine_free(e);
+        return nullptr;
     }
     return e;
 }
@@ -4296,29 +4392,48 @@ int lfm_internal_engine_request_kind_valid_for_test(uint32_t kind) {
 int lfm_internal_engine_wait_word_layout_for_test(void *ep) {
     Engine *e = static_cast<Engine *>(ep);
     if (!e) return -EINVAL;
-    constexpr size_t WAIT_WORD_COUNT =
-        3 + PASS_CAPACITY * 2 + ROUTE_CAPACITY;
-    std::array<const WaitWord *, WAIT_WORD_COUNT> words{};
+    constexpr size_t MAX_WAIT_WORD_COUNT =
+        2 + PASS_CAPACITY * 2 + ROUTE_CAPACITY + BLOCK_DOMAIN_COUNT;
+    std::array<const WaitWord *, MAX_WAIT_WORD_COUNT> words{};
     words[0] = &e->dispatch_word;
-    words[1] = &e->fence_word;
-    words[2] = &e->route_word;
+    words[1] = &e->route_word;
     for (size_t slot = 0; slot < PASS_CAPACITY; ++slot) {
-        words[3 + slot * 2] = &e->slots[slot].completion_word;
-        words[4 + slot * 2] = &e->slots[slot].audio_word;
+        words[2 + slot * 2] = &e->slots[slot].completion_word;
+        words[3 + slot * 2] = &e->slots[slot].audio_word;
     }
     for (size_t route = 0; route < ROUTE_CAPACITY; ++route) {
-        words[3 + PASS_CAPACITY * 2 + route] =
+        words[2 + PASS_CAPACITY * 2 + route] =
             &e->route_pool->routes[route].done;
     }
-    for (size_t left = 0; left < WAIT_WORD_COUNT; ++left) {
+    const size_t block_base = 2 + PASS_CAPACITY * 2 + ROUTE_CAPACITY;
+    for (size_t block = 0; block < e->block_count; ++block) {
+        words[block_base + block] = &e->blocks[block].completion_word;
+    }
+    const size_t word_count = block_base + e->block_count;
+    for (size_t left = 0; left < word_count; ++left) {
         const uintptr_t address = reinterpret_cast<uintptr_t>(words[left]);
         if (address % ENGINE_CACHELINE != 0) return -EFAULT;
-        for (size_t right = left + 1; right < WAIT_WORD_COUNT; ++right) {
+        for (size_t right = left + 1; right < word_count; ++right) {
             const uintptr_t peer = reinterpret_cast<uintptr_t>(words[right]);
             if (address / ENGINE_CACHELINE == peer / ENGINE_CACHELINE)
                 return -EFAULT;
         }
     }
+    return 0;
+}
+
+int lfm_internal_engine_grid_snapshot_for_test(
+    void *ep, uint32_t *blocks, uint64_t *completions,
+    uint64_t *generations, uint64_t *lease) {
+    Engine *e = static_cast<Engine *>(ep);
+    if (!e || !blocks || !completions || !generations || !lease) {
+        return -EINVAL;
+    }
+    *blocks = e->block_count;
+    *completions =
+        e->block_completions.load(std::memory_order_acquire);
+    *generations = e->gang_generations.load(std::memory_order_acquire);
+    *lease = e->gang_lease.load(std::memory_order_acquire);
     return 0;
 }
 
@@ -4398,9 +4513,10 @@ int lfm_engine_conformer_gemm_team(
         return -EINVAL;
     }
     PassSlot *slot = e->active_slot;
+    uint32_t member = UINT32_MAX;
     if (!slot || slot->request != REQ_AUDIO_ENCODE ||
         slot->audio.done.load(std::memory_order_acquire) ||
-        !pthread_equal(pthread_self(), e->workers[0])) {
+        kc_team_current_member(e->team, &member) != 0 || member != 0) {
         return -EBUSY;
     }
 
@@ -4474,6 +4590,11 @@ int lfm_engine_snapshot(void *ep, LfmEngineSnapshotV1 *out) {
         if (state != AUDIO_ROUTE_FREE) routes_live++;
         if (state == AUDIO_ROUTE_READY) routes_ready++;
     }
+    kc_collective_snapshot collective = {
+        .size = sizeof(kc_collective_snapshot),
+    };
+    if (kc_collective_snapshot_get(e->collective, &collective) != 0)
+        return -EFAULT;
     *out = {
         .size = sizeof(*out),
         .abi_version = 1,
@@ -4481,9 +4602,9 @@ int lfm_engine_snapshot(void *ep, LfmEngineSnapshotV1 *out) {
         .pass_completions = e->pass_completions.load(std::memory_order_relaxed),
         .bridge_dispatches = e->bridge_dispatches.load(std::memory_order_relaxed),
         .dispatch_wakes = e->dispatch_wakes.load(std::memory_order_relaxed),
-        .fence_wake_calls = e->fence_wake_calls.load(std::memory_order_relaxed),
-        .fence_wakes = e->fence_wakes.load(std::memory_order_relaxed),
-        .fence_generations = e->fence.gen.load(std::memory_order_acquire),
+        .fence_wake_calls = collective.wake_calls,
+        .fence_wakes = collective.wakes,
+        .fence_generations = collective.generation,
         .descriptor_acquires = descriptors.acquired,
         .descriptor_retains = descriptors.retained,
         .descriptor_releases = descriptors.released,
@@ -4525,10 +4646,12 @@ void lfm_engine_free(void *ep) {
     if (e->route_started > 0) pthread_join(e->route_worker, nullptr);
     if (e->bridge_started > 0) pthread_join(e->bridge_worker, nullptr);
     e->retire.store(true, std::memory_order_release);
-    e->lane_gen.fetch_add(1, std::memory_order_release);
     if (e->wait_words_prepared > 0) signal_all(&e->dispatch_word);
-    for (int lane = 0; lane < e->workers_started; ++lane) {
-        pthread_join(e->workers[lane], nullptr);
+    if (e->team) {
+        kc_team_request_stop(e->team);
+        if (kc_team_join(e->team) != 0 || kc_team_destroy(e->team) != 0)
+            std::abort();
+        e->team = nullptr;
     }
     if (e->bridge && lfm_kernel_bridge_destroy(e->bridge) != 0) std::abort();
     if (e->route_pool) {
@@ -4543,9 +4666,13 @@ void lfm_engine_free(void *ep) {
     for (int index = 0; index < e->slot_waits_prepared; ++index) {
         kc_port_wait_u32_release(e->slots[(size_t)index].completion_word.wait);
     }
-    if (e->wait_words_prepared > 1) kc_port_wait_u32_release(e->fence_word.wait);
+    for (int index = 0; index < e->block_waits_prepared; ++index) {
+        kc_port_wait_u32_release(
+            e->blocks[(size_t)index].completion_word.wait);
+    }
     if (e->route_wait_prepared) kc_port_wait_u32_release(e->route_word.wait);
     if (e->wait_words_prepared > 0) kc_port_wait_u32_release(e->dispatch_word.wait);
+    kc_collective_destroy(e->collective);
     delete e->route_pool;
     delete e;
 }

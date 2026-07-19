@@ -3,8 +3,11 @@
 
 /* Canonical public include for the active stackless runtime. */
 #include "kc_atomic.h"
+#include "kc_collective.h"
+#include "kc_doorbell.h"
 #include "kc_port.h"
 #include "kc_runtime.h"
+#include "kc_team.h"
 #include "kc_ticket.h"
 #include "kc_channel.h"
 #include "kc_cancel.h"

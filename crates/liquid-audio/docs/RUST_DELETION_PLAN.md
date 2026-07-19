@@ -33,11 +33,11 @@ production fallback.
 | Typed binding | **Landed.** Exact BF16/F32 dtype, rank, shape, layer, codebook, and vocabulary checks; possibly unaligned tensors remain byte views. | None for LFM2. |
 | Weight consumption | **Landed.** Frontend, Conformer, backbone, Depthformer, and Mimi bind the same image; BF16 unlift occurs in registers. | `compatibility_copied_bytes == 0` remains an acceptance assertion. Its counters were **stubs returning a literal 0** (review 2026-07-16) — the gate could not fail; now wired to real per-plan tallies. See "Accounting is a tally, not a constant" below. |
 | Native model chain | **Landed for numerical ownership.** One typed, model-correlated `REQ_AUDIO_ENCODE` pass owns resample → valid-only BF16 frontend → whole Conformer/adapter over borrowed spans and pre-reserved conversation buffers. Modality assembly, M≤4 checkpoint-BF16 prefill, backbone, sampling, Depthformer, Mimi, and tokenizer are also native-owned. | No remaining numerical-stage ownership gap for LFM2. The coordinator-to-continuation scheduling cut is tracked in the conversation/session row. |
-| Conversation/session | **Landed.** Native KV/ShortConv/codec state, PRNG, cursor, recurrence, text/PCM tickets, reliable events, epochs, interrupt, stop, and join. Rust does not drive progress. A fixed route pool and native expected-value broker release capacity between coarse nodes; exact-CQ callbacks only commit, retire the slot, and publish readiness. Text and audio routes notify a coordinator-owned `SessionAction`, which collects the exact handle without a numerical wait. | V2 BlockDomains remain separate scheduler work. |
+| Conversation/session | **Landed.** Native KV/ShortConv/codec state, PRNG, cursor, recurrence, text/PCM tickets, reliable events, epochs, interrupt, stop, and join. Rust does not drive progress. A fixed route pool and native expected-value broker release capacity between coarse nodes; exact-CQ callbacks only commit, retire the slot, and publish readiness. Text and audio routes notify a coordinator-owned `SessionAction`, which collects the exact handle without a numerical wait. | The V2.2 gang-completion protocol is mounted; private block execution remains separate scheduler work. |
 | Context rollover | **Landed.** Fixed capacity+runway BF16 state, monotonic cursor, absolute RoPE range generation, nonmutating whole-action admission, causal row-by-row eviction, and in-place compaction. | None for the activation-state sliding-window contract. |
 | Shared model | **Landed.** Per-conversation state/scratch and a fair model-owned expected-value pass gate; engine `-EBUSY` does not leak as scheduling policy. | Capacity-2 continuations may improve overlap; fairness is already correct. |
 | Production graph | **Landed.** Desktop creates `NativeVoiceModel` and opaque native conversations/sessions only; default dependencies do not enable Candle or Moshi. | Native Metal/MLX remains a separate future backend and must fail explicitly until mounted. |
-| Physical audio dock | **Partial.** Native generation-checked capture/playback leases and zero-spin doorbells are live. Playback is consumed synchronously from the borrowed native span by an installed Rust `PcmSink`; the lease is then released and only `Playback { ticket }` crosses the control channel. | Capture still copies `Utterance.samples` into a lease. Direct callback-filled chunks need a distinct VAD commit command so publishing a chunk does not incorrectly begin a turn. |
+| Physical audio dock | **Partial.** Native generation-checked capture/playback leases and zero-spin doorbells are live. Playback is consumed synchronously from the borrowed native span by an installed Rust `PcmSink`; the lease is then released and only `Playback { ticket }` crosses the control channel. Production VAD now submits a borrowed slice through `CaptureDock`; one copy fills the final native lease and only its opaque ticket crosses the inference-worker queue. | The mic callback still writes the Rust ring/VAD accumulation buffer before final lease admission. Closing that first copy requires a callback-writable reservation plus an explicit VAD commit operation. |
 | Moshi | **Not ported.** It is offline/oracle-only and is not the shipped default. | A full native Moshi port is a subsequent tranche; this LFM2 ledger does not claim it. |
 
 ## Completed LFM2 cutover
@@ -202,8 +202,11 @@ execution claim.
 Keep platform device callbacks in Rust, but have them reserve/fill capture leases
 and drain playback leases directly. Playback now drains its borrowed lease
 through `PcmSink` without `Vec<f32>`, `Reply::Audio`, or native
-`VoiceEvent::Audio` projection. Delete the remaining capture copy by separating
-callback-filled capture publication from the Rust-VAD turn-commit command.
+`VoiceEvent::Audio` projection. Capture no longer materializes an utterance
+`Vec<f32>` or copies again inside the inference worker: `CaptureDock` fills the
+final lease from a borrowed VAD slice and queues only its ticket. Delete the
+remaining mic-ring/VAD-buffer copy by separating callback-filled capture
+publication from the Rust-VAD turn-commit command.
 Preserve bounded reliable transcript/control delivery;
 only waveform/telemetry observation may be lossy.
 

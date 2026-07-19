@@ -33,12 +33,43 @@ pub trait PcmSink: Send + Sync {
     fn consume(&self, pcm: &[f32], rate: u32) -> bool;
 }
 
+/// Opaque correlation identity returned when a borrowed capture span has been
+/// copied once into its final retained native lease and published.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CaptureTicket {
+    pub(crate) runtime_epoch: u64,
+    pub(crate) sequence: u64,
+    pub(crate) generation: u32,
+    pub(crate) kind: u32,
+}
+
+/// Direct production capture seam. Implementations synchronously consume the
+/// borrowed span into final native lease storage and return only its ticket.
+/// No Rust-owned utterance buffer crosses the worker queue.
+pub trait CaptureDock: Send + Sync {
+    fn submit(&self, pcm: &[f32], rate: u32) -> Result<Option<CaptureTicket>, String>;
+}
+
 /// Tensor-free model/session edge used by application orchestration.
 pub trait VoiceEngine: Send {
     /// Install the direct PCM path when supported. `false` retains the semantic
     /// `VoiceEvent::Audio` compatibility path used by offline/oracle engines.
     fn install_pcm_sink(&mut self, _sink: Arc<dyn PcmSink>) -> bool {
         false
+    }
+
+    fn capture_dock(&self) -> Option<Arc<dyn CaptureDock>> {
+        None
+    }
+
+    fn await_capture(
+        &mut self,
+        _ticket: CaptureTicket,
+        _cancel: &AtomicBool,
+        _emit: &mut dyn FnMut(VoiceEvent),
+    ) -> Result<bool, String> {
+        Err("voice engine does not support direct capture tickets".into())
     }
 
     fn respond(
@@ -79,6 +110,19 @@ pub trait VoiceEngine: Send {
 impl<T: VoiceEngine + ?Sized> VoiceEngine for Box<T> {
     fn install_pcm_sink(&mut self, sink: Arc<dyn PcmSink>) -> bool {
         (**self).install_pcm_sink(sink)
+    }
+
+    fn capture_dock(&self) -> Option<Arc<dyn CaptureDock>> {
+        (**self).capture_dock()
+    }
+
+    fn await_capture(
+        &mut self,
+        ticket: CaptureTicket,
+        cancel: &AtomicBool,
+        emit: &mut dyn FnMut(VoiceEvent),
+    ) -> Result<bool, String> {
+        (**self).await_capture(ticket, cancel, emit)
     }
 
     fn respond(

@@ -3284,7 +3284,7 @@ async fn start_local_webrtc_input(
 }
 
 async fn local_webrtc_mic_loop(
-    writer: ExternalAudioInputWriter,
+    mut writer: ExternalAudioInputWriter,
     done: Arc<AtomicBool>,
     ready: oneshot::Sender<Result<(), String>>,
 ) -> Result<(), String> {
@@ -3337,7 +3337,7 @@ async fn local_webrtc_mic_loop(
     .map_err(|_| "local WebRTC microphone produced no frames before timeout".to_string())?;
     match first {
         Some(frame) => {
-            push_local_webrtc_mic_frame(&writer, &frame);
+            push_local_webrtc_mic_frame(&mut writer, &frame);
             send_local_webrtc_ready(&mut ready, Ok(()));
         }
         None => {
@@ -3361,9 +3361,8 @@ async fn local_webrtc_mic_loop(
         let Some(frame) = frame else {
             break;
         };
-        push_local_webrtc_mic_frame(&writer, &frame);
+        push_local_webrtc_mic_frame(&mut writer, &frame);
     }
-    writer.clear();
     Ok(())
 }
 
@@ -3405,7 +3404,10 @@ async fn next_local_webrtc_mic_frame(
     }
 }
 
-fn push_local_webrtc_mic_frame(writer: &ExternalAudioInputWriter, frame: &AudioFrame<'_>) -> bool {
+fn push_local_webrtc_mic_frame(
+    writer: &mut ExternalAudioInputWriter,
+    frame: &AudioFrame<'_>,
+) -> bool {
     if frame.sample_rate == 0 {
         return false;
     }

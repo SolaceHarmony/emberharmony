@@ -8,6 +8,7 @@
 //! [`RuntimeEvent`]s onto its IPC channel.
 
 use std::cell::UnsafeCell;
+use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -109,9 +110,12 @@ pub struct ExternalAudioOutput {
     clear: Arc<dyn Fn() + Send + Sync>,
 }
 
-#[derive(Clone)]
 pub struct ExternalAudioInputWriter {
     mic: Mic,
+    // One endpoint owns the SPSC producer cursor. Cell is Send but not Sync,
+    // preventing shared-reference publication from manufacturing another
+    // concurrent producer over PcmRing's UnsafeCell storage.
+    producer: std::marker::PhantomData<Cell<()>>,
 }
 
 impl ExternalAudioInput {
@@ -125,20 +129,18 @@ impl ExternalAudioInput {
                 mic: mic.clone(),
                 rate,
             },
-            ExternalAudioInputWriter { mic },
+            ExternalAudioInputWriter {
+                mic,
+                producer: std::marker::PhantomData,
+            },
         ))
     }
 }
 
 impl ExternalAudioInputWriter {
     /// Push mono f32 PCM into the capture ring. Returns the number of dropped samples.
-    pub fn push_mono_f32(&self, samples: &[f32]) -> usize {
+    pub fn push_mono_f32(&mut self, samples: &[f32]) -> usize {
         self.mic.push_slice(samples)
-    }
-
-    pub fn clear(&self) {
-        self.mic.clear();
-        self.mic.notify();
     }
 }
 
@@ -890,14 +892,15 @@ fn session_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
     const DIRECT_STATE_ERROR: &str = "native PCM state event was rejected";
     let direct_ring = output.ring.clone();
     let direct_rate = output.rate;
-    let direct_external = output.external.is_some();
+    let direct_output = output.external.clone();
+    let direct_flush = playback_flush.clone();
     let direct_audio = audio.clone();
     let direct_playback = output.playback.clone();
     let direct_assistant = assistant.clone();
     let direct_latency = latency.clone();
     let direct_sink = sink.clone();
     let direct_stop = stop.clone();
-    let _ = engine.install_pcm_sink(Arc::new(DirectPcmSink {
+    let direct_pcm = engine.install_pcm_sink(Arc::new(DirectPcmSink {
         consume: Box::new(move |pcm, rate| {
             if rate != direct_rate {
                 let message =
@@ -927,7 +930,26 @@ fn session_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
                     eprintln!("[voice-latency] first word {ms} ms after session start");
                 }
             }
-            let dropped = direct_ring.push_slice(pcm);
+            let dropped = if let Some(output) = &direct_output {
+                if direct_flush.swap(false, Ordering::SeqCst) {
+                    output.clear();
+                }
+                if let Err(error) = output.write_mono_f32(pcm) {
+                    emit_or_stop(
+                        &direct_sink,
+                        &direct_stop,
+                        RuntimeEvent::Error(format!("native PCM output failed: {error}")),
+                    );
+                    return false;
+                }
+                direct_audio
+                    .played_samples
+                    .fetch_add(pcm.len() as u64, Ordering::Relaxed);
+                direct_playback.set_playing(level);
+                0
+            } else {
+                direct_ring.push_slice(pcm)
+            };
             let queued = pcm.len().saturating_sub(dropped);
             direct_audio
                 .decoded_samples
@@ -938,9 +960,6 @@ fn session_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
             direct_audio
                 .dropped_samples
                 .fetch_add(dropped as u64, Ordering::Relaxed);
-            if direct_external && dropped == 0 {
-                direct_playback.set_playing(level);
-            }
             !direct_stop.load(Ordering::SeqCst)
         }),
     }));
@@ -1038,7 +1057,10 @@ fn session_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
         playback_flush.clone(),
         output.playback.clone(),
         latency.clone(),
-        output.external.clone(),
+        match direct_pcm {
+            true => None,
+            false => output.external.clone(),
+        },
     ) {
         Ok(consumer) => consumer,
         Err(error) => {
@@ -1577,10 +1599,11 @@ fn vad_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
             if trim_end > start {
                 let dur_s = (trim_end - start) as f32 / in_rate as f32;
                 if dur_s >= cfg.min_utterance_s {
-                    let sent = pipe.prepare(Utterance {
-                        samples: mic_buf[start..trim_end].to_vec(),
-                        rate: in_rate,
-                    });
+                    let sent = pipe.has_direct_capture()
+                        || pipe.prepare(Utterance {
+                            samples: mic_buf[start..trim_end].to_vec(),
+                            rate: in_rate,
+                        });
                     vtrace!(
                         "vad: pause {}ms -> speculative prepare ({dur_s:.2}s, sent {sent})",
                         last_voice.elapsed().as_millis()
@@ -1609,25 +1632,37 @@ fn vad_loop<S: FnMut(RuntimeEvent) -> bool + Send + 'static>(
             // fraction shifts it) and made `min_utterance_s` a real gate for
             // short interjections; both intentional, revisit on quality reports.
             let end = (voice_end + window).clamp(start, end);
-            let samples = mic_buf[start..end].to_vec();
-            mic_buf.clear();
-            read = 0;
-            speaking = false;
             let had_prepare = prepared.take();
-            voice_end = 0;
-
-            let dur_s = samples.len() as f32 / in_rate as f32;
-            if dur_s >= cfg.min_utterance_s {
+            let dur_s = (end - start) as f32 / in_rate as f32;
+            let submission = if dur_s >= cfg.min_utterance_s {
                 if !emit_or_stop(sink, stop, RuntimeEvent::State(SessionState::Thinking)) {
                     return;
                 }
-                if pipe.submit(Utterance {
-                    samples,
-                    rate: in_rate,
-                }) {
+                Some(pipe.submit_pcm(&mic_buf[start..end], in_rate))
+            } else {
+                None
+            };
+            mic_buf.clear();
+            read = 0;
+            speaking = false;
+            voice_end = 0;
+
+            if let Some(submission) = submission {
+                if submission == Ok(true) {
                     vtrace!("vad: utterance-end {dur_s:.2}s -> submitted");
                     latency.arm();
                 } else {
+                    if let Err(error) = submission {
+                        if !emit_or_stop(
+                            sink,
+                            stop,
+                            RuntimeEvent::Error(format!(
+                                "native capture admission failed: {error}"
+                            )),
+                        ) {
+                            return;
+                        }
+                    }
                     // A full utterance queue silently eating the user's speech is a
                     // real user-facing event — always say so, not just under trace.
                     eprintln!(

@@ -26,7 +26,9 @@ use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 
 #[cfg(feature = "oracle")]
 use crate::moshi::models::compression::MimiModel;
-pub use crate::voice_api::{FrameConfig, Utterance, VoiceEngine, VoiceEvent};
+pub use crate::voice_api::{
+    CaptureDock, CaptureTicket, FrameConfig, Utterance, VoiceEngine, VoiceEvent,
+};
 
 #[cfg(test)]
 const MIMI_RATE: u32 = 24_000; // Mimi/LFM2 detokenizer output rate.
@@ -155,8 +157,13 @@ pub enum FrameSubmitError {
     Disconnected,
 }
 
+enum TurnInput {
+    Owned(Utterance),
+    Capture(CaptureTicket),
+}
+
 struct QueuedUtterance {
-    utt: Utterance,
+    input: TurnInput,
     epoch: u64,
 }
 
@@ -177,6 +184,8 @@ enum Control {
 pub struct RealtimePipeline {
     utt_tx: Option<Sender<QueuedUtterance>>,
     ctl_tx: Option<Sender<Control>>,
+    capture: Option<Arc<dyn CaptureDock>>,
+    admission: Arc<AtomicBool>,
     signals: WorkerSignals,
     interrupt: Option<Arc<dyn Fn() + Send + Sync>>,
     event_rx: Receiver<VoiceEvent>,
@@ -190,6 +199,7 @@ pub struct RealtimePipelineHandle {
     ctl_tx: Sender<Control>,
     cancel: Arc<AtomicBool>,
     epoch: Arc<AtomicU64>,
+    admission: Arc<AtomicBool>,
     interrupt: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
@@ -197,11 +207,23 @@ impl RealtimePipelineHandle {
     /// Hand the worker a new utterance. Returns `false` if the bounded queue is full or the
     /// worker has stopped.
     pub fn submit(&self, utt: Utterance) -> bool {
+        if self
+            .admission
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
         let epoch = self.epoch.load(Ordering::Acquire);
-        match self.utt_tx.try_send(QueuedUtterance { utt, epoch }) {
+        let sent = match self.utt_tx.try_send(QueuedUtterance {
+            input: TurnInput::Owned(utt),
+            epoch,
+        }) {
             Ok(()) => true,
             Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => false,
-        }
+        };
+        self.admission.store(false, Ordering::Release);
+        sent
     }
 
     /// Best-effort speculative prefill of a PROBABLE utterance (see
@@ -266,7 +288,7 @@ fn handle_control<E: VoiceEngine>(engine: &mut E, ctl: Control, epoch_worker: &A
 /// driven from a two-channel `select`.
 fn serve_utterance<E: VoiceEngine>(
     engine: &mut E,
-    utt: Utterance,
+    input: TurnInput,
     epoch: u64,
     current_epoch: &mut u64,
     epoch_worker: &AtomicU64,
@@ -341,7 +363,12 @@ fn serve_utterance<E: VoiceEngine>(
         let mut emit = |ev: VoiceEvent| {
             events.emit(ev);
         };
-        engine.respond(&utt, cancel_worker, &mut emit)
+        match input {
+            TurnInput::Owned(utt) => engine.respond(&utt, cancel_worker, &mut emit),
+            TurnInput::Capture(ticket) => {
+                engine.await_capture(ticket, cancel_worker, &mut emit)
+            }
+        }
     };
     let terminal = if events.blocked() {
         VoiceEvent::Error("voice event queue full or disconnected".into())
@@ -386,6 +413,8 @@ impl RealtimePipeline {
         // of silently growing latency. Speculative Prepare/Discard ride their own channel so
         // they can never occupy the utterance slot.
         let interrupt = engine.interrupt_signal();
+        let capture = engine.capture_dock();
+        let admission = Arc::new(AtomicBool::new(false));
         let (utt_tx, utt_rx) = bounded::<QueuedUtterance>(UTTERANCE_QUEUE_CAP);
         let (ctl_tx, ctl_rx) = bounded::<Control>(CONTROL_QUEUE_CAP);
         let (shutdown_tx, shutdown_rx) = bounded::<()>(0);
@@ -461,9 +490,9 @@ impl RealtimePipeline {
                                 }
                             },
                             recv(utt_rx) -> msg => match msg {
-                                Ok(QueuedUtterance { utt, epoch }) => serve_utterance(
+                                Ok(QueuedUtterance { input, epoch }) => serve_utterance(
                                     &mut engine,
-                                    utt,
+                                    input,
                                     epoch,
                                     &mut current_epoch,
                                     &epoch_worker,
@@ -477,9 +506,9 @@ impl RealtimePipeline {
                         crossbeam_channel::select! {
                             recv(shutdown_rx) -> _ => return,
                             recv(utt_rx) -> msg => match msg {
-                                Ok(QueuedUtterance { utt, epoch }) => serve_utterance(
+                                Ok(QueuedUtterance { input, epoch }) => serve_utterance(
                                     &mut engine,
-                                    utt,
+                                    input,
                                     epoch,
                                     &mut current_epoch,
                                     &epoch_worker,
@@ -500,6 +529,8 @@ impl RealtimePipeline {
         Ok(Self {
             utt_tx: Some(utt_tx),
             ctl_tx: Some(ctl_tx),
+            capture,
+            admission,
             signals,
             interrupt,
             event_rx,
@@ -513,11 +544,75 @@ impl RealtimePipeline {
         let Some(tx) = self.utt_tx.as_ref() else {
             return false;
         };
+        if self
+            .admission
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
         let epoch = self.signals.current_epoch();
-        match tx.try_send(QueuedUtterance { utt, epoch }) {
+        let sent = match tx.try_send(QueuedUtterance {
+            input: TurnInput::Owned(utt),
+            epoch,
+        }) {
             Ok(()) => true,
             Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => false,
+        };
+        self.admission.store(false, Ordering::Release);
+        sent
+    }
+
+    /// Publish a borrowed utterance directly into a native capture lease when
+    /// available. Compatibility engines retain the owned `Utterance` queue.
+    pub fn submit_pcm(&self, pcm: &[f32], rate: u32) -> Result<bool, String> {
+        let Some(capture) = self.capture.as_ref() else {
+            return Ok(self.submit(Utterance {
+                samples: pcm.to_vec(),
+                rate,
+            }));
+        };
+        let Some(tx) = self.utt_tx.as_ref() else {
+            return Ok(false);
+        };
+        if self
+            .admission
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Ok(false);
         }
+        if tx.is_full() {
+            self.admission.store(false, Ordering::Release);
+            return Ok(false);
+        }
+        let ticket = match capture.submit(pcm, rate) {
+            Ok(ticket) => ticket,
+            Err(error) => {
+                self.admission.store(false, Ordering::Release);
+                return Err(error);
+            }
+        };
+        let Some(ticket) = ticket else {
+            self.admission.store(false, Ordering::Release);
+            return Ok(false);
+        };
+        let epoch = self.signals.current_epoch();
+        let sent = tx
+            .try_send(QueuedUtterance {
+                input: TurnInput::Capture(ticket),
+                epoch,
+            })
+            .is_ok();
+        self.admission.store(false, Ordering::Release);
+        if !sent {
+            self.interrupt();
+        }
+        Ok(sent)
+    }
+
+    pub fn has_direct_capture(&self) -> bool {
+        self.capture.is_some()
     }
 
     /// Best-effort speculative prefill of a PROBABLE utterance (see
@@ -566,6 +661,7 @@ impl RealtimePipeline {
                 ctl_tx: ctl_tx.clone(),
                 cancel: self.signals.cancel(),
                 epoch: self.signals.epoch(),
+                admission: self.admission.clone(),
                 interrupt: self.interrupt.clone(),
             }),
             _ => None,
@@ -3926,6 +4022,7 @@ mod native_tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
     use std::sync::mpsc;
+    use std::sync::Mutex;
     use std::time::Duration;
 
     struct NativeParkedEngine {
@@ -3984,5 +4081,86 @@ mod native_tests {
             VoiceEvent::Interrupted
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    struct DirectDock {
+        input: Mutex<Vec<f32>>,
+    }
+
+    impl CaptureDock for DirectDock {
+        fn submit(&self, pcm: &[f32], rate: u32) -> Result<Option<CaptureTicket>, String> {
+            assert_eq!(rate, 48_000);
+            self.input.lock().unwrap().extend_from_slice(pcm);
+            Ok(Some(CaptureTicket {
+                runtime_epoch: 7,
+                sequence: pcm.len() as u64,
+                generation: 3,
+                kind: 1,
+            }))
+        }
+    }
+
+    struct DirectEngine {
+        dock: Arc<DirectDock>,
+        owned_calls: Arc<AtomicUsize>,
+    }
+
+    impl VoiceEngine for DirectEngine {
+        fn capture_dock(&self) -> Option<Arc<dyn CaptureDock>> {
+            Some(self.dock.clone())
+        }
+
+        fn await_capture(
+            &mut self,
+            ticket: CaptureTicket,
+            _cancel: &AtomicBool,
+            emit: &mut dyn FnMut(VoiceEvent),
+        ) -> Result<bool, String> {
+            assert_eq!(ticket.runtime_epoch, 7);
+            assert_eq!(ticket.sequence, 4);
+            emit(VoiceEvent::Text("direct".into()));
+            Ok(true)
+        }
+
+        fn respond(
+            &mut self,
+            _utterance: &Utterance,
+            _cancel: &AtomicBool,
+            _emit: &mut dyn FnMut(VoiceEvent),
+        ) -> Result<bool, String> {
+            self.owned_calls.fetch_add(1, Ordering::SeqCst);
+            Err("owned utterance path was used".into())
+        }
+    }
+
+    #[test]
+    fn direct_capture_queues_only_the_native_ticket() {
+        let dock = Arc::new(DirectDock {
+            input: Mutex::new(Vec::new()),
+        });
+        let owned_calls = Arc::new(AtomicUsize::new(0));
+        let pipeline = RealtimePipeline::spawn(DirectEngine {
+            dock: dock.clone(),
+            owned_calls: owned_calls.clone(),
+        })
+        .unwrap();
+        let pcm = [0.25, -0.5, 0.75, -1.0];
+        assert_eq!(pipeline.submit_pcm(&pcm, 48_000), Ok(true));
+        assert_eq!(
+            pipeline
+                .events()
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            VoiceEvent::Text("direct".into())
+        );
+        assert_eq!(
+            pipeline
+                .events()
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            VoiceEvent::TurnComplete
+        );
+        assert_eq!(*dock.input.lock().unwrap(), pcm);
+        assert_eq!(owned_calls.load(Ordering::SeqCst), 0);
     }
 }

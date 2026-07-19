@@ -66,7 +66,7 @@ boundary and may not fall back to Candle.
 
 ```mermaid
 flowchart LR
-    Host["Rust platform audio / control"] -->|"current adapter copies into capture lease"| Dock["native PCM + text dock"]
+    Host["Rust platform audio / control"] -->|"borrowed VAD slice → final capture lease"| Dock["native PCM + text dock"]
     Dock --> Session["native LfmSession<br/>tickets · epoch · recurrence"]
     Session --> Conv["native LfmConversation<br/>KV · conv · PRNG · rollover"]
     Conv --> Gate["fair expected-value model pass gate"]
@@ -242,13 +242,15 @@ epochs, and expected-value space/data doorbells. Reliable text and terminal reco
 park for capacity; telemetry alone may be lossy. A stale epoch may finish a pass but
 cannot publish its value.
 
-The remaining transport debt is capture-side. `NativeLfm2VoiceEngine` still
-copies an existing Rust `Utterance.samples` slice into a reserved native capture
-lease. Playback no longer materializes a `Vec`: its Rust sink consumes the
-resolved borrowed span synchronously, releases the lease, and sends only a
-ticket completion record. Direct callback-filled capture chunks require a
-separate VAD commit command; publishing a chunk cannot continue to imply
-"begin a turn."
+The remaining transport debt is capture-side. Production no longer creates an
+utterance `Vec` or sends PCM through the inference-worker queue:
+`CaptureDock` copies the borrowed VAD slice once into its final retained native
+lease and queues only the opaque ticket. The mic callback still writes a Rust
+ring and VAD accumulation buffer before that admission. Playback materializes
+no `Vec`: its Rust sink consumes the resolved borrowed span synchronously,
+releases the lease, and sends only a ticket completion record. Direct
+callback-filled capture requires a separate VAD commit command; publishing a
+chunk cannot continue to imply "begin a turn."
 
 ### Thread model (AS-BUILT)
 
@@ -393,11 +395,12 @@ Do not compare them across executors or extrapolate a current latency.
    node becomes ready, so peers may queue without Rust progress. A
    coordinator-owned `SessionAction` collects text and audio terminal handles
    after a doorbell edge. Batched M≤4 prefill is already direct checkpoint BF16.
-5. **Physical kcoro audio-device adapter: capture half next.** Playback drains a
-   borrowed native lease through `PcmSink`; no PCM payload crosses the reply or
-   native event channels. Add callback-filled capture leases plus a VAD commit
-   command, then delete the remaining `Utterance.samples` copy while preserving
-   bounded reliable text and control projection.
+5. **Physical kcoro audio-device adapter: capture callback half next.** Playback
+   drains a borrowed native lease through `PcmSink`; capture queues only a ticket
+   after `CaptureDock` fills the final lease from a borrowed VAD slice. Add a
+   callback-writable reservation plus a VAD commit command, then delete the
+   mic-ring/VAD accumulation copy while preserving bounded reliable text and
+   control projection.
 6. **Native Moshi: subsequent independent tranche.** Port Moshi onto the same
    image/session discipline before making it selectable in production. The LFM2
    cutover neither implements Moshi nor permits a Candle fallback.

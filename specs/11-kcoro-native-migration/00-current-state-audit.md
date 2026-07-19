@@ -231,20 +231,35 @@ be described as native, closed, or production-tested until a gated commit lands.
   under active edit (`ROUTE_CAPACITY` moved 8 → 64 after `8a856160`). Text and
   audio terminal routes now return pooled handles and notify the coordinator's
   expected-value doorbell; exact-generation collection happens there without a
-  numerical wait. Because the
+  numerical wait. Starvation promotion is a separate 64-enqueue-epoch policy;
+  it no longer changes implicitly with pool capacity, and a route newer than a
+  broker snapshot has age zero rather than wrapping to maximum age. Because the
   file is mid-rewrite, the Scheduler and Backbone fast-path row citations into
   `flashkern_engine.cpp` remain pinned to the audited baseline revision and are
   stale by line position; they are re-pinned when the V2 work reaches a gated
   commit, not before. Design intent lives in
   `specs/11-kcoro-native-migration/16-flashkern-v2-coroutine-grid.md`.
-- **Callback-only progress holds at the route/engine layer, not yet the session
-  layer.** The broker and its exact-CQ callbacks advance without spin, submit,
-  allocation, or mutex. Above them, the C++ session coordinator still parks once
-  for the route's terminal result (`run_action`); converting it to a
-  session-owned asynchronous state machine is the open item **F1** in
-  `crates/liquid-audio/docs/RUST_DELETION_PLAN.md`. Until F1 lands,
-  "callback-only progress" is a true statement about the route layer and not yet
-  about command/control above it.
+- **Session terminal collection is asynchronous in the working tree.** The
+  coordinator owns a pooled `SessionAction`, submits one route, and re-enters on
+  its internal doorbell; it does not wait for the numerical terminal or playback
+  capacity. Playback-lease release rings that same work doorbell, closing the
+  ordinary playback-saturation wake edge. This remains an ungated working-tree
+  claim until the session suite and saturation regression are attached to a
+  commit.
+- **Direct production PCM transport is mounted, with one capture copy still
+  open.** Native playback stays in its retained lease through the installed
+  borrowed `PcmSink`; the external platform writer consumes it synchronously and
+  no `VoiceEvent::Audio` or Rust PCM vector is created. On capture, VAD submits a
+  borrowed utterance slice to `CaptureDock`; it is copied once into its final
+  native lease and only the opaque ticket crosses the worker queue. The Rust mic
+  ring and VAD accumulation buffer still precede that lease, so the stricter
+  callback-writes-native-reservation invariant is not yet closed.
+- **V2.2 gang completion is implemented, not block concurrency.** Eight-lane
+  engines create two soft four-lane completion domains with private SPSC CQs.
+  Reverse-order exact-generation drain and a gang lease gate the single bridge
+  publication. Both domains still share the current eight-lane stage board,
+  global fence, and numerical program; private boards and simultaneous `BLOCK4`
+  execution remain V2.3/V2.4 work.
 
 ## Claims That Are Not Yet Allowed
 

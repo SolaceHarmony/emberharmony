@@ -14,7 +14,7 @@ use std::thread::JoinHandle;
 use crossbeam_channel::{bounded, Receiver, Sender};
 
 use crate::ffi;
-use crate::voice_api::{PcmSink, Utterance, VoiceEngine, VoiceEvent};
+use crate::voice_api::{CaptureDock, CaptureTicket, PcmSink, Utterance, VoiceEngine, VoiceEvent};
 
 const RUNTIME_ABI: u32 = 1;
 const STATUS_BUSY: i32 = -16;
@@ -50,14 +50,7 @@ struct Session {
     _private: [u8; 0],
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct Ticket {
-    runtime_epoch: u64,
-    sequence: u64,
-    generation: u32,
-    kind: u32,
-}
+type Ticket = CaptureTicket;
 
 #[repr(C)]
 struct RuntimeConfig {
@@ -864,6 +857,83 @@ impl SessionControl {
     }
 }
 
+fn fill_capture(
+    session: NonNull<Session>,
+    samples: &[f32],
+    rate: u32,
+) -> Result<Option<PcmLease>, String> {
+    if samples.is_empty() || rate == 0 {
+        return Err("native voice utterance must contain PCM at a nonzero rate".into());
+    }
+    if rate != 48_000 {
+        return Err(format!(
+            "native voice session was prepared for 48000 Hz capture, received {rate} Hz"
+        ));
+    }
+    let frames = u32::try_from(samples.len())
+        .map_err(|_| "native voice utterance is too large".to_string())?;
+    if frames > MAX_CAPTURE_FRAMES {
+        return Err(format!(
+            "native voice utterance exceeds the {MAX_CAPTURE_FRAMES}-frame lease bound"
+        ));
+    }
+    let mut lease = PcmLease::default();
+    let reserve = unsafe {
+        lfm_audio_dock_wait_reserve(session.as_ptr(), PCM_CAPTURE, frames, rate, &mut lease)
+    };
+    if reserve == STATUS_STALE || reserve == STATUS_CANCELLED {
+        return Ok(None);
+    }
+    status(reserve, "reserve native capture lease")?;
+    if lease.format != PCM_F32 || lease.channels != 1 {
+        let _ = unsafe { lfm_audio_dock_release(session.as_ptr(), &lease) };
+        return Err("native capture lease returned an unsupported PCM format".into());
+    }
+    let mut target = std::ptr::null_mut();
+    let mut capacity = 0usize;
+    let resolve =
+        unsafe { lfm_audio_dock_resolve_mut(session.as_ptr(), &lease, &mut target, &mut capacity) };
+    if resolve != 0 || target.is_null() || capacity < samples.len() {
+        let _ = unsafe { lfm_audio_dock_release(session.as_ptr(), &lease) };
+        return Err(format!(
+            "resolve native capture lease failed with status {resolve}"
+        ));
+    }
+    unsafe { std::ptr::copy_nonoverlapping(samples.as_ptr(), target, samples.len()) };
+    Ok(Some(lease))
+}
+
+struct NativeCaptureDock {
+    control: Arc<SessionControl>,
+}
+
+impl CaptureDock for NativeCaptureDock {
+    fn submit(&self, pcm: &[f32], rate: u32) -> Result<Option<CaptureTicket>, String> {
+        let session = self
+            .control
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(session) = *session else {
+            return Ok(None);
+        };
+        let Some(lease) = fill_capture(session, pcm, rate)? else {
+            return Ok(None);
+        };
+        let publish = unsafe { lfm_audio_dock_publish(session.as_ptr(), &lease) };
+        if publish != 0 {
+            let _ = unsafe { lfm_audio_dock_release(session.as_ptr(), &lease) };
+            if publish == STATUS_STALE || publish == STATUS_CANCELLED {
+                return Ok(None);
+            }
+            return Err(format!(
+                "publish native capture lease failed with status {publish}"
+            ));
+        }
+        Ok(Some(lease.ticket))
+    }
+}
+
 /// Turn-based `VoiceEngine` backed entirely by the native LFM2 session.
 pub struct NativeLfm2VoiceEngine {
     _model: NativeVoiceModel,
@@ -967,64 +1037,7 @@ impl NativeLfm2VoiceEngine {
     }
 
     fn capture(&self, utterance: &Utterance) -> Result<Option<PcmLease>, String> {
-        if utterance.samples.is_empty() || utterance.rate == 0 {
-            return Err("native voice utterance must contain PCM at a nonzero rate".into());
-        }
-        if utterance.rate != 48_000 {
-            return Err(format!(
-                "native voice session was prepared for 48000 Hz capture, received {} Hz",
-                utterance.rate
-            ));
-        }
-        let frames = u32::try_from(utterance.samples.len())
-            .map_err(|_| "native voice utterance is too large".to_string())?;
-        if frames > MAX_CAPTURE_FRAMES {
-            return Err(format!(
-                "native voice utterance exceeds the {}-frame lease bound",
-                MAX_CAPTURE_FRAMES
-            ));
-        }
-        let mut lease = PcmLease::default();
-        let reserve = unsafe {
-            lfm_audio_dock_wait_reserve(
-                self.session.as_ptr(),
-                PCM_CAPTURE,
-                frames,
-                utterance.rate,
-                &mut lease,
-            )
-        };
-        if reserve == STATUS_STALE || reserve == STATUS_CANCELLED {
-            return Ok(None);
-        }
-        status(reserve, "reserve native capture lease")?;
-        if lease.format != PCM_F32 || lease.channels != 1 {
-            let _ = unsafe { lfm_audio_dock_release(self.session.as_ptr(), &lease) };
-            return Err("native capture lease returned an unsupported PCM format".into());
-        }
-        let mut samples = std::ptr::null_mut();
-        let mut capacity = 0usize;
-        let resolve = unsafe {
-            lfm_audio_dock_resolve_mut(self.session.as_ptr(), &lease, &mut samples, &mut capacity)
-        };
-        if resolve != 0 || samples.is_null() || capacity < utterance.samples.len() {
-            let _ = unsafe { lfm_audio_dock_release(self.session.as_ptr(), &lease) };
-            return Err(format!(
-                "resolve native capture lease failed with status {resolve}"
-            ));
-        }
-        // This is the sole transitional capture copy: the physical audio owner
-        // still supplies a Rust Vec. A native device dock will write this
-        // reservation directly; every session/model stage after this point
-        // retains the slot.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                utterance.samples.as_ptr(),
-                samples,
-                utterance.samples.len(),
-            );
-        }
-        Ok(Some(lease))
+        fill_capture(self.session, &utterance.samples, utterance.rate)
     }
 
     /// Submit one UTF-8 user turn through the bounded native control ring and
@@ -1305,6 +1318,21 @@ fn spawn_playback(
 impl VoiceEngine for NativeLfm2VoiceEngine {
     fn install_pcm_sink(&mut self, sink: Arc<dyn PcmSink>) -> bool {
         self.pcm.set(sink).is_ok()
+    }
+
+    fn capture_dock(&self) -> Option<Arc<dyn CaptureDock>> {
+        Some(Arc::new(NativeCaptureDock {
+            control: self.control.clone(),
+        }))
+    }
+
+    fn await_capture(
+        &mut self,
+        ticket: CaptureTicket,
+        cancel: &AtomicBool,
+        emit: &mut dyn FnMut(VoiceEvent),
+    ) -> Result<bool, String> {
+        self.await_ticket(ticket, cancel, emit)
     }
 
     fn respond(

@@ -82,7 +82,9 @@ pub use trainer::{Trainer, TrainerConfig};
 pub use utils::{get_model_dir, LFMModality};
 #[cfg(feature = "download")]
 pub use utils::{snapshot_download_to, snapshot_download_with, DownloadProgress};
-pub use voice_api::{FrameConfig, PcmSink, Utterance, VoiceEngine, VoiceEvent};
+pub use voice_api::{
+    CaptureDock, CaptureTicket, FrameConfig, PcmSink, Utterance, VoiceEngine, VoiceEvent,
+};
 pub use voice_runtime::{
     AudioStatsSnapshot, ExternalAudioInput, ExternalAudioInputWriter, ExternalAudioOutput,
     RuntimeConfig, RuntimeEvent, SessionState, VoiceRuntime,

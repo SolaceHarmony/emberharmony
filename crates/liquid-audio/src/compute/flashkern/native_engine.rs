@@ -652,6 +652,14 @@ extern "C" {
     #[cfg(test)]
     fn lfm_internal_engine_wait_word_layout_for_test(e: *mut c_void) -> i32;
     #[cfg(test)]
+    fn lfm_internal_engine_grid_snapshot_for_test(
+        e: *mut c_void,
+        blocks: *mut u32,
+        completions: *mut u64,
+        generations: *mut u64,
+        lease: *mut u64,
+    ) -> i32;
+    #[cfg(test)]
     fn lfm_internal_engine_audio_route_edge_for_test(
         node: u32,
         outcome: u32,
@@ -4216,12 +4224,46 @@ mod tests {
 
     #[test]
     fn engine_wait_words_occupy_distinct_128_byte_lines() {
-        let raw = unsafe { lfm_engine_new(2) };
+        let raw = unsafe { lfm_engine_new(8) };
         assert!(!raw.is_null());
         assert_eq!(
             unsafe { lfm_internal_engine_wait_word_layout_for_test(raw) },
             0
         );
+        unsafe { lfm_engine_free(raw) };
+    }
+
+    #[test]
+    fn eight_lane_gang_requires_both_block_completions() {
+        let raw = unsafe { lfm_engine_new(8) };
+        assert!(!raw.is_null());
+        let mut state = PrngState::from_seed(19).expect("seed");
+        let mut value = 0u64;
+        assert_eq!(
+            unsafe { lfm_engine_prng_fill(raw, &mut state, &mut value, 1) },
+            0
+        );
+
+        let mut blocks = 0u32;
+        let mut completions = 0u64;
+        let mut generations = 0u64;
+        let mut lease = u64::MAX;
+        assert_eq!(
+            unsafe {
+                lfm_internal_engine_grid_snapshot_for_test(
+                    raw,
+                    &mut blocks,
+                    &mut completions,
+                    &mut generations,
+                    &mut lease,
+                )
+            },
+            0
+        );
+        assert_eq!(blocks, 2);
+        assert_eq!(completions, 2);
+        assert_eq!(generations, 1);
+        assert_eq!(lease, 0, "publication must retire the exact gang lease");
         unsafe { lfm_engine_free(raw) };
     }
 
