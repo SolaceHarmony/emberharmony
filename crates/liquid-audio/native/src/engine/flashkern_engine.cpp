@@ -84,6 +84,7 @@ namespace {
 
 constexpr int MAX_WORKERS = 16;
 constexpr size_t PASS_CAPACITY = 2;
+constexpr size_t ROUTE_CAPACITY = 8;
 // Apple Silicon and every Apple-hosted slice (including Rosetta) run on
 // 128-byte cache lines.  Keeping this conservative size on other targets is
 // harmless and prevents adjacent expected-value words from sharing a line.
@@ -396,9 +397,23 @@ struct DepthScratch {
     std::array<float, MAX_WORKERS> partials{};
 };
 
+enum class SequenceMixerKind : uint8_t {
+    ShortConv = 0,
+    Attention = 1,
+    MonarchLongConv = 2,
+};
+
+struct SequenceMixerDesc {
+    SequenceMixerKind kind = SequenceMixerKind::ShortConv;
+    uint32_t layer = 0;
+    uint32_t kernel = 0;
+    uint32_t halo = 0;
+};
+
 struct BackbonePlan {
     uint64_t id = 0;
     std::vector<LfmLayerDesc> layers;
+    std::vector<SequenceMixerDesc> mixers;
     WeightBytes embed_w = nullptr;
     WeightBytes audio_embed_w = nullptr;
     WeightBytes emb_norm_w = nullptr;
@@ -575,6 +590,7 @@ struct ScratchBank {
 };
 
 struct Engine;
+struct AudioRoutePool;
 struct alignas(ENGINE_CACHELINE) WaitWord {
     uint32_t value = 0;
     uint32_t reserved = 0;
@@ -726,6 +742,12 @@ struct LfmEngineSnapshotV1 {
     uint32_t pass_slots_live;
     uint32_t max_pass_slots_live;
     uint64_t continuation_submissions;
+    uint32_t route_capacity;
+    uint32_t routes_live;
+    uint32_t routes_ready;
+    uint32_t reserved0;
+    uint64_t route_dispatches;
+    uint64_t route_parks;
 };
 
 struct Engine {
@@ -737,20 +759,27 @@ struct Engine {
     // release-rings full passes; it never schedules or migrates numerical call stacks.
     pthread_t workers[MAX_WORKERS] = {};
     pthread_t bridge_worker{};
+    pthread_t route_worker{};
     WaitWord dispatch_word;
     WaitWord fence_word;
+    WaitWord route_word;
     LaneArg largs[MAX_WORKERS] = {};
     int n_workers = 0;
     int wait_words_prepared = 0;
     int workers_started = 0;
     int bridge_started = 0;
+    int route_started = 0;
+    int route_wait_prepared = 0;
+    int route_done_waits_prepared = 0;
     int slot_waits_prepared = 0;
     int audio_waits_prepared = 0;
     uint32_t lanes_total = 1;
     std::atomic<uint64_t> lane_gen{0};
     int cur_req = REQ_NONE;
     std::atomic<bool> retire{false};
+    std::atomic<bool> route_retire{false};
     LfmKernelBridge *bridge = nullptr;
+    AudioRoutePool *route_pool = nullptr;
     std::array<PassSlot, PASS_CAPACITY> slots;
     PassSlot *active_slot = nullptr;
     KcSubmissionV1 active_submission{};
@@ -777,6 +806,8 @@ struct Engine {
     std::atomic<uint32_t> pass_slots_live{0};
     std::atomic<uint32_t> max_pass_slots_live{0};
     std::atomic<uint64_t> continuation_submissions{0};
+    std::atomic<uint64_t> route_dispatches{0};
+    std::atomic<uint64_t> route_parks{0};
     std::atomic<uint64_t> audio_encode_passes{0};
     // Private deterministic stop-race handshake for the IRFFT conformance
     // request only. Ordinary model passes never load or mutate this field.
@@ -1009,6 +1040,7 @@ static bool release_pass_slot(PassSlot *slot, uint64_t generation) {
      * decrements lets a recycler increment live 2 -> 3 on a two-slot engine. */
     slot->lease.store(pass_slot_lease(0, PASS_SLOT_FREE),
                       std::memory_order_release);
+    if (e->route_word.wait) signal_all(&e->route_word);
     if (e->test_live_target.load(std::memory_order_relaxed) != 0)
         signal_all(&e->dispatch_word);
     return true;
@@ -1191,108 +1223,6 @@ class PlanClaim {
   private:
     Engine *engine_ = nullptr;
     bool held_ = false;
-};
-
-/* The three-node audio route is the sole SQ producer from first admission to
- * exact-slot retirement. Acquisition happens on the caller while holding the
- * ordinary producer mutex; callbacks subsequently need neither that mutex nor
- * the descriptor mutex. */
-class AudioRouteClaim {
-  public:
-    explicit AudioRouteClaim(Engine *engine) : engine_(engine) {
-        if (!engine_) return;
-        std::lock_guard<std::mutex> submit(engine_->submission_mutex);
-        bool idle = false;
-        if (!engine_->pass_claimed.compare_exchange_strong(
-                idle, true, std::memory_order_acq_rel,
-                std::memory_order_acquire)) {
-            return;
-        }
-        if (engine_->pass_slots_live.load(std::memory_order_acquire) != 0) {
-            engine_->pass_claimed.store(false, std::memory_order_release);
-            return;
-        }
-        uint32_t admission = 0;
-        if (!engine_->pass_admission.compare_exchange_strong(
-                admission, PASS_ADMISSION_EXCLUSIVE,
-                std::memory_order_acq_rel, std::memory_order_acquire)) {
-            engine_->pass_claimed.store(false, std::memory_order_release);
-            return;
-        }
-        slot_ = reserve_pass_slot(engine_, true);
-        if (!slot_) {
-            const uint32_t previous = engine_->pass_admission.exchange(
-                0, std::memory_order_release);
-            if (previous != PASS_ADMISSION_EXCLUSIVE) std::abort();
-            engine_->pass_claimed.store(false, std::memory_order_release);
-            return;
-        }
-        generation_ = slot_generation(slot_);
-        held_ = true;
-    }
-
-    ~AudioRouteClaim() {
-        if (!held_) return;
-        if (slot_ && !release_pass_slot(slot_, generation_)) std::abort();
-        for (const KcDescriptorIdV1 descriptor : descriptors_) {
-            if (descriptor.generation != 0 &&
-                lfm_kernel_bridge_descriptor_release(engine_->bridge,
-                                                     descriptor) != 0) {
-                std::abort();
-            }
-        }
-        if (producer_ &&
-            lfm_kernel_bridge_producer_release(engine_->bridge) != 0) {
-            std::abort();
-        }
-        const uint32_t previous = engine_->pass_admission.exchange(
-            0, std::memory_order_release);
-        if (previous != PASS_ADMISSION_EXCLUSIVE) std::abort();
-        engine_->pass_claimed.store(false, std::memory_order_release);
-    }
-
-    int prepare_descriptors() {
-        if (!held_ || producer_) return -ESTALE;
-        constexpr std::array<uint32_t, 3> kinds = {
-            REQ_TOKEN_PASS, REQ_DEPTH_FRAME, REQ_MIMI_DECODE};
-        for (size_t index = 0; index < kinds.size(); ++index) {
-            LfmKernelDescriptorSpecV1 spec = {
-                .size = sizeof(LfmKernelDescriptorSpecV1),
-                .abi_version = KC_COORD_ABI_VERSION,
-                .kind = kinds[index],
-                .flags = 0,
-                .payload = slot_,
-                .context = nullptr,
-                .release = nullptr,
-                .reserved = {0, 0, 0},
-            };
-            const int status = lfm_kernel_bridge_descriptor_create(
-                engine_->bridge, &spec, &descriptors_[index]);
-            if (status != 0) return status;
-        }
-        const int status =
-            lfm_kernel_bridge_producer_acquire(engine_->bridge);
-        if (status != 0) return status;
-        producer_ = true;
-        return 0;
-    }
-
-    explicit operator bool() const { return held_; }
-    PassSlot *slot() const { return slot_; }
-    uint64_t generation() const { return generation_; }
-    const std::array<KcDescriptorIdV1, 3> &descriptors() const {
-        return descriptors_;
-    }
-    AudioRouteClaim(const AudioRouteClaim &) = delete;
-    AudioRouteClaim &operator=(const AudioRouteClaim &) = delete;
-
-  private:
-    Engine *engine_ = nullptr;
-    PassSlot *slot_ = nullptr;
-    uint64_t generation_ = 0;
-    std::array<KcDescriptorIdV1, 3> descriptors_{};
-    bool held_ = false;
-    bool producer_ = false;
 };
 
 // ---- tile bodies (identical math to decode.rs) ----------------------------------------
@@ -3647,6 +3577,19 @@ enum : uint32_t {
 enum : uint32_t {
     AUDIO_ROUTE_TERMINAL = AUDIO_ROUTE_NODE_COUNT,
 };
+enum : uint32_t {
+    AUDIO_TOKEN_CODEC = 0,
+    AUDIO_TOKEN_END = 1,
+    AUDIO_TOKEN_INVALID = 2,
+};
+enum : uint32_t {
+    AUDIO_ROUTE_FREE = 0,
+    AUDIO_ROUTE_CLAIMED = 1,
+    AUDIO_ROUTE_READY = 2,
+    AUDIO_ROUTE_DISPATCHING = 3,
+    AUDIO_ROUTE_RUNNING = 4,
+    AUDIO_ROUTE_DONE = 5,
+};
 
 static constexpr std::array<std::array<uint8_t, AUDIO_ROUTE_OUTCOME_COUNT>,
                             AUDIO_ROUTE_NODE_COUNT>
@@ -3671,13 +3614,26 @@ static bool audio_route_next(uint32_t node, uint32_t outcome,
     return true;
 }
 
+static uint32_t audio_token_class(uint32_t token) {
+    if (token < LFM_MIMI_CODE_VALUES) return AUDIO_TOKEN_CODEC;
+    if (token == LFM_MIMI_CODE_VALUES) return AUDIO_TOKEN_END;
+    return AUDIO_TOKEN_INVALID;
+}
+
 struct AudioRouteInstance {
+    Engine *engine = nullptr;
+    WaitWord done;
+    std::atomic<uint32_t> state{AUDIO_ROUTE_FREE};
+    std::atomic<uint64_t> generation{0};
+    uint64_t enqueue_sequence = 0;
+    uint32_t service_class = KC_COORD_SERVICE_INTERACTIVE;
     uint32_t node = AUDIO_ROUTE_TOKEN;
     uint64_t depth_id = 0;
     DepthPlan *depth = nullptr;
     DepthReq depth_req{};
     BackbonePlan *model = nullptr;
     uint64_t model_id = 0;
+    TokenReq token_req{};
     MimiReq mimi_req{};
     const LfmRouteEpoch *epoch = nullptr;
     uint64_t expected_epoch = 0;
@@ -3685,8 +3641,13 @@ struct AudioRouteInstance {
     bool decode_mimi = false;
     LfmTokenCommitRecord commit{};
     uint32_t *token_completed = nullptr;
-    std::array<KcDescriptorIdV1, AUDIO_ROUTE_NODE_COUNT> descriptors{};
     int status = -EINPROGRESS;
+};
+
+struct AudioRoutePool {
+    Engine *engine = nullptr;
+    std::array<AudioRouteInstance, ROUTE_CAPACITY> routes;
+    std::atomic<uint64_t> sequence{0};
 };
 
 static int preflight_audio_route_commit(const LfmTokenCommitRecord *commit,
@@ -3727,12 +3688,15 @@ static void finish_audio_route(PassContinuationPermit *permit,
     if (!permit || permit->consumed || !permit->slot || !route) std::abort();
     route->status = status;
     if (route->result) route->result->status = status;
-    if (!transition_slot(permit->slot, permit->generation,
-                         PASS_SLOT_RESERVED, PASS_SLOT_COMPLETE)) {
+    if (!release_continuation(permit)) std::abort();
+    uint32_t running = AUDIO_ROUTE_RUNNING;
+    if (!route->state.compare_exchange_strong(
+            running, AUDIO_ROUTE_DONE, std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
         std::abort();
     }
-    permit->consumed = true;
-    signal_all(&permit->slot->completion_word);
+    signal_all(&route->done);
+    signal_all(&route->engine->route_word);
 }
 
 static void continue_audio_route(PassContinuationPermit *permit,
@@ -3756,15 +3720,21 @@ static void continue_audio_route(PassContinuationPermit *permit,
     } else if (completion.status == 0 && route->node == AUDIO_ROUTE_DEPTH &&
                route->decode_mimi) {
         route->result->depth_completed = 1;
-        if (route->result->codes[0] == LFM_MIMI_CODE_VALUES) {
+        const uint32_t first_class =
+            audio_token_class(route->result->codes[0]);
+        if (first_class == AUDIO_TOKEN_END) {
             route->result->eoaudio = 1;
             outcome = AUDIO_ROUTE_EOAUDIO;
+        } else if (first_class == AUDIO_TOKEN_INVALID) {
+            finish_audio_route(permit, route, -ERANGE);
+            return;
         } else if (route->epoch->load(std::memory_order_acquire) !=
                    route->expected_epoch) {
             outcome = AUDIO_ROUTE_STALE;
         } else {
             for (size_t index = 0; index < LFM_MIMI_CODEBOOKS; ++index) {
-                if (route->result->codes[index] >= LFM_MIMI_CODE_VALUES) {
+                if (audio_token_class(route->result->codes[index]) !=
+                    AUDIO_TOKEN_CODEC) {
                     finish_audio_route(permit, route, -ERANGE);
                     return;
                 }
@@ -3777,6 +3747,11 @@ static void continue_audio_route(PassContinuationPermit *permit,
             route->expected_epoch) {
             outcome = AUDIO_ROUTE_STALE;
         }
+    }
+    if (completion.status == 0 &&
+        route->engine->route_retire.load(std::memory_order_acquire)) {
+        finish_audio_route(permit, route, -ECANCELED);
+        return;
     }
     uint32_t target = AUDIO_ROUTE_TERMINAL;
     if (!audio_route_next(route->node, outcome, &target)) {
@@ -3804,50 +3779,267 @@ static void continue_audio_route(PassContinuationPermit *permit,
         finish_audio_route(permit, route, 0);
         return;
     }
-    int request = REQ_NONE;
-    uint64_t context_id = 0;
     if (route->node == AUDIO_ROUTE_TOKEN && target == AUDIO_ROUTE_DEPTH &&
         route->depth && route->depth_id != 0) {
-        permit->slot->depth = route->depth;
-        permit->slot->depth_req = route->depth_req;
         route->node = AUDIO_ROUTE_DEPTH;
-        request = REQ_DEPTH_FRAME;
-        context_id = route->depth_id;
     } else if (route->node == AUDIO_ROUTE_DEPTH && target == AUDIO_ROUTE_MIMI &&
                route->decode_mimi && route->model && route->model_id != 0) {
-        permit->slot->model = route->model;
-        permit->slot->mimi = route->mimi_req;
         route->node = AUDIO_ROUTE_MIMI;
-        request = REQ_MIMI_DECODE;
-        context_id = route->model_id;
     } else {
         finish_audio_route(permit, route, -EPROTO);
         return;
     }
-    const int status = submit_continuation(
-        permit, request, context_id, continue_audio_route, route,
-        &route->descriptors[target]);
-    if (status != 0) finish_audio_route(permit, route, status);
+    if (!release_continuation(permit)) std::abort();
+    route->enqueue_sequence =
+        route->engine->route_pool->sequence.fetch_add(
+            1, std::memory_order_acq_rel) + 1;
+    uint32_t running = AUDIO_ROUTE_RUNNING;
+    if (!route->state.compare_exchange_strong(
+            running, AUDIO_ROUTE_READY, std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+        std::abort();
+    }
+    signal_all(&route->engine->route_word);
 }
 
-static int wait_audio_route(PassSlot *slot, uint64_t generation,
-                            const AudioRouteInstance &route) {
-    if (!slot || generation == 0) return -EINVAL;
+static int wait_audio_route(AudioRouteInstance *route, uint64_t generation) {
+    if (!route || generation == 0) return -EINVAL;
     uint32_t observed =
-        kc_atomic_u32_load_acquire(&slot->completion_word.value);
-    while (slot->lease.load(std::memory_order_acquire) !=
-           pass_slot_lease(generation, PASS_SLOT_COMPLETE)) {
+        kc_atomic_u32_load_acquire(&route->done.value);
+    while (route->state.load(std::memory_order_acquire) != AUDIO_ROUTE_DONE) {
         const int status =
-            kc_port_wait_u32(slot->completion_word.wait, observed, 0);
+            kc_port_wait_u32(route->done.wait, observed, 0);
         observed =
-            kc_atomic_u32_load_acquire(&slot->completion_word.value);
+            kc_atomic_u32_load_acquire(&route->done.value);
         if (status != 0 &&
-            slot->lease.load(std::memory_order_acquire) !=
-                pass_slot_lease(generation, PASS_SLOT_COMPLETE)) {
+            route->state.load(std::memory_order_acquire) != AUDIO_ROUTE_DONE) {
             std::abort();
         }
     }
-    return route.status;
+    if (route->generation.load(std::memory_order_acquire) != generation) {
+        return -ESTALE;
+    }
+    return route->status;
+}
+
+static AudioRouteInstance *claim_audio_route(Engine *engine,
+                                             uint64_t *generation) {
+    if (!engine || !generation || !enter_pass_admission(engine)) return nullptr;
+    for (AudioRouteInstance &route : engine->route_pool->routes) {
+        uint32_t free = AUDIO_ROUTE_FREE;
+        if (!route.state.compare_exchange_strong(
+                free, AUDIO_ROUTE_CLAIMED, std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            continue;
+        }
+        uint64_t next = route.generation.fetch_add(
+                            1, std::memory_order_acq_rel) + 1;
+        if (next == 0) {
+            next = route.generation.fetch_add(
+                       1, std::memory_order_acq_rel) + 1;
+        }
+        *generation = next;
+        return &route;
+    }
+    leave_pass_admission(engine);
+    return nullptr;
+}
+
+static void release_audio_route(AudioRouteInstance *route,
+                                uint64_t generation) {
+    if (!route || !route->engine || generation == 0 ||
+        route->generation.load(std::memory_order_acquire) != generation) {
+        std::abort();
+    }
+    uint32_t done = AUDIO_ROUTE_DONE;
+    if (!route->state.compare_exchange_strong(
+            done, AUDIO_ROUTE_FREE, std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+        std::abort();
+    }
+    leave_pass_admission(route->engine);
+    signal_all(&route->engine->route_word);
+}
+
+class AudioRouteLease {
+  public:
+    explicit AudioRouteLease(Engine *engine) {
+        route_ = claim_audio_route(engine, &generation_);
+    }
+
+    ~AudioRouteLease() {
+        if (!route_) return;
+        uint32_t state = route_->state.load(std::memory_order_acquire);
+        if (state == AUDIO_ROUTE_CLAIMED) {
+            route_->status = -ECANCELED;
+            route_->state.store(AUDIO_ROUTE_DONE, std::memory_order_release);
+            state = AUDIO_ROUTE_DONE;
+        }
+        if (state != AUDIO_ROUTE_DONE) std::abort();
+        release_audio_route(route_, generation_);
+    }
+
+    explicit operator bool() const { return route_ != nullptr; }
+    AudioRouteInstance *route() const { return route_; }
+    uint64_t generation() const { return generation_; }
+    AudioRouteLease(const AudioRouteLease &) = delete;
+    AudioRouteLease &operator=(const AudioRouteLease &) = delete;
+
+  private:
+    AudioRouteInstance *route_ = nullptr;
+    uint64_t generation_ = 0;
+};
+
+static void settle_audio_route(AudioRouteInstance *route, uint32_t from,
+                               int status) {
+    route->status = status;
+    if (route->result) route->result->status = status;
+    if (!route->state.compare_exchange_strong(
+            from, AUDIO_ROUTE_DONE, std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+        std::abort();
+    }
+    signal_all(&route->done);
+    signal_all(&route->engine->route_word);
+}
+
+static AudioRouteInstance *select_audio_route(AudioRoutePool *pool) {
+    AudioRouteInstance *best = nullptr;
+    uint32_t best_class = UINT32_MAX;
+    uint64_t best_sequence = UINT64_MAX;
+    const uint64_t now = pool->sequence.load(std::memory_order_acquire);
+    for (AudioRouteInstance &route : pool->routes) {
+        if (route.state.load(std::memory_order_acquire) != AUDIO_ROUTE_READY)
+            continue;
+        const uint64_t age = now - route.enqueue_sequence;
+        const uint32_t service = age >= ROUTE_CAPACITY
+            ? KC_COORD_SERVICE_DEADLINE
+            : route.service_class;
+        if (!best || service < best_class ||
+            (service == best_class &&
+             route.enqueue_sequence < best_sequence)) {
+            best = &route;
+            best_class = service;
+            best_sequence = route.enqueue_sequence;
+        }
+    }
+    if (!best) return nullptr;
+    uint32_t ready = AUDIO_ROUTE_READY;
+    if (!best->state.compare_exchange_strong(
+            ready, AUDIO_ROUTE_DISPATCHING, std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+        return nullptr;
+    }
+    return best;
+}
+
+static int mount_audio_route(PassSlot *slot, AudioRouteInstance *route,
+                             int *request, uint64_t *context) {
+    if (!slot || !route || !request || !context) return -EINVAL;
+    if (route->node == AUDIO_ROUTE_TOKEN) {
+        slot->model = route->model;
+        slot->tok = route->token_req;
+        *request = REQ_TOKEN_PASS;
+        *context = route->model_id;
+        return 0;
+    }
+    if (route->node == AUDIO_ROUTE_DEPTH) {
+        slot->depth = route->depth;
+        slot->depth_req = route->depth_req;
+        *request = REQ_DEPTH_FRAME;
+        *context = route->depth_id;
+        return 0;
+    }
+    if (route->node == AUDIO_ROUTE_MIMI && route->decode_mimi) {
+        slot->model = route->model;
+        slot->mimi = route->mimi_req;
+        *request = REQ_MIMI_DECODE;
+        *context = route->model_id;
+        return 0;
+    }
+    return -EPROTO;
+}
+
+static void *audio_route_main(void *context) {
+    Engine *engine = static_cast<Engine *>(context);
+    AudioRoutePool *pool = engine->route_pool;
+    uint32_t observed =
+        kc_atomic_u32_load_acquire(&engine->route_word.value);
+    for (;;) {
+        if (engine->route_retire.load(std::memory_order_acquire)) {
+            for (AudioRouteInstance &route : pool->routes) {
+                uint32_t ready = AUDIO_ROUTE_READY;
+                if (route.state.compare_exchange_strong(
+                        ready, AUDIO_ROUTE_DONE, std::memory_order_acq_rel,
+                        std::memory_order_acquire)) {
+                    route.status = -ECANCELED;
+                    if (route.result) route.result->status = -ECANCELED;
+                    signal_all(&route.done);
+                }
+            }
+            return nullptr;
+        }
+
+        AudioRouteInstance *route = select_audio_route(pool);
+        if (!route) {
+            const int status = kc_port_wait_u32(
+                engine->route_word.wait, observed, 0);
+            observed = kc_atomic_u32_load_acquire(
+                &engine->route_word.value);
+            if (status != 0 &&
+                !engine->route_retire.load(std::memory_order_acquire)) {
+                std::abort();
+            }
+            continue;
+        }
+
+        PassSlot *slot = reserve_pass_slot(engine);
+        if (!slot) {
+            engine->route_parks.fetch_add(1, std::memory_order_relaxed);
+            uint32_t dispatching = AUDIO_ROUTE_DISPATCHING;
+            if (!route->state.compare_exchange_strong(
+                    dispatching, AUDIO_ROUTE_READY,
+                    std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+                std::abort();
+            }
+            const int status = kc_port_wait_u32(
+                engine->route_word.wait, observed, 0);
+            observed = kc_atomic_u32_load_acquire(
+                &engine->route_word.value);
+            if (status != 0 &&
+                !engine->route_retire.load(std::memory_order_acquire)) {
+                std::abort();
+            }
+            continue;
+        }
+
+        int request = REQ_NONE;
+        uint64_t request_context = 0;
+        int status = mount_audio_route(slot, route, &request,
+                                       &request_context);
+        if (status != 0) {
+            if (!release_pass_slot(slot, slot_generation(slot))) std::abort();
+            settle_audio_route(route, AUDIO_ROUTE_DISPATCHING, status);
+            continue;
+        }
+        uint32_t dispatching = AUDIO_ROUTE_DISPATCHING;
+        if (!route->state.compare_exchange_strong(
+                dispatching, AUDIO_ROUTE_RUNNING, std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            std::abort();
+        }
+        const uint64_t slot_owner = slot_generation(slot);
+        status = submit_slot(engine, slot, slot_owner, request,
+                             request_context, continue_audio_route, route);
+        if (status != 0) {
+            if (!release_pass_slot(slot, slot_owner)) std::abort();
+            settle_audio_route(route, AUDIO_ROUTE_RUNNING, status);
+        } else {
+            engine->route_dispatches.fetch_add(1,
+                                               std::memory_order_relaxed);
+        }
+    }
 }
 
 } // namespace
@@ -3868,6 +4060,22 @@ void *lfm_engine_new(int workers) {
         e->runtime_epoch = next_engine_epoch.fetch_add(1, std::memory_order_acq_rel);
     e->lanes_total = (uint32_t)workers;
     e->n_workers = workers;
+    e->route_pool = new (std::nothrow) AudioRoutePool();
+    if (!e->route_pool) {
+        lfm_engine_free(e);
+        return nullptr;
+    }
+    e->route_pool->engine = e;
+    for (AudioRouteInstance &route : e->route_pool->routes) {
+        route.engine = e;
+        if (!kc_atomic_u32_is_lock_free(&route.done.value) ||
+            kc_port_wait_u32_prepare(&route.done.value,
+                                     &route.done.wait) != 0) {
+            lfm_engine_free(e);
+            return nullptr;
+        }
+        e->route_done_waits_prepared++;
+    }
     for (size_t index = 0; index < e->slots.size(); ++index) {
         PassSlot &slot = e->slots[index];
         slot.engine = e;
@@ -3893,6 +4101,13 @@ void *lfm_engine_new(int workers) {
         return nullptr;
     }
     e->wait_words_prepared++;
+    if (!kc_atomic_u32_is_lock_free(&e->route_word.value) ||
+        kc_port_wait_u32_prepare(&e->route_word.value,
+                                 &e->route_word.wait) != 0) {
+        lfm_engine_free(e);
+        return nullptr;
+    }
+    e->route_wait_prepared = 1;
     if (!kc_atomic_u32_is_lock_free(&e->fence_word.value) ||
         kc_port_wait_u32_prepare(&e->fence_word.value, &e->fence_word.wait) != 0) {
         lfm_engine_free(e);
@@ -3915,6 +4130,11 @@ void *lfm_engine_new(int workers) {
         return nullptr;
     }
     e->bridge_started = 1;
+    if (pthread_create(&e->route_worker, nullptr, audio_route_main, e) != 0) {
+        lfm_engine_free(e);
+        return nullptr;
+    }
+    e->route_started = 1;
     for (int lane = 0; lane < workers; ++lane) {
         e->largs[lane].e = e;
         e->largs[lane].lane = (uint32_t)lane;
@@ -3930,6 +4150,8 @@ void *lfm_engine_new(int workers) {
 void lfm_engine_request_stop(void *ep) {
     Engine *e = (Engine *)ep;
     if (!e) return;
+    e->route_retire.store(true, std::memory_order_release);
+    if (e->route_wait_prepared) signal_all(&e->route_word);
     if (e->bridge) lfm_kernel_bridge_request_stop(e->bridge);
     const bool wake_test =
         e->test_lane_pause.exchange(0, std::memory_order_acq_rel) != 0 ||
@@ -4043,13 +4265,19 @@ int lfm_internal_engine_request_kind_valid_for_test(uint32_t kind) {
 int lfm_internal_engine_wait_word_layout_for_test(void *ep) {
     Engine *e = static_cast<Engine *>(ep);
     if (!e) return -EINVAL;
-    constexpr size_t WAIT_WORD_COUNT = 2 + PASS_CAPACITY * 2;
+    constexpr size_t WAIT_WORD_COUNT =
+        3 + PASS_CAPACITY * 2 + ROUTE_CAPACITY;
     std::array<const WaitWord *, WAIT_WORD_COUNT> words{};
     words[0] = &e->dispatch_word;
     words[1] = &e->fence_word;
+    words[2] = &e->route_word;
     for (size_t slot = 0; slot < PASS_CAPACITY; ++slot) {
-        words[2 + slot * 2] = &e->slots[slot].completion_word;
-        words[3 + slot * 2] = &e->slots[slot].audio_word;
+        words[3 + slot * 2] = &e->slots[slot].completion_word;
+        words[4 + slot * 2] = &e->slots[slot].audio_word;
+    }
+    for (size_t route = 0; route < ROUTE_CAPACITY; ++route) {
+        words[3 + PASS_CAPACITY * 2 + route] =
+            &e->route_pool->routes[route].done;
     }
     for (size_t left = 0; left < WAIT_WORD_COUNT; ++left) {
         const uintptr_t address = reinterpret_cast<uintptr_t>(words[left]);
@@ -4067,6 +4295,10 @@ int lfm_internal_engine_audio_route_edge_for_test(uint32_t node,
                                                   uint32_t outcome,
                                                   uint32_t *target) {
     return audio_route_next(node, outcome, target) ? 0 : -EINVAL;
+}
+
+int lfm_internal_engine_audio_token_class_for_test(uint32_t token) {
+    return (int)audio_token_class(token);
 }
 
 int lfm_internal_engine_fail_audio_route_depth_for_test(void *ep, int status) {
@@ -4199,6 +4431,13 @@ int lfm_engine_snapshot(void *ep, LfmEngineSnapshotV1 *out) {
         .abi_version = KC_COORD_ABI_VERSION,
     };
     if (lfm_kernel_bridge_snapshot(e->bridge, &bridge) != 0) return -EFAULT;
+    uint32_t routes_live = 0;
+    uint32_t routes_ready = 0;
+    for (const AudioRouteInstance &route : e->route_pool->routes) {
+        const uint32_t state = route.state.load(std::memory_order_acquire);
+        if (state != AUDIO_ROUTE_FREE) routes_live++;
+        if (state == AUDIO_ROUTE_READY) routes_ready++;
+    }
     *out = {
         .size = sizeof(*out),
         .abi_version = 1,
@@ -4230,6 +4469,13 @@ int lfm_engine_snapshot(void *ep, LfmEngineSnapshotV1 *out) {
             e->max_pass_slots_live.load(std::memory_order_acquire),
         .continuation_submissions =
             e->continuation_submissions.load(std::memory_order_relaxed),
+        .route_capacity = (uint32_t)ROUTE_CAPACITY,
+        .routes_live = routes_live,
+        .routes_ready = routes_ready,
+        .reserved0 = 0,
+        .route_dispatches =
+            e->route_dispatches.load(std::memory_order_relaxed),
+        .route_parks = e->route_parks.load(std::memory_order_relaxed),
     };
     return 0;
 }
@@ -4237,7 +4483,10 @@ int lfm_engine_snapshot(void *ep, LfmEngineSnapshotV1 *out) {
 void lfm_engine_free(void *ep) {
     Engine *e = (Engine *)ep;
     if (!e) return;
+    e->route_retire.store(true, std::memory_order_release);
+    if (e->route_wait_prepared) signal_all(&e->route_word);
     if (e->bridge) lfm_kernel_bridge_request_stop(e->bridge);
+    if (e->route_started > 0) pthread_join(e->route_worker, nullptr);
     if (e->bridge_started > 0) pthread_join(e->bridge_worker, nullptr);
     e->retire.store(true, std::memory_order_release);
     e->lane_gen.fetch_add(1, std::memory_order_release);
@@ -4246,6 +4495,12 @@ void lfm_engine_free(void *ep) {
         pthread_join(e->workers[lane], nullptr);
     }
     if (e->bridge && lfm_kernel_bridge_destroy(e->bridge) != 0) std::abort();
+    if (e->route_pool) {
+        for (int index = 0; index < e->route_done_waits_prepared; ++index) {
+            kc_port_wait_u32_release(
+                e->route_pool->routes[(size_t)index].done.wait);
+        }
+    }
     for (int index = 0; index < e->audio_waits_prepared; ++index) {
         kc_port_wait_u32_release(e->slots[(size_t)index].audio_word.wait);
     }
@@ -4253,7 +4508,9 @@ void lfm_engine_free(void *ep) {
         kc_port_wait_u32_release(e->slots[(size_t)index].completion_word.wait);
     }
     if (e->wait_words_prepared > 1) kc_port_wait_u32_release(e->fence_word.wait);
+    if (e->route_wait_prepared) kc_port_wait_u32_release(e->route_word.wait);
     if (e->wait_words_prepared > 0) kc_port_wait_u32_release(e->dispatch_word.wait);
+    delete e->route_pool;
     delete e;
 }
 
@@ -4860,9 +5117,9 @@ static int run_audio_route(
         return -ESTALE;
     }
 
-    AudioRouteClaim claim(e);
+    AudioRouteLease claim(e);
     if (!claim) return -EBUSY;
-    PassSlot *slot = claim.slot();
+    AudioRouteInstance *route = claim.route();
     BackbonePlan *model = find_model(e, model_id);
     DepthPlan *depth = nullptr;
     for (const std::unique_ptr<DepthPlan> &candidate : e->depth_plans) {
@@ -4921,11 +5178,15 @@ static int run_audio_route(
         }
     }
 
-    const int descriptor_status = claim.prepare_descriptors();
-    if (descriptor_status != 0) return descriptor_status;
-
-    slot->model = model;
-    slot->tok = {
+    route->engine = e;
+    route->service_class = decode_mimi ? KC_COORD_SERVICE_DEADLINE
+                                       : KC_COORD_SERVICE_INTERACTIVE;
+    route->node = AUDIO_ROUTE_TOKEN;
+    route->depth_id = depth_id;
+    route->depth = depth;
+    route->model = model;
+    route->model_id = model_id;
+    route->token_req = {
         .ids = ids,
         .n_ids = id_count,
         .embed_kind = embedding_kind,
@@ -4942,11 +5203,7 @@ static int run_audio_route(
         .out_token = nullptr,
         .lanes = lanes,
     };
-    AudioRouteInstance route = {
-        .node = AUDIO_ROUTE_TOKEN,
-        .depth_id = depth_id,
-        .depth = depth,
-        .depth_req = {
+    route->depth_req = {
             .hidden = out_hidden,
             .sampler = *audio_sampler,
             .sample_state = prng,
@@ -4954,10 +5211,8 @@ static int run_audio_route(
             .completion_status =
                 e->test_audio_route_depth_status.exchange(
                     0, std::memory_order_acq_rel),
-        },
-        .model = model,
-        .model_id = model_id,
-        .mimi_req = {
+        };
+    route->mimi_req = {
             .state = mimi,
             .codes = out_codes,
             .pcm = decode_mimi ? target->pcm : nullptr,
@@ -4967,23 +5222,24 @@ static int run_audio_route(
                 ? e->test_audio_route_mimi_status.exchange(
                       0, std::memory_order_acq_rel)
                 : 0,
-        },
-        .epoch = decode_mimi ? target->epoch : nullptr,
-        .expected_epoch = decode_mimi ? target->expected_epoch : 0,
-        .result = result,
-        .decode_mimi = decode_mimi,
-        .commit = bound_commit,
-        .token_completed = out_token_completed,
-        .descriptors = claim.descriptors(),
-        .status = -EINPROGRESS,
-    };
-    const uint64_t generation = claim.generation();
-    int status = submit_slot(e, slot, generation, REQ_TOKEN_PASS, model_id,
-                             continue_audio_route, &route,
-                             &route.descriptors[AUDIO_ROUTE_TOKEN]);
-    if (status != 0) return status;
-    status = wait_audio_route(slot, generation, route);
-    return status;
+        };
+    route->epoch = decode_mimi ? target->epoch : nullptr;
+    route->expected_epoch = decode_mimi ? target->expected_epoch : 0;
+    route->result = result;
+    route->decode_mimi = decode_mimi;
+    route->commit = bound_commit;
+    route->token_completed = out_token_completed;
+    route->status = -EINPROGRESS;
+    route->enqueue_sequence =
+        e->route_pool->sequence.fetch_add(1, std::memory_order_acq_rel) + 1;
+    uint32_t claimed = AUDIO_ROUTE_CLAIMED;
+    if (!route->state.compare_exchange_strong(
+            claimed, AUDIO_ROUTE_READY, std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+        return -ESTALE;
+    }
+    signal_all(&e->route_word);
+    return wait_audio_route(route, claim.generation());
 }
 
 int lfm_engine_audio_recurrence(
@@ -5085,6 +5341,10 @@ int lfm_ctx_build(void *ep, const LfmLayerDesc *descs, size_t n_layers, size_t h
     size_t kmax = 1;
     size_t qkv_max = 0, y_max = 0, att_max = 0;
     for (size_t l = 0; l < n_layers; ++l) {
+        if (descs[l].kind ==
+            static_cast<uint32_t>(SequenceMixerKind::MonarchLongConv)) {
+            return -ENOTSUP;
+        }
         if (descs[l].kind != 0 && descs[l].kind != 1) return -EINVAL;
         if (descs[l].kind == 0) {
             if (!descs[l].op_norm_w || !descs[l].ffn_norm_w || !descs[l].in_w ||
@@ -5120,6 +5380,17 @@ int lfm_ctx_build(void *ep, const LfmLayerDesc *descs, size_t n_layers, size_t h
     if (!next) return -ENOMEM;
     try {
         next->layers.assign(descs, descs + n_layers);
+        next->mixers.reserve(n_layers);
+        for (size_t layer = 0; layer < n_layers; ++layer) {
+            const bool shortconv = descs[layer].kind == 0;
+            next->mixers.push_back({
+                .kind = shortconv ? SequenceMixerKind::ShortConv
+                                  : SequenceMixerKind::Attention,
+                .layer = (uint32_t)layer,
+                .kernel = shortconv ? (uint32_t)descs[layer].k : 0u,
+                .halo = shortconv ? (uint32_t)(descs[layer].k - 1) : 0u,
+            });
+        }
         const auto grow = [](auto &values, size_t count) {
             if (values.size() < count) values.resize(count);
         };

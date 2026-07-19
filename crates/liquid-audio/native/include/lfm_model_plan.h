@@ -62,6 +62,9 @@ int lfm_context_window_commit(LfmContextWindowState *window);
 /* Private native plan ABI shared by the model binder and fixed executor.
  * Rust never constructs either structure in production. */
 typedef struct LfmLayerDesc {
+    /* 0 ShortConv, 1 attention. 2 is the reserved MonarchLongConv selector
+     * and must fail with ENOTSUP until a checkpoint-trained implementation is
+     * mounted; no runtime token may manufacture another selector. */
     uint32_t kind;
     uint32_t k;
     float op_eps;
@@ -125,8 +128,9 @@ int lfm_engine_token_pass(void *engine, uint64_t id,
 
 /* Private eager two-node route used by interleaved audio generation. It runs
  * TOKEN_PASS without sampling, commits the exact predeclared context record,
- * then tail-submits DEPTH_FRAME from the token CQ on the same retained slot.
- * The outward call blocks only on the terminal slot completion. */
+ * then returns DEPTH_FRAME to the fixed native broker. Each coarse node releases
+ * its compute slot; the outward compatibility call waits only for the pooled
+ * route's terminal completion. */
 int lfm_engine_audio_recurrence(
     void *engine, uint64_t model_id, uint64_t depth_id,
     const uint32_t *ids, size_t id_count, uint32_t embedding_kind,

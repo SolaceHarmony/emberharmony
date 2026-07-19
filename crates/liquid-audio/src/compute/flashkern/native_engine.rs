@@ -209,6 +209,12 @@ struct EngineSnapshot {
     pass_slots_live: u32,
     max_pass_slots_live: u32,
     continuation_submissions: u64,
+    route_capacity: u32,
+    routes_live: u32,
+    routes_ready: u32,
+    reserved0: u32,
+    route_dispatches: u64,
+    route_parks: u64,
 }
 
 #[cfg(test)]
@@ -613,6 +619,8 @@ extern "C" {
         outcome: u32,
         target: *mut u32,
     ) -> i32;
+    #[cfg(test)]
+    fn lfm_internal_engine_audio_token_class_for_test(token: u32) -> i32;
     #[cfg(test)]
     fn lfm_internal_engine_fail_audio_route_depth_for_test(e: *mut c_void, status: i32) -> i32;
     #[cfg(test)]
@@ -2533,18 +2541,24 @@ mod tests {
         );
         assert_eq!(route_after.max_pass_slots_live, 1);
         assert_eq!(route_after.pass_slots_live, 0);
+        assert_eq!(route_after.route_capacity, 8);
+        assert_eq!((route_after.routes_live, route_after.routes_ready), (0, 0));
+        assert_eq!(
+            route_after.route_dispatches - route_before.route_dispatches,
+            2
+        );
         assert_eq!(route_after.descriptors_live, 0);
         assert_eq!(
             route_after.descriptor_acquires - route_before.descriptor_acquires,
-            3
+            2
         );
         assert_eq!(
             route_after.descriptor_retains - route_before.descriptor_retains,
-            0
+            2
         );
         assert_eq!(
             route_after.descriptor_releases - route_before.descriptor_releases,
-            3
+            4
         );
 
         let mut failed_carry = initial_carry;
@@ -2711,6 +2725,11 @@ mod tests {
             3
         );
         assert_eq!(mimi_after.pass_slots_live, 0);
+        assert_eq!((mimi_after.routes_live, mimi_after.routes_ready), (0, 0));
+        assert_eq!(
+            mimi_after.route_dispatches - mimi_before.route_dispatches,
+            3
+        );
         assert_eq!(mimi_after.descriptors_live, 0);
         assert_eq!(
             mimi_after.descriptor_acquires - mimi_before.descriptor_acquires,
@@ -2718,11 +2737,11 @@ mod tests {
         );
         assert_eq!(
             mimi_after.descriptor_retains - mimi_before.descriptor_retains,
-            0
+            3
         );
         assert_eq!(
             mimi_after.descriptor_releases - mimi_before.descriptor_releases,
-            3
+            6
         );
 
         split.depth_clear(split_depth);
@@ -3972,6 +3991,38 @@ mod tests {
             -libc::EINVAL
         );
         assert_eq!(target, 0xfeed_beef);
+        assert_eq!(unsafe { lfm_internal_engine_audio_token_class_for_test(0) }, 0);
+        assert_eq!(
+            unsafe { lfm_internal_engine_audio_token_class_for_test(2047) },
+            0
+        );
+        assert_eq!(
+            unsafe { lfm_internal_engine_audio_token_class_for_test(2048) },
+            1
+        );
+        assert_eq!(
+            unsafe { lfm_internal_engine_audio_token_class_for_test(2049) },
+            2
+        );
+        assert_eq!(
+            unsafe { lfm_internal_engine_audio_token_class_for_test(u32::MAX) },
+            2
+        );
+    }
+
+    #[test]
+    fn monarch_longconv_selector_is_explicitly_unsupported() {
+        let raw = unsafe { lfm_engine_new(2) };
+        assert!(!raw.is_null());
+        let mut descriptor = LayerDesc::attn_placeholder();
+        descriptor.kind = 2;
+        let mut id = 0u64;
+        assert_eq!(
+            unsafe { lfm_ctx_build(raw, &descriptor, 1, 4, 4, 8, &mut id) },
+            -libc::ENOTSUP
+        );
+        assert_eq!(id, 0);
+        unsafe { lfm_engine_free(raw) };
     }
 
     #[test]

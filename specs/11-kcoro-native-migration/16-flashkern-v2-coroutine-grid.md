@@ -1,13 +1,14 @@
 # 16 — Flashkern V2: The Eager Coroutine Grid
 
-Status: **design proposal.** V1 is one working fixed-team numerical execution
-domain. V2 extracts two independent logical four-lane blocks that can gang back
-into the existing eight-lane team, then drives them with design 14's compact
-forwarding table. It is an eager message-routed compute fabric, not a lazy tensor
-system, DAG VM, or promise of macOS hardware placement.
+Status: **V2.0–V2.1 landed; V2.2–V2.6 remain a design proposal.** V1 is one
+working fixed-team numerical execution domain. V2 extracts two independent
+logical four-lane blocks that can gang back into the existing eight-lane team,
+then drives them with design 14's compact forwarding table. It is an eager
+message-routed compute fabric, not a lazy tensor system, DAG VM, or promise of
+macOS hardware placement.
 
-**V2.0 safety subset — landed in the working tree.** Hot kcoro/engine/bridge/
-session/model-gate words and internal SQ/CQ storage cells now have 128-byte Apple
+**Landed through V2.1 at `1f6d1c5d4339`.** Hot kcoro, engine, bridge, session,
+and model-gate words plus internal SQ/CQ storage cells now have 128-byte Apple
 base alignment and stride while ABI-v1 values retain 64-byte caller alignment;
 current request, layer, and modality selectors are closed; invalid
 worker/logical-lane geometry rejects; four physical workers reproduce the
@@ -16,11 +17,22 @@ eight-way logical fold; and the zero-spin gate is green. A bounded production
 with a total three-node/four-outcome table, reserve-before-admit playback, and a
 direct Mimi write into the retained PCM span. The coordinator still makes one
 outward expected-value terminal wait; its fixed conversation result and stack
-callback are not the future asynchronous route pool. A route-exclusive producer
-lease and three pre-created borrowed descriptors make that callback mutex-free;
-they also deliberately exclude peer admission until the broker exists. Two `BlockDomain`s, the
-broker and reverse-order per-block CQs, event-register waits, pooled asynchronous
-tickets, and concurrent numerical passes remain open.
+callback are not the future asynchronous route pool. At the cited commit a
+route-exclusive producer lease and three pre-created borrowed descriptors made
+that callback mutex-free while deliberately excluding peer admission; the
+working-tree broker follow-on below replaces that transitional ownership.
+
+**Broker follow-on landed in the working tree.** The route now comes from a
+fixed eight-instance pool. A native expected-value broker creates one ordinary
+descriptor per coarse program, applies FIFO sequence order with bounded age
+promotion, and reacquires capacity only when the node is runnable. The exact-CQ
+callback commits declared state, releases the pass slot, and marks the next node
+ready; it never submits, waits, allocates, or takes a submission/descriptor
+mutex. The session coordinator still waits once for terminal collection.
+
+**Open after the broker follow-on.** Session-facing asynchronous collection, two
+`BlockDomain`s and reverse-order per-block CQs, event-register waits, and
+concurrent numerical passes remain open.
 
 ## 0. Ground truth and its limits
 
@@ -41,8 +53,9 @@ These values justify testing a `2×4` software geometry and require 128-byte
 cache-line isolation on every Apple slice. They do **not** prove that macOS will
 place four workers on one physical cluster, that an allocation remains in one
 L2, or that one Apple matrix unit is reservable per block. Apple AMX is
-undocumented and Accelerate is an opaque backend. Correctness cannot depend on
-any of those hypotheses.
+undocumented and Accelerate is an opaque backend. The topology earns an
+experiment, not a placement promise. Correctness cannot depend on any of those
+hypotheses.
 
 ## 1. What V1 actually leaves open
 
@@ -61,7 +74,8 @@ observation may be reported separately but cannot define C++ object alignment.
 V1 has one active request, stage board, fence generation, mixer, and fixed lane
 team. Its capacity-two SQ provides queueing, exact-slot recurrence, and dispatch
 overlap; it does not execute two numerical passes concurrently. Running commit
-and Mimi “on two slots” therefore serializes today.
+and Mimi “on two slots” therefore serializes today. Two queue slots are not two
+execution domains.
 
 An eight-lane fence is also wider than the measured four-cores-per-L2 topology
 suggests may be ideal, but there is no proof that the eight workers currently
@@ -85,7 +99,7 @@ The GPU analogy is a software ownership model, not a hardware equivalence claim:
 Each `BlockDomain` owns its active command, stage board, fence and dispatch
 words, scratch mount, SQ, SPSC CQ, and exact doorbell. Before two-block execution
 is enabled, both private CQs and exact ticket lookup must exist. A shared
-multi-producer CQ is not an acceptable shortcut.
+multi-producer CQ would change the ownership contract, not simplify it.
 
 The broker uses this deterministic policy:
 
@@ -97,11 +111,11 @@ The broker uses this deterministic policy:
   each block.
 - Initially, two state-mutating programs from the same conversation never
   overlap. Later relaxation requires an explicit disjoint `AccessSet` and a
-  dedicated test; informal “probably disjoint” reasoning is insufficient.
+  dedicated test. “Probably disjoint” is not an access contract.
 - No numerical program performs a cross-block barrier. A real join settles
   through exact CQs and the route instance outside both collectives.
 
-The working-tree V2.0 gate already proves four physical workers can process eight
+The landed V2.0 gate already proves four physical workers can process eight
 fixed logical partitions with the same fold order on the current single board.
 Block extraction preserves and reruns that proof. Output parity, not worker
 count, decides whether a program may use `BLOCK4`.
@@ -118,10 +132,11 @@ A mounted numerical stage is one fixed collective identified by
    advances the generation with release semantics, and wakes parked peers;
 5. every peer rechecks the generation before continuing.
 
-A lane may not yield, retire, or switch to unrelated work while it owes a
-collective arrival. Coroutines sequence only reconverged stages; assembly owns a
-complete tile and never yields inside a kernel. Large parallel transforms remain
-their own cooperative stages—the “last arrival” does not serialize their math.
+Once mounted, each lane must arrive exactly once before it may yield, retire, or
+switch to unrelated work. Coroutines sequence only reconverged stages; assembly
+owns a complete tile and never yields inside a kernel. Large parallel transforms
+remain their own cooperative stages—the “last arrival” does not serialize their
+math.
 
 Dynamic audio-fragment quorum is a different primitive. Missing media parks the
 route instance before numerical admission; it never mounts half a team and waits
@@ -139,7 +154,9 @@ Model-open selects a trusted compiled template and publishes an immutable table
 of coarse programs. A route label indexes that closed table; every outcome maps
 to `NEXT`, `TERMINAL`, or `FAULT`. Runtime token values first pass through a
 vocabulary-validated token-class map and never become opcodes or function
-pointers. Invalid labels, modalities, tokens, and outcomes fault before indexing.
+pointers. Tokens remain data; arriving at runtime does not confer executable
+authority. Invalid labels, modalities, tokens, and outcomes fault before
+indexing.
 
 The table validates direct byte views, aliases, scratch bounds, access sets, and
 all route targets at construction. It does not compile an arbitrary DAG,
@@ -152,7 +169,8 @@ state commit, publication eligibility, cause, and terminal status separately.
 It is not TCP retransmission: stateful numerical work is never blindly replayed
 after dispatch. A state-authoritative accepted pass may commit after its
 publication epoch becomes stale, but stale work cannot publish or take another
-route edge.
+route edge. That accepted pass may finish its authoritative commit; it has lost
+the microphone.
 
 ## 5. Wait backends: correctness first
 
@@ -169,7 +187,8 @@ ships only if all of the following hold:
 
 This is an alternative park backend, never a bounded pre-park spin tier. A wait
 word's block ownership prevents accidental cross-domain use, but allocation from
-a block arena does not guarantee physical L2 placement.
+a block arena does not guarantee physical L2 placement. A wake is not progress;
+the rechecked predicate decides whether the wait is over.
 
 Candidate instructions remain capability- and measurement-selected:
 
@@ -233,7 +252,8 @@ halo eight. Tests and descriptors name the operator so those halos cannot be
 silently exchanged.
 
 The recovered `flash-fft-conv-mlx` material establishes useful implementation
-shape, but not the claims previously attached to it:
+shape, but not the claims previously attached to it. Recovered code gets credit
+for what it proves, no more:
 
 - “banded” tests mean rectangular Monarch factors (`L != N`), not independent
   frequency-band partitioning;
@@ -269,9 +289,11 @@ Each step is independently gated and leaves a correct fallback geometry:
    commits token context, writes Mimi PCM directly into pre-admitted playback,
    and releases compute before publication. Its pre-created borrowed descriptors
    and exclusive producer lease keep the callback mutex-free. The coordinator
-   still waits once, and the peer slot is intentionally excluded. Add token-class
-   maps, pooled asynchronous route/result/playback instances, and the broker
-   before removing that wait or adding concurrency.
+   originally waited once while an exclusive producer lease excluded the peer
+   slot. The working-tree follow-on replaces that lease with a fixed route pool
+   and fair expected-value broker; each node releases its compute slot before it
+   re-enters the ready set. Session-facing asynchronous terminal collection and
+   model-owned token-class maps remain before block concurrency.
 3. **V2.2 — extract block state.** Create two `BlockDomain`s, private SPSC CQs,
    and the gang lease. Run one active block/gang only; preserve the already-green
    eight-way logical-fold parity and prove exact reverse-order CQ routing.
@@ -296,8 +318,8 @@ Each step is independently gated and leaves a correct fallback geometry:
   last-arrival mixer runs once; an early return is a test failure.
 - Invalid runtime selectors terminal-fault before table indexing and release all
   retained resources exactly once.
-- Full hidden states, logits, sampled codes, KV/ShortConv state, and PCM match the
-  V1/oracle path; greedy-token equality alone is insufficient.
+- Greedy-token equality is evidence, not acceptance. Full hidden states,
+  logits, sampled codes, KV/ShortConv state, and PCM match the V1/oracle path.
 - No allocation occurs after readiness, no weight is materialized or repacked,
   and blocked instances retain no compute slot.
 - Interrupt at every program boundary preserves the declared state commit while

@@ -186,10 +186,10 @@ compatibility-copied weight bytes.
       stays NEON). Final verdict's P2s also closed: stage errors propagate
       through mimi_decoder_step (negative rc never reads as priming);
       upsample weight validated exact-shape + non-null.
-- [ ] engine integration (the remaining rung): Mimi as a native C++ lane
-      program on the same Flashkern team through the native SQ/CQ —
-      REQ_MIMI at the F4 doorbell,
-      units band-split per the NOTES maps (conv: out-channel; attention:
-      head; sweeps: sub-range), zero-spin parked fences. Today the kernel is
-      serial-with-AMX inside one rim call —
-      correct and fast (13.8 ms/frame), but not yet ON the lane team.
+- [x] engine integration: typed `REQ_MIMI_DECODE` runs through the native SQ/CQ
+      and writes directly into its retained playback reservation.
+- [ ] cooperative interior (the remaining rung): split Mimi units across the
+      fixed team using the NOTES maps (conv: out-channel; attention: head;
+      sweeps: sub-range) with zero-spin generation fences. The mounted request
+      is correct and fast (13.8 ms/frame), but its stateful graph still executes
+      serial-with-AMX on lane zero while peers park.

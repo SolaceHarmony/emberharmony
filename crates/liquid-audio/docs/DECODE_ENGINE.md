@@ -48,14 +48,15 @@ sampling, or model recurrence.
 There is no per-pass heap allocation, copied pass payload, Rust lane callback,
 bounded spin, or polling. The engine has two descriptor-addressed ticket slots:
 each request record borrows payload spans and each slot owns only its activation
-scratch bank. A capacity-2 SQ/CQ hands an exact completion a private
-generation-bearing permit for that same slot; the callback either resubmits it
-atomically or releases it before waking its waiter. Packed `{generation,state}`
+scratch bank. A capacity-2 SQ/CQ hands each completion an exact
+generation-bearing permit. The bounded audio route releases that permit at every
+coarse node, marks its pooled route instance ready, and lets the native broker
+reacquire capacity in FIFO/age-promoted order. Its exact-CQ callback performs no
+submission, allocation, wait, or descriptor lock. Packed `{generation,state}`
 CAS transitions prevent slot theft and stale-destructor ABA, and `FREE` is the
-final accounting publication edge. The session coordinator has not adopted that
-callback yet: it synchronously parks for each exact CQ before submitting the
-next pass. Moving that native state machine onto the landed continuation is the
-remaining overlap/latency optimization, not a Rust recurrence or ownership gap.
+final accounting publication edge. The session coordinator still parks once for
+terminal route collection. Moving that final edge into the session event loop is
+the remaining orchestration cut, not a Rust recurrence or ownership gap.
 
 Flashkern is the CPU executor, never the Metal executor. CPU kernels retain NEON,
 BFMMLA/BFDOT, AVX2, and AVX-512-BF16 paths. Unsupported Metal selection fails
@@ -384,10 +385,12 @@ Do not compare them across executors or extrapolate a current latency.
    admission, sampling, recurrence, tickets, epochs, reliable events, context
    rollover, shared-model fairness, and stop/join are live. The default graph and
    desktop construct only the opaque native LFM2 path; Candle/Moshi are oracle-only.
-4. **Session continuation adoption: next.** The engine now has capacity 2,
-   one scratch bank per admitted ticket, and an exact-CQ callback that retains
-   and resubmits its generation-checked slot without Rust progress. Move the existing native session
-   transitions off the synchronous compatibility call and onto that callback.
+4. **Session continuation adoption: broker built; terminal edge next.** The
+   engine has capacity 2, one scratch bank per admitted program, a fixed route
+   pool, and an expected-value broker. Exact-CQ releases the slot before the next
+   node becomes ready, so peers may queue without Rust progress. Move terminal
+   route collection out of synchronous `run_action` and into the native session
+   event loop.
    Batched M≤4 prefill is already direct checkpoint BF16. This removes the parked
    coordinator from numerical progress; Rust already owns none of the recurrence.
 5. **Physical kcoro audio-device adapter: next.** Have mic/speaker callbacks

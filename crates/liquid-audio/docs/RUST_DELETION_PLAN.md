@@ -33,7 +33,7 @@ production fallback.
 | Typed binding | **Landed.** Exact BF16/F32 dtype, rank, shape, layer, codebook, and vocabulary checks; possibly unaligned tensors remain byte views. | None for LFM2. |
 | Weight consumption | **Landed.** Frontend, Conformer, backbone, Depthformer, and Mimi bind the same image; BF16 unlift occurs in registers. | `compatibility_copied_bytes == 0` remains an acceptance assertion. Its counters were **stubs returning a literal 0** (review 2026-07-16) — the gate could not fail; now wired to real per-plan tallies. See "Accounting is a tally, not a constant" below. |
 | Native model chain | **Landed for numerical ownership.** One typed, model-correlated `REQ_AUDIO_ENCODE` pass owns resample → valid-only BF16 frontend → whole Conformer/adapter over borrowed spans and pre-reserved conversation buffers. Modality assembly, M≤4 checkpoint-BF16 prefill, backbone, sampling, Depthformer, Mimi, and tokenizer are also native-owned. | No remaining numerical-stage ownership gap for LFM2. The coordinator-to-continuation scheduling cut is tracked in the conversation/session row. |
-| Conversation/session | **Landed.** Native KV/ShortConv/codec state, PRNG, cursor, recurrence, text/PCM tickets, reliable events, epochs, interrupt, stop, and join. Rust does not drive progress. The engine now owns a capacity-2 SQ/CQ and two per-ticket request/scratch slots; an exact-CQ continuation retains and generation-checks its completed slot, then atomically resubmits that same slot or releases it before waking the waiter. | The session coordinator still uses the synchronous compatibility submission for each numerical pass. Move that existing recurrence state machine onto the landed continuation path. |
+| Conversation/session | **Landed.** Native KV/ShortConv/codec state, PRNG, cursor, recurrence, text/PCM tickets, reliable events, epochs, interrupt, stop, and join. Rust does not drive progress. A fixed route pool and native expected-value broker release capacity between coarse nodes; exact-CQ callbacks only commit, retire the slot, and publish readiness. | The session coordinator still waits once for terminal route collection. Convert `run_action` to a session-owned asynchronous state machine. |
 | Context rollover | **Landed.** Fixed capacity+runway BF16 state, monotonic cursor, absolute RoPE range generation, nonmutating whole-action admission, causal row-by-row eviction, and in-place compaction. | None for the activation-state sliding-window contract. |
 | Shared model | **Landed.** Per-conversation state/scratch and a fair model-owned expected-value pass gate; engine `-EBUSY` does not leak as scheduling policy. | Capacity-2 continuations may improve overlap; fairness is already correct. |
 | Production graph | **Landed.** Desktop creates `NativeVoiceModel` and opaque native conversations/sessions only; default dependencies do not enable Candle or Moshi. | Native Metal/MLX remains a separate future backend and must fail explicitly until mounted. |
@@ -153,25 +153,34 @@ fact no author can forget to update.
 
 ## Remaining LFM2 follow-ons
 
-### F0 — Typed audio-input stage passes
+### F0 — Typed audio-input stage pass — landed
 
-Resample, frontend, and whole-Conformer math is native and uses direct buffers,
-but `lfm_model.cpp` still invokes those orchestrators synchronously on the
-session coordinator. Add typed retained requests for those stage boundaries so
-the fixed lane team owns their complete pass lifetime; do not confuse native
-math ownership with Flashkern pass ownership.
+`REQ_AUDIO_ENCODE` retains one model-correlated PCM span through prepared
+resample, valid-only BF16 frontend, and whole-Conformer workspaces. Its direct
+BF16 linears execute as fixed-team substages without nested SQ submission. The
+parity gate proves exact stage output and unchanged prepared-storage capacity on
+a second pass. No additional per-stage ticket split is required.
 
-### F1 — Capacity-2 completion continuations
+### F1 — Pooled completion continuations — broker landed, session cut open
 
 The engine substrate is landed: two native request/scratch slots, a capacity-2
 SQ/CQ, exact-ticket completion routing, callback-driven follow-on admission, and
 full-pass serialization. Slot generation and state form one atomic lease; exact
 CQ retains that lease across the callback, and deterministic tests cover peer
 producer handoff, stale-owner ABA, stop during execution, and capacity
-accounting. The current C++ session coordinator still parks without spin on each
-compatibility call. Move its existing recurrence transitions onto the native
-continuation path. Preserve FIFO full-pass fairness and one scratch slot per
-admitted ticket.
+accounting. The bounded audio route now uses a fixed eight-instance pool and a
+native expected-value broker. An exact-CQ callback commits the declared state,
+releases its pass slot, marks only the next coarse node ready, and rings the
+broker; it does not submit, wait, allocate, or take either submission/descriptor
+mutex. Ordinary bridge descriptors are created by the broker and live for one
+program. FIFO sequence order plus bounded age promotion chooses ready work, so a
+route does not retain either capacity-2 compute slot across a node boundary.
+
+The current C++ session coordinator still parks once for the route's terminal
+result. Convert `run_action` into a session-owned asynchronous route state
+machine so command/control progress no longer depends on that terminal wait.
+Preserve one mutating route per conversation and one scratch slot per admitted
+program.
 
 Correct full/suffix/audio prefill is native and production-owned. Its M≤4
 checkpoint-layout BF16 specialization reuses each loaded weight vector across
