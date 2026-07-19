@@ -12,6 +12,7 @@ pub enum TicketKind {
     ContextSwitch = 5,
     Checkpoint = 6,
     Workflow = 7,
+    Control = 8,
 }
 
 #[repr(u32)]

@@ -31,10 +31,8 @@ struct Id {
 struct TicketId {
     runtime_epoch: u64,
     sequence: u64,
-    slot: u32,
     generation: u32,
     kind: u32,
-    reserved: u32,
 }
 
 #[repr(C)]
@@ -240,8 +238,8 @@ fn cargo_links_exact_ticket_completion() {
         0
     );
     let replacement_id = unsafe { kc_ticket_id_get(replacement) };
-    assert_eq!(replacement_id.slot, id.slot);
     assert_ne!(replacement_id.generation, id.generation);
+    assert_ne!(replacement_id.sequence, id.sequence);
     assert!(unsafe { kc_ticket_complete_id(runtime, id, &completion) } < 0);
     assert_eq!(unsafe { kc_ticket_cancel_id(runtime, replacement_id) }, 1);
     assert_eq!(unsafe { kc_runtime_run_until_idle(runtime) }, 0);

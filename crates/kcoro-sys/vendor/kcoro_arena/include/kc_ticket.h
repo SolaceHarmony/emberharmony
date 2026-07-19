@@ -3,6 +3,7 @@
 #define KC_TICKET_H
 
 #include "kc_descriptor.h"
+#include "kc_identity.h"
 #include "kc_op.h"
 
 #include <stdint.h>
@@ -13,15 +14,6 @@ extern "C" {
 
 typedef struct kc_runtime kc_runtime_t;
 typedef struct kc_ticket kc_ticket_t;
-
-typedef struct kc_ticket_id {
-    uint64_t runtime_epoch;
-    uint64_t sequence;
-    uint32_t slot;
-    uint32_t generation;
-    uint32_t kind;
-    uint32_t reserved;
-} kc_ticket_id;
 
 typedef enum kc_ticket_state {
     KC_TICKET_CREATED = 0,

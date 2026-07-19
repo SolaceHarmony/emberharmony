@@ -5,6 +5,7 @@
 #include "kc_atomic.h"
 #include "kc_collective.h"
 #include "kc_doorbell.h"
+#include "kc_identity.h"
 #include "kc_port.h"
 #include "kc_runtime.h"
 #include "kc_team.h"

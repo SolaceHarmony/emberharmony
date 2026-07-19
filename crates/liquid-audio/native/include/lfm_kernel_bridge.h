@@ -4,6 +4,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "kc_identity.h"
+
 #ifdef __cplusplus
 extern "C" {
 #define LFM_KERNEL_ALIGNAS(n) alignas(n)
@@ -18,13 +20,13 @@ extern "C" {
 #define KC_COORD_ABI_VERSION 1u
 #define KC_COORD_MAX_RESULTS 8u
 
-#define KC_COORD_TICKET_SESSION 1u
-#define KC_COORD_TICKET_TURN 2u
-#define KC_COORD_TICKET_FRAME 3u
-#define KC_COORD_TICKET_PASS 4u
-#define KC_COORD_TICKET_CONTEXT_SWITCH 5u
-#define KC_COORD_TICKET_CHECKPOINT 6u
-#define KC_COORD_TICKET_WORKFLOW 7u
+#define KC_COORD_TICKET_SESSION KC_TICKET_KIND_SESSION
+#define KC_COORD_TICKET_TURN KC_TICKET_KIND_TURN
+#define KC_COORD_TICKET_FRAME KC_TICKET_KIND_FRAME
+#define KC_COORD_TICKET_PASS KC_TICKET_KIND_PASS
+#define KC_COORD_TICKET_CONTEXT_SWITCH KC_TICKET_KIND_CONTEXT_SWITCH
+#define KC_COORD_TICKET_CHECKPOINT KC_TICKET_KIND_CHECKPOINT
+#define KC_COORD_TICKET_WORKFLOW KC_TICKET_KIND_WORKFLOW
 
 #define KC_COORD_COMMAND_RUN_PASS 1u
 #define KC_COORD_COMMAND_RUN_STANDING_ORDER 2u
@@ -65,12 +67,7 @@ extern "C" {
 #define KC_COORD_RESULT_FRAME 3u
 #define KC_COORD_RESULT_CONTROL 4u
 
-typedef struct KcTicketIdV1 {
-    uint64_t runtime_epoch;
-    uint64_t sequence;
-    uint32_t generation;
-    uint32_t kind;
-} KcTicketIdV1;
+typedef kc_ticket_id KcTicketIdV1;
 
 typedef struct KcDescriptorIdV1 {
     uint32_t slot;

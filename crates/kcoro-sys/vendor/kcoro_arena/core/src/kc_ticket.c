@@ -134,7 +134,6 @@ int kc_ticket_create(kc_runtime_t *runtime,
         .ticket = {
             .runtime_epoch = runtime->epoch,
             .sequence = kc_runtime_next_sequence(runtime),
-            .slot = slot,
             .generation = generation,
             .kind = config->kind,
         },
@@ -285,14 +284,17 @@ static int completion_valid(const kc_ticket_completion_v1 *completion)
 
 static kc_ticket_t *ticket_from_id_locked(kc_runtime_t *runtime, kc_ticket_id id)
 {
-    if (id.runtime_epoch != runtime->epoch || id.slot >= runtime->ticket_capacity)
-        return NULL;
-    kc_ticket_t *ticket = &runtime->tickets[id.slot];
-    kc_ticket_id current = ticket->event.ticket;
-    if (!ticket->in_use || current.sequence != id.sequence ||
-        current.generation != id.generation || current.kind != id.kind)
-        return NULL;
-    return ticket;
+    if (id.runtime_epoch != runtime->epoch || id.sequence == 0 ||
+        id.generation == 0 || id.kind == 0) return NULL;
+    for (uint32_t slot = 0; slot < runtime->ticket_capacity; ++slot) {
+        kc_ticket_t *ticket = &runtime->tickets[slot];
+        kc_ticket_id current = ticket->event.ticket;
+        if (ticket->in_use && current.runtime_epoch == id.runtime_epoch &&
+            current.sequence == id.sequence &&
+            current.generation == id.generation && current.kind == id.kind)
+            return ticket;
+    }
+    return NULL;
 }
 
 static int complete_locked(kc_ticket_t *ticket,

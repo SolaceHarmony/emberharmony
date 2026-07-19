@@ -3,6 +3,8 @@
 
 #include <stdint.h>
 
+#include "kc_identity.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -28,17 +30,12 @@ typedef enum LfmStatusV1 {
     LFM_STATUS_INTERNAL = -1003,
 } LfmStatusV1;
 
-typedef struct LfmTicketIdV1 {
-    uint64_t runtime_epoch;
-    uint64_t sequence;
-    uint32_t generation;
-    uint32_t kind;
-} LfmTicketIdV1;
+typedef kc_ticket_id LfmTicketIdV1;
 
-#define LFM_TICKET_SESSION 1u
-#define LFM_TICKET_TURN 2u
-#define LFM_TICKET_FRAME 3u
-#define LFM_TICKET_CONTROL 4u
+#define LFM_TICKET_SESSION KC_TICKET_KIND_SESSION
+#define LFM_TICKET_TURN KC_TICKET_KIND_TURN
+#define LFM_TICKET_FRAME KC_TICKET_KIND_FRAME
+#define LFM_TICKET_CONTROL KC_TICKET_KIND_CONTROL
 
 #ifdef __cplusplus
 } /* extern "C" */

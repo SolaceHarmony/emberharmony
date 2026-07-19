@@ -77,6 +77,7 @@ fn main() {
         .warnings_into_errors(true)
         .flag_if_supported("-fvisibility=hidden")
         .include("native/include")
+        .include("../kcoro-sys/vendor/kcoro_arena/include")
         .compile("lfm_voice_protocol_c");
 
     println!("cargo::rerun-if-changed=native/src/engine/flashkern_engine.cpp");
@@ -147,6 +148,7 @@ fn main() {
         .warnings_into_errors(true)
         .flag_if_supported("-fvisibility=hidden")
         .include("native/include")
+        .include("../kcoro-sys/vendor/kcoro_arena/include")
         .compile("lfm_kernel_protocol_c");
 
     // Native audio frontend: torchaudio-exact resampler + NeMo mel featurizer.

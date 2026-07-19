@@ -7,8 +7,7 @@
 //! in this process. The Tauri layer owns one of these handles and maps
 //! [`RuntimeEvent`]s onto its IPC channel.
 
-use std::cell::UnsafeCell;
-use std::cell::Cell;
+use std::cell::{Cell, UnsafeCell};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;

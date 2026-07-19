@@ -176,7 +176,7 @@ fn e2e_voice_runtime_speaks_two_turns_through_real_speaker() {
     // ---- The one mock: a mic that plays a queue of samples in real time. ----
     // 20ms mono chunks at wall-clock cadence, zeros when the queue is empty —
     // exactly what a hardware capture callback delivers between utterances.
-    let (input, writer) = ExternalAudioInput::new(mic_rate).expect("external input");
+    let (input, mut writer) = ExternalAudioInput::new(mic_rate).expect("external input");
     let feed: Arc<Mutex<VecDeque<f32>>> = Arc::new(Mutex::new(VecDeque::new()));
     let feeder_stop = Arc::new(AtomicBool::new(false));
     let feeder = {
