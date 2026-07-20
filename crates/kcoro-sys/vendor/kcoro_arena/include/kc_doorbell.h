@@ -18,8 +18,10 @@ int kc_doorbell_create(kc_doorbell_t **out);
 uint32_t kc_doorbell_observe(const kc_doorbell_t *doorbell);
 void kc_doorbell_ring_one(kc_doorbell_t *doorbell);
 void kc_doorbell_ring_all(kc_doorbell_t *doorbell);
-int kc_doorbell_wait(kc_doorbell_t *doorbell, uint32_t expected,
-                     uint64_t deadline_ns);
+/* Indefinite dormancy for a resident kernel worker whose complete work
+ * predicate is empty. There is deliberately no deadline form: elapsed time
+ * may observe the runtime, but it cannot make a continuation runnable. */
+int kc_doorbell_park(kc_doorbell_t *doorbell, uint32_t expected);
 /* Ring is allocation-free for every backend, but only direct address-wake
  * backends are mutex-free and therefore admissible from realtime callbacks. */
 int kc_doorbell_realtime_safe(const kc_doorbell_t *doorbell);

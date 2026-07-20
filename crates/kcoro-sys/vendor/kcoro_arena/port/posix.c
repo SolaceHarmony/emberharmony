@@ -10,7 +10,6 @@
 #include <errno.h>
 #include <limits.h>
 #include <pthread.h>
-#include <sched.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -25,7 +24,6 @@
 #endif
 
 struct kc_port_mutex { pthread_mutex_t value; };
-struct kc_port_cond { pthread_cond_t value; };
 struct kc_port_thread { pthread_t value; };
 
 enum kc_wait_backend {
@@ -62,29 +60,6 @@ static int kc_cond_init(pthread_cond_t *cond)
     return rc;
 }
 
-static struct timespec kc_deadline_timespec(uint64_t deadline_ns)
-{
-#if defined(__APPLE__)
-    uint64_t now = kc_port_monotonic_ns();
-    uint64_t delta = deadline_ns > now ? deadline_ns - now : 0;
-    struct timespec deadline;
-    clock_gettime(CLOCK_REALTIME, &deadline);
-    deadline.tv_sec += (time_t)(delta / UINT64_C(1000000000));
-    deadline.tv_nsec += (long)(delta % UINT64_C(1000000000));
-    if (deadline.tv_nsec >= 1000000000L) {
-        deadline.tv_sec++;
-        deadline.tv_nsec -= 1000000000L;
-    }
-    return deadline;
-#else
-    struct timespec deadline = {
-        .tv_sec = (time_t)(deadline_ns / UINT64_C(1000000000)),
-        .tv_nsec = (long)(deadline_ns % UINT64_C(1000000000)),
-    };
-    return deadline;
-#endif
-}
-
 static void kc_wait_leave(kc_port_wait_word *word)
 {
     unsigned before = atomic_fetch_sub_explicit(&word->gate, 1,
@@ -98,14 +73,16 @@ static void kc_wait_leave(kc_port_wait_word *word)
 static int kc_wait_enter(kc_port_wait_word *word)
 {
     if (!word) return -EINVAL;
-    unsigned gate = atomic_load_explicit(&word->gate, memory_order_acquire);
-    for (;;) {
-        if (gate & KC_WAIT_CLOSED) return -ECANCELED;
-        if ((gate & KC_WAIT_COUNT) == KC_WAIT_COUNT) return -EAGAIN;
-        if (atomic_compare_exchange_weak_explicit(
-                &word->gate, &gate, gate + 1,
-                memory_order_acquire, memory_order_acquire)) return 0;
-    }
+    /* The registration owner bounds callers to its resident worker set, far
+     * below KC_WAIT_COUNT. One fetch-add admits or rejects this operation;
+     * idle entry and realtime wake never retry an atomic under contention. */
+    unsigned gate = atomic_fetch_add_explicit(&word->gate, 1,
+                                               memory_order_acquire);
+    if (!(gate & KC_WAIT_CLOSED) &&
+        (gate & KC_WAIT_COUNT) != KC_WAIT_COUNT) return 0;
+    kc_wait_leave(word);
+    if (gate & KC_WAIT_CLOSED) return -ECANCELED;
+    return -EAGAIN;
 }
 
 static int kc_wait_is_closing(const kc_port_wait_word *word)
@@ -135,41 +112,6 @@ void kc_port_mutex_destroy(kc_port_mutex *mutex)
 void kc_port_mutex_lock(kc_port_mutex *mutex) { pthread_mutex_lock(&mutex->value); }
 void kc_port_mutex_unlock(kc_port_mutex *mutex) { pthread_mutex_unlock(&mutex->value); }
 
-int kc_port_cond_create(kc_port_cond **out)
-{
-    if (!out) return -EINVAL;
-    kc_port_cond *cond = calloc(1, sizeof(*cond));
-    if (!cond) return -ENOMEM;
-    int rc = kc_cond_init(&cond->value);
-    if (rc != 0) { free(cond); return -rc; }
-    *out = cond;
-    return 0;
-}
-
-void kc_port_cond_destroy(kc_port_cond *cond)
-{
-    if (!cond) return;
-    pthread_cond_destroy(&cond->value);
-    free(cond);
-}
-
-void kc_port_cond_wait(kc_port_cond *cond, kc_port_mutex *mutex)
-{
-    pthread_cond_wait(&cond->value, &mutex->value);
-}
-
-int kc_port_cond_timedwait(kc_port_cond *cond, kc_port_mutex *mutex,
-                           uint64_t deadline_ns)
-{
-    if (deadline_ns <= kc_port_monotonic_ns()) return -ETIMEDOUT;
-    struct timespec deadline = kc_deadline_timespec(deadline_ns);
-    int rc = pthread_cond_timedwait(&cond->value, &mutex->value, &deadline);
-    return rc == 0 ? 0 : -rc;
-}
-
-void kc_port_cond_signal(kc_port_cond *cond) { pthread_cond_signal(&cond->value); }
-void kc_port_cond_broadcast(kc_port_cond *cond) { pthread_cond_broadcast(&cond->value); }
-
 int kc_port_wait_u32_prepare(uint32_t *address, kc_port_wait_word **out)
 {
     if (!address || !out || ((uintptr_t)address & (sizeof(*address) - 1)) != 0)
@@ -197,29 +139,14 @@ int kc_port_wait_u32_prepare(uint32_t *address, kc_port_wait_word **out)
     return 0;
 }
 
-static int kc_wait_pthread(kc_port_wait_word *word, uint32_t expected,
-                           uint64_t deadline_ns)
+static int kc_wait_pthread(kc_port_wait_word *word, uint32_t expected)
 {
     int result = 0;
     pthread_mutex_lock(&word->mutex);
     while (!kc_wait_is_closing(word) &&
            kc_atomic_u32_load_acquire(word->address) == expected) {
-        int rc;
-        if (deadline_ns == 0) rc = pthread_cond_wait(&word->cond, &word->mutex);
-        else {
-            if (deadline_ns <= kc_port_monotonic_ns()) {
-                result = -ETIMEDOUT;
-                break;
-            }
-            struct timespec deadline = kc_deadline_timespec(deadline_ns);
-            rc = pthread_cond_timedwait(&word->cond, &word->mutex, &deadline);
-        }
-        if (rc == ETIMEDOUT &&
-            kc_atomic_u32_load_acquire(word->address) == expected) {
-            result = -ETIMEDOUT;
-            break;
-        }
-        if (rc != 0 && rc != ETIMEDOUT) {
+        int rc = pthread_cond_wait(&word->cond, &word->mutex);
+        if (rc != 0) {
             result = -rc;
             break;
         }
@@ -232,32 +159,19 @@ static int kc_wait_pthread(kc_port_wait_word *word, uint32_t expected,
 }
 
 #if defined(__APPLE__)
-static int kc_wait_darwin(kc_port_wait_word *word, uint32_t expected,
-                          uint64_t deadline_ns)
+static int kc_wait_darwin(kc_port_wait_word *word, uint32_t expected)
 {
     if (__builtin_available(macOS 14.4, *)) {
         for (;;) {
             if (kc_atomic_u32_load_acquire(word->address) != expected) return 0;
             if (kc_wait_is_closing(word))
                 return -ECANCELED;
-            int rc;
-            if (deadline_ns == 0) {
-                rc = os_sync_wait_on_address(word->address, expected,
+            int rc = os_sync_wait_on_address(word->address, expected,
                                              sizeof(*word->address),
                                              OS_SYNC_WAIT_ON_ADDRESS_NONE);
-            } else {
-                uint64_t now = kc_port_monotonic_ns();
-                if (deadline_ns <= now) return -ETIMEDOUT;
-                rc = os_sync_wait_on_address_with_timeout(
-                    word->address, expected, sizeof(*word->address),
-                    OS_SYNC_WAIT_ON_ADDRESS_NONE, OS_CLOCK_MACH_ABSOLUTE_TIME,
-                    deadline_ns - now);
-            }
             if (rc >= 0) continue;
             int error = errno;
             if (error == EINTR) continue;
-            if (error == ETIMEDOUT &&
-                kc_atomic_u32_load_acquire(word->address) != expected) continue;
             return -error;
         }
     }
@@ -266,37 +180,23 @@ static int kc_wait_darwin(kc_port_wait_word *word, uint32_t expected,
 #endif
 
 #if defined(__linux__)
-static int kc_wait_futex(kc_port_wait_word *word, uint32_t expected,
-                         uint64_t deadline_ns)
+static int kc_wait_futex(kc_port_wait_word *word, uint32_t expected)
 {
     for (;;) {
         if (kc_atomic_u32_load_acquire(word->address) != expected) return 0;
         if (kc_wait_is_closing(word))
             return -ECANCELED;
-        struct timespec timeout;
-        struct timespec *timeout_ptr = NULL;
-        if (deadline_ns) {
-            uint64_t now = kc_port_monotonic_ns();
-            if (deadline_ns <= now) return -ETIMEDOUT;
-            uint64_t remaining = deadline_ns - now;
-            timeout.tv_sec = (time_t)(remaining / UINT64_C(1000000000));
-            timeout.tv_nsec = (long)(remaining % UINT64_C(1000000000));
-            timeout_ptr = &timeout;
-        }
         int rc = (int)syscall(SYS_futex, word->address, FUTEX_WAIT_PRIVATE,
-                              expected, timeout_ptr, NULL, 0);
+                              expected, NULL, NULL, 0);
         if (rc == 0) continue;
         int error = errno;
         if (error == EAGAIN || error == EINTR) continue;
-        if (error == ETIMEDOUT &&
-            kc_atomic_u32_load_acquire(word->address) != expected) continue;
         return -error;
     }
 }
 #endif
 
-int kc_port_wait_u32(kc_port_wait_word *word, uint32_t expected,
-                     uint64_t deadline_ns)
+int kc_port_wait_u32(kc_port_wait_word *word, uint32_t expected)
 {
     int entered = kc_wait_enter(word);
     if (entered != 0) return entered;
@@ -304,16 +204,16 @@ int kc_port_wait_u32(kc_port_wait_word *word, uint32_t expected,
     switch (word->backend) {
 #if defined(__APPLE__)
     case KC_WAIT_DARWIN:
-        result = kc_wait_darwin(word, expected, deadline_ns);
+        result = kc_wait_darwin(word, expected);
         break;
 #endif
 #if defined(__linux__)
     case KC_WAIT_FUTEX:
-        result = kc_wait_futex(word, expected, deadline_ns);
+        result = kc_wait_futex(word, expected);
         break;
 #endif
     default:
-        result = kc_wait_pthread(word, expected, deadline_ns);
+        result = kc_wait_pthread(word, expected);
         break;
     }
     kc_wait_leave(word);
@@ -437,5 +337,3 @@ uint64_t kc_port_monotonic_ns(void)
     clock_gettime(CLOCK_MONOTONIC, &now);
     return (uint64_t)now.tv_sec * UINT64_C(1000000000) + (uint64_t)now.tv_nsec;
 }
-
-void kc_port_thread_yield(void) { sched_yield(); }

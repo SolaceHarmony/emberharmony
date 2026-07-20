@@ -6,8 +6,6 @@
 
 mod ffi;
 pub mod native_voice;
-#[path = "runtime/realtime.rs"]
-pub mod realtime;
 #[path = "runtime/resample.rs"]
 pub mod resample;
 pub mod utils;
@@ -19,16 +17,12 @@ pub use native_voice::{
     NativeConversationVault, NativeLfm2VoiceEngine, NativeVoiceModel, NativeVoiceModelMemory,
     NativeVoiceRuntimeConfig, NativeVoiceSampling,
 };
-pub use realtime::{
-    FrameSubmitError, RealtimeFramePipeline, RealtimeFramePipelineHandle, RealtimePipeline,
-    RealtimePipelineHandle,
-};
 #[cfg(feature = "download")]
 pub use utils::{snapshot_download_to, snapshot_download_with, DownloadProgress};
 pub use voice_api::{
-    CaptureDock, CaptureTicket, FrameConfig, PcmSink, Utterance, VoiceEngine, VoiceEvent,
+    CaptureDock, CaptureTicket, EngineProgress, PlaybackSource, PlaybackWrite, VoiceEngine,
+    VoiceEvent,
 };
 pub use voice_runtime::{
-    AudioStatsSnapshot, ExternalAudioInput, ExternalAudioInputWriter, ExternalAudioOutput,
-    RuntimeConfig, RuntimeEvent, SessionState, VoiceRuntime,
+    AudioStatsSnapshot, RuntimeConfig, RuntimeEvent, SessionState, VoiceRuntime,
 };

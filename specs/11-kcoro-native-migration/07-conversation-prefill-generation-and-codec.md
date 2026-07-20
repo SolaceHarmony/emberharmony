@@ -385,35 +385,35 @@ advance, and clearing one plan leaves the other runnable.
 
 The probability policy mounts as one native subprogram of the token or
 Depthformer pass, not as a serial helper and not as a chain of kcoro tickets.
-The fixed Flashkern lanes are its CPU threadgroup. `lane_fence` is the exact
-equivalent of a GPU `threadgroup_barrier`: it publishes a logical generation,
-blocks declared peers through the zero-spin wait word, and lets the last arriver
-perform the bounded serial fold.
+The fixed Flashkern team is its CPU threadgroup. Each sampler phase is one
+non-suspending team generation. Every member returns; the final return performs
+the bounded serial fold and advances the same ticket's durable sampler phase.
+No lane or host thread waits at an internal barrier.
 
 The stage plan is:
 
 1. Partition the vocabulary into stable contiguous lane shards. Each lane reads
    logits in place, applies the configured temperature, and writes its local
    maximum to lane-private scratch.
-2. Fence. The last arriver folds maxima in lane order. The as-built threshold
-   top-k scan uses an engine-owned, preallocated min-heap containing values only;
+2. Full-team return. The final return folds maxima in lane order. The as-built
+   threshold top-k scan uses an engine-owned, preallocated min-heap containing values only;
    it never copies the logits payload, allocates during the pass, sorts a vector,
    or truncates boundary ties. A future measured optimization may shard candidate
    heaps per lane without changing the sampling ABI or draw order.
 3. Each lane computes masked `exp(logit - global_max)` weights and one local sum.
    The selected approximation and F32 rounding ladder are fixture-pinned.
-4. Fence. The last arriver folds sums in lane order and publishes deterministic
-   per-lane prefix intervals plus the total mass.
+4. Full-team return. The final return folds sums in lane order and publishes
+   deterministic per-lane prefix intervals plus the total mass.
 5. The serial section consumes exactly one value from the conversation's shared
    `LfmPrngStateV1` and maps it into `[0, total_mass)`. The one lane owning
    that interval scans only its shard to resolve the first crossing token.
-6. Fence. The winner publishes one token ID; native code appends it and advances
-   sampler/context state before the pass completion becomes visible.
+6. The terminal team return publishes one token ID; native code appends it and
+   advances sampler/context state before the pass completion becomes visible.
 
 Greedy mode uses the same first reduction and deterministic index tie-break,
 then skips probability and PRNG stages. Invalid configuration, empty support,
 or nonfinite-policy failure is detected before sampler or conversation mutation.
-Barrier count is plan metadata and a regression metric; adjacent stages may be
+Phase/dispatch count is plan metadata and a regression metric; adjacent stages may be
 fused only when the same parity fixtures prove the published generation facts
 are unchanged.
 
@@ -519,12 +519,9 @@ exact capture and ticket boundaries needed by spec 10:
   execute outside audio, fixed compute, completion, and coordination workers.
 
 The image, delta, WAL, branch, and compaction protocols remain owned by
-`specs/10-stateful-multi-agent-runtime.md:583-949`. In particular, long-running
-conversation images use immutable base/delta objects and A/B manifests. They do
-not use kcoro's current append-only `kc_wal_snapshot_write` implementation at
-`/Volumes/stuff/Projects/kotlinmania/kcoro_arena/core/src/kc_wal.c:535-580`.
-The WAL contains small transactional facts and checkpoint associations, not
-model-state pages.
+`specs/10-stateful-multi-agent-runtime.md:583-949`. Long-running conversation
+images use immutable base/delta objects and A/B manifests; their writer
+publishes a durable ticket edge back to the retained continuation.
 
 ## Implementation Order
 

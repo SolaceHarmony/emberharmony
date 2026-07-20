@@ -63,12 +63,12 @@ objc2-web-kit = "0.3"
 window-vibrancy = "0.7"
 # Native Flashkern voice lifecycle and PCM dock. Candle/Metal is oracle-only and
 # is deliberately absent from the shipped desktop dependency graph.
-liquid-audio = { path = "../../../crates/liquid-audio" }
+liquid-audio = { path = "../../../crates/liquid-audio", features = ["audio-io"] }
 
 # Linux CPU build of the same native runtime. Windows/MSVC is intentionally not a
 # release target until kcoro and flashkern have a real Windows port.
 [target.'cfg(not(target_os = "macos"))'.dependencies]
-liquid-audio = { path = "../../../crates/liquid-audio" }
+liquid-audio = { path = "../../../crates/liquid-audio", features = ["audio-io"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = [

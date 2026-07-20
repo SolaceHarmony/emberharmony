@@ -36,7 +36,7 @@ extern "C" {
 #define KC_COORD_COMMAND_CANCEL 6u
 #define KC_COORD_COMMAND_STOP 7u
 
-#define KC_COORD_SERVICE_DEADLINE 1u
+#define KC_COORD_SERVICE_REALTIME 1u
 #define KC_COORD_SERVICE_INTERACTIVE 2u
 #define KC_COORD_SERVICE_BACKGROUND 3u
 
@@ -69,6 +69,9 @@ extern "C" {
 
 typedef kc_ticket_id KcTicketIdV1;
 
+/* ABI name retained, but this is not a generic descriptor or owning object.
+ * It is the exact fixed pass-slot index plus ticket generation. The slot owns
+ * the typed byte views and durable continuation state. */
 typedef struct KcDescriptorIdV1 {
     uint32_t slot;
     uint32_t generation;
@@ -89,14 +92,9 @@ typedef struct LFM_KERNEL_ALIGNAS(64) KcSubmissionV1 {
     uint32_t service_class;
     uint32_t flags;
     uint32_t pass_budget;
-    uint64_t deadline_ns;
+    uint64_t reserved0;
     uint64_t reserved[3];
 } KcSubmissionV1;
-
-/* Private native-engine marker. A borrowed descriptor remains owned by the
- * route caller and is therefore neither retained by SQ admission nor released
- * by CQ consumption. Generic bridge callers must not set this bit. */
-#define KC_COORD_SUBMISSION_BORROWED_DESCRIPTOR (UINT32_C(1) << 31)
 
 typedef struct LFM_KERNEL_ALIGNAS(64) KcCompletionV1 {
     uint32_t size;
@@ -119,47 +117,11 @@ typedef struct LFM_KERNEL_ALIGNAS(64) KcCompletionV1 {
 
 typedef struct LfmKernelBridge LfmKernelBridge;
 
-typedef void (*LfmKernelDescriptorReleaseFn)(void *payload, void *context);
-
-typedef struct LfmKernelDescriptorSpecV1 {
-    uint32_t size;
-    uint32_t abi_version;
-    uint32_t kind;
-    uint32_t flags;
-    void *payload;
-    void *context;
-    LfmKernelDescriptorReleaseFn release;
-    uint64_t reserved[3];
-} LfmKernelDescriptorSpecV1;
-
-typedef struct LfmKernelDescriptorViewV1 {
-    uint32_t size;
-    uint32_t abi_version;
-    uint32_t kind;
-    uint32_t flags;
-    void *payload;
-    uint64_t reserved;
-} LfmKernelDescriptorViewV1;
-
-typedef struct LfmKernelDescriptorSnapshotV1 {
-    uint32_t size;
-    uint32_t abi_version;
-    uint32_t capacity;
-    uint32_t live;
-    uint64_t acquired;
-    uint64_t retained;
-    uint64_t released;
-    uint64_t callbacks;
-    uint32_t max_generation;
-    uint32_t retired;
-} LfmKernelDescriptorSnapshotV1;
-
 typedef struct LfmKernelBridgeConfigV1 {
     uint32_t size;
     uint32_t abi_version;
     uint32_t capacity;
-    /* Zero selects `capacity`; otherwise this is an independent fixed pool. */
-    uint32_t descriptor_capacity;
+    uint32_t reserved;
 } LfmKernelBridgeConfigV1;
 
 typedef struct LfmKernelBridgeSnapshotV1 {
@@ -171,70 +133,32 @@ typedef struct LfmKernelBridgeSnapshotV1 {
     uint64_t submissions_consumed;
     uint64_t completions_published;
     uint64_t completions_consumed;
-    uint32_t active_waits;
-    uint32_t reserved;
+    uint32_t reserved[2];
 } LfmKernelBridgeSnapshotV1;
 
 /*
  * Native submission side. The model runtime is the sole SQ producer and CQ
  * consumer in production. Rust bindings exercise this protocol only in tests.
- * Accepted submissions reserve one CQ cell until consumed. A nonzero deadline
- * is an absolute monotonic timestamp; zero waits forever.
+ * Accepted submissions reserve one CQ cell until consumed. Queue operations
+ * never wait: the owner resumes its retained service on publication and drains
+ * with the `try` operations below.
  */
 int lfm_kernel_bridge_create(const LfmKernelBridgeConfigV1 *config,
                              LfmKernelBridge **out);
-/*
- * Creates one native-owned descriptor lease. Accepted pass submissions retain
- * an additional queue lease until their completion cell is consumed.
- */
-int lfm_kernel_bridge_descriptor_create(
-    LfmKernelBridge *bridge, const LfmKernelDescriptorSpecV1 *spec,
-    KcDescriptorIdV1 *out);
-int lfm_kernel_bridge_descriptor_retain(LfmKernelBridge *bridge,
-                                        KcDescriptorIdV1 descriptor);
-/* The returned view is borrowed and valid only while the caller owns a lease. */
-int lfm_kernel_bridge_descriptor_get(LfmKernelBridge *bridge,
-                                     KcDescriptorIdV1 descriptor,
-                                     LfmKernelDescriptorViewV1 *out);
-/* Route-only immutable view. The caller must retain the owner lease until the
- * exact slot has completed and no executor can still read this descriptor. */
-int lfm_kernel_bridge_descriptor_get_borrowed(
-    LfmKernelBridge *bridge, KcDescriptorIdV1 descriptor,
-    LfmKernelDescriptorViewV1 *out);
-int lfm_kernel_bridge_descriptor_release(LfmKernelBridge *bridge,
-                                         KcDescriptorIdV1 descriptor);
-int lfm_kernel_bridge_descriptor_snapshot(
-    LfmKernelBridge *bridge, LfmKernelDescriptorSnapshotV1 *out);
-/* Acquires the route-only SPSC producer lease after all ordinary submissions
- * have settled. The same admission word excludes generic producers without a
- * second-lock race. */
-int lfm_kernel_bridge_producer_acquire(LfmKernelBridge *bridge);
-int lfm_kernel_bridge_producer_release(LfmKernelBridge *bridge);
 int lfm_kernel_bridge_submit(LfmKernelBridge *bridge,
                              const KcSubmissionV1 *submission);
-/* Route-only SPSC publication under caller-held exclusive producer authority.
- * This deliberately performs no descriptor retain or queue-ledger release. */
-int lfm_kernel_bridge_submit_borrowed(
-    LfmKernelBridge *bridge, const KcSubmissionV1 *submission);
 /* Nonblocking CQ receive. Returns -EAGAIN while the queue is empty and
  * -ECANCELED only after stop has closed submission admission and every
  * accepted ticket has settled. */
 int lfm_kernel_bridge_try_completion(LfmKernelBridge *bridge,
                                      KcCompletionV1 *out);
-int lfm_kernel_bridge_wait_completion(LfmKernelBridge *bridge,
-                                      KcCompletionV1 *out,
-                                      uint64_t deadline_ns);
 
 /*
  * Native side. One executor is the sole SQ consumer and logical CQ producer.
- * These functions perform no policy work. A nonzero deadline is absolute
- * monotonic time; zero waits forever.
+ * These functions perform no policy work and never wait.
  */
 int lfm_kernel_bridge_try_submission(LfmKernelBridge *bridge,
                                      KcSubmissionV1 *out);
-int lfm_kernel_bridge_wait_submission(LfmKernelBridge *bridge,
-                                      KcSubmissionV1 *out,
-                                      uint64_t deadline_ns);
 int lfm_kernel_bridge_publish_completion(LfmKernelBridge *bridge,
                                          const KcCompletionV1 *completion);
 
@@ -257,8 +181,8 @@ LFM_KERNEL_STATIC_ASSERT(offsetof(KcSubmissionV1, conversation_id) == 56,
                          "KcSubmissionV1 conversation offset");
 LFM_KERNEL_STATIC_ASSERT(offsetof(KcSubmissionV1, descriptor) == 72,
                          "KcSubmissionV1 descriptor offset");
-LFM_KERNEL_STATIC_ASSERT(offsetof(KcSubmissionV1, deadline_ns) == 96,
-                         "KcSubmissionV1 deadline offset");
+LFM_KERNEL_STATIC_ASSERT(offsetof(KcSubmissionV1, reserved0) == 96,
+                         "KcSubmissionV1 reserved offset");
 LFM_KERNEL_STATIC_ASSERT(sizeof(KcCompletionV1) == 128, "KcCompletionV1 size");
 LFM_KERNEL_STATIC_ASSERT(LFM_KERNEL_ALIGNOF(KcCompletionV1) == 64,
                          "KcCompletionV1 alignment");
@@ -272,12 +196,8 @@ LFM_KERNEL_STATIC_ASSERT(offsetof(KcCompletionV1, results) == 88,
                          "KcCompletionV1 results offset");
 LFM_KERNEL_STATIC_ASSERT(offsetof(KcCompletionV1, reserved) == 120,
                          "KcCompletionV1 reserved offset");
-LFM_KERNEL_STATIC_ASSERT(sizeof(LfmKernelDescriptorSpecV1) == 64,
-                         "LfmKernelDescriptorSpecV1 size");
-LFM_KERNEL_STATIC_ASSERT(sizeof(LfmKernelDescriptorViewV1) == 32,
-                         "LfmKernelDescriptorViewV1 size");
-LFM_KERNEL_STATIC_ASSERT(sizeof(LfmKernelDescriptorSnapshotV1) == 56,
-                         "LfmKernelDescriptorSnapshotV1 size");
+LFM_KERNEL_STATIC_ASSERT(sizeof(LfmKernelBridgeSnapshotV1) == 56,
+                         "LfmKernelBridgeSnapshotV1 size");
 
 #undef LFM_KERNEL_ALIGNAS
 #undef LFM_KERNEL_ALIGNOF

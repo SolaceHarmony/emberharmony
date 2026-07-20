@@ -17,7 +17,7 @@ const EDEADLK: i32 = 35;
     target_os = "android"
 )))]
 const EDEADLK: i32 = 35;
-const WAITING: u32 = 3;
+const DORMANT: u32 = 3;
 const DONE: u32 = 4;
 
 #[repr(C)]
@@ -25,8 +25,6 @@ struct RuntimeConfig {
     size: u32,
     abi_version: u32,
     worker_count: u32,
-    arena_segment_size: usize,
-    ticket_capacity: u32,
     reserved: u32,
 }
 
@@ -34,54 +32,16 @@ struct RuntimeConfig {
 struct RuntimeSnapshot {
     size: u32,
     abi_version: u32,
-    epoch: u64,
-    next_sequence: u64,
     active: usize,
     queued: usize,
     running: usize,
-    waiting: usize,
-    live_operations: usize,
-    live_timers: usize,
-    live_channels: usize,
-    live_scopes: usize,
-    live_tickets: usize,
-    completion_queued: usize,
-    completion_running: usize,
-    live_descriptors: usize,
-    live_regions: usize,
-    live_segments: usize,
-    reserved_bytes: usize,
+    dormant: usize,
     wake_requests: u64,
     resumes: u64,
     workers: u32,
     accepting: u32,
     started: u32,
     stop_requested: u32,
-    ticket_capacity: u32,
-}
-
-#[repr(C)]
-struct MemorySnapshot {
-    size: u32,
-    abi_version: u32,
-    live_descriptors: usize,
-    live_regions: usize,
-    live_segments: usize,
-    logical_bytes: usize,
-    reserved_bytes: usize,
-    cumulative_bytes: u64,
-    reclaimed_bytes: u64,
-}
-
-#[repr(C)]
-struct AdminSnapshot {
-    size: u32,
-    abi_version: u32,
-    capabilities: u64,
-    runtime: RuntimeSnapshot,
-    memory: MemorySnapshot,
-    terminal_causes: [u64; 7],
-    dropped_telemetry: u64,
 }
 
 type Callback = unsafe extern "C" fn(*mut c_void);
@@ -93,6 +53,8 @@ struct ServiceConfig {
     callback: Option<Callback>,
     context: *mut c_void,
     reserved: u64,
+    owner_init: Option<Callback>,
+    owner_fini: Option<Callback>,
 }
 
 #[repr(C)]
@@ -127,7 +89,6 @@ struct JoinProbe {
     runtime: AtomicPtr<c_void>,
     service: AtomicPtr<c_void>,
     service_join: AtomicI32,
-    idle: AtomicI32,
     join_all: AtomicI32,
     runtime_join: AtomicI32,
     done: Mutex<bool>,
@@ -168,10 +129,6 @@ unsafe extern "C" fn self_join_callback(context: *mut c_void) {
     probe
         .service_join
         .store(unsafe { kc_service_join(service) }, Ordering::Release);
-    probe.idle.store(
-        unsafe { kc_runtime_run_until_idle(runtime) },
-        Ordering::Release,
-    );
     probe
         .join_all
         .store(unsafe { kc_runtime_join_all(runtime) }, Ordering::Release);
@@ -208,13 +165,11 @@ unsafe extern "C" fn quota_callback(context: *mut c_void) {
 unsafe extern "C" {
     fn kc_runtime_create(config: *const RuntimeConfig, out: *mut *mut c_void) -> i32;
     fn kc_runtime_start(runtime: *mut c_void) -> i32;
-    fn kc_runtime_run_until_idle(runtime: *mut c_void) -> i32;
     fn kc_runtime_join_all(runtime: *mut c_void) -> i32;
     fn kc_runtime_request_stop(runtime: *mut c_void);
     fn kc_runtime_join(runtime: *mut c_void) -> i32;
     fn kc_runtime_destroy(runtime: *mut c_void) -> i32;
     fn kc_runtime_snapshot_get(runtime: *mut c_void, out: *mut RuntimeSnapshot) -> i32;
-    fn kc_admin_snapshot_get(runtime: *mut c_void, out: *mut AdminSnapshot) -> i32;
     fn kc_service_create(
         runtime: *mut c_void,
         config: *const ServiceConfig,
@@ -240,8 +195,6 @@ fn bounded_callback_can_reschedule_its_own_ready_predicate_without_an_external_e
         size: size_of::<RuntimeConfig>() as u32,
         abi_version: ABI,
         worker_count: 2,
-        arena_segment_size: 0,
-        ticket_capacity: 1,
         reserved: 0,
     };
     let mut runtime = std::ptr::null_mut();
@@ -258,6 +211,8 @@ fn bounded_callback_can_reschedule_its_own_ready_predicate_without_an_external_e
         callback: Some(quota_callback),
         context: (&quota as *const Quota).cast_mut().cast(),
         reserved: 0,
+        owner_init: None,
+        owner_fini: None,
     };
     let mut service = std::ptr::null_mut();
     assert_eq!(
@@ -268,7 +223,7 @@ fn bounded_callback_can_reschedule_its_own_ready_predicate_without_an_external_e
     assert_eq!(unsafe { kc_service_start(service) }, 0);
     assert_eq!(unsafe { kc_runtime_start(runtime) }, 0);
     assert_eq!(unsafe { kc_service_notify(service) }, 0);
-    assert_eq!(unsafe { kc_runtime_run_until_idle(runtime) }, 0);
+    wait_for_handled(service, QUOTAS);
 
     let mut snapshot = ServiceSnapshot {
         size: size_of::<ServiceSnapshot>() as u32,
@@ -306,8 +261,6 @@ fn callback_side_service_and_runtime_joins_fail_instead_of_deadlocking() {
         size: size_of::<RuntimeConfig>() as u32,
         abi_version: ABI,
         worker_count: 1,
-        arena_segment_size: 0,
-        ticket_capacity: 1,
         reserved: 0,
     };
     let mut runtime = std::ptr::null_mut();
@@ -316,7 +269,6 @@ fn callback_side_service_and_runtime_joins_fail_instead_of_deadlocking() {
         runtime: AtomicPtr::new(runtime),
         service: AtomicPtr::new(std::ptr::null_mut()),
         service_join: AtomicI32::new(i32::MIN),
-        idle: AtomicI32::new(i32::MIN),
         join_all: AtomicI32::new(i32::MIN),
         runtime_join: AtomicI32::new(i32::MIN),
         done: Mutex::new(false),
@@ -328,6 +280,8 @@ fn callback_side_service_and_runtime_joins_fail_instead_of_deadlocking() {
         callback: Some(self_join_callback),
         context: (&probe as *const JoinProbe).cast_mut().cast(),
         reserved: 0,
+        owner_init: None,
+        owner_fini: None,
     };
     let mut service = std::ptr::null_mut();
     assert_eq!(
@@ -348,7 +302,6 @@ fn callback_side_service_and_runtime_joins_fail_instead_of_deadlocking() {
     }
     drop(done);
     assert_eq!(probe.service_join.load(Ordering::Acquire), -EDEADLK);
-    assert_eq!(probe.idle.load(Ordering::Acquire), -EDEADLK);
     assert_eq!(probe.join_all.load(Ordering::Acquire), -EDEADLK);
     assert_eq!(probe.runtime_join.load(Ordering::Acquire), -EDEADLK);
 
@@ -360,14 +313,12 @@ fn callback_side_service_and_runtime_joins_fail_instead_of_deadlocking() {
 }
 
 #[test]
-fn run_until_idle_drains_every_realtime_edge_accepted_before_return() {
+fn fixed_owner_acknowledges_each_realtime_edge() {
     kcoro_sys::link_anchor();
     let config = RuntimeConfig {
         size: size_of::<RuntimeConfig>() as u32,
         abi_version: ABI,
         worker_count: 1,
-        arena_segment_size: 0,
-        ticket_capacity: 1,
         reserved: 0,
     };
     let mut runtime = std::ptr::null_mut();
@@ -381,6 +332,8 @@ fn run_until_idle_drains_every_realtime_edge_accepted_before_return() {
         callback: Some(count_callback),
         context: (&count as *const Count).cast_mut().cast(),
         reserved: 0,
+        owner_init: None,
+        owner_fini: None,
     };
     let mut service = std::ptr::null_mut();
     assert_eq!(
@@ -394,11 +347,10 @@ fn run_until_idle_drains_every_realtime_edge_accepted_before_return() {
         0
     );
     assert_eq!(unsafe { kc_runtime_start(runtime) }, 0);
-    assert_eq!(unsafe { kc_runtime_run_until_idle(runtime) }, 0);
 
     for generation in 1..=512_u64 {
         assert_eq!(unsafe { kc_service_notifier_notify(notifier) }, 0);
-        assert_eq!(unsafe { kc_runtime_run_until_idle(runtime) }, 0);
+        wait_for_handled(service, generation);
         let snapshot = service_snapshot(service);
         assert_eq!(snapshot.notifications, generation);
         assert_eq!(snapshot.handled_notifications, generation);
@@ -428,60 +380,21 @@ fn runtime_snapshot(runtime: *mut c_void) -> RuntimeSnapshot {
     let mut snapshot = RuntimeSnapshot {
         size: size_of::<RuntimeSnapshot>() as u32,
         abi_version: ABI,
-        epoch: 0,
-        next_sequence: 0,
         active: 0,
         queued: 0,
         running: 0,
-        waiting: 0,
-        live_operations: 0,
-        live_timers: 0,
-        live_channels: 0,
-        live_scopes: 0,
-        live_tickets: 0,
-        completion_queued: 0,
-        completion_running: 0,
-        live_descriptors: 0,
-        live_regions: 0,
-        live_segments: 0,
-        reserved_bytes: 0,
+        dormant: 0,
         wake_requests: 0,
         resumes: 0,
         workers: 0,
         accepting: 0,
         started: 0,
         stop_requested: 0,
-        ticket_capacity: 0,
     };
     assert_eq!(
         unsafe { kc_runtime_snapshot_get(runtime, &mut snapshot) },
         0
     );
-    snapshot
-}
-
-fn admin_snapshot(runtime: *mut c_void) -> AdminSnapshot {
-    let runtime_snapshot = runtime_snapshot(runtime);
-    let mut snapshot = AdminSnapshot {
-        size: size_of::<AdminSnapshot>() as u32,
-        abi_version: ABI,
-        capabilities: 0,
-        runtime: runtime_snapshot,
-        memory: MemorySnapshot {
-            size: size_of::<MemorySnapshot>() as u32,
-            abi_version: ABI,
-            live_descriptors: 0,
-            live_regions: 0,
-            live_segments: 0,
-            logical_bytes: 0,
-            reserved_bytes: 0,
-            cumulative_bytes: 0,
-            reclaimed_bytes: 0,
-        },
-        terminal_causes: [0; 7],
-        dropped_telemetry: 0,
-    };
-    assert_eq!(unsafe { kc_admin_snapshot_get(runtime, &mut snapshot) }, 0);
     snapshot
 }
 
@@ -492,8 +405,6 @@ fn service_stop_and_join_do_not_stop_the_explicit_runtime() {
         size: size_of::<RuntimeConfig>() as u32,
         abi_version: ABI,
         worker_count: 1,
-        arena_segment_size: 0,
-        ticket_capacity: 1,
         reserved: 0,
     };
     let mut runtime = std::ptr::null_mut();
@@ -509,6 +420,8 @@ fn service_stop_and_join_do_not_stop_the_explicit_runtime() {
         callback: Some(service_callback),
         context: (&seen as *const Seen).cast_mut().cast(),
         reserved: 0,
+        owner_init: None,
+        owner_fini: None,
     };
     let mut service = std::ptr::null_mut();
     assert_eq!(
@@ -516,7 +429,6 @@ fn service_stop_and_join_do_not_stop_the_explicit_runtime() {
         0
     );
     assert_eq!(unsafe { kc_service_start(service) }, 0);
-    assert_eq!(unsafe { kc_runtime_run_until_idle(runtime) }, 0);
     unsafe { kc_service_request_stop(service) };
     assert_eq!(unsafe { kc_service_join(service) }, 0);
     assert_eq!(unsafe { kc_service_destroy(service) }, 0);
@@ -541,6 +453,17 @@ fn service_snapshot(service: *mut c_void) -> ServiceSnapshot {
     snapshot
 }
 
+fn wait_for_handled(service: *mut c_void, handled: u64) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while service_snapshot(service).handled_notifications < handled {
+        assert!(
+            Instant::now() < deadline,
+            "service did not acknowledge notification {handled}"
+        );
+        std::thread::yield_now();
+    }
+}
+
 #[test]
 fn retained_service_coalesces_edges_without_lost_wakes_or_concurrent_callbacks() {
     kcoro_sys::link_anchor();
@@ -548,8 +471,6 @@ fn retained_service_coalesces_edges_without_lost_wakes_or_concurrent_callbacks()
         size: size_of::<RuntimeConfig>() as u32,
         abi_version: ABI,
         worker_count: 2,
-        arena_segment_size: 0,
-        ticket_capacity: 4,
         reserved: 0,
     };
     let mut runtime = std::ptr::null_mut();
@@ -565,13 +486,15 @@ fn retained_service_coalesces_edges_without_lost_wakes_or_concurrent_callbacks()
         callback: Some(service_callback),
         context: (&seen as *const Seen).cast_mut().cast(),
         reserved: 0,
+        owner_init: None,
+        owner_fini: None,
     };
     let mut service = std::ptr::null_mut();
     assert_eq!(
         unsafe { kc_service_create(runtime, &config, &mut service) },
         0
     );
-    assert_eq!(admin_snapshot(runtime).runtime.active, 0);
+    assert_eq!(runtime_snapshot(runtime).active, 0);
 
     assert!(unsafe { kc_service_notify(service) } < 0);
     assert_eq!(unsafe { kc_service_start(service) }, 0);
@@ -581,16 +504,16 @@ fn retained_service_coalesces_edges_without_lost_wakes_or_concurrent_callbacks()
     }
     assert_eq!(unsafe { kc_runtime_start(runtime) }, 0);
     wait_for_calls(&seen, 1);
-    assert_eq!(unsafe { kc_runtime_run_until_idle(runtime) }, 0);
+    wait_for_handled(service, 16);
 
     let first = service_snapshot(service);
     assert_eq!(first.notifications, 16);
     assert_eq!(first.handled_notifications, 16);
     assert_eq!(first.callbacks, 1);
-    assert_eq!(first.run_state, WAITING);
+    assert_eq!(first.run_state, DORMANT);
     let idle = runtime_snapshot(runtime);
     assert_eq!(
-        (idle.active, idle.queued, idle.running, idle.waiting),
+        (idle.active, idle.queued, idle.running, idle.dormant),
         (1, 0, 0, 1)
     );
     std::thread::sleep(Duration::from_millis(30));
@@ -644,8 +567,6 @@ fn joining_an_unstarted_service_is_terminal_and_cannot_enable_uaf() {
         size: size_of::<RuntimeConfig>() as u32,
         abi_version: ABI,
         worker_count: 1,
-        arena_segment_size: 0,
-        ticket_capacity: 1,
         reserved: 0,
     };
     let mut runtime = std::ptr::null_mut();
@@ -660,6 +581,8 @@ fn joining_an_unstarted_service_is_terminal_and_cannot_enable_uaf() {
         callback: Some(service_callback),
         context: (&seen as *const Seen).cast_mut().cast(),
         reserved: 0,
+        owner_init: None,
+        owner_fini: None,
     };
     let mut service = std::ptr::null_mut();
     assert_eq!(
@@ -682,8 +605,6 @@ fn realtime_notifier_drains_every_accepted_edge_before_stop_retires() {
         size: size_of::<RuntimeConfig>() as u32,
         abi_version: ABI,
         worker_count: 2,
-        arena_segment_size: 0,
-        ticket_capacity: 4,
         reserved: 0,
     };
     let mut runtime = std::ptr::null_mut();
@@ -701,6 +622,8 @@ fn realtime_notifier_drains_every_accepted_edge_before_stop_retires() {
         callback: Some(service_callback),
         context: (&seen as *const Seen).cast_mut().cast(),
         reserved: 0,
+        owner_init: None,
+        owner_fini: None,
     };
     let mut service = std::ptr::null_mut();
     assert_eq!(
@@ -714,10 +637,10 @@ fn realtime_notifier_drains_every_accepted_edge_before_stop_retires() {
         0
     );
     assert_eq!(unsafe { kc_runtime_start(runtime) }, 0);
-    assert_eq!(unsafe { kc_runtime_run_until_idle(runtime) }, 0);
 
     assert_eq!(unsafe { kc_service_notifier_notify(notifier) }, 0);
     wait_for_calls(&seen, 1);
+    let before = runtime_snapshot(runtime).wake_requests;
 
     let start = Arc::new(Barrier::new(5));
     let raw = notifier as usize;
@@ -738,6 +661,12 @@ fn realtime_notifier_drains_every_accepted_edge_before_stop_retires() {
         .into_iter()
         .map(|producer| producer.join().unwrap())
         .sum::<usize>();
+    let after = runtime_snapshot(runtime).wake_requests;
+    assert_eq!(
+        after - before,
+        1,
+        "the callback-side burst and stop share one fixed-owner ready bit"
+    );
     assert!(unsafe { kc_service_notifier_notify(notifier) } < 0);
 
     {
@@ -750,6 +679,7 @@ fn realtime_notifier_drains_every_accepted_edge_before_stop_retires() {
     assert_eq!(snapshot.notifications, (accepted + 1) as u64);
     assert_eq!(snapshot.handled_notifications, snapshot.notifications);
     assert_eq!(seen.gate.lock().unwrap().maximum, 1);
+    assert_eq!(runtime_snapshot(runtime).queued, 0);
 
     /* The setup-time edge owns the callback lifetime. Even a joined service
      * cannot be freed until the device producer has quiesced and releases it. */
@@ -763,7 +693,57 @@ fn realtime_notifier_drains_every_accepted_edge_before_stop_retires() {
 #[test]
 fn realtime_notify_callgraph_and_publication_order_are_source_gated() {
     let service = include_str!("../vendor/kcoro_arena/core/src/kc_service.c");
-    let begin = service.find("static int notify_realtime").unwrap();
+    let begin = service.find("static void realtime_leave").unwrap();
+    let end = service[begin..]
+        .find("static int realtime_enter")
+        .map(|offset| begin + offset)
+        .unwrap();
+    let body = &service[begin..end];
+    for forbidden in ["KC_MUTEX", "for (;;)", "while (", "kc_port_wait"] {
+        assert!(
+            !body.contains(forbidden),
+            "final realtime publication edge contains unbounded work: {forbidden}"
+        );
+    }
+    let release = body.find("atomic_fetch_sub_explicit").unwrap();
+    let final_publisher = body.find("prior == 1").unwrap();
+    let closed = body.find("realtime_closed").unwrap();
+    let successor = body.find("kc_runtime_publish_service_internal").unwrap();
+    assert!(release < final_publisher && final_publisher < closed && closed < successor);
+
+    let begin = service.find("static int realtime_enter").unwrap();
+    let end = service[begin..]
+        .find("static int notify_realtime")
+        .map(|offset| begin + offset)
+        .unwrap();
+    let body = &service[begin..end];
+    for forbidden in [
+        "KC_MUTEX",
+        "compare_exchange",
+        "for (;;)",
+        "while (",
+        "kc_port_wait",
+    ] {
+        assert!(
+            !body.contains(forbidden),
+            "realtime admission contains unbounded work: {forbidden}"
+        );
+    }
+    let first = body.find("&service->realtime_closed").unwrap();
+    let lease = body.find("&service->realtime_publishers").unwrap();
+    let second = body[first + 1..]
+        .find("&service->realtime_closed")
+        .map(|offset| first + 1 + offset)
+        .unwrap();
+    assert!(first < lease && lease < second);
+    assert!(
+        body.matches("memory_order_seq_cst").count() >= 3,
+        "close and publisher observations must share one total order"
+    );
+
+    let begin = service
+        .find("static int notify_realtime(kc_service_t *service)\n{")
+        .unwrap();
     let end = service[begin..]
         .find("int kc_service_notifier_create")
         .map(|offset| begin + offset)
@@ -771,24 +751,63 @@ fn realtime_notify_callgraph_and_publication_order_are_source_gated() {
     let body = &service[begin..end];
     assert!(!body.contains("KC_MUTEX"));
     assert!(!body.contains("calloc"));
+    assert!(!body.contains("compare_exchange"));
+    assert!(!body.contains("for (;;)") && !body.contains("while ("));
+    let entered = body.find("realtime_enter").unwrap();
     let notified = body.find("&service->notifications").unwrap();
-    let released = body.find("&service->realtime_gate, 1").unwrap();
-    let ring = body.find("kc_runtime_ring_work_internal").unwrap();
-    assert!(notified < released && released < ring);
+    let released = body.find("realtime_leave(service, 1)").unwrap();
+    let ready = body.find("kc_runtime_publish_service_internal").unwrap();
+    assert!(entered < notified && notified < ready && ready < released);
 
     let begin = service.find("int kc_service_ready_again").unwrap();
+    let end = service[begin..]
+        .find("int kc_service_complete_current")
+        .map(|offset| begin + offset)
+        .unwrap();
+    let body = &service[begin..end];
+    assert!(!body.contains("KC_MUTEX"));
+    assert!(!body.contains("kc_runtime_ring_workers_internal"));
+    assert!(!body.contains("kc_port_wait"));
+    assert!(!body.contains("compare_exchange"));
+    assert!(!body.contains("for (;;)") && !body.contains("while ("));
+    let entered = body.find("realtime_enter").unwrap();
+    let notified = body.find("&service->notifications").unwrap();
+    let released = body.find("realtime_leave(service, 1)").unwrap();
+    let ready = body.find("kc_runtime_publish_service_internal").unwrap();
+    assert!(entered < notified && notified < ready && ready < released);
+
+    let begin = service.find("int kc_service_complete_current").unwrap();
     let end = service[begin..]
         .find("void kc_service_request_stop")
         .map(|offset| begin + offset)
         .unwrap();
     let body = &service[begin..end];
     assert!(!body.contains("KC_MUTEX"));
-    assert!(!body.contains("kc_runtime_ring_work_internal"));
-    assert!(!body.contains("kc_port_wait"));
-    let notified = body.find("&service->notifications").unwrap();
-    let ready = body.find("->wake_pending").unwrap();
-    let released = body.find("&service->realtime_gate, 1").unwrap();
-    assert!(notified < ready && ready < released);
+    assert!(!body.contains("kc_runtime_ring_workers_internal"));
+    let current = body.find("kc_runtime_is_current_cont_internal").unwrap();
+    let closed = body.find("realtime_closed").unwrap();
+    let retiring = body.find("KC_SERVICE_RETIRING").unwrap();
+    assert!(current < closed && closed < retiring);
+    assert!(body.contains("memory_order_seq_cst"));
+
+    let begin = service.find("void kc_service_request_stop").unwrap();
+    let end = service[begin..]
+        .find("int kc_service_join")
+        .map(|offset| begin + offset)
+        .unwrap();
+    let body = &service[begin..end];
+    assert!(!body.contains("KC_MUTEX"));
+    assert!(body.contains("stop_service(service)"));
+    let begin = service.find("static void stop_service").unwrap();
+    let end = service[begin..]
+        .find("int kc_service_create")
+        .map(|offset| begin + offset)
+        .unwrap();
+    let body = &service[begin..end];
+    assert!(!body.contains("KC_MUTEX"));
+    assert!(!body.contains("while (") && !body.contains("for (;;)"));
+    assert!(body.contains("compare_exchange_strong"));
+    assert!(body.find("realtime_closed").unwrap() < body.find("KC_SERVICE_RETIRING").unwrap());
 
     let runtime = include_str!("../vendor/kcoro_arena/core/src/kc_runtime.c");
     assert!(!runtime.contains("work_cv"));
@@ -798,10 +817,140 @@ fn realtime_notify_callgraph_and_publication_order_are_source_gated() {
         .map(|offset| worker + offset)
         .unwrap();
     let body = &runtime[worker..start];
+    assert!(!body.contains("KC_MUTEX"));
+    assert!(!body.contains("runtime->head"));
+    assert!(!body.contains("runtime->tail"));
     let observe = body.find("kc_doorbell_observe").unwrap();
-    let drain = body
-        .find("kc_service_runtime_drain_realtime_locked")
-        .unwrap();
-    let park = body.find("kc_doorbell_wait").unwrap();
+    let drain = body.find("ready_services").unwrap();
+    let park = body.find("kc_doorbell_park").unwrap();
     assert!(observe < drain && drain < park);
+
+    let execute = service
+        .find("void kc_service_runtime_execute_internal")
+        .unwrap();
+    let body = &service[execute..];
+    let retire = body.find("kc_runtime_retire_service_internal").unwrap();
+    let done = body.find("KORO_DONE").unwrap();
+    let signal = body.find("kc_runtime_signal_lifecycle_internal").unwrap();
+    assert!(retire < done && done < signal);
+}
+
+#[test]
+fn legacy_scheduler_and_timed_progress_surfaces_are_absent() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    for source in [
+        include_str!("../src/lib.rs"),
+        include_str!("../vendor/kcoro_arena/include/kc_runtime.h"),
+        include_str!("../vendor/kcoro_arena/core/src/kc_runtime.c"),
+    ] {
+        assert!(
+            !source.contains("kc_runtime_run_until_idle"),
+            "operation-level runtime waiter survived"
+        );
+    }
+    for path in [
+        "vendor/kcoro_arena/core/src/kc_actor.c",
+        "vendor/kcoro_arena/core/src/kc_admin.c",
+        "vendor/kcoro_arena/core/src/kc_cancel.c",
+        "vendor/kcoro_arena/core/src/kc_chan_stackless.c",
+        "vendor/kcoro_arena/core/src/kc_checkpoint.c",
+        "vendor/kcoro_arena/core/src/kc_collective.c",
+        "vendor/kcoro_arena/core/src/kc_durable.c",
+        "vendor/kcoro_arena/core/src/kc_op.c",
+        "vendor/kcoro_arena/core/src/kc_scope.c",
+        "vendor/kcoro_arena/core/src/kc_shared.c",
+        "vendor/kcoro_arena/core/src/kc_timer.c",
+        "vendor/kcoro_arena/core/src/kc_transport.c",
+        "vendor/kcoro_arena/core/src/kc_wal.c",
+        "vendor/kcoro_arena/core/src/kc_workflow.c",
+        "vendor/kcoro_arena/core/src/koro_sched_stackless.c",
+        "vendor/kcoro_arena/include/kc_actor.h",
+        "vendor/kcoro_arena/include/kc_admin.h",
+        "vendor/kcoro_arena/include/kc_cancel.h",
+        "vendor/kcoro_arena/include/kc_channel.h",
+        "vendor/kcoro_arena/include/kc_collective.h",
+        "vendor/kcoro_arena/include/kc_durable.h",
+        "vendor/kcoro_arena/include/kc_op.h",
+        "vendor/kcoro_arena/include/kc_scope.h",
+        "vendor/kcoro_arena/include/kc_shared.h",
+        "vendor/kcoro_arena/include/kc_store.h",
+        "vendor/kcoro_arena/include/kc_timer.h",
+        "vendor/kcoro_arena/include/kc_transport.h",
+        "vendor/kcoro_arena/include/kc_wal.h",
+        "vendor/kcoro_arena/include/kc_workflow.h",
+        "vendor/kcoro_arena/include/kcoro_desc.h",
+        "vendor/kcoro_arena/include/kcoro_stackless.h",
+        "vendor/kcoro_arena/include/koro_sched_stackless.h",
+        "vendor/kcoro_arena/include/kc_ticket.h",
+        "vendor/kcoro_arena/include/kc_descriptor.h",
+        "vendor/kcoro_arena/include/kc_payload.h",
+        "vendor/kcoro_arena/core/src/kc_ticket.c",
+        "vendor/kcoro_arena/core/src/kc_ticket_internal.h",
+        "vendor/kcoro_arena/core/src/kc_desc.c",
+        "vendor/kcoro_arena/core/src/kc_descriptor_internal.h",
+    ] {
+        assert!(!root.join(path).exists(), "legacy surface survived: {path}");
+    }
+    assert!(
+        !root.join("../kcoro/Cargo.toml").exists(),
+        "mutex/condvar Rust scheduler crate survived"
+    );
+    let umbrella = include_str!("../vendor/kcoro_arena/include/kcoro_arena.h");
+    assert!(!umbrella.contains("kc_doorbell.h"));
+    assert!(!umbrella.contains("kc_port.h"));
+    assert!(!umbrella.contains("kc_collective.h"));
+    assert!(!include_str!("../build.rs").contains("kc_collective.c"));
+
+    let files = [
+        include_str!("../vendor/kcoro_arena/core/src/kc_runtime.c"),
+        include_str!("../vendor/kcoro_arena/core/src/kc_runtime_internal.h"),
+        include_str!("../vendor/kcoro_arena/core/src/kc_continuation.c"),
+        include_str!("../vendor/kcoro_arena/core/src/koro_internal.h"),
+        include_str!("../vendor/kcoro_arena/include/kcoro_arena.h"),
+        include_str!("../vendor/kcoro_arena/include/kc_doorbell.h"),
+        include_str!("../vendor/kcoro_arena/core/src/kc_doorbell.c"),
+        include_str!("../vendor/kcoro_arena/include/kc_port.h"),
+        include_str!("../vendor/kcoro_arena/include/kcoro_port.h"),
+        include_str!("../vendor/kcoro_arena/port/posix.c"),
+        include_str!("../build.rs"),
+    ];
+    for source in files {
+        for forbidden in [
+            "KC_OP_TIMER",
+            "KC_OP_TIMED_OUT",
+            "KC_CAUSE_TIMEOUT",
+            "kc_runtime_timer",
+            "kc_timer_",
+            "koro_sleep",
+            "KORO_SLEEP",
+            "timer_main",
+            "live_timers",
+            "KC_COND_TIMEDWAIT_NS",
+            "kc_port_cond_timedwait",
+            "kc_port_thread_yield",
+            "kc_doorbell_wait",
+            "deadline_ns",
+            "deadline_mode",
+            "KC_TICKET_CAUSE_TIMED_OUT",
+            "KC_TICKET_DEADLINE_",
+            "KORO_WAITING",
+            "KORO_WAIT_UNTIL",
+            "KORO_YIELD",
+            "kc_runtime_default",
+            "kc_runtime_spawn",
+            "kc_runtime_legacy_break",
+            "kc_runtime_register_op",
+            "kc_runtime_register_channel",
+            "kc_runtime_register_scope",
+            "koro_sched",
+            "KORO_SEND",
+            "KORO_RECV",
+            "KORO_SELECT",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "non-causal progress surface survived: {forbidden}"
+            );
+        }
+    }
 }

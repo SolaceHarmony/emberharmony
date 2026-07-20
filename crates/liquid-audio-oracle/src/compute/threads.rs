@@ -69,7 +69,7 @@ mod tests {
     use super::*;
 
     #[test]
-        fn realtime_pipeline_types_are_send() {
+    fn realtime_pipeline_types_are_send() {
         // Feasibility probe for the worker-thread realtime pipeline (task #24): a
         // dedicated inference thread must *own* the model + processor (the Mimi decoder
         // holds a !Sync RefCell, so nothing is shared by &). This compiles iff both are

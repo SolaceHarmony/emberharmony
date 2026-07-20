@@ -32,11 +32,6 @@
 
 #include <nlohmann/json.hpp>
 
-extern "C" {
-#include "kc_atomic.h"
-#include "kc_port.h"
-}
-
 using Json = nlohmann::ordered_json;
 namespace fs = std::filesystem;
 
@@ -309,69 +304,6 @@ void build_rope_f32(size_t positions, size_t head_dim, float theta,
 
 namespace {
 
-/* Apple arm64 and Rosetta execute on the same 128-byte cache-line hardware. */
-constexpr size_t HOT_ATOMIC_BYTES = 128;
-
-struct alignas(HOT_ATOMIC_BYTES) WaitCounter {
-    uint32_t value = 0;
-};
-static_assert(alignof(WaitCounter) == HOT_ATOMIC_BYTES);
-static_assert(sizeof(WaitCounter) == HOT_ATOMIC_BYTES,
-              "execution gate counters must not share an Apple cache line");
-
-/* A fair, expected-value pass gate. The lane board intentionally executes one
- * complete pass at a time even though the SQ and per-ticket scratch have depth
- * two. The synchronous session path queues conversations at pass boundaries
- * rather than surfacing compatibility admission details. */
-struct ExecutionGate {
-    WaitCounter next;
-    WaitCounter serving;
-    kc_port_wait_word *wait = nullptr;
-
-    int prepare() {
-        if (!kc_atomic_u32_is_lock_free(&next.value) ||
-            !kc_atomic_u32_is_lock_free(&serving.value)) {
-            return -ENOTSUP;
-        }
-        return kc_port_wait_u32_prepare(&serving.value, &wait);
-    }
-
-    uint32_t acquire() {
-        const uint32_t ticket = kc_atomic_u32_fetch_add_acq_rel(&next.value, 1);
-        for (;;) {
-            const uint32_t observed = kc_atomic_u32_load_acquire(&serving.value);
-            if (observed == ticket) return ticket;
-            (void)kc_port_wait_u32(wait, observed, 0);
-        }
-    }
-
-    void release(uint32_t ticket) {
-        (void)ticket;
-        /* The release increment publishes all engine outputs before the next
-         * ticket observes its turn with an acquire load. */
-        (void)kc_atomic_u32_fetch_add_release(&serving.value, 1);
-        kc_port_wake_u32_all(wait);
-    }
-
-    ~ExecutionGate() {
-        if (wait) kc_port_wait_u32_release(wait);
-    }
-};
-
-class ExecutionClaim {
-  public:
-    explicit ExecutionClaim(ExecutionGate &gate)
-        : gate_(&gate), ticket_(gate.acquire()) {}
-    ~ExecutionClaim() { gate_->release(ticket_); }
-
-    ExecutionClaim(const ExecutionClaim &) = delete;
-    ExecutionClaim &operator=(const ExecutionClaim &) = delete;
-
-  private:
-    ExecutionGate *gate_;
-    uint32_t ticket_;
-};
-
 } // namespace
 
 struct LfmModel {
@@ -411,7 +343,6 @@ struct LfmModel {
     std::vector<LfmLayerDesc> descriptors;
     std::vector<float> depth_rope_cos;
     std::vector<float> depth_rope_sin;
-    ExecutionGate execution;
     std::mutex lifecycle;
     bool closing = false;
     std::atomic<uint32_t> conversations{0};
@@ -421,6 +352,43 @@ struct ConversationLayer {
     std::vector<uint16_t> keys;
     std::vector<uint16_t> values;
     std::vector<uint16_t> convolution;
+};
+
+enum : uint32_t {
+    ADMISSION_NONE = 0,
+    ADMISSION_PCM = 1,
+    ADMISSION_TEXT = 2,
+    ADMISSION_MIXED = 3,
+};
+
+enum : uint32_t {
+    ADMISSION_AUDIO_ENCODE = 0,
+    ADMISSION_PREFIX = 1,
+    ADMISSION_TEXT_ROWS = 2,
+    ADMISSION_AUDIO_ROWS = 3,
+    ADMISSION_ASSISTANT = 4,
+    ADMISSION_TERMINAL = 5,
+};
+
+struct ConversationAdmission {
+    LfmConversation *conversation = nullptr;
+    LfmAudioRouteHandle route{};
+    KcTicketIdV1 ticket{};
+    LfmNativeEmission *out = nullptr;
+    LfmAudioRouteNotify notify = nullptr;
+    void *notify_context = nullptr;
+    const float *pcm = nullptr;
+    size_t sample_count = 0;
+    uint64_t adapted_values = 0;
+    size_t offset = 0;
+    size_t chunk = 0;
+    uint32_t sampled = 0;
+    uint32_t kind = ADMISSION_NONE;
+    uint32_t phase = ADMISSION_TERMINAL;
+    uint64_t generation = 0;
+    int status = -EINPROGRESS;
+    bool complete = false;
+    bool initial_prefix = false;
 };
 
 struct LfmConversation {
@@ -468,6 +436,7 @@ struct LfmConversation {
     bool text_done = false;
     bool generation_active = false;
     bool generation_ended = false;
+    ConversationAdmission admission{};
     std::atomic_flag active = ATOMIC_FLAG_INIT;
 
     ~LfmConversation() {
@@ -612,6 +581,12 @@ extern "C" int lfm_mixed_turn_plan(
 
 namespace {
 
+bool same_ticket(const KcTicketIdV1 &left, const KcTicketIdV1 &right) {
+    return left.runtime_epoch == right.runtime_epoch &&
+           left.sequence == right.sequence &&
+           left.generation == right.generation && left.kind == right.kind;
+}
+
 class ConversationClaim {
   public:
     explicit ConversationClaim(LfmConversation *conversation) : conversation_(conversation) {
@@ -624,6 +599,7 @@ class ConversationClaim {
     }
 
     explicit operator bool() const { return held_; }
+    void detach() { held_ = false; }
 
   private:
     LfmConversation *conversation_ = nullptr;
@@ -800,57 +776,6 @@ int reset_memory(LfmConversation &conversation) {
     return 0;
 }
 
-int prefill_rows_claimed(LfmConversation &conversation, const uint16_t *rows,
-                         size_t element_count, uint64_t *out_position,
-                         bool sample_last = false, uint32_t *sampled = nullptr) {
-    const size_t hidden = conversation.model->hidden;
-    if (!rows || element_count == 0 || !out_position || hidden == 0 ||
-        element_count % hidden != 0) {
-        return -EINVAL;
-    }
-    const size_t row_count = element_count / hidden;
-    int status = admit_context(conversation, row_count);
-    if (status != 0) return status;
-    ExecutionClaim execution(conversation.model->execution);
-    for (size_t index = 0; index < row_count;) {
-        size_t count = 0;
-        status = lfm_context_window_prefill_chunk(
-            &conversation.window, row_count - index, LFM_PREFILL_MAX_ROWS,
-            &count);
-        if (status != 0) return status;
-        status = reserve_context(conversation, count);
-        if (status != 0) return status;
-        const bool sample = sample_last && index + count == row_count;
-        status = lfm_engine_prefill(
-            conversation.model->engine, conversation.model->plan_id,
-            conversation.prefill_workspace, nullptr, rows + index * hidden,
-            count, /* embedding_kind = provided BF16 rows */ 2,
-            conversation.states.data(), conversation.states.size(),
-            (size_t)conversation.window.position,
-            conversation.rope_cos.empty() ? nullptr
-                : conversation.rope_cos.data() +
-                      conversation.window.start * conversation.rope_half,
-            conversation.rope_sin.empty() ? nullptr
-                : conversation.rope_sin.data() +
-                      conversation.window.start * conversation.rope_half,
-            conversation.rope_cos.size() -
-                conversation.window.start * conversation.rope_half,
-            conversation.hidden.data(), conversation.hidden.size(),
-            sample ? &conversation.text_sampler : nullptr,
-            sample ? &conversation.prng : nullptr,
-            sample ? sampled : nullptr, conversation.model->lanes);
-        if (status != 0) return status;
-        for (size_t row = 0; row < count; ++row) {
-            status = commit_context(conversation);
-            if (status != 0) return status;
-        }
-        conversation.hidden_ready = true;
-        index += count;
-    }
-    *out_position = conversation.window.cursor;
-    return 0;
-}
-
 int prepare_playback_claimed(LfmConversation &conversation,
                              uint32_t sample_rate,
                              size_t *out_playback_frames) {
@@ -985,63 +910,6 @@ int prepare_pcm_claimed(LfmConversation &conversation, size_t max_sample_count,
                                     out_playback_frames);
 }
 
-int prepare_pcm_rows_claimed(LfmConversation &conversation, const float *pcm,
-                             size_t sample_count, uint32_t sample_rate,
-                             size_t *out_values) {
-    LfmModel *model = conversation.model;
-    if (!pcm || sample_count == 0 || sample_rate == 0 || !out_values) return -EINVAL;
-    if (!model->frontend || !model->conformer || !conversation.frontend_workspace ||
-        !conversation.conformer_workspace || model->sample_rate == 0 ||
-        model->mel_features == 0 || !conversation.resampler ||
-        !conversation.resampler_workspace) {
-        return -ENOTSUP;
-    }
-    if (sample_rate != conversation.prepared_rate) return -EINVAL;
-    if (sample_count > conversation.prepared_samples) return -ENOBUFS;
-
-    uint64_t adapted_values = 0;
-    const LfmAudioEncodePassV1 pass = {
-        .size = sizeof(LfmAudioEncodePassV1),
-        .abi_version = LFM_AUDIO_PASS_ABI,
-        .resampler = conversation.resampler,
-        .resampler_workspace = conversation.resampler_workspace,
-        .frontend = model->frontend,
-        .frontend_workspace = conversation.frontend_workspace,
-        .conformer = model->conformer,
-        .conformer_workspace = conversation.conformer_workspace,
-        .pcm = pcm,
-        .sample_count = sample_count,
-        .resampled = conversation.resampled.empty()
-                         ? nullptr
-                         : conversation.resampled.data(),
-        .resampled_capacity = conversation.resampled.size(),
-        .mel = conversation.mel_bf16.data(),
-        .mel_capacity = conversation.mel_bf16.size(),
-        .adapted = conversation.adapted.data(),
-        .adapted_capacity = conversation.adapted.size(),
-        .out_adapted_values = &adapted_values,
-    };
-    ExecutionClaim execution(model->execution);
-    const int status = lfm_engine_audio_encode(model->engine, model->plan_id,
-                                               &pass);
-    if (status != 0) return status;
-    if (adapted_values > std::numeric_limits<size_t>::max()) return -EOVERFLOW;
-    *out_values = (size_t)adapted_values;
-    return 0;
-}
-
-int prefill_pcm_claimed(LfmConversation &conversation, const float *pcm,
-                        size_t sample_count, uint32_t sample_rate,
-                        uint64_t *out_position, bool sample_last = false,
-                        uint32_t *sampled = nullptr) {
-    size_t values = 0;
-    const int status = prepare_pcm_rows_claimed(
-        conversation, pcm, sample_count, sample_rate, &values);
-    if (status != 0) return status;
-    return prefill_rows_claimed(conversation, conversation.adapted.data(),
-                                values, out_position, sample_last, sampled);
-}
-
 int encode_text(LfmConversation &conversation, const char *text,
                 size_t text_bytes) {
     if (!conversation.model->tokenizer || !conversation.tokenizer_workspace ||
@@ -1071,63 +939,6 @@ int encode_tokens(const LfmTokenizer *tokenizer, const char *text,
                                 tokens->size(), &count);
 }
 
-int prefill_text_ids_claimed(LfmConversation &conversation,
-                             const uint32_t *tokens, size_t token_count,
-                             bool sample_last, uint32_t *sampled) {
-    if (!tokens || token_count == 0) return -EINVAL;
-    if (std::any_of(tokens, tokens + token_count, [&](uint32_t id) {
-            return id >= conversation.model->vocab;
-        })) {
-        return -ERANGE;
-    }
-    int status = admit_context(conversation, token_count);
-    if (status != 0) return status;
-    ExecutionClaim execution(conversation.model->execution);
-    for (size_t index = 0; index < token_count;) {
-        size_t count = 0;
-        status = lfm_context_window_prefill_chunk(
-            &conversation.window, token_count - index, LFM_PREFILL_MAX_ROWS,
-            &count);
-        if (status != 0) return status;
-        status = reserve_context(conversation, count);
-        if (status != 0) return status;
-        const bool sample = sample_last && index + count == token_count;
-        status = lfm_engine_prefill(
-            conversation.model->engine, conversation.model->plan_id,
-            conversation.prefill_workspace, tokens + index, nullptr, count, 0,
-            conversation.states.data(), conversation.states.size(),
-            (size_t)conversation.window.position,
-            conversation.rope_cos.empty() ? nullptr
-                : conversation.rope_cos.data() +
-                      conversation.window.start * conversation.rope_half,
-            conversation.rope_sin.empty() ? nullptr
-                : conversation.rope_sin.data() +
-                      conversation.window.start * conversation.rope_half,
-            conversation.rope_cos.size() -
-                conversation.window.start * conversation.rope_half,
-            conversation.hidden.data(), conversation.hidden.size(),
-            sample ? &conversation.text_sampler : nullptr,
-            sample ? &conversation.prng : nullptr,
-            sample ? sampled : nullptr, conversation.model->lanes);
-        if (status != 0) return status;
-        for (size_t row = 0; row < count; ++row) {
-            status = commit_context(conversation);
-            if (status != 0) return status;
-        }
-        conversation.hidden_ready = true;
-        index += count;
-    }
-    return 0;
-}
-
-int prefill_text_claimed(LfmConversation &conversation, bool sample_last,
-                         uint32_t *sampled) {
-    return prefill_text_ids_claimed(conversation,
-                                    conversation.token_scratch.data(),
-                                    conversation.token_count,
-                                    sample_last, sampled);
-}
-
 int validate_pending_claimed(const LfmConversation &conversation) {
     if (conversation.pending_count == 0 ||
         conversation.pending_count > LFM_INPUT_MAX_IDS) {
@@ -1145,47 +956,6 @@ int validate_pending_claimed(const LfmConversation &conversation) {
         conversation.pending_kind > 1) {
         return -ERANGE;
     }
-    return 0;
-}
-
-int forward_pending_claimed(LfmConversation &conversation, bool sample,
-                            uint32_t *sampled) {
-    int status = validate_pending_claimed(conversation);
-    if (status != 0) return status;
-    status = reserve_context(conversation, 1);
-    if (status != 0) return status;
-    ExecutionClaim execution(conversation.model->execution);
-    status = lfm_engine_token_pass(
-        conversation.model->engine, conversation.model->plan_id,
-        conversation.pending_ids, conversation.pending_count,
-        conversation.pending_kind, conversation.states.data(),
-        conversation.states.size(), (size_t)conversation.window.position,
-        conversation.rope_cos.empty() ? nullptr
-            : conversation.rope_cos.data() +
-                  conversation.window.start * conversation.rope_half,
-        conversation.rope_sin.empty() ? nullptr
-            : conversation.rope_sin.data() +
-                  conversation.window.start * conversation.rope_half,
-        conversation.rope_cos.size() -
-            conversation.window.start * conversation.rope_half,
-        conversation.hidden.data(),
-        conversation.hidden.size(), nullptr, 0,
-        sample ? &conversation.text_sampler : nullptr,
-        sample ? &conversation.prng : nullptr, sample ? sampled : nullptr,
-        conversation.model->lanes, nullptr);
-    if (status != 0) return status;
-    status = commit_context(conversation);
-    if (status != 0) return status;
-    conversation.hidden_ready = true;
-    return 0;
-}
-
-int commit_pending_claimed(LfmConversation &conversation) {
-    if (conversation.pending_count == 0) return 0;
-    const int status = forward_pending_claimed(conversation, false, nullptr);
-    if (status != 0) return status;
-    conversation.pending_count = 0;
-    conversation.pending_kind = 0;
     return 0;
 }
 
@@ -1267,70 +1037,6 @@ int emit_audio_claimed(LfmConversation &conversation, const uint32_t *computed,
     return 0;
 }
 
-int next_emission_claimed(LfmConversation &conversation,
-                          LfmNativeEmission *out) {
-    clear_emission(out, conversation.window.cursor);
-    if (!conversation.generation_active || conversation.generation_ended) {
-        out->kind = LFM_NATIVE_EMISSION_FINISHED;
-        return 0;
-    }
-    if (conversation.modality == 1) {
-        uint32_t sampled = 0;
-        const int status = forward_pending_claimed(conversation, true, &sampled);
-        if (status != 0) return status;
-        conversation.pending_count = 0;
-        conversation.pending_kind = 0;
-        out->position = conversation.window.cursor;
-        return emit_text_claimed(conversation, sampled, out);
-    }
-    int status = validate_pending_claimed(conversation);
-    if (status != 0) return status;
-    status = reserve_context(conversation, 1);
-    if (status != 0) return status;
-
-    uint32_t codes[LFM_AUDIO_TOKEN_CAPACITY] = {};
-    uint32_t token_completed = 0;
-    uint32_t token_committed = 0;
-    const LfmTokenCommitRecord commit = {
-        .window = &conversation.window,
-        .expected_position = conversation.window.position,
-        .expected_start = conversation.window.start,
-        .expected_cursor = conversation.window.cursor,
-        .expected_rope_base = conversation.window.rope_base,
-        .token_committed = &token_committed,
-    };
-    {
-        ExecutionClaim execution(conversation.model->execution);
-        status = lfm_engine_audio_recurrence(
-            conversation.model->engine, conversation.model->plan_id,
-            conversation.model->depth_plan_id, conversation.pending_ids,
-            conversation.pending_count, conversation.pending_kind,
-            conversation.states.data(), conversation.states.size(),
-            (size_t)conversation.window.position,
-            conversation.rope_cos.empty() ? nullptr
-                : conversation.rope_cos.data() +
-                      conversation.window.start * conversation.rope_half,
-            conversation.rope_sin.empty() ? nullptr
-                : conversation.rope_sin.data() +
-                      conversation.window.start * conversation.rope_half,
-            conversation.rope_cos.size() -
-                conversation.window.start * conversation.rope_half,
-            conversation.hidden.data(), conversation.hidden.size(),
-            &conversation.audio_sampler, &conversation.prng, codes,
-            conversation.model->codebooks, conversation.model->lanes,
-            &commit, &token_completed);
-    }
-    if (token_committed != 0) {
-        conversation.pending_count = 0;
-        conversation.pending_kind = 0;
-        conversation.hidden_ready = true;
-        out->position = conversation.window.cursor;
-    }
-    if (status != 0) return status;
-    if (token_completed == 0 || token_committed == 0) return -EFAULT;
-    return emit_audio_claimed(conversation, codes, out);
-}
-
 int submit_next_text_emission_claimed(
     LfmConversation &conversation, LfmAudioRouteNotify notify,
     void *notify_context, LfmAudioRouteHandle *handle) {
@@ -1395,7 +1101,8 @@ int submit_next_emission_into_claimed(
     LfmAudioRouteHandle *async_handle) {
     if (!conversation.generation_active || conversation.generation_ended ||
         conversation.modality != 3 || !conversation.mimi ||
-        conversation.model->codebooks != LFM_MIMI_CODEBOOKS) {
+        conversation.model->codebooks != LFM_MIMI_CODEBOOKS || !notify ||
+        !async_handle) {
         return -EINVAL;
     }
     int status = validate_pending_claimed(conversation);
@@ -1424,49 +1131,24 @@ int submit_next_emission_into_claimed(
         bound_target.codec_pcm = conversation.codec_pcm.data();
         bound_target.codec_pcm_capacity = conversation.codec_pcm.size();
     }
-    if (async_handle) {
-        status = lfm_engine_audio_route_submit(
-            conversation.model->engine, conversation.model->plan_id,
-            conversation.model->depth_plan_id, conversation.pending_ids,
-            conversation.pending_count, conversation.pending_kind,
-            conversation.states.data(), conversation.states.size(),
-            (size_t)conversation.window.position,
-            conversation.rope_cos.empty() ? nullptr
-                : conversation.rope_cos.data() +
-                      conversation.window.start * conversation.rope_half,
-            conversation.rope_sin.empty() ? nullptr
-                : conversation.rope_sin.data() +
-                      conversation.window.start * conversation.rope_half,
-            conversation.rope_cos.size() -
-                conversation.window.start * conversation.rope_half,
-            conversation.hidden.data(), conversation.hidden.size(),
-            &conversation.audio_sampler, &conversation.prng,
-            conversation.mimi, &bound_target, &result,
-            conversation.model->lanes,
-            &commit, notify, notify_context, async_handle);
-    } else {
-        ExecutionClaim execution(conversation.model->execution);
-        status = lfm_engine_audio_route(
-            conversation.model->engine, conversation.model->plan_id,
-            conversation.model->depth_plan_id, conversation.pending_ids,
-            conversation.pending_count, conversation.pending_kind,
-            conversation.states.data(), conversation.states.size(),
-            (size_t)conversation.window.position,
-            conversation.rope_cos.empty() ? nullptr
-                : conversation.rope_cos.data() +
-                      conversation.window.start * conversation.rope_half,
-            conversation.rope_sin.empty() ? nullptr
-                : conversation.rope_sin.data() +
-                      conversation.window.start * conversation.rope_half,
-            conversation.rope_cos.size() -
-                conversation.window.start * conversation.rope_half,
-            conversation.hidden.data(), conversation.hidden.size(),
-            &conversation.audio_sampler, &conversation.prng,
-            conversation.mimi, &bound_target, &result,
-            conversation.model->lanes,
-            &commit);
-    }
-    return status;
+    return lfm_engine_audio_route_submit(
+        conversation.model->engine, conversation.model->plan_id,
+        conversation.model->depth_plan_id, conversation.pending_ids,
+        conversation.pending_count, conversation.pending_kind,
+        conversation.states.data(), conversation.states.size(),
+        (size_t)conversation.window.position,
+        conversation.rope_cos.empty() ? nullptr
+            : conversation.rope_cos.data() +
+                  conversation.window.start * conversation.rope_half,
+        conversation.rope_sin.empty() ? nullptr
+            : conversation.rope_sin.data() +
+                  conversation.window.start * conversation.rope_half,
+        conversation.rope_cos.size() -
+            conversation.window.start * conversation.rope_half,
+        conversation.hidden.data(), conversation.hidden.size(),
+        &conversation.audio_sampler, &conversation.prng, conversation.mimi,
+        &bound_target, &result, conversation.model->lanes, &commit, notify,
+        notify_context, async_handle);
 }
 
 int finish_next_emission_into_claimed(LfmConversation &conversation,
@@ -1497,15 +1179,6 @@ int finish_next_emission_into_claimed(LfmConversation &conversation,
     return 0;
 }
 
-int next_emission_into_claimed(LfmConversation &conversation,
-                               const LfmAudioRouteTarget &target,
-                               LfmNativeEmission *out, size_t *out_samples) {
-    const int status = submit_next_emission_into_claimed(
-        conversation, target, nullptr, nullptr, nullptr);
-    return finish_next_emission_into_claimed(conversation, status, out,
-                                             out_samples);
-}
-
 int begin_generation_claimed(LfmConversation &conversation, uint32_t sampled,
                              LfmNativeEmission *out) {
     conversation.modality = 1;
@@ -1530,19 +1203,232 @@ int begin_generation_claimed(LfmConversation &conversation, uint32_t sampled,
     return 0;
 }
 
-int prefill_turn_prefix_claimed(LfmConversation &conversation) {
-    const std::vector<uint32_t> &prefix = conversation.window.cursor == 0
-        ? conversation.model->initial_turn_tokens
-        : conversation.model->next_turn_tokens;
-    return prefill_text_ids_claimed(conversation, prefix.data(), prefix.size(),
-                                    false, nullptr);
+void finish_admission(ConversationAdmission &admission, int status) {
+    if (admission.complete) std::abort();
+    admission.status = status;
+    admission.phase = ADMISSION_TERMINAL;
+    admission.complete = true;
+    admission.notify(admission.notify_context);
 }
 
-int prefill_assistant_claimed(LfmConversation &conversation,
-                              uint32_t *sampled) {
-    return prefill_text_ids_claimed(
-        conversation, conversation.model->assistant_tokens.data(),
-        conversation.model->assistant_tokens.size(), true, sampled);
+int admission_preflight(ConversationAdmission &admission) {
+    LfmConversation &conversation = *admission.conversation;
+    LfmModel *model = conversation.model;
+    if (!model || model->hidden == 0) return -EINVAL;
+    if (admission.adapted_values == 0 ||
+        admission.adapted_values % model->hidden != 0) {
+        return -EINVAL;
+    }
+    const size_t rows = (size_t)(admission.adapted_values / model->hidden);
+    const std::vector<uint32_t> &prefix = conversation.window.cursor == 0
+        ? model->initial_turn_tokens
+        : model->next_turn_tokens;
+    if (admission.kind == ADMISSION_PCM) {
+        if (prefix.size() > model->max_context ||
+            rows > model->max_context - prefix.size() ||
+            model->assistant_tokens.size() >
+                model->max_context - prefix.size() - rows) {
+            return -ENOSPC;
+        }
+        return admit_context(conversation,
+                             prefix.size() + rows +
+                                 model->assistant_tokens.size());
+    }
+    if (admission.kind != ADMISSION_MIXED) return -EPROTO;
+    LfmMixedTurnPlan plan{};
+    const int status = lfm_mixed_turn_plan(
+        model->max_context, prefix.size(), conversation.token_count, rows,
+        model->assistant_tokens.size(), &plan);
+    return status == 0 ? admit_context(conversation, plan.total) : status;
+}
+
+int submit_admission_node(ConversationAdmission &admission);
+
+void continue_admission(void *context) {
+    ConversationAdmission *admission =
+        static_cast<ConversationAdmission *>(context);
+    if (!admission || !admission->conversation || admission->complete) {
+        std::abort();
+    }
+    LfmConversation &conversation = *admission->conversation;
+    int status = lfm_engine_audio_route_collect(
+        conversation.model->engine, &admission->route);
+    if (status == -EINPROGRESS) status = -EPROTO;
+    if (status != 0) {
+        finish_admission(*admission, status);
+        return;
+    }
+    if (admission->phase == ADMISSION_AUDIO_ENCODE) {
+        status = admission_preflight(*admission);
+        if (status != 0) {
+            finish_admission(*admission, status);
+            return;
+        }
+        admission->phase = ADMISSION_PREFIX;
+        admission->offset = 0;
+    } else {
+        for (size_t row = 0; row < admission->chunk; ++row) {
+            status = commit_context(conversation);
+            if (status != 0) {
+                finish_admission(*admission, status);
+                return;
+            }
+        }
+        conversation.hidden_ready = true;
+        admission->offset += admission->chunk;
+        admission->chunk = 0;
+    }
+    status = submit_admission_node(*admission);
+    if (status != 0) finish_admission(*admission, status);
+}
+
+int submit_admission_audio(ConversationAdmission &admission) {
+    LfmConversation &conversation = *admission.conversation;
+    LfmModel *model = conversation.model;
+    if (!model || !admission.pcm || admission.sample_count == 0 ||
+        !model->frontend || !model->conformer ||
+        !conversation.frontend_workspace ||
+        !conversation.conformer_workspace || !conversation.resampler ||
+        !conversation.resampler_workspace ||
+        admission.sample_count > conversation.prepared_samples) {
+        return -EINVAL;
+    }
+    const LfmAudioEncodePassV1 pass = {
+        .size = sizeof(LfmAudioEncodePassV1),
+        .abi_version = LFM_AUDIO_PASS_ABI,
+        .resampler = conversation.resampler,
+        .resampler_workspace = conversation.resampler_workspace,
+        .frontend = model->frontend,
+        .frontend_workspace = conversation.frontend_workspace,
+        .conformer = model->conformer,
+        .conformer_workspace = conversation.conformer_workspace,
+        .pcm = admission.pcm,
+        .sample_count = admission.sample_count,
+        .resampled = conversation.resampled.empty()
+                         ? nullptr
+                         : conversation.resampled.data(),
+        .resampled_capacity = conversation.resampled.size(),
+        .mel = conversation.mel_bf16.data(),
+        .mel_capacity = conversation.mel_bf16.size(),
+        .adapted = conversation.adapted.data(),
+        .adapted_capacity = conversation.adapted.size(),
+    };
+    const int status = lfm_engine_audio_encode_submit(
+        model->engine, model->plan_id, &pass, &admission.adapted_values,
+        continue_admission, &admission, &admission.route);
+    if (status == 0 && admission.ticket.sequence == 0) {
+        admission.ticket = admission.route.ticket;
+    }
+    return status;
+}
+
+int submit_admission_prefill(ConversationAdmission &admission,
+                             const uint32_t *ids,
+                             const uint16_t *provided, size_t remaining,
+                             uint32_t kind, bool sample) {
+    LfmConversation &conversation = *admission.conversation;
+    size_t count = 0;
+    int status = lfm_context_window_prefill_chunk(
+        &conversation.window, remaining, LFM_PREFILL_MAX_ROWS, &count);
+    if (status != 0) return status;
+    status = reserve_context(conversation, count);
+    if (status != 0) return status;
+    admission.chunk = count;
+    status = lfm_engine_prefill_submit(
+        conversation.model->engine, conversation.model->plan_id,
+        conversation.prefill_workspace, ids, provided, count, kind,
+        conversation.states.data(), conversation.states.size(),
+        (size_t)conversation.window.position,
+        conversation.rope_cos.empty()
+            ? nullptr
+            : conversation.rope_cos.data() +
+                  conversation.window.start * conversation.rope_half,
+        conversation.rope_sin.empty()
+            ? nullptr
+            : conversation.rope_sin.data() +
+                  conversation.window.start * conversation.rope_half,
+        conversation.rope_cos.size() -
+            conversation.window.start * conversation.rope_half,
+        conversation.hidden.data(), conversation.hidden.size(),
+        sample && count == remaining ? &conversation.text_sampler : nullptr,
+        sample && count == remaining ? &conversation.prng : nullptr,
+        sample && count == remaining ? &admission.sampled : nullptr,
+        conversation.model->lanes,
+        continue_admission, &admission, &admission.route);
+    if (status == 0 && admission.ticket.sequence == 0) {
+        admission.ticket = admission.route.ticket;
+    }
+    return status;
+}
+
+int submit_admission_node(ConversationAdmission &admission) {
+    LfmConversation &conversation = *admission.conversation;
+    LfmModel *model = conversation.model;
+    for (;;) {
+        const std::vector<uint32_t> &prefix = admission.initial_prefix
+            ? model->initial_turn_tokens
+            : model->next_turn_tokens;
+        if (admission.phase == ADMISSION_AUDIO_ENCODE) {
+            return submit_admission_audio(admission);
+        }
+        if (admission.phase == ADMISSION_PREFIX) {
+            if (admission.offset < prefix.size()) {
+                return submit_admission_prefill(
+                    admission, prefix.data() + admission.offset, nullptr,
+                    prefix.size() - admission.offset, 0, false);
+            }
+            admission.phase = admission.kind == ADMISSION_PCM
+                ? ADMISSION_AUDIO_ROWS
+                : ADMISSION_TEXT_ROWS;
+            admission.offset = 0;
+            continue;
+        }
+        if (admission.phase == ADMISSION_TEXT_ROWS) {
+            if (admission.offset < conversation.token_count) {
+                return submit_admission_prefill(
+                    admission,
+                    conversation.token_scratch.data() + admission.offset,
+                    nullptr, conversation.token_count - admission.offset, 0,
+                    false);
+            }
+            admission.phase = admission.kind == ADMISSION_TEXT
+                ? ADMISSION_ASSISTANT
+                : ADMISSION_AUDIO_ROWS;
+            admission.offset = 0;
+            continue;
+        }
+        if (admission.phase == ADMISSION_AUDIO_ROWS) {
+            const size_t rows =
+                (size_t)(admission.adapted_values / model->hidden);
+            if (admission.offset < rows) {
+                return submit_admission_prefill(
+                    admission, nullptr,
+                    conversation.adapted.data() +
+                        admission.offset * model->hidden,
+                    rows - admission.offset, 2, false);
+            }
+            admission.phase = ADMISSION_ASSISTANT;
+            admission.offset = 0;
+            continue;
+        }
+        if (admission.phase == ADMISSION_ASSISTANT) {
+            const size_t count = model->assistant_tokens.size();
+            if (admission.offset < count) {
+                const size_t remaining = count - admission.offset;
+                return submit_admission_prefill(
+                    admission,
+                    model->assistant_tokens.data() + admission.offset,
+                    nullptr, remaining, 0,
+                    remaining <= LFM_PREFILL_MAX_ROWS);
+            }
+            const int status = begin_generation_claimed(
+                conversation, admission.sampled, admission.out);
+            if (status != 0) return status;
+            finish_admission(admission, 0);
+            return 0;
+        }
+        return -EPROTO;
+    }
 }
 
 } // namespace
@@ -1562,11 +1448,52 @@ int lfm_conversation_prepare_pcm_native(LfmConversation *conversation,
                                out_playback_frames);
 }
 
-int lfm_conversation_begin_pcm_native(LfmConversation *conversation,
-                                      const float *pcm, size_t sample_count,
-                                      uint32_t sample_rate,
-                                      LfmNativeEmission *out) {
-    if (!conversation || !pcm || sample_count == 0 || sample_rate == 0 || !out) {
+static int start_admission(
+    LfmConversation *conversation, uint32_t kind, const float *pcm,
+    size_t sample_count, LfmNativeEmission *out, LfmAudioRouteNotify notify,
+    void *notify_context, LfmConversationAdmissionHandle *out_handle) {
+    if (!conversation || !out || !notify || !notify_context || !out_handle ||
+        kind == ADMISSION_NONE || kind > ADMISSION_MIXED) {
+        return -EINVAL;
+    }
+    *out_handle = {};
+    ConversationAdmission &admission = conversation->admission;
+    uint64_t generation = admission.generation + 1;
+    if (generation == 0) generation = 1;
+    admission = {};
+    admission.conversation = conversation;
+    admission.out = out;
+    admission.notify = notify;
+    admission.notify_context = notify_context;
+    admission.pcm = pcm;
+    admission.sample_count = sample_count;
+    admission.kind = kind;
+    admission.phase = kind == ADMISSION_TEXT
+        ? ADMISSION_PREFIX
+        : ADMISSION_AUDIO_ENCODE;
+    admission.generation = generation;
+    admission.status = -EINPROGRESS;
+    admission.initial_prefix = conversation->window.cursor == 0;
+    clear_emission(out, conversation->window.cursor);
+    const int status = submit_admission_node(admission);
+    if (status != 0) {
+        admission = {};
+        admission.generation = generation;
+        return status;
+    }
+    out_handle->record = &admission;
+    out_handle->generation = generation;
+    out_handle->ticket = admission.ticket;
+    return 0;
+}
+
+int lfm_conversation_begin_pcm_submit_native(
+    LfmConversation *conversation, const float *pcm, size_t sample_count,
+    uint32_t sample_rate, LfmNativeEmission *out,
+    LfmAudioRouteNotify notify, void *notify_context,
+    LfmConversationAdmissionHandle *out_handle) {
+    if (!conversation || !pcm || sample_count == 0 || sample_rate == 0 ||
+        !out || !notify || !notify_context || !out_handle) {
         return -EINVAL;
     }
     ConversationClaim claim(conversation);
@@ -1581,42 +1508,25 @@ int lfm_conversation_begin_pcm_native(LfmConversation *conversation,
     if (conversation->generation_active && !conversation->generation_ended) {
         return -EALREADY;
     }
-    size_t adapted_values = 0;
-    int status = prepare_pcm_rows_claimed(*conversation, pcm, sample_count,
-                                          sample_rate, &adapted_values);
-    if (status != 0) return status;
-    const size_t rows = adapted_values / model->hidden;
-    const std::vector<uint32_t> &prefix = conversation->window.cursor == 0
-        ? model->initial_turn_tokens
-        : model->next_turn_tokens;
-    if (prefix.size() > model->max_context ||
-        rows > model->max_context - prefix.size() ||
-        model->assistant_tokens.size() >
-            model->max_context - prefix.size() - rows) {
-        return -ENOSPC;
+    if (sample_rate != conversation->prepared_rate ||
+        sample_count > conversation->prepared_samples) {
+        return -EINVAL;
     }
-    status = admit_context(*conversation,
-                           prefix.size() + rows +
-                               model->assistant_tokens.size());
-    if (status != 0) return status;
-
-    status = prefill_turn_prefix_claimed(*conversation);
-    if (status != 0) return status;
-    uint64_t position = conversation->window.cursor;
-    status = prefill_rows_claimed(*conversation, conversation->adapted.data(),
-                                  adapted_values, &position);
-    if (status != 0) return status;
-
-    uint32_t sampled = 0;
-    status = prefill_assistant_claimed(*conversation, &sampled);
-    if (status != 0) return status;
-    return begin_generation_claimed(*conversation, sampled, out);
+    const int status = start_admission(
+        conversation, ADMISSION_PCM, pcm, sample_count, out, notify,
+        notify_context, out_handle);
+    if (status == 0) claim.detach();
+    return status;
 }
 
-int lfm_conversation_begin_text_native(LfmConversation *conversation,
-                                       const char *text, size_t text_bytes,
-                                       LfmNativeEmission *out) {
-    if (!conversation || !text || text_bytes == 0 || !out) return -EINVAL;
+int lfm_conversation_begin_text_submit_native(
+    LfmConversation *conversation, const char *text, size_t text_bytes,
+    LfmNativeEmission *out, LfmAudioRouteNotify notify,
+    void *notify_context, LfmConversationAdmissionHandle *out_handle) {
+    if (!conversation || !text || text_bytes == 0 || !out || !notify ||
+        !notify_context || !out_handle) {
+        return -EINVAL;
+    }
     ConversationClaim claim(conversation);
     if (!claim) return -EBUSY;
     LfmModel *model = conversation->model;
@@ -1641,26 +1551,23 @@ int lfm_conversation_begin_text_native(LfmConversation *conversation,
             model->max_context - prefix.size() - text_tokens) {
         return -ENOSPC;
     }
-    status = admit_context(*conversation,
-                           prefix.size() + text_tokens +
-                               model->assistant_tokens.size());
+    status = admit_context(*conversation, prefix.size() + text_tokens +
+                                              model->assistant_tokens.size());
     if (status != 0) return status;
-    status = prefill_turn_prefix_claimed(*conversation);
-    if (status != 0) return status;
-    status = prefill_text_claimed(*conversation, false, nullptr);
-    if (status != 0) return status;
-    uint32_t sampled = 0;
-    status = prefill_assistant_claimed(*conversation, &sampled);
-    if (status != 0) return status;
-    return begin_generation_claimed(*conversation, sampled, out);
+    status = start_admission(conversation, ADMISSION_TEXT, nullptr, 0, out,
+                             notify, notify_context, out_handle);
+    if (status == 0) claim.detach();
+    return status;
 }
 
-int lfm_conversation_begin_mixed_native(
+int lfm_conversation_begin_mixed_submit_native(
     LfmConversation *conversation, const char *text, size_t text_bytes,
     const float *pcm, size_t sample_count, uint32_t sample_rate,
-    LfmNativeEmission *out) {
+    LfmNativeEmission *out, LfmAudioRouteNotify notify,
+    void *notify_context, LfmConversationAdmissionHandle *out_handle) {
     if (!conversation || !text || text_bytes == 0 || !pcm ||
-        sample_count == 0 || sample_rate == 0 || !out) {
+        sample_count == 0 || sample_rate == 0 || !out || !notify ||
+        !notify_context || !out_handle) {
         return -EINVAL;
     }
     ConversationClaim claim(conversation);
@@ -1676,50 +1583,38 @@ int lfm_conversation_begin_mixed_native(
         return -EALREADY;
     }
 
+    if (sample_rate != conversation->prepared_rate ||
+        sample_count > conversation->prepared_samples) {
+        return -EINVAL;
+    }
     int status = encode_text(*conversation, text, text_bytes);
     if (status != 0) return status;
     const size_t text_tokens = conversation->token_count;
     if (text_tokens == 0) return -EINVAL;
 
-    size_t adapted_values = 0;
-    status = prepare_pcm_rows_claimed(*conversation, pcm, sample_count,
-                                      sample_rate, &adapted_values);
-    if (status != 0) return status;
-    if (adapted_values == 0 || adapted_values % model->hidden != 0) {
-        return -EINVAL;
-    }
-    const size_t rows = adapted_values / model->hidden;
-    const std::vector<uint32_t> &prefix = conversation->window.cursor == 0
-        ? model->initial_turn_tokens
-        : model->next_turn_tokens;
-    LfmMixedTurnPlan plan{};
-    status = lfm_mixed_turn_plan(
-        model->max_context, prefix.size(), text_tokens, rows,
-        model->assistant_tokens.size(), &plan);
-    if (status != 0) return status;
-    status = admit_context(*conversation, plan.total);
-    if (status != 0) return status;
-
-    status = prefill_turn_prefix_claimed(*conversation);
-    if (status != 0) return status;
-    status = prefill_text_claimed(*conversation, false, nullptr);
-    if (status != 0) return status;
-    uint64_t position = conversation->window.cursor;
-    status = prefill_rows_claimed(*conversation, conversation->adapted.data(),
-                                  adapted_values, &position);
-    if (status != 0) return status;
-    uint32_t sampled = 0;
-    status = prefill_assistant_claimed(*conversation, &sampled);
-    if (status != 0) return status;
-    return begin_generation_claimed(*conversation, sampled, out);
+    status = start_admission(conversation, ADMISSION_MIXED, pcm, sample_count,
+                             out, notify, notify_context, out_handle);
+    if (status == 0) claim.detach();
+    return status;
 }
 
-int lfm_conversation_next_native(LfmConversation *conversation,
-                                 LfmNativeEmission *out) {
-    if (!conversation || !out) return -EINVAL;
-    ConversationClaim claim(conversation);
-    if (!claim) return -EBUSY;
-    return next_emission_claimed(*conversation, out);
+int lfm_conversation_begin_collect_native(
+    LfmConversation *conversation, LfmConversationAdmissionHandle *handle) {
+    if (!conversation || !handle || handle->record != &conversation->admission ||
+        handle->generation == 0 ||
+        handle->generation != conversation->admission.generation ||
+        !same_ticket(handle->ticket, conversation->admission.ticket)) {
+        return -ESTALE;
+    }
+    ConversationAdmission &admission = conversation->admission;
+    if (!admission.complete) return -EINPROGRESS;
+    const int status = admission.status;
+    const uint64_t generation = admission.generation;
+    admission = {};
+    admission.generation = generation;
+    *handle = {};
+    conversation->active.clear(std::memory_order_release);
+    return status;
 }
 
 int lfm_conversation_next_requires_playback_native(
@@ -1731,16 +1626,6 @@ int lfm_conversation_next_requires_playback_native(
         return 0;
     }
     return conversation->modality == 3 ? 1 : 0;
-}
-
-int lfm_conversation_next_into_native(
-    LfmConversation *conversation, const LfmAudioRouteTarget *target,
-    LfmNativeEmission *out, size_t *out_samples) {
-    if (!conversation || !target || !out || !out_samples) return -EINVAL;
-    ConversationClaim claim(conversation);
-    if (!claim) return -EBUSY;
-    return next_emission_into_claimed(*conversation, *target, out,
-                                      out_samples);
 }
 
 int lfm_conversation_next_submit_native(
@@ -1800,8 +1685,13 @@ int lfm_conversation_next_into_collect_native(
     return finish;
 }
 
-int lfm_conversation_interrupt_native(LfmConversation *conversation) {
-    if (!conversation) return -EINVAL;
+int lfm_conversation_interrupt_submit_native(
+    LfmConversation *conversation, LfmAudioRouteNotify notify,
+    void *notify_context, LfmAudioRouteHandle *out_handle) {
+    if (!conversation || !notify || !notify_context || !out_handle) {
+        return -EINVAL;
+    }
+    *out_handle = {};
     ConversationClaim claim(conversation);
     if (!claim) return -EBUSY;
     /* An emission is published before it becomes the input to the following
@@ -1810,113 +1700,77 @@ int lfm_conversation_interrupt_native(LfmConversation *conversation) {
      * performs no sampling and publishes nothing. This also commits the
      * recurrence-only EOAudio code tuple; im_end is terminal and is never put
      * in pending_ids by emit_text_claimed. */
-    const int status = commit_pending_claimed(*conversation);
-    if (status != 0) return status;
-    conversation->generation_active = false;
-    conversation->generation_ended = true;
-    return 0;
-}
-
-/* Private implementation-backed test seams. They are intentionally absent
- * from every product and transitional header. */
-extern "C" int lfm_internal_conversation_interrupt_for_test(
-    LfmConversation *conversation) {
-    return lfm_conversation_interrupt_native(conversation);
-}
-
-extern "C" int lfm_internal_conversation_stage_pending_for_test(
-    LfmConversation *conversation, const uint32_t *ids, size_t id_count,
-    uint32_t embedding_kind) {
-    if (!conversation || !ids || id_count == 0 ||
-        id_count > LFM_INPUT_MAX_IDS || embedding_kind > 1) {
-        return -EINVAL;
-    }
-    ConversationClaim claim(conversation);
-    if (!claim) return -EBUSY;
-    if (conversation->pending_count != 0 || conversation->generation_active) {
-        return -EALREADY;
-    }
-    if ((embedding_kind == 0 &&
-         (id_count != 1 || ids[0] >= conversation->model->vocab)) ||
-        (embedding_kind == 1 &&
-         std::any_of(ids, ids + id_count, [&](uint32_t id) {
-             return id >= conversation->model->audio_rows;
-         }))) {
-        return -ERANGE;
-    }
-    std::copy(ids, ids + id_count, conversation->pending_ids);
-    conversation->pending_count = (uint32_t)id_count;
-    conversation->pending_kind = embedding_kind;
-    conversation->generation_active = true;
-    conversation->generation_ended = false;
-    return 0;
-}
-
-extern "C" int lfm_internal_conversation_cache_digest_for_test(
-    LfmConversation *conversation, uint64_t *out) {
-    if (!conversation || !out) return -EINVAL;
-    ConversationClaim claim(conversation);
-    if (!claim) return -EBUSY;
-    uint64_t digest = UINT64_C(14695981039346656037);
-    const auto append = [&](const void *data, size_t bytes) {
-        const uint8_t *source = static_cast<const uint8_t *>(data);
-        for (size_t index = 0; index < bytes; ++index) {
-            digest ^= source[index];
-            digest *= UINT64_C(1099511628211);
+    int status = 0;
+    std::memset(&conversation->audio_route, 0,
+                sizeof(conversation->audio_route));
+    if (conversation->pending_count == 0) {
+        status = lfm_engine_control_route_submit(
+            conversation->model->engine, notify, notify_context, out_handle);
+    } else {
+        status = validate_pending_claimed(*conversation);
+        if (status == 0) status = reserve_context(*conversation, 1);
+        if (status == 0) {
+            LfmTokenCommitRecord commit = {
+                .window = &conversation->window,
+                .expected_position = conversation->window.position,
+                .expected_start = conversation->window.start,
+                .expected_cursor = conversation->window.cursor,
+                .expected_rope_base = conversation->window.rope_base,
+                .token_committed =
+                    &conversation->audio_route.token_committed,
+            };
+            status = lfm_engine_token_commit_route_submit(
+                conversation->model->engine, conversation->model->plan_id,
+                conversation->pending_ids, conversation->pending_count,
+                conversation->pending_kind, conversation->states.data(),
+                conversation->states.size(),
+                (size_t)conversation->window.position,
+                conversation->rope_cos.empty()
+                    ? nullptr
+                    : conversation->rope_cos.data() +
+                          conversation->window.start *
+                              conversation->rope_half,
+                conversation->rope_sin.empty()
+                    ? nullptr
+                    : conversation->rope_sin.data() +
+                          conversation->window.start *
+                              conversation->rope_half,
+                conversation->rope_cos.size() -
+                    conversation->window.start * conversation->rope_half,
+                conversation->hidden.data(), conversation->hidden.size(),
+                conversation->model->lanes, &commit,
+                &conversation->audio_route.token_completed, notify,
+                notify_context, out_handle);
         }
-    };
-    append(&conversation->window, sizeof(conversation->window));
-    for (const ConversationLayer &layer : conversation->memory) {
-        const size_t key_bytes = layer.keys.size() * sizeof(uint16_t);
-        const size_t value_bytes = layer.values.size() * sizeof(uint16_t);
-        const size_t convolution_bytes =
-            layer.convolution.size() * sizeof(uint16_t);
-        append(&key_bytes, sizeof(key_bytes));
-        append(layer.keys.data(), key_bytes);
-        append(&value_bytes, sizeof(value_bytes));
-        append(layer.values.data(), value_bytes);
-        append(&convolution_bytes, sizeof(convolution_bytes));
-        append(layer.convolution.data(), convolution_bytes);
     }
-    const size_t hidden_bytes = conversation->hidden.size() * sizeof(uint16_t);
-    append(&hidden_bytes, sizeof(hidden_bytes));
-    append(conversation->hidden.data(), hidden_bytes);
-    *out = digest;
-    return 0;
+    if (status == 0) claim.detach();
+    return status;
 }
 
-extern "C" int lfm_internal_conversation_prng_digest_for_test(
-    LfmConversation *conversation, uint64_t *out) {
-    if (!conversation || !out) return -EINVAL;
-    ConversationClaim claim(conversation);
-    if (!claim) return -EBUSY;
-    uint64_t digest = UINT64_C(14695981039346656037);
-    const uint8_t *bytes =
-        reinterpret_cast<const uint8_t *>(&conversation->prng);
-    for (size_t index = 0; index < sizeof(conversation->prng); ++index) {
-        digest ^= bytes[index];
-        digest *= UINT64_C(1099511628211);
+int lfm_conversation_interrupt_collect_native(
+    LfmConversation *conversation, LfmAudioRouteHandle *handle) {
+    if (!conversation || !handle) return -EINVAL;
+    const int status = lfm_engine_audio_route_collect(
+        conversation->model->engine, handle);
+    if (status == -EINPROGRESS) return status;
+    if (handle->record != nullptr) return status;
+    int result = status;
+    if (result == 0 && conversation->pending_count != 0) {
+        if (conversation->audio_route.token_completed == 0 ||
+            conversation->audio_route.token_committed == 0) {
+            result = -EFAULT;
+        } else {
+            conversation->pending_count = 0;
+            conversation->pending_kind = 0;
+            conversation->hidden_ready = true;
+        }
     }
-    *out = digest;
-    return 0;
-}
-
-int lfm_conversation_decode_native(LfmConversation *conversation,
-                                   const uint32_t *codes, size_t code_count,
-                                   float *pcm, size_t pcm_capacity,
-                                   size_t *out_samples) {
-    if (!conversation || !codes || !pcm || !out_samples ||
-        code_count != LFM_MIMI_CODEBOOKS ||
-        pcm_capacity < LFM_MIMI_PCM_CAPACITY) {
-        return -EINVAL;
+    if (result == 0) {
+        conversation->generation_active = false;
+        conversation->generation_ended = true;
     }
-    ConversationClaim claim(conversation);
-    if (!claim) return -EBUSY;
-    if (!conversation->mimi) return -ENOTSUP;
-    ExecutionClaim execution(conversation->model->execution);
-    return lfm_engine_mimi_decode(
-        conversation->model->engine, conversation->model->plan_id,
-        conversation->mimi, codes, code_count, pcm, pcm_capacity, out_samples);
+    conversation->active.clear(std::memory_order_release);
+    return result;
 }
 
 int lfm_conversation_belongs_to(const LfmConversation *conversation,
@@ -2452,8 +2306,6 @@ extern "C" int lfm_model_open(void *engine, const char *path, LfmModel **out,
         model->descriptors = std::move(descriptors);
         model->depth_rope_cos = std::move(depth_rope_cos);
         model->depth_rope_sin = std::move(depth_rope_sin);
-        status = model->execution.prepare();
-        if (status != 0) fail(status, "cannot prepare the native model pass gate");
         model->load_ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
                              std::chrono::steady_clock::now() - load_started)
                              .count();
@@ -2635,183 +2487,6 @@ extern "C" int lfm_conversation_create(LfmModel *model,
         set_error(error, error_length, exception.what());
         return -EINVAL;
     }
-}
-
-extern "C" int lfm_conversation_step(LfmConversation *conversation,
-                                      const uint32_t *ids, size_t id_count,
-                                      uint32_t embedding_kind,
-                                      LfmTokenResultV1 *out) {
-    if (!conversation || !ids || id_count == 0 || id_count > 8 || !out ||
-        out->size < sizeof(*out) || out->abi_version != LFM_MODEL_ABI_VERSION ||
-        embedding_kind > 1) {
-        return -EINVAL;
-    }
-    ConversationClaim claim(conversation);
-    if (!claim) return -EBUSY;
-    if ((embedding_kind == 0 && (id_count != 1 || ids[0] >= conversation->model->vocab)) ||
-        (embedding_kind == 1 &&
-         std::any_of(ids, ids + id_count, [&](uint32_t id) {
-             return id >= conversation->model->audio_rows;
-         }))) {
-        return -ERANGE;
-    }
-    int status = reserve_context(*conversation, 1);
-    if (status != 0) return status;
-    uint32_t token = 0;
-    ExecutionClaim execution(conversation->model->execution);
-    status = lfm_engine_token_pass(
-        conversation->model->engine, conversation->model->plan_id,
-        ids, id_count, embedding_kind, conversation->states.data(),
-        conversation->states.size(), (size_t)conversation->window.position,
-        conversation->rope_cos.empty() ? nullptr
-            : conversation->rope_cos.data() +
-                  conversation->window.start * conversation->rope_half,
-        conversation->rope_sin.empty() ? nullptr
-            : conversation->rope_sin.data() +
-                  conversation->window.start * conversation->rope_half,
-        conversation->rope_cos.size() -
-            conversation->window.start * conversation->rope_half,
-        conversation->hidden.data(),
-        conversation->hidden.size(), nullptr, 0, &conversation->text_sampler,
-        &conversation->prng, &token, conversation->model->lanes, nullptr);
-    if (status != 0) return status;
-    const uint64_t completed_position = conversation->window.cursor;
-    status = commit_context(*conversation);
-    if (status != 0) return status;
-    conversation->hidden_ready = true;
-    *out = {
-        .size = sizeof(*out),
-        .abi_version = LFM_MODEL_ABI_VERSION,
-        .position = completed_position,
-        .sampled_token = token,
-        .input_count = (uint32_t)id_count,
-        .embedding_kind = embedding_kind,
-        .flags = 0,
-        .reserved = {},
-    };
-    return 0;
-}
-
-extern "C" int lfm_conversation_prefill(LfmConversation *conversation,
-                                          const LfmInputV1 *inputs,
-                                          size_t input_count,
-                                          uint64_t *out_position) {
-    if (!conversation || !inputs || input_count == 0 || !out_position) return -EINVAL;
-    ConversationClaim claim(conversation);
-    if (!claim) return -EBUSY;
-    for (size_t index = 0; index < input_count; ++index) {
-        const LfmInputV1 &input = inputs[index];
-        if (input.size < sizeof(input) ||
-            input.abi_version != LFM_MODEL_ABI_VERSION ||
-            input.embedding_kind > 1 || input.id_count == 0 ||
-            input.id_count > LFM_INPUT_MAX_IDS ||
-            (input.embedding_kind == 0 && input.id_count != 1)) {
-            return -EINVAL;
-        }
-        if ((input.embedding_kind == 0 &&
-             input.ids[0] >= conversation->model->vocab) ||
-            (input.embedding_kind == 1 &&
-             std::any_of(input.ids, input.ids + input.id_count,
-                         [&](uint32_t id) {
-                             return id >= conversation->model->audio_rows;
-                         }))) {
-            return -ERANGE;
-        }
-    }
-    int status = admit_context(*conversation, input_count);
-    if (status != 0) return status;
-    for (size_t index = 0; index < input_count; ++index) {
-        const LfmInputV1 &input = inputs[index];
-        status = reserve_context(*conversation, 1);
-        if (status != 0) return status;
-        ExecutionClaim execution(conversation->model->execution);
-        status = lfm_engine_token_pass(
-            conversation->model->engine, conversation->model->plan_id,
-            input.ids, input.id_count, input.embedding_kind,
-            conversation->states.data(), conversation->states.size(),
-            (size_t)conversation->window.position,
-            conversation->rope_cos.empty() ? nullptr
-                : conversation->rope_cos.data() +
-                      conversation->window.start * conversation->rope_half,
-            conversation->rope_sin.empty() ? nullptr
-                : conversation->rope_sin.data() +
-                      conversation->window.start * conversation->rope_half,
-            conversation->rope_cos.size() -
-                conversation->window.start * conversation->rope_half,
-            conversation->hidden.data(),
-            conversation->hidden.size(), nullptr, 0, nullptr, nullptr, nullptr,
-            conversation->model->lanes, nullptr);
-        if (status != 0) return status;
-        status = commit_context(*conversation);
-        if (status != 0) return status;
-        conversation->hidden_ready = true;
-    }
-    *out_position = conversation->window.cursor;
-    return 0;
-}
-
-// Native audio-in prefill: prefill a flat continuous-embedding plane (the
-// Conformer/adapter output, `[row_count, model.hidden]` bf16) into KV, one native
-// token pass per row via the provided-embedding path (`embed_kind == 2`). C++
-// owns the geometry: callers provide only the actual element count. `rows` is a
-// borrowed VIEW into the caller's buffer — no payload crosses the ABI, and the
-// backbone reads it in place, exactly as the discrete-id prefill loops. Same
-// sequential-per-position shape as `lfm_conversation_prefill`.
-extern "C" int lfm_conversation_prefill_audio(LfmConversation *conversation,
-                                              const uint16_t *rows, size_t element_count,
-                                              uint64_t *out_position) {
-    if (!conversation || !rows || element_count == 0 || !out_position) return -EINVAL;
-    ConversationClaim claim(conversation);
-    if (!claim) return -EBUSY;
-    return prefill_rows_claimed(*conversation, rows, element_count, out_position);
-}
-
-extern "C" int lfm_conversation_prefill_pcm_f32(
-    LfmConversation *conversation, const float *pcm, size_t sample_count,
-    uint32_t sample_rate, uint64_t *out_position) {
-    if (!conversation || !pcm || sample_count == 0 || sample_rate == 0 ||
-        !out_position) {
-        return -EINVAL;
-    }
-    ConversationClaim claim(conversation);
-    if (!claim) return -EBUSY;
-    return prefill_pcm_claimed(*conversation, pcm, sample_count, sample_rate,
-                               out_position);
-}
-
-extern "C" int lfm_conversation_audio_frame(LfmConversation *conversation,
-                                              LfmAudioResultV1 *out) {
-    if (!conversation || !out || out->size < sizeof(*out) ||
-        out->abi_version != LFM_MODEL_ABI_VERSION) {
-        return -EINVAL;
-    }
-    ConversationClaim claim(conversation);
-    if (!claim) return -EBUSY;
-    if (!conversation->hidden_ready) return -ENODATA;
-    if (conversation->model->depth_plan_id == 0 ||
-        conversation->model->codebooks == 0 ||
-        conversation->model->codebooks > LFM_AUDIO_TOKEN_CAPACITY) {
-        return -ENOTSUP;
-    }
-    uint32_t tokens[LFM_AUDIO_TOKEN_CAPACITY] = {};
-    ExecutionClaim execution(conversation->model->execution);
-    const int status = lfm_engine_depth_frame(
-        conversation->model->engine, conversation->model->depth_plan_id,
-        conversation->hidden.data(), conversation->hidden.size(),
-        &conversation->audio_sampler, &conversation->prng, tokens,
-        conversation->model->codebooks);
-    if (status != 0) return status;
-    *out = {
-        .size = sizeof(*out),
-        .abi_version = LFM_MODEL_ABI_VERSION,
-        .source_position = conversation->window.cursor - 1,
-        .token_count = conversation->model->codebooks,
-        .flags = 0,
-        .tokens = {},
-        .reserved = {},
-    };
-    std::copy(tokens, tokens + conversation->model->codebooks, out->tokens);
-    return 0;
 }
 
 extern "C" int lfm_conversation_reset(LfmConversation *conversation) {

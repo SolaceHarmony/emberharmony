@@ -150,7 +150,7 @@ typedef enum LfmObserverLevelV1 {
 } LfmObserverLevelV1;
 
 typedef enum LfmServiceClassV1 {
-    LFM_SERVICE_DEADLINE = 1,
+    LFM_SERVICE_REALTIME = 1,
     LFM_SERVICE_INTERACTIVE = 2,
     LFM_SERVICE_BACKGROUND = 3
 } LfmServiceClassV1;
@@ -246,24 +246,24 @@ typedef struct LfmKernelSnapshotV1 {
     uint32_t total_lanes;
     uint32_t command_depth;
     uint32_t completion_depth;
-    uint32_t ready_deadline;
+    uint32_t ready_realtime;
     uint32_t ready_interactive;
     uint32_t ready_background;
     uint32_t active_service_class;
     uint32_t consecutive_passes;
     uint32_t reserved0;
-    uint64_t quantum_remaining_ns;
-    uint64_t active_pass_budget_ns;
+    uint64_t quantum_remaining_passes;
+    uint64_t active_pass_budget_generations;
     uint64_t longest_pass_ns;
-    uint64_t deadline_deferrals;
-    uint64_t deadline_misses;
+    uint64_t realtime_deferrals;
+    uint64_t reserved1;
     uint32_t ticket_capacity;
     uint32_t ticket_high_water;
     uint64_t coordination_wakes;
     uint64_t dispatch_wake_calls;
-    uint64_t fence_wake_calls;
-    uint64_t logical_fence_waiters;
-    uint64_t spurious_wait_returns;
+    uint64_t team_generations;
+    uint64_t completion_callbacks;
+    uint64_t reserved2;
     uint64_t dropped_telemetry;
 } LfmKernelSnapshotV1;
 ```

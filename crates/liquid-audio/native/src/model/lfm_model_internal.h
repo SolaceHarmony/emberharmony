@@ -1,11 +1,71 @@
 #ifndef LFM_MODEL_INTERNAL_H
 #define LFM_MODEL_INTERNAL_H
 
-#include "lfm_model_legacy.h"
 #include "lfm_model_plan.h"
+#include "lfm_runtime.h"
+#include "lfm_visibility.h"
 
 #include <stddef.h>
 #include <stdint.h>
+
+/* Private native owner ABI. These are lifecycle/configuration records used
+ * only between the opaque product runtime and the native model owner. They do
+ * not expose numerical operations, activations, or checkpoint views. */
+#define LFM_MODEL_CAP_DEPTHFORMER 1u
+#define LFM_MODEL_CAP_FRONTEND 2u
+#define LFM_MODEL_CAP_CONFORMER 4u
+#define LFM_MODEL_CAP_MIMI 8u
+#define LFM_INPUT_MAX_IDS 8u
+#define LFM_AUDIO_TOKEN_CAPACITY 64u
+
+typedef struct LfmConversationConfigV1 {
+    uint32_t size;
+    uint32_t abi_version;
+    uint32_t flags;
+    uint32_t reserved0;
+    uint64_t seed;
+    LfmSamplerConfigV1 text_sampler;
+    LfmSamplerConfigV1 audio_sampler;
+    uint64_t reserved[4];
+} LfmConversationConfigV1;
+
+typedef struct LfmModelInfoV1 {
+    uint32_t size;
+    uint32_t abi_version;
+    uint64_t resident_bytes;
+    uint64_t plan_id;
+    uint64_t depth_plan_id;
+    uint32_t hidden;
+    uint32_t ffn;
+    uint32_t layers;
+    uint32_t vocab;
+    uint32_t max_context;
+    uint32_t codebooks;
+    uint32_t capabilities;
+    uint32_t reserved[5];
+} LfmModelInfoV1;
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+LFM_ORACLE_API int lfm_model_open(void *engine, const char *path,
+                                  LfmModel **out, char *error,
+                                  size_t error_length);
+LFM_ORACLE_API int lfm_model_close(LfmModel *model);
+LFM_ORACLE_API int lfm_model_info(const LfmModel *model,
+                                  LfmModelInfoV1 *out);
+LFM_ORACLE_API int lfm_model_memory(const LfmModel *model,
+                                    LfmModelMemoryV1 *out);
+LFM_ORACLE_API int lfm_conversation_create(
+    LfmModel *model, const LfmConversationConfigV1 *config,
+    LfmConversation **out, char *error, size_t error_length);
+LFM_ORACLE_API int lfm_conversation_reset(LfmConversation *conversation);
+LFM_ORACLE_API int lfm_conversation_close(LfmConversation *conversation);
+
+#ifdef __cplusplus
+} /* extern "C" */
+#endif
 
 enum LfmNativeEmissionKind : uint32_t {
     LFM_NATIVE_EMISSION_NONE = 0,
@@ -44,6 +104,16 @@ struct LfmMixedTurnPlan {
     size_t total;
 };
 
+/* Private workflow identity for one retained conversation admission. The
+ * record is conversation-owned; `ticket` is the first workflow ticket and
+ * remains the external correlation identity while child pass tickets advance
+ * the state machine. */
+struct LfmConversationAdmissionHandle {
+    void *record;
+    uint64_t generation;
+    KcTicketIdV1 ticket;
+};
+
 extern "C" int lfm_context_window_reserve(LfmContextWindowState *window,
                                            size_t needed,
                                            LfmContextWindowMove *move);
@@ -70,24 +140,24 @@ extern "C" LFM_INTERNAL_API int lfm_native_emission_needs_pcm(
 LFM_INTERNAL_API int lfm_conversation_prepare_pcm_native(
     LfmConversation *conversation, size_t max_sample_count,
     uint32_t sample_rate, size_t *out_playback_frames);
-LFM_INTERNAL_API int lfm_conversation_begin_pcm_native(
+LFM_INTERNAL_API int lfm_conversation_begin_pcm_submit_native(
     LfmConversation *conversation, const float *pcm, size_t sample_count,
-    uint32_t sample_rate, LfmNativeEmission *out);
-LFM_INTERNAL_API int lfm_conversation_begin_text_native(
+    uint32_t sample_rate, LfmNativeEmission *out,
+    LfmAudioRouteNotify notify, void *notify_context,
+    LfmConversationAdmissionHandle *out_handle);
+LFM_INTERNAL_API int lfm_conversation_begin_text_submit_native(
     LfmConversation *conversation, const char *text, size_t text_bytes,
-    LfmNativeEmission *out);
-LFM_INTERNAL_API int lfm_conversation_begin_mixed_native(
+    LfmNativeEmission *out, LfmAudioRouteNotify notify,
+    void *notify_context, LfmConversationAdmissionHandle *out_handle);
+LFM_INTERNAL_API int lfm_conversation_begin_mixed_submit_native(
     LfmConversation *conversation, const char *text, size_t text_bytes,
     const float *pcm, size_t sample_count, uint32_t sample_rate,
-    LfmNativeEmission *out);
-LFM_INTERNAL_API int
-lfm_conversation_next_native(LfmConversation *conversation,
-                             LfmNativeEmission *out);
+    LfmNativeEmission *out, LfmAudioRouteNotify notify,
+    void *notify_context, LfmConversationAdmissionHandle *out_handle);
+LFM_INTERNAL_API int lfm_conversation_begin_collect_native(
+    LfmConversation *conversation, LfmConversationAdmissionHandle *handle);
 LFM_INTERNAL_API int lfm_conversation_next_requires_playback_native(
     LfmConversation *conversation);
-LFM_INTERNAL_API int lfm_conversation_next_into_native(
-    LfmConversation *conversation, const LfmAudioRouteTarget *target,
-    LfmNativeEmission *out, size_t *out_samples);
 LFM_INTERNAL_API int lfm_conversation_next_submit_native(
     LfmConversation *conversation, LfmAudioRouteNotify notify,
     void *notify_context, LfmAudioRouteHandle *out_handle);
@@ -101,20 +171,13 @@ LFM_INTERNAL_API int lfm_conversation_next_into_submit_native(
 LFM_INTERNAL_API int lfm_conversation_next_into_collect_native(
     LfmConversation *conversation, LfmAudioRouteHandle *handle,
     LfmNativeEmission *out, size_t *out_samples);
-LFM_INTERNAL_API int
-lfm_conversation_interrupt_native(LfmConversation *conversation);
-LFM_INTERNAL_API int lfm_conversation_decode_native(
-    LfmConversation *conversation, const uint32_t *codes, size_t code_count,
-    float *pcm, size_t pcm_capacity, size_t *out_samples);
+LFM_INTERNAL_API int lfm_conversation_interrupt_submit_native(
+    LfmConversation *conversation, LfmAudioRouteNotify notify,
+    void *notify_context, LfmAudioRouteHandle *out_handle);
+LFM_INTERNAL_API int lfm_conversation_interrupt_collect_native(
+    LfmConversation *conversation, LfmAudioRouteHandle *handle);
 LFM_INTERNAL_API int
 lfm_conversation_belongs_to(const LfmConversation *conversation,
                             const LfmModel *model);
-
-/* Private typed engine pass. Raw codec codes and playback reservations never
- * cross the product lifecycle/session ABI. */
-extern "C" LFM_INTERNAL_API int lfm_engine_mimi_decode(
-    void *engine, uint64_t model_id, MimiDecodeState *state,
-    const uint32_t *codes, size_t code_count, float *pcm_out,
-    size_t pcm_capacity, size_t *out_samples);
 
 #endif /* LFM_MODEL_INTERNAL_H */

@@ -181,49 +181,30 @@ accumulator (double-double) where dynamic range needs it, never the storage —
 weights stay bf16 (this is the one genuinely useful HOLOFLOAT principle:
 `GEMV_BF16_DD` reads bf16 directly, only the accumulator widens).
 
-### 3c. Coordination: wake correctness first, then `wfe`/`sev`
+### 3c. Coordination: causal edges first, optional hardware dormancy second
 
-**Wake correctness, stated precisely (the load-bearing invariant):** zero-spin
-does **not** mean "avoid sleeping" — it means **park on a shared predicate that
-the waker advances, so no wake is ever lost and no waiter ever polls.** The
-predicate is the shared word (the pass generation / expected value); the futex or
-`wfe` is only the *edge* that makes a parked waiter re-check it. A correct wait is:
-read the shared predicate; if already satisfied, proceed without sleeping; else
-park keyed to the value observed, so a waker's release-increment either is seen
-before parking or wakes the park. Any design that sleeps for a fixed time, or
-wakes and re-polls a value it didn't park on, is wrong regardless of how little it
-spins. Our `kc_port_wait_u32(word, expected, deadline)` is exactly this shape and
-is the contract every wait in the engine must keep.
+**The load-bearing invariant:** an operation never owns a waiter. Its ticket,
+route label, phase, leases, and scratch identity are durable records. A producer
+publishes the changed predicate and makes the retained continuation runnable;
+the exact CQ supplies addressed completion and epoch correlation. No timer,
+sleep, bounded spin, or repeatedly yielding coroutine can cause progress.
 
-Given that invariant, `wfe`/`sev` is an *implementation* of the wake edge, not a
-replacement for the shared predicate — the predicate (pass generation) stays
-either way.
+Only resident execution capacity whose complete ready predicate is empty may
+become dormant. The worker observes the shared doorbell generation, rechecks
+every ready predicate, and uses the private deadline-free address-dormancy
+adapter only if nothing is runnable. A publication that races this sequence
+either changes the observed generation or wakes the dormant worker. This
+adapter is not attached to the ticket and is never called at a numerical stage
+boundary.
 
-Our lane dispatch and fence use `kc_port_wait_u32` (expected-value word over
-`os_sync_wait_on_address`/futex). ember-ml's resident worker instead parks on the
-ARM64 **`wfe`/`sev`** event register: `sev` sets a sticky, edge-latched per-core
-event bit, so `wfe` cannot miss a wake that races the pre-park check — the
-lost-wakeup problem solved in two instructions with **no shared doorbell word and
-no compare-value**. `sevl` primes the register so the worker inspects the queue
-once before ever parking.
-
-Where it could apply: the **lane `dispatch_word`** specifically — a small fixed
-resident team is exactly the case `sev` fits (it broadcasts to all PEs, which is
-wasteful for many waiters but free for ~8 pinned lanes). Caveats that keep this a
-*targeted* swap, not a wholesale one:
-
-- `sev` is a broadcast, not addressed to one waiter — fine for the lane team,
-  wrong for per-conversation completion routing.
-- ember-ml's model has **no completion queue** — completion is "ring drained to
-  empty," in-order. Ours has a real CQ with per-pass results and epoch routing;
-  that is strictly more capable and must not regress.
-- The producer side in ember-ml busy-spins (`sched_yield`) on `flush`; ours
-  blocks properly. Keep ours.
-
-So: consider `wfe`/`sev` for the lane wake edge (a micro-optimization of an
-already-zero-spin path), keep the expected-value CQ everywhere completion must be
-addressed. Low priority; correctness-neutral; do it only if lane wake latency
-ever shows up in a profile.
+`wfe`/`sev` is therefore, at most, an implementation experiment for the fixed
+team's **idle dispatch doorbell**. It cannot replace the shared predicate or the
+CQ. It is admitted only if a guarded startup probe and profile show lower
+latency/power than `os_sync_wait_on_address`/futex without polling or lost edges.
+Rosetta and unsupported hosts keep the OS backend. Broadcast `sev` is unsuitable
+for per-conversation completion routing; ticket publication remains addressed.
+ember-ml's producer-side `sched_yield` loop and drain-to-empty completion model
+remain rejected.
 
 ## 4. The ember-ml borrow ledger (explicit)
 
@@ -236,7 +217,7 @@ ever shows up in a profile.
 | Register-resident hot tile, explicit memory-crossing only | already the leaves; sharpen with hand-asm §3b |
 | Stream → consume → drop for load (pointer walk, bounded scratch) | §3a + the resident-image binding (P1) |
 | Widen the accumulator, not the storage (dd over bf16) | §3b, item under the list |
-| `wfe`/`sev` sticky-event doorbell | §3c — lane wake only, optional |
+| `wfe`/`sev` event backend | §3c — idle team dormancy only, optional and measured |
 
 **Reject (numerical transform / weaker than what we have):**
 
@@ -246,7 +227,7 @@ ever shows up in a profile.
 | Möbius group-law "matmul" | Computes a different function than the bf16 dot product. |
 | `from_holo`/voxel array sink | Non-materializable — throws on raw pointer access. Antithetical to weight views. |
 | Drain-to-empty completion (no CQ) | Our SQ/**CQ** with epoch routing is strictly more capable. |
-| Producer busy-spin on flush | Our two-sided expected-value doorbell already blocks properly. |
+| Producer busy-spin on flush | Producers publish retained ready records and return; only idle kernel capacity may become dormant. |
 | In-flight-bytes load throttle | Direct reads borrow disjoint spans of the already-final image; worker count is the complete bound, so a byte throttle only serializes I/O. |
 | 6-slot bank / NEON-only / single-worker / no-fallback absolutism | Instance-specific limits; the pattern generalizes, this instance doesn't. |
 

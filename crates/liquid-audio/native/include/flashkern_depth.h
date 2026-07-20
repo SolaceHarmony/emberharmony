@@ -76,12 +76,6 @@ LFM_DEPTH_STATIC_ASSERT(sizeof(LfmDepthPlanV1) == 136,
 
 int lfm_engine_depth_build(void *engine, const LfmDepthPlanV1 *plan,
                            uint64_t *out_id);
-int lfm_engine_depth_frame(void *engine, uint64_t id,
-                           const uint16_t *backbone_hidden,
-                           size_t backbone_hidden_count,
-                           const LfmSamplerConfigV1 *sampler,
-                           LfmPrngStateV1 *sample_state,
-                           uint32_t *out_tokens, size_t out_token_count);
 int lfm_engine_depth_clear(void *engine, uint64_t id);
 
 #undef LFM_DEPTH_STATIC_ASSERT

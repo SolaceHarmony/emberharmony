@@ -7,55 +7,68 @@ Status: current implementation plus explicitly marked next steps.
 Flashkern is the CPU inference device:
 
 - native C++ owns the engine object, plans, request/pass slots, descriptors,
-  queues, fixed threads, barriers, scratch, and lifecycle;
+  queues, direct byte views, scratch, and numerical lifecycle;
+- kcoro owns every resident control worker and fixed-team member, their idle
+  dormancy, stop, and join;
 - architecture assembly owns numerical values;
-- Rust currently wraps the opaque engine for compatibility/tests and will
-  ultimately dock PCM/control only;
+- Rust docks platform PCM and control through opaque native handles only;
 - Metal is not part of Flashkern.
+
+An operation never owns a sleeping thread. Its suspension is a durable
+`PassSlot`, route, conversation, or session record. A callback edge makes that
+record runnable. Only a resident kcoro worker whose complete ready predicate is
+empty may enter expected-value dormancy.
 
 ## Current Command Flow
 
 ```mermaid
 sequenceDiagram
     participant S as Native session/caller
-    participant SQ as Native SQ
-    participant D as Descriptor dispatcher
-    participant L as Fixed lanes
+    participant R as Route/service
+    participant SQ as Ticketed SQ
+    participant T as kcoro fixed team
     participant CQ as Native CQ
 
-    S->>SQ: retain descriptor + publish submission
-    SQ-->>D: submission doorbell
-    D->>D: validate ticket, generation, context, epoch
-    D-->>L: publish lane generation
-    L->>L: claim assembly tiles + generation fences
-    L->>CQ: publish one terminal completion
-    CQ-->>S: completion doorbell resolves wait
-    S->>S: validate identity + release owner lease
+    S->>R: retain input leases + create route ticket
+    R->>SQ: publish validated pass descriptor
+    SQ-->>T: dispatch generation
+    T->>T: claim assembly tiles; every member returns once
+    T-->>R: final return invokes pass continuation
+    alt another route label
+        R->>SQ: publish next generation on the same ticket
+    else terminal outcome
+        R->>CQ: publish exact ticket completion
+        CQ-->>S: make retained session delivery runnable
+        S->>S: validate ticket/epoch + release leases
+    end
 ```
 
-`bridge_main` is at
-`native/src/engine/flashkern_engine.cpp:1898-1951`. `submit_pass` is at
-`1954-2003`. The Rust submitter callback and Rust coordinator module are gone.
+`bridge_service_main` validates submissions and drains completions;
+`bridge_team_complete` is kcoro's one final-return callback for a dispatched
+generation. `PassSlot::ProgramCursor` and request-specific records own every
+value that survives a return. The Rust submitter callback and Rust numerical
+coordinator are gone.
 
-The current bridge capacity is one and descriptor capacity is eight. Accepted
-submission owns a queue descriptor lease until CQ consumption; the caller owns
-the original lease until exact completion. Both releases are counted and the
-slot generation advances only after the final release callback returns.
+An accepted submission carries only `{pass_slot, ticket_generation}`. The
+engine-owned slot retains its typed byte views, program cursor, continuation,
+and input/output/conversation leases until the exact terminal callback. There
+is no descriptor registry or hot-path lookup lock. Slot generation advances
+only after the callback releases or resubmits it; no callback context points
+into a caller's stack.
 
 ## Fixed Lanes
 
-`lfm_engine_new` creates:
+`lfm_engine_new` creates a retained kcoro bridge service, a retained route
+service, and one stable `kc_team`. Flashkern does not create lane pthreads.
+The team owns one cache-isolated idle event and one generation-return counter;
+there is no per-pass or per-stage fence word.
 
-- one mechanical SQ dispatcher thread;
-- one stable OS thread per logical lane;
-- one cache-line-isolated dispatch wait word;
-- one cache-line-isolated fence wait word;
-- one shared stage claim counter and logical fence generation.
-
-Every lane executes the same nested pass program. A stage publishes immutable
-kind/count/grain, then lanes fetch-add disjoint tiles. The last fence arriver
-runs the bounded serial transition and wakes only declared waiters. There is no
-spin tier and no coroutine context switch inside the lane team.
+Every member executes the same published stage program. Members fetch-add
+disjoint tiles and return after their complete assembly leaf. The final return
+runs the bounded transition exactly once. It either publishes the next stage
+generation or the terminal CQ record. Members do not block one another at a
+barrier; after returning they are simply available for the next generation and
+become dormant only if the entire team has no work.
 
 ## Math ABI
 
@@ -109,30 +122,34 @@ facts and IDs.
 
 ## Recurrence
 
-The synchronous `submit_pass` helper is a transitional API around the already
-native ring. Final recurrence belongs to a native session continuation:
+Recurrence belongs to a native route/session continuation:
 
 1. acquire a pass slot;
 2. retain model/conversation/input/output leases;
 3. publish native SQ;
-4. park on exact CQ promise;
-5. arbitrate terminal facts and commit/rollback state;
-6. release slot leases;
-7. enqueue the next native action or park for PCM/control data.
+4. return to the runtime with durable route state;
+5. receive the final-team callback and publish the exact CQ;
+6. arbitrate terminal facts and commit/rollback state in the retained
+   continuation;
+7. release the slot or submit the next labeled native action.
 
-Rust is not step 4 or step 7. The outer Rust kcoro runtime handles only audio
-stream and control-ring continuations.
+Missing PCM, playback capacity, or reliable-output capacity leaves a durable
+route/session record dormant and releases the compute slot. The corresponding
+producer callback makes it runnable. No host loop, timeout, or thread waits for
+those resources. Rust handles only platform-audio and control edges.
 
 ## Teardown
 
-Stop closes bridge admission and wakes submission/completion waiters. Accepted
-work settles. The dispatcher joins before lane retirement; lanes join before
-wait-word release; the bridge destroys only when submissions, completions,
-active waits, and descriptor leases are all zero.
+Stop closes admission and marks retained services retiring. Accepted work
+settles into terminal CQ records, stale epochs lose publication authority, and
+all retained leases release exactly once. Services join before the fixed team;
+the team joins before its idle registration is released; the bridge destroys
+only when submissions, completions, routes, pass slots, and retained I/O leases
+are all settled.
 
-Safe Rust wrappers serialize temporary compatibility calls with `pass_lock`.
-The raw C ABI independently claims `pass_claimed` before touching shared request
-state, so concurrent raw callers receive `-EBUSY` before payload mutation.
+There is no production synchronous compatibility wrapper. Concurrent callers
+either acquire a generation-protected slot or receive a bounded admission
+result before mutating payload state.
 
 ## Verification
 
@@ -147,10 +164,14 @@ Current tests include:
 Required cutover gates:
 
 1. one million passes with exact descriptor/slot settlement;
-2. stop during every submit/dispatch/fence/CQ phase;
+2. stop during every submit/dispatch/final-return/CQ phase;
 3. zero allocation after readiness;
 4. no C++ production numerical expressions;
 5. no Rust model/numerical symbol in the release graph;
 6. two or more conversations scheduled fairly over one model image;
 7. p50/p95/p99/max callback and pass latency against frozen baselines;
 8. ASan, UBSan, Linux TSan, AArch64, x86_64, and Rosetta gates.
+
+Source-shape gates additionally reject production `wait_submitted_slot`, raw
+lane pthread creation, operation-scoped address parking, timer-driven progress,
+caller-stack continuation state, and completion channels.

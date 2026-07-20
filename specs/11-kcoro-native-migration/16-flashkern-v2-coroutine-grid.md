@@ -1,8 +1,9 @@
 # 16 — Flashkern V2: The Eager Coroutine Grid
 
 Status: **V2.0–V2.1 landed; the V2.2 gang-completion rung and the first V2.3
-kcoro-ownership rung are implemented in the working tree; independent block
-execution in V2.3–V2.6 remains incomplete.** V1 is one
+kcoro-ownership rung are implemented in the working tree; removal of the
+remaining synchronous admission seams and independent block execution in
+V2.3–V2.6 remain incomplete.** V1 is one
 working fixed-team numerical execution domain. V2 extracts two independent
 logical four-lane blocks that can gang back into the existing eight-lane team,
 then drives them with design 14's compact forwarding table. It is an eager
@@ -17,44 +18,42 @@ worker/logical-lane geometry rejects; four physical workers reproduce the
 eight-way logical fold; and the zero-spin gate is green. A bounded production
 `TOKEN_PASS -> DEPTH_FRAME -> MIMI_DECODE` route now advances through exact CQs
 with a total three-node/four-outcome table, reserve-before-admit playback, and a
-direct Mimi write into the retained PCM span. At the cited commit the
-coordinator still made one outward expected-value terminal wait and its fixed
-conversation result and stack callback were not the future asynchronous route
-pool. At that revision a
-route-exclusive producer lease and three pre-created borrowed descriptors made
-that callback mutex-free while deliberately excluding peer admission; the
-working-tree broker follow-on below replaces that transitional ownership.
+direct Mimi write into the retained PCM span. That cited revision still exposed
+a synchronous terminal collection seam and stack-scoped callback state. The
+working-tree route/session conversion replaces both. They are historical
+implementation debt, not a permitted fallback design.
 
 **Broker and session follow-on landed in the working tree.** Routes now come
 from a fixed 64-instance pool, matching the maximum session count. A native
-expected-value broker creates one ordinary
+callback-driven broker creates one ordinary
 descriptor per coarse program, applies FIFO sequence order with bounded age
 promotion, and reacquires capacity only when the node is runnable. The exact-CQ
 callback commits declared state, releases the pass slot, and marks the next node
-ready; it never submits, waits, allocates, or takes a submission/descriptor
-mutex. Text uses the same pool as a terminal single-node sampled-token route.
-Terminal notification only rings the session doorbell; its coordinator-owned
-`SessionAction` performs exact-generation collection and never waits for a
-numerical pass or playback capacity.
+ready; it never allocates or takes a submission/descriptor mutex. Text uses the
+same pool as a terminal single-node sampled-token route. Terminal notification
+makes the retained session delivery continuation runnable; its
+coordinator-owned `SessionAction` performs exact-generation collection without
+installing an operation waiter for numerical or playback capacity.
 
 **Gang-completion follow-on implemented in the working tree.** An eight-lane
 engine creates two soft four-lane `BlockDomain`s. Each block leader publishes
 an exact-generation record to its private expected-value SPSC CQ; lane zero
 deliberately drains block 1 before block 0, and only then retires the matching
-gang lease and publishes the bridge CQ. The existing eight-lane stage board and
-fence still execute one numerical program, so this proves the completion and
+gang lease and publishes the bridge CQ. The existing eight-lane stage board
+still executes one numerical program, so this proves the completion and
 ownership protocol without claiming block concurrency. Private stage boards,
-per-domain ready rings, block-local collectives, event-register waits, and two
+per-domain ready rings, block-local return counters, idle event backends, and two
 simultaneous numerical programs remain open.
 
 **Kcoro ownership follow-on implemented in the working tree.** The stable
-numerical members are now created, generation-dispatched, parked, stopped, and
-joined by `kc_team`; Flashkern no longer owns lane pthread lifecycle. Every
-Flashkern stage reconverges through `kc_collective`, whose final arrival runs
-the bounded transition once, release-publishes its generation, and resumes
-declared parked peers through the shared 128-byte `kc_doorbell`. The bridge and
-route loops are still transitional pthreads, and the team is still one ganged
-execution domain. This is thread and synchronization ownership, not yet two
+numerical members are created, generation-dispatched, stopped, and joined by
+`kc_team`; Flashkern no longer owns lane pthread lifecycle. The current
+completion seam counts fixed-team returns, and the final return invokes the
+bounded continuation exactly once. The continuation advances durable pass
+state and dispatches the next route label or publishes the terminal ticket.
+No peer is suspended on behalf of that pass. Resident team members become
+dormant only when the engine as a whole has no runnable generation. The team is
+still one ganged execution domain; this is thread ownership, not yet two
 independent block executors.
 
 ## 0. Ground truth and its limits
@@ -128,47 +127,48 @@ The broker uses this deterministic policy:
 
 - `GANG8` reserves both blocks and mounts a dedicated eight-lane board.
 - `BLOCK4` may occupy either free block.
-- With one latency-critical runnable instance, dispatch immediately; never wait
-  to manufacture parallelism or a batch.
+- With one latency-critical runnable instance, dispatch immediately; never
+  delay it to manufacture parallelism or a batch.
 - With two independent runnable conversations, one `BLOCK4` program may run on
   each block.
 - Initially, two state-mutating programs from the same conversation never
   overlap. Later relaxation requires an explicit disjoint `AccessSet` and a
   dedicated test. “Probably disjoint” is not an access contract.
 - No numerical program performs a cross-block barrier. A real join settles
-  through exact CQs and the route instance outside both collectives.
+  through exact CQs and the route instance outside both block domains.
 
 The landed V2.0 gate already proves four physical workers can process eight
 fixed logical partitions with the same fold order on the current single board.
 Block extraction preserves and reruns that proof. Output parity, not worker
 count, decides whether a program may use `BLOCK4`.
 
-## 3. Fixed-member collectives and lane coroutines
+## 3. Fixed-member returns and lane coroutines
 
-A mounted numerical stage is one fixed collective identified by
+A mounted numerical stage is one fixed-team generation identified by
 `{ticket, route_label, stage, generation, team}`:
 
 1. every team member observes the same stage descriptor;
-2. lanes claim disjoint tiles only after collective stage selection;
-3. every member reaches the stage fence exactly once;
-4. the last arrival runs the declared bounded mixer/transition exactly once,
-   advances the generation with release semantics, and wakes parked peers;
-5. every peer rechecks the generation before continuing.
+2. lanes claim disjoint tiles only after generation publication;
+3. every member returns exactly once after completing its assigned tile work;
+4. the final return runs the declared bounded mixer/transition exactly once;
+5. that callback advances durable pass state and either dispatches the next
+   generation or publishes the one terminal ticket.
 
-Once mounted, each lane must arrive exactly once before it may yield, retire, or
-switch to unrelated work. Coroutines sequence only reconverged stages; assembly
+Once mounted, each member must return exactly once before it may accept another
+generation or retire. Coroutines sequence only completed generations; assembly
 owns a complete tile and never yields inside a kernel. Large parallel transforms
-remain their own cooperative stages—the “last arrival” does not serialize their
-math.
+remain their own cooperative stages—the final-return callback does not serialize
+their math.
 
-Dynamic audio-fragment quorum is a different primitive. Missing media parks the
-route instance before numerical admission; it never mounts half a team and waits
-for an external fragment. Media ordering, model position, route identity, and
-lane identity remain separate as specified in design 14.
+Dynamic audio-fragment quorum is a different primitive. Missing media leaves a
+durable route record dormant before numerical admission; it never mounts half a
+team or assigns a thread to an absent fragment. The final fragment makes the
+route runnable. Media ordering, model position, route identity, and lane
+identity remain separate as specified in design 14.
 
 Block-mode kcoro therefore uses bounded per-domain ready rings plus lane-affine
 mailboxes, not the general runtime's mutex-protected global queue. There is no
-work stealing inside a mounted collective; atomic tile claim remains the
+work stealing inside a mounted generation; atomic tile claim remains the
 in-program load balancer.
 
 ## 4. Compact routing, not a graph machine
@@ -195,23 +195,27 @@ publication epoch becomes stale, but stale work cannot publish or take another
 route edge. That accepted pass may finish its authoritative commit; it has lost
 the microphone.
 
-## 5. Wait backends: correctness first
+## 5. Idle-capacity dormancy: correctness first
 
-The OS expected-value address wait remains the correctness baseline. An
-AArch64 `LDXR`/`WFE` or x86 `UMONITOR`/`UMWAIT` implementation is optional and
+An expected-value address park is permitted only inside a resident worker's
+idle loop after the runtime has proved that its complete ready predicate is
+empty. It is not an operation, route, ticket, fence, playback, or capacity
+primitive. Operation suspension is a durable record with no attached thread.
+An AArch64 `LDXR`/`WFE` or x86 `UMONITOR`/`UMWAIT` idle backend is optional and
 ships only if all of the following hold:
 
 - architectural detection and a guarded startup probe both succeed;
-- the loop arms the monitor, waits while the word equals the captured expected
-  value, tolerates spurious wakes, and rechecks before return;
+- the loop arms the monitor, becomes dormant while the word equals the captured
+  value, tolerates spurious events, and rechecks before return;
 - monitor retirement, stop, wrap, and lost-wake tests pass;
-- fence p50/p95/p99, idle CPU, and power beat or match the OS path;
+- idle-resume p50/p95/p99, idle CPU, and power beat or match the OS path;
 - the OS backend remains available. Rosetta always takes the fallback.
 
-This is an alternative park backend, never a bounded pre-park spin tier. A wait
-word's block ownership prevents accidental cross-domain use, but allocation from
-a block arena does not guarantee physical L2 placement. A wake is not progress;
-the rechecked predicate decides whether the wait is over.
+This is an alternative idle backend, never a bounded pre-dormancy spin tier. An
+idle word's block ownership prevents accidental cross-domain use, but allocation
+from a block arena does not guarantee physical L2 placement. A wake is not
+progress; an explicit callback edge changed a ready predicate, and the runtime
+rechecks that predicate before dispatch.
 
 Candidate instructions remain capability- and measurement-selected:
 
@@ -311,32 +315,33 @@ Each step is independently gated and leaves a correct fallback geometry:
    table retains one exact slot across `TOKEN_PASS -> DEPTH_FRAME -> MIMI_DECODE`,
    commits token context, writes equal-rate Mimi PCM directly into pre-admitted
    playback or native-resamples codec scratch into a device-rate reservation,
-   and releases compute before publication. Its pre-created borrowed descriptors
-   and exclusive producer lease keep the callback mutex-free. The coordinator
-   originally waited once while an exclusive producer lease excluded the peer
-   slot. The working-tree follow-on replaces that lease with a fixed route pool
-   and fair expected-value broker; each node releases its compute slot before it
-   re-enters the ready set. Session-facing asynchronous terminal collection and
-   total model-owned token classification are now mounted; block concurrency is
-   the next scheduler boundary.
+   and releases compute before publication. Each ticket carries an immutable
+   fixed-slot locator; the deleted generic descriptor registry and borrowed
+   submission mode cannot reintroduce a callback mutex. The fixed route pool
+   and callback-driven fair broker replace the historical exclusive-producer
+   and synchronous-collection seam; each node releases its compute slot before
+   it re-enters the ready set. Session-facing asynchronous terminal
+   collection and total model-owned token classification are now mounted; block
+   concurrency is the next scheduler boundary.
 3. **V2.2 — extract block completion state (working-tree implementation).** Two
    `BlockDomain`s, private SPSC CQs, and the exact-generation gang lease now gate
    one active eight-lane program. The remaining extraction of private stage
-   boards, block-local fences, and scratch mounts belongs to V2.3; no current
-   sentence may call the two blocks independent executors.
+   boards, block-local final-return accounting, and scratch mounts belongs to
+   V2.3; no current sentence may call the two blocks independent executors.
 4. **V2.3 — block-mode kcoro, partial working-tree implementation.** Fixed-team
-   thread lifecycle and shared generation reconvergence now belong to kcoro.
+   thread lifecycle and final-return generation completion now belong to kcoro.
    The bridge and route pthread loops are replaced by retained kcoro services;
    their production edges use setup-time realtime notifier leases and the
    runtime-owned expected-value doorbell, so no intermediary thread, mutex, or
    condition variable is on the progress path. Extract two domain-local teams,
-   per-domain ready rings, early-return assertions, and optional measured
-   event-wait backends.
+   per-domain ready rings, exact-return assertions, and optional measured idle
+   event backends.
 5. **V2.4 — two independent programs.** Admit two `BLOCK4` programs only for
    different conversations. Profile actual overlap and shared-bandwidth effects;
    retain gang mode when it wins latency or parity.
 6. **V2.5 — cooperative math and tile reuse.** Make Mimi and remaining lane-zero
-   programs collective, then add no-delay tile-stationary conversation snapshots.
+   programs fixed-team generations, then add no-delay tile-stationary
+   conversation snapshots.
 7. **V2.6 — mixer seam.** Bind LFM2 ShortConv and attention descriptors and add
    explicit unsupported `MonarchLongConv` validation. A full Hyena port is a
    later model tranche, not part of V2 enablement.
@@ -347,8 +352,8 @@ Each step is independently gated and leaves a correct fallback geometry:
   ticket confusion, lost ACKs, or double retirement.
 - A ganged program excludes both blocks; same-conversation mutating programs do
   not overlap in the initial release.
-- Every lane arrives exactly once at every declared collective boundary; the
-  last-arrival mixer runs once; an early return is a test failure.
+- Every member returns exactly once for every dispatched generation; the final
+  return callback runs once; a duplicate or missing return is a test failure.
 - Invalid runtime selectors terminal-fault before table indexing and release all
   retained resources exactly once.
 - Greedy-token equality is evidence, not acceptance. Full hidden states,
@@ -357,11 +362,13 @@ Each step is independently gated and leaves a correct fallback geometry:
   and blocked instances retain no compute slot.
 - Interrupt at every program boundary preserves the declared state commit while
   preventing stale publication and recurrence.
-- Fairness is measured at fused-program boundaries. The longest admitted program,
-  not the nominal quantum, is the preemption and third-conversation wait floor.
+- Fairness is measured at fused-program boundaries. The longest admitted
+  program, not the nominal quantum, bounds when a third conversation can next be
+  admitted.
 - Idle CPU stays below the existing zero-spin gate on aarch64 and
   x86_64/Rosetta.
 
-If block placement, cache reuse, event waits, or opaque matrix overlap provide no
-benefit, V2 remains correct as one ganged block with the OS wait backend. These
+If block placement, cache reuse, idle-event backends, or opaque matrix overlap
+provide no benefit, V2 remains correct as one ganged block with the OS idle
+backend. These
 are optimizations behind measurements, never correctness assumptions.

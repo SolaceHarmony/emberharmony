@@ -1,8 +1,9 @@
 // monarch_fused_coop.c — standalone cooperative two-factor FFT probe.
 //
-// This executable links the same kc_team and kc_collective implementations used
-// by the production flashkern engine, but it creates its own team, context, and
-// storage. It does not enter the engine request bridge or replace its FFT.
+// This executable links the same kc_runtime, kc_service, and kc_team
+// implementations used by the production flashkern engine, but it creates its
+// own runtime, team, context, and storage. It does not enter the engine request
+// bridge or replace its FFT.
 //
 // For row-major real input x[n][l], the columns-first factorization is:
 //   A[k2][l] = sum_n x[n][l] W_N^(n*k2)
@@ -15,11 +16,11 @@
 // one used by the recovered MLX formula; it is valid and is not evidence of a
 // broken DFT. This probe does not call the MLX kernel itself.
 //
-// Two synchronization modes run the same arithmetic:
-//   coarse:     stage A and stage B are separate kc_team generations, with the
-//               main thread waiting and redispatching at the boundary;
-//   collective: one kc_team generation runs stage A, kc_collective_arrive, then
-//               stage B. Members rendezvous without a mid-FFT host redispatch.
+// The cooperative transform is one durable PASS ticket with two retained
+// phases. Stage A and stage B use separate kc_team generations. The final
+// member return publishes the exact ticket and wakes its dormant kc_service;
+// that continuation advances A -> B or settles the ticket. There is no host
+// redispatch, operation waiter, member barrier, or ticket per stage.
 // The intermediate is explicitly materialized in ordinary static storage. The
 // probe has no cache or memory-traffic counters, so it makes no residency claim.
 // BFDOT is Arm BF16 dot product with FP32 accumulation, not an 8x8 tensor-matrix
@@ -29,7 +30,8 @@
 //   KA=../../../kcoro-sys/vendor/kcoro_arena
 //   clang -O3 -std=c11 -Wall -Wextra -Wpedantic -Werror \
 //     -ffp-contract=off -march=armv8.6-a+bf16 monarch_fused_coop.c \
-//     "$KA/core/src/kc_team.c" "$KA/core/src/kc_collective.c" \
+//     "$KA/core/src/kc_runtime.c" "$KA/core/src/kc_service.c" \
+//     "$KA/core/src/kc_continuation.c" "$KA/core/src/kc_team.c" \
 //     "$KA/core/src/kc_doorbell.c" "$KA/port/posix.c" \
 //     -I"$KA/include" -I"$KA/port" -pthread -lm -o /tmp/mfc && /tmp/mfc
 
@@ -40,12 +42,16 @@
 #error "monarch_fused_coop requires Arm BF16 vector arithmetic"
 #endif
 
-#include "kc_collective.h"
+#include "kc_identity.h"
 #include "kc_port.h"
+#include "kc_runtime.h"
+#include "kc_service.h"
 #include "kc_team.h"
 
 #include <arm_neon.h>
+#include <errno.h>
 #include <math.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -123,13 +129,23 @@ static inline float bfdot(const uint16_t *a, const uint16_t *b, int count)
     return vaddvq_f32(sum);
 }
 
+enum {
+    PHASE_A = 1,
+    PHASE_B = 2,
+};
+
+typedef struct {
+    kc_ticket_id ticket;
+    uint32_t phase;
+} Pass;
+
 typedef struct {
     const uint16_t *input;
     uint16_t *scratch_r;
     uint16_t *scratch_i;
     float *output_r;
     float *output_i;
-    kc_collective_t *collective;
+    Pass pass;
 } Coop;
 
 static void stage_a(Coop *coop, uint32_t member, uint32_t members)
@@ -151,7 +167,8 @@ static void stage_a(Coop *coop, uint32_t member, uint32_t members)
     }
 }
 
-static void stage_b(Coop *coop, uint32_t member, uint32_t members)
+static void stage_b(Coop *coop, uint32_t member, uint32_t members,
+                    float *output_r, float *output_i)
 {
     for (int k2 = (int)member; k2 < N; k2 += (int)members) {
         const uint16_t *ar = coop->scratch_r + (size_t)k2 * L;
@@ -161,81 +178,200 @@ static void stage_b(Coop *coop, uint32_t member, uint32_t members)
             const float ii = bfdot(ai, dli[k1], L);
             const float ri = bfdot(ar, dli[k1], L);
             const float ir = bfdot(ai, dlr[k1], L);
-            coop->output_r[(size_t)k1 * N + k2] = rr - ii;
-            coop->output_i[(size_t)k1 * N + k2] = ri + ir;
+            output_r[(size_t)k1 * N + k2] = rr - ii;
+            output_i[(size_t)k1 * N + k2] = ri + ir;
         }
     }
 }
 
-static void member_coarse(void *context, uint32_t member, uint32_t members,
-                          uint64_t generation)
-{
-    Coop *coop = context;
-    if (generation & 1u) {
-        stage_a(coop, member, members);
-        return;
-    }
-    stage_b(coop, member, members);
-}
-
-static void member_collective(void *context, uint32_t member,
-                              uint32_t members, uint64_t generation)
+static void member_fn(void *context, uint32_t member, uint32_t members,
+                      uint64_t generation)
 {
     (void)generation;
     Coop *coop = context;
-    stage_a(coop, member, members);
-    if (kc_collective_arrive(coop->collective, member, NULL, NULL) < 0)
+    if (coop->pass.ticket.runtime_epoch == 0 ||
+        coop->pass.ticket.sequence == 0 ||
+        coop->pass.ticket.generation == 0 ||
+        coop->pass.ticket.kind != KC_TICKET_KIND_PASS)
         abort();
-    stage_b(coop, member, members);
-}
-
-static int run_coarse(kc_team_t *team, uint64_t *generation)
-{
-    const uint64_t first = *generation + 1;
-    int status = kc_team_dispatch(team, first);
-    if (status != 0) return status;
-    status = kc_team_wait(team, first, 0);
-    if (status != 0) return status;
-    status = kc_team_dispatch(team, first + 1);
-    if (status != 0) return status;
-    status = kc_team_wait(team, first + 1, 0);
-    if (status != 0) return status;
-    *generation = first + 1;
-    return 0;
-}
-
-static int run_collective(kc_team_t *team, uint64_t *generation)
-{
-    const uint64_t next = *generation + 1;
-    int status = kc_team_dispatch(team, next);
-    if (status != 0) return status;
-    status = kc_team_wait(team, next, 0);
-    if (status != 0) return status;
-    *generation = next;
-    return 0;
-}
-
-typedef int (*run_fn)(kc_team_t *team, uint64_t *generation);
-
-static int measure(kc_team_t *team, uint64_t *generation, run_fn run,
-                   double *best)
-{
-    for (int index = 0; index < 50; ++index) {
-        const int status = run(team, generation);
-        if (status != 0) return status;
+    if (coop->pass.phase == PHASE_A) {
+        stage_a(coop, member, members);
+        return;
     }
-    *best = INFINITY;
-    for (int round = 0; round < 5; ++round) {
-        const uint64_t start = kc_port_monotonic_ns();
-        for (int index = 0; index < 400; ++index) {
-            const int status = run(team, generation);
-            if (status != 0) return status;
+    if (coop->pass.phase == PHASE_B) {
+        stage_b(coop, member, members, coop->output_r, coop->output_i);
+        return;
+    }
+    abort();
+}
+
+typedef struct {
+    kc_team_t *team;
+    kc_service_t *service;
+    kc_service_notifier_t *notifier;
+    Coop *coop;
+    Pass published;
+    _Atomic uint64_t ready;
+    uint64_t published_generation;
+    uint64_t epoch;
+    uint64_t sequence;
+    uint64_t generation;
+    uint64_t completed;
+    uint64_t batch_start;
+    double best;
+    uint32_t plan;
+    uint32_t index;
+    uint32_t round;
+    uint32_t started;
+    int status;
+} Runner;
+
+enum {
+    PLAN_CORRECTNESS = 1,
+    PLAN_WARMUP = 2,
+    PLAN_MEASURE = 3,
+    ADVANCE_DONE = 1,
+    WARMUP_FFTS = 50,
+    BATCH_FFTS = 400,
+    MEASURE_ROUNDS = 6,
+};
+
+static int ticket_equal(const kc_ticket_id *a, const kc_ticket_id *b)
+{
+    return a->runtime_epoch == b->runtime_epoch &&
+           a->sequence == b->sequence &&
+           a->generation == b->generation && a->kind == b->kind;
+}
+
+static void team_complete(void *context, uint64_t generation);
+
+static int dispatch(Runner *runner)
+{
+    const uint64_t next = runner->generation + 1;
+    if (next == 0) return -EOVERFLOW;
+    runner->generation = next;
+    const int status = kc_team_dispatch_notify(
+        runner->team, next, team_complete, runner);
+    if (status == 0) return 0;
+    runner->generation = next - 1;
+    return status;
+}
+
+static int begin_fft(Runner *runner)
+{
+    const uint64_t next = runner->sequence + 1;
+    if (next == 0 || next > UINT32_MAX) return -EOVERFLOW;
+    runner->sequence = next;
+    runner->coop->pass = (Pass){
+        .ticket = {
+            .runtime_epoch = runner->epoch,
+            .sequence = next,
+            .generation = (uint32_t)next,
+            .kind = KC_TICKET_KIND_PASS,
+        },
+        .phase = PHASE_A,
+    };
+    return dispatch(runner);
+}
+
+static void team_complete(void *context, uint64_t generation)
+{
+    Runner *runner = context;
+    if (generation != runner->generation ||
+        runner->coop->pass.ticket.sequence == 0 ||
+        atomic_load_explicit(&runner->ready, memory_order_relaxed) != 0)
+        abort();
+
+    // Publish the exact ticket and durable phase before making its dormant
+    // orchestration continuation runnable.
+    runner->published = runner->coop->pass;
+    runner->published_generation = generation;
+    atomic_store_explicit(&runner->ready, generation, memory_order_release);
+    if (kc_service_notifier_notify(runner->notifier) != 0) abort();
+}
+
+static void finish_runner(Runner *runner, int status)
+{
+    if (runner->status == 0) runner->status = status;
+    kc_team_request_stop(runner->team);
+    const int complete = kc_service_complete_current(runner->service);
+    if (runner->status == 0 && complete != 0) runner->status = complete;
+}
+
+static int advance(Runner *runner)
+{
+    if (runner->plan == PLAN_CORRECTNESS) {
+        runner->plan = PLAN_WARMUP;
+        runner->index = 0;
+        return begin_fft(runner);
+    }
+    if (runner->plan == PLAN_WARMUP) {
+        ++runner->index;
+        if (runner->index < WARMUP_FFTS) return begin_fft(runner);
+        runner->plan = PLAN_MEASURE;
+        runner->index = 0;
+        runner->round = 0;
+        runner->batch_start = kc_port_monotonic_ns();
+        return begin_fft(runner);
+    }
+
+    ++runner->index;
+    if (runner->index < BATCH_FFTS) return begin_fft(runner);
+    const double elapsed =
+        (kc_port_monotonic_ns() - runner->batch_start) / 1.0e9 / BATCH_FFTS;
+    if (!isfinite(elapsed)) return -ERANGE;
+    if (elapsed < runner->best) runner->best = elapsed;
+    ++runner->round;
+    if (runner->round == MEASURE_ROUNDS) return ADVANCE_DONE;
+    runner->index = 0;
+    runner->batch_start = kc_port_monotonic_ns();
+    return begin_fft(runner);
+}
+
+static void runner_service(void *context)
+{
+    Runner *runner = context;
+    const uint64_t generation = atomic_exchange_explicit(
+        &runner->ready, 0, memory_order_acq_rel);
+    if (!runner->started) {
+        runner->started = 1;
+        if (generation != 0) {
+            finish_runner(runner, -EIO);
+            return;
         }
-        const double elapsed =
-            (kc_port_monotonic_ns() - start) / 1.0e9 / 400.0;
-        if (elapsed < *best) *best = elapsed;
+        const int status = begin_fft(runner);
+        if (status != 0) finish_runner(runner, status);
+        return;
     }
-    return isfinite(*best) ? 0 : EXIT_FAILURE;
+
+    const Pass published = runner->published;
+    if (generation == 0 || generation != runner->published_generation ||
+        generation != runner->generation ||
+        !ticket_equal(&published.ticket, &runner->coop->pass.ticket) ||
+        published.phase != runner->coop->pass.phase) {
+        finish_runner(runner, -EIO);
+        return;
+    }
+    if (published.phase == PHASE_A) {
+        // Phase is retained on the same ticket; only the team generation
+        // changes at the numerical boundary.
+        runner->coop->pass.phase = PHASE_B;
+        const int status = dispatch(runner);
+        if (status != 0) finish_runner(runner, status);
+        return;
+    }
+    if (published.phase != PHASE_B) {
+        finish_runner(runner, -EIO);
+        return;
+    }
+
+    ++runner->completed;
+    const int status = advance(runner);
+    if (status == ADVANCE_DONE) {
+        finish_runner(runner, 0);
+        return;
+    }
+    if (status != 0) finish_runner(runner, status);
 }
 
 static int start_team(uint32_t members, kc_team_member_fn member,
@@ -263,12 +399,77 @@ static int start_team(uint32_t members, kc_team_member_fn member,
     return status;
 }
 
-static int stop_team(kc_team_t *team)
+static int run_runner(Runner *runner)
 {
-    kc_team_request_stop(team);
-    const int joined = kc_team_join(team);
-    const int destroyed = kc_team_destroy(team);
-    return joined != 0 ? joined : destroyed;
+    const kc_runtime_config runtime_config = {
+        .size = sizeof(runtime_config),
+        .abi_version = 1,
+        .worker_count = 1,
+        .reserved = 0,
+    };
+    kc_runtime_t *runtime = NULL;
+    kc_service_t *service = NULL;
+    kc_service_notifier_t *notifier = NULL;
+    int status = kc_runtime_create(&runtime_config, &runtime);
+    if (status == 0) status = kc_runtime_start(runtime);
+
+    const kc_service_config service_config = {
+        .size = sizeof(service_config),
+        .abi_version = 1,
+        .callback = runner_service,
+        .context = runner,
+        .reserved = 0,
+        .owner_init = NULL,
+        .owner_fini = NULL,
+    };
+    if (status == 0)
+        status = kc_service_create(runtime, &service_config, &service);
+    runner->service = service;
+    if (status == 0)
+        status = kc_service_notifier_create(service, &notifier);
+    runner->notifier = notifier;
+    if (status == 0) status = kc_service_start(service);
+    if (status == 0) status = kc_service_notifier_notify(notifier);
+
+    if (status != 0) {
+        kc_team_request_stop(runner->team);
+        if (service) kc_service_request_stop(service);
+    }
+
+    // The service publishes the terminal stop edge. This join is teardown,
+    // never a generation observation or a source of numerical progress.
+    const int team_joined = kc_team_join(runner->team);
+    if (status == 0) status = team_joined;
+
+    if (service) {
+        const int service_joined = kc_service_join(service);
+        if (status == 0) status = service_joined;
+        if (status == 0) status = runner->status;
+        if (status == 0) {
+            kc_service_snapshot snapshot = {.size = sizeof(snapshot)};
+            status = kc_service_snapshot_get(service, &snapshot);
+            const uint64_t callbacks = runner->generation + 1;
+            if (status == 0 &&
+                (snapshot.notifications != callbacks ||
+                 snapshot.handled_notifications != callbacks ||
+                 snapshot.callbacks != callbacks || !snapshot.joined))
+                status = EXIT_FAILURE;
+        }
+    }
+
+    const int notifier_destroyed =
+        kc_service_notifier_destroy(notifier);
+    if (status == 0) status = notifier_destroyed;
+    const int service_destroyed = kc_service_destroy(service);
+    if (status == 0) status = service_destroyed;
+    if (runtime) kc_runtime_request_stop(runtime);
+    const int runtime_joined = kc_runtime_join(runtime);
+    if (status == 0) status = runtime_joined;
+    const int runtime_destroyed = kc_runtime_destroy(runtime);
+    if (status == 0) status = runtime_destroyed;
+    runner->service = NULL;
+    runner->notifier = NULL;
+    return status;
 }
 
 // Columns-first factorization in double, with row-major input/output convention.
@@ -452,18 +653,18 @@ int main(void)
         .scratch_i = scratch_i,
         .output_r = leaf_r,
         .output_i = leaf_i,
-        .collective = NULL,
+        .pass = {0},
     };
     stage_a(&leaf, 0, 1);
-    stage_b(&leaf, 0, 1);
+    stage_b(&leaf, 0, 1, leaf_r, leaf_i);
     const double leaf_error =
         normalized_max(leaf_r, leaf_i, exact_r, exact_i);
 
     printf("# Standalone cooperative two-factor BF16 FFT probe\n");
     printf("# N=%d, L=%d, points=%d; row-major output K=k1*N+k2\n", N, L,
            NL);
-    printf("# coarse = 2 team generations; collective = 1 team generation + "
-           "1 member barrier\n\n");
+    printf("# ticketed = 1 PASS ticket with retained A/B state across 2 team "
+           "generations\n\n");
     if (columns_residual >= 0.0) {
         printf("  columns-first vs DFT(x.flatten())       : %.2e\n",
                columns_residual);
@@ -483,148 +684,105 @@ int main(void)
         return EXIT_FAILURE;
     }
 
-    printf("\n  lanes | coarse==leaf | collective==leaf | modes exact | "
-           "coarse err | collective err\n");
-    printf("  ------+--------------+------------------+-------------+"
-           "------------+---------------\n");
+    printf("\n  lanes | ticketed==leaf | ticketed err\n");
+    printf("  ------+----------------+-------------\n");
 
-    double one_coarse = 0.0;
-    double one_collective = 0.0;
-    double coarse_ms[4];
-    double collective_ms[4];
+    const uint64_t stamp = kc_port_monotonic_ns();
+    const uint64_t epoch = stamp != 0 ? stamp : 1;
+    uint64_t sequence = 0;
+    double one = 0.0;
+    double ticket_ms[4];
     uint32_t lane_count[4];
     int slot = 0;
 
     for (uint32_t members = 1; members <= 8; members *= 2) {
-        static float coarse_r[NL];
-        static float coarse_i[NL];
-        Coop coarse = {
+        static float ticket_r[NL];
+        static float ticket_i[NL];
+        Coop coop = {
             .input = input_bf16,
             .scratch_r = scratch_r,
             .scratch_i = scratch_i,
-            .output_r = coarse_r,
-            .output_i = coarse_i,
-            .collective = NULL,
+            .output_r = ticket_r,
+            .output_i = ticket_i,
+            .pass = {0},
         };
-        kc_team_t *coarse_team = NULL;
-        int status = start_team(members, member_coarse, &coarse, &coarse_team);
+        kc_team_t *team = NULL;
+        int status = start_team(members, member_fn, &coop, &team);
         if (status != 0) {
-            fprintf(stderr, "coarse team start failed for %u lanes: %d\n",
+            fprintf(stderr, "team start failed for %u lanes: %d\n",
                     members, status);
             return EXIT_FAILURE;
         }
-        uint64_t coarse_generation = 0;
-        status = run_coarse(coarse_team, &coarse_generation);
-        const int coarse_equal =
-            memcmp(coarse_r, leaf_r, sizeof(coarse_r)) == 0 &&
-            memcmp(coarse_i, leaf_i, sizeof(coarse_i)) == 0;
-        const double coarse_error =
-            normalized_max(coarse_r, coarse_i, exact_r, exact_i);
-        double coarse_best = INFINITY;
-        if (status == 0)
-            status = measure(coarse_team, &coarse_generation, run_coarse,
-                             &coarse_best);
-        const int coarse_stop = stop_team(coarse_team);
-        if (status == 0) status = coarse_stop;
-        if (status != 0) {
-            fprintf(stderr, "coarse run failed for %u lanes: %d\n", members,
-                    status);
-            return EXIT_FAILURE;
-        }
-
-        static float collective_r[NL];
-        static float collective_i[NL];
-        kc_collective_t *barrier = NULL;
-        status = kc_collective_create(members, &barrier);
-        if (status != 0) {
-            fprintf(stderr, "collective create failed for %u lanes: %d\n",
-                    members, status);
-            return EXIT_FAILURE;
-        }
-        Coop collective = {
-            .input = input_bf16,
-            .scratch_r = scratch_r,
-            .scratch_i = scratch_i,
-            .output_r = collective_r,
-            .output_i = collective_i,
-            .collective = barrier,
+        Runner runner = {
+            .team = team,
+            .coop = &coop,
+            .epoch = epoch,
+            .sequence = sequence,
+            .generation = 0,
+            .completed = 0,
+            .best = INFINITY,
+            .plan = PLAN_CORRECTNESS,
+            .status = 0,
         };
-        kc_team_t *collective_team = NULL;
-        status = start_team(members, member_collective, &collective,
-                            &collective_team);
-        if (status != 0) {
-            kc_collective_destroy(barrier);
-            fprintf(stderr, "collective team start failed for %u lanes: %d\n",
-                    members, status);
-            return EXIT_FAILURE;
-        }
-        uint64_t collective_generation = 0;
-        status = run_collective(collective_team, &collective_generation);
-        const int collective_equal =
-            memcmp(collective_r, leaf_r, sizeof(collective_r)) == 0 &&
-            memcmp(collective_i, leaf_i, sizeof(collective_i)) == 0;
-        const int modes_equal =
-            memcmp(collective_r, coarse_r, sizeof(collective_r)) == 0 &&
-            memcmp(collective_i, coarse_i, sizeof(collective_i)) == 0;
-        const double collective_error =
-            normalized_max(collective_r, collective_i, exact_r, exact_i);
-        double collective_best = INFINITY;
-        if (status == 0)
-            status = measure(collective_team, &collective_generation,
-                             run_collective, &collective_best);
-        kc_collective_snapshot snapshot = {.size = sizeof(snapshot)};
-        if (status == 0)
-            status = kc_collective_snapshot_get(barrier, &snapshot);
-        if (status == 0 && snapshot.generation != collective_generation)
+        atomic_init(&runner.ready, 0);
+        const uint64_t first = sequence;
+        status = run_runner(&runner);
+        kc_team_snapshot snapshot = {.size = sizeof(snapshot)};
+        if (status == 0) status = kc_team_snapshot_get(team, &snapshot);
+        if (status == 0 &&
+            (runner.completed !=
+                 1 + WARMUP_FFTS + BATCH_FFTS * MEASURE_ROUNDS ||
+             runner.sequence - first != runner.completed ||
+             runner.generation != runner.completed * 2 ||
+             snapshot.completed_generation != runner.generation ||
+             snapshot.dispatched_generation != runner.generation ||
+             snapshot.completed_members != members || !snapshot.joined ||
+             !isfinite(runner.best) || runner.published.phase != PHASE_B ||
+             !ticket_equal(&runner.published.ticket,
+                           &coop.pass.ticket)))
             status = EXIT_FAILURE;
-        const int collective_stop = stop_team(collective_team);
-        if (status == 0) status = collective_stop;
-        kc_collective_destroy(barrier);
+        const int destroyed = kc_team_destroy(team);
+        if (status == 0) status = destroyed;
         if (status != 0) {
-            fprintf(stderr, "collective run failed for %u lanes: %d\n",
+            fprintf(stderr, "ticketed run failed for %u lanes: %d\n",
                     members, status);
             return EXIT_FAILURE;
         }
+        sequence = runner.sequence;
 
-        printf("  %5u | %12s | %16s | %11s |   %.2e |      %.2e\n",
-               members, coarse_equal ? "yes" : "NO",
-               collective_equal ? "yes" : "NO",
-               modes_equal ? "yes" : "NO", coarse_error,
-               collective_error);
-        if (!coarse_equal || !collective_equal || !modes_equal ||
-            !isfinite(coarse_error) || !isfinite(collective_error) ||
-            coarse_error >= MFC_BF16_LIMIT ||
-            collective_error >= MFC_BF16_LIMIT) {
-            fprintf(stderr, "cooperative correctness gate failed for %u lanes\n",
+        const int equal =
+            memcmp(ticket_r, leaf_r, sizeof(ticket_r)) == 0 &&
+            memcmp(ticket_i, leaf_i, sizeof(ticket_i)) == 0;
+        const double error =
+            normalized_max(ticket_r, ticket_i, exact_r, exact_i);
+
+        printf("  %5u | %14s |    %.2e\n", members,
+               equal ? "yes" : "NO", error);
+        if (!equal || !isfinite(error) || error >= MFC_BF16_LIMIT) {
+            fprintf(stderr, "ticketed correctness gate failed for %u lanes\n",
                     members);
             return EXIT_FAILURE;
         }
 
-        if (members == 1) {
-            one_coarse = coarse_best;
-            one_collective = collective_best;
-        }
+        if (members == 1) one = runner.best;
         lane_count[slot] = members;
-        coarse_ms[slot] = coarse_best * 1.0e3;
-        collective_ms[slot] = collective_best * 1.0e3;
+        ticket_ms[slot] = runner.best * 1.0e3;
         ++slot;
     }
 
-    printf("\n  lanes | coarse ms | collective ms | coarse speedup | "
-           "collective speedup | coarse/collective\n");
-    printf("  ------+-----------+---------------+----------------+"
-           "--------------------+------------------\n");
+    printf("\n  lanes | ticketed ms | speedup\n");
+    printf("  ------+-------------+--------\n");
     for (int index = 0; index < slot; ++index) {
-        printf("  %5u | %9.3f | %13.3f | %13.2fx | %17.2fx | %16.2fx\n",
-               lane_count[index], coarse_ms[index], collective_ms[index],
-               one_coarse / (coarse_ms[index] / 1.0e3),
-               one_collective / (collective_ms[index] / 1.0e3),
-               coarse_ms[index] / collective_ms[index]);
+        printf("  %5u | %11.3f | %6.2fx\n", lane_count[index],
+               ticket_ms[index], one / (ticket_ms[index] / 1.0e3));
     }
 
-    printf("\n# Timings include host dispatch/wait; coarse/collective >1 favors "
-           "the lane barrier.\n");
-    printf("# This gates forward-factorization and partition equivalence only; "
-           "no inverse or convolution.\n");
+    printf("\n# Timings include retained-service dispatch/completion across both "
+           "ticket phases.\n");
+    printf("# Wall clock is measurement only; no timer makes work runnable.\n");
+    printf("# Direct convention oracles gate builds up to 4096 points; larger "
+           "builds use the factorized double reference.\n");
+    printf("# Repeated partition equivalence is gated; there is no inverse or "
+           "convolution.\n");
     return EXIT_SUCCESS;
 }

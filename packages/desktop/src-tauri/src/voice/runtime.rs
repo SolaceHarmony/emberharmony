@@ -1,41 +1,32 @@
 //! Tauri-owned voice runtime.
 //!
 //! The audio service itself lives in `liquid_audio::VoiceRuntime`: the Tauri layer
-//! feeds local microphone frames from WebRTC/PlatformAudio and routes local speaker
-//! PCM through WebRTC/PlatformAudio, while VAD, barge-in, and realtime inference run on Rust
-//! threads. This module is the desktop kernel wrapper: it loads Tauri settings,
+//! owns the platform microphone and speaker callbacks directly, while VAD,
+//! barge-in, and realtime inference run on Rust threads. This module is the desktop
+//! kernel wrapper: it loads Tauri settings,
 //! builds the LFM2 engine, owns the single active session, and maps runtime events
 //! onto the webview `Channel`.
 
 use std::{
     borrow::Cow,
     collections::HashMap,
-    future::Future,
     path::{Path, PathBuf},
     sync::{
         Arc, Condvar, Mutex,
-        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
-use crossbeam_channel::{Receiver, RecvTimeoutError};
-use futures::StreamExt;
 use liquid_audio::{
-    AudioStatsSnapshot, ExternalAudioInput, ExternalAudioInputWriter, ExternalAudioOutput,
-    FrameSubmitError, NativeConversationVault, NativeLfm2VoiceEngine, NativeVoiceModel,
-    NativeVoiceRuntimeConfig, NativeVoiceSampling, RealtimeFramePipeline,
-    RealtimeFramePipelineHandle, RealtimePipeline, RealtimePipelineHandle, RuntimeConfig,
-    RuntimeEvent, SessionState, Utterance, VoiceEngine, VoiceEvent as RealtimeEvent,
-    VoiceRuntime as Lfm2Runtime,
+    AudioStatsSnapshot, NativeConversationVault, NativeLfm2VoiceEngine, NativeVoiceModel,
+    NativeVoiceRuntimeConfig, NativeVoiceSampling, RuntimeConfig, RuntimeEvent, SessionState,
+    VoiceEngine, VoiceRuntime as Lfm2Runtime,
 };
 use livekit::{
-    AudioProcessingOptions, ConnectionState, DataPacket, PlatformAudio, Room, RoomEvent,
-    RoomOptions,
-    options::TrackPublishOptions,
+    AudioProcessingOptions, PlatformAudio,
     rtc_engine::lk_runtime::LkRuntime,
-    track::{LocalAudioTrack, LocalTrack, RemoteAudioTrack, RemoteTrack, TrackSource},
-    webrtc::audio_stream::native::{NativeAudioStream, NativeAudioStreamOptions},
+    track::LocalAudioTrack,
     webrtc::{
         audio_frame::AudioFrame,
         audio_source::{AudioSourceOptions, RtcAudioSource, native::NativeAudioSource},
@@ -49,42 +40,26 @@ use serde::Serialize;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::settings::{
-    self, Lfm2Device, Lfm2Settings, LiveKitSettings, LocalVoiceEngine, VoiceProvider, VoiceSettings,
+    self, Lfm2Device, Lfm2Settings, LocalVoiceEngine, VoiceProvider, VoiceSettings,
 };
 
 use super::control::{LiveKitGrant, Role, SessionCtx, VoiceEvent, VoiceState};
-use super::session::{SessionBridgeConfig, SessionBridgeEvent, run_turn};
+use super::session::{
+    CancelScope, CancelSignal, SessionBridgeConfig, SessionBridgeEvent, run_turn,
+};
 use super::threads::ThreadManager;
 
 type UiChannel = Arc<UiEvents>;
 type AsyncTask = tauri::async_runtime::JoinHandle<()>;
 const VOICE_COMMAND_CAP: usize = 16;
-const LIVEKIT_COMMAND_CAP: usize = 16;
 const UI_EVENT_CAP: usize = 256;
-const LIVEKIT_AUDIO_LEVEL_RATE: i32 = 48_000;
-const LIVEKIT_AUDIO_LEVEL_CHANNELS: i32 = 1;
-const LIVEKIT_REMOTE_SPEAKING_RMS: f32 = 0.006;
-const LIVEKIT_REMOTE_SILENCE_MS: u64 = 350;
-const LIVEKIT_AGENT_AUDIO_TIMEOUT_MS: u64 = 20_000;
-const LIVEKIT_DONE_POLL_MS: u64 = 50;
-const LIVEKIT_CONTROL_TOPIC: &str = "emberharmony.voice.control";
-const LIVEKIT_CONTROL_INTERRUPT: &[u8] = br#"{"type":"interrupt"}"#;
 const LIVEKIT_AGENT_AUDIO_RATE: u32 = 48_000;
 const LIVEKIT_AGENT_AUDIO_CHANNELS: u32 = 1;
-const LIVEKIT_AGENT_AUDIO_RATE_I32: i32 = 48_000;
-const LIVEKIT_AGENT_AUDIO_CHANNELS_I32: i32 = 1;
 const LIVEKIT_AGENT_AUDIO_QUEUE_MS: u32 = 250;
-const LOCAL_WEBRTC_MIC_QUEUE_FRAMES: usize = 4;
-const LOCAL_WEBRTC_MIC_READY_TIMEOUT_MS: u64 = 5_000;
 const LOCAL_WEBRTC_OUTPUT_READY_TIMEOUT_MS: u64 = 5_000;
 const LOCAL_WEBRTC_OUTPUT_ICE_TIMEOUT_MS: u64 = 5_000;
 const LOCAL_WEBRTC_OUTPUT_ICE_QUEUE_CAP: usize = 16;
-const LOCAL_WEBRTC_INPUT_STREAM_ID: &str = "local-lfm2-input";
 const LOCAL_WEBRTC_OUTPUT_STREAM_ID: &str = "local-lfm2-output";
-const LIVEKIT_AGENT_SILENCE_MS: u64 = 800;
-const LIVEKIT_AGENT_MAX_UTTERANCE_SECONDS: usize = 30;
-const LIVEKIT_AGENT_ECHO_GATE_MS: u64 = 700;
-const LIVEKIT_AGENT_ECHO_MULTIPLIER: f32 = 2.5;
 /// Identity of the one native resident image. The runtime configuration is part
 /// of the key because it controls native worker topology and dock capacities.
 #[derive(Clone, PartialEq)]
@@ -313,21 +288,16 @@ impl VoiceRuntime {
 
     pub async fn start_livekit(
         &self,
-        ctx: SessionCtx,
-        settings: VoiceSettings,
-        grant: LiveKitGrant,
-        channel: tauri::ipc::Channel<VoiceEvent>,
-        bridge: Option<SessionBridgeConfig>,
+        _ctx: SessionCtx,
+        _settings: VoiceSettings,
+        _grant: LiveKitGrant,
+        _channel: tauri::ipc::Channel<VoiceEvent>,
+        _bridge: Option<SessionBridgeConfig>,
     ) -> Result<(), String> {
-        self.request(|reply| RuntimeCommand::StartLivekit {
-            ctx,
-            settings,
-            grant,
-            channel,
-            bridge,
-            reply,
-        })
-        .await
+        Err(
+            "LiveKit voice inference was removed; LFM2 native voice is the only shipped path"
+                .into(),
+        )
     }
 
     pub async fn stop(&self) -> Result<(), String> {
@@ -460,14 +430,6 @@ enum RuntimeCommand {
         bridge: Option<SessionBridgeConfig>,
         reply: oneshot::Sender<Result<(), String>>,
     },
-    StartLivekit {
-        ctx: SessionCtx,
-        settings: VoiceSettings,
-        grant: LiveKitGrant,
-        channel: tauri::ipc::Channel<VoiceEvent>,
-        bridge: Option<SessionBridgeConfig>,
-        reply: oneshot::Sender<Result<(), String>>,
-    },
     Stop {
         reply: oneshot::Sender<Result<(), String>>,
     },
@@ -526,52 +488,31 @@ async fn kernel_loop(
                     channel,
                     bridge,
                     wake.clone(),
-                )
-                .await;
-                let _ = reply.send(result);
-            }
-            RuntimeCommand::StartLivekit {
-                ctx,
-                settings,
-                grant,
-                channel,
-                bridge,
-                reply,
-            } => {
-                let result = start_livekit_session(
-                    &mut session,
-                    &threads,
-                    ctx,
-                    settings,
-                    grant,
-                    channel,
-                    bridge,
-                    wake.clone(),
                 );
                 let _ = reply.send(result);
             }
             RuntimeCommand::Stop { reply } => {
-                let result = stop_session(&mut session, &threads).await;
+                let result = stop_session(&mut session, &threads);
                 let _ = reply.send(result);
             }
             RuntimeCommand::Interrupt { reply } => {
                 let result = match session.as_ref() {
-                    Some(session) => session.interrupt().await,
+                    Some(session) => session.interrupt(),
                     None => Ok(()),
                 };
                 let _ = reply.send(result);
             }
             RuntimeCommand::SetMicEnabled { enabled, reply } => {
                 let result = match session.as_ref() {
-                    Some(session) => session.set_mic_enabled(enabled).await,
+                    Some(session) => session.set_mic_enabled(enabled),
                     None => Ok(()),
                 };
                 let _ = reply.send(result);
             }
             RuntimeCommand::BeginTypedInput { reply } => {
                 let result = match session.as_ref() {
-                    Some(session) => match session.set_mic_enabled(false).await {
-                        Ok(()) => session.interrupt().await,
+                    Some(session) => match session.set_mic_enabled(false) {
+                        Ok(()) => session.interrupt(),
                         Err(error) => Err(error),
                     },
                     None => Ok(()),
@@ -579,7 +520,7 @@ async fn kernel_loop(
                 let _ = reply.send(result);
             }
             RuntimeCommand::ApplySettings { settings, reply } => {
-                let result = apply_settings_to_session(&mut session, &threads, settings).await;
+                let result = apply_settings_to_session(&mut session, &threads, settings);
                 let _ = reply.send(result);
             }
             RuntimeCommand::InvalidateProvider { provider, reply } => {
@@ -587,7 +528,7 @@ async fn kernel_loop(
                     .as_ref()
                     .is_some_and(|session| session.provider() == provider)
                 {
-                    stop_session(&mut session, &threads).await
+                    stop_session(&mut session, &threads)
                 } else {
                     Ok(())
                 };
@@ -611,11 +552,11 @@ async fn kernel_loop(
         publish_snapshot(&state, &session);
     }
 
-    let _ = stop_session(&mut session, &threads).await;
+    let _ = stop_session(&mut session, &threads);
     let _ = threads.wait();
 }
 
-async fn start_lfm2_session(
+fn start_lfm2_session(
     session: &mut Option<VoiceSession>,
     threads: &ThreadManager,
     ctx: SessionCtx,
@@ -629,34 +570,13 @@ async fn start_lfm2_session(
         return Err("Voice is already running.".into());
     }
     threads.wait()?;
-    *session = Some(VoiceSession::Lfm2(
-        Lfm2Session::spawn(threads, ctx, settings, channel, bridge, wake).await?,
-    ));
-    Ok(())
-}
-
-fn start_livekit_session(
-    session: &mut Option<VoiceSession>,
-    threads: &ThreadManager,
-    ctx: SessionCtx,
-    settings: VoiceSettings,
-    grant: LiveKitGrant,
-    channel: tauri::ipc::Channel<VoiceEvent>,
-    bridge: Option<SessionBridgeConfig>,
-    wake: mpsc::Sender<RuntimeCommand>,
-) -> Result<(), String> {
-    reap_finished(session, threads);
-    if session.is_some() {
-        return Err("Voice is already running.".into());
-    }
-    threads.wait()?;
-    *session = Some(VoiceSession::Livekit(LiveKitSession::spawn(
-        threads, ctx, settings, grant, channel, bridge, wake,
+    *session = Some(VoiceSession(Lfm2Session::spawn(
+        threads, ctx, settings, channel, bridge, wake,
     )?));
     Ok(())
 }
 
-async fn apply_settings_to_session(
+fn apply_settings_to_session(
     session: &mut Option<VoiceSession>,
     threads: &ThreadManager,
     settings: VoiceSettings,
@@ -666,17 +586,14 @@ async fn apply_settings_to_session(
         .as_ref()
         .is_some_and(|session| !session.matches_settings(&settings))
     {
-        return stop_session(session, threads).await;
+        return stop_session(session, threads);
     }
     Ok(())
 }
 
-async fn stop_session(
-    session: &mut Option<VoiceSession>,
-    threads: &ThreadManager,
-) -> Result<(), String> {
+fn stop_session(session: &mut Option<VoiceSession>, threads: &ThreadManager) -> Result<(), String> {
     if let Some(session) = session.take() {
-        session.stop(threads).await?;
+        session.stop(threads)?;
     }
     Ok(())
 }
@@ -717,7 +634,6 @@ fn runtime_snapshot(session: &Option<VoiceSession>) -> RuntimeSnapshot {
 struct SessionSettingsKey {
     provider: VoiceProvider,
     lfm2: Lfm2Settings,
-    livekit: Option<LiveKitSettings>,
 }
 
 impl SessionSettingsKey {
@@ -725,15 +641,6 @@ impl SessionSettingsKey {
         Self {
             provider: VoiceProvider::Lfm2,
             lfm2: settings.lfm2.clone(),
-            livekit: None,
-        }
-    }
-
-    fn livekit(settings: &VoiceSettings) -> Self {
-        Self {
-            provider: VoiceProvider::Livekit,
-            lfm2: settings.lfm2.clone(),
-            livekit: Some(settings.livekit.clone()),
         }
     }
 
@@ -744,1566 +651,53 @@ impl SessionSettingsKey {
         if self.provider == VoiceProvider::Lfm2 {
             return self == &Self::lfm2(settings);
         }
-        if self.provider == VoiceProvider::Livekit {
-            return self == &Self::livekit(settings);
-        }
         false
     }
 }
 
-enum VoiceSession {
-    Lfm2(Lfm2Session),
-    Livekit(LiveKitSession),
-}
+struct VoiceSession(Lfm2Session);
 
 impl VoiceSession {
     fn is_finished(&self) -> bool {
-        match self {
-            VoiceSession::Lfm2(session) => session.is_finished(),
-            VoiceSession::Livekit(session) => session.is_finished(),
-        }
+        self.0.is_finished()
     }
 
     fn provider(&self) -> VoiceProvider {
-        match self {
-            VoiceSession::Lfm2(_) => VoiceProvider::Lfm2,
-            VoiceSession::Livekit(_) => VoiceProvider::Livekit,
-        }
+        VoiceProvider::Lfm2
     }
 
     fn session_id(&self) -> &str {
-        match self {
-            VoiceSession::Lfm2(session) => &session.ctx.session_id,
-            VoiceSession::Livekit(session) => &session.ctx.session_id,
-        }
+        &self.0.ctx.session_id
     }
 
-    async fn interrupt(&self) -> Result<(), String> {
-        match self {
-            VoiceSession::Lfm2(session) => session.interrupt(),
-            VoiceSession::Livekit(session) => session.interrupt().await,
-        }
+    fn interrupt(&self) -> Result<(), String> {
+        self.0.interrupt()
     }
 
-    async fn set_mic_enabled(&self, enabled: bool) -> Result<(), String> {
-        match self {
-            VoiceSession::Lfm2(session) => session.set_mic_enabled(enabled),
-            VoiceSession::Livekit(session) => session.set_mic_enabled(enabled).await,
-        }
+    fn set_mic_enabled(&self, enabled: bool) -> Result<(), String> {
+        self.0.set_mic_enabled(enabled)
     }
 
     fn mic_enabled(&self) -> bool {
-        match self {
-            VoiceSession::Lfm2(session) => session.mic_enabled(),
-            VoiceSession::Livekit(session) => session.mic_enabled(),
-        }
+        self.0.mic_enabled()
     }
 
     fn audio_stats(&self) -> Option<AudioStatsSnapshot> {
-        match self {
-            VoiceSession::Lfm2(session) => session.audio_stats(),
-            VoiceSession::Livekit(_) => None,
-        }
+        self.0.audio_stats()
     }
 
     fn matches_settings(&self, settings: &VoiceSettings) -> bool {
-        match self {
-            VoiceSession::Lfm2(session) => session.settings.matches(settings),
-            VoiceSession::Livekit(session) => session.settings.matches(settings),
-        }
+        self.0.settings.matches(settings)
     }
 
-    async fn stop(self, threads: &ThreadManager) -> Result<(), String> {
-        match self {
-            VoiceSession::Lfm2(session) => stop_lfm2(threads, session).await,
-            VoiceSession::Livekit(session) => stop_livekit(threads, session).await,
-        }
+    fn stop(self, threads: &ThreadManager) -> Result<(), String> {
+        stop_lfm2(threads, self.0)
     }
 }
 
-async fn stop_lfm2(threads: &ThreadManager, session: Lfm2Session) -> Result<(), String> {
-    let (tx, rx) = oneshot::channel();
-    threads.spawn("voice-lfm2-stop", move || {
-        session.stop();
-        let _ = tx.send(());
-    })?;
-    rx.await
-        .map_err(|_| "LFM2 stop task dropped before joining".to_string())?;
+fn stop_lfm2(threads: &ThreadManager, session: Lfm2Session) -> Result<(), String> {
+    session.stop();
     threads.wait()
-}
-
-async fn stop_livekit(threads: &ThreadManager, session: LiveKitSession) -> Result<(), String> {
-    let (tx, rx) = oneshot::channel();
-    threads.spawn("voice-livekit-stop", move || {
-        let result = session.stop();
-        let _ = tx.send(result);
-    })?;
-    rx.await
-        .map_err(|_| "LiveKit stop task dropped before signalling".to_string())??;
-    threads.wait()
-}
-
-struct LiveKitSession {
-    ctx: SessionCtx,
-    settings: SessionSettingsKey,
-    commands: mpsc::Sender<LiveKitCommand>,
-    done: Arc<AtomicBool>,
-    finished: Arc<AtomicBool>,
-    bridge_cancel: Arc<AtomicBool>,
-    mic_enabled: Arc<AtomicBool>,
-}
-
-enum LiveKitCommand {
-    Interrupt,
-    SetMicEnabled(bool),
-    Stop,
-}
-
-impl LiveKitSession {
-    fn spawn(
-        threads: &ThreadManager,
-        ctx: SessionCtx,
-        settings: VoiceSettings,
-        grant: LiveKitGrant,
-        channel: tauri::ipc::Channel<VoiceEvent>,
-        bridge: Option<SessionBridgeConfig>,
-        wake: mpsc::Sender<RuntimeCommand>,
-    ) -> Result<Self, String> {
-        let key = SessionSettingsKey::livekit(&settings);
-        let channel = UiEvents::new(channel);
-        let (commands, rx) = mpsc::channel(LIVEKIT_COMMAND_CAP);
-        let done = Arc::new(AtomicBool::new(false));
-        let finished = Arc::new(AtomicBool::new(false));
-        let bridge_cancel = Arc::new(AtomicBool::new(false));
-        let mic_enabled = Arc::new(AtomicBool::new(true));
-        let thread_done = done.clone();
-        let thread_finished = finished.clone();
-        let thread_bridge_cancel = bridge_cancel.clone();
-        let thread_mic = mic_enabled.clone();
-        let thread_manager = threads.clone();
-        threads.spawn("voice-livekit-session", move || {
-            tauri::async_runtime::block_on(livekit_session_loop(
-                thread_manager,
-                grant,
-                settings,
-                channel,
-                bridge,
-                rx,
-                thread_done,
-                thread_bridge_cancel,
-                thread_mic,
-                wake.clone(),
-            ));
-            thread_finished.store(true, Ordering::SeqCst);
-            wake_kernel(&wake);
-        })?;
-        Ok(Self {
-            ctx,
-            settings: key,
-            commands,
-            done,
-            finished,
-            bridge_cancel,
-            mic_enabled,
-        })
-    }
-
-    fn is_finished(&self) -> bool {
-        self.finished.load(Ordering::SeqCst)
-    }
-
-    async fn interrupt(&self) -> Result<(), String> {
-        self.bridge_cancel.store(true, Ordering::SeqCst);
-        self.send(LiveKitCommand::Interrupt).await
-    }
-
-    async fn set_mic_enabled(&self, enabled: bool) -> Result<(), String> {
-        self.send(LiveKitCommand::SetMicEnabled(enabled)).await?;
-        self.mic_enabled.store(enabled, Ordering::SeqCst);
-        Ok(())
-    }
-
-    fn mic_enabled(&self) -> bool {
-        self.mic_enabled.load(Ordering::SeqCst)
-    }
-
-    fn stop(self) -> Result<(), String> {
-        if !self.done.swap(true, Ordering::SeqCst) {
-            self.bridge_cancel.store(true, Ordering::SeqCst);
-            let _ = self.commands.try_send(LiveKitCommand::Stop);
-        }
-        Ok(())
-    }
-
-    async fn send(&self, command: LiveKitCommand) -> Result<(), String> {
-        if self.done.load(Ordering::SeqCst) {
-            return Ok(());
-        }
-        match self.commands.send(command).await {
-            Ok(()) => Ok(()),
-            Err(_) => {
-                self.done.store(true, Ordering::SeqCst);
-                Err("LiveKit command queue closed".into())
-            }
-        }
-    }
-}
-
-impl Drop for LiveKitSession {
-    fn drop(&mut self) {
-        if self.done.swap(true, Ordering::SeqCst) {
-            return;
-        }
-        self.bridge_cancel.store(true, Ordering::SeqCst);
-        let _ = self.commands.try_send(LiveKitCommand::Stop);
-    }
-}
-
-async fn livekit_session_loop(
-    threads: ThreadManager,
-    grant: LiveKitGrant,
-    settings: VoiceSettings,
-    channel: UiChannel,
-    bridge: Option<SessionBridgeConfig>,
-    mut rx: mpsc::Receiver<LiveKitCommand>,
-    done: Arc<AtomicBool>,
-    bridge_cancel: Arc<AtomicBool>,
-    mic_enabled: Arc<AtomicBool>,
-    wake: mpsc::Sender<RuntimeCommand>,
-) {
-    if !send_livekit(
-        &channel,
-        &done,
-        VoiceEvent::State {
-            state: VoiceState::Loading,
-        },
-    ) {
-        return;
-    }
-    let vad_threshold = settings.lfm2.vad_threshold;
-    let interrupts_playback = can_interrupt_playback(&settings);
-    let engine = match build_engine(settings, LIVEKIT_AGENT_AUDIO_RATE, None) {
-        Ok(engine) => engine,
-        Err(error) => {
-            livekit_fail(
-                &channel,
-                &done,
-                format!("Native LiveKit agent model load failed: {error}"),
-            );
-            return;
-        }
-    };
-    let agent_pipe = match NativeAgentPipe::spawn(engine) {
-        Ok(pipe) => pipe,
-        Err(error) => {
-            livekit_fail(
-                &channel,
-                &done,
-                format!("Native LiveKit agent pipeline failed to start: {error}"),
-            );
-            return;
-        }
-    };
-    let Some(agent_handle) = agent_pipe.handle() else {
-        livekit_fail(
-            &channel,
-            &done,
-            "Native LiveKit agent pipeline failed to expose its control handle.".into(),
-        );
-        return;
-    };
-
-    let options = livekit_room_options();
-    let agent_options = livekit_room_options();
-
-    let (room, mut events) =
-        match livekit_until_done(&done, Room::connect(&grant.url, &grant.token, options)).await {
-            Some(Ok(room)) => room,
-            Some(Err(error)) => {
-                livekit_fail(&channel, &done, format!("LiveKit connect failed: {error}"));
-                return;
-            }
-            None => return,
-        };
-    let audio = match PlatformAudio::new() {
-        Ok(audio) => audio,
-        Err(error) => {
-            let _ = room.close().await;
-            livekit_fail(
-                &channel,
-                &done,
-                format!("LiveKit audio device failed: {error}"),
-            );
-            return;
-        }
-    };
-    if let Err(error) = configure_livekit_audio(&audio) {
-        let _ = room.close().await;
-        livekit_fail(
-            &channel,
-            &done,
-            format!("LiveKit audio processing failed: {error}"),
-        );
-        return;
-    }
-    let track = LocalAudioTrack::create_audio_track("microphone", audio.rtc_source());
-    let user = room.local_participant();
-    match livekit_until_done(
-        &done,
-        user.publish_track(
-            LocalTrack::Audio(track.clone()),
-            TrackPublishOptions {
-                source: TrackSource::Microphone,
-                ..Default::default()
-            },
-        ),
-    )
-    .await
-    {
-        Some(Ok(_)) => {}
-        Some(Err(error)) => {
-            let _ = room.close().await;
-            livekit_fail(
-                &channel,
-                &done,
-                format!("LiveKit microphone publish failed: {error}"),
-            );
-            return;
-        }
-        None => {
-            let _ = room.close().await;
-            return;
-        }
-    }
-    let (agent_room, mut agent_events) = match livekit_until_done(
-        &done,
-        Room::connect(&grant.url, &grant.agent_token, agent_options),
-    )
-    .await
-    {
-        Some(Ok(room)) => room,
-        Some(Err(error)) => {
-            let _ = room.close().await;
-            livekit_fail(
-                &channel,
-                &done,
-                format!("Native LiveKit agent connect failed: {error}"),
-            );
-            return;
-        }
-        None => {
-            let _ = room.close().await;
-            return;
-        }
-    };
-    let agent_source = NativeAudioSource::new(
-        AudioSourceOptions::default(),
-        LIVEKIT_AGENT_AUDIO_RATE,
-        LIVEKIT_AGENT_AUDIO_CHANNELS,
-        LIVEKIT_AGENT_AUDIO_QUEUE_MS,
-    );
-    let playback = LiveKitPlaybackReference::new();
-    let agent_track = LocalAudioTrack::create_audio_track(
-        "assistant",
-        RtcAudioSource::Native(agent_source.clone()),
-    );
-    let agent = agent_room.local_participant();
-    match livekit_until_done(
-        &done,
-        agent.publish_track(
-            LocalTrack::Audio(agent_track),
-            TrackPublishOptions {
-                source: TrackSource::Microphone,
-                ..Default::default()
-            },
-        ),
-    )
-    .await
-    {
-        Some(Ok(_)) => {}
-        Some(Err(error)) => {
-            let _ = agent_room.close().await;
-            let _ = room.close().await;
-            livekit_fail(
-                &channel,
-                &done,
-                format!("Native LiveKit agent audio publish failed: {error}"),
-            );
-            return;
-        }
-        None => {
-            let _ = agent_room.close().await;
-            let _ = room.close().await;
-            return;
-        }
-    }
-    let agent_events_spawned = spawn_native_livekit_agent_events(
-        &threads,
-        agent_pipe.events(),
-        agent_source.clone(),
-        channel.clone(),
-        done.clone(),
-        bridge,
-        bridge_cancel.clone(),
-        mic_enabled.clone(),
-        playback.clone(),
-        wake.clone(),
-    )
-    .map_err(|error| {
-        livekit_fail(&channel, &done, error);
-    })
-    .ok();
-    if agent_events_spawned.is_none() {
-        let _ = agent_room.close().await;
-        let _ = room.close().await;
-        return;
-    };
-    if !mic_enabled.load(Ordering::SeqCst)
-        && !livekit_set_mic(&audio, &track, false, &channel, &done)
-    {
-        let _ = agent_room.close().await;
-        let _ = room.close().await;
-        return;
-    }
-    if !reset_livekit_audio_state_or_done(&channel, &done, mic_enabled.load(Ordering::SeqCst)) {
-        let _ = room.close().await;
-        return;
-    }
-
-    let mut ended = false;
-    let mut audio_tasks = Vec::<LiveKitMediaTask>::new();
-    let mut agent_audio_tasks = Vec::<LiveKitMediaTask>::new();
-    let agent_audio_timeout =
-        tokio::time::sleep(Duration::from_millis(LIVEKIT_AGENT_AUDIO_TIMEOUT_MS));
-    tokio::pin!(agent_audio_timeout);
-    let mut done_poll = tokio::time::interval(Duration::from_millis(LIVEKIT_DONE_POLL_MS));
-    done_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut remote_audio_seen = false;
-    loop {
-        tokio::select! {
-            _ = done_poll.tick(), if done.load(Ordering::SeqCst) => {
-                break;
-            }
-            _ = &mut agent_audio_timeout, if !remote_audio_seen => {
-                livekit_fail(
-                    &channel,
-                    &done,
-                    format!(
-                        "Native LiveKit agent audio track did not subscribe within {}s.",
-                        LIVEKIT_AGENT_AUDIO_TIMEOUT_MS / 1000,
-                    ),
-                );
-                ended = true;
-                break;
-            }
-            command = rx.recv() => {
-                let Some(command) = command else {
-                    break;
-                };
-                if done.load(Ordering::SeqCst) && !matches!(command, LiveKitCommand::Stop) {
-                    break;
-                }
-                match command {
-                    LiveKitCommand::Interrupt => {
-                        bridge_cancel.store(true, Ordering::SeqCst);
-                        agent_handle.interrupt();
-                        agent_source.clear_buffer();
-                        playback.clear();
-                        send_livekit_interrupt(&room).await;
-                        if !reset_livekit_audio_state_or_done(
-                            &channel,
-                            &done,
-                            mic_enabled.load(Ordering::SeqCst),
-                        )
-                        {
-                            break;
-                        }
-                    }
-                    LiveKitCommand::SetMicEnabled(enabled) => {
-                        mic_enabled.store(enabled, Ordering::SeqCst);
-                        if !livekit_set_mic(&audio, &track, enabled, &channel, &done) {
-                            break;
-                        }
-                    }
-                    LiveKitCommand::Stop => {
-                        break;
-                    }
-                }
-            }
-            event = events.recv() => {
-                let Some(event) = event else {
-                    break;
-                };
-                if livekit_agent_audio_subscribed(&event, &grant.agent_identity) {
-                    remote_audio_seen = true;
-                }
-                if let Some(reason) = handle_livekit_event(
-                    &threads,
-                    &channel,
-                    event,
-                    &mut audio_tasks,
-                    &done,
-                    &mic_enabled,
-                    &grant.agent_identity,
-                ) {
-                    if let Some(reason) = reason {
-                        let _ = send_livekit(
-                            &channel,
-                            &done,
-                            VoiceEvent::Ended {
-                                reason: Some(reason),
-                            },
-                        );
-                        ended = true;
-                    }
-                    break;
-                }
-            }
-            event = agent_events.recv() => {
-                let Some(event) = event else {
-                    break;
-                };
-                handle_native_livekit_agent_event(
-                    &threads,
-                    event,
-                    &grant.user_identity,
-                    &mut agent_audio_tasks,
-                    agent_handle.clone(),
-                    channel.clone(),
-                    done.clone(),
-                    mic_enabled.clone(),
-                    playback.clone(),
-                    vad_threshold,
-                    interrupts_playback,
-                );
-            }
-        }
-    }
-
-    done.store(true, Ordering::SeqCst);
-    cancel_livekit_media_tasks(&mut agent_audio_tasks);
-    cancel_livekit_media_tasks(&mut audio_tasks);
-    let _ = threads.wait();
-    drop(agent_pipe);
-    let _ = agent_room.close().await;
-    let _ = room.close().await;
-    if !ended {
-        let _ = send_livekit(&channel, &done, VoiceEvent::Ended { reason: None });
-    }
-}
-
-fn livekit_room_options() -> RoomOptions {
-    let mut options = RoomOptions::default();
-    options.auto_subscribe = true;
-    options.dynacast = true;
-    options
-}
-
-fn spawn_native_livekit_agent_events(
-    threads: &ThreadManager,
-    events: Receiver<RealtimeEvent>,
-    source: NativeAudioSource,
-    channel: UiChannel,
-    done: Arc<AtomicBool>,
-    bridge: Option<SessionBridgeConfig>,
-    bridge_cancel: Arc<AtomicBool>,
-    mic_enabled: Arc<AtomicBool>,
-    playback: Arc<LiveKitPlaybackReference>,
-    wake: mpsc::Sender<RuntimeCommand>,
-) -> Result<(), String> {
-    let bridge_threads = threads.clone();
-    threads.spawn("voice-livekit-agent-events", move || {
-        let mut bridge_state =
-            BridgeState::new(bridge_threads, channel.clone(), bridge, bridge_cancel, wake);
-        let mut transcript = String::new();
-        while !done.load(Ordering::SeqCst) {
-            match events.recv_timeout(Duration::from_millis(50)) {
-                Ok(RealtimeEvent::Text(text)) => {
-                    bridge_state.handle_realtime_text(&text);
-                    transcript.push_str(&text);
-                    if !send(
-                        &channel,
-                        VoiceEvent::Transcript {
-                            role: Role::Assistant,
-                            text: transcript.clone(),
-                        },
-                    ) {
-                        done.store(true, Ordering::SeqCst);
-                        break;
-                    }
-                }
-                Ok(RealtimeEvent::Audio { pcm, rate }) => {
-                    bridge_state.handle_realtime_audio();
-                    // Rate-honest hand-off (the real-deal bug): consume the rate
-                    // the event CARRIES — never re-assert the constant. The
-                    // engine is built with LIVEKIT_AGENT_AUDIO_RATE, so a
-                    // mismatch here is a wiring bug; write() below hard-errors
-                    // on it rather than playing half-speed rumble.
-                    playback.observe(&pcm, rate);
-                    if !send(
-                        &channel,
-                        VoiceEvent::State {
-                            state: VoiceState::Speaking,
-                        },
-                    ) {
-                        done.store(true, Ordering::SeqCst);
-                        break;
-                    }
-                    let rms = rms_f32(&pcm);
-                    if rate != LIVEKIT_AGENT_AUDIO_RATE {
-                        let _ = send(
-                            &channel,
-                            VoiceEvent::Error {
-                                message: format!(
-                                    "engine audio at {rate} Hz, output track at {} Hz — rate wiring bug",
-                                    LIVEKIT_AGENT_AUDIO_RATE
-                                ),
-                            },
-                        );
-                        done.store(true, Ordering::SeqCst);
-                        break;
-                    }
-                    for frame in livekit_audio_frames(
-                        &pcm,
-                        rate,
-                        LIVEKIT_AGENT_AUDIO_CHANNELS,
-                    ) {
-                        if done.load(Ordering::SeqCst) {
-                            break;
-                        }
-                        if let Err(error) =
-                            tauri::async_runtime::block_on(source.capture_frame(&frame))
-                        {
-                            done.store(true, Ordering::SeqCst);
-                            let _ = send(
-                                &channel,
-                                VoiceEvent::Error {
-                                    message: format!(
-                                        "Native LiveKit agent audio publish failed: {error}"
-                                    ),
-                                },
-                            );
-                            return;
-                        }
-                    }
-                    if !send(&channel, VoiceEvent::Level { rms }) {
-                        done.store(true, Ordering::SeqCst);
-                        break;
-                    }
-                }
-                Ok(RealtimeEvent::TurnComplete) => {
-                    bridge_state.handle_realtime_turn_complete();
-                    transcript.clear();
-                    if !reset_livekit_audio_state_or_done(
-                        &channel,
-                        &done,
-                        mic_enabled.load(Ordering::SeqCst),
-                    ) {
-                        break;
-                    }
-                }
-                Ok(RealtimeEvent::Interrupted) => {
-                    bridge_state.handle_realtime_interrupted();
-                    transcript.clear();
-                    source.clear_buffer();
-                    playback.clear();
-                    if !reset_livekit_audio_state_or_done(
-                        &channel,
-                        &done,
-                        mic_enabled.load(Ordering::SeqCst),
-                    ) {
-                        break;
-                    }
-                }
-                Ok(RealtimeEvent::Error(message)) => {
-                    bridge_state.handle_realtime_error();
-                    if !send_livekit(&channel, &done, VoiceEvent::Error { message }) {
-                        break;
-                    }
-                    if !reset_livekit_audio_state_or_done(
-                        &channel,
-                        &done,
-                        mic_enabled.load(Ordering::SeqCst),
-                    ) {
-                        break;
-                    }
-                }
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => break,
-            }
-        }
-    })
-}
-
-struct LiveKitMediaTask {
-    cancel: Arc<AtomicBool>,
-}
-
-impl LiveKitMediaTask {
-    fn cancel(self) {
-        self.cancel.store(true, Ordering::SeqCst);
-    }
-}
-
-enum NativeAgentPipe {
-    Turn(RealtimePipeline),
-    Frame(RealtimeFramePipeline),
-}
-
-impl NativeAgentPipe {
-    fn spawn(engine: Box<dyn VoiceEngine>) -> Result<Self, String> {
-        if engine.frame_config().is_some() {
-            return RealtimeFramePipeline::spawn(engine).map(Self::Frame);
-        }
-        RealtimePipeline::spawn(engine).map(Self::Turn)
-    }
-
-    fn events(&self) -> Receiver<RealtimeEvent> {
-        match self {
-            Self::Turn(pipe) => pipe.events().clone(),
-            Self::Frame(pipe) => pipe.events().clone(),
-        }
-    }
-
-    fn handle(&self) -> Option<NativeAgentHandle> {
-        match self {
-            Self::Turn(pipe) => pipe.handle().map(NativeAgentHandle::Turn),
-            Self::Frame(pipe) => pipe.handle().map(NativeAgentHandle::Frame),
-        }
-    }
-}
-
-#[derive(Clone)]
-enum NativeAgentHandle {
-    Turn(RealtimePipelineHandle),
-    Frame(RealtimeFramePipelineHandle),
-}
-
-impl NativeAgentHandle {
-    fn interrupt(&self) {
-        match self {
-            Self::Turn(handle) => handle.interrupt(),
-            Self::Frame(handle) => handle.interrupt(),
-        }
-    }
-}
-
-fn cancel_livekit_media_tasks(tasks: &mut Vec<LiveKitMediaTask>) {
-    for task in tasks.drain(..) {
-        task.cancel();
-    }
-}
-
-fn livekit_media_cancelled(done: &Arc<AtomicBool>, cancel: &Arc<AtomicBool>) -> bool {
-    done.load(Ordering::SeqCst) || cancel.load(Ordering::SeqCst)
-}
-
-struct LiveKitPlaybackReference {
-    until_ms: AtomicU64,
-    rms_bits: AtomicU32,
-}
-
-impl LiveKitPlaybackReference {
-    fn new() -> Arc<Self> {
-        Arc::new(Self {
-            until_ms: AtomicU64::new(0),
-            rms_bits: AtomicU32::new(0.0f32.to_bits()),
-        })
-    }
-
-    fn observe(&self, pcm: &[f32], rate: u32) {
-        let audio_ms = if rate == 0 {
-            0
-        } else {
-            (pcm.len() as u64).saturating_mul(1000) / rate as u64
-        };
-        let until = livekit_now_ms()
-            .saturating_add(audio_ms)
-            .saturating_add(LIVEKIT_AGENT_ECHO_GATE_MS);
-        self.rms_bits
-            .store(rms_f32(pcm).to_bits(), Ordering::SeqCst);
-        self.until_ms.fetch_max(until, Ordering::SeqCst);
-    }
-
-    fn clear(&self) {
-        self.until_ms.store(0, Ordering::SeqCst);
-        self.rms_bits.store(0.0f32.to_bits(), Ordering::SeqCst);
-    }
-
-    fn active(&self) -> bool {
-        self.until_ms.load(Ordering::SeqCst) > livekit_now_ms()
-    }
-
-    fn reference_vad_threshold(&self, base: f32) -> f32 {
-        if !self.active() {
-            return base;
-        }
-        let rms = f32::from_bits(self.rms_bits.load(Ordering::SeqCst));
-        base.max(rms * LIVEKIT_AGENT_ECHO_MULTIPLIER)
-    }
-}
-
-fn livekit_now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
-        .unwrap_or(0)
-}
-
-fn handle_native_livekit_agent_event(
-    threads: &ThreadManager,
-    event: RoomEvent,
-    user_identity: &str,
-    audio_tasks: &mut Vec<LiveKitMediaTask>,
-    handle: NativeAgentHandle,
-    channel: UiChannel,
-    done: Arc<AtomicBool>,
-    mic_enabled: Arc<AtomicBool>,
-    playback: Arc<LiveKitPlaybackReference>,
-    vad_threshold: f32,
-    can_interrupt_playback: bool,
-) {
-    match event {
-        RoomEvent::TrackSubscribed {
-            track: RemoteTrack::Audio(track),
-            participant,
-            ..
-        } => {
-            if participant.identity().0 != user_identity {
-                return;
-            }
-            match spawn_native_livekit_agent_mic(
-                threads,
-                handle,
-                track,
-                channel.clone(),
-                done.clone(),
-                mic_enabled,
-                playback,
-                vad_threshold,
-                can_interrupt_playback,
-            ) {
-                Ok(task) => audio_tasks.push(task),
-                Err(error) => livekit_fail(&channel, &done, error),
-            }
-        }
-        RoomEvent::TrackUnsubscribed {
-            track: RemoteTrack::Audio(_),
-            participant,
-            ..
-        } => {
-            if participant.identity().0 != user_identity {
-                return;
-            }
-            cancel_livekit_media_tasks(audio_tasks);
-            let _ = threads.reap();
-        }
-        RoomEvent::ConnectionStateChanged(ConnectionState::Disconnected)
-        | RoomEvent::Disconnected { .. } => {
-            done.store(true, Ordering::SeqCst);
-        }
-        _ => {}
-    }
-}
-
-fn spawn_native_livekit_agent_mic(
-    threads: &ThreadManager,
-    handle: NativeAgentHandle,
-    track: RemoteAudioTrack,
-    channel: UiChannel,
-    done: Arc<AtomicBool>,
-    mic_enabled: Arc<AtomicBool>,
-    playback: Arc<LiveKitPlaybackReference>,
-    vad_threshold: f32,
-    can_interrupt_playback: bool,
-) -> Result<LiveKitMediaTask, String> {
-    let cancel = Arc::new(AtomicBool::new(false));
-    let thread_cancel = cancel.clone();
-    threads.spawn("voice-livekit-agent-mic", move || {
-        tauri::async_runtime::block_on(native_livekit_agent_mic_loop(
-            handle,
-            track,
-            channel,
-            done,
-            mic_enabled,
-            playback,
-            vad_threshold,
-            can_interrupt_playback,
-            thread_cancel,
-        ));
-    })?;
-    Ok(LiveKitMediaTask { cancel })
-}
-
-async fn native_livekit_agent_mic_loop(
-    handle: NativeAgentHandle,
-    track: RemoteAudioTrack,
-    channel: UiChannel,
-    done: Arc<AtomicBool>,
-    mic_enabled: Arc<AtomicBool>,
-    playback: Arc<LiveKitPlaybackReference>,
-    vad_threshold: f32,
-    can_interrupt_playback: bool,
-    cancel: Arc<AtomicBool>,
-) {
-    match handle {
-        NativeAgentHandle::Turn(handle) => {
-            native_livekit_agent_turn_mic_loop(
-                handle,
-                track,
-                channel,
-                done,
-                mic_enabled,
-                playback,
-                vad_threshold,
-                can_interrupt_playback,
-                cancel,
-            )
-            .await;
-        }
-        NativeAgentHandle::Frame(handle) => {
-            native_livekit_agent_frame_mic_loop(
-                handle,
-                track,
-                channel,
-                done,
-                mic_enabled,
-                playback,
-                vad_threshold,
-                can_interrupt_playback,
-                cancel,
-            )
-            .await;
-        }
-    }
-}
-
-async fn native_livekit_agent_turn_mic_loop(
-    handle: RealtimePipelineHandle,
-    track: RemoteAudioTrack,
-    channel: UiChannel,
-    done: Arc<AtomicBool>,
-    mic_enabled: Arc<AtomicBool>,
-    playback: Arc<LiveKitPlaybackReference>,
-    vad_threshold: f32,
-    can_interrupt_playback: bool,
-    cancel: Arc<AtomicBool>,
-) {
-    let mut stream = NativeAudioStream::new(
-        track.rtc_track(),
-        LIVEKIT_AGENT_AUDIO_RATE_I32,
-        LIVEKIT_AGENT_AUDIO_CHANNELS_I32,
-    );
-    let silence = Duration::from_millis(LIVEKIT_AGENT_SILENCE_MS);
-    let mut poll = tokio::time::interval(Duration::from_millis(LIVEKIT_DONE_POLL_MS));
-    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut speaking = false;
-    let mut last_voice = Instant::now();
-    let mut samples = Vec::<f32>::new();
-    while !livekit_media_cancelled(&done, &cancel) {
-        let frame = tokio::select! {
-            frame = stream.next() => frame,
-            _ = poll.tick() => {
-                if livekit_media_cancelled(&done, &cancel) {
-                    break;
-                }
-                continue;
-            }
-        };
-        let Some(frame) = frame else {
-            break;
-        };
-        if !mic_enabled.load(Ordering::SeqCst) {
-            speaking = false;
-            samples.clear();
-            continue;
-        }
-        let rate = frame.sample_rate;
-        if rate == 0 {
-            let _ = send_livekit(
-                &channel,
-                &done,
-                VoiceEvent::Error {
-                    message: "native LiveKit microphone frame sample rate is zero".into(),
-                },
-            );
-            break;
-        }
-        let pcm = i16_to_f32(frame.data.as_ref());
-        let rms = rms_f32(&pcm);
-        if playback.active() && !can_interrupt_playback {
-            speaking = false;
-            samples.clear();
-            continue;
-        }
-        let threshold = playback.reference_vad_threshold(vad_threshold);
-        if rms > threshold {
-            if !speaking {
-                speaking = true;
-                samples.clear();
-            }
-            last_voice = Instant::now();
-        } else if playback.active() {
-            speaking = false;
-            samples.clear();
-            continue;
-        }
-        if !speaking {
-            continue;
-        }
-        samples.extend_from_slice(&pcm);
-        let too_long = samples.len() >= rate as usize * LIVEKIT_AGENT_MAX_UTTERANCE_SECONDS;
-        let silent = last_voice.elapsed() >= silence;
-        if !silent && !too_long {
-            continue;
-        }
-        let utt = Utterance {
-            samples: std::mem::take(&mut samples),
-            rate,
-        };
-        speaking = false;
-        handle.interrupt();
-        if !handle.submit(utt) {
-            handle.interrupt();
-            samples.clear();
-            if !send_livekit(
-                &channel,
-                &done,
-                VoiceEvent::State {
-                    state: VoiceState::Listening,
-                },
-            ) {
-                break;
-            }
-            continue;
-        }
-        if !send_livekit(
-            &channel,
-            &done,
-            VoiceEvent::State {
-                state: VoiceState::Thinking,
-            },
-        ) {
-            break;
-        }
-    }
-}
-
-async fn native_livekit_agent_frame_mic_loop(
-    handle: RealtimeFramePipelineHandle,
-    track: RemoteAudioTrack,
-    channel: UiChannel,
-    done: Arc<AtomicBool>,
-    mic_enabled: Arc<AtomicBool>,
-    _playback: Arc<LiveKitPlaybackReference>,
-    _vad_threshold: f32,
-    _can_interrupt_playback: bool,
-    cancel: Arc<AtomicBool>,
-) {
-    let mut stream = NativeAudioStream::new(
-        track.rtc_track(),
-        LIVEKIT_AGENT_AUDIO_RATE_I32,
-        LIVEKIT_AGENT_AUDIO_CHANNELS_I32,
-    );
-    let frame = handle.config();
-    let mut resampler = LiveKitFrameResampler::new(LIVEKIT_AGENT_AUDIO_RATE, frame.sample_rate);
-    let mut model = Vec::with_capacity(frame.frame_size * 2);
-    let mut poll = tokio::time::interval(Duration::from_millis(LIVEKIT_DONE_POLL_MS));
-    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let interval = Duration::from_secs_f64(frame.frame_size as f64 / frame.sample_rate as f64);
-    let mut silence = tokio::time::interval(interval);
-    silence.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    silence.tick().await;
-    let mut next_silence = Instant::now() + interval;
-    let mut backpressure_reported = false;
-    while !livekit_media_cancelled(&done, &cancel) {
-        let (source, audio) = tokio::select! {
-            frame = stream.next() => (0u8, frame),
-            _ = poll.tick() => {
-                if livekit_media_cancelled(&done, &cancel) {
-                    break;
-                }
-                (1u8, None)
-            }
-            _ = silence.tick() => {
-                if livekit_media_cancelled(&done, &cancel) {
-                    break;
-                }
-                (2u8, None)
-            }
-        };
-        if source == 1 {
-            continue;
-        }
-        match source {
-            2 => {
-                if !mic_enabled.load(Ordering::SeqCst) {
-                    continue;
-                }
-                let now = Instant::now();
-                if now < next_silence {
-                    continue;
-                }
-                pad_next_livekit_model_frame(&mut model, frame.frame_size);
-                next_silence = now + interval;
-            }
-            _ => {
-                let Some(audio) = audio else {
-                    break;
-                };
-                if !mic_enabled.load(Ordering::SeqCst) {
-                    // Mic paused — stop feeding frames but keep the loop alive.
-                    // Don't clear the model buffer; when mic resumes, we pick up
-                    // the live stream. Moshi handles silence frames natively.
-                    continue;
-                }
-                if audio.sample_rate == 0 {
-                    let _ = send_livekit(
-                        &channel,
-                        &done,
-                        VoiceEvent::Error {
-                            message: "native LiveKit microphone frame sample rate is zero".into(),
-                        },
-                    );
-                    break;
-                }
-                let pcm = i16_to_f32(audio.data.as_ref());
-                // Full-duplex Moshi semantics: always feed real mic audio to the model.
-                // No VAD gating, no mic zeroing, no barge-in resets. The multistream LM
-                // handles turn-taking natively. Echo/AEC is handled by WebRTC's
-                // PlatformAudio (AEC/NS/AGC), not by zeroing model input.
-                // Explicit Stop/Interrupt are session-level controls only.
-                let rate = audio.sample_rate as u32;
-                if resampler.from() != rate {
-                    resampler = LiveKitFrameResampler::new(rate, frame.sample_rate);
-                    model.clear();
-                }
-                model.extend(resampler.process(&pcm));
-            }
-        }
-        while model.len() >= frame.frame_size {
-            let next = model[..frame.frame_size].to_vec();
-            model.drain(..frame.frame_size);
-            match handle.try_submit_frame(next) {
-                Ok(()) => {
-                    backpressure_reported = false;
-                    next_silence = Instant::now() + interval;
-                    continue;
-                }
-                Err(FrameSubmitError::Full) => {
-                    // Queue pressure is timing pressure, not a semantic
-                    // interruption. Keep the Moshi stream state intact and
-                    // drop buffered capture until inference catches up.
-                    model.clear();
-                    if !backpressure_reported {
-                        backpressure_reported = true;
-                        if !send_livekit(
-                            &channel,
-                            &done,
-                            VoiceEvent::State {
-                                state: VoiceState::Listening,
-                            },
-                        ) {
-                            break;
-                        }
-                    }
-                }
-                Err(FrameSubmitError::Disconnected | FrameSubmitError::WrongSize) => break,
-            }
-            break;
-        }
-        if model.len() > frame.frame_size * 4 {
-            model.clear();
-        }
-    }
-}
-
-fn pad_next_livekit_model_frame(model: &mut Vec<f32>, frame_size: usize) {
-    if frame_size == 0 {
-        return;
-    }
-    let partial = model.len() % frame_size;
-    let needed = if partial == 0 {
-        frame_size
-    } else {
-        frame_size - partial
-    };
-    model.resize(model.len() + needed, 0.0);
-}
-
-struct LiveKitFrameResampler {
-    from: u32,
-    to: u32,
-    carry: Option<f32>,
-}
-
-impl LiveKitFrameResampler {
-    fn new(from: u32, to: u32) -> Self {
-        Self {
-            from,
-            to,
-            carry: None,
-        }
-    }
-
-    fn from(&self) -> u32 {
-        self.from
-    }
-
-    fn process(&mut self, input: &[f32]) -> Vec<f32> {
-        if input.is_empty() || self.from == 0 || self.to == 0 {
-            return Vec::new();
-        }
-        if self.from == self.to {
-            return input.to_vec();
-        }
-        if self.from == self.to.saturating_mul(2) {
-            return self.downsample_by_two(input);
-        }
-        self.carry = input.last().copied();
-        liquid_audio::resample::resample_slice(input, self.from, self.to)
-    }
-
-    fn downsample_by_two(&mut self, input: &[f32]) -> Vec<f32> {
-        let mut out = Vec::with_capacity(input.len() / 2 + 1);
-        let mut start = 0usize;
-        if let Some(prev) = self.carry.take() {
-            if let Some(&sample) = input.first() {
-                out.push((prev + sample) * 0.5);
-                start = 1;
-            }
-        }
-        let pairs = &input[start..];
-        for pair in pairs.chunks_exact(2) {
-            out.push((pair[0] + pair[1]) * 0.5);
-        }
-        if pairs.len() % 2 == 1 {
-            self.carry = pairs.last().copied();
-        }
-        out
-    }
-}
-
-async fn send_livekit_interrupt(room: &Room) {
-    let packet = DataPacket {
-        payload: LIVEKIT_CONTROL_INTERRUPT.to_vec(),
-        topic: Some(LIVEKIT_CONTROL_TOPIC.to_string()),
-        reliable: true,
-        ..Default::default()
-    };
-    let _ = room.local_participant().publish_data(packet).await;
-}
-
-fn livekit_set_mic(
-    audio: &PlatformAudio,
-    track: &LocalAudioTrack,
-    enabled: bool,
-    channel: &UiChannel,
-    done: &Arc<AtomicBool>,
-) -> bool {
-    if enabled {
-        track.enable();
-        track.unmute();
-        let _ = audio.start_recording();
-        return send_livekit(
-            channel,
-            done,
-            VoiceEvent::State {
-                state: VoiceState::Listening,
-            },
-        );
-    }
-    track.mute();
-    track.disable();
-    let _ = audio.stop_recording();
-    if !send_livekit(
-        channel,
-        done,
-        VoiceEvent::State {
-            state: VoiceState::Idle,
-        },
-    ) {
-        return false;
-    }
-    send_livekit(channel, done, VoiceEvent::Level { rms: 0.0 })
-}
-
-fn configure_livekit_audio(audio: &PlatformAudio) -> Result<(), String> {
-    audio
-        .configure_audio_processing(AudioProcessingOptions {
-            echo_cancellation: true,
-            noise_suppression: true,
-            auto_gain_control: true,
-            prefer_hardware_processing: false,
-        })
-        .map_err(|e| e.to_string())
-}
-
-fn handle_livekit_event(
-    threads: &ThreadManager,
-    channel: &UiChannel,
-    event: RoomEvent,
-    audio_tasks: &mut Vec<LiveKitMediaTask>,
-    done: &Arc<AtomicBool>,
-    mic_enabled: &Arc<AtomicBool>,
-    agent_identity: &str,
-) -> Option<Option<String>> {
-    match event {
-        RoomEvent::ConnectionStateChanged(ConnectionState::Connected) => {
-            if !reset_livekit_audio_state_or_done(channel, done, mic_enabled.load(Ordering::SeqCst))
-            {
-                return Some(None);
-            }
-            None
-        }
-        RoomEvent::ConnectionStateChanged(ConnectionState::Reconnecting) => {
-            if !send_livekit(
-                channel,
-                done,
-                VoiceEvent::State {
-                    state: VoiceState::Loading,
-                },
-            ) {
-                return Some(None);
-            }
-            None
-        }
-        RoomEvent::ConnectionStateChanged(ConnectionState::Disconnected) => Some(None),
-        RoomEvent::Disconnected { reason } => Some(Some(format!("{reason:?}"))),
-        RoomEvent::TrackSubscribed {
-            track, participant, ..
-        } => {
-            if participant.identity().0 != agent_identity {
-                return None;
-            }
-            if let RemoteTrack::Audio(track) = track {
-                match spawn_livekit_audio_monitor(
-                    threads,
-                    channel.clone(),
-                    track,
-                    done.clone(),
-                    mic_enabled.clone(),
-                ) {
-                    Ok(task) => audio_tasks.push(task),
-                    Err(error) => {
-                        livekit_fail(channel, done, error);
-                        return Some(None);
-                    }
-                }
-            }
-            None
-        }
-        RoomEvent::TrackUnsubscribed {
-            track, participant, ..
-        } => {
-            if participant.identity().0 != agent_identity {
-                return None;
-            }
-            if matches!(track, RemoteTrack::Audio(_)) {
-                if !clear_livekit_audio(
-                    threads,
-                    channel,
-                    done,
-                    audio_tasks,
-                    mic_enabled.load(Ordering::SeqCst),
-                ) {
-                    return Some(None);
-                }
-            }
-            None
-        }
-        _ => None,
-    }
-}
-
-fn livekit_agent_audio_subscribed(event: &RoomEvent, agent_identity: &str) -> bool {
-    match event {
-        RoomEvent::TrackSubscribed {
-            track: RemoteTrack::Audio(_),
-            participant,
-            ..
-        } => participant.identity().0 == agent_identity,
-        _ => false,
-    }
-}
-
-async fn livekit_until_done<T, E>(
-    done: &Arc<AtomicBool>,
-    future: impl Future<Output = Result<T, E>>,
-) -> Option<Result<T, E>> {
-    tokio::pin!(future);
-    let mut poll = tokio::time::interval(Duration::from_millis(LIVEKIT_DONE_POLL_MS));
-    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    loop {
-        tokio::select! {
-            result = &mut future => return Some(result),
-            _ = poll.tick() => {
-                if done.load(Ordering::SeqCst) {
-                    return None;
-                }
-            }
-        }
-    }
-}
-
-fn clear_livekit_audio(
-    threads: &ThreadManager,
-    channel: &UiChannel,
-    done: &Arc<AtomicBool>,
-    audio_tasks: &mut Vec<LiveKitMediaTask>,
-    mic_enabled: bool,
-) -> bool {
-    cancel_livekit_media_tasks(audio_tasks);
-    let _ = threads.reap();
-    reset_livekit_audio_state_or_done(channel, done, mic_enabled)
-}
-
-fn reset_livekit_audio_state(channel: &UiChannel, mic_enabled: bool) -> bool {
-    if !send(
-        channel,
-        VoiceEvent::State {
-            state: if mic_enabled {
-                VoiceState::Listening
-            } else {
-                VoiceState::Idle
-            },
-        },
-    ) {
-        return false;
-    }
-    send(channel, VoiceEvent::Level { rms: 0.0 })
-}
-
-fn reset_livekit_audio_state_or_done(
-    channel: &UiChannel,
-    done: &Arc<AtomicBool>,
-    mic_enabled: bool,
-) -> bool {
-    if reset_livekit_audio_state(channel, mic_enabled) {
-        return true;
-    }
-    done.store(true, Ordering::SeqCst);
-    false
-}
-
-fn spawn_livekit_audio_monitor(
-    threads: &ThreadManager,
-    channel: UiChannel,
-    track: RemoteAudioTrack,
-    done: Arc<AtomicBool>,
-    mic_enabled: Arc<AtomicBool>,
-) -> Result<LiveKitMediaTask, String> {
-    let cancel = Arc::new(AtomicBool::new(false));
-    let thread_cancel = cancel.clone();
-    threads.spawn("voice-livekit-audio-monitor", move || {
-        tauri::async_runtime::block_on(livekit_audio_monitor_loop(
-            channel,
-            track,
-            done,
-            mic_enabled,
-            thread_cancel,
-        ));
-    })?;
-    Ok(LiveKitMediaTask { cancel })
-}
-
-async fn livekit_audio_monitor_loop(
-    channel: UiChannel,
-    track: RemoteAudioTrack,
-    done: Arc<AtomicBool>,
-    mic_enabled: Arc<AtomicBool>,
-    cancel: Arc<AtomicBool>,
-) {
-    let mut stream = NativeAudioStream::new(
-        track.rtc_track(),
-        LIVEKIT_AUDIO_LEVEL_RATE,
-        LIVEKIT_AUDIO_LEVEL_CHANNELS,
-    );
-    let mut poll = tokio::time::interval(Duration::from_millis(LIVEKIT_DONE_POLL_MS));
-    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut speaking = false;
-    let mut last_voice = Instant::now();
-    let silence = Duration::from_millis(LIVEKIT_REMOTE_SILENCE_MS);
-    while !livekit_media_cancelled(&done, &cancel) {
-        let frame = tokio::select! {
-            frame = stream.next() => frame,
-            _ = poll.tick() => {
-                if livekit_media_cancelled(&done, &cancel) {
-                    break;
-                }
-                continue;
-            }
-        };
-        let Some(frame) = frame else {
-            break;
-        };
-        let rms = rms_i16(frame.data.as_ref());
-        if rms > LIVEKIT_REMOTE_SPEAKING_RMS {
-            last_voice = Instant::now();
-            if !speaking {
-                speaking = true;
-                if !send(
-                    &channel,
-                    VoiceEvent::State {
-                        state: VoiceState::Speaking,
-                    },
-                ) {
-                    done.store(true, Ordering::SeqCst);
-                    break;
-                }
-            }
-        }
-        if !send(&channel, VoiceEvent::Level { rms }) {
-            done.store(true, Ordering::SeqCst);
-            break;
-        }
-        if speaking && last_voice.elapsed() >= silence {
-            speaking = false;
-            if !reset_livekit_audio_state_or_done(
-                &channel,
-                &done,
-                mic_enabled.load(Ordering::SeqCst),
-            ) {
-                break;
-            }
-        }
-    }
-    let _ = reset_livekit_audio_state_or_done(&channel, &done, mic_enabled.load(Ordering::SeqCst));
-}
-
-fn rms_i16(samples: &[i16]) -> f32 {
-    if samples.is_empty() {
-        return 0.0;
-    }
-    let sum = samples
-        .iter()
-        .map(|sample| {
-            let v = *sample as f32 / i16::MAX as f32;
-            v * v
-        })
-        .sum::<f32>();
-    (sum / samples.len() as f32).sqrt()
-}
-
-fn i16_to_f32(samples: &[i16]) -> Vec<f32> {
-    samples
-        .iter()
-        .map(|sample| *sample as f32 / i16::MAX as f32)
-        .collect()
-}
-
-fn rms_f32(samples: &[f32]) -> f32 {
-    if samples.is_empty() {
-        return 0.0;
-    }
-    let sum = samples
-        .iter()
-        .map(|sample| {
-            let v = *sample;
-            v * v
-        })
-        .sum::<f32>();
-    (sum / samples.len() as f32).sqrt()
 }
 
 fn f32_to_i16(sample: f32) -> i16 {
@@ -2341,42 +735,17 @@ fn livekit_audio_frames(pcm: &[f32], rate: u32, channels: u32) -> Vec<AudioFrame
         .collect()
 }
 
-fn send_livekit(channel: &UiChannel, done: &Arc<AtomicBool>, event: VoiceEvent) -> bool {
-    if send(channel, event) {
-        return true;
-    }
-    done.store(true, Ordering::SeqCst);
-    false
-}
-
-fn livekit_fail(channel: &UiChannel, done: &Arc<AtomicBool>, message: String) {
-    done.store(true, Ordering::SeqCst);
-    let _ = send(
-        channel,
-        VoiceEvent::Error {
-            message: message.clone(),
-        },
-    );
-    let _ = send(
-        channel,
-        VoiceEvent::Ended {
-            reason: Some(message),
-        },
-    );
-}
-
 struct Lfm2Session {
     ctx: SessionCtx,
     settings: SessionSettingsKey,
     channel: UiChannel,
     done: Arc<AtomicBool>,
-    finished: Arc<AtomicBool>,
-    bridge_cancel: Arc<AtomicBool>,
+    bridge_cancel: Arc<CancelSignal>,
     live: Option<Lfm2Runtime>,
 }
 
 impl Lfm2Session {
-    async fn spawn(
+    fn spawn(
         threads: &ThreadManager,
         ctx: SessionCtx,
         settings: VoiceSettings,
@@ -2386,8 +755,7 @@ impl Lfm2Session {
     ) -> Result<Self, String> {
         let key = SessionSettingsKey::lfm2(&settings);
         let done = Arc::new(AtomicBool::new(false));
-        let finished = Arc::new(AtomicBool::new(false));
-        let bridge_cancel = Arc::new(AtomicBool::new(false));
+        let bridge_cancel = Arc::new(CancelSignal::default());
         let channel = UiEvents::new(channel);
         let sink_done = done.clone();
         let sink_channel = channel.clone();
@@ -2403,18 +771,8 @@ impl Lfm2Session {
         );
         let cfg = local_runtime_config(&settings);
         let vault = conversation_vault(&ctx.session_id);
-        let input = start_local_webrtc_input(threads, done.clone()).await?;
-        let output = match start_local_webrtc_output().await {
-            Ok(output) => output,
-            Err(error) => {
-                done.store(true, Ordering::SeqCst);
-                return Err(error);
-            }
-        };
-        let (live, main) = Lfm2Runtime::prepare_with_io(
+        let live = Lfm2Runtime::prepare(
             cfg,
-            Some(input),
-            Some(output),
             move |out_rate| build_engine(settings, out_rate, Some(vault)),
             move |event| {
                 if matches!(event, RuntimeEvent::Ended(_)) {
@@ -2428,39 +786,23 @@ impl Lfm2Session {
                 }
                 sent
             },
-        );
-        let thread_finished = finished.clone();
-        let thread_wake = wake.clone();
-        match threads.spawn("voice-session", move || {
-            main();
-            thread_finished.store(true, Ordering::SeqCst);
-            wake_kernel(&thread_wake);
-        }) {
-            Ok(()) => {}
-            Err(error) => {
-                done.store(true, Ordering::SeqCst);
-                live.stop();
-                return Err(error);
-            }
-        }
+        )?;
         Ok(Self {
             ctx,
             settings: key,
             channel,
             done,
-            finished,
             bridge_cancel,
             live: Some(live),
         })
     }
 
     fn is_finished(&self) -> bool {
-        self.finished.load(Ordering::SeqCst)
-            || self.live.as_ref().is_some_and(Lfm2Runtime::is_finished)
+        self.live.as_ref().is_none_or(Lfm2Runtime::is_finished)
     }
 
     fn interrupt(&self) -> Result<(), String> {
-        self.bridge_cancel.store(true, Ordering::SeqCst);
+        self.bridge_cancel.cancel();
         if let Some(live) = self.live.as_ref() {
             live.interrupt();
         }
@@ -2503,7 +845,7 @@ impl Lfm2Session {
 
     fn stop(mut self) {
         self.done.store(true, Ordering::SeqCst);
-        self.bridge_cancel.store(true, Ordering::SeqCst);
+        self.bridge_cancel.cancel();
         if let Some(live) = self.live.take() {
             live.stop();
         }
@@ -2513,7 +855,7 @@ impl Lfm2Session {
 impl Drop for Lfm2Session {
     fn drop(&mut self) {
         self.done.store(true, Ordering::SeqCst);
-        self.bridge_cancel.store(true, Ordering::SeqCst);
+        self.bridge_cancel.cancel();
         if let Some(live) = self.live.take() {
             live.stop();
         }
@@ -2524,7 +866,7 @@ struct BridgeState {
     threads: ThreadManager,
     channel: UiChannel,
     bridge: Option<SessionBridgeConfig>,
-    cancel: Arc<AtomicBool>,
+    cancel: Arc<CancelSignal>,
     wake: mpsc::Sender<RuntimeCommand>,
     task: Option<DelegateTask>,
     transcript: String,
@@ -2552,7 +894,7 @@ impl BridgeState {
         threads: ThreadManager,
         channel: UiChannel,
         bridge: Option<SessionBridgeConfig>,
-        cancel: Arc<AtomicBool>,
+        cancel: Arc<CancelSignal>,
         wake: mpsc::Sender<RuntimeCommand>,
     ) -> Self {
         Self {
@@ -2581,35 +923,12 @@ impl BridgeState {
                 }
             }
             RuntimeEvent::Ended(_) | RuntimeEvent::Error(_) => {
-                self.cancel.store(true, Ordering::SeqCst);
+                self.cancel.cancel();
                 self.clear_turn();
             }
-            RuntimeEvent::Audio { .. } | RuntimeEvent::Level(_) | RuntimeEvent::State(_) => {}
+            RuntimeEvent::Level(_) | RuntimeEvent::State(_) => {}
         }
         send_runtime(&self.channel, event)
-    }
-
-    fn handle_realtime_text(&mut self, text: &str) {
-        self.transcript.push_str(text);
-        self.speaking = true;
-    }
-
-    fn handle_realtime_audio(&mut self) {
-        self.speaking = true;
-    }
-
-    fn handle_realtime_turn_complete(&mut self) {
-        self.finish_turn();
-    }
-
-    fn handle_realtime_interrupted(&mut self) {
-        self.cancel.store(true, Ordering::SeqCst);
-        self.clear_turn();
-    }
-
-    fn handle_realtime_error(&mut self) {
-        self.cancel.store(true, Ordering::SeqCst);
-        self.clear_turn();
     }
 
     fn finish_turn(&mut self) {
@@ -2639,8 +958,8 @@ impl BridgeState {
         if self.task.is_some() {
             return;
         }
-        self.cancel.store(false, Ordering::SeqCst);
-        let cancel = self.cancel.clone();
+        let signal = self.cancel.clone();
+        let cancel = signal.scope();
         let channel = self.channel.clone();
         let done = Arc::new(AtomicBool::new(false));
         let thread_done = done.clone();
@@ -2651,7 +970,7 @@ impl BridgeState {
                     done: thread_done,
                     wake: thread_wake,
                 };
-                if !send_or_cancel(
+                if !send_scoped(
                     &channel,
                     &cancel,
                     VoiceEvent::State {
@@ -2666,7 +985,7 @@ impl BridgeState {
                 let result = run_turn(cfg, task, cancel.clone(), move |event| match event {
                     SessionBridgeEvent::Delta { text, .. } => {
                         reply.push_str(&text);
-                        send_or_cancel(
+                        send_scoped(
                             &delta_channel,
                             &delta_cancel,
                             VoiceEvent::Transcript {
@@ -2679,10 +998,10 @@ impl BridgeState {
                 })
                 .await;
                 if let Err(error) = result {
-                    let _ = send_or_cancel(&channel, &cancel, VoiceEvent::Error { message: error });
+                    let _ = send_scoped(&channel, &cancel, VoiceEvent::Error { message: error });
                 }
-                if !cancel.load(Ordering::SeqCst) {
-                    let _ = send_or_cancel(
+                if !cancel.is_cancelled() {
+                    let _ = send_scoped(
                         &channel,
                         &cancel,
                         VoiceEvent::State {
@@ -2698,7 +1017,7 @@ impl BridgeState {
             }
             Err(message) => {
                 done.store(true, Ordering::SeqCst);
-                let _ = send_or_cancel(&self.channel, &self.cancel, VoiceEvent::Error { message });
+                let _ = send_or_cancel(&self.channel, &signal, VoiceEvent::Error { message });
             }
         }
     }
@@ -2717,7 +1036,7 @@ impl BridgeState {
 
 impl Drop for BridgeState {
     fn drop(&mut self) {
-        self.cancel.store(true, Ordering::SeqCst);
+        self.cancel.cancel();
     }
 }
 
@@ -2737,11 +1056,22 @@ fn send(channel: &UiChannel, event: VoiceEvent) -> bool {
     channel.send(event)
 }
 
-fn send_or_cancel(channel: &UiChannel, cancel: &Arc<AtomicBool>, event: VoiceEvent) -> bool {
+fn send_or_cancel(channel: &UiChannel, cancel: &CancelSignal, event: VoiceEvent) -> bool {
     if send(channel, event) {
         return true;
     }
-    cancel.store(true, Ordering::SeqCst);
+    cancel.cancel();
+    false
+}
+
+fn send_scoped(channel: &UiChannel, cancel: &CancelScope, event: VoiceEvent) -> bool {
+    if cancel.is_cancelled() {
+        return false;
+    }
+    if send(channel, event) {
+        return true;
+    }
+    cancel.cancel();
     false
 }
 
@@ -2767,7 +1097,6 @@ fn send_runtime(channel: &UiChannel, event: RuntimeEvent) -> bool {
             },
         ),
         RuntimeEvent::Level(rms) => send(channel, VoiceEvent::Level { rms }),
-        RuntimeEvent::Audio { .. } => true,
         RuntimeEvent::Ended(reason) => send(channel, VoiceEvent::Ended { reason }),
         RuntimeEvent::Error(message) => send(channel, VoiceEvent::Error { message }),
     }
@@ -2803,7 +1132,7 @@ fn can_interrupt_playback(settings: &VoiceSettings) -> bool {
 
 fn build_engine(
     settings: VoiceSettings,
-    _out_rate: u32,
+    out_rate: u32,
     vault: Option<NativeConversationVault>,
 ) -> Result<Box<dyn VoiceEngine>, String> {
     // Fail-hard, no network at start: load ONLY a local snapshot dir. The repo id/revision are
@@ -2833,7 +1162,7 @@ fn build_engine(
     }
     let model = resident_lfm2(&dir, &settings.lfm2.device)?;
     let sampling = native_sampling(&settings.lfm2.interleaved, settings.lfm2.seed);
-    let engine: NativeLfm2VoiceEngine = model.engine(sampling, vault)?;
+    let engine: NativeLfm2VoiceEngine = model.engine(sampling, vault, out_rate)?;
     Ok(Box::new(engine))
 }
 
@@ -2857,8 +1186,7 @@ pub async fn play_local_webrtc_probe(
     amplitude: f32,
 ) -> Result<VoiceAudioProbeReport, String> {
     let state = Arc::new(local_webrtc_output_loopback().await?);
-    let output = external_output_from_state(state.clone())?;
-    let rate = output.rate();
+    let rate = LIVEKIT_AGENT_AUDIO_RATE;
     let frames = ((duration.as_secs_f32() * rate as f32).ceil() as usize).max(1);
     let freq = if frequency_hz.is_finite() && frequency_hz > 0.0 {
         frequency_hz
@@ -2878,12 +1206,12 @@ pub async fn play_local_webrtc_probe(
         let phase = std::f32::consts::TAU * freq * i as f32 / rate as f32;
         samples.push(phase.sin() * amp * env);
     }
-    let write = output.clone();
-    tauri::async_runtime::spawn_blocking(move || write.write_mono_f32(&samples))
+    let write = state.clone();
+    tauri::async_runtime::spawn_blocking(move || write.write(&samples, rate))
         .await
         .map_err(|e| format!("audio probe task failed: {e}"))??;
     tokio::time::sleep(duration + Duration::from_millis(300)).await;
-    output.clear();
+    state.clear();
     Ok(state.probe_report(rate, frames, duration))
 }
 
@@ -2956,26 +1284,20 @@ impl Drop for LocalWebRtcOutputState {
     }
 }
 
-async fn start_local_webrtc_output() -> Result<ExternalAudioOutput, String> {
-    let state = Arc::new(local_webrtc_output_loopback().await?);
-    external_output_from_state(state)
-}
-
-fn external_output_from_state(
-    state: Arc<LocalWebRtcOutputState>,
-) -> Result<ExternalAudioOutput, String> {
-    let write_state = state.clone();
-    let clear_state = state.clone();
-    ExternalAudioOutput::new(
-        LIVEKIT_AGENT_AUDIO_RATE,
-        move |pcm, rate| write_state.write(pcm, rate),
-        move || clear_state.clear(),
-    )
+fn configure_platform_audio(audio: &PlatformAudio) -> Result<(), String> {
+    audio
+        .configure_audio_processing(AudioProcessingOptions {
+            echo_cancellation: true,
+            noise_suppression: true,
+            auto_gain_control: true,
+            prefer_hardware_processing: false,
+        })
+        .map_err(|error| error.to_string())
 }
 
 async fn local_webrtc_output_loopback() -> Result<LocalWebRtcOutputState, String> {
     let audio = PlatformAudio::new().map_err(|e| format!("WebRTC speaker device failed: {e}"))?;
-    configure_livekit_audio(&audio)
+    configure_platform_audio(&audio)
         .map_err(|e| format!("WebRTC speaker audio processing failed: {e}"))?;
     let source = NativeAudioSource::new(
         AudioSourceOptions::default(),
@@ -2999,6 +1321,8 @@ async fn local_webrtc_output_loopback() -> Result<LocalWebRtcOutputState, String
         mpsc::channel::<IceCandidate>(LOCAL_WEBRTC_OUTPUT_ICE_QUEUE_CAP);
     let (receiver_ice_tx, receiver_ice_rx) =
         mpsc::channel::<IceCandidate>(LOCAL_WEBRTC_OUTPUT_ICE_QUEUE_CAP);
+    let (sender_state_tx, sender_state_rx) = watch::channel(sender.connection_state());
+    let (receiver_state_tx, receiver_state_rx) = watch::channel(receiver.connection_state());
     let (remote_tx, remote_rx) = oneshot::channel::<livekit::webrtc::audio_track::RtcAudioTrack>();
     let remote_tx = Arc::new(Mutex::new(Some(remote_tx)));
 
@@ -3007,6 +1331,12 @@ async fn local_webrtc_output_loopback() -> Result<LocalWebRtcOutputState, String
     })));
     receiver.on_ice_candidate(Some(Box::new(move |candidate| {
         let _ = receiver_ice_tx.try_send(candidate);
+    })));
+    sender.on_connection_state_change(Some(Box::new(move |state| {
+        sender_state_tx.send_replace(state);
+    })));
+    receiver.on_connection_state_change(Some(Box::new(move |state| {
+        receiver_state_tx.send_replace(state);
     })));
     receiver.on_track(Some(Box::new(move |event| {
         if let MediaStreamTrack::Audio(track) = event.track {
@@ -3048,7 +1378,15 @@ async fn local_webrtc_output_loopback() -> Result<LocalWebRtcOutputState, String
         .set_remote_description(answer)
         .await
         .map_err(|e| format!("local WebRTC output set remote answer failed: {e}"))?;
-    exchange_loopback_ice(&sender, &receiver, sender_ice_rx, receiver_ice_rx).await?;
+    exchange_loopback_ice(
+        &sender,
+        &receiver,
+        sender_ice_rx,
+        receiver_ice_rx,
+        sender_state_rx,
+        receiver_state_rx,
+    )
+    .await?;
     let remote_track = tokio::time::timeout(
         Duration::from_millis(LOCAL_WEBRTC_OUTPUT_READY_TIMEOUT_MS),
         remote_rx,
@@ -3109,22 +1447,24 @@ async fn exchange_loopback_ice(
     receiver: &PeerConnection,
     mut sender_ice: mpsc::Receiver<IceCandidate>,
     mut receiver_ice: mpsc::Receiver<IceCandidate>,
+    mut sender_state: watch::Receiver<PeerConnectionState>,
+    mut receiver_state: watch::Receiver<PeerConnectionState>,
 ) -> Result<(), String> {
     let deadline = tokio::time::sleep(Duration::from_millis(LOCAL_WEBRTC_OUTPUT_ICE_TIMEOUT_MS));
     tokio::pin!(deadline);
-    let mut poll = tokio::time::interval(Duration::from_millis(20));
-    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut sender_open = true;
     let mut receiver_open = true;
     loop {
-        if local_webrtc_output_connected(sender, receiver) {
+        if loopback_connected(&sender_state, &receiver_state) {
             return Ok(());
+        }
+        if loopback_failed(&sender_state, &receiver_state) {
+            return Err("local WebRTC audio loopback connection failed".into());
         }
         tokio::select! {
             _ = &mut deadline => {
                 return Err("local WebRTC audio loopback did not connect before timeout".into())
             },
-            _ = poll.tick() => {}
             candidate = sender_ice.recv(), if sender_open => match candidate {
                 Some(candidate) => receiver
                     .add_ice_candidate(candidate)
@@ -3139,284 +1479,35 @@ async fn exchange_loopback_ice(
                     .map_err(|e| format!("local WebRTC output sender ICE failed: {e}"))?,
                 None => receiver_open = false,
             },
+            changed = sender_state.changed() => {
+                changed.map_err(|_| "local WebRTC output sender state closed".to_string())?;
+            },
+            changed = receiver_state.changed() => {
+                changed.map_err(|_| "local WebRTC output receiver state closed".to_string())?;
+            },
         }
     }
 }
 
-fn local_webrtc_output_connected(sender: &PeerConnection, receiver: &PeerConnection) -> bool {
-    matches!(sender.connection_state(), PeerConnectionState::Connected)
-        && matches!(receiver.connection_state(), PeerConnectionState::Connected)
-}
-
-struct LocalWebRtcInputState {
-    _audio: PlatformAudio,
-    _track: LocalAudioTrack,
-    sender: PeerConnection,
-    receiver: PeerConnection,
-    remote_track: livekit::webrtc::audio_track::RtcAudioTrack,
-}
-
-impl Drop for LocalWebRtcInputState {
-    fn drop(&mut self) {
-        // Paired with the explicit start_recording in local_webrtc_mic_loop.
-        let _ = self._audio.stop_recording();
-        self.remote_track.set_enabled(false);
-        self.sender.close();
-        self.receiver.close();
-    }
-}
-
-async fn local_webrtc_input_loopback(
-    audio: PlatformAudio,
-) -> Result<LocalWebRtcInputState, String> {
-    let track = LocalAudioTrack::create_audio_track("local-microphone", audio.rtc_source());
-    track.enable();
-    track.unmute();
-    let runtime = LkRuntime::instance();
-    let factory = runtime.pc_factory();
-    let sender = factory
-        .create_peer_connection(RtcConfiguration::default())
-        .map_err(|e| format!("local WebRTC input sender failed: {e}"))?;
-    let receiver = factory
-        .create_peer_connection(RtcConfiguration::default())
-        .map_err(|e| format!("local WebRTC input receiver failed: {e}"))?;
-    let (sender_ice_tx, sender_ice_rx) =
-        mpsc::channel::<IceCandidate>(LOCAL_WEBRTC_OUTPUT_ICE_QUEUE_CAP);
-    let (receiver_ice_tx, receiver_ice_rx) =
-        mpsc::channel::<IceCandidate>(LOCAL_WEBRTC_OUTPUT_ICE_QUEUE_CAP);
-    let (remote_tx, remote_rx) = oneshot::channel::<livekit::webrtc::audio_track::RtcAudioTrack>();
-    let remote_tx = Arc::new(Mutex::new(Some(remote_tx)));
-
-    sender.on_ice_candidate(Some(Box::new(move |candidate| {
-        let _ = sender_ice_tx.try_send(candidate);
-    })));
-    receiver.on_ice_candidate(Some(Box::new(move |candidate| {
-        let _ = receiver_ice_tx.try_send(candidate);
-    })));
-    receiver.on_track(Some(Box::new(move |event| {
-        if let MediaStreamTrack::Audio(track) = event.track {
-            track.set_enabled(false);
-            if let Ok(mut tx) = remote_tx.lock()
-                && let Some(tx) = tx.take()
-            {
-                let _ = tx.send(track);
-            }
-        }
-    })));
-
-    sender
-        .add_track(
-            MediaStreamTrack::Audio(track.rtc_track()),
-            &[LOCAL_WEBRTC_INPUT_STREAM_ID],
-        )
-        .map_err(|e| format!("local WebRTC input add_track failed: {e}"))?;
-    let offer = sender
-        .create_offer(OfferOptions::default())
-        .await
-        .map_err(|e| format!("local WebRTC input offer failed: {e}"))?;
-    sender
-        .set_local_description(offer.clone())
-        .await
-        .map_err(|e| format!("local WebRTC input set local offer failed: {e}"))?;
-    receiver
-        .set_remote_description(offer)
-        .await
-        .map_err(|e| format!("local WebRTC input set remote offer failed: {e}"))?;
-    let answer = receiver
-        .create_answer(AnswerOptions::default())
-        .await
-        .map_err(|e| format!("local WebRTC input answer failed: {e}"))?;
-    receiver
-        .set_local_description(answer.clone())
-        .await
-        .map_err(|e| format!("local WebRTC input set local answer failed: {e}"))?;
-    sender
-        .set_remote_description(answer)
-        .await
-        .map_err(|e| format!("local WebRTC input set remote answer failed: {e}"))?;
-    exchange_loopback_ice(&sender, &receiver, sender_ice_rx, receiver_ice_rx).await?;
-    let remote_track = tokio::time::timeout(
-        Duration::from_millis(LOCAL_WEBRTC_MIC_READY_TIMEOUT_MS),
-        remote_rx,
-    )
-    .await
-    .map_err(|_| "local WebRTC microphone track did not become ready".to_string())?
-    .map_err(|_| "local WebRTC microphone track setup channel closed".to_string())?;
-    remote_track.set_enabled(false);
-
-    Ok(LocalWebRtcInputState {
-        _audio: audio,
-        _track: track,
-        sender,
-        receiver,
-        remote_track,
-    })
-}
-
-async fn start_local_webrtc_input(
-    threads: &ThreadManager,
-    done: Arc<AtomicBool>,
-) -> Result<ExternalAudioInput, String> {
-    let (input, writer) = ExternalAudioInput::new(LIVEKIT_AGENT_AUDIO_RATE)?;
-    let (ready_tx, ready_rx) = oneshot::channel();
-    let thread_done = done.clone();
-    threads.spawn("voice-local-webrtc-mic", move || {
-        if let Err(error) =
-            tauri::async_runtime::block_on(local_webrtc_mic_loop(writer, thread_done, ready_tx))
-        {
-            eprintln!("[voice] local WebRTC microphone stopped: {error}");
-        }
-    })?;
-    match tokio::time::timeout(
-        Duration::from_millis(LOCAL_WEBRTC_MIC_READY_TIMEOUT_MS),
-        ready_rx,
-    )
-    .await
-    {
-        Ok(Ok(Ok(()))) => Ok(input),
-        Ok(Ok(Err(error))) => Err(error),
-        Ok(Err(_)) => Err("local WebRTC microphone setup channel closed".into()),
-        Err(_) => {
-            done.store(true, Ordering::SeqCst);
-            Err("local WebRTC microphone did not become ready before timeout".into())
-        }
-    }
-}
-
-async fn local_webrtc_mic_loop(
-    mut writer: ExternalAudioInputWriter,
-    done: Arc<AtomicBool>,
-    ready: oneshot::Sender<Result<(), String>>,
-) -> Result<(), String> {
-    let mut ready = Some(ready);
-    let audio = match PlatformAudio::new() {
-        Ok(audio) => audio,
-        Err(error) => {
-            let message = format!("WebRTC audio device failed: {error}");
-            send_local_webrtc_ready(&mut ready, Err(message.clone()));
-            return Err(message);
-        }
-    };
-    if let Err(error) = configure_livekit_audio(&audio) {
-        let message = format!("WebRTC audio processing failed: {error}");
-        send_local_webrtc_ready(&mut ready, Err(message.clone()));
-        return Err(message);
-    }
-    let input = match local_webrtc_input_loopback(audio).await {
-        Ok(input) => input,
-        Err(error) => {
-            send_local_webrtc_ready(&mut ready, Err(error.clone()));
-            return Err(error);
-        }
-    };
-    // Explicitly start ADM recording, like the native LiveKit mic path does
-    // (livekit_set_mic). Without it, capture only runs incidentally via the track
-    // and an OS-level denial would surface as silent no-frames instead of an
-    // error — and the APM capture chain (AEC/NS/AGC) may not fully engage.
-    // ORDER MATTERS: start_recording is a resume-style call — init_recording only
-    // succeeds once the device-source track exists (calling it pre-track failed
-    // with "init_recording failed"), so it runs AFTER the loopback is up.
-    if let Err(error) = input._audio.start_recording() {
-        let message = format!("WebRTC microphone start failed: {error}");
-        send_local_webrtc_ready(&mut ready, Err(message.clone()));
-        return Err(message);
-    }
-    let mut stream = NativeAudioStream::with_options(
-        input.remote_track.clone(),
-        LIVEKIT_AGENT_AUDIO_RATE_I32,
-        LIVEKIT_AGENT_AUDIO_CHANNELS_I32,
-        NativeAudioStreamOptions {
-            queue_size_frames: Some(LOCAL_WEBRTC_MIC_QUEUE_FRAMES),
-        },
-    );
-    let first = tokio::time::timeout(
-        Duration::from_millis(LOCAL_WEBRTC_MIC_READY_TIMEOUT_MS),
-        next_local_webrtc_mic_frame(&mut stream, &done),
-    )
-    .await
-    .map_err(|_| "local WebRTC microphone produced no frames before timeout".to_string())?;
-    match first {
-        Some(frame) => {
-            push_local_webrtc_mic_frame(&mut writer, &frame);
-            send_local_webrtc_ready(&mut ready, Ok(()));
-        }
-        None => {
-            let message = "local WebRTC microphone stream ended before first frame".to_string();
-            send_local_webrtc_ready(&mut ready, Err(message.clone()));
-            return Err(message);
-        }
-    }
-    let mut poll = tokio::time::interval(Duration::from_millis(LIVEKIT_DONE_POLL_MS));
-    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    while !done.load(Ordering::SeqCst) {
-        let frame = tokio::select! {
-            frame = stream.next() => frame,
-            _ = poll.tick() => {
-                if done.load(Ordering::SeqCst) {
-                    break;
-                }
-                continue;
-            }
-        };
-        let Some(frame) = frame else {
-            break;
-        };
-        push_local_webrtc_mic_frame(&mut writer, &frame);
-    }
-    Ok(())
-}
-
-fn send_local_webrtc_ready(
-    ready: &mut Option<oneshot::Sender<Result<(), String>>>,
-    result: Result<(), String>,
-) {
-    if let Some(ready) = ready.take() {
-        let _ = ready.send(result);
-    }
-}
-
-async fn next_local_webrtc_mic_frame(
-    stream: &mut NativeAudioStream,
-    done: &Arc<AtomicBool>,
-) -> Option<AudioFrame<'static>> {
-    let mut poll = tokio::time::interval(Duration::from_millis(LIVEKIT_DONE_POLL_MS));
-    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    loop {
-        let frame = tokio::select! {
-            frame = stream.next() => frame,
-            _ = poll.tick() => {
-                if done.load(Ordering::SeqCst) {
-                    return None;
-                }
-                continue;
-            }
-        };
-        let Some(frame) = frame else {
-            return None;
-        };
-        if frame.sample_rate == 0 {
-            continue;
-        }
-        if frame.data.as_ref().is_empty() || frame.num_channels == 0 {
-            continue;
-        }
-        return Some(frame);
-    }
-}
-
-fn push_local_webrtc_mic_frame(
-    writer: &mut ExternalAudioInputWriter,
-    frame: &AudioFrame<'_>,
+fn loopback_connected(
+    sender: &watch::Receiver<PeerConnectionState>,
+    receiver: &watch::Receiver<PeerConnectionState>,
 ) -> bool {
-    if frame.sample_rate == 0 {
-        return false;
-    }
-    let channels = frame.num_channels as usize;
-    if channels == 0 || frame.data.as_ref().is_empty() {
-        return false;
-    }
-    let _ = writer.push_interleaved_i16(frame.data.as_ref(), channels);
-    true
+    matches!(*sender.borrow(), PeerConnectionState::Connected)
+        && matches!(*receiver.borrow(), PeerConnectionState::Connected)
+}
+
+fn loopback_failed(
+    sender: &watch::Receiver<PeerConnectionState>,
+    receiver: &watch::Receiver<PeerConnectionState>,
+) -> bool {
+    matches!(
+        *sender.borrow(),
+        PeerConnectionState::Failed | PeerConnectionState::Closed
+    ) || matches!(
+        *receiver.borrow(),
+        PeerConnectionState::Failed | PeerConnectionState::Closed
+    )
 }
 
 #[cfg(test)]
@@ -3551,58 +1642,6 @@ mod tests {
         done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         threads.wait().unwrap();
         assert_eq!(threads.tracked_len(), 0);
-    }
-
-    #[test]
-    fn livekit_silence_padding_tops_off_one_model_frame() {
-        let mut partial = vec![1.0, 2.0, 3.0];
-        pad_next_livekit_model_frame(&mut partial, 5);
-        assert_eq!(partial, vec![1.0, 2.0, 3.0, 0.0, 0.0]);
-
-        let mut empty = Vec::new();
-        pad_next_livekit_model_frame(&mut empty, 4);
-        assert_eq!(empty, vec![0.0, 0.0, 0.0, 0.0]);
-
-        let mut aligned = vec![1.0, 2.0, 3.0, 4.0];
-        pad_next_livekit_model_frame(&mut aligned, 4);
-        assert_eq!(aligned, vec![1.0, 2.0, 3.0, 4.0, 0.0, 0.0, 0.0, 0.0]);
-    }
-
-    #[test]
-    fn livekit_stop_does_not_block_when_provider_queue_is_full() {
-        let (commands, _rx) = mpsc::channel(LIVEKIT_COMMAND_CAP);
-        for _ in 0..LIVEKIT_COMMAND_CAP {
-            assert!(commands.try_send(LiveKitCommand::Interrupt).is_ok());
-        }
-        let settings = VoiceSettings {
-            provider: VoiceProvider::Livekit,
-            ..VoiceSettings::default()
-        };
-        let done = Arc::new(AtomicBool::new(false));
-        let bridge_cancel = Arc::new(AtomicBool::new(false));
-        let session = LiveKitSession {
-            ctx: SessionCtx {
-                session_id: "test-session".into(),
-                directory: "/tmp".into(),
-                agent: None,
-                model: None,
-                variant: None,
-                prompt_mode: None,
-            },
-            settings: SessionSettingsKey::livekit(&settings),
-            commands,
-            done: done.clone(),
-            finished: Arc::new(AtomicBool::new(false)),
-            bridge_cancel: bridge_cancel.clone(),
-            mic_enabled: Arc::new(AtomicBool::new(true)),
-        };
-
-        let start = Instant::now();
-        session.stop().unwrap();
-
-        assert!(start.elapsed() < Duration::from_millis(100));
-        assert!(done.load(Ordering::SeqCst));
-        assert!(bridge_cancel.load(Ordering::SeqCst));
     }
 
     #[test]

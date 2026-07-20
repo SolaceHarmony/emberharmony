@@ -83,11 +83,9 @@ fn main() {
     println!("cargo::rerun-if-changed=native/src/engine/flashkern_engine.cpp");
     println!("cargo::rerun-if-changed=native/src/model/lfm_model.cpp");
     println!("cargo::rerun-if-changed=native/src/model/lfm_model_internal.h");
-    println!("cargo::rerun-if-changed=native/src/model/lfm_model_legacy.h");
     println!("cargo::rerun-if-changed=native/src/model/lfm_tokenizer.cpp");
     println!("cargo::rerun-if-changed=native/include/flashkern_conv.h");
     println!("cargo::rerun-if-changed=native/include/flashkern_depth.h");
-    println!("cargo::rerun-if-changed=native/include/flashkern_fft.h");
     println!("cargo::rerun-if-changed=native/include/flashkern_gemm.h");
     println!("cargo::rerun-if-changed=native/include/flashkern_math.h");
     println!("cargo::rerun-if-changed=native/include/lfm_audio_pass.h");
@@ -179,6 +177,7 @@ fn main() {
     // fixtures came from uncontracted candle ops.
     println!("cargo::rerun-if-changed=native/include/lfm_conformer.h");
     println!("cargo::rerun-if-changed=native/src/model/lfm_conformer.cpp");
+    println!("cargo::rerun-if-changed=native/src/model/lfm_conformer_program.h");
     let mut conformer = cc::Build::new();
     conformer
         .file("native/src/model/lfm_conformer.cpp")

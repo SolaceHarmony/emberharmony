@@ -56,11 +56,10 @@ void kc_doorbell_ring_all(kc_doorbell_t *doorbell)
     kc_port_wake_u32_all(doorbell->wait);
 }
 
-int kc_doorbell_wait(kc_doorbell_t *doorbell, uint32_t expected,
-                     uint64_t deadline_ns)
+int kc_doorbell_park(kc_doorbell_t *doorbell, uint32_t expected)
 {
     return doorbell
-        ? kc_port_wait_u32(doorbell->wait, expected, deadline_ns)
+        ? kc_port_wait_u32(doorbell->wait, expected)
         : -EINVAL;
 }
 

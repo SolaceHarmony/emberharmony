@@ -36,6 +36,7 @@ typedef enum LfmEventKindV1 {
     LFM_EVENT_TURN = 3,
     LFM_EVENT_ERROR = 4,
     LFM_EVENT_STOPPED = 5,
+    LFM_EVENT_PLAYBACK_READY = 6,
 } LfmEventKindV1;
 
 #define LFM_EVENT_FLAG_HAS_AUDIO (1u << 0)
@@ -47,6 +48,16 @@ typedef struct LfmTurnEventV1 {
     uint32_t playback_leases;
     uint32_t emitted_items;
 } LfmTurnEventV1;
+
+/* Identity carried by one reliable PLAYBACK_READY edge. The corresponding
+ * lease remains native-owned until the session's sole PlaybackConsumer claims
+ * the complete {event ticket, epoch, lease_id, buffer_generation} identity. */
+typedef struct LfmPlaybackReadyEventV1 {
+    uint32_t size;
+    uint32_t abi_version;
+    uint64_t lease_id;
+    uint64_t buffer_generation;
+} LfmPlaybackReadyEventV1;
 
 typedef struct LfmEventV1 {
     uint32_t size;
@@ -61,6 +72,11 @@ typedef struct LfmEventV1 {
     int32_t status;
 } LfmEventV1;
 
+/* The callback must copy the bounded record and return immediately. Returning
+ * WOULD_BLOCK retains the exact record in the native output continuation;
+ * after freeing host capacity, call lfm_session_host_capacity once. No pointer
+ * in the callback remains valid after a successful return. Any other nonzero
+ * status is a terminal host-sink failure. */
 typedef int (*LfmOnEventV1)(void *context, const LfmEventV1 *event);
 
 typedef struct LfmCallbacksV1 {
@@ -77,9 +93,8 @@ typedef struct LfmSessionSnapshotV1 {
     uint64_t epoch;
     uint32_t state;
     int32_t terminal_status;
-    uint64_t coordinator_parks;
-    uint64_t coordinator_wakes;
-    uint64_t notification_parks;
+    uint64_t reserved_coordinator[2];
+    uint64_t reserved_delivery;
     uint64_t callbacks_entered;
     uint64_t capture_consumed;
     uint64_t capture_stale;
@@ -98,7 +113,7 @@ typedef struct LfmSessionSnapshotV1 {
 #define LFM_SESSION_CREATED 0u
 #define LFM_SESSION_RUNNING 1u
 #define LFM_SESSION_STOPPING 2u
-#define LFM_SESSION_THREADS_JOINED 3u
+#define LFM_SESSION_SERVICES_JOINED 3u
 #define LFM_SESSION_JOINED 4u
 
 LFM_PUBLIC_API int lfm_session_create(
@@ -106,20 +121,19 @@ LFM_PUBLIC_API int lfm_session_create(
     const LfmSessionConfigV1 *config, const LfmCallbacksV1 *callbacks,
     LfmSession **out);
 LFM_PUBLIC_API int lfm_session_start(LfmSession *session);
-/* Compatibility try-submit. Returns WOULD_BLOCK when the fixed control ring is
- * full. New callers should use the expected-value blocking entry point below. */
+/* Copies one bounded UTF-8 command into the fixed control ring and returns its
+ * native action ticket. Returns WOULD_BLOCK immediately when the ring is full;
+ * callers never park on behalf of admission. */
 LFM_PUBLIC_API int lfm_session_submit_text(LfmSession *session,
                                            const char *utf8,
                                            size_t utf8_bytes,
                                            LfmTicketIdV1 *out_ticket);
-/* Copies one bounded UTF-8 command into the fixed control ring and returns its
- * native action ticket. Full-ring admission parks without polling until the
- * consumer opens space, the session is interrupted, or the session stops. */
-LFM_PUBLIC_API int lfm_session_wait_submit_text(
-    LfmSession *session, const char *utf8, size_t utf8_bytes,
-    LfmTicketIdV1 *out_ticket);
 LFM_PUBLIC_API int lfm_session_interrupt(LfmSession *session,
                                          uint64_t *out_epoch);
+/* Nonblocking host-capacity edge for a callback that previously returned
+ * WOULD_BLOCK. It makes the retained output continuation runnable; it never
+ * invokes the callback on the caller's stack. */
+LFM_PUBLIC_API int lfm_session_host_capacity(LfmSession *session);
 LFM_PUBLIC_API void lfm_session_request_stop(LfmSession *session);
 LFM_PUBLIC_API int lfm_session_join(LfmSession *session);
 LFM_PUBLIC_API int lfm_session_snapshot(const LfmSession *session,

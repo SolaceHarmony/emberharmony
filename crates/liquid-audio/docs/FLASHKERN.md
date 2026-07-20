@@ -38,8 +38,10 @@ flowchart LR
 
 `native/src/engine/flashkern_engine.cpp` owns a fixed lane team. Each lane runs
 the same control program, claims disjoint tiles, invokes assembly leaves, and
-crosses an expected-value generation fence. The private model SQ/CQ and its
-descriptor pool are native-owned. No model pass calls Rust.
+returns once. The final member return invokes the ticket continuation; no lane
+waits at an operation fence. The private model SQ/CQ correlates an exact ticket
+with one fixed engine-owned pass slot, without a descriptor registry or mutex.
+No model pass calls Rust.
 
 Mounted typed requests include:
 

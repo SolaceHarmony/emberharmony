@@ -7,10 +7,13 @@ This directory is a source snapshot of:
 - Ticket/wait implementation revision: `bcdc03d1a0731ee3116c850f3f9bd7cb27b55101`
 - License: BSD-3-Clause
 
-Vendored production paths are `include/`, `core/src/`, and `port/`, plus the
-upstream `LICENSE` and `README.md`. EmberHarmony carries no local source patch
-inside this snapshot. Changes belong upstream first; after its gates pass and
-the change is committed, resync these paths and update both revisions here.
+The original import came from that revision. EmberHarmony now intentionally
+carries a reduced production profile: retained services, fixed teams, exact
+product-edge identity, private idle doorbells, and the POSIX port. Product
+tickets and borrowed numerical views are owned by Flashkern. The generic
+channel/scheduler/timer, process-global compatibility runtime, and persistence
+surfaces were deleted after the native Flashkern cutover. Do not restore them
+during a vendor refresh.
 
 The upstream C test suite is authoritative for runtime behavior. The
 `kcoro-sys` Rust tests verify that this exact snapshot compiles, links, and

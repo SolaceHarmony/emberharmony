@@ -1469,7 +1469,7 @@ extern "C" float lfm_bf16_sumsq_seq_f32(const uint16_t *x, int n) {
 // x0+=x2), ADDV, then sequential leftovers. Each square rounds before accumulating (the
 // sqr() tensor's values). This is the token-exact norm reduction for fused blocks that
 // must bit-match the composed candle chain on aarch64.
-extern "C" float lfm_bf16_sumsq_candle_f32(const void *storage, int n) {
+extern "C" float lfm_bf16_sumsq_ordered_f32(const void *storage, int n) {
     const unsigned char *x = static_cast<const unsigned char *>(storage);
     const int np = n & ~15;
     float32x4_t sum0 = vdupq_n_f32(0.0f), sum1 = vdupq_n_f32(0.0f);

@@ -1,33 +1,35 @@
-# Assembly Kernels, Accelerate Dispatch, and Wait Primitives
+# Assembly Kernels, Accelerate Dispatch, and Callback Continuations
 
-Status: normative design. The zero-spin wait-word substrate, fixed Flashkern
-lane mount, typed resample/frontend/whole-Conformer request, capacity-2 SQ/CQ,
-per-ticket scratch slots, and exact-CQ continuation primitive are implemented.
-The continuation owns a packed `{generation,state}` slot lease across its
-callback and must atomically resubmit that same slot or release it before waking
-the waiter; adversarial tests cover peer admission, stale-owner ABA, stop, and
-capacity accounting.
+Status: normative design. The fixed Flashkern lane mount, typed
+resample/frontend/whole-Conformer request, capacity-2 SQ/CQ, per-ticket scratch
+slots, and exact-CQ continuation primitive are implemented. There is no
+operation waiter: a numerical member returns, the full-team return publishes
+the ticket's completion edge, and the retained continuation either submits the
+next phase or releases the exact packed `{generation,state}` slot lease.
+Adversarial tests cover peer admission, stale-owner ABA, stop, and capacity
+accounting.
 The V2.0 substrate repair is also implemented in the working tree: hot
-wait/cache words and internal SQ/CQ storage cells have 128-byte Apple base alignment and stride
+doorbell/cache words and internal SQ/CQ storage cells have 128-byte Apple base alignment and stride
 through kcoro, the engine, bridge, session, and model gate; request, layer, and
 modality selectors are closed; invalid worker/logical-lane geometry rejects; and
 four physical workers preserve the eight-way logical fold with parity. The
-zero-spin gate remains green.
+idle-dormancy gate remains green.
 The bounded production audio route now uses that continuation across
 `TOKEN_PASS -> DEPTH_FRAME -> MIMI_DECODE`: playback is reserved before
 admission, token context commits on its CQ, and Mimi writes direct at equal rate
 or feeds a prepared native resampler that writes the reserved device-rate PCM
 span. The exact slot is released before reliable publication.
-This bounded implementation takes a route-exclusive producer lease and prepares
-all three immutable descriptors before the first SQ publication; its CQ callback
-does not acquire the submission or descriptor mutex. Peer admission is deferred
-to the broker/block-domain tranche rather than hidden behind this fast path.
-The coordinator still makes one outward expected-value wait for the terminal
-result. Its fixed conversation-owned result plus stack callback state is not the
-future pooled asynchronous ticket executor. Pooled routes/results, the broker,
-two `BLOCK4` domains and reverse-order per-block CQs, event-register waits, and
-concurrent numerical passes remain open in designs 14 and 16. The full Moshi
-migration is a later tranche.
+The retained route service is the sole SQ producer. Each submission names its
+fixed pass slot and exact ticket generation directly; the bridge has no generic
+descriptor pool, borrowed mode, producer mutex, or retrying admission loop.
+Peer admission is represented by bounded route and pass-slot claims rather than
+hidden behind a synchronous fast path.
+The coordinator is a retained service. Its durable `SessionAction` and
+`ResultRecord` records survive numerical completion and outward backpressure;
+no host stack or sleeping thread represents that suspended action. Pooled
+routes/results and the broker are implemented. Two `BLOCK4` domains,
+reverse-order per-block CQs, and concurrent numerical passes remain open in
+designs 14 and 16. The full Moshi migration is a later tranche.
 
 Baseline: EmberHarmony `321538f11749`.
 
@@ -37,9 +39,10 @@ Fix the compute substrate for every native stage in documents 03 through 07:
 
 - **No tensor library in the production CPU path.** No Candle, Eigen, MLX-on-CPU,
   generic tensor-object or expression-template framework, or SLEEF/SVML enters
-  Flashkern. A CPU "tensor" is a pointer, a shape fact recorded in a plan, and a
-  kernel. Apple GPU matrix coprocessing is mandatory and belongs to a separate
-  MLX C++/Metal device engine, never inside Flashkern.
+  Flashkern. The word "tensor" is not a production type: values are immutable
+  byte-image views or mutable activation spans with plan-validated extents and
+  strides. A later MLX C++/Metal device engine is an independent tranche, never
+  a fallback inside Flashkern.
 - **All math is assembly.** AArch64 NEON and x86_64 AVX2/AVX-512 numerical
   kernels are hand-written `.S`. Production Rust and C++ contain no floating
   arithmetic, SIMD intrinsics, scalar libm loop, tensor object, or compiler-owned
@@ -51,12 +54,13 @@ Fix the compute substrate for every native stage in documents 03 through 07:
   and the recorded target-machine result wins. The ABI is pointers, dimensions,
   and strides against our planes. Do not claim a private Apple execution unit;
   Accelerate's implementation is opaque.
-- **Waiting is zero-spin.** A fence or doorbell reads its generation once,
-  registers and rechecks, then parks through the selected wait-word backend.
-  The OS address wait is the correctness baseline. An architectural event wait
-  may be selected only after a guarded startup probe and a recorded latency,
-  idle-CPU, and power win; it must recheck the same expected-value predicate and
-  fall back to the OS backend. There is no bounded spin or timed polling tier.
+- **Computational progress is edge driven.** Tickets, stages, results, playback
+  capacity, capture data, and control changes never own waiters and never use a
+  timer. Their producers publish an edge that makes a retained continuation
+  runnable. Only a resident kernel worker whose complete ready predicate is
+  empty may become dormant on one indefinite expected-value doorbell. That
+  worker is shared execution capacity, not the suspended operation. There is no
+  bounded spin, timed polling, per-stage park, or terminal-result wait tier.
 - **The numerical call graph is native pass descriptor -> C++ fixed executor ->
   assembly table.** Rust converts settings and owns PCM/control I/O scopes only.
   C++ owns model loading, pointer binding, stage planning, state ownership, and
@@ -71,15 +75,17 @@ native helper below it:
 
 Two substrate debts in the original audit are now closed. Kcoro worker progress
 uses one runtime-owned expected-value doorbell: a worker observes its generation,
-rechecks the protected queues and retained-service predicates, then parks on that
-exact value. `lifecycle_cv` remains administration-only. A retained
+rechecks the protected queues and retained-service predicates, then becomes
+dormant on that exact value only when the entire ready predicate remains empty.
+The session's `lifecycle_cv` is a terminal administrative join latch only: it
+cannot make a route, PCM record, or numerical pass runnable and has no deadline.
+A retained
 `kc_service_notifier` publishes a callback edge without allocation, a mutex, a
 deadline, or invoking the callback; creation rejects the pthread fallback, and
 its lifetime lease prevents service destruction until the producer is quiescent.
-Flashkern commit `d2c43abd` introduced shared dispatch/fence words and prepared
-`kc_port_wait_u32` handles at
-`native/src/engine/flashkern_engine.cpp:634-662` and `1041-1052`;
-`FENCE_SPIN`, `kcoro_park`, and `kcoro_unpark` are absent. The working-tree V2.0
+Flashkern commit `d2c43abd` introduced the private address-dormancy substrate;
+`FENCE_SPIN`, operation-level park/unpark, and numerical fence waiters are now
+absent. The working-tree V2.0
 repair replaces its insufficient 64-byte isolation with 128-byte Apple base
 alignment **and stride** and extends that rule to the hot kcoro ring, engine,
 bridge, session/model-gate, and SQ/CQ storage cells. ABI-v1 command/completion
@@ -87,22 +93,20 @@ values retain their 64-byte caller alignment. The four-versus-eight lane parity
 and current-selector rejection gates pass. The bounded three-node production
 audio route now advances token through Depthformer and Mimi with a total outcome
 map and a pre-reserved playback span. The pooled asynchronous executor, two
-independent `BLOCK4` domains, and architectural event-wait backend are not
+independent `BLOCK4` domains, and an architectural idle-dormancy backend are not
 implemented by this repair.
 
-| Current work in Rust | Evidence | Required native owner |
+The Rust resampler, frontend, Conformer, backbone, sampler, recurrence, and
+native-pass trampoline cited by the original audit have been deleted. LFM2
+production inference is native. Remaining ownership debt is within the native
+implementation, not permission to restore a Rust oracle or transport rim:
+
+| Remaining debt | Evidence | Required owner |
 |---|---|---|
-| resampling and audio accumulation | `crates/liquid-audio/src/processor.rs:1089-1163` | native frontend plan and SIMD resampler |
-| DFT, mel filtering, log, and normalization | `crates/liquid-audio/src/processor.rs:254-472` | native mel stages and reduction kernels |
-| Conformer and adapter tensor graph | `crates/liquid-audio/src/model/conformer/encoder.rs:185-317` and `crates/liquid-audio/src/model/lfm2_audio.rs:403-419` | C++ pass plan over assembly-table entries |
-| sampling and token recurrence | Native collective: `native/src/engine/flashkern_engine.cpp:806-970`; transitional owner/recurrence: `crates/liquid-audio/src/model/lfm2_audio.rs:199-281` and `1630-1743` | sampler leaves are assembly-mounted; move opaque RNG/state append and next-pass selection into native conversation control; Rust receives no per-pass result IDs |
-| Moshi frame arithmetic/state | `crates/liquid-audio/src/runtime/realtime.rs:1850-2065` | native Moshi pass program |
-| native pass entered through Rust capture/trampoline | `crates/liquid-audio/src/compute/flashkern/native_engine.rs:544-593` and `native/src/engine/flashkern_engine.cpp:1283-1291` | model-bound C++ plan with no Rust callback |
-| aarch64 feature flags applied to the whole kernel translation unit | `crates/liquid-audio/build.rs:45-58` | baseline and BF16/I8MM objects compiled separately; C++ binds one table after capability checks |
-| historical hot-call panel storage and packing | `crates/liquid-audio/native/kernels/aarch64/flashkern_neon.cpp:74-162` and `native/kernels/x86_64/flashkern_x86.cpp:74-154` | delete/bypass weight panels; plans retain only checkpoint-layout byte views and mutable activation scratch |
-| C++ intrinsic/libm activation and softmax loops | `flashkern_neon.cpp` and `flashkern_x86.cpp` | paired fixed-shape `.S` transcendental kernels with test-only scalar oracle; delete the C++ bodies |
-| sampler and PRNG | Native ChaCha20 block kernels are implemented in `native/kernels/{aarch64,x86_64}/flashkern_prng.S`; `run_sampler` is mounted inside token and Depthformer passes, with `REQ_SAMPLE` as a standalone fallback/conformance leaf. | move the one shared stream image from the Rust generation rim into each native conversation; never issue a pass ticket per random draw or codebook |
-| CPU streaming short-conv | `REQ_DEPTHWISE_STREAM`, `lfm_depthwise_stream_bf16`, and `flashkern_conv.h` borrow split state/input/weight planes and write output/state directly | keep this CPU-only; replace the sibling Candle Metal route with MLX C++/Metal rather than adding Metal dispatch to Flashkern |
+| optional Moshi-style frame shell still carries owned Rust PCM vectors | `crates/liquid-audio/src/runtime/realtime.rs` | later independent native Moshi session; no LFM2 fallback |
+| historical C++ intrinsic kernels and thread-local work vectors | `native/kernels/{aarch64,x86_64}/flashkern_{neon,x86}.cpp` | paired `.S` leaves plus plan-owned fixed activation arenas |
+| create-time scalar Conformer table construction and residual C++ movement | `native/src/model/lfm_conformer.cpp` | formula-derived immutable tables are allowed; all value-producing pass math and avoidable movement move to `.S`/Accelerate stages |
+| compatibility synchronous pass/result surfaces | `native/src/engine/flashkern_engine.cpp` and the product ABI audit | delete after their production callers become retained ticket continuations; never preserve as a legacy path |
 
 ## The Library Law
 
@@ -166,11 +170,13 @@ BF16 handling is exact everywhere: a bf16 value is the top 16 bits of its f32,
 so expansion is a zero-extend and 16-bit left shift — `SHLL`/`ZIP` on NEON,
 `VPMOVZXWD` + `VPSLLD` on x86. Where hardware dot products exist they are used
 (`BFDOT`/`BFMMLA` on ARMv8.6, `VDPBF16PS` under AVX512-BF16), with the exact
-expand-to-f32 path as the fallback and the oracle. Accumulation is F32,
-matching the reference ladder in documents 05 and 06. Accelerate GEMM operates
-on f32 planes (expanded once into a declared scratch plane when a bf16 source
-feeds a GEMM stage — a destination write under the byte-movement law, taken
-only where the plan proves the stage is compute-bound enough to pay for it).
+in-register expand-to-f32 path as the fallback and oracle. Accumulation is F32,
+matching the reference ladder in documents 05 and 06. A BF16 checkpoint weight
+is never widened into an F32 plane for Accelerate. Accelerate may be selected
+only when it can consume the resident dtype/layout directly or when the source
+is already a legitimate F32 view. Otherwise the plan binds the house BF16 leaf;
+layout, alignment, transpose, or dtype staging is forbidden weight
+materialization rather than a destination write.
 
 Accelerate integration constraints:
 
@@ -224,8 +230,8 @@ Concurrency (the "multitasking" set):
 | LSE `LDADD` | Optional relaxed tile-claim specialization after capability selection; stronger acquire/release forms are not required for a counter whose stage board is already published |
 | LSE `SWP`, `CAS` | Slot ownership using the narrowest atomic state actually required. `CASP` is reserved for a future proven 128-bit identity transition, not required by the current 64-bit packed lease. |
 | `LDAR`/`STLR` | Ring cursor publish/observe (release/acquire), matching document 04's ordering rules |
-| release/acquire shared doorbells and logical generations | Publish command/stage identity and fan out the exact declared waiter set through one blocking host wait-word edge |
-| selected wait-word backend | OS expected-value address wait by default; optional guarded `LDXR`/`WFE` experiment on AArch64. Both recheck the predicate and neither admits a user-space polling loop. |
+| release/acquire shared doorbells and logical generations | Publish a ready edge after durable ticket state is visible; the retained continuation consumes the edge and advances the route |
+| private idle-dormancy backend | OS expected-value address dormancy for an otherwise idle resident worker; optional guarded `LDXR`/`WFE` experiment on AArch64. Neither backend is exposed to an operation or admits a user-space polling loop. |
 
 ## x86_64 Primitive Inventory
 
@@ -244,90 +250,64 @@ Baseline AVX2+FMA3; AVX-512 (F/BW/VL, VNNI, BF16) and WAITPKG detected via
 | `LOCK XADD`, `CMPXCHG16B` | Tile claims; 16-byte descriptor publish |
 | `RDTSCP` | Stage timing for the performance gates |
 
-## The Zero-Spin Wait Boundary
+## The Callback and Dormancy Boundary
 
-Document 03 defines two distinct blocking paths:
+Document 03 defines one computational progress path:
 
 ```text
-coordination work   one ready permit -> signal one kcoro worker
-fixed compute       generation unchanged -> register/recheck -> block wait word
+producer publishes durable state -> ready edge -> retained continuation runs
+numerical stage returns as a full team -> exact ticket CQ -> next route label
 ```
 
-The coordination signal is the same expected-value doorbell used by the
-realtime notifier, not a condition-variable bridge. Neither canonical path has
-a spin tier. `PAUSE`, `YIELD`, repeated-load budgets,
-and timed polling are absent from the generated native wait code. A future
-capability-selected `LDXR`/`WFE` or `UMONITOR`/`UMWAIT` backend is a park
-implementation, not a pre-park budget; it is disabled unless it beats the OS
-expected-value wait without raising idle CPU or power. Rosetta and unsupported
-hosts take the OS path. The former `REQ_CALL` Depthformer exception is gone:
-`run_depth_frame` uses `lane_fence` for every cross-lane dependency, and the Rust
-`SpinBarrier`/lane callback were deleted together. The former GEMM and DD FFT
-grids are typed native passes. DD FFT bit reversal and butterfly stages use the
-same zero-spin generation fence; no generic callback or third wait primitive remains.
+No ticket, stage, route, result, audio block, or capacity condition owns a
+waiter. A suspended operation is only durable state: ticket identity, route
+label, phase cursor, epoch, borrowed-span leases, scratch-bank lease, and output
+reservation. The producing edge makes that record runnable. Callback code may
+drain ready work or publish another edge; it may not sleep, poll, allocate, or
+invoke a foreign runtime.
 
-The host adapter supplies operations equivalent to:
+The fixed team executes exactly one non-suspending numerical stage per
+generation. Every member returns from the stage. The team completion callback is
+the quorum edge; it advances the ticket cursor and either dispatches the next
+stage or publishes the terminal CQ record. Depthformer, Conformer, prefill,
+sampling, GEMM, DD FFT, and Mimi use this same callback-phased rule. There is no
+per-stage ticket, `lane_fence`, numerical collective waiter, or host-mediated
+transpose boundary.
+
+One private exception exists below the operation model: a resident runtime or
+team worker with no runnable continuation may become dormant on one shared
+expected-value doorbell. The operation is not attached to that worker; any
+worker may consume the next ready record. The public/private high-level surface
+is deliberately deadline-free:
 
 ```c
-typedef struct kc_port_wait_word kc_port_wait_word;
-
-int kc_port_wait_u32_prepare(uint32_t *address, kc_port_wait_word **out);
-int kc_port_wait_u32(kc_port_wait_word *word, uint32_t expected,
-                     uint64_t deadline_ns);
-void kc_port_wake_u32_one(kc_port_wait_word *word);
-void kc_port_wake_u32_all(kc_port_wait_word *word);
-void kc_port_wait_u32_release(kc_port_wait_word *word);
+uint32_t kc_doorbell_observe(const kc_doorbell *doorbell);
+int kc_doorbell_park(kc_doorbell *doorbell, uint32_t expected); /* runtime idle only */
+void kc_doorbell_ring(kc_doorbell *doorbell);
 ```
 
-The address points to aligned raw 32-bit storage owned by the private board. One
-internal lock-free `kc_atomic_*` helper family performs every load, decrement,
-and increment with explicit memory order from both C and C++. The adapter uses
-the address only for expected-value blocking/ordinary-wake bookkeeping and never
-publishes a sequence during an ordinary wake. Exact-once handle release may
-publish one terminal increment to drain an already-entered waiter. Do not cast
-between `_Atomic uint32_t` and
-`std::atomic<uint32_t>`; their cross-language layout is not the contract.
-The build selects one board owner and one helper implementation. It does not mix
-C11 atomic objects, compiler builtins, and `atomic_ref` accesses on the same
-word.
+The low-level `kc_port_wait_u32` name remains an implementation detail of that
+single idle-dormancy adapter and administrative tests; it is not callable by a
+computational operation. The adapter is prepared once at runtime construction,
+uses aligned raw 32-bit storage owned by the private board, rechecks the entire
+ready predicate before becoming dormant, tolerates spurious host returns, and
+has no deadline. Shutdown publishes a stop edge, joins the resident workers,
+releases the adapter exactly once, and only then frees the board. There is no
+condition-variable fallback on a realtime callback path and no spin fallback.
 
-A prepared handle backed by a direct futex, supported platform wait, guarded
-architectural event wait, or condition-variable fallback may implement the
-contract. Every backend waits while the word still equals `expected`, returns
-only after rechecking that predicate, and tolerates spurious wakeups. A C++
-adapter may use
-`std::atomic_ref<uint32_t>::wait/notify` over the aligned raw word only when the
-selected library implementation is audited to block immediately without a
-pre-block spin tier; it may not reinterpret the address as a distinct
-`std::atomic<uint32_t>` object. The adapter must close the register/recheck race
-and tolerate spurious returns. An event-register backend must additionally clear
-or retire its monitor correctly on exit and pass lost-wake, spurious-wake, and
-stop tests. If the platform cannot supply a conforming blocking wait, the
-fixed-executor capability is unavailable; inference does not silently fall back
-to spinning.
+All atomic access to the doorbell uses one internal `kc_atomic_*` helper family
+with explicit memory order from C and C++. Do not cast between `_Atomic
+uint32_t` and `std::atomic<uint32_t>`; their cross-language layout is not the
+contract. The build selects one board owner and one helper implementation. It
+does not mix C11 atomic objects, compiler builtins, and `atomic_ref` accesses on
+the same word.
 
-Prepare the shared dispatch and fence words during executor creation so backend
-selection and fallback allocation happen once. Hot waits and wakes use each
-handle directly and never search an address registry. Stage/idle waits use an
-infinite deadline; coordination timers own deadlines. Shutdown advances and
-wakes the dispatch word, joins workers, releases both handles exactly once, and
-only then frees the board.
-
-Every fixed lane waits on the shared dispatch word between passes. At a stage
-transition, non-last lanes declare bits in the logical park mask, recheck stage
-generation, and wait on the shared fence word. The last lane exchanges the mask;
-when nonempty it advances that word and performs one address wake-all. Peers that
-observed the new generation before blocking clear their own declarations. The
-logical generation carries identity; the shared word only delivers the edge.
-
-For design 16's block mode, a collective has fixed membership and one shared
-`{ticket, program, stage, generation}`. Every member reaches every stage fence;
-the last arrival runs the declared bounded mixer exactly once, advances the
-generation, and wakes the parked members. A lane may not yield, retire, or switch
-to an unrelated coroutine while it owes an arrival. Coroutines sequence
-reconverged stages; assembly owns complete tiles and never yields. Dynamic audio
-fragment assembly parks the route instance before admission and never holds a
-partially arrived numerical collective.
+For design 16's block mode, fixed members run one non-suspending stage and all
+return. The final return may run the declared bounded mixer exactly once before
+publishing the callback edge. No lane may suspend, retire, or switch programs
+mid-stage. Assembly owns complete tiles; retained continuations sequence the
+stages. Dynamic audio fragment assembly leaves the route record dormant until
+quorum and admits numerical work only after every required span is present.
 
 The committed evidence is
 [`G0_FENCE_SPIN_321538F1.md`](../../docs/native/baselines/G0_FENCE_SPIN_321538F1.md)
@@ -339,8 +319,8 @@ from `0.732` to `0.574 ms`. The median remains an optimization target while the
 tail materially improves. The next work is barrier-economy/fused-plan work plus
 full token/frame percentiles, not a hidden spin tier.
 
-Capture/playback space/data doorbells use the same zero-spin primitive outside
-hardware callbacks. Hardware callbacks never wait.
+Capture/playback space/data publication uses the same edge discipline. Hardware
+callbacks only publish bounded records and ring; they never become dormant.
 
 ## Dispatch and Capability Detection
 
@@ -369,10 +349,11 @@ hardware callbacks. Hardware callbacks never wait.
    Apple entropy thunk calls `SecRandomCopyBytes` only at conversation creation
    or explicit reseed. `run_sampler` is absorbed into token and Depthformer
    passes and adds no per-draw or per-codebook scheduling.
-5. `native/src/runtime/wait.{h,cpp}`: one register/recheck/park wrapper used by
-   shared fixed-executor generations and audio doorbells. Keep the OS wait-word
-   adapter as the baseline; admit an architectural event backend only through
-   capability probe plus the design-16 measurement gate. Add C/C++
+5. Kcoro doorbell substrate: one observe/recheck/dormancy wrapper used only by
+   otherwise-idle resident workers. Keep the OS address-dormancy adapter as the
+   baseline; admit an architectural event backend only through capability probe
+   plus the design-16 measurement gate. Operations publish ready records and
+   never call this wrapper. Add C/C++
    address-identity and memory-order litmus tests proving one selected atomic
    helper owns every board access.
 6. Accelerate stage adapter: `cblas_sgemm` calls as declared stages with
@@ -384,9 +365,9 @@ hardware callbacks. Hardware callbacks never wait.
    nothing else numerical; x86_64 links no BLAS; no `cblas_` symbol outside
    the Accelerate adapter; no libm vector calls in kernel objects; `memcpy`
    audit passes on kernel directories.
-8. Bandwidth and fence microbenchmarks recorded per machine: GEMV kernels
-   against measured STREAM bandwidth; blocking fence p50/p99, syscall/wake
-   counts, logical park-mask population, and idle CPU.
+8. Bandwidth and dispatch microbenchmarks recorded per machine: GEMV kernels
+   against measured STREAM bandwidth; callback-dispatch p50/p99, host wake
+   counts, ready-record depth, and idle CPU.
 
 ## Acceptance Gates
 
@@ -399,14 +380,15 @@ hardware callbacks. Hardware callbacks never wait.
   the target machine; regressions against the recorded baseline fail the gate.
 - Accelerate-dispatched stages meet the same per-stage tolerance fixtures as
   house kernels; no stage-local tolerance is widened to admit Accelerate.
-- Fence latency: blocking generation wake meets the recorded p50/p99/max
-  envelope; each nonempty logical park mask causes at most one host wake and no
-  coordination wake; idle CPU is indistinguishable from a blocked process.
+- Callback-dispatch latency meets the recorded p50/p99/max envelope; numerical
+  stage transitions cause no host wake, while an edge into a completely idle
+  runtime causes at most one host wake; idle CPU is indistinguishable from a
+  dormant process.
 - Disassembly/source audit finds no compiled spin loop, `PAUSE`, `YIELD`,
-  monitor-wait budget, or timed polling in a fence, command wait, or doorbell.
-  If an event-register backend is selected, the audit instead proves one
-  arm-and-park loop around the expected-value predicate and an OS fallback.
-- C/C++ and TSan tests prove the wait adapter observes the same aligned raw word
+  operation wait, numerical fence, monitor budget, or timed polling. If an
+  event-register idle backend is selected, the audit proves one private
+  arm-and-dormancy loop around the empty-ready predicate and an OS fallback.
+- C/C++ and TSan tests prove the doorbell adapter observes the same aligned raw word
   used by the selected atomic helper; no atomic-object reinterpret cast or mixed
   helper access exists.
 - The link/symbol audit passes: no tensor-framework, BLAS (outside Accelerate

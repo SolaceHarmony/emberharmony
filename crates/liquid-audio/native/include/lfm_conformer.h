@@ -1,12 +1,11 @@
 // Native Conformer encoder + audio adapter ABI. Replaces the Rust/Candle
-// owners in src/model/conformer/* and the adapter's Candle path; parity is
-// gated by native/tests/fixtures/conformer/ (captured from the deleted Rust
-// with real checkpoint weights on the production BF16 ladder).
+// owners in src/model/conformer/* and the adapter's former Candle path.
 //
-// Execution: one segment forward is a lane-uniform Flashkern program submitted
-// through lfm_engine_call — barriers via lfm_lane_fence, tiles via atomic
-// claims, planes swapped at serial transitions. C++ sequences stages and moves
-// bytes; every value is produced by an architecture assembly leaf
+// Execution: one segment is one retained Flashkern ticket. Every fixed-team
+// final return advances a ticket-owned program cursor and eagerly dispatches
+// its next stage; no lane or caller stack waits for an internal Conformer
+// result. C++ sequences stages and moves bytes; every value is produced by an
+// architecture assembly leaf
 // (flashkern_conformer.S) or the approved matmul dispatch (bf16 GEMM leaves;
 // f32 GEMM via Accelerate on Apple per the doc 09 split, lane-tiled scalar
 // leaf elsewhere).
@@ -80,9 +79,8 @@ LFM_ORACLE_API uint64_t
 lfm_conformer_direct_gemm_calls(const LfmConformer *conformer);
 
 // Session-owned mutable planes. Production reserves the maximum admitted mel
-// segment before readiness; subsequent forwards never grow and return
-// -ENOBUFS if admission is violated. An unreserved workspace retains the
-// transitional grow-on-first-forward behavior used by parity tests.
+// segment before readiness; ticket execution rejects an unsealed workspace,
+// never grows, and returns -ENOBUFS if admission is violated.
 LFM_ORACLE_API int
 lfm_conformer_workspace_create(LfmConformerWorkspace **out);
 LFM_ORACLE_API int
@@ -97,17 +95,6 @@ LFM_ORACLE_API uint64_t
 lfm_conformer_out_rows(const LfmConformer *conformer, uint64_t mel_frames);
 LFM_ORACLE_API uint64_t
 lfm_conformer_out_width(const LfmConformer *conformer);
-
-// mel: row-major (feat_in x mel_frames) BF16 bits — exactly the ChatState
-// audio_in segment layout after the prefill BF16 cast.
-// out_rows: row-major (out_rows x adapter_out) BF16 bits — adapted embedding
-// rows, written to the caller's destination (the borrowed prefill plane).
-// Blocks until the lane team completes the segment. Returns 0; -EINVAL on
-// nulls, zero frames, or undersized capacity.
-LFM_ORACLE_API int lfm_conformer_forward(
-    const LfmConformer *conformer, LfmConformerWorkspace *workspace,
-    const uint16_t *mel, uint64_t mel_frames, uint16_t *out_rows,
-    uint64_t out_capacity_values);
 
 #ifdef __cplusplus
 }

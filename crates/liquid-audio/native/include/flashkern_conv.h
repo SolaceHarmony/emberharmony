@@ -17,16 +17,6 @@ void lfm_depthwise_stream_bf16(const uint16_t *x, const uint16_t *cache,
                                uint16_t *next,
                                int batch, int channels, int steps, int kernel);
 
-/* One typed SQ/CQ pass over the fixed Flashkern lane team. Counts are in bf16
- * elements and must exactly match the declared geometry. */
-int lfm_engine_depthwise_stream_bf16(
-    void *engine, const uint16_t *x, size_t x_count,
-    const uint16_t *cache, size_t cache_count,
-    const uint16_t *weights, size_t weight_count,
-    uint16_t *out, size_t out_count,
-    uint16_t *next, size_t next_count,
-    size_t batch, size_t channels, size_t steps, size_t kernel);
-
 #ifdef __cplusplus
 }
 #endif

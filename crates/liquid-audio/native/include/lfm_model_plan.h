@@ -7,6 +7,7 @@
 #include "flashkern_prng.h"
 #include "flashkern_sampler.h"
 #include "lfm_frontend.h"
+#include "lfm_kernel_bridge.h"
 #include "lfm_mimi.h"
 
 #ifdef __cplusplus
@@ -72,6 +73,10 @@ typedef struct LfmAudioRouteTarget {
 typedef struct LfmAudioRouteHandle {
     void *record;
     uint64_t generation;
+    /* Canonical workflow identity. Child numerical passes have their own
+     * PASS tickets, but this value remains stable while the retained route is
+     * queued, running, complete, and awaiting exact collection. */
+    KcTicketIdV1 ticket;
 } LfmAudioRouteHandle;
 
 /* Terminal notification is an internal doorbell edge. Implementations must be
@@ -136,47 +141,6 @@ int lfm_ctx_set_heads(void *engine, uint64_t id,
                       float final_norm_eps);
 int lfm_ctx_clear(void *engine, uint64_t id);
 uint32_t lfm_engine_lanes(void *engine);
-int lfm_engine_token_pass(void *engine, uint64_t id,
-                          const uint32_t *ids, size_t id_count,
-                          uint32_t embedding_kind,
-                          const LfmLayerState *states, size_t state_count,
-                          size_t position, const uint16_t *rope_cos,
-                          const uint16_t *rope_sin, size_t rope_elements,
-                          uint16_t *out_hidden, size_t hidden_elements,
-                          float *out_logits, size_t logit_elements,
-                          const LfmSamplerConfigV1 *sampler,
-                          LfmPrngStateV1 *prng, uint32_t *out_token,
-                          size_t lanes, const uint16_t *provided_embed);
-
-/* Private eager two-node route used by interleaved audio generation. It runs
- * TOKEN_PASS without sampling, commits the exact predeclared context record,
- * then returns DEPTH_FRAME to the fixed native broker. Each coarse node releases
- * its compute slot; the outward compatibility call waits only for the pooled
- * route's terminal completion. */
-int lfm_engine_audio_recurrence(
-    void *engine, uint64_t model_id, uint64_t depth_id,
-    const uint32_t *ids, size_t id_count, uint32_t embedding_kind,
-    const LfmLayerState *states, size_t state_count, size_t position,
-    const uint16_t *rope_cos, const uint16_t *rope_sin,
-    size_t rope_elements, uint16_t *out_hidden, size_t hidden_elements,
-    const LfmSamplerConfigV1 *audio_sampler, LfmPrngStateV1 *prng,
-    uint32_t *out_codes, size_t code_count, size_t lanes,
-    const struct LfmTokenCommitRecord *commit,
-    uint32_t *out_token_completed);
-
-/* Production bounded route. PCM points directly into an already-retained
- * playback reservation; no dock or publication operation occurs in-engine. */
-int lfm_engine_audio_route(
-    void *engine, uint64_t model_id, uint64_t depth_id,
-    const uint32_t *ids, size_t id_count, uint32_t embedding_kind,
-    const LfmLayerState *states, size_t state_count, size_t position,
-    const uint16_t *rope_cos, const uint16_t *rope_sin,
-    size_t rope_elements, uint16_t *out_hidden, size_t hidden_elements,
-    const LfmSamplerConfigV1 *audio_sampler, LfmPrngStateV1 *prng,
-    MimiDecodeState *mimi, const LfmAudioRouteTarget *target,
-    LfmAudioRouteResult *result, size_t lanes,
-    const struct LfmTokenCommitRecord *commit);
-
 int lfm_engine_audio_route_submit(
     void *engine, uint64_t model_id, uint64_t depth_id,
     const uint32_t *ids, size_t id_count, uint32_t embedding_kind,
@@ -193,6 +157,11 @@ int lfm_engine_audio_route_submit(
 int lfm_engine_audio_route_collect(void *engine,
                                    LfmAudioRouteHandle *handle);
 
+/* Queue one callback-only control edge through the same fair broker. */
+int lfm_engine_control_route_submit(
+    void *engine, LfmAudioRouteNotify notify, void *notify_context,
+    LfmAudioRouteHandle *out_handle);
+
 /* Single-node sampled token continuation used by interleaved text output. It
  * shares the same fixed route pool and completion handle as the audio route. */
 int lfm_engine_token_route_submit(
@@ -206,6 +175,18 @@ int lfm_engine_token_route_submit(
     uint32_t *out_token_completed, LfmAudioRouteNotify notify,
     void *notify_context, LfmAudioRouteHandle *out_handle);
 
+/* Recurrence-only token commit used by interrupt. It advances the model's
+ * private KV/ShortConv thought state and publishes no sampled value. */
+int lfm_engine_token_commit_route_submit(
+    void *engine, uint64_t model_id, const uint32_t *ids, size_t id_count,
+    uint32_t embedding_kind, const LfmLayerState *states,
+    size_t state_count, size_t position, const uint16_t *rope_cos,
+    const uint16_t *rope_sin, size_t rope_elements, uint16_t *out_hidden,
+    size_t hidden_elements, size_t lanes,
+    const struct LfmTokenCommitRecord *commit,
+    uint32_t *out_token_completed, LfmAudioRouteNotify notify,
+    void *notify_context, LfmAudioRouteHandle *out_handle);
+
 /* Private native prefill seam. The workspace is conversation-owned and fully
  * sized before readiness; production never exposes it or the row/state planes
  * through the Rust ABI. A pass accepts at most four consecutive text embedding
@@ -213,16 +194,16 @@ int lfm_engine_token_route_submit(
 int lfm_engine_prefill_workspace_create(void *engine, uint64_t id,
                                         void **out_workspace);
 void lfm_engine_prefill_workspace_destroy(void *workspace);
-int lfm_engine_prefill(void *engine, uint64_t id, void *workspace,
-                       const uint32_t *ids, const uint16_t *provided_rows,
-                       size_t row_count, uint32_t embedding_kind,
-                       const LfmLayerState *states, size_t state_count,
-                       size_t position, const uint16_t *rope_cos,
-                       const uint16_t *rope_sin, size_t rope_elements,
-                       uint16_t *out_hidden, size_t hidden_elements,
-                       const LfmSamplerConfigV1 *sampler,
-                       LfmPrngStateV1 *prng, uint32_t *out_token,
-                       size_t lanes);
+int lfm_engine_prefill_submit(
+    void *engine, uint64_t id, void *workspace, const uint32_t *ids,
+    const uint16_t *provided_rows, size_t row_count,
+    uint32_t embedding_kind, const LfmLayerState *states,
+    size_t state_count, size_t position, const uint16_t *rope_cos,
+    const uint16_t *rope_sin, size_t rope_elements, uint16_t *out_hidden,
+    size_t hidden_elements, const LfmSamplerConfigV1 *sampler,
+    LfmPrngStateV1 *prng, uint32_t *out_token, size_t lanes,
+    LfmAudioRouteNotify notify, void *notify_context,
+    LfmAudioRouteHandle *out_handle);
 
 #ifdef __cplusplus
 } /* extern "C" */

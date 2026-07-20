@@ -10,8 +10,8 @@ Flashkern behaves like a resident command processor that can recur in realtime:
 - a native session chooses a typed pass;
 - one retained descriptor enters the native submission queue;
 - fixed lanes fan out stages over shared scratch;
-- the last lane publishes exactly one native completion;
-- that completion resolves the waiting native continuation;
+- the fixed-team final-return callback publishes exactly one native completion;
+- that completion makes the suspended native continuation runnable;
 - the session may immediately recur, switch conversations, fork a candidate,
   emit PCM, or park for an external audio/control event.
 
@@ -22,7 +22,7 @@ No model progress edge requires Rust, Tauri, polling, or serialized IPC.
 | Domain | Owner | Work unit | Forward-progress edge |
 |---|---|---|---|
 | Audio dock | Rust kcoro | PCM lease, device callback, control request, host projection | audio/control ring doorbell resolves a Rust promise |
-| Model runtime | Native session and Flashkern | complete model pass, stage, tile, native recurrence action | native CQ doorbell resolves a native continuation |
+| Model runtime | Native session and Flashkern | complete model pass, stage, tile, native recurrence action | native CQ publication resumes a retained continuation |
 
 Rust kcoro is a general parallelism library and the asynchronous audio dock. It
 does not schedule model passes. Flashkern's native ticket language may share
@@ -31,31 +31,29 @@ different.
 
 ## Current Native Mount
 
-The current working tree has one native executor with one in-flight pass slot:
+The current working tree has one native executor with a fixed pass-slot pool:
 
-1. `submit_pass` in
-   `crates/liquid-audio/native/src/engine/flashkern_engine.cpp:1954-2003`
-   creates a generation-protected descriptor and a 128-byte submission cell.
-2. `lfm_kernel_bridge_submit` retains the descriptor for the queue and rings the
-   native submission doorbell.
-3. `bridge_main` at `flashkern_engine.cpp:1898-1951` validates the descriptor,
-   request kind, context identity, and epoch before publishing the lane
-   generation.
-4. Every fixed lane runs the same nested pass program, claims disjoint tiles,
-   and crosses zero-spin generation fences.
-5. Lane 0 publishes one `KcCompletionV1` after the final fence.
-6. `submit_pass` blocks on `lfm_kernel_bridge_wait_completion`, validates exact
-   ticket/context/epoch identity, then releases the owner descriptor lease.
+1. `submit_slot` creates a generation-protected descriptor and a 128-byte
+   submission cell, then notifies the retained bridge service.
+2. The bridge service drains `lfm_kernel_bridge_try_submission`, validates the
+   descriptor, request kind, context identity, and epoch, and dispatches the
+   fixed team with an exact pass ticket.
+3. Every fixed lane runs the same nested pass program, claims disjoint tiles,
+   and returns at the current stage boundary.
+4. The fixed-team final-return callback advances the same ticket to its next
+   stage or publishes one terminal `KcCompletionV1`.
+5. CQ publication notifies the retained bridge service. It drains
+   `lfm_kernel_bridge_try_completion`, validates exact ticket/context/epoch
+   identity, and invokes the pass continuation. No thread waits for that fact.
 
 The old `LfmKernelSubmitFn`, `lfm_engine_set_submitter`,
 `lfm_engine_clear_submitter`, and Rust `coordinator.rs` path are deleted. The
 test `raw_engine_owns_its_sq_cq_without_rust_progress` constructs the raw C++
 engine and completes a pass without any Rust callback registration.
 
-This is a correct native ring mount, but not the final asynchronous session. The
-current C ABI helper waits synchronously because the engine still exposes one
-borrowed request slot. The next scheduler cut replaces that slot with native
-owned pass slots and parks a native continuation instead of a host call stack.
+The SQ/CQ surface is deliberately nonblocking. Empty queues return `-EAGAIN`;
+publication makes a retained service runnable. A continuation's durable state
+lives in its generation-leased pass slot rather than a blocked host call stack.
 
 ## Runtime Graph
 
@@ -162,49 +160,48 @@ served.
 A standing order is optional optimization, not a liveness crutch. It allows a
 session to chain a measured pass family for budget `N` without returning to the
 general broker between each pass. It stops at EOT, epoch change, output
-backpressure, deadline, or budget exhaustion. The ordinary completion contract
+backpressure, or budget exhaustion. The ordinary completion contract
 still publishes every pass terminal fact.
 
 ## Fixed Lane Team
 
-The numerical team uses stable OS threads and ordinary C++ call stacks. A parked
-lane cannot steal unrelated work from its own incomplete pass, so movable lane
-coroutines add no useful parallelism.
+The numerical team uses stable kcoro-owned member threads and ordinary C++ call
+stacks inside one non-suspending stage. Numerical state that survives the
+member return lives in the ticket's program record and scratch lease, never in
+those stacks or thread-local storage.
 
 Each stage:
 
-1. the last prior arriver publishes immutable stage metadata and resets the
-   claim counter;
-2. lanes fetch-add disjoint tile ranges;
-3. each tile calls a prebound assembly symbol;
-4. each lane arrives once at the generation fence;
-5. the last lane runs the bounded serial transition and release-publishes the
-   next generation;
-6. only lanes that declared themselves parked are woken.
+1. the retained ticket continuation publishes immutable stage metadata and
+   resets the claim counter;
+2. one team generation resumes every fixed member;
+3. members fetch-add disjoint tile ranges and each tile calls a prebound
+   assembly symbol;
+4. every member returns from the generation;
+5. the final return runs the bounded serial transition exactly once and invokes
+   the ticket completion edge;
+6. that edge advances the durable phase and either dispatches the next
+   generation or publishes the terminal CQ record.
 
-Tickets exist at pass/command granularity. Tiles and stages use counters and
-barriers; a ticket per tile is forbidden.
+Tickets exist at pass/command granularity. Tiles use atomic claims and stages
+are durable route labels within that ticket; a ticket per tile or stage is
+forbidden.
 
-## Zero-Spin Fence
+## No Operation Waiters
 
-`lane_fence` uses the expected-value wait contract:
+The numerical progress contract is:
 
 ```text
-read logical generation
-arrive
-if last:
-    run bounded serial transition
-    publish next generation
-    exchange parked mask
-    wake declared waiters
-else:
-    declare lane bit
-    recheck generation
-    block on shared expected-value word
+publish durable ticket phase
+dispatch one fixed-team generation
+all members return
+final return -> callback -> advance phase or terminal CQ
 ```
 
-There is no bounded spin tier. Interrupt and stop doorbells are checked only at
-complete pass boundaries, not inside an assembly operation or each tile.
+There is no numerical fence waiter, bounded spin tier, or host-mediated stage
+loop. Members may become dormant only after returning to the team's shared idle
+dispatch predicate. Interrupt and stop edges are checked only at declared pass
+boundaries, not inside an assembly operation or each tile.
 
 ## C++ / Assembly Boundary
 

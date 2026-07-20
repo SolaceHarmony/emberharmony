@@ -278,16 +278,16 @@ No thread sleeps for 5 ms and rechecks ring length. The current drain polling at
 `voice_runtime.rs:429-447` and turn drain loop in the consumer are replaced by
 space/drained edges from the playback owner.
 
-These edges use document 09's zero-spin wait-word contract. A waiter reads the
-ring generation once, registers/rechecks, and blocks. The hardware callback
-only publishes cursors/generation and invokes its setup-time retained
-`kc_service_notifier` edge. That edge is a lock-free generation publication and
-direct address wake; it never runs the continuation inline, allocates, takes the
-runtime mutex, or invokes a ticket callback. Hosts without that direct wake
-backend fail microphone setup rather than falling back to a pthread wake in the
-hardware callback. The runtime worker drains a fixed quota. If the ring remains
-ready, `kc_service_ready_again` requeues that exact continuation after it yields,
-without a timer, mutex, external edge, or wait-word syscall. A complete
+These edges use document 09's callback/dormancy contract. No audio block or
+capacity condition owns a waiter. The hardware callback release-publishes its
+cursor/generation and invokes its setup-time retained `kc_service_notifier`
+edge. That edge makes the durable VAD/frame continuation runnable; it never
+runs the continuation inline, allocates, takes the runtime mutex, or invokes a
+ticket callback. Hosts without a direct realtime-safe edge fail microphone
+setup rather than falling back to a pthread bridge in the hardware callback.
+The runtime callback drains a fixed quota. If the owned predicate remains ready,
+`kc_service_ready_again` republishes that exact continuation after it returns,
+without a timer, mutex, external edge, or address-park syscall. A complete
 utterance/frame creates one parent action ticket, and each model/codec pass
 reports readiness through the native completion path in documents 03 and 12.
 

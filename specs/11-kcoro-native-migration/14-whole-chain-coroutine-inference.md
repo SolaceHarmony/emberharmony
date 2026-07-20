@@ -48,9 +48,10 @@ owner. There is no owning tensor object, framework allocation, or materialized
 payload. Production data moves as retained buffer spans.
 
 The load-bearing observation: **the substrate for this already exists.** Flashkern
-is already a GPU-threadgroup engine — a fixed P-core lane team, generation-fence
-barriers, atomic tile-claim, one dispatcher, expected-value doorbells, no spin
-tier. The SQ/CQ bridge with descriptor leases exists. The safetensors loader
+is already a GPU-threadgroup engine — a fixed P-core lane team, atomic tile
+claims, one dispatcher, one final-return quorum callback, and no spin tier.
+The SQ/CQ bridge correlates exact tickets directly with fixed pass slots; it has
+no generic descriptor registry or operation waiter. The safetensors loader
 already demonstrates the required one-ingress-write discipline: a byte-exact
 resident image with immutable views. Mimi's private folded arena is not the
 model-image precedent and must not be generalized into a second weight pool.
@@ -83,12 +84,12 @@ There is no `.wav` generation anywhere, ever, as a principle — PCM is a live
 stream, not a rendered file. (A `.wav` render is the tell of a TTS mindset; this
 is an interleaved real-time model, not a text-to-speech renderer.)
 
-And the Rust audio dock uses **kcoro-rs** (`crates/kcoro`) — the same
-non-blocking, park-on-wake mechanism as the native layers — so that **Rust std
-channels are dumped entirely** at that layer. No `mpsc`, no `crossbeam`, no
-polling loop. The dock's rings and promises wake on the same expected-value
-substrate the lanes use. (Today the voice runtime holds ~57 std-channel sites;
-those are the debt this retires.)
+The Rust audio dock uses the narrow `kcoro-sys` retained-service surface and
+native PCM reservations, so **Rust std channels are absent** from that layer.
+No `mpsc`, `crossbeam`, polling loop, or operation waiter is permitted. A device
+callback publishes a bounded edge; that edge makes the fixed-owner continuation
+runnable. Only a resident kernel worker with no runnable ticket may become
+dormant.
 
 ---
 
@@ -106,8 +107,9 @@ those are the debt this retires.)
   This is the "device recurrence" row of the Flashkern GPU-equivalence table,
   realized.
 - **Rust's only production roles** are the two docks and the observer:
-  - dock microphone PCM in as a borrowed descriptor lease,
-  - drain speaker PCM out of a borrowed descriptor lease,
+  - fill a non-cloneable native capture reservation from the device callback,
+  - drain a ticket/epoch-tagged native playback reservation at the final device
+    callback,
   - submit control tickets (start turn, interrupt, configure),
   - observe transcript on the reliable event channel and telemetry on a lossy
     side channel.
@@ -127,12 +129,15 @@ those are the debt this retires.)
   barrier, fan-out, recurrence step, continuation, or register-sized tile.
   Scratch spans alias after their last consumer. No stage materializes a
   `Tensor` or grows a numerical `std::vector` on the progress path.
-- **Zero-wait.** No polling, no bounded spin, no host thread blocked on the
-  progress path. Every wait is an expected-value doorbell. The idle lane team
-  stays under the existing `< 0.1%` CPU gate (`engine_idle_zero_spin`).
+- **No operation waiters.** No polling, bounded spin, or host thread represents
+  suspended work. Producers publish durable records and make retained
+  continuations runnable. Only otherwise-idle resident runtime/team workers may
+  become dormant on one indefinite expected-value doorbell. The idle team stays
+  under the existing `< 0.1%` CPU gate (`engine_idle_zero_spin`).
 - **Real-time.** The pipeline overlaps stages, so wall-clock is the critical path,
   not the sum of stages. Per-frame Mimi decode (~14 ms) must keep pace with
-  playback; backpressure is a doorbell park on the speaker dock, never a sleep.
+  playback; backpressure leaves the route record dormant and releases the
+  engine slot until a speaker-capacity edge re-admits it.
 - **Faithful numerics.** bf16 bit-matched to the captured fixtures across every
   ported stage; `-ffp-contract=off`; Accelerate/AMX permitted for matmul-shaped
   stages on Apple. Seeded CSPRNG native; fixed-seed byte-identity per turn.
@@ -146,8 +151,8 @@ those are the debt this retires.)
   belong to Flashkern (see §0). Rust owns only the two PCM docks and control.
 - **No `.wav` generation, ever.** PCM is a live stream out of the model; there is
   no file-render step on the audio path.
-- **Rust channels are dumped** at the audio dock in favour of kcoro-rs rings /
-  promises, which park on the native wait-word substrate.
+- **Rust channels are dumped** at the audio dock in favour of bounded records
+  and retained kcoro services resumed by callback/capacity/control edges.
 - **No fallback chains.** A native gate failure is a terminal completion with a
   cause, not a silent drop to Candle. (This is a real sequencing constraint —
   see Trade-off 4.)
@@ -171,13 +176,13 @@ evaluator, or public model bytecode.
 ```
   ┌─────────────────────────────────────────────────────────────────────┐
   │ PLANE 1 — native model SQ/CQ (compute)                              │
-  │   fixed lane team · pass descriptors · generation fences · doorbells │
+  │   fixed lane team · exact ticket/slot · final-return callbacks       │
   │   THE progress path. exact-once completions. no host on it.          │
   ├─────────────────────────────────────────────────────────────────────┤
   │ PLANE 2 — PCM / control dock (I/O)                                   │
   │   mic lease in · speaker lease out · control tickets                 │
-  │   Rust lives here, on kcoro-rs rings/promises — NOT std channels.    │
-  │   borrowed descriptor regions. zero-copy. park-on-wake.              │
+  │   Rust lives here on retained native reservations — NOT std channels.│
+  │   ticket/epoch retained to device callback. zero-copy. callback edge.│
   ├─────────────────────────────────────────────────────────────────────┤
   │ PLANE 3 — reliable events + lossy observer (two sub-planes)         │
   │   text/transcript events: RELIABLE, ticketed, exactly-once.          │
@@ -240,10 +245,10 @@ SQ capacity ≥ 2 · no synchronous numerical wait · no bridge-thread I/O wait.
 | **Weight image** | One allocation containing byte-exact main+codec source files; tensor views are `base + offset` and may be unaligned. | **Landed; page-table read-only after validation.** |
 | **Scratch arenas** | Per-plan/per-conversation storage sized before readiness; zero steady-state growth. | **Partially landed.** Mimi and Conformer use fixed arenas; engine/backbone and conversation activation regions still need consolidation from separately owned vectors into one liveness map. |
 | **Session state machine** | One per conversation. Owns cursor, KV/conv planes, sampler CSPRNG, codec state, epoch, and recurrence. | **Landed natively; Rust no longer drives model progress.** |
-| **Pass program set** | Native resample, mel, Conformer, prefill, token, Depthformer, and Mimi stages. | **Typed boundary landed for LFM2.** Resample/frontend/whole-Conformer/adapter is one model-correlated SQ/CQ request over borrowed spans and conversation-owned workspace; its Conformer GEMMs are in-ticket team substages rather than recursive submissions. The native coordinator still submits and waits for that request synchronously, so route-executor integration remains open. |
+| **Pass program set** | Native resample, mel, Conformer, prefill, token, Depthformer, and Mimi stages. | **Typed boundary landed for LFM2.** Resample/frontend/whole-Conformer/adapter is one model-correlated ticket over borrowed spans and conversation-owned workspace. Conformer GEMMs and every other numerical substage advance through full-team return callbacks; no nested submission or numerical stage wait remains. |
 | **Immutable forwarding tables** | Model-owned, eagerly executed, total outcome maps over coarse precompiled programs; no callback objects, DAG VM, lazy evaluation, or per-turn construction. | **Bounded production route landed.** The audio branch uses a closed three-node/four-outcome `TOKEN_PASS -> DEPTH_FRAME -> MIMI_DECODE` table with bounds-checked terminal edges. Full-turn token-class and publication routing remain open. |
-| **Per-ticket route instances** | Fixed records carrying separate flow, ticket, route-label, media-position, model-position, retained leases, and terminal state. | **Partial.** One in-flight audio route uses a fixed conversation-owned result plus stack callback state and one exact pass-slot generation until terminal completion. This is not a pooled asynchronous route instance; pooled turns with independent flow/ticket/lease identities remain open. |
-| **SQ/CQ (capacity ≥ 2) + exact-CQ callback substrate** | A completion can retain and tail-resubmit its exact slot without a synchronous coordinator wait. | **Bounded production use landed.** Token commits on its CQ, Depthformer tail-submits Mimi when the pre-reserved playback span is live, and the slot releases before reliable PCM publication. Three pre-created borrowed descriptors plus an exclusive producer lease keep the callback mutex-free. The coordinator still performs one outward expected-value terminal wait; pooled asynchronous tickets, peer admission, and the fair broker remain open. |
+| **Per-ticket route instances** | Fixed records carrying separate flow, ticket, route-label, media-position, model-position, retained leases, and terminal state. | **Landed for the native LFM2 routes.** Fixed pooled records retain every cross-callback phase and lease; no stack callback or sleeping thread is continuation state. |
+| **SQ/CQ (capacity ≥ 2) + exact-CQ callback substrate** | A completion can retain and tail-resubmit its exact slot without a synchronous coordinator wait. | **Production use landed.** Token commits on its CQ, Depthformer advances to Mimi when the reserved playback span is live, and the slot releases before reliable PCM publication. The fair broker re-admits runnable nodes; outward result/playback backpressure is retained state resumed by an explicit host-capacity edge. |
 | **Docks** | Generation-checked mic/speaker PCM leases and bounded control/events. | **Native dock landed.** Physical Rust device adapter remains a later tranche. |
 | **Host collapse** | Rust submits tickets, services PCM, and observes events; it owns no model state. | **Landed in the desktop production path; oracle rims are non-release.** |
 
@@ -628,11 +633,12 @@ blocks that can gang into the existing eight-lane team. A block is a software
 execution domain, not a promise of macOS cluster placement, private L2, or AMX
 ownership.
 
-Each block owns its stage board, fixed-member fence, scratch mount, active
+Each block owns its stage board, scratch mount, active
 command, SQ, and SPSC CQ. A ganged pass reserves both blocks and uses a dedicated
-eight-lane board. Every collective member runs the same
-`{ticket,program,stage,generation}` and must arrive at every fence; no lane yields
-or retires while it owes an arrival. Initially, simultaneous four-lane programs
+eight-lane board. Every fixed member runs the same
+`{ticket,program,stage,generation}` and returns after that non-suspending stage.
+The final member return publishes the completion callback; no operation member
+parks at an internal boundary. Initially, simultaneous four-lane programs
 must belong to different conversations. One state-mutating numerical program per
 conversation is an invariant, not an inferred aliasing optimization.
 
@@ -648,13 +654,13 @@ prove fairness for more than two live route instances.
 
 The route executor adds a fixed-capacity model/runtime ready broker:
 
-- ready instances are grouped by bounded service class (`DEADLINE`,
+- ready instances are grouped by bounded service class (`REALTIME`,
   `INTERACTIVE`, `BACKGROUND`) and ordered FIFO within a conversation quantum;
 - a callback may retain its exact pass slot only for a bounded number of
   immediately ready programs;
 - at quantum exhaustion, external backpressure, cancellation, or a program that
   lacks a retained resource, it releases the pass slot and returns the route
-  instance to the broker/parked set;
+  instance to the broker's durable dormant set;
 - age promotion prevents a continuously recurring conversation from starving a
   third conversation when engine capacity is two;
 - an interrupt/control edge may outrank future numerical admission, but it does
@@ -666,8 +672,9 @@ Fairness can act only at fused-program boundaries. The longest admitted program,
 not the nominal quantum, is therefore the preemption and third-conversation wait
 floor; acceptance reports that measured duration.
 
-No fairness mechanism polls. Enqueue and quantum-return ring the broker's shared
-expected-value doorbell.
+No fairness mechanism polls. Enqueue and quantum-return publish one retained
+service edge. Only the resident runtime worker may become dormant when the
+entire ready predicate is empty.
 
 ### 4.2 Throughput and failure
 
@@ -678,8 +685,10 @@ expected-value doorbell.
   change that arithmetic, but deleting the duplicate keeps the working set from
   thrashing and keeps weights bf16 (half the bytes) in `(N,K)` (no repack). The
   win from zero-copy is measured in GB/s of avoided **activation** traffic.
-- **Deadlines.** Doorbell waits take an absolute `deadline_ns`. A missed real-time
-  deadline is a soft ticket cause — observable, not a crash.
+- **Time is observation only.** Tickets and doorbells have no deadline-driven
+  transition or timeout cause. Latency timestamps and device-liveness watchdogs
+  may report a separate telemetry/control fault, but elapsed time never admits,
+  completes, publishes, or advances numerical work.
 - **Failure is terminal, not degraded.** No fallback. A stale command rejected
   before admission or an unmet gate is a terminal completion with a cause. An
   already accepted stale-epoch pass settles under its commit policy but cannot

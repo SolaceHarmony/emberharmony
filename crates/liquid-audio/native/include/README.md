@@ -17,5 +17,6 @@ temporary parity surfaces; their location does not make them installable APIs.
   semantic callbacks, interruption, stop, join, and bounded snapshots.
 - `lfm_audio_dock.h` — private generation-checked capture/playback lease cells
   and pointer resolution. This header is not part of the product control ABI.
-- `lfm_kernel_bridge.h` — private fixed-record native model SQ/CQ and doorbell
-  ABI. Production Rust does not broker this queue; its bindings are test-only.
+- `lfm_kernel_bridge.h` — private fixed-record native model SQ/CQ ABI. Queue
+  publication resumes a retained native service; this surface has no blocking
+  receive API. Production Rust does not broker this queue.

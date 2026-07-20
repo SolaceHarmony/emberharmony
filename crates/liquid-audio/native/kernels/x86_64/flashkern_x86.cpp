@@ -1396,7 +1396,7 @@ extern "C" float lfm_bf16_sumsq_seq_f32(const uint16_t *x, int n) {
 // Sumsq in CANDLE's exact f32 reduction order (cpu/avx.rs vec_sum over a sqr() tensor):
 // four __m256 accumulators over 32-element steps, pairwise tree, then candle's exact
 // horizontal (low128+high128, hadd, hadd), sequential leftovers. See the NEON twin.
-extern "C" X86_TGT_AVX2 float lfm_bf16_sumsq_candle_f32(const void *storage, int n) {
+extern "C" X86_TGT_AVX2 float lfm_bf16_sumsq_ordered_f32(const void *storage, int n) {
     const unsigned char *x = static_cast<const unsigned char *>(storage);
     const int np = n & ~31;
     __m256 sum0 = _mm256_setzero_ps(), sum1 = _mm256_setzero_ps();

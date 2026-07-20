@@ -1,4 +1,5 @@
-use kcoro_sys::{Doorbell, Runtime, RuntimeConfig, Service, ServiceOutcome};
+use kcoro_sys::{Runtime, RuntimeConfig, Service, ServiceOutcome};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -66,12 +67,75 @@ impl Gate {
 }
 
 fn runtime(workers: u32) -> Runtime {
-    Runtime::with_config(RuntimeConfig {
-        workers,
-        segment: 0,
-        tickets: 4,
-    })
-    .unwrap()
+    Runtime::with_config(RuntimeConfig { workers }).unwrap()
+}
+
+#[test]
+fn safe_rust_surface_cannot_create_an_operation_waiter() {
+    const WRAPPER: &str = include_str!("../src/lib.rs");
+    for forbidden in [
+        "pub struct Doorbell",
+        "pub fn park",
+        "kc_doorbell_park",
+        "kc_port_wait_u32",
+    ] {
+        assert!(
+            !WRAPPER.contains(forbidden),
+            "safe Rust waiter surface survived: {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn concurrent_runtime_lifecycle_has_one_thread_set_owner() {
+    let runtime = runtime(4);
+    let gate = Arc::new(Barrier::new(17));
+    let statuses = std::thread::scope(|scope| {
+        let starts = (0..16)
+            .map(|_| {
+                let gate = Arc::clone(&gate);
+                let runtime = &runtime;
+                scope.spawn(move || {
+                    gate.wait();
+                    runtime.start()
+                })
+            })
+            .collect::<Vec<_>>();
+        gate.wait();
+        starts
+            .into_iter()
+            .map(|start| start.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    assert!(statuses.iter().any(Result::is_ok));
+    assert!(statuses
+        .iter()
+        .all(|status| status.is_ok() || *status == Err(-16)));
+
+    let gate = Arc::new(Barrier::new(17));
+    let statuses = std::thread::scope(|scope| {
+        let joins = (0..16)
+            .map(|_| {
+                let gate = Arc::clone(&gate);
+                let runtime = &runtime;
+                scope.spawn(move || {
+                    gate.wait();
+                    runtime.join()
+                })
+            })
+            .collect::<Vec<_>>();
+        gate.wait();
+        joins
+            .into_iter()
+            .map(|join| join.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    assert!(statuses.iter().any(Result::is_ok));
+    assert!(statuses
+        .iter()
+        .all(|status| status.is_ok() || *status == Err(-16)));
+    runtime.join().unwrap();
+    runtime.destroy().unwrap();
 }
 
 fn finish(runtime: Runtime, service: Service) {
@@ -79,12 +143,18 @@ fn finish(runtime: Runtime, service: Service) {
     runtime.destroy().unwrap();
 }
 
-#[test]
-fn doorbell_realtime_capability_is_queryable() {
-    let doorbell = Doorbell::new().unwrap();
-    let sequence = doorbell.observe();
-    let _ = doorbell.realtime_safe();
-    assert_eq!(doorbell.observe(), sequence);
+fn observe(service: &Service, handled: u64) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if service.snapshot().unwrap().handled_notifications >= handled {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "service edge was not acknowledged"
+        );
+        std::thread::yield_now();
+    }
 }
 
 #[test]
@@ -102,15 +172,167 @@ fn publication_precedes_the_safe_callback() {
 
     runtime.start().unwrap();
     service.start().unwrap();
-    runtime.run_until_idle().unwrap();
     assert_eq!(service.snapshot().unwrap().callbacks, 0);
 
     published.store(42, Ordering::Release);
     service.notify().unwrap();
-    runtime.run_until_idle().unwrap();
+    observe(&service, 1);
     assert_eq!(observed.load(Ordering::Acquire), 42);
 
     finish(runtime, service);
+}
+
+#[test]
+fn setup_factory_seals_one_callback_after_minting_distinct_producer_edges() {
+    let runtime = runtime(2);
+    let left = Arc::new(AtomicUsize::new(0));
+    let right = Arc::new(AtomicUsize::new(0));
+    let drained = Arc::new(AtomicUsize::new(0));
+    let left_task = Arc::clone(&left);
+    let right_task = Arc::clone(&right);
+    let total = Arc::clone(&drained);
+    let (service, (mut left_edge, mut right_edge)) = runtime
+        .state_service_factory(|setup| {
+            let left_edge = setup.realtime_notifier()?;
+            let right_edge = setup.realtime_notifier()?;
+            let callback = move || {
+                let count =
+                    left_task.swap(0, Ordering::AcqRel) + right_task.swap(0, Ordering::AcqRel);
+                total.fetch_add(count, Ordering::Release);
+                ServiceOutcome::Dormant
+            };
+            Ok::<_, i32>((callback, (left_edge, right_edge)))
+        })
+        .unwrap();
+
+    assert_eq!(service.snapshot().unwrap().callbacks, 0);
+    runtime.start().unwrap();
+    service.start().unwrap();
+    left.store(1, Ordering::Release);
+    right.store(1, Ordering::Release);
+    std::thread::scope(|scope| {
+        scope.spawn(|| left_edge.notify().unwrap());
+        scope.spawn(|| right_edge.notify().unwrap());
+    });
+    observe(&service, 2);
+
+    assert_eq!(drained.load(Ordering::Acquire), 2);
+    let snapshot = service.snapshot().unwrap();
+    assert_eq!(snapshot.notifications, 2);
+    assert_eq!(snapshot.handled_notifications, 2);
+    drop(left_edge);
+    drop(right_edge);
+    finish(runtime, service);
+}
+
+#[test]
+fn callback_owned_notifier_does_not_retain_its_callback_context() {
+    struct Dropped(Arc<AtomicBool>);
+
+    impl Drop for Dropped {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    let runtime = runtime(1);
+    let dropped = Arc::new(AtomicBool::new(false));
+    let guard = Dropped(Arc::clone(&dropped));
+    let (service, mut producer) = runtime
+        .state_service_factory(|setup| {
+            let callback_edge = setup.realtime_notifier()?;
+            let producer = setup.realtime_notifier()?;
+            let callback = move || {
+                /* Keeping this producer in durable callback state used to form
+                 * ServiceInner -> Callback -> RealtimeNotifier -> ServiceInner. */
+                let _ = &callback_edge;
+                let _ = &guard;
+                ServiceOutcome::Complete
+            };
+            Ok::<_, i32>((callback, producer))
+        })
+        .unwrap();
+
+    runtime.start().unwrap();
+    service.start().unwrap();
+    producer.notify().unwrap();
+    observe(&service, 1);
+    service.join().unwrap();
+    service.destroy().unwrap();
+    assert!(
+        dropped.load(Ordering::Acquire),
+        "terminal service retained a callback-owned notifier cycle"
+    );
+    assert!(producer.notify().is_err());
+    drop(producer);
+    runtime.destroy().unwrap();
+}
+
+#[test]
+fn owner_local_state_is_created_advanced_and_destroyed_on_one_worker() {
+    struct OwnerDrop {
+        owner: std::thread::ThreadId,
+        dropped: Arc<AtomicBool>,
+        migrated: Arc<AtomicBool>,
+    }
+
+    impl Drop for OwnerDrop {
+        fn drop(&mut self) {
+            if std::thread::current().id() != self.owner {
+                self.migrated.store(true, Ordering::Release);
+            }
+            self.dropped.store(true, Ordering::Release);
+        }
+    }
+
+    let runtime = runtime(4);
+    let initialized = Arc::new(AtomicBool::new(false));
+    let dropped = Arc::new(AtomicBool::new(false));
+    let migrated = Arc::new(AtomicBool::new(false));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let init_seen = Arc::clone(&initialized);
+    let drop_seen = Arc::clone(&dropped);
+    let migration = Arc::clone(&migrated);
+    let callback_calls = Arc::clone(&calls);
+    let (service, mut edge) = runtime
+        .owner_state_service_factory(|setup| {
+            let edge = setup.realtime_notifier()?;
+            let initializer = move || {
+                let owner = std::thread::current().id();
+                let local = Rc::new(());
+                let guard = OwnerDrop {
+                    owner,
+                    dropped: drop_seen,
+                    migrated: migration,
+                };
+                init_seen.store(true, Ordering::Release);
+                move || {
+                    let _ = (&local, &guard);
+                    if std::thread::current().id() != owner {
+                        guard.migrated.store(true, Ordering::Release);
+                    }
+                    callback_calls.fetch_add(1, Ordering::Release);
+                    ServiceOutcome::Dormant
+                }
+            };
+            Ok::<_, i32>((initializer, edge))
+        })
+        .unwrap();
+
+    runtime.start().unwrap();
+    service.start().unwrap();
+    edge.notify().unwrap();
+    observe(&service, 1);
+    assert!(initialized.load(Ordering::Acquire));
+    assert_eq!(calls.load(Ordering::Acquire), 1);
+
+    drop(edge);
+    service.stop();
+    service.join().unwrap();
+    assert!(dropped.load(Ordering::Acquire));
+    assert!(!migrated.load(Ordering::Acquire));
+    service.destroy().unwrap();
+    runtime.destroy().unwrap();
 }
 
 #[test]
@@ -130,11 +352,10 @@ fn safe_callback_is_not_invoked_inline() {
 
     runtime.start().unwrap();
     service.start().unwrap();
-    runtime.run_until_idle().unwrap();
     assert!(!called.load(Ordering::Acquire));
 
     service.notify().unwrap();
-    runtime.run_until_idle().unwrap();
+    observe(&service, 1);
     assert!(called.load(Ordering::Acquire));
     assert!(!inline.load(Ordering::Acquire));
 
@@ -150,7 +371,6 @@ fn notify_during_callback_is_serial_and_coalesced() {
 
     runtime.start().unwrap();
     service.start().unwrap();
-    runtime.run_until_idle().unwrap();
     service.notify().unwrap();
     gate.wait(1);
 
@@ -158,7 +378,7 @@ fn notify_during_callback_is_serial_and_coalesced() {
         service.notify().unwrap();
     }
     gate.release();
-    runtime.run_until_idle().unwrap();
+    observe(&service, 65);
 
     let snapshot = service.snapshot().unwrap();
     assert_eq!(snapshot.notifications, 65);
@@ -178,20 +398,20 @@ fn safe_bounded_callback_reenters_until_its_owned_predicate_is_drained() {
     let work = Arc::clone(&remaining);
     let seen = Arc::clone(&calls);
     let service = runtime
-        .polling_service(move || {
+        .state_service(move || {
             let before = work.fetch_sub(1, Ordering::AcqRel);
             seen.fetch_add(1, Ordering::Release);
             if before > 1 {
-                return ServiceOutcome::ReadyAgain;
+                return ServiceOutcome::Continue;
             }
-            ServiceOutcome::Park
+            ServiceOutcome::Dormant
         })
         .unwrap();
 
     runtime.start().unwrap();
     service.start().unwrap();
     service.notify().unwrap();
-    runtime.run_until_idle().unwrap();
+    observe(&service, QUOTAS as u64);
 
     assert_eq!(remaining.load(Ordering::Acquire), 0);
     assert_eq!(calls.load(Ordering::Acquire), QUOTAS);
@@ -205,6 +425,41 @@ fn safe_bounded_callback_reenters_until_its_owned_predicate_is_drained() {
 }
 
 #[test]
+fn natural_completion_retires_only_the_current_service() {
+    let runtime = runtime(2);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&calls);
+    let service = runtime
+        .state_service(move || {
+            seen.fetch_add(1, Ordering::Release);
+            ServiceOutcome::Complete
+        })
+        .unwrap();
+
+    runtime.start().unwrap();
+    service.start().unwrap();
+    service.notify().unwrap();
+    observe(&service, 1);
+    service.join().unwrap();
+    assert_eq!(calls.load(Ordering::Acquire), 1);
+    let snapshot = service.snapshot().unwrap();
+    assert!(snapshot.joined);
+    assert!(!snapshot.stop_requested);
+    service.destroy().unwrap();
+
+    let probe = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&probe);
+    let next = runtime
+        .service(move || flag.store(true, Ordering::Release))
+        .unwrap();
+    next.start().unwrap();
+    next.notify().unwrap();
+    observe(&next, 1);
+    assert!(probe.load(Ordering::Acquire));
+    finish(runtime, next);
+}
+
+#[test]
 fn stop_race_drains_accepted_realtime_edges_before_releasing_lifetimes() {
     let runtime = runtime(2);
     let gate = Arc::new(Gate::new());
@@ -214,7 +469,6 @@ fn stop_race_drains_accepted_realtime_edges_before_releasing_lifetimes() {
 
     runtime.start().unwrap();
     service.start().unwrap();
-    runtime.run_until_idle().unwrap();
     notifier.notify().unwrap();
     gate.wait(1);
 
@@ -264,15 +518,153 @@ fn callback_panic_is_contained_at_the_ffi_boundary() {
     runtime.start().unwrap();
     service.start().unwrap();
     service.notify().unwrap();
-    runtime.run_until_idle().unwrap();
+    observe(&service, 1);
     assert!(service.callback_panicked());
 
     service.notify().unwrap();
-    runtime.run_until_idle().unwrap();
+    observe(&service, 2);
     assert_eq!(calls.load(Ordering::Acquire), 1);
     let snapshot = service.snapshot().unwrap();
     assert_eq!(snapshot.notifications, 2);
     assert_eq!(snapshot.handled_notifications, 2);
 
     finish(runtime, service);
+}
+
+#[test]
+fn shared_realtime_control_edge_is_mpsc_and_callbacks_keep_one_owner() {
+    let runtime = runtime(4);
+    let owner = Arc::new(Mutex::new(None));
+    let migrated = Arc::new(AtomicBool::new(false));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let callback_owner = Arc::clone(&owner);
+    let callback_migrated = Arc::clone(&migrated);
+    let callback_calls = Arc::clone(&calls);
+    let service = runtime
+        .service(move || {
+            let current = std::thread::current().id();
+            let mut owner = callback_owner.lock().unwrap();
+            if let Some(first) = owner.as_ref() {
+                if *first != current {
+                    callback_migrated.store(true, Ordering::Release);
+                }
+            } else {
+                *owner = Some(current);
+            }
+            callback_calls.fetch_add(1, Ordering::Release);
+        })
+        .unwrap();
+    let edge = service.shared_realtime_notifier();
+
+    runtime.start().unwrap();
+    service.start().unwrap();
+    for round in 0..16 {
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let edge = edge.clone();
+                scope.spawn(move || edge.notify().unwrap());
+            }
+        });
+        observe(&service, ((round + 1) * 8) as u64);
+    }
+
+    let snapshot = service.snapshot().unwrap();
+    assert_eq!(snapshot.notifications, 128);
+    assert_eq!(snapshot.handled_notifications, 128);
+    assert!(calls.load(Ordering::Acquire) >= 16);
+    assert!(!migrated.load(Ordering::Acquire));
+    drop(edge);
+    finish(runtime, service);
+}
+
+#[test]
+fn shared_realtime_notify_surface_contains_no_callback_side_relay() {
+    const WRAPPER: &str = include_str!("../src/lib.rs");
+    let start = WRAPPER.find("impl SharedRealtimeNotifier").unwrap();
+    let end = WRAPPER[start..]
+        .find("/// Preserve the explicit link anchor")
+        .map(|offset| start + offset)
+        .unwrap();
+    let body = &WRAPPER[start..end];
+    for forbidden in ["Mutex", "UnsafeCell", "Box::", "Waker", "wait", "timer"] {
+        assert!(
+            !body.contains(forbidden),
+            "shared realtime notify gained a callback-side relay: {forbidden}"
+        );
+    }
+    assert!(body.contains("kc_service_notify"));
+}
+
+#[test]
+fn retained_state_cursor_survives_callbacks_and_stop_retires_the_final_edge() {
+    const STEPS: usize = 6;
+    for _round in 0..32 {
+        for stop in 0..STEPS {
+            let runtime = runtime(3);
+            let gate = Arc::new((Mutex::new((false, false)), Condvar::new()));
+            let trail = Arc::new(Mutex::new(Vec::new()));
+            let callback_gate = Arc::clone(&gate);
+            let callback_trail = Arc::clone(&trail);
+            let mut cursor = 0usize;
+            let mut payload = 7u64;
+            let service = runtime
+                .state_service(move || {
+                    payload = payload.wrapping_mul(17).wrapping_add(cursor as u64);
+                    callback_trail.lock().unwrap().push((
+                        cursor,
+                        payload,
+                        std::thread::current().id(),
+                    ));
+                    if cursor == stop {
+                        let (lock, changed) = &*callback_gate;
+                        let mut state = lock.lock().unwrap();
+                        state.0 = true;
+                        changed.notify_all();
+                        while !state.1 {
+                            state = changed.wait(state).unwrap();
+                        }
+                    }
+                    cursor += 1;
+                    if cursor == STEPS {
+                        return ServiceOutcome::Complete;
+                    }
+                    ServiceOutcome::Continue
+                })
+                .unwrap();
+
+            runtime.start().unwrap();
+            service.start().unwrap();
+            service.notify().unwrap();
+            {
+                let (lock, changed) = &*gate;
+                let mut state = lock.lock().unwrap();
+                while !state.0 {
+                    state = changed.wait(state).unwrap();
+                }
+            }
+            service.stop();
+            {
+                let (lock, changed) = &*gate;
+                let mut state = lock.lock().unwrap();
+                state.1 = true;
+                changed.notify_all();
+            }
+            service.join().unwrap();
+
+            let trail = trail.lock().unwrap();
+            assert_eq!(trail.len(), stop + 1);
+            assert!(trail.windows(2).all(|pair| pair[0].0 + 1 == pair[1].0));
+            assert!(trail.iter().all(|entry| entry.2 == trail[0].2));
+            let snapshot = service.snapshot().unwrap();
+            assert_eq!(snapshot.notifications, snapshot.callbacks);
+            assert_eq!(snapshot.handled_notifications, snapshot.notifications);
+            drop(trail);
+            service.destroy().unwrap();
+            runtime.destroy().unwrap();
+        }
+    }
+
+    const CONTINUATION: &str = include_str!("../vendor/kcoro_arena/core/src/koro_internal.h");
+    assert!(!CONTINUATION.contains("cursor"));
+    assert!(!CONTINUATION.contains("payload"));
 }

@@ -213,67 +213,13 @@ real; it does not erase the input-layout constraint.
   cases), not only the final scalar. An in-AMX exact reduction or a fused
   consumer is still required before this can satisfy the final-write-only goal.
 
-## `pipeline_probe.c` — the scheduling spine (fixed team + kc_port doorbell)
+## `monarch_fused_coop.c` — ticketed two-phase FFT without operation waiters
 
-Moves the question up a level: not "which leaf is fastest" but "does a
-flashkern-style fixed lane team, parked on the real in-repo `kc_port` doorbell,
-scale those leaves across the M2's cores with low, zero-spin overhead?" It links
-`kc_port` (`port/posix.c`) directly to isolate the lower-level wake path from
-`kc_team` orchestration. Work is a decode projection fanned out by
-an atomic tile-claim (flashkern's shared-counter pattern); leaves are BFDOT.
-Workers set `QOS_CLASS_USER_INTERACTIVE` to bias onto P-cores.
-
-### Measured on this M2 Max
-
-**Decode layer, N=2048 K=2048, 8 MiB BF16 weights, 64-row tiles:**
-
-| workers | ms/gen | GB/s | speedup |
-|---:|---:|---:|---:|
-| 1 | 0.206 | 40.7 | 1.00× |
-| 2 | 0.115 | 72.7 | 1.78× |
-| 4 | 0.071 | 118.7 | 2.91× |
-| 8 | 0.058 | 145.1 | 3.56× |
-
-**Orchestration overhead (tiny 1-tile work isolates the doorbell round-trip):**
-
-| workers | µs/gen |
-|---:|---:|
-| 1 | 2.59 |
-| 4 | 11.51 |
-| 8 | 23.62 |
-
-### What it establishes
-
-1. One worker reaches the same range as the standalone BFDOT measurement. No
-   dispatch regression was resolved by this methodology; that is weaker than
-   claiming the doorbell is free.
-2. Eight workers give **3.56×, not 8×**, and 4→8 buys only +0.65×. This proves
-   sublinear scaling for this footprint. The 8 MiB weight image can fit in the
-   measured machine's 16 MiB cluster L2, and the probe has no cache-miss or DRAM
-   counters, so it does **not** prove a DRAM-bandwidth ceiling.
-3. The tiny-work round trip is orchestration-dominated and rises from 2.59 µs
-   at one worker to 23.62 µs at eight. It includes dispatch, the tiny leaf,
-   completion, and reconvergence; it is an upper bound for orchestration, not a
-   pure wake-latency measurement.
-
-### Design consequence
-
-The result supports coarse resident-team generations instead of waking the full
-team for very small leaves. Four workers are the efficiency knee in this one
-shape. Weight reuse across already-ready rows is the next mechanism to test; it
-is not established here as the only possible way past the observed scaling.
-
-It does **not** yet measure the batched (weight-reuse) path, `kc_team`'s
-completion-callback edge, cross-conversation contention, or a heterogeneous
-AMX+NEON schedule — those are the next probes.
-
-## `monarch_fused_coop.c` — two FFT barrier strategies, measured head-to-head
-
-This AArch64 BF16 microbenchmark directly links the same vendored `kc_team` and
-`kc_collective` implementations used by the production flashkern engine. It
-creates a benchmark-local team, context, and storage; it is not dispatched
-through the engine request bridge or pass slots, and it does not replace the
-production FFT.
+This AArch64 BF16 microbenchmark directly links the same vendored `kc_runtime`,
+`kc_service`, and `kc_team` implementations used by the production flashkern
+engine. It creates a benchmark-local runtime, retained service, team, context,
+and storage; it is not dispatched through the engine request bridge or pass
+slots, and it does not replace the production FFT.
 
 For row-major input `x[n][l]`, the probe evaluates a columns-first two-factor
 forward transform: an N-point DFT down each column, the
@@ -287,18 +233,28 @@ formulas against their proper O(points²) direct DFT oracles at up to 4096
 points, including the unequal `16x32` shape. It does not call or validate the
 MLX kernel itself.
 
-The same BFDOT arithmetic runs under two synchronization modes:
+Each FFT is one real `KC_TICKET_KIND_PASS` identity whose retained record holds
+phase A or B. The retained service dispatches phase A as one team generation
+and returns dormant. The final member return copies the exact ticket and phase
+to the completion record, release-publishes its generation, and uses a retained
+service notifier to make the orchestration record runnable. The service
+acquire-consumes that publication: A advances the same ticket to B and
+dispatches a second team generation; B settles the ticket and schedules the
+next benchmark FFT. The ticket sequence advances once per complete FFT while
+the team generation advances twice.
 
-- `coarse` uses two complete team generations. The host waits after stage A
-  and dispatches stage B.
-- `collective` uses one team generation. Each callback performs stage A,
-  rendezvous through `kc_collective_arrive`, and then stage B.
+There is no `kc_team_wait`, `kc_collective`, member rendezvous, per-stage
+ticket, host-mediated phase transition, polling, sleep, timer, condition
+variable, or waiter thread. The main thread enters only terminal teardown
+joins; the team join can return only after the retained service publishes the
+stop edge, and teardown never advances a numerical phase.
 
-Both modes explicitly materialize the BF16 complex intermediate in ordinary
-static storage. The boundary publishes those writes; it is not a physical
-transpose. The probe has no cache or traffic counters, so it does not establish
-L1/L2 residency or the absence of DRAM traffic. BFDOT is Arm's BF16 dot-product
-operation with FP32 accumulation, not an 8x8 tensor-matrix operation.
+The two phases explicitly materialize the BF16 complex intermediate in
+ordinary static storage. The boundary publishes those writes; it is not a
+physical transpose. The probe has no cache or traffic counters, so it does not
+establish L1/L2 residency or the absence of DRAM traffic. BFDOT is Arm's BF16
+dot-product operation with FP32 accumulation, not an 8x8 tensor-matrix
+operation.
 
 Build from the repository root:
 
@@ -306,8 +262,10 @@ Build from the repository root:
 clang -O3 -std=c11 -Wall -Wextra -Wpedantic -Werror \
   -ffp-contract=off -march=armv8.6-a+bf16 \
   crates/liquid-audio/native/bench/monarch_fused_coop.c \
+  crates/kcoro-sys/vendor/kcoro_arena/core/src/kc_runtime.c \
+  crates/kcoro-sys/vendor/kcoro_arena/core/src/kc_service.c \
+  crates/kcoro-sys/vendor/kcoro_arena/core/src/kc_continuation.c \
   crates/kcoro-sys/vendor/kcoro_arena/core/src/kc_team.c \
-  crates/kcoro-sys/vendor/kcoro_arena/core/src/kc_collective.c \
   crates/kcoro-sys/vendor/kcoro_arena/core/src/kc_doorbell.c \
   crates/kcoro-sys/vendor/kcoro_arena/port/posix.c \
   -Icrates/kcoro-sys/vendor/kcoro_arena/include \
@@ -322,29 +280,39 @@ shapes.
 
 ### M2 Max measurements, 2026-07-19
 
-| factors | points | double oracle, max abs | BF16 normalized max | mode | 1 lane | 8 lanes | 8-lane speedup | coarse / collective at 8 lanes |
-|---|---:|---:|---:|---|---:|---:|---:|---:|
-| `16x32` | 512 | `7.01e-12` | `1.54e-02` | coarse | 0.014 ms | 0.051 ms | 0.28x | 1.20x |
-| | | | | collective | 0.008 ms | 0.042 ms | 0.20x | |
-| `32x32` | 1024 | `3.26e-11` | `2.65e-02` | coarse | 0.019 ms | 0.051 ms | 0.36x | 1.18x |
-| | | | | collective | 0.015 ms | 0.043 ms | 0.36x | |
-| `128x128` | 16384 | skipped | `4.85e-02` | coarse | 0.581 ms | 0.150 ms | 3.88x | 1.00x |
-| | | | | collective | 0.569 ms | 0.150 ms | 3.79x | |
+| factors | points | columns / rows double residual | BF16 normalized max | 1 lane | 2 lanes | 4 lanes | 8 lanes | 8-lane speedup |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `16x32` | 512 | `7.01e-12 / 4.28e-12` | `1.54e-02` | 0.013 ms | 0.017 ms | 0.025 ms | 0.054 ms | 0.24x |
+| `32x32` | 1024 | `3.26e-11 / 1.78e-11` | `2.65e-02` | 0.018 ms | 0.020 ms | 0.026 ms | 0.054 ms | 0.34x |
+| `128x128` | 16384 | skipped | `4.85e-02` | 0.558 ms | 0.297 ms | 0.180 ms | 0.137 ms | 4.07x |
 
-Every measured lane count (1, 2, 4, and 8) was bit-identical to the single-lane
-leaf and between synchronization modes. Timings are best-of-five warm samples
-and remain scheduler-sensitive. The collective removes one host round-trip and
-gives a 1.18–1.20x coarse/collective ratio on the synchronization-bound small
-cases at eight lanes; the difference is lost in the compute cost at 16384
-points. The large case shows useful parallel
-scaling, while the small cases remain slower as more lanes are added.
+Every measured lane count is bit-identical to the direct single-lane leaf.
+Timings are the best of six 400-FFT batches after 50 warmup FFTs and remain
+scheduler-sensitive. They include both team generations and both retained
+service completion edges. Wall clock records telemetry only; elapsed time never
+makes the continuation runnable. The small shapes remain orchestration-bound,
+while the 16384-point shape reaches 4.07x at eight lanes.
 
-The executable now fails on convention mismatches, non-finite results, BF16
-error above its documented limit, partition differences, team errors, and a
-collective-generation mismatch. It establishes forward-factorization and
-fixed-member partition equivalence only: there is no inverse, frequency-domain
-multiply, real packing, overlap/save, end-to-end convolution, or product-buffer
-integration.
+For each lane count the executable completes one correctness FFT, 50 warmups,
+and 2400 measured FFTs. It gates all of the following:
+
+- direct columns-first and rows-first convention residuals when points are at
+  most 4096, plus the factorized double reference and BF16 error limit at every
+  size;
+- bit-identical partitioned output for 1, 2, 4, and 8 members;
+- exactly one ticket-sequence increment and exactly two team generations per
+  completed FFT, ruling out a ticket per phase;
+- exact dispatched/completed team generations, final-member completion,
+  terminal team join, and an exact phase-B publication for the final ticket;
+- one handled retained-service callback for the kickoff and every team
+  completion publication, followed by natural service retirement; and
+- non-finite timing, ticket, dispatch, service, and teardown failures.
+
+The strict build and all three factor sweeps pass normally. The default
+`32x32` sweep also passes under ASan/UBSan and TSan. The probe establishes
+forward factorization, exact ticketed phase handoff, and fixed-member partition
+equivalence only: there is no inverse, frequency-domain multiply, real packing,
+overlap/save, end-to-end convolution, or product-buffer integration.
 
 ## `register_cache_chain.cpp` + `.S` — register FIFO ground truth
 

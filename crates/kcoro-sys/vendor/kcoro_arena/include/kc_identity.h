@@ -8,6 +8,12 @@
 extern "C" {
 #endif
 
+/* Correlation and trace identity carried by exact tickets. */
+typedef struct kc_id {
+    uint64_t epoch;
+    uint64_t sequence;
+} kc_id;
+
 /* Canonical ticket identity shared by kcoro, Flashkern, Rust, and product ABI. */
 typedef struct kc_ticket_id {
     uint64_t runtime_epoch;

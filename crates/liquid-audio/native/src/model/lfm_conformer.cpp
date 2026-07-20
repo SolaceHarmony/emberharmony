@@ -1,12 +1,9 @@
 // Native Conformer encoder + audio adapter. Contract: lfm_conformer.h.
-// Parity oracle: native/tests/fixtures/conformer/ (real checkpoint, BF16
-// production ladder, captured from the deleted Rust).
 //
 // Law of this TU: C++ binds views, moves bytes (transposes, padding, im2col,
 // rel_shift, head packing), and sequences stages. Every produced value comes
 // from an assembly leaf (flashkern_conformer.S / flashkern_math.S), the
-// engine's bf16 GEMM pass (the identical kernel+dispatch the deleted
-// linear_forward ticket used), or the approved f32 matmul dispatch
+// engine's bf16 GEMM pass, or the approved f32 matmul dispatch
 // (Accelerate on Apple, lfm_sgemm_f32 leaf elsewhere) for stages the
 // reference ran in f32 (convolutions, attention).
 //
@@ -21,8 +18,7 @@
 
 #include "lfm_conformer.h"
 
-#include "flashkern_gemm.h"
-#include "lfm_audio_pass.h"
+#include "lfm_conformer_program.h"
 #include "lfm_safetensors.h"
 
 #include <atomic>
@@ -313,42 +309,6 @@ int bind(const LfmWeightImage *img, const std::string &name, View &v,
     return 0;
 }
 
-// BF16 linear destination contract:
-//   X[rows,K] BF16 x W[N,K] resident bytes -> f32 dot -> f32 bias -> BF16 RNE
-//   directly into out[rows,N].
-//
-// The engine fixed team owns disjoint output-column bands. Each architecture
-// leaf carries its F32 dot and optional BF16 bias through the one logical RNE
-// boundary, then publishes directly into the final strided BF16 destination.
-// No accumulator plane crosses either the nested-team or ordinary ticket ABI.
-int bf16_linear(const LfmConformer *conformer, LfmConformerWorkspace *ws,
-                const uint16_t *x,
-                uint64_t rows, uint64_t k, const View &w, const View *bias,
-                uint16_t *out, bool engine_team) {
-    const uint64_t n = w.rows;
-    if (rows == 0 || k == 0 || n == 0 || w.cols != k) return -EINVAL;
-    if (rows > SIZE_MAX / k || n > SIZE_MAX / k || rows > SIZE_MAX / n) {
-        return -EOVERFLOW;
-    }
-    if (w.elements != n * k) return -EINVAL;
-    if (w.elements > SIZE_MAX / sizeof(uint16_t)) return -EOVERFLOW;
-    (void)ws;
-    const void *bias_bytes = bias && bias->bytes ? bias->bytes : nullptr;
-    const size_t bias_count = bias_bytes ? (size_t)n : 0;
-    const int status = engine_team
-        ? lfm_engine_conformer_gemm_team_bf16(
-              conformer->engine, x, (size_t)(rows * k), w.bytes,
-              (size_t)w.elements, bias_bytes, bias_count, out,
-              (size_t)(rows * n), (size_t)rows, (size_t)n, (size_t)k)
-        : lfm_engine_bf16_gemm_nt_direct_bf16(
-              conformer->engine, x, (size_t)(rows * k), w.bytes,
-              (size_t)w.elements, bias_bytes, bias_count, out,
-              (size_t)(rows * n), (size_t)rows, (size_t)n, (size_t)k);
-    if (status != 0) return -EIO;
-    conformer->direct_gemm_calls.fetch_add(1, std::memory_order_relaxed);
-    return 0;
-}
-
 // Pad activation planes without changing dtype. The direct convolution leaves
 // unlift both activations and resident taps at the MAC.
 void pad_1d(const uint16_t *x, uint64_t c, uint64_t t, uint64_t pad,
@@ -385,38 +345,6 @@ void rows_to_channels(const uint16_t *rows, uint64_t t, uint64_t c,
 }
 
 } // namespace
-
-#if defined(LFM_BUILD_ORACLE)
-// Oracle-only two-sided gate for the actual direct-destination implementation.
-extern "C" LFM_INTERNAL_API int lfm_internal_conformer_linear_for_test(
-    void *engine, const uint16_t *activation, uint64_t rows, uint64_t inner,
-    const void *weight_bytes, uint64_t columns, const void *bias_bytes,
-    uint16_t *out) {
-    if (!engine || !activation || !weight_bytes || !out || rows == 0 ||
-        inner == 0 || columns == 0) {
-        return -EINVAL;
-    }
-    if (rows > SIZE_MAX / columns || columns > SIZE_MAX / inner)
-        return -EOVERFLOW;
-    LfmConformer conformer{};
-    conformer.engine = engine;
-    LfmConformerWorkspace workspace{};
-    const View weight = {
-        .bytes = static_cast<const unsigned char *>(weight_bytes),
-        .rows = columns,
-        .cols = inner,
-        .elements = columns * inner,
-    };
-    const View bias = {
-        .bytes = static_cast<const unsigned char *>(bias_bytes),
-        .rows = columns,
-        .cols = 1,
-        .elements = columns,
-    };
-    return bf16_linear(&conformer, &workspace, activation, rows, inner,
-                       weight, bias_bytes ? &bias : nullptr, out, false);
-}
-#endif
 
 extern "C" int lfm_conformer_create(void *engine, const void *weights,
                                      const LfmConformerGeometry *geometry,
@@ -640,308 +568,609 @@ extern "C" uint64_t lfm_conformer_out_width(const LfmConformer *c) {
     return c ? c->g.adapter_out : 0;
 }
 
-int conformer_forward(const LfmConformer *c, LfmConformerWorkspace *ws,
-                      const uint16_t *mel, uint64_t mel_frames,
-                      uint16_t *out_rows_dst, uint64_t out_capacity_values,
-                      bool engine_team) {
-    if (!c || !ws || !mel || !out_rows_dst || mel_frames == 0) return -EINVAL;
-    const LfmConformerGeometry &g = c->g;
-    const uint64_t D = g.d_model, FF = g.d_ff, CC = g.conv_channels;
-    const uint64_t H = g.n_heads, DK = D / H, K = g.conv_kernel;
-    const uint64_t F0 = g.feat_in, T0 = mel_frames;
-    const uint64_t T1 = conv_len(T0), F1 = conv_len(F0);
-    const uint64_t T2 = conv_len(T1), F2 = conv_len(F1);
-    const uint64_t T3 = conv_len(T2), F3 = conv_len(F2);
-    const uint64_t Tp = T3, P = 2 * Tp - 1;
-    if (Tp == 0 || T1 == 0 || T2 == 0) return -EINVAL;
-    if (out_capacity_values < Tp * g.adapter_out) return -EINVAL;
-    const uint64_t FLAT = CC * F3;
-    size_t need_f = 0, need_b = 0;
-    const int workspace_status = workspace_needs(c, mel_frames, &need_f, &need_b);
-    if (workspace_status != 0) return workspace_status;
-    const int begin_status = ws->begin(need_f, need_b);
-    if (begin_status != 0) return begin_status;
+namespace {
 
-    // ---- subsampling --------------------------------------------------------
-    uint16_t *plane_a = ws->b(CC * T1 * F1);
-    {
-        // Input arrives (F0,T0); transpose directly into the padded image.
-        // The stem leaf reads that activation and the resident (CC,1,3,3)
-        // taps in place, so neither an im2col plane nor a widened weight plane
-        // exists. Its channel-major output is already plane_a's layout.
-        const size_t f_mark = ws->fo, b_mark = ws->bo;
-        const uint64_t hp = T0 + 2, wp = F0 + 2;
-        uint16_t *img0 = ws->b(hp * wp);
-        std::memset(img0, 0, (size_t)(hp * wp) * sizeof(uint16_t));
-        for (uint64_t f = 0; f < F0; ++f)
-            for (uint64_t t = 0; t < T0; ++t)
-                img0[(t + 1) * wp + f + 1] = mel[f * T0 + t];
-        float *stem = ws->f(CC * T1 * F1);
-        lfm_conv2d_stem_k3s2_bf16_f32(img0, c->stem_w.bytes, stem, CC,
-                                       hp, wp, T1, F1);
-        lfm_bias_bcast_f32(stem, c->stem_b.bytes, CC, T1 * F1);
-        lfm_f32_to_bf16(stem, plane_a, (int)(CC * T1 * F1));
-        lfm_relu_bf16(plane_a, CC * T1 * F1);
-        ws->fo = f_mark;
-        ws->bo = b_mark;
+enum : uint32_t {
+    CP_STEM = 0,
+    CP_DW_PREP = 1,
+    CP_DW_GEMM = 2,
+    CP_DW_FINISH = 3,
+    CP_FLATTEN = 4,
+    CP_SUB_OUT_GEMM = 5,
+    CP_POSITION = 6,
+    CP_FF1_PRE = 7,
+    CP_FF1_L1_GEMM = 8,
+    CP_FF1_ACT = 9,
+    CP_FF1_L2_GEMM = 10,
+    CP_ATTN_PRE = 11,
+    CP_ATTN_Q_GEMM = 12,
+    CP_ATTN_K_GEMM = 13,
+    CP_ATTN_V_GEMM = 14,
+    CP_ATTN_POS_GEMM = 15,
+    CP_ATTN_BODY = 16,
+    CP_ATTN_OUT_GEMM = 17,
+    CP_CONV_PRE = 18,
+    CP_CONV_PW1_GEMM = 19,
+    CP_CONV_BODY = 20,
+    CP_CONV_PW2_GEMM = 21,
+    CP_FF2_PRE = 22,
+    CP_FF2_L1_GEMM = 23,
+    CP_FF2_ACT = 24,
+    CP_FF2_L2_GEMM = 25,
+    CP_LAYER_FINISH = 26,
+    CP_ADAPTER_PRE = 27,
+    CP_ADAPTER_L1_GEMM = 28,
+    CP_ADAPTER_ACT = 29,
+    CP_ADAPTER_L2_GEMM = 30,
+    CP_DONE = 31,
+};
+
+struct ConformerProgramState {
+    const LfmConformer *c = nullptr;
+    LfmConformerWorkspace *ws = nullptr;
+    const uint16_t *mel = nullptr;
+    uint16_t *out = nullptr;
+    uint64_t out_capacity = 0;
+    uint64_t frames = 0;
+    uint64_t d = 0, ff = 0, cc = 0, heads = 0, dk = 0, kernel = 0;
+    uint64_t f0 = 0, t0 = 0, t1 = 0, f1 = 0, t2 = 0, f2 = 0;
+    uint64_t tp = 0, f3 = 0, p = 0, flat = 0;
+    uint32_t phase = CP_DONE;
+    uint32_t next = CP_DONE;
+    uint32_t layer = 0;
+    uint32_t dw = 0;
+    size_t f_mark = 0;
+    size_t b_mark = 0;
+    uint16_t *plane_a = nullptr;
+    uint16_t *plane_b = nullptr;
+    uint16_t *plane_c = nullptr;
+    uint16_t *flat_rows = nullptr;
+    uint16_t *x = nullptr;
+    uint16_t *pe = nullptr;
+    uint16_t *h = nullptr;
+    uint16_t *tmp = nullptr;
+    uint16_t *qkv = nullptr;
+    uint16_t *pproj = nullptr;
+    uint16_t *in_rows = nullptr;
+    uint16_t *out_rows = nullptr;
+    uint16_t *qu = nullptr;
+    uint16_t *qv = nullptr;
+    uint16_t *y1b = nullptr;
+    uint16_t *pw2_in = nullptr;
+    uint16_t *ah = nullptr;
+};
+
+static_assert(sizeof(ConformerProgramState) <=
+                  sizeof(LfmConformerProgram::storage),
+              "retained Conformer cursor exceeds the pass-slot storage");
+static_assert(alignof(ConformerProgramState) <= alignof(LfmConformerProgram),
+              "retained Conformer cursor alignment exceeds its storage");
+
+ConformerProgramState *program_state(LfmConformerProgram *program) {
+    return std::launder(reinterpret_cast<ConformerProgramState *>(
+        program->storage));
+}
+
+const ConformerProgramState *program_state(
+    const LfmConformerProgram *program) {
+    return std::launder(reinterpret_cast<const ConformerProgramState *>(
+        program->storage));
+}
+
+bool conformer_gemm_phase(uint32_t phase) {
+    switch (phase) {
+    case CP_DW_GEMM:
+    case CP_SUB_OUT_GEMM:
+    case CP_FF1_L1_GEMM:
+    case CP_FF1_L2_GEMM:
+    case CP_ATTN_Q_GEMM:
+    case CP_ATTN_K_GEMM:
+    case CP_ATTN_V_GEMM:
+    case CP_ATTN_POS_GEMM:
+    case CP_ATTN_OUT_GEMM:
+    case CP_CONV_PW1_GEMM:
+    case CP_CONV_PW2_GEMM:
+    case CP_FF2_L1_GEMM:
+    case CP_FF2_L2_GEMM:
+    case CP_ADAPTER_L1_GEMM:
+    case CP_ADAPTER_L2_GEMM:
+        return true;
+    default:
+        return false;
+    }
+}
+
+int conformer_gemm_desc(const ConformerProgramState &s,
+                        LfmConformerGemmStage *stage) {
+    if (!stage || !s.c || !s.ws || !conformer_gemm_phase(s.phase))
+        return -EINVAL;
+    const LfmConformer *c = s.c;
+    const LayerWeights *layer = s.layer < c->layers.size()
+        ? &c->layers[s.layer]
+        : nullptr;
+    const View *weight = nullptr;
+    const View *bias = nullptr;
+    const uint16_t *activation = nullptr;
+    uint16_t *out = nullptr;
+    uint64_t rows = 0, inner = 0;
+
+    switch (s.phase) {
+    case CP_DW_GEMM:
+        weight = s.dw == 0 ? &c->pwa_w : &c->pwb_w;
+        bias = s.dw == 0 ? &c->pwa_b : &c->pwb_b;
+        activation = s.in_rows;
+        out = s.out_rows;
+        rows = s.dw == 0 ? s.t2 * s.f2 : s.tp * s.f3;
+        inner = s.cc;
+        break;
+    case CP_SUB_OUT_GEMM:
+        weight = &c->sub_out_w;
+        bias = &c->sub_out_b;
+        activation = s.flat_rows;
+        out = s.x;
+        rows = s.tp;
+        inner = s.flat;
+        break;
+    case CP_FF1_L1_GEMM:
+        weight = &layer->ff1_l1_w; bias = &layer->ff1_l1_b;
+        activation = s.tmp; out = s.h; rows = s.tp; inner = s.d;
+        break;
+    case CP_FF1_L2_GEMM:
+        weight = &layer->ff1_l2_w; bias = &layer->ff1_l2_b;
+        activation = s.h; out = s.tmp; rows = s.tp; inner = s.ff;
+        break;
+    case CP_ATTN_Q_GEMM:
+        weight = &layer->q_w; bias = &layer->q_b;
+        activation = s.tmp; out = s.qkv; rows = s.tp; inner = s.d;
+        break;
+    case CP_ATTN_K_GEMM:
+        weight = &layer->k_w; bias = &layer->k_b;
+        activation = s.tmp; out = s.qkv + s.tp * s.d;
+        rows = s.tp; inner = s.d;
+        break;
+    case CP_ATTN_V_GEMM:
+        weight = &layer->v_w; bias = &layer->v_b;
+        activation = s.tmp; out = s.qkv + 2 * s.tp * s.d;
+        rows = s.tp; inner = s.d;
+        break;
+    case CP_ATTN_POS_GEMM:
+        weight = &layer->pos_w;
+        activation = s.pe; out = s.pproj; rows = s.p; inner = s.d;
+        break;
+    case CP_ATTN_OUT_GEMM:
+        weight = &layer->out_w; bias = &layer->out_b;
+        activation = s.tmp; out = s.h; rows = s.tp; inner = s.d;
+        break;
+    case CP_CONV_PW1_GEMM:
+        weight = &layer->pw1_w; bias = &layer->pw1_b;
+        activation = s.tmp; out = s.y1b; rows = s.tp; inner = s.d;
+        break;
+    case CP_CONV_PW2_GEMM:
+        weight = &layer->pw2_w; bias = &layer->pw2_b;
+        activation = s.pw2_in; out = s.tmp; rows = s.tp; inner = s.d;
+        break;
+    case CP_FF2_L1_GEMM:
+        weight = &layer->ff2_l1_w; bias = &layer->ff2_l1_b;
+        activation = s.tmp; out = s.h; rows = s.tp; inner = s.d;
+        break;
+    case CP_FF2_L2_GEMM:
+        weight = &layer->ff2_l2_w; bias = &layer->ff2_l2_b;
+        activation = s.h; out = s.tmp; rows = s.tp; inner = s.ff;
+        break;
+    case CP_ADAPTER_L1_GEMM:
+        weight = &c->ad_l1_w; bias = &c->ad_l1_b;
+        activation = s.tmp; out = s.ah; rows = s.tp; inner = s.d;
+        break;
+    case CP_ADAPTER_L2_GEMM:
+        weight = &c->ad_l2_w; bias = &c->ad_l2_b;
+        activation = s.ah; out = s.out; rows = s.tp;
+        inner = c->g.adapter_hidden;
+        break;
+    default:
+        return -EPROTO;
     }
 
-    // Two dw+pw stages. Both leaves read resident bf16 taps directly; only the
-    // activation layout changes between channel-major convolution and row-major
-    // checkpoint-layout GEMM.
-    uint16_t *plane_b = ws->b(CC * T2 * F2);
-    uint16_t *plane_c = ws->b(CC * T3 * F3);
-    struct Stage {
-        const View *dw_w, *dw_b, *pw_w, *pw_b;
-        uint16_t *in, *out;
-        uint64_t hi, wi, ho, wo;
-    } stages[2] = {
-        {&c->dw1_w, &c->dw1_b, &c->pwa_w, &c->pwa_b, plane_a, plane_b, T1, F1, T2, F2},
-        {&c->dw2_w, &c->dw2_b, &c->pwb_w, &c->pwb_b, plane_b, plane_c, T2, F2, T3, F3},
+    if (!weight || !weight->bytes || !activation || !out || rows == 0 ||
+        inner == 0 || weight->cols != inner || weight->rows == 0 ||
+        weight->elements != weight->rows * inner ||
+        rows > SIZE_MAX / inner || rows > SIZE_MAX / weight->rows ||
+        weight->elements > SIZE_MAX) {
+        return -EINVAL;
+    }
+    *stage = {
+        .activation = activation,
+        .activation_count = static_cast<size_t>(rows * inner),
+        .weight_bytes = weight->bytes,
+        .weight_count = static_cast<size_t>(weight->elements),
+        .bias_bytes = bias ? bias->bytes : nullptr,
+        .bias_count = bias ? static_cast<size_t>(weight->rows) : 0,
+        .out = out,
+        .out_count = static_cast<size_t>(rows * weight->rows),
+        .rows = static_cast<size_t>(rows),
+        .columns = static_cast<size_t>(weight->rows),
+        .inner = static_cast<size_t>(inner),
     };
-    for (const Stage &s : stages) {
-        const size_t f_mark = ws->fo, b_mark = ws->bo;
-        uint16_t *xpad = ws->b(CC * (s.hi + 2) * (s.wi + 2));
-        pad_2d(s.in, CC, s.hi, s.wi, xpad);
-        float *ydw = ws->f(CC * s.ho * s.wo);
-        lfm_dwconv2d_k3s2_bf16_f32(xpad, s.dw_w->bytes, ydw, CC,
-                                    s.hi + 2, s.wi + 2, s.ho, s.wo);
-        lfm_bias_bcast_f32(ydw, s.dw_b->bytes, CC, s.ho * s.wo);
-        uint16_t *dwb = ws->b(CC * s.ho * s.wo);
-        lfm_f32_to_bf16(ydw, dwb, (int)(CC * s.ho * s.wo));
-        const uint64_t positions = s.ho * s.wo;
-        uint16_t *in_rows = ws->b(positions * CC);
-        uint16_t *out_rows = ws->b(positions * CC);
-        channels_to_rows(dwb, CC, positions, in_rows);
-        int stage_rc = bf16_linear(c, ws, in_rows, positions, CC, *s.pw_w,
-                                   s.pw_b, out_rows, engine_team);
-        if (stage_rc != 0) return stage_rc;
-        lfm_relu_bf16(out_rows, positions * CC);
-        rows_to_channels(out_rows, positions, CC, s.out);
-        ws->fo = f_mark;
-        ws->bo = b_mark;
-    }
-
-    // flatten (CC, T3, F3) -> rows (T3, CC*F3): row t = [c-major][f]. FLAT was
-    // computed for the arena bound above.
-    uint16_t *flat_rows = ws->b(Tp * FLAT);
-    for (uint64_t t = 0; t < Tp; ++t)
-        for (uint64_t ch = 0; ch < CC; ++ch)
-            for (uint64_t f = 0; f < F3; ++f)
-                flat_rows[t * FLAT + ch * F3 + f] = plane_c[(ch * Tp + t) * F3 + f];
-
-    // pre_encode.out: bf16 linear (Tp x FLAT) x (D, FLAT) -> x (Tp x D).
-    uint16_t *x = ws->b(Tp * D);
-    int rc = bf16_linear(c, ws, flat_rows, Tp, FLAT, c->sub_out_w,
-                         &c->sub_out_b, x, engine_team);
-    if (rc != 0) return rc;
-
-    // rel-pos table (P x D) bf16 — sin/cos leaf; xscaling=false leaves x as-is.
-    uint16_t *pe = ws->b(P * D);
-    if (lfm_pe_build_bf16(c->pe_div, D / 2, Tp, pe) != 0) return -EIO;
-
-    // ---- layers -------------------------------------------------------------
-    uint16_t *h = ws->b(Tp * (FF > 2 * D ? FF : 2 * D)); // stage output plane
-    uint16_t *tmp = ws->b(Tp * (FF > 2 * D ? FF : 2 * D));
-    uint16_t *qkv = ws->b(3 * Tp * D);
-    uint16_t *pproj = ws->b(P * D);
-    const float inv_sdk = 1.0f / std::sqrt((float)DK); // 1/8 exact for dk=64
-
-    for (uint32_t li = 0; li < g.n_layers; ++li) {
-        const LayerWeights &L = c->layers[li];
-        const size_t f_mark = ws->fo, b_mark = ws->bo;
-
-        // ff1 half-step: LN -> lin1 -> SiLU -> lin2 -> residual + 0.5*h.
-        if (lfm_ln_bf16(x, L.norm_ff1_w.bytes, L.norm_ff1_b.bytes, tmp, Tp, D,
-                        1e-5f) != 0)
-            return -EIO;
-        rc = bf16_linear(c, ws, tmp, Tp, D, L.ff1_l1_w, &L.ff1_l1_b, h,
-                         engine_team);
-        if (rc != 0) return rc;
-        if (lfm_silu_bf16(h, Tp * FF) != 0) return -EIO;
-        rc = bf16_linear(c, ws, h, Tp, FF, L.ff1_l2_w, &L.ff1_l2_b, tmp,
-                         engine_team);
-        if (rc != 0) return rc;
-        lfm_residual_half_bf16(x, tmp, Tp * D);
-
-        // attention: LN -> q,k,v -> (q+u)kT + rel_shift((q+v)pT) -> softmax ->
-        // probs·v -> out linear -> residual.
-        if (lfm_ln_bf16(x, L.norm_att_w.bytes, L.norm_att_b.bytes, tmp, Tp, D,
-                        1e-5f) != 0)
-            return -EIO;
-        uint16_t *q = qkv, *k = qkv + Tp * D, *v = qkv + 2 * Tp * D;
-        rc = bf16_linear(c, ws, tmp, Tp, D, L.q_w, &L.q_b, q,
-                         engine_team);
-        if (rc == 0)
-            rc = bf16_linear(c, ws, tmp, Tp, D, L.k_w, &L.k_b, k,
-                             engine_team);
-        if (rc == 0)
-            rc = bf16_linear(c, ws, tmp, Tp, D, L.v_w, &L.v_b, v,
-                             engine_team);
-        if (rc == 0)
-            rc = bf16_linear(c, ws, pe, P, D, L.pos_w, nullptr, pproj,
-                             engine_team);
-        if (rc != 0) return rc;
-        // q+u / q+v in bf16 (broadcast add per (h, dk)).
-        uint16_t *qu = ws->b(Tp * D), *qv = ws->b(Tp * D);
-        lfm_add_bias_hd_bf16(q, L.bias_u.bytes, qu, Tp, H, DK);
-        lfm_add_bias_hd_bf16(q, L.bias_v.bytes, qv, Tp, H, DK);
-        // widen + pack per head: (Tp, H, DK) -> head-major (H, Tp, DK) f32.
-        float *quf = ws->f(H * Tp * DK), *qvf = ws->f(H * Tp * DK);
-        float *kf = ws->f(H * Tp * DK), *vf = ws->f(H * Tp * DK);
-        float *pf = ws->f(H * P * DK);
-        for (uint64_t hh = 0; hh < H; ++hh)
-            for (uint64_t t = 0; t < Tp; ++t) {
-                lfm_bf16_widen_f32(qu + t * D + hh * DK, quf + (hh * Tp + t) * DK, DK);
-                lfm_bf16_widen_f32(qv + t * D + hh * DK, qvf + (hh * Tp + t) * DK, DK);
-                lfm_bf16_widen_f32(k + t * D + hh * DK, kf + (hh * Tp + t) * DK, DK);
-                lfm_bf16_widen_f32(v + t * D + hh * DK, vf + (hh * Tp + t) * DK, DK);
-            }
-        for (uint64_t hh = 0; hh < H; ++hh)
-            for (uint64_t p = 0; p < P; ++p)
-                lfm_bf16_widen_f32(pproj + p * D + hh * DK, pf + (hh * P + p) * DK, DK);
-        // scores.
-        float *ac = ws->f(H * Tp * Tp);
-        float *bd = ws->f(H * Tp * P);
-        float *shifted = ws->f(H * Tp * P);
-        for (uint64_t hh = 0; hh < H; ++hh) {
-            sgemm_ntx(Tp, Tp, DK, quf + hh * Tp * DK, kf + hh * Tp * DK,
-                      ac + hh * Tp * Tp);
-            sgemm_ntx(Tp, P, DK, qvf + hh * Tp * DK, pf + hh * P * DK,
-                      bd + hh * Tp * P);
-        }
-        // rel_shift (movement): pad left 1 -> reshape (P+1, Tp) -> drop row 0
-        // -> reshape (Tp, P). Direct index algebra on the flat padded layout:
-        // padded flat index of out[t][j] is (t*(P+1) + j + 1) - Tp... realized
-        // literally below via the two reinterpretations.
-        for (uint64_t hh = 0; hh < H; ++hh) {
-            const float *src = bd + hh * Tp * P;
-            float *dst = shifted + hh * Tp * P;
-            // padded row-major (Tp, P+1) with col0 = 0: flat[t][0]=0,
-            // flat[t][j+1]=src[t][j]. Reshape to (P+1, Tp), drop first row,
-            // reshape (Tp, P): out_flat[i] = padded_flat[i + Tp].
-            for (uint64_t i = 0; i < Tp * P; ++i) {
-                const uint64_t padded_index = i + Tp;
-                const uint64_t r = padded_index / (P + 1);
-                const uint64_t col = padded_index % (P + 1);
-                dst[i] = (col == 0) ? 0.0f : src[r * P + col - 1];
-            }
-        }
-        // scores = (ac + shifted[:, :Tp]) * inv_sdk, then row softmax (f32).
-        for (uint64_t hh = 0; hh < H; ++hh)
-            lfm_add_scale_f32(ac + hh * Tp * Tp, shifted + hh * Tp * P, Tp, Tp,
-                              P, inv_sdk);
-        if (lfm_softmax_rows_f32(ac, H * Tp, Tp) != 0) return -EIO;
-        // aggregation: probs (Tp x Tp) x v (Tp x DK) per head -> (Tp, D) f32.
-        float *att = ws->f(Tp * D);
-        for (uint64_t hh = 0; hh < H; ++hh) {
-            float *outh = ws->f(Tp * DK);
-            sgemm_rm(Tp, DK, Tp, ac + hh * Tp * Tp, vf + hh * Tp * DK, outh);
-            for (uint64_t t = 0; t < Tp; ++t)
-                std::memcpy(att + t * D + hh * DK, outh + t * DK,
-                            DK * sizeof(float));
-            ws->fo -= Tp * DK;
-        }
-        lfm_f32_to_bf16(att, tmp, (int)(Tp * D));
-        rc = bf16_linear(c, ws, tmp, Tp, D, L.out_w, &L.out_b, h,
-                         engine_team);
-        if (rc != 0) return rc;
-        lfm_add_bf16(x, h, Tp * D);
-
-        // Conv module. Pointwise weights remain checkpoint-layout (N,K) bf16;
-        // depthwise taps remain (D,K) bf16. Only activation row/channel layout
-        // changes are materialized.
-        if (lfm_ln_bf16(x, L.norm_conv_w.bytes, L.norm_conv_b.bytes, tmp, Tp, D,
-                        1e-5f) != 0)
-            return -EIO;
-        uint16_t *y1b = ws->b(Tp * 2 * D);
-        rc = bf16_linear(c, ws, tmp, Tp, D, L.pw1_w, &L.pw1_b, y1b,
-                         engine_team);
-        if (rc != 0) return rc;
-        uint16_t *glu_rows = ws->b(Tp * D);
-        for (uint64_t t = 0; t < Tp; ++t)
-            if (lfm_glu_bf16(y1b + t * 2 * D, y1b + t * 2 * D + D,
-                             glu_rows + t * D, D) != 0)
-                return -EIO;
-        uint16_t *glu = ws->b(D * Tp);
-        rows_to_channels(glu_rows, Tp, D, glu);
-        // Depthwise k9, symmetric bf16 padding, f32 accumulation.
-        const uint64_t pad = (K - 1) / 2;
-        uint16_t *xdw = ws->b(D * (Tp + 2 * pad));
-        pad_1d(glu, D, Tp, pad, xdw);
-        float *ydw = ws->f(D * Tp);
-        lfm_dwconv_tap_bf16_f32(xdw, L.dw_w.bytes, ydw, D, Tp,
-                                 Tp + 2 * pad, K, 1);
-        lfm_bias_bcast_f32(ydw, L.dw_b.bytes, D, Tp);
-        uint16_t *dwb = ws->b(D * Tp);
-        lfm_f32_to_bf16(ydw, dwb, (int)(D * Tp));
-        uint16_t *bnb = ws->b(D * Tp);
-        lfm_bn_bf16(dwb, L.bn_mean.bytes, L.bn_denom, L.bn_w.bytes,
-                    L.bn_b.bytes, bnb, D, Tp);
-        if (lfm_silu_bf16(bnb, D * Tp) != 0) return -EIO;
-        uint16_t *pw2_in = ws->b(Tp * D);
-        channels_to_rows(bnb, D, Tp, pw2_in);
-        rc = bf16_linear(c, ws, pw2_in, Tp, D, L.pw2_w, &L.pw2_b, tmp,
-                         engine_team);
-        if (rc != 0) return rc;
-        lfm_add_bf16(x, tmp, Tp * D);
-
-        // ff2 half-step + norm_out.
-        if (lfm_ln_bf16(x, L.norm_ff2_w.bytes, L.norm_ff2_b.bytes, tmp, Tp, D,
-                        1e-5f) != 0)
-            return -EIO;
-        rc = bf16_linear(c, ws, tmp, Tp, D, L.ff2_l1_w, &L.ff2_l1_b, h,
-                         engine_team);
-        if (rc != 0) return rc;
-        if (lfm_silu_bf16(h, Tp * FF) != 0) return -EIO;
-        rc = bf16_linear(c, ws, h, Tp, FF, L.ff2_l2_w, &L.ff2_l2_b, tmp,
-                         engine_team);
-        if (rc != 0) return rc;
-        lfm_residual_half_bf16(x, tmp, Tp * D);
-        if (lfm_ln_bf16(x, L.norm_out_w.bytes, L.norm_out_b.bytes, tmp, Tp, D,
-                        1e-5f) != 0)
-            return -EIO;
-        // norm_out kills the prior residual plane. Publish it by exchanging the
-        // two persistent activation pointers; copying Tp*D values here once per
-        // layer only burns bandwidth and creates no new value.
-        std::swap(x, tmp);
-
-        ws->fo = f_mark;
-        ws->bo = b_mark;
-    }
-
-    // ---- adapter: LN -> lin(2048x512)+b -> gelu_erf -> lin(2048x2048)+b ----
-    if (lfm_ln_bf16(x, c->ad_ln_w.bytes, c->ad_ln_b.bytes, tmp, Tp, D, 1e-5f) != 0)
-        return -EIO;
-    uint16_t *ah = ws->b(Tp * g.adapter_hidden);
-    rc = bf16_linear(c, ws, tmp, Tp, D, c->ad_l1_w, &c->ad_l1_b, ah,
-                     engine_team);
-    if (rc != 0) return rc;
-    if (lfm_gelu_erf_bf16(ah, Tp * g.adapter_hidden) != 0) return -EIO;
-    rc = bf16_linear(c, ws, ah, Tp, g.adapter_hidden, c->ad_l2_w,
-                     &c->ad_l2_b, out_rows_dst, engine_team);
-    if (rc != 0) return rc;
-    // A workspace overflow means the reserved bound was too small — a sizing
-    // bug (never silent corruption). It would have handed out an aliased
-    // pointer, so the result is untrustworthy: fail loud.
-    if (ws->overflow) return -ENOMEM;
     return 0;
 }
 
-extern "C" int lfm_conformer_forward(const LfmConformer *c,
-                                      LfmConformerWorkspace *ws,
-                                      const uint16_t *mel,
-                                      uint64_t mel_frames,
-                                      uint16_t *out_rows_dst,
-                                      uint64_t out_capacity_values) {
-    return conformer_forward(c, ws, mel, mel_frames, out_rows_dst,
-                             out_capacity_values, false);
+} // namespace
+
+int lfm_conformer_program_begin(
+    LfmConformerProgram *program, const LfmConformer *c,
+    LfmConformerWorkspace *ws, const uint16_t *mel, uint64_t mel_frames,
+    uint16_t *out_rows, uint64_t out_capacity_values) {
+    if (!program || !c || !ws || !mel || !out_rows || mel_frames == 0)
+        return -EINVAL;
+    if (!ws->sealed) return -EPERM;
+    const LfmConformerGeometry &g = c->g;
+    const uint64_t t1 = conv_len(mel_frames), f1 = conv_len(g.feat_in);
+    const uint64_t t2 = conv_len(t1), f2 = conv_len(f1);
+    const uint64_t tp = conv_len(t2), f3 = conv_len(f2);
+    if (tp == 0 || t1 == 0 || t2 == 0 || g.n_heads == 0 ||
+        g.d_model % g.n_heads != 0 || tp > UINT64_MAX / g.adapter_out ||
+        out_capacity_values < tp * g.adapter_out) {
+        return -EINVAL;
+    }
+    size_t need_f = 0, need_b = 0;
+    int status = workspace_needs(c, mel_frames, &need_f, &need_b);
+    if (status != 0) return status;
+    status = ws->begin(need_f, need_b);
+    if (status != 0) return status;
+
+    std::memset(program->storage, 0, sizeof(program->storage));
+    ConformerProgramState *s =
+        ::new (program->storage) ConformerProgramState{};
+    s->c = c;
+    s->ws = ws;
+    s->mel = mel;
+    s->out = out_rows;
+    s->out_capacity = out_capacity_values;
+    s->frames = mel_frames;
+    s->d = g.d_model;
+    s->ff = g.d_ff;
+    s->cc = g.conv_channels;
+    s->heads = g.n_heads;
+    s->dk = g.d_model / g.n_heads;
+    s->kernel = g.conv_kernel;
+    s->f0 = g.feat_in;
+    s->t0 = mel_frames;
+    s->t1 = t1;
+    s->f1 = f1;
+    s->t2 = t2;
+    s->f2 = f2;
+    s->tp = tp;
+    s->f3 = f3;
+    s->p = 2 * tp - 1;
+    s->flat = s->cc * s->f3;
+    s->phase = CP_STEM;
+    s->next = CP_STEM;
+    return 0;
 }
 
-extern "C" int lfm_conformer_forward_engine_team(
-    const LfmConformer *c, LfmConformerWorkspace *ws, const uint16_t *mel,
-    uint64_t mel_frames, uint16_t *out_rows_dst,
-    uint64_t out_capacity_values) {
-    return conformer_forward(c, ws, mel, mel_frames, out_rows_dst,
-                             out_capacity_values, true);
+uint32_t lfm_conformer_program_stage(const LfmConformerProgram *program) {
+    if (!program) return LFM_CONFORMER_STAGE_DONE;
+    const ConformerProgramState *s = program_state(program);
+    if (!s->c || s->phase == CP_DONE) return LFM_CONFORMER_STAGE_DONE;
+    return conformer_gemm_phase(s->phase) ? LFM_CONFORMER_STAGE_GEMM
+                                          : LFM_CONFORMER_STAGE_SERIAL;
+}
+
+int lfm_conformer_program_gemm(const LfmConformerProgram *program,
+                               LfmConformerGemmStage *stage) {
+    if (!program) return -EINVAL;
+    return conformer_gemm_desc(*program_state(program), stage);
+}
+
+int lfm_conformer_program_run_serial(LfmConformerProgram *program) {
+    if (!program) return -EINVAL;
+    ConformerProgramState &s = *program_state(program);
+    if (!s.c || !s.ws || conformer_gemm_phase(s.phase) || s.phase == CP_DONE)
+        return -EPROTO;
+    const LfmConformer *c = s.c;
+    LfmConformerWorkspace *ws = s.ws;
+    const LayerWeights *layer = s.layer < c->layers.size()
+        ? &c->layers[s.layer]
+        : nullptr;
+
+    switch (s.phase) {
+    case CP_STEM: {
+        s.plane_a = ws->b(s.cc * s.t1 * s.f1);
+        const size_t fm = ws->fo, bm = ws->bo;
+        const uint64_t hp = s.t0 + 2, wp = s.f0 + 2;
+        uint16_t *img = ws->b(hp * wp);
+        std::memset(img, 0, static_cast<size_t>(hp * wp) * sizeof(uint16_t));
+        for (uint64_t f = 0; f < s.f0; ++f)
+            for (uint64_t t = 0; t < s.t0; ++t)
+                img[(t + 1) * wp + f + 1] = s.mel[f * s.t0 + t];
+        float *stem = ws->f(s.cc * s.t1 * s.f1);
+        lfm_conv2d_stem_k3s2_bf16_f32(img, c->stem_w.bytes, stem, s.cc,
+                                      hp, wp, s.t1, s.f1);
+        lfm_bias_bcast_f32(stem, c->stem_b.bytes, s.cc, s.t1 * s.f1);
+        lfm_f32_to_bf16(stem, s.plane_a,
+                        static_cast<int>(s.cc * s.t1 * s.f1));
+        lfm_relu_bf16(s.plane_a, s.cc * s.t1 * s.f1);
+        ws->fo = fm;
+        ws->bo = bm;
+        s.plane_b = ws->b(s.cc * s.t2 * s.f2);
+        s.plane_c = ws->b(s.cc * s.tp * s.f3);
+        s.dw = 0;
+        s.next = CP_DW_PREP;
+        return ws->overflow ? -ENOMEM : 0;
+    }
+    case CP_DW_PREP: {
+        const bool first = s.dw == 0;
+        const View &dw_w = first ? c->dw1_w : c->dw2_w;
+        const View &dw_b = first ? c->dw1_b : c->dw2_b;
+        uint16_t *in = first ? s.plane_a : s.plane_b;
+        const uint64_t hi = first ? s.t1 : s.t2;
+        const uint64_t wi = first ? s.f1 : s.f2;
+        const uint64_t ho = first ? s.t2 : s.tp;
+        const uint64_t wo = first ? s.f2 : s.f3;
+        s.f_mark = ws->fo;
+        s.b_mark = ws->bo;
+        uint16_t *xpad = ws->b(s.cc * (hi + 2) * (wi + 2));
+        pad_2d(in, s.cc, hi, wi, xpad);
+        float *ydw = ws->f(s.cc * ho * wo);
+        lfm_dwconv2d_k3s2_bf16_f32(xpad, dw_w.bytes, ydw, s.cc,
+                                   hi + 2, wi + 2, ho, wo);
+        lfm_bias_bcast_f32(ydw, dw_b.bytes, s.cc, ho * wo);
+        uint16_t *dwb = ws->b(s.cc * ho * wo);
+        lfm_f32_to_bf16(ydw, dwb, static_cast<int>(s.cc * ho * wo));
+        const uint64_t positions = ho * wo;
+        s.in_rows = ws->b(positions * s.cc);
+        s.out_rows = ws->b(positions * s.cc);
+        channels_to_rows(dwb, s.cc, positions, s.in_rows);
+        s.next = CP_DW_GEMM;
+        return ws->overflow ? -ENOMEM : 0;
+    }
+    case CP_DW_FINISH: {
+        const uint64_t positions = s.dw == 0 ? s.t2 * s.f2 : s.tp * s.f3;
+        uint16_t *out = s.dw == 0 ? s.plane_b : s.plane_c;
+        lfm_relu_bf16(s.out_rows, positions * s.cc);
+        rows_to_channels(s.out_rows, positions, s.cc, out);
+        ws->fo = s.f_mark;
+        ws->bo = s.b_mark;
+        if (s.dw == 0) {
+            s.dw = 1;
+            s.next = CP_DW_PREP;
+        } else {
+            s.next = CP_FLATTEN;
+        }
+        return 0;
+    }
+    case CP_FLATTEN:
+        s.flat_rows = ws->b(s.tp * s.flat);
+        for (uint64_t t = 0; t < s.tp; ++t)
+            for (uint64_t ch = 0; ch < s.cc; ++ch)
+                for (uint64_t f = 0; f < s.f3; ++f)
+                    s.flat_rows[t * s.flat + ch * s.f3 + f] =
+                        s.plane_c[(ch * s.tp + t) * s.f3 + f];
+        s.x = ws->b(s.tp * s.d);
+        s.next = CP_SUB_OUT_GEMM;
+        return ws->overflow ? -ENOMEM : 0;
+    case CP_POSITION: {
+        const uint64_t width = s.ff > 2 * s.d ? s.ff : 2 * s.d;
+        s.pe = ws->b(s.p * s.d);
+        if (lfm_pe_build_bf16(c->pe_div, s.d / 2, s.tp, s.pe) != 0)
+            return -EIO;
+        s.h = ws->b(s.tp * width);
+        s.tmp = ws->b(s.tp * width);
+        s.qkv = ws->b(3 * s.tp * s.d);
+        s.pproj = ws->b(s.p * s.d);
+        s.layer = 0;
+        s.next = c->g.n_layers == 0 ? CP_ADAPTER_PRE : CP_FF1_PRE;
+        return ws->overflow ? -ENOMEM : 0;
+    }
+    case CP_FF1_PRE:
+        if (!layer) return -EPROTO;
+        s.f_mark = ws->fo;
+        s.b_mark = ws->bo;
+        if (lfm_ln_bf16(s.x, layer->norm_ff1_w.bytes,
+                        layer->norm_ff1_b.bytes, s.tmp, s.tp, s.d,
+                        1e-5f) != 0)
+            return -EIO;
+        s.next = CP_FF1_L1_GEMM;
+        return 0;
+    case CP_FF1_ACT:
+        if (lfm_silu_bf16(s.h, s.tp * s.ff) != 0) return -EIO;
+        s.next = CP_FF1_L2_GEMM;
+        return 0;
+    case CP_ATTN_PRE:
+        if (!layer) return -EPROTO;
+        lfm_residual_half_bf16(s.x, s.tmp, s.tp * s.d);
+        if (lfm_ln_bf16(s.x, layer->norm_att_w.bytes,
+                        layer->norm_att_b.bytes, s.tmp, s.tp, s.d,
+                        1e-5f) != 0)
+            return -EIO;
+        s.next = CP_ATTN_Q_GEMM;
+        return 0;
+    case CP_ATTN_BODY: {
+        if (!layer) return -EPROTO;
+        uint16_t *q = s.qkv;
+        uint16_t *k = s.qkv + s.tp * s.d;
+        uint16_t *v = s.qkv + 2 * s.tp * s.d;
+        s.qu = ws->b(s.tp * s.d);
+        s.qv = ws->b(s.tp * s.d);
+        lfm_add_bias_hd_bf16(q, layer->bias_u.bytes, s.qu,
+                             s.tp, s.heads, s.dk);
+        lfm_add_bias_hd_bf16(q, layer->bias_v.bytes, s.qv,
+                             s.tp, s.heads, s.dk);
+        float *quf = ws->f(s.heads * s.tp * s.dk);
+        float *qvf = ws->f(s.heads * s.tp * s.dk);
+        float *kf = ws->f(s.heads * s.tp * s.dk);
+        float *vf = ws->f(s.heads * s.tp * s.dk);
+        float *pf = ws->f(s.heads * s.p * s.dk);
+        for (uint64_t head = 0; head < s.heads; ++head)
+            for (uint64_t t = 0; t < s.tp; ++t) {
+                lfm_bf16_widen_f32(s.qu + t * s.d + head * s.dk,
+                                   quf + (head * s.tp + t) * s.dk, s.dk);
+                lfm_bf16_widen_f32(s.qv + t * s.d + head * s.dk,
+                                   qvf + (head * s.tp + t) * s.dk, s.dk);
+                lfm_bf16_widen_f32(k + t * s.d + head * s.dk,
+                                   kf + (head * s.tp + t) * s.dk, s.dk);
+                lfm_bf16_widen_f32(v + t * s.d + head * s.dk,
+                                   vf + (head * s.tp + t) * s.dk, s.dk);
+            }
+        for (uint64_t head = 0; head < s.heads; ++head)
+            for (uint64_t p = 0; p < s.p; ++p)
+                lfm_bf16_widen_f32(s.pproj + p * s.d + head * s.dk,
+                                   pf + (head * s.p + p) * s.dk, s.dk);
+        float *ac = ws->f(s.heads * s.tp * s.tp);
+        float *bd = ws->f(s.heads * s.tp * s.p);
+        float *shifted = ws->f(s.heads * s.tp * s.p);
+        for (uint64_t head = 0; head < s.heads; ++head) {
+            sgemm_ntx(s.tp, s.tp, s.dk,
+                      quf + head * s.tp * s.dk,
+                      kf + head * s.tp * s.dk,
+                      ac + head * s.tp * s.tp);
+            sgemm_ntx(s.tp, s.p, s.dk,
+                      qvf + head * s.tp * s.dk,
+                      pf + head * s.p * s.dk,
+                      bd + head * s.tp * s.p);
+        }
+        for (uint64_t head = 0; head < s.heads; ++head) {
+            const float *src = bd + head * s.tp * s.p;
+            float *dst = shifted + head * s.tp * s.p;
+            for (uint64_t i = 0; i < s.tp * s.p; ++i) {
+                const uint64_t index = i + s.tp;
+                const uint64_t row = index / (s.p + 1);
+                const uint64_t col = index % (s.p + 1);
+                dst[i] = col == 0 ? 0.0f : src[row * s.p + col - 1];
+            }
+        }
+        const float scale = 1.0f / std::sqrt(static_cast<float>(s.dk));
+        for (uint64_t head = 0; head < s.heads; ++head)
+            lfm_add_scale_f32(ac + head * s.tp * s.tp,
+                              shifted + head * s.tp * s.p,
+                              s.tp, s.tp, s.p, scale);
+        if (lfm_softmax_rows_f32(ac, s.heads * s.tp, s.tp) != 0)
+            return -EIO;
+        float *att = ws->f(s.tp * s.d);
+        for (uint64_t head = 0; head < s.heads; ++head) {
+            float *outh = ws->f(s.tp * s.dk);
+            sgemm_rm(s.tp, s.dk, s.tp,
+                     ac + head * s.tp * s.tp,
+                     vf + head * s.tp * s.dk, outh);
+            for (uint64_t t = 0; t < s.tp; ++t)
+                std::memcpy(att + t * s.d + head * s.dk,
+                            outh + t * s.dk,
+                            static_cast<size_t>(s.dk) * sizeof(float));
+            ws->fo -= s.tp * s.dk;
+        }
+        lfm_f32_to_bf16(att, s.tmp, static_cast<int>(s.tp * s.d));
+        s.next = CP_ATTN_OUT_GEMM;
+        return ws->overflow ? -ENOMEM : 0;
+    }
+    case CP_CONV_PRE:
+        if (!layer) return -EPROTO;
+        lfm_add_bf16(s.x, s.h, s.tp * s.d);
+        if (lfm_ln_bf16(s.x, layer->norm_conv_w.bytes,
+                        layer->norm_conv_b.bytes, s.tmp, s.tp, s.d,
+                        1e-5f) != 0)
+            return -EIO;
+        s.y1b = ws->b(s.tp * 2 * s.d);
+        s.next = CP_CONV_PW1_GEMM;
+        return ws->overflow ? -ENOMEM : 0;
+    case CP_CONV_BODY: {
+        if (!layer) return -EPROTO;
+        uint16_t *glu_rows = ws->b(s.tp * s.d);
+        for (uint64_t t = 0; t < s.tp; ++t)
+            if (lfm_glu_bf16(s.y1b + t * 2 * s.d,
+                             s.y1b + t * 2 * s.d + s.d,
+                             glu_rows + t * s.d, s.d) != 0)
+                return -EIO;
+        uint16_t *glu = ws->b(s.d * s.tp);
+        rows_to_channels(glu_rows, s.tp, s.d, glu);
+        const uint64_t pad = (s.kernel - 1) / 2;
+        uint16_t *xdw = ws->b(s.d * (s.tp + 2 * pad));
+        pad_1d(glu, s.d, s.tp, pad, xdw);
+        float *ydw = ws->f(s.d * s.tp);
+        lfm_dwconv_tap_bf16_f32(xdw, layer->dw_w.bytes, ydw, s.d, s.tp,
+                                s.tp + 2 * pad, s.kernel, 1);
+        lfm_bias_bcast_f32(ydw, layer->dw_b.bytes, s.d, s.tp);
+        uint16_t *dwb = ws->b(s.d * s.tp);
+        lfm_f32_to_bf16(ydw, dwb, static_cast<int>(s.d * s.tp));
+        uint16_t *bnb = ws->b(s.d * s.tp);
+        lfm_bn_bf16(dwb, layer->bn_mean.bytes, layer->bn_denom,
+                    layer->bn_w.bytes, layer->bn_b.bytes, bnb, s.d, s.tp);
+        if (lfm_silu_bf16(bnb, s.d * s.tp) != 0) return -EIO;
+        s.pw2_in = ws->b(s.tp * s.d);
+        channels_to_rows(bnb, s.d, s.tp, s.pw2_in);
+        s.next = CP_CONV_PW2_GEMM;
+        return ws->overflow ? -ENOMEM : 0;
+    }
+    case CP_FF2_PRE:
+        if (!layer) return -EPROTO;
+        lfm_add_bf16(s.x, s.tmp, s.tp * s.d);
+        if (lfm_ln_bf16(s.x, layer->norm_ff2_w.bytes,
+                        layer->norm_ff2_b.bytes, s.tmp, s.tp, s.d,
+                        1e-5f) != 0)
+            return -EIO;
+        s.next = CP_FF2_L1_GEMM;
+        return 0;
+    case CP_FF2_ACT:
+        if (lfm_silu_bf16(s.h, s.tp * s.ff) != 0) return -EIO;
+        s.next = CP_FF2_L2_GEMM;
+        return 0;
+    case CP_LAYER_FINISH:
+        if (!layer) return -EPROTO;
+        lfm_residual_half_bf16(s.x, s.tmp, s.tp * s.d);
+        if (lfm_ln_bf16(s.x, layer->norm_out_w.bytes,
+                        layer->norm_out_b.bytes, s.tmp, s.tp, s.d,
+                        1e-5f) != 0)
+            return -EIO;
+        std::swap(s.x, s.tmp);
+        ws->fo = s.f_mark;
+        ws->bo = s.b_mark;
+        ++s.layer;
+        s.next = s.layer < c->g.n_layers ? CP_FF1_PRE : CP_ADAPTER_PRE;
+        return 0;
+    case CP_ADAPTER_PRE:
+        if (lfm_ln_bf16(s.x, c->ad_ln_w.bytes, c->ad_ln_b.bytes,
+                        s.tmp, s.tp, s.d, 1e-5f) != 0)
+            return -EIO;
+        s.ah = ws->b(s.tp * c->g.adapter_hidden);
+        s.next = CP_ADAPTER_L1_GEMM;
+        return ws->overflow ? -ENOMEM : 0;
+    case CP_ADAPTER_ACT:
+        if (lfm_gelu_erf_bf16(s.ah,
+                              s.tp * c->g.adapter_hidden) != 0)
+            return -EIO;
+        s.next = CP_ADAPTER_L2_GEMM;
+        return 0;
+    default:
+        return -EPROTO;
+    }
+}
+
+int lfm_conformer_program_advance(LfmConformerProgram *program) {
+    if (!program) return -EINVAL;
+    ConformerProgramState &s = *program_state(program);
+    if (!s.c || s.phase == CP_DONE) return -EPROTO;
+    if (conformer_gemm_phase(s.phase)) {
+        s.c->direct_gemm_calls.fetch_add(1, std::memory_order_relaxed);
+        switch (s.phase) {
+        case CP_DW_GEMM: s.next = CP_DW_FINISH; break;
+        case CP_SUB_OUT_GEMM: s.next = CP_POSITION; break;
+        case CP_FF1_L1_GEMM: s.next = CP_FF1_ACT; break;
+        case CP_FF1_L2_GEMM: s.next = CP_ATTN_PRE; break;
+        case CP_ATTN_Q_GEMM: s.next = CP_ATTN_K_GEMM; break;
+        case CP_ATTN_K_GEMM: s.next = CP_ATTN_V_GEMM; break;
+        case CP_ATTN_V_GEMM: s.next = CP_ATTN_POS_GEMM; break;
+        case CP_ATTN_POS_GEMM: s.next = CP_ATTN_BODY; break;
+        case CP_ATTN_OUT_GEMM: s.next = CP_CONV_PRE; break;
+        case CP_CONV_PW1_GEMM: s.next = CP_CONV_BODY; break;
+        case CP_CONV_PW2_GEMM: s.next = CP_FF2_PRE; break;
+        case CP_FF2_L1_GEMM: s.next = CP_FF2_ACT; break;
+        case CP_FF2_L2_GEMM: s.next = CP_LAYER_FINISH; break;
+        case CP_ADAPTER_L1_GEMM: s.next = CP_ADAPTER_ACT; break;
+        case CP_ADAPTER_L2_GEMM:
+            if (s.ws->overflow) return -ENOMEM;
+            s.next = CP_DONE;
+            break;
+        default: return -EPROTO;
+        }
+    }
+    s.phase = s.next;
+    return s.phase == CP_DONE ? 0 : 1;
 }

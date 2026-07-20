@@ -81,32 +81,6 @@ void lfm_bf16_gemv_pair_swiglu_bf16(const void *input,
                                     uint16_t *output,
                                     size_t rows, size_t depth);
 
-// One fixed-team SQ/CQ pass. Payloads remain borrowed until exact completion.
-int lfm_engine_bf16_gemm_f32(void *engine,
-                             const uint16_t *a, size_t a_count,
-                             const uint16_t *rhs, size_t rhs_count,
-                             float *out, size_t out_count,
-                             size_t m, size_t n, size_t k,
-                             uint32_t rhs_layout);
-
-// Checkpoint-native [N,K] ticket. The fixed lane team streams bf16 A and W
-// directly and widens values only in registers; no packed or f32 weight image
-// exists on any architecture.
-int lfm_engine_bf16_gemm_nt_direct_f32(void *engine,
-                                       const uint16_t *a, size_t a_count,
-                                       const void *weight_bytes,
-                                       size_t weight_count,
-                                       float *out, size_t out_count,
-                                       size_t m, size_t n, size_t k);
-
-// Private native direct-destination linear ticket. Bias may be null only when
-// bias_count is zero. No F32 output plane crosses the ticket boundary.
-int lfm_engine_bf16_gemm_nt_direct_bf16(
-    void *engine, const uint16_t *activation, size_t activation_count,
-    const void *weight_bytes, size_t weight_count,
-    const void *bias_bytes, size_t bias_count, uint16_t *output,
-    size_t output_count, size_t rows, size_t columns, size_t inner);
-
 #ifdef __cplusplus
 }
 #endif

@@ -1,22 +1,15 @@
 # kcoro_arena
 
-`kcoro_arena` is a C11 stackless coroutine runtime built around explicit
-runtime ownership, retained operation records, and event-driven continuation
-wakes. Its in-memory runtime, portable WAL, at-least-once delivery, serializable
-workflows, and host adapter boundaries are active. It remains `0.x` while the
-release-hardening and ABI-stability gates continue. Its first GPU-like substrate
-is active: precise work signaling, zero-spin expected-value waits, a preallocated
-ticket slab, and exact completion callbacks. EmberHarmony provides the first
-fixed-lane integration; generic broker submission and native recurrence remain.
-The working tree adds the first direct backport from Flashkern: a 128-byte
-cache-isolated `kc_doorbell`, a fixed-member `kc_collective`, and `kc_team`
-ownership of stable, non-stealing numerical workers. Flashkern now mounts its
-lane program on that team instead of creating lane pthreads itself.
+`kcoro_arena` is EmberHarmony's callback-driven coordination kernel. It owns a
+resident runtime, retained services, and fixed numerical teams. Computational
+progress comes only from publication: a producer edge, a completed fixed-team
+generation, released capacity, cancellation, or control. Exact product tickets
+and borrowed byte views live in Flashkern; kcoro does not duplicate them.
 
-The ticket, precise-wake, prepared wait-word, and build-identity claims in this
-tree are anchored by implementation commit
-`bcdc03d1a0731ee3116c850f3f9bd7cb27b55101`. Later documentation commits may
-describe that code, but an uncommitted working tree is never cited as evidence.
+There are no channels, actors, work stealing, generic coroutine spawning,
+process-global runtimes, timers, sleeps, deadline completions, WALs, workflows,
+or transport pumps in this production snapshot. Git is the archive; deleted
+mechanisms are not retained as compatibility surfaces.
 
 The canonical public include is:
 
@@ -24,162 +17,60 @@ The canonical public include is:
 #include "kcoro_arena.h"
 ```
 
-## Current Runtime
+## Runtime contract
 
-- `kc_runtime` owns workers, the ready queue, operation identities, shutdown,
-  and lifecycle accounting. There is no production process-global scheduler
-  except the compatibility wrapper used by the small `koro_*` API.
-- `kc_team` is a separate fixed-member executor class. It owns resident member
-  threads, exact generation dispatch, expected-value dormancy, and ordered
-  stop/join. It never migrates a numerical continuation or steals work.
-- `kc_collective` owns arrive/reconverge semantics: the last member runs one
-  bounded finalizer, release-publishes the next generation, and wakes only
-  declared parked peers through `kc_doorbell`.
-- Every channel wait is a retained `kc_op`. Match, close, and cancellation
-  arbitrate one terminal result while holding the channel mutex, then publish
-  the wake after releasing it.
-- Continuations use `NEW`, `QUEUED`, `RUNNING`, `WAITING`, and `DONE` states.
-  Park and wake transitions are serialized so one continuation cannot execute
-  concurrently or lose a completion doorbell.
-- Rendezvous, bounded FIFO, growable unlimited, and conflated channels use the
-  same operation queues.
-- Cancellation trees, deadlines, timers, select clauses, joins, and scopes all
-  terminate through the same retained operation arbitration. Actors are scope
-  children that park on mailbox receives instead of polling.
-- Bounded administration calls expose runtime, memory, operation, channel,
-  timer, descriptor, and scope snapshots. Public configuration and snapshot
-  records are size/version checked. The baseline capability function still
-  reports compiled optional services unconditionally; configured-service bits
-  are a required next-ABI repair.
-- The core calls the compile-time `kc_port_*` contract. The BSD POSIX adapter
-  under `port/` is linked separately and no OS threading symbol is admitted to
-  the core archive.
-- Work arrivals ring one runtime-owned, cache-isolated expected-value doorbell.
-  Workers observe, recheck every protected predicate, then park on the observed
-  generation, so realtime ingress has no mutex/condition-variable bridge and
-  cannot lose an edge. Idle/join/stop administration retains a separate
-  `lifecycle_cv`; it never drives worker progress.
-- Retained services mount stackless callbacks on that runtime. Ordinary
-  `kc_service_notify` is a control-plane operation that may lock. A setup-time
-  `kc_service_notifier` is the callback-side lifetime lease: on direct Darwin
-  address-wake or Linux futex backends its notify edge is lock-free,
-  allocation-free, deadline-free, and callback-free. Pthread-fallback runtimes
-  reject realtime notifier creation rather than silently taking a mutex. The
-  owner disconnects and quiesces every producer before releasing the lease;
-  fixed teams therefore join before notifier, service, and runtime teardown.
-  A bounded callback whose predicate remains ready uses
-  `kc_service_ready_again`: the exact currently-running continuation publishes
-  one coalescible local generation and requeues after yielding, without a
-  mutex, timer, external edge, or wait-word syscall. The safe Rust
-  `polling_service` wrapper exposes the same `Park`/`ReadyAgain` outcome.
-- Tickets are generation-protected slab entries with retained descriptor leases,
-  checked ID completion/cancellation, and one reserved terminal-delivery
-  reference. Completion queues the ticket itself and invokes its callback on an
-  arena worker exactly once.
-- The POSIX adapter prepares direct raw-`uint32_t` expected-value wait handles
-  once, then provides one/all wake, timeout, and entered-waiter teardown without
-  registry lookup or polling.
-- Copy-mode payloads use generation-protected descriptors over reclaimable,
-  runtime-owned aligned segments. Borrowed and host-owned regions hand off
-  pointers directly; host release callbacks run exactly once after the final
-  descriptor lease.
-- The portable WAL uses explicit little-endian records, CRC32C, transaction
-  begin/commit markers, and host-confirmed sync. Torn tail transactions are
-  removed on open; complete corrupt records fail recovery.
-- Durable messages persist publication, delivery attempt, acknowledgement,
-  retry, and dead-letter transitions. Unacknowledged work is redelivered after
-  restart; external consumers must be idempotent.
-- Workflow definitions are registered before recovery. Only stable
-  type/version IDs, instance/state IDs, encoded state, correlations, and
-  commands are persisted. Input acknowledgement, workflow state, and emitted
-  messages share one WAL transaction.
-- Transport, storage, and shared-region providers are direct link-time host
-  contracts. The core archive contains no filesystem, socket, or IPC backend.
+- `kc_runtime` owns a fixed worker set. Every retained service is permanently
+  bound to one worker, and every worker owns a private ready bitmap and idle
+  doorbell. A resident worker may park only when its private bitmap is empty.
+  Administrative teardown uses `join_all`, stop, and join; it never advances
+  work.
+- `kc_service` is one retained stackless state machine. Producer-specific
+  realtime notifier leases publish lock-free edges. The callback drains its
+  durable predicate and returns dormant, locally ready again, or terminal.
+- `kc_team` owns fixed, non-stealing numerical workers. One generation is one
+  phase. Every member returns; the final return invokes the completion callback,
+  which advances the durable program or publishes its product ticket. No member
+  waits on another member inside a production phase.
+- `kc_doorbell` is a cache-isolated generation edge. It is private kernel idle
+  capacity, not an operation-level wait API.
+
+Wall-clock timestamps are telemetry. A separately named device-liveness
+watchdog may publish a fault edge, but time never makes a continuation runnable
+and never advances speech, inference, or route state.
 
 ```text
-host application
-    -> kc_runtime
-       -> worker-ready queue -> stackless continuation
-       -> operation registry -> kc_op
-          -> channel/scope/timer waiter or buffered descriptor
-          -> one terminal claim
-          -> continuation wake
-       -> ticket slab -> kc_ticket
-          -> descriptor lease + terminal disposition
-          -> intrusive completion queue -> exact callback
-    -> host-linked kc_port_* adapter
-    -> kc_wal -> host-linked kc_store_* storage
-       -> kc_durable -> kc_workflows
-       -> kc_delivery -> host-linked kc_transport_*
-    -> kc_shared_payload -> host-linked kc_region_provider_*
+producer callback
+    -> realtime notifier edge
+       -> retained kc_service state machine
+          -> product ticket / fixed-team generation
+             -> final member return
+                -> completion callback
+                   -> next retained phase or terminal publication
 ```
 
-Terminal callbacks run on arena workers; there is no separate callback
-token-kernel thread or pointer-token table. Stable correlation lives in
-runtime-epoch/sequence operation and ticket IDs, and queues retain their
-operation or ticket records directly.
+## Source map
 
-## Build And Verify
+- `include/kcoro_arena.h`: canonical narrow C surface
+- `core/src/kc_runtime.c`: resident worker lifecycle and callback delivery
+- `core/src/kc_service.c`: retained stackless services and realtime edges
+- `core/src/kc_continuation.c`: private service continuation record
+- `core/src/kc_team.c`: fixed-member non-stealing execution
+- `core/src/kc_doorbell.c`: cache-isolated idle generation edge
+- `port/posix.c`: host thread and expected-value dormancy adapter
+
+The core calls the compile-time `kc_port_*` contract; the host adapter is linked
+as a separate archive.
+
+## Verification
+
+From the EmberHarmony repository root:
 
 ```sh
-make clean
-make test
-make -C tests test-full
-make test-race
-make test-soak
-make check-symbols
-make check-licenses
-make check-build-identity
+cargo test -p kcoro-sys
 ```
 
-On Clang platforms with AddressSanitizer and UndefinedBehaviorSanitizer:
-
-```sh
-make clean
-ASAN_OPTIONS=halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 \
-  make DEBUG=1 \
-  EXTRA_CFLAGS='-fsanitize=address,undefined' \
-  EXTRA_LDFLAGS='-fsanitize=address,undefined' test
-```
-
-`scripts/check_core_symbols.sh` rejects direct OS dependencies in
-`libkcoro_arena.a`. TSan runs on macOS and Linux where the selected toolchain
-supports it; Linux remains the gate for leak detection and the libFuzzer smoke
-runs (`make -C fuzz run`).
-
-## Source Map
-
-- `include/kcoro_arena.h`: canonical C API entry point
-- `core/src/kc_runtime.c`: explicit scheduler lifecycle and workers
-- `core/src/kc_team.c`: fixed-member, non-stealing execution ownership
-- `core/src/kc_collective.c`: generation reconvergence and last-arrival finalizer
-- `core/src/kc_doorbell.c`: cache-isolated expected-value edge
-- `core/src/kc_op.c`: retained operation identity and terminal publication
-- `core/src/kc_ticket.c`: pooled action receipts and exact callback delivery
-- `core/src/kc_chan_stackless.c`: all active channel policies
-- `core/src/kc_desc.c`: descriptor leases, regions, and segment reclamation
-- `core/src/kcoro_stackless.c`: continuation and begin/finish operations
-- `core/src/kc_scope.c`: structured child ownership and joins
-- `core/src/kc_actor.c`: parked mailbox consumers
-- `core/src/kc_admin.c`: bounded runtime administration
-- `core/src/kc_wal.c`: portable transactional WAL and snapshot ordering
-- `core/src/kc_durable.c`: durable message state and checkpoint section
-- `core/src/kc_workflow.c`: serializable workflow state machines
-- `core/src/kc_transport.c`: acknowledgement-driven delivery pump
-- `core/src/kc_shared.c`: portable shared-region references and leases
-- `port/`: optional host adapter, excluded from the core archive
-- `include/kc_atomic.h`: shared raw-word atomic operations for C/C++ doorbells
-- `tests/`: production-backed tests only
-
-See [Architecture](docs/ARCHITECTURE.md), [Durability](docs/DURABILITY.md),
-[Host Adapters](docs/HOST_ADAPTERS.md), [Runtime Backport](docs/KCORO_RUNTIME_BACKPORT.md),
-[GPU-Like Execution Kernel](docs/GPU_KERNEL_CONTRACT.md),
-[Tickets And Completion Callbacks](docs/TICKETS_AND_CALLBACKS.md), and
-[Roadmap](docs/ROADMAP.md).
-
-The process-global compatibility surface is not canonical design and is removed
-after explicit-runtime callers migrate. Git commits are the archive; retired
-source and documentation are not copied into the release tree.
+The tests execute the real native runtime and source-gate the absence of the
+retired scheduler, channel, timer, and persistence APIs.
 
 ## License
 

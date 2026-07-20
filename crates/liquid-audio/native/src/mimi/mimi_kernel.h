@@ -27,14 +27,12 @@
 //   - No exceptions across this ABI. No candle. Return codes, not throws.
 //   - ENGINE PLACEMENT (her directive): this kernel runs INSIDE the same kcoro
 //     engine as the backbone/depthformer (flashkern_engine.cpp) — same
-//     persistent lane team, same doorbell, a REQ kind at the pass boundary.
-//     Because this is a native C++ program (no Rust frames), its lane fences
-//     PARK precisely after the bounded spin (two-barrier doctrine) — unlike
-//     the Rust depthformer program, which must spin pure. First-pass unit
-//     APIs are single-call; write inner loops BAND-SPLITTABLE (channel/row
-//     bands with no incidental cross-band sequential dependence) so the
-//     arbiter integration step can cut them across lanes without re-deriving
-//     the math.
+//     persistent lane team, same idle doorbell, and one pass ticket. A lane
+//     never spins or parks at an operation barrier: every fixed member returns
+//     once, the final return is the quorum edge, and its callback advances the
+//     durable Mimi program cursor. Inner loops remain BAND-SPLITTABLE
+//     (channel/row bands with no incidental cross-band sequential dependence)
+//     so the engine can cut them across lanes without re-deriving the math.
 //
 // House NEON idiom (arm_neon.h, hers verbatim — chunks of a full register,
 // tail handled scalar after):

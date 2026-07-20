@@ -306,9 +306,8 @@ flowchart TB
 ```
 
 The mounted private bridge provides generation-checked retain/release operations
-for native descriptor IDs. Target owned pass slots use those operations and may
-not fall back to `KORO_SEND`, whose C baseline implementation copies
-at `kcoro_arena/core/src/kcoro_stackless.c:94-107`.
+for native descriptor IDs. A retained ticket carries that descriptor lease into
+the completion continuation; no payload is copied into a waiter or channel.
 
 ## Target Completion Callback Path
 
@@ -432,9 +431,8 @@ completion, or coordination executors.
 
 The image format, cumulative delta rule, A/B manifests, compaction, and macOS
 `F_FULLFSYNC` requirement remain normative in
-`specs/10-stateful-multi-agent-runtime.md:628-949`. The current kcoro append-only
-snapshot function at `core/src/kc_wal.c:535-580` is not used for long-running
-conversation images.
+`specs/10-stateful-multi-agent-runtime.md:628-949`. Persistence publishes its
+own durable completion edge; it is not part of kcoro's computational runtime.
 
 ## Native Event ABI
 

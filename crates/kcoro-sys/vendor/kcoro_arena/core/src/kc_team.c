@@ -10,9 +10,13 @@
 
 enum { KC_TEAM_ABI_VERSION = 1u };
 
+#define KC_TEAM_DISPATCH_CLOSED UINT32_C(0x80000000)
+#define KC_TEAM_DISPATCH_PUBLISHER UINT32_C(0x00000001)
+
 typedef struct kc_team_member {
     struct kc_team *team;
     uint32_t index;
+    uint64_t seen_generation;
 } kc_team_member;
 
 struct kc_team {
@@ -20,16 +24,19 @@ struct kc_team {
     kc_port_thread **threads;
     kc_team_member *members;
     kc_doorbell_t *dispatch;
-    kc_doorbell_t *completion;
+    kc_doorbell_t *readiness;
     atomic_uint started_members;
     atomic_uint completed_members;
     atomic_uint started;
     atomic_uint stop_requested;
+    /* High bit closes dispatch admission; low bit is the one publisher that
+     * crossed the gate. There is never a publisher-side spin or mutex. */
+    atomic_uint dispatch_gate;
+    atomic_uint joining;
     atomic_uint joined;
     atomic_uint_fast64_t dispatched_generation;
     atomic_uint_fast64_t completed_generation;
     atomic_uint_fast64_t retired_generation;
-    atomic_uint_fast64_t settled_generation;
     kc_team_completion_fn completion_notify;
     void *completion_context;
 };
@@ -38,33 +45,61 @@ static _Thread_local kc_team_t *current_team;
 static _Thread_local uint32_t current_member;
 static _Thread_local kc_team_t *current_completion_team;
 
+static int dispatch_enter(kc_team_t *team)
+{
+    unsigned expected = atomic_load_explicit(&team->dispatch_gate,
+                                             memory_order_acquire);
+    if (expected & KC_TEAM_DISPATCH_PUBLISHER) return -EBUSY;
+    if (expected & KC_TEAM_DISPATCH_CLOSED) return -ECANCELED;
+    const unsigned claimed = expected | KC_TEAM_DISPATCH_PUBLISHER;
+    if (atomic_compare_exchange_strong_explicit(
+            &team->dispatch_gate, &expected, claimed,
+            memory_order_acquire, memory_order_acquire)) return 0;
+    return (expected & KC_TEAM_DISPATCH_CLOSED) ? -ECANCELED : -EBUSY;
+}
+
+static void dispatch_leave(kc_team_t *team)
+{
+    unsigned before = atomic_fetch_sub_explicit(
+        &team->dispatch_gate, KC_TEAM_DISPATCH_PUBLISHER,
+        memory_order_release);
+    if (before & KC_TEAM_DISPATCH_CLOSED)
+        kc_doorbell_ring_all(team->dispatch);
+}
+
 static void *team_member_main(void *context)
 {
     kc_team_member *member = context;
     kc_team_t *team = member->team;
-    uint64_t seen = 0;
     uint32_t observed = kc_doorbell_observe(team->dispatch);
     atomic_fetch_add_explicit(&team->started_members, 1, memory_order_release);
-    kc_doorbell_ring_all(team->completion);
+    kc_doorbell_ring_all(team->readiness);
 
     for (;;) {
         uint64_t generation = atomic_load_explicit(
             &team->dispatched_generation, memory_order_acquire);
-        while (generation == seen &&
-               !atomic_load_explicit(&team->stop_requested,
-                                     memory_order_acquire)) {
-            int status = kc_doorbell_wait(team->dispatch, observed, 0);
+        while (generation == member->seen_generation) {
+            const unsigned gate = atomic_load_explicit(
+                &team->dispatch_gate, memory_order_acquire);
+            if (atomic_load_explicit(&team->stop_requested,
+                                     memory_order_acquire) &&
+                !(gate & KC_TEAM_DISPATCH_PUBLISHER)) return NULL;
+            int status = kc_doorbell_park(team->dispatch, observed);
             observed = kc_doorbell_observe(team->dispatch);
             if (status != 0 &&
                 atomic_load_explicit(&team->stop_requested,
-                                     memory_order_acquire)) return NULL;
+                                     memory_order_acquire) &&
+                !(atomic_load_explicit(&team->dispatch_gate,
+                                       memory_order_acquire) &
+                  KC_TEAM_DISPATCH_PUBLISHER)) return NULL;
             if (status != 0) abort();
             generation = atomic_load_explicit(
                 &team->dispatched_generation, memory_order_acquire);
         }
-        if (atomic_load_explicit(&team->stop_requested, memory_order_acquire))
-            return NULL;
-        seen = generation;
+        /* A generation admitted before stop remains authoritative. Every
+         * member completes it and produces its one final-return edge; stop
+         * only prevents the next admission. */
+        member->seen_generation = generation;
         current_team = team;
         current_member = member->index;
         team->config.member(team->config.context, member->index,
@@ -84,9 +119,6 @@ static void *team_member_main(void *context)
                 completion(context, generation);
                 current_completion_team = NULL;
             }
-            atomic_store_explicit(&team->settled_generation, generation,
-                                  memory_order_release);
-            kc_doorbell_ring_all(team->completion);
         }
     }
 }
@@ -111,13 +143,14 @@ int kc_team_create(const kc_team_config *config, kc_team_t **out)
     atomic_init(&team->completed_members, 0);
     atomic_init(&team->started, 0);
     atomic_init(&team->stop_requested, 0);
+    atomic_init(&team->dispatch_gate, 0);
+    atomic_init(&team->joining, 0);
     atomic_init(&team->joined, 0);
     atomic_init(&team->dispatched_generation, 0);
     atomic_init(&team->completed_generation, 0);
     atomic_init(&team->retired_generation, 0);
-    atomic_init(&team->settled_generation, 0);
     if (kc_doorbell_create(&team->dispatch) != 0 ||
-        kc_doorbell_create(&team->completion) != 0) {
+        kc_doorbell_create(&team->readiness) != 0) {
         kc_doorbell_destroy(team->dispatch);
         free(team->members);
         free(team->threads);
@@ -140,6 +173,7 @@ int kc_team_start(kc_team_t *team)
         team->members[started] = (kc_team_member){
             .team = team,
             .index = started,
+            .seen_generation = 0,
         };
         int status = kc_port_thread_create(&team->threads[started],
                                            team_member_main,
@@ -154,11 +188,11 @@ int kc_team_start(kc_team_t *team)
         atomic_store_explicit(&team->joined, 1, memory_order_release);
         return -EAGAIN;
     }
-    uint32_t observed = kc_doorbell_observe(team->completion);
+    uint32_t observed = kc_doorbell_observe(team->readiness);
     while (atomic_load_explicit(&team->started_members, memory_order_acquire) !=
            team->config.member_count) {
-        int status = kc_doorbell_wait(team->completion, observed, 0);
-        observed = kc_doorbell_observe(team->completion);
+        int status = kc_doorbell_park(team->readiness, observed);
+        observed = kc_doorbell_observe(team->readiness);
         if (status != 0) return status;
     }
     return 0;
@@ -173,59 +207,57 @@ int kc_team_dispatch_notify(kc_team_t *team, uint64_t generation,
                             kc_team_completion_fn completion, void *context)
 {
     if (!team || generation == 0) return -EINVAL;
-    if (!atomic_load_explicit(&team->started, memory_order_acquire) ||
-        atomic_load_explicit(&team->stop_requested, memory_order_acquire))
+    if (!atomic_load_explicit(&team->started, memory_order_acquire))
         return -ECANCELED;
+    int status = dispatch_enter(team);
+    if (status != 0) return status;
     uint64_t dispatched = atomic_load_explicit(
         &team->dispatched_generation, memory_order_acquire);
     uint64_t retired = atomic_load_explicit(
         &team->retired_generation, memory_order_acquire);
-    if (dispatched != retired) return -EBUSY;
-    if (generation <= dispatched) return -EINVAL;
+    if (dispatched != retired) {
+        dispatch_leave(team);
+        return -EBUSY;
+    }
+    if (generation <= dispatched) {
+        dispatch_leave(team);
+        return -EINVAL;
+    }
     team->completion_notify = completion;
     team->completion_context = context;
     atomic_store_explicit(&team->completed_members, 0, memory_order_relaxed);
     atomic_store_explicit(&team->dispatched_generation, generation,
                           memory_order_release);
+    dispatch_leave(team);
     kc_doorbell_ring_all(team->dispatch);
     return 0;
-}
-
-int kc_team_wait(kc_team_t *team, uint64_t generation, uint64_t deadline_ns)
-{
-    if (!team || generation == 0) return -EINVAL;
-    uint32_t observed = kc_doorbell_observe(team->completion);
-    for (;;) {
-        uint64_t settled = atomic_load_explicit(
-            &team->settled_generation, memory_order_acquire);
-        if (settled >= generation) return settled == generation ? 0 : -ESTALE;
-        if (current_completion_team == team) return -EDEADLK;
-        if (atomic_load_explicit(&team->stop_requested, memory_order_acquire))
-            return -ECANCELED;
-        int status = kc_doorbell_wait(team->completion, observed, deadline_ns);
-        observed = kc_doorbell_observe(team->completion);
-        if (status != 0) return status;
-    }
 }
 
 void kc_team_request_stop(kc_team_t *team)
 {
     if (!team) return;
+    atomic_fetch_or_explicit(&team->dispatch_gate,
+                             KC_TEAM_DISPATCH_CLOSED,
+                             memory_order_acq_rel);
     atomic_store_explicit(&team->stop_requested, 1, memory_order_release);
     kc_doorbell_ring_all(team->dispatch);
-    kc_doorbell_ring_all(team->completion);
+    kc_doorbell_ring_all(team->readiness);
 }
 
 int kc_team_join(kc_team_t *team)
 {
     if (!team) return -EINVAL;
+    if (current_team == team || current_completion_team == team)
+        return -EDEADLK;
     if (!atomic_load_explicit(&team->started, memory_order_acquire)) return 0;
-    if (!atomic_load_explicit(&team->stop_requested, memory_order_acquire))
-        return -EBUSY;
-    if (atomic_exchange_explicit(&team->joined, 1, memory_order_acq_rel))
-        return 0;
+    if (atomic_load_explicit(&team->joined, memory_order_acquire)) return 0;
+    unsigned expected = 0;
+    if (!atomic_compare_exchange_strong_explicit(
+            &team->joining, &expected, 1, memory_order_acq_rel,
+            memory_order_acquire)) return -EBUSY;
     for (uint32_t index = 0; index < team->config.member_count; ++index)
         kc_port_thread_join(team->threads[index]);
+    atomic_store_explicit(&team->joined, 1, memory_order_release);
     return 0;
 }
 
@@ -234,7 +266,7 @@ int kc_team_destroy(kc_team_t *team)
     if (!team) return 0;
     if (atomic_load_explicit(&team->started, memory_order_acquire) &&
         !atomic_load_explicit(&team->joined, memory_order_acquire)) return -EBUSY;
-    kc_doorbell_destroy(team->completion);
+    kc_doorbell_destroy(team->readiness);
     kc_doorbell_destroy(team->dispatch);
     free(team->members);
     free(team->threads);

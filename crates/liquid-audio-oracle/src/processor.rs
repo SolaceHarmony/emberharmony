@@ -16,7 +16,7 @@ use std::path::Path;
 use candle_core::{Device, Result, Tensor};
 use tokenizers::Tokenizer;
 
-use crate::audio_out::AudioDetokenizer;
+use crate::audio_out::AudioEncoder;
 use crate::utils::{mel2emb_len, LFMModality};
 
 mod mel {
@@ -452,17 +452,9 @@ impl SpecialTokenIds {
 pub struct LFM2AudioProcessor {
     pub tokenizer: Tokenizer,
     pub audio: FilterbankFeatures,
-    /// Audio-out DECODE backend: the LFM2 detokenizer (LFM2.5 snapshots ship
-    /// `audio_detokenizer/`). `None` for v1 models, where `decode` falls back to
-    /// [`Self::mimi`]. Behind the trait so the processor never touches a concrete
-    /// codec type. Mirrors the Python processor's `_audio_detokenizer` field.
-    pub audio_out: Option<Box<dyn AudioDetokenizer>>,
-    /// The Mimi codec (`tokenizer-…checkpoint125.safetensors`), loaded INDEPENDENTLY
-    /// of `audio_out`. Mirrors the Python processor's separate `_mimi` field: the
-    /// data mapper's `_encode_audio_out` calls `processor.mimi.encode` even on full
-    /// LFM2.5 snapshots — where the decode backend is the LFM2 detokenizer, not Mimi.
-    /// Conflating the two (one shared field) loses the encoder on full snapshots.
-    pub mimi: Option<Box<dyn AudioDetokenizer>>,
+    /// Training-data codec. Production codec work is native and is deliberately
+    /// absent from this crate's public surface.
+    pub mimi: Option<Box<dyn AudioEncoder>>,
     pub device: Device,
 }
 
@@ -470,39 +462,18 @@ impl LFM2AudioProcessor {
     /// Build from a local model directory: `tokenizer.json` + the mel buffers
     /// (`window`/`fb`) under a VarBuilder rooted at the audio preprocessor.
     ///
-    /// `audio_out` is the LFM2 detokenizer (decode; `None` for v1); `mimi` is the
-    /// Mimi codec (encode + v1 decode fallback). They are separate so a full
-    /// snapshot keeps both — Python loads `_audio_detokenizer` and `_mimi`
-    /// independently.
     pub fn new(
         tokenizer: Tokenizer,
         audio: FilterbankFeatures,
-        audio_out: Option<Box<dyn AudioDetokenizer>>,
-        mimi: Option<Box<dyn AudioDetokenizer>>,
+        mimi: Option<Box<dyn AudioEncoder>>,
         device: Device,
     ) -> Self {
         Self {
             tokenizer,
             audio,
-            audio_out,
             mimi,
             device,
         }
-    }
-
-    /// PORT: `LFM2AudioProcessor.from_pretrained(repo_id, *, device)` (py 56).
-    ///
-    /// The Python classmethod resolves the model dir (`get_model_dir`), reads
-    /// `config.json`, and constructs the processor (tokenizer + mel featurizer +
-    /// audio-out backend) on `device`. The crate's loader already performs that
-    /// exact construction inside [`crate::loader::from_pretrained`] (it builds both
-    /// the model and the processor in one pass over the checkpoint). To avoid
-    /// duplicating the loader logic this delegates to it and returns just the
-    /// processor — the model is dropped here (the Python classmethod likewise only
-    /// returns the processor).
-    pub fn from_pretrained(dir: &Path, device: &Device) -> Result<Self> {
-        let (_model, processor) = crate::loader::from_pretrained(dir, device)?;
-        Ok(processor)
     }
 
     pub fn load_tokenizer(dir: &Path) -> Result<Tokenizer> {
@@ -530,35 +501,6 @@ impl LFM2AudioProcessor {
         let ids: Vec<i64> = enc.get_ids().iter().map(|&id| id as i64).collect();
         let n = ids.len();
         Tensor::from_vec(ids, (1, n), &self.device)
-    }
-
-    /// Detokenize audio codes `(1, codebooks, T)` → 24 kHz waveform via whichever
-    /// audio-out backend was selected at load (LFM2 detokenizer or Mimi). The
-    /// processor dispatches through the [`AudioDetokenizer`](crate::audio_out)
-    /// trait — it doesn't know which concrete backend it holds.
-    pub fn decode(&self, audio_codes: &Tensor) -> Result<Tensor> {
-        // Python guard: reject codes outside [0, 2047] before detokenizing (the
-        // EOAudio sentinel 2048 must be stripped by the caller). u32 ⇒ ≥0 already;
-        // check the upper bound rather than index OOB in the codebook embedding.
-        let max_code = audio_codes
-            .to_dtype(candle_core::DType::U32)?
-            .flatten_all()?
-            .max(0)?
-            .to_scalar::<u32>()?;
-        if max_code > 2047 {
-            return Err(candle_core::Error::Msg(format!(
-                "audio code {max_code} out of range [0, 2047] (strip the EOAudio frame before decode)"
-            )));
-        }
-        // Decode through the LFM2 detokenizer when present (LFM2.5), else the Mimi
-        // codec (v1). Python's `decode` uses `audio_detokenizer`; v1 models ship no
-        // detokenizer and detokenize via `mimi` directly — the port unifies both
-        // behind `decode` via this `audio_out → mimi` fallback.
-        self.audio_out
-            .as_ref()
-            .or(self.mimi.as_ref())
-            .ok_or_else(|| candle_core::Error::Msg("no audio-out backend loaded".into()))?
-            .decode(audio_codes)
     }
 }
 
@@ -900,20 +842,7 @@ impl LFM2AudioProcessor {
         &self.device
     }
 
-    /// `audio_detokenizer` → the audio-out DECODE backend: the LFM2 detokenizer
-    /// (LFM2.5) when present, else the Mimi codec (v1). Python's `audio_detokenizer`
-    /// property is strictly the LFM2 detokenizer; the port folds the v1 Mimi-decode
-    /// path in here so callers (`decode`, streaming `decode_step` in `mic_chat`) get
-    /// a working backend on both model families.
-    pub fn audio_detokenizer(&self) -> Option<&dyn AudioDetokenizer> {
-        self.audio_out.as_deref().or(self.mimi.as_deref())
-    }
-
-    /// `mimi` → the Mimi CODEC, independent of the decode backend (Python `_mimi`).
-    /// This is what the data mapper's `_encode_audio_out` uses (`processor.mimi.encode`),
-    /// so on a full LFM2.5 snapshot it must return Mimi — NOT the LFM2 detokenizer
-    /// that `audio_detokenizer`/`decode` use.
-    pub fn mimi(&self) -> Option<&dyn AudioDetokenizer> {
+    pub fn mimi(&self) -> Option<&dyn AudioEncoder> {
         self.mimi.as_deref()
     }
 
@@ -1030,7 +959,7 @@ mod tests {
             &dev,
         )
         .unwrap();
-        LFM2AudioProcessor::new(tokenizer, audio, None, None, dev)
+        LFM2AudioProcessor::new(tokenizer, audio, None, dev)
     }
 
     #[test]

@@ -1,12 +1,12 @@
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicI32, AtomicPtr, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Barrier};
 
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
 const EDEADLK: i32 = 11;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 const EDEADLK: i32 = 35;
+const EBUSY: i32 = 16;
 #[cfg(not(any(
     target_os = "macos",
     target_os = "ios",
@@ -16,13 +16,16 @@ const EDEADLK: i32 = 35;
 )))]
 const EDEADLK: i32 = 35;
 
+const MEMBER_COUNT: u32 = 4;
+const MEMBER_MASK: u32 = (1 << MEMBER_COUNT) - 1;
+const GENERATIONS: u64 = 3;
+const CHAIN_DONE: u32 = GENERATIONS as u32 + 1;
+
 #[repr(C)]
 struct RuntimeConfig {
     size: u32,
     abi_version: u32,
     worker_count: u32,
-    arena_segment_size: usize,
-    ticket_capacity: u32,
     reserved: u32,
 }
 
@@ -33,6 +36,8 @@ struct ServiceConfig {
     callback: Option<unsafe extern "C" fn(*mut c_void)>,
     context: *mut c_void,
     reserved: u64,
+    owner_init: Option<unsafe extern "C" fn(*mut c_void)>,
+    owner_fini: Option<unsafe extern "C" fn(*mut c_void)>,
 }
 
 #[repr(C)]
@@ -59,40 +64,85 @@ struct TeamSnapshot {
     joined: u32,
 }
 
-struct Seen {
+struct Chain {
     team: AtomicPtr<c_void>,
-    collective: AtomicPtr<c_void>,
-    first: AtomicU32,
-    second: AtomicU32,
-    third: AtomicU32,
+    masks: [AtomicU32; GENERATIONS as usize],
+    latest: [AtomicU64; MEMBER_COUNT as usize],
+    callbacks: [AtomicU32; GENERATIONS as usize],
+    dispatches: [AtomicI32; GENERATIONS as usize - 1],
+    active: AtomicU32,
     calls: AtomicU32,
     bad: AtomicU32,
-    latest: AtomicU64,
-    finals: AtomicU32,
-    notifications: AtomicU32,
-    notified_generation: AtomicU64,
-    callback_wait_status: AtomicI32,
+    phase: AtomicU32,
+    callback_join_status: AtomicI32,
 }
 
 struct Handoff {
     team: AtomicPtr<c_void>,
-    service: AtomicPtr<c_void>,
     notifier: AtomicPtr<c_void>,
-    first: AtomicU32,
-    second: AtomicU32,
-    edge_status: AtomicI32,
-    dispatch_status: AtomicI32,
-    gate: Mutex<()>,
-    changed: Condvar,
+    masks: [AtomicU32; 2],
+    latest: [AtomicU64; 2],
+    callbacks: [AtomicU32; 2],
+    active: AtomicU32,
+    bad: AtomicU32,
+    phase: AtomicU32,
+    notifications: AtomicI32,
+    dispatch: AtomicI32,
+    service_callbacks: AtomicU32,
+    callback_gate: Barrier,
 }
 
-unsafe extern "C" fn finalizer(context: *mut c_void) {
-    let seen = unsafe { &*(context.cast::<Seen>()) };
-    seen.finals.fetch_add(1, Ordering::Relaxed);
+struct PublisherRace {
+    gate: Barrier,
+    members: AtomicU32,
+    bad: AtomicU32,
 }
 
-unsafe extern "C" fn completed(context: *mut c_void, generation: u64) {
-    let seen = unsafe { &*(context.cast::<Seen>()) };
+struct PublisherEdge {
+    team: AtomicPtr<c_void>,
+    callbacks: AtomicU32,
+}
+
+unsafe extern "C" fn chain_member(context: *mut c_void, index: u32, members: u32, generation: u64) {
+    let chain = unsafe { &*(context.cast::<Chain>()) };
+    if members != MEMBER_COUNT || index >= members || !(1..=GENERATIONS).contains(&generation) {
+        chain.bad.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+
+    let bit = 1 << index;
+    if chain.active.fetch_or(bit, Ordering::AcqRel) & bit != 0 {
+        chain.bad.fetch_add(1, Ordering::Relaxed);
+    }
+    if chain.phase.load(Ordering::Acquire) != generation as u32 {
+        chain.bad.fetch_add(1, Ordering::Relaxed);
+    }
+    if chain.latest[index as usize].swap(generation, Ordering::AcqRel) != generation - 1 {
+        chain.bad.fetch_add(1, Ordering::Relaxed);
+    }
+    if chain.masks[generation as usize - 1].fetch_or(bit, Ordering::AcqRel) & bit != 0 {
+        chain.bad.fetch_add(1, Ordering::Relaxed);
+    }
+    chain.calls.fetch_add(1, Ordering::Relaxed);
+    chain.active.fetch_and(!bit, Ordering::Release);
+}
+
+unsafe extern "C" fn chain_edge(context: *mut c_void, generation: u64) {
+    let chain = unsafe { &*(context.cast::<Chain>()) };
+    let team = chain.team.load(Ordering::Acquire);
+    if !(1..=GENERATIONS).contains(&generation) {
+        chain.bad.fetch_add(1, Ordering::Relaxed);
+        unsafe { kc_team_request_stop(team) };
+        return;
+    }
+
+    let slot = generation as usize - 1;
+    if chain.callbacks[slot].fetch_add(1, Ordering::AcqRel) != 0
+        || chain.masks[slot].load(Ordering::Acquire) != MEMBER_MASK
+        || chain.active.load(Ordering::Acquire) != 0
+    {
+        chain.bad.fetch_add(1, Ordering::Relaxed);
+    }
     let mut snapshot = TeamSnapshot {
         size: size_of::<TeamSnapshot>() as u32,
         abi_version: 1,
@@ -105,50 +155,43 @@ unsafe extern "C" fn completed(context: *mut c_void, generation: u64) {
         stop_requested: 0,
         joined: 0,
     };
-    let status = unsafe { kc_team_snapshot_get(seen.team.load(Ordering::Acquire), &mut snapshot) };
-    if status != 0 || generation != 2 || snapshot.completed_generation != generation {
-        seen.bad.fetch_add(1, Ordering::Relaxed);
+    if unsafe { kc_team_snapshot_get(team, &mut snapshot) } != 0
+        || snapshot.dispatched_generation != generation
+        || snapshot.completed_generation != generation
+        || snapshot.completed_members != MEMBER_COUNT
+    {
+        chain.bad.fetch_add(1, Ordering::Relaxed);
     }
-    seen.callback_wait_status.store(
-        unsafe { kc_team_wait(seen.team.load(Ordering::Acquire), generation, 0) },
-        Ordering::Release,
-    );
-    seen.notified_generation
-        .store(generation, Ordering::Release);
-    seen.notifications.fetch_add(1, Ordering::Release);
-}
-
-unsafe extern "C" fn member(context: *mut c_void, index: u32, members: u32, generation: u64) {
-    let seen = unsafe { &*(context.cast::<Seen>()) };
-    if members != 4 || index >= members {
-        seen.bad.fetch_add(1, Ordering::Relaxed);
-        return;
+    if generation == 2 {
+        chain
+            .callback_join_status
+            .store(unsafe { kc_team_join(team) }, Ordering::Release);
     }
-    let mask = if generation == 1 {
-        &seen.first
-    } else if generation == 2 {
-        &seen.second
-    } else if generation == 3 {
-        &seen.third
-    } else {
-        seen.bad.fetch_add(1, Ordering::Relaxed);
-        return;
-    };
-    if mask.fetch_or(1 << index, Ordering::AcqRel) & (1 << index) != 0 {
-        seen.bad.fetch_add(1, Ordering::Relaxed);
-    }
-    seen.calls.fetch_add(1, Ordering::Relaxed);
-    seen.latest.fetch_max(generation, Ordering::Release);
-    let status = unsafe {
-        kc_collective_arrive(
-            seen.collective.load(Ordering::Acquire),
-            index,
-            Some(finalizer),
-            context,
+    if chain
+        .phase
+        .compare_exchange(
+            generation as u32,
+            generation as u32 + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
         )
-    };
-    if status < 0 {
-        seen.bad.fetch_add(1, Ordering::Relaxed);
+        .is_err()
+    {
+        chain.bad.fetch_add(1, Ordering::Relaxed);
+        unsafe { kc_team_request_stop(team) };
+        return;
+    }
+    if generation == GENERATIONS {
+        unsafe { kc_team_request_stop(team) };
+        return;
+    }
+
+    let status =
+        unsafe { kc_team_dispatch_notify(team, generation + 1, Some(chain_edge), context) };
+    chain.dispatches[slot].store(status, Ordering::Release);
+    if status != 0 {
+        chain.bad.fetch_add(1, Ordering::Relaxed);
+        unsafe { kc_team_request_stop(team) };
     }
 }
 
@@ -159,74 +202,148 @@ unsafe extern "C" fn handoff_member(
     generation: u64,
 ) {
     let handoff = unsafe { &*(context.cast::<Handoff>()) };
-    if members != 2 || index >= members {
-        handoff.edge_status.store(-1, Ordering::Release);
+    if members != 2 || index >= members || !(1..=2).contains(&generation) {
+        handoff.bad.fetch_add(1, Ordering::Relaxed);
         return;
     }
-    let mask = if generation == 1 {
-        &handoff.first
-    } else if generation == 2 {
-        &handoff.second
-    } else {
-        handoff.edge_status.store(-2, Ordering::Release);
-        return;
-    };
-    mask.fetch_or(1 << index, Ordering::AcqRel);
+
+    let bit = 1 << index;
+    if handoff.active.fetch_or(bit, Ordering::AcqRel) & bit != 0 {
+        handoff.bad.fetch_add(1, Ordering::Relaxed);
+    }
+    let phase = if generation == 1 { 1 } else { 3 };
+    if handoff.phase.load(Ordering::Acquire) != phase {
+        handoff.bad.fetch_add(1, Ordering::Relaxed);
+    }
+    if handoff.latest[index as usize].swap(generation, Ordering::AcqRel) != generation - 1 {
+        handoff.bad.fetch_add(1, Ordering::Relaxed);
+    }
+    if handoff.masks[generation as usize - 1].fetch_or(bit, Ordering::AcqRel) & bit != 0 {
+        handoff.bad.fetch_add(1, Ordering::Relaxed);
+    }
+    handoff.active.fetch_and(!bit, Ordering::Release);
 }
 
 unsafe extern "C" fn handoff_edge(context: *mut c_void, generation: u64) {
     let handoff = unsafe { &*(context.cast::<Handoff>()) };
-    if generation != 1 {
-        let _gate = handoff.gate.lock().unwrap();
-        handoff.edge_status.store(-3, Ordering::Release);
-        handoff.changed.notify_all();
-        return;
-    }
-    let status = unsafe {
-        kc_service_notifier_notify(handoff.notifier.load(Ordering::Acquire))
-    };
-    if status != 0 {
-        let _gate = handoff.gate.lock().unwrap();
-        handoff.edge_status.store(status, Ordering::Release);
-        handoff.changed.notify_all();
+    let team = handoff.team.load(Ordering::Acquire);
+    if !(1..=2).contains(&generation) {
+        handoff.bad.fetch_add(1, Ordering::Relaxed);
+        unsafe { kc_team_request_stop(team) };
         return;
     }
 
-    /*
-     * Hold the final team member inside the completion callback until the
-     * resumed service attempts the next dispatch. This is the exact ordering
-     * that used to return -EBUSY and then lose its only edge.
-     */
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut gate = handoff.gate.lock().unwrap();
-    while handoff.dispatch_status.load(Ordering::Acquire) == i32::MIN {
-        let wait = deadline.saturating_duration_since(Instant::now());
-        if wait.is_zero() {
-            handoff.edge_status.store(-4, Ordering::Release);
-            handoff.changed.notify_all();
+    let slot = generation as usize - 1;
+    if handoff.callbacks[slot].fetch_add(1, Ordering::AcqRel) != 0
+        || handoff.masks[slot].load(Ordering::Acquire) != 0b11
+        || handoff.active.load(Ordering::Acquire) != 0
+    {
+        handoff.bad.fetch_add(1, Ordering::Relaxed);
+    }
+    let mut snapshot = TeamSnapshot {
+        size: size_of::<TeamSnapshot>() as u32,
+        abi_version: 1,
+        member_count: 0,
+        started_members: 0,
+        dispatched_generation: 0,
+        completed_generation: 0,
+        completed_members: 0,
+        started: 0,
+        stop_requested: 0,
+        joined: 0,
+    };
+    if unsafe { kc_team_snapshot_get(team, &mut snapshot) } != 0
+        || snapshot.dispatched_generation != generation
+        || snapshot.completed_generation != generation
+        || snapshot.completed_members != 2
+    {
+        handoff.bad.fetch_add(1, Ordering::Relaxed);
+    }
+
+    if generation == 1 {
+        if handoff
+            .phase
+            .compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            handoff.bad.fetch_add(1, Ordering::Relaxed);
+            unsafe { kc_team_request_stop(team) };
             return;
         }
-        gate = handoff.changed.wait_timeout(gate, wait).unwrap().0;
+        let status =
+            unsafe { kc_service_notifier_notify(handoff.notifier.load(Ordering::Acquire)) };
+        handoff.notifications.store(status, Ordering::Release);
+        if status != 0 {
+            handoff.bad.fetch_add(1, Ordering::Relaxed);
+            unsafe { kc_team_request_stop(team) };
+            return;
+        }
+        /* Test-only rendezvous: keep this callback on the stack until the
+         * resumed service has attempted generation two. Product execution has
+         * no corresponding waiter. */
+        handoff.callback_gate.wait();
+        return;
     }
-    handoff.edge_status.store(
-        handoff.dispatch_status.load(Ordering::Acquire),
-        Ordering::Release,
-    );
-    handoff.changed.notify_all();
+
+    if handoff
+        .phase
+        .compare_exchange(3, 4, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        handoff.bad.fetch_add(1, Ordering::Relaxed);
+    }
+    unsafe { kc_team_request_stop(team) };
 }
 
 unsafe extern "C" fn handoff_service(context: *mut c_void) {
     let handoff = unsafe { &*(context.cast::<Handoff>()) };
-    let status = unsafe { kc_team_dispatch(handoff.team.load(Ordering::Acquire), 2) };
-    let _gate = handoff.gate.lock().unwrap();
-    handoff.dispatch_status.store(status, Ordering::Release);
-    handoff.changed.notify_all();
+    handoff.service_callbacks.fetch_add(1, Ordering::AcqRel);
+    let team = handoff.team.load(Ordering::Acquire);
+    if handoff
+        .phase
+        .compare_exchange(2, 3, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        handoff.bad.fetch_add(1, Ordering::Relaxed);
+        unsafe { kc_team_request_stop(team) };
+        return;
+    }
+    let status = unsafe { kc_team_dispatch_notify(team, 2, Some(handoff_edge), context) };
+    handoff.dispatch.store(status, Ordering::Release);
+    handoff.callback_gate.wait();
+    if status != 0 {
+        handoff.bad.fetch_add(1, Ordering::Relaxed);
+        unsafe { kc_team_request_stop(team) };
+    }
+}
+
+unsafe extern "C" fn publisher_member(
+    context: *mut c_void,
+    index: u32,
+    members: u32,
+    generation: u64,
+) {
+    let race = unsafe { &*(context.cast::<PublisherRace>()) };
+    if members != MEMBER_COUNT || index >= members || generation != 1 {
+        race.bad.fetch_add(1, Ordering::Relaxed);
+    }
+    race.members.fetch_add(1, Ordering::AcqRel);
+    race.gate.wait();
+}
+
+unsafe extern "C" fn publisher_edge(context: *mut c_void, generation: u64) {
+    let edge = unsafe { &*(context.cast::<PublisherEdge>()) };
+    if generation != 1 {
+        edge.callbacks.fetch_add(2, Ordering::Relaxed);
+    } else {
+        edge.callbacks.fetch_add(1, Ordering::Release);
+    }
+    unsafe { kc_team_request_stop(edge.team.load(Ordering::Acquire)) };
 }
 
 unsafe extern "C" {
     fn kc_runtime_create(config: *const RuntimeConfig, out: *mut *mut c_void) -> i32;
     fn kc_runtime_start(runtime: *mut c_void) -> i32;
-    fn kc_runtime_run_until_idle(runtime: *mut c_void) -> i32;
     fn kc_runtime_request_stop(runtime: *mut c_void);
     fn kc_runtime_join(runtime: *mut c_void) -> i32;
     fn kc_runtime_destroy(runtime: *mut c_void) -> i32;
@@ -244,78 +361,65 @@ unsafe extern "C" {
     fn kc_service_destroy(service: *mut c_void) -> i32;
     fn kc_team_create(config: *const TeamConfig, out: *mut *mut c_void) -> i32;
     fn kc_team_start(team: *mut c_void) -> i32;
-    fn kc_team_dispatch(team: *mut c_void, generation: u64) -> i32;
     fn kc_team_dispatch_notify(
         team: *mut c_void,
         generation: u64,
         completion: Option<unsafe extern "C" fn(*mut c_void, u64)>,
         context: *mut c_void,
     ) -> i32;
-    fn kc_team_wait(team: *mut c_void, generation: u64, deadline_ns: u64) -> i32;
     fn kc_team_request_stop(team: *mut c_void);
     fn kc_team_join(team: *mut c_void) -> i32;
     fn kc_team_destroy(team: *mut c_void) -> i32;
     fn kc_team_snapshot_get(team: *mut c_void, out: *mut TeamSnapshot) -> i32;
-    fn kc_collective_create(members: u32, out: *mut *mut c_void) -> i32;
-    fn kc_collective_arrive(
-        collective: *mut c_void,
-        member: u32,
-        finalizer: Option<unsafe extern "C" fn(*mut c_void)>,
-        context: *mut c_void,
-    ) -> i32;
-    fn kc_collective_generation(collective: *const c_void) -> u64;
-    fn kc_collective_destroy(collective: *mut c_void);
 }
 
 #[test]
-fn fixed_members_run_each_generation_once_and_join_under_team_ownership() {
+fn completion_edges_drive_every_generation_and_terminal_teardown() {
     kcoro_sys::link_anchor();
-    let seen = Seen {
+    let chain = Chain {
         team: AtomicPtr::new(std::ptr::null_mut()),
-        collective: AtomicPtr::new(std::ptr::null_mut()),
-        first: AtomicU32::new(0),
-        second: AtomicU32::new(0),
-        third: AtomicU32::new(0),
+        masks: [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)],
+        latest: [
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+        ],
+        callbacks: [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)],
+        dispatches: [AtomicI32::new(i32::MIN), AtomicI32::new(i32::MIN)],
+        active: AtomicU32::new(0),
         calls: AtomicU32::new(0),
         bad: AtomicU32::new(0),
-        latest: AtomicU64::new(0),
-        finals: AtomicU32::new(0),
-        notifications: AtomicU32::new(0),
-        notified_generation: AtomicU64::new(0),
-        callback_wait_status: AtomicI32::new(i32::MIN),
+        phase: AtomicU32::new(1),
+        callback_join_status: AtomicI32::new(i32::MIN),
     };
-    let mut collective = std::ptr::null_mut();
-    assert_eq!(unsafe { kc_collective_create(4, &mut collective) }, 0);
-    seen.collective.store(collective, Ordering::Release);
     let config = TeamConfig {
         size: size_of::<TeamConfig>() as u32,
         abi_version: 1,
-        member_count: 4,
+        member_count: MEMBER_COUNT,
         reserved: 0,
-        member: Some(member),
-        context: (&seen as *const Seen).cast_mut().cast(),
+        member: Some(chain_member),
+        context: (&chain as *const Chain).cast_mut().cast(),
     };
     let mut team = std::ptr::null_mut();
     assert_eq!(unsafe { kc_team_create(&config, &mut team) }, 0);
-    seen.team.store(team, Ordering::Release);
+    chain.team.store(team, Ordering::Release);
     assert_eq!(unsafe { kc_team_start(team) }, 0);
-
-    assert_eq!(unsafe { kc_team_dispatch(team, 1) }, 0);
-    assert_eq!(unsafe { kc_team_wait(team, 1, 0) }, 0);
     assert_eq!(
         unsafe {
             kc_team_dispatch_notify(
                 team,
-                2,
-                Some(completed),
-                (&seen as *const Seen).cast_mut().cast(),
+                1,
+                Some(chain_edge),
+                (&chain as *const Chain).cast_mut().cast(),
             )
         },
         0
     );
-    assert_eq!(unsafe { kc_team_wait(team, 2, 0) }, 0);
-    assert_eq!(unsafe { kc_team_dispatch(team, 3) }, 0);
-    assert_eq!(unsafe { kc_team_wait(team, 3, 0) }, 0);
+
+    /* The terminal callback publishes stop. This join only tears down the
+     * stopped team; it is not a per-generation observation primitive. */
+    assert_eq!(unsafe { kc_team_join(team) }, 0);
 
     let mut snapshot = TeamSnapshot {
         size: size_of::<TeamSnapshot>() as u32,
@@ -330,38 +434,43 @@ fn fixed_members_run_each_generation_once_and_join_under_team_ownership() {
         joined: 0,
     };
     assert_eq!(unsafe { kc_team_snapshot_get(team, &mut snapshot) }, 0);
-    assert_eq!(snapshot.member_count, 4);
-    assert_eq!(snapshot.started_members, 4);
-    assert_eq!(snapshot.dispatched_generation, 3);
-    assert_eq!(snapshot.completed_generation, 3);
-    assert_eq!(snapshot.completed_members, 4);
-    assert_eq!(seen.first.load(Ordering::Acquire), 0b1111);
-    assert_eq!(seen.second.load(Ordering::Acquire), 0b1111);
-    assert_eq!(seen.third.load(Ordering::Acquire), 0b1111);
-    assert_eq!(seen.calls.load(Ordering::Acquire), 12);
-    assert_eq!(seen.bad.load(Ordering::Acquire), 0);
-    assert_eq!(seen.latest.load(Ordering::Acquire), 3);
-    assert_eq!(seen.finals.load(Ordering::Acquire), 3);
-    assert_eq!(seen.notifications.load(Ordering::Acquire), 1);
-    assert_eq!(seen.notified_generation.load(Ordering::Acquire), 2);
-    assert_eq!(seen.callback_wait_status.load(Ordering::Acquire), -EDEADLK);
-    assert_eq!(unsafe { kc_collective_generation(collective) }, 3);
-
-    unsafe { kc_team_request_stop(team) };
-    assert_eq!(unsafe { kc_team_join(team) }, 0);
+    assert_eq!(snapshot.member_count, MEMBER_COUNT);
+    assert_eq!(snapshot.started_members, MEMBER_COUNT);
+    assert_eq!(snapshot.dispatched_generation, GENERATIONS);
+    assert_eq!(snapshot.completed_generation, GENERATIONS);
+    assert_eq!(snapshot.completed_members, MEMBER_COUNT);
+    assert_eq!(snapshot.stop_requested, 1);
+    assert_eq!(snapshot.joined, 1);
+    assert_eq!(chain.phase.load(Ordering::Acquire), CHAIN_DONE);
+    assert_eq!(
+        chain.calls.load(Ordering::Acquire),
+        MEMBER_COUNT * GENERATIONS as u32
+    );
+    assert_eq!(chain.active.load(Ordering::Acquire), 0);
+    assert_eq!(chain.bad.load(Ordering::Acquire), 0);
+    assert_eq!(chain.callback_join_status.load(Ordering::Acquire), -EDEADLK);
+    for mask in &chain.masks {
+        assert_eq!(mask.load(Ordering::Acquire), MEMBER_MASK);
+    }
+    for latest in &chain.latest {
+        assert_eq!(latest.load(Ordering::Acquire), GENERATIONS);
+    }
+    for callbacks in &chain.callbacks {
+        assert_eq!(callbacks.load(Ordering::Acquire), 1);
+    }
+    for dispatch in &chain.dispatches {
+        assert_eq!(dispatch.load(Ordering::Acquire), 0);
+    }
     assert_eq!(unsafe { kc_team_destroy(team) }, 0);
-    unsafe { kc_collective_destroy(collective) };
 }
 
 #[test]
-fn completion_edge_resumes_service_after_next_dispatch_is_admissible() {
+fn completion_edge_resumes_state_before_the_next_dispatch() {
     kcoro_sys::link_anchor();
     let runtime_config = RuntimeConfig {
         size: size_of::<RuntimeConfig>() as u32,
         abi_version: 1,
         worker_count: 1,
-        arena_segment_size: 0,
-        ticket_capacity: 1,
         reserved: 0,
     };
     let mut runtime = std::ptr::null_mut();
@@ -373,14 +482,17 @@ fn completion_edge_resumes_service_after_next_dispatch_is_admissible() {
 
     let handoff = Handoff {
         team: AtomicPtr::new(std::ptr::null_mut()),
-        service: AtomicPtr::new(std::ptr::null_mut()),
         notifier: AtomicPtr::new(std::ptr::null_mut()),
-        first: AtomicU32::new(0),
-        second: AtomicU32::new(0),
-        edge_status: AtomicI32::new(i32::MIN),
-        dispatch_status: AtomicI32::new(i32::MIN),
-        gate: Mutex::new(()),
-        changed: Condvar::new(),
+        masks: [AtomicU32::new(0), AtomicU32::new(0)],
+        latest: [AtomicU64::new(0), AtomicU64::new(0)],
+        callbacks: [AtomicU32::new(0), AtomicU32::new(0)],
+        active: AtomicU32::new(0),
+        bad: AtomicU32::new(0),
+        phase: AtomicU32::new(1),
+        notifications: AtomicI32::new(i32::MIN),
+        dispatch: AtomicI32::new(i32::MIN),
+        service_callbacks: AtomicU32::new(0),
+        callback_gate: Barrier::new(2),
     };
     let service_config = ServiceConfig {
         size: size_of::<ServiceConfig>() as u32,
@@ -388,13 +500,14 @@ fn completion_edge_resumes_service_after_next_dispatch_is_admissible() {
         callback: Some(handoff_service),
         context: (&handoff as *const Handoff).cast_mut().cast(),
         reserved: 0,
+        owner_init: None,
+        owner_fini: None,
     };
     let mut service = std::ptr::null_mut();
     assert_eq!(
         unsafe { kc_service_create(runtime, &service_config, &mut service) },
         0
     );
-    handoff.service.store(service, Ordering::Release);
     assert_eq!(unsafe { kc_service_start(service) }, 0);
     let mut notifier = std::ptr::null_mut();
     assert_eq!(
@@ -402,7 +515,6 @@ fn completion_edge_resumes_service_after_next_dispatch_is_admissible() {
         0
     );
     handoff.notifier.store(notifier, Ordering::Release);
-    assert_eq!(unsafe { kc_runtime_run_until_idle(runtime) }, 0);
 
     let team_config = TeamConfig {
         size: size_of::<TeamConfig>() as u32,
@@ -427,34 +539,116 @@ fn completion_edge_resumes_service_after_next_dispatch_is_admissible() {
         },
         0
     );
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut gate = handoff.gate.lock().unwrap();
-    while handoff.edge_status.load(Ordering::Acquire) == i32::MIN {
-        let wait = deadline.saturating_duration_since(Instant::now());
-        assert!(
-            !wait.is_zero(),
-            "service did not receive team completion edge"
-        );
-        gate = handoff.changed.wait_timeout(gate, wait).unwrap().0;
-    }
-    drop(gate);
-    assert_eq!(handoff.dispatch_status.load(Ordering::Acquire), 0);
-    assert_eq!(unsafe { kc_team_wait(team, 2, 0) }, 0);
-    assert_eq!(handoff.edge_status.load(Ordering::Acquire), 0);
-    assert_eq!(handoff.first.load(Ordering::Acquire), 0b11);
-    assert_eq!(handoff.second.load(Ordering::Acquire), 0b11);
 
-    /* Quiesce the callback-side producer before releasing its notifier lease.
-     * This is the production teardown order: team -> notifier -> service ->
-     * runtime. */
-    unsafe { kc_team_request_stop(team) };
+    /* The team edge wakes the suspended service state, the service publishes
+     * generation two, and that generation's edge publishes terminal stop. */
     assert_eq!(unsafe { kc_team_join(team) }, 0);
+    assert_eq!(handoff.phase.load(Ordering::Acquire), 4);
+    assert_eq!(handoff.bad.load(Ordering::Acquire), 0);
+    assert_eq!(handoff.active.load(Ordering::Acquire), 0);
+    assert_eq!(handoff.notifications.load(Ordering::Acquire), 0);
+    assert_eq!(handoff.dispatch.load(Ordering::Acquire), 0);
+    assert_eq!(handoff.service_callbacks.load(Ordering::Acquire), 1);
+    for mask in &handoff.masks {
+        assert_eq!(mask.load(Ordering::Acquire), 0b11);
+    }
+    for latest in &handoff.latest {
+        assert_eq!(latest.load(Ordering::Acquire), 2);
+    }
+    for callbacks in &handoff.callbacks {
+        assert_eq!(callbacks.load(Ordering::Acquire), 1);
+    }
+
     assert_eq!(unsafe { kc_team_destroy(team) }, 0);
+    assert_eq!(unsafe { kc_service_notifier_destroy(notifier) }, 0);
     unsafe { kc_service_request_stop(service) };
     assert_eq!(unsafe { kc_service_join(service) }, 0);
-    assert_eq!(unsafe { kc_service_notifier_destroy(notifier) }, 0);
     assert_eq!(unsafe { kc_service_destroy(service) }, 0);
     unsafe { kc_runtime_request_stop(runtime) };
     assert_eq!(unsafe { kc_runtime_join(runtime) }, 0);
     assert_eq!(unsafe { kc_runtime_destroy(runtime) }, 0);
+}
+
+#[test]
+fn concurrent_publishers_cannot_overwrite_the_accepted_ticket_edge() {
+    kcoro_sys::link_anchor();
+    let race = PublisherRace {
+        gate: Barrier::new(MEMBER_COUNT as usize + 1),
+        members: AtomicU32::new(0),
+        bad: AtomicU32::new(0),
+    };
+    let config = TeamConfig {
+        size: size_of::<TeamConfig>() as u32,
+        abi_version: 1,
+        member_count: MEMBER_COUNT,
+        reserved: 0,
+        member: Some(publisher_member),
+        context: (&race as *const PublisherRace).cast_mut().cast(),
+    };
+    let mut team = std::ptr::null_mut();
+    assert_eq!(unsafe { kc_team_create(&config, &mut team) }, 0);
+    assert_eq!(unsafe { kc_team_start(team) }, 0);
+
+    let first = PublisherEdge {
+        team: AtomicPtr::new(team),
+        callbacks: AtomicU32::new(0),
+    };
+    let second = PublisherEdge {
+        team: AtomicPtr::new(team),
+        callbacks: AtomicU32::new(0),
+    };
+    let start = Arc::new(Barrier::new(3));
+    let spawn = |edge: &PublisherEdge| {
+        let start = Arc::clone(&start);
+        let team = team as usize;
+        let edge = edge as *const PublisherEdge as usize;
+        std::thread::spawn(move || {
+            start.wait();
+            unsafe {
+                kc_team_dispatch_notify(
+                    team as *mut c_void,
+                    1,
+                    Some(publisher_edge),
+                    edge as *mut c_void,
+                )
+            }
+        })
+    };
+    let one = spawn(&first);
+    let two = spawn(&second);
+    start.wait();
+    let mut statuses = [one.join().unwrap(), two.join().unwrap()];
+    statuses.sort_unstable();
+    assert_eq!(statuses, [-EBUSY, 0]);
+
+    /* The admitted generation is held inside its real member callbacks until
+     * both publisher results are known, so the losing result cannot be an
+     * accidental post-completion rejection. */
+    race.gate.wait();
+    assert_eq!(unsafe { kc_team_join(team) }, 0);
+    assert_eq!(race.members.load(Ordering::Acquire), MEMBER_COUNT);
+    assert_eq!(race.bad.load(Ordering::Acquire), 0);
+    assert_eq!(
+        first.callbacks.load(Ordering::Acquire) + second.callbacks.load(Ordering::Acquire),
+        1
+    );
+    assert_eq!(unsafe { kc_team_destroy(team) }, 0);
+}
+
+#[test]
+fn fixed_team_execution_has_no_blocking_generation_observer() {
+    const HEADER: &str = include_str!("../vendor/kcoro_arena/include/kc_team.h");
+    const CORE: &str = include_str!("../vendor/kcoro_arena/core/src/kc_team.c");
+    const TEST: &str = include_str!("fixed_team.rs");
+    let legacy = ["kc_team_", "wait"].concat();
+
+    for (path, source) in [
+        ("kc_team.h", HEADER),
+        ("kc_team.c", CORE),
+        ("fixed_team.rs", TEST),
+    ] {
+        assert!(!source.contains(&legacy), "{path} exposes {legacy}");
+    }
+    assert!(CORE.contains("uint64_t seen_generation"));
+    assert!(!CORE.contains("uint64_t seen ="));
 }

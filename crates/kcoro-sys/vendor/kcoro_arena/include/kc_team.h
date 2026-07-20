@@ -51,14 +51,17 @@ int kc_team_dispatch(kc_team_t *team, uint64_t generation);
  * The completion callback runs exactly once after completed_generation is
  * release-published and the generation has retired. The callback is an edge:
  * a resumed continuation may immediately dispatch the next generation. Team
- * wait does not return until this callback has returned. Waiting on this team
- * from its own completion callback returns -EDEADLK.
+ * execution has no completion-wait API; orchestration state advances from this
+ * edge instead of parking a thread on a generation.
  */
 int kc_team_dispatch_notify(kc_team_t *team, uint64_t generation,
                             kc_team_completion_fn completion, void *context);
-/* Zero deadline means an indefinite expected-value park. */
-int kc_team_wait(kc_team_t *team, uint64_t generation, uint64_t deadline_ns);
 void kc_team_request_stop(kc_team_t *team);
+/*
+ * Terminal teardown only. The stop edge may already be published or may be
+ * published by the terminal completion callback. Returns -EDEADLK from this
+ * team's member or completion callback.
+ */
 int kc_team_join(kc_team_t *team);
 int kc_team_destroy(kc_team_t *team);
 int kc_team_snapshot_get(kc_team_t *team, kc_team_snapshot *out);

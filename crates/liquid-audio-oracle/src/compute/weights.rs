@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use candle_core::{DType, Device, Result as CandleResult, Shape, Tensor};
 use candle_nn::var_builder::SimpleBackend;
-use candle_nn::VarBuilder;
+use candle_nn::{VarBuilder, VarMap};
 
 const ABI_VERSION: u32 = 1;
 const OK: i32 = 0;
@@ -45,29 +45,37 @@ struct RawTensorView {
 }
 
 extern "C" {
-    fn lfm_weights_open(
-        path: *const c_char,
-        out: *mut *mut RawWeightImage,
-        err: *mut c_char,
-        errlen: usize,
-    ) -> i32;
-    fn lfm_weights_open_files(
-        paths: *const *const c_char,
-        count: usize,
+    fn lfm_weights_open_bundle(
+        main_path: *const c_char,
+        codec_path: *const c_char,
         out: *mut *mut RawWeightImage,
         err: *mut c_char,
         errlen: usize,
     ) -> i32;
     fn lfm_weights_close(image: *mut RawWeightImage);
-    fn lfm_weights_data(image: *const RawWeightImage) -> *const c_void;
-    fn lfm_weights_resident_bytes(image: *const RawWeightImage) -> u64;
-    fn lfm_weights_count(image: *const RawWeightImage) -> usize;
-    fn lfm_weights_at(image: *const RawWeightImage, index: usize, out: *mut RawTensorView) -> i32;
-    fn lfm_weights_find(
+    fn lfm_weights_component_count(image: *const RawWeightImage, component: u32) -> usize;
+    fn lfm_weights_at_component(
         image: *const RawWeightImage,
+        component: u32,
+        index: usize,
+        out: *mut RawTensorView,
+    ) -> i32;
+    fn lfm_weights_find_component(
+        image: *const RawWeightImage,
+        component: u32,
         name: *const c_char,
         out: *mut RawTensorView,
     ) -> i32;
+}
+
+/// The bundle namespace is part of tensor identity. Main and codec checkpoints
+/// may legally contain the same tensor name, so no lookup is allowed to infer a
+/// component from the spelling of that name.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WeightComponent {
+    Main = 1,
+    Codec = 2,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,10 +90,6 @@ impl WeightError {
             status,
             message: message.into(),
         }
-    }
-
-    pub fn status(&self) -> i32 {
-        self.status
     }
 }
 
@@ -206,46 +210,25 @@ unsafe impl Send for NativeWeightImage {}
 unsafe impl Sync for NativeWeightImage {}
 
 impl NativeWeightImage {
-    /// Opaque `const LfmWeightImage *` for native components that bind views
-    /// directly (e.g. the native Conformer). The pointer is valid for the
-    /// lifetime of this owner; callers must not outlive it.
-    pub fn raw_image_ptr(&self) -> *const std::ffi::c_void {
-        self.raw.as_ptr() as *const std::ffi::c_void
-    }
-
-    pub fn open(path: &Path) -> Result<Self, WeightError> {
-        let path = CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| {
-            WeightError::new(INVALID_ARGUMENT, "weight path contains an embedded NUL")
+    pub fn open_bundle(main: &Path, codec: &Path) -> Result<Self, WeightError> {
+        let main = CString::new(main.as_os_str().as_encoded_bytes()).map_err(|_| {
+            WeightError::new(
+                INVALID_ARGUMENT,
+                "main weight path contains an embedded NUL",
+            )
+        })?;
+        let codec = CString::new(codec.as_os_str().as_encoded_bytes()).map_err(|_| {
+            WeightError::new(
+                INVALID_ARGUMENT,
+                "codec weight path contains an embedded NUL",
+            )
         })?;
         let mut raw = std::ptr::null_mut();
         let mut error = [0i8; ERROR_BYTES];
-        let status =
-            unsafe { lfm_weights_open(path.as_ptr(), &mut raw, error.as_mut_ptr(), error.len()) };
-        Self::finish_open(status, raw, &error)
-    }
-
-    pub fn open_files<P: AsRef<Path>>(paths: &[P]) -> Result<Self, WeightError> {
-        if paths.is_empty() {
-            return Err(WeightError::new(
-                INVALID_ARGUMENT,
-                "empty native weight file list",
-            ));
-        }
-        let paths = paths
-            .iter()
-            .map(|path| {
-                CString::new(path.as_ref().as_os_str().as_encoded_bytes()).map_err(|_| {
-                    WeightError::new(INVALID_ARGUMENT, "weight path contains an embedded NUL")
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let raw_paths = paths.iter().map(|path| path.as_ptr()).collect::<Vec<_>>();
-        let mut raw = std::ptr::null_mut();
-        let mut error = [0i8; ERROR_BYTES];
         let status = unsafe {
-            lfm_weights_open_files(
-                raw_paths.as_ptr(),
-                raw_paths.len(),
+            lfm_weights_open_bundle(
+                main.as_ptr(),
+                codec.as_ptr(),
                 &mut raw,
                 error.as_mut_ptr(),
                 error.len(),
@@ -271,50 +254,58 @@ impl NativeWeightImage {
         Ok(Self { raw })
     }
 
-    pub fn base(&self) -> *const u8 {
-        let raw = unsafe { lfm_weights_data(self.raw.as_ptr()) }.cast::<u8>();
-        assert!(
-            !raw.is_null(),
-            "a successfully opened native image has resident storage"
-        );
-        raw
+    pub fn len(&self, component: WeightComponent) -> usize {
+        unsafe { lfm_weights_component_count(self.raw.as_ptr(), component as u32) }
     }
 
-    pub fn resident_bytes(&self) -> u64 {
-        unsafe { lfm_weights_resident_bytes(self.raw.as_ptr()) }
-    }
-
-    pub fn len(&self) -> usize {
-        unsafe { lfm_weights_count(self.raw.as_ptr()) }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    pub fn at(&self, index: usize) -> Result<NativeTensor<'_>, WeightError> {
+    pub fn at(
+        &self,
+        component: WeightComponent,
+        index: usize,
+    ) -> Result<NativeTensor<'_>, WeightError> {
         let mut raw = RawTensorView::default();
-        let status = unsafe { lfm_weights_at(self.raw.as_ptr(), index, &mut raw) };
-        self.finish_view(status, raw, format!("weight index {index} was not found"))
+        let status = unsafe {
+            lfm_weights_at_component(self.raw.as_ptr(), component as u32, index, &mut raw)
+        };
+        self.finish_view(
+            status,
+            raw,
+            format!("{component:?} weight index {index} was not found"),
+        )
     }
 
-    pub fn find(&self, name: &str) -> Result<NativeTensor<'_>, WeightError> {
+    pub fn find(
+        &self,
+        component: WeightComponent,
+        name: &str,
+    ) -> Result<NativeTensor<'_>, WeightError> {
         let c_name = CString::new(name).map_err(|_| {
             WeightError::new(INVALID_ARGUMENT, "tensor name contains an embedded NUL")
         })?;
         let mut raw = RawTensorView::default();
-        let status = unsafe { lfm_weights_find(self.raw.as_ptr(), c_name.as_ptr(), &mut raw) };
-        self.finish_view(status, raw, format!("native tensor `{name}` was not found"))
+        let status = unsafe {
+            lfm_weights_find_component(
+                self.raw.as_ptr(),
+                component as u32,
+                c_name.as_ptr(),
+                &mut raw,
+            )
+        };
+        self.finish_view(
+            status,
+            raw,
+            format!("native {component:?} tensor `{name}` was not found"),
+        )
     }
 
-    pub fn contains(&self, name: &str) -> bool {
-        self.find(name).is_ok()
+    pub fn contains(&self, component: WeightComponent, name: &str) -> bool {
+        self.find(component, name).is_ok()
     }
 
-    pub fn floating_dtype(&self) -> Result<WeightDType, WeightError> {
+    pub fn floating_dtype(&self, component: WeightComponent) -> Result<WeightDType, WeightError> {
         let mut found: Option<(WeightDType, String)> = None;
-        for index in 0..self.len() {
-            let tensor = self.at(index)?;
+        for index in 0..self.len(component) {
+            let tensor = self.at(component, index)?;
             let dtype = tensor.dtype()?;
             if !dtype.is_floating() {
                 continue;
@@ -333,9 +324,12 @@ impl NativeWeightImage {
             }
             found = Some((dtype, tensor.name()?.to_owned()));
         }
-        found
-            .map(|(dtype, _)| dtype)
-            .ok_or_else(|| WeightError::new(INVALID_ARGUMENT, "checkpoint has no floating tensors"))
+        found.map(|(dtype, _)| dtype).ok_or_else(|| {
+            WeightError::new(
+                INVALID_ARGUMENT,
+                format!("{component:?} checkpoint has no floating tensors"),
+            )
+        })
     }
 
     fn finish_view(
@@ -397,10 +391,6 @@ impl NativeTensor<'_> {
         unsafe { std::slice::from_raw_parts(self.raw.data.cast::<u8>(), self.raw.bytes as usize) }
     }
 
-    pub fn data_ptr(&self) -> *const c_void {
-        self.raw.data
-    }
-
     pub fn shape(&self) -> &[u64] {
         if self.raw.rank == 0 {
             return &[];
@@ -423,20 +413,8 @@ impl NativeTensor<'_> {
         self.raw.dtype.try_into()
     }
 
-    pub fn offset(&self) -> u64 {
-        self.raw.offset
-    }
-
-    pub fn elements(&self) -> u64 {
-        self.raw.elements
-    }
-
     pub fn bytes(&self) -> u64 {
         self.raw.bytes
-    }
-
-    pub fn shard(&self) -> u32 {
-        self.raw.shard
     }
 }
 
@@ -455,50 +433,43 @@ struct CopyCounters {
 #[derive(Clone)]
 pub struct ResidentWeights {
     image: Arc<NativeWeightImage>,
-    dtype: DType,
     copies: Arc<CopyCounters>,
 }
 
 impl ResidentWeights {
-    pub fn open(path: &Path) -> Result<Self, WeightError> {
-        Self::from_image(NativeWeightImage::open(path)?)
-    }
-
-    /// Opaque `const LfmWeightImage *` into the resident image, for native
-    /// components that bind views directly. Valid while this `ResidentWeights`
-    /// (or a clone) is alive — the `Arc<NativeWeightImage>` keeps it resident.
-    pub fn raw_image_ptr(&self) -> *const std::ffi::c_void {
-        self.image.raw_image_ptr()
+    pub fn open_bundle(main: &Path, codec: &Path) -> Result<Self, WeightError> {
+        Self::from_image(NativeWeightImage::open_bundle(main, codec)?)
     }
 
     pub fn from_image(image: NativeWeightImage) -> Result<Self, WeightError> {
-        let dtype = image.floating_dtype()?.candle()?;
+        image.floating_dtype(WeightComponent::Main)?.candle()?;
         Ok(Self {
             image: Arc::new(image),
-            dtype,
             copies: Arc::new(CopyCounters::default()),
         })
     }
 
-    pub fn image(&self) -> &NativeWeightImage {
-        &self.image
-    }
-
-    pub fn dtype(&self) -> DType {
-        self.dtype
+    pub fn dtype(&self, component: WeightComponent) -> Result<DType, WeightError> {
+        self.image.floating_dtype(component)?.candle()
     }
 
     /// Temporary adapter for components that still instantiate Candle modules.
     /// Every successful tensor request is a payload copy and is counted.
-    pub fn candle_builder(&self, device: &Device) -> VarBuilder<'static> {
-        VarBuilder::from_backend(
+    pub fn candle_builder(
+        &self,
+        component: WeightComponent,
+        device: &Device,
+    ) -> Result<VarBuilder<'static>, WeightError> {
+        let dtype = self.dtype(component)?;
+        Ok(VarBuilder::from_backend(
             Box::new(CandleBridge {
                 image: self.image.clone(),
+                component,
                 copies: self.copies.clone(),
             }),
-            self.dtype,
+            dtype,
             device.clone(),
-        )
+        ))
     }
 
     pub fn compatibility_copies(&self) -> CompatibilityCopies {
@@ -507,10 +478,48 @@ impl ResidentWeights {
             bytes: self.copies.bytes.load(Ordering::Relaxed),
         }
     }
+
+    /// Initialize the mutable variables of the offline training oracle from
+    /// validated native views. This is the only intentional weight copy: the
+    /// model image remains byte-exact and immutable, while autograd requires
+    /// mutable framework-owned storage. Every copied payload is accounted.
+    pub fn copy_into_varmap(&self, component: WeightComponent, vars: &VarMap) -> CandleResult<()> {
+        let mut data = vars.data().lock().map_err(|_| {
+            candle_core::Error::Msg("training variable map lock was poisoned".into())
+        })?;
+        for (name, var) in data.iter_mut() {
+            let view = self
+                .image
+                .find(component, name)
+                .map_err(|error| candle_core::Error::Msg(error.to_string()))?;
+            let shape = view
+                .candle_shape()
+                .map_err(|error| candle_core::Error::Msg(error.to_string()))?;
+            if var.dims() != shape {
+                return Err(candle_core::Error::UnexpectedShape {
+                    msg: format!("shape mismatch for native {component:?} weight {name}"),
+                    expected: var.shape().clone(),
+                    got: Shape::from(shape),
+                }
+                .bt());
+            }
+            let source = view
+                .dtype()
+                .and_then(WeightDType::candle)
+                .map_err(|error| candle_core::Error::Msg(error.to_string()))?;
+            let tensor = Tensor::from_raw_buffer(view.data(), source, var.dims(), var.device())?
+                .to_dtype(var.dtype())?;
+            var.set(&tensor)?;
+            self.copies.tensors.fetch_add(1, Ordering::Relaxed);
+            self.copies.bytes.fetch_add(view.bytes(), Ordering::Relaxed);
+        }
+        Ok(())
+    }
 }
 
 struct CandleBridge {
     image: Arc<NativeWeightImage>,
+    component: WeightComponent,
     copies: Arc<CopyCounters>,
 }
 
@@ -524,7 +533,7 @@ impl CandleBridge {
     ) -> CandleResult<Tensor> {
         let view = self
             .image
-            .find(name)
+            .find(self.component, name)
             .map_err(|error| candle_core::Error::Msg(error.to_string()))?;
         let shape = view
             .candle_shape()
@@ -568,7 +577,7 @@ impl SimpleBackend for CandleBridge {
     }
 
     fn contains_tensor(&self, name: &str) -> bool {
-        self.image.contains(name)
+        self.image.contains(self.component, name)
     }
 }
 

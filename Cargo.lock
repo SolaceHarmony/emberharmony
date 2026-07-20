@@ -81,12 +81,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "anyhow"
-version = "1.0.103"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2a4385e2e34eb35d6b3efe798b9eb88096925d87726c0798709bf56d9ed84af3"
-
-[[package]]
 name = "arrayvec"
 version = "0.7.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1765,10 +1759,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "kcoro"
-version = "0.1.0"
-
-[[package]]
 name = "kcoro-sys"
 version = "0.1.0"
 dependencies = [
@@ -1888,30 +1878,21 @@ dependencies = [
 name = "liquid-audio-oracle"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "arrow-array",
  "arrow-ipc",
  "arrow-schema",
  "candle-core",
- "candle-flashfftconv",
  "candle-nn",
  "candle-transformers",
- "cpal",
- "crossbeam-channel",
- "half",
  "hf-hub",
- "kcoro",
- "kcoro-sys",
  "libc",
  "liquid-audio",
  "minijinja",
  "moshi",
  "num_cpus",
  "rayon",
- "sentencepiece-rust",
  "serde",
  "serde_json",
- "sha2",
  "symphonia",
  "tokenizers",
 ]
@@ -2873,12 +2854,6 @@ name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
-
-[[package]]
-name = "sentencepiece-rust"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "60f271394c88f9c091ea275db6ed526566bb40a232e64dfe702c66cf47c3dee6"
 
 [[package]]
 name = "seq-macro"

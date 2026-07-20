@@ -30,7 +30,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
-#include <mutex>
 #include <new>
 
 #ifdef __APPLE__
@@ -101,7 +100,6 @@ struct LfmFrontend {
 };
 
 struct LfmFrontendWorkspace {
-    std::mutex lock;
     float *values = nullptr;
     uint64_t capacity = 0;
 
@@ -127,7 +125,6 @@ struct LfmResamplerWorkspace {
 };
 
 struct LfmResamplerStream {
-    std::mutex lock;
     uint64_t orig = 0;
     uint64_t phases = 0;
     uint64_t capacity = 0;
@@ -341,7 +338,10 @@ int reserve_frontend(const LfmFrontend *f, LfmFrontendWorkspace *workspace,
         f, max_samples, (flags & LFM_FRONTEND_FORWARD_VALID_ONLY) != 0,
         (flags & LFM_FRONTEND_WORKSPACE_BF16_OUTPUT) != 0, &run);
     if (status != 0) return status;
-    std::lock_guard<std::mutex> guard(workspace->lock);
+    /* A workspace is mounted on one conversation and only its mutating route
+     * may enter it. Admission is enforced by the conversation state machine;
+     * putting a mutex inside the numerical leaf would turn contention into an
+     * operation waiter and hide an ownership violation. */
     if (workspace->capacity >= run.workspace_values) return 0;
     float *next = (float *)std::malloc((size_t)run.workspace_values * sizeof(float));
     if (!next) return -ENOMEM;
@@ -504,7 +504,6 @@ int frontend_forward(const LfmFrontend *f, LfmFrontendWorkspace *workspace,
         return 0;
     }
 
-    std::lock_guard<std::mutex> guard(workspace->lock);
     if (workspace->capacity < run.workspace_values) return -ENOBUFS;
     float *a = workspace->values; // signal, then DFT/power
     float *b = a + run.plane_a_values; // frames, then mel or row statistics
@@ -813,7 +812,6 @@ extern "C" int lfm_resampler_stream_destroy(LfmResamplerStream *stream) {
 
 extern "C" void lfm_resampler_stream_reset(LfmResamplerStream *stream) {
     if (!stream) return;
-    std::lock_guard<std::mutex> guard(stream->lock);
     stream->phase = stream->orig - 1;
     stream->previous = 0.0f;
     stream->ready = false;
@@ -823,7 +821,6 @@ extern "C" int lfm_resampler_stream_out_length(
     LfmResamplerStream *stream, uint64_t sample_count,
     uint64_t *out_length) {
     if (!stream || !out_length) return -EINVAL;
-    std::lock_guard<std::mutex> guard(stream->lock);
     if (sample_count > stream->capacity) return -ENOBUFS;
     return resampler_stream_length(stream->orig, stream->phases, stream->phase,
                                    sample_count, out_length)
@@ -838,7 +835,9 @@ extern "C" int lfm_resampler_stream_process(
     if (!stream || !result || (!input && sample_count != 0)) return -EINVAL;
     result->data = nullptr;
     result->length = 0;
-    std::lock_guard<std::mutex> guard(stream->lock);
+    /* Stream state is conversation-owned and is reached only from that
+     * conversation's current ticket. It must never serialize numerical work
+     * with an internal lock. */
     if (sample_count > stream->capacity) return -ENOBUFS;
     uint64_t target = 0;
     if (!resampler_stream_length(stream->orig, stream->phases, stream->phase,
