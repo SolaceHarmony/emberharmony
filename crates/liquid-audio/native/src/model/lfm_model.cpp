@@ -2145,8 +2145,11 @@ extern "C" int lfm_model_open(void *engine, const char *path, LfmModel **out,
                  attention_entry->get<std::string>() != "rel_pos")) {
                 fail(-EOPNOTSUPP, "native Conformer requires rel_pos attention");
             }
-            if (!boolean(encoder, "xscaling", true)) {
-                fail(-EOPNOTSUPP, "native Conformer requires encoder xscaling");
+            /* The native encoder applies no sqrt(d_model) input scale, so it
+             * implements xscaling=false. NeMo's default is true, so an absent
+             * key is refused rather than silently mis-scaled. */
+            if (boolean(encoder, "xscaling", true)) {
+                fail(-EOPNOTSUPP, "native Conformer does not implement encoder xscaling");
             }
             if (feat_in != features || feat_out != d_model || d_model == 0 ||
                 encoder_layers == 0 || encoder_heads == 0 || encoder_ff == 0 ||

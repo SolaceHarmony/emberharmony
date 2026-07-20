@@ -99,7 +99,7 @@ impl AudioInputWriter {
         // drops the whole block, so it must resume the continuation to close
         // the turn. Coalescing happens inside the retained notifier.
         if frames != 0 {
-            let _ = self.notify.notify();
+            self.notify.notify().expect("capture edge notify failed");
         }
         dropped
     }
@@ -124,13 +124,15 @@ impl AudioInputWriter {
     }
 
     fn push_interleaved_f32(&mut self, samples: &[f32], channels: usize) -> usize {
-        let frames = samples.len().checked_div(channels).unwrap_or_default();
+        // A live device always reports at least one channel; zero is a corrupt
+        // config, not a case to silently report as zero frames.
+        let frames = samples.len() / channels;
         let dropped = self.capture.write_interleaved_f32(samples, channels);
         self.publish(dropped, frames)
     }
 
     fn push_interleaved_u16(&mut self, samples: &[u16], channels: usize) -> usize {
-        let frames = samples.len().checked_div(channels).unwrap_or_default();
+        let frames = samples.len() / channels;
         let dropped = self.capture.write_interleaved_u16(samples, channels);
         self.publish(dropped, frames)
     }
@@ -652,13 +654,15 @@ impl VoiceRuntime {
     pub fn interrupt(&self) {
         self.interrupt.store(true, Ordering::SeqCst);
         self.playback_flush.store(true, Ordering::SeqCst);
-        let _ = self.control.notify();
+        // The flags are inert until this edge lands: a dropped notify is a
+        // barge-in that silently never happens.
+        self.control.notify().expect("interrupt notify failed");
     }
 
     /// Pause/resume mic capture without ending the session.
     pub fn set_mic_enabled(&self, on: bool) {
         self.mic_enabled.store(on, Ordering::SeqCst);
-        let _ = self.control.notify();
+        self.control.notify().expect("mic-enable notify failed");
     }
 
     /// Whether mic capture is currently allowed.

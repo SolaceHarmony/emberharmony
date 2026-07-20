@@ -570,10 +570,7 @@ impl ConversationClaim {
         vault: Option<NativeConversationVault>,
     ) -> Result<Self, String> {
         let stored = if let Some(vault) = vault.as_ref() {
-            let mut state = vault
-                .0
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut state = vault.0.lock().expect("conversation vault mutex poisoned");
             if state.claimed {
                 return Err("native conversation is already attached to another session".into());
             }
@@ -612,10 +609,7 @@ impl Drop for ConversationClaim {
         let Some(vault) = self.vault.as_ref() else {
             return;
         };
-        let mut state = vault
-            .0
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = vault.0.lock().expect("conversation vault mutex poisoned");
         state.conversation = self.conversation.take();
         state.claimed = false;
     }
@@ -1322,7 +1316,9 @@ impl NativePlaybackSource {
             self.result = Some(result);
             return false;
         }
-        let _ = self.notify.notify();
+        // The record is already queued; the notify IS its causal successor. A
+        // dropped edge leaves the consumer unwoken with no retry path.
+        self.notify.notify().expect("playback result notify failed");
         true
     }
 
@@ -1334,7 +1330,7 @@ impl NativePlaybackSource {
             return false;
         }
         self.result = None;
-        let _ = self.notify.notify();
+        self.notify.notify().expect("playback flush notify failed");
         true
     }
 
@@ -2116,10 +2112,7 @@ impl Drop for NativeLfm2VoiceEngine {
              * session teardown instead of putting it back in the vault. */
             self.conversation.take();
         }
-        let mut state = vault
-            .0
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = vault.0.lock().expect("conversation vault mutex poisoned");
         state.conversation = self.healthy.then(|| {
             self.conversation
                 .take()

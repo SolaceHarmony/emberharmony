@@ -69,8 +69,9 @@ pub fn snapshot_download_to(
             file: sib.rfilename.clone(),
         });
         let path = repo.get(&sib.rfilename).map_err(to_io)?;
-        let candidate =
-            snapshot_root(&path, &sib.rfilename).or_else(|| path.parent().map(|p| p.to_path_buf()));
+        // No guessing at the parent directory: an unresolvable snapshot root
+        // falls through to the NotFound below rather than a plausible wrong path.
+        let candidate = snapshot_root(&path, &sib.rfilename);
         if root.is_none() || sib.rfilename == "config.json" {
             root = candidate;
         }
