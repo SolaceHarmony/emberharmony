@@ -51,9 +51,12 @@ an edge:
 - a storage operation completed outside the realtime worker set.
 
 The producer writes data, release-publishes the sequence, then rings the exact
-doorbell. The consumer registers its expected sequence, rechecks, and blocks.
-There is no monitoring loop, timed queue probe, sleep/retry, bounded spin, or
-periodic UI tick that discovers work.
+doorbell. The continuation records its expected sequence and rechecks its full
+predicate before returning `Dormant`; no thread remains attached to that
+operation. A resident runtime worker may enter indefinite OS-backed dormancy
+only when the runtime's complete ready predicate is empty. There is no
+monitoring loop, timed queue probe, sleep/retry, bounded spin, or periodic UI
+tick that discovers work.
 
 This is promise semantics in systems form: the continuation is registered once
 and resumes because the promise resolves, not because a scheduler keeps asking.
@@ -78,9 +81,10 @@ resample, compute VAD, mel, features, codec values, or model values.
 ## Inner Native Contract
 
 The model pass ring is private to native code. C++ creates and retains a typed
-pass descriptor, publishes its ID to the native SQ, and parks a native
-continuation on the CQ doorbell. Fixed lanes execute assembly stages. Completion
-resolves the native continuation, which may submit another pass immediately.
+pass descriptor, publishes its ID to the native SQ, and leaves the continuation
+as durable ticket state. Fixed lanes execute assembly stages. The final member
+return publishes the exact completion edge; a runtime worker then resumes the
+continuation and may submit another pass immediately.
 
 No pass completion calls Rust. No Rust future owns a token, logits plane, KV
 lease, sampler state, or next-pass decision.
@@ -102,10 +106,11 @@ voice session
 `- observer projection
 ```
 
-### Park
+### Suspend
 
-Park one continuation because it awaits a registered event. Its children keep
-running. A parent waiting for child completions must not freeze those children.
+Suspend one continuation as durable state because it awaits a registered event.
+It owns no thread or waiter while suspended, and its children keep running. A
+parent awaiting child completions must not freeze those children.
 
 ### Pause
 
@@ -129,7 +134,8 @@ Stop is root cancellation plus ordered teardown:
 4. let accepted native passes publish terminal records;
 5. resolve and join dock children;
 6. join native dispatcher and lane team;
-7. prove zero live tickets, descriptors, PCM leases, callbacks, and waits;
+7. prove zero live tickets, descriptors, PCM leases, callbacks, operation
+   waiters, and deadline children;
 8. destroy session/model/runtime in owner order.
 
 ## Interrupt And Barge-In
@@ -188,7 +194,7 @@ Rust. Rust sees audio and high-level lifecycle/observer facts only.
 
 - fixed capacity and explicit worker count;
 - no Tokio or generic work-stealing executor in the realtime dock;
-- one preallocated waker per task;
+- one setup-time retained notifier edge per producer/continuation relation;
 - no allocation on publish/wake/resume;
 - bounded drain per wake with fairness across scopes;
 - platform QoS appropriate for audio I/O;
@@ -208,7 +214,8 @@ Rust. Rust sees audio and high-level lifecycle/observer facts only.
 
 - stable lane identity;
 - shared stage board and disjoint destinations;
-- generation fences with immediate expected-value block;
+- generation-stamped entered/returned masks and one final-return callback;
+- no operation member blocks, parks, or carries a waiter at a stage boundary;
 - no channels, tickets, callbacks, allocation, exceptions, syscalls, or stop
   checks inside an operation;
 - every value-producing operation is architecture assembly or an explicitly

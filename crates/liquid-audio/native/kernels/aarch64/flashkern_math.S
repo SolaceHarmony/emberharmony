@@ -1,3 +1,40 @@
+// flashkern_math.S — AArch64 scalar numeric leaves for the LFM2 decode path.
+//
+// NUMERIC CONTRACT (why these are hand-written rather than compiler output):
+//
+// 1. Rounding points are placed, not minimised. Where the reference stores a
+//    BF16 value, this code rounds to BF16 at that same point via LFM_RNE_WIDEN;
+//    where the reference holds F32, the value stays F32. Keeping more precision
+//    than the reference is a DEVIATION here, not an improvement — the weights
+//    were trained through the reference's rounding, so faithfulness to its
+//    intermediate precision outranks mathematical accuracy.
+//
+// 2. BF16 -> F32 lift is `lsl #16` — a pure bit move. Exact and lossless, never
+//    a conversion instruction, so no implementation-defined rounding enters.
+//
+// 3. F32 -> BF16 is round-to-nearest-EVEN, open-coded (see LFM_RNE_WIDEN):
+//        bits += 0x7fff + ((bits >> 16) & 1)
+//    The `& 1` term is the destination LSB, which is what makes exact ties round
+//    to even rather than always up. The result is left in an F32 register with
+//    the low 16 bits cleared, so a "BF16 value" stays register-resident and is
+//    only narrowed to 16 bits at a store.
+//
+// 4. Reductions are strictly sequential — one `fadd` per element, no vector
+//    lanes and no pairwise tree. A tree reduction is usually MORE accurate and
+//    would still be wrong here: it changes the summation order, and the order is
+//    the contract. This is what makes results bit-reproducible run to run and
+//    lane-count independent.
+//
+// 5. Division and square root use exact IEEE `fdiv`/`fsqrt`, never `frsqrte`/
+//    `frecpe`. The estimate instructions are faster but their Newton refinement
+//    diverges from the reference in the last bits, and they are permitted to
+//    differ across implementations.
+//
+// Recorded evidence of these numerics lives in
+// native/tests/fixtures/conformer/ (72 per-stage tensors, checkpoint
+// LFM2.5-Audio-1.5B c362a062) — kept as provenance for the values, independent
+// of any test harness that once consumed them.
+
 #include "lfm_asm_visibility.h"
 
 #ifdef __APPLE__
@@ -7,6 +44,9 @@
 #endif
 
 .text
+
+// float lfm_rsqrt_size(uint64_t n) -> 1.0f / sqrtf((float)n)
+// The RMSNorm/attention scale factor. Exact fsqrt + fdiv (contract note 5).
 .p2align 2
 .globl LFM_SYM(lfm_rsqrt_size)
 LFM_PRIVATE(LFM_SYM(lfm_rsqrt_size))
@@ -17,6 +57,11 @@ LFM_SYM(lfm_rsqrt_size):
     fdiv    s0, s0, s1
     ret
 
+// float lfm_inv_rms_f32(float sumsq /*s0*/, float eps /*s1*/, uint64_t n /*x0*/)
+//   -> 1.0f / sqrtf(sumsq / n + eps)
+// Operand ORDER is the contract: divide by n first, THEN add eps, then sqrt,
+// then reciprocate. Folding eps in before the division, or scaling after the
+// root, changes the low bits for small sumsq and breaks reference agreement.
 .p2align 2
 .globl LFM_SYM(lfm_inv_rms_f32)
 LFM_PRIVATE(LFM_SYM(lfm_inv_rms_f32))
@@ -29,6 +74,9 @@ LFM_SYM(lfm_inv_rms_f32):
     fdiv    s0, s1, s0
     ret
 
+// float lfm_sum_f32(const float *x /*x0*/, uint64_t n /*x1*/)
+// Strictly sequential F32 accumulation, low index to high (contract note 4).
+// Deliberately NOT vectorised: lane-parallel accumulation reorders the sum.
 .p2align 2
 .globl LFM_SYM(lfm_sum_f32)
 LFM_PRIVATE(LFM_SYM(lfm_sum_f32))
@@ -43,6 +91,13 @@ LFM_SYM(lfm_sum_f32):
 2:
     ret
 
+// float lfm_bf16_sumsq_stride_f32(const uint16_t *x /*x0*/, uint64_t end /*x1*/,
+//                                 uint64_t start /*x2*/, uint64_t stride /*x3*/)
+//   -> sum of (bf16→f32 x[i])^2 for i = start, start+stride, ... < end
+// The RMSNorm sum of squares over a strided view. Each element is lifted by
+// `lsl #16` (exact, note 2), squared and accumulated in F32, sequentially
+// (note 4). The stride lets a row of an interleaved plane be reduced without
+// materialising a contiguous copy.
 .p2align 2
 .globl LFM_SYM(lfm_bf16_sumsq_stride_f32)
 LFM_PRIVATE(LFM_SYM(lfm_bf16_sumsq_stride_f32))
@@ -100,8 +155,18 @@ LFM_SYM(lfm_bf16_unlift_bits):
     lsl     w0, w0, #16
     ret
 
-// `bias` is an explicit operand: callers may choose any scratch register, and
-// no macro expansion silently depends on a leaf-global w14 convention.
+// Round an F32 register to BF16 precision, in place, round-to-nearest-EVEN.
+// The result stays an F32 whose low 16 mantissa bits are zero, so a logical
+// BF16 value remains register-resident with no store/reload round trip.
+//
+//     tie   = (bits >> 16) & 1     // destination LSB — the "even" term
+//     bits += 0x7fff + tie         // half-way cases round toward even
+//     bits  = (bits >> 16) << 16   // clear what BF16 cannot represent
+//
+// Without the `tie` term this would be round-half-UP and would drift from the
+// reference on exact ties. `bias` is an explicit operand: callers may choose any
+// scratch register, and no macro expansion silently depends on a leaf-global
+// w14 convention.
 .macro LFM_RNE_WIDEN source, target, bits, tie, bias
     fmov    \bits, \source
     lsr     \tie, \bits, #16
@@ -113,6 +178,24 @@ LFM_SYM(lfm_bf16_unlift_bits):
     fmov    \target, \bits
 .endm
 
+// void lfm_bf16_rope_neox(uint16_t *x /*x0*/, const uint16_t *cos /*x1*/,
+//                         const uint16_t *sin /*x2*/, uint64_t dim /*x3*/)
+// Rotary position embedding, NeoX pairing, applied in place over one head.
+//
+// PAIRING: element i is rotated against element i + dim/2 (see `x5 = x0 +
+// (dim/2)*2`). That is the GPT-NeoX split-half convention, NOT the GPT-J
+// interleaved (i, i+1) one. Choosing the wrong pairing produces plausible
+// audio that degrades with sequence length, so it is stated here explicitly.
+// Odd `dim` is rejected (`tbnz x3, #0`) rather than silently truncated.
+//
+//     out[i]        =  x[i]*cos - x[i+d/2]*sin
+//     out[i + d/2]  =  x[i+d/2]*cos + x[i]*sin
+//
+// ROUNDING: every product and every sum passes through LFM_RNE_WIDEN — six
+// rounding points per pair, not one. Accumulating the pair in full F32 and
+// rounding once at the end would be more accurate and WRONG: the reference
+// materialises BF16 at each of these steps, and the model was trained through
+// exactly that loss. This is contract note 1 in its sharpest form.
 .p2align 2
 .globl LFM_SYM(lfm_bf16_rope_neox)
 LFM_PRIVATE(LFM_SYM(lfm_bf16_rope_neox))

@@ -635,10 +635,12 @@ extern "C" int lfm_tokenizer_open(const char *path, LfmTokenizer **out,
     *out = nullptr;
     try {
         const Json document = read_json(path);
+        /* This tokenizer builds BPE merges only; any other model type would be
+         * decoded as if it were BPE, so it is refused rather than mis-decoded. */
         if (!document.is_object() || !document.contains("model") ||
             !document.at("model").is_object() ||
             document.at("model").value("type", "") != "BPE") {
-            fail(-EOPNOTSUPP, "native tokenizer requires a BPE model");
+            fail(-EOPNOTSUPP, "native tokenizer implements BPE models only");
         }
         auto tokenizer = std::make_unique<LfmTokenizer>();
         build_byte_codec(tokenizer.get());

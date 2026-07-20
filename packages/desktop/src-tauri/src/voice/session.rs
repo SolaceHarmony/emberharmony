@@ -657,7 +657,6 @@ pub(crate) fn url_encode(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::StreamExt as _;
 
     const SID: &str = "ses_test";
 

@@ -8,13 +8,30 @@
 #include <stdatomic.h>
 #include <stdlib.h>
 
-enum { KC_TEAM_ABI_VERSION = 1u };
+enum {
+    KC_TEAM_ABI_VERSION = 1u,
+    KC_TEAM_CACHELINE = 128u,
+    KC_TEAM_MAX_MEMBERS = 64u,
+};
 
 #define KC_TEAM_DISPATCH_CLOSED UINT32_C(0x80000000)
 #define KC_TEAM_DISPATCH_PUBLISHER UINT32_C(0x00000001)
 
+typedef struct kc_team_member_progress {
+    _Alignas(KC_TEAM_CACHELINE) atomic_uint_fast64_t entered_generation;
+    atomic_uint_fast64_t returned_generation;
+    unsigned char padding[KC_TEAM_CACHELINE -
+                          2 * sizeof(atomic_uint_fast64_t)];
+} kc_team_member_progress;
+
+_Static_assert(_Alignof(kc_team_member_progress) == KC_TEAM_CACHELINE,
+               "team member progress must be cache isolated");
+_Static_assert(sizeof(kc_team_member_progress) == KC_TEAM_CACHELINE,
+               "adjacent team progress cells must not share cache lines");
+
 typedef struct kc_team_member {
     struct kc_team *team;
+    kc_team_member_progress *progress;
     uint32_t index;
     uint64_t seen_generation;
 } kc_team_member;
@@ -23,6 +40,7 @@ struct kc_team {
     kc_team_config config;
     kc_port_thread **threads;
     kc_team_member *members;
+    kc_team_member_progress *progress;
     kc_doorbell_t *dispatch;
     kc_doorbell_t *readiness;
     atomic_uint started_members;
@@ -100,11 +118,15 @@ static void *team_member_main(void *context)
          * member completes it and produces its one final-return edge; stop
          * only prevents the next admission. */
         member->seen_generation = generation;
+        atomic_store_explicit(&member->progress->entered_generation, generation,
+                              memory_order_release);
         current_team = team;
         current_member = member->index;
         team->config.member(team->config.context, member->index,
                             team->config.member_count, generation);
         current_team = NULL;
+        atomic_store_explicit(&member->progress->returned_generation, generation,
+                              memory_order_release);
         if (atomic_fetch_add_explicit(&team->completed_members, 1,
                                       memory_order_acq_rel) + 1 ==
             team->config.member_count) {
@@ -127,17 +149,27 @@ int kc_team_create(const kc_team_config *config, kc_team_t **out)
 {
     if (!config || !out || config->size < sizeof(*config) ||
         config->abi_version != KC_TEAM_ABI_VERSION || !config->member ||
-        config->member_count == 0 || config->reserved != 0) return -EINVAL;
+        config->member_count == 0 ||
+        config->member_count > KC_TEAM_MAX_MEMBERS ||
+        config->reserved != 0) return -EINVAL;
     kc_team_t *team = calloc(1, sizeof(*team));
     if (!team) return -ENOMEM;
     team->config = *config;
     team->threads = calloc(config->member_count, sizeof(*team->threads));
     team->members = calloc(config->member_count, sizeof(*team->members));
-    if (!team->threads || !team->members) {
+    team->progress = aligned_alloc(
+        KC_TEAM_CACHELINE,
+        config->member_count * sizeof(*team->progress));
+    if (!team->threads || !team->members || !team->progress) {
+        free(team->progress);
         free(team->members);
         free(team->threads);
         free(team);
         return -ENOMEM;
+    }
+    for (uint32_t index = 0; index < config->member_count; ++index) {
+        atomic_init(&team->progress[index].entered_generation, 0);
+        atomic_init(&team->progress[index].returned_generation, 0);
     }
     atomic_init(&team->started_members, 0);
     atomic_init(&team->completed_members, 0);
@@ -152,6 +184,7 @@ int kc_team_create(const kc_team_config *config, kc_team_t **out)
     if (kc_doorbell_create(&team->dispatch) != 0 ||
         kc_doorbell_create(&team->readiness) != 0) {
         kc_doorbell_destroy(team->dispatch);
+        free(team->progress);
         free(team->members);
         free(team->threads);
         free(team);
@@ -172,6 +205,7 @@ int kc_team_start(kc_team_t *team)
     for (; started < team->config.member_count; ++started) {
         team->members[started] = (kc_team_member){
             .team = team,
+            .progress = &team->progress[started],
             .index = started,
             .seen_generation = 0,
         };
@@ -268,6 +302,7 @@ int kc_team_destroy(kc_team_t *team)
         !atomic_load_explicit(&team->joined, memory_order_acquire)) return -EBUSY;
     kc_doorbell_destroy(team->readiness);
     kc_doorbell_destroy(team->dispatch);
+    free(team->progress);
     free(team->members);
     free(team->threads);
     free(team);
@@ -293,6 +328,48 @@ int kc_team_snapshot_get(kc_team_t *team, kc_team_snapshot *out)
         .stop_requested = atomic_load_explicit(&team->stop_requested,
                                                memory_order_acquire),
         .joined = atomic_load_explicit(&team->joined, memory_order_acquire),
+    };
+    return 0;
+}
+
+int kc_team_quorum_snapshot_get(kc_team_t *team, uint64_t generation,
+                                kc_team_quorum_snapshot *out)
+{
+    if (!team || !out || out->size < sizeof(*out) || generation == 0)
+        return -EINVAL;
+    uint64_t dispatched = atomic_load_explicit(
+        &team->dispatched_generation, memory_order_acquire);
+    if (dispatched != generation) return -ESTALE;
+
+    uint64_t entered = 0;
+    uint64_t returned = 0;
+    for (uint32_t index = 0; index < team->config.member_count; ++index) {
+        const uint64_t bit = UINT64_C(1) << index;
+        uint64_t member_returned = atomic_load_explicit(
+            &team->progress[index].returned_generation, memory_order_acquire);
+        if (member_returned == generation) {
+            returned |= bit;
+            entered |= bit;
+            continue;
+        }
+        uint64_t member_entered = atomic_load_explicit(
+            &team->progress[index].entered_generation, memory_order_acquire);
+        if (member_entered == generation) entered |= bit;
+    }
+
+    if (atomic_load_explicit(&team->dispatched_generation,
+                             memory_order_acquire) != generation)
+        return -EAGAIN;
+    const uint64_t expected = team->config.member_count == KC_TEAM_MAX_MEMBERS
+                                  ? UINT64_MAX
+                                  : (UINT64_C(1) << team->config.member_count) - 1;
+    *out = (kc_team_quorum_snapshot){
+        .size = sizeof(*out),
+        .abi_version = KC_TEAM_ABI_VERSION,
+        .generation = generation,
+        .expected_mask = expected,
+        .entered_mask = entered,
+        .returned_mask = returned,
     };
     return 0;
 }

@@ -217,8 +217,6 @@ pub struct Lfm2Settings {
     /// selected engine controls the run path instead of guessing from one folder.
     pub moshi_model_dir: Option<String>,
     pub device: Lfm2Device,
-    /// Energy-VAD threshold (mic_chat default 0.012).
-    pub vad_threshold: f32,
     /// Timestamped native voice call-graph diagnostics. Persisted and explicit;
     /// never inferred from the desktop process environment.
     pub trace: bool,
@@ -248,7 +246,6 @@ struct Lfm2SettingsSerde {
     model_dir: Option<String>,
     moshi_model_dir: Option<String>,
     device: Lfm2Device,
-    vad_threshold: f32,
     trace: bool,
     #[serde(deserialize_with = "de_asr", default = "Lfm2ModeSampling::asr_default")]
     asr: Lfm2ModeSampling,
@@ -275,7 +272,6 @@ impl Default for Lfm2SettingsSerde {
             model_dir: value.model_dir,
             moshi_model_dir: value.moshi_model_dir,
             device: value.device,
-            vad_threshold: value.vad_threshold,
             trace: value.trace,
             asr: value.asr,
             tts: value.tts,
@@ -313,7 +309,6 @@ impl<'de> Deserialize<'de> for Lfm2Settings {
             model_dir: value.model_dir,
             moshi_model_dir: value.moshi_model_dir,
             device: value.device,
-            vad_threshold: value.vad_threshold,
             trace: value.trace,
             asr: value.asr,
             tts: value.tts,
@@ -415,7 +410,6 @@ impl Default for Lfm2Settings {
             model_dir: None,
             moshi_model_dir: None,
             device: Lfm2Device::default(),
-            vad_threshold: 0.012,
             trace: false,
             asr: Lfm2ModeSampling::asr_default(),
             tts: Lfm2ModeSampling::tts_default(),
@@ -558,11 +552,9 @@ mod tests {
         // CPU on every platform since the measured flip (engine work, 2026-07-09):
         // the lane-team engine leads Metal on both latency and underruns.
         assert_eq!(json["lfm2"]["device"], "cpu");
-        assert!(json["lfm2"]["vadThreshold"].is_number()); // exact-float compare is brittle
         let back: VoiceSettings = serde_json::from_value(json).unwrap();
         assert_eq!(back.provider, VoiceProvider::Off);
         assert_eq!(back.last_provider, Some(VoiceProvider::Lfm2));
-        assert_eq!(back.lfm2.vad_threshold, 0.012); // f32 round-trips losslessly
     }
 
     #[test]
@@ -573,7 +565,6 @@ mod tests {
         assert_eq!(v.provider, VoiceProvider::Lfm2);
         assert_eq!(v.last_provider, Some(VoiceProvider::Lfm2));
         assert_eq!(v.lfm2.device, Lfm2Device::Metal);
-        assert_eq!(v.lfm2.vad_threshold, 0.012); // filled from Default
         assert!(!v.lfm2.trace); // diagnostics stay off unless the stored settings enable them
         // Absent mode groups take the correct PER-MODE defaults (older
         // stores predate the groups entirely).

@@ -15,17 +15,22 @@ typedef struct LfmSessionConfigV1 {
     uint32_t size;
     uint32_t abi_version;
     uint64_t session_id;
-    uint32_t capture_slots;
     uint32_t playback_slots;
-    uint32_t capture_frames_per_slot;
+    /* Maximum complete frame block promised by the platform capture device.
+     * Readiness must fail when this contract is unknown. Each callback is one
+     * indivisible capture chunk; native never guesses or splits this bound. */
+    uint32_t capture_max_callback_frames;
     /* Zero lets a model-backed session derive its exact codec/rate capacity.
      * Dock-only sessions must provide an explicit capacity. */
     uint32_t playback_frames_per_slot;
     uint32_t pcm_channels;
-    uint32_t pcm_sample_rate;
+    /* Capture and playback clocks are sealed independently at readiness.
+     * Capture leases must retain capture_sample_rate; generated PCM leases
+     * always carry playback_sample_rate. */
+    uint32_t capture_sample_rate;
+    uint32_t playback_sample_rate;
     uint32_t command_capacity;
     uint32_t max_new_tokens;
-    uint32_t reserved0;
     uint64_t flags;
     uint64_t reserved[4];
 } LfmSessionConfigV1;
@@ -37,6 +42,10 @@ typedef enum LfmEventKindV1 {
     LFM_EVENT_ERROR = 4,
     LFM_EVENT_STOPPED = 5,
     LFM_EVENT_PLAYBACK_READY = 6,
+    /* Reliable ownership edge for a native-admitted audio turn. Rust uses the
+     * exact ticket only to correlate outward records; it never creates or
+     * advances the turn. */
+    LFM_EVENT_TURN_STARTED = 7,
 } LfmEventKindV1;
 
 #define LFM_EVENT_FLAG_HAS_AUDIO (1u << 0)
@@ -103,7 +112,6 @@ typedef struct LfmSessionSnapshotV1 {
     uint64_t text_commands_accepted;
     uint64_t text_commands_consumed;
     uint64_t text_commands_stale;
-    uint32_t live_capture_leases;
     uint32_t live_playback_leases;
     uint32_t reliable_event_depth;
     uint32_t reliable_event_capacity;

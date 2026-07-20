@@ -5,6 +5,37 @@
 // ladders, and bf16 rounding (RNE, the LFM_RNE_WIDEN convention from
 // flashkern_math.S) is applied exactly where candle's bf16 arithmetic rounds:
 // once per tensor op. No FMA contraction anywhere.
+//
+// "ONCE PER TENSOR OP" IS THE WHOLE CONTRACT. Every per-leaf note below that
+// says "one round" / "two rounds" / "each step rounds" is counting candle's
+// rounding points, not describing an implementation detail. Fusing two leaves to
+// skip an intermediate round is the single easiest way to walk this file off its
+// fixtures: it is arithmetically MORE accurate and produces a different tensor.
+// The rounding count is load-bearing; the speed is not.
+//
+// LIBM DEPENDENCY — this is the LARGEST libm user in the kernel set:
+// expf (silu, glu, softmax), erff (gelu), and sinf/cosf (positional encoding).
+// Those are not bit-identical across platforms (Apple libm / glibc / musl), so
+// the conformer output — and any end-to-end byte oracle downstream of it — is
+// reproducible on a given platform but not guaranteed across them. Three files
+// carry libm: this one, flashkern_rope.S (powf/cosf/sinf) and
+// flashkern_frontend.S (logf). math/prng/sampler/sesame are libm-free and
+// bit-identical everywhere.
+//
+// VARIANCE CONVENTIONS DIFFER ACROSS THE TREE, ON PURPOSE. Three normalisers,
+// three formulas, each faithful to its own reference — do not harmonise them:
+//   lfm_ln_bf16        (here)          var = sumsq / cols        BIASED, eps per candle
+//   lfm_rowstat_f32    (frontend.S)    std = sqrt(sumsq/(n-1)) + eps   ddof-1, eps AFTER
+//   lfm_inv_rms_f32    (math.S)        1 / sqrt(sumsq/n + eps)         eps INSIDE
+// Seeing two of these side by side reads like a bug in one of them. It is not.
+//
+// WHY THE BF16 GEMM AVOIDS FEAT_BF16 (see lfm_bf16_gemm_nt_f32_scalar): the
+// stated reason is weight movement — halfwords are unlifted straight into f32
+// registers, never copied, packed or widened into memory. There is a second,
+// numerical reason to leave it alone: BFDOT accumulates pairwise with its own
+// rounding contract, which is NOT candle's sequential f32 k-ascending sum. A
+// BFDOT rewrite would therefore change the arithmetic order as well as the data
+// movement, and both are pinned by the fixtures.
 
 #ifdef __APPLE__
 #define LFM_SYM(name) _##name

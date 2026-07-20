@@ -4,6 +4,33 @@
 // Scalar SSE2, strictly ordered, RNE bf16 rounding at exactly the points the
 // candle ladder rounds. SysV plus Win64-GNU arg normalization (the sibling
 // leaves' convention). No FMA.
+//
+// Read the AArch64 twin for the full rationale; the contracts are identical.
+// Four things restated because they are what a reader gets wrong:
+//
+// "ONCE PER TENSOR OP" IS THE WHOLE CONTRACT. Every per-leaf note saying "one
+// round" / "two rounds" / "each step rounds" is counting candle's rounding
+// points, not describing an implementation detail. Fusing two leaves to skip an
+// intermediate round is arithmetically MORE accurate and produces a different
+// tensor. The rounding count is load-bearing; the speed is not.
+//
+// NO FMA — and it is easier to violate here than on AArch64, because FMA3 is
+// right there. vfmadd keeps the product at full internal width and rounds once;
+// mulss + addss rounds twice. Contracting any of these leaves walks the file off
+// native/tests/fixtures/conformer.
+//
+// LIBM DEPENDENCY — this is the LARGEST libm user in the kernel set: expf
+// (silu, glu, softmax), erff (gelu), sinf/cosf (positional encoding). Not
+// bit-identical across platforms, so conformer output and any byte oracle
+// downstream of it are platform-tied. Three files carry libm: this one,
+// flashkern_rope.S (powf/cosf/sinf), flashkern_frontend.S (logf).
+// math/prng/sampler/sesame are libm-free and bit-identical everywhere.
+//
+// VARIANCE CONVENTIONS DIFFER ACROSS THE TREE, ON PURPOSE — three normalisers,
+// three formulas, each faithful to its own reference. Do not harmonise:
+//   lfm_ln_bf16      (here)        var = sumsq / cols              BIASED
+//   lfm_rowstat_f32  (frontend.S)  std = sqrt(sumsq/(n-1)) + eps   ddof-1, eps AFTER
+//   lfm_inv_rms_f32  (math.S)      1 / sqrt(sumsq/n + eps)         eps INSIDE
 
 #ifdef __APPLE__
 #define LFM_SYM(name) _##name

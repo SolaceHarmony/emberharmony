@@ -6,24 +6,23 @@ Normative detail lives in
 [`specs/11-kcoro-native-migration.md`](../../../../../specs/11-kcoro-native-migration.md).
 The native integration runbook is
 [`docs/native/KCORO_ARENA_INTEGRATION.md`](../../../../../docs/native/KCORO_ARENA_INTEGRATION.md).
-This file describes the desktop-facing shape and records unfinished migration
-work. Git history, not a second live document, preserves the discarded
-Rust/Candle architecture.
+This file describes the desktop-facing production shape. Git history, not a
+second live implementation, preserves the discarded Rust/Candle architecture.
 
 ## Non-Negotiable Boundary
 
 The local voice system has four ownership layers:
 
-1. **Rust owns audio streams in and out.** It opens the OS microphone and
-   speaker, owns callback-safe PCM rings, translates persisted/Tauri settings,
-   and projects bounded events to SolidJS.
-2. **Rust kcoro owns asynchronous I/O continuations.** It parks and resumes PCM
-   and control operations from exact docking-ring callbacks. It does not submit,
-   inspect, or recur model passes.
-3. **C++ owns native control.** It loads files, validates plans, owns buffers and
-   handles, schedules fixed lanes, performs lifetime arbitration, and dispatches
-   assembly entry points. C++ contains no model, codec, DSP, sampler, or tensor
-   arithmetic in the completed system.
+1. **Rust owns platform callback endpoints.** It opens the OS microphone and
+   speaker, transfers one non-cloneable capture/playback endpoint into each
+   callback, translates persisted/Tauri settings, and projects bounded events
+   to SolidJS. It does not own PCM storage, VAD, endpointing, or resampling.
+2. **The safe kcoro Rust seam owns host continuations.** Retained services and
+   prebound realtime notifier leases resume control/observer work from exact
+   native edges. Suspended work is state, not an attached Rust thread or waiter.
+3. **Native C++/kcoro owns control and storage.** It loads files, validates plans,
+   owns immutable weight views, circular PCM arenas, conversation/session state,
+   fixed services/team workers, ticket correlation, and assembly dispatch.
 4. **Assembly owns every numerical operation.** AArch64 and x86_64 assembly own
    embedding, convolution, FFT, mel, normalization, attention, activations,
    sampling, codec, recurrence-state transforms, and GEMM. On Apple, a selected
@@ -40,20 +39,20 @@ only PCM/control docking events and observational snapshots.
 flowchart LR
     UI["SolidJS controls and visualization"]
     Tauri["Tauri commands and settings"]
-    Audio["Rust audio host: microphone, speaker, PCM rings"]
-    Dock["Rust kcoro audio/control dock"]
-    Native["C++ control: handles, plans, queues, barriers"]
+    Audio["Rust audio host: microphone/speaker callbacks"]
+    Dock["safe kcoro host services + opaque endpoints"]
+    Native["native kcoro: handles, buffers, routes, tickets"]
     Rings["Native model SQ/CQ and exact doorbells"]
     Lanes["Fixed Flashkern lane team"]
     Asm["AArch64 or x86_64 assembly math"]
 
     UI -->|"start, stop, mic, interrupt, settings"| Tauri
     Tauri --> Audio
-    Audio -->|"PCM lease ready"| Dock
-    Dock -->|"region and generation"| Native
+    Audio -->|"ephemeral device span"| Dock
+    Dock -->|"bounded native span operation"| Native
     Native --> Rings --> Lanes --> Asm
     Asm --> Lanes --> Rings --> Native
-    Native -->|"PCM lease ready"| Dock
+    Native -->|"ticketed playback lease"| Dock
     Dock --> Audio
     Audio --> UI
     Native -. "sampled telemetry only" .-> Tauri
@@ -72,23 +71,25 @@ continuation becomes runnable exactly once.
 ```mermaid
 sequenceDiagram
     participant HAL as OS audio callback
-    participant R as Rust PCM ring
-    participant K as Rust kcoro dock
+    participant R as Rust opaque endpoint
+    participant K as Native PCM dock
     participant N as Native session
     participant F as Flashkern lanes
     participant A as Assembly
 
-    HAL->>R: commit captured PCM lease
-    R-->>K: ring capture doorbell
-    K->>N: publish region identity
+    HAL->>R: callback with ephemeral interleaved span
+    R->>K: bounded write through CaptureSink
+    K->>K: reserve/convert/publish native chunk
+    K-->>N: exact capture edge
     N->>F: submit native pass chain
     F->>A: dispatch numerical stages
     A-->>F: stage completion
     F-->>N: exact native CQ completion
     Note over N,F: token/frame recurrence remains native
-    N-->>K: ring output-PCM doorbell
-    K->>R: commit playback lease
-    R-->>HAL: speaker callback consumes PCM
+    N-->>K: publish correlated playback lease
+    HAL->>R: request device buffer
+    R->>K: resolve/render/release exact lease
+    R-->>HAL: callback returns filled device span
 ```
 
 `stop`, `interrupt`, and microphone enablement are control edges. They bump an
@@ -105,9 +106,9 @@ polled; stale publication is rejected at the next complete pass boundary.
 | activation and scratch planes | native session/conversation | fixed lanes and assembly only |
 | logits and sampler scratch | native conversation | assembly only |
 | Mimi/codec state | native conversation | assembly only |
-| microphone PCM ring | Rust audio host | HAL producer, Rust kcoro consumer lease |
-| speaker PCM ring | Rust audio host | Rust kcoro producer lease, HAL consumer |
-| native PCM ingress/egress regions | docked lease | one side owns mutation; generation fences handoff |
+| microphone circular arena | native session | HAL callback supplies ephemeral source; native conversion writes reservation |
+| speaker playback pool | native session | Mimi/resampler writes reservation; HAL callback resolves and retires lease |
+| capture/playback descriptors | native dock | ticket, epoch, sequence, region/lease generation and span bounds |
 | UI event queue | Tauri host | compact metadata and copied display text only |
 
 Weights and model state never enter Rust. PCM never enters Tauri IPC as the
@@ -115,36 +116,41 @@ mechanism that makes audio progress.
 
 ## Current Implementation Truth
 
-The migration is active, not complete.
+The LFM2 production cutover is complete; supervision and release gates remain
+active working-tree work.
 
 ### Implemented
 
-- `native/src/io/safetensors.cpp` owns aligned resident checkpoint images and
-  immutable tensor views.
+- `native/src/io/safetensors.cpp` owns one byte-exact main-plus-codec checkpoint
+  image and immutable byte views.
 - `native/src/model/lfm_model.cpp` binds native model plans from those views.
-- `native/src/engine/flashkern_engine.cpp` owns the fixed lane team, generation
-  fences, native bridge submission/completion, and direct native pass dispatch.
-- `submit_pass` no longer calls a Rust coordinator. The compatibility Rust
-  `NativeEngine` stores only an opaque pointer and a call-serialization mutex.
+- `kc_team` owns the fixed numerical workers; `flashkern_engine.cpp` owns typed
+  stage boards, exact generation dispatch, final-member completion, route/pass
+  tickets, and direct native recurrence.
+- Native retained services own bridge, broker, coordinator, and delivery
+  continuations. No Rust model coordinator or blocking pass rim exists.
 - PRNG block expansion, RoPE table generation, scalar reductions, BF16 NeoX
   rotation, and sampler leaves including exponentiation have architecture `.S`
   implementations with no external numerical symbol.
 - Native sampler fixtures pass on Apple Silicon and x86_64 under Rosetta with
   the same seeded token stream.
-- Rust `fanout.rs` and the production Rust coordinator trampoline are deleted.
+- Native circular capture plus exact Sesame detection owns turn evidence and
+  endpointing. The non-cloneable Rust callback endpoints hold no PCM buffer.
+- Native playback retains ticket/epoch/generation through final device release;
+  no PCM payload enters `VoiceEvent` or Tauri IPC.
 
-### Still Migration Debt
+### Still Release / Future Debt
 
-- Rust/Candle model, processor, Conformer, and realtime code remains in the tree
-  and is still reachable in portions of the current desktop provider.
-- Numerical C++ remains in the architecture `.cpp` files, Mimi sources, DD FFT,
-  and sampler orchestration. Each family must move into `.S`; the `.cpp` files
-  become control-only and then disappear where they have no control role.
-- The Rust PCM/control docking ring is designed but not yet the sole desktop
-  audio boundary.
-- Native model recurrence is not yet fully conversation-owned; some outer turn
-  behavior still returns through transitional Rust model code.
-- The MLX C++/Metal peer backend is not mounted. Flashkern remains CPU-only.
+- Hard-only team quorum supervision is being wired through correlated monotonic
+  deadline children, entered/returned masks, one terminal CAS, and a reserved
+  fatal capsule. It must pass the post-change real-checkpoint and lifecycle
+  stress gates before release status is claimed.
+- Audit and remove residual compiler-owned C++ numerical loops where an assembly
+  or explicit Accelerate/AMX stage has not yet taken ownership.
+- The current engine is one fixed team. Independent V2 `BlockDomain`s are not
+  implemented and must not be inferred from logical lane folding.
+- The MLX C++/Metal peer backend and native Moshi are not mounted. Flashkern
+  remains the only shipped LFM2 engine; unsupported selections fail explicitly.
 
 No compatibility fallback is added for any removed path. A path is deleted only
 after its native assembly-backed replacement passes parity and lifecycle gates.
@@ -184,7 +190,7 @@ Required local gates while the migration is active:
 ```bash
 cargo test -p liquid-audio --lib -- --nocapture
 cargo test -p liquid-audio --tests -- --nocapture
-./crates/liquid-audio/scripts/test-rosetta.sh
+cargo test -p kcoro-sys --tests -- --nocapture
 git diff --check
 ```
 
@@ -204,9 +210,10 @@ The final cutover additionally requires:
 | Responsibility | Source |
 |---|---|
 | desktop commands/settings/events | `packages/desktop/src-tauri/src/voice/` |
-| Rust PCM/control dock | `crates/kcoro/` plus the pending audio-dock module |
+| safe Rust continuation/notifier seam | `crates/kcoro-sys/src/lib.rs` |
+| opaque platform callback endpoints | `crates/liquid-audio/src/voice_api.rs`, `src/native_voice.rs` |
 | native product lifecycle ABI | `crates/liquid-audio/native/include/lfm_runtime.h`, `lfm_session.h` |
-| private numerical oracle ABI | `crates/liquid-audio/native/src/model/lfm_model_legacy.h` |
+| private numerical oracle ABI | hidden `oracle-abi` entry points; no production legacy header |
 | native model binding | `crates/liquid-audio/native/src/model/lfm_model.cpp` |
 | native queue/doorbell protocol | `native/include/lfm_kernel_bridge.h`, `native/src/runtime/` |
 | fixed lane control | `native/src/engine/flashkern_engine.cpp` |

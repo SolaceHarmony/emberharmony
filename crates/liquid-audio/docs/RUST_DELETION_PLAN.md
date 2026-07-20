@@ -6,10 +6,11 @@ repository-structure follow-on ledger**, audited against the working tree on
 
 ## Ruling
 
-Rust owns platform microphone/speaker callbacks, VAD/endpointing, opaque
-lifetimes, settings/control mapping, and host projection. It owns no production
+Rust owns platform microphone/speaker callbacks, opaque endpoint lifetimes,
+settings/control mapping, and host projection. Native code owns the exact
+Sesame detector and sample-clock endpointing policy. Rust owns no production
 model math, DSP, tensor, weight, token, sampling, KV/codec state, model-pass
-scheduling, or recurrence.
+scheduling, recurrence, speech evidence, or turn boundary.
 
 C++ owns native plans, immutable views, conversations, sessions, queues, leases,
 stages, and recurrence. Production pass arithmetic belongs to typed
@@ -18,12 +19,11 @@ leaf boundary. Formula-derived immutable tables may be constructed at readiness
 and are reported separately. Layout, alignment, dtype, transpose, framework
 ownership, or convenience copies of weights are forbidden.
 
-The default crate and desktop production graph are native-only. Candle, the old
-Rust inference implementation, training, fixture capture, and Moshi are gated by
-the opt-in `oracle` feature; the workspace-only `liquid-audio-oracle` crate
-currently re-exports that feature rather than physically owning those sources.
-That source move remains repository-structure work. An oracle is never a
-production fallback.
+The default crate and desktop production graph are native-only. Candle, training,
+fixture capture, and Moshi dependencies live in the workspace-only
+`liquid-audio-oracle` crate. Production exposes only a hidden `oracle-abi` build
+surface for conformance entry points; it does not re-enable Rust model code. An
+oracle is never a production fallback.
 
 ## As-built / open-gaps ledger
 
@@ -33,11 +33,11 @@ production fallback.
 | Typed binding | **Landed.** Exact BF16/F32 dtype, rank, shape, layer, codebook, and vocabulary checks; possibly unaligned tensors remain byte views. | None for LFM2. |
 | Weight consumption | **Landed.** Frontend, Conformer, backbone, Depthformer, and Mimi bind the same image; BF16 unlift occurs in registers. | `compatibility_copied_bytes == 0` remains an acceptance assertion. Its counters were **stubs returning a literal 0** (review 2026-07-16) — the gate could not fail; now wired to real per-plan tallies. See "Accounting is a tally, not a constant" below. |
 | Native model chain | **Landed for numerical ownership.** One typed, model-correlated `REQ_AUDIO_ENCODE` pass owns resample → valid-only BF16 frontend → whole Conformer/adapter over borrowed spans and pre-reserved conversation buffers. Modality assembly, M≤4 checkpoint-BF16 prefill, backbone, sampling, Depthformer, Mimi, and tokenizer are also native-owned. | No remaining numerical-stage ownership gap for LFM2. The coordinator-to-continuation scheduling cut is tracked in the conversation/session row. |
-| Conversation/session | **Landed.** Native KV/ShortConv/codec state, PRNG, cursor, recurrence, text/PCM tickets, reliable events, epochs, interrupt, stop, and join. Rust does not drive progress. A fixed route pool and native expected-value broker release capacity between coarse nodes; exact-CQ callbacks only commit, retire the slot, and publish readiness. The bridge and broker are retained kcoro services, resumed through setup-time realtime notifier leases and one runtime-owned expected-value doorbell rather than private pthread loops or a mutex-taking notification. Text and audio routes notify a coordinator-owned `SessionAction`, which collects the exact handle without a numerical wait. | The V2.2 gang-completion protocol is mounted; private block execution remains separate scheduler work. |
+| Conversation/session | **Landed.** Native KV/ShortConv/codec state, PRNG, cursor, recurrence, text/PCM tickets, reliable events, epochs, interrupt, stop, and join. Rust does not drive progress. A fixed route pool and native expected-value broker release capacity between coarse nodes; exact-CQ callbacks only commit, retire the slot, and publish readiness. The bridge and broker are retained kcoro services, resumed through setup-time realtime notifier leases and one runtime-owned expected-value doorbell rather than private pthread loops or a mutex-taking notification. Text and audio routes notify a coordinator-owned `SessionAction`, which collects the exact handle without a numerical wait. | The current engine remains one fixed team. Real V2.2 `BlockDomain` extraction is separate scheduler work. |
 | Context rollover | **Landed.** Fixed capacity+runway BF16 state, monotonic cursor, absolute RoPE range generation, nonmutating whole-action admission, causal row-by-row eviction, and in-place compaction. | None for the activation-state sliding-window contract. |
 | Shared model | **Landed.** Per-conversation state/scratch and a fair model-owned expected-value pass gate; engine `-EBUSY` does not leak as scheduling policy. | Capacity-2 continuations may improve overlap; fairness is already correct. |
 | Production graph | **Landed.** Desktop creates `NativeVoiceModel` and opaque native conversations/sessions only; default dependencies do not enable Candle or Moshi. | Native Metal/MLX remains a separate future backend and must fail explicitly until mounted. |
-| Physical audio dock | **Partial.** Native generation-checked capture/playback leases and zero-spin doorbells are live. The Rust callback ring now admits or drops each complete callback block atomically, publishes it with one release cursor, and wakes VAD/frame/output consumers through the shared kcoro expected-value doorbell. Microphone setup rejects a pthread-fallback wake instead of taking a hidden mutex in the hardware callback. The former 40/10/100ms progress heartbeats and Crossbeam wake token are deleted; speech thresholds advance from delivered sample counts. Safe Rust `Runtime`/`Service`/single-producer `RealtimeNotifier` ownership is live, and bounded services can return `ReadyAgain` to re-enter locally without a timer, mutex, or synthetic producer edge. Playback is consumed synchronously from a borrowed native span, and production VAD still makes one copy into the final native capture lease. | Do not mount the current unbounded VAD loop as a service. First expose nonblocking capture reservation plus a native capture-space notifier, preallocate a quota-bounded VAD state, replace the Rust inference-queue capacity wait with an edge or delete that queue, attach the microphone notifier before producer start, and quiesce that producer before service teardown. Then replace Rust sample storage/VAD accumulation with callback-writable retained block reservations and an explicit VAD commit. Preserve playback ticket/epoch through the final device callback, remove `Vec` drains and the legacy audio event/channel adapters, and record block drops as sequenced XRUNs. |
+| Physical audio dock | **Landed for LFM2.** Non-cloneable Rust endpoints pass ephemeral hardware spans into bounded native operations. Capture converts/downmixs directly into a generation-checked circular-arena reservation and publishes typed chunk/XRUN records; native Sesame and turn policy consume those views. Playback resolves a retained native lease only inside the device callback and preserves ticket/epoch/generation through release. Safe Rust `Runtime`/`Service`/single-producer `RealtimeNotifier` ownership is live; there are no progress heartbeats, Crossbeam audio edges, Rust PCM rings, utterance vectors, or Rust VAD buffers. | Keep device-fault, producer-quiescence, stale-epoch, full-ring/XRUN, and teardown races in the release gate. |
 | Moshi | **Not ported.** It is offline/oracle-only and is not the shipped default. | A full native Moshi port is a subsequent tranche; this LFM2 ledger does not claim it. |
 
 ## Completed LFM2 cutover
@@ -102,12 +102,11 @@ Both are now real per-object tallies (`LfmConformer::materialized_weight_bytes`,
 `MimiDecodePlan::compatibility_copied_bytes`), sitting beside the tallies that
 were already real (`bound_weight_bytes`, `derived_bytes`). They still read 0,
 because nothing materializes a weight today — but now that is a *measurement*.
-The positive oracle witness is
-`rust_owner_drives_the_compatibility_builder_without_reopening_the_file`: it
-starts at zero, drives the deliberately copying Candle bridge, and requires the
-counter to report exactly one tensor and its payload bytes. Production plan
-counters remain zero because there is intentionally no legal production
-copying path to exercise.
+No deliberately copying compatibility builder is retained merely to make the
+counter positive; doing so would preserve the forbidden implementation beside
+its replacement. The gate is therefore two-sided structurally: real-checkpoint
+accounting must report zero, while dependency, symbol, and source audits reject
+every weight-staging/repack owner from the production graph.
 
 **Invariant:** any code that materializes a weight MUST add its bytes to the
 owning tally, exactly as binding adds to `bound_weight_bytes`. A weight-norm fold
@@ -132,9 +131,10 @@ fact no author can forget to update.
   events, capture/playback leases, interruption epochs, stop, join, and the native
   token → sample → Depthformer → Mimi recurrence loop. A stale pass may finish but
   cannot publish.
-- All waits use shared expected-value predicates. The model pass gate, engine
-  SQ/CQ, lane fences, event capacity, command capacity, and PCM lease capacity do
-  not poll or spin.
+- Operations own no waiters. Producers publish exact edges; suspended routes and
+  actions are durable records, while only an otherwise-idle runtime worker may
+  enter indefinite expected-value dormancy. The model gate, engine SQ/CQ, team
+  generations, event/command capacity, and PCM leases do not poll or spin.
 
 ### Exact context contract
 
@@ -154,15 +154,13 @@ fact no author can forget to update.
   `NativeVoiceModel`; it never constructs the old Rust `LFM2AudioModel`, processor,
   Candle device, Rust safetensors builder, or a simultaneous compatibility image.
 - `liquid-audio` defaults to the opaque native lifecycle. Rust model/tensor/
-  generation exports and dependencies are `#[cfg(feature = "oracle")]` only.
-  `liquid-audio-oracle` is `publish = false` and opts into that feature for
-  training and fixture work. It is currently a thin re-export; physically move
-  the oracle/training sources there before calling the repository split complete.
+  generation exports and dependencies are absent. `liquid-audio-oracle` is
+  `publish = false`, owns the Candle/Moshi/training dependencies, and opts into
+  only the hidden native `oracle-abi` conformance surface.
 - Unsupported native Metal and Moshi selections fail explicitly. There is no
   native/Candle, CPU/Metal, or model-version fallback chain.
-- The standalone `mimi_decoder_new_from_file` parity wrapper is compiled only
-  with `oracle`; it is absent from the shared header and production native
-  archive. Shipped Mimi can bind only the codec component owned by `LfmModel`.
+- The standalone file-owning Mimi parity decoder is deleted. Shipped Mimi can
+  bind only the codec component owned by `LfmModel`.
 
 ## Remaining LFM2 follow-ons
 
@@ -204,18 +202,15 @@ the row group without widening or packing, preserves causal KV/ShortConv commit
 order, and chunks longer prompts (including 4+3 tails) under one conversation
 execution claim.
 
-### F2 — Physical kcoro audio-device adapter
+### F2 — Physical kcoro audio-device adapter — landed
 
-Keep platform device callbacks in Rust, but have them reserve/fill capture leases
-and drain playback leases directly. Playback now drains its borrowed lease
-through `PcmSink` without `Vec<f32>`, `Reply::Audio`, or native
-`VoiceEvent::Audio` projection. Capture no longer materializes an utterance
-`Vec<f32>` or copies again inside the inference worker: `CaptureDock` fills the
-final lease from a borrowed VAD slice and queues only its ticket. Delete the
-remaining mic-ring/VAD-buffer copy by separating callback-filled capture
-publication from the Rust-VAD turn-commit command.
-Preserve bounded reliable transcript/control delivery;
-only waveform/telemetry observation may be lossy.
+Platform callbacks remain in Rust but own only opaque non-cloneable endpoints.
+The capture callback passes its ephemeral interleaved span to native format
+conversion, which writes one sealed circular-arena reservation and publishes a
+typed chunk or XRUN edge. The playback callback resolves a retained native span,
+renders directly into the device buffer, and releases its exact lease. Native
+Sesame policy commits turns; bounded transcripts/control remain reliable while
+waveform telemetry may be lossy.
 
 ### Subsequent — Native Moshi
 
@@ -252,17 +247,15 @@ offline/oracle-only and cannot serve as fallback.
 
 ```text
 src/
-  lib.rs                    native-only exports; oracle modules feature-gated
+  lib.rs                    native-only exports
   ffi.rs                    private opaque native declarations
-  native_voice.rs           RAII lifecycle + current PCM/event adapter
+  native_voice.rs           RAII lifecycle + opaque callback endpoints/events
   voice_api.rs              product VoiceEngine/VoiceEvent boundary
-  runtime/realtime.rs       generic host worker; Candle engine is oracle-only
-  runtime/voice_runtime.rs  platform audio, VAD, endpointing, control
-  runtime/resample.rs       host/device compatibility; oracle math gated
+  runtime/voice_runtime.rs  platform callbacks, kcoro host service, control/telemetry
   utils.rs                  model location/download helpers
 ```
 
 `src/model/**`, processor/training code, direct numerical Rust rims, Candle, and
-Moshi remain reachable only from the non-release oracle graph. Git history is the
-reference for deleted production ownership; the oracle is not an alternate
-inference runtime.
+Moshi are absent from this crate. The separate `liquid-audio-oracle` workspace
+crate owns oracle dependencies; Git history is the reference for deleted
+production ownership, not an alternate inference runtime.

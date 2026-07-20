@@ -13,7 +13,7 @@ _Static_assert(sizeof(LfmModelMemoryV1) == 96, "LfmModelMemoryV1 ABI");
 _Static_assert(sizeof(LfmSamplingPolicyV1) == 32, "LfmSamplingPolicyV1 ABI");
 _Static_assert(sizeof(LfmConversationOptionsV1) == 120,
                "LfmConversationOptionsV1 ABI");
-_Static_assert(sizeof(LfmSessionConfigV1) == 96, "LfmSessionConfigV1 ABI");
+_Static_assert(sizeof(LfmSessionConfigV1) == 88, "LfmSessionConfigV1 ABI");
 _Static_assert(sizeof(LfmTurnEventV1) == 16, "LfmTurnEventV1 ABI");
 _Static_assert(sizeof(LfmEventV1) == 72, "LfmEventV1 ABI");
 _Static_assert(offsetof(LfmEventV1, ticket) == 32, "LfmEventV1 ticket offset");

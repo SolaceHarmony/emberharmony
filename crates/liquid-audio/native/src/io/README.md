@@ -89,8 +89,8 @@ Native Mimi now binds the Codec catalog of the model-owned combined image throug
 one model-lifetime `MimiDecodePlan`; it neither reopens the codec file nor owns a
 duplicate image. Each conversation gets a `MimiDecodeState` containing only KV,
 convolution carry, and scratch. Formula-derived codebooks and RoPE data live once
-in the sealed plan. `mimi_decoder_new_from_file` remains only for isolated parity
-tests. Mimi consumes checkpoint-layout F32 bytes directly, including unaligned
+in the sealed plan. The standalone file-owning parity decoder is deleted. Mimi
+consumes checkpoint-layout F32 bytes directly, including unaligned
 views, and reports formula-derived immutable bytes separately from its always-zero
 compatibility-copy count.
 

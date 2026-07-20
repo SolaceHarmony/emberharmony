@@ -568,11 +568,12 @@ directly, reuses each loaded weight vector across the group, and commits native
 KV/ShortConv state in order. Longer inputs are chunked without exposing an
 embedding plane to Rust.
 
-The data and typed-executor boundary is now closed: one model-correlated audio
-encode request carries resample, frontend, and whole-Conformer/adapter over
-borrowed pointer spans and sealed conversation workspace. The remaining boundary
-is recurrence ownership: the native coordinator still submits and waits for this
-request synchronously instead of advancing it through a route instance.
+The data, typed-executor, and recurrence boundaries are closed: one
+model-correlated audio encode request carries resample, frontend, and
+whole-Conformer/adapter over borrowed pointer spans and sealed conversation
+workspace. The native route instance retains that request and advances only
+from exact completion edges; neither Rust nor a coordinator-owned waiter
+shepherds its stages.
 
 The route ABI reserves an internal `SequenceMixerDesc`, not a public tensor or
 operator language. LFM2 binds its existing ShortConv (`K=3`, causal halo two)
@@ -582,43 +583,37 @@ Hyena-family model whose checkpoint and oracle define that math. It is not a
 drop-in LFM2 attention replacement, and speculative LFM2 context extension is a
 separate research track.
 
-### 3.6 The docks (I/O plane) — kcoro-rs, no std channels
+### 3.6 The docks (I/O plane) — opaque native spans, no std channels
 
-The dock is where Rust std channels are dumped. Every hand-off below is a
-kcoro-rs `ring` (bounded SPSC, `SendFuture`/`RecvFuture` that park on wake) or a
-kcoro-rs `promise` (exact-once completion), so the audio path suspends and
-resumes on the same expected-value substrate the lanes use — never on `mpsc`,
-`crossbeam`, or a polling loop. kcoro-rs owns policy and lifecycle only; it never
-touches PCM/weights/math and never runs on a compute lane or an audio callback
-(its own contract).
+The safe Rust dock owns platform callback lifetimes and the setup-time kcoro
+notifier leases; it does not own PCM storage, speech policy, or a generic future
+ring. Every progress-bearing handoff is a bounded native record plus a retained
+edge. No `mpsc`, Crossbeam channel, promise waiter, polling loop, or standard
+`Waker` participates.
 
-- **Mic in — native chunked capture, NOT turn-batched.** The device callback
-  writes PCM into a bounded ring; small fixed **chunks** are leased
-  (`kc_descriptor` BORROWED) to the native session *as they arrive*, and the
-  native session runs VAD, resample, and mel on the streaming chunks and detects
-  turn boundaries itself. Rust does **not** accumulate a whole utterance and hand
-  it over at turn-close — that turn-batching is the defect this replaces; Rust
-  only moves chunks and holds the lease until the native side signals consumed.
-  The callback stays a thin writer and does not run kcoro-rs.
-- **Speaker out — native chunked playback.** Each Mimi frame pass publishes its
-  PCM chunk into a descriptor-leased ring as it is produced; the Rust output dock
-  drains chunks via a kcoro-rs `recv` future → `StreamingPcmResampler` (host
-  rate-match, a permanent Rust surface) → device. Playback is continuous per
-  chunk, not a whole-reply buffer. No `Tensor`, no `.wav`, no std channel crosses
-  this seam.
+- **Mic in — native circular capture, not turn-batched.** The device callback
+  passes its ephemeral interleaved hardware span to the non-cloneable
+  `CaptureSink`. Native code reserves a generation-checked region of the sealed
+  circular capture arena, converts/downmixs directly into that destination, and
+  publishes one typed chunk record containing stream, sequence, sample cursor,
+  epoch, ticket, region generation, format, and gap flags. The exact Sesame
+  detector, sample-clock turn policy, resampler, frontend, and Conformer consume
+  native views. Rust retains no utterance or PCM ring.
+- **Speaker out — native chunked playback.** Mimi and the native playback
+  resampler write the final device-rate PCM reservation. The non-cloneable
+  `PlaybackSource` resolves that retained lease only inside the hardware
+  callback and renders directly into the ephemeral device span. Ticket, epoch,
+  lease, and buffer generation survive through final callback release.
 
-The ~57 std-channel sites in the current voice runtime are retired here; the
-`ThreadManager`/`done_rx` polling that motivated the coroutine work in the first
-place is replaced by ring/promise waits.
+These are the two unavoidable HAL movements. No `Tensor`, `Vec<f32>`, `.wav`,
+stdout payload, standard channel, or extra resampler crosses the dock.
 
 ### 3.7 Host collapse
 
-`NativeEngine.pass_lock` now protects only the blocking compatibility rim; the
-private exact-CQ proof can use the capacity-2 per-ticket slots directly. Once the
-session drives recurrence through immutable route instances, the lock and every
-blocking `submit_pass` rim are deleted. Rust's engine
-surface collapses to: create session, submit TURN ticket with a mic lease,
-receive PCM leases, submit control tickets. That is spec 10's end state.
+The blocking compatibility rim and host-owned pass lock are deleted. Rust's
+engine surface is opaque lifecycle, transfer of the sole capture/playback
+endpoints, retained event/control edges, and bounded observer records. Route
+labels, tokens, numerical views, recurrence, and model state do not cross it.
 
 ---
 
@@ -685,10 +680,12 @@ entire ready predicate is empty.
   change that arithmetic, but deleting the duplicate keeps the working set from
   thrashing and keeps weights bf16 (half the bytes) in `(N,K)` (no repack). The
   win from zero-copy is measured in GB/s of avoided **activation** traffic.
-- **Time is observation only.** Tickets and doorbells have no deadline-driven
-  transition or timeout cause. Latency timestamps and device-liveness watchdogs
-  may report a separate telemetry/control fault, but elapsed time never admits,
-  completes, publishes, or advances numerical work.
+- **Deadlines are correlated supervision or speech-policy edges.** A monotonic
+  one-shot may make the owning supervisor or pause-policy continuation runnable.
+  It never fabricates numerical completion or success. Sesame pause commit is
+  dual-gated by sample evidence and the matching pause-generation deadline;
+  numerical quorum expiry races completion through one terminal claim and is a
+  fatal fault if it wins. Latency timestamps remain observation only.
 - **Failure is terminal, not degraded.** No fallback. A stale command rejected
   before admission or an unmet gate is a terminal completion with a cause. An
   already accepted stale-epoch pass settles under its commit policy but cannot

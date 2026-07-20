@@ -1,3 +1,54 @@
+// flashkern_rope.S — RoPE cos/sin TABLE GENERATION (x86-64).
+//
+// x86-64 twin of kernels/aarch64/flashkern_rope.S. The computation is identical
+// and was verified instruction-for-instruction; only register preservation
+// differs (see ABI note). This file builds the tables only — the rotation that
+// consumes them is `lfm_bf16_rope_neox` in flashkern_math.S. Precision seam:
+// tables are generated here in F32 and narrowed to BF16 before that read.
+//
+// WHAT IS COMPUTED, per position `p` and pair index `i` in [0, dim/2):
+//
+//     exponent = (2*i) / dim
+//     freq     = powf(theta, exponent)
+//     angle    = p / freq                 // i.e. p * theta^-(2i/dim)
+//     cos[p][i] = cosf(angle)
+//     sin[p][i] = sinf(angle)
+//
+// Both planes are [n_pos][dim/2] row-major F32. `angle` DIVIDES by the power
+// rather than multiplying a precomputed reciprocal — those differ in the last
+// bits and the division is the contract.
+//
+// LIBM DEPENDENCY — the one thing to know about this file:
+//
+// It calls `powf`, `cosf`, `sinf` from the platform libm — hence the frame,
+// since these are not leaf routines. Those are NOT bit-identical across platforms:
+// Apple libm, glibc and musl may each return different last bits. The tables are
+// reproducible on a given platform but not guaranteed across them, so any
+// end-to-end byte oracle is implicitly platform-tied through this file.
+//
+// THREE files in the kernel set call libm and are therefore platform-tied:
+// this one (powf/cosf/sinf), flashkern_frontend.S (logf), and
+// flashkern_conformer.S (expf/erff/sinf/cosf — the largest user by far).
+// math/prng/sampler/sesame are libm-free and bit-identical everywhere. If a
+// hash differs between machines with everything else equal, those three are
+// where to look.
+//
+// ABI NOTE (the only structural difference from AArch64): neither SysV nor
+// Win64 preserves xmm registers across a call, so `theta` and `angle` are
+// spilled to the stack slots LFM_THETA/LFM_ANGLE around the libm calls. The
+// AArch64 twin keeps them in callee-saved d8/d9 instead. Same values, same
+// order; only the holding location differs.
+//
+// VALIDATION (no silent coercion):
+//   -EINVAL (-22)     null plane, odd `dim`, or theta <= 0 / NaN
+//   -EOVERFLOW (-75)  `lfm_rope_range_f32` only: pos0 + (n_pos-1) wraps
+//
+// INVARIANT, and it is gated: `lfm_rope_range_f32` with pos0 == 0 must produce
+// bit-identical output to `lfm_rope_table_f32`. Proven by
+// `absolute_rope_range_is_bit_exact_with_the_zero_based_table` in
+// tests/native_context_rollover.rs — what keeps KV rollover from silently
+// re-phasing the cache against a differently-built table.
+
 #include "lfm_asm_visibility.h"
 
 #ifdef __APPLE__
@@ -9,6 +60,10 @@
 #endif
 
 .text
+
+// int lfm_rope_table_f32(uint64_t n_pos, uint64_t dim,
+//                        float *cos, float *sin, float theta)
+// Zero-based table: positions 0 .. n_pos-1. Returns 0, or -EINVAL.
 .p2align 4
 .globl LFM_SYM(lfm_rope_table_f32)
 LFM_PRIVATE(LFM_SYM(lfm_rope_table_f32))
@@ -114,6 +169,13 @@ LFM_SYM(lfm_rope_table_f32):
     movl    $-22, %eax
     ret
 
+// int lfm_rope_range_f32(uint64_t pos0, uint64_t n_pos, uint64_t dim,
+//                        float *cos, float *sin, float theta)
+// Absolute-position window: positions pos0 .. pos0+n_pos-1. This is the KV
+// rollover path — once the context window slides, entries must be re-phased at
+// their ABSOLUTE positions rather than re-based to zero, or the cache and the
+// incoming tokens disagree about phase.
+// Returns 0, -EINVAL, or -EOVERFLOW when pos0 + (n_pos-1) wraps.
 .p2align 4
 .globl LFM_SYM(lfm_rope_range_f32)
 LFM_PRIVATE(LFM_SYM(lfm_rope_range_f32))

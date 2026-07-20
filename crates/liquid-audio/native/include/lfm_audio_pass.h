@@ -20,9 +20,9 @@
 extern "C" {
 #endif
 
-#define LFM_AUDIO_PASS_ABI 1u
+#define LFM_AUDIO_PASS_ABI 2u
 
-typedef struct LfmAudioEncodePassV1 {
+typedef struct LfmAudioEncodePassV2 {
     uint32_t size;
     uint32_t abi_version;
 
@@ -33,22 +33,24 @@ typedef struct LfmAudioEncodePassV1 {
     const LfmConformer *conformer;
     LfmConformerWorkspace *conformer_workspace;
 
-    const float *pcm;
-    uint64_t sample_count;
+    // Inline fixed metadata: route admission copies this descriptor by value,
+    // never a pointer to a caller-owned descriptor array. The sample bytes are
+    // retained read-only leases until exact ticket collection.
+    LfmF32SpanChain pcm;
     float *resampled;
     uint64_t resampled_capacity;
     uint16_t *mel;
     uint64_t mel_capacity;
     uint16_t *adapted;
     uint64_t adapted_capacity;
-} LfmAudioEncodePassV1;
+} LfmAudioEncodePassV2;
 
 // Submit one retained PCM span through resample -> frontend -> Conformer. The
 // complete chain is one typed bridge ticket. `model_id` selects the resident
 // backbone plan solely for lifetime/correlation validation; weight bytes remain
 // reachable through `pass->conformer` as immutable views.
 LFM_INTERNAL_API int lfm_engine_audio_encode_submit(
-    void *engine, uint64_t model_id, const LfmAudioEncodePassV1 *pass,
+    void *engine, uint64_t model_id, const LfmAudioEncodePassV2 *pass,
     uint64_t *out_adapted_values, LfmAudioRouteNotify notify,
     void *notify_context, LfmAudioRouteHandle *out_handle);
 

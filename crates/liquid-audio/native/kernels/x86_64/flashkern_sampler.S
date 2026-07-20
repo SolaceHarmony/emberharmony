@@ -9,7 +9,60 @@
 .intel_syntax noprefix
 .text
 
-/* uint32_t lfm_sampler_argmax_f32(const float *x, size_t count) */
+/*
+ * flashkern_sampler.S — x86-64. Token selection: argmax, softmax-with-cutoff,
+ * and the CDF walk. Feeds on the uniform draw from flashkern_prng.S.
+ *
+ * x86-64 twin of kernels/aarch64/flashkern_sampler.S. Same five entry points,
+ * byte-identical exp constants, and the same three guarantees below — but the
+ * NaN guarantee costs real instructions here (see NaN SCRUB).
+ *
+ * DETERMINISM CONTRACT:
+ *
+ * 1. TIE-BREAK IS LOWEST INDEX. Both argmax leaves run TWO passes: a vector
+ *    reduction for the maximum VALUE, then a scan from index 0 for the first
+ *    element equal to it (.Largmax_*_scan). Fusing them would return whichever
+ *    lane saw the max first, making the answer depend on vector width and loop
+ *    peeling. Ties are common in quantised logits.
+ *
+ * 2. NaN CANNOT WIN — and this is where the architectures differ in MEANS, not
+ *    in result. AArch64 gets it free from `fmaxnm` (IEEE maxNum: a NaN operand
+ *    yields the other value). x86 `maxps`/`maxss` do the OPPOSITE — on an
+ *    unordered compare they return the SECOND operand, so a NaN lane would
+ *    capture the maximum and pin generation to one token. The loop therefore
+ *    scrubs NaN before every max:
+ *
+ *        movaps   xmm2, xmm1
+ *        cmpordps xmm2, xmm2     ; ordered mask: all-ones where NOT NaN
+ *        andps    xmm1, xmm2     ; keep the real lanes
+ *        andnps   xmm2, xmm3     ; xmm3 holds broadcast -inf
+ *        orps     xmm1, xmm2     ; NaN lanes become -inf
+ *        maxps    xmm0, xmm1
+ *
+ *    xmm3 is kept live across the whole loop solely as that -inf source. This is
+ *    a hand-built fmaxnm; deleting it as "redundant masking" silently
+ *    reintroduces the NaN-wins bug.
+ *
+ * 3. NO LIBM. The exponential is the local .Lsampler_exp_f32 below — f32 range
+ *    reduction plus a degree-six polynomial, entirely in this object, with
+ *    constants byte-identical to the AArch64 twin. Unlike flashkern_rope.S
+ *    (whose tables inherit the platform libm's last bits), sampling is
+ *    bit-identical on every machine and OS.
+ *
+ * PRECISION SPLIT. Logits are handled at model precision (f32 and bf16 leaves);
+ * the uniform draw indexing the distribution is a double built from 53 PRNG
+ * bits. Narrowing the draw to bf16 resolution would make any token with mass
+ * below ~1/256 unreachable — truncating the tail off the distribution rather
+ * than merely rounding it.
+ */
+
+/*
+ * uint32_t lfm_sampler_argmax_f32(const float *x, size_t count)
+ *
+ * Pass 1: NaN-scrubbed 4-lane `maxps`, then movhlps/shufps horizontal reduce,
+ * then scalar tail. Pass 2: linear scan for the FIRST index equal to that
+ * maximum. Accumulator starts at 0xff800000 (-inf). count == 0 returns 0.
+ */
 .p2align 4
 .globl LFM_SYM(lfm_sampler_argmax_f32)
 LFM_PRIVATE(LFM_SYM(lfm_sampler_argmax_f32))
@@ -78,7 +131,13 @@ LFM_SYM(lfm_sampler_argmax_f32):
 .Largmax_f32_done:
     ret
 
-/* uint32_t lfm_sampler_argmax_bf16(const uint16_t *x, size_t count) */
+/*
+ * uint32_t lfm_sampler_argmax_bf16(const uint16_t *x, size_t count)
+ *
+ * As the f32 leaf, including the NaN scrub and the two-pass lowest-index
+ * tie-break. BF16 lanes are lifted to F32 by shifting into the high half —
+ * exact and lossless, never a conversion instruction.
+ */
 .p2align 4
 .globl LFM_SYM(lfm_sampler_argmax_bf16)
 LFM_PRIVATE(LFM_SYM(lfm_sampler_argmax_bf16))
@@ -158,6 +217,21 @@ LFM_SYM(lfm_sampler_argmax_bf16):
  * The exp-sum leaves use the private f32 range-reduced polynomial below. All
  * traversal, scaling, thresholding, exponentiation, destination writes, and
  * ordered reduction are hand-written assembly.
+ *
+ * One fused pass producing the unnormalised softmax weights and their sum:
+ *
+ *     v = x[i] * scale                 // scale = 1/temperature
+ *     if (v < threshold)  w = 0        // top-k / top-p cutoff, no exp taken
+ *     else                w = exp(v - maximum)
+ *     weights[i] = w ;  sum += w
+ *
+ * Subtracting `maximum` is the overflow guard, so the exp argument is always
+ * <= 0 — which is why the local exp has no overflow path. The threshold is
+ * compared against the SCALED logit, before max-subtraction, so a caller's
+ * cutoff is expressed in the same units as its temperature.
+ *
+ * `sum` accumulates sequentially in F32, in index order. That ordering is the
+ * contract: prefix_pick must reproduce these partial sums exactly.
  */
 .p2align 4
 .globl LFM_SYM(lfm_sampler_exp_sum_f32)
@@ -224,6 +298,23 @@ LFM_SYM(lfm_sampler_exp_sum_f32):
     ret
 
 .p2align 4
+/*
+ * float lfm_sampler_exp_sum_bf16(const uint16_t *x, float *weights,
+ *                                size_t count, uint16_t bf16_scale,
+ *                                float maximum, float threshold)
+ *
+ * As the f32 leaf, with one deliberate extra rounding step: after v = x[i] *
+ * scale, the product is rounded BACK to BF16 precision (open-coded
+ * round-to-nearest-even, the same sequence as LFM_RNE_WIDEN in
+ * flashkern_math.S) BEFORE the threshold compare and the exp.
+ *
+ * Keeping that product in full F32 would be more accurate and WRONG: the
+ * reference materialises the scaled logit as BF16, so both the cutoff decision
+ * and the exp argument must see the rounded value. `scale` arrives as BF16 bits
+ * and is lifted by shift, so the multiply itself has BF16 inputs.
+ *
+ * Weights and their sum remain F32 — only the scaled logit is narrowed.
+ */
 .globl LFM_SYM(lfm_sampler_exp_sum_bf16)
 LFM_PRIVATE(LFM_SYM(lfm_sampler_exp_sum_bf16))
 LFM_SYM(lfm_sampler_exp_sum_bf16):
@@ -304,7 +395,26 @@ LFM_SYM(lfm_sampler_exp_sum_bf16):
     pop     rbp
     ret
 
-/* uint32_t lfm_sampler_prefix_pick(const float *weights, size_t count, float target) */
+/*
+ * uint32_t lfm_sampler_prefix_pick(const float *weights, size_t count,
+ *                                  float target)
+ *
+ * The CDF walk. Accumulates `weights` in index order and returns the first index
+ * where the running sum exceeds `target` (the uniform draw scaled by the total
+ * from exp_sum). Accumulation order matches exp_sum's exactly — both walk low to
+ * high in F32 — so the partial sums here reproduce the total computed there.
+ *
+ * SHORTFALL GUARANTEE — the reason a "last positive index" register is carried:
+ *
+ * `target` derives from a double uniform scaled by an F32 sum, so rounding can
+ * leave it a few ULP ABOVE the final running sum, and the loop falls out without
+ * ever triggering. Rather than returning 0 or count-1, the last index whose
+ * weight was STRICTLY POSITIVE is returned.
+ *
+ * This makes it impossible to select a token the threshold cut off (weight 0)
+ * purely because of a rounding shortfall — a bug invisible in aggregate
+ * statistics that would occasionally emit a token the policy had excluded.
+ */
 .p2align 4
 .globl LFM_SYM(lfm_sampler_prefix_pick)
 LFM_PRIVATE(LFM_SYM(lfm_sampler_prefix_pick))

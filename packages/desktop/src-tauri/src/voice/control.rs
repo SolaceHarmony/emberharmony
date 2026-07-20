@@ -292,10 +292,9 @@ pub enum Role {
 
 /// An event streamed to the webview during a voice session.
 ///
-/// Covers both the Phase-1 turn flow (the Liquid AI demo: `Transcript` streams the reply text,
-/// `AudioClip` delivers the decoded reply for an `<audio>` player) and the Phase-2 live flow
-/// (`Level` drives the visualizer since native audio never enters the webview as a track —
-/// see `FRONTEND_DESIGN.md`).
+/// Transcript and state records cross the UI boundary. Native PCM remains in
+/// the playback dock; `Level` is the lossy visualizer projection described in
+/// `FRONTEND_DESIGN.md`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum VoiceEvent {
@@ -306,49 +305,10 @@ pub enum VoiceEvent {
     /// audio amplitude (RMS) for the bar visualizer — the native path has no
     /// `MediaStreamTrack` in the webview, so the loop emits this instead.
     Level { rms: f32 },
-    /// the decoded audio reply as a WAV clip (turn mode → inline `<audio>` player).
-    AudioClip { wav: Vec<u8>, ms: u32 },
     /// the session ended (cleanly, or with a reason)
     Ended { reason: Option<String> },
     /// an error occurred
     Error { message: String },
-}
-
-/// The Liquid AI demo's three modes — same model, different system prompt + generate path.
-/// (`audio-model.js`: `Perform ASR.` / `Perform TTS. Use the UK female voice.` /
-/// `Respond with interleaved text and audio.`)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum TurnMode {
-    /// audio in → text out (transcription). `generate_sequential`, text only.
-    Asr,
-    /// text in → audio out (speech). `generate_sequential`, text then audio.
-    Tts,
-    /// audio (± text) in → interleaved text + audio out. `generate_interleaved`.
-    Interleaved,
-}
-
-impl TurnMode {
-    /// The demo's per-mode system prompt (verbatim from `audio-model.js`).
-    pub fn system_prompt(self) -> &'static str {
-        match self {
-            TurnMode::Asr => "Perform ASR.",
-            TurnMode::Tts => "Perform TTS. Use the UK female voice.",
-            TurnMode::Interleaved => "Respond with interleaved text and audio.",
-        }
-    }
-
-    /// The mode's decoding regime from Settings. Defaults per mode mirror the
-    /// demo (`audio-model.js`): ASR greedy/100, TTS text 0.7 + audio
-    /// 0.8/top-64/1024 — except the interleaved budget, which is OUR raised
-    /// 8192 (the demo ships `DEFAULT_MAX_TOKENS_AUDIO = 1024` ≈ 1 min).
-    pub fn sampling(self, lfm2: &settings::Lfm2Settings) -> &settings::Lfm2ModeSampling {
-        match self {
-            TurnMode::Asr => &lfm2.asr,
-            TurnMode::Tts => &lfm2.tts,
-            TurnMode::Interleaved => &lfm2.interleaved,
-        }
-    }
 }
 
 /// Start a voice session for the configured provider.

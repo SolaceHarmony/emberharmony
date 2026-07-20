@@ -10,10 +10,29 @@ use std::ffi::c_void;
 use std::marker::PhantomData;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU64, Ordering};
 use std::sync::Arc;
 
 const ABI_VERSION: u32 = 1;
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+const ECANCELED: i32 = 89;
+#[cfg(target_os = "freebsd")]
+const ECANCELED: i32 = 85;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const ECANCELED: i32 = 125;
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "linux",
+    target_os = "android"
+)))]
+const ECANCELED: i32 = 125;
+
+const SERVICE_TERMINAL_NORMAL: u64 = 1;
+const SERVICE_TERMINAL_FAULT: u64 = 1 << 63;
+const EBUSY: i32 = 16;
 
 #[repr(C)]
 struct NativeRuntimeConfig {
@@ -56,6 +75,7 @@ unsafe extern "C" {
     fn kc_runtime_create(config: *const NativeRuntimeConfig, out: *mut *mut c_void) -> i32;
     fn kc_runtime_start(runtime: *mut c_void) -> i32;
     fn kc_runtime_request_stop(runtime: *mut c_void);
+    fn kc_runtime_join_all(runtime: *mut c_void) -> i32;
     fn kc_runtime_join(runtime: *mut c_void) -> i32;
     fn kc_runtime_destroy(runtime: *mut c_void) -> i32;
 
@@ -89,6 +109,146 @@ fn status(code: i32) -> Result<(), i32> {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RuntimeConfig {
     pub workers: u32,
+}
+
+/// Identity-free reason published when a retained Rust service cannot make
+/// further progress safely.
+///
+/// Product ticket, epoch, and route identity belong to the supervisor that
+/// consumes this edge. The generic kcoro adapter reports only its local cause
+/// and the native status, if one exists.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ServiceFaultCause {
+    InitializerPanic = 1,
+    CallbackPanic = 2,
+    ReadyAgainFailed = 3,
+    CompletionFailed = 4,
+    OwnerFinalizerPanic = 5,
+    InternalInvariant = 6,
+}
+
+/// One terminal generic service fault record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ServiceFault {
+    pub cause: ServiceFaultCause,
+    /// Native negative errno for a scheduling failure, or zero for a Rust
+    /// panic where [`cause`](Self::cause) carries the complete generic reason.
+    pub status: i32,
+}
+
+/// One-shot terminal state of a fault edge.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ServiceTerminal {
+    Pending,
+    Normal,
+    Fault(ServiceFault),
+}
+
+struct ServiceFaultState {
+    /* One atomic word makes normal-vs-fault and competing fault publishers a
+     * single linearization point. Bit 63 is the fault tag, bits 32..62 carry
+     * the generic cause, and the low 32 bits preserve the signed status. */
+    terminal: AtomicU64,
+    /* A fault record has one producer owner. Cloned handles are observers;
+     * they must not turn one correlation edge into a fan-in mailbox. */
+    installed: AtomicBool,
+}
+
+/// A setup-time fault edge from one watched service to a separate supervisor.
+///
+/// A supervisor mints this through [`ServiceSetup::fault_edge`], retains one
+/// clone to consume the fixed record, and installs another clone on a watched
+/// service with one of the `*_with_fault_edge` factories. The watched callback
+/// publishes with one atomic CAS and then rings the supervisor's prebound
+/// realtime notifier. It never invokes the supervisor callback inline.
+///
+/// The edge deliberately contains no product identity. A product supervisor
+/// correlates it using the durable ticket state that already owns the watched
+/// service. Exactly one watched service may install an edge; clones exist only
+/// so that service and supervisor can retain the same record. The supervisor
+/// must remain started until the watched service has retired, ensuring its
+/// prebound notifier remains an admitted publication target through
+/// `owner_fini`.
+#[derive(Clone)]
+pub struct ServiceFaultEdge {
+    state: Arc<ServiceFaultState>,
+    notifier: SharedRealtimeNotifier,
+}
+
+impl ServiceFaultEdge {
+    fn new(notifier: SharedRealtimeNotifier) -> Self {
+        Self {
+            state: Arc::new(ServiceFaultState {
+                terminal: AtomicU64::new(0),
+                installed: AtomicBool::new(false),
+            }),
+            notifier,
+        }
+    }
+
+    #[inline]
+    fn claim(&self) -> Result<(), i32> {
+        self.state
+            .installed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| ())
+            .map_err(|_| -EBUSY)
+    }
+
+    #[inline]
+    fn release_failed_claim(&self) {
+        self.state.installed.store(false, Ordering::Release);
+    }
+
+    /// Observe the terminal record published before service retirement.
+    pub fn terminal(&self) -> ServiceTerminal {
+        let terminal = self.state.terminal.load(Ordering::Acquire);
+        if terminal == 0 {
+            return ServiceTerminal::Pending;
+        }
+        if terminal == SERVICE_TERMINAL_NORMAL {
+            return ServiceTerminal::Normal;
+        }
+        let cause = match ((terminal >> 32) & 0x7fff_ffff) as u32 {
+            1 => ServiceFaultCause::InitializerPanic,
+            2 => ServiceFaultCause::CallbackPanic,
+            3 => ServiceFaultCause::ReadyAgainFailed,
+            4 => ServiceFaultCause::CompletionFailed,
+            5 => ServiceFaultCause::OwnerFinalizerPanic,
+            _ => ServiceFaultCause::InternalInvariant,
+        };
+        ServiceTerminal::Fault(ServiceFault {
+            cause,
+            status: terminal as u32 as i32,
+        })
+    }
+
+    #[inline]
+    fn publish_normal(&self) {
+        let _ = self.state.terminal.compare_exchange(
+            0,
+            SERVICE_TERMINAL_NORMAL,
+            Ordering::Release,
+            Ordering::Acquire,
+        );
+    }
+
+    #[inline]
+    fn publish_fault(&self, cause: ServiceFaultCause, status: i32) {
+        let terminal = SERVICE_TERMINAL_FAULT | ((cause as u64) << 32) | status as u32 as u64;
+        if self
+            .state
+            .terminal
+            .compare_exchange(0, terminal, Ordering::Release, Ordering::Acquire)
+            .is_ok()
+        {
+            /* This is the preallocated native atomics-only edge. It publishes
+             * runnable state for a separate supervisor continuation; it does
+             * not call that continuation, allocate, lock, wait, or unwind. */
+            let _ = self.notifier.notify();
+        }
+    }
 }
 
 struct RuntimeInner {
@@ -179,6 +339,16 @@ impl Runtime {
         self.inner.join()
     }
 
+    /// Observe natural completion of every retained continuation.
+    ///
+    /// This is administrative settlement on the runtime's expected-value
+    /// lifecycle doorbell. It neither closes admission nor advances a task;
+    /// producers and retained callbacks remain the only progress edges.
+    #[inline]
+    pub fn join_all(&self) -> Result<(), i32> {
+        status(unsafe { kc_runtime_join_all(self.inner.raw.as_ptr()) })
+    }
+
     /// Stop and join this handle. Native destruction occurs when services have
     /// released their internal runtime ownership tokens.
     pub fn destroy(self) -> Result<(), i32> {
@@ -233,9 +403,41 @@ impl Runtime {
         F: FnMut() -> ServiceOutcome + Send + 'static,
         B: FnOnce(&ServiceSetup) -> Result<(F, T), i32>,
     {
+        self.state_service_factory_inner(None, build)
+    }
+
+    /// Build a retained service whose terminal adapter faults wake a separate
+    /// supervisor continuation through a prebound edge.
+    pub fn state_service_factory_with_fault_edge<F, B, T>(
+        &self,
+        fault: ServiceFaultEdge,
+        build: B,
+    ) -> Result<(Service, T), i32>
+    where
+        F: FnMut() -> ServiceOutcome + Send + 'static,
+        B: FnOnce(&ServiceSetup) -> Result<(F, T), i32>,
+    {
+        fault.claim()?;
+        let result = self.state_service_factory_inner(Some(fault.clone()), build);
+        if result.is_err() {
+            fault.release_failed_claim();
+        }
+        result
+    }
+
+    fn state_service_factory_inner<F, B, T>(
+        &self,
+        fault: Option<ServiceFaultEdge>,
+        build: B,
+    ) -> Result<(Service, T), i32>
+    where
+        F: FnMut() -> ServiceOutcome + Send + 'static,
+        B: FnOnce(&ServiceSetup) -> Result<(F, T), i32>,
+    {
         let context = Box::new(Callback {
             callback: UnsafeCell::new(None),
             initializer: UnsafeCell::new(None),
+            fault,
             panicked: AtomicBool::new(false),
             owner_local: false,
             owner_initialized: AtomicBool::new(false),
@@ -295,9 +497,43 @@ impl Runtime {
         F: FnMut() -> ServiceOutcome + 'static,
         B: FnOnce(&ServiceSetup) -> Result<(I, T), i32>,
     {
+        self.owner_state_service_factory_inner(None, build)
+    }
+
+    /// Build fixed-owner state whose initializer/callback/finalizer faults
+    /// resume a separate supervisor continuation.
+    pub fn owner_state_service_factory_with_fault_edge<I, F, B, T>(
+        &self,
+        fault: ServiceFaultEdge,
+        build: B,
+    ) -> Result<(Service, T), i32>
+    where
+        I: FnOnce() -> F + Send + 'static,
+        F: FnMut() -> ServiceOutcome + 'static,
+        B: FnOnce(&ServiceSetup) -> Result<(I, T), i32>,
+    {
+        fault.claim()?;
+        let result = self.owner_state_service_factory_inner(Some(fault.clone()), build);
+        if result.is_err() {
+            fault.release_failed_claim();
+        }
+        result
+    }
+
+    fn owner_state_service_factory_inner<I, F, B, T>(
+        &self,
+        fault: Option<ServiceFaultEdge>,
+        build: B,
+    ) -> Result<(Service, T), i32>
+    where
+        I: FnOnce() -> F + Send + 'static,
+        F: FnMut() -> ServiceOutcome + 'static,
+        B: FnOnce(&ServiceSetup) -> Result<(I, T), i32>,
+    {
         let context = Box::new(Callback {
             callback: UnsafeCell::new(None),
             initializer: UnsafeCell::new(None),
+            fault,
             panicked: AtomicBool::new(false),
             owner_local: true,
             owner_initialized: AtomicBool::new(false),
@@ -351,6 +587,7 @@ impl Drop for Runtime {
 struct Callback {
     callback: UnsafeCell<Option<Box<ServiceTask>>>,
     initializer: UnsafeCell<Option<Box<OwnerInitializer>>>,
+    fault: Option<ServiceFaultEdge>,
     panicked: AtomicBool,
     owner_local: bool,
     owner_initialized: AtomicBool,
@@ -365,6 +602,32 @@ struct Callback {
 unsafe impl Send for Callback {}
 unsafe impl Sync for Callback {}
 
+#[inline]
+fn publish_fault(context: &Callback, cause: ServiceFaultCause, status: i32) {
+    if let Some(fault) = context.fault.as_ref() {
+        fault.publish_fault(cause, status);
+    }
+}
+
+#[inline]
+fn scheduling_failed(context: &Callback, cause: ServiceFaultCause, status: i32) {
+    if status == 0 || (status == -ECANCELED && cause == ServiceFaultCause::ReadyAgainFailed) {
+        return;
+    }
+    context.reschedule_error.store(status, Ordering::Release);
+    publish_fault(context, cause, status);
+    /* An unexpected local scheduling failure must not leave a silent dormant
+     * service. stop is an atomics-only closure edge; finalization remains on
+     * the permanent owner. */
+    unsafe { kc_service_request_stop(context.service.load(Ordering::Acquire)) };
+}
+
+#[inline]
+fn complete_after_fault(context: &Callback) {
+    let status = unsafe { kc_service_complete_current(context.service.load(Ordering::Acquire)) };
+    scheduling_failed(context, ServiceFaultCause::CompletionFailed, status);
+}
+
 unsafe extern "C" fn initialize(context: *mut c_void) {
     let context = unsafe { &*context.cast::<Callback>() };
     context.owner_initialized.store(true, Ordering::Release);
@@ -376,12 +639,9 @@ unsafe extern "C" fn initialize(context: *mut c_void) {
     }));
     if let Err(payload) = result {
         context.panicked.store(true, Ordering::Release);
+        publish_fault(context, ServiceFaultCause::InitializerPanic, 0);
         std::mem::forget(payload);
-        let status =
-            unsafe { kc_service_complete_current(context.service.load(Ordering::Acquire)) };
-        if status != 0 {
-            context.reschedule_error.store(status, Ordering::Release);
-        }
+        complete_after_fault(context);
     }
 }
 
@@ -393,7 +653,10 @@ unsafe extern "C" fn retire(context: *mut c_void) {
     }));
     if let Err(payload) = result {
         context.panicked.store(true, Ordering::Release);
+        publish_fault(context, ServiceFaultCause::OwnerFinalizerPanic, 0);
         std::mem::forget(payload);
+    } else if let Some(fault) = context.fault.as_ref() {
+        fault.publish_normal();
     }
     context.owner_retired.store(true, Ordering::Release);
 }
@@ -413,23 +676,21 @@ unsafe extern "C" fn invoke(context: *mut c_void) {
         Ok(ServiceOutcome::Dormant) => {}
         Ok(ServiceOutcome::Continue) => {
             let status = unsafe { kc_service_ready_again(context.service.load(Ordering::Acquire)) };
-            if status != 0 {
-                context.reschedule_error.store(status, Ordering::Release);
-            }
+            scheduling_failed(context, ServiceFaultCause::ReadyAgainFailed, status);
         }
         Ok(ServiceOutcome::Complete) => {
             let status =
                 unsafe { kc_service_complete_current(context.service.load(Ordering::Acquire)) };
-            if status != 0 {
-                context.reschedule_error.store(status, Ordering::Release);
-            }
+            scheduling_failed(context, ServiceFaultCause::CompletionFailed, status);
         }
         Err(payload) => {
             context.panicked.store(true, Ordering::Release);
+            publish_fault(context, ServiceFaultCause::CallbackPanic, 0);
             // A user-defined panic payload may itself panic from Drop. Leaking
             // this one exceptional payload keeps even that unwind from crossing
             // the C ABI.
             std::mem::forget(payload);
+            complete_after_fault(context);
         }
     }
 }
@@ -504,6 +765,13 @@ pub struct ServiceSetup {
 }
 
 impl ServiceSetup {
+    /// Create one fixed fault record whose successful publication resumes this
+    /// service as its supervisor. Creation and notifier retention happen only
+    /// during setup; the later fault path is atomic and nonblocking.
+    pub fn fault_edge(&self) -> ServiceFaultEdge {
+        ServiceFaultEdge::new(self.shared_realtime_notifier())
+    }
+
     /// Mint one non-cloneable realtime edge for one producer.
     pub fn realtime_notifier(&self) -> Result<RealtimeNotifier, i32> {
         realtime_notifier(&self.inner)
@@ -638,8 +906,8 @@ impl Service {
         self.join()
     }
 
-    /// Whether the callback has panicked. After the first panic the trampoline
-    /// safely ignores subsequent invocations while the native service drains.
+    /// Whether the callback has panicked. A panic closes producer admission
+    /// and retires this service without stopping its shared runtime.
     #[inline]
     pub fn callback_panicked(&self) -> bool {
         self.inner
@@ -650,8 +918,8 @@ impl Service {
             .load(Ordering::Acquire)
     }
 
-    /// The native status from a failed local reschedule, if any. A stop racing
-    /// a callback may legitimately close admission before `Continue` lands.
+    /// The native status from an unexpected local scheduling failure, if any.
+    /// A cancellation caused by retirement is normal and is not recorded.
     #[inline]
     pub fn reschedule_error(&self) -> Option<i32> {
         let status = self

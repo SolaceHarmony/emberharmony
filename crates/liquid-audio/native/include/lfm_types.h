@@ -9,7 +9,7 @@
 extern "C" {
 #endif
 
-#define LFM_RUNTIME_ABI_VERSION 1u
+#define LFM_RUNTIME_ABI_VERSION 4u
 #define LFM_TEXT_COMMAND_MAX_BYTES 2048u
 
 typedef struct LfmRuntime LfmRuntime;
@@ -36,6 +36,7 @@ typedef kc_ticket_id LfmTicketIdV1;
 #define LFM_TICKET_TURN KC_TICKET_KIND_TURN
 #define LFM_TICKET_FRAME KC_TICKET_KIND_FRAME
 #define LFM_TICKET_CONTROL KC_TICKET_KIND_CONTROL
+#define LFM_TICKET_DEADLINE KC_TICKET_KIND_DEADLINE
 
 #ifdef __cplusplus
 } /* extern "C" */

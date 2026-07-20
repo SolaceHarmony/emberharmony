@@ -696,8 +696,14 @@ impl VoiceSession {
 }
 
 fn stop_lfm2(threads: &ThreadManager, session: Lfm2Session) -> Result<(), String> {
-    session.stop();
-    threads.wait()
+    let stopped = session.stop();
+    let joined = threads.wait();
+    match (stopped, joined) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(stop), Ok(())) => Err(stop),
+        (Ok(()), Err(join)) => Err(join),
+        (Err(stop), Err(join)) => Err(format!("{stop}; {join}")),
+    }
 }
 
 fn f32_to_i16(sample: f32) -> i16 {
@@ -773,7 +779,15 @@ impl Lfm2Session {
         let vault = conversation_vault(&ctx.session_id);
         let live = Lfm2Runtime::prepare(
             cfg,
-            move |out_rate| build_engine(settings, out_rate, Some(vault)),
+            move |in_rate, out_rate, max_callback_frames| {
+                build_engine(
+                    settings,
+                    in_rate,
+                    out_rate,
+                    max_callback_frames,
+                    Some(vault),
+                )
+            },
             move |event| {
                 if matches!(event, RuntimeEvent::Ended(_)) {
                     sink_done.store(true, Ordering::SeqCst);
@@ -804,14 +818,14 @@ impl Lfm2Session {
     fn interrupt(&self) -> Result<(), String> {
         self.bridge_cancel.cancel();
         if let Some(live) = self.live.as_ref() {
-            live.interrupt();
+            return live.interrupt();
         }
-        self.emit_ready()
+        Ok(())
     }
 
     fn set_mic_enabled(&self, enabled: bool) -> Result<(), String> {
         if let Some(live) = self.live.as_ref() {
-            live.set_mic_enabled(enabled);
+            live.set_mic_enabled(enabled)?;
         }
         self.emit_ready()
     }
@@ -843,12 +857,13 @@ impl Lfm2Session {
         self.live.as_ref().map(Lfm2Runtime::audio_stats)
     }
 
-    fn stop(mut self) {
+    fn stop(mut self) -> Result<(), String> {
         self.done.store(true, Ordering::SeqCst);
         self.bridge_cancel.cancel();
         if let Some(live) = self.live.take() {
-            live.stop();
+            live.stop()?;
         }
+        Ok(())
     }
 }
 
@@ -857,7 +872,9 @@ impl Drop for Lfm2Session {
         self.done.store(true, Ordering::SeqCst);
         self.bridge_cancel.cancel();
         if let Some(live) = self.live.take() {
-            live.stop();
+            if let Err(error) = live.stop() {
+                eprintln!("[flashkern] desktop voice teardown failed: {error}");
+            }
         }
     }
 }
@@ -1119,20 +1136,15 @@ fn native_sampling(mode: &settings::Lfm2ModeSampling, seed: Option<u64>) -> Nati
 
 fn local_runtime_config(settings: &VoiceSettings) -> RuntimeConfig {
     RuntimeConfig {
-        vad_threshold: settings.lfm2.vad_threshold,
-        can_interrupt: can_interrupt_playback(settings),
         trace: settings.lfm2.trace,
-        ..RuntimeConfig::default()
     }
-}
-
-fn can_interrupt_playback(settings: &VoiceSettings) -> bool {
-    settings.lfm2.engine != LocalVoiceEngine::MoshiRealtime
 }
 
 fn build_engine(
     settings: VoiceSettings,
+    in_rate: u32,
     out_rate: u32,
+    capture_max_callback_frames: u32,
     vault: Option<NativeConversationVault>,
 ) -> Result<Box<dyn VoiceEngine>, String> {
     // Fail-hard, no network at start: load ONLY a local snapshot dir. The repo id/revision are
@@ -1162,7 +1174,13 @@ fn build_engine(
     }
     let model = resident_lfm2(&dir, &settings.lfm2.device)?;
     let sampling = native_sampling(&settings.lfm2.interleaved, settings.lfm2.seed);
-    let engine: NativeLfm2VoiceEngine = model.engine(sampling, vault, out_rate)?;
+    let engine: NativeLfm2VoiceEngine = model.engine(
+        sampling,
+        vault,
+        in_rate,
+        out_rate,
+        capture_max_callback_frames,
+    )?;
     Ok(Box::new(engine))
 }
 
@@ -1645,14 +1663,11 @@ mod tests {
     }
 
     #[test]
-    fn local_runtime_config_comes_from_persisted_settings() {
+    fn local_runtime_config_keeps_only_host_tracing_policy() {
         let mut settings = VoiceSettings::default();
-        settings.lfm2.vad_threshold = 0.027;
         settings.lfm2.trace = true;
 
         let cfg = local_runtime_config(&settings);
-        assert_eq!(cfg.vad_threshold, 0.027);
         assert!(cfg.trace);
-        assert_eq!(cfg.can_interrupt, can_interrupt_playback(&settings));
     }
 }

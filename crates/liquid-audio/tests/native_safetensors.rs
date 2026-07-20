@@ -12,7 +12,7 @@ const FORMAT: i32 = -3;
 const NOT_FOUND: i32 = -5;
 const INVALID: i32 = -22;
 const WEIGHT_ABI: u32 = 1;
-const RUNTIME_ABI: u32 = 1;
+const RUNTIME_ABI: u32 = 4;
 const MODEL_ABI: u32 = 3;
 const BF16: u32 = 13;
 const F32: u32 = 16;
@@ -24,11 +24,6 @@ struct WeightImage {
 
 #[repr(C)]
 struct NativeModel {
-    _private: [u8; 0],
-}
-
-#[repr(C)]
-struct NativeConversation {
     _private: [u8; 0],
 }
 
@@ -61,29 +56,6 @@ struct RuntimeSnapshot {
     kernel_lanes: u32,
     live_models: u32,
     live_sessions: u32,
-    reserved: [u64; 4],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct SamplerConfig {
-    size: u32,
-    abi_version: u32,
-    flags: u32,
-    top_k: u32,
-    temperature: f64,
-    reserved: u64,
-}
-
-#[repr(C)]
-struct ConversationConfig {
-    size: u32,
-    abi_version: u32,
-    flags: u32,
-    reserved0: u32,
-    seed: u64,
-    text_sampler: SamplerConfig,
-    audio_sampler: SamplerConfig,
     reserved: [u64; 4],
 }
 
@@ -214,14 +186,6 @@ extern "C" {
     fn lfm_model_close(model: *mut NativeModel) -> i32;
     fn lfm_model_info(model: *const NativeModel, out: *mut ModelInfo) -> i32;
     fn lfm_model_memory(model: *const NativeModel, out: *mut ModelMemory) -> i32;
-    fn lfm_conversation_create(
-        model: *mut NativeModel,
-        config: *const ConversationConfig,
-        out: *mut *mut NativeConversation,
-        error: *mut c_char,
-        error_length: usize,
-    ) -> i32;
-    fn lfm_conversation_close(conversation: *mut NativeConversation) -> i32;
     fn mimi_weight_load_f32(bytes: *const u8, index: u64) -> f32;
     fn mimi_weight_gemv_f32(
         weights: *const u8,
@@ -1614,7 +1578,6 @@ fn opaque_native_model_reports_single_image_accounting() {
     let temp = Temp::new();
     write_tiny_model(&temp, 2, |_| {});
     let (engine, model, status, message) = open_tiny_model(&temp);
-    let mut error = [0i8; 512];
     assert_eq!(status, 0, "native model open failed: {message}");
     assert!(!model.is_null());
     let mut info = ModelInfo {
@@ -1674,114 +1637,6 @@ fn complete_runtime_model_reports_lifecycle_only_memory_accounting() {
     assert!(first.load_ns > 0);
     assert!((1..=4).contains(&first.load_workers));
     assert!(first.load_tasks > 0);
-}
-
-#[test]
-#[cfg(feature = "oracle")]
-#[ignore = "requires LFM_MODEL_DIR and the real LFM2.5-Audio checkpoint"]
-fn native_audio_prefill_matches_discrete_for_the_same_embedding() {
-    // The native audio-in prefill (`embed_kind == 2`, a provided embedding VIEW —
-    // the shape the Conformer/adapter output will use) must produce the SAME
-    // backbone state as the discrete text path (`embed_kind == 0`) when fed the
-    // same embedding: the text token's own `embed_tokens` row. Proven end-to-end
-    // through the native conversation (C++ owns the prefill loop), greedy so the
-    // sampler cannot diverge. This is the parity the eventual native prefill rests
-    // on. Checkpoint-free CI ignores this gate explicitly; a requested run fails
-    // rather than being reported as a pass.
-    let dir = PathBuf::from(
-        std::env::var_os("LFM_MODEL_DIR")
-            .expect("LFM_MODEL_DIR must name the real LFM2.5-Audio checkpoint"),
-    );
-    let model = liquid_audio::NativeModel::open(&dir).expect("native model");
-    let hidden = model.info().expect("model info").hidden as usize;
-
-    // The exact embed_tokens row the discrete path would look up for token `t`.
-    let resident = ResidentWeights::open(&dir.join("model.safetensors")).expect("resident image");
-    let embed = resident
-        .image()
-        .find("lfm.embed_tokens.weight")
-        .expect("embed_tokens");
-    let bytes = embed.data();
-    let t: usize = 100; // any in-vocab token
-    let row: Vec<u16> = bytes[t * hidden * 2..(t + 1) * hidden * 2]
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
-        .collect();
-    assert_eq!(row.len(), hidden);
-    let probe: u32 = 5; // token stepped after prefill to read out the state
-
-    let cfg = || liquid_audio::NativeConversationConfig {
-        seed: Some(7),
-        temperature: None, // greedy — no sampler draw to diverge on
-        top_k: None,
-    };
-
-    // Discrete: embed_kind==0 for token t (sampled token discarded), then probe.
-    let mut a = model.conversation(cfg()).expect("conv a");
-    a.step(&[t as u32], liquid_audio::EmbeddingKind::Text)
-        .expect("a discrete prefill");
-    let ta = a
-        .step(&[probe], liquid_audio::EmbeddingKind::Text)
-        .expect("a probe")
-        .sampled_token;
-
-    // Audio-in: embed_kind==2 with the identical embedding row, then probe.
-    let mut b = model.conversation(cfg()).expect("conv b");
-    let pos = b.prefill_audio(&row).expect("b audio-in prefill");
-    assert_eq!(pos, 1, "one row prefilled → position advances by one");
-    let tb = b
-        .step(&[probe], liquid_audio::EmbeddingKind::Text)
-        .expect("b probe")
-        .sampled_token;
-
-    assert_eq!(
-        ta, tb,
-        "audio-in prefill (embed_kind==2) diverged from the discrete embed for the same embedding"
-    );
-}
-
-#[test]
-#[cfg(feature = "oracle")]
-fn rust_owner_drives_the_compatibility_builder_without_reopening_the_file() {
-    let temp = Temp::new();
-    let path = temp.0.join("weights.safetensors");
-    let values = [1.25f32, -3.5f32];
-    let data = values
-        .iter()
-        .flat_map(|value| value.to_le_bytes())
-        .collect::<Vec<_>>();
-    write_file(
-        &path,
-        &[Tensor {
-            name: "model.weight",
-            dtype: "F32",
-            shape: &[2],
-            data: &data,
-        }],
-    );
-
-    let resident = ResidentWeights::open(&path).unwrap();
-    assert_eq!(resident.dtype(), candle_core::DType::F32);
-    assert_eq!(resident.image().len(), 1);
-    let view = resident.image().find("model.weight").unwrap();
-    assert_eq!(view.shape(), &[2]);
-    assert_eq!(
-        view.data_ptr() as usize,
-        resident.image().base() as usize + view.offset() as usize
-    );
-
-    let witness = resident.clone();
-    let builder = resident.candle_builder(&candle_core::Device::Cpu);
-    drop(resident);
-    let tensor = builder.get((2,), "model.weight").unwrap();
-    assert_eq!(tensor.to_vec1::<f32>().unwrap(), values);
-    assert_eq!(
-        witness.compatibility_copies(),
-        liquid_audio::weights::CompatibilityCopies {
-            tensors: 1,
-            bytes: data.len() as u64,
-        }
-    );
 }
 
 #[test]
@@ -1935,74 +1790,4 @@ fn indexed_view_iteration_uses_the_public_descriptor_surface() {
     assert_eq!(unsafe { lfm_weights_at(image.0, 0, &mut view) }, OK);
     assert_eq!(unsafe { CStr::from_ptr(view.name) }.to_bytes(), b"only");
     assert_eq!(unsafe { lfm_weights_at(image.0, 1, &mut view) }, NOT_FOUND);
-}
-
-#[test]
-#[ignore = "needs the repository LFM2.5-Audio fixture and about 3 GB of free memory"]
-#[cfg(feature = "oracle")]
-fn real_model_checkpoint_loads_without_candle() {
-    let dir = workspace_model_dir();
-    assert!(
-        dir.join("model.safetensors").is_file(),
-        "missing fixture at {}",
-        dir.display()
-    );
-    let model = dir.join("model.safetensors");
-    let bytes = std::fs::metadata(&model).unwrap().len();
-    let resident = ResidentWeights::open(&dir).unwrap();
-    assert_eq!(resident.dtype(), candle_core::DType::BF16);
-    let image = resident.image();
-    let count = image.len();
-    assert!(count > 100, "real model exposed only {count} tensors");
-    assert_eq!(image.resident_bytes(), (bytes + 63) & !63);
-
-    let base = image.base() as usize;
-    let end = base + image.resident_bytes() as usize;
-    let mut bf16 = 0usize;
-    for index in 0..count {
-        let view = image.at(index).unwrap();
-        assert!(!view.name().unwrap().is_empty());
-        assert_eq!(view.data_ptr() as usize, base + view.offset() as usize);
-        assert!(
-            view.data_ptr() as usize >= base
-                && view.data_ptr() as usize + view.bytes() as usize <= end
-        );
-        bf16 += usize::from(view.dtype().unwrap() == WeightDType::BF16);
-    }
-    eprintln!(
-        "[native-weights] {} bytes, {count} tensors, {bf16} BF16 tensors",
-        image.resident_bytes()
-    );
-    assert!(bf16 > 100, "real model exposed only {bf16} BF16 tensors");
-}
-
-#[test]
-#[ignore = "needs the repository LFM2.5-Audio fixture and about 8 GB of free memory"]
-#[cfg(feature = "oracle")]
-fn real_production_loader_retains_the_native_image() {
-    let dir = workspace_model_dir();
-    assert!(
-        dir.join("model.safetensors").is_file(),
-        "missing fixture at {}",
-        dir.display()
-    );
-    let (model, _processor) =
-        liquid_audio::from_pretrained(&dir, &candle_core::Device::Cpu).unwrap();
-    let image = model
-        .resident_weights()
-        .expect("production model lost its native checkpoint owner");
-    assert!(image.len() > 100);
-    assert!(image.resident_bytes() > 2_000_000_000);
-
-    let copies = model.compatibility_copies();
-    assert!(
-        copies.tensors > 500,
-        "only {} tensors crossed the compatibility boundary",
-        copies.tensors
-    );
-    assert!(
-        copies.bytes > 2_000_000_000,
-        "only {} bytes crossed the compatibility boundary",
-        copies.bytes
-    );
 }

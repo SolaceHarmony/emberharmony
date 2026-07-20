@@ -694,8 +694,8 @@ extern "C" void mimi_transformer_reset(MimiTransformerState *st) {
  *     priming shapes only) take the scalar movement loop. All internal math
  *     is [t, c] row-major (candle's b,t,c with b=1).
  *
- * (d) KV interface: THIS UNIT OWNS THE CACHE (arbiter-settled; the mimi_kv_*
- *     ABI is parked and never called from here).
+ * (d) KV interface: THIS UNIT OWNS THE SOLE CACHE. No parallel cache ABI or
+ *     unwired compatibility implementation remains.
  *     Why: transformer.rs:17 imports crate::kv_cache::KvCache, and
  *     kv_cache.rs:220 defines it as an enum wrapping
  *     candle_nn::kv_cache::RotatingKvCache; transformer.rs:432 builds

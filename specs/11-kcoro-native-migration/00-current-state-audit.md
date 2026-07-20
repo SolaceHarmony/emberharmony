@@ -160,25 +160,26 @@ destination in place.
 
 ## Current Thread and Wake Boundaries
 
-The local path currently composes several independent thread systems:
+The production voice path has four ownership boundaries:
 
-- Tauri `ThreadManager` (`packages/desktop/src-tauri/src/voice/threads.rs:13-92`).
-- a top-level `voice-session` (`voice/runtime.rs:2312-2369`).
-- turn or frame inference worker (`runtime/realtime.rs:491-922`).
-- event consumer and optional output worker (`voice_runtime.rs:1040-1343`).
-- WebRTC microphone and media workers (`voice/runtime.rs:2965-3419`).
-- Flashkern's fixed pthread lane team and one mechanical SQ dispatcher
-  (`flashkern_engine.cpp:1041-1248`).
-- the current working tree no longer has a Rust model-pass broker or CQ ingress
-  thread; native code owns both endpoints. A future Rust kcoro mount is limited
-  to capture, playback, control, and observer docking tasks.
-- The C arena coordination worker, former
-  stackful dispatcher, and saved lane stacks have been deleted from the product
-  pass path.
+- CPAL/platform microphone and speaker callbacks remain OS-owned. They hold the
+  sole non-cloneable Rust capture/playback endpoints and perform only bounded
+  native span operations.
+- The safe `kcoro-sys` Rust layer owns retained host services and prebound
+  realtime notifier leases. A suspended action is durable state, not a thread;
+  only an otherwise-idle runtime worker may enter indefinite OS-backed
+  dormancy.
+- Native kcoro services own session coordination, delivery, route brokering,
+  and bridge continuations. Bounded records and exact producer edges replace
+  Rust inference channels and timeout probes.
+- `kc_team` owns Flashkern's stable numerical workers. One dispatched
+  generation runs one non-suspending assembly stage; the final member return is
+  the quorum/completion edge.
 
-This is why a fast kernel can still stutter: the complete frame/turn crosses
-several allocators, queues, condition variables, and ownership domains before
-and after the numerical pass.
+Tauri workers that remain are application/network/device owners, not model-pass
+or PCM-transport workers. There is no Rust model broker, CQ ingress thread,
+turn-inference worker, stackful dispatcher, saved lane stack, or operation-level
+waiter in the LFM2 path.
 
 ## What Is Already Correct
 
@@ -187,80 +188,70 @@ The migration must preserve these existing decisions:
 - Product settings, not `LFM_*` environment variables, determine engine and
   device. `Lfm2Settings` explicitly documents this at
   `packages/desktop/src-tauri/src/settings.rs:210-250`.
-- Native safetensors bytes are immutable and bit exact.
-- Native mel frontend math has landed and is parity-gated:
-  `native/src/frontend/lfm_frontend.cpp` and
-  `native/kernels/{aarch64,x86_64}/flashkern_frontend.S` at commit `a1b06fc7`,
-  checked against `crates/liquid-audio/tests/fixtures/mel/`. The arithmetic is
-  off Rust; `FilterbankFeatures` ownership, allocation, and `Tensor`
-  materialization in `processor.rs` are the remaining mel work, not the math.
+- `native/src/io/safetensors.cpp` loads one immutable main-plus-codec image;
+  exact typed byte views bind directly against it and production accounting
+  requires `compatibility_copied_bytes == 0`.
+- Resampling, frontend, exact Sesame detection, Conformer, backbone,
+  Depthformer, recurrence, sampling, and Mimi are native. The deleted
+  `processor.rs`, Rust model tree, and Rust PCM resampler are not transitional
+  owners and must not be restored.
 - Flashkern tile fan-out uses a shared atomic claim counter, not one channel
-  message per tile (`flashkern_engine.cpp:119-128`, `670-684`).
-- At executor commit `d2c43abd`, the generation fence closes the declared-park
-  lost-wake race with a precise logical park mask and one prepared shared fence
-  handle (`flashkern_engine.cpp:134-138`, `634-662`). At bridge mount
-  `95069bd5`, dispatch uses the prepared SQ doorbell at `bridge_main:1106-1140`
-  and the lane word at `1041-1081`. `FENCE_SPIN`, stackful
-  park/unpark, and the process-global wait registry are gone. G0/G3 percentile
-  evidence is pinned under `docs/native/baselines/`; barrier economy remains the
-  next measured optimization.
-- At `4f06a3d5`, production pass progress crosses only registered edges: the
-  C++ callback admits a preallocated slot, the Rust ring wakes its broker, the
-  native CQ doorbell wakes dedicated ingress, and ingress resolves the exact
-  slot plus broker continuation. The 10,000-pass debug/release/arm64/Rosetta
-  soak, no-submitter descriptor cleanup test, and 0.001-0.004% idle gate passed
-  locally; remote CI remains the authority for cross-host production status.
-- Shutdown wins over queued turn preparation in the Rust worker; that behavior
-  remains a regression gate during replacement.
-- Frame interruption drops stale frames without resetting the continuous model
-  stream (`runtime/realtime.rs:788-849`, `888-895`).
-- Native Mimi streaming decode is a required production kernel, not an optional
-  accelerator (`runtime/audio_out.rs:77-156`).
+  message per tile. Assembly owns complete tiles and never yields inside a
+  kernel.
+- Fixed team members publish generation-stamped entered/returned evidence and
+  the final return invokes one completion callback. `FENCE_SPIN`, stackful
+  park/unpark, per-stage numerical waiters, and the process-global wait registry
+  are absent.
+- Production pass progress crosses registered native edges only: pooled routes,
+  exact pass slots, callback-driven CQs, session actions, and retained kcoro
+  services. Rust receives only opaque lifecycle/control and bounded outward
+  events.
+- Interrupt advances the publication epoch; accepted state-authoritative work
+  may settle, but stale text/PCM cannot publish or recur. Stop closes admission,
+  retires endpoints, drains exact leases, joins services/team, then destroys
+  owners in order.
+- Native Mimi streaming decode and native device-rate resampling write directly
+  into retained playback reservations.
 
-## Working-Tree Deltas Not Yet Gated (2026-07-17)
+## Working-Tree Deltas Under Final Gate (2026-07-19)
 
-These changes exist in the working tree or in explicitly ungated safety commits.
-Per the Claims Policy they are `prototype`/`uncommitted`-equivalent and must not
-be described as native, closed, or production-tested until a gated commit lands.
+These changes exist in the working tree. The real-checkpoint typed/audio/audio
+self-chat truth gate has passed on the pre-supervision state, but the complete
+post-supervision suite and repeated lifecycle stress remain the authority before
+release status is claimed.
 
-- **Flashkern V2.1 eager route broker.** `flashkern_engine.cpp` now carries an
-  64-entry `AudioRoutePool` served by a dedicated `audio_route_main` broker thread and a
+- **Flashkern V2.1 eager route broker.** `flashkern_engine.cpp` carries a
+  64-entry `AudioRoutePool` served by a retained kcoro service and a
   vocabulary-validated `audio_token_class` map. It replaces the former exclusive
   single-producer `AudioRouteClaim` lease so a route releases its compute slot
   between nodes and the capacity-limited engine stays fair across conversations.
-  Landed as safety commits `1f6d1c5d` and `8a856160` with no gate run, and still
-  under active edit (`ROUTE_CAPACITY` moved 8 → 64 after `8a856160`). Text and
-  audio terminal routes now return pooled handles and notify the coordinator's
+  Text and audio terminal routes now return pooled handles and notify the coordinator's
   expected-value doorbell; exact-generation collection happens there without a
   numerical wait. Starvation promotion is a separate 64-enqueue-epoch policy;
   it no longer changes implicitly with pool capacity, and a route newer than a
-  broker snapshot has age zero rather than wrapping to maximum age. Because the
-  file is mid-rewrite, the Scheduler and Backbone fast-path row citations into
-  `flashkern_engine.cpp` remain pinned to the audited baseline revision and are
-  stale by line position; they are re-pinned when the V2 work reaches a gated
-  commit, not before. Design intent lives in
+  broker snapshot has age zero rather than wrapping to maximum age. Source line
+  positions remain intentionally unpinned while supervision is under
+  active edit. Design intent lives in
   `specs/11-kcoro-native-migration/16-flashkern-v2-coroutine-grid.md`.
-- **Session terminal collection is asynchronous in the working tree.** The
+- **Session terminal collection is asynchronous.** The
   coordinator owns a pooled `SessionAction`, submits one route, and re-enters on
   its internal doorbell; it does not wait for the numerical terminal or playback
   capacity. Playback-lease release rings that same work doorbell, closing the
-  ordinary playback-saturation wake edge. This remains an ungated working-tree
-  claim until the session suite and saturation regression are attached to a
-  commit.
-- **Direct production PCM transport is mounted, with one capture copy still
-  open.** Native playback stays in its retained lease through the installed
-  borrowed `PcmSink`; the external platform writer consumes it synchronously and
-  no `VoiceEvent::Audio` or Rust PCM vector is created. On capture, VAD submits a
-  borrowed utterance slice to `CaptureDock`; it is copied once into its final
-  native lease and only the opaque ticket crosses the worker queue. The Rust mic
-  ring and VAD accumulation buffer still precede that lease, so the stricter
-  callback-writes-native-reservation invariant is not yet closed.
-- **V2.2 gang completion is implemented, not block concurrency.** Eight-lane
-  engines create two soft four-lane completion domains with private SPSC CQs.
-  Reverse-order exact-generation drain and a gang lease gate the single bridge
-  publication. Both domains still share the current eight-lane stage board,
-  global fence, and numerical program; private boards and simultaneous `BLOCK4`
-  execution remain V2.3/V2.4 work.
+  ordinary playback-saturation wake edge.
+- **Direct production PCM transport is mounted.** The non-cloneable Rust
+  callback endpoints pass only ephemeral hardware spans into native capture and
+  playback operations. Capture reserves a generation-checked region of the
+  sealed native circular arena and publishes typed chunk/XRUN records; the exact
+  Sesame detector and turn policy consume native views. Playback retains ticket,
+  epoch, lease, and buffer generation through the final device callback. No
+  `VoiceEvent::Audio`, Rust PCM ring, utterance `Vec`, or Rust VAD buffer remains
+  on this path.
+- **V2.2 block extraction is not implemented.** The engine has one fixed team,
+  one stage board, one scratch mount, `block_count == 1`, and one active
+  generation. Its `gang_lease` is exclusive admission for that single team, not
+  evidence of two soft completion domains. Real private `BlockDomain` boards,
+  CQs, scratch, return accounting, and simultaneous `BLOCK4` execution remain
+  future V2.2/V2.4 work.
 
 ## Claims That Are Not Yet Allowed
 

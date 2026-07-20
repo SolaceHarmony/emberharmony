@@ -6,8 +6,6 @@
 
 mod ffi;
 pub mod native_voice;
-#[path = "runtime/resample.rs"]
-pub mod resample;
 pub mod utils;
 mod voice_api;
 #[path = "runtime/voice_runtime.rs"]
@@ -20,7 +18,7 @@ pub use native_voice::{
 #[cfg(feature = "download")]
 pub use utils::{snapshot_download_to, snapshot_download_with, DownloadProgress};
 pub use voice_api::{
-    CaptureDock, CaptureTicket, EngineProgress, PlaybackSource, PlaybackWrite, VoiceEngine,
+    CaptureSink, CaptureWrite, EngineProgress, PlaybackSource, PlaybackWrite, VoiceEngine,
     VoiceEvent,
 };
 pub use voice_runtime::{

@@ -377,8 +377,7 @@ struct ConversationAdmission {
     LfmNativeEmission *out = nullptr;
     LfmAudioRouteNotify notify = nullptr;
     void *notify_context = nullptr;
-    const float *pcm = nullptr;
-    size_t sample_count = 0;
+    LfmF32SpanChain pcm{};
     uint64_t adapted_values = 0;
     size_t offset = 0;
     size_t chunk = 0;
@@ -830,25 +829,26 @@ int prepare_playback_claimed(LfmConversation &conversation,
 }
 
 int prepare_pcm_claimed(LfmConversation &conversation, size_t max_sample_count,
-                        uint32_t sample_rate,
+                        uint32_t capture_rate, uint32_t playback_rate,
                         size_t *out_playback_frames) {
     LfmModel *model = conversation.model;
     if (!model || !model->frontend || !model->conformer ||
         !conversation.frontend_workspace || !conversation.conformer_workspace ||
-        max_sample_count == 0 || sample_rate == 0 || model->sample_rate == 0 ||
+        max_sample_count == 0 || capture_rate == 0 || playback_rate == 0 ||
+        model->sample_rate == 0 ||
         model->mel_features == 0 || model->hidden == 0) {
         return -EINVAL;
     }
     if (conversation.resampler && conversation.resampler_workspace &&
-        conversation.prepared_rate == sample_rate &&
+        conversation.prepared_rate == capture_rate &&
         conversation.prepared_samples >= max_sample_count) {
-        return prepare_playback_claimed(conversation, sample_rate,
+        return prepare_playback_claimed(conversation, playback_rate,
                                         out_playback_frames);
     }
 
     LfmResampler *plan = nullptr;
     LfmResamplerWorkspace *workspace = nullptr;
-    int status = lfm_resampler_create(sample_rate, model->sample_rate, &plan);
+    int status = lfm_resampler_create(capture_rate, model->sample_rate, &plan);
     if (status != 0) return status;
     status = lfm_resampler_workspace_create(&workspace);
     if (status == 0) {
@@ -886,7 +886,7 @@ int prepare_pcm_claimed(LfmConversation &conversation, size_t max_sample_count,
     if (status == 0) {
         try {
             conversation.resampled.resize(
-                sample_rate == model->sample_rate ? 0 : (size_t)target_samples);
+                capture_rate == model->sample_rate ? 0 : (size_t)target_samples);
             conversation.mel_bf16.resize((size_t)frames * model->mel_features);
             conversation.adapted.resize((size_t)rows * model->hidden);
         } catch (const std::bad_alloc &) {
@@ -905,8 +905,8 @@ int prepare_pcm_claimed(LfmConversation &conversation, size_t max_sample_count,
     conversation.resampler = plan;
     conversation.resampler_workspace = workspace;
     conversation.prepared_samples = max_sample_count;
-    conversation.prepared_rate = sample_rate;
-    return prepare_playback_claimed(conversation, sample_rate,
+    conversation.prepared_rate = capture_rate;
+    return prepare_playback_claimed(conversation, playback_rate,
                                     out_playback_frames);
 }
 
@@ -1285,16 +1285,16 @@ void continue_admission(void *context) {
 int submit_admission_audio(ConversationAdmission &admission) {
     LfmConversation &conversation = *admission.conversation;
     LfmModel *model = conversation.model;
-    if (!model || !admission.pcm || admission.sample_count == 0 ||
+    if (!model || admission.pcm.count == 0 || admission.pcm.length == 0 ||
         !model->frontend || !model->conformer ||
         !conversation.frontend_workspace ||
         !conversation.conformer_workspace || !conversation.resampler ||
         !conversation.resampler_workspace ||
-        admission.sample_count > conversation.prepared_samples) {
+        admission.pcm.length > conversation.prepared_samples) {
         return -EINVAL;
     }
-    const LfmAudioEncodePassV1 pass = {
-        .size = sizeof(LfmAudioEncodePassV1),
+    const LfmAudioEncodePassV2 pass = {
+        .size = sizeof(LfmAudioEncodePassV2),
         .abi_version = LFM_AUDIO_PASS_ABI,
         .resampler = conversation.resampler,
         .resampler_workspace = conversation.resampler_workspace,
@@ -1303,7 +1303,6 @@ int submit_admission_audio(ConversationAdmission &admission) {
         .conformer = model->conformer,
         .conformer_workspace = conversation.conformer_workspace,
         .pcm = admission.pcm,
-        .sample_count = admission.sample_count,
         .resampled = conversation.resampled.empty()
                          ? nullptr
                          : conversation.resampled.data(),
@@ -1435,22 +1434,24 @@ int submit_admission_node(ConversationAdmission &admission) {
 
 int lfm_conversation_prepare_pcm_native(LfmConversation *conversation,
                                         size_t max_sample_count,
-                                        uint32_t sample_rate,
+                                        uint32_t capture_rate,
+                                        uint32_t playback_rate,
                                         size_t *out_playback_frames) {
-    if (!conversation || max_sample_count == 0 || sample_rate == 0 ||
-        !out_playback_frames) {
+    if (!conversation || max_sample_count == 0 || capture_rate == 0 ||
+        playback_rate == 0 || !out_playback_frames) {
         return -EINVAL;
     }
     *out_playback_frames = 0;
     ConversationClaim claim(conversation);
     if (!claim) return -EBUSY;
-    return prepare_pcm_claimed(*conversation, max_sample_count, sample_rate,
-                               out_playback_frames);
+    return prepare_pcm_claimed(*conversation, max_sample_count, capture_rate,
+                               playback_rate, out_playback_frames);
 }
 
 static int start_admission(
-    LfmConversation *conversation, uint32_t kind, const float *pcm,
-    size_t sample_count, LfmNativeEmission *out, LfmAudioRouteNotify notify,
+    LfmConversation *conversation, uint32_t kind,
+    const LfmF32SpanChain *pcm, LfmNativeEmission *out,
+    LfmAudioRouteNotify notify,
     void *notify_context, LfmConversationAdmissionHandle *out_handle) {
     if (!conversation || !out || !notify || !notify_context || !out_handle ||
         kind == ADMISSION_NONE || kind > ADMISSION_MIXED) {
@@ -1465,8 +1466,7 @@ static int start_admission(
     admission.out = out;
     admission.notify = notify;
     admission.notify_context = notify_context;
-    admission.pcm = pcm;
-    admission.sample_count = sample_count;
+    admission.pcm = pcm ? *pcm : LfmF32SpanChain{};
     admission.kind = kind;
     admission.phase = kind == ADMISSION_TEXT
         ? ADMISSION_PREFIX
@@ -1492,10 +1492,27 @@ int lfm_conversation_begin_pcm_submit_native(
     uint32_t sample_rate, LfmNativeEmission *out,
     LfmAudioRouteNotify notify, void *notify_context,
     LfmConversationAdmissionHandle *out_handle) {
-    if (!conversation || !pcm || sample_count == 0 || sample_rate == 0 ||
+    const LfmF32Span span = {
+        .data = pcm,
+        .length = sample_count,
+    };
+    return lfm_conversation_begin_pcm_spans_submit_native(
+        conversation, &span, 1, sample_rate, out, notify, notify_context,
+        out_handle);
+}
+
+int lfm_conversation_begin_pcm_spans_submit_native(
+    LfmConversation *conversation, const LfmF32Span *spans,
+    uint32_t span_count, uint32_t sample_rate, LfmNativeEmission *out,
+    LfmAudioRouteNotify notify, void *notify_context,
+    LfmConversationAdmissionHandle *out_handle) {
+    if (!conversation || !spans || span_count == 0 || sample_rate == 0 ||
         !out || !notify || !notify_context || !out_handle) {
         return -EINVAL;
     }
+    LfmF32SpanChain pcm{};
+    int status = lfm_f32_span_chain_init(spans, span_count, &pcm);
+    if (status != 0) return status;
     ConversationClaim claim(conversation);
     if (!claim) return -EBUSY;
     LfmModel *model = conversation->model;
@@ -1509,12 +1526,11 @@ int lfm_conversation_begin_pcm_submit_native(
         return -EALREADY;
     }
     if (sample_rate != conversation->prepared_rate ||
-        sample_count > conversation->prepared_samples) {
+        pcm.length > conversation->prepared_samples) {
         return -EINVAL;
     }
-    const int status = start_admission(
-        conversation, ADMISSION_PCM, pcm, sample_count, out, notify,
-        notify_context, out_handle);
+    status = start_admission(conversation, ADMISSION_PCM, &pcm, out, notify,
+                             notify_context, out_handle);
     if (status == 0) claim.detach();
     return status;
 }
@@ -1554,7 +1570,7 @@ int lfm_conversation_begin_text_submit_native(
     status = admit_context(*conversation, prefix.size() + text_tokens +
                                               model->assistant_tokens.size());
     if (status != 0) return status;
-    status = start_admission(conversation, ADMISSION_TEXT, nullptr, 0, out,
+    status = start_admission(conversation, ADMISSION_TEXT, nullptr, out,
                              notify, notify_context, out_handle);
     if (status == 0) claim.detach();
     return status;
@@ -1587,12 +1603,19 @@ int lfm_conversation_begin_mixed_submit_native(
         sample_count > conversation->prepared_samples) {
         return -EINVAL;
     }
-    int status = encode_text(*conversation, text, text_bytes);
+    const LfmF32Span span = {
+        .data = pcm,
+        .length = sample_count,
+    };
+    LfmF32SpanChain chain{};
+    int status = lfm_f32_span_chain_init(&span, 1, &chain);
+    if (status != 0) return status;
+    status = encode_text(*conversation, text, text_bytes);
     if (status != 0) return status;
     const size_t text_tokens = conversation->token_count;
     if (text_tokens == 0) return -EINVAL;
 
-    status = start_admission(conversation, ADMISSION_MIXED, pcm, sample_count,
+    status = start_admission(conversation, ADMISSION_MIXED, &chain,
                              out, notify, notify_context, out_handle);
     if (status == 0) claim.detach();
     return status;
@@ -2139,15 +2162,21 @@ extern "C" int lfm_model_open(void *engine, const char *path, LfmModel **out,
                                              : d_model;
             const int64_t configured_out = signed_integer(encoder, "feat_out", -1);
             const size_t feat_out = configured_out > 0 ? (size_t)configured_out : d_model;
+            /* These refuse cases this encoder does not implement, so an
+             * unsupported config fails loudly instead of silently computing a
+             * different transform. A guard may only state what the code does
+             * NOT do; it must never assert a requirement the code never reads
+             * (the old xscaling guard demanded a sqrt(d_model) scale that is
+             * applied nowhere, and refused the exact case it implements). */
             const auto attention_entry = encoder.find("self_attention_model");
             if (attention_entry != encoder.end() &&
                 (!attention_entry->is_string() ||
                  attention_entry->get<std::string>() != "rel_pos")) {
-                fail(-EOPNOTSUPP, "native Conformer requires rel_pos attention");
+                fail(-EOPNOTSUPP, "native Conformer implements rel_pos attention only");
             }
-            /* The native encoder applies no sqrt(d_model) input scale, so it
-             * implements xscaling=false. NeMo's default is true, so an absent
-             * key is refused rather than silently mis-scaled. */
+            /* No sqrt(d_model) input scale exists in this encoder: it implements
+             * xscaling=false. NeMo defaults the key to true, so an absent key is
+             * refused rather than silently mis-scaled. */
             if (boolean(encoder, "xscaling", true)) {
                 fail(-EOPNOTSUPP, "native Conformer does not implement encoder xscaling");
             }

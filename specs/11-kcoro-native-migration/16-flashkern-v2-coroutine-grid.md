@@ -1,14 +1,13 @@
 # 16 — Flashkern V2: The Eager Coroutine Grid
 
-Status: **V2.0–V2.1 landed; the V2.2 gang-completion rung and the first V2.3
-kcoro-ownership rung are implemented in the working tree; removal of the
-remaining synchronous admission seams and independent block execution in
-V2.3–V2.6 remain incomplete.** V1 is one
-working fixed-team numerical execution domain. V2 extracts two independent
-logical four-lane blocks that can gang back into the existing eight-lane team,
-then drives them with design 14's compact forwarding table. It is an eager
-message-routed compute fabric, not a lazy tensor system, DAG VM, or promise of
-macOS hardware placement.
+Status: **V2.0–V2.1 and kcoro ownership of the one fixed numerical team are
+landed. V2.2 block extraction and every form of independent block execution
+remain unimplemented.** The working engine has `block_count == 1`, one stage
+board, one scratch mount, and one active team generation. The proposed V2
+extracts two independent logical four-lane blocks that can gang back into an
+eight-lane team, then drives them with design 14's compact forwarding table. It
+is an eager message-routed compute fabric, not a lazy tensor system, DAG VM, or
+promise of macOS hardware placement.
 
 **Landed through V2.1 at `1f6d1c5d4339`.** Hot kcoro, engine, bridge, session,
 and model-gate words plus internal SQ/CQ storage cells now have 128-byte Apple
@@ -35,15 +34,12 @@ makes the retained session delivery continuation runnable; its
 coordinator-owned `SessionAction` performs exact-generation collection without
 installing an operation waiter for numerical or playback capacity.
 
-**Gang-completion follow-on implemented in the working tree.** An eight-lane
-engine creates two soft four-lane `BlockDomain`s. Each block leader publishes
-an exact-generation record to its private expected-value SPSC CQ; lane zero
-deliberately drains block 1 before block 0, and only then retires the matching
-gang lease and publishes the bridge CQ. The existing eight-lane stage board
-still executes one numerical program, so this proves the completion and
-ownership protocol without claiming block concurrency. Private stage boards,
-per-domain ready rings, block-local return counters, idle event backends, and two
-simultaneous numerical programs remain open.
+**No `BlockDomain` exists in the working tree.** The current `gang_lease` is an
+exclusive lease over the one fixed team, not proof of two completion domains.
+There are no private per-block stage boards, scratch mounts, CQs, return
+counters, ready rings, or simultaneous numerical programs. Earlier synthetic
+two-block completion accounting did not establish the ownership boundary and
+must not be cited as V2.2 implementation evidence.
 
 **Kcoro ownership follow-on implemented in the working tree.** The stable
 numerical members are created, generation-dispatched, stopped, and joined by
@@ -323,19 +319,15 @@ Each step is independently gated and leaves a correct fallback geometry:
    it re-enters the ready set. Session-facing asynchronous terminal
    collection and total model-owned token classification are now mounted; block
    concurrency is the next scheduler boundary.
-3. **V2.2 — extract block completion state (working-tree implementation).** Two
-   `BlockDomain`s, private SPSC CQs, and the exact-generation gang lease now gate
-   one active eight-lane program. The remaining extraction of private stage
-   boards, block-local final-return accounting, and scratch mounts belongs to
-   V2.3; no current sentence may call the two blocks independent executors.
-4. **V2.3 — block-mode kcoro, partial working-tree implementation.** Fixed-team
-   thread lifecycle and final-return generation completion now belong to kcoro.
-   The bridge and route pthread loops are replaced by retained kcoro services;
-   their production edges use setup-time realtime notifier leases and the
-   runtime-owned expected-value doorbell, so no intermediary thread, mutex, or
-   condition variable is on the progress path. Extract two domain-local teams,
-   per-domain ready rings, exact-return assertions, and optional measured idle
-   event backends.
+3. **V2.2 — extract block completion state, open.** Create two real
+   `BlockDomain`s with private stage boards, scratch mounts, SPSC CQs, return
+   accounting, and exact doorbells. Until all of those owners exist, the engine
+   remains one team and one program regardless of any logical lane fold.
+4. **V2.3 — block-mode kcoro, open after thread ownership.** Fixed-team thread
+   lifecycle and final-return generation completion already belong to kcoro,
+   and the bridge/route loops are retained kcoro services. V2.3 must extract two
+   domain-local teams and ready rings, then prove exact-return and idle-event
+   behavior independently for each domain.
 5. **V2.4 — two independent programs.** Admit two `BLOCK4` programs only for
    different conversations. Profile actual overlap and shared-bandwidth effects;
    retain gang mode when it wins latency or parity.

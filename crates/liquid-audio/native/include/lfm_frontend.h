@@ -49,6 +49,26 @@ typedef struct LfmF32Span {
     uint64_t length;
 } LfmF32Span;
 
+// Fixed metadata-only view over one logical PCM range. A circular native arena
+// may split that range once at physical wrap, so two spans are sufficient. The
+// descriptor itself is copied into every asynchronous owner; the pointed
+// samples remain borrowed and read-only. `length` is the checked sum of the
+// admitted non-empty spans. No numerical entry point retains a pointer to a
+// caller's descriptor array.
+#define LFM_F32_SPAN_CHAIN_CAPACITY 2u
+typedef struct LfmF32SpanChain {
+    uint32_t count;
+    uint32_t reserved0;
+    uint64_t length;
+    LfmF32Span spans[LFM_F32_SPAN_CHAIN_CAPACITY];
+} LfmF32SpanChain;
+
+// Validate and copy one or two non-empty borrowed spans into a fixed chain.
+// The descriptor array may be transient; the sample storage must outlive the
+// asynchronous owner that copies the resulting chain.
+LFM_INTERNAL_API int lfm_f32_span_chain_init(
+    const LfmF32Span *spans, uint32_t span_count, LfmF32SpanChain *out);
+
 typedef struct LfmFrontendConfig {
     uint32_t size;
     uint32_t abi_version;
@@ -128,6 +148,15 @@ LFM_ORACLE_API int lfm_frontend_forward_workspace(
     const float *pcm, uint64_t sample_count, float *out_mel,
     uint64_t out_capacity_values, uint32_t flags);
 
+// Split-range production form. The frontend reads the logical span chain
+// directly. Preemphasis carries the preceding original sample across the one
+// possible arena-wrap boundary, and frame gather resolves logical indices
+// without concatenating PCM.
+LFM_INTERNAL_API int lfm_frontend_forward_spans_workspace(
+    const LfmFrontend *frontend, LfmFrontendWorkspace *workspace,
+    const LfmF32SpanChain *pcm, float *out_mel,
+    uint64_t out_capacity_values, uint32_t flags);
+
 // Production Conformer seam: computes tightly packed valid mel rows in the
 // prepared workspace and rounds each normalized row directly into the caller's
 // BF16 destination. No f32 mel plane is published or copied. The workspace
@@ -135,6 +164,10 @@ LFM_ORACLE_API int lfm_frontend_forward_workspace(
 LFM_ORACLE_API int lfm_frontend_forward_bf16_workspace(
     const LfmFrontend *frontend, LfmFrontendWorkspace *workspace,
     const float *pcm, uint64_t sample_count, uint16_t *out_mel,
+    uint64_t out_capacity_values);
+LFM_INTERNAL_API int lfm_frontend_forward_bf16_spans_workspace(
+    const LfmFrontend *frontend, LfmFrontendWorkspace *workspace,
+    const LfmF32SpanChain *pcm, uint16_t *out_mel,
     uint64_t out_capacity_values);
 
 // Immutable, pair-specific torchaudio resampling plan. Formula-derived f64
@@ -169,6 +202,15 @@ LFM_ORACLE_API int lfm_resampler_process(
     const LfmResampler *resampler, LfmResamplerWorkspace *workspace,
     const float *input, uint64_t sample_count, float *destination,
     uint64_t destination_capacity, LfmF32Span *result);
+
+// Split-range production form. Equal-rate processing returns the original
+// fixed chain unchanged. Different-rate processing performs the sinc
+// convolution directly over logical indices and returns one span over
+// `destination`.
+LFM_INTERNAL_API int lfm_resampler_process_spans(
+    const LfmResampler *resampler, LfmResamplerWorkspace *workspace,
+    const LfmF32SpanChain *input, float *destination,
+    uint64_t destination_capacity, LfmF32SpanChain *result);
 
 // Conversation-owned streaming rate converter. Unlike the offline sinc path
 // above, this retains the preceding sample and exact reduced-rate phase across

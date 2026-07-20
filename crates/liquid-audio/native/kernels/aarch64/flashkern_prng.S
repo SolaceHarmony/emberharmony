@@ -10,6 +10,37 @@
 .p2align 4
 
 /*
+ * flashkern_prng.S — AArch64. TWO functions with OPPOSITE reproducibility
+ * guarantees. Confusing them silently destroys fixed-seed byte-identity, so the
+ * distinction is stated first:
+ *
+ *   lfm_chacha20_block       DETERMINISTIC. Pure function of input[16].
+ *   lfm_apple_secure_random  NON-DETERMINISTIC. Kernel entropy, by design.
+ *
+ * Any path that claims reproducible output from a seed must reach the first and
+ * never the second.
+ *
+ * DETERMINISM CONTRACT (lfm_chacha20_block):
+ *
+ * - Integer only: add / eor / ror. No floating point, no libm, no platform math.
+ *   Unlike flashkern_rope.S — whose tables inherit the platform libm's last bits
+ *   — this kernel is bit-identical on every machine and every OS. Same
+ *   input[16] gives the same output[16], always.
+ * - The x86-64 twin packs one ROW per XMM register and realigns with pshufd.
+ *   Different data layout, IDENTICAL stream. That equivalence is an invariant of
+ *   the pair, not a coincidence.
+ * - 20 rounds, as 10 iterations of the double-round (w19 = 10): four column
+ *   quarter-rounds then four diagonal quarter-rounds, written out explicitly
+ *   here because all sixteen words are already in registers.
+ *
+ * LAYOUT — the interop detail that matters:
+ *
+ * This is the ORIGINAL ChaCha20 word layout: 64-bit counter + 64-bit nonce.
+ * It is NOT RFC 8439, which splits the same 128 bits as a 32-bit counter plus a
+ * 96-bit nonce. The rounds are identical either way, so a mismatch does not fail
+ * loudly — it just yields a completely different keystream for the same seed
+ * material. Anything interoperating with this PRNG must use the same split.
+ *
  * ChaCha20 block function, original 64-bit-counter/64-bit-nonce layout.
  *
  *   x0: const uint32_t input[16]
@@ -104,6 +135,10 @@ CNAME(lfm_chacha20_block):
 #if defined(__APPLE__)
 /*
  * int lfm_apple_secure_random(void *bytes, size_t count)
+ *
+ * TRUE ENTROPY — the deliberate opposite of lfm_chacha20_block. Output is not
+ * reproducible and must never feed a path that promises fixed-seed byte
+ * identity. It exists to SEED that path, not to replace it.
  *
  * Correct SecRandomCopyBytes ABI:
  *   x0 = kSecRandomDefault (NULL)

@@ -30,6 +30,7 @@ typedef struct kc_ticket_id {
 #define KC_TICKET_KIND_CHECKPOINT 6u
 #define KC_TICKET_KIND_WORKFLOW 7u
 #define KC_TICKET_KIND_CONTROL 8u
+#define KC_TICKET_KIND_DEADLINE 9u
 
 #ifdef __cplusplus
 }

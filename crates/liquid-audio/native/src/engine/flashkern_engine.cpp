@@ -35,6 +35,7 @@
 #include <limits>
 #include <memory>
 #include <new>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -52,6 +53,7 @@
 #include "../model/lfm_route_epoch.h"
 
 extern "C" {
+#include "kc_deadline.h"
 #include "kc_runtime.h"
 #include "kc_service.h"
 #include "kc_team.h"
@@ -102,6 +104,21 @@ constexpr uint32_t ROUTE_PUBLISHER_CAPACITY =
     static_cast<uint32_t>(ROUTE_CAPACITY);
 constexpr uint32_t BRIDGE_SERVICE_IDLE = 0;
 constexpr uint32_t BRIDGE_SERVICE_COMPLETION = 1;
+constexpr uint32_t TEAM_DEADLINE_SLOT = 0;
+/* Provisional hard-only liveness floor. This is deliberately not presented as
+ * a benchmark-derived budget: the acceptance benchmark still has to freeze a
+ * per-stage/shape field before this constant may be tightened. */
+constexpr uint64_t TEAM_HARD_DEADLINE_NS = UINT64_C(1000000000);
+constexpr uint32_t TEAM_TERMINAL_BITS = 2;
+constexpr uint64_t TEAM_TERMINAL_MASK =
+    (UINT64_C(1) << TEAM_TERMINAL_BITS) - 1;
+constexpr uint64_t TEAM_GENERATION_MAX = UINT64_MAX >> TEAM_TERMINAL_BITS;
+enum : uint32_t {
+    TEAM_TERMINAL_IDLE = 0,
+    TEAM_TERMINAL_ACTIVE = 1,
+    TEAM_TERMINAL_COMPLETED = 2,
+    TEAM_TERMINAL_TIMED_OUT = 3,
+};
 constexpr size_t PREFILL_ROWS = LFM_PREFILL_MAX_ROWS;
 constexpr size_t TOKEN_INPUT_MAX_IDS = 8;
 std::atomic<uint64_t> next_engine_epoch{1};
@@ -517,7 +534,7 @@ struct MimiReq {
 };
 
 struct AudioReq {
-    LfmAudioEncodePassV1 pass{};
+    LfmAudioEncodePassV2 pass{};
     LfmConformerProgram conformer{};
     uint64_t adapted_values = 0;
     uint64_t frames = 0;
@@ -685,6 +702,55 @@ struct LfmEngineSnapshotV1 {
     uint64_t route_admission_deferrals;
 };
 
+/* Reserved crash evidence for one hard quorum failure. The capsule is wholly
+ * pointer-free so platform crash reporting can preserve it without chasing an
+ * engine, route, conversation, or scratch lifetime. It is never a CQ record:
+ * timeout poisons the process and therefore cannot publish ordinary progress. */
+struct alignas(ENGINE_CACHELINE) TeamFatalCapsule {
+    uint32_t size = sizeof(TeamFatalCapsule);
+    uint32_t abi_version = 1;
+    uint32_t request = REQ_NONE;
+    uint32_t stage = ST_IDLE;
+    KcTicketIdV1 workflow{};
+    KcTicketIdV1 pass{};
+    KcTicketIdV1 deadline{};
+    uint64_t conversation_id = 0;
+    uint64_t epoch = 0;
+    uint64_t scope_generation = 0;
+    uint64_t team_generation = 0;
+    uint64_t expected_mask = 0;
+    uint64_t entered_mask = 0;
+    uint64_t returned_mask = 0;
+    uint64_t hard_budget_ns = 0;
+    uint64_t elapsed_floor_ns = 0;
+    uint64_t deadline_event_sequence = 0;
+    uint64_t scheduled_arm_generation = 0;
+    uint64_t current_arm_generation = 0;
+};
+static_assert(std::is_trivially_copyable_v<TeamFatalCapsule>);
+
+static constexpr uint64_t team_terminal_word(uint64_t generation,
+                                             uint32_t state) {
+    return (generation << TEAM_TERMINAL_BITS) | state;
+}
+
+static constexpr uint64_t team_terminal_generation(uint64_t word) {
+    return word >> TEAM_TERMINAL_BITS;
+}
+
+static constexpr uint32_t team_terminal_state(uint64_t word) {
+    return static_cast<uint32_t>(word & TEAM_TERMINAL_MASK);
+}
+
+static bool claim_team_terminal(std::atomic<uint64_t> *word,
+                                uint64_t generation, uint32_t winner) {
+    uint64_t expected =
+        team_terminal_word(generation, TEAM_TERMINAL_ACTIVE);
+    return word->compare_exchange_strong(
+        expected, team_terminal_word(generation, winner),
+        std::memory_order_acq_rel, std::memory_order_acquire);
+}
+
 struct Engine {
     // Whole-pass programs use the engine records below; continuation-mounted
     // programs bind their PassSlot-owned records through these pointers. This
@@ -702,10 +768,14 @@ struct Engine {
     kc_runtime_t *control_runtime = nullptr;
     kc_service_t *bridge_service = nullptr;
     kc_service_t *route_service = nullptr;
+    kc_service_t *supervisor_service = nullptr;
     kc_service_notifier_t *bridge_notifier = nullptr;
     kc_service_notifier_t *route_notifier = nullptr;
+    kc_service_notifier_t *supervisor_notifier = nullptr;
+    kc_deadline_source_t *team_deadlines = nullptr;
     int n_workers = 0;
     int control_started = 0;
+    int bridge_started = 0;
     uint32_t block_count = 1;
     uint32_t lanes_total = 1;
     std::atomic<uint64_t> lane_gen{0};
@@ -726,6 +796,24 @@ struct Engine {
     std::atomic<uint64_t> bridge_team_generation{0};
     bool bridge_valid = false;
     std::atomic<uint64_t> bridge_retired_generation{0};
+    /* One fixed team means one active generation and therefore one reusable
+     * deadline slot. The packed word is the sole completion-vs-timeout CAS.
+     * If native expiry owns the deadline slot while completion owns this word,
+     * two generation stamps form a callback-only handshake; no stack waits. */
+    std::atomic<uint64_t> team_terminal{0};
+    kc_deadline_arm team_deadline_arm{};
+    KcSubmissionV1 supervised_submission{};
+    KcTicketIdV1 supervised_deadline{};
+    uint64_t supervised_scope_generation = 0;
+    uint64_t supervised_team_generation = 0;
+    uint32_t supervised_request = REQ_NONE;
+    uint32_t supervised_stage = ST_IDLE;
+    std::atomic<uint64_t> team_completion_deferred{0};
+    std::atomic<uint64_t> team_expiry_acked{0};
+    std::atomic<uint64_t> deadline_sequence{0};
+    std::atomic<uint32_t> deadline_ticket_generation{0};
+    std::atomic<uint32_t> fatal_ready{0};
+    TeamFatalCapsule fatal_capsule{};
     // Numerical publishers take a bounded, single-pass lease. Plan mutation
     // closes admission and succeeds only when every already-admitted publisher
     // has retired. No producer retries or waits for exclusivity.
@@ -3381,18 +3469,18 @@ static int configure_audio_gemm(Engine *e, PassSlot *slot) {
 
 static int prepare_audio_conformer(Engine *e, PassSlot *slot) {
     AudioReq &audio = slot->audio;
-    const LfmAudioEncodePassV1 &pass = audio.pass;
-    LfmF32Span samples{};
-    int status = lfm_resampler_process(
-        pass.resampler, pass.resampler_workspace, pass.pcm,
-        pass.sample_count, pass.resampled, pass.resampled_capacity, &samples);
+    const LfmAudioEncodePassV2 &pass = audio.pass;
+    LfmF32SpanChain samples{};
+    int status = lfm_resampler_process_spans(
+        pass.resampler, pass.resampler_workspace, &pass.pcm, pass.resampled,
+        pass.resampled_capacity, &samples);
     if (status != 0) return status;
 
     audio.frames = lfm_frontend_seq_len(pass.frontend, samples.length);
     if (audio.frames == 0) return -EINVAL;
-    status = lfm_frontend_forward_bf16_workspace(
-        pass.frontend, pass.frontend_workspace, samples.data, samples.length,
-        pass.mel, pass.mel_capacity);
+    status = lfm_frontend_forward_bf16_spans_workspace(
+        pass.frontend, pass.frontend_workspace, &samples, pass.mel,
+        pass.mel_capacity);
     if (status != 0) return status;
 
     const uint64_t rows =
@@ -3571,6 +3659,241 @@ static bool ticket_equal(const KcTicketIdV1 &a, const KcTicketIdV1 &b) {
            a.generation == b.generation && a.kind == b.kind;
 }
 
+static uint64_t next_sequence(std::atomic<uint64_t> *counter);
+static uint32_t next_generation(std::atomic<uint32_t> *counter);
+static void bridge_team_complete(void *context, uint64_t generation);
+static void process_team_completion(Engine *e, uint64_t generation);
+
+static void deadline_supervisor_notify(void *context) {
+    notify_service(static_cast<kc_service_notifier_t *>(context));
+}
+
+static uint64_t expected_team_mask(const Engine *e) {
+    if (!e || e->lanes_total == 0 || e->lanes_total > 64) std::abort();
+    return e->lanes_total == 64
+               ? UINT64_MAX
+               : (UINT64_C(1) << e->lanes_total) - 1;
+}
+
+static void fill_team_fatal_capsule(
+    TeamFatalCapsule *capsule, const KcSubmissionV1 &submission,
+    const kc_deadline_event &event, uint32_t request, uint32_t stage,
+    uint64_t budget_ns, const kc_team_quorum_snapshot &quorum) {
+    if (!capsule) std::abort();
+    *capsule = {
+        .size = sizeof(*capsule),
+        .abi_version = 1,
+        .request = request,
+        .stage = stage,
+        .workflow = submission.parent,
+        .pass = submission.ticket,
+        .deadline = event.child,
+        .conversation_id = submission.conversation_id,
+        .epoch = submission.epoch,
+        .scope_generation = event.scope_generation,
+        .team_generation = event.team_generation,
+        .expected_mask = quorum.expected_mask,
+        .entered_mask = quorum.entered_mask,
+        .returned_mask = quorum.returned_mask,
+        .hard_budget_ns = budget_ns,
+        .elapsed_floor_ns = budget_ns,
+        .deadline_event_sequence = event.sequence,
+        .scheduled_arm_generation = event.scheduled_arm_generation,
+        .current_arm_generation = event.current_arm_generation,
+    };
+}
+
+static bool deadline_event_matches(const Engine *e,
+                                   const kc_deadline_event &event) {
+    const KcSubmissionV1 &submission = e->supervised_submission;
+    return event.kind == KC_DEADLINE_EVENT_EXPIRED &&
+           event.slot == TEAM_DEADLINE_SLOT &&
+           event.scheduled_arm_generation != 0 &&
+           event.current_arm_generation ==
+               event.scheduled_arm_generation &&
+           event.team_generation == e->supervised_team_generation &&
+           event.scope_generation == e->supervised_scope_generation &&
+           event.epoch == submission.epoch &&
+           event.domain == e->runtime_epoch &&
+           ticket_equal(event.child, e->supervised_deadline) &&
+           ticket_equal(event.parent, submission.ticket) &&
+           submission.parent.runtime_epoch != 0 &&
+           submission.parent.sequence != 0 &&
+           submission.parent.generation != 0 &&
+           submission.parent.kind == KC_COORD_TICKET_WORKFLOW;
+}
+
+static uint64_t claim_deferred_team_completion(
+    std::atomic<uint64_t> *deferred, std::atomic<uint64_t> *acked) {
+    const uint64_t generation =
+        deferred->load(std::memory_order_acquire);
+    if (generation == 0 ||
+        acked->load(std::memory_order_acquire) != generation) {
+        return 0;
+    }
+    uint64_t expected = generation;
+    if (!deferred->compare_exchange_strong(
+            expected, 0, std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+        return 0;
+    }
+    expected = generation;
+    if (!acked->compare_exchange_strong(
+            expected, 0, std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+        std::abort();
+    }
+    return generation;
+}
+
+static void resume_deferred_team_completion(Engine *e) {
+    const uint64_t generation = claim_deferred_team_completion(
+        &e->team_completion_deferred, &e->team_expiry_acked);
+    if (generation == 0) return;
+    process_team_completion(e, generation);
+}
+
+static void team_supervisor_main(void *context) {
+    Engine *e = static_cast<Engine *>(context);
+    kc_deadline_event event = {
+        .size = sizeof(event),
+        .abi_version = KC_ABI_VERSION,
+    };
+    const int event_status = kc_deadline_source_event_get(
+        e->team_deadlines, TEAM_DEADLINE_SLOT, &event);
+    if (event_status == 0) {
+        if (!deadline_event_matches(e, event)) std::abort();
+        if (claim_team_terminal(&e->team_terminal, event.team_generation,
+                                TEAM_TERMINAL_TIMED_OUT)) {
+            kc_team_quorum_snapshot quorum = {
+                .size = sizeof(quorum),
+                .abi_version = KC_ABI_VERSION,
+                .generation = event.team_generation,
+                .expected_mask = expected_team_mask(e),
+                .entered_mask = 0,
+                .returned_mask = 0,
+            };
+            const int quorum_status = kc_team_quorum_snapshot_get(
+                e->team, event.team_generation, &quorum);
+            if (quorum_status != 0) {
+                quorum.expected_mask = expected_team_mask(e);
+                quorum.entered_mask = 0;
+                quorum.returned_mask = 0;
+            }
+            fill_team_fatal_capsule(
+                &e->fatal_capsule, e->supervised_submission, event,
+                e->supervised_request, e->supervised_stage,
+                TEAM_HARD_DEADLINE_NS, quorum);
+            /* This release-published reserved capsule is the non-droppable
+             * fatal record. No CQ, recurrence, scratch retirement, or retry is
+             * legal after timeout wins; abort hands the capsule to the platform
+             * crash report instead of pretending the model can recover. */
+            e->fatal_ready.store(1, std::memory_order_release);
+            std::abort();
+        }
+        const uint64_t terminal =
+            e->team_terminal.load(std::memory_order_acquire);
+        if (team_terminal_generation(terminal) != event.team_generation ||
+            team_terminal_state(terminal) != TEAM_TERMINAL_COMPLETED) {
+            std::abort();
+        }
+        if (kc_deadline_source_event_ack(e->team_deadlines, &event) != 0) {
+            std::abort();
+        }
+        uint64_t idle = 0;
+        if (!e->team_expiry_acked.compare_exchange_strong(
+                idle, event.team_generation, std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            std::abort();
+        }
+    } else if (event_status != -EAGAIN) {
+        std::abort();
+    }
+
+    resume_deferred_team_completion(e);
+
+    kc_deadline_source_snapshot snapshot = {
+        .size = sizeof(snapshot),
+        .abi_version = KC_ABI_VERSION,
+    };
+    if (kc_deadline_source_snapshot_get(e->team_deadlines, &snapshot) != 0) {
+        std::abort();
+    }
+    if (snapshot.phase == KC_DEADLINE_SOURCE_STOPPED &&
+        snapshot.pending_events == 0) {
+        if (kc_service_complete_current(e->supervisor_service) != 0) {
+            std::abort();
+        }
+    }
+}
+
+static void begin_team_supervision(Engine *e, uint64_t generation) {
+    if (!e || !e->team_deadlines || generation == 0 ||
+        generation > TEAM_GENERATION_MAX ||
+        e->team_completion_deferred.load(std::memory_order_acquire) != 0 ||
+        e->team_expiry_acked.load(std::memory_order_acquire) != 0) {
+        std::abort();
+    }
+    uint64_t terminal = e->team_terminal.load(std::memory_order_acquire);
+    const uint64_t prior_generation = team_terminal_generation(terminal);
+    const uint32_t prior_state = team_terminal_state(terminal);
+    if (!((prior_generation == 0 && prior_state == TEAM_TERMINAL_IDLE) ||
+          (prior_generation < generation &&
+           prior_state == TEAM_TERMINAL_COMPLETED)) ||
+        !e->active_slot || e->bridge_slot_owner == 0) {
+        std::abort();
+    }
+    if (!e->team_terminal.compare_exchange_strong(
+            terminal,
+            team_terminal_word(generation, TEAM_TERMINAL_ACTIVE),
+            std::memory_order_acq_rel, std::memory_order_acquire)) {
+        std::abort();
+    }
+
+    KcTicketIdV1 child = {
+        .runtime_epoch = e->runtime_epoch,
+        .sequence = next_sequence(&e->deadline_sequence),
+        .generation = next_generation(&e->deadline_ticket_generation),
+        .kind = KC_TICKET_KIND_DEADLINE,
+    };
+    /* Publish every identity field before arming. If this control callback is
+     * descheduled for the whole hard budget immediately after the native timer
+     * is armed, its expiry still observes a complete pointer-free correlation
+     * record and correctly reports a never-entered generation. */
+    e->supervised_submission = e->active_submission;
+    e->supervised_deadline = child;
+    e->supervised_scope_generation = e->bridge_slot_owner;
+    e->supervised_team_generation = generation;
+    e->supervised_request = static_cast<uint32_t>(e->cur_req);
+    e->supervised_stage = e->stage.kind;
+    const kc_deadline_arm_config config = {
+        .size = sizeof(config),
+        .abi_version = KC_ABI_VERSION,
+        .slot = TEAM_DEADLINE_SLOT,
+        .reserved = 0,
+        .delay_ns = TEAM_HARD_DEADLINE_NS,
+        .child = child,
+        .parent = e->active_submission.ticket,
+        .scope_generation = e->bridge_slot_owner,
+        .epoch = e->active_submission.epoch,
+        .domain = e->runtime_epoch,
+        .team_generation = generation,
+    };
+    kc_deadline_arm arm = {};
+    if (kc_deadline_source_arm(e->team_deadlines, &config, &arm) != 0) {
+        std::abort();
+    }
+    e->team_deadline_arm = arm;
+}
+
+static void dispatch_supervised_team(Engine *e, uint64_t generation) {
+    begin_team_supervision(e, generation);
+    if (kc_team_dispatch_notify(e->team, generation, bridge_team_complete, e) !=
+        0) {
+        std::abort();
+    }
+}
+
 static void publish_rejected(Engine *e, const KcSubmissionV1 &submission, int status) {
     KcCompletionV1 completion{};
     completion.size = sizeof(completion);
@@ -3589,8 +3912,6 @@ static void publish_rejected(Engine *e, const KcSubmissionV1 &submission, int st
 // SQ/CQ records remain authoritative. These service notifications are only
 // coalesced predicate edges, and each callback performs one bounded state
 // transition before returning to kcoro's explicit one-worker control runtime.
-static void bridge_team_complete(void *context, uint64_t generation);
-
 static void redispatch_team_stage(Engine *e, uint64_t generation) {
     const uint64_t next = generation + 1;
     if (next == 0) std::abort();
@@ -3604,15 +3925,46 @@ static void redispatch_team_stage(Engine *e, uint64_t generation) {
     e->lane_gen.store(next, std::memory_order_release);
     e->bridge_team_generation.store(next, std::memory_order_release);
     e->dispatch_wakes.fetch_add(1, std::memory_order_relaxed);
-    if (kc_team_dispatch_notify(e->team, next, bridge_team_complete, e) != 0) {
-        std::abort();
-    }
+    dispatch_supervised_team(e, next);
 }
 
 static void bridge_team_complete(void *context, uint64_t generation) {
     Engine *e = static_cast<Engine *>(context);
     e->block_completions.fetch_add(e->block_count,
                                    std::memory_order_relaxed);
+    if (!claim_team_terminal(&e->team_terminal, generation,
+                             TEAM_TERMINAL_COMPLETED)) {
+        const uint64_t terminal =
+            e->team_terminal.load(std::memory_order_acquire);
+        if (team_terminal_generation(terminal) == generation &&
+            team_terminal_state(terminal) == TEAM_TERMINAL_TIMED_OUT) {
+            return;
+        }
+        std::abort();
+    }
+    if (e->team_deadline_arm.team_generation != generation ||
+        e->team_deadline_arm.slot != TEAM_DEADLINE_SLOT ||
+        e->team_deadline_arm.arm_generation == 0) {
+        std::abort();
+    }
+    const int retired = kc_deadline_source_retire(
+        e->team_deadlines, TEAM_DEADLINE_SLOT,
+        e->team_deadline_arm.arm_generation);
+    if (retired == KC_DEADLINE_RETIRE_RETIRED) {
+        process_team_completion(e, generation);
+        return;
+    }
+    if (retired != KC_DEADLINE_RETIRE_EXPIRY_WON) std::abort();
+    uint64_t idle = 0;
+    if (!e->team_completion_deferred.compare_exchange_strong(
+            idle, generation, std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+        std::abort();
+    }
+    notify_service(e->supervisor_notifier);
+}
+
+static void process_team_completion(Engine *e, uint64_t generation) {
     PassSlot *slot = e->active_slot;
     if (!slot) std::abort();
     if (slot->request == REQ_CONV_LAYER && advance_conv_program(slot)) {
@@ -3769,6 +4121,8 @@ static void bridge_service_main(void *context) {
         lfm_kernel_bridge_try_submission(e->bridge, &submission);
     if (status == -EAGAIN) return;
     if (status == -ECANCELED) {
+        if (e->team_deadlines)
+            kc_deadline_source_request_stop(e->team_deadlines);
         kc_service_request_stop(e->bridge_service);
         return;
     }
@@ -3784,6 +4138,10 @@ static void bridge_service_main(void *context) {
                 submission.command == KC_COORD_COMMAND_RUN_PASS &&
                 submission.pass_budget == 1 && submission.flags == 0 &&
                 submission.ticket.kind == KC_COORD_TICKET_PASS &&
+                submission.parent.runtime_epoch == e->runtime_epoch &&
+                submission.parent.sequence != 0 &&
+                submission.parent.generation != 0 &&
+                submission.parent.kind == KC_COORD_TICKET_WORKFLOW &&
                 submission.epoch != 0 && slot->engine == e &&
                 slot->context_id == submission.conversation_id &&
                 submission.descriptor.generation ==
@@ -3791,7 +4149,8 @@ static void bridge_service_main(void *context) {
                 slot->submission.descriptor.slot == slot->index &&
                 slot->submission.descriptor.generation ==
                     submission.descriptor.generation &&
-                ticket_equal(slot->submission.ticket, submission.ticket);
+                ticket_equal(slot->submission.ticket, submission.ticket) &&
+                ticket_equal(slot->submission.parent, submission.parent);
     }
     if (valid) {
         switch (slot->request) {
@@ -3866,10 +4225,7 @@ static void bridge_service_main(void *context) {
     e->lane_gen.store(generation, std::memory_order_release);
     e->bridge_team_generation.store(generation, std::memory_order_release);
     e->dispatch_wakes.fetch_add(1, std::memory_order_relaxed);
-    if (kc_team_dispatch_notify(e->team, generation, bridge_team_complete, e) !=
-        0) {
-        std::abort();
-    }
+    dispatch_supervised_team(e, generation);
 }
 
 static uint64_t next_sequence(std::atomic<uint64_t> *counter) {
@@ -3890,11 +4246,14 @@ static uint32_t next_generation(std::atomic<uint32_t> *counter) {
 
 static int submit_slot(Engine *e, PassSlot *slot, uint64_t generation,
                        int request, uint64_t context_id,
+                       const KcTicketIdV1 &parent,
                        PassContinuation continuation,
                        void *continuation_context) {
     if (!e || !slot || slot->engine != e ||
         !request_kind_valid(static_cast<uint32_t>(request)) || generation == 0 ||
-        !continuation ||
+        !continuation || parent.runtime_epoch != e->runtime_epoch ||
+        parent.sequence == 0 || parent.generation == 0 ||
+        parent.kind != KC_COORD_TICKET_WORKFLOW ||
         slot->lease.load(std::memory_order_acquire) !=
             pass_slot_lease(generation, PASS_SLOT_RESERVED)) {
         return -EINVAL;
@@ -3914,6 +4273,7 @@ static int submit_slot(Engine *e, PassSlot *slot, uint64_t generation,
     submission.ticket.sequence = sequence;
     submission.ticket.generation = ticket_generation;
     submission.ticket.kind = KC_COORD_TICKET_PASS;
+    submission.parent = parent;
     submission.conversation_id = context_id;
     submission.epoch = context_id == 0 ? 1 : context_id;
     // The descriptor is an immutable locator into the engine-owned pass-slot
@@ -4531,7 +4891,8 @@ static void audio_route_service_main(void *context) {
     }
     const uint64_t slot_owner = slot_generation(slot);
     status = submit_slot(engine, slot, slot_owner, request,
-                         request_context, continue_audio_route, route);
+                         request_context, route->ticket,
+                         continue_audio_route, route);
     if (status != 0) {
         if (!release_pass_slot(slot, slot_owner)) std::abort();
         settle_audio_route(route, AUDIO_ROUTE_RUNNING, status);
@@ -4622,23 +4983,51 @@ void *lfm_engine_new(int workers) {
         .context = e,
         .reserved = 0,
     };
+    const kc_service_config supervisor_service_config = {
+        .size = sizeof(kc_service_config),
+        .abi_version = KC_ABI_VERSION,
+        .callback = team_supervisor_main,
+        .context = e,
+        .reserved = 0,
+    };
     if (kc_service_create(e->control_runtime, &bridge_service_config,
                           &e->bridge_service) != 0 ||
         kc_service_create(e->control_runtime, &route_service_config,
                           &e->route_service) != 0 ||
+        kc_service_create(e->control_runtime, &supervisor_service_config,
+                          &e->supervisor_service) != 0 ||
         kc_service_notifier_create(e->bridge_service,
                                    &e->bridge_notifier) != 0 ||
         kc_service_notifier_create(e->route_service,
                                    &e->route_notifier) != 0 ||
+        kc_service_notifier_create(e->supervisor_service,
+                                   &e->supervisor_notifier) != 0 ||
         kc_runtime_start(e->control_runtime) != 0) {
         lfm_engine_free(e);
         return nullptr;
     }
     e->control_started = 1;
+    if (kc_service_start(e->supervisor_service) != 0) {
+        lfm_engine_free(e);
+        return nullptr;
+    }
+    const kc_deadline_source_config deadline_config = {
+        .size = sizeof(deadline_config),
+        .abi_version = KC_ABI_VERSION,
+        .capacity = 1,
+        .reserved = 0,
+        .notify = deadline_supervisor_notify,
+        .context = e->supervisor_notifier,
+    };
+    if (kc_deadline_source_create(&deadline_config, &e->team_deadlines) != 0) {
+        lfm_engine_free(e);
+        return nullptr;
+    }
     if (kc_service_start(e->bridge_service) != 0) {
         lfm_engine_free(e);
         return nullptr;
     }
+    e->bridge_started = 1;
     if (kc_service_start(e->route_service) != 0) {
         lfm_engine_free(e);
         return nullptr;
@@ -4651,6 +5040,10 @@ void lfm_engine_request_stop(void *ep) {
     if (!e) return;
     e->route_retire.store(true, std::memory_order_seq_cst);
     if (e->bridge) lfm_kernel_bridge_request_stop(e->bridge);
+    if (!e->team_deadlines && e->supervisor_service)
+        kc_service_request_stop(e->supervisor_service);
+    if (e->team_deadlines && !e->bridge_started)
+        kc_deadline_source_request_stop(e->team_deadlines);
     notify_service(e->route_notifier);
     notify_service(e->bridge_notifier);
 }
@@ -4660,6 +5053,114 @@ void lfm_engine_request_stop(void *ep) {
 // typed payload, so submitting an empty test slot would be an unsafe probe.
 int lfm_internal_engine_request_kind_valid_for_test(uint32_t kind) {
     return request_kind_valid(kind) ? 1 : 0;
+}
+
+int lfm_internal_engine_team_terminal_race_for_test(
+    uint64_t generation, uint32_t first, uint32_t second,
+    uint32_t *winner_bits, uint32_t *terminal_state) {
+    if (generation == 0 || generation > TEAM_GENERATION_MAX ||
+        !winner_bits || !terminal_state ||
+        (first != TEAM_TERMINAL_COMPLETED &&
+         first != TEAM_TERMINAL_TIMED_OUT) ||
+        (second != TEAM_TERMINAL_COMPLETED &&
+         second != TEAM_TERMINAL_TIMED_OUT) ||
+        first == second) {
+        return -EINVAL;
+    }
+    std::atomic<uint64_t> terminal{
+        team_terminal_word(generation, TEAM_TERMINAL_ACTIVE)};
+    uint32_t winners = 0;
+    if (claim_team_terminal(&terminal, generation, first)) winners |= 1;
+    if (claim_team_terminal(&terminal, generation, second)) winners |= 2;
+    const uint64_t result = terminal.load(std::memory_order_acquire);
+    if (team_terminal_generation(result) != generation) return -EFAULT;
+    *winner_bits = winners;
+    *terminal_state = team_terminal_state(result);
+    return 0;
+}
+
+int lfm_internal_engine_deferred_handshake_for_test(
+    uint64_t generation, uint32_t ack_first, uint64_t *after_first,
+    uint64_t *after_second, uint64_t *after_duplicate) {
+    if (generation == 0 || ack_first > 1 || !after_first || !after_second ||
+        !after_duplicate) {
+        return -EINVAL;
+    }
+    std::atomic<uint64_t> deferred{0};
+    std::atomic<uint64_t> acked{0};
+    if (ack_first) {
+        acked.store(generation, std::memory_order_release);
+    } else {
+        deferred.store(generation, std::memory_order_release);
+    }
+    *after_first = claim_deferred_team_completion(&deferred, &acked);
+    if (ack_first) {
+        deferred.store(generation, std::memory_order_release);
+    } else {
+        acked.store(generation, std::memory_order_release);
+    }
+    *after_second = claim_deferred_team_completion(&deferred, &acked);
+    *after_duplicate = claim_deferred_team_completion(&deferred, &acked);
+    return 0;
+}
+
+int lfm_internal_engine_fatal_capsule_for_test(
+    uint64_t generation, uint64_t expected_mask, uint64_t entered_mask,
+    uint64_t returned_mask, TeamFatalCapsule *out) {
+    if (!out || out->size < sizeof(*out) || generation == 0 ||
+        (entered_mask & ~expected_mask) != 0 ||
+        (returned_mask & ~entered_mask) != 0) {
+        return -EINVAL;
+    }
+    const KcSubmissionV1 submission = {
+        .size = sizeof(submission),
+        .abi_version = KC_COORD_ABI_VERSION,
+        .ticket = {
+            .runtime_epoch = 11,
+            .sequence = 22,
+            .generation = 32,
+            .kind = KC_COORD_TICKET_PASS,
+        },
+        .parent = {
+            .runtime_epoch = 11,
+            .sequence = 21,
+            .generation = 31,
+            .kind = KC_COORD_TICKET_WORKFLOW,
+        },
+        .conversation_id = 44,
+        .epoch = 55,
+    };
+    const kc_deadline_event event = {
+        .size = sizeof(event),
+        .abi_version = KC_ABI_VERSION,
+        .slot = TEAM_DEADLINE_SLOT,
+        .kind = KC_DEADLINE_EVENT_EXPIRED,
+        .sequence = 77,
+        .scheduled_arm_generation = 88,
+        .current_arm_generation = 88,
+        .child = {
+            .runtime_epoch = 11,
+            .sequence = 23,
+            .generation = 33,
+            .kind = KC_TICKET_KIND_DEADLINE,
+        },
+        .parent = submission.ticket,
+        .scope_generation = 66,
+        .epoch = submission.epoch,
+        .domain = 99,
+        .team_generation = generation,
+    };
+    const kc_team_quorum_snapshot quorum = {
+        .size = sizeof(quorum),
+        .abi_version = KC_ABI_VERSION,
+        .generation = generation,
+        .expected_mask = expected_mask,
+        .entered_mask = entered_mask,
+        .returned_mask = returned_mask,
+    };
+    fill_team_fatal_capsule(out, submission, event, REQ_TOKEN_PASS,
+                            ST_NORM, TEAM_HARD_DEADLINE_NS, quorum);
+    return 0;
 }
 
 int lfm_internal_engine_grid_snapshot_for_test(
@@ -4737,7 +5238,7 @@ uint64_t lfm_engine_audio_encode_passes(const void *ep) {
 }
 
 int lfm_engine_audio_encode_submit(
-    void *ep, uint64_t model_id, const LfmAudioEncodePassV1 *pass,
+    void *ep, uint64_t model_id, const LfmAudioEncodePassV2 *pass,
     uint64_t *out_adapted_values, LfmAudioRouteNotify notify,
     void *notify_context, LfmAudioRouteHandle *out_handle) {
     Engine *e = static_cast<Engine *>(ep);
@@ -4745,11 +5246,18 @@ int lfm_engine_audio_encode_submit(
         pass->abi_version != LFM_AUDIO_PASS_ABI || !pass->resampler ||
         !pass->resampler_workspace || !pass->frontend ||
         !pass->frontend_workspace || !pass->conformer ||
-        !pass->conformer_workspace || !pass->pcm || pass->sample_count == 0 ||
+        !pass->conformer_workspace || pass->pcm.count == 0 ||
+        pass->pcm.length == 0 ||
         (!pass->resampled && pass->resampled_capacity != 0) || !pass->mel ||
         pass->mel_capacity == 0 || !pass->adapted ||
         pass->adapted_capacity == 0 || !out_adapted_values || !notify ||
         !out_handle) {
+        return -EINVAL;
+    }
+    LfmF32SpanChain checked{};
+    if (lfm_f32_span_chain_init(pass->pcm.spans, pass->pcm.count, &checked) !=
+            0 ||
+        std::memcmp(&checked, &pass->pcm, sizeof(checked)) != 0) {
         return -EINVAL;
     }
     *out_handle = {};
@@ -4864,6 +5372,9 @@ void lfm_engine_free(void *ep) {
     if (e->bridge_service) {
         if (kc_service_join(e->bridge_service) != 0) std::abort();
     }
+    if (e->supervisor_service) {
+        if (kc_service_join(e->supervisor_service) != 0) std::abort();
+    }
     /* Service completion means every numerical generation is authoritative,
      * but its last fixed-team member may still be returning from the notifier
      * edge that published that fact. Quiesce the owned producer threads before
@@ -4875,10 +5386,19 @@ void lfm_engine_free(void *ep) {
             std::abort();
         e->team = nullptr;
     }
+    if (e->team_deadlines) {
+        if (kc_deadline_source_destroy(e->team_deadlines) != 0) std::abort();
+        e->team_deadlines = nullptr;
+    }
     /* A notifier is the callback-side lifetime lease. Every engine-owned
-     * producer has been stopped and both retained continuations are DONE before
+     * producer has been stopped and all retained continuations are DONE before
      * it is released; service_destroy intentionally refuses to race a live
      * notifier. */
+    if (e->supervisor_notifier) {
+        if (kc_service_notifier_destroy(e->supervisor_notifier) != 0)
+            std::abort();
+        e->supervisor_notifier = nullptr;
+    }
     if (e->route_notifier) {
         if (kc_service_notifier_destroy(e->route_notifier) != 0) std::abort();
         e->route_notifier = nullptr;
@@ -4894,6 +5414,10 @@ void lfm_engine_free(void *ep) {
     if (e->bridge_service) {
         if (kc_service_destroy(e->bridge_service) != 0) std::abort();
         e->bridge_service = nullptr;
+    }
+    if (e->supervisor_service) {
+        if (kc_service_destroy(e->supervisor_service) != 0) std::abort();
+        e->supervisor_service = nullptr;
     }
     if (e->control_runtime) {
         kc_runtime_request_stop(e->control_runtime);

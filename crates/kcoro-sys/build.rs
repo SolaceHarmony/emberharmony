@@ -11,6 +11,8 @@ fn main() {
         "kc_service.c",
         "kc_doorbell.c",
         "kc_team.c",
+        "kc_fixed_scope.c",
+        "kc_deadline.c",
     ];
 
     let mut core = cc::Build::new();

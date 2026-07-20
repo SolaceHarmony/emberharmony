@@ -1,12 +1,12 @@
 //! Callback-driven host audio service mounted on one retained kcoro continuation.
 //!
-//! Platform callbacks publish bounded PCM/control edges and return. The retained
-//! [`SessionTask`] owns the durable VAD and orchestration state and advances only
-//! when a producer makes one of its predicates ready. It never polls a clock or
-//! blocks an operating-system thread on behalf of model progress.
+//! Platform callbacks publish bounded native PCM/control edges and return. The
+//! retained [`SessionTask`] owns only device handles, outward UI delivery, and
+//! engine-event draining; native kcoro owns detector, turn, and model state. It
+//! never polls a clock or blocks an operating-system thread for model progress.
 
-use std::cell::{Cell, UnsafeCell};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::cell::UnsafeCell;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -18,17 +18,13 @@ use kcoro_sys::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::voice_api::{CaptureReservation, PlaybackSource};
+use crate::voice_api::{CaptureSink, PlaybackSource};
 use crate::{EngineProgress, VoiceEngine, VoiceEvent};
 
 type Res<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
-type Capture = Arc<CaptureIngress>;
-type Playback = Arc<PlaybackReference>;
 type Stats = Arc<AudioStats>;
 #[cfg(feature = "audio-io")]
 type HostStream = cpal::Stream;
-#[cfg(not(feature = "audio-io"))]
-struct HostStream;
 
 #[cfg(feature = "audio-io")]
 struct DeviceStreams {
@@ -38,21 +34,6 @@ struct DeviceStreams {
 
 #[cfg(not(feature = "audio-io"))]
 struct DeviceStreams;
-
-const CAPTURE_BLOCKS: usize = 2;
-const MAX_UTTERANCE_SECONDS: usize = 30;
-const PLAYBACK_VAD_MULTIPLIER: f32 = 3.0;
-const PLAYBACK_ECHO_MULTIPLIER: f32 = 2.5;
-/// Barge-in sustain gate (spec 09, W5): while the assistant is audible, this many
-/// CONSECUTIVE voiced VAD windows (200ms each at the in_rate/5 window size) are
-/// required before an interrupt fires. One loud window is how echo blips and coughs
-/// stop the assistant; 400ms of sustained speech is how a human interjects. When the
-/// assistant is quiet the first voiced window still engages immediately.
-const BARGE_IN_SUSTAIN_WINDOWS: usize = 2;
-/// Echo-tail speech policy. This duration is converted once to capture frames;
-/// microphone callbacks, including callbacks containing acoustic silence, advance
-/// the cursor. A stopped device never masquerades as elapsed silence.
-const PLAYBACK_ECHO_TAIL_MS: u64 = 700;
 
 /// Trace the voice call graph when the host enables `RuntimeConfig::trace`.
 /// Configuration is explicit so an inherited process environment cannot alter
@@ -82,241 +63,39 @@ macro_rules! vtrace {
     };
 }
 
-struct AudioInputWriter {
-    capture: Capture,
-    notify: RealtimeNotifier,
-    // One endpoint owns the SPSC producer cursor. Cell is Send but not Sync,
-    // preventing shared-reference publication from manufacturing another
-    // concurrent producer over the native reservation.
-    producer: std::marker::PhantomData<Cell<()>>,
-}
-
-impl AudioInputWriter {
-    fn publish(&mut self, dropped: usize, frames: usize) -> usize {
-        // The edge represents a callback/sample-clock transition, not only a
-        // successful write. A seal racing an over-capacity callback may first
-        // observe WRITING and yield; that callback restores OPEN even when it
-        // drops the whole block, so it must resume the continuation to close
-        // the turn. Coalescing happens inside the retained notifier.
-        if frames != 0 {
-            self.notify.notify().expect("capture edge notify failed");
-        }
-        dropped
-    }
-
-    /// Downmix one interleaved signed-16 callback block directly into the
-    /// capture ring. Admission is block-atomic: the return value is either zero
-    /// or the complete frame count, so a realtime callback never publishes a
-    /// prefix/suffix splice and never allocates an intermediate PCM vector.
-    fn push_interleaved_i16(&mut self, samples: &[i16], channels: usize) -> usize {
-        if samples.is_empty() {
-            return 0;
-        }
-        if channels == 0 {
-            return samples.len();
-        }
-        if samples.len() % channels != 0 {
-            return samples.len().div_ceil(channels);
-        }
-        let frames = samples.len() / channels;
-        let dropped = self.capture.write_interleaved_i16(samples, channels);
-        self.publish(dropped, frames)
-    }
-
-    fn push_interleaved_f32(&mut self, samples: &[f32], channels: usize) -> usize {
-        // A live device always reports at least one channel; zero is a corrupt
-        // config, not a case to silently report as zero frames.
-        let frames = samples.len() / channels;
-        let dropped = self.capture.write_interleaved_f32(samples, channels);
-        self.publish(dropped, frames)
-    }
-
-    fn push_interleaved_u16(&mut self, samples: &[u16], channels: usize) -> usize {
-        let frames = samples.len() / channels;
-        let dropped = self.capture.write_interleaved_u16(samples, channels);
-        self.publish(dropped, frames)
-    }
-}
-
-/// Bounded callback-to-continuation dock. The callback owns only the block
-/// selected by `active`; the retained VAD continuation seals that block before
-/// changing the index. The sample clock advances for every valid hardware
-/// callback, including a block dropped under backpressure, so acoustic policy
-/// is driven by device samples rather than a timer.
-struct CaptureIngress {
-    blocks: [Arc<CaptureReservation>; CAPTURE_BLOCKS],
-    active: AtomicUsize,
-    clock: Arc<AtomicUsize>,
-    stats: Stats,
-}
-
-impl CaptureIngress {
-    fn new(
-        blocks: [Arc<CaptureReservation>; CAPTURE_BLOCKS],
-        clock: Arc<AtomicUsize>,
-        stats: Stats,
-    ) -> Capture {
-        Arc::new(Self {
-            blocks,
-            active: AtomicUsize::new(0),
-            clock,
-            stats,
-        })
-    }
-
-    fn write_interleaved_f32(&self, samples: &[f32], channels: usize) -> usize {
-        if channels == 0 || samples.len() % channels != 0 {
-            return samples.len().div_ceil(channels.max(1));
-        }
-        let frames = samples.len() / channels;
-        self.clock.fetch_add(frames, Ordering::Release);
-        let Some(block) = self.blocks.get(self.active.load(Ordering::Acquire)) else {
-            self.record_drop(frames);
-            return frames;
-        };
-        let dropped = block.write_interleaved_f32(samples, channels);
-        self.record_drop(dropped);
-        dropped
-    }
-
-    fn write_interleaved_i16(&self, samples: &[i16], channels: usize) -> usize {
-        if channels == 0 || samples.len() % channels != 0 {
-            return samples.len().div_ceil(channels.max(1));
-        }
-        let frames = samples.len() / channels;
-        self.clock.fetch_add(frames, Ordering::Release);
-        let Some(block) = self.blocks.get(self.active.load(Ordering::Acquire)) else {
-            self.record_drop(frames);
-            return frames;
-        };
-        let dropped = block.write_interleaved_i16(samples, channels);
-        self.record_drop(dropped);
-        dropped
-    }
-
-    fn write_interleaved_u16(&self, samples: &[u16], channels: usize) -> usize {
-        if channels == 0 || samples.len() % channels != 0 {
-            return samples.len().div_ceil(channels.max(1));
-        }
-        let frames = samples.len() / channels;
-        self.clock.fetch_add(frames, Ordering::Release);
-        let Some(block) = self.blocks.get(self.active.load(Ordering::Acquire)) else {
-            self.record_drop(frames);
-            return frames;
-        };
-        let dropped = block.write_interleaved_u16(samples, channels);
-        self.record_drop(dropped);
-        dropped
-    }
-
-    fn record_drop(&self, dropped: usize) {
-        if dropped != 0 {
-            self.stats
-                .dropped_samples
-                .fetch_add(dropped as u64, Ordering::Relaxed);
-        }
-    }
-
-    fn deactivate(&self) {
-        self.active.store(CAPTURE_BLOCKS, Ordering::Release);
-    }
-
-    fn activate(&self, index: usize) {
-        debug_assert!(index < CAPTURE_BLOCKS);
-        self.active.store(index, Ordering::Release);
-    }
-
-    fn next_open(&self, exclude: usize) -> Option<usize> {
-        (0..CAPTURE_BLOCKS).find(|index| *index != exclude && self.blocks[*index].is_open())
-    }
-
-    fn rearm(&self) -> Result<(), String> {
-        for block in &self.blocks {
-            let _ = block.try_rearm()?;
-        }
-        Ok(())
-    }
-}
-
-struct PlaybackReference {
-    active: AtomicBool,
-    rms_bits: AtomicU32,
-    capture_clock: Arc<AtomicUsize>,
-    tail_frames: usize,
-    /// Capture cursor at the first playback-idle edge. `usize::MAX` means no tail.
-    idle_at_frame: AtomicUsize,
-}
-
-impl PlaybackReference {
-    fn new(capture_clock: Arc<AtomicUsize>, capture_rate: u32) -> Playback {
-        Arc::new(Self {
-            active: AtomicBool::new(false),
-            rms_bits: AtomicU32::new(0.0f32.to_bits()),
-            capture_clock,
-            tail_frames: ((capture_rate as u64 * PLAYBACK_ECHO_TAIL_MS) / 1_000) as usize,
-            idle_at_frame: AtomicUsize::new(usize::MAX),
-        })
-    }
-
-    fn set_playing(&self, rms: f32) {
-        self.rms_bits
-            .store(rms.max(0.0).to_bits(), Ordering::Release);
-        self.active.store(true, Ordering::Release);
-        self.idle_at_frame.store(usize::MAX, Ordering::Release);
-    }
-
-    fn set_idle(&self) {
-        // Only the first idle after playing starts the tail cursor; repeated
-        // set_idle calls (TurnComplete then Error, etc.) must not extend it.
-        if self.active.swap(false, Ordering::AcqRel) {
-            self.idle_at_frame.store(
-                self.capture_clock.load(Ordering::Acquire),
-                Ordering::Release,
-            );
-        }
-        self.rms_bits.store(0.0f32.to_bits(), Ordering::Release);
-    }
-
-    fn active(&self) -> bool {
-        self.active.load(Ordering::Acquire)
-    }
-
-    /// True while playing OR within the post-playback echo tail — the speaker
-    /// drain plus room decay window in which mic energy is presumed to be our own
-    /// voice coming back. The turn is not over until the room is quiet.
-    fn active_or_tail(&self) -> bool {
-        if self.active() {
-            return true;
-        }
-        let idle_at = self.idle_at_frame.load(Ordering::Acquire);
-        idle_at != usize::MAX
-            && self
-                .capture_clock
-                .load(Ordering::Acquire)
-                .wrapping_sub(idle_at)
-                < self.tail_frames
-    }
-
-    fn rms(&self) -> f32 {
-        f32::from_bits(self.rms_bits.load(Ordering::Acquire))
-    }
-}
-
-/// Sentinel for "no voiced input observed yet" in [`TurnLatency`].
-const TURN_LATENCY_NO_VOICE: u64 = u64::MAX;
+/// Sentinel for "no native turn accepted yet" in [`TurnLatency`].
+const TURN_LATENCY_NO_TURN: u64 = u64::MAX;
 /// Minimum output-chunk RMS that counts as the assistant audibly speaking.
 /// Filters silence frames so the measurement matches voice onset, not stream onset.
+#[cfg(feature = "audio-io")]
 const TURN_LATENCY_AGENT_RMS: f32 = 0.01;
+const DEVICE_FAULT_INPUT: u32 = 1;
+const DEVICE_FAULT_OUTPUT: u32 = 1 << 1;
+#[cfg(feature = "audio-io")]
+/// Requested hardware callback cadence. This is setup geometry, not a progress
+/// timer. CPAL's cross-platform `Fixed` value is only the requested cadence;
+/// native capture admission is sealed independently at the product maximum.
+const CAPTURE_CALLBACK_REQUEST_MS: u32 = 20;
+#[cfg(feature = "audio-io")]
+const CAPTURE_CALLBACK_MAX_MS: u32 = 40;
 
-/// Turn-responsiveness telemetry (spec 09, W1): the gap between the user's
-/// last voiced mic input and the first audible assistant PCM per turn — the
-/// same measurement the Sesame demo client grades on 300/500/1000/3000ms bands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CaptureContract {
+    rate: u32,
+    requested_frames: u32,
+    max_callback_frames: u32,
+}
+
+/// Host-observed response telemetry: the gap from the native correlated
+/// turn-start edge to the first audible assistant PCM. Exact last-voice timing
+/// belongs to the native Sesame detector and is not reconstructed in Rust.
 struct TurnLatency {
     origin: Instant,
-    /// Milliseconds since `origin` of the most recent voiced mic window.
-    last_voice_ms: std::sync::atomic::AtomicU64,
+    /// Milliseconds since `origin` of the most recent accepted native turn.
+    turn_ms: std::sync::atomic::AtomicU64,
     /// Armed while a reply is pending; the first audible chunk measures and disarms.
     awaiting: AtomicBool,
+    #[cfg(any(feature = "audio-io", test))]
     first_word_logged: AtomicBool,
 }
 
@@ -324,8 +103,9 @@ impl TurnLatency {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             origin: Instant::now(),
-            last_voice_ms: std::sync::atomic::AtomicU64::new(TURN_LATENCY_NO_VOICE),
+            turn_ms: std::sync::atomic::AtomicU64::new(TURN_LATENCY_NO_TURN),
             awaiting: AtomicBool::new(false),
+            #[cfg(any(feature = "audio-io", test))]
             first_word_logged: AtomicBool::new(false),
         })
     }
@@ -334,12 +114,12 @@ impl TurnLatency {
         self.origin.elapsed().as_millis() as u64
     }
 
-    fn mark_voice(&self) {
-        self.last_voice_ms.store(self.now_ms(), Ordering::Release);
+    fn mark_turn(&self) {
+        self.turn_ms.store(self.now_ms(), Ordering::Release);
     }
 
     fn arm(&self) {
-        if self.last_voice_ms.load(Ordering::Acquire) != TURN_LATENCY_NO_VOICE {
+        if self.turn_ms.load(Ordering::Acquire) != TURN_LATENCY_NO_TURN {
             self.awaiting.store(true, Ordering::Release);
         }
     }
@@ -348,19 +128,21 @@ impl TurnLatency {
         self.awaiting.store(false, Ordering::Release);
     }
 
-    /// If armed, measure last-voice → now and disarm. Returns the gap in ms.
+    /// If armed, measure native-turn-start → now and disarm.
+    #[cfg(any(feature = "audio-io", test))]
     fn try_measure(&self) -> Option<u64> {
         if !self.awaiting.swap(false, Ordering::AcqRel) {
             return None;
         }
-        let last = self.last_voice_ms.load(Ordering::Acquire);
-        if last == TURN_LATENCY_NO_VOICE {
+        let last = self.turn_ms.load(Ordering::Acquire);
+        if last == TURN_LATENCY_NO_TURN {
             return None;
         }
         Some(self.now_ms().saturating_sub(last))
     }
 
     /// Session-start → first audible assistant word, logged once.
+    #[cfg(any(feature = "audio-io", test))]
     fn first_word(&self) -> Option<u64> {
         if self.first_word_logged.swap(true, Ordering::AcqRel) {
             return None;
@@ -444,6 +226,7 @@ impl EngineHandoff {
 }
 
 impl AudioStats {
+    #[cfg(any(feature = "audio-io", test))]
     fn record_turn_latency(&self, ms: u64) {
         self.turn_count.fetch_add(1, Ordering::Relaxed);
         self.last_turn_latency_ms.store(ms, Ordering::Relaxed);
@@ -488,30 +271,16 @@ pub enum RuntimeEvent {
     Error(String),
 }
 
-/// VAD and capture-loop knobs.
+/// Host-only voice service settings. Turn detection and speech policy are
+/// sealed in the native session configuration, never duplicated in Rust.
 #[derive(Debug, Clone, Copy)]
 pub struct RuntimeConfig {
-    pub vad_threshold: f32,
-    pub silence_ms: u64,
-    pub min_utterance_s: f32,
-    pub can_interrupt: bool,
     pub trace: bool,
 }
 
 impl Default for RuntimeConfig {
     fn default() -> Self {
-        Self {
-            vad_threshold: 0.012,
-            // End-of-turn silence (spec 09, W3): 800ms burned most of the response
-            // budget before any model work. Sesame's demo grades <300ms pause→first-
-            // word as excellent. 350ms proved too eager in live testing — it committed
-            // echo blips as turns and split mid-sentence pauses — so 500ms until the
-            // AEC verification (W6) lands.
-            silence_ms: 500,
-            min_utterance_s: 0.3,
-            can_interrupt: false,
-            trace: false,
-        }
+        Self { trace: false }
     }
 }
 
@@ -520,7 +289,6 @@ pub struct VoiceRuntime {
     stop: Arc<AtomicBool>,
     interrupt: Arc<AtomicBool>,
     mic_enabled: Arc<AtomicBool>,
-    playback_flush: Arc<AtomicBool>,
     runtime: Arc<CoroutineRuntime>,
     service: Option<CoroutineService>,
     control: SharedRealtimeNotifier,
@@ -532,10 +300,14 @@ pub struct VoiceRuntime {
 
 impl VoiceRuntime {
     /// Mount and start the retained native coroutine service using platform
-    /// audio devices.
+    /// audio devices. The engine factory receives capture rate, playback rate,
+    /// and the sealed maximum capture callback size; CPAL's smaller requested
+    /// cadence remains a platform-owner detail.
     pub fn prepare(
         cfg: RuntimeConfig,
-        build_engine: impl FnOnce(u32) -> Result<Box<dyn VoiceEngine>, String> + Send + 'static,
+        build_engine: impl FnOnce(u32, u32, u32) -> Result<Box<dyn VoiceEngine>, String>
+            + Send
+            + 'static,
         sink: impl FnMut(RuntimeEvent) -> bool + Send + 'static,
     ) -> Result<VoiceRuntime, String> {
         VOICE_TRACE_ENABLED.store(cfg.trace, Ordering::Relaxed);
@@ -543,30 +315,51 @@ impl VoiceRuntime {
         let interrupt = Arc::new(AtomicBool::new(false));
         let mic_enabled = Arc::new(AtomicBool::new(true));
         let playback_flush = Arc::new(AtomicBool::new(false));
+        let device_fault = Arc::new(AtomicU32::new(0));
         let audio = Arc::new(AudioStats::default());
         let done = Arc::new(AtomicBool::new(false));
-        let in_rate = default_input_rate().map_err(|error| format!("audio input: {error}"))?;
+        let input = default_input_contract().map_err(|error| format!("audio input: {error}"))?;
         let out_rate = default_output_rate().map_err(|error| format!("audio output: {error}"))?;
         let mut sink: EventSink = Box::new(sink);
         if !emit_or_stop(&mut sink, &stop, RuntimeEvent::State(SessionState::Loading)) {
             return Err("voice event sink rejected the loading state".into());
         }
-        let clock = Arc::new(AtomicUsize::new(0));
-        let mut engine = build_engine(out_rate).map_err(|error| format!("model load: {error}"))?;
-        let mut dock = engine
-            .take_capture_dock()?
-            .ok_or("callback-driven native engine did not expose capture leases")?;
-        let frames = (in_rate as usize * MAX_UTTERANCE_SECONDS).max(1);
-        let first = dock
-            .reserve(frames, in_rate)?
-            .ok_or("native capture dock has no first setup reservation")?;
-        let second = dock
-            .reserve(frames, in_rate)?
-            .ok_or("native capture dock has no second setup reservation")?;
-        let capture = CaptureIngress::new([first, second], clock, audio.clone());
-        let playback = PlaybackReference::new(capture.clock.clone(), in_rate);
-        let latency = TurnLatency::new();
+        let engine = build_engine(input.rate, out_rate, input.max_callback_frames)
+            .map_err(|error| format!("model load: {error}"))?;
         let handoff = EngineHandoff::new();
+        let mut resources = InitResources::new(engine, handoff.clone());
+        let capture = resources
+            .engine_mut()?
+            .take_capture_sink()?
+            .ok_or("callback-driven native engine did not expose a capture sink")?;
+        resources.capture = Some(capture);
+        let capture_rate = resources.capture_rate()?;
+        if capture_rate != input.rate {
+            return Err(format!(
+                "native PCM rate does not match the input device: received {} Hz, expected {in_rate} Hz",
+                capture_rate,
+                in_rate = input.rate,
+            ));
+        }
+        let latency = TurnLatency::new();
+        let mut init = SessionInit {
+            resources,
+            sink,
+            stop: stop.clone(),
+            interrupt: interrupt.clone(),
+            mic_enabled: mic_enabled.clone(),
+            playback_flush: playback_flush.clone(),
+            device_fault: device_fault.clone(),
+            control: None,
+            audio: audio.clone(),
+            in_rate: input.rate,
+            in_request_frames: input.requested_frames,
+            in_max_callback_frames: input.max_callback_frames,
+            out_rate,
+            latency: latency.clone(),
+            done: done.clone(),
+            events: None,
+        };
         let runtime = Arc::new(
             CoroutineRuntime::with_config(CoroutineConfig {
                 workers: 1,
@@ -576,38 +369,20 @@ impl VoiceRuntime {
         );
         let (service, control) = runtime
             .owner_state_service_factory(|setup| {
-                let capture_edge = setup.realtime_notifier()?;
                 let events = setup.realtime_notifier()?;
                 let playback_events = setup.realtime_notifier()?;
                 let control = setup.shared_realtime_notifier();
-                let source = engine
+                let source = init
+                    .resources
+                    .engine_mut()
+                    .map_err(|_| -1)?
                     .take_playback_source(playback_events)
                     .map_err(|_| -1)?
                     .ok_or(-1)?;
-                let task = SessionTask::Init(Some(SessionInit {
-                    cfg,
-                    engine: Some(engine),
-                    sink,
-                    stop: stop.clone(),
-                    interrupt: interrupt.clone(),
-                    mic_enabled: mic_enabled.clone(),
-                    playback_flush: playback_flush.clone(),
-                    audio: audio.clone(),
-                    capture: Some(capture.clone()),
-                    writer: Some(AudioInputWriter {
-                        capture: capture.clone(),
-                        notify: capture_edge,
-                        producer: std::marker::PhantomData,
-                    }),
-                    source: Some(source),
-                    in_rate,
-                    out_rate,
-                    playback: playback.clone(),
-                    latency: latency.clone(),
-                    done: done.clone(),
-                    handoff: handoff.clone(),
-                    events: Some(events),
-                }));
+                init.resources.source = Some(source);
+                init.control = Some(control.clone());
+                init.events = Some(events);
+                let task = SessionTask::Init(Some(init));
                 Ok((
                     move || {
                         let mut owner = OwnerSession::new(task);
@@ -630,7 +405,6 @@ impl VoiceRuntime {
             stop: stop.clone(),
             interrupt: interrupt.clone(),
             mic_enabled: mic_enabled.clone(),
-            playback_flush: playback_flush.clone(),
             runtime,
             service: Some(service),
             control,
@@ -644,25 +418,47 @@ impl VoiceRuntime {
     /// Start the retained voice service and return immediately.
     pub fn start(
         cfg: RuntimeConfig,
-        build_engine: impl FnOnce(u32) -> Result<Box<dyn VoiceEngine>, String> + Send + 'static,
+        build_engine: impl FnOnce(u32, u32, u32) -> Result<Box<dyn VoiceEngine>, String>
+            + Send
+            + 'static,
         sink: impl FnMut(RuntimeEvent) -> bool + Send + 'static,
     ) -> Result<Self, String> {
         Self::prepare(cfg, build_engine, sink)
     }
 
     /// Abort the current reply and flush queued playback.
-    pub fn interrupt(&self) {
+    pub fn interrupt(&self) -> Result<(), String> {
+        if self.is_finished() {
+            return Ok(());
+        }
         self.interrupt.store(true, Ordering::SeqCst);
-        self.playback_flush.store(true, Ordering::SeqCst);
-        // The flags are inert until this edge lands: a dropped notify is a
-        // barge-in that silently never happens.
-        self.control.notify().expect("interrupt notify failed");
+        if let Err(code) = self.control.notify() {
+            self.interrupt.store(false, Ordering::SeqCst);
+            if self.is_finished() {
+                return Ok(());
+            }
+            return Err(format!(
+                "native interrupt edge was rejected with status {code}"
+            ));
+        }
+        Ok(())
     }
 
     /// Pause/resume mic capture without ending the session.
-    pub fn set_mic_enabled(&self, on: bool) {
+    pub fn set_mic_enabled(&self, on: bool) -> Result<(), String> {
+        if self.is_finished() {
+            return Ok(());
+        }
         self.mic_enabled.store(on, Ordering::SeqCst);
-        self.control.notify().expect("mic-enable notify failed");
+        if let Err(code) = self.control.notify() {
+            if self.is_finished() {
+                return Ok(());
+            }
+            return Err(format!(
+                "native mic-control edge was rejected with status {code}"
+            ));
+        }
+        Ok(())
     }
 
     /// Whether mic capture is currently allowed.
@@ -684,33 +480,66 @@ impl VoiceRuntime {
     }
 
     /// Signal stop and administratively join the retained service.
-    pub fn stop(mut self) {
-        self.shutdown();
+    pub fn stop(mut self) -> Result<(), String> {
+        self.shutdown()
     }
 
-    fn shutdown(&mut self) {
+    fn shutdown(&mut self) -> Result<(), String> {
         if self.closed.swap(true, Ordering::AcqRel) {
-            return;
+            return Ok(());
         }
+        let mut errors = Vec::new();
         self.stop.store(true, Ordering::SeqCst);
-        let _ = self.control.notify();
+        let already_done = self.done.load(Ordering::Acquire);
+        let notified = already_done || self.control.notify().is_ok();
         if let Some(service) = self.service.take() {
-            service.stop();
-            let _ = service.join();
+            /* Normal shutdown is an owned state transition, not an
+             * out-of-band service kill. The control edge makes LiveTask ask
+             * native to stop; its final correlated event returns Complete.
+             * OwnerSession then drops both CPAL streams before kcoro closes
+             * notifier admission. Only an already-closed service needs the
+             * administrative stop fallback. */
+            if !notified {
+                errors.push("voice stop edge was rejected before terminal settlement".into());
+                service.stop();
+            }
+            if let Err(code) = service.join() {
+                errors.push(format!("join voice continuation failed with status {code}"));
+            }
+            if service.callback_panicked() {
+                errors.push("voice continuation panicked before terminal settlement".into());
+            }
+            if let Some(code) = service.reschedule_error() {
+                errors.push(format!(
+                    "voice continuation reschedule failed with status {code}"
+                ));
+            }
             drop(service);
         }
         if let Some(mut engine) = self.engine.take() {
-            let _ = engine.stop_session();
+            if let Err(error) = engine.stop_session() {
+                errors.push(error);
+            }
         }
         self.runtime.stop();
-        let _ = self.runtime.join();
+        if let Err(code) = self.runtime.join() {
+            errors.push(format!(
+                "join voice kcoro runtime failed with status {code}"
+            ));
+        }
         self.done.store(true, Ordering::SeqCst);
+        if errors.is_empty() {
+            return Ok(());
+        }
+        Err(errors.join("; "))
     }
 }
 
 impl Drop for VoiceRuntime {
     fn drop(&mut self) {
-        self.shutdown();
+        if let Err(error) = self.shutdown() {
+            eprintln!("[flashkern] voice runtime teardown failed: {error}");
+        }
     }
 }
 
@@ -729,37 +558,77 @@ fn emit_or_stop(sink: &mut EventSink, stop: &Arc<AtomicBool>, event: RuntimeEven
 type EventSink = Box<dyn FnMut(RuntimeEvent) -> bool + Send + 'static>;
 
 struct SessionInit {
-    cfg: RuntimeConfig,
-    engine: Option<Box<dyn VoiceEngine>>,
+    resources: InitResources,
     sink: EventSink,
     stop: Arc<AtomicBool>,
     interrupt: Arc<AtomicBool>,
     mic_enabled: Arc<AtomicBool>,
     playback_flush: Arc<AtomicBool>,
+    device_fault: Arc<AtomicU32>,
+    control: Option<SharedRealtimeNotifier>,
     audio: Stats,
-    capture: Option<Capture>,
-    writer: Option<AudioInputWriter>,
-    source: Option<Box<dyn PlaybackSource>>,
     in_rate: u32,
+    in_request_frames: u32,
+    in_max_callback_frames: u32,
     out_rate: u32,
-    playback: Playback,
     latency: Arc<TurnLatency>,
     done: Arc<AtomicBool>,
-    handoff: Arc<EngineHandoff>,
     events: Option<RealtimeNotifier>,
 }
 
-impl SessionInit {
+struct InitResources {
+    capture: Option<Box<dyn CaptureSink>>,
+    source: Option<Box<dyn PlaybackSource>>,
+    engine: Option<Box<dyn VoiceEngine>>,
+    handoff: Arc<EngineHandoff>,
+}
+
+impl InitResources {
+    fn new(engine: Box<dyn VoiceEngine>, handoff: Arc<EngineHandoff>) -> Self {
+        Self {
+            capture: None,
+            source: None,
+            engine: Some(engine),
+            handoff,
+        }
+    }
+
+    fn engine_mut(&mut self) -> Result<&mut Box<dyn VoiceEngine>, String> {
+        self.engine
+            .as_mut()
+            .ok_or_else(|| "voice engine was already consumed".into())
+    }
+
+    fn capture_rate(&self) -> Result<u32, String> {
+        self.capture
+            .as_ref()
+            .map(|capture| capture.rate())
+            .ok_or_else(|| "platform capture endpoint was already consumed".into())
+    }
+
     fn retire_engine(&mut self) {
-        if let Some(engine) = self.engine.take() {
+        if let Some(mut engine) = self.engine.take() {
+            engine.request_stop();
             self.handoff.publish(engine);
         }
     }
 }
 
+impl Drop for InitResources {
+    fn drop(&mut self) {
+        /* The declaration order is deliberate, and this explicit retirement
+         * makes it invariant under future field additions: hardware callback
+         * endpoints die before native session state is asked to stop and
+         * transferred to the administrative owner. */
+        drop(self.capture.take());
+        drop(self.source.take());
+        self.retire_engine();
+    }
+}
+
 enum SessionTask {
     Init(Option<SessionInit>),
-    Turn(VadTask),
+    Live(LiveTask),
     Done,
 }
 
@@ -780,7 +649,7 @@ impl OwnerSession {
             SessionTask::Init(Some(init)) if !init.stop.load(Ordering::Acquire) => {
                 start_devices(init).map(Some)
             }
-            SessionTask::Init(_) | SessionTask::Turn(_) | SessionTask::Done => Ok(None),
+            SessionTask::Init(_) | SessionTask::Live(_) | SessionTask::Done => Ok(None),
         };
         match setup {
             Ok(streams) => Self {
@@ -804,11 +673,27 @@ impl OwnerSession {
             self.retire();
             return ServiceOutcome::Complete;
         }
+        self.quiesce();
         let outcome = self.task.advance();
+        self.quiesce();
         if outcome == ServiceOutcome::Complete {
             self.retire();
         }
         outcome
+    }
+
+    fn quiesce(&mut self) {
+        if !self.task.stop_requested() {
+            return;
+        }
+        /* A stop is first a hardware-ownership transition. Closing both CPAL
+         * streams proves their callbacks can no longer borrow the capture or
+         * playback endpoints. Only then may native settle its correlated
+         * STOPPED edge; waiting for STOPPED before this drop creates a cycle
+         * because native session retirement also requires both endpoints to
+         * be gone. */
+        drop(self.streams.take());
+        self.task.begin_stop();
     }
 
     fn retire(&mut self) {
@@ -831,6 +716,20 @@ impl Drop for OwnerSession {
 }
 
 impl SessionTask {
+    fn stop_requested(&self) -> bool {
+        match self {
+            Self::Init(Some(init)) => init.stop.load(Ordering::Acquire),
+            Self::Live(task) => task.stop.load(Ordering::Acquire),
+            Self::Init(None) | Self::Done => false,
+        }
+    }
+
+    fn begin_stop(&mut self) {
+        if let Self::Live(task) = self {
+            task.begin_stop();
+        }
+    }
+
     fn advance(&mut self) -> ServiceOutcome {
         let state = std::mem::replace(self, Self::Done);
         match state {
@@ -860,9 +759,9 @@ impl SessionTask {
                 }
             },
             Self::Init(None) | Self::Done => ServiceOutcome::Complete,
-            Self::Turn(mut task) => {
+            Self::Live(mut task) => {
                 let outcome = task.step();
-                *self = Self::Turn(task);
+                *self = Self::Live(task);
                 outcome
             }
         }
@@ -889,9 +788,9 @@ impl SessionTask {
         match std::mem::replace(self, Self::Done) {
             Self::Init(Some(mut init)) => {
                 init.done.store(true, Ordering::Release);
-                init.retire_engine();
+                init.resources.retire_engine();
             }
-            Self::Turn(mut task) => {
+            Self::Live(mut task) => {
                 task.done.store(true, Ordering::Release);
                 task.finish();
             }
@@ -902,51 +801,41 @@ impl SessionTask {
 
 impl SessionInit {
     fn mount(mut self) -> Result<SessionTask, (Self, String)> {
-        let Some(mut engine) = self.engine.take() else {
+        let Some(mut engine) = self.resources.engine.take() else {
             return Err((self, "voice engine was already consumed".into()));
         };
-        let Some(capture) = self.capture.take() else {
-            return Err((
-                self,
-                "native capture reservations were already consumed".into(),
-            ));
-        };
-        let assistant = Arc::new(AtomicBool::new(false));
-
         let Some(events) = self.events.take() else {
-            self.engine = Some(engine);
+            self.resources.engine = Some(engine);
             return Err((self, "voice event notifier was already consumed".into()));
         };
-        let native = match engine.mount_events(events) {
-            Ok(native) => native,
-            Err(error) => {
-                self.engine = Some(engine);
-                return Err((self, format!("mount native event edge: {error}")));
-            }
-        };
-        if !native {
-            self.engine = Some(engine);
-            return Err((
-                self,
-                "voice engine does not implement the native callback continuation contract".into(),
-            ));
+        if let Err(error) = engine.mount_events(events) {
+            self.resources.engine = Some(engine);
+            return Err((self, format!("mount native event edge: {error}")));
         }
         if !emit_or_stop(
             &mut self.sink,
             &self.stop,
             RuntimeEvent::State(SessionState::Listening),
         ) {
+            self.resources.engine = Some(engine);
             return Err((self, "voice event sink rejected listening state".into()));
         }
-        Ok(SessionTask::Turn(VadTask::new(
-            self,
-            capture,
-            TurnDriver {
+        Ok(SessionTask::Live(LiveTask {
+            sink: self.sink,
+            stop: self.stop,
+            interrupt: self.interrupt,
+            mic_enabled: self.mic_enabled,
+            playback_flush: self.playback_flush,
+            device_fault: self.device_fault,
+            done: self.done,
+            handoff: self.resources.handoff.clone(),
+            stopping: false,
+            driver: Some(TurnDriver {
                 engine,
                 events: EventState::default(),
-            },
-            assistant,
-        )))
+            }),
+            latency: self.latency,
+        }))
     }
 }
 
@@ -963,17 +852,21 @@ impl EventState {
         event: VoiceEvent,
         sink: &mut EventSink,
         stop: &Arc<AtomicBool>,
-        assistant: &AtomicBool,
         mic_enabled: &AtomicBool,
         latency: &TurnLatency,
-        playback: &PlaybackReference,
     ) {
         if self.failed {
             return;
         }
         let ok = match event {
+            VoiceEvent::TurnStarted => {
+                latency.mark_turn();
+                latency.arm();
+                self.transcript.clear();
+                self.speaking = false;
+                emit_or_stop(sink, stop, RuntimeEvent::State(SessionState::Thinking))
+            }
             VoiceEvent::Text(text) => {
-                assistant.store(true, Ordering::Release);
                 self.transcript.push_str(&text);
                 let state = self.speaking
                     || emit_or_stop(sink, stop, RuntimeEvent::State(SessionState::Speaking));
@@ -986,17 +879,13 @@ impl EventState {
                     )
             }
             VoiceEvent::TurnComplete | VoiceEvent::Interrupted => {
-                assistant.store(false, Ordering::Release);
                 latency.disarm();
-                playback.set_idle();
                 self.transcript.clear();
                 self.speaking = false;
                 emit_ready(sink, stop, mic_enabled)
             }
             VoiceEvent::Error(error) => {
-                assistant.store(false, Ordering::Release);
                 latency.disarm();
-                playback.set_idle();
                 self.transcript.clear();
                 self.speaking = false;
                 emit_or_stop(sink, stop, RuntimeEvent::Error(error))
@@ -1013,27 +902,23 @@ struct TurnDriver {
 }
 
 impl TurnDriver {
-    fn interrupt(&mut self) {
-        let _ = self.engine.interrupt_stream();
+    fn interrupt(&mut self) -> Result<u64, String> {
+        self.engine.interrupt_stream()
     }
 
-    fn begin(&mut self, ticket: crate::CaptureTicket) -> Result<bool, String> {
-        self.engine.begin_capture(ticket)
+    fn request_stop(&mut self) {
+        self.engine.request_stop();
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn advance_events(
         &mut self,
         stop: &Arc<AtomicBool>,
         sink: &mut EventSink,
-        assistant: &AtomicBool,
         mic_enabled: &AtomicBool,
         latency: &TurnLatency,
-        playback: &PlaybackReference,
     ) -> Result<EngineProgress, String> {
         let progress = self.engine.advance_events(stop, &mut |event| {
-            self.events
-                .emit(event, sink, stop, assistant, mic_enabled, latency, playback);
+            self.events.emit(event, sink, stop, mic_enabled, latency);
         })?;
         if self.events.failed {
             return Ok(EngineProgress::Complete);
@@ -1042,405 +927,96 @@ impl TurnDriver {
     }
 }
 
-struct VadTask {
-    cfg: RuntimeConfig,
+struct LiveTask {
     sink: EventSink,
     stop: Arc<AtomicBool>,
     interrupt: Arc<AtomicBool>,
     mic_enabled: Arc<AtomicBool>,
     playback_flush: Arc<AtomicBool>,
-    capture: Option<Capture>,
-    block: Option<usize>,
-    in_rate: u32,
+    device_fault: Arc<AtomicU32>,
     done: Arc<AtomicBool>,
     handoff: Arc<EngineHandoff>,
-    playback: Playback,
+    stopping: bool,
     driver: Option<TurnDriver>,
-    pending: Option<crate::CaptureTicket>,
-    assistant: Arc<AtomicBool>,
     latency: Arc<TurnLatency>,
-    window: usize,
-    max_local: usize,
-    silence_frames: usize,
-    speaking: bool,
-    start: usize,
-    read: usize,
-    voice_end: usize,
-    voiced_streak: usize,
-    streak_start: usize,
 }
 
-impl VadTask {
-    fn new(
-        init: SessionInit,
-        capture: Capture,
-        driver: TurnDriver,
-        assistant: Arc<AtomicBool>,
-    ) -> Self {
-        let window = (init.in_rate as usize / 5).max(1);
-        let max_local = (init.in_rate as usize * MAX_UTTERANCE_SECONDS).max(window);
-        let silence_frames = ((init.in_rate as u64 * init.cfg.silence_ms) / 1_000) as usize;
-        Self {
-            cfg: init.cfg,
-            sink: init.sink,
-            stop: init.stop,
-            interrupt: init.interrupt,
-            mic_enabled: init.mic_enabled,
-            playback_flush: init.playback_flush,
-            capture: Some(capture),
-            block: Some(0),
-            in_rate: init.in_rate,
-            done: init.done,
-            handoff: init.handoff,
-            playback: init.playback,
-            driver: Some(driver),
-            pending: None,
-            assistant,
-            latency: init.latency,
-            window,
-            max_local,
-            silence_frames,
-            speaking: false,
-            start: 0,
-            read: 0,
-            voice_end: 0,
-            voiced_streak: 0,
-            streak_start: 0,
+impl LiveTask {
+    fn begin_stop(&mut self) {
+        if self.stopping {
+            return;
         }
-    }
-
-    fn outcome(&self) -> ServiceOutcome {
-        if self.stop.load(Ordering::Acquire) {
-            return ServiceOutcome::Complete;
+        self.stopping = true;
+        if let Some(driver) = self.driver.as_mut() {
+            driver.request_stop();
         }
-        if self.interrupt.load(Ordering::Acquire) {
-            return ServiceOutcome::Continue;
-        }
-        let Some(capture) = self.capture.as_ref() else {
-            return ServiceOutcome::Complete;
-        };
-        if self
-            .block
-            .and_then(|index| capture.blocks.get(index))
-            .is_some_and(|block| self.read + self.window <= block.len())
-        {
-            return ServiceOutcome::Continue;
-        }
-        ServiceOutcome::Dormant
-    }
-
-    fn reset_capture_state(&mut self) {
-        self.read = 0;
-        self.start = 0;
-        self.voice_end = 0;
-        self.speaking = false;
-        self.voiced_streak = 0;
-        self.streak_start = 0;
-    }
-
-    fn prepare_capture(&mut self) -> Result<(), String> {
-        let Some(capture) = self.capture.as_ref() else {
-            return Err("native capture ingress was retired".into());
-        };
-        capture.rearm()?;
-        if self.block.is_some() {
-            return Ok(());
-        }
-        let Some(index) = (0..CAPTURE_BLOCKS).find(|index| capture.blocks[*index].is_open()) else {
-            capture.deactivate();
-            return Ok(());
-        };
-        capture.activate(index);
-        self.block = Some(index);
-        self.reset_capture_state();
-        Ok(())
-    }
-
-    /// Retire the current capture contents without changing native storage.
-    /// `false` means a hardware callback owns WRITING; that callback publishes
-    /// its tail and rings the service edge, so this continuation simply yields.
-    fn discard_capture(&mut self) -> bool {
-        let Some(capture) = self.capture.as_ref() else {
-            return true;
-        };
-        let Some(index) = self.block else {
-            return true;
-        };
-        let block = &capture.blocks[index];
-        if !block.try_seal() {
-            return false;
-        }
-        capture.deactivate();
-        block.discard_sealed();
-        capture.activate(index);
-        self.reset_capture_state();
-        true
-    }
-
-    fn publish_capture(
-        &mut self,
-        start: usize,
-        end: usize,
-    ) -> Result<Option<crate::CaptureTicket>, String> {
-        let capture = self
-            .capture
-            .as_ref()
-            .ok_or("native capture ingress was retired")?;
-        let index = self.block.ok_or("native capture block is not armed")?;
-        let block = Arc::clone(&capture.blocks[index]);
-        if !block.try_seal() {
-            return Ok(None);
-        }
-
-        // Switch producer ownership before publishing the sealed view. A
-        // callback racing this transition either finishes the old block before
-        // sealing or observes the next block; it can never write a published
-        // generation.
-        let next = capture.next_open(index);
-        capture.deactivate();
-        if let Some(next) = next {
-            capture.activate(next);
-        }
-        let ticket = block.publish(start, end)?;
-        self.block = next;
-        self.reset_capture_state();
-        Ok(ticket)
     }
 
     fn step(&mut self) -> ServiceOutcome {
-        if self.stop.load(Ordering::Acquire) {
-            return ServiceOutcome::Complete;
-        }
         if self.driver.is_none() {
             return ServiceOutcome::Complete;
         }
-        let playback = self.playback.clone();
-        if let Err(error) = self.prepare_capture() {
+        let faults = self.device_fault.swap(0, Ordering::AcqRel);
+        if faults != 0 {
+            let device = match faults {
+                DEVICE_FAULT_INPUT => "input",
+                DEVICE_FAULT_OUTPUT => "output",
+                _ => "input and output",
+            };
             let _ = emit_or_stop(
                 &mut self.sink,
                 &self.stop,
-                RuntimeEvent::Error(format!("native capture rearm failed: {error}")),
+                RuntimeEvent::Error(format!("platform audio {device} device stopped")),
             );
-            return ServiceOutcome::Complete;
+            self.stop.store(true, Ordering::Release);
         }
-        if let Some(ticket) = self.pending {
-            match self
+        if !self.stopping && self.interrupt.swap(false, Ordering::SeqCst) {
+            let interrupt = self
                 .driver
                 .as_mut()
                 .expect("driver checked above")
-                .begin(ticket)
-            {
-                Ok(true) => {
-                    self.pending = None;
-                    self.latency.arm();
-                }
-                Ok(false) => {}
-                Err(error) => {
-                    let _ = emit_or_stop(
-                        &mut self.sink,
-                        &self.stop,
-                        RuntimeEvent::Error(format!(
-                            "native pending capture admission failed: {error}"
-                        )),
-                    );
-                    return ServiceOutcome::Complete;
-                }
+                .interrupt();
+            if let Err(error) = interrupt {
+                let _ = emit_or_stop(
+                    &mut self.sink,
+                    &self.stop,
+                    RuntimeEvent::Error(format!("native interrupt failed: {error}")),
+                );
+                self.stop.store(true, Ordering::Release);
+                return ServiceOutcome::Dormant;
+            }
+            self.playback_flush.store(true, Ordering::SeqCst);
+            if !emit_ready(&mut self.sink, &self.stop, &self.mic_enabled) {
+                return ServiceOutcome::Dormant;
             }
         }
-        let progress = self
+        match self
             .driver
             .as_mut()
             .expect("driver checked above")
-            .advance_events(
-                &self.stop,
-                &mut self.sink,
-                &self.assistant,
-                &self.mic_enabled,
-                &self.latency,
-                &playback,
-            );
-        match progress {
-            Ok(EngineProgress::Continue) => return ServiceOutcome::Continue,
-            Ok(EngineProgress::Dormant | EngineProgress::Complete) => {}
+            .advance_events(&self.stop, &mut self.sink, &self.mic_enabled, &self.latency)
+        {
+            Ok(EngineProgress::Continue) => ServiceOutcome::Continue,
+            Ok(EngineProgress::Dormant | EngineProgress::Complete) => ServiceOutcome::Dormant,
+            Ok(EngineProgress::Stopped) => ServiceOutcome::Complete,
             Err(error) => {
                 let _ = emit_or_stop(
                     &mut self.sink,
                     &self.stop,
                     RuntimeEvent::Error(format!("native event drain failed: {error}")),
                 );
-                return ServiceOutcome::Complete;
+                self.stop.store(true, Ordering::Release);
+                ServiceOutcome::Dormant
             }
         }
-        if let Some(ticket) = self.pending {
-            match self
-                .driver
-                .as_mut()
-                .expect("driver checked above")
-                .begin(ticket)
-            {
-                Ok(true) => {
-                    self.pending = None;
-                    self.latency.arm();
-                }
-                Ok(false) => return ServiceOutcome::Dormant,
-                Err(error) => {
-                    let _ = emit_or_stop(
-                        &mut self.sink,
-                        &self.stop,
-                        RuntimeEvent::Error(format!(
-                            "native pending capture admission failed: {error}"
-                        )),
-                    );
-                    return ServiceOutcome::Complete;
-                }
-            }
-        }
-
-        if self.interrupt.swap(false, Ordering::SeqCst) {
-            self.driver
-                .as_mut()
-                .expect("driver checked above")
-                .interrupt();
-            self.playback_flush.store(true, Ordering::SeqCst);
-            self.assistant.store(false, Ordering::SeqCst);
-            self.speaking = false;
-            self.voiced_streak = 0;
-            if !emit_ready(&mut self.sink, &self.stop, &self.mic_enabled) {
-                return ServiceOutcome::Complete;
-            }
-        }
-
-        if !self.mic_enabled.load(Ordering::SeqCst) {
-            if !self.discard_capture() {
-                return ServiceOutcome::Dormant;
-            }
-            return self.outcome();
-        }
-
-        if reference_audio_active(&self.assistant, &playback) && !self.cfg.can_interrupt {
-            if !self.discard_capture() {
-                return ServiceOutcome::Dormant;
-            }
-            return self.outcome();
-        }
-
-        let Some(capture) = self.capture.as_ref() else {
-            return ServiceOutcome::Complete;
-        };
-        let Some(index) = self.block else {
-            return self.outcome();
-        };
-        let block = Arc::clone(&capture.blocks[index]);
-        let n = block.len();
-        let mut windows = 0usize;
-        while self.read + self.window <= n && windows < 8 {
-            let threshold =
-                reference_vad_threshold(self.cfg.vad_threshold, &self.assistant, &playback);
-            let voiced = block
-                .with_span(self.read, self.read + self.window, rms)
-                .is_some_and(|level| level > threshold);
-            if voiced {
-                if !self.speaking {
-                    if self.voiced_streak == 0 {
-                        self.streak_start = self.read;
-                    }
-                    self.voiced_streak += 1;
-                    let reference = reference_audio_active(&self.assistant, &playback);
-                    let needed = if reference {
-                        BARGE_IN_SUSTAIN_WINDOWS
-                    } else {
-                        1
-                    };
-                    if self.voiced_streak >= needed {
-                        if reference {
-                            self.driver
-                                .as_mut()
-                                .expect("driver checked above")
-                                .interrupt();
-                            self.playback_flush.store(true, Ordering::SeqCst);
-                        }
-                        self.speaking = true;
-                        self.start = self.streak_start;
-                        self.voiced_streak = 0;
-                        if !emit_or_stop(
-                            &mut self.sink,
-                            &self.stop,
-                            RuntimeEvent::State(SessionState::Listening),
-                        ) {
-                            return ServiceOutcome::Complete;
-                        }
-                    }
-                }
-                self.latency.mark_voice();
-                self.voice_end = self.read + self.window;
-            } else if !self.speaking {
-                self.voiced_streak = 0;
-            }
-            self.read += self.window;
-            windows += 1;
-        }
-        if self.read + self.window <= n {
-            return ServiceOutcome::Continue;
-        }
-
-        let silent_frames = n.saturating_sub(self.voice_end);
-        let forced_end = self.speaking && n >= self.max_local;
-        if self.speaking && (silent_frames >= self.silence_frames || forced_end) {
-            let end = (self.voice_end + self.window).clamp(self.start, self.read.min(n));
-            let dur_s = (end - self.start) as f32 / self.in_rate as f32;
-            let submission = if dur_s >= self.cfg.min_utterance_s {
-                if !emit_or_stop(
-                    &mut self.sink,
-                    &self.stop,
-                    RuntimeEvent::State(SessionState::Thinking),
-                ) {
-                    return ServiceOutcome::Complete;
-                }
-                match self.publish_capture(self.start, end) {
-                    Ok(Some(ticket)) => Some((
-                        ticket,
-                        self.driver
-                            .as_mut()
-                            .expect("driver checked above")
-                            .begin(ticket),
-                    )),
-                    Ok(None) => return ServiceOutcome::Dormant,
-                    Err(error) => Some((crate::CaptureTicket::default(), Err(error))),
-                }
-            } else {
-                if !self.discard_capture() {
-                    return ServiceOutcome::Dormant;
-                }
-                None
-            };
-            if let Some((ticket, submission)) = submission {
-                match submission {
-                    Ok(true) => self.latency.arm(),
-                    Ok(false) => self.pending = Some(ticket),
-                    Err(error) => {
-                        let _ = emit_or_stop(
-                            &mut self.sink,
-                            &self.stop,
-                            RuntimeEvent::Error(format!(
-                                "native capture admission failed: {error}"
-                            )),
-                        );
-                        return ServiceOutcome::Complete;
-                    }
-                }
-            }
-        } else if !self.speaking && n > self.in_rate as usize * 5 && !self.discard_capture() {
-            return ServiceOutcome::Dormant;
-        }
-        self.outcome()
     }
 
     fn finish(&mut self) {
         // OwnerSession has already destroyed both hardware streams, so no
         // callback can still hold a ticketed capture/playback endpoint while
         // this state crosses the terminal handoff.
-        drop(self.capture.take());
-        if let Some(driver) = self.driver.take() {
+        if let Some(mut driver) = self.driver.take() {
+            driver.request_stop();
             self.handoff.publish(driver.engine);
         }
         let _ = emit_or_stop(
@@ -1453,16 +1029,12 @@ impl VadTask {
     }
 }
 
-impl Drop for VadTask {
+impl Drop for LiveTask {
     fn drop(&mut self) {
         if !self.done.load(Ordering::Acquire) {
             self.finish();
         }
     }
-}
-
-fn reference_audio_active(assistant: &AtomicBool, playback: &PlaybackReference) -> bool {
-    assistant.load(Ordering::SeqCst) || playback.active_or_tail()
 }
 
 fn ready_state(mic_enabled: &AtomicBool) -> SessionState {
@@ -1477,30 +1049,23 @@ fn emit_ready(sink: &mut EventSink, stop: &Arc<AtomicBool>, mic_enabled: &Atomic
         && emit_or_stop(sink, stop, RuntimeEvent::Level(0.0))
 }
 
-fn reference_vad_threshold(base: f32, assistant: &AtomicBool, playback: &PlaybackReference) -> f32 {
-    if !reference_audio_active(assistant, playback) {
-        return base;
-    }
-    (base * PLAYBACK_VAD_MULTIPLIER).max(playback.rms() * PLAYBACK_ECHO_MULTIPLIER)
-}
-
-fn rms(samples: &[f32]) -> f32 {
-    if samples.is_empty() {
-        return 0.0;
-    }
-    (samples.iter().map(|v| v * v).sum::<f32>() / samples.len() as f32).sqrt()
-}
-
 #[cfg(feature = "audio-io")]
 fn start_devices(init: &mut SessionInit) -> Result<DeviceStreams, String> {
-    let writer = init
-        .writer
+    let capture = init
+        .resources
+        .capture
         .take()
         .ok_or("platform capture endpoint was already consumed")?;
     let source = init
+        .resources
         .source
         .take()
         .ok_or("platform playback endpoint was already consumed")?;
+    let control = init
+        .control
+        .as_ref()
+        .ok_or("voice control edge was not installed before device start")?
+        .clone();
     if source.rate() != init.out_rate {
         return Err(format!(
             "native PCM rate does not match the output device: received {} Hz, expected {} Hz",
@@ -1512,12 +1077,22 @@ fn start_devices(init: &mut SessionInit) -> Result<DeviceStreams, String> {
         source,
         init.audio.clone(),
         init.playback_flush.clone(),
-        init.playback.clone(),
         init.latency.clone(),
+        init.device_fault.clone(),
+        control.clone(),
     )
     .map_err(|error| format!("audio output: {error}"))?;
-    let input =
-        start_input(writer, init.in_rate).map_err(|error| format!("audio input: {error}"))?;
+    let input = start_input(
+        capture,
+        init.in_rate,
+        init.in_request_frames,
+        init.in_max_callback_frames,
+        init.mic_enabled.clone(),
+        init.audio.clone(),
+        init.device_fault.clone(),
+        control,
+    )
+    .map_err(|error| format!("audio input: {error}"))?;
     Ok(DeviceStreams {
         _input: input,
         _output: output,
@@ -1526,11 +1101,24 @@ fn start_devices(init: &mut SessionInit) -> Result<DeviceStreams, String> {
 
 #[cfg(not(feature = "audio-io"))]
 fn start_devices(_init: &mut SessionInit) -> Result<DeviceStreams, String> {
+    // No callback can own these endpoints in a build without platform audio;
+    // retire them deterministically before reporting the configuration error.
+    drop(_init.resources.capture.take());
+    drop(_init.resources.source.take());
+    let _ = (
+        _init.in_rate,
+        _init.in_request_frames,
+        _init.in_max_callback_frames,
+        _init.out_rate,
+        _init.audio.snapshot(),
+        &_init.device_fault,
+        &_init.control,
+    );
     Err("liquid-audio was built without platform audio support".into())
 }
 
 #[cfg(feature = "audio-io")]
-fn default_input_rate() -> Res<u32> {
+fn default_input_contract() -> Res<CaptureContract> {
     let host = cpal::default_host();
     let dev = host
         .default_input_device()
@@ -1540,11 +1128,11 @@ fn default_input_rate() -> Res<u32> {
     if rate == 0 {
         return Err("audio input sample rate is zero".into());
     }
-    Ok(rate)
+    capture_contract(rate, supported.buffer_size()).map_err(Into::into)
 }
 
 #[cfg(not(feature = "audio-io"))]
-fn default_input_rate() -> Res<u32> {
+fn default_input_contract() -> Res<CaptureContract> {
     Err("liquid-audio was built without platform audio support".into())
 }
 
@@ -1567,7 +1155,36 @@ fn default_output_rate() -> Res<u32> {
 }
 
 #[cfg(feature = "audio-io")]
-fn start_input(mut writer: AudioInputWriter, expected_rate: u32) -> Res<HostStream> {
+#[inline]
+fn gate_capture_callback(
+    failed: &AtomicBool,
+    frames: usize,
+    max_frames: usize,
+    terminal: impl FnOnce(),
+) -> bool {
+    if failed.load(Ordering::Acquire) {
+        return true;
+    }
+    if frames <= max_frames {
+        return false;
+    }
+    if !failed.swap(true, Ordering::AcqRel) {
+        terminal();
+    }
+    true
+}
+
+#[cfg(feature = "audio-io")]
+fn start_input(
+    sink: Box<dyn CaptureSink>,
+    expected_rate: u32,
+    expected_request_frames: u32,
+    expected_max_callback_frames: u32,
+    enabled: Arc<AtomicBool>,
+    audio: Stats,
+    fault: Arc<AtomicU32>,
+    control: SharedRealtimeNotifier,
+) -> Res<HostStream> {
     let host = cpal::default_host();
     let dev = host
         .default_input_device()
@@ -1577,37 +1194,127 @@ fn start_input(mut writer: AudioInputWriter, expected_rate: u32) -> Res<HostStre
     if rate == 0 || rate != expected_rate {
         return Err("audio input sample rate changed during setup".into());
     }
+    let contract = capture_contract(rate, supported.buffer_size())?;
+    if contract.requested_frames != expected_request_frames
+        || contract.max_callback_frames != expected_max_callback_frames
+    {
+        return Err(format!(
+            "audio input callback contract changed during setup: negotiated request/max {expected_request_frames}/{expected_max_callback_frames}, device now selects {}/{}",
+            contract.requested_frames, contract.max_callback_frames,
+        )
+        .into());
+    }
+    let sealed = sink.max_callback_frames();
+    if sealed != expected_max_callback_frames {
+        return Err(format!(
+            "native capture admission is sealed at {sealed} frames, expected {expected_max_callback_frames}"
+        )
+        .into());
+    }
     let channels = supported.channels() as usize;
+    if channels == 0 {
+        return Err("audio input device exposes zero channels".into());
+    }
     let fmt = supported.sample_format();
-    let cfg: cpal::StreamConfig = supported.into();
-    let err = |e| eprintln!("[voice] input stream error: {e}");
-
+    let mut cfg: cpal::StreamConfig = supported.into();
+    cfg.buffer_size = cpal::BufferSize::Fixed(expected_request_frames);
     macro_rules! stream {
-        ($t:ty, $push:expr) => {{
+        ($t:ty, $write:ident) => {{
+            let mut sink = sink;
+            let enabled = enabled.clone();
+            let audio = audio.clone();
+            let callback_fault = fault.clone();
+            let error_fault = fault.clone();
+            let callback_control = control.clone();
+            let error_control = control.clone();
+            let failed = Arc::new(AtomicBool::new(false));
+            let callback_failed = failed.clone();
             dev.build_input_stream(
                 &cfg,
                 move |data: &[$t], _: &cpal::InputCallbackInfo| {
-                    $push(&mut writer, data, channels);
+                    let frames = data.len().div_ceil(channels);
+                    if gate_capture_callback(&callback_failed, frames, sealed as usize, || {
+                        /* Preserve one-callback/one-record semantics. The
+                         * native endpoint rejects this whole callback and
+                         * publishes its explicit GAP/XRUN descriptor; the
+                         * correlated device-fault edge then makes the owner
+                         * retire the stream instead of repeatedly dropping. */
+                        let write = sink.$write(data, channels);
+                        audio
+                            .dropped_samples
+                            .fetch_add(write.dropped_frames as u64, Ordering::Relaxed);
+                        callback_fault.fetch_or(DEVICE_FAULT_INPUT, Ordering::Release);
+                        let _ = callback_control.notify();
+                    }) {
+                        return;
+                    }
+                    if !enabled.load(Ordering::Acquire) {
+                        let _ = sink.mute(frames, channels);
+                        return;
+                    }
+                    let write = sink.$write(data, channels);
+                    if write.dropped_frames != 0 {
+                        audio
+                            .dropped_samples
+                            .fetch_add(write.dropped_frames as u64, Ordering::Relaxed);
+                    }
                 },
-                err,
+                move |_| {
+                    if failed.swap(true, Ordering::AcqRel) {
+                        return;
+                    }
+                    error_fault.fetch_or(DEVICE_FAULT_INPUT, Ordering::Release);
+                    let _ = error_control.notify();
+                },
                 None,
             )
         }};
     }
 
     let stream = match fmt {
-        cpal::SampleFormat::F32 => stream!(f32, AudioInputWriter::push_interleaved_f32),
-        cpal::SampleFormat::I16 => stream!(i16, AudioInputWriter::push_interleaved_i16),
-        cpal::SampleFormat::U16 => stream!(u16, AudioInputWriter::push_interleaved_u16),
+        cpal::SampleFormat::F32 => stream!(f32, write_f32),
+        cpal::SampleFormat::I16 => stream!(i16, write_i16),
+        cpal::SampleFormat::U16 => stream!(u16, write_u16),
         other => return Err(format!("unsupported input sample format {other:?}").into()),
     }?;
     stream.play()?;
     Ok(stream)
 }
 
-#[cfg(not(feature = "audio-io"))]
-fn start_input(_writer: AudioInputWriter, _expected_rate: u32) -> Res<HostStream> {
-    Err("liquid-audio was built without platform audio support".into())
+#[cfg(feature = "audio-io")]
+fn capture_contract(
+    rate: u32,
+    supported: &cpal::SupportedBufferSize,
+) -> Result<CaptureContract, String> {
+    if rate == 0 {
+        return Err("native capture callback contract is empty".into());
+    }
+    let cpal::SupportedBufferSize::Range { min, max } = supported else {
+        return Err("input device does not expose a sealable callback-buffer range".into());
+    };
+    if min > max || *max == 0 {
+        return Err("input device exposed an invalid callback-buffer range".into());
+    }
+    /* Some CPAL backends use zero to mean that the backend imposes no lower
+     * bound. One frame is the smallest usable fixed request; zero itself is
+     * never submitted to the device. */
+    let min = (*min).max(1);
+    let requested = ((rate as u64 * CAPTURE_CALLBACK_REQUEST_MS as u64) + 999) / 1_000;
+    let requested = u32::try_from(requested)
+        .map_err(|_| "audio input callback request overflow".to_string())?;
+    let admitted = ((rate as u64 * CAPTURE_CALLBACK_MAX_MS as u64) + 999) / 1_000;
+    let admitted = u32::try_from(admitted)
+        .map_err(|_| "audio input callback admission overflow".to_string())?;
+    if min > admitted {
+        return Err(format!(
+            "input device requires at least {min} callback frames but native admission is sealed at {admitted}"
+        ));
+    }
+    Ok(CaptureContract {
+        rate,
+        requested_frames: requested.max(min).min(*max),
+        max_callback_frames: admitted,
+    })
 }
 
 #[cfg(feature = "audio-io")]
@@ -1615,8 +1322,9 @@ fn start_output(
     source: Box<dyn PlaybackSource>,
     audio: Stats,
     flush: Arc<AtomicBool>,
-    playback: Playback,
     latency: Arc<TurnLatency>,
+    fault: Arc<AtomicU32>,
+    control: SharedRealtimeNotifier,
 ) -> Res<HostStream> {
     let host = cpal::default_host();
     let dev = host
@@ -1633,23 +1341,19 @@ fn start_output(
     if source.rate() != rate {
         return Err("audio output sample rate changed during setup".into());
     }
-    let err = |e| eprintln!("[voice] output stream error: {e}");
-
     macro_rules! stream {
         ($t:ty, $write:ident) => {{
             let mut source = source;
             let flush = flush.clone();
-            let playback = playback.clone();
             let audio = audio.clone();
             let latency = latency.clone();
+            let fault = fault.clone();
+            let control = control.clone();
             dev.build_output_stream(
                 &cfg,
                 move |data: &mut [$t], _: &cpal::OutputCallbackInfo| {
                     let reset = flush.swap(false, Ordering::AcqRel);
                     let write = source.$write(data, channels, reset);
-                    if reset {
-                        playback.set_idle();
-                    }
                     if write.claimed_samples != 0 {
                         audio
                             .decoded_samples
@@ -1667,15 +1371,12 @@ fn start_output(
                         audio
                             .played_samples
                             .fetch_add(write.played_frames as u64, Ordering::Relaxed);
-                        playback.set_playing(write.rms);
                         if write.rms > TURN_LATENCY_AGENT_RMS {
                             if let Some(ms) = latency.try_measure() {
                                 audio.record_turn_latency(ms);
                             }
                             let _ = latency.first_word();
                         }
-                    } else if !write.active {
-                        playback.set_idle();
                     }
                     if write.underrun_frames != 0 {
                         audio
@@ -1683,7 +1384,10 @@ fn start_output(
                             .fetch_add(write.underrun_frames as u64, Ordering::Relaxed);
                     }
                 },
-                err,
+                move |_| {
+                    fault.fetch_or(DEVICE_FAULT_OUTPUT, Ordering::Release);
+                    let _ = control.notify();
+                },
                 None,
             )
         }};
@@ -1699,95 +1403,27 @@ fn start_output(
     Ok(stream)
 }
 
-#[cfg(not(feature = "audio-io"))]
-fn start_output(
-    _source: Box<dyn PlaybackSource>,
-    _audio: Stats,
-    _flush: Arc<AtomicBool>,
-    _playback: Playback,
-    _latency: Arc<TurnLatency>,
-) -> Res<HostStream> {
-    Err("liquid-audio was built without platform audio support".into())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Mutex;
 
     #[test]
-    fn playback_reference_extends_echo_gate_after_generation_finishes() {
-        let assistant = AtomicBool::new(false);
-        let capture = Arc::new(AtomicUsize::new(0));
-        let playback = PlaybackReference::new(capture.clone(), 1_000);
-
-        // Never played: no tail, not reference audio.
-        assert!(!reference_audio_active(&assistant, &playback));
-        assert_eq!(reference_vad_threshold(0.012, &assistant, &playback), 0.012);
-
-        playback.set_playing(0.08);
-        assert!(reference_audio_active(&assistant, &playback));
-        assert!(reference_vad_threshold(0.012, &assistant, &playback) >= 0.1);
-
-        // Idle starts the ECHO TAIL: the speaker is still draining and the room
-        // still ringing, so the reference gate must stay up (the bug this guards:
-        // the model's own trailing audio re-entering as a fresh "user" utterance).
-        playback.set_idle();
-        assert!(!playback.active(), "raw active flag drops on idle");
-        assert!(
-            reference_audio_active(&assistant, &playback),
-            "echo tail keeps reference audio active right after idle"
-        );
-
-        // Acoustic-silence callbacks advance the sample cursor. Wall-clock time
-        // alone is never allowed to advance the speech state machine.
-        let tail = playback.tail_frames;
-        capture.fetch_add(tail, Ordering::Release);
-        assert!(!reference_audio_active(&assistant, &playback));
-
-        // Playing again clears the tail bookkeeping.
-        playback.set_playing(0.05);
-        assert!(reference_audio_active(&assistant, &playback));
-    }
-
-    #[test]
-    fn playback_reference_requires_barge_in_above_echo_floor() {
-        let assistant = AtomicBool::new(false);
-        let playback = PlaybackReference::new(Arc::new(AtomicUsize::new(0)), 1_000);
-        playback.set_playing(0.08);
-
-        assert_eq!(
-            reference_vad_threshold(0.012, &assistant, &playback),
-            0.08 * PLAYBACK_ECHO_MULTIPLIER
-        );
-    }
-
-    #[test]
-    fn assistant_generation_is_reference_audio_even_before_playback_starts() {
-        let assistant = AtomicBool::new(true);
-        let playback = PlaybackReference::new(Arc::new(AtomicUsize::new(0)), 1_000);
-
-        assert!(reference_audio_active(&assistant, &playback));
-        assert_eq!(
-            reference_vad_threshold(0.012, &assistant, &playback),
-            0.012 * PLAYBACK_VAD_MULTIPLIER
-        );
-    }
-
-    #[test]
-    fn turn_latency_measures_only_when_armed_after_voice() {
+    fn turn_latency_measures_only_when_armed_after_native_turn() {
         let latency = TurnLatency::new();
 
-        // Not armed, no voice: nothing to measure.
+        // Not armed, no native turn: nothing to measure.
         assert_eq!(latency.try_measure(), None);
 
-        // Arming without any voiced input is a no-op.
+        // Arming without an accepted turn is a no-op.
         latency.arm();
         assert_eq!(latency.try_measure(), None);
 
-        latency.mark_voice();
+        latency.mark_turn();
         latency.arm();
-        let measured = latency.try_measure().expect("armed after voice measures");
+        let measured = latency
+            .try_measure()
+            .expect("armed after native turn measures");
         assert!(measured < 1000, "same-test measurement should be near-zero");
 
         // Measurement disarms: a second audible chunk doesn't re-measure.
@@ -1797,7 +1433,7 @@ mod tests {
     #[test]
     fn turn_latency_disarm_cancels_pending_measurement() {
         let latency = TurnLatency::new();
-        latency.mark_voice();
+        latency.mark_turn();
         latency.arm();
         latency.disarm();
         assert_eq!(latency.try_measure(), None);
@@ -1845,8 +1481,252 @@ mod tests {
         assert_eq!(ready_state(&mic), SessionState::Idle);
     }
 
+    #[cfg(feature = "audio-io")]
     #[test]
-    fn interrupt_flushes_queued_playback_from_runtime_handle() {
+    fn capture_request_is_distinct_from_native_admission_bound() {
+        let range = cpal::SupportedBufferSize::Range {
+            min: 128,
+            max: 2_048,
+        };
+        assert_eq!(
+            capture_contract(48_000, &range).unwrap(),
+            CaptureContract {
+                rate: 48_000,
+                requested_frames: 960,
+                max_callback_frames: 1_920,
+            }
+        );
+        assert_eq!(
+            capture_contract(44_100, &range).unwrap(),
+            CaptureContract {
+                rate: 44_100,
+                requested_frames: 882,
+                max_callback_frames: 1_764,
+            }
+        );
+        assert_eq!(
+            capture_contract(
+                48_000,
+                &cpal::SupportedBufferSize::Range {
+                    min: 0,
+                    max: u32::MAX,
+                },
+            )
+            .unwrap(),
+            CaptureContract {
+                rate: 48_000,
+                requested_frames: 960,
+                max_callback_frames: 1_920,
+            }
+        );
+
+        let oversized = cpal::SupportedBufferSize::Range {
+            min: 2_048,
+            max: 4_096,
+        };
+        assert!(capture_contract(48_000, &oversized).is_err());
+        assert!(capture_contract(48_000, &cpal::SupportedBufferSize::Unknown).is_err());
+    }
+
+    #[cfg(feature = "audio-io")]
+    #[test]
+    fn oversized_callback_publishes_one_terminal_action_then_stays_retired() {
+        let failed = AtomicBool::new(false);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        assert!(!gate_capture_callback(&failed, 960, 1_920, || {
+            calls.fetch_add(1, Ordering::Relaxed);
+        }));
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        assert!(gate_capture_callback(&failed, 1_921, 1_920, || {
+            calls.fetch_add(1, Ordering::Relaxed);
+        }));
+        assert!(gate_capture_callback(&failed, 1_921, 1_920, || {
+            calls.fetch_add(1, Ordering::Relaxed);
+        }));
+        assert!(gate_capture_callback(&failed, 960, 1_920, || {
+            calls.fetch_add(1, Ordering::Relaxed);
+        }));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn abandoned_initializer_retires_endpoints_before_engine_handoff() {
+        struct Capture(Arc<Mutex<Vec<&'static str>>>);
+        struct Playback(Arc<Mutex<Vec<&'static str>>>);
+        struct Engine(Arc<Mutex<Vec<&'static str>>>);
+
+        impl Drop for Capture {
+            fn drop(&mut self) {
+                self.0.lock().expect("lifecycle log").push("capture-drop");
+            }
+        }
+
+        impl Drop for Playback {
+            fn drop(&mut self) {
+                self.0.lock().expect("lifecycle log").push("playback-drop");
+            }
+        }
+
+        impl Drop for Engine {
+            fn drop(&mut self) {
+                self.0.lock().expect("lifecycle log").push("engine-drop");
+            }
+        }
+
+        impl CaptureSink for Capture {
+            fn rate(&self) -> u32 {
+                48_000
+            }
+
+            fn max_callback_frames(&self) -> u32 {
+                1_920
+            }
+
+            fn write_f32(&mut self, _: &[f32], _: usize) -> crate::voice_api::CaptureWrite {
+                crate::voice_api::CaptureWrite::default()
+            }
+
+            fn write_i16(&mut self, _: &[i16], _: usize) -> crate::voice_api::CaptureWrite {
+                crate::voice_api::CaptureWrite::default()
+            }
+
+            fn write_u16(&mut self, _: &[u16], _: usize) -> crate::voice_api::CaptureWrite {
+                crate::voice_api::CaptureWrite::default()
+            }
+
+            fn mute(&mut self, _: usize, _: usize) -> crate::voice_api::CaptureMute {
+                crate::voice_api::CaptureMute::default()
+            }
+        }
+
+        impl PlaybackSource for Playback {
+            fn rate(&self) -> u32 {
+                48_000
+            }
+
+            fn write_f32(
+                &mut self,
+                _: &mut [f32],
+                _: usize,
+                _: bool,
+            ) -> crate::voice_api::PlaybackWrite {
+                crate::voice_api::PlaybackWrite::default()
+            }
+
+            fn write_i16(
+                &mut self,
+                _: &mut [i16],
+                _: usize,
+                _: bool,
+            ) -> crate::voice_api::PlaybackWrite {
+                crate::voice_api::PlaybackWrite::default()
+            }
+
+            fn write_u16(
+                &mut self,
+                _: &mut [u16],
+                _: usize,
+                _: bool,
+            ) -> crate::voice_api::PlaybackWrite {
+                crate::voice_api::PlaybackWrite::default()
+            }
+        }
+
+        impl VoiceEngine for Engine {
+            fn take_capture_sink(&mut self) -> Result<Option<Box<dyn CaptureSink>>, String> {
+                Ok(None)
+            }
+
+            fn take_playback_source(
+                &mut self,
+                _: RealtimeNotifier,
+            ) -> Result<Option<Box<dyn PlaybackSource>>, String> {
+                Ok(None)
+            }
+
+            fn mount_events(&mut self, _: RealtimeNotifier) -> Result<(), String> {
+                Ok(())
+            }
+
+            fn advance_events(
+                &mut self,
+                _: &AtomicBool,
+                _: &mut dyn FnMut(VoiceEvent),
+            ) -> Result<EngineProgress, String> {
+                Ok(EngineProgress::Dormant)
+            }
+
+            fn interrupt_stream(&mut self) -> Result<u64, String> {
+                Ok(1)
+            }
+
+            fn request_stop(&mut self) {
+                self.0.lock().expect("lifecycle log").push("request-stop");
+            }
+
+            fn stop_session(&mut self) -> Result<(), String> {
+                self.0.lock().expect("lifecycle log").push("stop-session");
+                Ok(())
+            }
+        }
+
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let handoff = EngineHandoff::new();
+        let mut resources = InitResources::new(Box::new(Engine(log.clone())), handoff.clone());
+        resources.capture = Some(Box::new(Capture(log.clone())));
+        resources.source = Some(Box::new(Playback(log.clone())));
+        let runtime = Arc::new(CoroutineRuntime::new().expect("lifecycle runtime"));
+        let service = runtime.service(|| {}).expect("lifecycle service");
+        let init = SessionInit {
+            resources,
+            sink: Box::new(|_| false),
+            stop: Arc::new(AtomicBool::new(false)),
+            interrupt: Arc::new(AtomicBool::new(false)),
+            mic_enabled: Arc::new(AtomicBool::new(true)),
+            playback_flush: Arc::new(AtomicBool::new(false)),
+            device_fault: Arc::new(AtomicU32::new(0)),
+            control: Some(service.shared_realtime_notifier()),
+            audio: Arc::new(AudioStats::default()),
+            in_rate: 48_000,
+            in_request_frames: 960,
+            in_max_callback_frames: 1_920,
+            out_rate: 48_000,
+            latency: TurnLatency::new(),
+            done: Arc::new(AtomicBool::new(false)),
+            events: Some(service.realtime_notifier().expect("event edge")),
+        };
+        let failed = match init.mount() {
+            Err((init, error)) => {
+                assert!(error.contains("rejected listening state"));
+                init
+            }
+            Ok(_) => panic!("rejecting sink unexpectedly admitted the session"),
+        };
+        drop(failed);
+        assert_eq!(
+            log.lock().expect("lifecycle log").as_slice(),
+            ["capture-drop", "playback-drop", "request-stop"]
+        );
+
+        let mut engine = handoff
+            .take()
+            .expect("engine crosses administrative handoff");
+        engine.stop_session().expect("administrative settlement");
+        drop(engine);
+        assert_eq!(
+            log.lock().expect("lifecycle log").as_slice(),
+            [
+                "capture-drop",
+                "playback-drop",
+                "request-stop",
+                "stop-session",
+                "engine-drop",
+            ]
+        );
+    }
+
+    #[test]
+    fn interrupt_is_a_fallible_realtime_control_edge() {
         let runtime = Arc::new(CoroutineRuntime::new().unwrap());
         let service = runtime.service(|| {}).unwrap();
         let control = service.shared_realtime_notifier();
@@ -1856,7 +1736,6 @@ mod tests {
             stop: Arc::new(AtomicBool::new(false)),
             interrupt: Arc::new(AtomicBool::new(false)),
             mic_enabled: Arc::new(AtomicBool::new(true)),
-            playback_flush: Arc::new(AtomicBool::new(false)),
             runtime,
             service: Some(service),
             control,
@@ -1867,12 +1746,16 @@ mod tests {
         };
 
         assert!(!live.interrupt.load(Ordering::SeqCst));
-        assert!(!live.playback_flush.load(Ordering::SeqCst));
 
-        live.interrupt();
+        live.interrupt().unwrap();
 
         assert!(live.interrupt.load(Ordering::SeqCst));
-        assert!(live.playback_flush.load(Ordering::SeqCst));
+
+        // This unit fixture uses a generic dormant service rather than the
+        // production OwnerSession state machine, so retire it explicitly.
+        live.service.as_ref().unwrap().stop();
+        live.service.as_ref().unwrap().join().unwrap();
+        live.closed.store(true, Ordering::Release);
     }
 
     #[test]

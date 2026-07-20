@@ -1,4 +1,7 @@
-use kcoro_sys::{Runtime, RuntimeConfig, Service, ServiceOutcome};
+use kcoro_sys::{
+    Runtime, RuntimeConfig, Service, ServiceFaultCause, ServiceFaultEdge, ServiceOutcome,
+    ServiceTerminal,
+};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Condvar, Mutex};
@@ -70,6 +73,24 @@ fn runtime(workers: u32) -> Runtime {
     Runtime::with_config(RuntimeConfig { workers }).unwrap()
 }
 
+fn fault_supervisor(runtime: &Runtime) -> (Service, ServiceFaultEdge, Arc<AtomicUsize>) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&calls);
+    let (service, edge) = runtime
+        .state_service_factory(|setup| {
+            let edge = setup.fault_edge();
+            let record = edge.clone();
+            let callback = move || {
+                assert!(matches!(record.terminal(), ServiceTerminal::Fault(_)));
+                seen.fetch_add(1, Ordering::Release);
+                ServiceOutcome::Dormant
+            };
+            Ok::<_, i32>((callback, edge))
+        })
+        .unwrap();
+    (service, edge, calls)
+}
+
 #[test]
 fn safe_rust_surface_cannot_create_an_operation_waiter() {
     const WRAPPER: &str = include_str!("../src/lib.rs");
@@ -82,6 +103,36 @@ fn safe_rust_surface_cannot_create_an_operation_waiter() {
         assert!(
             !WRAPPER.contains(forbidden),
             "safe Rust waiter surface survived: {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn fault_publication_is_one_atomic_record_then_one_prebound_wake() {
+    const WRAPPER: &str = include_str!("../src/lib.rs");
+    let start = WRAPPER
+        .find("fn publish_fault(&self, cause: ServiceFaultCause")
+        .unwrap();
+    let end = WRAPPER[start..]
+        .find("\n}\n\nstruct RuntimeInner")
+        .map(|offset| start + offset)
+        .unwrap();
+    let body = &WRAPPER[start..end];
+    assert!(body.contains("compare_exchange(0, terminal"));
+    assert!(body.contains("self.notifier.notify()"));
+    for forbidden in [
+        "Box::new",
+        "Mutex",
+        "Condvar",
+        ".lock(",
+        ".wait(",
+        "catch_unwind",
+        "callback()",
+        "panic!",
+    ] {
+        assert!(
+            !body.contains(forbidden),
+            "fault publication gained forbidden work: {forbidden}"
         );
     }
 }
@@ -504,7 +555,7 @@ fn stop_race_drains_accepted_realtime_edges_before_releasing_lifetimes() {
 }
 
 #[test]
-fn callback_panic_is_contained_at_the_ffi_boundary() {
+fn callback_panic_retires_the_service_without_stopping_the_runtime() {
     let runtime = runtime(1);
     let calls = Arc::new(AtomicUsize::new(0));
     let seen = Arc::clone(&calls);
@@ -518,17 +569,318 @@ fn callback_panic_is_contained_at_the_ffi_boundary() {
     runtime.start().unwrap();
     service.start().unwrap();
     service.notify().unwrap();
-    observe(&service, 1);
-    assert!(service.callback_panicked());
+    runtime.join_all().unwrap();
+    service.join().unwrap();
 
-    service.notify().unwrap();
-    observe(&service, 2);
+    assert!(service.callback_panicked());
     assert_eq!(calls.load(Ordering::Acquire), 1);
     let snapshot = service.snapshot().unwrap();
-    assert_eq!(snapshot.notifications, 2);
-    assert_eq!(snapshot.handled_notifications, 2);
+    assert_eq!(snapshot.notifications, 1);
+    assert_eq!(snapshot.handled_notifications, 1);
+    assert_eq!(snapshot.callbacks, 1);
+    assert!(snapshot.joined);
+    assert!(!snapshot.stop_requested);
+    assert!(service.notify().is_err());
+    service.destroy().unwrap();
 
-    finish(runtime, service);
+    let continued = Arc::new(AtomicBool::new(false));
+    let observed = Arc::clone(&continued);
+    let next = runtime
+        .state_service(move || {
+            observed.store(true, Ordering::Release);
+            ServiceOutcome::Complete
+        })
+        .unwrap();
+    next.start().unwrap();
+    next.notify().unwrap();
+    runtime.join_all().unwrap();
+    next.join().unwrap();
+    assert!(continued.load(Ordering::Acquire));
+
+    finish(runtime, next);
+}
+
+#[test]
+fn callback_panic_publishes_one_fault_edge_before_owner_finalization() {
+    struct Finalized {
+        edge: ServiceFaultEdge,
+        ordered: Arc<AtomicBool>,
+    }
+
+    impl Drop for Finalized {
+        fn drop(&mut self) {
+            self.ordered.store(
+                matches!(
+                    self.edge.terminal(),
+                    ServiceTerminal::Fault(fault)
+                        if fault.cause == ServiceFaultCause::CallbackPanic
+                            && fault.status == 0
+                ),
+                Ordering::Release,
+            );
+        }
+    }
+
+    let runtime = runtime(2);
+    let (supervisor, edge, calls) = fault_supervisor(&runtime);
+    let ordered = Arc::new(AtomicBool::new(false));
+    let guard = Finalized {
+        edge: edge.clone(),
+        ordered: Arc::clone(&ordered),
+    };
+    let (watched, ()) = runtime
+        .state_service_factory_with_fault_edge(edge.clone(), |_| {
+            let callback = move || {
+                let _ = &guard;
+                panic!("caught callback panic with a fault edge");
+            };
+            Ok::<_, i32>((callback, ()))
+        })
+        .unwrap();
+
+    runtime.start().unwrap();
+    supervisor.start().unwrap();
+    watched.start().unwrap();
+    watched.notify().unwrap();
+    observe(&supervisor, 1);
+    supervisor.stop();
+    runtime.join_all().unwrap();
+    watched.join().unwrap();
+    supervisor.join().unwrap();
+
+    assert!(watched.callback_panicked());
+    assert!(ordered.load(Ordering::Acquire));
+    assert_eq!(
+        edge.terminal(),
+        ServiceTerminal::Fault(kcoro_sys::ServiceFault {
+            cause: ServiceFaultCause::CallbackPanic,
+            status: 0,
+        })
+    );
+    assert_eq!(calls.load(Ordering::Acquire), 1);
+    assert_eq!(supervisor.snapshot().unwrap().notifications, 1);
+    watched.destroy().unwrap();
+    drop(edge);
+    supervisor.destroy().unwrap();
+    runtime.destroy().unwrap();
+}
+
+#[test]
+fn owner_initializer_panic_publishes_one_fault_and_runtime_survives() {
+    let runtime = runtime(2);
+    let (supervisor, edge, calls) = fault_supervisor(&runtime);
+    let (watched, ()) = runtime
+        .owner_state_service_factory_with_fault_edge(edge.clone(), |_| {
+            let initializer = || -> fn() -> ServiceOutcome {
+                panic!("caught owner initializer panic");
+            };
+            Ok::<_, i32>((initializer, ()))
+        })
+        .unwrap();
+
+    runtime.start().unwrap();
+    supervisor.start().unwrap();
+    watched.start().unwrap();
+    observe(&supervisor, 1);
+    supervisor.stop();
+    runtime.join_all().unwrap();
+    watched.join().unwrap();
+    supervisor.join().unwrap();
+
+    assert!(watched.callback_panicked());
+    assert_eq!(
+        edge.terminal(),
+        ServiceTerminal::Fault(kcoro_sys::ServiceFault {
+            cause: ServiceFaultCause::InitializerPanic,
+            status: 0,
+        })
+    );
+    assert_eq!(calls.load(Ordering::Acquire), 1);
+    assert_eq!(watched.snapshot().unwrap().callbacks, 0);
+    watched.destroy().unwrap();
+
+    let alive = Arc::new(AtomicBool::new(false));
+    let signal = Arc::clone(&alive);
+    let probe = runtime
+        .state_service(move || {
+            signal.store(true, Ordering::Release);
+            ServiceOutcome::Complete
+        })
+        .unwrap();
+    probe.start().unwrap();
+    probe.notify().unwrap();
+    runtime.join_all().unwrap();
+    probe.join().unwrap();
+    assert!(alive.load(Ordering::Acquire));
+    probe.destroy().unwrap();
+
+    drop(edge);
+    supervisor.destroy().unwrap();
+    runtime.destroy().unwrap();
+}
+
+#[test]
+fn owner_finalizer_fault_proves_the_hook_outlives_callback_state() {
+    struct PanicOnDrop;
+
+    impl Drop for PanicOnDrop {
+        fn drop(&mut self) {
+            panic!("caught owner finalizer panic");
+        }
+    }
+
+    let runtime = runtime(2);
+    let (supervisor, edge, calls) = fault_supervisor(&runtime);
+    let guard = PanicOnDrop;
+    let (watched, ()) = runtime
+        .state_service_factory_with_fault_edge(edge.clone(), |_| {
+            let callback = move || {
+                let _ = &guard;
+                ServiceOutcome::Complete
+            };
+            Ok::<_, i32>((callback, ()))
+        })
+        .unwrap();
+
+    runtime.start().unwrap();
+    supervisor.start().unwrap();
+    watched.start().unwrap();
+    watched.notify().unwrap();
+    observe(&supervisor, 1);
+    supervisor.stop();
+    runtime.join_all().unwrap();
+    watched.join().unwrap();
+    supervisor.join().unwrap();
+
+    assert!(watched.callback_panicked());
+    assert_eq!(
+        edge.terminal(),
+        ServiceTerminal::Fault(kcoro_sys::ServiceFault {
+            cause: ServiceFaultCause::OwnerFinalizerPanic,
+            status: 0,
+        })
+    );
+    assert_eq!(calls.load(Ordering::Acquire), 1);
+    watched.destroy().unwrap();
+    drop(edge);
+    supervisor.destroy().unwrap();
+    runtime.destroy().unwrap();
+}
+
+#[test]
+fn retirement_cancellation_is_normal_and_does_not_ring_the_fault_edge() {
+    let runtime = runtime(2);
+    let (supervisor, edge, calls) = fault_supervisor(&runtime);
+    let gate = Arc::new(Gate::new());
+    let callback_gate = Arc::clone(&gate);
+    let (watched, ()) = runtime
+        .state_service_factory_with_fault_edge(edge.clone(), |_| {
+            let callback = move || {
+                callback_gate.callback();
+                ServiceOutcome::Continue
+            };
+            Ok::<_, i32>((callback, ()))
+        })
+        .unwrap();
+
+    runtime.start().unwrap();
+    supervisor.start().unwrap();
+    watched.start().unwrap();
+    watched.notify().unwrap();
+    gate.wait(1);
+    watched.stop();
+    gate.release();
+    supervisor.stop();
+    runtime.join_all().unwrap();
+    watched.join().unwrap();
+    supervisor.join().unwrap();
+
+    assert_eq!(edge.terminal(), ServiceTerminal::Normal);
+    assert_eq!(watched.reschedule_error(), None);
+    assert_eq!(calls.load(Ordering::Acquire), 0);
+    assert_eq!(supervisor.snapshot().unwrap().notifications, 0);
+    watched.destroy().unwrap();
+    drop(edge);
+    supervisor.destroy().unwrap();
+    runtime.destroy().unwrap();
+}
+
+#[test]
+fn one_fault_edge_cannot_be_installed_on_two_services() {
+    let runtime = runtime(2);
+    let (supervisor, edge, calls) = fault_supervisor(&runtime);
+    let (first, ()) = runtime
+        .state_service_factory_with_fault_edge(edge.clone(), |_| {
+            let callback = || {
+                panic!("caught watched callback fault");
+            };
+            Ok::<_, i32>((callback, ()))
+        })
+        .unwrap();
+    let second = runtime.state_service_factory_with_fault_edge(edge.clone(), |_| {
+        let callback = || panic!("must never install");
+        Ok::<_, i32>((callback, ()))
+    });
+    assert_eq!(second.err(), Some(-16));
+
+    runtime.start().unwrap();
+    supervisor.start().unwrap();
+    first.start().unwrap();
+    first.notify().unwrap();
+    observe(&supervisor, 1);
+    supervisor.stop();
+    runtime.join_all().unwrap();
+    first.join().unwrap();
+    supervisor.join().unwrap();
+
+    assert_eq!(
+        edge.terminal(),
+        ServiceTerminal::Fault(kcoro_sys::ServiceFault {
+            cause: ServiceFaultCause::CallbackPanic,
+            status: 0,
+        })
+    );
+    assert_eq!(calls.load(Ordering::Acquire), 1);
+    let snapshot = supervisor.snapshot().unwrap();
+    assert_eq!(snapshot.notifications, 1);
+    assert_eq!(snapshot.handled_notifications, 1);
+    first.destroy().unwrap();
+    drop(edge);
+    supervisor.destroy().unwrap();
+    runtime.destroy().unwrap();
+}
+
+#[test]
+fn failed_service_setup_releases_the_fault_edge_installation() {
+    let runtime = runtime(2);
+    let (supervisor, edge, calls) = fault_supervisor(&runtime);
+    let failed = runtime.state_service_factory_with_fault_edge::<fn() -> ServiceOutcome, _, ()>(
+        edge.clone(),
+        |_| Err(-17),
+    );
+    assert_eq!(failed.err(), Some(-17));
+
+    let (watched, ()) = runtime
+        .state_service_factory_with_fault_edge(edge.clone(), |_| {
+            Ok::<_, i32>((|| ServiceOutcome::Complete, ()))
+        })
+        .unwrap();
+    runtime.start().unwrap();
+    supervisor.start().unwrap();
+    watched.start().unwrap();
+    watched.notify().unwrap();
+    watched.stop();
+    supervisor.stop();
+    runtime.join_all().unwrap();
+    watched.join().unwrap();
+    supervisor.join().unwrap();
+
+    assert_eq!(edge.terminal(), ServiceTerminal::Normal);
+    assert_eq!(calls.load(Ordering::Acquire), 0);
+    watched.destroy().unwrap();
+    drop(edge);
+    supervisor.destroy().unwrap();
+    runtime.destroy().unwrap();
 }
 
 #[test]

@@ -21,9 +21,10 @@ the dispatch model, verification, and the build order.
 ## 0. As-built architecture (2026-07-19 working tree)
 
 The shipped LFM2 CPU path is native from accepted text/PCM through emitted text/PCM.
-Rust owns opaque lifecycle, platform audio, VAD/endpointing, settings, and the current
-product observer adapter; it does not own weights, tensors, tokens, model state,
-sampling, or model recurrence.
+Rust owns opaque lifecycle, platform audio callbacks, settings, and the product
+observer adapter. Native code owns exact Sesame evidence and turn endpointing.
+Rust does not own weights, tensors, tokens, model state, sampling, recurrence,
+speech evidence, or turn boundaries.
 
 - `safetensors.cpp` loads main and codec sources into one byte-exact, page-table
   read-only image. `LfmModel` owns that image and binds frontend, Conformer,
@@ -37,8 +38,9 @@ sampling, or model recurrence.
   coordinator advances recurrence; Rust never waits on or interprets a numerical
   completion.
 - kcoro owns one stable fixed-team worker per numerical lane. Typed audio encode,
-  backbone, Depthformer, and Mimi requests enter that team and park on
-  expected-value words between passes and at generation fences.
+  backbone, Depthformer, and Mimi requests enter that team as non-suspending
+  generations. Every member returns; the final return publishes the exact
+  completion callback. No operation member parks at a stage boundary.
   `REQ_AUDIO_ENCODE` carries borrowed PCM/output spans through resample,
   valid-only BF16 frontend, and whole Conformer/adapter orchestration; its
   checkpoint-layout GEMMs run as in-ticket fixed-team substages. A fair
@@ -66,17 +68,17 @@ boundary and may not fall back to Candle.
 
 ```mermaid
 flowchart LR
-    Host["Rust platform audio / control"] -->|"borrowed VAD slice → final capture lease"| Dock["native PCM + text dock"]
+    Host["Rust platform callbacks / control"] -->|"ephemeral device span"| Dock["native circular capture + playback docks"]
     Dock --> Session["native LfmSession<br/>tickets · epoch · recurrence"]
     Session --> Conv["native LfmConversation<br/>KV · conv · PRNG · rollover"]
     Conv --> Gate["fair expected-value model pass gate"]
     Gate -->|"128-byte SQ cell"| Bridge["native SQ/CQ + retained descriptor"]
-    Bridge --> Team["fixed Flashkern pthread lanes"]
+    Bridge --> Team["kcoro-owned fixed Flashkern team"]
     Team --> Board["shared stage board<br/>atomic tile claims"]
     Board --> Kernels["AArch64 / x86_64 leaves"]
-    Kernels -->|"exact completion doorbell"| Conv
+    Kernels -->|"final-member callback"| Conv
     Conv -->|"Mimi + native device-rate resample into lease"| Playback["native playback dock"]
-    Playback -->|"current Vec/VoiceEvent observer bridge"| Host
+    Playback -->|"generation-checked borrowed span"| Host
 ```
 
 `REQ_TOKEN_PASS` executes embedding lookup/provided embedding, the native
@@ -142,21 +144,20 @@ as-built. Read this as the spec, not the changelog.
    as register accumulators (an rb-epilogue in every kernel). **KV planes are bf16** (torch's
    cache dtype — f32 KV was the wrong call twice over: memory *and* fidelity).
 3. **Dispatch.** the native conversation submits and recurs full passes without a
-   Rust model-progress edge. The persistent pinned P-core lane team runs the
-   chain as a resident stage machine: publish stage state, bump epoch, workers
-   pull tile indices with an atomic counter, and the last worker rings the native
-   continuation. Sampling is an assembly collective; results land in native
-   ring slots. The doorbell (epoch + reason word) is checked at the **pass boundary
-   and nowhere inside**; event backpressure never touches it.
+   Rust model-progress edge. The resident fixed team runs the chain as a stage
+   machine: publish stage state, bump generation, workers pull tile indices with
+   an atomic counter, and the final member return resumes the native
+   continuation. macOS placement is never assumed. Sampling is an assembly
+   collective; results land in native ring slots. Interruption is applied at a
+   complete pass boundary; event backpressure never touches a numerical stage.
 4. **Transport.** Rings + `(offset, len, epoch)` descriptors, no owned `Vec` payloads on hot
    surfaces.
 
-For LFM2, weight/compute ownership, the typed audio-input request, native
-recurrence, capacity-2 exact-completion route, and retained kcoro bridge/broker
-services are built. The remaining contract gap is the physical Rust audio dock:
-replace transitional `Vec`/event payload ownership with retained block leases and
-mount its bounded VAD/frame state machines on the same callback-resumed runtime.
-This statement does not include a native Moshi port.
+For LFM2, weight/compute ownership, typed audio input, native recurrence,
+capacity-2 exact-completion routes, retained kcoro bridge/broker services, exact
+Sesame turn policy, and direct native capture/playback spans are built. The
+current engine is one fixed team; independent V2 block domains and native Moshi
+remain separate future work.
 
 **Lineage.** The learned lessons come from the sibling m2-bert-mlx project (same team as
 LFM2-Audio / Hyena / Monarch): whole-conv-in-one-dispatch vs streamed split at sync
@@ -232,43 +233,41 @@ retaining inputs and recomputing the whole tail.
   activation plane survives. Mimi writes direct at equal rates; otherwise native codec scratch feeds the
   prepared output resampler, which writes the device-rate playback reservation.
   Weight planes are never widened, packed, transposed, or copied.
-- Native generation fences use acquire/release generations and expected-value
-  parks. The last lane performs the fixed serial transition and wakes only actual
-  waiters. There is no spin budget or timed polling.
+- Native team generations use release/acquire publication plus generation-stamped
+  entered/returned evidence. The final member publishes one completion callback;
+  there is no numerical fence waiter, spin budget, or timed polling.
 - One fair expected-value `ExecutionGate` belongs to the model. Conversations
   queue at legal pass boundaries; each conversation retains private state while
   each admitted engine ticket retains a separate transient scratch bank.
 
-### Tier 3 — Transport (AS-BUILT native dock; legacy device adapter remains)
+### Tier 3 — Transport (AS-BUILT native dock)
 
 The native runtime/session owns bounded text commands, reliable event records,
-generation-checked capture/playback lease pools, ticket correlation, interruption
-epochs, and expected-value space/data doorbells. Reliable text and terminal records
-park for capacity; telemetry alone may be lossy. A stale epoch may finish a pass but
-cannot publish its value.
+generation-checked circular capture storage and playback leases, ticket
+correlation, interruption epochs, and exact data/space edges. Reliable text and
+terminal records suspend as durable state when capacity is unavailable;
+telemetry alone may be lossy. A stale epoch may finish a pass but cannot publish
+its value.
 
-The remaining transport debt is capture-side. Production no longer creates an
-utterance `Vec` or sends PCM through the inference-worker queue:
-`CaptureDock` copies the borrowed VAD slice once into its final retained native
-lease and queues only the opaque ticket. The mic callback still writes a Rust
-ring and VAD accumulation buffer before that admission. Playback materializes
-no `Vec`: its Rust sink consumes the resolved borrowed span synchronously,
-releases the lease, and sends only a ticket completion record. Direct
-callback-filled capture requires a separate VAD commit command; publishing a
-chunk cannot continue to imply "begin a turn."
+The microphone callback passes its ephemeral interleaved hardware span through
+the non-cloneable `CaptureSink`. Native format leaves write directly into a
+reserved circular-arena span and publish one typed chunk/XRUN record. The exact
+Sesame detector and sample-clock policy consume that native storage. Playback
+resolves its generation-checked lease only inside the device callback, renders
+directly into the ephemeral device buffer, and releases the exact ticket. No
+Rust PCM ring, utterance `Vec`, VAD buffer, or audio event payload remains.
 
 ### Thread model (AS-BUILT)
 
-- One stable pthread owns each Flashkern lane. The team enters once for a full
-  token/Depthformer pass and checks interruption only at the pass boundary.
-- A native session coordinator owns admission and recurrence; a native
-  notification thread drains reliable records. Both use expected-value predicates.
-  The coordinator currently waits for each exact engine completion before
-  calling the next native transition. The capacity-2 callback path is landed in
-  the engine but is not yet wired into this session state machine.
-- Rust callback/playback threads only adapt native events and PCM to the existing
-  product `VoiceEngine` surface. They do not submit model passes, hold KV, sample,
-  tokenize, or advance recurrence.
+- `kc_team` owns each stable Flashkern member. One generation executes one
+  non-suspending stage; the final return resumes the retained continuation.
+- Native coordinator/delivery/bridge/route services own admission, recurrence,
+  reliable events, and exact completion collection. Suspended actions are
+  records, not attached threads or waiters.
+- Rust platform callbacks own only the opaque `CaptureSink`/`PlaybackSource`
+  endpoints. Safe Rust retained services project bounded events/control; they do
+  not submit model passes, hold PCM/model state, sample, tokenize, or advance
+  recurrence.
 
 ---
 
@@ -384,7 +383,7 @@ Do not compare them across executors or extrapolate a current latency.
 ## 7. Build order
 
 1. **Fixed numerical executor and native SQ/CQ boundary: built.** Stable
-   pthread lanes, zero-spin native expected-value waits, two pointer-stable
+   kcoro-owned team members, callback-completed generations, two pointer-stable
    per-ticket request/scratch slots, a capacity-2 native SQ/CQ, retained descriptors, native endpoint ownership,
    and deletion of the stackful runtime are live.
 2. **One-image native LFM2 model: built.** The direct loader, typed BF16 views,
@@ -400,12 +399,10 @@ Do not compare them across executors or extrapolate a current latency.
    node becomes ready, so peers may queue without Rust progress. A
    coordinator-owned `SessionAction` collects text and audio terminal handles
    after a doorbell edge. Batched M≤4 prefill is already direct checkpoint BF16.
-5. **Physical kcoro audio-device adapter: capture callback half next.** Playback
-   drains a borrowed native lease through `PcmSink`; capture queues only a ticket
-   after `CaptureDock` fills the final lease from a borrowed VAD slice. Add a
-   callback-writable reservation plus a VAD commit command, then delete the
-   mic-ring/VAD accumulation copy while preserving bounded reliable text and
-   control projection.
+5. **Physical kcoro audio-device adapter: built for LFM2.** Rust platform
+   callbacks transfer only ephemeral device spans through non-cloneable opaque
+   endpoints; native circular capture, exact Sesame turn policy, playback
+   reservations, and ticket/generation retirement own the full data path.
 6. **Native Moshi: subsequent independent tranche.** Port Moshi onto the same
    image/session discipline before making it selectable in production. The LFM2
    cutover neither implements Moshi nor permits a Candle fallback.

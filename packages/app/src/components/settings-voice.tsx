@@ -704,20 +704,6 @@ export const SettingsVoice: Component = () => {
                 />
               </SettingsRow>
               <SettingsRow
-                title={language.t("settings.voice.row.vadThreshold.title")}
-                description={language.t("settings.voice.row.vadThreshold.description")}
-              >
-                <TextField
-                  hideLabel
-                  label={language.t("settings.voice.row.vadThreshold.title")}
-                  defaultValue={String(lfm2().vadThreshold)}
-                  onFocusOut={(e: FocusEvent) => {
-                    const n = numberFromInput(e)
-                    if (n !== undefined && n > 0) updateLfm2({ vadThreshold: n })
-                  }}
-                />
-              </SettingsRow>
-              <SettingsRow
                 title={language.t("settings.voice.row.trace.title")}
                 description={language.t("settings.voice.row.trace.description")}
               >

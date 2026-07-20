@@ -55,12 +55,15 @@ Fix the compute substrate for every native stage in documents 03 through 07:
   and strides against our planes. Do not claim a private Apple execution unit;
   Accelerate's implementation is opaque.
 - **Computational progress is edge driven.** Tickets, stages, results, playback
-  capacity, capture data, and control changes never own waiters and never use a
-  timer. Their producers publish an edge that makes a retained continuation
-  runnable. Only a resident kernel worker whose complete ready predicate is
-  empty may become dormant on one indefinite expected-value doorbell. That
-  worker is shared execution capacity, not the suspended operation. There is no
-  bounded spin, timed polling, per-stage park, or terminal-result wait tier.
+  capacity, capture data, and control changes never own waiters. Their producers
+  publish an edge that makes a retained continuation runnable. Correlated
+  monotonic one-shots are separate supervision/policy sources: expiry may
+  publish a terminal quorum fault or satisfy one half of a Sesame pause gate,
+  but it cannot fabricate numerical completion. Only a resident kernel worker
+  whose complete ready predicate is empty may become dormant on one indefinite
+  expected-value doorbell. That worker is shared execution capacity, not the
+  suspended operation. There is no bounded spin, timed polling, per-stage park,
+  or terminal-result wait tier.
 - **The numerical call graph is native pass descriptor -> C++ fixed executor ->
   assembly table.** Rust converts settings and owns PCM/control I/O scopes only.
   C++ owns model loading, pointer binding, stage planning, state ownership, and
@@ -277,8 +280,8 @@ transpose boundary.
 One private exception exists below the operation model: a resident runtime or
 team worker with no runnable continuation may become dormant on one shared
 expected-value doorbell. The operation is not attached to that worker; any
-worker may consume the next ready record. The public/private high-level surface
-is deliberately deadline-free:
+worker may consume the next ready record. The doorbell surface is deliberately
+deadline-free:
 
 ```c
 uint32_t kc_doorbell_observe(const kc_doorbell *doorbell);
@@ -294,6 +297,13 @@ ready predicate before becoming dormant, tolerates spurious host returns, and
 has no deadline. Shutdown publishes a stop edge, joins the resident workers,
 releases the adapter exactly once, and only then frees the board. There is no
 condition-variable fallback on a realtime callback path and no spin fallback.
+
+`kc_deadline_source` is a different primitive. It is created and sealed during
+runtime readiness, retains fixed child identity until cancellation/expiry is
+acknowledged, and publishes a small correlated record from an OS monotonic
+one-shot. Its handler never dereferences numerical, route, conversation, or
+scratch storage. Healthy numerical completion retires the matching arm without
+publishing an event; a winning expiry resumes only the owning supervisor.
 
 All atomic access to the doorbell uses one internal `kc_atomic_*` helper family
 with explicit memory order from C and C++. Do not cast between `_Atomic

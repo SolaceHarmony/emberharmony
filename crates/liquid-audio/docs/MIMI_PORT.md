@@ -44,8 +44,7 @@ conv-block transformer variants (config says None/LayerNorm/false), LSTM
 | 2 | `mimi_conv.cpp` | conv.rs | `NormConv1d`/`NormConvTranspose1d` forward math incl. weight-norm fold semantics, `StreamableConv1d::step`, `StreamableConvTranspose1d::step` (pending/partial-frame state carry), `ConvTrUpsample1d::step` | `ConvDownsample1d` (encode-only), batched mask paths |
 | 3 | `mimi_seanet.cpp` | seanet.rs | `SeaNetResnetBlock::step`, `SeaNetDecoder::step` (+ ELU), reset | `SeaNetEncoder` |
 | 4 | `mimi_transformer.cpp` | transformer.rs | `LayerScale`, `RotaryEmbedding`/`Rope` (rope_i interleaved), `StreamingMultiheadAttention::forward` (causal, kv_repeat 1), `Mlp::NoGating` (gelu_erf), `LayerNorm`, `StreamingTransformerLayer`, `StreamingTransformer::step`, `ProjectedTransformer::step` (projs are None at 512↔512) | cross-attn, gating, RmsNorm, conv-block, batched |
-| 5 | `mimi_kv.cpp` | kv_cache.rs | ~~ScatteredKvCache~~ **PARKED** — unit 5's port proved the streaming path never uses it: transformer.rs imports `kv_cache::KvCache` = an enum over **candle_nn `RotatingKvCache`**, mask built inline in StreamingTransformer::step (t==1 no-mask fast path; allow-rule `last_reset_pos <= k_pos <= t_pos <= k_pos+context`). The real cache is ported inside unit 4 from candle-nn-0.9.2 kv_cache.rs:336 + the inline mask. mimi_kv.cpp stays in-tree unwired (correct work, batched-serving consumer only). | |
-| 6 | `mimi_decode.cpp` | mimi.rs (+ streaming.rs as reference) | `Mimi::decode_step` orchestration over units 1–5, `reset_state` (decoder half), config `v0_1(8)` constants | `encode*`, `load*` (weights arrive via the table), batching |
+| 5 | `mimi_decode.cpp` | mimi.rs (+ streaming.rs as reference) | `Mimi::decode_step` orchestration over units 1–4, `reset_state` (decoder half), config `v0_1(8)` constants | `encode*`, `load*` (weights arrive via the table), batching |
 
 Shared contract: `native/src/mimi/mimi_kernel.h` (arbiter-authored) — weight
 table, state arena, C ABI. nn.rs collapses into the header's plain-f32 linear.
@@ -94,7 +93,8 @@ compatibility-copied weight bytes.
   *faithful* — ulp-band parity vs moshi-Rust per module (candle's blocked gemm
   is not economically bit-reproducible); thresholds measured by the harness,
   not asserted blind. The end-to-end wav byte hash WILL move → oracle re-arm
-  is deliberate and hers, gate.sh + DECODE_ENGINE.md together, never alone.
+  is deliberate and hers, with the directly invoked native real-checkpoint
+  trace and DECODE_ENGINE.md updated together, never alone.
 - **No fallbacks**: the native Mimi, once gated in, is required — absent it,
   hard error (Mimi always ships; never the LFM2 detokenizer silently).
 - C linkage entry points; no exceptions across the ABI; no candle, no Rust
@@ -178,7 +178,7 @@ compatibility-copied weight bytes.
       `-ffp-contract=off` (load-bearing). Production constructs
       `MimiDecodePlan` from the codec component of `LfmModel`'s one immutable
       image and gives each `LfmConversation` its own `MimiDecodeState`. The
-      standalone file-opening decoder/rim is oracle-feature-only.
+      standalone file-opening decoder/rim is deleted.
 - [x] PRODUCTION SWAP: native conversation recurrence invokes
       `REQ_MIMI_DECODE`; the moshi `decode_step` graph is absent from the
       shipped path. Rust moshi code remains only in the opt-in oracle/training
@@ -190,7 +190,7 @@ compatibility-copied weight bytes.
       between (lane-blocked reduction NaN'd on near-constant rows — probe-
       proven; accumulation now bit-matches candle's sequential order, apply
       stays NEON). Final verdict's P2s also closed: stage errors propagate
-      through mimi_decoder_step (negative rc never reads as priming);
+      through `mimi_decode_state_step` (negative rc never reads as priming);
       upsample weight validated exact-shape + non-null.
 - [x] engine integration: typed `REQ_MIMI_DECODE` runs through the native SQ/CQ.
       Equal-rate output writes its retained playback reservation directly; the

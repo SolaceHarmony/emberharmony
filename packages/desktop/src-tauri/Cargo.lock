@@ -1429,7 +1429,6 @@ name = "emberharmony-desktop"
 version = "0.0.0"
 dependencies = [
  "comrak",
- "crossbeam-channel",
  "futures",
  "keyring",
  "liquid-audio",
@@ -2993,7 +2992,6 @@ version = "0.1.0"
 dependencies = [
  "cc",
  "cpal",
- "crossbeam-channel",
  "hf-hub",
  "kcoro-sys",
  "serde",

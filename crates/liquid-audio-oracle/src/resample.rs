@@ -1,8 +1,56 @@
-//! Candle adapter around the production native resampler.
+//! Offline Candle adapter around the native torchaudio-exact resampler.
 
 use candle_core::{DType, Result, Tensor};
 
-pub use liquid_audio::resample::resample_slice;
+unsafe extern "C" {
+    fn lfm_resample_f32(
+        input: *const f32,
+        length: u64,
+        original_rate: u32,
+        new_rate: u32,
+        output: *mut f32,
+        output_capacity: u64,
+        output_length: *mut u64,
+    ) -> i32;
+}
+
+/// Oracle-only owned-vector adapter. Production passes borrowed PCM views
+/// directly through the native frontend/session and exposes no Rust numerical
+/// resampling surface.
+pub fn resample_slice(input: &[f32], original_rate: u32, new_rate: u32) -> Vec<f32> {
+    if original_rate == new_rate || input.is_empty() {
+        return input.to_vec();
+    }
+    let mut left = original_rate;
+    let mut right = new_rate;
+    while right != 0 {
+        let next = left % right;
+        left = right;
+        right = next;
+    }
+    let original = (original_rate / left) as f64;
+    let new = (new_rate / left) as f64;
+    let target = ((new * input.len() as f64) / original).ceil() as usize;
+    let mut output = vec![0.0f32; target];
+    let mut written = 0u64;
+    let status = unsafe {
+        lfm_resample_f32(
+            input.as_ptr(),
+            input.len() as u64,
+            original_rate,
+            new_rate,
+            output.as_mut_ptr(),
+            target as u64,
+            &mut written,
+        )
+    };
+    assert!(
+        status == 0 && written as usize == target,
+        "native oracle resample failed (status {status}, {original_rate} -> {new_rate} Hz, {} samples)",
+        input.len()
+    );
+    output
+}
 
 /// `torchaudio.functional.resample(wave, orig_freq, new_freq)` with the library
 /// defaults. `wave` is `(1, L)` -> `(1, L')` f32 with

@@ -5,7 +5,6 @@
 - `src/engine/` — non-numerical resident control, stage, queue, and barrier implementation.
 - `kernels/aarch64/` — hand-written AArch64/NEON assembly math.
 - `kernels/x86_64/` — hand-written x86-64 assembly math.
-- `reference/` — reference or fallback kernels.
 - `bench/` — standalone microbenchmarks/experiments (not built by `../build.rs`).
 
 Cargo builds these sources through `../build.rs`. Rust sees opaque engine/model
@@ -20,8 +19,7 @@ deleted as their paired `.S` families land.
 checkpoint directory; reads every selected shard directly into one 64-byte-aligned
 allocation; validates the complete payload; and returns immutable pointer/offset
 views. The native image itself never materializes payloads as Rust or Candle
-tensors. `src/compute/weights.rs` contains the explicit, counted compatibility
-copies still required by model components that have not moved to native kernels.
+objects, and there is no compatibility weight-copy owner in this crate.
 
 The JSON parser is nlohmann/json 3.11.3, vendored from the local `ember-ml` tree
 under `vendor/nlohmann/` with its MIT license.

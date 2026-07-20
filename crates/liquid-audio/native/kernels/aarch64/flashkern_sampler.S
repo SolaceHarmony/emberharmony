@@ -8,7 +8,44 @@
 
 .text
 
-/* uint32_t lfm_sampler_argmax_f32(const float *x, size_t count) */
+/*
+ * flashkern_sampler.S — AArch64. Token selection: argmax, softmax-with-cutoff,
+ * and the CDF walk. Feeds on the uniform draw produced by flashkern_prng.S.
+ *
+ * DETERMINISM CONTRACT — three guarantees, none of them obvious from the code:
+ *
+ * 1. TIE-BREAK IS LOWEST INDEX. Both argmax leaves run TWO passes: a vector
+ *    reduction to find the maximum VALUE, then a scan from index 0 for the first
+ *    element equal to it. A single fused pass that tracked the index while
+ *    reducing would return whichever lane happened to see the max first, making
+ *    the answer depend on vector width and loop peeling. Ties are common in
+ *    quantised logits, so this is a real reproducibility hazard, not a
+ *    theoretical one.
+ *
+ * 2. NaN CANNOT WIN. `fmaxnm` implements IEEE maxNum: a NaN operand returns the
+ *    OTHER value rather than propagating. One poisoned logit therefore cannot
+ *    capture the argmax and silently pin generation to a single token.
+ *
+ * 3. NO LIBM. The exponential is the local `.Lsampler_exp_f32` below — f32 range
+ *    reduction plus a degree-six polynomial, entirely in this object. Unlike
+ *    flashkern_rope.S (whose tables inherit the platform libm's last bits), this
+ *    file is bit-identical on every machine and OS. Sampling reproducibility does
+ *    not depend on which libm is linked.
+ *
+ * PRECISION SPLIT. The logits are handled at model precision (f32 and bf16
+ * leaves); the uniform draw that indexes the distribution is a double built from
+ * 53 PRNG bits. Those are deliberately different: narrowing the draw to bf16
+ * resolution would make any token with mass below ~1/256 unreachable, which
+ * truncates the tail off the distribution rather than merely rounding it.
+ */
+
+/*
+ * uint32_t lfm_sampler_argmax_f32(const float *x, size_t count)
+ *
+ * Pass 1: 4-lane `fmaxnm` reduction + `fmaxnmv` horizontal max + scalar tail.
+ * Pass 2: linear scan for the FIRST index equal to that maximum (guarantee 1).
+ * Accumulator starts at 0xff800000 (-inf). count == 0 returns 0.
+ */
 .p2align 2
 .globl LFM_SYM(lfm_sampler_argmax_f32)
 LFM_PRIVATE(LFM_SYM(lfm_sampler_argmax_f32))
@@ -57,7 +94,13 @@ LFM_SYM(lfm_sampler_argmax_f32):
     mov     w0, w2
     ret
 
-/* uint32_t lfm_sampler_argmax_bf16(const uint16_t *x, size_t count) */
+/*
+ * uint32_t lfm_sampler_argmax_bf16(const uint16_t *x, size_t count)
+ *
+ * As the f32 leaf, including the two-pass lowest-index tie-break. `shll
+ * v1.4s, v1.4h, #16` lifts four BF16 lanes to F32 by bit-shift — exact and
+ * lossless, never a conversion instruction.
+ */
 .p2align 2
 .globl LFM_SYM(lfm_sampler_argmax_bf16)
 LFM_PRIVATE(LFM_SYM(lfm_sampler_argmax_bf16))
@@ -116,6 +159,21 @@ LFM_SYM(lfm_sampler_argmax_bf16):
  *                               size_t count, float scale,
  *                               float maximum, float threshold)
  *
+ * One fused pass producing the unnormalised softmax weights and their sum:
+ *
+ *     v = x[i] * scale                 // scale = 1/temperature
+ *     if (v < threshold)  w = 0        // top-k / top-p cutoff, no exp taken
+ *     else                w = exp(v - maximum)
+ *     weights[i] = w ;  sum += w
+ *
+ * Subtracting `maximum` is the standard overflow guard, so the exp argument is
+ * always <= 0 — which is why the local exp has no overflow path. Note the
+ * threshold is compared against the SCALED logit, before max-subtraction, so a
+ * caller's cutoff is expressed in the same units as its temperature.
+ *
+ * `sum` accumulates sequentially in F32, in index order: that ordering is the
+ * contract, since the CDF walk below must see exactly this total.
+ *
  * The local exp leaf uses f32 range reduction and a degree-six polynomial.
  * Traversal, scaling, thresholding, exponentiation, writes, and reduction all
  * remain in this assembly object.
@@ -166,6 +224,18 @@ LFM_SYM(lfm_sampler_exp_sum_f32):
  * float lfm_sampler_exp_sum_bf16(const uint16_t *x, float *weights,
  *                                size_t count, uint16_t bf16_scale,
  *                                float maximum, float threshold)
+ *
+ * As the f32 leaf, with one deliberate extra rounding step: after `v = x[i] *
+ * scale`, the product is rounded BACK to BF16 precision (the open-coded
+ * round-to-nearest-even at w22 = 0x7fff — same sequence as LFM_RNE_WIDEN in
+ * flashkern_math.S) BEFORE the threshold compare and the exp.
+ *
+ * Keeping that product in full F32 would be more accurate and WRONG: the
+ * reference materialises the scaled logit as BF16, so the cutoff decision and
+ * the exp argument must both see the rounded value. Note `scale` arrives as
+ * BF16 bits and is lifted by shift, so the multiply itself has BF16 inputs.
+ *
+ * The weights and their sum remain F32 — only the scaled logit is narrowed.
  */
 .p2align 2
 .globl LFM_SYM(lfm_sampler_exp_sum_bf16)
@@ -221,7 +291,27 @@ LFM_SYM(lfm_sampler_exp_sum_bf16):
     ldp     x29, x30, [sp], #96
     ret
 
-/* uint32_t lfm_sampler_prefix_pick(const float *weights, size_t count, float target) */
+/*
+ * uint32_t lfm_sampler_prefix_pick(const float *weights, size_t count,
+ *                                  float target)
+ *
+ * The CDF walk. Accumulates `weights` in index order and returns the first index
+ * where the running sum exceeds `target` (the uniform draw scaled by the total
+ * from exp_sum). Accumulation order matches exp_sum's exactly — both walk low to
+ * high in F32 — so the partial sums here reproduce the total computed there.
+ *
+ * SHORTFALL GUARANTEE — the reason for the `w8` register:
+ *
+ * `target` is derived from a double uniform scaled by an F32 sum, so rounding can
+ * leave it a few ULP ABOVE the final running sum. The loop then falls out
+ * without ever triggering. Rather than returning 0 or count-1, `w8` carries the
+ * last index whose weight was STRICTLY POSITIVE, and that is what is returned.
+ *
+ * This makes it impossible to select a token that was cut off by the threshold
+ * (weight 0) purely because of a rounding shortfall — a bug that would be
+ * invisible in aggregate statistics and would occasionally emit a token the
+ * sampling policy had explicitly excluded.
+ */
 .p2align 2
 .globl LFM_SYM(lfm_sampler_prefix_pick)
 LFM_PRIVATE(LFM_SYM(lfm_sampler_prefix_pick))
@@ -257,6 +347,24 @@ LFM_SYM(lfm_sampler_prefix_pick):
  * n = trunc(x * log2(e) - 0.5)
  * r = x - n * ln(2)
  * exp(x) = 2^n * P6(r)
+ *
+ * P6 is the degree-six Taylor series of e^r evaluated by Horner; the constants
+ * below are literally 1/720, 1/120, 1/24, 1/6, 1/2, 1. `2^n` is built directly
+ * as the exponent field ((n + 127) << 23) rather than by calling ldexp.
+ *
+ * The `- 0.5` in the range reduction makes `trunc` behave as round-to-nearest
+ * over the negative domain this leaf is restricted to (trunc rounds toward zero,
+ * so the bias is what centres the residual r about 0 and keeps |r| <= ln(2)/2,
+ * where the degree-six truncation is accurate).
+ *
+ * Being local and libm-free is the point: sampling stays bit-identical across
+ * platforms. Replacing this with expf() would make token choice depend on which
+ * libm is linked.
+ *
+ * Underflow: n < -126 is below the normal f32 exponent range, so the result is
+ * flushed to exactly 0 — such a token contributes nothing to the CDF and, by the
+ * shortfall guarantee in prefix_pick, can never be selected. No overflow path
+ * exists because x <= 0 always.
  */
 .p2align 2
 .Lsampler_exp_f32:

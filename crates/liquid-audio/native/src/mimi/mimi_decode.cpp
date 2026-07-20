@@ -7,7 +7,7 @@
 //   - mimi_weight_find   (init-time weight-table lookup)
 //   - mimi_gemv_f32 / mimi_gemm_f32 / mimi_softmax_f32 / mimi_gelu_erf_f32 /
 //     mimi_elu_f32 / mimi_layer_norm_f32   (deterministic math primitives)
-//   - mimi_decoder_new / _step / _reset / _free   (top-level orchestration)
+//   - model-owned plan + conversation-owned state lifecycle
 //
 // The StreamTensor Option-ness of the Rust (streaming.rs) is dissolved here into
 // explicit per-stage frame counts (n_in/n_out). A stage handed 0 frames returns
@@ -1142,14 +1142,6 @@ struct MimiDecodeState {
     // MIMI_FRAME_OUT*2), so no pcm scratch is carved here.
 };
 
-#ifdef LFM_BUILD_ORACLE
-struct MimiDecoder {
-    LfmWeightImage *weights;
-    MimiDecodePlan *plan;
-    MimiDecodeState *state;
-};
-#endif
-
 static size_t mimi_align_size(size_t bytes) {
     if (bytes > SIZE_MAX - (MIMI_ARENA_ALIGN - 1)) return 0;
     return (bytes + (MIMI_ARENA_ALIGN - 1)) & ~(MIMI_ARENA_ALIGN - 1);
@@ -1432,83 +1424,6 @@ extern "C" uint64_t mimi_decode_state_bytes(const MimiDecodeState *state) {
                                          state->arena.size) : 0;
 }
 
-#ifdef LFM_BUILD_ORACLE
-extern "C" int mimi_decoder_new(MimiDecoder **out, const MimiWeightTable *weights,
-                                 char *err, size_t errlen) {
-    if (!out) return -1;
-    *out = nullptr;
-    MimiDecoder *decoder =
-        static_cast<MimiDecoder *>(calloc(1, sizeof(MimiDecoder)));
-    if (!decoder) return -1;
-    int rc = mimi_plan_new(&decoder->plan, weights, err, errlen);
-    if (rc == 0) {
-        rc = mimi_decode_state_new(&decoder->state, decoder->plan, err, errlen);
-    }
-    if (rc != 0) {
-        mimi_decode_plan_free(decoder->plan);
-        free(decoder);
-        return rc;
-    }
-    *out = decoder;
-    return 0;
-}
-
-extern "C" int mimi_decoder_new_from_image(MimiDecoder **d_out,
-                                             const LfmWeightImage *image,
-                                             char *err, size_t errlen) {
-    if (!d_out || !image) return -1;
-    *d_out = nullptr;
-    MimiDecoder *decoder =
-        static_cast<MimiDecoder *>(calloc(1, sizeof(MimiDecoder)));
-    if (!decoder) return -1;
-    int rc = mimi_decode_plan_new_from_image(&decoder->plan, image, err, errlen);
-    if (rc == 0) {
-        rc = mimi_decode_state_new(&decoder->state, decoder->plan, err, errlen);
-    }
-    if (rc != 0) {
-        mimi_decode_plan_free(decoder->plan);
-        free(decoder);
-        return rc;
-    }
-    *d_out = decoder;
-    return 0;
-}
-
-extern "C" int mimi_decoder_new_from_file(MimiDecoder **d_out,
-                                           const char *checkpoint,
-                                           char *err, size_t errlen) {
-    if (!d_out) return -1;
-    *d_out = NULL;
-    if (!checkpoint || checkpoint[0] == '\0') {
-        MIMI_ERR("mimi_decoder_new_from_file: empty checkpoint path");
-        return -1;
-    }
-    LfmWeightImage *image = NULL;
-    int rc = lfm_weights_open(checkpoint, &image, err, errlen);
-    if (rc != LFM_WEIGHT_OK) return rc;
-    MimiDecoder *decoder =
-        static_cast<MimiDecoder *>(calloc(1, sizeof(MimiDecoder)));
-    if (!decoder) {
-        lfm_weights_close(image);
-        return -1;
-    }
-    rc = mimi_plan_new_from_component(&decoder->plan, image,
-                                      LFM_WEIGHT_COMPONENT_MAIN, err, errlen);
-    if (rc == 0) {
-        rc = mimi_decode_state_new(&decoder->state, decoder->plan, err, errlen);
-    }
-    if (rc != 0) {
-        mimi_decode_plan_free(decoder->plan);
-        free(decoder);
-        lfm_weights_close(image);
-        return rc;
-    }
-    decoder->weights = image;
-    *d_out = decoder;
-    return 0;
-}
-#endif
-
 extern "C" int mimi_decode_state_step(MimiDecodeState *d,
                                        const uint32_t *codes, float *pcm_out) {
     // Faithful port of Mimi::decode_step (mimi.rs:214). In our streaming path
@@ -1561,37 +1476,6 @@ extern "C" void mimi_decode_state_reset(MimiDecodeState *d) {
     mimi_upsample_reset(d->upsample);
 }
 
-#ifdef LFM_BUILD_ORACLE
-extern "C" int mimi_decoder_step(MimiDecoder *decoder, const uint32_t *codes,
-                                   float *pcm_out) {
-    return decoder ? mimi_decode_state_step(decoder->state, codes, pcm_out)
-                   : -EINVAL;
-}
-
-extern "C" void mimi_decoder_reset(MimiDecoder *decoder) {
-    if (decoder) mimi_decode_state_reset(decoder->state);
-}
-
-extern "C" void mimi_decoder_free(MimiDecoder *d) {
-    if (!d) {
-        return;
-    }
-    mimi_decode_state_free(d->state);
-    mimi_decode_plan_free(d->plan);
-    lfm_weights_close(d->weights);
-    free(d);
-}
-
-extern "C" uint64_t mimi_decoder_derived_bytes(const MimiDecoder *d) {
-    return d ? mimi_decode_plan_derived_bytes(d->plan) : 0;
-}
-
-extern "C" uint64_t mimi_decoder_compatibility_copied_bytes(
-    const MimiDecoder *d) {
-    return d ? mimi_decode_plan_compatibility_copied_bytes(d->plan) : 0;
-}
-#endif
-
 /* NOTES
  * ============================================================================
  * FAITHFUL PORT NOTES — mimi_decode.cpp (Unit #6), moshi 0.6.4
@@ -1601,15 +1485,15 @@ extern "C" uint64_t mimi_decoder_compatibility_copied_bytes(
  * ------------------------
  *  Rust (moshi 0.6.4)                         | C++ (this file)
  *  -------------------------------------------|--------------------------------
- *  Mimi::decode_step (mimi.rs:214)            | mimi_decoder_step
+ *  Mimi::decode_step (mimi.rs:214)            | mimi_decode_state_step
  *    codes.as_option()/quantizer.decode       |   mimi_quant_decode (always 1 fr)
  *    upsample.step (ConvTrUpsample1d)         |   mimi_upsample_step
  *    decoder_transformer.step (Projected...)  |   mimi_transformer_step
  *    decoder.step (SeaNetDecoder)             |   mimi_seanet_step
- *  Mimi::reset_state, decoder half (mimi.rs:224)| mimi_decoder_reset
+ *  Mimi::reset_state, decoder half (mimi.rs:224)| mimi_decode_state_reset
  *    decoder / decoder_transformer / upsample |   seanet / transformer / upsample
  *    (encoder, encoder_transformer, downsample|   SKIPPED — encoder-side / OOS)
- *  Mimi::new_ construction order              | mimi_decoder_new (unit inits)
+ *  Mimi::new_ construction order              | model plan + state initialization
  *  StreamTensor(Option<Tensor>) (streaming.rs)| explicit int n_in/n_out counts
  *  StreamTensor::empty() propagation          | a stage handed 0 returns 0
  *  candle weight-norm fold (conv.rs:27,133)   | units fold into arena at init
@@ -1653,11 +1537,11 @@ extern "C" uint64_t mimi_decoder_compatibility_copied_bytes(
  *  decode_step already emits a full 1920 samples; there is no 0-output warm-up
  *  in this config. The consumer's "first call(s) may yield None" (audio_out.rs)
  *  is the generic streaming-codec disclaimer, not a v0_1(8) behavior. I still
- *  plumb the 0-propagation faithfully (mimi_decoder_step returns whatever
- *  mimi_seanet_step reports, 0 legal) so the contract holds if a unit author or
- *  the parity harness feeds partial frames, and because the header mandates it.
+ *  plumb the 0-propagation faithfully (mimi_decode_state_step returns whatever
+ *  mimi_seanet_step reports, 0 legal) so the native streaming contract remains
+ *  total for partial input frames.
  *
- *  I do NOT hardcode 1920: mimi_decoder_step returns the seanet's reported
+ *  I do NOT hardcode 1920: mimi_decode_state_step returns the seanet's reported
  *  n_out, and feeds each stage the prior stage's actual count. This is robust to
  *  whatever emit schedule units 2–3 land on, and is why the buffers are sized
  *  for the doubled worst case rather than the steady value.
@@ -1736,7 +1620,7 @@ extern "C" uint64_t mimi_decoder_compatibility_copied_bytes(
  *     sweep bodies). Transcendentals are libm erff/expf lane-wise (NOT vector
  *     polynomials) to stay on the faithful tier. Softmax is max-subtracted
  *     3-pass matching candle's softmax_last_dim formula.
- *  5. Quantizer emptiness. mimi_decoder_step assumes `codes` is a present single
+ *  5. Quantizer emptiness. mimi_decode_state_step assumes `codes` is a present single
  *     frame (true on our path). There is no ABI way to pass "empty codes" to
  *     mimi_quant_decode, so the None-codes arm of Rust decode_step is not
  *     reachable here; if a future caller needs it, add an n_in to the quant ABI.
@@ -1758,7 +1642,7 @@ extern "C" uint64_t mimi_decoder_compatibility_copied_bytes(
  *  register chunks + scalar tail, so a band boundary that isn't 4-aligned still
  *  computes correctly (each lane runs its own tail).
  *
- *  Fence points inside mimi_decoder_step (doorbell / hand-back boundaries),
+ *  Fence points inside mimi_decode_state_step (callback stage boundaries),
  *  in execution order:
  *    F0  post-quant     : after mimi_quant_decode -> emb_buf[MIMI_DIM, 1].
  *                         RVQ decode is embarrassingly bandable over the 8

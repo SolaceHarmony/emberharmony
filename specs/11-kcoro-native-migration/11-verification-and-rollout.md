@@ -420,9 +420,11 @@ Add symbol audits for:
 - no scalar-oracle object or Rust numerical symbol in the release link map;
 - no production C ABI operation accepting a numerical payload span.
 
-Replace `crates/liquid-audio/scripts/gate.sh:47-50` environment-based device
-selection with explicit test config files or CLI arguments parsed by the test
-harness and passed through the same ABI config structs as Tauri.
+The native real-checkpoint test is invoked directly through Cargo; no wrapper
+script, stdout PCM transport, or environment-selected device shim is part of
+the gate. Explicit test configuration enters through the same ABI config
+records as Tauri, and evidence artifacts are written only after the in-memory
+pipeline has retired.
 
 ## CI Matrix
 

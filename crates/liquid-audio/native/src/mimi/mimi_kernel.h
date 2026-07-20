@@ -254,7 +254,6 @@ int  mimi_seanet_step(MimiSeanetState *st, const float *x, int n_in, float *pcm)
 void mimi_seanet_reset(MimiSeanetState *st);
 
 /* 6. top level: model-lifetime plan + conversation-lifetime state */
-typedef struct MimiDecoder MimiDecoder;
 typedef struct MimiDecodePlan MimiDecodePlan;
 typedef struct MimiDecodeState MimiDecodeState;
 typedef struct LfmWeightImage LfmWeightImage;
@@ -277,23 +276,6 @@ LFM_ORACLE_API int mimi_decode_state_step(MimiDecodeState *state,
                                           float *pcm_out);
 LFM_ORACLE_API void mimi_decode_state_reset(MimiDecodeState *state);
 LFM_ORACLE_API uint64_t mimi_decode_state_bytes(const MimiDecodeState *state);
-#ifdef LFM_BUILD_ORACLE
-/* Offline parity-only wrapper. It may own a standalone checkpoint image and is
- * intentionally absent from the production archive and shared native header. */
-LFM_ORACLE_API int mimi_decoder_new_from_file(MimiDecoder **d,
-                                              const char *checkpoint,
-                                              char *err, size_t errlen);
-/* one latent frame of codes [MIMI_NQ] -> n_out samples (0 while priming);
- * pcm_out capacity MIMI_FRAME_OUT * 2 (drain headroom). */
-LFM_ORACLE_API int mimi_decoder_step(MimiDecoder *d, const uint32_t *codes,
-                                     float *pcm_out);
-LFM_ORACLE_API void mimi_decoder_reset(MimiDecoder *d);
-LFM_ORACLE_API void mimi_decoder_free(MimiDecoder *d);
-LFM_ORACLE_API uint64_t mimi_decoder_derived_bytes(const MimiDecoder *d);
-LFM_ORACLE_API uint64_t
-mimi_decoder_compatibility_copied_bytes(const MimiDecoder *d);
-#endif
-
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

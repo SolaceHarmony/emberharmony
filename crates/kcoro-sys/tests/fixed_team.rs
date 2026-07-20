@@ -7,6 +7,11 @@ const EDEADLK: i32 = 11;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 const EDEADLK: i32 = 35;
 const EBUSY: i32 = 16;
+const EINVAL: i32 = 22;
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+const ESTALE: i32 = 70;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const ESTALE: i32 = 116;
 #[cfg(not(any(
     target_os = "macos",
     target_os = "ios",
@@ -15,6 +20,14 @@ const EBUSY: i32 = 16;
     target_os = "android"
 )))]
 const EDEADLK: i32 = 35;
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "linux",
+    target_os = "android"
+)))]
+const ESTALE: i32 = 116;
 
 const MEMBER_COUNT: u32 = 4;
 const MEMBER_MASK: u32 = (1 << MEMBER_COUNT) - 1;
@@ -64,6 +77,16 @@ struct TeamSnapshot {
     joined: u32,
 }
 
+#[repr(C)]
+struct TeamQuorumSnapshot {
+    size: u32,
+    abi_version: u32,
+    generation: u64,
+    expected_mask: u64,
+    entered_mask: u64,
+    returned_mask: u64,
+}
+
 struct Chain {
     team: AtomicPtr<c_void>,
     masks: [AtomicU32; GENERATIONS as usize],
@@ -101,6 +124,17 @@ struct PublisherRace {
 struct PublisherEdge {
     team: AtomicPtr<c_void>,
     callbacks: AtomicU32,
+}
+
+struct Quorum {
+    team: AtomicPtr<c_void>,
+    entered: Barrier,
+    release: Barrier,
+    completed: Barrier,
+    retire: Barrier,
+    calls: [AtomicU32; MEMBER_COUNT as usize],
+    callbacks: AtomicU32,
+    bad: AtomicU32,
 }
 
 unsafe extern "C" fn chain_member(context: *mut c_void, index: u32, members: u32, generation: u64) {
@@ -159,6 +193,15 @@ unsafe extern "C" fn chain_edge(context: *mut c_void, generation: u64) {
         || snapshot.dispatched_generation != generation
         || snapshot.completed_generation != generation
         || snapshot.completed_members != MEMBER_COUNT
+    {
+        chain.bad.fetch_add(1, Ordering::Relaxed);
+    }
+    let mut quorum = quorum_snapshot();
+    if unsafe { kc_team_quorum_snapshot_get(team, generation, &mut quorum) } != 0
+        || quorum.generation != generation
+        || quorum.expected_mask != MEMBER_MASK as u64
+        || quorum.entered_mask != MEMBER_MASK as u64
+        || quorum.returned_mask != MEMBER_MASK as u64
     {
         chain.bad.fetch_add(1, Ordering::Relaxed);
     }
@@ -341,6 +384,34 @@ unsafe extern "C" fn publisher_edge(context: *mut c_void, generation: u64) {
     unsafe { kc_team_request_stop(edge.team.load(Ordering::Acquire)) };
 }
 
+unsafe extern "C" fn quorum_member(
+    context: *mut c_void,
+    index: u32,
+    members: u32,
+    generation: u64,
+) {
+    let quorum = unsafe { &*(context.cast::<Quorum>()) };
+    if members != MEMBER_COUNT || index >= members || generation != 7 {
+        quorum.bad.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    if quorum.calls[index as usize].fetch_add(1, Ordering::AcqRel) != 0 {
+        quorum.bad.fetch_add(1, Ordering::Relaxed);
+    }
+    quorum.entered.wait();
+    quorum.release.wait();
+}
+
+unsafe extern "C" fn quorum_edge(context: *mut c_void, generation: u64) {
+    let quorum = unsafe { &*(context.cast::<Quorum>()) };
+    if generation != 7 || quorum.callbacks.fetch_add(1, Ordering::AcqRel) != 0 {
+        quorum.bad.fetch_add(1, Ordering::Relaxed);
+    }
+    quorum.completed.wait();
+    quorum.retire.wait();
+    unsafe { kc_team_request_stop(quorum.team.load(Ordering::Acquire)) };
+}
+
 unsafe extern "C" {
     fn kc_runtime_create(config: *const RuntimeConfig, out: *mut *mut c_void) -> i32;
     fn kc_runtime_start(runtime: *mut c_void) -> i32;
@@ -371,6 +442,22 @@ unsafe extern "C" {
     fn kc_team_join(team: *mut c_void) -> i32;
     fn kc_team_destroy(team: *mut c_void) -> i32;
     fn kc_team_snapshot_get(team: *mut c_void, out: *mut TeamSnapshot) -> i32;
+    fn kc_team_quorum_snapshot_get(
+        team: *mut c_void,
+        generation: u64,
+        out: *mut TeamQuorumSnapshot,
+    ) -> i32;
+}
+
+fn quorum_snapshot() -> TeamQuorumSnapshot {
+    TeamQuorumSnapshot {
+        size: size_of::<TeamQuorumSnapshot>() as u32,
+        abi_version: 1,
+        generation: u64::MAX,
+        expected_mask: u64::MAX,
+        entered_mask: u64::MAX,
+        returned_mask: u64::MAX,
+    }
 }
 
 #[test]
@@ -633,6 +720,135 @@ fn concurrent_publishers_cannot_overwrite_the_accepted_ticket_edge() {
         1
     );
     assert_eq!(unsafe { kc_team_destroy(team) }, 0);
+}
+
+#[test]
+fn quorum_snapshot_tracks_one_exact_generation_without_duplicate_execution() {
+    kcoro_sys::link_anchor();
+    let quorum = Quorum {
+        team: AtomicPtr::new(std::ptr::null_mut()),
+        entered: Barrier::new(MEMBER_COUNT as usize + 1),
+        release: Barrier::new(MEMBER_COUNT as usize + 1),
+        completed: Barrier::new(2),
+        retire: Barrier::new(2),
+        calls: [
+            AtomicU32::new(0),
+            AtomicU32::new(0),
+            AtomicU32::new(0),
+            AtomicU32::new(0),
+        ],
+        callbacks: AtomicU32::new(0),
+        bad: AtomicU32::new(0),
+    };
+    let config = TeamConfig {
+        size: size_of::<TeamConfig>() as u32,
+        abi_version: 1,
+        member_count: MEMBER_COUNT,
+        reserved: 0,
+        member: Some(quorum_member),
+        context: (&quorum as *const Quorum).cast_mut().cast(),
+    };
+    let mut team = std::ptr::null_mut();
+    assert_eq!(unsafe { kc_team_create(&config, &mut team) }, 0);
+    quorum.team.store(team, Ordering::Release);
+    assert_eq!(unsafe { kc_team_start(team) }, 0);
+
+    let mut before = quorum_snapshot();
+    assert_eq!(
+        unsafe { kc_team_quorum_snapshot_get(team, 7, &mut before) },
+        -ESTALE
+    );
+    assert_eq!(before.generation, u64::MAX);
+    assert_eq!(
+        unsafe {
+            kc_team_dispatch_notify(
+                team,
+                7,
+                Some(quorum_edge),
+                (&quorum as *const Quorum).cast_mut().cast(),
+            )
+        },
+        0
+    );
+    assert_eq!(
+        unsafe {
+            kc_team_dispatch_notify(
+                team,
+                7,
+                Some(quorum_edge),
+                (&quorum as *const Quorum).cast_mut().cast(),
+            )
+        },
+        -EBUSY
+    );
+
+    quorum.entered.wait();
+    let mut active = quorum_snapshot();
+    assert_eq!(
+        unsafe { kc_team_quorum_snapshot_get(team, 7, &mut active) },
+        0
+    );
+    assert_eq!(active.generation, 7);
+    assert_eq!(active.expected_mask, MEMBER_MASK as u64);
+    assert_eq!(active.entered_mask, MEMBER_MASK as u64);
+    assert_eq!(active.returned_mask, 0);
+    let mut successor = quorum_snapshot();
+    assert_eq!(
+        unsafe { kc_team_quorum_snapshot_get(team, 8, &mut successor) },
+        -ESTALE
+    );
+    assert_eq!(successor.generation, u64::MAX);
+
+    quorum.release.wait();
+    quorum.completed.wait();
+    let mut complete = quorum_snapshot();
+    assert_eq!(
+        unsafe { kc_team_quorum_snapshot_get(team, 7, &mut complete) },
+        0
+    );
+    assert_eq!(complete.entered_mask, MEMBER_MASK as u64);
+    assert_eq!(complete.returned_mask, MEMBER_MASK as u64);
+    assert_eq!(
+        unsafe {
+            kc_team_dispatch_notify(
+                team,
+                7,
+                Some(quorum_edge),
+                (&quorum as *const Quorum).cast_mut().cast(),
+            )
+        },
+        -EINVAL
+    );
+    quorum.retire.wait();
+
+    assert_eq!(unsafe { kc_team_join(team) }, 0);
+    assert_eq!(quorum.bad.load(Ordering::Acquire), 0);
+    assert_eq!(quorum.callbacks.load(Ordering::Acquire), 1);
+    for calls in &quorum.calls {
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+    }
+    assert_eq!(unsafe { kc_team_destroy(team) }, 0);
+}
+
+#[test]
+fn fixed_team_rejects_members_that_cannot_fit_the_quorum_mask() {
+    kcoro_sys::link_anchor();
+    let race = PublisherRace {
+        gate: Barrier::new(1),
+        members: AtomicU32::new(0),
+        bad: AtomicU32::new(0),
+    };
+    let config = TeamConfig {
+        size: size_of::<TeamConfig>() as u32,
+        abi_version: 1,
+        member_count: 65,
+        reserved: 0,
+        member: Some(publisher_member),
+        context: (&race as *const PublisherRace).cast_mut().cast(),
+    };
+    let mut team = std::ptr::null_mut();
+    assert_eq!(unsafe { kc_team_create(&config, &mut team) }, -EINVAL);
+    assert!(team.is_null());
 }
 
 #[test]

@@ -49,6 +49,7 @@ fn main() {
     println!("cargo::rerun-if-changed=native/include/lfm_runtime.h");
     println!("cargo::rerun-if-changed=native/include/lfm_session.h");
     println!("cargo::rerun-if-changed=native/include/lfm_audio_dock.h");
+    println!("cargo::rerun-if-changed=native/include/lfm_capture_policy.h");
     println!("cargo::rerun-if-changed=native/include/lfm_visibility.h");
     println!("cargo::rerun-if-changed=native/include/lfm_asm_visibility.h");
     println!("cargo::rerun-if-changed=native/src/runtime/voice_session.cpp");
@@ -172,6 +173,40 @@ fn main() {
     }
     frontend.compile("lfm_frontend");
 
+    // Exact Sesame/Web-Audio selected-band turn evidence. Formula tables are
+    // setup-time immutable storage; the 256-point selected DFT, magnitude
+    // smoothing, and byte-threshold search are architecture assembly leaves.
+    println!("cargo::rerun-if-changed=native/include/lfm_sesame_detector.h");
+    println!("cargo::rerun-if-changed=native/src/runtime/lfm_sesame_detector.cpp");
+    cc::Build::new()
+        .file("native/src/runtime/lfm_sesame_detector.cpp")
+        .cpp(true)
+        .std("c++23")
+        .opt_level(3)
+        .warnings(true)
+        .warnings_into_errors(true)
+        .flag("-ffp-contract=off")
+        .flag_if_supported("-fvisibility=hidden")
+        .include("native/include")
+        .compile("lfm_sesame_detector");
+
+    // Realtime callback-format ingestion. C++ validates only borrowed-view
+    // geometry; every conversion and channel reduction is an architecture
+    // assembly leaf in the provider archive below.
+    println!("cargo::rerun-if-changed=native/include/lfm_capture_format.h");
+    println!("cargo::rerun-if-changed=native/src/runtime/lfm_capture_format.cpp");
+    cc::Build::new()
+        .file("native/src/runtime/lfm_capture_format.cpp")
+        .cpp(true)
+        .std("c++23")
+        .opt_level(3)
+        .warnings(true)
+        .warnings_into_errors(true)
+        .flag("-ffp-contract=off")
+        .flag_if_supported("-fvisibility=hidden")
+        .include("native/include")
+        .compile("lfm_capture_format");
+
     // Native Conformer encoder + audio adapter over the resident image and the
     // Flashkern GEMM pass. Same -ffp-contract=off contract: the parity
     // fixtures came from uncontracted candle ops.
@@ -223,6 +258,8 @@ fn main() {
         println!("cargo::rerun-if-changed=native/kernels/x86_64/flashkern_math.S");
         println!("cargo::rerun-if-changed=native/kernels/x86_64/flashkern_sampler.S");
         println!("cargo::rerun-if-changed=native/kernels/x86_64/flashkern_frontend.S");
+        println!("cargo::rerun-if-changed=native/kernels/x86_64/flashkern_sesame.S");
+        println!("cargo::rerun-if-changed=native/kernels/x86_64/flashkern_capture_format.S");
         let mut kern = cc::Build::new();
         kern.file("native/kernels/x86_64/flashkern_x86.cpp")
             .file("native/kernels/x86_64/flashkern_prng.S")
@@ -230,6 +267,8 @@ fn main() {
             .file("native/kernels/x86_64/flashkern_math.S")
             .file("native/kernels/x86_64/flashkern_sampler.S")
             .file("native/kernels/x86_64/flashkern_frontend.S")
+            .file("native/kernels/x86_64/flashkern_sesame.S")
+            .file("native/kernels/x86_64/flashkern_capture_format.S")
             .file("native/kernels/x86_64/flashkern_conformer.S")
             .cpp(true)
             .std("c++23")
@@ -249,6 +288,8 @@ fn main() {
         println!("cargo::rerun-if-changed=native/kernels/aarch64/flashkern_math.S");
         println!("cargo::rerun-if-changed=native/kernels/aarch64/flashkern_sampler.S");
         println!("cargo::rerun-if-changed=native/kernels/aarch64/flashkern_frontend.S");
+        println!("cargo::rerun-if-changed=native/kernels/aarch64/flashkern_sesame.S");
+        println!("cargo::rerun-if-changed=native/kernels/aarch64/flashkern_capture_format.S");
         let mut kern = cc::Build::new();
         kern.file("native/kernels/aarch64/flashkern_neon.cpp")
             .file("native/kernels/aarch64/flashkern_prng.S")
@@ -256,6 +297,8 @@ fn main() {
             .file("native/kernels/aarch64/flashkern_math.S")
             .file("native/kernels/aarch64/flashkern_sampler.S")
             .file("native/kernels/aarch64/flashkern_frontend.S")
+            .file("native/kernels/aarch64/flashkern_sesame.S")
+            .file("native/kernels/aarch64/flashkern_capture_format.S")
             .file("native/kernels/aarch64/flashkern_conformer.S")
             .cpp(true)
             .std("c++23")
@@ -275,9 +318,9 @@ fn main() {
         kern.compile("lfm_flashkern_neon");
     }
 
-    // The native Mimi decode kernel (docs/MIMI_PORT.md): five active units;
-    // mimi_kv.cpp stays parked (the streaming path owns a RotatingKvCache port
-    // inside mimi_transformer.cpp). -ffp-contract=off is LOAD-BEARING here:
+    // The native Mimi decode kernel (docs/MIMI_PORT.md): the streaming path
+    // owns its sole RotatingKvCache inside mimi_transformer.cpp.
+    // -ffp-contract=off is LOAD-BEARING here:
     // the scalar parity siblings are only oracles of the Rust reference if
     // clang can't contract a*b+c into fma (rustc never does).
     println!("cargo::rerun-if-changed=native/src/mimi");

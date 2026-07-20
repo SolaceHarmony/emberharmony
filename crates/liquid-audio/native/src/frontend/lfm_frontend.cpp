@@ -41,7 +41,12 @@
 
 // Architecture assembly leaves (flashkern_frontend.S, both arches).
 extern "C" {
-int lfm_preemph_f32(const float *x, float *y, uint64_t n, float coef);
+int lfm_preemph_spans_f32(const LfmF32SpanChain *x, float *y, float coef);
+void lfm_frame_gather_spans_f32(const LfmF32SpanChain *x,
+                                uint64_t logical_offset,
+                                uint64_t logical_limit, uint64_t center,
+                                uint64_t hop, uint64_t n_fft, uint64_t cols,
+                                float *out);
 void lfm_power_spec_f32(const float *re, const float *im, float *out, uint64_t n);
 int lfm_log_add_f32(float *x, uint64_t n, float guard);
 int lfm_rowstat_f32(const float *x, uint64_t rows, uint64_t cols, uint64_t valid,
@@ -49,11 +54,11 @@ int lfm_rowstat_f32(const float *x, uint64_t rows, uint64_t cols, uint64_t valid
 void lfm_norm_apply_f32(float *x, const float *mean, const float *std,
                         uint64_t rows, uint64_t cols);
 void lfm_f32_to_bf16(const float *input, uint16_t *output, int count);
-void lfm_resample_conv_f32(const float *input, uint64_t input_len,
-                           const double *kernels, uint64_t phases,
-                           uint64_t stride, uint64_t width,
-                           uint64_t first_value, float *out,
-                           uint64_t value_count);
+void lfm_resample_conv_spans_f32(const LfmF32SpanChain *input,
+                                 const double *kernels, uint64_t phases,
+                                 uint64_t stride, uint64_t width,
+                                 uint64_t first_value, float *out,
+                                 uint64_t value_count);
 }
 
 namespace {
@@ -90,7 +95,77 @@ bool mul_u64(uint64_t a, uint64_t b, uint64_t *out) {
     return true;
 }
 
+bool span_chain_valid(const LfmF32SpanChain *chain) {
+    if (!chain || chain->reserved0 != 0 || chain->count == 0 ||
+        chain->count > LFM_F32_SPAN_CHAIN_CAPACITY || chain->length == 0) {
+        return false;
+    }
+    uint64_t total = 0;
+    for (uint32_t index = 0; index < chain->count; ++index) {
+        const LfmF32Span &span = chain->spans[index];
+        if (!span.data || span.length == 0 ||
+            span.length > UINTPTR_MAX / sizeof(float)) {
+            return false;
+        }
+        const uintptr_t begin = reinterpret_cast<uintptr_t>(span.data);
+        const uintptr_t bytes =
+            static_cast<uintptr_t>(span.length * sizeof(float));
+        if (begin > UINTPTR_MAX - bytes || !add_u64(total, span.length, &total)) {
+            return false;
+        }
+    }
+    for (uint32_t index = chain->count;
+         index < LFM_F32_SPAN_CHAIN_CAPACITY; ++index) {
+        if (chain->spans[index].data || chain->spans[index].length != 0) {
+            return false;
+        }
+    }
+    return total == chain->length;
+}
+
+bool spans_overlap_output(const LfmF32SpanChain &chain, const float *output,
+                          uint64_t output_length) {
+    if (!output || output_length == 0 ||
+        output_length > UINTPTR_MAX / sizeof(float)) {
+        return false;
+    }
+    const uintptr_t output_begin = reinterpret_cast<uintptr_t>(output);
+    const uintptr_t output_bytes =
+        static_cast<uintptr_t>(output_length * sizeof(float));
+    if (output_begin > UINTPTR_MAX - output_bytes) return true;
+    const uintptr_t output_end = output_begin + output_bytes;
+    for (uint32_t index = 0; index < chain.count; ++index) {
+        const uintptr_t input_begin =
+            reinterpret_cast<uintptr_t>(chain.spans[index].data);
+        const uintptr_t input_end =
+            input_begin + static_cast<uintptr_t>(chain.spans[index].length *
+                                                  sizeof(float));
+        if (input_begin < output_end && output_begin < input_end) return true;
+    }
+    return false;
+}
+
 } // namespace
+
+extern "C" int lfm_f32_span_chain_init(const LfmF32Span *spans,
+                                        uint32_t span_count,
+                                        LfmF32SpanChain *out) {
+    if (!spans || !out || span_count == 0 ||
+        span_count > LFM_F32_SPAN_CHAIN_CAPACITY) {
+        return -EINVAL;
+    }
+    LfmF32SpanChain next{};
+    next.count = span_count;
+    for (uint32_t index = 0; index < span_count; ++index) {
+        next.spans[index] = spans[index];
+        if (!add_u64(next.length, spans[index].length, &next.length)) {
+            return -EOVERFLOW;
+        }
+    }
+    if (!span_chain_valid(&next)) return -EINVAL;
+    *out = next;
+    return 0;
+}
 
 struct LfmFrontend {
     LfmFrontendConfig cfg;
@@ -393,6 +468,9 @@ extern "C" int lfm_frontend_create(const LfmFrontendConfig *config, LfmFrontend 
         config->n_window_size > config->n_fft ||
         (config->exact_pad && config->n_window_stride > config->n_fft))
         return -EINVAL;
+    /* lfm_power_spec_f32 computes re^2 + im^2 in assembly — the power spectrum,
+     * i.e. mag_power == 2. Magnitude (1.0) is not implemented, so it is refused
+     * rather than silently returning power. */
     if (config->mag_power != 2.0) return -EOPNOTSUPP;
 
     LfmFrontend *f = new (std::nothrow) LfmFrontend();
@@ -483,10 +561,11 @@ extern "C" int lfm_frontend_out_frames(const LfmFrontend *f, uint64_t l,
 namespace {
 
 int frontend_forward(const LfmFrontend *f, LfmFrontendWorkspace *workspace,
-                     const float *pcm, uint64_t l, void *out_mel,
+                     const LfmF32SpanChain *pcm, void *out_mel,
                      uint64_t out_capacity_values, bool valid_only,
                      bool bf16_output) {
-    if (!f || !workspace || !pcm || !out_mel || l == 0) return -EINVAL;
+    if (!f || !workspace || !span_chain_valid(pcm) || !out_mel) return -EINVAL;
+    const uint64_t l = pcm->length;
     const LfmFrontendConfig &c = f->cfg;
     const uint64_t freq = f->freq;
     FrontendRun run{};
@@ -513,27 +592,29 @@ int frontend_forward(const LfmFrontend *f, LfmFrontendWorkspace *workspace,
     // likewise write straight into its final logical offset because the first
     // retained sample's predecessor is the virtual zero pad. The reference's
     // unusual post-preemphasis mask remains the logical [L, Li) interval.
-    const float *signal = pcm;
+    const LfmF32SpanChain *signal = pcm;
+    LfmF32SpanChain preemphasized_span{};
     const uint64_t signal_offset = c.exact_pad ? run.pad : 0;
     if (c.preemph != 0.0 && l > 1) {
         float *preemphasized = a + signal_offset;
-        lfm_preemph_f32(pcm, preemphasized, l, (float)c.preemph);
-        signal = preemphasized;
+        if (lfm_preemph_spans_f32(pcm, preemphasized,
+                                  (float)c.preemph) != 0) {
+            return -EINVAL;
+        }
+        const LfmF32Span span = {
+            .data = preemphasized,
+            .length = l,
+        };
+        if (lfm_f32_span_chain_init(&span, 1, &preemphasized_span) != 0) {
+            return -EFAULT;
+        }
+        signal = &preemphasized_span;
     }
 
     // Every gathered cell is assigned; stale high-water workspace values are
     // never observed and the whole block does not need calloc/zero-fill.
-    for (uint64_t tt = 0; tt < run.cols; ++tt) {
-        const uint64_t start = tt * c.n_window_stride; // index into ypad
-        for (uint64_t n = 0; n < c.n_fft; ++n) {
-            const uint64_t idx = start + n;
-            const uint64_t source = idx >= run.center ? idx - run.center : 0;
-            b[n * run.cols + tt] = idx >= run.center &&
-                                            source >= signal_offset && source < l
-                                        ? signal[source - signal_offset]
-                                        : 0.0f;
-        }
-    }
+    lfm_frame_gather_spans_f32(signal, signal_offset, l, run.center,
+                                c.n_window_stride, c.n_fft, run.cols, b);
 
     // Frames are dead after DFT, and signal is dead before it: the two planes
     // alternate ownership. Power aliases the real DFT half exactly, and mel is
@@ -575,8 +656,22 @@ extern "C" int lfm_frontend_forward_workspace(
     const LfmFrontend *f, LfmFrontendWorkspace *workspace, const float *pcm,
     uint64_t l, float *out_mel, uint64_t out_capacity_values, uint32_t flags) {
     if (flags & ~LFM_FRONTEND_FORWARD_VALID_ONLY) return -EINVAL;
-    return frontend_forward(f, workspace, pcm, l, out_mel,
+    const LfmF32Span span = {.data = pcm, .length = l};
+    LfmF32SpanChain chain{};
+    const int status = lfm_f32_span_chain_init(&span, 1, &chain);
+    if (status != 0) return status;
+    return frontend_forward(f, workspace, &chain, out_mel,
                             out_capacity_values,
+                            (flags & LFM_FRONTEND_FORWARD_VALID_ONLY) != 0,
+                            false);
+}
+
+extern "C" int lfm_frontend_forward_spans_workspace(
+    const LfmFrontend *f, LfmFrontendWorkspace *workspace,
+    const LfmF32SpanChain *pcm, float *out_mel,
+    uint64_t out_capacity_values, uint32_t flags) {
+    if (flags & ~LFM_FRONTEND_FORWARD_VALID_ONLY) return -EINVAL;
+    return frontend_forward(f, workspace, pcm, out_mel, out_capacity_values,
                             (flags & LFM_FRONTEND_FORWARD_VALID_ONLY) != 0,
                             false);
 }
@@ -584,7 +679,19 @@ extern "C" int lfm_frontend_forward_workspace(
 extern "C" int lfm_frontend_forward_bf16_workspace(
     const LfmFrontend *f, LfmFrontendWorkspace *workspace, const float *pcm,
     uint64_t l, uint16_t *out_mel, uint64_t out_capacity_values) {
-    return frontend_forward(f, workspace, pcm, l, out_mel,
+    const LfmF32Span span = {.data = pcm, .length = l};
+    LfmF32SpanChain chain{};
+    const int status = lfm_f32_span_chain_init(&span, 1, &chain);
+    if (status != 0) return status;
+    return frontend_forward(f, workspace, &chain, out_mel,
+                            out_capacity_values, true, true);
+}
+
+extern "C" int lfm_frontend_forward_bf16_spans_workspace(
+    const LfmFrontend *f, LfmFrontendWorkspace *workspace,
+    const LfmF32SpanChain *pcm, uint16_t *out_mel,
+    uint64_t out_capacity_values) {
+    return frontend_forward(f, workspace, pcm, out_mel,
                             out_capacity_values, true, true);
 }
 
@@ -594,7 +701,11 @@ extern "C" int lfm_frontend_forward(const LfmFrontend *f, const float *pcm,
     LfmFrontendWorkspace workspace;
     const int reserved = reserve_frontend(f, &workspace, l, 0);
     if (reserved != 0) return reserved;
-    return frontend_forward(f, &workspace, pcm, l, out_mel,
+    const LfmF32Span span = {.data = pcm, .length = l};
+    LfmF32SpanChain chain{};
+    const int status = lfm_f32_span_chain_init(&span, 1, &chain);
+    if (status != 0) return status;
+    return frontend_forward(f, &workspace, &chain, out_mel,
                             out_capacity_values, false, false);
 }
 
@@ -606,7 +717,11 @@ extern "C" int lfm_frontend_forward_valid(const LfmFrontend *f,
     const int reserved = reserve_frontend(
         f, &workspace, l, LFM_FRONTEND_FORWARD_VALID_ONLY);
     if (reserved != 0) return reserved;
-    return frontend_forward(f, &workspace, pcm, l, out_mel,
+    const LfmF32Span span = {.data = pcm, .length = l};
+    LfmF32SpanChain chain{};
+    const int status = lfm_f32_span_chain_init(&span, 1, &chain);
+    if (status != 0) return status;
+    return frontend_forward(f, &workspace, &chain, out_mel,
                             out_capacity_values, true, false);
 }
 
@@ -727,23 +842,21 @@ extern "C" int lfm_resampler_workspace_reserve(
     return 0;
 }
 
-extern "C" int lfm_resampler_process(
+extern "C" int lfm_resampler_process_spans(
     const LfmResampler *resampler, LfmResamplerWorkspace *workspace,
-    const float *input, uint64_t sample_count, float *destination,
-    uint64_t destination_capacity, LfmF32Span *result) {
-    if (!resampler || !workspace || !result ||
-        (!input && sample_count != 0)) {
+    const LfmF32SpanChain *input, float *destination,
+    uint64_t destination_capacity, LfmF32SpanChain *result) {
+    if (!resampler || !workspace || !span_chain_valid(input) || !result) {
         return -EINVAL;
     }
-    result->data = nullptr;
-    result->length = 0;
+    *result = {};
+    const uint64_t sample_count = input->length;
     uint64_t target = 0;
     if (!resampler_out_length(*resampler, sample_count, &target)) {
         return -EOVERFLOW;
     }
-    if (resampler->orig_freq == resampler->new_freq || sample_count == 0) {
-        result->data = input;
-        result->length = sample_count;
+    if (resampler->orig_freq == resampler->new_freq) {
+        *result = *input;
         return 0;
     }
     if (!destination || destination_capacity < target) return -EINVAL;
@@ -754,29 +867,44 @@ extern "C" int lfm_resampler_process(
         std::numeric_limits<uint64_t>::max() - resampler->width) {
         return -EOVERFLOW;
     }
-    if (sample_count > UINTPTR_MAX / sizeof(float) ||
-        target > UINTPTR_MAX / sizeof(float)) {
+    if (target > UINTPTR_MAX / sizeof(float)) {
         return -EOVERFLOW;
     }
-    const uintptr_t input_begin = reinterpret_cast<uintptr_t>(input);
-    const uintptr_t output_begin = reinterpret_cast<uintptr_t>(destination);
-    const uintptr_t input_bytes =
-        static_cast<uintptr_t>(sample_count * sizeof(float));
-    const uintptr_t output_bytes =
-        static_cast<uintptr_t>(target * sizeof(float));
-    if (input_begin > UINTPTR_MAX - input_bytes ||
-        output_begin > UINTPTR_MAX - output_bytes) {
-        return -EOVERFLOW;
-    }
-    if (input_begin < output_begin + output_bytes &&
-        output_begin < input_begin + input_bytes) {
-        return -EINVAL;
-    }
-    lfm_resample_conv_f32(input, sample_count, resampler->kernels,
-                          resampler->phases, resampler->orig,
-                          resampler->width, 0, destination, target);
-    result->data = destination;
-    result->length = target;
+    if (spans_overlap_output(*input, destination, target)) return -EINVAL;
+    lfm_resample_conv_spans_f32(input, resampler->kernels,
+                                resampler->phases, resampler->orig,
+                                resampler->width, 0, destination, target);
+    const LfmF32Span output = {
+        .data = destination,
+        .length = target,
+    };
+    const int status = lfm_f32_span_chain_init(&output, 1, result);
+    if (status != 0) return status;
+    return 0;
+}
+
+extern "C" int lfm_resampler_process(
+    const LfmResampler *resampler, LfmResamplerWorkspace *workspace,
+    const float *input, uint64_t sample_count, float *destination,
+    uint64_t destination_capacity, LfmF32Span *result) {
+    if (!result || (!input && sample_count != 0)) return -EINVAL;
+    result->data = nullptr;
+    result->length = 0;
+    if (sample_count == 0) return resampler && workspace ? 0 : -EINVAL;
+    const LfmF32Span span = {
+        .data = input,
+        .length = sample_count,
+    };
+    LfmF32SpanChain chain{};
+    int status = lfm_f32_span_chain_init(&span, 1, &chain);
+    if (status != 0) return status;
+    LfmF32SpanChain output{};
+    status = lfm_resampler_process_spans(
+        resampler, workspace, &chain, destination, destination_capacity,
+        &output);
+    if (status != 0) return status;
+    if (output.count != 1) return -EFAULT;
+    *result = output.spans[0];
     return 0;
 }
 

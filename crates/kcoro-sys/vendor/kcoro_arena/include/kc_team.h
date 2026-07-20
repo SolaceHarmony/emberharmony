@@ -43,6 +43,23 @@ typedef struct kc_team_snapshot {
     uint32_t joined;
 } kc_team_snapshot;
 
+/*
+ * A read-only observation of one exact dispatched generation. Team members
+ * publish their own entry and return stamps; this mask is derived by scanning
+ * those cache-isolated stamps and never adds a contended arrival bitmap to the
+ * execution path. The requested generation must still be the team's current
+ * dispatched generation. A return bit always implies the corresponding entry
+ * bit.
+ */
+typedef struct kc_team_quorum_snapshot {
+    uint32_t size;
+    uint32_t abi_version;
+    uint64_t generation;
+    uint64_t expected_mask;
+    uint64_t entered_mask;
+    uint64_t returned_mask;
+} kc_team_quorum_snapshot;
+
 int kc_team_create(const kc_team_config *config, kc_team_t **out);
 int kc_team_start(kc_team_t *team);
 /* Exactly one generation may be active. Generations are non-zero and increasing. */
@@ -65,6 +82,13 @@ void kc_team_request_stop(kc_team_t *team);
 int kc_team_join(kc_team_t *team);
 int kc_team_destroy(kc_team_t *team);
 int kc_team_snapshot_get(kc_team_t *team, kc_team_snapshot *out);
+/*
+ * Returns -ESTALE when generation is not the exact current dispatched
+ * generation and -EAGAIN if a successor is dispatched during the scan.
+ * Teams are bounded to 64 members so every lane has one stable mask bit.
+ */
+int kc_team_quorum_snapshot_get(kc_team_t *team, uint64_t generation,
+                                kc_team_quorum_snapshot *out);
 /* Returns zero only while the caller is executing this team's member callback. */
 int kc_team_current_member(const kc_team_t *team, uint32_t *out_member);
 

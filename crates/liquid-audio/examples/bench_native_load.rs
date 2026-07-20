@@ -24,7 +24,7 @@ use std::time::Instant;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-const ABI: u32 = 1;
+const ABI: u32 = 3;
 const OK: i32 = 0;
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 

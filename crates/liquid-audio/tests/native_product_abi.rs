@@ -24,7 +24,7 @@ const PRODUCT: [(&str, &str); 4] = [
 ];
 
 #[cfg(all(not(feature = "oracle-abi"), target_os = "macos"))]
-const PRODUCT_SYMBOLS: [&str; 40] = [
+const PRODUCT_SYMBOLS: [&str; 36] = [
     "lfm_runtime_create",
     "lfm_runtime_start",
     "lfm_runtime_request_stop",
@@ -45,17 +45,13 @@ const PRODUCT_SYMBOLS: [&str; 40] = [
     "lfm_session_join",
     "lfm_session_snapshot",
     "lfm_session_destroy",
-    "lfm_audio_dock_reserve",
-    "lfm_session_submit_mixed",
-    "lfm_audio_dock_resolve_mut",
-    "lfm_audio_dock_finalize_capture",
-    "lfm_audio_dock_publish",
-    "lfm_capture_producer_create",
-    "lfm_capture_producer_reserve",
-    "lfm_capture_producer_resolve_mut",
-    "lfm_capture_producer_finalize",
-    "lfm_capture_producer_publish",
-    "lfm_capture_producer_release",
+    "lfm_capture_chunk_producer_create",
+    "lfm_capture_producer_claim_chunk",
+    "lfm_capture_producer_resolve_chunk",
+    "lfm_capture_producer_commit_chunk",
+    "lfm_capture_producer_write_interleaved",
+    "lfm_capture_producer_abort_chunk",
+    "lfm_capture_producer_publish_gap",
     "lfm_capture_producer_destroy",
     "lfm_playback_consumer_create",
     "lfm_playback_consumer_claim",
@@ -89,17 +85,13 @@ unsafe extern "C" {
     fn lfm_session_join();
     fn lfm_session_snapshot();
     fn lfm_session_destroy();
-    fn lfm_audio_dock_reserve();
-    fn lfm_session_submit_mixed();
-    fn lfm_audio_dock_resolve_mut();
-    fn lfm_audio_dock_finalize_capture();
-    fn lfm_audio_dock_publish();
-    fn lfm_capture_producer_create();
-    fn lfm_capture_producer_reserve();
-    fn lfm_capture_producer_resolve_mut();
-    fn lfm_capture_producer_finalize();
-    fn lfm_capture_producer_publish();
-    fn lfm_capture_producer_release();
+    fn lfm_capture_chunk_producer_create();
+    fn lfm_capture_producer_claim_chunk();
+    fn lfm_capture_producer_resolve_chunk();
+    fn lfm_capture_producer_commit_chunk();
+    fn lfm_capture_producer_write_interleaved();
+    fn lfm_capture_producer_abort_chunk();
+    fn lfm_capture_producer_publish_gap();
     fn lfm_capture_producer_destroy();
     fn lfm_playback_consumer_create();
     fn lfm_playback_consumer_claim();
@@ -271,17 +263,13 @@ fn retain_product_surface() {
         lfm_session_join as usize,
         lfm_session_snapshot as usize,
         lfm_session_destroy as usize,
-        lfm_audio_dock_reserve as usize,
-        lfm_session_submit_mixed as usize,
-        lfm_audio_dock_resolve_mut as usize,
-        lfm_audio_dock_finalize_capture as usize,
-        lfm_audio_dock_publish as usize,
-        lfm_capture_producer_create as usize,
-        lfm_capture_producer_reserve as usize,
-        lfm_capture_producer_resolve_mut as usize,
-        lfm_capture_producer_finalize as usize,
-        lfm_capture_producer_publish as usize,
-        lfm_capture_producer_release as usize,
+        lfm_capture_chunk_producer_create as usize,
+        lfm_capture_producer_claim_chunk as usize,
+        lfm_capture_producer_resolve_chunk as usize,
+        lfm_capture_producer_commit_chunk as usize,
+        lfm_capture_producer_write_interleaved as usize,
+        lfm_capture_producer_abort_chunk as usize,
+        lfm_capture_producer_publish_gap as usize,
         lfm_capture_producer_destroy as usize,
         lfm_playback_consumer_create as usize,
         lfm_playback_consumer_claim as usize,

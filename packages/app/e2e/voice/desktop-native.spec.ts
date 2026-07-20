@@ -20,7 +20,6 @@ type Settings = {
     model: string
     modelDir?: string
     device: "metal"
-    vadThreshold: number
     asr: ModeSampling
     tts: ModeSampling
     interleaved: ModeSampling
@@ -42,7 +41,6 @@ async function install(page: Page, provider: Provider, options?: { ready?: boole
           model: "LiquidAI/LFM2.5-Audio-1.5B",
           modelDir: "/tmp/lfm2-audio-e2e",
           device: "metal",
-          vadThreshold: 0.012,
           asr: { textTemperature: 0, textTopK: 0, audioTemperature: 0, audioTopK: 0, maxTokens: 100 },
           tts: { textTemperature: 0.7, textTopK: 0, audioTemperature: 0.8, audioTopK: 64, maxTokens: 1024 },
           interleaved: { textTemperature: 1.0, textTopK: 0, audioTemperature: 1.0, audioTopK: 4, maxTokens: 8192 },
@@ -331,7 +329,6 @@ for (const provider of ["lfm2", "livekit"] as const) {
           model: "LiquidAI/LFM2.5-Audio-1.5B",
           modelDir: "/tmp/lfm2-audio-e2e",
           device: "metal",
-          vadThreshold: 0.012,
           asr: { textTemperature: 0, textTopK: 0, audioTemperature: 0, audioTopK: 0, maxTokens: 100 },
           tts: { textTemperature: 0.7, textTopK: 0, audioTemperature: 0.8, audioTopK: 64, maxTokens: 1024 },
           interleaved: { textTemperature: 1.0, textTopK: 0, audioTemperature: 1.0, audioTopK: 4, maxTokens: 8192 },
@@ -390,7 +387,6 @@ for (const provider of ["lfm2", "livekit"] as const) {
           model: "LiquidAI/LFM2.5-Audio-1.5B",
           modelDir: "/tmp/lfm2-audio-e2e",
           device: "metal",
-          vadThreshold: 0.012,
           asr: { textTemperature: 0, textTopK: 0, audioTemperature: 0, audioTopK: 0, maxTokens: 100 },
           tts: { textTemperature: 0.7, textTopK: 0, audioTemperature: 0.8, audioTopK: 64, maxTokens: 1024 },
           interleaved: { textTemperature: 1.0, textTopK: 0, audioTemperature: 1.0, audioTopK: 4, maxTokens: 8192 },
