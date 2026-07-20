@@ -346,6 +346,7 @@ export const dict = {
   "dialog.plugins.empty": "Plugins configured in emberharmony.json",
 
   "mcp.status.connected": "connected",
+  "mcp.status.connecting": "connecting",
   "mcp.status.failed": "failed",
   "mcp.status.needs_auth": "needs auth",
   "mcp.status.disabled": "disabled",

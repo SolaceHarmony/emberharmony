@@ -129,6 +129,7 @@ export function Sidebar(props: { sessionID: string; overlay?: boolean }) {
                             fg: (
                               {
                                 connected: theme.success,
+                                connecting: theme.textMuted,
                                 failed: theme.error,
                                 disabled: theme.textMuted,
                                 needs_auth: theme.warning,
@@ -144,6 +145,7 @@ export function Sidebar(props: { sessionID: string; overlay?: boolean }) {
                           <span style={{ fg: theme.textMuted }}>
                             <Switch fallback={item.status}>
                               <Match when={item.status === "connected"}>Connected</Match>
+                              <Match when={item.status === "connecting"}>Connecting</Match>
                               <Match when={item.status === "failed" && item}>{(val) => <i>{val().error}</i>}</Match>
                               <Match when={item.status === "disabled"}>Disabled</Match>
                               <Match when={(item.status as string) === "needs_auth"}>Needs auth</Match>

@@ -74,6 +74,13 @@ export namespace MCP {
         }),
       z
         .object({
+          status: z.literal("connecting"),
+        })
+        .meta({
+          ref: "MCPStatusConnecting",
+        }),
+      z
+        .object({
           status: z.literal("disabled"),
         })
         .meta({
@@ -167,6 +174,7 @@ export namespace MCP {
       const clients: Record<string, MCPClient> = {}
       const status: Record<string, Status> = {}
       const lifecycle = { disposed: false }
+      const pending = new Map<string, Promise<void>>()
 
       // Connect every server in the BACKGROUND. An MCP server is an optional,
       // external dependency — connecting can take up to ~30s (and ~60s for a
@@ -186,7 +194,8 @@ export namespace MCP {
           status[key] = { status: "disabled" }
           continue
         }
-        void create(key, mcp)
+        status[key] = { status: "connecting" }
+        const task = create(key, mcp)
           .then((result) => {
             if (lifecycle.disposed) {
               result?.mcpClient?.close().catch(() => {})
@@ -203,11 +212,14 @@ export namespace MCP {
             if (lifecycle.disposed) return
             status[key] = { status: "failed", error: error instanceof Error ? error.message : String(error) }
           })
+          .finally(() => pending.delete(key))
+        pending.set(key, task)
       }
       return {
         status,
         clients,
         lifecycle,
+        pending,
       }
     },
     async (state) => {
@@ -557,29 +569,45 @@ export namespace MCP {
       return
     }
 
-    const result = await create(name, { ...mcp, enabled: true })
-
-    if (!result) {
-      const s = await state()
-      s.status[name] = {
-        status: "failed",
-        error: "Unknown error during connection",
-      }
-      return
-    }
-
     const s = await state()
-    s.status[name] = result.status
-    if (result.mcpClient) {
-      // Close existing client if present to prevent memory leaks
-      const existingClient = s.clients[name]
-      if (existingClient) {
-        await existingClient.close().catch((error) => {
-          log.error("Failed to close existing MCP client", { name, error })
-        })
-      }
-      s.clients[name] = result.mcpClient
-    }
+    const pending = s.pending.get(name)
+    if (pending) return pending
+
+    s.status[name] = { status: "connecting" }
+    const task = create(name, { ...mcp, enabled: true })
+      .then(async (result) => {
+        if (s.lifecycle.disposed) {
+          await result?.mcpClient?.close().catch(() => {})
+          return
+        }
+
+        if (!result) {
+          s.status[name] = {
+            status: "failed",
+            error: "Unknown error during connection",
+          }
+          return
+        }
+
+        s.status[name] = result.status
+        if (!result.mcpClient) return
+
+        // Close existing client if present to prevent memory leaks
+        const existingClient = s.clients[name]
+        if (existingClient) {
+          await existingClient.close().catch((error) => {
+            log.error("Failed to close existing MCP client", { name, error })
+          })
+        }
+        s.clients[name] = result.mcpClient
+      })
+      .catch((error) => {
+        if (s.lifecycle.disposed) return
+        s.status[name] = { status: "failed", error: error instanceof Error ? error.message : String(error) }
+      })
+      .finally(() => s.pending.delete(name))
+    s.pending.set(name, task)
+    return task
   }
 
   export async function disconnect(name: string) {
