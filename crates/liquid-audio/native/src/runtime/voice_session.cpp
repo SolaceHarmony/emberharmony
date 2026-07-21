@@ -8,7 +8,7 @@
 #include "kc_service.h"
 #include "lfm_capture_policy.h"
 #include "lfm_capture_format.h"
-#include "lfm_mimi.h"
+#include "lfm_detokenizer.h"
 #include "lfm_model_internal.h"
 #include "lfm_sesame_detector.h"
 #include "lfm_platform_audio_internal.h"
@@ -728,7 +728,7 @@ int release_slot(PlaybackPool *pool, const LfmPcmLeaseV1 *lease,
     }
     /* `playback_consumed` is the retirement side of
      * `playback_published`; an unused reservation never entered that
-     * accounting domain. Generation can reserve one final Mimi buffer and
+     * accounting domain. Generation can reserve one final detokenizer buffer and
      * release it when no PCM remains, so counting SLOT_RESERVED here makes a
      * clean turn report consumed > published. */
     const bool published = state == SLOT_PUBLISHED || state == SLOT_CONSUMING;
@@ -1617,7 +1617,7 @@ int validate_voice_model(const LfmModel *model, char *error,
     }
     constexpr uint32_t required =
         LFM_MODEL_CAP_DEPTHFORMER | LFM_MODEL_CAP_FRONTEND |
-        LFM_MODEL_CAP_CONFORMER | LFM_MODEL_CAP_MIMI;
+        LFM_MODEL_CAP_CONFORMER | LFM_MODEL_CAP_DETOKENIZER;
     if ((info.capabilities & required) != required || info.codebooks == 0) {
         set_error(error, error_length,
                   "checkpoint is not a complete native LFM2 voice model");
@@ -2997,12 +2997,18 @@ ActionProgress advance_action(LfmSession *session) {
                     return ACTION_PROGRESS;
                 }
                 if (needs_pcm != 0) {
-                    if (emission.code_count != LFM_MIMI_CODEBOOKS ||
-                        !action.playback.active || action.playback.samples == 0 ||
+                    if (emission.code_count != LFM_DETOKENIZER_CODEBOOKS ||
+                        !action.playback.active ||
                         action.playback.samples > UINT32_MAX) {
                         fail_action(session, LFM_STATUS_INTERNAL,
-                                    "native Mimi route produced invalid PCM");
+                                    "native detokenizer route produced invalid PCM");
                         return ACTION_PROGRESS;
+                    }
+                    if (action.playback.samples == 0) {
+                        release_prepared(session, &action.playback);
+                        action.emission = {};
+                        action.phase = ACTION_PHASE_NEED_ROUTE;
+                        continue;
                     }
                     action.playback.lease.ticket = action.ticket;
                     action.playback.lease.frames =
@@ -5200,18 +5206,23 @@ int lfm_internal_session_submit_pcm_spans(
 
 int lfm_native_emission_needs_pcm(const LfmNativeEmission *emission) {
     if (!emission || emission->kind != LFM_NATIVE_EMISSION_AUDIO_CODES ||
-        emission->code_count != LFM_MIMI_CODEBOOKS ||
+        emission->code_count != LFM_DETOKENIZER_CODEBOOKS ||
         (emission->flags & ~EMISSION_AUDIO_END) != 0) {
         return LFM_STATUS_INVALID_ARGUMENT;
     }
     const bool end = (emission->flags & EMISSION_AUDIO_END) != 0;
     for (uint32_t index = 0; index < emission->code_count; ++index) {
-        if ((end && emission->codes[index] != LFM_MIMI_CODE_VALUES) ||
-            (!end && emission->codes[index] >= LFM_MIMI_CODE_VALUES)) {
+        if ((end &&
+             emission->codes[index] != LFM_DETOKENIZER_CODE_VALUES) ||
+            (!end &&
+             emission->codes[index] >= LFM_DETOKENIZER_CODE_VALUES)) {
             return LFM_STATUS_INVALID_ARGUMENT;
         }
     }
-    return end ? 0 : 1;
+    /* EOAudio is also a detokenizer call: it flushes the final 480 samples of
+     * same-padding overlap. A response that emitted no codes legitimately
+     * returns zero samples and releases its already-reserved playback lease. */
+    return 1;
 }
 
 static int runtime_create_impl(const LfmRuntimeConfigV1 *config,

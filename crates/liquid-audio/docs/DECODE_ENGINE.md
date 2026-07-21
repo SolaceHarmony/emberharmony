@@ -26,11 +26,12 @@ code owns CoreAudio callbacks, exact Sesame evidence, and turn endpointing.
 Rust does not own weights, tensors, tokens, model state, sampling, recurrence,
 speech evidence, or turn boundaries.
 
-- `safetensors.cpp` loads main and codec sources into one byte-exact, page-table
-  read-only image. `LfmModel` owns that image and binds frontend, Conformer,
-  backbone, Depthformer, Mimi, and tokenizer plans directly from immutable typed
-  byte views.
-- `LfmConversation` owns BF16 KV/short-convolution state, frontend/Conformer/Mimi
+- `safetensors.cpp` loads main and released `audio_detokenizer/` sources into one
+  byte-exact, page-table read-only image. `LfmModel` owns that image and binds
+  frontend, Conformer, backbone, Depthformer, audio-detokenizer, and tokenizer
+  plans directly from immutable typed byte views.
+- `LfmConversation` owns BF16 KV/short-convolution state,
+  frontend/Conformer/audio-detokenizer
   workspaces, bounded tokenizer storage, sampler PRNG, the monotonic context cursor,
   and sliding-window rollover. No Rust model object participates in a turn.
 - `LfmSession` owns text/PCM admission, ticket/epoch correlation, reliable events,
@@ -38,7 +39,8 @@ speech evidence, or turn boundaries.
   coordinator advances recurrence; Rust never waits on or interprets a numerical
   completion.
 - kcoro owns one stable fixed-team worker per numerical lane. Typed audio encode,
-  backbone, Depthformer, and Mimi requests enter that team as non-suspending
+  backbone, Depthformer, and audio-detokenizer requests enter that team as
+  non-suspending
   generations. Every member returns; the final return publishes the exact
   completion callback. No operation member parks at a stage boundary.
   `REQ_AUDIO_ENCODE` carries borrowed PCM/output spans through resample,
@@ -80,7 +82,7 @@ flowchart LR
     Team --> Board["shared stage board<br/>atomic tile claims"]
     Board --> Kernels["AArch64 / x86_64 leaves"]
     Kernels -->|"final-member callback"| Conv
-    Conv -->|"Mimi + native device-rate resample into lease"| Playback["native playback dock"]
+    Conv -->|"LFM2.5 detokenizer + native device-rate resample into lease"| Playback["native playback dock"]
     Playback -->|"generation-checked borrowed span"| Device["CoreAudio device callback"]
 ```
 
@@ -88,7 +90,8 @@ flowchart LR
 ShortConv/attention/MLP walk, final norm, and optional sampling in one team entry.
 `REQ_DEPTH_FRAME` executes projection, every Depthformer codebook/layer, resident KV
 recurrence, collective sampling, and sampled-embedding feedback.
-`REQ_MIMI_DECODE` serializes conversation-local codec state through the same SQ/CQ.
+`REQ_AUDIO_DETOKENIZE` serializes conversation-local detokenizer state through
+the same SQ/CQ.
 At 24 kHz it writes directly into the retained reservation; at another device
 rate it decodes into conversation-owned codec scratch and the same route's native
 retained streaming rate converter writes directly into the reservation. `REQ_AUDIO_ENCODE`
@@ -138,7 +141,7 @@ The settled architecture for the decode engine. This is the target; §4 says how
 as-built. Read this as the spec, not the changelog.
 
 1. **Weights.** ONE resident raw image for the process; the native loader owns a
-   component-scoped `(Main|Codec, name) → (offset, dtype, shape)` catalog parsed
+   component-scoped `(Main|Detokenizer, name) → (offset, dtype, shape)` catalog parsed
    straight from safetensors. This is as-built for LFM2. Candle is an offline
    oracle, not a production owner. Reads are the floor; any weight movement is
    theft on top of it.
@@ -175,7 +178,8 @@ Where every byte lives on the decode path, from the most durable to the most eph
 
 ### Tier 0 — Weights (AS-BUILT: one immutable combined image)
 
-- `safetensors.cpp` opens and fingerprints every main and codec shard before
+- `safetensors.cpp` opens and fingerprints every main and audio-detokenizer
+  shard before
   allocation, computes checked 64-byte source bases, and allocates exactly one
   final image. Up to four workers issue retrying 8 MiB positioned reads directly
   into disjoint final spans; there is no chunk buffer or application payload
@@ -185,13 +189,15 @@ Where every byte lives on the decode path, from the most durable to the most eph
   metadata is parsed, and exact dtype/rank/shape spans are validated. Source
   handles close before publication, after which `mprotect`/`VirtualProtect`
   makes the image read-only.
-- `LfmModel` is the sole owner. Component-scoped names allow main and codec to
+- `LfmModel` is the sole owner. Component-scoped names allow main and
+  detokenizer keys to
   overlap without opening a second image. Plans retain byte-addressed views;
   possibly unaligned checkpoint BF16 is never represented as a dereferenceable
   C++ `uint16_t*`. Architecture kernels unlift little-endian words in registers.
 - `LfmModelMemoryV1` reports source, resident, directly bound, formula-derived,
   compatibility-copied, load-time, worker, and task counts. Formula-derived rope,
-  frontend/FFT/window, Conformer denominator, and Mimi fold tables are counted
+  frontend/FFT/window, Conformer denominator, and detokenizer inverse-DFT/RoPE
+  tables are counted
   separately. Layout, alignment, dtype, transpose, and framework-owner copies are
   forbidden. The production acceptance value is
   `compatibility_copied_bytes == 0`.
@@ -202,7 +208,8 @@ Where every byte lives on the decode path, from the most durable to the most eph
 
 - Every attention layer has fixed BF16 K/V planes sized for
   `[n_kv, configured_capacity + runway, head_dim]`; every ShortConv layer has its
-  fixed carry. Depthformer and Mimi state are native and conversation-local.
+  fixed carry. Depthformer and audio-detokenizer state are native and
+  conversation-local.
 - `LfmContextWindowState` tracks live `position`, physical `start`, monotonic
   `cursor`, and absolute `rope_base`. The runway is
   `min(configured_capacity, 256)`. Once capacity is full, admission drops the
@@ -223,7 +230,8 @@ retaining inputs and recomputing the whole tail.
 ### Tier 2 — Native scratch + fixed-lane generation fence (AS-BUILT)
 
 - Engine attention, ShortConv, token, logits, Depthformer, and sampler planes are
-  plan-owned. Frontend, resampler, Conformer, bounded tokenizer, Mimi, hidden,
+  plan-owned. Frontend, resampler, Conformer, bounded tokenizer,
+  audio-detokenizer, hidden,
   mel, and adapted planes are conversation-owned. Engine activation scratch is
   double-buffered per admitted ticket and only one bank is mounted on the lane
   board at a time. Session creation reserves the
@@ -233,7 +241,8 @@ retaining inputs and recomputing the whole tail.
   the BF16 Conformer destination, and Conformer writes the native prefill plane.
   M≤4 prefill linears publish their exact-RNE BF16 results directly into strided
   `stage`, ShortConv, and Q/K/V consumer planes; no `bcxf`, `projf`, or `qkvf`
-  activation plane survives. Mimi writes direct at equal rates; otherwise native codec scratch feeds the
+  activation plane survives. The detokenizer writes direct at 24 kHz; otherwise
+  native detokenizer scratch feeds the
   prepared output resampler, which writes the device-rate playback reservation.
   Weight planes are never widened, packed, transposed, or copied.
 - Native team generations use release/acquire publication plus generation-stamped
@@ -281,7 +290,7 @@ Depthformer programs plus the lower-level kernel inventory.
 
 | Region | As-built path | Where |
 |---|---|---|
-| resident weights | one combined main+codec read-only image; exact typed byte views bind every LFM2 consumer; BF16 unlift happens in registers | `native/src/io/safetensors.cpp`, `native/src/model/lfm_model.cpp` |
+| resident weights | one combined main+detokenizer read-only image; exact typed byte views bind every LFM2.5 consumer; BF16 unlift happens in registers | `native/src/io/safetensors.cpp`, `native/src/model/lfm_model.cpp` |
 | resample + mel frontend | prepared workspaces inside model-correlated `REQ_AUDIO_ENCODE`; borrowed PCM spans produce direct valid-only BF16 mel with aliased activation planes | `native/src/frontend/lfm_frontend.cpp`, `native/src/engine/flashkern_engine.cpp`, `native/kernels/*/flashkern_frontend.S` |
 | Conformer + adapter | exact image-bound plan and per-conversation workspace inside the same typed audio ticket; checkpoint-layout GEMMs use fixed-team substages and adapter rows land directly in the native prefill plane | `native/src/model/lfm_conformer.cpp`, `native/src/engine/flashkern_engine.cpp`, `native/kernels/*/flashkern_conformer.S` |
 | tokenizer + turn grammar | native byte-BPE tokenizer, bounded per-conversation workspace, native control-token grammar | `native/src/model/lfm_tokenizer.cpp`, `native/src/model/lfm_model.cpp` |
@@ -289,7 +298,8 @@ Depthformer programs plus the lower-level kernel inventory.
 | backbone recurrence | `REQ_TOKEN_PASS` over direct checkpoint BF16; native KV/ShortConv state, grouped GQA, final norm, and text sampling | `native/src/engine/flashkern_engine.cpp`, `native/src/model/lfm_model.cpp` |
 | context rollover | fixed capacity+runway BF16 state, monotonic cursor, absolute RoPE range generation, in-place compaction | `native/src/model/lfm_model.cpp`, `native/kernels/*/flashkern_rope.S` |
 | audio frame | `REQ_DEPTH_FRAME`: projection, every Depthformer codebook/layer, KV recurrence, native sampling, embedding feedback | `native/src/engine/flashkern_engine.cpp` |
-| Mimi decode | typed `REQ_MIMI_DECODE`; codec component views from the same image; conversation-local state; PCM writes directly into a playback lease | `native/src/mimi/`, `native/src/engine/flashkern_engine.cpp`, `native/src/runtime/voice_session.cpp` |
+| LFM2.5 audio detokenizer | typed `REQ_AUDIO_DETOKENIZE`; required F32 detokenizer views from the same image; conversation-local ShortConv/GQA/ISTFT state; PCM writes directly into a playback lease | `native/src/detokenizer/`, `native/src/engine/flashkern_engine.cpp`, `native/src/runtime/voice_session.cpp` |
+| Mimi | retained native archive with a distinct `MIMI` image component; no LFM2.5 loader or route edge; reserved for native Moshi | `native/src/mimi/`, `docs/MIMI_PORT.md` |
 | generation/session | native ticketed text/PCM admission and recurrence, reliable events, interruption epochs, stop/join | `native/src/runtime/voice_session.cpp` |
 | desktop production host | opaque native runtime/model/conversation/session; no Rust model construction or Candle fallback | `src/native_voice.rs`, `packages/desktop/src-tauri/src/voice/runtime.rs` |
 
@@ -339,7 +349,8 @@ post-pass process CPU with eight parked lanes. `cargo check -p liquid-audio
 
 The ignored gates are explicit rather than silent: the one-million-cycle soak is
 opt-in, and complete model memory accounting requires `LFM_MODEL_DIR` plus the
-main and Mimi checkpoint. The latter asserts one lifecycle-owned image and
+main and released audio-detokenizer checkpoint. The latter asserts one
+lifecycle-owned image and
 `compatibility_copied_bytes == 0` when the real fixture is supplied.
 
 The rollover and model-schema fixtures also pass through the x86_64/Rosetta
@@ -390,7 +401,8 @@ Do not compare them across executors or extrapolate a current latency.
    per-ticket request/scratch slots, a capacity-2 native SQ/CQ, retained descriptors, native endpoint ownership,
    and deletion of the stackful runtime are live.
 2. **One-image native LFM2 model: built.** The direct loader, typed BF16 views,
-   frontend, Conformer, backbone, Depthformer, Mimi, tokenizer, per-conversation
+   frontend, Conformer, backbone, Depthformer, audio detokenizer, tokenizer,
+   per-conversation
    state, and memory accounting are mounted without a compatibility weight copy.
 3. **Native session and atomic product cutover: built.** Native text/PCM/mixed
    admission, sampling, recurrence, tickets, epochs, reliable events, context

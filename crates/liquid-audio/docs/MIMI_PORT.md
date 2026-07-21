@@ -1,18 +1,24 @@
 # Native Mimi port manifest
 
-Production Mimi is native. After the backbone (`REQ_TOKEN_PASS`) and typed
-Depthformer (`REQ_DEPTH_FRAME`), `REQ_MIMI_DECODE` consumes byte-addressed
-views from the model's single immutable main-plus-codec image and publishes PCM
-without returning numerical work to Rust. This manifest records that completed
-ownership cut and the remaining performance rung: divide the already-native
-stateful graph across the fixed Flashkern team instead of running its interior
-serially on lane zero.
+Status: **retained native codec for the future Moshi tranche; deliberately
+unwired from released LFM2.5-Audio.** `liblfm_mimi.a` remains build-checked and
+its private native ABI remains available to the future Moshi model owner.
+`mimi_decode_plan_new_from_image` binds only
+`LFM_WEIGHT_COMPONENT_MIMI`, a component that the LFM2.5 loader never
+populates. There is no LFM2.5 request kind, route edge, conversation state, or
+fallback that can select Mimi.
+
+Released LFM2.5 output is instead
+`REQ_TOKEN_PASS → REQ_DEPTH_FRAME → REQ_AUDIO_DETOKENIZE`, using the checkpoint's
+required `audio_detokenizer/` component. This manifest preserves the native
+Mimi implementation and its remaining optimization work so Moshi can adopt it
+without confusing the two model contracts.
 
 ## Source of truth
 
 `moshi 0.6.4` (crates.io registry copy:
 `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/moshi-0.6.4/src/`),
-entered from our `MimiDetokenizer` (src/runtime/audio_out.rs):
+originally entered from the former Rust `MimiDetokenizer` implementation:
 
 - **Hot path (per generated frame): `Mimi::decode_step`** — mimi.rs:214
   1. `SplitResidualVectorQuantizer::decode` (quantization.rs:383)
@@ -29,14 +35,14 @@ entered from our `MimiDetokenizer` (src/runtime/audio_out.rs):
 - Weights: `tokenizer-e351c8d8-checkpoint125.safetensors`, f32, n_q=8
   (rvq_first 1 + rvq_rest 7), bins 2048, quantizer dim 256 ↔ model dim 512.
 
-**Out of production scope (oracle/training only):** the encoder half
+**Out of the retained decoder scope (oracle/training only):** the encoder half
 (`encode*` — used only by training preprocessing), batching >1,
 `StreamMask` batched masking, quantized-weight paths (`MaybeQuantized*` —
 this checkpoint is unquantized f32), cross-attention / gating / RmsNorm /
 conv-block transformer variants (config says None/LayerNorm/false), LSTM
 (seanet lstm=0).
 
-## Port units — one file per agent
+## Native port units
 
 | # | C++ file (native/src/mimi/) | Rust source | Port | Skip |
 |---|---|---|---|---|
@@ -51,14 +57,15 @@ table, state arena, C ABI. nn.rs collapses into the header's plain-f32 linear.
 streaming.rs (`StreamTensor` = Option<Tensor>) becomes explicit
 `n_in/n_out` frame counts — no optional-tensor plumbing in C++.
 
-Production ownership is split: `MimiDecodePlan` belongs to `LfmModel` and owns
-validated byte views plus the formula-derived immutable arena;
-`MimiDecodeState` belongs to one conversation and owns KV/carry/scratch. Plan
-construction probes the exact state arena size, seals derived storage, and
-subsequent state creation replays only the derived offsets—never the fold math.
-On the production checkpoint the measured accounting is 16,777,344 derived
-bytes once per model and 48,808,616 mutable bytes per conversation, with zero
-compatibility-copied weight bytes.
+Future Moshi ownership is split: `MimiDecodePlan` belongs to the native Moshi
+model owner and owns validated byte views plus the formula-derived immutable
+arena; `MimiDecodeState` belongs to one Moshi conversation and owns
+KV/carry/scratch. Plan construction probes the exact state arena size, seals
+derived storage, and subsequent state creation replays only the derived
+offsets—never the fold math. The isolated implementation measured 16,777,344
+derived bytes once per model and 48,808,616 mutable bytes per conversation,
+with zero compatibility-copied weight bytes. Those bytes are not allocated by
+an LFM2.5 model or conversation.
 
 ## Discipline (same as the engine, non-negotiable)
 
@@ -95,8 +102,9 @@ compatibility-copied weight bytes.
   not asserted blind. The end-to-end wav byte hash WILL move → oracle re-arm
   is deliberate and hers, with the directly invoked native real-checkpoint
   trace and DECODE_ENGINE.md updated together, never alone.
-- **No fallbacks**: the native Mimi, once gated in, is required — absent it,
-  hard error (Mimi always ships; never the LFM2 detokenizer silently).
+- **No cross-model fallback**: Moshi adoption will require the native Mimi
+  component and fail when it is absent. LFM2.5 requires the released audio
+  detokenizer and fails when it is absent. Neither substitutes for the other.
 - C linkage entry points; no exceptions across the ABI; no candle, no Rust
   types below the seam.
 
@@ -110,10 +118,9 @@ compatibility-copied weight bytes.
    left-context, KV ring wrap at 250).
 3. e2e: perf-chain wav vs current PERF hash — expected to move; the audible
    dual-path e2e + her ear bless the re-arm.
-4. Integration (after parity — her directive, structural not optional): the
-   Mimi kernel runs as a typed pass on the same Flashkern lane team as the
-   backbone, crossing the mounted Rust-broker/native-SQ/CQ boundary — same
-   persistent lanes and doorbells, its own REQ kind at the pass boundary.
+4. Future Moshi integration: the Mimi kernel runs as a typed pass on the same
+   Flashkern lane team as the Moshi backbone, with its own request kind at the
+   pass boundary.
    Because it is a native C++ program (no Rust frames cross the fences), its lane
    fences use the shared expected-value word and block without a spin tier — the
    depthformer's transitional pure-spin barrier does not apply here. Unit inner
@@ -174,15 +181,15 @@ compatibility-copied weight bytes.
       Still open from the verdict: AMX dispatch is inferred from the 5.6x on
       GEMM-bound shapes, not proven by counters; cold init ~665 ms (page
       faults + re-arm) needs one measurement pass at integration.
-- [x] build wiring: build.rs compiles the five active units as C++23 with
-      `-ffp-contract=off` (load-bearing). Production constructs
-      `MimiDecodePlan` from the codec component of `LfmModel`'s one immutable
-      image and gives each `LfmConversation` its own `MimiDecodeState`. The
-      standalone file-opening decoder/rim is deleted.
-- [x] PRODUCTION SWAP: native conversation recurrence invokes
-      `REQ_MIMI_DECODE`; the moshi `decode_step` graph is absent from the
-      shipped path. Rust moshi code remains only in the opt-in oracle/training
-      graph and is never a production fallback.
+- [x] isolated build wiring: build.rs compiles the five units as C++23 with
+      `-ffp-contract=off` (load-bearing). The private plan binds only the
+      reserved Mimi component. LFM2.5 never constructs the plan or state.
+- [x] LFM2.5 isolation: native LFM2.5 recurrence has no `REQ_MIMI_DECODE`, no
+      Mimi state, no Mimi weights, and no version fallback. Its released
+      detokenizer is mandatory.
+- [ ] Moshi production adoption: the future native Moshi model owner must load
+      its main and Mimi sources into one image, construct the retained native
+      plan/state, and mount the request on its coroutine route.
 - [x] chain parity, in-repo (tests/mimi_native_parity.rs, gate rung 2/6):
       130 frames across the 250-slot KV wrap through the production FFI —
       worst |Δ| = 3.085e-6 (assert 5e-5), post-reset 2.9e-7. Tighter than
@@ -192,10 +199,10 @@ compatibility-copied weight bytes.
       stays NEON). Final verdict's P2s also closed: stage errors propagate
       through `mimi_decode_state_step` (negative rc never reads as priming);
       upsample weight validated exact-shape + non-null.
-- [x] engine integration: typed `REQ_MIMI_DECODE` runs through the native SQ/CQ.
-      Equal-rate output writes its retained playback reservation directly; the
-      48 kHz desktop path decodes into conversation-owned codec scratch and
-      stream-rate-converts directly into that same route's device-rate reservation.
+- [ ] Moshi engine integration: add a Moshi-owned typed Mimi request to the
+      native SQ/CQ. Equal-rate output must write its retained playback
+      reservation directly; other device rates use conversation-owned scratch
+      and the same route's native stream resampler.
 - [x] transformer QKV destination cut: Q uses a 16 KiB fixed scratch plane;
       each K/V output head projects directly from the packed resident byte view
       into its final rotating-cache slot. The original 48 KiB QKV plane is gone,
@@ -208,11 +215,11 @@ compatibility-copied weight bytes.
       multi-step, matrix-route, and reset goldens are bit exact. This removes
       50,688 copied bytes and 2,497 nonzero `memcpy` calls per steady decode
       without changing arithmetic or the two-bank state footprint.
-- [ ] cooperative interior (the remaining rung): split Mimi units across the
-      fixed team using the NOTES maps (conv: out-channel; attention: head;
-      sweeps: sub-range) with zero-spin generation fences. The mounted request
-      is correct and fast (13.8 ms/frame), but its stateful graph still executes
-      serial-with-AMX on lane zero while peers park. The remaining large mutable
+- [ ] cooperative interior: split Mimi units across the fixed team when Moshi
+      mounts it, using the NOTES maps (conv: out-channel; attention: head;
+      sweeps: sub-range). The isolated graph is correct and fast
+      (13.8 ms/frame), but its stateful interior remains serial-with-AMX. The
+      remaining large mutable
       planes are `attn_cat`, `branch`, MLP hidden storage, and SeaNet activation/
       residual ping-pong. Carry banks remain necessary while old overlap and the
       next tail coexist, but their publication is now pointer-only. Eliminate or

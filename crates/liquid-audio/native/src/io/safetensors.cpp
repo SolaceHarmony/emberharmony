@@ -1235,13 +1235,15 @@ extern "C" int lfm_weights_open_files(const char *const *paths, size_t count,
         out, err, errlen);
 }
 
-static int weights_open_bundle(const char *main_path, const char *codec_path,
+static int weights_open_bundle(const char *main_path,
+                               const char *detokenizer_path,
                                const LfmPayloadReadOwner *owner,
                                LfmWeightImage **out, char *err,
                                size_t errlen) {
-    if (!main_path || main_path[0] == '\0' || !codec_path || codec_path[0] == '\0') {
+    if (!main_path || main_path[0] == '\0' || !detokenizer_path ||
+        detokenizer_path[0] == '\0') {
         if (out) *out = nullptr;
-        set_error(err, errlen, "empty main or codec weight path");
+        set_error(err, errlen, "empty main or detokenizer weight path");
         return LFM_WEIGHT_INVALID_ARGUMENT;
     }
     return open_c(
@@ -1260,28 +1262,28 @@ static int weights_open_bundle(const char *main_path, const char *codec_path,
                              &scope));
             append_resolved(
                 resolved,
-                resolve_path(fs::path(codec_path), LFM_WEIGHT_COMPONENT_CODEC,
-                             &scope));
+                resolve_path(fs::path(detokenizer_path),
+                             LFM_WEIGHT_COMPONENT_DETOKENIZER, &scope));
             return load(std::move(resolved), {}, &scope);
         },
         out, err, errlen);
 }
 
 extern "C" int lfm_weights_open_bundle(const char *main_path,
-                                        const char *codec_path,
+                                        const char *detokenizer_path,
                                         LfmWeightImage **out, char *err,
                                         size_t errlen) {
-    return weights_open_bundle(main_path, codec_path, nullptr, out, err,
+    return weights_open_bundle(main_path, detokenizer_path, nullptr, out, err,
                                errlen);
 }
 
 int lfm_weights_open_bundle_owned(const char *main_path,
-                                  const char *codec_path,
+                                  const char *detokenizer_path,
                                   const LfmPayloadReadOwner *owner,
                                   LfmWeightImage **out, char *err,
                                   size_t errlen) {
     if (!owner) return LFM_WEIGHT_INVALID_ARGUMENT;
-    return weights_open_bundle(main_path, codec_path, owner, out, err,
+    return weights_open_bundle(main_path, detokenizer_path, owner, out, err,
                                errlen);
 }
 
@@ -1290,10 +1292,10 @@ int lfm_weights_open_bundle_owned(const char *main_path,
  * supported) with the file cache bypassed. This is not a model/loader ABI for
  * product code and may change with the benchmark without compatibility notice. */
 extern "C" int lfm_internal_weights_open_bundle_benchmark(
-    const char *main_path, const char *codec_path, uint32_t workers,
+    const char *main_path, const char *detokenizer_path, uint32_t workers,
     uint32_t uncached, LfmWeightImage **out, char *err, size_t errlen) {
-    if (!main_path || main_path[0] == '\0' || !codec_path ||
-        codec_path[0] == '\0' || uncached > 1) {
+    if (!main_path || main_path[0] == '\0' || !detokenizer_path ||
+        detokenizer_path[0] == '\0' || uncached > 1) {
         if (out) *out = nullptr;
         set_error(err, errlen, "invalid native load benchmark arguments");
         return LFM_WEIGHT_INVALID_ARGUMENT;
@@ -1306,7 +1308,8 @@ extern "C" int lfm_internal_weights_open_bundle_benchmark(
                 resolve_path(fs::path(main_path), LFM_WEIGHT_COMPONENT_MAIN));
             append_resolved(
                 resolved,
-                resolve_path(fs::path(codec_path), LFM_WEIGHT_COMPONENT_CODEC));
+                resolve_path(fs::path(detokenizer_path),
+                             LFM_WEIGHT_COMPONENT_DETOKENIZER));
             return load(std::move(resolved),
                         LoadOptions{workers, uncached != 0});
         },

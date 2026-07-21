@@ -31,7 +31,11 @@ constexpr uint32_t CALLBACK_FRAMES = 480;
 constexpr uint32_t EVENT_CAPACITY = 128;
 constexpr uint32_t EVENT_PAYLOAD = 512;
 constexpr uint32_t EVENT_BUDGET = 24;
-constexpr uint32_t MAX_TOKENS = 48;
+/* Production interleaved-turn budget. This is deliberately much larger than
+ * the vendor demo's 1024-step guard: the model owns its terminal, and this
+ * gate must expose—not manufacture—a cutoff before that terminal. The bound
+ * remains below the model card's 32,768-token conversation context. */
+constexpr uint32_t MAX_TOKENS = 8192;
 constexpr uint64_t CLOSED_LOOP_CAPACITY = UINT64_C(30) * RATE;
 constexpr uint64_t MONITOR_CAPACITY = UINT64_C(1) << 20;
 constexpr uint64_t MONITOR_CALLBACK_CLOSED = UINT64_C(1) << 63;
@@ -688,6 +692,13 @@ int process_event(Gate *gate, GateFrame *frame, uint32_t endpoint,
     if (turn.size != sizeof(turn) || turn.abi_version != ABI ||
         event.status != 0) {
         return event.status != 0 ? event.status : LFM_STATUS_ABI_MISMATCH;
+    }
+    if ((event.flags & LFM_EVENT_FLAG_TRUNCATED) != 0) {
+        fail(frame, LFM_STATUS_INTERNAL,
+             first
+                 ? "first native agent exhausted max_new_tokens before its terminal"
+                 : "second native agent exhausted max_new_tokens before its terminal");
+        return 0;
     }
     if (first) {
         frame->first_terminals++;

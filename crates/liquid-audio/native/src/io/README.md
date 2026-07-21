@@ -41,11 +41,13 @@ actual tensor names and source shards. Without an index, a directory resolves
 `model.safetensors`, then sorted `model-*.safetensors`; unrelated tokenizer
 checkpoints are not folded into the model image.
 
-`lfm_weights_open_bundle` resolves the main model and Mimi source separately,
+`lfm_weights_open_bundle` resolves the main model and LFM2.5 audio-detokenizer
+source separately,
 then sends both source sets through the same allocation and read team. Its
-catalog key is `(Main|Codec, tensor name)`: cross-component duplicate names are
-legal; duplicates within one component fail. The legacy lookup functions are
-Main-scoped, while native model construction uses the component-scoped forms.
+catalog key is `(Main|Detokenizer, tensor name)`: cross-component duplicate
+names are legal; duplicates within one component fail. The legacy lookup
+functions are Main-scoped, while native model construction uses the
+component-scoped forms.
 
 ## Validation
 
@@ -85,14 +87,12 @@ the cold report is `null` rather than warm data under a misleading label. The
 process exits unsuccessfully if the four-worker p50 or p95 regresses the serial
 baseline. `LFM_LOAD_BENCH_RUNS` changes the default five samples per mode.
 
-Native Mimi now binds the Codec catalog of the model-owned combined image through
-one model-lifetime `MimiDecodePlan`; it neither reopens the codec file nor owns a
-duplicate image. Each conversation gets a `MimiDecodeState` containing only KV,
-convolution carry, and scratch. Formula-derived codebooks and RoPE data live once
-in the sealed plan. The standalone file-owning parity decoder is deleted. Mimi
-consumes checkpoint-layout F32 bytes directly, including unaligned
-views, and reports formula-derived immutable bytes separately from its always-zero
-compatibility-copy count.
+Native LFM2.5 output binds the Detokenizer catalog of the model-owned combined
+image. It does not reopen the submodel and never constructs the legacy Mimi
+decoder. Each conversation owns only detokenizer KV, convolution carry, ISTFT
+overlap state, and scratch. Formula-derived RoPE/ISTFT tables live once in the
+plan. Checkpoint-layout F32 weights remain immutable resident-image views; no
+alignment, layout, or dtype copy is admitted.
 
 ## Provenance
 

@@ -13,7 +13,8 @@
 //! (default 5). The benchmark alternates the one-worker serial baseline and the
 //! production four-worker direct loader. Cold measurements use an OS cache
 //! bypass/eviction hint and are emitted as unavailable when that cannot be done
-//! honestly. `LFM_LOAD_BENCH_CODEC` may override the codec checkpoint path.
+//! honestly. `LFM_LOAD_BENCH_DETOKENIZER` may override the released
+//! `audio_detokenizer` directory.
 
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::path::{Path, PathBuf};
@@ -60,7 +61,7 @@ unsafe extern "C" {
     // installed/product header and from liquid-audio's Rust API.
     fn lfm_internal_weights_open_bundle_benchmark(
         main_path: *const c_char,
-        codec_path: *const c_char,
+        detokenizer_path: *const c_char,
         workers: u32,
         uncached: u32,
         out: *mut *mut WeightImage,
@@ -77,15 +78,15 @@ unsafe extern "C" {
 struct Image(NonNull<WeightImage>);
 
 impl Image {
-    fn open(main: &Path, codec: &Path, workers: u32, uncached: bool) -> Res<Self> {
+    fn open(main: &Path, detokenizer: &Path, workers: u32, uncached: bool) -> Res<Self> {
         let main = CString::new(main.as_os_str().as_encoded_bytes())?;
-        let codec = CString::new(codec.as_os_str().as_encoded_bytes())?;
+        let detokenizer = CString::new(detokenizer.as_os_str().as_encoded_bytes())?;
         let mut raw = std::ptr::null_mut();
         let mut error = [0i8; 1024];
         let status = unsafe {
             lfm_internal_weights_open_bundle_benchmark(
                 main.as_ptr(),
-                codec.as_ptr(),
+                detokenizer.as_ptr(),
                 workers,
                 u32::from(uncached),
                 &mut raw,
@@ -163,10 +164,10 @@ fn rss_bytes() -> Option<u64> {
         .checked_mul(1024)
 }
 
-fn sample(main: &Path, codec: &Path, workers: u32, uncached: bool) -> Res<Sample> {
+fn sample(main: &Path, detokenizer: &Path, workers: u32, uncached: bool) -> Res<Sample> {
     let rss_before = rss_bytes();
     let started = Instant::now();
-    let image = Image::open(main, codec, workers, uncached)?;
+    let image = Image::open(main, detokenizer, workers, uncached)?;
     let elapsed = started.elapsed();
     let rss_after = rss_bytes();
     let stats = image.stats()?;
@@ -234,13 +235,18 @@ fn compare(serial: &[Sample], parallel: &[Sample]) -> Value {
     })
 }
 
-fn pair(main: &Path, codec: &Path, runs: usize, uncached: bool) -> Res<(Vec<Sample>, Vec<Sample>)> {
+fn pair(
+    main: &Path,
+    detokenizer: &Path,
+    runs: usize,
+    uncached: bool,
+) -> Res<(Vec<Sample>, Vec<Sample>)> {
     let mut serial = Vec::with_capacity(runs);
     let mut parallel = Vec::with_capacity(runs);
     for run in 0..runs {
         let order = if run % 2 == 0 { [1, 4] } else { [4, 1] };
         for workers in order {
-            let measured = sample(main, codec, workers, uncached)?;
+            let measured = sample(main, detokenizer, workers, uncached)?;
             if workers == 1 {
                 serial.push(measured);
             } else {
@@ -295,26 +301,30 @@ fn main() -> Res<()> {
     if !main.is_dir() {
         return Err(format!("LFM_MODEL_DIR is not a directory: {}", main.display()).into());
     }
-    let codec = std::env::var_os("LFM_LOAD_BENCH_CODEC")
+    let detokenizer = std::env::var_os("LFM_LOAD_BENCH_DETOKENIZER")
         .map(PathBuf::from)
-        .unwrap_or_else(|| main.join("tokenizer-e351c8d8-checkpoint125.safetensors"));
-    if !codec.is_file() {
-        return Err(format!("Mimi codec checkpoint is missing: {}", codec.display()).into());
+        .unwrap_or_else(|| main.join("audio_detokenizer"));
+    if !detokenizer.join("model.safetensors").is_file() {
+        return Err(format!(
+            "released audio detokenizer is missing: {}",
+            detokenizer.display()
+        )
+        .into());
     }
     let runs = env_runs()?;
     let cold_supported = unsafe { lfm_internal_weights_benchmark_cold_supported() } == 1;
     let skip_cold = std::env::var_os("LFM_LOAD_BENCH_SKIP_COLD").is_some();
 
     let cold = if cold_supported && !skip_cold {
-        let (serial, parallel) = pair(&main, &codec, runs, true)?;
+        let (serial, parallel) = pair(&main, &detokenizer, runs, true)?;
         Some((serial, parallel))
     } else {
         None
     };
 
     // One unreported cached open makes the subsequent warm series explicit.
-    drop(sample(&main, &codec, 4, false)?);
-    let (warm_serial, warm_parallel) = pair(&main, &codec, runs, false)?;
+    drop(sample(&main, &detokenizer, 4, false)?);
+    let (warm_serial, warm_parallel) = pair(&main, &detokenizer, runs, false)?;
     let mut all = vec![warm_serial.as_slice(), warm_parallel.as_slice()];
     if let Some((serial, parallel)) = &cold {
         all.push(serial);
@@ -332,7 +342,7 @@ fn main() -> Res<()> {
     });
     let report = json!({
         "checkpoint": main,
-        "codec": codec,
+        "audio_detokenizer": detokenizer,
         "runs_per_mode": runs,
         "chunk_bytes": 8 * 1024 * 1024usize,
         "digest_algorithm": "sha256",

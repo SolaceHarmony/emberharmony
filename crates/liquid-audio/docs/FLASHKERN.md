@@ -92,8 +92,14 @@ Additional numerical C++ debt remains in:
 
 - `native/src/engine/flashkern_engine.cpp`: top-k heap/serial sampler routing,
   double-double FFT arithmetic, twiddle generation, and residual expressions;
-- `native/src/mimi/*.cpp`: codec GEMM, activation, normalization, convolution,
-  transformer, quantizer, and SeaNet arithmetic;
+- `native/src/detokenizer/lfm_detokenizer.cpp`: current LFM2.5 output
+  embedding, ShortConv, GQA, projection, polar-spectrum, inverse-DFT, and
+  overlap-add arithmetic. Large dense stages may remain behind the measured
+  Accelerate/AMX seam; all other payload calculations require paired assembly
+  leaves and cooperative fixed-team scheduling.
+- `native/src/mimi/*.cpp`: retained future-Moshi codec GEMM, activation,
+  normalization, convolution, transformer, quantizer, and SeaNet arithmetic.
+  This archive is not mounted by LFM2.5;
 - `native/src/tirex/tirex2_slstm.cpp`: recurrent gates and normalization.
 
 C++ control loops may remain only after every payload calculation inside them is

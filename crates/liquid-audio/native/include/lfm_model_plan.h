@@ -6,9 +6,9 @@
 
 #include "flashkern_prng.h"
 #include "flashkern_sampler.h"
+#include "lfm_detokenizer.h"
 #include "lfm_frontend.h"
 #include "lfm_kernel_bridge.h"
-#include "lfm_mimi.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -44,11 +44,11 @@ typedef struct LfmAudioRouteResult {
     uint32_t token_completed;
     uint32_t token_committed;
     uint32_t depth_completed;
-    uint32_t mimi_completed;
+    uint32_t detokenizer_completed;
     uint32_t eoaudio;
     uint32_t reserved;
     size_t pcm_samples;
-    uint32_t codes[LFM_MIMI_CODEBOOKS];
+    uint32_t codes[LFM_DETOKENIZER_CODEBOOKS];
 } LfmAudioRouteResult;
 
 typedef struct LfmAudioRouteTarget {
@@ -57,13 +57,14 @@ typedef struct LfmAudioRouteTarget {
     /* Final device-rate playback reservation. */
     float *pcm;
     size_t pcm_capacity;
-    /* When device and codec rates differ, Mimi writes its legal 24 kHz result
+    /* When device and output rates differ, the detokenizer writes its legal
+     * 24 kHz result
      * here and the same retained route stream-converts directly into `pcm`.
      * The stream owns only cross-call scalar history/phase. These are
      * conversation-owned activation views, never weight or tensor
      * materialization. All three fields are null/zero for direct 24 kHz output. */
-    float *codec_pcm;
-    size_t codec_pcm_capacity;
+    float *detokenizer_pcm;
+    size_t detokenizer_pcm_capacity;
     LfmResamplerStream *resampler_stream;
 } LfmAudioRouteTarget;
 
@@ -148,7 +149,7 @@ int lfm_engine_audio_route_submit(
     const uint16_t *rope_cos, const uint16_t *rope_sin,
     size_t rope_elements, uint16_t *out_hidden, size_t hidden_elements,
     const LfmSamplerConfigV1 *audio_sampler, LfmPrngStateV1 *prng,
-    MimiDecodeState *mimi, const LfmAudioRouteTarget *target,
+    LfmAudioDetokenizerState *detokenizer, const LfmAudioRouteTarget *target,
     LfmAudioRouteResult *result, size_t lanes,
     const struct LfmTokenCommitRecord *commit,
     LfmAudioRouteNotify notify, void *notify_context,

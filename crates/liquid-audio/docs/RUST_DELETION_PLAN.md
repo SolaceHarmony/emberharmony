@@ -29,11 +29,11 @@ oracle is never a production fallback.
 
 | Area | Working-tree state | Remaining work |
 |---|---|---|
-| Main + codec weights | **Landed.** One byte-exact allocation, direct parallel positioned reads, component-scoped catalog, source handles closed, image page-table read-only after validation. | Keep real-checkpoint digest/load benchmarks as release gates. |
+| Main + LFM2.5 detokenizer weights | **Landed.** One byte-exact allocation, direct parallel positioned reads, component-scoped catalog, source handles closed, image page-table read-only after validation. | Keep real-checkpoint digest/load benchmarks as release gates. Mimi is a distinct future-Moshi component and is not loaded here. |
 | Typed binding | **Landed.** Exact BF16/F32 dtype, rank, shape, layer, codebook, and vocabulary checks; possibly unaligned tensors remain byte views. | None for LFM2. |
-| Weight consumption | **Landed.** Frontend, Conformer, backbone, Depthformer, and Mimi bind the same image; BF16 unlift occurs in registers. | `compatibility_copied_bytes == 0` remains an acceptance assertion. Its counters were **stubs returning a literal 0** (review 2026-07-16) — the gate could not fail; now wired to real per-plan tallies. See "Accounting is a tally, not a constant" below. |
-| Native model chain | **Landed for numerical ownership.** One typed, model-correlated `REQ_AUDIO_ENCODE` pass owns resample → valid-only BF16 frontend → whole Conformer/adapter over borrowed spans and pre-reserved conversation buffers. Modality assembly, M≤4 checkpoint-BF16 prefill, backbone, sampling, Depthformer, Mimi, and tokenizer are also native-owned. | No remaining numerical-stage ownership gap for LFM2. The coordinator-to-continuation scheduling cut is tracked in the conversation/session row. |
-| Conversation/session | **Landed.** Native KV/ShortConv/codec state, PRNG, cursor, recurrence, text/PCM tickets, reliable events, epochs, interrupt, stop, and join. Rust does not drive progress. A fixed route pool releases capacity between coarse nodes. The numerical bridge is a saved stackless frame with an exact CONTROL ticket; the final-team callback only resumes that frame on the shared kcoro pool. Route and supervisor services use the same pool, not private pthreads or a one-worker side runtime. Text and audio routes notify a coordinator-owned `SessionAction`, which collects the exact handle without a numerical wait. | Per-route state is still represented by fixed route records behind the broker; migrating each multi-hop route into its own reusable saved frame is the remaining coroutine-purity cut. Real V2.2 `BlockDomain` extraction is separate scheduler work. |
+| Weight consumption | **Landed.** Frontend, Conformer, backbone, Depthformer, and the released audio detokenizer bind the same image; BF16 unlift occurs in registers and detokenizer F32 views remain direct. | `compatibility_copied_bytes == 0` remains an acceptance assertion. Its counters were **stubs returning a literal 0** (review 2026-07-16) — the gate could not fail; now wired to real per-plan tallies. See "Accounting is a tally, not a constant" below. |
+| Native model chain | **Landed for numerical ownership.** One typed, model-correlated `REQ_AUDIO_ENCODE` pass owns resample → valid-only BF16 frontend → whole Conformer/adapter over borrowed spans and pre-reserved conversation buffers. Modality assembly, M≤4 checkpoint-BF16 prefill, backbone, sampling, Depthformer, released audio detokenizer, and tokenizer are also native-owned. | No remaining numerical-stage ownership gap for LFM2.5. Mimi remains isolated for future Moshi and has no LFM2.5 route. |
+| Conversation/session | **Landed.** Native KV/ShortConv/detokenizer state, PRNG, cursor, recurrence, text/PCM tickets, reliable events, epochs, interrupt, stop, and join. Rust does not drive progress. A fixed route pool releases capacity between coarse nodes. The numerical bridge is a saved stackless frame with an exact CONTROL ticket; the final-team callback only resumes that frame on the shared kcoro pool. Route and supervisor services use the same pool, not private pthreads or a one-worker side runtime. Text and audio routes notify a coordinator-owned `SessionAction`, which collects the exact handle without a numerical wait. | Per-route state is still represented by fixed route records behind the broker; migrating each multi-hop route into its own reusable saved frame is the remaining coroutine-purity cut. Real V2.2 `BlockDomain` extraction is separate scheduler work. |
 | Context rollover | **Landed.** Fixed capacity+runway BF16 state, monotonic cursor, absolute RoPE range generation, nonmutating whole-action admission, causal row-by-row eviction, and in-place compaction. | None for the activation-state sliding-window contract. |
 | Shared model | **Landed.** Per-conversation state/scratch and a fair model-owned expected-value pass gate; engine `-EBUSY` does not leak as scheduling policy. | Capacity-2 continuations may improve overlap; fairness is already correct. |
 | Production graph | **Landed.** Desktop creates `NativeVoiceModel` and opaque native conversations/sessions only; default dependencies do not enable Candle or Moshi. | Native Metal/MLX remains a separate future backend and must fail explicitly until mounted. |
@@ -46,7 +46,7 @@ oracle is never a production fallback.
 
 - `native/src/io/safetensors.cpp` opens and fingerprints all selected shards,
   computes checked 64-byte source bases, and allocates exactly one combined
-  main+codec image.
+  main+detokenizer image.
 - Up to four workers perform retrying 8 MiB positioned reads directly into
   disjoint final spans. There are no chunk allocations, payload staging buffers,
   payload zero-fill, or application payload `memcpy` calls. Only inter-source
@@ -63,22 +63,25 @@ oracle is never a production fallback.
 ### Direct native consumers
 
 - `LfmModel` is the sole image owner. Exact byte-addressed views bind embeddings,
-  every backbone layer, Conformer, Depthformer, and Mimi. No public production ABI
+  every backbone layer, Conformer, Depthformer, and the released audio
+  detokenizer. No public production ABI
   exposes names, shapes, weight pointers, mel rows, hidden rows, logits, KV, or
   codec codes.
 - BF16 checkpoint storage is not widened, aligned, transposed, packed, or copied.
   Architecture kernels load unaligned little-endian words and unlift them in
   registers; scalar tails use safe byte loads.
 - Formula-changing tables—RoPE, frontend/window/FFT, BatchNorm denominators, and
-  Mimi folds—are the only admitted derived storage and are accounted separately.
+  detokenizer inverse-DFT/RoPE tables—are the only admitted derived storage and
+  are accounted separately.
 - Frontend power aliases dead STFT real storage, valid mel writes the BF16
   Conformer destination, and Conformer writes the native prefill plane. Every
   eligible M≤4 backbone prefill projection now keeps its f32 accumulators inside
   the architecture leaf and publishes one exact-RNE BF16 result directly into
   the strided consumer plane. The former `bcxf`, `qkvf`, and `projf` planes are
-  deleted, saving `16 * (4h + qkv_max)` bytes per prefill workspace. Mimi
-  writes directly into a 24 kHz playback reservation when rates match; for the
-  48 kHz desktop dock it writes conversation-owned codec scratch and the same
+  deleted, saving `16 * (4h + qkv_max)` bytes per prefill workspace. The
+  LFM2.5 detokenizer writes directly into a 24 kHz playback reservation when
+  rates match; for the 48 kHz desktop dock it writes conversation-owned
+  detokenizer scratch and the same
   retained route stream-rate-converts directly into the device-rate reservation.
   Neither path performs a transport copy or returns numerical work to Rust.
 
@@ -92,16 +95,18 @@ returned a literal:
 - `lfm_conformer_materialized_weight_bytes(const LfmConformer *c) { (void)c; return 0; }`
 - `mimi_decode_plan_compatibility_copied_bytes(const MimiDecodePlan *) { return 0; }`
 
-`lfm_model.cpp` sums exactly those two, so `voice_session.cpp`'s
+The pre-detokenizer `lfm_model.cpp` summed exactly those two, so
+`voice_session.cpp`'s
 `if (memory.compatibility_copied_bytes != 0) reject` was dead code and
 `native_safetensors.rs`'s `assert_eq!(…, 0)` asserted a literal. A staging
 buffer, transpose, repack, or alignment copy could have been reintroduced — the
 exact thing the doctrine forbids — and every gate would have stayed green.
 
-Both are now real per-object tallies (`LfmConformer::materialized_weight_bytes`,
-`MimiDecodePlan::compatibility_copied_bytes`), sitting beside the tallies that
-were already real (`bound_weight_bytes`, `derived_bytes`). They still read 0,
-because nothing materializes a weight today — but now that is a *measurement*.
+The conformer and retained Mimi implementation now have real per-object tallies.
+The current LFM2.5 model accounting sums the conformer and
+`LfmAudioDetokenizerPlan::compatibility_copied_bytes`; all remain zero because
+nothing materializes a weight today—but now that is a measurement rather than
+a literal.
 No deliberately copying compatibility builder is retained merely to make the
 counter positive; doing so would preserve the forbidden implementation beside
 its replacement. The gate is therefore two-sided structurally: real-checkpoint
@@ -121,7 +126,8 @@ fact no author can forget to update.
 ### Native conversation and recurrence
 
 - `LfmConversation` owns fixed BF16 KV and ShortConv state, frontend/resampler/
-  Conformer/Mimi workspaces, bounded tokenizer storage, sampler PRNG, generation
+  Conformer/audio-detokenizer workspaces, bounded tokenizer storage, sampler
+  PRNG, generation
   cadence, context cursor, and epoch-sensitive state.
 - Text, PCM, and mixed text+PCM actions validate their complete row requirement
   without mutating the window before the first backbone pass. Eviction then occurs
@@ -129,7 +135,8 @@ fact no author can forget to update.
   first row. No caller supplies hidden geometry.
 - `LfmSession` owns bounded commands, ticket-correlated reliable text/terminal
   events, capture/playback leases, interruption epochs, stop, join, and the native
-  token → sample → Depthformer → Mimi recurrence loop. A stale pass may finish but
+  token → sample → Depthformer → audio-detokenizer recurrence loop. A stale
+  pass may finish but
   cannot publish.
 - Operations own no waiters. Producers publish exact edges; a suspended
   orchestration is a fixed stackless frame holding its program counter, locals,
@@ -161,8 +168,10 @@ fact no author can forget to update.
   only the hidden native `oracle-abi` conformance surface.
 - Unsupported native Metal and Moshi selections fail explicitly. There is no
   native/Candle, CPU/Metal, or model-version fallback chain.
-- The standalone file-owning Mimi parity decoder is deleted. Shipped Mimi can
-  bind only the codec component owned by `LfmModel`.
+- Native Mimi source remains build-checked for the future Moshi tranche and can
+  bind only the distinct `LFM_WEIGHT_COMPONENT_MIMI`. The LFM2.5 loader never
+  populates that component, constructs a Mimi plan/state, or exposes a Mimi
+  request. No fallback crosses this model boundary.
 
 ## Remaining LFM2 follow-ons
 
@@ -190,7 +199,8 @@ promotion chooses ready work, so a route does not retain either capacity-2
 compute slot across a node boundary.
 
 The C++ session coordinator owns one pooled `SessionAction`. Text uses a
-terminal single-node token route; audio uses token → Depthformer → Mimi. Both
+terminal single-node token route; audio uses token → Depthformer → released
+audio detokenizer. Both
 return after admission, ring the existing expected-value doorbell at terminal
 completion, and are collected by exact generation. No engine slot remains
 mounted while a route waits for playback or reliable-output capacity. One
@@ -226,7 +236,8 @@ offline/oracle-only and cannot serve as fallback.
   plus **146 liquid-audio tests**, with only the one-million calibration and two
   real-checkpoint gates ignored by default. The same default suites passed as
   x86_64 binaries under Rosetta. Both ignored real-checkpoint gates were then
-  invoked explicitly on a complete LFM2.5-Audio main-plus-Mimi image: model
+  invoked explicitly on a complete LFM2.5-Audio main-plus-detokenizer image:
+  model
   accounting passed, and the deterministic two-native-agent in-memory speech
   exchange passed twice inside one invocation.
 - On 2026-07-16, the focused default-graph aarch64 run passed **32 tests** with
@@ -244,7 +255,7 @@ offline/oracle-only and cannot serve as fallback.
 - `cargo check -p liquid-audio --no-default-features` passes. The default feature
   declaration does not enable Candle or Moshi.
 - The real-checkpoint `LFM_MODEL_DIR` gate is intentionally explicit. It checks
-  one complete main+Mimi lifecycle image and
+  one complete main+detokenizer lifecycle image and
   `compatibility_copied_bytes == 0`; reviews must not report it as run when the
   checkpoint is unavailable.
 - Stop, interruption, reliable-event saturation, capture/playback backpressure,

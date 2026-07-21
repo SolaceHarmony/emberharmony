@@ -57,7 +57,7 @@ int lfm_weights_open_owned(const char *path,
                            LfmWeightImage **out, char *error,
                            size_t error_length);
 int lfm_weights_open_bundle_owned(const char *main_path,
-                                  const char *codec_path,
+                                  const char *detokenizer_path,
                                   const LfmPayloadReadOwner *owner,
                                   LfmWeightImage **out, char *error,
                                   size_t error_length);

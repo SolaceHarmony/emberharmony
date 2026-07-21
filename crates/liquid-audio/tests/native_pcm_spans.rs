@@ -152,7 +152,7 @@ unsafe extern "C" {
         preprocessor_rate: u32,
         playback_rate: u32,
         out_preprocessor_rate: *mut u32,
-        out_codec_rate: *mut u32,
+        out_audio_output_rate: *mut u32,
         out_playback_frames: *mut u64,
         out_direct: *mut u32,
     ) -> c_int;
@@ -422,10 +422,10 @@ fn equal_rate_resampling_preserves_the_original_two_views() {
 }
 
 #[test]
-fn mimi_playback_rate_is_distinct_from_the_preprocessor_rate() {
-    for (device, frames, direct) in [(16_000, 2_560, 0), (24_000, 3_840, 1), (48_000, 7_680, 0)] {
+fn detokenizer_playback_rate_is_distinct_from_the_preprocessor_rate() {
+    for (device, frames, direct) in [(16_000, 1_280, 0), (24_000, 1_920, 1), (48_000, 3_840, 0)] {
         let mut preprocessor = 0;
-        let mut codec = 0;
+        let mut output_rate = 0;
         let mut actual = 0;
         let mut actual_direct = 0;
         assert_eq!(
@@ -434,7 +434,7 @@ fn mimi_playback_rate_is_distinct_from_the_preprocessor_rate() {
                     16_000,
                     device,
                     &mut preprocessor,
-                    &mut codec,
+                    &mut output_rate,
                     &mut actual,
                     &mut actual_direct,
                 )
@@ -442,15 +442,15 @@ fn mimi_playback_rate_is_distinct_from_the_preprocessor_rate() {
             0
         );
         assert_eq!(preprocessor, 16_000, "device={device}");
-        assert_eq!(codec, 24_000, "device={device}");
+        assert_eq!(output_rate, 24_000, "device={device}");
         assert_eq!(actual, frames, "device={device}");
         assert_eq!(actual_direct, direct, "device={device}");
     }
 }
 
 #[test]
-fn mimi_frames_keep_exact_duration_across_streaming_rate_boundaries() {
-    const CODEC_RATE: u64 = 24_000;
+fn detokenizer_frames_keep_exact_duration_across_streaming_rate_boundaries() {
+    const OUTPUT_RATE: u64 = 24_000;
     const FRAME: usize = 1_920;
     let samples = input(FRAME * 2);
 
@@ -458,7 +458,7 @@ fn mimi_frames_keep_exact_duration_across_streaming_rate_boundaries() {
         let mut stream = ptr::null_mut();
         assert_eq!(
             unsafe {
-                lfm_resampler_stream_create(CODEC_RATE as u32, device, FRAME as u64, &mut stream)
+                lfm_resampler_stream_create(OUTPUT_RATE as u32, device, FRAME as u64, &mut stream)
             },
             0
         );
@@ -498,7 +498,7 @@ fn mimi_frames_keep_exact_duration_across_streaming_rate_boundaries() {
         assert_eq!(
             unsafe {
                 lfm_resampler_stream_create(
-                    CODEC_RATE as u32,
+                    OUTPUT_RATE as u32,
                     device,
                     samples.len() as u64,
                     &mut whole_stream,
@@ -525,7 +525,7 @@ fn mimi_frames_keep_exact_duration_across_streaming_rate_boundaries() {
         assert_eq!(result.length, whole.len() as u64, "device={device}");
         assert_eq!(chunked, whole, "stream phase drift at device={device}");
         assert_eq!(
-            whole.len() as u64 * CODEC_RATE,
+            whole.len() as u64 * OUTPUT_RATE,
             samples.len() as u64 * u64::from(device),
             "duration drift at device={device}"
         );

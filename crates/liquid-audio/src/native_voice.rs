@@ -1365,8 +1365,8 @@ impl NativeLfm2VoiceEngine {
             session_id: 0,
             playback_slots: PLAYBACK_SLOTS,
             capture_max_callback_frames,
-            // Zero delegates model/codec/rate geometry to native readiness.
-            // Rust must not encode Mimi's frame capacity as model knowledge.
+            // Zero delegates model/output/rate geometry to native readiness.
+            // Rust must not encode detokenizer capacity as model knowledge.
             playback_frames_per_slot: 0,
             pcm_channels: 1,
             capture_sample_rate: capture_rate,

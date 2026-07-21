@@ -214,7 +214,7 @@ LFM_INTERNAL_API int lfm_resampler_process_spans(
 
 // Conversation-owned streaming band-limited rate converter. It uses the same
 // immutable sinc/Hann polyphase table as the offline path, causalized by a
-// fixed `width + reduced_input_rate - 1` source-sample group delay. For Mimi's
+// fixed `width + reduced_input_rate - 1` source-sample group delay. For the
 // 24 kHz -> 16 kHz path that is 12 source samples (8 device samples); its
 // 23-tap support reaches back 22 source samples, and the circular carry keeps
 // one additional sample for a phase-stride boundary. Chunk boundaries are

@@ -254,6 +254,14 @@ fn defines_symbol(symbols: &str, symbol: &str) -> bool {
 }
 
 #[cfg(all(not(feature = "oracle-abi"), target_os = "macos"))]
+fn references_symbol(symbols: &str, symbol: &str) -> bool {
+    let suffix = format!(" _{symbol}");
+    symbols
+        .lines()
+        .any(|line| line.ends_with(&suffix) && line.contains("(undefined)"))
+}
+
+#[cfg(all(not(feature = "oracle-abi"), target_os = "macos"))]
 fn default_native_definitions(symbols: &str) -> BTreeSet<String> {
     symbols
         .lines()
@@ -261,7 +269,7 @@ fn default_native_definitions(symbols: &str) -> BTreeSet<String> {
         .filter(|line| line.contains(") external _"))
         .filter(|line| !line.contains("private external"))
         .filter_map(|line| line.rsplit_once(" _").map(|(_, symbol)| symbol))
-        .filter(|symbol| symbol.starts_with("lfm_") || symbol.starts_with("mimi_"))
+        .filter(|symbol| symbol.starts_with("lfm_"))
         .map(str::to_owned)
         .collect()
 }
@@ -361,6 +369,20 @@ fn production_archives_keep_only_native_owner_lifecycle_private_external() {
         );
     }
 
+    let detokenizer = archive_symbols("liblfm_detokenizer.a");
+    for symbol in [
+        "lfm_detokenizer_plan_new_from_image",
+        "lfm_detokenizer_state_new",
+        "lfm_detokenizer_state_step",
+        "lfm_detokenizer_state_flush",
+        "lfm_detokenizer_state_reset",
+    ] {
+        assert!(
+            symbol_line(&detokenizer, symbol).contains("private external"),
+            "detokenizer numerical seam `{symbol}` is a default-visible export"
+        );
+    }
+
     let mimi = archive_symbols("liblfm_mimi.a");
     for symbol in [
         "mimi_decode_plan_new_from_image",
@@ -370,11 +392,26 @@ fn production_archives_keep_only_native_owner_lifecycle_private_external() {
     ] {
         assert!(
             symbol_line(&mimi, symbol).contains("private external"),
-            "Mimi numerical seam `{symbol}` is a default-visible export"
+            "future Moshi Mimi seam `{symbol}` is a default-visible export"
         );
     }
 
     let model = archive_symbols("liblfm_flashkern_engine.a");
+    assert!(
+        references_symbol(&model, "lfm_detokenizer_state_step"),
+        "released LFM2.5 archive does not reference its audio detokenizer"
+    );
+    for symbol in [
+        "mimi_decode_plan_new_from_image",
+        "mimi_decode_state_new",
+        "mimi_decode_state_step",
+        "mimi_decode_state_reset",
+    ] {
+        assert!(
+            !references_symbol(&model, symbol),
+            "released LFM2.5 archive still references future-Moshi seam `{symbol}`"
+        );
+    }
     for symbol in [
         "lfm_model_open",
         "lfm_model_info",
@@ -435,6 +472,7 @@ fn production_archives_keep_only_native_owner_lifecycle_private_external() {
         } else {
             "liblfm_flashkern_x86.a"
         },
+        "liblfm_detokenizer.a",
         "liblfm_mimi.a",
         "liblfm_safetensors.a",
     ];

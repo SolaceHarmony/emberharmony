@@ -1382,7 +1382,7 @@ static int mimi_plan_new_from_component(MimiDecodePlan **out,
 extern "C" int mimi_decode_plan_new_from_image(MimiDecodePlan **out,
                                                 const LfmWeightImage *image,
                                                 char *err, size_t errlen) {
-    return mimi_plan_new_from_component(out, image, LFM_WEIGHT_COMPONENT_CODEC,
+    return mimi_plan_new_from_component(out, image, LFM_WEIGHT_COMPONENT_MIMI,
                                         err, errlen);
 }
 

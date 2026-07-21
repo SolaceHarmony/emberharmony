@@ -171,7 +171,7 @@ extern "C" {
     ) -> i32;
     fn lfm_weights_open_bundle(
         main_path: *const c_char,
-        codec_path: *const c_char,
+        detokenizer_path: *const c_char,
         out: *mut *mut WeightImage,
         err: *mut c_char,
         errlen: usize,
@@ -230,83 +230,10 @@ extern "C" {
         weights_status: *mut i32,
         tokenizer_status: *mut i32,
     ) -> i32;
-    fn mimi_weight_load_f32(bytes: *const u8, index: u64) -> f32;
-    fn mimi_weight_gemv_f32(
-        weights: *const u8,
-        input: *const f32,
-        bias: *const u8,
-        output: *mut f32,
-        rows: i32,
-        cols: i32,
-    );
-    fn mimi_weight_gemv_rows_f32(
-        weights: *const u8,
-        input: *const f32,
-        bias: *const u8,
-        output: *mut f32,
-        row_begin: i32,
-        row_end: i32,
-        cols: i32,
-        accumulate: i32,
-    );
-    fn mimi_weight_gemv_span_f32(
-        weights: *const u8,
-        input: *const f32,
-        bias: *const u8,
-        output: *mut f32,
-        row_begin: i32,
-        row_end: i32,
-        cols: i32,
-    );
-    fn mimi_weight_gemv_scale_residual_rows_f32(
-        weights: *const u8,
-        input: *const f32,
-        scale: *const u8,
-        residual: *mut f32,
-        row_begin: i32,
-        row_end: i32,
-        cols: i32,
-    );
-    fn mimi_weight_gemm_f32(
-        weights: *const u8,
-        input: *const f32,
-        output: *mut f32,
-        rows: i32,
-        cols: i32,
-        width: i32,
-        beta: i32,
-    );
-    fn mimi_weight_gemm_tn_f32(
-        weights: *const u8,
-        input: *const f32,
-        output: *mut f32,
-        rows: i32,
-        cols: i32,
-        width: i32,
-    );
-    fn mimi_add_vec_f32(left: *const f32, right: *const f32, output: *mut f32, count: i32);
-    fn mimi_scale_vec_f32(input: *const f32, scale: *const f32, output: *mut f32, count: i32);
-    fn mimi_weight_scale_vec_f32(input: *const f32, scale: *const u8, output: *mut f32, count: i32);
-    fn mimi_layer_norm_f32(
-        input: *const f32,
-        weight: *const f32,
-        bias: *const f32,
-        output: *mut f32,
-        count: i32,
-        epsilon: f32,
-    );
-    fn mimi_weight_layer_norm_f32(
-        input: *const f32,
-        weight: *const u8,
-        bias: *const u8,
-        output: *mut f32,
-        count: i32,
-        epsilon: f32,
-    );
     fn lfm_bf16_unlift_bits(source_bytes: *const c_void) -> u32;
     fn lfm_internal_weights_open_bundle_benchmark(
         main_path: *const c_char,
-        codec_path: *const c_char,
+        detokenizer_path: *const c_char,
         workers: u32,
         uncached: u32,
         out: *mut *mut WeightImage,
@@ -746,13 +673,13 @@ fn published_image_is_process_read_only() {
 #[test]
 fn bundle_scopes_duplicate_names_and_uses_one_image() {
     const MAIN: u32 = 1;
-    const CODEC: u32 = 2;
+    const DETOKENIZER: u32 = 2;
 
     let temp = Temp::new();
     let main = temp.0.join("model.safetensors");
-    let codec = temp.0.join("tokenizer-e351c8d8-checkpoint125.safetensors");
+    let detokenizer = temp.0.join("audio_detokenizer.safetensors");
     let main_data = 1.25f32.to_le_bytes();
-    let codec_data = (-3.5f32).to_le_bytes();
+    let detokenizer_data = (-3.5f32).to_le_bytes();
     write_file(
         &main,
         &[Tensor {
@@ -763,24 +690,24 @@ fn bundle_scopes_duplicate_names_and_uses_one_image() {
         }],
     );
     write_file(
-        &codec,
+        &detokenizer,
         &[Tensor {
             name: "shared.weight",
             dtype: "F32",
             shape: &[1],
-            data: &codec_data,
+            data: &detokenizer_data,
         }],
     );
 
     let main_c = CString::new(main.as_os_str().as_encoded_bytes()).unwrap();
-    let codec_c = CString::new(codec.as_os_str().as_encoded_bytes()).unwrap();
+    let detokenizer_c = CString::new(detokenizer.as_os_str().as_encoded_bytes()).unwrap();
     let mut raw = std::ptr::null_mut();
     let mut err = [0i8; 512];
     assert_eq!(
         unsafe {
             lfm_weights_open_bundle(
                 main_c.as_ptr(),
-                codec_c.as_ptr(),
+                detokenizer_c.as_ptr(),
                 &mut raw,
                 err.as_mut_ptr(),
                 err.len(),
@@ -793,32 +720,37 @@ fn bundle_scopes_duplicate_names_and_uses_one_image() {
     let image = Image(raw);
     assert_eq!(unsafe { lfm_weights_count(image.0) }, 1);
     assert_eq!(unsafe { lfm_weights_component_count(image.0, MAIN) }, 1);
-    assert_eq!(unsafe { lfm_weights_component_count(image.0, CODEC) }, 1);
+    assert_eq!(
+        unsafe { lfm_weights_component_count(image.0, DETOKENIZER) },
+        1
+    );
 
     let name = CString::new("shared.weight").unwrap();
     let mut main_view = TensorView::default();
-    let mut codec_view = TensorView::default();
+    let mut detokenizer_view = TensorView::default();
     assert_eq!(
         unsafe { lfm_weights_find(image.0, name.as_ptr(), &mut main_view) },
         OK
     );
     assert_eq!(
-        unsafe { lfm_weights_find_component(image.0, CODEC, name.as_ptr(), &mut codec_view) },
+        unsafe {
+            lfm_weights_find_component(image.0, DETOKENIZER, name.as_ptr(), &mut detokenizer_view)
+        },
         OK
     );
-    assert_ne!(main_view.data, codec_view.data);
+    assert_ne!(main_view.data, detokenizer_view.data);
     assert_eq!(
         unsafe { std::slice::from_raw_parts(main_view.data.cast::<u8>(), 4) },
         main_data
     );
     assert_eq!(
-        unsafe { std::slice::from_raw_parts(codec_view.data.cast::<u8>(), 4) },
-        codec_data
+        unsafe { std::slice::from_raw_parts(detokenizer_view.data.cast::<u8>(), 4) },
+        detokenizer_data
     );
     let base = unsafe { lfm_weights_data(image.0) } as usize;
     let resident = unsafe { lfm_weights_resident_bytes(image.0) } as usize;
     assert!((main_view.data as usize) >= base);
-    assert!((codec_view.data as usize) < base + resident);
+    assert!((detokenizer_view.data as usize) < base + resident);
 
     let open_benchmark = |workers| {
         let mut raw = std::ptr::null_mut();
@@ -827,7 +759,7 @@ fn bundle_scopes_duplicate_names_and_uses_one_image() {
             unsafe {
                 lfm_internal_weights_open_bundle_benchmark(
                     main_c.as_ptr(),
-                    codec_c.as_ptr(),
+                    detokenizer_c.as_ptr(),
                     workers,
                     0,
                     &mut raw,
@@ -870,313 +802,6 @@ fn bundle_scopes_duplicate_names_and_uses_one_image() {
         )
     };
     assert_eq!(serial_bytes, parallel_bytes);
-}
-
-fn resident_f32(values: &[f32], skew: usize) -> (Vec<u8>, usize) {
-    assert!(skew <= 1);
-    let mut storage = vec![0xa5; values.len() * size_of::<f32>() + 8];
-    let base = storage.as_ptr() as usize;
-    let aligned = (size_of::<f32>() - base % size_of::<f32>()) % size_of::<f32>();
-    let offset = aligned + skew;
-    for (index, value) in values.iter().enumerate() {
-        let start = offset + index * size_of::<f32>();
-        storage[start..start + size_of::<f32>()].copy_from_slice(&value.to_le_bytes());
-    }
-    (storage, offset)
-}
-
-#[test]
-fn mimi_weight_leaves_read_aligned_and_unaligned_checkpoint_bytes_without_staging() {
-    for skew in [0usize, 1] {
-        let gemv_values = [1.0f32; 16]
-            .into_iter()
-            .chain([0.5f32; 16])
-            .collect::<Vec<_>>();
-        let (gemv_storage, gemv_offset) = resident_f32(&gemv_values, skew);
-        let gemv = unsafe { gemv_storage.as_ptr().add(gemv_offset) };
-        assert_eq!((gemv as usize) % size_of::<f32>(), skew);
-        for (index, expected) in gemv_values.iter().enumerate() {
-            assert_eq!(
-                unsafe { mimi_weight_load_f32(gemv, index as u64) }.to_bits(),
-                expected.to_bits()
-            );
-        }
-        let input = std::array::from_fn::<_, 16, _>(|index| (index + 1) as f32);
-        let (bias_storage, bias_offset) = resident_f32(&[1.0, -2.0], skew);
-        let bias = unsafe { bias_storage.as_ptr().add(bias_offset) };
-        let mut output = [0.0f32; 2];
-        unsafe { mimi_weight_gemv_f32(gemv, input.as_ptr(), bias, output.as_mut_ptr(), 2, 16) };
-        assert_eq!(output, [137.0, 66.0]);
-
-        // Disjoint output bands leave untouched rows alone and may accumulate
-        // a completed projection directly into its final destination. This is
-        // the Mimi quantizer's no-intermediate-plane seam.
-        let mut banded = [11.0f32, 13.0];
-        unsafe {
-            mimi_weight_gemv_rows_f32(gemv, input.as_ptr(), bias, banded.as_mut_ptr(), 1, 2, 16, 0);
-        }
-        assert_eq!(banded, [11.0, 66.0]);
-        unsafe {
-            mimi_weight_gemv_rows_f32(gemv, input.as_ptr(), bias, banded.as_mut_ptr(), 0, 2, 16, 1);
-        }
-        assert_eq!(banded, [148.0, 132.0]);
-
-        // A packed destination span keeps the original checkpoint row index
-        // (including its bias) but stores from destination row zero. This is
-        // the transformer's K/V ring-slot projection seam.
-        let mut span = [f32::NAN];
-        unsafe {
-            mimi_weight_gemv_span_f32(gemv, input.as_ptr(), bias, span.as_mut_ptr(), 1, 2, 16);
-        }
-        assert_eq!(span[0].to_bits(), output[1].to_bits());
-
-        // C[2,4] = W[2,4] * identity[4,4].
-        let matrix = [1.0f32, 2.0, 3.0, 4.0, -1.0, 0.0, 1.0, 2.0];
-        let (matrix_storage, matrix_offset) = resident_f32(&matrix, skew);
-        let weights = unsafe { matrix_storage.as_ptr().add(matrix_offset) };
-        let identity = [
-            1.0f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
-        ];
-        let mut product = [0.0f32; 8];
-        unsafe {
-            mimi_weight_gemm_f32(weights, identity.as_ptr(), product.as_mut_ptr(), 2, 4, 4, 0)
-        };
-        assert_eq!(product, matrix);
-
-        let pair_rhs = [1.0f32, 2.0, 3.0, 4.0, -1.0, 0.5, 2.0, -2.0];
-        let mut pair_product = [0.0f32; 4];
-        unsafe {
-            mimi_weight_gemm_f32(
-                weights,
-                pair_rhs.as_ptr(),
-                pair_product.as_mut_ptr(),
-                2,
-                4,
-                2,
-                0,
-            )
-        };
-        assert_eq!(pair_product, [12.0, 3.5, 2.0, -5.5]);
-
-        // C[4,2] = W[K=2,rows=4]^T * B[2,2]; n=2 exercises the hot
-        // row-vector transpose-GEMM path.
-        let transposed = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
-        let (tn_storage, tn_offset) = resident_f32(&transposed, skew);
-        let tn = unsafe { tn_storage.as_ptr().add(tn_offset) };
-        let rhs = [2.0f32, 3.0, -1.0, 4.0];
-        let mut tn_product = [0.0f32; 8];
-        unsafe { mimi_weight_gemm_tn_f32(tn, rhs.as_ptr(), tn_product.as_mut_ptr(), 4, 2, 2) };
-        assert_eq!(tn_product, [-3.0, 23.0, -2.0, 30.0, -1.0, 37.0, 0.0, 44.0]);
-
-        let scale = [1.0f32, -1.0, 0.5, 2.0, -2.0, 0.25, 4.0, 0.0];
-        let (scale_storage, scale_offset) = resident_f32(&scale, skew);
-        let scale_bytes = unsafe { scale_storage.as_ptr().add(scale_offset) };
-        let values = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
-        let mut expected_scale = [0.0f32; 8];
-        let mut got_scale = [0.0f32; 8];
-        unsafe {
-            mimi_scale_vec_f32(
-                values.as_ptr(),
-                scale.as_ptr(),
-                expected_scale.as_mut_ptr(),
-                8,
-            );
-            mimi_weight_scale_vec_f32(values.as_ptr(), scale_bytes, got_scale.as_mut_ptr(), 8);
-        }
-        assert_eq!(got_scale, expected_scale);
-
-        // The Transformer projection epilogue must be exactly the existing
-        // GEMV -> resident LayerScale -> residual-add sequence while storing
-        // no branch plane. Exercise a nonzero output-row band, a 16+tail K,
-        // deliberately unaligned W/scale views, residual-first NaN handling,
-        // signed zero, and untouched rows/guards.
-        const ROWS: usize = 6;
-        const COLS: usize = 19;
-        const BEGIN: usize = 1;
-        const END: usize = 5;
-        let mut fused_values = (0..ROWS * COLS)
-            .map(|index| {
-                let row = index / COLS;
-                if row == END - 1 {
-                    return 0.0;
-                }
-                let lane = ((index * 17 + 5) % 31) as i32 - 15;
-                lane as f32 * 0.03125
-            })
-            .collect::<Vec<_>>();
-        // Preserve a finite, deterministic K tail distinct from the SIMD body.
-        fused_values[BEGIN * COLS + COLS - 1] = -0.1875;
-        let (fused_storage, fused_offset) = resident_f32(&fused_values, skew);
-        let fused_weights = unsafe { fused_storage.as_ptr().add(fused_offset) };
-        let fused_input = std::array::from_fn::<_, COLS, _>(|index| {
-            let signed = index as i32 - 9;
-            signed as f32 * 0.0625
-        });
-        let fused_scales = [1.0f32, -0.5, 0.25, -2.0, -0.0, 0.75];
-        let (fused_scale_storage, fused_scale_offset) = resident_f32(&fused_scales, skew);
-        let fused_scale = unsafe { fused_scale_storage.as_ptr().add(fused_scale_offset) };
-        assert_eq!((fused_weights as usize) % size_of::<f32>(), skew);
-        assert_eq!((fused_scale as usize) % size_of::<f32>(), skew);
-
-        let guard_lo = f32::from_bits(0x4e12_3456);
-        let guard_hi = f32::from_bits(0xce65_4321);
-        let untouched_lo = f32::from_bits(0x3eaa_55aa);
-        let untouched_hi = f32::from_bits(0xbe55_aa55);
-        let nan = f32::from_bits(0x7fc1_2345);
-        let initial = [
-            guard_lo,
-            untouched_lo,
-            nan,
-            -0.0,
-            0.0,
-            -0.0,
-            untouched_hi,
-            guard_hi,
-        ];
-        let mut expected = initial;
-        let mut actual = initial;
-        let mut branch = [f32::from_bits(0x7fa5_5aa5); ROWS];
-        let expected_rows = unsafe { expected.as_mut_ptr().add(1) };
-        let actual_rows = unsafe { actual.as_mut_ptr().add(1) };
-        unsafe {
-            mimi_weight_gemv_rows_f32(
-                fused_weights,
-                fused_input.as_ptr(),
-                std::ptr::null(),
-                branch.as_mut_ptr(),
-                BEGIN as i32,
-                END as i32,
-                COLS as i32,
-                0,
-            );
-            mimi_weight_scale_vec_f32(
-                branch.as_ptr().add(BEGIN),
-                fused_scale.add(BEGIN * size_of::<f32>()),
-                branch.as_mut_ptr().add(BEGIN),
-                (END - BEGIN) as i32,
-            );
-            mimi_add_vec_f32(
-                expected_rows.add(BEGIN),
-                branch.as_ptr().add(BEGIN),
-                expected_rows.add(BEGIN),
-                (END - BEGIN) as i32,
-            );
-            mimi_weight_gemv_scale_residual_rows_f32(
-                fused_weights,
-                fused_input.as_ptr(),
-                fused_scale,
-                actual_rows,
-                BEGIN as i32,
-                END as i32,
-                COLS as i32,
-            );
-        }
-        assert_eq!(
-            actual.map(f32::to_bits),
-            expected.map(f32::to_bits),
-            "direct epilogue changed the established three-operation bits at skew {skew}"
-        );
-        assert_eq!(actual[0].to_bits(), guard_lo.to_bits());
-        assert_eq!(actual[1].to_bits(), untouched_lo.to_bits());
-        assert_eq!(actual[6].to_bits(), untouched_hi.to_bits());
-        assert_eq!(actual[7].to_bits(), guard_hi.to_bits());
-        assert_eq!(actual[2].to_bits(), nan.to_bits());
-        assert_eq!(actual[5].to_bits(), (-0.0f32).to_bits());
-
-        let norm_weight = [1.0f32, 0.5, -1.0, 2.0, 1.5, -0.5, 0.25, 3.0];
-        let norm_bias = [0.0f32, 1.0, -1.0, 0.5, -0.5, 2.0, 0.25, -2.0];
-        let (weight_storage, weight_offset) = resident_f32(&norm_weight, skew);
-        let (norm_bias_storage, norm_bias_offset) = resident_f32(&norm_bias, skew);
-        let weight_bytes = unsafe { weight_storage.as_ptr().add(weight_offset) };
-        let bias_bytes = unsafe { norm_bias_storage.as_ptr().add(norm_bias_offset) };
-        let mut expected_norm = [0.0f32; 8];
-        let mut got_norm = [0.0f32; 8];
-        unsafe {
-            mimi_layer_norm_f32(
-                values.as_ptr(),
-                norm_weight.as_ptr(),
-                norm_bias.as_ptr(),
-                expected_norm.as_mut_ptr(),
-                8,
-                1e-5,
-            );
-            mimi_weight_layer_norm_f32(
-                values.as_ptr(),
-                weight_bytes,
-                bias_bytes,
-                got_norm.as_mut_ptr(),
-                8,
-                1e-5,
-            );
-        }
-        assert_eq!(got_norm, expected_norm);
-    }
-}
-
-#[test]
-fn mimi_transformer_projection_uses_no_dedicated_staging_plane() {
-    let source = include_str!("../native/src/mimi/mimi_transformer.cpp");
-    assert!(source.contains("mimi_weight_gemv_span_f32"));
-    assert!(source.contains("mimi_weight_gemv_scale_residual_rows_f32"));
-    assert!(source.contains("prefix is Q/attention"));
-    assert!(!source.contains("float *qkv"));
-    assert!(!source.contains("float *q;"));
-    assert!(!source.contains("float *attn_cat"));
-    assert!(!source.contains("float *branch"));
-    assert!(!source.contains("memcpy(L->k_ring"));
-    assert!(!source.contains("memcpy(L->v_ring"));
-}
-
-#[test]
-fn mimi_decode_reuses_the_latent_plane_and_right_sizes_quant_output() {
-    let source = include_str!("../native/src/mimi/mimi_decode.cpp");
-    assert!(source.contains("mimi_arena_alloc(&state->arena, (size_t)MIMI_DIM * sizeof(float))"));
-    assert!(source.contains("mimi_transformer_step(d->transformer, d->up_buf, n_up, d->up_buf)"));
-    assert!(source.contains("mimi_seanet_step(d->seanet, d->up_buf, n_tr, pcm_out)"));
-    assert!(!source.contains("float *tr_buf"));
-}
-
-#[test]
-fn mimi_checkpoint_weights_never_become_typed_float_pointers() {
-    for (name, source) in [
-        (
-            "mimi_decode.cpp",
-            include_str!("../native/src/mimi/mimi_decode.cpp"),
-        ),
-        (
-            "mimi_conv.cpp",
-            include_str!("../native/src/mimi/mimi_conv.cpp"),
-        ),
-        (
-            "mimi_quant.cpp",
-            include_str!("../native/src/mimi/mimi_quant.cpp"),
-        ),
-        (
-            "mimi_seanet.cpp",
-            include_str!("../native/src/mimi/mimi_seanet.cpp"),
-        ),
-        (
-            "mimi_transformer.cpp",
-            include_str!("../native/src/mimi/mimi_transformer.cpp"),
-        ),
-        (
-            "mimi_kernel.h",
-            include_str!("../native/src/mimi/mimi_kernel.h"),
-        ),
-    ] {
-        for forbidden in [
-            "mimi_aligned_f32",
-            "reinterpret_cast<const float",
-            "static_cast<const float",
-            "(const float *)",
-            "(const float*)",
-        ] {
-            assert!(
-                !source.contains(forbidden),
-                "{name} creates a typed checkpoint pointer via `{forbidden}`"
-            );
-        }
-    }
 }
 
 #[test]
@@ -1722,8 +1347,8 @@ fn conversation_readiness_seal_rejects_numerical_reallocation_before_mutation() 
     assert_eq!(rejected.post_readiness_allocation_attempts, 3);
     assert_eq!(
         rejected.post_readiness_allocation_bytes,
-        53_760,
-        "logical bytes must cover 6,400-frame growth, 3,200-frame capture-plan replacement, and one 24 kHz Mimi playback plane"
+        46_080,
+        "logical bytes must cover 6,400-frame growth, 3,200-frame capture-plan replacement, and one 24 kHz detokenizer playback plane"
     );
 }
 
@@ -1858,7 +1483,7 @@ fn model_owned_index_read_is_counted_without_posthoc_loader_summation() {
 }
 
 #[test]
-#[ignore = "requires LFM_MODEL_DIR and the complete LFM2-Audio plus Mimi checkpoint"]
+#[ignore = "requires LFM_MODEL_DIR and its released audio_detokenizer component"]
 fn complete_runtime_model_reports_lifecycle_only_memory_accounting() {
     let dir = PathBuf::from(
         std::env::var_os("LFM_MODEL_DIR")

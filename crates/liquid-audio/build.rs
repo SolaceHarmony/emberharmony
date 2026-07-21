@@ -26,7 +26,7 @@ fn main() {
         );
     }
 
-    // Accelerate is a macOS fact, not an aarch64 fact: the Mimi kernel calls
+    // Accelerate is a macOS fact, not an aarch64 fact: native dense kernels call
     // cblas under __APPLE__ on BOTH arches (review P1: an x86_64-apple-darwin
     // link dies on cblas_sgemm$NEWLAPACK with this directive inside the arm
     // branch only).
@@ -125,6 +125,7 @@ fn main() {
     println!("cargo::rerun-if-changed=native/include/lfm_model.h");
     println!("cargo::rerun-if-changed=native/include/lfm_model_plan.h");
     println!("cargo::rerun-if-changed=native/include/lfm_mimi.h");
+    println!("cargo::rerun-if-changed=native/include/lfm_detokenizer.h");
     println!("cargo::rerun-if-changed=../kcoro-sys/vendor/kcoro_arena/include");
     // C++23, not a style choice: this TU includes kcoro headers, and C++23 is
     // the FIRST standard that requires <stdatomic.h> to work in C++ and expose
@@ -152,6 +153,27 @@ fn main() {
         engine.define("LFM_BUILD_ORACLE", None);
     }
     engine.compile("lfm_flashkern_engine");
+
+    // Released LFM2.5 audio output path. The submodel consumes the Detokenizer
+    // component of the same sealed resident image and keeps only causal state,
+    // a bounded liveness arena, and ISTFT overlap per conversation. Its six-row
+    // dense stages ride Accelerate/AMX on Apple; no checkpoint weight is moved.
+    println!("cargo::rerun-if-changed=native/src/detokenizer/lfm_detokenizer.cpp");
+    let mut detokenizer = cc::Build::new();
+    detokenizer
+        .file("native/src/detokenizer/lfm_detokenizer.cpp")
+        .cpp(true)
+        .std("c++23")
+        .opt_level(3)
+        .warnings(true)
+        .warnings_into_errors(true)
+        .flag("-ffp-contract=off")
+        .flag_if_supported("-fvisibility=hidden")
+        .include("native/include");
+    if oracle {
+        detokenizer.define("LFM_BUILD_ORACLE", None);
+    }
+    detokenizer.compile("lfm_detokenizer");
 
     // Private Rust-kcoro/native docking leaf. The C++ translation unit owns the
     // ring atomics and expected-value doorbells; the C anchor makes header
@@ -184,7 +206,7 @@ fn main() {
 
     // Native audio frontend: torchaudio-exact resampler + NeMo mel featurizer.
     // Table build is init-time f64; hot loops live in flashkern_frontend.S; the
-    // matmul-shaped stages ride Accelerate on Apple (mimi_decode.cpp pattern).
+    // Matmul-shaped stages ride Accelerate on Apple.
     // -ffp-contract=off is LOAD-BEARING: the parity fixtures were captured from
     // uncontracted Rust ops.
     println!("cargo::rerun-if-changed=native/include/lfm_frontend.h");
@@ -350,11 +372,11 @@ fn main() {
         kern.compile("lfm_flashkern_neon");
     }
 
-    // The native Mimi decode kernel (docs/MIMI_PORT.md): the streaming path
-    // owns its sole RotatingKvCache inside mimi_transformer.cpp.
-    // -ffp-contract=off is LOAD-BEARING here:
-    // the scalar parity siblings are only oracles of the Rust reference if
-    // clang can't contract a*b+c into fma (rustc never does).
+    // Isolated native Mimi implementation retained for the future Moshi
+    // model tranche. LFM2.5 has no route to this archive and its loader never
+    // publishes a MIMI component; released LFM2.5 output is the detokenizer
+    // above. Keeping the archive buildable prevents the future codec from
+    // decaying without making it a fallback.
     println!("cargo::rerun-if-changed=native/src/mimi");
     let mut mimi = cc::Build::new();
     mimi.files([
@@ -373,18 +395,14 @@ fn main() {
         .include("native/include")
         .include("native/src/mimi");
     if oracle {
-        // The from-file Mimi wrapper deliberately owns a second checkpoint
-        // image and exists only for offline Candle/Moshi parity. Never put
-        // that duplicate-loader route in the production native archive.
         mimi.define("LFM_BUILD_ORACLE", None);
     }
     mimi.compile("lfm_mimi");
 
     // Native checkpoint ownership: whole safetensors shards are read directly
-    // into one aligned resident image, then exposed as immutable tensor views.
-    // Build this archive after Mimi because the oracle-only from-file parity
-    // constructor calls into it (static archive consumers precede providers on
-    // GNU ld). Production Mimi receives the lifecycle-owned image directly.
+    // into one aligned resident image, then exposed as immutable byte views.
+    // Static archive consumers precede this provider on GNU ld: the released
+    // detokenizer and main model both bind this one lifecycle-owned image.
     println!("cargo::rerun-if-changed=native/src/io/safetensors.cpp");
     println!("cargo::rerun-if-changed=native/src/model/lfm_payload_reader.h");
     println!("cargo::rerun-if-changed=native/include/lfm_safetensors.h");

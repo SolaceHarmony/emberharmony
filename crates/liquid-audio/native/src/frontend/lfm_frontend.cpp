@@ -3,11 +3,11 @@
 // for the parity oracle (captured from the deleted Rust owners at e018540c).
 //
 // Layering: this TU builds immutable tables at create (f64 math, run once, the
-// same init-time class as Mimi's weight folding), owns pass layout (framing,
+// same init-time class as other formula-derived plan tables), owns pass layout (framing,
 // masks, pads), and routes every hot value-producing loop to an architecture
 // assembly leaf in flashkern_frontend.S. The two matmul-shaped stages ride
 // Accelerate cblas on Apple and the scalar reference path elsewhere — the same
-// guard mimi_decode.cpp ships.
+// guard the released native audio path ships.
 //
 // Faithful-port notes (final outputs are fixture-gated; the committed
 // intermediate/table captures still need their own direct-observation gate):

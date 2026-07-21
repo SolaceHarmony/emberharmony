@@ -14,7 +14,7 @@
 #define LFM_MODEL_CAP_DEPTHFORMER 1u
 #define LFM_MODEL_CAP_FRONTEND 2u
 #define LFM_MODEL_CAP_CONFORMER 4u
-#define LFM_MODEL_CAP_MIMI 8u
+#define LFM_MODEL_CAP_DETOKENIZER 8u
 #define LFM_INPUT_MAX_IDS 8u
 #define LFM_AUDIO_TOKEN_CAPACITY 64u
 
@@ -84,7 +84,7 @@ struct LfmNativeEmission {
     uint32_t codes[LFM_AUDIO_TOKEN_CAPACITY];
 };
 
-struct MimiDecodeState;
+struct LfmAudioDetokenizerState;
 
 struct LfmContextWindowMove {
     uint64_t dropped;

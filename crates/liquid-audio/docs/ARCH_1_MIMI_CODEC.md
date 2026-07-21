@@ -1,5 +1,12 @@
 # Architecture 1 — The Mimi Codec
 
+> **Current product boundary:** Mimi remains a native codec implementation for
+> the future Moshi tranche. Released LFM2.5 uses its required
+> `audio_detokenizer/` graph and has no Mimi loader, request, state, or fallback.
+> Sections below preserve upstream and former Rust-port archaeology; current
+> native ownership is specified by `MIMI_PORT.md` and
+> `AUDIO_DETOKENIZER_PORT.md`.
+
 Scope: what Mimi *is*, how it's built and loaded, the encode/decode signal path, its
 device/CUDA story, and the exact Python→Rust mapping. Hand-traced from the source
 (`upstream-liquid-audio/src/liquid_audio/...` and `liquid-audio-rs/...`), not summarized.
@@ -25,8 +32,9 @@ processor (`processor.py`) exposes **two independent audio-out facilities**:
    the model's audio vocabulary.*
 2. **Audio-OUT decode in the demo** — `demo/chat.py:34` `mimi.decode(t[None,:,None])`
    turns each generated 8-code frame back into 24 kHz audio, inside `mimi.streaming(1)`.
-3. **Audio-OUT decode fallback** — when a model ships no `audio_detokenizer/` weights
-   (the local `model/` tree), the codec is the only vocoder available.
+3. **Historical upstream fallback** — older processor/client paths used Mimi
+   when a model shipped no `audio_detokenizer/` weights. The native product
+   deliberately does not preserve this cross-model fallback.
 4. **NOT audio-IN.** Mic audio entering the model goes through the **conformer mel
    front-end** (`processor.py:226-250`), never Mimi. Mimi-encode is only for building
    `audio_out` *targets*, not for feeding the model's *input*.
@@ -183,13 +191,14 @@ where only `MimiModel` exposes `encode`); `decode_step` defaults to one-shot.
 
 The model never sees waveforms on the output side — it emits **8-codebook frames**
 (`audio frame (8,)`, values `[0,2048]`, where `2048` = EOAudio). Those frames are
-*exactly* Mimi's `(B,8,T)` code layout (one frame = one timestep column). The codec is
-the bridge at both ends of training and at the output end of inference:
+compatible with Mimi's `(B,8,T)` code layout (one frame = one timestep column).
+Mimi defines the training/older-codec side of that vocabulary; released LFM2.5
+inference uses its separately trained audio detokenizer:
 
 ```
   training:  reference wav ──mimi.encode──► audio_out codes (8,L) ──► model targets
-  inference: model audio head ──► frame (8,) ──mimi.decode(stream)──► wav (1,1920)@24k
-                                              └─ or ─ LFM2 detok (codes→ISTFT→wav)
+  LFM2.5:    model audio head ──► frame (8,) ──audio detokenizer──► wav @24k
+  Moshi:     future native Moshi route ────────mimi.decode───────► wav @24k
 ```
 
 The semantic codebook (index 0, `rvq_first`) is why LFM2-Audio's audio loss upweights

@@ -56,7 +56,7 @@
 #include "../model/lfm_conformer_program.h"
 #include "lfm_frontend.h"
 #include "lfm_kernel_bridge.h"
-#include "lfm_mimi.h"
+#include "lfm_detokenizer.h"
 #include "lfm_model_plan.h"
 #include "../model/lfm_route_epoch.h"
 
@@ -259,11 +259,11 @@ enum : int {
     // sampler, and sampled-embedding recurrence under one native ticket.
     REQ_DEPTH_FRAME = 8,
     REQ_PREFILL = 13,
-    // One conversation-owned Mimi state step writes directly into a retained
+    // One conversation-owned detokenizer state step writes directly into a retained
     // playback reservation. Lane 0 runs the stateful graph while peer members
     // return from the same generation; codec work therefore shares SQ/CQ
     // ordering and cannot oversubscribe the backbone/Depthformer executor.
-    REQ_MIMI_DECODE = 14,
+    REQ_AUDIO_DETOKENIZE = 14,
     // One retained PCM view through prepared resample, frontend, and Conformer
     // workspaces. Conformer GEMMs are fixed-team substages of this ticket and
     // never recurse through the bridge.
@@ -277,7 +277,7 @@ static constexpr bool request_kind_valid(uint32_t kind) {
     case REQ_TOKEN_PASS:
     case REQ_DEPTH_FRAME:
     case REQ_PREFILL:
-    case REQ_MIMI_DECODE:
+    case REQ_AUDIO_DETOKENIZE:
     case REQ_AUDIO_ENCODE:
         return true;
     default:
@@ -538,15 +538,16 @@ struct PrefillReq {
     size_t lanes = 0;
 };
 
-struct MimiReq {
-    MimiDecodeState *state = nullptr;
+struct DetokenizerReq {
+    LfmAudioDetokenizerState *state = nullptr;
     const uint32_t *codes = nullptr;
     float *pcm = nullptr;
     size_t capacity = 0;
-    float *codec_pcm = nullptr;
-    size_t codec_capacity = 0;
+    float *detokenizer_pcm = nullptr;
+    size_t detokenizer_capacity = 0;
     LfmResamplerStream *resampler_stream = nullptr;
     size_t *out_samples = nullptr;
+    bool flush = false;
     int completion_status = 0; // private deterministic route-fault seam
 };
 
@@ -659,7 +660,7 @@ struct alignas(ENGINE_CACHELINE) PassSlot {
     TokenReq tok;
     TokenProgram token_program{};
     PrefillReq prefill;
-    MimiReq mimi;
+    DetokenizerReq detokenizer;
     AudioReq audio;
     ScratchBank scratch;
 };
@@ -1104,7 +1105,7 @@ struct Engine {
     std::atomic<uint64_t> route_admission_deferrals{0};
     std::atomic<uint64_t> audio_encode_passes{0};
     std::atomic<int> test_audio_route_depth_status{0};
-    std::atomic<int> test_audio_route_mimi_status{0};
+    std::atomic<int> test_audio_route_detokenizer_status{0};
 
     ConvReq conv;  // conv-layer request payload
     AttnReq attn;  // attention-layer request payload
@@ -1120,7 +1121,7 @@ struct Engine {
     BackbonePlan *model = nullptr;
     uint64_t model_seq = 0;
     TokenReq tok; // token-pass request payload
-    MimiReq mimi;
+    DetokenizerReq detokenizer;
 
     // Persistent scratch backing is sized before numerical admission and is
     // swapped with the active ticket's private activation bank.
@@ -1255,7 +1256,7 @@ static void clear_slot_request(PassSlot *slot) {
     slot->tok = {};
     slot->token_program = {};
     slot->prefill = {};
-    slot->mimi = {};
+    slot->detokenizer = {};
     slot->audio = {};
 }
 
@@ -1371,7 +1372,7 @@ static void activate_slot(Engine *e, PassSlot *slot) {
     e->depth_req = slot->depth_req;
     e->gemm = slot->gemm;
     e->tok = slot->tok;
-    e->mimi = slot->mimi;
+    e->detokenizer = slot->detokenizer;
     e->pass_view = &e->pass;
     e->sc_view = &e->sc;
     e->at_view = &e->at;
@@ -3864,37 +3865,51 @@ static void lane_program(Engine *e, uint32_t lane) {
     case REQ_DEPTH_FRAME:
         run_depth_program_stage(e, lane, e->active_slot);
         break;
-    case REQ_MIMI_DECODE:
+    case REQ_AUDIO_DETOKENIZE:
         if (lane == 0) {
-            float *decode_pcm = e->mimi.resampler_stream
-                                    ? e->mimi.codec_pcm
-                                    : e->mimi.pcm;
-            const int samples = e->mimi.completion_status != 0
-                                    ? e->mimi.completion_status
-                                    : mimi_decode_state_step(
-                                          e->mimi.state, e->mimi.codes,
-                                          decode_pcm);
-            if (samples < 0) {
-                e->active_status.store(samples, std::memory_order_release);
-            } else if (static_cast<size_t>(samples) >
-                       (e->mimi.resampler_stream ? e->mimi.codec_capacity
-                                                 : e->mimi.capacity)) {
+            DetokenizerReq &request = e->detokenizer;
+            float *decode_pcm = request.resampler_stream
+                                    ? request.detokenizer_pcm
+                                    : request.pcm;
+            size_t samples = 0;
+            const int status = request.completion_status != 0
+                ? request.completion_status
+                : (request.flush
+                       ? lfm_detokenizer_state_flush(
+                             request.state, decode_pcm,
+                             request.resampler_stream
+                                 ? request.detokenizer_capacity
+                                                      : request.capacity,
+                             &samples)
+                       : lfm_detokenizer_state_step(
+                             request.state, request.codes, decode_pcm,
+                             request.resampler_stream
+                                 ? request.detokenizer_capacity
+                                 : request.capacity,
+                             &samples));
+            if (status != 0) {
+                e->active_status.store(status, std::memory_order_release);
+            } else if (samples >
+                       (request.resampler_stream
+                            ? request.detokenizer_capacity
+                            : request.capacity)) {
                 e->active_status.store(-EOVERFLOW, std::memory_order_release);
-            } else if (e->mimi.resampler_stream) {
+            } else if (request.resampler_stream) {
                 LfmF32Span span{};
-                const int status = lfm_resampler_stream_process(
-                    e->mimi.resampler_stream, decode_pcm,
-                    static_cast<size_t>(samples), e->mimi.pcm,
-                    e->mimi.capacity, &span);
-                if (status != 0 || span.data != e->mimi.pcm ||
-                    span.length > e->mimi.capacity) {
-                    e->active_status.store(status != 0 ? status : -EFAULT,
+                const int resample_status = lfm_resampler_stream_process(
+                    request.resampler_stream, decode_pcm, samples, request.pcm,
+                    request.capacity, &span);
+                if (resample_status != 0 || span.data != request.pcm ||
+                    span.length > request.capacity) {
+                    e->active_status.store(resample_status != 0
+                                               ? resample_status
+                                               : -EFAULT,
                                            std::memory_order_release);
                 } else {
-                    *e->mimi.out_samples = static_cast<size_t>(span.length);
+                    *request.out_samples = static_cast<size_t>(span.length);
                 }
             } else {
-                *e->mimi.out_samples = static_cast<size_t>(samples);
+                *request.out_samples = samples;
             }
         }
         break;
@@ -3987,9 +4002,9 @@ static TeamWorkDescriptor describe_active_generation(const Engine *e) {
         work.shape1 = slot.depth ? slot.depth->codebooks : 0;
         work.shape2 = slot.depth ? slot.depth->layers.size() : 0;
         break;
-    case REQ_MIMI_DECODE:
-        work.shape0 = slot.mimi.capacity;
-        work.shape1 = slot.mimi.codec_capacity;
+    case REQ_AUDIO_DETOKENIZE:
+        work.shape0 = slot.detokenizer.capacity;
+        work.shape1 = slot.detokenizer.detokenizer_capacity;
         break;
     case REQ_AUDIO_ENCODE:
         work.program_kind = slot.audio.phase;
@@ -4018,7 +4033,7 @@ static uint64_t team_hard_budget_ns(bool hard_timeout_probe,
     case REQ_TOKEN_PASS:
     case REQ_DEPTH_FRAME:
     case REQ_PREFILL:
-    case REQ_MIMI_DECODE:
+    case REQ_AUDIO_DETOKENIZE:
     case REQ_AUDIO_ENCODE:
         return 0;
     default:
@@ -4542,7 +4557,7 @@ static bool bridge_step_once(Engine *e) {
         case REQ_ATTN_LAYER:
         case REQ_TOKEN_PASS:
         case REQ_PREFILL:
-        case REQ_MIMI_DECODE:
+        case REQ_AUDIO_DETOKENIZE:
             valid = slot->model &&
                     submission.conversation_id == slot->model->id &&
                     submission.epoch == slot->model->id;
@@ -4750,7 +4765,7 @@ static bool release_continuation(PassContinuationPermit *permit) {
 enum : uint32_t {
     AUDIO_ROUTE_TOKEN = 0,
     AUDIO_ROUTE_DEPTH = 1,
-    AUDIO_ROUTE_MIMI = 2,
+    AUDIO_ROUTE_DETOKENIZER = 2,
     AUDIO_ROUTE_NODE_COUNT = 3,
 };
 enum : uint32_t {
@@ -4764,7 +4779,7 @@ enum : uint32_t {
     AUDIO_ROUTE_TERMINAL = AUDIO_ROUTE_NODE_COUNT,
 };
 enum : uint32_t {
-    AUDIO_TOKEN_CODEC = 0,
+    AUDIO_TOKEN_VALUE = 0,
     AUDIO_TOKEN_END = 1,
     AUDIO_TOKEN_INVALID = 2,
 };
@@ -4789,8 +4804,8 @@ static constexpr std::array<std::array<uint8_t, AUDIO_ROUTE_OUTCOME_COUNT>,
     AUDIO_ROUTE_TABLE = {{
         {{AUDIO_ROUTE_DEPTH, AUDIO_ROUTE_TERMINAL, AUDIO_ROUTE_TERMINAL,
           AUDIO_ROUTE_TERMINAL}},
-        {{AUDIO_ROUTE_MIMI, AUDIO_ROUTE_TERMINAL, AUDIO_ROUTE_TERMINAL,
-          AUDIO_ROUTE_TERMINAL}},
+        {{AUDIO_ROUTE_DETOKENIZER, AUDIO_ROUTE_TERMINAL,
+          AUDIO_ROUTE_DETOKENIZER, AUDIO_ROUTE_TERMINAL}},
         {{AUDIO_ROUTE_TERMINAL, AUDIO_ROUTE_TERMINAL, AUDIO_ROUTE_TERMINAL,
           AUDIO_ROUTE_TERMINAL}},
     }};
@@ -4808,8 +4823,8 @@ static bool audio_route_next(uint32_t node, uint32_t outcome,
 }
 
 static uint32_t audio_token_class(uint32_t token) {
-    if (token < LFM_MIMI_CODE_VALUES) return AUDIO_TOKEN_CODEC;
-    if (token == LFM_MIMI_CODE_VALUES) return AUDIO_TOKEN_END;
+    if (token < LFM_DETOKENIZER_CODE_VALUES) return AUDIO_TOKEN_VALUE;
+    if (token == LFM_DETOKENIZER_CODE_VALUES) return AUDIO_TOKEN_END;
     return AUDIO_TOKEN_INVALID;
 }
 
@@ -4831,14 +4846,14 @@ struct AudioRouteInstance {
     PrefillReq prefill_req{};
     AudioReq audio_req{};
     uint64_t *adapted_values = nullptr;
-    MimiReq mimi_req{};
+    DetokenizerReq detokenizer_req{};
     const LfmRouteEpoch *epoch = nullptr;
     uint64_t expected_epoch = 0;
     LfmAudioRouteResult *result = nullptr;
     LfmAudioRouteNotify notify = nullptr;
     void *notify_context = nullptr;
     bool terminal_after_token = false;
-    bool decode_mimi = false;
+    bool decode_detokenizer = false;
     LfmTokenCommitRecord commit{};
     uint32_t *token_completed = nullptr;
     int status = -EINPROGRESS;
@@ -4939,18 +4954,19 @@ static void continue_audio_route(PassContinuationPermit *permit,
             finish_audio_route(permit, route, 0);
             return;
         }
-        if (route->decode_mimi &&
+        if (route->decode_detokenizer &&
             route->epoch->load(std::memory_order_acquire) !=
                 route->expected_epoch) {
             outcome = AUDIO_ROUTE_STALE;
         }
     } else if (completion.status == 0 && route->node == AUDIO_ROUTE_DEPTH &&
-               route->decode_mimi) {
+               route->decode_detokenizer) {
         route->result->depth_completed = 1;
         const uint32_t first_class =
             audio_token_class(route->result->codes[0]);
         if (first_class == AUDIO_TOKEN_END) {
             route->result->eoaudio = 1;
+            route->detokenizer_req.flush = true;
             outcome = AUDIO_ROUTE_EOAUDIO;
         } else if (first_class == AUDIO_TOKEN_INVALID) {
             finish_audio_route(permit, route, -ERANGE);
@@ -4959,17 +4975,18 @@ static void continue_audio_route(PassContinuationPermit *permit,
                    route->expected_epoch) {
             outcome = AUDIO_ROUTE_STALE;
         } else {
-            for (size_t index = 0; index < LFM_MIMI_CODEBOOKS; ++index) {
+            for (size_t index = 0; index < LFM_DETOKENIZER_CODEBOOKS; ++index) {
                 if (audio_token_class(route->result->codes[index]) !=
-                    AUDIO_TOKEN_CODEC) {
+                    AUDIO_TOKEN_VALUE) {
                     finish_audio_route(permit, route, -ERANGE);
                     return;
                 }
             }
         }
-    } else if (completion.status == 0 && route->node == AUDIO_ROUTE_MIMI &&
-               route->decode_mimi) {
-        route->result->mimi_completed = 1;
+    } else if (completion.status == 0 &&
+               route->node == AUDIO_ROUTE_DETOKENIZER &&
+               route->decode_detokenizer) {
+        route->result->detokenizer_completed = 1;
         if (route->epoch->load(std::memory_order_acquire) !=
             route->expected_epoch) {
             outcome = AUDIO_ROUTE_STALE;
@@ -4993,13 +5010,10 @@ static void continue_audio_route(PassContinuationPermit *permit,
         finish_audio_route(permit, route, -ESTALE);
         return;
     }
-    if (outcome == AUDIO_ROUTE_EOAUDIO) {
-        finish_audio_route(permit, route, 0);
-        return;
-    }
-    /* A codes-only route terminates after Depth; only a playback reservation
-     * adds the Mimi publication node. */
-    if (!route->decode_mimi && route->node == AUDIO_ROUTE_DEPTH) {
+    /* A codes-only route terminates after Depth. A playback route sends both a
+     * normal code frame and EOAudio through the detokenizer: EOAudio flushes
+     * the final same-padding overlap instead of manufacturing another code. */
+    if (!route->decode_detokenizer && route->node == AUDIO_ROUTE_DEPTH) {
         finish_audio_route(permit, route, 0);
         return;
     }
@@ -5010,9 +5024,11 @@ static void continue_audio_route(PassContinuationPermit *permit,
     if (route->node == AUDIO_ROUTE_TOKEN && target == AUDIO_ROUTE_DEPTH &&
         route->depth && route->depth_id != 0) {
         route->node = AUDIO_ROUTE_DEPTH;
-    } else if (route->node == AUDIO_ROUTE_DEPTH && target == AUDIO_ROUTE_MIMI &&
-               route->decode_mimi && route->model && route->model_id != 0) {
-        route->node = AUDIO_ROUTE_MIMI;
+    } else if (route->node == AUDIO_ROUTE_DEPTH &&
+               target == AUDIO_ROUTE_DETOKENIZER &&
+               route->decode_detokenizer && route->model &&
+               route->model_id != 0) {
+        route->node = AUDIO_ROUTE_DETOKENIZER;
     } else {
         finish_audio_route(permit, route, -EPROTO);
         return;
@@ -5224,10 +5240,11 @@ static int mount_audio_route(PassSlot *slot, AudioRouteInstance *route,
         *context = route->depth_id;
         return 0;
     }
-    if (route->node == AUDIO_ROUTE_MIMI && route->decode_mimi) {
+    if (route->node == AUDIO_ROUTE_DETOKENIZER &&
+        route->decode_detokenizer) {
         slot->model = route->model;
-        slot->mimi = route->mimi_req;
-        *request = REQ_MIMI_DECODE;
+        slot->detokenizer = route->detokenizer_req;
+        *request = REQ_AUDIO_DETOKENIZE;
         *context = route->model_id;
         return 0;
     }
@@ -5738,11 +5755,12 @@ int lfm_internal_engine_fail_audio_route_depth_for_test(void *ep, int status) {
         : -EBUSY;
 }
 
-int lfm_internal_engine_fail_audio_route_mimi_for_test(void *ep, int status) {
+int lfm_internal_engine_fail_audio_route_detokenizer_for_test(void *ep,
+                                                              int status) {
     Engine *e = static_cast<Engine *>(ep);
     if (!e || status >= 0) return -EINVAL;
     int idle = 0;
-    return e->test_audio_route_mimi_status.compare_exchange_strong(
+    return e->test_audio_route_detokenizer_status.compare_exchange_strong(
                idle, status, std::memory_order_acq_rel,
                std::memory_order_acquire)
         ? 0
@@ -5820,7 +5838,7 @@ int lfm_engine_audio_encode_submit(
     route->notify = notify;
     route->notify_context = notify_context;
     route->terminal_after_token = false;
-    route->decode_mimi = false;
+    route->decode_detokenizer = false;
     route->status = -EINPROGRESS;
     route->enqueue_sequence =
         e->route_pool->sequence.fetch_add(1, std::memory_order_acq_rel) + 1;
@@ -6144,7 +6162,8 @@ static int run_audio_route(
     const LfmSamplerConfigV1 *audio_sampler, LfmPrngStateV1 *prng,
     uint32_t *out_codes, size_t code_count, size_t lanes,
     const LfmTokenCommitRecord *commit, uint32_t *out_token_completed,
-    MimiDecodeState *mimi, const LfmAudioRouteTarget *target,
+    LfmAudioDetokenizerState *detokenizer,
+    const LfmAudioRouteTarget *target,
     LfmAudioRouteResult *result, LfmAudioRouteNotify notify,
     void *notify_context, LfmAudioRouteHandle *out_handle,
     uint32_t *terminal_sampled = nullptr) {
@@ -6152,33 +6171,37 @@ static int run_audio_route(
     if (!notify || !out_handle) return -EINVAL;
     *out_handle = {};
     const bool terminal_after_token = terminal_sampled != nullptr;
-    const bool decode_mimi = mimi || target || result;
-    const bool commit_only = !terminal_after_token && !decode_mimi &&
+    const bool decode_detokenizer = detokenizer || target || result;
+    const bool commit_only = !terminal_after_token && !decode_detokenizer &&
                              depth_id == 0 && out_codes == nullptr &&
                              code_count == 0;
     if (terminal_after_token &&
-        (decode_mimi || depth_id != 0 || out_codes != nullptr ||
+        (decode_detokenizer || depth_id != 0 || out_codes != nullptr ||
          code_count != 0)) {
         return -EINVAL;
     }
-    const bool resample_mimi =
-        decode_mimi && target && target->resampler_stream;
-    if (decode_mimi && (!mimi || !target || !result || !target->epoch ||
+    const bool resample_detokenizer =
+        decode_detokenizer && target && target->resampler_stream;
+    if (decode_detokenizer &&
+        (!detokenizer || !target || !result || !target->epoch ||
                         !target->pcm || target->expected_epoch == 0 ||
                         target->pcm_capacity == 0 ||
-                        (resample_mimi &&
-                         (!target->codec_pcm ||
-                          target->codec_pcm_capacity < LFM_MIMI_PCM_CAPACITY)) ||
-                        (!resample_mimi &&
-                         target->pcm_capacity < LFM_MIMI_PCM_CAPACITY) ||
-                        (!resample_mimi &&
-                         (target->codec_pcm || target->codec_pcm_capacity != 0 ||
+                        (resample_detokenizer &&
+                         (!target->detokenizer_pcm ||
+                          target->detokenizer_pcm_capacity <
+                              LFM_DETOKENIZER_MAX_STEP_SAMPLES)) ||
+                        (!resample_detokenizer &&
+                         target->pcm_capacity <
+                             LFM_DETOKENIZER_MAX_STEP_SAMPLES) ||
+                        (!resample_detokenizer &&
+                         (target->detokenizer_pcm ||
+                          target->detokenizer_pcm_capacity != 0 ||
                           target->resampler_stream)) ||
                         out_codes != result->codes ||
                         out_token_completed != &result->token_completed ||
                         !commit || commit->token_committed !=
                                        &result->token_committed ||
-                        code_count != LFM_MIMI_CODEBOOKS)) {
+                        code_count != LFM_DETOKENIZER_CODEBOOKS)) {
         return -EINVAL;
     }
     if (result) {
@@ -6209,7 +6232,7 @@ static int run_audio_route(
     const int commit_status =
         preflight_audio_route_commit(&bound_commit, position);
     if (commit_status != 0) return commit_status;
-    if (decode_mimi &&
+    if (decode_detokenizer &&
         target->epoch->load(std::memory_order_acquire) !=
             target->expected_epoch) {
         return -ESTALE;
@@ -6286,8 +6309,8 @@ static int run_audio_route(
     }
 
     route->engine = e;
-    route->service_class = decode_mimi ? KC_COORD_SERVICE_REALTIME
-                                       : KC_COORD_SERVICE_INTERACTIVE;
+    route->service_class = decode_detokenizer ? KC_COORD_SERVICE_REALTIME
+                                              : KC_COORD_SERVICE_INTERACTIVE;
     route->kind = AUDIO_ROUTE_GENERATION;
     route->node = AUDIO_ROUTE_TOKEN;
     route->depth_id = depth_id;
@@ -6320,29 +6343,33 @@ static int run_audio_route(
                 e->test_audio_route_depth_status.exchange(
                     0, std::memory_order_acq_rel),
         };
-    route->mimi_req = {
-            .state = mimi,
+    route->detokenizer_req = {
+            .state = detokenizer,
             .codes = out_codes,
-            .pcm = decode_mimi ? target->pcm : nullptr,
-            .capacity = decode_mimi ? target->pcm_capacity : 0,
-            .codec_pcm = resample_mimi ? target->codec_pcm : nullptr,
-            .codec_capacity =
-                resample_mimi ? target->codec_pcm_capacity : 0,
+            .pcm = decode_detokenizer ? target->pcm : nullptr,
+            .capacity = decode_detokenizer ? target->pcm_capacity : 0,
+            .detokenizer_pcm =
+                resample_detokenizer ? target->detokenizer_pcm : nullptr,
+            .detokenizer_capacity =
+                resample_detokenizer
+                    ? target->detokenizer_pcm_capacity
+                    : 0,
             .resampler_stream =
-                resample_mimi ? target->resampler_stream : nullptr,
+                resample_detokenizer ? target->resampler_stream : nullptr,
             .out_samples = result ? &result->pcm_samples : nullptr,
-            .completion_status = decode_mimi
-                ? e->test_audio_route_mimi_status.exchange(
+            .flush = false,
+            .completion_status = decode_detokenizer
+                ? e->test_audio_route_detokenizer_status.exchange(
                       0, std::memory_order_acq_rel)
                 : 0,
         };
-    route->epoch = decode_mimi ? target->epoch : nullptr;
-    route->expected_epoch = decode_mimi ? target->expected_epoch : 0;
+    route->epoch = decode_detokenizer ? target->epoch : nullptr;
+    route->expected_epoch = decode_detokenizer ? target->expected_epoch : 0;
     route->result = result;
     route->notify = notify;
     route->notify_context = notify_context;
     route->terminal_after_token = terminal_after_token || commit_only;
-    route->decode_mimi = decode_mimi;
+    route->decode_detokenizer = decode_detokenizer;
     route->commit = bound_commit;
     route->token_completed = out_token_completed;
     route->status = -EINPROGRESS;
@@ -6371,7 +6398,8 @@ int lfm_engine_audio_route_submit(
     const uint16_t *rope_cos, const uint16_t *rope_sin,
     size_t rope_elements, uint16_t *out_hidden, size_t hidden_elements,
     const LfmSamplerConfigV1 *audio_sampler, LfmPrngStateV1 *prng,
-    MimiDecodeState *mimi, const LfmAudioRouteTarget *target,
+    LfmAudioDetokenizerState *detokenizer,
+    const LfmAudioRouteTarget *target,
     LfmAudioRouteResult *result, size_t lanes,
     const LfmTokenCommitRecord *commit, LfmAudioRouteNotify notify,
     void *notify_context, LfmAudioRouteHandle *out_handle) {
@@ -6380,7 +6408,8 @@ int lfm_engine_audio_route_submit(
         ep, model_id, depth_id, ids, id_count, embedding_kind, states,
         state_count, position, rope_cos, rope_sin, rope_elements, out_hidden,
         hidden_elements, audio_sampler, prng, result->codes,
-        LFM_MIMI_CODEBOOKS, lanes, commit, &result->token_completed, mimi,
+        LFM_DETOKENIZER_CODEBOOKS, lanes, commit, &result->token_completed,
+        detokenizer,
         target, result, notify, notify_context, out_handle);
 }
 
@@ -6443,7 +6472,7 @@ int lfm_engine_control_route_submit(
     route->notify = notify;
     route->notify_context = notify_context;
     route->terminal_after_token = false;
-    route->decode_mimi = false;
+    route->decode_detokenizer = false;
     route->status = -EINPROGRESS;
     route->enqueue_sequence =
         engine->route_pool->sequence.fetch_add(
@@ -6865,7 +6894,7 @@ int lfm_engine_prefill_submit(
     route->notify = notify;
     route->notify_context = notify_context;
     route->terminal_after_token = false;
-    route->decode_mimi = false;
+    route->decode_detokenizer = false;
     route->status = -EINPROGRESS;
     route->enqueue_sequence =
         e->route_pool->sequence.fetch_add(1, std::memory_order_acq_rel) + 1;

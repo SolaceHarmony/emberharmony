@@ -17,8 +17,11 @@ typedef struct LfmWeightImage LfmWeightImage;
 typedef enum LfmWeightComponent {
     LFM_WEIGHT_COMPONENT_INVALID = 0,
     LFM_WEIGHT_COMPONENT_MAIN = 1,
-    LFM_WEIGHT_COMPONENT_CODEC = 2,
-    LFM_WEIGHT_COMPONENT_COUNT = 3,
+    LFM_WEIGHT_COMPONENT_DETOKENIZER = 2,
+    /* Reserved for the separate native Moshi model tranche. The LFM2.5
+     * loader never populates this component. */
+    LFM_WEIGHT_COMPONENT_MIMI = 3,
+    LFM_WEIGHT_COMPONENT_COUNT = 4,
 } LfmWeightComponent;
 
 typedef enum LfmWeightStatus {
@@ -97,11 +100,13 @@ LFM_ORACLE_API int lfm_weights_open_files(const char *const *paths, size_t count
                                           LfmWeightImage **out, char *err,
                                           size_t errlen);
 
-/* Load the model checkpoint and Mimi codec with one allocation and one read
+/* Load the model checkpoint and LFM2.5 audio detokenizer with one allocation
+ * and one read
  * team. Tensor names are scoped by component, so identical keys in Main and
- * Codec are legal while duplicates inside either component remain errors. */
+ * Detokenizer are legal while duplicates inside either component remain
+ * errors. */
 LFM_ORACLE_API int lfm_weights_open_bundle(const char *main_path,
-                                           const char *codec_path,
+                                           const char *detokenizer_path,
                                            LfmWeightImage **out, char *err,
                                            size_t errlen);
 

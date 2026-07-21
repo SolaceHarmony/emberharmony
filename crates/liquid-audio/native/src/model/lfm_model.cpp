@@ -5,8 +5,8 @@
 #include "flashkern_rope.h"
 #include "lfm_audio_pass.h"
 #include "lfm_conformer.h"
+#include "lfm_detokenizer.h"
 #include "lfm_frontend.h"
-#include "lfm_mimi.h"
 #include "lfm_model_plan.h"
 #include "lfm_payload_reader.h"
 #include "lfm_safetensors.h"
@@ -504,7 +504,7 @@ struct LfmModel {
     LfmFrontend *frontend = nullptr;
     LfmConformer *conformer = nullptr;
     LfmTokenizer *tokenizer = nullptr;
-    MimiDecodePlan *mimi = nullptr;
+    LfmAudioDetokenizerPlan *detokenizer = nullptr;
     uint64_t plan_id = 0;
     uint64_t depth_plan_id = 0;
     uint64_t resident_bytes = 0;
@@ -520,7 +520,7 @@ struct LfmModel {
     uint32_t codebooks = 0;
     uint32_t lanes = 0;
     uint32_t preprocessor_rate = 0; // frontend/Conformer input
-    uint32_t codec_rate = 0;        // Mimi PCM output
+    uint32_t audio_output_rate = 0; // released detokenizer PCM output
     uint32_t mel_features = 0;
     uint32_t interleaved_text = 0;
     uint32_t interleaved_audio = 0;
@@ -589,7 +589,7 @@ struct LfmConversation {
     LfmResampler *resampler = nullptr;
     LfmResamplerWorkspace *resampler_workspace = nullptr;
     LfmResamplerStream *playback_resampler_stream = nullptr;
-    MimiDecodeState *mimi = nullptr;
+    LfmAudioDetokenizerState *detokenizer = nullptr;
     LfmAudioRouteResult audio_route{};
     uint32_t route_sampled = 0;
     LfmTokenizerWorkspace *tokenizer_workspace = nullptr;
@@ -601,7 +601,7 @@ struct LfmConversation {
     std::vector<float> rope_sin_f32;
     std::vector<uint16_t> hidden;
     std::vector<float> resampled;
-    std::array<float, LFM_MIMI_PCM_CAPACITY> codec_pcm{};
+    std::array<float, LFM_DETOKENIZER_MAX_STEP_SAMPLES> detokenizer_pcm{};
     std::vector<uint16_t> mel_bf16;
     std::vector<uint16_t> adapted;
     std::array<uint32_t, LFM_TEXT_COMMAND_MAX_BYTES> token_scratch{};
@@ -633,7 +633,7 @@ struct LfmConversation {
     ~LfmConversation() {
         lfm_engine_prefill_workspace_destroy(prefill_workspace);
         lfm_tokenizer_workspace_destroy(tokenizer_workspace);
-        if (mimi) mimi_decode_state_free(mimi);
+        if (detokenizer) lfm_detokenizer_state_free(detokenizer);
         if (resampler_workspace) {
             (void)lfm_resampler_workspace_destroy(resampler_workspace);
         }
@@ -960,7 +960,8 @@ int reset_memory(LfmConversation &conversation) {
     conversation.text_done = false;
     conversation.generation_active = false;
     conversation.generation_ended = false;
-    if (conversation.mimi) mimi_decode_state_reset(conversation.mimi);
+    if (conversation.detokenizer)
+        lfm_detokenizer_state_reset(conversation.detokenizer);
     if (conversation.playback_resampler_stream) {
         lfm_resampler_stream_reset(conversation.playback_resampler_stream);
     }
@@ -974,11 +975,12 @@ uint64_t logical_capture_bytes(size_t samples) {
 }
 
 uint64_t logical_playback_bytes(const LfmModel &model, uint32_t sample_rate) {
-    if (model.codec_rate == 0) return UINT64_MAX;
+    if (model.audio_output_rate == 0) return UINT64_MAX;
     const uint64_t numerator =
-        (uint64_t)LFM_MIMI_PCM_CAPACITY * sample_rate;
+        (uint64_t)LFM_DETOKENIZER_MAX_STEP_SAMPLES * sample_rate;
     const uint64_t frames =
-        (numerator + model.codec_rate - 1) / model.codec_rate;
+        (numerator + model.audio_output_rate - 1) /
+        model.audio_output_rate;
     return frames > UINT64_MAX / sizeof(float)
         ? UINT64_MAX
         : frames * sizeof(float);
@@ -988,15 +990,15 @@ int prepare_playback_claimed(LfmConversation &conversation,
                              uint32_t sample_rate,
                              size_t *out_playback_frames) {
     LfmModel *model = conversation.model;
-    if (!model || model->codec_rate == 0 || sample_rate == 0 ||
+    if (!model || model->audio_output_rate == 0 || sample_rate == 0 ||
         !out_playback_frames) {
         return -EINVAL;
     }
     if (conversation.playback_rate == sample_rate &&
         conversation.playback_frames != 0 &&
-        ((sample_rate == model->codec_rate &&
+        ((sample_rate == model->audio_output_rate &&
           !conversation.playback_resampler_stream) ||
-         (sample_rate != model->codec_rate &&
+         (sample_rate != model->audio_output_rate &&
           conversation.playback_resampler_stream))) {
         *out_playback_frames = conversation.playback_frames;
         return 0;
@@ -1007,17 +1009,18 @@ int prepare_playback_claimed(LfmConversation &conversation,
     }
 
     LfmResamplerStream *stream = nullptr;
-    /* Every route admits Mimi's complete documented 3,840-sample result. The
-     * rate-changing geometry therefore reserves the maximum corresponding
-     * device-rate span, even though steady-state steps usually return 1,920. */
-    uint64_t frames = LFM_MIMI_PCM_CAPACITY;
+    /* Every route admits the detokenizer's complete 1,920-sample steady-state
+     * block. The first block is 1,440 and EOAudio flush is 480, so this single
+     * reservation also covers both boundary shapes. */
+    uint64_t frames = LFM_DETOKENIZER_MAX_STEP_SAMPLES;
     int status = 0;
-    if (sample_rate != model->codec_rate) {
+    if (sample_rate != model->audio_output_rate) {
         status = lfm_resampler_stream_create(
-            model->codec_rate, sample_rate, LFM_MIMI_PCM_CAPACITY, &stream);
+            model->audio_output_rate, sample_rate,
+            LFM_DETOKENIZER_MAX_STEP_SAMPLES, &stream);
         if (status == 0) {
             status = lfm_resampler_stream_out_length(
-                stream, LFM_MIMI_PCM_CAPACITY, &frames);
+                stream, LFM_DETOKENIZER_MAX_STEP_SAMPLES, &frames);
         }
     }
     if (status == 0 &&
@@ -1048,7 +1051,7 @@ int prepare_pcm_claimed(LfmConversation &conversation, size_t max_sample_count,
     if (!model || !model->frontend || !model->conformer ||
         !conversation.frontend_workspace || !conversation.conformer_workspace ||
         max_sample_count == 0 || capture_rate == 0 || playback_rate == 0 ||
-        model->preprocessor_rate == 0 || model->codec_rate == 0 ||
+        model->preprocessor_rate == 0 || model->audio_output_rate == 0 ||
         model->mel_features == 0 || model->hidden == 0) {
         return -EINVAL;
     }
@@ -1059,9 +1062,9 @@ int prepare_pcm_claimed(LfmConversation &conversation, size_t max_sample_count,
     const bool playback_ready =
         conversation.playback_rate == playback_rate &&
         conversation.playback_frames != 0 &&
-        ((playback_rate == model->codec_rate &&
+        ((playback_rate == model->audio_output_rate &&
           !conversation.playback_resampler_stream) ||
-         (playback_rate != model->codec_rate &&
+         (playback_rate != model->audio_output_rate &&
           conversation.playback_resampler_stream));
     if (conversation.allocation_sealed) {
         if (capture_ready && playback_ready) {
@@ -1347,8 +1350,8 @@ int submit_next_emission_into_claimed(
     LfmAudioRouteNotify notify, void *notify_context,
     LfmAudioRouteHandle *async_handle) {
     if (!conversation.generation_active || conversation.generation_ended ||
-        conversation.modality != 3 || !conversation.mimi ||
-        conversation.model->codebooks != LFM_MIMI_CODEBOOKS || !notify ||
+        conversation.modality != 3 || !conversation.detokenizer ||
+        conversation.model->codebooks != LFM_DETOKENIZER_CODEBOOKS || !notify ||
         !async_handle) {
         return -EINVAL;
     }
@@ -1371,12 +1374,13 @@ int submit_next_emission_into_claimed(
         return -ENOBUFS;
     }
     LfmAudioRouteTarget bound_target = target;
-    bound_target.codec_pcm = nullptr;
-    bound_target.codec_pcm_capacity = 0;
+    bound_target.detokenizer_pcm = nullptr;
+    bound_target.detokenizer_pcm_capacity = 0;
     bound_target.resampler_stream = conversation.playback_resampler_stream;
     if (bound_target.resampler_stream) {
-        bound_target.codec_pcm = conversation.codec_pcm.data();
-        bound_target.codec_pcm_capacity = conversation.codec_pcm.size();
+        bound_target.detokenizer_pcm = conversation.detokenizer_pcm.data();
+        bound_target.detokenizer_pcm_capacity =
+            conversation.detokenizer_pcm.size();
     }
     return lfm_engine_audio_route_submit(
         conversation.model->engine, conversation.model->plan_id,
@@ -1393,7 +1397,8 @@ int submit_next_emission_into_claimed(
         conversation.rope_cos.size() -
             conversation.window.start * conversation.rope_half,
         conversation.hidden.data(), conversation.hidden.size(),
-        &conversation.audio_sampler, &conversation.prng, conversation.mimi,
+        &conversation.audio_sampler, &conversation.prng,
+        conversation.detokenizer,
         &bound_target, &result, conversation.model->lanes, &commit, notify,
         notify_context, async_handle);
 }
@@ -1418,9 +1423,8 @@ int finish_next_emission_into_claimed(LfmConversation &conversation,
     if (emission_status != 0) return emission_status;
     if (status != 0) return status;
     if (result.token_completed == 0 || result.token_committed == 0 ||
-        result.depth_completed == 0 ||
-        (result.eoaudio == 0 &&
-         (result.mimi_completed == 0 || result.pcm_samples == 0))) {
+        result.depth_completed == 0 || result.detokenizer_completed == 0 ||
+        (result.eoaudio == 0 && result.pcm_samples == 0)) {
         return -EFAULT;
     }
     return 0;
@@ -1439,11 +1443,11 @@ int begin_generation_claimed(LfmConversation &conversation, uint32_t sampled,
     clear_emission(out, conversation.window.cursor);
     const int status = emit_text_claimed(conversation, sampled, out);
     if (status != 0) return status;
-    /* Candle created a fresh Mimi streaming decoder for every response. Keep
-     * that turn boundary here, after the turn has begun successfully and only
-     * once: interleaved audio runs within the turn share both codec and output
-     * rate-conversion state. */
-    if (conversation.mimi) mimi_decode_state_reset(conversation.mimi);
+    /* The released detokenizer is causal across every audio-code frame in one
+     * response. Reset once at the response boundary; interleaved chunks share
+     * its ShortConv/KV and ISTFT overlap state. */
+    if (conversation.detokenizer)
+        lfm_detokenizer_state_reset(conversation.detokenizer);
     if (conversation.playback_resampler_stream) {
         lfm_resampler_stream_reset(conversation.playback_resampler_stream);
     }
@@ -2057,7 +2061,7 @@ extern "C" int lfm_model_open(void *engine, const char *path, LfmModel **out,
     LfmFrontend *frontend = nullptr;
     LfmConformer *conformer = nullptr;
     LfmTokenizer *tokenizer = nullptr;
-    MimiDecodePlan *mimi = nullptr;
+    LfmAudioDetokenizerPlan *detokenizer = nullptr;
     uint64_t plan_id = 0;
     uint64_t depth_plan_id = 0;
     std::vector<float> depth_rope_cos;
@@ -2114,14 +2118,16 @@ extern "C" int lfm_model_open(void *engine, const char *path, LfmModel **out,
         const float rope_theta = (float)number(config, "rope_theta", 1000000.0);
         const size_t codebooks = integer(document, "codebooks", 0, false);
 
-        const fs::path codec_path = root / "tokenizer-e351c8d8-checkpoint125.safetensors";
+        const fs::path detokenizer_root = root / "audio_detokenizer";
+        const fs::path detokenizer_path = detokenizer_root / "model.safetensors";
         const bool voice_model = document.contains("preprocessor") ||
                                  document.contains("encoder");
-        if (voice_model && codebooks != LFM_MIMI_CODEBOOKS) {
-            fail(-EINVAL, "native Mimi requires exactly eight audio codebooks");
+        if (voice_model && codebooks != LFM_DETOKENIZER_CODEBOOKS) {
+            fail(-EINVAL,
+                 "native LFM2.5 detokenizer requires exactly eight audio codebooks");
         }
-        std::error_code codec_error;
-        bool codec_exists = false;
+        std::error_code detokenizer_error;
+        bool detokenizer_exists = false;
         {
             /* This lease closes the publication race around metadata I/O, but
              * it deliberately installs no payload source. Only the owned
@@ -2129,19 +2135,53 @@ extern "C" int lfm_model_open(void *engine, const char *path, LfmModel **out,
             LfmPayloadReadScope probe(&payload_owner, 0);
             if (probe.status() != 0) {
                 fail(probe.status(),
-                     "codec source inspection rejected by its model owner");
+                     "detokenizer source inspection rejected by its model owner");
             }
-            codec_exists = fs::is_regular_file(codec_path, codec_error);
+            detokenizer_exists =
+                fs::is_regular_file(detokenizer_path, detokenizer_error);
         }
-        if (voice_model && (!codec_exists || codec_error)) {
+        if (voice_model && (!detokenizer_exists || detokenizer_error)) {
             fail(-ENOENT,
-                 "native LFM2-Audio requires its Mimi codec checkpoint");
+                 "native LFM2.5-Audio requires audio_detokenizer/model.safetensors");
+        }
+        if (voice_model) {
+            const Json detokenizer_config =
+                read_json(&payload_owner, detokenizer_root / "config.json");
+            const std::array<const char *, 8> expected_layers = {
+                "conv", "conv", "sliding_attention", "conv",
+                "sliding_attention", "conv", "sliding_attention", "conv",
+            };
+            if (!detokenizer_config.is_object() ||
+                integer(detokenizer_config, "hidden_size") != 512 ||
+                integer(detokenizer_config, "num_hidden_layers") != 8 ||
+                integer(detokenizer_config, "num_attention_heads") != 16 ||
+                integer(detokenizer_config, "num_key_value_heads") != 8 ||
+                integer(detokenizer_config, "conv_L_cache") != 3 ||
+                integer(detokenizer_config, "sliding_window") != 30 ||
+                integer(detokenizer_config, "output_size") != 1282 ||
+                integer(detokenizer_config, "block_multiple_of") != 256 ||
+                integer(detokenizer_config, "block_ff_dim") != 3328 ||
+                !detokenizer_config.contains("layer_types") ||
+                !detokenizer_config.at("layer_types").is_array() ||
+                detokenizer_config.at("layer_types").size() !=
+                    expected_layers.size()) {
+                fail(-EINVAL,
+                     "audio_detokenizer/config.json has unsupported geometry");
+            }
+            for (size_t index = 0; index < expected_layers.size(); ++index) {
+                const Json &kind = detokenizer_config.at("layer_types").at(index);
+                if (!kind.is_string() || kind.get<std::string>() !=
+                                             expected_layers[index]) {
+                    fail(-EINVAL,
+                         "audio_detokenizer layer topology is not the released LFM2.5 graph");
+                }
+            }
         }
         char weight_error[512] = {};
-        const std::string codec_native = codec_path.string();
-        int status = codec_exists
+        const std::string detokenizer_native = detokenizer_root.string();
+        int status = detokenizer_exists
                          ? lfm_weights_open_bundle_owned(
-                               path, codec_native.c_str(), &payload_owner,
+                               path, detokenizer_native.c_str(), &payload_owner,
                                &weights, weight_error, sizeof(weight_error))
                          : lfm_weights_open_owned(path, &payload_owner, &weights,
                                                   weight_error,
@@ -2496,12 +2536,15 @@ extern "C" int lfm_model_open(void *engine, const char *path, LfmModel **out,
         }
 
         if (voice_model) {
-            char mimi_error[512] = {};
-            status = mimi_decode_plan_new_from_image(&mimi, weights, mimi_error,
-                                                     sizeof(mimi_error));
+            char detokenizer_error[512] = {};
+            status = lfm_detokenizer_plan_new_from_image(
+                &detokenizer, weights, detokenizer_error,
+                sizeof(detokenizer_error));
             if (status != 0) {
-                fail(status, mimi_error[0] ? mimi_error
-                                           : "cannot bind native Mimi decoder");
+                fail(status,
+                     detokenizer_error[0]
+                         ? detokenizer_error
+                         : "cannot bind native LFM2.5 audio detokenizer");
             }
         }
 
@@ -2510,7 +2553,7 @@ extern "C" int lfm_model_open(void *engine, const char *path, LfmModel **out,
         model->frontend = frontend;
         model->conformer = conformer;
         model->tokenizer = tokenizer;
-        model->mimi = mimi;
+        model->detokenizer = detokenizer;
         model->plan_id = plan_id;
         model->depth_plan_id = depth_plan_id;
         LfmWeightLoadStatsV1 load_stats = {
@@ -2525,7 +2568,7 @@ extern "C" int lfm_model_open(void *engine, const char *path, LfmModel **out,
         model->source_bytes = load_stats.source_bytes;
         const uint64_t bound_parts[] = {
             lfm_conformer_bound_weight_bytes(conformer),
-            mimi_decode_plan_bound_weight_bytes(mimi),
+            lfm_detokenizer_plan_bound_weight_bytes(detokenizer),
         };
         for (uint64_t bytes : bound_parts) {
             status = model->accounting.weight(WeightKind::Bound, bytes);
@@ -2538,7 +2581,7 @@ extern "C" int lfm_model_open(void *engine, const char *path, LfmModel **out,
             lfm_conformer_derived_bytes(conformer),
             (uint64_t)(depth_rope_cos.size() + depth_rope_sin.size()) *
                 sizeof(float),
-            mimi_decode_plan_derived_bytes(mimi),
+            lfm_detokenizer_plan_derived_bytes(detokenizer),
         };
         for (uint64_t bytes : derived_parts) {
             status = model->accounting.weight(WeightKind::Derived, bytes);
@@ -2548,7 +2591,7 @@ extern "C" int lfm_model_open(void *engine, const char *path, LfmModel **out,
         }
         const uint64_t compatibility_parts[] = {
             lfm_conformer_materialized_weight_bytes(conformer),
-            mimi_decode_plan_compatibility_copied_bytes(mimi),
+            lfm_detokenizer_plan_compatibility_copied_bytes(detokenizer),
         };
         for (uint64_t bytes : compatibility_parts) {
             status = model->accounting.weight(WeightKind::Compatibility,
@@ -2571,7 +2614,8 @@ extern "C" int lfm_model_open(void *engine, const char *path, LfmModel **out,
         model->codebooks = codebooks > UINT32_MAX ? 0 : (uint32_t)codebooks;
         model->lanes = lfm_engine_lanes(engine);
         model->preprocessor_rate = sample_rate;
-        model->codec_rate = mimi ? LFM_MIMI_SAMPLE_RATE : 0;
+        model->audio_output_rate =
+            detokenizer ? LFM_DETOKENIZER_SAMPLE_RATE : 0;
         model->mel_features = mel_features;
         model->audio_rows = audio_rows;
         if (tokenizer) {
@@ -2634,7 +2678,7 @@ extern "C" int lfm_model_open(void *engine, const char *path, LfmModel **out,
         frontend = nullptr;
         conformer = nullptr;
         tokenizer = nullptr;
-        mimi = nullptr;
+        detokenizer = nullptr;
         plan_id = 0;
         depth_plan_id = 0;
         *out = model.release();
@@ -2645,7 +2689,7 @@ extern "C" int lfm_model_open(void *engine, const char *path, LfmModel **out,
         if (conformer) (void)lfm_conformer_destroy(conformer);
         if (frontend) (void)lfm_frontend_destroy(frontend);
         if (tokenizer) lfm_tokenizer_close(tokenizer);
-        if (mimi) mimi_decode_plan_free(mimi);
+        if (detokenizer) lfm_detokenizer_plan_free(detokenizer);
         if (weights) lfm_weights_close(weights);
         set_error(error, error_length, exception.what());
         return exception.status();
@@ -2655,7 +2699,7 @@ extern "C" int lfm_model_open(void *engine, const char *path, LfmModel **out,
         if (conformer) (void)lfm_conformer_destroy(conformer);
         if (frontend) (void)lfm_frontend_destroy(frontend);
         if (tokenizer) lfm_tokenizer_close(tokenizer);
-        if (mimi) mimi_decode_plan_free(mimi);
+        if (detokenizer) lfm_detokenizer_plan_free(detokenizer);
         if (weights) lfm_weights_close(weights);
         set_error(error, error_length, "native model allocation failed");
         return -ENOMEM;
@@ -2665,7 +2709,7 @@ extern "C" int lfm_model_open(void *engine, const char *path, LfmModel **out,
         if (conformer) (void)lfm_conformer_destroy(conformer);
         if (frontend) (void)lfm_frontend_destroy(frontend);
         if (tokenizer) lfm_tokenizer_close(tokenizer);
-        if (mimi) mimi_decode_plan_free(mimi);
+        if (detokenizer) lfm_detokenizer_plan_free(detokenizer);
         if (weights) lfm_weights_close(weights);
         set_error(error, error_length, exception.what());
         return -EINVAL;
@@ -2692,7 +2736,8 @@ extern "C" int lfm_model_close(LfmModel *model) {
     if (model->conformer) (void)lfm_conformer_destroy(model->conformer);
     if (model->frontend) (void)lfm_frontend_destroy(model->frontend);
     if (model->tokenizer) lfm_tokenizer_close(model->tokenizer);
-    if (model->mimi) mimi_decode_plan_free(model->mimi);
+    if (model->detokenizer)
+        lfm_detokenizer_plan_free(model->detokenizer);
     lfm_weights_close(model->weights);
     delete model;
     return 0;
@@ -2749,14 +2794,16 @@ extern "C" int lfm_conversation_create(LfmModel *model,
                 lfm_conformer_workspace_create(&conversation->conformer_workspace);
             if (status != 0) fail(status, "cannot allocate native Conformer workspace");
         }
-        if (model->mimi) {
-            char mimi_error[512] = {};
-            const int status = mimi_decode_state_new(&conversation->mimi,
-                                                     model->mimi, mimi_error,
-                                                     sizeof(mimi_error));
+        if (model->detokenizer) {
+            char detokenizer_error[512] = {};
+            const int status = lfm_detokenizer_state_new(
+                &conversation->detokenizer, model->detokenizer,
+                detokenizer_error, sizeof(detokenizer_error));
             if (status != 0) {
-                fail(status, mimi_error[0] ? mimi_error
-                                           : "cannot allocate native Mimi state");
+                fail(status,
+                     detokenizer_error[0]
+                         ? detokenizer_error
+                         : "cannot allocate native detokenizer state");
             }
         }
 
@@ -2848,7 +2895,7 @@ extern "C" int lfm_model_info(const LfmModel *model, LfmModelInfoV1 *out) {
             (model->depth_plan_id != 0 ? LFM_MODEL_CAP_DEPTHFORMER : 0u) |
             (model->frontend != nullptr ? LFM_MODEL_CAP_FRONTEND : 0u) |
             (model->conformer != nullptr ? LFM_MODEL_CAP_CONFORMER : 0u) |
-            (model->mimi != nullptr ? LFM_MODEL_CAP_MIMI : 0u),
+            (model->detokenizer != nullptr ? LFM_MODEL_CAP_DETOKENIZER : 0u),
         .reserved = {},
     };
     return 0;
@@ -2914,25 +2961,26 @@ extern "C" int lfm_model_memory(const LfmModel *model, LfmModelMemoryV1 *out) {
 }
 
 /* Focused native contract probe. It drives the real conversation playback
- * preparation with independently sealed preprocessor and codec rates; no
- * inference state, checkpoint tensor, or PCM plane is created. */
+ * preparation with independently sealed preprocessor and detokenizer rates;
+ * no inference state, checkpoint view, or PCM plane is created. */
 extern "C" LFM_INTERNAL_API int lfm_internal_playback_rate_contract_test(
     uint32_t preprocessor_rate, uint32_t playback_rate,
-    uint32_t *out_preprocessor_rate, uint32_t *out_codec_rate,
+    uint32_t *out_preprocessor_rate, uint32_t *out_audio_output_rate,
     uint64_t *out_playback_frames, uint32_t *out_direct) {
     if (preprocessor_rate == 0 || playback_rate == 0 ||
-        !out_preprocessor_rate || !out_codec_rate || !out_playback_frames ||
+        !out_preprocessor_rate || !out_audio_output_rate ||
+        !out_playback_frames ||
         !out_direct) {
         return -EINVAL;
     }
     *out_preprocessor_rate = 0;
-    *out_codec_rate = 0;
+    *out_audio_output_rate = 0;
     *out_playback_frames = 0;
     *out_direct = 0;
 
     LfmModel model;
     model.preprocessor_rate = preprocessor_rate;
-    model.codec_rate = LFM_MIMI_SAMPLE_RATE;
+    model.audio_output_rate = LFM_DETOKENIZER_SAMPLE_RATE;
     LfmConversation conversation;
     conversation.model = &model;
     size_t frames = 0;
@@ -2940,7 +2988,7 @@ extern "C" LFM_INTERNAL_API int lfm_internal_playback_rate_contract_test(
         conversation, playback_rate, &frames);
     if (status != 0) return status;
     *out_preprocessor_rate = model.preprocessor_rate;
-    *out_codec_rate = model.codec_rate;
+    *out_audio_output_rate = model.audio_output_rate;
     *out_playback_frames = (uint64_t)frames;
     *out_direct = conversation.playback_resampler_stream ? 0u : 1u;
     return 0;
@@ -2968,7 +3016,7 @@ lfm_internal_conversation_allocation_seal_test(
 
     LfmModel model;
     model.preprocessor_rate = 16000;
-    model.codec_rate = LFM_MIMI_SAMPLE_RATE;
+    model.audio_output_rate = LFM_DETOKENIZER_SAMPLE_RATE;
     model.mel_features = 128;
     model.hidden = 512;
     model.frontend = reinterpret_cast<LfmFrontend *>(uintptr_t{1});

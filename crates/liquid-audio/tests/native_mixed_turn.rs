@@ -63,7 +63,7 @@ fn plan(
 }
 
 #[test]
-fn eo_audio_stays_in_recurrence_and_never_enters_mimi() {
+fn eo_audio_flushes_the_released_detokenizers_final_overlap() {
     use liquid_audio as _;
     assert_eq!(
         unsafe { lfm_native_emission_needs_pcm(&NativeEmission::audio(0)) },
@@ -71,7 +71,7 @@ fn eo_audio_stays_in_recurrence_and_never_enters_mimi() {
     );
     assert_eq!(
         unsafe { lfm_native_emission_needs_pcm(&NativeEmission::audio(1)) },
-        0
+        1
     );
     assert_eq!(
         unsafe { lfm_native_emission_needs_pcm(&NativeEmission::audio(2)) },
