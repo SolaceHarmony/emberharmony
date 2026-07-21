@@ -76,7 +76,11 @@ uint32_t koro_cont_current_worker(const koro_cont_t *continuation);
 uint32_t koro_cont_state_get(const koro_cont_t *continuation);
 void koro_cont_state_set(koro_cont_t *continuation, uint32_t state,
                          uint32_t suspend_kind);
-void koro_cont_finish(koro_cont_t *continuation);
+/* Claims terminal ownership against a concurrent callback resume. Returns one
+ * when terminal publication may proceed. Returns zero when a correlated edge
+ * won first; the caller must return dormant and let that successor invocation
+ * run. */
+int koro_cont_finish(koro_cont_t *continuation);
 
 /* The source position is only a private resume label inside one compiled
  * function.  It is never serialized or exposed as product protocol state. */
@@ -100,8 +104,7 @@ void koro_cont_finish(koro_cont_t *continuation);
 
 #define KORO_END(k)                                                       \
     }                                                                     \
-    koro_cont_finish((k));                                                 \
-    return (void *)1
+    return koro_cont_finish((k)) ? (void *)1 : NULL
 
 #ifdef __cplusplus
 }

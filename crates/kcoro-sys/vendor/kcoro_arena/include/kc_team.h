@@ -23,6 +23,8 @@ typedef struct kc_team kc_team_t;
 typedef void (*kc_team_member_fn)(void *context, uint32_t member,
                                   uint32_t members, uint64_t generation);
 typedef void (*kc_team_completion_fn)(void *context, uint64_t generation);
+/* Exact edge emitted after every started member reaches DONE. The team retains
+ * this context until the callback returns, then publishes joined. */
 typedef void (*kc_team_retired_fn)(void *context, uint64_t last_generation);
 
 typedef struct kc_team_config {

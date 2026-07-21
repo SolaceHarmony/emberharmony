@@ -10,6 +10,7 @@
 
 enum kc_service_phase {
     KC_SERVICE_CREATED = 0,
+    KC_SERVICE_STARTING,
     KC_SERVICE_STARTED,
     KC_SERVICE_RETIRING,
     KC_SERVICE_JOINED,
@@ -42,6 +43,8 @@ struct kc_service {
      * services remain movable across the bounded runtime pool. */
     int owner_initialized;
     int owner_finalized;
+    void (*test_start_hook)(void *context, uint32_t stage);
+    void *test_start_context;
 };
 
 struct kc_service_notifier {
@@ -85,8 +88,7 @@ static void *service_step(koro_cont_t *continuation)
             service->owner_finalized = 1;
             if (service->owner_fini) service->owner_fini(service->context);
         }
-        continuation->completed = 1;
-        return (void *)1;
+        return koro_cont_finish(continuation) ? (void *)1 : NULL;
     }
     return NULL;
 }
@@ -96,20 +98,26 @@ static void stop_service(kc_service_t *service)
     if (!service) return;
     atomic_store_explicit(&service->realtime_closed, 1,
                           memory_order_seq_cst);
+    atomic_store_explicit(&service->stop_requested, 1,
+                          memory_order_release);
     unsigned phase = atomic_load_explicit(&service->phase,
                                           memory_order_acquire);
-    if (phase != KC_SERVICE_CREATED && phase != KC_SERVICE_STARTED) return;
-    int won = atomic_compare_exchange_strong_explicit(
-        &service->phase, &phase, KC_SERVICE_RETIRING,
-        memory_order_acq_rel, memory_order_acquire);
-    if (!won && phase == KC_SERVICE_STARTED) {
-        won = atomic_compare_exchange_strong_explicit(
-            &service->phase, &phase, KC_SERVICE_RETIRING,
+    if (phase == KC_SERVICE_CREATED) {
+        unsigned expected = KC_SERVICE_CREATED;
+        (void)atomic_compare_exchange_strong_explicit(
+            &service->phase, &expected, KC_SERVICE_RETIRING,
             memory_order_acq_rel, memory_order_acquire);
+        return;
     }
-    if (!won) return;
-    atomic_store_explicit(&service->stop_requested, 1, memory_order_release);
-    if (atomic_load_explicit(&service->ever_started, memory_order_acquire))
+    /* STARTING is the starter's in-flight lease. Stop deposits its request but
+     * never steals that phase; the starter publishes STARTED or RETIRING after
+     * it knows whether a frame was actually admitted. */
+    if (phase == KC_SERVICE_STARTING) return;
+    if (phase != KC_SERVICE_STARTED) return;
+    unsigned expected = KC_SERVICE_STARTED;
+    if (atomic_compare_exchange_strong_explicit(
+            &service->phase, &expected, KC_SERVICE_RETIRING,
+            memory_order_acq_rel, memory_order_acquire))
         kc_runtime_publish_service_internal(service->runtime,
                                             service->continuation);
 }
@@ -153,16 +161,17 @@ int kc_service_create(kc_runtime_t *runtime, const kc_service_config *config,
         .completion = NULL,
         .completion_context = NULL,
     };
-    if (koro_cont_create_on(runtime, &continuation_config,
-                            &service->continuation) != 0) {
+    const int created = koro_cont_create_on(runtime, &continuation_config,
+                                            &service->continuation);
+    if (created != 0) {
         free(service);
-        return -ENOMEM;
+        return created;
     }
 
     KC_MUTEX_LOCK(&runtime->mu);
     if (!runtime->accepting) {
         KC_MUTEX_UNLOCK(&runtime->mu);
-        koro_cont_release_internal(service->continuation);
+        (void)koro_cont_destroy(service->continuation);
         free(service);
         return -ECANCELED;
     }
@@ -187,29 +196,64 @@ int kc_service_start(kc_service_t *service)
         KC_MUTEX_UNLOCK(&runtime->mu);
         return 0;
     }
-    if (phase != KC_SERVICE_CREATED || !runtime->accepting) {
+    if (phase != KC_SERVICE_CREATED || !runtime->accepting ||
+        atomic_load_explicit(&service->stop_requested,
+                             memory_order_acquire)) {
         KC_MUTEX_UNLOCK(&runtime->mu);
         return -ECANCELED;
     }
 
     unsigned expected = KC_SERVICE_CREATED;
     if (!atomic_compare_exchange_strong_explicit(
-            &service->phase, &expected, KC_SERVICE_STARTED,
+            &service->phase, &expected, KC_SERVICE_STARTING,
             memory_order_acq_rel, memory_order_acquire)) {
         KC_MUTEX_UNLOCK(&runtime->mu);
         return -ECANCELED;
     }
-    atomic_store_explicit(&service->ever_started, 1, memory_order_release);
-    atomic_store_explicit(&service->realtime_closed, 0,
-                          memory_order_seq_cst);
-    if (atomic_load_explicit(&service->phase, memory_order_acquire) !=
-        KC_SERVICE_STARTED)
+    KC_MUTEX_UNLOCK(&runtime->mu);
+    if (service->test_start_hook)
+        service->test_start_hook(service->test_start_context, 1);
+    const int status = koro_cont_start_internal(service->continuation);
+    if (status != 0) {
         atomic_store_explicit(&service->realtime_closed, 1,
                               memory_order_seq_cst);
-    KC_MUTEX_UNLOCK(&runtime->mu);
-    const int status = koro_cont_start_internal(service->continuation);
-    if (status != 0) stop_service(service);
-    return status;
+        atomic_store_explicit(&service->stop_requested, 1,
+                              memory_order_release);
+        atomic_store_explicit(&service->phase, KC_SERVICE_RETIRING,
+                              memory_order_release);
+        kc_runtime_signal_lifecycle_internal(runtime);
+        return status;
+    }
+    if (service->test_start_hook)
+        service->test_start_hook(service->test_start_context, 2);
+
+    atomic_store_explicit(&service->ever_started, 1, memory_order_release);
+    if (atomic_load_explicit(&service->stop_requested,
+                             memory_order_acquire)) {
+        atomic_store_explicit(&service->phase, KC_SERVICE_RETIRING,
+                              memory_order_release);
+        kc_runtime_publish_service_internal(service->runtime,
+                                            service->continuation);
+        kc_runtime_signal_lifecycle_internal(runtime);
+        return -ECANCELED;
+    }
+    atomic_store_explicit(&service->phase, KC_SERVICE_STARTED,
+                          memory_order_release);
+    atomic_store_explicit(&service->realtime_closed, 0,
+                          memory_order_seq_cst);
+    if (atomic_load_explicit(&service->stop_requested,
+                             memory_order_acquire)) {
+        atomic_store_explicit(&service->realtime_closed, 1,
+                              memory_order_seq_cst);
+        expected = KC_SERVICE_STARTED;
+        (void)atomic_compare_exchange_strong_explicit(
+            &service->phase, &expected, KC_SERVICE_RETIRING,
+            memory_order_acq_rel, memory_order_acquire);
+        kc_runtime_publish_service_internal(service->runtime,
+                                            service->continuation);
+        return -ECANCELED;
+    }
+    return 0;
 }
 
 int kc_service_notify(kc_service_t *service)
@@ -396,6 +440,10 @@ int kc_service_join(kc_service_t *service)
         KC_MUTEX_UNLOCK(&runtime->mu);
         return 0;
     }
+    if (phase == KC_SERVICE_STARTING) {
+        KC_MUTEX_UNLOCK(&runtime->mu);
+        return -EBUSY;
+    }
     if (phase != KC_SERVICE_RETIRING) {
         KC_MUTEX_UNLOCK(&runtime->mu);
         return -EBUSY;
@@ -407,8 +455,9 @@ int kc_service_join(kc_service_t *service)
         return 0;
     }
 
-    while (atomic_load_explicit(&service->continuation->run_state,
-                                memory_order_acquire) != KORO_DONE) {
+    while (koro_run_base(atomic_load_explicit(
+               &service->continuation->run_state,
+               memory_order_acquire)) != KORO_DONE) {
         if (!runtime->started) {
             KC_MUTEX_UNLOCK(&runtime->mu);
             return -EBUSY;
@@ -419,8 +468,9 @@ int kc_service_join(kc_service_t *service)
                                                  memory_order_acquire);
         atomic_fetch_add_explicit(&runtime->lifecycle_waiters, 1,
                                   memory_order_seq_cst);
-        if (atomic_load_explicit(&service->continuation->run_state,
-                                 memory_order_acquire) != KORO_DONE &&
+        if (koro_run_base(atomic_load_explicit(
+                &service->continuation->run_state,
+                memory_order_acquire)) != KORO_DONE &&
             atomic_load_explicit(&runtime->progress, memory_order_acquire) ==
                 progress) {
             if (kc_doorbell_park(runtime->lifecycle_doorbell, observed) != 0)
@@ -449,8 +499,8 @@ int kc_service_snapshot_get(kc_service_t *service, kc_service_snapshot *out)
             &service->handled_notifications, memory_order_acquire),
         .callbacks = atomic_load_explicit(&service->callbacks,
                                           memory_order_acquire),
-        .run_state = (uint32_t)atomic_load_explicit(
-            &service->continuation->run_state, memory_order_acquire),
+        .run_state = koro_run_public(atomic_load_explicit(
+            &service->continuation->run_state, memory_order_acquire)),
         .started = atomic_load_explicit(&service->ever_started,
                                         memory_order_acquire),
         .stop_requested = atomic_load_explicit(&service->stop_requested,
@@ -466,8 +516,8 @@ int kc_service_destroy(kc_service_t *service)
     kc_runtime_t *runtime = service->runtime;
     KC_MUTEX_LOCK(&runtime->mu);
     unsigned phase = atomic_load_explicit(&service->phase, memory_order_acquire);
-    int run_state = atomic_load_explicit(&service->continuation->run_state,
-                                         memory_order_acquire);
+    int run_state = koro_run_base(atomic_load_explicit(
+        &service->continuation->run_state, memory_order_acquire));
     if (service->realtime_notifiers) {
         KC_MUTEX_UNLOCK(&runtime->mu);
         return -EBUSY;
@@ -501,6 +551,18 @@ void kc_service_runtime_stop_locked(kc_runtime_t *runtime)
 {
     for (kc_service_t *service = runtime->services_head; service;
          service = service->registry_next) stop_service(service);
+}
+
+int kc_service_inject_start_hook_for_test(
+    kc_service_t *service, void (*hook)(void *context, uint32_t stage),
+    void *context)
+{
+    if (!service || !hook) return -EINVAL;
+    if (atomic_load_explicit(&service->phase, memory_order_acquire) !=
+        KC_SERVICE_CREATED) return -EBUSY;
+    service->test_start_hook = hook;
+    service->test_start_context = context;
+    return 0;
 }
 
 koro_cont_t *kc_service_continuation_internal(kc_service_t *service)

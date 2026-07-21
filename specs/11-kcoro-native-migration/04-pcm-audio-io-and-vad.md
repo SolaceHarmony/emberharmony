@@ -1,17 +1,14 @@
 # PCM, Audio I/O, and VAD Design
 
-Status: normative design for the local model provider.
-
-Baseline: EmberHarmony `321538f11749`.
+Status: normative as-built contract for the local LFM2 provider.
 
 ## Goal
 
-Keep local capture/playback callbacks and speech policy in Rust, but mount them
-on kcoro's callback-resumed docking substrate. After a hardware callback copies
-a complete device block into its preallocated retained reservation, PCM is
-passed to the native session only by generation-checked spans and is mutated
-only in declared destination buffers. Rust never owns model math or numerical
-progress; C++ never owns the platform device callback.
+Keep local capture/playback callbacks, PCM storage, and speech policy native.
+CoreAudio renders a complete capture block directly into a preallocated native
+reservation; every later handoff is a generation-checked view and each kernel
+writes only its declared destination. Rust owns neither platform PCM nor model
+progress.
 
 The remote LiveKit provider is a separate product transport and is not an
 inference fallback. This design removes the Rust WebRTC loopback used as the
@@ -19,94 +16,50 @@ local model's audio device; it does not silently change remote-provider policy.
 
 ## Current Code Map
 
-| Current symbol | Evidence | Required replacement |
-|---|---|---|
-| `ExternalAudioInput` / writer | `crates/liquid-audio/src/runtime/voice_runtime.rs:85-132` | Native capture adapter writes directly into native ring. |
-| `ExternalAudioOutput` | `voice_runtime.rs:94-160` | Native playback adapter drains native ring. |
-| `PcmRing` | `voice_runtime.rs:163-282` | Rust-owned segmented SPSC PCM region with generation-protected spans and kcoro doorbell. |
-| `PlaybackReference` | `voice_runtime.rs:284-341` | Native playback/echo-reference state updated by actual playback callback. |
-| `PlaybackOutput` / `OutputSink` | `voice_runtime.rs:343-419` | One native output owner, with platform adapter selected at session start. |
-| Consumer/output threads | `voice_runtime.rs:421-449`, `1040-1343` | Native notification and playback continuations; no Rust worker. |
-| `VoiceRuntime::interrupt` | `voice_runtime.rs:740-748` | Epoch doorbell plus native playback flush. |
-| Turn VAD | `voice_runtime.rs:1344-1596` | Fixed Rust `TurnDetector` continuation reading retained ring windows; commits only descriptors. |
-| Frame clock/resampler | `voice_runtime.rs:1599-1775` | Rust frame-dock continuation; numerical resampling remains a typed native pass. |
-| CPAL callbacks | `voice_runtime.rs:1820-2000` | Rust platform callback writing retained reservations and ringing kcoro. |
-| Desktop local WebRTC output | `packages/desktop/src-tauri/src/voice/runtime.rs:2965-3155` | Remove from local model path. |
-| Desktop local WebRTC input | `voice/runtime.rs:3158-3419` | Remove from local model path. |
+| Current symbol | As-built ownership |
+|---|---|
+| `lfm_platform_audio.cpp` | Native AUHAL input/output units, callback buffers, device geometry, faults, and teardown. |
+| `LfmCaptureProducer` | Sole physical producer over the native circular arena; claim/resolve/commit and explicit gap/XRUN records. |
+| `LfmPlaybackConsumer` | Exact ticket/epoch/generation claim, device-buffer render, evidence, capacity release. |
+| `voice_session.cpp` | Arena, Sesame microphone/playback state, turn policy, deadlines, capture ranges, playback leases, and native session actions. |
+| `voice_runtime.rs` | Opaque native platform-audio handle, controls, and bounded outward event projection only. |
 
-The current implementation is not yet payload-zero-copy. Callback publication
-is block-atomic and wakes consumers through kcoro's expected-value doorbell;
-there is no Crossbeam wake token or timed progress heartbeat. Playback now
-borrows the ring's one or two readable spans directly, but `PcmRing::drain_into`
-still pushes capture into a `Vec`, VAD slices new utterance vectors, and frame
-mode creates a new vector per model frame. Those remaining payload owners
-disappear when capture callbacks write retained block reservations.
+No Rust PCM ring, capture/output trait, utterance vector, CPAL dependency, or
+audio payload event remains in the local LFM2 path.
 
 ## Platform Adapter Boundary
 
-Rust owns the platform APIs (WebRTC/PlatformAudio today, CPAL fallback where
-enabled) and one non-cloneable producer endpoint per device stream. The endpoint
-reserves a stable PCM block, converts/downmixes directly into it, publishes one
-descriptor, rings `kc_doorbell`, and returns. Device objects, framework callback
-types, and temporary device pointers never cross the C ABI. C++ sees only the
-validated span record and its ticket/epoch.
+Native C++ owns the platform API and one producer/consumer endpoint pair per
+session. On macOS, `lfm_platform_audio_default_config` captures exact default
+device identity, sample rates, and callback geometry before session creation.
+`lfm_platform_audio_create` mounts AUHAL units while the session is still
+`CREATED`; start admits callbacks only after every arena and record is sealed.
+Other platforms return unsupported until an equivalent native adapter lands.
 
 Echo cancellation, noise suppression, and gain control are capabilities, not
-assumptions. The current desktop code configures WebRTC audio processing at
-`packages/desktop/src-tauri/src/voice/runtime.rs:1964-1973` and uses
-`PlatformAudio` in the local loops. The replacement adapter must report which
-processing is active and pass an echo/barge-in app gate. A raw CoreAudio path is
-not declared equivalent merely because it produces samples.
+assumptions. The native adapter must report what the device path actually
+provides and pass the echo/barge-in app gate; raw AUHAL is not declared
+equivalent to a processed WebRTC path merely because it produces samples.
 
 ## Capture Ring
 
-Use a fixed segmented SPSC region allocated at session creation. Fixed-size
-blocks make callback writes contiguous while allowing a logical utterance to
-span wraparound without copying.
+Use one fixed circular `float` arena allocated at session creation. A capture
+chunk carries a monotonic sample cursor, offset, frame count, stream epoch,
+ticket, lease identity, and buffer generation; it never carries an enduring
+pointer. Native consumers resolve the descriptor only while the generation is
+live.
 
-```c
-typedef struct LfmPcmSpanV1 {
-    uint32_t size;
-    uint32_t abi_version;
-    uint64_t region_id;
-    uint64_t generation;
-    uint64_t start_frame;
-    uint64_t frame_count;
-    uint32_t sample_rate;
-    uint16_t channels;
-    uint16_t format;
-} LfmPcmSpanV1;
-```
+On macOS the page-rounded arena is mapped twice into adjacent virtual ranges.
+A callback that crosses the physical wrap therefore receives one contiguous
+virtual destination backed by the same pages—no relocation or wrap copy. The
+portable arena resolver may return two borrowed spans, but no non-Apple product
+adapter is selected until it meets the same callback contract.
 
-`start_frame` is a monotonic logical index, not a raw pointer. Native readers
-resolve it to one or two physical ranges in the ring. A retained span pins every
-covered block generation until the consumer releases the lease. Stale generation
-resolution fails; it never reads overwritten PCM.
-
-```c++
-struct PcmBlock {
-    alignas(64) std::atomic<uint64_t> generation;
-    std::atomic<uint32_t> leases;
-    uint32_t frames;
-    float mono[kFramesPerBlock];
-};
-
-struct PcmRing {
-    PcmBlock *blocks;
-    uint32_t block_count;
-    std::atomic<uint64_t> write_frame;
-    std::atomic<uint64_t> read_frame;
-    std::atomic<uint32_t> wake_armed;
-};
-```
-
-Capacity is configured from maximum utterance duration, pre-roll, and callback
-headroom. The current six-second mic ring (`voice_runtime.rs:36`, `111`) is too
-small for the current 30-second utterance cap (`voice_runtime.rs:38`) if a whole
-utterance must remain leased. The target defaults to at least:
+Capacity is configured from two simultaneously live 30-second turn ranges plus
+detector cadence and callback guards:
 
 ```text
-max_utterance_ms + pre_roll_ms + 2 * largest_callback_ms
+2 * forced_endpoint_frames + 2 * cadence_frames + 2 * largest_callback_frames
 ```
 
 When the ring cannot accept a callback block, it drops the new block, increments
@@ -117,11 +70,11 @@ allocate, block, evict leased speech, or overwrite unread data.
 
 Capture callback:
 
-1. Convert/downmix the hardware buffer directly into the reserved ring block.
-2. Use vectorized conversion where the format permits it.
-3. Publish frame count and write index with release ordering.
-4. Wake the capture continuation only on empty-to-nonempty transition.
-5. Return.
+1. Claim and resolve one complete native callback reservation.
+2. Ask `AudioUnitRender` to write mono f32 directly into that destination.
+3. Commit the typed chunk record with release ordering, or publish an explicit
+   sequenced gap/XRUN after draining an unadmitted hardware block.
+4. Return.
 
 Playback callback:
 
@@ -130,16 +83,12 @@ Playback callback:
    buffer, converting/duplicating channels as needed.
 3. Fill any underrun remainder with silence.
 4. Update played-frame count and actual played RMS.
-5. Wake a blocked producer only when crossing a configured free-space threshold.
+5. Publish the exact capacity-release edge when a lease retires.
 6. Return.
 
 Callbacks may not allocate, lock, emit Tauri events, run VAD, resample, enter
-the model, or invoke a continuation directly. Their sole kcoro operation is the
-realtime-safe doorbell ring after publishing the block.
-
-The current CPAL callback behavior at `voice_runtime.rs:1842-1855` and
-`1906-1984` is the semantic reference for format conversion, underrun accounting,
-flush, and played-sample statistics.
+the model, or invoke a continuation inline. Their progress operation is the
+bounded native record publication that resumes an existing continuation edge.
 
 ## VAD State Machine
 
@@ -274,59 +223,58 @@ flowchart LR
     MODEL --> NOTE["bounded notification continuation"]
 ```
 
-No thread sleeps for 5 ms and rechecks ring length. The current drain polling at
-`voice_runtime.rs:429-447` and turn drain loop in the consumer are replaced by
-space/drained edges from the playback owner.
+No thread sleeps and rechecks ring length. Capture publication and playback
+lease retirement are the only data/space edges.
 
 These edges use document 09's callback/dormancy contract. No audio block or
 capacity condition owns a waiter. The hardware callback release-publishes its
-cursor/generation and invokes its setup-time retained `kc_service_notifier`
-edge. That edge makes the durable VAD/frame continuation runnable; it never
-runs the continuation inline, allocates, takes the runtime mutex, or invokes a
-ticket callback. Hosts without a direct realtime-safe edge fail microphone
-setup rather than falling back to a pthread bridge in the hardware callback.
-The runtime callback drains a fixed quota. If the owned predicate remains ready,
-`kc_service_ready_again` republishes that exact continuation after it returns,
-without a timer, mutex, external edge, or address-park syscall. A complete
-utterance/frame creates one parent action ticket, and each model/codec pass
-reports readiness through the native completion path in documents 03 and 12.
+cursor/generation through the prebound native dock edge. That edge makes the
+durable session continuation runnable; it never runs the continuation inline,
+allocates, takes the runtime mutex, or invokes a Rust callback. Platforms
+without a direct realtime-safe native edge fail microphone setup rather than
+falling back to a pthread bridge. The resumed continuation drains a fixed quota
+and republishes itself only while its owned predicate remains ready. A complete
+utterance creates one parent action ticket, and each model/codec pass reports
+readiness through the native completion path in documents 03 and 12.
 
 ## Implementation Map
 
-1. Add native PCM region/ring/span implementation and deterministic wrap/lease
-   tests.
-2. Add a test audio adapter that uses the real ring and callback contract, not a
-   duplicate model of it.
-3. Port stats and playback reference semantics from
-   `voice_runtime.rs:284-341`, `533-580`, and `1877-2000`.
-4. Mount turn VAD as a fixed Rust docking continuation; compare endpoint and
-   barge-in traces against recorded fixtures.
-5. Add the candidate parent/decision operation, candidate-epoch check, and
-   frontend/prefill child-ticket join before enabling speculative prepare.
-6. Make the Rust frame assembler publish retained descriptors and mount
-   resampling as a typed native pass.
-7. Prove the Rust WebRTC/PlatformAudio callback dock and AEC/echo behavior in
-   the actual desktop app.
-8. Replace `start_local_webrtc_input` and `start_local_webrtc_output` calls at
-   `packages/desktop/src-tauri/src/voice/runtime.rs:2339-2340`.
-9. Remove local WebRTC loopback helpers at `runtime.rs:2965-3419` from the local
-   provider path.
-10. Remove the transitional sample ring, `Vec` accumulators, worker channels,
-   and compatibility audio events after retained-block app gates pass. Keep the
-   Rust platform adapter and fixed VAD/frame docking continuations.
-11. Keep remote LiveKit code isolated under its provider boundary; it cannot be a
-    fallback for local model audio.
+Landed:
+
+1. Native circular capture arena, exact chunk/gap records, lease generations,
+   and deterministic wrap/lifetime tests.
+2. Native Sesame detector, sample-clock turn policy, playback evidence, and
+   correlated deadline children.
+3. Native playback reservations, Mimi/device-rate output, flush, underrun, and
+   exact capacity-release edges.
+4. Native macOS AUHAL capture/playback units with direct capture rendering into
+   the page-mirrored arena.
+5. Rust PCM traits, CPAL dependency, rings, utterance vectors, VAD, and audio
+   payload events deleted.
+6. A real-checkpoint, two-native-agent, in-memory speech gate that traverses
+   typed input → audio tokens → Mimi PCM → native capture → Sesame → full model
+   → Mimi PCM twice with deterministic evidence.
+
+Open release work:
+
+1. Prove microphone, speaker, actual device-rate geometry, echo, and barge-in in
+   the desktop app.
+2. Report and gate device processing capabilities rather than assuming AEC/NS/AGC.
+3. Add native adapters for other platforms; unsupported systems must continue
+   to fail explicitly.
+4. Keep remote LiveKit isolated under its provider boundary; it is not a local
+   inference fallback.
 
 ## Acceptance Gates
 
-- Callback-to-ring is the only capture payload copy. A copy audit finds no
-  utterance or model-frame `Vec<f32>` in the production path.
-- An utterance crossing ring wrap is processed from retained spans without
-  concatenation.
+- AUHAL renders capture directly into the native arena. A copy audit finds no
+  intermediate callback, utterance, or model-frame `Vec<f32>`.
+- A callback crossing the macOS page-mirrored wrap receives one contiguous view;
+  no concatenation or relocation occurs.
 - Stale generation, overrun, underrun, and lease exhaustion fail deterministically.
-- No allocation, blocking mutex, continuation execution, ticket callback, or
-  Tauri callback occurs on an audio callback thread; its only kcoro operation is
-  the retained notifier's lock-free publication/wake edge.
+- No allocation, blocking mutex, continuation execution, ticket callback, Rust
+  callback, or Tauri callback occurs on an audio callback thread; it only
+  publishes fixed native records/lease edges.
 - Turn endpoint traces match the current configured behavior on silence, false
   pause, short utterance, long utterance, and barge-in fixtures.
 - In 100,000 commit/resume/child-complete/stop races, one candidate decision
@@ -341,8 +289,7 @@ reports readiness through the native completion path in documents 03 and 12.
 - Played statistics advance only from the platform playback callback.
 - Stop while capture is idle, capture is active, playback is full, and playback
   is draining completes with exactly one terminal event and no polling timeout.
-- The desktop microphone/speaker/AEC app gate passes before Rust local WebRTC or
-  CPAL ownership is deleted.
+- The desktop microphone/speaker/rate/AEC app gate passes before release.
 
 ## Non-Goals
 

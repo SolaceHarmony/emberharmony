@@ -7,11 +7,11 @@ proposal and it does not preserve deleted bridge or coroutine implementations.
 
 ## Contract
 
-- Rust owns platform audio callbacks, opaque native-handle lifetime, controls,
-  telemetry, and UI projection.
-- Native C++ owns the immutable checkpoint image, pointer/stride views, plans,
-  activation arenas, PCM arenas, conversations, sessions, routing, recurrence,
-  and model tickets.
+- Rust owns opaque native-handle lifetime, controls, telemetry, and UI
+  projection.
+- Native C++ owns CoreAudio callback units, the immutable checkpoint image,
+  pointer/stride views, plans, activation arenas, PCM arenas, conversations,
+  sessions, routing, recurrence, and model tickets.
 - `kcoro-sys/vendor/kcoro_arena` owns resident coordination workers, retained
   stackless services, realtime notifier edges, fixed scopes, correlated
   deadlines, and the fixed numerical team.
@@ -36,16 +36,17 @@ engine constructor is private implementation detail.
 An engine currently owns:
 
 - one `kc_team` with the configured fixed lane count;
-- one one-worker control `kc_runtime`;
+- one bounded engine `kc_runtime` with the configured lane-worker count;
 - retained bridge, route, and team-supervisor `kc_service` continuations;
 - one native SQ/CQ bridge and generation-protected pass/route records;
 - one correlated deadline source for team-generation supervision.
 
-The product runtime separately owns the retained session coordinator and
-delivery services. `kc_service` does not create a thread: it is permanently
-assigned to one runtime worker and becomes runnable through its ready bit.
-Realtime producers use retained notifier leases whose notify operation is
-bounded, lock-free, allocation-free, and never invokes the callback inline.
+The product runtime separately owns a bounded coordination `kc_runtime` for
+retained session coordinator/delivery services. `kc_service` creates no thread:
+its saved frame becomes runnable on any eligible free worker through the shared
+ready board. Realtime producers use retained notifier leases whose notify
+operation is bounded, lock-free, allocation-free, and never invokes the callback
+inline.
 
 Flashkern V2 is still one team. Source fields that describe logical blocks or
 collect block counters do not create two independent `BlockDomain` teams and do
@@ -86,12 +87,11 @@ circular arena, performs the architecture conversion directly into those spans,
 and publishes one metadata record. A block that cannot be admitted produces an
 explicit sequenced gap/XRUN record; no prefix is silently spliced to a suffix.
 
-Playback stays native until the hardware callback claims its exact reliable
+Playback stays native until the native hardware callback claims its exact reliable
 `PLAYBACK_READY` identity, resolves a borrowed span, writes the device buffer,
 and releases the lease. Lease release publishes the capacity edge that can
 resume the native session. PCM never travels through stdout, a temporary WAV,
-or an event payload. WAV files produced by an explicit truth-gate run are
-post-retirement evidence only.
+an event payload, or a Rust PCM object.
 
 ## Sesame Turn Policy
 
@@ -254,10 +254,15 @@ git diff --check
 ```
 
 The ignored real-checkpoint truth gate must also be invoked explicitly with the
-model and `question.wav` fixture. It drives typed input, two audio turns on one
-conversation, and a two-engine audio-token exchange through native capture and
-playback leases. An OS one-shot is a failing watchdog only; it never advances
-the test state machine.
+model image. It creates two native conversations and sessions. Agent A accepts a
+typed prompt, generates audio tokens, and decodes them through native Mimi into
+native PCM leases. Those in-memory samples are written directly into Agent B's
+native capture reservations in hardware-sized blocks; B then traverses Sesame,
+frontend, Conformer, recurrence, Depthformer, Mimi, and playback. The complete
+exchange is repeated with fixed seeds and its transcript, PCM digest, ticket,
+epoch, accounting, and retirement evidence must match. Rust only launches the
+native ABI test; it never owns PCM or model progress. A monotonic OS one-shot is
+a failing watchdog only and never advances the test state machine.
 
 Release still requires:
 

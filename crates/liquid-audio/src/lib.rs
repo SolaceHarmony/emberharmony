@@ -12,14 +12,13 @@ mod voice_api;
 pub mod voice_runtime;
 
 pub use native_voice::{
-    NativeConversationVault, NativeLfm2VoiceEngine, NativeVoiceModel, NativeVoiceModelMemory,
-    NativeVoiceRuntimeConfig, NativeVoiceSampling,
+    default_platform_audio_config, NativeConversationVault, NativeLfm2VoiceEngine,
+    NativeVoiceModel, NativeVoiceModelMemory, NativeVoiceRuntimeConfig, NativeVoiceSampling,
 };
 #[cfg(feature = "download")]
 pub use utils::{snapshot_download_to, snapshot_download_with, DownloadProgress};
 pub use voice_api::{
-    CaptureSink, CaptureWrite, EngineProgress, PlaybackSource, PlaybackWrite, VoiceEngine,
-    VoiceEvent,
+    EngineProgress, PlatformAudioConfig, PlatformAudioSnapshot, VoiceEngine, VoiceEvent,
 };
 pub use voice_runtime::{
     AudioStatsSnapshot, RuntimeConfig, RuntimeEvent, SessionState, VoiceRuntime,

@@ -12,7 +12,8 @@ Flashkern is the CPU inference device:
   dormancy, stop, and join;
 - architecture assembly is the primary numerical implementation, with Apple
   Accelerate/AMX admitted only behind an explicit large-matrix ABI;
-- Rust docks platform PCM and control through opaque native handles only;
+- Rust docks control/observation through opaque native handles only; native
+  platform callbacks own PCM;
 - Metal is not part of Flashkern.
 
 Production enters through `lfm_runtime_create`. That implementation creates the
@@ -162,10 +163,11 @@ Recurrence belongs to a native route/session continuation:
    continuation;
 7. release the slot or submit the next labeled native action.
 
-Missing PCM, playback capacity, or reliable-output capacity leaves a durable
-route/session record dormant and releases the compute slot. The corresponding
-producer callback makes it runnable. No host loop, timeout, or thread waits for
-those resources. Rust handles only platform-audio and control edges.
+Missing PCM, playback capacity, or reliable-output capacity leaves the exact
+route/session frame dormant and releases the compute slot. Its retained records
+remain backing data; the corresponding producer callback makes the saved frame
+runnable. No host loop, timeout, or thread represents those resources. Rust
+handles only platform-audio and control edges.
 
 ## Native Audio Policy
 
@@ -233,8 +235,10 @@ Current tests include:
 - `native_voice_session.rs` for PCM leases, exact sample-clock policy, pause
   deadline races, callback failure, stop, and no-operation-wait source gates;
 - `native_product_abi.rs` for the opaque production export allowlist;
-- an explicitly ignored real-checkpoint truth gate that drives typed input,
-  repeated audio turns, and a two-engine audio-token exchange.
+- an explicitly ignored real-checkpoint truth gate that drives typed input and
+  two audio turns on one retained conversation through native audio-token
+  generation and Mimi playback. Direct model-to-model conversation remains a
+  future native audio-token/code dock, never an acoustic VAD loopback.
 
 Required cutover gates:
 

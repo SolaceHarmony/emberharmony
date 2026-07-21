@@ -7,12 +7,15 @@ recurrence, per-conversation state/rollover, fixed PCM leases, reliable ticketed
 events, interruption epochs, and expected-value parking. Resample, frontend, and
 whole-Conformer/adapter orchestration now enter Flashkern as one typed,
 model-correlated fixed-team SQ/CQ pass over borrowed pointer spans and sealed
-conversation workspaces. Its native coordinator caller still waits synchronously;
-this pass-boundary cut is not completion-continuation recurrence. The engine now
-has a capacity-2 SQ/CQ, two per-ticket request/scratch slots, and an exact-CQ
-callback substrate that retains a packed generation/state lease for its exact
-slot and can atomically resubmit that slot without Rust progress. Deterministic
-tests cover callback-slot theft, stale-owner ABA, stop, and live-slot accounting.
+conversation workspaces. That historical synchronous pass boundary has since
+been replaced by a reusable saved stackless bridge frame. The frame retains its
+program counter, fixed locals, exact CONTROL ticket, and generation-leased
+pass-slot/result references. The final-team callback only makes that exact frame
+runnable on the shared kcoro pool. The engine has a capacity-2 SQ/CQ and two
+fixed request/scratch slots; those slots are numerical backing storage, not
+continuation identity. Deterministic tests cover callback-slot theft,
+stale-owner ABA, stop, migration, terminal-callback lifetime, and live-slot
+accounting.
 The V2.0 safety subset is also landed: 128-byte Apple isolation covers hot
 kcoro/engine/bridge/session/model-gate words and internal SQ/CQ storage cells
 without changing ABI-v1 value alignment; request, layer,
@@ -26,11 +29,12 @@ The bounded route holds exclusive SQ-producer authority and borrows three
 pre-created immutable descriptors, so the CQ callback performs no mutex-taking
 descriptor work or generic submission. That exclusivity is temporary migration
 scaffolding, not a claim that the peer slot can run unrelated work yet.
-The coordinator still makes one outward expected-value wait. Its fixed
-conversation-owned result and stack callback state are a bounded bridge, not the
-future pooled asynchronous route instance. Two `BLOCK4` domains, the ready
-broker, reverse-order per-block CQs, event-register waits, pooled tickets, and
-concurrent numerical passes remain open. The physical mic/speaker adapter also
+The fixed route pool, fair broker, and coordinator-owned `SessionAction` are
+bounded transitional backing records. They do not replace a coroutine frame.
+The remaining coroutine-purity cut moves each multi-hop route's program counter
+and fixed locals into its own reusable saved frame, then deletes record-driven
+re-entry. Two `BLOCK4` domains, reverse-order per-block CQs, and concurrent
+numerical passes remain open. The physical mic/speaker adapter also
 still bridges the native dock into the legacy Rust `VoiceEvent` surface. The full Moshi port and physical
 kcoro device dock are subsequent tranches; neither permits a Candle fallback.
 
@@ -136,8 +140,8 @@ dormant.
   under the existing `< 0.1%` CPU gate (`engine_idle_zero_spin`).
 - **Real-time.** The pipeline overlaps stages, so wall-clock is the critical path,
   not the sum of stages. Per-frame Mimi decode (~14 ms) must keep pace with
-  playback; backpressure leaves the route record dormant and releases the
-  engine slot until a speaker-capacity edge re-admits it.
+  playback; backpressure leaves the route frame dormant and releases the
+  engine slot until a speaker-capacity edge makes that exact frame runnable.
 - **Faithful numerics.** bf16 bit-matched to the captured fixtures across every
   ported stage; `-ffp-contract=off`; Accelerate/AMX permitted for matmul-shaped
   stages on Apple. Seeded CSPRNG native; fixed-seed byte-identity per turn.
@@ -147,8 +151,9 @@ dormant.
 - **No tensors in the production data plane** — buffers with pointers. Candle
   survives only as an *offline* capture/parity oracle, never wired into the
   shipped path.
-- **No math, memory allocation, or threading in Rust for inference.** All three
-  belong to Flashkern (see §0). Rust owns only the two PCM docks and control.
+- **No math, PCM, memory allocation, or threading in Rust for inference.** All
+  four belong to the native runtime/Flashkern boundary (see §0). Rust owns only
+  opaque handles, control, and bounded observation.
 - **No `.wav` generation, ever.** PCM is a live stream out of the model; there is
   no file-render step on the audio path.
 - **Rust channels are dumped** at the audio dock in favour of bounded records
@@ -166,10 +171,12 @@ dormant.
 
 The whole chain is **one native session state machine eagerly executing a compact,
 model-owned forwarding table on the Flashkern lane domains.** Each accepted
-command owns a fixed per-ticket route instance. Exact completions advance that
-instance; they do not invoke an allocated list of callbacks. The table is a
-closed direct-threaded continuation map, not a DAG VM, graph compiler, lazy
-evaluator, or public model bytecode.
+command leases one reusable saved stackless route frame. Its fixed locals retain
+the exact ticket, route label, media/model positions, and generation-leased
+backing records. Exact completions make that same frame runnable; its saved
+program counter selects the next forwarding row. The table is a closed
+direct-threaded continuation map, not a DAG VM, graph compiler, lazy evaluator,
+or public model bytecode.
 
 ### 2.1 Three planes (do not merge them)
 
@@ -214,13 +221,13 @@ Rust generate_with_cache loop  (holds a thread the entire turn):
 **Target — eager native route execution, exact-CQ-driven:**
 
 ```
-Rust: submit TURN ticket  (borrowed mic PCM lease) ──┐
+Native audio dock: publish TURN ticket + mic PCM lease ──┐
                                                       ▼
                           ┌──────────────────────────────────────────┐
                           │        NATIVE SESSION STATE MACHINE        │
                           │  cursor · KV/conv planes · CSPRNG · epoch  │
                           └──────────────────────────────────────────┘
-   TURN accepted ─▶ RouteInstance(label=AUDIO_ENCODE)
+   TURN accepted ─▶ RouteFrame(pc=AUDIO_ENCODE, label=AUDIO_ENCODE)
                               │
                               ├─▶ PASS(audio encode + prefill) ─▶ CQ ─┐
                               │                                      │ exact-CQ:
@@ -232,9 +239,10 @@ Rust: submit TURN ticket  (borrowed mic PCM lease) ──┐
                               │              │ retained playback     │
                               └◀─ recur ◀─ CQ(Mimi) ◀─ CQ(Depth) ◀───┘
 
-   session coordinator: result cell ─▶ reliable text / PCM publication
-                        external pressure ─▶ park instance, then re-admit
-Rust only: fills the mic lease, drains the speaker lease, reads the transcript.
+   session delivery: result cell ─▶ reliable text / PCM publication
+                     external pressure ─▶ frame returns dormant
+                     capacity edge ─▶ exact frame runnable
+Rust only: sends controls and reads bounded transcript/state observations.
 SQ capacity ≥ 2 · no synchronous numerical wait · no bridge-thread I/O wait.
 ```
 
@@ -247,10 +255,10 @@ SQ capacity ≥ 2 · no synchronous numerical wait · no bridge-thread I/O wait.
 | **Session state machine** | One per conversation. Owns cursor, KV/conv planes, sampler CSPRNG, codec state, epoch, and recurrence. | **Landed natively; Rust no longer drives model progress.** |
 | **Pass program set** | Native resample, mel, Conformer, prefill, token, Depthformer, and Mimi stages. | **Typed boundary landed for LFM2.** Resample/frontend/whole-Conformer/adapter is one model-correlated ticket over borrowed spans and conversation-owned workspace. Conformer GEMMs and every other numerical substage advance through full-team return callbacks; no nested submission or numerical stage wait remains. |
 | **Immutable forwarding tables** | Model-owned, eagerly executed, total outcome maps over coarse precompiled programs; no callback objects, DAG VM, lazy evaluation, or per-turn construction. | **Bounded production route landed.** The audio branch uses a closed three-node/four-outcome `TOKEN_PASS -> DEPTH_FRAME -> MIMI_DECODE` table with bounds-checked terminal edges. Full-turn token-class and publication routing remain open. |
-| **Per-ticket route instances** | Fixed records carrying separate flow, ticket, route-label, media-position, model-position, retained leases, and terminal state. | **Landed for the native LFM2 routes.** Fixed pooled records retain every cross-callback phase and lease; no stack callback or sleeping thread is continuation state. |
-| **SQ/CQ (capacity ≥ 2) + exact-CQ callback substrate** | A completion can retain and tail-resubmit its exact slot without a synchronous coordinator wait. | **Production use landed.** Token commits on its CQ, Depthformer advances to Mimi when the reserved playback span is live, and the slot releases before reliable PCM publication. The fair broker re-admits runnable nodes; outward result/playback backpressure is retained state resumed by an explicit host-capacity edge. |
-| **Docks** | Generation-checked mic/speaker PCM leases and bounded control/events. | **Native dock landed.** Physical Rust device adapter remains a later tranche. |
-| **Host collapse** | Rust submits tickets, services PCM, and observes events; it owns no model state. | **Landed in the desktop production path; oracle rims are non-release.** |
+| **Per-ticket route frames** | Reusable saved stackless frames carrying a program counter plus fixed locals for flow, ticket, route label, positions, retained leases, and terminal state. | **Partially landed.** The numerical bridge is a saved frame; LFM2 multi-hop phases still live in pooled route records behind retained services. Move each route into its own reusable frame, then delete record-driven re-entry. |
+| **SQ/CQ (capacity ≥ 2) + exact-CQ callback substrate** | A completion can retain and tail-resubmit its exact slot without a synchronous coordinator wait. | **Production use landed.** Token commits on its CQ, Depthformer advances to Mimi when the reserved playback span is live, and the slot releases before reliable PCM publication. The fair broker currently publishes runnable backing records; per-route saved frames replace that transitional re-entry seam. |
+| **Docks** | Generation-checked mic/speaker PCM leases and bounded control/events. | **Native dock and macOS AUHAL adapter landed.** Other platforms fail explicitly until their native adapters exist. |
+| **Host collapse** | Rust sends control, owns opaque handles, and observes bounded events; it owns no PCM or model state. | **Landed in the desktop production path; oracle rims are non-release.** |
 
 ### 2.4 Tickets identify work; labels select the next program
 
@@ -327,10 +335,13 @@ CQ, unavailable predeclared capacity, an epoch/control edge, or a scheduling
 quantum. There is no lazy array, `eval`, graph recording, JIT, on-demand output
 allocation, or first-use construction on the inference path.
 
-Each accepted turn uses a record from a fixed session-owned pool:
+Each accepted turn leases a reusable stackless frame from a sealed
+session-owned pool. The frame—not a callback stack, pass slot, coordinator
+record, or physical worker—is the continuation:
 
 ```c++
-struct RouteInstance {
+struct RouteFrame {
+    ProgramCounter pc;
     FlowKey flow;
     TicketId ticket;
     RouteLabel label;
@@ -358,11 +369,13 @@ struct CompletionAck {
 };
 ```
 
-Every payload view is reachable through one retained lease. The instance is
+Every payload view is reachable through one retained lease. The frame is
 bound to one conversation scratch generation and borrows an exact engine slot
 only while a program is queued or running. It outlives individual passes. At
-quantum exhaustion it releases the slot; re-admission restores the exact flow,
-ticket, label, position, and leases without rebuilding or replaying work.
+quantum exhaustion it releases the slot and returns dormant. An exact
+completion, capacity, or control edge makes that same frame runnable with its
+program counter and locals intact; no coordinator reconstructs or re-admits
+route state.
 
 ### 2.5 The non-blocking completion boundary
 
@@ -372,14 +385,15 @@ doorbell; the ready broker is the sole consumer of both. A shared multi-producer
 CQ is not an allowed shortcut. In either geometry, completion handling has a
 deliberately tiny contract:
 
-1. validate the exact `TicketId`, pass-slot generation, route-instance
+1. validate the exact `TicketId`, pass-slot generation, route-frame lease
    generation, `FlowKey`, and `RouteLabel` generation;
 2. record the program outcome and apply its predeclared commit policy;
 3. map that outcome through the total forwarding row;
-4. tail-submit at most one already-ready numerical program using the retained exact
-   slot, **or** release that slot and publish the instance to a pre-reserved
-   session completion/ready cell;
-5. ring one expected-value doorbell.
+4. advance the saved program counter and either tail-submit one already-ready
+   numerical program with the retained slot, return the exact frame dormant
+   after releasing the slot, or publish its terminal result;
+5. publish the edge that makes the exact frame or session-delivery frame
+   runnable.
 
 The compatibility engine currently overloads submission `conversation_id` and
 `epoch` with a backbone or Depthformer plan id. The route cut separates those
@@ -398,29 +412,26 @@ invoke Rust/Tauri, or run a user callback. In particular, calling the current
 callback would deadlock: both submit and synchronously wait on the same bridge
 thread that is executing the callback.
 
-The session coordinator owns all publication work that can encounter
-backpressure. It drains fixed result cells, attempts reliable
-text/terminal or PCM publication, services control/interrupts, and re-admits
-route instances whose external resource became available. A full destination
-parks that instance in a fixed set; it does not make the coordinator wait inside
-the publication call while unrelated ready work exists. The coordinator never
-waits synchronously for a numerical CQ. Only when no command, result,
-resource-ready edge, or route instance is runnable does it park on the composite
-shared expected-value predicate. The bridge remains free to consume other SQ/CQ
-cells throughout.
+The retained session-delivery continuation owns all publication work that can
+encounter backpressure. It drains fixed result cells and attempts reliable
+text/terminal or PCM publication. A full destination makes the exact route
+frame dormant after it releases compute capacity. The resource producer later
+publishes the edge that makes that frame runnable; no coordinator reconstructs
+or re-admits it. The bridge remains free to consume other SQ/CQ cells
+throughout.
 
 **Playback is admission, not a completion-side allocation.** Before a Mimi program
-may be submitted, its route instance must already retain a playback reservation
+may be submitted, its route frame must already retain a playback reservation
 large enough for the complete fixed-capacity PCM result. The Mimi pass writes
 directly into that reservation. If the interleave schedule says an audio branch
 is next, the session reserves the output before admitting the branch; no space
-means the route instance parks without holding an engine slot. If Depthformer
+means the route frame returns dormant without holding an engine slot. If Depthformer
 produces EOAudio, the unused reservation is released exactly once. A stale epoch
 also releases rather than publishes it.
 
 Reliable text has the same pressure law even though its payload is small: a
 fixed result cell is reserved before the producing program is admitted. If the
-reliable channel cannot accept that cell, the route instance parks at the
+reliable channel cannot accept that cell, the route frame returns dormant at the
 publication boundary and releases its compute slot. Telemetry may be dropped; text,
 terminal records, and PCM ownership facts may not.
 
@@ -490,11 +501,11 @@ a lifetime boundary and never justifies materialization.
 ### 3.3 The native recurrence loop (the heart)
 
 The Rust `generate_with_cache` state machine has been replaced by a native one.
-As built, the C++ session coordinator performs the following steps after parking
-for each exact completion through synchronous compatibility calls. The target
-does not transplant that loop into a bridge-thread callback. It encodes the
-ordered math as immutable forwarding rows and lets the ticket's `RouteInstance`
-advance between programs:
+The numerical bridge already resumes one saved stackless frame from exact CQ.
+Multi-hop route state is still held in pooled records behind the broker; the
+remaining cut moves those locals and their program counter into one reusable
+route frame. Ordered math remains immutable forwarding rows rather than a
+bridge-thread callback loop:
 
 1. reads the sampled token (sampling already native, folded into the pass),
 2. checks stop / EOS,
@@ -505,7 +516,7 @@ advance between programs:
 ```
           ┌──────── token-pass CQ ──────────────┐
           ▼                                      │
-   RouteInstance(label=TOKEN_DONE) ── EOS? ─▶ terminal-result cell
+   RouteFrame(pc=TOKEN_DONE, label=TOKEN_DONE) ── EOS? ─▶ terminal-result cell
           │  no
           ├─▶ ready(DEPTH_FRAME) ─▶ CQ ─▶ pc=DEPTH_DONE
           │                                │
@@ -516,20 +527,20 @@ advance between programs:
           │                                │       completed-PCM result cell
           └─▶ ready(TOKEN_PASS t+1) ◀──────┘
 
-session coordinator: drain fixed result cell → reliable publish / re-admit
+session-delivery frame: drain result cell → reliable publish or return dormant
 ```
 
 The exact-CQ callback may take a ready edge only when every input, output,
 scratch, and result-cell lease for the destination node is already retained. If
-an edge requires external capacity, it releases the compute slot, places the
-instance in the session's fixed parked set, and rings the session doorbell. The
-session coordinator later re-admits the same instance; it does not rebuild the
-route or replay a completed program.
+an edge requires external capacity, it releases the compute slot and the route
+frame returns dormant while retaining its fixed locals. The resource producer
+publishes the edge that makes that exact frame runnable; no coordinator rebuilds
+or re-admits route state, and no completed program is replayed.
 
 ### 3.4 Cancellation and resource retirement
 
 - **Epoch first.** Interrupt / barge-in advances the publication epoch before
-  waking either coordinator. Every route instance and every SQ record carries
+  waking either delivery frame. Every route frame and every SQ record carries
   its captured epoch. An already accepted assembly pass reaches its boundary.
   Its state-authoritative commit is not retroactively cancelled, but an old-epoch
   result cannot publish text or PCM and cannot enqueue another numerical node.
@@ -540,18 +551,19 @@ route or replay a completed program.
   without another sample so KV/ShortConv agrees with the reliable transcript and
   audio stream. No generic cancellation path guesses this policy.
 - **One terminal winner.** Completion, stale epoch, interrupt, fault, and stop
-  race through one generation-checked terminal claim on the route instance.
+  race through one generation-checked terminal claim on the route frame.
   Losers do not publish or release resources a second time.
 - **Retire after the last possible reader.** A capture lease releases only after
   its final frontend/prefill node completes. An unpublished playback reservation
   releases on EOAudio, stale epoch, cancellation, or fault. A result-cell lease
   releases after the coordinator consumes it. Conversation and scratch leases
-  release only after the final accepted CQ is consumed and no parked/publication
+  release only after the final accepted CQ is consumed and no dormant/publication
   record can refer to them. Slot generation is recycled last.
 - **Stop closes admission, then drains.** Stop prevents new route and pass
-  admission, advances the epoch, and wakes every parked predicate. Accepted
-  nodes settle; callbacks return their instances to the retirement queue instead
-  of taking recurrence edges. Join waits for zero live route instances, engine
+  admission, advances the epoch, and publishes every dormant frame's control
+  edge. Accepted
+  nodes settle; callbacks return their frames to the retirement queue instead
+  of taking recurrence edges. Join waits for zero live route frames, engine
   slots, descriptors, result cells, capture leases, and playback leases before
   model/session destruction.
 
@@ -571,7 +583,7 @@ embedding plane to Rust.
 The data, typed-executor, and recurrence boundaries are closed: one
 model-correlated audio encode request carries resample, frontend, and
 whole-Conformer/adapter over borrowed pointer spans and sealed conversation
-workspace. The native route instance retains that request and advances only
+workspace. The native route frame retains that request and advances only
 from exact completion edges; neither Rust nor a coordinator-owned waiter
 shepherds its stages.
 
@@ -585,25 +597,24 @@ separate research track.
 
 ### 3.6 The docks (I/O plane) — opaque native spans, no std channels
 
-The safe Rust dock owns platform callback lifetimes and the setup-time kcoro
-notifier leases; it does not own PCM storage, speech policy, or a generic future
-ring. Every progress-bearing handoff is a bounded native record plus a retained
-edge. No `mpsc`, Crossbeam channel, promise waiter, polling loop, or standard
-`Waker` participates.
+The native session owns platform callback lifetimes and the setup-time dock
+edges; Rust holds only an opaque platform-audio handle. Every progress-bearing
+handoff is a bounded native record plus a retained edge. No `mpsc`, Crossbeam
+channel, promise waiter, polling loop, standard `Waker`, or Rust PCM callback
+participates.
 
-- **Mic in — native circular capture, not turn-batched.** The device callback
-  passes its ephemeral interleaved hardware span to the non-cloneable
-  `CaptureSink`. Native code reserves a generation-checked region of the sealed
-  circular capture arena, converts/downmixs directly into that destination, and
-  publishes one typed chunk record containing stream, sequence, sample cursor,
-  epoch, ticket, region generation, format, and gap flags. The exact Sesame
-  detector, sample-clock turn policy, resampler, frontend, and Conformer consume
-  native views. Rust retains no utterance or PCM ring.
+- **Mic in — native circular capture, not turn-batched.** The AUHAL callback
+  reserves a generation-checked region of the sealed page-mirrored capture arena
+  and asks CoreAudio to render directly into that destination. It publishes one
+  typed chunk record containing stream, sequence, sample cursor, epoch, ticket,
+  region generation, format, and gap flags. The exact Sesame detector,
+  sample-clock turn policy, resampler, frontend, and Conformer consume native
+  views. Rust retains no endpoint, utterance, or PCM ring.
 - **Speaker out — native chunked playback.** Mimi and the native playback
-  resampler write the final device-rate PCM reservation. The non-cloneable
-  `PlaybackSource` resolves that retained lease only inside the hardware
-  callback and renders directly into the ephemeral device span. Ticket, epoch,
-  lease, and buffer generation survive through final callback release.
+  resampler write the final device-rate PCM reservation. The AUHAL callback
+  resolves that retained lease and renders directly into the ephemeral device
+  span. Ticket, epoch, lease, and buffer generation survive through final
+  callback release.
 
 These are the two unavoidable HAL movements. No `Tensor`, `Vec<f32>`, `.wav`,
 stdout payload, standard channel, or extra resampler crosses the dock.
@@ -611,8 +622,8 @@ stdout payload, standard channel, or extra resampler crosses the dock.
 ### 3.7 Host collapse
 
 The blocking compatibility rim and host-owned pass lock are deleted. Rust's
-engine surface is opaque lifecycle, transfer of the sole capture/playback
-endpoints, retained event/control edges, and bounded observer records. Route
+engine surface is opaque lifecycle/platform-audio handles, retained control
+edges, and bounded observer records. Route
 labels, tokens, numerical views, recurrence, and model state do not cross it.
 
 ---
@@ -645,9 +656,10 @@ not need to rediscover the logical-width rule.
 The as-built exact-CQ substrate is FIFO over two descriptor-addressed pass slots.
 A private test continuation tail-submits its same slot, which lets an already
 queued peer run first. That is necessary, but it is not a broker and does not
-prove fairness for more than two live route instances.
+prove fairness for more than two live route frames.
 
-The route executor adds a fixed-capacity model/runtime ready broker:
+The transitional route executor adds a fixed-capacity model/runtime ready broker;
+the final cut publishes these edges directly to reusable saved route frames:
 
 - ready instances are grouped by bounded service class (`REALTIME`,
   `INTERACTIVE`, `BACKGROUND`) and ordered FIFO within a conversation quantum;
@@ -705,19 +717,19 @@ until deterministic tests also prove:
    dtype/shape/stride, illegal aliases, and scratch or lease high-water overflow
    fail before publication. The immutable table has a stable digest.
 2. **Ordered route math:** token → Depthformer → Mimi runs from one route
-   instance with full hidden/logit/code/PCM parity, while every program receives
+   frame with full hidden/logit/code/PCM parity, while every program receives
    the exact prebound view and conversation scratch generation.
 3. **More-than-capacity fairness:** run at least three multi-program route
-   instances through a capacity-2 engine with a quantum of one. A captured dispatch trace
-   proves bounded round-robin/age promotion; no instance retains a pass slot
+   frames through a capacity-2 engine with a quantum of one. A captured dispatch trace
+   proves bounded round-robin/age promotion; no frame retains a pass slot
    across its quantum and all three make progress.
 4. **Peer arrival during recurrence:** a peer submitted after program 1 but before
    program 2 is dispatched before the recurring instance can exceed its quantum.
    Repeating this for more than two route edges produces the same trace.
 5. **Backpressure split:** fill the reliable result ring and the playback ring,
-   separately. The affected instance parks with zero engine slots retained; the
+   separately. The affected frame returns dormant with zero engine slots retained; the
    sole bridge thread continues settling an unrelated ticket. Draining the exact
-   ring wakes and resumes only the parked instance—no retry loop.
+   ring's capacity edge makes only the exact frame runnable—no retry loop.
 6. **Playback admission:** Mimi is never dispatched without a retained,
    capacity-checked playback reservation. EOAudio, stale epoch, fault, and stop
    each release an unused reservation exactly once; successful equal-rate Mimi
@@ -729,7 +741,7 @@ until deterministic tests also prove:
    state-authoritative program may commit, but no stale route
    publishes or takes another numerical edge.
 8. **Stop and retirement:** stop from every state produces one terminal winner
-   and joins with zero route instances, pass slots, descriptors, result cells,
+   and joins with zero route frames, pass slots, descriptors, result cells,
    capture leases, playback leases, and wait registrations. Owner-drop ordering
    runs under ASan/UBSan/TSan.
 9. **No bridge blocking:** instrument the exact-CQ callback and fail if it calls
@@ -830,19 +842,20 @@ the only weight pool.
 
 ### 6.1 Historical phase record and live follow-ons
 
-P0–P3 below are retained as migration rationale, not current-state claims. Their
-numerical ownership outcomes are landed; their asynchronous scheduling outcome
-is not. The live LFM2 work is now:
+P0–P3 below are retained as migration rationale, not current-state claims. The
+numerical ownership outcomes, saved bridge frame, fixed route pool, fair broker,
+and asynchronous `SessionAction` collection are landed. The live scheduling cut
+is per-route saved frames. The live LFM2 work is now:
 
 1. **V2.0 safety subset — landed.** Keep the green 128-byte isolation,
    closed request/layer/modality selectors, invalid-lane rejection,
    four-worker/eight-logical-lane parity, and zero-spin gates;
-2. **V2.1 bounded audio route — landed; asynchronous executor open.** Keep the
+2. **V2.1 bounded audio route — landed; per-route saved frames open.** Keep the
    total `TOKEN_PASS -> DEPTH_FRAME -> MIMI_DECODE` production route,
    reserve-before-admit playback contract, direct PCM write, and terminal
-   cleanup gates. Replace its one outward expected-value wait and fixed
-   conversation-result/stack-callback bridge with model-owned token classes,
-   pooled route/result/playback instances, and the fair broker;
+   cleanup gates. Migrate each multi-hop route's program counter and locals out
+   of pooled record-driven service re-entry into one reusable saved frame, then
+   retire `SessionAction` reconstruction;
 3. extract two logical four-lane block domains plus a gang lease, but run only
    one block/ganged program until each block owns an independent SPSC CQ and the
    four-lane logical-fold parity gate passes;
@@ -851,9 +864,9 @@ is not. The live LFM2 work is now:
 5. enable two-block execution first for different conversations, then add
    opportunistic tile-stationary multi-conversation decode without admission
    delay;
-6. replace the transitional Rust PCM/`VoiceEvent` adapter with physical kcoro
-   audio-device docks and move oracle/training sources into
-   `liquid-audio-oracle`.
+6. **landed on macOS:** replace the transitional Rust PCM/`VoiceEvent` adapter
+   with native kcoro/AUHAL audio-device docks. Other platforms require native
+   peers and may not restore the Rust adapter.
 
 Each phase ends at a gate and deletes the Rust/Candle owner it replaces.
 
@@ -922,7 +935,7 @@ Each phase ends at a gate and deletes the Rust/Candle owner it replaces.
   chains decode → depth → Mimi through exact-CQ advancement; `pass_lock` and the
   blocking rims go. *Gate:*
   `compatibility_copied_bytes == 0` for LFM2; RAM halves; 1M-pass soak;
-  at least three route instances fair through the capacity-2 executor;
+  at least three route frames fair through the capacity-2 executor;
   zero-alloc-after-ready; idle `< 0.1%`; no session coordinator blocks on a
   numerical CQ. (This is the old P1+P2+P4 collapsed, because the native vehicle
   already exists.)

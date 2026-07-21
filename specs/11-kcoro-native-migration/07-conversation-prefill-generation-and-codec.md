@@ -257,16 +257,16 @@ prepare, preserving the shutdown rule already covered by the realtime tests.
 
 ## Callback-Driven Generation
 
-The resident coordinator owns this state machine. Native passes own every
-numerical box; Rust owns the policy edges between boxes:
+The resident native continuation owns this state machine. Native passes own
+every numerical box and native tickets own every policy edge between boxes:
 
 ```mermaid
 flowchart TD
-    READY["prefill complete"] --> DOOR{"Rust scope current and work remains?"}
+    READY["prefill complete"] --> DOOR{"native scope current and work remains?"}
     DOOR -->|yes| TOKEN["backbone token pass"]
     DOOR -->|no| CLOSE["finish or stale turn boundary"]
     TOKEN --> COMPLETE["native sample + state append + CQ"]
-    COMPLETE --> MODE{"Rust compact-result policy"}
+    COMPLETE --> MODE{"native modality policy"}
     MODE -->|text token| EVENT["publish bounded text event"]
     MODE -->|audio modality| DEPTH["typed native Depthformer pass"]
     DEPTH --> APPEND["native codebook state append + CQ"]
@@ -368,8 +368,8 @@ The PRNG conformance tests in
 published zero-key/zero-nonce blocks, exact state/cursor advancement, replay
 from both empty and partially consumed block snapshots, real SQ/CQ/fence
 counters, and Apple system seeding. They pass on aarch64 and through the
-repository's local-only x86_64 Rosetta gate
-(`crates/liquid-audio/scripts/test-rosetta.sh`). A native x86_64 runner remains
+repository's local-only x86_64 Rosetta gate (`cargo test -p kcoro-sys -p
+liquid-audio --target x86_64-apple-darwin -- --test-threads=1`). A native x86_64 runner remains
 required for ISA features that Rosetta does not advertise; the SSE2 ChaCha block
 itself executes and passes under Rosetta.
 

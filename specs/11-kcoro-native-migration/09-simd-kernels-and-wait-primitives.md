@@ -65,7 +65,8 @@ Fix the compute substrate for every native stage in documents 03 through 07:
   suspended operation. There is no bounded spin, timed polling, per-stage park,
   or terminal-result wait tier.
 - **The numerical call graph is native pass descriptor -> C++ fixed executor ->
-  assembly table.** Rust converts settings and owns PCM/control I/O scopes only.
+  assembly table.** Rust converts settings and owns control/observation only;
+  native code owns PCM and platform I/O scopes.
   C++ owns model loading, pointer binding, stage planning, state ownership, and
   dispatch, but performs no arithmetic. Sampling, state transforms, and every
   kernel leaf execute in assembly. Transitional Rust and C++ numerical bodies
@@ -316,8 +317,9 @@ For design 16's block mode, fixed members run one non-suspending stage and all
 return. The final return may run the declared bounded mixer exactly once before
 publishing the callback edge. No lane may suspend, retire, or switch programs
 mid-stage. Assembly owns complete tiles; retained continuations sequence the
-stages. Dynamic audio fragment assembly leaves the route record dormant until
-quorum and admits numerical work only after every required span is present.
+stages. Dynamic audio fragment assembly leaves the route frame dormant; its
+retained fragment record captures quorum, and the final fragment makes the
+exact frame runnable before numerical admission.
 
 The committed evidence is
 [`G0_FENCE_SPIN_321538F1.md`](../../docs/native/baselines/G0_FENCE_SPIN_321538F1.md)

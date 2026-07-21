@@ -1,17 +1,16 @@
-# Rust Audio Dock, Host Seam, And Inference Deletion
+# Rust Host Seam And Native Audio Ownership
 
-Status: normative. Rust is the audio-stream and host boundary, not the model
-coordinator or numerical runtime.
+Status: normative as-built boundary. Rust is the product host, not the audio
+stream, model coordinator, or numerical runtime.
 
 ## Boundary
 
 Production Rust may own:
 
-- microphone and speaker stream objects required by the platform audio crate;
-- preallocated PCM lease pools and docking-ring endpoints;
-- Rust kcoro tasks that park on audio/control ring promises;
 - explicit settings mapping and backend capability requests;
 - opaque runtime/model/conversation/session handles;
+- an opaque native platform-audio handle and lifecycle controls;
+- Rust kcoro tasks for bounded host control/observation;
 - Tauri command adapters and bounded observer projection;
 - remote-provider networking, download, authentication, and persistence.
 
@@ -19,25 +18,27 @@ Production Rust may not own:
 
 - a tensor, logits vector, token stream, sampler, KV/cache plane, model state, or
   prompt assembly;
+- a microphone/speaker callback, PCM pointer, PCM lease pool, capture/playback
+  endpoint, resampler, or speech detector;
 - mel, resampling, VAD, Conformer, adapter, backbone, Depthformer, Mimi, Moshi,
   codec, or quantizer arithmetic;
 - model-pass tickets, pass recurrence, stage scheduling, or assembly dispatch;
 - a pointer into the resident model image or any numerical scratch plane;
 - a callback whose return is required for the native model to recur.
 
-The only high-rate bidirectional boundary is PCM/control docking. All model
-progress stays native.
+There is no high-rate Rust/native payload boundary. PCM, audio callbacks, and
+model progress stay native; Rust crosses only control and bounded observation.
 
 ## Target Flow
 
 ```mermaid
 flowchart LR
-    MIC["Rust mic stream callback"] --> CAP["capture PCM lease pool"]
-    CAP -->|"lease cell + doorbell"| NATIVE["native voice session"]
-    NATIVE -->|"lease cell + doorbell"| PLAY["playback PCM lease pool"]
-    PLAY --> SPK["Rust speaker stream callback"]
+    MIC["native CoreAudio capture callback"] --> CAP["native mirrored capture arena"]
+    CAP -->|"chunk record + edge"| NATIVE["native voice session"]
+    NATIVE -->|"playback lease + edge"| PLAY["native playback dock"]
+    PLAY --> SPK["native CoreAudio playback callback"]
 
-    TAURI["Tauri commands/settings"] --> CTRL["Rust control ring endpoint"]
+    TAURI["Tauri commands/settings"] --> CTRL["Rust opaque control wrapper"]
     CTRL --> NATIVE
     NATIVE --> OBS["bounded semantic/telemetry records"]
     OBS --> TAURI
@@ -45,9 +46,9 @@ flowchart LR
     NATIVE <-->|"private native pass SQ/CQ"| KERNEL["Flashkern + assembly"]
 ```
 
-Rust PCM tasks can run concurrently and park independently. A capture wait does
-not block playback, a playback wait does not block control, and none blocks the
-native model unless it has exhausted the relevant bounded buffer contract.
+Native capture, playback, session, and model continuations become runnable from
+their exact data/capacity callbacks on the shared bounded kcoro pool. No
+operation owns a waiter or Rust audio task.
 
 ## Production Rust API
 
@@ -58,21 +59,21 @@ pub struct Runtime(NonNull<lfm_runtime_t>);
 pub struct Model(NonNull<lfm_model_t>);
 pub struct Conversation(NonNull<lfm_conversation_t>);
 pub struct Session(NonNull<lfm_session_t>);
-pub struct AudioDock { /* private ring endpoints and PCM leases */ }
+pub struct PlatformAudio(NonNull<lfm_platform_audio_t>);
 ```
 
-Allowed methods are lifecycle, settings/control, PCM lease publication and
-consumption, status snapshot, and observer subscription. There is no public or
+Allowed methods are lifecycle, settings/control, opaque platform-audio control,
+status snapshot, and observer subscription. There is no public or
 private Rust method named `step`, `prefill`, `sample`, `token_pass`,
 `depth_frame`, `mel`, `encode`, or `decode` in the production local-inference
 call graph.
 
 `Model` opens an explicit path. Native code reads and binds the complete model;
 Rust never allocates or fills the weight image. `Conversation` is an opaque
-native state owner. `Session` runs native recurrence. `AudioDock` only attaches
-PCM/control rings.
+native state owner. `Session` runs native recurrence. `PlatformAudio` never
+exposes its native PCM endpoints.
 
-## PCM Lease ABI
+## Private Native PCM Lease ABI
 
 The ring cell is compact and versioned:
 
@@ -94,31 +95,28 @@ typedef struct LfmPcmLeaseV1 {
 } LfmPcmLeaseV1;
 ```
 
-The cell does not contain an unscoped raw pointer. A dock endpoint resolves the
+The cell does not contain an unscoped raw pointer. A native dock endpoint resolves the
 lease ID against its fixed buffer pool and generation. The producer retains the
 lease before release-publishing the cell. The consumer releases it after use or
 flush. Recycle occurs only after the final release callback returns.
 
-Capture makes the single hardware-buffer copy into a free preallocated block.
-Playback makes the single block-to-hardware copy required by the platform API.
-The native session mutates/consumes retained blocks in place between those
-edges.
+On macOS, `AudioUnitRender` writes capture directly into a free reservation in
+the page-mirrored arena. Playback makes the final block-to-hardware movement
+required by the platform API. The native session mutates/consumes retained
+blocks in place between those edges.
 
 ## Rust kcoro Role
 
-`crates/kcoro` remains a general-purpose callback executor for Rust functions
-and threads. In this product it supplies:
+`kcoro-sys` supplies the Rust host's bounded callback-resumed service. In this
+product that service owns:
 
-- independent capture, playback, control, and observer tasks;
-- exact-once promises for ring data/space/terminal events;
-- inherited pause/cancel scope words;
-- bounded SPSC endpoints and custom wakers;
+- control and observer tasks;
+- exact terminal/fault notification;
 - fixed worker/task capacity and bounded drain fairness.
 
-It does not mirror the native lane scheduler. It does not receive native
-model-pass completions. The shared vocabulary of ticket, epoch, terminal cause,
-and exact callback exists so global control is coherent, not so math crosses the
-language boundary.
+It does not receive PCM or native model-pass completions. The shared vocabulary
+of ticket, epoch, terminal cause, and exact callback exists so global control is
+coherent, not so audio or math crosses the language boundary.
 
 No Tokio, async-std, runtime vtable, polling stream adapter, or serialized IPC
 is allowed in the local realtime dock.
@@ -131,18 +129,19 @@ Creation order:
 2. create native runtime;
 3. open and warm the native model image;
 4. create native conversation and session;
-5. allocate PCM pools and rings;
-6. start Rust audio streams and kcoro dock tasks;
-7. attach dock endpoints to the native session;
-8. publish ready only after both sides acknowledge their doorbells and leases.
+5. query native device geometry and create native platform audio while the
+   session is `CREATED`;
+6. start the native session and AUHAL units;
+7. publish ready only after native endpoints, callbacks, and kcoro services are
+   mounted.
 
 Teardown order:
 
 1. advance root cancel/output epoch;
-2. close capture/control admission and stop platform callbacks;
+2. close capture/control admission and retire native platform callbacks;
 3. native session flushes stale playback and settles accepted work;
-4. join Rust dock tasks;
-5. detach and prove all PCM leases returned;
+4. settle the Rust host observer/control service;
+5. prove all native PCM leases returned;
 6. stop/join/destroy native session;
 7. release conversation, model, and runtime handles.
 
@@ -192,20 +191,17 @@ crates/liquid-audio/
   Cargo.toml                  # no Candle/moshi inference dependencies
   build.rs                    # native source/link manifest
   src/
-    lib.rs                    # public audio dock and opaque handles
-    ffi.rs                    # private lifecycle/control/PCM declarations
+    lib.rs                    # public opaque host API
+    native_voice.rs           # private lifecycle/control/platform-audio FFI
     handles.rs                # RAII only
-    audio/
-      input.rs                # platform input stream -> capture leases
-      output.rs               # playback leases -> platform output stream
-      dock.rs                 # kcoro ring tasks, no DSP
-    tauri.rs                  # small control/event mapping when shared
+    runtime/voice_runtime.rs  # retained host control/observer service
   native/
     include/
       lfm_voice.h             # sole public native ABI
-      lfm_audio_dock.h        # private PCM/control ring ABI
+      lfm_audio_dock.h        # private native PCM/control ABI
+      lfm_platform_audio.h    # native platform-audio lifecycle ABI
     src/
-      runtime/                # session, native SQ/CQ, pass slots
+      runtime/                # session, platform audio, native SQ/CQ, pass slots
       model/                  # model/conversation binding and recurrence
       frontend/               # VAD, resample, mel
       conformer/
@@ -216,8 +212,9 @@ crates/liquid-audio/
       x86_64/*.S
     tests/oracles/            # test-only, never release-linked
 
-crates/kcoro/
-  src/                        # general Rust callback executor and rings
+crates/kcoro-sys/
+  src/                        # safe host control/observer wrappers
+  vendor/kcoro_arena/         # native runtime, scopes, teams, continuations
 
 packages/desktop/src-tauri/src/voice/native/
   config.rs
@@ -227,9 +224,10 @@ packages/desktop/src-tauri/src/voice/native/
   status.rs
 ```
 
-There is no legacy/reference crate and no feature that restores Candle. Test
-oracles are independent fixture readers or native test-only objects, not a
-second production implementation.
+The workspace-only `liquid-audio-oracle` crate contains training/reference code
+and is absent from the production dependency graph. No feature restores it as a
+runtime fallback. Production gates are native implementation tests, not a
+second execution path kept beside the product.
 
 ## Deletion Ledger
 
@@ -279,10 +277,11 @@ Release gates fail on:
 
 ## Gates
 
-1. Rust audio streams continue bidirectionally while capture/playback tasks park
-   independently on exact ring edges.
-2. Root cancel wakes and settles all dock children and native session work once.
-3. No PCM payload copy occurs after the device callback copy.
+1. Native CoreAudio streams continue bidirectionally while capture/playback
+   continuations suspend and resume on exact ring edges.
+2. Root cancel settles all native dock children and session work once.
+3. Capture renders directly into the native arena and no intermediate PCM copy
+   occurs; playback performs only the final device movement.
 4. Native recurrence completes 1,000 tokens/frames with zero Rust model callbacks.
 5. Tauri/webview stall does not affect native or buffered audio progress.
 6. Full workspace and Tauri builds pass with Candle removed.

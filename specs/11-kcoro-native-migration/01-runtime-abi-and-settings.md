@@ -7,13 +7,13 @@ Baselines: EmberHarmony `321538f11749`; `kcoro_arena` `447d04f0246b`.
 ## Goal
 
 Define one stable product C ABI plus two deliberately separate private queue
-contracts. The native model SQ/CQ stays entirely native. The Rust/native docking
-ring carries only PCM/control leases. Tauri remains the product host; Rust owns
-OS audio streams, persisted settings, opaque handles, and bounded event
-projection. Rust kcoro parks and resumes audio/control I/O continuations only.
-It does not own model tensors, passes, tokens, recurrence, or numerical state.
-C++ opens model files and controls plans, buffers, barriers, and dispatch; every
-numerical body called by that control layer is architecture assembly.
+contracts. The native model SQ/CQ and PCM docks stay entirely native. Tauri
+remains the product host; Rust owns persisted settings, opaque handles, control,
+and bounded event projection. Native code owns OS audio streams and all
+audio/model continuations. Rust does not own platform PCM, model tensors,
+passes, tokens, recurrence, or numerical state. C++ opens model files and
+controls plans, buffers, barriers, and dispatch; every numerical body called by
+that control layer is architecture assembly or an explicit Accelerate/AMX seam.
 
 ## Current Boundary
 

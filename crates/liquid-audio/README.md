@@ -1,8 +1,10 @@
 # liquid-audio
 
-Native LFM2.5-Audio engine and transitional Rust host rim used by the desktop
-voice stack. C++ and architecture kernels own the inference substrate; the
-remaining Candle compatibility paths are migration work, not the target design.
+Native LFM2.5-Audio engine used by the desktop voice stack. Native
+C++/kcoro/Flashkern and architecture kernels own the model image, inference,
+turn policy, CoreAudio callbacks, and PCM docks. Rust exposes opaque lifecycle,
+control, and bounded observation only. Candle lives in the separate offline
+`liquid-audio-oracle` crate and is not linked into this production crate.
 
 - Detailed architecture docs: `docs/`.
 - Native C/C++ sources: `native/`.
@@ -13,18 +15,33 @@ Run from the repo root:
 
 ```sh
 cargo test -p liquid-audio --lib -- --nocapture
-cargo build -p liquid-audio --all-targets
+cargo test -p liquid-audio --tests -- --test-threads=1
 ```
 
-On Apple Silicon, the local-only Rosetta lane cross-builds Darwin x86_64 and
-runs the resulting tests explicitly through Rosetta:
+The complete native two-agent, memory-only speech gate is explicit because it
+opens the real checkpoint:
 
 ```sh
-./crates/liquid-audio/scripts/test-rosetta.sh
+LFM_MODEL_DIR=/absolute/LFM2.5-Audio-1.5B \
+  cargo test -p liquid-audio --test native_speech_to_speech \
+  -- --ignored --nocapture --test-threads=1
 ```
 
-The script reports whether Rosetta exposes AVX2. When it does not, feature-gated
-SIMD tests skip; x86 compilation, linking, ABI, scheduler, and dispatch checks
-still run. Actual AVX2/AVX-512 instruction correctness requires an x86 runner
-that advertises those features. Use `--require-avx2` when SIMD execution is the
-required gate; it fails instead of returning a partial green result.
+Set `LFM_SPEECH_GATE_AUDIBLE=1` to prebuffer the first deterministic exchange
+and play it through the default CoreAudio speaker. Use
+`LFM_SPEECH_GATE_AUDIBLE=stream` to exercise live generation cadence and report
+hardware-buffer underruns. Both monitors are native, bounded, callback driven,
+and read the same in-memory PCM blocks without creating an audio file.
+
+On Apple Silicon, cross-build the Darwin x86_64 suites and let macOS execute
+the test binaries through Rosetta directly:
+
+```sh
+cargo test -p kcoro-sys -p liquid-audio \
+  --target x86_64-apple-darwin -- --test-threads=1
+```
+
+Feature-gated SIMD tests skip when Rosetta does not expose the required ISA;
+x86 compilation, linking, scalar assembly ABI, scheduler, and dispatch checks
+still run. Actual AVX2/AVX-512 instruction correctness requires a native x86
+runner that advertises those features.

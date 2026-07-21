@@ -1,10 +1,10 @@
 # Native Runtime Map
 
-The production voice path is split between a thin Rust host and a native
-LFM2-Audio runtime. Rust owns platform callbacks, application control, and UI
-projection. Native C++/kcoro/Flashkern owns checkpoint loading, model state,
-turn policy, scheduling, PCM storage, and inference. The production
-`liquid-audio` dependency graph is Candle-free.
+The production voice path is split between a thin Rust product host and a native
+LFM2-Audio runtime. Rust owns application control, settings, opaque handles, and
+UI projection. Native C++/kcoro/Flashkern owns CoreAudio callbacks, checkpoint
+loading, model state, turn policy, scheduling, PCM storage, and inference. The
+production `liquid-audio` dependency graph is Candle-free.
 
 ## Crates
 
@@ -28,8 +28,8 @@ remains native.
 
 - Bun/TypeScript calls Tauri commands and receives bounded observations. It
   does not load a model or carry numerical payloads.
-- Tauri owns settings, platform stream lifetime, opaque native handles, and UI
-  event projection.
+- Tauri owns settings, opaque native handles, lifecycle commands, and UI event
+  projection. Platform stream lifetime is session-owned native state.
 - A hardware capture callback writes directly into a preallocated native PCM
   lease and publishes a typed chunk record. A playback callback resolves and
   drains a native playback lease. PCM is not transferred through stdout,

@@ -6,9 +6,9 @@ repository-structure follow-on ledger**, audited against the working tree on
 
 ## Ruling
 
-Rust owns platform microphone/speaker callbacks, opaque endpoint lifetimes,
-settings/control mapping, and host projection. Native code owns the exact
-Sesame detector and sample-clock endpointing policy. Rust owns no production
+Rust owns settings/control mapping, opaque native handles, and host projection.
+Native code owns platform microphone/speaker callbacks, endpoint lifetimes, the
+exact Sesame detector, and sample-clock endpointing policy. Rust owns no production
 model math, DSP, tensor, weight, token, sampling, KV/codec state, model-pass
 scheduling, recurrence, speech evidence, or turn boundary.
 
@@ -37,7 +37,7 @@ oracle is never a production fallback.
 | Context rollover | **Landed.** Fixed capacity+runway BF16 state, monotonic cursor, absolute RoPE range generation, nonmutating whole-action admission, causal row-by-row eviction, and in-place compaction. | None for the activation-state sliding-window contract. |
 | Shared model | **Landed.** Per-conversation state/scratch and a fair model-owned expected-value pass gate; engine `-EBUSY` does not leak as scheduling policy. | Capacity-2 continuations may improve overlap; fairness is already correct. |
 | Production graph | **Landed.** Desktop creates `NativeVoiceModel` and opaque native conversations/sessions only; default dependencies do not enable Candle or Moshi. | Native Metal/MLX remains a separate future backend and must fail explicitly until mounted. |
-| Physical audio dock | **Landed for LFM2.** Non-cloneable Rust endpoints pass ephemeral hardware spans into bounded native operations. Capture converts/downmixs directly into a generation-checked circular-arena reservation and publishes typed chunk/XRUN records; native Sesame and turn policy consume those views. Playback resolves a retained native lease only inside the device callback and preserves ticket/epoch/generation through release. Safe Rust `Runtime`/`Service`/single-producer `RealtimeNotifier` ownership is live; there are no progress heartbeats, Crossbeam audio edges, Rust PCM rings, utterance vectors, or Rust VAD buffers. | Keep device-fault, producer-quiescence, stale-epoch, full-ring/XRUN, and teardown races in the release gate. |
+| Physical audio dock | **Landed for LFM2 on macOS.** Native AUHAL callbacks own the device units and the sole capture/playback endpoints. CoreAudio renders capture directly into a page-mirrored, generation-checked circular-arena reservation; the callback publishes typed chunk/XRUN records consumed by native Sesame and turn policy. Native playback resolves a retained lease only in the device callback and preserves ticket/epoch/generation through release. Rust retains only an opaque platform-audio handle; there are no progress heartbeats, Crossbeam audio edges, Rust PCM endpoints/rings, utterance vectors, or Rust VAD buffers. | Keep real-device rate/geometry, fault, stale-epoch, full-ring/XRUN, and teardown races in the release gate. Other platforms fail explicitly until their native adapters land. |
 | Moshi | **Not ported.** It is offline/oracle-only and is not the shipped default. | A full native Moshi port is a subsequent tranche; this LFM2 ledger does not claim it. |
 
 ## Completed LFM2 cutover
@@ -222,6 +222,13 @@ offline/oracle-only and cannot serve as fallback.
 
 ## Gates and current evidence
 
+- On 2026-07-20, the complete default aarch64 suites passed: **86 kcoro tests**
+  plus **146 liquid-audio tests**, with only the one-million calibration and two
+  real-checkpoint gates ignored by default. The same default suites passed as
+  x86_64 binaries under Rosetta. Both ignored real-checkpoint gates were then
+  invoked explicitly on a complete LFM2.5-Audio main-plus-Mimi image: model
+  accounting passed, and the deterministic two-native-agent in-memory speech
+  exchange passed twice inside one invocation.
 - On 2026-07-16, the focused default-graph aarch64 run passed **32 tests** with
   two explicit opt-in tests ignored: native safetensors/schema 17/18,
   session/lease 8/9, rollover 3/3, mixed-turn admission 2/2, and tokenizer 2/2.
@@ -252,7 +259,7 @@ src/
   ffi.rs                    private opaque native declarations
   native_voice.rs           RAII lifecycle + opaque callback endpoints/events
   voice_api.rs              product VoiceEngine/VoiceEvent boundary
-  runtime/voice_runtime.rs  platform callbacks, kcoro host service, control/telemetry
+  runtime/voice_runtime.rs  opaque native service/platform handles, control/telemetry
   utils.rs                  model location/download helpers
 ```
 

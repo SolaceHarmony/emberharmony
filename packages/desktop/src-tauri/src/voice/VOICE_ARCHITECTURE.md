@@ -13,16 +13,17 @@ second live implementation, preserves the discarded Rust/Candle architecture.
 
 The local voice system has four ownership layers:
 
-1. **Rust owns platform callback endpoints.** It opens the OS microphone and
-   speaker, transfers one non-cloneable capture/playback endpoint into each
-   callback, translates persisted/Tauri settings, and projects bounded events
-   to SolidJS. It does not own PCM storage, VAD, endpointing, or resampling.
+1. **Native code owns platform callback endpoints.** It opens the OS microphone
+   and speaker, owns the sole capture/playback endpoints, and keeps PCM inside
+   native session arenas. Rust translates persisted/Tauri settings, holds an
+   opaque platform-audio handle, and projects bounded events to SolidJS.
 2. **The safe kcoro Rust seam owns host continuations.** Retained services and
    prebound realtime notifier leases resume control/observer work from exact
    native edges. Suspended work is state, not an attached Rust thread or waiter.
-3. **Native C++/kcoro owns control and storage.** It loads files, validates plans,
-   owns immutable weight views, circular PCM arenas, conversation/session state,
-   fixed services/team workers, ticket correlation, and assembly dispatch.
+3. **Native C++/kcoro owns callbacks, control, and storage.** It loads files,
+   validates plans, owns CoreAudio units, immutable weight views, circular PCM
+   arenas, conversation/session state, fixed services/team workers, ticket
+   correlation, and assembly dispatch.
 4. **Assembly owns every numerical operation.** AArch64 and x86_64 assembly own
    embedding, convolution, FFT, mel, normalization, attention, activations,
    sampling, codec, recurrence-state transforms, and GEMM. On Apple, a selected
@@ -39,17 +40,17 @@ only PCM/control docking events and observational snapshots.
 flowchart LR
     UI["SolidJS controls and visualization"]
     Tauri["Tauri commands and settings"]
-    Audio["Rust audio host: microphone/speaker callbacks"]
-    Dock["safe kcoro host services + opaque endpoints"]
+    Audio["native CoreAudio microphone/speaker callbacks"]
+    Dock["native PCM docks + session arenas"]
     Native["native kcoro: handles, buffers, routes, tickets"]
     Rings["Native model SQ/CQ and exact doorbells"]
     Lanes["Fixed Flashkern lane team"]
     Asm["AArch64 or x86_64 assembly math"]
 
     UI -->|"start, stop, mic, interrupt, settings"| Tauri
-    Tauri --> Audio
-    Audio -->|"ephemeral device span"| Dock
-    Dock -->|"bounded native span operation"| Native
+    Tauri -->|"opaque platform-audio control"| Native
+    Audio -->|"direct native reservation/render"| Dock
+    Dock --> Native
     Native --> Rings --> Lanes --> Asm
     Asm --> Lanes --> Rings --> Native
     Native -->|"ticketed playback lease"| Dock
@@ -58,9 +59,9 @@ flowchart LR
     Native -. "sampled telemetry only" .-> Tauri
 ```
 
-The arrows between Rust and native code carry small control records and retained
-buffer identities. They do not carry tensors, logits, KV rows, model tokens, or
-per-pass callbacks.
+The arrows between Rust and native code carry only small control records and
+bounded observations. They do not carry PCM, buffer identities, tensors,
+logits, KV rows, model tokens, or per-pass callbacks.
 
 ## Callback-Only Progress
 
@@ -71,15 +72,13 @@ continuation becomes runnable exactly once.
 ```mermaid
 sequenceDiagram
     participant HAL as OS audio callback
-    participant R as Rust opaque endpoint
     participant K as Native PCM dock
     participant N as Native session
     participant F as Flashkern lanes
     participant A as Assembly
 
-    HAL->>R: callback with ephemeral interleaved span
-    R->>K: bounded write through CaptureSink
-    K->>K: reserve/convert/publish native chunk
+    HAL->>K: callback renders directly into native reservation
+    K->>K: commit typed native chunk
     K-->>N: exact capture edge
     N->>F: submit native pass chain
     F->>A: dispatch numerical stages
@@ -87,9 +86,9 @@ sequenceDiagram
     F-->>N: exact native CQ completion
     Note over N,F: token/frame recurrence remains native
     N-->>K: publish correlated playback lease
-    HAL->>R: request device buffer
-    R->>K: resolve/render/release exact lease
-    R-->>HAL: callback returns filled device span
+    HAL->>K: request device buffer
+    K->>K: resolve/render/release exact lease
+    K-->>HAL: callback returns filled device span
 ```
 
 `stop`, `interrupt`, and microphone enablement are control edges. They bump an
@@ -106,7 +105,7 @@ polled; stale publication is rejected at the next complete pass boundary.
 | activation and scratch planes | native session/conversation | fixed lanes and assembly only |
 | logits and sampler scratch | native conversation | assembly only |
 | Mimi/codec state | native conversation | assembly only |
-| microphone circular arena | native session | HAL callback supplies ephemeral source; native conversion writes reservation |
+| microphone circular arena | native session | CoreAudio renders directly into a generation-checked reservation |
 | speaker playback pool | native session | Mimi/resampler writes reservation; HAL callback resolves and retires lease |
 | capture/playback descriptors | native dock | ticket, epoch, sequence, region/lease generation and span bounds |
 | UI event queue | Tauri host | compact metadata and copied display text only |
@@ -134,8 +133,8 @@ active working-tree work.
   implementations with no external numerical symbol.
 - Native sampler fixtures pass on Apple Silicon and x86_64 under Rosetta with
   the same seeded token stream.
-- Native circular capture plus exact Sesame detection owns turn evidence and
-  endpointing. The non-cloneable Rust callback endpoints hold no PCM buffer.
+- Native CoreAudio plus circular capture and exact Sesame detection own device
+  PCM, turn evidence, and endpointing. Rust has no callback endpoint.
 - Native playback retains ticket/epoch/generation through final device release;
   no PCM payload enters `VoiceEvent` or Tauri IPC.
 

@@ -33,6 +33,10 @@ fn main() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
         println!("cargo::rustc-link-lib=framework=Accelerate");
         println!("cargo::rustc-link-lib=framework=Security");
+        println!("cargo::rustc-link-lib=framework=AudioUnit");
+        println!("cargo::rustc-link-lib=framework=AudioToolbox");
+        println!("cargo::rustc-link-lib=framework=CoreAudio");
+        println!("cargo::rustc-link-lib=framework=CoreFoundation");
     }
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         println!("cargo::rustc-link-lib=bcrypt");
@@ -50,6 +54,10 @@ fn main() {
     println!("cargo::rerun-if-changed=native/include/lfm_session.h");
     println!("cargo::rerun-if-changed=native/include/lfm_audio_dock.h");
     println!("cargo::rerun-if-changed=native/include/lfm_capture_policy.h");
+    println!("cargo::rerun-if-changed=native/include/lfm_platform_audio.h");
+    println!("cargo::rerun-if-changed=native/src/runtime/lfm_platform_audio.cpp");
+    println!("cargo::rerun-if-changed=native/src/runtime/lfm_platform_audio_internal.h");
+    println!("cargo::rerun-if-changed=native/src/runtime/lfm_runtime_internal.h");
     println!("cargo::rerun-if-changed=native/include/lfm_visibility.h");
     println!("cargo::rerun-if-changed=native/include/lfm_asm_visibility.h");
     println!("cargo::rerun-if-changed=native/src/runtime/voice_session.cpp");
@@ -57,6 +65,7 @@ fn main() {
     let mut session = cc::Build::new();
     session
         .file("native/src/runtime/voice_session.cpp")
+        .file("native/src/runtime/lfm_platform_audio.cpp")
         .cpp(true)
         .std("c++23")
         .opt_level(3)
@@ -71,6 +80,28 @@ fn main() {
         session.define("LFM_BUILD_ORACLE", None);
     }
     session.compile("lfm_voice_session");
+
+    /* Native-only product truth gate. It is a separate archive: ordinary
+     * binaries never reference its one entry point, so the linker omits it.
+     * The Rust integration test is only an ABI launcher; all model, PCM,
+     * coroutine, watchdog, and evidence logic remains in this C++23 TU. */
+    println!("cargo::rerun-if-changed=native/tests/native_speech_to_speech.cpp");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        let mut native_tests = cc::Build::new();
+        native_tests
+            .file("native/tests/native_speech_to_speech.cpp")
+            .cpp(true)
+            .std("c++23")
+            .opt_level(3)
+            .warnings(true)
+            .warnings_into_errors(true)
+            .flag("-pthread")
+            .flag_if_supported("-fvisibility=hidden")
+            .include("native/include")
+            .include("native/src/runtime")
+            .include("../kcoro-sys/vendor/kcoro_arena/include");
+        native_tests.compile("lfm_native_truth_gate");
+    }
     cc::Build::new()
         .file("native/src/runtime/voice_protocol_c.c")
         .std("c11")

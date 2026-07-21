@@ -4,7 +4,8 @@ Status: normative design. The C arena ticket machinery remains a conformance
 oracle. The current working tree mounts retained descriptors and both model-pass
 SQ/CQ endpoints natively; the former Rust inference broker is deleted. Native
 parent actors, service-class policy, recurrence, Tauri projection, and the
-visualizer remain open. Rust kcoro is reserved for PCM/control docking.
+visualizer remain open. Rust kcoro is reserved for host control/observation;
+native kcoro owns PCM docking.
 
 Baselines: EmberHarmony `321538f11749`; `kcoro_arena` `447d04f0246b`.
 
@@ -721,10 +722,10 @@ high-water mark so a model plan cannot silently consume the lifecycle reserve.
    private bounded SQ/CQ, admits only with reserved completion capacity, and
    binds final-fence completion to one CQ publication. The former C arena
    ticket/callback path is deleted from the production engine.
-3. **Implemented docking foundation (`3a5b1431`):** `crates/kcoro` owns exact
-   promises, bounded workers/rings, scope words, and record definitions used as
-   the Rust PCM/control docking substrate and conformance oracle. It is not the
-   model-pass broker.
+3. **Implemented docking foundation (`3a5b1431`):** the restored native kcoro
+   runtime owns exact continuations, bounded workers/rings, scopes, teams, and
+   records used by the native PCM/control substrate. Safe Rust wrappers own only
+   host control/observation and are not the model-pass broker.
 4. **Current endpoint mount:** the private bridge retains descriptor leases
    through CQ consumption; `submit_pass` owns native SQ submission and native CQ
    wait. The Rust broker/callback registration layer is deleted. Native

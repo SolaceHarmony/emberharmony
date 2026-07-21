@@ -73,8 +73,11 @@ unsafe extern "C" fn step(raw: *mut c_void) -> *mut c_void {
             std::ptr::null_mut()
         }
         1 => {
-            unsafe { koro_cont_finish(raw) };
-            1_usize as *mut c_void
+            if unsafe { koro_cont_finish(raw) } != 0 {
+                1_usize as *mut c_void
+            } else {
+                std::ptr::null_mut()
+            }
         }
         state => panic!("unexpected resume point {state}"),
     }
@@ -106,12 +109,15 @@ unsafe extern "C" {
     fn koro_cont_argument(cont: *mut c_void) -> *mut c_void;
     fn koro_cont_state_get(cont: *const c_void) -> u32;
     fn koro_cont_state_set(cont: *mut c_void, state: u32, suspend_kind: u32);
-    fn koro_cont_finish(cont: *mut c_void);
+    fn koro_cont_finish(cont: *mut c_void) -> i32;
 }
 
 fn cpu(runtime: *mut c_void) -> u64 {
     let mut value = 0;
-    assert_eq!(unsafe { kc_runtime_worker_cpu_ns_for_test(runtime, &mut value) }, 0);
+    assert_eq!(
+        unsafe { kc_runtime_worker_cpu_ns_for_test(runtime, &mut value) },
+        0
+    );
     value
 }
 
@@ -140,7 +146,10 @@ fn bounded_workers_are_silent_before_and_after_a_callback_resume() {
     std::thread::sleep(Duration::from_millis(300));
     let cold = idle(runtime, Duration::from_secs(1));
     eprintln!("cold kcoro pool idle: {cold:.3}% native-worker CPU");
-    assert!(cold < IDLE_MAX_PCT, "kcoro pool spins cold at {cold:.3}% CPU");
+    assert!(
+        cold < IDLE_MAX_PCT,
+        "kcoro pool spins cold at {cold:.3}% CPU"
+    );
 
     let edge = Edge {
         entered: AtomicBool::new(false),

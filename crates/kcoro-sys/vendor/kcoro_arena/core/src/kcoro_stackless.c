@@ -47,9 +47,9 @@ int koro_cont_create_on(kc_runtime_t *runtime,
     continuation->slot = UINT32_MAX;
     continuation->suspend_kind = KORO_SUSPEND_CALLBACK;
     atomic_init(&continuation->run_state, KORO_NEW);
-    atomic_init(&continuation->wake_pending, 0);
     atomic_init(&continuation->refs, 1);
     atomic_init(&continuation->current_worker, UINT32_MAX);
+    atomic_init(&continuation->registered, 0);
 
     const int status = kc_runtime_register_continuation_internal(
         runtime, continuation);
@@ -121,8 +121,8 @@ kc_ticket_id koro_cont_identity(const koro_cont_t *continuation)
 int koro_cont_destroy(koro_cont_t *continuation)
 {
     if (!continuation) return 0;
-    const int state = atomic_load_explicit(&continuation->run_state,
-                                           memory_order_acquire);
+    const int state = koro_run_base(atomic_load_explicit(
+        &continuation->run_state, memory_order_acquire));
     if (state != KORO_NEW && state != KORO_DONE) return -EBUSY;
     const int status = kc_runtime_unregister_continuation_internal(
         continuation->runtime, continuation);
@@ -164,9 +164,33 @@ void koro_cont_state_set(koro_cont_t *continuation, uint32_t state,
     continuation->suspend_kind = suspend_kind;
 }
 
-void koro_cont_finish(koro_cont_t *continuation)
+int koro_cont_finish(koro_cont_t *continuation)
 {
-    if (!continuation) return;
-    continuation->state = 0;
-    continuation->completed = 1;
+    if (!continuation) return 0;
+    for (;;) {
+        int state = atomic_load_explicit(&continuation->run_state,
+                                         memory_order_acquire);
+        if (koro_run_base(state) == KORO_RUNNING &&
+            !koro_run_has_wake(state)) {
+            int expected = state;
+            if (!atomic_compare_exchange_weak_explicit(
+                    &continuation->run_state, &expected, KORO_COMPLETING,
+                    memory_order_acq_rel, memory_order_acquire)) continue;
+            continuation->state = 0;
+            continuation->completed = 1;
+            return 1;
+        }
+        if (koro_run_base(state) == KORO_RUNNING &&
+            koro_run_has_wake(state)) {
+            int expected = state;
+            if (!atomic_compare_exchange_weak_explicit(
+                    &continuation->run_state, &expected, KORO_RUNNING,
+                    memory_order_acq_rel, memory_order_acquire)) continue;
+            continuation->state = 0;
+            continuation->completed = 0;
+            continuation->suspend_kind = KORO_SUSPEND_YIELD;
+            return 0;
+        }
+        abort();
+    }
 }

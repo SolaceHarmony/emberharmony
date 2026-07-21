@@ -34,6 +34,12 @@ makes the retained session delivery continuation runnable; its
 coordinator-owned `SessionAction` performs exact-generation collection without
 installing an operation waiter for numerical or playback capacity.
 
+That pooled route-record re-entry is transitional, not the coroutine
+destination. The numerical bridge is already one saved stackless frame. Each
+multi-hop route still needs its own reusable frame containing the program
+counter, fixed locals, exact ticket, and retained record references; exact
+completion/capacity/control edges make that frame runnable on the shared pool.
+
 **No `BlockDomain` exists in the working tree.** The current `gang_lease` is an
 exclusive lease over the one fixed team, not proof of two completion domains.
 There are no private per-block stage boards, scratch mounts, CQs, return
@@ -131,7 +137,7 @@ The broker uses this deterministic policy:
   overlap. Later relaxation requires an explicit disjoint `AccessSet` and a
   dedicated test. “Probably disjoint” is not an access contract.
 - No numerical program performs a cross-block barrier. A real join settles
-  through exact CQs and the route instance outside both block domains.
+  through exact CQs and the route frame outside both block domains.
 
 The landed V2.0 gate already proves four physical workers can process eight
 fixed logical partitions with the same fold order on the current single board.
@@ -157,9 +163,9 @@ remain their own cooperative stages—the final-return callback does not seriali
 their math.
 
 Dynamic audio-fragment quorum is a different primitive. Missing media leaves a
-durable route record dormant before numerical admission; it never mounts half a
-team or assigns a thread to an absent fragment. The final fragment makes the
-route runnable. Media ordering, model position, route identity, and lane
+saved route frame dormant before numerical admission; its retained media locals
+record the partial quorum. It never mounts half a team or assigns a worker to an
+absent fragment. The final fragment makes the exact frame runnable. Media ordering, model position, route identity, and lane
 identity remain separate as specified in design 14.
 
 Block-mode kcoro therefore uses bounded per-domain ready rings plus lane-affine
@@ -307,7 +313,7 @@ Each step is independently gated and leaves a correct fallback geometry:
 1. **V2.0 — safety subset landed.** 128-byte Apple hot-word/SQ-CQ isolation,
    closed current request/layer/modality selectors, invalid-lane rejection,
    four-worker/eight-logical-lane parity, and zero-spin are green.
-2. **V2.1 — bounded routed V1 audio, landed.** A total three-node/four-outcome
+2. **V2.1 — bounded routed V1 audio, route frames still open.** A total three-node/four-outcome
    table retains one exact slot across `TOKEN_PASS -> DEPTH_FRAME -> MIMI_DECODE`,
    commits token context, writes equal-rate Mimi PCM directly into pre-admitted
    playback or native-resamples codec scratch into a device-rate reservation,
@@ -317,8 +323,10 @@ Each step is independently gated and leaves a correct fallback geometry:
    and callback-driven fair broker replace the historical exclusive-producer
    and synchronous-collection seam; each node releases its compute slot before
    it re-enters the ready set. Session-facing asynchronous terminal
-   collection and total model-owned token classification are now mounted; block
-   concurrency is the next scheduler boundary.
+   collection and total model-owned token classification are now mounted. Move
+   each multi-hop route's program counter and locals out of pooled record-driven
+   service re-entry into one reusable saved frame before V2.2; block concurrency
+   is the next independent scheduler boundary.
 3. **V2.2 — extract block completion state, open.** Create two real
    `BlockDomain`s with private stage boards, scratch mounts, SPSC CQs, return
    accounting, and exact doorbells. Until all of those owners exist, the engine

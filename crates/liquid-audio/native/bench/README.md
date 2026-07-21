@@ -264,7 +264,7 @@ clang -O3 -std=c11 -Wall -Wextra -Wpedantic -Werror \
   crates/liquid-audio/native/bench/monarch_fused_coop.c \
   crates/kcoro-sys/vendor/kcoro_arena/core/src/kc_runtime.c \
   crates/kcoro-sys/vendor/kcoro_arena/core/src/kc_service.c \
-  crates/kcoro-sys/vendor/kcoro_arena/core/src/kc_continuation.c \
+  crates/kcoro-sys/vendor/kcoro_arena/core/src/kcoro_stackless.c \
   crates/kcoro-sys/vendor/kcoro_arena/core/src/kc_team.c \
   crates/kcoro-sys/vendor/kcoro_arena/core/src/kc_doorbell.c \
   crates/kcoro-sys/vendor/kcoro_arena/port/posix.c \

@@ -12,8 +12,8 @@ conversation semantics, full-pass interruption, bounded memory, precise wakes,
 no post-load disk traffic, no hidden fallback, and the actual Tauri microphone
 and speaker path. It also means the local numerical stack has the fixed shape
 native session -> native pass descriptor -> C++ fixed executor -> architecture
-assembly. Rust publishes and consumes PCM/control leases only; it has no model
-descriptor, token, arithmetic, or payload-bearing math call.
+assembly. Native callbacks publish and consume PCM leases; Rust has no PCM,
+model descriptor, token, arithmetic, or payload-bearing call.
 
 No phase becomes the production default because it compiles or wins a microbench.
 It advances only when its numerical, lifecycle, memory, latency, dependency, and
@@ -29,7 +29,7 @@ The migration starts with useful tests, not a blank slate:
 | native attention/conv/MLP parity | `src/compute/flashkern/native_engine.rs:592-1050` | Preserve as boundary fixtures independent of Candle calls. |
 | former lane/fanout numerical tests | `fanout.rs` is deleted in the current working tree; architecture kernel modules retain the live fixtures | Keep stable fixture vectors in native/assembly tests; do not restore the Rust implementation. |
 | engine idle/zero-spin test | `tests/engine_idle_zero_spin.rs` | Extend to coordination signal-one and fixed-executor blocking wait/syscall assertions. |
-| Rust kcoro races and edge tests | `crates/kcoro/tests/` at `3a5b1431` | Preserve 100,000 terminal races, ring wrap/full/close, self-wake exclusion, and stop-admission teardown for the PCM/control dock. |
+| kcoro races and edge tests | `crates/kcoro-sys/tests/` | Preserve terminal races, continuation migration, ring wrap/full/close, self-wake exclusion, zero-spin idle, and stop-admission teardown for native audio/control. |
 | native SQ/CQ lifecycle | `flashkern_engine.cpp:1898-2003` and native-engine tests | Preserve raw no-Rust progress, exact descriptor cleanup, 10,000 passes, zero live slots, AArch64/x86 execution, and idle CPU. Extend to one million passes and stop-during-active-pass races. |
 | scalar assembly ABI | `scalar_assembly_math_abi_is_bit_exact_without_simd_feature_gates` | Run on AArch64 and x86_64/Rosetta even when feature-gated SIMD tests skip. |
 | speculative prefill and cache tests | `tests/speculative_prefill.rs`, `tests/cache_equivalence.rs` | Re-express against native conversation marks and suffix state. |
@@ -496,9 +496,9 @@ The migration is complete only when:
 
 - G0 through G11 pass on required architectures;
 - LFM2 and the product-selected Moshi path run entirely behind the native ABI;
-- runtime weights, activations, model state, logits, sampler state, and codec
-  state never enter Rust; Rust owns only PCM streams/leases and control facts and
-  receives no internal model CQ records;
+- runtime weights, activations, PCM, model state, logits, sampler state, and
+  codec state never enter Rust; Rust owns only opaque handles, control facts,
+  and bounded outward observations and receives no internal model CQ records;
 - Rust invokes audio/config/lifecycle/control methods only; C++ owns loading,
   plans, buffers, queues, barriers, and dispatch, while every numerical operation
   is implemented by the selected architecture assembly table;

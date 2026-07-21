@@ -10,6 +10,14 @@ const EDEADLK: i32 = 35;
 const EBUSY: i32 = 16;
 const EINVAL: i32 = 22;
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+const ECANCELED: i32 = 89;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const ECANCELED: i32 = 125;
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+const EAGAIN: i32 = 35;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const EAGAIN: i32 = 11;
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
 const ESTALE: i32 = 70;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 const ESTALE: i32 = 116;
@@ -165,6 +173,51 @@ struct Retired {
     changed: Condvar,
 }
 
+struct RetiredGate {
+    state: Mutex<(bool, bool)>,
+    changed: Condvar,
+}
+
+struct StartGate {
+    entered: Barrier,
+    release: Barrier,
+}
+
+unsafe extern "C" fn start_admitted(context: *mut c_void, member: u32) {
+    let gate = unsafe { &*context.cast::<StartGate>() };
+    assert_eq!(member, 1);
+    gate.entered.wait();
+    gate.release.wait();
+}
+
+impl RetiredGate {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new((false, false)),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn wait_entered(&self) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut state = self.state.lock().unwrap();
+        while !state.0 {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "team retirement callback did not enter"
+            );
+            state = self.changed.wait_timeout(state, remaining).unwrap().0;
+        }
+    }
+
+    fn release(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.1 = true;
+        self.changed.notify_all();
+    }
+}
+
 impl Retired {
     fn new() -> Self {
         Self {
@@ -188,6 +241,24 @@ unsafe extern "C" fn retired_edge(context: *mut c_void, _generation: u64) {
     let retired = unsafe { &*context.cast::<Retired>() };
     *retired.done.lock().unwrap() = true;
     retired.changed.notify_all();
+}
+
+unsafe extern "C" fn blocked_retired_edge(context: *mut c_void, _generation: u64) {
+    let gate = unsafe { &*context.cast::<RetiredGate>() };
+    let mut state = gate.state.lock().unwrap();
+    state.0 = true;
+    gate.changed.notify_all();
+    while !state.1 {
+        state = gate.changed.wait(state).unwrap();
+    }
+}
+
+unsafe extern "C" fn noop_member(
+    _context: *mut c_void,
+    _index: u32,
+    _members: u32,
+    _generation: u64,
+) {
 }
 
 unsafe extern "C" fn chain_member(context: *mut c_void, index: u32, members: u32, generation: u64) {
@@ -541,6 +612,7 @@ unsafe extern "C" {
     fn kc_port_monotonic_ns() -> u64;
     fn kc_runtime_create(config: *const RuntimeConfig, out: *mut *mut c_void) -> i32;
     fn kc_runtime_start(runtime: *mut c_void) -> i32;
+    fn kc_runtime_join_all(runtime: *mut c_void) -> i32;
     fn kc_runtime_request_stop(runtime: *mut c_void);
     fn kc_runtime_join(runtime: *mut c_void) -> i32;
     fn kc_runtime_destroy(runtime: *mut c_void) -> i32;
@@ -579,6 +651,13 @@ unsafe extern "C" {
         member: u32,
         point: u32,
         ready: Option<unsafe extern "C" fn(*mut c_void, u64)>,
+        context: *mut c_void,
+    ) -> i32;
+    fn kc_team_inject_start_failure_for_test(team: *mut c_void, after_started: u32) -> i32;
+    fn kc_team_inject_start_pause_for_test(
+        team: *mut c_void,
+        member: u32,
+        pause: Option<unsafe extern "C" fn(*mut c_void, u32)>,
         context: *mut c_void,
     ) -> i32;
 }
@@ -665,6 +744,7 @@ fn completion_edges_drive_every_generation_and_terminal_teardown() {
     /* The terminal callback publishes stop. This join only tears down the
      * stopped team; it is not a per-generation observation primitive. */
     retired.wait();
+    assert_eq!(unsafe { kc_runtime_join_all(runtime) }, 0);
     assert_eq!(unsafe { kc_team_join(team) }, 0);
 
     let mut snapshot = TeamSnapshot {
@@ -794,7 +874,6 @@ fn completion_edge_resumes_state_before_the_next_dispatch() {
     /* The team edge wakes the suspended service state, the service publishes
      * generation two, and that generation's edge publishes terminal stop. */
     retired.wait();
-    assert_eq!(unsafe { kc_team_join(team) }, 0);
     assert_eq!(handoff.phase.load(Ordering::Acquire), 4);
     assert_eq!(handoff.bad.load(Ordering::Acquire), 0);
     assert_eq!(handoff.active.load(Ordering::Acquire), 0);
@@ -811,9 +890,14 @@ fn completion_edge_resumes_state_before_the_next_dispatch() {
         assert_eq!(callbacks.load(Ordering::Acquire), 1);
     }
 
-    assert_eq!(unsafe { kc_team_destroy(team) }, 0);
+    /* Retire the still-dormant handoff service, then use the runtime's
+     * administrative terminal acknowledgement to prove both callbacks have
+     * returned before either callback context is released. */
     assert_eq!(unsafe { kc_service_notifier_destroy(notifier) }, 0);
     unsafe { kc_service_request_stop(service) };
+    assert_eq!(unsafe { kc_runtime_join_all(runtime) }, 0);
+    assert_eq!(unsafe { kc_team_join(team) }, 0);
+    assert_eq!(unsafe { kc_team_destroy(team) }, 0);
     assert_eq!(unsafe { kc_service_join(service) }, 0);
     assert_eq!(unsafe { kc_service_destroy(service) }, 0);
     unsafe { kc_runtime_request_stop(runtime) };
@@ -883,6 +967,7 @@ fn concurrent_publishers_cannot_overwrite_the_accepted_ticket_edge() {
      * accidental post-completion rejection. */
     race.gate.wait();
     retired.wait();
+    assert_eq!(unsafe { kc_runtime_join_all(runtime) }, 0);
     assert_eq!(unsafe { kc_team_join(team) }, 0);
     assert_eq!(race.members.load(Ordering::Acquire), MEMBER_COUNT);
     assert_eq!(race.bad.load(Ordering::Acquire), 0);
@@ -999,6 +1084,7 @@ fn quorum_snapshot_tracks_one_exact_generation_without_duplicate_execution() {
     quorum.retire.wait();
 
     retired.wait();
+    assert_eq!(unsafe { kc_runtime_join_all(runtime) }, 0);
     assert_eq!(unsafe { kc_team_join(team) }, 0);
     assert_eq!(quorum.bad.load(Ordering::Acquire), 0);
     assert_eq!(quorum.callbacks.load(Ordering::Acquire), 1);
@@ -1062,6 +1148,7 @@ fn never_entered_injection_preserves_exact_partial_quorum_without_completion() {
         0
     );
     retired.wait();
+    assert_eq!(unsafe { kc_runtime_join_all(runtime) }, 0);
     assert_eq!(unsafe { kc_team_join(team) }, 0);
 
     assert_eq!(injected.status.load(Ordering::Acquire), 0);
@@ -1135,6 +1222,7 @@ fn one_million_healthy_generations_report_the_fixed_team_budget_floor() {
         0
     );
     retired.wait();
+    assert_eq!(unsafe { kc_runtime_join_all(runtime) }, 0);
     assert_eq!(unsafe { kc_team_join(team) }, 0);
     assert_eq!(healthy.bad.load(Ordering::Acquire), 0);
     assert_eq!(
@@ -1188,6 +1276,170 @@ fn fixed_team_rejects_members_that_cannot_fit_the_quorum_mask() {
     let mut team = std::ptr::null_mut();
     assert_eq!(unsafe { kc_team_create(&config, &mut team) }, -EINVAL);
     assert!(team.is_null());
+    retire_runtime(runtime);
+}
+
+#[test]
+fn partial_start_retires_only_started_frames_and_remains_destroyable() {
+    kcoro_sys::link_anchor();
+    let runtime = runtime(MEMBER_COUNT);
+    let retired = Retired::new();
+    let config = TeamConfig {
+        size: size_of::<TeamConfig>() as u32,
+        abi_version: 1,
+        member_count: MEMBER_COUNT,
+        reserved: 0,
+        member: Some(noop_member),
+        context: std::ptr::null_mut(),
+        runtime,
+        retired: Some(retired_edge),
+        retired_context: (&retired as *const Retired).cast_mut().cast(),
+    };
+    let mut team = std::ptr::null_mut();
+    assert_eq!(unsafe { kc_team_create(&config, &mut team) }, 0);
+    assert_eq!(unsafe { kc_team_inject_start_failure_for_test(team, 2) }, 0);
+    assert_eq!(unsafe { kc_team_start(team) }, -EAGAIN);
+    retired.wait();
+    assert_eq!(unsafe { kc_runtime_join_all(runtime) }, 0);
+    assert!(unsafe { kc_team_start(team) } < 0);
+    assert!(unsafe { kc_team_dispatch_notify(team, 1, None, std::ptr::null_mut()) } < 0);
+
+    let mut snapshot = TeamSnapshot {
+        size: size_of::<TeamSnapshot>() as u32,
+        abi_version: 1,
+        member_count: 0,
+        started_members: 0,
+        dispatched_generation: 0,
+        completed_generation: 0,
+        completed_members: 0,
+        started: 0,
+        stop_requested: 0,
+        joined: 0,
+    };
+    assert_eq!(unsafe { kc_team_snapshot_get(team, &mut snapshot) }, 0);
+    assert_eq!(snapshot.started_members, 2);
+    assert_eq!(snapshot.stop_requested, 1);
+    assert_eq!(snapshot.joined, 1);
+    assert_eq!(unsafe { kc_team_join(team) }, 0);
+    assert_eq!(unsafe { kc_team_destroy(team) }, 0);
+    retire_runtime(runtime);
+}
+
+#[test]
+fn stopping_an_unstarted_team_has_no_retirement_callback_to_outlive_it() {
+    kcoro_sys::link_anchor();
+    let runtime = runtime(MEMBER_COUNT);
+    let retired = Retired::new();
+    let config = TeamConfig {
+        size: size_of::<TeamConfig>() as u32,
+        abi_version: 1,
+        member_count: MEMBER_COUNT,
+        reserved: 0,
+        member: Some(noop_member),
+        context: std::ptr::null_mut(),
+        runtime,
+        retired: Some(retired_edge),
+        retired_context: (&retired as *const Retired).cast_mut().cast(),
+    };
+    let mut team = std::ptr::null_mut();
+    assert_eq!(unsafe { kc_team_create(&config, &mut team) }, 0);
+    unsafe { kc_team_request_stop(team) };
+    assert!(!*retired.done.lock().unwrap());
+    assert_eq!(unsafe { kc_team_join(team) }, 0);
+    assert_eq!(unsafe { kc_team_destroy(team) }, 0);
+    retire_runtime(runtime);
+}
+
+#[test]
+fn concurrent_stop_cannot_overtake_start_admission_and_lose_retirement() {
+    kcoro_sys::link_anchor();
+    let runtime = runtime(MEMBER_COUNT);
+    let retired = Retired::new();
+    let gate = StartGate {
+        entered: Barrier::new(2),
+        release: Barrier::new(2),
+    };
+    let config = TeamConfig {
+        size: size_of::<TeamConfig>() as u32,
+        abi_version: 1,
+        member_count: MEMBER_COUNT,
+        reserved: 0,
+        member: Some(noop_member),
+        context: std::ptr::null_mut(),
+        runtime,
+        retired: Some(retired_edge),
+        retired_context: (&retired as *const Retired).cast_mut().cast(),
+    };
+    let mut team = std::ptr::null_mut();
+    assert_eq!(unsafe { kc_team_create(&config, &mut team) }, 0);
+    assert_eq!(
+        unsafe {
+            kc_team_inject_start_pause_for_test(
+                team,
+                1,
+                Some(start_admitted),
+                (&gate as *const StartGate).cast_mut().cast(),
+            )
+        },
+        0
+    );
+
+    let raw = team as usize;
+    let starter = std::thread::spawn(move || unsafe { kc_team_start(raw as *mut c_void) });
+    gate.entered.wait();
+    unsafe { kc_team_request_stop(team) };
+    gate.release.wait();
+    assert_eq!(starter.join().unwrap(), -ECANCELED);
+
+    retired.wait();
+    assert_eq!(unsafe { kc_runtime_join_all(runtime) }, 0);
+    let mut snapshot = TeamSnapshot {
+        size: size_of::<TeamSnapshot>() as u32,
+        abi_version: 1,
+        member_count: 0,
+        started_members: 0,
+        dispatched_generation: 0,
+        completed_generation: 0,
+        completed_members: 0,
+        started: 0,
+        stop_requested: 0,
+        joined: 0,
+    };
+    assert_eq!(unsafe { kc_team_snapshot_get(team, &mut snapshot) }, 0);
+    assert_eq!(snapshot.started_members, 2);
+    assert_eq!(snapshot.stop_requested, 1);
+    assert_eq!(snapshot.joined, 1);
+    assert_eq!(unsafe { kc_team_join(team) }, 0);
+    assert_eq!(unsafe { kc_team_destroy(team) }, 0);
+    retire_runtime(runtime);
+}
+
+#[test]
+fn team_join_cannot_overtake_the_last_retirement_callback() {
+    kcoro_sys::link_anchor();
+    let runtime = runtime(MEMBER_COUNT);
+    let gate = RetiredGate::new();
+    let config = TeamConfig {
+        size: size_of::<TeamConfig>() as u32,
+        abi_version: 1,
+        member_count: MEMBER_COUNT,
+        reserved: 0,
+        member: Some(noop_member),
+        context: std::ptr::null_mut(),
+        runtime,
+        retired: Some(blocked_retired_edge),
+        retired_context: (&gate as *const RetiredGate).cast_mut().cast(),
+    };
+    let mut team = std::ptr::null_mut();
+    assert_eq!(unsafe { kc_team_create(&config, &mut team) }, 0);
+    assert_eq!(unsafe { kc_team_start(team) }, 0);
+    unsafe { kc_team_request_stop(team) };
+    gate.wait_entered();
+    assert_eq!(unsafe { kc_team_join(team) }, -EBUSY);
+    gate.release();
+    assert_eq!(unsafe { kc_runtime_join_all(runtime) }, 0);
+    assert_eq!(unsafe { kc_team_join(team) }, 0);
+    assert_eq!(unsafe { kc_team_destroy(team) }, 0);
     retire_runtime(runtime);
 }
 

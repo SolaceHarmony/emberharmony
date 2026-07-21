@@ -10,8 +10,9 @@ tensor library, a C++ numerical library, or a Metal backend.
 - Native C++ loads and validates model images, binds pointers, owns buffers and
   plans, schedules fixed lanes, crosses barriers, and calls assembly symbols.
 - AArch64 and x86_64 `.S` files perform every numerical operation.
-- Rust owns no model payload and calls no numerical leaf. Its final role is OS
-  audio streams, PCM/control docking, settings, opaque handles, and observation.
+- Rust owns no model or PCM payload and calls no numerical leaf. Its final role
+  is settings, opaque handles, control, and observation; native code owns OS
+  audio streams and PCM docks.
 - Flashkern is CPU-only. The Apple GPU peer will use MLX C++/Metal as a separate
   device engine selected above Flashkern.
 - Apple Accelerate may be selected for a measured GEMM shape as an opaque
@@ -193,7 +194,7 @@ Required commands while migrating:
 ```bash
 cargo test -p liquid-audio --lib -- --nocapture
 cargo test -p liquid-audio --tests -- --nocapture
-./crates/liquid-audio/scripts/test-rosetta.sh
+cargo test -p kcoro-sys -p liquid-audio --target x86_64-apple-darwin -- --test-threads=1
 git diff --check
 ```
 

@@ -1,5 +1,5 @@
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicI32, AtomicPtr, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -106,6 +106,39 @@ struct Quota {
     status: AtomicI32,
 }
 
+struct StartGate {
+    target: u32,
+    stage: AtomicU32,
+    released: Mutex<bool>,
+    changed: Condvar,
+}
+
+impl StartGate {
+    fn new(target: u32) -> Self {
+        Self {
+            target,
+            stage: AtomicU32::new(0),
+            released: Mutex::new(false),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn wait(&self) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut released = self.released.lock().unwrap();
+        while self.stage.load(Ordering::Acquire) != self.target {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "service start hook did not arrive");
+            released = self.changed.wait_timeout(released, remaining).unwrap().0;
+        }
+    }
+
+    fn release(&self) {
+        *self.released.lock().unwrap() = true;
+        self.changed.notify_all();
+    }
+}
+
 unsafe extern "C" fn service_callback(context: *mut c_void) {
     let seen = unsafe { &*(context.cast::<Seen>()) };
     let mut gate = seen.gate.lock().unwrap();
@@ -162,6 +195,19 @@ unsafe extern "C" fn quota_callback(context: *mut c_void) {
     );
 }
 
+unsafe extern "C" fn start_hook(context: *mut c_void, stage: u32) {
+    let gate = unsafe { &*context.cast::<StartGate>() };
+    if stage != gate.target {
+        return;
+    }
+    gate.stage.store(stage, Ordering::Release);
+    gate.changed.notify_all();
+    let mut released = gate.released.lock().unwrap();
+    while !*released {
+        released = gate.changed.wait(released).unwrap();
+    }
+}
+
 unsafe extern "C" {
     fn kc_runtime_create(config: *const RuntimeConfig, out: *mut *mut c_void) -> i32;
     fn kc_runtime_start(runtime: *mut c_void) -> i32;
@@ -185,6 +231,11 @@ unsafe extern "C" {
     fn kc_service_join(service: *mut c_void) -> i32;
     fn kc_service_snapshot_get(service: *mut c_void, out: *mut ServiceSnapshot) -> i32;
     fn kc_service_destroy(service: *mut c_void) -> i32;
+    fn kc_service_inject_start_hook_for_test(
+        service: *mut c_void,
+        hook: Option<unsafe extern "C" fn(*mut c_void, u32)>,
+        context: *mut c_void,
+    ) -> i32;
 }
 
 #[test]
@@ -599,6 +650,119 @@ fn joining_an_unstarted_service_is_terminal_and_cannot_enable_uaf() {
 }
 
 #[test]
+fn concurrent_start_and_runtime_stop_always_reaches_a_destroyable_terminal_state() {
+    kcoro_sys::link_anchor();
+    for _ in 0..256 {
+        let config = RuntimeConfig {
+            size: size_of::<RuntimeConfig>() as u32,
+            abi_version: ABI,
+            worker_count: 2,
+            reserved: 0,
+        };
+        let mut runtime = std::ptr::null_mut();
+        assert_eq!(unsafe { kc_runtime_create(&config, &mut runtime) }, 0);
+        assert_eq!(unsafe { kc_runtime_start(runtime) }, 0);
+        let count = Count {
+            callbacks: AtomicU64::new(0),
+        };
+        let config = ServiceConfig {
+            size: size_of::<ServiceConfig>() as u32,
+            abi_version: ABI,
+            callback: Some(count_callback),
+            context: (&count as *const Count).cast_mut().cast(),
+            reserved: 0,
+            owner_init: None,
+            owner_fini: None,
+        };
+        let mut service = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { kc_service_create(runtime, &config, &mut service) },
+            0
+        );
+
+        let gate = Arc::new(Barrier::new(3));
+        let start_gate = Arc::clone(&gate);
+        let start_service = service as usize;
+        let starter = std::thread::spawn(move || {
+            start_gate.wait();
+            unsafe { kc_service_start(start_service as *mut c_void) }
+        });
+        let stop_gate = Arc::clone(&gate);
+        let stop_runtime = runtime as usize;
+        let stopper = std::thread::spawn(move || {
+            stop_gate.wait();
+            unsafe { kc_runtime_request_stop(stop_runtime as *mut c_void) };
+        });
+        gate.wait();
+        let started = starter.join().unwrap();
+        stopper.join().unwrap();
+        assert!(started == 0 || started < 0);
+
+        unsafe { kc_service_request_stop(service) };
+        assert_eq!(unsafe { kc_service_join(service) }, 0);
+        assert_eq!(unsafe { kc_service_destroy(service) }, 0);
+        assert_eq!(unsafe { kc_runtime_join(runtime) }, 0);
+        assert_eq!(unsafe { kc_runtime_destroy(runtime) }, 0);
+    }
+}
+
+#[test]
+fn stop_and_join_cannot_overtake_either_start_publication_boundary() {
+    kcoro_sys::link_anchor();
+    for target in [1, 2] {
+        let config = RuntimeConfig {
+            size: size_of::<RuntimeConfig>() as u32,
+            abi_version: ABI,
+            worker_count: 2,
+            reserved: 0,
+        };
+        let mut runtime = std::ptr::null_mut();
+        assert_eq!(unsafe { kc_runtime_create(&config, &mut runtime) }, 0);
+        assert_eq!(unsafe { kc_runtime_start(runtime) }, 0);
+        let count = Count {
+            callbacks: AtomicU64::new(0),
+        };
+        let config = ServiceConfig {
+            size: size_of::<ServiceConfig>() as u32,
+            abi_version: ABI,
+            callback: Some(count_callback),
+            context: (&count as *const Count).cast_mut().cast(),
+            reserved: 0,
+            owner_init: None,
+            owner_fini: None,
+        };
+        let mut service = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { kc_service_create(runtime, &config, &mut service) },
+            0
+        );
+        let gate = StartGate::new(target);
+        assert_eq!(
+            unsafe {
+                kc_service_inject_start_hook_for_test(
+                    service,
+                    Some(start_hook),
+                    (&gate as *const StartGate).cast_mut().cast(),
+                )
+            },
+            0
+        );
+        let raw = service as usize;
+        let starter = std::thread::spawn(move || unsafe { kc_service_start(raw as *mut c_void) });
+        gate.wait();
+        unsafe { kc_service_request_stop(service) };
+        assert_eq!(unsafe { kc_service_join(service) }, -EBUSY);
+        gate.release();
+        assert!(starter.join().unwrap() < 0);
+        assert_eq!(unsafe { kc_service_join(service) }, 0);
+        assert_eq!(unsafe { kc_service_destroy(service) }, 0);
+        unsafe { kc_runtime_request_stop(runtime) };
+        assert_eq!(unsafe { kc_runtime_join(runtime) }, 0);
+        assert_eq!(unsafe { kc_runtime_destroy(runtime) }, 0);
+    }
+}
+
+#[test]
 fn realtime_notifier_drains_every_accepted_edge_before_stop_retires() {
     kcoro_sys::link_anchor();
     let config = RuntimeConfig {
@@ -808,6 +972,22 @@ fn realtime_notify_callgraph_and_publication_order_are_source_gated() {
 
     let runtime = include_str!("../vendor/kcoro_arena/core/src/kc_runtime.c");
     assert!(!runtime.contains("work_cv"));
+    let resume = runtime
+        .find("int kc_runtime_resume_continuation_internal")
+        .unwrap();
+    let publish = runtime[resume..]
+        .find("void kc_runtime_publish_service_internal")
+        .map(|offset| resume + offset)
+        .unwrap();
+    let body = &runtime[resume..publish];
+    for forbidden in ["for (;;)", "while (", "compare_exchange"] {
+        assert!(
+            !body.contains(forbidden),
+            "realtime callback resume contains retry/arbitration work: {forbidden}"
+        );
+    }
+    assert!(body.contains("atomic_fetch_or_explicit"));
+    assert!(body.contains("KORO_WAKE_BIT"));
     let worker = runtime.find("static void *worker_main").unwrap();
     let start = runtime[worker..]
         .find("int kc_runtime_start")
@@ -822,13 +1002,18 @@ fn realtime_notify_callgraph_and_publication_order_are_source_gated() {
     let park = body.find("kc_doorbell_park").unwrap();
     assert!(observe < drain && drain < park);
 
-    let execute = runtime
-        .find("static void execute_continuation")
-        .unwrap();
+    let execute = runtime.find("static void execute_continuation").unwrap();
     let body = &runtime[execute..worker];
     let done = body.find("KORO_DONE").unwrap();
     let signal = body.find("kc_runtime_signal_lifecycle_internal").unwrap();
     assert!(done < signal);
+
+    let snapshot = service.find("int kc_service_snapshot_get").unwrap();
+    let destroy = service[snapshot..]
+        .find("int kc_service_destroy")
+        .map(|offset| snapshot + offset)
+        .unwrap();
+    assert!(service[snapshot..destroy].contains("koro_run_public"));
 }
 
 #[test]

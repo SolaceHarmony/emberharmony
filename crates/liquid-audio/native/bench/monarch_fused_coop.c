@@ -31,7 +31,7 @@
 //   clang -O3 -std=c11 -Wall -Wextra -Wpedantic -Werror \
 //     -ffp-contract=off -march=armv8.6-a+bf16 monarch_fused_coop.c \
 //     "$KA/core/src/kc_runtime.c" "$KA/core/src/kc_service.c" \
-//     "$KA/core/src/kc_continuation.c" "$KA/core/src/kc_team.c" \
+//     "$KA/core/src/kcoro_stackless.c" "$KA/core/src/kc_team.c" \
 //     "$KA/core/src/kc_doorbell.c" "$KA/port/posix.c" \
 //     -I"$KA/include" -I"$KA/port" -pthread -lm -o /tmp/mfc && /tmp/mfc
 
@@ -231,10 +231,17 @@ enum {
     PLAN_WARMUP = 2,
     PLAN_MEASURE = 3,
     ADVANCE_DONE = 1,
-    WARMUP_FFTS = 50,
-    BATCH_FFTS = 400,
-    MEASURE_ROUNDS = 6,
 };
+
+#ifndef MFC_WARMUP_FFTS
+#define MFC_WARMUP_FFTS 50
+#endif
+#ifndef MFC_BATCH_FFTS
+#define MFC_BATCH_FFTS 400
+#endif
+#ifndef MFC_MEASURE_ROUNDS
+#define MFC_MEASURE_ROUNDS 6
+#endif
 
 static int ticket_equal(const kc_ticket_id *a, const kc_ticket_id *b)
 {
@@ -307,7 +314,7 @@ static int advance(Runner *runner)
     }
     if (runner->plan == PLAN_WARMUP) {
         ++runner->index;
-        if (runner->index < WARMUP_FFTS) return begin_fft(runner);
+        if (runner->index < MFC_WARMUP_FFTS) return begin_fft(runner);
         runner->plan = PLAN_MEASURE;
         runner->index = 0;
         runner->round = 0;
@@ -316,13 +323,14 @@ static int advance(Runner *runner)
     }
 
     ++runner->index;
-    if (runner->index < BATCH_FFTS) return begin_fft(runner);
+    if (runner->index < MFC_BATCH_FFTS) return begin_fft(runner);
     const double elapsed =
-        (kc_port_monotonic_ns() - runner->batch_start) / 1.0e9 / BATCH_FFTS;
+        (kc_port_monotonic_ns() - runner->batch_start) /
+        1.0e9 / MFC_BATCH_FFTS;
     if (!isfinite(elapsed)) return -ERANGE;
     if (elapsed < runner->best) runner->best = elapsed;
     ++runner->round;
-    if (runner->round == MEASURE_ROUNDS) return ADVANCE_DONE;
+    if (runner->round == MFC_MEASURE_ROUNDS) return ADVANCE_DONE;
     runner->index = 0;
     runner->batch_start = kc_port_monotonic_ns();
     return begin_fft(runner);
@@ -374,8 +382,8 @@ static void runner_service(void *context)
     if (status != 0) finish_runner(runner, status);
 }
 
-static int start_team(uint32_t members, kc_team_member_fn member,
-                      Coop *coop, kc_team_t **out)
+static int start_team(kc_runtime_t *runtime, uint32_t members,
+                      kc_team_member_fn member, Coop *coop, kc_team_t **out)
 {
     const kc_team_config config = {
         .size = sizeof(config),
@@ -384,6 +392,9 @@ static int start_team(uint32_t members, kc_team_member_fn member,
         .reserved = 0,
         .member = member,
         .context = coop,
+        .runtime = runtime,
+        .retired = NULL,
+        .retired_context = NULL,
     };
     *out = NULL;
     int status = kc_team_create(&config, out);
@@ -399,19 +410,11 @@ static int start_team(uint32_t members, kc_team_member_fn member,
     return status;
 }
 
-static int run_runner(Runner *runner)
+static int run_runner(kc_runtime_t *runtime, Runner *runner)
 {
-    const kc_runtime_config runtime_config = {
-        .size = sizeof(runtime_config),
-        .abi_version = 1,
-        .worker_count = 1,
-        .reserved = 0,
-    };
-    kc_runtime_t *runtime = NULL;
     kc_service_t *service = NULL;
     kc_service_notifier_t *notifier = NULL;
-    int status = kc_runtime_create(&runtime_config, &runtime);
-    if (status == 0) status = kc_runtime_start(runtime);
+    int status = 0;
 
     const kc_service_config service_config = {
         .size = sizeof(service_config),
@@ -436,8 +439,11 @@ static int run_runner(Runner *runner)
         if (service) kc_service_request_stop(service);
     }
 
-    // The service publishes the terminal stop edge. This join is teardown,
-    // never a generation observation or a source of numerical progress.
+    /* The service publishes the terminal stop edge. The host observes only
+     * whole-run retirement; it never shepherds either FFT phase or a team
+     * generation. Team members and orchestration share this one runtime. */
+    const int drained = kc_runtime_join_all(runtime);
+    if (status == 0) status = drained;
     const int team_joined = kc_team_join(runner->team);
     if (status == 0) status = team_joined;
 
@@ -462,11 +468,6 @@ static int run_runner(Runner *runner)
     if (status == 0) status = notifier_destroyed;
     const int service_destroyed = kc_service_destroy(service);
     if (status == 0) status = service_destroyed;
-    if (runtime) kc_runtime_request_stop(runtime);
-    const int runtime_joined = kc_runtime_join(runtime);
-    if (status == 0) status = runtime_joined;
-    const int runtime_destroyed = kc_runtime_destroy(runtime);
-    if (status == 0) status = runtime_destroyed;
     runner->service = NULL;
     runner->notifier = NULL;
     return status;
@@ -706,11 +707,26 @@ int main(void)
             .output_i = ticket_i,
             .pass = {0},
         };
+        const kc_runtime_config runtime_config = {
+            .size = sizeof(runtime_config),
+            .abi_version = 1,
+            .worker_count = members,
+            .reserved = 0,
+        };
+        kc_runtime_t *runtime = NULL;
+        int status = kc_runtime_create(&runtime_config, &runtime);
+        if (status == 0) status = kc_runtime_start(runtime);
         kc_team_t *team = NULL;
-        int status = start_team(members, member_fn, &coop, &team);
+        if (status == 0)
+            status = start_team(runtime, members, member_fn, &coop, &team);
         if (status != 0) {
             fprintf(stderr, "team start failed for %u lanes: %d\n",
                     members, status);
+            if (runtime) {
+                kc_runtime_request_stop(runtime);
+                (void)kc_runtime_join(runtime);
+                (void)kc_runtime_destroy(runtime);
+            }
             return EXIT_FAILURE;
         }
         Runner runner = {
@@ -726,12 +742,13 @@ int main(void)
         };
         atomic_init(&runner.ready, 0);
         const uint64_t first = sequence;
-        status = run_runner(&runner);
+        status = run_runner(runtime, &runner);
         kc_team_snapshot snapshot = {.size = sizeof(snapshot)};
         if (status == 0) status = kc_team_snapshot_get(team, &snapshot);
         if (status == 0 &&
             (runner.completed !=
-                 1 + WARMUP_FFTS + BATCH_FFTS * MEASURE_ROUNDS ||
+                 1 + MFC_WARMUP_FFTS +
+                     MFC_BATCH_FFTS * MFC_MEASURE_ROUNDS ||
              runner.sequence - first != runner.completed ||
              runner.generation != runner.completed * 2 ||
              snapshot.completed_generation != runner.generation ||
@@ -743,6 +760,11 @@ int main(void)
             status = EXIT_FAILURE;
         const int destroyed = kc_team_destroy(team);
         if (status == 0) status = destroyed;
+        kc_runtime_request_stop(runtime);
+        const int runtime_joined = kc_runtime_join(runtime);
+        if (status == 0) status = runtime_joined;
+        const int runtime_destroyed = kc_runtime_destroy(runtime);
+        if (status == 0) status = runtime_destroyed;
         if (status != 0) {
             fprintf(stderr, "ticketed run failed for %u lanes: %d\n",
                     members, status);

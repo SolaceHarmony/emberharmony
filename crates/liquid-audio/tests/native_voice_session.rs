@@ -33,6 +33,8 @@ const MANUAL_DEADLINES: u64 = 1 << 62;
 const DEADLINE_PREPARE: u32 = 0;
 const DEADLINE_COMMIT: u32 = 1;
 const DEADLINE_FORCED: u32 = 2;
+const SNAPSHOT_PLAYBACK: u32 = 1;
+const SNAPSHOT_CAPTURE: u32 = 2;
 const EVENT_STATE: u32 = 1;
 const EVENT_TURN: u32 = 3;
 const EVENT_ERROR: u32 = 4;
@@ -42,6 +44,7 @@ const SESSION_CREATED: u32 = 0;
 const SESSION_RUNNING: u32 = 1;
 const FIXED_SCOPE_SEALED: u32 = 2;
 const DEADLINE_SOURCE_OPEN: u32 = 1;
+const DEADLINE_SOURCE_STOPPED: u32 = 3;
 
 #[repr(C)]
 struct Runtime {
@@ -433,6 +436,7 @@ unsafe extern "C" {
     fn lfm_runtime_request_stop(runtime: *mut Runtime);
     fn lfm_runtime_join(runtime: *mut Runtime) -> c_int;
     fn lfm_runtime_destroy(runtime: *mut Runtime) -> c_int;
+    fn lfm_internal_platform_audio_callback_retirement_test() -> c_int;
 
     fn lfm_session_create(
         runtime: *mut Runtime,
@@ -540,6 +544,19 @@ unsafe extern "C" {
     fn lfm_internal_session_release_unpublished_playback_for_test(
         session: *mut Session,
         frames: u32,
+    ) -> c_int;
+    fn lfm_internal_session_seed_capture_range_capacity_for_test(session: *mut Session) -> c_int;
+    fn lfm_internal_session_snapshot_pin_inactive_for_test(
+        session: *mut Session,
+        kind: u32,
+        out_pin: *mut u64,
+    ) -> c_int;
+    fn lfm_internal_session_snapshot_unpin_for_test(session: *mut Session, pin: u64) -> c_int;
+    fn lfm_internal_session_snapshot_state_for_test(
+        session: *const Session,
+        kind: u32,
+        out_published: *mut u32,
+        out_pending: *mut u32,
     ) -> c_int;
     fn lfm_playback_consumer_claim(
         consumer: *mut PlaybackConsumer,
@@ -919,6 +936,53 @@ fn wait_event(sink: &Sink, predicate: impl Fn(&Seen) -> bool) -> Seen {
         let (next, timeout) = sink.edge.wait_timeout(events, remaining).unwrap();
         events = next;
         assert!(!timeout.timed_out(), "event deadline expired: {events:#?}");
+    }
+}
+
+fn wait_event_count(sink: &Sink, kind: u32, count: usize) {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut events = sink.events.lock().unwrap();
+    while events.iter().filter(|event| event.kind == kind).count() < count {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "event-count deadline expired: {events:#?}"
+        );
+        let (next, timeout) = sink.edge.wait_timeout(events, remaining).unwrap();
+        events = next;
+        assert!(
+            !timeout.timed_out(),
+            "event-count callback edge timed out: {events:#?}"
+        );
+    }
+}
+
+fn wait_snapshot_pending(session: *mut Session, kind: u32, expected: bool) {
+    /* Test watchdog only. The retained reader and its release are the sole
+     * production edges; this observer never notifies the coordinator. */
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let mut published = 0;
+        let mut pending = 0;
+        assert_eq!(
+            unsafe {
+                lfm_internal_session_snapshot_state_for_test(
+                    session,
+                    kind,
+                    &mut published,
+                    &mut pending,
+                )
+            },
+            0
+        );
+        if (pending != 0) == expected {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "snapshot kind {kind} did not reach pending={expected}: published={published} pending_slot={pending}"
+        );
+        std::thread::yield_now();
     }
 }
 
@@ -1323,6 +1387,16 @@ fn drive_capture_to_pause(
 }
 
 #[test]
+fn platform_retirement_is_the_successor_of_every_admitted_playback_callback() {
+    // SAFETY: the private native test owns its synthetic binding for the
+    // complete synchronous invocation and exercises the production gate.
+    assert_eq!(
+        unsafe { lfm_internal_platform_audio_callback_retirement_test() },
+        0
+    );
+}
+
+#[test]
 fn capture_chunks_append_arbitrary_blocks_without_a_manual_boundary() {
     let sink = Sink {
         events: Mutex::new(Vec::new()),
@@ -1458,7 +1532,7 @@ fn capture_gap_is_explicit_and_never_splices_the_following_range() {
 }
 
 #[test]
-fn capture_arena_wrap_publishes_two_borrowed_spans_without_relocation() {
+fn capture_arena_wrap_is_one_mirrored_view_on_apple_and_two_borrowed_views_elsewhere() {
     let sink = Sink {
         events: Mutex::new(Vec::new()),
         edge: Condvar::new(),
@@ -1470,13 +1544,24 @@ fn capture_arena_wrap_publishes_two_borrowed_spans_without_relocation() {
     const CALLBACK: u32 = 1_920;
     const CADENCE: u32 = RATE.div_ceil(50);
     const CAPACITY: u32 = 2 * RATE * 30 + 2 * CADENCE + 2 * CALLBACK;
+    #[cfg(target_os = "macos")]
+    let capacity = {
+        // SAFETY: sysconf reads immutable process/platform configuration.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        assert!(page > 0);
+        let page_frames =
+            u32::try_from(page).unwrap() / u32::try_from(std::mem::size_of::<f32>()).unwrap();
+        CAPACITY.div_ceil(page_frames) * page_frames
+    };
+    #[cfg(not(target_os = "macos"))]
+    let capacity = CAPACITY;
 
     let mut gap = CaptureChunk::default();
     assert_eq!(
         unsafe {
             lfm_capture_producer_publish_gap(
                 producer,
-                CAPACITY - 1,
+                capacity - 1,
                 1,
                 CHUNK_GAP | CHUNK_MUTED,
                 &mut gap,
@@ -1491,8 +1576,8 @@ fn capture_arena_wrap_publishes_two_borrowed_spans_without_relocation() {
         unsafe { lfm_capture_producer_claim_chunk(producer, 4, RATE, 1, 0, &mut chunk) },
         0
     );
-    assert_eq!(chunk.first_sample_cursor, u64::from(CAPACITY - 1));
-    assert_eq!(chunk.offset_frames, CAPACITY - 1);
+    assert_eq!(chunk.first_sample_cursor, u64::from(capacity - 1));
+    assert_eq!(chunk.offset_frames, capacity - 1);
     let mut spans = [MutableSpan::default(); 2];
     let mut count = 0;
     assert_eq!(
@@ -1506,11 +1591,21 @@ fn capture_arena_wrap_publishes_two_borrowed_spans_without_relocation() {
         },
         0
     );
-    assert_eq!(count, 2);
-    assert_eq!((spans[0].count, spans[1].count), (1, 3));
-    unsafe { spans[0].data.write(0.25) };
-    unsafe { std::slice::from_raw_parts_mut(spans[1].data, 3) }
-        .copy_from_slice(&[-0.25, 0.5, -0.5]);
+    #[cfg(target_os = "macos")]
+    {
+        assert_eq!(count, 1);
+        assert_eq!(spans[0].count, 4);
+        unsafe { std::slice::from_raw_parts_mut(spans[0].data, 4) }
+            .copy_from_slice(&[0.25, -0.25, 0.5, -0.5]);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        assert_eq!(count, 2);
+        assert_eq!((spans[0].count, spans[1].count), (1, 3));
+        unsafe { spans[0].data.write(0.25) };
+        unsafe { std::slice::from_raw_parts_mut(spans[1].data, 3) }
+            .copy_from_slice(&[-0.25, 0.5, -0.5]);
+    }
     assert_eq!(
         unsafe { lfm_capture_producer_commit_chunk(producer, &chunk) },
         0
@@ -1522,7 +1617,7 @@ fn capture_arena_wrap_publishes_two_borrowed_spans_without_relocation() {
         unsafe { lfm_capture_producer_claim_chunk(producer, 1, RATE, 1, 0, &mut next) },
         0
     );
-    assert_eq!(next.first_sample_cursor, u64::from(CAPACITY) + 3);
+    assert_eq!(next.first_sample_cursor, u64::from(capacity) + 3);
     assert_eq!(next.offset_frames, 3);
     assert_eq!(next.buffer_generation, 2);
     assert_eq!(
@@ -2062,13 +2157,20 @@ fn capture_disconnect_transfers_inflight_retirement_to_the_coordinator() {
     );
 
     assert_eq!(unsafe { lfm_session_start(session) }, 0);
-    let mut barrier = Ticket::default();
-    submit_text_eventually(session, b"retired", &mut barrier);
     let _ = wait_event(&sink, |event| {
-        event.kind == EVENT_TURN && event.ticket == barrier
+        event.kind == EVENT_ERROR
+            && event.status == CANCELLED
+            && event.payload == b"capture-device-lost"
     });
+    assert_eq!(unsafe { lfm_session_join(session) }, CANCELLED);
+    let mut policy = CapturePolicySnapshot::default();
+    assert_eq!(
+        unsafe { lfm_session_capture_policy_snapshot(session, &mut policy) },
+        0
+    );
+    assert_eq!(policy.last_evidence_cursor, 24, "{policy:?}");
+    assert_eq!(policy.detector_backlog, 0);
 
-    unsafe { stop_all(runtime, session, CANCELLED) };
     let events = sink.events.lock().unwrap();
     assert!(events.iter().any(|event| {
         event.kind == EVENT_ERROR
@@ -2076,6 +2178,50 @@ fn capture_disconnect_transfers_inflight_retirement_to_the_coordinator() {
             && event.payload == b"capture-device-lost"
     }));
     assert_eq!(events.last().map(|event| event.kind), Some(EVENT_STOPPED));
+    drop(events);
+    assert_eq!(unsafe { lfm_session_destroy(session) }, 0);
+    unsafe { lfm_runtime_request_stop(runtime) };
+    assert_eq!(unsafe { lfm_runtime_join(runtime) }, 0);
+    assert_eq!(unsafe { lfm_runtime_destroy(runtime) }, 0);
+}
+
+#[test]
+fn frozen_capture_capacity_drains_the_completed_action_owner_before_dehydrating() {
+    let sink = Sink {
+        events: Mutex::new(Vec::new()),
+        edge: Condvar::new(),
+        fail: false,
+    };
+    let runtime = runtime();
+    let session = session(runtime, &sink);
+    let mut producer = std::ptr::null_mut();
+    assert_eq!(
+        unsafe { lfm_capture_chunk_producer_create(session, 73, 0, &mut producer) },
+        0
+    );
+    assert_eq!(
+        unsafe { lfm_internal_session_seed_capture_range_capacity_for_test(session) },
+        0
+    );
+
+    /* A completed action still owns one immutable range, a second range is
+     * ready, and a third committed turn owns the freeze. Session start is the
+     * only edge. The coordinator must retire the completed action, release its
+     * slot, and mount the frozen successor without a host kick or hypothetical
+     * fourth capture callback. */
+    assert_eq!(unsafe { lfm_session_start(session) }, 0);
+    wait_event_count(&sink, EVENT_TURN, 2);
+
+    let snapshot = wait_session_snapshot(session, |snapshot| snapshot.capture_consumed == 2);
+    assert_eq!(snapshot.capture_stale, 0);
+    let mut policy = CapturePolicySnapshot::default();
+    assert_eq!(
+        unsafe { lfm_session_capture_policy_snapshot(session, &mut policy) },
+        0
+    );
+    assert_eq!(policy.detector_backlog, 0);
+
+    unsafe { stop_all_with_capture(runtime, session, producer, 0) };
 }
 
 #[test]
@@ -2089,10 +2235,29 @@ fn started_capture_disconnect_retires_before_stopped_and_join() {
     let (session, producer) = chunk_session(runtime, &sink);
     let _ = write_chunk(producer, 8, 0, 0.25);
     assert_eq!(unsafe { lfm_capture_producer_destroy(producer) }, 0);
+    let lost = wait_event(&sink, |event| {
+        event.kind == EVENT_ERROR
+            && event.status == CANCELLED
+            && event.payload == b"capture-device-lost"
+    });
+    assert_ne!(lost.ticket.sequence, 0);
 
     unsafe { lfm_session_request_stop(session) };
-    assert_eq!(unsafe { lfm_session_join(session) }, 0);
+    assert_eq!(unsafe { lfm_session_join(session) }, CANCELLED);
     let events = sink.events.lock().unwrap();
+    let error = events
+        .iter()
+        .position(|event| {
+            event.kind == EVENT_ERROR
+                && event.status == CANCELLED
+                && event.payload == b"capture-device-lost"
+        })
+        .expect("live capture disconnect must publish a correlated device-loss fault");
+    let stopped = events
+        .iter()
+        .position(|event| event.kind == EVENT_STOPPED)
+        .expect("device loss must retire through one terminal STOPPED record");
+    assert!(error < stopped);
     assert_eq!(
         events
             .iter()
@@ -2274,6 +2439,138 @@ fn capture_commit_samples_before_expiry_remain_uncommitted() {
     assert_eq!(turn.status, 0);
 
     unsafe { stop_all_with_capture(runtime, session, producer, 0) };
+}
+
+#[test]
+fn final_capture_snapshot_republishes_when_its_reader_releases() {
+    let sink = Sink {
+        events: Mutex::new(Vec::new()),
+        edge: Condvar::new(),
+        fail: false,
+    };
+    let runtime = runtime();
+    let (session, producer) = manual_chunk_session(runtime, &sink);
+    let (parent, pause) = drive_capture_to_pause(session, producer, &sink);
+    assert!(pause.silence_frames < 24_000);
+    let _ = write_signal(producer, (24_000 - pause.silence_frames) as u32, false);
+    sync_session(session, &sink, b"snapshot-samples");
+    let sampled = capture_supervision(session);
+    assert_eq!(sampled.commit_sample_generation, pause.pause_generation);
+    assert_eq!(sampled.slots[DEADLINE_COMMIT as usize].expiry_generation, 0);
+
+    let mut pin = 0;
+    assert_eq!(
+        unsafe {
+            lfm_internal_session_snapshot_pin_inactive_for_test(session, SNAPSHOT_CAPTURE, &mut pin)
+        },
+        0
+    );
+    assert_ne!(pin, 0);
+    assert_eq!(
+        unsafe { lfm_session_capture_deadline_advance_manual_test(session, 500_000_000) },
+        0
+    );
+    assert_eq!(
+        unsafe { lfm_session_capture_deadline_fire_manual_test(session, DEADLINE_COMMIT) },
+        0
+    );
+    wait_snapshot_pending(session, SNAPSHOT_CAPTURE, true);
+    let retained = capture_supervision(session);
+    assert_eq!(
+        retained.slots[DEADLINE_COMMIT as usize].expiry_generation, 0,
+        "the pinned inactive generation must leave the prior coherent image visible"
+    );
+
+    /* Releasing this retained reader is the only successor edge. No command,
+     * capture callback, or host-capacity kick follows it. */
+    assert_eq!(
+        unsafe { lfm_internal_session_snapshot_unpin_for_test(session, pin) },
+        0
+    );
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let published = capture_supervision(session);
+        if published.slots[DEADLINE_COMMIT as usize].expiry_generation == pause.pause_generation {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "capture terminal snapshot was not republished after reader release"
+        );
+        std::thread::yield_now();
+    }
+    wait_snapshot_pending(session, SNAPSHOT_CAPTURE, false);
+    let event = wait_event(&sink, |event| {
+        event.kind == EVENT_TURN && event.ticket == parent
+    });
+    assert_eq!(event.status, 0);
+
+    unsafe { stop_all_with_capture(runtime, session, producer, 0) };
+}
+
+#[test]
+fn coordinator_retires_only_after_both_terminal_snapshots_publish() {
+    let sink = Sink {
+        events: Mutex::new(Vec::new()),
+        edge: Condvar::new(),
+        fail: false,
+    };
+    let runtime = runtime();
+    let session = session(runtime, &sink);
+    assert_eq!(unsafe { lfm_session_start(session) }, 0);
+    let _ = wait_event(&sink, |event| event.kind == EVENT_STATE);
+
+    let mut playback_pin = 0;
+    let mut capture_pin = 0;
+    assert_eq!(
+        unsafe {
+            lfm_internal_session_snapshot_pin_inactive_for_test(
+                session,
+                SNAPSHOT_PLAYBACK,
+                &mut playback_pin,
+            )
+        },
+        0
+    );
+    assert_eq!(
+        unsafe {
+            lfm_internal_session_snapshot_pin_inactive_for_test(
+                session,
+                SNAPSHOT_CAPTURE,
+                &mut capture_pin,
+            )
+        },
+        0
+    );
+
+    unsafe { lfm_session_request_stop(session) };
+    wait_snapshot_pending(session, SNAPSHOT_PLAYBACK, true);
+    wait_snapshot_pending(session, SNAPSHOT_CAPTURE, true);
+
+    /* Each retained diagnostic reader is a child lifetime. Releasing one may
+     * publish its image, but the other still keeps coordinator retirement
+     * closed. No command, timer, PCM callback, or host-capacity kick follows. */
+    assert_eq!(
+        unsafe { lfm_internal_session_snapshot_unpin_for_test(session, capture_pin) },
+        0
+    );
+    wait_snapshot_pending(session, SNAPSHOT_CAPTURE, false);
+    wait_snapshot_pending(session, SNAPSHOT_PLAYBACK, true);
+    assert_eq!(
+        unsafe { lfm_internal_session_snapshot_unpin_for_test(session, playback_pin) },
+        0
+    );
+    wait_snapshot_pending(session, SNAPSHOT_PLAYBACK, false);
+
+    assert_eq!(unsafe { lfm_session_join(session) }, 0);
+    assert_eq!(
+        capture_supervision(session).source_phase,
+        DEADLINE_SOURCE_STOPPED
+    );
+    assert_eq!(unsafe { lfm_session_destroy(session) }, 0);
+    unsafe { lfm_runtime_request_stop(runtime) };
+    assert_eq!(unsafe { lfm_runtime_join(runtime) }, 0);
+    assert_eq!(unsafe { lfm_runtime_destroy(runtime) }, 0);
 }
 
 #[test]
@@ -4360,8 +4657,12 @@ fn session_runtime_has_no_operation_wait_path() {
         .map(|offset| step_begin + offset)
         .unwrap();
     let step = &source[step_begin..step_end];
+    let active = &step[step
+        .find("Capture policy remains live while a reply is being generated")
+        .unwrap()..];
     assert!(
-        step.find("step_capture_policy").unwrap() < step.find("advance_action(session)").unwrap(),
+        active.find("step_capture_policy").unwrap()
+            < active.find("advance_action(session)").unwrap(),
         "capture policy must run before active recurrence"
     );
     assert!(source.contains("lfm_sesame_detector_process"));
@@ -4790,6 +5091,56 @@ fn playback_lease_sample_rate_is_the_device_rate() {
         unsafe { lfm_playback_consumer_release(consumer, &claimed) },
         0
     );
+    retire_playback_dock(runtime, session, consumer, &sink);
+}
+
+#[test]
+fn final_playback_snapshot_republishes_when_its_reader_releases() {
+    let (runtime, session, consumer, sink) = playback_dock(1, 512, 48_000, 24_000);
+    let _ = wait_event(&sink, |event| event.kind == EVENT_STATE);
+    let samples = [0.25f32; 512];
+    let published = publish_playback(session, &samples).unwrap();
+    let claimed = claim_playback(consumer, published);
+    sync_session(session, &sink, b"snapshot-prime");
+
+    let mut pin = 0;
+    assert_eq!(
+        unsafe {
+            lfm_internal_session_snapshot_pin_inactive_for_test(
+                session,
+                SNAPSHOT_PLAYBACK,
+                &mut pin,
+            )
+        },
+        0
+    );
+    assert_ne!(pin, 0);
+    let rendered = render_playback_block(consumer, &claimed, 0, 512);
+    assert_eq!(
+        unsafe { lfm_playback_consumer_release(consumer, &claimed) },
+        0
+    );
+    wait_snapshot_pending(session, SNAPSHOT_PLAYBACK, true);
+    let retained = playback_policy(session);
+    assert_eq!(retained.evidence_records, 0);
+
+    /* The retained reader release is the only edge after the evidence record
+     * retires. The terminal diagnostic image must not need another playback
+     * callback to become visible. */
+    assert_eq!(
+        unsafe { lfm_internal_session_snapshot_unpin_for_test(session, pin) },
+        0
+    );
+    let snapshot = wait_playback_evidence(session, 480, 1);
+    wait_snapshot_pending(session, SNAPSHOT_PLAYBACK, false);
+    assert_eq!(snapshot.ticket, claimed.ticket);
+    assert_eq!(snapshot.stream_epoch, claimed.stream_epoch);
+    assert_eq!(snapshot.last_evidence_cursor, 480);
+    assert_eq!(
+        rendered.first_playback_sample_cursor + 480,
+        snapshot.last_evidence_cursor
+    );
+
     retire_playback_dock(runtime, session, consumer, &sink);
 }
 

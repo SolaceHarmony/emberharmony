@@ -21,8 +21,8 @@ the dispatch model, verification, and the build order.
 ## 0. As-built architecture (2026-07-19 working tree)
 
 The shipped LFM2 CPU path is native from accepted text/PCM through emitted text/PCM.
-Rust owns opaque lifecycle, platform audio callbacks, settings, and the product
-observer adapter. Native code owns exact Sesame evidence and turn endpointing.
+Rust owns opaque lifecycle, settings, and the product observer adapter. Native
+code owns CoreAudio callbacks, exact Sesame evidence, and turn endpointing.
 Rust does not own weights, tensors, tokens, model state, sampling, recurrence,
 speech evidence, or turn boundaries.
 
@@ -52,7 +52,7 @@ bounded spin, or polling. The engine has two descriptor-addressed ticket slots:
 each request record borrows payload spans and each slot owns only its activation
 scratch bank. A capacity-2 SQ/CQ hands each completion an exact
 generation-bearing permit. The bounded audio route releases that permit at every
-coarse node, marks its pooled route instance ready, and lets the native broker
+coarse node, marks its pooled route record ready, and lets the native broker
 reacquire capacity in FIFO/age-promoted order. Its exact-CQ callback performs no
 submission, allocation, wait, or descriptor lock. Packed `{generation,state}`
 CAS transitions prevent slot theft and stale-destructor ABA, and `FREE` is the
@@ -60,6 +60,9 @@ final accounting publication edge. Text and audio admission return a pooled
 handle; terminal notification rings the session work doorbell and the
 coordinator collects that exact generation. The coordinator never waits for a
 numerical pass or holds a compute slot across an external-resource boundary.
+The pooled route record/broker re-entry remains transitional: the numerical
+bridge is already a saved stackless frame, and each multi-hop route still needs
+its own reusable frame carrying the program counter and fixed locals.
 
 Flashkern is the CPU executor, never the Metal executor. CPU kernels retain NEON,
 BFMMLA/BFDOT, AVX2, and AVX-512-BF16 paths. Unsupported Metal selection fails
@@ -68,7 +71,7 @@ boundary and may not fall back to Candle.
 
 ```mermaid
 flowchart LR
-    Host["Rust platform callbacks / control"] -->|"ephemeral device span"| Dock["native circular capture + playback docks"]
+    Host["Rust settings / control / observation"] --> Dock["native CoreAudio + circular capture/playback docks"]
     Dock --> Session["native LfmSession<br/>tickets · epoch · recurrence"]
     Session --> Conv["native LfmConversation<br/>KV · conv · PRNG · rollover"]
     Conv --> Gate["fair expected-value model pass gate"]
@@ -78,7 +81,7 @@ flowchart LR
     Board --> Kernels["AArch64 / x86_64 leaves"]
     Kernels -->|"final-member callback"| Conv
     Conv -->|"Mimi + native device-rate resample into lease"| Playback["native playback dock"]
-    Playback -->|"generation-checked borrowed span"| Host
+    Playback -->|"generation-checked borrowed span"| Device["CoreAudio device callback"]
 ```
 
 `REQ_TOKEN_PASS` executes embedding lookup/provided embedding, the native
@@ -249,13 +252,13 @@ terminal records suspend as durable state when capacity is unavailable;
 telemetry alone may be lossy. A stale epoch may finish a pass but cannot publish
 its value.
 
-The microphone callback passes its ephemeral interleaved hardware span through
-the non-cloneable `CaptureSink`. Native format leaves write directly into a
-reserved circular-arena span and publish one typed chunk/XRUN record. The exact
-Sesame detector and sample-clock policy consume that native storage. Playback
-resolves its generation-checked lease only inside the device callback, renders
-directly into the ephemeral device buffer, and releases the exact ticket. No
-Rust PCM ring, utterance `Vec`, VAD buffer, or audio event payload remains.
+The native AUHAL microphone callback asks CoreAudio to render directly into a
+reserved circular-arena span, then publishes one typed chunk/XRUN record. The
+exact Sesame detector and sample-clock policy consume that native storage.
+Native playback resolves its generation-checked lease only inside the AUHAL
+callback, renders directly into the device buffer, and releases the exact
+ticket. No Rust PCM endpoint, ring, utterance `Vec`, VAD buffer, or audio event
+payload remains.
 
 ### Thread model (AS-BUILT)
 
@@ -264,10 +267,10 @@ Rust PCM ring, utterance `Vec`, VAD buffer, or audio event payload remains.
 - Native coordinator/delivery/bridge/route services own admission, recurrence,
   reliable events, and exact completion collection. Suspended actions are
   records, not attached threads or waiters.
-- Rust platform callbacks own only the opaque `CaptureSink`/`PlaybackSource`
-  endpoints. Safe Rust retained services project bounded events/control; they do
-  not submit model passes, hold PCM/model state, sample, tokenize, or advance
-  recurrence.
+- The native session owns the CoreAudio units and both PCM dock endpoints. Safe
+  Rust retained services hold only an opaque platform-audio handle and project
+  bounded events/control; they do not touch device PCM, submit model passes,
+  hold model state, sample, tokenize, or advance recurrence.
 
 ---
 
@@ -399,10 +402,11 @@ Do not compare them across executors or extrapolate a current latency.
    node becomes ready, so peers may queue without Rust progress. A
    coordinator-owned `SessionAction` collects text and audio terminal handles
    after a doorbell edge. Batched M≤4 prefill is already direct checkpoint BF16.
-5. **Physical kcoro audio-device adapter: built for LFM2.** Rust platform
-   callbacks transfer only ephemeral device spans through non-cloneable opaque
-   endpoints; native circular capture, exact Sesame turn policy, playback
-   reservations, and ticket/generation retirement own the full data path.
+5. **Physical kcoro audio-device adapter: built for LFM2 on macOS.** Native
+   AUHAL callbacks render capture directly into the mirrored circular arena and
+   drain native playback reservations into CoreAudio. Exact Sesame turn policy,
+   ticket/generation retirement, and device faults stay inside the session.
+   Unsupported platforms fail setup rather than selecting a Rust fallback.
 6. **Native Moshi: subsequent independent tranche.** Port Moshi onto the same
    image/session discipline before making it selectable in production. The LFM2
    cutover neither implements Moshi nor permits a Candle fallback.

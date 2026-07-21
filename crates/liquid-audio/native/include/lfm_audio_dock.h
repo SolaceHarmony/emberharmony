@@ -1,7 +1,7 @@
 #ifndef LFM_AUDIO_DOCK_H
 #define LFM_AUDIO_DOCK_H
 
-/* Private Rust/native PCM dock ABI. The product header intentionally does not
+/* Private native PCM dock ABI. The product header intentionally does not
  * include this file. Lease cells contain identity and bounds, never pointers;
  * a pointer exists only during a generation-checked resolve call. */
 

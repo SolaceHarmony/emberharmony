@@ -1,32 +1,33 @@
 # Coordination Contract
 
 Status: normative. This file owns the meaning of callback-driven progress,
-scope control, and the Rust/native docking boundary.
+scope control, and the product/native boundary.
 
 ## One Sentence
 
-Rust kcoro docks asynchronous PCM streams and controls to a self-recurring
+Native kcoro docks asynchronous PCM streams and controls to a self-recurring
 native voice session; every forward step is caused by an exact event callback,
-and no model math or model-pass decision crosses Rust.
+and neither PCM, model math, nor model-pass decisions cross Rust.
 
 ## The Three Planes
 
 ```mermaid
 flowchart TB
     Tauri["Tauri / UI host"]
-    Rust["Rust kcoro audio dock"]
+    Rust["Rust host control / observation"]
     Native["Native session coordinator"]
     Kernel["Flashkern lanes + assembly"]
 
     Tauri -->|"commands/settings"| Rust
-    Rust <-->|"PCM/control SQ/CQ"| Native
+    Rust <-->|"bounded control / observation"| Native
+    Audio["Native CoreAudio + PCM docks"] --> Native
     Native <-->|"native pass SQ/CQ"| Kernel
     Native -->|"sampled semantic/telemetry"| Rust
     Rust -->|"coalesced observer events"| Tauri
 ```
 
-1. **Realtime data plane:** PCM lease rings, native model session, fixed lanes,
-   assembly kernels, playback ring.
+1. **Realtime data plane:** native CoreAudio callbacks, PCM lease rings, native
+   model session, fixed lanes, assembly kernels, playback ring.
 2. **Control plane:** start, stop, interrupt, mic gate, settings, conversation
    selection, snapshot request.
 3. **Observer plane:** text/state summaries, levels, queue depths, ticket phases,
@@ -63,20 +64,18 @@ and resumes because the promise resolves, not because a scheduler keeps asking.
 
 ## Docking Ring Contract
 
-The Rust/native dock has three bounded rings:
+The native audio/control boundary has three bounded record paths:
 
 | Ring | Producer -> consumer | Cell | Payload ownership |
 |---|---|---|---|
-| capture | Rust audio callback -> native session | lease ID, epoch, format, offset, frames | preallocated PCM block retained until native release |
-| playback | native session -> Rust audio callback | lease ID, epoch, format, offset, frames | native PCM block retained until device consumption/release |
+| capture | native OS callback -> native session | lease ID, epoch, format, offset, frames | preallocated PCM region retained until native release |
+| playback | native session -> native OS callback | lease ID, epoch, format, offset, frames | native PCM block retained until device consumption/release |
 | control/completion | Rust host <-> native session | command/result ID, scope, epoch, cause, small scalar fields | inline fixed record; no numerical payload |
 
-The device callback may perform the one unavoidable copy from an ephemeral
-hardware buffer into a preallocated capture block, or from a playback block into
-an ephemeral device buffer. No additional PCM copy is introduced by the dock.
-
-Rust may inspect PCM only as required by the platform stream API. It does not
-resample, compute VAD, mel, features, codec values, or model values.
+On macOS, CoreAudio renders capture directly into the preallocated native arena;
+playback still performs the final unavoidable movement into the ephemeral device
+buffer. No additional PCM copy is introduced by the dock, and Rust never
+inspects PCM.
 
 ## Inner Native Contract
 

@@ -1145,7 +1145,10 @@ fn deadline_terminal_signal_guard_survives_concurrent_join_and_destroy() {
     leave.release.wait();
     stop.join().unwrap();
     assert_eq!(destroy.join().unwrap(), 0);
-    assert_eq!(admitted, 1, "destroy did not drain the terminal signal guard");
+    assert_eq!(
+        admitted, 1,
+        "destroy did not drain the terminal signal guard"
+    );
 }
 
 #[test]

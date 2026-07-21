@@ -43,7 +43,10 @@ fn production_engine_mounts_lanes_and_bridge_on_one_bounded_pool() {
     unsafe { libc::alarm(10) };
     let mut status = 0;
     let engine = unsafe { lfm_engine_new_status(4, &mut status) };
-    assert!(!engine.is_null(), "production engine creation failed: {status}");
+    assert!(
+        !engine.is_null(),
+        "production engine creation failed: {status}"
+    );
 
     let mut runtime = RuntimeSnapshot {
         size: size_of::<RuntimeSnapshot>() as u32,
@@ -62,11 +65,7 @@ fn production_engine_mounts_lanes_and_bridge_on_one_bounded_pool() {
     let mut bridge = Ticket::default();
     assert_eq!(
         unsafe {
-            lfm_internal_engine_stackless_runtime_for_test(
-                engine,
-                &mut runtime,
-                &mut bridge,
-            )
+            lfm_internal_engine_stackless_runtime_for_test(engine, &mut runtime, &mut bridge)
         },
         0
     );

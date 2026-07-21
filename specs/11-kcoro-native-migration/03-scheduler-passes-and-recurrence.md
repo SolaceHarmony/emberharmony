@@ -21,13 +21,12 @@ No model progress edge requires Rust, Tauri, polling, or serialized IPC.
 
 | Domain | Owner | Work unit | Forward-progress edge |
 |---|---|---|---|
-| Audio dock | Rust kcoro | PCM lease, device callback, control request, host projection | audio/control ring doorbell resolves a Rust promise |
+| Audio dock | Native session/kcoro | PCM lease, device callback, control request | native record publication resumes the exact continuation |
 | Model runtime | Native session and Flashkern | complete model pass, stage, tile, native recurrence action | native CQ publication resumes a retained continuation |
 
-Rust kcoro is a general parallelism library and the asynchronous audio dock. It
-does not schedule model passes. Flashkern's native ticket language may share
-record layouts and terminal semantics with Rust kcoro, but endpoint ownership is
-different.
+Rust kcoro owns bounded host control/observation only and does not schedule model
+passes or own PCM endpoints. Flashkern and the native audio dock share kcoro's
+ticket/continuation semantics inside one native ownership domain.
 
 ## Current Native Mount
 
@@ -52,8 +51,10 @@ test `raw_engine_owns_its_sq_cq_without_rust_progress` constructs the raw C++
 engine and completes a pass without any Rust callback registration.
 
 The SQ/CQ surface is deliberately nonblocking. Empty queues return `-EAGAIN`;
-publication makes a retained service runnable. A continuation's durable state
-lives in its generation-leased pass slot rather than a blocked host call stack.
+publication makes a retained continuation runnable. A continuation's durable
+state lives in its saved frame: program counter, fixed locals, exact ticket, and
+retained generation-leased pass-slot reference. The pass slot owns typed
+request/scratch leases, not continuation identity.
 
 ## Runtime Graph
 
@@ -68,7 +69,7 @@ flowchart TB
     ConvA["Conversation A pages"]
     ConvB["Conversation B pages"]
     Model["Immutable model plan + weights"]
-    Audio["Rust PCM dock"]
+    Audio["Native CoreAudio + PCM dock"]
 
     Audio -->|"PCM lease / control edge"| Session
     Session --> Broker

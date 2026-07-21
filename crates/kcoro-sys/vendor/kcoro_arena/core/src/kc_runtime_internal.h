@@ -9,6 +9,11 @@
 #include <stdatomic.h>
 
 struct kc_service;
+typedef void (*kc_runtime_test_claim_fn)(void *context, uint32_t worker,
+                                         uint32_t slot);
+typedef void (*kc_runtime_test_register_fn)(void *context,
+                                            struct kc_runtime *runtime,
+                                            uint32_t slot);
 
 enum { KC_RUNTIME_CONTINUATIONS_PER_WORKER = 64 };
 
@@ -36,10 +41,17 @@ struct kc_runtime {
     size_t continuation_capacity;
     size_t ready_word_count;
     _Atomic(koro_cont_t *) *continuations;
+    atomic_uint *slot_gates;
     atomic_uint_fast64_t *ready_words;
     uint32_t *slot_generations;
     atomic_uint next_ready_word;
     atomic_uint next_affinity_worker;
+    atomic_uint test_claim_armed;
+    kc_runtime_test_claim_fn test_claim_pause;
+    void *test_claim_context;
+    atomic_uint test_register_armed;
+    kc_runtime_test_register_fn test_register_pause;
+    void *test_register_context;
     uint64_t runtime_epoch;
     atomic_uint_fast64_t next_sequence;
     int accepting;

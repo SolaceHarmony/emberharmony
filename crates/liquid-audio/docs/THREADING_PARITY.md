@@ -15,8 +15,8 @@ The live ownership split is:
 
 | Domain | Owner | Execution contract |
 | --- | --- | --- |
-| capture/playback device callbacks | platform/CPAL with thin Rust closures | bounded native lease write or drain, publish edge, return |
-| host voice state/UI delivery | one Rust `kcoro_sys::Service` | owner-affine only where a platform handle is genuinely `!Send` |
+| capture/playback device callbacks | native CoreAudio AUHAL units | direct native lease write or drain, publish edge, return |
+| host voice state/UI delivery | one Rust `kcoro_sys::Service` | opaque handles, settings/control, bounded outward events only |
 | native session coordination/delivery | native `kc_service` continuations | callback-driven, exact tickets, migratable on the bounded pool |
 | native route/bridge/supervision | saved bridge frame plus retained route/supervisor services | same bounded pool as the numerical lanes |
 | numerical work | one engine `kc_team` | fixed logical members on kcoro workers; one active generation |
@@ -25,21 +25,21 @@ The live ownership split is:
 ## Rust host
 
 `VoiceRuntime` mounts `SessionTask` as a retained kcoro service with one worker.
-The service owns device handles, outward event delivery, and the opaque
-`VoiceEngine`; it does not own numerical state. Its control and device-fault
-inputs are realtime notifier edges, not timeout loops or Crossbeam channels.
+The service owns outward event delivery and opaque native handles; it does not
+own a platform callback or numerical state. Its controls are realtime notifier
+edges, not timeout loops or Crossbeam channels. Native device faults arrive as
+bounded session events.
 
-Capture callbacks call the native `CaptureSink` with one complete interleaved
-device block. Native code reserves generation-checked spans in its preallocated
-PCM arena, performs format conversion/downmix directly into those spans, and
-publishes one chunk record. Playback callbacks claim, resolve, drain, and
-release exact native playback leases. The host never writes PCM to a file or
-event channel to move it between stages.
+The AUHAL input callback reserves one generation-checked native span and asks
+CoreAudio to render the complete device block directly into it before publishing
+one chunk record. The AUHAL output callback claims, resolves, drains, and releases
+exact native playback leases. The Rust host never sees PCM and no layer writes
+it to a file or event channel to move it between stages.
 
-The callback cadence requested from CPAL is device geometry, not a scheduler
+The callback cadence reported by CoreAudio is device geometry, not a scheduler
 timer. An input callback advances the sample clock even for acoustic silence.
-Device failure is an explicit fault callback. Rust wall-clock/RMS observations
-are response telemetry only and do not decide speech boundaries.
+Device failure is an explicit native fault edge. Wall-clock observations are
+response telemetry/watchdogs only and do not decide speech boundaries.
 
 ## kcoro runtime workers
 
@@ -161,8 +161,11 @@ cargo test -p liquid-audio --tests
 git diff --check
 ```
 
-The real-checkpoint ignored truth gate must be executed explicitly when its
-checkpoint and `question.wav` fixture are available. Release additionally
-requires the product linkage audit, zero post-readiness allocation/model reads,
-calibrated supervision, observable fatal evidence, playback-fed Sesame traces,
-and AArch64 plus x86_64/Rosetta coverage.
+The ignored real-checkpoint truth gate must be executed explicitly with the
+model image. It runs two native LFM2 conversations entirely in memory: typed
+input produces audio-token/Mimi playback for Agent A, and hardware-sized native
+PCM reservations drive Agent B through Sesame and the full speech path. The
+fixed-seed exchange is repeated and must match. Release additionally requires
+the product linkage audit, zero post-readiness allocation/model reads,
+calibrated supervision, observable fatal evidence, real-device rate/geometry
+coverage, and AArch64 plus x86_64/Rosetta coverage.
