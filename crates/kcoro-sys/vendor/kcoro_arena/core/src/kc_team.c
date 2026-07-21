@@ -8,6 +8,20 @@
 #include <stdatomic.h>
 #include <stdlib.h>
 
+/* Implementation-private deterministic fault injection. It is linked only so
+ * subprocess tests can exercise the real fixed-member lifecycle; the public
+ * kc_team header deliberately exposes no team-poison surface. */
+typedef void (*kc_team_test_fault_fn)(void *context, uint64_t generation);
+
+enum kc_team_test_fault_point {
+    KC_TEAM_TEST_NEVER_ENTERED = 1,
+    KC_TEAM_TEST_ENTERED_NEVER_RETURNED = 2,
+};
+
+int kc_team_inject_member_exit_for_test(
+    kc_team_t *team, uint64_t generation, uint32_t member, uint32_t point,
+    kc_team_test_fault_fn ready, void *context);
+
 enum {
     KC_TEAM_ABI_VERSION = 1u,
     KC_TEAM_CACHELINE = 128u,
@@ -57,6 +71,13 @@ struct kc_team {
     atomic_uint_fast64_t retired_generation;
     kc_team_completion_fn completion_notify;
     void *completion_context;
+    atomic_uint_fast64_t test_fault_generation;
+    atomic_uint test_fault_member;
+    atomic_uint test_fault_point;
+    atomic_uint test_fault_settled;
+    kc_team_test_fault_fn test_fault_ready;
+    void *test_fault_context;
+    kc_doorbell_t *test_fault_hold;
 };
 
 static _Thread_local kc_team_t *current_team;
@@ -83,6 +104,18 @@ static void dispatch_leave(kc_team_t *team)
         memory_order_release);
     if (before & KC_TEAM_DISPATCH_CLOSED)
         kc_doorbell_ring_all(team->dispatch);
+}
+
+static void test_fault_settle(kc_team_t *team, uint64_t generation)
+{
+    if (atomic_load_explicit(&team->test_fault_generation,
+                             memory_order_acquire) != generation) return;
+    unsigned settled = atomic_fetch_add_explicit(&team->test_fault_settled, 1,
+                                                  memory_order_acq_rel) + 1;
+    if (settled != team->config.member_count) return;
+    kc_team_test_fault_fn ready = team->test_fault_ready;
+    if (!ready) abort();
+    ready(team->test_fault_context, generation);
 }
 
 static void *team_member_main(void *context)
@@ -145,6 +178,83 @@ static void *team_member_main(void *context)
     }
 }
 
+static void *team_member_fault_main(void *context)
+{
+    kc_team_member *member = context;
+    kc_team_t *team = member->team;
+    uint32_t observed = kc_doorbell_observe(team->dispatch);
+    atomic_fetch_add_explicit(&team->started_members, 1, memory_order_release);
+    kc_doorbell_ring_all(team->readiness);
+
+    for (;;) {
+        uint64_t generation = atomic_load_explicit(
+            &team->dispatched_generation, memory_order_acquire);
+        while (generation == member->seen_generation) {
+            const unsigned gate = atomic_load_explicit(
+                &team->dispatch_gate, memory_order_acquire);
+            if (atomic_load_explicit(&team->stop_requested,
+                                     memory_order_acquire) &&
+                !(gate & KC_TEAM_DISPATCH_PUBLISHER)) return NULL;
+            int status = kc_doorbell_park(team->dispatch, observed);
+            observed = kc_doorbell_observe(team->dispatch);
+            if (status != 0 &&
+                atomic_load_explicit(&team->stop_requested,
+                                     memory_order_acquire) &&
+                !(atomic_load_explicit(&team->dispatch_gate,
+                                       memory_order_acquire) &
+                  KC_TEAM_DISPATCH_PUBLISHER)) return NULL;
+            if (status != 0) abort();
+            generation = atomic_load_explicit(
+                &team->dispatched_generation, memory_order_acquire);
+        }
+
+        member->seen_generation = generation;
+        const int selected =
+            atomic_load_explicit(&team->test_fault_generation,
+                                 memory_order_acquire) == generation &&
+            atomic_load_explicit(&team->test_fault_member,
+                                 memory_order_relaxed) == member->index;
+        const uint32_t point = selected
+            ? atomic_load_explicit(&team->test_fault_point,
+                                   memory_order_relaxed)
+            : 0;
+        if (point == KC_TEAM_TEST_NEVER_ENTERED) {
+            test_fault_settle(team, generation);
+            return NULL;
+        }
+        atomic_store_explicit(&member->progress->entered_generation, generation,
+                              memory_order_release);
+        if (point == KC_TEAM_TEST_ENTERED_NEVER_RETURNED) {
+            test_fault_settle(team, generation);
+            const uint32_t expected = kc_doorbell_observe(team->test_fault_hold);
+            for (;;) (void)kc_doorbell_park(team->test_fault_hold, expected);
+        }
+        current_team = team;
+        current_member = member->index;
+        team->config.member(team->config.context, member->index,
+                            team->config.member_count, generation);
+        current_team = NULL;
+        atomic_store_explicit(&member->progress->returned_generation, generation,
+                              memory_order_release);
+        test_fault_settle(team, generation);
+        if (atomic_fetch_add_explicit(&team->completed_members, 1,
+                                      memory_order_acq_rel) + 1 ==
+            team->config.member_count) {
+            kc_team_completion_fn completion = team->completion_notify;
+            void *completion_context = team->completion_context;
+            atomic_store_explicit(&team->completed_generation, generation,
+                                  memory_order_release);
+            atomic_store_explicit(&team->retired_generation, generation,
+                                  memory_order_release);
+            if (completion) {
+                current_completion_team = team;
+                completion(completion_context, generation);
+                current_completion_team = NULL;
+            }
+        }
+    }
+}
+
 int kc_team_create(const kc_team_config *config, kc_team_t **out)
 {
     if (!config || !out || config->size < sizeof(*config) ||
@@ -181,6 +291,10 @@ int kc_team_create(const kc_team_config *config, kc_team_t **out)
     atomic_init(&team->dispatched_generation, 0);
     atomic_init(&team->completed_generation, 0);
     atomic_init(&team->retired_generation, 0);
+    atomic_init(&team->test_fault_generation, 0);
+    atomic_init(&team->test_fault_member, 0);
+    atomic_init(&team->test_fault_point, 0);
+    atomic_init(&team->test_fault_settled, 0);
     if (kc_doorbell_create(&team->dispatch) != 0 ||
         kc_doorbell_create(&team->readiness) != 0) {
         kc_doorbell_destroy(team->dispatch);
@@ -201,6 +315,8 @@ int kc_team_start(kc_team_t *team)
     if (!atomic_compare_exchange_strong_explicit(
             &team->started, &expected, 1, memory_order_acq_rel,
             memory_order_acquire)) return expected == 1 ? 0 : -EINVAL;
+    const int inject = atomic_load_explicit(&team->test_fault_generation,
+                                            memory_order_acquire) != 0;
     uint32_t started = 0;
     for (; started < team->config.member_count; ++started) {
         team->members[started] = (kc_team_member){
@@ -210,7 +326,8 @@ int kc_team_start(kc_team_t *team)
             .seen_generation = 0,
         };
         int status = kc_port_thread_create(&team->threads[started],
-                                           team_member_main,
+                                           inject ? team_member_fault_main
+                                                  : team_member_main,
                                            &team->members[started]);
         if (status != 0) break;
     }
@@ -302,6 +419,7 @@ int kc_team_destroy(kc_team_t *team)
         !atomic_load_explicit(&team->joined, memory_order_acquire)) return -EBUSY;
     kc_doorbell_destroy(team->readiness);
     kc_doorbell_destroy(team->dispatch);
+    kc_doorbell_destroy(team->test_fault_hold);
     free(team->progress);
     free(team->members);
     free(team->threads);
@@ -379,5 +497,40 @@ int kc_team_current_member(const kc_team_t *team, uint32_t *out_member)
     if (!team || !out_member) return -EINVAL;
     if (current_team != team) return -EPERM;
     *out_member = current_member;
+    return 0;
+}
+
+int kc_team_inject_member_exit_for_test(
+    kc_team_t *team, uint64_t generation, uint32_t member, uint32_t point,
+    kc_team_test_fault_fn ready, void *context)
+{
+    if (!team || generation == 0 || member >= team->config.member_count ||
+        (point != KC_TEAM_TEST_NEVER_ENTERED &&
+         point != KC_TEAM_TEST_ENTERED_NEVER_RETURNED) || !ready)
+        return -EINVAL;
+    if (atomic_load_explicit(&team->started, memory_order_acquire))
+        return -EBUSY;
+    if (generation != 1) return -EINVAL;
+
+    kc_doorbell_t *hold = NULL;
+    if (kc_doorbell_create(&hold) != 0) return -ENOTSUP;
+    uint64_t expected = 0;
+    if (!atomic_compare_exchange_strong_explicit(
+            &team->test_fault_generation, &expected, UINT64_MAX,
+            memory_order_acq_rel, memory_order_acquire)) {
+        kc_doorbell_destroy(hold);
+        return -EALREADY;
+    }
+    team->test_fault_hold = hold;
+    team->test_fault_ready = ready;
+    team->test_fault_context = context;
+    atomic_store_explicit(&team->test_fault_member, member,
+                          memory_order_relaxed);
+    atomic_store_explicit(&team->test_fault_point, point,
+                          memory_order_relaxed);
+    atomic_store_explicit(&team->test_fault_settled, 0,
+                          memory_order_relaxed);
+    atomic_store_explicit(&team->test_fault_generation, generation,
+                          memory_order_release);
     return 0;
 }

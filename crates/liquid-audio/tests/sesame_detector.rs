@@ -41,6 +41,19 @@ struct Window {
     second_count: usize,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Span {
+    samples: *const f32,
+    count: usize,
+}
+
+#[repr(C)]
+struct Scatter {
+    spans: *const Span,
+    span_count: usize,
+}
+
 unsafe extern "C" {
     fn lfm_sesame_detector_create(rate: u32, out: *mut *mut NativeDetector) -> c_int;
     fn lfm_sesame_detector_destroy(detector: *mut NativeDetector) -> c_int;
@@ -61,6 +74,14 @@ unsafe extern "C" {
         detector: *mut NativeDetector,
         stream: u32,
         window: *const Window,
+        selected_bytes: *mut u8,
+        selected_capacity: usize,
+        decision: *mut Decision,
+    ) -> c_int;
+    fn lfm_sesame_detector_process_scatter_window(
+        detector: *mut NativeDetector,
+        stream: u32,
+        window: *const Scatter,
         selected_bytes: *mut u8,
         selected_capacity: usize,
         decision: *mut Decision,
@@ -106,6 +127,57 @@ impl Drop for Detector {
     fn drop(&mut self) {
         assert_eq!(unsafe { lfm_sesame_detector_destroy(self.0) }, 0);
     }
+}
+
+fn bins(detector: &Detector) -> usize {
+    (unsafe { lfm_sesame_detector_end_bin(detector.0) }
+        - unsafe { lfm_sesame_detector_first_bin(detector.0) }) as usize
+}
+
+fn reset(detector: &Detector, stream: u32) {
+    assert_eq!(unsafe { lfm_sesame_detector_reset(detector.0, stream) }, 0);
+}
+
+fn process(detector: &Detector, stream: u32, input: &[f32; 256]) -> (Vec<u8>, Decision) {
+    let mut bytes = vec![0; bins(detector)];
+    let mut decision = Decision::default();
+    assert_eq!(
+        unsafe {
+            lfm_sesame_detector_process(
+                detector.0,
+                stream,
+                input.as_ptr(),
+                bytes.as_mut_ptr(),
+                bytes.len(),
+                &mut decision,
+            )
+        },
+        0
+    );
+    (bytes, decision)
+}
+
+fn process_scatter(detector: &Detector, stream: u32, spans: &[Span]) -> (Vec<u8>, Decision) {
+    let window = Scatter {
+        spans: spans.as_ptr(),
+        span_count: spans.len(),
+    };
+    let mut bytes = vec![0; bins(detector)];
+    let mut decision = Decision::default();
+    assert_eq!(
+        unsafe {
+            lfm_sesame_detector_process_scatter_window(
+                detector.0,
+                stream,
+                &window,
+                bytes.as_mut_ptr(),
+                bytes.len(),
+                &mut decision,
+            )
+        },
+        0
+    );
+    (bytes, decision)
 }
 
 #[derive(Deserialize)]
@@ -168,55 +240,104 @@ fn samples(kind: &str, rate: u32) -> [f32; 256] {
 }
 
 #[test]
-fn selected_bins_match_real_chrome_web_audio_bytes_exactly() {
+fn selected_bins_match_real_chrome_web_audio_bytes_exactly_for_both_streams() {
     let fixture: Fixture = serde_json::from_str(include_str!(
         "../native/tests/fixtures/sesame/selected_bins_v1.json"
     ))
     .unwrap();
 
     for case in &fixture.cases {
-        let detector = Detector::new(case.rate);
-        let input = samples(&case.kind, case.rate);
-        let mut bytes = vec![0u8; case.bytes.len()];
-        let mut decision = Decision::default();
-        assert_eq!(
-            unsafe {
-                lfm_sesame_detector_process(
-                    detector.0,
-                    MIC,
-                    input.as_ptr(),
-                    bytes.as_mut_ptr(),
-                    bytes.len(),
-                    &mut decision,
-                )
-            },
-            0,
-            "{} Hz {}",
-            case.rate,
-            case.kind
-        );
-        assert_eq!(
-            bytes, case.bytes,
-            "Chrome byte mismatch at {} Hz for {}",
-            case.rate, case.kind
-        );
-        assert_eq!(
-            unsafe { lfm_sesame_detector_first_bin(detector.0) },
-            case.lo
-        );
-        assert_eq!(unsafe { lfm_sesame_detector_end_bin(detector.0) }, case.hi);
-        assert_eq!(decision.size as usize, std::mem::size_of::<Decision>());
-        assert_eq!(decision.abi_version, ABI);
-        assert_eq!(decision.sample_rate, case.rate);
-        assert_eq!(decision.stream, MIC);
-        assert_eq!(decision.first_bin, case.lo);
-        assert_eq!(decision.end_bin, case.hi);
-        assert_eq!(decision.selected_bins as usize, case.bytes.len());
-        assert_eq!(decision.threshold, 50);
-        assert_eq!(
-            unsafe { lfm_sesame_detector_derived_bytes(detector.0) },
-            case.bytes.len() as u64 * 256 * 2 * 4 + 256 * 8
-        );
+        for (stream, threshold) in [(MIC, 50), (PLAYBACK, 10)] {
+            let detector = Detector::new(case.rate);
+            let input = samples(&case.kind, case.rate);
+            let mut bytes = vec![0u8; case.bytes.len()];
+            let mut decision = Decision::default();
+            assert_eq!(
+                unsafe {
+                    lfm_sesame_detector_process(
+                        detector.0,
+                        stream,
+                        input.as_ptr(),
+                        bytes.as_mut_ptr(),
+                        bytes.len(),
+                        &mut decision,
+                    )
+                },
+                0,
+                "{} Hz {} stream {}",
+                case.rate,
+                case.kind,
+                stream
+            );
+            assert_eq!(
+                bytes, case.bytes,
+                "Chrome byte mismatch at {} Hz for {} stream {}",
+                case.rate, case.kind, stream
+            );
+            assert_eq!(
+                unsafe { lfm_sesame_detector_first_bin(detector.0) },
+                case.lo
+            );
+            assert_eq!(unsafe { lfm_sesame_detector_end_bin(detector.0) }, case.hi);
+            assert_eq!(decision.size as usize, std::mem::size_of::<Decision>());
+            assert_eq!(decision.abi_version, ABI);
+            assert_eq!(decision.sample_rate, case.rate);
+            assert_eq!(decision.stream, stream);
+            assert_eq!(decision.first_bin, case.lo);
+            assert_eq!(decision.end_bin, case.hi);
+            assert_eq!(decision.selected_bins as usize, case.bytes.len());
+            assert_eq!(decision.threshold, threshold);
+            assert_eq!(
+                unsafe { lfm_sesame_detector_derived_bytes(detector.0) },
+                case.bytes.len() as u64 * 256 * 2 * 4 + 256 * 8
+            );
+        }
+    }
+}
+
+#[test]
+fn interleaved_microphone_and_playback_updates_keep_independent_history() {
+    let fixture: Fixture = serde_json::from_str(include_str!(
+        "../native/tests/fixtures/sesame/selected_bins_v1.json"
+    ))
+    .unwrap();
+    let sequence = fixture.sequence;
+    let shared = Detector::new(sequence.rate);
+    let mic = Detector::new(sequence.rate);
+    let playback = Detector::new(sequence.rate);
+
+    for (index, mic_kind) in sequence.segment_kinds.iter().enumerate() {
+        let playback_kind = &sequence.segment_kinds[sequence.segment_kinds.len() - index - 1];
+        for (stream, kind, isolated) in [
+            (MIC, mic_kind.as_str(), &mic),
+            (PLAYBACK, playback_kind.as_str(), &playback),
+        ] {
+            let input = samples(kind, sequence.rate);
+            let spans = [
+                Span {
+                    samples: input[..37].as_ptr(),
+                    count: 37,
+                },
+                Span {
+                    samples: input[37..194].as_ptr(),
+                    count: 157,
+                },
+                Span {
+                    samples: input[194..].as_ptr(),
+                    count: 62,
+                },
+            ];
+            let (shared_bytes, shared_decision) = process_scatter(&shared, stream, &spans);
+            let (isolated_bytes, isolated_decision) = process(isolated, stream, &input);
+            assert_eq!(
+                shared_bytes, isolated_bytes,
+                "stream {stream} update {index}"
+            );
+            assert_eq!(
+                shared_decision, isolated_decision,
+                "stream {stream} classifier state diverged at update {index}"
+            );
+        }
     }
 }
 
@@ -333,6 +454,149 @@ fn circular_window_splits_are_bit_exact_at_vector_and_phase_boundaries() {
 }
 
 #[test]
+fn scatter_fixture_cases_match_chrome_for_every_rate_and_stream() {
+    let fixture: Fixture = serde_json::from_str(include_str!(
+        "../native/tests/fixtures/sesame/selected_bins_v1.json"
+    ))
+    .unwrap();
+
+    for case in &fixture.cases {
+        let input = samples(&case.kind, case.rate);
+        let spans: [Span; 256] = std::array::from_fn(|index| Span {
+            samples: unsafe { input.as_ptr().add(index) },
+            count: 1,
+        });
+        for stream in [MIC, PLAYBACK] {
+            let detector = Detector::new(case.rate);
+            let (bytes, decision) = process_scatter(&detector, stream, &spans);
+            assert_eq!(
+                bytes, case.bytes,
+                "scatter Chrome byte mismatch at {} Hz for {} stream {}",
+                case.rate, case.kind, stream
+            );
+            assert_eq!(decision.stream, stream);
+            assert_eq!(decision.first_bin, case.lo);
+            assert_eq!(decision.end_bin, case.hi);
+        }
+    }
+}
+
+#[test]
+fn every_scatter_boundary_is_bit_exact_for_every_rate_and_stream() {
+    for rate in [16_000, 24_000, 44_100, 48_000] {
+        let input = samples("integer", rate);
+        for stream in [MIC, PLAYBACK] {
+            let contiguous = Detector::new(rate);
+            let scatter = Detector::new(rate);
+            for boundary in 1..256 {
+                reset(&contiguous, stream);
+                reset(&scatter, stream);
+                let spans = if boundary < 255 {
+                    [
+                        Span {
+                            samples: input[..boundary].as_ptr(),
+                            count: boundary,
+                        },
+                        Span {
+                            samples: input[boundary..boundary + 1].as_ptr(),
+                            count: 1,
+                        },
+                        Span {
+                            samples: input[boundary + 1..].as_ptr(),
+                            count: 255 - boundary,
+                        },
+                    ]
+                } else {
+                    [
+                        Span {
+                            samples: input[..1].as_ptr(),
+                            count: 1,
+                        },
+                        Span {
+                            samples: input[1..255].as_ptr(),
+                            count: 254,
+                        },
+                        Span {
+                            samples: input[255..].as_ptr(),
+                            count: 1,
+                        },
+                    ]
+                };
+                let expected = process(&contiguous, stream, &input);
+                let actual = process_scatter(&scatter, stream, &spans);
+                assert_eq!(
+                    actual, expected,
+                    "{rate} Hz stream {stream} boundary {boundary}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn disjoint_real_zero_real_spans_are_bit_exact() {
+    for rate in [16_000, 24_000, 44_100, 48_000] {
+        let first = samples("selected-square", rate)[..73].to_vec();
+        let zero = vec![0.0f32; 91];
+        let last = samples("integer", rate)[..92].to_vec();
+        let mut input = [0.0f32; 256];
+        input[..73].copy_from_slice(&first);
+        input[73..164].copy_from_slice(&zero);
+        input[164..].copy_from_slice(&last);
+        let spans = [
+            Span {
+                samples: first.as_ptr(),
+                count: first.len(),
+            },
+            Span {
+                samples: zero.as_ptr(),
+                count: zero.len(),
+            },
+            Span {
+                samples: last.as_ptr(),
+                count: last.len(),
+            },
+        ];
+        for stream in [MIC, PLAYBACK] {
+            let contiguous = Detector::new(rate);
+            let scatter = Detector::new(rate);
+            assert_eq!(
+                process_scatter(&scatter, stream, &spans),
+                process(&contiguous, stream, &input),
+                "{rate} Hz stream {stream}"
+            );
+        }
+    }
+}
+
+#[test]
+fn alternating_one_sample_spans_are_bit_exact() {
+    for rate in [16_000, 24_000, 44_100, 48_000] {
+        let real = samples("selected-square", rate);
+        let zero = [0.0f32; 128];
+        let input: [f32; 256] =
+            std::array::from_fn(|index| if index % 2 == 0 { real[index] } else { 0.0 });
+        let spans: [Span; 256] = std::array::from_fn(|index| Span {
+            samples: if index % 2 == 0 {
+                unsafe { real.as_ptr().add(index) }
+            } else {
+                unsafe { zero.as_ptr().add(index / 2) }
+            },
+            count: 1,
+        });
+        for stream in [MIC, PLAYBACK] {
+            let contiguous = Detector::new(rate);
+            let scatter = Detector::new(rate);
+            assert_eq!(
+                process_scatter(&scatter, stream, &spans),
+                process(&contiguous, stream, &input),
+                "{rate} Hz stream {stream}"
+            );
+        }
+    }
+}
+
+#[test]
 fn adaptive_extrema_are_sticky_separate_and_equality_is_voice() {
     let mut detector = Detector::new(48_000);
 
@@ -434,4 +698,165 @@ fn malformed_geometry_and_calls_are_rejected() {
         0
     );
     assert_ne!(unsafe { lfm_sesame_detector_reset(detector.0, 99) }, 0);
+
+    let valid = [Span {
+        samples: input.as_ptr(),
+        count: input.len(),
+    }];
+    let valid_window = Scatter {
+        spans: valid.as_ptr(),
+        span_count: valid.len(),
+    };
+    let mut bytes = vec![0u8; bins(&detector)];
+    assert_ne!(
+        unsafe {
+            lfm_sesame_detector_process_scatter_window(
+                detector.0,
+                MIC,
+                ptr::null(),
+                bytes.as_mut_ptr(),
+                bytes.len(),
+                &mut decision,
+            )
+        },
+        0
+    );
+    for window in [
+        Scatter {
+            spans: ptr::null(),
+            span_count: 1,
+        },
+        Scatter {
+            spans: valid.as_ptr(),
+            span_count: 0,
+        },
+        Scatter {
+            spans: valid.as_ptr(),
+            span_count: 257,
+        },
+    ] {
+        assert_ne!(
+            unsafe {
+                lfm_sesame_detector_process_scatter_window(
+                    detector.0,
+                    MIC,
+                    &window,
+                    bytes.as_mut_ptr(),
+                    bytes.len(),
+                    &mut decision,
+                )
+            },
+            0
+        );
+    }
+
+    let null_sample = [Span {
+        samples: ptr::null(),
+        count: 256,
+    }];
+    let zero_count = [Span {
+        samples: input.as_ptr(),
+        count: 0,
+    }];
+    let oversized = [Span {
+        samples: input.as_ptr(),
+        count: 257,
+    }];
+    let overflowing = [Span {
+        samples: input.as_ptr(),
+        count: usize::MAX,
+    }];
+    let short = [Span {
+        samples: input.as_ptr(),
+        count: 255,
+    }];
+    let long = [
+        Span {
+            samples: input.as_ptr(),
+            count: 128,
+        },
+        Span {
+            samples: unsafe { input.as_ptr().add(128) },
+            count: 129,
+        },
+    ];
+    for spans in [
+        null_sample.as_slice(),
+        zero_count.as_slice(),
+        oversized.as_slice(),
+        overflowing.as_slice(),
+        short.as_slice(),
+        long.as_slice(),
+    ] {
+        let window = Scatter {
+            spans: spans.as_ptr(),
+            span_count: spans.len(),
+        };
+        assert_ne!(
+            unsafe {
+                lfm_sesame_detector_process_scatter_window(
+                    detector.0,
+                    MIC,
+                    &window,
+                    bytes.as_mut_ptr(),
+                    bytes.len(),
+                    &mut decision,
+                )
+            },
+            0
+        );
+    }
+
+    assert_ne!(
+        unsafe {
+            lfm_sesame_detector_process_scatter_window(
+                detector.0,
+                99,
+                &valid_window,
+                bytes.as_mut_ptr(),
+                bytes.len(),
+                &mut decision,
+            )
+        },
+        0
+    );
+    assert_ne!(
+        unsafe {
+            lfm_sesame_detector_process_scatter_window(
+                detector.0,
+                MIC,
+                &valid_window,
+                ptr::null_mut(),
+                1,
+                &mut decision,
+            )
+        },
+        0
+    );
+    assert_ne!(
+        unsafe {
+            lfm_sesame_detector_process_scatter_window(
+                detector.0,
+                MIC,
+                &valid_window,
+                bytes.as_mut_ptr(),
+                bytes.len().saturating_sub(1),
+                &mut decision,
+            )
+        },
+        0
+    );
+    assert_ne!(
+        unsafe {
+            lfm_sesame_detector_process_scatter_window(
+                detector.0,
+                MIC,
+                &valid_window,
+                bytes.as_mut_ptr(),
+                bytes.len(),
+                ptr::null_mut(),
+            )
+        },
+        0
+    );
 }

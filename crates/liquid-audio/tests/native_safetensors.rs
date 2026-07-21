@@ -7,13 +7,19 @@ use std::sync::{Arc, Barrier};
 use liquid_audio::NativeVoiceSampling;
 
 const OK: i32 = 0;
+const PERMISSION: i32 = -1;
 const IO: i32 = -2;
 const FORMAT: i32 = -3;
 const NOT_FOUND: i32 = -5;
 const INVALID: i32 = -22;
 const WEIGHT_ABI: u32 = 1;
 const RUNTIME_ABI: u32 = 4;
-const MODEL_ABI: u32 = 3;
+const MODEL_ABI: u32 = 4;
+const PAYLOAD_CONFIG: u32 = 1;
+const PAYLOAD_WEIGHT_IMAGE: u32 = 1 << 1;
+const PAYLOAD_WEIGHT_INDEX: u32 = 1 << 2;
+const PAYLOAD_TOKENIZER: u32 = 1 << 3;
+const PAYLOAD_READS_COMPLETE: u32 = 1;
 const BF16: u32 = 13;
 const F32: u32 = 16;
 
@@ -86,10 +92,20 @@ struct ModelMemory {
     resident_image_bytes: u64,
     directly_bound_bytes: u64,
     derived_immutable_bytes: u64,
+    materialized_weight_bytes: u64,
     compatibility_copied_bytes: u64,
+    payload_read_calls: u64,
+    payload_read_bytes: u64,
+    post_publication_read_calls: u64,
+    post_publication_read_bytes: u64,
+    post_publication_materialization_attempts: u64,
+    post_publication_materialization_bytes: u64,
+    publication_generation: u64,
     load_ns: u64,
     load_workers: u32,
     load_tasks: u32,
+    payload_read_coverage: u32,
+    accounting_flags: u32,
     reserved: [u64; 4],
 }
 
@@ -122,7 +138,10 @@ struct LoadStats {
 }
 
 extern "C" {
-    fn lfm_runtime_create(config: *const RuntimeConfig, out: *mut *mut NativeRuntime) -> i32;
+    fn lfm_internal_runtime_create_manual_deadlines_for_test(
+        config: *const RuntimeConfig,
+        out: *mut *mut NativeRuntime,
+    ) -> i32;
     fn lfm_runtime_start(runtime: *mut NativeRuntime) -> i32;
     fn lfm_runtime_request_stop(runtime: *mut NativeRuntime);
     fn lfm_runtime_join(runtime: *mut NativeRuntime) -> i32;
@@ -174,7 +193,7 @@ extern "C" {
         out: *mut TensorView,
     ) -> i32;
     fn lfm_weights_dtype_name(dtype: u32) -> *const c_char;
-    fn lfm_engine_new(workers: i32) -> *mut c_void;
+    fn lfm_internal_engine_new_manual_deadlines_for_test(workers: i32) -> *mut c_void;
     fn lfm_engine_free(engine: *mut c_void);
     fn lfm_model_open(
         engine: *mut c_void,
@@ -186,6 +205,22 @@ extern "C" {
     fn lfm_model_close(model: *mut NativeModel) -> i32;
     fn lfm_model_info(model: *const NativeModel, out: *mut ModelInfo) -> i32;
     fn lfm_model_memory(model: *const NativeModel, out: *mut ModelMemory) -> i32;
+    fn lfm_internal_model_accounting_fault_test(
+        source: *const u8,
+        loaded: *mut u8,
+        rejected: *mut u8,
+        bytes: usize,
+        out: *mut ModelMemory,
+        out_read_status: *mut i32,
+        out_weight_status: *mut i32,
+        out_policy_status: *mut i32,
+    ) -> i32;
+    fn lfm_internal_model_source_gate_test(
+        path: *const c_char,
+        config_status: *mut i32,
+        weights_status: *mut i32,
+        tokenizer_status: *mut i32,
+    ) -> i32;
     fn mimi_weight_load_f32(bytes: *const u8, index: u64) -> f32;
     fn mimi_weight_gemv_f32(
         weights: *const u8,
@@ -520,7 +555,7 @@ fn write_tiny_model(temp: &Temp, layers: usize, mutate: impl FnOnce(&mut Vec<Tin
 }
 
 fn open_tiny_model(temp: &Temp) -> (*mut c_void, *mut NativeModel, i32, String) {
-    let engine = unsafe { lfm_engine_new(2) };
+    let engine = unsafe { lfm_internal_engine_new_manual_deadlines_for_test(2) };
     assert!(!engine.is_null());
     let path = CString::new(temp.0.as_os_str().as_encoded_bytes()).unwrap();
     let mut model = std::ptr::null_mut();
@@ -1514,7 +1549,10 @@ fn runtime_rejects_incomplete_voice_model_without_retaining_a_child() {
         reserved: [0; 4],
     };
     let mut runtime = std::ptr::null_mut();
-    assert_eq!(unsafe { lfm_runtime_create(&config, &mut runtime) }, 0);
+    assert_eq!(
+        unsafe { lfm_internal_runtime_create_manual_deadlines_for_test(&config, &mut runtime) },
+        0
+    );
     assert_eq!(unsafe { lfm_runtime_start(runtime) }, 0);
     let path = CString::new(temp.0.as_os_str().as_encoded_bytes()).unwrap();
     let mut model = std::ptr::null_mut();
@@ -1574,6 +1612,90 @@ fn directly_bound_accounting_excludes_unused_checkpoint_tensors() {
 }
 
 #[test]
+fn model_accounting_counts_before_and_rejects_after_publication() {
+    const BYTES: usize = 7;
+    let source = [3u8, 1, 4, 1, 5, 9, 2];
+    let mut loaded = [0u8; BYTES];
+    let mut rejected = [0xa5u8; BYTES];
+    let untouched = rejected;
+    let mut memory = ModelMemory {
+        size: std::mem::size_of::<ModelMemory>() as u32,
+        abi_version: MODEL_ABI,
+        ..Default::default()
+    };
+    let mut read = 0;
+    let mut weight = 0;
+    let mut policy = 0;
+    assert_eq!(
+        unsafe {
+            lfm_internal_model_accounting_fault_test(
+                source.as_ptr(),
+                loaded.as_mut_ptr(),
+                rejected.as_mut_ptr(),
+                BYTES,
+                &mut memory,
+                &mut read,
+                &mut weight,
+                &mut policy,
+            )
+        },
+        0
+    );
+
+    assert_eq!(loaded, source, "prepublication recorder skipped its copy");
+    assert_eq!(
+        rejected, untouched,
+        "post-publication recorder touched the destination before rejecting"
+    );
+    assert_eq!(read, PERMISSION);
+    assert_eq!(weight, PERMISSION);
+    assert_eq!(
+        policy, INVALID,
+        "production weight-zero policy accepted a copy"
+    );
+    assert_eq!(memory.publication_generation, 1);
+    assert_eq!(memory.payload_read_calls, 1);
+    assert_eq!(memory.payload_read_bytes, BYTES as u64);
+    assert_eq!(memory.post_publication_read_calls, 1);
+    assert_eq!(memory.post_publication_read_bytes, BYTES as u64);
+    assert_eq!(memory.materialized_weight_bytes, BYTES as u64);
+    assert_eq!(memory.compatibility_copied_bytes, BYTES as u64);
+    assert_eq!(memory.post_publication_materialization_attempts, 1);
+    assert_eq!(memory.post_publication_materialization_bytes, BYTES as u64);
+    assert_eq!(memory.payload_read_coverage, PAYLOAD_CONFIG);
+    assert_eq!(
+        memory.accounting_flags & PAYLOAD_READS_COMPLETE,
+        PAYLOAD_READS_COMPLETE
+    );
+}
+
+#[test]
+fn every_native_model_source_rejects_before_path_io_after_publication() {
+    let temp = Temp::new();
+    let path = temp.0.join("publication-must-not-touch-this-path");
+    assert!(!path.exists());
+    let sentinel = CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+    let mut config = 0;
+    let mut weights = 0;
+    let mut tokenizer = 0;
+    assert_eq!(
+        unsafe {
+            lfm_internal_model_source_gate_test(
+                sentinel.as_ptr(),
+                &mut config,
+                &mut weights,
+                &mut tokenizer,
+            )
+        },
+        0
+    );
+    assert_eq!(config, PERMISSION);
+    assert_eq!(weights, PERMISSION);
+    assert_eq!(tokenizer, PERMISSION);
+    assert!(!path.exists());
+}
+
+#[test]
 fn opaque_native_model_reports_single_image_accounting() {
     let temp = Temp::new();
     write_tiny_model(&temp, 2, |_| {});
@@ -1605,13 +1727,74 @@ fn opaque_native_model_reports_single_image_accounting() {
     assert!(memory.source_bytes > 0);
     assert_eq!(memory.resident_image_bytes, info.resident_bytes);
     assert!(memory.directly_bound_bytes > 0);
+    assert_eq!(memory.materialized_weight_bytes, 0);
     assert_eq!(memory.compatibility_copied_bytes, 0);
+    assert_eq!(memory.publication_generation, 1);
+    assert_eq!(
+        memory.payload_read_calls,
+        u64::from(memory.load_tasks) + 1,
+        "config read plus resident-image read tasks must be accounted"
+    );
+    let config_bytes = std::fs::metadata(temp.0.join("config.json")).unwrap().len();
+    assert_eq!(
+        memory.payload_read_bytes,
+        memory.source_bytes + config_bytes
+    );
+    assert_eq!(memory.post_publication_read_calls, 0);
+    assert_eq!(memory.post_publication_read_bytes, 0);
+    assert_eq!(memory.post_publication_materialization_attempts, 0);
+    assert_eq!(memory.post_publication_materialization_bytes, 0);
+    assert_eq!(
+        memory.payload_read_coverage,
+        PAYLOAD_CONFIG | PAYLOAD_WEIGHT_IMAGE
+    );
+    assert_eq!(
+        memory.accounting_flags & PAYLOAD_READS_COMPLETE,
+        PAYLOAD_READS_COMPLETE,
+        "all applicable source implementations are installed on this owner"
+    );
     assert!(memory.load_ns > 0);
     assert!(memory.load_workers > 0);
     assert!(memory.load_tasks > 0);
 
     assert_eq!(unsafe { lfm_model_close(model) }, 0);
     unsafe { lfm_engine_free(engine) };
+}
+
+#[test]
+fn model_owned_index_read_is_counted_without_posthoc_loader_summation() {
+    let temp = Temp::new();
+    write_tiny_model(&temp, 2, |_| {});
+    let shard = "model-00001-of-00001.safetensors";
+    std::fs::rename(temp.0.join("model.safetensors"), temp.0.join(shard)).unwrap();
+    let map = tiny_model_tensors(2)
+        .into_iter()
+        .map(|tensor| (tensor.name, serde_json::Value::String(shard.into())))
+        .collect::<serde_json::Map<_, _>>();
+    let index = serde_json::to_vec(&serde_json::json!({ "weight_map": map })).unwrap();
+    std::fs::write(temp.0.join("model.safetensors.index.json"), &index).unwrap();
+
+    let memory = tiny_model_memory(&temp);
+    let config = std::fs::metadata(temp.0.join("config.json")).unwrap().len();
+    assert_eq!(
+        memory.payload_read_calls,
+        u64::from(memory.load_tasks) + 2,
+        "config and index are distinct owner-recorded reads"
+    );
+    assert_eq!(
+        memory.payload_read_bytes,
+        memory.source_bytes + config + index.len() as u64
+    );
+    assert_eq!(
+        memory.payload_read_coverage,
+        PAYLOAD_CONFIG | PAYLOAD_WEIGHT_IMAGE | PAYLOAD_WEIGHT_INDEX
+    );
+    assert_eq!(
+        memory.accounting_flags & PAYLOAD_READS_COMPLETE,
+        PAYLOAD_READS_COMPLETE
+    );
+    assert_eq!(memory.post_publication_read_calls, 0);
+    assert_eq!(memory.post_publication_read_bytes, 0);
 }
 
 #[test]
@@ -1633,7 +1816,31 @@ fn complete_runtime_model_reports_lifecycle_only_memory_accounting() {
     assert!(first.source_bytes > 0);
     assert!(first.resident_image_bytes >= first.source_bytes);
     assert!(first.directly_bound_bytes > 0);
+    assert_eq!(first.materialized_weight_bytes, 0);
     assert_eq!(first.compatibility_copied_bytes, 0);
+    assert!(first.payload_read_calls > 0);
+    assert!(
+        first.payload_read_calls >= u64::from(first.load_tasks) + 2,
+        "voice accounting omitted its config or tokenizer read"
+    );
+    assert!(
+        first.payload_read_bytes > first.source_bytes,
+        "voice accounting omitted non-image payload bytes"
+    );
+    assert_eq!(
+        first.payload_read_coverage & (PAYLOAD_CONFIG | PAYLOAD_WEIGHT_IMAGE | PAYLOAD_TOKENIZER),
+        PAYLOAD_CONFIG | PAYLOAD_WEIGHT_IMAGE | PAYLOAD_TOKENIZER,
+        "complete voice model did not account an actual config, shard, or tokenizer read"
+    );
+    assert_eq!(first.publication_generation, 1);
+    assert_eq!(first.post_publication_read_calls, 0);
+    assert_eq!(first.post_publication_read_bytes, 0);
+    assert_eq!(first.post_publication_materialization_attempts, 0);
+    assert_eq!(first.post_publication_materialization_bytes, 0);
+    assert!(
+        first.payload_read_accounting_complete,
+        "real-checkpoint read gate refuses incomplete source coverage"
+    );
     assert!(first.load_ns > 0);
     assert!((1..=4).contains(&first.load_workers));
     assert!(first.load_tasks > 0);

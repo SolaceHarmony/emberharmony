@@ -1,11 +1,12 @@
 //! Tauri-owned voice runtime.
 //!
 //! The audio service itself lives in `liquid_audio::VoiceRuntime`: the Tauri layer
-//! owns the platform microphone and speaker callbacks directly, while VAD,
-//! barge-in, and realtime inference run on Rust threads. This module is the desktop
-//! kernel wrapper: it loads Tauri settings,
-//! builds the LFM2 engine, owns the single active session, and maps runtime events
-//! onto the webview `Channel`.
+//! owns the platform microphone and speaker callbacks, which pass ephemeral
+//! device spans through opaque native capture/playback endpoints. Native Sesame,
+//! kcoro, and Flashkern own turn policy and inference progress. This module is
+//! the desktop wrapper: it loads Tauri settings, builds the LFM2 engine, owns the
+//! single active session, and maps bounded runtime events onto the webview
+//! `Channel`.
 
 use std::{
     borrow::Cow,

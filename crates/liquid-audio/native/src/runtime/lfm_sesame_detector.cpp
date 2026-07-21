@@ -23,6 +23,10 @@ extern "C" void lfm_sesame_selected_magnitudes_window(
     const LfmSesameWindowV1 *window, const float *real_table,
     const float *imag_table, float *smoothed_magnitudes,
     size_t selected_bins);
+extern "C" void lfm_sesame_selected_magnitudes_scatter(
+    const LfmSesameScatterWindowV1 *window, const float *real_table,
+    const float *imag_table, float *smoothed_magnitudes,
+    size_t selected_bins);
 extern "C" void lfm_sesame_magnitudes_to_bytes(
     const float *magnitudes, const double *thresholds, uint8_t *bytes,
     size_t count);
@@ -110,6 +114,33 @@ int classify(LfmSesameDetector *detector, uint32_t stream,
         bytes, count, &state->minimum, &state->maximum, threshold_for(stream),
         &score);
     fill_decision(*detector, stream, *state, score, voice, decision);
+    return 0;
+}
+
+bool destination_valid(const LfmSesameDetector *detector,
+                       const uint8_t *selected_bytes,
+                       size_t selected_capacity,
+                       const LfmSesameDecisionV1 *decision) {
+    return detector && decision &&
+           ((selected_bytes && selected_capacity >= detector->bins) ||
+            (!selected_bytes && selected_capacity == 0));
+}
+
+int finish_process(LfmSesameDetector *detector, uint32_t stream,
+                   StreamState *state, uint8_t *selected_bytes,
+                   LfmSesameDecisionV1 *decision) {
+    std::array<uint8_t, kFrequencyBins> evidence{};
+    lfm_sesame_magnitudes_to_bytes(
+        state->magnitude.get(), detector->byte_thresholds.get(),
+        evidence.data(), detector->bins);
+    const int status = classify(detector, stream, evidence.data(),
+                                detector->bins, decision);
+    if (status != 0) {
+        return status;
+    }
+    if (selected_bytes) {
+        std::copy_n(evidence.data(), detector->bins, selected_bytes);
+    }
     return 0;
 }
 
@@ -265,8 +296,8 @@ extern "C" int lfm_sesame_detector_process_window(
         window->first_count + window->second_count != kFft ||
         (window->second_count != 0 && !window->second) ||
         (window->second_count == 0 && window->second != nullptr) ||
-        (selected_bytes && selected_capacity < detector->bins) ||
-        (!selected_bytes && selected_capacity != 0)) {
+        !destination_valid(detector, selected_bytes, selected_capacity,
+                           decision)) {
         return -EINVAL;
     }
 
@@ -281,19 +312,55 @@ extern "C" int lfm_sesame_detector_process_window(
             state->magnitude.get(), detector->bins);
     }
 
-    std::array<uint8_t, kFrequencyBins> evidence{};
-    lfm_sesame_magnitudes_to_bytes(
-        state->magnitude.get(), detector->byte_thresholds.get(), evidence.data(),
-        detector->bins);
-    const int status = classify(detector, stream, evidence.data(), detector->bins,
-                                decision);
-    if (status != 0) {
-        return status;
+    return finish_process(detector, stream, state, selected_bytes, decision);
+}
+
+extern "C" int lfm_sesame_detector_process_scatter_window(
+    LfmSesameDetector *detector, uint32_t stream,
+    const LfmSesameScatterWindowV1 *window, uint8_t *selected_bytes,
+    size_t selected_capacity, LfmSesameDecisionV1 *decision) {
+    StreamState *state = state_for(detector, stream);
+    if (!state || !window || !window->spans || window->span_count == 0 ||
+        window->span_count > kFft ||
+        !destination_valid(detector, selected_bytes, selected_capacity,
+                           decision)) {
+        return -EINVAL;
     }
-    if (selected_bytes) {
-        std::copy_n(evidence.data(), detector->bins, selected_bytes);
+
+    size_t total = 0;
+    for (size_t index = 0; index < window->span_count; ++index) {
+        const LfmSesameSpanV1 &span = window->spans[index];
+        if (!span.samples || span.count == 0 || span.count > kFft ||
+            total > kFft - span.count) {
+            return -EINVAL;
+        }
+        total += span.count;
     }
-    return 0;
+    if (total != kFft) {
+        return -EINVAL;
+    }
+
+    if (window->span_count == 1) {
+        lfm_sesame_selected_magnitudes(
+            window->spans[0].samples, detector->real_table.get(),
+            detector->imag_table.get(), state->magnitude.get(),
+            detector->bins);
+    } else if (window->span_count == 2) {
+        const LfmSesameWindowV1 split = {
+            .first = window->spans[0].samples,
+            .first_count = window->spans[0].count,
+            .second = window->spans[1].samples,
+            .second_count = window->spans[1].count,
+        };
+        lfm_sesame_selected_magnitudes_window(
+            &split, detector->real_table.get(), detector->imag_table.get(),
+            state->magnitude.get(), detector->bins);
+    } else {
+        lfm_sesame_selected_magnitudes_scatter(
+            window, detector->real_table.get(), detector->imag_table.get(),
+            state->magnitude.get(), detector->bins);
+    }
+    return finish_process(detector, stream, state, selected_bytes, decision);
 }
 
 extern "C" int lfm_sesame_detector_classify_bytes(

@@ -1,143 +1,162 @@
-# Threading & compute parity with torch
+# Threading and execution ownership
 
-Goal: stop "making it similar" and actually match torch's execution model — intra-op
-thread policy, the CPU matmul backend, and the realtime pipeline — reading torch's source
-where needed (we don't link libtorch's C++ ABI, so we replicate it).
+Status: current production architecture. The torch/Candle comparison at the end
+is explicitly historical.
 
-## 1. Intra-op thread pool — DONE, verified
+## Production rule
 
-**torch** (`aten/src/ATen/ParallelCommon.cpp` `intraop_default_num_threads()`): honours
-`OMP_NUM_THREADS` then `MKL_NUM_THREADS`, else `TaskThreadPoolBase::defaultNumThreads()`,
-which **on Apple Silicon queries `hw.perflevel0.physicalcpu` — the performance cores only**
-(excludes the efficiency cores).
+Production no longer tries to reproduce Candle's Rust/Rayon execution model.
+`liquid-audio` has no Candle dependency and does not own a Rust model, tensor,
+sampler, KV cache, Conformer, Depthformer, Mimi codec, or inference loop. The
+workspace-only `liquid-audio-oracle` crate owns reference/training code; it is
+not linked as a fallback.
 
-**candle** (`utils.rs::get_num_threads`): `RAYON_NUM_THREADS` else `num_cpus::get()` — **all
-logical cores**, i.e. it schedules compute-bound matmul (`gemm`, rayon) onto the slow E-cores
-that torch deliberately avoids → different pool, worse throughput/tail latency.
+The live ownership split is:
 
-**Fix** (`src/compute/threads.rs`): `intraop_default_num_threads()` replicates torch's policy exactly
-(`OMP`/`MKL`/`RAYON` env → `hw.perflevel0.physicalcpu` → `hw.physicalcpu` → `num_cpus::get_physical()`),
-and `configure_intraop_threads()` installs it as rayon's **global** pool (candle + `gemm`
-inherit it). Called once at the top of `from_pretrained`.
+| Domain | Owner | Execution contract |
+| --- | --- | --- |
+| capture/playback device callbacks | platform/CPAL with thin Rust closures | bounded native lease write or drain, publish edge, return |
+| host voice state/UI delivery | one Rust `kcoro_sys::Service` | retained stackless callback on one fixed runtime worker |
+| native session coordination/delivery | native `kc_service` continuations | callback-driven, exact tickets, no polling thread |
+| native route/bridge/supervision | engine `kc_service` continuations | one explicit one-worker control runtime |
+| numerical work | one engine `kc_team` | fixed non-stealing members; one active generation |
+| model math | architecture leaves and explicit Accelerate/AMX seams | pointer/stride views; no Rust numerical body |
 
-Verified on **M2 Max** (8 P-cores + 4 E-cores = 12 logical): candle would use **12**; we now
-use **8** — byte-matching `sysctl hw.perflevel0.physicalcpu`. (`threads::tests`.)
+## Rust host
 
-## 2. CPU matmul backend — DONE
+`VoiceRuntime` mounts `SessionTask` as a retained kcoro service with one worker.
+The service owns device handles, outward event delivery, and the opaque
+`VoiceEngine`; it does not own numerical state. Its control and device-fault
+inputs are realtime notifier edges, not timeout loops or Crossbeam channels.
 
-torch's CPU backend on Apple Silicon is Accelerate/vecLib BLAS (multi-threaded, tuned).
-Added an opt-in **`accelerate` feature** (`candle-core/accelerate`,`candle-nn/accelerate`)
-so CPU-mode `sgemm`/`dgemm` use Apple BLAS instead of candle's pure-Rust `gemm`. Builds clean.
+Capture callbacks call the native `CaptureSink` with one complete interleaved
+device block. Native code reserves generation-checked spans in its preallocated
+PCM arena, performs format conversion/downmix directly into those spans, and
+publishes one chunk record. Playback callbacks claim, resolve, drain, and
+release exact native playback leases. The host never writes PCM to a file or
+event channel to move it between stages.
 
-## 3. bf16 CPU matmul — DONE (kernel), verified bit-exact
+The callback cadence requested from CPAL is device geometry, not a scheduler
+timer. An input callback advances the sample clock even for acoustic silence.
+Device failure is an explicit fault callback. Rust wall-clock/RMS observations
+are response telemetry only and do not decide speech boundaries.
 
-candle 0.9.2's CPU matmul allowlist is **`F16 | F32 | F64`** (`cpu_backend/mod.rs:1368`;
-Accelerate path F32/F64) — **bf16 → `UnsupportedDTypeForOp`**, so the loader forced f32 on
-CPU. (candle _has_ bf16 everywhere else — dtype, every elementwise op, conversions, Metal
-matmul; the gap is only this CPU-gemm allowlist, and `gemm-f16` already handles the `half`
-types, so it's a candle choice, not a `gemm` limit.)
+## kcoro runtime workers
 
-The M2 Max has **FEAT_BF16** (`sysctl hw.optional.arm.FEAT_BF16 = 1`) → `BFMMLA`. So we wrote
-a real kernel instead of falling back to f32:
+`kc_runtime` owns a fixed worker set. Every `kc_service` is permanently bound to
+one worker and one ready bit in that worker's bounded bitmap. Producer
+notification is an atomic publication edge. There is no shared ready queue,
+work stealing, generic future executor, or task migration.
 
-- **`native/kernels/aarch64/flashkern_neon.cpp`** — the live BFMMLA kernel library,
-  including packed GEMM/GEMV and native-layout decode forms with bf16 inputs and f32 accumulation.
-- **`flashkern/native_engine.rs`** exposes only the native capability query and typed
-  ticket ABI. `src/compute/bf16_gemm.rs` and its Candle `CustomOp2` are deleted.
-- **Verified**: typed `REQ_GEMM` fixtures cover checkpoint-native and transposed
-  layouts plus decode GEMV; AArch64 and Rosetta execute the same ABI.
+A service callback drains durable state and returns one of three outcomes:
 
-The temporary Candle linear owner borrows contiguous storage and submits `REQ_GEMM`.
-No Rust numerical implementation or architecture selection remains in that route.
+- dormant because its complete predicate is empty;
+- locally runnable again because bounded work remains;
+- terminal after stop/fault and admitted edges have settled.
 
-**Caution.** The 2-D linear path is BF16 on CPU when the checkpoint is BF16 and FEAT_BF16 is
-available. The intentional F32 paths are local math/accumulation only: audio preprocessing,
-logits/loss/sampling, and 4-D attention score/value matmuls. Any parity run that reloads the
-whole checkpoint as F32 is no longer a valid test for the desktop voice path.
-blind sweep — and only if bf16-on-CPU is actually wanted over the faithful f32 path.
+Only the resident runtime worker may enter expected-value dormancy. A model
+operation never creates a waiter or preserves a blocked stack.
 
-## 4. Realtime pipeline threading — DONE (worker pipeline + barge-in), task #24
+## Flashkern fixed team
 
-**Python**: `demo/chat.py` runs the sync generator on a **producer `Thread`** → `queue.Queue`
-→ main relays to WebRTC playback (overlap gen+play; half-duplex via `ReplyOnPause`,
-`can_interrupt=False`). `moshi/server.py` is true full-duplex: 3 asyncio coroutines
-(recv/inference/send) + PortAudio callback threads.
+The engine creates one stable `kc_team` with `kernel_lanes` members (eight by
+default). `kcoro_arena` owns the member threads, dispatch doorbell, stop, join,
+and generation entry/return stamps. Flashkern owns the lane-uniform numerical
+program and ticketed pass state.
 
-**Was**: `mic_chat.rs` ran `generate_interleaved` on **main**; cpal callback threads did I/O;
-`Arc<Mutex<VecDeque>>` ring for playback (gen overlapped play, but gen blocked main and the
-mic was dropped during generation — half-duplex).
+One generation is active at a time. All members observe the same generation,
+claim disjoint tiles, run a complete assembly leaf without yielding, record
+return, and become available. The final return invokes the continuation callback
+exactly once; that callback may publish the next eager stage generation without
+a host round trip.
 
-**Now** (`src/runtime/realtime.rs`): a **persistent inference worker thread** ([`RealtimePipeline`])
-_owns_ the model + processor + detokenizer (the [`VoiceEngine`] trait; real impl
-[`Lfm2VoiceEngine`]) and loops `recv `[`Utterance`]` → respond (emit text + decode audio →
-emit PCM) → TurnComplete`, talking to the consumer over bounded, non-blocking
-**`crossbeam-channel`** queues ([`VoiceEvent`] stream). Because the model lives off the main
-thread, capture/playback stay live (full-duplex).
-**Barge-in** is an `AtomicBool` the generate loop polls — `generate_interleaved_cancellable`
-(`lfm2_audio.rs`) breaks the decode loop the moment `cancel` is set, so an interrupting
-utterance aborts the in-flight reply instead of running to `max_new_tokens`. The worker can own
-the model because `LFM2AudioModel`/`LFM2AudioProcessor` are now `Send` (the MLP + `AudioDetokenizer`
-`Send` fixes); nothing is shared by `&` across threads. `Drop` closes the channel and joins.
+The current implementation is one team, not two concurrently executing
+four-lane `BlockDomain`s. Logical block counters do not change that fact. A V2
+grid must not be counted as landed until independent teams, scratch domains,
+completion paths, and cross-domain ownership tests exist.
 
-The threading is **unit-tested with a fake engine** (`realtime::tests`): event ordering,
-worker persistence across turns, one-slot utterance backpressure, event backpressure cancellation,
-barge-in aborts the in-flight turn, engine errors are reported without killing the worker, and
-`Drop` joins + drops the engine. End-to-end full-duplex (live cpal capture, VAD-driven utterance boundaries,
-voice-onset-during-reply ⇒ barge-in + flush) is the **`duplex_chat`** example.
+## Numerical parallelism
 
-The `voice_runtime.rs` module wraps the pipeline + cpal into a `VoiceRuntime` service: bounded
-SPSC PCM rings for mic/playback, energy VAD → utterance submission, `can_interrupt` gate (drops
-mic while assistant speaks, matching `chat.py`'s `ReplyOnPause(can_interrupt=False)`),
-`StreamingPcmResampler` for cross-chunk audio continuity (24k→48k integer upsample), and
-`mic_enabled` `AtomicBool` for pause/resume.
+- BF16 checkpoint bytes stay in the immutable native image and are unlifted in
+  registers by the selected architecture leaf.
+- NEON/x86 SIMD assembly is the primary implementation for elementwise,
+  reduction, convolution, sampler, frontend, Sesame, and model-stage work.
+- Large Apple matrix operations may cross the documented Accelerate/AMX seam.
+  This is a numerical backend call, not a second scheduler or an alignment/dtype
+  staging license.
+- A register-resident chain may keep intermediate values inside one assembly
+  leaf. A team-generation return is the materialization boundary: only the
+  compact state needed by the next retained stage is written to its sealed
+  native arena.
+- Remaining value-producing C++ loops are migration debt and cannot serve as a
+  production fallback once their assembly replacement lands.
 
-The Tauri integration (`voice/control.rs` + `voice/runtime.rs` in the desktop crate) wraps
-`VoiceRuntime` in a single desktop kernel: Tauri commands enqueue bounded `RuntimeCommand`s over
-`tokio::sync::mpsc`, the kernel owns the active `VoiceSession` enum (`Lfm2`/`Livekit`) and publishes
-a `watch` snapshot for status. A `ThreadManager` still owns blocking stop/reap/drop work for the
-session threads. `voice_start` spawns the pipeline, `voice_stop` interrupts + drops,
-`voice_set_mic_enabled` pauses the cpal mic. LiveKit now has the same native command shape
-under the kernel (`LiveKitCommand` over bounded `mpsc`) and uses the Rust `livekit` SDK to
-`Room::connect`, create `PlatformAudio`, and publish a device-backed `LocalAudioTrack` microphone.
-It also monitors remote audio with `NativeAudioStream` and treats interrupt as a native room-loop
-control packet rather than a UI-only state change. The remaining LiveKit media parity work is
-polish around same-room interruption, not SolidJS ownership. Events stream over a
-`tauri::ipc::Channel<VoiceEvent>` to the SolidJS frontend. **No HTTP for the LFM2 path** — fully
-in-process.
+## Speech timing and deadlines
 
-The local LFM2 path still does not have sample-accurate acoustic echo cancellation, but it is no
-longer blind to its own speaker output: the playback callback maintains a reference RMS, queued
-speaker PCM counts as active reference audio before the first output callback runs, and the VAD
-uses a raised echo floor during playback so ordinary assistant audio does not cut itself off.
-LiveKit uses WebRTC's native echo cancellation/noise suppression/AGC through `PlatformAudio`.
+The native Sesame microphone policy consumes one evidence update per 20 ms of
+incoming samples. Minimum utterance, prepare, endpoint, and forced endpoint are
+sample-count state. The current prepare edge records policy readiness; it does
+not yet run candidate-owned speculative model scratch. Pause gates own one-shot
+deadline children; an expiry publishes a typed edge for the exact pause
+generation and never runs inference inline.
 
-## 5. Python ↔ Rust threading-model comparison
+Flashkern team generations are guarded by a hard correlated monotonic deadline.
+Member entry/return stamps identify a missing lane without adding an arrival
+spin. Normal completion retires the deadline; expiry and completion race through
+one terminal decision.
 
-Full dissection in **`glm-version/threading.md`** (torch + `chat.py` + `moshi/server.py` vs the
-Rust port). Concurrency separates into **four layers** — keeping them apart is what prevents
-"why is Rust different" confusion:
+Current limitations:
 
-| Layer                                          | torch / Python                                                                                                                                         | Rust port                                                                                                                         | Verdict                                                        |
-| ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------- |
-| **A · intra-op** (one matmul across cores)     | ATen pool, P-cores (`intraop_default_num_threads`)                                                                                                     | rayon global pool, sized by `threads.rs`                                                                                          | **parity** (verified 8 P-cores)                                |
-| **B · inter-op** (independent ops in parallel) | separate `at::launch` pool (default #CPUs)                                                                                                             | none (candle is eager-sequential)                                                                                                 | **N/A** — LFM2's graph is sequential, torch's pool is idle too |
-| **C · GIL**                                    | GIL serializes Python; torch releases it inside C++ ops ⇒ threads overlap **only during** kernels                                                      | **no GIL** — worker ‖ consumer ‖ cpal callbacks overlap **always**                                                                | **Rust is more parallel** (overlap is unconditional)           |
-| **D · pipeline**                               | `chat.py`: producer `Thread`+`queue.Queue`, half-duplex, no barge-in · `moshi/server.py`: 3 asyncio coroutines, 1 loop, cooperative, continuous-duplex | `realtime.rs`: worker thread owns model, `crossbeam` channels, **full-duplex + explicit `AtomicBool` barge-in** (`*_cancellable`) | **matched + extended**                                         |
-| **E · audio I/O**                              | PortAudio/fastrtc/WebSocket callback threads                                                                                                           | cpal real-time callback threads + ring                                                                                            | **equivalent**                                                 |
+- the native detector's playback state exists, but production feeds only the
+  microphone stream;
+- the Flashkern one-second hard deadline is provisional and not yet calibrated
+  by stage/shape;
+- the fatal capsule is captured before abort but is not yet routed to a durable,
+  observable platform crash sink.
 
-The one remaining _structural_ difference is a **model** difference, not a threading gap:
-Moshi's server is _continuously_ full-duplex (its architecture processes in/out every frame),
-while LFM2-Audio is **turn-based interleaved** — the Rust pipeline is faithful to LFM2's turn
-model and adds explicit barge-in, rather than imposing Moshi's frame loop on it.
+## Teardown ownership
 
-## Files
+Normal stop first closes native progress admission. Platform streams are then
+disconnected so no callback can publish through a retired notifier. Retained
+services settle terminal records, the fixed team stops after its admitted
+generation, deadline handlers acknowledge cancellation, and administrative
+join proves ownership has drained before storage is freed.
 
-`src/compute/threads.rs`, `src/compute/flashkern/native_engine.rs`, `native/kernels/aarch64/flashkern_neon.cpp`, `build.rs`, `src/runtime/realtime.rs`,
-`src/runtime/voice_runtime.rs`, `examples/duplex_chat.rs`, `examples/chat_multiturn.rs`,
-`examples/text_chat.rs`, `Cargo.toml` (`rayon`/`num_cpus`/`libc`/`half`/`crossbeam-channel`
-deps, `cc` build-dep, `accelerate`/`metal` features), `src/model/lfm2_audio.rs`
-(`generate_interleaved_cancellable`, `GenParams::demo_defaults`),
-`src/processor.rs` (`ChatState::from_parts` for multi-turn),
-`src/loader.rs` (calls `configure_intraop_threads`; precise bf16 note), `src/lib.rs`.
-Desktop crate: `src/voice/control.rs`, `src/voice/runtime.rs`, `src/voice/session.rs`,
-`src/settings.rs`.
+Join is lifecycle observation, never the means by which model progress occurs.
+
+## Historical torch/Candle reference
+
+During the deleted Candle migration, the project compared torch's P-core
+intra-op sizing with Candle/Rayon and explored an Accelerate feature plus a BF16
+CPU GEMM shim. Those measurements explained early performance differences, but
+they are not the production threading architecture. The retained historical
+implementation belongs under `liquid-audio-oracle`, including its
+`src/compute/threads.rs` policy.
+
+Similarly, the former `RealtimePipeline` worker, `crossbeam-channel` event path,
+Rust RMS VAD, and Rust model-owned cancellation loop are historical. Current
+source of truth is:
+
+- `src/runtime/voice_runtime.rs` for the platform callback/service rim;
+- `src/native_voice.rs` for opaque runtime/session and PCM endpoint bindings;
+- `native/src/runtime/voice_session.cpp` for sessions, PCM docks, Sesame policy,
+  and delivery;
+- `native/src/engine/flashkern_engine.cpp` for route/pass continuations and team
+  supervision;
+- `crates/kcoro-sys/vendor/kcoro_arena` for runtime, service, scope, deadline,
+  team, and doorbell ownership.
+
+## Gates
+
+```bash
+cargo test -p kcoro-sys
+cargo test -p liquid-audio --lib
+cargo test -p liquid-audio --tests
+git diff --check
+```
+
+The real-checkpoint ignored truth gate must be executed explicitly when its
+checkpoint and `question.wav` fixture are available. Release additionally
+requires the product linkage audit, zero post-readiness allocation/model reads,
+calibrated supervision, observable fatal evidence, playback-fed Sesame traces,
+and AArch64 plus x86_64/Rosetta coverage.

@@ -383,15 +383,6 @@ pub fn lfm2_model_dir(settings: &Lfm2Settings) -> Option<PathBuf> {
         .map(hf_snapshot_dir)
 }
 
-pub fn moshi_model_dir(settings: &Lfm2Settings) -> Option<PathBuf> {
-    settings
-        .moshi_model_dir
-        .as_deref()
-        .filter(|s| !s.trim().is_empty())
-        .map(expand_user_path)
-        .map(hf_snapshot_dir)
-}
-
 /// The active LFM2-Audio directory iff it contains a local model snapshot. No repo-id
 /// fallback, no default — this is the fail-hard run-path resolver. `model`/`revision`
 /// are the download *source*; this is what the runtime actually loads.
@@ -664,7 +655,6 @@ mod tests {
         };
         assert_eq!(lfm2_model_dir(&s), Some(snap.clone()));
         assert_eq!(lfm2_active_model_dir(&s), Some(snap.clone()));
-        assert_eq!(moshi_model_dir(&s), Some(snap));
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -751,21 +741,6 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(lfm2_active_model_dir(&s), None);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn moshi_model_dir_is_separate_from_lfm2_model_dir() {
-        let dir = std::env::temp_dir().join(format!(
-            "emberharmony-moshi-dir-test-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let s = Lfm2Settings {
-            moshi_model_dir: Some(dir.to_string_lossy().into_owned()),
-            ..Default::default()
-        };
-        assert_eq!(moshi_model_dir(&s), Some(dir.clone()));
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -38,6 +38,20 @@ typedef struct LfmSesameWindowV1 {
     size_t second_count;
 } LfmSesameWindowV1;
 
+/* One borrowed fragment of a logical analyser window. Descriptors are stack
+ * metadata only; samples remain in their owning capture/playback buffers. */
+typedef struct LfmSesameSpanV1 {
+    const float *samples;
+    size_t count;
+} LfmSesameSpanV1;
+
+/* An ordered scatter view of exactly 256 logical mono samples. The detector
+ * accepts at most 256 nonempty spans and never flattens them. */
+typedef struct LfmSesameScatterWindowV1 {
+    const LfmSesameSpanV1 *spans;
+    size_t span_count;
+} LfmSesameScatterWindowV1;
+
 typedef struct LfmSesameDecisionV1 {
     uint32_t size;
     uint32_t abi_version;
@@ -92,6 +106,14 @@ LFM_INTERNAL_API int lfm_sesame_detector_process(
 LFM_INTERNAL_API int lfm_sesame_detector_process_window(
     LfmSesameDetector *detector, uint32_t stream,
     const LfmSesameWindowV1 *window, uint8_t *selected_bytes,
+    size_t selected_capacity, LfmSesameDecisionV1 *decision);
+
+/* Consume an arbitrary-span logical window. One- and two-span inputs retain
+ * the existing contiguous/circular fast leaves; fragmented inputs are read
+ * directly from the descriptor sequence by the architecture assembly leaf. */
+LFM_INTERNAL_API int lfm_sesame_detector_process_scatter_window(
+    LfmSesameDetector *detector, uint32_t stream,
+    const LfmSesameScatterWindowV1 *window, uint8_t *selected_bytes,
     size_t selected_capacity, LfmSesameDecisionV1 *decision);
 
 // Feed already-quantized selected-bin evidence through the same sticky

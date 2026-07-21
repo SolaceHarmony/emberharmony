@@ -217,7 +217,9 @@ LFM_INTERNAL_API int lfm_resampler_process_spans(
 // calls, so chunk boundaries are numerically invisible. The maximum admitted
 // input span is fixed at creation; execution writes directly into the caller's
 // final destination and never allocates or owns an output plane. Its immutable
-// rate plan and mutable continuity state are fixed scalars.
+// rate plan and mutable continuity state are fixed scalars. Per-sample linear
+// interpolation executes in the architecture leaf; C++ only validates the
+// borrowed views and advances the bounded phase/history state.
 LFM_ORACLE_API int lfm_resampler_stream_create(
     uint32_t orig_freq, uint32_t new_freq, uint64_t max_sample_count,
     LfmResamplerStream **out);
@@ -237,7 +239,7 @@ LFM_ORACLE_API int lfm_resampler_stream_process(
 // ceil(length * new_freq / orig_freq) samples. Transitional compatibility
 // wrapper: it constructs a temporary plan/workspace and must copy when equal
 // rates and output != input. Production capture uses the prepared plan/span API;
-// streaming playback uses the retained scalar state above.
+// streaming playback uses the retained phase/history state above.
 LFM_ORACLE_API int lfm_resample_f32(
     const float *x, uint64_t length, uint32_t orig_freq, uint32_t new_freq,
     float *out, uint64_t out_capacity, uint64_t *out_length);

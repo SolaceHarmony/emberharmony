@@ -506,6 +506,117 @@ LFM_SYM(lfm_norm_apply_f32):
     .seh_endproc
 #endif
 
+// uint64_t lfm_resampler_stream_linear_f32(const StreamKernel *kernel)
+// Retained linear rate conversion over one borrowed codec frame. The kernel
+// descriptor is {input@0, destination@8, sample_count@16, orig@24,
+// phases@32, phase@40, previous@48, ready@52}. C++ validates those views and
+// updates the conversation-owned phase/history once this leaf returns; all
+// per-sample interpolation stays here. Separate subss/mulss/addss preserve the
+// unfused f32 operation order of the former implementation.
+.p2align 4
+.globl LFM_SYM(lfm_resampler_stream_linear_f32)
+LFM_PRIVATE(LFM_SYM(lfm_resampler_stream_linear_f32))
+LFM_SYM(lfm_resampler_stream_linear_f32):
+#ifdef _WIN32
+    .seh_proc LFM_SYM(lfm_resampler_stream_linear_f32)
+#endif
+    pushq     %rbx
+#ifdef _WIN32
+    .seh_pushreg %rbx
+#endif
+    pushq     %rbp
+#ifdef _WIN32
+    .seh_pushreg %rbp
+#endif
+    pushq     %r12
+#ifdef _WIN32
+    .seh_pushreg %r12
+#endif
+    pushq     %r13
+#ifdef _WIN32
+    .seh_pushreg %r13
+#endif
+    pushq     %r14
+#ifdef _WIN32
+    .seh_pushreg %r14
+#endif
+    pushq     %r15
+#ifdef _WIN32
+    .seh_pushreg %r15
+#endif
+    pushq     %rdi
+#ifdef _WIN32
+    .seh_pushreg %rdi
+    .seh_endprologue
+    movq      %rcx, %r15
+#else
+    movq      %rdi, %r15
+#endif
+    movq      0(%r15), %r12      // input
+    movq      8(%r15), %r13      // destination
+    movq      16(%r15), %r14     // remaining input samples
+    movq      24(%r15), %rbx     // reduced input rate
+    movq      32(%r15), %rbp     // reduced output phases
+    movq      40(%r15), %r10     // retained phase
+    movss     48(%r15), %xmm4    // retained previous sample
+    movl      52(%r15), %r11d    // previous sample is ready
+    cvtsi2ssq %rbp, %xmm5
+    xorq      %r9, %r9           // written
+1:
+    testq     %r14, %r14
+    jz        8f
+    movss     (%r12), %xmm0      // sample
+    testl     %r11d, %r11d
+    jnz       2f
+    movaps    %xmm0, %xmm1       // first call starts from this sample
+    jmp       3f
+2:
+    movaps    %xmm4, %xmm1       // previous
+3:
+    movq      %r10, %rdi         // phase before this input sample
+    leaq      (%r10,%rbp), %rax  // phase + phases
+    xorq      %rdx, %rdx
+    divq      %rbx
+    movq      %rax, %r8          // output count for this input
+    movq      %rdx, %r10         // next retained phase
+    movaps    %xmm0, %xmm2
+    subss     %xmm1, %xmm2       // sample - previous
+    movq      $1, %rcx
+4:
+    cmpq      %r8, %rcx
+    ja        5f
+    movq      %rcx, %rax
+    imulq     %rbx, %rax
+    subq      %rdi, %rax         // output*orig - old phase
+    cvtsi2ssq %rax, %xmm3
+    divss     %xmm5, %xmm3       // interpolation fraction
+    mulss     %xmm2, %xmm3
+    addss     %xmm1, %xmm3
+    movss     %xmm3, (%r13)
+    addq      $4, %r13
+    incq      %r9
+    incq      %rcx
+    jmp       4b
+5:
+    movaps    %xmm0, %xmm4
+    movl      $1, %r11d
+    addq      $4, %r12
+    decq      %r14
+    jmp       1b
+8:
+    movq      %r9, %rax
+    popq      %rdi
+    popq      %r15
+    popq      %r14
+    popq      %r13
+    popq      %r12
+    popq      %rbp
+    popq      %rbx
+    ret
+#ifdef _WIN32
+    .seh_endproc
+#endif
+
 // void lfm_resample_conv_spans_f32(const LfmF32SpanChain *input,
 //     const double *kernels, uint64_t phases, uint64_t stride, uint64_t width,
 //     uint64_t first_value, float *out, uint64_t value_count)

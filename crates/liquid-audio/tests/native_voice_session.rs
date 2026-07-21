@@ -11,6 +11,8 @@ const WOULD_BLOCK: i32 = -11;
 const STALE: i32 = -116;
 const CANCELLED: i32 = -125;
 const HOST_SINK: i32 = -1002;
+#[cfg(not(target_os = "macos"))]
+const UNSUPPORTED: i32 = -1004;
 #[cfg(target_os = "macos")]
 const TIMED_OUT: i32 = -60;
 #[cfg(not(target_os = "macos"))]
@@ -22,6 +24,10 @@ const CAPTURE_F32: u32 = 1;
 const CAPTURE_I16: u32 = 2;
 const CAPTURE_U16: u32 = 3;
 const WRITE_GAP_PUBLISHED: u32 = 1;
+const PLAYBACK_RENDERED: u32 = 1;
+const PLAYBACK_SILENCE: u32 = 2;
+const PLAYBACK_FLUSH: u32 = 4;
+const PLAYBACK_DISCONTINUITY: u32 = 8;
 const DOCK_ONLY: u64 = 1 << 63;
 const MANUAL_DEADLINES: u64 = 1 << 62;
 const DEADLINE_PREPARE: u32 = 0;
@@ -31,6 +37,7 @@ const EVENT_STATE: u32 = 1;
 const EVENT_TURN: u32 = 3;
 const EVENT_ERROR: u32 = 4;
 const EVENT_STOPPED: u32 = 5;
+const EVENT_TURN_STARTED: u32 = 7;
 
 #[repr(C)]
 struct Runtime {
@@ -184,6 +191,99 @@ struct MutableSpan {
     count: usize,
 }
 
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct PcmLease {
+    size: u32,
+    abi_version: u32,
+    lease_id: u64,
+    stream_epoch: u64,
+    buffer_generation: u64,
+    ticket: Ticket,
+    frames: u32,
+    channels: u32,
+    sample_rate: u32,
+    format: u32,
+    offset_bytes: u32,
+    length_bytes: u32,
+    flags: u32,
+    reserved: u32,
+}
+
+impl Default for PcmLease {
+    fn default() -> Self {
+        // SAFETY: this private descriptor contains identity and bounds only.
+        unsafe { std::mem::zeroed() }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct PlaybackRender {
+    size: u32,
+    abi_version: u32,
+    session_id: u64,
+    stream_epoch: u64,
+    ticket: Ticket,
+    lease_id: u64,
+    buffer_generation: u64,
+    source_offset_frames: u32,
+    rendered_frames: u32,
+    first_playback_sample_cursor: u64,
+    capture_sample_cursor_snapshot: u64,
+    flags: u32,
+    reserved0: u32,
+    reserved: [u64; 2],
+}
+
+impl Default for PlaybackRender {
+    fn default() -> Self {
+        // SAFETY: this private callback result contains scalar accounting only.
+        unsafe { std::mem::zeroed() }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+struct PlaybackPolicySnapshot {
+    size: u32,
+    abi_version: u32,
+    sample_rate: u32,
+    last_voice: u32,
+    detector_backlog: u32,
+    retained_observers: u32,
+    evidence_records: u64,
+    evidence_updates: u64,
+    last_evidence_cursor: u64,
+    discontinuities: u64,
+    stream_epoch: u64,
+    ticket: Ticket,
+    capture_sample_cursor_snapshot: u64,
+    last_score: f64,
+    adaptive_min: u32,
+    adaptive_max: u32,
+    echo_start_capture_cursor: u64,
+    last_voice_capture_cursor: u64,
+    echo_tail_capture_cursor: u64,
+    barge_voiced_frames: u64,
+    barge_interrupts: u64,
+    barge_source_epoch: u64,
+    barge_interrupt_epoch: u64,
+    barge_playback_ticket: Ticket,
+    reserved: [u64; 1],
+}
+
+impl Default for PlaybackPolicySnapshot {
+    fn default() -> Self {
+        Self {
+            size: std::mem::size_of::<Self>() as u32,
+            abi_version: ABI,
+            // SAFETY: remaining private diagnostic fields are scalar outputs.
+            ..unsafe { std::mem::zeroed() }
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct SessionSnapshot {
@@ -315,6 +415,11 @@ impl Default for SessionSnapshot {
 
 unsafe extern "C" {
     fn lfm_runtime_create(config: *const RuntimeConfig, out: *mut *mut Runtime) -> c_int;
+    #[cfg(not(target_os = "macos"))]
+    fn lfm_internal_runtime_create_manual_deadlines_for_test(
+        config: *const RuntimeConfig,
+        out: *mut *mut Runtime,
+    ) -> c_int;
     fn lfm_runtime_start(runtime: *mut Runtime) -> c_int;
     fn lfm_runtime_request_stop(runtime: *mut Runtime);
     fn lfm_runtime_join(runtime: *mut Runtime) -> c_int;
@@ -343,6 +448,10 @@ unsafe extern "C" {
     fn lfm_session_capture_policy_snapshot(
         session: *const Session,
         out: *mut CapturePolicySnapshot,
+    ) -> c_int;
+    fn lfm_session_playback_policy_snapshot(
+        session: *const Session,
+        out: *mut PlaybackPolicySnapshot,
     ) -> c_int;
     fn lfm_session_capture_supervision_snapshot(
         session: *const Session,
@@ -410,6 +519,46 @@ unsafe extern "C" {
     fn lfm_playback_consumer_create(
         session: *mut Session,
         out: *mut *mut PlaybackConsumer,
+    ) -> c_int;
+    fn lfm_session_publish_playback_f32_test(
+        session: *mut Session,
+        samples: *const f32,
+        frames: u32,
+        out: *mut PcmLease,
+    ) -> c_int;
+    fn lfm_internal_session_release_unpublished_playback_for_test(
+        session: *mut Session,
+        frames: u32,
+    ) -> c_int;
+    fn lfm_playback_consumer_claim(
+        consumer: *mut PlaybackConsumer,
+        ticket: *const Ticket,
+        stream_epoch: u64,
+        lease_id: u64,
+        buffer_generation: u64,
+        out: *mut PcmLease,
+    ) -> c_int;
+    fn lfm_playback_consumer_render_f32(
+        consumer: *mut PlaybackConsumer,
+        lease: *const PcmLease,
+        source_offset_frames: u32,
+        destination: *mut f32,
+        frames: u32,
+        channels: u32,
+        destination_capacity: usize,
+        out: *mut PlaybackRender,
+    ) -> c_int;
+    fn lfm_playback_consumer_observe(
+        consumer: *mut PlaybackConsumer,
+        lease: *const PcmLease,
+        source_offset_frames: u32,
+        frames: u32,
+        flags: u32,
+        out: *mut PlaybackRender,
+    ) -> c_int;
+    fn lfm_playback_consumer_release(
+        consumer: *mut PlaybackConsumer,
+        lease: *const PcmLease,
     ) -> c_int;
     fn lfm_playback_consumer_destroy(consumer: *mut PlaybackConsumer) -> c_int;
 
@@ -538,7 +687,12 @@ fn runtime_with(event_capacity: u32) -> *mut Runtime {
     };
     let mut runtime = std::ptr::null_mut();
     // SAFETY: config and output storage are valid for the synchronous calls.
-    assert_eq!(unsafe { lfm_runtime_create(&config, &mut runtime) }, 0);
+    #[cfg(target_os = "macos")]
+    let status = unsafe { lfm_runtime_create(&config, &mut runtime) };
+    #[cfg(not(target_os = "macos"))]
+    let status =
+        unsafe { lfm_internal_runtime_create_manual_deadlines_for_test(&config, &mut runtime) };
+    assert_eq!(status, 0);
     assert!(!runtime.is_null());
     // SAFETY: runtime is a live unique native handle.
     assert_eq!(unsafe { lfm_runtime_start(runtime) }, 0);
@@ -671,6 +825,42 @@ fn manual_chunk_session_rate(
     (session, producer)
 }
 
+fn manual_gate_chunk_session(
+    runtime: *mut Runtime,
+    sink: &GateSink,
+) -> (*mut Session, *mut CaptureProducer) {
+    let mut config = dock_config();
+    config.flags |= MANUAL_DEADLINES;
+    let callbacks = Callbacks {
+        size: std::mem::size_of::<Callbacks>() as u32,
+        abi_version: ABI,
+        context: std::ptr::from_ref(sink).cast_mut().cast(),
+        on_event: Some(gated),
+    };
+    let mut session = std::ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            lfm_session_create(
+                runtime,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &config,
+                &callbacks,
+                &mut session,
+            )
+        },
+        0
+    );
+    let mut producer = std::ptr::null_mut();
+    assert_eq!(
+        unsafe { lfm_capture_chunk_producer_create(session, 72, 0, &mut producer) },
+        0
+    );
+    assert_eq!(unsafe { lfm_session_start(session) }, 0);
+    wait_gate_attempt(sink);
+    (session, producer)
+}
+
 fn submit_text_eventually(session: *mut Session, text: &[u8], ticket: &mut Ticket) {
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
@@ -761,6 +951,23 @@ unsafe fn stop_all(runtime: *mut Runtime, session: *mut Session, expected: i32) 
     // SAFETY: joined session has no live leases in these tests.
     assert_eq!(unsafe { lfm_session_destroy(session) }, 0);
     // SAFETY: session is gone, so runtime now has no child.
+    unsafe { lfm_runtime_request_stop(runtime) };
+    assert_eq!(unsafe { lfm_runtime_join(runtime) }, 0);
+    assert_eq!(unsafe { lfm_runtime_destroy(runtime) }, 0);
+}
+
+unsafe fn stop_all_with_capture(
+    runtime: *mut Runtime,
+    session: *mut Session,
+    producer: *mut CaptureProducer,
+    expected: i32,
+) {
+    // SAFETY: stop closes capture admission before endpoint retirement, so an
+    // administrative shutdown cannot be mistaken for a hardware disconnect.
+    unsafe { lfm_session_request_stop(session) };
+    assert_eq!(unsafe { lfm_capture_producer_destroy(producer) }, 0);
+    assert_eq!(unsafe { lfm_session_join(session) }, expected);
+    assert_eq!(unsafe { lfm_session_destroy(session) }, 0);
     unsafe { lfm_runtime_request_stop(runtime) };
     assert_eq!(unsafe { lfm_runtime_join(runtime) }, 0);
     assert_eq!(unsafe { lfm_runtime_destroy(runtime) }, 0);
@@ -895,6 +1102,149 @@ fn capture_supervision(session: *mut Session) -> CaptureSupervisionSnapshot {
         0
     );
     snapshot
+}
+
+fn wait_capture_evidence(session: *mut Session, cursor: u64) {
+    /* Test watchdog only: capture commits and deadline callbacks are the sole
+     * production progress edges. Snapshot reads never notify capacity or
+     * advance the coordinator; this loop only fails if an expected edge was
+     * lost while no host record exists for the internal detector cadence. */
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let mut policy = CapturePolicySnapshot::default();
+        assert_eq!(
+            unsafe { lfm_session_capture_policy_snapshot(session, &mut policy) },
+            0
+        );
+        if policy.last_evidence_cursor >= cursor {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "capture evidence did not reach cursor {cursor}: {}",
+            policy.last_evidence_cursor
+        );
+        std::thread::yield_now();
+    }
+}
+
+fn playback_policy(session: *mut Session) -> PlaybackPolicySnapshot {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let mut snapshot = PlaybackPolicySnapshot::default();
+        let status = unsafe { lfm_session_playback_policy_snapshot(session, &mut snapshot) };
+        if status == 0 {
+            return snapshot;
+        }
+        assert_eq!(status, WOULD_BLOCK);
+        assert!(
+            Instant::now() < deadline,
+            "playback policy snapshot stayed contended"
+        );
+        std::thread::yield_now();
+    }
+}
+
+fn wait_playback_evidence(
+    session: *mut Session,
+    cursor: u64,
+    records: u64,
+) -> PlaybackPolicySnapshot {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let snapshot = playback_policy(session);
+        if snapshot.last_evidence_cursor >= cursor && snapshot.evidence_records >= records {
+            return snapshot;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "playback evidence did not reach cursor {cursor}/record {records}: cursor={} records={} backlog={} observers={}",
+            snapshot.last_evidence_cursor,
+            snapshot.evidence_records,
+            snapshot.detector_backlog,
+            snapshot.retained_observers
+        );
+        std::thread::yield_now();
+    }
+}
+
+fn write_gate_signal(
+    session: *mut Session,
+    producer: *mut CaptureProducer,
+    voiced: bool,
+) -> CaptureChunk {
+    let chunk = write_signal(producer, 960, voiced);
+    wait_capture_evidence(session, chunk.first_sample_cursor + u64::from(chunk.frames));
+    chunk
+}
+
+fn freeze_gate_capture_turn(session: *mut Session, producer: *mut CaptureProducer) -> Ticket {
+    let mut parent = Ticket::default();
+    for _ in 0..40 {
+        let chunk = write_gate_signal(session, producer, true);
+        let snapshot = capture_supervision(session);
+        if snapshot.policy_state == 2 {
+            parent = snapshot.parent;
+            assert_eq!(parent, chunk.turn_ticket);
+            break;
+        }
+        assert!(snapshot.policy_state <= 1);
+    }
+    assert_ne!(parent, Ticket::default(), "capture never reached SPEAKING");
+
+    let mut ready = false;
+    for _ in 0..40 {
+        let _ = write_gate_signal(session, producer, false);
+        let snapshot = capture_supervision(session);
+        if snapshot.policy_state == 3 && snapshot.commit_sample_generation != 0 {
+            assert_eq!(snapshot.parent, parent);
+            ready = true;
+            break;
+        }
+    }
+    assert!(ready, "capture never reached commit-ready PAUSE");
+    assert_eq!(
+        unsafe { lfm_session_capture_deadline_advance_manual_test(session, 500_000_000) },
+        0
+    );
+    assert_eq!(
+        unsafe { lfm_session_capture_deadline_fire_manual_test(session, DEADLINE_COMMIT) },
+        0
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let snapshot = capture_supervision(session);
+        if snapshot.policy_state == 0 {
+            return parent;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "committed capture range did not freeze"
+        );
+        std::thread::yield_now();
+    }
+}
+
+fn wait_session_snapshot(
+    session: *mut Session,
+    predicate: impl Fn(&SessionSnapshot) -> bool,
+) -> SessionSnapshot {
+    /* Test watchdog only. The predicate observes a transition driven by an
+     * already-published callback/deadline edge and never drives it. */
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let mut snapshot = SessionSnapshot::default();
+        assert_eq!(unsafe { lfm_session_snapshot(session, &mut snapshot) }, 0);
+        if predicate(&snapshot) {
+            return snapshot;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "session snapshot predicate did not become true"
+        );
+        std::thread::yield_now();
+    }
 }
 
 fn drive_capture_to_candidate(
@@ -1034,8 +1384,7 @@ fn capture_chunks_append_arbitrary_blocks_without_a_manual_boundary() {
         .iter()
         .all(|event| event.ticket != first.turn_ticket));
 
-    assert_eq!(unsafe { lfm_capture_producer_destroy(producer) }, 0);
-    unsafe { stop_all(runtime, session, 0) };
+    unsafe { stop_all_with_capture(runtime, session, producer, 0) };
 }
 
 #[test]
@@ -1094,8 +1443,7 @@ fn capture_gap_is_explicit_and_never_splices_the_following_range() {
         .iter()
         .all(|event| event.ticket != next.turn_ticket));
 
-    assert_eq!(unsafe { lfm_capture_producer_destroy(producer) }, 0);
-    unsafe { stop_all(runtime, session, 0) };
+    unsafe { stop_all_with_capture(runtime, session, producer, 0) };
 }
 
 #[test]
@@ -1171,8 +1519,7 @@ fn capture_arena_wrap_publishes_two_borrowed_spans_without_relocation() {
         0
     );
 
-    assert_eq!(unsafe { lfm_capture_producer_destroy(producer) }, 0);
-    unsafe { stop_all(runtime, session, 0) };
+    unsafe { stop_all_with_capture(runtime, session, producer, 0) };
 }
 
 #[test]
@@ -1219,8 +1566,7 @@ fn capture_freeze_dormancy_is_resumed_by_the_active_writer_commit() {
         .iter()
         .all(|event| event.ticket != chunk.turn_ticket));
 
-    assert_eq!(unsafe { lfm_capture_producer_destroy(producer) }, 0);
-    unsafe { stop_all(runtime, session, 0) };
+    unsafe { stop_all_with_capture(runtime, session, producer, 0) };
 }
 
 #[test]
@@ -1313,8 +1659,7 @@ fn stale_active_callback_cannot_seed_the_new_epoch_detector() {
         .iter()
         .all(|event| event.ticket != stale.turn_ticket));
 
-    assert_eq!(unsafe { lfm_capture_producer_destroy(producer) }, 0);
-    unsafe { stop_all(runtime, session, 0) };
+    unsafe { stop_all_with_capture(runtime, session, producer, 0) };
 }
 
 #[test]
@@ -1358,8 +1703,7 @@ fn capture_interrupt_rotates_correlation_without_relocating_the_arena() {
         event.ticket != stale_chunk.turn_ticket && event.ticket != current.turn_ticket
     }));
 
-    assert_eq!(unsafe { lfm_capture_producer_destroy(producer) }, 0);
-    unsafe { stop_all(runtime, session, 0) };
+    unsafe { stop_all_with_capture(runtime, session, producer, 0) };
 }
 
 #[test]
@@ -1462,8 +1806,7 @@ fn native_interleaved_write_owns_conversion_commit_and_explicit_drop() {
     });
     assert_eq!(interrupted.status, 0);
 
-    assert_eq!(unsafe { lfm_capture_producer_destroy(producer) }, 0);
-    unsafe { stop_all(runtime, session, 0) };
+    unsafe { stop_all_with_capture(runtime, session, producer, 0) };
 }
 
 #[test]
@@ -1502,8 +1845,7 @@ fn capture_chunk_preserves_ingress_channels_but_resolves_one_mono_plane() {
         );
     }
 
-    assert_eq!(unsafe { lfm_capture_producer_destroy(producer) }, 0);
-    unsafe { stop_all(runtime, session, 0) };
+    unsafe { stop_all_with_capture(runtime, session, producer, 0) };
 }
 
 #[test]
@@ -1655,8 +1997,7 @@ fn full_ring_xrun_debt_publishes_before_any_successor_pcm() {
     let _ = wait_event(&sink, |event| {
         event.kind == EVENT_STATE && event.epoch == epoch && event.payload == b"interrupted"
     });
-    assert_eq!(unsafe { lfm_capture_producer_destroy(producer) }, 0);
-    unsafe { stop_all(runtime, session, 0) };
+    unsafe { stop_all_with_capture(runtime, session, producer, 0) };
 }
 
 #[test]
@@ -1716,7 +2057,14 @@ fn capture_disconnect_transfers_inflight_retirement_to_the_coordinator() {
         event.kind == EVENT_TURN && event.ticket == barrier
     });
 
-    unsafe { stop_all(runtime, session, 0) };
+    unsafe { stop_all(runtime, session, CANCELLED) };
+    let events = sink.events.lock().unwrap();
+    assert!(events.iter().any(|event| {
+        event.kind == EVENT_ERROR
+            && event.status == CANCELLED
+            && event.payload == b"capture-device-lost"
+    }));
+    assert_eq!(events.last().map(|event| event.kind), Some(EVENT_STOPPED));
 }
 
 #[test]
@@ -1807,8 +2155,8 @@ fn native_sesame_policy_consumes_exact_sample_clock_windows() {
     );
     assert_eq!(pause.forced_sample_generation, 0);
 
-    assert_eq!(unsafe { lfm_capture_producer_destroy(producer) }, 0);
     unsafe { lfm_session_request_stop(session) };
+    assert_eq!(unsafe { lfm_capture_producer_destroy(producer) }, 0);
     assert_eq!(unsafe { lfm_session_join(session) }, 0);
 
     let mut policy = CapturePolicySnapshot::default();
@@ -1872,8 +2220,7 @@ fn capture_commit_expiry_before_samples_remains_usable() {
     });
     assert_eq!(turn.status, 0);
 
-    assert_eq!(unsafe { lfm_capture_producer_destroy(producer) }, 0);
-    unsafe { stop_all(runtime, session, 0) };
+    unsafe { stop_all_with_capture(runtime, session, producer, 0) };
 }
 
 #[test]
@@ -1915,8 +2262,7 @@ fn capture_commit_samples_before_expiry_remain_uncommitted() {
     });
     assert_eq!(turn.status, 0);
 
-    assert_eq!(unsafe { lfm_capture_producer_destroy(producer) }, 0);
-    unsafe { stop_all(runtime, session, 0) };
+    unsafe { stop_all_with_capture(runtime, session, producer, 0) };
 }
 
 #[test]
@@ -1951,8 +2297,7 @@ fn consecutive_capture_turns_rearm_one_fresh_scope_and_ticket() {
         sync_session(session, &sink, &[b'x', turn]);
     }
 
-    assert_eq!(unsafe { lfm_capture_producer_destroy(producer) }, 0);
-    unsafe { stop_all(runtime, session, 0) };
+    unsafe { stop_all_with_capture(runtime, session, producer, 0) };
 }
 
 #[test]
@@ -1989,8 +2334,7 @@ fn candidate_accumulates_voice_across_brief_sesame_negative_valleys() {
     assert_eq!(speaking.policy_state, 2);
     assert_eq!(speaking.parent, first.turn_ticket);
 
-    assert_eq!(unsafe { lfm_capture_producer_destroy(producer) }, 0);
-    unsafe { stop_all(runtime, session, 0) };
+    unsafe { stop_all_with_capture(runtime, session, producer, 0) };
 }
 
 #[test]
@@ -2029,8 +2373,7 @@ fn minimum_utterance_uses_retained_span_not_positive_window_sum() {
         "retained utterance span did not reach the minimum: candidate={candidate:#?}, speaking={speaking:#?}"
     );
 
-    assert_eq!(unsafe { lfm_capture_producer_destroy(producer) }, 0);
-    unsafe { stop_all(runtime, session, 0) };
+    unsafe { stop_all_with_capture(runtime, session, producer, 0) };
 }
 
 #[test]
@@ -2062,8 +2405,7 @@ fn candidate_false_start_retires_after_endpoint_length_silence() {
         .iter()
         .all(|event| event.ticket != first.turn_ticket));
 
-    assert_eq!(unsafe { lfm_capture_producer_destroy(producer) }, 0);
-    unsafe { stop_all(runtime, session, 0) };
+    unsafe { stop_all_with_capture(runtime, session, producer, 0) };
 }
 
 #[test]
@@ -2138,8 +2480,7 @@ fn resumed_voice_disarms_and_rearms_one_exact_pause_generation() {
         event.kind == EVENT_TURN && event.ticket == parent
     });
 
-    assert_eq!(unsafe { lfm_capture_producer_destroy(producer) }, 0);
-    unsafe { stop_all(runtime, session, 0) };
+    unsafe { stop_all_with_capture(runtime, session, producer, 0) };
 }
 
 #[test]
@@ -2192,8 +2533,7 @@ fn prestart_voiced_capture_enters_a_presealed_supervision_scope() {
         supervised.scope_generation
     );
 
-    assert_eq!(unsafe { lfm_capture_producer_destroy(producer) }, 0);
-    unsafe { stop_all(runtime, session, 0) };
+    unsafe { stop_all_with_capture(runtime, session, producer, 0) };
 }
 
 #[test]
@@ -2251,8 +2591,7 @@ fn capture_turn_may_begin_at_absolute_cursor_zero() {
     assert_eq!(active.turn_start_cursor, 0);
     assert_eq!(active.parent, first.turn_ticket);
 
-    assert_eq!(unsafe { lfm_capture_producer_destroy(producer) }, 0);
-    unsafe { stop_all(runtime, session, 0) };
+    unsafe { stop_all_with_capture(runtime, session, producer, 0) };
 }
 
 #[test]
@@ -2276,8 +2615,7 @@ fn first_capture_ticket_is_minted_after_an_earlier_typed_action() {
         "capture ticket was pre-minted before the typed action"
     );
 
-    assert_eq!(unsafe { lfm_capture_producer_destroy(producer) }, 0);
-    unsafe { stop_all(runtime, session, 0) };
+    unsafe { stop_all_with_capture(runtime, session, producer, 0) };
 }
 
 #[test]
@@ -2356,8 +2694,7 @@ fn forced_turn_in_pause_retains_a_nonzero_prefix_at_non_48k() {
     });
     assert_eq!(turn.status, 0);
 
-    assert_eq!(unsafe { lfm_capture_producer_destroy(producer) }, 0);
-    unsafe { stop_all(runtime, session, 0) };
+    unsafe { stop_all_with_capture(runtime, session, producer, 0) };
 }
 
 #[test]
@@ -2419,8 +2756,7 @@ fn capture_deadline_rejects_every_mismatched_correlation_coordinate() {
         STALE
     );
 
-    assert_eq!(unsafe { lfm_capture_producer_destroy(producer) }, 0);
-    unsafe { stop_all(runtime, session, 0) };
+    unsafe { stop_all_with_capture(runtime, session, producer, 0) };
 }
 
 #[test]
@@ -2454,14 +2790,27 @@ fn capture_device_loss_is_explicit_while_listening() {
     assert_eq!(capture_supervision(session).policy_state, 0);
     assert_eq!(unsafe { lfm_capture_producer_destroy(producer) }, 0);
     let lost = wait_event(&sink, |event| {
-        event.kind == EVENT_STATE && event.status == CANCELLED
+        event.kind == EVENT_ERROR
+            && event.status == CANCELLED
+            && event.payload == b"capture-device-lost"
     });
     assert_eq!(lost.epoch, capture_supervision(session).epoch.max(1));
-    unsafe { stop_all(runtime, session, 0) };
+    unsafe { stop_all(runtime, session, CANCELLED) };
+    let events = sink.events.lock().unwrap();
+    let error = events
+        .iter()
+        .position(|event| event.kind == EVENT_ERROR)
+        .expect("device loss must publish a reliable ERROR");
+    let stopped = events
+        .iter()
+        .position(|event| event.kind == EVENT_STOPPED)
+        .expect("device loss must terminate the session");
+    assert!(error < stopped);
+    assert_eq!(events.last().map(|event| event.kind), Some(EVENT_STOPPED));
 }
 
 #[test]
-fn capture_device_loss_cancels_candidate_with_its_parent_ticket() {
+fn capture_device_loss_retires_candidate_without_an_action_terminal() {
     let sink = Sink {
         events: Mutex::new(Vec::new()),
         edge: Condvar::new(),
@@ -2473,14 +2822,22 @@ fn capture_device_loss_cancels_candidate_with_its_parent_ticket() {
 
     assert_eq!(unsafe { lfm_capture_producer_destroy(producer) }, 0);
     let lost = wait_event(&sink, |event| {
-        event.kind == EVENT_TURN && event.ticket == first.turn_ticket && event.status == CANCELLED
+        event.kind == EVENT_ERROR
+            && event.status == CANCELLED
+            && event.payload == b"capture-device-lost"
     });
     assert_eq!(lost.epoch, candidate.epoch);
-    unsafe { stop_all(runtime, session, 0) };
+    assert!(sink
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|event| { event.kind != EVENT_TURN || event.ticket != first.turn_ticket }));
+    unsafe { stop_all(runtime, session, CANCELLED) };
 }
 
 #[test]
-fn capture_device_loss_cancels_speaking_with_its_parent_ticket() {
+fn capture_device_loss_retires_speaking_without_an_action_terminal() {
     let sink = Sink {
         events: Mutex::new(Vec::new()),
         edge: Condvar::new(),
@@ -2492,14 +2849,22 @@ fn capture_device_loss_cancels_speaking_with_its_parent_ticket() {
 
     assert_eq!(unsafe { lfm_capture_producer_destroy(producer) }, 0);
     let lost = wait_event(&sink, |event| {
-        event.kind == EVENT_TURN && event.ticket == voice.turn_ticket && event.status == CANCELLED
+        event.kind == EVENT_ERROR
+            && event.status == CANCELLED
+            && event.payload == b"capture-device-lost"
     });
     assert_eq!(lost.epoch, speaking.epoch);
-    unsafe { stop_all(runtime, session, 0) };
+    assert!(sink
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|event| { event.kind != EVENT_TURN || event.ticket != voice.turn_ticket }));
+    unsafe { stop_all(runtime, session, CANCELLED) };
 }
 
 #[test]
-fn capture_device_loss_cancels_pause_after_deadline_evidence() {
+fn capture_device_loss_retires_pause_without_an_action_terminal() {
     let sink = Sink {
         events: Mutex::new(Vec::new()),
         edge: Condvar::new(),
@@ -2524,10 +2889,18 @@ fn capture_device_loss_cancels_pause_after_deadline_evidence() {
 
     assert_eq!(unsafe { lfm_capture_producer_destroy(producer) }, 0);
     let lost = wait_event(&sink, |event| {
-        event.kind == EVENT_TURN && event.ticket == parent && event.status == CANCELLED
+        event.kind == EVENT_ERROR
+            && event.status == CANCELLED
+            && event.payload == b"capture-device-lost"
     });
     assert_eq!(lost.epoch, pause.epoch);
-    unsafe { stop_all(runtime, session, 0) };
+    assert!(sink
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|event| { event.kind != EVENT_TURN || event.ticket != parent }));
+    unsafe { stop_all(runtime, session, CANCELLED) };
 }
 
 #[test]
@@ -2647,8 +3020,7 @@ fn forced_sample_readiness_is_restamped_after_resume_restart() {
     });
     assert_eq!(turn.status, 0);
 
-    assert_eq!(unsafe { lfm_capture_producer_destroy(producer) }, 0);
-    unsafe { stop_all(runtime, session, 0) };
+    unsafe { stop_all_with_capture(runtime, session, producer, 0) };
 }
 
 #[test]
@@ -2717,8 +3089,7 @@ fn forced_expiry_grants_one_bounded_writer_completion_edge() {
     });
     assert_eq!(turn.status, 0);
 
-    assert_eq!(unsafe { lfm_capture_producer_destroy(producer) }, 0);
-    unsafe { stop_all(runtime, session, 0) };
+    unsafe { stop_all_with_capture(runtime, session, producer, 0) };
 }
 
 #[test]
@@ -2785,8 +3156,7 @@ fn background_silence_reclaims_native_storage_without_relocation() {
         "classified background silence must not publish a model turn"
     );
 
-    assert_eq!(unsafe { lfm_capture_producer_destroy(producer) }, 0);
-    unsafe { stop_all(runtime, session, 0) };
+    unsafe { stop_all_with_capture(runtime, session, producer, 0) };
 }
 
 #[test]
@@ -2833,8 +3203,8 @@ fn sesame_cadence_is_rational_on_nondivisible_capture_rates() {
     let _ = wait_event(&sink, |event| {
         event.kind == EVENT_TURN && event.ticket == barrier
     });
-    assert_eq!(unsafe { lfm_capture_producer_destroy(producer) }, 0);
     unsafe { lfm_session_request_stop(session) };
+    assert_eq!(unsafe { lfm_capture_producer_destroy(producer) }, 0);
     assert_eq!(unsafe { lfm_session_join(session) }, 0);
     let mut policy = CapturePolicySnapshot::default();
     assert_eq!(
@@ -2906,6 +3276,29 @@ fn runtime_rejects_lane_counts_the_engine_cannot_construct() {
     assert_eq!(
         unsafe { lfm_runtime_create(&config, &mut runtime) },
         INVALID
+    );
+    assert!(runtime.is_null());
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn production_runtime_rejects_missing_deadline_backend_at_readiness() {
+    let config = RuntimeConfig {
+        size: std::mem::size_of::<RuntimeConfig>() as u32,
+        abi_version: ABI,
+        coordination_workers: 1,
+        kernel_lanes: 1,
+        event_capacity: 2,
+        session_capacity: 1,
+        reserved0: 0,
+        reserved1: 0,
+        flags: 0,
+        reserved: [0; 4],
+    };
+    let mut runtime = std::ptr::null_mut();
+    assert_eq!(
+        unsafe { lfm_runtime_create(&config, &mut runtime) },
+        UNSUPPORTED
     );
     assert!(runtime.is_null());
 }
@@ -3015,9 +3408,7 @@ fn capture_rate_is_sealed_at_session_readiness() {
         event.kind == EVENT_STATE && event.epoch == epoch && event.payload == b"interrupted"
     });
     assert_eq!(interrupted.payload, b"interrupted");
-    assert_eq!(unsafe { lfm_capture_producer_destroy(producer) }, 0);
-
-    unsafe { stop_all(runtime, session, 0) };
+    unsafe { stop_all_with_capture(runtime, session, producer, 0) };
 }
 
 #[test]
@@ -3443,8 +3834,94 @@ fn reliable_output_saturation_does_not_starve_native_capture_evidence() {
             event.kind == EVENT_TURN && event.ticket == ticket
         });
     }
+    unsafe { stop_all_with_capture(runtime, session, producer, 0) };
+}
+
+#[test]
+fn stop_releases_unadmitted_capture_without_an_orphan_turn() {
+    let sink = GateSink {
+        events: Mutex::new(Vec::new()),
+        event_edge: Condvar::new(),
+        blocked: Mutex::new(true),
+        attempts: Mutex::new(0),
+        attempt_edge: Condvar::new(),
+    };
+    let runtime = runtime_with(2);
+    let (session, producer) = manual_gate_chunk_session(runtime, &sink);
+
+    let typed = saturate_reliable_ring(session);
+    let capture = freeze_gate_capture_turn(session, producer);
+    let snapshot = wait_session_snapshot(session, |snapshot| {
+        snapshot.reliable_event_depth == 2 && snapshot.capture_consumed == 0
+    });
+    assert_eq!(snapshot.text_commands_consumed, typed.len() as u64);
+
+    unsafe { lfm_session_request_stop(session) };
     assert_eq!(unsafe { lfm_capture_producer_destroy(producer) }, 0);
-    unsafe { stop_all(runtime, session, 0) };
+    open_gate(session, &sink);
+    let _ = wait_gate_event(&sink, |event| event.kind == EVENT_STOPPED);
+    assert_eq!(unsafe { lfm_session_join(session) }, 0);
+
+    let events = sink.events.lock().unwrap();
+    assert!(events.iter().all(|event| {
+        event.ticket != capture || (event.kind != EVENT_TURN_STARTED && event.kind != EVENT_TURN)
+    }));
+    assert_eq!(events.last().map(|event| event.kind), Some(EVENT_STOPPED));
+    drop(events);
+
+    assert_eq!(unsafe { lfm_session_destroy(session) }, 0);
+    unsafe { lfm_runtime_request_stop(runtime) };
+    assert_eq!(unsafe { lfm_runtime_join(runtime) }, 0);
+    assert_eq!(unsafe { lfm_runtime_destroy(runtime) }, 0);
+}
+
+#[test]
+fn stop_orders_admitted_audio_start_cancel_then_stopped() {
+    let sink = GateSink {
+        events: Mutex::new(Vec::new()),
+        event_edge: Condvar::new(),
+        blocked: Mutex::new(true),
+        attempts: Mutex::new(0),
+        attempt_edge: Condvar::new(),
+    };
+    let runtime = runtime_with(2);
+    let (session, producer) = manual_gate_chunk_session(runtime, &sink);
+
+    let mut filler = Ticket::default();
+    submit_text_eventually(session, b"fifo-filler", &mut filler);
+    let _ = wait_session_snapshot(session, |snapshot| snapshot.reliable_event_depth == 1);
+    let capture = freeze_gate_capture_turn(session, producer);
+    let _ = wait_session_snapshot(session, |snapshot| {
+        snapshot.capture_consumed == 1 && snapshot.reliable_event_depth == 2
+    });
+
+    unsafe { lfm_session_request_stop(session) };
+    assert_eq!(unsafe { lfm_capture_producer_destroy(producer) }, 0);
+    open_gate(session, &sink);
+    let _ = wait_gate_event(&sink, |event| event.kind == EVENT_STOPPED);
+    assert_eq!(unsafe { lfm_session_join(session) }, 0);
+
+    let events = sink.events.lock().unwrap();
+    let action: Vec<_> = events
+        .iter()
+        .filter(|event| event.ticket == capture)
+        .collect();
+    assert_eq!(
+        action.len(),
+        2,
+        "audio action must have one start and terminal"
+    );
+    assert_eq!(action[0].kind, EVENT_TURN_STARTED);
+    assert_eq!(action[0].status, 0);
+    assert_eq!(action[1].kind, EVENT_TURN);
+    assert_eq!(action[1].status, CANCELLED);
+    assert_eq!(events.last().map(|event| event.kind), Some(EVENT_STOPPED));
+    drop(events);
+
+    assert_eq!(unsafe { lfm_session_destroy(session) }, 0);
+    unsafe { lfm_runtime_request_stop(runtime) };
+    assert_eq!(unsafe { lfm_runtime_join(runtime) }, 0);
+    assert_eq!(unsafe { lfm_runtime_destroy(runtime) }, 0);
 }
 
 #[test]
@@ -3586,7 +4063,9 @@ fn session_runtime_has_no_operation_wait_path() {
     assert!(source.contains("lfm_session_control_interrupt"));
     assert!(source.contains("Cursor<uint64_t> publication_gate"));
     assert!(source.contains("publication_gate.value.fetch_or(PUBLICATION_CLOSED"));
-    let enter_begin = source.find("bool enter_publication").unwrap();
+    let enter_begin = source
+        .find("bool enter_publication(LfmSession *session) {")
+        .unwrap();
     let enter_end = source[enter_begin..]
         .find("void leave_publication")
         .map(|offset| enter_begin + offset)
@@ -3611,7 +4090,7 @@ fn session_runtime_has_no_operation_wait_path() {
         .find("if (session->publication_gate.value.load(")
         .unwrap();
     assert!(retire < source.find("if (session->command_pending)").unwrap());
-    assert!(retire < source.find("flush_published(&session->playback)").unwrap());
+    assert!(retire < source.find("flush_published(session)").unwrap());
     for (begin, end) in [("int submit_text", "} // namespace")] {
         let begin = source.find(begin).unwrap();
         let end = source[begin..]
@@ -3874,4 +4353,746 @@ fn conversation_owned_frontend_state_never_waits_on_a_numerical_mutex() {
     }
     assert!(frontend.contains("A workspace is mounted on one conversation"));
     assert!(frontend.contains("Stream state is conversation-owned"));
+}
+
+fn playback_dock(
+    slots: u32,
+    frames: u32,
+    capture_rate: u32,
+    playback_rate: u32,
+) -> (*mut Runtime, *mut Session, *mut PlaybackConsumer, Box<Sink>) {
+    let sink = Box::new(Sink {
+        events: Mutex::new(Vec::new()),
+        edge: Condvar::new(),
+        fail: false,
+    });
+    let runtime = runtime();
+    let mut config = dock_config();
+    config.playback_slots = slots;
+    config.playback_frames_per_slot = frames;
+    config.capture_sample_rate = capture_rate;
+    config.playback_sample_rate = playback_rate;
+    let callbacks = Callbacks {
+        size: std::mem::size_of::<Callbacks>() as u32,
+        abi_version: ABI,
+        context: std::ptr::from_ref(sink.as_ref()).cast_mut().cast(),
+        on_event: Some(collect),
+    };
+    let mut session = std::ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            lfm_session_create(
+                runtime,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &config,
+                &callbacks,
+                &mut session,
+            )
+        },
+        0
+    );
+    let mut consumer = std::ptr::null_mut();
+    assert_eq!(
+        unsafe { lfm_playback_consumer_create(session, &mut consumer) },
+        0
+    );
+    assert_eq!(unsafe { lfm_session_start(session) }, 0);
+    (runtime, session, consumer, sink)
+}
+
+fn duplex_dock_state(
+    rate: u32,
+    playback_frames: u32,
+    start: bool,
+) -> (
+    *mut Runtime,
+    *mut Session,
+    *mut CaptureProducer,
+    *mut PlaybackConsumer,
+    Box<Sink>,
+) {
+    let sink = Box::new(Sink {
+        events: Mutex::new(Vec::new()),
+        edge: Condvar::new(),
+        fail: false,
+    });
+    let runtime = runtime();
+    let mut config = dock_config();
+    config.capture_sample_rate = rate;
+    config.capture_max_callback_frames = rate.div_ceil(50) * 2;
+    config.playback_sample_rate = rate;
+    config.playback_frames_per_slot = playback_frames;
+    config.playback_slots = 1;
+    config.flags |= MANUAL_DEADLINES;
+    let callbacks = Callbacks {
+        size: std::mem::size_of::<Callbacks>() as u32,
+        abi_version: ABI,
+        context: std::ptr::from_ref(sink.as_ref()).cast_mut().cast(),
+        on_event: Some(collect),
+    };
+    let mut session = std::ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            lfm_session_create(
+                runtime,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &config,
+                &callbacks,
+                &mut session,
+            )
+        },
+        0
+    );
+    let mut producer = std::ptr::null_mut();
+    assert_eq!(
+        unsafe { lfm_capture_chunk_producer_create(session, 91, 0, &mut producer) },
+        0
+    );
+    let mut consumer = std::ptr::null_mut();
+    assert_eq!(
+        unsafe { lfm_playback_consumer_create(session, &mut consumer) },
+        0
+    );
+    if start {
+        assert_eq!(unsafe { lfm_session_start(session) }, 0);
+    }
+    (runtime, session, producer, consumer, sink)
+}
+
+fn duplex_dock(
+    rate: u32,
+    playback_frames: u32,
+) -> (
+    *mut Runtime,
+    *mut Session,
+    *mut CaptureProducer,
+    *mut PlaybackConsumer,
+    Box<Sink>,
+) {
+    duplex_dock_state(rate, playback_frames, true)
+}
+
+fn publish_playback(session: *mut Session, samples: &[f32]) -> Result<PcmLease, i32> {
+    let mut lease = PcmLease::default();
+    let status = unsafe {
+        lfm_session_publish_playback_f32_test(
+            session,
+            samples.as_ptr(),
+            samples.len() as u32,
+            &mut lease,
+        )
+    };
+    if status == 0 {
+        return Ok(lease);
+    }
+    Err(status)
+}
+
+fn claim_playback(consumer: *mut PlaybackConsumer, published: PcmLease) -> PcmLease {
+    let mut claimed = PcmLease::default();
+    assert_eq!(
+        unsafe {
+            lfm_playback_consumer_claim(
+                consumer,
+                &published.ticket,
+                published.stream_epoch,
+                published.lease_id,
+                published.buffer_generation,
+                &mut claimed,
+            )
+        },
+        0
+    );
+    assert_eq!(claimed.lease_id, published.lease_id);
+    claimed
+}
+
+fn retire_playback_dock(
+    runtime: *mut Runtime,
+    session: *mut Session,
+    consumer: *mut PlaybackConsumer,
+    sink: &Sink,
+) {
+    unsafe { lfm_session_request_stop(session) };
+    let _ = wait_event(sink, |event| event.kind == EVENT_STOPPED);
+    assert_eq!(unsafe { lfm_playback_consumer_destroy(consumer) }, 0);
+    assert_eq!(unsafe { lfm_session_join(session) }, 0);
+    assert_eq!(unsafe { lfm_session_destroy(session) }, 0);
+    unsafe { lfm_runtime_request_stop(runtime) };
+    assert_eq!(unsafe { lfm_runtime_join(runtime) }, 0);
+    assert_eq!(unsafe { lfm_runtime_destroy(runtime) }, 0);
+}
+
+fn retire_duplex_dock(
+    runtime: *mut Runtime,
+    session: *mut Session,
+    producer: *mut CaptureProducer,
+    consumer: *mut PlaybackConsumer,
+    sink: &Sink,
+) {
+    unsafe { lfm_session_request_stop(session) };
+    assert_eq!(unsafe { lfm_capture_producer_destroy(producer) }, 0);
+    assert_eq!(unsafe { lfm_playback_consumer_destroy(consumer) }, 0);
+    let _ = wait_event(sink, |event| event.kind == EVENT_STOPPED);
+    assert_eq!(unsafe { lfm_session_join(session) }, 0);
+    assert_eq!(unsafe { lfm_session_destroy(session) }, 0);
+    unsafe { lfm_runtime_request_stop(runtime) };
+    assert_eq!(unsafe { lfm_runtime_join(runtime) }, 0);
+    assert_eq!(unsafe { lfm_runtime_destroy(runtime) }, 0);
+}
+
+fn render_playback_block(
+    consumer: *mut PlaybackConsumer,
+    lease: &PcmLease,
+    offset: u32,
+    frames: u32,
+) -> PlaybackRender {
+    let mut output = vec![0.0f32; frames as usize];
+    let mut evidence = PlaybackRender::default();
+    assert_eq!(
+        unsafe {
+            lfm_playback_consumer_render_f32(
+                consumer,
+                lease,
+                offset,
+                output.as_mut_ptr(),
+                frames,
+                1,
+                output.len(),
+                &mut evidence,
+            )
+        },
+        0
+    );
+    evidence
+}
+
+#[test]
+fn live_playback_endpoint_loss_is_terminal_host_sink() {
+    let (runtime, session, consumer, sink) = playback_dock(2, 512, 48_000, 24_000);
+
+    /* Destroying the sole device endpoint without first stopping the session
+     * is a physical sink loss, not administrative handle retirement. */
+    assert_eq!(unsafe { lfm_playback_consumer_destroy(consumer) }, 0);
+    let stopped = wait_event(&sink, |event| event.kind == EVENT_STOPPED);
+    assert_eq!(stopped.status, HOST_SINK);
+    assert_eq!(unsafe { lfm_session_join(session) }, HOST_SINK);
+
+    let mut snapshot = SessionSnapshot::default();
+    assert_eq!(unsafe { lfm_session_snapshot(session, &mut snapshot) }, 0);
+    assert_eq!(snapshot.terminal_status, HOST_SINK);
+    assert_eq!(snapshot.live_playback_leases, 0);
+
+    assert_eq!(unsafe { lfm_session_destroy(session) }, 0);
+    unsafe { lfm_runtime_request_stop(runtime) };
+    assert_eq!(unsafe { lfm_runtime_join(runtime) }, 0);
+    assert_eq!(unsafe { lfm_runtime_destroy(runtime) }, 0);
+}
+
+#[test]
+fn unused_playback_reservation_retires_outside_published_accounting() {
+    let (runtime, session, consumer, sink) = playback_dock(1, 512, 48_000, 24_000);
+    assert_eq!(
+        unsafe { lfm_internal_session_release_unpublished_playback_for_test(session, 512) },
+        0
+    );
+
+    let mut snapshot = SessionSnapshot::default();
+    assert_eq!(unsafe { lfm_session_snapshot(session, &mut snapshot) }, 0);
+    assert_eq!(snapshot.playback_published, 0);
+    assert_eq!(snapshot.playback_consumed, 0);
+    assert_eq!(snapshot.live_playback_leases, 0);
+
+    retire_playback_dock(runtime, session, consumer, &sink);
+}
+
+#[test]
+fn playback_lease_sample_rate_is_the_device_rate() {
+    let (runtime, session, consumer, sink) = playback_dock(1, 512, 16_000, 24_000);
+    let samples = [0.25f32; 512];
+    let published = publish_playback(session, &samples).unwrap();
+    assert_eq!(published.sample_rate, 24_000);
+    let claimed = claim_playback(consumer, published);
+    assert_eq!(claimed.sample_rate, 24_000);
+    let rendered = render_playback_block(consumer, &claimed, 0, 512);
+    assert_eq!(rendered.rendered_frames, 512);
+    assert_eq!(
+        unsafe { lfm_playback_consumer_release(consumer, &claimed) },
+        0
+    );
+    retire_playback_dock(runtime, session, consumer, &sink);
+}
+
+#[test]
+fn queued_preplayback_mic_evidence_cannot_cross_playback_causal_start() {
+    const RATE: u32 = 48_000;
+    const BLOCK: u32 = RATE / 50;
+    const CAPTURE_BLOCKS: u32 = 25;
+    const PLAYBACK_BLOCKS: u32 = 20;
+    let (runtime, session, producer, consumer, sink) =
+        duplex_dock_state(RATE, BLOCK * PLAYBACK_BLOCKS, false);
+    let mut start = SessionSnapshot::default();
+    assert_eq!(unsafe { lfm_session_snapshot(session, &mut start) }, 0);
+
+    /* Deliberately queue more than the 400 ms barge threshold before any
+     * playback callback. Playback metadata is drained first by contract, so
+     * this recreates the causal-lag ordering that used to relabel old mic
+     * evidence as speech-over-playback. */
+    let queued = write_signal(producer, BLOCK * CAPTURE_BLOCKS, true);
+    let queued_end = queued.first_sample_cursor + u64::from(queued.frames);
+    assert_eq!(queued_end, u64::from(BLOCK * CAPTURE_BLOCKS));
+
+    let half = (RATE / 2_000) as usize;
+    let samples = (0..(BLOCK * PLAYBACK_BLOCKS) as usize)
+        .map(|index| {
+            if index < BLOCK as usize {
+                return 0.0;
+            }
+            if (index / half) & 1 == 0 {
+                0.25
+            } else {
+                -0.25
+            }
+        })
+        .collect::<Vec<_>>();
+    let published = publish_playback(session, &samples).unwrap();
+    let claimed = claim_playback(consumer, published);
+    let mut last = PlaybackRender::default();
+    for block in 0..PLAYBACK_BLOCKS {
+        last = render_playback_block(consumer, &claimed, block * BLOCK, BLOCK);
+        assert_eq!(last.capture_sample_cursor_snapshot, queued_end);
+    }
+
+    assert_eq!(unsafe { lfm_session_start(session) }, 0);
+    let playback = wait_playback_evidence(
+        session,
+        last.first_playback_sample_cursor + u64::from(BLOCK),
+        u64::from(PLAYBACK_BLOCKS),
+    );
+    assert_eq!(playback.last_voice, 1);
+    assert_eq!(playback.echo_start_capture_cursor, queued_end);
+    wait_capture_evidence(session, queued_end);
+
+    let policy = playback_policy(session);
+    let mut snapshot = SessionSnapshot::default();
+    assert_eq!(unsafe { lfm_session_snapshot(session, &mut snapshot) }, 0);
+    assert_eq!(snapshot.epoch, start.epoch);
+    assert_eq!(policy.barge_voiced_frames, 0);
+    assert_eq!(policy.barge_interrupts, 0);
+
+    assert_eq!(
+        unsafe { lfm_playback_consumer_release(consumer, &claimed) },
+        0
+    );
+    retire_duplex_dock(runtime, session, producer, consumer, &sink);
+}
+
+#[test]
+fn sustained_mic_evidence_interrupts_once_inside_the_playback_echo_tail() {
+    const RATE: u32 = 48_000;
+    const BLOCK: u32 = RATE / 50;
+    const BLOCKS: u32 = 48;
+    let (runtime, session, producer, consumer, sink) = duplex_dock(RATE, BLOCK * BLOCKS);
+    let mut start = SessionSnapshot::default();
+    assert_eq!(unsafe { lfm_session_snapshot(session, &mut start) }, 0);
+
+    let prime = write_signal(producer, BLOCK, false);
+    wait_capture_evidence(session, prime.first_sample_cursor + u64::from(prime.frames));
+
+    let half = (RATE / 2_000) as usize;
+    let samples = (0..(BLOCK * BLOCKS) as usize)
+        .map(|index| {
+            if index < BLOCK as usize {
+                return 0.0;
+            }
+            if (index / half) & 1 == 0 {
+                0.25
+            } else {
+                -0.25
+            }
+        })
+        .collect::<Vec<_>>();
+    let published = publish_playback(session, &samples).unwrap();
+    let claimed = claim_playback(consumer, published);
+    let mut offset = 0u32;
+    let mut records = 0u64;
+    let first = render_playback_block(consumer, &claimed, offset, BLOCK);
+    offset += BLOCK;
+    records += 1;
+    let _ = wait_playback_evidence(
+        session,
+        first.first_playback_sample_cursor + u64::from(BLOCK),
+        records,
+    );
+
+    let mut playback = playback_policy(session);
+    for _ in 0..12 {
+        if playback.last_voice != 0 {
+            break;
+        }
+        let rendered = render_playback_block(consumer, &claimed, offset, BLOCK);
+        offset += BLOCK;
+        records += 1;
+        playback = wait_playback_evidence(
+            session,
+            rendered.first_playback_sample_cursor + u64::from(BLOCK),
+            records,
+        );
+        let silence = write_signal(producer, BLOCK, false);
+        wait_capture_evidence(
+            session,
+            silence.first_sample_cursor + u64::from(silence.frames),
+        );
+    }
+    assert_eq!(
+        playback.last_voice, 1,
+        "playback Sesame never classified voice"
+    );
+    assert_eq!(playback.stream_epoch, start.epoch);
+    assert_eq!(playback.ticket, claimed.ticket);
+
+    /* This is detector-positive microphone evidence, not a synthetic claim
+     * that raw room echo has been cancelled. Keep it below the 400 ms policy,
+     * then prove one negative evidence edge resets the consecutive streak. */
+    for _ in 0..10 {
+        let rendered = render_playback_block(consumer, &claimed, offset, BLOCK);
+        offset += BLOCK;
+        records += 1;
+        let _ = wait_playback_evidence(
+            session,
+            rendered.first_playback_sample_cursor + u64::from(BLOCK),
+            records,
+        );
+        let voice = write_signal(producer, BLOCK, true);
+        wait_capture_evidence(session, voice.first_sample_cursor + u64::from(voice.frames));
+    }
+    let brief = playback_policy(session);
+    let mut snapshot = SessionSnapshot::default();
+    assert_eq!(unsafe { lfm_session_snapshot(session, &mut snapshot) }, 0);
+    assert_eq!(snapshot.epoch, start.epoch);
+    assert!(brief.barge_voiced_frames < u64::from(RATE) * 400 / 1_000);
+
+    let mut reset = false;
+    for _ in 0..12 {
+        let rendered = render_playback_block(consumer, &claimed, offset, BLOCK);
+        offset += BLOCK;
+        records += 1;
+        let _ = wait_playback_evidence(
+            session,
+            rendered.first_playback_sample_cursor + u64::from(BLOCK),
+            records,
+        );
+        let silence = write_signal(producer, BLOCK, false);
+        wait_capture_evidence(
+            session,
+            silence.first_sample_cursor + u64::from(silence.frames),
+        );
+        if playback_policy(session).barge_voiced_frames == 0 {
+            reset = true;
+            break;
+        }
+    }
+    assert!(
+        reset,
+        "detector-negative mic evidence did not reset the streak"
+    );
+
+    assert_eq!(
+        unsafe { lfm_playback_consumer_release(consumer, &claimed) },
+        0
+    );
+    let mut flush = PlaybackRender::default();
+    assert_eq!(
+        unsafe {
+            lfm_playback_consumer_observe(
+                consumer,
+                std::ptr::null(),
+                0,
+                0,
+                PLAYBACK_FLUSH | PLAYBACK_DISCONTINUITY,
+                &mut flush,
+            )
+        },
+        0
+    );
+    records += 1;
+    let tail = wait_playback_evidence(session, flush.first_playback_sample_cursor, records);
+    assert!(tail.echo_tail_capture_cursor > tail.capture_sample_cursor_snapshot);
+
+    let mut interrupted = None;
+    for _ in 0..25 {
+        let voice = write_signal(producer, BLOCK, true);
+        wait_capture_evidence(session, voice.first_sample_cursor + u64::from(voice.frames));
+        assert_eq!(unsafe { lfm_session_snapshot(session, &mut snapshot) }, 0);
+        if snapshot.epoch != start.epoch {
+            interrupted = Some(snapshot.epoch);
+            break;
+        }
+    }
+    let epoch = interrupted.expect("400 ms sustained mic evidence did not interrupt");
+    assert_eq!(epoch, start.epoch + 1);
+    let barge = playback_policy(session);
+    assert_eq!(barge.barge_interrupts, 1);
+    assert_eq!(barge.barge_source_epoch, start.epoch);
+    assert_eq!(barge.barge_interrupt_epoch, epoch);
+    assert_eq!(barge.barge_playback_ticket, claimed.ticket);
+
+    for _ in 0..4 {
+        let voice = write_signal(producer, BLOCK, true);
+        wait_capture_evidence(session, voice.first_sample_cursor + u64::from(voice.frames));
+    }
+    assert_eq!(unsafe { lfm_session_snapshot(session, &mut snapshot) }, 0);
+    assert_eq!(
+        snapshot.epoch, epoch,
+        "one playback lineage interrupted twice"
+    );
+
+    retire_duplex_dock(runtime, session, producer, consumer, &sink);
+}
+
+#[test]
+fn playback_sesame_handles_render_silence_render_fragmentation_without_a_pcm_plane() {
+    let (runtime, session, consumer, sink) = playback_dock(2, 512, 48_000, 24_000);
+    let samples = (0..512)
+        .map(|index| (index as f32 - 256.0) / 256.0)
+        .collect::<Vec<_>>();
+    let published = publish_playback(session, &samples).unwrap();
+    let claimed = claim_playback(consumer, published);
+
+    let mut first = vec![0.0f32; 600];
+    let mut evidence = PlaybackRender::default();
+    assert_eq!(
+        unsafe {
+            lfm_playback_consumer_render_f32(
+                consumer,
+                &claimed,
+                0,
+                first.as_mut_ptr(),
+                300,
+                2,
+                first.len(),
+                &mut evidence,
+            )
+        },
+        0
+    );
+    assert_eq!(evidence.flags, PLAYBACK_RENDERED);
+    assert_eq!(evidence.source_offset_frames, 0);
+    assert_eq!(evidence.rendered_frames, 300);
+    assert_eq!(evidence.first_playback_sample_cursor, 0);
+    for (frame, pair) in first.chunks_exact(2).enumerate() {
+        assert_eq!(pair, [samples[frame], samples[frame]].as_slice());
+    }
+
+    assert_eq!(
+        unsafe {
+            lfm_playback_consumer_observe(
+                consumer,
+                std::ptr::null(),
+                0,
+                80,
+                PLAYBACK_SILENCE,
+                &mut evidence,
+            )
+        },
+        0
+    );
+    assert_eq!(evidence.first_playback_sample_cursor, 300);
+    let mut tail = [0.0f32; 100];
+    assert_eq!(
+        unsafe {
+            lfm_playback_consumer_render_f32(
+                consumer,
+                &claimed,
+                300,
+                tail.as_mut_ptr(),
+                100,
+                1,
+                tail.len(),
+                &mut evidence,
+            )
+        },
+        0
+    );
+    assert_eq!(tail.as_slice(), &samples[300..400]);
+    assert_eq!(evidence.first_playback_sample_cursor, 380);
+    assert_eq!(
+        unsafe { lfm_playback_consumer_release(consumer, &claimed) },
+        0
+    );
+
+    let policy = wait_playback_evidence(session, 480, 3);
+    assert_eq!(policy.sample_rate, 24_000);
+    assert_eq!(policy.ticket, claimed.ticket);
+    assert_eq!(policy.stream_epoch, claimed.stream_epoch);
+    assert_eq!(policy.retained_observers, 0);
+    assert_eq!(policy.capture_sample_cursor_snapshot, 0);
+    assert_eq!(policy.discontinuities, 0);
+    let mut snapshot = SessionSnapshot::default();
+    assert_eq!(unsafe { lfm_session_snapshot(session, &mut snapshot) }, 0);
+    assert_eq!(snapshot.playback_consumed, 1);
+    retire_playback_dock(runtime, session, consumer, &sink);
+}
+
+#[test]
+fn playback_observer_retirement_and_epoch_reset_are_exact() {
+    let (runtime, session, consumer, sink) = playback_dock(1, 512, 44_100, 24_000);
+    let samples = (0..512)
+        .map(|index| if index & 1 == 0 { 0.5 } else { -0.5 })
+        .collect::<Vec<_>>();
+    let first = publish_playback(session, &samples).unwrap();
+    let first = claim_playback(consumer, first);
+    let mut output = [0.0f32; 100];
+    let mut evidence = PlaybackRender::default();
+    assert_eq!(
+        unsafe {
+            lfm_playback_consumer_render_f32(
+                consumer,
+                &first,
+                50,
+                output.as_mut_ptr(),
+                100,
+                1,
+                output.len(),
+                &mut evidence,
+            )
+        },
+        0
+    );
+    assert_eq!(output.as_slice(), &samples[50..150]);
+    assert_eq!(
+        unsafe { lfm_playback_consumer_release(consumer, &first) },
+        0
+    );
+    assert!(matches!(
+        publish_playback(session, &samples),
+        Err(WOULD_BLOCK)
+    ));
+
+    assert_eq!(
+        unsafe {
+            lfm_playback_consumer_observe(
+                consumer,
+                std::ptr::null(),
+                0,
+                380,
+                PLAYBACK_SILENCE,
+                &mut evidence,
+            )
+        },
+        0
+    );
+    let settled = wait_playback_evidence(session, 480, 2);
+    assert_eq!(settled.retained_observers, 0);
+
+    let second = publish_playback(session, &samples).unwrap();
+    let second = claim_playback(consumer, second);
+    let mut prefix = [0.0f32; 50];
+    assert_eq!(
+        unsafe {
+            lfm_playback_consumer_render_f32(
+                consumer,
+                &second,
+                0,
+                prefix.as_mut_ptr(),
+                50,
+                1,
+                prefix.len(),
+                &mut evidence,
+            )
+        },
+        0
+    );
+    let mut epoch = 0;
+    assert_eq!(unsafe { lfm_session_interrupt(session, &mut epoch) }, 0);
+    assert!(epoch > second.stream_epoch);
+    let mut stale = [7.0f32; 10];
+    assert_eq!(
+        unsafe {
+            lfm_playback_consumer_render_f32(
+                consumer,
+                &second,
+                50,
+                stale.as_mut_ptr(),
+                10,
+                1,
+                stale.len(),
+                &mut evidence,
+            )
+        },
+        STALE
+    );
+    assert_eq!(stale, [7.0; 10]);
+    assert_eq!(
+        unsafe { lfm_playback_consumer_release(consumer, &second) },
+        0
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let third = loop {
+        match publish_playback(session, &samples) {
+            Ok(lease) => break lease,
+            Err(WOULD_BLOCK) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "old playback observer survived epoch reset"
+                );
+                std::thread::yield_now();
+            }
+            Err(status) => panic!("new-epoch playback publication failed: {status}"),
+        }
+    };
+    assert_eq!(third.stream_epoch, epoch);
+    let third = claim_playback(consumer, third);
+    let mut full = [0.0f32; 480];
+    assert_eq!(
+        unsafe {
+            lfm_playback_consumer_render_f32(
+                consumer,
+                &third,
+                0,
+                full.as_mut_ptr(),
+                480,
+                1,
+                full.len(),
+                &mut evidence,
+            )
+        },
+        0
+    );
+    assert_eq!(
+        unsafe { lfm_playback_consumer_release(consumer, &third) },
+        0
+    );
+    let reset = wait_playback_evidence(session, 1_010, 4);
+    assert_eq!(reset.ticket, third.ticket);
+    assert_eq!(reset.stream_epoch, epoch);
+    assert!(reset.discontinuities >= 1);
+    assert_eq!(reset.retained_observers, 0);
+
+    assert_eq!(
+        unsafe {
+            lfm_playback_consumer_observe(
+                consumer,
+                std::ptr::null(),
+                0,
+                0,
+                PLAYBACK_FLUSH | PLAYBACK_DISCONTINUITY,
+                &mut evidence,
+            )
+        },
+        0
+    );
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let policy = playback_policy(session);
+        if policy.evidence_records >= 5 && policy.discontinuities >= 2 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "flush evidence did not retire");
+        std::thread::yield_now();
+    }
+    retire_playback_dock(runtime, session, consumer, &sink);
 }

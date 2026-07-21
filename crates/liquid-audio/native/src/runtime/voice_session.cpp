@@ -27,7 +27,8 @@
 #include <new>
 
 extern "C" {
-void *lfm_engine_new(int workers);
+void *lfm_engine_new_status(int workers, int *out_status);
+void *lfm_internal_engine_new_manual_deadlines_for_test(int workers);
 void lfm_engine_request_stop(void *engine);
 void lfm_engine_free(void *engine);
 }
@@ -55,13 +56,16 @@ constexpr uint32_t SLOT_RESERVED = 1;
 constexpr uint32_t SLOT_PUBLISHED = 2;
 constexpr uint32_t SLOT_CONSUMING = 3;
 constexpr uint32_t SLOT_RELEASING = 4;
-constexpr uint32_t SLOT_RETIRED = 5;
+constexpr uint32_t SLOT_FINALIZING = 5;
+constexpr uint32_t SLOT_RETIRED = 6;
 constexpr uint32_t EMISSION_AUDIO_END = 1;
 constexpr size_t EVENT_PAYLOAD_CAPACITY = 512;
 constexpr uint32_t MAX_KERNEL_LANES = 16;
 constexpr uint32_t SESSION_STEP_BUDGET = 16;
 constexpr uint32_t ACTION_TRANSITION_BUDGET = 8;
 constexpr uint32_t ACTION_CAPTURE_DRAIN_BUDGET = 8;
+constexpr uint32_t ACTION_PLAYBACK_EVIDENCE_DRAIN_BUDGET = 16;
+constexpr uint32_t PLAYBACK_EVIDENCE_CAPACITY = 512;
 constexpr uint32_t ACTION_PHASE_EMIT = 1;
 constexpr uint32_t ACTION_PHASE_TEXT_PUBLISHED = 2;
 constexpr uint32_t ACTION_PHASE_TERMINAL_PUBLISHED = 3;
@@ -94,6 +98,8 @@ constexpr uint32_t CAPTURE_DEADLINE_FORCED = 2;
 constexpr uint32_t CAPTURE_DEADLINE_COUNT = 3;
 constexpr uint64_t CAPTURE_PREPARE_DELAY_NS = UINT64_C(200'000'000);
 constexpr uint64_t CAPTURE_COMMIT_DELAY_NS = UINT64_C(500'000'000);
+constexpr uint32_t CAPTURE_BARGE_SUSTAIN_MS = 400;
+constexpr uint32_t CAPTURE_ECHO_TAIL_MS = 700;
 constexpr uint64_t PUBLICATION_CLOSED = UINT64_C(1) << 63;
 constexpr uint64_t PUBLICATION_COUNT_MASK = PUBLICATION_CLOSED - 1;
 /* Apple arm64 and Rosetta execute on the same 128-byte cache-line hardware. */
@@ -125,6 +131,7 @@ struct PcmSlot {
     std::atomic<uint32_t> state{SLOT_FREE};
     std::atomic<uint64_t> generation{1};
     std::atomic<uint64_t> identity{0};
+    std::atomic<uint32_t> observers{0};
     float *samples = nullptr;
     uint32_t reserved_frames = 0;
     uint32_t channels = 0;
@@ -147,6 +154,64 @@ struct PlaybackPool {
     Cursor<uint64_t> head;
     Cursor<uint64_t> tail;
     Cursor<uint32_t> cursor;
+};
+
+struct PlaybackEvidenceRecord {
+    uint64_t session_id = 0;
+    uint64_t stream_epoch = 0;
+    LfmTicketIdV1 ticket{};
+    uint64_t lease_id = 0;
+    uint64_t buffer_generation = 0;
+    uint32_t source_offset_frames = 0;
+    uint32_t rendered_frames = 0;
+    uint64_t first_playback_sample_cursor = 0;
+    uint64_t capture_sample_cursor_snapshot = 0;
+    uint32_t sample_rate = 0;
+    uint32_t flags = 0;
+};
+
+struct PlaybackEvidenceRing {
+    PlaybackEvidenceRecord *records = nullptr;
+    uint32_t capacity = 0;
+    Cursor<uint64_t> head;
+    Cursor<uint64_t> tail;
+};
+
+struct PlaybackEvidenceHistory {
+    PlaybackEvidenceRecord *records = nullptr;
+    uint32_t capacity = 0;
+    uint64_t head = 0;
+    uint64_t tail = 0;
+};
+
+struct alignas(HOT_ATOMIC_BYTES) PlaybackPolicySnapshotSlot {
+    mutable std::atomic<uint32_t> state{0};
+    LfmPlaybackPolicySnapshotV1 value{};
+};
+static_assert(alignof(PlaybackPolicySnapshotSlot) == HOT_ATOMIC_BYTES);
+
+struct PlaybackPolicy {
+    LfmSesameDetector *detector = nullptr;
+    PlaybackEvidenceRing incoming;
+    PlaybackEvidenceHistory history;
+    LfmSesameDecisionV1 decision{};
+    LfmTicketIdV1 last_ticket{};
+    uint64_t last_epoch = 0;
+    uint64_t last_capture_cursor = 0;
+    uint64_t next_evidence_cursor = 0;
+    uint64_t last_evidence_cursor = 0;
+    uint64_t available_cursor = 0;
+    uint64_t evidence_records = 0;
+    uint64_t evidence_updates = 0;
+    uint64_t discontinuities = 0;
+    uint64_t echo_start_capture_cursor = 0;
+    uint64_t last_voice_capture_cursor = 0;
+    uint64_t echo_tail_capture_cursor = 0;
+    uint64_t echo_epoch = 0;
+    LfmTicketIdV1 echo_ticket{};
+    uint32_t cadence_remainder = 49;
+    std::atomic<uint32_t> published_snapshot{0};
+    PlaybackPolicySnapshotSlot snapshots[2]{};
 };
 
 struct CaptureChunkRing {
@@ -281,11 +346,19 @@ struct CapturePolicy {
     uint64_t commit_ready_generation = 0;
     uint64_t forced_ready_generation = 0;
     uint64_t discarded_silence_frames = 0;
+    uint64_t barge_voiced_frames = 0;
+    uint64_t barge_candidate_epoch = 0;
+    uint64_t barge_source_epoch = 0;
+    uint64_t barge_interrupt_epoch = 0;
+    uint64_t barge_interrupts = 0;
+    LfmTicketIdV1 barge_candidate_ticket{};
+    LfmTicketIdV1 barge_playback_ticket{};
     uint64_t segment_epoch = 0;
     uint32_t cadence_remainder = 49;
     uint32_t state = CAPTURE_POLICY_LISTENING;
     bool chunk_pending = false;
     bool turn_active = false;
+    bool barge_triggered = false;
 };
 
 struct EventRecord {
@@ -406,14 +479,19 @@ uint32_t pool_live(const PlaybackPool &pool) {
     uint32_t live = 0;
     for (uint32_t i = 0; i < pool.capacity; ++i) {
         uint32_t state = pool.slots[i].state.load(std::memory_order_acquire);
-        if (state >= SLOT_RESERVED && state <= SLOT_RELEASING) live++;
+        if (state >= SLOT_RESERVED && state <= SLOT_FINALIZING) live++;
     }
     return live;
 }
 
 void pool_destroy(PlaybackPool *pool) {
     if (pool->slots) {
-        for (uint32_t i = 0; i < pool->capacity; ++i) delete[] pool->slots[i].samples;
+        for (uint32_t i = 0; i < pool->capacity; ++i) {
+            if (pool->slots[i].observers.load(std::memory_order_acquire) != 0) {
+                std::abort();
+            }
+            delete[] pool->slots[i].samples;
+        }
     }
     delete[] pool->slots;
     delete[] pool->ring;
@@ -487,13 +565,49 @@ int pool_slot(PlaybackPool *pool, const LfmPcmLeaseV1 *lease, PcmSlot **out,
     return 0;
 }
 
+bool finalize_slot(PcmSlot *slot, std::atomic<uint64_t> *consumed) {
+    if (slot->observers.load(std::memory_order_acquire) != 0) return false;
+    uint32_t expected = SLOT_RELEASING;
+    if (!slot->state.compare_exchange_strong(
+            expected, SLOT_FINALIZING, std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+        return false;
+    }
+    slot->reserved_frames = 0;
+    slot->channels = 0;
+    slot->sample_rate = 0;
+    slot->stream_epoch = 0;
+    slot->ticket = {};
+    slot->identity.store(0, std::memory_order_relaxed);
+    const uint64_t generation =
+        slot->generation.load(std::memory_order_relaxed);
+    if (consumed) consumed->fetch_add(1, std::memory_order_relaxed);
+    if (generation == std::numeric_limits<uint64_t>::max()) {
+        slot->state.store(SLOT_RETIRED, std::memory_order_release);
+        return true;
+    }
+    slot->generation.store(generation + 1, std::memory_order_relaxed);
+    slot->state.store(SLOT_FREE, std::memory_order_release);
+    return true;
+}
+
+void retire_slot_observer(PcmSlot *slot,
+                          std::atomic<uint64_t> *consumed) {
+    const uint32_t prior =
+        slot->observers.fetch_sub(1, std::memory_order_acq_rel);
+    if (prior == 0) std::abort();
+    if (prior == 1) (void)finalize_slot(slot, consumed);
+}
+
 int release_slot(PlaybackPool *pool, const LfmPcmLeaseV1 *lease,
+                 std::atomic<uint64_t> *consumed,
                  uint32_t allowed_states = UINT32_MAX) {
     PcmSlot *slot = nullptr;
     int rc = pool_slot(pool, lease, &slot, nullptr);
     if (rc != 0) return rc;
     uint32_t state = slot->state.load(std::memory_order_acquire);
-    if (state == SLOT_FREE || state == SLOT_RELEASING || state == SLOT_RETIRED) {
+    if (state == SLOT_FREE || state == SLOT_RELEASING ||
+        state == SLOT_FINALIZING || state == SLOT_RETIRED) {
         return LFM_STATUS_STALE;
     }
     if ((allowed_states & (UINT32_C(1) << state)) == 0) {
@@ -504,20 +618,13 @@ int release_slot(PlaybackPool *pool, const LfmPcmLeaseV1 *lease,
             std::memory_order_acquire)) {
         return LFM_STATUS_STALE;
     }
-    slot->reserved_frames = 0;
-    slot->channels = 0;
-    slot->sample_rate = 0;
-    slot->stream_epoch = 0;
-    slot->ticket = {};
-    slot->identity.store(0, std::memory_order_relaxed);
-    const uint64_t generation =
-        slot->generation.load(std::memory_order_relaxed);
-    if (generation == std::numeric_limits<uint64_t>::max()) {
-        slot->state.store(SLOT_RETIRED, std::memory_order_release);
-        return 0;
-    }
-    slot->generation.store(generation + 1, std::memory_order_relaxed);
-    slot->state.store(SLOT_FREE, std::memory_order_release);
+    /* `playback_consumed` is the retirement side of
+     * `playback_published`; an unused reservation never entered that
+     * accounting domain. Generation can reserve one final Mimi buffer and
+     * release it when no PCM remains, so counting SLOT_RESERVED here makes a
+     * clean turn report consumed > published. */
+    const bool published = state == SLOT_PUBLISHED || state == SLOT_CONSUMING;
+    (void)finalize_slot(slot, published ? consumed : nullptr);
     return 0;
 }
 
@@ -596,6 +703,7 @@ struct LfmRuntime {
     uint32_t kernel_lanes = 0;
     uint32_t event_capacity = 0;
     uint32_t session_capacity = 0;
+    bool manual_deadlines = false;
     std::atomic<uint32_t> state{LFM_RUNTIME_CREATED};
     mutable std::mutex children_mutex;
     LfmModel *model = nullptr;
@@ -627,6 +735,8 @@ struct SessionAction {
     bool admission_pending = false;
     bool capture_range_active = false;
     bool announce_start = false;
+    bool turn_started_required = false;
+    bool turn_started_visible = false;
     bool route_pending = false;
     bool route_audio = false;
 };
@@ -677,7 +787,15 @@ struct LfmSession {
     std::atomic<uint64_t> text_commands_stale{0};
     std::atomic<uint64_t> capture_evidence_updates{0};
     std::atomic<uint64_t> capture_evidence_cursor{0};
+    std::atomic<uint64_t> playback_evidence_records{0};
+    std::atomic<uint64_t> playback_evidence_updates{0};
+    std::atomic<uint64_t> playback_evidence_cursor{0};
+    std::atomic<uint64_t> playback_sample_cursor{0};
+    std::atomic<uint32_t> playback_evidence_voice{0};
+    std::atomic<uint32_t> playback_evidence_backlog{0};
+    std::atomic<uint32_t> playback_retained_observers{0};
     PlaybackPool playback;
+    PlaybackPolicy playback_policy;
     CaptureArena capture_arena;
     CaptureChunkRing capture_chunks;
     CapturePolicy capture_policy;
@@ -723,7 +841,12 @@ struct LfmSession {
         if (capture_policy.detector) {
             (void)lfm_sesame_detector_destroy(capture_policy.detector);
         }
+        if (playback_policy.detector) {
+            (void)lfm_sesame_detector_destroy(playback_policy.detector);
+        }
         pool_destroy(&playback);
+        delete[] playback_policy.incoming.records;
+        delete[] playback_policy.history.records;
         delete[] capture_arena.samples;
         delete[] capture_chunks.records;
         delete[] events.records;
@@ -758,7 +881,10 @@ struct LfmCaptureProducer {
 struct LfmPlaybackConsumer {
     LfmSession *session = nullptr;
     LfmPcmLeaseV1 lease{};
+    LfmPcmLeaseV1 lineage{};
+    uint64_t sample_cursor = 0;
     bool active = false;
+    bool faulted = false;
 };
 
 struct LfmSessionControl {
@@ -900,6 +1026,9 @@ bool valid_chunk(const LfmCaptureChunkV1 *chunk) {
 }
 
 void request_stop(LfmSession *session, int32_t status);
+void notify_session(LfmSession *session);
+bool enter_publication(LfmSession *session);
+void leave_publication(LfmSession *session);
 int release_capture_range(LfmSession *session,
                           const CaptureRangeLease &lease);
 
@@ -971,6 +1100,226 @@ bool consumer_matches(const LfmPlaybackConsumer *consumer,
            consumer->lease.buffer_generation == lease->buffer_generation &&
            consumer->lease.stream_epoch == lease->stream_epoch &&
            ticket_equal(consumer->lease.ticket, lease->ticket);
+}
+
+bool playback_evidence_empty(const PlaybackEvidenceRing &ring) {
+    return ring.head.value.load(std::memory_order_acquire) ==
+           ring.tail.value.load(std::memory_order_acquire);
+}
+
+bool playback_evidence_push(PlaybackEvidenceRing *ring,
+                            const PlaybackEvidenceRecord &record) {
+    const uint64_t tail = ring->tail.value.load(std::memory_order_relaxed);
+    const uint64_t head = ring->head.value.load(std::memory_order_acquire);
+    if (tail - head == ring->capacity) return false;
+    ring->records[tail % ring->capacity] = record;
+    ring->tail.value.store(tail + 1, std::memory_order_release);
+    return true;
+}
+
+bool playback_evidence_pop(PlaybackEvidenceRing *ring,
+                           PlaybackEvidenceRecord *out) {
+    const uint64_t head = ring->head.value.load(std::memory_order_relaxed);
+    const uint64_t tail = ring->tail.value.load(std::memory_order_acquire);
+    if (head == tail) return false;
+    *out = ring->records[head % ring->capacity];
+    ring->head.value.store(head + 1, std::memory_order_release);
+    return true;
+}
+
+uint64_t playback_capture_cursor_snapshot(const LfmSession *session) {
+    LfmCaptureProducer *producer =
+        session->chunk_producer.load(std::memory_order_acquire);
+    return producer
+        ? producer->sample_cursor.load(std::memory_order_acquire)
+        : session->capture_evidence_cursor.load(std::memory_order_acquire);
+}
+
+void fill_playback_render(const PlaybackEvidenceRecord &record,
+                          LfmPlaybackRenderV1 *out) {
+    *out = {
+        .size = sizeof(*out),
+        .abi_version = LFM_RUNTIME_ABI_VERSION,
+        .session_id = record.session_id,
+        .stream_epoch = record.stream_epoch,
+        .ticket = record.ticket,
+        .lease_id = record.lease_id,
+        .buffer_generation = record.buffer_generation,
+        .source_offset_frames = record.source_offset_frames,
+        .rendered_frames = record.rendered_frames,
+        .first_playback_sample_cursor =
+            record.first_playback_sample_cursor,
+        .capture_sample_cursor_snapshot =
+            record.capture_sample_cursor_snapshot,
+        .flags = record.flags,
+        .reserved0 = 0,
+        .reserved = {},
+    };
+}
+
+int publish_playback_evidence(LfmPlaybackConsumer *consumer,
+                              const LfmPcmLeaseV1 *lease,
+                              uint32_t source_offset_frames, uint32_t frames,
+                              uint32_t flags, LfmPlaybackRenderV1 *out) {
+    if (!consumer || !consumer->session || !out) {
+        return LFM_STATUS_INVALID_ARGUMENT;
+    }
+    if (consumer->faulted ||
+        consumer->session->stop.load(std::memory_order_acquire)) {
+        return LFM_STATUS_CANCELLED;
+    }
+    constexpr uint32_t supported = LFM_PLAYBACK_EVIDENCE_RENDERED |
+                                   LFM_PLAYBACK_EVIDENCE_SILENCE |
+                                   LFM_PLAYBACK_EVIDENCE_FLUSH |
+                                   LFM_PLAYBACK_EVIDENCE_DISCONTINUITY;
+    if (flags == 0 || (flags & ~supported) != 0 ||
+        ((flags & LFM_PLAYBACK_EVIDENCE_RENDERED) != 0 &&
+         ((flags & ~LFM_PLAYBACK_EVIDENCE_RENDERED) != 0 || frames == 0)) ||
+        ((flags & LFM_PLAYBACK_EVIDENCE_SILENCE) != 0 &&
+         ((flags & ~LFM_PLAYBACK_EVIDENCE_SILENCE) != 0 || frames == 0)) ||
+        ((flags & (LFM_PLAYBACK_EVIDENCE_FLUSH |
+                   LFM_PLAYBACK_EVIDENCE_DISCONTINUITY)) != 0 &&
+         frames != 0)) {
+        return LFM_STATUS_INVALID_ARGUMENT;
+    }
+    const bool rendered = (flags & LFM_PLAYBACK_EVIDENCE_RENDERED) != 0;
+    const LfmPcmLeaseV1 *lineage = lease;
+    if (!lineage) {
+        lineage = consumer->lineage.lease_id == 0 ? nullptr
+                                                  : &consumer->lineage;
+    }
+    if (!lineage || !ticket_equal(lineage->ticket,
+                                  consumer->lineage.ticket)) {
+        return LFM_STATUS_STALE;
+    }
+    LfmSession *session = consumer->session;
+    if (!enter_publication(session)) return LFM_STATUS_CANCELLED;
+    const auto finish = [session](int status) {
+        leave_publication(session);
+        return status;
+    };
+    const uint64_t epoch = session->epoch.load(std::memory_order_acquire);
+    if (lineage->stream_epoch != epoch) return finish(LFM_STATUS_STALE);
+    if (frames != 0 && consumer->sample_cursor > UINT64_MAX - frames) {
+        request_stop(session, -EOVERFLOW);
+        return finish(-EOVERFLOW);
+    }
+    PlaybackEvidenceRing &ring = session->playback_policy.incoming;
+    const uint64_t tail = ring.tail.value.load(std::memory_order_relaxed);
+    const uint64_t head = ring.head.value.load(std::memory_order_acquire);
+    if (tail - head == ring.capacity) {
+        request_stop(session, LFM_STATUS_INTERNAL);
+        return finish(LFM_STATUS_INTERNAL);
+    }
+
+    PcmSlot *slot = nullptr;
+    if (rendered) {
+        if (!consumer_matches(consumer, lineage) ||
+            source_offset_frames > lineage->frames ||
+            frames > lineage->frames - source_offset_frames) {
+            return finish(LFM_STATUS_STALE);
+        }
+        const int resolved = pool_slot(&session->playback, lineage, &slot,
+                                       nullptr);
+        if (resolved != 0 ||
+            slot->state.load(std::memory_order_acquire) != SLOT_CONSUMING) {
+            return finish(resolved == 0 ? LFM_STATUS_STALE : resolved);
+        }
+        const uint32_t prior =
+            slot->observers.fetch_add(1, std::memory_order_acq_rel);
+        if (prior == UINT32_MAX) std::abort();
+        session->playback_retained_observers.fetch_add(
+            1, std::memory_order_release);
+    }
+
+    const PlaybackEvidenceRecord record = {
+        .session_id = session->id,
+        .stream_epoch = epoch,
+        .ticket = lineage->ticket,
+        .lease_id = rendered ? lineage->lease_id : 0,
+        .buffer_generation = rendered ? lineage->buffer_generation : 0,
+        .source_offset_frames = rendered ? source_offset_frames : 0,
+        .rendered_frames = frames,
+        .first_playback_sample_cursor = consumer->sample_cursor,
+        .capture_sample_cursor_snapshot =
+            playback_capture_cursor_snapshot(session),
+        .sample_rate = session->playback_rate,
+        .flags = flags,
+    };
+    if (!playback_evidence_push(&ring, record)) std::abort();
+    consumer->sample_cursor += frames;
+    session->playback_sample_cursor.store(consumer->sample_cursor,
+                                          std::memory_order_release);
+    fill_playback_render(record, out);
+    notify_session(session);
+    return finish(0);
+}
+
+using PlaybackFanout = int (*)(const float *, void *, size_t, uint32_t,
+                               size_t);
+
+int render_playback_evidence(LfmPlaybackConsumer *consumer,
+                             const LfmPcmLeaseV1 *lease,
+                             uint32_t source_offset_frames, void *destination,
+                             uint32_t frames, uint32_t channels,
+                             size_t destination_capacity,
+                             PlaybackFanout fanout,
+                             LfmPlaybackRenderV1 *out) {
+    if (!consumer || !consumer->session || !lease || !destination ||
+        !fanout || !out || frames == 0 || channels == 0 ||
+        source_offset_frames > lease->frames ||
+        frames > lease->frames - source_offset_frames) {
+        return LFM_STATUS_INVALID_ARGUMENT;
+    }
+    if (consumer->faulted ||
+        consumer->session->stop.load(std::memory_order_acquire)) {
+        return LFM_STATUS_CANCELLED;
+    }
+    if (!consumer_matches(consumer, lease)) return LFM_STATUS_STALE;
+    const float *samples = nullptr;
+    size_t count = 0;
+    const int resolved = playback_resolve(consumer->session, lease, &samples,
+                                          &count);
+    if (resolved != 0) return resolved;
+    if (!samples || count != lease->frames) return LFM_STATUS_INTERNAL;
+    const int rendered = fanout(samples + source_offset_frames, destination,
+                                frames, channels, destination_capacity);
+    if (rendered != 0) return rendered;
+    const int published = publish_playback_evidence(
+        consumer, lease, source_offset_frames, frames,
+        LFM_PLAYBACK_EVIDENCE_RENDERED, out);
+    if (published == 0) return 0;
+    /* The device prefix is already visible. It cannot be replayed after its
+     * correlated evidence edge loses an epoch/stop/capacity race. Poison this
+     * endpoint and make the session failure explicit. */
+    consumer->faulted = true;
+    if (consumer->sample_cursor <= UINT64_MAX - frames) {
+        consumer->sample_cursor += frames;
+        consumer->session->playback_sample_cursor.store(
+            consumer->sample_cursor, std::memory_order_release);
+    }
+    request_stop(consumer->session, LFM_STATUS_HOST_SINK);
+    return published;
+}
+
+int fanout_f32_erased(const float *source, void *destination, size_t frames,
+                      uint32_t channels, size_t capacity) {
+    return lfm_playback_fanout_f32(source, static_cast<float *>(destination),
+                                   frames, channels, capacity);
+}
+
+int fanout_i16_erased(const float *source, void *destination, size_t frames,
+                      uint32_t channels, size_t capacity) {
+    return lfm_playback_fanout_i16(
+        source, static_cast<int16_t *>(destination), frames, channels,
+        capacity);
+}
+
+int fanout_u16_erased(const float *source, void *destination, size_t frames,
+                      uint32_t channels, size_t capacity) {
+    return lfm_playback_fanout_u16(
+        source, static_cast<uint16_t *>(destination), frames, channels,
+        capacity);
 }
 
 LfmTicketIdV1 next_ticket(LfmSession *session, uint32_t kind) {
@@ -1056,6 +1405,7 @@ int reserve_slot_at(LfmSession *session, PlaybackPool *pool,
                                             std::memory_order_acquire)) {
         return LFM_STATUS_WOULD_BLOCK;
     }
+    if (slot.observers.load(std::memory_order_acquire) != 0) std::abort();
     const uint64_t identity = lease_id(LFM_PCM_LEASE_PLAYBACK, index);
     if (identity == 0) {
         slot.state.store(SLOT_RETIRED, std::memory_order_release);
@@ -1835,7 +2185,8 @@ int step_capture_supervision(LfmSession *session) {
     if (supervision.cycle_active &&
         supervision.epoch !=
             session->epoch.load(std::memory_order_acquire) &&
-        !supervision.stop_requested) {
+        !supervision.stop_requested &&
+        !supervision.restart_after_cancel) {
         const int cancelled = capture_supervision_cancel(
             session, KC_SCOPE_CAUSE_CANCELLED, false, false);
         if (cancelled != 0) return cancelled;
@@ -2174,6 +2525,15 @@ ResultProgress drain_result(LfmSession *session) {
         request_stop(session, LFM_STATUS_HOST_SINK);
         return RESULT_DRAINED;
     }
+    if (result.records[0].kind == LFM_EVENT_TURN_STARTED &&
+        session->stop.load(std::memory_order_acquire)) {
+        for (uint32_t index = result.next; index < result.count; ++index) {
+            if (result.records[index].kind == LFM_EVENT_TURN) {
+                result.records[index].status = LFM_STATUS_CANCELLED;
+                result.records[index].flags &= ~LFM_EVENT_FLAG_TRUNCATED;
+            }
+        }
+    }
     if (result.gate_epoch && result.next == 0 &&
         session->epoch.load(std::memory_order_acquire) !=
             result.records[0].epoch) {
@@ -2211,8 +2571,14 @@ ResultProgress drain_result(LfmSession *session) {
      * the coordinator-owned diagnostic image before making that edge visible. */
     publish_capture_supervision_snapshot(session);
     while (result.next < result.count) {
-        if (!event_push(&session->events, result.records[result.next])) {
+        const EventRecord &record = result.records[result.next];
+        if (!event_push(&session->events, record)) {
             return RESULT_BLOCKED;
+        }
+        if (record.kind == LFM_EVENT_TURN_STARTED &&
+            session->action.active &&
+            ticket_equal(record.ticket, session->action.ticket)) {
+            session->action.turn_started_visible = true;
         }
         result.next++;
         (void)notify_delivery(session);
@@ -2227,17 +2593,28 @@ void fail_action(LfmSession *session, int status, const char *message) {
     SessionAction &action = session->action;
     release_action_capture_range(session, &action);
     release_prepared(session, &action.playback);
+    const bool visible = !action.turn_started_required ||
+                         action.turn_started_visible;
     if (session->stop.load(std::memory_order_acquire)) {
-        (void)stage_turn(session, action.epoch, action.ticket,
-                         action.playback_count, action.emitted, 0,
-                         LFM_STATUS_CANCELLED);
+        if (visible) {
+            (void)stage_turn(session, action.epoch, action.ticket,
+                             action.playback_count, action.emitted, 0,
+                             LFM_STATUS_CANCELLED);
+        }
         action.phase = ACTION_PHASE_TERMINAL_PUBLISHED;
         return;
     }
     if (session->epoch.load(std::memory_order_acquire) != action.epoch) {
-        (void)stage_turn(session, action.epoch, action.ticket,
-                         action.playback_count, action.emitted, 0,
-                         LFM_STATUS_STALE);
+        if (visible) {
+            (void)stage_turn(session, action.epoch, action.ticket,
+                             action.playback_count, action.emitted, 0,
+                             LFM_STATUS_STALE);
+        }
+        action.phase = ACTION_PHASE_TERMINAL_PUBLISHED;
+        return;
+    }
+    if (!visible) {
+        stage_error(session, status, message);
         action.phase = ACTION_PHASE_TERMINAL_PUBLISHED;
         return;
     }
@@ -2276,7 +2653,7 @@ ActionProgress advance_action(LfmSession *session) {
                 action.phase = ACTION_PHASE_TURN_STARTED_PUBLISHED;
                 if (!stage_event(session, LFM_EVENT_TURN_STARTED,
                                  action.epoch, action.ticket, 0, nullptr, 0,
-                                 0, true)) {
+                                 0, false)) {
                     fail_action(session, LFM_STATUS_INTERNAL,
                                 "native turn-start publication failed");
                 }
@@ -2332,10 +2709,13 @@ ActionProgress advance_action(LfmSession *session) {
                 fail_action(session, rc, "native action interrupt failed");
                 return ACTION_PROGRESS;
             }
-            (void)stage_turn(session, action.epoch, action.ticket,
-                             action.playback_count, action.emitted,
-                             action.interrupt_flags,
-                             action.interrupt_status);
+            if (!action.turn_started_required ||
+                action.turn_started_visible) {
+                (void)stage_turn(session, action.epoch, action.ticket,
+                                 action.playback_count, action.emitted,
+                                 action.interrupt_flags,
+                                 action.interrupt_status);
+            }
             action.phase = ACTION_PHASE_TERMINAL_PUBLISHED;
             return ACTION_PROGRESS;
         }
@@ -2528,10 +2908,14 @@ ActionProgress advance_action(LfmSession *session) {
 }
 
 SessionAction *prepare_action(LfmSession *session, uint64_t action_epoch,
-                              LfmTicketIdV1 ticket) {
+                              LfmTicketIdV1 ticket,
+                              bool turn_started_required) {
     if (session->action.active) {
-        stage_action_failure(session, action_epoch, ticket, LFM_STATUS_BUSY,
-                               "conversation already has a mutating route");
+        if (!turn_started_required) {
+            stage_action_failure(session, action_epoch, ticket,
+                                 LFM_STATUS_BUSY,
+                                 "conversation already has a mutating route");
+        }
         return nullptr;
     }
     session->action = {};
@@ -2540,6 +2924,8 @@ SessionAction *prepare_action(LfmSession *session, uint64_t action_epoch,
     session->action.phase = ACTION_PHASE_ADMISSION_PENDING;
     session->action.active = true;
     session->action.admission_pending = true;
+    session->action.turn_started_required = turn_started_required;
+    session->action.announce_start = turn_started_required;
     return &session->action;
 }
 
@@ -2844,6 +3230,10 @@ void reset_capture_policy(LfmSession *session, uint64_t cursor,
     policy.last_voiced_cursor = 0;
     policy.voiced_frames = 0;
     policy.silence_frames = 0;
+    policy.barge_voiced_frames = 0;
+    policy.barge_candidate_epoch = 0;
+    policy.barge_candidate_ticket = {};
+    policy.barge_triggered = false;
     policy.pause_generation++;
     if (policy.pause_generation == 0) policy.pause_generation = 1;
     policy.prepare_sample_generation = 0;
@@ -2865,6 +3255,98 @@ void reset_capture_policy(LfmSession *session, uint64_t cursor,
 
 uint64_t capture_duration_frames(uint32_t sample_rate, uint32_t milliseconds) {
     return (static_cast<uint64_t>(sample_rate) * milliseconds + 999) / 1000;
+}
+
+void clear_barge_candidate(CapturePolicy *policy) {
+    policy->barge_voiced_frames = 0;
+    policy->barge_candidate_epoch = 0;
+    policy->barge_candidate_ticket = {};
+}
+
+bool playback_echo_window(const LfmSession *session, uint64_t cursor) {
+    const PlaybackPolicy &playback = session->playback_policy;
+    const uint64_t epoch = session->epoch.load(std::memory_order_acquire);
+    return playback.echo_epoch == epoch &&
+           playback.echo_ticket.sequence != 0 &&
+           cursor > playback.echo_start_capture_cursor &&
+           cursor <= playback.echo_tail_capture_cursor;
+}
+
+int trigger_barge_interrupt(LfmSession *session) {
+    CapturePolicy &policy = session->capture_policy;
+    CaptureSupervision &supervision = session->capture_supervision;
+    const PlaybackPolicy &playback = session->playback_policy;
+    if (policy.barge_triggered) return 0;
+    if (!policy.turn_active || policy.state != CAPTURE_POLICY_SPEAKING ||
+        policy.turn_ticket.sequence == 0 || !supervision.cycle_active ||
+        supervision.freeze_pending || playback.echo_ticket.sequence == 0 ||
+        playback.echo_epoch !=
+            session->epoch.load(std::memory_order_acquire)) {
+        return LFM_STATUS_INTERNAL;
+    }
+    if (policy.barge_interrupts == UINT64_MAX) return -EOVERFLOW;
+
+    /* Retire the old epoch's deadline children first, then restart the same
+     * capture turn under the new epoch. The capture turn ticket deliberately
+     * survives: its initial 400 ms of user speech is still the beginning of
+     * this turn and must not be discarded merely because it interrupted the
+     * assistant. */
+    const int cancelled = capture_supervision_cancel(
+        session, KC_SCOPE_CAUSE_CANCELLED, false, false);
+    if (cancelled != 0) return cancelled;
+    uint64_t epoch = 0;
+    const int interrupted = lfm_session_interrupt(session, &epoch);
+    if (interrupted != 0) return interrupted;
+
+    supervision.restart_after_cancel = true;
+    supervision.commit_after_cancel = false;
+    supervision.restart_parent = policy.turn_ticket;
+    policy.segment_epoch = epoch;
+    if (policy.chunk_pending) {
+        policy.chunk.stream_epoch = epoch;
+        policy.chunk.turn_ticket = policy.turn_ticket;
+    }
+    policy.barge_triggered = true;
+    policy.barge_source_epoch = playback.echo_epoch;
+    policy.barge_interrupt_epoch = epoch;
+    policy.barge_playback_ticket = playback.echo_ticket;
+    policy.barge_interrupts++;
+    return 0;
+}
+
+int apply_barge_decision(LfmSession *session, uint64_t cursor,
+                         uint64_t interval,
+                         const LfmSesameDecisionV1 &decision) {
+    CapturePolicy &policy = session->capture_policy;
+    const PlaybackPolicy &playback = session->playback_policy;
+    if (decision.voice == 0 || !playback_echo_window(session, cursor)) {
+        clear_barge_candidate(&policy);
+        return 0;
+    }
+    if (policy.barge_candidate_epoch != playback.echo_epoch ||
+        !ticket_equal(policy.barge_candidate_ticket,
+                      playback.echo_ticket)) {
+        policy.barge_candidate_epoch = playback.echo_epoch;
+        policy.barge_candidate_ticket = playback.echo_ticket;
+        policy.barge_voiced_frames = 0;
+    }
+    /* Playback metadata is drained before capture metadata. A playback edge
+     * can therefore snapshot a producer cursor whose older microphone blocks
+     * are still queued. Count only the portion of this detector interval that
+     * is causally newer than the first classified playback voice for this
+     * ticket; queued pre-playback speech must never become barge evidence. */
+    const uint64_t interval_start = cursor >= interval ? cursor - interval : 0;
+    const uint64_t eligible_start = std::max(
+        interval_start, playback.echo_start_capture_cursor);
+    const uint64_t eligible = cursor - eligible_start;
+    if (policy.barge_voiced_frames > UINT64_MAX - eligible) {
+        return -EOVERFLOW;
+    }
+    policy.barge_voiced_frames += eligible;
+    const uint64_t sustained = capture_duration_frames(
+        session->capture_rate, CAPTURE_BARGE_SUSTAIN_MS);
+    if (policy.barge_voiced_frames < sustained) return 0;
+    return trigger_barge_interrupt(session);
 }
 
 int apply_capture_decision(LfmSession *session, uint64_t cursor,
@@ -2985,6 +3467,9 @@ int apply_capture_decision(LfmSession *session, uint64_t cursor,
                 .roles[CAPTURE_DEADLINE_FORCED]
                 .domain_generation;
     }
+    const int barge = apply_barge_decision(
+        session, cursor, interval, decision);
+    if (barge != 0) return barge;
     session->capture_evidence_cursor.store(cursor, std::memory_order_relaxed);
     session->capture_evidence_updates.store(
         policy.evidence_updates, std::memory_order_release);
@@ -3133,26 +3618,459 @@ int step_capture_policy(LfmSession *session, uint32_t *budget) {
     return process_capture_chunk(session, chunk);
 }
 
-void flush_published(PlaybackPool *pool) {
+alignas(64) const float playback_zeros[LFM_SESAME_FFT_SIZE]{};
+
+int playback_record_slot(LfmSession *session,
+                         const PlaybackEvidenceRecord &record,
+                         PcmSlot **out) {
+    if ((record.flags & LFM_PLAYBACK_EVIDENCE_RENDERED) == 0 ||
+        record.rendered_frames == 0) {
+        return LFM_STATUS_INVALID_ARGUMENT;
+    }
+    uint32_t index = 0;
+    if (!decode_playback_lease_id(record.lease_id, &index) ||
+        index >= session->playback.capacity) {
+        return LFM_STATUS_INVALID_ARGUMENT;
+    }
+    PcmSlot &slot = session->playback.slots[index];
+    const uint32_t state = slot.state.load(std::memory_order_acquire);
+    if (slot.identity.load(std::memory_order_acquire) != record.lease_id ||
+        slot.generation.load(std::memory_order_acquire) !=
+            record.buffer_generation ||
+        slot.stream_epoch != record.stream_epoch ||
+        !ticket_equal(slot.ticket, record.ticket) ||
+        (state != SLOT_CONSUMING && state != SLOT_RELEASING) ||
+        record.source_offset_frames > slot.reserved_frames ||
+        record.rendered_frames >
+            slot.reserved_frames - record.source_offset_frames) {
+        return LFM_STATUS_STALE;
+    }
+    *out = &slot;
+    return 0;
+}
+
+int retire_playback_record(LfmSession *session,
+                           const PlaybackEvidenceRecord &record) {
+    if ((record.flags & LFM_PLAYBACK_EVIDENCE_RENDERED) == 0) return 0;
+    PcmSlot *slot = nullptr;
+    const int status = playback_record_slot(session, record, &slot);
+    if (status != 0) return status;
+    retire_slot_observer(slot, &session->playback_consumed);
+    const uint32_t prior = session->playback_retained_observers.fetch_sub(
+        1, std::memory_order_acq_rel);
+    if (prior == 0) std::abort();
+    return 0;
+}
+
+int retire_playback_history(LfmSession *session) {
+    PlaybackEvidenceHistory &history = session->playback_policy.history;
+    while (history.head != history.tail) {
+        const PlaybackEvidenceRecord record =
+            history.records[history.head % history.capacity];
+        history.head++;
+        const int status = retire_playback_record(session, record);
+        if (status != 0) return status;
+    }
+    return 0;
+}
+
+bool advance_playback_cadence(PlaybackPolicy *policy,
+                              uint32_t sample_rate) {
+    const uint64_t scaled =
+        static_cast<uint64_t>(policy->cadence_remainder) + sample_rate;
+    const uint64_t step = scaled / 50;
+    policy->cadence_remainder = static_cast<uint32_t>(scaled % 50);
+    if (step == 0 ||
+        policy->next_evidence_cursor > UINT64_MAX - step) {
+        return false;
+    }
+    policy->next_evidence_cursor += step;
+    return true;
+}
+
+int reset_playback_policy(LfmSession *session, uint64_t cursor,
+                          bool count_discontinuity,
+                          bool preserve_echo_tail) {
+    PlaybackPolicy &policy = session->playback_policy;
+    const int retired = retire_playback_history(session);
+    if (retired != 0) return retired;
+    const int reset = lfm_sesame_detector_discontinuity(
+        policy.detector, LFM_SESAME_STREAM_PLAYBACK);
+    if (reset != 0) return reset;
+    policy.decision = {};
+    policy.next_evidence_cursor = cursor;
+    policy.last_evidence_cursor = cursor;
+    policy.available_cursor = cursor;
+    policy.cadence_remainder = 49;
+    if (!preserve_echo_tail) {
+        policy.echo_start_capture_cursor = 0;
+        policy.last_voice_capture_cursor = 0;
+        policy.echo_tail_capture_cursor = 0;
+        policy.echo_epoch = 0;
+        policy.echo_ticket = {};
+    }
+    if (count_discontinuity) policy.discontinuities++;
+    return advance_playback_cadence(&policy, session->playback_rate)
+               ? 0
+               : -EOVERFLOW;
+}
+
+int append_playback_history(LfmSession *session,
+                            const PlaybackEvidenceRecord &record) {
+    PlaybackPolicy &policy = session->playback_policy;
+    PlaybackEvidenceHistory &history = policy.history;
+    if (history.tail - history.head == history.capacity) {
+        return LFM_STATUS_INTERNAL;
+    }
+    if (record.first_playback_sample_cursor != policy.available_cursor ||
+        record.rendered_frames == 0 ||
+        record.first_playback_sample_cursor >
+            UINT64_MAX - record.rendered_frames) {
+        return LFM_STATUS_INTERNAL;
+    }
+    history.records[history.tail % history.capacity] = record;
+    history.tail++;
+    policy.available_cursor += record.rendered_frames;
+    return 0;
+}
+
+struct PlaybackWindowBuilder {
+    LfmSesameSpanV1 *spans = nullptr;
+    size_t capacity = 0;
+    size_t count = 0;
+    size_t filled = 0;
+};
+
+bool append_playback_window_span(PlaybackWindowBuilder *builder,
+                                 const float *data, size_t frames,
+                                 bool zero) {
+    if (frames == 0) return true;
+    if (!builder || !builder->spans || !data ||
+        builder->filled > LFM_SESAME_FFT_SIZE ||
+        frames > LFM_SESAME_FFT_SIZE - builder->filled) {
+        return false;
+    }
+    if (builder->count != 0) {
+        LfmSesameSpanV1 &prior = builder->spans[builder->count - 1];
+        if ((zero && prior.samples == playback_zeros) ||
+            (!zero && prior.samples != playback_zeros &&
+             prior.samples + prior.count == data)) {
+            prior.count += frames;
+            builder->filled += frames;
+            return true;
+        }
+    }
+    if (builder->count == builder->capacity) return false;
+    builder->spans[builder->count] = {
+        .samples = data,
+        .count = frames,
+    };
+    ++builder->count;
+    builder->filled += frames;
+    return true;
+}
+
+int resolve_playback_window(LfmSession *session, uint64_t cursor,
+                            LfmSesameSpanV1 *spans, size_t capacity,
+                            size_t *out_count) {
+    if (!spans || capacity == 0 || !out_count ||
+        cursor > session->playback_policy.available_cursor) {
+        return LFM_STATUS_INVALID_ARGUMENT;
+    }
+    *out_count = 0;
+    const uint64_t real_start =
+        cursor > LFM_SESAME_FFT_SIZE ? cursor - LFM_SESAME_FFT_SIZE : 0;
+    const size_t prefix = cursor < LFM_SESAME_FFT_SIZE
+                              ? LFM_SESAME_FFT_SIZE - cursor
+                              : 0;
+    PlaybackWindowBuilder builder = {
+        .spans = spans,
+        .capacity = capacity,
+    };
+    if (!append_playback_window_span(&builder, playback_zeros, prefix, true)) {
+        return LFM_STATUS_INTERNAL;
+    }
+    uint64_t expected = real_start;
+    PlaybackEvidenceHistory &history = session->playback_policy.history;
+    for (uint64_t cursor_index = history.head;
+         cursor_index != history.tail && expected < cursor; ++cursor_index) {
+        const PlaybackEvidenceRecord &record =
+            history.records[cursor_index % history.capacity];
+        const uint64_t end = record.first_playback_sample_cursor +
+                             record.rendered_frames;
+        if (end <= real_start) continue;
+        const uint64_t start =
+            std::max(record.first_playback_sample_cursor, real_start);
+        if (start != expected || end < start) return LFM_STATUS_INTERNAL;
+        const uint64_t selected_end = std::min(end, cursor);
+        const size_t frames = static_cast<size_t>(selected_end - start);
+        const bool zero =
+            (record.flags & LFM_PLAYBACK_EVIDENCE_SILENCE) != 0;
+        const float *data = playback_zeros;
+        if (!zero) {
+            PcmSlot *slot = nullptr;
+            const int status = playback_record_slot(session, record, &slot);
+            if (status != 0) return status;
+            const uint64_t offset = record.source_offset_frames +
+                                    (start - record.first_playback_sample_cursor);
+            if (offset > slot->reserved_frames ||
+                frames > slot->reserved_frames - offset) {
+                return LFM_STATUS_INTERNAL;
+            }
+            data = slot->samples + offset;
+        }
+        if (!append_playback_window_span(&builder, data, frames, zero)) {
+            return LFM_STATUS_INTERNAL;
+        }
+        expected = selected_end;
+    }
+    if (expected != cursor || builder.count == 0 ||
+        builder.filled != LFM_SESAME_FFT_SIZE) {
+        return LFM_STATUS_INTERNAL;
+    }
+    *out_count = builder.count;
+    return 0;
+}
+
+int trim_playback_history(LfmSession *session) {
+    PlaybackPolicy &policy = session->playback_policy;
+    PlaybackEvidenceHistory &history = policy.history;
+    const uint64_t keep = policy.next_evidence_cursor > LFM_SESAME_FFT_SIZE
+                              ? policy.next_evidence_cursor -
+                                    LFM_SESAME_FFT_SIZE
+                              : 0;
+    while (history.head != history.tail) {
+        const PlaybackEvidenceRecord &record =
+            history.records[history.head % history.capacity];
+        const uint64_t end = record.first_playback_sample_cursor +
+                             record.rendered_frames;
+        if (end > keep) break;
+        const PlaybackEvidenceRecord retired = record;
+        history.head++;
+        const int status = retire_playback_record(session, retired);
+        if (status != 0) return status;
+    }
+    return 0;
+}
+
+enum PlaybackPolicyProgress : int {
+    PLAYBACK_POLICY_EMPTY = 0,
+    PLAYBACK_POLICY_PROGRESS = 1,
+};
+
+int step_playback_policy(LfmSession *session, uint32_t *budget) {
+    PlaybackPolicy &policy = session->playback_policy;
+    if (policy.next_evidence_cursor <= policy.available_cursor) {
+        LfmSesameSpanV1 spans[LFM_SESAME_FFT_SIZE];
+        size_t span_count = 0;
+        const int resolved = resolve_playback_window(
+            session, policy.next_evidence_cursor, spans,
+            LFM_SESAME_FFT_SIZE, &span_count);
+        if (resolved != 0) return resolved;
+        LfmSesameDecisionV1 decision{};
+        int detected = 0;
+        if (span_count <= 2) {
+            const LfmSesameWindowV1 window = {
+                .first = spans[0].samples,
+                .first_count = spans[0].count,
+                .second = span_count == 2 ? spans[1].samples : nullptr,
+                .second_count = span_count == 2 ? spans[1].count : 0,
+            };
+            detected = lfm_sesame_detector_process_window(
+                policy.detector, LFM_SESAME_STREAM_PLAYBACK, &window,
+                nullptr, 0, &decision);
+        } else {
+            const LfmSesameScatterWindowV1 window = {
+                .spans = spans,
+                .span_count = span_count,
+            };
+            detected = lfm_sesame_detector_process_scatter_window(
+                policy.detector, LFM_SESAME_STREAM_PLAYBACK, &window,
+                nullptr, 0, &decision);
+        }
+        if (detected != 0) return detected;
+        if (decision.voice != 0) {
+            const uint64_t tail = capture_duration_frames(
+                session->capture_rate, CAPTURE_ECHO_TAIL_MS);
+            if (policy.last_capture_cursor > UINT64_MAX - tail) {
+                return -EOVERFLOW;
+            }
+            const uint64_t until = policy.last_capture_cursor + tail;
+            if (policy.echo_epoch != policy.last_epoch ||
+                !ticket_equal(policy.echo_ticket, policy.last_ticket)) {
+                policy.echo_start_capture_cursor =
+                    policy.last_capture_cursor;
+                policy.echo_tail_capture_cursor = until;
+            } else {
+                policy.echo_tail_capture_cursor = std::max(
+                    policy.echo_tail_capture_cursor, until);
+            }
+            policy.last_voice_capture_cursor = policy.last_capture_cursor;
+            policy.echo_epoch = policy.last_epoch;
+            policy.echo_ticket = policy.last_ticket;
+        }
+        policy.decision = decision;
+        policy.last_evidence_cursor = policy.next_evidence_cursor;
+        policy.evidence_updates++;
+        session->playback_evidence_updates.store(
+            policy.evidence_updates, std::memory_order_relaxed);
+        session->playback_evidence_cursor.store(
+            policy.last_evidence_cursor, std::memory_order_relaxed);
+        session->playback_evidence_voice.store(decision.voice,
+                                               std::memory_order_relaxed);
+        if (!advance_playback_cadence(&policy, session->playback_rate)) {
+            return -EOVERFLOW;
+        }
+        const int trimmed = trim_playback_history(session);
+        if (trimmed != 0) return trimmed;
+        return PLAYBACK_POLICY_PROGRESS;
+    }
+    if (!budget || *budget == 0) {
+        return playback_evidence_empty(policy.incoming)
+                   ? PLAYBACK_POLICY_EMPTY
+                   : PLAYBACK_POLICY_PROGRESS;
+    }
+    PlaybackEvidenceRecord record{};
+    if (!playback_evidence_pop(&policy.incoming, &record)) {
+        session->playback_evidence_backlog.store(0,
+                                                std::memory_order_release);
+        return PLAYBACK_POLICY_EMPTY;
+    }
+    --*budget;
+    if (record.session_id != session->id ||
+        record.sample_rate != session->playback_rate ||
+        record.first_playback_sample_cursor >
+            UINT64_MAX - record.rendered_frames) {
+        (void)retire_playback_record(session, record);
+        return LFM_STATUS_INTERNAL;
+    }
+    policy.evidence_records++;
+    policy.last_ticket = record.ticket;
+    policy.last_epoch = record.stream_epoch;
+    policy.last_capture_cursor = record.capture_sample_cursor_snapshot;
+    session->playback_evidence_records.store(
+        policy.evidence_records, std::memory_order_relaxed);
+    const uint64_t current_epoch =
+        session->epoch.load(std::memory_order_acquire);
+    const bool control =
+        (record.flags & (LFM_PLAYBACK_EVIDENCE_FLUSH |
+                         LFM_PLAYBACK_EVIDENCE_DISCONTINUITY)) != 0;
+    if (record.stream_epoch != current_epoch || control) {
+        const int retired = retire_playback_record(session, record);
+        if (retired != 0) return retired;
+        const uint64_t cursor = record.first_playback_sample_cursor +
+                                record.rendered_frames;
+        const bool preserve_echo_tail =
+            record.stream_epoch == current_epoch &&
+            (record.flags & LFM_PLAYBACK_EVIDENCE_FLUSH) != 0;
+        const int reset = reset_playback_policy(
+            session, cursor, true, preserve_echo_tail);
+        if (reset != 0) return reset;
+        return PLAYBACK_POLICY_PROGRESS;
+    }
+    const int appended = append_playback_history(session, record);
+    if (appended != 0) {
+        (void)retire_playback_record(session, record);
+        return appended;
+    }
+    session->playback_evidence_backlog.store(
+        static_cast<uint32_t>(policy.history.tail - policy.history.head),
+        std::memory_order_release);
+    return PLAYBACK_POLICY_PROGRESS;
+}
+
+void publish_playback_policy_snapshot(LfmSession *session) {
+    PlaybackPolicy &policy = session->playback_policy;
+    const uint32_t current = policy.published_snapshot.load(
+        std::memory_order_relaxed);
+    const uint32_t target = current ^ 1u;
+    PlaybackPolicySnapshotSlot &slot = policy.snapshots[target];
+    uint32_t expected = 0;
+    if (!slot.state.compare_exchange_strong(
+            expected, CAPTURE_SNAPSHOT_WRITING, std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+        return;
+    }
+    const uint64_t incoming_head = policy.incoming.head.value.load(
+        std::memory_order_acquire);
+    const uint64_t incoming_tail = policy.incoming.tail.value.load(
+        std::memory_order_acquire);
+    slot.value = {
+        .size = sizeof(LfmPlaybackPolicySnapshotV1),
+        .abi_version = LFM_RUNTIME_ABI_VERSION,
+        .sample_rate = session->playback_rate,
+        .last_voice = policy.decision.voice,
+        .detector_backlog = static_cast<uint32_t>(
+            std::min<uint64_t>(UINT32_MAX,
+                               incoming_tail - incoming_head +
+                                   policy.history.tail - policy.history.head)),
+        .retained_observers = session->playback_retained_observers.load(
+            std::memory_order_acquire),
+        .evidence_records = policy.evidence_records,
+        .evidence_updates = policy.evidence_updates,
+        .last_evidence_cursor = policy.last_evidence_cursor,
+        .discontinuities = policy.discontinuities,
+        .stream_epoch = policy.last_epoch,
+        .ticket = policy.last_ticket,
+        .capture_sample_cursor_snapshot = policy.last_capture_cursor,
+        .last_score = policy.decision.score,
+        .adaptive_min = policy.decision.adaptive_min,
+        .adaptive_max = policy.decision.adaptive_max,
+        .echo_start_capture_cursor = policy.echo_start_capture_cursor,
+        .last_voice_capture_cursor = policy.last_voice_capture_cursor,
+        .echo_tail_capture_cursor = policy.echo_tail_capture_cursor,
+        .barge_voiced_frames = session->capture_policy.barge_voiced_frames,
+        .barge_interrupts = session->capture_policy.barge_interrupts,
+        .barge_source_epoch =
+            session->capture_policy.barge_source_epoch,
+        .barge_interrupt_epoch =
+            session->capture_policy.barge_interrupt_epoch,
+        .barge_playback_ticket =
+            session->capture_policy.barge_playback_ticket,
+        .reserved = {},
+    };
+    slot.state.store(0, std::memory_order_release);
+    policy.published_snapshot.store(target, std::memory_order_release);
+}
+
+int read_playback_policy_snapshot(
+    const LfmSession *session, LfmPlaybackPolicySnapshotV1 *out) {
+    const PlaybackPolicy &policy = session->playback_policy;
+    for (uint32_t attempt = 0; attempt < 2; ++attempt) {
+        const uint32_t index = policy.published_snapshot.load(
+            std::memory_order_acquire);
+        const PlaybackPolicySnapshotSlot &slot = policy.snapshots[index];
+        uint32_t readers = slot.state.load(std::memory_order_acquire);
+        if ((readers & CAPTURE_SNAPSHOT_WRITING) != 0 ||
+            readers == CAPTURE_SNAPSHOT_WRITING - 1) {
+            continue;
+        }
+        if (!slot.state.compare_exchange_strong(
+                readers, readers + 1, std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            continue;
+        }
+        if (policy.published_snapshot.load(std::memory_order_acquire) !=
+            index) {
+            slot.state.fetch_sub(1, std::memory_order_release);
+            continue;
+        }
+        *out = slot.value;
+        slot.state.fetch_sub(1, std::memory_order_release);
+        return 0;
+    }
+    return LFM_STATUS_WOULD_BLOCK;
+}
+
+void flush_published(LfmSession *session) {
+    PlaybackPool *pool = &session->playback;
     for (uint32_t i = 0; i < pool->capacity; ++i) {
         PcmSlot &slot = pool->slots[i];
         uint32_t expected = SLOT_PUBLISHED;
         if (slot.state.compare_exchange_strong(expected, SLOT_RELEASING,
                                                std::memory_order_acq_rel,
                                                std::memory_order_acquire)) {
-            slot.reserved_frames = 0;
-            slot.channels = 0;
-            slot.sample_rate = 0;
-            slot.stream_epoch = 0;
-            slot.ticket = {};
-            slot.identity.store(0, std::memory_order_relaxed);
-            uint64_t generation = slot.generation.load(std::memory_order_relaxed);
-            if (generation == std::numeric_limits<uint64_t>::max()) {
-                slot.state.store(SLOT_RETIRED, std::memory_order_release);
-                continue;
-            }
-            slot.generation.store(generation + 1, std::memory_order_relaxed);
-            slot.state.store(SLOT_FREE, std::memory_order_release);
+            (void)finalize_slot(&slot, &session->playback_consumed);
         }
     }
 }
@@ -3178,7 +4096,17 @@ int drive_conversation_interrupt(LfmSession *session) {
 
 bool apply_epoch(LfmSession *session, uint64_t epoch) {
     const int rc = drive_conversation_interrupt(session);
-    if (rc == 0) return true;
+    if (rc == 0) {
+        /* This continuation owns available_cursor. Callback publication may
+         * have advanced the hardware cursor while its SPSC record is still
+         * pending; resetting to that producer cursor would jump over the FIFO
+         * head. Old-epoch records advance/reset themselves when drained. */
+        const uint64_t cursor = session->playback_policy.available_cursor;
+        const int reset = reset_playback_policy(session, cursor, true, false);
+        if (reset == 0) return true;
+        stage_error(session, reset, "native playback epoch reset failed");
+        return false;
+    }
     if (rc == -EINPROGRESS) return false;
     stage_error(session, rc, "native conversation interrupt failed");
     (void)epoch;
@@ -3205,14 +4133,17 @@ void process_capture_range(LfmSession *session,
     if (range.stream_epoch != current_epoch) {
         session->capture_stale.fetch_add(1, std::memory_order_relaxed);
         (void)release_capture_range(session, range);
-        (void)stage_turn(session, range.stream_epoch, range.ticket, 0, 0, 0,
-                         LFM_STATUS_STALE);
         return;
     }
     session->capture_consumed.fetch_add(1, std::memory_order_relaxed);
     if (session->dock_only) {
         (void)release_capture_range(session, range);
-        (void)stage_turn(session, current_epoch, range.ticket, 0, 0, 0);
+        const EventRecord records[2] = {
+            make_event(LFM_EVENT_TURN_STARTED, current_epoch, range.ticket,
+                       0, nullptr, 0),
+            make_turn(current_epoch, range.ticket, 0, 0, 0, 0),
+        };
+        (void)stage_results(session, records, 2);
         return;
     }
 
@@ -3223,19 +4154,17 @@ void process_capture_range(LfmSession *session,
         spans, &span_count);
     if (rc != 0) {
         (void)release_capture_range(session, range);
-        (void)stage_action_failure(session, current_epoch, range.ticket, rc,
-                                   "native capture range resolve failed");
+        stage_error(session, rc, "native capture range resolve failed");
         return;
     }
     SessionAction *action = prepare_action(
-        session, current_epoch, range.ticket);
+        session, current_epoch, range.ticket, true);
     if (!action) {
         (void)release_capture_range(session, range);
         return;
     }
     action->capture_range = range;
     action->capture_range_active = true;
-    action->announce_start = true;
     rc = lfm_conversation_begin_pcm_spans_submit_native(
         session->conversation, spans, span_count, range.sample_rate,
         &action->emission, route_notify, session, &action->admission);
@@ -3259,7 +4188,7 @@ void process_text(LfmSession *session, const TextCommand &command) {
         return;
     }
     SessionAction *action = prepare_action(
-        session, current_epoch, command.ticket);
+        session, current_epoch, command.ticket, false);
     if (!action) return;
     int rc = lfm_conversation_begin_text_submit_native(
         session->conversation, command.text, command.bytes,
@@ -3286,7 +4215,18 @@ enum SessionProgress : uint32_t {
 
 SessionProgress session_step(LfmSession *session) {
     uint32_t capture_budget = ACTION_CAPTURE_DRAIN_BUDGET;
+    uint32_t playback_budget = ACTION_PLAYBACK_EVIDENCE_DRAIN_BUDGET;
     for (uint32_t quantum = 0; quantum < SESSION_STEP_BUDGET; ++quantum) {
+        /* Playback evidence is an input to turn policy, not outward telemetry.
+         * Drain its callback-published metadata before any action, supervision,
+         * or microphone decision can observe a later state. */
+        const int playback = step_playback_policy(session, &playback_budget);
+        if (playback < 0) {
+            stage_error(session, playback,
+                        "native playback detector failed");
+            continue;
+        }
+        if (playback == PLAYBACK_POLICY_PROGRESS) continue;
         const int supervision = step_capture_supervision(session);
         if (supervision < 0) {
             stage_error(session, supervision,
@@ -3347,22 +4287,16 @@ SessionProgress session_step(LfmSession *session) {
 
         if (session->capture_supervision.device_loss_ready) {
             CaptureSupervision &capture = session->capture_supervision;
-            const bool turn = capture.device_loss_parent.sequence != 0;
-            const EventRecord disposition = turn
-                ? make_turn(capture.device_loss_epoch,
-                            capture.device_loss_parent, 0, 0, 0,
-                            LFM_STATUS_CANCELLED)
-                : make_event(LFM_EVENT_STATE, capture.device_loss_epoch,
-                             next_ticket(session, LFM_TICKET_CONTROL),
-                             LFM_STATUS_CANCELLED, "capture-device-lost",
-                             sizeof("capture-device-lost") - 1);
-            if (!stage_results(session, &disposition, 1)) {
-                request_stop(session, LFM_STATUS_INTERNAL);
-                continue;
-            }
+            const uint64_t epoch = capture.device_loss_epoch;
             capture.device_loss_ready = false;
             capture.device_loss_parent = {};
             capture.device_loss_epoch = 0;
+            static constexpr char lost[] = "capture-device-lost";
+            (void)stage_event(
+                session, LFM_EVENT_ERROR, epoch,
+                next_ticket(session, LFM_TICKET_CONTROL),
+                LFM_STATUS_CANCELLED, lost, sizeof(lost) - 1, 0, false,
+                LFM_STATUS_CANCELLED);
             continue;
         }
 
@@ -3458,8 +4392,6 @@ SessionProgress session_step(LfmSession *session) {
                 session->pending_range = {};
                 session->range_pending = false;
                 (void)release_capture_range(session, range);
-                (void)stage_turn(session, range.stream_epoch, range.ticket,
-                                 0, 0, 0, LFM_STATUS_CANCELLED);
                 continue;
             }
             TextCommand command{};
@@ -3471,8 +4403,6 @@ SessionProgress session_step(LfmSession *session) {
             CaptureRangeLease range{};
             if (take_capture_range(session, &range) == 0) {
                 (void)release_capture_range(session, range);
-                (void)stage_turn(session, range.stream_epoch, range.ticket,
-                                 0, 0, 0, LFM_STATUS_CANCELLED);
                 continue;
             }
             if (!session->dock_only) {
@@ -3487,7 +4417,19 @@ SessionProgress session_step(LfmSession *session) {
                         std::memory_order_acquire);
                 }
             }
-            flush_published(&session->playback);
+            if (!playback_evidence_empty(
+                    session->playback_policy.incoming)) {
+                return SESSION_READY;
+            }
+            const int playback_retired = retire_playback_history(session);
+            if (playback_retired != 0) {
+                int32_t expected = 0;
+                session->terminal_status.compare_exchange_strong(
+                    expected, playback_retired, std::memory_order_acq_rel,
+                    std::memory_order_acquire);
+                continue;
+            }
+            flush_published(session);
             const bool first_terminal = !session->event_done.exchange(
                 true, std::memory_order_acq_rel);
             if (first_terminal) (void)notify_delivery(session);
@@ -3501,6 +4443,8 @@ SessionProgress session_step(LfmSession *session) {
             if (session->chunk_producer.load(std::memory_order_acquire) ||
                 session->capture_producers.load(std::memory_order_acquire) != 0 ||
                 session->playback_consumers.load(std::memory_order_acquire) != 0 ||
+                session->playback_retained_observers.load(
+                    std::memory_order_acquire) != 0 ||
                 capture_range_live(session->capture_arena) != 0 ||
                 !capture_range_empty(session->capture_arena.ready) ||
                 pool_live(session->playback) != 0) {
@@ -3602,6 +4546,7 @@ SessionProgress session_step(LfmSession *session) {
 void coordinator_main(void *context) {
     LfmSession *session = static_cast<LfmSession *>(context);
     const SessionProgress progress = session_step(session);
+    publish_playback_policy_snapshot(session);
     publish_capture_supervision_snapshot(session);
     if (progress != SESSION_READY) return;
     const int status = kc_service_ready_again(session->coordinator);
@@ -3797,7 +4742,8 @@ int lfm_native_emission_needs_pcm(const LfmNativeEmission *emission) {
     return end ? 0 : 1;
 }
 
-int lfm_runtime_create(const LfmRuntimeConfigV1 *config, LfmRuntime **out) {
+static int runtime_create_impl(const LfmRuntimeConfigV1 *config,
+                               LfmRuntime **out, bool manual_deadlines) {
     if (!config || !out) return LFM_STATUS_INVALID_ARGUMENT;
     *out = nullptr;
     if (config->size != sizeof(*config) ||
@@ -3820,9 +4766,16 @@ int lfm_runtime_create(const LfmRuntimeConfigV1 *config, LfmRuntime **out) {
     runtime->kernel_lanes = config->kernel_lanes;
     runtime->event_capacity = config->event_capacity;
     runtime->session_capacity = config->session_capacity;
-    runtime->engine = lfm_engine_new(static_cast<int>(config->kernel_lanes));
+    runtime->manual_deadlines = manual_deadlines;
+    int engine_status = 0;
+    runtime->engine = manual_deadlines
+        ? lfm_internal_engine_new_manual_deadlines_for_test(
+              static_cast<int>(config->kernel_lanes))
+        : lfm_engine_new_status(static_cast<int>(config->kernel_lanes),
+                                &engine_status);
     if (!runtime->engine) {
         delete runtime;
+        if (engine_status == -ENOTSUP) return LFM_STATUS_UNSUPPORTED;
         return LFM_STATUS_OUT_OF_MEMORY;
     }
     const kc_runtime_config coordination = {
@@ -3839,6 +4792,18 @@ int lfm_runtime_create(const LfmRuntimeConfigV1 *config, LfmRuntime **out) {
     }
     *out = runtime;
     return 0;
+}
+
+int lfm_runtime_create(const LfmRuntimeConfigV1 *config, LfmRuntime **out) {
+    return runtime_create_impl(config, out, false);
+}
+
+/* Private deterministic construction for non-Apple lifecycle tests. The
+ * product ABI never exposes this symbol and production callers cannot select
+ * a clock that only advances under test control. */
+int lfm_internal_runtime_create_manual_deadlines_for_test(
+    const LfmRuntimeConfigV1 *config, LfmRuntime **out) {
+    return runtime_create_impl(config, out, true);
 }
 
 int lfm_runtime_start(LfmRuntime *runtime) {
@@ -4074,12 +5039,14 @@ int lfm_session_create(LfmRuntime *runtime, LfmModel *model,
     }
     const bool dock_only =
         (config->flags & LFM_SESSION_FLAG_DOCK_ONLY) != 0;
-    const bool manual_deadlines =
+    const bool requested_manual_deadlines =
         (config->flags & LFM_SESSION_FLAG_MANUAL_DEADLINES) != 0;
+    const bool manual_deadlines =
+        runtime->manual_deadlines || requested_manual_deadlines;
     if (runtime->state.load(std::memory_order_acquire) >= LFM_RUNTIME_STOPPING ||
         (config->flags & ~(LFM_SESSION_FLAG_DOCK_ONLY |
                            LFM_SESSION_FLAG_MANUAL_DEADLINES)) != 0 ||
-        (manual_deadlines && !dock_only) ||
+        (requested_manual_deadlines && !dock_only) ||
         config->playback_slots == 0 || config->playback_slots > MAX_PCM_SLOTS ||
         config->capture_max_callback_frames == 0 ||
         (dock_only && config->playback_frames_per_slot == 0) ||
@@ -4161,7 +5128,6 @@ int lfm_session_create(LfmRuntime *runtime, LfmModel *model,
         playback_samples > UINT32_MAX / sizeof(float)) {
         return LFM_STATUS_INVALID_ARGUMENT;
     }
-
     LfmSession *session = new (std::nothrow) LfmSession();
     if (!session) return LFM_STATUS_OUT_OF_MEMORY;
     session->runtime = runtime;
@@ -4194,9 +5160,17 @@ int lfm_session_create(LfmRuntime *runtime, LfmModel *model,
     session->capture_chunks.records =
         new (std::nothrow) LfmCaptureChunkV1[CAPTURE_CHUNK_CAPACITY];
     session->capture_chunks.capacity = CAPTURE_CHUNK_CAPACITY;
+    session->playback_policy.incoming.records =
+        new (std::nothrow) PlaybackEvidenceRecord[PLAYBACK_EVIDENCE_CAPACITY];
+    session->playback_policy.incoming.capacity = PLAYBACK_EVIDENCE_CAPACITY;
+    session->playback_policy.history.records =
+        new (std::nothrow) PlaybackEvidenceRecord[PLAYBACK_EVIDENCE_CAPACITY];
+    session->playback_policy.history.capacity = PLAYBACK_EVIDENCE_CAPACITY;
     int rc = session->events.records && session->commands.ring &&
                      session->capture_arena.samples &&
-                     session->capture_chunks.records
+                     session->capture_chunks.records &&
+                     session->playback_policy.incoming.records &&
+                     session->playback_policy.history.records
                  ? 0
                  : LFM_STATUS_OUT_OF_MEMORY;
     if (rc == 0) {
@@ -4204,6 +5178,16 @@ int lfm_session_create(LfmRuntime *runtime, LfmModel *model,
             session->capture_rate, &session->capture_policy.detector);
     }
     if (rc == 0) reset_capture_policy(session, 0, false);
+    if (rc == 0) {
+        rc = lfm_sesame_detector_create(
+            session->playback_rate, &session->playback_policy.detector);
+    }
+    if (rc == 0 &&
+        !advance_playback_cadence(&session->playback_policy,
+                                  session->playback_rate)) {
+        rc = -EOVERFLOW;
+    }
+    if (rc == 0) publish_playback_policy_snapshot(session);
     if (rc == 0) {
         for (uint32_t index = 0; index < config->command_capacity; ++index) {
             session->commands.ring[index].sequence.store(
@@ -4574,6 +5558,16 @@ int lfm_session_capture_policy_snapshot(
         .reserved = {},
     };
     return 0;
+}
+
+int lfm_session_playback_policy_snapshot(
+    const LfmSession *session, LfmPlaybackPolicySnapshotV1 *out) {
+    if (!session || !out) return LFM_STATUS_INVALID_ARGUMENT;
+    if (out->size != sizeof(*out) ||
+        out->abi_version != LFM_RUNTIME_ABI_VERSION) {
+        return LFM_STATUS_ABI_MISMATCH;
+    }
+    return read_playback_policy_snapshot(session, out);
 }
 
 int lfm_session_capture_supervision_snapshot(
@@ -5068,8 +6062,10 @@ int lfm_capture_producer_destroy(LfmCaptureProducer *producer) {
         session->capture_producers.store(0, std::memory_order_release);
         session->retired_chunk_producer = producer;
     }
-    session->capture_supervision.device_loss_pending.store(
-        true, std::memory_order_release);
+    if (!session->stop.load(std::memory_order_acquire)) {
+        session->capture_supervision.device_loss_pending.store(
+            true, std::memory_order_release);
+    }
     /* The hardware endpoint is now disconnected, so Rust may drop its opaque
      * handle. Native session ownership remains until the coordinator drains
      * every publication admitted before `closing`, retires the endpoint, and
@@ -5105,6 +6101,50 @@ int lfm_playback_consumer_create(LfmSession *session,
     consumer->session = session;
     *out = consumer;
     return 0;
+}
+
+int lfm_session_publish_playback_f32_test(LfmSession *session,
+                                          const float *samples,
+                                          uint32_t frames,
+                                          LfmPcmLeaseV1 *out) {
+    if (!session || !samples || !out || !session->dock_only || frames == 0 ||
+        frames > session->playback_frames) {
+        return LFM_STATUS_INVALID_ARGUMENT;
+    }
+    LfmPcmLeaseV1 lease{};
+    int status = playback_reserve(session, frames, session->playback_rate,
+                                  &lease);
+    if (status != 0) return status;
+    float *destination = nullptr;
+    size_t capacity = 0;
+    status = playback_resolve_mut(session, &lease, &destination, &capacity);
+    if (status != 0 || !destination || capacity < frames) {
+        (void)playback_release(session, &lease);
+        return status == 0 ? LFM_STATUS_INTERNAL : status;
+    }
+    std::memcpy(destination, samples, static_cast<size_t>(frames) *
+                                      sizeof(float));
+    lease.ticket = next_ticket(session, LFM_TICKET_TURN);
+    status = playback_publish(session, &lease);
+    if (status != 0) {
+        (void)playback_release(session, &lease);
+        return status;
+    }
+    *out = lease;
+    return 0;
+}
+
+int lfm_internal_session_release_unpublished_playback_for_test(
+    LfmSession *session, uint32_t frames) {
+    if (!session || !session->dock_only || frames == 0 ||
+        frames > session->playback_frames) {
+        return LFM_STATUS_INVALID_ARGUMENT;
+    }
+    LfmPcmLeaseV1 lease{};
+    const int status = playback_reserve(session, frames,
+                                        session->playback_rate, &lease);
+    if (status != 0) return status;
+    return playback_release(session, &lease);
 }
 
 int lfm_playback_consumer_claim(LfmPlaybackConsumer *consumer,
@@ -5146,20 +6186,52 @@ int lfm_playback_consumer_claim(LfmPlaybackConsumer *consumer,
         if (release != 0) return release;
         return LFM_STATUS_STALE;
     }
-    consumer->session->playback_consumed.fetch_add(
-        1, std::memory_order_relaxed);
     consumer->lease = lease;
+    consumer->lineage = lease;
     consumer->active = true;
     return 0;
 }
 
-int lfm_playback_consumer_resolve(const LfmPlaybackConsumer *consumer,
+int lfm_playback_consumer_render_f32(
+    LfmPlaybackConsumer *consumer, const LfmPcmLeaseV1 *lease,
+    uint32_t source_offset_frames, float *destination, uint32_t frames,
+    uint32_t channels, size_t destination_capacity,
+    LfmPlaybackRenderV1 *out) {
+    return render_playback_evidence(
+        consumer, lease, source_offset_frames, destination, frames, channels,
+        destination_capacity, fanout_f32_erased, out);
+}
+
+int lfm_playback_consumer_render_i16(
+    LfmPlaybackConsumer *consumer, const LfmPcmLeaseV1 *lease,
+    uint32_t source_offset_frames, int16_t *destination, uint32_t frames,
+    uint32_t channels, size_t destination_capacity,
+    LfmPlaybackRenderV1 *out) {
+    return render_playback_evidence(
+        consumer, lease, source_offset_frames, destination, frames, channels,
+        destination_capacity, fanout_i16_erased, out);
+}
+
+int lfm_playback_consumer_render_u16(
+    LfmPlaybackConsumer *consumer, const LfmPcmLeaseV1 *lease,
+    uint32_t source_offset_frames, uint16_t *destination, uint32_t frames,
+    uint32_t channels, size_t destination_capacity,
+    LfmPlaybackRenderV1 *out) {
+    return render_playback_evidence(
+        consumer, lease, source_offset_frames, destination, frames, channels,
+        destination_capacity, fanout_u16_erased, out);
+}
+
+int lfm_playback_consumer_observe(LfmPlaybackConsumer *consumer,
                                   const LfmPcmLeaseV1 *lease,
-                                  const float **out_samples,
-                                  size_t *out_sample_count) {
-    if (!consumer_matches(consumer, lease)) return LFM_STATUS_STALE;
-    return playback_resolve(consumer->session, lease, out_samples,
-                            out_sample_count);
+                                  uint32_t source_offset_frames,
+                                  uint32_t frames, uint32_t flags,
+                                  LfmPlaybackRenderV1 *out) {
+    if ((flags & LFM_PLAYBACK_EVIDENCE_RENDERED) != 0) {
+        return LFM_STATUS_INVALID_ARGUMENT;
+    }
+    return publish_playback_evidence(consumer, lease, source_offset_frames,
+                                     frames, flags, out);
 }
 
 int lfm_playback_consumer_release(LfmPlaybackConsumer *consumer,
@@ -5184,10 +6256,20 @@ int lfm_playback_consumer_destroy(LfmPlaybackConsumer *consumer) {
             std::abort();
         }
         session->playback_consumers.store(0, std::memory_order_release);
+        /* A live playback endpoint is a lifetime lease over the physical
+         * sink. Losing it is terminal: allowing the native route to keep
+         * producing would only fill the fixed pool and leave the session
+         * dormant with no callback capable of draining it. Administrative
+         * teardown sets stop while holding this same lifecycle lock first, so
+         * it remains a clean close rather than forging a device-loss fault. */
+        if (!session->stop.load(std::memory_order_acquire)) {
+            request_stop(session, LFM_STATUS_HOST_SINK);
+        } else {
+            notify_session(session);
+        }
+        consumer->session = nullptr;
     }
-    consumer->session = nullptr;
     delete consumer;
-    notify_session(session);
     return 0;
 }
 
@@ -5350,7 +6432,8 @@ int playback_release(LfmSession *session, const LfmPcmLeaseV1 *lease) {
     PlaybackPool *pool = &session->playback;
     const uint32_t allowed = (UINT32_C(1) << SLOT_RESERVED) |
                              (UINT32_C(1) << SLOT_CONSUMING);
-    const int status = release_slot(pool, lease, allowed);
+    const int status = release_slot(pool, lease,
+                                    &session->playback_consumed, allowed);
     /* Playback retirement is the sole successor edge after the coordinator
      * observed a live device lease and became dormant. */
     if (status == 0) notify_session(session);

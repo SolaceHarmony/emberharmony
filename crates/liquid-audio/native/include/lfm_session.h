@@ -107,6 +107,9 @@ typedef struct LfmSessionSnapshotV1 {
     uint64_t callbacks_entered;
     uint64_t capture_consumed;
     uint64_t capture_stale;
+    /* Published counts leases admitted to the device FIFO. Consumed counts
+     * those same published leases after both the device and native observers
+     * retire; an unused reservation belongs to neither counter. */
     uint64_t playback_published;
     uint64_t playback_consumed;
     uint64_t text_commands_accepted;

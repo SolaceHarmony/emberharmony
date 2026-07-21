@@ -1,4 +1,5 @@
 #include "lfm_tokenizer.h"
+#include "lfm_payload_reader.h"
 
 #include <algorithm>
 #include <array>
@@ -40,7 +41,11 @@ void set_error(char *error, size_t length, const char *message) {
     std::snprintf(error, length, "%s", message ? message : "tokenizer error");
 }
 
-Json read_json(const char *path) {
+Json read_json(const char *path, const LfmPayloadReadOwner *owner) {
+    LfmPayloadReadScope scope(owner, LFM_MODEL_PAYLOAD_READ_TOKENIZER);
+    if (scope.status() != 0) {
+        fail(scope.status(), "tokenizer read rejected by its model owner");
+    }
     std::unique_ptr<std::FILE, decltype(&std::fclose)> file(
         std::fopen(path, "rb"), &std::fclose);
     if (!file) fail(-ENOENT, std::string("cannot open tokenizer '") + path + "'");
@@ -49,7 +54,12 @@ Json read_json(const char *path) {
     if (end <= 0 || end > 128 * 1024 * 1024L) fail(-EFBIG, "invalid tokenizer size");
     std::rewind(file.get());
     std::vector<char> bytes((size_t)end);
-    if (std::fread(bytes.data(), 1, bytes.size(), file.get()) != bytes.size()) {
+    const size_t count =
+        std::fread(bytes.data(), 1, bytes.size(), file.get());
+    const int status = scope.record(LFM_MODEL_PAYLOAD_READ_TOKENIZER,
+                                    (uint64_t)count);
+    if (status != 0) fail(status, "cannot account tokenizer read");
+    if (count != bytes.size()) {
         fail(-EIO, "cannot read tokenizer");
     }
     try {
@@ -629,12 +639,14 @@ int decode_token(const LfmTokenizer &tokenizer, uint32_t token,
 
 } // namespace
 
-extern "C" int lfm_tokenizer_open(const char *path, LfmTokenizer **out,
-                                   char *error, size_t error_length) {
+static int tokenizer_open(const char *path,
+                          const LfmPayloadReadOwner *owner,
+                          LfmTokenizer **out, char *error,
+                          size_t error_length) {
     if (!path || !out) return -EINVAL;
     *out = nullptr;
     try {
-        const Json document = read_json(path);
+        const Json document = read_json(path, owner);
         /* This tokenizer builds BPE merges only; any other model type would be
          * decoded as if it were BPE, so it is refused rather than mis-decoded. */
         if (!document.is_object() || !document.contains("model") ||
@@ -743,6 +755,19 @@ extern "C" int lfm_tokenizer_open(const char *path, LfmTokenizer **out,
         set_error(error, error_length, exception.what());
         return -EINVAL;
     }
+}
+
+extern "C" int lfm_tokenizer_open(const char *path, LfmTokenizer **out,
+                                   char *error, size_t error_length) {
+    return tokenizer_open(path, nullptr, out, error, error_length);
+}
+
+int lfm_tokenizer_open_owned(const char *path,
+                             const LfmPayloadReadOwner *owner,
+                             LfmTokenizer **out, char *error,
+                             size_t error_length) {
+    if (!owner) return -EINVAL;
+    return tokenizer_open(path, owner, out, error, error_length);
 }
 
 extern "C" void lfm_tokenizer_close(LfmTokenizer *tokenizer) { delete tokenizer; }

@@ -28,6 +28,7 @@ typedef enum LfmStatusV1 {
     LFM_STATUS_ABI_MISMATCH = -1001,
     LFM_STATUS_HOST_SINK = -1002,
     LFM_STATUS_INTERNAL = -1003,
+    LFM_STATUS_UNSUPPORTED = -1004,
 } LfmStatusV1;
 
 typedef kc_ticket_id LfmTicketIdV1;

@@ -6,6 +6,7 @@
 // kernels receive immutable pointers into one process-long aligned image.
 
 #include "lfm_safetensors.h"
+#include "lfm_payload_reader.h"
 
 #include <algorithm>
 #include <atomic>
@@ -573,7 +574,8 @@ struct ReadTestHook {
 
 ReadSummary read_sources(const std::vector<OpenFile> &files, uint8_t *image,
                          const std::vector<Source> &sources,
-                         size_t worker_limit, ReadTestHook *test) {
+                         size_t worker_limit, ReadTestHook *test,
+                         const LfmPayloadReadScope *accounting = nullptr) {
     std::vector<ReadTask> tasks;
     for (size_t source = 0; source < sources.size(); ++source) {
         for (size_t offset = 0; offset < sources[source].bytes;) {
@@ -640,6 +642,15 @@ ReadSummary read_sources(const std::vector<OpenFile> &files, uint8_t *image,
                         }
                         files[task.source].read_at(task.destination, task.bytes,
                                                    task.offset, event);
+                        if (accounting) {
+                            const int status = accounting->record(
+                                LFM_MODEL_PAYLOAD_READ_WEIGHT_IMAGE,
+                                (uint64_t)task.bytes);
+                            if (status != 0) {
+                                fail(status,
+                                     "cannot account safetensors read task");
+                            }
+                        }
                     } catch (...) {
                         task.error = std::current_exception();
                     }
@@ -697,7 +708,8 @@ ReadSummary read_sources(const std::vector<OpenFile> &files, uint8_t *image,
     return {static_cast<uint32_t>(tasks.size()), static_cast<uint32_t>(count)};
 }
 
-void read_small_file_exact(const fs::path &path, uint8_t *data, size_t bytes) {
+void read_small_file_exact(const fs::path &path, uint8_t *data, size_t bytes,
+                           const LfmPayloadReadScope *accounting = nullptr) {
     const std::string native = path.string();
     std::unique_ptr<std::FILE, decltype(&std::fclose)> file(
         std::fopen(native.c_str(), "rb"), &std::fclose);
@@ -727,16 +739,25 @@ void read_small_file_exact(const fs::path &path, uint8_t *data, size_t bytes) {
         fail(LFM_WEIGHT_IO_ERROR,
              "EOF check failed for '" + native + "': " + std::strerror(errno));
     }
+    if (accounting) {
+        const int status = accounting->record(
+            LFM_MODEL_PAYLOAD_READ_WEIGHT_INDEX, (uint64_t)bytes);
+        if (status != 0) {
+            fail(status, "cannot account checkpoint index read");
+        }
+    }
 }
 
-std::vector<uint8_t> read_small_file(const fs::path &path) {
+std::vector<uint8_t> read_small_file(
+    const fs::path &path,
+    const LfmPayloadReadScope *accounting = nullptr) {
     const size_t bytes = weight_file_size(path);
     if (bytes > kMaxHeaderBytes) {
         fail(LFM_WEIGHT_FORMAT_ERROR,
              "JSON index exceeds the 100 MB safety limit: '" + path.string() + "'");
     }
     std::vector<uint8_t> data(bytes);
-    read_small_file_exact(path, data.data(), data.size());
+    read_small_file_exact(path, data.data(), data.size(), accounting);
     return data;
 }
 
@@ -772,8 +793,9 @@ std::string safe_shard_name(const std::string &name) {
     return path.lexically_normal().generic_string();
 }
 
-Resolved resolve_index(const fs::path &index_path, uint32_t component) {
-    const auto bytes = read_small_file(index_path);
+Resolved resolve_index(const fs::path &index_path, uint32_t component,
+                       const LfmPayloadReadScope *accounting = nullptr) {
+    const auto bytes = read_small_file(index_path, accounting);
     const Json root = parse_json(bytes.data(), bytes.size(), index_path.string());
     if (!root.is_object() || !root.contains("weight_map") ||
         !root.at("weight_map").is_object()) {
@@ -808,11 +830,12 @@ Resolved resolve_index(const fs::path &index_path, uint32_t component) {
     return resolved;
 }
 
-Resolved resolve_path(const fs::path &path, uint32_t component) {
+Resolved resolve_path(const fs::path &path, uint32_t component,
+                      const LfmPayloadReadScope *accounting = nullptr) {
     std::error_code error;
     if (fs::is_regular_file(path, error)) {
         if (path.filename().string().ends_with(".safetensors.index.json")) {
-            return resolve_index(path, component);
+            return resolve_index(path, component, accounting);
         }
         return Resolved{{Source{path, path.filename().generic_string(), 0, 0, component}}, {}};
     }
@@ -825,7 +848,9 @@ Resolved resolve_path(const fs::path &path, uint32_t component) {
     }
 
     const fs::path index = path / "model.safetensors.index.json";
-    if (fs::is_regular_file(index, error)) return resolve_index(index, component);
+    if (fs::is_regular_file(index, error)) {
+        return resolve_index(index, component, accounting);
+    }
     error.clear();
 
     const fs::path single = path / "model.safetensors";
@@ -1017,8 +1042,9 @@ void parse_shard(LfmWeightImage &image, uint32_t shard) {
     }
 }
 
-std::unique_ptr<LfmWeightImage> load(Resolved resolved,
-                                     LoadOptions options = {}) {
+std::unique_ptr<LfmWeightImage> load(
+    Resolved resolved, LoadOptions options = {},
+    const LfmPayloadReadScope *accounting = nullptr) {
     if (resolved.sources.empty()) {
         fail(LFM_WEIGHT_INVALID_ARGUMENT, "no safetensors sources were provided");
     }
@@ -1068,7 +1094,7 @@ std::unique_ptr<LfmWeightImage> load(Resolved resolved,
 
     const ReadSummary summary = read_sources(files, image->storage.data(),
                                              image->sources, options.workers,
-                                             options.test);
+                                             options.test, accounting);
     files.clear();
     image->source_bytes = source_bytes;
     image->task_count = summary.tasks;
@@ -1148,16 +1174,39 @@ int open_c(Open &&open, LfmWeightImage **out, char *err, size_t errlen) {
 
 } // namespace
 
-extern "C" int lfm_weights_open(const char *path, LfmWeightImage **out,
-                                char *err, size_t errlen) {
+static int weights_open(const char *path, const LfmPayloadReadOwner *owner,
+                        LfmWeightImage **out, char *err, size_t errlen) {
     if (!path || path[0] == '\0') {
         if (out) *out = nullptr;
         set_error(err, errlen, "empty weight path");
         return LFM_WEIGHT_INVALID_ARGUMENT;
     }
     return open_c(
-        [&] { return load(resolve_path(fs::path(path), LFM_WEIGHT_COMPONENT_MAIN)); },
+        [&] {
+            LfmPayloadReadScope scope(
+                owner, LFM_MODEL_PAYLOAD_READ_WEIGHT_IMAGE |
+                           LFM_MODEL_PAYLOAD_READ_WEIGHT_INDEX);
+            if (scope.status() != 0) {
+                fail(scope.status(),
+                     "weight-image read rejected by its model owner");
+            }
+            return load(resolve_path(fs::path(path),
+                                     LFM_WEIGHT_COMPONENT_MAIN, &scope),
+                        {}, &scope);
+        },
         out, err, errlen);
+}
+
+extern "C" int lfm_weights_open(const char *path, LfmWeightImage **out,
+                                char *err, size_t errlen) {
+    return weights_open(path, nullptr, out, err, errlen);
+}
+
+int lfm_weights_open_owned(const char *path,
+                           const LfmPayloadReadOwner *owner,
+                           LfmWeightImage **out, char *err, size_t errlen) {
+    if (!owner) return LFM_WEIGHT_INVALID_ARGUMENT;
+    return weights_open(path, owner, out, err, errlen);
 }
 
 extern "C" int lfm_weights_open_files(const char *const *paths, size_t count,
@@ -1186,10 +1235,10 @@ extern "C" int lfm_weights_open_files(const char *const *paths, size_t count,
         out, err, errlen);
 }
 
-extern "C" int lfm_weights_open_bundle(const char *main_path,
-                                         const char *codec_path,
-                                         LfmWeightImage **out, char *err,
-                                         size_t errlen) {
+static int weights_open_bundle(const char *main_path, const char *codec_path,
+                               const LfmPayloadReadOwner *owner,
+                               LfmWeightImage **out, char *err,
+                               size_t errlen) {
     if (!main_path || main_path[0] == '\0' || !codec_path || codec_path[0] == '\0') {
         if (out) *out = nullptr;
         set_error(err, errlen, "empty main or codec weight path");
@@ -1197,16 +1246,43 @@ extern "C" int lfm_weights_open_bundle(const char *main_path,
     }
     return open_c(
         [&] {
+            LfmPayloadReadScope scope(
+                owner, LFM_MODEL_PAYLOAD_READ_WEIGHT_IMAGE |
+                           LFM_MODEL_PAYLOAD_READ_WEIGHT_INDEX);
+            if (scope.status() != 0) {
+                fail(scope.status(),
+                     "weight-bundle read rejected by its model owner");
+            }
             Resolved resolved;
             append_resolved(
                 resolved,
-                resolve_path(fs::path(main_path), LFM_WEIGHT_COMPONENT_MAIN));
+                resolve_path(fs::path(main_path), LFM_WEIGHT_COMPONENT_MAIN,
+                             &scope));
             append_resolved(
                 resolved,
-                resolve_path(fs::path(codec_path), LFM_WEIGHT_COMPONENT_CODEC));
-            return load(std::move(resolved));
+                resolve_path(fs::path(codec_path), LFM_WEIGHT_COMPONENT_CODEC,
+                             &scope));
+            return load(std::move(resolved), {}, &scope);
         },
         out, err, errlen);
+}
+
+extern "C" int lfm_weights_open_bundle(const char *main_path,
+                                        const char *codec_path,
+                                        LfmWeightImage **out, char *err,
+                                        size_t errlen) {
+    return weights_open_bundle(main_path, codec_path, nullptr, out, err,
+                               errlen);
+}
+
+int lfm_weights_open_bundle_owned(const char *main_path,
+                                  const char *codec_path,
+                                  const LfmPayloadReadOwner *owner,
+                                  LfmWeightImage **out, char *err,
+                                  size_t errlen) {
+    if (!owner) return LFM_WEIGHT_INVALID_ARGUMENT;
+    return weights_open_bundle(main_path, codec_path, owner, out, err,
+                               errlen);
 }
 
 /* Deliberately absent from the installed header: the load benchmark needs to

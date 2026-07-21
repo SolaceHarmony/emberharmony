@@ -17,6 +17,7 @@ typedef struct MimiDecodeState MimiDecodeState;
 enum {
     LFM_MIMI_CODEBOOKS = 8,
     LFM_MIMI_CODE_VALUES = 2048,
+    LFM_MIMI_SAMPLE_RATE = 24000,
     LFM_MIMI_FRAME_SAMPLES = 1920,
     LFM_MIMI_PCM_CAPACITY = 3840,
 };

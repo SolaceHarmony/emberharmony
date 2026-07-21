@@ -1,5 +1,6 @@
-// Native Conformer encoder + audio adapter ABI. Replaces the Rust/Candle
-// owners in src/model/conformer/* and the adapter's former Candle path.
+// Native production Conformer encoder + audio adapter ABI. The deleted
+// Rust/Candle implementation survives only as an offline oracle, never as a
+// linked fallback.
 //
 // Execution: one segment is one retained Flashkern ticket. Every fixed-team
 // final return advances a ticket-owned program cursor and eagerly dispatches
@@ -51,12 +52,16 @@ typedef struct LfmConformerGeometry {
     uint64_t reserved[4];
 } LfmConformerGeometry;
 
-// Binds every encoder/adapter weight as views into the resident safetensors
-// image (the same image the model owns; no duplicate bytes, no name lookups
-// after this call). `weights` is the LfmWeights handle from lfm_weights_open.
-// `engine` is the resident Flashkern engine (lfm_engine_new) whose lane team
-// executes segment passes. Returns 0; -EINVAL on nulls/bad geometry; -ENOENT
-// with `error` filled when a required weight field is missing or mis-shaped.
+// Binds every encoder/adapter weight as byte views into the resident
+// safetensors image (the same image the model owns; no duplicate bytes, no
+// name lookups after this call). A view may be unaligned; kernels load it by
+// bytes rather than exposing a dereferenceable aligned weight pointer.
+// `weights` is the native model's private LfmWeightImage handle. `engine` is
+// the runtime-owned Flashkern engine created internally by
+// lfm_engine_new_status through lfm_runtime_create; the engine constructor and
+// weight image are not exposed to product Rust. Returns 0; -EINVAL on nulls/bad
+// geometry; -ENOENT with `error` filled when a required weight field is
+// missing or mis-shaped.
 LFM_ORACLE_API int lfm_conformer_create(
     void *engine, const void *weights, const LfmConformerGeometry *geometry,
     LfmConformer **out, char *error, size_t error_length);
@@ -66,9 +71,9 @@ LFM_ORACLE_API int lfm_conformer_destroy(LfmConformer *conformer);
 // derived tables (BN denominators and relative-position frequencies). Bound
 // checkpoint bytes remain views into the owner image. Materialized bytes must
 // remain zero for every forward. `direct_gemm_calls` counts logical linear
-// operations (a cache-bounded compatibility rim may currently issue multiple
-// fixed-team accumulator tiles for one operation); it is an execution witness
-// for steady-state tests, not a physical-dispatch counter.
+// operations (fixed-team execution may issue multiple accumulator tiles for
+// one operation); it is an execution witness for steady-state tests, not a
+// physical-dispatch counter.
 LFM_ORACLE_API uint64_t
 lfm_conformer_bound_weight_bytes(const LfmConformer *conformer);
 LFM_ORACLE_API uint64_t
@@ -89,8 +94,8 @@ LFM_ORACLE_API int lfm_conformer_workspace_reserve(
     const LfmConformer *conformer, LfmConformerWorkspace *workspace,
     uint64_t max_mel_frames);
 
-// Output rows for a mel segment of `mel_frames`: the dw_striding length chain
-// (three k3/s2/p1 stages), matching the Rust calc_length/mel2emb_len contract.
+// Output rows for a mel segment of `mel_frames`: the pinned dw_striding length
+// chain (three k3/s2/p1 stages), checked against the offline reference fixtures.
 LFM_ORACLE_API uint64_t
 lfm_conformer_out_rows(const LfmConformer *conformer, uint64_t mel_frames);
 LFM_ORACLE_API uint64_t

@@ -8,6 +8,7 @@
 #include "lfm_frontend.h"
 #include "lfm_mimi.h"
 #include "lfm_model_plan.h"
+#include "lfm_payload_reader.h"
 #include "lfm_safetensors.h"
 #include "lfm_tokenizer.h"
 #include "lfm_types.h"
@@ -39,6 +40,174 @@ extern "C" void lfm_f32_to_bf16(const float *input, uint16_t *output, int count)
 
 namespace {
 
+static_assert(std::atomic<uint64_t>::is_always_lock_free);
+static_assert(std::atomic<uint32_t>::is_always_lock_free);
+
+int add_counter(std::atomic<uint64_t> *counter, uint64_t value) {
+    uint64_t current = counter->load(std::memory_order_relaxed);
+    for (;;) {
+        if (value > UINT64_MAX - current) return -EOVERFLOW;
+        if (counter->compare_exchange_weak(current, current + value,
+                                           std::memory_order_relaxed,
+                                           std::memory_order_relaxed)) {
+            return 0;
+        }
+    }
+}
+
+enum class WeightKind : uint32_t {
+    Bound,
+    Derived,
+    Materialized,
+    Compatibility,
+};
+
+/* One ledger belongs to one model construction. Publication is a one-way
+ * generation transition. Setup callers are construction-exclusive; after the
+ * transition, the fixed atomics only record and reject forbidden attempts. */
+struct ModelAccounting {
+    static constexpr uint64_t kPublished = uint64_t{1} << 63;
+
+    std::atomic<uint64_t> publication_generation{0};
+    std::atomic<uint64_t> read_state{0};
+    std::atomic<uint64_t> payload_read_calls{0};
+    std::atomic<uint64_t> payload_read_bytes{0};
+    std::atomic<uint64_t> post_publication_read_calls{0};
+    std::atomic<uint64_t> post_publication_read_bytes{0};
+    std::atomic<uint64_t> directly_bound_bytes{0};
+    std::atomic<uint64_t> derived_immutable_bytes{0};
+    std::atomic<uint64_t> materialized_weight_bytes{0};
+    std::atomic<uint64_t> compatibility_copied_bytes{0};
+    std::atomic<uint64_t> post_publication_materialization_attempts{0};
+    std::atomic<uint64_t> post_publication_materialization_bytes{0};
+    std::atomic<uint32_t> payload_read_coverage{0};
+    std::atomic<uint32_t> installed_sources{0};
+    std::atomic<uint32_t> flags{0};
+
+    int reject_payload(uint64_t bytes) {
+        int status = add_counter(&post_publication_read_calls, 1);
+        if (status != 0) return status;
+        status = add_counter(&post_publication_read_bytes, bytes);
+        return status == 0 ? -EPERM : status;
+    }
+
+    int begin_payload(uint32_t declared, uint64_t attempted_bytes) {
+        uint64_t state = read_state.load(std::memory_order_acquire);
+        for (;;) {
+            if ((state & kPublished) != 0) {
+                return reject_payload(attempted_bytes);
+            }
+            if (state == kPublished - 1) return -EOVERFLOW;
+            if (read_state.compare_exchange_weak(
+                    state, state + 1, std::memory_order_acquire,
+                    std::memory_order_relaxed)) {
+                installed_sources.fetch_or(declared,
+                                           std::memory_order_relaxed);
+                return 0;
+            }
+        }
+    }
+
+    int record_payload(uint32_t source, uint64_t bytes) {
+        if (source == 0 || (source & (source - 1)) != 0 ||
+            (source & (LFM_MODEL_PAYLOAD_READ_CONFIG |
+                       LFM_MODEL_PAYLOAD_READ_WEIGHT_IMAGE |
+                       LFM_MODEL_PAYLOAD_READ_WEIGHT_INDEX |
+                       LFM_MODEL_PAYLOAD_READ_TOKENIZER)) == 0) {
+            return -EINVAL;
+        }
+        const uint64_t state = read_state.load(std::memory_order_acquire);
+        if (state == 0 || (state & kPublished) != 0) return -EPERM;
+        int status = add_counter(&payload_read_calls, 1);
+        if (status != 0) return status;
+        status = add_counter(&payload_read_bytes, bytes);
+        if (status != 0) return status;
+        payload_read_coverage.fetch_or(source, std::memory_order_relaxed);
+        return 0;
+    }
+
+    void end_payload() {
+        const uint64_t previous =
+            read_state.fetch_sub(1, std::memory_order_release);
+        (void)previous;
+    }
+
+    static int begin_payload(void *context, uint32_t declared,
+                             uint64_t attempted_bytes) {
+        return static_cast<ModelAccounting *>(context)->begin_payload(
+            declared, attempted_bytes);
+    }
+
+    static int record_payload(void *context, uint32_t source,
+                              uint64_t bytes) {
+        return static_cast<ModelAccounting *>(context)->record_payload(source,
+                                                                        bytes);
+    }
+
+    static void end_payload(void *context) {
+        static_cast<ModelAccounting *>(context)->end_payload();
+    }
+
+    LfmPayloadReadOwner reader() {
+        return {
+            .context = this,
+            .begin = &ModelAccounting::begin_payload,
+            .record = &ModelAccounting::record_payload,
+            .end = &ModelAccounting::end_payload,
+        };
+    }
+
+    int weight(WeightKind kind, uint64_t bytes) {
+        if (publication_generation.load(std::memory_order_acquire) != 0) {
+            if (kind == WeightKind::Materialized ||
+                kind == WeightKind::Compatibility) {
+                int status = add_counter(
+                    &post_publication_materialization_attempts, 1);
+                if (status != 0) return status;
+                status = add_counter(&post_publication_materialization_bytes,
+                                     bytes);
+                if (status != 0) return status;
+            }
+            return -EPERM;
+        }
+        if (kind == WeightKind::Bound) {
+            return add_counter(&directly_bound_bytes, bytes);
+        }
+        if (kind == WeightKind::Derived) {
+            return add_counter(&derived_immutable_bytes, bytes);
+        }
+        int status = add_counter(&materialized_weight_bytes, bytes);
+        if (status != 0 || kind == WeightKind::Materialized) return status;
+        return add_counter(&compatibility_copied_bytes, bytes);
+    }
+
+    int weight_policy() const {
+        if (materialized_weight_bytes.load(std::memory_order_acquire) != 0 ||
+            compatibility_copied_bytes.load(std::memory_order_acquire) != 0) {
+            return -EINVAL;
+        }
+        return 0;
+    }
+
+    int publish(uint32_t required_sources) {
+        const uint32_t installed =
+            installed_sources.load(std::memory_order_acquire);
+        if ((installed & required_sources) != required_sources) {
+            return -ENODATA;
+        }
+        uint64_t expected = 0;
+        if (!read_state.compare_exchange_strong(
+                expected, kPublished, std::memory_order_acq_rel,
+                std::memory_order_relaxed)) {
+            return (expected & kPublished) != 0 ? -EALREADY : -EBUSY;
+        }
+        flags.fetch_or(LFM_MODEL_ACCOUNTING_PAYLOAD_READS_COMPLETE,
+                       std::memory_order_relaxed);
+        publication_generation.store(1, std::memory_order_release);
+        return 0;
+    }
+};
+
 class ModelError final : public std::runtime_error {
   public:
     ModelError(int status, std::string message)
@@ -59,7 +228,11 @@ void set_error(char *error, size_t length, const char *message) {
     std::snprintf(error, length, "%s", message ? message : "unknown model error");
 }
 
-Json read_json(const fs::path &path) {
+Json read_json(const LfmPayloadReadOwner *owner, const fs::path &path) {
+    LfmPayloadReadScope scope(owner, LFM_MODEL_PAYLOAD_READ_CONFIG);
+    if (scope.status() != 0) {
+        fail(scope.status(), "model config read rejected by its owner");
+    }
     const std::string native = path.string();
     std::unique_ptr<std::FILE, decltype(&std::fclose)> file(
         std::fopen(native.c_str(), "rb"), &std::fclose);
@@ -73,7 +246,16 @@ Json read_json(const fs::path &path) {
     }
     std::rewind(file.get());
     std::vector<char> bytes((size_t)end);
-    if (!bytes.empty() && std::fread(bytes.data(), 1, bytes.size(), file.get()) != bytes.size()) {
+    const size_t count = bytes.empty()
+                             ? 0
+                             : std::fread(bytes.data(), 1, bytes.size(),
+                                          file.get());
+    const int status = scope.record(LFM_MODEL_PAYLOAD_READ_CONFIG,
+                                    (uint64_t)count);
+    if (status != 0) {
+        fail(status, "cannot account model config read '" + native + "'");
+    }
+    if (count != bytes.size()) {
         fail(-EIO, "cannot read model config '" + native + "'");
     }
     try {
@@ -161,8 +343,10 @@ struct BindingLedger {
         uint64_t bytes;
     };
 
+    explicit BindingLedger(ModelAccounting *owner) : owner(owner) {}
+
+    ModelAccounting *owner;
     std::vector<Span> spans;
-    uint64_t total = 0;
 
     void add(const LfmTensorView &view) {
         const auto found = std::find_if(
@@ -170,11 +354,9 @@ struct BindingLedger {
                 return span.data == view.data && span.bytes == view.bytes;
             });
         if (found != spans.end()) return;
-        if (view.bytes > UINT64_MAX - total) {
-            fail(-EOVERFLOW, "directly bound tensor byte accounting overflow");
-        }
+        const int status = owner->weight(WeightKind::Bound, view.bytes);
+        if (status != 0) fail(status, "cannot account directly bound tensor bytes");
         spans.push_back({view.data, view.bytes});
-        total += view.bytes;
     }
 };
 
@@ -307,6 +489,7 @@ namespace {
 } // namespace
 
 struct LfmModel {
+    ModelAccounting accounting;
     void *engine = nullptr;
     LfmWeightImage *weights = nullptr;
     LfmFrontend *frontend = nullptr;
@@ -317,8 +500,6 @@ struct LfmModel {
     uint64_t depth_plan_id = 0;
     uint64_t resident_bytes = 0;
     uint64_t source_bytes = 0;
-    uint64_t directly_bound_bytes = 0;
-    uint64_t derived_immutable_bytes = 0;
     uint64_t load_ns = 0;
     uint32_t load_workers = 0;
     uint32_t load_tasks = 0;
@@ -329,7 +510,8 @@ struct LfmModel {
     uint32_t max_context = 0;
     uint32_t codebooks = 0;
     uint32_t lanes = 0;
-    uint32_t sample_rate = 0;
+    uint32_t preprocessor_rate = 0; // frontend/Conformer input
+    uint32_t codec_rate = 0;        // Mimi PCM output
     uint32_t mel_features = 0;
     uint32_t interleaved_text = 0;
     uint32_t interleaved_audio = 0;
@@ -779,15 +961,15 @@ int prepare_playback_claimed(LfmConversation &conversation,
                              uint32_t sample_rate,
                              size_t *out_playback_frames) {
     LfmModel *model = conversation.model;
-    if (!model || model->sample_rate == 0 || sample_rate == 0 ||
+    if (!model || model->codec_rate == 0 || sample_rate == 0 ||
         !out_playback_frames) {
         return -EINVAL;
     }
     if (conversation.playback_rate == sample_rate &&
         conversation.playback_frames != 0 &&
-        ((sample_rate == model->sample_rate &&
+        ((sample_rate == model->codec_rate &&
           !conversation.playback_resampler_stream) ||
-         (sample_rate != model->sample_rate &&
+         (sample_rate != model->codec_rate &&
           conversation.playback_resampler_stream))) {
         *out_playback_frames = conversation.playback_frames;
         return 0;
@@ -799,9 +981,9 @@ int prepare_playback_claimed(LfmConversation &conversation,
      * device-rate span, even though steady-state steps usually return 1,920. */
     uint64_t frames = LFM_MIMI_PCM_CAPACITY;
     int status = 0;
-    if (sample_rate != model->sample_rate) {
+    if (sample_rate != model->codec_rate) {
         status = lfm_resampler_stream_create(
-            model->sample_rate, sample_rate, LFM_MIMI_PCM_CAPACITY, &stream);
+            model->codec_rate, sample_rate, LFM_MIMI_PCM_CAPACITY, &stream);
         if (status == 0) {
             status = lfm_resampler_stream_out_length(
                 stream, LFM_MIMI_PCM_CAPACITY, &frames);
@@ -835,7 +1017,7 @@ int prepare_pcm_claimed(LfmConversation &conversation, size_t max_sample_count,
     if (!model || !model->frontend || !model->conformer ||
         !conversation.frontend_workspace || !conversation.conformer_workspace ||
         max_sample_count == 0 || capture_rate == 0 || playback_rate == 0 ||
-        model->sample_rate == 0 ||
+        model->preprocessor_rate == 0 ||
         model->mel_features == 0 || model->hidden == 0) {
         return -EINVAL;
     }
@@ -848,7 +1030,8 @@ int prepare_pcm_claimed(LfmConversation &conversation, size_t max_sample_count,
 
     LfmResampler *plan = nullptr;
     LfmResamplerWorkspace *workspace = nullptr;
-    int status = lfm_resampler_create(capture_rate, model->sample_rate, &plan);
+    int status = lfm_resampler_create(capture_rate,
+                                      model->preprocessor_rate, &plan);
     if (status != 0) return status;
     status = lfm_resampler_workspace_create(&workspace);
     if (status == 0) {
@@ -886,7 +1069,9 @@ int prepare_pcm_claimed(LfmConversation &conversation, size_t max_sample_count,
     if (status == 0) {
         try {
             conversation.resampled.resize(
-                capture_rate == model->sample_rate ? 0 : (size_t)target_samples);
+                capture_rate == model->preprocessor_rate
+                    ? 0
+                    : (size_t)target_samples);
             conversation.mel_bf16.resize((size_t)frames * model->mel_features);
             conversation.adapted.resize((size_t)rows * model->hidden);
         } catch (const std::bad_alloc &) {
@@ -1815,7 +2000,13 @@ extern "C" int lfm_model_open(void *engine, const char *path, LfmModel **out,
     uint64_t depth_plan_id = 0;
     std::vector<float> depth_rope_cos;
     std::vector<float> depth_rope_sin;
-    BindingLedger bindings;
+    std::unique_ptr<LfmModel> model(new (std::nothrow) LfmModel());
+    if (!model) {
+        set_error(error, error_length, "cannot allocate native model handle");
+        return -ENOMEM;
+    }
+    const LfmPayloadReadOwner payload_owner = model->accounting.reader();
+    BindingLedger bindings(&model->accounting);
     try {
         const auto tensor = [&bindings](const LfmWeightImage *image,
                                         const std::string &name,
@@ -1833,7 +2024,8 @@ extern "C" int lfm_model_open(void *engine, const char *path, LfmModel **out,
             return bind_matrix(image, name, columns, &bindings);
         };
         const fs::path root(path);
-        const Json document = read_json(root / "config.json");
+        const Json document = read_json(&payload_owner,
+                                        root / "config.json");
         if (!document.is_object() || !document.contains("lfm") ||
             !document.at("lfm").is_object()) {
             fail(-EINVAL, "model config has no object 'lfm'");
@@ -1867,17 +2059,31 @@ extern "C" int lfm_model_open(void *engine, const char *path, LfmModel **out,
             fail(-EINVAL, "native Mimi requires exactly eight audio codebooks");
         }
         std::error_code codec_error;
-        const bool codec_exists = fs::is_regular_file(codec_path, codec_error);
+        bool codec_exists = false;
+        {
+            /* This lease closes the publication race around metadata I/O, but
+             * it deliberately installs no payload source. Only the owned
+             * loader below may prove the shard/index hooks are present. */
+            LfmPayloadReadScope probe(&payload_owner, 0);
+            if (probe.status() != 0) {
+                fail(probe.status(),
+                     "codec source inspection rejected by its model owner");
+            }
+            codec_exists = fs::is_regular_file(codec_path, codec_error);
+        }
         if (voice_model && (!codec_exists || codec_error)) {
-            fail(-ENOENT, "native LFM2-Audio requires its Mimi codec checkpoint");
+            fail(-ENOENT,
+                 "native LFM2-Audio requires its Mimi codec checkpoint");
         }
         char weight_error[512] = {};
         const std::string codec_native = codec_path.string();
         int status = codec_exists
-                         ? lfm_weights_open_bundle(path, codec_native.c_str(), &weights,
-                                                   weight_error, sizeof(weight_error))
-                         : lfm_weights_open(path, &weights, weight_error,
-                                            sizeof(weight_error));
+                         ? lfm_weights_open_bundle_owned(
+                               path, codec_native.c_str(), &payload_owner,
+                               &weights, weight_error, sizeof(weight_error))
+                         : lfm_weights_open_owned(path, &payload_owner, &weights,
+                                                  weight_error,
+                                                  sizeof(weight_error));
         if (status != LFM_WEIGHT_OK) {
             fail(status, weight_error[0] ? weight_error : "cannot open model weights");
         }
@@ -2218,8 +2424,9 @@ extern "C" int lfm_model_open(void *engine, const char *path, LfmModel **out,
             const fs::path tokenizer_path = root / "tokenizer.json";
             const std::string tokenizer_native = tokenizer_path.string();
             char tokenizer_error[512] = {};
-            status = lfm_tokenizer_open(tokenizer_native.c_str(), &tokenizer,
-                                        tokenizer_error, sizeof(tokenizer_error));
+            status = lfm_tokenizer_open_owned(
+                tokenizer_native.c_str(), &payload_owner, &tokenizer,
+                tokenizer_error, sizeof(tokenizer_error));
             if (status != 0) {
                 fail(status, tokenizer_error[0] ? tokenizer_error
                                                 : "cannot load native tokenizer");
@@ -2236,8 +2443,6 @@ extern "C" int lfm_model_open(void *engine, const char *path, LfmModel **out,
             }
         }
 
-        std::unique_ptr<LfmModel> model(new (std::nothrow) LfmModel());
-        if (!model) fail(-ENOMEM, "cannot allocate native model handle");
         model->engine = engine;
         model->weights = weights;
         model->frontend = frontend;
@@ -2257,15 +2462,14 @@ extern "C" int lfm_model_open(void *engine, const char *path, LfmModel **out,
         model->resident_bytes = load_stats.resident_bytes;
         model->source_bytes = load_stats.source_bytes;
         const uint64_t bound_parts[] = {
-            bindings.total,
             lfm_conformer_bound_weight_bytes(conformer),
             mimi_decode_plan_bound_weight_bytes(mimi),
         };
         for (uint64_t bytes : bound_parts) {
-            if (bytes > UINT64_MAX - model->directly_bound_bytes) {
-                fail(-EOVERFLOW, "directly bound tensor byte accounting overflow");
+            status = model->accounting.weight(WeightKind::Bound, bytes);
+            if (status != 0) {
+                fail(status, "cannot account directly bound component bytes");
             }
-            model->directly_bound_bytes += bytes;
         }
         const uint64_t derived_parts[] = {
             frontend_derived,
@@ -2275,10 +2479,25 @@ extern "C" int lfm_model_open(void *engine, const char *path, LfmModel **out,
             mimi_decode_plan_derived_bytes(mimi),
         };
         for (uint64_t bytes : derived_parts) {
-            if (bytes > UINT64_MAX - model->derived_immutable_bytes) {
-                fail(-EOVERFLOW, "derived model byte accounting overflow");
+            status = model->accounting.weight(WeightKind::Derived, bytes);
+            if (status != 0) {
+                fail(status, "cannot account formula-derived immutable bytes");
             }
-            model->derived_immutable_bytes += bytes;
+        }
+        const uint64_t compatibility_parts[] = {
+            lfm_conformer_materialized_weight_bytes(conformer),
+            mimi_decode_plan_compatibility_copied_bytes(mimi),
+        };
+        for (uint64_t bytes : compatibility_parts) {
+            status = model->accounting.weight(WeightKind::Compatibility,
+                                              bytes);
+            if (status != 0) {
+                fail(status, "cannot account compatibility-copied weights");
+            }
+        }
+        status = model->accounting.weight_policy();
+        if (status != 0) {
+            fail(status, "native model materialized checkpoint weights");
         }
         model->load_workers = load_stats.worker_count;
         model->load_tasks = load_stats.task_count;
@@ -2289,7 +2508,8 @@ extern "C" int lfm_model_open(void *engine, const char *path, LfmModel **out,
         model->max_context = (uint32_t)max_context;
         model->codebooks = codebooks > UINT32_MAX ? 0 : (uint32_t)codebooks;
         model->lanes = lfm_engine_lanes(engine);
-        model->sample_rate = sample_rate;
+        model->preprocessor_rate = sample_rate;
+        model->codec_rate = mimi ? LFM_MIMI_SAMPLE_RATE : 0;
         model->mel_features = mel_features;
         model->audio_rows = audio_rows;
         if (tokenizer) {
@@ -2341,6 +2561,13 @@ extern "C" int lfm_model_open(void *engine, const char *path, LfmModel **out,
         model->load_ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
                              std::chrono::steady_clock::now() - load_started)
                              .count();
+        uint32_t required_sources =
+            LFM_MODEL_PAYLOAD_READ_CONFIG |
+            LFM_MODEL_PAYLOAD_READ_WEIGHT_IMAGE |
+            LFM_MODEL_PAYLOAD_READ_WEIGHT_INDEX;
+        if (voice_model) required_sources |= LFM_MODEL_PAYLOAD_READ_TOKENIZER;
+        status = model->accounting.publish(required_sources);
+        if (status != 0) fail(status, "native model publication repeated");
         weights = nullptr;
         frontend = nullptr;
         conformer = nullptr;
@@ -2575,15 +2802,212 @@ extern "C" int lfm_model_memory(const LfmModel *model, LfmModelMemoryV1 *out) {
         .abi_version = LFM_MODEL_ABI_VERSION,
         .source_bytes = model->source_bytes,
         .resident_image_bytes = model->resident_bytes,
-        .directly_bound_bytes = model->directly_bound_bytes,
-        .derived_immutable_bytes = model->derived_immutable_bytes,
+        .directly_bound_bytes = model->accounting.directly_bound_bytes.load(
+            std::memory_order_acquire),
+        .derived_immutable_bytes =
+            model->accounting.derived_immutable_bytes.load(
+                std::memory_order_acquire),
+        .materialized_weight_bytes =
+            model->accounting.materialized_weight_bytes.load(
+                std::memory_order_acquire),
         .compatibility_copied_bytes =
-            lfm_conformer_materialized_weight_bytes(model->conformer) +
-            mimi_decode_plan_compatibility_copied_bytes(model->mimi),
+            model->accounting.compatibility_copied_bytes.load(
+                std::memory_order_acquire),
+        .payload_read_calls = model->accounting.payload_read_calls.load(
+            std::memory_order_acquire),
+        .payload_read_bytes = model->accounting.payload_read_bytes.load(
+            std::memory_order_acquire),
+        .post_publication_read_calls =
+            model->accounting.post_publication_read_calls.load(
+                std::memory_order_acquire),
+        .post_publication_read_bytes =
+            model->accounting.post_publication_read_bytes.load(
+                std::memory_order_acquire),
+        .post_publication_materialization_attempts =
+            model->accounting.post_publication_materialization_attempts.load(
+                std::memory_order_acquire),
+        .post_publication_materialization_bytes =
+            model->accounting.post_publication_materialization_bytes.load(
+                std::memory_order_acquire),
+        .publication_generation =
+            model->accounting.publication_generation.load(
+                std::memory_order_acquire),
         .load_ns = model->load_ns,
         .load_workers = model->load_workers,
         .load_tasks = model->load_tasks,
+        .payload_read_coverage =
+            model->accounting.payload_read_coverage.load(
+                std::memory_order_acquire),
+        .accounting_flags = model->accounting.flags.load(
+            std::memory_order_acquire),
         .reserved = {},
     };
+    return 0;
+}
+
+/* Focused native contract probe. It drives the real conversation playback
+ * preparation with independently sealed preprocessor and codec rates; no
+ * inference state, checkpoint tensor, or PCM plane is created. */
+extern "C" LFM_INTERNAL_API int lfm_internal_playback_rate_contract_test(
+    uint32_t preprocessor_rate, uint32_t playback_rate,
+    uint32_t *out_preprocessor_rate, uint32_t *out_codec_rate,
+    uint64_t *out_playback_frames, uint32_t *out_direct) {
+    if (preprocessor_rate == 0 || playback_rate == 0 ||
+        !out_preprocessor_rate || !out_codec_rate || !out_playback_frames ||
+        !out_direct) {
+        return -EINVAL;
+    }
+    *out_preprocessor_rate = 0;
+    *out_codec_rate = 0;
+    *out_playback_frames = 0;
+    *out_direct = 0;
+
+    LfmModel model;
+    model.preprocessor_rate = preprocessor_rate;
+    model.codec_rate = LFM_MIMI_SAMPLE_RATE;
+    LfmConversation conversation;
+    conversation.model = &model;
+    size_t frames = 0;
+    const int status = prepare_playback_claimed(
+        conversation, playback_rate, &frames);
+    if (status != 0) return status;
+    *out_preprocessor_rate = model.preprocessor_rate;
+    *out_codec_rate = model.codec_rate;
+    *out_playback_frames = (uint64_t)frames;
+    *out_direct = conversation.playback_resampler_stream ? 0u : 1u;
+    return 0;
+}
+
+/* Focused non-production fault entry. The caller supplies tiny stack buffers;
+ * both operations go through the same record-before-operation helpers used by
+ * model construction. No numerical backend or checkpoint tensor is involved. */
+extern "C" LFM_INTERNAL_API int lfm_internal_model_accounting_fault_test(
+    const uint8_t *source, uint8_t *loaded, uint8_t *rejected, size_t bytes,
+    LfmModelMemoryV1 *out, int *out_read_status,
+    int *out_weight_status, int *out_policy_status) {
+    if (!source || !loaded || !rejected || bytes == 0 || !out ||
+        out->size < sizeof(*out) ||
+        out->abi_version != LFM_MODEL_ABI_VERSION || !out_read_status ||
+        !out_weight_status || !out_policy_status) {
+        return -EINVAL;
+    }
+
+    ModelAccounting accounting;
+    const LfmPayloadReadOwner owner = accounting.reader();
+    int status = 0;
+    {
+        LfmPayloadReadScope source_scope(
+            &owner, LFM_MODEL_PAYLOAD_READ_CONFIG, (uint64_t)bytes);
+        status = source_scope.status();
+        if (status != 0) return status;
+        std::memcpy(loaded, source, bytes);
+        status = source_scope.record(LFM_MODEL_PAYLOAD_READ_CONFIG,
+                                     (uint64_t)bytes);
+        if (status != 0) return status;
+    }
+    status = accounting.weight(WeightKind::Compatibility, (uint64_t)bytes);
+    if (status != 0) return status;
+    std::memcpy(loaded, source, bytes);
+    status = accounting.publish(LFM_MODEL_PAYLOAD_READ_CONFIG);
+    if (status != 0) return status;
+
+    {
+        LfmPayloadReadScope rejected_scope(
+            &owner, LFM_MODEL_PAYLOAD_READ_CONFIG, (uint64_t)bytes);
+        *out_read_status = rejected_scope.status();
+        if (*out_read_status == 0) {
+            std::memcpy(rejected, source, bytes);
+            *out_read_status = rejected_scope.record(
+                LFM_MODEL_PAYLOAD_READ_CONFIG, (uint64_t)bytes);
+        }
+    }
+    *out_weight_status = accounting.weight(WeightKind::Compatibility,
+                                           (uint64_t)bytes);
+    if (*out_weight_status == 0) std::memcpy(rejected, source, bytes);
+    *out_policy_status = accounting.weight_policy();
+    *out = {
+        .size = sizeof(*out),
+        .abi_version = LFM_MODEL_ABI_VERSION,
+        .directly_bound_bytes = accounting.directly_bound_bytes.load(
+            std::memory_order_acquire),
+        .derived_immutable_bytes = accounting.derived_immutable_bytes.load(
+            std::memory_order_acquire),
+        .materialized_weight_bytes =
+            accounting.materialized_weight_bytes.load(
+                std::memory_order_acquire),
+        .compatibility_copied_bytes =
+            accounting.compatibility_copied_bytes.load(
+                std::memory_order_acquire),
+        .payload_read_calls = accounting.payload_read_calls.load(
+            std::memory_order_acquire),
+        .payload_read_bytes = accounting.payload_read_bytes.load(
+            std::memory_order_acquire),
+        .post_publication_read_calls =
+            accounting.post_publication_read_calls.load(
+                std::memory_order_acquire),
+        .post_publication_read_bytes =
+            accounting.post_publication_read_bytes.load(
+                std::memory_order_acquire),
+        .post_publication_materialization_attempts =
+            accounting.post_publication_materialization_attempts.load(
+                std::memory_order_acquire),
+        .post_publication_materialization_bytes =
+            accounting.post_publication_materialization_bytes.load(
+                std::memory_order_acquire),
+        .publication_generation =
+            accounting.publication_generation.load(std::memory_order_acquire),
+        .payload_read_coverage =
+            accounting.payload_read_coverage.load(std::memory_order_acquire),
+        .accounting_flags = accounting.flags.load(std::memory_order_acquire),
+        .reserved = {},
+    };
+    return 0;
+}
+
+/* Actual source-entrypoint gate: after publication, each implementation must
+ * return before inspecting or opening `path`. A nonexistent sentinel makes a
+ * misplaced gate self-identify as an I/O error instead of -EPERM. */
+extern "C" LFM_INTERNAL_API int lfm_internal_model_source_gate_test(
+    const char *path, int *config_status, int *weights_status,
+    int *tokenizer_status) {
+    if (!path || !config_status || !weights_status || !tokenizer_status) {
+        return -EINVAL;
+    }
+    ModelAccounting accounting;
+    const LfmPayloadReadOwner owner = accounting.reader();
+    {
+        LfmPayloadReadScope install(
+            &owner, LFM_MODEL_PAYLOAD_READ_CONFIG |
+                        LFM_MODEL_PAYLOAD_READ_WEIGHT_IMAGE |
+                        LFM_MODEL_PAYLOAD_READ_WEIGHT_INDEX |
+                        LFM_MODEL_PAYLOAD_READ_TOKENIZER);
+        if (install.status() != 0) return install.status();
+    }
+    int status = accounting.publish(
+        LFM_MODEL_PAYLOAD_READ_CONFIG |
+        LFM_MODEL_PAYLOAD_READ_WEIGHT_IMAGE |
+        LFM_MODEL_PAYLOAD_READ_WEIGHT_INDEX |
+        LFM_MODEL_PAYLOAD_READ_TOKENIZER);
+    if (status != 0) return status;
+
+    try {
+        (void)read_json(&owner, fs::path(path));
+        *config_status = 0;
+    } catch (const ModelError &error) {
+        *config_status = error.status();
+    }
+
+    LfmWeightImage *weights = nullptr;
+    char weight_error[128] = {};
+    *weights_status = lfm_weights_open_owned(
+        path, &owner, &weights, weight_error, sizeof(weight_error));
+    if (weights) lfm_weights_close(weights);
+
+    LfmTokenizer *tokenizer = nullptr;
+    char tokenizer_error[128] = {};
+    *tokenizer_status = lfm_tokenizer_open_owned(
+        path, &owner, &tokenizer, tokenizer_error,
+        sizeof(tokenizer_error));
+    if (tokenizer) lfm_tokenizer_close(tokenizer);
     return 0;
 }

@@ -356,13 +356,70 @@ LFM_SYM(lfm_norm_apply_f32):
 8:
     ret
 
+// uint64_t lfm_resampler_stream_linear_f32(const StreamKernel *kernel)
+// Retained linear rate conversion over one borrowed codec frame. The kernel
+// descriptor is {input@0, destination@8, sample_count@16, orig@24,
+// phases@32, phase@40, previous@48, ready@52}. C++ owns validation and the
+// bounded phase/history update; this leaf owns every per-sample interpolation.
+// Separate fsub/fmul/fadd retains the former unfused f32 operation order.
+.p2align 2
+.globl LFM_SYM(lfm_resampler_stream_linear_f32)
+LFM_PRIVATE(LFM_SYM(lfm_resampler_stream_linear_f32))
+LFM_SYM(lfm_resampler_stream_linear_f32):
+    ldr     x1, [x0]             // input
+    ldr     x2, [x0, #8]         // destination
+    ldr     x3, [x0, #16]        // remaining input samples
+    ldr     x4, [x0, #24]        // reduced input rate
+    ldr     x5, [x0, #32]        // reduced output phases
+    ldr     x6, [x0, #40]        // retained phase
+    ldr     s4, [x0, #48]        // retained previous sample
+    ldr     w7, [x0, #52]        // previous sample is ready
+    ucvtf   s5, x5
+    mov     x8, #0               // written
+1:
+    cbz     x3, 8f
+    ldr     s0, [x1], #4         // sample
+    cbnz    w7, 2f
+    fmov    s1, s0               // first call starts from this sample
+    b       3f
+2:
+    fmov    s1, s4               // previous
+3:
+    mov     x12, x6              // phase before this input sample
+    add     x9, x6, x5
+    udiv    x10, x9, x4          // output count for this input
+    msub    x6, x10, x4, x9      // next retained phase
+    fsub    s2, s0, s1           // sample - previous
+    mov     x11, #1
+4:
+    cmp     x11, x10
+    b.hi    5f
+    mul     x13, x11, x4
+    sub     x13, x13, x12        // output*orig - old phase
+    ucvtf   s3, x13
+    fdiv    s3, s3, s5           // interpolation fraction
+    fmul    s3, s2, s3
+    fadd    s3, s1, s3
+    str     s3, [x2], #4
+    add     x8, x8, #1
+    add     x11, x11, #1
+    b       4b
+5:
+    fmov    s4, s0
+    mov     w7, #1
+    sub     x3, x3, #1
+    b       1b
+8:
+    mov     x0, x8
+    ret
+
 // void lfm_resample_conv_spans_f32(const LfmF32SpanChain *input,
 //                                  const double *kernels, uint64_t phases,
 //                                  uint64_t stride, uint64_t width,
 //                                  uint64_t first_value, float *out,
 //                                  uint64_t value_count)
-// Polyphase resampling convolution — the sample-rate conversion between the
-// device rate and the model's 24 kHz.
+// Generic polyphase sample-rate conversion from the source rate to the
+// destination rate selected by the immutable resampler plan.
 //
 // Each output sample picks its kernel by PHASE and its input window by BLOCK:
 //     block = start / up ;  phase = start % up      (udiv + msub)

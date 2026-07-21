@@ -306,20 +306,12 @@ LFM_SYM(lfm_capture_downmix_u16_dd):
 249:
     ret
 
-// Playback leaves carry callback-local sum-of-squares through meter offset 16,
-// rendered frames at offset 8, and publish aggregate RMS at offset 20. The
-// reduction order remains source-frame order even on the vector output paths.
-
-// void lfm_playback_render_f32_dd(const float *source, float *destination,
-//     size_t frames, uint32_t channels, LfmPlaybackMeterV1 *meter)
+// void lfm_playback_fanout_f32_dd(const float *source, float *destination,
+//     size_t frames, uint32_t channels)
 .p2align 2
-.globl LFM_SYM(lfm_playback_render_f32_dd)
-LFM_PRIVATE(LFM_SYM(lfm_playback_render_f32_dd))
-LFM_SYM(lfm_playback_render_f32_dd):
-    ldr     x8, [x4, #8]
-    add     x8, x8, x2
-    str     x8, [x4, #8]
-    ldr     s6, [x4, #16]
+.globl LFM_SYM(lfm_playback_fanout_f32_dd)
+LFM_PRIVATE(LFM_SYM(lfm_playback_fanout_f32_dd))
+LFM_SYM(lfm_playback_fanout_f32_dd):
     cmp     w3, #1
     b.eq    310f
     cmp     w3, #2
@@ -331,14 +323,6 @@ LFM_SYM(lfm_playback_render_f32_dd):
 311:
     ldr     q0, [x0], #16
     str     q0, [x1], #16
-    fmul    v1.4s, v0.4s, v0.4s
-    fadd    s6, s6, s1
-    dup     v2.4s, v1.s[1]
-    fadd    s6, s6, s2
-    dup     v2.4s, v1.s[2]
-    fadd    s6, s6, s2
-    dup     v2.4s, v1.s[3]
-    fadd    s6, s6, s2
     subs    x2, x2, #4
     cmp     x2, #4
     b.hs    311b
@@ -350,14 +334,6 @@ LFM_SYM(lfm_playback_render_f32_dd):
     ldr     q0, [x0], #16
     mov     v1.16b, v0.16b
     st2     {v0.4s, v1.4s}, [x1], #32
-    fmul    v1.4s, v0.4s, v0.4s
-    fadd    s6, s6, s1
-    dup     v2.4s, v1.s[1]
-    fadd    s6, s6, s2
-    dup     v2.4s, v1.s[2]
-    fadd    s6, s6, s2
-    dup     v2.4s, v1.s[3]
-    fadd    s6, s6, s2
     subs    x2, x2, #4
     cmp     x2, #4
     b.hs    321b
@@ -365,8 +341,6 @@ LFM_SYM(lfm_playback_render_f32_dd):
     cbz     x2, 348f
 341:
     ldr     s0, [x0], #4
-    fmul    s1, s0, s0
-    fadd    s6, s6, s1
     uxtw    x9, w3
 342:
     str     s0, [x1], #4
@@ -375,23 +349,14 @@ LFM_SYM(lfm_playback_render_f32_dd):
     subs    x2, x2, #1
     b.ne    341b
 348:
-    str     s6, [x4, #16]
-    scvtf   s0, x8
-    fdiv    s1, s6, s0
-    fsqrt   s1, s1
-    str     s1, [x4, #20]
     ret
 
-// void lfm_playback_render_i16_dd(const float *source, int16_t *destination,
-//     size_t frames, uint32_t channels, LfmPlaybackMeterV1 *meter)
+// void lfm_playback_fanout_i16_dd(const float *source, int16_t *destination,
+//     size_t frames, uint32_t channels)
 .p2align 2
-.globl LFM_SYM(lfm_playback_render_i16_dd)
-LFM_PRIVATE(LFM_SYM(lfm_playback_render_i16_dd))
-LFM_SYM(lfm_playback_render_i16_dd):
-    ldr     x8, [x4, #8]
-    add     x8, x8, x2
-    str     x8, [x4, #8]
-    ldr     s6, [x4, #16]
+.globl LFM_SYM(lfm_playback_fanout_i16_dd)
+LFM_PRIVATE(LFM_SYM(lfm_playback_fanout_i16_dd))
+LFM_SYM(lfm_playback_fanout_i16_dd):
     fmov    v4.4s, #1.0
     fneg    v5.4s, v4.4s
     mov     w11, #32767
@@ -407,14 +372,6 @@ LFM_SYM(lfm_playback_render_i16_dd):
     b.lo    440f
 411:
     ldr     q0, [x0], #16
-    fmul    v1.4s, v0.4s, v0.4s
-    fadd    s6, s6, s1
-    dup     v2.4s, v1.s[1]
-    fadd    s6, s6, s2
-    dup     v2.4s, v1.s[2]
-    fadd    s6, s6, s2
-    dup     v2.4s, v1.s[3]
-    fadd    s6, s6, s2
     fcmeq   v2.4s, v0.4s, v0.4s
     and     v0.16b, v0.16b, v2.16b
     fmax    v0.4s, v0.4s, v5.4s
@@ -432,14 +389,6 @@ LFM_SYM(lfm_playback_render_i16_dd):
     b.lo    440f
 421:
     ldr     q0, [x0], #16
-    fmul    v1.4s, v0.4s, v0.4s
-    fadd    s6, s6, s1
-    dup     v2.4s, v1.s[1]
-    fadd    s6, s6, s2
-    dup     v2.4s, v1.s[2]
-    fadd    s6, s6, s2
-    dup     v2.4s, v1.s[3]
-    fadd    s6, s6, s2
     fcmeq   v2.4s, v0.4s, v0.4s
     and     v0.16b, v0.16b, v2.16b
     fmax    v0.4s, v0.4s, v5.4s
@@ -456,8 +405,6 @@ LFM_SYM(lfm_playback_render_i16_dd):
     cbz     x2, 448f
 441:
     ldr     s0, [x0], #4
-    fmul    s1, s0, s0
-    fadd    s6, s6, s1
     fcmp    s0, s0
     fmov    s2, wzr
     fcsel   s0, s0, s2, vc
@@ -473,23 +420,14 @@ LFM_SYM(lfm_playback_render_i16_dd):
     subs    x2, x2, #1
     b.ne    441b
 448:
-    str     s6, [x4, #16]
-    scvtf   s0, x8
-    fdiv    s1, s6, s0
-    fsqrt   s1, s1
-    str     s1, [x4, #20]
     ret
 
-// void lfm_playback_render_u16_dd(const float *source, uint16_t *destination,
-//     size_t frames, uint32_t channels, LfmPlaybackMeterV1 *meter)
+// void lfm_playback_fanout_u16_dd(const float *source, uint16_t *destination,
+//     size_t frames, uint32_t channels)
 .p2align 2
-.globl LFM_SYM(lfm_playback_render_u16_dd)
-LFM_PRIVATE(LFM_SYM(lfm_playback_render_u16_dd))
-LFM_SYM(lfm_playback_render_u16_dd):
-    ldr     x8, [x4, #8]
-    add     x8, x8, x2
-    str     x8, [x4, #8]
-    ldr     s6, [x4, #16]
+.globl LFM_SYM(lfm_playback_fanout_u16_dd)
+LFM_PRIVATE(LFM_SYM(lfm_playback_fanout_u16_dd))
+LFM_SYM(lfm_playback_fanout_u16_dd):
     fmov    v4.4s, #1.0
     fneg    v5.4s, v4.4s
     mov     w11, #32767
@@ -505,14 +443,6 @@ LFM_SYM(lfm_playback_render_u16_dd):
     b.lo    540f
 511:
     ldr     q0, [x0], #16
-    fmul    v1.4s, v0.4s, v0.4s
-    fadd    s6, s6, s1
-    dup     v2.4s, v1.s[1]
-    fadd    s6, s6, s2
-    dup     v2.4s, v1.s[2]
-    fadd    s6, s6, s2
-    dup     v2.4s, v1.s[3]
-    fadd    s6, s6, s2
     fcmeq   v2.4s, v0.4s, v0.4s
     and     v0.16b, v0.16b, v2.16b
     fmax    v0.4s, v0.4s, v5.4s
@@ -533,14 +463,6 @@ LFM_SYM(lfm_playback_render_u16_dd):
     b.lo    540f
 521:
     ldr     q0, [x0], #16
-    fmul    v1.4s, v0.4s, v0.4s
-    fadd    s6, s6, s1
-    dup     v2.4s, v1.s[1]
-    fadd    s6, s6, s2
-    dup     v2.4s, v1.s[2]
-    fadd    s6, s6, s2
-    dup     v2.4s, v1.s[3]
-    fadd    s6, s6, s2
     fcmeq   v2.4s, v0.4s, v0.4s
     and     v0.16b, v0.16b, v2.16b
     fmax    v0.4s, v0.4s, v5.4s
@@ -560,8 +482,6 @@ LFM_SYM(lfm_playback_render_u16_dd):
     cbz     x2, 548f
 541:
     ldr     s0, [x0], #4
-    fmul    s1, s0, s0
-    fadd    s6, s6, s1
     fcmp    s0, s0
     fmov    s2, wzr
     fcsel   s0, s0, s2, vc
@@ -578,11 +498,6 @@ LFM_SYM(lfm_playback_render_u16_dd):
     subs    x2, x2, #1
     b.ne    541b
 548:
-    str     s6, [x4, #16]
-    scvtf   s0, x8
-    fdiv    s1, s6, s0
-    fsqrt   s1, s1
-    str     s1, [x4, #20]
     ret
 
 #if !defined(__APPLE__) && !defined(_WIN32)

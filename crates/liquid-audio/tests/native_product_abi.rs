@@ -24,7 +24,7 @@ const PRODUCT: [(&str, &str); 4] = [
 ];
 
 #[cfg(all(not(feature = "oracle-abi"), target_os = "macos"))]
-const PRODUCT_SYMBOLS: [&str; 36] = [
+const PRODUCT_SYMBOLS: [&str; 40] = [
     "lfm_runtime_create",
     "lfm_runtime_start",
     "lfm_runtime_request_stop",
@@ -55,9 +55,13 @@ const PRODUCT_SYMBOLS: [&str; 36] = [
     "lfm_capture_producer_destroy",
     "lfm_playback_consumer_create",
     "lfm_playback_consumer_claim",
-    "lfm_playback_consumer_resolve",
+    "lfm_playback_consumer_render_f32",
+    "lfm_playback_consumer_render_i16",
+    "lfm_playback_consumer_render_u16",
+    "lfm_playback_consumer_observe",
     "lfm_playback_consumer_release",
     "lfm_playback_consumer_destroy",
+    "lfm_session_playback_policy_snapshot",
     "lfm_session_control_create",
     "lfm_session_control_interrupt",
     "lfm_session_control_destroy",
@@ -95,9 +99,13 @@ unsafe extern "C" {
     fn lfm_capture_producer_destroy();
     fn lfm_playback_consumer_create();
     fn lfm_playback_consumer_claim();
-    fn lfm_playback_consumer_resolve();
+    fn lfm_playback_consumer_render_f32();
+    fn lfm_playback_consumer_render_i16();
+    fn lfm_playback_consumer_render_u16();
+    fn lfm_playback_consumer_observe();
     fn lfm_playback_consumer_release();
     fn lfm_playback_consumer_destroy();
+    fn lfm_session_playback_policy_snapshot();
     fn lfm_session_control_create();
     fn lfm_session_control_interrupt();
     fn lfm_session_control_destroy();
@@ -151,6 +159,29 @@ fn product_headers_include_runtime_scoped_conversation_lifecycle() {
         "lfm_runtime_conversation_close(",
     ] {
         assert!(runtime.contains(term), "product ABI lost `{term}`");
+    }
+}
+
+#[test]
+fn payload_reader_is_a_private_native_construction_seam() {
+    let private = include_str!("../native/src/model/lfm_payload_reader.h");
+    for term in [
+        "LfmPayloadReadOwner",
+        "LfmPayloadReadScope",
+        "lfm_weights_open_owned",
+        "lfm_weights_open_bundle_owned",
+        "lfm_tokenizer_open_owned",
+    ] {
+        assert!(
+            private.contains(term),
+            "private source ledger lost `{term}`"
+        );
+        for (name, header) in PRODUCT {
+            assert!(
+                !header.contains(term),
+                "product header {name} exposed private source ledger `{term}`"
+            );
+        }
     }
 }
 
@@ -273,9 +304,13 @@ fn retain_product_surface() {
         lfm_capture_producer_destroy as usize,
         lfm_playback_consumer_create as usize,
         lfm_playback_consumer_claim as usize,
-        lfm_playback_consumer_resolve as usize,
+        lfm_playback_consumer_render_f32 as usize,
+        lfm_playback_consumer_render_i16 as usize,
+        lfm_playback_consumer_render_u16 as usize,
+        lfm_playback_consumer_observe as usize,
         lfm_playback_consumer_release as usize,
         lfm_playback_consumer_destroy as usize,
+        lfm_session_playback_policy_snapshot as usize,
         lfm_session_control_create as usize,
         lfm_session_control_interrupt as usize,
         lfm_session_control_destroy as usize,

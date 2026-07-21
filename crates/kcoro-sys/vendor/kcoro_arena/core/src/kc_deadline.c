@@ -500,7 +500,17 @@ static int source_create(const kc_deadline_source_config *config, int manual,
 int kc_deadline_source_create(const kc_deadline_source_config *config,
                               kc_deadline_source_t **out)
 {
+#if !defined(__APPLE__)
+    (void)config;
+    if (!out) return -EINVAL;
+    *out = NULL;
+    /* Production construction is the readiness capability boundary.  A
+     * source that can only fail later, at the first arm, turns an unsupported
+     * platform into a mid-pass abort after numerical state is already live. */
+    return -ENOTSUP;
+#else
     return source_create(config, 0, out);
+#endif
 }
 
 int kc_deadline_source_create_manual_test(

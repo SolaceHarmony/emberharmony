@@ -14,7 +14,18 @@ extern "C" {
 /* The immutable native model/accounting ABI remains versioned independently
  * from the runtime lifecycle ABI. Numerical model metadata is intentionally not
  * part of this header. */
-#define LFM_MODEL_ABI_VERSION 3u
+#define LFM_MODEL_ABI_VERSION 4u
+
+/* `payload_read_coverage` says which setup-time payload sources contribute to
+ * the counters below. `LFM_MODEL_ACCOUNTING_PAYLOAD_READS_COMPLETE` is a
+ * separate claim: it must remain clear until every possible source is routed
+ * through the rejecting owner-scoped recorder. This prevents partial zero
+ * counters from masquerading as a complete post-publication read gate. */
+#define LFM_MODEL_PAYLOAD_READ_CONFIG (1u << 0)
+#define LFM_MODEL_PAYLOAD_READ_WEIGHT_IMAGE (1u << 1)
+#define LFM_MODEL_PAYLOAD_READ_WEIGHT_INDEX (1u << 2)
+#define LFM_MODEL_PAYLOAD_READ_TOKENIZER (1u << 3)
+#define LFM_MODEL_ACCOUNTING_PAYLOAD_READS_COMPLETE (1u << 0)
 
 typedef struct LfmModelMemoryV1 {
     uint32_t size;
@@ -23,10 +34,24 @@ typedef struct LfmModelMemoryV1 {
     uint64_t resident_image_bytes;
     uint64_t directly_bound_bytes;
     uint64_t derived_immutable_bytes;
+    uint64_t materialized_weight_bytes;
     uint64_t compatibility_copied_bytes;
+    uint64_t payload_read_calls;
+    uint64_t payload_read_bytes;
+    /* Attempted after publication and rejected before the recorder performs
+     * its payload operation. These are attempts, not completed reads. */
+    uint64_t post_publication_read_calls;
+    uint64_t post_publication_read_bytes;
+    uint64_t post_publication_materialization_attempts;
+    uint64_t post_publication_materialization_bytes;
+    /* Zero while the model is private construction state; one after its only
+     * successful publication. The generation belongs to this model object. */
+    uint64_t publication_generation;
     uint64_t load_ns;
     uint32_t load_workers;
     uint32_t load_tasks;
+    uint32_t payload_read_coverage;
+    uint32_t accounting_flags;
     uint64_t reserved[4];
 } LfmModelMemoryV1;
 

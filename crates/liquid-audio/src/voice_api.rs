@@ -35,13 +35,12 @@ pub enum EngineProgress {
 /// Fixed result of one hardware playback callback. The callback writes device
 /// frames directly from an opaque native lease; this record contains telemetry,
 /// never a PCM payload or a native address.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PlaybackWrite {
     pub claimed_samples: usize,
     pub dropped_samples: usize,
     pub played_frames: usize,
     pub underrun_frames: usize,
-    pub rms: f32,
     pub active: bool,
 }
 

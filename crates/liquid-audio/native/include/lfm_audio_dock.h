@@ -28,6 +28,10 @@ extern "C" {
 #define LFM_CAPTURE_DEADLINE_COMMIT 1u
 #define LFM_CAPTURE_DEADLINE_FORCED 2u
 #define LFM_CAPTURE_DEADLINE_COUNT 3u
+#define LFM_PLAYBACK_EVIDENCE_RENDERED (1u << 0)
+#define LFM_PLAYBACK_EVIDENCE_SILENCE (1u << 1)
+#define LFM_PLAYBACK_EVIDENCE_FLUSH (1u << 2)
+#define LFM_PLAYBACK_EVIDENCE_DISCONTINUITY (1u << 3)
 /* Private bring-up mode for dock/lifecycle verification before a model is
  * attached. Production session creation rejects null owners without it. */
 #define LFM_SESSION_FLAG_DOCK_ONLY (UINT64_C(1) << 63)
@@ -99,6 +103,56 @@ typedef struct LfmMutableF32SpanV1 {
     float *data;
     size_t count;
 } LfmMutableF32SpanV1;
+
+/* One playback callback edge. PCM remains in the immutable native lease; this
+ * result contains correlation and sample-clock accounting only. */
+typedef struct LfmPlaybackRenderV1 {
+    uint32_t size;
+    uint32_t abi_version;
+    uint64_t session_id;
+    uint64_t stream_epoch;
+    LfmTicketIdV1 ticket;
+    uint64_t lease_id;
+    uint64_t buffer_generation;
+    uint32_t source_offset_frames;
+    uint32_t rendered_frames;
+    uint64_t first_playback_sample_cursor;
+    uint64_t capture_sample_cursor_snapshot;
+    uint32_t flags;
+    uint32_t reserved0;
+    uint64_t reserved[2];
+} LfmPlaybackRenderV1;
+
+/* Private playback-detector observability. The detector is session-owned and
+ * created at playback_sample_rate; these counters are release-published by the
+ * coordinator after it consumes playback evidence. */
+typedef struct LfmPlaybackPolicySnapshotV1 {
+    uint32_t size;
+    uint32_t abi_version;
+    uint32_t sample_rate;
+    uint32_t last_voice;
+    uint32_t detector_backlog;
+    uint32_t retained_observers;
+    uint64_t evidence_records;
+    uint64_t evidence_updates;
+    uint64_t last_evidence_cursor;
+    uint64_t discontinuities;
+    uint64_t stream_epoch;
+    LfmTicketIdV1 ticket;
+    uint64_t capture_sample_cursor_snapshot;
+    double last_score;
+    uint32_t adaptive_min;
+    uint32_t adaptive_max;
+    uint64_t echo_start_capture_cursor;
+    uint64_t last_voice_capture_cursor;
+    uint64_t echo_tail_capture_cursor;
+    uint64_t barge_voiced_frames;
+    uint64_t barge_interrupts;
+    uint64_t barge_source_epoch;
+    uint64_t barge_interrupt_epoch;
+    LfmTicketIdV1 barge_playback_ticket;
+    uint64_t reserved[1];
+} LfmPlaybackPolicySnapshotV1;
 
 typedef struct LfmCaptureDeadlineSlotSnapshotV1 {
     uint32_t slot;
@@ -189,7 +243,7 @@ LFM_PUBLIC_API int lfm_capture_producer_destroy(
     LfmCaptureProducer *producer);
 
 /* Setup-time structural ownership for the hardware playback edge. Exactly one
- * non-cloneable device endpoint owns this handle. Claim/resolve/release are
+ * non-cloneable device endpoint owns this handle. Claim/render/release are
  * bounded callback operations: no allocation, mutex, wait, timer, retry, or
  * Rust callback occurs. The ticket identity supplied by the reliable
  * PLAYBACK_READY record is validated before the lease becomes active. Claim is
@@ -202,9 +256,33 @@ LFM_PUBLIC_API int lfm_playback_consumer_claim(
     LfmPlaybackConsumer *consumer, const LfmTicketIdV1 *ticket,
     uint64_t stream_epoch, uint64_t lease_id, uint64_t buffer_generation,
     LfmPcmLeaseV1 *out);
-LFM_PUBLIC_API int lfm_playback_consumer_resolve(
-    const LfmPlaybackConsumer *consumer, const LfmPcmLeaseV1 *lease,
-    const float **out_samples, size_t *out_sample_count);
+/* Lease-aware realtime render operations. The source pointer never crosses the
+ * ABI: native code validates the exact active lease, fans its requested range
+ * directly into the device callback buffer, and publishes one metadata-only
+ * playback-evidence record. No allocation, mutex, wait, retry, or callback is
+ * performed. destination_capacity is measured in interleaved scalar samples. */
+LFM_PUBLIC_API int lfm_playback_consumer_render_f32(
+    LfmPlaybackConsumer *consumer, const LfmPcmLeaseV1 *lease,
+    uint32_t source_offset_frames, float *destination, uint32_t frames,
+    uint32_t channels, size_t destination_capacity,
+    LfmPlaybackRenderV1 *out);
+LFM_PUBLIC_API int lfm_playback_consumer_render_i16(
+    LfmPlaybackConsumer *consumer, const LfmPcmLeaseV1 *lease,
+    uint32_t source_offset_frames, int16_t *destination, uint32_t frames,
+    uint32_t channels, size_t destination_capacity,
+    LfmPlaybackRenderV1 *out);
+LFM_PUBLIC_API int lfm_playback_consumer_render_u16(
+    LfmPlaybackConsumer *consumer, const LfmPcmLeaseV1 *lease,
+    uint32_t source_offset_frames, uint16_t *destination, uint32_t frames,
+    uint32_t channels, size_t destination_capacity,
+    LfmPlaybackRenderV1 *out);
+/* Publish callback-rendered logical silence or a zero-frame flush/
+ * discontinuity edge. A null lease uses the most recently claimed exact
+ * playback lineage; observation before any successful claim is STALE. */
+LFM_PUBLIC_API int lfm_playback_consumer_observe(
+    LfmPlaybackConsumer *consumer, const LfmPcmLeaseV1 *lease,
+    uint32_t source_offset_frames, uint32_t frames, uint32_t flags,
+    LfmPlaybackRenderV1 *out);
 LFM_PUBLIC_API int lfm_playback_consumer_release(
     LfmPlaybackConsumer *consumer, const LfmPcmLeaseV1 *lease);
 /* Administrative teardown after the device callback has been disconnected and
@@ -236,6 +314,13 @@ LFM_INTERNAL_API int lfm_session_capture_deadline_fire_manual_test(
 LFM_INTERNAL_API int lfm_session_capture_deadline_identity_test(
     const LfmSession *session, uint32_t slot,
     const LfmCaptureDeadlineSlotSnapshotV1 *identity);
+LFM_PUBLIC_API int lfm_session_playback_policy_snapshot(
+    const LfmSession *session, LfmPlaybackPolicySnapshotV1 *out);
+/* Private implementation-backed dock-test source. It enters the ordinary
+ * reserve/fill/publish path and is rejected outside DOCK_ONLY sessions. */
+LFM_INTERNAL_API int lfm_session_publish_playback_f32_test(
+    LfmSession *session, const float *samples, uint32_t frames,
+    LfmPcmLeaseV1 *out);
 
 #ifdef __cplusplus
 } /* extern "C" */

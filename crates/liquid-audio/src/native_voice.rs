@@ -26,6 +26,8 @@ const STATUS_BUSY: i32 = -16;
 const STATUS_STALE: i32 = -116;
 const STATUS_CANCELLED: i32 = -125;
 const STATUS_HOST_SINK: i32 = -1002;
+const STATUS_UNSUPPORTED: i32 = -1004;
+const MODEL_ACCOUNTING_PAYLOAD_READS_COMPLETE: u32 = 1;
 const EVENT_STATE: u32 = 1;
 const EVENT_TEXT: u32 = 2;
 const EVENT_TURN: u32 = 3;
@@ -50,6 +52,12 @@ const CAPTURE_INPUT_U16: u32 = 3;
 const CAPTURE_WRITE_GAP_PUBLISHED: u32 = 1;
 const CAPTURE_CHUNK_GAP: u32 = 1;
 const CAPTURE_CHUNK_MUTED: u32 = 1 << 2;
+const PCM_FORMAT_F32: u32 = 1;
+const PCM_LEASE_PLAYBACK: u32 = 2;
+const PLAYBACK_EVIDENCE_RENDERED: u32 = 1;
+const PLAYBACK_EVIDENCE_SILENCE: u32 = 1 << 1;
+const PLAYBACK_EVIDENCE_FLUSH: u32 = 1 << 2;
+const PLAYBACK_EVIDENCE_DISCONTINUITY: u32 = 1 << 3;
 
 #[repr(C)]
 struct Runtime {
@@ -108,10 +116,20 @@ struct ModelMemory {
     resident_image_bytes: u64,
     directly_bound_bytes: u64,
     derived_immutable_bytes: u64,
+    materialized_weight_bytes: u64,
     compatibility_copied_bytes: u64,
+    payload_read_calls: u64,
+    payload_read_bytes: u64,
+    post_publication_read_calls: u64,
+    post_publication_read_bytes: u64,
+    post_publication_materialization_attempts: u64,
+    post_publication_materialization_bytes: u64,
+    publication_generation: u64,
     load_ns: u64,
     load_workers: u32,
     load_tasks: u32,
+    payload_read_coverage: u32,
+    accounting_flags: u32,
     reserved: [u64; 4],
 }
 
@@ -156,6 +174,7 @@ struct SessionConfig {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct NativeEvent {
     size: u32,
     abi_version: u32,
@@ -259,22 +278,32 @@ struct NativeCaptureChunk {
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-struct PlaybackMeter {
+struct NativePlaybackRender {
     size: u32,
     abi_version: u32,
-    rendered_frames: u64,
-    sum_squares: f32,
-    rms: f32,
-    reserved: [u64; 3],
+    session_id: u64,
+    stream_epoch: u64,
+    ticket: Ticket,
+    lease_id: u64,
+    buffer_generation: u64,
+    source_offset_frames: u32,
+    rendered_frames: u32,
+    first_playback_sample_cursor: u64,
+    capture_sample_cursor_snapshot: u64,
+    flags: u32,
+    reserved0: u32,
+    reserved: [u64; 2],
 }
 
 type PlaybackRender<T> = unsafe extern "C" fn(
-    source: *const f32,
+    consumer: *mut PlaybackConsumer,
+    lease: *const PcmLease,
+    source_offset_frames: u32,
     destination: *mut T,
-    frames: usize,
+    frames: u32,
     channels: u32,
     destination_capacity: usize,
-    meter: *mut PlaybackMeter,
+    out: *mut NativePlaybackRender,
 ) -> i32;
 
 unsafe extern "C" {
@@ -336,42 +365,49 @@ unsafe extern "C" {
         buffer_generation: u64,
         out: *mut PcmLease,
     ) -> i32;
-    fn lfm_playback_consumer_resolve(
-        consumer: *const PlaybackConsumer,
+    fn lfm_playback_consumer_render_f32(
+        consumer: *mut PlaybackConsumer,
         lease: *const PcmLease,
-        out_samples: *mut *const f32,
-        out_sample_count: *mut usize,
+        source_offset_frames: u32,
+        destination: *mut f32,
+        frames: u32,
+        channels: u32,
+        destination_capacity: usize,
+        out: *mut NativePlaybackRender,
+    ) -> i32;
+    fn lfm_playback_consumer_render_i16(
+        consumer: *mut PlaybackConsumer,
+        lease: *const PcmLease,
+        source_offset_frames: u32,
+        destination: *mut i16,
+        frames: u32,
+        channels: u32,
+        destination_capacity: usize,
+        out: *mut NativePlaybackRender,
+    ) -> i32;
+    fn lfm_playback_consumer_render_u16(
+        consumer: *mut PlaybackConsumer,
+        lease: *const PcmLease,
+        source_offset_frames: u32,
+        destination: *mut u16,
+        frames: u32,
+        channels: u32,
+        destination_capacity: usize,
+        out: *mut NativePlaybackRender,
+    ) -> i32;
+    fn lfm_playback_consumer_observe(
+        consumer: *mut PlaybackConsumer,
+        lease: *const PcmLease,
+        source_offset_frames: u32,
+        frames: u32,
+        flags: u32,
+        out: *mut NativePlaybackRender,
     ) -> i32;
     fn lfm_playback_consumer_release(
         consumer: *mut PlaybackConsumer,
         lease: *const PcmLease,
     ) -> i32;
     fn lfm_playback_consumer_destroy(consumer: *mut PlaybackConsumer) -> i32;
-    fn lfm_playback_meter_reset(meter: *mut PlaybackMeter) -> i32;
-    fn lfm_playback_render_f32(
-        source: *const f32,
-        destination: *mut f32,
-        frames: usize,
-        channels: u32,
-        destination_capacity: usize,
-        meter: *mut PlaybackMeter,
-    ) -> i32;
-    fn lfm_playback_render_i16(
-        source: *const f32,
-        destination: *mut i16,
-        frames: usize,
-        channels: u32,
-        destination_capacity: usize,
-        meter: *mut PlaybackMeter,
-    ) -> i32;
-    fn lfm_playback_render_u16(
-        source: *const f32,
-        destination: *mut u16,
-        frames: usize,
-        channels: u32,
-        destination_capacity: usize,
-        meter: *mut PlaybackMeter,
-    ) -> i32;
     fn lfm_capture_chunk_producer_create(
         session: *mut Session,
         stream: u64,
@@ -459,7 +495,20 @@ pub struct NativeVoiceModelMemory {
     pub resident_image_bytes: u64,
     pub directly_bound_bytes: u64,
     pub derived_immutable_bytes: u64,
+    pub materialized_weight_bytes: u64,
     pub compatibility_copied_bytes: u64,
+    pub payload_read_calls: u64,
+    pub payload_read_bytes: u64,
+    pub post_publication_read_calls: u64,
+    pub post_publication_read_bytes: u64,
+    pub post_publication_materialization_attempts: u64,
+    pub post_publication_materialization_bytes: u64,
+    pub publication_generation: u64,
+    /// Bitmask of model payload sources included in the read totals.
+    pub payload_read_coverage: u32,
+    /// True only when every possible model payload source is routed through
+    /// the rejecting owner-scoped recorder.
+    pub payload_read_accounting_complete: bool,
     pub load_ns: u64,
     pub load_workers: u32,
     pub load_tasks: u32,
@@ -604,7 +653,20 @@ impl NativeVoiceModel {
             resident_image_bytes: memory.resident_image_bytes,
             directly_bound_bytes: memory.directly_bound_bytes,
             derived_immutable_bytes: memory.derived_immutable_bytes,
+            materialized_weight_bytes: memory.materialized_weight_bytes,
             compatibility_copied_bytes: memory.compatibility_copied_bytes,
+            payload_read_calls: memory.payload_read_calls,
+            payload_read_bytes: memory.payload_read_bytes,
+            post_publication_read_calls: memory.post_publication_read_calls,
+            post_publication_read_bytes: memory.post_publication_read_bytes,
+            post_publication_materialization_attempts: memory
+                .post_publication_materialization_attempts,
+            post_publication_materialization_bytes: memory.post_publication_materialization_bytes,
+            publication_generation: memory.publication_generation,
+            payload_read_coverage: memory.payload_read_coverage,
+            payload_read_accounting_complete: memory.accounting_flags
+                & MODEL_ACCOUNTING_PAYLOAD_READS_COMPLETE
+                != 0,
             load_ns: memory.load_ns,
             load_workers: memory.load_workers,
             load_tasks: memory.load_tasks,
@@ -834,10 +896,98 @@ struct ReplyCell(UnsafeCell<MaybeUninit<Reply>>);
 // each cell; the payload itself is never concurrently accessed.
 unsafe impl Sync for ReplyCell {}
 
+const START_OPEN: usize = 0;
+const START_WRITE: usize = 1;
+const START_HELD: usize = 2;
+const START_BLOCKED: usize = 3;
+
+struct StartGate {
+    flow: UnsafeCell<MaybeUninit<Flow>>,
+    state: AtomicUsize,
+}
+
+// The native delivery continuation is the sole writer and the Rust event
+// continuation is the sole reader. `state` transfers ownership of `flow`.
+unsafe impl Sync for StartGate {}
+
+impl StartGate {
+    fn new() -> Self {
+        Self {
+            flow: UnsafeCell::new(MaybeUninit::uninit()),
+            state: AtomicUsize::new(START_OPEN),
+        }
+    }
+
+    fn hold(&self, flow: Flow) -> bool {
+        if self
+            .state
+            .compare_exchange(
+                START_OPEN,
+                START_WRITE,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        unsafe { (*self.flow.get()).write(flow) };
+        self.state.store(START_HELD, Ordering::Release);
+        true
+    }
+
+    fn block(&self) -> bool {
+        match self.state.compare_exchange(
+            START_HELD,
+            START_BLOCKED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) | Err(START_BLOCKED | START_WRITE) => true,
+            Err(START_OPEN) => false,
+            Err(_) => unreachable!("invalid native turn-start gate state"),
+        }
+    }
+
+    fn release(&self, flow: Flow) -> Result<bool, String> {
+        const INVALID: &str = "native turn-start gate has no retained record";
+        const CHANGED: &str = "native turn-start gate changed exact flow";
+        const STATE: &str = "native turn-start gate entered an invalid state";
+        let state = self.state.load(Ordering::Acquire);
+        if state != START_HELD && state != START_BLOCKED {
+            return Err(if state == START_OPEN { INVALID } else { STATE }.into());
+        }
+        let retained = unsafe { (*self.flow.get()).assume_init_read() };
+        if retained != flow {
+            return Err(format!(
+                "{CHANGED} (expected={retained:?}, received={flow:?})"
+            ));
+        }
+        match self
+            .state
+            .compare_exchange(state, START_OPEN, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => Ok(state == START_BLOCKED),
+            Err(START_BLOCKED) if state == START_HELD => self
+                .state
+                .compare_exchange(
+                    START_BLOCKED,
+                    START_OPEN,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .map(|_| true)
+                .map_err(|state| if state == START_OPEN { INVALID } else { STATE }.into()),
+            Err(state) => Err(if state == START_OPEN { INVALID } else { STATE }.into()),
+        }
+    }
+}
+
 struct ReplyRing {
     cells: Box<[ReplyCell]>,
     read: AtomicUsize,
     write: AtomicUsize,
+    start: StartGate,
 }
 
 unsafe impl Send for ReplyRing {}
@@ -853,6 +1003,7 @@ impl ReplyRing {
             cells,
             read: AtomicUsize::new(0),
             write: AtomicUsize::new(0),
+            start: StartGate::new(),
         })
     }
 
@@ -976,6 +1127,10 @@ impl PlaybackState {
 
     fn audio_active(&self, local: bool) -> bool {
         local || !self.ready.is_empty()
+    }
+
+    fn retire(&self, result: PlaybackResult) -> bool {
+        self.done.try_push(result)
     }
 }
 
@@ -1114,12 +1269,73 @@ impl NativeAction {
             emitted_items: 0,
         }
     }
+
+    fn settled(&self) -> bool {
+        self.terminal
+            .is_some_and(|(has_audio, playback)| !has_audio || self.playback >= playback)
+    }
+
+    fn retire(&mut self, done: PlaybackResult) -> Result<(), String> {
+        if done.status != 0 && done.status != STATUS_STALE && done.status != STATUS_CANCELLED {
+            return Err(format!(
+                "native playback callback failed with status {}",
+                done.status
+            ));
+        }
+        if self.flow != Some(done.flow) {
+            return Err(format!(
+                "native playback retirement changed flow (expected={:?}, received={:?})",
+                self.flow, done.flow
+            ));
+        }
+        self.playback = self.playback.saturating_add(1);
+        Ok(())
+    }
+}
+
+fn retain_successor(
+    pending: &mut Option<Flow>,
+    action: &NativeAction,
+    flow: Flow,
+) -> Result<(), String> {
+    if action.ticket == flow.ticket {
+        return Err("native action published a duplicate turn-start".into());
+    }
+    let prior = action
+        .flow
+        .ok_or("native successor turn-start followed an unbound prior action")?;
+    if flow.session != prior.session
+        || flow.epoch != prior.epoch
+        || flow.ticket.runtime_epoch != prior.ticket.runtime_epoch
+        || flow.ticket.generation != prior.ticket.generation
+        || flow.ticket.kind != prior.ticket.kind
+        || flow.ticket.sequence <= prior.ticket.sequence
+    {
+        return Err(format!(
+            "native successor turn-start broke ticket lineage (prior={prior:?}, successor={flow:?})"
+        ));
+    }
+    if let Some(successor) = pending {
+        if *successor == flow {
+            return Err("native action published a duplicate successor turn-start".into());
+        }
+        return Err("native action published more than one pending successor".into());
+    }
+    let Some((has_audio, playback)) = action.terminal else {
+        return Err("native successor turn-start arrived before the prior terminal".into());
+    };
+    if !has_audio || action.playback >= playback {
+        return Err("native successor turn-start arrived after the prior action settled".into());
+    }
+    *pending = Some(flow);
+    Ok(())
 }
 
 #[cfg(test)]
 #[derive(Clone, Copy)]
 struct TerminalProbe {
     flow: Flow,
+    cancelled: bool,
     terminal_records: u32,
     text_emissions: u32,
     emitted_items: u32,
@@ -1142,6 +1358,9 @@ unsafe extern "C" fn on_event(context: *mut c_void, event: *const NativeEvent) -
             || event.payload_bytes as usize > TEXT_EVENT_MAX_BYTES
         {
             return Err(STATUS_HOST_SINK);
+        }
+        if sink.replies.start.block() {
+            return Ok(STATUS_WOULD_BLOCK);
         }
         let bytes = if event.payload_bytes == 0 {
             &[][..]
@@ -1215,7 +1434,20 @@ unsafe extern "C" fn on_event(context: *mut c_void, event: *const NativeEvent) -
         let Some(reply) = reply else {
             return Ok(0);
         };
+        let start = match &reply {
+            Reply::TurnStarted { flow } => Some(*flow),
+            _ => None,
+        };
+        if start.is_some_and(|flow| !sink.replies.start.hold(flow)) {
+            return Ok(STATUS_WOULD_BLOCK);
+        }
         if sink.replies.try_push(reply).is_err() {
+            if let Some(flow) = start {
+                sink.replies
+                    .start
+                    .release(flow)
+                    .map_err(|_| STATUS_HOST_SINK)?;
+            }
             return Ok(STATUS_WOULD_BLOCK);
         }
         let Some(resume) = sink.resume.as_mut() else {
@@ -1224,7 +1456,15 @@ unsafe extern "C" fn on_event(context: *mut c_void, event: *const NativeEvent) -
             // retained here and install_resume publishes the missing edge.
             return Ok(0);
         };
-        resume.notify().map_err(|_| STATUS_HOST_SINK)?;
+        if resume.notify().is_err() {
+            if let Some(flow) = start {
+                sink.replies
+                    .start
+                    .release(flow)
+                    .map_err(|_| STATUS_HOST_SINK)?;
+            }
+            return Err(STATUS_HOST_SINK);
+        }
         Ok(0)
     });
     match result {
@@ -1382,19 +1622,98 @@ struct ClaimedPlayback {
     cursor: usize,
 }
 
+#[cfg(test)]
+#[derive(Default)]
+struct PlaybackCursorAudit {
+    next_playback_sample_cursor: std::sync::atomic::AtomicU64,
+    capture_sample_cursor_snapshot: std::sync::atomic::AtomicU64,
+    reports: std::sync::atomic::AtomicU64,
+    claimed_leases: std::sync::atomic::AtomicU64,
+    claimed_frames: std::sync::atomic::AtomicU64,
+    unclaimed_retirements: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(test)]
+impl PlaybackCursorAudit {
+    fn publish(&self, next_playback_sample_cursor: u64, capture_sample_cursor_snapshot: u64) {
+        self.next_playback_sample_cursor
+            .store(next_playback_sample_cursor, Ordering::Relaxed);
+        self.capture_sample_cursor_snapshot
+            .store(capture_sample_cursor_snapshot, Ordering::Relaxed);
+        self.reports.fetch_add(1, Ordering::Release);
+    }
+
+    fn snapshot(&self) -> (u64, u64, u64) {
+        let reports = self.reports.load(Ordering::Acquire);
+        (
+            reports,
+            self.next_playback_sample_cursor.load(Ordering::Relaxed),
+            self.capture_sample_cursor_snapshot.load(Ordering::Relaxed),
+        )
+    }
+
+    fn claim(&self, frames: usize) {
+        self.claimed_frames
+            .fetch_add(frames as u64, Ordering::Relaxed);
+        self.claimed_leases.fetch_add(1, Ordering::Release);
+    }
+
+    fn retire_unclaimed(&self) {
+        self.unclaimed_retirements.fetch_add(1, Ordering::Release);
+    }
+
+    fn claims(&self) -> (u64, u64, u64) {
+        (
+            self.claimed_leases.load(Ordering::Acquire),
+            self.claimed_frames.load(Ordering::Relaxed),
+            self.unclaimed_retirements.load(Ordering::Acquire),
+        )
+    }
+}
+
 struct NativePlaybackSource {
     consumer: NonNull<PlaybackConsumer>,
     state: Arc<PlaybackState>,
     notify: RealtimeNotifier,
     notice: Option<PlaybackNotice>,
     current: Option<ClaimedPlayback>,
+    lineage: Option<Flow>,
     result: Option<PlaybackResult>,
+    fault: bool,
     rate: u32,
+    next_playback_sample_cursor: Option<u64>,
+    capture_sample_cursor_snapshot: Option<u64>,
+    #[cfg(test)]
+    cursor_audit: Arc<PlaybackCursorAudit>,
 }
 
 unsafe impl Send for NativePlaybackSource {}
 
 impl NativePlaybackSource {
+    fn accept_cursors(&mut self, report: &NativePlaybackRender) -> bool {
+        let Some(next) = report
+            .first_playback_sample_cursor
+            .checked_add(u64::from(report.rendered_frames))
+        else {
+            return false;
+        };
+        if self
+            .next_playback_sample_cursor
+            .is_some_and(|expected| expected != report.first_playback_sample_cursor)
+            || self
+                .capture_sample_cursor_snapshot
+                .is_some_and(|prior| prior > report.capture_sample_cursor_snapshot)
+        {
+            return false;
+        }
+        self.next_playback_sample_cursor = Some(next);
+        self.capture_sample_cursor_snapshot = Some(report.capture_sample_cursor_snapshot);
+        #[cfg(test)]
+        self.cursor_audit
+            .publish(next, report.capture_sample_cursor_snapshot);
+        true
+    }
+
     fn active(&self) -> bool {
         self.state
             .active(self.result.is_some() || self.notice.is_some() || self.current.is_some())
@@ -1406,7 +1725,7 @@ impl NativePlaybackSource {
     }
 
     fn publish_result(&mut self, result: PlaybackResult) -> bool {
-        if !self.state.done.try_push(result) {
+        if !self.state.retire(result) {
             self.result = Some(result);
             return false;
         }
@@ -1423,7 +1742,7 @@ impl NativePlaybackSource {
         let Some(result) = self.result else {
             return true;
         };
-        if !self.state.done.try_push(result) {
+        if !self.state.retire(result) {
             return false;
         }
         self.result = None;
@@ -1439,9 +1758,14 @@ impl NativePlaybackSource {
             unsafe { lfm_playback_consumer_release(self.consumer.as_ptr(), &current.lease) };
         let status = if status_code != 0 {
             status_code
+        } else if release == STATUS_STALE || release == STATUS_CANCELLED {
+            0
         } else {
             release
         };
+        if status != 0 {
+            self.fault = true;
+        }
         let _ = self.publish_result(PlaybackResult {
             flow: Flow {
                 session: current.session,
@@ -1451,6 +1775,55 @@ impl NativePlaybackSource {
             status,
         });
         dropped
+    }
+
+    fn observe(&mut self, frames: usize, flags: u32) -> bool {
+        if frames == 0 && flags == PLAYBACK_EVIDENCE_SILENCE {
+            return true;
+        }
+        let Ok(frames) = u32::try_from(frames) else {
+            return false;
+        };
+        let lease = self.current.as_ref().map_or(std::ptr::null(), |current| {
+            std::ptr::from_ref(&current.lease)
+        });
+        let mut report = NativePlaybackRender::default();
+        let status = unsafe {
+            lfm_playback_consumer_observe(
+                self.consumer.as_ptr(),
+                lease,
+                0,
+                frames,
+                flags,
+                &mut report,
+            )
+        };
+        if status == STATUS_STALE || status == STATUS_CANCELLED {
+            return true;
+        }
+        if status != 0 {
+            self.fault = true;
+            return false;
+        }
+        let Some(flow) = self.lineage else {
+            self.fault = true;
+            return false;
+        };
+        let valid = report.size as usize == std::mem::size_of::<NativePlaybackRender>()
+            && report.abi_version == RUNTIME_ABI
+            && report.session_id == flow.session
+            && report.stream_epoch == flow.epoch
+            && report.ticket == flow.ticket
+            && report.lease_id == 0
+            && report.buffer_generation == 0
+            && report.source_offset_frames == 0
+            && report.rendered_frames == frames
+            && report.flags == flags
+            && report.reserved0 == 0
+            && report.reserved == [0; 2];
+        let valid = valid && self.accept_cursors(&report);
+        self.fault |= !valid;
+        valid
     }
 
     fn claim(&mut self, write: &mut PlaybackWrite) -> bool {
@@ -1476,6 +1849,8 @@ impl NativePlaybackSource {
             return false;
         }
         if claim == STATUS_STALE || claim == STATUS_CANCELLED {
+            #[cfg(test)]
+            self.cursor_audit.retire_unclaimed();
             let _ = self.publish_result(PlaybackResult {
                 flow: notice.flow,
                 status: 0,
@@ -1483,6 +1858,7 @@ impl NativePlaybackSource {
             return false;
         }
         if claim != 0 {
+            self.fault = true;
             let _ = self.publish_result(PlaybackResult {
                 flow: notice.flow,
                 status: claim,
@@ -1493,7 +1869,19 @@ impl NativePlaybackSource {
             || lease.stream_epoch != notice.flow.epoch
             || lease.lease_id != notice.lease_id
             || lease.buffer_generation != notice.buffer_generation
+            || lease.size as usize != std::mem::size_of::<PcmLease>()
+            || lease.abi_version != RUNTIME_ABI
+            || lease.frames == 0
+            || lease.channels != 1
+            || lease.sample_rate != self.rate
+            || lease.format != PCM_FORMAT_F32
+            || lease.offset_bytes != 0
+            || lease.frames.checked_mul(std::mem::size_of::<f32>() as u32)
+                != Some(lease.length_bytes)
+            || lease.flags != PCM_LEASE_PLAYBACK
+            || lease.reserved != 0
         {
+            self.fault = true;
             let _ = unsafe { lfm_playback_consumer_release(self.consumer.as_ptr(), &lease) };
             let _ = self.publish_result(PlaybackResult {
                 flow: notice.flow,
@@ -1501,57 +1889,18 @@ impl NativePlaybackSource {
             });
             return false;
         }
-        let mut samples = std::ptr::null();
-        let mut count = 0usize;
-        let resolve = unsafe {
-            lfm_playback_consumer_resolve(self.consumer.as_ptr(), &lease, &mut samples, &mut count)
-        };
-        if resolve != 0 || samples.is_null() {
-            let _ = unsafe { lfm_playback_consumer_release(self.consumer.as_ptr(), &lease) };
-            let status = if resolve == STATUS_STALE || resolve == STATUS_CANCELLED {
-                0
-            } else {
-                resolve
-            };
-            let _ = self.publish_result(PlaybackResult {
-                flow: notice.flow,
-                status,
-            });
-            return false;
-        }
+        let count = lease.frames as usize;
         write.claimed_samples = write.claimed_samples.saturating_add(count);
+        self.lineage = Some(notice.flow);
         self.current = Some(ClaimedPlayback {
             session: notice.flow.session,
             lease,
             count,
             cursor: 0,
         });
+        #[cfg(test)]
+        self.cursor_audit.claim(count);
         true
-    }
-
-    fn resolve(&mut self) -> Option<*const f32> {
-        let Some(current) = self.current.as_ref() else {
-            return None;
-        };
-        let lease = current.lease;
-        let expected = current.count;
-        let mut samples = std::ptr::null();
-        let mut count = 0usize;
-        let status = unsafe {
-            lfm_playback_consumer_resolve(self.consumer.as_ptr(), &lease, &mut samples, &mut count)
-        };
-        if status == 0 && !samples.is_null() && count == expected {
-            return Some(samples);
-        }
-        let status = if status == STATUS_STALE || status == STATUS_CANCELLED {
-            0
-        } else if status != 0 {
-            status
-        } else {
-            STATUS_HOST_SINK
-        };
-        self.finish_current(status);
-        None
     }
 
     fn discard(&mut self, write: &mut PlaybackWrite) {
@@ -1575,80 +1924,121 @@ impl NativePlaybackSource {
         render: PlaybackRender<T>,
     ) -> PlaybackWrite {
         let mut write = PlaybackWrite::default();
-        if channels == 0 || output.len() % channels != 0 {
+        if channels == 0 {
             output.fill(silence);
+            let _ = self.observe(0, PLAYBACK_EVIDENCE_DISCONTINUITY);
+            self.fault = false;
+            write.active = self.active();
+            return write;
+        }
+        let frames = output.len() / channels;
+        if output.len() % channels != 0 {
+            output.fill(silence);
+            let _ = self.observe(0, PLAYBACK_EVIDENCE_DISCONTINUITY);
+            let _ = self.observe(frames, PLAYBACK_EVIDENCE_SILENCE);
+            self.fault = false;
             write.active = self.active();
             return write;
         }
         let Ok(native_channels) = u32::try_from(channels) else {
             output.fill(silence);
+            let _ = self.observe(0, PLAYBACK_EVIDENCE_DISCONTINUITY);
+            let _ = self.observe(frames, PLAYBACK_EVIDENCE_SILENCE);
+            self.fault = false;
             write.active = self.active();
             return write;
         };
-        let mut meter = PlaybackMeter::default();
-        if unsafe { lfm_playback_meter_reset(&mut meter) } != 0 {
-            std::process::abort();
-        }
         if !self.flush_result() {
             output.fill(silence);
             write.active = true;
             if self.audio_active() {
-                write.underrun_frames = output.len() / channels;
+                write.underrun_frames = frames;
             }
+            if std::mem::take(&mut self.fault) {
+                let _ = self.observe(0, PLAYBACK_EVIDENCE_DISCONTINUITY);
+            }
+            let _ = self.observe(frames, PLAYBACK_EVIDENCE_SILENCE);
             return write;
         }
         if flush {
             self.discard(&mut write);
+            self.fault = false;
             output.fill(silence);
+            let _ = self.observe(0, PLAYBACK_EVIDENCE_FLUSH | PLAYBACK_EVIDENCE_DISCONTINUITY);
+            let _ = self.observe(frames, PLAYBACK_EVIDENCE_SILENCE);
             write.active = self.active();
             return write;
         }
 
-        let frames = output.len() / channels;
         let mut frame = 0usize;
+        let mut broken = std::mem::take(&mut self.fault);
         while frame < frames {
             if self.current.is_none() && !self.claim(&mut write) {
                 break;
             }
-            let Some(samples) = self.resolve() else {
-                if self.result.is_some() {
-                    break;
-                }
-                continue;
-            };
-            let (source, count) = {
-                let current = self
-                    .current
-                    .as_ref()
-                    .expect("revalidated playback disappeared");
+            let (lease, cursor, count) = {
+                let current = self.current.as_ref().expect("claimed playback disappeared");
                 (
-                    unsafe { samples.add(current.cursor) },
+                    current.lease,
+                    current.cursor as u32,
                     (frames - frame).min(current.count - current.cursor),
                 )
             };
+            let count = count as u32;
             let offset = frame * channels;
+            let mut report = NativePlaybackRender::default();
             let status = unsafe {
                 render(
-                    source,
+                    self.consumer.as_ptr(),
+                    &lease,
+                    cursor,
                     output.as_mut_ptr().add(offset),
                     count,
                     native_channels,
                     output.len() - offset,
-                    &mut meter,
+                    &mut report,
                 )
             };
-            if status != 0 {
+            let valid = status == 0
+                && report.size as usize == std::mem::size_of::<NativePlaybackRender>()
+                && report.abi_version == RUNTIME_ABI
+                && report.session_id
+                    == self
+                        .current
+                        .as_ref()
+                        .expect("rendered playback disappeared")
+                        .session
+                && report.stream_epoch == lease.stream_epoch
+                && report.ticket == lease.ticket
+                && report.lease_id == lease.lease_id
+                && report.buffer_generation == lease.buffer_generation
+                && report.source_offset_frames == cursor
+                && report.rendered_frames == count
+                && report.flags == PLAYBACK_EVIDENCE_RENDERED
+                && report.reserved0 == 0
+                && report.reserved == [0; 2]
+                && self.accept_cursors(&report);
+            if !valid {
+                const RETIRED: [i32; 2] = [STATUS_STALE, STATUS_CANCELLED];
+                const FAILED: i32 = STATUS_HOST_SINK;
+                const OK: i32 = 0;
+                let failure = if RETIRED.contains(&status) {
+                    OK
+                } else {
+                    FAILED
+                };
                 write.dropped_samples = write
                     .dropped_samples
-                    .saturating_add(self.finish_current(STATUS_HOST_SINK));
+                    .saturating_add(self.finish_current(failure));
+                broken = true;
                 break;
             }
             let current = self
                 .current
                 .as_mut()
                 .expect("rendered playback disappeared");
-            current.cursor += count;
-            frame += count;
+            current.cursor += count as usize;
+            frame += count as usize;
             if current.cursor == current.count {
                 self.finish_current(0);
                 if self.result.is_some() {
@@ -1656,13 +2046,19 @@ impl NativePlaybackSource {
                 }
             }
         }
+        broken |= std::mem::take(&mut self.fault);
         output[frame * channels..].fill(silence);
         write.played_frames = frame;
-        write.rms = meter.rms;
         let audio_active = self.audio_active();
         write.active = self.active();
         if audio_active && frame < frames {
             write.underrun_frames = frames - frame;
+        }
+        if broken {
+            let _ = self.observe(0, PLAYBACK_EVIDENCE_DISCONTINUITY);
+        }
+        if frame < frames {
+            let _ = self.observe(frames - frame, PLAYBACK_EVIDENCE_SILENCE);
         }
         write
     }
@@ -1674,11 +2070,17 @@ impl PlaybackSource for NativePlaybackSource {
     }
 
     fn write_f32(&mut self, output: &mut [f32], channels: usize, flush: bool) -> PlaybackWrite {
-        self.write(output, channels, flush, 0.0, lfm_playback_render_f32)
+        self.write(
+            output,
+            channels,
+            flush,
+            0.0,
+            lfm_playback_consumer_render_f32,
+        )
     }
 
     fn write_i16(&mut self, output: &mut [i16], channels: usize, flush: bool) -> PlaybackWrite {
-        self.write(output, channels, flush, 0, lfm_playback_render_i16)
+        self.write(output, channels, flush, 0, lfm_playback_consumer_render_i16)
     }
 
     fn write_u16(&mut self, output: &mut [u16], channels: usize, flush: bool) -> PlaybackWrite {
@@ -1687,19 +2089,21 @@ impl PlaybackSource for NativePlaybackSource {
             channels,
             flush,
             u16::MAX / 2,
-            lfm_playback_render_u16,
+            lfm_playback_consumer_render_u16,
         )
     }
 }
 
 impl Drop for NativePlaybackSource {
     fn drop(&mut self) {
-        if let Some(current) = self.current.take() {
-            let _ =
-                unsafe { lfm_playback_consumer_release(self.consumer.as_ptr(), &current.lease) };
+        if self.current.is_some() {
+            self.finish_current(0);
         }
         let mut notice = self.notice.take().or_else(|| self.state.ready.try_pop());
-        while let Some(ready) = notice {
+        while self.result.is_none() {
+            let Some(ready) = notice else {
+                break;
+            };
             let mut lease = PcmLease::default();
             let claim = unsafe {
                 lfm_playback_consumer_claim(
@@ -1711,9 +2115,22 @@ impl Drop for NativePlaybackSource {
                     &mut lease,
                 )
             };
-            if claim == 0 {
-                let _ = unsafe { lfm_playback_consumer_release(self.consumer.as_ptr(), &lease) };
-            }
+            const RETIRED: [i32; 3] = [0, STATUS_STALE, STATUS_CANCELLED];
+            const FAILED: i32 = STATUS_HOST_SINK;
+            let release = (claim == 0)
+                .then(|| unsafe { lfm_playback_consumer_release(self.consumer.as_ptr(), &lease) });
+            let status = release.unwrap_or(claim);
+            let status = if RETIRED.contains(&status) {
+                0
+            } else if status == STATUS_WOULD_BLOCK {
+                0
+            } else {
+                FAILED
+            };
+            let _ = self.publish_result(PlaybackResult {
+                flow: ready.flow,
+                status,
+            });
             notice = self.state.ready.try_pop();
         }
         let destroy = unsafe { lfm_playback_consumer_destroy(self.consumer.as_ptr()) };
@@ -1736,6 +2153,7 @@ pub struct NativeLfm2VoiceEngine {
     sink: Option<Box<EventSink>>,
     replies: Arc<ReplyRing>,
     active: Option<NativeAction>,
+    pending_start: Option<Flow>,
     playback: Arc<PlaybackState>,
     pending_playback: Option<PlaybackNotice>,
     playback_taken: bool,
@@ -1749,6 +2167,8 @@ pub struct NativeLfm2VoiceEngine {
     joined: bool,
     #[cfg(test)]
     terminal_probe: Option<TerminalProbe>,
+    #[cfg(test)]
+    playback_cursor_audit: Arc<PlaybackCursorAudit>,
 }
 
 unsafe impl Send for NativeLfm2VoiceEngine {}
@@ -1848,6 +2268,8 @@ impl NativeLfm2VoiceEngine {
             max_callback_frames: capture_max_callback_frames,
         };
         let playback = PlaybackState::new();
+        #[cfg(test)]
+        let playback_cursor_audit = Arc::new(PlaybackCursorAudit::default());
         Ok(Self {
             _model: model,
             conversation: Some(claim.into_conversation()),
@@ -1860,6 +2282,7 @@ impl NativeLfm2VoiceEngine {
             sink: Some(sink),
             replies,
             active: None,
+            pending_start: None,
             playback,
             pending_playback: None,
             playback_taken: false,
@@ -1873,6 +2296,8 @@ impl NativeLfm2VoiceEngine {
             joined: false,
             #[cfg(test)]
             terminal_probe: None,
+            #[cfg(test)]
+            playback_cursor_audit,
         })
     }
 
@@ -1883,6 +2308,7 @@ impl NativeLfm2VoiceEngine {
             .expect("completed native action has no correlated flow");
         self.terminal_probe = Some(TerminalProbe {
             flow,
+            cancelled: action.cancelled,
             terminal_records: action.terminal_records,
             text_emissions: action.text_emissions,
             emitted_items: action.emitted_items,
@@ -1935,6 +2361,37 @@ impl NativeLfm2VoiceEngine {
         Ok(action)
     }
 
+    fn release_start(&self, flow: Flow) -> Result<bool, String> {
+        self.replies.start.release(flow)
+    }
+
+    fn resume_host(&self) -> Result<(), String> {
+        const CANCELLED: [i32; 2] = [0, STATUS_CANCELLED];
+        let capacity = unsafe { lfm_session_host_capacity(self.session.as_ptr()) };
+        if CANCELLED.contains(&capacity) {
+            return Ok(());
+        }
+        Err(format!(
+            "resume native host-capacity edge failed with status {capacity}"
+        ))
+    }
+
+    fn activate_pending_start(&mut self, emit: &mut dyn FnMut(VoiceEvent)) -> Result<bool, String> {
+        if self.active.is_some() {
+            return Ok(false);
+        }
+        let Some(flow) = self.pending_start.take() else {
+            return Ok(false);
+        };
+        self.active = Some(NativeAction::new(flow.ticket));
+        self.bind_action(flow)?;
+        emit(VoiceEvent::TurnStarted);
+        if self.release_start(flow)? {
+            self.resume_host()?;
+        }
+        Ok(true)
+    }
+
     fn install_resume(&mut self, resume: RealtimeNotifier) -> Result<(), String> {
         if self.started {
             return Err("native voice event continuation is already mounted".into());
@@ -1972,7 +2429,7 @@ impl NativeLfm2VoiceEngine {
         if !self.started {
             return Err("native voice event continuation is not mounted".into());
         }
-        if self.active.is_some() {
+        if self.active.is_some() || self.pending_start.is_some() {
             return Ok(false);
         }
         self.active = Some(NativeAction::new(ticket));
@@ -1994,22 +2451,10 @@ impl NativeLfm2VoiceEngine {
                 break;
             };
             drained += 1;
-            if done.status != 0 && done.status != STATUS_STALE && done.status != STATUS_CANCELLED {
-                return Err(format!(
-                    "native playback callback failed with status {}",
-                    done.status
-                ));
-            }
             let Some(action) = self.active.as_mut() else {
                 return Err("native playback retired without an active action".into());
             };
-            if action.flow != Some(done.flow) {
-                return Err(format!(
-                    "native playback retirement changed flow (expected={:?}, received={:?})",
-                    action.flow, done.flow
-                ));
-            }
-            action.playback = action.playback.saturating_add(1);
+            action.retire(done)?;
         }
         Ok(drained)
     }
@@ -2020,7 +2465,7 @@ impl NativeLfm2VoiceEngine {
         if text.is_empty() || text.len() > 2_048 {
             return Err("native typed input must contain 1..=2048 UTF-8 bytes".into());
         }
-        if self.active.is_some() {
+        if self.active.is_some() || self.pending_start.is_some() {
             return Ok(false);
         }
         let mut ticket = Ticket::default();
@@ -2044,6 +2489,7 @@ impl NativeLfm2VoiceEngine {
         cancel: &AtomicBool,
         emit: &mut dyn FnMut(VoiceEvent),
     ) -> Result<EngineProgress, String> {
+        self.activate_pending_start(emit)?;
         if let Some(action) = self.active.as_mut() {
             if cancel.load(Ordering::Acquire) {
                 action.cancelled = true;
@@ -2052,11 +2498,7 @@ impl NativeLfm2VoiceEngine {
         }
 
         self.drain_playback_results()?;
-        let complete = self.active.as_ref().is_some_and(|action| {
-            action
-                .terminal
-                .is_some_and(|(has_audio, playback)| !has_audio || action.playback >= playback)
-        });
+        let complete = self.active.as_ref().is_some_and(NativeAction::settled);
         if complete {
             let action = self
                 .active
@@ -2090,12 +2532,63 @@ impl NativeLfm2VoiceEngine {
                 Reply::TurnStarted { flow } => {
                     if self.active.is_none() {
                         self.active = Some(NativeAction::new(flow.ticket));
+                        if let Err(error) = self.bind_action(flow) {
+                            let _ = self.release_start(flow);
+                            result = Err(error);
+                            break;
+                        }
                         emit(VoiceEvent::TurnStarted);
+                        if let Err(error) = self.release_start(flow) {
+                            result = Err(error);
+                            break;
+                        }
+                        continue;
                     }
-                    if let Err(error) = self.bind_action(flow) {
+                    let same = self
+                        .active
+                        .as_ref()
+                        .is_some_and(|action| action.ticket == flow.ticket);
+                    if same {
+                        if self
+                            .active
+                            .as_ref()
+                            .is_some_and(|action| action.flow.is_some())
+                        {
+                            let _ = self.release_start(flow);
+                            result = Err("native action published a duplicate turn-start".into());
+                            break;
+                        }
+                        if let Err(error) = self.bind_action(flow) {
+                            let _ = self.release_start(flow);
+                            result = Err(error);
+                            break;
+                        }
+                        if let Err(error) = self.release_start(flow) {
+                            result = Err(error);
+                            break;
+                        }
+                        continue;
+                    }
+                    if let Err(error) = self.accept_flow(flow) {
+                        let _ = self.release_start(flow);
                         result = Err(error);
                         break;
                     }
+                    if flow.ticket.kind != TICKET_TURN {
+                        let _ = self.release_start(flow);
+                        result = Err(format!(
+                            "native successor turn-start carried ticket kind {} instead of {TICKET_TURN}",
+                            flow.ticket.kind
+                        ));
+                        break;
+                    }
+                    let action = self.active.as_ref().expect("active checked above");
+                    if let Err(error) = retain_successor(&mut self.pending_start, action, flow) {
+                        let _ = self.release_start(flow);
+                        result = Err(error);
+                        break;
+                    }
+                    break;
                 }
                 Reply::Text { flow, payload } => match self.bind_action(flow) {
                     Ok(action) if !action.cancelled => {
@@ -2162,18 +2655,22 @@ impl NativeLfm2VoiceEngine {
                             Err("native action published more than one terminal record".into());
                         break;
                     }
+                    #[cfg(test)]
+                    {
+                        action.emitted_items = emitted_items;
+                    }
                     if status == STATUS_STALE || status == STATUS_CANCELLED {
                         action.cancelled = true;
                         action.text.reset();
-                        action.terminal = Some((false, 0));
+                        // Cancellation suppresses publication; it does not
+                        // revoke playback leases that were already promised
+                        // to the physical endpoint. Retain the native count so
+                        // the action cannot settle until every lease retires.
+                        action.terminal = Some((has_audio, playback_leases));
                     } else if status != 0 {
                         result = Err(format!("native turn failed with status {status}"));
                         break;
                     } else {
-                        #[cfg(test)]
-                        {
-                            action.emitted_items = emitted_items;
-                        }
                         if !action.cancelled {
                             action
                                 .text
@@ -2219,9 +2716,23 @@ impl NativeLfm2VoiceEngine {
                     }
                     self.stopped = true;
                     self.stopped_flow = Some(flow);
+                    let mut failure = self.pending_start.take().map(|successor| {
+                        format!(
+                            "native STOPPED skipped retained successor turn-start {successor:?}"
+                        )
+                    });
                     if status != 0 {
-                        result = Err(format!("native voice session stopped with status {status}"));
-                        break;
+                        let status = format!("native voice session stopped with status {status}");
+                        if let Some(previous) = failure.as_mut() {
+                            previous.push_str("; ");
+                            previous.push_str(&status);
+                        } else {
+                            failure = Some(status);
+                        }
+                    }
+                    if let Some(failure) = failure {
+                        self.healthy = false;
+                        emit(VoiceEvent::Error(failure));
                     }
                     if let Some(mut action) = self.active.take() {
                         action.cancelled = true;
@@ -2233,11 +2744,7 @@ impl NativeLfm2VoiceEngine {
                 }
             }
 
-            let complete = self.active.as_ref().is_some_and(|action| {
-                action
-                    .terminal
-                    .is_some_and(|(has_audio, playback)| !has_audio || action.playback >= playback)
-            });
+            let complete = self.active.as_ref().is_some_and(NativeAction::settled);
             if complete {
                 let action = self
                     .active
@@ -2257,11 +2764,10 @@ impl NativeLfm2VoiceEngine {
         }
 
         if drained != 0 {
-            let capacity = unsafe { lfm_session_host_capacity(self.session.as_ptr()) };
-            if capacity != 0 && capacity != STATUS_CANCELLED && result.is_ok() {
-                result = Err(format!(
-                    "resume native host-capacity edge failed with status {capacity}"
-                ));
+            if let Err(error) = self.resume_host() {
+                if result.is_ok() {
+                    result = Err(error);
+                }
             }
         }
         if result.is_err() {
@@ -2276,6 +2782,16 @@ impl NativeLfm2VoiceEngine {
             Ok(EngineProgress::Complete | EngineProgress::Stopped)
         ) {
             return result;
+        }
+        if self.pending_start.is_some() {
+            if self.active.is_none() || !self.playback.done.is_empty() {
+                return Ok(EngineProgress::Continue);
+            }
+            /* Later replies belong to the retained successor. Its predecessor
+             * still owns playback, so only the device retirement callback may
+             * resume this continuation. Re-draining the reply ring here would
+             * cross ticket identity and turn Continue into a spin loop. */
+            return Ok(EngineProgress::Dormant);
         }
         if self.pending_playback.is_none()
             && (!self.replies.is_empty() || !self.playback.done.is_empty())
@@ -2319,8 +2835,14 @@ impl VoiceEngine for NativeLfm2VoiceEngine {
             notify,
             notice: None,
             current: None,
+            lineage: None,
             result: None,
+            fault: false,
             rate: self.playback_rate,
+            next_playback_sample_cursor: None,
+            capture_sample_cursor_snapshot: None,
+            #[cfg(test)]
+            cursor_audit: Arc::clone(&self.playback_cursor_audit),
         })))
     }
 
@@ -2361,11 +2883,12 @@ impl VoiceEngine for NativeLfm2VoiceEngine {
         if self.joined {
             return Ok(());
         }
-        // Retire all Rust-owned native endpoints first. Session stop/join is a
-        // terminal state-machine edge, not a way to cancel live callback leases.
+        // Close native admission before retiring Rust-owned callback endpoints.
+        // Destroying capture while the session is live is a real device-loss
+        // edge; administrative shutdown must never forge that failure.
+        self.request_stop();
         self.control.take();
         self.capture.take();
-        self.request_stop();
         let join = unsafe { lfm_session_join(self.session.as_ptr()) };
         if join == 0 {
             self.joined = true;
@@ -2428,6 +2951,11 @@ fn status(code: i32, operation: &str) -> Result<(), String> {
     if code == STATUS_BUSY {
         return Err(format!("{operation}: native owner is busy"));
     }
+    if code == STATUS_UNSUPPORTED {
+        return Err(format!(
+            "{operation}: this platform has no production monotonic deadline backend"
+        ));
+    }
     Err(format!("{operation} failed with native status {code}"))
 }
 
@@ -2446,6 +2974,8 @@ mod real_checkpoint_gate {
     const CAPTURE_CHUNK_MS: usize = 20;
     const CAPTURE_TAIL_MS: usize = 1_000;
     const JOINED: u32 = 4;
+    const MIMI_CODEC_OUTPUT_RATE: u64 = 24_000;
+    const MIMI_CODEC_FRAME_SAMPLES: u64 = 1_920;
 
     #[repr(C)]
     #[derive(Clone, Copy)]
@@ -2652,8 +3182,14 @@ mod real_checkpoint_gate {
         pcm: Vec<f32>,
         rate: u32,
         flow: Flow,
+        interrupted: bool,
+        playback_leases: u64,
+        claimed_leases: u64,
+        unclaimed_leases: u64,
         claimed: usize,
         played: usize,
+        dropped: usize,
+        underrun: usize,
         blocks: usize,
         terminals: usize,
     }
@@ -2684,10 +3220,76 @@ mod real_checkpoint_gate {
         }
     }
 
+    fn validate_codec_duration<'a>(
+        label: &str,
+        turns: impl Iterator<Item = &'a Turn>,
+        playback_leases: u64,
+    ) -> Result<(), String> {
+        let mut rate = None;
+        let mut leases = 0u128;
+        for turn in turns {
+            if rate.is_some_and(|prior| prior != turn.rate) {
+                return Err(format!(
+                    "{label} changed its device sample rate between turns"
+                ));
+            }
+            rate = Some(turn.rate);
+            leases = leases
+                .checked_add(u128::from(turn.playback_leases))
+                .ok_or_else(|| format!("{label} playback-lease accounting overflow"))?;
+            if turn.claimed_leases.checked_add(turn.unclaimed_leases) != Some(turn.playback_leases)
+                || turn.claimed != turn.played.saturating_add(turn.dropped)
+                || turn.played != turn.pcm.len()
+                || turn.underrun != 0
+            {
+                return Err(format!(
+                    "{label} lost correlated playback accounting on ticket {}",
+                    turn.flow.ticket.sequence
+                ));
+            }
+            let numerator = u128::from(MIMI_CODEC_FRAME_SAMPLES) * u128::from(turn.rate);
+            if numerator % u128::from(MIMI_CODEC_OUTPUT_RATE) != 0 {
+                return Err(format!(
+                    "{label} device rate {} cannot represent one Mimi frame exactly",
+                    turn.rate
+                ));
+            }
+            let frames_per_lease = numerator / u128::from(MIMI_CODEC_OUTPUT_RATE);
+            if turn.claimed as u128 != u128::from(turn.claimed_leases) * frames_per_lease
+                || (!turn.interrupted
+                    && (turn.dropped != 0
+                        || turn.unclaimed_leases != 0
+                        || turn.played as u128
+                            != u128::from(turn.playback_leases) * frames_per_lease))
+            {
+                return Err(format!(
+                    "{label} changed Mimi duration on ticket {}: device={} played + {} discarded frames at {} Hz, claimed/published leases={}/{}, expected {} frames/lease from {MIMI_CODEC_FRAME_SAMPLES}@{MIMI_CODEC_OUTPUT_RATE} Hz",
+                    turn.flow.ticket.sequence,
+                    turn.played,
+                    turn.dropped,
+                    turn.rate,
+                    turn.claimed_leases,
+                    turn.playback_leases,
+                    frames_per_lease,
+                ));
+            }
+        }
+        rate.ok_or_else(|| format!("{label} has no PCM duration evidence"))?;
+        if leases != u128::from(playback_leases) {
+            return Err(format!(
+                "{label} terminal playback leases {leases} did not match session publication count {playback_leases}"
+            ));
+        }
+        Ok(())
+    }
+
     struct Report {
         turns: Vec<Turn>,
         snapshot: SessionSnapshot,
         stopped: Flow,
+        capture_sample_cursor: u64,
+        playback_sample_cursor: u64,
+        playback_evidence_reports: u64,
     }
 
     #[derive(Debug)]
@@ -2704,9 +3306,82 @@ mod real_checkpoint_gate {
         Done,
     }
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum StopAction {
+        Idle,
+        Started,
+        Interrupted,
+    }
+
+    impl StopAction {
+        fn start(&mut self) -> Result<(), &'static str> {
+            match self {
+                Self::Idle => {
+                    *self = Self::Started;
+                    Ok(())
+                }
+                Self::Started => Err("published a duplicate turn-start while stopping"),
+                Self::Interrupted => Err("published a turn-start after its interruption"),
+            }
+        }
+
+        fn finish(&mut self) -> Result<(), &'static str> {
+            match self {
+                Self::Started => {
+                    *self = Self::Idle;
+                    Ok(())
+                }
+                Self::Idle => Err("completed an action before its turn-start"),
+                Self::Interrupted => Err("completed an action after its interruption"),
+            }
+        }
+
+        fn interrupt(&mut self) -> Result<(), &'static str> {
+            match self {
+                Self::Started => {
+                    *self = Self::Interrupted;
+                    Ok(())
+                }
+                Self::Idle => Err("published an interruption before its turn-start"),
+                Self::Interrupted => Err("published a duplicate interruption"),
+            }
+        }
+
+        fn retire_interrupted(&mut self) -> Result<(), &'static str> {
+            match self {
+                Self::Interrupted => {
+                    *self = Self::Idle;
+                    Ok(())
+                }
+                Self::Idle => Err("retired an interruption before its turn-start"),
+                Self::Started => Err("retired an action before its interruption"),
+            }
+        }
+
+        fn stopped(self) -> Result<(), &'static str> {
+            match self {
+                Self::Idle | Self::Interrupted => Ok(()),
+                Self::Started => Err("published STOPPED before interrupting its started action"),
+            }
+        }
+    }
+
+    fn stop_event(state: &mut StopAction, event: VoiceEvent) -> Result<(), String> {
+        match event {
+            VoiceEvent::TurnStarted => state.start().map_err(str::to_owned),
+            VoiceEvent::Interrupted => state.interrupt().map_err(str::to_owned),
+            VoiceEvent::Text(_) => Err("published text while stopping".into()),
+            VoiceEvent::TurnComplete => Err("published turn-complete while stopping".into()),
+            VoiceEvent::Error(error) => Err(format!("published an error while stopping: {error}")),
+        }
+    }
+
     struct GateExit {
         engine: NativeLfm2VoiceEngine,
         turns: Vec<Turn>,
+        capture_sample_cursor: u64,
+        playback_sample_cursor: u64,
+        playback_evidence_reports: u64,
         error: Option<String>,
     }
 
@@ -2727,12 +3402,39 @@ mod real_checkpoint_gate {
         claimed: usize,
         played: usize,
         blocks: usize,
+        capture_sample_cursor: u64,
+        playback_sample_cursor: u64,
+        playback_evidence_reports: u64,
+        stop: StopAction,
         error: Option<String>,
         result: ResultCell,
         trace: bool,
     }
 
     impl Gate {
+        fn audit_playback_cursors(&mut self) -> Result<(), String> {
+            let (reports, playback, capture) = self
+                .engine
+                .as_ref()
+                .ok_or("native truth-gate engine retired before cursor evidence")?
+                .playback_cursor_audit
+                .snapshot();
+            if reports < self.playback_evidence_reports || playback < self.playback_sample_cursor {
+                return Err("native playback cursor evidence regressed".into());
+            }
+            if reports != self.playback_evidence_reports {
+                if capture != self.capture_sample_cursor {
+                    return Err(format!(
+                        "native playback evidence captured the wrong input cursor (native={capture}, callback={})",
+                        self.capture_sample_cursor
+                    ));
+                }
+                self.playback_evidence_reports = reports;
+                self.playback_sample_cursor = playback;
+            }
+            Ok(())
+        }
+
         fn step(&mut self) -> ServiceOutcome {
             match self.advance() {
                 Ok(outcome) => outcome,
@@ -2762,6 +3464,9 @@ mod real_checkpoint_gate {
                 {
                     return Err("native typed turn was not admitted".into());
                 }
+                self.stop
+                    .start()
+                    .map_err(|error| format!("native truth gate {error}"))?;
                 self.ticket = self
                     .engine()?
                     .active
@@ -2818,16 +3523,22 @@ mod real_checkpoint_gate {
                             .ok_or("native audio turn-start has no correlated action")?
                             .ticket;
                         self.check_ticket(ticket)?;
+                        self.stop
+                            .start()
+                            .map_err(|error| format!("native truth gate {error}"))?;
                         self.ticket = ticket;
                         self.phase = Phase::Generate(audio_turn);
                     }
                     VoiceEvent::Text(text) => self.transcript.push_str(&text),
                     VoiceEvent::TurnComplete => terminals += 1,
                     VoiceEvent::Interrupted => {
+                        self.stop
+                            .interrupt()
+                            .map_err(|error| format!("native truth gate {error}"))?;
                         return Err(format!(
                             "native truth gate turn {} was interrupted",
                             turn + 1
-                        ))
+                        ));
                     }
                     VoiceEvent::Error(error) => return Err(error),
                 }
@@ -2853,6 +3564,9 @@ mod real_checkpoint_gate {
                     );
                 }
                 self.finish_turn(turn)?;
+                self.stop
+                    .finish()
+                    .map_err(|error| format!("native truth gate {error}"))?;
                 if self.trace {
                     eprintln!("[native-e2e] gate completed turn {}", turn + 1);
                 }
@@ -2882,6 +3596,7 @@ mod real_checkpoint_gate {
                 .as_mut()
                 .ok_or("native playback source retired during generation")?
                 .write_f32(&mut block, 1, false);
+            self.audit_playback_cursors()?;
             if write.dropped_samples != 0 || write.underrun_frames != 0 {
                 return Err(format!(
                     "native playback was discontinuous (dropped={}, underrun={})",
@@ -2933,6 +3648,10 @@ mod real_checkpoint_gate {
                     {
                         return Err("native capture sink dropped a complete callback block".into());
                     }
+                    self.capture_sample_cursor = self
+                        .capture_sample_cursor
+                        .checked_add(write.admitted_frames as u64)
+                        .ok_or("native truth-gate capture cursor overflow")?;
                     *cursor = end;
                     return Ok(ServiceOutcome::Continue);
                 }
@@ -2958,6 +3677,10 @@ mod real_checkpoint_gate {
                     {
                         return Err("native capture sink dropped a silent callback block".into());
                     }
+                    self.capture_sample_cursor = self
+                        .capture_sample_cursor
+                        .checked_add(write.admitted_frames as u64)
+                        .ok_or("native truth-gate capture cursor overflow")?;
                     *silence += frames;
                     return Ok(ServiceOutcome::Continue);
                 }
@@ -3079,8 +3802,14 @@ mod real_checkpoint_gate {
                     .ok_or("native playback source retired before turn evidence")?
                     .rate(),
                 flow: probe.flow,
+                interrupted: false,
+                playback_leases: u64::from(probe.playback_leases),
+                claimed_leases: u64::from(probe.playback_leases),
+                unclaimed_leases: 0,
                 claimed: std::mem::take(&mut self.claimed),
                 played: std::mem::take(&mut self.played),
+                dropped: 0,
+                underrun: 0,
                 blocks: std::mem::take(&mut self.blocks),
                 terminals: std::mem::take(&mut self.terminals),
             });
@@ -3097,12 +3826,12 @@ mod real_checkpoint_gate {
                 }
             }
             if !matches!(self.phase, Phase::Stopping | Phase::Done) {
-                self.source.take();
-                self.capture.take();
                 let started = self.engine.as_ref().is_some_and(|engine| engine.started);
                 if let Some(engine) = self.engine.as_mut() {
                     engine.request_stop();
                 }
+                self.source.take();
+                self.capture.take();
                 if !started {
                     let mut engine = self
                         .engine
@@ -3112,6 +3841,9 @@ mod real_checkpoint_gate {
                     let exit = GateExit {
                         engine,
                         turns: std::mem::take(&mut self.turns),
+                        capture_sample_cursor: self.capture_sample_cursor,
+                        playback_sample_cursor: self.playback_sample_cursor,
+                        playback_evidence_reports: self.playback_evidence_reports,
                         error: self.error.take(),
                     };
                     *self
@@ -3136,25 +3868,32 @@ mod real_checkpoint_gate {
                 Ok(progress) => progress,
                 Err(error) => {
                     self.begin_stop(Some(error));
-                    if !self.engine.as_ref().is_some_and(|engine| engine.stopped) {
-                        return Ok(ServiceOutcome::Dormant);
+                    if self.engine.as_ref().is_some_and(|engine| engine.stopped) {
+                        EngineProgress::Stopped
+                    } else {
+                        EngineProgress::Dormant
                     }
-                    EngineProgress::Stopped
                 }
             };
             for event in events {
-                if !matches!(event, VoiceEvent::Interrupted) {
-                    return Err(
-                        "native truth gate published a non-stop event while retiring".into(),
-                    );
+                if let Err(error) = stop_event(&mut self.stop, event) {
+                    self.begin_stop(Some(format!("native truth gate {error}")));
                 }
             }
             if progress != EngineProgress::Stopped {
-                return Ok(if progress == EngineProgress::Continue {
-                    ServiceOutcome::Continue
-                } else {
-                    ServiceOutcome::Dormant
-                });
+                return Ok(
+                    if matches!(
+                        progress,
+                        EngineProgress::Continue | EngineProgress::Complete
+                    ) {
+                        ServiceOutcome::Continue
+                    } else {
+                        ServiceOutcome::Dormant
+                    },
+                );
+            }
+            if let Err(error) = self.stop.stopped() {
+                self.begin_stop(Some(format!("native truth gate {error}")));
             }
             let mut engine = self
                 .engine
@@ -3170,6 +3909,9 @@ mod real_checkpoint_gate {
             let exit = GateExit {
                 engine,
                 turns: std::mem::take(&mut self.turns),
+                capture_sample_cursor: self.capture_sample_cursor,
+                playback_sample_cursor: self.playback_sample_cursor,
+                playback_evidence_reports: self.playback_evidence_reports,
                 error: self.error.take(),
             };
             *self
@@ -3205,18 +3947,28 @@ mod real_checkpoint_gate {
 
     struct Exchange {
         side: Side,
+        cause: Option<usize>,
+        forwarded: usize,
         turn: Turn,
     }
 
     struct DuoReport {
         exchanges: Vec<Exchange>,
+        a_to_b: usize,
+        b_to_a: usize,
         a: SessionSnapshot,
         b: SessionSnapshot,
         stopped_a: Flow,
         stopped_b: Flow,
+        capture_a_sample_cursor: u64,
+        capture_b_sample_cursor: u64,
+        playback_a_sample_cursor: u64,
+        playback_b_sample_cursor: u64,
+        playback_a_evidence_reports: u64,
+        playback_b_evidence_reports: u64,
     }
 
-    const DUO_ROUTE: [(Side, bool); 3] = [(Side::A, true), (Side::B, true), (Side::A, false)];
+    const DUO_ACTION_LIMIT: usize = 16;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum DuoLeg {
@@ -3229,11 +3981,15 @@ mod real_checkpoint_gate {
         transcript: String,
         pcm: Vec<f32>,
         ticket: Ticket,
+        cause: Option<usize>,
         claimed: usize,
         played: usize,
+        dropped: usize,
+        underrun: usize,
         blocks: usize,
         terminals: usize,
         forwarded: usize,
+        claim_base: (u64, u64, u64),
     }
 
     impl DuoLane {
@@ -3243,11 +3999,15 @@ mod real_checkpoint_gate {
                 transcript: String::new(),
                 pcm: Vec::new(),
                 ticket: Ticket::default(),
+                cause: None,
                 claimed: 0,
                 played: 0,
+                dropped: 0,
+                underrun: 0,
                 blocks: 0,
                 terminals: 0,
                 forwarded: 0,
+                claim_base: (0, 0, 0),
             }
         }
     }
@@ -3274,6 +4034,14 @@ mod real_checkpoint_gate {
         engine_a: NativeLfm2VoiceEngine,
         engine_b: NativeLfm2VoiceEngine,
         exchanges: Vec<Exchange>,
+        a_to_b: Option<usize>,
+        b_to_a: Option<usize>,
+        capture_a_sample_cursor: u64,
+        capture_b_sample_cursor: u64,
+        playback_a_sample_cursor: u64,
+        playback_b_sample_cursor: u64,
+        playback_a_evidence_reports: u64,
+        playback_b_evidence_reports: u64,
         error: Option<String>,
     }
 
@@ -3297,14 +4065,82 @@ mod real_checkpoint_gate {
         lane_b: DuoLane,
         exchanges: Vec<Option<Exchange>>,
         next: usize,
+        forwarding: bool,
+        last_to_a: Option<usize>,
+        last_to_b: Option<usize>,
+        a_to_b: Option<usize>,
+        b_to_a: Option<usize>,
         pending_a: Vec<VoiceEvent>,
         pending_b: Vec<VoiceEvent>,
+        stop_a: StopAction,
+        stop_b: StopAction,
+        capture_a_sample_cursor: u64,
+        capture_b_sample_cursor: u64,
+        playback_a_sample_cursor: u64,
+        playback_b_sample_cursor: u64,
+        playback_a_evidence_reports: u64,
+        playback_b_evidence_reports: u64,
         error: Option<String>,
         result: DuoResultCell,
         trace: bool,
     }
 
     impl Duo {
+        fn audit_playback_cursors(&mut self, side: Side) -> Result<(), String> {
+            let (reports, playback, capture) = match side {
+                Side::A => self
+                    .engine_a
+                    .as_ref()
+                    .ok_or("self-chat A engine retired before cursor evidence")?
+                    .playback_cursor_audit
+                    .snapshot(),
+                Side::B => self
+                    .engine_b
+                    .as_ref()
+                    .ok_or("self-chat B engine retired before cursor evidence")?
+                    .playback_cursor_audit
+                    .snapshot(),
+            };
+            let (expected_capture, prior_playback, prior_reports) = match side {
+                Side::A => (
+                    self.capture_a_sample_cursor,
+                    self.playback_a_sample_cursor,
+                    self.playback_a_evidence_reports,
+                ),
+                Side::B => (
+                    self.capture_b_sample_cursor,
+                    self.playback_b_sample_cursor,
+                    self.playback_b_evidence_reports,
+                ),
+            };
+            if reports < prior_reports || playback < prior_playback {
+                return Err(format!(
+                    "self-chat {} playback cursor evidence regressed",
+                    side.name()
+                ));
+            }
+            if reports == prior_reports {
+                return Ok(());
+            }
+            if capture != expected_capture {
+                return Err(format!(
+                    "self-chat {} playback evidence captured the wrong input cursor (native={capture}, callback={expected_capture})",
+                    side.name()
+                ));
+            }
+            match side {
+                Side::A => {
+                    self.playback_a_sample_cursor = playback;
+                    self.playback_a_evidence_reports = reports;
+                }
+                Side::B => {
+                    self.playback_b_sample_cursor = playback;
+                    self.playback_b_evidence_reports = reports;
+                }
+            }
+            Ok(())
+        }
+
         fn step(&mut self) -> ServiceOutcome {
             match self.advance() {
                 Ok(outcome) => outcome,
@@ -3355,6 +4191,36 @@ mod real_checkpoint_gate {
                     .as_mut()
                     .ok_or("self-chat B engine disappeared before mount")?
                     .mount_events(events_b)?;
+                let source_a_rate = self
+                    .source_a
+                    .as_ref()
+                    .ok_or("self-chat A playback source disappeared before rate validation")?
+                    .rate();
+                let source_b_rate = self
+                    .source_b
+                    .as_ref()
+                    .ok_or("self-chat B playback source disappeared before rate validation")?
+                    .rate();
+                let capture_a_rate = self
+                    .capture_a
+                    .as_ref()
+                    .ok_or("self-chat A capture sink disappeared before rate validation")?
+                    .rate();
+                let capture_b_rate = self
+                    .capture_b
+                    .as_ref()
+                    .ok_or("self-chat B capture sink disappeared before rate validation")?
+                    .rate();
+                if source_a_rate != capture_b_rate
+                    || source_b_rate != capture_a_rate
+                    || source_a_rate != self.fixture.rate
+                    || source_b_rate != self.fixture.rate
+                {
+                    return Err(format!(
+                        "self-chat sample clocks disagree (A playback={source_a_rate}, B capture={capture_b_rate}, B playback={source_b_rate}, A capture={capture_a_rate}, fixture={})",
+                        self.fixture.rate
+                    ));
+                }
                 self.bootstrap = Some(DuoBootstrap {
                     cursor: 0,
                     silence: 0,
@@ -3386,19 +4252,16 @@ mod real_checkpoint_gate {
             }
             let events_a = std::mem::take(&mut self.pending_a);
             let events_b = std::mem::take(&mut self.pending_b);
-            if DUO_ROUTE
-                .get(self.next)
-                .is_some_and(|route| route.0 == Side::B)
-            {
-                self.process(Side::B, events_b, progress_b)?;
-                self.process(Side::A, events_a, progress_a)?;
-            } else {
-                self.process(Side::A, events_a, progress_a)?;
-                self.process(Side::B, events_b, progress_b)?;
-            }
+            self.process(Side::A, events_a, progress_a)?;
+            self.process(Side::B, events_b, progress_b)?;
 
-            let mut ready =
-                progress_a == EngineProgress::Continue || progress_b == EngineProgress::Continue;
+            let mut ready = matches!(
+                progress_a,
+                EngineProgress::Continue | EngineProgress::Complete
+            ) || matches!(
+                progress_b,
+                EngineProgress::Continue | EngineProgress::Complete
+            );
             if matches!(self.lane_a.leg, DuoLeg::Running(_)) {
                 ready |= self.pump(Side::A)?;
             }
@@ -3409,12 +4272,15 @@ mod real_checkpoint_gate {
             ready |= self.feed_tail(Side::A)?;
             ready |= self.feed_tail(Side::B)?;
 
-            if self.exchanges.iter().all(Option::is_some)
+            if self.b_to_a.is_some()
+                && self.exchanges[..self.next].iter().all(Option::is_some)
                 && self.lane_a.leg == DuoLeg::Idle
                 && self.lane_b.leg == DuoLeg::Idle
                 && self.bootstrap.is_none()
                 && self.tail_a.is_none()
                 && self.tail_b.is_none()
+                && progress_a == EngineProgress::Dormant
+                && progress_b == EngineProgress::Dormant
             {
                 return Ok(self.begin_stop(None));
             }
@@ -3437,6 +4303,33 @@ mod real_checkpoint_gate {
                 Side::A => &mut self.lane_a,
                 Side::B => &mut self.lane_b,
             }
+        }
+
+        fn stop(&self, side: Side) -> StopAction {
+            match side {
+                Side::A => self.stop_a,
+                Side::B => self.stop_b,
+            }
+        }
+
+        fn stop_mut(&mut self, side: Side) -> &mut StopAction {
+            match side {
+                Side::A => &mut self.stop_a,
+                Side::B => &mut self.stop_b,
+            }
+        }
+
+        fn lineage(&self, exchange: usize) -> Option<(Side, Option<usize>)> {
+            if self.lane_a.leg == DuoLeg::Running(exchange) {
+                return Some((Side::A, self.lane_a.cause));
+            }
+            if self.lane_b.leg == DuoLeg::Running(exchange) {
+                return Some((Side::B, self.lane_b.cause));
+            }
+            self.exchanges
+                .get(exchange)
+                .and_then(Option::as_ref)
+                .map(|settled| (settled.side, settled.cause))
         }
 
         fn process(
@@ -3469,7 +4362,17 @@ mod real_checkpoint_gate {
                         lane.terminals = lane.terminals.saturating_add(1);
                     }
                     VoiceEvent::Interrupted => {
-                        return Err(format!("self-chat {} was interrupted", side.name()))
+                        let lane = self.lane_mut(side);
+                        if !matches!(lane.leg, DuoLeg::Running(_)) {
+                            return Err(format!(
+                                "self-chat {} received an uncorrelated interruption",
+                                side.name()
+                            ));
+                        }
+                        lane.terminals = lane.terminals.saturating_add(1);
+                        self.stop_mut(side)
+                            .interrupt()
+                            .map_err(|error| format!("self-chat {} {error}", side.name()))?;
                     }
                     VoiceEvent::Error(error) => return Err(error),
                 }
@@ -3505,7 +4408,7 @@ mod real_checkpoint_gate {
                         side.name()
                     ));
                 }
-                self.finish_exchange(side, exchange)?;
+                self.finish_exchange(side, exchange, self.stop(side) == StopAction::Interrupted)?;
                 return Ok(());
             }
             if terminals != 0 {
@@ -3519,26 +4422,23 @@ mod real_checkpoint_gate {
 
         fn pump(&mut self, side: Side) -> Result<bool, String> {
             let mut block = [0.0f32; DEVICE_FRAMES];
-            let write = match side {
-                Side::A => self
-                    .source_a
-                    .as_mut()
-                    .ok_or("self-chat A playback source retired")?
-                    .write_f32(&mut block, 1, false),
-                Side::B => self
-                    .source_b
-                    .as_mut()
-                    .ok_or("self-chat B playback source retired")?
-                    .write_f32(&mut block, 1, false),
+            let (source_rate, write) = match side {
+                Side::A => {
+                    let source = self
+                        .source_a
+                        .as_mut()
+                        .ok_or("self-chat A playback source retired")?;
+                    (source.rate(), source.write_f32(&mut block, 1, false))
+                }
+                Side::B => {
+                    let source = self
+                        .source_b
+                        .as_mut()
+                        .ok_or("self-chat B playback source retired")?;
+                    (source.rate(), source.write_f32(&mut block, 1, false))
+                }
             };
-            if write.dropped_samples != 0 || write.underrun_frames != 0 {
-                return Err(format!(
-                    "self-chat {} playback was discontinuous (dropped={}, underrun={})",
-                    side.name(),
-                    write.dropped_samples,
-                    write.underrun_frames
-                ));
-            }
+            self.audit_playback_cursors(side)?;
             if write.played_frames > block.len()
                 || block[..write.played_frames]
                     .iter()
@@ -3559,12 +4459,20 @@ mod real_checkpoint_gate {
                 let DuoLeg::Running(exchange) = leg else {
                     unreachable!()
                 };
-                if DUO_ROUTE[exchange].1 {
+                if self.forwarding {
                     let target = match side.other() {
                         Side::A => self.capture_a.as_mut(),
                         Side::B => self.capture_b.as_mut(),
                     }
                     .ok_or("self-chat playback has no direct peer capture sink")?;
+                    let target_rate = target.rate();
+                    if source_rate != target_rate {
+                        return Err(format!(
+                            "self-chat {} playback clock {source_rate} Hz cannot feed {} capture clock {target_rate} Hz without a declared bridge resampler",
+                            side.name(),
+                            side.other().name()
+                        ));
+                    }
                     let capture = target.write_f32(&block[..write.played_frames], 1);
                     if capture.admitted_frames != write.played_frames
                         || capture.dropped_frames != 0
@@ -3575,15 +4483,43 @@ mod real_checkpoint_gate {
                             side.name()
                         ));
                     }
+                    if (write.played_frames as u128) * u128::from(target_rate)
+                        != (capture.admitted_frames as u128) * u128::from(source_rate)
+                    {
+                        return Err(format!(
+                            "self-chat {} changed callback duration while forwarding {} frames at {source_rate} Hz into {} frames at {target_rate} Hz",
+                            side.name(),
+                            write.played_frames,
+                            capture.admitted_frames
+                        ));
+                    }
+                    match side.other() {
+                        Side::A => {
+                            self.capture_a_sample_cursor = self
+                                .capture_a_sample_cursor
+                                .checked_add(capture.admitted_frames as u64)
+                                .ok_or("self-chat A capture cursor overflow")?;
+                        }
+                        Side::B => {
+                            self.capture_b_sample_cursor = self
+                                .capture_b_sample_cursor
+                                .checked_add(capture.admitted_frames as u64)
+                                .ok_or("self-chat B capture cursor overflow")?;
+                        }
+                    }
                     let forwarded = self
                         .lane(side)
                         .forwarded
                         .saturating_add(write.played_frames);
                     self.lane_mut(side).forwarded = forwarded;
+                    match side.other() {
+                        Side::A => self.last_to_a = Some(exchange),
+                        Side::B => self.last_to_b = Some(exchange),
+                    }
                 }
-                // This is evidence only. The production handoff above writes
-                // each device-sized block into the peer's native reservation
-                // while the source lease remains claimed.
+                // This Vec is post-render evidence only. The actual self-chat
+                // hop is one device-callback-sized copy: native playback lease
+                // -> stack callback buffer -> peer native capture reservation.
                 let lane = self.lane_mut(side);
                 lane.pcm.extend_from_slice(&block[..write.played_frames]);
                 lane.blocks = lane.blocks.saturating_add(1);
@@ -3591,6 +4527,8 @@ mod real_checkpoint_gate {
             let lane = self.lane_mut(side);
             lane.claimed = lane.claimed.saturating_add(write.claimed_samples);
             lane.played = lane.played.saturating_add(write.played_frames);
+            lane.dropped = lane.dropped.saturating_add(write.dropped_samples);
+            lane.underrun = lane.underrun.saturating_add(write.underrun_frames);
             Ok(write.active || write.played_frames != 0)
         }
 
@@ -3615,6 +4553,10 @@ mod real_checkpoint_gate {
                 {
                     return Err("self-chat bootstrap dropped a capture block".into());
                 }
+                self.capture_a_sample_cursor = self
+                    .capture_a_sample_cursor
+                    .checked_add(write.admitted_frames as u64)
+                    .ok_or("self-chat A capture cursor overflow")?;
                 feed.cursor = end;
                 return Ok(true);
             }
@@ -3636,6 +4578,10 @@ mod real_checkpoint_gate {
                 {
                     return Err("self-chat bootstrap dropped a silent callback block".into());
                 }
+                self.capture_a_sample_cursor = self
+                    .capture_a_sample_cursor
+                    .checked_add(write.admitted_frames as u64)
+                    .ok_or("self-chat A capture cursor overflow")?;
                 feed.silence += frames;
                 return Ok(true);
             }
@@ -3651,6 +4597,9 @@ mod real_checkpoint_gate {
         }
 
         fn feed_tail(&mut self, side: Side) -> Result<bool, String> {
+            if self.forwarding && matches!(self.lane(side.other()).leg, DuoLeg::Running(_)) {
+                return Ok(false);
+            }
             let trace = self.trace;
             let (tail, capture) = match side {
                 Side::A => (&mut self.tail_a, self.capture_a.as_mut()),
@@ -3670,6 +4619,20 @@ mod real_checkpoint_gate {
                     || write.gap_published
                 {
                     return Err("self-chat peer dropped a silent callback block".into());
+                }
+                match side {
+                    Side::A => {
+                        self.capture_a_sample_cursor = self
+                            .capture_a_sample_cursor
+                            .checked_add(write.admitted_frames as u64)
+                            .ok_or("self-chat A capture cursor overflow")?;
+                    }
+                    Side::B => {
+                        self.capture_b_sample_cursor = self
+                            .capture_b_sample_cursor
+                            .checked_add(write.admitted_frames as u64)
+                            .ok_or("self-chat B capture cursor overflow")?;
+                    }
                 }
                 feed.silence += frames;
                 return Ok(true);
@@ -3693,17 +4656,10 @@ mod real_checkpoint_gate {
                     side.name()
                 ));
             }
-            let Some(&(expected, _)) = DUO_ROUTE.get(self.next) else {
+            if self.next == DUO_ACTION_LIMIT {
                 return Err(format!(
-                    "self-chat {} started after the fixed route completed",
-                    side.name()
-                ));
-            };
-            if side != expected {
-                return Err(format!(
-                    "self-chat {} changed the fixed A/B/A route at exchange {}",
-                    side.name(),
-                    self.next + 1
+                    "self-chat exceeded its hard {}-action split bound",
+                    DUO_ACTION_LIMIT
                 ));
             }
             let ticket = match side {
@@ -3772,24 +4728,90 @@ mod real_checkpoint_gate {
                 ));
             }
             let exchange = self.next;
+            let cause = match side {
+                Side::A => self.last_to_a,
+                Side::B => self.last_to_b,
+            };
+            let ancestry = cause
+                .map(|source| {
+                    let (source_side, source_cause) = self.lineage(source).ok_or_else(|| {
+                        format!(
+                            "self-chat {} lost source exchange {}",
+                            side.name(),
+                            source + 1
+                        )
+                    })?;
+                    if source >= exchange || source_side != side.other() {
+                        return Err(format!(
+                            "self-chat {} received invalid causal source exchange {}",
+                            side.name(),
+                            source + 1
+                        ));
+                    }
+                    Ok((source, source_cause))
+                })
+                .transpose()?;
+            if side == Side::B && ancestry.is_none() {
+                return Err("self-chat B started without forwarded A PCM".into());
+            }
+            if side == Side::B && self.a_to_b.is_none() {
+                self.a_to_b = Some(exchange);
+            }
+            if side == Side::A && self.b_to_a.is_none() {
+                if let Some((source, Some(root))) = ancestry {
+                    let (root_side, _) = self.lineage(root).ok_or_else(|| {
+                        format!("self-chat lost causal root exchange {}", root + 1)
+                    })?;
+                    if root_side == Side::A {
+                        self.a_to_b = Some(source);
+                        self.b_to_a = Some(exchange);
+                        self.forwarding = false;
+                    }
+                }
+            }
+            self.stop_mut(side)
+                .start()
+                .map_err(|error| format!("self-chat {} {error}", side.name()))?;
+            let claim_base = match side {
+                Side::A => self
+                    .engine_a
+                    .as_ref()
+                    .ok_or("self-chat A engine disappeared before claim audit")?
+                    .playback_cursor_audit
+                    .claims(),
+                Side::B => self
+                    .engine_b
+                    .as_ref()
+                    .ok_or("self-chat B engine disappeared before claim audit")?
+                    .playback_cursor_audit
+                    .claims(),
+            };
             self.next += 1;
             let lane = self.lane_mut(side);
             *lane = DuoLane::new();
             lane.leg = DuoLeg::Running(exchange);
             lane.ticket = ticket;
+            lane.cause = cause;
+            lane.claim_base = claim_base;
             if self.trace {
                 eprintln!(
-                    "[native-e2e] self-chat admitted exchange {} on {} ticket sequence={} (forward={})",
+                    "[native-e2e] self-chat admitted exchange {} on {} ticket sequence={} cause={:?} forward={}",
                     exchange + 1,
                     side.name(),
                     ticket.sequence,
-                    DUO_ROUTE[exchange].1
+                    cause.map(|source| source + 1),
+                    self.forwarding
                 );
             }
             Ok(())
         }
 
-        fn finish_exchange(&mut self, side: Side, exchange: usize) -> Result<(), String> {
+        fn finish_exchange(
+            &mut self,
+            side: Side,
+            exchange: usize,
+            interrupted: bool,
+        ) -> Result<(), String> {
             if exchange >= self.exchanges.len() || self.exchanges[exchange].is_some() {
                 return Err(format!(
                     "self-chat {} attempted to settle exchange {} twice",
@@ -3812,19 +4834,62 @@ mod real_checkpoint_gate {
                 Side::A => self.engine_a.as_ref().and_then(|engine| engine.session_id),
                 Side::B => self.engine_b.as_ref().and_then(|engine| engine.session_id),
             };
+            let claims = match side {
+                Side::A => self
+                    .engine_a
+                    .as_ref()
+                    .ok_or("self-chat A engine disappeared before terminal claim audit")?
+                    .playback_cursor_audit
+                    .claims(),
+                Side::B => self
+                    .engine_b
+                    .as_ref()
+                    .ok_or("self-chat B engine disappeared before terminal claim audit")?
+                    .playback_cursor_audit
+                    .claims(),
+            };
             let lane = std::mem::replace(self.lane_mut(side), DuoLane::new());
-            if lane.leg != DuoLeg::Running(exchange) || DUO_ROUTE[exchange].0 != side {
-                return Err("self-chat terminal changed its fixed route".into());
+            if lane.leg != DuoLeg::Running(exchange) {
+                return Err("self-chat terminal changed its correlated action".into());
             }
-            let audio = probe
-                .emitted_items
-                .checked_sub(probe.text_emissions)
-                .ok_or("self-chat text accounting exceeds emitted items")?;
+            if interrupted {
+                self.stop_mut(side)
+                    .retire_interrupted()
+                    .map_err(|error| format!("self-chat {} {error}", side.name()))?;
+            } else {
+                self.stop_mut(side)
+                    .finish()
+                    .map_err(|error| format!("self-chat {} {error}", side.name()))?;
+            }
+            let audio = if interrupted {
+                probe.playback_leases
+            } else {
+                probe
+                    .emitted_items
+                    .checked_sub(probe.text_emissions)
+                    .ok_or("self-chat text accounting exceeds emitted items")?
+            };
+            let claimed_leases = claims
+                .0
+                .checked_sub(lane.claim_base.0)
+                .ok_or("self-chat claimed-lease audit regressed")?;
+            let claimed_frames = claims
+                .1
+                .checked_sub(lane.claim_base.1)
+                .ok_or("self-chat claimed-frame audit regressed")?;
+            let unclaimed_leases = claims
+                .2
+                .checked_sub(lane.claim_base.2)
+                .ok_or("self-chat unclaimed-retirement audit regressed")?;
             if probe.flow.ticket != lane.ticket
                 || session != Some(probe.flow.session)
+                || probe.cancelled != interrupted
                 || probe.terminal_records != 1
                 || probe.playback_leases != audio
                 || probe.playback_retired != probe.playback_leases
+                || claimed_leases.checked_add(unclaimed_leases)
+                    != Some(u64::from(probe.playback_leases))
+                || claimed_frames != lane.claimed as u64
             {
                 return Err(format!(
                     "self-chat {} did not publish and retire every correlated audio emission",
@@ -3838,8 +4903,14 @@ mod real_checkpoint_gate {
                 .rev()
                 .find(|prior| prior.side == side)
             {
+                let expected_epoch = previous
+                    .turn
+                    .flow
+                    .epoch
+                    .checked_add(u64::from(previous.turn.interrupted))
+                    .ok_or("self-chat stream epoch overflow")?;
                 if probe.flow.session != previous.turn.flow.session
-                    || probe.flow.epoch != previous.turn.flow.epoch
+                    || probe.flow.epoch != expected_epoch
                     || probe.flow.ticket.runtime_epoch != previous.turn.flow.ticket.runtime_epoch
                     || probe.flow.ticket.sequence <= previous.turn.flow.ticket.sequence
                 {
@@ -3849,11 +4920,12 @@ mod real_checkpoint_gate {
                     ));
                 }
             }
-            if lane.transcript.trim().is_empty()
+            if (!interrupted && lane.transcript.trim().is_empty())
                 || lane.pcm.is_empty()
                 || lane.pcm.iter().any(|sample| !sample.is_finite())
-                || lane.claimed != lane.played
+                || lane.claimed != lane.played.saturating_add(lane.dropped)
                 || lane.played != lane.pcm.len()
+                || lane.underrun != 0
                 || lane.blocks == 0
             {
                 return Err(format!(
@@ -3861,9 +4933,19 @@ mod real_checkpoint_gate {
                     side.name()
                 ));
             }
-            if DUO_ROUTE[exchange].1 && lane.forwarded != lane.pcm.len() {
+            if !interrupted
+                && (lane.dropped != 0
+                    || unclaimed_leases != 0
+                    || claimed_leases != u64::from(probe.playback_leases))
+            {
                 return Err(format!(
-                    "self-chat {} direct capture did not contain every playback sample",
+                    "self-chat {} completed after dropping correlated playback",
+                    side.name()
+                ));
+            }
+            if lane.forwarded > lane.pcm.len() {
+                return Err(format!(
+                    "self-chat {} forwarded more PCM than it played",
                     side.name()
                 ));
             }
@@ -3883,29 +4965,34 @@ mod real_checkpoint_gate {
             };
             self.exchanges[exchange] = Some(Exchange {
                 side,
+                cause: lane.cause,
+                forwarded: lane.forwarded,
                 turn: Turn {
                     transcript: lane.transcript,
                     pcm: lane.pcm,
                     rate,
                     flow: probe.flow,
+                    interrupted,
+                    playback_leases: u64::from(probe.playback_leases),
+                    claimed_leases,
+                    unclaimed_leases,
                     claimed: lane.claimed,
                     played: lane.played,
+                    dropped: lane.dropped,
+                    underrun: lane.underrun,
                     blocks: lane.blocks,
                     terminals: lane.terminals,
                 },
             });
-            if DUO_ROUTE[exchange].1 {
+            if lane.forwarded != 0 {
                 let target = side.other();
                 let tail = match target {
                     Side::A => &mut self.tail_a,
                     Side::B => &mut self.tail_b,
                 };
-                if tail.is_some() {
-                    return Err(format!(
-                        "self-chat {} acoustic tail overlapped its predecessor",
-                        target.name()
-                    ));
-                }
+                /* A resumed source action invalidates any partially emitted
+                 * silence from its predecessor. Require one complete tail
+                 * after the newest forwarded source finishes. */
                 *tail = Some(DuoTail {
                     exchange,
                     silence: 0,
@@ -3931,16 +5018,16 @@ mod real_checkpoint_gate {
                 }
             }
             if !matches!(self.phase, DuoPhase::Stopping | DuoPhase::Done) {
-                self.source_a.take();
-                self.source_b.take();
-                self.capture_a.take();
-                self.capture_b.take();
                 if let Some(engine) = self.engine_a.as_mut() {
                     engine.request_stop();
                 }
                 if let Some(engine) = self.engine_b.as_mut() {
                     engine.request_stop();
                 }
+                self.source_a.take();
+                self.source_b.take();
+                self.capture_a.take();
+                self.capture_b.take();
                 self.phase = DuoPhase::Stopping;
             }
             ServiceOutcome::Continue
@@ -3964,18 +5051,16 @@ mod real_checkpoint_gate {
             if let Err(error) = &b {
                 self.begin_stop(Some(format!("self-chat B stop: {error}")));
             }
-            if self
-                .pending_a
-                .iter()
-                .chain(&self.pending_b)
-                .any(|event| !matches!(event, VoiceEvent::Interrupted))
-            {
-                self.begin_stop(Some(
-                    "self-chat published a non-stop action event while retiring".into(),
-                ));
+            for (side, events) in [
+                (Side::A, std::mem::take(&mut self.pending_a)),
+                (Side::B, std::mem::take(&mut self.pending_b)),
+            ] {
+                for event in events {
+                    if let Err(error) = stop_event(self.stop_mut(side), event) {
+                        self.begin_stop(Some(format!("self-chat {} {error}", side.name())));
+                    }
+                }
             }
-            self.pending_a.clear();
-            self.pending_b.clear();
             let stopped_a = self
                 .engine_a
                 .as_ref()
@@ -3986,8 +5071,8 @@ mod real_checkpoint_gate {
                 .is_some_and(|engine| !engine.started || engine.stopped);
             if !stopped_a || !stopped_b {
                 return Ok(
-                    if matches!(a, Ok(EngineProgress::Continue))
-                        || matches!(b, Ok(EngineProgress::Continue))
+                    if matches!(a, Ok(EngineProgress::Continue | EngineProgress::Complete))
+                        || matches!(b, Ok(EngineProgress::Continue | EngineProgress::Complete))
                     {
                         ServiceOutcome::Continue
                     } else {
@@ -3995,21 +5080,29 @@ mod real_checkpoint_gate {
                     },
                 );
             }
-            for (side, engine) in [
-                (Side::A, self.engine_a.as_ref().unwrap()),
-                (Side::B, self.engine_b.as_ref().unwrap()),
-            ] {
-                if !engine.started {
-                    continue;
-                }
-                let flow = engine.stopped_flow.ok_or_else(|| {
-                    format!("self-chat {} STOPPED edge had no correlation", side.name())
-                })?;
-                if engine.session_id != Some(flow.session) {
-                    return Err(format!(
-                        "self-chat {} STOPPED edge changed session identity",
-                        side.name()
-                    ));
+            for side in [Side::A, Side::B] {
+                let issue = {
+                    let engine = match side {
+                        Side::A => self.engine_a.as_ref().unwrap(),
+                        Side::B => self.engine_b.as_ref().unwrap(),
+                    };
+                    if !engine.started {
+                        None
+                    } else if let Some(flow) = engine.stopped_flow {
+                        if engine.session_id == Some(flow.session) {
+                            self.stop(side)
+                                .stopped()
+                                .err()
+                                .map(|error| error.to_owned())
+                        } else {
+                            Some("STOPPED edge changed session identity".to_owned())
+                        }
+                    } else {
+                        Some("STOPPED edge had no correlation".to_owned())
+                    }
+                };
+                if let Some(error) = issue {
+                    self.begin_stop(Some(format!("self-chat {} {error}", side.name())));
                 }
             }
             self.engine_a
@@ -4025,6 +5118,14 @@ mod real_checkpoint_gate {
                 engine_a: self.engine_a.take().unwrap(),
                 engine_b: self.engine_b.take().unwrap(),
                 exchanges,
+                a_to_b: self.a_to_b,
+                b_to_a: self.b_to_a,
+                capture_a_sample_cursor: self.capture_a_sample_cursor,
+                capture_b_sample_cursor: self.capture_b_sample_cursor,
+                playback_a_sample_cursor: self.playback_a_sample_cursor,
+                playback_b_sample_cursor: self.playback_b_sample_cursor,
+                playback_a_evidence_reports: self.playback_a_evidence_reports,
+                playback_b_evidence_reports: self.playback_b_evidence_reports,
                 error: self.error.take(),
             };
             *self.result.lock().expect("self-chat result mutex poisoned") = Some(exit);
@@ -4107,10 +5208,23 @@ mod real_checkpoint_gate {
                         tail_b: None,
                         lane_a: DuoLane::new(),
                         lane_b: DuoLane::new(),
-                        exchanges: (0..DUO_ROUTE.len()).map(|_| None).collect(),
+                        exchanges: (0..DUO_ACTION_LIMIT).map(|_| None).collect(),
                         next: 0,
+                        forwarding: true,
+                        last_to_a: None,
+                        last_to_b: None,
+                        a_to_b: None,
+                        b_to_a: None,
                         pending_a: Vec::new(),
                         pending_b: Vec::new(),
+                        stop_a: StopAction::Idle,
+                        stop_b: StopAction::Idle,
+                        capture_a_sample_cursor: 0,
+                        capture_b_sample_cursor: 0,
+                        playback_a_sample_cursor: 0,
+                        playback_b_sample_cursor: 0,
+                        playback_a_evidence_reports: 0,
+                        playback_b_evidence_reports: 0,
                         error: None,
                         result,
                         trace: std::env::var_os("LFM_E2E_TRACE").is_some(),
@@ -4179,7 +5293,17 @@ mod real_checkpoint_gate {
             unsafe { lfm_session_snapshot(exit.engine_b.session.as_ptr(), &mut b) },
             "snapshot settled self-chat B",
         )?;
-        for (side, snapshot, capture) in [(Side::A, a, 2), (Side::B, b, 1)] {
+        let captures_a = exit
+            .exchanges
+            .iter()
+            .filter(|exchange| exchange.side == Side::A)
+            .count() as u64;
+        let captures_b = exit
+            .exchanges
+            .iter()
+            .filter(|exchange| exchange.side == Side::B)
+            .count() as u64;
+        for (side, snapshot, capture) in [(Side::A, a, captures_a), (Side::B, b, captures_b)] {
             if snapshot.state != JOINED
                 || snapshot.terminal_status != 0
                 || snapshot.capture_consumed != capture
@@ -4192,7 +5316,22 @@ mod real_checkpoint_gate {
                 || snapshot.live_playback_leases != 0
                 || snapshot.reliable_event_depth != 0
             {
-                let message = format!("self-chat {} did not retire cleanly", side.name());
+                let message = format!(
+                    "self-chat {} did not retire cleanly: state={}, status={}, capture={}/{}, stale={}, playback={}/{}, live={}, events={}, text={}/{}/{}",
+                    side.name(),
+                    snapshot.state,
+                    snapshot.terminal_status,
+                    snapshot.capture_consumed,
+                    capture,
+                    snapshot.capture_stale,
+                    snapshot.playback_published,
+                    snapshot.playback_consumed,
+                    snapshot.live_playback_leases,
+                    snapshot.reliable_event_depth,
+                    snapshot.text_commands_accepted,
+                    snapshot.text_commands_consumed,
+                    snapshot.text_commands_stale,
+                );
                 if let Some(error) = exit.error.as_mut() {
                     error.push_str("; ");
                     error.push_str(&message);
@@ -4213,6 +5352,41 @@ mod real_checkpoint_gate {
         if let Some(error) = exit.error {
             return Err(error);
         }
+        validate_codec_duration(
+            "self-chat A",
+            exit.exchanges
+                .iter()
+                .filter(|exchange| exchange.side == Side::A)
+                .map(|exchange| &exchange.turn),
+            a.playback_published,
+        )?;
+        validate_codec_duration(
+            "self-chat B",
+            exit.exchanges
+                .iter()
+                .filter(|exchange| exchange.side == Side::B)
+                .map(|exchange| &exchange.turn),
+            b.playback_published,
+        )?;
+        let a_to_b = exit
+            .a_to_b
+            .ok_or("self-chat never carried A playback into a B action")?;
+        let b_to_a = exit
+            .b_to_a
+            .ok_or("self-chat never carried B playback into a later A action")?;
+        if a_to_b >= exit.exchanges.len()
+            || b_to_a >= exit.exchanges.len()
+            || exit.exchanges[a_to_b].side != Side::B
+            || exit.exchanges[b_to_a].side != Side::A
+            || exit.exchanges[b_to_a].cause != Some(a_to_b)
+            || exit.exchanges[a_to_b].cause.is_none_or(|root| {
+                exit.exchanges
+                    .get(root)
+                    .is_none_or(|item| item.side != Side::A)
+            })
+        {
+            return Err("self-chat causal action lineage was incomplete".into());
+        }
         let stopped_a = exit
             .engine_a
             .stopped_flow
@@ -4228,12 +5402,29 @@ mod real_checkpoint_gate {
         {
             return Err("self-chat STOPPED flow did not match its settled snapshot".into());
         }
+        if exit.capture_a_sample_cursor == 0
+            || exit.capture_b_sample_cursor == 0
+            || exit.playback_a_sample_cursor == 0
+            || exit.playback_b_sample_cursor == 0
+            || exit.playback_a_evidence_reports == 0
+            || exit.playback_b_evidence_reports == 0
+        {
+            return Err("self-chat did not retain both native cursor lineages".into());
+        }
         Ok(DuoReport {
             exchanges: exit.exchanges,
+            a_to_b,
+            b_to_a,
             a,
             b,
             stopped_a,
             stopped_b,
+            capture_a_sample_cursor: exit.capture_a_sample_cursor,
+            capture_b_sample_cursor: exit.capture_b_sample_cursor,
+            playback_a_sample_cursor: exit.playback_a_sample_cursor,
+            playback_b_sample_cursor: exit.playback_b_sample_cursor,
+            playback_a_evidence_reports: exit.playback_a_evidence_reports,
+            playback_b_evidence_reports: exit.playback_b_evidence_reports,
         })
     }
 
@@ -4283,6 +5474,10 @@ mod real_checkpoint_gate {
                         played: 0,
                         blocks: 0,
                         terminals: 0,
+                        capture_sample_cursor: 0,
+                        playback_sample_cursor: 0,
+                        playback_evidence_reports: 0,
+                        stop: StopAction::Idle,
                         error: None,
                         result,
                         trace: std::env::var_os("LFM_E2E_TRACE").is_some(),
@@ -4381,6 +5576,11 @@ mod real_checkpoint_gate {
         if let Some(error) = exit.error {
             return Err(error);
         }
+        validate_codec_duration(
+            "native truth-gate",
+            exit.turns.iter(),
+            snapshot.playback_published,
+        )?;
         let stopped = exit
             .engine
             .stopped_flow
@@ -4388,10 +5588,19 @@ mod real_checkpoint_gate {
         if snapshot.session_id != stopped.session || snapshot.epoch != stopped.epoch {
             return Err("native truth-gate STOPPED flow did not match its settled snapshot".into());
         }
+        if exit.capture_sample_cursor == 0
+            || exit.playback_sample_cursor == 0
+            || exit.playback_evidence_reports == 0
+        {
+            return Err("native truth-gate did not retain cursor evidence".into());
+        }
         Ok(Report {
             turns: exit.turns,
             snapshot,
             stopped,
+            capture_sample_cursor: exit.capture_sample_cursor,
+            playback_sample_cursor: exit.playback_sample_cursor,
+            playback_evidence_reports: exit.playback_evidence_reports,
         })
     }
 
@@ -4404,9 +5613,10 @@ mod real_checkpoint_gate {
         dir: &Path,
     ) -> Result<(), String> {
         // Evidence serialization happens only after both state machines have
-        // retired. WAV and JSON files are never an inference or self-chat hop;
-        // exchanged audio travels directly from PlaybackSource into the peer's
-        // callback-owned native CaptureSink while its playback lease is live.
+        // retired. WAV and JSON files are never an inference or self-chat hop.
+        // The live exchange uses the device callback's fixed stack buffer: one
+        // native playback render fills it, then one native capture write copies
+        // that buffer into the peer reservation while the source lease is live.
         std::fs::create_dir_all(dir)
             .map_err(|error| format!("create native gate output {}: {error}", dir.display()))?;
         let dir = dir
@@ -4445,6 +5655,10 @@ mod real_checkpoint_gate {
                     "turn": index + 1,
                     "role": roles[index],
                     "transcript": turn.transcript,
+                    "interrupted": turn.interrupted,
+                    "playback_leases": turn.playback_leases,
+                    "claimed_leases": turn.claimed_leases,
+                    "unclaimed_stale_leases": turn.unclaimed_leases,
                     "pcm_samples": turn.pcm.len(),
                     "sample_rate": turn.rate,
                     "pcm_rms": turn.rms(),
@@ -4453,6 +5667,8 @@ mod real_checkpoint_gate {
                     "device_blocks": turn.blocks,
                     "claimed_samples": turn.claimed,
                     "played_samples": turn.played,
+                    "discarded_samples": turn.dropped,
+                    "underrun_frames": turn.underrun,
                     "terminal_events": turn.terminals,
                     "ticket": {
                         "session": turn.flow.session,
@@ -4470,12 +5686,34 @@ mod real_checkpoint_gate {
             .iter()
             .enumerate()
             .map(|(index, exchange)| {
+                let cause = exchange.cause.map(|source_index| {
+                    let source = &duo.exchanges[source_index];
+                    json!({
+                        "turn": source_index + 1,
+                        "speaker": source.side.name(),
+                        "session": source.turn.flow.session,
+                        "runtime_epoch": source.turn.flow.ticket.runtime_epoch,
+                        "ticket_sequence": source.turn.flow.ticket.sequence,
+                        "ticket_generation": source.turn.flow.ticket.generation,
+                    })
+                });
                 json!({
                     "turn": index + 1,
                     "speaker": exchange.side.name(),
+                    "cause": cause,
                     "transcript_evidence_only": exchange.turn.transcript,
-                    "transport": if index < 2 { "direct_playback_pcm_to_peer_native_capture" } else { "terminal_observer_output" },
+                    "interrupted": exchange.turn.interrupted,
+                    "playback_leases": exchange.turn.playback_leases,
+                    "claimed_leases": exchange.turn.claimed_leases,
+                    "unclaimed_stale_leases": exchange.turn.unclaimed_leases,
+                    "transport": if exchange.forwarded != 0 { "native_playback_to_callback_buffer_to_peer_native_capture" } else { "terminal_observer_output" },
+                    "forwarded_pcm_samples": exchange.forwarded,
+                    "forwarded_duration_seconds": exchange.forwarded as f64 / exchange.turn.rate as f64,
                     "pcm_samples": exchange.turn.pcm.len(),
+                    "claimed_samples": exchange.turn.claimed,
+                    "discarded_samples": exchange.turn.dropped,
+                    "underrun_frames": exchange.turn.underrun,
+                    "output_duration_seconds": exchange.turn.pcm.len() as f64 / exchange.turn.rate as f64,
                     "sample_rate": exchange.turn.rate,
                     "pcm_rms": exchange.turn.rms(),
                     "transcript_sha256": exchange.turn.transcript_digest(),
@@ -4494,7 +5732,7 @@ mod real_checkpoint_gate {
             })
             .collect::<Vec<_>>();
         let manifest = json!({
-            "schema": 2,
+            "schema": 5,
             "seed": 0,
             "max_new_tokens": tokens,
             "self_chat_max_new_tokens": self_chat_tokens,
@@ -4503,6 +5741,11 @@ mod real_checkpoint_gate {
             "audio_top_k": 4,
             "typed_output_sample_rate": OUTPUT_RATE,
             "pcm_digest_encoding": "sha256 over little-endian f32 bit patterns",
+            "mimi_codec_clock": {
+                "sample_rate_hz": MIMI_CODEC_OUTPUT_RATE,
+                "samples_per_playback_lease": MIMI_CODEC_FRAME_SAMPLES,
+                "duration_contract": "each claimed lease has 1920 * device_sample_rate / 24000 frames; completed turns play every frame; interrupted turns correlate played + discarded + unclaimed stale leases to the exact terminal lease count",
+            },
             "turns": turns,
             "retained_context_evidence": {
                 "same_native_session": report.turns.iter().all(|turn| turn.flow.session == report.turns[0].flow.session),
@@ -4514,23 +5757,41 @@ mod real_checkpoint_gate {
                 "bootstrap": "question.wav audio only",
                 "scripted_dialogue": false,
                 "text_relay": false,
+                "pcm_handoff": "one_device_callback_buffer_copy",
+                "callback_clock_hz": duo.exchanges.first().map_or(0, |exchange| exchange.turn.rate),
+                "duration_contract": "played_frames/playback_rate == admitted_frames/peer_capture_rate",
+                "action_limit": DUO_ACTION_LIMIT,
+                "causal_round_trip": {
+                    "a_output_to_b_action": duo.a_to_b + 1,
+                    "b_output_to_later_a_action": duo.b_to_a + 1,
+                },
                 "exchanges": self_chat,
                 "sessions": {
                     "a": {
                         "id": duo.a.session_id,
+                        "device_sample_rate": duo.exchanges.iter().find(|exchange| exchange.side == Side::A).map_or(0, |exchange| exchange.turn.rate),
+                        "device_pcm_frames": duo.exchanges.iter().filter(|exchange| exchange.side == Side::A).map(|exchange| exchange.turn.pcm.len()).sum::<usize>(),
                         "stopped_epoch": duo.stopped_a.epoch,
                         "stopped_ticket_sequence": duo.stopped_a.ticket.sequence,
                         "capture_consumed": duo.a.capture_consumed,
                         "playback_published": duo.a.playback_published,
                         "playback_consumed": duo.a.playback_consumed,
+                        "capture_sample_cursor": duo.capture_a_sample_cursor,
+                        "playback_sample_cursor": duo.playback_a_sample_cursor,
+                        "playback_evidence_reports": duo.playback_a_evidence_reports,
                     },
                     "b": {
                         "id": duo.b.session_id,
+                        "device_sample_rate": duo.exchanges.iter().find(|exchange| exchange.side == Side::B).map_or(0, |exchange| exchange.turn.rate),
+                        "device_pcm_frames": duo.exchanges.iter().filter(|exchange| exchange.side == Side::B).map(|exchange| exchange.turn.pcm.len()).sum::<usize>(),
                         "stopped_epoch": duo.stopped_b.epoch,
                         "stopped_ticket_sequence": duo.stopped_b.ticket.sequence,
                         "capture_consumed": duo.b.capture_consumed,
                         "playback_published": duo.b.playback_published,
                         "playback_consumed": duo.b.playback_consumed,
+                        "capture_sample_cursor": duo.capture_b_sample_cursor,
+                        "playback_sample_cursor": duo.playback_b_sample_cursor,
+                        "playback_evidence_reports": duo.playback_b_evidence_reports,
                     },
                 },
             },
@@ -4539,13 +5800,25 @@ mod real_checkpoint_gate {
                 "resident_image_bytes": model.resident_image_bytes,
                 "directly_bound_bytes": model.directly_bound_bytes,
                 "derived_immutable_bytes": model.derived_immutable_bytes,
+                "materialized_weight_bytes": model.materialized_weight_bytes,
                 "compatibility_copied_bytes": model.compatibility_copied_bytes,
+                "payload_read_calls": model.payload_read_calls,
+                "payload_read_bytes": model.payload_read_bytes,
+                "post_publication_read_calls": model.post_publication_read_calls,
+                "post_publication_read_bytes": model.post_publication_read_bytes,
+                "post_publication_materialization_attempts": model.post_publication_materialization_attempts,
+                "post_publication_materialization_bytes": model.post_publication_materialization_bytes,
+                "publication_generation": model.publication_generation,
+                "payload_read_coverage": model.payload_read_coverage,
+                "payload_read_accounting_complete": model.payload_read_accounting_complete,
                 "load_ns": model.load_ns,
                 "load_workers": model.load_workers,
                 "load_tasks": model.load_tasks,
             },
             "session": {
                 "id": report.snapshot.session_id,
+                "device_sample_rate": report.turns.first().map_or(0, |turn| turn.rate),
+                "device_pcm_frames": report.turns.iter().map(|turn| turn.pcm.len()).sum::<usize>(),
                 "epoch": report.snapshot.epoch,
                 "stopped_epoch": report.stopped.epoch,
                 "stopped_ticket_sequence": report.stopped.ticket.sequence,
@@ -4553,6 +5826,9 @@ mod real_checkpoint_gate {
                 "capture_consumed": report.snapshot.capture_consumed,
                 "playback_published": report.snapshot.playback_published,
                 "playback_consumed": report.snapshot.playback_consumed,
+                "capture_sample_cursor": report.capture_sample_cursor,
+                "playback_sample_cursor": report.playback_sample_cursor,
+                "playback_evidence_reports": report.playback_evidence_reports,
             },
         });
         std::fs::write(
@@ -4563,6 +5839,139 @@ mod real_checkpoint_gate {
         .map_err(|error| format!("write native gate manifest: {error}"))?;
         eprintln!("native truth-gate evidence: {}", dir.display());
         Ok(())
+    }
+
+    #[test]
+    fn stopping_action_requires_start_then_single_interruption() {
+        let mut action = StopAction::Idle;
+        assert!(action.interrupt().unwrap_err().contains("before"));
+        action.start().unwrap();
+        assert!(action.start().unwrap_err().contains("duplicate"));
+        action.interrupt().unwrap();
+        assert!(action.interrupt().unwrap_err().contains("duplicate"));
+        action.stopped().unwrap();
+
+        let mut unfinished = StopAction::Idle;
+        unfinished.start().unwrap();
+        assert!(unfinished
+            .stopped()
+            .unwrap_err()
+            .contains("before interrupting"));
+        assert!(stop_event(&mut unfinished, VoiceEvent::Text("late".into()))
+            .unwrap_err()
+            .contains("text"));
+        assert!(stop_event(&mut unfinished, VoiceEvent::TurnComplete)
+            .unwrap_err()
+            .contains("turn-complete"));
+
+        let mut barge = StopAction::Idle;
+        barge.start().unwrap();
+        barge.interrupt().unwrap();
+        barge.retire_interrupted().unwrap();
+        barge.start().unwrap();
+        barge.finish().unwrap();
+    }
+
+    #[test]
+    fn cancelled_action_waits_for_every_promised_playback_retirement() {
+        let ticket = Ticket {
+            runtime_epoch: 3,
+            sequence: 5,
+            generation: 7,
+            kind: TICKET_TURN,
+        };
+        let mut action = NativeAction::new(ticket);
+        action.flow = Some(Flow {
+            session: 11,
+            epoch: 13,
+            ticket,
+        });
+        action.cancelled = true;
+        action.terminal = Some((true, 3));
+        action.playback = 2;
+        assert!(!action.settled());
+        action.playback = 3;
+        assert!(action.settled());
+    }
+
+    #[test]
+    fn codec_duration_attributes_an_interrupted_old_epoch_remainder() {
+        let flow = |sequence| Flow {
+            session: 7,
+            epoch: 11,
+            ticket: Ticket {
+                runtime_epoch: 13,
+                sequence,
+                generation: 17,
+                kind: TICKET_TURN,
+            },
+        };
+        let complete = Turn {
+            transcript: "complete".into(),
+            pcm: vec![0.25; 2_560],
+            rate: 16_000,
+            flow: flow(19),
+            interrupted: false,
+            playback_leases: 2,
+            claimed_leases: 2,
+            unclaimed_leases: 0,
+            claimed: 2_560,
+            played: 2_560,
+            dropped: 0,
+            underrun: 0,
+            blocks: 5,
+            terminals: 1,
+        };
+        let interrupted = Turn {
+            transcript: String::new(),
+            pcm: vec![0.25; 2_000],
+            rate: 16_000,
+            flow: flow(23),
+            interrupted: true,
+            playback_leases: 3,
+            claimed_leases: 2,
+            unclaimed_leases: 1,
+            claimed: 2_560,
+            played: 2_000,
+            dropped: 560,
+            underrun: 0,
+            blocks: 4,
+            terminals: 1,
+        };
+        let turns = [complete, interrupted];
+        validate_codec_duration("interrupted fixture", turns.iter(), 5).unwrap();
+    }
+
+    #[test]
+    fn codec_duration_rejects_a_completed_drop() {
+        let turn = Turn {
+            transcript: "broken".into(),
+            pcm: vec![0.25; 1_279],
+            rate: 16_000,
+            flow: Flow {
+                session: 7,
+                epoch: 11,
+                ticket: Ticket {
+                    runtime_epoch: 13,
+                    sequence: 19,
+                    generation: 17,
+                    kind: TICKET_TURN,
+                },
+            },
+            interrupted: false,
+            playback_leases: 1,
+            claimed_leases: 1,
+            unclaimed_leases: 0,
+            claimed: 1_280,
+            played: 1_279,
+            dropped: 1,
+            underrun: 0,
+            blocks: 3,
+            terminals: 1,
+        };
+        let error = validate_codec_duration("completed fixture", std::iter::once(&turn), 1)
+            .expect_err("completed playback must reject a dropped device frame");
+        assert!(error.contains("changed Mimi duration"));
     }
 
     #[test]
@@ -4614,7 +6023,14 @@ mod real_checkpoint_gate {
         .expect("open complete native checkpoint with two session slots");
         let before = model.memory().expect("read native model accounting");
         assert!(before.source_bytes > 0 && before.directly_bound_bytes > 0);
+        assert!(before.payload_read_calls > 0 && before.payload_read_bytes > 0);
+        assert_eq!(before.publication_generation, 1);
+        assert_eq!(before.materialized_weight_bytes, 0);
         assert_eq!(before.compatibility_copied_bytes, 0);
+        assert_eq!(before.post_publication_read_calls, 0);
+        assert_eq!(before.post_publication_read_bytes, 0);
+        assert_eq!(before.post_publication_materialization_attempts, 0);
+        assert_eq!(before.post_publication_materialization_bytes, 0);
 
         let first = run(&model, &fixture, tokens).expect("first native truth-gate run");
         let middle = model
@@ -4655,10 +6071,19 @@ mod real_checkpoint_gate {
         }
         let duo =
             run_duo(&model, &fixture, self_chat_tokens).expect("two-engine native audio self-chat");
-        assert_eq!(duo.exchanges.len(), 3);
-        assert_eq!(duo.exchanges[0].side, Side::A);
-        assert_eq!(duo.exchanges[1].side, Side::B);
-        assert_eq!(duo.exchanges[2].side, Side::A);
+        assert!(
+            duo.exchanges.len() <= DUO_ACTION_LIMIT,
+            "self-chat exceeded its action bound"
+        );
+        assert_eq!(duo.exchanges[duo.a_to_b].side, Side::B);
+        assert_eq!(duo.exchanges[duo.b_to_a].side, Side::A);
+        assert_eq!(duo.exchanges[duo.b_to_a].cause, Some(duo.a_to_b));
+        assert!(
+            duo.exchanges[duo.a_to_b]
+                .cause
+                .is_some_and(|root| duo.exchanges[root].side == Side::A),
+            "self-chat A-to-B action lost its source ticket"
+        );
         assert_eq!(
             model
                 .memory()
@@ -4676,6 +6101,11 @@ mod real_checkpoint_gate {
             });
         output(&first, &duo, before, tokens, self_chat_tokens, &dir)
             .expect("write native truth-gate evidence");
+        assert!(
+            before.payload_read_accounting_complete,
+            "native evidence was produced at {}, but final zero-read acceptance refuses incomplete source coverage",
+            dir.display()
+        );
         drop(watchdog);
     }
 }
@@ -5001,5 +6431,478 @@ mod tests {
                 },
             }) if seen == ticket
         ));
+    }
+
+    #[test]
+    fn successor_records_wait_behind_terminal_playback_across_callbacks() {
+        let prior = Flow {
+            session: 9,
+            epoch: 17,
+            ticket: Ticket {
+                runtime_epoch: 3,
+                sequence: 23,
+                generation: 4,
+                kind: TICKET_TURN,
+            },
+        };
+        let next = Flow {
+            ticket: Ticket {
+                sequence: 24,
+                ..prior.ticket
+            },
+            ..prior
+        };
+        let mut action = NativeAction::new(prior.ticket);
+        action.flow = Some(prior);
+        action.terminal = Some((true, 2));
+        action.playback = 1;
+        let mut pending = None;
+
+        let replies = ReplyRing::new();
+        let mut sink = EventSink {
+            replies: Arc::clone(&replies),
+            resume: None,
+        };
+        let context = std::ptr::from_mut(&mut sink).cast();
+        let started = NativeEvent {
+            size: std::mem::size_of::<NativeEvent>() as u32,
+            abi_version: RUNTIME_ABI,
+            kind: EVENT_TURN_STARTED,
+            flags: 0,
+            session_id: next.session,
+            epoch: next.epoch,
+            ticket: next.ticket,
+            payload: std::ptr::null(),
+            payload_bytes: 0,
+            status: 0,
+        };
+        assert_eq!(unsafe { on_event(context, &started) }, 0);
+        assert!(matches!(
+            replies.try_pop(),
+            Some(Reply::TurnStarted { flow }) if flow == next
+        ));
+        retain_successor(&mut pending, &action, next).unwrap();
+        assert_eq!(pending, Some(next));
+
+        let text = NativeEvent {
+            kind: EVENT_TEXT,
+            payload: b"successor".as_ptr().cast(),
+            payload_bytes: 9,
+            ..started
+        };
+        let ready = PlaybackReadyEvent {
+            size: std::mem::size_of::<PlaybackReadyEvent>() as u32,
+            abi_version: RUNTIME_ABI,
+            lease_id: 41,
+            buffer_generation: 7,
+        };
+        let playback = NativeEvent {
+            kind: EVENT_PLAYBACK_READY,
+            payload: std::ptr::from_ref(&ready).cast(),
+            payload_bytes: std::mem::size_of::<PlaybackReadyEvent>() as u32,
+            ..started
+        };
+        let terminal = TurnEvent {
+            size: std::mem::size_of::<TurnEvent>() as u32,
+            abi_version: RUNTIME_ABI,
+            playback_leases: 1,
+            emitted_items: 2,
+        };
+        let turn = NativeEvent {
+            kind: EVENT_TURN,
+            flags: EVENT_HAS_AUDIO,
+            payload: std::ptr::from_ref(&terminal).cast(),
+            payload_bytes: std::mem::size_of::<TurnEvent>() as u32,
+            ..started
+        };
+        for event in [&text, &playback, &turn] {
+            assert_eq!(unsafe { on_event(context, event) }, STATUS_WOULD_BLOCK);
+            assert!(replies.is_empty());
+            assert_eq!(action.playback, 1);
+        }
+
+        let changed = Flow {
+            epoch: next.epoch + 1,
+            ..next
+        };
+        assert!(replies
+            .start
+            .release(changed)
+            .unwrap_err()
+            .contains("changed exact flow"));
+        action.playback += 1;
+        assert_eq!(action.playback, action.terminal.unwrap().1);
+        assert!(replies.start.release(pending.take().unwrap()).unwrap());
+        assert_eq!(unsafe { on_event(context, &text) }, 0);
+        assert!(matches!(
+            replies.try_pop(),
+            Some(Reply::Text { flow, payload })
+                if flow == next && payload.as_bytes() == b"successor"
+        ));
+
+        let third = Flow {
+            ticket: Ticket {
+                sequence: 25,
+                ..prior.ticket
+            },
+            ..prior
+        };
+        let mut retained = Some(next);
+        assert!(retain_successor(&mut retained, &action, next)
+            .unwrap_err()
+            .contains("duplicate successor turn-start"));
+        assert!(retain_successor(&mut retained, &action, third)
+            .unwrap_err()
+            .contains("more than one pending successor"));
+    }
+
+    #[test]
+    fn source_drop_retirements_unblock_successor_and_stopped_delivery() {
+        const DOCK_ONLY: u64 = 1 << 63;
+        unsafe extern "C" {
+            fn lfm_session_publish_playback_f32_test(
+                session: *mut Session,
+                samples: *const f32,
+                frames: u32,
+                out: *mut PcmLease,
+            ) -> i32;
+        }
+        unsafe extern "C" fn accept(_: *mut c_void, _: *const NativeEvent) -> i32 {
+            0
+        }
+
+        let runtime_config = RuntimeConfig {
+            size: std::mem::size_of::<RuntimeConfig>() as u32,
+            abi_version: RUNTIME_ABI,
+            coordination_workers: 1,
+            kernel_lanes: 1,
+            event_capacity: 16,
+            session_capacity: 1,
+            reserved0: 0,
+            reserved1: 0,
+            flags: 0,
+            reserved: [0; 4],
+        };
+        let mut native_runtime = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { lfm_runtime_create(&runtime_config, &mut native_runtime) },
+            0
+        );
+        assert_eq!(unsafe { lfm_runtime_start(native_runtime) }, 0);
+        let session_config = SessionConfig {
+            size: std::mem::size_of::<SessionConfig>() as u32,
+            abi_version: RUNTIME_ABI,
+            session_id: 9,
+            playback_slots: 1,
+            capture_max_callback_frames: 960,
+            playback_frames_per_slot: 4,
+            pcm_channels: 1,
+            capture_sample_rate: 48_000,
+            playback_sample_rate: 24_000,
+            command_capacity: 4,
+            max_new_tokens: 4,
+            flags: DOCK_ONLY,
+            reserved: [0; 4],
+        };
+        let callbacks = Callbacks {
+            size: std::mem::size_of::<Callbacks>() as u32,
+            abi_version: RUNTIME_ABI,
+            context: std::ptr::null_mut(),
+            on_event: Some(accept),
+        };
+        let mut native_session = std::ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                lfm_session_create(
+                    native_runtime,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &session_config,
+                    &callbacks,
+                    &mut native_session,
+                )
+            },
+            0
+        );
+        let mut consumer = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { lfm_playback_consumer_create(native_session, &mut consumer) },
+            0
+        );
+        assert_eq!(unsafe { lfm_session_start(native_session) }, 0);
+        let samples = [0.25f32, -0.5, 0.75, -1.0];
+        let mut published = PcmLease::default();
+        assert_eq!(
+            unsafe {
+                lfm_session_publish_playback_f32_test(
+                    native_session,
+                    samples.as_ptr(),
+                    samples.len() as u32,
+                    &mut published,
+                )
+            },
+            0
+        );
+        let prior = Flow {
+            session: session_config.session_id,
+            epoch: published.stream_epoch,
+            ticket: published.ticket,
+        };
+        let next = Flow {
+            ticket: Ticket {
+                sequence: prior.ticket.sequence + 1,
+                ..prior.ticket
+            },
+            ..prior
+        };
+        let mut action = NativeAction::new(prior.ticket);
+        action.flow = Some(prior);
+        action.terminal = Some((true, 1));
+
+        let playback = PlaybackState::new();
+        let runtime = kcoro_sys::Runtime::new().expect("create source-drop kcoro runtime");
+        let callbacks = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&callbacks);
+        let (service, notify) = runtime
+            .state_service_factory(|setup| {
+                let notify = setup.realtime_notifier()?;
+                Ok::<_, i32>((
+                    move || {
+                        seen.fetch_add(1, Ordering::Relaxed);
+                        kcoro_sys::ServiceOutcome::Dormant
+                    },
+                    notify,
+                ))
+            })
+            .expect("mount source-drop continuation");
+        runtime.start().expect("start source-drop kcoro runtime");
+        service.start().expect("start source-drop continuation");
+        let cursor_audit = Arc::new(PlaybackCursorAudit::default());
+        let mut source = NativePlaybackSource {
+            consumer: NonNull::new(consumer).expect("native playback consumer is null"),
+            state: Arc::clone(&playback),
+            notify,
+            notice: Some(PlaybackNotice {
+                flow: prior,
+                lease_id: published.lease_id,
+                buffer_generation: published.buffer_generation,
+            }),
+            current: None,
+            lineage: None,
+            result: None,
+            fault: false,
+            rate: session_config.playback_sample_rate,
+            next_playback_sample_cursor: None,
+            capture_sample_cursor_snapshot: None,
+            cursor_audit: Arc::clone(&cursor_audit),
+        };
+        let mut device = [0.0f32; 1];
+        let write = source.write_f32(&mut device, 1, false);
+        assert_eq!(write.claimed_samples, samples.len());
+        assert_eq!(write.played_frames, 1);
+        assert_eq!(device, [samples[0]]);
+        assert_eq!(cursor_audit.snapshot(), (1, 1, 0));
+
+        let replies = ReplyRing::new();
+        let mut sink = EventSink {
+            replies: Arc::clone(&replies),
+            resume: None,
+        };
+        let context = std::ptr::from_mut(&mut sink).cast();
+        let started = NativeEvent {
+            size: std::mem::size_of::<NativeEvent>() as u32,
+            abi_version: RUNTIME_ABI,
+            kind: EVENT_TURN_STARTED,
+            flags: 0,
+            session_id: next.session,
+            epoch: next.epoch,
+            ticket: next.ticket,
+            payload: std::ptr::null(),
+            payload_bytes: 0,
+            status: 0,
+        };
+        assert_eq!(unsafe { on_event(context, &started) }, 0);
+        assert!(matches!(
+            replies.try_pop(),
+            Some(Reply::TurnStarted { flow }) if flow == next
+        ));
+        let mut pending = None;
+        retain_successor(&mut pending, &action, next).unwrap();
+
+        let terminal = TurnEvent {
+            size: std::mem::size_of::<TurnEvent>() as u32,
+            abi_version: RUNTIME_ABI,
+            playback_leases: 0,
+            emitted_items: 0,
+        };
+        let cancelled = NativeEvent {
+            kind: EVENT_TURN,
+            payload: std::ptr::from_ref(&terminal).cast(),
+            payload_bytes: std::mem::size_of::<TurnEvent>() as u32,
+            status: STATUS_CANCELLED,
+            ..started
+        };
+        assert_eq!(unsafe { on_event(context, &cancelled) }, STATUS_WOULD_BLOCK);
+
+        drop(source);
+        service.stop();
+        service.join().expect("join source-drop continuation");
+        assert!(callbacks.load(Ordering::Relaxed) >= 1);
+        while let Some(done) = playback.done.try_pop() {
+            action.retire(done).unwrap();
+        }
+        assert!(action.settled());
+        assert!(replies.start.release(pending.take().unwrap()).unwrap());
+
+        assert_eq!(unsafe { on_event(context, &cancelled) }, 0);
+        assert!(matches!(
+            replies.try_pop(),
+            Some(Reply::Turn { flow, status: STATUS_CANCELLED, .. }) if flow == next
+        ));
+        let stopped = Flow {
+            ticket: Ticket {
+                sequence: next.ticket.sequence + 1,
+                kind: TICKET_SESSION,
+                ..next.ticket
+            },
+            ..next
+        };
+        let event = NativeEvent {
+            kind: EVENT_STOPPED,
+            ticket: stopped.ticket,
+            status: 0,
+            ..started
+        };
+        assert_eq!(unsafe { on_event(context, &event) }, 0);
+        assert!(matches!(
+            replies.try_pop(),
+            Some(Reply::Stopped { flow, status: 0 }) if flow == stopped
+        ));
+
+        unsafe { lfm_session_request_stop(native_session) };
+        assert_eq!(
+            unsafe { lfm_session_join(native_session) },
+            STATUS_HOST_SINK,
+            "dropping the physical playback endpoint before session stop must remain a correlated device-loss fault"
+        );
+        assert_eq!(unsafe { lfm_session_destroy(native_session) }, 0);
+        unsafe { lfm_runtime_request_stop(native_runtime) };
+        assert_eq!(unsafe { lfm_runtime_join(native_runtime) }, 0);
+        assert_eq!(unsafe { lfm_runtime_destroy(native_runtime) }, 0);
+        service.destroy().expect("destroy source-drop continuation");
+        runtime
+            .destroy()
+            .expect("destroy source-drop kcoro runtime");
+    }
+
+    #[test]
+    fn successor_start_rejects_early_duplicate_and_settled_predecessor() {
+        let prior = Flow {
+            session: 9,
+            epoch: 17,
+            ticket: Ticket {
+                runtime_epoch: 3,
+                sequence: 23,
+                generation: 4,
+                kind: TICKET_TURN,
+            },
+        };
+        let next = Flow {
+            ticket: Ticket {
+                sequence: 24,
+                ..prior.ticket
+            },
+            ..prior
+        };
+        let mut action = NativeAction::new(prior.ticket);
+        action.flow = Some(prior);
+        let mut pending = None;
+        assert!(retain_successor(&mut pending, &action, next)
+            .unwrap_err()
+            .contains("before the prior terminal"));
+        assert!(retain_successor(&mut pending, &action, prior)
+            .unwrap_err()
+            .contains("duplicate turn-start"));
+
+        action.terminal = Some((true, 1));
+        action.playback = 1;
+        assert!(retain_successor(&mut pending, &action, next)
+            .unwrap_err()
+            .contains("after the prior action settled"));
+    }
+
+    #[test]
+    fn successor_start_rejects_broken_ticket_lineage() {
+        let prior = Flow {
+            session: 9,
+            epoch: 17,
+            ticket: Ticket {
+                runtime_epoch: 3,
+                sequence: 23,
+                generation: 4,
+                kind: TICKET_TURN,
+            },
+        };
+        let mut action = NativeAction::new(prior.ticket);
+        action.flow = Some(prior);
+        action.terminal = Some((true, 2));
+        action.playback = 1;
+        let mut pending = None;
+
+        let broken = [
+            Flow {
+                session: prior.session + 1,
+                ticket: Ticket {
+                    sequence: 24,
+                    ..prior.ticket
+                },
+                ..prior
+            },
+            Flow {
+                epoch: prior.epoch + 1,
+                ticket: Ticket {
+                    sequence: 24,
+                    ..prior.ticket
+                },
+                ..prior
+            },
+            Flow {
+                ticket: Ticket {
+                    runtime_epoch: prior.ticket.runtime_epoch + 1,
+                    sequence: 24,
+                    ..prior.ticket
+                },
+                ..prior
+            },
+            Flow {
+                ticket: Ticket {
+                    sequence: prior.ticket.sequence - 1,
+                    ..prior.ticket
+                },
+                ..prior
+            },
+            Flow {
+                ticket: Ticket {
+                    sequence: 24,
+                    generation: prior.ticket.generation + 1,
+                    ..prior.ticket
+                },
+                ..prior
+            },
+            Flow {
+                ticket: Ticket {
+                    sequence: 24,
+                    kind: TICKET_CONTROL,
+                    ..prior.ticket
+                },
+                ..prior
+            },
+        ];
+        for flow in broken {
+            assert!(retain_successor(&mut pending, &action, flow)
+                .unwrap_err()
+                .contains("broke ticket lineage"));
+            assert!(pending.is_none());
+        }
     }
 }

@@ -59,7 +59,29 @@ void lfm_resample_conv_spans_f32(const LfmF32SpanChain *input,
                                  uint64_t stride, uint64_t width,
                                  uint64_t first_value, float *out,
                                  uint64_t value_count);
+struct LfmResamplerStreamKernel {
+    const float *input;
+    float *destination;
+    uint64_t sample_count;
+    uint64_t orig;
+    uint64_t phases;
+    uint64_t phase;
+    float previous;
+    uint32_t ready;
+};
+uint64_t lfm_resampler_stream_linear_f32(
+    const LfmResamplerStreamKernel *kernel);
 }
+
+static_assert(offsetof(LfmResamplerStreamKernel, input) == 0);
+static_assert(offsetof(LfmResamplerStreamKernel, destination) == 8);
+static_assert(offsetof(LfmResamplerStreamKernel, sample_count) == 16);
+static_assert(offsetof(LfmResamplerStreamKernel, orig) == 24);
+static_assert(offsetof(LfmResamplerStreamKernel, phases) == 32);
+static_assert(offsetof(LfmResamplerStreamKernel, phase) == 40);
+static_assert(offsetof(LfmResamplerStreamKernel, previous) == 48);
+static_assert(offsetof(LfmResamplerStreamKernel, ready) == 52);
+static_assert(sizeof(LfmResamplerStreamKernel) == 56);
 
 namespace {
 
@@ -976,25 +998,28 @@ extern "C" int lfm_resampler_stream_process(
         return -ENOBUFS;
     }
 
-    uint64_t written = 0;
-    for (uint64_t index = 0; index < sample_count; ++index) {
-        const float sample = input[index];
-        const float previous = stream->ready ? stream->previous : sample;
-        const uint64_t phase = stream->phase;
-        const uint64_t total = phase + stream->phases;
-        const uint64_t count = total / stream->orig;
-        for (uint64_t output = 1; output <= count; ++output) {
-            const uint64_t numerator = output * stream->orig - phase;
-            const float fraction = static_cast<float>(numerator) /
-                                   static_cast<float>(stream->phases);
-            destination[written++] =
-                previous + (sample - previous) * fraction;
-        }
-        stream->phase = total % stream->orig;
-        stream->previous = sample;
+    const LfmResamplerStreamKernel kernel = {
+        .input = input,
+        .destination = destination,
+        .sample_count = sample_count,
+        .orig = stream->orig,
+        .phases = stream->phases,
+        .phase = stream->phase,
+        .previous = stream->previous,
+        .ready = stream->ready ? 1u : 0u,
+    };
+    const uint64_t written = lfm_resampler_stream_linear_f32(&kernel);
+    if (written != target) return -EFAULT;
+    uint64_t consumed = 0;
+    if (!mul_u64(sample_count, stream->phases, &consumed) ||
+        !add_u64(stream->phase, consumed, &consumed)) {
+        return -EOVERFLOW;
+    }
+    stream->phase = consumed % stream->orig;
+    if (sample_count != 0) {
+        stream->previous = input[sample_count - 1];
         stream->ready = true;
     }
-    if (written != target) return -EFAULT;
     result->data = destination;
     result->length = written;
     return 0;

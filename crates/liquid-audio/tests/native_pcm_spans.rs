@@ -28,6 +28,11 @@ struct ResamplerWorkspace {
     _private: [u8; 0],
 }
 
+#[repr(C)]
+struct ResamplerStream {
+    _private: [u8; 0],
+}
+
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
 struct Span {
@@ -121,6 +126,34 @@ unsafe extern "C" {
         destination: *mut f32,
         destination_capacity: u64,
         result: *mut Chain,
+    ) -> c_int;
+    fn lfm_resampler_stream_create(
+        orig_freq: u32,
+        new_freq: u32,
+        max_sample_count: u64,
+        out: *mut *mut ResamplerStream,
+    ) -> c_int;
+    fn lfm_resampler_stream_destroy(stream: *mut ResamplerStream) -> c_int;
+    fn lfm_resampler_stream_out_length(
+        stream: *mut ResamplerStream,
+        sample_count: u64,
+        out_length: *mut u64,
+    ) -> c_int;
+    fn lfm_resampler_stream_process(
+        stream: *mut ResamplerStream,
+        input: *const f32,
+        sample_count: u64,
+        destination: *mut f32,
+        destination_capacity: u64,
+        result: *mut Span,
+    ) -> c_int;
+    fn lfm_internal_playback_rate_contract_test(
+        preprocessor_rate: u32,
+        playback_rate: u32,
+        out_preprocessor_rate: *mut u32,
+        out_codec_rate: *mut u32,
+        out_playback_frames: *mut u64,
+        out_direct: *mut u32,
     ) -> c_int;
 }
 
@@ -330,4 +363,137 @@ fn equal_rate_resampling_preserves_the_original_two_views() {
     }
     assert_eq!(unsafe { lfm_resampler_workspace_destroy(workspace) }, 0);
     assert_eq!(unsafe { lfm_resampler_destroy(resampler) }, 0);
+}
+
+#[test]
+fn mimi_playback_rate_is_distinct_from_the_preprocessor_rate() {
+    for (device, frames, direct) in [(16_000, 2_560, 0), (24_000, 3_840, 1), (48_000, 7_680, 0)] {
+        let mut preprocessor = 0;
+        let mut codec = 0;
+        let mut actual = 0;
+        let mut actual_direct = 0;
+        assert_eq!(
+            unsafe {
+                lfm_internal_playback_rate_contract_test(
+                    16_000,
+                    device,
+                    &mut preprocessor,
+                    &mut codec,
+                    &mut actual,
+                    &mut actual_direct,
+                )
+            },
+            0
+        );
+        assert_eq!(preprocessor, 16_000, "device={device}");
+        assert_eq!(codec, 24_000, "device={device}");
+        assert_eq!(actual, frames, "device={device}");
+        assert_eq!(actual_direct, direct, "device={device}");
+    }
+}
+
+#[test]
+fn mimi_frames_keep_exact_duration_across_streaming_rate_boundaries() {
+    const CODEC_RATE: u64 = 24_000;
+    const FRAME: usize = 1_920;
+    let samples = input(FRAME * 2);
+
+    for (device, output_per_frame) in [(16_000u32, 1_280usize), (48_000, 3_840)] {
+        let mut stream = ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                lfm_resampler_stream_create(CODEC_RATE as u32, device, FRAME as u64, &mut stream)
+            },
+            0
+        );
+        let mut chunked = vec![0.0f32; output_per_frame * 2];
+        for frame in 0..2 {
+            let mut length = 0;
+            assert_eq!(
+                unsafe { lfm_resampler_stream_out_length(stream, FRAME as u64, &mut length) },
+                0
+            );
+            assert_eq!(length, output_per_frame as u64, "device={device}");
+            let source = unsafe { samples.as_ptr().add(frame * FRAME) };
+            let destination = unsafe { chunked.as_mut_ptr().add(frame * output_per_frame) };
+            let mut result = Span::default();
+            assert_eq!(
+                unsafe {
+                    lfm_resampler_stream_process(
+                        stream,
+                        source,
+                        FRAME as u64,
+                        destination,
+                        output_per_frame as u64,
+                        &mut result,
+                    )
+                },
+                0
+            );
+            assert_eq!(result.data, destination, "device={device} frame={frame}");
+            assert_eq!(
+                result.length, output_per_frame as u64,
+                "device={device} frame={frame}"
+            );
+        }
+        assert_eq!(unsafe { lfm_resampler_stream_destroy(stream) }, 0);
+
+        let mut whole_stream = ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                lfm_resampler_stream_create(
+                    CODEC_RATE as u32,
+                    device,
+                    samples.len() as u64,
+                    &mut whole_stream,
+                )
+            },
+            0
+        );
+        let mut whole = vec![0.0f32; output_per_frame * 2];
+        let mut result = Span::default();
+        assert_eq!(
+            unsafe {
+                lfm_resampler_stream_process(
+                    whole_stream,
+                    samples.as_ptr(),
+                    samples.len() as u64,
+                    whole.as_mut_ptr(),
+                    whole.len() as u64,
+                    &mut result,
+                )
+            },
+            0
+        );
+        assert_eq!(unsafe { lfm_resampler_stream_destroy(whole_stream) }, 0);
+        assert_eq!(result.length, whole.len() as u64, "device={device}");
+        assert_eq!(chunked, whole, "stream phase drift at device={device}");
+        assert_eq!(
+            whole.len() as u64 * CODEC_RATE,
+            samples.len() as u64 * u64::from(device),
+            "duration drift at device={device}"
+        );
+    }
+}
+
+#[test]
+fn streaming_playback_interpolation_has_no_scalar_cpp_loop() {
+    let source = include_str!("../native/src/frontend/lfm_frontend.cpp");
+    let begin = source
+        .find("extern \"C\" int lfm_resampler_stream_process(")
+        .unwrap();
+    let end = source[begin..]
+        .find("extern \"C\" int lfm_resample_f32(")
+        .map(|offset| begin + offset)
+        .unwrap();
+    let process = &source[begin..end];
+    assert!(process.contains("lfm_resampler_stream_linear_f32(&kernel)"));
+    assert!(!process.contains("for (") && !process.contains("while ("));
+
+    for leaf in [
+        include_str!("../native/kernels/aarch64/flashkern_frontend.S"),
+        include_str!("../native/kernels/x86_64/flashkern_frontend.S"),
+    ] {
+        assert!(leaf.contains("LFM_SYM(lfm_resampler_stream_linear_f32):"));
+    }
 }

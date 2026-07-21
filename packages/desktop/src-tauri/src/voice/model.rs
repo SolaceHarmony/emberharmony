@@ -146,8 +146,12 @@ pub async fn voice_model_download(
         .map_err(|e| format!("failed to resolve application cache: {e}"))?
         .join("voice-models")
         .join("huggingface");
-    std::fs::create_dir_all(&cache)
-        .map_err(|e| format!("failed to create voice model cache {}: {e}", cache.display()))?;
+    std::fs::create_dir_all(&cache).map_err(|e| {
+        format!(
+            "failed to create voice model cache {}: {e}",
+            cache.display()
+        )
+    })?;
 
     runtime.spawn(move || {
         let result = liquid_audio::snapshot_download_to(

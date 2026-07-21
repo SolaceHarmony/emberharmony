@@ -63,12 +63,6 @@ macro_rules! vtrace {
     };
 }
 
-/// Sentinel for "no native turn accepted yet" in [`TurnLatency`].
-const TURN_LATENCY_NO_TURN: u64 = u64::MAX;
-/// Minimum output-chunk RMS that counts as the assistant audibly speaking.
-/// Filters silence frames so the measurement matches voice onset, not stream onset.
-#[cfg(feature = "audio-io")]
-const TURN_LATENCY_AGENT_RMS: f32 = 0.01;
 const DEVICE_FAULT_INPUT: u32 = 1;
 const DEVICE_FAULT_OUTPUT: u32 = 1 << 1;
 #[cfg(feature = "audio-io")]
@@ -86,84 +80,6 @@ struct CaptureContract {
     max_callback_frames: u32,
 }
 
-/// Host-observed response telemetry: the gap from the native correlated
-/// turn-start edge to the first audible assistant PCM. Exact last-voice timing
-/// belongs to the native Sesame detector and is not reconstructed in Rust.
-struct TurnLatency {
-    origin: Instant,
-    /// Milliseconds since `origin` of the most recent accepted native turn.
-    turn_ms: std::sync::atomic::AtomicU64,
-    /// Armed while a reply is pending; the first audible chunk measures and disarms.
-    awaiting: AtomicBool,
-    #[cfg(any(feature = "audio-io", test))]
-    first_word_logged: AtomicBool,
-}
-
-impl TurnLatency {
-    fn new() -> Arc<Self> {
-        Arc::new(Self {
-            origin: Instant::now(),
-            turn_ms: std::sync::atomic::AtomicU64::new(TURN_LATENCY_NO_TURN),
-            awaiting: AtomicBool::new(false),
-            #[cfg(any(feature = "audio-io", test))]
-            first_word_logged: AtomicBool::new(false),
-        })
-    }
-
-    fn now_ms(&self) -> u64 {
-        self.origin.elapsed().as_millis() as u64
-    }
-
-    fn mark_turn(&self) {
-        self.turn_ms.store(self.now_ms(), Ordering::Release);
-    }
-
-    fn arm(&self) {
-        if self.turn_ms.load(Ordering::Acquire) != TURN_LATENCY_NO_TURN {
-            self.awaiting.store(true, Ordering::Release);
-        }
-    }
-
-    fn disarm(&self) {
-        self.awaiting.store(false, Ordering::Release);
-    }
-
-    /// If armed, measure native-turn-start → now and disarm.
-    #[cfg(any(feature = "audio-io", test))]
-    fn try_measure(&self) -> Option<u64> {
-        if !self.awaiting.swap(false, Ordering::AcqRel) {
-            return None;
-        }
-        let last = self.turn_ms.load(Ordering::Acquire);
-        if last == TURN_LATENCY_NO_TURN {
-            return None;
-        }
-        Some(self.now_ms().saturating_sub(last))
-    }
-
-    /// Session-start → first audible assistant word, logged once.
-    #[cfg(any(feature = "audio-io", test))]
-    fn first_word(&self) -> Option<u64> {
-        if self.first_word_logged.swap(true, Ordering::AcqRel) {
-            return None;
-        }
-        Some(self.now_ms())
-    }
-}
-
-/// Sesame's agent-response-latency rating bands (recovered demo client,
-/// `getAgentResponseLatencyRating`): <300ms = 5 … ≥3000ms = 1.
-#[cfg(test)]
-fn turn_latency_rating(ms: u64) -> u8 {
-    match ms {
-        0..=299 => 5,
-        300..=499 => 4,
-        500..=999 => 3,
-        1000..=2999 => 2,
-        _ => 1,
-    }
-}
-
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AudioStatsSnapshot {
@@ -172,11 +88,11 @@ pub struct AudioStatsSnapshot {
     pub dropped_samples: u64,
     pub played_samples: u64,
     pub underrun_frames: u64,
-    /// Completed pause→first-audio measurements this session (spec 09, W1).
+    /// Reserved for a future native correlated onset event; currently zero.
     pub turn_count: u64,
-    /// Most recent pause→first-audio gap in milliseconds.
+    /// Reserved for a future native correlated onset event; currently zero.
     pub last_turn_latency_ms: u64,
-    /// Mean pause→first-audio gap in milliseconds across the session.
+    /// Reserved for a future native correlated onset event; currently zero.
     pub mean_turn_latency_ms: u64,
 }
 
@@ -187,9 +103,6 @@ struct AudioStats {
     dropped_samples: std::sync::atomic::AtomicU64,
     played_samples: std::sync::atomic::AtomicU64,
     underrun_frames: std::sync::atomic::AtomicU64,
-    turn_count: std::sync::atomic::AtomicU64,
-    last_turn_latency_ms: std::sync::atomic::AtomicU64,
-    total_turn_latency_ms: std::sync::atomic::AtomicU64,
 }
 
 /// One terminal ownership transfer from the fixed coroutine owner back to the
@@ -226,27 +139,16 @@ impl EngineHandoff {
 }
 
 impl AudioStats {
-    #[cfg(any(feature = "audio-io", test))]
-    fn record_turn_latency(&self, ms: u64) {
-        self.turn_count.fetch_add(1, Ordering::Relaxed);
-        self.last_turn_latency_ms.store(ms, Ordering::Relaxed);
-        self.total_turn_latency_ms.fetch_add(ms, Ordering::Relaxed);
-    }
-
     fn snapshot(&self) -> AudioStatsSnapshot {
-        let turn_count = self.turn_count.load(Ordering::Relaxed);
-        let total_turn_latency_ms = self.total_turn_latency_ms.load(Ordering::Relaxed);
         AudioStatsSnapshot {
             decoded_samples: self.decoded_samples.load(Ordering::Relaxed),
             queued_samples: self.queued_samples.load(Ordering::Relaxed),
             dropped_samples: self.dropped_samples.load(Ordering::Relaxed),
             played_samples: self.played_samples.load(Ordering::Relaxed),
             underrun_frames: self.underrun_frames.load(Ordering::Relaxed),
-            turn_count,
-            last_turn_latency_ms: self.last_turn_latency_ms.load(Ordering::Relaxed),
-            mean_turn_latency_ms: total_turn_latency_ms
-                .checked_div(turn_count)
-                .unwrap_or_default(),
+            turn_count: 0,
+            last_turn_latency_ms: 0,
+            mean_turn_latency_ms: 0,
         }
     }
 }
@@ -341,7 +243,6 @@ impl VoiceRuntime {
                 in_rate = input.rate,
             ));
         }
-        let latency = TurnLatency::new();
         let mut init = SessionInit {
             resources,
             sink,
@@ -356,7 +257,6 @@ impl VoiceRuntime {
             in_request_frames: input.requested_frames,
             in_max_callback_frames: input.max_callback_frames,
             out_rate,
-            latency: latency.clone(),
             done: done.clone(),
             events: None,
         };
@@ -571,7 +471,6 @@ struct SessionInit {
     in_request_frames: u32,
     in_max_callback_frames: u32,
     out_rate: u32,
-    latency: Arc<TurnLatency>,
     done: Arc<AtomicBool>,
     events: Option<RealtimeNotifier>,
 }
@@ -581,6 +480,7 @@ struct InitResources {
     source: Option<Box<dyn PlaybackSource>>,
     engine: Option<Box<dyn VoiceEngine>>,
     handoff: Arc<EngineHandoff>,
+    stopping: bool,
 }
 
 impl InitResources {
@@ -590,6 +490,7 @@ impl InitResources {
             source: None,
             engine: Some(engine),
             handoff,
+            stopping: false,
         }
     }
 
@@ -607,19 +508,29 @@ impl InitResources {
     }
 
     fn retire_engine(&mut self) {
-        if let Some(mut engine) = self.engine.take() {
-            engine.request_stop();
+        self.request_stop();
+        if let Some(engine) = self.engine.take() {
             self.handoff.publish(engine);
+        }
+    }
+
+    fn request_stop(&mut self) {
+        if self.stopping {
+            return;
+        }
+        self.stopping = true;
+        if let Some(engine) = self.engine.as_mut() {
+            engine.request_stop();
         }
     }
 }
 
 impl Drop for InitResources {
     fn drop(&mut self) {
-        /* The declaration order is deliberate, and this explicit retirement
-         * makes it invariant under future field additions: hardware callback
-         * endpoints die before native session state is asked to stop and
-         * transferred to the administrative owner. */
+        /* Close native admission before hardware endpoint destruction. A
+         * capture producer disappearing while the session is still live is a
+         * real device-loss edge; administrative shutdown must not forge one. */
+        self.request_stop();
         drop(self.capture.take());
         drop(self.source.take());
         self.retire_engine();
@@ -686,23 +597,19 @@ impl OwnerSession {
         if !self.task.stop_requested() {
             return;
         }
-        /* A stop is first a hardware-ownership transition. Closing both CPAL
-         * streams proves their callbacks can no longer borrow the capture or
-         * playback endpoints. Only then may native settle its correlated
-         * STOPPED edge; waiting for STOPPED before this drop creates a cycle
-         * because native session retirement also requires both endpoints to
-         * be gone. */
-        drop(self.streams.take());
+        /* Stop closes native admission synchronously; endpoint destruction can
+         * then retire callback ownership without being misclassified as an
+         * unexpected device loss. No join occurs until both streams are gone,
+         * so this ordering creates no callback/session cycle. */
         self.task.begin_stop();
+        drop(self.streams.take());
     }
 
     fn retire(&mut self) {
         if self.retired {
             return;
         }
-        // Dropping CPAL streams closes the producer callbacks. Only then may
-        // capture/playback leases and the native engine cross the terminal
-        // handoff, preserving ticket and epoch ownership through the device.
+        self.task.begin_stop();
         drop(self.streams.take());
         self.task.finish();
         self.retired = true;
@@ -725,8 +632,10 @@ impl SessionTask {
     }
 
     fn begin_stop(&mut self) {
-        if let Self::Live(task) = self {
-            task.begin_stop();
+        match self {
+            Self::Init(Some(init)) => init.resources.request_stop(),
+            Self::Live(task) => task.begin_stop(),
+            Self::Init(None) | Self::Done => {}
         }
     }
 
@@ -834,7 +743,6 @@ impl SessionInit {
                 engine,
                 events: EventState::default(),
             }),
-            latency: self.latency,
         }))
     }
 }
@@ -853,15 +761,12 @@ impl EventState {
         sink: &mut EventSink,
         stop: &Arc<AtomicBool>,
         mic_enabled: &AtomicBool,
-        latency: &TurnLatency,
     ) {
         if self.failed {
             return;
         }
         let ok = match event {
             VoiceEvent::TurnStarted => {
-                latency.mark_turn();
-                latency.arm();
                 self.transcript.clear();
                 self.speaking = false;
                 emit_or_stop(sink, stop, RuntimeEvent::State(SessionState::Thinking))
@@ -879,13 +784,11 @@ impl EventState {
                     )
             }
             VoiceEvent::TurnComplete | VoiceEvent::Interrupted => {
-                latency.disarm();
                 self.transcript.clear();
                 self.speaking = false;
                 emit_ready(sink, stop, mic_enabled)
             }
             VoiceEvent::Error(error) => {
-                latency.disarm();
                 self.transcript.clear();
                 self.speaking = false;
                 emit_or_stop(sink, stop, RuntimeEvent::Error(error))
@@ -915,15 +818,10 @@ impl TurnDriver {
         stop: &Arc<AtomicBool>,
         sink: &mut EventSink,
         mic_enabled: &AtomicBool,
-        latency: &TurnLatency,
     ) -> Result<EngineProgress, String> {
-        let progress = self.engine.advance_events(stop, &mut |event| {
-            self.events.emit(event, sink, stop, mic_enabled, latency);
-        })?;
-        if self.events.failed {
-            return Ok(EngineProgress::Complete);
-        }
-        Ok(progress)
+        self.engine.advance_events(stop, &mut |event| {
+            self.events.emit(event, sink, stop, mic_enabled);
+        })
     }
 }
 
@@ -938,7 +836,6 @@ struct LiveTask {
     handoff: Arc<EngineHandoff>,
     stopping: bool,
     driver: Option<TurnDriver>,
-    latency: Arc<TurnLatency>,
 }
 
 impl LiveTask {
@@ -994,10 +891,10 @@ impl LiveTask {
             .driver
             .as_mut()
             .expect("driver checked above")
-            .advance_events(&self.stop, &mut self.sink, &self.mic_enabled, &self.latency)
+            .advance_events(&self.stop, &mut self.sink, &self.mic_enabled)
         {
-            Ok(EngineProgress::Continue) => ServiceOutcome::Continue,
-            Ok(EngineProgress::Dormant | EngineProgress::Complete) => ServiceOutcome::Dormant,
+            Ok(EngineProgress::Continue | EngineProgress::Complete) => ServiceOutcome::Continue,
+            Ok(EngineProgress::Dormant) => ServiceOutcome::Dormant,
             Ok(EngineProgress::Stopped) => ServiceOutcome::Complete,
             Err(error) => {
                 let _ = emit_or_stop(
@@ -1077,7 +974,6 @@ fn start_devices(init: &mut SessionInit) -> Result<DeviceStreams, String> {
         source,
         init.audio.clone(),
         init.playback_flush.clone(),
-        init.latency.clone(),
         init.device_fault.clone(),
         control.clone(),
     )
@@ -1322,7 +1218,6 @@ fn start_output(
     source: Box<dyn PlaybackSource>,
     audio: Stats,
     flush: Arc<AtomicBool>,
-    latency: Arc<TurnLatency>,
     fault: Arc<AtomicU32>,
     control: SharedRealtimeNotifier,
 ) -> Res<HostStream> {
@@ -1346,7 +1241,6 @@ fn start_output(
             let mut source = source;
             let flush = flush.clone();
             let audio = audio.clone();
-            let latency = latency.clone();
             let fault = fault.clone();
             let control = control.clone();
             dev.build_output_stream(
@@ -1371,12 +1265,6 @@ fn start_output(
                         audio
                             .played_samples
                             .fetch_add(write.played_frames as u64, Ordering::Relaxed);
-                        if write.rms > TURN_LATENCY_AGENT_RMS {
-                            if let Some(ms) = latency.try_measure() {
-                                audio.record_turn_latency(ms);
-                            }
-                            let _ = latency.first_word();
-                        }
                     }
                     if write.underrun_frames != 0 {
                         audio
@@ -1409,67 +1297,12 @@ mod tests {
     use std::sync::Mutex;
 
     #[test]
-    fn turn_latency_measures_only_when_armed_after_native_turn() {
-        let latency = TurnLatency::new();
-
-        // Not armed, no native turn: nothing to measure.
-        assert_eq!(latency.try_measure(), None);
-
-        // Arming without an accepted turn is a no-op.
-        latency.arm();
-        assert_eq!(latency.try_measure(), None);
-
-        latency.mark_turn();
-        latency.arm();
-        let measured = latency
-            .try_measure()
-            .expect("armed after native turn measures");
-        assert!(measured < 1000, "same-test measurement should be near-zero");
-
-        // Measurement disarms: a second audible chunk doesn't re-measure.
-        assert_eq!(latency.try_measure(), None);
-    }
-
-    #[test]
-    fn turn_latency_disarm_cancels_pending_measurement() {
-        let latency = TurnLatency::new();
-        latency.mark_turn();
-        latency.arm();
-        latency.disarm();
-        assert_eq!(latency.try_measure(), None);
-    }
-
-    #[test]
-    fn turn_latency_first_word_logs_once() {
-        let latency = TurnLatency::new();
-        assert!(latency.first_word().is_some());
-        assert_eq!(latency.first_word(), None);
-    }
-
-    #[test]
-    fn turn_latency_rating_matches_sesame_bands() {
-        assert_eq!(turn_latency_rating(0), 5);
-        assert_eq!(turn_latency_rating(299), 5);
-        assert_eq!(turn_latency_rating(300), 4);
-        assert_eq!(turn_latency_rating(499), 4);
-        assert_eq!(turn_latency_rating(500), 3);
-        assert_eq!(turn_latency_rating(999), 3);
-        assert_eq!(turn_latency_rating(1000), 2);
-        assert_eq!(turn_latency_rating(2999), 2);
-        assert_eq!(turn_latency_rating(3000), 1);
-    }
-
-    #[test]
-    fn audio_stats_snapshot_reports_mean_turn_latency() {
+    fn audio_stats_do_not_fabricate_turn_latency() {
         let stats = AudioStats::default();
-        assert_eq!(stats.snapshot().mean_turn_latency_ms, 0);
-
-        stats.record_turn_latency(400);
-        stats.record_turn_latency(800);
         let snapshot = stats.snapshot();
-        assert_eq!(snapshot.turn_count, 2);
-        assert_eq!(snapshot.last_turn_latency_ms, 800);
-        assert_eq!(snapshot.mean_turn_latency_ms, 600);
+        assert_eq!(snapshot.turn_count, 0);
+        assert_eq!(snapshot.last_turn_latency_ms, 0);
+        assert_eq!(snapshot.mean_turn_latency_ms, 0);
     }
 
     #[test]
@@ -1479,6 +1312,61 @@ mod tests {
 
         mic.store(false, Ordering::SeqCst);
         assert_eq!(ready_state(&mic), SessionState::Idle);
+    }
+
+    #[test]
+    fn rejected_sink_preserves_native_stopped_progress() {
+        struct Stopped;
+
+        impl VoiceEngine for Stopped {
+            fn take_capture_sink(&mut self) -> Result<Option<Box<dyn CaptureSink>>, String> {
+                Ok(None)
+            }
+
+            fn take_playback_source(
+                &mut self,
+                _: RealtimeNotifier,
+            ) -> Result<Option<Box<dyn PlaybackSource>>, String> {
+                Ok(None)
+            }
+
+            fn mount_events(&mut self, _: RealtimeNotifier) -> Result<(), String> {
+                Ok(())
+            }
+
+            fn advance_events(
+                &mut self,
+                _: &AtomicBool,
+                emit: &mut dyn FnMut(VoiceEvent),
+            ) -> Result<EngineProgress, String> {
+                emit(VoiceEvent::TurnStarted);
+                Ok(EngineProgress::Stopped)
+            }
+
+            fn interrupt_stream(&mut self) -> Result<u64, String> {
+                Ok(1)
+            }
+
+            fn request_stop(&mut self) {}
+
+            fn stop_session(&mut self) -> Result<(), String> {
+                Ok(())
+            }
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let mic = AtomicBool::new(true);
+        let mut sink: EventSink = Box::new(|_| false);
+        let mut driver = TurnDriver {
+            engine: Box::new(Stopped),
+            events: EventState::default(),
+        };
+        assert_eq!(
+            driver.advance_events(&stop, &mut sink, &mic).unwrap(),
+            EngineProgress::Stopped
+        );
+        assert!(driver.events.failed);
+        assert!(stop.load(Ordering::Acquire));
     }
 
     #[cfg(feature = "audio-io")]
@@ -1691,7 +1579,6 @@ mod tests {
             in_request_frames: 960,
             in_max_callback_frames: 1_920,
             out_rate: 48_000,
-            latency: TurnLatency::new(),
             done: Arc::new(AtomicBool::new(false)),
             events: Some(service.realtime_notifier().expect("event edge")),
         };
@@ -1705,7 +1592,7 @@ mod tests {
         drop(failed);
         assert_eq!(
             log.lock().expect("lifecycle log").as_slice(),
-            ["capture-drop", "playback-drop", "request-stop"]
+            ["request-stop", "capture-drop", "playback-drop"]
         );
 
         let mut engine = handoff
@@ -1716,9 +1603,9 @@ mod tests {
         assert_eq!(
             log.lock().expect("lifecycle log").as_slice(),
             [
+                "request-stop",
                 "capture-drop",
                 "playback-drop",
-                "request-stop",
                 "stop-session",
                 "engine-drop",
             ]

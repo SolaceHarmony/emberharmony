@@ -10,9 +10,15 @@ Flashkern is the CPU inference device:
   queues, direct byte views, scratch, and numerical lifecycle;
 - kcoro owns every resident control worker and fixed-team member, their idle
   dormancy, stop, and join;
-- architecture assembly owns numerical values;
+- architecture assembly is the primary numerical implementation, with Apple
+  Accelerate/AMX admitted only behind an explicit large-matrix ABI;
 - Rust docks platform PCM and control through opaque native handles only;
 - Metal is not part of Flashkern.
+
+Production enters through `lfm_runtime_create`. That implementation creates the
+private engine with `lfm_engine_new_status` so deadline-backend failure can be
+reported before work is admitted. The deterministic manual-deadline
+constructors are private test interfaces only.
 
 An operation never owns a sleeping thread. Its suspension is a durable
 `PassSlot`, route, conversation, or session record. A callback edge makes that
@@ -58,8 +64,9 @@ into a caller's stack.
 
 ## Fixed Lanes
 
-`lfm_engine_new` creates a retained kcoro bridge service, a retained route
-service, and one stable `kc_team`. Flashkern does not create lane pthreads.
+`lfm_engine_new_status`, reached through `lfm_runtime_create`, creates retained
+kcoro bridge, route, and team-supervisor services plus one stable `kc_team`.
+Flashkern does not create lane pthreads.
 The team owns one cache-isolated idle event and one generation-return counter;
 there is no per-pass or per-stage fence word.
 
@@ -70,10 +77,16 @@ generation or the terminal CQ record. Members do not block one another at a
 barrier; after returning they are simply available for the next generation and
 become dormant only if the entire team has no work.
 
+This is one team. The current engine may describe logical blocks for accounting,
+but it does not own two independent four-lane teams and cannot run two numerical
+programs concurrently. Independent `BlockDomain`s remain an unimplemented V2
+step.
+
 ## Math ABI
 
-C++ routes pointers, dimensions, strides, and stage identity. It does not own
-the numerical ladder.
+C++ routes pointers, dimensions, strides, and stage identity. That is its target
+steady-state role; the remaining value-producing C++ called out below is an
+open transliteration gap, not an alternate numerical tier.
 
 Current hand-written assembly files include:
 
@@ -81,6 +94,11 @@ Current hand-written assembly files include:
 - `native/kernels/x86_64/flashkern_math.S`
 - `native/kernels/{aarch64,x86_64}/flashkern_prng.S`
 - `native/kernels/{aarch64,x86_64}/flashkern_rope.S`
+- `native/kernels/{aarch64,x86_64}/flashkern_sampler.S`
+- `native/kernels/{aarch64,x86_64}/flashkern_frontend.S`
+- `native/kernels/{aarch64,x86_64}/flashkern_conformer.S`
+- `native/kernels/{aarch64,x86_64}/flashkern_sesame.S`
+- `native/kernels/{aarch64,x86_64}/flashkern_capture_format.S`
 
 `flashkern_math.S` currently owns reciprocal RMS scaling, fixed-order f32
 reduction, strided BF16 sum-of-squares, BF16 bias addition, and exact BF16 NeoX
@@ -101,10 +119,16 @@ AMX/Accelerate remains the Apple matrix coprocessor. Its invocation must sit
 behind the architecture math ABI; C++ may select the leaf but may not prepare or
 evaluate model values in the pass scheduler.
 
+The private loader type named `LfmTensorView` is metadata over checkpoint bytes,
+not an owning tensor. Production never constructs a framework tensor or loads a
+checkpoint in Rust.
+
 ## State And Memory
 
-The engine currently owns grow-only vectors for model plans and scratch. Final
-design requires all model-sized allocation before readiness:
+Setup-time C++ containers build immutable plans, formula-derived tables, and
+workspace high-water marks. Production activation workspaces are reserved and
+sealed before session readiness. All model-sized allocation belongs before
+readiness:
 
 - immutable model and Depthformer plans;
 - per-lane panels and temporary accumulators;
@@ -116,9 +140,10 @@ No pass may resize a vector, allocate a stack-dependent variable-length buffer,
 or throw across `extern "C"`. Plan construction tracks maxima across every layer,
 not only the final layer geometry.
 
-Weights remain views into the resident aligned model image. Activations and
-state mutate in declared native buffers. SQ/CQ records contain only fixed control
-facts and IDs.
+Weights remain views into the resident model image; an individual checkpoint
+view may be unaligned and must be loaded safely by its architecture leaf.
+Activations and state mutate in declared native buffers. SQ/CQ records contain
+only fixed control facts and IDs.
 
 ## Recurrence
 
@@ -138,6 +163,46 @@ route/session record dormant and releases the compute slot. The corresponding
 producer callback makes it runnable. No host loop, timeout, or thread waits for
 those resources. Rust handles only platform-audio and control edges.
 
+## Native Audio Policy
+
+The session consumes typed capture-chunk records over its preallocated native
+PCM arena. Every 20 ms of incoming samples, it runs the paired architecture
+Sesame leaf over the exact 256-sample Blackman-windowed 600–2400 Hz view. The
+detector, adaptive microphone state, sample-count thresholds, and pause
+generation belong to the native session. Rust does not run an RMS VAD.
+
+The 200 ms prepare gate currently records retained policy readiness only.
+Candidate-owned activation scratch and speculative numerical execution remain
+open work.
+
+The detector also implements separate playback adaptive state, but the product
+session currently calls only the microphone stream. Feeding exact playback
+evidence through Sesame remains an open integration gate; Rust output RMS is
+telemetry only.
+
+## Correlated Deadlines
+
+Each numerical team generation is hard-supervised by a readiness-time
+`kc_deadline_source`. On macOS it uses a monotonic GCD one-shot; non-Apple
+production runtime construction returns `LFM_STATUS_UNSUPPORTED` before
+admission, while private tests use a deterministic manual backend.
+
+Before dispatch, the engine copies pointer-free ticket, pass, stage, shape, and
+generation identity into retained supervision state and arms a one-second hard
+deadline. Each team member release-publishes its own generation-stamped entry
+and return. Normal final return retires the exact deadline. Completion and
+expiry race through one terminal CAS, so neither path can publish twice.
+
+If expiry wins, the supervisor captures the expected, entered, returned,
+never-entered, and entered-not-returned masks in a reserved fatal capsule,
+suppresses CQ/recurrence/scratch retirement, and aborts. There is no numerical
+retry or potentially-live scratch reuse.
+
+The mechanism is landed, but two release requirements remain open: the capsule
+is not yet exported to a durable observable crash sink, and the one-second
+budget is a provisional floor rather than a calibrated per-stage/shape value.
+Soft nudge/rebroadcast behavior is not part of production.
+
 ## Teardown
 
 Stop closes admission and marks retained services retiring. Accepted work
@@ -155,11 +220,17 @@ result before mutating payload state.
 
 Current tests include:
 
-- `raw_engine_owns_its_sq_cq_without_rust_progress`;
-- `native_engine_bridge_and_fence_soak` (10,000 passes);
-- exact MLP, conv, attention, PRNG, sampler, FFT, GEMM, and plan-lifetime tests;
-- `scalar_assembly_math_abi_is_bit_exact_without_simd_feature_gates`;
-- native AArch64 and local Rosetta x86_64 execution.
+- `kcoro-sys/tests/fixed_team.rs` for fixed membership, callback completion,
+  quorum snapshots, and stop/join ownership;
+- `engine_hard_supervision.rs` for deadline retirement, terminal arbitration,
+  and fatal-capsule content;
+- `sesame_detector.rs` for exact browser evidence, circular windows, separate
+  stream state, and malformed input;
+- `native_voice_session.rs` for PCM leases, exact sample-clock policy, pause
+  deadline races, callback failure, stop, and no-operation-wait source gates;
+- `native_product_abi.rs` for the opaque production export allowlist;
+- an explicitly ignored real-checkpoint truth gate that drives typed input,
+  repeated audio turns, and a two-engine audio-token exchange.
 
 Required cutover gates:
 
@@ -170,7 +241,9 @@ Required cutover gates:
 5. no Rust model/numerical symbol in the release graph;
 6. two or more conversations scheduled fairly over one model image;
 7. p50/p95/p99/max callback and pass latency against frozen baselines;
-8. ASan, UBSan, Linux TSan, AArch64, x86_64, and Rosetta gates.
+8. ASan, UBSan, Linux TSan, AArch64, x86_64, and Rosetta gates;
+9. observable platform fatal diagnostics and benchmark-calibrated hard budgets;
+10. playback-fed Sesame/echo evidence instead of host RMS policy.
 
 Source-shape gates additionally reject production `wait_submitted_slot`, raw
 lane pthread creation, operation-scoped address parking, timer-driven progress,

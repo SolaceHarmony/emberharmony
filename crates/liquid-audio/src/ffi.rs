@@ -1,4 +1,4 @@
-pub(crate) const ABI: u32 = 3;
+pub(crate) const ABI: u32 = 4;
 
 #[repr(C)]
 pub(crate) struct Model {

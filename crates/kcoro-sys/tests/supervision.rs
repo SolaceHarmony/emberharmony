@@ -1730,28 +1730,23 @@ fn non_apple_production_arm_is_explicitly_unsupported() {
         cancels: AtomicU64::new(0),
         owner: thread::current(),
     };
-    let source = deadline(&edge, false, 1);
-    let config = ArmConfig {
-        size: size_of::<ArmConfig>() as u32,
+    let config = DeadlineConfig {
+        size: size_of::<DeadlineConfig>() as u32,
         abi_version: ABI,
-        slot: 0,
+        capacity: 1,
         reserved: 0,
-        delay_ns: 1,
-        child: Ticket::new(300, 30, TICKET_DEADLINE),
-        parent: Ticket::new(400, 40, TICKET_WORKFLOW),
-        scope_generation: 50,
-        epoch: 60,
-        domain: 70,
-        team_generation: 80,
+        notify: Some(notify),
+        context: (&edge as *const Edge).cast_mut().cast(),
     };
-    let mut armed = Arm::default();
+    let mut source = std::ptr::null_mut();
     assert_ne!(
-        unsafe { kc_deadline_source_arm(source, &config, &mut armed) },
+        unsafe { kc_deadline_source_create(&config, &mut source) },
         0
     );
-    unsafe { kc_deadline_source_request_stop(source) };
-    wait_edge(&edge, 1);
-    assert_eq!(unsafe { kc_deadline_source_destroy(source) }, 0);
+    assert!(
+        source.is_null(),
+        "unsupported construction published a source"
+    );
 }
 
 #[test]

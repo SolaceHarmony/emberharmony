@@ -234,6 +234,132 @@ LFM_SYM(lfm_sesame_selected_magnitudes_window):
     .seh_endproc
 #endif
 
+// Load one logical sample into the requested SIMD lane source register,
+// advancing to the next validated descriptor only after this span is empty.
+.macro LFM_SESAME_SCATTER_SCALAR target
+    testq     %rax, %rax
+    jnz       .Lscatter_have\@
+    movq      0(%r10), %r9
+    movq      8(%r10), %rax
+    addq      $16, %r10
+.Lscatter_have\@:
+    movss     0(%r9), \target
+    addq      $4, %r9
+    decq      %rax
+.endm
+
+// void lfm_sesame_selected_magnitudes_scatter(
+//     const LfmSesameScatterWindowV1 *window, const float *real_table,
+//     const float *imag_table, float *smoothed_magnitudes,
+//     size_t selected_bins)
+//
+// Full four-sample groups load directly from their owning span. Groups that
+// cross one or more descriptor boundaries are assembled in xmm2. The math and
+// reduction order are identical to the contiguous leaf and no PCM plane or
+// stack spill is created.
+.p2align 4
+.globl LFM_SYM(lfm_sesame_selected_magnitudes_scatter)
+LFM_PRIVATE(LFM_SYM(lfm_sesame_selected_magnitudes_scatter))
+LFM_SYM(lfm_sesame_selected_magnitudes_scatter):
+#ifdef _WIN32
+    .seh_proc LFM_SYM(lfm_sesame_selected_magnitudes_scatter)
+#endif
+    pushq     %r12
+#ifdef _WIN32
+    .seh_pushreg %r12
+#endif
+    pushq     %r13
+#ifdef _WIN32
+    .seh_pushreg %r13
+    .seh_endprologue
+    movq      %rcx, %r12
+    movq      %rdx, %r11
+    movq      %r8,  %rdx
+    movq      %r9,  %rcx
+    movq      56(%rsp), %r8
+#else
+    movq      %rdi, %r12
+    movq      %rsi, %r11
+#endif
+    testq     %r8, %r8
+    jz        .Lscatter_done
+    movl      $0x3e4ccccd, %eax
+    movd      %eax, %xmm5       // 0.2f
+.Lscatter_bin:
+    movq      0(%r12), %r10
+    movq      0(%r10), %r9
+    movq      8(%r10), %rax
+    addq      $16, %r10
+    movl      $64, %r13d
+    xorps     %xmm0, %xmm0
+    xorps     %xmm1, %xmm1
+.Lscatter_group:
+    cmpq      $4, %rax
+    jb        .Lscatter_fragment
+    movups    0(%r9), %xmm2
+    addq      $16, %r9
+    subq      $4, %rax
+    jmp       .Lscatter_accumulate
+.Lscatter_fragment:
+    LFM_SESAME_SCATTER_SCALAR %xmm2
+    LFM_SESAME_SCATTER_SCALAR %xmm3
+    unpcklps  %xmm3, %xmm2
+    LFM_SESAME_SCATTER_SCALAR %xmm3
+    LFM_SESAME_SCATTER_SCALAR %xmm4
+    unpcklps  %xmm4, %xmm3
+    movlhps   %xmm3, %xmm2
+.Lscatter_accumulate:
+    movups    0(%r11), %xmm3
+    movups    0(%rdx), %xmm4
+    mulps     %xmm2, %xmm3
+    mulps     %xmm2, %xmm4
+    addps     %xmm3, %xmm0
+    addps     %xmm4, %xmm1
+    addq      $16, %r11
+    addq      $16, %rdx
+    decl      %r13d
+    jnz       .Lscatter_group
+
+    movaps    %xmm0, %xmm2
+    shufps    $0x4e, %xmm2, %xmm2
+    addps     %xmm2, %xmm0
+    movaps    %xmm0, %xmm2
+    shufps    $0xb1, %xmm2, %xmm2
+    addss     %xmm2, %xmm0
+    movaps    %xmm1, %xmm2
+    shufps    $0x4e, %xmm2, %xmm2
+    addps     %xmm2, %xmm1
+    movaps    %xmm1, %xmm2
+    shufps    $0xb1, %xmm2, %xmm2
+    addss     %xmm2, %xmm1
+    mulss     %xmm0, %xmm0
+    mulss     %xmm1, %xmm1
+    addss     %xmm1, %xmm0
+    sqrtss    %xmm0, %xmm0
+    movd      %xmm0, %eax
+    andl      $0x7f800000, %eax
+    cmpl      $0x7f800000, %eax
+    jne       .Lscatter_finite
+    xorps     %xmm0, %xmm0
+.Lscatter_finite:
+    mulss     %xmm5, %xmm0
+    movss     0(%rcx), %xmm1
+    movl      $0x3f4ccccd, %eax
+    movd      %eax, %xmm4       // 0.8f
+    mulss     %xmm4, %xmm1
+    addss     %xmm1, %xmm0
+    movss     %xmm0, 0(%rcx)
+    addq      $4, %rcx
+    decq      %r8
+    jnz       .Lscatter_bin
+.Lscatter_done:
+    popq      %r13
+    popq      %r12
+    ret
+#ifdef _WIN32
+    .seh_endproc
+#endif
+
 // void lfm_sesame_magnitudes_to_bytes(const float *magnitudes,
 //     const double thresholds[256], uint8_t *bytes, size_t count)
 .p2align 4

@@ -1,268 +1,272 @@
 # kcoro and Flashkern Integration Runbook
 
-Status: current implementation map plus migration gates.
+Status: current implementation map plus open release gates.
 
-This runbook answers one question: where does asynchronous coordination end and
-numerical inference begin? The answer is intentionally strict.
+This runbook describes the production ownership boundary. It is not a migration
+proposal and it does not preserve deleted bridge or coroutine implementations.
 
 ## Contract
 
-- Rust owns OS audio streams, PCM rings, settings, and Tauri projection.
-- Rust kcoro coordinates only asynchronous PCM/control I/O.
-- Native C++ owns handles, plans, queues, barriers, buffer lifetimes, and model
-  recurrence control.
-- AArch64/x86_64 assembly owns all math.
-- The native model SQ/CQ is internal to the native runtime. Rust does not broker
-  model passes.
-- Progress is callback/doorbell driven. There is no polling or bounded spin.
-- A callback that makes progress is reliable and exact-once. Telemetry is
-  observational, sampled, coalescible, and never on the progress path.
+- Rust owns platform audio callbacks, opaque native-handle lifetime, controls,
+  telemetry, and UI projection.
+- Native C++ owns the immutable checkpoint image, pointer/stride views, plans,
+  activation arenas, PCM arenas, conversations, sessions, routing, recurrence,
+  and model tickets.
+- `kcoro-sys/vendor/kcoro_arena` owns resident coordination workers, retained
+  stackless services, realtime notifier edges, fixed scopes, correlated
+  deadlines, and the fixed numerical team.
+- Architecture assembly is the primary numerical implementation. Apple
+  Accelerate/AMX is permitted only behind an explicit matrix ABI. Remaining
+  value-producing C++ is migration debt, not a fallback tier.
+- No production path loads safetensors in Rust or constructs a framework tensor.
+  A model value is a validated non-owning byte view into the one sealed native
+  image.
+- Progress is caused by a published callback, completion, capacity, control, or
+  correlated deadline edge. There is no polling or bounded spin.
 
-`kcoro` therefore names two related but different substrates:
+`kcoro-sys` contains both the native runtime build and its Rust docking
+wrappers. Model-pass bridge implementation is native.
 
-1. `crates/kcoro-sys/vendor/kcoro_arena` supplies native expected-value waits,
-   tickets, and lifecycle primitives used by the C++ control runtime.
-2. `crates/kcoro` supplies Rust continuations for the PCM/control docking layer
-   and future Tauri-side parallel work. It does not become an inference engine.
+## Live Runtime Construction
 
-## As-Built Native Pass
+The product enters through `lfm_runtime_create`. The runtime internally calls
+`lfm_engine_new_status`, then constructs the kcoro coordination runtime. The
+engine constructor is private implementation detail.
 
-The current native pass no longer crosses Rust for progress.
+An engine currently owns:
 
-```mermaid
-sequenceDiagram
-    participant ABI as Rust opaque-handle call
-    participant Submit as C++ submit_pass
-    participant SQ as Native SQ and descriptor pool
-    participant Dispatch as Native bridge thread
-    participant Lanes as Fixed Flashkern lanes
-    participant ASM as Architecture assembly
-    participant CQ as Native CQ
+- one `kc_team` with the configured fixed lane count;
+- one one-worker control `kc_runtime`;
+- retained bridge, route, and team-supervisor `kc_service` continuations;
+- one native SQ/CQ bridge and generation-protected pass/route records;
+- one correlated deadline source for team-generation supervision.
 
-    ABI->>Submit: one compatibility call with borrowed extent
-    Submit->>SQ: retain descriptor and publish submission
-    SQ-->>Dispatch: submission doorbell
-    Dispatch->>Lanes: publish request generation
-    Lanes->>ASM: execute stage leaves
-    ASM-->>Lanes: return numerical result
-    Lanes-->>CQ: publish exact completion
-    CQ-->>Submit: completion doorbell
-    Submit-->>ABI: status only
-```
+The product runtime separately owns the retained session coordinator and
+delivery services. `kc_service` does not create a thread: it is permanently
+assigned to one runtime worker and becomes runnable through its ready bit.
+Realtime producers use retained notifier leases whose notify operation is
+bounded, lock-free, allocation-free, and never invokes the callback inline.
 
-The outer Rust call is presently blocking because it preserves borrowed-buffer
-lifetime for compatibility. That is not a Rust coordinator and it does not
-choose the next model pass. The final native conversation owns persistent
-buffers and recurrence, eliminating the per-pass host call entirely.
+Flashkern V2 is still one team. Source fields that describe logical blocks or
+collect block counters do not create two independent `BlockDomain` teams and do
+not permit two simultaneous numerical programs. Two independent four-lane
+domains remain future work.
 
-Current source:
-
-- bridge records and descriptor ABI:
-  `crates/liquid-audio/native/include/lfm_kernel_bridge.h`;
-- rings, doorbells, descriptor leases:
-  `crates/liquid-audio/native/src/runtime/kernel_bridge.cpp`;
-- bridge consumer and native submission:
-  `bridge_main` and `submit_pass` in
-  `crates/liquid-audio/native/src/engine/flashkern_engine.cpp`;
-- fixed lanes and generation fence: `lane_main`, `run_stage`, and `lane_fence`
-  in the same file;
-- Rust compatibility wrapper:
-  `crates/liquid-audio/src/compute/flashkern/native_engine.rs`;
-- Rust bridge bindings:
-  `crates/liquid-audio/src/compute/flashkern/bridge.rs`, test-only.
-
-## Final Continuous Flow
+## End-to-End Audio Flow
 
 ```mermaid
 flowchart LR
-    Mic["microphone callback"]
-    In["Rust capture ring"]
-    Dock["Rust kcoro PCM/control dock"]
-    Session["native conversation/session control"]
-    SQ["native model SQ"]
-    Team["fixed lane team"]
-    ASM["assembly stages"]
-    CQ["native model CQ"]
-    Out["Rust playback ring"]
-    Speaker["speaker callback"]
+    Mic["platform capture callback"]
+    Capture["native capture reservation"]
+    Chunk["typed capture chunk record"]
+    Coord["native session kc_service"]
+    Sesame["native Sesame mic policy"]
+    Route["ticketed native route"]
+    Team["one fixed kc_team"]
+    Math["assembly / explicit AMX seam"]
+    Lease["native playback lease"]
+    Deliver["reliable native delivery edge"]
+    Speaker["platform playback callback"]
 
-    Mic -->|"commit PCM lease"| In
-    In -->|"doorbell"| Dock
-    Dock -->|"region id, generation, extent"| Session
-    Session --> SQ --> Team --> ASM
-    ASM --> Team --> CQ
-    CQ -->|"native continuation"| Session
-    Session -->|"PCM region ready"| Dock
-    Dock --> Out --> Speaker
+    Mic -->|"write complete callback block"| Capture
+    Capture -->|"release-publish metadata"| Chunk
+    Chunk -->|"realtime notifier"| Coord
+    Coord --> Sesame
+    Sesame -->|"turn ticket"| Route
+    Route --> Team --> Math
+    Math -->|"final-member callback"| Route
+    Route --> Lease --> Deliver
+    Deliver -->|"claim / resolve"| Speaker
+    Speaker -->|"release capacity edge"| Coord
 ```
 
-Model recurrence can issue more token, frame, codec, or predictive work while
-Rust audio continuations handle independent PCM and control edges. Completion
-order need not equal submission order across conversations. Identity, epoch,
-generation, and parent scope route every completion to its exact continuation.
+The callback source PCM is borrowed only for the synchronous format/downmix
+write. Native code reserves the exact destination spans in its preallocated
+circular arena, performs the architecture conversion directly into those spans,
+and publishes one metadata record. A block that cannot be admitted produces an
+explicit sequenced gap/XRUN record; no prefix is silently spliced to a suffix.
 
-## Three Queue Classes
+Playback stays native until the hardware callback claims its exact reliable
+`PLAYBACK_READY` identity, resolves a borrowed span, writes the device buffer,
+and releases the lease. Lease release publishes the capacity edge that can
+resume the native session. PCM never travels through stdout, a temporary WAV,
+or an event payload. WAV files produced by an explicit truth-gate run are
+post-retirement evidence only.
 
-Do not merge these queues merely because each uses a ring.
+## Sesame Turn Policy
 
-| Queue | Producer/consumer | Payload | Progress owner |
-|---|---|---|---|
-| native model SQ/CQ | native control and Flashkern | compact pass records and descriptor IDs | native continuation |
-| Rust/native PCM dock | Rust audio host and native session | region lease identity, extent, epoch | Rust kcoro I/O continuation |
-| Tauri observer queue | native/Rust runtime and webview | bounded metadata snapshots | nobody; lossy observer only |
+The native session owns the recovered Sesame detector and samples microphone
+evidence every 20 ms of incoming samples. The numerical detector uses the
+256-sample Blackman-windowed 600–2400 Hz band, magnitude smoothing, dB mapping,
+and adaptive byte-range classifier implemented by the paired
+`flashkern_sesame.S` leaves.
 
-The first queue is not public IPC. The second is not a tensor channel. The third
-can drop or coalesce without affecting audio or model progress.
+Speech durations are sample-clock state:
 
-## Scope Semantics
+- 200 ms prepare gate;
+- 500 ms endpoint commit;
+- 300 ms minimum utterance;
+- 30 s forced endpoint.
 
-Three states must remain distinct:
+Pause preparation and commit are dual-gated: the matching amount of
+detector-classified silence must arrive and the correlated monotonic deadline
+child for the same pause generation must expire. Resumed speech advances the
+pause generation and structurally cancels its children. Timer callbacks carry
+identity and publish a dormant record; they never inspect a conversation or
+advance inference inline.
 
-- **park**: the parent waits for a child completion; children continue;
-- **pause**: scheduling is inhibited while state and registrations remain live;
-- **cancel**: the scope epoch changes, descendants become stale, and terminal
-  callbacks resolve exactly once.
+The current prepare edge records durable policy readiness only. Candidate-owned
+activation scratch and speculative model execution have not landed and must not
+be inferred from the name of the gate.
 
-Stopping speech does not synchronously preempt an assembly instruction. It marks
-the publication epoch stale immediately. The active full pass reaches its fence,
-may commit model thought state according to conversation policy, cannot publish
-stale audio, and rings its terminal completion. Speculative branches roll back
-instead of committing.
+The detector maintains separate mic and playback adaptive state and its tests
+exercise both. The production session currently invokes only
+`LFM_SESAME_STREAM_MIC`; it does not yet feed playback evidence into the
+detector. Playback-aware Sesame/echo classification is therefore an open gate.
+Rust RMS values are output/latency telemetry and must not be described as the
+turn detector.
 
-## Assembly Ownership
+## Retained State Instead of Waiters
 
-The completed production source graph has no numerical Rust or C++ body.
+No operation owns a blocked stack. Values that must survive a callback return
+live in a bounded retained record:
 
-### C++ may
+- a `kc_service` context for host/session state machines;
+- a sealed `kc_fixed_scope` plus generation-stamped child leases for turn
+  deadline ownership;
+- an engine pass slot and program cursor for a numerical continuation;
+- a route record for resource and recurrence state;
+- a generation-protected capture or playback lease for PCM ownership.
 
-- validate sizes, alignments, capabilities, and epochs;
-- own allocations outside passes;
-- build immutable plans and bind function pointers;
-- move descriptor identities through rings;
-- claim work indices and cross barriers;
-- invoke assembly ABI functions;
-- select an Apple Accelerate/AMX backend at model-open time from measured profile
-  data without performing arithmetic itself.
+The service callback drains a durable predicate, publishes a successor edge if
+work remains, and returns. The fixed team runs one generation. Its final member
+return invokes the completion callback, which either dispatches the next eager
+stage or publishes the terminal ticket. No caller waits for a stage, and there
+is no per-operation completion channel.
 
-### C++ may not
+`kc_fixed_scope` is an ownership graph, not a scheduler. Its child table is
+sealed at setup. A failed functional child cancels live siblings; lossy
+telemetry children retire independently; the final child publishes the one
+parent-ready edge. There are no child joins, waiter stacks, actor queues, or
+generic channels.
 
-- add, multiply, normalize, convert, reduce, sample, convolve, rotate, transform,
-  quantize, or otherwise numerically mutate model/audio payloads;
-- contain SIMD intrinsics as a production kernel implementation;
-- call scalar libm from a production numerical loop;
-- use Candle, Eigen, MLX-CPU, or generic tensor objects;
-- allocate or resize scratch during a pass.
+## Tickets and Publication
 
-### Rust may not
+The canonical ticket is
+`{runtime_epoch, sequence, generation, kind}`. Product, kcoro, and Flashkern
+share the same ticket kinds, including session, turn, pass, workflow, control,
+and deadline. A callback may use an immutable ticket value or retained notifier
+state; it may not retain a pointer into route, conversation, scratch, or a
+caller's stack.
 
-- own a tensor, logit plane, KV cache, sampler state, model token buffer, or model
-  pass descriptor;
-- expose a generic numerical FFI wrapper;
-- decide token/frame recurrence;
-- execute DSP, model, sampler, or codec arithmetic.
+Submission order need not equal completion order across conversations. Exact
+ticket, parent, epoch, scope generation, domain, team generation, and arm
+generation decide ownership. A stale callback can publish a wake hint, but the
+consumer rejects its identity before touching successor state.
 
-Test-only scalar oracles may exist in an explicitly excluded test target. They
-cannot link into the product archive.
+Reliable progress records include transcript text, playback-ready identity,
+errors, turn terminal, and stopped. Telemetry may be coalesced or dropped. A
+reliable callback rejection is a terminal host fault; it cannot silently turn
+future native progress into a self-rescheduling loop.
 
-## Mounted Assembly Families
+## Fixed-Team Execution
 
-| Family | Assembly source | Current status |
-|---|---|---|
-| ChaCha20 block and Apple entropy thunk | `native/kernels/{aarch64,x86_64}/flashkern_prng.S` | mounted |
-| RoPE table generation | `native/kernels/{aarch64,x86_64}/flashkern_rope.S` | mounted |
-| scalar reductions, inverse RMS, BF16 bias/NeoX rotation | `native/kernels/{aarch64,x86_64}/flashkern_math.S` | mounted |
-| sampler argmax, scaling, threshold, exponentiation, ordered sum, prefix selection | `native/kernels/{aarch64,x86_64}/flashkern_sampler.S` | mounted; no external numerical symbol |
-| GEMM, attention, activation, convolution, FFT, Mimi | architecture `.cpp` and native C++ sources | migration debt |
+`kc_team` owns stable, non-stealing members. Only one generation is active on
+the current team:
 
-The sampler includes a local f32 range-reduced degree-six exponential in each
-architecture object. It imports no libm numerical symbol and preserves the
-pinned seeded sampler stream on Apple Silicon and x86_64 under Rosetta.
+1. the engine seals the active pass/program descriptor;
+2. it arms correlated hard supervision;
+3. it release-publishes a strictly increasing generation;
+4. every member records entry, claims disjoint numerical tiles, runs its full
+   leaf without yielding, records return, and becomes available;
+5. the final return retires the deadline and invokes exactly one completion
+   callback;
+6. that callback advances the durable program or settles its CQ record.
 
-## Buffer and Lease Rules
+Members do not wait at an internal barrier. The final-return count is the
+quorum edge. Idle team members may enter kcoro's expected-value dormancy only
+when no generation is runnable; that is a kernel-owned zero-instruction park,
+not a polling waiter attached to an operation.
 
-```mermaid
-flowchart TB
-    Image["resident immutable weight image"]
-    Plan["model plan and packed panels"]
-    Conv["conversation state: KV, conv, RNG, codec"]
-    Scratch["fixed scratch planes"]
-    Desc["generation-protected descriptor lease"]
-    Pass["native pass"]
-    PCM["Rust-owned PCM regions"]
+## Deadline Supervision
 
-    Image --> Plan
-    Plan --> Pass
-    Conv --> Desc --> Pass
-    Scratch --> Pass
-    PCM -->|"docked region lease only"| Desc
-```
+`kc_deadline_source` is a fixed readiness-time pool. On macOS each slot uses a
+GCD one-shot based on monotonic `dispatch_time`; wall-clock timers are forbidden
+for speech and numerical liveness. Non-Apple production construction fails with
+`LFM_STATUS_UNSUPPORTED` before work is admitted. A deterministic manual source
+exists only behind private test constructors.
 
-- A descriptor moves by identity; its payload does not move through a channel.
-- A pass retains every source/destination lease until its CQ cell is consumed.
-- Scratch capacity is fixed before submission.
-- Recycle increments generation before a slot can be reused.
-- Shutdown closes admission, drains terminal completions, joins workers, proves
-  zero live leases, then destroys storage.
-- Raw payload `memcpy` is limited to named hardware ingress and declared assembly
-  destination writes.
+Every Flashkern generation currently has a hard-only one-second deadline.
+Completion and expiry race through one terminal CAS. If expiry wins, the
+supervisor snapshots generation-stamped per-member entry/return masks, copies
+ticket lineage and stage/shape evidence into reserved storage, suppresses all
+CQ/recurrence/scratch retirement, and aborts. Stateful numerical work is not
+retried.
 
-## Native Recurrence
+This mechanism has landed, but release supervision is not complete:
 
-One conversation has one native recurrence state containing:
+- the reserved fatal capsule is only in process memory when `abort()` executes;
+  a durable platform crash sink/export must make it observable;
+- the one-second value is a provisional floor. Per-stage/shape budgets must be
+  frozen from the target million-generation benchmark before tightening;
+- soft targeted nudges and full-team rebroadcast are not production behavior.
 
-- current modality and token/frame cursor;
-- KV and short-convolution cursor/state;
-- sampler CSPRNG image;
-- codec state;
-- interrupt/publication epoch;
-- active candidate or speculative mark;
-- pending native continuation identity.
+## Memory and Numerical Boundaries
 
-A completion may directly enqueue the next native pass. Rust is informed only
-when PCM/control ownership crosses the docking boundary or when a sampled
-observer event is emitted.
+- `safetensors.cpp` opens and validates the checkpoint sources and reads them
+  directly into one final immutable image.
+- Plans bind dtype/shape/stride pointer views. The name `LfmTensorView` in the
+  private loader ABI denotes metadata over bytes; it is not an owning tensor or
+  a framework numerical object.
+- Model weights are never widened, transposed, aligned, or repacked for
+  convenience. Formula-changing immutable tables are separately accounted.
+- Activation and PCM arenas are allocated and sealed before readiness. A pass
+  may reuse dead planes according to declared liveness, but may not grow or
+  materialize an intermediate tensor.
+- Assembly leaves own tiles and register-resident intermediate values. Values
+  crossing a team-generation boundary are compactly materialized into the
+  declared native arena because no caller or lane stack survives that return.
+- Apple Accelerate/AMX is an explicit large-matrix seam. The scheduler passes
+  raw views and dimensions; it does not stage weights or emulate tensor ops.
 
-Predictive listening uses the same mechanism. A draft owns a candidate epoch;
-resumed speech cancels that epoch; terminal arbitration decides commit versus
-rollback without routing through Tauri.
+## Shutdown
 
-## Migration Order
+Stop closes producer and route admission, advances the publication epoch, and
+requests retirement of retained services and deadline sources. Hardware
+callbacks are disconnected before their notifier and PCM endpoints are
+destroyed. Already-admitted work settles exactly once; stale work cannot
+publish. Deadline cancellation acknowledges asynchronous handlers before
+storage is freed.
 
-1. Keep the direct native SQ/CQ mount and delete all remaining Rust model-pass
-   routing.
-2. Move every architecture `.cpp` numerical family into paired AArch64/x86_64
-   `.S` objects. Remove each C++ body after parity passes.
-3. Bind the full model from the resident safetensors image and move conversation
-   state plus recurrence behind opaque native handles.
-4. Port mel, Conformer, adapter, Mimi, and remaining generation code; delete the
-   corresponding Rust/Candle sources in the same gate.
-5. Mount Rust kcoro PCM/control docking rings and reduce the desktop Rust layer to
-   streams, settings, handles, and event projection.
-6. Add the separate MLX C++/Metal device engine. Do not add Metal to Flashkern.
-7. Remove Candle dependencies and verify the product symbol graph.
+Administrative joins occur only after progress admission is closed. They prove
+that services, team members, tickets, route slots, PCM leases, and notifier
+publishers have retired; a join is never used to drive inference.
 
-## Gates
+## Verification Gates
 
-Run after every numerical family:
+Run the implementation-backed suites from the repository root:
 
 ```bash
-cargo test -p liquid-audio --lib -- --nocapture
-cargo test -p liquid-audio --tests -- --nocapture
-./crates/liquid-audio/scripts/test-rosetta.sh
+cargo test -p kcoro-sys
+cargo test -p liquid-audio --lib
+cargo test -p liquid-audio --tests
 git diff --check
 ```
 
-The family gate must prove:
+The ignored real-checkpoint truth gate must also be invoked explicitly with the
+model and `question.wav` fixture. It drives typed input, two audio turns on one
+conversation, and a two-engine audio-token exchange through native capture and
+playback leases. An OS one-shot is a failing watchdog only; it never advances
+the test state machine.
 
-- fixed fixture parity on AArch64 and x86_64;
-- deterministic pass/fence counts where promised;
-- no per-pass allocation;
-- no Rust callback or Tauri event required for progress;
-- no stale publication after interrupt;
-- zero live descriptors and continuations at teardown;
-- source/disassembly shows the production numerical body in `.S`;
-- the replaced Rust/C++ numerical body is deleted, not retained as fallback.
+Release still requires:
 
-Final release gates add one-million-pass soak, completion/cancel/stop races,
-idle-CPU measurement, PCM underrun/overrun accounting, and a product-binary audit
-for Candle, Rust tensor, scalar libm, and disallowed C++ numerical symbols.
+- zero compatibility-copied weight bytes, with a positive test proving the
+  tally can fail;
+- no post-readiness allocation, model-file read, or weight materialization;
+- deterministic full-output evidence and exact lease/ticket retirement;
+- one-million healthy team generations with no deadline fire;
+- calibrated hard budgets and observable fatal diagnostics;
+- playback-fed Sesame evidence and echo traces;
+- AArch64 plus x86_64/Rosetta numerical and lifecycle gates;
+- a product linkage audit proving no Candle numerical symbols.

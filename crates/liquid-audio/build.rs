@@ -84,6 +84,7 @@ fn main() {
     println!("cargo::rerun-if-changed=native/src/engine/flashkern_engine.cpp");
     println!("cargo::rerun-if-changed=native/src/model/lfm_model.cpp");
     println!("cargo::rerun-if-changed=native/src/model/lfm_model_internal.h");
+    println!("cargo::rerun-if-changed=native/src/model/lfm_payload_reader.h");
     println!("cargo::rerun-if-changed=native/src/model/lfm_tokenizer.cpp");
     println!("cargo::rerun-if-changed=native/include/flashkern_conv.h");
     println!("cargo::rerun-if-changed=native/include/flashkern_depth.h");
@@ -354,6 +355,7 @@ fn main() {
     // constructor calls into it (static archive consumers precede providers on
     // GNU ld). Production Mimi receives the lifecycle-owned image directly.
     println!("cargo::rerun-if-changed=native/src/io/safetensors.cpp");
+    println!("cargo::rerun-if-changed=native/src/model/lfm_payload_reader.h");
     println!("cargo::rerun-if-changed=native/include/lfm_safetensors.h");
     println!("cargo::rerun-if-changed=native/vendor/nlohmann");
     let mut weights = cc::Build::new();
@@ -366,7 +368,9 @@ fn main() {
         .flag("-pthread")
         .flag_if_supported("-fvisibility=hidden")
         .include("native/include")
-        .include("native/vendor");
+        .include("native/src/model")
+        .include("native/vendor")
+        .include("../kcoro-sys/vendor/kcoro_arena/include");
     if oracle {
         weights.define("LFM_BUILD_ORACLE", None);
     }

@@ -278,31 +278,21 @@ LFM_SYM(lfm_capture_downmix_u16_dd):
 249:
     ret
 
-// Playback leaves update the callback-local meter in place: rendered frames
-// at +8, f32 sum-of-squares at +16, and aggregate f32 RMS at +20. Vector output
-// paths still add squares in source-frame order.
-
-// void lfm_playback_render_f32_dd(const float *source, float *destination,
-//     size_t frames, uint32_t channels, LfmPlaybackMeterV1 *meter)
+// void lfm_playback_fanout_f32_dd(const float *source, float *destination,
+//     size_t frames, uint32_t channels)
 .p2align 4
-.globl LFM_SYM(lfm_playback_render_f32_dd)
-LFM_PRIVATE(LFM_SYM(lfm_playback_render_f32_dd))
-LFM_SYM(lfm_playback_render_f32_dd):
+.globl LFM_SYM(lfm_playback_fanout_f32_dd)
+LFM_PRIVATE(LFM_SYM(lfm_playback_fanout_f32_dd))
+LFM_SYM(lfm_playback_fanout_f32_dd):
 #ifdef _WIN32
     movq      %rcx, %r10
     movq      %rdx, %r11
     movq      %r8, %rdx
     movl      %r9d, %ecx
-    movq      40(%rsp), %r9
 #else
     movq      %rdi, %r10
     movq      %rsi, %r11
-    movq      %r8, %r9
 #endif
-    movq      8(%r9), %r8
-    addq      %rdx, %r8
-    movq      %r8, 8(%r9)
-    movss     16(%r9), %xmm5
     cmpl      $1, %ecx
     je        310f
     cmpl      $2, %ecx
@@ -314,17 +304,6 @@ LFM_SYM(lfm_playback_render_f32_dd):
 311:
     movups    (%r10), %xmm0
     movups    %xmm0, (%r11)
-    movaps    %xmm0, %xmm1
-    mulps     %xmm1, %xmm1
-    addss     %xmm1, %xmm5
-    movaps    %xmm1, %xmm2
-    shufps    $0x55, %xmm2, %xmm2
-    addss     %xmm2, %xmm5
-    movaps    %xmm1, %xmm2
-    shufps    $0xaa, %xmm2, %xmm2
-    addss     %xmm2, %xmm5
-    shufps    $0xff, %xmm1, %xmm1
-    addss     %xmm1, %xmm5
     addq      $16, %r10
     addq      $16, %r11
     subq      $4, %rdx
@@ -342,17 +321,6 @@ LFM_SYM(lfm_playback_render_f32_dd):
     unpckhps  %xmm2, %xmm2
     movups    %xmm1, (%r11)
     movups    %xmm2, 16(%r11)
-    movaps    %xmm0, %xmm1
-    mulps     %xmm1, %xmm1
-    addss     %xmm1, %xmm5
-    movaps    %xmm1, %xmm2
-    shufps    $0x55, %xmm2, %xmm2
-    addss     %xmm2, %xmm5
-    movaps    %xmm1, %xmm2
-    shufps    $0xaa, %xmm2, %xmm2
-    addss     %xmm2, %xmm5
-    shufps    $0xff, %xmm1, %xmm1
-    addss     %xmm1, %xmm5
     addq      $16, %r10
     addq      $32, %r11
     subq      $4, %rdx
@@ -364,9 +332,6 @@ LFM_SYM(lfm_playback_render_f32_dd):
 341:
     movss     (%r10), %xmm0
     addq      $4, %r10
-    movaps    %xmm0, %xmm1
-    mulss     %xmm1, %xmm1
-    addss     %xmm1, %xmm5
     movl      %ecx, %eax
 342:
     movss     %xmm0, (%r11)
@@ -376,36 +341,23 @@ LFM_SYM(lfm_playback_render_f32_dd):
     decq      %rdx
     jnz       341b
 348:
-    movss     %xmm5, 16(%r9)
-    movq      8(%r9), %r8
-    cvtsi2ssq %r8, %xmm0
-    movaps    %xmm5, %xmm1
-    divss     %xmm0, %xmm1
-    sqrtss    %xmm1, %xmm1
-    movss     %xmm1, 20(%r9)
     ret
 
-// void lfm_playback_render_i16_dd(const float *source, int16_t *destination,
-//     size_t frames, uint32_t channels, LfmPlaybackMeterV1 *meter)
+// void lfm_playback_fanout_i16_dd(const float *source, int16_t *destination,
+//     size_t frames, uint32_t channels)
 .p2align 4
-.globl LFM_SYM(lfm_playback_render_i16_dd)
-LFM_PRIVATE(LFM_SYM(lfm_playback_render_i16_dd))
-LFM_SYM(lfm_playback_render_i16_dd):
+.globl LFM_SYM(lfm_playback_fanout_i16_dd)
+LFM_PRIVATE(LFM_SYM(lfm_playback_fanout_i16_dd))
+LFM_SYM(lfm_playback_fanout_i16_dd):
 #ifdef _WIN32
     movq      %rcx, %r10
     movq      %rdx, %r11
     movq      %r8, %rdx
     movl      %r9d, %ecx
-    movq      40(%rsp), %r9
 #else
     movq      %rdi, %r10
     movq      %rsi, %r11
-    movq      %r8, %r9
 #endif
-    movq      8(%r9), %r8
-    addq      %rdx, %r8
-    movq      %r8, 8(%r9)
-    movss     16(%r9), %xmm5
     movl      $0x3f800000, %eax
     movd      %eax, %xmm3
     shufps    $0, %xmm3, %xmm3
@@ -422,17 +374,6 @@ LFM_SYM(lfm_playback_render_i16_dd):
     jb        440f
 411:
     movups    (%r10), %xmm0
-    movaps    %xmm0, %xmm1
-    mulps     %xmm1, %xmm1
-    addss     %xmm1, %xmm5
-    movaps    %xmm1, %xmm2
-    shufps    $0x55, %xmm2, %xmm2
-    addss     %xmm2, %xmm5
-    movaps    %xmm1, %xmm2
-    shufps    $0xaa, %xmm2, %xmm2
-    addss     %xmm2, %xmm5
-    shufps    $0xff, %xmm1, %xmm1
-    addss     %xmm1, %xmm5
     movaps    %xmm0, %xmm2
     cmpordps  %xmm0, %xmm2
     andps     %xmm2, %xmm0
@@ -456,17 +397,6 @@ LFM_SYM(lfm_playback_render_i16_dd):
     jb        440f
 421:
     movups    (%r10), %xmm0
-    movaps    %xmm0, %xmm1
-    mulps     %xmm1, %xmm1
-    addss     %xmm1, %xmm5
-    movaps    %xmm1, %xmm2
-    shufps    $0x55, %xmm2, %xmm2
-    addss     %xmm2, %xmm5
-    movaps    %xmm1, %xmm2
-    shufps    $0xaa, %xmm2, %xmm2
-    addss     %xmm2, %xmm5
-    shufps    $0xff, %xmm1, %xmm1
-    addss     %xmm1, %xmm5
     movaps    %xmm0, %xmm2
     cmpordps  %xmm0, %xmm2
     andps     %xmm2, %xmm0
@@ -492,9 +422,6 @@ LFM_SYM(lfm_playback_render_i16_dd):
     movss     (%r10), %xmm0
     addq      $4, %r10
     movaps    %xmm0, %xmm1
-    mulss     %xmm1, %xmm1
-    addss     %xmm1, %xmm5
-    movaps    %xmm0, %xmm1
     cmpordss  %xmm0, %xmm1
     andps     %xmm1, %xmm0
     maxss     %xmm4, %xmm0
@@ -512,36 +439,23 @@ LFM_SYM(lfm_playback_render_i16_dd):
     decq      %rdx
     jnz       441b
 448:
-    movss     %xmm5, 16(%r9)
-    movq      8(%r9), %r8
-    cvtsi2ssq %r8, %xmm0
-    movaps    %xmm5, %xmm1
-    divss     %xmm0, %xmm1
-    sqrtss    %xmm1, %xmm1
-    movss     %xmm1, 20(%r9)
     ret
 
-// void lfm_playback_render_u16_dd(const float *source, uint16_t *destination,
-//     size_t frames, uint32_t channels, LfmPlaybackMeterV1 *meter)
+// void lfm_playback_fanout_u16_dd(const float *source, uint16_t *destination,
+//     size_t frames, uint32_t channels)
 .p2align 4
-.globl LFM_SYM(lfm_playback_render_u16_dd)
-LFM_PRIVATE(LFM_SYM(lfm_playback_render_u16_dd))
-LFM_SYM(lfm_playback_render_u16_dd):
+.globl LFM_SYM(lfm_playback_fanout_u16_dd)
+LFM_PRIVATE(LFM_SYM(lfm_playback_fanout_u16_dd))
+LFM_SYM(lfm_playback_fanout_u16_dd):
 #ifdef _WIN32
     movq      %rcx, %r10
     movq      %rdx, %r11
     movq      %r8, %rdx
     movl      %r9d, %ecx
-    movq      40(%rsp), %r9
 #else
     movq      %rdi, %r10
     movq      %rsi, %r11
-    movq      %r8, %r9
 #endif
-    movq      8(%r9), %r8
-    addq      %rdx, %r8
-    movq      %r8, 8(%r9)
-    movss     16(%r9), %xmm5
     movl      $0x3f800000, %eax
     movd      %eax, %xmm3
     shufps    $0, %xmm3, %xmm3
@@ -558,17 +472,6 @@ LFM_SYM(lfm_playback_render_u16_dd):
     jb        540f
 511:
     movups    (%r10), %xmm0
-    movaps    %xmm0, %xmm1
-    mulps     %xmm1, %xmm1
-    addss     %xmm1, %xmm5
-    movaps    %xmm1, %xmm2
-    shufps    $0x55, %xmm2, %xmm2
-    addss     %xmm2, %xmm5
-    movaps    %xmm1, %xmm2
-    shufps    $0xaa, %xmm2, %xmm2
-    addss     %xmm2, %xmm5
-    shufps    $0xff, %xmm1, %xmm1
-    addss     %xmm1, %xmm5
     movaps    %xmm0, %xmm2
     cmpordps  %xmm0, %xmm2
     andps     %xmm2, %xmm0
@@ -595,17 +498,6 @@ LFM_SYM(lfm_playback_render_u16_dd):
     jb        540f
 521:
     movups    (%r10), %xmm0
-    movaps    %xmm0, %xmm1
-    mulps     %xmm1, %xmm1
-    addss     %xmm1, %xmm5
-    movaps    %xmm1, %xmm2
-    shufps    $0x55, %xmm2, %xmm2
-    addss     %xmm2, %xmm5
-    movaps    %xmm1, %xmm2
-    shufps    $0xaa, %xmm2, %xmm2
-    addss     %xmm2, %xmm5
-    shufps    $0xff, %xmm1, %xmm1
-    addss     %xmm1, %xmm5
     movaps    %xmm0, %xmm2
     cmpordps  %xmm0, %xmm2
     andps     %xmm2, %xmm0
@@ -634,9 +526,6 @@ LFM_SYM(lfm_playback_render_u16_dd):
     movss     (%r10), %xmm0
     addq      $4, %r10
     movaps    %xmm0, %xmm1
-    mulss     %xmm1, %xmm1
-    addss     %xmm1, %xmm5
-    movaps    %xmm0, %xmm1
     cmpordss  %xmm0, %xmm1
     andps     %xmm1, %xmm0
     maxss     %xmm4, %xmm0
@@ -655,13 +544,6 @@ LFM_SYM(lfm_playback_render_u16_dd):
     decq      %rdx
     jnz       541b
 548:
-    movss     %xmm5, 16(%r9)
-    movq      8(%r9), %r8
-    cvtsi2ssq %r8, %xmm0
-    movaps    %xmm5, %xmm1
-    divss     %xmm0, %xmm1
-    sqrtss    %xmm1, %xmm1
-    movss     %xmm1, 20(%r9)
     ret
 
 #if !defined(__APPLE__) && !defined(_WIN32)

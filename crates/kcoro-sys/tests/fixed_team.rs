@@ -33,6 +33,8 @@ const MEMBER_COUNT: u32 = 4;
 const MEMBER_MASK: u32 = (1 << MEMBER_COUNT) - 1;
 const GENERATIONS: u64 = 3;
 const CHAIN_DONE: u32 = GENERATIONS as u32 + 1;
+const NEVER_ENTERED: u32 = 1;
+const HEALTHY_GENERATIONS: u64 = 1_000_000;
 
 #[repr(C)]
 struct RuntimeConfig {
@@ -134,6 +136,23 @@ struct Quorum {
     retire: Barrier,
     calls: [AtomicU32; MEMBER_COUNT as usize],
     callbacks: AtomicU32,
+    bad: AtomicU32,
+}
+
+struct Injected {
+    team: AtomicPtr<c_void>,
+    calls: AtomicU32,
+    callbacks: AtomicU32,
+    status: AtomicI32,
+    entered: AtomicU64,
+    returned: AtomicU64,
+}
+
+struct Healthy {
+    team: AtomicPtr<c_void>,
+    samples: Box<[AtomicU64]>,
+    started: AtomicU64,
+    callbacks: AtomicU64,
     bad: AtomicU32,
 }
 
@@ -412,7 +431,80 @@ unsafe extern "C" fn quorum_edge(context: *mut c_void, generation: u64) {
     unsafe { kc_team_request_stop(quorum.team.load(Ordering::Acquire)) };
 }
 
+unsafe extern "C" fn injected_member(
+    context: *mut c_void,
+    _index: u32,
+    _members: u32,
+    _generation: u64,
+) {
+    let injected = unsafe { &*(context.cast::<Injected>()) };
+    injected.calls.fetch_add(1, Ordering::Relaxed);
+}
+
+unsafe extern "C" fn injected_completion(context: *mut c_void, _generation: u64) {
+    let injected = unsafe { &*(context.cast::<Injected>()) };
+    injected.callbacks.fetch_add(1, Ordering::Release);
+}
+
+unsafe extern "C" fn injected_ready(context: *mut c_void, generation: u64) {
+    let injected = unsafe { &*(context.cast::<Injected>()) };
+    let team = injected.team.load(Ordering::Acquire);
+    let mut snapshot = quorum_snapshot();
+    let status = unsafe { kc_team_quorum_snapshot_get(team, generation, &mut snapshot) };
+    injected.status.store(status, Ordering::Release);
+    if status == 0 {
+        injected
+            .entered
+            .store(snapshot.entered_mask, Ordering::Release);
+        injected
+            .returned
+            .store(snapshot.returned_mask, Ordering::Release);
+    }
+    unsafe { kc_team_request_stop(team) };
+}
+
+unsafe extern "C" fn healthy_member(
+    context: *mut c_void,
+    index: u32,
+    members: u32,
+    generation: u64,
+) {
+    let healthy = unsafe { &*(context.cast::<Healthy>()) };
+    if members != MEMBER_COUNT
+        || index >= members
+        || !(1..=HEALTHY_GENERATIONS).contains(&generation)
+    {
+        healthy.bad.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+unsafe extern "C" fn healthy_edge(context: *mut c_void, generation: u64) {
+    let healthy = unsafe { &*(context.cast::<Healthy>()) };
+    let now = unsafe { kc_port_monotonic_ns() };
+    let started = healthy.started.load(Ordering::Acquire);
+    if started == 0 || now < started || generation == 0 || generation > HEALTHY_GENERATIONS {
+        healthy.bad.fetch_add(1, Ordering::Relaxed);
+        unsafe { kc_team_request_stop(healthy.team.load(Ordering::Acquire)) };
+        return;
+    }
+    healthy.samples[generation as usize - 1].store(now - started, Ordering::Release);
+    healthy.callbacks.fetch_add(1, Ordering::Relaxed);
+    let team = healthy.team.load(Ordering::Acquire);
+    if generation == HEALTHY_GENERATIONS {
+        unsafe { kc_team_request_stop(team) };
+        return;
+    }
+    healthy
+        .started
+        .store(unsafe { kc_port_monotonic_ns() }, Ordering::Release);
+    if unsafe { kc_team_dispatch_notify(team, generation + 1, Some(healthy_edge), context) } != 0 {
+        healthy.bad.fetch_add(1, Ordering::Relaxed);
+        unsafe { kc_team_request_stop(team) };
+    }
+}
+
 unsafe extern "C" {
+    fn kc_port_monotonic_ns() -> u64;
     fn kc_runtime_create(config: *const RuntimeConfig, out: *mut *mut c_void) -> i32;
     fn kc_runtime_start(runtime: *mut c_void) -> i32;
     fn kc_runtime_request_stop(runtime: *mut c_void);
@@ -446,6 +538,14 @@ unsafe extern "C" {
         team: *mut c_void,
         generation: u64,
         out: *mut TeamQuorumSnapshot,
+    ) -> i32;
+    fn kc_team_inject_member_exit_for_test(
+        team: *mut c_void,
+        generation: u64,
+        member: u32,
+        point: u32,
+        ready: Option<unsafe extern "C" fn(*mut c_void, u64)>,
+        context: *mut c_void,
     ) -> i32;
 }
 
@@ -827,6 +927,148 @@ fn quorum_snapshot_tracks_one_exact_generation_without_duplicate_execution() {
     for calls in &quorum.calls {
         assert_eq!(calls.load(Ordering::Acquire), 1);
     }
+    assert_eq!(unsafe { kc_team_destroy(team) }, 0);
+}
+
+#[test]
+fn never_entered_injection_preserves_exact_partial_quorum_without_completion() {
+    kcoro_sys::link_anchor();
+    let injected = Injected {
+        team: AtomicPtr::new(std::ptr::null_mut()),
+        calls: AtomicU32::new(0),
+        callbacks: AtomicU32::new(0),
+        status: AtomicI32::new(i32::MIN),
+        entered: AtomicU64::new(0),
+        returned: AtomicU64::new(0),
+    };
+    let config = TeamConfig {
+        size: size_of::<TeamConfig>() as u32,
+        abi_version: 1,
+        member_count: MEMBER_COUNT,
+        reserved: 0,
+        member: Some(injected_member),
+        context: (&injected as *const Injected).cast_mut().cast(),
+    };
+    let mut team = std::ptr::null_mut();
+    assert_eq!(unsafe { kc_team_create(&config, &mut team) }, 0);
+    injected.team.store(team, Ordering::Release);
+    assert_eq!(
+        unsafe {
+            kc_team_inject_member_exit_for_test(
+                team,
+                1,
+                1,
+                NEVER_ENTERED,
+                Some(injected_ready),
+                (&injected as *const Injected).cast_mut().cast(),
+            )
+        },
+        0
+    );
+    assert_eq!(unsafe { kc_team_start(team) }, 0);
+    assert_eq!(
+        unsafe {
+            kc_team_dispatch_notify(
+                team,
+                1,
+                Some(injected_completion),
+                (&injected as *const Injected).cast_mut().cast(),
+            )
+        },
+        0
+    );
+    assert_eq!(unsafe { kc_team_join(team) }, 0);
+
+    assert_eq!(injected.status.load(Ordering::Acquire), 0);
+    assert_eq!(injected.entered.load(Ordering::Acquire), 0b1101);
+    assert_eq!(injected.returned.load(Ordering::Acquire), 0b1101);
+    assert_eq!(injected.calls.load(Ordering::Acquire), MEMBER_COUNT - 1);
+    assert_eq!(injected.callbacks.load(Ordering::Acquire), 0);
+    let mut snapshot = TeamSnapshot {
+        size: size_of::<TeamSnapshot>() as u32,
+        abi_version: 1,
+        member_count: 0,
+        started_members: 0,
+        dispatched_generation: 0,
+        completed_generation: 0,
+        completed_members: 0,
+        started: 0,
+        stop_requested: 0,
+        joined: 0,
+    };
+    assert_eq!(unsafe { kc_team_snapshot_get(team, &mut snapshot) }, 0);
+    assert_eq!(snapshot.dispatched_generation, 1);
+    assert_eq!(snapshot.completed_generation, 0);
+    assert_eq!(snapshot.completed_members, MEMBER_COUNT - 1);
+    assert_eq!(unsafe { kc_team_destroy(team) }, 0);
+}
+
+#[test]
+#[ignore = "one-million-generation target-hardware calibration"]
+fn one_million_healthy_generations_report_the_fixed_team_budget_floor() {
+    kcoro_sys::link_anchor();
+    let healthy = Healthy {
+        team: AtomicPtr::new(std::ptr::null_mut()),
+        samples: (0..HEALTHY_GENERATIONS)
+            .map(|_| AtomicU64::new(0))
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+        started: AtomicU64::new(0),
+        callbacks: AtomicU64::new(0),
+        bad: AtomicU32::new(0),
+    };
+    let config = TeamConfig {
+        size: size_of::<TeamConfig>() as u32,
+        abi_version: 1,
+        member_count: MEMBER_COUNT,
+        reserved: 0,
+        member: Some(healthy_member),
+        context: (&healthy as *const Healthy).cast_mut().cast(),
+    };
+    let mut team = std::ptr::null_mut();
+    assert_eq!(unsafe { kc_team_create(&config, &mut team) }, 0);
+    healthy.team.store(team, Ordering::Release);
+    assert_eq!(unsafe { kc_team_start(team) }, 0);
+    healthy
+        .started
+        .store(unsafe { kc_port_monotonic_ns() }, Ordering::Release);
+    assert_eq!(
+        unsafe {
+            kc_team_dispatch_notify(
+                team,
+                1,
+                Some(healthy_edge),
+                (&healthy as *const Healthy).cast_mut().cast(),
+            )
+        },
+        0
+    );
+    assert_eq!(unsafe { kc_team_join(team) }, 0);
+    assert_eq!(healthy.bad.load(Ordering::Acquire), 0);
+    assert_eq!(
+        healthy.callbacks.load(Ordering::Acquire),
+        HEALTHY_GENERATIONS
+    );
+
+    let mut samples = healthy
+        .samples
+        .iter()
+        .map(|sample| sample.load(Ordering::Acquire))
+        .collect::<Vec<_>>();
+    assert!(samples.iter().all(|sample| *sample != 0));
+    samples.sort_unstable();
+    let p99 = samples[(samples.len() * 99).div_ceil(100) - 1];
+    let max = *samples.last().expect("healthy generation samples");
+    let soft = 10_000_000_u64
+        .max(p99.saturating_mul(8))
+        .max(max.saturating_mul(4));
+    let hard = 1_000_000_000_u64.max(soft.saturating_mul(4));
+    eprintln!(
+        "fixed_team_budget_floor generations={} members={} p99_ns={} max_ns={} soft_ns={} hard_ns={}",
+        HEALTHY_GENERATIONS, MEMBER_COUNT, p99, max, soft, hard
+    );
+    assert!(soft >= 10_000_000);
+    assert!(hard >= 1_000_000_000);
     assert_eq!(unsafe { kc_team_destroy(team) }, 0);
 }
 

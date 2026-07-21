@@ -9,7 +9,7 @@
 _Static_assert(sizeof(LfmTicketIdV1) == 24, "LfmTicketIdV1 ABI");
 _Static_assert(sizeof(LfmRuntimeConfigV1) == 72, "LfmRuntimeConfigV1 ABI");
 _Static_assert(sizeof(LfmRuntimeSnapshotV1) == 64, "LfmRuntimeSnapshotV1 ABI");
-_Static_assert(sizeof(LfmModelMemoryV1) == 96, "LfmModelMemoryV1 ABI");
+_Static_assert(sizeof(LfmModelMemoryV1) == 168, "LfmModelMemoryV1 ABI");
 _Static_assert(sizeof(LfmSamplingPolicyV1) == 32, "LfmSamplingPolicyV1 ABI");
 _Static_assert(sizeof(LfmConversationOptionsV1) == 120,
                "LfmConversationOptionsV1 ABI");

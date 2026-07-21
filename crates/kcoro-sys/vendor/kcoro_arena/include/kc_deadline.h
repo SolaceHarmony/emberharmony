@@ -115,8 +115,8 @@ typedef struct kc_deadline_source_snapshot {
 
 /* Creates a fixed native source pool during readiness. On Apple platforms each
  * slot owns one GCD one-shot timer on a private serial queue and uses monotonic
- * dispatch_time. Non-Apple construction is valid for portable ownership code,
- * but production arm returns -ENOTSUP. */
+ * dispatch_time. Non-Apple production construction returns -ENOTSUP so an
+ * engine rejects the unsupported backend before admitting numerical work. */
 int kc_deadline_source_create(const kc_deadline_source_config *config,
                               kc_deadline_source_t **out);
 

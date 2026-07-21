@@ -187,6 +187,12 @@ fn local_engine_mode(settings: &VoiceSettings) -> Result<Option<VoiceEngineMode>
 }
 
 fn local_model_ready(settings: &VoiceSettings) -> Result<bool, String> {
+    if !cfg!(target_os = "macos") {
+        return Err(
+            "Native voice is unavailable on this platform until a production monotonic deadline backend is installed."
+                .into(),
+        );
+    }
     match settings.lfm2.engine {
         settings::LocalVoiceEngine::Lfm2Interleaved => {
             let Some(dir) = settings::lfm2_active_model_dir(&settings.lfm2) else {
@@ -503,12 +509,17 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("config.json"), "{}").unwrap();
         let path = dir.to_string_lossy().into_owned();
-        // This test exercises the LFM2-Audio readiness path; the DEFAULT local
-        // engine is Moshi realtime (which inspects a different snapshot), so pin
-        // the engine the test is named for.
+        // This test exercises the LFM2-Audio snapshot resolver explicitly.
         let mut s = settings(VoiceProvider::Lfm2, Some(&path));
         s.lfm2.engine = crate::settings::LocalVoiceEngine::Lfm2Interleaved;
-        assert!(plan(&s).ready);
+        let result = plan(&s);
+        #[cfg(target_os = "macos")]
+        assert!(result.ready);
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert!(!result.ready);
+            assert!(result.detail.contains("monotonic deadline backend"));
+        }
         std::fs::remove_dir_all(dir).unwrap();
     }
 

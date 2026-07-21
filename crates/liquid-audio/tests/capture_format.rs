@@ -4,19 +4,7 @@ use liquid_audio as _;
 use std::ffi::c_int;
 
 type Leaf<T> = unsafe extern "C" fn(*const T, *mut f32, usize, u32, usize) -> c_int;
-type Render<T> =
-    unsafe extern "C" fn(*const f32, *mut T, usize, u32, usize, *mut PlaybackMeter) -> c_int;
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-struct PlaybackMeter {
-    size: u32,
-    abi_version: u32,
-    rendered_frames: u64,
-    sum_squares: f32,
-    rms: f32,
-    reserved: [u64; 3],
-}
+type Fanout<T> = unsafe extern "C" fn(*const f32, *mut T, usize, u32, usize) -> c_int;
 
 unsafe extern "C" {
     fn lfm_capture_downmix_f32(
@@ -40,30 +28,26 @@ unsafe extern "C" {
         channels: u32,
         destination_capacity: usize,
     ) -> c_int;
-    fn lfm_playback_meter_reset(meter: *mut PlaybackMeter) -> c_int;
-    fn lfm_playback_render_f32(
+    fn lfm_playback_fanout_f32(
         source: *const f32,
         destination: *mut f32,
         frames: usize,
         channels: u32,
         destination_capacity: usize,
-        meter: *mut PlaybackMeter,
     ) -> c_int;
-    fn lfm_playback_render_i16(
+    fn lfm_playback_fanout_i16(
         source: *const f32,
         destination: *mut i16,
         frames: usize,
         channels: u32,
         destination_capacity: usize,
-        meter: *mut PlaybackMeter,
     ) -> c_int;
-    fn lfm_playback_render_u16(
+    fn lfm_playback_fanout_u16(
         source: *const f32,
         destination: *mut u16,
         frames: usize,
         channels: u32,
         destination_capacity: usize,
-        meter: *mut PlaybackMeter,
     ) -> c_int;
 }
 
@@ -106,43 +90,32 @@ fn check<T: Copy + PartialEq + std::fmt::Debug>(
     }
 }
 
-fn meter(source: &[f32]) -> (f32, f32) {
-    let mut sum = 0.0f32;
-    for sample in source {
-        sum += sample * sample;
-    }
-    (sum, (sum / source.len() as f32).sqrt())
-}
-
-fn render_float(source: &[f32], channels: u32) {
+fn fanout_float(source: &[f32], channels: u32) {
     const GUARD: u32 = 0x55aa_1234;
     let samples = source.len() * channels as usize;
     let mut output = vec![f32::from_bits(GUARD); samples + 4];
-    let mut state = PlaybackMeter::default();
-    assert_eq!(unsafe { lfm_playback_meter_reset(&mut state) }, 0);
+    let saved = source.to_vec();
     let first = 5;
     assert_eq!(
         unsafe {
-            lfm_playback_render_f32(
+            lfm_playback_fanout_f32(
                 source.as_ptr(),
                 output.as_mut_ptr().add(2),
                 first,
                 channels,
                 samples,
-                &mut state,
             )
         },
         0
     );
     assert_eq!(
         unsafe {
-            lfm_playback_render_f32(
+            lfm_playback_fanout_f32(
                 source.as_ptr().add(first),
                 output.as_mut_ptr().add(2 + first * channels as usize),
                 source.len() - first,
                 channels,
                 samples - first * channels as usize,
-                &mut state,
             )
         },
         0
@@ -151,6 +124,13 @@ fn render_float(source: &[f32], channels: u32) {
     assert_eq!(output[1].to_bits(), GUARD);
     assert_eq!(output[samples + 2].to_bits(), GUARD);
     assert_eq!(output[samples + 3].to_bits(), GUARD);
+    assert!(
+        source
+            .iter()
+            .zip(&saved)
+            .all(|(actual, expected)| actual.to_bits() == expected.to_bits()),
+        "playback fan-out changed its borrowed source"
+    );
     for (frame, expected) in source.iter().enumerate() {
         for channel in 0..channels as usize {
             assert_eq!(
@@ -159,64 +139,43 @@ fn render_float(source: &[f32], channels: u32) {
             );
         }
     }
-    let expected = meter(source);
-    assert_eq!(state.size as usize, std::mem::size_of::<PlaybackMeter>());
-    assert_eq!(state.abi_version, 1);
-    assert_eq!(state.rendered_frames, source.len() as u64);
-    assert_eq!(state.sum_squares.to_bits(), expected.0.to_bits());
-    assert_eq!(state.rms.to_bits(), expected.1.to_bits());
-
-    let before = state;
     assert_eq!(
-        unsafe {
-            lfm_playback_render_f32(
-                std::ptr::null(),
-                std::ptr::null_mut(),
-                0,
-                channels,
-                0,
-                &mut state,
-            )
-        },
+        unsafe { lfm_playback_fanout_f32(std::ptr::null(), std::ptr::null_mut(), 0, channels, 0,) },
         0
     );
-    assert_eq!(state, before, "zero-frame render changed prior meter");
 }
 
-fn render_integer<T: Copy + Eq + std::fmt::Debug>(
+fn fanout_integer<T: Copy + Eq + std::fmt::Debug>(
     source: &[f32],
     channels: u32,
     guard: T,
-    render: Render<T>,
+    fanout: Fanout<T>,
     convert: impl Fn(f32) -> T,
-) -> PlaybackMeter {
+) {
     let samples = source.len() * channels as usize;
     let mut output = vec![guard; samples + 4];
-    let mut state = PlaybackMeter::default();
-    assert_eq!(unsafe { lfm_playback_meter_reset(&mut state) }, 0);
+    let saved = source.to_vec();
     let first = 5;
     assert_eq!(
         unsafe {
-            render(
+            fanout(
                 source.as_ptr(),
                 output.as_mut_ptr().add(2),
                 first,
                 channels,
                 samples,
-                &mut state,
             )
         },
         0
     );
     assert_eq!(
         unsafe {
-            render(
+            fanout(
                 source.as_ptr().add(first),
                 output.as_mut_ptr().add(2 + first * channels as usize),
                 source.len() - first,
                 channels,
                 samples - first * channels as usize,
-                &mut state,
             )
         },
         0
@@ -225,6 +184,13 @@ fn render_integer<T: Copy + Eq + std::fmt::Debug>(
     assert_eq!(output[1], guard);
     assert_eq!(output[samples + 2], guard);
     assert_eq!(output[samples + 3], guard);
+    assert!(
+        source
+            .iter()
+            .zip(&saved)
+            .all(|(actual, expected)| actual.to_bits() == expected.to_bits()),
+        "playback fan-out changed its borrowed source"
+    );
     for (frame, sample) in source.iter().enumerate() {
         const CONTEXT: &str = "playback format/fan-out drift";
         let expected = convert(*sample);
@@ -236,7 +202,6 @@ fn render_integer<T: Copy + Eq + std::fmt::Debug>(
             );
         }
     }
-    state
 }
 
 fn to_i16(sample: f32) -> i16 {
@@ -325,33 +290,27 @@ fn capture_format_validation_never_dereferences_empty_views() {
 }
 
 #[test]
-fn playback_formats_fan_out_and_meter_across_lease_boundaries() {
+fn playback_formats_fan_out_exact_values_across_lease_boundaries() {
     let source = [
         -2.0f32, -1.0, -0.75, -0.0, 0.0, 0.125, 0.5, 0.999, 1.0, 2.0, -0.3, 0.7, -1.5, 1.5, -0.9,
         0.25, -0.125,
     ];
     for channels in [1u32, 2, 3, 4, 6] {
-        render_float(&source, channels);
-        let i16_meter = render_integer(
+        fanout_float(&source, channels);
+        fanout_integer(
             &source,
             channels,
             0x5aa5u16 as i16,
-            lfm_playback_render_i16,
+            lfm_playback_fanout_i16,
             to_i16,
         );
-        let u16_meter = render_integer(
+        fanout_integer(
             &source,
             channels,
             0x5aa5u16,
-            lfm_playback_render_u16,
+            lfm_playback_fanout_u16,
             to_u16,
         );
-        let expected = meter(&source);
-        for state in [i16_meter, u16_meter] {
-            assert_eq!(state.rendered_frames, source.len() as u64);
-            assert_eq!(state.sum_squares.to_bits(), expected.0.to_bits());
-            assert_eq!(state.rms.to_bits(), expected.1.to_bits());
-        }
     }
 }
 
@@ -377,64 +336,58 @@ fn playback_integer_conversion_handles_nan_infinity_and_clamps() {
         -0.0,
     ];
     for channels in [1u32, 2, 3, 4, 6] {
-        let i16_meter = render_integer(
+        fanout_integer(
             &source,
             channels,
             0x5aa5u16 as i16,
-            lfm_playback_render_i16,
+            lfm_playback_fanout_i16,
             to_i16,
         );
-        let u16_meter = render_integer(
+        fanout_integer(
             &source,
             channels,
             0x5aa5u16,
-            lfm_playback_render_u16,
+            lfm_playback_fanout_u16,
             to_u16,
         );
-        assert!(i16_meter.sum_squares.is_nan());
-        assert!(i16_meter.rms.is_nan());
-        assert!(u16_meter.sum_squares.is_nan());
-        assert!(u16_meter.rms.is_nan());
     }
 }
 
 #[test]
-fn playback_format_validation_is_bounded_and_preserves_meter_on_failure() {
+fn playback_format_validation_is_bounded_and_never_dereferences_empty_views() {
     assert_eq!(
-        unsafe { lfm_playback_meter_reset(std::ptr::null_mut()) },
+        unsafe { lfm_playback_fanout_i16(std::ptr::null(), std::ptr::null_mut(), 0, 1, 0) },
+        0
+    );
+    assert_eq!(
+        unsafe { lfm_playback_fanout_u16(std::ptr::null(), std::ptr::null_mut(), 0, 1, 0) },
+        0
+    );
+    assert_eq!(
+        unsafe { lfm_playback_fanout_f32(std::ptr::null(), std::ptr::null_mut(), 1, 1, 1) },
         -libc::EINVAL
     );
-    let mut state = PlaybackMeter::default();
-    assert_eq!(unsafe { lfm_playback_meter_reset(&mut state) }, 0);
-    state.rendered_frames = 7;
-    state.sum_squares = 2.5;
-    state.rms = 0.75;
-    let before = state;
     assert_eq!(
-        unsafe {
-            lfm_playback_render_i16(std::ptr::null(), std::ptr::null_mut(), 0, 1, 0, &mut state)
-        },
-        0
-    );
-    assert_eq!(state, before);
-    assert_eq!(
-        unsafe {
-            lfm_playback_render_u16(std::ptr::null(), std::ptr::null_mut(), 0, 1, 0, &mut state)
-        },
-        0
-    );
-    assert_eq!(state, before);
-    assert_eq!(
-        unsafe {
-            lfm_playback_render_f32(std::ptr::null(), std::ptr::null_mut(), 1, 1, 1, &mut state)
-        },
+        unsafe { lfm_playback_fanout_f32(std::ptr::null(), std::ptr::null_mut(), 0, 0, 0) },
         -libc::EINVAL
     );
     let one = [0.0f32];
-    let mut output = [0.0f32; 1];
+    let mut output = [f32::from_bits(0x55aa_1234)];
     assert_eq!(
-        unsafe { lfm_playback_render_f32(one.as_ptr(), output.as_mut_ptr(), 1, 2, 1, &mut state,) },
+        unsafe { lfm_playback_fanout_f32(one.as_ptr(), output.as_mut_ptr(), 1, 2, 1) },
         -libc::ENOSPC
     );
-    assert_eq!(state, before);
+    assert_eq!(output[0].to_bits(), 0x55aa_1234);
+    assert_eq!(
+        unsafe {
+            lfm_playback_fanout_f32(
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                usize::MAX,
+                2,
+                usize::MAX,
+            )
+        },
+        -libc::EOVERFLOW
+    );
 }

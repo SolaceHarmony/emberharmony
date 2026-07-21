@@ -172,6 +172,91 @@ LFM_SYM(lfm_sesame_selected_magnitudes_window):
 19:
     ret
 
+// Load one logical sample into a fixed vector lane, advancing to the next
+// validated descriptor only when the current borrowed span is exhausted.
+.macro LFM_SESAME_SCATTER_LANE lane
+    cbnz    x7, .Lscatter_have\@
+    ldp     x6, x7, [x5], #16
+.Lscatter_have\@:
+    ld1     {v2.s}[\lane], [x6], #4
+    sub     x7, x7, #1
+.endm
+
+// void lfm_sesame_selected_magnitudes_scatter(
+//     const LfmSesameScatterWindowV1 *window, const float *real_table,
+//     const float *imag_table, float *smoothed_magnitudes,
+//     size_t selected_bins)
+//
+// Full groups remain one vector load. A group crossing one or more descriptor
+// boundaries is assembled directly in v2, one scalar lane at a time. No PCM
+// plane or stack spill is created, and the multiply/add/reduction sequence is
+// identical to the contiguous leaf.
+.p2align 2
+.globl LFM_SYM(lfm_sesame_selected_magnitudes_scatter)
+LFM_PRIVATE(LFM_SYM(lfm_sesame_selected_magnitudes_scatter))
+LFM_SYM(lfm_sesame_selected_magnitudes_scatter):
+    cbz     x4, .Lscatter_done
+    mov     x13, x0
+    mov     w8, #0xcccd
+    movk    w8, #0x3e4c, lsl #16 // 0.2f
+    fmov    s6, w8
+    mov     w8, #0xcccd
+    movk    w8, #0x3f4c, lsl #16 // 0.8f
+    fmov    s7, w8
+    mov     w8, #0x7f80
+    lsl     w8, w8, #16
+.Lscatter_bin:
+    ldr     x5, [x13]
+    ldp     x6, x7, [x5], #16
+    mov     x9, #64
+    eor     v0.16b, v0.16b, v0.16b
+    eor     v1.16b, v1.16b, v1.16b
+.Lscatter_group:
+    cmp     x7, #4
+    b.lo    .Lscatter_fragment
+    ldr     q2, [x6], #16
+    sub     x7, x7, #4
+    b       .Lscatter_accumulate
+.Lscatter_fragment:
+    eor     v2.16b, v2.16b, v2.16b
+    LFM_SESAME_SCATTER_LANE 0
+    LFM_SESAME_SCATTER_LANE 1
+    LFM_SESAME_SCATTER_LANE 2
+    LFM_SESAME_SCATTER_LANE 3
+.Lscatter_accumulate:
+    ldr     q3, [x1], #16
+    ldr     q4, [x2], #16
+    fmul    v3.4s, v2.4s, v3.4s
+    fmul    v4.4s, v2.4s, v4.4s
+    fadd    v0.4s, v0.4s, v3.4s
+    fadd    v1.4s, v1.4s, v4.4s
+    subs    x9, x9, #1
+    b.ne    .Lscatter_group
+
+    faddp   v0.4s, v0.4s, v0.4s
+    faddp   v0.4s, v0.4s, v0.4s
+    faddp   v1.4s, v1.4s, v1.4s
+    faddp   v1.4s, v1.4s, v1.4s
+    fmul    s0, s0, s0
+    fmul    s1, s1, s1
+    fadd    s0, s0, s1
+    fsqrt   s0, s0
+    fmov    w9, s0
+    and     w9, w9, #0x7f800000
+    cmp     w9, w8
+    b.ne    .Lscatter_finite
+    fmov    s0, wzr
+.Lscatter_finite:
+    ldr     s1, [x3]
+    fmul    s1, s1, s7
+    fmul    s0, s0, s6
+    fadd    s0, s1, s0
+    str     s0, [x3], #4
+    subs    x4, x4, #1
+    b.ne    .Lscatter_bin
+.Lscatter_done:
+    ret
+
 // void lfm_sesame_magnitudes_to_bytes(const float *magnitudes,
 //     const double thresholds[256], uint8_t *bytes, size_t count)
 // thresholds[q] is the exact f64 magnitude where floor-affine Web-Audio byte

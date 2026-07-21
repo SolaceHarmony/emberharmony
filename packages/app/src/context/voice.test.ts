@@ -720,17 +720,16 @@ describe("desktop voice context boundary", () => {
     )
   })
 
-  test("native model directory settings accept Hugging Face cache repo roots", async () => {
+  test("native LFM2 directory settings accept Hugging Face cache repo roots without a Moshi runtime resolver", async () => {
     const rust = await root("packages/desktop/src-tauri/src/settings.rs")
     const resolver = between(rust, "fn hf_snapshot_dir", "pub fn expand_user_path")
-    const lfm2 = between(rust, "pub fn lfm2_model_dir", "pub fn moshi_model_dir")
-    const moshi = between(rust, "pub fn moshi_model_dir", "/// The active LFM2-Audio directory")
+    const lfm2 = between(rust, "pub fn lfm2_model_dir", "/// The active LFM2-Audio directory")
 
     expect(resolver).toContain('dir.join("snapshots")')
     expect(resolver).toContain('dir.join("refs").join("main")')
     expect(resolver).toContain("snapshots.join(rev.trim())")
     expect(lfm2).toContain(".map(hf_snapshot_dir)")
-    expect(moshi).toContain(".map(hf_snapshot_dir)")
+    expect(rust).not.toContain("pub fn moshi_model_dir")
   })
 
 
