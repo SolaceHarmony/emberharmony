@@ -6,7 +6,7 @@ fn main() {
     }
 
     let srcs = [
-        "kc_continuation.c",
+        "kcoro_stackless.c",
         "kc_runtime.c",
         "kc_service.c",
         "kc_doorbell.c",

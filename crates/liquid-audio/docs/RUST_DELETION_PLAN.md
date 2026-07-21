@@ -33,7 +33,7 @@ oracle is never a production fallback.
 | Typed binding | **Landed.** Exact BF16/F32 dtype, rank, shape, layer, codebook, and vocabulary checks; possibly unaligned tensors remain byte views. | None for LFM2. |
 | Weight consumption | **Landed.** Frontend, Conformer, backbone, Depthformer, and Mimi bind the same image; BF16 unlift occurs in registers. | `compatibility_copied_bytes == 0` remains an acceptance assertion. Its counters were **stubs returning a literal 0** (review 2026-07-16) — the gate could not fail; now wired to real per-plan tallies. See "Accounting is a tally, not a constant" below. |
 | Native model chain | **Landed for numerical ownership.** One typed, model-correlated `REQ_AUDIO_ENCODE` pass owns resample → valid-only BF16 frontend → whole Conformer/adapter over borrowed spans and pre-reserved conversation buffers. Modality assembly, M≤4 checkpoint-BF16 prefill, backbone, sampling, Depthformer, Mimi, and tokenizer are also native-owned. | No remaining numerical-stage ownership gap for LFM2. The coordinator-to-continuation scheduling cut is tracked in the conversation/session row. |
-| Conversation/session | **Landed.** Native KV/ShortConv/codec state, PRNG, cursor, recurrence, text/PCM tickets, reliable events, epochs, interrupt, stop, and join. Rust does not drive progress. A fixed route pool and native expected-value broker release capacity between coarse nodes; exact-CQ callbacks only commit, retire the slot, and publish readiness. The bridge and broker are retained kcoro services, resumed through setup-time realtime notifier leases and one runtime-owned expected-value doorbell rather than private pthread loops or a mutex-taking notification. Text and audio routes notify a coordinator-owned `SessionAction`, which collects the exact handle without a numerical wait. | The current engine remains one fixed team. Real V2.2 `BlockDomain` extraction is separate scheduler work. |
+| Conversation/session | **Landed.** Native KV/ShortConv/codec state, PRNG, cursor, recurrence, text/PCM tickets, reliable events, epochs, interrupt, stop, and join. Rust does not drive progress. A fixed route pool releases capacity between coarse nodes. The numerical bridge is a saved stackless frame with an exact CONTROL ticket; the final-team callback only resumes that frame on the shared kcoro pool. Route and supervisor services use the same pool, not private pthreads or a one-worker side runtime. Text and audio routes notify a coordinator-owned `SessionAction`, which collects the exact handle without a numerical wait. | Per-route state is still represented by fixed route records behind the broker; migrating each multi-hop route into its own reusable saved frame is the remaining coroutine-purity cut. Real V2.2 `BlockDomain` extraction is separate scheduler work. |
 | Context rollover | **Landed.** Fixed capacity+runway BF16 state, monotonic cursor, absolute RoPE range generation, nonmutating whole-action admission, causal row-by-row eviction, and in-place compaction. | None for the activation-state sliding-window contract. |
 | Shared model | **Landed.** Per-conversation state/scratch and a fair model-owned expected-value pass gate; engine `-EBUSY` does not leak as scheduling policy. | Capacity-2 continuations may improve overlap; fairness is already correct. |
 | Production graph | **Landed.** Desktop creates `NativeVoiceModel` and opaque native conversations/sessions only; default dependencies do not enable Candle or Moshi. | Native Metal/MLX remains a separate future backend and must fail explicitly until mounted. |
@@ -131,10 +131,12 @@ fact no author can forget to update.
   events, capture/playback leases, interruption epochs, stop, join, and the native
   token → sample → Depthformer → Mimi recurrence loop. A stale pass may finish but
   cannot publish.
-- Operations own no waiters. Producers publish exact edges; suspended routes and
-  actions are durable records, while only an otherwise-idle runtime worker may
-  enter indefinite expected-value dormancy. The model gate, engine SQ/CQ, team
-  generations, event/command capacity, and PCM leases do not poll or spin.
+- Operations own no waiters. Producers publish exact edges; a suspended
+  orchestration is a fixed stackless frame holding its program counter, locals,
+  exact ticket, and retained record references. Any free eligible kcoro worker
+  may resume it. Only an otherwise-idle runtime worker may enter indefinite
+  expected-value dormancy. The model gate, engine SQ/CQ, team generations,
+  event/command capacity, and PCM leases do not poll or spin.
 
 ### Exact context contract
 
@@ -177,16 +179,15 @@ a second pass. No additional per-stage ticket split is required.
 The engine substrate is landed: two native request/scratch slots, a capacity-2
 SQ/CQ, exact-ticket completion routing, callback-driven follow-on admission, and
 full-pass serialization. Slot generation and state form one atomic lease; exact
-CQ retains that lease across the callback, and deterministic tests cover peer
-producer handoff, stale-owner ABA, stop during execution, and capacity
-accounting. The bounded route now uses a fixed 64-instance pool (the maximum
-runtime session count) and a
-native expected-value broker. An exact-CQ callback commits the declared state,
-releases its pass slot, marks only the next coarse node ready, and rings the
-broker; it does not submit, wait, allocate, or take either submission/descriptor
-mutex. Ordinary bridge descriptors are created by the broker and live for one
-program. FIFO sequence order plus bounded age promotion chooses ready work, so a
-route does not retain either capacity-2 compute slot across a node boundary.
+CQ retains that lease across the callback. The bridge itself is again a literal
+stackless continuation: the final lane publishes one generation and resumes its
+exact ticket, and a free kcoro worker continues from the saved program counter.
+The bounded route still uses a fixed 64-instance pool and fair broker. An
+exact-CQ callback commits the declared state, releases its pass slot, marks only
+the next coarse node ready, and rings the broker; it does not wait, allocate, or
+take a submission/descriptor mutex. FIFO sequence order plus bounded age
+promotion chooses ready work, so a route does not retain either capacity-2
+compute slot across a node boundary.
 
 The C++ session coordinator owns one pooled `SessionAction`. Text uses a
 terminal single-node token route; audio uses token → Depthformer → Mimi. Both

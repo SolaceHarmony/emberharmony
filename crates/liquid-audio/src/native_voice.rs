@@ -130,8 +130,14 @@ struct ModelMemory {
     load_tasks: u32,
     payload_read_coverage: u32,
     accounting_flags: u32,
-    reserved: [u64; 4],
+    post_readiness_allocation_attempts: u64,
+    post_readiness_allocation_bytes: u64,
+    reserved: [u64; 2],
 }
+
+const _: [(); 168] = [(); std::mem::size_of::<ModelMemory>()];
+const _: [(); 136] = [(); std::mem::offset_of!(ModelMemory, post_readiness_allocation_attempts)];
+const _: [(); 144] = [(); std::mem::offset_of!(ModelMemory, post_readiness_allocation_bytes)];
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -503,6 +509,12 @@ pub struct NativeVoiceModelMemory {
     pub post_publication_read_bytes: u64,
     pub post_publication_materialization_attempts: u64,
     pub post_publication_materialization_bytes: u64,
+    /// Rejected requests to change a conversation's numerical allocation
+    /// geometry after its first complete capture/playback preparation.
+    pub post_readiness_allocation_attempts: u64,
+    /// Logical numerical capacity requested by those rejected calls. This is
+    /// deliberately independent of allocator metadata and object overhead.
+    pub post_readiness_allocation_bytes: u64,
     pub publication_generation: u64,
     /// Bitmask of model payload sources included in the read totals.
     pub payload_read_coverage: u32,
@@ -662,6 +674,8 @@ impl NativeVoiceModel {
             post_publication_materialization_attempts: memory
                 .post_publication_materialization_attempts,
             post_publication_materialization_bytes: memory.post_publication_materialization_bytes,
+            post_readiness_allocation_attempts: memory.post_readiness_allocation_attempts,
+            post_readiness_allocation_bytes: memory.post_readiness_allocation_bytes,
             publication_generation: memory.publication_generation,
             payload_read_coverage: memory.payload_read_coverage,
             payload_read_accounting_complete: memory.accounting_flags
@@ -2155,6 +2169,7 @@ pub struct NativeLfm2VoiceEngine {
     active: Option<NativeAction>,
     pending_start: Option<Flow>,
     playback: Arc<PlaybackState>,
+    playback_consumer: Option<NonNull<PlaybackConsumer>>,
     pending_playback: Option<PlaybackNotice>,
     playback_taken: bool,
     playback_rate: u32,
@@ -2172,6 +2187,13 @@ pub struct NativeLfm2VoiceEngine {
 }
 
 unsafe impl Send for NativeLfm2VoiceEngine {}
+
+fn admit_audio_endpoint_transfer(started: bool) -> Result<(), String> {
+    if started {
+        return Err("native audio endpoints must transfer before session readiness".into());
+    }
+    Ok(())
+}
 
 impl NativeLfm2VoiceEngine {
     fn new(
@@ -2267,6 +2289,24 @@ impl NativeLfm2VoiceEngine {
             rate: capture_rate,
             max_callback_frames: capture_max_callback_frames,
         };
+        let mut playback_consumer = std::ptr::null_mut();
+        if let Err(error) = status(
+            unsafe { lfm_playback_consumer_create(session.as_ptr(), &mut playback_consumer) },
+            "create native playback consumer",
+        ) {
+            unsafe { lfm_session_request_stop(session.as_ptr()) };
+            drop(capture);
+            drop(control);
+            retire_unstarted_session(session);
+            return Err(error);
+        }
+        let Some(playback_consumer) = NonNull::new(playback_consumer) else {
+            unsafe { lfm_session_request_stop(session.as_ptr()) };
+            drop(capture);
+            drop(control);
+            retire_unstarted_session(session);
+            return Err("native playback consumer returned a null handle".into());
+        };
         let playback = PlaybackState::new();
         #[cfg(test)]
         let playback_cursor_audit = Arc::new(PlaybackCursorAudit::default());
@@ -2284,6 +2324,7 @@ impl NativeLfm2VoiceEngine {
             active: None,
             pending_start: None,
             playback,
+            playback_consumer: Some(playback_consumer),
             pending_playback: None,
             playback_taken: false,
             playback_rate,
@@ -2804,6 +2845,7 @@ impl NativeLfm2VoiceEngine {
 
 impl VoiceEngine for NativeLfm2VoiceEngine {
     fn take_capture_sink(&mut self) -> Result<Option<Box<dyn CaptureSink>>, String> {
+        admit_audio_endpoint_transfer(self.started)?;
         if self.capture_taken {
             return Err("native capture sink was already transferred".into());
         }
@@ -2818,16 +2860,14 @@ impl VoiceEngine for NativeLfm2VoiceEngine {
         &mut self,
         notify: RealtimeNotifier,
     ) -> Result<Option<Box<dyn PlaybackSource>>, String> {
+        admit_audio_endpoint_transfer(self.started)?;
         if self.playback_taken {
             return Err("native playback consumer was already transferred".into());
         }
-        let mut consumer = std::ptr::null_mut();
-        status(
-            unsafe { lfm_playback_consumer_create(self.session.as_ptr(), &mut consumer) },
-            "create native playback consumer",
-        )?;
-        let consumer =
-            NonNull::new(consumer).ok_or("native playback consumer returned a null handle")?;
+        let consumer = self
+            .playback_consumer
+            .take()
+            .ok_or("prepared native playback consumer is unavailable")?;
         self.playback_taken = true;
         Ok(Some(Box::new(NativePlaybackSource {
             consumer,
@@ -2889,6 +2929,15 @@ impl VoiceEngine for NativeLfm2VoiceEngine {
         self.request_stop();
         self.control.take();
         self.capture.take();
+        if let Some(consumer) = self.playback_consumer.take() {
+            let status = unsafe { lfm_playback_consumer_destroy(consumer.as_ptr()) };
+            if status != 0 {
+                self.healthy = false;
+                return Err(format!(
+                    "retire prepared native playback consumer failed with status {status}"
+                ));
+            }
+        }
         let join = unsafe { lfm_session_join(self.session.as_ptr()) };
         if join == 0 {
             self.joined = true;
@@ -2969,7 +3018,11 @@ mod real_checkpoint_gate {
     use std::sync::atomic::AtomicBool;
     use std::time::Duration;
 
-    const OUTPUT_RATE: u32 = 24_000;
+    /* Exercise the desktop-rate playback converter in the real gate. The
+     * audio-only peer exchange below independently exercises 24 -> 16 kHz
+     * because question.wav is the 16 kHz device clock. A 24 kHz-only gate
+     * would bypass the exact seam that previously produced slow/fast audio. */
+    const OUTPUT_RATE: u32 = 48_000;
     const DEVICE_FRAMES: usize = 512;
     const CAPTURE_CHUNK_MS: usize = 20;
     const CAPTURE_TAIL_MS: usize = 1_000;
@@ -5581,6 +5634,11 @@ mod real_checkpoint_gate {
             exit.turns.iter(),
             snapshot.playback_published,
         )?;
+        if exit.turns.iter().any(|turn| turn.rate != OUTPUT_RATE) {
+            return Err(format!(
+                "native truth-gate playback lease did not retain the configured {OUTPUT_RATE} Hz device clock"
+            ));
+        }
         let stopped = exit
             .engine
             .stopped_flow
@@ -5808,6 +5866,8 @@ mod real_checkpoint_gate {
                 "post_publication_read_bytes": model.post_publication_read_bytes,
                 "post_publication_materialization_attempts": model.post_publication_materialization_attempts,
                 "post_publication_materialization_bytes": model.post_publication_materialization_bytes,
+                "post_readiness_allocation_attempts": model.post_readiness_allocation_attempts,
+                "post_readiness_allocation_bytes": model.post_readiness_allocation_bytes,
                 "publication_generation": model.publication_generation,
                 "payload_read_coverage": model.payload_read_coverage,
                 "payload_read_accounting_complete": model.payload_read_accounting_complete,
@@ -6031,6 +6091,8 @@ mod real_checkpoint_gate {
         assert_eq!(before.post_publication_read_bytes, 0);
         assert_eq!(before.post_publication_materialization_attempts, 0);
         assert_eq!(before.post_publication_materialization_bytes, 0);
+        assert_eq!(before.post_readiness_allocation_attempts, 0);
+        assert_eq!(before.post_readiness_allocation_bytes, 0);
 
         let first = run(&model, &fixture, tokens).expect("first native truth-gate run");
         let middle = model
@@ -6127,6 +6189,14 @@ fn native_error(status: i32, error: &[i8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audio_endpoint_transfer_is_setup_only() {
+        assert!(admit_audio_endpoint_transfer(false).is_ok());
+        assert!(admit_audio_endpoint_transfer(true)
+            .unwrap_err()
+            .contains("before session readiness"));
+    }
 
     fn collect(stream: &mut Utf8Stream, chunks: &[&[u8]], finish: bool) -> String {
         let mut pieces = Vec::new();

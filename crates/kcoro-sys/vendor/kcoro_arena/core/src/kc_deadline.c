@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #include "kc_deadline.h"
 
+#include "kc_atomic.h"
+#include "kc_port.h"
+
 #include <errno.h>
 #include <limits.h>
 #include <stdatomic.h>
@@ -70,6 +73,14 @@ struct kc_deadline_source {
     atomic_uint cancellation_walk_done;
     atomic_uint cancellation_acks;
     atomic_uint active_handlers;
+    atomic_uint joining;
+    atomic_uint joined;
+    uint32_t join_word;
+    kc_port_wait_word *join_wait;
+    kc_deadline_notify_fn terminal_leave_hook;
+    void *terminal_leave_context;
+    kc_deadline_guard_hook_manual_test_fn join_close_hook;
+    void *join_close_context;
     atomic_uint_fast64_t published_events;
     atomic_uint_fast64_t stale_events;
     atomic_uint_fast64_t notifications;
@@ -102,6 +113,32 @@ static int ticket_valid(const kc_ticket_id *ticket)
 }
 
 static void cancel_ack(kc_deadline_slot *slot);
+
+/* Pin signal admission before publishing active_handlers == 0. A concurrent
+ * destroy may observe joined and close the wait registration, but release then
+ * drains this pre-acquired guard before freeing the inline word or source. The
+ * terminal word publication and wake therefore remain one protected operation
+ * without reversing their order and creating a lost wake. */
+static void handler_leave(kc_deadline_source_t *source)
+{
+    kc_port_wait_signal signal = {0};
+    if (kc_port_wait_u32_signal_acquire(source->join_wait, &signal) != 0)
+        abort();
+    int manual = source->manual;
+    kc_deadline_notify_fn hook = source->terminal_leave_hook;
+    void *context = source->terminal_leave_context;
+    unsigned prior = atomic_fetch_sub_explicit(&source->active_handlers, 1,
+                                                memory_order_acq_rel);
+    if (prior == 1) {
+        if (manual && hook &&
+            atomic_load_explicit(&source->phase, memory_order_acquire) !=
+                KC_DEADLINE_SOURCE_OPEN)
+            hook(context);
+        kc_atomic_u32_fetch_add_release(&source->join_word, 1);
+        kc_port_wait_u32_signal_all(&signal);
+    }
+    kc_port_wait_u32_signal_release(&signal);
+}
 
 /* STOPPED is the logical terminal edge: all native cancel acknowledgements
  * have arrived and the one cancellation-submission owner has finished issuing
@@ -233,15 +270,13 @@ static int deliver_hint(kc_deadline_slot *slot)
     uint64_t control = atomic_load_explicit(&slot->control,
                                             memory_order_acquire);
     if (control_state(control) != KC_DEADLINE_SLOT_ARMED) {
-        atomic_fetch_sub_explicit(&source->active_handlers, 1,
-                                  memory_order_acq_rel);
+        handler_leave(source);
         return -ESTALE;
     }
     uint64_t due = atomic_load_explicit(&slot->due_ns,
                                         memory_order_acquire);
     if (source_now(source) < due) {
-        atomic_fetch_sub_explicit(&source->active_handlers, 1,
-                                  memory_order_acq_rel);
+        handler_leave(source);
         return -EAGAIN;
     }
 
@@ -250,8 +285,7 @@ static int deliver_hint(kc_deadline_slot *slot)
     if (!atomic_compare_exchange_strong_explicit(
             &slot->control, &control, firing,
             memory_order_acq_rel, memory_order_acquire)) {
-        atomic_fetch_sub_explicit(&source->active_handlers, 1,
-                                  memory_order_acq_rel);
+        handler_leave(source);
         return -ESTALE;
     }
     publish_event_record(slot, KC_DEADLINE_EVENT_EXPIRED, current);
@@ -267,8 +301,7 @@ static int deliver_hint(kc_deadline_slot *slot)
     atomic_fetch_add_explicit(&source->notifications, 1,
                               memory_order_relaxed);
     notify(context);
-    atomic_fetch_sub_explicit(&source->active_handlers, 1,
-                              memory_order_acq_rel);
+    handler_leave(source);
     return 0;
 }
 
@@ -303,8 +336,7 @@ static void cancel_ack(kc_deadline_slot *slot)
         atomic_fetch_add_explicit(&source->notifications, 1,
                                   memory_order_relaxed);
     if (publish) notify(context);
-    atomic_fetch_sub_explicit(&source->active_handlers, 1,
-                              memory_order_acq_rel);
+    handler_leave(source);
 }
 
 #if defined(__APPLE__)
@@ -383,8 +415,7 @@ static void start_cancellation(kc_deadline_source_t *source)
         atomic_fetch_add_explicit(&source->notifications, 1,
                                   memory_order_relaxed);
     if (stopped) notify(context);
-    atomic_fetch_sub_explicit(&source->active_handlers, 1,
-                              memory_order_acq_rel);
+    handler_leave(source);
 }
 
 static int arm_enter(kc_deadline_source_t *source)
@@ -439,10 +470,25 @@ static int source_create(const kc_deadline_source_config *config, int manual,
     atomic_init(&source->cancellation_walk_done, 0);
     atomic_init(&source->cancellation_acks, 0);
     atomic_init(&source->active_handlers, 0);
+    atomic_init(&source->joining, 0);
+    atomic_init(&source->joined, 0);
+    source->join_word = 0;
+    source->join_wait = NULL;
+    source->terminal_leave_hook = NULL;
+    source->terminal_leave_context = NULL;
+    source->join_close_hook = NULL;
+    source->join_close_context = NULL;
     atomic_init(&source->published_events, 0);
     atomic_init(&source->stale_events, 0);
     atomic_init(&source->notifications, 0);
     atomic_init(&source->manual_now_ns, 1);
+    int prepared = kc_port_wait_u32_prepare(&source->join_word,
+                                            &source->join_wait);
+    if (prepared != 0) {
+        free(source->slots);
+        free(source);
+        return prepared;
+    }
     for (uint32_t index = 0; index < source->capacity; ++index) {
         kc_deadline_slot *slot = &source->slots[index];
         slot->source = source;
@@ -456,7 +502,10 @@ static int source_create(const kc_deadline_source_config *config, int manual,
         !atomic_is_lock_free(&source->slots[0].due_ns) ||
         !atomic_is_lock_free(&source->slots[0].event.sequence) ||
         !atomic_is_lock_free(&source->cancellation_walk_done) ||
-        !atomic_is_lock_free(&source->active_handlers)) {
+        !atomic_is_lock_free(&source->active_handlers) ||
+        !atomic_is_lock_free(&source->joining) ||
+        !atomic_is_lock_free(&source->joined)) {
+        kc_port_wait_u32_release(source->join_wait);
         free(source->slots);
         free(source);
         return -ENOTSUP;
@@ -467,6 +516,7 @@ static int source_create(const kc_deadline_source_config *config, int manual,
         source->queue = dispatch_queue_create(
             "kcoro.deadline.monotonic", DISPATCH_QUEUE_SERIAL);
         if (!source->queue) {
+            kc_port_wait_u32_release(source->join_wait);
             free(source->slots);
             free(source);
             return -ENOMEM;
@@ -479,6 +529,7 @@ static int source_create(const kc_deadline_source_config *config, int manual,
                 for (uint32_t prior = 0; prior < index; ++prior)
                     dispatch_release_object(source->slots[prior].timer);
                 dispatch_release_object(source->queue);
+                kc_port_wait_u32_release(source->join_wait);
                 free(source->slots);
                 free(source);
                 return -ENOMEM;
@@ -816,6 +867,39 @@ int kc_deadline_source_fire_manual_test(kc_deadline_source_t *source,
     return deliver_hint(&source->slots[slot]);
 }
 
+int kc_deadline_source_set_terminal_leave_hook_manual_test(
+    kc_deadline_source_t *source, kc_deadline_notify_fn hook, void *context)
+{
+    if (!source || !source->manual || !hook) return -EINVAL;
+    if (atomic_load_explicit(&source->phase, memory_order_acquire) !=
+            KC_DEADLINE_SOURCE_OPEN ||
+        atomic_load_explicit(&source->cancellation_started,
+                             memory_order_acquire) ||
+        atomic_load_explicit(&source->active_handlers,
+                             memory_order_acquire) != 0)
+        return -EBUSY;
+    source->terminal_leave_hook = hook;
+    source->terminal_leave_context = context;
+    return 0;
+}
+
+int kc_deadline_source_set_join_close_hook_manual_test(
+    kc_deadline_source_t *source,
+    kc_deadline_guard_hook_manual_test_fn hook, void *context)
+{
+    if (!source || !source->manual || !hook) return -EINVAL;
+    if (atomic_load_explicit(&source->phase, memory_order_acquire) !=
+            KC_DEADLINE_SOURCE_OPEN ||
+        atomic_load_explicit(&source->cancellation_started,
+                             memory_order_acquire) ||
+        atomic_load_explicit(&source->active_handlers,
+                             memory_order_acquire) != 0)
+        return -EBUSY;
+    source->join_close_hook = hook;
+    source->join_close_context = context;
+    return 0;
+}
+
 void kc_deadline_source_request_stop(kc_deadline_source_t *source)
 {
     if (!source) return;
@@ -827,6 +911,60 @@ void kc_deadline_source_request_stop(kc_deadline_source_t *source)
     if (atomic_load_explicit(&source->publishers,
                              memory_order_seq_cst) == 0)
         start_cancellation(source);
+}
+
+static int source_join_ready(const kc_deadline_source_t *source)
+{
+    return atomic_load_explicit(&source->phase, memory_order_acquire) ==
+               KC_DEADLINE_SOURCE_STOPPED &&
+           atomic_load_explicit(&source->cancellation_walk_done,
+                                memory_order_acquire) &&
+           atomic_load_explicit(&source->cancellation_acks,
+                                memory_order_acquire) == source->capacity &&
+           atomic_load_explicit(&source->publishers,
+                                memory_order_acquire) == 0 &&
+           atomic_load_explicit(&source->active_handlers,
+                                memory_order_acquire) == 0;
+}
+
+int kc_deadline_source_join(kc_deadline_source_t *source)
+{
+    if (!source) return -EINVAL;
+    if (atomic_load_explicit(&source->joined, memory_order_acquire)) return 0;
+    if (atomic_load_explicit(&source->phase, memory_order_acquire) ==
+        KC_DEADLINE_SOURCE_OPEN) return -EBUSY;
+    unsigned expected_joiner = 0;
+    if (!atomic_compare_exchange_strong_explicit(
+            &source->joining, &expected_joiner, 1,
+            memory_order_acq_rel, memory_order_acquire))
+        return atomic_load_explicit(&source->joined, memory_order_acquire)
+                   ? 0 : -EBUSY;
+
+    for (;;) {
+        uint32_t expected = kc_atomic_u32_load_acquire(&source->join_word);
+        if (source_join_ready(source)) break;
+        int waited = kc_port_wait_u32(source->join_wait, expected);
+        if (waited == 0) continue;
+        atomic_store_explicit(&source->joining, 0, memory_order_release);
+        return waited;
+    }
+
+#if defined(__APPLE__)
+    if (!source->manual)
+        /* STOPPED is published inside the final cancel handler. The wait-word
+         * acknowledgement makes its final source access visible; this serial
+         * barrier additionally proves the dispatch callback has returned. */
+        dispatch_sync_f(source->queue, NULL, drain_deadline_queue);
+#endif
+    if (!source_join_ready(source)) {
+        atomic_store_explicit(&source->joining, 0, memory_order_release);
+        return -EBUSY;
+    }
+    /* Publish joined as this caller's final source access. Keeping the joiner
+     * claim closed makes a concurrent destroy that observes joined unable to
+     * free storage beneath a trailing bookkeeping store. */
+    atomic_store_explicit(&source->joined, 1, memory_order_release);
+    return 0;
 }
 
 int kc_deadline_source_snapshot_get(const kc_deadline_source_t *source,
@@ -869,7 +1007,8 @@ int kc_deadline_source_snapshot_get(const kc_deadline_source_t *source,
 int kc_deadline_source_destroy(kc_deadline_source_t *source)
 {
     if (!source) return 0;
-    if (atomic_load_explicit(&source->phase, memory_order_acquire) !=
+    if (!atomic_load_explicit(&source->joined, memory_order_acquire) ||
+        atomic_load_explicit(&source->phase, memory_order_acquire) !=
             KC_DEADLINE_SOURCE_STOPPED ||
         atomic_load_explicit(&source->cancellation_acks,
                              memory_order_acquire) != source->capacity ||
@@ -884,15 +1023,6 @@ int kc_deadline_source_destroy(kc_deadline_source_t *source)
     }
 #if defined(__APPLE__)
     if (!source->manual) {
-        /* STOPPED is published from the final cancel handler before that
-         * handler returns. Administrative destruction drains the source's
-         * serial queue so no caller has to poll a handler counter and no final
-         * zero-transition wake can be lost. Destroy is forbidden from a
-         * deadline handler by the public callback contract. */
-        dispatch_sync_f(source->queue, NULL, drain_deadline_queue);
-        if (atomic_load_explicit(&source->active_handlers,
-                                 memory_order_acquire) != 0)
-            return -EBUSY;
         for (uint32_t index = 0; index < source->capacity; ++index)
             dispatch_release_object(source->slots[index].timer);
         dispatch_release_object(source->queue);
@@ -901,6 +1031,12 @@ int kc_deadline_source_destroy(kc_deadline_source_t *source)
     if (atomic_load_explicit(&source->active_handlers,
                              memory_order_acquire) != 0)
         return -EBUSY;
+    uint32_t admitted = 0;
+    if (kc_port_wait_u32_close(source->join_wait, &admitted) != 0)
+        abort();
+    if (source->manual && source->join_close_hook)
+        source->join_close_hook(source->join_close_context, admitted);
+    kc_port_wait_u32_release(source->join_wait);
     free(source->slots);
     free(source);
     return 0;

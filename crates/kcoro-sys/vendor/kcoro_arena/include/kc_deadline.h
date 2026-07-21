@@ -36,6 +36,8 @@ typedef enum kc_deadline_retire_result {
 } kc_deadline_retire_result;
 
 typedef void (*kc_deadline_notify_fn)(void *context);
+typedef void (*kc_deadline_guard_hook_manual_test_fn)(void *context,
+                                                       uint32_t admitted);
 
 /* notify is a retained edge sink, normally kc_service_notifier_notify behind a
  * signature adapter. It must only publish its owned predicate: it may not lock,
@@ -166,18 +168,37 @@ int kc_deadline_source_advance_manual_test(kc_deadline_source_t *source,
                                            uint64_t elapsed_ns);
 int kc_deadline_source_fire_manual_test(kc_deadline_source_t *source,
                                         uint32_t slot);
+/* Deterministic lifecycle test hook only. Installs one callback before stop;
+ * the final retained handler invokes it after publishing active_handlers == 0
+ * but while holding the wait-registration signal guard and before its wake. */
+int kc_deadline_source_set_terminal_leave_hook_manual_test(
+    kc_deadline_source_t *source, kc_deadline_notify_fn hook, void *context);
+/* Deterministic lifecycle test hook only. Invoked by manual-source destroy
+ * after closing signal admission and reports guards admitted before closure. */
+int kc_deadline_source_set_join_close_hook_manual_test(
+    kc_deadline_source_t *source,
+    kc_deadline_guard_hook_manual_test_fn hook, void *context);
 
 /* Stop closes arm admission and asynchronously cancels every native source.
  * STOPPED is one correlated logical edge published only after the cancellation
- * submission walk is complete and every GCD cancel handler acknowledges. A
- * handler may still be returning from that retained notification; Apple
- * destruction drains the private serial queue administratively before freeing
- * storage. Consumers therefore never poll active_handlers or wait for a
- * handler-stack zero transition. Producers must be disconnected and quiesced
- * before destroy. There is no source join or waiter API. */
+ * submission walk is complete and every GCD cancel handler acknowledges.
+ * Producers must be disconnected and quiesced before administrative teardown. */
 void kc_deadline_source_request_stop(kc_deadline_source_t *source);
+
+/* Terminal administrative teardown only. request_stop must precede join. Join
+ * parks one teardown caller on the source's private expected-value wait word
+ * until cancellation submission, native acknowledgements, admitted publishers,
+ * and retained callback stacks are all terminal. It never polls or runs a
+ * consumer inline. Repeated stop and completed join calls are idempotent; a
+ * concurrent second join returns -EBUSY.
+ *
+ * Join is forbidden from numerical, coordinator, service, deadline-notify, and
+ * audio callback paths. Those paths may only publish their owned terminal edge
+ * and return. The host must quiesce every potential producer before join. */
+int kc_deadline_source_join(kc_deadline_source_t *source);
 int kc_deadline_source_snapshot_get(const kc_deadline_source_t *source,
                                     kc_deadline_source_snapshot *out);
+/* Destroy requires a completed join and no retained reliable event. */
 int kc_deadline_source_destroy(kc_deadline_source_t *source);
 
 #ifdef __cplusplus

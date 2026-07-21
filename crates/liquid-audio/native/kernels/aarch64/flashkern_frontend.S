@@ -356,61 +356,103 @@ LFM_SYM(lfm_norm_apply_f32):
 8:
     ret
 
-// uint64_t lfm_resampler_stream_linear_f32(const StreamKernel *kernel)
-// Retained linear rate conversion over one borrowed codec frame. The kernel
-// descriptor is {input@0, destination@8, sample_count@16, orig@24,
-// phases@32, phase@40, previous@48, ready@52}. C++ owns validation and the
-// bounded phase/history update; this leaf owns every per-sample interpolation.
-// Separate fsub/fmul/fadd retains the former unfused f32 operation order.
+// uint64_t lfm_resampler_stream_polyphase_f32(const StreamKernel *kernel)
+// Causal streaming twin of lfm_resample_conv_spans_f32. It consumes the same
+// immutable f64 sinc/Hann phase table and accumulates each output in ascending
+// tap order with separate fmul/fadd. The centered table is shifted by its
+// right extent, giving a fixed width+orig-1 source-sample group delay while
+// requiring only past/current samples. The descriptor is
+// {history@0,input@8,destination@16,kernels@24,
+// history_length@32,history_head@40,input_count@48,sample_count@56,
+// block@64,phase@72,output_length@80,orig@88,phases@96,
+// kernel_length@104,next_history_head@112}.
 .p2align 2
-.globl LFM_SYM(lfm_resampler_stream_linear_f32)
-LFM_PRIVATE(LFM_SYM(lfm_resampler_stream_linear_f32))
-LFM_SYM(lfm_resampler_stream_linear_f32):
-    ldr     x1, [x0]             // input
-    ldr     x2, [x0, #8]         // destination
-    ldr     x3, [x0, #16]        // remaining input samples
-    ldr     x4, [x0, #24]        // reduced input rate
-    ldr     x5, [x0, #32]        // reduced output phases
-    ldr     x6, [x0, #40]        // retained phase
-    ldr     s4, [x0, #48]        // retained previous sample
-    ldr     w7, [x0, #52]        // previous sample is ready
-    ucvtf   s5, x5
-    mov     x8, #0               // written
+.globl LFM_SYM(lfm_resampler_stream_polyphase_f32)
+LFM_PRIVATE(LFM_SYM(lfm_resampler_stream_polyphase_f32))
+LFM_SYM(lfm_resampler_stream_polyphase_f32):
+    ldr     x1, [x0]             // retained history
+    ldr     x2, [x0, #8]         // current input
+    ldr     x3, [x0, #16]        // destination
+    ldr     x4, [x0, #24]        // phase kernels
+    ldr     x5, [x0, #32]        // retained history length
+    ldr     x6, [x0, #40]        // circular history write head
+    ldr     x7, [x0, #48]        // global current-input start
+    ldr     x8, [x0, #56]        // current input length
+    ldr     x9, [x0, #64]        // first output block's latest input
+    ldr     x10, [x0, #72]       // first output phase
+    ldr     x11, [x0, #80]       // remaining outputs
+    ldr     x12, [x0, #88]       // reduced input stride
+    ldr     x13, [x0, #96]       // reduced output phases
+    ldr     x14, [x0, #104]      // taps per phase
 1:
-    cbz     x3, 8f
-    ldr     s0, [x1], #4         // sample
-    cbnz    w7, 2f
-    fmov    s1, s0               // first call starts from this sample
-    b       3f
+    cbz     x11, 8f
+    mul     x15, x10, x14
+    add     x15, x4, x15, lsl #3 // phase kernel row
+    mov     x16, #0              // tap
+    fmov    d0, xzr              // f64 accumulator
 2:
-    fmov    s1, s4               // previous
+    cmp     x16, x14
+    b.hs    7f
+    add     x17, x9, x16
+    add     x17, x17, #1
+    cmp     x17, x14
+    b.lo    6f                   // conceptual pre-stream zero
+    sub     x17, x17, x14        // global causal source index
+    cmp     x17, x7
+    b.hs    4f
+    add     x17, x17, x5
+    cmp     x17, x7
+    b.lo    6f                   // older than retained history
+    sub     x17, x17, x7
+    add     x17, x17, x6         // logical -> circular physical index
+    cmp     x17, x5
+    b.lo    3f
+    sub     x17, x17, x5
 3:
-    mov     x12, x6              // phase before this input sample
-    add     x9, x6, x5
-    udiv    x10, x9, x4          // output count for this input
-    msub    x6, x10, x4, x9      // next retained phase
-    fsub    s2, s0, s1           // sample - previous
-    mov     x11, #1
+    ldr     s1, [x1, x17, lsl #2]
+    b       5f
 4:
-    cmp     x11, x10
-    b.hi    5f
-    mul     x13, x11, x4
-    sub     x13, x13, x12        // output*orig - old phase
-    ucvtf   s3, x13
-    fdiv    s3, s3, s5           // interpolation fraction
-    fmul    s3, s2, s3
-    fadd    s3, s1, s3
-    str     s3, [x2], #4
-    add     x8, x8, #1
-    add     x11, x11, #1
-    b       4b
+    sub     x17, x17, x7
+    cmp     x17, x8
+    b.hs    6f
+    ldr     s1, [x2, x17, lsl #2]
 5:
-    fmov    s4, s0
-    mov     w7, #1
-    sub     x3, x3, #1
+    fcvt    d1, s1
+    ldr     d2, [x15, x16, lsl #3]
+    fmul    d1, d1, d2
+    fadd    d0, d0, d1
+6:
+    add     x16, x16, #1
+    b       2b
+7:
+    fcvt    s0, d0
+    str     s0, [x3], #4
+    add     x10, x10, #1
+    cmp     x10, x13
+    b.lo    9f
+    mov     x10, #0
+    add     x9, x9, x12
+9:
+    sub     x11, x11, #1
     b       1b
 8:
-    mov     x0, x8
+    mov     x15, #0
+10:
+    cmp     x15, x8
+    b.hs    12f
+    ldr     s0, [x2, x15, lsl #2]
+    str     s0, [x1, x6, lsl #2]
+    add     x6, x6, #1
+    cmp     x6, x5
+    b.lo    11f
+    mov     x6, #0
+11:
+    add     x15, x15, #1
+    b       10b
+12:
+    ldr     x15, [x0, #112]
+    str     x6, [x15]
+    ldr     x0, [x0, #80]
     ret
 
 // void lfm_resample_conv_spans_f32(const LfmF32SpanChain *input,

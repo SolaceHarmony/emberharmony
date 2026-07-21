@@ -60,28 +60,42 @@ void lfm_resample_conv_spans_f32(const LfmF32SpanChain *input,
                                  uint64_t first_value, float *out,
                                  uint64_t value_count);
 struct LfmResamplerStreamKernel {
+    const float *history;
     const float *input;
     float *destination;
+    const double *kernels;
+    uint64_t history_length;
+    uint64_t history_head;
+    uint64_t input_count;
     uint64_t sample_count;
+    uint64_t block;
+    uint64_t phase;
+    uint64_t output_length;
     uint64_t orig;
     uint64_t phases;
-    uint64_t phase;
-    float previous;
-    uint32_t ready;
+    uint64_t kernel_length;
+    uint64_t *next_history_head;
 };
-uint64_t lfm_resampler_stream_linear_f32(
+uint64_t lfm_resampler_stream_polyphase_f32(
     const LfmResamplerStreamKernel *kernel);
 }
 
-static_assert(offsetof(LfmResamplerStreamKernel, input) == 0);
-static_assert(offsetof(LfmResamplerStreamKernel, destination) == 8);
-static_assert(offsetof(LfmResamplerStreamKernel, sample_count) == 16);
-static_assert(offsetof(LfmResamplerStreamKernel, orig) == 24);
-static_assert(offsetof(LfmResamplerStreamKernel, phases) == 32);
-static_assert(offsetof(LfmResamplerStreamKernel, phase) == 40);
-static_assert(offsetof(LfmResamplerStreamKernel, previous) == 48);
-static_assert(offsetof(LfmResamplerStreamKernel, ready) == 52);
-static_assert(sizeof(LfmResamplerStreamKernel) == 56);
+static_assert(offsetof(LfmResamplerStreamKernel, history) == 0);
+static_assert(offsetof(LfmResamplerStreamKernel, input) == 8);
+static_assert(offsetof(LfmResamplerStreamKernel, destination) == 16);
+static_assert(offsetof(LfmResamplerStreamKernel, kernels) == 24);
+static_assert(offsetof(LfmResamplerStreamKernel, history_length) == 32);
+static_assert(offsetof(LfmResamplerStreamKernel, history_head) == 40);
+static_assert(offsetof(LfmResamplerStreamKernel, input_count) == 48);
+static_assert(offsetof(LfmResamplerStreamKernel, sample_count) == 56);
+static_assert(offsetof(LfmResamplerStreamKernel, block) == 64);
+static_assert(offsetof(LfmResamplerStreamKernel, phase) == 72);
+static_assert(offsetof(LfmResamplerStreamKernel, output_length) == 80);
+static_assert(offsetof(LfmResamplerStreamKernel, orig) == 88);
+static_assert(offsetof(LfmResamplerStreamKernel, phases) == 96);
+static_assert(offsetof(LfmResamplerStreamKernel, kernel_length) == 104);
+static_assert(offsetof(LfmResamplerStreamKernel, next_history_head) == 112);
+static_assert(sizeof(LfmResamplerStreamKernel) == 120);
 
 namespace {
 
@@ -222,12 +236,18 @@ struct LfmResamplerWorkspace {
 };
 
 struct LfmResamplerStream {
-    uint64_t orig = 0;
-    uint64_t phases = 0;
+    LfmResampler *plan = nullptr;
+    float *history = nullptr;
+    uint64_t history_length = 0;
+    uint64_t history_head = 0;
     uint64_t capacity = 0;
-    uint64_t phase = 0;
-    float previous = 0.0f;
-    bool ready = false;
+    uint64_t input_count = 0;
+    uint64_t output_count = 0;
+
+    ~LfmResamplerStream() {
+        std::free(history);
+        delete plan;
+    }
 };
 
 namespace {
@@ -464,17 +484,19 @@ bool resampler_out_length(const LfmResampler &r, uint64_t length,
     return add_u64(base, extra, out);
 }
 
-bool resampler_stream_length(uint64_t orig, uint64_t phases, uint64_t phase,
+bool resampler_stream_length(const LfmResamplerStream &stream,
                              uint64_t length, uint64_t *out) {
-    if (orig == 0 || phases == 0 || phase >= orig || !out) {
+    if (!stream.plan || !out) {
         return false;
     }
-    uint64_t scaled = 0;
-    if (!mul_u64(length, phases, &scaled) ||
-        !add_u64(phase, scaled, &scaled)) {
+    uint64_t total = 0;
+    uint64_t end = 0;
+    if (!add_u64(stream.input_count, length, &total) ||
+        !resampler_out_length(*stream.plan, total, &end) ||
+        end < stream.output_count) {
         return false;
     }
-    *out = scaled / orig;
+    *out = end - stream.output_count;
     return true;
 }
 
@@ -937,19 +959,35 @@ extern "C" int lfm_resampler_stream_create(
         return -EINVAL;
     }
     *out = nullptr;
+    LfmResampler *plan = nullptr;
+    const int status = lfm_resampler_create(orig_freq, new_freq, &plan);
+    if (status != 0) return status;
     LfmResamplerStream *stream = new (std::nothrow) LfmResamplerStream();
-    if (!stream) return -ENOMEM;
-    uint64_t gcd = orig_freq;
-    uint64_t divisor = new_freq;
-    while (divisor != 0) {
-        const uint64_t next = gcd % divisor;
-        gcd = divisor;
-        divisor = next;
+    if (!stream) {
+        delete plan;
+        return -ENOMEM;
     }
-    stream->orig = orig_freq / gcd;
-    stream->phases = new_freq / gcd;
+    stream->plan = plan;
+    if (orig_freq != new_freq) {
+        uint64_t history = 0;
+        if (!add_u64(plan->kernel_len, plan->orig, &history) || history < 2) {
+            delete stream;
+            return -EOVERFLOW;
+        }
+        history -= 2;
+        if (history == 0 || history > SIZE_MAX / sizeof(float)) {
+            delete stream;
+            return -EOVERFLOW;
+        }
+        stream->history = static_cast<float *>(
+            std::calloc(static_cast<size_t>(history), sizeof(float)));
+        if (!stream->history) {
+            delete stream;
+            return -ENOMEM;
+        }
+        stream->history_length = history;
+    }
     stream->capacity = max_sample_count;
-    stream->phase = stream->orig - 1;
     *out = stream;
     return 0;
 }
@@ -962,9 +1000,14 @@ extern "C" int lfm_resampler_stream_destroy(LfmResamplerStream *stream) {
 
 extern "C" void lfm_resampler_stream_reset(LfmResamplerStream *stream) {
     if (!stream) return;
-    stream->phase = stream->orig - 1;
-    stream->previous = 0.0f;
-    stream->ready = false;
+    if (stream->history) {
+        std::memset(stream->history, 0,
+                    static_cast<size_t>(stream->history_length) *
+                        sizeof(float));
+    }
+    stream->input_count = 0;
+    stream->output_count = 0;
+    stream->history_head = 0;
 }
 
 extern "C" int lfm_resampler_stream_out_length(
@@ -972,8 +1015,7 @@ extern "C" int lfm_resampler_stream_out_length(
     uint64_t *out_length) {
     if (!stream || !out_length) return -EINVAL;
     if (sample_count > stream->capacity) return -ENOBUFS;
-    return resampler_stream_length(stream->orig, stream->phases, stream->phase,
-                                   sample_count, out_length)
+    return resampler_stream_length(*stream, sample_count, out_length)
                ? 0
                : -EOVERFLOW;
 }
@@ -990,36 +1032,86 @@ extern "C" int lfm_resampler_stream_process(
      * with an internal lock. */
     if (sample_count > stream->capacity) return -ENOBUFS;
     uint64_t target = 0;
-    if (!resampler_stream_length(stream->orig, stream->phases, stream->phase,
-                                 sample_count, &target)) {
+    if (!resampler_stream_length(*stream, sample_count, &target)) {
         return -EOVERFLOW;
     }
     if (target != 0 && (!destination || destination_capacity < target)) {
         return -ENOBUFS;
     }
-
-    const LfmResamplerStreamKernel kernel = {
-        .input = input,
-        .destination = destination,
-        .sample_count = sample_count,
-        .orig = stream->orig,
-        .phases = stream->phases,
-        .phase = stream->phase,
-        .previous = stream->previous,
-        .ready = stream->ready ? 1u : 0u,
-    };
-    const uint64_t written = lfm_resampler_stream_linear_f32(&kernel);
-    if (written != target) return -EFAULT;
-    uint64_t consumed = 0;
-    if (!mul_u64(sample_count, stream->phases, &consumed) ||
-        !add_u64(stream->phase, consumed, &consumed)) {
+    if (sample_count > UINTPTR_MAX / sizeof(float) ||
+        target > UINTPTR_MAX / sizeof(float)) {
         return -EOVERFLOW;
     }
-    stream->phase = consumed % stream->orig;
-    if (sample_count != 0) {
-        stream->previous = input[sample_count - 1];
-        stream->ready = true;
+
+    uint64_t input_end = 0;
+    if (!add_u64(stream->input_count, sample_count, &input_end)) {
+        return -EOVERFLOW;
     }
+    if (stream->plan->orig_freq == stream->plan->new_freq) {
+        if (sample_count != 0 && destination != input) {
+            std::memmove(destination, input,
+                         static_cast<size_t>(sample_count) * sizeof(float));
+        }
+        stream->input_count = input_end;
+        stream->output_count += target;
+        result->data = destination;
+        result->length = target;
+        return 0;
+    }
+
+    if (!stream->history || stream->history_length == 0 ||
+        !stream->plan->kernels || stream->plan->kernel_len == 0) {
+        return -EFAULT;
+    }
+    uint64_t bound = 0;
+    if (!add_u64(input_end, stream->history_length, &bound) ||
+        !add_u64(bound, stream->plan->kernel_len, &bound)) {
+        return -EOVERFLOW;
+    }
+    if (sample_count != 0) {
+        const LfmF32Span span = {
+            .data = input,
+            .length = sample_count,
+        };
+        LfmF32SpanChain chain{};
+        const int status = lfm_f32_span_chain_init(&span, 1, &chain);
+        if (status != 0) return status;
+        if (spans_overlap_output(chain, destination, target)) return -EINVAL;
+    }
+
+    const uint64_t block_index =
+        stream->output_count / stream->plan->phases;
+    const uint64_t phase =
+        stream->output_count % stream->plan->phases;
+    uint64_t block = 0;
+    if (!mul_u64(block_index, stream->plan->orig, &block)) {
+        return -EOVERFLOW;
+    }
+    uint64_t next_head = stream->history_head;
+
+    const LfmResamplerStreamKernel kernel = {
+        .history = stream->history,
+        .input = input,
+        .destination = destination,
+        .kernels = stream->plan->kernels,
+        .history_length = stream->history_length,
+        .history_head = stream->history_head,
+        .input_count = stream->input_count,
+        .sample_count = sample_count,
+        .block = block,
+        .phase = phase,
+        .output_length = target,
+        .orig = stream->plan->orig,
+        .phases = stream->plan->phases,
+        .kernel_length = stream->plan->kernel_len,
+        .next_history_head = &next_head,
+    };
+    const uint64_t written = lfm_resampler_stream_polyphase_f32(&kernel);
+    if (written != target) return -EFAULT;
+    if (next_head >= stream->history_length) return -EFAULT;
+    stream->history_head = next_head;
+    stream->input_count = input_end;
+    stream->output_count += target;
     result->data = destination;
     result->length = written;
     return 0;

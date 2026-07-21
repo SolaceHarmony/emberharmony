@@ -313,7 +313,7 @@ fn callback_side_service_and_runtime_joins_fail_instead_of_deadlocking() {
 }
 
 #[test]
-fn fixed_owner_acknowledges_each_realtime_edge() {
+fn serial_continuation_acknowledges_each_realtime_edge() {
     kcoro_sys::link_anchor();
     let config = RuntimeConfig {
         size: size_of::<RuntimeConfig>() as u32,
@@ -640,8 +640,6 @@ fn realtime_notifier_drains_every_accepted_edge_before_stop_retires() {
 
     assert_eq!(unsafe { kc_service_notifier_notify(notifier) }, 0);
     wait_for_calls(&seen, 1);
-    let before = runtime_snapshot(runtime).wake_requests;
-
     let start = Arc::new(Barrier::new(5));
     let raw = notifier as usize;
     let producers = (0..4)
@@ -661,12 +659,6 @@ fn realtime_notifier_drains_every_accepted_edge_before_stop_retires() {
         .into_iter()
         .map(|producer| producer.join().unwrap())
         .sum::<usize>();
-    let after = runtime_snapshot(runtime).wake_requests;
-    assert_eq!(
-        after - before,
-        1,
-        "the callback-side burst and stop share one fixed-owner ready bit"
-    );
     assert!(unsafe { kc_service_notifier_notify(notifier) } < 0);
 
     {
@@ -678,6 +670,11 @@ fn realtime_notifier_drains_every_accepted_edge_before_stop_retires() {
     let snapshot = service_snapshot(service);
     assert_eq!(snapshot.notifications, (accepted + 1) as u64);
     assert_eq!(snapshot.handled_notifications, snapshot.notifications);
+    assert_eq!(
+        snapshot.callbacks,
+        1 + u64::from(accepted != 0),
+        "accepted burst edges must coalesce into at most one migrated successor"
+    );
     assert_eq!(seen.gate.lock().unwrap().maximum, 1);
     assert_eq!(runtime_snapshot(runtime).queued, 0);
 
@@ -821,18 +818,17 @@ fn realtime_notify_callgraph_and_publication_order_are_source_gated() {
     assert!(!body.contains("runtime->head"));
     assert!(!body.contains("runtime->tail"));
     let observe = body.find("kc_doorbell_observe").unwrap();
-    let drain = body.find("ready_services").unwrap();
+    let drain = body.find("claim_ready(worker)").unwrap();
     let park = body.find("kc_doorbell_park").unwrap();
     assert!(observe < drain && drain < park);
 
-    let execute = service
-        .find("void kc_service_runtime_execute_internal")
+    let execute = runtime
+        .find("static void execute_continuation")
         .unwrap();
-    let body = &service[execute..];
-    let retire = body.find("kc_runtime_retire_service_internal").unwrap();
+    let body = &runtime[execute..worker];
     let done = body.find("KORO_DONE").unwrap();
     let signal = body.find("kc_runtime_signal_lifecycle_internal").unwrap();
-    assert!(retire < done && done < signal);
+    assert!(done < signal);
 }
 
 #[test]
@@ -879,7 +875,6 @@ fn legacy_scheduler_and_timed_progress_surfaces_are_absent() {
         "vendor/kcoro_arena/include/kc_wal.h",
         "vendor/kcoro_arena/include/kc_workflow.h",
         "vendor/kcoro_arena/include/kcoro_desc.h",
-        "vendor/kcoro_arena/include/kcoro_stackless.h",
         "vendor/kcoro_arena/include/koro_sched_stackless.h",
         "vendor/kcoro_arena/include/kc_ticket.h",
         "vendor/kcoro_arena/include/kc_descriptor.h",
@@ -896,6 +891,7 @@ fn legacy_scheduler_and_timed_progress_surfaces_are_absent() {
         "mutex/condvar Rust scheduler crate survived"
     );
     let umbrella = include_str!("../vendor/kcoro_arena/include/kcoro_arena.h");
+    assert!(umbrella.contains("kcoro_stackless.h"));
     assert!(!umbrella.contains("kc_doorbell.h"));
     assert!(!umbrella.contains("kc_port.h"));
     assert!(!umbrella.contains("kc_collective.h"));
@@ -904,7 +900,7 @@ fn legacy_scheduler_and_timed_progress_surfaces_are_absent() {
     let files = [
         include_str!("../vendor/kcoro_arena/core/src/kc_runtime.c"),
         include_str!("../vendor/kcoro_arena/core/src/kc_runtime_internal.h"),
-        include_str!("../vendor/kcoro_arena/core/src/kc_continuation.c"),
+        include_str!("../vendor/kcoro_arena/core/src/kcoro_stackless.c"),
         include_str!("../vendor/kcoro_arena/core/src/koro_internal.h"),
         include_str!("../vendor/kcoro_arena/include/kcoro_arena.h"),
         include_str!("../vendor/kcoro_arena/include/kc_doorbell.h"),
@@ -935,7 +931,6 @@ fn legacy_scheduler_and_timed_progress_surfaces_are_absent() {
             "KC_TICKET_DEADLINE_",
             "KORO_WAITING",
             "KORO_WAIT_UNTIL",
-            "KORO_YIELD",
             "kc_runtime_default",
             "kc_runtime_spawn",
             "kc_runtime_legacy_break",

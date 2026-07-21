@@ -45,6 +45,9 @@ void kc_runtime_request_stop(kc_runtime_t *runtime);
 int kc_runtime_join(kc_runtime_t *runtime);
 int kc_runtime_destroy(kc_runtime_t *runtime);
 int kc_runtime_snapshot_get(kc_runtime_t *runtime, kc_runtime_snapshot *out);
+/* Valid only from a continuation callback running on this runtime. */
+int kc_runtime_current_worker(const kc_runtime_t *runtime,
+                              uint32_t *out_worker);
 
 #ifdef __cplusplus
 }

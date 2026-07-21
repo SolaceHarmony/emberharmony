@@ -12,6 +12,9 @@ extern "C" {
 typedef struct kc_port_mutex kc_port_mutex;
 typedef struct kc_port_thread kc_port_thread;
 typedef struct kc_port_wait_word kc_port_wait_word;
+typedef struct kc_port_wait_signal {
+    kc_port_wait_word *word;
+} kc_port_wait_signal;
 typedef void *(*kc_port_thread_fn)(void *arg);
 
 int kc_port_mutex_create(kc_port_mutex **out);
@@ -35,13 +38,32 @@ int kc_port_wait_u32_prepare(uint32_t *address, kc_port_wait_word **out);
 int kc_port_wait_u32(kc_port_wait_word *word, uint32_t expected);
 void kc_port_wake_u32_one(kc_port_wait_word *word);
 void kc_port_wake_u32_all(kc_port_wait_word *word);
+/* Two-phase wake ownership for a publisher whose terminal predicate also
+ * permits the registration owner to destroy its backing address. Acquire must
+ * happen while that publisher's enclosing lifetime is still retained. Release
+ * closes new guard admission and drains every acquired guard before freeing the
+ * registration, so a guard may publish the terminal predicate and wake after
+ * the enclosing lifetime counter reaches zero. A guard is move-only by
+ * convention and must be released exactly once. None of these operations
+ * allocates or searches a registry. */
+int kc_port_wait_u32_signal_acquire(kc_port_wait_word *word,
+                                    kc_port_wait_signal *signal);
+void kc_port_wait_u32_signal_one(const kc_port_wait_signal *signal);
+void kc_port_wait_u32_signal_all(const kc_port_wait_signal *signal);
+void kc_port_wait_u32_signal_release(kc_port_wait_signal *signal);
 /* True only when wake uses the host's direct address primitive and cannot
  * acquire the pthread fallback mutex. The result is immutable after prepare. */
 int kc_port_wait_u32_wake_is_realtime_safe(const kc_port_wait_word *word);
+/* Closes operation admission without freeing the registration. out_admitted
+ * reports guards/waits/wakes that crossed the packed gate before closure.
+ * release may follow a prior close and drains those admitted operations. */
+int kc_port_wait_u32_close(kc_port_wait_word *word,
+                           uint32_t *out_admitted);
 void kc_port_wait_u32_release(kc_port_wait_word *word);
 
 int kc_port_thread_create(kc_port_thread **out, kc_port_thread_fn fn, void *arg);
 void kc_port_thread_join(kc_port_thread *thread);
+int kc_port_thread_cpu_ns(const kc_port_thread *thread, uint64_t *out_ns);
 unsigned kc_port_cpu_count(void);
 uint64_t kc_port_monotonic_ns(void);
 

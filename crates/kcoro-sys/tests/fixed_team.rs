@@ -1,6 +1,7 @@
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicI32, AtomicPtr, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
 const EDEADLK: i32 = 11;
@@ -63,6 +64,9 @@ struct TeamConfig {
     reserved: u32,
     member: Option<unsafe extern "C" fn(*mut c_void, u32, u32, u64)>,
     context: *mut c_void,
+    runtime: *mut c_void,
+    retired: Option<unsafe extern "C" fn(*mut c_void, u64)>,
+    retired_context: *mut c_void,
 }
 
 #[repr(C)]
@@ -154,6 +158,36 @@ struct Healthy {
     started: AtomicU64,
     callbacks: AtomicU64,
     bad: AtomicU32,
+}
+
+struct Retired {
+    done: Mutex<bool>,
+    changed: Condvar,
+}
+
+impl Retired {
+    fn new() -> Self {
+        Self {
+            done: Mutex::new(false),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn wait(&self) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut done = self.done.lock().unwrap();
+        while !*done {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "team retirement callback timed out");
+            done = self.changed.wait_timeout(done, remaining).unwrap().0;
+        }
+    }
+}
+
+unsafe extern "C" fn retired_edge(context: *mut c_void, _generation: u64) {
+    let retired = unsafe { &*context.cast::<Retired>() };
+    *retired.done.lock().unwrap() = true;
+    retired.changed.notify_all();
 }
 
 unsafe extern "C" fn chain_member(context: *mut c_void, index: u32, members: u32, generation: u64) {
@@ -560,9 +594,30 @@ fn quorum_snapshot() -> TeamQuorumSnapshot {
     }
 }
 
+fn runtime(workers: u32) -> *mut c_void {
+    let config = RuntimeConfig {
+        size: size_of::<RuntimeConfig>() as u32,
+        abi_version: 1,
+        worker_count: workers,
+        reserved: 0,
+    };
+    let mut runtime = std::ptr::null_mut();
+    assert_eq!(unsafe { kc_runtime_create(&config, &mut runtime) }, 0);
+    assert_eq!(unsafe { kc_runtime_start(runtime) }, 0);
+    runtime
+}
+
+fn retire_runtime(runtime: *mut c_void) {
+    unsafe { kc_runtime_request_stop(runtime) };
+    assert_eq!(unsafe { kc_runtime_join(runtime) }, 0);
+    assert_eq!(unsafe { kc_runtime_destroy(runtime) }, 0);
+}
+
 #[test]
 fn completion_edges_drive_every_generation_and_terminal_teardown() {
     kcoro_sys::link_anchor();
+    let runtime = runtime(MEMBER_COUNT);
+    let retired = Retired::new();
     let chain = Chain {
         team: AtomicPtr::new(std::ptr::null_mut()),
         masks: [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)],
@@ -587,6 +642,9 @@ fn completion_edges_drive_every_generation_and_terminal_teardown() {
         reserved: 0,
         member: Some(chain_member),
         context: (&chain as *const Chain).cast_mut().cast(),
+        runtime,
+        retired: Some(retired_edge),
+        retired_context: (&retired as *const Retired).cast_mut().cast(),
     };
     let mut team = std::ptr::null_mut();
     assert_eq!(unsafe { kc_team_create(&config, &mut team) }, 0);
@@ -606,6 +664,7 @@ fn completion_edges_drive_every_generation_and_terminal_teardown() {
 
     /* The terminal callback publishes stop. This join only tears down the
      * stopped team; it is not a per-generation observation primitive. */
+    retired.wait();
     assert_eq!(unsafe { kc_team_join(team) }, 0);
 
     let mut snapshot = TeamSnapshot {
@@ -649,6 +708,7 @@ fn completion_edges_drive_every_generation_and_terminal_teardown() {
         assert_eq!(dispatch.load(Ordering::Acquire), 0);
     }
     assert_eq!(unsafe { kc_team_destroy(team) }, 0);
+    retire_runtime(runtime);
 }
 
 #[test]
@@ -657,7 +717,7 @@ fn completion_edge_resumes_state_before_the_next_dispatch() {
     let runtime_config = RuntimeConfig {
         size: size_of::<RuntimeConfig>() as u32,
         abi_version: 1,
-        worker_count: 1,
+        worker_count: 3,
         reserved: 0,
     };
     let mut runtime = std::ptr::null_mut();
@@ -702,6 +762,7 @@ fn completion_edge_resumes_state_before_the_next_dispatch() {
         0
     );
     handoff.notifier.store(notifier, Ordering::Release);
+    let retired = Retired::new();
 
     let team_config = TeamConfig {
         size: size_of::<TeamConfig>() as u32,
@@ -710,6 +771,9 @@ fn completion_edge_resumes_state_before_the_next_dispatch() {
         reserved: 0,
         member: Some(handoff_member),
         context: (&handoff as *const Handoff).cast_mut().cast(),
+        runtime,
+        retired: Some(retired_edge),
+        retired_context: (&retired as *const Retired).cast_mut().cast(),
     };
     let mut team = std::ptr::null_mut();
     assert_eq!(unsafe { kc_team_create(&team_config, &mut team) }, 0);
@@ -729,6 +793,7 @@ fn completion_edge_resumes_state_before_the_next_dispatch() {
 
     /* The team edge wakes the suspended service state, the service publishes
      * generation two, and that generation's edge publishes terminal stop. */
+    retired.wait();
     assert_eq!(unsafe { kc_team_join(team) }, 0);
     assert_eq!(handoff.phase.load(Ordering::Acquire), 4);
     assert_eq!(handoff.bad.load(Ordering::Acquire), 0);
@@ -759,6 +824,8 @@ fn completion_edge_resumes_state_before_the_next_dispatch() {
 #[test]
 fn concurrent_publishers_cannot_overwrite_the_accepted_ticket_edge() {
     kcoro_sys::link_anchor();
+    let runtime = runtime(MEMBER_COUNT);
+    let retired = Retired::new();
     let race = PublisherRace {
         gate: Barrier::new(MEMBER_COUNT as usize + 1),
         members: AtomicU32::new(0),
@@ -771,6 +838,9 @@ fn concurrent_publishers_cannot_overwrite_the_accepted_ticket_edge() {
         reserved: 0,
         member: Some(publisher_member),
         context: (&race as *const PublisherRace).cast_mut().cast(),
+        runtime,
+        retired: Some(retired_edge),
+        retired_context: (&retired as *const Retired).cast_mut().cast(),
     };
     let mut team = std::ptr::null_mut();
     assert_eq!(unsafe { kc_team_create(&config, &mut team) }, 0);
@@ -812,6 +882,7 @@ fn concurrent_publishers_cannot_overwrite_the_accepted_ticket_edge() {
      * both publisher results are known, so the losing result cannot be an
      * accidental post-completion rejection. */
     race.gate.wait();
+    retired.wait();
     assert_eq!(unsafe { kc_team_join(team) }, 0);
     assert_eq!(race.members.load(Ordering::Acquire), MEMBER_COUNT);
     assert_eq!(race.bad.load(Ordering::Acquire), 0);
@@ -820,11 +891,14 @@ fn concurrent_publishers_cannot_overwrite_the_accepted_ticket_edge() {
         1
     );
     assert_eq!(unsafe { kc_team_destroy(team) }, 0);
+    retire_runtime(runtime);
 }
 
 #[test]
 fn quorum_snapshot_tracks_one_exact_generation_without_duplicate_execution() {
     kcoro_sys::link_anchor();
+    let runtime = runtime(MEMBER_COUNT);
+    let retired = Retired::new();
     let quorum = Quorum {
         team: AtomicPtr::new(std::ptr::null_mut()),
         entered: Barrier::new(MEMBER_COUNT as usize + 1),
@@ -847,6 +921,9 @@ fn quorum_snapshot_tracks_one_exact_generation_without_duplicate_execution() {
         reserved: 0,
         member: Some(quorum_member),
         context: (&quorum as *const Quorum).cast_mut().cast(),
+        runtime,
+        retired: Some(retired_edge),
+        retired_context: (&retired as *const Retired).cast_mut().cast(),
     };
     let mut team = std::ptr::null_mut();
     assert_eq!(unsafe { kc_team_create(&config, &mut team) }, 0);
@@ -921,6 +998,7 @@ fn quorum_snapshot_tracks_one_exact_generation_without_duplicate_execution() {
     );
     quorum.retire.wait();
 
+    retired.wait();
     assert_eq!(unsafe { kc_team_join(team) }, 0);
     assert_eq!(quorum.bad.load(Ordering::Acquire), 0);
     assert_eq!(quorum.callbacks.load(Ordering::Acquire), 1);
@@ -928,11 +1006,14 @@ fn quorum_snapshot_tracks_one_exact_generation_without_duplicate_execution() {
         assert_eq!(calls.load(Ordering::Acquire), 1);
     }
     assert_eq!(unsafe { kc_team_destroy(team) }, 0);
+    retire_runtime(runtime);
 }
 
 #[test]
 fn never_entered_injection_preserves_exact_partial_quorum_without_completion() {
     kcoro_sys::link_anchor();
+    let runtime = runtime(MEMBER_COUNT);
+    let retired = Retired::new();
     let injected = Injected {
         team: AtomicPtr::new(std::ptr::null_mut()),
         calls: AtomicU32::new(0),
@@ -948,6 +1029,9 @@ fn never_entered_injection_preserves_exact_partial_quorum_without_completion() {
         reserved: 0,
         member: Some(injected_member),
         context: (&injected as *const Injected).cast_mut().cast(),
+        runtime,
+        retired: Some(retired_edge),
+        retired_context: (&retired as *const Retired).cast_mut().cast(),
     };
     let mut team = std::ptr::null_mut();
     assert_eq!(unsafe { kc_team_create(&config, &mut team) }, 0);
@@ -977,6 +1061,7 @@ fn never_entered_injection_preserves_exact_partial_quorum_without_completion() {
         },
         0
     );
+    retired.wait();
     assert_eq!(unsafe { kc_team_join(team) }, 0);
 
     assert_eq!(injected.status.load(Ordering::Acquire), 0);
@@ -1001,12 +1086,15 @@ fn never_entered_injection_preserves_exact_partial_quorum_without_completion() {
     assert_eq!(snapshot.completed_generation, 0);
     assert_eq!(snapshot.completed_members, MEMBER_COUNT - 1);
     assert_eq!(unsafe { kc_team_destroy(team) }, 0);
+    retire_runtime(runtime);
 }
 
 #[test]
 #[ignore = "one-million-generation target-hardware calibration"]
 fn one_million_healthy_generations_report_the_fixed_team_budget_floor() {
     kcoro_sys::link_anchor();
+    let runtime = runtime(MEMBER_COUNT);
+    let retired = Retired::new();
     let healthy = Healthy {
         team: AtomicPtr::new(std::ptr::null_mut()),
         samples: (0..HEALTHY_GENERATIONS)
@@ -1024,6 +1112,9 @@ fn one_million_healthy_generations_report_the_fixed_team_budget_floor() {
         reserved: 0,
         member: Some(healthy_member),
         context: (&healthy as *const Healthy).cast_mut().cast(),
+        runtime,
+        retired: Some(retired_edge),
+        retired_context: (&retired as *const Retired).cast_mut().cast(),
     };
     let mut team = std::ptr::null_mut();
     assert_eq!(unsafe { kc_team_create(&config, &mut team) }, 0);
@@ -1043,6 +1134,7 @@ fn one_million_healthy_generations_report_the_fixed_team_budget_floor() {
         },
         0
     );
+    retired.wait();
     assert_eq!(unsafe { kc_team_join(team) }, 0);
     assert_eq!(healthy.bad.load(Ordering::Acquire), 0);
     assert_eq!(
@@ -1070,11 +1162,13 @@ fn one_million_healthy_generations_report_the_fixed_team_budget_floor() {
     assert!(soft >= 10_000_000);
     assert!(hard >= 1_000_000_000);
     assert_eq!(unsafe { kc_team_destroy(team) }, 0);
+    retire_runtime(runtime);
 }
 
 #[test]
 fn fixed_team_rejects_members_that_cannot_fit_the_quorum_mask() {
     kcoro_sys::link_anchor();
+    let runtime = runtime(1);
     let race = PublisherRace {
         gate: Barrier::new(1),
         members: AtomicU32::new(0),
@@ -1087,10 +1181,14 @@ fn fixed_team_rejects_members_that_cannot_fit_the_quorum_mask() {
         reserved: 0,
         member: Some(publisher_member),
         context: (&race as *const PublisherRace).cast_mut().cast(),
+        runtime,
+        retired: None,
+        retired_context: std::ptr::null_mut(),
     };
     let mut team = std::ptr::null_mut();
     assert_eq!(unsafe { kc_team_create(&config, &mut team) }, -EINVAL);
     assert!(team.is_null());
+    retire_runtime(runtime);
 }
 
 #[test]
@@ -1109,4 +1207,7 @@ fn fixed_team_execution_has_no_blocking_generation_observer() {
     }
     assert!(CORE.contains("uint64_t seen_generation"));
     assert!(!CORE.contains("uint64_t seen ="));
+    assert!(!CORE.contains("kc_port_thread_create"));
+    assert!(!CORE.contains("pthread_create"));
+    assert!(CORE.contains("koro_cont_create_on"));
 }

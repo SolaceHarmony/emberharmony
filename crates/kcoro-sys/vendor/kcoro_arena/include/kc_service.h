@@ -13,10 +13,10 @@ extern "C" {
 
 /*
  * A retained service is one stackless continuation mounted on an explicit
- * runtime. It creates no thread. Creation assigns one permanent worker and one
- * bit in that worker's bounded inbound bitmap. Notifications are coalesced by
- * an atomic OR while the callback drains its own predicate; there is no shared
- * ready queue, migration, or work stealing. The continuation state
+ * runtime. It creates no thread. Normal services are resumable by any free
+ * runtime worker; owner hooks narrow eligibility to one worker only for a
+ * genuinely thread-affine host resource. Notifications are coalesced while
+ * the callback drains its own predicate. The continuation state
  * closes notify-before-dormancy and notify-during-callback races. Realtime
  * notify takes one bounded admission lease, with no compare/exchange retry:
  * a successful notify
@@ -37,7 +37,7 @@ typedef struct kc_service_config {
     void *context;
     uint64_t reserved;
     /* Optional owner-affine lifecycle hooks. owner_init runs exactly once on
-     * the service's permanent worker before its first callback can run.
+     * the service's eligible worker before its first callback can run.
      * owner_fini runs exactly once on that same worker after every admitted
      * edge has drained and before DONE is published. They are the lifetime
      * boundary for resources that may neither migrate nor be destroyed by an
@@ -65,8 +65,8 @@ int kc_service_start(kc_service_t *service);
  * this function allocates nothing, takes no mutex, and invokes no callback. */
 int kc_service_notify(kc_service_t *service);
 /* Setup-time retained realtime edge. Creation may allocate and lock; notify
- * performs no mutex, allocation, retry loop, deadline, or callback. A burst rings the
- * owner only on the per-service ready-bit 0 -> 1 transition. The producer publishes
+ * performs no mutex, allocation, retry loop, deadline, or callback. A burst
+ * publishes only the continuation's ready transition. The producer publishes
  * its owned predicate before notify. Stop closes service admission. The host
  * must disconnect and quiesce every producer before notifier_destroy; this is
  * the same ownership boundary used before releasing a hardware callback
@@ -78,7 +78,7 @@ int kc_service_notifier_notify(kc_service_notifier_t *notifier);
 int kc_service_notifier_destroy(kc_service_notifier_t *notifier);
 /* Bounded-callback continuation edge. Callable only from this service's active
  * callback. It publishes one coalescible local-ready generation and causes the
- * same continuation to re-enter after yielding, without a mutex, timer,
+ * same logical continuation to re-enter after yielding, without a mutex, timer,
  * external producer, or wait-word syscall. This is the quota boundary for a
  * callback whose owned predicate still contains work. */
 int kc_service_ready_again(kc_service_t *service);

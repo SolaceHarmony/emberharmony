@@ -38,6 +38,10 @@ const EVENT_TURN: u32 = 3;
 const EVENT_ERROR: u32 = 4;
 const EVENT_STOPPED: u32 = 5;
 const EVENT_TURN_STARTED: u32 = 7;
+const SESSION_CREATED: u32 = 0;
+const SESSION_RUNNING: u32 = 1;
+const FIXED_SCOPE_SEALED: u32 = 2;
+const DEADLINE_SOURCE_OPEN: u32 = 1;
 
 #[repr(C)]
 struct Runtime {
@@ -66,6 +70,11 @@ struct CaptureProducer {
 
 #[repr(C)]
 struct PlaybackConsumer {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
+struct SessionControl {
     _private: [u8; 0],
 }
 
@@ -468,6 +477,8 @@ unsafe extern "C" {
         identity: *const CaptureDeadlineSlotSnapshot,
     ) -> c_int;
     fn lfm_session_destroy(session: *mut Session) -> c_int;
+    fn lfm_session_control_create(session: *mut Session, out: *mut *mut SessionControl) -> c_int;
+    fn lfm_session_control_destroy(control: *mut SessionControl) -> c_int;
 
     fn lfm_capture_chunk_producer_create(
         session: *mut Session,
@@ -2513,14 +2524,29 @@ fn prestart_voiced_capture_enters_a_presealed_supervision_scope() {
         },
         0
     );
+    let mut created = SessionSnapshot::default();
+    assert_eq!(unsafe { lfm_session_snapshot(session, &mut created) }, 0);
+    assert_eq!(created.state, SESSION_CREATED);
+    let sealed = capture_supervision(session);
+    assert_eq!(sealed.scope_phase, FIXED_SCOPE_SEALED);
+    assert_eq!(sealed.source_phase, DEADLINE_SOURCE_OPEN);
+    assert_eq!(sealed.cycle_active, 0);
     let mut producer = std::ptr::null_mut();
     assert_eq!(
         unsafe { lfm_capture_chunk_producer_create(session, 79, 0, &mut producer) },
         0
     );
     let voice = write_signal(producer, 14_400, true);
+    let mut dormant = SessionSnapshot::default();
+    assert_eq!(unsafe { lfm_session_snapshot(session, &mut dormant) }, 0);
+    assert_eq!(dormant.state, SESSION_CREATED);
+    assert_eq!(dormant.capture_consumed, 0);
+    assert_eq!(dormant.callbacks_entered, 0);
 
     assert_eq!(unsafe { lfm_session_start(session) }, 0);
+    let mut running = SessionSnapshot::default();
+    assert_eq!(unsafe { lfm_session_snapshot(session, &mut running) }, 0);
+    assert_eq!(running.state, SESSION_RUNNING);
     let _ = wait_event(&sink, |event| event.kind == EVENT_STATE);
     sync_session(session, &sink, b"prestart-voice");
     let supervised = capture_supervision(session);
@@ -2534,6 +2560,149 @@ fn prestart_voiced_capture_enters_a_presealed_supervision_scope() {
     );
 
     unsafe { stop_all_with_capture(runtime, session, producer, 0) };
+}
+
+#[test]
+fn physical_audio_endpoints_are_setup_only_and_survive_readiness() {
+    let (runtime, session, producer, consumer, sink) = duplex_dock_state(48_000, 32, false);
+    let mut created = SessionSnapshot::default();
+    assert_eq!(unsafe { lfm_session_snapshot(session, &mut created) }, 0);
+    assert_eq!(created.state, SESSION_CREATED);
+    let supervision = capture_supervision(session);
+    assert_eq!(supervision.scope_phase, FIXED_SCOPE_SEALED);
+    assert_eq!(supervision.source_phase, DEADLINE_SOURCE_OPEN);
+
+    assert_eq!(unsafe { lfm_session_start(session) }, 0);
+    let _ = wait_event(&sink, |event| event.kind == EVENT_STATE);
+    let mut late_capture = std::ptr::null_mut();
+    assert_eq!(
+        unsafe { lfm_capture_chunk_producer_create(session, 92, 0, &mut late_capture) },
+        CANCELLED
+    );
+    assert!(late_capture.is_null());
+    let mut late_playback = std::ptr::null_mut();
+    assert_eq!(
+        unsafe { lfm_playback_consumer_create(session, &mut late_playback) },
+        CANCELLED
+    );
+    assert!(late_playback.is_null());
+    let mut late_control = std::ptr::null_mut();
+    assert_eq!(
+        unsafe { lfm_session_control_create(session, &mut late_control) },
+        CANCELLED
+    );
+    assert!(late_control.is_null());
+
+    let capture = write_chunk(producer, 8, 0, 0.25);
+    sync_session(session, &sink, b"setup-capture");
+    assert_ne!(capture.turn_ticket.sequence, 0);
+    let samples = [0.25f32; 32];
+    let published = publish_playback(session, &samples).unwrap();
+    let claimed = claim_playback(consumer, published);
+    let rendered = render_playback_block(consumer, &claimed, 0, 32);
+    assert_eq!(rendered.rendered_frames, 32);
+    assert_eq!(
+        unsafe { lfm_playback_consumer_release(consumer, &claimed) },
+        0
+    );
+
+    retire_duplex_dock(runtime, session, producer, consumer, &sink);
+}
+
+#[test]
+fn endpoint_creation_and_start_share_one_readiness_linearization() {
+    for iteration in 0..32u64 {
+        let runtime = runtime();
+        let mut config = dock_config();
+        config.flags |= MANUAL_DEADLINES;
+        let mut session = std::ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                lfm_session_create(
+                    runtime,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &config,
+                    std::ptr::null(),
+                    &mut session,
+                )
+            },
+            0
+        );
+
+        let edge = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let start_edge = edge.clone();
+        let start_session = session as usize;
+        let starter = std::thread::spawn(move || {
+            start_edge.wait();
+            unsafe { lfm_session_start(start_session as *mut Session) }
+        });
+        let endpoint_edge = edge.clone();
+        let endpoint_session = session as usize;
+        let endpoint = std::thread::spawn(move || {
+            endpoint_edge.wait();
+            let mut producer = std::ptr::null_mut();
+            let capture_status = unsafe {
+                lfm_capture_chunk_producer_create(
+                    endpoint_session as *mut Session,
+                    iteration + 1,
+                    0,
+                    &mut producer,
+                )
+            };
+            let mut consumer = std::ptr::null_mut();
+            let playback_status = unsafe {
+                lfm_playback_consumer_create(endpoint_session as *mut Session, &mut consumer)
+            };
+            let mut control = std::ptr::null_mut();
+            let control_status = unsafe {
+                lfm_session_control_create(endpoint_session as *mut Session, &mut control)
+            };
+            (
+                capture_status,
+                producer as usize,
+                playback_status,
+                consumer as usize,
+                control_status,
+                control as usize,
+            )
+        });
+        edge.wait();
+        assert_eq!(starter.join().unwrap(), 0);
+        let (capture_status, producer, playback_status, consumer, control_status, control) =
+            endpoint.join().unwrap();
+        assert!(capture_status == 0 || capture_status == CANCELLED);
+        assert_eq!(producer == 0, capture_status == CANCELLED);
+        assert!(playback_status == 0 || playback_status == CANCELLED);
+        assert_eq!(consumer == 0, playback_status == CANCELLED);
+        assert!(control_status == 0 || control_status == CANCELLED);
+        assert_eq!(control == 0, control_status == CANCELLED);
+
+        unsafe { lfm_session_request_stop(session) };
+        if producer != 0 {
+            assert_eq!(
+                unsafe { lfm_capture_producer_destroy(producer as *mut CaptureProducer) },
+                0
+            );
+        }
+        if consumer != 0 {
+            assert_eq!(
+                unsafe { lfm_playback_consumer_destroy(consumer as *mut PlaybackConsumer,) },
+                0
+            );
+        }
+        if control != 0 {
+            assert_eq!(
+                unsafe { lfm_session_control_destroy(control as *mut SessionControl) },
+                0
+            );
+        }
+        assert_eq!(unsafe { lfm_session_join(session) }, 0);
+        assert_eq!(unsafe { lfm_session_destroy(session) }, 0);
+        unsafe { lfm_runtime_request_stop(runtime) };
+        assert_eq!(unsafe { lfm_runtime_join(runtime) }, 0);
+        assert_eq!(unsafe { lfm_runtime_destroy(runtime) }, 0);
+    }
 }
 
 #[test]
@@ -3359,14 +3528,13 @@ fn capture_rate_is_sealed_at_session_readiness() {
         },
         0
     );
-    assert_eq!(unsafe { lfm_session_start(session) }, 0);
-    let _ = wait_event(&sink, |event| event.kind == EVENT_STATE);
-
     let mut producer = std::ptr::null_mut();
     assert_eq!(
         unsafe { lfm_capture_chunk_producer_create(session, 9, 0, &mut producer) },
         0
     );
+    assert_eq!(unsafe { lfm_session_start(session) }, 0);
+    let _ = wait_event(&sink, |event| event.kind == EVENT_STATE);
     let input = [0.25f32; 8];
     let mut default_capture = CaptureWrite::default();
     assert_eq!(

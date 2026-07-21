@@ -7,8 +7,8 @@
 // fewer), and each fence's last arriver runs that boundary's serial ladder work
 // (sumsq folds, conv update, qk-norm/rope/append, embed) exactly once. The only
 // runtime boundary is a fixed submission/completion bridge: a retained kcoro
-// service mounts one pass descriptor, and lane 0 publishes one exact CQ record
-// before the fixed team release-retires that generation.
+// frame mounts one pass descriptor, and the final lane callback resumes that
+// exact frame before it publishes one correlated CQ record.
 //
 // Every operation enters through a retained workflow ticket. Completion makes
 // the next continuation runnable; no caller thread waits on numerical progress.
@@ -66,6 +66,7 @@ extern "C" {
 #include "kc_runtime.h"
 #include "kc_service.h"
 #include "kc_team.h"
+#include "kcoro_stackless.h"
 }
 
 // Stage kernels from the flashkern TU (same image, plain calls).
@@ -1019,15 +1020,16 @@ struct Engine {
     ScPass *sc_view = nullptr;
     AtPass *at_view = nullptr;
 
-    // Kcoro owns the fixed team and every resident lane thread. The SQ/CQ
-    // dispatcher only mounts full generations; numerical call stacks never
-    // migrate or enter the general continuation executor.
+    // One bounded kcoro pool owns both orchestration frames and the logical
+    // lane continuations. A lane identity is stable for quorum accounting,
+    // but its physical worker is not: any free eligible worker may run its
+    // uninterrupted numerical tile.
     kc_team_t *team = nullptr;
     kc_runtime_t *control_runtime = nullptr;
-    kc_service_t *bridge_service = nullptr;
+    koro_cont_t *bridge_continuation = nullptr;
+    kc_ticket_id bridge_identity{};
     kc_service_t *route_service = nullptr;
     kc_service_t *supervisor_service = nullptr;
-    kc_service_notifier_t *bridge_notifier = nullptr;
     kc_service_notifier_t *route_notifier = nullptr;
     kc_service_notifier_t *supervisor_notifier = nullptr;
     kc_deadline_source_t *team_deadlines = nullptr;
@@ -1052,8 +1054,10 @@ struct Engine {
     PassSlot *bridge_slot = nullptr;
     uint64_t bridge_slot_owner = 0;
     std::atomic<uint64_t> bridge_team_generation{0};
+    std::atomic<uint64_t> bridge_team_completion{0};
     bool bridge_valid = false;
     std::atomic<uint64_t> bridge_retired_generation{0};
+    std::atomic<bool> bridge_done{false};
     /* One fixed team means one active generation and therefore one reusable
      * deadline slot. The deadline slot decides whether completion or expiry
      * won first; only a successfully retired deadline may publish COMPLETED in
@@ -1149,6 +1153,13 @@ struct Engine {
 static void notify_service(kc_service_notifier_t *notifier) {
     if (!notifier) return;
     const int status = kc_service_notifier_notify(notifier);
+    if (status != 0 && status != -ECANCELED) std::abort();
+}
+
+static void resume_bridge(Engine *engine) {
+    if (!engine || !engine->bridge_continuation) return;
+    const int status = koro_cont_resume(engine->bridge_continuation,
+                                        &engine->bridge_identity);
     if (status != 0 && status != -ECANCELED) std::abort();
 }
 
@@ -4250,9 +4261,9 @@ static void publish_rejected(Engine *e, const KcSubmissionV1 &submission, int st
     if (lfm_kernel_bridge_publish_completion(e->bridge, &completion) != 0) std::abort();
 }
 
-// SQ/CQ records remain authoritative. These service notifications are only
-// coalesced predicate edges, and each callback performs one bounded state
-// transition before returning to kcoro's explicit one-worker control runtime.
+// SQ/CQ records remain authoritative. A final-lane callback resumes the exact
+// bridge frame; whichever bounded-pool worker claims it performs one program
+// transition and suspends again.
 static void redispatch_team_stage(Engine *e, uint64_t generation) {
     const uint64_t next = generation + 1;
     if (next == 0) std::abort();
@@ -4274,6 +4285,20 @@ static void bridge_team_complete(void *context, uint64_t generation) {
     e->block_completions.fetch_add(e->block_count,
                                    std::memory_order_relaxed);
     if (e->supervised_team_generation != generation) std::abort();
+    uint64_t empty = 0;
+    if (!e->bridge_team_completion.compare_exchange_strong(
+            empty, generation, std::memory_order_release,
+            std::memory_order_acquire)) {
+        std::abort();
+    }
+    /* Final-lane return is a callback edge, not the orchestration itself. It
+     * names the suspended bridge frame and walks away; whichever pool worker
+     * claims that frame performs the next GOSUB instruction. */
+    resume_bridge(e);
+}
+
+static void consume_team_completion(Engine *e, uint64_t generation) {
+    if (!e || e->supervised_team_generation != generation) std::abort();
     if (e->supervised_hard_budget_ns == 0) {
         if (e->team_deadline_arm.arm_generation != 0 ||
             !claim_team_terminal(&e->team_terminal, generation,
@@ -4386,21 +4411,36 @@ static void process_team_completion(Engine *e, uint64_t generation) {
         std::abort();
     }
     e->bridge_retired_generation.store(generation, std::memory_order_release);
-    notify_service(e->bridge_notifier);
+    resume_bridge(e);
 }
 
-static void bridge_service_main(void *context) {
-    Engine *e = static_cast<Engine *>(context);
+static bool bridge_step_once(Engine *e) {
     if (e->bridge_phase == BRIDGE_SERVICE_COMPLETION) {
+        if (e->bridge_valid) {
+            const uint64_t generation = e->bridge_team_generation.load(
+                std::memory_order_acquire);
+            uint64_t completed = e->bridge_team_completion.load(
+                std::memory_order_acquire);
+            if (completed != 0) {
+                if (completed != generation ||
+                    !e->bridge_team_completion.compare_exchange_strong(
+                        completed, 0, std::memory_order_acq_rel,
+                        std::memory_order_acquire)) {
+                    std::abort();
+                }
+                consume_team_completion(e, generation);
+                return false;
+            }
+        }
         if (e->bridge_valid &&
             e->bridge_retired_generation.load(std::memory_order_acquire) !=
                 e->bridge_team_generation.load(std::memory_order_acquire)) {
-            return;
+            return false;
         }
         KcCompletionV1 completion{};
         const int status =
             lfm_kernel_bridge_try_completion(e->bridge, &completion);
-        if (status == -EAGAIN) return;
+        if (status == -EAGAIN) return false;
         if (status != 0) std::abort();
 
         PassSlot *slot = e->bridge_slot;
@@ -4452,19 +4492,23 @@ static void bridge_service_main(void *context) {
             !release_pass_slot(slot, slot_owner)) {
             std::abort();
         }
-        notify_service(e->bridge_notifier);
-        return;
+        resume_bridge(e);
+        return false;
     }
 
     KcSubmissionV1 submission{};
     const int status =
         lfm_kernel_bridge_try_submission(e->bridge, &submission);
-    if (status == -EAGAIN) return;
+    if (status == -EAGAIN) return false;
     if (status == -ECANCELED) {
         if (e->team_deadlines)
             kc_deadline_source_request_stop(e->team_deadlines);
-        kc_service_request_stop(e->bridge_service);
-        return;
+        /* The canceled-and-empty SQ is the authoritative terminal edge for
+         * numerical admission. Only now may the logical lane continuations
+         * consume their stop edge; an active generation has already returned
+         * through the correlated CQ path above. */
+        if (e->team) kc_team_request_stop(e->team);
+        return true;
     }
     if (status != 0) std::abort();
 
@@ -4531,8 +4575,8 @@ static void bridge_service_main(void *context) {
     e->bridge_valid = valid;
     if (!valid) {
         publish_rejected(e, submission, -ESTALE);
-        notify_service(e->bridge_notifier);
-        return;
+        resume_bridge(e);
+        return false;
     }
 
     activate_slot(e, slot);
@@ -4566,6 +4610,38 @@ static void bridge_service_main(void *context) {
     e->bridge_team_generation.store(generation, std::memory_order_release);
     e->dispatch_wakes.fetch_add(1, std::memory_order_relaxed);
     dispatch_supervised_team(e, generation);
+    return false;
+}
+
+struct BridgeContinuationFrame {
+    Engine *engine;
+    uint64_t activations;
+};
+
+static void bridge_continuation_retired(void *context,
+                                        const kc_ticket_id *identity) {
+    Engine *engine = static_cast<Engine *>(context);
+    if (!engine || !identity ||
+        identity->runtime_epoch != engine->bridge_identity.runtime_epoch ||
+        identity->sequence != engine->bridge_identity.sequence ||
+        identity->generation != engine->bridge_identity.generation ||
+        identity->kind != engine->bridge_identity.kind) {
+        std::abort();
+    }
+    engine->bridge_done.store(true, std::memory_order_release);
+}
+
+static void *bridge_continuation_step(koro_cont_t *continuation) {
+    BridgeContinuationFrame *frame = static_cast<BridgeContinuationFrame *>(
+        koro_cont_frame(continuation));
+    if (!frame || !frame->engine) std::abort();
+    KORO_BEGIN(continuation);
+    for (;;) {
+        frame->activations++;
+        if (bridge_step_once(frame->engine)) break;
+        KORO_SUSPEND(continuation);
+    }
+    KORO_END(continuation);
 }
 
 static uint64_t next_sequence(std::atomic<uint64_t> *counter) {
@@ -4648,7 +4724,7 @@ static int submit_slot(Engine *e, PassSlot *slot, uint64_t generation,
     /* SQ/CQ are authoritative; this coalesced edge only resumes the retained
      * consumer. Notify after both success and failure so a stop racing the
      * final admitted producer can observe that admission has settled. */
-    notify_service(e->bridge_notifier);
+    resume_bridge(e);
     if (rc != 0) {
         if (slot_state(slot) == PASS_SLOT_SUBMITTING) {
             slot->lease.store(pass_slot_lease(generation,
@@ -5249,9 +5325,9 @@ extern "C" {
 
 void lfm_engine_free(void *ep);
 
-// `workers` is the total fixed numerical lane count. Kcoro owns those fixed
-// team members plus one explicit control-runtime worker shared by the retained
-// bridge and route continuations.
+// `workers` is the complete bounded kcoro worker pool. Numerical lane members,
+// the bridge, the route broker, and the supervisor are logical continuations
+// on that one pool; engine construction creates no second thread society.
 static void *engine_new_impl(int workers, bool manual_deadlines,
                              const TeamFaultTestConfig *fault,
                              int *out_status) {
@@ -5301,6 +5377,16 @@ static void *engine_new_impl(int workers, bool manual_deadlines,
         lfm_engine_free(e);
         return nullptr;
     }
+    const kc_runtime_config runtime_config = {
+        .size = sizeof(kc_runtime_config),
+        .abi_version = KC_ABI_VERSION,
+        .worker_count = static_cast<uint32_t>(workers),
+        .reserved = 0,
+    };
+    if (kc_runtime_create(&runtime_config, &e->control_runtime) != 0) {
+        lfm_engine_free(e);
+        return nullptr;
+    }
     const kc_team_config team_config = {
         .size = sizeof(kc_team_config),
         .abi_version = KC_ABI_VERSION,
@@ -5308,34 +5394,43 @@ static void *engine_new_impl(int workers, bool manual_deadlines,
         .reserved = 0,
         .member = lane_member,
         .context = e,
+        .runtime = e->control_runtime,
+        .retired = nullptr,
+        .retired_context = nullptr,
     };
     if (kc_team_create(&team_config, &e->team) != 0) {
         lfm_engine_free(e);
         return nullptr;
     }
-    if ((fault && kc_team_inject_member_exit_for_test(
-                      e->team, 1, fault->member, fault->point,
-                      hard_timeout_probe_ready, e) != 0) ||
-        kc_team_start(e->team) != 0) {
+    if (fault && kc_team_inject_member_exit_for_test(
+                     e->team, 1, fault->member, fault->point,
+                     hard_timeout_probe_ready, e) != 0) {
         lfm_engine_free(e);
         return nullptr;
     }
-    const kc_runtime_config runtime_config = {
-        .size = sizeof(kc_runtime_config),
+    const koro_cont_config bridge_continuation_config = {
+        .size = sizeof(koro_cont_config),
         .abi_version = KC_ABI_VERSION,
-        .worker_count = 1,
-        .reserved = 0,
+        .step = bridge_continuation_step,
+        .argument = e,
+        .frame_size = sizeof(BridgeContinuationFrame),
+        .worker_mask = 0,
+        .completion = bridge_continuation_retired,
+        .completion_context = e,
     };
-    if (kc_runtime_create(&runtime_config, &e->control_runtime) != 0) {
+    if (koro_cont_create_on(e->control_runtime,
+                            &bridge_continuation_config,
+                            &e->bridge_continuation) != 0) {
         lfm_engine_free(e);
         return nullptr;
     }
-    const kc_service_config bridge_service_config = {
-        .size = sizeof(kc_service_config),
-        .abi_version = KC_ABI_VERSION,
-        .callback = bridge_service_main,
-        .context = e,
-        .reserved = 0,
+    e->bridge_identity = koro_cont_identity(e->bridge_continuation);
+    BridgeContinuationFrame *bridge_frame =
+        static_cast<BridgeContinuationFrame *>(
+            koro_cont_frame(e->bridge_continuation));
+    *bridge_frame = {
+        .engine = e,
+        .activations = 0,
     };
     const kc_service_config route_service_config = {
         .size = sizeof(kc_service_config),
@@ -5351,24 +5446,14 @@ static void *engine_new_impl(int workers, bool manual_deadlines,
         .context = e,
         .reserved = 0,
     };
-    if (kc_service_create(e->control_runtime, &bridge_service_config,
-                          &e->bridge_service) != 0 ||
-        kc_service_create(e->control_runtime, &route_service_config,
+    if (kc_service_create(e->control_runtime, &route_service_config,
                           &e->route_service) != 0 ||
         kc_service_create(e->control_runtime, &supervisor_service_config,
                           &e->supervisor_service) != 0 ||
-        kc_service_notifier_create(e->bridge_service,
-                                   &e->bridge_notifier) != 0 ||
         kc_service_notifier_create(e->route_service,
                                    &e->route_notifier) != 0 ||
         kc_service_notifier_create(e->supervisor_service,
-                                   &e->supervisor_notifier) != 0 ||
-        kc_runtime_start(e->control_runtime) != 0) {
-        lfm_engine_free(e);
-        return nullptr;
-    }
-    e->control_started = 1;
-    if (kc_service_start(e->supervisor_service) != 0) {
+                                   &e->supervisor_notifier) != 0) {
         lfm_engine_free(e);
         return nullptr;
     }
@@ -5389,7 +5474,14 @@ static void *engine_new_impl(int workers, bool manual_deadlines,
         lfm_engine_free(e);
         return nullptr;
     }
-    if (kc_service_start(e->bridge_service) != 0) {
+    if (kc_runtime_start(e->control_runtime) != 0) {
+        lfm_engine_free(e);
+        return nullptr;
+    }
+    e->control_started = 1;
+    if (kc_team_start(e->team) != 0 ||
+        kc_service_start(e->supervisor_service) != 0 ||
+        koro_cont_start(e->bridge_continuation) != 0) {
         lfm_engine_free(e);
         return nullptr;
     }
@@ -5473,7 +5565,7 @@ void lfm_engine_request_stop(void *ep) {
     if (e->team_deadlines && !e->bridge_started)
         kc_deadline_source_request_stop(e->team_deadlines);
     notify_service(e->route_notifier);
-    notify_service(e->bridge_notifier);
+    resume_bridge(e);
 }
 
 // Private implementation-backed protocol probes. Selector membership is
@@ -5796,23 +5888,45 @@ int lfm_engine_snapshot(void *ep, LfmEngineSnapshotV1 *out) {
     return 0;
 }
 
+int lfm_internal_engine_stackless_runtime_for_test(
+    void *ep, kc_runtime_snapshot *out_runtime, KcTicketIdV1 *out_bridge) {
+    Engine *engine = static_cast<Engine *>(ep);
+    if (!engine || !engine->control_runtime || !engine->bridge_continuation ||
+        !out_runtime || out_runtime->size < sizeof(*out_runtime) ||
+        !out_bridge) {
+        return -EINVAL;
+    }
+    const int status = kc_runtime_snapshot_get(engine->control_runtime,
+                                               out_runtime);
+    if (status != 0) return status;
+    *out_bridge = {
+        .runtime_epoch = engine->bridge_identity.runtime_epoch,
+        .sequence = engine->bridge_identity.sequence,
+        .generation = engine->bridge_identity.generation,
+        .kind = engine->bridge_identity.kind,
+    };
+    return 0;
+}
+
 void lfm_engine_free(void *ep) {
     Engine *e = (Engine *)ep;
     if (!e) return;
     lfm_engine_request_stop(e);
-    /* Administrative teardown begins only after the retained services have
-     * acknowledged their authoritative terminal edges. This lifecycle join is
-     * outside execution; calling kc_service_join while a stop callback is only
-     * published would correctly return -EBUSY. */
+    /* Construction failures before the bridge continuation becomes live have
+     * no SQ terminal edge to retire the team. Publish that edge directly; in
+     * the normal path bridge_step_once owns it after the canceled SQ has
+     * drained, so an in-flight numerical generation is never cut short. */
+    if (e->team && (!e->control_started || !e->bridge_started))
+        kc_team_request_stop(e->team);
+    /* Administrative teardown begins only after the retained frames have
+     * acknowledged their authoritative terminal edges. No inference operation
+     * owns this observation; the bridge and team retire through callbacks. */
     if (e->control_runtime && e->control_started > 0 &&
         kc_runtime_join_all(e->control_runtime) != 0) {
         std::abort();
     }
     if (e->route_service) {
         if (kc_service_join(e->route_service) != 0) std::abort();
-    }
-    if (e->bridge_service) {
-        if (kc_service_join(e->bridge_service) != 0) std::abort();
     }
     if (e->supervisor_service) {
         if (kc_service_join(e->supervisor_service) != 0) std::abort();
@@ -5828,8 +5942,20 @@ void lfm_engine_free(void *ep) {
             std::abort();
         e->team = nullptr;
     }
+    if (e->bridge_continuation) {
+        if ((e->bridge_started &&
+             !e->bridge_done.load(std::memory_order_acquire)) ||
+            koro_cont_destroy(e->bridge_continuation) != 0) {
+            std::abort();
+        }
+        e->bridge_continuation = nullptr;
+        e->bridge_identity = {};
+    }
     if (e->team_deadlines) {
-        if (kc_deadline_source_destroy(e->team_deadlines) != 0) std::abort();
+        if (kc_deadline_source_join(e->team_deadlines) != 0 ||
+            kc_deadline_source_destroy(e->team_deadlines) != 0) {
+            std::abort();
+        }
         e->team_deadlines = nullptr;
     }
     /* A notifier is the callback-side lifetime lease. Every engine-owned
@@ -5845,17 +5971,9 @@ void lfm_engine_free(void *ep) {
         if (kc_service_notifier_destroy(e->route_notifier) != 0) std::abort();
         e->route_notifier = nullptr;
     }
-    if (e->bridge_notifier) {
-        if (kc_service_notifier_destroy(e->bridge_notifier) != 0) std::abort();
-        e->bridge_notifier = nullptr;
-    }
     if (e->route_service) {
         if (kc_service_destroy(e->route_service) != 0) std::abort();
         e->route_service = nullptr;
-    }
-    if (e->bridge_service) {
-        if (kc_service_destroy(e->bridge_service) != 0) std::abort();
-        e->bridge_service = nullptr;
     }
     if (e->supervisor_service) {
         if (kc_service_destroy(e->supervisor_service) != 0) std::abort();

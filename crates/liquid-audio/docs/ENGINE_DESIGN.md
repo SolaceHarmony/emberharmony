@@ -20,17 +20,19 @@ private engine with `lfm_engine_new_status` so deadline-backend failure can be
 reported before work is admitted. The deterministic manual-deadline
 constructors are private test interfaces only.
 
-An operation never owns a sleeping thread. Its suspension is a durable
-`PassSlot`, route, conversation, or session record. A callback edge makes that
-record runnable. Only a resident kcoro worker whose complete ready predicate is
-empty may enter expected-value dormancy.
+An operation never owns a sleeping thread. Its suspension is a stackless frame:
+saved program counter, fixed locals, exact ticket, and retained references to
+its `PassSlot`, route, conversation, or session records. A correlated callback
+makes that exact frame runnable on any free eligible worker. Only a resident
+kcoro worker whose complete ready predicate is empty may enter expected-value
+dormancy.
 
 ## Current Command Flow
 
 ```mermaid
 sequenceDiagram
     participant S as Native session/caller
-    participant R as Route/service
+    participant R as Route/bridge frame
     participant SQ as Ticketed SQ
     participant T as kcoro fixed team
     participant CQ as Native CQ
@@ -39,7 +41,7 @@ sequenceDiagram
     R->>SQ: publish validated pass descriptor
     SQ-->>T: dispatch generation
     T->>T: claim assembly tiles; every member returns once
-    T-->>R: final return invokes pass continuation
+    T-->>R: final return resumes exact bridge ticket
     alt another route label
         R->>SQ: publish next generation on the same ticket
     else terminal outcome
@@ -49,11 +51,12 @@ sequenceDiagram
     end
 ```
 
-`bridge_service_main` validates submissions and drains completions;
-`bridge_team_complete` is kcoro's one final-return callback for a dispatched
-generation. `PassSlot::ProgramCursor` and request-specific records own every
-value that survives a return. The Rust submitter callback and Rust numerical
-coordinator are gone.
+`bridge_continuation_step` validates submissions and drains completions from a
+fixed saved frame. `bridge_team_complete` only publishes the completed
+generation and resumes that exact continuation; it never shepherds the next
+stage inline. `PassSlot::ProgramCursor` and request-specific records own every
+numerical value that survives a return. The Rust submitter callback and Rust
+numerical coordinator are gone.
 
 An accepted submission carries only `{pass_slot, ticket_generation}`. The
 engine-owned slot retains its typed byte views, program cursor, continuation,
@@ -64,18 +67,19 @@ into a caller's stack.
 
 ## Fixed Lanes
 
-`lfm_engine_new_status`, reached through `lfm_runtime_create`, creates retained
-kcoro bridge, route, and team-supervisor services plus one stable `kc_team`.
-Flashkern does not create lane pthreads.
-The team owns one cache-isolated idle event and one generation-return counter;
-there is no per-pass or per-stage fence word.
+`lfm_engine_new_status`, reached through `lfm_runtime_create`, creates one
+bounded kcoro runtime, a saved bridge continuation, route and team-supervisor
+services, and one stable logical `kc_team` on that same pool. Flashkern and
+`kc_team` create no lane pthreads. The runtime owns one infrastructure
+doorbell; there is no operation-owned idle registration or per-pass fence word.
 
 Every member executes the same published stage program. Members fetch-add
 disjoint tiles and return after their complete assembly leaf. The final return
-runs the bounded transition exactly once. It either publishes the next stage
-generation or the terminal CQ record. Members do not block one another at a
-barrier; after returning they are simply available for the next generation and
-become dormant only if the entire team has no work.
+publishes one edge to the bridge frame. The resumed bridge transition either
+publishes the next stage generation or the terminal CQ record. Members do not
+block one another at a barrier; after returning they are simply available for
+the next generation and workers become dormant only if the entire pool has no
+work.
 
 This is one team. The current engine may describe logical blocks for accounting,
 but it does not own two independent four-lane teams and cannot run two numerical
@@ -205,12 +209,12 @@ Soft nudge/rebroadcast behavior is not part of production.
 
 ## Teardown
 
-Stop closes admission and marks retained services retiring. Accepted work
-settles into terminal CQ records, stale epochs lose publication authority, and
-all retained leases release exactly once. Services join before the fixed team;
-the team joins before its idle registration is released; the bridge destroys
-only when submissions, completions, routes, pass slots, and retained I/O leases
-are all settled.
+Stop closes admission and resumes the bridge frame. Accepted work settles into
+terminal CQ records, stale epochs lose publication authority, and all retained
+leases release exactly once. The canceled-and-empty SQ is the terminal edge
+that retires the logical team; the runtime then owns only terminal physical
+worker teardown. The bridge frame is destroyed only when submissions,
+completions, routes, pass slots, and retained I/O leases are all settled.
 
 There is no production synchronous compatibility wrapper. Concurrent callers
 either acquire a generation-protected slot or receive a bounded admission
@@ -247,4 +251,5 @@ Required cutover gates:
 
 Source-shape gates additionally reject production `wait_submitted_slot`, raw
 lane pthread creation, operation-scoped address parking, timer-driven progress,
-caller-stack continuation state, and completion channels.
+caller-stack continuation state, and completion channels. Fixed heap-backed
+stackless frames are required rather than forbidden.

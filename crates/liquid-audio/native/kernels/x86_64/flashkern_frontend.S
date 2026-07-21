@@ -506,19 +506,22 @@ LFM_SYM(lfm_norm_apply_f32):
     .seh_endproc
 #endif
 
-// uint64_t lfm_resampler_stream_linear_f32(const StreamKernel *kernel)
-// Retained linear rate conversion over one borrowed codec frame. The kernel
-// descriptor is {input@0, destination@8, sample_count@16, orig@24,
-// phases@32, phase@40, previous@48, ready@52}. C++ validates those views and
-// updates the conversation-owned phase/history once this leaf returns; all
-// per-sample interpolation stays here. Separate subss/mulss/addss preserve the
-// unfused f32 operation order of the former implementation.
+// uint64_t lfm_resampler_stream_polyphase_f32(const StreamKernel *kernel)
+// Causal streaming twin of lfm_resample_conv_spans_f32. It consumes the same
+// immutable f64 sinc/Hann phase table and accumulates each output in ascending
+// tap order with separate mulsd/addsd. The centered table is shifted by its
+// right extent, giving a fixed width+orig-1 source-sample group delay while
+// requiring only past/current samples. The descriptor is
+// {history@0,input@8,destination@16,kernels@24,
+// history_length@32,history_head@40,input_count@48,sample_count@56,
+// block@64,phase@72,output_length@80,orig@88,phases@96,
+// kernel_length@104,next_history_head@112}.
 .p2align 4
-.globl LFM_SYM(lfm_resampler_stream_linear_f32)
-LFM_PRIVATE(LFM_SYM(lfm_resampler_stream_linear_f32))
-LFM_SYM(lfm_resampler_stream_linear_f32):
+.globl LFM_SYM(lfm_resampler_stream_polyphase_f32)
+LFM_PRIVATE(LFM_SYM(lfm_resampler_stream_polyphase_f32))
+LFM_SYM(lfm_resampler_stream_polyphase_f32):
 #ifdef _WIN32
-    .seh_proc LFM_SYM(lfm_resampler_stream_linear_f32)
+    .seh_proc LFM_SYM(lfm_resampler_stream_polyphase_f32)
 #endif
     pushq     %rbx
 #ifdef _WIN32
@@ -547,64 +550,102 @@ LFM_SYM(lfm_resampler_stream_linear_f32):
     pushq     %rdi
 #ifdef _WIN32
     .seh_pushreg %rdi
+#endif
+    pushq     %rsi
+#ifdef _WIN32
+    .seh_pushreg %rsi
     .seh_endprologue
     movq      %rcx, %r15
 #else
     movq      %rdi, %r15
 #endif
-    movq      0(%r15), %r12      // input
-    movq      8(%r15), %r13      // destination
-    movq      16(%r15), %r14     // remaining input samples
-    movq      24(%r15), %rbx     // reduced input rate
-    movq      32(%r15), %rbp     // reduced output phases
-    movq      40(%r15), %r10     // retained phase
-    movss     48(%r15), %xmm4    // retained previous sample
-    movl      52(%r15), %r11d    // previous sample is ready
-    cvtsi2ssq %rbp, %xmm5
-    xorq      %r9, %r9           // written
+    movq      16(%r15), %r12     // destination
+    movq      64(%r15), %r13     // first output block's latest input
+    movq      80(%r15), %r14     // remaining outputs
+    movq      24(%r15), %rbx     // phase kernels
+    movq      72(%r15), %rbp     // first output phase
 1:
     testq     %r14, %r14
     jz        8f
-    movss     (%r12), %xmm0      // sample
-    testl     %r11d, %r11d
-    jnz       2f
-    movaps    %xmm0, %xmm1       // first call starts from this sample
-    jmp       3f
+    movq      %rbp, %rax
+    imulq     104(%r15), %rax
+    leaq      (%rbx,%rax,8), %rdi // phase kernel row
+    xorq      %rsi, %rsi         // tap
+    xorpd     %xmm0, %xmm0       // f64 accumulator
 2:
-    movaps    %xmm4, %xmm1       // previous
+    cmpq      104(%r15), %rsi
+    jae       7f
+    movq      %r13, %rax
+    addq      %rsi, %rax
+    incq      %rax
+    movq      104(%r15), %rcx
+    cmpq      %rcx, %rax
+    jb        6f                 // conceptual pre-stream zero
+    subq      %rcx, %rax         // global causal source index
+    movq      48(%r15), %rdx
+    cmpq      %rdx, %rax
+    jae       4f
+    addq      32(%r15), %rax
+    cmpq      %rdx, %rax
+    jb        6f                 // older than retained history
+    subq      %rdx, %rax
+    addq      40(%r15), %rax     // logical -> circular physical index
+    cmpq      32(%r15), %rax
+    jb        3f
+    subq      32(%r15), %rax
 3:
-    movq      %r10, %rdi         // phase before this input sample
-    leaq      (%r10,%rbp), %rax  // phase + phases
-    xorq      %rdx, %rdx
-    divq      %rbx
-    movq      %rax, %r8          // output count for this input
-    movq      %rdx, %r10         // next retained phase
-    movaps    %xmm0, %xmm2
-    subss     %xmm1, %xmm2       // sample - previous
-    movq      $1, %rcx
+    movq      0(%r15), %rcx
+    cvtss2sd  (%rcx,%rax,4), %xmm1
+    jmp       5f
 4:
-    cmpq      %r8, %rcx
-    ja        5f
-    movq      %rcx, %rax
-    imulq     %rbx, %rax
-    subq      %rdi, %rax         // output*orig - old phase
-    cvtsi2ssq %rax, %xmm3
-    divss     %xmm5, %xmm3       // interpolation fraction
-    mulss     %xmm2, %xmm3
-    addss     %xmm1, %xmm3
-    movss     %xmm3, (%r13)
-    addq      $4, %r13
-    incq      %r9
-    incq      %rcx
-    jmp       4b
+    subq      %rdx, %rax
+    cmpq      56(%r15), %rax
+    jae       6f
+    movq      8(%r15), %rcx
+    cvtss2sd  (%rcx,%rax,4), %xmm1
 5:
-    movaps    %xmm0, %xmm4
-    movl      $1, %r11d
+    movsd     (%rdi,%rsi,8), %xmm2
+    mulsd     %xmm2, %xmm1
+    addsd     %xmm1, %xmm0
+6:
+    incq      %rsi
+    jmp       2b
+7:
+    cvtsd2ss  %xmm0, %xmm0
+    movss     %xmm0, (%r12)
     addq      $4, %r12
+    incq      %rbp
+    cmpq      96(%r15), %rbp
+    jb        9f
+    xorq      %rbp, %rbp
+    addq      88(%r15), %r13
+9:
     decq      %r14
     jmp       1b
 8:
-    movq      %r9, %rax
+    movq      0(%r15), %rdi      // circular history
+    movq      8(%r15), %rsi      // current input
+    movq      56(%r15), %rcx     // current input length
+    movq      40(%r15), %rdx     // circular write head
+    movq      32(%r15), %r8      // history length
+    xorq      %r9, %r9
+10:
+    cmpq      %rcx, %r9
+    jae       12f
+    movss     (%rsi,%r9,4), %xmm0
+    movss     %xmm0, (%rdi,%rdx,4)
+    incq      %rdx
+    cmpq      %r8, %rdx
+    jb        11f
+    xorq      %rdx, %rdx
+11:
+    incq      %r9
+    jmp       10b
+12:
+    movq      112(%r15), %rax
+    movq      %rdx, (%rax)
+    movq      80(%r15), %rax
+    popq      %rsi
     popq      %rdi
     popq      %r15
     popq      %r14

@@ -37,9 +37,9 @@ struct kc_service {
     atomic_uint realtime_publishers;
     size_t realtime_notifiers;
     int realtime_capable;
-    /* Touched only by the permanent owner worker. They deliberately are not
-     * atomics: service affinity, rather than shared synchronization, is the
-     * ownership proof. */
+    /* Touched only by an eligible worker while this continuation is RUNNING.
+     * Services with owner hooks receive a one-worker eligibility mask; normal
+     * services remain movable across the bounded runtime pool. */
     int owner_initialized;
     int owner_finalized;
 };
@@ -142,8 +142,19 @@ int kc_service_create(kc_runtime_t *runtime, const kc_service_config *config,
         atomic_is_lock_free(&service->realtime_publishers) &&
         atomic_is_lock_free(&runtime->wake_requests) &&
         kc_runtime_work_realtime_safe_internal(runtime);
-    service->continuation = koro_cont_create_on(runtime, service_step, service, 0);
-    if (!service->continuation) {
+    const koro_cont_config continuation_config = {
+        .size = sizeof(koro_cont_config),
+        .abi_version = KC_ABI_VERSION,
+        .step = service_step,
+        .argument = service,
+        .frame_size = 0,
+        .worker_mask = config->owner_init || config->owner_fini
+            ? kc_runtime_affinity_mask_internal(runtime) : 0,
+        .completion = NULL,
+        .completion_context = NULL,
+    };
+    if (koro_cont_create_on(runtime, &continuation_config,
+                            &service->continuation) != 0) {
         free(service);
         return -ENOMEM;
     }
@@ -154,14 +165,6 @@ int kc_service_create(kc_runtime_t *runtime, const kc_service_config *config,
         koro_cont_release_internal(service->continuation);
         free(service);
         return -ECANCELED;
-    }
-    int bind_status = kc_runtime_bind_service_locked_internal(
-        runtime, service, service->continuation);
-    if (bind_status != 0) {
-        KC_MUTEX_UNLOCK(&runtime->mu);
-        koro_cont_release_internal(service->continuation);
-        free(service);
-        return bind_status;
     }
     service->registry_next = runtime->services_head;
     if (runtime->services_head)
@@ -196,10 +199,6 @@ int kc_service_start(kc_service_t *service)
         KC_MUTEX_UNLOCK(&runtime->mu);
         return -ECANCELED;
     }
-    service->continuation->tracked = 1;
-    atomic_store_explicit(&service->continuation->run_state, KORO_QUEUED,
-                          memory_order_release);
-    atomic_fetch_add_explicit(&runtime->active, 1, memory_order_relaxed);
     atomic_store_explicit(&service->ever_started, 1, memory_order_release);
     atomic_store_explicit(&service->realtime_closed, 0,
                           memory_order_seq_cst);
@@ -208,8 +207,9 @@ int kc_service_start(kc_service_t *service)
         atomic_store_explicit(&service->realtime_closed, 1,
                               memory_order_seq_cst);
     KC_MUTEX_UNLOCK(&runtime->mu);
-    kc_runtime_publish_service_internal(runtime, service->continuation);
-    return 0;
+    const int status = koro_cont_start_internal(service->continuation);
+    if (status != 0) stop_service(service);
+    return status;
 }
 
 int kc_service_notify(kc_service_t *service)
@@ -230,7 +230,7 @@ static void realtime_leave(kc_service_t *service, int published)
      * publication lease is still live. In that case it must remain dormant,
      * because the producer may still be installing its notification. The
      * final publisher is therefore the causal successor: once 1 -> 0 makes
-     * every admitted publication visible, it republishes the fixed-owner bit
+     * every admitted publication visible, it republishes the continuation
      * so the continuation can observe quiescence and retire. If this release
      * linearizes before close, stop_service publishes the successor instead. */
     if (prior == 1 &&
@@ -257,9 +257,9 @@ static int realtime_enter(kc_service_t *service)
                               memory_order_seq_cst) &&
         atomic_load_explicit(&service->phase, memory_order_acquire) ==
             KC_SERVICE_STARTED) return 0;
-    /* Publish retirement work before dropping the admission lease. Once the
-     * owner observes zero publishers, every admitted producer has already
-     * installed its fixed-owner bit. */
+    /* Publish retirement work before dropping the admission lease. Once a
+     * resumed frame observes zero publishers, every admitted producer has
+     * already installed its edge. */
     kc_runtime_publish_service_internal(service->runtime,
                                         service->continuation);
     realtime_leave(service, 0);
@@ -339,7 +339,7 @@ int kc_service_ready_again(kc_service_t *service)
 
     /* Use the same bounded admission lease as the realtime producer edge, so a
      * local reschedule linearizes cleanly against stop. Unlike an external
-     * notification, it republishes the same fixed-owner slot. The current
+     * notification, it republishes the same logical frame. The current
      * callback returns before its owner consumes that next edge. */
     int status = realtime_enter(service);
     if (status != 0) return status;
@@ -488,12 +488,11 @@ int kc_service_destroy(kc_service_t *service)
     if (service->registry_next)
         service->registry_next->registry_prev = service->registry_prev;
     if (runtime->live_services) runtime->live_services--;
-    kc_runtime_unbind_service_locked_internal(runtime, service,
-                                              service->continuation);
     KC_MUTEX_UNLOCK(&runtime->mu);
 
     kc_runtime_signal_lifecycle_internal(runtime);
-    koro_cont_release_internal(service->continuation);
+    const int destroy_status = koro_cont_destroy(service->continuation);
+    if (destroy_status != 0) return destroy_status;
     free(service);
     return 0;
 }
@@ -507,41 +506,4 @@ void kc_service_runtime_stop_locked(kc_runtime_t *runtime)
 koro_cont_t *kc_service_continuation_internal(kc_service_t *service)
 {
     return service ? service->continuation : NULL;
-}
-
-void kc_service_runtime_execute_internal(kc_service_t *service)
-{
-    if (!service) return;
-    kc_runtime_t *runtime = service->runtime;
-    koro_cont_t *continuation = service->continuation;
-    int state = atomic_load_explicit(&continuation->run_state,
-                                     memory_order_acquire);
-    if (state != KORO_QUEUED && state != KORO_DORMANT) return;
-    atomic_store_explicit(&continuation->run_state, KORO_RUNNING,
-                          memory_order_release);
-    atomic_fetch_add_explicit(&runtime->running, 1,
-                              memory_order_relaxed);
-    if (state == KORO_DORMANT)
-        atomic_fetch_add_explicit(&runtime->resumes, 1,
-                                  memory_order_relaxed);
-
-    void *result = koro_cont_step(continuation);
-    atomic_fetch_sub_explicit(&runtime->running, 1,
-                              memory_order_relaxed);
-    if (result || continuation->completed) {
-        kc_runtime_retire_service_internal(runtime, continuation);
-        if (continuation->tracked) {
-            continuation->tracked = 0;
-            atomic_fetch_sub_explicit(&runtime->active, 1,
-                                      memory_order_relaxed);
-        }
-        /* DONE is the retirement acknowledgement. No owner bit remains and
-         * no service field is touched after this release publication. */
-        atomic_store_explicit(&continuation->run_state, KORO_DONE,
-                              memory_order_release);
-    } else {
-        atomic_store_explicit(&continuation->run_state, KORO_DORMANT,
-                              memory_order_release);
-    }
-    kc_runtime_signal_lifecycle_internal(runtime);
 }

@@ -16,10 +16,10 @@ The live ownership split is:
 | Domain | Owner | Execution contract |
 | --- | --- | --- |
 | capture/playback device callbacks | platform/CPAL with thin Rust closures | bounded native lease write or drain, publish edge, return |
-| host voice state/UI delivery | one Rust `kcoro_sys::Service` | retained stackless callback on one fixed runtime worker |
-| native session coordination/delivery | native `kc_service` continuations | callback-driven, exact tickets, no polling thread |
-| native route/bridge/supervision | engine `kc_service` continuations | one explicit one-worker control runtime |
-| numerical work | one engine `kc_team` | fixed non-stealing members; one active generation |
+| host voice state/UI delivery | one Rust `kcoro_sys::Service` | owner-affine only where a platform handle is genuinely `!Send` |
+| native session coordination/delivery | native `kc_service` continuations | callback-driven, exact tickets, migratable on the bounded pool |
+| native route/bridge/supervision | saved bridge frame plus retained route/supervisor services | same bounded pool as the numerical lanes |
+| numerical work | one engine `kc_team` | fixed logical members on kcoro workers; one active generation |
 | model math | architecture leaves and explicit Accelerate/AMX seams | pointer/stride views; no Rust numerical body |
 
 ## Rust host
@@ -43,10 +43,13 @@ are response telemetry only and do not decide speech boundaries.
 
 ## kcoro runtime workers
 
-`kc_runtime` owns a fixed worker set. Every `kc_service` is permanently bound to
-one worker and one ready bit in that worker's bounded bitmap. Producer
-notification is an atomic publication edge. There is no shared ready queue,
-work stealing, generic future executor, or task migration.
+`kc_runtime` owns a fixed worker set and a bounded atomic ready board. A
+stackless continuation retains its program counter, locals frame, and exact
+ticket independently of physical workers. Producer notification is an atomic
+publication edge; any free eligible worker may claim the frame. There is no
+work-stealing deque, generic future executor, or operation-owned thread. An
+explicit eligibility mask exists only for a genuinely thread-affine host
+resource.
 
 A service callback drains durable state and returns one of three outcomes:
 
@@ -54,21 +57,24 @@ A service callback drains durable state and returns one of three outcomes:
 - locally runnable again because bounded work remains;
 - terminal after stop/fault and admitted edges have settled.
 
-Only the resident runtime worker may enter expected-value dormancy. A model
-operation never creates a waiter or preserves a blocked stack.
+Only an otherwise-idle resident runtime worker may enter expected-value
+dormancy. A model operation creates no waiter and preserves no blocked native
+stack; its fixed stackless frame is the literal continuation.
 
 ## Flashkern fixed team
 
-The engine creates one stable `kc_team` with `kernel_lanes` members (eight by
-default). `kcoro_arena` owns the member threads, dispatch doorbell, stop, join,
-and generation entry/return stamps. Flashkern owns the lane-uniform numerical
-program and ticketed pass state.
+The engine creates one stable `kc_team` with `kernel_lanes` logical members
+(eight by default) on the same kcoro pool as its bridge and control services.
+`kcoro_arena` owns resumption, stop, and generation entry/return stamps;
+`kc_team` creates no pthread or private idle doorbell. Flashkern owns the
+lane-uniform numerical program and ticketed pass state.
 
 One generation is active at a time. All members observe the same generation,
 claim disjoint tiles, run a complete assembly leaf without yielding, record
-return, and become available. The final return invokes the continuation callback
-exactly once; that callback may publish the next eager stage generation without
-a host round trip.
+return, and become available. The final return invokes a minimal callback
+exactly once; that callback publishes the completed generation and resumes the
+exact suspended bridge ticket. A free kcoro worker continues at its saved
+program counter and may publish the next eager stage without a host round trip.
 
 The current implementation is one team, not two concurrently executing
 four-lane `BlockDomain`s. Logical block counters do not change that fact. A V2

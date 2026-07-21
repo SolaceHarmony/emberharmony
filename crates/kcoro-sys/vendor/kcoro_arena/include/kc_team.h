@@ -2,6 +2,8 @@
 #ifndef KC_TEAM_H
 #define KC_TEAM_H
 
+#include "kc_runtime.h"
+
 #include <stddef.h>
 #include <stdint.h>
 
@@ -10,16 +12,18 @@ extern "C" {
 #endif
 
 /*
- * Fixed-team execution is deliberately separate from the general continuation
- * executor.  Members never migrate or steal work.  One release-published
- * generation resumes every member, each member runs the supplied callback once,
- * and the final return completes that generation.
+ * A team is a fixed set of logical lane continuations mounted on one bounded
+ * kcoro runtime.  Member identity is stable, but physical workers are not:
+ * any free eligible worker may execute a member's uninterrupted numerical
+ * tile.  One release-published generation resumes every logical member and the
+ * final return completes that generation.
  */
 typedef struct kc_team kc_team_t;
 
 typedef void (*kc_team_member_fn)(void *context, uint32_t member,
                                   uint32_t members, uint64_t generation);
 typedef void (*kc_team_completion_fn)(void *context, uint64_t generation);
+typedef void (*kc_team_retired_fn)(void *context, uint64_t last_generation);
 
 typedef struct kc_team_config {
     uint32_t size;
@@ -28,6 +32,9 @@ typedef struct kc_team_config {
     uint32_t reserved;
     kc_team_member_fn member;
     void *context;
+    kc_runtime_t *runtime;
+    kc_team_retired_fn retired;
+    void *retired_context;
 } kc_team_config;
 
 typedef struct kc_team_snapshot {
@@ -75,9 +82,8 @@ int kc_team_dispatch_notify(kc_team_t *team, uint64_t generation,
                             kc_team_completion_fn completion, void *context);
 void kc_team_request_stop(kc_team_t *team);
 /*
- * Terminal teardown only. The stop edge may already be published or may be
- * published by the terminal completion callback. Returns -EDEADLK from this
- * team's member or completion callback.
+ * Terminal acknowledgement only; it never parks.  Returns -EBUSY until every
+ * logical member has consumed the stop edge and reached DONE.
  */
 int kc_team_join(kc_team_t *team);
 int kc_team_destroy(kc_team_t *team);

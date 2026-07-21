@@ -212,14 +212,20 @@ LFM_INTERNAL_API int lfm_resampler_process_spans(
     const LfmF32SpanChain *input, float *destination,
     uint64_t destination_capacity, LfmF32SpanChain *result);
 
-// Conversation-owned streaming rate converter. Unlike the offline sinc path
-// above, this retains the preceding sample and exact reduced-rate phase across
-// calls, so chunk boundaries are numerically invisible. The maximum admitted
-// input span is fixed at creation; execution writes directly into the caller's
-// final destination and never allocates or owns an output plane. Its immutable
-// rate plan and mutable continuity state are fixed scalars. Per-sample linear
-// interpolation executes in the architecture leaf; C++ only validates the
-// borrowed views and advances the bounded phase/history state.
+// Conversation-owned streaming band-limited rate converter. It uses the same
+// immutable sinc/Hann polyphase table as the offline path, causalized by a
+// fixed `width + reduced_input_rate - 1` source-sample group delay. For Mimi's
+// 24 kHz -> 16 kHz path that is 12 source samples (8 device samples); its
+// 23-tap support reaches back 22 source samples, and the circular carry keeps
+// one additional sample for a phase-stride boundary. Chunk boundaries are
+// numerically invisible. Process emits only the duration-aligned
+// ceil(total_input * new/orig) prefix: it does not implicitly feed terminal
+// zeros. A caller that needs the delayed FIR tail must submit zeros explicitly;
+// reset deliberately discards that tail. The maximum admitted input span is
+// fixed at creation; execution writes directly into the caller's final
+// destination and never owns an output plane. Convolution and circular-history
+// carry execute in the architecture leaf; C++ owns table setup, borrowed-view
+// validation, and continuity-state commits.
 LFM_ORACLE_API int lfm_resampler_stream_create(
     uint32_t orig_freq, uint32_t new_freq, uint64_t max_sample_count,
     LfmResamplerStream **out);

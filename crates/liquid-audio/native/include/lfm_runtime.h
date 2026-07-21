@@ -52,7 +52,14 @@ typedef struct LfmModelMemoryV1 {
     uint32_t load_tasks;
     uint32_t payload_read_coverage;
     uint32_t accounting_flags;
-    uint64_t reserved[4];
+    /* A conversation seals its numerical allocation geometry after its first
+     * complete capture-plus-playback preparation. These counters aggregate
+     * later rejected attempts across the model's conversations. Bytes are the
+     * logical numerical capacity requested at the rejecting boundary, not
+     * allocator metadata or an estimate of opaque object overhead. */
+    uint64_t post_readiness_allocation_attempts;
+    uint64_t post_readiness_allocation_bytes;
+    uint64_t reserved[2];
 } LfmModelMemoryV1;
 
 typedef struct LfmRuntimeConfigV1 {

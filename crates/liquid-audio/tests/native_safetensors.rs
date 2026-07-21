@@ -106,7 +106,9 @@ struct ModelMemory {
     load_tasks: u32,
     payload_read_coverage: u32,
     accounting_flags: u32,
-    reserved: [u64; 4],
+    post_readiness_allocation_attempts: u64,
+    post_readiness_allocation_bytes: u64,
+    reserved: [u64; 2],
 }
 
 #[repr(C)]
@@ -214,6 +216,13 @@ extern "C" {
         out_read_status: *mut i32,
         out_weight_status: *mut i32,
         out_policy_status: *mut i32,
+    ) -> i32;
+    fn lfm_internal_conversation_allocation_seal_test(
+        after_compatible: *mut ModelMemory,
+        after_rejected: *mut ModelMemory,
+        out_growth_status: *mut i32,
+        out_capture_rate_status: *mut i32,
+        out_playback_rate_status: *mut i32,
     ) -> i32;
     fn lfm_internal_model_source_gate_test(
         path: *const c_char,
@@ -1662,10 +1671,59 @@ fn model_accounting_counts_before_and_rejects_after_publication() {
     assert_eq!(memory.compatibility_copied_bytes, BYTES as u64);
     assert_eq!(memory.post_publication_materialization_attempts, 1);
     assert_eq!(memory.post_publication_materialization_bytes, BYTES as u64);
+    assert_eq!(memory.post_readiness_allocation_attempts, 0);
+    assert_eq!(memory.post_readiness_allocation_bytes, 0);
     assert_eq!(memory.payload_read_coverage, PAYLOAD_CONFIG);
     assert_eq!(
         memory.accounting_flags & PAYLOAD_READS_COMPLETE,
         PAYLOAD_READS_COMPLETE
+    );
+}
+
+#[test]
+fn conversation_readiness_seal_rejects_numerical_reallocation_before_mutation() {
+    let mut compatible = ModelMemory {
+        size: std::mem::size_of::<ModelMemory>() as u32,
+        abi_version: MODEL_ABI,
+        ..Default::default()
+    };
+    let mut rejected = ModelMemory {
+        size: std::mem::size_of::<ModelMemory>() as u32,
+        abi_version: MODEL_ABI,
+        ..Default::default()
+    };
+    let mut growth = 0;
+    let mut capture = 0;
+    let mut playback = 0;
+    assert_eq!(
+        unsafe {
+            lfm_internal_conversation_allocation_seal_test(
+                &mut compatible,
+                &mut rejected,
+                &mut growth,
+                &mut capture,
+                &mut playback,
+            )
+        },
+        0
+    );
+
+    assert_eq!(compatible.post_readiness_allocation_attempts, 0);
+    assert_eq!(compatible.post_readiness_allocation_bytes, 0);
+    assert_eq!(growth, PERMISSION, "capture high-water growth was admitted");
+    assert_eq!(
+        capture, PERMISSION,
+        "capture-rate plan replacement was admitted"
+    );
+    assert_eq!(
+        playback, PERMISSION,
+        "playback-rate plan replacement was admitted"
+    );
+    assert_eq!(rejected.post_readiness_allocation_attempts, 3);
+    assert_eq!(
+        rejected.post_readiness_allocation_bytes,
+        53_760,
+        "logical bytes must cover 6,400-frame growth, 3,200-frame capture-plan replacement, and one 24 kHz Mimi playback plane"
     );
 }
 
@@ -1744,6 +1802,8 @@ fn opaque_native_model_reports_single_image_accounting() {
     assert_eq!(memory.post_publication_read_bytes, 0);
     assert_eq!(memory.post_publication_materialization_attempts, 0);
     assert_eq!(memory.post_publication_materialization_bytes, 0);
+    assert_eq!(memory.post_readiness_allocation_attempts, 0);
+    assert_eq!(memory.post_readiness_allocation_bytes, 0);
     assert_eq!(
         memory.payload_read_coverage,
         PAYLOAD_CONFIG | PAYLOAD_WEIGHT_IMAGE

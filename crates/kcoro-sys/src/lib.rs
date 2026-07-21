@@ -105,7 +105,7 @@ fn status(code: i32) -> Result<(), i32> {
     Ok(())
 }
 
-/// Setup parameters for a [`Runtime`]. Zero workers selects one fixed owner.
+/// Setup parameters for a [`Runtime`]. Zero workers selects one pool worker.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RuntimeConfig {
     pub workers: u32,
@@ -787,8 +787,9 @@ impl ServiceSetup {
     }
 }
 
-// Each native service has one permanent worker owner. Producer edges use only
-// atomics; the owner invokes the Send closure serially.
+// A normal native service is one serial logical continuation whose physical
+// worker may change after suspension. Producer edges use only atomics. The
+// owner-state factory is the explicit exception for genuinely !Send state.
 unsafe impl Send for ServiceInner {}
 unsafe impl Sync for ServiceInner {}
 

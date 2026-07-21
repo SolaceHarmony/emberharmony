@@ -4545,6 +4545,18 @@ SessionProgress session_step(LfmSession *session) {
 
 void coordinator_main(void *context) {
     LfmSession *session = static_cast<LfmSession *>(context);
+    /* kc_service_start publishes its retained continuation once so owner
+     * initialization can run. A pre-created realtime endpoint can also race a
+     * notification into the narrow interval between service start and the
+     * readiness publication. Neither edge may enter numerical/session work
+     * until start publishes RUNNING; the explicit post-publication notify is
+     * their only successor. Stop is admitted so a partially-started service
+     * can still retire after a start failure. */
+    if (session->state.load(std::memory_order_acquire) !=
+            LFM_SESSION_RUNNING &&
+        !session->stop.load(std::memory_order_acquire)) {
+        return;
+    }
     const SessionProgress progress = session_step(session);
     publish_playback_policy_snapshot(session);
     publish_capture_supervision_snapshot(session);
@@ -4657,6 +4669,11 @@ DeliveryProgress delivery_step(LfmSession *session) {
 
 void delivery_main(void *context) {
     LfmSession *session = static_cast<LfmSession *>(context);
+    if (session->state.load(std::memory_order_acquire) !=
+            LFM_SESSION_RUNNING &&
+        !session->stop.load(std::memory_order_acquire)) {
+        return;
+    }
     if (delivery_step(session) != DELIVERY_READY) return;
     const int status = kc_service_ready_again(session->delivery);
     if (status != 0 && status != -ECANCELED) {
@@ -4676,8 +4693,7 @@ bool register_session_locked(LfmRuntime *runtime, LfmSession *session) {
     return false;
 }
 
-void unregister_session(LfmRuntime *runtime, LfmSession *session) {
-    std::lock_guard<std::mutex> guard(runtime->children_mutex);
+void unregister_session_locked(LfmRuntime *runtime, LfmSession *session) {
     for (uint32_t i = 0; i < runtime->session_capacity; ++i) {
         if (runtime->sessions[i] == session) {
             runtime->sessions[i] = nullptr;
@@ -4685,6 +4701,11 @@ void unregister_session(LfmRuntime *runtime, LfmSession *session) {
             return;
         }
     }
+}
+
+void unregister_session(LfmRuntime *runtime, LfmSession *session) {
+    std::lock_guard<std::mutex> guard(runtime->children_mutex);
+    unregister_session_locked(runtime, session);
 }
 
 int submit_text(LfmSession *session, const char *utf8, size_t utf8_bytes,
@@ -5233,8 +5254,18 @@ int lfm_session_create(LfmRuntime *runtime, LfmModel *model,
                                    &session->delivery_notifier) != 0) {
         rc = LFM_STATUS_INTERNAL;
     }
-    if (rc == 0 && !register_session_locked(runtime, session)) {
-        rc = LFM_STATUS_BUSY;
+    bool registered = false;
+    if (rc == 0) {
+        registered = register_session_locked(runtime, session);
+        if (!registered) rc = LFM_STATUS_BUSY;
+    }
+    /* Scope roles, native deadline sources, and every GCD timer are readiness
+     * storage. Construct and seal them while the session is still private and
+     * CREATED; start is consequently an allocation-free state publication. */
+    if (rc == 0) rc = capture_supervision_create(session);
+    if (rc != 0 && registered) {
+        unregister_session_locked(runtime, session);
+        registered = false;
     }
     if (rc != 0) {
         if (session->delivery_notifier) {
@@ -5271,38 +5302,13 @@ int lfm_session_start(LfmSession *session) {
     if (session->stop.load(std::memory_order_acquire)) {
         return LFM_STATUS_CANCELLED;
     }
-    uint32_t expected = LFM_SESSION_CREATED;
-    if (!session->state.compare_exchange_strong(expected, LFM_SESSION_RUNNING,
-                                                std::memory_order_acq_rel,
-                                                std::memory_order_acquire)) {
+    if (session->state.load(std::memory_order_acquire) !=
+        LFM_SESSION_CREATED) {
         return LFM_STATUS_BUSY;
     }
     int rc = kc_service_start(session->delivery);
-    if (rc != 0) {
-        session->state.store(LFM_SESSION_CREATED, std::memory_order_release);
-        return rc;
-    }
+    if (rc != 0) return rc;
     session->delivery_started = true;
-    /* Seal the turn scope and its deadline source before the coordinator is
-     * admitted. Capture callbacks may have published complete chunks while
-     * the session was CREATED; the first coordinator step must therefore see
-     * the supervision graph already present. */
-    rc = capture_supervision_create(session);
-    if (rc != 0) {
-        request_stop(session, rc);
-        kc_service_request_stop(session->delivery);
-        session->start_cleanup = true;
-        owner.unlock();
-        lifecycle.unlock();
-        (void)kc_service_join(session->delivery);
-        lifecycle.lock();
-        session->delivery_started = false;
-        session->services_joined = true;
-        session->start_cleanup = false;
-        session->state.store(LFM_SESSION_SERVICES_JOINED,
-                             std::memory_order_release);
-        return rc;
-    }
     rc = kc_service_start(session->coordinator);
     if (rc != 0) {
         request_stop(session, rc);
@@ -5324,6 +5330,11 @@ int lfm_session_start(LfmSession *session) {
         return rc;
     }
     session->coordinator_started = true;
+    /* Starting a retained service only publishes its owner-initialization
+     * continuation; with zero notifications its callback remains dormant.
+     * Both services and every setup allocation are therefore complete before
+     * this release makes product work admissible. */
+    session->state.store(LFM_SESSION_RUNNING, std::memory_order_release);
     notify_session(session);
     return 0;
 }
@@ -5372,6 +5383,7 @@ int lfm_session_join(LfmSession *session) {
     if (!session) return LFM_STATUS_INVALID_ARGUMENT;
     std::lock_guard<std::mutex> join(session->join_mutex);
     bool unstarted = false;
+    bool stop_source = false;
     {
         std::lock_guard<std::mutex> lifecycle(session->lifecycle_mutex);
         const uint32_t state = session->state.load(std::memory_order_acquire);
@@ -5393,11 +5405,21 @@ int lfm_session_join(LfmSession *session) {
             // under the same transition lock as start makes that choice final.
             request_stop(session, 0);
             unstarted = true;
+            if (session->capture_supervision.source &&
+                !session->capture_supervision.source_stop_requested) {
+                session->capture_supervision.source_stop_requested = true;
+                stop_source = true;
+            }
         }
         if (!session->stop.load(std::memory_order_acquire) &&
             state != LFM_SESSION_CREATED) {
             return LFM_STATUS_BUSY;
         }
+    }
+
+    if (stop_source) {
+        kc_deadline_source_request_stop(
+            session->capture_supervision.source);
     }
 
     if (unstarted) {
@@ -5433,6 +5455,11 @@ int lfm_session_join(LfmSession *session) {
         session->services_joined = true;
         session->state.store(LFM_SESSION_SERVICES_JOINED,
                              std::memory_order_release);
+    }
+    if (session->capture_supervision.source_stop_requested) {
+        const int status = kc_deadline_source_join(
+            session->capture_supervision.source);
+        if (status != 0) return status;
     }
     if (session->capture_supervision.source) {
         const int status = kc_deadline_source_destroy(
@@ -5653,29 +5680,25 @@ int lfm_capture_chunk_producer_create(LfmSession *session, uint64_t stream,
         return LFM_STATUS_INVALID_ARGUMENT;
     }
     *out = nullptr;
+    std::lock_guard<std::mutex> lifecycle(session->lifecycle_mutex);
+    if (session->state.load(std::memory_order_acquire) !=
+            LFM_SESSION_CREATED ||
+        session->stop.load(std::memory_order_acquire)) {
+        return LFM_STATUS_CANCELLED;
+    }
+    if (session->capture_producers.load(std::memory_order_acquire) != 0 ||
+        session->retired_chunk_producer != nullptr ||
+        !session->capture_arena.samples ||
+        session->capture_arena.capacity_frames == 0 ||
+        !capture_chunk_empty(session->capture_chunks) ||
+        capture_range_live(session->capture_arena) != 0) {
+        return LFM_STATUS_BUSY;
+    }
+    /* Allocation occurs inside CREATED admission. A racing start owns this
+     * same mutex, so no physical endpoint can appear after readiness. */
     LfmCaptureProducer *producer =
         new (std::nothrow) LfmCaptureProducer();
     if (!producer) return LFM_STATUS_OUT_OF_MEMORY;
-    {
-        std::lock_guard<std::mutex> lifecycle(session->lifecycle_mutex);
-        const uint32_t state = session->state.load(std::memory_order_acquire);
-        if ((state != LFM_SESSION_CREATED && state != LFM_SESSION_RUNNING) ||
-            session->stop.load(std::memory_order_acquire)) {
-            delete producer;
-            return LFM_STATUS_CANCELLED;
-        }
-        if (session->capture_producers.load(std::memory_order_acquire) != 0 ||
-            session->retired_chunk_producer != nullptr ||
-            !session->capture_arena.samples ||
-            session->capture_arena.capacity_frames == 0 ||
-            !capture_chunk_empty(session->capture_chunks) ||
-            capture_range_live(session->capture_arena) != 0) {
-            delete producer;
-            return LFM_STATUS_BUSY;
-        }
-        session->capture_producers.store(1, std::memory_order_release);
-    }
-
     producer->session = session;
     producer->stream = stream;
     producer->lane = lane;
@@ -5685,6 +5708,7 @@ int lfm_capture_chunk_producer_create(LfmSession *session, uint64_t stream,
      * ticket newer than every action already admitted to this runtime. */
     producer->transport_sequence.store(0, std::memory_order_relaxed);
     producer->transport_epoch.store(0, std::memory_order_relaxed);
+    session->capture_producers.store(1, std::memory_order_release);
     session->chunk_producer.store(producer, std::memory_order_release);
     *out = producer;
     return 0;
@@ -6078,27 +6102,23 @@ int lfm_playback_consumer_create(LfmSession *session,
                                  LfmPlaybackConsumer **out) {
     if (!session || !out) return LFM_STATUS_INVALID_ARGUMENT;
     *out = nullptr;
+    std::lock_guard<std::mutex> lifecycle(session->lifecycle_mutex);
+    if (session->state.load(std::memory_order_acquire) !=
+            LFM_SESSION_CREATED ||
+        session->stop.load(std::memory_order_acquire)) {
+        return LFM_STATUS_CANCELLED;
+    }
+    /* PlaybackPool::head is a single-consumer cursor. Make that ownership a
+     * lifecycle invariant instead of trusting callers not to clone the
+     * hardware endpoint. */
+    if (session->playback_consumers.load(std::memory_order_acquire) != 0) {
+        return LFM_STATUS_BUSY;
+    }
     LfmPlaybackConsumer *consumer =
         new (std::nothrow) LfmPlaybackConsumer();
     if (!consumer) return LFM_STATUS_OUT_OF_MEMORY;
-    {
-        std::lock_guard<std::mutex> lifecycle(session->lifecycle_mutex);
-        const uint32_t state = session->state.load(std::memory_order_acquire);
-        if ((state != LFM_SESSION_CREATED && state != LFM_SESSION_RUNNING) ||
-            session->stop.load(std::memory_order_acquire)) {
-            delete consumer;
-            return LFM_STATUS_CANCELLED;
-        }
-        /* PlaybackPool::head is a single-consumer cursor. Make that ownership a
-         * lifecycle invariant instead of trusting callers not to clone the
-         * hardware endpoint. */
-        if (session->playback_consumers.load(std::memory_order_acquire) != 0) {
-            delete consumer;
-            return LFM_STATUS_BUSY;
-        }
-        session->playback_consumers.store(1, std::memory_order_release);
-    }
     consumer->session = session;
+    session->playback_consumers.store(1, std::memory_order_release);
     *out = consumer;
     return 0;
 }
@@ -6277,23 +6297,19 @@ int lfm_session_control_create(LfmSession *session,
                                LfmSessionControl **out) {
     if (!session || !out) return LFM_STATUS_INVALID_ARGUMENT;
     *out = nullptr;
+    std::lock_guard<std::mutex> lifecycle(session->lifecycle_mutex);
+    if (session->state.load(std::memory_order_acquire) !=
+            LFM_SESSION_CREATED ||
+        session->stop.load(std::memory_order_acquire)) {
+        return LFM_STATUS_CANCELLED;
+    }
+    if (session->control_handles == UINT32_MAX) {
+        return LFM_STATUS_OUT_OF_MEMORY;
+    }
     LfmSessionControl *control = new (std::nothrow) LfmSessionControl();
     if (!control) return LFM_STATUS_OUT_OF_MEMORY;
-    {
-        std::lock_guard<std::mutex> lifecycle(session->lifecycle_mutex);
-        const uint32_t state = session->state.load(std::memory_order_acquire);
-        if ((state != LFM_SESSION_CREATED && state != LFM_SESSION_RUNNING) ||
-            session->stop.load(std::memory_order_acquire)) {
-            delete control;
-            return LFM_STATUS_CANCELLED;
-        }
-        if (session->control_handles == UINT32_MAX) {
-            delete control;
-            return LFM_STATUS_OUT_OF_MEMORY;
-        }
-        session->control_handles++;
-    }
     control->session = session;
+    session->control_handles++;
     *out = control;
     return 0;
 }

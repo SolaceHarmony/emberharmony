@@ -8,4 +8,3 @@ struct koro_cont;
 /* runtime->mu is held by the caller. */
 void kc_service_runtime_stop_locked(struct kc_runtime *runtime);
 struct koro_cont *kc_service_continuation_internal(struct kc_service *service);
-void kc_service_runtime_execute_internal(struct kc_service *service);

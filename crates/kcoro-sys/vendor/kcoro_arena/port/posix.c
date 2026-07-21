@@ -17,6 +17,8 @@
 #include <unistd.h>
 
 #if defined(__APPLE__)
+#include <mach/mach.h>
+#include <mach/thread_info.h>
 #include <os/os_sync_wait_on_address.h>
 #elif defined(__linux__)
 #include <linux/futex.h>
@@ -263,6 +265,37 @@ static void kc_port_wake_u32(kc_port_wait_word *word, int all)
 void kc_port_wake_u32_one(kc_port_wait_word *word) { kc_port_wake_u32(word, 0); }
 void kc_port_wake_u32_all(kc_port_wait_word *word) { kc_port_wake_u32(word, 1); }
 
+int kc_port_wait_u32_signal_acquire(kc_port_wait_word *word,
+                                    kc_port_wait_signal *signal)
+{
+    if (!signal) return -EINVAL;
+    signal->word = NULL;
+    int entered = kc_wait_enter(word);
+    if (entered != 0) return entered;
+    signal->word = word;
+    return 0;
+}
+
+void kc_port_wait_u32_signal_one(const kc_port_wait_signal *signal)
+{
+    if (!signal || !signal->word) return;
+    kc_wait_wake_native(signal->word, 0);
+}
+
+void kc_port_wait_u32_signal_all(const kc_port_wait_signal *signal)
+{
+    if (!signal || !signal->word) return;
+    kc_wait_wake_native(signal->word, 1);
+}
+
+void kc_port_wait_u32_signal_release(kc_port_wait_signal *signal)
+{
+    if (!signal || !signal->word) return;
+    kc_port_wait_word *word = signal->word;
+    signal->word = NULL;
+    kc_wait_leave(word);
+}
+
 int kc_port_wait_u32_wake_is_realtime_safe(const kc_port_wait_word *word)
 {
     if (!word || !atomic_is_lock_free(&word->gate)) return 0;
@@ -280,14 +313,30 @@ int kc_port_wait_u32_wake_is_realtime_safe(const kc_port_wait_word *word)
     }
 }
 
+static unsigned kc_wait_close(kc_port_wait_word *word)
+{
+    unsigned before = atomic_fetch_or_explicit(&word->gate, KC_WAIT_CLOSED,
+                                               memory_order_acq_rel);
+    if (!(before & KC_WAIT_CLOSED)) {
+        kc_atomic_u32_fetch_add_release(word->address, 1);
+        kc_wait_wake_native(word, 1);
+    }
+    return before;
+}
+
+int kc_port_wait_u32_close(kc_port_wait_word *word,
+                           uint32_t *out_admitted)
+{
+    if (!word || !out_admitted) return -EINVAL;
+    unsigned before = kc_wait_close(word);
+    *out_admitted = before & KC_WAIT_COUNT;
+    return before & KC_WAIT_CLOSED ? -EALREADY : 0;
+}
+
 void kc_port_wait_u32_release(kc_port_wait_word *word)
 {
     if (!word) return;
-    unsigned before = atomic_fetch_or_explicit(&word->gate, KC_WAIT_CLOSED,
-                                               memory_order_acq_rel);
-    if (before & KC_WAIT_CLOSED) return;
-    kc_atomic_u32_fetch_add_release(word->address, 1);
-    kc_wait_wake_native(word, 1);
+    (void)kc_wait_close(word);
 
     pthread_mutex_lock(&word->mutex);
     pthread_cond_broadcast(&word->cond);
@@ -317,6 +366,34 @@ void kc_port_thread_join(kc_port_thread *thread)
     if (!thread) return;
     pthread_join(thread->value, NULL);
     free(thread);
+}
+
+int kc_port_thread_cpu_ns(const kc_port_thread *thread, uint64_t *out_ns)
+{
+    if (!thread || !out_ns) return -EINVAL;
+#if defined(__APPLE__)
+    thread_basic_info_data_t info;
+    mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
+    kern_return_t status = thread_info(
+        pthread_mach_thread_np(thread->value), THREAD_BASIC_INFO,
+        (thread_info_t)&info, &count);
+    if (status != KERN_SUCCESS) return -EIO;
+    *out_ns =
+        ((uint64_t)info.user_time.seconds +
+         (uint64_t)info.system_time.seconds) * UINT64_C(1000000000) +
+        ((uint64_t)info.user_time.microseconds +
+         (uint64_t)info.system_time.microseconds) * UINT64_C(1000);
+    return 0;
+#else
+    clockid_t clock_id;
+    int status = pthread_getcpuclockid(thread->value, &clock_id);
+    if (status != 0) return -status;
+    struct timespec value;
+    if (clock_gettime(clock_id, &value) != 0) return -errno;
+    *out_ns = (uint64_t)value.tv_sec * UINT64_C(1000000000) +
+              (uint64_t)value.tv_nsec;
+    return 0;
+#endif
 }
 
 unsigned kc_port_cpu_count(void)

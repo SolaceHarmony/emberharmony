@@ -80,6 +80,8 @@ struct ModelAccounting {
     std::atomic<uint64_t> compatibility_copied_bytes{0};
     std::atomic<uint64_t> post_publication_materialization_attempts{0};
     std::atomic<uint64_t> post_publication_materialization_bytes{0};
+    std::atomic<uint64_t> post_readiness_allocation_attempts{0};
+    std::atomic<uint64_t> post_readiness_allocation_bytes{0};
     std::atomic<uint32_t> payload_read_coverage{0};
     std::atomic<uint32_t> installed_sources{0};
     std::atomic<uint32_t> flags{0};
@@ -187,6 +189,13 @@ struct ModelAccounting {
             return -EINVAL;
         }
         return 0;
+    }
+
+    int reject_allocation(uint64_t bytes) {
+        int status = add_counter(&post_readiness_allocation_attempts, 1);
+        if (status != 0) return status;
+        status = add_counter(&post_readiness_allocation_bytes, bytes);
+        return status == 0 ? -EPERM : status;
     }
 
     int publish(uint32_t required_sources) {
@@ -607,6 +616,7 @@ struct LfmConversation {
     uint32_t prepared_rate = 0;
     size_t playback_frames = 0;
     uint32_t playback_rate = 0;
+    bool allocation_sealed = false;
     bool hidden_ready = false;
     uint32_t modality = 1;
     uint32_t modality_left = 0;
@@ -957,6 +967,23 @@ int reset_memory(LfmConversation &conversation) {
     return 0;
 }
 
+uint64_t logical_capture_bytes(size_t samples) {
+    return samples > UINT64_MAX / sizeof(float)
+        ? UINT64_MAX
+        : (uint64_t)samples * sizeof(float);
+}
+
+uint64_t logical_playback_bytes(const LfmModel &model, uint32_t sample_rate) {
+    if (model.codec_rate == 0) return UINT64_MAX;
+    const uint64_t numerator =
+        (uint64_t)LFM_MIMI_PCM_CAPACITY * sample_rate;
+    const uint64_t frames =
+        (numerator + model.codec_rate - 1) / model.codec_rate;
+    return frames > UINT64_MAX / sizeof(float)
+        ? UINT64_MAX
+        : frames * sizeof(float);
+}
+
 int prepare_playback_claimed(LfmConversation &conversation,
                              uint32_t sample_rate,
                              size_t *out_playback_frames) {
@@ -973,6 +1000,10 @@ int prepare_playback_claimed(LfmConversation &conversation,
           conversation.playback_resampler_stream))) {
         *out_playback_frames = conversation.playback_frames;
         return 0;
+    }
+    if (conversation.allocation_sealed) {
+        return model->accounting.reject_allocation(
+            logical_playback_bytes(*model, sample_rate));
     }
 
     LfmResamplerStream *stream = nullptr;
@@ -1017,15 +1048,44 @@ int prepare_pcm_claimed(LfmConversation &conversation, size_t max_sample_count,
     if (!model || !model->frontend || !model->conformer ||
         !conversation.frontend_workspace || !conversation.conformer_workspace ||
         max_sample_count == 0 || capture_rate == 0 || playback_rate == 0 ||
-        model->preprocessor_rate == 0 ||
+        model->preprocessor_rate == 0 || model->codec_rate == 0 ||
         model->mel_features == 0 || model->hidden == 0) {
         return -EINVAL;
     }
-    if (conversation.resampler && conversation.resampler_workspace &&
+    const bool capture_ready =
+        conversation.resampler && conversation.resampler_workspace &&
         conversation.prepared_rate == capture_rate &&
-        conversation.prepared_samples >= max_sample_count) {
-        return prepare_playback_claimed(conversation, playback_rate,
-                                        out_playback_frames);
+        conversation.prepared_samples >= max_sample_count;
+    const bool playback_ready =
+        conversation.playback_rate == playback_rate &&
+        conversation.playback_frames != 0 &&
+        ((playback_rate == model->codec_rate &&
+          !conversation.playback_resampler_stream) ||
+         (playback_rate != model->codec_rate &&
+          conversation.playback_resampler_stream));
+    if (conversation.allocation_sealed) {
+        if (capture_ready && playback_ready) {
+            *out_playback_frames = conversation.playback_frames;
+            return 0;
+        }
+        uint64_t requested = 0;
+        if (!capture_ready) {
+            requested = logical_capture_bytes(max_sample_count);
+        }
+        if (!playback_ready) {
+            const uint64_t bytes =
+                logical_playback_bytes(*model, playback_rate);
+            requested = bytes > UINT64_MAX - requested
+                ? UINT64_MAX
+                : requested + bytes;
+        }
+        return model->accounting.reject_allocation(requested);
+    }
+    if (capture_ready) {
+        const int status = prepare_playback_claimed(
+            conversation, playback_rate, out_playback_frames);
+        if (status == 0) conversation.allocation_sealed = true;
+        return status;
     }
 
     LfmResampler *plan = nullptr;
@@ -1091,8 +1151,10 @@ int prepare_pcm_claimed(LfmConversation &conversation, size_t max_sample_count,
     conversation.resampler_workspace = workspace;
     conversation.prepared_samples = max_sample_count;
     conversation.prepared_rate = capture_rate;
-    return prepare_playback_claimed(conversation, playback_rate,
-                                    out_playback_frames);
+    status = prepare_playback_claimed(conversation, playback_rate,
+                                      out_playback_frames);
+    if (status == 0) conversation.allocation_sealed = true;
+    return status;
 }
 
 int encode_text(LfmConversation &conversation, const char *text,
@@ -2840,6 +2902,12 @@ extern "C" int lfm_model_memory(const LfmModel *model, LfmModelMemoryV1 *out) {
                 std::memory_order_acquire),
         .accounting_flags = model->accounting.flags.load(
             std::memory_order_acquire),
+        .post_readiness_allocation_attempts =
+            model->accounting.post_readiness_allocation_attempts.load(
+                std::memory_order_acquire),
+        .post_readiness_allocation_bytes =
+            model->accounting.post_readiness_allocation_bytes.load(
+                std::memory_order_acquire),
         .reserved = {},
     };
     return 0;
@@ -2876,6 +2944,99 @@ extern "C" LFM_INTERNAL_API int lfm_internal_playback_rate_contract_test(
     *out_playback_frames = (uint64_t)frames;
     *out_direct = conversation.playback_resampler_stream ? 0u : 1u;
     return 0;
+}
+
+/* Focused preparation-policy gate. The real capture resampler/workspace and
+ * playback stream are prepared through the production decision path. Opaque
+ * frontend/Conformer handles are never dereferenced because the capture
+ * high-water mark is already prepared; they only satisfy the same complete
+ * resource predicate a production conversation established immediately
+ * before this path. Every post-seal call below reaches prepare_pcm_claimed. */
+extern "C" LFM_INTERNAL_API int
+lfm_internal_conversation_allocation_seal_test(
+    LfmModelMemoryV1 *after_compatible, LfmModelMemoryV1 *after_rejected,
+    int *out_growth_status, int *out_capture_rate_status,
+    int *out_playback_rate_status) {
+    if (!after_compatible || after_compatible->size < sizeof(*after_compatible) ||
+        after_compatible->abi_version != LFM_MODEL_ABI_VERSION ||
+        !after_rejected || after_rejected->size < sizeof(*after_rejected) ||
+        after_rejected->abi_version != LFM_MODEL_ABI_VERSION ||
+        !out_growth_status || !out_capture_rate_status ||
+        !out_playback_rate_status) {
+        return -EINVAL;
+    }
+
+    LfmModel model;
+    model.preprocessor_rate = 16000;
+    model.codec_rate = LFM_MIMI_SAMPLE_RATE;
+    model.mel_features = 128;
+    model.hidden = 512;
+    model.frontend = reinterpret_cast<LfmFrontend *>(uintptr_t{1});
+    model.conformer = reinterpret_cast<LfmConformer *>(uintptr_t{1});
+
+    LfmConversation conversation;
+    conversation.model = &model;
+    int status = lfm_resampler_create(16000, model.preprocessor_rate,
+                                      &conversation.resampler);
+    if (status != 0) return status;
+    status = lfm_resampler_workspace_create(&conversation.resampler_workspace);
+    if (status != 0) return status;
+    status = lfm_resampler_workspace_reserve(
+        conversation.resampler, conversation.resampler_workspace, 3200);
+    if (status != 0) return status;
+    conversation.prepared_samples = 3200;
+    conversation.prepared_rate = 16000;
+    conversation.frontend_workspace =
+        reinterpret_cast<LfmFrontendWorkspace *>(uintptr_t{1});
+    conversation.conformer_workspace =
+        reinterpret_cast<LfmConformerWorkspace *>(uintptr_t{1});
+
+    size_t frames = 0;
+    status = prepare_pcm_claimed(conversation, 3200, 16000, 48000, &frames);
+    if (status == 0 && !conversation.allocation_sealed) status = -EFAULT;
+    if (status == 0) {
+        status = prepare_pcm_claimed(conversation, 3200, 16000, 48000,
+                                     &frames);
+    }
+    if (status == 0) {
+        status = prepare_pcm_claimed(conversation, 1600, 16000, 48000,
+                                     &frames);
+    }
+    if (status == 0) status = lfm_model_memory(&model, after_compatible);
+
+    LfmResampler *const capture_plan = conversation.resampler;
+    LfmResamplerWorkspace *const capture_workspace =
+        conversation.resampler_workspace;
+    LfmResamplerStream *const playback_plan =
+        conversation.playback_resampler_stream;
+    const size_t prepared_samples = conversation.prepared_samples;
+    const uint32_t prepared_rate = conversation.prepared_rate;
+    const size_t playback_frames = conversation.playback_frames;
+    const uint32_t playback_rate = conversation.playback_rate;
+    if (status == 0) {
+        *out_growth_status = prepare_pcm_claimed(
+            conversation, 6400, 16000, 48000, &frames);
+        *out_capture_rate_status = prepare_pcm_claimed(
+            conversation, 3200, 48000, 48000, &frames);
+        *out_playback_rate_status = prepare_pcm_claimed(
+            conversation, 3200, 16000, 24000, &frames);
+        if (conversation.resampler != capture_plan ||
+            conversation.resampler_workspace != capture_workspace ||
+            conversation.playback_resampler_stream != playback_plan ||
+            conversation.prepared_samples != prepared_samples ||
+            conversation.prepared_rate != prepared_rate ||
+            conversation.playback_frames != playback_frames ||
+            conversation.playback_rate != playback_rate) {
+            status = -EFAULT;
+        }
+    }
+    if (status == 0) status = lfm_model_memory(&model, after_rejected);
+
+    conversation.frontend_workspace = nullptr;
+    conversation.conformer_workspace = nullptr;
+    model.frontend = nullptr;
+    model.conformer = nullptr;
+    return status;
 }
 
 /* Focused non-production fault entry. The caller supplies tiny stack buffers;
@@ -2959,6 +3120,12 @@ extern "C" LFM_INTERNAL_API int lfm_internal_model_accounting_fault_test(
         .payload_read_coverage =
             accounting.payload_read_coverage.load(std::memory_order_acquire),
         .accounting_flags = accounting.flags.load(std::memory_order_acquire),
+        .post_readiness_allocation_attempts =
+            accounting.post_readiness_allocation_attempts.load(
+                std::memory_order_acquire),
+        .post_readiness_allocation_bytes =
+            accounting.post_readiness_allocation_bytes.load(
+                std::memory_order_acquire),
         .reserved = {},
     };
     return 0;

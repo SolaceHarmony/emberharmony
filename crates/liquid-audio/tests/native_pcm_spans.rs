@@ -134,6 +134,7 @@ unsafe extern "C" {
         out: *mut *mut ResamplerStream,
     ) -> c_int;
     fn lfm_resampler_stream_destroy(stream: *mut ResamplerStream) -> c_int;
+    fn lfm_resampler_stream_reset(stream: *mut ResamplerStream);
     fn lfm_resampler_stream_out_length(
         stream: *mut ResamplerStream,
         sample_count: u64,
@@ -184,6 +185,61 @@ fn chain(input: &[f32], split: usize) -> Chain {
         0
     );
     chain
+}
+
+fn stream(input: &[f32], chunks: &[usize], rate: u32) -> Vec<f32> {
+    assert_eq!(chunks.iter().sum::<usize>(), input.len());
+    let capacity = chunks.iter().copied().max().unwrap();
+    let mut stream = ptr::null_mut();
+    assert_eq!(
+        unsafe { lfm_resampler_stream_create(24_000, rate, capacity as u64, &mut stream) },
+        0
+    );
+    let mut output = Vec::new();
+    let mut offset = 0;
+    for &chunk in chunks {
+        let mut length = 0;
+        assert_eq!(
+            unsafe { lfm_resampler_stream_out_length(stream, chunk as u64, &mut length) },
+            0
+        );
+        let base = output.len();
+        output.resize(base + length as usize, 0.0);
+        let mut result = Span::default();
+        assert_eq!(
+            unsafe {
+                lfm_resampler_stream_process(
+                    stream,
+                    input.as_ptr().add(offset),
+                    chunk as u64,
+                    output.as_mut_ptr().add(base),
+                    length,
+                    &mut result,
+                )
+            },
+            0
+        );
+        assert_eq!(result.data, unsafe { output.as_ptr().add(base) });
+        assert_eq!(result.length, length);
+        offset += chunk;
+    }
+    assert_eq!(unsafe { lfm_resampler_stream_destroy(stream) }, 0);
+    output
+}
+
+fn irregular_chunks(length: usize) -> Vec<usize> {
+    let pattern = [1, 17, 511, 1_920, 73, 997, 24, 1_279];
+    let mut chunks = Vec::new();
+    let mut offset = 0;
+    for chunk in pattern.into_iter().cycle() {
+        if offset == length {
+            return chunks;
+        }
+        let chunk = chunk.min(length - offset);
+        chunks.push(chunk);
+        offset += chunk;
+    }
+    unreachable!()
 }
 
 #[test]
@@ -477,7 +533,201 @@ fn mimi_frames_keep_exact_duration_across_streaming_rate_boundaries() {
 }
 
 #[test]
-fn streaming_playback_interpolation_has_no_scalar_cpp_loop() {
+fn streaming_playback_matches_the_offline_sinc_after_its_causal_delay() {
+    let input = input(4_097);
+    let mut resampler = ptr::null_mut();
+    let mut workspace = ptr::null_mut();
+    assert_eq!(
+        unsafe { lfm_resampler_create(24_000, 16_000, &mut resampler) },
+        0
+    );
+    assert_eq!(unsafe { lfm_resampler_workspace_create(&mut workspace) }, 0);
+    assert_eq!(
+        unsafe { lfm_resampler_workspace_reserve(resampler, workspace, input.len() as u64) },
+        0
+    );
+    let mut length = 0;
+    assert_eq!(
+        unsafe { lfm_resampler_out_length(resampler, input.len() as u64, &mut length) },
+        0
+    );
+    let mut offline = vec![0.0f32; length as usize];
+    let mut result = Span::default();
+    assert_eq!(
+        unsafe {
+            lfm_resampler_process(
+                resampler,
+                workspace,
+                input.as_ptr(),
+                input.len() as u64,
+                offline.as_mut_ptr(),
+                offline.len() as u64,
+                &mut result,
+            )
+        },
+        0
+    );
+    assert_eq!(unsafe { lfm_resampler_workspace_destroy(workspace) }, 0);
+    assert_eq!(unsafe { lfm_resampler_destroy(resampler) }, 0);
+
+    let online = stream(&input, &irregular_chunks(input.len()), 16_000);
+    assert_eq!(online.len(), offline.len());
+    assert_eq!(
+        &online[8..],
+        &offline[..offline.len() - 8],
+        "the causal leaf must reuse the offline sinc table and operation order"
+    );
+}
+
+#[test]
+fn streaming_playback_sinc_preserves_passband_phase_across_chunks() {
+    const INPUT_RATE: f64 = 24_000.0;
+    const OUTPUT_RATE: f64 = 16_000.0;
+    const FREQUENCY: f64 = 1_000.0;
+    const AMPLITUDE: f64 = 0.5;
+    const DELAY: f64 = 12.0;
+    const LENGTH: usize = 1_920 * 8;
+
+    let input = (0..LENGTH)
+        .map(|index| {
+            (AMPLITUDE * (std::f64::consts::TAU * FREQUENCY * index as f64 / INPUT_RATE).sin())
+                as f32
+        })
+        .collect::<Vec<_>>();
+    let chunked = stream(&input, &irregular_chunks(input.len()), OUTPUT_RATE as u32);
+    let whole = stream(&input, &[input.len()], OUTPUT_RATE as u32);
+    assert_eq!(
+        chunked, whole,
+        "chunk boundaries changed a polyphase result bit"
+    );
+
+    let body = &chunked[256..];
+    let (sin, cos) = body
+        .iter()
+        .enumerate()
+        .fold((0.0, 0.0), |(sin, cos), (offset, &sample)| {
+            let index = offset + 256;
+            let angle = std::f64::consts::TAU
+                * FREQUENCY
+                * (index as f64 / OUTPUT_RATE - DELAY / INPUT_RATE);
+            (
+                sin + f64::from(sample) * angle.sin(),
+                cos + f64::from(sample) * angle.cos(),
+            )
+        });
+    let scale = 2.0 / body.len() as f64;
+    let gain = (sin.hypot(cos) * scale) / AMPLITUDE;
+    let phase = cos.atan2(sin);
+    assert!((gain - 1.0).abs() < 0.002, "passband gain={gain}");
+    assert!(phase.abs() < 0.002, "passband phase error={phase}");
+}
+
+#[test]
+fn streaming_playback_sinc_rejects_above_device_nyquist() {
+    const FREQUENCY: f64 = 10_000.0;
+    const AMPLITUDE: f64 = 0.5;
+    const LENGTH: usize = 1_920 * 8;
+
+    let input = (0..LENGTH)
+        .map(|index| {
+            (AMPLITUDE * (std::f64::consts::TAU * FREQUENCY * index as f64 / 24_000.0).sin()) as f32
+        })
+        .collect::<Vec<_>>();
+    let output = stream(&input, &irregular_chunks(input.len()), 16_000);
+    let body = &output[256..];
+    let rms = (body
+        .iter()
+        .map(|&sample| f64::from(sample).powi(2))
+        .sum::<f64>()
+        / body.len() as f64)
+        .sqrt();
+    let gain = rms / (AMPLITUDE / 2.0f64.sqrt());
+    assert!(gain < 0.01, "10 kHz stopband gain={gain}");
+}
+
+#[test]
+fn streaming_playback_causal_delay_and_terminal_tail_are_explicit() {
+    const FRAME: usize = 1_920;
+    let mut onset = vec![0.0f32; FRAME];
+    onset[0] = 1.0;
+    let output = stream(&onset, &[FRAME], 16_000);
+    let peak = output
+        .iter()
+        .enumerate()
+        .max_by(|left, right| left.1.abs().total_cmp(&right.1.abs()))
+        .unwrap()
+        .0;
+    assert_eq!(peak, 8, "12 source samples must be 8 device samples");
+
+    let mut stream = ptr::null_mut();
+    assert_eq!(
+        unsafe { lfm_resampler_stream_create(24_000, 16_000, FRAME as u64, &mut stream) },
+        0
+    );
+    let mut terminal = vec![0.0f32; FRAME];
+    terminal[FRAME - 1] = 1.0;
+    let mut first = vec![0.0f32; 1_280];
+    let mut result = Span::default();
+    assert_eq!(
+        unsafe {
+            lfm_resampler_stream_process(
+                stream,
+                terminal.as_ptr(),
+                FRAME as u64,
+                first.as_mut_ptr(),
+                first.len() as u64,
+                &mut result,
+            )
+        },
+        0
+    );
+    assert!(first.iter().all(|&sample| sample == 0.0));
+
+    let zeros = [0.0f32; 48];
+    let mut tail = [0.0f32; 32];
+    assert_eq!(
+        unsafe {
+            lfm_resampler_stream_process(
+                stream,
+                zeros.as_ptr(),
+                zeros.len() as u64,
+                tail.as_mut_ptr(),
+                tail.len() as u64,
+                &mut result,
+            )
+        },
+        0
+    );
+    let peak = tail
+        .iter()
+        .enumerate()
+        .max_by(|left, right| left.1.abs().total_cmp(&right.1.abs()))
+        .unwrap()
+        .0;
+    assert_eq!(peak, 7);
+    assert!(tail.iter().any(|&sample| sample != 0.0));
+
+    unsafe { lfm_resampler_stream_reset(stream) };
+    tail.fill(f32::NAN);
+    assert_eq!(
+        unsafe {
+            lfm_resampler_stream_process(
+                stream,
+                zeros.as_ptr(),
+                zeros.len() as u64,
+                tail.as_mut_ptr(),
+                tail.len() as u64,
+                &mut result,
+            )
+        },
+        0
+    );
+    assert!(tail.iter().all(|&sample| sample == 0.0));
+    assert_eq!(unsafe { lfm_resampler_stream_destroy(stream) }, 0);
+}
+
+#[test]
+fn streaming_playback_polyphase_has_no_scalar_cpp_loop_or_per_output_division() {
     let source = include_str!("../native/src/frontend/lfm_frontend.cpp");
     let begin = source
         .find("extern \"C\" int lfm_resampler_stream_process(")
@@ -487,13 +737,24 @@ fn streaming_playback_interpolation_has_no_scalar_cpp_loop() {
         .map(|offset| begin + offset)
         .unwrap();
     let process = &source[begin..end];
-    assert!(process.contains("lfm_resampler_stream_linear_f32(&kernel)"));
+    assert!(process.contains("lfm_resampler_stream_polyphase_f32(&kernel)"));
     assert!(!process.contains("for (") && !process.contains("while ("));
+    let hot = &process[process.find("if (!stream->history").unwrap()..];
+    assert!(!hot.contains("memcpy") && !hot.contains("memmove"));
 
     for leaf in [
         include_str!("../native/kernels/aarch64/flashkern_frontend.S"),
         include_str!("../native/kernels/x86_64/flashkern_frontend.S"),
     ] {
-        assert!(leaf.contains("LFM_SYM(lfm_resampler_stream_linear_f32):"));
+        let begin = leaf
+            .find("LFM_SYM(lfm_resampler_stream_polyphase_f32):")
+            .unwrap();
+        let end = leaf[begin..]
+            .find("// void lfm_resample_conv_spans_f32")
+            .map(|offset| begin + offset)
+            .unwrap();
+        let stream = &leaf[begin..end];
+        assert!(!stream.contains("udiv") && !stream.contains("divq"));
+        assert!(stream.contains("#112") || stream.contains("112(%r15)"));
     }
 }

@@ -10,3 +10,4 @@
 #include "kc_runtime.h"
 #include "kc_service.h"
 #include "kc_team.h"
+#include "kcoro_stackless.h"

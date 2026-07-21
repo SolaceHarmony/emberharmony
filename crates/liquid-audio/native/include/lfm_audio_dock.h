@@ -205,7 +205,8 @@ typedef struct LfmCaptureSupervisionSnapshotV1 {
  * bounded by the platform contract sealed in
  * `LfmSessionConfigV1::capture_max_callback_frames`; a larger device block is
  * rejected as one block and becomes an explicit XRUN rather than an unbounded
- * WRITING lease. */
+ * WRITING lease. The sole physical producer is created while the session is
+ * CREATED; readiness permanently closes endpoint allocation. */
 LFM_PUBLIC_API int lfm_capture_chunk_producer_create(
     LfmSession *session, uint64_t stream, uint32_t lane,
     LfmCaptureProducer **out);
@@ -248,8 +249,10 @@ LFM_PUBLIC_API int lfm_capture_producer_destroy(
  * Rust callback occurs. The ticket identity supplied by the reliable
  * PLAYBACK_READY record is validated before the lease becomes active. Claim is
  * not a polling API: a missing or mismatched head is STALE and never consumes
- * another ticket. Session join refuses to retire its continuation notifiers
- * until this endpoint has been disconnected from the device and destroyed. */
+ * another ticket. The sole physical consumer is created while the session is
+ * CREATED; readiness permanently closes endpoint allocation. Session join
+ * refuses to retire its continuation notifiers until this endpoint has been
+ * disconnected from the device and destroyed. */
 LFM_PUBLIC_API int lfm_playback_consumer_create(
     LfmSession *session, LfmPlaybackConsumer **out);
 LFM_PUBLIC_API int lfm_playback_consumer_claim(
@@ -292,8 +295,9 @@ LFM_PUBLIC_API int lfm_playback_consumer_destroy(
 
 /* Interrupt is a separate retained control edge. It never borrows the capture
  * producer and therefore cannot accidentally turn a second source into an
- * SPSC producer. Creation/destruction are administrative; interrupt itself is
- * one lock-free, coalescible epoch transition. */
+ * SPSC producer. Control handles are allocated only while the session is
+ * CREATED; destruction is administrative, and interrupt itself is one
+ * lock-free, coalescible epoch transition. */
 LFM_PUBLIC_API int lfm_session_control_create(
     LfmSession *session, LfmSessionControl **out);
 LFM_PUBLIC_API int lfm_session_control_interrupt(

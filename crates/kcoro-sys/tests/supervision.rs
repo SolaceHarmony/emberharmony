@@ -1,5 +1,5 @@
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Barrier;
 use std::thread::{self, Thread};
 use std::time::{Duration, Instant};
@@ -46,6 +46,7 @@ impl Ticket {
 }
 
 type Notify = unsafe extern "C" fn(*mut c_void);
+type GuardHook = unsafe extern "C" fn(*mut c_void, u32);
 type ScopeReady = unsafe extern "C" fn(*mut c_void, u64, u32);
 
 #[repr(C)]
@@ -297,6 +298,11 @@ struct Blocker {
     release: Barrier,
 }
 
+struct GuardProbe {
+    admitted: AtomicU32,
+    closed: Barrier,
+}
+
 impl Blocker {
     fn new(target: u64) -> Self {
         Self {
@@ -346,6 +352,12 @@ unsafe extern "C" fn blocking_notify(context: *mut c_void) {
     blocker.hit();
 }
 
+unsafe extern "C" fn guard_probe(context: *mut c_void, admitted: u32) {
+    let probe = unsafe { &*(context.cast::<GuardProbe>()) };
+    probe.admitted.store(admitted, Ordering::Release);
+    probe.closed.wait();
+}
+
 unsafe extern "C" fn blocking_ready(context: *mut c_void, _generation: u64, _cause: u32) {
     unsafe { blocking_notify(context) };
 }
@@ -390,7 +402,18 @@ unsafe extern "C" {
     fn kc_deadline_source_event_ack(source: *mut c_void, event: *const DeadlineEvent) -> i32;
     fn kc_deadline_source_advance_manual_test(source: *mut c_void, elapsed_ns: u64) -> i32;
     fn kc_deadline_source_fire_manual_test(source: *mut c_void, slot: u32) -> i32;
+    fn kc_deadline_source_set_terminal_leave_hook_manual_test(
+        source: *mut c_void,
+        hook: Option<Notify>,
+        context: *mut c_void,
+    ) -> i32;
+    fn kc_deadline_source_set_join_close_hook_manual_test(
+        source: *mut c_void,
+        hook: Option<GuardHook>,
+        context: *mut c_void,
+    ) -> i32;
     fn kc_deadline_source_request_stop(source: *mut c_void);
+    fn kc_deadline_source_join(source: *mut c_void) -> i32;
     fn kc_deadline_source_snapshot_get(source: *const c_void, out: *mut DeadlineSnapshot) -> i32;
     fn kc_deadline_source_destroy(source: *mut c_void) -> i32;
 }
@@ -519,6 +542,14 @@ fn deadline_snapshot(source: *mut c_void) -> DeadlineSnapshot {
         0
     );
     snapshot
+}
+
+unsafe fn deadline_join_destroy(source: *mut c_void) -> i32 {
+    let joined = unsafe { kc_deadline_source_join(source) };
+    if joined != 0 {
+        return joined;
+    }
+    unsafe { kc_deadline_source_destroy(source) }
 }
 
 #[test]
@@ -987,6 +1018,137 @@ const fn stale_errno() -> i32 {
 }
 
 #[test]
+fn deadline_stop_before_first_arm_joins_without_publishing_work() {
+    kcoro_sys::link_anchor();
+    let edge = Edge {
+        count: AtomicU64::new(0),
+        cancels: AtomicU64::new(0),
+        owner: thread::current(),
+    };
+    let source = deadline(&edge, true, 2);
+
+    unsafe { kc_deadline_source_request_stop(source) };
+    let stopped = deadline_snapshot(source);
+    assert_eq!(stopped.phase, SOURCE_STOPPED);
+    assert_eq!(stopped.cancellation_acks, 2);
+    assert_eq!(stopped.published_events, 0);
+    assert_eq!(stopped.pending_events, 0);
+    let config = ArmConfig {
+        size: size_of::<ArmConfig>() as u32,
+        abi_version: ABI,
+        slot: 0,
+        reserved: 0,
+        delay_ns: 1,
+        child: Ticket::new(300, 30, TICKET_DEADLINE),
+        parent: Ticket::new(400, 40, TICKET_WORKFLOW),
+        scope_generation: 50,
+        epoch: 60,
+        domain: 70,
+        team_generation: 80,
+    };
+    let mut rejected = Arm::default();
+    assert_eq!(
+        unsafe { kc_deadline_source_arm(source, &config, &mut rejected) },
+        race_canceled()
+    );
+    assert_eq!(unsafe { kc_deadline_source_join(source) }, 0);
+    assert_eq!(unsafe { kc_deadline_source_destroy(source) }, 0);
+}
+
+#[test]
+fn deadline_repeated_stop_and_join_are_idempotent() {
+    kcoro_sys::link_anchor();
+    let edge = Edge {
+        count: AtomicU64::new(0),
+        cancels: AtomicU64::new(0),
+        owner: thread::current(),
+    };
+    let source = deadline(&edge, true, 1);
+
+    assert_eq!(unsafe { kc_deadline_source_join(source) }, -16);
+    unsafe { kc_deadline_source_request_stop(source) };
+    unsafe { kc_deadline_source_request_stop(source) };
+    assert_eq!(unsafe { kc_deadline_source_join(source) }, 0);
+    assert_eq!(unsafe { kc_deadline_source_join(source) }, 0);
+    assert_eq!(deadline_snapshot(source).phase, SOURCE_STOPPED);
+    assert_eq!(unsafe { kc_deadline_source_destroy(source) }, 0);
+}
+
+#[test]
+fn deadline_destroy_rejects_a_stopped_source_until_join() {
+    kcoro_sys::link_anchor();
+    let edge = Edge {
+        count: AtomicU64::new(0),
+        cancels: AtomicU64::new(0),
+        owner: thread::current(),
+    };
+    let source = deadline(&edge, true, 1);
+
+    unsafe { kc_deadline_source_request_stop(source) };
+    assert_eq!(deadline_snapshot(source).phase, SOURCE_STOPPED);
+    assert_eq!(unsafe { kc_deadline_source_destroy(source) }, -16);
+    assert_eq!(unsafe { kc_deadline_source_join(source) }, 0);
+    assert_eq!(unsafe { kc_deadline_source_destroy(source) }, 0);
+}
+
+#[test]
+fn deadline_terminal_signal_guard_survives_concurrent_join_and_destroy() {
+    kcoro_sys::link_anchor();
+    let edge = Edge {
+        count: AtomicU64::new(0),
+        cancels: AtomicU64::new(0),
+        owner: thread::current(),
+    };
+    let leave = Blocker::new(1);
+    let close = GuardProbe {
+        admitted: AtomicU32::new(0),
+        closed: Barrier::new(2),
+    };
+    let source = deadline(&edge, true, 1);
+    assert_eq!(
+        unsafe {
+            kc_deadline_source_set_terminal_leave_hook_manual_test(
+                source,
+                Some(blocking_notify),
+                (&leave as *const Blocker).cast_mut().cast(),
+            )
+        },
+        0
+    );
+    assert_eq!(
+        unsafe {
+            kc_deadline_source_set_join_close_hook_manual_test(
+                source,
+                Some(guard_probe),
+                (&close as *const GuardProbe).cast_mut().cast(),
+            )
+        },
+        0
+    );
+
+    let stop_address = source as usize;
+    let stop = thread::spawn(move || unsafe {
+        kc_deadline_source_request_stop(stop_address as *mut c_void)
+    });
+    leave.entered.wait();
+    let terminal = deadline_snapshot(source);
+    assert_eq!(terminal.phase, SOURCE_STOPPED);
+    assert_eq!(terminal.active_handlers, 0);
+    assert_eq!(unsafe { kc_deadline_source_join(source) }, 0);
+
+    let destroy_address = source as usize;
+    let destroy = thread::spawn(move || unsafe {
+        kc_deadline_source_destroy(destroy_address as *mut c_void)
+    });
+    close.closed.wait();
+    let admitted = close.admitted.load(Ordering::Acquire);
+    leave.release.wait();
+    stop.join().unwrap();
+    assert_eq!(destroy.join().unwrap(), 0);
+    assert_eq!(admitted, 1, "destroy did not drain the terminal signal guard");
+}
+
+#[test]
 fn exact_generation_retire_is_silent_and_rearm_safe() {
     kcoro_sys::link_anchor();
     let edge = Edge {
@@ -1033,7 +1195,7 @@ fn exact_generation_retire_is_silent_and_rearm_safe() {
 
     unsafe { kc_deadline_source_request_stop(source) };
     assert_eq!(deadline_snapshot(source).phase, SOURCE_STOPPED);
-    assert_eq!(unsafe { kc_deadline_source_destroy(source) }, 0);
+    assert_eq!(unsafe { deadline_join_destroy(source) }, 0);
 }
 
 #[test]
@@ -1079,7 +1241,7 @@ fn exact_generation_retire_reports_when_expiry_already_won() {
 
     unsafe { kc_deadline_source_request_stop(source) };
     assert_eq!(deadline_snapshot(source).phase, SOURCE_STOPPED);
-    assert_eq!(unsafe { kc_deadline_source_destroy(source) }, 0);
+    assert_eq!(unsafe { deadline_join_destroy(source) }, 0);
 }
 
 #[test]
@@ -1147,7 +1309,7 @@ fn exact_generation_retire_and_expiry_share_one_terminal_cas() {
 
     unsafe { kc_deadline_source_request_stop(source) };
     assert_eq!(deadline_snapshot(source).phase, SOURCE_STOPPED);
-    assert_eq!(unsafe { kc_deadline_source_destroy(source) }, 0);
+    assert_eq!(unsafe { deadline_join_destroy(source) }, 0);
 }
 
 #[test]
@@ -1205,7 +1367,7 @@ fn disarm_promptly_publishes_stale_identity_then_allows_reuse() {
     assert_eq!(snapshot.published_events, 2);
     assert_eq!(snapshot.stale_events, 1);
     assert_eq!(snapshot.active_handlers, 0);
-    assert_eq!(unsafe { kc_deadline_source_destroy(source) }, 0);
+    assert_eq!(unsafe { deadline_join_destroy(source) }, 0);
 }
 
 #[test]
@@ -1254,7 +1416,7 @@ fn stale_ack_cannot_clear_a_reused_slots_successor_event() {
 
     unsafe { kc_deadline_source_request_stop(source) };
     assert_eq!(deadline_snapshot(source).phase, SOURCE_STOPPED);
-    assert_eq!(unsafe { kc_deadline_source_destroy(source) }, 0);
+    assert_eq!(unsafe { deadline_join_destroy(source) }, 0);
 }
 
 #[test]
@@ -1304,11 +1466,11 @@ fn copied_event_cannot_ack_another_slot_with_the_same_sequence_and_generation() 
     );
     unsafe { kc_deadline_source_request_stop(source) };
     assert_eq!(deadline_snapshot(source).phase, SOURCE_STOPPED);
-    assert_eq!(unsafe { kc_deadline_source_destroy(source) }, 0);
+    assert_eq!(unsafe { deadline_join_destroy(source) }, 0);
 }
 
 #[test]
-fn final_cancellation_notify_retains_source_until_callback_returns() {
+fn deadline_join_parks_until_final_cancellation_notify_returns() {
     kcoro_sys::link_anchor();
     let blocker = Blocker::new(2);
     let config = DeadlineConfig {
@@ -1332,9 +1494,13 @@ fn final_cancellation_notify_retains_source_until_callback_returns() {
     let snapshot = deadline_snapshot(source);
     assert_eq!(snapshot.phase, SOURCE_STOPPED);
     assert_eq!(snapshot.active_handlers, 1);
+    let join_address = source as usize;
+    let join =
+        thread::spawn(move || unsafe { kc_deadline_source_join(join_address as *mut c_void) });
     let during = unsafe { kc_deadline_source_destroy(source) };
     blocker.release.wait();
     stop.join().unwrap();
+    assert_eq!(join.join().unwrap(), 0);
 
     assert_eq!(during, -16);
     assert_eq!(blocker.calls.load(Ordering::Acquire), 2);
@@ -1375,7 +1541,7 @@ fn stopped_is_withheld_until_the_cancellation_walk_has_finished() {
     assert_eq!(settled.phase, SOURCE_STOPPED);
     assert_eq!(settled.active_handlers, 0);
     assert_eq!(blocker.calls.load(Ordering::Acquire), 2);
-    assert_eq!(unsafe { kc_deadline_source_destroy(source) }, 0);
+    assert_eq!(unsafe { deadline_join_destroy(source) }, 0);
 }
 
 #[test]
@@ -1414,11 +1580,11 @@ fn disarm_notify_retains_arm_admission_until_callback_returns() {
     assert_eq!(during, -16);
     assert_eq!(blocker.calls.load(Ordering::Acquire), 3);
     assert_eq!(deadline_snapshot(source).phase, SOURCE_STOPPED);
-    assert_eq!(unsafe { kc_deadline_source_destroy(source) }, 0);
+    assert_eq!(unsafe { deadline_join_destroy(source) }, 0);
 }
 
 #[test]
-fn expiry_notify_retains_handler_until_callback_returns() {
+fn deadline_join_parks_across_a_queued_expiry_handler() {
     kcoro_sys::link_anchor();
     let blocker = Blocker::new(1);
     let config = DeadlineConfig {
@@ -1452,9 +1618,13 @@ fn expiry_notify_retains_handler_until_callback_returns() {
     let snapshot = deadline_snapshot(source);
     assert_eq!(snapshot.phase, SOURCE_STOPPED);
     assert_eq!(snapshot.active_handlers, 1);
+    let join_address = source as usize;
+    let join =
+        thread::spawn(move || unsafe { kc_deadline_source_join(join_address as *mut c_void) });
     let during = unsafe { kc_deadline_source_destroy(source) };
     blocker.release.wait();
     assert_eq!(expire.join().unwrap(), 0);
+    assert_eq!(join.join().unwrap(), 0);
 
     assert_eq!(during, -16);
     assert_eq!(blocker.calls.load(Ordering::Acquire), 3);
@@ -1522,7 +1692,7 @@ fn three_permanent_slots_cover_repeated_prepare_commit_and_forced_endpoint_arms(
     unsafe { kc_deadline_source_request_stop(source) };
     wait_edge(&edge, CYCLES * 3 + 3);
     assert_eq!(deadline_snapshot(source).phase, SOURCE_STOPPED);
-    assert_eq!(unsafe { kc_deadline_source_destroy(source) }, 0);
+    assert_eq!(unsafe { deadline_join_destroy(source) }, 0);
 }
 
 #[test]
@@ -1561,7 +1731,7 @@ fn completion_disarm_and_stop_races_never_publish_twice_or_reuse_live_state() {
     unsafe { kc_deadline_source_request_stop(source) };
     wait_edge(&edge, 257);
     assert_eq!(deadline_snapshot(source).phase, SOURCE_STOPPED);
-    assert_eq!(unsafe { kc_deadline_source_destroy(source) }, 0);
+    assert_eq!(unsafe { deadline_join_destroy(source) }, 0);
 }
 
 #[test]
@@ -1588,7 +1758,7 @@ fn source_stop_preserves_an_unacknowledged_expiry_record() {
     let stopped = deadline_snapshot(source);
     assert_eq!(stopped.phase, SOURCE_STOPPED);
     assert_eq!(stopped.pending_events, 1);
-    assert_ne!(unsafe { kc_deadline_source_destroy(source) }, 0);
+    assert_ne!(unsafe { deadline_join_destroy(source) }, 0);
 
     let retained = event(source, 0);
     assert_eq!(retained.sequence, published.sequence);
@@ -1597,7 +1767,7 @@ fn source_stop_preserves_an_unacknowledged_expiry_record() {
         unsafe { kc_deadline_source_event_ack(source, &retained) },
         0
     );
-    assert_eq!(unsafe { kc_deadline_source_destroy(source) }, 0);
+    assert_eq!(unsafe { deadline_join_destroy(source) }, 0);
 }
 
 #[cfg(target_os = "macos")]
@@ -1622,7 +1792,7 @@ fn gcd_source_is_monotonic_one_shot_and_cancellation_ack_prevents_late_uaf() {
     assert_eq!(snapshot.phase, SOURCE_STOPPED);
     assert_eq!(snapshot.cancellation_acks, 1);
     assert_eq!(snapshot.active_handlers, 0);
-    assert_eq!(unsafe { kc_deadline_source_destroy(source) }, 0);
+    assert_eq!(unsafe { deadline_join_destroy(source) }, 0);
 }
 
 #[cfg(target_os = "macos")]
@@ -1650,7 +1820,7 @@ fn gcd_disarm_promptly_publishes_stale_identity_and_quarantines_no_slot() {
     unsafe { kc_deadline_source_request_stop(source) };
     wait_edge(&edge, 2);
     assert_eq!(deadline_snapshot(source).phase, SOURCE_STOPPED);
-    assert_eq!(unsafe { kc_deadline_source_destroy(source) }, 0);
+    assert_eq!(unsafe { deadline_join_destroy(source) }, 0);
 }
 
 #[cfg(target_os = "macos")]
@@ -1690,7 +1860,7 @@ fn gcd_retire_is_silent_and_disables_the_old_timer_before_rearm() {
     unsafe { kc_deadline_source_request_stop(source) };
     wait_edge(&edge, 2);
     assert_eq!(deadline_snapshot(source).phase, SOURCE_STOPPED);
-    assert_eq!(unsafe { kc_deadline_source_destroy(source) }, 0);
+    assert_eq!(unsafe { deadline_join_destroy(source) }, 0);
 }
 
 #[cfg(target_os = "macos")]
@@ -1711,7 +1881,7 @@ fn gcd_cancel_ack_quiesces_a_future_handler_before_storage_is_freed() {
     assert_eq!(snapshot.cancellation_acks, 1);
     assert_eq!(snapshot.published_events, 0);
     assert_eq!(snapshot.active_handlers, 0);
-    assert_eq!(unsafe { kc_deadline_source_destroy(source) }, 0);
+    assert_eq!(unsafe { deadline_join_destroy(source) }, 0);
 
     thread::sleep(Duration::from_millis(75));
     assert_eq!(
@@ -1750,10 +1920,10 @@ fn non_apple_production_arm_is_explicitly_unsupported() {
 }
 
 #[test]
-fn supervision_surface_has_no_wait_join_channel_or_wall_clock_api() {
+fn supervision_surface_has_only_administrative_deadline_join() {
     let scope = include_str!("../vendor/kcoro_arena/include/kc_fixed_scope.h");
     let deadline = include_str!("../vendor/kcoro_arena/include/kc_deadline.h");
-    for forbidden in ["_wait", "_join", "channel", "dispatch_walltime"] {
+    for forbidden in ["_wait", "channel", "dispatch_walltime"] {
         assert!(
             !scope.contains(forbidden),
             "fixed scope contains {forbidden}"
@@ -1763,6 +1933,11 @@ fn supervision_surface_has_no_wait_join_channel_or_wall_clock_api() {
             "deadline surface contains {forbidden}"
         );
     }
+    assert!(!scope.contains("_join"));
+    assert!(deadline.contains("int kc_deadline_source_join("));
+    assert!(deadline.contains("Terminal administrative teardown only"));
+    assert!(deadline.contains("forbidden from numerical, coordinator, service"));
+    assert!(deadline.contains("audio callback paths"));
     assert!(deadline.contains("never a product route,"));
     assert!(deadline.contains("conversation, or numerical scratch owner"));
     let implementation = include_str!("../vendor/kcoro_arena/core/src/kc_deadline.c");
@@ -1781,11 +1956,24 @@ fn supervision_surface_has_no_wait_join_channel_or_wall_clock_api() {
         );
     }
     let notify = handler.find("notify(context)").unwrap();
-    let release = handler.rfind("active_handlers").unwrap();
+    let release = handler.rfind("handler_leave(source)").unwrap();
     assert!(
         notify < release,
         "expiry handler released lifetime before notify"
     );
+
+    let leave_begin = implementation.find("static void handler_leave(").unwrap();
+    let leave_end = implementation[leave_begin..]
+        .find("static int publish_stopped(")
+        .map(|offset| leave_begin + offset)
+        .unwrap();
+    let leave = &implementation[leave_begin..leave_end];
+    let acquire = leave.find("kc_port_wait_u32_signal_acquire").unwrap();
+    let terminal = leave.find("atomic_fetch_sub_explicit").unwrap();
+    let publish = leave.find("kc_atomic_u32_fetch_add_release").unwrap();
+    let wake = leave.find("kc_port_wait_u32_signal_all").unwrap();
+    let unpin = leave.find("kc_port_wait_u32_signal_release").unwrap();
+    assert!(acquire < terminal && terminal < publish && publish < wake && wake < unpin);
 
     let cancel_begin = implementation.rfind("static void cancel_ack(").unwrap();
     let cancel_end = implementation[cancel_begin..]
@@ -1794,7 +1982,7 @@ fn supervision_surface_has_no_wait_join_channel_or_wall_clock_api() {
         .unwrap();
     let cancel = &implementation[cancel_begin..cancel_end];
     assert!(
-        cancel.find("notify(context)").unwrap() < cancel.rfind("active_handlers").unwrap(),
+        cancel.find("notify(context)").unwrap() < cancel.rfind("handler_leave(source)").unwrap(),
         "cancel handler released lifetime before notify"
     );
 
@@ -1807,7 +1995,7 @@ fn supervision_surface_has_no_wait_join_channel_or_wall_clock_api() {
         .unwrap();
     let stop = &implementation[stop_begin..stop_end];
     assert!(
-        stop.find("notify(context)").unwrap() < stop.rfind("active_handlers").unwrap(),
+        stop.find("notify(context)").unwrap() < stop.rfind("handler_leave(source)").unwrap(),
         "cancellation walk released lifetime before its final notify"
     );
 
@@ -1843,6 +2031,22 @@ fn supervision_surface_has_no_wait_join_channel_or_wall_clock_api() {
         assert!(
             !retire.contains(forbidden),
             "silent deadline retirement contains {forbidden}"
+        );
+    }
+
+    let join_begin = implementation
+        .find("int kc_deadline_source_join(")
+        .expect("administrative deadline join is missing");
+    let join_end = implementation[join_begin..]
+        .find("int kc_deadline_source_snapshot_get(")
+        .map(|offset| join_begin + offset)
+        .unwrap();
+    let join = &implementation[join_begin..join_end];
+    assert!(join.contains("kc_port_wait_u32("));
+    for forbidden in ["sched_yield", "nanosleep", "usleep"] {
+        assert!(
+            !join.contains(forbidden),
+            "administrative deadline join contains {forbidden}"
         );
     }
     assert_eq!(CAUSE_CANCELLED, 2);
