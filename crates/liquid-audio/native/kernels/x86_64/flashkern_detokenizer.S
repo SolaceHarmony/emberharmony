@@ -9,6 +9,31 @@
 #define LFM_CALL(name) name
 #endif
 
+// flashkern_detokenizer.S — x86-64 leaves of the LFM2.5 audio detokenizer.
+//
+// x86-64 twin of aarch64/flashkern_detokenizer.S — read that file's header and
+// per-symbol blocks for the full port rationale (oracle: vendored
+// reference/detokenizer.py + audio_detokenizer/config.json, checkpoint
+// c362a062, weights sha256 d294aef1...). Same 19 symbols, same argument-block
+// ABI (lfm_detokenizer_kernels.h), same setup-only libm surface (powf in the
+// RoPE-inverse builder, cos/sin in the irfft-basis builder; every hot-pass
+// leaf is libm-free).
+//
+// CROSS-ARCH BIT-IDENTITY DOES NOT HOLD FOR THIS FILE — stated here so nobody
+// hunts a phantom bug: this is baseline SSE2 with ZERO fused operations
+// (mulps + addps = two roundings per multiply-add), while the AArch64 twin's
+// committed order is fused fmla (one rounding). The reduction TREES match
+// (two accumulators, 8-float stride, pairwise collapse — haddps here, faddp
+// there); the fusion does not, because SSE2 has no FMA and NEON has nothing
+// else. Consequence: the real-checkpoint trace gate
+// (docs/AUDIO_DETOKENIZER_PORT.md) is an ARCH-SCOPED contract — each
+// architecture locks its own stream. A cross-arch PCM hash comparison is
+// expected to differ in the last bits and is not a regression.
+//
+// NaN semantics in max match the AArch64 twin exactly (a NaN at [0] sticks,
+// later NaNs never replace the running max — corruption is the trace gate's
+// job). Win64/SysV dual ABI like every sibling leaf.
+
 .text
 
 // x86_64 twin of the LFM2.5 detokenizer leaf family. Hot passes own complete
@@ -17,6 +42,8 @@
 // are libm-free. SysV and Win64 guards preserve one semantic ABI.
 
 .p2align 4
+// void lfm_detok_copy_f32(const float *src, float *dst, uint64_t count)
+// Plain view copy (movups). See AArch64 twin for role.
 .globl LFM_SYM(lfm_detok_copy_f32)
 LFM_PRIVATE(LFM_SYM(lfm_detok_copy_f32))
 LFM_SYM(lfm_detok_copy_f32):
@@ -54,6 +81,8 @@ LFM_SYM(lfm_detok_copy_f32):
 9:  ret
 
 .p2align 4
+// void lfm_detok_add_f32(float *accum, const float *addend, uint64_t count)
+// accum[i] += addend[i] — residual adds. Unfused by ISA (header note).
 .globl LFM_SYM(lfm_detok_add_f32)
 LFM_PRIVATE(LFM_SYM(lfm_detok_add_f32))
 LFM_SYM(lfm_detok_add_f32):
@@ -88,6 +117,9 @@ LFM_SYM(lfm_detok_add_f32):
 9:  ret
 
 .p2align 4
+// void lfm_detok_embed_f32(args: LFM_DETOK_EMBED_* block)
+// FusedEmbedding: mean of 8 offset codebook embeddings per frame
+// (detokenizer.py line 24). Same gather-accumulate-scale as the twin.
 .globl LFM_SYM(lfm_detok_embed_f32)
 LFM_PRIVATE(LFM_SYM(lfm_detok_embed_f32))
 LFM_SYM(lfm_detok_embed_f32):
@@ -143,6 +175,9 @@ LFM_SYM(lfm_detok_embed_f32):
 9:  ret
 
 .p2align 4
+// void lfm_detok_rms_f32(args: LFM_DETOK_RMS_* block)
+// Backbone RMSNorm (block_norm_eps 1e-5). Same op order as the twin:
+// sumsq -> /dim -> +eps -> rsqrt via exact sqrtss+divss, never rsqrtss.
 .globl LFM_SYM(lfm_detok_rms_f32)
 LFM_PRIVATE(LFM_SYM(lfm_detok_rms_f32))
 LFM_SYM(lfm_detok_rms_f32):
@@ -197,6 +232,9 @@ LFM_SYM(lfm_detok_rms_f32):
 9:  ret
 
 .p2align 4
+// void lfm_detok_swiglu_f32(gate*, up*, exp_neg_gate*, count)
+// out = gate * up / (1 + exp(-gate)); exp precomputed by the C++ owner.
+// Pure mul/div/add here — hot-pass libm-free rule.
 .globl LFM_SYM(lfm_detok_swiglu_f32)
 LFM_PRIVATE(LFM_SYM(lfm_detok_swiglu_f32))
 LFM_SYM(lfm_detok_swiglu_f32):
@@ -233,6 +271,10 @@ LFM_SYM(lfm_detok_swiglu_f32):
 9:  ret
 
 .p2align 4
+// float lfm_detok_dot32_scaled_f32(q*, k*, scale)
+// One attention score over exactly 32 floats (head_dim). Two xmm
+// accumulators, 8-float stride, haddps x2 collapse, then *scale. Same tree
+// as the twin's fmla/faddp — minus the fusion (header note).
 .globl LFM_SYM(lfm_detok_dot32_scaled_f32)
 LFM_PRIVATE(LFM_SYM(lfm_detok_dot32_scaled_f32))
 LFM_SYM(lfm_detok_dot32_scaled_f32):
@@ -265,6 +307,9 @@ LFM_SYM(lfm_detok_dot32_scaled_f32):
     ret
 
 .p2align 4
+// float lfm_detok_max_f32(x*, count) — softmax guard max, scalar.
+// ucomiss + jbe: NaN at [0] sticks, later NaNs never win (matches twin;
+// deliberate — the trace gate owns corruption detection).
 .globl LFM_SYM(lfm_detok_max_f32)
 LFM_PRIVATE(LFM_SYM(lfm_detok_max_f32))
 LFM_SYM(lfm_detok_max_f32):
@@ -290,6 +335,8 @@ LFM_SYM(lfm_detok_max_f32):
 9:  ret
 
 .p2align 4
+// void lfm_detok_subtract_f32(x*, count, value) — x[i] -= value.
+// Softmax max-subtraction before the C++ owner exponentiates.
 .globl LFM_SYM(lfm_detok_subtract_f32)
 LFM_PRIVATE(LFM_SYM(lfm_detok_subtract_f32))
 LFM_SYM(lfm_detok_subtract_f32):
@@ -321,6 +368,9 @@ LFM_SYM(lfm_detok_subtract_f32):
 9:  ret
 
 .p2align 4
+// float lfm_detok_sum_f32(x*, count) — softmax denominator.
+// Vectorized-pairwise (addps + haddps) IS the committed order here; the
+// frontend's strictly-sequential rule belongs to a different oracle.
 .globl LFM_SYM(lfm_detok_sum_f32)
 LFM_PRIVATE(LFM_SYM(lfm_detok_sum_f32))
 LFM_SYM(lfm_detok_sum_f32):
@@ -350,6 +400,9 @@ LFM_SYM(lfm_detok_sum_f32):
 9:  ret
 
 .p2align 4
+// void lfm_detok_normalize_f32(x*, count, sum) — softmax normalize.
+// Reciprocal computed ONCE then multiplied (contrast frontend norm_apply,
+// which divides per element — each is its own reference's committed order).
 .globl LFM_SYM(lfm_detok_normalize_f32)
 LFM_PRIVATE(LFM_SYM(lfm_detok_normalize_f32))
 LFM_SYM(lfm_detok_normalize_f32):
@@ -385,6 +438,8 @@ LFM_SYM(lfm_detok_normalize_f32):
 9:  ret
 
 .p2align 4
+// void lfm_detok_rope_angles_f32(inv_freq*, out*, count, position)
+// out[i] = inv_freq[i] * (float)position; cos/sin taken by the C++ owner.
 .globl LFM_SYM(lfm_detok_rope_angles_f32)
 LFM_PRIVATE(LFM_SYM(lfm_detok_rope_angles_f32))
 LFM_SYM(lfm_detok_rope_angles_f32):
@@ -414,6 +469,9 @@ LFM_SYM(lfm_detok_rope_angles_f32):
 9:  ret
 
 .p2align 4
+// void lfm_detok_rope_f32(head*, cos*, sin*) — rotary, NeoX split-half
+// (i vs i+16 over one 32-float head), full F32, no BF16 rounding: the
+// detokenizer reference runs torch F32 (see twin for the faithfulness note).
 .globl LFM_SYM(lfm_detok_rope_f32)
 LFM_PRIVATE(LFM_SYM(lfm_detok_rope_f32))
 LFM_SYM(lfm_detok_rope_f32):
@@ -449,6 +507,9 @@ LFM_SYM(lfm_detok_rope_f32):
     ret
 
 .p2align 4
+// int lfm_detok_rope_inverse_f32(out*, count, head_dim, theta)
+// SETUP-ONLY: out[i] = theta^(-2i/head_dim) via libm powf (platform-tied
+// builder #1, header note). Returns 0 / -EINVAL.
 .globl LFM_SYM(lfm_detok_rope_inverse_f32)
 LFM_PRIVATE(LFM_SYM(lfm_detok_rope_inverse_f32))
 LFM_SYM(lfm_detok_rope_inverse_f32):
@@ -512,6 +573,11 @@ LFM_SYM(lfm_detok_rope_inverse_f32):
     ret
 
 .p2align 4
+// int lfm_detok_ifft_basis_f32(basis*, bins, n_fft)
+// SETUP-ONLY: the one-sided irfft basis (torch.fft.irfft, norm="backward")
+// as [real|imag] GEMM planes; F64 construction with libm cos/sin, doubling
+// 2 except DC/Nyquist, -sin for the conjugate side, /n_fft, narrowed once.
+// Platform-tied builder #2. Guards bins == n_fft/2 + 1. See twin for math.
 .globl LFM_SYM(lfm_detok_ifft_basis_f32)
 LFM_PRIVATE(LFM_SYM(lfm_detok_ifft_basis_f32))
 LFM_SYM(lfm_detok_ifft_basis_f32):
@@ -619,6 +685,9 @@ LFM_SYM(lfm_detok_ifft_basis_f32):
 .endm
 
 .p2align 4
+// void lfm_detok_conv_f32(args: LFM_DETOK_CONV_* block)
+// LFM2 gated shortconv, width 3 (conv_L_cache): out = C.(w0*s0 + w1*s1 +
+// w2*(B.x)) with the two-entry carry rotated in place. See twin.
 .globl LFM_SYM(lfm_detok_conv_f32)
 LFM_PRIVATE(LFM_SYM(lfm_detok_conv_f32))
 LFM_SYM(lfm_detok_conv_f32):
@@ -660,6 +729,10 @@ LFM_SYM(lfm_detok_conv_f32):
 9:  ret
 
 .p2align 4
+// void lfm_detok_weighted_f32(args: LFM_DETOK_WEIGHTED_* block)
+// Weighted-V for one head: out[32] = sum_j scores[j] * V[(first+j) mod 30].
+// The mod-30 ring is the reference's sliding window (sliding_window_size=30).
+// Eight xmm accumulators hold the full head; ascending-j committed order.
 .globl LFM_SYM(lfm_detok_weighted_f32)
 LFM_PRIVATE(LFM_SYM(lfm_detok_weighted_f32))
 LFM_SYM(lfm_detok_weighted_f32):
@@ -767,6 +840,9 @@ LFM_SYM(lfm_detok_weighted_f32):
 #endif
 
 .p2align 4
+// void lfm_detok_polar_f32(args: LFM_DETOK_POLAR_* block)
+// real = mag*cos, imag = mag*sin — the multiply half of torch.polar; exp/
+// cos/sin precomputed by the C++ owner (hot-pass libm rule).
 .globl LFM_SYM(lfm_detok_polar_f32)
 LFM_PRIVATE(LFM_SYM(lfm_detok_polar_f32))
 LFM_SYM(lfm_detok_polar_f32):
@@ -816,6 +892,9 @@ LFM_SYM(lfm_detok_polar_f32):
 9:  ret
 
 .p2align 4
+// void lfm_detok_overlap_f32(args: LFM_DETOK_OVERLAP_* block)
+// Both iSTFT folds per pass: output += frame*window; envelope += window^2
+// (Hann 1280, hop 320). Same coupled traversal as the twin.
 .globl LFM_SYM(lfm_detok_overlap_f32)
 LFM_PRIVATE(LFM_SYM(lfm_detok_overlap_f32))
 LFM_SYM(lfm_detok_overlap_f32):
@@ -868,6 +947,10 @@ LFM_SYM(lfm_detok_overlap_f32):
 9:  ret
 
 .p2align 4
+// int lfm_detok_emit_f32(args: LFM_DETOK_EMIT_* block)
+// pcm[i] = output[i]/envelope[i] with the NOLA guard: any envelope <=
+// epsilon returns -ERANGE before emitting (the reference's assert
+// window_envelope > 1e-11, promoted to a typed hard error).
 .globl LFM_SYM(lfm_detok_emit_f32)
 LFM_PRIVATE(LFM_SYM(lfm_detok_emit_f32))
 LFM_SYM(lfm_detok_emit_f32):

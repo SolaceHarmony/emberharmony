@@ -287,6 +287,7 @@ LFM_SYM(lfm_relu_bf16):
     ret
 
 // int lfm_silu_bf16(uint16_t *x, uint64_t n)
+// x * sigmoid(x), computed f32 via libm expf, ONE bf16 round (candle silu).
 .p2align 4
 .globl LFM_SYM(lfm_silu_bf16)
 LFM_PRIVATE(LFM_SYM(lfm_silu_bf16))
@@ -334,6 +335,8 @@ LFM_SYM(lfm_silu_bf16):
     ret
 
 // int lfm_glu_bf16(const uint16_t *a, const uint16_t *b, uint16_t *y, uint64_t n)
+// candle order: sigmoid rounds to bf16 FIRST, then the product rounds — two
+// distinct rounds; fusing them changes the tensor (header rule).
 .p2align 4
 .globl LFM_SYM(lfm_glu_bf16)
 LFM_PRIVATE(LFM_SYM(lfm_glu_bf16))
@@ -397,6 +400,8 @@ LFM_SYM(lfm_glu_bf16):
     ret
 
 // int lfm_gelu_erf_bf16(uint16_t *x, uint64_t n)
+// 0.5 * x * (1 + erf(x/sqrt(2))) via libm erff, f32, ONE round — the adapter's
+// activation (geometry: LN -> 512x2048 -> gelu_erf -> 2048x2048).
 .p2align 4
 .globl LFM_SYM(lfm_gelu_erf_bf16)
 LFM_PRIVATE(LFM_SYM(lfm_gelu_erf_bf16))
@@ -446,6 +451,8 @@ LFM_SYM(lfm_gelu_erf_bf16):
     ret
 
 // void lfm_residual_half_bf16(uint16_t *r, const uint16_t *h, uint64_t n)
+// r = bf16(r + bf16(0.5*h)) — TWO rounds in candle op order: the halved term
+// materializes bf16 before the add does. The conformer's half-step FF residual.
 .p2align 4
 .globl LFM_SYM(lfm_residual_half_bf16)
 LFM_PRIVATE(LFM_SYM(lfm_residual_half_bf16))
@@ -510,6 +517,8 @@ LFM_SYM(lfm_add_bf16):
     ret
 
 // int lfm_softmax_rows_f32(float *x, uint64_t rows, uint64_t cols)
+// candle ladder, all f32: row max, subtract, exp (libm expf), sum, divide —
+// strictly sequential per row, no vector shortcut (fixture-pinned order).
 .p2align 4
 .globl LFM_SYM(lfm_softmax_rows_f32)
 LFM_PRIVATE(LFM_SYM(lfm_softmax_rows_f32))
@@ -587,6 +596,9 @@ LFM_SYM(lfm_softmax_rows_f32):
     ret
 
 // void lfm_sgemm_f32(a, b, c, m, n, k) — C(MxN) = A(MxK).B(KxN), scalar.
+// C(MxN) = A(MxK) . B(KxN), scalar, k-ascending f32 accumulate — the off-Apple
+// reference path (Apple routes dense GEMMs to Accelerate; this order is the
+// parity ladder both must match at the fixtures).
 .p2align 4
 .globl LFM_SYM(lfm_sgemm_f32)
 LFM_PRIVATE(LFM_SYM(lfm_sgemm_f32))
@@ -648,6 +660,8 @@ LFM_SYM(lfm_sgemm_f32):
     ret
 
 // void lfm_sgemm_nt_f32(a, bt, c, m, n, k) — C = A(MxK) . B(NxK)^T.
+// C(MxN) = A(MxK) . B(NxK)^T — B pre-transposed so both operands are
+// row-contiguous dots; same k-ascending scalar accumulate contract.
 .p2align 4
 .globl LFM_SYM(lfm_sgemm_nt_f32)
 LFM_PRIVATE(LFM_SYM(lfm_sgemm_nt_f32))
@@ -776,6 +790,8 @@ LFM_SYM(lfm_bf16_gemm_nt_f32_scalar):
     ret
 
 // void lfm_dwconv_tap_f32(xpad, w, y, channels, t_out, t_pad, k, stride)
+// Depthwise conv over pre-padded input: per channel, y[t] = sum_k w[k] *
+// xpad[t*stride+k], k-ascending, f32 — the conformer conv module's k=9 taps.
 .p2align 4
 .globl LFM_SYM(lfm_dwconv_tap_f32)
 LFM_PRIVATE(LFM_SYM(lfm_dwconv_tap_f32))
@@ -1262,6 +1278,8 @@ LFM_SYM(lfm_dwconv2d_k3s2_bf16_f32):
     ret
 
 // void lfm_bias_rows_f32(float *y, const uint16_t *bias, uint64_t rows, uint64_t n)
+// y[r][i] += widen(bias[i]) — f32 bias add of the linear contract; bias stays
+// bf16 in memory, lifted per use, never staged.
 .p2align 4
 .globl LFM_SYM(lfm_bias_rows_f32)
 LFM_PRIVATE(LFM_SYM(lfm_bias_rows_f32))
@@ -1298,6 +1316,7 @@ LFM_SYM(lfm_bias_rows_f32):
     ret
 
 // void lfm_bias_bcast_f32(float *y, const uint16_t *bias, uint64_t channels, uint64_t t)
+// y[c][*] += widen(bias[c]) — channel-broadcast form for [C][T] planes.
 .p2align 4
 .globl LFM_SYM(lfm_bias_bcast_f32)
 LFM_PRIVATE(LFM_SYM(lfm_bias_bcast_f32))
@@ -1372,6 +1391,8 @@ LFM_SYM(lfm_add_scale_f32):
     ret
 
 // void lfm_add_bias_hd_bf16(x, bias, y, t, heads, dk)
+// y[t][h*dk+d] = bf16(x + bias[h][d]) — ONE round: candle's broadcast_add in
+// bf16. The per-head attention bias.
 .p2align 4
 .globl LFM_SYM(lfm_add_bias_hd_bf16)
 LFM_PRIVATE(LFM_SYM(lfm_add_bias_hd_bf16))
@@ -1420,6 +1441,9 @@ LFM_SYM(lfm_add_bias_hd_bf16):
     ret
 
 // int lfm_pe_build_bf16(const float *div, uint64_t half, uint64_t t, uint16_t *out)
+// Rel-pos table (2t-1 rows, 2*half cols): position (t-1-i); pe[i][2j] =
+// sin(pos*div[j]), pe[i][2j+1] = cos(...) — f32 angles via libm sinf/cosf,
+// stored bf16. Setup-time; part of this file's platform-tied libm surface.
 .p2align 4
 .globl LFM_SYM(lfm_pe_build_bf16)
 LFM_PRIVATE(LFM_SYM(lfm_pe_build_bf16))

@@ -1,5 +1,14 @@
 #include "lfm_asm_visibility.h"
 
+// NUMERIC CONTRACT (identical to the AArch64 twin, verified):
+// - Downmix is the MEAN; mean and sample scale share ONE divide (i16 divisor
+//   = channels * 32767, built once). Exact divps/divss, never rcpps.
+// - i16 full-scale is 32767, NOT 32768 (symmetric +/-32767 -> +/-1.0). The
+//   Rust callback side and the fanout inverse are committed to this constant
+//   as a PAIR — do not "harmonize" to /32768; it re-scales every sample and
+//   breaks the capture/playback round trip.
+// - u16 is offset binary: subtract 32768, then the same combined divisor.
+// - Widen to int32 + cvtdq2ps-class exact converts; no table, no estimate.
 // SSE2 twin of the realtime capture-format leaves. Mono and stereo device
 // layouts run across frames in vectors; uncommon channel counts preserve the
 // source implementation's left-to-right channel order in scalar SSE. Both

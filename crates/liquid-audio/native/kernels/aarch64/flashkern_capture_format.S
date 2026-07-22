@@ -1,5 +1,22 @@
 #include "lfm_asm_visibility.h"
 
+// NUMERIC CONTRACT (identical on both architectures, verified):
+//
+// - Downmix is the MEAN of the device channels, and the mean and the sample
+//   scale share ONE divide: for i16 the divisor is channels * 32767 built
+//   once, so sum/(N*32767) rounds a single time. Exact divide, never a
+//   reciprocal-multiply (the frontend rule).
+// - The i16 full-scale is 32767, NOT 32768. Symmetric mapping: +/-32767 ->
+//   +/-1.0; -32768 lands just below -1.0. Ecosystems split on this constant
+//   (many use /32768); this port's Rust callback side and the fanout inverse
+//   below are committed to 32767 as a PAIR. Changing one side re-scales every
+//   sample by 32768/32767 and breaks capture/playback round-trip identity —
+//   do not "harmonize" it to match some other library.
+// - u16 is offset binary: subtract 32768 first, then the same combined
+//   divisor as i16.
+// - Integer->float goes through exact int32 widening + scvtf-class converts;
+//   no table, no estimate.
+//
 // Realtime device capture conversion. The common mono/stereo/quad device
 // layouts run across frames in NEON; uncommon channel counts retain the exact
 // left-to-right channel order in the scalar FP lane. All paths are assembly —
