@@ -1624,8 +1624,8 @@ int validate_voice_model(const LfmModel *model, char *error,
         return LFM_STATUS_INVALID_ARGUMENT;
     }
 
-    LfmModelMemoryV1 memory = {
-        .size = sizeof(LfmModelMemoryV1),
+    LfmModelMemoryV2 memory = {
+        .size = sizeof(LfmModelMemoryV2),
         .abi_version = LFM_MODEL_ABI_VERSION,
     };
     rc = lfm_model_memory(model, &memory);
@@ -5414,7 +5414,7 @@ int lfm_runtime_model_open(LfmRuntime *runtime, const char *path,
 
 int lfm_runtime_model_memory(const LfmRuntime *runtime,
                              const LfmModel *model,
-                             LfmModelMemoryV1 *out) {
+                             LfmModelMemoryV2 *out) {
     if (!runtime || !model || !out) return LFM_STATUS_INVALID_ARGUMENT;
     std::lock_guard<std::mutex> guard(runtime->children_mutex);
     if (runtime->model != model) return LFM_STATUS_INVALID_ARGUMENT;

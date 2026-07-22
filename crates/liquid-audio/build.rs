@@ -120,6 +120,26 @@ fn main() {
             .include("../kcoro-sys/vendor/kcoro_arena/include");
         inner_voice.compile("lfm_native_inner_voice_probe");
     }
+
+    /* Native shared-weight single-flight gate. Rust supplies only a temporary
+     * path and invokes one C ABI launcher; all eight kcoro continuations,
+     * BUILDING dehydration, READY callbacks, validation, and retirement live
+     * in the C++23 test TU. */
+    println!("cargo::rerun-if-changed=native/tests/native_weight_segment.cpp");
+    let mut weight_gate = cc::Build::new();
+    weight_gate
+        .file("native/tests/native_weight_segment.cpp")
+        .cpp(true)
+        .std("c++23")
+        .opt_level(3)
+        .warnings(true)
+        .warnings_into_errors(true)
+        .flag("-pthread")
+        .flag_if_supported("-fvisibility=hidden")
+        .include("native/include")
+        .include("native/src/model")
+        .include("../kcoro-sys/vendor/kcoro_arena/include");
+    weight_gate.compile("lfm_native_weight_gate");
     cc::Build::new()
         .file("native/src/runtime/voice_protocol_c.c")
         .std("c11")
@@ -405,8 +425,9 @@ fn main() {
         .include("native/src/mimi");
     mimi.compile("lfm_mimi");
 
-    // Native checkpoint ownership: whole safetensors shards are read directly
-    // into one aligned resident image, then exposed as immutable byte views.
+    // Native checkpoint ownership: whole safetensors shards are read once into
+    // one named, wired, read-only shared segment, then exposed as immutable
+    // byte views. Later processes attach with zero tensor-payload reads.
     // Static archive consumers precede this provider on GNU ld: the released
     // detokenizer and main model both bind this one lifecycle-owned image.
     println!("cargo::rerun-if-changed=native/src/io/safetensors.cpp");

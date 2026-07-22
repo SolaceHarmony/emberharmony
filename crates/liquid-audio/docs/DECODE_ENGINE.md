@@ -196,7 +196,8 @@ Where every byte lives on the decode path, from the most durable to the most eph
   overlap without opening a second image. Plans retain byte-addressed views;
   possibly unaligned checkpoint BF16 is never represented as a dereferenceable
   C++ `uint16_t*`. Architecture kernels unlift little-endian words in registers.
-- `LfmModelMemoryV1` reports source, resident, directly bound, formula-derived,
+- `LfmModelMemoryV2` reports source, shared segment build/attach/wire,
+  tensor-payload reads, directly bound, formula-derived,
   compatibility-copied, load-time, worker, and task counts. Formula-derived rope,
   frontend/FFT/window, Conformer denominator, and detokenizer inverse-DFT/RoPE
   tables are counted

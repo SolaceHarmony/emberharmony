@@ -16,17 +16,18 @@
 //! honestly. `LFM_LOAD_BENCH_DETOKENIZER` may override the released
 //! `audio_detokenizer` directory.
 
-use std::ffi::{c_char, c_void, CStr, CString};
+use std::ffi::{c_char, CStr, CString};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::ptr::NonNull;
 use std::time::Instant;
 
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
-
-const ABI: u32 = 3;
+const ABI: u32 = 2;
 const OK: i32 = 0;
+const BUILT: u32 = 1;
+const ATTACHED: u32 = 1 << 1;
+const WIRED: u32 = 1 << 2;
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 
 type Res<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -42,9 +43,22 @@ struct LoadStats {
     size: u32,
     abi_version: u32,
     source_bytes: u64,
-    resident_bytes: u64,
+    segment_bytes: u64,
+    segment_constructed_bytes: u64,
+    attached_shared_bytes: u64,
+    wired_bytes: u64,
+    process_resident_bytes: u64,
+    build_ns: u64,
+    attach_ns: u64,
+    generation: u64,
     task_count: u32,
     worker_count: u32,
+    flags: u32,
+    source_count: u32,
+    payload_read_calls: u64,
+    payload_read_bytes: u64,
+    identity_digest: [u8; 32],
+    content_digest: [u8; 32],
 }
 
 #[link(name = "lfm_safetensors", kind = "static")]
@@ -70,9 +84,8 @@ unsafe extern "C" {
     ) -> i32;
     fn lfm_internal_weights_benchmark_cold_supported() -> i32;
     fn lfm_weights_close(image: *mut WeightImage);
-    fn lfm_weights_data(image: *const WeightImage) -> *const c_void;
-    fn lfm_weights_resident_bytes(image: *const WeightImage) -> u64;
     fn lfm_weights_load_stats(image: *const WeightImage, out: *mut LoadStats) -> i32;
+    fn lfm_weights_evict(identity: *const u8, error: *mut c_char, error_length: usize) -> i32;
 }
 
 struct Image(NonNull<WeightImage>);
@@ -118,17 +131,6 @@ impl Image {
         }
         Ok(stats)
     }
-
-    fn digest(&self) -> Res<String> {
-        let bytes = unsafe { lfm_weights_resident_bytes(self.0.as_ptr()) };
-        let len = usize::try_from(bytes).map_err(|_| "resident image exceeds usize")?;
-        let data = unsafe { lfm_weights_data(self.0.as_ptr()) }.cast::<u8>();
-        if data.is_null() && len != 0 {
-            return Err("native loader returned a null image base".into());
-        }
-        let image = unsafe { std::slice::from_raw_parts(data, len) };
-        Ok(format!("{:x}", Sha256::digest(image)))
-    }
 }
 
 impl Drop for Image {
@@ -139,13 +141,31 @@ impl Drop for Image {
 
 #[derive(Clone)]
 struct Sample {
+    built: bool,
     requested_workers: u32,
     elapsed_ms: f64,
-    gib_per_second: f64,
+    gib_per_second: Option<f64>,
     rss_after_open_bytes: Option<u64>,
     rss_delta_bytes: Option<i64>,
     stats: LoadStats,
     digest: String,
+}
+
+fn digest(bytes: &[u8; 32]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn evict(identity: &[u8; 32]) -> Res<()> {
+    let mut error = [0i8; 1024];
+    let status = unsafe { lfm_weights_evict(identity.as_ptr(), error.as_mut_ptr(), error.len()) };
+    if status == OK {
+        return Ok(());
+    }
+    Err(format!(
+        "native segment eviction status {status}: {}",
+        unsafe { CStr::from_ptr(error.as_ptr()) }.to_string_lossy()
+    )
+    .into())
 }
 
 fn rss_bytes() -> Option<u64> {
@@ -164,25 +184,54 @@ fn rss_bytes() -> Option<u64> {
         .checked_mul(1024)
 }
 
-fn sample(main: &Path, detokenizer: &Path, workers: u32, uncached: bool) -> Res<Sample> {
+fn sample(
+    main: &Path,
+    detokenizer: &Path,
+    workers: u32,
+    uncached: bool,
+    built: bool,
+    identity: &[u8; 32],
+) -> Res<Sample> {
+    if built {
+        evict(identity)?;
+    }
     let rss_before = rss_bytes();
     let started = Instant::now();
     let image = Image::open(main, detokenizer, workers, uncached)?;
     let elapsed = started.elapsed();
     let rss_after = rss_bytes();
     let stats = image.stats()?;
-    let digest = image.digest()?;
+    const DISPOSITION: u32 = BUILT | ATTACHED;
+    const REQUIRED: u32 = WIRED;
+    if stats.flags & REQUIRED != REQUIRED
+        || stats.flags & DISPOSITION != if built { BUILT } else { ATTACHED }
+        || stats.payload_read_calls
+            != if built {
+                u64::from(stats.task_count)
+            } else {
+                0
+            }
+        || stats.payload_read_bytes != if built { stats.source_bytes } else { 0 }
+    {
+        return Err(format!(
+            "native loader returned the wrong {} accounting flags/counters",
+            if built { "build" } else { "attach" }
+        )
+        .into());
+    }
     let seconds = elapsed.as_secs_f64();
     Ok(Sample {
+        built,
         requested_workers: workers,
         elapsed_ms: seconds * 1000.0,
-        gib_per_second: stats.source_bytes as f64 / GIB / seconds.max(f64::MIN_POSITIVE),
+        gib_per_second: built
+            .then_some(stats.source_bytes as f64 / GIB / seconds.max(f64::MIN_POSITIVE)),
         rss_after_open_bytes: rss_after,
         rss_delta_bytes: rss_before
             .zip(rss_after)
             .map(|(before, after)| after as i64 - before as i64),
         stats,
-        digest,
+        digest: digest(&stats.content_digest),
     })
 }
 
@@ -212,14 +261,19 @@ fn summary(samples: &[Sample]) -> Value {
     json!({
         "samples": samples.len(),
         "elapsed_ms": metric(samples, |sample| Some(sample.elapsed_ms)),
-        "gib_per_second": metric(samples, |sample| Some(sample.gib_per_second)),
+        "gib_per_second": metric(samples, |sample| sample.gib_per_second),
         "rss_after_open_bytes": metric(samples, |sample| sample.rss_after_open_bytes.map(|value| value as f64)),
         "rss_delta_bytes": metric(samples, |sample| sample.rss_delta_bytes.map(|value| value as f64)),
         "source_bytes": first.stats.source_bytes,
-        "resident_image_bytes": first.stats.resident_bytes,
+        "segment_bytes": first.stats.segment_bytes,
+        "segment_constructed_bytes": first.stats.segment_constructed_bytes,
+        "attached_shared_bytes": first.stats.attached_shared_bytes,
+        "wired_bytes": first.stats.wired_bytes,
+        "payload_read_calls": first.stats.payload_read_calls,
+        "payload_read_bytes": first.stats.payload_read_bytes,
         "task_count": first.stats.task_count,
         "worker_count": first.stats.worker_count,
-        "image_sha256": first.digest,
+        "content_tree_sha256": first.digest,
     })
 }
 
@@ -240,13 +294,14 @@ fn pair(
     detokenizer: &Path,
     runs: usize,
     uncached: bool,
+    identity: &[u8; 32],
 ) -> Res<(Vec<Sample>, Vec<Sample>)> {
     let mut serial = Vec::with_capacity(runs);
     let mut parallel = Vec::with_capacity(runs);
     for run in 0..runs {
         let order = if run % 2 == 0 { [1, 4] } else { [4, 1] };
         for workers in order {
-            let measured = sample(main, detokenizer, workers, uncached)?;
+            let measured = sample(main, detokenizer, workers, uncached, true, identity)?;
             if workers == 1 {
                 serial.push(measured);
             } else {
@@ -257,6 +312,12 @@ fn pair(
     Ok((serial, parallel))
 }
 
+fn attaches(main: &Path, detokenizer: &Path, runs: usize, identity: &[u8; 32]) -> Res<Vec<Sample>> {
+    (0..runs)
+        .map(|_| sample(main, detokenizer, 4, false, false, identity))
+        .collect()
+}
+
 fn validate(samples: &[&[Sample]]) -> Res<()> {
     let first = samples
         .iter()
@@ -265,14 +326,14 @@ fn validate(samples: &[&[Sample]]) -> Res<()> {
         .ok_or("native loader benchmark produced no samples")?;
     for sample in samples.iter().flat_map(|samples| samples.iter()) {
         if sample.stats.source_bytes != first.stats.source_bytes
-            || sample.stats.resident_bytes != first.stats.resident_bytes
+            || sample.stats.segment_bytes != first.stats.segment_bytes
             || sample.stats.task_count != first.stats.task_count
             || sample.digest != first.digest
         {
             return Err("native loader image/accounting changed between benchmark modes".into());
         }
         let expected = sample.stats.task_count.min(sample.requested_workers);
-        if sample.stats.worker_count != expected {
+        if sample.built && sample.stats.worker_count != expected {
             return Err(format!(
                 "loader reported {} workers for {} tasks",
                 sample.stats.worker_count, sample.stats.task_count
@@ -294,6 +355,10 @@ fn env_runs() -> Res<usize> {
 }
 
 fn main() -> Res<()> {
+    /* The native loader now publishes correlated kcoro readiness edges. This
+     * direct-FFI benchmark must retain the substrate crate even though Rust
+     * owns no loader logic. */
+    kcoro_sys::link_anchor();
     let main = PathBuf::from(
         std::env::var_os("LFM_MODEL_DIR")
             .ok_or("set LFM_MODEL_DIR to an explicit local LFM2-Audio checkpoint")?,
@@ -315,17 +380,33 @@ fn main() -> Res<()> {
     let cold_supported = unsafe { lfm_internal_weights_benchmark_cold_supported() } == 1;
     let skip_cold = std::env::var_os("LFM_LOAD_BENCH_SKIP_COLD").is_some();
 
+    /* Resolve the exact identity once, then make every build sample explicit
+     * with evict. Without this preflight the persistent segment turns a
+     * loader benchmark into an attach benchmark after its first sample. */
+    let preflight = Image::open(&main, &detokenizer, 4, false)?;
+    let identity = preflight.stats()?.identity_digest;
+    drop(preflight);
+
     let cold = if cold_supported && !skip_cold {
-        let (serial, parallel) = pair(&main, &detokenizer, runs, true)?;
+        let (serial, parallel) = pair(&main, &detokenizer, runs, true, &identity)?;
         Some((serial, parallel))
     } else {
         None
     };
 
-    // One unreported cached open makes the subsequent warm series explicit.
-    drop(sample(&main, &detokenizer, 4, false)?);
-    let (warm_serial, warm_parallel) = pair(&main, &detokenizer, runs, false)?;
-    let mut all = vec![warm_serial.as_slice(), warm_parallel.as_slice()];
+    /* One unreported build warms the source page cache. The segment is then
+     * explicitly evicted by the first measured sample; only the file cache is
+     * warm. */
+    drop(sample(&main, &detokenizer, 4, false, true, &identity)?);
+    let (warm_serial, warm_parallel) = pair(&main, &detokenizer, runs, false, &identity)?;
+    /* The final warm build intentionally leaves READY behind. Every following
+     * sample must attach with zero tensor-payload reads. */
+    let attach = attaches(&main, &detokenizer, runs, &identity)?;
+    let mut all = vec![
+        warm_serial.as_slice(),
+        warm_parallel.as_slice(),
+        attach.as_slice(),
+    ];
     if let Some((serial, parallel)) = &cold {
         all.push(serial);
         all.push(parallel);
@@ -345,7 +426,7 @@ fn main() -> Res<()> {
         "audio_detokenizer": detokenizer,
         "runs_per_mode": runs,
         "chunk_bytes": 8 * 1024 * 1024usize,
-        "digest_algorithm": "sha256",
+        "digest_algorithm": "LFM-WEIGHT-CONTENT-V1 sha256 tree",
         "cold_cache_control": if skip_cold {
             "skipped_by_LFM_LOAD_BENCH_SKIP_COLD"
         } else if cfg!(target_os = "macos") {
@@ -355,23 +436,25 @@ fn main() -> Res<()> {
         } else {
             "unavailable"
         },
-        "cold": cold_json,
-        "warm": {
+        "cold_build": cold_json,
+        "warm_build": {
             "serial": summary(&warm_serial),
             "four_worker": summary(&warm_parallel),
             "comparison": warm_compare,
         },
+        "attach": summary(&attach),
     });
     println!("{}", serde_json::to_string_pretty(&report)?);
 
-    let warm_pass = report["warm"]["comparison"]["passes_no_regression_gate"] == true;
-    let cold_pass = report["cold"]
+    let warm_pass = report["warm_build"]["comparison"]["passes_no_regression_gate"] == true;
+    let cold_pass = report["cold_build"]
         .as_object()
         .map(|cold| cold["comparison"]["passes_no_regression_gate"] == true)
         .unwrap_or(true);
     if (!warm_pass || !cold_pass) && std::env::var_os("LFM_LOAD_BENCH_ALLOW_REGRESSION").is_none() {
         return Err("four-worker native loader regressed its serial baseline".into());
     }
+    evict(&identity)?;
     Ok(())
 }
 

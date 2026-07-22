@@ -53,7 +53,8 @@ There is no oracle feature, callable numerical ABI, or Rust model fallback.
 - Every worker joins before failure unwinds the image. The loader deterministically
   selects failures, verifies the same open handles, closes them before publication,
   validates metadata/spans, and seals the allocation read-only.
-- `LfmModelMemoryV1` reports source bytes, resident bytes, directly bound bytes,
+- `LfmModelMemoryV2` reports source bytes, shared segment build/attach/wire
+  ownership, tensor-payload reads, directly bound bytes,
   formula-derived immutable bytes, compatibility-copied bytes, load time, worker
   count, and task count. Directly bound bytes come from successful exact binders
   (deduplicated by resident span), not from summing every checkpoint entry; unused

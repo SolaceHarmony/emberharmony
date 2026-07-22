@@ -10,7 +10,7 @@
 extern "C" {
 #endif
 
-#define LFM_WEIGHT_ABI_VERSION 1u
+#define LFM_WEIGHT_ABI_VERSION 2u
 
 typedef struct LfmWeightImage LfmWeightImage;
 
@@ -31,6 +31,12 @@ typedef enum LfmWeightStatus {
     LFM_WEIGHT_FORMAT_ERROR = -3,
     LFM_WEIGHT_OUT_OF_MEMORY = -4,
     LFM_WEIGHT_NOT_FOUND = -5,
+    /* A matching segment is being built by a live owner. Synchronous callers
+     * must return this edge to their owning continuation; they must not poll,
+     * sleep, or park a physical worker beside the BUILDING generation. */
+    LFM_WEIGHT_IN_PROGRESS = -6,
+    /* A same-name shared object failed the identity/layout/security ladder. */
+    LFM_WEIGHT_REJECTED = -7,
 } LfmWeightStatus;
 
 typedef enum LfmWeightDType {
@@ -77,14 +83,44 @@ typedef struct LfmTensorView {
     uint32_t reserved;
 } LfmTensorView;
 
-typedef struct LfmWeightLoadStatsV1 {
+typedef enum LfmWeightLoadFlags {
+    LFM_WEIGHT_LOAD_BUILT = 1u << 0,
+    LFM_WEIGHT_LOAD_ATTACHED = 1u << 1,
+    LFM_WEIGHT_LOAD_WIRED = 1u << 2,
+    LFM_WEIGHT_LOAD_REGISTRY_REUSED = 1u << 3,
+} LfmWeightLoadFlags;
+
+/* Per-process provenance for one immutable shared weight segment. The two
+ * ownership byte counts are mutually exclusive for the process's first lease:
+ * a builder reports segment_constructed_bytes; a new mapping reports
+ * attached_shared_bytes; a process-registry lease reports neither. Shared
+ * pages are never presented as a fresh private allocation for every model.
+ * process_resident_bytes describes the one process mapping and is deliberately
+ * non-additive across handles or processes. */
+typedef struct LfmWeightLoadStatsV2 {
     uint32_t size;
     uint32_t abi_version;
     uint64_t source_bytes;
-    uint64_t resident_bytes;
+    uint64_t segment_bytes;
+    uint64_t segment_constructed_bytes;
+    uint64_t attached_shared_bytes;
+    uint64_t wired_bytes;
+    uint64_t process_resident_bytes;
+    uint64_t build_ns;
+    uint64_t attach_ns;
+    uint64_t generation;
     uint32_t task_count;
     uint32_t worker_count;
-} LfmWeightLoadStatsV1;
+    uint32_t flags;
+    uint32_t source_count;
+    /* Tensor-payload I/O performed by this open. These are the decisive
+     * build-vs-attach counters: a builder reports one record per positioned
+     * read task and all source bytes; every attach reports zero for both. */
+    uint64_t payload_read_calls;
+    uint64_t payload_read_bytes;
+    uint8_t identity_digest[32];
+    uint8_t content_digest[32];
+} LfmWeightLoadStatsV2;
 
 /* Open one .safetensors file, a model.safetensors.index.json file, or a
  * checkpoint directory. A directory prefers the Hugging Face shard index,
@@ -112,16 +148,22 @@ LFM_INTERNAL_API int lfm_weights_open_bundle(const char *main_path,
 
 LFM_INTERNAL_API void lfm_weights_close(LfmWeightImage *image);
 
+/* Remove only the machine-wide name for an exact checkpoint identity. Existing
+ * mappings and views remain alive through their leases; a later open elects a
+ * new builder. Detach never calls this function implicitly. */
+LFM_INTERNAL_API int lfm_weights_evict(const uint8_t identity_digest[32],
+                                      char *err, size_t errlen);
+
 LFM_INTERNAL_API const void *lfm_weights_data(const LfmWeightImage *image);
 LFM_INTERNAL_API uint64_t
 lfm_weights_resident_bytes(const LfmWeightImage *image);
 LFM_INTERNAL_API size_t lfm_weights_count(const LfmWeightImage *image);
 LFM_INTERNAL_API size_t
 lfm_weights_component_count(const LfmWeightImage *image, uint32_t component);
-/* Transitional native-only accounting. Source bytes exclude alignment padding;
- * resident bytes include it. The function initializes the complete V1 output. */
+/* Native-only shared-segment accounting. The function initializes the complete
+ * V2 output, including identity and content digests. */
 LFM_INTERNAL_API int lfm_weights_load_stats(const LfmWeightImage *image,
-                                          LfmWeightLoadStatsV1 *out);
+                                          LfmWeightLoadStatsV2 *out);
 
 LFM_INTERNAL_API int lfm_weights_at(const LfmWeightImage *image, size_t index,
                                   LfmTensorView *out);

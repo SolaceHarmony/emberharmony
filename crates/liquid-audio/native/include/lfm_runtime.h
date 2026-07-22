@@ -14,7 +14,7 @@ extern "C" {
 /* The immutable native model/accounting ABI remains versioned independently
  * from the runtime lifecycle ABI. Numerical model metadata is intentionally not
  * part of this header. */
-#define LFM_MODEL_ABI_VERSION 4u
+#define LFM_MODEL_ABI_VERSION 5u
 
 /* `payload_read_coverage` says which setup-time payload sources contribute to
  * the counters below. `LFM_MODEL_ACCOUNTING_PAYLOAD_READS_COMPLETE` is a
@@ -27,11 +27,15 @@ extern "C" {
 #define LFM_MODEL_PAYLOAD_READ_TOKENIZER (1u << 3)
 #define LFM_MODEL_ACCOUNTING_PAYLOAD_READS_COMPLETE (1u << 0)
 
-typedef struct LfmModelMemoryV1 {
+typedef struct LfmModelMemoryV2 {
     uint32_t size;
     uint32_t abi_version;
     uint64_t source_bytes;
-    uint64_t resident_image_bytes;
+    uint64_t segment_bytes;
+    uint64_t segment_constructed_bytes;
+    uint64_t attached_shared_bytes;
+    uint64_t wired_bytes;
+    uint64_t process_resident_bytes;
     uint64_t directly_bound_bytes;
     uint64_t derived_immutable_bytes;
     uint64_t materialized_weight_bytes;
@@ -47,11 +51,18 @@ typedef struct LfmModelMemoryV1 {
     /* Zero while the model is private construction state; one after its only
      * successful publication. The generation belongs to this model object. */
     uint64_t publication_generation;
+    uint64_t weight_build_ns;
+    uint64_t weight_attach_ns;
+    uint64_t weight_generation;
     uint64_t load_ns;
     uint32_t load_workers;
     uint32_t load_tasks;
     uint32_t payload_read_coverage;
     uint32_t accounting_flags;
+    uint32_t weight_flags;
+    uint32_t weight_source_count;
+    uint64_t weight_payload_read_calls;
+    uint64_t weight_payload_read_bytes;
     /* A conversation seals its numerical allocation geometry after its first
      * complete capture-plus-playback preparation. These counters aggregate
      * later rejected attempts across the model's conversations. Bytes are the
@@ -59,8 +70,10 @@ typedef struct LfmModelMemoryV1 {
      * allocator metadata or an estimate of opaque object overhead. */
     uint64_t post_readiness_allocation_attempts;
     uint64_t post_readiness_allocation_bytes;
+    uint8_t weight_identity_digest[32];
+    uint8_t weight_content_digest[32];
     uint64_t reserved[2];
-} LfmModelMemoryV1;
+} LfmModelMemoryV2;
 
 typedef struct LfmRuntimeConfigV1 {
     uint32_t size;
@@ -136,7 +149,7 @@ LFM_PUBLIC_API int lfm_runtime_model_open(
  * shape, vocabulary, or numerical-plan metadata crosses this boundary. */
 LFM_PUBLIC_API int lfm_runtime_model_memory(const LfmRuntime *runtime,
                                             const LfmModel *model,
-                                            LfmModelMemoryV1 *out);
+                                            LfmModelMemoryV2 *out);
 LFM_PUBLIC_API int lfm_runtime_model_close(LfmRuntime *runtime,
                                            LfmModel *model);
 

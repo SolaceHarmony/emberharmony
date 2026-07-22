@@ -11,10 +11,11 @@ const PERMISSION: i32 = -1;
 const IO: i32 = -2;
 const FORMAT: i32 = -3;
 const NOT_FOUND: i32 = -5;
+const IN_PROGRESS: i32 = -6;
 const INVALID: i32 = -22;
-const WEIGHT_ABI: u32 = 1;
+const WEIGHT_ABI: u32 = 2;
 const RUNTIME_ABI: u32 = 4;
-const MODEL_ABI: u32 = 4;
+const MODEL_ABI: u32 = 5;
 const PAYLOAD_CONFIG: u32 = 1;
 const PAYLOAD_WEIGHT_IMAGE: u32 = 1 << 1;
 const PAYLOAD_WEIGHT_INDEX: u32 = 1 << 2;
@@ -22,6 +23,9 @@ const PAYLOAD_TOKENIZER: u32 = 1 << 3;
 const PAYLOAD_READS_COMPLETE: u32 = 1;
 const BF16: u32 = 13;
 const F32: u32 = 16;
+const LOAD_BUILT: u32 = 1;
+const LOAD_ATTACHED: u32 = 1 << 1;
+const LOAD_WIRED: u32 = 1 << 2;
 
 #[repr(C)]
 struct WeightImage {
@@ -89,7 +93,11 @@ struct ModelMemory {
     size: u32,
     abi_version: u32,
     source_bytes: u64,
-    resident_image_bytes: u64,
+    segment_bytes: u64,
+    segment_constructed_bytes: u64,
+    attached_shared_bytes: u64,
+    wired_bytes: u64,
+    process_resident_bytes: u64,
     directly_bound_bytes: u64,
     derived_immutable_bytes: u64,
     materialized_weight_bytes: u64,
@@ -101,13 +109,22 @@ struct ModelMemory {
     post_publication_materialization_attempts: u64,
     post_publication_materialization_bytes: u64,
     publication_generation: u64,
+    weight_build_ns: u64,
+    weight_attach_ns: u64,
+    weight_generation: u64,
     load_ns: u64,
     load_workers: u32,
     load_tasks: u32,
     payload_read_coverage: u32,
     accounting_flags: u32,
+    weight_flags: u32,
+    weight_source_count: u32,
+    weight_payload_read_calls: u64,
+    weight_payload_read_bytes: u64,
     post_readiness_allocation_attempts: u64,
     post_readiness_allocation_bytes: u64,
+    weight_identity_digest: [u8; 32],
+    weight_content_digest: [u8; 32],
     reserved: [u64; 2],
 }
 
@@ -134,9 +151,22 @@ struct LoadStats {
     size: u32,
     abi_version: u32,
     source_bytes: u64,
-    resident_bytes: u64,
+    segment_bytes: u64,
+    segment_constructed_bytes: u64,
+    attached_shared_bytes: u64,
+    wired_bytes: u64,
+    process_resident_bytes: u64,
+    build_ns: u64,
+    attach_ns: u64,
+    generation: u64,
     task_count: u32,
     worker_count: u32,
+    flags: u32,
+    source_count: u32,
+    payload_read_calls: u64,
+    payload_read_bytes: u64,
+    identity_digest: [u8; 32],
+    content_digest: [u8; 32],
 }
 
 extern "C" {
@@ -177,6 +207,8 @@ extern "C" {
         errlen: usize,
     ) -> i32;
     fn lfm_weights_close(image: *mut WeightImage);
+    fn lfm_weights_evict(identity: *const u8, err: *mut c_char, errlen: usize) -> i32;
+    fn lfm_internal_weights_evict_path_for_test(path: *const c_char) -> i32;
     fn lfm_weights_data(image: *const WeightImage) -> *const c_void;
     fn lfm_weights_resident_bytes(image: *const WeightImage) -> u64;
     fn lfm_weights_count(image: *const WeightImage) -> usize;
@@ -248,6 +280,24 @@ extern "C" {
         err: *mut c_char,
         errlen: usize,
     ) -> i32;
+    fn lfm_internal_weights_continuation_singleflight_test(
+        path: *const c_char,
+        built: *mut u32,
+        attached: *mut u32,
+        reused: *mut u32,
+        suspended: *mut u32,
+        err: *mut c_char,
+        errlen: usize,
+    ) -> i32;
+    fn lfm_internal_weights_hostile_segment_test(
+        path: *const c_char,
+        mode: u32,
+        observed_status: *mut i32,
+        abandoned_generation: *mut u64,
+        published_generation: *mut u64,
+        err: *mut c_char,
+        errlen: usize,
+    ) -> i32;
 }
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -268,6 +318,11 @@ impl Temp {
 
 impl Drop for Temp {
     fn drop(&mut self) {
+        if let Ok(path) = CString::new(self.0.as_os_str().as_encoded_bytes()) {
+            unsafe {
+                lfm_internal_weights_evict_path_for_test(path.as_ptr());
+            }
+        }
         std::fs::remove_dir_all(&self.0).unwrap_or_default();
     }
 }
@@ -537,7 +592,7 @@ fn tiny_model_memory(temp: &Temp) -> ModelMemory {
 }
 
 #[derive(Debug)]
-struct Image(*mut WeightImage);
+struct Image(*mut WeightImage, bool);
 
 impl Image {
     fn open(path: &Path) -> Result<Self, (i32, String)> {
@@ -553,7 +608,12 @@ impl Image {
             return Err((rc, message));
         }
         assert!(!image.is_null());
-        Ok(Self(image))
+        Ok(Self(image, true))
+    }
+
+    fn preserve_segment(mut self) -> Self {
+        self.1 = false;
+        self
     }
 
     fn find(&self, name: &str) -> Result<TensorView, i32> {
@@ -569,7 +629,24 @@ impl Image {
 
 impl Drop for Image {
     fn drop(&mut self) {
+        let mut stats = LoadStats::default();
+        let status = unsafe { lfm_weights_load_stats(self.0, &mut stats) };
         unsafe { lfm_weights_close(self.0) };
+        if status == OK && self.1 {
+            let mut error = [0i8; 512];
+            assert_eq!(
+                unsafe {
+                    lfm_weights_evict(
+                        stats.identity_digest.as_ptr(),
+                        error.as_mut_ptr(),
+                        error.len(),
+                    )
+                },
+                OK,
+                "{}",
+                unsafe { CStr::from_ptr(error.as_ptr()) }.to_string_lossy()
+            );
+        }
     }
 }
 
@@ -624,6 +701,166 @@ fn native_file_is_one_aligned_image_with_stable_views() {
         b"BF16"
     );
     assert_eq!(image.find("missing.weight").unwrap_err(), NOT_FOUND);
+}
+
+#[test]
+fn closed_builder_reopens_as_a_wired_zero_payload_attach_until_explicit_evict() {
+    let temp = Temp::new();
+    let path = temp.0.join("model.safetensors");
+    write_file(
+        &path,
+        &[Tensor {
+            name: "weight",
+            dtype: "U8",
+            shape: &[4],
+            data: &[1, 3, 3, 7],
+        }],
+    );
+
+    let first = Image::open(&path).unwrap().preserve_segment();
+    let mut built = LoadStats::default();
+    assert_eq!(unsafe { lfm_weights_load_stats(first.0, &mut built) }, OK);
+    assert_eq!(
+        built.flags & (LOAD_BUILT | LOAD_ATTACHED | LOAD_WIRED),
+        LOAD_BUILT | LOAD_WIRED
+    );
+    assert_eq!(built.segment_constructed_bytes, built.segment_bytes);
+    assert_eq!(built.attached_shared_bytes, 0);
+    assert_eq!(built.wired_bytes, built.segment_bytes);
+    assert_eq!(built.payload_read_calls, u64::from(built.task_count));
+    assert_eq!(built.payload_read_bytes, built.source_bytes);
+    assert!(built.build_ns > 0);
+    assert_eq!(built.attach_ns, 0);
+    assert_eq!(built.source_count, 1);
+    assert!(built.identity_digest.iter().any(|byte| *byte != 0));
+    assert!(built.content_digest.iter().any(|byte| *byte != 0));
+    drop(first);
+
+    let second = Image::open(&path).unwrap();
+    let mut attached = LoadStats::default();
+    assert_eq!(
+        unsafe { lfm_weights_load_stats(second.0, &mut attached) },
+        OK
+    );
+    assert_eq!(
+        attached.flags & (LOAD_BUILT | LOAD_ATTACHED | LOAD_WIRED),
+        LOAD_ATTACHED | LOAD_WIRED
+    );
+    assert_eq!(attached.segment_constructed_bytes, 0);
+    assert_eq!(attached.attached_shared_bytes, attached.segment_bytes);
+    assert_eq!(attached.wired_bytes, attached.segment_bytes);
+    assert_eq!(attached.payload_read_calls, 0);
+    assert_eq!(attached.payload_read_bytes, 0);
+    assert!(attached.attach_ns > 0);
+    assert_eq!(attached.generation, built.generation);
+    assert_eq!(attached.identity_digest, built.identity_digest);
+    assert_eq!(attached.content_digest, built.content_digest);
+    assert_eq!(second.find("weight").unwrap().bytes, 4);
+    drop(second);
+
+    let rebuilt = Image::open(&path).unwrap();
+    let mut after_evict = LoadStats::default();
+    assert_eq!(
+        unsafe { lfm_weights_load_stats(rebuilt.0, &mut after_evict) },
+        OK
+    );
+    assert_ne!(after_evict.generation, built.generation);
+    assert_eq!(after_evict.flags & LOAD_BUILT, LOAD_BUILT);
+}
+
+#[test]
+fn eight_coroutines_single_flight_one_build_and_seven_correlated_registry_leases() {
+    let temp = Temp::new();
+    let path = temp.0.join("single-flight.safetensors");
+    let payload = vec![0x5au8; 32 * 1024 * 1024];
+    write_file(
+        &path,
+        &[Tensor {
+            name: "weight",
+            dtype: "U8",
+            shape: &[payload.len() as u64],
+            data: &payload,
+        }],
+    );
+    let path = CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+    let mut built = 0;
+    let mut attached = 0;
+    let mut reused = 0;
+    let mut suspended = 0;
+    let mut error = [0i8; 512];
+    let status = unsafe {
+        lfm_internal_weights_continuation_singleflight_test(
+            path.as_ptr(),
+            &mut built,
+            &mut attached,
+            &mut reused,
+            &mut suspended,
+            error.as_mut_ptr(),
+            error.len(),
+        )
+    };
+    assert_eq!(
+        status,
+        0,
+        "native continuation gate failed: {}",
+        unsafe { CStr::from_ptr(error.as_ptr()) }.to_string_lossy()
+    );
+    assert_eq!((built, attached, reused, suspended), (1, 0, 7, 7));
+}
+
+#[test]
+#[cfg(unix)]
+fn hostile_and_abandoned_named_segments_fail_closed_or_take_over_once() {
+    let temp = Temp::new();
+    let path = temp.0.join("hostile.safetensors");
+    write_file(
+        &path,
+        &[Tensor {
+            name: "weight",
+            dtype: "U8",
+            shape: &[4],
+            data: &[2, 3, 5, 7],
+        }],
+    );
+    let path = CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+    for mode in 1..=8 {
+        let mut observed = 0;
+        let mut abandoned = 0;
+        let mut published = 0;
+        let mut error = [0i8; 512];
+        let status = unsafe {
+            lfm_internal_weights_hostile_segment_test(
+                path.as_ptr(),
+                mode,
+                &mut observed,
+                &mut abandoned,
+                &mut published,
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        assert_eq!(
+            status,
+            OK,
+            "hostile segment mode {mode} failed: {}",
+            unsafe { CStr::from_ptr(error.as_ptr()) }.to_string_lossy()
+        );
+        assert_eq!(
+            observed,
+            if mode == 5 {
+                IN_PROGRESS
+            } else if mode == 6 {
+                OK
+            } else {
+                -7
+            }
+        );
+        if mode == 6 {
+            assert_ne!(abandoned, 0);
+            assert_ne!(published, 0);
+            assert_ne!(published, abandoned);
+        }
+    }
 }
 
 #[test]
@@ -717,7 +954,7 @@ fn bundle_scopes_duplicate_names_and_uses_one_image() {
         "{}",
         unsafe { CStr::from_ptr(err.as_ptr()) }.to_string_lossy()
     );
-    let image = Image(raw);
+    let image = Image(raw, true);
     assert_eq!(unsafe { lfm_weights_count(image.0) }, 1);
     assert_eq!(unsafe { lfm_weights_component_count(image.0, MAIN) }, 1);
     assert_eq!(
@@ -771,10 +1008,20 @@ fn bundle_scopes_duplicate_names_and_uses_one_image() {
             "{}",
             unsafe { CStr::from_ptr(error.as_ptr()) }.to_string_lossy()
         );
-        Image(raw)
+        Image(raw, true)
     };
     let serial = open_benchmark(1);
     let parallel = open_benchmark(4);
+    assert_eq!(
+        unsafe { lfm_weights_data(image.0) },
+        unsafe { lfm_weights_data(serial.0) },
+        "the process registry must reuse one mapped image"
+    );
+    assert_eq!(
+        unsafe { lfm_weights_data(image.0) },
+        unsafe { lfm_weights_data(parallel.0) },
+        "the process registry must reuse one mapped image"
+    );
     let mut serial_stats = LoadStats::default();
     let mut parallel_stats = LoadStats::default();
     assert_eq!(
@@ -785,7 +1032,7 @@ fn bundle_scopes_duplicate_names_and_uses_one_image() {
         unsafe { lfm_weights_load_stats(parallel.0, &mut parallel_stats) },
         OK
     );
-    assert_eq!(serial_stats.worker_count, 1);
+    assert_eq!(serial_stats.worker_count, 2);
     assert_eq!(parallel_stats.worker_count, 2);
     assert_eq!(serial_stats.task_count, 2);
     assert_eq!(parallel_stats.task_count, 2);
@@ -869,7 +1116,7 @@ fn parallel_read_is_byte_exact_across_chunks_and_zeroes_only_padding() {
         stats.source_bytes,
         (first_file.len() + second_file.len()) as u64
     );
-    assert_eq!(stats.resident_bytes, resident as u64);
+    assert_eq!(stats.segment_bytes, resident as u64);
     let tasks = (first_file.len() + CHUNK - 1) / CHUNK + (second_file.len() + CHUNK - 1) / CHUNK;
     assert_eq!(stats.task_count, tasks as u32);
     assert_eq!(stats.worker_count, tasks.min(4) as u32);
@@ -882,14 +1129,21 @@ fn parallel_read_is_byte_exact_across_chunks_and_zeroes_only_padding() {
         unsafe { std::slice::from_raw_parts(b_view.data.cast::<u8>(), b.len()) } == b.as_slice(),
         "second payload changed across positioned-read chunks"
     );
+    let first_base = a_view.offset as usize - payload_start(&first);
+    assert_eq!(
+        first_base,
+        64 * 1024,
+        "source zero follows the fixed header"
+    );
+    assert!(bytes[..first_base].iter().any(|byte| *byte != 0));
     assert!(
-        &bytes[..first_file.len()] == first_file.as_slice(),
+        &bytes[first_base..first_base + first_file.len()] == first_file.as_slice(),
         "first complete source changed in the resident image"
     );
 
     let second_base = b_view.offset as usize - payload_start(&second);
-    assert_eq!(second_base & 63, 0);
-    assert!(bytes[first_file.len()..second_base]
+    assert_eq!(second_base & ((64 * 1024) - 1), 0);
+    assert!(bytes[first_base + first_file.len()..second_base]
         .iter()
         .all(|byte| *byte == 0));
     assert!(
@@ -902,7 +1156,7 @@ fn parallel_read_is_byte_exact_across_chunks_and_zeroes_only_padding() {
 }
 
 #[test]
-fn concurrent_opens_publish_independent_complete_images() {
+fn synchronous_concurrent_open_never_waits_on_or_observes_a_partial_image() {
     let temp = Temp::new();
     let path = temp.0.join("model.safetensors");
     let payload = (0usize..1024 * 1024 + 19)
@@ -928,23 +1182,40 @@ fn concurrent_opens_publish_independent_complete_images() {
             let expected = payload.clone();
             std::thread::spawn(move || {
                 start.wait();
-                let image = Image::open(&path).expect("concurrent image open");
-                let view = image.find("weight").expect("concurrent tensor view");
-                let actual = unsafe {
-                    std::slice::from_raw_parts(view.data.cast::<u8>(), view.bytes as usize)
+                let opened_image = Image::open(&path);
+                let result = match opened_image.as_ref() {
+                    Ok(image) => {
+                        let view = image.find("weight").expect("concurrent tensor view");
+                        let actual = unsafe {
+                            std::slice::from_raw_parts(view.data.cast::<u8>(), view.bytes as usize)
+                        };
+                        assert_eq!(actual, expected);
+                        (OK, unsafe { lfm_weights_data(image.0) as usize })
+                    }
+                    Err((status, _)) => (*status, 0),
                 };
-                assert_eq!(actual, expected);
-                let base = unsafe { lfm_weights_data(image.0) as usize };
                 opened.wait();
-                base
+                result
             })
         })
         .collect::<Vec<_>>();
-    let bases = workers
+    let outcomes = workers
         .into_iter()
         .map(|worker| worker.join().expect("concurrent loader worker"))
+        .collect::<Vec<_>>();
+    assert!(outcomes.iter().any(|(status, _)| *status == OK));
+    assert!(outcomes
+        .iter()
+        .all(|(status, _)| *status == OK || *status == IN_PROGRESS));
+    let bases = outcomes
+        .iter()
+        .filter_map(|(status, base)| (*status == OK).then_some(*base))
         .collect::<std::collections::HashSet<_>>();
-    assert_eq!(bases.len(), 8, "each open must own its own final image");
+    assert_eq!(
+        bases.len(),
+        1,
+        "every published handle must be one registry image"
+    );
 }
 
 #[test]
@@ -997,6 +1268,13 @@ fn changed_source_and_read_failure_join_the_complete_read_team() {
         "loader returned before every read task terminated"
     );
     assert!(message.contains("injected positioned-read failure"));
+
+    let (status, scheduled, completed, message) = invoke(&failed, 3);
+    assert_eq!(status, IO);
+    assert_eq!(scheduled, 0, "wire failure must precede payload reads");
+    assert_eq!(completed, 0);
+    assert!(message.contains("cannot mlock the shared weight segment"));
+    assert!(message.contains("Unwired model operation is forbidden"));
 
     let changed = temp.0.join("changed.safetensors");
     write_file(
@@ -1238,7 +1516,7 @@ fn directly_bound_accounting_excludes_unused_checkpoint_tensors() {
     let extra_memory = tiny_model_memory(&extra);
 
     assert!(extra_memory.source_bytes > baseline_memory.source_bytes);
-    assert!(extra_memory.resident_image_bytes > baseline_memory.resident_image_bytes);
+    assert!(extra_memory.segment_bytes >= baseline_memory.segment_bytes);
     assert_eq!(
         extra_memory.directly_bound_bytes, baseline_memory.directly_bound_bytes,
         "unused checkpoint tensors must not masquerade as schema-bound weights"
@@ -1408,7 +1686,26 @@ fn opaque_native_model_reports_single_image_accounting() {
     };
     assert_eq!(unsafe { lfm_model_memory(model, &mut memory) }, 0);
     assert!(memory.source_bytes > 0);
-    assert_eq!(memory.resident_image_bytes, info.resident_bytes);
+    assert_eq!(memory.segment_bytes, info.resident_bytes);
+    assert_eq!(memory.segment_constructed_bytes, memory.segment_bytes);
+    assert_eq!(memory.attached_shared_bytes, 0);
+    assert_eq!(memory.wired_bytes, memory.segment_bytes);
+    assert_eq!(memory.process_resident_bytes, memory.segment_bytes);
+    assert_eq!(
+        memory.weight_flags & (LOAD_BUILT | LOAD_WIRED),
+        LOAD_BUILT | LOAD_WIRED
+    );
+    assert!(memory.weight_build_ns > 0);
+    assert_eq!(memory.weight_attach_ns, 0);
+    assert!(memory.weight_generation > 0);
+    assert_eq!(memory.weight_source_count, 1);
+    assert_eq!(
+        memory.weight_payload_read_calls,
+        u64::from(memory.load_tasks)
+    );
+    assert_eq!(memory.weight_payload_read_bytes, memory.source_bytes);
+    assert!(memory.weight_identity_digest.iter().any(|byte| *byte != 0));
+    assert!(memory.weight_content_digest.iter().any(|byte| *byte != 0));
     assert!(memory.directly_bound_bytes > 0);
     assert_eq!(memory.materialized_weight_bytes, 0);
     assert_eq!(memory.compatibility_copied_bytes, 0);
@@ -1489,46 +1786,124 @@ fn complete_runtime_model_reports_lifecycle_only_memory_accounting() {
         std::env::var_os("LFM_MODEL_DIR")
             .expect("LFM_MODEL_DIR must name the complete LFM2-Audio checkpoint"),
     );
-    let model = liquid_audio::NativeVoiceModel::open(&dir).expect("complete native voice model");
-    let first = model.memory().expect("native lifecycle memory report");
-    let second = model
+    let prior =
+        liquid_audio::NativeVoiceModel::open(&dir).expect("open prior shared segment identity");
+    let prior_memory = prior.memory().expect("prior shared segment identity");
+    drop(prior);
+    let mut error = [0i8; 512];
+    assert_eq!(
+        unsafe {
+            lfm_weights_evict(
+                prior_memory.weight_identity_digest.as_ptr(),
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        },
+        OK,
+        "cannot establish a cold build generation: {}",
+        unsafe { CStr::from_ptr(error.as_ptr()) }.to_string_lossy()
+    );
+
+    let builder =
+        liquid_audio::NativeVoiceModel::open(&dir).expect("build complete native voice model");
+    let built = builder.memory().expect("native build memory report");
+    let repeated = builder
         .memory()
         .expect("repeat native lifecycle memory report");
     assert_eq!(
-        first, second,
+        built, repeated,
         "immutable model accounting changed after open"
     );
-    assert!(first.source_bytes > 0);
-    assert!(first.resident_image_bytes >= first.source_bytes);
-    assert!(first.directly_bound_bytes > 0);
-    assert_eq!(first.materialized_weight_bytes, 0);
-    assert_eq!(first.compatibility_copied_bytes, 0);
-    assert!(first.payload_read_calls > 0);
-    assert!(
-        first.payload_read_calls >= u64::from(first.load_tasks) + 2,
-        "voice accounting omitted its config or tokenizer read"
+    assert!(built.source_bytes > 0);
+    assert!(built.segment_bytes >= built.source_bytes);
+    assert_eq!(built.segment_constructed_bytes, built.segment_bytes);
+    assert_eq!(built.attached_shared_bytes, 0);
+    assert_eq!(built.wired_bytes, built.segment_bytes);
+    assert_eq!(built.process_resident_bytes, built.segment_bytes);
+    assert_eq!(built.weight_flags & LOAD_BUILT, LOAD_BUILT);
+    assert_eq!(built.weight_payload_read_calls, u64::from(built.load_tasks));
+    assert_eq!(built.weight_payload_read_bytes, built.source_bytes);
+    assert_eq!(built.weight_attach_ns, 0);
+    assert!(built.weight_build_ns > 0);
+    assert!(built.weight_generation > 0);
+    assert!(built.weight_identity_digest.iter().any(|byte| *byte != 0));
+    assert!(built.weight_content_digest.iter().any(|byte| *byte != 0));
+    assert!(built.directly_bound_bytes > 0);
+    assert_eq!(built.materialized_weight_bytes, 0);
+    assert_eq!(built.compatibility_copied_bytes, 0);
+    assert!(built.payload_read_calls > built.weight_payload_read_calls);
+    assert!(built.payload_read_bytes > built.weight_payload_read_bytes);
+    assert_eq!(
+        built.payload_read_coverage & (PAYLOAD_CONFIG | PAYLOAD_WEIGHT_IMAGE | PAYLOAD_TOKENIZER),
+        PAYLOAD_CONFIG | PAYLOAD_WEIGHT_IMAGE | PAYLOAD_TOKENIZER,
+        "builder did not account config, tensor payload, and tokenizer reads"
     );
-    assert!(
-        first.payload_read_bytes > first.source_bytes,
-        "voice accounting omitted non-image payload bytes"
+    assert_eq!(built.publication_generation, 1);
+    assert_eq!(built.post_publication_read_calls, 0);
+    assert_eq!(built.post_publication_read_bytes, 0);
+    assert_eq!(built.post_publication_materialization_attempts, 0);
+    assert_eq!(built.post_publication_materialization_bytes, 0);
+    assert!(built.payload_read_accounting_complete);
+    assert!(built.load_ns > 0);
+    assert!((1..=4).contains(&built.load_workers));
+    assert!(built.load_tasks > 0);
+    drop(builder);
+
+    let attacher = liquid_audio::NativeVoiceModel::open(&dir)
+        .expect("attach complete native voice model without payload reads");
+    let attached = attacher.memory().expect("native attach memory report");
+    assert_eq!(attached.source_bytes, built.source_bytes);
+    assert_eq!(attached.segment_bytes, built.segment_bytes);
+    assert_eq!(attached.segment_constructed_bytes, 0);
+    assert_eq!(attached.attached_shared_bytes, attached.segment_bytes);
+    assert_eq!(attached.wired_bytes, attached.segment_bytes);
+    assert_eq!(attached.process_resident_bytes, attached.segment_bytes);
+    assert_eq!(attached.weight_flags & LOAD_ATTACHED, LOAD_ATTACHED);
+    assert_eq!(attached.weight_payload_read_calls, 0);
+    assert_eq!(attached.weight_payload_read_bytes, 0);
+    assert!(attached.weight_attach_ns > 0);
+    assert_eq!(attached.weight_generation, built.weight_generation);
+    assert_eq!(
+        attached.weight_identity_digest,
+        built.weight_identity_digest
+    );
+    assert_eq!(attached.weight_content_digest, built.weight_content_digest);
+    assert_eq!(attached.directly_bound_bytes, built.directly_bound_bytes);
+    assert_eq!(attached.materialized_weight_bytes, 0);
+    assert_eq!(attached.compatibility_copied_bytes, 0);
+    assert!(attached.payload_read_calls > 0);
+    assert!(attached.payload_read_bytes > 0);
+    assert_eq!(
+        attached.payload_read_coverage & (PAYLOAD_CONFIG | PAYLOAD_TOKENIZER),
+        PAYLOAD_CONFIG | PAYLOAD_TOKENIZER,
+        "attacher omitted its config or tokenizer metadata read"
     );
     assert_eq!(
-        first.payload_read_coverage & (PAYLOAD_CONFIG | PAYLOAD_WEIGHT_IMAGE | PAYLOAD_TOKENIZER),
-        PAYLOAD_CONFIG | PAYLOAD_WEIGHT_IMAGE | PAYLOAD_TOKENIZER,
-        "complete voice model did not account an actual config, shard, or tokenizer read"
+        attached.payload_read_coverage & PAYLOAD_WEIGHT_IMAGE,
+        0,
+        "attacher re-read checkpoint tensor payload"
     );
-    assert_eq!(first.publication_generation, 1);
-    assert_eq!(first.post_publication_read_calls, 0);
-    assert_eq!(first.post_publication_read_bytes, 0);
-    assert_eq!(first.post_publication_materialization_attempts, 0);
-    assert_eq!(first.post_publication_materialization_bytes, 0);
-    assert!(
-        first.payload_read_accounting_complete,
-        "real-checkpoint read gate refuses incomplete source coverage"
+    assert_eq!(attached.publication_generation, 1);
+    assert_eq!(attached.post_publication_read_calls, 0);
+    assert_eq!(attached.post_publication_read_bytes, 0);
+    assert_eq!(attached.post_publication_materialization_attempts, 0);
+    assert_eq!(attached.post_publication_materialization_bytes, 0);
+    assert!(attached.payload_read_accounting_complete);
+    drop(attacher);
+
+    error.fill(0);
+    assert_eq!(
+        unsafe {
+            lfm_weights_evict(
+                built.weight_identity_digest.as_ptr(),
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        },
+        OK,
+        "cannot evict completed real-checkpoint gate: {}",
+        unsafe { CStr::from_ptr(error.as_ptr()) }.to_string_lossy()
     );
-    assert!(first.load_ns > 0);
-    assert!((1..=4).contains(&first.load_workers));
-    assert!(first.load_tasks > 0);
 }
 
 #[test]

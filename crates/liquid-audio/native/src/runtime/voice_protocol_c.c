@@ -9,13 +9,13 @@
 _Static_assert(sizeof(LfmTicketIdV1) == 24, "LfmTicketIdV1 ABI");
 _Static_assert(sizeof(LfmRuntimeConfigV1) == 72, "LfmRuntimeConfigV1 ABI");
 _Static_assert(sizeof(LfmRuntimeSnapshotV1) == 64, "LfmRuntimeSnapshotV1 ABI");
-_Static_assert(sizeof(LfmModelMemoryV1) == 168, "LfmModelMemoryV1 ABI");
-_Static_assert(offsetof(LfmModelMemoryV1,
-                        post_readiness_allocation_attempts) == 136,
-               "LfmModelMemoryV1 allocation attempts offset");
-_Static_assert(offsetof(LfmModelMemoryV1,
-                        post_readiness_allocation_bytes) == 144,
-               "LfmModelMemoryV1 allocation bytes offset");
+_Static_assert(sizeof(LfmModelMemoryV2) == 312, "LfmModelMemoryV2 ABI");
+_Static_assert(offsetof(LfmModelMemoryV2,
+                        post_readiness_allocation_attempts) == 216,
+               "LfmModelMemoryV2 allocation attempts offset");
+_Static_assert(offsetof(LfmModelMemoryV2,
+                        post_readiness_allocation_bytes) == 224,
+               "LfmModelMemoryV2 allocation bytes offset");
 _Static_assert(sizeof(LfmSamplingPolicyV1) == 32, "LfmSamplingPolicyV1 ABI");
 _Static_assert(sizeof(LfmConversationOptionsV1) == 120,
                "LfmConversationOptionsV1 ABI");

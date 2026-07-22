@@ -281,8 +281,8 @@ struct Gate {
     float *closed_loop_pcm = nullptr;
     uint64_t closed_loop_frames = 0;
     bool audible = false;
-    LfmModelMemoryV1 before{};
-    LfmModelMemoryV1 after{};
+    LfmModelMemoryV2 before{};
+    LfmModelMemoryV2 after{};
     float sink[CALLBACK_FRAMES]{};
 #if defined(__APPLE__)
     CFRunLoopRef runloop = nullptr;
@@ -1416,10 +1416,14 @@ int run_once(Gate *gate, uint64_t run, uint32_t audible, GateEvidence *evidence,
 #endif
 }
 
-bool accounting_equal(const LfmModelMemoryV1 &a,
-                      const LfmModelMemoryV1 &b) {
+bool accounting_equal(const LfmModelMemoryV2 &a,
+                      const LfmModelMemoryV2 &b) {
     return a.source_bytes == b.source_bytes &&
-           a.resident_image_bytes == b.resident_image_bytes &&
+           a.segment_bytes == b.segment_bytes &&
+           a.segment_constructed_bytes == b.segment_constructed_bytes &&
+           a.attached_shared_bytes == b.attached_shared_bytes &&
+           a.wired_bytes == b.wired_bytes &&
+           a.process_resident_bytes == b.process_resident_bytes &&
            a.directly_bound_bytes == b.directly_bound_bytes &&
            a.derived_immutable_bytes == b.derived_immutable_bytes &&
            a.materialized_weight_bytes == b.materialized_weight_bytes &&
@@ -1433,6 +1437,17 @@ bool accounting_equal(const LfmModelMemoryV1 &a,
            a.post_publication_materialization_bytes ==
                b.post_publication_materialization_bytes &&
            a.publication_generation == b.publication_generation &&
+           a.weight_build_ns == b.weight_build_ns &&
+           a.weight_attach_ns == b.weight_attach_ns &&
+           a.weight_generation == b.weight_generation &&
+           a.weight_flags == b.weight_flags &&
+           a.weight_source_count == b.weight_source_count &&
+           a.weight_payload_read_calls == b.weight_payload_read_calls &&
+           a.weight_payload_read_bytes == b.weight_payload_read_bytes &&
+           std::memcmp(a.weight_identity_digest, b.weight_identity_digest,
+                       sizeof(a.weight_identity_digest)) == 0 &&
+           std::memcmp(a.weight_content_digest, b.weight_content_digest,
+                       sizeof(a.weight_content_digest)) == 0 &&
            a.post_readiness_allocation_attempts ==
                b.post_readiness_allocation_attempts &&
            a.post_readiness_allocation_bytes ==
@@ -1473,7 +1488,7 @@ extern "C" int lfm_native_speech_to_speech_gate(
     }
     if (status == 0) {
         gate.before = {
-            .size = sizeof(LfmModelMemoryV1),
+            .size = sizeof(LfmModelMemoryV2),
             .abi_version = LFM_MODEL_ABI_VERSION,
         };
         status = lfm_runtime_model_memory(gate.runtime, gate.model,
@@ -1510,7 +1525,7 @@ extern "C" int lfm_native_speech_to_speech_gate(
     }
     if (status == 0) {
         gate.after = {
-            .size = sizeof(LfmModelMemoryV1),
+            .size = sizeof(LfmModelMemoryV2),
             .abi_version = LFM_MODEL_ABI_VERSION,
         };
         status = lfm_runtime_model_memory(gate.runtime, gate.model,

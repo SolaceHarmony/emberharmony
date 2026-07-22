@@ -7,10 +7,13 @@
 
 #include "lfm_safetensors.h"
 #include "lfm_payload_reader.h"
+#include "kcoro_stackless.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -18,12 +21,14 @@
 #include <filesystem>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <new>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -36,10 +41,16 @@
 #include <windows.h>
 #else
 #include <fcntl.h>
+#include <signal.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <sys/proc.h>
+#include <sys/sysctl.h>
+#endif
 #endif
 
 #include <nlohmann/json.hpp>
@@ -49,11 +60,167 @@ namespace fs = std::filesystem;
 
 namespace {
 
-constexpr size_t kWeightAlign = 64;
+/* One layout granule covers Windows section alignment and every supported
+ * POSIX page size. It is intentionally much larger than tensor alignment:
+ * tensor offsets inside each verbatim safetensors source are never changed. */
+constexpr size_t kWeightAlign = 64 * 1024;
+constexpr size_t kSegmentHeaderBytes = kWeightAlign;
+constexpr uint32_t kSegmentLayoutVersion = 1;
+constexpr uint32_t kSegmentBuilding = 1;
+constexpr uint32_t kSegmentReady = 2;
+constexpr uint32_t kSegmentPoisoned = 3;
+constexpr size_t kMaxSegmentSources = 512;
 constexpr size_t kReadChunkBytes = 8 * 1024 * 1024;
 constexpr size_t kReadWorkers = 4;
 constexpr uint64_t kMaxHeaderBytes = 100'000'000;
-static_assert(sizeof(LfmWeightLoadStatsV1) == 32);
+static_assert(sizeof(LfmWeightLoadStatsV2) == 176);
+
+using Digest = std::array<uint8_t, 32>;
+
+class Sha256 {
+  public:
+    Sha256() = default;
+
+    void update(const void *data, size_t bytes) {
+        const auto *source = static_cast<const uint8_t *>(data);
+        total_ += bytes;
+        while (bytes != 0) {
+            const size_t count = std::min(bytes, block_.size() - used_);
+            std::memcpy(block_.data() + used_, source, count);
+            source += count;
+            bytes -= count;
+            used_ += count;
+            if (used_ == block_.size()) {
+                transform(block_.data());
+                used_ = 0;
+            }
+        }
+    }
+
+    Digest finish() const {
+        Sha256 copy = *this;
+        const uint64_t bits = static_cast<uint64_t>(copy.total_) * 8u;
+        const uint8_t one = 0x80;
+        copy.update(&one, 1);
+        const uint8_t zero = 0;
+        while (copy.used_ != 56) copy.update(&zero, 1);
+        uint8_t length[8]{};
+        for (size_t i = 0; i < sizeof(length); ++i) {
+            length[7 - i] = static_cast<uint8_t>(bits >> (i * 8));
+        }
+        copy.update(length, sizeof(length));
+
+        Digest digest{};
+        for (size_t word = 0; word < copy.state_.size(); ++word) {
+            for (size_t byte = 0; byte < 4; ++byte) {
+                digest[word * 4 + byte] = static_cast<uint8_t>(
+                    copy.state_[word] >> ((3 - byte) * 8));
+            }
+        }
+        return digest;
+    }
+
+  private:
+    static uint32_t rotate(uint32_t value, unsigned bits) {
+        return (value >> bits) | (value << (32u - bits));
+    }
+
+    void transform(const uint8_t *block) {
+        static constexpr uint32_t constants[64] = {
+            0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
+            0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+            0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
+            0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+            0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
+            0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+            0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+            0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+            0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+            0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+            0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3,
+            0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+            0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5,
+            0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+            0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+            0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+        };
+        uint32_t words[64]{};
+        for (size_t i = 0; i < 16; ++i) {
+            words[i] = (static_cast<uint32_t>(block[i * 4]) << 24) |
+                       (static_cast<uint32_t>(block[i * 4 + 1]) << 16) |
+                       (static_cast<uint32_t>(block[i * 4 + 2]) << 8) |
+                       static_cast<uint32_t>(block[i * 4 + 3]);
+        }
+        for (size_t i = 16; i < 64; ++i) {
+            const uint32_t s0 = rotate(words[i - 15], 7) ^
+                                rotate(words[i - 15], 18) ^
+                                (words[i - 15] >> 3);
+            const uint32_t s1 = rotate(words[i - 2], 17) ^
+                                rotate(words[i - 2], 19) ^
+                                (words[i - 2] >> 10);
+            words[i] = words[i - 16] + s0 + words[i - 7] + s1;
+        }
+
+        uint32_t a = state_[0];
+        uint32_t b = state_[1];
+        uint32_t c = state_[2];
+        uint32_t d = state_[3];
+        uint32_t e = state_[4];
+        uint32_t f = state_[5];
+        uint32_t g = state_[6];
+        uint32_t h = state_[7];
+        for (size_t i = 0; i < 64; ++i) {
+            const uint32_t sum1 = rotate(e, 6) ^ rotate(e, 11) ^ rotate(e, 25);
+            const uint32_t choice = (e & f) ^ (~e & g);
+            const uint32_t temp1 = h + sum1 + choice + constants[i] + words[i];
+            const uint32_t sum0 = rotate(a, 2) ^ rotate(a, 13) ^ rotate(a, 22);
+            const uint32_t majority = (a & b) ^ (a & c) ^ (b & c);
+            const uint32_t temp2 = sum0 + majority;
+            h = g;
+            g = f;
+            f = e;
+            e = d + temp1;
+            d = c;
+            c = b;
+            b = a;
+            a = temp1 + temp2;
+        }
+        state_[0] += a;
+        state_[1] += b;
+        state_[2] += c;
+        state_[3] += d;
+        state_[4] += e;
+        state_[5] += f;
+        state_[6] += g;
+        state_[7] += h;
+    }
+
+    std::array<uint32_t, 8> state_ = {
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+    };
+    std::array<uint8_t, 64> block_{};
+    size_t used_{0};
+    size_t total_{0};
+};
+
+template <typename Integer>
+void hash_integer(Sha256 &hash, Integer value) {
+    static_assert(std::is_integral_v<Integer>);
+    uint8_t bytes[sizeof(Integer)]{};
+    using Unsigned = std::make_unsigned_t<Integer>;
+    const Unsigned raw = static_cast<Unsigned>(value);
+    for (size_t i = 0; i < sizeof(Integer); ++i) {
+        bytes[i] = static_cast<uint8_t>(raw >> (i * 8));
+    }
+    hash.update(bytes, sizeof(bytes));
+}
+
+Digest hash_bytes(const void *data, size_t bytes) {
+    Sha256 hash;
+    hash.update(data, bytes);
+    return hash.finish();
+}
 
 struct ReadTestHook;
 
@@ -103,97 +270,6 @@ uint64_t checked_mul(uint64_t left, uint64_t right, const std::string &what) {
     }
     return left * right;
 }
-
-class AlignedBytes {
-  public:
-    AlignedBytes() = default;
-
-    explicit AlignedBytes(size_t bytes) : bytes_(bytes) {
-#ifdef _WIN32
-        SYSTEM_INFO info{};
-        GetSystemInfo(&info);
-        const size_t page = static_cast<size_t>(info.dwPageSize);
-#else
-        const long configured = sysconf(_SC_PAGESIZE);
-        if (configured <= 0) {
-            fail(LFM_WEIGHT_IO_ERROR, "cannot query the virtual-memory page size");
-        }
-        const size_t page = static_cast<size_t>(configured);
-#endif
-        const size_t logical = bytes == 0 ? kWeightAlign : bytes;
-        if (page == 0 || logical > std::numeric_limits<size_t>::max() - (page - 1)) {
-            fail(LFM_WEIGHT_OUT_OF_MEMORY, "weight image page alignment overflows size_t");
-        }
-        allocation_ = ((logical + page - 1) / page) * page;
-#ifdef _WIN32
-        data_ = static_cast<uint8_t *>(VirtualAlloc(
-            nullptr, allocation_, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-        if (!data_) throw std::bad_alloc();
-#else
-        void *memory = mmap(nullptr, allocation_, PROT_READ | PROT_WRITE,
-                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (memory == MAP_FAILED) throw std::bad_alloc();
-        data_ = static_cast<uint8_t *>(memory);
-#endif
-    }
-
-    AlignedBytes(const AlignedBytes &) = delete;
-    AlignedBytes &operator=(const AlignedBytes &) = delete;
-
-    AlignedBytes(AlignedBytes &&other) noexcept { swap(other); }
-
-    AlignedBytes &operator=(AlignedBytes &&other) noexcept {
-        if (this != &other) {
-            AlignedBytes empty;
-            swap(empty);
-            swap(other);
-        }
-        return *this;
-    }
-
-    ~AlignedBytes() {
-        if (!data_) return;
-#ifdef _WIN32
-        (void)VirtualFree(data_, 0, MEM_RELEASE);
-#else
-        (void)munmap(data_, allocation_);
-#endif
-    }
-
-    uint8_t *data() { return data_; }
-    const uint8_t *data() const { return data_; }
-    size_t size() const { return bytes_; }
-
-    void seal() {
-        if (!data_ || sealed_) return;
-#ifdef _WIN32
-        DWORD previous = 0;
-        if (!VirtualProtect(data_, allocation_, PAGE_READONLY, &previous)) {
-            fail(LFM_WEIGHT_IO_ERROR, "cannot publish the weight image read-only");
-        }
-#else
-        if (mprotect(data_, allocation_, PROT_READ) != 0) {
-            fail(LFM_WEIGHT_IO_ERROR, "cannot publish the weight image read-only");
-        }
-#endif
-        sealed_ = true;
-    }
-
-    bool sealed() const { return sealed_; }
-
-  private:
-    void swap(AlignedBytes &other) noexcept {
-        std::swap(data_, other.data_);
-        std::swap(bytes_, other.bytes_);
-        std::swap(allocation_, other.allocation_);
-        std::swap(sealed_, other.sealed_);
-    }
-
-    uint8_t *data_{nullptr};
-    size_t bytes_{0};
-    size_t allocation_{0};
-    bool sealed_{false};
-};
 
 struct Source {
     fs::path path;
@@ -342,6 +418,7 @@ class OpenFile {
     OpenFile &operator=(OpenFile &&) = delete;
 
     size_t bytes() const { return initial_.bytes; }
+    const FileState &identity() const { return initial_; }
 
     void read_at(uint8_t *data, size_t bytes, size_t offset, ReadEvent event) const {
         size_t done = 0;
@@ -480,6 +557,7 @@ class OpenFile {
     OpenFile &operator=(OpenFile &&) = delete;
 
     size_t bytes() const { return initial_.bytes; }
+    const FileState &identity() const { return initial_; }
 
     void read_at(uint8_t *data, size_t bytes, size_t offset, ReadEvent) const {
         size_t done = 0;
@@ -549,17 +627,646 @@ class OpenFile {
 
 #endif
 
+struct SegmentSourceRecord {
+    uint64_t offset{0};
+    uint64_t bytes{0};
+    uint32_t component{0};
+    uint32_t reserved0{0};
+    uint8_t label_digest[32]{};
+    uint64_t reserved1{0};
+};
+static_assert(sizeof(SegmentSourceRecord) == 64);
+
+struct alignas(64) SegmentHeader {
+    uint8_t magic[8]{};
+    uint32_t layout_version{0};
+    uint32_t header_bytes{0};
+    uint32_t state{0};
+    uint32_t source_count{0};
+    uint64_t total_bytes{0};
+    uint64_t source_bytes{0};
+    uint64_t generation{0};
+    uint64_t owner_pid{0};
+    uint64_t owner_start_time{0};
+    uint64_t owner_uid{0};
+    uint64_t build_ns{0};
+    uint32_t build_tasks{0};
+    uint32_t build_workers{0};
+    uint8_t identity_digest[32]{};
+    uint8_t content_digest[32]{};
+    SegmentSourceRecord sources[kMaxSegmentSources]{};
+};
+static_assert(sizeof(SegmentHeader) <= kSegmentHeaderBytes);
+static_assert(offsetof(SegmentHeader, state) % alignof(uint32_t) == 0);
+static_assert(__atomic_always_lock_free(sizeof(uint32_t), nullptr));
+
+constexpr uint8_t kSegmentMagic[8] = {'L', 'F', 'M', 'W', 'S', 'E', 'G', '2'};
+
+uint32_t segment_state(const SegmentHeader *header) {
+    return __atomic_load_n(&header->state, __ATOMIC_ACQUIRE);
+}
+
+void publish_segment_state(SegmentHeader *header, uint32_t state) {
+    __atomic_store_n(&header->state, state, __ATOMIC_RELEASE);
+}
+
+bool digest_empty(const uint8_t digest[32]) {
+    uint8_t value = 0;
+    for (size_t i = 0; i < 32; ++i) value |= digest[i];
+    return value == 0;
+}
+
+std::string digest_hex(const uint8_t digest[32], size_t bytes = 32) {
+    static constexpr char alphabet[] = "0123456789abcdef";
+    std::string text(bytes * 2, '0');
+    for (size_t i = 0; i < bytes; ++i) {
+        text[i * 2] = alphabet[digest[i] >> 4];
+        text[i * 2 + 1] = alphabet[digest[i] & 15];
+    }
+    return text;
+}
+
+std::string segment_name(const Digest &identity) {
+    return "/lfm-" + digest_hex(identity.data(), 12);
+}
+
+Digest label_digest(std::string_view label) {
+    return hash_bytes(label.data(), label.size());
+}
+
+Digest identity_digest(const std::vector<Source> &sources,
+                       const std::vector<OpenFile> &files) {
+    static constexpr char domain[] = "LFM-WEIGHT-IDENTITY-V1";
+    Sha256 hash;
+    hash.update(domain, sizeof(domain) - 1);
+    hash_integer(hash, kSegmentLayoutVersion);
+    hash_integer(hash, static_cast<uint64_t>(sources.size()));
+    for (size_t index = 0; index < sources.size(); ++index) {
+        const Source &source = sources[index];
+        const FileState &state = files[index].identity();
+        const Digest label = label_digest(source.label);
+        hash_integer(hash, source.component);
+        hash.update(label.data(), label.size());
+        hash_integer(hash, static_cast<uint64_t>(state.bytes));
+        hash_integer(hash, state.identity0);
+        hash_integer(hash, state.identity1);
+        hash_integer(hash, state.modified_seconds);
+        hash_integer(hash, state.modified_nanos);
+        hash_integer(hash, state.changed_seconds);
+        hash_integer(hash, state.changed_nanos);
+    }
+    return hash.finish();
+}
+
+uint64_t current_pid();
+uint64_t current_uid();
+
+uint64_t segment_generation() {
+    uint64_t generation = static_cast<uint64_t>(
+                              std::chrono::steady_clock::now()
+                                  .time_since_epoch()
+                                  .count()) ^
+                          (current_pid() << 17);
+    return generation == 0 ? 1 : generation;
+}
+
+void initialize_segment_header(SegmentHeader *header,
+                               const std::vector<Source> &sources,
+                               size_t bytes, size_t source_bytes,
+                               const Digest &identity, uint64_t generation,
+                               uint64_t owner_pid, uint64_t owner_start,
+                               uint64_t owner_uid, uint32_t state) {
+    std::memset(header, 0, kSegmentHeaderBytes);
+    std::memcpy(header->magic, kSegmentMagic, sizeof(kSegmentMagic));
+    header->layout_version = kSegmentLayoutVersion;
+    header->header_bytes = static_cast<uint32_t>(kSegmentHeaderBytes);
+    header->source_count = static_cast<uint32_t>(sources.size());
+    header->total_bytes = bytes;
+    header->source_bytes = source_bytes;
+    header->generation = generation;
+    header->owner_pid = owner_pid;
+    header->owner_start_time = owner_start;
+    header->owner_uid = owner_uid;
+    std::memcpy(header->identity_digest, identity.data(), identity.size());
+    for (size_t index = 0; index < sources.size(); ++index) {
+        SegmentSourceRecord &record = header->sources[index];
+        const Source &source = sources[index];
+        const Digest label = label_digest(source.label);
+        record.offset = source.offset;
+        record.bytes = source.bytes;
+        record.component = source.component;
+        std::memcpy(record.label_digest, label.data(), label.size());
+    }
+    publish_segment_state(header, state);
+}
+
+uint64_t process_start_time(uint64_t pid) {
+#ifdef _WIN32
+    const DWORD access = PROCESS_QUERY_LIMITED_INFORMATION;
+    HANDLE process = OpenProcess(access, FALSE, static_cast<DWORD>(pid));
+    if (!process) return 0;
+    FILETIME created{}, exited{}, kernel{}, user{};
+    const BOOL ok = GetProcessTimes(process, &created, &exited, &kernel, &user);
+    CloseHandle(process);
+    if (!ok) return 0;
+    ULARGE_INTEGER value{};
+    value.LowPart = created.dwLowDateTime;
+    value.HighPart = created.dwHighDateTime;
+    return value.QuadPart;
+#elif defined(__APPLE__)
+    if (pid > static_cast<uint64_t>(std::numeric_limits<int>::max())) return 0;
+    int query[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, static_cast<int>(pid)};
+    kinfo_proc info{};
+    size_t bytes = sizeof(info);
+    if (sysctl(query, 4, &info, &bytes, nullptr, 0) != 0 || bytes == 0) return 0;
+    const timeval started = info.kp_proc.p_starttime;
+    return static_cast<uint64_t>(started.tv_sec) * 1'000'000u +
+           static_cast<uint64_t>(started.tv_usec);
+#else
+    const std::string path = "/proc/" + std::to_string(pid) + "/stat";
+    std::unique_ptr<std::FILE, decltype(&std::fclose)> file(
+        std::fopen(path.c_str(), "r"), &std::fclose);
+    if (!file) return 0;
+    char line[4096]{};
+    if (!std::fgets(line, sizeof(line), file.get())) return 0;
+    char *field = std::strrchr(line, ')');
+    if (!field || field[1] != ' ') return 0;
+    field += 2;
+    for (unsigned number = 3; number <= 22; ++number) {
+        char *end = field;
+        while (*end != '\0' && *end != ' ') ++end;
+        if (number == 22) {
+            const char saved = *end;
+            *end = '\0';
+            char *parsed = nullptr;
+            const unsigned long long value = std::strtoull(field, &parsed, 10);
+            *end = saved;
+            return parsed == field ? 0 : static_cast<uint64_t>(value);
+        }
+        if (*end == '\0') return 0;
+        field = end + 1;
+    }
+    return 0;
+#endif
+}
+
+uint64_t current_pid() {
+#ifdef _WIN32
+    return static_cast<uint64_t>(GetCurrentProcessId());
+#else
+    return static_cast<uint64_t>(getpid());
+#endif
+}
+
+uint64_t current_uid() {
+#ifdef _WIN32
+    return 0;
+#else
+    return static_cast<uint64_t>(geteuid());
+#endif
+}
+
+bool owner_alive(uint64_t pid, uint64_t started) {
+    if (pid == 0 || started == 0) return false;
+#ifndef _WIN32
+    if (pid > static_cast<uint64_t>(std::numeric_limits<pid_t>::max())) return false;
+    if (kill(static_cast<pid_t>(pid), 0) != 0 && errno == ESRCH) return false;
+#endif
+    return process_start_time(pid) == started;
+}
+
+std::string wire_failure(size_t bytes, int error) {
+#ifdef _WIN32
+    return "cannot wire the shared weight segment (" + std::to_string(bytes) +
+           " bytes): " + system_message(static_cast<DWORD>(error)) +
+           ". Increase the process working-set quota; unwired model operation is forbidden";
+#else
+    rlimit limit{};
+    const bool have_limit = getrlimit(RLIMIT_MEMLOCK, &limit) == 0;
+    std::string message = "cannot mlock the shared weight segment (" +
+                          std::to_string(bytes) + " bytes): " +
+                          std::strerror(error) + ". ";
+    if (have_limit && limit.rlim_cur != RLIM_INFINITY) {
+        message += "RLIMIT_MEMLOCK is " + std::to_string(limit.rlim_cur) +
+                   " bytes; raise it (for example, `ulimit -l unlimited`). ";
+    }
+#ifdef __APPLE__
+    message += "Also raise macOS vm.user_wire_limit and vm.global_user_wire_limit "
+               "above the requested byte count. ";
+#else
+    message += "Raise RLIMIT_MEMLOCK or grant CAP_IPC_LOCK. ";
+#endif
+    return message + "Unwired model operation is forbidden";
+#endif
+}
+
+struct ReadyTarget {
+    koro_cont_t *continuation{nullptr};
+    kc_ticket_id identity{};
+};
+
+struct ReadySubscriber {
+    koro_cont_t *continuation{nullptr};
+    kc_ticket_id identity{};
+};
+
+bool ticket_equal(const kc_ticket_id &left, const kc_ticket_id &right) {
+    return left.runtime_epoch == right.runtime_epoch &&
+           left.sequence == right.sequence &&
+           left.generation == right.generation && left.kind == right.kind;
+}
+
+class WeightSegment {
+  public:
+    WeightSegment() = default;
+    WeightSegment(const WeightSegment &) = delete;
+    WeightSegment &operator=(const WeightSegment &) = delete;
+    WeightSegment(WeightSegment &&other) noexcept { swap(other); }
+    WeightSegment &operator=(WeightSegment &&other) noexcept {
+        if (this != &other) {
+            WeightSegment empty;
+            swap(empty);
+            swap(other);
+        }
+        return *this;
+    }
+
+    ~WeightSegment() {
+        if (creator_ && data_ && !published_) {
+            publish_segment_state(header(), kSegmentPoisoned);
+#ifndef _WIN32
+            if (!name_.empty()) (void)shm_unlink(name_.c_str());
+#endif
+        }
+        release();
+    }
+
+    static WeightSegment acquire(const std::vector<Source> &sources,
+                                 const std::vector<OpenFile> &files,
+                                 size_t bytes, size_t source_bytes,
+                                 const Digest &identity,
+                                 bool inject_wire_failure = false,
+                                 bool takeover = true) {
+        if (sources.size() > kMaxSegmentSources) {
+            fail(LFM_WEIGHT_FORMAT_ERROR,
+                 "shared weight segment source count exceeds header capacity");
+        }
+        WeightSegment segment;
+        segment.name_ = segment_name(identity);
+        segment.identity_ = identity;
+        segment.bytes_ = bytes;
+        const auto begin = std::chrono::steady_clock::now();
+#ifdef _WIN32
+        std::wstring name(segment.name_.begin() + 1, segment.name_.end());
+        name.insert(0, L"Local\\");
+        segment.mapping_ = CreateFileMappingW(
+            INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
+            static_cast<DWORD>(static_cast<uint64_t>(bytes) >> 32),
+            static_cast<DWORD>(bytes), name.c_str());
+        if (!segment.mapping_) {
+            fail(LFM_WEIGHT_IO_ERROR,
+                 "cannot create/open shared weight section: " +
+                     system_message(GetLastError()));
+        }
+        const bool created = GetLastError() != ERROR_ALREADY_EXISTS;
+        segment.creator_ = created;
+        const DWORD access = created ? FILE_MAP_ALL_ACCESS : FILE_MAP_READ;
+        segment.data_ = static_cast<uint8_t *>(
+            MapViewOfFile(segment.mapping_, access, 0, 0, bytes));
+        if (!segment.data_) {
+            const DWORD error = GetLastError();
+            segment.release();
+            fail(LFM_WEIGHT_IO_ERROR,
+                 "cannot map shared weight section: " + system_message(error));
+        }
+#else
+        const int flags = O_RDWR | O_CREAT | O_EXCL;
+        segment.fd_ = shm_open(segment.name_.c_str(), flags, 0600);
+        if (segment.fd_ >= 0) {
+#ifdef FD_CLOEXEC
+            (void)fcntl(segment.fd_, F_SETFD, FD_CLOEXEC);
+#endif
+            segment.creator_ = true;
+            if (ftruncate(segment.fd_, static_cast<off_t>(bytes)) != 0) {
+                const int error = errno;
+                (void)shm_unlink(segment.name_.c_str());
+                segment.release();
+                fail(LFM_WEIGHT_IO_ERROR,
+                     "cannot size shared weight segment '" + segment.name_ +
+                         "': " + std::strerror(error));
+            }
+            void *mapping = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
+                                 MAP_SHARED, segment.fd_, 0);
+            if (mapping == MAP_FAILED) {
+                const int error = errno;
+                (void)shm_unlink(segment.name_.c_str());
+                segment.data_ = nullptr;
+                segment.release();
+                fail(LFM_WEIGHT_IO_ERROR,
+                     "cannot map new shared weight segment '" + segment.name_ +
+                         "': " + std::strerror(error));
+            }
+            segment.data_ = static_cast<uint8_t *>(mapping);
+        } else {
+            const int create_error = errno;
+            if (create_error != EEXIST) {
+                fail(LFM_WEIGHT_IO_ERROR,
+                     "cannot elect shared weight builder for '" + segment.name_ +
+                         "': " + std::strerror(create_error));
+            }
+            segment.fd_ = shm_open(segment.name_.c_str(), O_RDONLY, 0);
+            if (segment.fd_ < 0) {
+                const int error = errno;
+                fail(LFM_WEIGHT_IO_ERROR,
+                     "cannot attach shared weight segment '" + segment.name_ +
+                         "': " + std::strerror(error));
+            }
+#ifdef FD_CLOEXEC
+            (void)fcntl(segment.fd_, F_SETFD, FD_CLOEXEC);
+#endif
+            struct stat info {};
+            if (fstat(segment.fd_, &info) != 0) {
+                const int error = errno;
+                segment.release();
+                fail(LFM_WEIGHT_IO_ERROR,
+                     "cannot stat shared weight segment '" + segment.name_ +
+                         "': " + std::strerror(error));
+            }
+            if (info.st_uid != geteuid()) {
+                segment.release();
+                fail(LFM_WEIGHT_REJECTED,
+                     "shared weight segment owner uid does not match this process");
+            }
+            if (info.st_size == 0) {
+                segment.release();
+                fail(LFM_WEIGHT_REJECTED,
+                     "same-name shared weight object has no published storage");
+            }
+            if (info.st_size < 0 || static_cast<uint64_t>(info.st_size) != bytes) {
+                segment.release();
+                fail(LFM_WEIGHT_REJECTED,
+                     "shared weight segment size does not match checkpoint layout");
+            }
+            void *mapping = mmap(nullptr, bytes, PROT_READ, MAP_SHARED,
+                                 segment.fd_, 0);
+            if (mapping == MAP_FAILED) {
+                const int error = errno;
+                segment.data_ = nullptr;
+                segment.release();
+                fail(LFM_WEIGHT_IO_ERROR,
+                     "cannot map shared weight segment read-only: " +
+                         std::string(std::strerror(error)));
+            }
+            segment.data_ = static_cast<uint8_t *>(mapping);
+        }
+#endif
+
+        if (segment.creator_) {
+            SegmentHeader *header = segment.header();
+            const uint64_t pid = current_pid();
+            initialize_segment_header(
+                header, sources, bytes, source_bytes, identity,
+                segment_generation(), pid, process_start_time(pid),
+                current_uid(), kSegmentBuilding);
+        } else {
+            const SegmentHeader *header = segment.header();
+            if (segment_state(header) == 0) {
+                segment.release();
+                fail(LFM_WEIGHT_REJECTED,
+                     "same-name shared weight object has no valid BUILDING header");
+            }
+            const bool header_valid =
+                std::memcmp(header->magic, kSegmentMagic, sizeof(kSegmentMagic)) == 0 &&
+                header->layout_version == kSegmentLayoutVersion &&
+                header->header_bytes == kSegmentHeaderBytes &&
+                header->total_bytes == bytes &&
+                header->source_bytes == source_bytes &&
+                header->source_count == sources.size() &&
+                header->generation != 0 &&
+                header->owner_uid == current_uid() &&
+                std::memcmp(header->identity_digest, identity.data(), identity.size()) == 0;
+            if (!header_valid) {
+                segment.release();
+                fail(LFM_WEIGHT_REJECTED,
+                     "same-name shared weight object failed its identity/layout header");
+            }
+            for (size_t index = 0; index < sources.size(); ++index) {
+                const SegmentSourceRecord &record = header->sources[index];
+                const Source &source = sources[index];
+                const Digest label = label_digest(source.label);
+                if (record.offset != source.offset || record.bytes != source.bytes ||
+                    record.component != source.component ||
+                    std::memcmp(record.label_digest, label.data(), label.size()) != 0) {
+                    segment.release();
+                    fail(LFM_WEIGHT_REJECTED,
+                         "shared weight source table does not match checkpoint layout");
+                }
+            }
+            const uint32_t state = segment_state(header);
+            if (state == kSegmentBuilding) {
+                const uint64_t generation = header->generation;
+                const uint64_t owner = header->owner_pid;
+                const uint64_t started = header->owner_start_time;
+                segment.release();
+#ifndef _WIN32
+                if (takeover && !owner_alive(owner, started)) {
+                    int fd = shm_open(segment.name_.c_str(), O_RDWR, 0);
+                    if (fd >= 0) {
+                        void *memory = mmap(nullptr, kSegmentHeaderBytes,
+                                            PROT_READ | PROT_WRITE, MAP_SHARED,
+                                            fd, 0);
+                        if (memory != MAP_FAILED) {
+                            auto *candidate = static_cast<SegmentHeader *>(memory);
+                            uint32_t expected = kSegmentBuilding;
+                            if (candidate->generation == generation &&
+                                candidate->owner_pid == owner &&
+                                candidate->owner_start_time == started &&
+                                !owner_alive(owner, started) &&
+                                __atomic_compare_exchange_n(
+                                    &candidate->state, &expected,
+                                    kSegmentPoisoned, false,
+                                    __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+                                (void)shm_unlink(segment.name_.c_str());
+                            }
+                            (void)munmap(memory, kSegmentHeaderBytes);
+                        }
+                        (void)::close(fd);
+                    }
+                    return acquire(sources, files, bytes, source_bytes,
+                                   identity, inject_wire_failure, false);
+                }
+#endif
+                fail(LFM_WEIGHT_IN_PROGRESS,
+                     "shared weight segment is BUILDING under a live owner; "
+                     "resume this open from its readiness callback");
+            }
+            if (state == kSegmentPoisoned) {
+                segment.release();
+                fail(LFM_WEIGHT_REJECTED,
+                     "shared weight segment generation is POISONED; evict it explicitly");
+            }
+            if (state != kSegmentReady || digest_empty(header->content_digest)) {
+                segment.release();
+                fail(LFM_WEIGHT_REJECTED,
+                     "shared weight segment has no valid READY publication");
+            }
+            segment.attached_ = true;
+            segment.published_ = true;
+        }
+
+        if (inject_wire_failure) {
+            fail(LFM_WEIGHT_IO_ERROR, wire_failure(bytes, ENOMEM));
+        }
+        segment.wire();
+        const auto end = std::chrono::steady_clock::now();
+        const uint64_t elapsed = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin).count());
+        if (segment.attached_) segment.attach_ns_ = elapsed;
+        return segment;
+    }
+
+    uint8_t *mutable_data() {
+        if (!creator_ || published_) {
+            fail(LFM_WEIGHT_REJECTED,
+                 "only an unpublished builder may mutate a weight segment");
+        }
+        return data_;
+    }
+    const uint8_t *data() const { return data_; }
+    size_t size() const { return bytes_; }
+    bool creator() const { return creator_; }
+    bool attached() const { return attached_; }
+    bool wired() const { return wired_; }
+    uint64_t attach_ns() const { return attach_ns_; }
+    const Digest &identity() const { return identity_; }
+    const std::string &name() const { return name_; }
+    const SegmentHeader *published_header() const { return header(); }
+
+    void publish(const Digest &content, uint64_t build_ns, uint32_t tasks,
+                 uint32_t workers) {
+        if (!creator_ || published_) {
+            fail(LFM_WEIGHT_REJECTED,
+                 "invalid shared weight publication transition");
+        }
+        SegmentHeader *value = header();
+        value->build_ns = build_ns;
+        value->build_tasks = tasks;
+        value->build_workers = workers;
+        std::memcpy(value->content_digest, content.data(), content.size());
+        publish_segment_state(value, kSegmentReady);
+#ifdef _WIN32
+        DWORD previous = 0;
+        if (!VirtualProtect(data_, bytes_, PAGE_READONLY, &previous)) {
+            fail(LFM_WEIGHT_IO_ERROR,
+                 "cannot publish shared weight mapping read-only: " +
+                     system_message(GetLastError()));
+        }
+#else
+        if (mprotect(data_, bytes_, PROT_READ) != 0) {
+            fail(LFM_WEIGHT_IO_ERROR,
+                 "cannot publish shared weight mapping read-only: " +
+                     std::string(std::strerror(errno)));
+        }
+#endif
+        published_ = true;
+    }
+
+  private:
+    SegmentHeader *header() {
+        return reinterpret_cast<SegmentHeader *>(data_);
+    }
+    const SegmentHeader *header() const {
+        return reinterpret_cast<const SegmentHeader *>(data_);
+    }
+
+    void wire() {
+        if (wired_) return;
+#ifdef _WIN32
+        if (!VirtualLock(data_, bytes_)) {
+            fail(LFM_WEIGHT_IO_ERROR,
+                 wire_failure(bytes_, static_cast<int>(GetLastError())));
+        }
+#else
+        if (mlock(data_, bytes_) != 0) {
+            const int error = errno;
+            fail(LFM_WEIGHT_IO_ERROR, wire_failure(bytes_, error));
+        }
+#endif
+        wired_ = true;
+    }
+
+    void release() noexcept {
+        if (data_) {
+            if (wired_) {
+#ifdef _WIN32
+                (void)VirtualUnlock(data_, bytes_);
+#else
+                (void)munlock(data_, bytes_);
+#endif
+            }
+#ifdef _WIN32
+            (void)UnmapViewOfFile(data_);
+#else
+            (void)munmap(data_, bytes_);
+#endif
+        }
+        data_ = nullptr;
+        wired_ = false;
+#ifdef _WIN32
+        if (mapping_) CloseHandle(mapping_);
+        mapping_ = nullptr;
+#else
+        if (fd_ >= 0) (void)::close(fd_);
+        fd_ = -1;
+#endif
+    }
+
+    void swap(WeightSegment &other) noexcept {
+        std::swap(data_, other.data_);
+        std::swap(bytes_, other.bytes_);
+        std::swap(name_, other.name_);
+        std::swap(identity_, other.identity_);
+        std::swap(creator_, other.creator_);
+        std::swap(attached_, other.attached_);
+        std::swap(published_, other.published_);
+        std::swap(wired_, other.wired_);
+        std::swap(attach_ns_, other.attach_ns_);
+#ifdef _WIN32
+        std::swap(mapping_, other.mapping_);
+#else
+        std::swap(fd_, other.fd_);
+#endif
+    }
+
+    uint8_t *data_{nullptr};
+    size_t bytes_{0};
+    std::string name_;
+    Digest identity_{};
+    bool creator_{false};
+    bool attached_{false};
+    bool published_{false};
+    bool wired_{false};
+    uint64_t attach_ns_{0};
+#ifdef _WIN32
+    HANDLE mapping_{nullptr};
+#else
+    int fd_{-1};
+#endif
+};
+
 struct ReadTask {
     size_t source{0};
     size_t offset{0};
     size_t bytes{0};
     uint8_t *destination{nullptr};
+    Digest digest{};
     std::exception_ptr error;
 };
 
 struct ReadSummary {
     uint32_t tasks{0};
     uint32_t workers{0};
+    Digest content_digest{};
 };
 
 /* Private deterministic fault injection for the loader integration test. It
@@ -570,18 +1277,20 @@ struct ReadTestHook {
     fs::path change_after_reads;
     std::atomic<size_t> completed{0};
     size_t scheduled{0};
+    bool fail_wire{false};
 };
 
 ReadSummary read_sources(const std::vector<OpenFile> &files, uint8_t *image,
                          const std::vector<Source> &sources,
-                         size_t worker_limit, ReadTestHook *test,
+                         size_t image_bytes, size_t worker_limit,
+                         ReadTestHook *test,
                          const LfmPayloadReadScope *accounting = nullptr) {
     std::vector<ReadTask> tasks;
     for (size_t source = 0; source < sources.size(); ++source) {
         for (size_t offset = 0; offset < sources[source].bytes;) {
             const size_t bytes = std::min(kReadChunkBytes, sources[source].bytes - offset);
             tasks.push_back({source, offset, bytes,
-                             image + sources[source].offset + offset, {}});
+                             image + sources[source].offset + offset, {}, {}});
             offset += bytes;
         }
     }
@@ -642,6 +1351,7 @@ ReadSummary read_sources(const std::vector<OpenFile> &files, uint8_t *image,
                         }
                         files[task.source].read_at(task.destination, task.bytes,
                                                    task.offset, event);
+                        task.digest = hash_bytes(task.destination, task.bytes);
                         if (accounting) {
                             const int status = accounting->record(
                                 LFM_MODEL_PAYLOAD_READ_WEIGHT_IMAGE,
@@ -705,7 +1415,31 @@ ReadSummary read_sources(const std::vector<OpenFile> &files, uint8_t *image,
             ++task;
         }
     }
-    return {static_cast<uint32_t>(tasks.size()), static_cast<uint32_t>(count)};
+    /* Parallel tasks hash their own exact byte spans. The publication digest is
+     * a deterministic tree over the layout and those ordered leaf hashes; it
+     * covers every source byte without a second multi-gigabyte scan and binds
+     * the zero-filled gaps/tail through their offsets and final segment size. */
+    static constexpr char domain[] = "LFM-WEIGHT-CONTENT-V1";
+    Sha256 content;
+    content.update(domain, sizeof(domain) - 1);
+    hash_integer(content, static_cast<uint64_t>(image_bytes));
+    hash_integer(content, static_cast<uint64_t>(sources.size()));
+    for (size_t source = 0; source < sources.size(); ++source) {
+        const Source &value = sources[source];
+        const Digest label = label_digest(value.label);
+        hash_integer(content, static_cast<uint64_t>(value.offset));
+        hash_integer(content, static_cast<uint64_t>(value.bytes));
+        hash_integer(content, value.component);
+        content.update(label.data(), label.size());
+        for (const ReadTask &leaf : tasks) {
+            if (leaf.source != source) continue;
+            hash_integer(content, static_cast<uint64_t>(leaf.offset));
+            hash_integer(content, static_cast<uint64_t>(leaf.bytes));
+            content.update(leaf.digest.data(), leaf.digest.size());
+        }
+    }
+    return {static_cast<uint32_t>(tasks.size()),
+            static_cast<uint32_t>(count), content.finish()};
 }
 
 void read_small_file_exact(const fs::path &path, uint8_t *data, size_t bytes,
@@ -909,8 +1643,8 @@ struct PendingTensor {
 
 } // namespace
 
-struct LfmWeightImage {
-    AlignedBytes storage;
+struct WeightImageCore {
+    WeightSegment segment;
     std::vector<Source> sources;
     std::vector<TensorMeta> tensors;
     std::unordered_map<std::string, size_t> names[LFM_WEIGHT_COMPONENT_COUNT];
@@ -918,13 +1652,190 @@ struct LfmWeightImage {
     uint64_t source_bytes{0};
     uint32_t task_count{0};
     uint32_t worker_count{0};
+    bool evicted{false};
+};
+
+struct LfmWeightImage {
+    std::shared_ptr<WeightImageCore> core;
+    uint32_t disposition{0};
 };
 
 namespace {
 
-void parse_shard(LfmWeightImage &image, uint32_t shard) {
+std::mutex &weight_registry_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+struct RegistryRecord {
+    std::weak_ptr<WeightImageCore> core;
+    std::vector<ReadySubscriber> subscribers;
+    uint64_t claim{0};
+    bool loading{false};
+};
+
+struct RegistryClaim {
+    std::shared_ptr<WeightImageCore> core;
+    uint64_t claim{0};
+    bool loading{false};
+};
+
+struct RegistrySubscription {
+    std::shared_ptr<WeightImageCore> core;
+    bool retained{false};
+};
+
+struct RegistryPublication {
+    std::vector<ReadySubscriber> subscribers;
+    bool accepted{false};
+};
+
+std::unordered_map<std::string, RegistryRecord> &weight_registry() {
+    static std::unordered_map<std::string, RegistryRecord> registry;
+    return registry;
+}
+
+uint64_t next_registry_claim() {
+    static uint64_t sequence = 0;
+    ++sequence;
+    if (sequence == 0) ++sequence;
+    return sequence;
+}
+
+RegistryClaim registry_claim(const std::string &name) {
+    std::lock_guard guard(weight_registry_mutex());
+    RegistryRecord &record = weight_registry()[name];
+    if (std::shared_ptr<WeightImageCore> resident = record.core.lock()) {
+        if (!resident->evicted) return {.core = std::move(resident)};
+        record.core.reset();
+    }
+    if (record.loading) return {.loading = true};
+    record.loading = true;
+    record.claim = next_registry_claim();
+    return {.claim = record.claim};
+}
+
+void resume_subscribers(std::vector<ReadySubscriber> subscribers) {
+    for (const ReadySubscriber &subscriber : subscribers) {
+        (void)koro_cont_resume(subscriber.continuation, &subscriber.identity);
+        koro_cont_release(subscriber.continuation);
+    }
+}
+
+RegistrySubscription registry_subscribe(const std::string &name,
+                                        const ReadyTarget &target) {
+    if (!target.continuation || target.identity.runtime_epoch == 0 ||
+        target.identity.sequence == 0) {
+        return {};
+    }
+    std::lock_guard guard(weight_registry_mutex());
+    const auto found = weight_registry().find(name);
+    if (found == weight_registry().end()) return {};
+    RegistryRecord &record = found->second;
+    if (std::shared_ptr<WeightImageCore> resident = record.core.lock()) {
+        if (!resident->evicted) return {.core = std::move(resident)};
+        record.core.reset();
+    }
+    if (!record.loading) return {};
+    for (const ReadySubscriber &subscriber : record.subscribers) {
+        if (subscriber.continuation == target.continuation &&
+            ticket_equal(subscriber.identity, target.identity)) {
+            return {.retained = true};
+        }
+    }
+    koro_cont_retain(target.continuation);
+    record.subscribers.push_back({target.continuation, target.identity});
+    return {.retained = true};
+}
+
+RegistryPublication registry_publish(
+    const std::string &name, uint64_t claim,
+    const std::shared_ptr<WeightImageCore> &image) {
+    std::lock_guard guard(weight_registry_mutex());
+    const auto found = weight_registry().find(name);
+    if (found == weight_registry().end() || !found->second.loading ||
+        found->second.claim != claim) return {};
+    found->second.core = image;
+    found->second.loading = false;
+    found->second.claim = 0;
+    return {
+        .subscribers = std::move(found->second.subscribers),
+        .accepted = true,
+    };
+}
+
+std::vector<ReadySubscriber> registry_abandon(const std::string &name,
+                                               uint64_t claim) {
+    std::lock_guard guard(weight_registry_mutex());
+    const auto found = weight_registry().find(name);
+    if (found == weight_registry().end() || !found->second.loading ||
+        found->second.claim != claim) return {};
+    std::vector<ReadySubscriber> subscribers =
+        std::move(found->second.subscribers);
+    if (found->second.core.expired()) {
+        weight_registry().erase(found);
+        return subscribers;
+    }
+    found->second.loading = false;
+    found->second.claim = 0;
+    return subscribers;
+}
+
+void registry_cancel_ready(const ReadyTarget &target) {
+    std::vector<koro_cont_t *> releases;
+    {
+        std::lock_guard guard(weight_registry_mutex());
+        for (auto &[name, record] : weight_registry()) {
+            (void)name;
+            record.subscribers.erase(
+                std::remove_if(
+                    record.subscribers.begin(), record.subscribers.end(),
+                    [&](const ReadySubscriber &subscriber) {
+                        if (subscriber.continuation != target.continuation ||
+                            !ticket_equal(subscriber.identity, target.identity)) {
+                            return false;
+                        }
+                        releases.push_back(subscriber.continuation);
+                        return true;
+                    }),
+                record.subscribers.end());
+        }
+    }
+    for (koro_cont_t *continuation : releases) koro_cont_release(continuation);
+}
+
+class RegistryLoad final {
+  public:
+    RegistryLoad(std::string name, uint64_t claim)
+        : name_(std::move(name)), claim_(claim) {}
+
+    ~RegistryLoad() {
+        if (claim_ == 0) return;
+        resume_subscribers(registry_abandon(name_, claim_));
+    }
+
+    RegistryLoad(const RegistryLoad &) = delete;
+    RegistryLoad &operator=(const RegistryLoad &) = delete;
+
+    void publish(const std::shared_ptr<WeightImageCore> &image) {
+        RegistryPublication publication =
+            registry_publish(name_, claim_, image);
+        if (!publication.accepted) {
+            fail(LFM_WEIGHT_REJECTED,
+                 "shared weight registry claim was evicted before publication");
+        }
+        claim_ = 0;
+        resume_subscribers(std::move(publication.subscribers));
+    }
+
+  private:
+    std::string name_;
+    uint64_t claim_{0};
+};
+
+void parse_shard(WeightImageCore &image, uint32_t shard) {
     const Source &source = image.sources.at(shard);
-    const uint8_t *file = image.storage.data() + source.offset;
+    const uint8_t *file = image.segment.data() + source.offset;
     if (source.bytes < 8) {
         fail(LFM_WEIGHT_FORMAT_ERROR,
              "safetensors file is shorter than its header prefix: '" + source.path.string() + "'");
@@ -1042,9 +1953,10 @@ void parse_shard(LfmWeightImage &image, uint32_t shard) {
     }
 }
 
-std::unique_ptr<LfmWeightImage> load(
+LfmWeightImage *load(
     Resolved resolved, LoadOptions options = {},
-    const LfmPayloadReadScope *accounting = nullptr) {
+    const LfmPayloadReadScope *accounting = nullptr,
+    const ReadyTarget *ready = nullptr) {
     if (resolved.sources.empty()) {
         fail(LFM_WEIGHT_INVALID_ARGUMENT, "no safetensors sources were provided");
     }
@@ -1069,7 +1981,7 @@ std::unique_ptr<LfmWeightImage> load(
         source.bytes = files.back().bytes();
     }
 
-    size_t total = 0;
+    size_t total = kSegmentHeaderBytes;
     size_t source_bytes = 0;
     for (auto &source : resolved.sources) {
         source_bytes = checked_add(source_bytes, source.bytes, "weight source bytes");
@@ -1077,28 +1989,86 @@ std::unique_ptr<LfmWeightImage> load(
         total = checked_add(source.offset, source.bytes, "weight image size");
     }
 
-    auto image = std::make_unique<LfmWeightImage>();
-    image->storage = AlignedBytes(checked_align(total));
-    image->sources = std::move(resolved.sources);
-
-    size_t cursor = 0;
-    for (const auto &source : image->sources) {
-        if (source.offset > cursor) {
-            std::memset(image->storage.data() + cursor, 0, source.offset - cursor);
+    total = checked_align(total);
+    const Digest identity = identity_digest(resolved.sources, files);
+    const std::string name = segment_name(identity);
+    RegistryClaim claim;
+    for (;;) {
+        claim = registry_claim(name);
+        if (claim.core) {
+            return new LfmWeightImage{
+                .core = std::move(claim.core),
+                .disposition = LFM_WEIGHT_LOAD_REGISTRY_REUSED,
+            };
         }
-        cursor = checked_add(source.offset, source.bytes, "weight image cursor");
+        if (!claim.loading) break;
+        if (!ready) {
+            fail(LFM_WEIGHT_IN_PROGRESS,
+                 "shared weight image is BUILDING; synchronous callers must "
+                 "retry from a correlated continuation edge");
+        }
+        RegistrySubscription subscription = registry_subscribe(name, *ready);
+        if (subscription.core) {
+            return new LfmWeightImage{
+                .core = std::move(subscription.core),
+                .disposition = LFM_WEIGHT_LOAD_REGISTRY_REUSED,
+            };
+        }
+        if (subscription.retained) {
+            fail(LFM_WEIGHT_IN_PROGRESS,
+                 "shared weight image is BUILDING; continuation retained");
+        }
+        /* Publication or abandonment won between claim and subscription.
+         * Re-observe the registry transition in this same active callback;
+         * this is not a wait or a polling edge. */
     }
-    if (image->storage.size() > cursor) {
-        std::memset(image->storage.data() + cursor, 0, image->storage.size() - cursor);
+    RegistryLoad registry(name, claim.claim);
+    const auto build_begin = std::chrono::steady_clock::now();
+    auto image = std::make_shared<WeightImageCore>();
+    try {
+        image->segment = WeightSegment::acquire(
+            resolved.sources, files, total, source_bytes, identity,
+            options.test && options.test->fail_wire);
+    } catch (const WeightError &error) {
+        if (error.status() != LFM_WEIGHT_IN_PROGRESS) throw;
+        if (ready) {
+            fail(LFM_WEIGHT_REJECTED,
+                 "a foreign process owns the BUILDING weight generation; "
+                 "direct continuation admission has no cross-process callback "
+                 "edge (enter through the native model host readiness ticket)");
+        }
+        fail(LFM_WEIGHT_IN_PROGRESS,
+             "a foreign process owns the BUILDING weight generation; "
+             "host-less synchronous open cannot wait or poll for it");
     }
-
-    const ReadSummary summary = read_sources(files, image->storage.data(),
-                                             image->sources, options.workers,
-                                             options.test, accounting);
-    files.clear();
+    image->sources = std::move(resolved.sources);
     image->source_bytes = source_bytes;
-    image->task_count = summary.tasks;
-    image->worker_count = summary.workers;
+    ReadSummary summary{};
+    if (image->segment.creator()) {
+        uint8_t *destination = image->segment.mutable_data();
+        size_t cursor = kSegmentHeaderBytes;
+        for (const auto &source : image->sources) {
+            if (source.offset > cursor) {
+                std::memset(destination + cursor, 0, source.offset - cursor);
+            }
+            cursor = checked_add(source.offset, source.bytes,
+                                 "weight image cursor");
+        }
+        if (image->segment.size() > cursor) {
+            std::memset(destination + cursor, 0,
+                        image->segment.size() - cursor);
+        }
+        summary = read_sources(files, destination, image->sources,
+                               image->segment.size(), options.workers,
+                               options.test, accounting);
+        image->task_count = summary.tasks;
+        image->worker_count = summary.workers;
+    } else {
+        const SegmentHeader *header = image->segment.published_header();
+        image->task_count = header->build_tasks;
+        image->worker_count = header->build_workers;
+    }
+    files.clear();
     for (uint32_t shard = 0; shard < image->sources.size(); ++shard) {
         parse_shard(*image, shard);
     }
@@ -1121,21 +2091,37 @@ std::unique_ptr<LfmWeightImage> load(
             }
         }
     }
-    // Publication is the ownership boundary: every source handle has closed,
-    // metadata and exact typed spans have validated, and all later consumers
-    // receive const byte views. Enforce that invariant in the page tables so an
-    // accidental C++ write faults instead of silently corrupting shared weights.
-    image->storage.seal();
-    return image;
+    if (image->segment.creator()) {
+        const auto build_end = std::chrono::steady_clock::now();
+        const uint64_t build_ns = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                build_end - build_begin)
+                .count());
+        /* Publication is the ownership boundary: source handles have closed,
+         * every typed span and shard index has validated, and READY is the
+         * release edge after the content digest. The mapping becomes read-only
+         * before any model receives a view. */
+        image->segment.publish(summary.content_digest, build_ns,
+                               summary.tasks, summary.workers);
+    }
+    const uint32_t disposition = image->segment.creator()
+                                     ? LFM_WEIGHT_LOAD_BUILT
+                                     : LFM_WEIGHT_LOAD_ATTACHED;
+    registry.publish(image);
+    return new LfmWeightImage{
+        .core = std::move(image),
+        .disposition = disposition,
+    };
 }
 
 void fill_view(const LfmWeightImage &image, const TensorMeta &tensor,
                LfmTensorView &view) {
+    const WeightImageCore &core = *image.core;
     view = {};
     view.size = sizeof(LfmTensorView);
     view.abi_version = LFM_WEIGHT_ABI_VERSION;
     view.name = tensor.name.c_str();
-    view.data = image.storage.data() + tensor.offset;
+    view.data = core.segment.data() + tensor.offset;
     view.shape = tensor.shape.data();
     view.offset = tensor.offset;
     view.elements = tensor.elements;
@@ -1154,8 +2140,7 @@ int open_c(Open &&open, LfmWeightImage **out, char *err, size_t errlen) {
     }
     *out = nullptr;
     try {
-        auto image = open();
-        *out = image.release();
+        *out = open();
         return LFM_WEIGHT_OK;
     } catch (const WeightError &error) {
         set_error(err, errlen, error.what());
@@ -1175,6 +2160,7 @@ int open_c(Open &&open, LfmWeightImage **out, char *err, size_t errlen) {
 } // namespace
 
 static int weights_open(const char *path, const LfmPayloadReadOwner *owner,
+                        const ReadyTarget *ready,
                         LfmWeightImage **out, char *err, size_t errlen) {
     if (!path || path[0] == '\0') {
         if (out) *out = nullptr;
@@ -1192,21 +2178,38 @@ static int weights_open(const char *path, const LfmPayloadReadOwner *owner,
             }
             return load(resolve_path(fs::path(path),
                                      LFM_WEIGHT_COMPONENT_MAIN, &scope),
-                        {}, &scope);
+                        {}, &scope, ready);
         },
         out, err, errlen);
 }
 
 extern "C" int lfm_weights_open(const char *path, LfmWeightImage **out,
                                 char *err, size_t errlen) {
-    return weights_open(path, nullptr, out, err, errlen);
+    return weights_open(path, nullptr, nullptr, out, err, errlen);
 }
 
 int lfm_weights_open_owned(const char *path,
                            const LfmPayloadReadOwner *owner,
                            LfmWeightImage **out, char *err, size_t errlen) {
     if (!owner) return LFM_WEIGHT_INVALID_ARGUMENT;
-    return weights_open(path, owner, out, err, errlen);
+    return weights_open(path, owner, nullptr, out, err, errlen);
+}
+
+int lfm_weights_open_owned_continuation(
+    const char *path, const LfmPayloadReadOwner *owner,
+    koro_cont_t *continuation, LfmWeightImage **out, char *err,
+    size_t errlen) {
+    if (!owner || !continuation) return LFM_WEIGHT_INVALID_ARGUMENT;
+    const ReadyTarget ready = {
+        .continuation = continuation,
+        .identity = koro_cont_identity(continuation),
+    };
+    return weights_open(path, owner, &ready, out, err, errlen);
+}
+
+void lfm_weights_cancel_readiness(koro_cont_t *continuation) {
+    if (!continuation) return;
+    registry_cancel_ready({continuation, koro_cont_identity(continuation)});
 }
 
 extern "C" int lfm_weights_open_files(const char *const *paths, size_t count,
@@ -1238,6 +2241,7 @@ extern "C" int lfm_weights_open_files(const char *const *paths, size_t count,
 static int weights_open_bundle(const char *main_path,
                                const char *detokenizer_path,
                                const LfmPayloadReadOwner *owner,
+                               const ReadyTarget *ready,
                                LfmWeightImage **out, char *err,
                                size_t errlen) {
     if (!main_path || main_path[0] == '\0' || !detokenizer_path ||
@@ -1264,7 +2268,7 @@ static int weights_open_bundle(const char *main_path,
                 resolved,
                 resolve_path(fs::path(detokenizer_path),
                              LFM_WEIGHT_COMPONENT_DETOKENIZER, &scope));
-            return load(std::move(resolved), {}, &scope);
+            return load(std::move(resolved), {}, &scope, ready);
         },
         out, err, errlen);
 }
@@ -1273,8 +2277,8 @@ extern "C" int lfm_weights_open_bundle(const char *main_path,
                                         const char *detokenizer_path,
                                         LfmWeightImage **out, char *err,
                                         size_t errlen) {
-    return weights_open_bundle(main_path, detokenizer_path, nullptr, out, err,
-                               errlen);
+    return weights_open_bundle(main_path, detokenizer_path, nullptr, nullptr,
+                               out, err, errlen);
 }
 
 int lfm_weights_open_bundle_owned(const char *main_path,
@@ -1283,8 +2287,21 @@ int lfm_weights_open_bundle_owned(const char *main_path,
                                   LfmWeightImage **out, char *err,
                                   size_t errlen) {
     if (!owner) return LFM_WEIGHT_INVALID_ARGUMENT;
-    return weights_open_bundle(main_path, detokenizer_path, owner, out, err,
-                               errlen);
+    return weights_open_bundle(main_path, detokenizer_path, owner, nullptr, out,
+                               err, errlen);
+}
+
+int lfm_weights_open_bundle_owned_continuation(
+    const char *main_path, const char *detokenizer_path,
+    const LfmPayloadReadOwner *owner, koro_cont_t *continuation,
+    LfmWeightImage **out, char *err, size_t errlen) {
+    if (!owner || !continuation) return LFM_WEIGHT_INVALID_ARGUMENT;
+    const ReadyTarget ready = {
+        .continuation = continuation,
+        .identity = koro_cont_identity(continuation),
+    };
+    return weights_open_bundle(main_path, detokenizer_path, owner, &ready, out,
+                               err, errlen);
 }
 
 /* Deliberately absent from the installed header: the load benchmark needs to
@@ -1328,7 +2345,7 @@ extern "C" int lfm_internal_weights_open_fault_test(
     const char *path, uint32_t mode, uint32_t *scheduled,
     uint32_t *completed, char *err, size_t errlen) {
     if (!path || path[0] == '\0' || !scheduled || !completed ||
-        (mode != 1 && mode != 2)) {
+        (mode != 1 && mode != 2 && mode != 3)) {
         set_error(err, errlen, "invalid native loader fault-test arguments");
         return LFM_WEIGHT_INVALID_ARGUMENT;
     }
@@ -1337,8 +2354,10 @@ extern "C" int lfm_internal_weights_open_fault_test(
     ReadTestHook hook;
     if (mode == 1) {
         hook.fail_task = 0;
-    } else {
+    } else if (mode == 2) {
         hook.change_after_reads = fs::path(path);
+    } else {
+        hook.fail_wire = true;
     }
     LfmWeightImage *image = nullptr;
     const int status = open_c(
@@ -1348,7 +2367,7 @@ extern "C" int lfm_internal_weights_open_fault_test(
                         LoadOptions{kReadWorkers, false, &hook});
         },
         &image, err, errlen);
-    delete image;
+    lfm_weights_close(image);
     if (hook.scheduled <= std::numeric_limits<uint32_t>::max()) {
         *scheduled = static_cast<uint32_t>(hook.scheduled);
     }
@@ -1359,36 +2378,269 @@ extern "C" int lfm_internal_weights_open_fault_test(
     return status;
 }
 
-extern "C" void lfm_weights_close(LfmWeightImage *image) { delete image; }
+/* Hostile/stale namespace gate. It fabricates the named object through the
+ * same header initializer used by the elected builder, mutates exactly one
+ * contract field, then enters through the public attach path. Test code does
+ * not duplicate the validation ladder it is meant to verify. */
+extern "C" int lfm_internal_weights_hostile_segment_test(
+    const char *path, uint32_t mode, int32_t *observed_status,
+    uint64_t *abandoned_generation, uint64_t *published_generation,
+    char *err, size_t errlen) {
+#ifdef _WIN32
+    (void)path;
+    (void)mode;
+    (void)observed_status;
+    (void)abandoned_generation;
+    (void)published_generation;
+    set_error(err, errlen,
+              "hostile POSIX shared-memory fixture is unsupported on Windows");
+    return LFM_WEIGHT_REJECTED;
+#else
+    if (!path || !path[0] || mode < 1 || mode > 8 || !observed_status ||
+        !abandoned_generation || !published_generation) {
+        set_error(err, errlen, "invalid hostile-segment gate arguments");
+        return LFM_WEIGHT_INVALID_ARGUMENT;
+    }
+    *observed_status = 0;
+    *abandoned_generation = 0;
+    *published_generation = 0;
+    try {
+        Resolved resolved =
+            resolve_path(fs::path(path), LFM_WEIGHT_COMPONENT_MAIN);
+        std::vector<OpenFile> files;
+        files.reserve(resolved.sources.size());
+        size_t total = kSegmentHeaderBytes;
+        size_t source_bytes = 0;
+        for (Source &source : resolved.sources) {
+            files.emplace_back(source.path, false);
+            source.bytes = files.back().bytes();
+            source_bytes = checked_add(source_bytes, source.bytes,
+                                       "hostile fixture source bytes");
+            source.offset = checked_align(total);
+            total = checked_add(source.offset, source.bytes,
+                                "hostile fixture segment bytes");
+        }
+        total = checked_align(total);
+        const Digest identity = identity_digest(resolved.sources, files);
+        const std::string name = segment_name(identity);
+        (void)lfm_weights_evict(identity.data(), nullptr, 0);
+
+        const int fd = shm_open(name.c_str(), O_RDWR | O_CREAT | O_EXCL, 0600);
+        if (fd < 0) {
+            fail(LFM_WEIGHT_IO_ERROR,
+                 "cannot create hostile shared weight fixture: " +
+                     std::string(std::strerror(errno)));
+        }
+        const size_t object_bytes = mode == 2 ? total - kWeightAlign : total;
+        if (ftruncate(fd, static_cast<off_t>(object_bytes)) != 0) {
+            const int error = errno;
+            (void)::close(fd);
+            (void)shm_unlink(name.c_str());
+            fail(LFM_WEIGHT_IO_ERROR,
+                 "cannot size hostile shared weight fixture: " +
+                     std::string(std::strerror(error)));
+        }
+        if (mode != 2) {
+            void *mapping = mmap(nullptr, total, PROT_READ | PROT_WRITE,
+                                 MAP_SHARED, fd, 0);
+            if (mapping == MAP_FAILED) {
+                const int error = errno;
+                (void)::close(fd);
+                (void)shm_unlink(name.c_str());
+                fail(LFM_WEIGHT_IO_ERROR,
+                     "cannot map hostile shared weight fixture: " +
+                         std::string(std::strerror(error)));
+            }
+            auto *header = static_cast<SegmentHeader *>(mapping);
+            if (mode == 1) {
+                std::memset(header, 0, kSegmentHeaderBytes);
+            } else {
+                const bool dead = mode == 6;
+                const uint64_t pid = dead ? UINT64_MAX : current_pid();
+                const uint64_t started =
+                    dead ? UINT64_C(1) : process_start_time(pid);
+                const uint32_t state = mode == 4 ? kSegmentReady
+                                                 : kSegmentBuilding;
+                const uint64_t generation = segment_generation();
+                initialize_segment_header(
+                    header, resolved.sources, total, source_bytes, identity,
+                    generation, pid, started, current_uid(), state);
+                *abandoned_generation = generation;
+                if (mode == 3) header->header_bytes = 1;
+                if (mode == 7) header->owner_uid = current_uid() + 1;
+                if (mode == 8) ++header->sources[0].offset;
+                /* Mode 4 deliberately leaves the READY content digest empty. */
+            }
+            (void)munmap(mapping, total);
+        }
+        (void)::close(fd);
+
+        LfmWeightImage *image = nullptr;
+        char open_error[512]{};
+        *observed_status = lfm_weights_open(path, &image, open_error,
+                                            sizeof(open_error));
+        const int32_t expected = mode == 5 ? LFM_WEIGHT_IN_PROGRESS
+                                           : mode == 6 ? LFM_WEIGHT_OK
+                                                       : LFM_WEIGHT_REJECTED;
+        int result = LFM_WEIGHT_OK;
+        if (*observed_status != expected) {
+            set_error(err, errlen,
+                      open_error[0] ? open_error
+                                    : "hostile object returned wrong status");
+            result = LFM_WEIGHT_REJECTED;
+        }
+        if (mode == 6 && image) {
+            LfmWeightLoadStatsV2 stats{
+                .size = sizeof(LfmWeightLoadStatsV2),
+                .abi_version = LFM_WEIGHT_ABI_VERSION,
+            };
+            if (lfm_weights_load_stats(image, &stats) != LFM_WEIGHT_OK ||
+                !(stats.flags & LFM_WEIGHT_LOAD_BUILT) ||
+                stats.generation == *abandoned_generation) {
+                set_error(err, errlen,
+                          "dead BUILDING generation was not replaced exactly once");
+                result = LFM_WEIGHT_REJECTED;
+            }
+            *published_generation = stats.generation;
+        }
+        lfm_weights_close(image);
+        (void)lfm_weights_evict(identity.data(), nullptr, 0);
+        return result;
+    } catch (const WeightError &error) {
+        set_error(err, errlen, error.what());
+        return error.status();
+    } catch (const std::exception &error) {
+        set_error(err, errlen, error.what());
+        return LFM_WEIGHT_FORMAT_ERROR;
+    }
+#endif
+}
+
+extern "C" void lfm_weights_close(LfmWeightImage *image) {
+    delete image;
+}
+
+extern "C" int lfm_weights_evict(const uint8_t identity_digest[32],
+                                  char *err, size_t errlen) {
+    if (err && errlen) err[0] = '\0';
+    if (!identity_digest || digest_empty(identity_digest)) {
+        set_error(err, errlen, "empty shared weight identity");
+        return LFM_WEIGHT_INVALID_ARGUMENT;
+    }
+    Digest identity{};
+    std::memcpy(identity.data(), identity_digest, identity.size());
+    const std::string name = segment_name(identity);
+    std::vector<ReadySubscriber> subscribers;
+    {
+        std::lock_guard guard(weight_registry_mutex());
+        const auto found = weight_registry().find(name);
+        if (found != weight_registry().end()) {
+            if (std::shared_ptr<WeightImageCore> resident =
+                    found->second.core.lock()) {
+                resident->evicted = true;
+            }
+            subscribers = std::move(found->second.subscribers);
+            weight_registry().erase(found);
+        }
+    }
+    resume_subscribers(std::move(subscribers));
+#ifdef _WIN32
+    set_error(err, errlen,
+              "Windows named sections are evicted by retiring the keeper lease; "
+              "explicit namespace unlink is unavailable");
+    return LFM_WEIGHT_REJECTED;
+#else
+    if (shm_unlink(name.c_str()) == 0 || errno == ENOENT) return LFM_WEIGHT_OK;
+    const int error = errno;
+    set_error(err, errlen,
+              ("cannot evict shared weight segment '" + name + "': " +
+               std::strerror(error))
+                  .c_str());
+    return LFM_WEIGHT_IO_ERROR;
+#endif
+}
+
+/* Test cleanup resolves identity from file metadata only; it never opens or
+ * reads a published segment and is deliberately absent from the installed
+ * header. Product detach must never smuggle an unlink through close(). */
+extern "C" int lfm_internal_weights_evict_path_for_test(const char *path) {
+    if (!path || !path[0]) return LFM_WEIGHT_INVALID_ARGUMENT;
+    try {
+        Resolved resolved =
+            resolve_path(fs::path(path), LFM_WEIGHT_COMPONENT_MAIN, nullptr);
+        std::vector<OpenFile> files;
+        files.reserve(resolved.sources.size());
+        for (Source &source : resolved.sources) {
+            files.emplace_back(source.path, false);
+            source.bytes = files.back().bytes();
+        }
+        const Digest identity = identity_digest(resolved.sources, files);
+        return lfm_weights_evict(identity.data(), nullptr, 0);
+    } catch (...) {
+        return LFM_WEIGHT_NOT_FOUND;
+    }
+}
 
 extern "C" const void *lfm_weights_data(const LfmWeightImage *image) {
-    return image ? image->storage.data() : nullptr;
+    return image && image->core ? image->core->segment.data() : nullptr;
 }
 
 extern "C" uint64_t lfm_weights_resident_bytes(const LfmWeightImage *image) {
-    return image ? image->storage.size() : 0;
+    return image && image->core ? image->core->segment.size() : 0;
 }
 
 extern "C" size_t lfm_weights_count(const LfmWeightImage *image) {
-    return image ? image->components[LFM_WEIGHT_COMPONENT_MAIN].size() : 0;
+    return image && image->core
+               ? image->core->components[LFM_WEIGHT_COMPONENT_MAIN].size()
+               : 0;
 }
 
 extern "C" size_t lfm_weights_component_count(const LfmWeightImage *image,
                                                 uint32_t component) {
-    if (!image || component >= LFM_WEIGHT_COMPONENT_COUNT) return 0;
-    return image->components[component].size();
+    if (!image || !image->core || component >= LFM_WEIGHT_COMPONENT_COUNT) return 0;
+    return image->core->components[component].size();
 }
 
 extern "C" int lfm_weights_load_stats(const LfmWeightImage *image,
-                                       LfmWeightLoadStatsV1 *out) {
-    if (!image || !out) return LFM_WEIGHT_INVALID_ARGUMENT;
+                                       LfmWeightLoadStatsV2 *out) {
+    if (!image || !image->core || !out) return LFM_WEIGHT_INVALID_ARGUMENT;
+    const WeightImageCore &core = *image->core;
     *out = {};
-    out->size = static_cast<uint32_t>(sizeof(LfmWeightLoadStatsV1));
+    out->size = static_cast<uint32_t>(sizeof(LfmWeightLoadStatsV2));
     out->abi_version = LFM_WEIGHT_ABI_VERSION;
-    out->source_bytes = image->source_bytes;
-    out->resident_bytes = image->storage.size();
-    out->task_count = image->task_count;
-    out->worker_count = image->worker_count;
+    out->source_bytes = core.source_bytes;
+    out->segment_bytes = core.segment.size();
+    out->segment_constructed_bytes =
+        image->disposition == LFM_WEIGHT_LOAD_BUILT ? core.segment.size() : 0;
+    out->attached_shared_bytes =
+        image->disposition == LFM_WEIGHT_LOAD_ATTACHED ? core.segment.size()
+                                                      : 0;
+    out->wired_bytes = core.segment.wired() ? core.segment.size() : 0;
+    out->process_resident_bytes = out->wired_bytes;
+    const SegmentHeader *header = core.segment.published_header();
+    out->build_ns = header->build_ns;
+    out->attach_ns = core.segment.attach_ns();
+    out->generation = header->generation;
+    out->task_count = core.task_count;
+    out->worker_count = core.worker_count;
+    out->flags = (image->disposition == LFM_WEIGHT_LOAD_BUILT
+                      ? LFM_WEIGHT_LOAD_BUILT
+                  : image->disposition == LFM_WEIGHT_LOAD_ATTACHED
+                      ? LFM_WEIGHT_LOAD_ATTACHED
+                      : 0u) |
+                 (core.segment.wired() ? LFM_WEIGHT_LOAD_WIRED : 0u) |
+                 (image->disposition == LFM_WEIGHT_LOAD_REGISTRY_REUSED
+                      ? LFM_WEIGHT_LOAD_REGISTRY_REUSED
+                      : 0u);
+    out->source_count = static_cast<uint32_t>(core.sources.size());
+    out->payload_read_calls =
+        image->disposition == LFM_WEIGHT_LOAD_BUILT ? core.task_count : 0;
+    out->payload_read_bytes =
+        image->disposition == LFM_WEIGHT_LOAD_BUILT ? core.source_bytes : 0;
+    std::memcpy(out->identity_digest, header->identity_digest,
+                sizeof(out->identity_digest));
+    std::memcpy(out->content_digest, header->content_digest,
+                sizeof(out->content_digest));
     return LFM_WEIGHT_OK;
 }
 
@@ -1405,11 +2657,12 @@ extern "C" int lfm_weights_find(const LfmWeightImage *image, const char *name,
 extern "C" int lfm_weights_at_component(const LfmWeightImage *image,
                                           uint32_t component, size_t index,
                                           LfmTensorView *out) {
-    if (!image || !out || component >= LFM_WEIGHT_COMPONENT_COUNT) {
+    if (!image || !image->core || !out || component >= LFM_WEIGHT_COMPONENT_COUNT) {
         return LFM_WEIGHT_INVALID_ARGUMENT;
     }
-    if (index >= image->components[component].size()) return LFM_WEIGHT_NOT_FOUND;
-    fill_view(*image, image->tensors[image->components[component][index]], *out);
+    const WeightImageCore &core = *image->core;
+    if (index >= core.components[component].size()) return LFM_WEIGHT_NOT_FOUND;
+    fill_view(*image, core.tensors[core.components[component][index]], *out);
     return LFM_WEIGHT_OK;
 }
 
@@ -1417,12 +2670,14 @@ extern "C" int lfm_weights_find_component(const LfmWeightImage *image,
                                             uint32_t component,
                                             const char *name,
                                             LfmTensorView *out) {
-    if (!image || !name || !out || component >= LFM_WEIGHT_COMPONENT_COUNT) {
+    if (!image || !image->core || !name || !out ||
+        component >= LFM_WEIGHT_COMPONENT_COUNT) {
         return LFM_WEIGHT_INVALID_ARGUMENT;
     }
-    const auto found = image->names[component].find(name);
-    if (found == image->names[component].end()) return LFM_WEIGHT_NOT_FOUND;
-    fill_view(*image, image->tensors[found->second], *out);
+    const WeightImageCore &core = *image->core;
+    const auto found = core.names[component].find(name);
+    if (found == core.names[component].end()) return LFM_WEIGHT_NOT_FOUND;
+    fill_view(*image, core.tensors[found->second], *out);
     return LFM_WEIGHT_OK;
 }
 

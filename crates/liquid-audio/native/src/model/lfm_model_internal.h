@@ -56,7 +56,7 @@ LFM_INTERNAL_API int lfm_model_close(LfmModel *model);
 LFM_INTERNAL_API int lfm_model_info(const LfmModel *model,
                                   LfmModelInfoV1 *out);
 LFM_INTERNAL_API int lfm_model_memory(const LfmModel *model,
-                                    LfmModelMemoryV1 *out);
+                                    LfmModelMemoryV2 *out);
 LFM_INTERNAL_API int lfm_conversation_create(
     LfmModel *model, const LfmConversationConfigV1 *config,
     LfmConversation **out, char *error, size_t error_length);

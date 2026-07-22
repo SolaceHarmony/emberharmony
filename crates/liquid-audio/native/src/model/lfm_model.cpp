@@ -507,11 +507,8 @@ struct LfmModel {
     LfmAudioDetokenizerPlan *detokenizer = nullptr;
     uint64_t plan_id = 0;
     uint64_t depth_plan_id = 0;
-    uint64_t resident_bytes = 0;
-    uint64_t source_bytes = 0;
+    LfmWeightLoadStatsV2 weight_stats{};
     uint64_t load_ns = 0;
-    uint32_t load_workers = 0;
-    uint32_t load_tasks = 0;
     uint32_t hidden = 0;
     uint32_t ffn = 0;
     uint32_t layers = 0;
@@ -2556,16 +2553,15 @@ extern "C" int lfm_model_open(void *engine, const char *path, LfmModel **out,
         model->detokenizer = detokenizer;
         model->plan_id = plan_id;
         model->depth_plan_id = depth_plan_id;
-        LfmWeightLoadStatsV1 load_stats = {
-            .size = sizeof(LfmWeightLoadStatsV1),
+        LfmWeightLoadStatsV2 load_stats = {
+            .size = sizeof(LfmWeightLoadStatsV2),
             .abi_version = LFM_WEIGHT_ABI_VERSION,
         };
         status = lfm_weights_load_stats(weights, &load_stats);
         if (status != LFM_WEIGHT_OK) {
             fail(status, "cannot read resident-image load accounting");
         }
-        model->resident_bytes = load_stats.resident_bytes;
-        model->source_bytes = load_stats.source_bytes;
+        model->weight_stats = load_stats;
         const uint64_t bound_parts[] = {
             lfm_conformer_bound_weight_bytes(conformer),
             lfm_detokenizer_plan_bound_weight_bytes(detokenizer),
@@ -2604,8 +2600,6 @@ extern "C" int lfm_model_open(void *engine, const char *path, LfmModel **out,
         if (status != 0) {
             fail(status, "native model materialized checkpoint weights");
         }
-        model->load_workers = load_stats.worker_count;
-        model->load_tasks = load_stats.task_count;
         model->hidden = (uint32_t)hidden;
         model->ffn = (uint32_t)ffn;
         model->layers = (uint32_t)layers;
@@ -2882,7 +2876,7 @@ extern "C" int lfm_model_info(const LfmModel *model, LfmModelInfoV1 *out) {
     *out = {
         .size = sizeof(*out),
         .abi_version = LFM_MODEL_ABI_VERSION,
-        .resident_bytes = model->resident_bytes,
+        .resident_bytes = model->weight_stats.segment_bytes,
         .plan_id = model->plan_id,
         .depth_plan_id = model->depth_plan_id,
         .hidden = model->hidden,
@@ -2901,7 +2895,7 @@ extern "C" int lfm_model_info(const LfmModel *model, LfmModelInfoV1 *out) {
     return 0;
 }
 
-extern "C" int lfm_model_memory(const LfmModel *model, LfmModelMemoryV1 *out) {
+extern "C" int lfm_model_memory(const LfmModel *model, LfmModelMemoryV2 *out) {
     if (!model || !out || out->size < sizeof(*out) ||
         out->abi_version != LFM_MODEL_ABI_VERSION) {
         return -EINVAL;
@@ -2909,8 +2903,13 @@ extern "C" int lfm_model_memory(const LfmModel *model, LfmModelMemoryV1 *out) {
     *out = {
         .size = sizeof(*out),
         .abi_version = LFM_MODEL_ABI_VERSION,
-        .source_bytes = model->source_bytes,
-        .resident_image_bytes = model->resident_bytes,
+        .source_bytes = model->weight_stats.source_bytes,
+        .segment_bytes = model->weight_stats.segment_bytes,
+        .segment_constructed_bytes =
+            model->weight_stats.segment_constructed_bytes,
+        .attached_shared_bytes = model->weight_stats.attached_shared_bytes,
+        .wired_bytes = model->weight_stats.wired_bytes,
+        .process_resident_bytes = model->weight_stats.process_resident_bytes,
         .directly_bound_bytes = model->accounting.directly_bound_bytes.load(
             std::memory_order_acquire),
         .derived_immutable_bytes =
@@ -2941,22 +2940,37 @@ extern "C" int lfm_model_memory(const LfmModel *model, LfmModelMemoryV1 *out) {
         .publication_generation =
             model->accounting.publication_generation.load(
                 std::memory_order_acquire),
+        .weight_build_ns = model->weight_stats.build_ns,
+        .weight_attach_ns = model->weight_stats.attach_ns,
+        .weight_generation = model->weight_stats.generation,
         .load_ns = model->load_ns,
-        .load_workers = model->load_workers,
-        .load_tasks = model->load_tasks,
+        .load_workers = model->weight_stats.worker_count,
+        .load_tasks = model->weight_stats.task_count,
         .payload_read_coverage =
             model->accounting.payload_read_coverage.load(
                 std::memory_order_acquire),
         .accounting_flags = model->accounting.flags.load(
             std::memory_order_acquire),
+        .weight_flags = model->weight_stats.flags,
+        .weight_source_count = model->weight_stats.source_count,
+        .weight_payload_read_calls = model->weight_stats.payload_read_calls,
+        .weight_payload_read_bytes = model->weight_stats.payload_read_bytes,
         .post_readiness_allocation_attempts =
             model->accounting.post_readiness_allocation_attempts.load(
                 std::memory_order_acquire),
         .post_readiness_allocation_bytes =
             model->accounting.post_readiness_allocation_bytes.load(
                 std::memory_order_acquire),
+        .weight_identity_digest = {},
+        .weight_content_digest = {},
         .reserved = {},
     };
+    std::memcpy(out->weight_identity_digest,
+                model->weight_stats.identity_digest,
+                sizeof(out->weight_identity_digest));
+    std::memcpy(out->weight_content_digest,
+                model->weight_stats.content_digest,
+                sizeof(out->weight_content_digest));
     return 0;
 }
 
@@ -3002,7 +3016,7 @@ extern "C" LFM_INTERNAL_API int lfm_internal_playback_rate_contract_test(
  * before this path. Every post-seal call below reaches prepare_pcm_claimed. */
 extern "C" LFM_INTERNAL_API int
 lfm_internal_conversation_allocation_seal_test(
-    LfmModelMemoryV1 *after_compatible, LfmModelMemoryV1 *after_rejected,
+    LfmModelMemoryV2 *after_compatible, LfmModelMemoryV2 *after_rejected,
     int *out_growth_status, int *out_capture_rate_status,
     int *out_playback_rate_status) {
     if (!after_compatible || after_compatible->size < sizeof(*after_compatible) ||
@@ -3092,7 +3106,7 @@ lfm_internal_conversation_allocation_seal_test(
  * model construction. No numerical backend or checkpoint tensor is involved. */
 extern "C" LFM_INTERNAL_API int lfm_internal_model_accounting_fault_test(
     const uint8_t *source, uint8_t *loaded, uint8_t *rejected, size_t bytes,
-    LfmModelMemoryV1 *out, int *out_read_status,
+    LfmModelMemoryV2 *out, int *out_read_status,
     int *out_weight_status, int *out_policy_status) {
     if (!source || !loaded || !rejected || bytes == 0 || !out ||
         out->size < sizeof(*out) ||

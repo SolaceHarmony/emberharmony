@@ -20,6 +20,7 @@ use crate::voice_api::{
 };
 
 const RUNTIME_ABI: u32 = 4;
+const MODEL_ABI: u32 = 5;
 const STATUS_WOULD_BLOCK: i32 = -11;
 const STATUS_BUSY: i32 = -16;
 const STATUS_STALE: i32 = -116;
@@ -130,7 +131,11 @@ struct ModelMemory {
     size: u32,
     abi_version: u32,
     source_bytes: u64,
-    resident_image_bytes: u64,
+    segment_bytes: u64,
+    segment_constructed_bytes: u64,
+    attached_shared_bytes: u64,
+    wired_bytes: u64,
+    process_resident_bytes: u64,
     directly_bound_bytes: u64,
     derived_immutable_bytes: u64,
     materialized_weight_bytes: u64,
@@ -142,19 +147,28 @@ struct ModelMemory {
     post_publication_materialization_attempts: u64,
     post_publication_materialization_bytes: u64,
     publication_generation: u64,
+    weight_build_ns: u64,
+    weight_attach_ns: u64,
+    weight_generation: u64,
     load_ns: u64,
     load_workers: u32,
     load_tasks: u32,
     payload_read_coverage: u32,
     accounting_flags: u32,
+    weight_flags: u32,
+    weight_source_count: u32,
+    weight_payload_read_calls: u64,
+    weight_payload_read_bytes: u64,
     post_readiness_allocation_attempts: u64,
     post_readiness_allocation_bytes: u64,
+    weight_identity_digest: [u8; 32],
+    weight_content_digest: [u8; 32],
     reserved: [u64; 2],
 }
 
-const _: [(); 168] = [(); std::mem::size_of::<ModelMemory>()];
-const _: [(); 136] = [(); std::mem::offset_of!(ModelMemory, post_readiness_allocation_attempts)];
-const _: [(); 144] = [(); std::mem::offset_of!(ModelMemory, post_readiness_allocation_bytes)];
+const _: [(); 312] = [(); std::mem::size_of::<ModelMemory>()];
+const _: [(); 216] = [(); std::mem::offset_of!(ModelMemory, post_readiness_allocation_attempts)];
+const _: [(); 224] = [(); std::mem::offset_of!(ModelMemory, post_readiness_allocation_bytes)];
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -354,7 +368,11 @@ impl Default for NativeVoiceRuntimeConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NativeVoiceModelMemory {
     pub source_bytes: u64,
-    pub resident_image_bytes: u64,
+    pub segment_bytes: u64,
+    pub segment_constructed_bytes: u64,
+    pub attached_shared_bytes: u64,
+    pub wired_bytes: u64,
+    pub process_resident_bytes: u64,
     pub directly_bound_bytes: u64,
     pub derived_immutable_bytes: u64,
     pub materialized_weight_bytes: u64,
@@ -372,6 +390,17 @@ pub struct NativeVoiceModelMemory {
     /// deliberately independent of allocator metadata and object overhead.
     pub post_readiness_allocation_bytes: u64,
     pub publication_generation: u64,
+    pub weight_build_ns: u64,
+    pub weight_attach_ns: u64,
+    pub weight_generation: u64,
+    pub weight_flags: u32,
+    pub weight_source_count: u32,
+    /// Positioned tensor-payload reads performed by this process for this
+    /// image. Both values are zero for a shared-segment attach.
+    pub weight_payload_read_calls: u64,
+    pub weight_payload_read_bytes: u64,
+    pub weight_identity_digest: [u8; 32],
+    pub weight_content_digest: [u8; 32],
     /// Bitmask of model payload sources included in the read totals.
     pub payload_read_coverage: u32,
     /// True only when every possible model payload source is routed through
@@ -504,7 +533,7 @@ impl NativeVoiceModel {
     pub fn memory(&self) -> Result<NativeVoiceModelMemory, String> {
         let mut memory = ModelMemory {
             size: std::mem::size_of::<ModelMemory>() as u32,
-            abi_version: ffi::ABI,
+            abi_version: MODEL_ABI,
             ..Default::default()
         };
         status(
@@ -519,7 +548,11 @@ impl NativeVoiceModel {
         )?;
         Ok(NativeVoiceModelMemory {
             source_bytes: memory.source_bytes,
-            resident_image_bytes: memory.resident_image_bytes,
+            segment_bytes: memory.segment_bytes,
+            segment_constructed_bytes: memory.segment_constructed_bytes,
+            attached_shared_bytes: memory.attached_shared_bytes,
+            wired_bytes: memory.wired_bytes,
+            process_resident_bytes: memory.process_resident_bytes,
             directly_bound_bytes: memory.directly_bound_bytes,
             derived_immutable_bytes: memory.derived_immutable_bytes,
             materialized_weight_bytes: memory.materialized_weight_bytes,
@@ -534,6 +567,15 @@ impl NativeVoiceModel {
             post_readiness_allocation_attempts: memory.post_readiness_allocation_attempts,
             post_readiness_allocation_bytes: memory.post_readiness_allocation_bytes,
             publication_generation: memory.publication_generation,
+            weight_build_ns: memory.weight_build_ns,
+            weight_attach_ns: memory.weight_attach_ns,
+            weight_generation: memory.weight_generation,
+            weight_flags: memory.weight_flags,
+            weight_source_count: memory.weight_source_count,
+            weight_payload_read_calls: memory.weight_payload_read_calls,
+            weight_payload_read_bytes: memory.weight_payload_read_bytes,
+            weight_identity_digest: memory.weight_identity_digest,
+            weight_content_digest: memory.weight_content_digest,
             payload_read_coverage: memory.payload_read_coverage,
             payload_read_accounting_complete: memory.accounting_flags
                 & MODEL_ACCOUNTING_PAYLOAD_READS_COMPLETE
