@@ -9,6 +9,7 @@ unsafe extern "C" {
     fn lfm_native_inner_voice_probe_gate(
         model_path: *const c_char,
         probe_dir: *const c_char,
+        item_filter: *const c_char,
         kernel_lanes: u32,
         error: *mut c_char,
         error_length: usize,
@@ -30,6 +31,9 @@ fn inner_voice_listening_probe_reads_text_head_per_audio_row() {
     );
     let probe_dir = CString::new(probe_dir.as_os_str().as_encoded_bytes())
         .expect("probe dataset path contains a NUL byte");
+    let item_filter = std::env::var_os("LFM_PROBE_ITEM").map(|item| {
+        CString::new(item.as_encoded_bytes()).expect("probe item filter contains a NUL byte")
+    });
     let lanes = std::env::var("LFM_SPEECH_GATE_LANES")
         .map(|value| {
             value
@@ -42,6 +46,9 @@ fn inner_voice_listening_probe_reads_text_head_per_audio_row() {
         lfm_native_inner_voice_probe_gate(
             model.as_ptr(),
             probe_dir.as_ptr(),
+            item_filter
+                .as_ref()
+                .map_or(std::ptr::null(), |item| item.as_ptr()),
             lanes,
             error.as_mut_ptr(),
             error.len(),

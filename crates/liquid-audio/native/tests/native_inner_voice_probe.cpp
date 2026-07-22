@@ -444,8 +444,15 @@ extern "C" int lfm_native_inner_voice_probe_gate(
         }
     }
 
+    if (status == 0 && items_run == 0) {
+        copy_error(error, error_length,
+                   "item filter matched no probe item");
+        status = LFM_STATUS_INVALID_ARGUMENT;
+    }
+
     if (rows_csv) std::fclose(rows_csv);
     if (items_csv) std::fclose(items_csv);
+    if (v2_csv) std::fclose(v2_csv);
 
     if (model) {
         const int closed = lfm_runtime_model_close(runtime, model);
