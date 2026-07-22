@@ -258,16 +258,10 @@ non-owning byte views. Equal-rate PCM is written directly into the retained
 playback reservation; otherwise the prepared native resampler writes that final
 reservation from conversation-owned codec scratch without a transport copy.
 
-The legacy `mimi_decoder_new_from_file` route remains solely for offline
-Candle/Moshi parity. It is compiled only with `LFM_BUILD_ORACLE`, is absent from
-the shared native header, and is not present in the production native archive.
-It may own a standalone image because the oracle intentionally compares two
-independent implementations; no shipped session can reach it.
-
-The LFM2 custom detokenizer at `crates/liquid-audio/src/detokenizer.rs:219-310`
-is not on the shipped realtime path, which requires Mimi. Prove no Tauri command
-reaches it, capture any still-required compatibility fixtures, and delete it.
-The production loader does not bind or advertise it. Git history is sufficient
+No standalone Mimi-from-file loader, Rust custom detokenizer, or oracle-only
+loader ABI remains. Native Mimi stays isolated for the future Moshi tranche;
+LFM2.5 binds only the released audio detokenizer from the model-owned combined
+image. Git history is sufficient for the deleted alternatives.
 if a future native port needs to consult the old implementation.
 
 If a future product requirement needs that one-shot API, port its embedding,

@@ -61,8 +61,8 @@ index-to-shard disagreement. No C++ exception crosses the C ABI.
 The shipped desktop opens the image only through the opaque native runtime. It
 does not construct `ResidentWeights`, a Candle builder, or a Rust LFM2 model.
 The old Rust model, training code, fixture capture, and compatibility adapters
-are isolated behind the workspace-only `liquid-audio-oracle` package. They are
-not in the production dependency graph.
+were deleted after native ownership landed; no callable alternative loader or
+model graph remains.
 
 `LfmModelMemoryV1` reports source bytes, logical resident-image bytes, directly
 bound tensor bytes, formula-derived immutable bytes, compatibility-copy bytes,

@@ -3,11 +3,11 @@
 //! The exported lifecycle/session surface stays opaque, and deleted direct
 //! numerical entry points must not survive as hidden compatibility symbols.
 
-#[cfg(all(not(feature = "oracle-abi"), target_os = "macos"))]
+#[cfg(target_os = "macos")]
 use std::collections::BTreeSet;
-#[cfg(all(not(feature = "oracle-abi"), target_os = "macos"))]
+#[cfg(target_os = "macos")]
 use std::path::Path;
-#[cfg(all(not(feature = "oracle-abi"), target_os = "macos"))]
+#[cfg(target_os = "macos")]
 use std::process::Command;
 
 const PRODUCT: [(&str, &str); 4] = [
@@ -23,14 +23,11 @@ const PRODUCT: [(&str, &str); 4] = [
     ("lfm_model.h", include_str!("../native/include/lfm_model.h")),
 ];
 
-const DETOKENIZER_CPP: &str =
-    include_str!("../native/src/detokenizer/lfm_detokenizer.cpp");
-const DETOKENIZER_AARCH64: &str =
-    include_str!("../native/kernels/aarch64/flashkern_detokenizer.S");
-const DETOKENIZER_X86_64: &str =
-    include_str!("../native/kernels/x86_64/flashkern_detokenizer.S");
+const DETOKENIZER_CPP: &str = include_str!("../native/src/detokenizer/lfm_detokenizer.cpp");
+const DETOKENIZER_AARCH64: &str = include_str!("../native/kernels/aarch64/flashkern_detokenizer.S");
+const DETOKENIZER_X86_64: &str = include_str!("../native/kernels/x86_64/flashkern_detokenizer.S");
 
-#[cfg(all(not(feature = "oracle-abi"), target_os = "macos"))]
+#[cfg(target_os = "macos")]
 const PRODUCT_SYMBOLS: [&str; 40] = [
     "lfm_runtime_create",
     "lfm_runtime_start",
@@ -74,7 +71,7 @@ const PRODUCT_SYMBOLS: [&str; 40] = [
     "lfm_session_control_destroy",
 ];
 
-#[cfg(all(not(feature = "oracle-abi"), target_os = "macos"))]
+#[cfg(target_os = "macos")]
 unsafe extern "C" {
     fn lfm_runtime_create();
     fn lfm_runtime_start();
@@ -280,7 +277,7 @@ fn detokenizer_payload_math_is_owned_by_paired_assembly() {
     }
 }
 
-#[cfg(all(not(feature = "oracle-abi"), target_os = "macos"))]
+#[cfg(target_os = "macos")]
 fn archive_symbols(name: &str) -> String {
     let path = Path::new(env!("LFM_NATIVE_ARCHIVE_DIR")).join(name);
     let output = Command::new("nm")
@@ -302,7 +299,7 @@ fn archive_symbols(name: &str) -> String {
     })
 }
 
-#[cfg(all(not(feature = "oracle-abi"), target_os = "macos"))]
+#[cfg(target_os = "macos")]
 fn symbol_line<'a>(symbols: &'a str, symbol: &str) -> &'a str {
     let suffix = format!(" _{symbol}");
     symbols
@@ -311,7 +308,7 @@ fn symbol_line<'a>(symbols: &'a str, symbol: &str) -> &'a str {
         .unwrap_or_else(|| panic!("archive did not define `{symbol}`"))
 }
 
-#[cfg(all(not(feature = "oracle-abi"), target_os = "macos"))]
+#[cfg(target_os = "macos")]
 fn defines_symbol(symbols: &str, symbol: &str) -> bool {
     let suffix = format!(" _{symbol}");
     symbols
@@ -319,7 +316,7 @@ fn defines_symbol(symbols: &str, symbol: &str) -> bool {
         .any(|line| line.ends_with(&suffix) && !line.contains("(undefined)"))
 }
 
-#[cfg(all(not(feature = "oracle-abi"), target_os = "macos"))]
+#[cfg(target_os = "macos")]
 fn references_symbol(symbols: &str, symbol: &str) -> bool {
     let suffix = format!(" _{symbol}");
     symbols
@@ -327,7 +324,7 @@ fn references_symbol(symbols: &str, symbol: &str) -> bool {
         .any(|line| line.ends_with(&suffix) && line.contains("(undefined)"))
 }
 
-#[cfg(all(not(feature = "oracle-abi"), target_os = "macos"))]
+#[cfg(target_os = "macos")]
 fn default_native_definitions(symbols: &str) -> BTreeSet<String> {
     symbols
         .lines()
@@ -340,7 +337,7 @@ fn default_native_definitions(symbols: &str) -> BTreeSet<String> {
         .collect()
 }
 
-#[cfg(all(not(feature = "oracle-abi"), target_os = "macos"))]
+#[cfg(target_os = "macos")]
 #[allow(function_casts_as_integer)]
 fn retain_product_surface() {
     // Retain the Rust owner rim so Cargo propagates this crate's native archive
@@ -392,7 +389,7 @@ fn retain_product_surface() {
 }
 
 #[test]
-#[cfg(all(not(feature = "oracle-abi"), target_os = "macos"))]
+#[cfg(target_os = "macos")]
 fn production_archives_keep_only_native_owner_lifecycle_private_external() {
     let weights = archive_symbols("liblfm_safetensors.a");
     for symbol in [
@@ -598,7 +595,7 @@ fn production_archives_keep_only_native_owner_lifecycle_private_external() {
 }
 
 #[test]
-#[cfg(all(not(feature = "oracle-abi"), target_os = "macos"))]
+#[cfg(target_os = "macos")]
 fn linked_product_exports_exact_lifecycle_allowlist() {
     retain_product_surface();
     let executable = std::env::current_exe().expect("test executable path");

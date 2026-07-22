@@ -49,19 +49,19 @@ typedef struct LfmModelInfoV1 {
 extern "C" {
 #endif
 
-LFM_ORACLE_API int lfm_model_open(void *engine, const char *path,
+LFM_INTERNAL_API int lfm_model_open(void *engine, const char *path,
                                   LfmModel **out, char *error,
                                   size_t error_length);
-LFM_ORACLE_API int lfm_model_close(LfmModel *model);
-LFM_ORACLE_API int lfm_model_info(const LfmModel *model,
+LFM_INTERNAL_API int lfm_model_close(LfmModel *model);
+LFM_INTERNAL_API int lfm_model_info(const LfmModel *model,
                                   LfmModelInfoV1 *out);
-LFM_ORACLE_API int lfm_model_memory(const LfmModel *model,
+LFM_INTERNAL_API int lfm_model_memory(const LfmModel *model,
                                     LfmModelMemoryV1 *out);
-LFM_ORACLE_API int lfm_conversation_create(
+LFM_INTERNAL_API int lfm_conversation_create(
     LfmModel *model, const LfmConversationConfigV1 *config,
     LfmConversation **out, char *error, size_t error_length);
-LFM_ORACLE_API int lfm_conversation_reset(LfmConversation *conversation);
-LFM_ORACLE_API int lfm_conversation_close(LfmConversation *conversation);
+LFM_INTERNAL_API int lfm_conversation_reset(LfmConversation *conversation);
+LFM_INTERNAL_API int lfm_conversation_close(LfmConversation *conversation);
 
 #ifdef __cplusplus
 } /* extern "C" */
@@ -135,6 +135,28 @@ extern "C" int lfm_mixed_turn_plan(size_t capacity, size_t prefix_tokens,
  * the product ABI: 1 = decode/publish PCM, 0 = recurrence-only EOAudio. */
 extern "C" LFM_INTERNAL_API int lfm_native_emission_needs_pcm(
     const LfmNativeEmission *emission);
+
+/* Test-scoped inner-voice listening probe. Feeds one user audio turn through
+ * the production admission prefill seam ONE adapted row per pass, sampling
+ * the greedy text head at every row into `out_tokens` and recording per-row
+ * wall time into `out_row_ns`. `out_readouts` is optional: when non-null it
+ * must hold `row_capacity` records and every row pass also reports top-k ids
+ * with natural-log probabilities plus full-distribution entropy for the text
+ * head and the Depthformer codebook-0 head (see LfmListenReadoutForTest).
+ * Sampled ids and readouts are reported only, never committed; context
+ * commits match a production admission over the same prefix and rows.
+ * Submit rings `notify` once at terminal; collect returns -EINPROGRESS until
+ * then and releases the probe record on any terminal status. */
+extern "C" LFM_INTERNAL_API int
+lfm_internal_conversation_listen_probe_submit_for_test(
+    LfmConversation *conversation, const float *pcm, size_t sample_count,
+    uint32_t sample_rate, uint32_t *out_tokens, uint64_t *out_row_ns,
+    LfmListenReadoutForTest *out_readouts, size_t row_capacity,
+    LfmAudioRouteNotify notify, void *notify_context, void **out_probe);
+extern "C" LFM_INTERNAL_API int
+lfm_internal_conversation_listen_probe_collect_for_test(
+    LfmConversation *conversation, void *probe, uint64_t *out_rows,
+    uint64_t *out_encode_ns);
 
 /* Private session/model seam. No declaration in the product or Rust ABI. */
 LFM_INTERNAL_API int lfm_conversation_prepare_pcm_native(

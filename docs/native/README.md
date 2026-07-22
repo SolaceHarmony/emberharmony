@@ -16,10 +16,11 @@ production `liquid-audio` dependency graph is Candle-free.
   vendored `kcoro_arena` runtime. The vendored C runtime owns retained
   services, realtime notifier edges, fixed teams, fixed scopes, doorbells, and
   correlated monotonic deadlines.
-- `crates/liquid-audio-oracle` — workspace-only Candle reference, training, and
-  fixture-capture code. It is not a production fallback.
 - `crates/candle-flashfftconv` — workspace-only experimental Candle/Metal
   kernels. The desktop does not depend on it.
+
+The former Rust/Candle LFM2 model crate was deleted after the native model path
+landed. Historical reports remain documentation, not a callable second model.
 
 Rust docking uses the production wrappers in `kcoro-sys`; model-pass scheduling
 remains native.

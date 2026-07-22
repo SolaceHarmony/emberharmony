@@ -3,8 +3,8 @@
 Native LFM2.5-Audio engine used by the desktop voice stack. Native
 C++/kcoro/Flashkern and architecture kernels own the model image, inference,
 turn policy, CoreAudio callbacks, and PCM docks. Rust exposes opaque lifecycle,
-control, and bounded observation only. Candle lives in the separate offline
-`liquid-audio-oracle` crate and is not linked into this production crate.
+control, and bounded observation only. The former Rust/Candle LFM2 model and its
+callable oracle surface were deleted after native ownership landed.
 
 - Detailed architecture docs: `docs/`.
 - Native C/C++ sources: `native/`.

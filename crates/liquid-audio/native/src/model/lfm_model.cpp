@@ -1603,7 +1603,7 @@ int submit_admission_prefill(ConversationAdmission &admission,
         sample && count == remaining ? &conversation.text_sampler : nullptr,
         sample && count == remaining ? &conversation.prng : nullptr,
         sample && count == remaining ? &admission.sampled : nullptr,
-        conversation.model->lanes,
+        conversation.model->lanes, nullptr,
         continue_admission, &admission, &admission.route);
     if (status == 0 && admission.ticket.sequence == 0) {
         admission.ticket = admission.route.ticket;
@@ -3225,4 +3225,303 @@ extern "C" LFM_INTERNAL_API int lfm_internal_model_source_gate_test(
         sizeof(tokenizer_error));
     if (tokenizer) lfm_tokenizer_close(tokenizer);
     return 0;
+}
+
+namespace {
+
+/* Test-scoped inner-voice listening probe. It replays the production PCM
+ * admission shape (audio encode, then turn prefix, then adapted rows through
+ * the prefill seam) but feeds exactly ONE adapted row per pass and asks the
+ * greedy text head for a sample at every row. When the caller provides a
+ * readout array, every row pass additionally reports the top-k/entropy
+ * readout of the text head and of the Depthformer codebook-0 head through
+ * the engine's test-only sample-seam readout. Sampled ids and readouts are
+ * reported into caller arrays only; context commits are byte-identical to a
+ * production admission over the same rows. No assistant suffix is fed and no
+ * generation begins, so the probed conversation ends holding just the user
+ * audio turn. */
+enum : uint32_t {
+    LISTEN_PROBE_ENCODE = 0,
+    LISTEN_PROBE_PREFIX = 1,
+    LISTEN_PROBE_ROWS = 2,
+    LISTEN_PROBE_TERMINAL = 3,
+};
+
+struct ListenProbeForTest {
+    LfmConversation *conversation = nullptr;
+    LfmAudioRouteHandle route{};
+    LfmAudioRouteNotify notify = nullptr;
+    void *notify_context = nullptr;
+    LfmF32SpanChain pcm{};
+    uint64_t adapted_values = 0;
+    uint32_t *tokens = nullptr;
+    uint64_t *row_ns = nullptr;
+    LfmListenReadoutForTest *readouts = nullptr;
+    size_t capacity = 0;
+    size_t rows = 0;
+    size_t offset = 0;
+    size_t chunk = 0;
+    uint32_t phase = LISTEN_PROBE_TERMINAL;
+    int status = -EINPROGRESS;
+    bool complete = false;
+    bool initial_prefix = false;
+    std::chrono::steady_clock::time_point node_started{};
+    uint64_t encode_ns = 0;
+};
+
+int submit_listen_probe_node(ListenProbeForTest &probe);
+void continue_listen_probe(void *context);
+
+void finish_listen_probe(ListenProbeForTest &probe, int status) {
+    if (probe.complete) std::abort();
+    probe.status = status;
+    probe.phase = LISTEN_PROBE_TERMINAL;
+    probe.complete = true;
+    probe.notify(probe.notify_context);
+}
+
+int submit_listen_probe_audio(ListenProbeForTest &probe) {
+    LfmConversation &conversation = *probe.conversation;
+    LfmModel *model = conversation.model;
+    if (!model || probe.pcm.count == 0 || probe.pcm.length == 0 ||
+        !model->frontend || !model->conformer ||
+        !conversation.frontend_workspace ||
+        !conversation.conformer_workspace || !conversation.resampler ||
+        !conversation.resampler_workspace ||
+        probe.pcm.length > conversation.prepared_samples) {
+        return -EINVAL;
+    }
+    const LfmAudioEncodePassV2 pass = {
+        .size = sizeof(LfmAudioEncodePassV2),
+        .abi_version = LFM_AUDIO_PASS_ABI,
+        .resampler = conversation.resampler,
+        .resampler_workspace = conversation.resampler_workspace,
+        .frontend = model->frontend,
+        .frontend_workspace = conversation.frontend_workspace,
+        .conformer = model->conformer,
+        .conformer_workspace = conversation.conformer_workspace,
+        .pcm = probe.pcm,
+        .resampled = conversation.resampled.empty()
+                         ? nullptr
+                         : conversation.resampled.data(),
+        .resampled_capacity = conversation.resampled.size(),
+        .mel = conversation.mel_bf16.data(),
+        .mel_capacity = conversation.mel_bf16.size(),
+        .adapted = conversation.adapted.data(),
+        .adapted_capacity = conversation.adapted.size(),
+    };
+    return lfm_engine_audio_encode_submit(
+        model->engine, model->plan_id, &pass, &probe.adapted_values,
+        continue_listen_probe, &probe, &probe.route);
+}
+
+int submit_listen_probe_prefill(ListenProbeForTest &probe,
+                                const uint32_t *ids,
+                                const uint16_t *provided, size_t remaining,
+                                uint32_t kind, uint32_t *out_token,
+                                LfmListenReadoutForTest *readout) {
+    LfmConversation &conversation = *probe.conversation;
+    size_t count = 0;
+    int status = lfm_context_window_prefill_chunk(
+        &conversation.window, remaining, LFM_PREFILL_MAX_ROWS, &count);
+    if (status != 0) return status;
+    /* A sampled pass must cover exactly the one probed row. */
+    if (out_token && count != 1) return -EPROTO;
+    status = reserve_context(conversation, count);
+    if (status != 0) return status;
+    probe.chunk = count;
+    return lfm_engine_prefill_submit(
+        conversation.model->engine, conversation.model->plan_id,
+        conversation.prefill_workspace, ids, provided, count, kind,
+        conversation.states.data(), conversation.states.size(),
+        (size_t)conversation.window.position,
+        conversation.rope_cos.empty()
+            ? nullptr
+            : conversation.rope_cos.data() +
+                  conversation.window.start * conversation.rope_half,
+        conversation.rope_sin.empty()
+            ? nullptr
+            : conversation.rope_sin.data() +
+                  conversation.window.start * conversation.rope_half,
+        conversation.rope_cos.size() -
+            conversation.window.start * conversation.rope_half,
+        conversation.hidden.data(), conversation.hidden.size(),
+        out_token ? &conversation.text_sampler : nullptr, nullptr,
+        out_token, conversation.model->lanes, readout,
+        continue_listen_probe, &probe, &probe.route);
+}
+
+int collect_listen_probe_node(ListenProbeForTest &probe) {
+    LfmConversation &conversation = *probe.conversation;
+    LfmModel *model = conversation.model;
+    const uint64_t elapsed =
+        (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - probe.node_started)
+            .count();
+    if (probe.phase == LISTEN_PROBE_ENCODE) {
+        probe.encode_ns = elapsed;
+        if (!model || model->hidden == 0 || probe.adapted_values == 0 ||
+            probe.adapted_values % model->hidden != 0) {
+            return -EINVAL;
+        }
+        const size_t rows = (size_t)(probe.adapted_values / model->hidden);
+        const std::vector<uint32_t> &prefix = probe.initial_prefix
+            ? model->initial_turn_tokens
+            : model->next_turn_tokens;
+        if (rows > probe.capacity || prefix.size() > model->max_context ||
+            rows > model->max_context - prefix.size()) {
+            return -ENOSPC;
+        }
+        const int status = admit_context(conversation,
+                                         prefix.size() + rows);
+        if (status != 0) return status;
+        probe.rows = rows;
+        probe.phase = LISTEN_PROBE_PREFIX;
+        probe.offset = 0;
+        return 0;
+    }
+    for (size_t row = 0; row < probe.chunk; ++row) {
+        const int status = commit_context(conversation);
+        if (status != 0) return status;
+    }
+    conversation.hidden_ready = true;
+    if (probe.phase == LISTEN_PROBE_ROWS) probe.row_ns[probe.offset] = elapsed;
+    probe.offset += probe.chunk;
+    probe.chunk = 0;
+    return 0;
+}
+
+int submit_listen_probe_node(ListenProbeForTest &probe) {
+    LfmConversation &conversation = *probe.conversation;
+    LfmModel *model = conversation.model;
+    for (;;) {
+        const std::vector<uint32_t> &prefix = probe.initial_prefix
+            ? model->initial_turn_tokens
+            : model->next_turn_tokens;
+        if (probe.phase == LISTEN_PROBE_ENCODE) {
+            probe.node_started = std::chrono::steady_clock::now();
+            return submit_listen_probe_audio(probe);
+        }
+        if (probe.phase == LISTEN_PROBE_PREFIX) {
+            if (probe.offset < prefix.size()) {
+                return submit_listen_probe_prefill(
+                    probe, prefix.data() + probe.offset, nullptr,
+                    prefix.size() - probe.offset, 0, nullptr, nullptr);
+            }
+            probe.phase = LISTEN_PROBE_ROWS;
+            probe.offset = 0;
+            continue;
+        }
+        if (probe.phase == LISTEN_PROBE_ROWS) {
+            if (probe.offset < probe.rows) {
+                probe.node_started = std::chrono::steady_clock::now();
+                LfmListenReadoutForTest *readout = probe.readouts
+                    ? probe.readouts + probe.offset
+                    : nullptr;
+                if (readout) {
+                    *readout = {};
+                    readout->depth_id = model->depth_plan_id;
+                }
+                return submit_listen_probe_prefill(
+                    probe, nullptr,
+                    conversation.adapted.data() +
+                        probe.offset * model->hidden,
+                    1, 2, probe.tokens + probe.offset, readout);
+            }
+            finish_listen_probe(probe, 0);
+            return 0;
+        }
+        return -EPROTO;
+    }
+}
+
+void continue_listen_probe(void *context) {
+    ListenProbeForTest *probe = static_cast<ListenProbeForTest *>(context);
+    if (!probe || !probe->conversation || probe->complete) std::abort();
+    int status = lfm_engine_audio_route_collect(
+        probe->conversation->model->engine, &probe->route);
+    if (status == -EINPROGRESS) status = -EPROTO;
+    if (status == 0) status = collect_listen_probe_node(*probe);
+    if (status == 0) status = submit_listen_probe_node(*probe);
+    if (status != 0) finish_listen_probe(*probe, status);
+}
+
+} // namespace
+
+extern "C" LFM_INTERNAL_API int
+lfm_internal_conversation_listen_probe_submit_for_test(
+    LfmConversation *conversation, const float *pcm, size_t sample_count,
+    uint32_t sample_rate, uint32_t *out_tokens, uint64_t *out_row_ns,
+    LfmListenReadoutForTest *out_readouts, size_t row_capacity,
+    LfmAudioRouteNotify notify, void *notify_context, void **out_probe) {
+    if (!conversation || !pcm || sample_count == 0 || sample_rate == 0 ||
+        !out_tokens || !out_row_ns || row_capacity == 0 || !notify ||
+        !notify_context || !out_probe) {
+        return -EINVAL;
+    }
+    *out_probe = nullptr;
+    const LfmF32Span span = {
+        .data = pcm,
+        .length = sample_count,
+    };
+    LfmF32SpanChain chain{};
+    int status = lfm_f32_span_chain_init(&span, 1, &chain);
+    if (status != 0) return status;
+    ConversationClaim claim(conversation);
+    if (!claim) return -EBUSY;
+    LfmModel *model = conversation->model;
+    if (!model || !model->frontend || !model->conformer ||
+        model->hidden == 0) {
+        return -ENOTSUP;
+    }
+    if (conversation->generation_active && !conversation->generation_ended) {
+        return -EALREADY;
+    }
+    if (sample_rate != conversation->prepared_rate ||
+        sample_count > conversation->prepared_samples) {
+        return -EINVAL;
+    }
+    /* The readout is meaningful only as a deterministic argmax trajectory. */
+    if ((conversation->text_sampler.flags & LFM_SAMPLE_FLAG_GREEDY) == 0) {
+        return -EINVAL;
+    }
+    /* The dual-head readout needs the Depthformer codebook-0 head. */
+    if (out_readouts && model->depth_plan_id == 0) return -ENOTSUP;
+    std::unique_ptr<ListenProbeForTest> probe(
+        new (std::nothrow) ListenProbeForTest());
+    if (!probe) return -ENOMEM;
+    probe->conversation = conversation;
+    probe->notify = notify;
+    probe->notify_context = notify_context;
+    probe->pcm = chain;
+    probe->tokens = out_tokens;
+    probe->row_ns = out_row_ns;
+    probe->readouts = out_readouts;
+    probe->capacity = row_capacity;
+    probe->phase = LISTEN_PROBE_ENCODE;
+    probe->initial_prefix = conversation->window.cursor == 0;
+    status = submit_listen_probe_node(*probe);
+    if (status != 0) return status;
+    *out_probe = probe.release();
+    claim.detach();
+    return 0;
+}
+
+extern "C" LFM_INTERNAL_API int
+lfm_internal_conversation_listen_probe_collect_for_test(
+    LfmConversation *conversation, void *probe_pointer, uint64_t *out_rows,
+    uint64_t *out_encode_ns) {
+    if (!conversation || !probe_pointer || !out_rows || !out_encode_ns) {
+        return -EINVAL;
+    }
+    ListenProbeForTest *probe =
+        static_cast<ListenProbeForTest *>(probe_pointer);
+    if (probe->conversation != conversation) return -ESTALE;
+    if (!probe->complete) return -EINPROGRESS;
+    const int status = probe->status;
+    *out_rows = probe->rows;
+    *out_encode_ns = probe->encode_ns;
+    delete probe;
+    conversation->active.clear(std::memory_order_release);
+    return status;
 }

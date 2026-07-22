@@ -212,7 +212,7 @@ The final cutover additionally requires:
 | safe Rust continuation/notifier seam | `crates/kcoro-sys/src/lib.rs` |
 | opaque platform callback endpoints | `crates/liquid-audio/src/voice_api.rs`, `src/native_voice.rs` |
 | native product lifecycle ABI | `crates/liquid-audio/native/include/lfm_runtime.h`, `lfm_session.h` |
-| private numerical oracle ABI | hidden `oracle-abi` entry points; no production legacy header |
+| private numerical oracle ABI | none; the callable Rust/Candle comparison path was deleted |
 | native model binding | `crates/liquid-audio/native/src/model/lfm_model.cpp` |
 | native queue/doorbell protocol | `native/include/lfm_kernel_bridge.h`, `native/src/runtime/` |
 | fixed lane control | `native/src/engine/flashkern_engine.cpp` |

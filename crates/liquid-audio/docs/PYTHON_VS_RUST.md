@@ -2,10 +2,9 @@
 
 Status: **historical numerical archaeology, not a production architecture or
 current command guide.** The Rust/Candle inference port described below has
-been deleted from `liquid-audio`. Offline training and oracle material lives in
-the separate `liquid-audio-oracle` crate; production loads and executes the
-model only through native C++/kcoro/Flashkern. Git history, not a retained
-second inference path, preserves the implementation this report measured.
+been deleted. Production loads and executes the model only through native
+C++/kcoro/Flashkern. Git history, not a retained second inference or training
+path, preserves the implementation this report measured.
 
 Scope: the pure-Rust **candle** port of Liquid AI's `liquid_audio` (LFM2.5-Audio-1.5B)
 against the upstream Python. "Same" = verified numerically/structurally identical;

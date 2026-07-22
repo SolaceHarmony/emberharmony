@@ -88,13 +88,13 @@ typedef struct LfmFrontendConfig {
 
 // 0 on success; -EINVAL on a malformed config; -EOPNOTSUPP when mag_power is
 // not 2.0 (the reference's general branch is not admitted to production).
-LFM_ORACLE_API int lfm_frontend_create(const LfmFrontendConfig *config,
+LFM_INTERNAL_API int lfm_frontend_create(const LfmFrontendConfig *config,
                                        LfmFrontend **out);
-LFM_ORACLE_API int lfm_frontend_destroy(LfmFrontend *frontend);
+LFM_INTERNAL_API int lfm_frontend_destroy(LfmFrontend *frontend);
 
 // Immutable formula-derived table bytes owned by the plan (mel filterbank and
 // windowed DFT basis). Source/model bytes are not included.
-LFM_ORACLE_API uint64_t
+LFM_INTERNAL_API uint64_t
 lfm_frontend_derived_bytes(const LfmFrontend *frontend);
 
 // Reusable, session-owned run storage. Reserve the maximum admitted clip at
@@ -102,30 +102,30 @@ lfm_frontend_derived_bytes(const LfmFrontend *frontend);
 // used with any frontend plan, but concurrent lanes should own distinct
 // workspaces. Reserve flags select padded f32 (0), tightly packed valid f32
 // (VALID_ONLY), or tightly packed valid BF16 (VALID_ONLY|BF16_OUTPUT).
-LFM_ORACLE_API int
+LFM_INTERNAL_API int
 lfm_frontend_workspace_create(LfmFrontendWorkspace **out);
-LFM_ORACLE_API int
+LFM_INTERNAL_API int
 lfm_frontend_workspace_destroy(LfmFrontendWorkspace *workspace);
-LFM_ORACLE_API int lfm_frontend_workspace_reserve(
+LFM_INTERNAL_API int lfm_frontend_workspace_reserve(
     const LfmFrontend *frontend, LfmFrontendWorkspace *workspace,
     uint64_t max_sample_count, uint32_t flags);
 
 // Valid mel frames for a clip of sample_count samples — the reference
 // get_seq_len floor-divide contract (integer arithmetic, single source of
 // truth for callers that used the Rust featurizer's method).
-LFM_ORACLE_API uint64_t
+LFM_INTERNAL_API uint64_t
 lfm_frontend_seq_len(const LfmFrontend *frontend, uint64_t sample_count);
 
 // Total output frames forward will produce for this clip (framing count plus
 // pad_to rounding), so the caller sizes out_mel exactly: nfilt * out_frames.
-LFM_ORACLE_API int lfm_frontend_out_frames(const LfmFrontend *frontend,
+LFM_INTERNAL_API int lfm_frontend_out_frames(const LfmFrontend *frontend,
                                            uint64_t sample_count,
                                            uint64_t *out_frames);
 
 // pcm: mono f32 in [-1,1], sample_count > 0 samples at config sample_rate.
 // out_mel: row-major (nfilt x out_frames) normalized log-mel.
 // Returns 0; -EINVAL on null/empty input or undersized capacity.
-LFM_ORACLE_API int lfm_frontend_forward(
+LFM_INTERNAL_API int lfm_frontend_forward(
     const LfmFrontend *frontend, const float *pcm, uint64_t sample_count,
     float *out_mel, uint64_t out_capacity_values);
 
@@ -136,14 +136,14 @@ LFM_ORACLE_API int lfm_frontend_forward(
 // Returns 0; -EINVAL on null/empty input, a zero valid-frame count, or an
 // undersized output. This wrapper owns a temporary workspace; production
 // sessions use lfm_frontend_forward_workspace below.
-LFM_ORACLE_API int lfm_frontend_forward_valid(
+LFM_INTERNAL_API int lfm_frontend_forward_valid(
     const LfmFrontend *frontend, const float *pcm, uint64_t sample_count,
     float *out_mel, uint64_t out_capacity_values);
 
 // Allocation-free-after-warm form used by production. flags is either 0 for
 // the padded compatibility contract or LFM_FRONTEND_FORWARD_VALID_ONLY for a
 // tightly packed (nfilt x seq_len) destination. All other bits are rejected.
-LFM_ORACLE_API int lfm_frontend_forward_workspace(
+LFM_INTERNAL_API int lfm_frontend_forward_workspace(
     const LfmFrontend *frontend, LfmFrontendWorkspace *workspace,
     const float *pcm, uint64_t sample_count, float *out_mel,
     uint64_t out_capacity_values, uint32_t flags);
@@ -161,7 +161,7 @@ LFM_INTERNAL_API int lfm_frontend_forward_spans_workspace(
 // prepared workspace and rounds each normalized row directly into the caller's
 // BF16 destination. No f32 mel plane is published or copied. The workspace
 // must have been reserved with VALID_ONLY|BF16_OUTPUT.
-LFM_ORACLE_API int lfm_frontend_forward_bf16_workspace(
+LFM_INTERNAL_API int lfm_frontend_forward_bf16_workspace(
     const LfmFrontend *frontend, LfmFrontendWorkspace *workspace,
     const float *pcm, uint64_t sample_count, uint16_t *out_mel,
     uint64_t out_capacity_values);
@@ -172,12 +172,12 @@ LFM_INTERNAL_API int lfm_frontend_forward_bf16_spans_workspace(
 
 // Immutable, pair-specific torchaudio resampling plan. Formula-derived f64
 // phase kernels are built once here, never during execution.
-LFM_ORACLE_API int lfm_resampler_create(uint32_t orig_freq, uint32_t new_freq,
+LFM_INTERNAL_API int lfm_resampler_create(uint32_t orig_freq, uint32_t new_freq,
                                         LfmResampler **out);
-LFM_ORACLE_API int lfm_resampler_destroy(LfmResampler *resampler);
-LFM_ORACLE_API uint64_t
+LFM_INTERNAL_API int lfm_resampler_destroy(LfmResampler *resampler);
+LFM_INTERNAL_API uint64_t
 lfm_resampler_derived_bytes(const LfmResampler *resampler);
-LFM_ORACLE_API int lfm_resampler_out_length(const LfmResampler *resampler,
+LFM_INTERNAL_API int lfm_resampler_out_length(const LfmResampler *resampler,
                                             uint64_t sample_count,
                                             uint64_t *out_length);
 
@@ -185,11 +185,11 @@ LFM_ORACLE_API int lfm_resampler_out_length(const LfmResampler *resampler,
 // numerical plane. Processing reads the caller's f32 span directly, treats the
 // prefix/suffix padding as logical zeros, and returns -ENOBUFS if a command
 // exceeds the prepared sample count.
-LFM_ORACLE_API int
+LFM_INTERNAL_API int
 lfm_resampler_workspace_create(LfmResamplerWorkspace **out);
-LFM_ORACLE_API int
+LFM_INTERNAL_API int
 lfm_resampler_workspace_destroy(LfmResamplerWorkspace *workspace);
-LFM_ORACLE_API int lfm_resampler_workspace_reserve(
+LFM_INTERNAL_API int lfm_resampler_workspace_reserve(
     const LfmResampler *resampler, LfmResamplerWorkspace *workspace,
     uint64_t max_sample_count);
 
@@ -198,7 +198,7 @@ LFM_ORACLE_API int lfm_resampler_workspace_reserve(
 // final convolution values directly (there is no intermediate/copy) and result
 // aliases destination. For different rates input and destination must not
 // overlap: preserving an overlapping source would require forbidden staging.
-LFM_ORACLE_API int lfm_resampler_process(
+LFM_INTERNAL_API int lfm_resampler_process(
     const LfmResampler *resampler, LfmResamplerWorkspace *workspace,
     const float *input, uint64_t sample_count, float *destination,
     uint64_t destination_capacity, LfmF32Span *result);
@@ -226,16 +226,16 @@ LFM_INTERNAL_API int lfm_resampler_process_spans(
 // destination and never owns an output plane. Convolution and circular-history
 // carry execute in the architecture leaf; C++ owns table setup, borrowed-view
 // validation, and continuity-state commits.
-LFM_ORACLE_API int lfm_resampler_stream_create(
+LFM_INTERNAL_API int lfm_resampler_stream_create(
     uint32_t orig_freq, uint32_t new_freq, uint64_t max_sample_count,
     LfmResamplerStream **out);
-LFM_ORACLE_API int
+LFM_INTERNAL_API int
 lfm_resampler_stream_destroy(LfmResamplerStream *stream);
-LFM_ORACLE_API void lfm_resampler_stream_reset(LfmResamplerStream *stream);
-LFM_ORACLE_API int lfm_resampler_stream_out_length(
+LFM_INTERNAL_API void lfm_resampler_stream_reset(LfmResamplerStream *stream);
+LFM_INTERNAL_API int lfm_resampler_stream_out_length(
     LfmResamplerStream *stream, uint64_t sample_count,
     uint64_t *out_length);
-LFM_ORACLE_API int lfm_resampler_stream_process(
+LFM_INTERNAL_API int lfm_resampler_stream_process(
     LfmResamplerStream *stream, const float *input, uint64_t sample_count,
     float *destination, uint64_t destination_capacity,
     LfmF32Span *result);
@@ -246,7 +246,7 @@ LFM_ORACLE_API int lfm_resampler_stream_process(
 // wrapper: it constructs a temporary plan/workspace and must copy when equal
 // rates and output != input. Production capture uses the prepared plan/span API;
 // streaming playback uses the retained phase/history state above.
-LFM_ORACLE_API int lfm_resample_f32(
+LFM_INTERNAL_API int lfm_resample_f32(
     const float *x, uint64_t length, uint32_t orig_freq, uint32_t new_freq,
     float *out, uint64_t out_capacity, uint64_t *out_length);
 

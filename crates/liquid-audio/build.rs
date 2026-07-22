@@ -8,7 +8,6 @@
 // #[cfg(target_arch)]; everything else is unconditional.
 fn main() {
     let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
-    let oracle = std::env::var_os("CARGO_FEATURE_ORACLE_ABI").is_some();
     let out = std::env::var("OUT_DIR").expect("Cargo did not set OUT_DIR");
     println!("cargo::rustc-env=LFM_NATIVE_ARCHIVE_DIR={out}");
 
@@ -76,9 +75,6 @@ fn main() {
         .include("native/include")
         .include("native/src/model")
         .include("../kcoro-sys/vendor/kcoro_arena/include");
-    if oracle {
-        session.define("LFM_BUILD_ORACLE", None);
-    }
     session.compile("lfm_voice_session");
 
     /* Native-only product truth gate. It is a separate archive: ordinary
@@ -102,6 +98,27 @@ fn main() {
             .include("native/src/runtime")
             .include("../kcoro-sys/vendor/kcoro_arena/include");
         native_tests.compile("lfm_native_truth_gate");
+    }
+
+    /* Native-only inner-voice listening-probe spike gate. Same shape as the
+     * truth gate above: a separate archive with one C ABI entry point that
+     * ordinary binaries never reference, launched by a thin Rust test. */
+    println!("cargo::rerun-if-changed=native/tests/native_inner_voice_probe.cpp");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        let mut inner_voice = cc::Build::new();
+        inner_voice
+            .file("native/tests/native_inner_voice_probe.cpp")
+            .cpp(true)
+            .std("c++23")
+            .opt_level(3)
+            .warnings(true)
+            .warnings_into_errors(true)
+            .flag("-pthread")
+            .flag_if_supported("-fvisibility=hidden")
+            .include("native/include")
+            .include("native/src/model")
+            .include("../kcoro-sys/vendor/kcoro_arena/include");
+        inner_voice.compile("lfm_native_inner_voice_probe");
     }
     cc::Build::new()
         .file("native/src/runtime/voice_protocol_c.c")
@@ -153,9 +170,6 @@ fn main() {
         .include("native/src/detokenizer")
         .include("native/vendor")
         .include("../kcoro-sys/vendor/kcoro_arena/include");
-    if oracle {
-        engine.define("LFM_BUILD_ORACLE", None);
-    }
     engine.compile("lfm_flashkern_engine");
 
     // Released LFM2.5 audio output path. The submodel consumes the Detokenizer
@@ -176,9 +190,6 @@ fn main() {
         .flag_if_supported("-fvisibility=hidden")
         .include("native/include")
         .include("native/src/detokenizer");
-    if oracle {
-        detokenizer.define("LFM_BUILD_ORACLE", None);
-    }
     detokenizer.compile("lfm_detokenizer");
 
     // Private Rust-kcoro/native docking leaf. The C++ translation unit owns the
@@ -228,9 +239,6 @@ fn main() {
         .flag("-ffp-contract=off")
         .flag_if_supported("-fvisibility=hidden")
         .include("native/include");
-    if oracle {
-        frontend.define("LFM_BUILD_ORACLE", None);
-    }
     frontend.compile("lfm_frontend");
 
     // Exact Sesame/Web-Audio selected-band turn evidence. Formula tables are
@@ -285,9 +293,6 @@ fn main() {
         .flag_if_supported("-fvisibility=hidden")
         .include("native/include")
         .include("native/vendor");
-    if oracle {
-        conformer.define("LFM_BUILD_ORACLE", None);
-    }
     conformer.compile("lfm_conformer");
 
     // Snapshotable ChaCha20 CSPRNG state/refill. Apple entropy enters through a
@@ -339,9 +344,6 @@ fn main() {
             .flag("-ffp-contract=off")
             .flag_if_supported("-fvisibility=hidden")
             .include("native/include");
-        if oracle {
-            kern.define("LFM_BUILD_ORACLE", None);
-        }
         kern.compile("lfm_flashkern_x86");
     } else {
         println!("cargo::rerun-if-changed=native/kernels/aarch64/flashkern_neon.cpp");
@@ -376,9 +378,6 @@ fn main() {
         } else {
             kern.flag("-march=armv8.2-a");
         }
-        if oracle {
-            kern.define("LFM_BUILD_ORACLE", None);
-        }
         kern.compile("lfm_flashkern_neon");
     }
 
@@ -404,9 +403,6 @@ fn main() {
         .flag_if_supported("-fvisibility=hidden")
         .include("native/include")
         .include("native/src/mimi");
-    if oracle {
-        mimi.define("LFM_BUILD_ORACLE", None);
-    }
     mimi.compile("lfm_mimi");
 
     // Native checkpoint ownership: whole safetensors shards are read directly
@@ -430,8 +426,5 @@ fn main() {
         .include("native/src/model")
         .include("native/vendor")
         .include("../kcoro-sys/vendor/kcoro_arena/include");
-    if oracle {
-        weights.define("LFM_BUILD_ORACLE", None);
-    }
     weights.compile("lfm_safetensors");
 }

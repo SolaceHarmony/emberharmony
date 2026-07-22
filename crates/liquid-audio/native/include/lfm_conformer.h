@@ -62,10 +62,10 @@ typedef struct LfmConformerGeometry {
 // weight image are not exposed to product Rust. Returns 0; -EINVAL on nulls/bad
 // geometry; -ENOENT with `error` filled when a required weight field is
 // missing or mis-shaped.
-LFM_ORACLE_API int lfm_conformer_create(
+LFM_INTERNAL_API int lfm_conformer_create(
     void *engine, const void *weights, const LfmConformerGeometry *geometry,
     LfmConformer **out, char *error, size_t error_length);
-LFM_ORACLE_API int lfm_conformer_destroy(LfmConformer *conformer);
+LFM_INTERNAL_API int lfm_conformer_destroy(LfmConformer *conformer);
 
 // Immutable residency accounting. `derived_bytes` is limited to formula-
 // derived tables (BN denominators and relative-position frequencies). Bound
@@ -74,31 +74,31 @@ LFM_ORACLE_API int lfm_conformer_destroy(LfmConformer *conformer);
 // operations (fixed-team execution may issue multiple accumulator tiles for
 // one operation); it is an execution witness for steady-state tests, not a
 // physical-dispatch counter.
-LFM_ORACLE_API uint64_t
+LFM_INTERNAL_API uint64_t
 lfm_conformer_bound_weight_bytes(const LfmConformer *conformer);
-LFM_ORACLE_API uint64_t
+LFM_INTERNAL_API uint64_t
 lfm_conformer_derived_bytes(const LfmConformer *conformer);
-LFM_ORACLE_API uint64_t
+LFM_INTERNAL_API uint64_t
 lfm_conformer_materialized_weight_bytes(const LfmConformer *conformer);
-LFM_ORACLE_API uint64_t
+LFM_INTERNAL_API uint64_t
 lfm_conformer_direct_gemm_calls(const LfmConformer *conformer);
 
 // Session-owned mutable planes. Production reserves the maximum admitted mel
 // segment before readiness; ticket execution rejects an unsealed workspace,
 // never grows, and returns -ENOBUFS if admission is violated.
-LFM_ORACLE_API int
+LFM_INTERNAL_API int
 lfm_conformer_workspace_create(LfmConformerWorkspace **out);
-LFM_ORACLE_API int
+LFM_INTERNAL_API int
 lfm_conformer_workspace_destroy(LfmConformerWorkspace *workspace);
-LFM_ORACLE_API int lfm_conformer_workspace_reserve(
+LFM_INTERNAL_API int lfm_conformer_workspace_reserve(
     const LfmConformer *conformer, LfmConformerWorkspace *workspace,
     uint64_t max_mel_frames);
 
 // Output rows for a mel segment of `mel_frames`: the pinned dw_striding length
 // chain (three k3/s2/p1 stages), checked against the offline reference fixtures.
-LFM_ORACLE_API uint64_t
+LFM_INTERNAL_API uint64_t
 lfm_conformer_out_rows(const LfmConformer *conformer, uint64_t mel_frames);
-LFM_ORACLE_API uint64_t
+LFM_INTERNAL_API uint64_t
 lfm_conformer_out_width(const LfmConformer *conformer);
 
 #ifdef __cplusplus

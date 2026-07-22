@@ -1,8 +1,8 @@
 //! Native LFM2-Audio host surface.
 //!
 //! Model computation and checkpoint interpretation live behind the opaque
-//! C++/Flashkern runtime. Framework-backed reference code is physically owned
-//! by the workspace-only `liquid-audio-oracle` crate.
+//! C++/kcoro/Flashkern runtime. No Rust framework model or numerical fallback
+//! remains in the workspace.
 
 mod ffi;
 pub mod native_voice;

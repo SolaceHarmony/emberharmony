@@ -305,18 +305,19 @@ Depthformer programs plus the lower-level kernel inventory.
 | generation/session | native ticketed text/PCM admission and recurrence, reliable events, interruption epochs, stop/join | `native/src/runtime/voice_session.cpp` |
 | desktop production host | opaque native runtime/model/conversation/session; no Rust model construction or Candle fallback | `src/native_voice.rs`, `packages/desktop/src-tauri/src/voice/runtime.rs` |
 
-### Default graph versus oracle graph
+### Single native graph
 
 - The default `liquid-audio` feature graph contains the opaque native runtime and
   does not enable Candle or Moshi. Desktop LFM2 construction calls
   `NativeVoiceModel::open_with_config`; it never constructs `LFM2AudioModel`, a
   Candle device, or a Rust safetensors builder.
-- Legacy Rust model, training, fixture capture, direct numerical rims, Candle, and
-  Moshi are compiled only by the opt-in `oracle` feature and the workspace-only
-  `liquid-audio-oracle` crate. They are comparison tools, not fallback branches.
+- The legacy Rust model, training surface, direct numerical rims, Candle, and
+  callable oracle feature were deleted after the native path landed. Captured
+  immutable fixtures remain evidence; they are not a second execution graph.
 - Native LFM2 CPU is the shipped voice model. Native Metal/MLX is not mounted and
-  fails explicitly. The full Moshi-to-Flashkern port has **not** landed; Moshi is
-  offline/oracle-only rather than silently routed through Candle.
+  fails explicitly. The full Moshi-to-Flashkern port has **not** landed; native
+  Mimi remains reserved for that later tranche and no Candle route substitutes
+  for it.
 - Multi-row prefill is native. Text embeddings remain resident views, provided
   embeddings remain borrowed views, and M≤4 checkpoint-BF16 kernels reuse each
   loaded weight vector across rows while committing causal KV/ShortConv state in
@@ -361,13 +362,12 @@ whole-action admission with causal incremental eviction, shared-model conversati
 wrong dtypes/shapes, missing middle layers, and mixed vocabulary/codebook
 rejection. Do not generalize that statement into a full native Moshi gate.
 
-### Offline oracle gates
+### Historical oracle evidence
 
-`liquid-audio-oracle` retains captured Candle/reference comparisons for frontend,
-Conformer, ShortConv, GEMM/GEMV, Depthformer, Mimi, grouped GQA, and historical
-seeded waveform output. Those fixtures arbitrate numerical ports but are not
-linked by default and never run as a production fallback. Quote a fresh feature-
-specific run rather than carrying an old crate-wide count forward.
+Captured immutable fixtures and historical reports preserve the evidence used
+while porting frontend, Conformer, ShortConv, GEMM/GEMV, Depthformer, Mimi,
+grouped GQA, and seeded waveform output. The executable Rust/Candle oracle was
+deleted; current gates exercise the native implementation directly.
 
 ---
 

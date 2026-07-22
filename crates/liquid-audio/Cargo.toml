@@ -31,6 +31,3 @@ path = "examples/bench_native_load.rs"
 [features]
 default = ["download"]
 download = ["dep:hf-hub"]
-# Builds hidden native conformance entry points for the workspace-only Oracle.
-# This never enables Rust numerical code or framework dependencies.
-oracle-abi = []

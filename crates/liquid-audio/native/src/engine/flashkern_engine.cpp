@@ -535,6 +535,8 @@ struct PrefillReq {
     bool sample = false;
     LfmPrngStateV1 *sample_state = nullptr;
     uint32_t *out_token = nullptr;
+    /* Test-only dual-head readout target. Null on every production pass. */
+    LfmListenReadoutForTest *readout = nullptr;
     size_t lanes = 0;
 };
 
@@ -2685,6 +2687,14 @@ enum : uint32_t {
     PREFILL_PHASE_DONE = 22,
 };
 
+enum : uint32_t {
+    PREFILL_FLAG_SAMPLE = 1u,
+    /* Test-only: the pass is running the Depthformer codebook-0 readout tail
+     * of a sampled prefill; program.phase holds DEPTH_PHASE_* values and the
+     * ordinary depth program stages execute against this slot. */
+    PREFILL_FLAG_READOUT_DEPTH = 2u,
+};
+
 static PrefillInput prefill_first_input(const PassSlot *slot) {
     const PrefillReq &request = slot->prefill;
     if (request.embed_kind == 0) {
@@ -2931,7 +2941,10 @@ static void initialize_prefill_program(Engine *e, PassSlot *slot) {
          (slot->prefill.embed_kind == 2 && slot->prefill.provided_rows &&
           slot->prefill.provided_values == provided_values)) &&
         ((!slot->prefill.sample && !slot->prefill.out_token) ||
-         (slot->prefill.sample && slot->prefill.out_token));
+         (slot->prefill.sample && slot->prefill.out_token)) &&
+        (!slot->prefill.readout ||
+         (slot->prefill.sample && slot->depth &&
+          slot->depth_req.hidden == slot->prefill.out_hidden));
     const size_t end_pos = slot->prefill.pos + slot->prefill.rows;
     valid = valid && end_pos >= slot->prefill.pos &&
         end_pos <= slot->model->max_ctx;
@@ -2963,7 +2976,7 @@ static void initialize_prefill_program(Engine *e, PassSlot *slot) {
     }
     slot->program.outer = 0;
     slot->program.inner = 0;
-    slot->program.flags = slot->prefill.sample ? 1u : 0u;
+    slot->program.flags = slot->prefill.sample ? PREFILL_FLAG_SAMPLE : 0u;
     if (!valid) {
         e->active_status.store(-ESTALE, std::memory_order_release);
         slot->program.phase = PREFILL_PHASE_DONE;
@@ -2989,8 +3002,71 @@ static void configure_prefill_sample(Engine *e, PassSlot *slot) {
     e->sample = slot->sample;
 }
 
+/* Test-only readout fill. It scans the exact logits plane the sampler
+ * consumed (softmax/logprob math lives here, on the test path only) and
+ * mirrors the greedy fold's tie policy: equal values keep the lower id. */
+static void fill_listen_readout_head(const void *logits, size_t count,
+                                     uint32_t dtype, uint32_t *out_ids,
+                                     float *out_logprobs,
+                                     float *out_entropy) {
+    const auto value_at = [logits, dtype](size_t index) {
+        const float value = dtype == SAMPLE_F32
+            ? static_cast<const float *>(logits)[index]
+            : bf16_f32(static_cast<const uint16_t *>(logits)[index]);
+        return std::isnan(value) ? -std::numeric_limits<float>::infinity()
+                                 : value;
+    };
+    float top_values[LFM_LISTEN_READOUT_TOP_K];
+    uint32_t top_ids[LFM_LISTEN_READOUT_TOP_K];
+    size_t held = 0;
+    float maximum = -std::numeric_limits<float>::infinity();
+    for (size_t index = 0; index < count; ++index) {
+        const float value = value_at(index);
+        if (value > maximum) maximum = value;
+        size_t rank = held;
+        while (rank > 0 && value > top_values[rank - 1]) --rank;
+        if (rank >= LFM_LISTEN_READOUT_TOP_K) continue;
+        const size_t tail =
+            std::min(held, size_t{LFM_LISTEN_READOUT_TOP_K} - 1);
+        for (size_t move = tail; move > rank; --move) {
+            top_values[move] = top_values[move - 1];
+            top_ids[move] = top_ids[move - 1];
+        }
+        top_values[rank] = value;
+        top_ids[rank] = static_cast<uint32_t>(index);
+        if (held < LFM_LISTEN_READOUT_TOP_K) ++held;
+    }
+    double exp_sum = 0.0;
+    double weighted = 0.0;
+    for (size_t index = 0; index < count; ++index) {
+        const double centered =
+            static_cast<double>(value_at(index)) -
+            static_cast<double>(maximum);
+        const double weight = std::exp(centered);
+        exp_sum += weight;
+        weighted += weight * centered;
+    }
+    const double log_z = std::log(exp_sum);
+    for (size_t rank = 0; rank < LFM_LISTEN_READOUT_TOP_K; ++rank) {
+        const bool live = rank < held;
+        out_ids[rank] = live ? top_ids[rank] : UINT32_MAX;
+        out_logprobs[rank] = live
+            ? static_cast<float>(
+                  static_cast<double>(top_values[rank]) -
+                  static_cast<double>(maximum) - log_z)
+            : -std::numeric_limits<float>::infinity();
+    }
+    *out_entropy = static_cast<float>(log_z - weighted / exp_sum);
+}
+
 static void run_prefill_program_stage(Engine *e, uint32_t lane,
                                       PassSlot *slot) {
+    if ((slot->program.flags & PREFILL_FLAG_READOUT_DEPTH) != 0) {
+        /* Test-only readout tail: the codebook-0 head evaluation runs the
+         * ordinary depth program stages against this slot's depth scratch. */
+        run_depth_program_stage(e, lane, slot);
+        return;
+    }
     PrefillWorkspace *workspace = slot->prefill.workspace;
     const size_t layer = static_cast<size_t>(slot->program.outer);
     const size_t rows = slot->prefill.rows;
@@ -3108,8 +3184,26 @@ static void run_prefill_program_stage(Engine *e, uint32_t lane,
 
 static bool advance_prefill_program(Engine *e, PassSlot *slot) {
     if (e->active_status.load(std::memory_order_acquire) != 0) {
+        slot->program.flags &= ~PREFILL_FLAG_READOUT_DEPTH;
         slot->program.phase = PREFILL_PHASE_DONE;
         return false;
+    }
+    if ((slot->program.flags & PREFILL_FLAG_READOUT_DEPTH) != 0) {
+        /* Test-only readout tail. Halt the depth program at the codebook-0
+         * logits: the readout wants the head distribution, never a sampled
+         * code, so no sampler state is consumed and no embedding follows. */
+        if (slot->program.phase == DEPTH_PHASE_HEAD_LOGITS) {
+            LfmListenReadoutForTest *readout = slot->prefill.readout;
+            fill_listen_readout_head(
+                e->depth_scratch.logits_b.data(),
+                slot->depth->heads[0].vocab, SAMPLE_BF16,
+                readout->audio_ids, readout->audio_logprobs,
+                &readout->audio_entropy);
+            slot->program.flags &= ~PREFILL_FLAG_READOUT_DEPTH;
+            slot->program.phase = PREFILL_PHASE_DONE;
+            return false;
+        }
+        return advance_depth_program(e, slot);
     }
     switch (slot->program.phase) {
     case PREFILL_PHASE_CONV_NORM:
@@ -3182,6 +3276,21 @@ static bool advance_prefill_program(Engine *e, PassSlot *slot) {
         return true;
     case PREFILL_PHASE_SAMPLE:
         if (advance_sample_program(e, slot)) return true;
+        if (slot->prefill.readout) {
+            /* Test-only: report the text head from the very plane the sample
+             * fold consumed, then evaluate the codebook-0 head by running the
+             * ordinary depth program on the just-published hidden. */
+            LfmListenReadoutForTest *readout = slot->prefill.readout;
+            fill_listen_readout_head(
+                slot->prefill.workspace->logits.data(), slot->model->vocab,
+                SAMPLE_F32, readout->text_ids, readout->text_logprobs,
+                &readout->text_entropy);
+            slot->program.outer = 0;
+            slot->program.inner = 0;
+            slot->program.flags |= PREFILL_FLAG_READOUT_DEPTH;
+            slot->program.phase = DEPTH_PHASE_PROJECT;
+            return true;
+        }
         slot->program.phase = PREFILL_PHASE_DONE;
         return false;
     case PREFILL_PHASE_DONE:
@@ -5278,6 +5387,12 @@ static int mount_audio_route(PassSlot *slot, AudioRouteInstance *route,
     if (route->kind == AUDIO_ROUTE_PREFILL) {
         slot->model = route->model;
         slot->prefill = route->prefill_req;
+        if (route->prefill_req.readout) {
+            /* Test-only dual-head readout: the codebook-0 evaluation reuses
+             * the depth program on this slot after the text sample. */
+            slot->depth = route->depth;
+            slot->depth_req = route->depth_req;
+        }
         *request = REQ_PREFILL;
         *context = route->model_id;
         return 0;
@@ -6827,7 +6942,8 @@ int lfm_engine_prefill_submit(
     const uint16_t *cos_base, const uint16_t *sin_base, size_t rope_len,
     uint16_t *out_hidden, size_t out_hidden_len,
     const LfmSamplerConfigV1 *sampler, LfmPrngStateV1 *sample_state,
-    uint32_t *out_token, size_t lanes, LfmAudioRouteNotify notify,
+    uint32_t *out_token, size_t lanes,
+    LfmListenReadoutForTest *readout, LfmAudioRouteNotify notify,
     void *notify_context, LfmAudioRouteHandle *out_handle) {
     Engine *e = (Engine *)ep;
     PrefillWorkspace *workspace =
@@ -6881,6 +6997,23 @@ int lfm_engine_prefill_submit(
         }
     } else if (sampler || sample_state) {
         return -EINVAL;
+    }
+    DepthPlan *readout_depth = nullptr;
+    if (readout) {
+        /* Test-only readout: it rides a sampled pass and evaluates the named
+         * Depthformer's codebook-0 head on the pass's published hidden. */
+        if (!out_token || readout->depth_id == 0) return -EINVAL;
+        for (const std::unique_ptr<DepthPlan> &candidate : e->depth_plans) {
+            if (candidate->id == readout->depth_id) {
+                readout_depth = candidate.get();
+                break;
+            }
+        }
+        if (!readout_depth) return -ESTALE;
+        if (readout_depth->backbone_dim != model->h ||
+            readout_depth->heads.empty()) {
+            return -EINVAL;
+        }
     }
 
     const size_t end_pos = pos + row_count;
@@ -6945,7 +7078,14 @@ int lfm_engine_prefill_submit(
     route->prefill_req.sample = out_token != nullptr;
     route->prefill_req.sample_state = sample_state;
     route->prefill_req.out_token = out_token;
+    route->prefill_req.readout = readout;
     route->prefill_req.lanes = lanes;
+    if (readout) {
+        route->depth = readout_depth;
+        route->depth_id = readout->depth_id;
+        route->depth_req = {};
+        route->depth_req.hidden = out_hidden;
+    }
     route->adapted_values = nullptr;
     route->result = nullptr;
     route->notify = notify;

@@ -19,11 +19,10 @@ leaf boundary. Formula-derived immutable tables may be constructed at readiness
 and are reported separately. Layout, alignment, dtype, transpose, framework
 ownership, or convenience copies of weights are forbidden.
 
-The default crate and desktop production graph are native-only. Candle, training,
-fixture capture, and Moshi dependencies live in the workspace-only
-`liquid-audio-oracle` crate. Production exposes only a hidden `oracle-abi` build
-surface for conformance entry points; it does not re-enable Rust model code. An
-oracle is never a production fallback.
+The default crate and desktop production graph are native-only. The former
+Rust/Candle LFM2 model, training surface, fixture-capture code, and Moshi
+dependencies were removed from the workspace after native ownership landed.
+There is no oracle feature, callable numerical ABI, or Rust model fallback.
 
 ## As-built / open-gaps ledger
 
@@ -163,9 +162,8 @@ fact no author can forget to update.
   `NativeVoiceModel`; it never constructs the old Rust `LFM2AudioModel`, processor,
   Candle device, Rust safetensors builder, or a simultaneous compatibility image.
 - `liquid-audio` defaults to the opaque native lifecycle. Rust model/tensor/
-  generation exports and dependencies are absent. `liquid-audio-oracle` is
-  `publish = false`, owns the Candle/Moshi/training dependencies, and opts into
-  only the hidden native `oracle-abi` conformance surface.
+  generation exports and dependencies are absent. No Cargo feature restores the
+  deleted Rust/Candle implementation or a private numerical conformance ABI.
 - Unsupported native Metal and Moshi selections fail explicitly. There is no
   native/Candle, CPU/Metal, or model-version fallback chain.
 - Native Mimi source remains build-checked for the future Moshi tranche and can
@@ -275,6 +273,5 @@ src/
 ```
 
 `src/model/**`, processor/training code, direct numerical Rust rims, Candle, and
-Moshi are absent from this crate. The separate `liquid-audio-oracle` workspace
-crate owns oracle dependencies; Git history is the reference for deleted
-production ownership, not an alternate inference runtime.
+Moshi are absent from the workspace model path. Git history is the reference
+for deleted Rust ownership, not an alternate inference or training runtime.

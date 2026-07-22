@@ -24,26 +24,26 @@ enum {
 
 /* Production ownership split: one immutable plan per model image, one mutable
  * state per conversation. The plan must outlive every state created from it. */
-LFM_ORACLE_API int mimi_decode_plan_new_from_image(
+LFM_INTERNAL_API int mimi_decode_plan_new_from_image(
     MimiDecodePlan **plan, const LfmWeightImage *image, char *error,
     size_t error_length);
-LFM_ORACLE_API void mimi_decode_plan_free(MimiDecodePlan *plan);
-LFM_ORACLE_API uint64_t
+LFM_INTERNAL_API void mimi_decode_plan_free(MimiDecodePlan *plan);
+LFM_INTERNAL_API uint64_t
 mimi_decode_plan_derived_bytes(const MimiDecodePlan *plan);
-LFM_ORACLE_API uint64_t
+LFM_INTERNAL_API uint64_t
 mimi_decode_plan_bound_weight_bytes(const MimiDecodePlan *plan);
-LFM_ORACLE_API uint64_t
+LFM_INTERNAL_API uint64_t
 mimi_decode_plan_compatibility_copied_bytes(const MimiDecodePlan *plan);
 
-LFM_ORACLE_API int mimi_decode_state_new(MimiDecodeState **state,
+LFM_INTERNAL_API int mimi_decode_state_new(MimiDecodeState **state,
                                          const MimiDecodePlan *plan,
                                          char *error, size_t error_length);
-LFM_ORACLE_API void mimi_decode_state_free(MimiDecodeState *state);
-LFM_ORACLE_API int mimi_decode_state_step(MimiDecodeState *state,
+LFM_INTERNAL_API void mimi_decode_state_free(MimiDecodeState *state);
+LFM_INTERNAL_API int mimi_decode_state_step(MimiDecodeState *state,
                                           const uint32_t *codes,
                                           float *pcm_out);
-LFM_ORACLE_API void mimi_decode_state_reset(MimiDecodeState *state);
-LFM_ORACLE_API uint64_t mimi_decode_state_bytes(const MimiDecodeState *state);
+LFM_INTERNAL_API void mimi_decode_state_reset(MimiDecodeState *state);
+LFM_INTERNAL_API uint64_t mimi_decode_state_bytes(const MimiDecodeState *state);
 
 #ifdef __cplusplus
 } /* extern "C" */

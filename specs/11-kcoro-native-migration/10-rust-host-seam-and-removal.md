@@ -224,10 +224,10 @@ packages/desktop/src-tauri/src/voice/native/
   status.rs
 ```
 
-The workspace-only `liquid-audio-oracle` crate contains training/reference code
-and is absent from the production dependency graph. No feature restores it as a
-runtime fallback. Production gates are native implementation tests, not a
-second execution path kept beside the product.
+The former workspace-only Rust/Candle model and training crate was deleted after
+native ownership landed. No feature restores it as a runtime fallback.
+Production gates are native implementation tests, not a second execution path
+kept beside the product.
 
 ## Deletion Ledger
 

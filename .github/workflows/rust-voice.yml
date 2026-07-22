@@ -7,7 +7,6 @@ on:
     paths:
       - "crates/kcoro-sys/**"
       - "crates/liquid-audio/**"
-      - "crates/liquid-audio-oracle/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - "rust-toolchain.toml"
@@ -50,9 +49,6 @@ jobs:
 
       - name: Test native voice integration gates
         run: cargo test -p liquid-audio --tests -- --nocapture
-
-      - name: Compile hidden oracle ABI
-        run: cargo check -p liquid-audio --features oracle-abi
 
       # The ignored real-checkpoint truth gate is intentionally not made
       # vacuous in generic CI. Release automation must provision the model and

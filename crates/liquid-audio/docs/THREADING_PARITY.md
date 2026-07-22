@@ -8,8 +8,8 @@ is explicitly historical.
 Production no longer tries to reproduce Candle's Rust/Rayon execution model.
 `liquid-audio` has no Candle dependency and does not own a Rust model, tensor,
 sampler, KV cache, Conformer, Depthformer, Mimi codec, or inference loop. The
-workspace-only `liquid-audio-oracle` crate owns reference/training code; it is
-not linked as a fallback.
+former workspace-only Rust/Candle model and training implementation is retained
+only in Git history, not as a callable fallback.
 
 The live ownership split is:
 
@@ -135,9 +135,8 @@ Join is lifecycle observation, never the means by which model progress occurs.
 During the deleted Candle migration, the project compared torch's P-core
 intra-op sizing with Candle/Rayon and explored an Accelerate feature plus a BF16
 CPU GEMM shim. Those measurements explained early performance differences, but
-they are not the production threading architecture. The retained historical
-implementation belongs under `liquid-audio-oracle`, including its
-`src/compute/threads.rs` policy.
+they are not the production threading architecture. Git history preserves that
+deleted implementation and its former intra-op thread policy.
 
 Similarly, the former `RealtimePipeline` worker, `crossbeam-channel` event path,
 Rust RMS VAD, and Rust model-owned cancellation loop are historical. Current
