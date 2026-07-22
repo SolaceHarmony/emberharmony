@@ -5,7 +5,7 @@ CXX ?= clang++
 CC ?= clang
 CXXFLAGS ?= -O3 -std=c++23 -Wall -Wextra -Werror -pthread
 CFLAGS ?= -O2 -std=c11 -Wall -Wextra -pthread -D_GNU_SOURCE
-CPPFLAGS := -I$(ROOT)/include -I$(ROOT)/src/model -I$(ROOT)/vendor -I$(KCORO)/include
+CPPFLAGS := -I$(ROOT)/include -I$(ROOT)/src/io -I$(ROOT)/src/model -I$(ROOT)/vendor -I$(KCORO)/include
 PRODUCT_CPPFLAGS := $(CPPFLAGS) -I$(ROOT)/src/detokenizer -I$(ROOT)/src/runtime -I$(ROOT)/src/mimi
 PRODUCT_CXXFLAGS := -O3 -std=c++23 -ffp-contract=off -pthread -fvisibility=hidden
 PRODUCT_CFLAGS := -O2 -std=c11 -pthread -D_GNU_SOURCE -fvisibility=hidden
@@ -27,7 +27,9 @@ endif
 
 KCORO_CORE := kcoro_stackless kc_runtime kc_service kc_doorbell kc_team kc_fixed_scope kc_deadline
 KCORO_OBJECTS := $(addprefix $(BUILD)/,$(addsuffix .o,$(KCORO_CORE))) $(BUILD)/kc_port_posix.o
-OBJECTS := $(BUILD)/weight_segment_host.o $(BUILD)/safetensors.o $(KCORO_OBJECTS)
+HOST_OBJECTS := $(BUILD)/host_mailbox.o $(BUILD)/safetensors.o $(KCORO_OBJECTS)
+OBJECTS := $(BUILD)/weight_segment_host.o $(HOST_OBJECTS)
+HOST_GATE_OBJECTS := $(BUILD)/native_host_mailbox.o $(HOST_OBJECTS)
 
 PRODUCT_CXX_SOURCES := \
 	src/runtime/voice_session.cpp \
@@ -72,12 +74,15 @@ SPEECH_OBJECTS := $(BUILD)/native_speech_gate_main.o $(BUILD)/safetensors.o \
 ifeq ($(SYSTEM),Darwin)
 SPEECH_LIBS := -framework Accelerate -framework Security -framework AudioUnit \
 	-framework AudioToolbox -framework CoreAudio -framework CoreFoundation
+HOST_LIBS := -lbsm
 else
 SPEECH_LIBS := -lm
+HOST_LIBS :=
 endif
 
 .PHONY: all clean
-all: $(BUILD)/lfm-weight-segment $(BUILD)/lfm-native-speech-gate
+all: $(BUILD)/lfm-weight-segment $(BUILD)/lfm-host-mailbox-gate \
+	$(BUILD)/lfm-native-speech-gate
 
 $(BUILD):
 	mkdir -p $@
@@ -89,6 +94,12 @@ $(BUILD)/native_speech_gate_main.o: native_speech_gate_main.cpp | $(BUILD)
 	$(CXX) $(PRODUCT_CPPFLAGS) $(CXXFLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(BUILD)/safetensors.o: $(ROOT)/src/io/safetensors.cpp | $(BUILD)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(DEPFLAGS) -c $< -o $@
+
+$(BUILD)/host_mailbox.o: $(ROOT)/src/io/lfm_host_mailbox.cpp | $(BUILD)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(DEPFLAGS) -c $< -o $@
+
+$(BUILD)/native_host_mailbox.o: $(ROOT)/tests/native_host_mailbox.cpp | $(BUILD)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(BUILD)/%.o: $(KCORO)/core/src/%.c | $(BUILD)
@@ -114,7 +125,10 @@ $(BUILD)/product/%.o: $(ROOT)/%.S
 	$(CC) $(PRODUCT_CPPFLAGS) $(KERNEL_FLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(BUILD)/lfm-weight-segment: $(OBJECTS)
-	$(CXX) $(CXXFLAGS) $^ -o $@
+	$(CXX) $(CXXFLAGS) $^ $(HOST_LIBS) -o $@
+
+$(BUILD)/lfm-host-mailbox-gate: $(HOST_GATE_OBJECTS)
+	$(CXX) $(CXXFLAGS) $^ $(HOST_LIBS) -o $@
 
 $(BUILD)/lfm-native-speech-gate: $(SPEECH_OBJECTS)
 	$(CXX) $(PRODUCT_CXXFLAGS) $^ $(SPEECH_LIBS) -o $@
@@ -122,4 +136,5 @@ $(BUILD)/lfm-native-speech-gate: $(SPEECH_OBJECTS)
 clean:
 	rm -rf $(BUILD)
 
--include $(OBJECTS:.o=.d) $(SPEECH_OBJECTS:.o=.d)
+-include $(OBJECTS:.o=.d) $(HOST_GATE_OBJECTS:.o=.d) \
+	$(SPEECH_OBJECTS:.o=.d)

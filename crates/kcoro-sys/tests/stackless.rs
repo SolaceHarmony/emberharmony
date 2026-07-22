@@ -567,6 +567,11 @@ fn callback_wins_against_terminal_claim_and_receives_one_successor_invocation() 
     drop(release);
     assert_eq!(race.runs.load(Ordering::Acquire), 2);
     assert_eq!(unsafe { koro_cont_resume(cont, &identity) }, -ECANCELED);
+    // The completion callback's own publication proves that it ran, not that
+    // it has returned. DONE is deliberately published after callback return so
+    // destroy cannot free completion_context underneath that callback. Use the
+    // administrative lifecycle gate before destroying the retained frame.
+    assert_eq!(unsafe { kc_runtime_join_all(runtime) }, 0);
     assert_eq!(unsafe { koro_cont_destroy(cont) }, 0);
     destroy_runtime(runtime);
 }

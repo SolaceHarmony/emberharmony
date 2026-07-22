@@ -1,9 +1,10 @@
 # Native Weight Image
 
 `safetensors.cpp` is the native checkpoint boundary for the CPU inference stack.
-It has no Rust or Candle dependency. A host supplies one path through the C ABI in
-`native/include/lfm_safetensors.h`; C++ owns file discovery, file reads, parsing,
-validation, tensor indexing, and lifetime.
+It has no Rust or Candle dependency. C++ owns file discovery, file reads,
+parsing, validation, indexed byte views, and lifetime. The narrow C-linkage
+lifecycle header is an opaque construction/testing seam; inference itself binds
+native pointers, offsets, and strides once and never crosses an ABI per pass.
 
 ## Memory Contract
 
@@ -90,35 +91,41 @@ bound tensor bytes, formula-derived immutable bytes, compatibility-copy bytes,
 load time, worker count, and task count. Production rejects a model unless
 `compatibility_copied_bytes == 0`.
 
-The standalone C++23 keeper is built without a Rust launcher:
+The standalone C++23 host and its hostile-lifecycle gate are built without a
+Rust launcher:
 
 ```sh
 make -C crates/liquid-audio/native/tools
-crates/liquid-audio/native/tools/build/lfm-weight-segment verify /absolute/checkpoint
 crates/liquid-audio/native/tools/build/lfm-weight-segment \
-  host /absolute/checkpoint EPOCH:SEQUENCE:GENERATION:KIND
+  serve /absolute/checkpoint com.solaceharmony.lfm.host
+crates/liquid-audio/native/tools/build/lfm-host-mailbox-gate \
+  /absolute/checkpoint
 crates/liquid-audio/native/tools/build/lfm-native-speech-gate \
   /absolute/checkpoint 8 silent
 ```
 
-It holds the wired lease across arbitrary client exits. On macOS GCD owns its
-signal dormancy and invokes teardown; there is no sleeping host loop. `open`
-performs one attach-or-build and exits, while `evict IDENTITY_SHA256` removes
-only the named object. The optional canonical ticket is echoed in the fixed
-readiness record so a spawning client resumes the exact logical continuation.
-`verify` proves, with the real checkpoint, that one keeper build is followed by
-a simultaneous zero-payload client attach and a fresh-process post-keeper
-attach. It also samples macOS's wired-page counter: the keeper must wire roughly
-one segment, a second mapping must not wire a second physical model, and keeper
-retirement must drop roughly one segment's pages.
+The host holds the wired lease across arbitrary client exits. On macOS,
+launchd owns service discovery and GCD delivers Mach/process/signal callback
+edges; no sleeping host loop or operation waiter exists. `open` performs one
+attach-or-build and exits, while `evict IDENTITY_SHA256` removes only the named
+object.
 
-Cross-process multi-client request routing remains the next host seam; direct
-continuation admission against a foreign `INITIALIZING` or `BUILDING`
-generation is rejected
-unless it arrived through the host's correlated readiness edge. No client
-invents a retry loop or suspends without an owner that can resume it. The
-blocking pipe/read and child reap inside `verify` are administrative test
-coordination, not model execution or keeper dormancy.
+The mailbox is one page-aligned shared byte buffer. Its header and fixed client
+strides are accessed through validated base-plus-offset views; it contains no
+embedded model, PCM, activation, tensor, or pointer arrays. Request and
+completion cells carry only canonical tickets, generations, operation tags,
+and weight identity. Mach messages carry port registration and coalesced wake
+edges only. A full request buffer retains the logical continuation on one
+aggregate capacity generation; consuming a cell resumes that exact ticket.
+The host owns client-slot admission and installs the client-death source before
+acknowledging the slot, so there is no orphanable client-side claim window.
+
+`lfm-host-mailbox-gate` proves multi-client attach, live-lease eviction refusal,
+client-death reclamation, capacity dehydration, stale-completion rejection,
+host death/restart generation changes, no numerical replay, and exact saved
+frame resumption. Its pipes report child readiness only; product operations and
+all model storage stay in native shared buffers. Its one-shot watchdog can fail
+the executable but never advances the state machine.
 
 `lfm-native-speech-gate` is the standalone production-path output gate. It is
 linked directly from the C++23 runtime/model, kcoro C runtime, architecture
