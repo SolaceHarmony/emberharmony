@@ -31,9 +31,10 @@ typedef enum LfmWeightStatus {
     LFM_WEIGHT_FORMAT_ERROR = -3,
     LFM_WEIGHT_OUT_OF_MEMORY = -4,
     LFM_WEIGHT_NOT_FOUND = -5,
-    /* A matching segment is being built by a live owner. Synchronous callers
-     * must return this edge to their owning continuation; they must not poll,
-     * sleep, or park a physical worker beside the BUILDING generation. */
+    /* A matching segment is being initialized or built by a live owner.
+     * Synchronous callers must return this edge to their owning continuation;
+     * they must not poll, sleep, or park a physical worker beside the active
+     * generation. */
     LFM_WEIGHT_IN_PROGRESS = -6,
     /* A same-name shared object failed the identity/layout/security ladder. */
     LFM_WEIGHT_REJECTED = -7,

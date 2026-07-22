@@ -27,7 +27,11 @@ checkpoint directory / file
 - `shm_open(O_CREAT|O_EXCL)` / `CreateFileMapping` elects one builder for an
   identity derived from the ordered source `FileState` tuples. Every selected
   shard is read directly into its final slice of that one named segment.
-- The builder publishes `BUILDING -> READY | POISONED`. Same-process contenders
+- The builder publishes `INVALID -> INITIALIZING -> BUILDING -> READY | POISONED`.
+  `INITIALIZING` publishes the owner PID/start/UID and generation before any
+  layout field, so a live initializer is correlated and a dead initializer can
+  be poisoned and replaced without misclassifying the zero-state creation
+  window. Same-process contenders
   dehydrate literal kcoro continuations; `READY` resumes their exact ticket
   after the process registry owns the completed lease. Synchronous callers
   receive `LFM_WEIGHT_IN_PROGRESS`; no thread waits, polls, or sleeps beside
@@ -109,7 +113,8 @@ one segment, a second mapping must not wire a second physical model, and keeper
 retirement must drop roughly one segment's pages.
 
 Cross-process multi-client request routing remains the next host seam; direct
-continuation admission against a foreign `BUILDING` generation is rejected
+continuation admission against a foreign `INITIALIZING` or `BUILDING`
+generation is rejected
 unless it arrived through the host's correlated readiness edge. No client
 invents a retry loop or suspends without an owner that can resume it. The
 blocking pipe/read and child reap inside `verify` are administrative test

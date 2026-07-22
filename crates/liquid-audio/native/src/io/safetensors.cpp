@@ -65,10 +65,12 @@ namespace {
  * tensor offsets inside each verbatim safetensors source are never changed. */
 constexpr size_t kWeightAlign = 64 * 1024;
 constexpr size_t kSegmentHeaderBytes = kWeightAlign;
-constexpr uint32_t kSegmentLayoutVersion = 1;
-constexpr uint32_t kSegmentBuilding = 1;
-constexpr uint32_t kSegmentReady = 2;
-constexpr uint32_t kSegmentPoisoned = 3;
+constexpr uint32_t kSegmentLayoutVersion = 2;
+constexpr uint32_t kSegmentInvalid = 0;
+constexpr uint32_t kSegmentInitializing = 1;
+constexpr uint32_t kSegmentBuilding = 2;
+constexpr uint32_t kSegmentReady = 3;
+constexpr uint32_t kSegmentPoisoned = 4;
 constexpr size_t kMaxSegmentSources = 512;
 constexpr size_t kReadChunkBytes = 8 * 1024 * 1024;
 constexpr size_t kReadWorkers = 4;
@@ -730,23 +732,27 @@ uint64_t segment_generation() {
     return generation == 0 ? 1 : generation;
 }
 
-void initialize_segment_header(SegmentHeader *header,
-                               const std::vector<Source> &sources,
-                               size_t bytes, size_t source_bytes,
-                               const Digest &identity, uint64_t generation,
-                               uint64_t owner_pid, uint64_t owner_start,
-                               uint64_t owner_uid, uint32_t state) {
+void initialize_segment_owner(SegmentHeader *header, uint64_t generation,
+                              uint64_t owner_pid, uint64_t owner_start,
+                              uint64_t owner_uid) {
     std::memset(header, 0, kSegmentHeaderBytes);
+    header->generation = generation;
+    header->owner_pid = owner_pid;
+    header->owner_start_time = owner_start;
+    header->owner_uid = owner_uid;
+    publish_segment_state(header, kSegmentInitializing);
+}
+
+void publish_segment_build_header(SegmentHeader *header,
+                                  const std::vector<Source> &sources,
+                                  size_t bytes, size_t source_bytes,
+                                  const Digest &identity) {
     std::memcpy(header->magic, kSegmentMagic, sizeof(kSegmentMagic));
     header->layout_version = kSegmentLayoutVersion;
     header->header_bytes = static_cast<uint32_t>(kSegmentHeaderBytes);
     header->source_count = static_cast<uint32_t>(sources.size());
     header->total_bytes = bytes;
     header->source_bytes = source_bytes;
-    header->generation = generation;
-    header->owner_pid = owner_pid;
-    header->owner_start_time = owner_start;
-    header->owner_uid = owner_uid;
     std::memcpy(header->identity_digest, identity.data(), identity.size());
     for (size_t index = 0; index < sources.size(); ++index) {
         SegmentSourceRecord &record = header->sources[index];
@@ -757,7 +763,7 @@ void initialize_segment_header(SegmentHeader *header,
         record.component = source.component;
         std::memcpy(record.label_digest, label.data(), label.size());
     }
-    publish_segment_state(header, state);
+    publish_segment_state(header, kSegmentBuilding);
 }
 
 uint64_t process_start_time(uint64_t pid) {
@@ -834,6 +840,44 @@ bool owner_alive(uint64_t pid, uint64_t started) {
 #endif
     return process_start_time(pid) == started;
 }
+
+#ifndef _WIN32
+bool poison_abandoned_segment(const std::string &name, uint64_t generation,
+                              uint64_t owner, uint64_t started,
+                              uint64_t owner_uid) {
+    const int fd = shm_open(name.c_str(), O_RDWR, 0);
+    if (fd < 0) return false;
+    struct stat info {};
+    if (fstat(fd, &info) != 0 || info.st_uid != geteuid() ||
+        info.st_size < static_cast<off_t>(kSegmentHeaderBytes)) {
+        (void)::close(fd);
+        return false;
+    }
+    void *memory = mmap(nullptr, kSegmentHeaderBytes, PROT_READ | PROT_WRITE,
+                        MAP_SHARED, fd, 0);
+    if (memory == MAP_FAILED) {
+        (void)::close(fd);
+        return false;
+    }
+    auto *candidate = static_cast<SegmentHeader *>(memory);
+    uint32_t expected = segment_state(candidate);
+    const bool mutable_state = expected == kSegmentInitializing ||
+                               expected == kSegmentBuilding;
+    const bool same_owner = candidate->generation == generation &&
+                            candidate->owner_pid == owner &&
+                            candidate->owner_start_time == started &&
+                            candidate->owner_uid == owner_uid;
+    const bool poisoned = mutable_state && same_owner &&
+                          !owner_alive(owner, started) &&
+                          __atomic_compare_exchange_n(
+                              &candidate->state, &expected, kSegmentPoisoned,
+                              false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+    if (poisoned) (void)shm_unlink(name.c_str());
+    (void)munmap(memory, kSegmentHeaderBytes);
+    (void)::close(fd);
+    return poisoned;
+}
+#endif
 
 std::string wire_failure(size_t bytes, int error) {
 #ifdef _WIN32
@@ -1024,27 +1068,76 @@ class WeightSegment {
         if (segment.creator_) {
             SegmentHeader *header = segment.header();
             const uint64_t pid = current_pid();
-            initialize_segment_header(
-                header, sources, bytes, source_bytes, identity,
-                segment_generation(), pid, process_start_time(pid),
-                current_uid(), kSegmentBuilding);
+            const uint64_t started = process_start_time(pid);
+            if (started == 0) {
+                fail(LFM_WEIGHT_IO_ERROR,
+                     "cannot establish shared weight builder process identity");
+            }
+            initialize_segment_owner(header, segment_generation(), pid,
+                                     started, current_uid());
+            publish_segment_build_header(header, sources, bytes, source_bytes,
+                                         identity);
         } else {
             const SegmentHeader *header = segment.header();
-            if (segment_state(header) == 0) {
+            const uint32_t state = segment_state(header);
+            if (state == kSegmentInvalid) {
                 segment.release();
                 fail(LFM_WEIGHT_REJECTED,
-                     "same-name shared weight object has no valid BUILDING header");
+                     "same-name shared weight object has no published "
+                     "initializer identity");
+            }
+            if (state != kSegmentInitializing && state != kSegmentBuilding &&
+                state != kSegmentReady && state != kSegmentPoisoned) {
+                segment.release();
+                fail(LFM_WEIGHT_REJECTED,
+                     "same-name shared weight object has an unknown "
+                     "lifecycle state");
+            }
+            const uint64_t generation = header->generation;
+            const uint64_t owner = header->owner_pid;
+            const uint64_t started = header->owner_start_time;
+            const uint64_t owner_uid = header->owner_uid;
+            const bool owner_valid = generation != 0 && owner != 0 &&
+                                     started != 0 && owner_uid == current_uid();
+            if (!owner_valid) {
+                segment.release();
+                fail(LFM_WEIGHT_REJECTED,
+                     "same-name shared weight object failed its initializer "
+                     "identity");
+            }
+            if (state == kSegmentInitializing) {
+                segment.release();
+#ifndef _WIN32
+                if (takeover && !owner_alive(owner, started)) {
+                    (void)poison_abandoned_segment(
+                        segment.name_, generation, owner, started, owner_uid);
+                    return acquire(sources, files, bytes, source_bytes,
+                                   identity, inject_wire_failure, false);
+                }
+#else
+                if (!owner_alive(owner, started)) {
+                    fail(LFM_WEIGHT_REJECTED,
+                         "shared weight initializer died and takeover is unsupported");
+                }
+#endif
+                fail(LFM_WEIGHT_IN_PROGRESS,
+                     "shared weight segment is INITIALIZING under a live owner; "
+                     "resume this open from its readiness callback");
             }
             const bool header_valid =
-                std::memcmp(header->magic, kSegmentMagic, sizeof(kSegmentMagic)) == 0 &&
+                std::memcmp(header->magic, kSegmentMagic,
+                            sizeof(kSegmentMagic)) == 0 &&
                 header->layout_version == kSegmentLayoutVersion &&
                 header->header_bytes == kSegmentHeaderBytes &&
                 header->total_bytes == bytes &&
                 header->source_bytes == source_bytes &&
                 header->source_count == sources.size() &&
-                header->generation != 0 &&
-                header->owner_uid == current_uid() &&
-                std::memcmp(header->identity_digest, identity.data(), identity.size()) == 0;
+                header->generation == generation &&
+                header->owner_pid == owner &&
+                header->owner_start_time == started &&
+                header->owner_uid == owner_uid &&
+                std::memcmp(header->identity_digest, identity.data(),
+                            identity.size()) == 0;
             if (!header_valid) {
                 segment.release();
                 fail(LFM_WEIGHT_REJECTED,
@@ -1054,7 +1147,8 @@ class WeightSegment {
                 const SegmentSourceRecord &record = header->sources[index];
                 const Source &source = sources[index];
                 const Digest label = label_digest(source.label);
-                if (record.offset != source.offset || record.bytes != source.bytes ||
+                if (record.offset != source.offset ||
+                    record.bytes != source.bytes ||
                     record.component != source.component ||
                     std::memcmp(record.label_digest, label.data(), label.size()) != 0) {
                     segment.release();
@@ -1062,38 +1156,19 @@ class WeightSegment {
                          "shared weight source table does not match checkpoint layout");
                 }
             }
-            const uint32_t state = segment_state(header);
             if (state == kSegmentBuilding) {
-                const uint64_t generation = header->generation;
-                const uint64_t owner = header->owner_pid;
-                const uint64_t started = header->owner_start_time;
                 segment.release();
 #ifndef _WIN32
                 if (takeover && !owner_alive(owner, started)) {
-                    int fd = shm_open(segment.name_.c_str(), O_RDWR, 0);
-                    if (fd >= 0) {
-                        void *memory = mmap(nullptr, kSegmentHeaderBytes,
-                                            PROT_READ | PROT_WRITE, MAP_SHARED,
-                                            fd, 0);
-                        if (memory != MAP_FAILED) {
-                            auto *candidate = static_cast<SegmentHeader *>(memory);
-                            uint32_t expected = kSegmentBuilding;
-                            if (candidate->generation == generation &&
-                                candidate->owner_pid == owner &&
-                                candidate->owner_start_time == started &&
-                                !owner_alive(owner, started) &&
-                                __atomic_compare_exchange_n(
-                                    &candidate->state, &expected,
-                                    kSegmentPoisoned, false,
-                                    __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-                                (void)shm_unlink(segment.name_.c_str());
-                            }
-                            (void)munmap(memory, kSegmentHeaderBytes);
-                        }
-                        (void)::close(fd);
-                    }
+                    (void)poison_abandoned_segment(
+                        segment.name_, generation, owner, started, owner_uid);
                     return acquire(sources, files, bytes, source_bytes,
                                    identity, inject_wire_failure, false);
+                }
+#else
+                if (!owner_alive(owner, started)) {
+                    fail(LFM_WEIGHT_REJECTED,
+                         "shared weight builder died and takeover is unsupported");
                 }
 #endif
                 fail(LFM_WEIGHT_IN_PROGRESS,
@@ -2004,7 +2079,8 @@ LfmWeightImage *load(
         if (!claim.loading) break;
         if (!ready) {
             fail(LFM_WEIGHT_IN_PROGRESS,
-                 "shared weight image is BUILDING; synchronous callers must "
+                 "shared weight image is INITIALIZING or BUILDING; "
+                 "synchronous callers must "
                  "retry from a correlated continuation edge");
         }
         RegistrySubscription subscription = registry_subscribe(name, *ready);
@@ -2016,7 +2092,8 @@ LfmWeightImage *load(
         }
         if (subscription.retained) {
             fail(LFM_WEIGHT_IN_PROGRESS,
-                 "shared weight image is BUILDING; continuation retained");
+                 "shared weight image is INITIALIZING or BUILDING; "
+                 "continuation retained");
         }
         /* Publication or abandonment won between claim and subscription.
          * Re-observe the registry transition in this same active callback;
@@ -2033,12 +2110,12 @@ LfmWeightImage *load(
         if (error.status() != LFM_WEIGHT_IN_PROGRESS) throw;
         if (ready) {
             fail(LFM_WEIGHT_REJECTED,
-                 "a foreign process owns the BUILDING weight generation; "
+                 "a foreign process owns the active weight generation; "
                  "direct continuation admission has no cross-process callback "
                  "edge (enter through the native model host readiness ticket)");
         }
         fail(LFM_WEIGHT_IN_PROGRESS,
-             "a foreign process owns the BUILDING weight generation; "
+             "a foreign process owns the active weight generation; "
              "host-less synchronous open cannot wait or poll for it");
     }
     image->sources = std::move(resolved.sources);
@@ -2378,10 +2455,12 @@ extern "C" int lfm_internal_weights_open_fault_test(
     return status;
 }
 
-/* Hostile/stale namespace gate. It fabricates the named object through the
- * same header initializer used by the elected builder, mutates exactly one
- * contract field, then enters through the public attach path. Test code does
- * not duplicate the validation ladder it is meant to verify. */
+/* Hostile/stale namespace gate. It fabricates every persisted crash window
+ * through the elected builder's real publication helpers: zero state before
+ * INITIALIZING, live/dead INITIALIZING, live/dead BUILDING, malformed READY,
+ * and POISONED. Other modes mutate exactly one contract field before entering
+ * through the public attach path. Test code does not duplicate the validation
+ * ladder it is meant to verify. */
 extern "C" int lfm_internal_weights_hostile_segment_test(
     const char *path, uint32_t mode, int32_t *observed_status,
     uint64_t *abandoned_generation, uint64_t *published_generation,
@@ -2396,7 +2475,7 @@ extern "C" int lfm_internal_weights_hostile_segment_test(
               "hostile POSIX shared-memory fixture is unsupported on Windows");
     return LFM_WEIGHT_REJECTED;
 #else
-    if (!path || !path[0] || mode < 1 || mode > 8 || !observed_status ||
+    if (!path || !path[0] || mode < 1 || mode > 11 || !observed_status ||
         !abandoned_generation || !published_generation) {
         set_error(err, errlen, "invalid hostile-segment gate arguments");
         return LFM_WEIGHT_INVALID_ARGUMENT;
@@ -2455,21 +2534,29 @@ extern "C" int lfm_internal_weights_hostile_segment_test(
             if (mode == 1) {
                 std::memset(header, 0, kSegmentHeaderBytes);
             } else {
-                const bool dead = mode == 6;
+                const bool dead = mode == 6 || mode == 10;
+                const bool initializing = mode == 9 || mode == 10;
                 const uint64_t pid = dead ? UINT64_MAX : current_pid();
                 const uint64_t started =
                     dead ? UINT64_C(1) : process_start_time(pid);
-                const uint32_t state = mode == 4 ? kSegmentReady
-                                                 : kSegmentBuilding;
                 const uint64_t generation = segment_generation();
-                initialize_segment_header(
-                    header, resolved.sources, total, source_bytes, identity,
-                    generation, pid, started, current_uid(), state);
+                initialize_segment_owner(header, generation, pid, started,
+                                         current_uid());
                 *abandoned_generation = generation;
-                if (mode == 3) header->header_bytes = 1;
-                if (mode == 7) header->owner_uid = current_uid() + 1;
-                if (mode == 8) ++header->sources[0].offset;
-                /* Mode 4 deliberately leaves the READY content digest empty. */
+                if (!initializing) {
+                    publish_segment_build_header(header, resolved.sources,
+                                                 total, source_bytes, identity);
+                    if (mode == 3) header->header_bytes = 1;
+                    if (mode == 4) {
+                        /* Deliberately publish READY without a content tree. */
+                        publish_segment_state(header, kSegmentReady);
+                    }
+                    if (mode == 7) header->owner_uid = current_uid() + 1;
+                    if (mode == 8) ++header->sources[0].offset;
+                    if (mode == 11) {
+                        publish_segment_state(header, kSegmentPoisoned);
+                    }
+                }
             }
             (void)munmap(mapping, total);
         }
@@ -2479,9 +2566,10 @@ extern "C" int lfm_internal_weights_hostile_segment_test(
         char open_error[512]{};
         *observed_status = lfm_weights_open(path, &image, open_error,
                                             sizeof(open_error));
-        const int32_t expected = mode == 5 ? LFM_WEIGHT_IN_PROGRESS
-                                           : mode == 6 ? LFM_WEIGHT_OK
-                                                       : LFM_WEIGHT_REJECTED;
+        const int32_t expected = mode == 5 || mode == 9
+                                     ? LFM_WEIGHT_IN_PROGRESS
+                                 : mode == 6 || mode == 10 ? LFM_WEIGHT_OK
+                                                          : LFM_WEIGHT_REJECTED;
         int result = LFM_WEIGHT_OK;
         if (*observed_status != expected) {
             set_error(err, errlen,
@@ -2489,7 +2577,7 @@ extern "C" int lfm_internal_weights_hostile_segment_test(
                                     : "hostile object returned wrong status");
             result = LFM_WEIGHT_REJECTED;
         }
-        if (mode == 6 && image) {
+        if ((mode == 6 || mode == 10) && image) {
             LfmWeightLoadStatsV2 stats{
                 .size = sizeof(LfmWeightLoadStatsV2),
                 .abi_version = LFM_WEIGHT_ABI_VERSION,
@@ -2498,7 +2586,8 @@ extern "C" int lfm_internal_weights_hostile_segment_test(
                 !(stats.flags & LFM_WEIGHT_LOAD_BUILT) ||
                 stats.generation == *abandoned_generation) {
                 set_error(err, errlen,
-                          "dead BUILDING generation was not replaced exactly once");
+                          "dead initializer generation was not replaced "
+                          "exactly once");
                 result = LFM_WEIGHT_REJECTED;
             }
             *published_generation = stats.generation;

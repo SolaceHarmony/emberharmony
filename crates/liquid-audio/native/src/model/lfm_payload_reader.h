@@ -62,10 +62,11 @@ int lfm_weights_open_bundle_owned(const char *main_path,
                                   const LfmPayloadReadOwner *owner,
                                   LfmWeightImage **out, char *error,
                                   size_t error_length);
-/* Continuation-aware twins for model readiness. A live BUILDING generation
- * returns LFM_WEIGHT_IN_PROGRESS after retaining this exact GOSUB identity;
- * builder publication resumes it. The caller dehydrates immediately and
- * retries the same open on resume. No physical thread waits beside the image. */
+/* Continuation-aware twins for model readiness. A live INITIALIZING or
+ * BUILDING generation returns LFM_WEIGHT_IN_PROGRESS after retaining this
+ * exact GOSUB identity; builder publication resumes it. The caller dehydrates
+ * immediately and retries the same open on resume. No physical thread waits
+ * beside the image. */
 int lfm_weights_open_owned_continuation(
     const char *path, const LfmPayloadReadOwner *owner,
     koro_cont_t *continuation, LfmWeightImage **out, char *error,

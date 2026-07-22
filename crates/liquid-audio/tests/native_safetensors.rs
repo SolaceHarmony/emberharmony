@@ -12,6 +12,7 @@ const IO: i32 = -2;
 const FORMAT: i32 = -3;
 const NOT_FOUND: i32 = -5;
 const IN_PROGRESS: i32 = -6;
+const REJECTED: i32 = -7;
 const INVALID: i32 = -22;
 const WEIGHT_ABI: u32 = 2;
 const RUNTIME_ABI: u32 = 4;
@@ -810,7 +811,7 @@ fn eight_coroutines_single_flight_one_build_and_seven_correlated_registry_leases
 
 #[test]
 #[cfg(unix)]
-fn hostile_and_abandoned_named_segments_fail_closed_or_take_over_once() {
+fn every_segment_publication_window_fails_closed_or_takes_over_once() {
     let temp = Temp::new();
     let path = temp.0.join("hostile.safetensors");
     write_file(
@@ -823,7 +824,20 @@ fn hostile_and_abandoned_named_segments_fail_closed_or_take_over_once() {
         }],
     );
     let path = CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
-    for mode in 1..=8 {
+    let cases = [
+        (1, REJECTED, false, "crash before INITIALIZING"),
+        (2, REJECTED, false, "wrong-sized shared object"),
+        (3, REJECTED, false, "malformed BUILDING header"),
+        (4, REJECTED, false, "READY without a content digest"),
+        (5, IN_PROGRESS, false, "live BUILDING owner"),
+        (6, OK, true, "dead BUILDING owner"),
+        (7, REJECTED, false, "header uid mismatch"),
+        (8, REJECTED, false, "source table mismatch"),
+        (9, IN_PROGRESS, false, "live INITIALIZING owner"),
+        (10, OK, true, "dead INITIALIZING owner"),
+        (11, REJECTED, false, "POISONED generation"),
+    ];
+    for (mode, expected, takeover, label) in cases {
         let mut observed = 0;
         let mut abandoned = 0;
         let mut published = 0;
@@ -842,20 +856,11 @@ fn hostile_and_abandoned_named_segments_fail_closed_or_take_over_once() {
         assert_eq!(
             status,
             OK,
-            "hostile segment mode {mode} failed: {}",
+            "hostile segment mode {mode} ({label}) failed: {}",
             unsafe { CStr::from_ptr(error.as_ptr()) }.to_string_lossy()
         );
-        assert_eq!(
-            observed,
-            if mode == 5 {
-                IN_PROGRESS
-            } else if mode == 6 {
-                OK
-            } else {
-                -7
-            }
-        );
-        if mode == 6 {
+        assert_eq!(observed, expected, "wrong status for {label}");
+        if takeover {
             assert_ne!(abandoned, 0);
             assert_ne!(published, 0);
             assert_ne!(published, abandoned);
