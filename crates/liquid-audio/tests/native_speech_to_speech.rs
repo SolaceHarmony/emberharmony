@@ -9,6 +9,7 @@ unsafe extern "C" {
     fn lfm_native_speech_to_speech_gate(
         model_path: *const c_char,
         audible: u32,
+        kernel_lanes: u32,
         error: *mut c_char,
         error_length: usize,
     ) -> i32;
@@ -28,9 +29,22 @@ fn two_native_lfm2_agents_speak_through_memory_only() {
         Some(value) if value == "stream" => 2,
         Some(_) => 1,
     };
+    let lanes = std::env::var("LFM_SPEECH_GATE_LANES")
+        .map(|value| {
+            value
+                .parse::<u32>()
+                .expect("LFM_SPEECH_GATE_LANES must be a positive integer")
+        })
+        .unwrap_or(8);
     let mut error = [0i8; 512];
     let status = unsafe {
-        lfm_native_speech_to_speech_gate(path.as_ptr(), audible, error.as_mut_ptr(), error.len())
+        lfm_native_speech_to_speech_gate(
+            path.as_ptr(),
+            audible,
+            lanes,
+            error.as_mut_ptr(),
+            error.len(),
+        )
     };
     let end = error
         .iter()

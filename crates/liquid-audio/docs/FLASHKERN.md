@@ -16,9 +16,11 @@ tensor library, a C++ numerical library, or a Metal backend.
 - Flashkern is CPU-only. The Apple GPU peer will use MLX C++/Metal as a separate
   device engine selected above Flashkern.
 - Apple Accelerate may be selected for a measured GEMM shape as an opaque
-  machine-code/AMX backend behind an architecture assembly thunk. Selection
-  happens at model open; C++ still performs no arithmetic and unsupported
-  shapes do not silently fall back.
+  machine-code/AMX backend at an explicit C++ control seam. The preceding
+  assembly tile materializes once into declared scratch, Accelerate writes its
+  final destination, and the successor assembly tile resumes the FIFO. C++
+  performs no formula arithmetic and unsupported shapes do not silently fall
+  back.
 
 ```mermaid
 flowchart LR
@@ -65,6 +67,7 @@ implementation passes both architecture gates.
 | RoPE table | `flashkern_rope.h` | `flashkern_rope.S` | `flashkern_rope.S` | table generation does not enter Rust |
 | scalar/reduction math | `flashkern_math.h` | `flashkern_math.S` | `flashkern_math.S` | inverse RMS, fixed-order sum, BF16 stride sumsq, bias, NeoX rotation |
 | sampler leaves | `flashkern_sampler.h` | `flashkern_sampler.S` | `flashkern_sampler.S` | argmax, BF16 scale, threshold traversal, ordered sum, prefix pick |
+| LFM2.5 audio detokenizer | `lfm_detokenizer_kernels.h` | `flashkern_detokenizer.S` | `flashkern_detokenizer.S` | complete hot arithmetic tiles plus setup-only RoPE/IFFT derived-table construction; AMX/vForce remain explicit opaque seams |
 
 The sampler assembly includes its own f32 range reduction and degree-six
 exponential polynomial. It imports no libm numerical symbol and preserves the
@@ -92,11 +95,6 @@ Additional numerical C++ debt remains in:
 
 - `native/src/engine/flashkern_engine.cpp`: top-k heap/serial sampler routing,
   double-double FFT arithmetic, twiddle generation, and residual expressions;
-- `native/src/detokenizer/lfm_detokenizer.cpp`: current LFM2.5 output
-  embedding, ShortConv, GQA, projection, polar-spectrum, inverse-DFT, and
-  overlap-add arithmetic. Large dense stages may remain behind the measured
-  Accelerate/AMX seam; all other payload calculations require paired assembly
-  leaves and cooperative fixed-team scheduling.
 - `native/src/mimi/*.cpp`: retained future-Moshi codec GEMM, activation,
   normalization, convolution, transformer, quantizer, and SeaNet arithmetic.
   This archive is not mounted by LFM2.5;

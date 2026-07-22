@@ -57,6 +57,7 @@
 #include "lfm_frontend.h"
 #include "lfm_kernel_bridge.h"
 #include "lfm_detokenizer.h"
+#include "lfm_detokenizer_program.h"
 #include "lfm_model_plan.h"
 #include "../model/lfm_route_epoch.h"
 
@@ -259,10 +260,9 @@ enum : int {
     // sampler, and sampled-embedding recurrence under one native ticket.
     REQ_DEPTH_FRAME = 8,
     REQ_PREFILL = 13,
-    // One conversation-owned detokenizer state step writes directly into a retained
-    // playback reservation. Lane 0 runs the stateful graph while peer members
-    // return from the same generation; codec work therefore shares SQ/CQ
-    // ordering and cannot oversubscribe the backbone/Depthformer executor.
+    // One conversation-owned detokenizer program writes directly into a
+    // retained playback reservation. Dense AMX phases are explicit serial
+    // resources; every separable phase is partitioned across the fixed team.
     REQ_AUDIO_DETOKENIZE = 14,
     // One retained PCM view through prepared resample, frontend, and Conformer
     // workspaces. Conformer GEMMs are fixed-team substages of this ticket and
@@ -547,7 +547,9 @@ struct DetokenizerReq {
     size_t detokenizer_capacity = 0;
     LfmResamplerStream *resampler_stream = nullptr;
     size_t *out_samples = nullptr;
+    LfmAudioDetokenizerProgram program{};
     bool flush = false;
+    bool resample_pending = false;
     int completion_status = 0; // private deterministic route-fault seam
 };
 
@@ -1121,7 +1123,6 @@ struct Engine {
     BackbonePlan *model = nullptr;
     uint64_t model_seq = 0;
     TokenReq tok; // token-pass request payload
-    DetokenizerReq detokenizer;
 
     // Persistent scratch backing is sized before numerical admission and is
     // swapped with the active ticket's private activation bank.
@@ -1372,7 +1373,6 @@ static void activate_slot(Engine *e, PassSlot *slot) {
     e->depth_req = slot->depth_req;
     e->gemm = slot->gemm;
     e->tok = slot->tok;
-    e->detokenizer = slot->detokenizer;
     e->pass_view = &e->pass;
     e->sc_view = &e->sc;
     e->at_view = &e->at;
@@ -3836,6 +3836,95 @@ static bool advance_audio_program(Engine *e, PassSlot *slot) {
     return true;
 }
 
+static void publish_detokenizer_error(Engine *e, int status) {
+    if (status == 0) return;
+    int expected = 0;
+    e->active_status.compare_exchange_strong(
+        expected, status, std::memory_order_release,
+        std::memory_order_acquire);
+}
+
+static void initialize_detokenizer_program(Engine *e, PassSlot *slot) {
+    DetokenizerReq &request = slot->detokenizer;
+    request.resample_pending = false;
+    request.program = {};
+    if (request.completion_status != 0) {
+        publish_detokenizer_error(e, request.completion_status);
+        return;
+    }
+    float *decode_pcm = request.resampler_stream
+        ? request.detokenizer_pcm
+        : request.pcm;
+    const size_t decode_capacity = request.resampler_stream
+        ? request.detokenizer_capacity
+        : request.capacity;
+    const int status = lfm_detokenizer_program_begin(
+        &request.program, request.state, request.codes, decode_pcm,
+        decode_capacity, request.flush ? 1u : 0u);
+    publish_detokenizer_error(e, status);
+}
+
+static void run_detokenizer_program_stage(Engine *e, uint32_t lane) {
+    PassSlot *slot = e->active_slot;
+    if (!slot || e->active_status.load(std::memory_order_acquire) != 0)
+        return;
+    DetokenizerReq &request = slot->detokenizer;
+    if (request.resample_pending) {
+        if (lane != 0) return;
+        LfmF32Span span{};
+        const int status = lfm_resampler_stream_process(
+            request.resampler_stream, request.detokenizer_pcm,
+            request.program.produced, request.pcm, request.capacity, &span);
+        if (status != 0 || span.data != request.pcm ||
+            span.length > request.capacity) {
+            publish_detokenizer_error(
+                e, status != 0 ? status : -EFAULT);
+            return;
+        }
+        *request.out_samples = static_cast<size_t>(span.length);
+        return;
+    }
+    publish_detokenizer_error(
+        e, lfm_detokenizer_program_run(
+               &request.program, lane,
+               static_cast<uint32_t>(e->lanes_total)));
+}
+
+static bool advance_detokenizer_program(Engine *e, PassSlot *slot) {
+    DetokenizerReq &request = slot->detokenizer;
+    if (e->active_status.load(std::memory_order_acquire) != 0) {
+        if (request.program.active)
+            lfm_detokenizer_program_cancel(&request.program);
+        request.resample_pending = false;
+        return false;
+    }
+    if (request.resample_pending) {
+        request.resample_pending = false;
+        return false;
+    }
+    const int status = lfm_detokenizer_program_advance(&request.program);
+    if (status < 0) {
+        publish_detokenizer_error(e, status);
+        lfm_detokenizer_program_cancel(&request.program);
+        return false;
+    }
+    if (status > 0) return true;
+    const size_t samples = request.program.produced;
+    const size_t decode_capacity = request.resampler_stream
+        ? request.detokenizer_capacity
+        : request.capacity;
+    if (samples > decode_capacity) {
+        publish_detokenizer_error(e, -EOVERFLOW);
+        return false;
+    }
+    if (request.resampler_stream) {
+        request.resample_pending = true;
+        return true;
+    }
+    *request.out_samples = samples;
+    return false;
+}
+
 // The per-generation program is dispatched identically on every lane. Request
 // payloads are release-published before dispatch and remain borrowed until the
 // fixed team's final-return callback publishes the exact ticket completion.
@@ -3866,52 +3955,7 @@ static void lane_program(Engine *e, uint32_t lane) {
         run_depth_program_stage(e, lane, e->active_slot);
         break;
     case REQ_AUDIO_DETOKENIZE:
-        if (lane == 0) {
-            DetokenizerReq &request = e->detokenizer;
-            float *decode_pcm = request.resampler_stream
-                                    ? request.detokenizer_pcm
-                                    : request.pcm;
-            size_t samples = 0;
-            const int status = request.completion_status != 0
-                ? request.completion_status
-                : (request.flush
-                       ? lfm_detokenizer_state_flush(
-                             request.state, decode_pcm,
-                             request.resampler_stream
-                                 ? request.detokenizer_capacity
-                                                      : request.capacity,
-                             &samples)
-                       : lfm_detokenizer_state_step(
-                             request.state, request.codes, decode_pcm,
-                             request.resampler_stream
-                                 ? request.detokenizer_capacity
-                                 : request.capacity,
-                             &samples));
-            if (status != 0) {
-                e->active_status.store(status, std::memory_order_release);
-            } else if (samples >
-                       (request.resampler_stream
-                            ? request.detokenizer_capacity
-                            : request.capacity)) {
-                e->active_status.store(-EOVERFLOW, std::memory_order_release);
-            } else if (request.resampler_stream) {
-                LfmF32Span span{};
-                const int resample_status = lfm_resampler_stream_process(
-                    request.resampler_stream, decode_pcm, samples, request.pcm,
-                    request.capacity, &span);
-                if (resample_status != 0 || span.data != request.pcm ||
-                    span.length > request.capacity) {
-                    e->active_status.store(resample_status != 0
-                                               ? resample_status
-                                               : -EFAULT,
-                                           std::memory_order_release);
-                } else {
-                    *request.out_samples = static_cast<size_t>(span.length);
-                }
-            } else {
-                *request.out_samples = samples;
-            }
-        }
+        run_detokenizer_program_stage(e, lane);
         break;
     case REQ_AUDIO_ENCODE:
         run_audio_program_stage(e, lane);
@@ -4003,8 +4047,14 @@ static TeamWorkDescriptor describe_active_generation(const Engine *e) {
         work.shape2 = slot.depth ? slot.depth->layers.size() : 0;
         break;
     case REQ_AUDIO_DETOKENIZE:
+        work.program_kind = slot.detokenizer.resample_pending ? 1u : 0u;
+        work.program_phase = slot.detokenizer.resample_pending
+            ? LFM_DETOKENIZER_PHASE_DONE
+            : slot.detokenizer.program.phase;
+        work.program_outer = slot.detokenizer.program.layer;
         work.shape0 = slot.detokenizer.capacity;
         work.shape1 = slot.detokenizer.detokenizer_capacity;
+        work.shape2 = slot.detokenizer.program.produced;
         break;
     case REQ_AUDIO_ENCODE:
         work.program_kind = slot.audio.phase;
@@ -4370,6 +4420,11 @@ static void process_team_completion(Engine *e, uint64_t generation) {
         redispatch_team_stage(e, generation);
         return;
     }
+    if (slot->request == REQ_AUDIO_DETOKENIZE &&
+        advance_detokenizer_program(e, slot)) {
+        redispatch_team_stage(e, generation);
+        return;
+    }
     if (slot->request == REQ_AUDIO_ENCODE &&
         advance_audio_program(e, slot)) {
         redispatch_team_stage(e, generation);
@@ -4608,6 +4663,8 @@ static bool bridge_step_once(Engine *e) {
         initialize_prefill_program(e, slot);
     } else if (slot->request == REQ_DEPTH_FRAME) {
         initialize_depth_program(slot);
+    } else if (slot->request == REQ_AUDIO_DETOKENIZE) {
+        initialize_detokenizer_program(e, slot);
     } else if (slot->request == REQ_AUDIO_ENCODE) {
         slot->audio.phase = AUDIO_PHASE_FRONTEND;
     }

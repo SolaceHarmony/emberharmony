@@ -90,8 +90,10 @@ flowchart LR
 ShortConv/attention/MLP walk, final norm, and optional sampling in one team entry.
 `REQ_DEPTH_FRAME` executes projection, every Depthformer codebook/layer, resident KV
 recurrence, collective sampling, and sampled-embedding feedback.
-`REQ_AUDIO_DETOKENIZE` serializes conversation-local detokenizer state through
-the same SQ/CQ.
+`REQ_AUDIO_DETOKENIZE` serializes one conversation's causal detokenizer state
+through the same SQ/CQ while its retained program partitions every separable
+phase across the kcoro-owned fixed team. Final-member callbacks advance the
+phase cursor; the former lane-zero whole-graph call no longer exists.
 At 24 kHz it writes directly into the retained reservation; at another device
 rate it decodes into conversation-owned codec scratch and the same route's native
 retained streaming rate converter writes directly into the reservation. `REQ_AUDIO_ENCODE`
@@ -298,7 +300,7 @@ Depthformer programs plus the lower-level kernel inventory.
 | backbone recurrence | `REQ_TOKEN_PASS` over direct checkpoint BF16; native KV/ShortConv state, grouped GQA, final norm, and text sampling | `native/src/engine/flashkern_engine.cpp`, `native/src/model/lfm_model.cpp` |
 | context rollover | fixed capacity+runway BF16 state, monotonic cursor, absolute RoPE range generation, in-place compaction | `native/src/model/lfm_model.cpp`, `native/kernels/*/flashkern_rope.S` |
 | audio frame | `REQ_DEPTH_FRAME`: projection, every Depthformer codebook/layer, KV recurrence, native sampling, embedding feedback | `native/src/engine/flashkern_engine.cpp` |
-| LFM2.5 audio detokenizer | typed `REQ_AUDIO_DETOKENIZE`; required F32 detokenizer views from the same image; conversation-local ShortConv/GQA/ISTFT state; PCM writes directly into a playback lease | `native/src/detokenizer/`, `native/src/engine/flashkern_engine.cpp`, `native/src/runtime/voice_session.cpp` |
+| LFM2.5 audio detokenizer | typed retained `REQ_AUDIO_DETOKENIZE` program; required F32 detokenizer views from the same image; paired AArch64/x86_64 assembly owns every non-opaque payload operation; register/cache FIFO materializes only at causal state, quorum, AMX, or vForce seams; PCM writes directly into a playback lease | `native/src/detokenizer/`, `native/kernels/*/flashkern_detokenizer.S`, `native/src/engine/flashkern_engine.cpp`, `native/src/runtime/voice_session.cpp` |
 | Mimi | retained native archive with a distinct `MIMI` image component; no LFM2.5 loader or route edge; reserved for native Moshi | `native/src/mimi/`, `docs/MIMI_PORT.md` |
 | generation/session | native ticketed text/PCM admission and recurrence, reliable events, interruption epochs, stop/join | `native/src/runtime/voice_session.cpp` |
 | desktop production host | opaque native runtime/model/conversation/session; no Rust model construction or Candle fallback | `src/native_voice.rs`, `packages/desktop/src-tauri/src/voice/runtime.rs` |

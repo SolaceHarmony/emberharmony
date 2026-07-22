@@ -82,9 +82,10 @@ REQ_TOKEN_PASS
   → retained playback lease
 ```
 
-EOAudio routes to `lfm_detokenizer_state_flush`; it is not an artificial
-silence timer and it cannot publish twice. Ticket/epoch checks remain attached
-through final device consumption.
+EOAudio begins a flush-form `LfmAudioDetokenizerProgram`. Its only numerical
+phase is the remaining overlap emission, mounted on the same fixed team as a
+normal code frame; it is not an artificial silence timer and it cannot publish
+twice. Ticket/epoch checks remain attached through final device consumption.
 
 Mimi is retained as `liblfm_mimi.a` for a future native Moshi model. Its plan
 can bind only `LFM_WEIGHT_COMPONENT_MIMI`. The LFM2.5 loader loads only
@@ -94,25 +95,66 @@ can bind only `LFM_WEIGHT_COMPONENT_MIMI`. The LFM2.5 loader loads only
 
 ## Numerical execution
 
-Large six-row dense stages use Accelerate/AMX on Apple. Other current stages
-use architecture SIMD and direct byte views, with accumulators kept in
-registers and only stage results published. The implementation is already
-native and tensor-free, but it is not yet the final Flashkern arithmetic form:
-several value-producing loops remain in C++/intrinsics and the complete
-detokenizer currently executes on lane zero.
+The detokenizer is one retained `LfmAudioDetokenizerProgram` carried by its
+admitted pass ticket. Each causal phase is one Flashkern team generation. The
+last logical lane to return publishes the quorum edge; that callback resumes
+the bridge continuation, which advances the durable phase/layer cursor and
+dispatches the successor. No host thread waits for a phase, and no lane waits
+for another lane.
 
-Remaining performance work is therefore explicit:
+Embedding columns, row norms, ShortConv channels, GQA head groups, SwiGLU and
+residual bands, spectral bins, overlap-add ring ranges, and final PCM ranges
+are disjoint fixed-team partitions. A lane carries residual→RMSNorm through one
+row-owned generation and overlap-add→normalization/emit through one ring-owned
+generation; those pairs have no cross-lane dependency, so materializing a
+quorum between them would only eject hot state. This removes 17 artificial
+team generations per code frame. Large six-row dense stages and the inverse
+DFT use Accelerate/AMX on Apple as explicit serial resources inside the same
+ticket; peers return immediately and remain available to the shared kcoro
+pool. An optional output-rate conversion is one final native generation.
 
-1. Transliterate remaining scalar/intrinsic numerical bodies into paired
-   AArch64/x86_64 assembly leaves without introducing a fallback.
-2. Fuse projection → polar conversion → inverse DFT → window/overlap-add where
-   liveness permits so intermediate spectrum/time planes disappear.
-3. Partition ShortConv, GQA heads, dense rows, and spectral bins across the
-   fixed kcoro/Flashkern team. Coroutines sequence coarse stages; assembly owns
-   complete tiles and never suspends inside a kernel.
-4. Preserve fixed accumulation/rounding contracts and direct destination
-   writes while reducing the streaming underflow count in the real speaker
-   gate.
+Every non-opaque payload operation is now a paired
+`flashkern_detokenizer.S` leaf on AArch64 and x86_64: embedding, residuals,
+RMSNorm, SwiGLU arithmetic, scaled attention dots, softmax reductions and
+normalization, RoPE, ShortConv, weighted values, polar conversion,
+overlap-add, envelope normalization, PCM emission, and both immutable derived
+table constructors. C++23 binds views and advances phases; it contains no
+detokenizer payload formula or architecture intrinsic. The only opaque
+numerical seams are measured Accelerate/AMX dense calls and vForce
+exponential/sine/cosine calls.
+
+The FIFO boundary is explicit. Values remain in architecture registers for a
+complete assembly tile. They materialize only when the next consumer is an
+opaque AMX/vForce call, a causal state owner, or a cross-lane quorum. The final
+AMX projection writes once into its destination; bias, exponential/trigonometric
+conversion, and polar conversion proceed in place in the same retained
+continuation. The inverse DFT writes into the now-dead FFN scratch plane, and
+overlap-add plus emission share one generation. There is no separate IFFT
+plane, magnitude copy, phase copy, or bridge-side numerical handoff.
+
+All stages consume direct byte views and preallocated conversation scratch.
+The implementation is native and tensor-free. It also fixes the former AArch64
+ShortConv tap scratch overrun: each of four NEON channels now owns exactly its
+three taps instead of indexing a three-row array with four channel indices.
+SIMD-producing partitions are expressed in four-element quanta, so changing
+the fixed-team width cannot create new scalar boundary cells or change the
+rounding contract. The real-checkpoint gate runs one fixed code trace through
+three- and eight-lane programs, including causal state and final flush, and
+requires byte-identical PCM.
+
+The physical callback gate measured the change in two steps at 24 kHz in the
+same two-agent test. Removing the former lane-zero whole-graph execution cut
+streaming starvation from 11,744 frames across 47 callbacks to 640/3. Fusing
+the row- and ring-local successors then reached **0 underflow frames across 0
+callbacks**, with the same fixed-seed transcripts, PCM digests, frame counts,
+and one ordered source transition. This is a measured gate result, not a claim
+that arbitrary hardware can never underrun.
+
+There is no known detokenizer numerical-ownership debt. Further fusion is
+profile-driven only: it may remove a materialization boundary when liveness
+proves the consumer can remain in the same register tile, but it may not cross
+an opaque AMX/vForce seam, conceal a cross-lane dependency, add a fallback, or
+change the fixed rounding contract merely to reduce a phase count.
 
 ## Gates
 
@@ -124,7 +166,9 @@ Remaining performance work is therefore explicit:
 - Native two-agent speech-to-speech gate: generated code frames pass through
   Depthformer and this detokenizer in memory; transcript, PCM, ticket, epoch,
   deterministic seed, and complete retirement are checked.
+- Fixed-team invariance: the same released weights and audio-code trace must
+  produce byte-identical stateful PCM at three and eight lanes. The full gate
+  accepts `LFM_SPEECH_GATE_LANES` for an additional non-default team run.
 - Real speaker gate: the same in-memory stream is drained by the native device
   callback. Audible clarity does not waive underflow, overlap, truncation, or
   terminal-order failures.
-

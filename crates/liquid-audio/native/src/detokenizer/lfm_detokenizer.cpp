@@ -7,13 +7,14 @@
 // widening, alignment repair, transpose, or packed copy exists in this file.
 
 #include "lfm_detokenizer.h"
+#include "lfm_detokenizer_kernels.h"
+#include "lfm_detokenizer_program.h"
 
 #include "lfm_safetensors.h"
 
 #include <algorithm>
 #include <array>
 #include <cerrno>
-#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -31,12 +32,9 @@
 #include <Accelerate/Accelerate.h>
 #endif
 
-#if defined(__aarch64__) || defined(__ARM_ARCH_ISA_A64)
-#include <arm_neon.h>
-#define LFM_DETOK_NEON 1
-#elif defined(__x86_64__) || defined(_M_X64)
-#include <immintrin.h>
-#define LFM_DETOK_SSE 1
+#if defined(__aarch64__) || defined(__ARM_ARCH_ISA_A64) ||                 \
+    defined(__x86_64__) || defined(_M_X64)
+#define LFM_DETOK_ASM 1
 #endif
 
 extern "C" void lfm_sgemm_f32(const float *a, const float *b, float *c,
@@ -112,37 +110,9 @@ size_t aligned_bytes(size_t bytes) {
     return (bytes + (kAlign - 1)) & ~(kAlign - 1);
 }
 
-float load_f32(const F32View &view, uint64_t index) {
-    float value = 0.0f;
-    std::memcpy(&value, view.bytes + index * sizeof(float), sizeof(value));
-    return value;
-}
-
 const float *f32_pointer(const F32View &view) {
     return reinterpret_cast<const float *>(view.bytes);
 }
-
-#if defined(LFM_DETOK_NEON)
-float32x4_t load4(const F32View &view, uint64_t index) {
-    return vreinterpretq_f32_u8(
-        vld1q_u8(reinterpret_cast<const uint8_t *>(view.bytes) +
-                 index * sizeof(float)));
-}
-
-float sum4(float32x4_t value) { return vaddvq_f32(value); }
-#elif defined(LFM_DETOK_SSE)
-__m128 load4(const F32View &view, uint64_t index) {
-    __m128 value;
-    std::memcpy(&value, view.bytes + index * sizeof(float), sizeof(value));
-    return value;
-}
-
-float sum4(__m128 value) {
-    alignas(16) float lanes[4];
-    _mm_store_ps(lanes, value);
-    return (lanes[0] + lanes[1]) + (lanes[2] + lanes[3]);
-}
-#endif
 
 int bind_f32(const LfmWeightImage *image, const std::string &name,
              std::initializer_list<uint64_t> shape, F32View *out,
@@ -218,120 +188,18 @@ void dense(const float *left, size_t rows, size_t inner,
 #endif
 }
 
-void add_bias(float *values, size_t rows, size_t columns,
-              const F32View &bias) {
-    for (size_t row = 0; row < rows; ++row) {
-        float *dst = values + row * columns;
-        size_t column = 0;
-#if defined(LFM_DETOK_NEON)
-        for (; column + 4 <= columns; column += 4) {
-            vst1q_f32(dst + column,
-                      vaddq_f32(vld1q_f32(dst + column),
-                                load4(bias, column)));
-        }
-#elif defined(LFM_DETOK_SSE)
-        for (; column + 4 <= columns; column += 4) {
-            _mm_storeu_ps(dst + column,
-                          _mm_add_ps(_mm_loadu_ps(dst + column),
-                                     load4(bias, column)));
-        }
-#endif
-        for (; column < columns; ++column) dst[column] += load_f32(bias, column);
-    }
-}
-
-void copy_values(const float *source, float *destination, size_t count) {
-    size_t index = 0;
-#if defined(LFM_DETOK_NEON)
-    for (; index + 16 <= count; index += 16) {
-        const float32x4x4_t value = {
-            {vld1q_f32(source + index), vld1q_f32(source + index + 4),
-             vld1q_f32(source + index + 8),
-             vld1q_f32(source + index + 12)}};
-        vst1q_f32(destination + index, value.val[0]);
-        vst1q_f32(destination + index + 4, value.val[1]);
-        vst1q_f32(destination + index + 8, value.val[2]);
-        vst1q_f32(destination + index + 12, value.val[3]);
-    }
-#elif defined(LFM_DETOK_SSE)
-    for (; index + 16 <= count; index += 16) {
-        _mm_storeu_ps(destination + index, _mm_loadu_ps(source + index));
-        _mm_storeu_ps(destination + index + 4,
-                      _mm_loadu_ps(source + index + 4));
-        _mm_storeu_ps(destination + index + 8,
-                      _mm_loadu_ps(source + index + 8));
-        _mm_storeu_ps(destination + index + 12,
-                      _mm_loadu_ps(source + index + 12));
-    }
-#endif
-    for (; index < count; ++index) destination[index] = source[index];
-}
-
-void add_values(float *destination, const float *source, size_t count) {
-    size_t index = 0;
-#if defined(LFM_DETOK_NEON)
-    for (; index + 4 <= count; index += 4)
-        vst1q_f32(destination + index,
-                  vaddq_f32(vld1q_f32(destination + index),
-                            vld1q_f32(source + index)));
-#elif defined(LFM_DETOK_SSE)
-    for (; index + 4 <= count; index += 4)
-        _mm_storeu_ps(destination + index,
-                      _mm_add_ps(_mm_loadu_ps(destination + index),
-                                 _mm_loadu_ps(source + index)));
-#endif
-    for (; index < count; ++index) destination[index] += source[index];
-}
-
 void rmsnorm(const float *input, size_t rows, size_t columns,
              const F32View &weight, float *output) {
     for (size_t row = 0; row < rows; ++row) {
-        const float *src = input + row * columns;
-        float *dst = output + row * columns;
-        float sum = 0.0f;
-        size_t column = 0;
-#if defined(LFM_DETOK_NEON)
-        float32x4_t acc0 = vdupq_n_f32(0.0f);
-        float32x4_t acc1 = vdupq_n_f32(0.0f);
-        for (; column + 8 <= columns; column += 8) {
-            const float32x4_t a = vld1q_f32(src + column);
-            const float32x4_t b = vld1q_f32(src + column + 4);
-            acc0 = vmlaq_f32(acc0, a, a);
-            acc1 = vmlaq_f32(acc1, b, b);
-        }
-        sum = sum4(vaddq_f32(acc0, acc1));
-#elif defined(LFM_DETOK_SSE)
-        __m128 acc0 = _mm_setzero_ps();
-        __m128 acc1 = _mm_setzero_ps();
-        for (; column + 8 <= columns; column += 8) {
-            const __m128 a = _mm_loadu_ps(src + column);
-            const __m128 b = _mm_loadu_ps(src + column + 4);
-            acc0 = _mm_add_ps(acc0, _mm_mul_ps(a, a));
-            acc1 = _mm_add_ps(acc1, _mm_mul_ps(b, b));
-        }
-        sum = sum4(_mm_add_ps(acc0, acc1));
-#endif
-        for (; column < columns; ++column) sum += src[column] * src[column];
-        const float scale = 1.0f / std::sqrt(sum / static_cast<float>(columns) +
-                                             kEpsilon);
-        column = 0;
-#if defined(LFM_DETOK_NEON)
-        const float32x4_t gain = vdupq_n_f32(scale);
-        for (; column + 4 <= columns; column += 4)
-            vst1q_f32(dst + column,
-                      vmulq_f32(vmulq_f32(vld1q_f32(src + column),
-                                         load4(weight, column)),
-                                gain));
-#elif defined(LFM_DETOK_SSE)
-        const __m128 gain = _mm_set1_ps(scale);
-        for (; column + 4 <= columns; column += 4)
-            _mm_storeu_ps(dst + column,
-                          _mm_mul_ps(_mm_mul_ps(_mm_loadu_ps(src + column),
-                                               load4(weight, column)),
-                                     gain));
-#endif
-        for (; column < columns; ++column)
-            dst[column] = src[column] * load_f32(weight, column) * scale;
+        const LfmDetokRmsArgs args = {
+            .input = input + row * columns,
+            .weight = weight.bytes,
+            .output = output + row * columns,
+            .columns = columns,
+            .epsilon = kEpsilon,
+            .reserved = 0,
+        };
+        lfm_detok_rms_f32(&args);
     }
 }
 
@@ -346,56 +214,8 @@ int swiglu(float *gate, const float *up, float *scratch, size_t count) {
     vDSP_vneg(gate, 1, scratch, 1, static_cast<vDSP_Length>(count));
     const int length = static_cast<int>(count);
     vvexpf(scratch, scratch, &length);
-    size_t index = 0;
-#if defined(LFM_DETOK_NEON)
-    const float32x4_t one = vdupq_n_f32(1.0f);
-    for (; index + 4 <= count; index += 4) {
-        const float32x4_t sigmoid =
-            vdivq_f32(one, vaddq_f32(one, vld1q_f32(scratch + index)));
-        vst1q_f32(gate + index,
-                  vmulq_f32(vmulq_f32(vld1q_f32(gate + index), sigmoid),
-                            vld1q_f32(up + index)));
-    }
-#elif defined(LFM_DETOK_SSE)
-    const __m128 one = _mm_set1_ps(1.0f);
-    for (; index + 4 <= count; index += 4) {
-        const __m128 sigmoid =
-            _mm_div_ps(one, _mm_add_ps(one, _mm_loadu_ps(scratch + index)));
-        _mm_storeu_ps(gate + index,
-                      _mm_mul_ps(_mm_mul_ps(_mm_loadu_ps(gate + index),
-                                           sigmoid),
-                                 _mm_loadu_ps(up + index)));
-    }
-#endif
-    for (; index < count; ++index)
-        gate[index] = gate[index] / (1.0f + scratch[index]) * up[index];
+    lfm_detok_swiglu_f32(gate, up, scratch, count);
     return 0;
-#endif
-}
-
-float dot32(const float *left, const float *right) {
-#if defined(LFM_DETOK_NEON)
-    float32x4_t a0 = vdupq_n_f32(0.0f);
-    float32x4_t a1 = vdupq_n_f32(0.0f);
-    for (size_t index = 0; index < kHead; index += 8) {
-        a0 = vmlaq_f32(a0, vld1q_f32(left + index),
-                       vld1q_f32(right + index));
-        a1 = vmlaq_f32(a1, vld1q_f32(left + index + 4),
-                       vld1q_f32(right + index + 4));
-    }
-    return sum4(vaddq_f32(a0, a1));
-#elif defined(LFM_DETOK_SSE)
-    __m128 a0 = _mm_setzero_ps();
-    __m128 a1 = _mm_setzero_ps();
-    for (size_t index = 0; index < kHead; index += 8) {
-        a0 = _mm_add_ps(a0, _mm_mul_ps(_mm_loadu_ps(left + index),
-                                       _mm_loadu_ps(right + index)));
-        a1 = _mm_add_ps(a1, _mm_mul_ps(_mm_loadu_ps(left + index + 4),
-                                       _mm_loadu_ps(right + index + 4)));
-    }
-    return sum4(_mm_add_ps(a0, a1));
-#else
-    return 0.0f;
 #endif
 }
 
@@ -405,52 +225,12 @@ int softmax(float *scores, size_t count) {
     (void)count;
     return -ENOTSUP;
 #else
-    float maximum = scores[0];
-    for (size_t index = 1; index < count; ++index)
-        maximum = std::max(maximum, scores[index]);
-    size_t index = 0;
-#if defined(LFM_DETOK_NEON)
-    const float32x4_t maxv = vdupq_n_f32(maximum);
-    for (; index + 4 <= count; index += 4)
-        vst1q_f32(scores + index,
-                  vsubq_f32(vld1q_f32(scores + index), maxv));
-#elif defined(LFM_DETOK_SSE)
-    const __m128 maxv = _mm_set1_ps(maximum);
-    for (; index + 4 <= count; index += 4)
-        _mm_storeu_ps(scores + index,
-                      _mm_sub_ps(_mm_loadu_ps(scores + index), maxv));
-#endif
-    for (; index < count; ++index) scores[index] -= maximum;
+    const float maximum = lfm_detok_max_f32(scores, count);
+    lfm_detok_subtract_f32(scores, count, maximum);
     const int length = static_cast<int>(count);
     vvexpf(scores, scores, &length);
-    float sum = 0.0f;
-    index = 0;
-#if defined(LFM_DETOK_NEON)
-    float32x4_t acc = vdupq_n_f32(0.0f);
-    for (; index + 4 <= count; index += 4)
-        acc = vaddq_f32(acc, vld1q_f32(scores + index));
-    sum = sum4(acc);
-#elif defined(LFM_DETOK_SSE)
-    __m128 acc = _mm_setzero_ps();
-    for (; index + 4 <= count; index += 4)
-        acc = _mm_add_ps(acc, _mm_loadu_ps(scores + index));
-    sum = sum4(acc);
-#endif
-    for (; index < count; ++index) sum += scores[index];
-    const float inverse = 1.0f / sum;
-    index = 0;
-#if defined(LFM_DETOK_NEON)
-    const float32x4_t inv = vdupq_n_f32(inverse);
-    for (; index + 4 <= count; index += 4)
-        vst1q_f32(scores + index,
-                  vmulq_f32(vld1q_f32(scores + index), inv));
-#elif defined(LFM_DETOK_SSE)
-    const __m128 inv = _mm_set1_ps(inverse);
-    for (; index + 4 <= count; index += 4)
-        _mm_storeu_ps(scores + index,
-                      _mm_mul_ps(_mm_loadu_ps(scores + index), inv));
-#endif
-    for (; index < count; ++index) scores[index] *= inverse;
+    const float sum = lfm_detok_sum_f32(scores, count);
+    lfm_detok_normalize_f32(scores, count, sum);
     return 0;
 #endif
 }
@@ -460,29 +240,7 @@ int rope_angles(const LfmAudioDetokenizerPlan *plan, uint64_t position,
 
 void apply_rope(float *values, const float cosine[kHead / 2],
                 const float sine[kHead / 2]) {
-#if defined(LFM_DETOK_NEON)
-    for (size_t index = 0; index < kHead / 2; index += 4) {
-        const float32x4_t a = vld1q_f32(values + index);
-        const float32x4_t b = vld1q_f32(values + kHead / 2 + index);
-        const float32x4_t c = vld1q_f32(cosine + index);
-        const float32x4_t s = vld1q_f32(sine + index);
-        vst1q_f32(values + index,
-                  vsubq_f32(vmulq_f32(a, c), vmulq_f32(b, s)));
-        vst1q_f32(values + kHead / 2 + index,
-                  vaddq_f32(vmulq_f32(b, c), vmulq_f32(a, s)));
-    }
-#elif defined(LFM_DETOK_SSE)
-    for (size_t index = 0; index < kHead / 2; index += 4) {
-        const __m128 a = _mm_loadu_ps(values + index);
-        const __m128 b = _mm_loadu_ps(values + kHead / 2 + index);
-        const __m128 c = _mm_load_ps(cosine + index);
-        const __m128 s = _mm_load_ps(sine + index);
-        _mm_storeu_ps(values + index,
-                      _mm_sub_ps(_mm_mul_ps(a, c), _mm_mul_ps(b, s)));
-        _mm_storeu_ps(values + kHead / 2 + index,
-                      _mm_add_ps(_mm_mul_ps(b, c), _mm_mul_ps(a, s)));
-    }
-#endif
+    lfm_detok_rope_f32(values, cosine, sine);
 }
 
 } // namespace
@@ -517,14 +275,16 @@ struct LfmAudioDetokenizerState {
     float *wide2 = nullptr;
     float *terminal = nullptr;
     float *spectral = nullptr;
-    float *ifft = nullptr;
     float *ola = nullptr;
     float *envelope = nullptr;
+    alignas(64) std::array<float, kRows * (kHead / 2)> rope_cosine{};
+    alignas(64) std::array<float, kRows * (kHead / 2)> rope_sine{};
     uint64_t position = 0;
     uint64_t frames = 0;
     uint64_t emitted_raw = kPad;
     bool prefix_cleared = false;
     bool flushed = false;
+    bool active = false;
 };
 
 namespace {
@@ -539,9 +299,8 @@ int rope_angles(const LfmAudioDetokenizerPlan *plan, uint64_t position,
     return -ENOTSUP;
 #else
     alignas(64) float angles[kHead / 2];
-    for (size_t index = 0; index < kHead / 2; ++index)
-        angles[index] =
-            static_cast<float>(position) * plan->rope_inverse[index];
+    lfm_detok_rope_angles_f32(plan->rope_inverse.data(), angles, kHead / 2,
+                              position);
     const int length = static_cast<int>(kHead / 2);
     vvsincosf(sine, cosine, angles, &length);
     return 0;
@@ -554,239 +313,197 @@ float *carve(float **cursor, size_t count) {
     return result;
 }
 
-int run_mlp(LfmAudioDetokenizerState *state, const LayerPlan &layer) {
-    rmsnorm(state->x, kRows, kHidden, layer.ffn_norm, state->norm);
-    linear(state->norm, kRows, layer.w1, state->wide0);
-    linear(state->norm, kRows, layer.w3, state->wide1);
-    int status = swiglu(state->wide0, state->wide1, state->wide2,
-                        kRows * kFfn);
-    if (status != 0) return status;
-    linear(state->wide0, kRows, layer.w2, state->terminal);
-    add_values(state->x, state->terminal, kRows * kHidden);
-    return 0;
+void lane_bounds(size_t count, uint32_t lane, uint32_t lanes, size_t *first,
+                 size_t *last) {
+    *first = count * lane / lanes;
+    *last = count * (lane + 1) / lanes;
 }
 
-void gathered_taps(const F32View &weight, size_t channel, float values[3]) {
-    values[0] = load_f32(weight, channel * 3);
-    values[1] = load_f32(weight, channel * 3 + 1);
-    values[2] = load_f32(weight, channel * 3 + 2);
+void vector_lane_bounds(size_t count, uint32_t lane, uint32_t lanes,
+                        size_t width, size_t *first, size_t *last) {
+    size_t first_vector = 0;
+    size_t last_vector = 0;
+    lane_bounds(count / width, lane, lanes, &first_vector, &last_vector);
+    *first = first_vector * width;
+    *last = last_vector * width;
+    if (lane + 1 == lanes) *last = count;
 }
 
-int run_conv(LfmAudioDetokenizerState *state, const LayerPlan &layer) {
-    rmsnorm(state->x, kRows, kHidden, layer.operator_norm, state->norm);
-    linear(state->norm, kRows, layer.in_proj, state->wide2);
-    float *carry = state->conv + layer.state_index * kConvWidth * kHidden;
-    for (size_t row = 0; row < kRows; ++row) {
-        const float *projected = state->wide2 + row * 3 * kHidden;
-        const float *gate = projected;
-        const float *coefficient = projected + kHidden;
-        const float *value = projected + 2 * kHidden;
-        float *output = state->norm + row * kHidden;
-        size_t channel = 0;
-#if defined(LFM_DETOK_NEON)
-        for (; channel + 4 <= kHidden; channel += 4) {
-            const float32x4_t bx =
-                vmulq_f32(vld1q_f32(gate + channel),
-                           vld1q_f32(value + channel));
-            const float32x4_t s0 =
-                vld1q_f32(carry + 1 * kHidden + channel);
-            const float32x4_t s1 =
-                vld1q_f32(carry + 2 * kHidden + channel);
-            float taps[3][4];
-            for (size_t lane = 0; lane < 4; ++lane)
-                gathered_taps(layer.conv, channel + lane, taps[lane]);
-            const float32x4_t w0 = {taps[0][0], taps[1][0], taps[2][0],
-                                    taps[3][0]};
-            const float32x4_t w1 = {taps[0][1], taps[1][1], taps[2][1],
-                                    taps[3][1]};
-            const float32x4_t w2 = {taps[0][2], taps[1][2], taps[2][2],
-                                    taps[3][2]};
-            const float32x4_t convolved =
-                vmlaq_f32(vmlaq_f32(vmulq_f32(s0, w0), s1, w1), bx, w2);
-            vst1q_f32(output + channel,
-                      vmulq_f32(vld1q_f32(coefficient + channel), convolved));
-            vst1q_f32(carry + 0 * kHidden + channel, s0);
-            vst1q_f32(carry + 1 * kHidden + channel, s1);
-            vst1q_f32(carry + 2 * kHidden + channel, bx);
-        }
-#elif defined(LFM_DETOK_SSE)
-        for (; channel + 4 <= kHidden; channel += 4) {
-            const __m128 bx = _mm_mul_ps(_mm_loadu_ps(gate + channel),
-                                         _mm_loadu_ps(value + channel));
-            const __m128 s0 = _mm_loadu_ps(carry + kHidden + channel);
-            const __m128 s1 = _mm_loadu_ps(carry + 2 * kHidden + channel);
-            float taps[4][3];
-            for (size_t lane = 0; lane < 4; ++lane)
-                gathered_taps(layer.conv, channel + lane, taps[lane]);
-            const __m128 w0 = _mm_setr_ps(taps[0][0], taps[1][0], taps[2][0],
-                                          taps[3][0]);
-            const __m128 w1 = _mm_setr_ps(taps[0][1], taps[1][1], taps[2][1],
-                                          taps[3][1]);
-            const __m128 w2 = _mm_setr_ps(taps[0][2], taps[1][2], taps[2][2],
-                                          taps[3][2]);
-            const __m128 convolved =
-                _mm_add_ps(_mm_add_ps(_mm_mul_ps(s0, w0), _mm_mul_ps(s1, w1)),
-                           _mm_mul_ps(bx, w2));
-            _mm_storeu_ps(output + channel,
-                          _mm_mul_ps(_mm_loadu_ps(coefficient + channel),
-                                     convolved));
-            _mm_storeu_ps(carry + channel, s0);
-            _mm_storeu_ps(carry + kHidden + channel, s1);
-            _mm_storeu_ps(carry + 2 * kHidden + channel, bx);
-        }
-#endif
-        for (; channel < kHidden; ++channel) {
-            const float bx = gate[channel] * value[channel];
-            const float s0 = carry[kHidden + channel];
-            const float s1 = carry[2 * kHidden + channel];
-            float taps[3];
-            gathered_taps(layer.conv, channel, taps);
-            output[channel] = coefficient[channel] *
-                              (s0 * taps[0] + s1 * taps[1] + bx * taps[2]);
-            carry[channel] = s0;
-            carry[kHidden + channel] = s1;
-            carry[2 * kHidden + channel] = bx;
-        }
+void embed_codes_lane(LfmAudioDetokenizerState *state,
+                      const uint32_t codes[kCodebooks], uint32_t lane,
+                      uint32_t lanes) {
+    size_t first = 0;
+    size_t last = 0;
+    vector_lane_bounds(kHidden, lane, lanes, 4, &first, &last);
+    LfmDetokEmbedArgs args{};
+    for (size_t codebook = 0; codebook < kCodebooks; ++codebook) {
+        const uint64_t row = codebook * kCodeValues + codes[codebook];
+        args.rows[codebook] =
+            state->plan->embedding.bytes +
+            (row * kHidden + first) * sizeof(float);
     }
-    linear(state->norm, kRows, layer.out_proj, state->terminal);
-    add_values(state->x, state->terminal, kRows * kHidden);
-    return run_mlp(state, layer);
+    args.output = state->x + first;
+    args.count = last - first;
+    lfm_detok_embed_f32(&args);
 }
 
-int run_attention(LfmAudioDetokenizerState *state, const LayerPlan &layer) {
-    rmsnorm(state->x, kRows, kHidden, layer.operator_norm, state->norm);
+void rmsnorm_rows_lane(const float *input, size_t rows, size_t columns,
+                       const F32View &weight, float *output, uint32_t lane,
+                       uint32_t lanes) {
+    size_t first = 0;
+    size_t last = 0;
+    lane_bounds(rows, lane, lanes, &first, &last);
+    if (first == last) return;
+    rmsnorm(input + first * columns, last - first, columns, weight,
+            output + first * columns);
+}
+
+void residual_norm_rows_lane(float *destination, const float *residual,
+                             size_t rows, size_t columns,
+                             const F32View &weight, float *normalized,
+                             uint32_t lane, uint32_t lanes) {
+    size_t first = 0;
+    size_t last = 0;
+    lane_bounds(rows, lane, lanes, &first, &last);
+    for (size_t row = first; row < last; ++row) {
+        float *value = destination + row * columns;
+        lfm_detok_add_f32(value, residual + row * columns, columns);
+        rmsnorm(value, 1, columns, weight, normalized + row * columns);
+    }
+}
+
+int swiglu_lane(float *gate, const float *up, float *scratch, size_t count,
+                uint32_t lane, uint32_t lanes) {
+    size_t first = 0;
+    size_t last = 0;
+    vector_lane_bounds(count, lane, lanes, 4, &first, &last);
+    return swiglu(gate + first, up + first, scratch + first, last - first);
+}
+
+void conv_mix_lane(LfmAudioDetokenizerState *state, const LayerPlan &layer,
+                   uint32_t lane, uint32_t lanes) {
+    float *carry = state->conv + layer.state_index * kConvWidth * kHidden;
+    size_t first = 0;
+    size_t last = 0;
+    vector_lane_bounds(kHidden, lane, lanes, 4, &first, &last);
+    for (size_t row = 0; row < kRows; ++row) {
+        const LfmDetokConvArgs args = {
+            .projected = state->wide2 + row * 3 * kHidden + first,
+            .carry = carry + first,
+            .weight = layer.conv.bytes + first * 3 * sizeof(float),
+            .output = state->norm + row * kHidden + first,
+            .count = last - first,
+        };
+        lfm_detok_conv_f32(&args);
+    }
+}
+
+int prepare_attention(LfmAudioDetokenizerState *state,
+                      const LayerPlan &layer) {
     linear(state->norm, kRows, layer.q_proj, state->wide0);
     linear(state->norm, kRows, layer.k_proj, state->wide1);
     linear(state->norm, kRows, layer.v_proj, state->wide2);
+    for (size_t row = 0; row < kRows; ++row) {
+        const int status = rope_angles(
+            state->plan, state->position + row,
+            state->rope_cosine.data() + row * (kHead / 2),
+            state->rope_sine.data() + row * (kHead / 2));
+        if (status != 0) return status;
+    }
+    return 0;
+}
+
+int attention_mix_lane(LfmAudioDetokenizerState *state,
+                       const LayerPlan &layer, uint32_t lane,
+                       uint32_t lanes) {
     float *keys = state->keys + layer.state_index * kWindow * kKvHeads * kHead;
     float *values =
         state->values + layer.state_index * kWindow * kKvHeads * kHead;
+    size_t first_head = 0;
+    size_t last_head = 0;
+    lane_bounds(kKvHeads, lane, lanes, &first_head, &last_head);
     for (size_t row = 0; row < kRows; ++row) {
         const uint64_t absolute = state->position + row;
         float *query = state->wide0 + row * kHidden;
         float *key = state->wide1 + row * kKvHeads * kHead;
         float *value = state->wide2 + row * kKvHeads * kHead;
-        rmsnorm(query, kHeads, kHead, layer.q_norm, query);
-        rmsnorm(key, kKvHeads, kHead, layer.k_norm, key);
-        alignas(64) float cosine[kHead / 2];
-        alignas(64) float sine[kHead / 2];
-        const int angle_status =
-            rope_angles(state->plan, absolute, cosine, sine);
-        if (angle_status != 0) return angle_status;
-        for (size_t head = 0; head < kHeads; ++head)
-            apply_rope(query + head * kHead, cosine, sine);
-        for (size_t head = 0; head < kKvHeads; ++head)
-            apply_rope(key + head * kHead, cosine, sine);
+        const float *cosine =
+            state->rope_cosine.data() + row * (kHead / 2);
+        const float *sine = state->rope_sine.data() + row * (kHead / 2);
         const size_t ring = static_cast<size_t>(absolute % kWindow);
-        copy_values(key, keys + ring * kKvHeads * kHead, kKvHeads * kHead);
-        copy_values(value, values + ring * kKvHeads * kHead, kKvHeads * kHead);
         const size_t count = static_cast<size_t>(std::min<uint64_t>(
             kWindow, absolute + 1));
         const uint64_t first = absolute + 1 - count;
-        for (size_t head = 0; head < kHeads; ++head) {
-            alignas(64) float score[kWindow];
-            const float *q = query + head * kHead;
-            const size_t kv_head = head / (kHeads / kKvHeads);
-            for (size_t item = 0; item < count; ++item) {
-                const size_t source =
-                    static_cast<size_t>((first + item) % kWindow);
-                score[item] =
-                    dot32(q, keys + (source * kKvHeads + kv_head) * kHead) *
-                    kAttentionScale;
+        for (size_t kv_head = first_head; kv_head < last_head; ++kv_head) {
+            float *key_head = key + kv_head * kHead;
+            float *value_head = value + kv_head * kHead;
+            rmsnorm(key_head, 1, kHead, layer.k_norm, key_head);
+            apply_rope(key_head, cosine, sine);
+            lfm_detok_copy_f32(
+                key_head, keys + (ring * kKvHeads + kv_head) * kHead, kHead);
+            lfm_detok_copy_f32(
+                value_head, values + (ring * kKvHeads + kv_head) * kHead,
+                kHead);
+            const size_t q_first = kv_head * (kHeads / kKvHeads);
+            const size_t q_last = q_first + (kHeads / kKvHeads);
+            for (size_t head = q_first; head < q_last; ++head) {
+                alignas(64) float score[kWindow];
+                float *q = query + head * kHead;
+                rmsnorm(q, 1, kHead, layer.q_norm, q);
+                apply_rope(q, cosine, sine);
+                for (size_t item = 0; item < count; ++item) {
+                    const size_t source =
+                        static_cast<size_t>((first + item) % kWindow);
+                    score[item] = lfm_detok_dot32_scaled_f32(
+                        q, keys + (source * kKvHeads + kv_head) * kHead,
+                        kAttentionScale);
+                }
+                const int status = softmax(score, count);
+                if (status != 0) return status;
+                float *destination =
+                    state->norm + row * kHidden + head * kHead;
+                const LfmDetokWeightedArgs args = {
+                    .values = values,
+                    .scores = score,
+                    .output = destination,
+                    .ring_first = first % kWindow,
+                    .count = count,
+                    .kv_head = kv_head,
+                };
+                lfm_detok_weighted_f32(&args);
             }
-            const int status = softmax(score, count);
-            if (status != 0) return status;
-            float *destination = state->norm + row * kHidden + head * kHead;
-#if defined(LFM_DETOK_NEON)
-            std::array<float32x4_t, kHead / 4> acc{};
-            for (auto &value_acc : acc) value_acc = vdupq_n_f32(0.0f);
-            for (size_t item = 0; item < count; ++item) {
-                const size_t source =
-                    static_cast<size_t>((first + item) % kWindow);
-                const float *v =
-                    values + (source * kKvHeads + kv_head) * kHead;
-                for (size_t lane = 0; lane < acc.size(); ++lane)
-                    acc[lane] = vmlaq_n_f32(acc[lane],
-                                            vld1q_f32(v + lane * 4), score[item]);
-            }
-            for (size_t lane = 0; lane < acc.size(); ++lane)
-                vst1q_f32(destination + lane * 4, acc[lane]);
-#elif defined(LFM_DETOK_SSE)
-            std::array<__m128, kHead / 4> acc{};
-            for (auto &value_acc : acc) value_acc = _mm_setzero_ps();
-            for (size_t item = 0; item < count; ++item) {
-                const size_t source =
-                    static_cast<size_t>((first + item) % kWindow);
-                const float *v =
-                    values + (source * kKvHeads + kv_head) * kHead;
-                const __m128 scale = _mm_set1_ps(score[item]);
-                for (size_t lane = 0; lane < acc.size(); ++lane)
-                    acc[lane] = _mm_add_ps(
-                        acc[lane], _mm_mul_ps(_mm_loadu_ps(v + lane * 4), scale));
-            }
-            for (size_t lane = 0; lane < acc.size(); ++lane)
-                _mm_storeu_ps(destination + lane * 4, acc[lane]);
-#endif
         }
     }
-    linear(state->norm, kRows, layer.out_proj, state->terminal);
-    add_values(state->x, state->terminal, kRows * kHidden);
-    return run_mlp(state, layer);
+    return 0;
 }
 
-void embed_codes(LfmAudioDetokenizerState *state,
-                 const uint32_t codes[kCodebooks]) {
-    alignas(64) float fused[kHidden];
-    for (size_t column = 0; column < kHidden; column += 4) {
-#if defined(LFM_DETOK_NEON)
-        float32x4_t sum = vdupq_n_f32(0.0f);
-        for (size_t codebook = 0; codebook < kCodebooks; ++codebook) {
-            const uint64_t row = codebook * kCodeValues + codes[codebook];
-            sum = vaddq_f32(sum,
-                            load4(state->plan->embedding, row * kHidden + column));
-        }
-        vst1q_f32(fused + column, vmulq_n_f32(sum, 1.0f / kCodebooks));
-#elif defined(LFM_DETOK_SSE)
-        __m128 sum = _mm_setzero_ps();
-        for (size_t codebook = 0; codebook < kCodebooks; ++codebook) {
-            const uint64_t row = codebook * kCodeValues + codes[codebook];
-            sum = _mm_add_ps(
-                sum, load4(state->plan->embedding, row * kHidden + column));
-        }
-        _mm_store_ps(fused + column,
-                     _mm_mul_ps(sum, _mm_set1_ps(1.0f / kCodebooks)));
-#endif
-    }
-    for (size_t row = 0; row < kRows; ++row)
-        copy_values(fused, state->x + row * kHidden, kHidden);
-}
-
-int polar_spectrum(LfmAudioDetokenizerState *state) {
+int project_polar(LfmAudioDetokenizerState *state) {
 #ifndef __APPLE__
     (void)state;
     return -ENOTSUP;
 #else
     const size_t count = kRows * kBins;
-    float *magnitude = state->wide2;
-    float *sine = state->wide2 + count;
-    float *cosine = state->wide0;
-    float *angles = state->wide1;
+    float *sine = state->wide2;
+    float *cosine = state->wide2 + count;
+    linear(state->norm, kRows, state->plan->projection, state->spectral);
+    const float *bias = f32_pointer(state->plan->bias);
     for (size_t row = 0; row < kRows; ++row) {
-        copy_values(state->spectral + row * kProjection,
-                    magnitude + row * kBins, kBins);
-        copy_values(state->spectral + row * kProjection + kBins,
-                    angles + row * kBins, kBins);
-    }
-    const int length = static_cast<int>(count);
-    vvexpf(magnitude, magnitude, &length);
-    vvsincosf(sine, cosine, angles, &length);
-    for (size_t index = 0; index < count; ++index) {
-        const float scale = magnitude[index];
-        const size_t row = index / kBins;
-        const size_t bin = index % kBins;
-        state->spectral[row * kProjection + bin] = scale * cosine[index];
-        state->spectral[row * kProjection + kBins + bin] =
-            scale * sine[index];
+        float *magnitude = state->spectral + row * kProjection;
+        float *phase = magnitude + kBins;
+        lfm_detok_add_f32(magnitude, bias, kBins);
+        lfm_detok_add_f32(phase, bias + kBins, kBins);
+        const int length = static_cast<int>(kBins);
+        vvexpf(magnitude, magnitude, &length);
+        vvsincosf(sine + row * kBins, cosine + row * kBins, phase, &length);
+        const LfmDetokPolarArgs args = {
+            .magnitude = magnitude,
+            .sine = sine + row * kBins,
+            .cosine = cosine + row * kBins,
+            .real = magnitude,
+            .imaginary = phase,
+            .count = kBins,
+        };
+        lfm_detok_polar_f32(&args);
     }
     return 0;
 #endif
@@ -804,102 +521,81 @@ void clear_ring(LfmAudioDetokenizerState *state, uint64_t first,
     }
 }
 
-void overlap_add(LfmAudioDetokenizerState *state) {
+void overlap_segment_lane(LfmAudioDetokenizerState *state, size_t row,
+                          size_t done, size_t offset, size_t count,
+                          uint32_t lane, uint32_t lanes) {
+    size_t lane_first = 0;
+    size_t lane_last = 0;
+    vector_lane_bounds(kRing, lane, lanes, 4, &lane_first, &lane_last);
+    const size_t first = std::max(offset, lane_first);
+    const size_t last = std::min(offset + count, lane_last);
+    if (first >= last) return;
+    const size_t source = done + first - offset;
+    const LfmDetokOverlapArgs args = {
+        .signal = state->wide2 + row * kFft + source,
+        .window = state->plan->window.bytes + source * sizeof(float),
+        .output = state->ola + first,
+        .envelope = state->envelope + first,
+        .count = last - first,
+    };
+    lfm_detok_overlap_f32(&args);
+}
+
+void overlap_add_lane(LfmAudioDetokenizerState *state, uint32_t lane,
+                      uint32_t lanes) {
     for (size_t row = 0; row < kRows; ++row) {
-        const uint64_t start = state->frames * kHop;
+        const uint64_t start = (state->frames + row) * kHop;
         size_t done = 0;
         while (done < kFft) {
             const size_t offset = static_cast<size_t>((start + done) % kRing);
             const size_t count = std::min(kFft - done, kRing - offset);
-            size_t index = 0;
-#if defined(LFM_DETOK_NEON)
-            for (; index + 4 <= count; index += 4) {
-                const float32x4_t window =
-                    load4(state->plan->window, done + index);
-                const float32x4_t signal =
-                    vld1q_f32(state->ifft + row * kFft + done + index);
-                vst1q_f32(state->ola + offset + index,
-                          vmlaq_f32(vld1q_f32(state->ola + offset + index),
-                                    signal, window));
-                vst1q_f32(
-                    state->envelope + offset + index,
-                    vmlaq_f32(vld1q_f32(state->envelope + offset + index),
-                              window, window));
-            }
-#elif defined(LFM_DETOK_SSE)
-            for (; index + 4 <= count; index += 4) {
-                const __m128 window = load4(state->plan->window, done + index);
-                const __m128 signal =
-                    _mm_loadu_ps(state->ifft + row * kFft + done + index);
-                _mm_storeu_ps(
-                    state->ola + offset + index,
-                    _mm_add_ps(_mm_loadu_ps(state->ola + offset + index),
-                               _mm_mul_ps(signal, window)));
-                _mm_storeu_ps(
-                    state->envelope + offset + index,
-                    _mm_add_ps(_mm_loadu_ps(state->envelope + offset + index),
-                               _mm_mul_ps(window, window)));
-            }
-#endif
-            for (; index < count; ++index) {
-                const float window = load_f32(state->plan->window, done + index);
-                state->ola[offset + index] +=
-                    state->ifft[row * kFft + done + index] * window;
-                state->envelope[offset + index] += window * window;
-            }
+            overlap_segment_lane(state, row, done, offset, count, lane, lanes);
             done += count;
         }
-        ++state->frames;
     }
 }
 
-int emit_range(LfmAudioDetokenizerState *state, uint64_t end, float *pcm,
-               size_t capacity, size_t *out_samples) {
-    if (end < state->emitted_raw || end - state->emitted_raw > capacity) {
-        return -ENOSPC;
-    }
+int emit_segment_owned_lane(LfmAudioDetokenizerState *state, float *pcm,
+                            size_t written, size_t offset, size_t count,
+                            uint32_t lane, uint32_t lanes) {
+    size_t lane_first = 0;
+    size_t lane_last = 0;
+    vector_lane_bounds(kRing, lane, lanes, 4, &lane_first, &lane_last);
+    const size_t first = std::max(offset, lane_first);
+    const size_t last = std::min(offset + count, lane_last);
+    if (first >= last) return 0;
+    const size_t destination = written + first - offset;
+    const size_t owned = last - first;
+    const LfmDetokEmitArgs args = {
+        .output = state->ola + first,
+        .envelope = state->envelope + first,
+        .pcm = pcm + destination,
+        .count = owned,
+        .epsilon = 1.0e-11f,
+        .reserved = 0,
+    };
+    const int status = lfm_detok_emit_f32(&args);
+    if (status != 0) return status;
+    std::memset(state->ola + first, 0, owned * sizeof(float));
+    std::memset(state->envelope + first, 0, owned * sizeof(float));
+    return 0;
+}
+
+int emit_range_owned_lane(LfmAudioDetokenizerState *state, uint64_t end,
+                          float *pcm, uint32_t lane, uint32_t lanes) {
     const size_t total = static_cast<size_t>(end - state->emitted_raw);
     uint64_t cursor = state->emitted_raw;
     size_t written = 0;
-    while (cursor < end) {
+    while (written < total) {
         const size_t offset = static_cast<size_t>(cursor % kRing);
         const size_t count = static_cast<size_t>(
-            std::min<uint64_t>(end - cursor, kRing - offset));
-        size_t index = 0;
-#if defined(LFM_DETOK_NEON)
-        for (; index + 4 <= count; index += 4) {
-            const float32x4_t envelope =
-                vld1q_f32(state->envelope + offset + index);
-            if (vminvq_f32(envelope) <= 1.0e-11f) return -ERANGE;
-            vst1q_f32(pcm + written + index,
-                      vdivq_f32(vld1q_f32(state->ola + offset + index),
-                                envelope));
-        }
-#elif defined(LFM_DETOK_SSE)
-        for (; index + 4 <= count; index += 4) {
-            const __m128 envelope =
-                _mm_loadu_ps(state->envelope + offset + index);
-            alignas(16) float check[4];
-            _mm_store_ps(check, envelope);
-            if (*std::min_element(check, check + 4) <= 1.0e-11f)
-                return -ERANGE;
-            _mm_storeu_ps(pcm + written + index,
-                          _mm_div_ps(_mm_loadu_ps(state->ola + offset + index),
-                                     envelope));
-        }
-#endif
-        for (; index < count; ++index) {
-            const float envelope = state->envelope[offset + index];
-            if (envelope <= 1.0e-11f) return -ERANGE;
-            pcm[written + index] = state->ola[offset + index] / envelope;
-        }
-        std::memset(state->ola + offset, 0, count * sizeof(float));
-        std::memset(state->envelope + offset, 0, count * sizeof(float));
+            std::min<uint64_t>(total - written, kRing - offset));
+        const int status = emit_segment_owned_lane(
+            state, pcm, written, offset, count, lane, lanes);
+        if (status != 0) return status;
         cursor += count;
         written += count;
     }
-    state->emitted_raw = end;
-    *out_samples = total;
     return 0;
 }
 
@@ -910,7 +606,7 @@ extern "C" int lfm_detokenizer_plan_new_from_image(
     size_t error_length) {
     if (!out || !image) return -EINVAL;
     *out = nullptr;
-#if !defined(LFM_DETOK_NEON) && !defined(LFM_DETOK_SSE)
+#if !defined(LFM_DETOK_ASM)
     set_error(error, error_length,
               "detokenizer: no supported architecture vector ISA");
     return -ENOTSUP;
@@ -1027,24 +723,17 @@ extern "C" int lfm_detokenizer_plan_new_from_image(
         delete plan;
         return -ENOMEM;
     }
-    std::memset(plan->ifft_basis, 0, basis_bytes);
-    for (size_t index = 0; index < plan->rope_inverse.size(); ++index) {
-        plan->rope_inverse[index] =
-            std::pow(kTheta, -static_cast<float>(2 * index) /
-                                 static_cast<float>(kHead));
-    }
-    const double scale = 1.0 / static_cast<double>(kFft);
-    for (size_t bin = 0; bin < kBins; ++bin) {
-        for (size_t sample = 0; sample < kFft; ++sample) {
-            const double phase = 2.0 * std::acos(-1.0) *
-                                 static_cast<double>(bin * sample) /
-                                 static_cast<double>(kFft);
-            const double edge = bin == 0 || bin == kFft / 2 ? 1.0 : 2.0;
-            plan->ifft_basis[bin * kFft + sample] =
-                static_cast<float>(edge * std::cos(phase) * scale);
-            plan->ifft_basis[(kBins + bin) * kFft + sample] =
-                static_cast<float>(-edge * std::sin(phase) * scale);
-        }
+    status = lfm_detok_rope_inverse_f32(plan->rope_inverse.data(),
+                                        plan->rope_inverse.size(), kTheta,
+                                        kHead);
+    if (status == 0)
+        status = lfm_detok_ifft_basis_f32(plan->ifft_basis, kBins, kFft);
+    if (status != 0) {
+        set_error(error, error_length,
+                  "detokenizer: assembly table construction failed");
+        std::free(plan->ifft_basis);
+        delete plan;
+        return status;
     }
     plan->ifft_basis_bytes = basis_bytes;
     plan->bound_bytes = bound;
@@ -1092,9 +781,8 @@ extern "C" int lfm_detokenizer_state_new(
     constexpr size_t p4 = kRows * kFfn;
     constexpr size_t p5 = kRows * kHidden;
     constexpr size_t p6 = kRows * kProjection;
-    constexpr size_t p7 = kRows * kProjection;
     constexpr size_t total = conv + kv + kv + p0 + p1 + p2 + p3 + p4 + p5 +
-                             p6 + p7 + kRing + kRing;
+                             p6 + kRing + kRing;
     const size_t bytes = aligned_bytes(total * sizeof(float));
     state->memory = static_cast<float *>(std::aligned_alloc(kAlign, bytes));
     if (!state->memory) {
@@ -1116,7 +804,6 @@ extern "C" int lfm_detokenizer_state_new(
     state->wide2 = carve(&cursor, p4);
     state->terminal = carve(&cursor, p5);
     state->spectral = carve(&cursor, p6);
-    state->ifft = carve(&cursor, p7);
     state->ola = carve(&cursor, kRing);
     state->envelope = carve(&cursor, kRing);
     if (cursor > state->memory + total) {
@@ -1148,6 +835,7 @@ lfm_detokenizer_state_reset(LfmAudioDetokenizerState *state) {
     state->emitted_raw = kPad;
     state->prefix_cleared = false;
     state->flushed = false;
+    state->active = false;
 }
 
 extern "C" uint64_t lfm_detokenizer_state_bytes(
@@ -1155,50 +843,215 @@ extern "C" uint64_t lfm_detokenizer_state_bytes(
     return state ? sizeof(*state) + state->memory_bytes : 0;
 }
 
-extern "C" int lfm_detokenizer_state_step(
-    LfmAudioDetokenizerState *state,
+extern "C" int lfm_detokenizer_program_begin(
+    LfmAudioDetokenizerProgram *program, LfmAudioDetokenizerState *state,
     const uint32_t codes[LFM_DETOKENIZER_CODEBOOKS], float *pcm,
-    size_t pcm_capacity, size_t *out_samples) {
-    if (!state || !codes || !pcm || !out_samples || state->flushed)
+    size_t pcm_capacity, uint32_t flush) {
+    if (!program || !state || !pcm || state->flushed || state->active ||
+        flush > 1) {
         return -EINVAL;
-    *out_samples = 0;
-    for (size_t index = 0; index < kCodebooks; ++index)
-        if (codes[index] >= kCodeValues) return -ERANGE;
-    embed_codes(state, codes);
-    for (const LayerPlan &layer : state->plan->layers) {
-        const int status = layer.attention ? run_attention(state, layer)
-                                           : run_conv(state, layer);
-        if (status != 0) return status;
     }
-    rmsnorm(state->x, kRows, kHidden, state->plan->final_norm, state->norm);
-    linear(state->norm, kRows, state->plan->projection, state->spectral);
-    add_bias(state->spectral, kRows, kProjection, state->plan->bias);
-    int status = polar_spectrum(state);
-    if (status != 0) return status;
-    dense(state->spectral, kRows, kProjection, state->plan->ifft_basis, kFft,
-          state->ifft);
-    overlap_add(state);
-    state->position += kRows;
-    if (!state->prefix_cleared) {
-        clear_ring(state, 0, kPad);
-        state->prefix_cleared = true;
+    if (!flush && !codes) return -EINVAL;
+    LfmAudioDetokenizerProgram next{};
+    next.state = state;
+    next.pcm = pcm;
+    next.pcm_capacity = pcm_capacity;
+    next.phase = flush ? LFM_DETOKENIZER_PHASE_EMIT
+                       : LFM_DETOKENIZER_PHASE_EMBED;
+    next.flush = flush;
+    next.active = 1;
+    if (flush) {
+        if (state->frames >
+            (std::numeric_limits<uint64_t>::max() - kPad) / kHop) {
+            return -EOVERFLOW;
+        }
+        next.emit_end = state->frames * kHop + kPad;
+    } else {
+        if (state->frames >
+            (std::numeric_limits<uint64_t>::max() / kHop) - kRows) {
+            return -EOVERFLOW;
+        }
+        next.emit_end = (state->frames + kRows) * kHop;
+        for (size_t index = 0; index < kCodebooks; ++index) {
+            if (codes[index] >= kCodeValues) return -ERANGE;
+            next.codes[index] = codes[index];
+        }
     }
-    return emit_range(state, state->frames * kHop, pcm, pcm_capacity,
-                      out_samples);
+    if (next.emit_end < state->emitted_raw ||
+        next.emit_end - state->emitted_raw > pcm_capacity) {
+        return -ENOSPC;
+    }
+    state->active = true;
+    *program = next;
+    return 0;
 }
 
-extern "C" int lfm_detokenizer_state_flush(
-    LfmAudioDetokenizerState *state, float *pcm, size_t pcm_capacity,
-    size_t *out_samples) {
-    if (!state || !pcm || !out_samples || state->flushed)
+extern "C" int lfm_detokenizer_program_run(
+    LfmAudioDetokenizerProgram *program, uint32_t lane, uint32_t lanes) {
+    if (!program || !program->active || !program->state || lanes == 0 ||
+        lane >= lanes) {
         return -EINVAL;
-    *out_samples = 0;
-    if (state->frames == 0) {
-        state->flushed = true;
+    }
+    LfmAudioDetokenizerState *state = program->state;
+    if (!state->active || !state->plan) return -ESTALE;
+    if (program->phase >= LFM_DETOKENIZER_PHASE_DONE) return -EPROTO;
+    const LayerPlan *layer = program->layer < kLayers
+        ? &state->plan->layers[program->layer]
+        : nullptr;
+    switch (program->phase) {
+    case LFM_DETOKENIZER_PHASE_EMBED:
+        embed_codes_lane(state, program->codes, lane, lanes);
+        return 0;
+    case LFM_DETOKENIZER_PHASE_OPERATOR_NORM:
+        if (!layer) return -EPROTO;
+        rmsnorm_rows_lane(state->x, kRows, kHidden, layer->operator_norm,
+                          state->norm, lane, lanes);
+        return 0;
+    case LFM_DETOKENIZER_PHASE_OPERATOR_PROJECT:
+        if (!layer) return -EPROTO;
+        if (lane != 0) return 0;
+        if (layer->attention) return prepare_attention(state, *layer);
+        linear(state->norm, kRows, layer->in_proj, state->wide2);
+        return 0;
+    case LFM_DETOKENIZER_PHASE_OPERATOR_MIX:
+        if (!layer) return -EPROTO;
+        if (layer->attention)
+            return attention_mix_lane(state, *layer, lane, lanes);
+        conv_mix_lane(state, *layer, lane, lanes);
+        return 0;
+    case LFM_DETOKENIZER_PHASE_OPERATOR_OUT:
+        if (!layer) return -EPROTO;
+        if (lane == 0)
+            linear(state->norm, kRows, layer->out_proj, state->terminal);
+        return 0;
+    case LFM_DETOKENIZER_PHASE_OPERATOR_RESIDUAL_NORM:
+        if (!layer) return -EPROTO;
+        residual_norm_rows_lane(state->x, state->terminal, kRows, kHidden,
+                                layer->ffn_norm, state->norm, lane, lanes);
+        return 0;
+    case LFM_DETOKENIZER_PHASE_FFN_PROJECT:
+        if (!layer) return -EPROTO;
+        if (lane == 0) {
+            linear(state->norm, kRows, layer->w1, state->wide0);
+            linear(state->norm, kRows, layer->w3, state->wide1);
+        }
+        return 0;
+    case LFM_DETOKENIZER_PHASE_FFN_ACTIVATE:
+        return swiglu_lane(state->wide0, state->wide1, state->wide2,
+                           kRows * kFfn, lane, lanes);
+    case LFM_DETOKENIZER_PHASE_FFN_DOWN:
+        if (!layer) return -EPROTO;
+        if (lane == 0)
+            linear(state->wide0, kRows, layer->w2, state->terminal);
+        return 0;
+    case LFM_DETOKENIZER_PHASE_FFN_RESIDUAL_NORM: {
+        if (!layer) return -EPROTO;
+        const F32View &next_norm = program->layer + 1 < kLayers
+            ? state->plan->layers[program->layer + 1].operator_norm
+            : state->plan->final_norm;
+        residual_norm_rows_lane(state->x, state->terminal, kRows, kHidden,
+                                next_norm, state->norm, lane, lanes);
         return 0;
     }
-    const uint64_t end = state->frames * kHop + kPad;
-    const int status = emit_range(state, end, pcm, pcm_capacity, out_samples);
-    if (status == 0) state->flushed = true;
-    return status;
+    case LFM_DETOKENIZER_PHASE_FINAL_PROJECT:
+        return lane == 0 ? project_polar(state) : 0;
+    case LFM_DETOKENIZER_PHASE_IFFT:
+        if (lane == 0)
+            dense(state->spectral, kRows, kProjection,
+                  state->plan->ifft_basis, kFft, state->wide2);
+        return 0;
+    case LFM_DETOKENIZER_PHASE_OVERLAP_EMIT: {
+        overlap_add_lane(state, lane, lanes);
+        return emit_range_owned_lane(state, program->emit_end, program->pcm,
+                                     lane, lanes);
+    }
+    case LFM_DETOKENIZER_PHASE_EMIT:
+        return emit_range_owned_lane(state, program->emit_end, program->pcm,
+                                     lane, lanes);
+    default:
+        return -EPROTO;
+    }
+}
+
+extern "C" int lfm_detokenizer_program_advance(
+    LfmAudioDetokenizerProgram *program) {
+    if (!program || !program->active || !program->state ||
+        !program->state->active) {
+        return -EINVAL;
+    }
+    LfmAudioDetokenizerState *state = program->state;
+    switch (program->phase) {
+    case LFM_DETOKENIZER_PHASE_EMBED:
+        program->phase = LFM_DETOKENIZER_PHASE_OPERATOR_NORM;
+        return 1;
+    case LFM_DETOKENIZER_PHASE_OPERATOR_NORM:
+        program->phase = LFM_DETOKENIZER_PHASE_OPERATOR_PROJECT;
+        return 1;
+    case LFM_DETOKENIZER_PHASE_OPERATOR_PROJECT:
+        program->phase = LFM_DETOKENIZER_PHASE_OPERATOR_MIX;
+        return 1;
+    case LFM_DETOKENIZER_PHASE_OPERATOR_MIX:
+        program->phase = LFM_DETOKENIZER_PHASE_OPERATOR_OUT;
+        return 1;
+    case LFM_DETOKENIZER_PHASE_OPERATOR_OUT:
+        program->phase = LFM_DETOKENIZER_PHASE_OPERATOR_RESIDUAL_NORM;
+        return 1;
+    case LFM_DETOKENIZER_PHASE_OPERATOR_RESIDUAL_NORM:
+        program->phase = LFM_DETOKENIZER_PHASE_FFN_PROJECT;
+        return 1;
+    case LFM_DETOKENIZER_PHASE_FFN_PROJECT:
+        program->phase = LFM_DETOKENIZER_PHASE_FFN_ACTIVATE;
+        return 1;
+    case LFM_DETOKENIZER_PHASE_FFN_ACTIVATE:
+        program->phase = LFM_DETOKENIZER_PHASE_FFN_DOWN;
+        return 1;
+    case LFM_DETOKENIZER_PHASE_FFN_DOWN:
+        program->phase = LFM_DETOKENIZER_PHASE_FFN_RESIDUAL_NORM;
+        return 1;
+    case LFM_DETOKENIZER_PHASE_FFN_RESIDUAL_NORM:
+        ++program->layer;
+        program->phase = program->layer < kLayers
+            ? LFM_DETOKENIZER_PHASE_OPERATOR_PROJECT
+            : LFM_DETOKENIZER_PHASE_FINAL_PROJECT;
+        return 1;
+    case LFM_DETOKENIZER_PHASE_FINAL_PROJECT:
+        program->phase = LFM_DETOKENIZER_PHASE_IFFT;
+        return 1;
+    case LFM_DETOKENIZER_PHASE_IFFT:
+        program->phase = LFM_DETOKENIZER_PHASE_OVERLAP_EMIT;
+        return 1;
+    case LFM_DETOKENIZER_PHASE_OVERLAP_EMIT:
+        state->frames += kRows;
+        state->position += kRows;
+        if (!state->prefix_cleared) {
+            clear_ring(state, 0, kPad);
+            state->prefix_cleared = true;
+        }
+        program->produced =
+            static_cast<size_t>(program->emit_end - state->emitted_raw);
+        state->emitted_raw = program->emit_end;
+        state->active = false;
+        program->active = 0;
+        program->phase = LFM_DETOKENIZER_PHASE_DONE;
+        return 0;
+    case LFM_DETOKENIZER_PHASE_EMIT:
+        program->produced =
+            static_cast<size_t>(program->emit_end - state->emitted_raw);
+        state->emitted_raw = program->emit_end;
+        if (program->flush) state->flushed = true;
+        state->active = false;
+        program->active = 0;
+        program->phase = LFM_DETOKENIZER_PHASE_DONE;
+        return 0;
+    default:
+        return -EPROTO;
+    }
+}
+
+extern "C" void lfm_detokenizer_program_cancel(
+    LfmAudioDetokenizerProgram *program) {
+    if (!program) return;
+    if (program->state && program->active) program->state->active = false;
+    program->active = 0;
+    program->phase = LFM_DETOKENIZER_PHASE_DONE;
 }

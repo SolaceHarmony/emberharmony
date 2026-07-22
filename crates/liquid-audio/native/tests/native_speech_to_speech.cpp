@@ -1,10 +1,14 @@
 #include "kcoro_stackless.h"
 #include "lfm_audio_dock.h"
+#include "lfm_detokenizer.h"
+#include "lfm_detokenizer_program.h"
 #include "lfm_runtime.h"
 #include "lfm_runtime_internal.h"
+#include "lfm_safetensors.h"
 #include "lfm_session.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <cmath>
@@ -15,6 +19,7 @@
 #include <cstring>
 #include <limits>
 #include <new>
+#include <string>
 
 #if defined(__APPLE__)
 #include <AudioUnit/AudioUnit.h>
@@ -47,6 +52,118 @@ constexpr uint32_t GATE_CONTINUATION_DONE = 1u << 0;
 constexpr uint32_t GATE_WATCHDOG_DONE = 1u << 1;
 constexpr uint32_t GATE_ALL_DONE =
     GATE_CONTINUATION_DONE | GATE_WATCHDOG_DONE;
+
+void copy_error(char *destination, size_t capacity, const char *source);
+
+int run_detokenizer_frame(LfmAudioDetokenizerState *state,
+                          const uint32_t *codes, uint32_t flush,
+                          uint32_t lanes, float *pcm, size_t capacity,
+                          size_t *samples) {
+    LfmAudioDetokenizerProgram program{};
+    int status = lfm_detokenizer_program_begin(
+        &program, state, codes, pcm, capacity, flush);
+    size_t transitions = 0;
+    while (status == 0 && program.active) {
+        if (++transitions > 256) {
+            status = -ELOOP;
+            break;
+        }
+        for (uint32_t lane = 0; lane < lanes && status == 0; ++lane)
+            status = lfm_detokenizer_program_run(&program, lane, lanes);
+        if (status == 0) status = lfm_detokenizer_program_advance(&program);
+        if (status > 0) status = 0;
+    }
+    if (status != 0) {
+        lfm_detokenizer_program_cancel(&program);
+        return status;
+    }
+    *samples = program.produced;
+    return 0;
+}
+
+int verify_detokenizer_lane_invariance(const char *model_path, char *error,
+                                       size_t error_length) {
+    const std::string detokenizer =
+        std::string(model_path) + "/audio_detokenizer";
+    LfmWeightImage *image = nullptr;
+    LfmAudioDetokenizerPlan *plan = nullptr;
+    LfmAudioDetokenizerState *three = nullptr;
+    LfmAudioDetokenizerState *eight = nullptr;
+    int status = lfm_weights_open_bundle(
+        model_path, detokenizer.c_str(), &image, error, error_length);
+    if (status == 0)
+        status = lfm_detokenizer_plan_new_from_image(
+            &plan, image, error, error_length);
+    if (status == 0)
+        status = lfm_detokenizer_state_new(
+            &three, plan, error, error_length);
+    if (status == 0)
+        status = lfm_detokenizer_state_new(
+            &eight, plan, error, error_length);
+    std::array<float, LFM_DETOKENIZER_MAX_STEP_SAMPLES> three_pcm{};
+    std::array<float, LFM_DETOKENIZER_MAX_STEP_SAMPLES> eight_pcm{};
+    for (uint32_t frame = 0; frame < 3 && status == 0; ++frame) {
+        uint32_t codes[LFM_DETOKENIZER_CODEBOOKS]{};
+        for (uint32_t codebook = 0;
+             codebook < LFM_DETOKENIZER_CODEBOOKS; ++codebook) {
+            codes[codebook] =
+                (17u + frame * 197u + codebook * 263u) %
+                LFM_DETOKENIZER_CODE_VALUES;
+        }
+        size_t three_samples = 0;
+        size_t eight_samples = 0;
+        status = run_detokenizer_frame(
+            three, codes, 0, 3, three_pcm.data(), three_pcm.size(),
+            &three_samples);
+        if (status == 0)
+            status = run_detokenizer_frame(
+                eight, codes, 0, 8, eight_pcm.data(), eight_pcm.size(),
+                &eight_samples);
+        if (status == 0 &&
+            (three_samples != eight_samples ||
+             std::memcmp(three_pcm.data(), eight_pcm.data(),
+                         three_samples * sizeof(float)) != 0)) {
+            status = LFM_STATUS_INTERNAL;
+            size_t sample = 0;
+            while (sample < std::min(three_samples, eight_samples) &&
+                   std::memcmp(three_pcm.data() + sample,
+                               eight_pcm.data() + sample, sizeof(float)) == 0) {
+                ++sample;
+            }
+            std::snprintf(
+                error, error_length,
+                "detokenizer output changed with fixed-team width at frame "
+                "%u sample %zu/%zu: 3-lane=%a 8-lane=%a",
+                frame, sample, std::min(three_samples, eight_samples),
+                sample < three_samples ? three_pcm[sample] : 0.0,
+                sample < eight_samples ? eight_pcm[sample] : 0.0);
+        }
+    }
+    if (status == 0) {
+        size_t three_samples = 0;
+        size_t eight_samples = 0;
+        status = run_detokenizer_frame(
+            three, nullptr, 1, 3, three_pcm.data(), three_pcm.size(),
+            &three_samples);
+        if (status == 0)
+            status = run_detokenizer_frame(
+                eight, nullptr, 1, 8, eight_pcm.data(), eight_pcm.size(),
+                &eight_samples);
+        if (status == 0 &&
+            (three_samples != eight_samples ||
+             std::memcmp(three_pcm.data(), eight_pcm.data(),
+                         three_samples * sizeof(float)) != 0)) {
+            status = LFM_STATUS_INTERNAL;
+            copy_error(error, error_length,
+                       "detokenizer flush changed with fixed-team width");
+        }
+    }
+    lfm_detokenizer_state_free(eight);
+    lfm_detokenizer_state_free(three);
+    lfm_detokenizer_plan_free(plan);
+    lfm_weights_close(image);
+    return status;
+}
 
 struct Gate;
 
@@ -975,22 +1092,39 @@ void copy_error(char *destination, size_t capacity, const char *source) {
 
 int close_gate(Gate *gate, char *error, size_t error_length) {
     int result = 0;
-    auto playback = [&](LfmPlaybackConsumer **consumer) {
+    const char *failure = nullptr;
+    auto record = [&](int status, const char *operation) {
+        if (result != 0 || status == 0) return;
+        result = status;
+        failure = operation;
+    };
+    auto playback = [&](LfmPlaybackConsumer **consumer,
+                        const char *operation) {
         if (!*consumer) return;
         const int status = lfm_playback_consumer_destroy(*consumer);
-        if (result == 0 && status != 0) result = status;
+        record(status, operation);
         *consumer = nullptr;
     };
-    playback(&gate->first_playback);
-    playback(&gate->second_playback);
-    for (LfmSession **session : {&gate->first_session,
-                                &gate->second_session}) {
+    playback(&gate->first_playback, "destroy first playback consumer");
+    playback(&gate->second_playback, "destroy second playback consumer");
+    struct SessionClose {
+        LfmSession **session;
+        const char *join;
+        const char *destroy;
+    };
+    for (const SessionClose close : {
+             SessionClose{&gate->first_session, "join first session",
+                          "destroy first session"},
+             SessionClose{&gate->second_session, "join second session",
+                          "destroy second session"},
+         }) {
+        LfmSession **session = close.session;
         if (!*session) continue;
         lfm_session_request_stop(*session);
         int status = lfm_session_join(*session);
-        if (result == 0 && status != 0) result = status;
+        record(status, close.join);
         status = lfm_session_destroy(*session);
-        if (result == 0 && status != 0) result = status;
+        record(status, close.destroy);
         *session = nullptr;
     }
     if (gate->continuation) {
@@ -1000,19 +1134,28 @@ int close_gate(Gate *gate, char *error, size_t error_length) {
          * published DONE before unregistering its frame. */
         const int status = kc_runtime_join_all(
             lfm_internal_runtime_coordination(gate->runtime));
-        if (result == 0 && status != 0) result = status;
+        record(status, "drain coordination runtime");
     }
     if (gate->continuation) {
         const int status = koro_cont_destroy(gate->continuation);
-        if (result == 0 && status != 0) result = status;
+        record(status, "destroy gate continuation");
         gate->continuation = nullptr;
     }
-    for (LfmConversation **conversation : {&gate->first_conversation,
-                                           &gate->second_conversation}) {
+    struct ConversationClose {
+        LfmConversation **conversation;
+        const char *operation;
+    };
+    for (const ConversationClose close : {
+             ConversationClose{&gate->first_conversation,
+                               "close first conversation"},
+             ConversationClose{&gate->second_conversation,
+                               "close second conversation"},
+         }) {
+        LfmConversation **conversation = close.conversation;
         if (!*conversation) continue;
         const int status = lfm_runtime_conversation_close(
             gate->runtime, *conversation);
-        if (result == 0 && status != 0) result = status;
+        record(status, close.operation);
         *conversation = nullptr;
     }
     delete[] gate->closed_loop_pcm;
@@ -1021,7 +1164,8 @@ int close_gate(Gate *gate, char *error, size_t error_length) {
     if (result != 0 && error && error_length != 0 && error[0] == '\0') {
         char message[128]{};
         std::snprintf(message, sizeof(message),
-                      "native gate teardown failed: %d", result);
+                      "native gate teardown failed during %s: %d",
+                      failure ? failure : "unknown operation", result);
         copy_error(error, error_length, message);
     }
     return result;
@@ -1298,19 +1442,22 @@ bool accounting_equal(const LfmModelMemoryV1 &a,
 } // namespace
 
 extern "C" int lfm_native_speech_to_speech_gate(
-    const char *model_path, uint32_t audible, char *error,
+    const char *model_path, uint32_t audible, uint32_t kernel_lanes, char *error,
     size_t error_length) {
-    if (!model_path || !*model_path || audible > 2 || !error ||
+    if (!model_path || !*model_path || audible > 2 || kernel_lanes == 0 || !error ||
         error_length == 0) {
         return LFM_STATUS_INVALID_ARGUMENT;
     }
     error[0] = '\0';
+    int status = verify_detokenizer_lane_invariance(
+        model_path, error, error_length);
+    if (status != 0) return status;
     Gate gate{};
     const LfmRuntimeConfigV1 config = {
         .size = sizeof(LfmRuntimeConfigV1),
         .abi_version = ABI,
         .coordination_workers = 2,
-        .kernel_lanes = 8,
+        .kernel_lanes = kernel_lanes,
         .event_capacity = 64,
         .session_capacity = 2,
         .reserved0 = 0,
@@ -1318,7 +1465,7 @@ extern "C" int lfm_native_speech_to_speech_gate(
         .flags = 0,
         .reserved = {},
     };
-    int status = lfm_runtime_create(&config, &gate.runtime);
+    status = lfm_runtime_create(&config, &gate.runtime);
     if (status == 0) status = lfm_runtime_start(gate.runtime);
     if (status == 0) {
         status = lfm_runtime_model_open(
@@ -1376,12 +1523,16 @@ extern "C" int lfm_native_speech_to_speech_gate(
     }
     if (status == 0) {
         std::fprintf(stderr,
-                     "native speech gate: A=%llu frames/%llu nonzero, "
-                     "B=%llu frames/%llu nonzero\nA: %s\nB: %s\n",
+                     "native speech gate: lanes=%u A=%llu frames/%llu nonzero "
+                     "hash=%016llx, B=%llu frames/%llu nonzero hash=%016llx\n"
+                     "A: %s\nB: %s\n",
+                     kernel_lanes,
                      static_cast<unsigned long long>(first.first_frames),
                      static_cast<unsigned long long>(first.first_nonzero),
+                     static_cast<unsigned long long>(first.first_hash),
                      static_cast<unsigned long long>(first.second_frames),
                      static_cast<unsigned long long>(first.second_nonzero),
+                     static_cast<unsigned long long>(first.second_hash),
                      first.first_text, first.second_text);
         if (audible != 0) {
             std::fprintf(

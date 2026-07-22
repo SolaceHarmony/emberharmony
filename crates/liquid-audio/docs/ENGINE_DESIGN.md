@@ -104,6 +104,7 @@ Current hand-written assembly files include:
 - `native/kernels/{aarch64,x86_64}/flashkern_conformer.S`
 - `native/kernels/{aarch64,x86_64}/flashkern_sesame.S`
 - `native/kernels/{aarch64,x86_64}/flashkern_capture_format.S`
+- `native/kernels/{aarch64,x86_64}/flashkern_detokenizer.S`
 
 `flashkern_math.S` currently owns reciprocal RMS scaling, fixed-order f32
 reduction, strided BF16 sum-of-squares, BF16 bias addition, and exact BF16 NeoX

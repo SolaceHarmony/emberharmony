@@ -51,13 +51,6 @@ LFM_ORACLE_API void
 lfm_detokenizer_state_reset(LfmAudioDetokenizerState *state);
 LFM_ORACLE_API uint64_t
 lfm_detokenizer_state_bytes(const LfmAudioDetokenizerState *state);
-LFM_ORACLE_API int lfm_detokenizer_state_step(
-    LfmAudioDetokenizerState *state,
-    const uint32_t codes[LFM_DETOKENIZER_CODEBOOKS], float *pcm,
-    size_t pcm_capacity, size_t *out_samples);
-LFM_ORACLE_API int lfm_detokenizer_state_flush(
-    LfmAudioDetokenizerState *state, float *pcm, size_t pcm_capacity,
-    size_t *out_samples);
 
 #ifdef __cplusplus
 } /* extern "C" */

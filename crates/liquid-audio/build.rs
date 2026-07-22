@@ -98,6 +98,7 @@ fn main() {
             .flag("-pthread")
             .flag_if_supported("-fvisibility=hidden")
             .include("native/include")
+            .include("native/src/detokenizer")
             .include("native/src/runtime")
             .include("../kcoro-sys/vendor/kcoro_arena/include");
         native_tests.compile("lfm_native_truth_gate");
@@ -126,6 +127,8 @@ fn main() {
     println!("cargo::rerun-if-changed=native/include/lfm_model_plan.h");
     println!("cargo::rerun-if-changed=native/include/lfm_mimi.h");
     println!("cargo::rerun-if-changed=native/include/lfm_detokenizer.h");
+    println!("cargo::rerun-if-changed=native/src/detokenizer/lfm_detokenizer_program.h");
+    println!("cargo::rerun-if-changed=native/src/detokenizer/lfm_detokenizer_kernels.h");
     println!("cargo::rerun-if-changed=../kcoro-sys/vendor/kcoro_arena/include");
     // C++23, not a style choice: this TU includes kcoro headers, and C++23 is
     // the FIRST standard that requires <stdatomic.h> to work in C++ and expose
@@ -147,6 +150,7 @@ fn main() {
         .flag("-pthread")
         .flag_if_supported("-fvisibility=hidden")
         .include("native/include")
+        .include("native/src/detokenizer")
         .include("native/vendor")
         .include("../kcoro-sys/vendor/kcoro_arena/include");
     if oracle {
@@ -156,8 +160,9 @@ fn main() {
 
     // Released LFM2.5 audio output path. The submodel consumes the Detokenizer
     // component of the same sealed resident image and keeps only causal state,
-    // a bounded liveness arena, and ISTFT overlap per conversation. Its six-row
-    // dense stages ride Accelerate/AMX on Apple; no checkpoint weight is moved.
+    // a bounded liveness arena, and ISTFT overlap per conversation. Flashkern
+    // partitions separable stages over its fixed team; six-row dense stages
+    // remain explicit Accelerate/AMX resources. No checkpoint weight is moved.
     println!("cargo::rerun-if-changed=native/src/detokenizer/lfm_detokenizer.cpp");
     let mut detokenizer = cc::Build::new();
     detokenizer
@@ -169,7 +174,8 @@ fn main() {
         .warnings_into_errors(true)
         .flag("-ffp-contract=off")
         .flag_if_supported("-fvisibility=hidden")
-        .include("native/include");
+        .include("native/include")
+        .include("native/src/detokenizer");
     if oracle {
         detokenizer.define("LFM_BUILD_ORACLE", None);
     }
@@ -314,6 +320,7 @@ fn main() {
         println!("cargo::rerun-if-changed=native/kernels/x86_64/flashkern_frontend.S");
         println!("cargo::rerun-if-changed=native/kernels/x86_64/flashkern_sesame.S");
         println!("cargo::rerun-if-changed=native/kernels/x86_64/flashkern_capture_format.S");
+        println!("cargo::rerun-if-changed=native/kernels/x86_64/flashkern_detokenizer.S");
         let mut kern = cc::Build::new();
         kern.file("native/kernels/x86_64/flashkern_x86.cpp")
             .file("native/kernels/x86_64/flashkern_prng.S")
@@ -323,6 +330,7 @@ fn main() {
             .file("native/kernels/x86_64/flashkern_frontend.S")
             .file("native/kernels/x86_64/flashkern_sesame.S")
             .file("native/kernels/x86_64/flashkern_capture_format.S")
+            .file("native/kernels/x86_64/flashkern_detokenizer.S")
             .file("native/kernels/x86_64/flashkern_conformer.S")
             .cpp(true)
             .std("c++23")
@@ -344,6 +352,7 @@ fn main() {
         println!("cargo::rerun-if-changed=native/kernels/aarch64/flashkern_frontend.S");
         println!("cargo::rerun-if-changed=native/kernels/aarch64/flashkern_sesame.S");
         println!("cargo::rerun-if-changed=native/kernels/aarch64/flashkern_capture_format.S");
+        println!("cargo::rerun-if-changed=native/kernels/aarch64/flashkern_detokenizer.S");
         let mut kern = cc::Build::new();
         kern.file("native/kernels/aarch64/flashkern_neon.cpp")
             .file("native/kernels/aarch64/flashkern_prng.S")
@@ -353,6 +362,7 @@ fn main() {
             .file("native/kernels/aarch64/flashkern_frontend.S")
             .file("native/kernels/aarch64/flashkern_sesame.S")
             .file("native/kernels/aarch64/flashkern_capture_format.S")
+            .file("native/kernels/aarch64/flashkern_detokenizer.S")
             .file("native/kernels/aarch64/flashkern_conformer.S")
             .cpp(true)
             .std("c++23")

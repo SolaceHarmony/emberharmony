@@ -23,6 +23,13 @@ const PRODUCT: [(&str, &str); 4] = [
     ("lfm_model.h", include_str!("../native/include/lfm_model.h")),
 ];
 
+const DETOKENIZER_CPP: &str =
+    include_str!("../native/src/detokenizer/lfm_detokenizer.cpp");
+const DETOKENIZER_AARCH64: &str =
+    include_str!("../native/kernels/aarch64/flashkern_detokenizer.S");
+const DETOKENIZER_X86_64: &str =
+    include_str!("../native/kernels/x86_64/flashkern_detokenizer.S");
+
 #[cfg(all(not(feature = "oracle-abi"), target_os = "macos"))]
 const PRODUCT_SYMBOLS: [&str; 40] = [
     "lfm_runtime_create",
@@ -214,6 +221,65 @@ fn native_owner_header_contains_lifecycle_but_no_direct_numerical_abi() {
     }
 }
 
+#[test]
+fn detokenizer_payload_math_is_owned_by_paired_assembly() {
+    for forbidden in [
+        "<arm_neon.h>",
+        "<immintrin.h>",
+        "std::pow(",
+        "std::acos(",
+        "std::cos(",
+        "std::sin(",
+        "1.0f / sum",
+        "static_cast<float>(position)",
+        "lfm_detok_dot32_f32",
+        "lfm_detok_scale_f32",
+    ] {
+        assert!(
+            !DETOKENIZER_CPP.contains(forbidden),
+            "detokenizer C++ regained numerical implementation `{forbidden}`"
+        );
+    }
+
+    for seam in ["cblas_sgemm(", "vvexpf(", "vvsincosf("] {
+        assert!(
+            DETOKENIZER_CPP.contains(seam),
+            "declared Accelerate/vForce seam `{seam}` disappeared"
+        );
+    }
+
+    for symbol in [
+        "lfm_detok_copy_f32",
+        "lfm_detok_add_f32",
+        "lfm_detok_embed_f32",
+        "lfm_detok_rms_f32",
+        "lfm_detok_swiglu_f32",
+        "lfm_detok_dot32_scaled_f32",
+        "lfm_detok_max_f32",
+        "lfm_detok_subtract_f32",
+        "lfm_detok_sum_f32",
+        "lfm_detok_normalize_f32",
+        "lfm_detok_rope_angles_f32",
+        "lfm_detok_rope_f32",
+        "lfm_detok_rope_inverse_f32",
+        "lfm_detok_ifft_basis_f32",
+        "lfm_detok_conv_f32",
+        "lfm_detok_weighted_f32",
+        "lfm_detok_polar_f32",
+        "lfm_detok_overlap_f32",
+        "lfm_detok_emit_f32",
+    ] {
+        assert!(
+            DETOKENIZER_AARCH64.contains(symbol),
+            "AArch64 detokenizer assembly lost `{symbol}`"
+        );
+        assert!(
+            DETOKENIZER_X86_64.contains(symbol),
+            "x86_64 detokenizer assembly lost `{symbol}`"
+        );
+    }
+}
+
 #[cfg(all(not(feature = "oracle-abi"), target_os = "macos"))]
 fn archive_symbols(name: &str) -> String {
     let path = Path::new(env!("LFM_NATIVE_ARCHIVE_DIR")).join(name);
@@ -370,16 +436,49 @@ fn production_archives_keep_only_native_owner_lifecycle_private_external() {
     }
 
     let detokenizer = archive_symbols("liblfm_detokenizer.a");
+    let detokenizer_kernels = archive_symbols(if cfg!(target_arch = "aarch64") {
+        "liblfm_flashkern_neon.a"
+    } else {
+        "liblfm_flashkern_x86.a"
+    });
     for symbol in [
         "lfm_detokenizer_plan_new_from_image",
         "lfm_detokenizer_state_new",
-        "lfm_detokenizer_state_step",
-        "lfm_detokenizer_state_flush",
         "lfm_detokenizer_state_reset",
+        "lfm_detokenizer_program_begin",
+        "lfm_detokenizer_program_run",
+        "lfm_detokenizer_program_advance",
+        "lfm_detokenizer_program_cancel",
     ] {
         assert!(
             symbol_line(&detokenizer, symbol).contains("private external"),
             "detokenizer numerical seam `{symbol}` is a default-visible export"
+        );
+    }
+    for symbol in [
+        "lfm_detok_copy_f32",
+        "lfm_detok_add_f32",
+        "lfm_detok_embed_f32",
+        "lfm_detok_rms_f32",
+        "lfm_detok_swiglu_f32",
+        "lfm_detok_dot32_scaled_f32",
+        "lfm_detok_max_f32",
+        "lfm_detok_subtract_f32",
+        "lfm_detok_sum_f32",
+        "lfm_detok_normalize_f32",
+        "lfm_detok_rope_angles_f32",
+        "lfm_detok_rope_f32",
+        "lfm_detok_rope_inverse_f32",
+        "lfm_detok_ifft_basis_f32",
+        "lfm_detok_conv_f32",
+        "lfm_detok_weighted_f32",
+        "lfm_detok_polar_f32",
+        "lfm_detok_overlap_f32",
+        "lfm_detok_emit_f32",
+    ] {
+        assert!(
+            symbol_line(&detokenizer_kernels, symbol).contains("private external"),
+            "detokenizer assembly leaf `{symbol}` is not private external"
         );
     }
 
@@ -397,10 +496,23 @@ fn production_archives_keep_only_native_owner_lifecycle_private_external() {
     }
 
     let model = archive_symbols("liblfm_flashkern_engine.a");
-    assert!(
-        references_symbol(&model, "lfm_detokenizer_state_step"),
-        "released LFM2.5 archive does not reference its audio detokenizer"
-    );
+    for symbol in [
+        "lfm_detokenizer_program_begin",
+        "lfm_detokenizer_program_run",
+        "lfm_detokenizer_program_advance",
+        "lfm_detokenizer_program_cancel",
+    ] {
+        assert!(
+            references_symbol(&model, symbol),
+            "released LFM2.5 archive does not mount detokenizer stage `{symbol}`"
+        );
+    }
+    for symbol in ["lfm_detokenizer_state_step", "lfm_detokenizer_state_flush"] {
+        assert!(
+            !detokenizer.lines().any(|line| line.contains(symbol)),
+            "retired whole-graph detokenizer seam `{symbol}` remains linked"
+        );
+    }
     for symbol in [
         "mimi_decode_plan_new_from_image",
         "mimi_decode_state_new",
