@@ -3,6 +3,9 @@
 #include "kcoro_arena.h"
 
 #include <atomic>
+#ifdef NDEBUG
+#undef NDEBUG
+#endif
 #include <cassert>
 #include <cerrno>
 #include <cstdint>

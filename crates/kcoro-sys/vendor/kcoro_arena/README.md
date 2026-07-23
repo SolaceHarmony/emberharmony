@@ -74,11 +74,13 @@ cmake --build /tmp/emberharmony-kcoro-build --parallel
 ctest --test-dir /tmp/emberharmony-kcoro-build --output-on-failure
 ```
 
-The first direct gate proves that dormant logical continuations are bounded by
-the fixed registration board, slot reuse changes generation, stale callbacks
-cannot resume a replacement frame, and an exact callback resumes the saved
-stackless program counter and frame. Rust bindings are not the authority for
-the native kernel.
+The native gates prove the complete substrate contract: bounded registration
+and generation-safe slot reuse; exact callback correlation; saved-frame
+migration between eligible workers; one fixed OS-worker population with no
+per-operation threads; notify-during-execution handoff without a lost edge;
+sub-percent idle-worker CPU before and after work; and four logical team
+members completing one exact quorum generation over two physical workers.
+Rust bindings are not the authority for the native kernel.
 
 ## License
 

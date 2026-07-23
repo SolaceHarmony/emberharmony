@@ -38,4 +38,12 @@ enable_testing()
 add_executable(kcoro_stackless_test tests/stackless_runtime.cpp)
 target_link_libraries(kcoro_stackless_test PRIVATE kcoro)
 
+add_executable(kcoro_runtime_contract_test tests/runtime_contract.cpp)
+target_link_libraries(kcoro_runtime_contract_test PRIVATE kcoro)
+
+add_executable(kcoro_team_contract_test tests/team_contract.cpp)
+target_link_libraries(kcoro_team_contract_test PRIVATE kcoro)
+
 add_test(NAME kcoro_stackless COMMAND kcoro_stackless_test)
+add_test(NAME kcoro_runtime_contract COMMAND kcoro_runtime_contract_test)
+add_test(NAME kcoro_team_contract COMMAND kcoro_team_contract_test)
