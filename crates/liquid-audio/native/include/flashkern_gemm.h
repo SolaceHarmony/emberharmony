@@ -13,10 +13,13 @@ enum {
     LFM_GEMM_RHS_NK = 1,
 };
 
-// Runtime ISA gate for the architecture leaf selected into this build.
+// Readiness predicate for the one architecture leaf selected into this build.
+// The engine checks this once before publishing readiness. Numerical callers
+// never branch to another implementation.
 int lfm_bf16_gemm_available(void);
 
-// Architecture leaves. Callers must pass the runtime gate above first.
+// Architecture leaves. A ready engine has already established their ISA
+// contract.
 void lfm_bf16_gemm_f32_v2(const uint16_t *a, const uint16_t *b, float *c,
                           int m, int n, int k);
 void lfm_bf16_gemv_f32(const uint16_t *a, const uint16_t *b, float *c,
@@ -29,15 +32,6 @@ void lfm_bf16_gemm_nt_f32(const uint16_t *a, const void *weight_bytes, float *c,
 void lfm_bf16_gemm_nt_strided_f32(const uint16_t *a,
                                   const void *weight_bytes, float *c,
                                   int m, int n, int k, int output_stride);
-// Baseline architecture leaf for hosts where the tuned SIMD leaf is unavailable
-// (notably Rosetta's deliberately failed AVX state gate). Both operands stay in
-// checkpoint-native bf16 storage; conversion happens only in scalar registers.
-void lfm_bf16_gemm_nt_f32_scalar(const uint16_t *a, const void *weight_bytes, float *c,
-                                 int m, int n, int k);
-void lfm_bf16_gemm_nt_strided_f32_scalar(const uint16_t *a,
-                                         const void *weight_bytes, float *c,
-                                         int m, int n, int k,
-                                         int output_stride);
 
 // Conformer linear epilogue. Checkpoint-native W[N,K] and optional BF16 bias
 // are consumed as byte views. Each F32 dot receives its bias before the single

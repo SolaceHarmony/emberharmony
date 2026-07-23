@@ -1,13 +1,9 @@
-// x86-64 flashkern — the Intel/AMD sibling of native/kernels/aarch64/flashkern_neon.cpp. Same public `extern "C"` API
-// and the same GPU-idiom → SIMD-opcode mapping, but expressed in SSE/AVX2/AVX-512 instead of
-// NEON. build.rs compiles exactly one of the two per target arch, so the Rust FFI is arch-
-// agnostic. Each function runtime-dispatches on CPUID/XCR0 and is
-// confined behind a per-function `target(...)` attribute so no gated opcode leaks into an
-// ungated function.
+// x86-64 flashkern — the Intel/AMD sibling of
+// native/kernels/aarch64/flashkern_neon.cpp. The mounted LFM2.5 path is one
+// AVX2/FMA implementation. Engine readiness establishes that contract once;
+// numerical calls never dispatch to a second implementation.
 //
 //   ARM (flashkern_neon)                         x86 (this file)
-//   BFMMLA / BFDOT (vbfmmlaq/vbfdotq)   ->  VDPBF16PS (_mm512_dpbf16_ps), AVX512-BF16
-//   (bf16 store) BFCVT                  ->  VCVTNEPS2BF16 (_mm512_cvtneps_pbh)
 //   TBL/TBX (vqtbl1q_u8)               ->  PSHUFB (_mm256_shuffle_epi8)
 //   ADDV/FADDP (vaddvq_f32)            ->  AVX horizontal reduce
 //   FRECPE/FRSQRTE (+Newton)           ->  RCPPS/RSQRTPS (_mm256_rcp_ps/_mm256_rsqrt_ps)+Newton
@@ -15,9 +11,8 @@
 //   double_double two_prod/two_sum     ->  FMA error-free transforms (_mm256_fmadd/ fmsub)
 //   SMMLA (vmmlaq_s32)                 ->  VPMADDWD (_mm512_madd_epi16), AVX512-BW
 //
-// The bf16 GEMM has two real kernels dispatched by CPUID: AVX-512-BF16 (VDPBF16PS, the
-// tensor MAC) when present, else an AVX2 upconvert+FMA microkernel (baseline on all x86-64).
-// Both compute bf16 products with f32 accumulate — torch's CPU bf16-matmul numerics.
+// BF16 GEMM widens checkpoint halfwords only in registers and accumulates in
+// F32 through the sole AVX2/FMA leaf.
 
 #include "flashkern_gemm.h"
 
@@ -29,21 +24,18 @@
 #include <vector>
 #include <cmath>
 
-// Every opcode-bearing function is confined to its own ISA via a per-function `target(...)`
-// attribute, so nothing above AVX2 ever leaks into an ungated function (notably the AVX2
-// bf16 fallback microkernel). This holds for BOTH gcc and clang on x86: clang honours
-// per-function target attributes and declares the immintrin intrinsics unconditionally — so,
-// unlike the aarch64 flashkern where clang needs the feature in the base -march, here neither
-// compiler needs a raised base ISA (build.rs compiles this TU with NO global AVX-512 flags).
-// That is exactly what stops a clang binary from emitting zmm codegen inside gemm_bf16_avx2
-// and then SIGILL-ing on an AVX2-only CPU that legitimately passed the AVX2 feature gate.
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#endif
+
+// Opcode-bearing functions carry explicit target attributes so setup and
+// readiness code stays on the base ISA. This holds for both GCC and Clang.
 // MSVC understands none of this (no __attribute__), so it is
 // deliberately excluded in build.rs; this #error is the backstop if that gate ever regresses.
 #if defined(_MSC_VER) && !defined(__clang__)
 #error "flashkern_x86.cpp requires GCC/Clang target attributes; build.rs must not compile it with MSVC"
 #endif
 #define X86_TGT_AVX2 __attribute__((target("avx2,fma")))
-#define X86_TGT_BF16 __attribute__((target("avx512f,avx512bw,avx512vl,avx512bf16")))
 #define X86_TGT_AVX512 __attribute__((target("avx512f,avx512bw,avx512vl")))
 
 // bf16 (upper 16 bits of the f32) -> f32, scalar.
@@ -95,6 +87,18 @@ static bool cpu_has_avx2_fma() {
         return (ebx & avx2) != 0;
     }();
     return available;
+}
+
+static bool rosetta_translates_avx2() {
+#if defined(__APPLE__)
+    int translated = 0;
+    size_t size = sizeof(translated);
+    return sysctlbyname("sysctl.proc_translated", &translated, &size,
+                        nullptr, 0) == 0 &&
+           translated == 1;
+#else
+    return false;
+#endif
 }
 
 // --- AVX2 baseline: upconvert bf16->f32 + FMA, 8 output columns per row. ---
@@ -305,25 +309,8 @@ extern "C" void lfm_bf16_gemm_nt_bias_bf16(
         return;
     const auto *weights = static_cast<const unsigned char *>(W);
     const auto *bias = static_cast<const unsigned char *>(bias_storage);
-    if (lfm_bf16_gemm_available()) {
-        gemm_nt_bias_bf16_avx2(A, weights, bias, output, M, N, K,
-                               output_stride);
-        return;
-    }
-    for (int n = 0; n < N; ++n) {
-        const void *weight = weights + (size_t)n * K * sizeof(uint16_t);
-        const float offset = bias
-            ? bf16_to_f32(load_bf16_word(
-                  bias + (size_t)n * sizeof(uint16_t)))
-            : 0.0f;
-        for (int m = 0; m < M; ++m) {
-            float sum = 0.0f;
-            lfm_bf16_gemm_nt_f32_scalar(A + (size_t)m * K, weight, &sum,
-                                        1, 1, K);
-            output[(size_t)m * output_stride + n] =
-                f32_to_bf16_bits(bias ? sum + offset : sum);
-        }
-    }
+    gemm_nt_bias_bf16_avx2(A, weights, bias, output, M, N, K,
+                           output_stride);
 }
 
 extern "C" void lfm_bf16_gemv_rne_add_bf16(
@@ -337,16 +324,11 @@ extern "C" void lfm_bf16_gemv_rne_add_bf16(
     const auto *input = static_cast<const uint16_t *>(input_storage);
     const auto *weights = static_cast<const unsigned char *>(weight_storage);
     const auto *residual = static_cast<const unsigned char *>(residual_storage);
-    const bool simd = lfm_bf16_gemm_available() != 0;
     for (size_t row = 0; row < rows; ++row) {
         const void *weight = weights + row * depth * sizeof(uint16_t);
         float dot = 0.0f;
-        if (simd)
-            gemm_nt_impl(input, weight, &dot, 1, 1,
-                         static_cast<int>(depth), 1);
-        else
-            lfm_bf16_gemm_nt_f32_scalar(input, weight, &dot, 1, 1,
-                                        static_cast<int>(depth));
+        gemm_nt_impl(input, weight, &dot, 1, 1,
+                     static_cast<int>(depth), 1);
         const uint16_t projected = f32_to_bf16_bits(dot);
         const float sum = bf16_to_f32(projected) +
                           bf16_to_f32(load_bf16_word(
@@ -364,52 +346,21 @@ extern "C" void lfm_bf16_gemv_rne_bf16(
         return;
     const auto *input = static_cast<const uint16_t *>(input_storage);
     const auto *weights = static_cast<const unsigned char *>(weight_storage);
-    const bool simd = lfm_bf16_gemm_available() != 0;
     for (size_t row = 0; row < rows; ++row) {
         const void *weight = weights + row * depth * sizeof(uint16_t);
         float dot = 0.0f;
-        if (simd)
-            gemm_nt_impl(input, weight, &dot, 1, 1,
-                         static_cast<int>(depth), 1);
-        else
-            lfm_bf16_gemm_nt_f32_scalar(input, weight, &dot, 1, 1,
-                                        static_cast<int>(depth));
+        gemm_nt_impl(input, weight, &dot, 1, 1,
+                     static_cast<int>(depth), 1);
         output[row] = f32_to_bf16_bits(dot);
     }
 }
 
-// SSE2-safe fallback for Rosetta/hosts whose OS does not publish AVX state.
-// The build disables contraction, matching the scalar assembly leaf's ordered
-// MULSS+ADDSS ladder, but hoists each checkpoint word across up to four row
-// accumulators so the fallback preserves the same single-read invariant.
-extern "C" void lfm_bf16_gemm_nt_strided_f32_scalar(
-    const uint16_t *A, const void *W, float *C, int M, int N, int K, int ldc) {
-    if (M <= 0 || N <= 0 || K <= 0 || ldc < N) return;
-    const unsigned char *weight_bytes = static_cast<const unsigned char *>(W);
-    for (int n = 0; n < N; ++n) {
-        const unsigned char *wr =
-            weight_bytes + (size_t)n * K * sizeof(uint16_t);
-        for (int m0 = 0; m0 < M; m0 += 4) {
-            const int rows = M - m0 < 4 ? M - m0 : 4;
-            float sums[4] = {};
-            for (int k = 0; k < K; ++k) {
-                const float weight = bf16_to_f32(load_bf16_word(
-                    wr + (size_t)k * sizeof(uint16_t)));
-                for (int row = 0; row < rows; ++row) {
-                    const float activation =
-                        bf16_to_f32(A[(size_t)(m0 + row) * K + k]);
-                    const float product = activation * weight;
-                    sums[row] = sums[row] + product;
-                }
-            }
-            for (int row = 0; row < rows; ++row)
-                C[(size_t)(m0 + row) * ldc + n] = sums[row];
-        }
-    }
-}
-
 extern "C" int lfm_bf16_gemm_available(void) {
-    return cpu_has_avx2_fma() ? 1 : 0;
+    /* Rosetta executes the AVX2/FMA opcodes used by this one x86 path even
+     * though its virtual CPUID/XCR0 contract does not advertise host-owned
+     * YMM state. This is readiness validation only; it never selects another
+     * numerical implementation. */
+    return cpu_has_avx2_fma() || rosetta_translates_avx2() ? 1 : 0;
 }
 
 // int8 tensor MAC via VPMADDWD (AVX-512-BW): C(M,N) s32 = A(M,K) s8 · B(K,N) s8.
@@ -1149,26 +1100,7 @@ extern "C" void lfm_bf16_gemv_pair_swiglu_bf16(
     const auto *input = static_cast<const unsigned char *>(input_storage);
     const auto *gate = static_cast<const unsigned char *>(gate_weight_storage);
     const auto *up = static_cast<const unsigned char *>(up_weight_storage);
-    if (lfm_bf16_gemm_available()) {
-        gemv_pair_swiglu_avx2(input, gate, up, output, rows, depth);
-        return;
-    }
-    for (size_t row = 0; row < rows; ++row) {
-        float g = 0.0f, u = 0.0f;
-        lfm_bf16_gemm_nt_f32_scalar(
-            static_cast<const uint16_t *>(input_storage),
-            gate + row * depth * sizeof(uint16_t), &g, 1, 1,
-            static_cast<int>(depth));
-        lfm_bf16_gemm_nt_f32_scalar(
-            static_cast<const uint16_t *>(input_storage),
-            up + row * depth * sizeof(uint16_t), &u, 1, 1,
-            static_cast<int>(depth));
-        g = bf16_to_f32(f32_to_bf16_bits(g));
-        const float silu = bf16_to_f32(f32_to_bf16_bits(
-            g / (1.0f + expf(-g))));
-        u = bf16_to_f32(f32_to_bf16_bits(u));
-        output[row] = f32_to_bf16_bits(silu * u);
-    }
+    gemv_pair_swiglu_avx2(input, gate, up, output, rows, depth);
 }
 
 X86_TGT_AVX2
@@ -1244,49 +1176,9 @@ extern "C" void lfm_shortconv_project_update_bf16(
     const auto *projection =
         static_cast<const unsigned char *>(projection_weight_storage);
     const auto *conv = static_cast<const unsigned char *>(conv_weight_storage);
-    if (lfm_bf16_gemm_available()) {
-        shortconv_project_update_avx2(
-            input, projection, state, conv, y, next, hidden, channel_begin,
-            channel_count, kernel);
-        return;
-    }
-    const size_t row_bytes = hidden * sizeof(uint16_t);
-    for (size_t channel = channel_begin;
-         channel < channel_begin + channel_count; ++channel) {
-        float values[3] = {};
-        lfm_bf16_gemm_nt_f32_scalar(
-            static_cast<const uint16_t *>(input_storage),
-            projection + channel * row_bytes, values, 1, 1,
-            static_cast<int>(hidden));
-        lfm_bf16_gemm_nt_f32_scalar(
-            static_cast<const uint16_t *>(input_storage),
-            projection + (hidden + channel) * row_bytes, values + 1, 1, 1,
-            static_cast<int>(hidden));
-        lfm_bf16_gemm_nt_f32_scalar(
-            static_cast<const uint16_t *>(input_storage),
-            projection + (2 * hidden + channel) * row_bytes, values + 2, 1,
-            1, static_cast<int>(hidden));
-        const float b = bf16_to_f32(f32_to_bf16_bits(values[0]));
-        const float c = bf16_to_f32(f32_to_bf16_bits(values[1]));
-        const float x = bf16_to_f32(f32_to_bf16_bits(values[2]));
-        const float bx = bf16_to_f32(f32_to_bf16_bits(b * x));
-        const size_t base = channel * (kernel - 1);
-        const unsigned char *taps =
-            conv + channel * kernel * sizeof(uint16_t);
-        float acc = 0.0f;
-        for (size_t tap = 0; tap + 1 < kernel; ++tap)
-            acc = acc + bf16_to_f32(load_bf16_word(
-                                taps + tap * sizeof(uint16_t))) *
-                            bf16_to_f32(state[base + tap]);
-        acc = acc + bf16_to_f32(load_bf16_word(
-                            taps + (kernel - 1) * sizeof(uint16_t))) *
-                        bx;
-        acc = bf16_to_f32(f32_to_bf16_bits(acc));
-        y[channel] = f32_to_bf16_bits(c * acc);
-        for (size_t tap = 0; tap + 2 < kernel; ++tap)
-            next[base + tap] = state[base + tap + 1];
-        next[base + kernel - 2] = f32_to_bf16_bits(bx);
-    }
+    shortconv_project_update_avx2(
+        input, projection, state, conv, y, next, hidden, channel_begin,
+        channel_count, kernel);
 }
 
 extern "C" void lfm_softmax_scaled_f32(float *x, int n, float scale) {

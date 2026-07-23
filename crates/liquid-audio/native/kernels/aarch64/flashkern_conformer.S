@@ -29,8 +29,8 @@
 //   lfm_inv_rms_f32    (math.S)        1 / sqrt(sumsq/n + eps)         eps INSIDE
 // Seeing two of these side by side reads like a bug in one of them. It is not.
 //
-// WHY THE BF16 GEMM AVOIDS FEAT_BF16 (see lfm_bf16_gemm_nt_f32_scalar): the
-// stated reason is weight movement — halfwords are unlifted straight into f32
+// WHY THE ORDERED BF16 GEMM AVOIDS BF16 DOT PRODUCTS: halfwords are unlifted
+// straight into f32
 // registers, never copied, packed or widened into memory. There is a second,
 // numerical reason to leave it alone: BFDOT accumulates pairwise with its own
 // rounding contract, which is NOT candle's sequential f32 k-ascending sum. A
@@ -533,52 +533,6 @@ LFM_SYM(lfm_sgemm_nt_f32):
     b.hs    4f
     ldr     s1, [x9, x8, lsl #2]
     ldr     s2, [x10, x8, lsl #2]
-    fmul    s1, s1, s2
-    fadd    s0, s0, s1
-    add     x8, x8, #1
-    b       3b
-4:
-    mul     x11, x6, x4
-    add     x11, x11, x7
-    str     s0, [x2, x11, lsl #2]
-    add     x7, x7, #1
-    b       2b
-5:
-    add     x6, x6, #1
-    b       1b
-8:
-    ret
-
-// Baseline direct bf16 checkpoint-layout GEMM. This leaf deliberately uses no
-// FEAT_BF16 opcode: each halfword is unlifted into an f32 register and weights
-// are never copied, packed, or widened into memory.
-// void lfm_bf16_gemm_nt_f32_scalar(const uint16_t *a, const uint16_t *w,
-//                                  float *c, int m, int n, int k)
-.p2align 2
-.globl LFM_SYM(lfm_bf16_gemm_nt_f32_scalar)
-LFM_PRIVATE(LFM_SYM(lfm_bf16_gemm_nt_f32_scalar))
-LFM_SYM(lfm_bf16_gemm_nt_f32_scalar):
-    mov     x6, #0
-1:
-    cmp     w6, w3
-    b.hs    8f
-    mov     x7, #0
-2:
-    cmp     w7, w4
-    b.hs    5f
-    fmov    s0, wzr
-    mul     x9, x6, x5
-    add     x9, x0, x9, lsl #1
-    mul     x10, x7, x5
-    add     x10, x1, x10, lsl #1
-    mov     x8, #0
-3:
-    cmp     w8, w5
-    b.hs    4f
-    ldrh    w11, [x9, x8, lsl #1]
-    BF16_WIDEN w11, s1
-    ldrh    w12, [x10, x8, lsl #1]
-    BF16_WIDEN w12, s2
     fmul    s1, s1, s2
     fadd    s0, s0, s1
     add     x8, x8, #1

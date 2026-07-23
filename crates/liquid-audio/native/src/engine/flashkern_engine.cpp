@@ -2350,18 +2350,9 @@ static void prefill_linear(Engine *e, uint32_t lane, const uint16_t *a,
     prefill_band(n, lane, e->lanes_total, &begin, &end);
     if (end > begin) {
         WeightBytes band = weight_offset(weight, begin * k);
-#if defined(__x86_64__) || defined(_M_X64)
-        if (!lfm_bf16_gemm_available()) {
-            lfm_bf16_gemm_nt_strided_f32_scalar(
-                a, band, out + begin, (int)rows, (int)(end - begin),
-                (int)k, (int)stride);
-        } else
-#endif
-        {
-            lfm_bf16_gemm_nt_strided_f32(
-                a, band, out + begin, (int)rows, (int)(end - begin),
-                (int)k, (int)stride);
-        }
+        lfm_bf16_gemm_nt_strided_f32(
+            a, band, out + begin, (int)rows, (int)(end - begin),
+            (int)k, (int)stride);
     }
 }
 
@@ -3501,7 +3492,6 @@ static void run_token_program_stage(Engine *e, uint32_t lane, PassSlot *slot) {
 static void run_gemm(Engine *e, uint32_t lane) {
     const GemmReq &request = e->gemm;
     const size_t lanes = e->lanes_total;
-    const bool scalar_nt = request.direct && !lfm_bf16_gemm_available();
 
     if (request.bf16_epilogue) {
         const size_t columns = (request.n + lanes - 1) / lanes;
@@ -3538,14 +3528,9 @@ static void run_gemm(Engine *e, uint32_t lane) {
             const void *weights =
                 static_cast<const unsigned char *>(request.rhs) +
                 col * request.k * sizeof(uint16_t);
-            if (scalar_nt)
-                lfm_bf16_gemm_nt_f32_scalar(
-                    request.a, weights, request.out + col, 1, (int)count,
-                    (int)request.k);
-            else
-                lfm_bf16_gemm_nt_f32(request.a, weights,
-                                     request.out + col, 1, (int)count,
-                                     (int)request.k);
+            lfm_bf16_gemm_nt_f32(request.a, weights,
+                                 request.out + col, 1, (int)count,
+                                 (int)request.k);
         }
         return;
     }
@@ -3566,15 +3551,9 @@ static void run_gemm(Engine *e, uint32_t lane) {
                              (int)request.n, (int)request.k);
         return;
     }
-    if (scalar_nt)
-        lfm_bf16_gemm_nt_f32_scalar(
-            request.a + row * request.k, request.rhs,
-            request.out + row * request.n, (int)count, (int)request.n,
-            (int)request.k);
-    else
-        lfm_bf16_gemm_nt_f32(request.a + row * request.k, request.rhs,
-                             request.out + row * request.n, (int)count,
-                             (int)request.n, (int)request.k);
+    lfm_bf16_gemm_nt_f32(request.a + row * request.k, request.rhs,
+                         request.out + row * request.n, (int)count,
+                         (int)request.n, (int)request.k);
 }
 
 enum : uint32_t {
@@ -4790,6 +4769,10 @@ static void *engine_new_impl(int workers, bool manual_deadlines,
     if (out_status) *out_status = -ENOMEM;
     if (workers < 1 || workers > MAX_WORKERS) {
         if (out_status) *out_status = -EINVAL;
+        return nullptr;
+    }
+    if (!lfm_bf16_gemm_available()) {
+        if (out_status) *out_status = -ENOTSUP;
         return nullptr;
     }
     Engine *e = new (std::nothrow) Engine();
