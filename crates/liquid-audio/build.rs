@@ -212,34 +212,7 @@ fn main() {
         .include("native/src/detokenizer");
     detokenizer.compile("lfm_detokenizer");
 
-    // Private Rust-kcoro/native docking leaf. The C++ translation unit owns the
-    // ring atomics and expected-value doorbells; the C anchor makes header
-    // compatibility and all layout assertions part of every build.
-    println!("cargo::rerun-if-changed=native/include/lfm_kernel_bridge.h");
-    println!("cargo::rerun-if-changed=native/src/runtime/kernel_bridge.cpp");
     println!("cargo::rerun-if-changed=native/src/model/lfm_route_epoch.h");
-    println!("cargo::rerun-if-changed=native/src/runtime/kernel_protocol_c.c");
-    cc::Build::new()
-        .file("native/src/runtime/kernel_bridge.cpp")
-        .cpp(true)
-        .std("c++23")
-        .opt_level(3)
-        .warnings(true)
-        .warnings_into_errors(true)
-        .flag("-pthread")
-        .flag_if_supported("-fvisibility=hidden")
-        .include("native/include")
-        .include("../kcoro-sys/vendor/kcoro_arena/include")
-        .compile("lfm_kernel_bridge");
-    cc::Build::new()
-        .file("native/src/runtime/kernel_protocol_c.c")
-        .std("c11")
-        .warnings(true)
-        .warnings_into_errors(true)
-        .flag_if_supported("-fvisibility=hidden")
-        .include("native/include")
-        .include("../kcoro-sys/vendor/kcoro_arena/include")
-        .compile("lfm_kernel_protocol_c");
 
     // Native audio frontend: torchaudio-exact resampler + NeMo mel featurizer.
     // Table build is init-time f64; hot loops live in flashkern_frontend.S; the

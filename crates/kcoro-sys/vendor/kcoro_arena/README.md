@@ -55,6 +55,8 @@ producer callback
 - `include/kcoro_arena.h`: canonical narrow C surface
 - `include/kc_coordination.hpp`: unversioned C++23 ticket, admission, and
   generation-lease primitives
+- `include/kc_mailbox.hpp`: fixed typed request/completion exchange with
+  sequence-stamped cells, endpoint leases, and correlated callback edges
 - `core/src/kc_runtime.c`: bounded ready board, worker lifecycle, and callback delivery
 - `core/src/kcoro_stackless.c`: saved program counter/frame and exact-ticket resume
 - `core/src/kc_service.c`: retained stackless services and realtime edges

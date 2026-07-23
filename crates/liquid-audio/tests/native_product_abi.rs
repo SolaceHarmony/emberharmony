@@ -391,6 +391,17 @@ fn retain_product_surface() {
 #[test]
 #[cfg(target_os = "macos")]
 fn production_archives_keep_only_native_owner_lifecycle_private_external() {
+    let build = include_str!("../build.rs");
+    for deleted in [
+        "lfm_kernel_bridge",
+        "lfm_kernel_protocol_c",
+    ] {
+        assert!(
+            !build.contains(deleted),
+            "deleted in-process bridge target `{deleted}` remains in the build"
+        );
+    }
+
     let weights = archive_symbols("liblfm_safetensors.a");
     for symbol in [
         "lfm_weights_open",
@@ -548,17 +559,6 @@ fn production_archives_keep_only_native_owner_lifecycle_private_external() {
         );
     }
 
-    let bridge = archive_symbols("liblfm_kernel_bridge.a");
-    for symbol in [
-        "lfm_kernel_bridge_wait_submission",
-        "lfm_kernel_bridge_wait_completion",
-    ] {
-        assert!(
-            !bridge.contains(symbol),
-            "blocking kernel-bridge receive `{symbol}` remains in the native archive"
-        );
-    }
-
     let product = archive_symbols("liblfm_voice_session.a");
     for symbol in PRODUCT_SYMBOLS {
         let line = symbol_line(&product, symbol);
@@ -571,8 +571,6 @@ fn production_archives_keep_only_native_owner_lifecycle_private_external() {
     let internal = [
         "liblfm_voice_protocol_c.a",
         "liblfm_flashkern_engine.a",
-        "liblfm_kernel_bridge.a",
-        "liblfm_kernel_protocol_c.a",
         "liblfm_frontend.a",
         "liblfm_conformer.a",
         "liblfm_flashkern_prng.a",

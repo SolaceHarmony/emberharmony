@@ -38,7 +38,6 @@ PRODUCT_CXX_SOURCES := \
 	src/model/lfm_model.cpp \
 	src/model/lfm_tokenizer.cpp \
 	src/detokenizer/lfm_detokenizer.cpp \
-	src/runtime/kernel_bridge.cpp \
 	src/frontend/lfm_frontend.cpp \
 	src/runtime/lfm_sesame_detector.cpp \
 	src/runtime/lfm_capture_format.cpp \
@@ -52,8 +51,7 @@ PRODUCT_CXX_SOURCES := \
 	tests/native_speech_to_speech.cpp \
 	$(KERNEL_CPP)
 PRODUCT_C_SOURCES := \
-	src/runtime/voice_protocol_c.c \
-	src/runtime/kernel_protocol_c.c
+	src/runtime/voice_protocol_c.c
 KERNEL_ASM_SOURCES := \
 	kernels/$(KERNEL_ARCH)/flashkern_prng.S \
 	kernels/$(KERNEL_ARCH)/flashkern_rope.S \

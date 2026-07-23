@@ -126,7 +126,7 @@ struct LfmMixedTurnPlan {
 struct LfmConversationAdmissionHandle {
     void *record;
     uint64_t generation;
-    KcTicketIdV1 ticket;
+    kc_ticket_id ticket;
 };
 
 extern "C" int lfm_context_window_reserve(LfmContextWindowState *window,

@@ -5,7 +5,6 @@
 #include "kc_service.h"
 #include "kc_team.h"
 #include "kcoro_stackless.h"
-#include "lfm_kernel_bridge.h"
 #include "lfm_runtime.h"
 
 #include <atomic>
@@ -71,6 +70,10 @@ struct LfmEngineDiagnosticCounts {
     uint64_t bridge_team_generation = 0;
     uint64_t bridge_team_completion = 0;
     uint64_t bridge_retired_generation = 0;
+    uint64_t mailbox_requests_published = 0;
+    uint64_t mailbox_requests_consumed = 0;
+    uint64_t mailbox_completions_published = 0;
+    uint64_t mailbox_completions_consumed = 0;
     uint64_t gang_lease = 0;
     uint64_t team_terminal = 0;
     uint32_t pass_slots_live = 0;
@@ -89,7 +92,6 @@ struct LfmEngineDiagnosticView {
     kc_service_t *route_service = nullptr;
     kc_service_t *supervisor_service = nullptr;
     kc_team_t *team = nullptr;
-    LfmKernelBridge *bridge = nullptr;
     void *owner = nullptr;
 };
 

@@ -6,9 +6,9 @@
 
 #include "flashkern_prng.h"
 #include "flashkern_sampler.h"
+#include "kc_identity.h"
 #include "lfm_detokenizer.h"
 #include "lfm_frontend.h"
-#include "lfm_kernel_bridge.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -77,7 +77,7 @@ typedef struct LfmAudioRouteHandle {
     /* Canonical workflow identity. Child numerical passes have their own
      * PASS tickets, but this value remains stable while the retained route is
      * queued, running, complete, and awaiting exact collection. */
-    KcTicketIdV1 ticket;
+    kc_ticket_id ticket;
 } LfmAudioRouteHandle;
 
 /* Terminal notification is an internal doorbell edge. Implementations must be

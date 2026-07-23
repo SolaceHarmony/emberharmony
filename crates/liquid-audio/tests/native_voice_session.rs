@@ -4758,45 +4758,6 @@ fn session_runtime_has_no_operation_wait_path() {
 }
 
 #[test]
-fn kernel_bridge_is_a_bounded_ticket_edge_not_a_descriptor_registry() {
-    let bridge = include_str!("../native/src/runtime/kernel_bridge.cpp");
-    let header = include_str!("../native/include/lfm_kernel_bridge.h");
-    for forbidden in [
-        "std::mutex",
-        "compare_exchange_weak",
-        "for (;;)",
-        "while (",
-        "DescriptorSlot",
-        "descriptor_mutex",
-        "descriptor_create",
-        "descriptor_retain",
-        "descriptor_release",
-        "descriptor_get",
-        "submit_borrowed",
-        "producer_acquire",
-        "producer_release",
-        "BORROWED_DESCRIPTOR",
-    ] {
-        assert!(
-            !bridge.contains(forbidden) && !header.contains(forbidden),
-            "generic or retrying bridge machinery returned: {forbidden}"
-        );
-    }
-    assert!(bridge.contains("ADMISSION_PUBLISHER"));
-    assert!(bridge.contains("compare_exchange_strong"));
-    assert!(bridge.contains("fetch_and"));
-    assert!(bridge.matches("memory_order_seq_cst").count() >= 6);
-
-    let engine = include_str!("../native/src/engine/flashkern_engine.cpp");
-    assert!(engine.contains(".slot = slot->index"));
-    assert!(engine.contains(".generation = ticket.generation"));
-    assert!(engine.contains("e->tickets.mint(KC_COORD_TICKET_PASS)"));
-    assert!(engine.contains("submission.descriptor.slot < e->slots.size()"));
-    assert!(!engine.contains("LfmKernelDescriptor"));
-    assert!(!engine.contains("KC_COORD_SUBMISSION_BORROWED_DESCRIPTOR"));
-}
-
-#[test]
 fn conversation_owned_frontend_state_never_waits_on_a_numerical_mutex() {
     let frontend = include_str!("../native/src/frontend/lfm_frontend.cpp");
     for forbidden in [

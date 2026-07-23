@@ -27,8 +27,6 @@ AUDIO_LIBS := \
 	$(AUDIO_OUT)/liblfm_conformer.a \
 	$(AUDIO_OUT)/liblfm_frontend.a \
 	$(AUDIO_OUT)/liblfm_flashkern_prng.a \
-	$(AUDIO_OUT)/liblfm_kernel_bridge.a \
-	$(AUDIO_OUT)/liblfm_kernel_protocol_c.a \
 	$(AUDIO_OUT)/liblfm_safetensors.a \
 	$(AUDIO_OUT)/liblfm_sesame_detector.a \
 	$(AUDIO_OUT)/liblfm_capture_format.a \

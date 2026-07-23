@@ -628,10 +628,10 @@ void watchdog_cancelled(void *context) {
 
 #endif
 
-bool same_accounting(const LfmModelMemoryV1 &left,
-                     const LfmModelMemoryV1 &right) {
+bool same_accounting(const LfmModelMemoryV2 &left,
+                     const LfmModelMemoryV2 &right) {
     return left.source_bytes == right.source_bytes &&
-        left.resident_image_bytes == right.resident_image_bytes &&
+        left.segment_bytes == right.segment_bytes &&
         left.directly_bound_bytes == right.directly_bound_bytes &&
         left.derived_immutable_bytes == right.derived_immutable_bytes &&
         left.materialized_weight_bytes == right.materialized_weight_bytes &&
@@ -723,11 +723,11 @@ extern "C" int lfm_native_spec_replay_probe_gate(
         status = lfm_runtime_model_open(probe.runtime, model_path, &probe.model,
                                         error, error_length);
     }
-    LfmModelMemoryV1 before = {
-        .size = sizeof(LfmModelMemoryV1),
+    LfmModelMemoryV2 before = {
+        .size = sizeof(LfmModelMemoryV2),
         .abi_version = LFM_MODEL_ABI_VERSION,
     };
-    LfmModelMemoryV1 after = before;
+    LfmModelMemoryV2 after = before;
     const LfmConversationOptionsV1 source_options = options(0x51d7u);
     const LfmConversationOptionsV1 branch_options = options(0x7a11u);
     if (status == 0) {
@@ -778,8 +778,6 @@ extern "C" int lfm_native_spec_replay_probe_gate(
     }
 
     const koro_cont_config continuation = {
-        .size = sizeof(koro_cont_config),
-        .abi_version = KC_ABI_VERSION,
         .step = probe_step,
         .argument = &probe,
         .frame_size = sizeof(ProbeFrame),

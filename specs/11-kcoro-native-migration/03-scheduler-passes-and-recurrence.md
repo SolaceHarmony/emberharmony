@@ -32,29 +32,36 @@ ticket/continuation semantics inside one native ownership domain.
 
 The current working tree has one native executor with a fixed pass-slot pool:
 
-1. `submit_slot` creates a generation-protected descriptor and a 128-byte
-   submission cell, then notifies the retained bridge service.
-2. The bridge service drains `lfm_kernel_bridge_try_submission`, validates the
-   descriptor, request kind, context identity, and epoch, and dispatches the
-   fixed team with an exact pass ticket.
+1. `submit_slot` retains a generation-protected slot and publishes one compact
+   request into the embedded `kc::Mailbox`.
+2. Mailbox publication resumes the exact retained bridge continuation. It
+   validates request kind, slot lease generation, context identity, epoch,
+   parent, and pass ticket before dispatching the fixed team.
 3. Every fixed lane runs the same nested pass program, claims disjoint tiles,
    and returns at the current stage boundary.
 4. The fixed-team final-return callback advances the same ticket to its next
-   stage or publishes one terminal `KcCompletionV1`.
-5. CQ publication notifies the retained bridge service. It drains
-   `lfm_kernel_bridge_try_completion`, validates exact ticket/context/epoch
-   identity, and invokes the pass continuation. No thread waits for that fact.
+   stage or publishes one terminal typed completion.
+5. Completion publication resumes the same retained continuation. It consumes
+   the completion, validates exact ticket, parent, slot lease, context, and
+   epoch identity, and invokes the pass continuation. No thread waits for that
+   fact.
 
 The old `LfmKernelSubmitFn`, `lfm_engine_set_submitter`,
 `lfm_engine_clear_submitter`, and Rust `coordinator.rs` path are deleted. The
-test `raw_engine_owns_its_sq_cq_without_rust_progress` constructs the raw C++
-engine and completes a pass without any Rust callback registration.
+standalone C++23 mailbox contract covers exact ticket delivery, saturation,
+stale-completion rejection, drain-after-stop, endpoint retirement, and
+correlated callback counts. The native speech gate exercises the same mailbox
+through the complete real-checkpoint engine without a Rust runtime.
 
-The SQ/CQ surface is deliberately nonblocking. Empty queues return `-EAGAIN`;
-publication makes a retained continuation runnable. A continuation's durable
-state lives in its saved frame: program counter, fixed locals, exact ticket, and
-retained generation-leased pass-slot reference. The pass slot owns typed
-request/scratch leases, not continuation identity.
+The request/completion mailbox is an unversioned in-process C++23 type owned by
+kcoro. Its four setup-time endpoint leases are non-copyable, its cells and
+ticket ledger are fixed and sequence-stamped, and an accepted request reserves
+completion capacity until exact consumption. Empty live endpoints return
+`-EAGAIN`; capacity exhaustion dehydrates the producer continuation until the
+correlated capacity callback fires. A continuation's durable state lives in
+its saved frame: program counter, fixed locals, exact ticket, and retained
+generation-leased pass-slot reference. The pass slot owns typed request and
+scratch leases, not continuation identity.
 
 ## Runtime Graph
 
@@ -62,10 +69,10 @@ request/scratch leases, not continuation identity.
 flowchart TB
     Session["Native LfmSession state machine"]
     Broker["Native service-class broker"]
-    SQ["Native SQ: fixed control cells"]
-    Dispatch["Mechanical descriptor dispatcher"]
+    SQ["kcoro typed request mailbox"]
+    Dispatch["Retained bridge continuation"]
     Board["Stage board + fixed lanes"]
-    CQ["Native CQ: terminal facts"]
+    CQ["kcoro typed completion mailbox"]
     ConvA["Conversation A pages"]
     ConvB["Conversation B pages"]
     Model["Immutable model plan + weights"]
@@ -89,28 +96,21 @@ flowchart TB
 The target executor owns a fixed-capacity pool:
 
 ```c++
-struct PassSlot {
-    uint32_t size;
-    uint32_t generation;
-    uint64_t pass_id;
+struct FlashkernRequest {
+    kc_ticket_id ticket;
+    kc_ticket_id parent;
     uint64_t conversation_id;
     uint64_t epoch;
-    PassKind kind;
-    PassState state;
-    const ModelPlan *model;
-    ConversationState *conversation;
-    const void *input;
-    void *output;
-    void *scratch;
-    uint32_t flags;
+    uint64_t lease_generation;
+    uint32_t slot;
+    uint32_t operation;
 };
 ```
 
-The descriptor table retains a slot, not an arbitrary callback/context pointer.
-Its generation prevents ABA after recycling. The SQ cell carries only ticket,
-slot ID, generation, service class, deadline, and cancellation epoch. The slot
-retains every model, conversation, state-page, input, output, and scratch lease
-until CQ consumption.
+The mailbox retains the slot index and exact lease generation, not an arbitrary
+payload or registry handle. The generation prevents ABA after recycling. The
+owner-held slot retains every model, conversation, state-page, input, output,
+and scratch lease until completion consumption.
 
 No weight, activation, KV row, PCM sample, or state page is copied into SQ/CQ.
 
@@ -166,16 +166,18 @@ still publishes every pass terminal fact.
 
 ## Fixed Lane Team
 
-The numerical team uses stable kcoro-owned member threads and ordinary C++ call
-stacks inside one non-suspending stage. Numerical state that survives the
-member return lives in the ticket's program record and scratch lease, never in
-those stacks or thread-local storage.
+The numerical team uses stable logical member identities mounted as kcoro
+continuations on one bounded OS-worker pool. A team member is not a thread:
+any eligible free worker may execute that member's ordinary C++ call stack for
+one non-suspending stage. Numerical state that survives the member return lives
+in the ticket's program record and scratch lease, never in a worker stack or
+thread-local storage.
 
 Each stage:
 
 1. the retained ticket continuation publishes immutable stage metadata and
    resets the claim counter;
-2. one team generation resumes every fixed member;
+2. one team generation makes every fixed logical member runnable;
 3. members fetch-add disjoint tile ranges and each tile calls a prebound
    assembly symbol;
 4. every member returns from the generation;
@@ -229,14 +231,12 @@ outside those leaves are migration defects, not an approved permanent tier.
 
 ## Terminal Arbitration
 
-Every accepted pass publishes four independent facts:
-
-```text
-execution:    not_dispatched | completed | failed
-state:        none | committed | rolled_back | poisoned
-publication:  none | committed | stale
-cause:        success | rejected | canceled | timed_out | stale_epoch | stop | fault
-```
+The deleted versioned bridge encoded a generic execution/state/publication/
+cause taxonomy in every completion. The in-process mailbox does not. One
+accepted pass produces one compact completion containing exact lineage, slot
+lease, status, and only the bounded model-specific terminal values its
+continuation needs. Team completion and hard expiry still race through one
+generation-stamped terminal CAS, so a pass cannot publish twice.
 
 An interrupt cannot tear an assembly pass in half. The pass reaches its boundary.
 For committed conversational thought, state may remain committed while old-epoch

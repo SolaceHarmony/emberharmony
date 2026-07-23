@@ -65,10 +65,11 @@ source and tests establish the direction:
 
 The source-backed assembly ABI test
 `scalar_assembly_math_abi_is_bit_exact_without_simd_feature_gates` executes on
-native AArch64 and under Rosetta x86_64 even when AVX2 is unavailable. The raw
-engine test `raw_engine_owns_its_sq_cq_without_rust_progress` proves one complete
-pass has no Rust callback dependency. The 10,000-pass soak proves exact retained
-descriptor settlement and zero-poll fence progress.
+native AArch64 and under Rosetta x86_64 even when AVX2 is unavailable. The
+standalone C++23 kcoro contracts prove exact continuation migration, fixed-team
+quorum, zero-idle-CPU workers, admission, leases, and typed mailbox retirement.
+The native speech gate drives the real checkpoint through that mailbox without
+a Rust runtime and requires exact terminal settlement.
 
 ## Flow
 

@@ -55,11 +55,11 @@
 #include "lfm_audio_pass.h"
 #include "../model/lfm_conformer_program.h"
 #include "lfm_frontend.h"
-#include "lfm_kernel_bridge.h"
 #include "lfm_detokenizer.h"
 #include "lfm_detokenizer_program.h"
 #include "lfm_model_plan.h"
 #include "kc_coordination.hpp"
+#include "kc_mailbox.hpp"
 #include "../runtime/lfm_runtime_diagnostics.hpp"
 #include "../model/lfm_route_epoch.h"
 
@@ -604,16 +604,51 @@ enum : uint32_t {
     PASS_SLOT_COMPLETE = 6,
 };
 
+enum : uint32_t {
+    PASS_RESULT_NONE = 0,
+    PASS_RESULT_TEXT_TOKEN = 1,
+    PASS_RESULT_FRAME = 2,
+};
+
+constexpr size_t PASS_RESULT_CAPACITY = 8;
+
+struct FlashkernRequest {
+    kc_ticket_id ticket{};
+    kc_ticket_id parent{};
+    uint64_t conversation_id = 0;
+    uint64_t epoch = 0;
+    uint64_t lease_generation = 0;
+    uint32_t slot = 0;
+    uint32_t operation = REQ_NONE;
+};
+
+struct FlashkernCompletion {
+    kc_ticket_id ticket{};
+    kc_ticket_id parent{};
+    uint64_t conversation_id = 0;
+    uint64_t epoch = 0;
+    uint64_t lease_generation = 0;
+    uint32_t slot = 0;
+    int32_t status = 0;
+    uint32_t result_kind = PASS_RESULT_NONE;
+    uint32_t result_count = 0;
+    uint32_t results[PASS_RESULT_CAPACITY]{};
+};
+
+using EngineMailbox =
+    kc::Mailbox<FlashkernRequest, FlashkernCompletion, PASS_CAPACITY,
+                ENGINE_CACHELINE>;
+
 struct PassSlot;
 struct PassContinuationPermit;
 using PassContinuation = void (*)(PassContinuationPermit *,
-                                  const KcCompletionV1 &, void *);
+                                  const FlashkernCompletion &, void *);
 
 struct alignas(ENGINE_CACHELINE) PassSlot {
     Engine *engine = nullptr;
     uint32_t index = 0;
-    KcSubmissionV1 submission{};
-    KcCompletionV1 completion{};
+    FlashkernRequest submission{};
+    FlashkernCompletion completion{};
     int request = REQ_NONE;
     uint64_t context_id = 0;
     PassContinuation continuation = nullptr;
@@ -721,9 +756,9 @@ struct alignas(ENGINE_CACHELINE) TeamFatalCapsule {
     uint32_t program_phase = 0;
     uint32_t program_flags = 0;
     int32_t quorum_status = 0;
-    KcTicketIdV1 workflow{};
-    KcTicketIdV1 pass{};
-    KcTicketIdV1 deadline{};
+    kc_ticket_id workflow{};
+    kc_ticket_id pass{};
+    kc_ticket_id deadline{};
     uint64_t conversation_id = 0;
     uint64_t epoch = 0;
     uint64_t scope_generation = 0;
@@ -1012,13 +1047,16 @@ struct Engine {
     int cur_req = REQ_NONE;
     std::atomic<bool> retire{false};
     kc::AdmissionGate<ROUTE_PUBLISHER_CAPACITY> route_admission;
-    LfmKernelBridge *bridge = nullptr;
+    EngineMailbox mailbox;
+    EngineMailbox::Endpoints mailbox_endpoints;
+    kc_ticket_id mailbox_capacity_identity{};
+    bool mailbox_opened = false;
     AudioRoutePool *route_pool = nullptr;
     PassSlotPool slots;
     PassSlot *active_slot = nullptr;
-    KcSubmissionV1 active_submission{};
+    FlashkernRequest active_submission{};
     uint32_t bridge_phase = BRIDGE_SERVICE_IDLE;
-    KcSubmissionV1 bridge_submission{};
+    FlashkernRequest bridge_submission{};
     PassSlot *bridge_slot = nullptr;
     uint64_t bridge_slot_owner = 0;
     std::atomic<uint64_t> bridge_team_generation{0};
@@ -1032,8 +1070,8 @@ struct Engine {
      * this generation-stamped terminal word. */
     std::atomic<uint64_t> team_terminal{0};
     kc_deadline_arm team_deadline_arm{};
-    KcSubmissionV1 supervised_submission{};
-    KcTicketIdV1 supervised_deadline{};
+    FlashkernRequest supervised_submission{};
+    kc_ticket_id supervised_deadline{};
     uint64_t supervised_scope_generation = 0;
     uint64_t supervised_team_generation = 0;
     uint64_t supervised_armed_ns = 0;
@@ -1174,6 +1212,28 @@ static void resume_bridge(Engine *engine) {
     const int status = koro_cont_resume(engine->bridge_continuation,
                                         &engine->bridge_identity);
     if (status != 0 && status != -ECANCELED) std::abort();
+}
+
+static void publish_mailbox_bridge_edge(void *context,
+                                        const kc_ticket_id *identity) {
+    Engine *engine = static_cast<Engine *>(context);
+    if (!engine || !identity ||
+        !kc::ticket_equal(*identity, engine->bridge_identity)) {
+        std::abort();
+    }
+    const int status =
+        koro_cont_resume(engine->bridge_continuation, identity);
+    if (status != 0 && status != -ECANCELED) std::abort();
+}
+
+static void publish_mailbox_capacity_edge(void *context,
+                                          const kc_ticket_id *identity) {
+    Engine *engine = static_cast<Engine *>(context);
+    if (!engine || !identity ||
+        !kc::ticket_equal(*identity, engine->mailbox_capacity_identity)) {
+        std::abort();
+    }
+    notify_service(engine->route_notifier);
 }
 
 static BackbonePlan *find_model(Engine *e, uint64_t id) {
@@ -4051,7 +4111,7 @@ static void lane_member(void *context, uint32_t lane, uint32_t members,
     lane_program(e, lane);
 }
 
-static bool ticket_equal(const KcTicketIdV1 &a, const KcTicketIdV1 &b) {
+static bool ticket_equal(const kc_ticket_id &a, const kc_ticket_id &b) {
     return kc::ticket_equal(a, b);
 }
 
@@ -4156,7 +4216,7 @@ static uint64_t team_hard_budget_ns(bool hard_timeout_probe,
 }
 
 static void fill_team_fatal_capsule(
-    TeamFatalCapsule *capsule, const KcSubmissionV1 &submission,
+    TeamFatalCapsule *capsule, const FlashkernRequest &submission,
     const kc_deadline_event &event, const TeamWorkDescriptor &work,
     uint64_t armed_ns, uint64_t budget_ns, uint64_t elapsed_ns,
     int quorum_status, const kc_team_quorum_snapshot &quorum) {
@@ -4202,7 +4262,7 @@ static void fill_team_fatal_capsule(
 
 static bool deadline_event_matches(const Engine *e,
                                    const kc_deadline_event &event) {
-    const KcSubmissionV1 &submission = e->supervised_submission;
+    const FlashkernRequest &submission = e->supervised_submission;
     return e->supervised_hard_budget_ns != 0 &&
            event.kind == KC_DEADLINE_EVENT_EXPIRED &&
            event.slot == TEAM_DEADLINE_SLOT &&
@@ -4218,7 +4278,7 @@ static bool deadline_event_matches(const Engine *e,
            submission.parent.runtime_epoch != 0 &&
            submission.parent.sequence != 0 &&
            submission.parent.generation != 0 &&
-           submission.parent.kind == KC_COORD_TICKET_WORKFLOW;
+           submission.parent.kind == KC_TICKET_KIND_WORKFLOW;
 }
 
 static void team_supervisor_main(void *context) {
@@ -4329,7 +4389,7 @@ static void begin_team_supervision(Engine *e, uint64_t generation) {
         e->supervised_armed_ns = 0;
         return;
     }
-    const KcTicketIdV1 child =
+    const kc_ticket_id child =
         e->tickets.mint(KC_TICKET_KIND_DEADLINE);
     /* Publish every identity field before arming. If this control callback is
      * descheduled for the whole hard budget immediately after the native timer
@@ -4362,19 +4422,18 @@ static void dispatch_supervised_team(Engine *e, uint64_t generation) {
     }
 }
 
-static void publish_rejected(Engine *e, const KcSubmissionV1 &submission, int status) {
-    KcCompletionV1 completion{};
-    completion.size = sizeof(completion);
-    completion.abi_version = KC_COORD_ABI_VERSION;
+static void publish_rejected(Engine *e, const FlashkernRequest &submission,
+                             int status) {
+    FlashkernCompletion completion{};
     completion.ticket = submission.ticket;
+    completion.parent = submission.parent;
     completion.conversation_id = submission.conversation_id;
     completion.epoch = submission.epoch;
-    completion.execution = KC_COORD_EXECUTION_NOT_DISPATCHED;
-    completion.state = KC_COORD_STATE_NONE;
-    completion.publication = KC_COORD_PUBLICATION_NONE;
-    completion.cause = KC_COORD_CAUSE_REJECTED;
+    completion.lease_generation = submission.lease_generation;
+    completion.slot = submission.slot;
     completion.status = status;
-    if (lfm_kernel_bridge_publish_completion(e->bridge, &completion) != 0) std::abort();
+    if (e->mailbox_endpoints.completions.publish(completion) != 0)
+        std::abort();
 }
 
 // SQ/CQ records remain authoritative. A final-lane callback resumes the exact
@@ -4491,26 +4550,22 @@ static void process_team_completion(Engine *e, uint64_t generation) {
             std::memory_order_acquire)) {
         std::abort();
     }
-    const KcSubmissionV1 submission = e->active_submission;
-    KcCompletionV1 completion{};
-    completion.size = sizeof(completion);
-    completion.abi_version = KC_COORD_ABI_VERSION;
+    const FlashkernRequest submission = e->active_submission;
+    FlashkernCompletion completion{};
     completion.ticket = submission.ticket;
+    completion.parent = submission.parent;
     completion.conversation_id = submission.conversation_id;
     completion.epoch = submission.epoch;
-    completion.pass_id = submission.ticket.sequence;
+    completion.lease_generation = submission.lease_generation;
+    completion.slot = submission.slot;
     completion.status = e->active_status.load(std::memory_order_acquire);
     if (completion.status == 0) {
-        completion.execution = KC_COORD_EXECUTION_COMPLETED;
-        completion.state = KC_COORD_STATE_COMMITTED;
-        completion.publication = KC_COORD_PUBLICATION_COMMITTED;
-        completion.cause = KC_COORD_CAUSE_SUCCESS;
         // CQ is the durable handoff. The bridge service clears the pass record
         // before invoking an asynchronous continuation, so terminal values
         // needed after that point belong in the exact ticket completion rather
         // than in PassSlot or a caller stack frame.
         if (slot->request == REQ_AUDIO_ENCODE) {
-            completion.result_kind = KC_COORD_RESULT_FRAME;
+            completion.result_kind = PASS_RESULT_FRAME;
             completion.result_count = 2;
             completion.results[0] = static_cast<uint32_t>(
                 slot->audio.adapted_values & UINT64_C(0xffffffff));
@@ -4518,25 +4573,24 @@ static void process_team_completion(Engine *e, uint64_t generation) {
                 slot->audio.adapted_values >> 32);
         } else if (slot->request == REQ_PREFILL &&
                    slot->prefill.sample) {
-            completion.result_kind = KC_COORD_RESULT_TEXT_TOKEN;
+            completion.result_kind = PASS_RESULT_TEXT_TOKEN;
             completion.result_count = 1;
             completion.results[0] = *slot->prefill.out_token;
         }
-    } else {
-        completion.execution = KC_COORD_EXECUTION_FAILED;
-        completion.state = KC_COORD_STATE_NONE;
-        completion.publication = KC_COORD_PUBLICATION_NONE;
-        completion.cause = KC_COORD_CAUSE_FAULT;
     }
     e->pass_completions.fetch_add(1, std::memory_order_relaxed);
-    if (lfm_kernel_bridge_publish_completion(e->bridge, &completion) != 0) {
+    /* Completion readiness entails numerical retirement. Publish this owner
+     * state before the mailbox fires its callback edge so a future executor
+     * may deliver that edge from any eligible worker without relying on the
+     * current continuation's notify-during-execution coalescing. */
+    e->bridge_retired_generation.store(generation,
+                                       std::memory_order_release);
+    if (e->mailbox_endpoints.completions.publish(completion) != 0) {
         // The accepted ticket owns a reserved CQ cell. Losing this edge would
         // strand its continuation, so a publication failure is an executor
         // invariant violation rather than a recoverable numerical outcome.
         std::abort();
     }
-    e->bridge_retired_generation.store(generation, std::memory_order_release);
-    resume_bridge(e);
 }
 
 static bool bridge_step_once(Engine *e) {
@@ -4562,20 +4616,23 @@ static bool bridge_step_once(Engine *e) {
                 e->bridge_team_generation.load(std::memory_order_acquire)) {
             return false;
         }
-        KcCompletionV1 completion{};
+        FlashkernCompletion completion{};
         const int status =
-            lfm_kernel_bridge_try_completion(e->bridge, &completion);
+            e->mailbox_endpoints.completion_consumer.consume(&completion);
         if (status == -EAGAIN) return false;
         if (status != 0) std::abort();
 
         PassSlot *slot = e->bridge_slot;
         const uint64_t slot_owner = e->bridge_slot_owner;
         const bool valid = e->bridge_valid;
-        const KcSubmissionV1 submission = e->bridge_submission;
+        const FlashkernRequest submission = e->bridge_submission;
         if (valid) deactivate_slot(e, slot);
         if (!slot || !ticket_equal(completion.ticket, submission.ticket) ||
+            !ticket_equal(completion.parent, submission.parent) ||
             completion.conversation_id != submission.conversation_id ||
-            completion.epoch != submission.epoch) {
+            completion.epoch != submission.epoch ||
+            completion.slot != submission.slot ||
+            completion.lease_generation != submission.lease_generation) {
             std::abort();
         }
 
@@ -4619,13 +4676,16 @@ static bool bridge_step_once(Engine *e) {
             !release_pass_slot(slot, slot_owner)) {
             std::abort();
         }
-        resume_bridge(e);
-        return false;
+        /* Request-ready edges may coalesce while this exact pass owns the
+         * single team. Completion consumption has returned the continuation
+         * to IDLE, so consume one already-published successor below before
+         * suspending. This is level-driven forward progress, not a self-wake
+         * or a poll: an empty mailbox still reaches KORO_SUSPEND immediately. */
     }
 
-    KcSubmissionV1 submission{};
+    FlashkernRequest submission{};
     const int status =
-        lfm_kernel_bridge_try_submission(e->bridge, &submission);
+        e->mailbox_endpoints.request_consumer.consume(&submission);
     if (status == -EAGAIN) return false;
     if (status == -ECANCELED) {
         if (e->team_deadlines)
@@ -4639,27 +4699,27 @@ static bool bridge_step_once(Engine *e) {
     }
     if (status != 0) std::abort();
 
-    PassSlot *slot = submission.descriptor.slot < e->slots.size()
-        ? &e->slots.record(submission.descriptor.slot)
-        : nullptr;
-    const uint64_t slot_owner = slot ? slot_generation(slot) : 0;
+    const PassSlotPool::Lease lease = {
+        .index = submission.slot,
+        .generation = submission.lease_generation,
+    };
+    PassSlot *slot = e->slots.get(lease);
+    const uint64_t slot_owner = submission.lease_generation;
     bool valid = slot && slot_state(slot) == PASS_SLOT_SUBMITTED;
     if (valid) {
-        valid = request_kind_valid(static_cast<uint32_t>(slot->request)) &&
-                submission.command == KC_COORD_COMMAND_RUN_PASS &&
-                submission.pass_budget == 1 && submission.flags == 0 &&
-                submission.ticket.kind == KC_COORD_TICKET_PASS &&
+        valid = request_kind_valid(submission.operation) &&
+                slot->request == static_cast<int>(submission.operation) &&
+                submission.ticket.kind == KC_TICKET_KIND_PASS &&
                 submission.parent.runtime_epoch == e->tickets.epoch() &&
                 submission.parent.sequence != 0 &&
                 submission.parent.generation != 0 &&
-                submission.parent.kind == KC_COORD_TICKET_WORKFLOW &&
+                submission.parent.kind == KC_TICKET_KIND_WORKFLOW &&
                 submission.epoch != 0 && slot->engine == e &&
                 slot->context_id == submission.conversation_id &&
-                submission.descriptor.generation ==
-                    submission.ticket.generation &&
-                slot->submission.descriptor.slot == slot->index &&
-                slot->submission.descriptor.generation ==
-                    submission.descriptor.generation &&
+                slot->submission.slot == slot->index &&
+                slot->submission.lease_generation ==
+                    submission.lease_generation &&
+                slot->submission.operation == submission.operation &&
                 ticket_equal(slot->submission.ticket, submission.ticket) &&
                 ticket_equal(slot->submission.parent, submission.parent);
     }
@@ -4702,7 +4762,6 @@ static bool bridge_step_once(Engine *e) {
     e->bridge_valid = valid;
     if (!valid) {
         publish_rejected(e, submission, -ESTALE);
-        resume_bridge(e);
         return false;
     }
 
@@ -4779,14 +4838,14 @@ static void *bridge_continuation_step(koro_cont_t *continuation) {
 
 static int submit_slot(Engine *e, PassSlot *slot, uint64_t generation,
                        int request, uint64_t context_id,
-                       const KcTicketIdV1 &parent,
+                       const kc_ticket_id &parent,
                        PassContinuation continuation,
                        void *continuation_context) {
     if (!e || !slot || slot->engine != e ||
         !request_kind_valid(static_cast<uint32_t>(request)) || generation == 0 ||
         !continuation || parent.runtime_epoch != e->tickets.epoch() ||
         parent.sequence == 0 || parent.generation == 0 ||
-        parent.kind != KC_COORD_TICKET_WORKFLOW ||
+        parent.kind != KC_TICKET_KIND_WORKFLOW ||
         slot_state(slot) != PASS_SLOT_RESERVED ||
         slot_generation(slot) != generation) {
         return -EINVAL;
@@ -4796,26 +4855,16 @@ static int submit_slot(Engine *e, PassSlot *slot, uint64_t generation,
         return -ESTALE;
     }
 
-    const kc_ticket_id ticket = e->tickets.mint(KC_COORD_TICKET_PASS);
+    const kc_ticket_id ticket = e->tickets.mint(KC_TICKET_KIND_PASS);
 
-    KcSubmissionV1 submission{};
-    submission.size = sizeof(submission);
-    submission.abi_version = KC_COORD_ABI_VERSION;
+    FlashkernRequest submission{};
     submission.ticket = ticket;
     submission.parent = parent;
     submission.conversation_id = context_id;
     submission.epoch = context_id == 0 ? 1 : context_id;
-    // The descriptor is an immutable locator into the engine-owned pass-slot
-    // array, not a registry handle. Its generation is correlated with the
-    // exact ticket, while the slot lease guards the numerical payload.
-    submission.descriptor = {
-        .slot = slot->index,
-        .generation = ticket.generation,
-    };
-    submission.command = KC_COORD_COMMAND_RUN_PASS;
-    submission.service_class = KC_COORD_SERVICE_INTERACTIVE;
-    submission.flags = 0;
-    submission.pass_budget = 1;
+    submission.lease_generation = generation;
+    submission.slot = slot->index;
+    submission.operation = static_cast<uint32_t>(request);
 
     slot->request = request;
     slot->context_id = context_id;
@@ -4831,17 +4880,13 @@ static int submit_slot(Engine *e, PassSlot *slot, uint64_t generation,
                          PASS_SLOT_SUBMITTED)) {
         std::abort();
     }
-    const int rc = lfm_kernel_bridge_submit(e->bridge, &submission);
+    const int rc = e->mailbox_endpoints.requests.publish(submission);
     if (rc != 0) {
         if (!transition_slot(slot, generation, PASS_SLOT_SUBMITTED,
                              PASS_SLOT_RESERVED)) {
             std::abort();
         }
     }
-    /* SQ/CQ are authoritative; this coalesced edge only resumes the retained
-     * consumer. Notify after both success and failure so a stop racing the
-     * final admitted producer can observe that admission has settled. */
-    resume_bridge(e);
     if (rc != 0) {
         return rc;
     }
@@ -4930,8 +4975,8 @@ struct AudioRouteInstance {
     std::atomic<uint32_t> state{AUDIO_ROUTE_FREE};
     std::atomic<uint64_t> generation{0};
     uint64_t enqueue_sequence = 0;
-    KcTicketIdV1 ticket{};
-    uint32_t service_class = KC_COORD_SERVICE_INTERACTIVE;
+    kc_ticket_id ticket{};
+    kc::ServiceClass service_class = kc::ServiceClass::Interactive;
     uint32_t kind = AUDIO_ROUTE_GENERATION;
     uint32_t node = AUDIO_ROUTE_TOKEN;
     uint64_t depth_id = 0;
@@ -5012,14 +5057,14 @@ static void finish_audio_route(PassContinuationPermit *permit,
 }
 
 static void continue_audio_route(PassContinuationPermit *permit,
-                                 const KcCompletionV1 &completion,
+                                 const FlashkernCompletion &completion,
                                  void *context) noexcept {
     AudioRouteInstance *route = static_cast<AudioRouteInstance *>(context);
     if (!permit || !route) std::abort();
     if (route->kind == AUDIO_ROUTE_ENCODE) {
         if (completion.status == 0) {
             if (!route->adapted_values ||
-                completion.result_kind != KC_COORD_RESULT_FRAME ||
+                completion.result_kind != PASS_RESULT_FRAME ||
                 completion.result_count != 2) {
                 finish_audio_route(permit, route, -EPROTO);
                 return;
@@ -5164,7 +5209,7 @@ static AudioRouteInstance *claim_audio_route(Engine *engine,
                        1, std::memory_order_acq_rel) + 1;
         }
         route.ticket =
-            engine->tickets.mint(KC_COORD_TICKET_WORKFLOW);
+            engine->tickets.mint(KC_TICKET_KIND_WORKFLOW);
         *generation = next;
         return &route;
     }
@@ -5266,16 +5311,16 @@ static uint64_t audio_route_age(uint64_t snapshot, uint64_t enqueued) {
     return snapshot >= enqueued ? snapshot - enqueued : 0;
 }
 
-static uint32_t audio_route_service(uint64_t snapshot, uint64_t enqueued,
-                                    uint32_t service) {
+static kc::ServiceClass audio_route_service(
+    uint64_t snapshot, uint64_t enqueued, kc::ServiceClass service) {
     return audio_route_age(snapshot, enqueued) >= ROUTE_AGE_PROMOTION
-        ? KC_COORD_SERVICE_REALTIME
+        ? kc::ServiceClass::Deadline
         : service;
 }
 
 static AudioRouteInstance *select_audio_route(AudioRoutePool *pool) {
     AudioRouteInstance *best = nullptr;
-    uint32_t best_class = UINT32_MAX;
+    kc::ServiceClass best_class = kc::ServiceClass::Background;
     uint64_t best_sequence = UINT64_MAX;
     const uint64_t now = pool->sequence.load(std::memory_order_acquire);
     for (AudioRouteInstance &route : pool->routes) {
@@ -5284,7 +5329,7 @@ static AudioRouteInstance *select_audio_route(AudioRoutePool *pool) {
         /* A producer may enqueue after this scan latched `now`. That route is
          * newer than the snapshot, not infinitely old; age zero prevents a
          * fresh continuation from jumping genuinely-starved work. */
-        const uint32_t service = audio_route_service(
+        const kc::ServiceClass service = audio_route_service(
             now, route.enqueue_sequence, route.service_class);
         if (!best || service < best_class ||
             (service == best_class &&
@@ -5486,16 +5531,6 @@ static void *engine_new_impl(int workers, bool manual_deadlines,
         slot.engine = e;
         slot.index = (uint32_t)index;
     }
-    LfmKernelBridgeConfigV1 bridge_config = {
-        .size = sizeof(LfmKernelBridgeConfigV1),
-        .abi_version = KC_COORD_ABI_VERSION,
-        .capacity = (uint32_t)PASS_CAPACITY,
-        .reserved = 0,
-    };
-    if (lfm_kernel_bridge_create(&bridge_config, &e->bridge) != 0) {
-        lfm_engine_free(e);
-        return nullptr;
-    }
     const kc_runtime_config runtime_config = {
         .worker_count = static_cast<uint32_t>(workers),
     };
@@ -5562,6 +5597,23 @@ static void *engine_new_impl(int workers, bool manual_deadlines,
         lfm_engine_free(e);
         return nullptr;
     }
+    e->mailbox_capacity_identity =
+        e->tickets.mint(KC_TICKET_KIND_CONTROL);
+    const EngineMailbox::Config mailbox_config = {
+        .request_ready = {
+            publish_mailbox_bridge_edge, e, e->bridge_identity},
+        .completion_ready = {
+            publish_mailbox_bridge_edge, e, e->bridge_identity},
+        .capacity_ready = {
+            publish_mailbox_capacity_edge, e,
+            e->mailbox_capacity_identity},
+    };
+    if (e->mailbox.bind(mailbox_config) != 0 ||
+        e->mailbox.open(&e->mailbox_endpoints) != 0) {
+        lfm_engine_free(e);
+        return nullptr;
+    }
+    e->mailbox_opened = true;
     e->pass_admission.bind(notify_admission, e->route_notifier);
     e->route_admission.bind(notify_admission, e->route_notifier);
     const kc_deadline_source_config deadline_config = {
@@ -5635,22 +5687,23 @@ int lfm_internal_engine_trigger_hard_timeout_probe_for_test(void *ep) {
     e->cur_req = slot.request;
     e->bridge_slot_owner = 1;
     e->active_submission = {
-        .size = sizeof(KcSubmissionV1),
-        .abi_version = KC_COORD_ABI_VERSION,
         .ticket = {
             .runtime_epoch = e->tickets.epoch(),
             .sequence = 2,
             .generation = 1,
-            .kind = KC_COORD_TICKET_PASS,
+            .kind = KC_TICKET_KIND_PASS,
         },
         .parent = {
             .runtime_epoch = e->tickets.epoch(),
             .sequence = 1,
             .generation = 1,
-            .kind = KC_COORD_TICKET_WORKFLOW,
+            .kind = KC_TICKET_KIND_WORKFLOW,
         },
         .conversation_id = 1,
         .epoch = 1,
+        .lease_generation = 1,
+        .slot = 0,
+        .operation = REQ_AUDIO_ENCODE,
     };
     e->gang_lease.store(1, std::memory_order_release);
     e->lane_gen.store(1, std::memory_order_release);
@@ -5663,13 +5716,16 @@ void lfm_engine_request_stop(void *ep) {
     Engine *e = (Engine *)ep;
     if (!e) return;
     e->route_admission.stop();
-    if (e->bridge) lfm_kernel_bridge_request_stop(e->bridge);
+    if (e->mailbox_opened) {
+        e->mailbox.stop();
+    } else {
+        notify_service(e->route_notifier);
+        resume_bridge(e);
+    }
     if (!e->team_deadlines && e->supervisor_service)
         kc_service_request_stop(e->supervisor_service);
     if (e->team_deadlines && !e->bridge_started)
         kc_deadline_source_request_stop(e->team_deadlines);
-    notify_service(e->route_notifier);
-    resume_bridge(e);
 }
 
 // Private implementation-backed protocol probes. Selector membership is
@@ -5735,20 +5791,18 @@ int lfm_internal_engine_fatal_capsule_for_test(
         (returned_mask & ~entered_mask) != 0) {
         return -EINVAL;
     }
-    const KcSubmissionV1 submission = {
-        .size = sizeof(submission),
-        .abi_version = KC_COORD_ABI_VERSION,
+    const FlashkernRequest submission = {
         .ticket = {
             .runtime_epoch = 11,
             .sequence = 22,
             .generation = 32,
-            .kind = KC_COORD_TICKET_PASS,
+            .kind = KC_TICKET_KIND_PASS,
         },
         .parent = {
             .runtime_epoch = 11,
             .sequence = 21,
             .generation = 31,
-            .kind = KC_COORD_TICKET_WORKFLOW,
+            .kind = KC_TICKET_KIND_WORKFLOW,
         },
         .conversation_id = 44,
         .epoch = 55,
@@ -5824,7 +5878,12 @@ int lfm_internal_engine_audio_token_class_for_test(uint32_t token) {
 
 uint32_t lfm_internal_engine_audio_route_service_for_test(
     uint64_t snapshot, uint64_t enqueued, uint32_t service) {
-    return audio_route_service(snapshot, enqueued, service);
+    if (service < static_cast<uint32_t>(kc::ServiceClass::Deadline) ||
+        service > static_cast<uint32_t>(kc::ServiceClass::Background)) {
+        return 0;
+    }
+    return static_cast<uint32_t>(audio_route_service(
+        snapshot, enqueued, static_cast<kc::ServiceClass>(service)));
 }
 
 int lfm_internal_engine_fail_audio_route_depth_for_test(void *ep, int status) {
@@ -5908,7 +5967,7 @@ int lfm_engine_audio_encode_submit(
     }
     AudioRouteInstance *route = claim.route();
     route->engine = e;
-    route->service_class = KC_COORD_SERVICE_INTERACTIVE;
+    route->service_class = kc::ServiceClass::Interactive;
     route->kind = AUDIO_ROUTE_ENCODE;
     route->node = AUDIO_ROUTE_TERMINAL;
     route->model = model;
@@ -5944,11 +6003,7 @@ int lfm_engine_audio_encode_submit(
 int lfm_engine_snapshot(void *ep, LfmEngineSnapshotV1 *out) {
     Engine *e = (Engine *)ep;
     if (!e || !out || out->size < sizeof(*out) || out->abi_version != 1) return -EINVAL;
-    LfmKernelBridgeSnapshotV1 bridge = {
-        .size = sizeof(LfmKernelBridgeSnapshotV1),
-        .abi_version = KC_COORD_ABI_VERSION,
-    };
-    if (lfm_kernel_bridge_snapshot(e->bridge, &bridge) != 0) return -EFAULT;
+    const kc::MailboxSnapshot mailbox = e->mailbox.snapshot();
     uint32_t routes_live = 0;
     uint32_t routes_ready = 0;
     for (const AudioRouteInstance &route : e->route_pool->routes) {
@@ -5970,7 +6025,7 @@ int lfm_engine_snapshot(void *ep, LfmEngineSnapshotV1 *out) {
         .attention_score_capacity =
             e->attention_score_capacity.load(std::memory_order_relaxed),
         .pass_claimed = e->pass_claimed.load(std::memory_order_acquire) ? 1u : 0u,
-        .bridge_capacity = bridge.capacity,
+        .bridge_capacity = mailbox.capacity,
         .pass_slot_capacity = (uint32_t)e->slots.size(),
         .pass_slots_live = e->pass_slots_live.load(std::memory_order_acquire),
         .max_pass_slots_live =
@@ -5994,7 +6049,8 @@ extern "C++" int lfm_internal_engine_diagnostic_view(
     Engine *engine = static_cast<Engine *>(ep);
     if (!engine || !out || !engine->control_runtime ||
         !engine->bridge_continuation || !engine->route_service ||
-        !engine->supervisor_service || !engine->team || !engine->bridge) {
+        !engine->supervisor_service || !engine->team ||
+        !engine->mailbox_opened) {
         return -EINVAL;
     }
     *out = {
@@ -6004,7 +6060,6 @@ extern "C++" int lfm_internal_engine_diagnostic_view(
         .route_service = engine->route_service,
         .supervisor_service = engine->supervisor_service,
         .team = engine->team,
-        .bridge = engine->bridge,
         .owner = engine,
     };
     return 0;
@@ -6014,6 +6069,7 @@ extern "C++" int lfm_internal_engine_diagnostic_counts(
     const LfmEngineDiagnosticView *view, LfmEngineDiagnosticCounts *out) {
     if (!view || !view->owner || !view->state || !out) return -EINVAL;
     Engine *engine = static_cast<Engine *>(view->owner);
+    const kc::MailboxSnapshot mailbox = engine->mailbox.snapshot();
     LfmEngineDiagnosticCounts counts = {
         .pass_submissions =
             engine->pass_submissions.load(std::memory_order_acquire),
@@ -6033,6 +6089,10 @@ extern "C++" int lfm_internal_engine_diagnostic_counts(
             engine->bridge_team_completion.load(std::memory_order_acquire),
         .bridge_retired_generation =
             engine->bridge_retired_generation.load(std::memory_order_acquire),
+        .mailbox_requests_published = mailbox.requests_published,
+        .mailbox_requests_consumed = mailbox.requests_consumed,
+        .mailbox_completions_published = mailbox.completions_published,
+        .mailbox_completions_consumed = mailbox.completions_consumed,
         .gang_lease = engine->gang_lease.load(std::memory_order_acquire),
         .team_terminal =
             engine->team_terminal.load(std::memory_order_acquire),
@@ -6068,7 +6128,7 @@ extern "C++" int lfm_internal_engine_diagnostic_counts(
 }
 
 int lfm_internal_engine_stackless_runtime_for_test(
-    void *ep, kc_runtime_snapshot *out_runtime, KcTicketIdV1 *out_bridge) {
+    void *ep, kc_runtime_snapshot *out_runtime, kc_ticket_id *out_bridge) {
     Engine *engine = static_cast<Engine *>(ep);
     if (!engine || !engine->control_runtime || !engine->bridge_continuation ||
         !out_runtime || !out_bridge) {
@@ -6165,7 +6225,11 @@ void lfm_engine_free(void *ep) {
         }
         e->control_runtime = nullptr;
     }
-    if (e->bridge && lfm_kernel_bridge_destroy(e->bridge) != 0) std::abort();
+    if (e->mailbox_opened &&
+        e->mailbox.retire(&e->mailbox_endpoints) != 0) {
+        std::abort();
+    }
+    e->mailbox_opened = false;
     fatal_sink_destroy(&e->fatal_sink);
     delete e->route_pool;
     delete e;
@@ -6470,8 +6534,9 @@ static int run_audio_route(
     }
 
     route->engine = e;
-    route->service_class = decode_detokenizer ? KC_COORD_SERVICE_REALTIME
-                                              : KC_COORD_SERVICE_INTERACTIVE;
+    route->service_class = decode_detokenizer
+        ? kc::ServiceClass::Deadline
+        : kc::ServiceClass::Interactive;
     route->kind = AUDIO_ROUTE_GENERATION;
     route->node = AUDIO_ROUTE_TOKEN;
     route->depth_id = depth_id;
@@ -6623,7 +6688,7 @@ int lfm_engine_control_route_submit(
     if (!claim) return -EBUSY;
     AudioRouteInstance *route = claim.route();
     route->engine = engine;
-    route->service_class = KC_COORD_SERVICE_INTERACTIVE;
+    route->service_class = kc::ServiceClass::Interactive;
     route->kind = AUDIO_ROUTE_CONTROL;
     route->node = AUDIO_ROUTE_TERMINAL;
     route->model = nullptr;
@@ -7042,7 +7107,7 @@ int lfm_engine_prefill_submit(
 
     AudioRouteInstance *route = claim.route();
     route->engine = e;
-    route->service_class = KC_COORD_SERVICE_INTERACTIVE;
+    route->service_class = kc::ServiceClass::Interactive;
     route->kind = AUDIO_ROUTE_PREFILL;
     route->node = AUDIO_ROUTE_TERMINAL;
     route->model = model;

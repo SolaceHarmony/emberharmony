@@ -561,7 +561,7 @@ enum : uint32_t {
 struct ConversationAdmission {
     LfmConversation *conversation = nullptr;
     LfmAudioRouteHandle route{};
-    KcTicketIdV1 ticket{};
+    kc_ticket_id ticket{};
     LfmNativeEmission *out = nullptr;
     LfmAudioRouteNotify notify = nullptr;
     void *notify_context = nullptr;
@@ -770,7 +770,7 @@ extern "C" int lfm_mixed_turn_plan(
 
 namespace {
 
-bool same_ticket(const KcTicketIdV1 &left, const KcTicketIdV1 &right) {
+bool same_ticket(const kc_ticket_id &left, const kc_ticket_id &right) {
     return left.runtime_epoch == right.runtime_epoch &&
            left.sequence == right.sequence &&
            left.generation == right.generation && left.kind == right.kind;

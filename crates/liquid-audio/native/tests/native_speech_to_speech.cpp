@@ -1015,10 +1015,6 @@ void print_native_watchdog(Gate *gate) {
     };
     kc_team_quorum_snapshot quorum = {
     };
-    LfmKernelBridgeSnapshotV1 bridge = {
-        .size = sizeof(LfmKernelBridgeSnapshotV1),
-        .abi_version = KC_COORD_ABI_VERSION,
-    };
     LfmEngineDiagnosticCounts counts{};
     const int gate_status =
         koro_cont_snapshot_get(gate->continuation, &gate_cont);
@@ -1038,8 +1034,6 @@ void print_native_watchdog(Gate *gate) {
         ? kc_team_quorum_snapshot_get(view.engine.team,
                                       team.dispatched_generation, &quorum)
         : -EINVAL;
-    const int queue_status =
-        lfm_kernel_bridge_snapshot(view.engine.bridge, &bridge);
     const int counts_status =
         lfm_internal_engine_diagnostic_counts(&view.engine, &counts);
     const LfmEngineDiagnosticState *engine = view.engine.state;
@@ -1060,8 +1054,9 @@ void print_native_watchdog(Gate *gate) {
                engine->team_completion_consumed.load(
                    std::memory_order_acquire)) {
         classification = "lost-team-completion-resume";
-    } else if (queue_status == 0 &&
-               bridge.completions_published > bridge.completions_consumed) {
+    } else if (counts_status == 0 &&
+               counts.mailbox_completions_published >
+                   counts.mailbox_completions_consumed) {
         classification = "lost-bridge-completion-resume";
     } else if (counts_status == 0 && counts.routes_ready != 0 &&
                route_status == 0 && route.run_state == KORO_SUSPENDED &&
@@ -1157,11 +1152,11 @@ void print_native_watchdog(Gate *gate) {
         team.completed_members, quorum_status,
         static_cast<unsigned long long>(quorum.expected_mask),
         static_cast<unsigned long long>(quorum.entered_mask),
-        static_cast<unsigned long long>(quorum.returned_mask), queue_status,
-        static_cast<unsigned long long>(bridge.submissions_consumed),
-        static_cast<unsigned long long>(bridge.submissions_accepted),
-        static_cast<unsigned long long>(bridge.completions_consumed),
-        static_cast<unsigned long long>(bridge.completions_published),
+        static_cast<unsigned long long>(quorum.returned_mask), counts_status,
+        static_cast<unsigned long long>(counts.mailbox_requests_consumed),
+        static_cast<unsigned long long>(counts.mailbox_requests_published),
+        static_cast<unsigned long long>(counts.mailbox_completions_consumed),
+        static_cast<unsigned long long>(counts.mailbox_completions_published),
         counts_status,
         static_cast<unsigned long long>(counts.pass_completions),
         static_cast<unsigned long long>(counts.pass_submissions),
@@ -1284,14 +1279,8 @@ int validate_native_diagnostics(Gate *gate, char *error,
     const LfmRuntimeDiagnosticView &view = gate->runtime_diagnostics;
     kc_team_snapshot team = {
     };
-    LfmKernelBridgeSnapshotV1 bridge = {
-        .size = sizeof(LfmKernelBridgeSnapshotV1),
-        .abi_version = KC_COORD_ABI_VERSION,
-    };
     LfmEngineDiagnosticCounts counts{};
     const int team_status = kc_team_snapshot_get(view.engine.team, &team);
-    const int bridge_status =
-        lfm_kernel_bridge_snapshot(view.engine.bridge, &bridge);
     const int counts_status =
         lfm_internal_engine_diagnostic_counts(&view.engine, &counts);
     const LfmEngineDiagnosticState *state = view.engine.state;
@@ -1303,10 +1292,12 @@ int validate_native_diagnostics(Gate *gate, char *error,
         counts.routes_claimed + counts.routes_ready +
         counts.routes_dispatching + counts.routes_running + counts.routes_done;
     const bool settled =
-        team_status == 0 && bridge_status == 0 && counts_status == 0 &&
+        team_status == 0 && counts_status == 0 &&
         team.dispatched_generation == team.completed_generation &&
-        bridge.submissions_accepted == bridge.submissions_consumed &&
-        bridge.completions_published == bridge.completions_consumed &&
+        counts.mailbox_requests_published ==
+            counts.mailbox_requests_consumed &&
+        counts.mailbox_completions_published ==
+            counts.mailbox_completions_consumed &&
         counts.pass_submissions == counts.pass_completions &&
         counts.pass_slots_live == 0 && live_routes == 0 &&
         counts.gang_lease == 0 && completion_edge == completion_consumed &&
@@ -1315,16 +1306,16 @@ int validate_native_diagnostics(Gate *gate, char *error,
     if (settled) return 0;
     std::snprintf(
         error, error_length,
-        "native diagnostic settlement failed: rc=%d/%d/%d team=%llu/%llu "
+        "native diagnostic settlement failed: rc=%d/%d team=%llu/%llu "
         "sq=%llu/%llu cq=%llu/%llu pass=%llu/%llu slots=%u routes=%u "
         "lease=%llu edge=%llu/%llu done=%u/%u",
-        team_status, bridge_status, counts_status,
+        team_status, counts_status,
         static_cast<unsigned long long>(team.completed_generation),
         static_cast<unsigned long long>(team.dispatched_generation),
-        static_cast<unsigned long long>(bridge.submissions_consumed),
-        static_cast<unsigned long long>(bridge.submissions_accepted),
-        static_cast<unsigned long long>(bridge.completions_consumed),
-        static_cast<unsigned long long>(bridge.completions_published),
+        static_cast<unsigned long long>(counts.mailbox_requests_consumed),
+        static_cast<unsigned long long>(counts.mailbox_requests_published),
+        static_cast<unsigned long long>(counts.mailbox_completions_consumed),
+        static_cast<unsigned long long>(counts.mailbox_completions_published),
         static_cast<unsigned long long>(counts.pass_completions),
         static_cast<unsigned long long>(counts.pass_submissions),
         counts.pass_slots_live, live_routes,

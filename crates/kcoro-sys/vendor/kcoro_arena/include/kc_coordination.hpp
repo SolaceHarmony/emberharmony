@@ -14,6 +14,12 @@
 
 namespace kc {
 
+enum class ServiceClass : std::uint32_t {
+    Deadline = 1,
+    Interactive = 2,
+    Background = 3,
+};
+
 inline bool ticket_equal(const kc_ticket_id &left,
                          const kc_ticket_id &right) noexcept {
     return left.runtime_epoch == right.runtime_epoch &&
