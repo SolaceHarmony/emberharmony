@@ -115,7 +115,9 @@ void count_completion(void *context, const kc_ticket_id *identity) {
 }
 
 void verify_bounded_worker_pool() {
+#if !defined(KCORO_TEST_THREAD_SANITIZER)
     const std::size_t baseline_threads = process_threads();
+#endif
     const kc_runtime_config config{.worker_count = 3};
     kc_runtime_t *runtime = nullptr;
     check(kc_runtime_create(&config, &runtime) == 0,
@@ -399,65 +401,71 @@ void race_complete(void *context, const kc_ticket_id *identity) {
 
 void *race_step(koro_cont_t *continuation) {
     auto *race = static_cast<Race *>(koro_cont_argument(continuation));
-    switch (koro_cont_state_get(continuation)) {
-    case 0: {
-        race->runs.fetch_add(1, std::memory_order_relaxed);
+    const unsigned run =
+        race->runs.fetch_add(1, std::memory_order_acq_rel) + 1;
+    if (run == 1) {
         race->signal.publish(1);
         std::unique_lock lock(race->mutex);
         race->changed.wait(lock, [&] { return race->release; });
-        koro_cont_state_set(continuation, 1, KORO_SUSPEND_CALLBACK);
-        return nullptr;
     }
-    case 1:
-        race->runs.fetch_add(1, std::memory_order_relaxed);
+    if (run == 2) {
         race->signal.publish(2);
-        return koro_cont_finish(continuation)
-            ? reinterpret_cast<void *>(1)
-            : nullptr;
-    default:
-        fail("race continuation resumed at an unknown position");
     }
+    check(run <= 2, "terminal race produced a duplicate invocation");
+    return koro_cont_finish(continuation)
+        ? reinterpret_cast<void *>(1)
+        : nullptr;
 }
 
-void verify_resume_during_step() {
-    const kc_runtime_config config{.worker_count = 1};
+void verify_resume_during_step_runtime() {
+    const kc_runtime_config config{.worker_count = 2};
     kc_runtime_t *runtime = nullptr;
     check(kc_runtime_create(&config, &runtime) == 0,
           "race runtime creation failed");
     check(kc_runtime_start(runtime) == 0, "race runtime start failed");
 
-    Race race;
-    const koro_cont_config continuation_config{
-        .step = race_step,
-        .argument = &race,
-        .frame_size = 0,
-        .worker_mask = 0,
-        .completion = race_complete,
-        .completion_context = &race,
-    };
-    koro_cont_t *continuation = nullptr;
-    check(koro_cont_create_on(runtime, &continuation_config,
-                              &continuation) == 0,
-          "race continuation creation failed");
-    check(koro_cont_start(continuation) == 0,
-          "race continuation start failed");
-    race.signal.await(1, "race continuation did not enter");
-    const kc_ticket_id identity = koro_cont_identity(continuation);
-    check(koro_cont_resume(continuation, &identity) == 0,
-          "callback during execution was rejected");
-    {
-        std::lock_guard lock(race.mutex);
-        race.release = true;
+    for (unsigned iteration = 0; iteration < 1024; ++iteration) {
+        Race race;
+        const koro_cont_config continuation_config{
+            .step = race_step,
+            .argument = &race,
+            .frame_size = 0,
+            .worker_mask = 0,
+            .completion = race_complete,
+            .completion_context = &race,
+        };
+        koro_cont_t *continuation = nullptr;
+        check(koro_cont_create_on(runtime, &continuation_config,
+                                  &continuation) == 0,
+              "race continuation creation failed");
+        check(koro_cont_start(continuation) == 0,
+              "race continuation start failed");
+        race.signal.await(1, "race continuation did not enter");
+        const kc_ticket_id identity = koro_cont_identity(continuation);
+        check(koro_cont_resume(continuation, &identity) == 0,
+              "callback during execution was rejected");
+        {
+            std::lock_guard lock(race.mutex);
+            race.release = true;
+        }
+        race.changed.notify_all();
+        race.signal.await(3, "callback during suspension was lost");
+        check(race.runs.load(std::memory_order_acquire) == 2,
+              "overlapping callback did not produce one successor invocation");
+        check(kc_runtime_join_all(runtime) == 0,
+              "race runtime did not become idle");
+        check(koro_cont_destroy(continuation) == 0,
+              "race continuation destroy failed");
     }
-    race.changed.notify_all();
-    race.signal.await(3, "callback during suspension was lost");
-    check(race.runs.load(std::memory_order_acquire) == 2,
-          "overlapping callback did not produce one successor invocation");
-    check(kc_runtime_join_all(runtime) == 0,
-          "race runtime did not become idle");
-    check(koro_cont_destroy(continuation) == 0,
-          "race continuation destroy failed");
     stop_runtime(runtime);
+}
+
+void verify_resume_during_step() {
+    std::vector<std::thread> controllers;
+    controllers.reserve(8);
+    for (unsigned index = 0; index < 8; ++index)
+        controllers.emplace_back(verify_resume_during_step_runtime);
+    for (std::thread &controller : controllers) controller.join();
 }
 
 double idle_percent(kc_runtime_t *runtime,

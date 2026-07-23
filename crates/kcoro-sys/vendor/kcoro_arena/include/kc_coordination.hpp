@@ -32,6 +32,23 @@ inline bool ticket_valid(const kc_ticket_id &ticket) noexcept {
         ticket.generation != 0 && ticket.kind != 0;
 }
 
+struct CallbackEdge {
+    using Publish = void (*)(void *, const kc_ticket_id *);
+
+    Publish publish = nullptr;
+    void *context = nullptr;
+    kc_ticket_id identity{};
+
+    [[nodiscard]] bool valid() const noexcept {
+        return publish != nullptr && ticket_valid(identity);
+    }
+
+    void fire() const noexcept {
+        if (!valid()) std::abort();
+        publish(context, &identity);
+    }
+};
+
 class TicketSource final {
   public:
     TicketSource() noexcept : epoch_(next(epoch_source_)) {}

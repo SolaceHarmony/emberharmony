@@ -986,6 +986,28 @@ fn wait_snapshot_pending(session: *mut Session, kind: u32, expected: bool) {
     }
 }
 
+fn pin_inactive_snapshot(session: *mut Session, kind: u32) -> u64 {
+    /* Test watchdog only. Session readiness and the snapshot publisher are
+     * independent callback edges, so the first inactive slot may still be
+     * owned by its initial publication after the STATE event is delivered.
+     * This observer never advances either continuation. */
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let mut pin = 0;
+        let status =
+            unsafe { lfm_internal_session_snapshot_pin_inactive_for_test(session, kind, &mut pin) };
+        if status == 0 {
+            return pin;
+        }
+        assert_eq!(status, WOULD_BLOCK);
+        assert!(
+            Instant::now() < deadline,
+            "snapshot kind {kind} never exposed its inactive slot"
+        );
+        std::thread::yield_now();
+    }
+}
+
 fn wait_gate_event(sink: &GateSink, predicate: impl Fn(&Seen) -> bool) -> Seen {
     let deadline = Instant::now() + Duration::from_secs(3);
     let mut events = sink.events.lock().unwrap();
@@ -1238,6 +1260,26 @@ fn wait_playback_evidence(
             snapshot.evidence_records,
             snapshot.detector_backlog,
             snapshot.retained_observers
+        );
+        std::thread::yield_now();
+    }
+}
+
+fn wait_barge_interrupt(session: *mut Session, epoch: u64) -> PlaybackPolicySnapshot {
+    /* Test watchdog only. The epoch CAS is the interrupt edge; the playback
+     * policy snapshot is a separate retained publication that follows it.
+     * Reading either record never advances the coordinator. */
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let snapshot = playback_policy(session);
+        if snapshot.barge_interrupts == 1 && snapshot.barge_interrupt_epoch == epoch {
+            return snapshot;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "barge evidence did not publish for epoch {epoch}: interrupts={} published_epoch={}",
+            snapshot.barge_interrupts,
+            snapshot.barge_interrupt_epoch,
         );
         std::thread::yield_now();
     }
@@ -2520,28 +2562,8 @@ fn coordinator_retires_only_after_both_terminal_snapshots_publish() {
     assert_eq!(unsafe { lfm_session_start(session) }, 0);
     let _ = wait_event(&sink, |event| event.kind == EVENT_STATE);
 
-    let mut playback_pin = 0;
-    let mut capture_pin = 0;
-    assert_eq!(
-        unsafe {
-            lfm_internal_session_snapshot_pin_inactive_for_test(
-                session,
-                SNAPSHOT_PLAYBACK,
-                &mut playback_pin,
-            )
-        },
-        0
-    );
-    assert_eq!(
-        unsafe {
-            lfm_internal_session_snapshot_pin_inactive_for_test(
-                session,
-                SNAPSHOT_CAPTURE,
-                &mut capture_pin,
-            )
-        },
-        0
-    );
+    let playback_pin = pin_inactive_snapshot(session, SNAPSHOT_PLAYBACK);
+    let capture_pin = pin_inactive_snapshot(session, SNAPSHOT_CAPTURE);
 
     unsafe { lfm_session_request_stop(session) };
     wait_snapshot_pending(session, SNAPSHOT_PLAYBACK, true);
@@ -4743,7 +4765,7 @@ fn session_runtime_has_no_operation_wait_path() {
         );
     }
     assert!(engine.contains("kc::AdmissionGate<PASS_PUBLISHER_CAPACITY>"));
-    assert!(engine.contains("kc::AdmissionGate<ROUTE_PUBLISHER_CAPACITY>"));
+    assert!(engine.contains("AudioRouteBroker routes"));
     assert!(engine.contains("PassSlotPool slots"));
     assert!(!engine.contains("std::atomic<bool> pass_closed"));
     assert!(!engine.contains("std::atomic<uint32_t> pass_publishers"));
@@ -4755,6 +4777,10 @@ fn session_runtime_has_no_operation_wait_path() {
     assert!(!coordination.contains("compare_exchange_weak"));
     assert!(!coordination.contains("for (;;)"));
     assert!(!coordination.contains("while ("));
+    let broker = include_str!("../../kcoro-sys/vendor/kcoro_arena/include/kc_permit_broker.hpp");
+    assert!(broker.contains("class PermitBroker"));
+    assert!(broker.contains("AdmissionGate<"));
+    assert!(broker.contains("PermitEvent::Completion"));
 }
 
 #[test]
@@ -5304,7 +5330,7 @@ fn sustained_mic_evidence_interrupts_once_inside_the_playback_echo_tail() {
     }
     let epoch = interrupted.expect("400 ms sustained mic evidence did not interrupt");
     assert_eq!(epoch, start.epoch + 1);
-    let barge = playback_policy(session);
+    let barge = wait_barge_interrupt(session, epoch);
     assert_eq!(barge.barge_interrupts, 1);
     assert_eq!(barge.barge_source_epoch, start.epoch);
     assert_eq!(barge.barge_interrupt_epoch, epoch);

@@ -59,6 +59,9 @@ producer callback
   sequence-stamped cells, endpoint leases, and correlated callback edges
 - `include/kc_team_executor.hpp`: retained mailbox-to-team continuation with
   exact generation callbacks and asynchronous retirement
+- `include/kc_permit_broker.hpp`: fixed fair permit pool with one retained
+  continuation per admitted operation, exact completion resumption, and
+  callback-published capacity
 - `core/src/kc_runtime.c`: bounded ready board, worker lifecycle, and callback delivery
 - `core/src/kcoro_stackless.c`: saved program counter/frame and exact-ticket resume
 - `core/src/kc_service.c`: retained stackless services and realtime edges
@@ -92,6 +95,10 @@ temporary sealing, unique canonical ticket minting, and stale fixed-slot lease
 rejection. The team-executor contract saturates its mailbox, advances one
 request across two quorum generations, rejects another request through its
 correlated completion, drains coalesced edges, and retires without a waiter.
+The permit-broker contract proves service-class/FIFO/age ordering, age zero for
+records newer than the selector snapshot, exact stale-completion rejection,
+two concurrently dehydrated operations, completion during execution without a
+lost edge, retained multi-hop frames, and callback-driven retirement.
 Rust bindings are not the authority for the native kernel.
 
 ## License

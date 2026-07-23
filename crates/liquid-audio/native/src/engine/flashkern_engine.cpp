@@ -60,6 +60,7 @@
 #include "lfm_model_plan.h"
 #include "kc_coordination.hpp"
 #include "kc_mailbox.hpp"
+#include "kc_permit_broker.hpp"
 #include "kc_team_executor.hpp"
 #include "../runtime/lfm_runtime_diagnostics.hpp"
 #include "../model/lfm_route_epoch.h"
@@ -120,8 +121,6 @@ constexpr uint64_t ROUTE_AGE_PROMOTION = 64;
 constexpr size_t ENGINE_CACHELINE = 128;
 constexpr uint32_t PASS_PUBLISHER_CAPACITY =
     static_cast<uint32_t>(ROUTE_CAPACITY + PASS_CAPACITY);
-constexpr uint32_t ROUTE_PUBLISHER_CAPACITY =
-    static_cast<uint32_t>(ROUTE_CAPACITY);
 constexpr uint32_t TEAM_DEADLINE_SLOT = 0;
 /* Deterministic fault probes use a conservative hard deadline. Production
  * work receives no fatal deadline until its exact stage/shape class has a
@@ -588,10 +587,39 @@ struct ScratchBank {
 };
 
 struct Engine;
-struct AudioRoutePool;
 constexpr size_t BLOCK_DOMAIN_COUNT = 2;
 constexpr uint32_t BLOCK_LANES = 4;
 constexpr uint32_t GRID_LANES = BLOCK_DOMAIN_COUNT * BLOCK_LANES;
+
+// The production audio route is deliberately smaller than a graph runtime:
+// three trusted coarse nodes and one total immutable outcome table.
+enum : uint32_t {
+    AUDIO_ROUTE_TOKEN = 0,
+    AUDIO_ROUTE_DEPTH = 1,
+    AUDIO_ROUTE_DETOKENIZER = 2,
+    AUDIO_ROUTE_NODE_COUNT = 3,
+};
+enum : uint32_t {
+    AUDIO_ROUTE_SUCCESS = 0,
+    AUDIO_ROUTE_FAILURE = 1,
+    AUDIO_ROUTE_EOAUDIO = 2,
+    AUDIO_ROUTE_STALE = 3,
+    AUDIO_ROUTE_OUTCOME_COUNT = 4,
+};
+enum : uint32_t {
+    AUDIO_ROUTE_TERMINAL = AUDIO_ROUTE_NODE_COUNT,
+};
+enum : uint32_t {
+    AUDIO_TOKEN_VALUE = 0,
+    AUDIO_TOKEN_END = 1,
+    AUDIO_TOKEN_INVALID = 2,
+};
+enum : uint32_t {
+    AUDIO_ROUTE_GENERATION = 0,
+    AUDIO_ROUTE_ENCODE = 1,
+    AUDIO_ROUTE_PREFILL = 2,
+    AUDIO_ROUTE_CONTROL = 3,
+};
 
 enum : uint32_t {
     PASS_SLOT_FREE = 0,
@@ -633,6 +661,39 @@ struct FlashkernCompletion {
     uint32_t result_count = 0;
     uint32_t results[PASS_RESULT_CAPACITY]{};
 };
+
+struct AudioRouteInstance {
+    Engine *engine = nullptr;
+    uint32_t lease_index = UINT32_MAX;
+    uint64_t lease_generation = 0;
+    kc_ticket_id ticket{};
+    uint32_t kind = AUDIO_ROUTE_GENERATION;
+    uint32_t node = AUDIO_ROUTE_TOKEN;
+    uint64_t depth_id = 0;
+    DepthPlan *depth = nullptr;
+    DepthReq depth_req{};
+    BackbonePlan *model = nullptr;
+    uint64_t model_id = 0;
+    TokenReq token_req{};
+    PrefillReq prefill_req{};
+    AudioReq audio_req{};
+    uint64_t *adapted_values = nullptr;
+    DetokenizerReq detokenizer_req{};
+    const LfmRouteEpoch *epoch = nullptr;
+    uint64_t expected_epoch = 0;
+    LfmAudioRouteResult *result = nullptr;
+    LfmAudioRouteNotify notify = nullptr;
+    void *notify_context = nullptr;
+    bool terminal_after_token = false;
+    bool decode_detokenizer = false;
+    LfmTokenCommitRecord commit{};
+    uint32_t *token_completed = nullptr;
+    FlashkernCompletion pass_completion{};
+    int status = -EINPROGRESS;
+};
+
+using AudioRouteBroker =
+    kc::PermitBroker<AudioRouteInstance, ROUTE_CAPACITY, ENGINE_CACHELINE>;
 
 using EngineExecutor =
     kc::TeamExecutor<FlashkernRequest, FlashkernCompletion, PASS_CAPACITY,
@@ -1029,9 +1090,8 @@ struct Engine {
     // uninterrupted numerical tile.
     kc_runtime_t *control_runtime = nullptr;
     EngineExecutor executor;
-    kc_service_t *route_service = nullptr;
+    AudioRouteBroker routes;
     kc_service_t *supervisor_service = nullptr;
-    kc_service_notifier_t *route_notifier = nullptr;
     kc_service_notifier_t *supervisor_notifier = nullptr;
     kc_deadline_source_t *team_deadlines = nullptr;
     int n_workers = 0;
@@ -1041,9 +1101,8 @@ struct Engine {
     uint32_t lanes_total = 1;
     int cur_req = REQ_NONE;
     std::atomic<bool> retire{false};
-    kc::AdmissionGate<ROUTE_PUBLISHER_CAPACITY> route_admission;
     kc_ticket_id mailbox_capacity_identity{};
-    AudioRoutePool *route_pool = nullptr;
+    kc_ticket_id route_capacity_identity{};
     PassSlotPool slots;
     PassSlot *active_slot = nullptr;
     FlashkernRequest active_submission{};
@@ -1081,7 +1140,6 @@ struct Engine {
     std::atomic<uint32_t> max_pass_slots_live{0};
     std::atomic<uint64_t> continuation_submissions{0};
     std::atomic<uint64_t> route_dispatches{0};
-    std::atomic<uint64_t> route_admission_deferrals{0};
     std::atomic<uint64_t> audio_encode_passes{0};
     std::atomic<int> test_audio_route_depth_status{0};
     std::atomic<int> test_audio_route_detokenizer_status{0};
@@ -1181,8 +1239,9 @@ static void notify_service(kc_service_notifier_t *notifier) {
     if (status != 0 && status != -ECANCELED) std::abort();
 }
 
-static void notify_admission(void *context) {
-    notify_service(static_cast<kc_service_notifier_t *>(context));
+static void notify_route_broker(void *context) {
+    Engine *engine = static_cast<Engine *>(context);
+    if (engine) engine->routes.notify();
 }
 
 static void publish_mailbox_capacity_edge(void *context,
@@ -1192,7 +1251,17 @@ static void publish_mailbox_capacity_edge(void *context,
         !kc::ticket_equal(*identity, engine->mailbox_capacity_identity)) {
         std::abort();
     }
-    notify_service(engine->route_notifier);
+    engine->routes.notify();
+}
+
+static void publish_route_capacity_edge(void *context,
+                                        const kc_ticket_id *identity) {
+    Engine *engine = static_cast<Engine *>(context);
+    if (!engine || !identity ||
+        !kc::ticket_equal(*identity, engine->route_capacity_identity)) {
+        std::abort();
+    }
+    engine->routes.notify();
 }
 
 static BackbonePlan *find_model(Engine *e, uint64_t id) {
@@ -1228,15 +1297,6 @@ static bool enter_pass_admission(Engine *e) {
 static void leave_pass_admission(Engine *e) {
     if (!e) std::abort();
     e->pass_admission.leave();
-}
-
-static int enter_route_admission(Engine *e) {
-    return e ? e->route_admission.enter() : -EINVAL;
-}
-
-static void leave_route_admission(Engine *e) {
-    if (!e) std::abort();
-    e->route_admission.leave();
 }
 
 static void clear_slot_request(PassSlot *slot) {
@@ -4701,8 +4761,9 @@ static int submit_slot(Engine *e, PassSlot *slot, uint64_t generation,
     slot->continuation = continuation;
     slot->continuation_context = continuation_context;
 
-    // The retained route service is the sole SQ producer. Keeping that
-    // ownership structural avoids a mutex on the numerical progress path.
+    // The route continuation publishes one pointer-only request through
+    // TeamExecutor's fixed producer endpoint. Its bounded admission lease
+    // serializes concurrent route publishers without a mutex or retry loop.
     slot->submission = submission;
     // This is the publication edge for every typed request field and its exact
     // ticket locator. The SQ consumer acquires this state before reading them.
@@ -4732,45 +4793,6 @@ static bool release_continuation(PassContinuationPermit *permit) {
     return true;
 }
 
-// The production audio route is deliberately smaller than a graph runtime:
-// three trusted coarse nodes and one total immutable outcome table.
-enum : uint32_t {
-    AUDIO_ROUTE_TOKEN = 0,
-    AUDIO_ROUTE_DEPTH = 1,
-    AUDIO_ROUTE_DETOKENIZER = 2,
-    AUDIO_ROUTE_NODE_COUNT = 3,
-};
-enum : uint32_t {
-    AUDIO_ROUTE_SUCCESS = 0,
-    AUDIO_ROUTE_FAILURE = 1,
-    AUDIO_ROUTE_EOAUDIO = 2,
-    AUDIO_ROUTE_STALE = 3,
-    AUDIO_ROUTE_OUTCOME_COUNT = 4,
-};
-enum : uint32_t {
-    AUDIO_ROUTE_TERMINAL = AUDIO_ROUTE_NODE_COUNT,
-};
-enum : uint32_t {
-    AUDIO_TOKEN_VALUE = 0,
-    AUDIO_TOKEN_END = 1,
-    AUDIO_TOKEN_INVALID = 2,
-};
-enum : uint32_t {
-    AUDIO_ROUTE_FREE = 0,
-    AUDIO_ROUTE_CLAIMED = 1,
-    AUDIO_ROUTE_READY = 2,
-    AUDIO_ROUTE_DISPATCHING = 3,
-    AUDIO_ROUTE_RUNNING = 4,
-    AUDIO_ROUTE_DONE = 5,
-};
-
-enum : uint32_t {
-    AUDIO_ROUTE_GENERATION = 0,
-    AUDIO_ROUTE_ENCODE = 1,
-    AUDIO_ROUTE_PREFILL = 2,
-    AUDIO_ROUTE_CONTROL = 3,
-};
-
 static constexpr std::array<std::array<uint8_t, AUDIO_ROUTE_OUTCOME_COUNT>,
                             AUDIO_ROUTE_NODE_COUNT>
     AUDIO_ROUTE_TABLE = {{
@@ -4799,43 +4821,6 @@ static uint32_t audio_token_class(uint32_t token) {
     if (token == LFM_DETOKENIZER_CODE_VALUES) return AUDIO_TOKEN_END;
     return AUDIO_TOKEN_INVALID;
 }
-
-struct AudioRouteInstance {
-    Engine *engine = nullptr;
-    std::atomic<uint32_t> state{AUDIO_ROUTE_FREE};
-    std::atomic<uint64_t> generation{0};
-    uint64_t enqueue_sequence = 0;
-    kc_ticket_id ticket{};
-    kc::ServiceClass service_class = kc::ServiceClass::Interactive;
-    uint32_t kind = AUDIO_ROUTE_GENERATION;
-    uint32_t node = AUDIO_ROUTE_TOKEN;
-    uint64_t depth_id = 0;
-    DepthPlan *depth = nullptr;
-    DepthReq depth_req{};
-    BackbonePlan *model = nullptr;
-    uint64_t model_id = 0;
-    TokenReq token_req{};
-    PrefillReq prefill_req{};
-    AudioReq audio_req{};
-    uint64_t *adapted_values = nullptr;
-    DetokenizerReq detokenizer_req{};
-    const LfmRouteEpoch *epoch = nullptr;
-    uint64_t expected_epoch = 0;
-    LfmAudioRouteResult *result = nullptr;
-    LfmAudioRouteNotify notify = nullptr;
-    void *notify_context = nullptr;
-    bool terminal_after_token = false;
-    bool decode_detokenizer = false;
-    LfmTokenCommitRecord commit{};
-    uint32_t *token_completed = nullptr;
-    int status = -EINPROGRESS;
-};
-
-struct AudioRoutePool {
-    Engine *engine = nullptr;
-    std::array<AudioRouteInstance, ROUTE_CAPACITY> routes;
-    std::atomic<uint64_t> sequence{0};
-};
 
 static int preflight_audio_route_commit(const LfmTokenCommitRecord *commit,
                                         size_t position) {
@@ -4870,61 +4855,44 @@ static int commit_audio_route_token(AudioRouteInstance *route) {
     return status;
 }
 
-static void finish_audio_route(PassContinuationPermit *permit,
-                               AudioRouteInstance *route, int status) {
-    if (!permit || permit->consumed || !permit->slot || !route) std::abort();
-    route->status = status;
-    if (route->result) route->result->status = status;
-    if (!release_continuation(permit)) std::abort();
-    uint32_t running = AUDIO_ROUTE_RUNNING;
-    if (!route->state.compare_exchange_strong(
-            running, AUDIO_ROUTE_DONE, std::memory_order_acq_rel,
-            std::memory_order_acquire)) {
-        std::abort();
-    }
-    notify_service(route->engine->route_notifier);
-    route->notify(route->notify_context);
+static kc::PermitAdvance complete_audio_route(int status) {
+    return {
+        .disposition = kc::PermitDisposition::Complete,
+        .status = status,
+    };
 }
 
-static void continue_audio_route(PassContinuationPermit *permit,
-                                 const FlashkernCompletion &completion,
-                                 void *context) noexcept {
-    AudioRouteInstance *route = static_cast<AudioRouteInstance *>(context);
-    if (!permit || !route) std::abort();
+static kc::PermitAdvance continue_audio_route(
+    AudioRouteInstance *route,
+    const FlashkernCompletion &completion) noexcept {
+    if (!route) std::abort();
     if (route->kind == AUDIO_ROUTE_ENCODE) {
         if (completion.status == 0) {
             if (!route->adapted_values ||
                 completion.result_kind != PASS_RESULT_FRAME ||
                 completion.result_count != 2) {
-                finish_audio_route(permit, route, -EPROTO);
-                return;
+                return complete_audio_route(-EPROTO);
             }
             *route->adapted_values =
                 static_cast<uint64_t>(completion.results[0]) |
                 (static_cast<uint64_t>(completion.results[1]) << 32);
         }
-        finish_audio_route(permit, route, completion.status);
-        return;
+        return complete_audio_route(completion.status);
     }
     if (route->kind == AUDIO_ROUTE_PREFILL) {
-        finish_audio_route(permit, route, completion.status);
-        return;
+        return complete_audio_route(completion.status);
     }
     if (route->kind != AUDIO_ROUTE_GENERATION) {
-        finish_audio_route(permit, route, -EPROTO);
-        return;
+        return complete_audio_route(-EPROTO);
     }
     uint32_t outcome = completion.status == 0 ? AUDIO_ROUTE_SUCCESS
                                               : AUDIO_ROUTE_FAILURE;
     if (completion.status == 0 && route->node == AUDIO_ROUTE_TOKEN) {
         const int commit_status = commit_audio_route_token(route);
-        if (commit_status != 0) {
-            finish_audio_route(permit, route, commit_status);
-            return;
-        }
+        if (commit_status != 0)
+            return complete_audio_route(commit_status);
         if (route->terminal_after_token) {
-            finish_audio_route(permit, route, 0);
-            return;
+            return complete_audio_route(0);
         }
         if (route->decode_detokenizer &&
             route->epoch->load(std::memory_order_acquire) !=
@@ -4941,8 +4909,7 @@ static void continue_audio_route(PassContinuationPermit *permit,
             route->detokenizer_req.flush = true;
             outcome = AUDIO_ROUTE_EOAUDIO;
         } else if (first_class == AUDIO_TOKEN_INVALID) {
-            finish_audio_route(permit, route, -ERANGE);
-            return;
+            return complete_audio_route(-ERANGE);
         } else if (route->epoch->load(std::memory_order_acquire) !=
                    route->expected_epoch) {
             outcome = AUDIO_ROUTE_STALE;
@@ -4950,8 +4917,7 @@ static void continue_audio_route(PassContinuationPermit *permit,
             for (size_t index = 0; index < LFM_DETOKENIZER_CODEBOOKS; ++index) {
                 if (audio_token_class(route->result->codes[index]) !=
                     AUDIO_TOKEN_VALUE) {
-                    finish_audio_route(permit, route, -ERANGE);
-                    return;
+                    return complete_audio_route(-ERANGE);
                 }
             }
         }
@@ -4964,35 +4930,22 @@ static void continue_audio_route(PassContinuationPermit *permit,
             outcome = AUDIO_ROUTE_STALE;
         }
     }
-    if (completion.status == 0 &&
-        route->engine->route_admission.stopped()) {
-        finish_audio_route(permit, route, -ECANCELED);
-        return;
-    }
+    if (completion.status == 0 && route->engine->routes.stopped())
+        return complete_audio_route(-ECANCELED);
     uint32_t target = AUDIO_ROUTE_TERMINAL;
-    if (!audio_route_next(route->node, outcome, &target)) {
-        finish_audio_route(permit, route, -EPROTO);
-        return;
-    }
-    if (completion.status != 0) {
-        finish_audio_route(permit, route, completion.status);
-        return;
-    }
-    if (outcome == AUDIO_ROUTE_STALE) {
-        finish_audio_route(permit, route, -ESTALE);
-        return;
-    }
+    if (!audio_route_next(route->node, outcome, &target))
+        return complete_audio_route(-EPROTO);
+    if (completion.status != 0)
+        return complete_audio_route(completion.status);
+    if (outcome == AUDIO_ROUTE_STALE)
+        return complete_audio_route(-ESTALE);
     /* A codes-only route terminates after Depth. A playback route sends both a
      * normal code frame and EOAudio through the detokenizer: EOAudio flushes
      * the final same-padding overlap instead of manufacturing another code. */
-    if (!route->decode_detokenizer && route->node == AUDIO_ROUTE_DEPTH) {
-        finish_audio_route(permit, route, 0);
-        return;
-    }
-    if (target == AUDIO_ROUTE_TERMINAL) {
-        finish_audio_route(permit, route, 0);
-        return;
-    }
+    if (!route->decode_detokenizer && route->node == AUDIO_ROUTE_DEPTH)
+        return complete_audio_route(0);
+    if (target == AUDIO_ROUTE_TERMINAL)
+        return complete_audio_route(0);
     if (route->node == AUDIO_ROUTE_TOKEN && target == AUDIO_ROUTE_DEPTH &&
         route->depth && route->depth_id != 0) {
         route->node = AUDIO_ROUTE_DEPTH;
@@ -5002,182 +4955,74 @@ static void continue_audio_route(PassContinuationPermit *permit,
                route->model_id != 0) {
         route->node = AUDIO_ROUTE_DETOKENIZER;
     } else {
-        finish_audio_route(permit, route, -EPROTO);
-        return;
+        return complete_audio_route(-EPROTO);
     }
-    if (!release_continuation(permit)) std::abort();
-    route->enqueue_sequence =
-        route->engine->route_pool->sequence.fetch_add(
-            1, std::memory_order_acq_rel) + 1;
-    uint32_t running = AUDIO_ROUTE_RUNNING;
-    if (!route->state.compare_exchange_strong(
-            running, AUDIO_ROUTE_READY, std::memory_order_acq_rel,
-            std::memory_order_acquire)) {
-        std::abort();
-    }
-    notify_service(route->engine->route_notifier);
+    return {
+        .disposition = kc::PermitDisposition::Requeue,
+        .status = 0,
+    };
 }
-
-static AudioRouteInstance *claim_audio_route(Engine *engine,
-                                             uint64_t *generation) {
-    if (!engine || !generation ||
-        engine->route_admission.stopped() ||
-        !enter_pass_admission(engine)) {
-        return nullptr;
-    }
-    for (AudioRouteInstance &route : engine->route_pool->routes) {
-        uint32_t free = AUDIO_ROUTE_FREE;
-        if (!route.state.compare_exchange_strong(
-                free, AUDIO_ROUTE_CLAIMED, std::memory_order_acq_rel,
-                std::memory_order_acquire)) {
-            continue;
-        }
-        uint64_t next = route.generation.fetch_add(
-                            1, std::memory_order_acq_rel) + 1;
-        if (next == 0) {
-            next = route.generation.fetch_add(
-                       1, std::memory_order_acq_rel) + 1;
-        }
-        route.ticket =
-            engine->tickets.mint(KC_TICKET_KIND_WORKFLOW);
-        *generation = next;
-        return &route;
-    }
-    leave_pass_admission(engine);
-    /* A transient route claimant may have occupied the sole pass publisher
-     * while the retained route service made its one admission attempt. Its
-     * release—not a retry loop—publishes the missing capacity edge. */
-    notify_service(engine->route_notifier);
-    return nullptr;
-}
-
-static void release_audio_route(AudioRouteInstance *route,
-                                uint64_t generation) {
-    if (!route || !route->engine || generation == 0 ||
-        route->generation.load(std::memory_order_acquire) != generation) {
-        std::abort();
-    }
-    uint32_t done = AUDIO_ROUTE_DONE;
-    if (!route->state.compare_exchange_strong(
-            done, AUDIO_ROUTE_FREE, std::memory_order_acq_rel,
-            std::memory_order_acquire)) {
-        std::abort();
-    }
-    leave_pass_admission(route->engine);
-    notify_service(route->engine->route_notifier);
-}
-
-class RouteProducerAdmission {
-  public:
-    explicit RouteProducerAdmission(Engine *engine) : engine_(engine) {
-        status_ = engine_ ? enter_route_admission(engine_) : -EINVAL;
-        held_ = status_ == 0;
-    }
-
-    ~RouteProducerAdmission() { release(); }
-
-    explicit operator bool() const { return held_; }
-    int status() const { return status_; }
-
-    void release() {
-        if (!held_) return;
-        leave_route_admission(engine_);
-        held_ = false;
-    }
-
-    RouteProducerAdmission(const RouteProducerAdmission &) = delete;
-    RouteProducerAdmission &operator=(const RouteProducerAdmission &) = delete;
-
-  private:
-    Engine *engine_ = nullptr;
-    bool held_ = false;
-    int status_ = -EINVAL;
-};
 
 class AudioRouteLease {
   public:
-    explicit AudioRouteLease(Engine *engine) {
-        route_ = claim_audio_route(engine, &generation_);
+    explicit AudioRouteLease(
+        Engine *engine,
+        kc::ServiceClass service =
+            kc::ServiceClass::Interactive) {
+        if (!engine) {
+            status_ = -EINVAL;
+            return;
+        }
+        if (!enter_pass_admission(engine)) {
+            status_ = -EBUSY;
+            return;
+        }
+        engine_ = engine;
+        pass_admitted_ = true;
+        status_ = engine->routes.claim(service, &claim_);
+        if (status_ != 0) {
+            claim_.abandon();
+            leave_pass_admission(engine_);
+            pass_admitted_ = false;
+            return;
+        }
+        lease_ = claim_.lease();
+        route_ = claim_.record();
+        if (!route_) std::abort();
+        route_->lease_generation = lease_.generation;
+        route_->ticket = lease_.ticket;
     }
 
     ~AudioRouteLease() {
-        if (!route_) return;
-        uint32_t state = route_->state.load(std::memory_order_acquire);
-        if (state == AUDIO_ROUTE_CLAIMED) {
-            route_->status = -ECANCELED;
-            route_->state.store(AUDIO_ROUTE_DONE, std::memory_order_release);
-            state = AUDIO_ROUTE_DONE;
-        }
-        if (state != AUDIO_ROUTE_DONE) std::abort();
-        release_audio_route(route_, generation_);
+        if (!pass_admitted_) return;
+        claim_.abandon();
+        leave_pass_admission(engine_);
     }
 
     explicit operator bool() const { return route_ != nullptr; }
+    int status() const { return status_; }
     AudioRouteInstance *route() const { return route_; }
-    uint64_t generation() const { return generation_; }
-    void detach() { route_ = nullptr; }
+    uint64_t generation() const { return lease_.generation; }
+    const kc_ticket_id &ticket() const { return lease_.ticket; }
+    int publish() {
+        const int status = claim_.publish();
+        if (status == 0) {
+            route_ = nullptr;
+            pass_admitted_ = false;
+        }
+        return status;
+    }
     AudioRouteLease(const AudioRouteLease &) = delete;
     AudioRouteLease &operator=(const AudioRouteLease &) = delete;
 
   private:
+    AudioRouteBroker::Claim claim_;
+    AudioRouteBroker::Lease lease_{};
+    Engine *engine_ = nullptr;
     AudioRouteInstance *route_ = nullptr;
-    uint64_t generation_ = 0;
+    bool pass_admitted_ = false;
+    int status_ = -EINVAL;
 };
-
-static void settle_audio_route(AudioRouteInstance *route, uint32_t from,
-                               int status) {
-    route->status = status;
-    if (route->result) route->result->status = status;
-    if (!route->state.compare_exchange_strong(
-            from, AUDIO_ROUTE_DONE, std::memory_order_acq_rel,
-            std::memory_order_acquire)) {
-        std::abort();
-    }
-    notify_service(route->engine->route_notifier);
-    route->notify(route->notify_context);
-}
-
-static uint64_t audio_route_age(uint64_t snapshot, uint64_t enqueued) {
-    return snapshot >= enqueued ? snapshot - enqueued : 0;
-}
-
-static kc::ServiceClass audio_route_service(
-    uint64_t snapshot, uint64_t enqueued, kc::ServiceClass service) {
-    return audio_route_age(snapshot, enqueued) >= ROUTE_AGE_PROMOTION
-        ? kc::ServiceClass::Deadline
-        : service;
-}
-
-static AudioRouteInstance *select_audio_route(AudioRoutePool *pool) {
-    AudioRouteInstance *best = nullptr;
-    kc::ServiceClass best_class = kc::ServiceClass::Background;
-    uint64_t best_sequence = UINT64_MAX;
-    const uint64_t now = pool->sequence.load(std::memory_order_acquire);
-    for (AudioRouteInstance &route : pool->routes) {
-        if (route.state.load(std::memory_order_acquire) != AUDIO_ROUTE_READY)
-            continue;
-        /* A producer may enqueue after this scan latched `now`. That route is
-         * newer than the snapshot, not infinitely old; age zero prevents a
-         * fresh continuation from jumping genuinely-starved work. */
-        const kc::ServiceClass service = audio_route_service(
-            now, route.enqueue_sequence, route.service_class);
-        if (!best || service < best_class ||
-            (service == best_class &&
-             route.enqueue_sequence < best_sequence)) {
-            best = &route;
-            best_class = service;
-            best_sequence = route.enqueue_sequence;
-        }
-    }
-    if (!best) return nullptr;
-    uint32_t ready = AUDIO_ROUTE_READY;
-    if (!best->state.compare_exchange_strong(
-            ready, AUDIO_ROUTE_DISPATCHING, std::memory_order_acq_rel,
-            std::memory_order_acquire)) {
-        return nullptr;
-    }
-    return best;
-}
 
 static int mount_audio_route(PassSlot *slot, AudioRouteInstance *route,
                              int *request, uint64_t *context) {
@@ -5228,90 +5073,102 @@ static int mount_audio_route(PassSlot *slot, AudioRouteInstance *route,
     return -EPROTO;
 }
 
-static void audio_route_service_main(void *context) {
+static void reset_audio_route(void *context, AudioRouteInstance &route,
+                              uint32_t index) noexcept {
+    Engine *engine = static_cast<Engine *>(context);
+    route = {};
+    route.engine = engine;
+    route.lease_index = index;
+}
+
+static void publish_audio_route_completion(
+    PassContinuationPermit *permit,
+    const FlashkernCompletion &completion,
+    void *context) noexcept {
+    AudioRouteInstance *route =
+        static_cast<AudioRouteInstance *>(context);
+    if (!permit || !route || !route->engine ||
+        route->pass_completion.ticket.sequence != 0) {
+        std::abort();
+    }
+    route->pass_completion = completion;
+    if (!release_continuation(permit)) std::abort();
+    const AudioRouteBroker::Lease lease = {
+        .index = route->lease_index,
+        .generation = route->lease_generation,
+        .ticket = route->ticket,
+    };
+    if (route->engine->routes.resume(lease) != 0) {
+        std::abort();
+    }
+}
+
+static kc::PermitAdvance step_audio_route(
+    void *context, AudioRouteBroker::Lease,
+    AudioRouteInstance &route, kc::PermitEvent event) noexcept {
     Engine *engine = static_cast<Engine *>(context);
     engine->diagnostics.route_callbacks.fetch_add(
         1, std::memory_order_relaxed);
-    AudioRoutePool *pool = engine->route_pool;
-    if (engine->route_admission.stopped()) {
-        if (engine->route_admission.active() != 0) {
-            return;
-        }
-        for (AudioRouteInstance &route : pool->routes) {
-            uint32_t ready = AUDIO_ROUTE_READY;
-            if (!route.state.compare_exchange_strong(
-                    ready, AUDIO_ROUTE_DONE, std::memory_order_acq_rel,
-                    std::memory_order_acquire)) {
-                continue;
-            }
-            route.status = -ECANCELED;
-            if (route.result) route.result->status = -ECANCELED;
-            route.notify(route.notify_context);
-            notify_service(engine->route_notifier);
-            return;
-        }
-        for (const AudioRouteInstance &route : pool->routes) {
-            const uint32_t state = route.state.load(std::memory_order_acquire);
-            if (state == AUDIO_ROUTE_CLAIMED ||
-                state == AUDIO_ROUTE_READY ||
-                state == AUDIO_ROUTE_DISPATCHING ||
-                state == AUDIO_ROUTE_RUNNING) {
-                return;
-            }
-        }
-        kc_service_request_stop(engine->route_service);
-        return;
+    if (event == kc::PermitEvent::Cancel)
+        return complete_audio_route(-ECANCELED);
+    if (event == kc::PermitEvent::Completion) {
+        if (route.pass_completion.ticket.sequence == 0)
+            std::abort();
+        const FlashkernCompletion completion =
+            route.pass_completion;
+        route.pass_completion = {};
+        return continue_audio_route(&route, completion);
     }
-
-    AudioRouteInstance *route = select_audio_route(pool);
-    if (!route) return;
-
-    if (route->kind == AUDIO_ROUTE_CONTROL) {
-        settle_audio_route(route, AUDIO_ROUTE_DISPATCHING, 0);
-        return;
-    }
+    if (event != kc::PermitEvent::Grant) std::abort();
+    if (route.kind == AUDIO_ROUTE_CONTROL)
+        return complete_audio_route(0);
 
     PassSlot *slot = reserve_pass_slot(engine);
     if (!slot) {
-        /* The route remains a durable READY record. No stack or worker waits:
-         * the owner that reopens admission or releases a slot/route publishes
-         * the successor edge. This callback never republishes itself. */
-        engine->route_admission_deferrals.fetch_add(
-            1, std::memory_order_relaxed);
-        uint32_t dispatching = AUDIO_ROUTE_DISPATCHING;
-        if (!route->state.compare_exchange_strong(
-                dispatching, AUDIO_ROUTE_READY, std::memory_order_acq_rel,
-                std::memory_order_acquire)) {
-            std::abort();
-        }
-        return;
+        return {
+            .disposition = kc::PermitDisposition::Preserve,
+            .status = 0,
+        };
     }
 
     int request = REQ_NONE;
     uint64_t request_context = 0;
-    int status = mount_audio_route(slot, route, &request, &request_context);
+    int status = mount_audio_route(
+        slot, &route, &request, &request_context);
     if (status != 0) {
-        if (!release_pass_slot(slot, slot_generation(slot))) std::abort();
-        settle_audio_route(route, AUDIO_ROUTE_DISPATCHING, status);
-        return;
-    }
-    uint32_t dispatching = AUDIO_ROUTE_DISPATCHING;
-    if (!route->state.compare_exchange_strong(
-            dispatching, AUDIO_ROUTE_RUNNING, std::memory_order_acq_rel,
-            std::memory_order_acquire)) {
-        std::abort();
+        if (!release_pass_slot(slot, slot_generation(slot)))
+            std::abort();
+        return complete_audio_route(status);
     }
     const uint64_t slot_owner = slot_generation(slot);
-    status = submit_slot(engine, slot, slot_owner, request,
-                         request_context, route->ticket,
-                         continue_audio_route, route);
+    status = submit_slot(
+        engine, slot, slot_owner, request, request_context,
+        route.ticket, publish_audio_route_completion, &route);
     if (status != 0) {
         if (!release_pass_slot(slot, slot_owner)) std::abort();
-        settle_audio_route(route, AUDIO_ROUTE_RUNNING, status);
-        return;
+        if (status == -EBUSY || status == -EAGAIN) {
+            return {
+                .disposition = kc::PermitDisposition::Preserve,
+                .status = 0,
+            };
+        }
+        return complete_audio_route(status);
     }
-    engine->route_dispatches.fetch_add(1, std::memory_order_relaxed);
-    notify_service(engine->route_notifier);
+    engine->route_dispatches.fetch_add(
+        1, std::memory_order_relaxed);
+    return {
+        .disposition = kc::PermitDisposition::Suspend,
+        .status = 0,
+    };
+}
+
+static void finish_audio_route(
+    void *, AudioRouteBroker::Lease,
+    AudioRouteInstance &route, int status) noexcept {
+    route.status = status;
+    if (route.result) route.result->status = status;
+    if (!route.notify) std::abort();
+    route.notify(route.notify_context);
 }
 
 } // namespace
@@ -5347,15 +5204,6 @@ static void *engine_new_impl(int workers, bool manual_deadlines,
     e->lanes_total = (uint32_t)workers;
     e->n_workers = workers;
     e->block_count = workers == (int)GRID_LANES ? 2u : 1u;
-    e->route_pool = new (std::nothrow) AudioRoutePool();
-    if (!e->route_pool) {
-        lfm_engine_free(e);
-        return nullptr;
-    }
-    e->route_pool->engine = e;
-    for (AudioRouteInstance &route : e->route_pool->routes) {
-        route.engine = e;
-    }
     for (size_t index = 0; index < e->slots.size(); ++index) {
         PassSlot &slot = e->slots.record(index);
         slot.engine = e;
@@ -5364,24 +5212,20 @@ static void *engine_new_impl(int workers, bool manual_deadlines,
     const kc_runtime_config runtime_config = {
         .worker_count = static_cast<uint32_t>(workers),
     };
-    if (kc_runtime_create(&runtime_config, &e->control_runtime) != 0) {
+    const size_t continuation_capacity =
+        ROUTE_CAPACITY + static_cast<size_t>(workers) + 3;
+    if (kc_runtime_create_capacity(
+            runtime_config.worker_count, continuation_capacity,
+            &e->control_runtime) != 0) {
         lfm_engine_free(e);
         return nullptr;
     }
-    const kc_service_config route_service_config = {
-        .callback = audio_route_service_main,
-        .context = e,
-    };
     const kc_service_config supervisor_service_config = {
         .callback = team_supervisor_main,
         .context = e,
     };
-    if (kc_service_create(e->control_runtime, &route_service_config,
-                          &e->route_service) != 0 ||
-        kc_service_create(e->control_runtime, &supervisor_service_config,
+    if (kc_service_create(e->control_runtime, &supervisor_service_config,
                           &e->supervisor_service) != 0 ||
-        kc_service_notifier_create(e->route_service,
-                                   &e->route_notifier) != 0 ||
         kc_service_notifier_create(e->supervisor_service,
                                    &e->supervisor_notifier) != 0) {
         lfm_engine_free(e);
@@ -5389,6 +5233,27 @@ static void *engine_new_impl(int workers, bool manual_deadlines,
     }
     e->mailbox_capacity_identity =
         e->tickets.mint(KC_TICKET_KIND_CONTROL);
+    e->route_capacity_identity =
+        e->tickets.mint(KC_TICKET_KIND_CONTROL);
+    const AudioRouteBroker::Config route_config = {
+        .runtime = e->control_runtime,
+        .tickets = &e->tickets,
+        .ticket_kind = KC_TICKET_KIND_WORKFLOW,
+        .age_promotion = ROUTE_AGE_PROMOTION,
+        .context = e,
+        .operations = {
+            .reset = reset_audio_route,
+            .step = step_audio_route,
+            .finished = finish_audio_route,
+        },
+        .capacity_ready = {
+            publish_route_capacity_edge, e,
+            e->route_capacity_identity},
+    };
+    if (e->routes.initialize(route_config) != 0) {
+        lfm_engine_free(e);
+        return nullptr;
+    }
     const EngineExecutor::Config executor_config = {
         .runtime = e->control_runtime,
         .member_count = static_cast<uint32_t>(workers),
@@ -5420,8 +5285,7 @@ static void *engine_new_impl(int workers, bool manual_deadlines,
         lfm_engine_free(e);
         return nullptr;
     }
-    e->pass_admission.bind(notify_admission, e->route_notifier);
-    e->route_admission.bind(notify_admission, e->route_notifier);
+    e->pass_admission.bind(notify_route_broker, e);
     const kc_deadline_source_config deadline_config = {
         .capacity = 1,
         .notify = deadline_supervisor_notify,
@@ -5447,7 +5311,7 @@ static void *engine_new_impl(int workers, bool manual_deadlines,
         return nullptr;
     }
     e->executor_started = 1;
-    if (kc_service_start(e->route_service) != 0) {
+    if (e->routes.start() != 0) {
         lfm_engine_free(e);
         return nullptr;
     }
@@ -5508,9 +5372,8 @@ int lfm_internal_engine_trigger_hard_timeout_probe_for_test(void *ep) {
 void lfm_engine_request_stop(void *ep) {
     Engine *e = (Engine *)ep;
     if (!e) return;
-    e->route_admission.stop();
+    e->routes.request_stop();
     e->executor.request_stop();
-    notify_service(e->route_notifier);
     if (!e->team_deadlines && e->supervisor_service)
         kc_service_request_stop(e->supervisor_service);
     if (e->team_deadlines && !e->executor_started)
@@ -5672,8 +5535,9 @@ uint32_t lfm_internal_engine_audio_route_service_for_test(
         service > static_cast<uint32_t>(kc::ServiceClass::Background)) {
         return 0;
     }
-    return static_cast<uint32_t>(audio_route_service(
-        snapshot, enqueued, static_cast<kc::ServiceClass>(service)));
+    return static_cast<uint32_t>(AudioRouteBroker::classify(
+        snapshot, enqueued, static_cast<kc::ServiceClass>(service),
+        ROUTE_AGE_PROMOTION));
 }
 
 int lfm_internal_engine_fail_audio_route_depth_for_test(void *ep, int status) {
@@ -5746,10 +5610,8 @@ int lfm_engine_audio_encode_submit(
     }
     *out_handle = {};
     *out_adapted_values = 0;
-    RouteProducerAdmission admission(e);
-    if (!admission) return admission.status();
     AudioRouteLease claim(e);
-    if (!claim) return -EBUSY;
+    if (!claim) return claim.status();
     BackbonePlan *model = model_id == 0 ? nullptr : find_model(e, model_id);
     if (model_id != 0 && !model) return -ESTALE;
     if (model && lfm_conformer_out_width(pass->conformer) != model->h) {
@@ -5757,7 +5619,6 @@ int lfm_engine_audio_encode_submit(
     }
     AudioRouteInstance *route = claim.route();
     route->engine = e;
-    route->service_class = kc::ServiceClass::Interactive;
     route->kind = AUDIO_ROUTE_ENCODE;
     route->node = AUDIO_ROUTE_TERMINAL;
     route->model = model;
@@ -5772,21 +5633,14 @@ int lfm_engine_audio_encode_submit(
     route->terminal_after_token = false;
     route->decode_detokenizer = false;
     route->status = -EINPROGRESS;
-    route->enqueue_sequence =
-        e->route_pool->sequence.fetch_add(1, std::memory_order_acq_rel) + 1;
     out_handle->record = route;
     out_handle->generation = claim.generation();
     out_handle->ticket = route->ticket;
-    uint32_t claimed = AUDIO_ROUTE_CLAIMED;
-    if (!route->state.compare_exchange_strong(
-            claimed, AUDIO_ROUTE_READY, std::memory_order_acq_rel,
-            std::memory_order_acquire)) {
+    const int published = claim.publish();
+    if (published != 0) {
         *out_handle = {};
-        return -ESTALE;
+        return published;
     }
-    claim.detach();
-    admission.release();
-    notify_service(e->route_notifier);
     return 0;
 }
 
@@ -5795,13 +5649,7 @@ int lfm_engine_snapshot(void *ep, LfmEngineSnapshotV1 *out) {
     if (!e || !out || out->size < sizeof(*out) || out->abi_version != 1) return -EINVAL;
     const kc::TeamExecutorSnapshot executor = e->executor.snapshot();
     const kc::MailboxSnapshot mailbox = executor.mailbox;
-    uint32_t routes_live = 0;
-    uint32_t routes_ready = 0;
-    for (const AudioRouteInstance &route : e->route_pool->routes) {
-        const uint32_t state = route.state.load(std::memory_order_acquire);
-        if (state != AUDIO_ROUTE_FREE) routes_live++;
-        if (state == AUDIO_ROUTE_READY) routes_ready++;
-    }
+    const kc::PermitBrokerSnapshot routes = e->routes.snapshot();
     *out = {
         .size = sizeof(*out),
         .abi_version = 1,
@@ -5824,13 +5672,12 @@ int lfm_engine_snapshot(void *ep, LfmEngineSnapshotV1 *out) {
         .continuation_submissions =
             e->continuation_submissions.load(std::memory_order_relaxed),
         .route_capacity = (uint32_t)ROUTE_CAPACITY,
-        .routes_live = routes_live,
-        .routes_ready = routes_ready,
+        .routes_live = routes.live,
+        .routes_ready = routes.ready,
         .reserved0 = 0,
         .route_dispatches =
             e->route_dispatches.load(std::memory_order_relaxed),
-        .route_admission_deferrals =
-            e->route_admission_deferrals.load(std::memory_order_relaxed),
+        .route_admission_deferrals = routes.deferrals,
     };
     return 0;
 }
@@ -5839,7 +5686,7 @@ extern "C++" int lfm_internal_engine_diagnostic_view(
     void *ep, LfmEngineDiagnosticView *out) {
     Engine *engine = static_cast<Engine *>(ep);
     if (!engine || !out || !engine->control_runtime ||
-        !engine->executor.continuation() || !engine->route_service ||
+        !engine->executor.continuation() || !engine->routes.service() ||
         !engine->supervisor_service || !engine->executor.team()) {
         return -EINVAL;
     }
@@ -5847,7 +5694,7 @@ extern "C++" int lfm_internal_engine_diagnostic_view(
         .state = &engine->diagnostics,
         .runtime = engine->control_runtime,
         .bridge_continuation = engine->executor.continuation(),
-        .route_service = engine->route_service,
+        .route_service = engine->routes.service(),
         .supervisor_service = engine->supervisor_service,
         .team = engine->executor.team(),
         .owner = engine,
@@ -5862,6 +5709,8 @@ extern "C++" int lfm_internal_engine_diagnostic_counts(
     const kc::TeamExecutorSnapshot executor =
         engine->executor.snapshot();
     const kc::MailboxSnapshot mailbox = executor.mailbox;
+    const kc::PermitBrokerSnapshot routes =
+        engine->routes.snapshot();
     LfmEngineDiagnosticCounts counts = {
         .pass_submissions =
             engine->pass_submissions.load(std::memory_order_acquire),
@@ -5871,8 +5720,7 @@ extern "C++" int lfm_internal_engine_diagnostic_counts(
         .dispatch_wakes = executor.generations_dispatched,
         .route_dispatches =
             engine->route_dispatches.load(std::memory_order_acquire),
-        .route_admission_deferrals =
-            engine->route_admission_deferrals.load(std::memory_order_acquire),
+        .route_admission_deferrals = routes.deferrals,
         .bridge_team_generation = executor.generation,
         .bridge_team_completion = executor.returned_generation,
         .bridge_retired_generation = executor.retired_generation,
@@ -5886,30 +5734,12 @@ extern "C++" int lfm_internal_engine_diagnostic_counts(
         .pass_slots_live =
             engine->pass_slots_live.load(std::memory_order_acquire),
     };
-    for (const AudioRouteInstance &route : engine->route_pool->routes) {
-        switch (route.state.load(std::memory_order_acquire)) {
-        case AUDIO_ROUTE_FREE:
-            counts.routes_free++;
-            break;
-        case AUDIO_ROUTE_CLAIMED:
-            counts.routes_claimed++;
-            break;
-        case AUDIO_ROUTE_READY:
-            counts.routes_ready++;
-            break;
-        case AUDIO_ROUTE_DISPATCHING:
-            counts.routes_dispatching++;
-            break;
-        case AUDIO_ROUTE_RUNNING:
-            counts.routes_running++;
-            break;
-        case AUDIO_ROUTE_DONE:
-            counts.routes_done++;
-            break;
-        default:
-            std::abort();
-        }
-    }
+    counts.routes_free = routes.free;
+    counts.routes_claimed = routes.claimed;
+    counts.routes_ready = routes.ready;
+    counts.routes_dispatching = 0;
+    counts.routes_running = routes.running;
+    counts.routes_done = routes.done;
     *out = counts;
     return 0;
 }
@@ -5940,9 +5770,7 @@ void lfm_engine_free(void *ep) {
         kc_runtime_join_all(e->control_runtime) != 0) {
         std::abort();
     }
-    if (e->route_service) {
-        if (kc_service_join(e->route_service) != 0) std::abort();
-    }
+    if (e->routes.join() != 0) std::abort();
     if (e->supervisor_service) {
         if (kc_service_join(e->supervisor_service) != 0) std::abort();
     }
@@ -5964,14 +5792,7 @@ void lfm_engine_free(void *ep) {
             std::abort();
         e->supervisor_notifier = nullptr;
     }
-    if (e->route_notifier) {
-        if (kc_service_notifier_destroy(e->route_notifier) != 0) std::abort();
-        e->route_notifier = nullptr;
-    }
-    if (e->route_service) {
-        if (kc_service_destroy(e->route_service) != 0) std::abort();
-        e->route_service = nullptr;
-    }
+    if (e->routes.destroy() != 0) std::abort();
     if (e->supervisor_service) {
         if (kc_service_destroy(e->supervisor_service) != 0) std::abort();
         e->supervisor_service = nullptr;
@@ -5985,7 +5806,6 @@ void lfm_engine_free(void *ep) {
         e->control_runtime = nullptr;
     }
     fatal_sink_destroy(&e->fatal_sink);
-    delete e->route_pool;
     delete e;
 }
 
@@ -6217,10 +6037,11 @@ static int run_audio_route(
         return -ESTALE;
     }
 
-    RouteProducerAdmission admission(e);
-    if (!admission) return admission.status();
-    AudioRouteLease claim(e);
-    if (!claim) return -EBUSY;
+    AudioRouteLease claim(
+        e, decode_detokenizer
+            ? kc::ServiceClass::Deadline
+            : kc::ServiceClass::Interactive);
+    if (!claim) return claim.status();
     AudioRouteInstance *route = claim.route();
     BackbonePlan *model = find_model(e, model_id);
     DepthPlan *depth = nullptr;
@@ -6288,9 +6109,6 @@ static int run_audio_route(
     }
 
     route->engine = e;
-    route->service_class = decode_detokenizer
-        ? kc::ServiceClass::Deadline
-        : kc::ServiceClass::Interactive;
     route->kind = AUDIO_ROUTE_GENERATION;
     route->node = AUDIO_ROUTE_TOKEN;
     route->depth_id = depth_id;
@@ -6353,21 +6171,14 @@ static int run_audio_route(
     route->commit = bound_commit;
     route->token_completed = out_token_completed;
     route->status = -EINPROGRESS;
-    route->enqueue_sequence =
-        e->route_pool->sequence.fetch_add(1, std::memory_order_acq_rel) + 1;
     out_handle->record = route;
     out_handle->generation = claim.generation();
     out_handle->ticket = route->ticket;
-    uint32_t claimed = AUDIO_ROUTE_CLAIMED;
-    if (!route->state.compare_exchange_strong(
-            claimed, AUDIO_ROUTE_READY, std::memory_order_acq_rel,
-            std::memory_order_acquire)) {
+    const int published = claim.publish();
+    if (published != 0) {
         *out_handle = {};
-        return -ESTALE;
+        return published;
     }
-    claim.detach();
-    admission.release();
-    notify_service(e->route_notifier);
     return 0;
 }
 
@@ -6436,13 +6247,10 @@ int lfm_engine_control_route_submit(
     Engine *engine = static_cast<Engine *>(ep);
     if (!engine || !notify || !out_handle) return -EINVAL;
     *out_handle = {};
-    RouteProducerAdmission admission(engine);
-    if (!admission) return admission.status();
     AudioRouteLease claim(engine);
-    if (!claim) return -EBUSY;
+    if (!claim) return claim.status();
     AudioRouteInstance *route = claim.route();
     route->engine = engine;
-    route->service_class = kc::ServiceClass::Interactive;
     route->kind = AUDIO_ROUTE_CONTROL;
     route->node = AUDIO_ROUTE_TERMINAL;
     route->model = nullptr;
@@ -6454,51 +6262,39 @@ int lfm_engine_control_route_submit(
     route->terminal_after_token = false;
     route->decode_detokenizer = false;
     route->status = -EINPROGRESS;
-    route->enqueue_sequence =
-        engine->route_pool->sequence.fetch_add(
-            1, std::memory_order_acq_rel) + 1;
     out_handle->record = route;
     out_handle->generation = claim.generation();
     out_handle->ticket = route->ticket;
-    uint32_t claimed = AUDIO_ROUTE_CLAIMED;
-    if (!route->state.compare_exchange_strong(
-            claimed, AUDIO_ROUTE_READY, std::memory_order_acq_rel,
-            std::memory_order_acquire)) {
+    const int published = claim.publish();
+    if (published != 0) {
         *out_handle = {};
-        return -ESTALE;
+        return published;
     }
-    claim.detach();
-    admission.release();
-    notify_service(engine->route_notifier);
     return 0;
 }
 
 int lfm_engine_audio_route_collect(void *ep,
                                    LfmAudioRouteHandle *handle) {
     Engine *engine = static_cast<Engine *>(ep);
-    if (!engine || !handle || !handle->record || handle->generation == 0 ||
-        !engine->route_pool) {
+    if (!engine || !handle || !handle->record ||
+        handle->generation == 0) {
         return -EINVAL;
     }
     AudioRouteInstance *route =
         static_cast<AudioRouteInstance *>(handle->record);
-    bool owned = false;
-    for (AudioRouteInstance &candidate : engine->route_pool->routes) {
-        if (&candidate == route) {
-            owned = true;
-            break;
-        }
-    }
-    if (!owned || route->engine != engine ||
-        route->generation.load(std::memory_order_acquire) !=
-            handle->generation || !ticket_equal(route->ticket, handle->ticket)) {
+    AudioRouteBroker::Lease lease{};
+    if (engine->routes.locate(
+            route, handle->generation, handle->ticket,
+            &lease) != 0 ||
+        route->engine != engine) {
         return -ESTALE;
     }
-    if (route->state.load(std::memory_order_acquire) != AUDIO_ROUTE_DONE) {
+    if (!engine->routes.done(lease)) {
         return -EINPROGRESS;
     }
     const int status = route->status;
-    release_audio_route(route, handle->generation);
+    if (engine->routes.release(lease) != 0) std::abort();
+    leave_pass_admission(engine);
     *handle = {};
     return status;
 }
@@ -6764,10 +6560,8 @@ int lfm_engine_prefill_submit(
         return -EINVAL;
     }
     *out_handle = {};
-    RouteProducerAdmission admission(e);
-    if (!admission) return admission.status();
     AudioRouteLease claim(e);
-    if (!claim) return -EBUSY;
+    if (!claim) return claim.status();
     BackbonePlan *model = find_model(e, id);
     if (!model || !model->embed_w || !model->emb_norm_w ||
         state_count != model->layers.size() || row_count > model->max_ctx ||
@@ -6861,7 +6655,6 @@ int lfm_engine_prefill_submit(
 
     AudioRouteInstance *route = claim.route();
     route->engine = e;
-    route->service_class = kc::ServiceClass::Interactive;
     route->kind = AUDIO_ROUTE_PREFILL;
     route->node = AUDIO_ROUTE_TERMINAL;
     route->model = model;
@@ -6903,21 +6696,14 @@ int lfm_engine_prefill_submit(
     route->terminal_after_token = false;
     route->decode_detokenizer = false;
     route->status = -EINPROGRESS;
-    route->enqueue_sequence =
-        e->route_pool->sequence.fetch_add(1, std::memory_order_acq_rel) + 1;
     out_handle->record = route;
     out_handle->generation = claim.generation();
     out_handle->ticket = route->ticket;
-    uint32_t claimed = AUDIO_ROUTE_CLAIMED;
-    if (!route->state.compare_exchange_strong(
-            claimed, AUDIO_ROUTE_READY, std::memory_order_acq_rel,
-            std::memory_order_acquire)) {
+    const int published = claim.publish();
+    if (published != 0) {
         *out_handle = {};
-        return -ESTALE;
+        return published;
     }
-    claim.detach();
-    admission.release();
-    notify_service(e->route_notifier);
     return 0;
 }
 

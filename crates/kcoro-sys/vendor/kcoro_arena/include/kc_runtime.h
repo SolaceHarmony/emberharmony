@@ -29,6 +29,12 @@ typedef struct kc_runtime_snapshot {
 } kc_runtime_snapshot;
 
 int kc_runtime_create(const kc_runtime_config *config, kc_runtime_t **out);
+/* Native fixed-topology constructor. Worker count and logical continuation
+ * count are independent dimensions; both are allocated before readiness and
+ * neither may grow afterward. */
+int kc_runtime_create_capacity(unsigned worker_count,
+                               size_t continuation_capacity,
+                               kc_runtime_t **out);
 int kc_runtime_start(kc_runtime_t *runtime);
 /* Administrative join for retained services and their notifier leases.
  * Returns -EDEADLK from a callback executing on this runtime. */

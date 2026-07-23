@@ -100,7 +100,7 @@ class TeamExecutor final {
         std::uint32_t member_count = 0;
         void *context = nullptr;
         Operations operations{};
-        MailboxEdge capacity_ready{};
+        CallbackEdge capacity_ready{};
         Retired retired = nullptr;
         void *retired_context = nullptr;
     };

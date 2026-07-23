@@ -18,7 +18,7 @@ The live ownership split is:
 | capture/playback device callbacks | native CoreAudio AUHAL units | direct native lease write or drain, publish edge, return |
 | host voice state/UI delivery | one Rust `kcoro_sys::Service` | opaque handles, settings/control, bounded outward events only |
 | native session coordination/delivery | native `kc_service` continuations | callback-driven, exact tickets, migratable on the bounded pool |
-| native route/bridge/supervision | saved bridge frame plus retained route/supervisor services | same bounded pool as the numerical lanes |
+| native route/executor/supervision | one saved frame per route, saved team-executor frame, broker and supervisor services | same bounded pool as the numerical lanes |
 | numerical work | one engine `kc_team` | fixed logical members on kcoro workers; one active generation |
 | model math | architecture leaves and explicit Accelerate/AMX seams | pointer/stride views; no Rust numerical body |
 

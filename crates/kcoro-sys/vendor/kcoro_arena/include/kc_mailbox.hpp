@@ -14,23 +14,6 @@
 
 namespace kc {
 
-struct MailboxEdge {
-    using Publish = void (*)(void *, const kc_ticket_id *);
-
-    Publish publish = nullptr;
-    void *context = nullptr;
-    kc_ticket_id identity{};
-
-    [[nodiscard]] bool valid() const noexcept {
-        return publish != nullptr && ticket_valid(identity);
-    }
-
-    void fire() const noexcept {
-        if (!valid()) std::abort();
-        publish(context, &identity);
-    }
-};
-
 struct MailboxSnapshot {
     std::uint64_t requests_published = 0;
     std::uint64_t requests_consumed = 0;
@@ -96,9 +79,9 @@ class Mailbox final {
 
   public:
     struct Config {
-        MailboxEdge request_ready{};
-        MailboxEdge completion_ready{};
-        MailboxEdge capacity_ready{};
+        CallbackEdge request_ready{};
+        CallbackEdge completion_ready{};
+        CallbackEdge capacity_ready{};
     };
 
     class RequestProducer final {

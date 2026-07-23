@@ -67,8 +67,11 @@ static int create_workers(kc_runtime_t *runtime)
 static int create_continuation_board(kc_runtime_t *runtime)
 {
     if (runtime->worker_count > 64) return -EINVAL;
-    runtime->continuation_capacity =
-        (size_t)runtime->worker_count * KC_RUNTIME_CONTINUATIONS_PER_WORKER;
+    if (!runtime->continuation_capacity)
+        runtime->continuation_capacity =
+            (size_t)runtime->worker_count *
+            KC_RUNTIME_CONTINUATIONS_PER_WORKER;
+    if (runtime->continuation_capacity > UINT32_MAX) return -EOVERFLOW;
     runtime->ready_word_count =
         (runtime->continuation_capacity + 63) / 64;
     runtime->continuations = calloc(runtime->continuation_capacity,
@@ -91,7 +94,9 @@ static int create_continuation_board(kc_runtime_t *runtime)
     return 0;
 }
 
-int kc_runtime_create(const kc_runtime_config *config, kc_runtime_t **out)
+static int runtime_create(unsigned worker_count,
+                          size_t continuation_capacity,
+                          kc_runtime_t **out)
 {
     if (!out) return -EINVAL;
     kc_runtime_t *runtime = calloc(1, sizeof(*runtime));
@@ -111,8 +116,8 @@ int kc_runtime_create(const kc_runtime_config *config, kc_runtime_t **out)
     atomic_init(&runtime->test_register_armed, 0);
     atomic_init(&runtime->next_sequence, 1);
     runtime->runtime_epoch = next_epoch();
-    runtime->worker_count = config && config->worker_count
-        ? config->worker_count : 1;
+    runtime->worker_count = worker_count ? worker_count : 1;
+    runtime->continuation_capacity = continuation_capacity;
     if (runtime->worker_count > 64) {
         free(runtime);
         return -EINVAL;
@@ -132,6 +137,20 @@ int kc_runtime_create(const kc_runtime_config *config, kc_runtime_t **out)
     runtime->accepting = 1;
     *out = runtime;
     return 0;
+}
+
+int kc_runtime_create(const kc_runtime_config *config, kc_runtime_t **out)
+{
+    return runtime_create(
+        config ? config->worker_count : 0, 0, out);
+}
+
+int kc_runtime_create_capacity(unsigned worker_count,
+                               size_t continuation_capacity,
+                               kc_runtime_t **out)
+{
+    if (!worker_count || !continuation_capacity) return -EINVAL;
+    return runtime_create(worker_count, continuation_capacity, out);
 }
 
 void kc_runtime_signal_lifecycle_internal(kc_runtime_t *runtime)

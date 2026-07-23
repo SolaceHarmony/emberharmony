@@ -53,18 +53,17 @@ There is no per-pass heap allocation, copied pass payload, Rust lane callback,
 bounded spin, or polling. The engine has two descriptor-addressed ticket slots:
 each request record borrows payload spans and each slot owns only its activation
 scratch bank. A capacity-2 SQ/CQ hands each completion an exact
-generation-bearing permit. The bounded audio route releases that permit at every
-coarse node, marks its pooled route record ready, and lets the native broker
-reacquire capacity in FIFO/age-promoted order. Its exact-CQ callback performs no
-submission, allocation, wait, or descriptor lock. Packed `{generation,state}`
-CAS transitions prevent slot theft and stale-destructor ABA, and `FREE` is the
-final accounting publication edge. Text and audio admission return a pooled
-handle; terminal notification rings the session work doorbell and the
-coordinator collects that exact generation. The coordinator never waits for a
-numerical pass or holds a compute slot across an external-resource boundary.
-The pooled route record/broker re-entry remains transitional: the numerical
-bridge is already a saved stackless frame, and each multi-hop route still needs
-its own reusable frame carrying the program counter and fixed locals.
+generation-bearing permit. `kc::PermitBroker` owns the fixed route pool,
+generation leases, bounded admission, FIFO/service-class/age selection, and one
+saved continuation frame per route. A granted route mounts one coarse pass and
+dehydrates; its exact completion resumes that route frame, which either
+publishes the terminal result or requeues itself for the next token →
+Depthformer → detokenizer node. Packed `{generation,state}` CAS transitions
+prevent slot theft and stale-destructor ABA, and `FREE` is the final accounting
+publication edge. Text and audio admission return a pooled handle; terminal
+notification makes the session continuation runnable and the coordinator
+collects that exact generation. The coordinator never waits for a numerical
+pass or holds a compute slot across an external-resource boundary.
 
 Flashkern is the CPU executor, never the Metal executor. CPU kernels retain NEON,
 BFMMLA/BFDOT, AVX2, and AVX-512-BF16 paths. Unsupported Metal selection fails
@@ -162,7 +161,7 @@ as-built. Read this as the spec, not the changelog.
    surfaces.
 
 For LFM2, weight/compute ownership, typed audio input, native recurrence,
-capacity-2 exact-completion routes, retained kcoro bridge/broker services, exact
+capacity-2 exact-completion routes, retained kcoro route/executor frames, exact
 Sesame turn policy, and direct native capture/playback spans are built. The
 current engine is one fixed team; independent V2 block domains and native Moshi
 remain separate future work.
@@ -276,9 +275,10 @@ payload remains.
 
 - `kc_team` owns each stable Flashkern member. One generation executes one
   non-suspending stage; the final return resumes the retained continuation.
-- Native coordinator/delivery/bridge/route services own admission, recurrence,
-  reliable events, and exact completion collection. Suspended actions are
-  records, not attached threads or waiters.
+- Native coordinator/delivery services, `kc::PermitBroker`, and
+  `kc::TeamExecutor` own admission, recurrence, reliable events, and exact
+  completion collection. Suspended routes and passes are saved continuation
+  frames, not attached threads or waiters.
 - The native session owns the CoreAudio units and both PCM dock endpoints. Safe
   Rust retained services hold only an opaque platform-audio handle and project
   bounded events/control; they do not touch device PCM, submit model passes,

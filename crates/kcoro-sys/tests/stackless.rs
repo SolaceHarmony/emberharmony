@@ -129,6 +129,7 @@ unsafe extern "C" fn frame_step(raw: *mut c_void) -> *mut c_void {
 unsafe extern "C" fn completed(context: *mut c_void, identity: *const Ticket) {
     let signal = unsafe { &*context.cast::<Signal>() };
     assert!(!identity.is_null());
+    let _stage = signal.stage.lock().unwrap();
     signal.completed.store(true, Ordering::Release);
     signal.changed.notify_all();
 }
@@ -172,9 +173,9 @@ unsafe extern "C" fn terminal_race_step(raw: *mut c_void) -> *mut c_void {
     let race = unsafe { &*koro_cont_argument(raw).cast::<TerminalRace>() };
     let run = race.runs.fetch_add(1, Ordering::AcqRel) + 1;
     if run == 1 {
+        let mut release = race.release.lock().unwrap();
         race.entered.store(true, Ordering::Release);
         race.changed.notify_all();
-        let mut release = race.release.lock().unwrap();
         while !*release {
             release = race.changed.wait(release).unwrap();
         }
@@ -189,6 +190,7 @@ unsafe extern "C" fn terminal_race_step(raw: *mut c_void) -> *mut c_void {
 unsafe extern "C" fn terminal_race_completed(context: *mut c_void, identity: *const Ticket) {
     let race = unsafe { &*context.cast::<TerminalRace>() };
     assert!(!identity.is_null());
+    let _release = race.release.lock().unwrap();
     race.completed.store(true, Ordering::Release);
     race.changed.notify_all();
 }
@@ -237,9 +239,9 @@ unsafe extern "C" fn completion_gate_step(raw: *mut c_void) -> *mut c_void {
 unsafe extern "C" fn completion_gate_callback(context: *mut c_void, identity: *const Ticket) {
     let gate = unsafe { &*context.cast::<CompletionGate>() };
     assert!(!identity.is_null());
+    let mut release = gate.release.lock().unwrap();
     gate.entered.store(true, Ordering::Release);
     gate.changed.notify_all();
-    let mut release = gate.release.lock().unwrap();
     while !*release {
         release = gate.changed.wait(release).unwrap();
     }
@@ -250,15 +252,16 @@ unsafe extern "C" fn completion_gate_callback(context: *mut c_void, identity: *c
 unsafe extern "C" fn blocker_completed(context: *mut c_void, identity: *const Ticket) {
     let blocker = unsafe { &*context.cast::<Blocker>() };
     assert!(!identity.is_null());
+    let _release = blocker.release.lock().unwrap();
     blocker.completed.store(true, Ordering::Release);
     blocker.changed.notify_all();
 }
 
 unsafe extern "C" fn blocker_step(raw: *mut c_void) -> *mut c_void {
     let blocker = unsafe { &*koro_cont_argument(raw).cast::<Blocker>() };
+    let mut release = blocker.release.lock().unwrap();
     blocker.entered.store(true, Ordering::Release);
     blocker.changed.notify_all();
-    let mut release = blocker.release.lock().unwrap();
     while !*release {
         release = blocker.changed.wait(release).unwrap();
     }
@@ -414,6 +417,7 @@ struct LostWake {
 unsafe extern "C" fn lost_wake_completed(context: *mut c_void, identity: *const Ticket) {
     let state = unsafe { &*context.cast::<LostWake>() };
     assert!(!identity.is_null());
+    let _release = state.release.lock().unwrap();
     state.completed.store(true, Ordering::Release);
     state.changed.notify_all();
 }
@@ -422,9 +426,9 @@ unsafe extern "C" fn lost_wake_step(raw: *mut c_void) -> *mut c_void {
     let state = unsafe { &*koro_cont_argument(raw).cast::<LostWake>() };
     match unsafe { koro_cont_state_get(raw) } {
         0 => {
+            let mut release = state.release.lock().unwrap();
             state.entered.store(true, Ordering::Release);
             state.changed.notify_all();
-            let mut release = state.release.lock().unwrap();
             while !*release {
                 release = state.changed.wait(release).unwrap();
             }
@@ -433,6 +437,7 @@ unsafe extern "C" fn lost_wake_step(raw: *mut c_void) -> *mut c_void {
             std::ptr::null_mut()
         }
         1 => {
+            let _release = state.release.lock().unwrap();
             state.stages.store(2, Ordering::Release);
             state.changed.notify_all();
             if unsafe { koro_cont_finish(raw) } != 0 {
@@ -649,6 +654,7 @@ fn callback_ticket_names_one_coroutine_not_a_fifo_position() {
     first.wait(2);
     first.wait_completed();
 
+    assert_eq!(unsafe { kc_runtime_join_all(runtime) }, 0);
     assert_eq!(unsafe { koro_cont_destroy(first_cont) }, 0);
     assert_eq!(unsafe { koro_cont_destroy(second_cont) }, 0);
     destroy_runtime(runtime);

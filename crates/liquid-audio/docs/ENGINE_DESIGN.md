@@ -8,8 +8,9 @@ Flashkern is the CPU inference device:
 
 - native C++ owns the engine object, plans, request/pass slots, direct byte
   views, scratch, model-stage selection, and numerical lifecycle;
-- kcoro owns every resident control worker, saved executor frame, typed
-  mailbox, fixed-team member, generation callback, and asynchronous retirement;
+- kcoro owns every resident control worker, saved route/executor frame, fair
+  permit broker, typed mailbox, fixed-team member, generation callback, and
+  asynchronous retirement;
 - architecture assembly is the primary numerical implementation, with Apple
   Accelerate/AMX admitted only behind an explicit large-matrix ABI;
 - Rust docks control/observation through opaque native handles only; native
@@ -60,6 +61,17 @@ publishes and consumes the correlated completion before calling Flashkern's
 value that survives a return. The former Flashkern-local bridge interpreter,
 generation counters, mailbox endpoints, and team callback are gone.
 
+`kc::PermitBroker` owns the fixed route records, generation leases, bounded
+admission, service-class/FIFO/age selection, and one retained continuation
+frame per route. Its single broker service only grants permits; it never
+interprets a route or submits numerical work. The granted route frame mounts
+one pass, dehydrates, and is resumed exactly by that pass completion. A
+multi-hop token → Depthformer → detokenizer route therefore continues in its
+own saved frame rather than re-entering one Flashkern-local route interpreter.
+Released pass or mailbox capacity publishes the successor edge for a preserved
+route. Records newer than a selector snapshot have age zero, and route capacity
+is independent from the age-promotion threshold.
+
 An accepted submission carries only `{pass_slot, ticket_generation}`. The
 engine-owned slot retains its typed byte views, program cursor, continuation,
 and input/output/conversation leases until the exact terminal callback. There
@@ -70,8 +82,9 @@ into a caller's stack.
 ## Fixed Lanes
 
 `lfm_engine_new_status`, reached through `lfm_runtime_create`, creates one
-bounded kcoro runtime, one `kc::TeamExecutor`, route and team-supervisor
-services, and the executor's stable logical `kc_team` on that same pool.
+bounded kcoro runtime, one `kc::TeamExecutor`, one `kc::PermitBroker`, a
+team-supervisor service, and the executor's stable logical `kc_team` on that
+same pool.
 Flashkern and `kc_team` create no lane pthreads. The runtime owns one
 infrastructure doorbell; there is no operation-owned idle registration or
 per-pass fence word.
